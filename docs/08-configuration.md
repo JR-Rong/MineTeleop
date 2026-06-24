@@ -130,6 +130,14 @@ vehicle_adapter:
   type: mock
 ```
 
+## 控制超时参数语义
+
+- `max_command_gap_ms`：单次有效命令到达间隔上限，用于丢弃过旧命令、记录异常和提示链路抖动。
+- `degraded_timeout_ms`：链路异常持续多久后进入降级控制，用于区分偶发丢包和连续抖动。
+- `control_timeout_ms`：持续没有有效控制心跳多久后进入 `TIMEOUT_BRAKE`。
+
+`control_timeout_ms` 不能只按网络体验调大。配置前必须结合车速上限、制动曲线、坡道/松散路面和矿区安全距离，反推允许的最大控制超时。
+
 ## 驾驶端配置示例
 
 ```yaml
@@ -168,6 +176,7 @@ control:
 - 控制超时大于命令周期。
 - 安全停车制动曲线存在且不是单步全力制动。
 - `max_command_gap_ms`、`degraded_timeout_ms`、`control_timeout_ms` 按递增关系配置。
+- `control_timeout_ms` 有基于真实车辆制动距离或台架标定的上限依据。
 - 急停锁存和复位策略已配置。
 - 时间同步策略已配置。
 - 录像容量规划已配置，上传限速低于录像产生速率时必须给出保留或降级策略。
