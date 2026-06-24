@@ -17,6 +17,7 @@ flowchart LR
     RealtimeEnc["Realtime Encoder"]
     RecordEnc["Record Encoder"]
     WebRTCClient["WebRTC Client"]
+    ControlRx["Control Receiver"]
     VehicleAdapter["Vehicle Adapter"]
     Safety["Safety State Machine"]
     Recorder["Segment Recorder"]
@@ -48,7 +49,8 @@ flowchart LR
   WebRTCClient <--> Decoder
   Input --> ControlClient
   ControlClient <--> WebRTCClient
-  ControlClient --> Safety
+  WebRTCClient --> ControlRx
+  ControlRx --> Safety
   Safety --> VehicleAdapter
   UI <--> Auth
   UI <--> Signaling
@@ -77,16 +79,18 @@ flowchart LR
 ### 控制链路
 
 1. 驾驶端输入层产生控制状态。
-2. Control Client 以 20 Hz 发送 `ControlCommand`。
-3. 车端接收后校验序号、时间戳、会话和控制权。
-4. Safety State Machine 判断是否可执行。
-5. Vehicle Adapter 下发给真实车辆接口或 Mock Adapter。
-6. Telemetry 回传当前状态。
+2. Control Client 以 20 Hz 发送包含 `protocol_version`、`seq` 和完整控制状态的 `ControlCommand`。
+3. 如果控制走 WebRTC DataChannel，通道必须配置为 unordered/unreliable，避免可靠有序重传造成队头阻塞和旧命令积压。
+4. 车端接收后校验协议版本、序号、会话和控制权，并用本地到达间隔判断命令新鲜度。
+5. Safety State Machine 判断是否可执行。
+6. Vehicle Adapter 下发给真实车辆接口或 Mock Adapter。
+7. Telemetry 回传当前状态。
 
 设计要求：
 
 - 控制命令轻量、固定频率、可追溯。
 - 安全停车由车端本地状态机执行。
+- 急停命令一旦到达车端即锁存，不依赖驾驶端持续发送。
 - 云端不在控制闭环中做逐帧/逐命令转发决策。
 
 ### 录像上传链路
@@ -94,7 +98,7 @@ flowchart LR
 1. Record Encoder 生成分段文件。
 2. Segment Recorder 写入本地目录和元数据。
 3. Upload Queue 根据策略挑选文件。
-4. Uploader 打包或转码后上传对象存储。
+4. Uploader 逐文件直传对象存储；默认不做 zip/tar 打包或二次转码。
 5. 上传状态更新到本地索引。
 
 设计要求：
@@ -106,19 +110,20 @@ flowchart LR
 
 ## 进程划分建议
 
-首版可以先采用较少进程，方便调试：
+首版可以先采用较少进程，但安全关键逻辑不能和媒体编码 pipeline 共故障域：
 
-- `vehicle-agent`：车端主进程，包含采集、编码、WebRTC、控制、安全、录像、上传队列。
+- `vehicle-control-agent`：车端高优先级控制进程，包含 Control Receiver、Safety State Machine、Vehicle Adapter 和本地看门狗。它必须能在媒体 pipeline 卡死或重启时继续执行安全停车。
+- `vehicle-media-agent`：车端媒体进程，包含相机采集、实时编码、WebRTC 媒体和录像分段。若控制暂时复用 WebRTC DataChannel，媒体进程只负责把最新命令通过有界本地 IPC 转交给 `vehicle-control-agent`，不能承载最终安全状态机。
+- `vehicle-uploader`：低优先级上传进程或独立服务，负责上传队列、限速和重试。
 - `driver-console`：驾驶端 Qt 应用。
 - `signaling-server`：云端信令和会话管理服务。
 - `turn-server`：coturn 或等价 TURN 服务。
 
-后续如果车端进程过大，可拆分：
+如果第一阶段为了联调临时放在一个可执行文件内，至少也要把控制/安全放入独立高优先级线程、使用看门狗监测媒体线程卡死，并在设计上保留拆分到独立进程的 IPC 边界。
 
-- `vehicle-media-agent`
-- `vehicle-control-agent`
+后续可继续拆分：
+
 - `vehicle-recorder`
-- `vehicle-uploader`
 
 拆分前提是接口稳定，且有监控和进程监管能力。
 
@@ -154,4 +159,3 @@ flowchart LR
 驾驶端不应直接绕过会话系统控制车辆。所有控制命令必须带有会话身份和控制权验证。
 
 录像上传不属于实时控制路径。上传失败只能影响云端归档状态，不应影响视频预览和控制命令。
-

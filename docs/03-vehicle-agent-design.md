@@ -15,6 +15,8 @@ Vehicle Agent 运行在车端 Ubuntu 工控机，负责：
 - 管理上传队列。
 - 输出运行日志和健康状态。
 
+安全关键职责必须与媒体 pipeline 做故障隔离。首版推荐独立 `vehicle-control-agent` 进程承载 Control Receiver、Safety State Machine 和 Vehicle Adapter；如果联调阶段暂时使用同一可执行文件，也必须使用独立高优先级线程、看门狗和有界队列，确保媒体编码或上传卡死不会阻塞安全停车。
+
 ## 模块划分
 
 ### Config Manager
@@ -95,12 +97,13 @@ Camera Source
 
 处理步骤：
 
-1. 校验会话 ID。
-2. 校验控制权。
-3. 校验序号是否新于最近命令。
-4. 校验时间戳是否未过期。
-5. 更新控制心跳时间。
-6. 将命令交给 Safety State Machine。
+1. 校验 `protocol_version`。
+2. 校验会话 ID。
+3. 校验控制权。
+4. 校验序号是否新于最近命令。
+5. 使用车端本地接收时间更新控制心跳，并基于到达间隔判断命令是否过旧。
+6. 将驾驶端时间戳保留用于审计和延迟估算，不直接用跨机器时钟差做安全判定。
+7. 将命令交给 Safety State Machine。
 
 ### Safety State Machine
 
@@ -110,7 +113,7 @@ Camera Source
 
 - `INIT`：启动中，禁止车辆动作。
 - `STANDBY`：待命，未获得有效控制。
-- `ACTIVE`：控制链路有效，允许下发命令。
+- `CONTROL_ACTIVE`：控制链路有效，允许下发命令。
 - `TIMEOUT_BRAKE`：控制心跳超时，执行安全停车。
 - `ESTOP`：急停锁定，需要人工复位。
 - `FAULT`：车辆或系统故障，禁止继续控制。
@@ -118,10 +121,14 @@ Camera Source
 转换规则：
 
 - `INIT -> STANDBY`：配置加载、通信初始化完成。
-- `STANDBY -> ACTIVE`：会话建立且收到有效控制心跳。
-- `ACTIVE -> TIMEOUT_BRAKE`：超过 `control_timeout_ms` 未收到有效命令。
-- `ACTIVE -> ESTOP`：驾驶端或车端触发急停。
+- `STANDBY -> CONTROL_ACTIVE`：会话建立且收到有效控制心跳。
+- `CONTROL_ACTIVE -> TIMEOUT_BRAKE`：超过 `control_timeout_ms` 未收到有效命令。
+- `CONTROL_ACTIVE -> ESTOP`：驾驶端或车端触发急停。
+- `TIMEOUT_BRAKE -> STANDBY`：车辆停稳且会话已释放或复位流程完成。
+- `ESTOP -> STANDBY`：现场物理确认和授权复位完成。
 - 任意状态 -> `FAULT`：检测到不可恢复故障。
+
+急停必须锁存。车端收到一次 `estop=true` 即进入 `ESTOP`，后续是否继续收到驾驶端急停包不影响锁存状态。解除急停不能只依赖驾驶端 UI 按钮，真实车辆接入前必须定义现场物理确认、授权人和复位记录。
 
 ### Vehicle Adapter
 
@@ -177,6 +184,7 @@ VehicleAdapter
 - 元数据写入 sidecar JSON。
 - 先写临时文件，完成后原子 rename。
 - 磁盘空间低于阈值时停止新增录像或删除最旧已上传文件。
+- 按配置计算目标保留时长。若录像产生速率持续高于上传带宽，应优先保护实时控制和已完成文件完整性，并通过降码率、暂停录像、扩容或只删除已上传文件等策略处理，不能默认删除未上传片段而不告警。
 
 ### Uploader
 
@@ -185,12 +193,13 @@ VehicleAdapter
 能力：
 
 - 扫描待上传文件。
-- 按批次上传。
+- 逐文件上传视频片段和 sidecar 元数据。
 - 上传成功标记。
 - 上传失败退避重试。
 - 限速。
 - 可暂停。
 - 可恢复。
+- 使用预签名 URL 时，在每次上传前检查有效期，过期或即将过期时重新向云端申请凭证。
 
 ## 车端启动顺序
 
@@ -230,4 +239,3 @@ VehicleAdapter
 - 低水位告警。
 - 达到硬阈值后停止录像或删除已上传旧文件。
 - 不允许影响控制安全状态机。
-

@@ -109,6 +109,7 @@ sudo docker run --rm \
 
 - 4 路 720p30 H.264 VAAPI 并发编码。
 - 4 路实时流加 4 路录像流同时运行。
+- H.264 profile/level 与 WebRTC SDP 协商兼容性，特别是 VAAPI High profile 与驾驶端 constrained-baseline 偏好之间的匹配。
 - 长时间运行稳定性，例如 2 小时。
 - CPU/GPU/内存/磁盘 IO/温度。
 - GStreamer 是否能使用 Intel 硬编插件。
@@ -116,4 +117,3 @@ sudo docker run --rm \
 特别注意：
 
 当前 GStreamer 检测中未发现 `vaapih264enc`、`qsvh264enc`、`vah264enc`。因此 FFmpeg 证明了 Intel 硬编能力，但不能自动证明 GStreamer 项目链路已经可用。
-

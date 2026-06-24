@@ -45,12 +45,29 @@ ice:
 
 control:
   rate_hz: 20
-  command_max_age_ms: 200
-  control_timeout_ms: 300
+  freshness_mode: local_receive_interval_and_seq
+  max_command_gap_ms: 200
+  degraded_timeout_ms: 300
+  control_timeout_ms: 800
   timeout_action:
     throttle: 0.0
-    brake: 1.0
-    gear: N
+    deceleration_profile:
+      - after_ms: 0
+        brake: 0.3
+      - after_ms: 500
+        brake: 0.6
+      - after_ms: 1500
+        brake: vehicle_defined_max_safe
+    gear_before_stopped: hold_current_or_vehicle_safe_mode
+    stopped_action:
+      gear: N
+      apply_parking_brake: true
+  estop:
+    latch: true
+    reset_requires_local_confirmation: true
+  time_sync:
+    minimum: ntp
+    ptp_required_for_multicamera_sync: evaluate_later
 
 media:
   realtime_profiles:
@@ -93,14 +110,19 @@ cameras:
 
 recording:
   root_dir: /var/lib/mine-teleop/recordings
+  retention_target_hours: 8
+  capacity_plan_required: true
   min_free_gb: 50
   delete_uploaded_when_below_free_gb: 30
+  delete_unuploaded_when_below_free_gb: false
 
 upload:
   enabled: true
   backend: s3
   max_bandwidth_mbps: 5
-  batch_segments: 20
+  trigger_segments: 20
+  direct_file_upload: true
+  presigned_url_refresh_margin_seconds: 300
   retry_initial_seconds: 10
   retry_max_seconds: 600
 
@@ -144,6 +166,11 @@ control:
 - 证书文件存在。
 - TURN URL 格式合法。
 - 控制超时大于命令周期。
+- 安全停车制动曲线存在且不是单步全力制动。
+- `max_command_gap_ms`、`degraded_timeout_ms`、`control_timeout_ms` 按递增关系配置。
+- 急停锁存和复位策略已配置。
+- 时间同步策略已配置。
+- 录像容量规划已配置，上传限速低于录像产生速率时必须给出保留或降级策略。
 
 ## 热更新
 
@@ -163,4 +190,3 @@ control:
 - 车辆控制适配器。
 - 相机设备列表。
 - 安全停车策略。
-
