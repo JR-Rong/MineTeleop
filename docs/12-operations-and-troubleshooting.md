@@ -232,7 +232,7 @@ journalctl -u mine-teleop-vehicle-agent -f
 
 `signaling-server --serve` 默认绑定 `127.0.0.1`，适合本机开发或由本机反向
 代理转发。若直接绑定 `0.0.0.0`、公网 IP 或其它非回环地址，必须同时提供
-`--tls-cert` 和 `--tls-key`：
+`--tls-cert`、`--tls-key`、驾驶员凭据和车端设备凭据：
 
 ```bash
 python3 signaling-server/signaling_server.py \
@@ -240,7 +240,9 @@ python3 signaling-server/signaling_server.py \
   --host 0.0.0.0 \
   --port 8765 \
   --tls-cert /etc/mine-teleop/tls/signaling.crt \
-  --tls-key /etc/mine-teleop/tls/signaling.key
+  --tls-key /etc/mine-teleop/tls/signaling.key \
+  --driver-credentials /etc/mine-teleop/driver-credentials.json \
+  --device-credentials /etc/mine-teleop/device-credentials.json
 ```
 
 如果使用 nginx、Caddy 或云负载均衡终止 TLS，推荐让 signaling server 继续

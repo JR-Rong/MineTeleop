@@ -282,6 +282,36 @@ class VehicleRecorderUploaderTests(unittest.TestCase):
             audit_events = [json.loads(line)["event"] for line in (root / "audit.jsonl").read_text().splitlines()]
             self.assertIn("upload_failed", audit_events)
 
+    def test_upload_completion_api_failure_marks_retry_wait_instead_of_leaving_uploading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            signaling = SignalingHttpService(audit_log_path=root / "audit.jsonl")
+            with signaling.running() as base_url:
+                recorder = VehicleRecorderUploader(
+                    recording_root=root / "recordings",
+                    queue_state_path=root / "upload-queue.json",
+                    archive_root=root / "archive",
+                    upload_api=_FailingCompletionUploadApi(base_url, "upload_api_unavailable"),
+                    refresh_margin_seconds=300,
+                    retry_initial_seconds=10,
+                )
+                recorder.record_segment(_metadata(segment_id="seg-upload-complete-fail"), payload=b"fake-h264")
+
+                try:
+                    result = recorder.process_once(now_ms=1_000)
+                except OSError as exc:
+                    self.fail(f"process_once should convert completion failures to retry_wait, raised {exc}")
+
+                self.assertEqual(result.action, "failed")
+                self.assertEqual(result.error, "upload_api_unavailable")
+                self.assertEqual(recorder.queue.items[0].status, "retry_wait")
+                self.assertEqual(recorder.queue.items[0].last_error, "upload_api_unavailable")
+                self.assertEqual(recorder.queue.items[0].next_retry_at_ms, 11_000)
+                self.assertEqual(recorder.process_once(now_ms=10_999).action, "wait")
+
+            audit_events = [json.loads(line)["event"] for line in (root / "audit.jsonl").read_text().splitlines()]
+            self.assertIn("upload_failed", audit_events)
+
     def test_upload_bandwidth_limit_defers_next_segment_without_marking_it_uploading(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -734,6 +764,15 @@ class _FailingArchiveUploader:
         self.error = error
 
     def upload(self, **kwargs):
+        raise OSError(self.error)
+
+
+class _FailingCompletionUploadApi(UploadApiClient):
+    def __init__(self, base_url, error):
+        super().__init__(base_url)
+        self.error = error
+
+    def mark_uploaded(self, segment_id, object_path, bytes_uploaded):
         raise OSError(self.error)
 
 

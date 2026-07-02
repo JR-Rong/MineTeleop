@@ -312,18 +312,18 @@ class VehicleRecorderUploader:
                 upload_url=item.upload_url,
                 metadata_upload_url=item.metadata_upload_url,
             )
+            bytes_uploaded = video_path.stat().st_size
+            metadata_bytes_uploaded = metadata_path.stat().st_size
+            # Confirm with the Upload API BEFORE flipping the local "uploaded" state,
+            # which is what makes a segment eligible for retention deletion. A crash
+            # between a local flip and server confirmation must never delete a segment
+            # the cloud never acknowledged.
+            self.upload_api.mark_uploaded(item.segment_id, item.object_path, bytes_uploaded)
+            if item.metadata_object_path:
+                self.upload_api.mark_uploaded(item.segment_id, item.metadata_object_path, metadata_bytes_uploaded)
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
             return self._mark_upload_failed(item, metadata_object_path, error, now_ms)
-        bytes_uploaded = video_path.stat().st_size
-        metadata_bytes_uploaded = metadata_path.stat().st_size
-        # Confirm with the Upload API BEFORE flipping the local "uploaded" state,
-        # which is what makes a segment eligible for retention deletion. A crash
-        # between a local flip and server confirmation must never delete a segment
-        # the cloud never acknowledged.
-        self.upload_api.mark_uploaded(item.segment_id, item.object_path, bytes_uploaded)
-        if item.metadata_object_path:
-            self.upload_api.mark_uploaded(item.segment_id, item.metadata_object_path, metadata_bytes_uploaded)
         update_segment_upload_state(metadata_path, "uploaded")
         if archive_result.metadata_object_path is not None:
             update_segment_upload_state(archive_result.metadata_object_path, "uploaded")

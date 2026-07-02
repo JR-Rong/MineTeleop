@@ -27,6 +27,7 @@ RUN groupadd --system mineteleop \
     && useradd --system --gid mineteleop --home-dir /opt/mine-teleop --shell /usr/sbin/nologin mineteleop \
     && (getent group video || groupadd --system video) \
     && (getent group render || groupadd --system render) \
-    && usermod -aG video,render mineteleop
+    && usermod -aG video,render mineteleop \
+    && mkdir -p /var/lib/mine-teleop/recordings /var/lib/mine-teleop/uploader \
+    && chown -R mineteleop:mineteleop /var/lib/mine-teleop
 USER mineteleop
-

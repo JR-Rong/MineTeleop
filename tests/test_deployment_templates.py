@@ -9718,6 +9718,10 @@ sys.exit(1)
         self.assertIn("vainfo", dockerfile)
         self.assertIn("intel-media-va-driver", dockerfile)
         self.assertIn("gstreamer1.0-tools", dockerfile)
+        self.assertIn("/var/lib/mine-teleop/recordings", dockerfile)
+        self.assertIn("/var/lib/mine-teleop/uploader", dockerfile)
+        self.assertIn("chown -R mineteleop:mineteleop /var/lib/mine-teleop", dockerfile)
+        self.assertIn("USER mineteleop", dockerfile)
 
         media = compose["services"]["vehicle-media-agent"]
         devices = set(media["devices"])
@@ -9738,6 +9742,15 @@ sys.exit(1)
         self.assertLess(uploader["cpu_shares"], agent["cpu_shares"])
         self.assertLess(uploader["cpu_shares"], media["cpu_shares"])
         self.assertIn("--service-mode", uploader["command"])
+
+    def test_signaling_tls_docs_include_required_identity_credentials(self):
+        docs = Path("docs/12-operations-and-troubleshooting.md").read_text(encoding="utf-8")
+        section = docs.split("### Signaling TLS", 1)[1].split("### Identity Credentials", 1)[0]
+
+        self.assertIn("--tls-cert /etc/mine-teleop/tls/signaling.crt", section)
+        self.assertIn("--tls-key /etc/mine-teleop/tls/signaling.key", section)
+        self.assertIn("--driver-credentials /etc/mine-teleop/driver-credentials.json", section)
+        self.assertIn("--device-credentials /etc/mine-teleop/device-credentials.json", section)
 
     def test_vehicle_container_template_uses_deployed_vehicle_config(self):
         compose = yaml.safe_load(Path("deployments/container/docker-compose.vehicle.yml").read_text(encoding="utf-8"))
