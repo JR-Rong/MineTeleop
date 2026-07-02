@@ -1,0 +1,18 @@
+[Unit]
+Description=Mine Teleop signaling server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mine-teleop
+EnvironmentFile=/etc/mine-teleop/mine-teleop.env
+LogsDirectory=mine-teleop
+ExecStart=/usr/bin/python3 /opt/mine-teleop/signaling-server/signaling_server.py --serve --host 127.0.0.1 --vehicle-config /etc/mine-teleop/vehicle-agent.yaml --audit-log /var/log/mine-teleop/signaling-audit.jsonl
+Restart=on-failure
+RestartSec=2
+StandardOutput=append:/var/log/mine-teleop/signaling-server.log
+StandardError=append:/var/log/mine-teleop/signaling-server.log
+
+[Install]
+WantedBy=multi-user.target

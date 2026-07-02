@@ -1,0 +1,91 @@
+services:
+  vehicle-agent:
+    build:
+      context: ../..
+      dockerfile: deployments/container/Dockerfile.media
+    working_dir: /opt/mine-teleop
+    command:
+      - python3
+      - vehicle-agent/vehicle_agent.py
+      - --run-loop
+      - --config
+      - /etc/mine-teleop/vehicle-agent.yaml
+    volumes:
+      - ../..:/opt/mine-teleop:ro
+      - /etc/mine-teleop:/etc/mine-teleop:ro
+      - mine-teleop-recordings:/var/lib/mine-teleop/recordings
+    cpus: "1.0"
+    cpu_shares: 1024
+    mem_limit: "1g"
+    restart: on-failure
+
+  vehicle-media-agent:
+    build:
+      context: ../..
+      dockerfile: deployments/container/Dockerfile.media
+    working_dir: /opt/mine-teleop
+    command:
+      - python3
+      - vehicle-media-agent/vehicle_media_agent.py
+      - --config
+      - /etc/mine-teleop/vehicle-agent.yaml
+      - --mode
+      - pipeline
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+      - /dev/dri/card1:/dev/dri/card1
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+    volumes:
+      - ../..:/opt/mine-teleop:ro
+      - /etc/mine-teleop:/etc/mine-teleop:ro
+      - mine-teleop-recordings:/var/lib/mine-teleop/recordings
+    cpus: "2.0"
+    cpu_shares: 2048
+    mem_limit: "2g"
+    restart: on-failure
+
+  vehicle-uploader:
+    build:
+      context: ../..
+      dockerfile: deployments/container/Dockerfile.media
+    working_dir: /opt/mine-teleop
+    command:
+      - python3
+      - vehicle-uploader/vehicle_uploader.py
+      - --service-mode
+      - --config
+      - /etc/mine-teleop/vehicle-agent.yaml
+      - --work-dir
+      - /var/lib/mine-teleop/uploader
+    volumes:
+      - ../..:/opt/mine-teleop:ro
+      - /etc/mine-teleop:/etc/mine-teleop:ro
+      - mine-teleop-recordings:/var/lib/mine-teleop/recordings
+      - mine-teleop-uploader:/var/lib/mine-teleop/uploader
+    cpus: "1.0"
+    cpu_shares: 256
+    mem_limit: "1g"
+    restart: on-failure
+
+  turn-server:
+    image: coturn/coturn:4.6.2
+    command:
+      - turnserver
+      - -c
+      - /etc/mine-teleop/turnserver.conf
+      - --no-cli
+    ports:
+      - "3478:3478/udp"
+      - "5349:5349/udp"
+      - "49152-49200:49152-49200/udp"
+    volumes:
+      - ../turnserver/turnserver.conf.template:/etc/mine-teleop/turnserver.conf:ro
+      - ../tls:/etc/mine-teleop/tls:ro
+    cpus: "1.0"
+    mem_limit: "512m"
+    restart: on-failure
+
+volumes:
+  mine-teleop-recordings:
+  mine-teleop-uploader:

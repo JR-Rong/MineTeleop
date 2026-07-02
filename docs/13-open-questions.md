@@ -4,9 +4,15 @@
 
 ## 车辆控制接口
 
-待确认：
+已确认的首个接入路径：
 
-- 最终是 CAN、动态库、串口、以太网，还是其他接口。
+- 使用 `/Volumes/SystemDisk/Workspace/ChassisControl` 的 ChassisControl 动态库作为首个真实底盘控制接入目标。
+- ChassisControl checkout 以 `UI_Test` 分支为当前集成基线。
+- `/Volumes/SystemDisk/Workspace/MinePilot` 的 `merge_ui_test` 分支提供低层 CAN、`can_db`、`can_receiver` 和 `can_sender` 来源。
+- `mine-teleop` 通过仓库内 ChassisControl C shim bridge 调用底层库，并通过 MinePilot CAN DB/receiver 拉取 decoded CAN feedback；目标 CAN 主机仍需完成真实构建、SocketCAN/CAN 卡和底盘联调验证。
+
+仍待确认：
+
 - 控制指令单位和范围。
 - 档位枚举。
 - 转向是角度、角速度还是归一化控制。

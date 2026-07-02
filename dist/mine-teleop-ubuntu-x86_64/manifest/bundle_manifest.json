@@ -1,0 +1,19 @@
+{
+  "docs": [
+    "docs/15-ubuntu-bundle-software.md",
+    "docs/16-ubuntu-bundle-usage.md",
+    "docs/17-ubuntu-bundle-architecture.md"
+  ],
+  "dynamic_libraries": [
+    "lib/libmine_teleop_chassis_bridge.so",
+    "lib/libchassis_control.so"
+  ],
+  "event": "mine_teleop_ubuntu_bundle",
+  "executable": "bin/mine-teleop",
+  "smoke_commands": [
+    "bin/mine-teleop --list",
+    "bin/mine-teleop vehicle-agent --config /etc/mine-teleop/vehicle-agent.yaml --adapter-status",
+    "bin/mine-teleop target-host-validation-plan --format shell"
+  ],
+  "target_platform": "linux/amd64"
+}

@@ -1,0 +1,132 @@
+vehicle:
+  id: vehicle-001
+  name: mine-truck-001
+
+cloud:
+  signaling_url: ws://127.0.0.1:8765/signaling
+  auth_url: http://127.0.0.1:8765/auth
+
+ice:
+  stun_servers:
+    - stun:127.0.0.1:3478
+  turn_servers: []
+
+control:
+  rate_hz: 20
+  freshness_mode: local_receive_interval_and_seq
+  max_command_gap_ms: 200
+  degraded_timeout_ms: 300
+  control_timeout_ms: 800
+  timeout_action:
+    throttle: 0.0
+    deceleration_profile:
+      - after_ms: 0
+        brake: 0.3
+      - after_ms: 500
+        brake: 0.6
+      - after_ms: 1500
+        brake: vehicle_defined_max_safe
+  estop:
+    latch: true
+    reset_requires_local_confirmation: true
+  time_sync:
+    minimum: ntp
+
+media:
+  realtime_profiles:
+    realtime_720p:
+      codec: h264
+      encoder: vaapi
+      width: 1280
+      height: 720
+      fps: 30
+      bitrate_kbps: 3000
+      keyframe_interval_frames: 30
+      low_latency: true
+    realtime_480p15:
+      codec: h264
+      encoder: vaapi
+      width: 854
+      height: 480
+      fps: 15
+      bitrate_kbps: 1200
+      keyframe_interval_frames: 30
+      low_latency: true
+  record_profiles:
+    record_source_h264:
+      codec: h264
+      encoder: vaapi
+      width: source
+      height: source
+      fps: source
+      bitrate_kbps: 8000
+      segment_seconds: 60
+
+cameras:
+  - id: front
+    enabled: true
+    device: testsrc
+    capture_width: 1920
+    capture_height: 1080
+    capture_fps: 30
+    realtime_profile: realtime_720p
+    record_profile: record_source_h264
+  - id: rear
+    enabled: false
+    device: testsrc
+    capture_width: 1920
+    capture_height: 1080
+    capture_fps: 30
+    realtime_profile: realtime_720p
+    record_profile: record_source_h264
+
+hardware:
+  can:
+    interface: can0
+    bitrate: 500000
+    restart_ms: 100
+    probe_timeout_seconds: 3
+  encoding:
+    vaapi_render_device: /dev/dri/renderD128
+    dri_card_device: /dev/dri/card1
+    require_hardware_encoder: true
+    gstreamer_hardware_plugins:
+      - vaapih264enc
+      - qsvh264enc
+      - vah264enc
+      - nvh264enc
+    gstreamer_fallback_plugins:
+      - x264enc
+    ffmpeg_probe_output_dir: /tmp/mine-teleop-vaapi
+    validation_duration_seconds: 5
+  network:
+    interface: wwan0
+
+field_safety:
+  commissioning_mode: bench
+  max_speed_kph: 40
+  require_can_feedback_before_control: true
+  require_local_estop_reset: true
+  require_time_sync: true
+
+recording:
+  root_dir: .local/recordings
+  retention_target_hours: 8
+  min_free_gb: 5
+  delete_uploaded_when_below_free_gb: 2
+  delete_unuploaded_when_below_free_gb: false
+  upload_lag_policy: alert_and_preserve_uploaded_only
+
+upload:
+  enabled: true
+  backend: local_archive
+  max_bandwidth_mbps: 5
+  trigger_segments: 20
+  trigger_network_idle: true
+  direct_file_upload: true
+  presigned_url_refresh_margin_seconds: 300
+  retry_initial_seconds: 10
+  retry_max_seconds: 600
+
+vehicle_adapter:
+  type: mock

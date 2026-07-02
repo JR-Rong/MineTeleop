@@ -36,6 +36,9 @@ realtime_profile:
 H.264 是首版推荐，因为驾驶端兼容性最好。H.265/HEVC 码率更低，但解码兼容性、浏览器支持和部分硬件支持更复杂，不建议第一版实时流直接强依赖。
 
 需要单独确认 WebRTC H.264 profile 协商。当前硬件验证看到 VAAPI 支持 H.264 High profile，但部分 WebRTC 端默认偏好 constrained-baseline。首版实现必须在 SDP 协商、编码器 profile/level 和驾驶端解码能力之间做一致性验证，避免编码成功但驾驶端无法接收或解码。
+本地 SDP 校验只接受 `a=rtpmap` 明确声明为 H264 的 payload type 对应
+`a=fmtp` 中的 `profile-level-id`，避免把 VP8/其它 codec 的同名参数误当成
+H.264 能力。
 
 ### 低延迟原则
 
@@ -46,6 +49,10 @@ H.264 是首版推荐，因为驾驶端兼容性最好。H.265/HEVC 码率更低
 - 拥塞时丢旧帧。
 - 使用 UDP 优先的 WebRTC 路径。
 - TURN 兜底节点必须支持 UDP。
+
+本地参考实现会保留实时 profile 的 `keyframe_interval_frames`，并把该值写入
+GStreamer 实时编码器参数：VAAPI/QSV 使用 `keyframe-period`，x264 使用
+`key-int-max`。
 
 ## 多路相机
 
@@ -108,6 +115,10 @@ record_profiles:
 - 典型和最差 5G 上行带宽。
 - 上传追不上时的处理策略：降录像码率、暂停上传以保护实时链路、扩大磁盘、只删除已上传文件、或在明确告警后接受未上传片段丢弃。
 
+本地水位策略默认只删除 `upload_state=uploaded` 的片段；若现场配置显式允许
+删除未上传片段，返回动作必须标记为 `deleted_unuploaded_segments`，并带
+`explicit unuploaded deletion policy` 原因，避免运维误认为只是普通已上传清理。
+
 ### 文件组织
 
 建议：
@@ -140,6 +151,7 @@ record_profiles:
   "height": 1080,
   "fps": 30,
   "file_size_bytes": 64000000,
+  "video_sha256": "4b8c...",
   "upload_state": "pending"
 }
 ```
@@ -156,6 +168,27 @@ record_profiles:
 - 网络空闲时上传。
 
 触发策略只决定何时调度上传；默认上传单位是单个视频片段和对应 sidecar 元数据，不做 zip/tar 打包。
+本地 uploader 会接入数量、累计字节、等待时间和网络空闲四类触发条件；
+`network_idle` 由调用方根据链路策略传入，真实 5G modem/网络空闲采样仍需车端环境接入。
+
+本地 recorder/uploader 闭环会同时申请 video 和 metadata 两类上传凭证，
+队列持久化两个对象路径，以及视频文件和 sidecar 元数据文件的 SHA-256
+校验值和 `enqueued_at_ms` 入队时间；上传调度的时间窗口按最早 pending
+片段的入队时间计算。上传成功后分别登记视频片段和 sidecar 元数据，并将源
+sidecar 与归档 sidecar 的 `upload_state` 原子更新为 `uploaded`。
+`upload.backend=s3` 时，车端会把视频和 sidecar 直接 HTTP PUT 到签发的
+URL；`local_archive` 后端只用于本地开发归档。
+当 `upload.enabled=false` 时，本地录像和 sidecar 写入保持可用，但 uploader
+不会申请凭证、入队、扫描 pending sidecar 或执行上传；单次调度返回
+`disabled`。
+部署入口必须使用 `vehicle-uploader --service-mode`，从
+`recording.root_dir` 扫描已有 pending sidecar，并把队列状态和本地归档写入
+独立 work dir；默认不带 `--service-mode` 的入口只用于本地闭环 demo，会创建
+演示片段后退出。目标主机 smoke 可加 `--process-once --json`，把单次调度结果
+输出为 `vehicle_uploader_process_once` JSONL 证据，便于归档报告区分
+`uploaded`、`idle`、`wait`、`disabled` 和 `failed`。
+本地归档适配器会校验对象路径必须落在归档根目录内，拒绝 `../` 或绝对路径
+造成的目录逃逸。
 
 ### 上传状态
 
@@ -185,6 +218,22 @@ record_profiles:
 - 车端检测 5G 网络质量差时暂停上传。
 - 实时流码率可动态降低。
 - 上传限速必须与录像产生速率一起评估。若限速长期低于产生速率，系统必须进入明确降级或告警状态，而不是无限堆积队列。
+
+本地参考实现提供上传网络质量策略：基于连接状态、RTT、抖动、丢包率和
+上行带宽样本输出暂停/恢复决策，调用方可用该 reason 驱动上传队列
+`pause()`；真实 5G modem/链路样本采集仍需在车端环境接入。
+部署模板还会把 uploader 降为低 CPU/IO 调度优先级：systemd 使用较低
+`CPUWeight`/`IOWeight` 和 idle IO 调度，容器模板使用低于 control/media 的
+`cpu_shares`，避免大文件上传与实时控制和媒体 pipeline 争抢调度优先级。
+
+本地参考实现同时提供实时流码率自适应策略：RTT 或丢包超阈值时按比例
+下调且不低于下限，网络恢复后逐步上调到目标码率；并提供实时媒体 runtime
+controller，把允许的实时 profile 码率更新转成命名 encoder 的 `bitrate`
+property update，并通过 GStreamer pipeline property setter 绑定到命名元素。
+弱网需要进一步降级时，runtime 也提供 profile 级策略，可在已声明的实时
+profile 之间按顺序从 720p30 下切到 480p15 等低帧率/低分辨率档位，并在
+网络恢复后上切；profile 切换通过显式 pipeline hook 成功后才更新活动状态。
+真实 GStreamer/WebRTC 主循环仍需在目标 Ubuntu 工控机做端到端验证。
 
 ## 4 路编码压力验证
 

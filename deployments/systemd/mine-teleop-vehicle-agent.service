@@ -1,0 +1,20 @@
+[Unit]
+Description=Mine Teleop vehicle control agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mine-teleop
+EnvironmentFile=/etc/mine-teleop/mine-teleop.env
+LogsDirectory=mine-teleop
+ExecStartPre=/usr/bin/python3 /opt/mine-teleop/vehicle-agent/vehicle_agent.py --config /etc/mine-teleop/vehicle-agent.yaml --preflight --hardware-device /dev/dri/renderD128 --hardware-device /dev/dri/card1
+ExecStartPre=/usr/bin/python3 /opt/mine-teleop/vehicle-agent/vehicle_agent.py --config /etc/mine-teleop/vehicle-agent.yaml --adapter-status
+ExecStart=/usr/bin/python3 /opt/mine-teleop/vehicle-agent/vehicle_agent.py --run-loop --config /etc/mine-teleop/vehicle-agent.yaml
+Restart=on-failure
+RestartSec=2
+StandardOutput=append:/var/log/mine-teleop/vehicle-agent.log
+StandardError=append:/var/log/mine-teleop/vehicle-agent.log
+
+[Install]
+WantedBy=multi-user.target

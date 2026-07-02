@@ -31,6 +31,17 @@ Vehicle Agent 运行在车端 Ubuntu 工控机，负责：
 - 输出最终生效配置到日志。
 - 支持后续热更新部分非危险配置。
 
+本地参考实现提供 `effective_vehicle_config_log_payload`，用于生成可
+JSON 序列化的最终生效配置摘要，并把设备证书、密钥和 TURN 凭据等敏感
+字段只标记为已配置/未配置，避免启动日志泄露路径或密钥内容。
+`vehicle-agent/vehicle_agent.py` 启动加载配置后会先输出一条
+`effective_vehicle_config` JSONL 记录，供 preflight、run-loop 和本地 demo
+归档使用。
+`--adapter-status` 会打开配置的 VehicleAdapter 并输出
+`vehicle_adapter_status`；联调真实 C shim 时可加 `--poll-feedback` 输出
+`vehicle_adapter_feedback_poll`，再加 `--require-feedback` 要求必须收到一帧
+MinePilot decoded CAN feedback，否则进程返回非 0，供目标 CAN 主机验收归档。
+
 危险配置如车辆控制适配器、设备证书路径、车辆 ID，不建议运行时热更新。
 
 ### Camera Manager
@@ -52,6 +63,13 @@ CameraSource
 - `V4L2CameraSource`：接 USB 或 V4L2 兼容设备。
 - `TestPatternSource`：用于无相机开发联调。
 - `FileReplaySource`：用于回放测试。
+
+本地参考实现支持 `V4L2CameraSource` 的设备路径校验和 GStreamer source
+片段生成；真实 USB/V4L2 相机采集仍需在 Ubuntu 工控机和目标相机上验证。
+
+本地参考实现支持 JSONL 格式的 `FileReplaySource`。每行是一帧，字段为
+`seq`、`width`、`height`、`timestamp_ms` 和 `pattern`；回放耗尽时该路
+相机进入明确错误，其他相机仍由 supervisor 继续轮询。
 
 后续实现：
 
@@ -128,7 +146,7 @@ Camera Source
 - `ESTOP -> STANDBY`：现场物理确认和授权复位完成。
 - 任意状态 -> `FAULT`：检测到不可恢复故障。
 
-急停必须锁存。车端收到一次 `estop=true` 即进入 `ESTOP`，后续是否继续收到驾驶端急停包不影响锁存状态。解除急停不能只依赖驾驶端 UI 按钮，真实车辆接入前必须定义现场物理确认、授权人和复位记录。
+急停必须锁存。车端收到一次 `estop=true` 即进入 `ESTOP`，后续是否继续收到驾驶端急停包不影响锁存状态。解除急停不能只依赖驾驶端 UI 按钮。本地参考实现要求复位调用带本地确认和授权人，并写入 `estop_reset` 审计事件；真实车辆接入前必须定义现场物理确认、授权人和复位记录。
 
 ### Vehicle Adapter
 
@@ -142,6 +160,7 @@ VehicleAdapter
   close()
   applyControl(command)
   applySafeStop()
+  pollFeedback()
   readTelemetry()
   getStatus()
 ```
@@ -149,11 +168,37 @@ VehicleAdapter
 首版实现：
 
 - `MockVehicleAdapter`：打印/记录控制命令，不接真实车辆。
+- 本地参考实现只允许 `vehicle_adapter.type=mock` 直接创建可运行适配器；`can` 和 `dynamic_library` 必须先在配置中声明控制单位、档位、心跳、安全停车、急停、命令确认和 telemetry 字段契约，并提供 `control.timeout_calibration` 标定证据。配置为 `abi: c_shim` 且声明 `bridge_library_path` 后，`can` 与 `dynamic_library` 都可通过 ChassisControl bridge 创建真实 adapter；缺少 bridge 时必须启动失败，不能静默退回 Mock。
+- `vehicle-agent` 的无模式默认闭环是开发 Mock demo，只能在 `vehicle_adapter.type=mock`
+  配置下运行。真实 adapter 配置必须显式走 `--run-loop` 或 `--adapter-status`；
+  否则进程返回非 0 并输出 `vehicle_agent_mode_error`，避免目标机误以为真实底盘链路已经启动。
+- `dynamic_library` 的首个真实接入目标是 `/Volumes/SystemDisk/Workspace/ChassisControl` 的 `chassis_control` 动态库和 `/Volumes/SystemDisk/Workspace/MinePilot` 的低层 CAN、`can_db`/receiver/sender。车端 Python 层通过稳定 C shim ABI 下发 ChassisControl 调用意图；由于该库当前暴露 C++ API，实际加载前必须提供 C++ bridge/C shim 来封装 `Initialize`、`UpdateVehicleState`、`RunArmingStateMachine`、`SendCanMessage` 和当前动态库导出的 `EmergencyStopWheels`，并把它封装为稳定 C ABI `mine_teleop_chassis_emergency_stop`。仓库内的 `deployments/chassis-control-bridge/` 提供 bridge 模板。
 
 后续实现：
 
-- `CanVehicleAdapter`：通过 SocketCAN 或厂商 CAN 卡 SDK。
-- `DynamicLibraryVehicleAdapter`：调用封装好的 `.so` 动态库。
+- `CanVehicleAdapter`：当前可通过 ChassisControl C shim 间接使用 SocketCAN/厂商 CAN 后端；后续若需要绕过 ChassisControl，可再增加直接 SocketCAN 或厂商 CAN 卡 SDK adapter。
+
+本地参考实现已提供 ChassisControl C shim 接入路径：配置为
+`abi: c_shim` 且声明 `bridge_library_path` 后，`can` 与 `dynamic_library` 可通过 `ctypes` 调用
+`deployments/chassis-control-bridge/` 导出的稳定 C ABI；该 ABI 由
+`mine_teleop_chassis_bridge.h` 声明，供目标主机编译、Python `ctypes` 结构和联调审查共用。该路径已覆盖控制下发、
+急停、CAN feedback polling、telemetry 读取、adapter `get_status()` 打开/健康/错误状态与下发计数快照和 MinePilot decoded CAN feedback 转发；当链接 MinePilot
+提供的 `libchassis_control` 时，bridge CMake 会校验 MinePilot 的
+`include/can/can_common.h`、`include/can/can_message.h`、`can_db.h`、
+`can_receiver.h` 和 `can_sender.h` 均存在，并选择 MinePilot 的
+`chassis_control.h` 作为 ABI 头根，并把 decoded CAN 中的 4 路转向角反馈传给
+支持 `eps_angle` 的 ChassisControl arming feedback，缺失转向角以 NaN 标记，避免
+误判车轮已回正。目标 Ubuntu 车辆主机仍需完成真实 `.so` 构建、SocketCAN/CAN
+卡和底盘联调验证。
+车端长期控制服务和 `vehicle-agent --run-loop` 摘要也只读取 adapter `get_status()`
+中的 `applied_command_count`，避免真实 C shim adapter 运行路径依赖 Mock 专用的
+内部命令列表。
+`scripts/chassis_bridge_check.py` 默认校验 ChassisControl checkout 位于
+`UI_Test` 分支、MinePilot checkout 位于 `merge_ui_test` 分支，并确认
+MinePilot 的 `can_db.h`、`can_receiver.h`、`can_sender.h`、
+`include/can/can_common.h`、`include/can/can_message.h`、`src/can_db.cpp`、
+`src/can_receiver.cpp`、`src/can_sender.cpp` 和
+`libchassis_control` 可被 bridge CMake 选中。
 
 ### Telemetry Publisher
 
@@ -172,6 +217,11 @@ VehicleAdapter
 - 视频码率。
 - 编码 fps。
 - CPU/GPU/内存/磁盘占用。
+
+本地参考实现的 `TelemetryPublisher` 保留每路视频状态中的 `fault` 和
+`encoder` 字段，并把系统 `fault_flags` 与每路视频故障聚合到顶层
+`fault_flags`，例如 `video.front.hardware_encoder_unavailable`。Mock
+Telemetry 仍明确标记为非真实车辆反馈。
 
 ### Recorder
 
@@ -201,6 +251,19 @@ VehicleAdapter
 - 可恢复。
 - 使用预签名 URL 时，在每次上传前检查有效期，过期或即将过期时重新向云端申请凭证。
 
+本地 `VehicleRecorderUploader.scan_pending_segments()` 会扫描录像根目录下
+`upload_state=pending` 且视频文件仍存在的 sidecar，重新向 Upload API 申请
+video/metadata 两类凭证后恢复上传队列；已在队列中的片段不会重复入队。
+`process_once()` 在队列无可执行项时会先触发一次扫描，再决定上传或返回
+`idle`。通过 `from_config()` 创建的 uploader 会把 `upload.trigger_segments`、
+`upload.trigger_bytes_mb` 和 `upload.trigger_interval_seconds` 接入实际调度；
+未达到触发条件时保持 `pending` 并返回 `wait`。
+当 `upload.enabled=false` 时，recorder 仍写入视频和 sidecar，但不会申请上传
+凭证、不会把片段加入上传队列，也不会扫描历史 pending sidecar；`process_once()`
+返回 `disabled`。
+上传目标写入或对象存储适配器抛出 IO 异常时，uploader 会登记失败并进入
+`retry_wait`，而不是把片段留在 `uploading` 状态。
+
 ## 车端启动顺序
 
 1. 加载配置。
@@ -213,6 +276,13 @@ VehicleAdapter
 8. 进入待命状态。
 9. 会话建立后启动实时推流和控制接收。
 10. 根据配置启动录像和上传队列。
+
+本地参考实现提供只读 `VehiclePreflightChecker`：启动前检查启用相机设备、
+录像目录写权限和指定硬编设备节点，输出每项 `ready`、`missing`、
+`not_readable` 或 `not_writable` 状态，不自动修改权限或创建系统设备。
+`vehicle-agent --preflight --hardware-device /dev/dri/renderD128` 会以 JSONL
+输出汇总和逐项检查；全部检查 ready/skipped 时返回 0，否则返回 2，便于
+systemd `ExecStartPre` 或部署脚本阻止带缺失设备的真实车端启动。
 
 ## 车端异常处理
 
@@ -228,10 +298,28 @@ VehicleAdapter
 - 如果硬编失败，可按配置降级 CPU 编码。
 - 降级必须写日志和上报状态。
 
+本地参考实现提供 `MediaFaultRecoveryPolicy`：watchdog 判定单路 pipeline
+卡死后生成 `restart_camera_pipeline` 恢复动作、`media_pipeline_restart_requested`
+组件日志和该相机的 `reconnecting` 视频状态；硬编失败且存在 CPU fallback
+时生成 `fallback_encoder` 动作、`media_encoder_fallback` 组件日志和
+`degraded` 视频状态。`MediaFaultRecoveryExecutor` 可把这些决策绑定到媒体主循环
+控制器的 `restart_camera_pipeline(camera_id)` 和
+`switch_camera_encoder(camera_id, encoder)` 方法；真实 GStreamer pipeline 重启和
+编码器切换仍需在目标车端运行时端到端验证。
+
 ### 网络异常
 
 - 信令断开：尝试重连。
 - 媒体断开：尝试 ICE restart 或重建会话。
+
+本地参考实现提供 `RealtimeConnectionRecoveryPolicy`：信令断开时生成
+`reconnect_signaling` 决策、退避延迟和 `signaling_reconnect_requested`
+组件日志；媒体断开时先生成 `ice_restart` 决策，超过配置次数后生成
+`rebuild_session` 决策，并分别写入 `media_ice_restart_requested` 或
+`media_session_rebuild_requested` 组件日志。`RealtimeConnectionRecoveryExecutor`
+可把这些决策绑定到实时连接控制器的 `reconnect_signaling(retry_delay_ms)`、
+`restart_ice(camera_id)` 和 `rebuild_media_session(camera_id)` 方法；真实
+WebRTC reconnect、ICE restart 和 session rebuild 操作仍需目标运行时端到端验证。
 - 控制心跳超时：立即安全停车。
 
 ### 磁盘异常

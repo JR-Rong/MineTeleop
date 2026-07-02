@@ -28,14 +28,20 @@
 
 字段说明：
 
-- `protocol_version`：控制协议版本，用于车端/驾驶端兼容性检查。
-- `seq`：单调递增，用于丢弃乱序旧命令。
-- `ts_ms`：驾驶端生成时间，用于审计、日志对齐和延迟估算；安全判定不能直接依赖两端系统时钟差。
-- `gear`：档位，具体枚举待车辆接口确认。
-- `steering`：归一化转向，范围 `[-1.0, 1.0]`。
-- `throttle`：归一化油门，范围 `[0.0, 1.0]`。
-- `brake`：归一化刹车，范围 `[0.0, 1.0]`。
-- `estop`：急停。
+- `protocol_version`：控制协议版本，必须是 JSON integer，用于车端/驾驶端兼容性检查。
+- `vehicle_id`：目标车辆 ID，必须是 JSON string。
+- `session_id`：当前控制会话 ID，必须是 JSON string。
+- `seq`：单调递增的非负 JSON integer，用于丢弃乱序旧命令。
+- `ts_ms`：驾驶端生成时间，必须是 JSON integer，用于审计、日志对齐和延迟估算；安全判定不能直接依赖两端系统时钟差，明显偏斜时只记录 warning。
+- `gear`：档位，必须是 JSON string，具体枚举待车辆接口确认。
+- `steering`：归一化转向，必须是 JSON number，范围 `[-1.0, 1.0]`。
+- `throttle`：归一化油门，必须是 JSON number，范围 `[0.0, 1.0]`。
+- `brake`：归一化刹车，必须是 JSON number，范围 `[0.0, 1.0]`。
+- `estop`：急停，必须是 JSON boolean，不能用 `"true"`/`"false"` 字符串。
+- `authority_token`：可选控制权令牌；如果出现，必须是 JSON string。
+
+控制命令中的 JSON string、number、integer 和 boolean 字段不能互相用字符串、
+布尔值或数字代替。
 
 ## 发送频率
 
@@ -126,6 +132,7 @@ control:
 - 车端收到一次 `estop=true` 即锁存进入 `ESTOP`，不依赖驾驶端持续发包。
 - 急停进入后，控制输出必须进入车辆定义的急停/安全停车策略。
 - 急停解除必须走显式复位流程，不应只靠驾驶端按钮。
+- 本地参考实现中，车端控制服务只接受带本地确认和授权人的复位调用，复位成功后写入 `estop_reset` 审计事件。
 - 真实车辆接入前必须定义谁有权解除、是否必须现场物理确认、是否需要双人确认、如何记录审计日志。
 
 ## Telemetry
@@ -167,7 +174,7 @@ control:
 后续：
 
 - `CanVehicleAdapter`
-- `DynamicLibraryVehicleAdapter`
+- `DynamicLibraryVehicleAdapter` 的本地 C shim 路径已实现，目标车辆主机仍需联调验证。
 
 真实车辆接入前必须补充：
 
