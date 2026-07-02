@@ -144,7 +144,9 @@ class ChassisControlCommandMapper:
             target_speed = 0.0
             target_accel = -safe_brake * self.max_decel_mps2
         else:
-            target_speed = safe_throttle * self.max_speed_mps
+            # Braking must also lower the commanded target velocity, otherwise the
+            # chassis receives a "drive fast" target together with a hard decel.
+            target_speed = safe_throttle * (1.0 - safe_brake) * self.max_speed_mps
             target_accel = safe_throttle * self.max_accel_mps2 - safe_brake * self.max_decel_mps2
         steering_angle = _clamp(steering, -1.0, 1.0) * self.max_steering_rad
         vehicle_state = ChassisControlVehicleStateIntent(

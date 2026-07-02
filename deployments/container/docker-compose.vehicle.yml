@@ -4,6 +4,10 @@ services:
       context: ../..
       dockerfile: deployments/container/Dockerfile.media
     working_dir: /opt/mine-teleop
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
     command:
       - python3
       - vehicle-agent/vehicle_agent.py
@@ -24,6 +28,10 @@ services:
       context: ../..
       dockerfile: deployments/container/Dockerfile.media
     working_dir: /opt/mine-teleop
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
     command:
       - python3
       - vehicle-media-agent/vehicle_media_agent.py
@@ -50,6 +58,10 @@ services:
       context: ../..
       dockerfile: deployments/container/Dockerfile.media
     working_dir: /opt/mine-teleop
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
     command:
       - python3
       - vehicle-uploader/vehicle_uploader.py
@@ -70,6 +82,12 @@ services:
 
   turn-server:
     image: coturn/coturn:4.6.2
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
     command:
       - turnserver
       - -c

@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import http.client
+import ipaddress
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -398,7 +400,17 @@ class UploadQueue:
             "pause_reason": self.pause_reason,
             "items": [asdict(item) for item in self.items],
         }
-        self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        # Write atomically so a crash/power loss (common in field vehicles) cannot
+        # leave a truncated/corrupt queue. The queue persists presigned upload URLs
+        # (bearer credentials) at rest, so restrict permissions.
+        tmp_path = self.state_path.with_name(self.state_path.name + ".tmp")
+        tmp_path.write_text(text, encoding="utf-8")
+        try:
+            tmp_path.chmod(0o600)
+        except OSError:
+            pass
+        tmp_path.replace(self.state_path)
 
     def _first_actionable_item(self) -> UploadItem:
         for item in self.items:
@@ -494,6 +506,8 @@ class HttpPutUploader:
         parsed = urlparse(upload_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("upload_url must include http(s) scheme and host")
+        if parsed.scheme == "http" and not _is_loopback_netloc(parsed.netloc):
+            raise ValueError("refusing to PUT upload over plaintext http to a non-loopback host")
         target = parsed.path or "/"
         if parsed.query:
             target = f"{target}?{parsed.query}"
@@ -501,12 +515,15 @@ class HttpPutUploader:
         connection = connection_class(parsed.netloc, timeout=self.timeout_seconds)
         try:
             with source_path.open("rb") as body:
+                # Take the length from the open handle to avoid a TOCTOU size
+                # mismatch if the file is rotated between stat() and send.
+                content_length = os.fstat(body.fileno()).st_size
                 connection.request(
                     "PUT",
                     target,
                     body=body,
                     headers={
-                        "Content-Length": str(source_path.stat().st_size),
+                        "Content-Length": str(content_length),
                         "Content-Type": "application/octet-stream",
                     },
                 )
@@ -787,10 +804,15 @@ def _is_safe_relative_object_path(object_path: str) -> bool:
 
 
 def _secret_value(value: str | None, file_path: str | None, label: str, required: bool = True) -> str:
-    if value is not None:
+    # An empty/whitespace inline value must not silently win over a configured
+    # secret file; treat it as unset and fall through.
+    if value is not None and value.strip():
         return value
     if file_path is not None:
-        secret = Path(file_path).read_text(encoding="utf-8").strip()
+        try:
+            secret = Path(file_path).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError(f"{label} secret file could not be read: {exc}") from exc
         if secret:
             return secret
     if required:
@@ -800,3 +822,17 @@ def _secret_value(value: str | None, file_path: str | None, label: str, required
 
 def _hmac_sha256(key: bytes, value: str) -> bytes:
     return hmac.new(key, value.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _is_loopback_netloc(netloc: str) -> bool:
+    host = netloc.rsplit("@", 1)[-1]
+    if host.startswith("["):  # IPv6 literal, e.g. [::1]:8443
+        host = host[1:].split("]", 1)[0]
+    else:
+        host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False

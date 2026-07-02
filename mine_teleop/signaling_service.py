@@ -29,6 +29,12 @@ SIGNALING_MESSAGE_TYPES = {
     "session_end",
 }
 
+# Cap request/frame sizes so a malicious or buggy client cannot force an
+# unbounded allocation (Content-Length / WebSocket frame length are attacker
+# controlled). Signaling payloads are small JSON objects.
+MAX_HTTP_BODY_BYTES = 256 * 1024
+MAX_WEBSOCKET_MESSAGE_BYTES = 256 * 1024
+
 
 def _time_ms() -> int:
     return int(time.time() * 1000)
@@ -293,6 +299,7 @@ class DriverTokenStore:
         self._tokens: Dict[str, DriverLoginToken] = {}
         self._counter = 0
         self._credentials = credentials
+        self._lock = threading.Lock()
 
     def login(self, driver_id: str, password: str) -> DriverLoginToken:
         driver_id = _require_non_empty_string_value(driver_id, "driver_id")
@@ -302,7 +309,8 @@ class DriverTokenStore:
         elif password != "dev-password":
             raise PermissionError("invalid driver credentials")
         self._counter += 1
-        token = f"driver-token-{self._counter:06d}-{driver_id}"
+        # Opaque random token; must not be guessable from driver_id or a counter.
+        token = f"driver-token-{secrets.token_urlsafe(24)}"
         issued_at_ms = self._clock_ms()
         login_token = DriverLoginToken(
             token=token,
@@ -310,13 +318,15 @@ class DriverTokenStore:
             issued_at_ms=issued_at_ms,
             expires_at_ms=issued_at_ms + self.token_ttl_ms,
         )
-        self._tokens[token] = login_token
+        with self._lock:
+            self._tokens[token] = login_token
         return login_token
 
     def validate(self, driver_id: str, token: str) -> None:
         driver_id = _require_non_empty_string_value(driver_id, "driver_id")
         token = _require_string_value(token, "driver token")
-        login_token = self._tokens.get(token)
+        with self._lock:
+            login_token = self._tokens.get(token)
         if login_token is None or login_token.driver_id != driver_id:
             raise PermissionError("invalid driver token")
         if self._clock_ms() >= login_token.expires_at_ms:
@@ -326,6 +336,7 @@ class DriverTokenStore:
 class DeviceCredentialStore:
     def __init__(self, tokens_by_vehicle: Dict[str, str] | None = None) -> None:
         self._tokens_by_vehicle: Dict[str, str] = {}
+        self._lock = threading.Lock()
         if tokens_by_vehicle:
             for vehicle_id, device_token in tokens_by_vehicle.items():
                 self.register(vehicle_id, device_token)
@@ -347,26 +358,32 @@ class DeviceCredentialStore:
     def register(self, vehicle_id: str, device_token: str) -> None:
         vehicle_id = _require_non_empty_string_value(vehicle_id, "vehicle_id")
         device_token = _require_non_empty_string_value(device_token, "device_token")
-        self._tokens_by_vehicle[vehicle_id] = device_token
+        with self._lock:
+            self._tokens_by_vehicle[vehicle_id] = device_token
 
     def validate(self, vehicle_id: str, device_token: str) -> None:
         vehicle_id = _require_non_empty_string_value(vehicle_id, "vehicle_id")
         device_token = _require_string_value(device_token, "device_token")
-        if self._tokens_by_vehicle.get(vehicle_id) != device_token:
+        with self._lock:
+            expected = self._tokens_by_vehicle.get(vehicle_id)
+        if expected is None or not hmac.compare_digest(expected, device_token):
             raise PermissionError("invalid device token")
 
 
 class SignalingMessageStore:
     def __init__(self) -> None:
         self._messages: Dict[tuple[str, str], List[SignalingMessage]] = {}
+        self._lock = threading.Lock()
 
     def enqueue(self, message: SignalingMessage) -> int:
         key = (message.session_id, message.recipient)
-        self._messages.setdefault(key, []).append(message)
-        return len(self._messages[key])
+        with self._lock:
+            self._messages.setdefault(key, []).append(message)
+            return len(self._messages[key])
 
     def pop_for(self, session_id: str, recipient: str) -> List[SignalingMessage]:
-        return self._messages.pop((session_id, recipient), [])
+        with self._lock:
+            return self._messages.pop((session_id, recipient), [])
 
 
 class SignalingHttpService:
@@ -396,6 +413,7 @@ class SignalingHttpService:
             self.devices = device_credentials
         self.messages = SignalingMessageStore()
         self.turn_usage_by_session: Dict[str, TurnUsageSummary] = {}
+        self._turn_usage_lock = threading.Lock()
         self.audit = AuditLog(audit_log_path, max_bytes=audit_log_max_bytes, backup_count=audit_log_backup_count)
         self.uploads = upload_credentials or UploadCredentialService()
         self.ice_config = ice_config
@@ -753,7 +771,15 @@ class SignalingHttpService:
                 return
 
             def _read_json(self) -> Dict[str, Any]:
-                length = int(self.headers.get("Content-Length", "0"))
+                raw_length = self.headers.get("Content-Length", "0")
+                try:
+                    length = int(raw_length)
+                except (TypeError, ValueError):
+                    raise ValueError("invalid Content-Length header")
+                if length < 0:
+                    raise ValueError("invalid Content-Length header")
+                if length > MAX_HTTP_BODY_BYTES:
+                    raise ValueError("request body too large")
                 raw = self.rfile.read(length).decode("utf-8") if length else "{}"
                 data = json.loads(raw)
                 if not isinstance(data, dict):
@@ -819,39 +845,46 @@ class SignalingHttpService:
                     self._write_websocket_json(response)
 
             def _read_websocket_json(self) -> Dict[str, Any] | None:
-                header = self.rfile.read(2)
-                if not header:
-                    return None
-                fin = bool(header[0] & 0x80)
-                opcode = header[0] & 0x0F
-                masked = bool(header[1] & 0x80)
-                length = header[1] & 0x7F
-                if not masked:
-                    raise ValueError("client websocket frames must be masked")
-                if not fin:
-                    raise ValueError("fragmented websocket messages are not supported")
-                if length == 126:
-                    length = int.from_bytes(self.rfile.read(2), "big")
-                elif length == 127:
-                    length = int.from_bytes(self.rfile.read(8), "big")
-                if opcode in {8, 9, 10} and length > 125:
-                    raise ValueError("websocket control frames must be no longer than 125 bytes")
-                mask = self.rfile.read(4) if masked else b""
-                raw = self.rfile.read(length)
-                if opcode == 8:
-                    return None
-                if opcode != 1:
-                    raise ValueError("only text websocket frames are supported")
-                if masked:
-                    raw = bytes(byte ^ mask[index % 4] for index, byte in enumerate(raw))
-                data = json.loads(raw.decode("utf-8"))
-                if not isinstance(data, dict):
-                    raise ValueError("websocket message must be a JSON object")
-                return data
+                while True:
+                    header = self.rfile.read(2)
+                    if len(header) < 2:
+                        return None
+                    fin = bool(header[0] & 0x80)
+                    opcode = header[0] & 0x0F
+                    masked = bool(header[1] & 0x80)
+                    length = header[1] & 0x7F
+                    if not masked:
+                        raise ValueError("client websocket frames must be masked")
+                    if length == 126:
+                        length = int.from_bytes(self.rfile.read(2), "big")
+                    elif length == 127:
+                        length = int.from_bytes(self.rfile.read(8), "big")
+                    if opcode in {8, 9, 10} and length > 125:
+                        raise ValueError("websocket control frames must be no longer than 125 bytes")
+                    if length > MAX_WEBSOCKET_MESSAGE_BYTES:
+                        raise ValueError("websocket message too large")
+                    mask = self.rfile.read(4) if masked else b""
+                    raw = self.rfile.read(length)
+                    if masked:
+                        raw = bytes(byte ^ mask[index % 4] for index, byte in enumerate(raw))
+                    if opcode == 8:  # close
+                        return None
+                    if opcode == 9:  # ping -> reply with pong and keep the connection open
+                        self._write_websocket_frame(0x8A, raw)
+                        continue
+                    if opcode == 10:  # pong -> ignore keepalive
+                        continue
+                    if not fin:
+                        raise ValueError("fragmented websocket messages are not supported")
+                    if opcode != 1:
+                        raise ValueError("only text websocket frames are supported")
+                    data = json.loads(raw.decode("utf-8"))
+                    if not isinstance(data, dict):
+                        raise ValueError("websocket message must be a JSON object")
+                    return data
 
-            def _write_websocket_json(self, payload: Dict[str, Any]) -> None:
-                body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-                header = bytearray([0x81])
+            def _write_websocket_frame(self, first_byte: int, body: bytes) -> None:
+                header = bytearray([first_byte])
                 if len(body) < 126:
                     header.append(len(body))
                 elif len(body) < 65536:
@@ -860,6 +893,10 @@ class SignalingHttpService:
                     header.extend([127, *len(body).to_bytes(8, "big")])
                 self.wfile.write(bytes(header) + body)
                 self.wfile.flush()
+
+            def _write_websocket_json(self, payload: Dict[str, Any]) -> None:
+                body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                self._write_websocket_frame(0x81, body)
 
         return Handler
 
@@ -1163,14 +1200,15 @@ class SignalingHttpService:
         extra_details: Dict[str, Any],
     ) -> Dict[str, Any]:
         sample_bytes = bytes_sent + bytes_received
-        summary = self.turn_usage_by_session.setdefault(
-            session.session_id,
-            TurnUsageSummary(session_id=session.session_id, vehicle_id=session.vehicle_id),
-        )
-        summary.relay_bytes_total += sample_bytes
-        summary.sample_count += 1
-        summary.last_bitrate_kbps = round(sample_bytes * 8 / duration_ms, 3)
-        payload = summary.to_dict()
+        with self._turn_usage_lock:
+            summary = self.turn_usage_by_session.setdefault(
+                session.session_id,
+                TurnUsageSummary(session_id=session.session_id, vehicle_id=session.vehicle_id),
+            )
+            summary.relay_bytes_total += sample_bytes
+            summary.sample_count += 1
+            summary.last_bitrate_kbps = round(sample_bytes * 8 / duration_ms, 3)
+            payload = summary.to_dict()
         self._audit(
             "turn_relay_usage",
             vehicle_id=session.vehicle_id,

@@ -55,8 +55,6 @@ class ControlCommand:
         if not self.session_id:
             raise ValueError("session_id is required")
         _validate_non_negative_int_field(self.seq, "seq")
-        if self.seq < 0:
-            raise ValueError("seq must be non-negative")
         _validate_int_field(self.ts_ms, "ts_ms")
         _validate_string_field(self.gear, "gear")
         if self.gear not in ALLOWED_GEARS:
@@ -206,6 +204,8 @@ def _validate_int_field(value: object, key: str) -> None:
 def _validate_non_negative_int_field(value: object, key: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{key} must be a non-negative integer")
+    if value < 0:
+        raise ValueError(f"{key} must be non-negative")
 
 
 def _validate_number_field(value: object, key: str) -> None:

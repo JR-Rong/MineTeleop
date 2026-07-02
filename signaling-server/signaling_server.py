@@ -39,6 +39,13 @@ def main() -> int:
             parser.error("--tls-cert and --tls-key must be configured together")
         if not _is_loopback_host(args.host) and not tls_enabled:
             parser.error("--tls-cert and --tls-key are required for non-loopback hosts")
+        # Fail closed: never fall back to the built-in dev credentials on a
+        # network-reachable deployment. Loopback (dev/test) may still use them.
+        if not _is_loopback_host(args.host):
+            if not args.driver_credentials:
+                parser.error("--driver-credentials is required for non-loopback hosts")
+            if not args.device_credentials:
+                parser.error("--device-credentials is required for non-loopback hosts")
 
         upload_credentials = None
         ice_config = None
@@ -68,6 +75,7 @@ def main() -> int:
         server = service.make_server(args.host, args.port)
         if tls_enabled:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(args.tls_cert, args.tls_key)
             server.socket = context.wrap_socket(server.socket, server_side=True)
         actual_host, actual_port = server.server_address

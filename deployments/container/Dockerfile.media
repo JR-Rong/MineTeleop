@@ -19,3 +19,14 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/mine-teleop
+
+# Run as a non-root user. Add it to the video/render groups so the media agent
+# can still reach the passed-through /dev/dri and /dev/video* devices. If the
+# host device GIDs differ, set `group_add:` for the service in compose.
+RUN groupadd --system mineteleop \
+    && useradd --system --gid mineteleop --home-dir /opt/mine-teleop --shell /usr/sbin/nologin mineteleop \
+    && (getent group video || groupadd --system video) \
+    && (getent group render || groupadd --system render) \
+    && usermod -aG video,render mineteleop
+USER mineteleop
+

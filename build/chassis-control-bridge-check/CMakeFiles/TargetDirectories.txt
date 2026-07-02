@@ -1,3 +1,0 @@
-/Volumes/SystemDisk/Workspace/mine-teleop/build/chassis-control-bridge-check/CMakeFiles/mine_teleop_chassis_bridge.dir
-/Volumes/SystemDisk/Workspace/mine-teleop/build/chassis-control-bridge-check/CMakeFiles/edit_cache.dir
-/Volumes/SystemDisk/Workspace/mine-teleop/build/chassis-control-bridge-check/CMakeFiles/rebuild_cache.dir

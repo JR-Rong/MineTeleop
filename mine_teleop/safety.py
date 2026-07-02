@@ -35,7 +35,9 @@ class SafetyStateMachine:
     ) -> None:
         self.degraded_timeout_ms = degraded_timeout_ms
         self.control_timeout_ms = control_timeout_ms
-        self.deceleration_profile = deceleration_profile
+        # Sort by elapsed threshold so _brake_for_timeout (which keeps the last
+        # matching stage) is correct even if a caller passes an unordered profile.
+        self.deceleration_profile = sorted(deceleration_profile, key=lambda stage: stage[0])
         self.state = SafetyState.INIT
         self.last_valid_command: ControlCommand | None = None
         self.last_valid_receive_ms: int | None = None
@@ -86,6 +88,9 @@ class SafetyStateMachine:
             return ControlOutput(gear=gear, steering=0.0, throttle=0.0, brake=self._brake_for_timeout(now_ms))
         if self.state == SafetyState.ESTOP:
             return ControlOutput(gear=gear, steering=0.0, throttle=0.0, brake=1.0, estop=True)
+        if self.state == SafetyState.FAULT:
+            # A fault must fail safe with full braking, never coast.
+            return ControlOutput(gear=gear, steering=0.0, throttle=0.0, brake=1.0)
         return ControlOutput(gear="N", steering=0.0, throttle=0.0, brake=0.0)
 
     def reset_estop(self, local_confirmed: bool, authorized_by: str, now_ms: int) -> bool:

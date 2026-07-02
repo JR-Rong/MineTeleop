@@ -6,11 +6,19 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
+from urllib.parse import urlparse
 
 from .capacity import UploadBacklogMonitor, UploadBacklogStatus, scan_segment_candidates
 from .config import RuntimeConfigUpdateDecision, RuntimeConfigUpdatePolicy, VehicleConfig
 from .recording import SegmentMetadata, SegmentWriteResult, SegmentWriter, update_segment_upload_state
-from .upload import HttpPutUploader, LocalArchiveUploader, UploadBandwidthLimiter, UploadQueue, UploadTriggerPolicy
+from .upload import (
+    HttpPutUploader,
+    LocalArchiveUploader,
+    UploadBandwidthLimiter,
+    UploadQueue,
+    UploadTriggerPolicy,
+    _is_loopback_netloc,
+)
 
 
 @dataclass(frozen=True)
@@ -27,6 +35,11 @@ class UploadApiClient:
     def __init__(self, base_url: str, device_token: str = "dev-device-secret") -> None:
         self.base_url = base_url.rstrip("/")
         self.device_token = device_token
+        parsed = urlparse(self.base_url)
+        # The device_token is a bearer credential; never send it in cleartext to a
+        # non-loopback host.
+        if parsed.scheme == "http" and not _is_loopback_netloc(parsed.netloc):
+            raise ValueError("Upload API base_url must use https for non-loopback hosts")
 
     def issue_credential(self, metadata: SegmentMetadata, kind: str) -> Dict[str, Any]:
         return self._post(
@@ -191,7 +204,7 @@ class VehicleRecorderUploader:
                 continue
             if not candidate.video_path.exists():
                 continue
-            metadata = SegmentMetadata(**json.loads(candidate.metadata_path.read_text(encoding="utf-8")))
+            metadata = SegmentMetadata.from_dict(json.loads(candidate.metadata_path.read_text(encoding="utf-8")))
             video_credential = self.upload_api.issue_credential(metadata, kind="video")
             metadata_credential = self.upload_api.issue_credential(metadata, kind="metadata")
             self.queue.enqueue(
@@ -302,16 +315,20 @@ class VehicleRecorderUploader:
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
             return self._mark_upload_failed(item, metadata_object_path, error, now_ms)
+        bytes_uploaded = video_path.stat().st_size
+        metadata_bytes_uploaded = metadata_path.stat().st_size
+        # Confirm with the Upload API BEFORE flipping the local "uploaded" state,
+        # which is what makes a segment eligible for retention deletion. A crash
+        # between a local flip and server confirmation must never delete a segment
+        # the cloud never acknowledged.
+        self.upload_api.mark_uploaded(item.segment_id, item.object_path, bytes_uploaded)
+        if item.metadata_object_path:
+            self.upload_api.mark_uploaded(item.segment_id, item.metadata_object_path, metadata_bytes_uploaded)
         update_segment_upload_state(metadata_path, "uploaded")
         if archive_result.metadata_object_path is not None:
             update_segment_upload_state(archive_result.metadata_object_path, "uploaded")
         item.metadata_sha256 = _sha256_file(metadata_path)
         self.queue.mark_uploaded(item.segment_id)
-        bytes_uploaded = video_path.stat().st_size
-        metadata_bytes_uploaded = metadata_path.stat().st_size
-        self.upload_api.mark_uploaded(item.segment_id, item.object_path, bytes_uploaded)
-        if item.metadata_object_path:
-            self.upload_api.mark_uploaded(item.segment_id, item.metadata_object_path, metadata_bytes_uploaded)
         if self.bandwidth_limiter is not None:
             self.bandwidth_limiter.record_upload(bytes_uploaded + metadata_bytes_uploaded, finished_at_ms=now_ms)
         return RecorderUploaderResult(
@@ -359,7 +376,7 @@ class VehicleRecorderUploader:
         if metadata is not None:
             return metadata
         raw = json.loads(Path(item.metadata_path).read_text(encoding="utf-8"))
-        metadata = SegmentMetadata(**raw)
+        metadata = SegmentMetadata.from_dict(raw)
         self._metadata_by_segment[item.segment_id] = metadata
         return metadata
 

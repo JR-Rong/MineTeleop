@@ -306,7 +306,8 @@ class DynamicLibraryVehicleAdapter:
 def create_vehicle_adapter(
     adapter_type: str,
     contract: VehicleAdapterContract | None = None,
-) -> MockVehicleAdapter:
+    max_speed_mps: float | None = None,
+) -> "MockVehicleAdapter | DynamicLibraryVehicleAdapter":
     if adapter_type == "mock":
         return MockVehicleAdapter()
     if adapter_type in {"can", "dynamic_library"} and contract is not None and contract.integration is not None:
@@ -321,9 +322,18 @@ def create_vehicle_adapter(
                 raise VehicleAdapterError(
                     "vehicle_adapter.integration.chassis_control.bridge_library_path is required for c_shim ABI"
                 )
+            # Drive the command mapper's speed ceiling from the configured field
+            # safety limit rather than the hardcoded default (2 m/s).
+            mapper = None
+            if max_speed_mps is not None:
+                mapper = ChassisControlCommandMapper(
+                    can_interface=chassis.can_interface,
+                    max_speed_mps=max_speed_mps,
+                )
             return DynamicLibraryVehicleAdapter(
                 library_path=chassis.bridge_library_path,
                 can_interface=chassis.can_interface,
+                mapper=mapper,
                 adapter_type=adapter_type,
             )
     if adapter_type in {"can", "dynamic_library"}:

@@ -276,7 +276,10 @@ class ChassisBridgeChecker:
         if not path.is_dir():
             return ChassisBridgeCheck(name, "skipped", str(path), "Git dirty check was skipped because the root is not ready")
         result = subprocess.run(
-            ["git", "-C", str(path), "status", "--short", "--untracked-files=all"],
+            # --porcelain uses the stable short format with normal untracked-file
+            # handling; avoid --untracked-files=all which can exhaust memory on
+            # large source trees (ChassisControl/MinePilot).
+            ["git", "-C", str(path), "status", "--porcelain"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

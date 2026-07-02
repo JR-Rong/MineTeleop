@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/Volumes/SystemDisk/Workspace/mine-teleop/build/chassis-control-bridge-build-check/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

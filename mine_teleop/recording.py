@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 
@@ -23,6 +23,14 @@ class SegmentMetadata:
     upload_state: str
     file_size_bytes: int = 0
     video_sha256: str = ""
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "SegmentMetadata":
+        # Tolerate forward-compatible metadata: ignore unknown keys written by a
+        # newer schema instead of raising TypeError. Missing required fields still
+        # surface as an error.
+        known = {field.name for field in fields(cls)}
+        return cls(**{key: value for key, value in raw.items() if key in known})
 
 
 @dataclass(frozen=True)
@@ -64,7 +72,7 @@ def update_segment_upload_state(metadata_path: Path | str, upload_state: str) ->
     path = Path(metadata_path)
     raw = json.loads(path.read_text(encoding="utf-8"))
     raw["upload_state"] = upload_state
-    metadata = SegmentMetadata(**raw)
+    metadata = SegmentMetadata.from_dict(raw)
     tmp_metadata = path.with_suffix(path.suffix + ".tmp")
     tmp_metadata.write_text(
         json.dumps(asdict(metadata), ensure_ascii=False, indent=2, sort_keys=True),

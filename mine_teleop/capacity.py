@@ -157,8 +157,13 @@ def recording_mbps_for(cameras: Iterable[object], record_profiles: Dict[str, obj
 def scan_segment_candidates(root_dir: Path | str) -> List[SegmentCandidate]:
     candidates = []
     for metadata_path in Path(root_dir).rglob("*.json"):
-        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
-        segment_id = str(raw["segment_id"])
+        # A single corrupt/partial sidecar (e.g. power loss mid-write) must not
+        # abort the whole scan, which gates retention/backlog enforcement.
+        try:
+            raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+            segment_id = str(raw["segment_id"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
         video_path = metadata_path.with_suffix(".mp4")
         candidates.append(
             SegmentCandidate(

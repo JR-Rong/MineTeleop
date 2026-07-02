@@ -143,6 +143,11 @@ void apply_feedback_unlocked(const MineTeleopChassisFeedback& feedback)
         g_last_telemetry.speed_mps = feedback.vehicle_speed;
     }
     g_last_telemetry.gear = feedback.gear_status;
+    // Steering feedback is available on the CAN set (eps_angle); prefer it over
+    // the commanded angle so telemetry reflects the actual wheel state.
+    if (!std::isnan(feedback.eps_angle[0])) {
+        g_last_telemetry.steering_feedback = feedback.eps_angle[0];
+    }
 }
 
 bool decode_feedback_frame(const can_frame_t& frame, MineTeleopChassisFeedback* feedback)
@@ -377,11 +382,17 @@ extern "C" int mine_teleop_chassis_apply_state(
     if (!SendCanMessage(g_can_interface, 0)) {
         return -3;
     }
-    g_last_telemetry.speed_mps = std::abs(target_vx);
-    g_last_telemetry.gear = target_gear;
-    g_last_telemetry.steering_feedback = steering_count > 0 ? steering_values[0] : 0.0;
+    // NOTE: speed_mps, gear and steering_feedback are populated ONLY from decoded
+    // CAN feedback (see apply_feedback_unlocked) and must never be set from the
+    // command here, otherwise telemetry would show the vehicle "obeying" even when
+    // the chassis rejected the command. The CAN feedback set carries no dedicated
+    // throttle/brake actuator magnitude, so these two fields expose the commanded
+    // longitudinal effort as a best-effort indication until such feedback exists.
     g_last_telemetry.throttle_feedback = target_ax > 0.0 ? std::min(target_ax, 1.0) : 0.0;
     g_last_telemetry.brake_feedback = target_ax < 0.0 ? std::min(std::abs(target_ax), 1.0) : 0.0;
+    // Normal control has resumed; clear the e-stop indication. In the correct flow
+    // apply_state is never invoked while an e-stop is latched (the safety layer
+    // routes to emergency_stop instead).
     g_last_telemetry.estop = 0;
     return 0;
 }

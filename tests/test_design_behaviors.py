@@ -3715,7 +3715,8 @@ class SignalingHttpServiceTests(unittest.TestCase):
 
             self.assertEqual(wrong["error"], "invalid driver credentials")
             self.assertEqual(login["token_type"], "bearer")
-            self.assertTrue(login["token"].endswith("-driver-a"))
+            self.assertTrue(login["token"].startswith("driver-token-"))
+            self.assertNotIn("driver-a", login["token"])
 
     def test_http_vehicle_online_can_use_configured_device_credentials(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -8017,7 +8018,8 @@ class CommandLineEntryPointTests(unittest.TestCase):
 
         self.assertEqual(wrong["error"], "invalid driver credentials")
         self.assertEqual(login["token_type"], "bearer")
-        self.assertTrue(login["token"].endswith("-driver-a"))
+        self.assertTrue(login["token"].startswith("driver-token-"))
+        self.assertNotIn("driver-a", login["token"])
 
     def test_signaling_server_cli_loads_device_credentials_file(self):
         with tempfile.TemporaryDirectory() as tmp:

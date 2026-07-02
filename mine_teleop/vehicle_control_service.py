@@ -36,6 +36,7 @@ class VehicleControlService:
         self._timeout_audited = False
         self._estop_audited = False
         self._last_telemetry_ms: int | None = None
+        self._feedback_error: str | None = None
 
     @property
     def applied_command_count(self) -> int:
@@ -67,7 +68,11 @@ class VehicleControlService:
             session_id=session_id,
             receiver=receiver,
             safety=safety,
-            adapter=adapter or create_vehicle_adapter(config.vehicle_adapter_type, config.vehicle_adapter_contract),
+            adapter=adapter or create_vehicle_adapter(
+                config.vehicle_adapter_type,
+                config.vehicle_adapter_contract,
+                max_speed_mps=config.field_safety.max_speed_kph / 3.6,
+            ),
             telemetry_publisher=TelemetryPublisher(config.vehicle_id, session_id, source=config.vehicle_adapter_type),
             telemetry_interval_ms=telemetry_interval_ms,
             audit_log=audit_log,
@@ -141,14 +146,17 @@ class VehicleControlService:
             return
         try:
             snapshot = poll_feedback()
-        except Exception:
+        except Exception as exc:  # do not let a feedback fault crash the control loop
+            self._feedback_error = f"poll_feedback failed: {exc}"
             return
         update_feedback = getattr(self.adapter, "update_feedback", None)
         if snapshot is not None and callable(update_feedback):
             try:
                 update_feedback(snapshot)
-            except Exception:
+            except Exception as exc:
+                self._feedback_error = f"update_feedback failed: {exc}"
                 return
+        self._feedback_error = None
 
     def _build_telemetry(self, now_ms: int) -> Dict[str, Any]:
         payload = self.telemetry_publisher.build(
@@ -166,6 +174,7 @@ class VehicleControlService:
             "link": {
                 "control_rtt_ms": 0,
                 "signaling_connected": self.signaling_connected,
+                "feedback_error": self._feedback_error,
             }
         }
         payload["vehicle_adapter"] = _compact_status(self.adapter.get_status())
