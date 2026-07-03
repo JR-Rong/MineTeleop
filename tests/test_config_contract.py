@@ -500,6 +500,52 @@ estop = "E"
         self.assertEqual(config.control.keyboard.throttle, "W")
         self.assertEqual(config.control.keyboard.brake, "S")
         self.assertEqual(config.control.keyboard.estop, "E")
+        self.assertTrue(config.control.gamepad.enabled)
+        self.assertEqual(config.control.gamepad.steering_axis, 0)
+        self.assertEqual(config.control.gamepad.throttle_axis, 2)
+        self.assertEqual(config.control.gamepad.brake_axis, 5)
+        self.assertEqual(config.control.gamepad.axis_deadzone, 0.05)
+        self.assertTrue(config.control.gamepad.throttle_inverted)
+        self.assertTrue(config.control.gamepad.brake_inverted)
+        self.assertEqual(config.control.gamepad.estop_button, 0)
+
+    def test_driver_config_rejects_invalid_gamepad_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "driver.yaml"
+            path.write_text(
+                """
+driver:
+  id: driver-console-001
+cloud:
+  auth_url: http://127.0.0.1:8765/auth
+  signaling_url: ws://127.0.0.1:8765/signaling
+ui:
+  default_layout: grid_4
+  show_debug_overlay: true
+control:
+  rate_hz: 20
+  estop_hold_ms: 500
+  keyboard:
+    steering_left: A
+    steering_right: D
+    throttle: W
+    brake: S
+    estop: E
+  gamepad:
+    enabled: true
+    steering_axis: -1
+    throttle_axis: 2
+    brake_axis: 5
+    axis_deadzone: 0.05
+    throttle_inverted: true
+    brake_inverted: true
+    estop_button: 0
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigError, "control.gamepad.steering_axis must be a non-negative integer"):
+                load_driver_config(path)
 
     def test_driver_config_rejects_duplicate_keyboard_bindings(self):
         with tempfile.TemporaryDirectory() as tmp:

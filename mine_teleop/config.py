@@ -139,10 +139,23 @@ class DriverKeyboardConfig:
 
 
 @dataclass(frozen=True)
+class DriverGamepadConfig:
+    enabled: bool
+    steering_axis: int
+    throttle_axis: int
+    brake_axis: int
+    axis_deadzone: float
+    throttle_inverted: bool
+    brake_inverted: bool
+    estop_button: int
+
+
+@dataclass(frozen=True)
 class DriverControlConfig:
     rate_hz: int
     estop_hold_ms: int
     keyboard: DriverKeyboardConfig
+    gamepad: DriverGamepadConfig
 
 
 @dataclass(frozen=True)
@@ -794,7 +807,48 @@ def _parse_driver_control(raw: Dict[str, Any]) -> DriverControlConfig:
     ]
     if len(set(bindings)) != len(bindings):
         raise ConfigError("keyboard bindings must be unique")
-    return DriverControlConfig(rate_hz=rate_hz, estop_hold_ms=estop_hold_ms, keyboard=parsed_keyboard)
+    return DriverControlConfig(
+        rate_hz=rate_hz,
+        estop_hold_ms=estop_hold_ms,
+        keyboard=parsed_keyboard,
+        gamepad=_parse_driver_gamepad(raw.get("gamepad")),
+    )
+
+
+def _parse_driver_gamepad(raw: Any) -> DriverGamepadConfig:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("control.gamepad must be configured as a mapping")
+    axis_deadzone = _non_negative_finite_number(raw.get("axis_deadzone", 0.05), "control.gamepad.axis_deadzone")
+    if axis_deadzone >= 1.0:
+        raise ConfigError("control.gamepad.axis_deadzone must be in [0, 1)")
+    return DriverGamepadConfig(
+        enabled=_optional_bool(raw, "enabled", "control.gamepad.enabled", default=False),
+        steering_axis=_positive_or_zero_int(
+            {"steering_axis": raw.get("steering_axis", 0)},
+            "steering_axis",
+            "control.gamepad.steering_axis",
+        ),
+        throttle_axis=_positive_or_zero_int(
+            {"throttle_axis": raw.get("throttle_axis", 2)},
+            "throttle_axis",
+            "control.gamepad.throttle_axis",
+        ),
+        brake_axis=_positive_or_zero_int(
+            {"brake_axis": raw.get("brake_axis", 5)},
+            "brake_axis",
+            "control.gamepad.brake_axis",
+        ),
+        axis_deadzone=axis_deadzone,
+        throttle_inverted=_optional_bool(raw, "throttle_inverted", "control.gamepad.throttle_inverted", default=True),
+        brake_inverted=_optional_bool(raw, "brake_inverted", "control.gamepad.brake_inverted", default=True),
+        estop_button=_positive_or_zero_int(
+            {"estop_button": raw.get("estop_button", 0)},
+            "estop_button",
+            "control.gamepad.estop_button",
+        ),
+    )
 
 
 def _parse_control(raw: Dict[str, Any]) -> ControlConfig:

@@ -110,6 +110,12 @@ visible，便于后续 UI 层保持常驻入口。
 - 档位器。
 - 自定义串口/CAN 驾驶台。
 
+当前 Docker 友好的 HTTP 控制端程序先通过浏览器 Gamepad API 接入模拟驾驶器：
+方向盘/踏板仍由操作员浏览器读取，Docker 容器只接收已归一化的 steering、
+throttle、brake、estop 和 gear 状态，因此不要求容器直接挂载宿主
+`/dev/input` 或安装 HID 驱动。轴编号、踏板反向、deadzone 和急停按钮通过
+`control.gamepad` 配置暴露。
+
 ## 控制命令生成
 
 Console 不应只在按键变化时发送控制，而应按固定周期发送当前控制状态。
@@ -131,6 +137,16 @@ Console 不应只在按键变化时发送控制，而应按固定周期发送当
 - 支持单路放大。
 - 支持布局保存。
 - 解码失败不能拖死整个 UI。
+
+当前 Docker 友好的 HTTP 控制端程序会把车端 `webrtc_offer` 返回给浏览器页面，
+页面用 `RTCPeerConnection` 创建 answer，并通过 `ontrack` 把远端视频流挂到对应
+camera 的 `<video>` 元素；控制 DataChannel 按 unordered/unreliable 配置创建。
+页面连接后会周期轮询信令并处理车端 remote ICE candidate，同时把浏览器 local
+ICE candidate 经控制端转发到车端。本地 Docker smoke 只验证 offer/answer/ICE
+信令和页面 wiring，不替代真实车端 RTP 媒体流与 DataChannel 端到端现场验证。
+页面右侧提供操作员可扫视状态面板，直接显示 session 状态、session id、控制权、
+信令连接状态、摄像头连接数量、WebRTC 状态、最近一条控制命令和 DataChannel 状态；
+原始 JSON 状态仍保留为调试输出，但不作为主要操作界面。
 
 本地参考实现的 `DriverVideoDashboard` 支持把布局偏好保存为 JSON 文件并恢复。
 该文件只持久化 layout、聚焦相机和相机 ID；每路连接状态、fps、码率、延迟和

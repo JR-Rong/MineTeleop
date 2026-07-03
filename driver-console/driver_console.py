@@ -16,6 +16,7 @@ from mine_teleop.driver_console import (
     EstopInputGuard,
     InputState,
 )
+from mine_teleop.driver_console_runtime import DriverConsoleHttpApp, DriverConsoleRuntime, JsonlControlCommandSink
 
 
 def main() -> int:
@@ -24,11 +25,17 @@ def main() -> int:
     parser.add_argument("--operation-log", help="Append local driver operation events as JSONL.")
     parser.add_argument("--operation-log-max-bytes", type=int, help="Rotate the operation log before this size.")
     parser.add_argument("--operation-log-backup-count", type=int, default=0, help="Number of rotated operation logs to keep.")
+    parser.add_argument("--serve", action="store_true", help="Run the Docker-friendly HTTP driver console program.")
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP host for --serve.")
+    parser.add_argument("--port", type=int, default=8080, help="HTTP port for --serve; use 0 to pick a free port.")
+    parser.add_argument("--port-file", default="", help="Write the selected HTTP port for --serve.")
+    parser.add_argument("--signaling-http-url", help="HTTP base URL for the signaling service.")
+    parser.add_argument("--vehicle-id", default="vehicle-001", help="Vehicle id to request when connecting.")
+    parser.add_argument("--password", default="dev-password", help="Driver login password.")
+    parser.add_argument("--control-output", help="Write generated control commands as JSONL instead of signaling relay.")
     args = parser.parse_args()
 
     config = load_driver_config(args.config)
-    vehicle_id = "vehicle-001"
-    session_id = "session-001"
     operation_log = (
         DriverOperationLog(
             args.operation_log,
@@ -38,6 +45,45 @@ def main() -> int:
         if args.operation_log
         else None
     )
+    if args.serve:
+        sink = JsonlControlCommandSink(args.control_output) if args.control_output else None
+        runtime = DriverConsoleRuntime(
+            config,
+            signaling_http_url=args.signaling_http_url or config.cloud.signaling_url,
+            vehicle_id=args.vehicle_id,
+            password=args.password,
+            control_sink=sink,
+            operation_log=operation_log,
+            config_version=args.config,
+        )
+        app = DriverConsoleHttpApp(runtime)
+        server = app.make_server(args.host, args.port)
+        actual_host, actual_port = server.server_address
+        if args.port_file:
+            Path(args.port_file).write_text(str(actual_port), encoding="utf-8")
+        print(
+            json.dumps(
+                {
+                    "event": "driver_console_startup",
+                    "host": actual_host,
+                    "port": actual_port,
+                    "status": "serving",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
+        return 0
+
+    vehicle_id = "vehicle-001"
+    session_id = "session-001"
 
     def append_operation(ts_ms: int, event: str, details: dict) -> None:
         if operation_log is None:

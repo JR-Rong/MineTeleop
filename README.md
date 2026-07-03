@@ -37,6 +37,7 @@
 - [Ubuntu Bundle 软件说明](docs/15-ubuntu-bundle-software.md)
 - [Ubuntu Bundle 使用说明](docs/16-ubuntu-bundle-usage.md)
 - [Ubuntu Bundle 架构说明](docs/17-ubuntu-bundle-architecture.md)
+- [控制端 Docker 程序与 Smoke](docs/18-control-plane-docker-smoke.md)
 - ADR:
   - [0001: 传输与媒体栈选择](docs/adr/0001-transport-and-media-stack.md)
   - [0002: 硬件编码策略](docs/adr/0002-hardware-encoding-strategy.md)
@@ -69,7 +70,12 @@
   `--run-loop` 或 `--adapter-status`，避免静默退回 Mock。
 - `vehicle-media-agent/vehicle_media_agent.py`：按全部启用相机生成独立媒体 pipeline，并提供 VAAPI Docker、GStreamer 插件和四路硬件编码验证命令生成入口。
 - `vehicle-uploader/vehicle_uploader.py`：录像分段、本地上传队列和 Upload API 闭环 demo。
-- `driver-console/driver_console.py`：读取驾驶端配置、生成 20 Hz 控制命令示例，并可写入驾驶端本地操作 JSONL 日志。
+- `driver-console/driver_console.py`：读取驾驶端配置，既可运行 20 Hz 控制命令示例，也可用
+  `--serve` 启动 Docker 友好的 HTTP 控制端程序；该程序提供驾驶端 UI/API、会话连接、
+  WebRTC offer/answer 信令转发、浏览器视频/DataChannel wiring 和控制命令转发入口。
+- `mine_teleop/control_console_container.py`：控制端容器默认入口，读取
+  `MINE_TELEOP_DRIVER_CONSOLE_*` 环境变量启动完整 HTTP 控制端程序，避免现场部署时重写
+  容器 command。
 - `signaling-server/signaling_server.py`：一车一驾驶员会话 demo，以及本地 HTTP JSON 信令服务入口。
 - `deployments/`：systemd 和容器部署模板。
 - `tests/`：设计行为回归测试。
@@ -87,14 +93,16 @@
   开发地址允许 `ws`/`http`。
 - 公网车端设备身份门禁：非回环 cloud 配置必须声明存在的
   `device_cert`/`device_key`，本地开发配置可继续无证书运行。
-- 结构化驾驶端配置校验：cloud、UI 布局、调试 overlay、控制频率、急停长按阈值和键盘映射。
+- 结构化驾驶端配置校验：cloud、UI 布局、调试 overlay、控制频率、急停长按阈值、
+  键盘映射和模拟驾驶器 Gamepad 轴/按钮映射。
 - 驾驶端本地操作日志：记录登录用户、连接车辆、会话、控制权、控制命令、断连/重连、急停字段、UI 版本和配置版本，并支持按大小轮转为编号备份文件。
 - 驾驶端视频状态模型：每路独立记录连接、fps、码率、延迟、低码率、重连和解码失败状态，并支持 1/2/4 布局、单路放大与布局偏好文件保存；`to_dict()` 输出当前渲染用 `visible_camera_ids`，布局文件只保存 layout、聚焦相机和相机 ID，不持久化瞬时运行状态。
 - 驾驶端状态栏快照：把 telemetry、adapter 健康状态、视频面板、丢包样本
   和控制权状态归一化为右侧/底部状态栏字段。
 - 驾驶端工具栏快照：固定登录/退出、连接/断开、会话、急停和设置动作，
   并保持急停动作常驻可见。
-- 驾驶端输入合成：软件控件连续量优先于键盘离散量，急停最高优先级，
+- 驾驶端输入合成：软件控件、键盘离散量和模拟驾驶器连续轴都进入同一条
+  20 Hz 控制命令链路；急停最高优先级，
   刹车覆盖油门，窗口失焦时主动油门和转向归零但继续发送心跳，并在
   本地生成命令前拒绝未知档位。
 - V4L2 相机源契约：校验设备路径并生成 GStreamer `v4l2src` source
@@ -250,6 +258,7 @@ python3 vehicle-uploader/vehicle_uploader.py --work-dir .local/uploader-demo
 python3 vehicle-uploader/vehicle_uploader.py --service-mode --process-once --config configs/vehicle-agent.dev.yaml --work-dir .local/uploader-service --upload-api-base-url http://127.0.0.1:8765
 python3 driver-console/driver_console.py --config configs/driver-console.dev.yaml
 python3 driver-console/driver_console.py --config configs/driver-console.dev.yaml --operation-log .local/driver-ops.jsonl --operation-log-max-bytes 10485760 --operation-log-backup-count 5
+python3 -m mine_teleop.control_console_container
 python3 signaling-server/signaling_server.py --serve --host 127.0.0.1 --port 8765 --audit-log .local/signaling-audit.jsonl --audit-log-max-bytes 10485760 --audit-log-backup-count 5
 python3 scripts/render_chassis_vehicle_config.py --bridge-library /opt/mine-teleop/lib/libmine_teleop_chassis_bridge.so --chassis-control-library /Volumes/SystemDisk/Workspace/MinePilot/libchassis_control.so --max-control-timeout-ms 900 --calibration-evidence bench-brake-test-2026-06-24
 python3 scripts/target_host_validation_plan.py --bridge-library /opt/mine-teleop/lib/libmine_teleop_chassis_bridge.so --chassis-control-library /Volumes/SystemDisk/Workspace/MinePilot/libchassis_control.so --format shell

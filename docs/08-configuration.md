@@ -347,16 +347,28 @@ ui:
 
 control:
   rate_hz: 20
+  estop_hold_ms: 500
   keyboard:
     steering_left: A
     steering_right: D
     throttle: W
     brake: S
     estop: E
+  gamepad:
+    enabled: true
+    steering_axis: 0
+    throttle_axis: 2
+    brake_axis: 5
+    axis_deadzone: 0.05
+    throttle_inverted: true
+    brake_inverted: true
+    estop_button: 0
 ```
 
 `ui.show_debug_overlay` 必须写成 YAML/TOML boolean `true`/`false`，不能用带引号
 字符串，避免调试层在正式驾驶端被误启用或误关闭。
+`control.gamepad` 的轴编号来自浏览器 Gamepad API；如果现场方向盘/踏板轴顺序不同，
+只需要调整该配置，不需要改 Docker 镜像。
 
 ## 配置校验
 

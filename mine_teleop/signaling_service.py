@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, Iterator, List
 from urllib.parse import parse_qs, urlparse
 
 from .config import IceConfig
+from .control import ControlCommand
 from .observability import AuditEvent, AuditLog
 from .signaling import SessionError, SessionManager
 from .upload import UploadCredentialService
@@ -27,6 +28,7 @@ SIGNALING_MESSAGE_TYPES = {
     "webrtc_answer",
     "ice_candidate",
     "session_end",
+    "control_command",
 }
 
 # Cap request/frame sizes so a malicious or buggy client cannot force an
@@ -923,12 +925,25 @@ class SignalingHttpService:
         recipient = _required_json_string(payload, "recipient")
         if recipient not in {session.driver_id, session.vehicle_id}:
             raise SessionError("recipient is not current session participant")
+        message_payload = _optional_json_object(payload, "payload")
+        if message_type == "control_command":
+            command = ControlCommand.from_dict(message_payload)
+            if sender != session.driver_id:
+                raise SessionError("control_command sender must be current driver")
+            if recipient != session.vehicle_id:
+                raise SessionError("control_command recipient must be current vehicle")
+            if command.vehicle_id != session.vehicle_id:
+                raise SessionError("control_command vehicle_id is not current session vehicle")
+            if command.session_id != session_id:
+                raise SessionError("control_command session_id is not current session")
+            if command.authority_token != session.control_token:
+                raise SessionError("control authority token is invalid")
         message = SignalingMessage(
             session_id=session_id,
             sender=sender,
             recipient=recipient,
             type=message_type,
-            payload=_optional_json_object(payload, "payload"),
+            payload=message_payload,
         )
         queued = self.messages.enqueue(message)
         self._audit(
