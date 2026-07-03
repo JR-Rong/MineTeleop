@@ -14,6 +14,7 @@ config="${MINE_TELEOP_CONFIG:-$root/etc/vehicle-agent.yaml}"
 can_iface="${MINE_TELEOP_CAN_IFACE:-can1}"
 camera_devices="${MINE_TELEOP_CAMERAS:-/dev/video0 /dev/video2}"
 render_device="${MINE_TELEOP_VAAPI_DEVICE:-/dev/dri/renderD128}"
+feedback_attempts="${MINE_TELEOP_FEEDBACK_ATTEMPTS:-5}"
 logdir="${MINE_TELEOP_SMOKE_LOGDIR:-$root/data/manual-smoke-$(date +%Y%m%d-%H%M%S)}"
 
 mkdir -p "$logdir" "$root/logs" "$root/data/uploader"
@@ -154,15 +155,24 @@ if ! grep -q '"healthy": true' "$logdir/adapter-status.stdout.log"; then
   mark_fail "adapter status did not report healthy=true"
 fi
 
-run_optional adapter-feedback "$root/bin/mine-teleop" vehicle-agent --config "$config" --adapter-status --poll-feedback
-if grep -q '"event": "vehicle_adapter_feedback_poll"' "$logdir/adapter-feedback.stdout.log"; then
-  if grep -q '"received": true' "$logdir/adapter-feedback.stdout.log"; then
-    log "OK: adapter feedback received"
-  else
-    mark_warn "adapter opened but did not receive a decoded feedback frame"
+feedback_event=0
+feedback_received=0
+for attempt in $(seq 1 "$feedback_attempts"); do
+  run_optional "adapter-feedback-$attempt" "$root/bin/mine-teleop" vehicle-agent --config "$config" --adapter-status --poll-feedback
+  if grep -q '"event": "vehicle_adapter_feedback_poll"' "$logdir/adapter-feedback-$attempt.stdout.log"; then
+    feedback_event=1
+    if grep -q '"received": true' "$logdir/adapter-feedback-$attempt.stdout.log"; then
+      feedback_received=1
+      log "OK: adapter feedback received on attempt $attempt"
+      break
+    fi
   fi
-else
+  sleep 0.5
+done
+if [ "$feedback_event" -eq 0 ]; then
   mark_warn "adapter feedback event was not emitted"
+elif [ "$feedback_received" -eq 0 ]; then
+  mark_warn "adapter opened but did not receive a decoded feedback frame after $feedback_attempts attempts"
 fi
 
 run_required driver-console-once "$root/bin/mine-teleop" driver-console \

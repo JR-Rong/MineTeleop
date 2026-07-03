@@ -71,6 +71,7 @@ cd "$HOME/mine-teleop"
 MINE_TELEOP_CAN_IFACE=can0 \
 MINE_TELEOP_CAMERAS="/dev/video4 /dev/video6" \
 MINE_TELEOP_VAAPI_DEVICE=/dev/dri/renderD128 \
+MINE_TELEOP_FEEDBACK_ATTEMPTS=10 \
 ./manual-smoke.sh
 ```
 
