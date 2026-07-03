@@ -232,8 +232,16 @@ class ContainerTemplateTests(unittest.TestCase):
         self.assertIn("pyinstaller", result.stdout)
         self.assertIn("--onefile", result.stdout)
         self.assertIn("mine_teleop/cli.py", result.stdout)
+        self.assertIn("mine-teleop.real", result.stdout)
+        self.assertIn("LD_LIBRARY_PATH", result.stdout)
         self.assertIn("libmine_teleop_chassis_bridge.so", result.stdout)
         self.assertIn("libchassis_control.so", result.stdout)
+        self.assertIn("apt-get install -y --no-install-recommends", result.stdout)
+        self.assertIn("ffmpeg", result.stdout)
+        self.assertIn("ffprobe", result.stdout)
+        self.assertIn("vainfo", result.stdout)
+        self.assertIn("LIBVA_DRIVERS_PATH", result.stdout)
+        self.assertIn("iHD_drv_video.so", result.stdout)
 
     def test_ubuntu_bundle_docs_cover_software_usage_and_architecture(self):
         docs = {
@@ -365,7 +373,7 @@ class ContainerTemplateTests(unittest.TestCase):
         commands = {command.name: command for command in plan.commands}
 
         self.assertIn(
-            "vainfo --display drm --device /dev/dri/renderD129",
+            "LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri vainfo --display drm --device /dev/dri/renderD129",
             commands["gpu.vaapi.vainfo"].command,
         )
         self.assertIn("gpu_vaapi_vainfo", commands["gpu.vaapi.vainfo"].command)
@@ -381,6 +389,10 @@ class ContainerTemplateTests(unittest.TestCase):
             data["hardware"]["can"]["probe_timeout_seconds"] = 7
             data["hardware"]["encoding"]["vaapi_render_device"] = "/dev/dri/renderD129"
             data["hardware"]["encoding"]["dri_card_device"] = "/dev/dri/card2"
+            data["hardware"]["encoding"]["ffmpeg_binary"] = "/opt/mine-teleop/bin/ffmpeg"
+            data["hardware"]["encoding"]["ffprobe_binary"] = "/opt/mine-teleop/bin/ffprobe"
+            data["hardware"]["encoding"]["vainfo_binary"] = "/opt/mine-teleop/bin/vainfo"
+            data["hardware"]["encoding"]["libva_drivers_path"] = "/opt/mine-teleop/lib/dri"
             data["hardware"]["network"]["interface"] = "wwan1"
             config_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
@@ -408,11 +420,18 @@ class ContainerTemplateTests(unittest.TestCase):
         self.assertEqual(summary["hardware_devices"], ["/dev/dri/renderD129", "/dev/dri/card2"])
         self.assertEqual(summary["network_interface"], "wwan1")
         self.assertEqual(summary["can_probe_timeout_seconds"], 7)
+        self.assertEqual(summary["ffmpeg_binary"], "/opt/mine-teleop/bin/ffmpeg")
+        self.assertEqual(summary["ffprobe_binary"], "/opt/mine-teleop/bin/ffprobe")
+        self.assertEqual(summary["vainfo_binary"], "/opt/mine-teleop/bin/vainfo")
+        self.assertEqual(summary["libva_drivers_path"], "/opt/mine-teleop/lib/dri")
         self.assertIn("ip -details link show can42", commands["can.interface.show"]["command"])
         self.assertIn("script/check_can.sh can42", commands["minepilot.can.socket.probe"]["command"])
         self.assertIn("timeout 7s", commands["minepilot.can.sender.smoke"]["command"])
         self.assertIn("can_sender_main can42", commands["minepilot.can.sender.smoke"]["command"])
-        self.assertIn("vainfo --display drm --device /dev/dri/renderD129", commands["gpu.vaapi.vainfo"]["command"])
+        self.assertIn(
+            "LIBVA_DRIVERS_PATH=/opt/mine-teleop/lib/dri /opt/mine-teleop/bin/vainfo --display drm --device /dev/dri/renderD129",
+            commands["gpu.vaapi.vainfo"]["command"],
+        )
         self.assertIn("--hardware-device /dev/dri/renderD129", commands["vehicle.preflight"]["command"])
         self.assertIn("--hardware-device /dev/dri/card2", commands["vehicle.preflight"]["command"])
         self.assertIn("scripts/netem_plan.py --interface wwan1 --matrix", commands["network.weak.matrix"]["command"])
@@ -485,6 +504,14 @@ class ContainerTemplateTests(unittest.TestCase):
                 "wwan0",
                 "--mine-teleop-binary",
                 "/opt/mine-teleop/bin/mine-teleop",
+                "--ffmpeg-binary",
+                "/opt/mine-teleop/bin/ffmpeg",
+                "--ffprobe-binary",
+                "/opt/mine-teleop/bin/ffprobe",
+                "--vainfo-binary",
+                "/opt/mine-teleop/bin/vainfo",
+                "--libva-drivers-path",
+                "/opt/mine-teleop/lib/dri",
                 "--format",
                 "shell",
             ],
@@ -524,6 +551,7 @@ class ContainerTemplateTests(unittest.TestCase):
         self.assertIn("/opt/mine-teleop/bin/mine-teleop vehicle-media-agent --config /etc/mine-teleop/vehicle-agent.yaml --mode hardware-probes", result.stdout)
         self.assertIn("/opt/mine-teleop/bin/mine-teleop netem-plan --interface wwan0 --matrix", result.stdout)
         self.assertIn("/opt/mine-teleop/bin/mine-teleop acceptance-metrics-report --samples /tmp/mine-teleop-acceptance-samples.jsonl --scenario target-host-acceptance", result.stdout)
+        self.assertIn("LIBVA_DRIVERS_PATH=/opt/mine-teleop/lib/dri /opt/mine-teleop/bin/vainfo --display drm", result.stdout)
         self.assertNotIn("python3 vehicle-agent/vehicle_agent.py", result.stdout)
         self.assertNotIn("python3 scripts/chassis_bridge_check.py", result.stdout)
 

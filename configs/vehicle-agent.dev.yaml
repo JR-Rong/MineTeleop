@@ -98,6 +98,10 @@ hardware:
     gstreamer_fallback_plugins:
       - x264enc
     ffmpeg_probe_output_dir: /tmp/mine-teleop-vaapi
+    ffmpeg_binary: ffmpeg
+    ffprobe_binary: ffprobe
+    vainfo_binary: vainfo
+    libva_drivers_path: /usr/lib/x86_64-linux-gnu/dri
     validation_duration_seconds: 5
   network:
     interface: wwan0

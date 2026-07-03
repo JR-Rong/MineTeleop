@@ -212,6 +212,12 @@ def _container_build_script(
             "lib/libmine_teleop_chassis_bridge.so",
             "lib/libchassis_control.so",
         ],
+        "media_tools": [
+            "bin/ffmpeg",
+            "bin/ffprobe",
+            "bin/vainfo",
+            "lib/dri/iHD_drv_video.so",
+        ],
         "docs": [
             "docs/15-ubuntu-bundle-software.md",
             "docs/16-ubuntu-bundle-usage.md",
@@ -219,6 +225,7 @@ def _container_build_script(
         ],
         "smoke_commands": [
             "bin/mine-teleop --list",
+            "bin/ffmpeg -hide_banner -hwaccels",
             "bin/mine-teleop vehicle-agent --config /etc/mine-teleop/vehicle-agent.yaml --adapter-status",
             "bin/mine-teleop target-host-validation-plan --mine-teleop-binary /opt/mine-teleop/bin/mine-teleop --format shell",
         ],
@@ -250,9 +257,14 @@ def _container_build_script(
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-pip python3-venv binutils file git
         fi
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
+          ffmpeg \\
+          intel-media-va-driver \\
+          vainfo
         python3 -m pip install --no-cache-dir PyYAML pyinstaller
         rm -rf build/ubuntu-executable dist/mine-teleop
-        mkdir -p /workspace/output/bin /workspace/output/lib /workspace/output/configs /workspace/output/docs /workspace/output/manifest
+        mkdir -p /workspace/output/bin /workspace/output/lib /workspace/output/lib/dri /workspace/output/configs /workspace/output/docs /workspace/output/manifest
         pyinstaller --clean --onefile --name mine-teleop \\
           --distpath build/ubuntu-executable/dist \\
           --workpath build/ubuntu-executable/work \\
@@ -264,19 +276,82 @@ def _container_build_script(
           --add-data /workspace/mine-teleop/driver-console:driver-console \\
           --add-data /workspace/mine-teleop/signaling-server:signaling-server \\
           /workspace/mine-teleop/mine_teleop/cli.py
-        cp build/ubuntu-executable/dist/mine-teleop /workspace/output/bin/mine-teleop
+        cp build/ubuntu-executable/dist/mine-teleop /workspace/output/bin/mine-teleop.real
+        chmod +x /workspace/output/bin/mine-teleop.real
+        cat > /workspace/output/bin/mine-teleop <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(CDPATH= cd -- "$(dirname -- "${{BASH_SOURCE[0]}}")/.." && pwd)"
+export LD_LIBRARY_PATH="$root/lib:${{LD_LIBRARY_PATH:-}}"
+export LIBVA_DRIVERS_PATH="${{LIBVA_DRIVERS_PATH:-$root/lib/dri}}"
+exec "$root/bin/mine-teleop.real" "$@"
+SH
         chmod +x /workspace/output/bin/mine-teleop
         cp {shlex.quote(container_chassis_control_library)} /workspace/output/lib/libchassis_control.so
         {bridge_step}
+        copy_shared_libs() {{
+          for object in "$@"; do
+            ldd "$object" 2>/dev/null | awk '/=>/ {{print $3}} /^[[:space:]]*\\// {{print $1}}' | while read -r lib; do
+              [ -n "$lib" ] || continue
+              [ -f "$lib" ] || continue
+              case "$(basename "$lib")" in
+                libc.so.*|ld-linux-*|linux-vdso.so.*)
+                  continue
+                  ;;
+              esac
+              cp -L -n "$lib" /workspace/output/lib/ || true
+            done
+          done
+        }}
+        install_media_tool() {{
+          tool="$1"
+          real_name="$2"
+          real_path="$(command -v "$tool")"
+          cp -L "$real_path" "/workspace/output/bin/$real_name"
+          chmod +x "/workspace/output/bin/$real_name"
+          copy_shared_libs "$real_path"
+          cat > "/workspace/output/bin/$tool" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(CDPATH= cd -- "$(dirname -- "${{BASH_SOURCE[0]}}")/.." && pwd)"
+export LD_LIBRARY_PATH="$root/lib:${{LD_LIBRARY_PATH:-}}"
+export LIBVA_DRIVERS_PATH="${{LIBVA_DRIVERS_PATH:-$root/lib/dri}}"
+exec "$root/bin/TOOL_REAL_NAME" "$@"
+SH
+          sed -i "s/TOOL_REAL_NAME/$real_name/g" "/workspace/output/bin/$tool"
+          chmod +x "/workspace/output/bin/$tool"
+        }}
+        install_media_tool ffmpeg ffmpeg.real
+        install_media_tool ffprobe ffprobe.real
+        install_media_tool vainfo vainfo.real
+        for driver in /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so /usr/lib/x86_64-linux-gnu/dri/i965_drv_video.so; do
+          if [ -f "$driver" ]; then
+            cp -L "$driver" "/workspace/output/lib/dri/$(basename "$driver")"
+            copy_shared_libs "$driver"
+          fi
+        done
         cp configs/vehicle-agent.dev.yaml /workspace/output/configs/
+        python3 - <<'PY'
+from pathlib import Path
+import yaml
+
+path = Path("/workspace/output/configs/vehicle-agent.dev.yaml")
+config = yaml.safe_load(path.read_text(encoding="utf-8"))
+encoding = config.setdefault("hardware", {{}}).setdefault("encoding", {{}})
+encoding["ffmpeg_binary"] = "/opt/mine-teleop/bin/ffmpeg"
+encoding["ffprobe_binary"] = "/opt/mine-teleop/bin/ffprobe"
+encoding["vainfo_binary"] = "/opt/mine-teleop/bin/vainfo"
+encoding["libva_drivers_path"] = "/opt/mine-teleop/lib/dri"
+path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+PY
         cp configs/driver-console.dev.yaml /workspace/output/configs/
         cp README.md /workspace/output/docs/README.md
         cp docs/14-current-status-and-ipc-deployment.md /workspace/output/docs/
         cp docs/15-ubuntu-bundle-software.md /workspace/output/docs/
         cp docs/16-ubuntu-bundle-usage.md /workspace/output/docs/
         cp docs/17-ubuntu-bundle-architecture.md /workspace/output/docs/
-        file /workspace/output/bin/mine-teleop > /workspace/output/manifest/file.txt
-        ldd /workspace/output/bin/mine-teleop > /workspace/output/manifest/ldd.txt || true
+        file /workspace/output/bin/mine-teleop.real > /workspace/output/manifest/file.txt
+        ldd /workspace/output/bin/mine-teleop.real > /workspace/output/manifest/ldd.txt || true
         """
     ).strip()
     script += "\ncat > /workspace/output/manifest/bundle_manifest.json <<'MINE_TELEOP_MANIFEST'\n"

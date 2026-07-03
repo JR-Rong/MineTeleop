@@ -27,6 +27,12 @@ def main() -> int:
         choices=["pipeline", "vaapi-probe", "gst-probe", "hardware-probes", "hardware-report"],
         default="pipeline",
     )
+    parser.add_argument(
+        "--probe-execution",
+        choices=["host", "docker"],
+        default="host",
+        help="Emit host/bundle media probe commands by default; docker is for build-host development checks.",
+    )
     parser.add_argument("--lanes", type=int, default=4, help="Number of parallel VAAPI probe lanes.")
     parser.add_argument("--scenario", help="Hardware validation scenario name for --mode hardware-report.")
     parser.add_argument(
@@ -71,7 +77,7 @@ def main() -> int:
         print(f"gst_plugin_probe={plan.gstreamer_plugin_probe.command}")
         for scenario in plan.scenarios:
             print(f"scenario={scenario.name}")
-            print(scenario.docker_command())
+            print(scenario.host_command() if args.probe_execution == "host" else scenario.docker_command())
         print(f"metrics={','.join(plan.metrics_fields)}")
         return 0
 
@@ -98,8 +104,12 @@ def main() -> int:
         fps=30,
         duration_seconds=encoding.validation_duration_seconds,
         bitrate="4M",
+        ffmpeg_binary=encoding.ffmpeg_binary,
+        ffprobe_binary=encoding.ffprobe_binary,
+        vainfo_binary=encoding.vainfo_binary,
+        libva_drivers_path=encoding.libva_drivers_path,
     )
-    print(probe.docker_command())
+    print(probe.host_command() if args.probe_execution == "host" else probe.docker_command())
     return 0
 
 
@@ -111,6 +121,10 @@ def _hardware_encoding_plan_from_config(config, gstreamer_probe: GStreamerPlugin
         output_dir=encoding.ffmpeg_probe_output_dir,
         duration_seconds=encoding.validation_duration_seconds,
         gstreamer_plugin_probe=gstreamer_probe,
+        ffmpeg_binary=encoding.ffmpeg_binary,
+        ffprobe_binary=encoding.ffprobe_binary,
+        vainfo_binary=encoding.vainfo_binary,
+        libva_drivers_path=encoding.libva_drivers_path,
     )
 
 

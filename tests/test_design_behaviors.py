@@ -7727,7 +7727,12 @@ class CommandLineEntryPointTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.count("-c:v h264_vaapi"), 4)
-        self.assertIn("--device /dev/dri/renderD128", result.stdout)
+        self.assertIn("-vaapi_device /dev/dri/renderD128", result.stdout)
+        self.assertIn("export LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri", result.stdout)
+        self.assertIn("ffmpeg -hide_banner", result.stdout)
+        self.assertIn("ffprobe -hide_banner", result.stdout)
+        self.assertNotIn("sudo docker run", result.stdout)
+        self.assertNotIn("apt-get install", result.stdout)
 
     def test_vehicle_media_agent_prints_gstreamer_plugin_probe(self):
         result = subprocess.run(
@@ -7758,6 +7763,13 @@ class CommandLineEntryPointTests(unittest.TestCase):
             content = content.replace("/dev/dri/renderD128", "/dev/dri/renderD129")
             content = content.replace("/dev/dri/card1", "/dev/dri/card2")
             content = content.replace("/tmp/mine-teleop-vaapi", "/tmp/custom-vaapi")
+            content = content.replace("ffmpeg_binary: ffmpeg", "ffmpeg_binary: /opt/mine-teleop/bin/ffmpeg")
+            content = content.replace("ffprobe_binary: ffprobe", "ffprobe_binary: /opt/mine-teleop/bin/ffprobe")
+            content = content.replace("vainfo_binary: vainfo", "vainfo_binary: /opt/mine-teleop/bin/vainfo")
+            content = content.replace(
+                "libva_drivers_path: /usr/lib/x86_64-linux-gnu/dri",
+                "libva_drivers_path: /opt/mine-teleop/lib/dri",
+            )
             content = content.replace("      - vaapih264enc", "      - customh264enc")
             content = content.replace("      - x264enc", "      - openh264enc")
             config_path.write_text(content, encoding="utf-8")
@@ -7792,9 +7804,14 @@ class CommandLineEntryPointTests(unittest.TestCase):
             )
 
         self.assertEqual(vaapi_result.returncode, 0, vaapi_result.stderr)
-        self.assertIn("--device /dev/dri/renderD129", vaapi_result.stdout)
-        self.assertIn("--device /dev/dri/card2", vaapi_result.stdout)
-        self.assertIn("-v /tmp/custom-vaapi:/out", vaapi_result.stdout)
+        self.assertIn("-vaapi_device /dev/dri/renderD129", vaapi_result.stdout)
+        self.assertIn("/tmp/custom-vaapi/vaapi-h264-lane-0.mp4", vaapi_result.stdout)
+        self.assertIn("/opt/mine-teleop/bin/ffmpeg -hide_banner", vaapi_result.stdout)
+        self.assertIn("/opt/mine-teleop/bin/ffprobe -hide_banner", vaapi_result.stdout)
+        self.assertIn("/opt/mine-teleop/bin/vainfo --display drm", vaapi_result.stdout)
+        self.assertIn("export LIBVA_DRIVERS_PATH=/opt/mine-teleop/lib/dri", vaapi_result.stdout)
+        self.assertNotIn("sudo docker run", vaapi_result.stdout)
+        self.assertNotIn("apt-get install", vaapi_result.stdout)
         self.assertEqual(gst_result.returncode, 0, gst_result.stderr)
         self.assertIn("gst-inspect-1.0 customh264enc qsvh264enc vah264enc nvh264enc openh264enc", gst_result.stdout)
 

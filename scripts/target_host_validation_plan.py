@@ -40,6 +40,10 @@ def main() -> int:
         "--mine-teleop-binary",
         help="Generate commands that invoke this bundled mine-teleop binary instead of source-tree Python scripts.",
     )
+    parser.add_argument("--ffmpeg-binary")
+    parser.add_argument("--ffprobe-binary")
+    parser.add_argument("--vainfo-binary")
+    parser.add_argument("--libva-drivers-path")
     parser.add_argument("--format", choices=["jsonl", "shell"], default="jsonl")
     parser.add_argument("--artifact-dir", help="When printing shell, wrap commands to archive stdout, stderr, and return codes here.")
     args = parser.parse_args()
@@ -63,6 +67,10 @@ def main() -> int:
         acceptance_samples_path=args.acceptance_samples,
         acceptance_scenario=args.acceptance_scenario,
         mine_teleop_binary=args.mine_teleop_binary,
+        ffmpeg_binary=args.ffmpeg_binary or config_defaults["ffmpeg_binary"],
+        ffprobe_binary=args.ffprobe_binary or config_defaults["ffprobe_binary"],
+        vainfo_binary=args.vainfo_binary or config_defaults["vainfo_binary"],
+        libva_drivers_path=args.libva_drivers_path or config_defaults["libva_drivers_path"],
     )
     if args.format == "shell":
         print(plan.to_shell_script(artifact_dir=args.artifact_dir), end="")
@@ -78,6 +86,10 @@ def _vehicle_config_defaults(parser: argparse.ArgumentParser, vehicle_config_pat
         "can_probe_timeout_seconds": 3,
         "hardware_devices": ("/dev/dri/renderD128", "/dev/dri/card1"),
         "network_interface": "wwan0",
+        "ffmpeg_binary": "ffmpeg",
+        "ffprobe_binary": "ffprobe",
+        "vainfo_binary": "vainfo",
+        "libva_drivers_path": "/usr/lib/x86_64-linux-gnu/dri",
     }
     path = Path(vehicle_config_path)
     if not path.exists():
@@ -91,6 +103,10 @@ def _vehicle_config_defaults(parser: argparse.ArgumentParser, vehicle_config_pat
         "can_probe_timeout_seconds": config.hardware.can.probe_timeout_seconds,
         "hardware_devices": tuple(config.hardware.preflight_devices),
         "network_interface": config.hardware.network.interface,
+        "ffmpeg_binary": config.hardware.encoding.ffmpeg_binary,
+        "ffprobe_binary": config.hardware.encoding.ffprobe_binary,
+        "vainfo_binary": config.hardware.encoding.vainfo_binary,
+        "libva_drivers_path": config.hardware.encoding.libva_drivers_path,
     }
 
 

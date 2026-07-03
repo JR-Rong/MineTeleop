@@ -42,6 +42,10 @@ class ConfigContractTests(unittest.TestCase):
         self.assertEqual(config.hardware.encoding.dri_card_device, "/dev/dri/card1")
         self.assertTrue(config.hardware.encoding.require_hardware_encoder)
         self.assertIn("vaapih264enc", config.hardware.encoding.gstreamer_hardware_plugins)
+        self.assertEqual(config.hardware.encoding.ffmpeg_binary, "ffmpeg")
+        self.assertEqual(config.hardware.encoding.ffprobe_binary, "ffprobe")
+        self.assertEqual(config.hardware.encoding.vainfo_binary, "vainfo")
+        self.assertEqual(config.hardware.encoding.libva_drivers_path, "/usr/lib/x86_64-linux-gnu/dri")
         self.assertEqual(config.hardware.network.interface, "wwan0")
         self.assertEqual(config.field_safety.commissioning_mode, "bench")
         self.assertEqual(config.field_safety.max_speed_kph, 40.0)
@@ -50,6 +54,7 @@ class ConfigContractTests(unittest.TestCase):
         self.assertTrue(config.field_safety.require_time_sync)
         self.assertEqual(payload["hardware"]["can"]["interface"], "can0")
         self.assertEqual(payload["hardware"]["encoding"]["vaapi_render_device"], "/dev/dri/renderD128")
+        self.assertEqual(payload["hardware"]["encoding"]["ffmpeg_binary"], "ffmpeg")
         self.assertEqual(payload["field_safety"]["commissioning_mode"], "bench")
 
     def test_vehicle_config_can_load_toml_config_file(self):
@@ -1438,6 +1443,26 @@ vehicle_adapter:
                     str(chassis_library),
                     "--can-interface",
                     "can42",
+                    "--recording-root",
+                    "/home/user/mine-teleop/data/recordings",
+                    "--network-interface",
+                    "wlx6c1ff77d6624",
+                    "--ffmpeg-binary",
+                    "/home/user/mine-teleop/bin/ffmpeg",
+                    "--ffprobe-binary",
+                    "/home/user/mine-teleop/bin/ffprobe",
+                    "--vainfo-binary",
+                    "/home/user/mine-teleop/bin/vainfo",
+                    "--libva-drivers-path",
+                    "/home/user/mine-teleop/lib/dri",
+                    "--camera-device",
+                    "front=/dev/video0",
+                    "--camera-device",
+                    "rear=/dev/video2",
+                    "--camera-capture-size",
+                    "1280x720",
+                    "--camera-capture-fps",
+                    "30",
                     "--max-control-timeout-ms",
                     "900",
                     "--calibration-evidence",
@@ -1459,6 +1484,17 @@ vehicle_adapter:
         self.assertEqual(config.control.timeout_calibration.max_control_timeout_ms, 900)
         self.assertEqual(config.control.timeout_calibration.evidence, "bench-brake-test-2026-06-24")
         self.assertEqual(config.vehicle_adapter_contract.command_ack, "telemetry_feedback")
+        self.assertEqual(config.recording.root_dir, "/home/user/mine-teleop/data/recordings")
+        self.assertEqual(config.hardware.network.interface, "wlx6c1ff77d6624")
+        self.assertEqual(config.hardware.encoding.ffmpeg_binary, "/home/user/mine-teleop/bin/ffmpeg")
+        self.assertEqual(config.hardware.encoding.ffprobe_binary, "/home/user/mine-teleop/bin/ffprobe")
+        self.assertEqual(config.hardware.encoding.vainfo_binary, "/home/user/mine-teleop/bin/vainfo")
+        self.assertEqual(config.hardware.encoding.libva_drivers_path, "/home/user/mine-teleop/lib/dri")
+        self.assertEqual(config.cameras[0].device, "/dev/video0")
+        self.assertEqual(config.cameras[0].capture_width, 1280)
+        self.assertEqual(config.cameras[0].capture_height, 720)
+        self.assertTrue(config.cameras[1].enabled)
+        self.assertEqual(config.cameras[1].device, "/dev/video2")
         self.assertEqual(integration.chassis_control.abi, "c_shim")
         self.assertFalse(integration.chassis_control.requires_cpp_bridge)
         self.assertEqual(integration.chassis_control.bridge_library_path, str(bridge_library))

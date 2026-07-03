@@ -274,6 +274,10 @@ class EncodingHardwareConfig:
     gstreamer_hardware_plugins: List[str]
     gstreamer_fallback_plugins: List[str]
     ffmpeg_probe_output_dir: str
+    ffmpeg_binary: str
+    ffprobe_binary: str
+    vainfo_binary: str
+    libva_drivers_path: str
     validation_duration_seconds: int
 
 
@@ -416,6 +420,10 @@ def effective_vehicle_config_log_payload(config: VehicleConfig) -> Dict[str, Any
                 "gstreamer_hardware_plugins": list(config.hardware.encoding.gstreamer_hardware_plugins),
                 "gstreamer_fallback_plugins": list(config.hardware.encoding.gstreamer_fallback_plugins),
                 "ffmpeg_probe_output_dir": config.hardware.encoding.ffmpeg_probe_output_dir,
+                "ffmpeg_binary": config.hardware.encoding.ffmpeg_binary,
+                "ffprobe_binary": config.hardware.encoding.ffprobe_binary,
+                "vainfo_binary": config.hardware.encoding.vainfo_binary,
+                "libva_drivers_path": config.hardware.encoding.libva_drivers_path,
                 "validation_duration_seconds": config.hardware.encoding.validation_duration_seconds,
             },
             "network": {
@@ -1124,6 +1132,30 @@ def _parse_hardware(raw: Any) -> HardwareConfig:
                 "ffmpeg_probe_output_dir",
                 "hardware.encoding.ffmpeg_probe_output_dir",
                 default="/tmp/mine-teleop-vaapi",
+            ),
+            ffmpeg_binary=_optional_non_empty_string(
+                encoding,
+                "ffmpeg_binary",
+                "hardware.encoding.ffmpeg_binary",
+                default="ffmpeg",
+            ),
+            ffprobe_binary=_optional_non_empty_string(
+                encoding,
+                "ffprobe_binary",
+                "hardware.encoding.ffprobe_binary",
+                default="ffprobe",
+            ),
+            vainfo_binary=_optional_non_empty_string(
+                encoding,
+                "vainfo_binary",
+                "hardware.encoding.vainfo_binary",
+                default="vainfo",
+            ),
+            libva_drivers_path=_optional_non_empty_string(
+                encoding,
+                "libva_drivers_path",
+                "hardware.encoding.libva_drivers_path",
+                default="/usr/lib/x86_64-linux-gnu/dri",
             ),
             validation_duration_seconds=_positive_int(
                 {"validation_duration_seconds": encoding.get("validation_duration_seconds", 5)},

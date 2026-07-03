@@ -10,9 +10,15 @@
 mine-teleop-ubuntu-x86_64/
   bin/
     mine-teleop
+    ffmpeg
+    ffprobe
+    vainfo
   lib/
     libmine_teleop_chassis_bridge.so
     libchassis_control.so
+    *.so
+    dri/
+      iHD_drv_video.so
   configs/
     vehicle-agent.dev.yaml
     driver-console.dev.yaml
@@ -33,6 +39,11 @@ mine-teleop-ubuntu-x86_64/
 `libmine_teleop_chassis_bridge.so` 是 Mine Teleop C shim，负责给 Python 侧提供稳定 C ABI。
 
 `libchassis_control.so` 是底层 ChassisControl/MinePilot 动态库，负责真实底盘控制发送路径。
+
+`bin/mine-teleop`、`bin/ffmpeg`、`bin/ffprobe` 和 `bin/vainfo` 都通过随包 wrapper
+把 `LD_LIBRARY_PATH` 指向当前 bundle 的 `lib/`，把 `LIBVA_DRIVERS_PATH` 指向当前 bundle 的
+`lib/dri/`，避免使用工控机上的 `/usr/local/bin/ffmpeg`、系统 libva 或系统 VAAPI driver。
+随包 `lib/*.so` 包含这些运行件所需的动态库。
 
 ## 子命令
 
@@ -59,10 +70,10 @@ mine-teleop-ubuntu-x86_64/
 当前软件包用于工控机联调和验收证据收集，不代表完整生产 UI 已完成。真实 CAN、底盘控制量、急停、相机、VAAPI、TURN/S3 和场地制动仍必须在目标环境验证。
 
 这些现场差异已经暴露到 `configs/vehicle-agent.dev.yaml` 和部署后的
-`/etc/mine-teleop/vehicle-agent.yaml`：
+`$HOME/mine-teleop/etc/vehicle-agent.yaml`：
 
 - `hardware.can.*`：CAN interface、bitrate、probe 超时。
-- `cameras[*]` 和 `hardware.encoding.*`：相机设备、VAAPI/DRI 节点、GStreamer 硬编/降级插件。
+- `cameras[*]` 和 `hardware.encoding.*`：相机设备、VAAPI/DRI 节点、随包 ffmpeg/ffprobe/vainfo 路径、VAAPI driver 路径。
 - `ice.turn_servers` 和 `upload.s3.*`：TURN 与 S3 目标、凭据文件。
 - `field_safety.*`、`control.timeout_calibration`、`control.estop`：现场安全门禁和制动标定。
 
@@ -78,6 +89,6 @@ mine-teleop-ubuntu-x86_64/
 - Linux x86_64 和 SocketCAN。
 - 目标 CAN interface，例如 `can0`。
 - 与随包动态库 ABI 兼容的 glibc/libstdc++。
-- 如测试媒体链路，需要目标机已有相机设备、DRI/VAAPI 和 GStreamer/FFmpeg 工具。
+- 如测试媒体链路，需要目标机已有相机设备和 DRI/VAAPI 设备节点；FFmpeg/FFprobe/Vainfo 由 bundle 提供。
 
 工控机不需要 Docker。Docker 只用于构建机生成 `bin/mine-teleop` 和 bundle。

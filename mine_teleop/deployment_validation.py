@@ -555,6 +555,10 @@ class TargetHostValidationPlan:
         acceptance_samples_path: str = "/tmp/mine-teleop-acceptance-samples.jsonl",
         acceptance_scenario: str = "target-host-acceptance",
         mine_teleop_binary: str | None = None,
+        ffmpeg_binary: str = "ffmpeg",
+        ffprobe_binary: str = "ffprobe",
+        vainfo_binary: str = "vainfo",
+        libva_drivers_path: str = "/usr/lib/x86_64-linux-gnu/dri",
     ) -> "TargetHostValidationPlan":
         devices = tuple(hardware_devices)
         vaapi_render_device = _select_vaapi_render_device(devices)
@@ -633,7 +637,8 @@ class TargetHostValidationPlan:
                 ValidationCommand(
                     name=_GPU_VAAPI_COMMAND_NAME,
                     command=(
-                        f"vainfo --display drm --device {_quote(vaapi_render_device)} && "
+                        f"LIBVA_DRIVERS_PATH={_quote(libva_drivers_path)} "
+                        f"{_quote(vainfo_binary)} --display drm --device {_quote(vaapi_render_device)} && "
                         + _jsonl_echo_command(
                             {
                                 "device": vaapi_render_device,
@@ -845,6 +850,10 @@ class TargetHostValidationPlan:
                 "network_interface": network_interface,
                 "uploader_work_dir": uploader_work_dir,
                 "vehicle_config_path": vehicle_config_path,
+                "ffmpeg_binary": ffmpeg_binary,
+                "ffprobe_binary": ffprobe_binary,
+                "vainfo_binary": vainfo_binary,
+                "libva_drivers_path": libva_drivers_path,
             },
         )
 

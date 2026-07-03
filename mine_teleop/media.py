@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import math
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional, Set
 
 from .config import RuntimeConfigUpdateDecision, RuntimeConfigUpdatePolicy
 from .observability import ComponentLogEvent
+
+
+def _quote(value: str) -> str:
+    return shlex.quote(value)
 
 
 def _background_wait_script(commands: list[str]) -> str:
@@ -814,6 +819,40 @@ class FFmpegVaapiProbePlan:
     fps: int
     duration_seconds: int
     bitrate: str
+    ffmpeg_binary: str = "ffmpeg"
+    ffprobe_binary: str = "ffprobe"
+    vainfo_binary: str = "vainfo"
+    libva_drivers_path: str = "/usr/lib/x86_64-linux-gnu/dri"
+
+    def host_command(self) -> str:
+        if self.lanes <= 0:
+            raise ValueError("VAAPI probe plan must include at least one lane")
+        lane_commands = []
+        for lane in range(self.lanes):
+            lane_commands.append(
+                f"{_quote(self.ffmpeg_binary)} -hide_banner "
+                f"-vaapi_device {_quote(self.render_device)} "
+                f"-f lavfi -i testsrc2=size={self.width}x{self.height}:rate={self.fps} "
+                f"-t {self.duration_seconds} "
+                "-vf format=nv12,hwupload "
+                f"-c:v h264_vaapi -b:v {self.bitrate} "
+                f"-y {_quote(f'{self.output_dir}/vaapi-h264-lane-{lane}.mp4')}"
+            )
+        probe = (
+            f"{_quote(self.ffprobe_binary)} -hide_banner -select_streams v:0 "
+            "-show_entries stream=codec_name,width,height,avg_frame_rate,bit_rate "
+            f"-of default=nw=1 {_quote(f'{self.output_dir}/vaapi-h264-lane-0.mp4')}"
+        )
+        return " && ".join(
+            [
+                "set -e",
+                f"mkdir -p {_quote(self.output_dir)}",
+                f"export LIBVA_DRIVERS_PATH={_quote(self.libva_drivers_path)}",
+                f"{_quote(self.vainfo_binary)} --display drm --device {_quote(self.render_device)}",
+                _background_wait_script(lane_commands),
+                probe,
+            ]
+        )
 
     def docker_command(self) -> str:
         if self.lanes <= 0:
@@ -889,6 +928,40 @@ class FFmpegVaapiLoadScenario:
     output_dir: str
     duration_seconds: int
     lanes: tuple[FFmpegVaapiProbeLane, ...]
+    ffmpeg_binary: str = "ffmpeg"
+    ffprobe_binary: str = "ffprobe"
+    vainfo_binary: str = "vainfo"
+    libva_drivers_path: str = "/usr/lib/x86_64-linux-gnu/dri"
+
+    def host_command(self) -> str:
+        if not self.lanes:
+            raise ValueError("hardware encoding scenario must include at least one lane")
+        lane_commands = []
+        for lane in self.lanes:
+            lane_commands.append(
+                f"{_quote(self.ffmpeg_binary)} -hide_banner "
+                f"-vaapi_device {_quote(self.render_device)} "
+                f"-f lavfi -i testsrc2=size={lane.width}x{lane.height}:rate={lane.fps} "
+                f"-t {self.duration_seconds} "
+                "-vf format=nv12,hwupload "
+                f"-c:v h264_vaapi -b:v {lane.bitrate} "
+                f"-y {_quote(f'{self.output_dir}/{self.name}-{lane.lane_id}.mp4')}"
+            )
+        probe = (
+            f"{_quote(self.ffprobe_binary)} -hide_banner -select_streams v:0 "
+            "-show_entries stream=codec_name,width,height,avg_frame_rate,bit_rate "
+            f"-of default=nw=1 {_quote(f'{self.output_dir}/{self.name}-{self.lanes[0].lane_id}.mp4')}"
+        )
+        return " && ".join(
+            [
+                "set -e",
+                f"mkdir -p {_quote(self.output_dir)}",
+                f"export LIBVA_DRIVERS_PATH={_quote(self.libva_drivers_path)}",
+                f"{_quote(self.vainfo_binary)} --display drm --device {_quote(self.render_device)}",
+                _background_wait_script(lane_commands),
+                probe,
+            ]
+        )
 
     def docker_command(self) -> str:
         if not self.lanes:
@@ -943,6 +1016,10 @@ class HardwareEncodingValidationPlan:
         output_dir: str = "/tmp/mine-teleop-vaapi",
         duration_seconds: int = 5,
         gstreamer_plugin_probe: GStreamerPluginProbePlan | None = None,
+        ffmpeg_binary: str = "ffmpeg",
+        ffprobe_binary: str = "ffprobe",
+        vainfo_binary: str = "vainfo",
+        libva_drivers_path: str = "/usr/lib/x86_64-linux-gnu/dri",
     ) -> "HardwareEncodingValidationPlan":
         camera_ids = ("front", "rear", "left", "right")
         realtime_lanes = tuple(
@@ -975,6 +1052,10 @@ class HardwareEncodingValidationPlan:
                     output_dir=output_dir,
                     duration_seconds=duration_seconds,
                     lanes=realtime_lanes,
+                    ffmpeg_binary=ffmpeg_binary,
+                    ffprobe_binary=ffprobe_binary,
+                    vainfo_binary=vainfo_binary,
+                    libva_drivers_path=libva_drivers_path,
                 ),
                 FFmpegVaapiLoadScenario(
                     name="four-camera-recording-source",
@@ -983,6 +1064,10 @@ class HardwareEncodingValidationPlan:
                     output_dir=output_dir,
                     duration_seconds=duration_seconds,
                     lanes=recording_lanes,
+                    ffmpeg_binary=ffmpeg_binary,
+                    ffprobe_binary=ffprobe_binary,
+                    vainfo_binary=vainfo_binary,
+                    libva_drivers_path=libva_drivers_path,
                 ),
                 FFmpegVaapiLoadScenario(
                     name="four-camera-realtime-plus-recording",
@@ -991,6 +1076,10 @@ class HardwareEncodingValidationPlan:
                     output_dir=output_dir,
                     duration_seconds=duration_seconds,
                     lanes=(*realtime_lanes, *recording_lanes),
+                    ffmpeg_binary=ffmpeg_binary,
+                    ffprobe_binary=ffprobe_binary,
+                    vainfo_binary=vainfo_binary,
+                    libva_drivers_path=libva_drivers_path,
                 ),
             ),
             metrics_fields=(
