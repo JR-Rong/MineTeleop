@@ -554,6 +554,7 @@ class TargetHostValidationPlan:
         can_probe_timeout_seconds: int = 3,
         acceptance_samples_path: str = "/tmp/mine-teleop-acceptance-samples.jsonl",
         acceptance_scenario: str = "target-host-acceptance",
+        mine_teleop_binary: str | None = None,
     ) -> "TargetHostValidationPlan":
         devices = tuple(hardware_devices)
         vaapi_render_device = _select_vaapi_render_device(devices)
@@ -562,6 +563,37 @@ class TargetHostValidationPlan:
         can_probe_timeout_seconds = int(can_probe_timeout_seconds)
         if can_probe_timeout_seconds <= 0:
             raise ValueError("can_probe_timeout_seconds must be positive")
+        vehicle_agent_command = _entrypoint_command(
+            mine_teleop_binary,
+            "vehicle-agent",
+            "python3 vehicle-agent/vehicle_agent.py",
+        )
+        vehicle_media_agent_command = _entrypoint_command(
+            mine_teleop_binary,
+            "vehicle-media-agent",
+            "python3 vehicle-media-agent/vehicle_media_agent.py",
+        )
+        vehicle_uploader_command = _entrypoint_command(
+            mine_teleop_binary,
+            "vehicle-uploader",
+            "python3 vehicle-uploader/vehicle_uploader.py",
+        )
+        chassis_bridge_check_command = _entrypoint_command(
+            mine_teleop_binary,
+            "chassis-bridge-check",
+            "python3 scripts/chassis_bridge_check.py",
+        )
+        netem_plan_command = _entrypoint_command(
+            mine_teleop_binary,
+            "netem-plan",
+            "python3 scripts/netem_plan.py",
+        )
+        acceptance_metrics_command = _entrypoint_command(
+            mine_teleop_binary,
+            "acceptance-metrics-report",
+            "python3 scripts/acceptance_metrics_report.py",
+        )
+        chassis_bridge_check_mode_arg = "--skip-cmake" if mine_teleop_binary else "--build"
         minepilot_can_source_test = "test " + " -a ".join(
             f"-f {_quote(f'{minepilot_root}/{source_file}')}"
             for source_file in _REQUIRED_MINEPILOT_CAN_SOURCE_FILES
@@ -615,15 +647,18 @@ class TargetHostValidationPlan:
                 ),
                 ValidationCommand(
                     name=_HARDWARE_PROBES_COMMAND_NAME,
-                    command="python3 vehicle-media-agent/vehicle_media_agent.py --mode hardware-probes",
+                    command=(
+                        f"{vehicle_media_agent_command} --config {_quote(vehicle_config_path)} "
+                        "--mode hardware-probes"
+                    ),
                     required=True,
                     purpose="Print four-camera VAAPI and GStreamer hardware probe commands.",
                 ),
                 ValidationCommand(
                     name="vehicle.preflight",
                     command=(
-                        "python3 vehicle-agent/vehicle_agent.py "
-                        f"--config {_quote(vehicle_config_path)} --preflight {hardware_args}"
+                        f"{vehicle_agent_command} --config {_quote(vehicle_config_path)} "
+                        f"--preflight {hardware_args}"
                     ).strip(),
                     required=True,
                     purpose="Check vehicle config, camera paths, recording root, and hardware devices.",
@@ -721,14 +756,14 @@ class TargetHostValidationPlan:
                 ValidationCommand(
                     name="chassis.bridge.check",
                     command=(
-                        "python3 scripts/chassis_bridge_check.py "
+                        f"{chassis_bridge_check_command} "
                         f"--chassis-control-root {_quote(chassis_control_root)} "
                         f"--minepilot-root {_quote(minepilot_root)} "
                         f"--chassis-control-branch {_quote(chassis_control_branch)} "
                         f"--minepilot-branch {_quote(minepilot_branch)} "
                         f"--chassis-control-library {_quote(chassis_control_library)} "
                         f"--build-dir {_quote(bridge_build_dir)} "
-                        "--build"
+                        f"{chassis_bridge_check_mode_arg}"
                     ),
                     required=True,
                     purpose="Validate ChassisControl/MinePilot headers, library selection, CMake configure, and bridge build.",
@@ -736,8 +771,7 @@ class TargetHostValidationPlan:
                 ValidationCommand(
                     name="vehicle.adapter.status",
                     command=(
-                        "python3 vehicle-agent/vehicle_agent.py "
-                        f"--config {_quote(vehicle_config_path)} --adapter-status"
+                        f"{vehicle_agent_command} --config {_quote(vehicle_config_path)} --adapter-status"
                     ),
                     required=True,
                     purpose="Open the configured VehicleAdapter and archive opened/healthy bridge status.",
@@ -745,8 +779,7 @@ class TargetHostValidationPlan:
                 ValidationCommand(
                     name="vehicle.adapter.feedback_poll",
                     command=(
-                        "python3 vehicle-agent/vehicle_agent.py "
-                        f"--config {_quote(vehicle_config_path)} "
+                        f"{vehicle_agent_command} --config {_quote(vehicle_config_path)} "
                         "--adapter-status --poll-feedback --require-feedback"
                     ),
                     required=True,
@@ -755,8 +788,7 @@ class TargetHostValidationPlan:
                 ValidationCommand(
                     name=_UPLOADER_PROCESS_ONCE_COMMAND_NAME,
                     command=(
-                        "python3 vehicle-uploader/vehicle_uploader.py "
-                        "--service-mode --process-once "
+                        f"{vehicle_uploader_command} --service-mode --process-once "
                         f"--config {_quote(vehicle_config_path)} "
                         f"--work-dir {_quote(uploader_work_dir)} "
                         "--json"
@@ -766,14 +798,14 @@ class TargetHostValidationPlan:
                 ),
                 ValidationCommand(
                     name=_WEAK_NETWORK_MATRIX_COMMAND_NAME,
-                    command=f"python3 scripts/netem_plan.py --interface {_quote(network_interface)} --matrix",
+                    command=f"{netem_plan_command} --interface {_quote(network_interface)} --matrix",
                     required=False,
                     purpose="Print the documented weak-network tc matrix without applying it.",
                 ),
                 ValidationCommand(
                     name="media.hardware.report.template",
                     command=(
-                        "python3 vehicle-media-agent/vehicle_media_agent.py --mode hardware-report "
+                        f"{vehicle_media_agent_command} --config {_quote(vehicle_config_path)} --mode hardware-report "
                         "--scenario four-camera-realtime-720p30 "
                         "--ffprobe-output front-realtime-720p30=/tmp/front.ffprobe.txt "
                         "--ffprobe-output rear-realtime-720p30=/tmp/rear.ffprobe.txt "
@@ -787,7 +819,7 @@ class TargetHostValidationPlan:
                 ValidationCommand(
                     name="acceptance.metrics.report",
                     command=(
-                        "python3 scripts/acceptance_metrics_report.py "
+                        f"{acceptance_metrics_command} "
                         f"--samples {_quote(acceptance_samples_path)} "
                         f"--scenario {_quote(acceptance_scenario)}"
                     ),
@@ -809,6 +841,7 @@ class TargetHostValidationPlan:
                 "minepilot_branch": minepilot_branch,
                 "minepilot_can_probe_build_dir": minepilot_can_probe_build_dir,
                 "minepilot_root": minepilot_root,
+                "mine_teleop_binary": mine_teleop_binary,
                 "network_interface": network_interface,
                 "uploader_work_dir": uploader_work_dir,
                 "vehicle_config_path": vehicle_config_path,
@@ -1028,6 +1061,12 @@ class TargetHostValidationPlan:
 
 def _quote(value: str) -> str:
     return shlex.quote(value)
+
+
+def _entrypoint_command(mine_teleop_binary: str | None, subcommand: str, source_command: str) -> str:
+    if mine_teleop_binary:
+        return f"{_quote(mine_teleop_binary)} {subcommand}"
+    return source_command
 
 
 def _jsonl_echo_command(record: Mapping[str, Any]) -> str:

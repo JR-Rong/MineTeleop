@@ -220,7 +220,7 @@ def _container_build_script(
         "smoke_commands": [
             "bin/mine-teleop --list",
             "bin/mine-teleop vehicle-agent --config /etc/mine-teleop/vehicle-agent.yaml --adapter-status",
-            "bin/mine-teleop target-host-validation-plan --format shell",
+            "bin/mine-teleop target-host-validation-plan --mine-teleop-binary /opt/mine-teleop/bin/mine-teleop --format shell",
         ],
     }
     manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2)

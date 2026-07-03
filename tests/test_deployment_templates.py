@@ -297,7 +297,10 @@ class ContainerTemplateTests(unittest.TestCase):
             commands["chassis.bridge.check"].command,
         )
         self.assertIn("media.hardware.probes", commands)
-        self.assertIn("vehicle-media-agent/vehicle_media_agent.py --mode hardware-probes", commands["media.hardware.probes"].command)
+        self.assertIn(
+            "vehicle-media-agent/vehicle_media_agent.py --config /etc/mine-teleop/vehicle-agent.yaml --mode hardware-probes",
+            commands["media.hardware.probes"].command,
+        )
         self.assertIn("network.weak.matrix", commands)
         self.assertIn("scripts/netem_plan.py --interface wwan0 --matrix", commands["network.weak.matrix"].command)
         self.assertIn("can.interface.show", commands)
@@ -453,13 +456,76 @@ class ContainerTemplateTests(unittest.TestCase):
             result.stdout,
         )
         self.assertIn("python3 scripts/chassis_bridge_check.py", result.stdout)
-        self.assertIn("python3 vehicle-media-agent/vehicle_media_agent.py --mode hardware-probes", result.stdout)
+        self.assertIn(
+            "python3 vehicle-media-agent/vehicle_media_agent.py "
+            "--config /etc/mine-teleop/vehicle-agent.yaml --mode hardware-probes",
+            result.stdout,
+        )
         self.assertIn("python3 scripts/netem_plan.py --interface wwan0 --matrix", result.stdout)
         self.assertIn("MinePilot/script/check_can.sh can0", result.stdout)
         self.assertIn("can_sender_main can0", result.stdout)
         self.assertIn("--chassis-control-branch UI_Test", result.stdout)
         self.assertIn("--minepilot-branch merge_ui_test", result.stdout)
         self.assertIn("python3 scripts/acceptance_metrics_report.py --samples /tmp/mine-teleop-acceptance-samples.jsonl --scenario target-host-acceptance", result.stdout)
+
+    def test_target_host_validation_plan_cli_can_emit_bundle_entrypoint_shell_script(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/target_host_validation_plan.py",
+                "--vehicle-config",
+                "/etc/mine-teleop/vehicle-agent.yaml",
+                "--hardware-device",
+                "/dev/dri/renderD128",
+                "--hardware-device",
+                "/dev/dri/card1",
+                "--can-interface",
+                "can1",
+                "--network-interface",
+                "wwan0",
+                "--mine-teleop-binary",
+                "/opt/mine-teleop/bin/mine-teleop",
+                "--format",
+                "shell",
+            ],
+            cwd=Path.cwd(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "/opt/mine-teleop/bin/mine-teleop vehicle-agent "
+            "--config /etc/mine-teleop/vehicle-agent.yaml --preflight",
+            result.stdout,
+        )
+        self.assertIn(
+            "/opt/mine-teleop/bin/mine-teleop vehicle-agent "
+            "--config /etc/mine-teleop/vehicle-agent.yaml --adapter-status",
+            result.stdout,
+        )
+        self.assertIn(
+            "/opt/mine-teleop/bin/mine-teleop vehicle-agent "
+            "--config /etc/mine-teleop/vehicle-agent.yaml --adapter-status --poll-feedback --require-feedback",
+            result.stdout,
+        )
+        self.assertIn(
+            "/opt/mine-teleop/bin/mine-teleop vehicle-uploader --service-mode --process-once "
+            "--config /etc/mine-teleop/vehicle-agent.yaml --work-dir /var/lib/mine-teleop/uploader --json",
+            result.stdout,
+        )
+        self.assertIn(
+            "/opt/mine-teleop/bin/mine-teleop chassis-bridge-check "
+            "--chassis-control-root /Volumes/SystemDisk/Workspace/ChassisControl",
+            result.stdout,
+        )
+        self.assertIn("--skip-cmake", result.stdout)
+        self.assertIn("/opt/mine-teleop/bin/mine-teleop vehicle-media-agent --config /etc/mine-teleop/vehicle-agent.yaml --mode hardware-probes", result.stdout)
+        self.assertIn("/opt/mine-teleop/bin/mine-teleop netem-plan --interface wwan0 --matrix", result.stdout)
+        self.assertIn("/opt/mine-teleop/bin/mine-teleop acceptance-metrics-report --samples /tmp/mine-teleop-acceptance-samples.jsonl --scenario target-host-acceptance", result.stdout)
+        self.assertNotIn("python3 vehicle-agent/vehicle_agent.py", result.stdout)
+        self.assertNotIn("python3 scripts/chassis_bridge_check.py", result.stdout)
 
     def test_target_host_validation_plan_cli_can_emit_artifact_archiving_shell_script(self):
         result = subprocess.run(

@@ -126,6 +126,7 @@ artifact_dir=/var/log/mine-teleop/target-validation-$(date +%Y%m%d-%H%M%S)
 
 /opt/mine-teleop/bin/mine-teleop target-host-validation-plan \
   --vehicle-config /etc/mine-teleop/vehicle-agent.yaml \
+  --mine-teleop-binary /opt/mine-teleop/bin/mine-teleop \
   --chassis-control-root /opt/ChassisControl \
   --minepilot-root /opt/MinePilot \
   --bridge-library /opt/mine-teleop/lib/libmine_teleop_chassis_bridge.so \

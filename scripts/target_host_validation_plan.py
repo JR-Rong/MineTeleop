@@ -36,6 +36,10 @@ def main() -> int:
     parser.add_argument("--can-probe-timeout-seconds", type=int)
     parser.add_argument("--acceptance-samples", default="/tmp/mine-teleop-acceptance-samples.jsonl")
     parser.add_argument("--acceptance-scenario", default="target-host-acceptance")
+    parser.add_argument(
+        "--mine-teleop-binary",
+        help="Generate commands that invoke this bundled mine-teleop binary instead of source-tree Python scripts.",
+    )
     parser.add_argument("--format", choices=["jsonl", "shell"], default="jsonl")
     parser.add_argument("--artifact-dir", help="When printing shell, wrap commands to archive stdout, stderr, and return codes here.")
     args = parser.parse_args()
@@ -58,6 +62,7 @@ def main() -> int:
         can_probe_timeout_seconds=args.can_probe_timeout_seconds or config_defaults["can_probe_timeout_seconds"],
         acceptance_samples_path=args.acceptance_samples,
         acceptance_scenario=args.acceptance_scenario,
+        mine_teleop_binary=args.mine_teleop_binary,
     )
     if args.format == "shell":
         print(plan.to_shell_script(artifact_dir=args.artifact_dir), end="")
