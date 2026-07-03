@@ -92,6 +92,14 @@ class SessionManager:
                 raise SessionError("sender is not current session participant")
             return session
 
+    def active_session_for_vehicle(self, vehicle_id: str) -> Session | None:
+        _require_non_empty_string(vehicle_id, "vehicle_id")
+        with self._lock:
+            for session in self.sessions.values():
+                if session.vehicle_id == vehicle_id and session.state == "SESSION_ACTIVE":
+                    return session
+            return None
+
 
 def _require_non_empty_string(value: object, field_name: str) -> str:
     if not isinstance(value, str) or value == "":

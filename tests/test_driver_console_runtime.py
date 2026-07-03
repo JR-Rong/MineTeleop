@@ -493,15 +493,15 @@ class DriverConsoleHttpAppTests(unittest.TestCase):
                     _json_post(f"{console_url}/api/connect", {})
                     first = _json_post(
                         f"{console_url}/api/control/keyboard",
-                        {"keys": ["W", "D"], "gear": "D", "now_ms": 0},
+                        {"keys": ["ArrowUp", "ArrowRight"], "gear": "D", "now_ms": 0},
                     )
                     too_soon = _json_post(
                         f"{console_url}/api/control/keyboard",
-                        {"keys": ["W", "D"], "gear": "D", "now_ms": 20},
+                        {"keys": ["ArrowUp", "ArrowRight"], "gear": "D", "now_ms": 20},
                     )
                     brake = _json_post(
                         f"{console_url}/api/control/keyboard",
-                        {"keys": ["W", "S"], "gear": "D", "now_ms": 50},
+                        {"keys": ["ArrowUp", "ArrowDown"], "gear": "D", "now_ms": 50},
                     )
 
         self.assertTrue(first["sent"])

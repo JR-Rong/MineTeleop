@@ -515,6 +515,28 @@ class SignalingHttpService:
                         return
                     self._json_response(200, payload)
                     return
+                if len(parts) == 3 and parts[0] == "vehicles" and parts[2] == "session":
+                    query = parse_qs(parsed.query)
+                    vehicle_id = parts[1]
+                    try:
+                        service.devices.validate(vehicle_id, query.get("device_token", [""])[0])
+                    except PermissionError as exc:
+                        self._json_response(401, {"error": str(exc)})
+                        return
+                    active = service.sessions.active_session_for_vehicle(vehicle_id)
+                    if active is None:
+                        self._json_response(200, {"vehicle_id": vehicle_id, "session_id": "", "state": "none"})
+                        return
+                    self._json_response(
+                        200,
+                        {
+                            "vehicle_id": vehicle_id,
+                            "session_id": active.session_id,
+                            "driver_id": active.driver_id,
+                            "state": active.state,
+                        },
+                    )
+                    return
                 self._json_response(404, {"error": "not found"})
 
             def do_POST(self) -> None:

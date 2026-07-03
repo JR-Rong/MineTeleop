@@ -13,10 +13,10 @@ control:
   rate_hz: 20
   estop_hold_ms: 500
   keyboard:
-    steering_left: A
-    steering_right: D
-    throttle: W
-    brake: S
+    steering_left: ArrowLeft
+    steering_right: ArrowRight
+    throttle: ArrowUp
+    brake: ArrowDown
     estop: E
   gamepad:
     enabled: true

@@ -16,6 +16,7 @@ from mine_teleop.preflight import VehiclePreflightChecker
 from mine_teleop.time_sync import TimeSyncMonitor, TimeSyncStatus
 from mine_teleop.vehicle_adapter import create_vehicle_adapter
 from mine_teleop.vehicle_control_service import VehicleControlService
+from mine_teleop.vehicle_teleop_runtime import VehicleTeleopRuntime
 
 
 def main() -> int:
@@ -46,10 +47,31 @@ def main() -> int:
         default=[],
         help="Additional hardware device path to check during --preflight.",
     )
+    parser.add_argument(
+        "--teleop",
+        action="store_true",
+        help="Run the live teleop loop: consume relayed driver control commands and execute them.",
+    )
+    parser.add_argument(
+        "--signaling-http-url",
+        default="",
+        help="Signaling base URL for --teleop (defaults to the vehicle config cloud.signaling_url).",
+    )
+    parser.add_argument("--device-token", default="dev-device-secret", help="Vehicle device token for --teleop.")
+    parser.add_argument("--teleop-duration-ms", type=int, default=5000, help="How long to run the --teleop loop.")
+    parser.add_argument("--teleop-poll-interval-ms", type=int, default=50, help="--teleop signaling poll cadence.")
+    parser.add_argument(
+        "--teleop-session-wait-ms",
+        type=int,
+        default=5000,
+        help="How long --teleop waits for an active driver session before giving up.",
+    )
     args = parser.parse_args()
 
     config = load_vehicle_config(args.config)
     print(json.dumps(effective_vehicle_config_log_payload(config), ensure_ascii=False, sort_keys=True))
+    if args.teleop:
+        return _run_teleop(config, args)
     if args.adapter_status:
         return _run_adapter_status_smoke(
             config,
@@ -136,6 +158,21 @@ def main() -> int:
         f"accepted_commands={result.commands_applied_before_disconnect}"
     )
     return 0
+
+
+def _run_teleop(config, args) -> int:
+    runtime = VehicleTeleopRuntime(
+        config,
+        signaling_http_url=args.signaling_http_url or config.cloud.signaling_url,
+        device_token=args.device_token,
+    )
+    summary = runtime.run(
+        duration_ms=args.teleop_duration_ms,
+        poll_interval_ms=args.teleop_poll_interval_ms,
+        session_wait_ms=args.teleop_session_wait_ms,
+    )
+    print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    return 0 if summary.get("session_discovered") else 2
 
 
 def _run_adapter_status_smoke(config, *, poll_feedback: bool = False, require_feedback: bool = False) -> int:
