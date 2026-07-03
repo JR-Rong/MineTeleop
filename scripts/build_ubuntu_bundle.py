@@ -218,12 +218,14 @@ def _container_build_script(
             "bin/vainfo",
             "lib/dri/iHD_drv_video.so",
         ],
+        "manual_smoke": "manual-smoke.sh",
         "docs": [
             "docs/15-ubuntu-bundle-software.md",
             "docs/16-ubuntu-bundle-usage.md",
             "docs/17-ubuntu-bundle-architecture.md",
         ],
         "smoke_commands": [
+            "./manual-smoke.sh",
             "bin/mine-teleop --list",
             "bin/ffmpeg -hide_banner -hwaccels",
             "bin/mine-teleop vehicle-agent --config /etc/mine-teleop/vehicle-agent.yaml --adapter-status",
@@ -345,6 +347,8 @@ encoding["libva_drivers_path"] = "/opt/mine-teleop/lib/dri"
 path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 PY
         cp configs/driver-console.dev.yaml /workspace/output/configs/
+        cp scripts/ipc_manual_smoke.sh /workspace/output/manual-smoke.sh
+        chmod +x /workspace/output/manual-smoke.sh
         cp README.md /workspace/output/docs/README.md
         cp docs/14-current-status-and-ipc-deployment.md /workspace/output/docs/
         cp docs/15-ubuntu-bundle-software.md /workspace/output/docs/

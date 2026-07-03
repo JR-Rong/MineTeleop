@@ -56,6 +56,28 @@ ldd "$base/bin/mine-teleop.real"
 ldd "$base/lib/libmine_teleop_chassis_bridge.so"
 ```
 
+包根目录还包含一个手动 smoke 入口，不安装服务、不设置自动启动，适合现场先验证
+主程序、相机、CAN 只读状态、adapter 打开状态和 loopback 信令：
+
+```bash
+cd "$HOME/mine-teleop"
+./manual-smoke.sh
+```
+
+默认检查 `can1`、`/dev/video0`、`/dev/video2` 和 `/dev/dri/renderD128`。如果现场设备名不同，
+用环境变量覆盖：
+
+```bash
+MINE_TELEOP_CAN_IFACE=can0 \
+MINE_TELEOP_CAMERAS="/dev/video4 /dev/video6" \
+MINE_TELEOP_VAAPI_DEVICE=/dev/dri/renderD128 \
+./manual-smoke.sh
+```
+
+脚本不会执行 `vehicle-agent --run-loop`，也不会运行包含 `can_sender_main` 的全量
+`target-validation.sh`。如果 `adapter-feedback` 只返回 `received=false`，说明 CAN 口和 adapter
+可打开，但真实底盘反馈帧尚未按当前协议读到，仍不能进入真实控制测试。
+
 ## 3. 生成车端配置
 
 首次联调用示例命令生成真实 adapter 配置：
