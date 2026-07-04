@@ -349,7 +349,17 @@ class DriverConsoleRuntime:
             "last_command": self._last_command.to_dict() if self._last_command else None,
         }
 
-    def ingest_encoded_frame(self, camera_id: str, codec: str, payload: bytes) -> dict[str, Any]:
+    def ingest_encoded_frame(
+        self,
+        camera_id: str,
+        codec: str,
+        payload: bytes,
+        *,
+        captured_at_ms: int | None = None,
+        encoded_at_ms: int | None = None,
+        sent_at_ms: int | None = None,
+        received_at_ms: int | None = None,
+    ) -> dict[str, Any]:
         if not camera_id:
             raise ValueError("camera_id is required")
         if codec.lower() != "h264":
@@ -359,6 +369,10 @@ class DriverConsoleRuntime:
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             raise RuntimeError("ffmpeg is required to decode control-console media frames")
+        receive_time_ms = _now_ms() if received_at_ms is None else _optional_non_negative_int(received_at_ms, "received_at_ms")
+        captured_at_ms = _optional_non_negative_int(captured_at_ms, "captured_at_ms")
+        encoded_at_ms = _optional_non_negative_int(encoded_at_ms, "encoded_at_ms")
+        sent_at_ms = _optional_non_negative_int(sent_at_ms, "sent_at_ms")
         self._ensure_camera(camera_id)
         self.frame_dir.mkdir(parents=True, exist_ok=True)
         encoded_path = self.frame_dir / f"{camera_id}.h264"
@@ -381,21 +395,34 @@ class DriverConsoleRuntime:
             ],
             check=True,
         )
+        decoded_at_ms = _now_ms()
         size_bytes = frame_path.stat().st_size
         if size_bytes <= 0:
             raise RuntimeError("decoded frame is empty")
         current = self.dashboard.camera_status[camera_id]
+        latency = _non_negative_delta(decoded_at_ms, captured_at_ms)
         self.dashboard.update_camera_status(
             camera_id,
             state="connected",
             fps=current.fps,
             bitrate_kbps=current.bitrate_kbps,
-            latency_ms=current.latency_ms,
+            latency_ms=latency if latency is not None else current.latency_ms,
             message="decoded_frame_received",
         )
         self.latest_frame_by_camera[camera_id] = frame_path
         frame_sequence = self.decoded_frame_count_by_camera.get(camera_id, 0) + 1
         self.decoded_frame_count_by_camera[camera_id] = frame_sequence
+        timing = {
+            "captured_at_ms": captured_at_ms,
+            "encoded_at_ms": encoded_at_ms,
+            "sent_at_ms": sent_at_ms,
+            "received_at_ms": receive_time_ms,
+            "decoded_at_ms": decoded_at_ms,
+            "encode_latency_ms": _non_negative_delta(encoded_at_ms, captured_at_ms),
+            "transport_latency_ms": _non_negative_delta(receive_time_ms, sent_at_ms),
+            "decode_latency_ms": max(0, decoded_at_ms - receive_time_ms),
+            "end_to_end_latency_ms": latency,
+        }
         return {
             "camera_id": camera_id,
             "codec": codec.lower(),
@@ -403,7 +430,7 @@ class DriverConsoleRuntime:
             "frame_sequence": frame_sequence,
             "frame_path": str(frame_path),
             "frame_size_bytes": size_bytes,
-        }
+        } | {key: value for key, value in timing.items() if value is not None}
 
     def read_decoded_frame(self, camera_id: str) -> bytes:
         frame_path = self.latest_frame_by_camera.get(camera_id)
@@ -611,6 +638,9 @@ class DriverConsoleHttpApp:
                             camera_id,
                             codec,
                             base64.b64decode(payload_base64.encode("ascii"), validate=True),
+                            captured_at_ms=_optional_payload_int(payload, "captured_at_ms"),
+                            encoded_at_ms=_optional_payload_int(payload, "encoded_at_ms"),
+                            sent_at_ms=_optional_payload_int(payload, "sent_at_ms"),
                         )
                         self._json_response(200, frame | {"snapshot": app.runtime.snapshot()})
                         return
@@ -1016,12 +1046,37 @@ def _optional_payload_string(payload: dict[str, Any], key: str) -> str | None:
     return _require_non_empty_string(value, key)
 
 
+def _optional_payload_int(payload: dict[str, Any], key: str) -> int | None:
+    if key not in payload:
+        return None
+    value = payload[key]
+    if value is None:
+        return None
+    return _optional_non_negative_int(value, key)
+
+
 def _require_non_empty_string(value: Any, field: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string")
     if not value:
         raise ValueError(f"{field} must be a non-empty string")
     return value
+
+
+def _optional_non_negative_int(value: Any, field: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be a non-negative integer")
+    if value < 0:
+        raise ValueError(f"{field} must be non-negative")
+    return value
+
+
+def _non_negative_delta(later_ms: int | None, earlier_ms: int | None) -> int | None:
+    if later_ms is None or earlier_ms is None:
+        return None
+    return max(0, later_ms - earlier_ms)
 
 
 def _now_ms() -> int:

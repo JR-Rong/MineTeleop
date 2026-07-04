@@ -66,6 +66,11 @@ def main() -> int:
         default=5000,
         help="How long --teleop waits for an active driver session before giving up.",
     )
+    parser.add_argument(
+        "--teleop-log-controls",
+        action="store_true",
+        help="With --teleop, print one JSONL record for each accepted control command.",
+    )
     args = parser.parse_args()
 
     config = load_vehicle_config(args.config)
@@ -170,6 +175,11 @@ def _run_teleop(config, args) -> int:
         duration_ms=args.teleop_duration_ms,
         poll_interval_ms=args.teleop_poll_interval_ms,
         session_wait_ms=args.teleop_session_wait_ms,
+        control_log_callback=(
+            lambda record: print(json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)
+            if args.teleop_log_controls
+            else None
+        ),
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return 0 if summary.get("session_discovered") else 2

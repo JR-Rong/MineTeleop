@@ -805,6 +805,71 @@ class DriverConsoleHttpAppTests(unittest.TestCase):
         self.assertEqual(status["dashboard"]["cameras"]["front"]["message"], "decoded_frame_received")
         self.assertEqual(status["decoded_frame_count_by_camera"]["front"], 2)
 
+    def test_http_app_records_media_frame_latency(self):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("ffmpeg is required for H.264 decode smoke")
+        with tempfile.TemporaryDirectory() as tmp:
+            frame_dir = Path(tmp) / "frames"
+            encoded_path = Path(tmp) / "front.h264"
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=160x90:rate=1",
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "zerolatency",
+                    "-f",
+                    "h264",
+                    str(encoded_path),
+                ],
+                check=True,
+            )
+            runtime = DriverConsoleRuntime.from_config(
+                "configs/driver-console.dev.yaml",
+                signaling_http_url="http://127.0.0.1:8765",
+                vehicle_id="vehicle-001",
+                password="dev-password",
+                control_sink=RecordingControlCommandSink(),
+                frame_dir=frame_dir,
+            )
+            captured_at_ms = int(time.time() * 1000) - 120
+            encoded_at_ms = captured_at_ms + 20
+            sent_at_ms = captured_at_ms + 40
+            app = DriverConsoleHttpApp(runtime)
+            with app.running("127.0.0.1", 0) as console_url:
+                decoded = _json_post(
+                    f"{console_url}/api/media/frame",
+                    {
+                        "camera_id": "front",
+                        "codec": "h264",
+                        "payload_base64": base64.b64encode(encoded_path.read_bytes()).decode("ascii"),
+                        "captured_at_ms": captured_at_ms,
+                        "encoded_at_ms": encoded_at_ms,
+                        "sent_at_ms": sent_at_ms,
+                    },
+                )
+                status = _json_get(f"{console_url}/api/status")
+
+        self.assertTrue(decoded["frame_received"])
+        self.assertGreaterEqual(decoded["end_to_end_latency_ms"], 0)
+        self.assertGreaterEqual(decoded["transport_latency_ms"], 0)
+        self.assertGreaterEqual(decoded["decode_latency_ms"], 0)
+        self.assertEqual(decoded["encode_latency_ms"], 20)
+        self.assertEqual(status["dashboard"]["cameras"]["front"]["latency_ms"], decoded["end_to_end_latency_ms"])
+
     def test_driver_console_cli_can_serve_http_control_program(self):
         with tempfile.TemporaryDirectory() as tmp:
             port_file = Path(tmp) / "driver-console.port"

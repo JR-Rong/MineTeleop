@@ -44,7 +44,7 @@ def main() -> int:
     container_bridge_library = (
         _container_path_for(bridge_library, chassis_control_root, minepilot_root)
         if bridge_library is not None
-        else "/workspace/output/lib/libmine_teleop_chassis_bridge.so"
+        else ""
     )
     container_script = _container_build_script(
         build_bridge=not args.skip_bridge_build,
@@ -248,25 +248,100 @@ def _container_build_script(
             cp build/ubuntu-chassis-bridge/libmine_teleop_chassis_bridge.so /workspace/output/lib/
             """
         ).strip()
-    else:
+    elif container_bridge_library:
         bridge_step = f"cp {shlex.quote(container_bridge_library)} /workspace/output/lib/libmine_teleop_chassis_bridge.so"
+    else:
+        bridge_step = textwrap.dedent(
+            """
+            if ! command -v cc >/dev/null 2>&1; then
+              echo "C compiler is required to build the no-CAN chassis bridge stub" >&2
+              exit 2
+            fi
+            cat > build/ubuntu-chassis-bridge-stub.c <<'C'
+#include "mine_teleop_chassis_bridge.h"
+
+#include <string.h>
+
+int mine_teleop_chassis_open(const char* can_interface)
+{
+    (void)can_interface;
+    return -95;
+}
+
+int mine_teleop_chassis_apply_state(
+    int target_gear,
+    double target_vx,
+    double target_ax,
+    const double* steering_values,
+    int steering_count)
+{
+    (void)target_gear;
+    (void)target_vx;
+    (void)target_ax;
+    (void)steering_values;
+    (void)steering_count;
+    return -95;
+}
+
+int mine_teleop_chassis_emergency_stop()
+{
+    return -95;
+}
+
+int mine_teleop_chassis_update_feedback(const struct MineTeleopChassisFeedback* feedback)
+{
+    (void)feedback;
+    return -95;
+}
+
+int mine_teleop_chassis_poll_feedback(struct MineTeleopChassisFeedback* feedback)
+{
+    if (feedback != 0) {
+        memset(feedback, 0, sizeof(*feedback));
+    }
+    return 1;
+}
+
+int mine_teleop_chassis_read_telemetry(struct MineTeleopChassisTelemetry* telemetry)
+{
+    if (telemetry != 0) {
+        memset(telemetry, 0, sizeof(*telemetry));
+    }
+    return -95;
+}
+
+int mine_teleop_chassis_close()
+{
+    return 0;
+}
+C
+            cc -shared -fPIC \\
+              -Ideployments/chassis-control-bridge \\
+              build/ubuntu-chassis-bridge-stub.c \\
+              -Wl,-soname,libmine_teleop_chassis_bridge.so \\
+              -o /workspace/output/lib/libmine_teleop_chassis_bridge.so
+            """
+        ).strip()
 
     script = textwrap.dedent(
         f"""
         set -euo pipefail
         cd /workspace/mine-teleop
+        apt_get() {{
+          apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 "$@"
+        }}
         if ! python3 -m pip --version >/dev/null 2>&1; then
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-pip python3-venv binutils file git
+          apt_get update
+          DEBIAN_FRONTEND=noninteractive apt_get install -y --no-install-recommends python3-pip python3-venv binutils file git
         fi
-        apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
+        apt_get update
+        DEBIAN_FRONTEND=noninteractive apt_get install -y --no-install-recommends \\
           ffmpeg \\
           intel-media-va-driver \\
           vainfo
         python3 -m pip install --no-cache-dir PyYAML pyinstaller
         rm -rf build/ubuntu-executable dist/mine-teleop
-        mkdir -p /workspace/output/bin /workspace/output/lib /workspace/output/lib/dri /workspace/output/configs /workspace/output/docs /workspace/output/manifest
+        mkdir -p /workspace/output/bin /workspace/output/lib /workspace/output/lib/dri /workspace/output/configs /workspace/output/docs /workspace/output/manifest /workspace/output/scripts
         pyinstaller --clean --onefile --name mine-teleop \\
           --distpath build/ubuntu-executable/dist \\
           --workpath build/ubuntu-executable/work \\
@@ -347,6 +422,8 @@ encoding["libva_drivers_path"] = "/opt/mine-teleop/lib/dri"
 path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 PY
         cp configs/driver-console.dev.yaml /workspace/output/configs/
+        cp scripts/run_vehicle_live_media.sh /workspace/output/scripts/
+        chmod +x /workspace/output/scripts/run_vehicle_live_media.sh
         cp scripts/ipc_manual_smoke.sh /workspace/output/manual-smoke.sh
         chmod +x /workspace/output/manual-smoke.sh
         cp README.md /workspace/output/docs/README.md

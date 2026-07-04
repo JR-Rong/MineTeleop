@@ -165,6 +165,7 @@ def run_smoke(
             "frame_path": str(frame["path"]),
             "frame_size_bytes": frame["size_bytes"],
             "frame_sequences": frame["frame_sequences"],
+            "latency": frame["latency"],
             "decoded_frame_count_by_camera": console_snapshot.get("decoded_frame_count_by_camera", {}),
             "dashboard": console_snapshot["dashboard"],
         },
@@ -363,12 +364,18 @@ def _decode_test_frame(artifact_dir: Path, *, driver_console_url: str) -> dict[s
     encoded_base64 = base64.b64encode(encoded_path.read_bytes()).decode("ascii")
     decoded_results: list[dict[str, Any]] = []
     for expected_sequence in (1, 2):
+        captured_at_ms = int(time.time() * 1000) - 100
+        encoded_at_ms = captured_at_ms + 20
+        sent_at_ms = int(time.time() * 1000)
         decoded = _json_post(
             f"{driver_console_url}/api/media/frame",
             {
                 "camera_id": "front",
                 "codec": "h264",
                 "payload_base64": encoded_base64,
+                "captured_at_ms": captured_at_ms,
+                "encoded_at_ms": encoded_at_ms,
+                "sent_at_ms": sent_at_ms,
             },
         )
         if not decoded.get("frame_received"):
@@ -389,6 +396,12 @@ def _decode_test_frame(artifact_dir: Path, *, driver_console_url: str) -> dict[s
         "path": frame_path,
         "size_bytes": size_bytes,
         "frame_sequences": [decoded["frame_sequence"] for decoded in decoded_results],
+        "latency": {
+            "end_to_end_latency_ms": decoded_results[-1].get("end_to_end_latency_ms", 0),
+            "transport_latency_ms": decoded_results[-1].get("transport_latency_ms", 0),
+            "decode_latency_ms": decoded_results[-1].get("decode_latency_ms", 0),
+            "encode_latency_ms": decoded_results[-1].get("encode_latency_ms", 0),
+        },
     }
 
 

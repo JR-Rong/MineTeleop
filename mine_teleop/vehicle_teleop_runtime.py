@@ -40,6 +40,7 @@ class VehicleTeleopRuntime:
         self.processed_control_commands = 0
         self._last_applied_command: ControlCommand | None = None
         self._last_result: ReceiveResult | None = None
+        self.control_receive_logs: list[dict[str, Any]] = []
 
     @classmethod
     def from_config(
@@ -100,6 +101,7 @@ class VehicleTeleopRuntime:
             raise RuntimeError("signaling messages response must contain a messages list")
         received = 0
         applied = 0
+        current_logs: list[dict[str, Any]] = []
         for message in messages:
             if not isinstance(message, dict) or message.get("type") != "control_command":
                 continue
@@ -110,14 +112,20 @@ class VehicleTeleopRuntime:
             if result.accepted and result.command is not None:
                 applied += 1
                 self._last_applied_command = result.command
+                record = _control_receive_record(result.command, timestamp)
+                current_logs.append(record)
+                self.control_receive_logs.append(record)
         # Always advance the safety state machine so command-timeout braking and
         # telemetry continue even when no new command arrived this cycle.
         self.service.tick(timestamp)
         self.processed_control_commands += applied
+        latest_latency = current_logs[-1]["control_latency_ms"] if current_logs else None
         return {
             "received_control_commands": received,
             "applied_control_commands": applied,
             "safety_state": self.service.safety.state.value,
+            "control_latency_ms": latest_latency,
+            "control_receive_logs": current_logs,
         }
 
     def run(
@@ -127,6 +135,7 @@ class VehicleTeleopRuntime:
         poll_interval_ms: int = 50,
         session_wait_ms: int = 5_000,
         now_fn: Any = None,
+        control_log_callback: Any = None,
     ) -> dict[str, Any]:
         clock = now_fn or _now_ms
         self.register_online()
@@ -143,7 +152,10 @@ class VehicleTeleopRuntime:
             time.sleep(poll_interval_ms / 1000.0)
         deadline = clock() + duration_ms
         while clock() < deadline:
-            self.poll_and_execute(now_ms=clock())
+            result = self.poll_and_execute(now_ms=clock())
+            if control_log_callback is not None:
+                for record in result["control_receive_logs"]:
+                    control_log_callback(record)
             time.sleep(poll_interval_ms / 1000.0)
         summary = self.summary()
         summary["session_discovered"] = True
@@ -159,7 +171,10 @@ class VehicleTeleopRuntime:
                 "applied_command_count": 0,
                 "processed_control_commands": 0,
                 "last_command": None,
+                "control_latency_ms_avg": 0.0,
+                "control_receive_logs": [],
             }
+        latencies = [record["control_latency_ms"] for record in self.control_receive_logs]
         return {
             "event": "vehicle_teleop_run",
             "vehicle_id": self.vehicle_id,
@@ -169,6 +184,8 @@ class VehicleTeleopRuntime:
             "processed_control_commands": self.processed_control_commands,
             "telemetry_count": len(self.service.telemetry_history),
             "last_command": self._last_applied_command.to_dict() if self._last_applied_command else None,
+            "control_latency_ms_avg": _average(latencies),
+            "control_receive_logs": list(self.control_receive_logs[-20:]),
         }
 
 
@@ -187,6 +204,29 @@ def _normalize_signaling_http_url(url: str) -> str:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _control_receive_record(command: ControlCommand, receive_time_ms: int) -> dict[str, Any]:
+    return {
+        "event": "vehicle_control_command_received",
+        "vehicle_id": command.vehicle_id,
+        "session_id": command.session_id,
+        "seq": command.seq,
+        "command_ts_ms": command.ts_ms,
+        "receive_time_ms": receive_time_ms,
+        "control_latency_ms": max(0, receive_time_ms - command.ts_ms),
+        "gear": command.gear,
+        "steering": command.steering,
+        "throttle": command.throttle,
+        "brake": command.brake,
+        "estop": command.estop,
+    }
+
+
+def _average(values: list[int]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
 
 
 def _json_get(url: str) -> dict[str, Any]:

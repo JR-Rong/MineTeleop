@@ -17,6 +17,7 @@ from mine_teleop.media import (
     HardwareEncodingValidationPlan,
     HardwareEncodingValidationReport,
 )
+from mine_teleop.vehicle_media_runtime import DriverConsoleFrameSink, FfmpegH264FrameEncoder, UploadApiClient, VehicleMediaRuntime
 
 
 def main() -> int:
@@ -24,7 +25,7 @@ def main() -> int:
     parser.add_argument("--config", default="configs/vehicle-agent.dev.yaml")
     parser.add_argument(
         "--mode",
-        choices=["pipeline", "vaapi-probe", "gst-probe", "hardware-probes", "hardware-report"],
+        choices=["pipeline", "vaapi-probe", "gst-probe", "hardware-probes", "hardware-report", "teleop"],
         default="pipeline",
     )
     parser.add_argument(
@@ -42,9 +43,22 @@ def main() -> int:
         help="Lane ffprobe output mapping for --mode hardware-report, formatted as lane_id=/path/to/ffprobe.txt.",
     )
     parser.add_argument("--metrics-json", help="Optional JSON file with CPU/GPU/memory/disk/temperature metrics.")
+    parser.add_argument("--driver-console-url", default="", help="Driver console HTTP URL for --mode teleop.")
+    parser.add_argument("--frames", type=int, default=1, help="Number of frame ticks to send in --mode teleop.")
+    parser.add_argument("--frame-interval-ms", type=int, default=33, help="Delay between frame ticks in --mode teleop.")
+    parser.add_argument("--ffmpeg-binary", default="", help="Override ffmpeg binary for --mode teleop.")
+    parser.add_argument("--json", action="store_true", help="Emit --mode teleop summary as JSON.")
+    parser.add_argument("--record-upload-once", action="store_true", help="Record and upload the last encoded frame.")
+    parser.add_argument("--recording-root", default="", help="Recording root for --record-upload-once.")
+    parser.add_argument("--uploader-work-dir", default=".local/vehicle-media-uploader", help="Uploader work dir for --record-upload-once.")
+    parser.add_argument("--archive-root", default="", help="Archive root for --record-upload-once.")
+    parser.add_argument("--upload-api-base-url", default="", help="Upload API base URL for --record-upload-once.")
+    parser.add_argument("--device-token", default="dev-device-secret", help="Vehicle device token for upload API calls.")
     args = parser.parse_args()
 
     config = load_vehicle_config(args.config)
+    if args.mode == "teleop":
+        return _run_teleop(config, args)
     encoding = config.hardware.encoding
     gstreamer_probe = GStreamerPluginProbePlan(
         hardware_plugins=tuple(encoding.gstreamer_hardware_plugins),
@@ -111,6 +125,54 @@ def main() -> int:
     )
     print(probe.host_command() if args.probe_execution == "host" else probe.docker_command())
     return 0
+
+
+def _run_teleop(config, args: argparse.Namespace) -> int:
+    if not args.driver_console_url:
+        print("--driver-console-url is required for --mode teleop", file=sys.stderr)
+        return 2
+    if args.frames <= 0:
+        print("--frames must be positive", file=sys.stderr)
+        return 2
+    if args.frame_interval_ms < 0:
+        print("--frame-interval-ms must be non-negative", file=sys.stderr)
+        return 2
+    runtime = VehicleMediaRuntime(
+        config,
+        frame_sink=DriverConsoleFrameSink(args.driver_console_url),
+        encoder=FfmpegH264FrameEncoder(
+            config,
+            ffmpeg_binary=args.ffmpeg_binary or config.hardware.encoding.ffmpeg_binary,
+        ),
+    )
+    summary = runtime.send_frames(frame_count=args.frames, frame_interval_ms=args.frame_interval_ms)
+    if args.record_upload_once:
+        if runtime.last_frame is None:
+            print("cannot record upload before a frame has been encoded", file=sys.stderr)
+            return 2
+        if not args.upload_api_base_url:
+            print("--upload-api-base-url is required with --record-upload-once", file=sys.stderr)
+            return 2
+        uploader_work_dir = Path(args.uploader_work_dir)
+        recording_root = Path(args.recording_root) if args.recording_root else Path(config.recording.root_dir)
+        archive_root = Path(args.archive_root) if args.archive_root else uploader_work_dir / "archive"
+        summary["recording_upload"] = runtime.record_and_upload_once(
+            runtime.last_frame,
+            recording_root=recording_root,
+            queue_state_path=uploader_work_dir / "upload-queue.json",
+            archive_root=archive_root,
+            upload_api=UploadApiClient(args.upload_api_base_url, device_token=args.device_token),
+        )
+        summary["passed"] = bool(summary["passed"] and summary["recording_upload"]["action"] != "failed")
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    else:
+        print(
+            f"vehicle_media_teleop sent_frames={summary['sent_frames']} "
+            f"passed={str(summary['passed']).lower()} "
+            f"latency_avg_ms={summary['latency']['end_to_end_latency_ms_avg']}"
+        )
+    return 0 if summary["passed"] else 1
 
 
 def _hardware_encoding_plan_from_config(config, gstreamer_probe: GStreamerPluginProbePlan) -> HardwareEncodingValidationPlan:

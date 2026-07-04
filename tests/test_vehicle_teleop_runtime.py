@@ -99,6 +99,50 @@ class VehicleTeleopRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(result["applied_control_commands"], 1)
         self.assertEqual(vehicle.service.safety.state, SafetyState.ESTOP)
 
+    def test_vehicle_reports_control_receive_latency_and_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = SignalingHttpService(audit_log_path=Path(tmp) / "audit.jsonl")
+            with service.running() as signaling_url:
+                _json_post(
+                    f"{signaling_url}/vehicles/online",
+                    {"vehicle_id": "vehicle-001", "device_token": "dev-device-secret"},
+                )
+                driver = DriverConsoleRuntime.from_config(
+                    "configs/driver-console.dev.yaml",
+                    signaling_http_url=signaling_url,
+                    vehicle_id="vehicle-001",
+                    password="dev-password",
+                )
+                driver.connect(now_ms=0)
+                vehicle = VehicleTeleopRuntime.from_config(
+                    "configs/vehicle-agent.dev.yaml",
+                    signaling_http_url=signaling_url,
+                    device_token="dev-device-secret",
+                )
+                vehicle.register_online()
+                vehicle.discover_session(now_ms=0)
+
+                sent = driver.send_control(
+                    {"gear": "D", "throttle": 0.25, "steering": -0.5, "brake": 0.0},
+                    now_ms=1_000,
+                )
+                self.assertIsNotNone(sent)
+                result = vehicle.poll_and_execute(now_ms=1_055)
+                summary = vehicle.summary()
+
+        self.assertEqual(result["control_latency_ms"], 55)
+        self.assertEqual(len(result["control_receive_logs"]), 1)
+        record = result["control_receive_logs"][0]
+        self.assertEqual(record["seq"], sent.seq)
+        self.assertEqual(record["receive_time_ms"], 1055)
+        self.assertEqual(record["control_latency_ms"], 55)
+        self.assertEqual(record["gear"], "D")
+        self.assertAlmostEqual(record["steering"], -0.5)
+        self.assertAlmostEqual(record["throttle"], 0.25)
+        self.assertAlmostEqual(record["brake"], 0.0)
+        self.assertEqual(summary["control_latency_ms_avg"], 55.0)
+        self.assertEqual(summary["control_receive_logs"][-1]["seq"], sent.seq)
+
     def test_session_discovery_endpoint_returns_active_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             service = SignalingHttpService(audit_log_path=Path(tmp) / "audit.jsonl")

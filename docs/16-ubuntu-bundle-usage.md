@@ -27,11 +27,60 @@ dist/mine-teleop-ubuntu-x86_64.tar.gz
 python3 scripts/build_ubuntu_bundle.py --dry-run
 ```
 
+如果当前验收只覆盖媒体、控制信令、录像上传，不覆盖真实 CAN 收发，可显式跳过 C shim bridge
+构建。脚本会生成一个 no-CAN stub `libmine_teleop_chassis_bridge.so`，保证车端包仍然是“执行文件
++ 随包动态库”的完整形态；真实 CAN 联调时再去掉 `--skip-bridge-build` 并使用完整
+ChassisControl/MinePilot bridge：
+
+```bash
+python3 scripts/build_ubuntu_bundle.py \
+  --output-dir dist/mine-teleop-ubuntu-x86_64 \
+  --chassis-control-root /Users/rongjianrui/workspace/ChassisControl \
+  --minepilot-root /Users/rongjianrui/workspace/MinePilot \
+  --chassis-control-library /Users/rongjianrui/workspace/MinePilot/libchassis_control.so \
+  --skip-bridge-build
+```
+
 脚本会把 `/Volumes/SystemDisk/Workspace` 下的仓库先复制到
 `~/.cache/mine-teleop/ubuntu-bundle-workspaces/`，再挂载给 Docker。这样构建机可以
 使用 Docker，工控机仍然不需要 Docker。
 
-## 2. 拷贝到工控机主目录
+## 2. 通过 SSH 部署到工控机
+
+如果目标车端已经通过 FRP 暴露 SSH，可直接把 bundle 传到目标用户目录并执行随包 smoke。
+默认目标就是现场联调隧道 `ssh -p 6000 user@60.205.213.254`：
+
+```bash
+scripts/deploy_vehicle_bundle.sh
+```
+
+脚本只使用 `ssh`、`scp` 和远端随包文件，不会在工控机上运行 Docker。首次执行前可以先 dry-run：
+
+```bash
+scripts/deploy_vehicle_bundle.sh --dry-run
+```
+
+如果本机 Docker 控制端有一个车端可访问的 HTTP 地址，可让车端部署后立即发送测试 H.264
+帧到控制端：
+
+```bash
+scripts/deploy_vehicle_bundle.sh \
+  --driver-console-url http://CONTROL_HOST:8080 \
+  --media-frames 3
+```
+
+如果控制端信令服务也有车端可访问的 HTTP 地址，可让车端进入控制接收模式，并把接收到的控制
+命令逐条打印成 JSONL 日志：
+
+```bash
+scripts/deploy_vehicle_bundle.sh \
+  --signaling-http-url http://CONTROL_HOST:8765 \
+  --run-control-teleop
+```
+
+可用 `--ssh-option BatchMode=yes`、`--ssh-option ConnectTimeout=8` 等参数传递额外 SSH 选项。
+
+## 3. 手动拷贝到工控机主目录
 
 工控机端不安装 systemd 服务，不设置自动启动；所有文件放在普通用户主目录下，手动执行。
 
@@ -79,7 +128,7 @@ MINE_TELEOP_FEEDBACK_ATTEMPTS=10 \
 `target-validation.sh`。如果 `adapter-feedback` 只返回 `received=false`，说明 CAN 口和 adapter
 可打开，但真实底盘反馈帧尚未按当前协议读到，仍不能进入真实控制测试。
 
-## 3. 生成车端配置
+## 4. 生成车端配置
 
 首次联调用示例命令生成真实 adapter 配置：
 
@@ -127,7 +176,7 @@ can_iface=can1
 `vehicle_adapter.integration.chassis_control.can_interface`。如果后续手动改 CAN 口，两处必须一致；
 配置加载器会拒绝不一致的真实 adapter 配置。
 
-## 4. CAN 和 adapter smoke
+## 5. CAN 和 adapter smoke
 
 按配置中的 `hardware.can.interface` 和 `hardware.can.bitrate` 配置接口。下面以 `can1` 和
 `500000` 为例：
@@ -182,7 +231,7 @@ mkdir -p "$base/data/vaapi-smoke"
   -of default=nw=1 "$base/data/vaapi-smoke/test.mp4"
 ```
 
-## 5. 目标主机验收脚本
+## 6. 目标主机验收脚本
 
 ```bash
 base="$HOME/mine-teleop"

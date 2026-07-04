@@ -27,6 +27,7 @@ from mine_teleop import time_sync as _time_sync  # noqa: F401
 from mine_teleop import upload as _upload  # noqa: F401
 from mine_teleop import vehicle_adapter as _vehicle_adapter  # noqa: F401
 from mine_teleop import vehicle_control_service as _vehicle_control_service  # noqa: F401
+from mine_teleop import vehicle_media_runtime as _vehicle_media_runtime  # noqa: F401
 from mine_teleop import vehicle_recorder_uploader as _vehicle_recorder_uploader  # noqa: F401
 
 
