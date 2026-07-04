@@ -8118,6 +8118,42 @@ class CommandLineEntryPointTests(unittest.TestCase):
         self.assertNotEqual(process.returncode, 0, stdout)
         self.assertIn("--tls-cert and --tls-key are required for non-loopback hosts", stderr)
 
+    def test_signaling_server_cli_allows_explicit_insecure_non_loopback_dev_bind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            port_file = root / "port.txt"
+            audit_log = root / "audit.jsonl"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "signaling-server/signaling_server.py",
+                    "--serve",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "0",
+                    "--port-file",
+                    str(port_file),
+                    "--audit-log",
+                    str(audit_log),
+                    "--allow-insecure-nonloopback-dev",
+                ],
+                cwd=Path.cwd(),
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                port = _wait_for_port_file(port_file)
+                self.assertEqual(_json_get(f"http://127.0.0.1:{port}/health")["status"], "ok")
+            finally:
+                process.terminate()
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate(timeout=5)
+
     def test_netem_plan_cli_prints_dry_run_commands_without_executing_tc(self):
         result = subprocess.run(
             [

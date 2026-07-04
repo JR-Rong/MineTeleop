@@ -114,9 +114,10 @@ MINE_TELEOP_NTP_SERVERS="ntp.aliyun.com ntp.tencent.com" \
 MINE_TELEOP_TIMESYNC_BACKEND=chrony scripts/setup_vehicle_timesync.sh
 ```
 
-本机控制端通过 Docker 运行，车端通过 SSH 反向隧道访问本机 `8080`。先在本机启动控制端和
-反向隧道；脚本会在本机检查 `/health`，并从车端反查 `http://127.0.0.1:18080/health`，避免车端
-脚本启动后刷 `Connection refused`：
+本机控制端通过 Docker 运行，车端通过 SSH 反向隧道访问本机 `8080` 和 signaling `8765`。先在本机
+启动控制端和反向隧道；脚本会在本机检查 `/health`，并从车端反查
+`http://127.0.0.1:18080/health` 与 `http://127.0.0.1:18765/health`，避免车端脚本启动后刷
+`Connection refused`：
 
 ```bash
 cd /Users/rongjianrui/workspace/MineTeleop
@@ -124,12 +125,41 @@ MINE_TELEOP_VEHICLE_SSH_PASSWORD='******' \
   scripts/start_live_control_plane_tunnel.sh
 ```
 
-再在车端运行实时媒体脚本。脚本会自动选择第一个支持 `Video Capture` 的 `/dev/video*`，优先选择
-支持 MJPEG 的节点，生成 `configs/vehicle-agent.live.yaml`，持续采集、H.264 编码并 POST 到控制端：
+再在车端运行实时媒体脚本。脚本会自动选择所有支持 `Video Capture` 的 `/dev/video*` 节点，生成
+`configs/vehicle-agent.live.yaml`，持续采集、MJPEG 编码并 POST 到控制端。
+MJPEG 是实时预览默认路径，用来避免每帧 H.264 编码和每帧 H.264 解码带来的 0.x Hz 级瓶颈：
 
 ```bash
 cd /home/user/mine-teleop
 scripts/run_vehicle_live_media.sh
+```
+
+如果车端接了多个相机，脚本默认会启用所有 `Video Capture` 节点，并按
+`front/rear/left/right/cameraN` 命名。也可以显式指定名称和设备：
+
+```bash
+MINE_TELEOP_CAMERA_DEVICES="front=/dev/video0 rear=/dev/video2" \
+  scripts/run_vehicle_live_media.sh
+```
+
+如果需要回退旧 H.264 单帧路径，可显式设置：
+
+```bash
+MINE_TELEOP_FRAME_CODEC=h264 scripts/run_vehicle_live_media.sh
+```
+
+要在车端看到控制端按键/手柄发出的控制命令反馈，另开一个车端终端运行控制接收器。每条接受到的
+控制命令会以 JSONL 打印，包含 `seq`、`steering`、`throttle`、`brake`、`gear` 和
+`control_latency_ms`：
+
+```bash
+cd /home/user/mine-teleop
+bin/mine-teleop vehicle-agent \
+  --config configs/vehicle-agent.live.yaml \
+  --teleop \
+  --signaling-http-url http://127.0.0.1:18765 \
+  --teleop-log-controls \
+  --teleop-duration-ms 600000
 ```
 
 前端相机卡片会显示最新帧的细分时序：

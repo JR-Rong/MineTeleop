@@ -805,6 +805,44 @@ class DriverConsoleHttpAppTests(unittest.TestCase):
         self.assertEqual(status["dashboard"]["cameras"]["front"]["message"], "decoded_frame_received")
         self.assertEqual(status["decoded_frame_count_by_camera"]["front"], 2)
 
+    def test_http_app_accepts_mjpeg_frame_without_decode_step(self):
+        jpeg_payload = b"\xff\xd8\xff\xe0" + b"mine-teleop-jpeg" + b"\xff\xd9"
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = DriverConsoleRuntime.from_config(
+                "configs/driver-console.dev.yaml",
+                signaling_http_url="http://127.0.0.1:8765",
+                vehicle_id="vehicle-001",
+                password="dev-password",
+                control_sink=RecordingControlCommandSink(),
+                frame_dir=Path(tmp) / "frames",
+            )
+            app = DriverConsoleHttpApp(runtime)
+            with app.running("127.0.0.1", 0) as console_url:
+                decoded = _json_post(
+                    f"{console_url}/api/media/frame",
+                    {
+                        "camera_id": "front",
+                        "codec": "mjpeg",
+                        "payload_base64": base64.b64encode(jpeg_payload).decode("ascii"),
+                        "captured_at_ms": 1000,
+                        "encoded_at_ms": 1001,
+                        "sent_at_ms": 1002,
+                    },
+                )
+                req = request.Request(f"{console_url}/api/frame/front.png?seq=1")
+                with request.urlopen(req, timeout=5) as response:
+                    frame_body = response.read()
+                    content_type = response.headers["Content-Type"]
+                status = _json_get(f"{console_url}/api/status")
+
+        self.assertTrue(decoded["frame_received"])
+        self.assertEqual(decoded["codec"], "mjpeg")
+        self.assertEqual(decoded["decode_latency_ms"], 0)
+        self.assertEqual(frame_body, jpeg_payload)
+        self.assertEqual(content_type, "image/jpeg")
+        self.assertEqual(status["latest_frame_timing_by_camera"]["front"]["codec"], "mjpeg")
+        self.assertEqual(status["decoded_frame_count_by_camera"]["front"], 1)
+
     def test_http_app_records_media_frame_latency(self):
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:

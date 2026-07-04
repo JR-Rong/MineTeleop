@@ -108,6 +108,7 @@ class DriverConsoleRuntime:
         self.config_version = config_version
         self.frame_dir = Path(frame_dir)
         self.latest_frame_by_camera: dict[str, Path] = {}
+        self.latest_frame_content_type_by_camera: dict[str, str] = {}
         self.latest_frame_timing_by_camera: dict[str, dict[str, Any]] = {}
         self.decoded_frame_count_by_camera: dict[str, int] = {}
         self.frame_receive_times_by_camera: dict[str, deque[int]] = {}
@@ -366,40 +367,52 @@ class DriverConsoleRuntime:
     ) -> dict[str, Any]:
         if not camera_id:
             raise ValueError("camera_id is required")
-        if codec.lower() != "h264":
-            raise ValueError("only h264 encoded frames are supported")
+        codec_lower = codec.lower()
+        if codec_lower not in {"h264", "mjpeg", "jpeg"}:
+            raise ValueError("only h264 and mjpeg encoded frames are supported")
         if not payload:
             raise ValueError("encoded frame payload is empty")
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            raise RuntimeError("ffmpeg is required to decode control-console media frames")
+        ffmpeg = shutil.which("ffmpeg") if codec_lower == "h264" else None
+        if codec_lower == "h264" and not ffmpeg:
+            raise RuntimeError("ffmpeg is required to decode control-console H.264 frames")
         receive_time_ms = _now_ms() if received_at_ms is None else _optional_non_negative_int(received_at_ms, "received_at_ms")
         captured_at_ms = _optional_non_negative_int(captured_at_ms, "captured_at_ms")
         encoded_at_ms = _optional_non_negative_int(encoded_at_ms, "encoded_at_ms")
         sent_at_ms = _optional_non_negative_int(sent_at_ms, "sent_at_ms")
         self._ensure_camera(camera_id)
         self.frame_dir.mkdir(parents=True, exist_ok=True)
-        encoded_path = self.frame_dir / f"{camera_id}.h264"
-        frame_path = self.frame_dir / f"{camera_id}.png"
-        encoded_path.write_bytes(payload)
-        subprocess.run(
-            [
-                ffmpeg,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "h264",
-                "-i",
-                str(encoded_path),
-                "-frames:v",
-                "1",
-                str(frame_path),
-            ],
-            check=True,
-        )
-        decoded_at_ms = _now_ms()
+        if codec_lower == "h264":
+            encoded_path = self.frame_dir / f"{camera_id}.h264"
+            frame_path = self.frame_dir / f"{camera_id}.png"
+            encoded_path.write_bytes(payload)
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "h264",
+                    "-i",
+                    str(encoded_path),
+                    "-frames:v",
+                    "1",
+                    str(frame_path),
+                ],
+                check=True,
+            )
+            decoded_at_ms = _now_ms()
+            decode_latency_ms = max(0, decoded_at_ms - receive_time_ms)
+            content_type = "image/png"
+        else:
+            if not (payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9")):
+                raise ValueError("mjpeg frame payload must contain a complete JPEG image")
+            frame_path = self.frame_dir / f"{camera_id}.jpg"
+            frame_path.write_bytes(payload)
+            decoded_at_ms = receive_time_ms
+            decode_latency_ms = 0
+            content_type = "image/jpeg"
         size_bytes = frame_path.stat().st_size
         if size_bytes <= 0:
             raise RuntimeError("decoded frame is empty")
@@ -418,6 +431,7 @@ class DriverConsoleRuntime:
             message="decoded_frame_received",
         )
         self.latest_frame_by_camera[camera_id] = frame_path
+        self.latest_frame_content_type_by_camera[camera_id] = content_type
         frame_sequence = self.decoded_frame_count_by_camera.get(camera_id, 0) + 1
         self.decoded_frame_count_by_camera[camera_id] = frame_sequence
         timing = {
@@ -428,7 +442,7 @@ class DriverConsoleRuntime:
             "decoded_at_ms": decoded_at_ms,
             "encode_latency_ms": _non_negative_delta(encoded_at_ms, captured_at_ms),
             "transport_latency_ms": _non_negative_delta(receive_time_ms, sent_at_ms),
-            "decode_latency_ms": max(0, decoded_at_ms - receive_time_ms),
+            "decode_latency_ms": decode_latency_ms,
             "end_to_end_latency_ms": latency,
             "received_fps": round(received_fps, 2),
         }
@@ -436,12 +450,12 @@ class DriverConsoleRuntime:
             "camera_id": camera_id,
             "frame_sequence": frame_sequence,
             "frame_size_bytes": size_bytes,
-            "codec": codec.lower(),
+            "codec": codec_lower,
         } | {key: value for key, value in timing.items() if value is not None}
         self.latest_frame_timing_by_camera[camera_id] = timing_snapshot
         return {
             "camera_id": camera_id,
-            "codec": codec.lower(),
+            "codec": codec_lower,
             "frame_received": True,
             "frame_sequence": frame_sequence,
             "frame_path": str(frame_path),
@@ -453,6 +467,9 @@ class DriverConsoleRuntime:
         if frame_path is None or not frame_path.is_file():
             raise FileNotFoundError(f"no decoded frame for camera {camera_id}")
         return frame_path.read_bytes()
+
+    def read_decoded_frame_content_type(self, camera_id: str) -> str:
+        return self.latest_frame_content_type_by_camera.get(camera_id, "image/png")
 
     def _handle_signaling_message(self, message: dict[str, Any]) -> None:
         if message.get("type") != "webrtc_offer":
@@ -562,7 +579,7 @@ class DriverConsoleHttpApp:
                         self._json_response(404, {"error": str(exc)})
                         return
                     self.send_response(200)
-                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Type", app.runtime.read_decoded_frame_content_type(camera_id))
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)

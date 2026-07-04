@@ -58,6 +58,26 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         self.assertIn("backlight_compensation=", text)
         self.assertIn("exposure_dynamic_framerate=", text)
 
+    def test_live_media_script_enables_all_detected_camera_devices_with_mjpeg_codec(self):
+        text = LIVE_MEDIA_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("MINE_TELEOP_CAMERA_DEVICES", text)
+        self.assertIn("find_camera_devices()", text)
+        self.assertIn("camera_device_pairs", text)
+        self.assertIn("write_live_config \"${camera_device_pairs[@]}\"", text)
+        self.assertIn('FRAMES="${MINE_TELEOP_MEDIA_FRAMES:-300}"', text)
+        self.assertIn('FRAME_CODEC="${MINE_TELEOP_FRAME_CODEC:-mjpeg}"', text)
+        self.assertIn('--frame-codec "$FRAME_CODEC"', text)
+
+    def test_live_control_tunnel_exposes_signaling_for_vehicle_control_feedback(self):
+        text = LIVE_CONTROL_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('SIGNALING_LOCAL_PORT="${MINE_TELEOP_SIGNALING_LOCAL_PORT:-8765}"', text)
+        self.assertIn('SIGNALING_REMOTE_PORT="${MINE_TELEOP_SIGNALING_REMOTE_PORT:-18765}"', text)
+        self.assertIn('-R ${remote_signaling_port}:127.0.0.1:${signaling_local_port}', text)
+        self.assertIn('VEHICLE_SIDE_SIGNALING_HTTP_URL=http://127.0.0.1:${SIGNALING_REMOTE_PORT}', text)
+        self.assertIn('--teleop-log-controls', text)
+
     def test_dry_run_targets_default_vehicle_ssh_tunnel_without_remote_docker(self):
         result = subprocess.run(
             ["bash", str(SCRIPT), "--dry-run"],

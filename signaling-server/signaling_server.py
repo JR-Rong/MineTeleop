@@ -31,21 +31,34 @@ def main() -> int:
     parser.add_argument("--upload-public-base-url", default="", help="Public base URL for local placeholder upload URLs.")
     parser.add_argument("--tls-cert", default="", help="TLS certificate chain for non-loopback HTTPS serving.")
     parser.add_argument("--tls-key", default="", help="TLS private key for non-loopback HTTPS serving.")
+    parser.add_argument(
+        "--allow-insecure-nonloopback-dev",
+        action="store_true",
+        help="Allow plaintext non-loopback serving with built-in dev credentials for local Docker field preview only.",
+    )
     args = parser.parse_args()
 
     if args.serve:
         tls_enabled = bool(args.tls_cert or args.tls_key)
         if bool(args.tls_cert) != bool(args.tls_key):
             parser.error("--tls-cert and --tls-key must be configured together")
-        if not _is_loopback_host(args.host) and not tls_enabled:
+        loopback_host = _is_loopback_host(args.host)
+        insecure_dev_bind = bool(args.allow_insecure_nonloopback_dev)
+        if not loopback_host and not tls_enabled and not insecure_dev_bind:
             parser.error("--tls-cert and --tls-key are required for non-loopback hosts")
         # Fail closed: never fall back to the built-in dev credentials on a
         # network-reachable deployment. Loopback (dev/test) may still use them.
-        if not _is_loopback_host(args.host):
+        if not loopback_host and not insecure_dev_bind:
             if not args.driver_credentials:
                 parser.error("--driver-credentials is required for non-loopback hosts")
             if not args.device_credentials:
                 parser.error("--device-credentials is required for non-loopback hosts")
+        if not loopback_host and insecure_dev_bind:
+            print(
+                "warning: plaintext non-loopback dev signaling bind enabled; use only behind localhost/SSH field tunnels",
+                file=sys.stderr,
+                flush=True,
+            )
 
         upload_credentials = None
         ice_config = None

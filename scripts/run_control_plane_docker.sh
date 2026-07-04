@@ -7,6 +7,7 @@ image="${MINE_TELEOP_CONTROL_PLANE_IMAGE:-mine-teleop-control-plane:local}"
 server_name="${MINE_TELEOP_CONTROL_PLANE_SERVER:-mine-teleop-signaling-local}"
 console_name="${MINE_TELEOP_CONTROL_PLANE_CONSOLE:-mine-teleop-driver-console-local}"
 console_port="${MINE_TELEOP_CONTROL_PLANE_CONSOLE_PORT:-8080}"
+signaling_port="${MINE_TELEOP_CONTROL_PLANE_SIGNALING_PORT:-8765}"
 vehicle_id="${MINE_TELEOP_CONTROL_PLANE_VEHICLE_ID:-vehicle-001}"
 password="${MINE_TELEOP_CONTROL_PLANE_PASSWORD:-dev-password}"
 
@@ -34,10 +35,11 @@ docker run -d \
   --name "$server_name" \
   --security-opt "no-new-privileges:true" \
   --cap-drop ALL \
+  -p "127.0.0.1:${signaling_port}:8765" \
   -p "127.0.0.1:${console_port}:8080" \
   -w /opt/mine-teleop \
   "$image" \
-  sh -c 'mkdir -p /tmp/mine-teleop-control-plane && exec python3 signaling-server/signaling_server.py --serve --host 127.0.0.1 --port 8765 --audit-log /tmp/mine-teleop-control-plane/signaling-audit.jsonl' >/dev/null
+  sh -c 'mkdir -p /tmp/mine-teleop-control-plane && exec python3 signaling-server/signaling_server.py --serve --host 0.0.0.0 --port 8765 --audit-log /tmp/mine-teleop-control-plane/signaling-audit.jsonl --allow-insecure-nonloopback-dev' >/dev/null
 
 for _ in $(seq 1 30); do
   if docker exec "$server_name" python3 -c \
@@ -79,6 +81,7 @@ docker exec "$server_name" python3 -c \
   "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()" >/dev/null
 
 echo "DRIVER_CONSOLE_URL=http://127.0.0.1:${console_port}"
+echo "SIGNALING_HTTP_URL=http://127.0.0.1:${signaling_port}"
 echo "Press Ctrl-C to stop the local Docker control plane."
 
 while true; do

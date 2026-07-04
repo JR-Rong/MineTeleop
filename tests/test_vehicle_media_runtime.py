@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -12,7 +13,7 @@ from urllib import request
 from mine_teleop.config import load_driver_config, load_vehicle_config
 from mine_teleop.driver_console_runtime import DriverConsoleHttpApp, DriverConsoleRuntime, RecordingControlCommandSink
 from mine_teleop.signaling_service import SignalingHttpService
-from mine_teleop.vehicle_media_runtime import EncodedFrame, VehicleMediaRuntime
+from mine_teleop.vehicle_media_runtime import EncodedFrame, MjpegFrameEncoder, VehicleMediaRuntime
 
 
 def _json_get(url: str) -> dict:
@@ -78,6 +79,50 @@ class VehicleMediaRuntimeTests(unittest.TestCase):
         self.assertEqual(sink.posted[0]["encoded_at_ms"], 1005)
         self.assertEqual(sink.posted[0]["sent_at_ms"], 1010)
         self.assertTrue(sink.posted[0]["payload_base64"])
+
+    def test_mjpeg_frame_encoder_reuses_one_ffmpeg_process_per_camera(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launches = root / "launches.txt"
+            fake_ffmpeg = root / "fake-ffmpeg.py"
+            fake_ffmpeg.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env python3",
+                        "import os, sys, time",
+                        "with open(os.environ['MINE_TELEOP_FAKE_FFMPEG_LAUNCHES'], 'a', encoding='utf-8') as handle:",
+                        "    handle.write('launch\\n')",
+                        "sys.stdout.buffer.write(b'\\xff\\xd8first\\xff\\xd9')",
+                        "sys.stdout.buffer.flush()",
+                        "sys.stdout.buffer.write(b'\\xff\\xd8second\\xff\\xd9')",
+                        "sys.stdout.buffer.flush()",
+                        "time.sleep(2)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            fake_ffmpeg.chmod(0o755)
+            config = load_vehicle_config(Path("configs/vehicle-agent.dev.yaml"))
+            camera = config.enabled_cameras[0]
+            old_env = os.environ.get("MINE_TELEOP_FAKE_FFMPEG_LAUNCHES")
+            os.environ["MINE_TELEOP_FAKE_FFMPEG_LAUNCHES"] = str(launches)
+            encoder = MjpegFrameEncoder(config, ffmpeg_binary=str(fake_ffmpeg), frame_timeout_seconds=1.0)
+            try:
+                first = encoder.encode(camera, seq=1, now_ms=1000)
+                second = encoder.encode(camera, seq=2, now_ms=1100)
+                launches_lines = launches.read_text(encoding="utf-8").splitlines()
+            finally:
+                encoder.close()
+                if old_env is None:
+                    os.environ.pop("MINE_TELEOP_FAKE_FFMPEG_LAUNCHES", None)
+                else:
+                    os.environ["MINE_TELEOP_FAKE_FFMPEG_LAUNCHES"] = old_env
+
+        self.assertEqual(first.codec, "mjpeg")
+        self.assertEqual(second.codec, "mjpeg")
+        self.assertEqual(first.payload, b"\xff\xd8first\xff\xd9")
+        self.assertEqual(second.payload, b"\xff\xd8second\xff\xd9")
+        self.assertEqual(launches_lines, ["launch"])
 
 
 class VehicleMediaRuntimeCliTests(unittest.TestCase):

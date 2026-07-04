@@ -17,7 +17,13 @@ from mine_teleop.media import (
     HardwareEncodingValidationPlan,
     HardwareEncodingValidationReport,
 )
-from mine_teleop.vehicle_media_runtime import DriverConsoleFrameSink, FfmpegH264FrameEncoder, UploadApiClient, VehicleMediaRuntime
+from mine_teleop.vehicle_media_runtime import (
+    DriverConsoleFrameSink,
+    FfmpegH264FrameEncoder,
+    MjpegFrameEncoder,
+    UploadApiClient,
+    VehicleMediaRuntime,
+)
 
 
 def main() -> int:
@@ -46,6 +52,12 @@ def main() -> int:
     parser.add_argument("--driver-console-url", default="", help="Driver console HTTP URL for --mode teleop.")
     parser.add_argument("--frames", type=int, default=1, help="Number of frame ticks to send in --mode teleop.")
     parser.add_argument("--frame-interval-ms", type=int, default=33, help="Delay between frame ticks in --mode teleop.")
+    parser.add_argument(
+        "--frame-codec",
+        choices=["h264", "mjpeg"],
+        default="h264",
+        help="Encoded frame codec for --mode teleop. mjpeg is lower latency for browser preview.",
+    )
     parser.add_argument("--ffmpeg-binary", default="", help="Override ffmpeg binary for --mode teleop.")
     parser.add_argument("--json", action="store_true", help="Emit --mode teleop summary as JSON.")
     parser.add_argument("--record-upload-once", action="store_true", help="Record and upload the last encoded frame.")
@@ -137,15 +149,18 @@ def _run_teleop(config, args: argparse.Namespace) -> int:
     if args.frame_interval_ms < 0:
         print("--frame-interval-ms must be non-negative", file=sys.stderr)
         return 2
-    runtime = VehicleMediaRuntime(
-        config,
-        frame_sink=DriverConsoleFrameSink(args.driver_console_url),
-        encoder=FfmpegH264FrameEncoder(
-            config,
-            ffmpeg_binary=args.ffmpeg_binary or config.hardware.encoding.ffmpeg_binary,
-        ),
-    )
-    summary = runtime.send_frames(frame_count=args.frames, frame_interval_ms=args.frame_interval_ms)
+    ffmpeg_binary = args.ffmpeg_binary or config.hardware.encoding.ffmpeg_binary
+    if args.frame_codec == "mjpeg":
+        encoder = MjpegFrameEncoder(config, ffmpeg_binary=ffmpeg_binary)
+    else:
+        encoder = FfmpegH264FrameEncoder(config, ffmpeg_binary=ffmpeg_binary)
+    runtime = VehicleMediaRuntime(config, frame_sink=DriverConsoleFrameSink(args.driver_console_url), encoder=encoder)
+    try:
+        summary = runtime.send_frames(frame_count=args.frames, frame_interval_ms=args.frame_interval_ms)
+    finally:
+        close = getattr(encoder, "close", None)
+        if callable(close):
+            close()
     if args.record_upload_once:
         if runtime.last_frame is None:
             print("cannot record upload before a frame has been encoded", file=sys.stderr)

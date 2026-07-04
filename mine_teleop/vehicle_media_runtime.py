@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import select
 import subprocess
 import time
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -125,6 +127,135 @@ class FfmpegH264FrameEncoder:
             ]
         )
         return command
+
+
+@dataclass
+class _MjpegStream:
+    process: subprocess.Popen[bytes]
+    buffer: bytes = field(default_factory=bytes)
+
+
+class MjpegFrameEncoder:
+    def __init__(self, config: VehicleConfig, *, ffmpeg_binary: str = "ffmpeg", frame_timeout_seconds: float = 2.0) -> None:
+        self.config = config
+        self.ffmpeg_binary = ffmpeg_binary
+        self.frame_timeout_seconds = frame_timeout_seconds
+        self._streams: dict[str, _MjpegStream] = {}
+
+    def encode(self, camera: CameraConfig, *, seq: int, now_ms: int) -> EncodedFrame:
+        profile = self.config.realtime_profiles[camera.realtime_profile]
+        width = int(profile.width)
+        height = int(profile.height)
+        fps = int(profile.fps)
+        stream = self._stream_for(camera, width=width, height=height, fps=fps)
+        payload = self._read_jpeg_frame(camera.camera_id, stream)
+        return EncodedFrame(
+            camera_id=camera.camera_id,
+            seq=seq,
+            codec="mjpeg",
+            payload=payload,
+            captured_at_ms=now_ms,
+            encoded_at_ms=_now_ms(),
+            width=width,
+            height=height,
+            fps=fps,
+            bitrate_kbps=profile.bitrate_kbps,
+        )
+
+    def close(self) -> None:
+        for stream in self._streams.values():
+            if stream.process.poll() is None:
+                stream.process.terminate()
+                try:
+                    stream.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    stream.process.kill()
+                    stream.process.wait(timeout=2)
+            if stream.process.stdout is not None:
+                stream.process.stdout.close()
+            if stream.process.stderr is not None:
+                stream.process.stderr.close()
+        self._streams.clear()
+
+    def _stream_for(self, camera: CameraConfig, *, width: int, height: int, fps: int) -> _MjpegStream:
+        stream = self._streams.get(camera.camera_id)
+        if stream is not None and stream.process.poll() is None:
+            return stream
+        command = self._command(camera, width=width, height=height, fps=fps)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if process.stdout is None:
+            raise RuntimeError("ffmpeg MJPEG stream stdout is unavailable")
+        stream = _MjpegStream(process=process)
+        self._streams[camera.camera_id] = stream
+        return stream
+
+    def _command(self, camera: CameraConfig, *, width: int, height: int, fps: int) -> list[str]:
+        command = [self.ffmpeg_binary, "-hide_banner", "-loglevel", "error"]
+        if camera.device == "testsrc":
+            command.extend(["-f", "lavfi", "-i", f"testsrc2=size={width}x{height}:rate={fps}"])
+        else:
+            command.extend(
+                [
+                    "-f",
+                    "v4l2",
+                    "-input_format",
+                    "mjpeg",
+                    "-video_size",
+                    f"{camera.capture_width}x{camera.capture_height}",
+                    "-framerate",
+                    str(camera.capture_fps),
+                    "-i",
+                    camera.device,
+                    "-vf",
+                    f"fps={fps},scale={width}:{height}",
+                ]
+            )
+        command.extend(["-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"])
+        return command
+
+    def _read_jpeg_frame(self, camera_id: str, stream: _MjpegStream) -> bytes:
+        if stream.process.stdout is None:
+            raise RuntimeError(f"ffmpeg MJPEG stream stdout closed for {camera_id}")
+        fd = stream.process.stdout.fileno()
+        deadline = time.monotonic() + self.frame_timeout_seconds
+        while True:
+            frame = self._pop_jpeg_from_buffer(stream)
+            if frame is not None:
+                return frame
+            if stream.process.poll() is not None:
+                stderr = _read_process_stderr(stream.process)
+                raise RuntimeError(f"ffmpeg MJPEG stream exited for {camera_id}: {stderr}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"timed out waiting for MJPEG frame from {camera_id}")
+            readable, _, _ = select.select([fd], [], [], remaining)
+            if not readable:
+                raise RuntimeError(f"timed out waiting for MJPEG frame from {camera_id}")
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                stderr = _read_process_stderr(stream.process)
+                raise RuntimeError(f"ffmpeg MJPEG stream ended for {camera_id}: {stderr}")
+            stream.buffer += chunk
+            if len(stream.buffer) > 8 * 1024 * 1024:
+                start = stream.buffer.rfind(b"\xff\xd8")
+                stream.buffer = stream.buffer[start:] if start >= 0 else b""
+
+    @staticmethod
+    def _pop_jpeg_from_buffer(stream: _MjpegStream) -> bytes | None:
+        start = stream.buffer.find(b"\xff\xd8")
+        if start < 0:
+            stream.buffer = b""
+            return None
+        if start > 0:
+            stream.buffer = stream.buffer[start:]
+            start = 0
+        end = stream.buffer.find(b"\xff\xd9", start + 2)
+        if end < 0:
+            return None
+        end += 2
+        frame = stream.buffer[start:end]
+        stream.buffer = stream.buffer[end:]
+        return frame
 
 
 class DriverConsoleFrameSink:
@@ -264,6 +395,16 @@ def _average(values: list[int]) -> float:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _read_process_stderr(process: subprocess.Popen[bytes]) -> str:
+    if process.stderr is None:
+        return ""
+    try:
+        data = process.stderr.read()
+    except Exception:
+        return ""
+    return data.decode("utf-8", errors="replace").strip()
 
 
 def _iso_ms(value_ms: int) -> str:
