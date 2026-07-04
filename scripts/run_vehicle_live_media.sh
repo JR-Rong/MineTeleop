@@ -12,8 +12,11 @@ FRAMES="${MINE_TELEOP_MEDIA_FRAMES:-30}"
 FRAME_INTERVAL_MS="${MINE_TELEOP_FRAME_INTERVAL_MS:-33}"
 CAPTURE_WIDTH="${MINE_TELEOP_CAPTURE_WIDTH:-1280}"
 CAPTURE_HEIGHT="${MINE_TELEOP_CAPTURE_HEIGHT:-720}"
-CAPTURE_FPS="${MINE_TELEOP_CAPTURE_FPS:-10}"
+CAPTURE_FPS="${MINE_TELEOP_CAPTURE_FPS:-30}"
 CAMERA_DEVICE="${MINE_TELEOP_CAMERA_DEVICE:-}"
+RETRY_SECONDS="${MINE_TELEOP_RETRY_SECONDS:-2}"
+HEALTH_RETRIES="${MINE_TELEOP_HEALTH_RETRIES:-5}"
+HEALTH_URL="${DRIVER_CONSOLE_URL%/}/health"
 
 find_camera_device() {
   if [[ -n "$CAMERA_DEVICE" ]]; then
@@ -31,15 +34,50 @@ find_camera_device() {
   fi
 
   local dev
+  local fallback=""
   for dev in /dev/video*; do
     [[ -e "$dev" ]] || continue
-    if v4l2-ctl -d "$dev" --all 2>/dev/null | grep -q "Video Capture"; then
+    if ! v4l2-ctl -d "$dev" --all 2>/dev/null | grep -q "Video Capture"; then
+      continue
+    fi
+    [[ -n "$fallback" ]] || fallback="$dev"
+    if v4l2-ctl -d "$dev" --list-formats-ext 2>/dev/null | grep -q "'MJPG'"; then
       printf '%s\n' "$dev"
       return
     fi
   done
 
+  if [[ -n "$fallback" ]]; then
+    printf '%s\n' "$fallback"
+    return
+  fi
+
   echo "no Video Capture device found under /dev/video*" >&2
+  return 1
+}
+
+configure_camera_device() {
+  local camera_device="$1"
+  if command -v v4l2-ctl >/dev/null 2>&1; then
+    v4l2-ctl -d "$camera_device" \
+      --set-fmt-video="width=${CAPTURE_WIDTH},height=${CAPTURE_HEIGHT},pixelformat=MJPG" \
+      --set-parm="$CAPTURE_FPS" >/dev/null 2>&1 || true
+  fi
+}
+
+wait_for_driver_console() {
+  for _ in $(seq 1 "$HEALTH_RETRIES"); do
+    if curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  cat >&2 <<EOF
+driver console is not reachable from the vehicle: $HEALTH_URL
+Start or repair the reverse tunnel from the local machine first:
+  MINE_TELEOP_VEHICLE_SSH_PASSWORD=... scripts/start_live_control_plane_tunnel.sh
+EOF
   return 1
 }
 
@@ -64,21 +102,29 @@ PY
 }
 
 camera="$(find_camera_device)"
+configure_camera_device "$camera"
 write_live_config "$camera"
 
 echo "Using camera: $camera"
 echo "Driver console: $DRIVER_CONSOLE_URL"
+echo "Driver console health: $HEALTH_URL"
 echo "Live config: $CONFIG_LIVE"
 echo "Log: $LOG_PATH"
 
 while true; do
-  "$MINE_TELEOP_BIN" vehicle-media-agent \
+  if ! wait_for_driver_console; then
+    sleep "$RETRY_SECONDS"
+    continue
+  fi
+  if ! "$MINE_TELEOP_BIN" vehicle-media-agent \
     --config "$CONFIG_LIVE" \
     --mode teleop \
     --driver-console-url "$DRIVER_CONSOLE_URL" \
     --frames "$FRAMES" \
     --frame-interval-ms "$FRAME_INTERVAL_MS" \
     --ffmpeg-binary "$FFMPEG_BIN" \
-    --json | tee -a "$LOG_PATH"
+    --json | tee -a "$LOG_PATH"; then
+    echo "vehicle-media-agent exited; retrying in ${RETRY_SECONDS}s" >&2
+  fi
   sleep 1
 done
