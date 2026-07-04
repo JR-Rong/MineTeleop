@@ -107,6 +107,7 @@ class DriverConsoleRuntime:
         self.config_version = config_version
         self.frame_dir = Path(frame_dir)
         self.latest_frame_by_camera: dict[str, Path] = {}
+        self.latest_frame_timing_by_camera: dict[str, dict[str, Any]] = {}
         self.decoded_frame_count_by_camera: dict[str, int] = {}
         self.token = ""
         self.session_id = ""
@@ -346,6 +347,7 @@ class DriverConsoleRuntime:
             ).to_dict(),
             "status": status,
             "decoded_frame_count_by_camera": dict(self.decoded_frame_count_by_camera),
+            "latest_frame_timing_by_camera": dict(self.latest_frame_timing_by_camera),
             "last_command": self._last_command.to_dict() if self._last_command else None,
         }
 
@@ -423,6 +425,13 @@ class DriverConsoleRuntime:
             "decode_latency_ms": max(0, decoded_at_ms - receive_time_ms),
             "end_to_end_latency_ms": latency,
         }
+        timing_snapshot = {
+            "camera_id": camera_id,
+            "frame_sequence": frame_sequence,
+            "frame_size_bytes": size_bytes,
+            "codec": codec.lower(),
+        } | {key: value for key, value in timing.items() if value is not None}
+        self.latest_frame_timing_by_camera[camera_id] = timing_snapshot
         return {
             "camera_id": camera_id,
             "codec": codec.lower(),
@@ -708,9 +717,14 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
     footer { border-top: 1px solid #39413d; border-bottom: 0; font-size: 13px; color: #c6cec8; }
     main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px; padding: 12px; }
     .grid { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); grid-auto-rows: minmax(180px, 1fr); gap: 10px; min-height: 520px; }
-    .camera { border: 1px solid #404b46; background: #0b0d0d; display: grid; grid-template-rows: 1fr auto; }
-    .camera div { display: grid; place-items: center; color: #9fa9a3; font-size: 14px; }
-    .camera strong { padding: 8px 10px; background: #1f2523; font-size: 13px; }
+    .camera { border: 1px solid #404b46; background: #0b0d0d; display: grid; grid-template-rows: minmax(0, 1fr) auto; min-height: 0; }
+    .camera-frame { display: grid; place-items: center; min-height: 0; color: #9fa9a3; font-size: 14px; }
+    .camera-frame img, .camera-frame video { width: 100%; height: 100%; max-width: 100%; max-height: 100%; object-fit: contain; }
+    .camera strong { padding: 8px 10px 4px; background: #1f2523; font-size: 13px; }
+    .camera-meta { background: #1f2523; padding: 0 10px 8px; display: grid; gap: 4px; font-size: 11px; color: #c6cec8; }
+    .camera-meta .latency-total { color: #f3f5f2; font-weight: 700; }
+    .timing-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 8px; }
+    .timing-grid span { overflow-wrap: anywhere; }
     aside { display: grid; gap: 10px; align-content: start; }
     .operator-panel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     .status-tile { border: 1px solid #3d4843; background: #111514; padding: 8px; min-height: 58px; display: grid; gap: 4px; }
@@ -778,11 +792,31 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
       document.getElementById('footer').textContent = `${data.session.state} ${data.session.session_id || ''}`;
       renderOperatorStatus(data);
       const cameras = data.dashboard.cameras || {};
+      const timings = data.latest_frame_timing_by_camera || {};
       document.getElementById('cameras').innerHTML = Object.keys(cameras).map((id) => {
         const cam = cameras[id];
-        return `<article class="camera" data-camera-id="${id}"><div id="camera-body-${id}"><img src="/api/frame/${id}.png?ts=${Date.now()}" alt="${id}" style="max-width:100%;max-height:100%;object-fit:contain" onerror="this.replaceWith(document.createTextNode('${cam.state}'))"></div><strong>${id} ${cam.fps}fps ${cam.bitrate_kbps}kbps</strong></article>`;
+        return `<article class="camera" data-camera-id="${id}"><div class="camera-frame" id="camera-body-${id}"><img src="/api/frame/${id}.png?ts=${Date.now()}" alt="${id}" onerror="this.replaceWith(document.createTextNode('${cam.state}'))"></div><strong>${id} ${cam.fps}fps ${cam.bitrate_kbps}kbps</strong>${renderFrameTiming(timings[id] || {}, cam)}</article>`;
       }).join('');
       restoreRemoteVideos();
+    }
+    function renderFrameTiming(timing, cam) {
+      const total = timing.end_to_end_latency_ms ?? cam.latency_ms;
+      return `<div class="camera-meta"><span class="latency-total">E2E ${formatMs(total)}</span><div class="timing-grid">
+        <span>capture ${formatTime(timing.captured_at_ms)}</span>
+        <span>encode ${formatTime(timing.encoded_at_ms)} / ${formatMs(timing.encode_latency_ms)}</span>
+        <span>send ${formatTime(timing.sent_at_ms)}</span>
+        <span>receive ${formatTime(timing.received_at_ms)} / ${formatMs(timing.transport_latency_ms)}</span>
+        <span>decode ${formatTime(timing.decoded_at_ms)} / ${formatMs(timing.decode_latency_ms)}</span>
+        <span>seq ${timing.frame_sequence ?? '-'}</span>
+      </div></div>`;
+    }
+    function formatMs(value) {
+      return Number.isFinite(Number(value)) ? `${Math.round(Number(value))}ms` : '-';
+    }
+    function formatTime(value) {
+      if (!Number.isFinite(Number(value))) return '-';
+      const date = new Date(Number(value));
+      return date.toLocaleTimeString([], {hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'}) + `.${String(date.getMilliseconds()).padStart(3, '0')}`;
     }
     function renderOperatorStatus(data) {
       const session = data.session || {};
@@ -918,7 +952,7 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
       if (!body) return;
       let video = document.getElementById(`webrtc-video-${cameraId}`);
       if (!video) {
-        body.innerHTML = `<video id="webrtc-video-${cameraId}" autoplay playsinline muted style="width:100%;height:100%;object-fit:contain"></video>`;
+        body.innerHTML = `<video id="webrtc-video-${cameraId}" autoplay playsinline muted></video>`;
         video = document.getElementById(`webrtc-video-${cameraId}`);
       }
       video.srcObject = stream;

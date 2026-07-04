@@ -869,6 +869,38 @@ class DriverConsoleHttpAppTests(unittest.TestCase):
         self.assertGreaterEqual(decoded["decode_latency_ms"], 0)
         self.assertEqual(decoded["encode_latency_ms"], 20)
         self.assertEqual(status["dashboard"]["cameras"]["front"]["latency_ms"], decoded["end_to_end_latency_ms"])
+        latest_timing = status["latest_frame_timing_by_camera"]["front"]
+        self.assertEqual(latest_timing["camera_id"], "front")
+        self.assertEqual(latest_timing["frame_sequence"], decoded["frame_sequence"])
+        self.assertEqual(latest_timing["captured_at_ms"], captured_at_ms)
+        self.assertEqual(latest_timing["encoded_at_ms"], encoded_at_ms)
+        self.assertEqual(latest_timing["sent_at_ms"], sent_at_ms)
+        self.assertEqual(latest_timing["received_at_ms"], decoded["received_at_ms"])
+        self.assertEqual(latest_timing["decoded_at_ms"], decoded["decoded_at_ms"])
+        self.assertEqual(latest_timing["encode_latency_ms"], decoded["encode_latency_ms"])
+        self.assertEqual(latest_timing["transport_latency_ms"], decoded["transport_latency_ms"])
+        self.assertEqual(latest_timing["decode_latency_ms"], decoded["decode_latency_ms"])
+        self.assertEqual(latest_timing["end_to_end_latency_ms"], decoded["end_to_end_latency_ms"])
+
+    def test_http_page_renders_frame_timing_breakdown(self):
+        runtime = DriverConsoleRuntime.from_config(
+            "configs/driver-console.dev.yaml",
+            signaling_http_url="http://127.0.0.1:8765",
+            vehicle_id="vehicle-001",
+            password="dev-password",
+            control_sink=RecordingControlCommandSink(),
+        )
+        app = DriverConsoleHttpApp(runtime)
+        with app.running("127.0.0.1", 0) as console_url:
+            page = request.urlopen(f"{console_url}/", timeout=5).read().decode("utf-8")
+
+        self.assertIn("latest_frame_timing_by_camera", page)
+        self.assertIn("function renderFrameTiming", page)
+        self.assertIn("capture ${formatTime(timing.captured_at_ms)}", page)
+        self.assertIn("encode ${formatTime(timing.encoded_at_ms)}", page)
+        self.assertIn("receive ${formatTime(timing.received_at_ms)}", page)
+        self.assertIn("decode ${formatTime(timing.decoded_at_ms)}", page)
+        self.assertIn("E2E ${formatMs(total)}", page)
 
     def test_driver_console_cli_can_serve_http_control_program(self):
         with tempfile.TemporaryDirectory() as tmp:

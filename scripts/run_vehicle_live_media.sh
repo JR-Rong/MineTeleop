@@ -17,6 +17,14 @@ CAMERA_DEVICE="${MINE_TELEOP_CAMERA_DEVICE:-}"
 RETRY_SECONDS="${MINE_TELEOP_RETRY_SECONDS:-2}"
 HEALTH_RETRIES="${MINE_TELEOP_HEALTH_RETRIES:-5}"
 HEALTH_URL="${DRIVER_CONSOLE_URL%/}/health"
+LOW_LIGHT="${MINE_TELEOP_CAMERA_LOW_LIGHT:-1}"
+CAMERA_BRIGHTNESS="${MINE_TELEOP_CAMERA_BRIGHTNESS:-24}"
+CAMERA_GAIN="${MINE_TELEOP_CAMERA_GAIN:-96}"
+CAMERA_GAMMA="${MINE_TELEOP_CAMERA_GAMMA:-450}"
+CAMERA_BACKLIGHT="${MINE_TELEOP_CAMERA_BACKLIGHT:-2}"
+CAMERA_EXPOSURE_DYNAMIC_FRAMERATE="${MINE_TELEOP_CAMERA_EXPOSURE_DYNAMIC_FRAMERATE:-1}"
+CAMERA_AUTO_EXPOSURE="${MINE_TELEOP_CAMERA_AUTO_EXPOSURE:-3}"
+CAMERA_EXPOSURE_ABSOLUTE="${MINE_TELEOP_CAMERA_EXPOSURE_ABSOLUTE:-}"
 
 find_camera_device() {
   if [[ -n "$CAMERA_DEVICE" ]]; then
@@ -62,6 +70,20 @@ configure_camera_device() {
     v4l2-ctl -d "$camera_device" \
       --set-fmt-video="width=${CAPTURE_WIDTH},height=${CAPTURE_HEIGHT},pixelformat=MJPG" \
       --set-parm="$CAPTURE_FPS" >/dev/null 2>&1 || true
+    if [[ "$LOW_LIGHT" == "1" ]]; then
+      v4l2-ctl -d "$camera_device" \
+        -c "auto_exposure=${CAMERA_AUTO_EXPOSURE}" \
+        -c "brightness=${CAMERA_BRIGHTNESS}" \
+        -c "gain=${CAMERA_GAIN}" \
+        -c "gamma=${CAMERA_GAMMA}" \
+        -c "backlight_compensation=${CAMERA_BACKLIGHT}" \
+        -c "exposure_dynamic_framerate=${CAMERA_EXPOSURE_DYNAMIC_FRAMERATE}" >/dev/null 2>&1 || true
+      if [[ -n "$CAMERA_EXPOSURE_ABSOLUTE" ]]; then
+        v4l2-ctl -d "$camera_device" \
+          -c auto_exposure=1 \
+          -c "exposure_time_absolute=${CAMERA_EXPOSURE_ABSOLUTE}" >/dev/null 2>&1 || true
+      fi
+    fi
   fi
 }
 
@@ -106,6 +128,7 @@ configure_camera_device "$camera"
 write_live_config "$camera"
 
 echo "Using camera: $camera"
+echo "Low light profile: $LOW_LIGHT"
 echo "Driver console: $DRIVER_CONSOLE_URL"
 echo "Driver console health: $HEALTH_URL"
 echo "Live config: $CONFIG_LIVE"

@@ -80,6 +80,66 @@ scripts/deploy_vehicle_bundle.sh \
 
 可用 `--ssh-option BatchMode=yes`、`--ssh-option ConnectTimeout=8` 等参数传递额外 SSH 选项。
 
+## 2.1 本机 Docker 控制端和车端实时推流
+
+本机控制端通过 Docker 运行，车端通过 SSH 反向隧道访问本机 `8080`。先在本机启动控制端和
+反向隧道；脚本会在本机检查 `/health`，并从车端反查 `http://127.0.0.1:18080/health`，避免车端
+脚本启动后刷 `Connection refused`：
+
+```bash
+cd /Users/rongjianrui/workspace/MineTeleop
+MINE_TELEOP_VEHICLE_SSH_PASSWORD='******' \
+  scripts/start_live_control_plane_tunnel.sh
+```
+
+再在车端运行实时媒体脚本。脚本会自动选择第一个支持 `Video Capture` 的 `/dev/video*`，优先选择
+支持 MJPEG 的节点，生成 `configs/vehicle-agent.live.yaml`，持续采集、H.264 编码并 POST 到控制端：
+
+```bash
+cd /home/user/mine-teleop
+scripts/run_vehicle_live_media.sh
+```
+
+前端相机卡片会显示最新帧的细分时序：
+
+- `capture`：车端采集开始时间戳。
+- `encode`：车端编码完成时间戳和采集到编码耗时。
+- `send`：车端发送时间戳。
+- `receive`：控制端收到请求时间戳和传输耗时。
+- `decode`：控制端解码完成时间戳和解码耗时。
+- `E2E`：采集到解码完成的端到端耗时。
+
+这些字段也会出现在 `/api/status` 的 `latest_frame_timing_by_camera` 中。严格时延验收要求车端和
+控制端时钟同步；如果两端时钟存在几十毫秒偏差，`send` 可能看起来晚于 `receive`，脚本会把传输耗时
+钳制为 `0ms`，但端到端分析仍应先修正 NTP/chrony。
+
+夜间或低照度时，车端脚本默认启用一个温和的低照度 profile：
+
+```text
+MINE_TELEOP_CAMERA_LOW_LIGHT=1
+MINE_TELEOP_CAMERA_BRIGHTNESS=24
+MINE_TELEOP_CAMERA_GAIN=96
+MINE_TELEOP_CAMERA_GAMMA=450
+MINE_TELEOP_CAMERA_BACKLIGHT=2
+MINE_TELEOP_CAMERA_EXPOSURE_DYNAMIC_FRAMERATE=1
+```
+
+如果白天过曝，可关闭低照度增强：
+
+```bash
+MINE_TELEOP_CAMERA_LOW_LIGHT=0 scripts/run_vehicle_live_media.sh
+```
+
+如果夜间仍偏暗，可以降低采集帧率让相机有更长曝光时间，或者切到手动曝光：
+
+```bash
+MINE_TELEOP_CAPTURE_FPS=15 \
+MINE_TELEOP_CAMERA_BRIGHTNESS=40 \
+MINE_TELEOP_CAMERA_GAIN=120 \
+MINE_TELEOP_CAMERA_EXPOSURE_ABSOLUTE=600 \
+scripts/run_vehicle_live_media.sh
+```
+
 ## 3. 手动拷贝到工控机主目录
 
 工控机端不安装 systemd 服务，不设置自动启动；所有文件放在普通用户主目录下，手动执行。

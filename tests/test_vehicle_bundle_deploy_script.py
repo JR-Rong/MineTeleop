@@ -5,6 +5,8 @@ from pathlib import Path
 
 
 SCRIPT = Path("scripts/deploy_vehicle_bundle.sh")
+LIVE_CONTROL_SCRIPT = Path("scripts/start_live_control_plane_tunnel.sh")
+LIVE_MEDIA_SCRIPT = Path("scripts/run_vehicle_live_media.sh")
 
 
 class VehicleBundleDeployScriptTests(unittest.TestCase):
@@ -15,6 +17,23 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         result = subprocess.run(["bash", "-n", str(SCRIPT)], text=True, capture_output=True)
 
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_live_run_scripts_are_executable_and_have_valid_shell_syntax(self):
+        for script in (LIVE_CONTROL_SCRIPT, LIVE_MEDIA_SCRIPT):
+            self.assertTrue(script.is_file(), f"{script} should exist")
+            self.assertTrue(os.access(script, os.X_OK), f"{script} should be executable")
+            result = subprocess.run(["bash", "-n", str(script)], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_live_media_script_exposes_low_light_camera_controls(self):
+        text = LIVE_MEDIA_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("MINE_TELEOP_CAMERA_LOW_LIGHT", text)
+        self.assertIn("brightness=", text)
+        self.assertIn("gain=", text)
+        self.assertIn("gamma=", text)
+        self.assertIn("backlight_compensation=", text)
+        self.assertIn("exposure_dynamic_framerate=", text)
 
     def test_dry_run_targets_default_vehicle_ssh_tunnel_without_remote_docker(self):
         result = subprocess.run(
