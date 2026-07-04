@@ -7,6 +7,8 @@ from pathlib import Path
 SCRIPT = Path("scripts/deploy_vehicle_bundle.sh")
 LIVE_CONTROL_SCRIPT = Path("scripts/start_live_control_plane_tunnel.sh")
 LIVE_MEDIA_SCRIPT = Path("scripts/run_vehicle_live_media.sh")
+TIMESYNC_SCRIPT = Path("scripts/setup_vehicle_timesync.sh")
+BUILD_BUNDLE_SCRIPT = Path("scripts/build_ubuntu_bundle.py")
 
 
 class VehicleBundleDeployScriptTests(unittest.TestCase):
@@ -19,11 +21,32 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_live_run_scripts_are_executable_and_have_valid_shell_syntax(self):
-        for script in (LIVE_CONTROL_SCRIPT, LIVE_MEDIA_SCRIPT):
+        for script in (LIVE_CONTROL_SCRIPT, LIVE_MEDIA_SCRIPT, TIMESYNC_SCRIPT):
             self.assertTrue(script.is_file(), f"{script} should exist")
             self.assertTrue(os.access(script, os.X_OK), f"{script} should be executable")
             result = subprocess.run(["bash", "-n", str(script)], text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_timesync_script_configures_chrony_without_embedding_passwords(self):
+        text = TIMESYNC_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("MINE_TELEOP_NTP_SERVERS", text)
+        self.assertIn("MINE_TELEOP_TIMESYNC_BACKEND", text)
+        self.assertIn("chrony", text)
+        self.assertIn("chronyc tracking", text)
+        self.assertIn("chronyc sources -v", text)
+        self.assertIn("systemd-timesyncd", text)
+        self.assertIn("timedatectl timesync-status", text)
+        self.assertIn("timedatectl status", text)
+        self.assertIn("systemctl enable --now chrony", text)
+        self.assertIn("systemctl enable --now systemd-timesyncd", text)
+        self.assertNotIn("cz666666", text)
+
+    def test_ubuntu_bundle_includes_vehicle_timesync_script(self):
+        text = BUILD_BUNDLE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("setup_vehicle_timesync.sh", text)
+        self.assertIn("/workspace/output/scripts/setup_vehicle_timesync.sh", text)
 
     def test_live_media_script_exposes_low_light_camera_controls(self):
         text = LIVE_MEDIA_SCRIPT.read_text(encoding="utf-8")

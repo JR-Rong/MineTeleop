@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -109,6 +110,7 @@ class DriverConsoleRuntime:
         self.latest_frame_by_camera: dict[str, Path] = {}
         self.latest_frame_timing_by_camera: dict[str, dict[str, Any]] = {}
         self.decoded_frame_count_by_camera: dict[str, int] = {}
+        self.frame_receive_times_by_camera: dict[str, deque[int]] = {}
         self.token = ""
         self.session_id = ""
         self.control_token = ""
@@ -403,10 +405,14 @@ class DriverConsoleRuntime:
             raise RuntimeError("decoded frame is empty")
         current = self.dashboard.camera_status[camera_id]
         latency = _non_negative_delta(decoded_at_ms, captured_at_ms)
+        received_fps = self._record_frame_receive(camera_id, receive_time_ms)
+        display_fps = current.fps
+        if received_fps > 0:
+            display_fps = max(1, int(round(received_fps)))
         self.dashboard.update_camera_status(
             camera_id,
             state="connected",
-            fps=current.fps,
+            fps=display_fps,
             bitrate_kbps=current.bitrate_kbps,
             latency_ms=latency if latency is not None else current.latency_ms,
             message="decoded_frame_received",
@@ -424,6 +430,7 @@ class DriverConsoleRuntime:
             "transport_latency_ms": _non_negative_delta(receive_time_ms, sent_at_ms),
             "decode_latency_ms": max(0, decoded_at_ms - receive_time_ms),
             "end_to_end_latency_ms": latency,
+            "received_fps": round(received_fps, 2),
         }
         timing_snapshot = {
             "camera_id": camera_id,
@@ -472,6 +479,19 @@ class DriverConsoleRuntime:
     def _ensure_camera(self, camera_id: str) -> None:
         if camera_id not in self.dashboard.camera_status:
             self.dashboard.camera_status[camera_id] = CameraDisplayStatus(camera_id=camera_id)
+
+    def _record_frame_receive(self, camera_id: str, received_at_ms: int) -> float:
+        samples = self.frame_receive_times_by_camera.setdefault(camera_id, deque())
+        samples.append(received_at_ms)
+        cutoff_ms = received_at_ms - 5000
+        while samples and samples[0] < cutoff_ms:
+            samples.popleft()
+        while len(samples) > 120:
+            samples.popleft()
+        if len(samples) < 2:
+            return 0.0
+        elapsed_ms = max(1, samples[-1] - samples[0])
+        return (len(samples) - 1) * 1000.0 / elapsed_ms
 
     def _require_connected(self) -> None:
         if not self.session_id or not self.token:
@@ -777,6 +797,8 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
     const remoteStreamsByCamera = new Map();
     const gamepadMapping = __GAMEPAD_MAPPING_JSON__;
     const operatorPanelState = {dataChannel: 'closed', webrtc: 'idle'};
+    const knownCameraIds = new Set();
+    const lastRenderedFrameSequenceByCamera = {};
     async function postJson(path, payload) {
       const res = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
       const data = await res.json();
@@ -793,25 +815,79 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
       renderOperatorStatus(data);
       const cameras = data.dashboard.cameras || {};
       const timings = data.latest_frame_timing_by_camera || {};
-      document.getElementById('cameras').innerHTML = Object.keys(cameras).map((id) => {
-        const cam = cameras[id];
-        return `<article class="camera" data-camera-id="${id}"><div class="camera-frame" id="camera-body-${id}"><img src="/api/frame/${id}.png?ts=${Date.now()}" alt="${id}" onerror="this.replaceWith(document.createTextNode('${cam.state}'))"></div><strong>${id} ${cam.fps}fps ${cam.bitrate_kbps}kbps</strong>${renderFrameTiming(timings[id] || {}, cam)}</article>`;
-      }).join('');
+      renderCameraGrid(cameras, timings);
       restoreRemoteVideos();
+    }
+    function renderCameraGrid(cameras, timings) {
+      const grid = document.getElementById('cameras');
+      const cameraIds = Object.keys(cameras);
+      for (const knownId of Array.from(knownCameraIds)) {
+        if (!cameraIds.includes(knownId)) {
+          document.getElementById(`camera-card-${knownId}`)?.remove();
+          knownCameraIds.delete(knownId);
+          delete lastRenderedFrameSequenceByCamera[knownId];
+        }
+      }
+      for (const id of cameraIds) {
+        if (!knownCameraIds.has(id)) createCameraCard(id);
+        updateCameraCard(id, cameras[id], timings[id] || {});
+      }
+    }
+    function createCameraCard(id) {
+      const grid = document.getElementById('cameras');
+      const article = document.createElement('article');
+      article.className = 'camera';
+      article.id = `camera-card-${id}`;
+      article.dataset.cameraId = id;
+      article.innerHTML = `<div class="camera-frame" id="camera-body-${id}"><span id="camera-placeholder-${id}">waiting</span><img id="camera-img-${id}" alt="${id}" hidden></div><strong id="camera-title-${id}"></strong>${renderFrameTiming({camera_id: id}, {})}`;
+      grid.appendChild(article);
+      knownCameraIds.add(id);
+    }
+    function updateCameraCard(id, cam, timing) {
+      setText(`camera-title-${id}`, `${id} ${formatFps(timing.received_fps ?? cam.fps)}fps ${cam.bitrate_kbps}kbps`);
+      setText(`camera-e2e-${id}`, `E2E ${formatMs(timing.end_to_end_latency_ms ?? cam.latency_ms)}`);
+      setText(`camera-capture-${id}`, `capture ${formatTime(timing.captured_at_ms)}`);
+      setText(`camera-encode-${id}`, `encode ${formatTime(timing.encoded_at_ms)} / ${formatMs(timing.encode_latency_ms)}`);
+      setText(`camera-send-${id}`, `send ${formatTime(timing.sent_at_ms)}`);
+      setText(`camera-receive-${id}`, `receive ${formatTime(timing.received_at_ms)} / ${formatMs(timing.transport_latency_ms)}`);
+      setText(`camera-decode-${id}`, `decode ${formatTime(timing.decoded_at_ms)} / ${formatMs(timing.decode_latency_ms)}`);
+      setText(`camera-seq-${id}`, `seq ${timing.frame_sequence ?? '-'}`);
+      if (remoteStreamsByCamera.has(id)) return;
+      const sequence = timing.frame_sequence;
+      const img = document.getElementById(`camera-img-${id}`);
+      const placeholder = document.getElementById(`camera-placeholder-${id}`);
+      if (!img || !placeholder) return;
+      if (Number.isFinite(Number(sequence)) && sequence > 0) {
+        if (lastRenderedFrameSequenceByCamera[id] !== sequence) {
+          img.src = `/api/frame/${id}.png?seq=${sequence}`;
+          lastRenderedFrameSequenceByCamera[id] = sequence;
+        }
+        img.hidden = false;
+        placeholder.hidden = true;
+      } else {
+        img.hidden = true;
+        placeholder.hidden = false;
+        placeholder.textContent = cam.state || 'waiting';
+      }
     }
     function renderFrameTiming(timing, cam) {
       const total = timing.end_to_end_latency_ms ?? cam.latency_ms;
-      return `<div class="camera-meta"><span class="latency-total">E2E ${formatMs(total)}</span><div class="timing-grid">
-        <span>capture ${formatTime(timing.captured_at_ms)}</span>
-        <span>encode ${formatTime(timing.encoded_at_ms)} / ${formatMs(timing.encode_latency_ms)}</span>
-        <span>send ${formatTime(timing.sent_at_ms)}</span>
-        <span>receive ${formatTime(timing.received_at_ms)} / ${formatMs(timing.transport_latency_ms)}</span>
-        <span>decode ${formatTime(timing.decoded_at_ms)} / ${formatMs(timing.decode_latency_ms)}</span>
-        <span>seq ${timing.frame_sequence ?? '-'}</span>
+      return `<div class="camera-meta"><span id="camera-e2e-${timing.camera_id || ''}" class="latency-total">E2E ${formatMs(total)}</span><div class="timing-grid">
+        <span id="camera-capture-${timing.camera_id || ''}">capture ${formatTime(timing.captured_at_ms)}</span>
+        <span id="camera-encode-${timing.camera_id || ''}">encode ${formatTime(timing.encoded_at_ms)} / ${formatMs(timing.encode_latency_ms)}</span>
+        <span id="camera-send-${timing.camera_id || ''}">send ${formatTime(timing.sent_at_ms)}</span>
+        <span id="camera-receive-${timing.camera_id || ''}">receive ${formatTime(timing.received_at_ms)} / ${formatMs(timing.transport_latency_ms)}</span>
+        <span id="camera-decode-${timing.camera_id || ''}">decode ${formatTime(timing.decoded_at_ms)} / ${formatMs(timing.decode_latency_ms)}</span>
+        <span id="camera-seq-${timing.camera_id || ''}">seq ${timing.frame_sequence ?? '-'}</span>
       </div></div>`;
     }
     function formatMs(value) {
       return Number.isFinite(Number(value)) ? `${Math.round(Number(value))}ms` : '-';
+    }
+    function formatFps(value) {
+      if (!Number.isFinite(Number(value))) return '0';
+      const fps = Number(value);
+      return fps >= 10 ? String(Math.round(fps)) : fps.toFixed(1).replace(/\\.0$/, '');
     }
     function formatTime(value) {
       if (!Number.isFinite(Number(value))) return '-';

@@ -226,6 +226,7 @@ def _container_build_script(
         ],
         "smoke_commands": [
             "./manual-smoke.sh",
+            "scripts/setup_vehicle_timesync.sh --check",
             "bin/mine-teleop --list",
             "bin/ffmpeg -hide_banner -hwaccels",
             "bin/mine-teleop vehicle-agent --config /etc/mine-teleop/vehicle-agent.yaml --adapter-status",
@@ -424,6 +425,8 @@ PY
         cp configs/driver-console.dev.yaml /workspace/output/configs/
         cp scripts/run_vehicle_live_media.sh /workspace/output/scripts/
         chmod +x /workspace/output/scripts/run_vehicle_live_media.sh
+        cp scripts/setup_vehicle_timesync.sh /workspace/output/scripts/
+        chmod +x /workspace/output/scripts/setup_vehicle_timesync.sh
         cp scripts/ipc_manual_smoke.sh /workspace/output/manual-smoke.sh
         chmod +x /workspace/output/manual-smoke.sh
         cp README.md /workspace/output/docs/README.md

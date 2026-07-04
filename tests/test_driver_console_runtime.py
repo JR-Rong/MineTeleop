@@ -882,6 +882,59 @@ class DriverConsoleHttpAppTests(unittest.TestCase):
         self.assertEqual(latest_timing["decode_latency_ms"], decoded["decode_latency_ms"])
         self.assertEqual(latest_timing["end_to_end_latency_ms"], decoded["end_to_end_latency_ms"])
 
+    def test_http_app_updates_received_fps_from_frame_arrivals(self):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("ffmpeg is required for H.264 decode smoke")
+        with tempfile.TemporaryDirectory() as tmp:
+            frame_dir = Path(tmp) / "frames"
+            encoded_path = Path(tmp) / "front.h264"
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=160x90:rate=1",
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "zerolatency",
+                    "-f",
+                    "h264",
+                    str(encoded_path),
+                ],
+                check=True,
+            )
+            payload = encoded_path.read_bytes()
+            runtime = DriverConsoleRuntime.from_config(
+                "configs/driver-console.dev.yaml",
+                signaling_http_url="http://127.0.0.1:8765",
+                vehicle_id="vehicle-001",
+                password="dev-password",
+                control_sink=RecordingControlCommandSink(),
+                frame_dir=frame_dir,
+            )
+
+            runtime.ingest_encoded_frame("front", "h264", payload, received_at_ms=1000)
+            runtime.ingest_encoded_frame("front", "h264", payload, received_at_ms=1500)
+            decoded = runtime.ingest_encoded_frame("front", "h264", payload, received_at_ms=2000)
+            status = runtime.snapshot()
+
+        latest_timing = status["latest_frame_timing_by_camera"]["front"]
+        self.assertEqual(decoded["frame_sequence"], 3)
+        self.assertEqual(status["dashboard"]["cameras"]["front"]["fps"], 2)
+        self.assertAlmostEqual(latest_timing["received_fps"], 2.0)
+        self.assertAlmostEqual(decoded["received_fps"], 2.0)
+
     def test_http_page_renders_frame_timing_breakdown(self):
         runtime = DriverConsoleRuntime.from_config(
             "configs/driver-console.dev.yaml",
@@ -901,6 +954,28 @@ class DriverConsoleHttpAppTests(unittest.TestCase):
         self.assertIn("receive ${formatTime(timing.received_at_ms)}", page)
         self.assertIn("decode ${formatTime(timing.decoded_at_ms)}", page)
         self.assertIn("E2E ${formatMs(total)}", page)
+
+    def test_http_page_updates_camera_cards_without_rebuilding_frame_dom(self):
+        runtime = DriverConsoleRuntime.from_config(
+            "configs/driver-console.dev.yaml",
+            signaling_http_url="http://127.0.0.1:8765",
+            vehicle_id="vehicle-001",
+            password="dev-password",
+            control_sink=RecordingControlCommandSink(),
+        )
+        app = DriverConsoleHttpApp(runtime)
+        with app.running("127.0.0.1", 0) as console_url:
+            page = request.urlopen(f"{console_url}/", timeout=5).read().decode("utf-8")
+
+        self.assertIn("const knownCameraIds = new Set()", page)
+        self.assertIn("const lastRenderedFrameSequenceByCamera = {}", page)
+        self.assertIn("function renderCameraGrid(cameras, timings)", page)
+        self.assertIn("function createCameraCard(id)", page)
+        self.assertIn("function updateCameraCard(id, cam, timing)", page)
+        self.assertIn("img.src = `/api/frame/${id}.png?seq=${sequence}`", page)
+        self.assertIn("formatFps(timing.received_fps ?? cam.fps)", page)
+        self.assertNotIn("innerHTML = Object.keys(cameras).map", page)
+        self.assertNotIn("?ts=${Date.now()}", page)
 
     def test_driver_console_cli_can_serve_http_control_program(self):
         with tempfile.TemporaryDirectory() as tmp:

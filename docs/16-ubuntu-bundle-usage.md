@@ -82,6 +82,38 @@ scripts/deploy_vehicle_bundle.sh \
 
 ## 2.1 本机 Docker 控制端和车端实时推流
 
+端到端延迟细分依赖车端和控制端时钟同步。车端包内带有 chrony/NTP 配置脚本，首次联调前先在车端
+检查当前同步状态：
+
+```bash
+cd /home/user/mine-teleop
+scripts/setup_vehicle_timesync.sh --check
+```
+
+如果 `chronyc tracking` 或 `timedatectl status` 显示未同步，执行配置脚本。脚本默认使用
+`MINE_TELEOP_TIMESYNC_BACKEND=auto`：如果车端已经安装 chrony，就写入
+`/etc/chrony/conf.d/mine-teleop.conf` 并重启 chrony；如果没有 chrony，就写入
+`/etc/systemd/timesyncd.conf.d/mine-teleop.conf` 并启用 systemd-timesyncd，避免和已有
+`time-daemon` 包冲突：
+
+```bash
+cd /home/user/mine-teleop
+scripts/setup_vehicle_timesync.sh
+```
+
+默认 NTP 源为 `ntp.aliyun.com ntp.tencent.com time.cloudflare.com pool.ntp.org`。现场也可以覆盖：
+
+```bash
+MINE_TELEOP_NTP_SERVERS="ntp.aliyun.com ntp.tencent.com" \
+  scripts/setup_vehicle_timesync.sh
+```
+
+只有在现场明确需要 chrony 且 apt 包依赖状态正常时，才强制 chrony 后端：
+
+```bash
+MINE_TELEOP_TIMESYNC_BACKEND=chrony scripts/setup_vehicle_timesync.sh
+```
+
 本机控制端通过 Docker 运行，车端通过 SSH 反向隧道访问本机 `8080`。先在本机启动控制端和
 反向隧道；脚本会在本机检查 `/health`，并从车端反查 `http://127.0.0.1:18080/health`，避免车端
 脚本启动后刷 `Connection refused`：
