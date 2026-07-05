@@ -38,6 +38,7 @@
 - [Ubuntu Bundle 使用说明](docs/16-ubuntu-bundle-usage.md)
 - [Ubuntu Bundle 架构说明](docs/17-ubuntu-bundle-architecture.md)
 - [控制端 Docker 程序与 Smoke](docs/18-control-plane-docker-smoke.md)
+- [实时遥操现场调试纪要](docs/19-live-teleop-field-debug.md)
 - ADR:
   - [0001: 传输与媒体栈选择](docs/adr/0001-transport-and-media-stack.md)
   - [0002: 硬件编码策略](docs/adr/0002-hardware-encoding-strategy.md)
