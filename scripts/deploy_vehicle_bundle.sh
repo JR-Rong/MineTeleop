@@ -5,14 +5,15 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 
 BUNDLE="$REPO_ROOT/dist/mine-teleop-ubuntu-x86_64.tar.gz"
-SSH_USER="user"
-SSH_HOST="60.205.213.254"
-SSH_PORT="6000"
+SSH_USER=""
+SSH_HOST=""
+SSH_PORT="22"
+SSH_KEY="${MINE_TELEOP_VEHICLE_SSH_KEY:-}"
 REMOTE_DIR=""
 REMOTE_ARCHIVE="/tmp/mine-teleop-ubuntu-x86_64.tar.gz"
 DRIVER_CONSOLE_URL=""
 SIGNALING_HTTP_URL=""
-DEVICE_TOKEN="dev-device-secret"
+DEVICE_TOKEN="${MINE_TELEOP_VEHICLE_DEVICE_TOKEN:-}"
 MEDIA_FRAMES="1"
 FRAME_INTERVAL_MS="33"
 RUN_CONTROL_TELEOP="false"
@@ -29,14 +30,15 @@ Usage:
 Deploy the no-Docker-on-target Ubuntu vehicle bundle over SSH, unpack it under
 the remote user's home directory, and run smoke commands from the bundled files.
 
-Defaults match the field tunnel:
-  ssh -p 6000 user@60.205.213.254
+Required: --host and --user (or MINE_TELEOP_VEHICLE_SSH_HOST / _USER). Prefer
+key-based auth via --ssh-key or MINE_TELEOP_VEHICLE_SSH_KEY.
 
 Options:
   --bundle PATH                Local bundle archive. Default: dist/mine-teleop-ubuntu-x86_64.tar.gz
-  --user USER                  SSH user. Default: user
-  --host HOST                  SSH host. Default: 60.205.213.254
-  --port PORT                  SSH port. Default: 6000
+  --user USER                  SSH user (required).
+  --host HOST                  SSH host (required).
+  --port PORT                  SSH port. Default: 22
+  --ssh-key PATH               SSH identity file for key-based auth.
   --remote-dir PATH            Remote install directory. Default: /home/<user>/mine-teleop
   --remote-archive PATH        Remote temporary archive path. Default: /tmp/mine-teleop-ubuntu-x86_64.tar.gz
   --driver-console-url URL     After deploy, send encoded test frames to this driver console URL.
@@ -46,15 +48,15 @@ Options:
   --run-control-teleop         Run vehicle-agent --teleop and print accepted control command JSONL logs.
   --teleop-duration-ms MS      Control teleop run duration. Default: 15000
   --teleop-session-wait-ms MS  How long to wait for an active session. Default: 15000
-  --device-token TOKEN         Vehicle device token for signaling/upload APIs. Default: dev-device-secret
+  --device-token TOKEN         Vehicle device token for signaling/upload APIs (required for smoke calls).
   --ssh-option OPTION          Extra -o option passed to ssh/scp. Can be repeated.
   --dry-run                    Print commands without connecting or reading the bundle.
   -h, --help                   Show this help.
 
 Examples:
-  scripts/deploy_vehicle_bundle.sh --dry-run
-  scripts/deploy_vehicle_bundle.sh --driver-console-url http://CONTROL_HOST:8080
-  scripts/deploy_vehicle_bundle.sh --signaling-http-url http://CONTROL_HOST:8765 --run-control-teleop
+  scripts/deploy_vehicle_bundle.sh --host HOST --user USER --dry-run
+  scripts/deploy_vehicle_bundle.sh --host HOST --user USER --ssh-key ~/.ssh/id_ed25519 --driver-console-url http://CONTROL_HOST:8080
+  scripts/deploy_vehicle_bundle.sh --host HOST --user USER --signaling-http-url http://CONTROL_HOST:8765 --run-control-teleop
 EOF
 }
 
@@ -89,6 +91,11 @@ while [[ $# -gt 0 ]]; do
     --port)
       require_value "$1" "${2:-}"
       SSH_PORT="$2"
+      shift 2
+      ;;
+    --ssh-key)
+      require_value "$1" "${2:-}"
+      SSH_KEY="$2"
       shift 2
       ;;
     --remote-dir)
@@ -165,8 +172,12 @@ done
 [[ "$TELEOP_DURATION_MS" =~ ^[0-9]+$ ]] || die "--teleop-duration-ms must be an integer"
 [[ "$TELEOP_SESSION_WAIT_MS" =~ ^[0-9]+$ ]] || die "--teleop-session-wait-ms must be an integer"
 
+if [[ "$DRY_RUN" != "true" ]]; then
+  [[ -n "$SSH_HOST" ]] || die "--host (or MINE_TELEOP_VEHICLE_SSH_HOST) is required"
+  [[ -n "$SSH_USER" ]] || die "--user (or MINE_TELEOP_VEHICLE_SSH_USER) is required"
+fi
 if [[ -z "$REMOTE_DIR" ]]; then
-  REMOTE_DIR="/home/$SSH_USER/mine-teleop"
+  REMOTE_DIR="/home/${SSH_USER:-user}/mine-teleop"
 fi
 if [[ "$RUN_CONTROL_TELEOP" == "true" && -z "$SIGNALING_HTTP_URL" ]]; then
   die "--run-control-teleop requires --signaling-http-url"
@@ -178,6 +189,10 @@ fi
 SSH_TARGET="$SSH_USER@$SSH_HOST"
 SSH_BASE=(ssh -p "$SSH_PORT")
 SCP_BASE=(scp -P "$SSH_PORT")
+if [[ -n "$SSH_KEY" ]]; then
+  SSH_BASE+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
+  SCP_BASE+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
+fi
 if [[ ${#SSH_OPTIONS[@]} -gt 0 ]]; then
   SSH_BASE+=("${SSH_OPTIONS[@]}")
   SCP_BASE+=("${SSH_OPTIONS[@]}")

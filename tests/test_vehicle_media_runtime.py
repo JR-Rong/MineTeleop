@@ -13,7 +13,13 @@ from urllib import request
 from mine_teleop.config import load_driver_config, load_vehicle_config
 from mine_teleop.driver_console_runtime import DriverConsoleHttpApp, DriverConsoleRuntime, RecordingControlCommandSink
 from mine_teleop.signaling_service import SignalingHttpService
-from mine_teleop.vehicle_media_runtime import EncodedFrame, MjpegFrameEncoder, VehicleMediaRuntime
+from mine_teleop.vehicle_media_runtime import (
+    DriverConsoleFrameSink,
+    EncodedFrame,
+    MjpegFrameEncoder,
+    VehicleMediaRuntime,
+    _LatestFrameMailbox,
+)
 
 
 def _json_get(url: str) -> dict:
@@ -226,5 +232,82 @@ class VehicleMediaRuntimeCliTests(unittest.TestCase):
             self.assertTrue((root / "uploader" / "archive").exists())
 
 
+def _frame(seq: int) -> EncodedFrame:
+    return EncodedFrame(
+        camera_id="front",
+        seq=seq,
+        codec="mjpeg",
+        payload=b"\xff\xd8frame\xff\xd9",
+        captured_at_ms=1000 + seq,
+        encoded_at_ms=1001 + seq,
+        width=320,
+        height=180,
+        fps=15,
+        bitrate_kbps=800,
+    )
+
+
+class LatestFrameMailboxTests(unittest.TestCase):
+    def test_mailbox_keeps_only_the_freshest_frame_and_counts_drops(self):
+        mailbox = _LatestFrameMailbox()
+        mailbox.publish(_frame(1))
+        mailbox.publish(_frame(2))
+        mailbox.publish(_frame(3))
+        self.assertEqual(mailbox.published, 3)
+        self.assertEqual(mailbox.dropped, 2)
+        popped = mailbox.pop()
+        self.assertIsNotNone(popped)
+        self.assertEqual(popped.seq, 3)
+        self.assertIsNone(mailbox.pop())
+
+
+class StreamFramesTests(unittest.TestCase):
+    def test_stream_frames_sends_and_always_delivers_the_latest_frame(self):
+        config = load_vehicle_config(Path("configs/vehicle-agent.dev.yaml"))
+        encoder = _FakeEncoder(calls=[])
+        sink = _FakeSink(posted=[])
+        runtime = VehicleMediaRuntime(config, frame_sink=sink, encoder=encoder)
+
+        summary = runtime.stream_frames(frame_count=5, capture_interval_ms=0, sleep_fn=lambda _s: None)
+
+        self.assertEqual(summary["event"], "vehicle_media_stream_summary")
+        self.assertEqual(summary["captured_frames"], 5)
+        self.assertEqual(summary["sent_frames"] + summary["dropped_frames"], 5)
+        self.assertGreaterEqual(summary["sent_frames"], 1)
+        self.assertEqual(summary["send_errors"], 0)
+        # The freshest (last) captured frame must always be delivered.
+        self.assertEqual(sink.posted[-1]["seq"], 5)
+
+
+class DriverConsoleFrameSinkTests(unittest.TestCase):
+    def test_sink_reuses_connection_and_applies_clock_offset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            driver_config = load_driver_config(Path("configs/driver-console.dev.yaml"))
+            runtime = DriverConsoleRuntime(
+                driver_config,
+                signaling_http_url="http://127.0.0.1:8765",
+                vehicle_id="vehicle-001",
+                password="dev-password",
+                control_sink=RecordingControlCommandSink(),
+                frame_dir=Path(tmp) / "frames",
+            )
+            with DriverConsoleHttpApp(runtime).running("127.0.0.1", 0) as console_url:
+                sink = DriverConsoleFrameSink(console_url)
+                try:
+                    responses = [sink.send_frame(_frame(seq), sent_at_ms=2000 + seq) for seq in (1, 2, 3)]
+                finally:
+                    sink.close()
+                status = _json_get(f"{console_url}/api/status")
+
+        self.assertEqual(len(responses), 3)
+        for response in responses:
+            self.assertTrue(response["frame_received"])
+            self.assertGreaterEqual(response["end_to_end_latency_ms"], 0)
+        self.assertIsInstance(sink.clock_offset_ms, int)
+        self.assertIsNotNone(sink._last_clock_sync_ms)
+        self.assertEqual(status["decoded_frame_count_by_camera"]["front"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -59,6 +59,17 @@ def main() -> int:
         help="Encoded frame codec for --mode teleop. mjpeg is lower latency for browser preview.",
     )
     parser.add_argument("--ffmpeg-binary", default="", help="Override ffmpeg binary for --mode teleop.")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream frames with a concurrent capture/send pipeline (drops stale frames) for --mode teleop.",
+    )
+    parser.add_argument(
+        "--duration-ms",
+        type=int,
+        default=0,
+        help="With --stream, stream for this many milliseconds (0 falls back to --frames).",
+    )
     parser.add_argument("--json", action="store_true", help="Emit --mode teleop summary as JSON.")
     parser.add_argument("--record-upload-once", action="store_true", help="Record and upload the last encoded frame.")
     parser.add_argument("--recording-root", default="", help="Recording root for --record-upload-once.")
@@ -156,11 +167,15 @@ def _run_teleop(config, args: argparse.Namespace) -> int:
         encoder = FfmpegH264FrameEncoder(config, ffmpeg_binary=ffmpeg_binary)
     runtime = VehicleMediaRuntime(config, frame_sink=DriverConsoleFrameSink(args.driver_console_url), encoder=encoder)
     try:
-        summary = runtime.send_frames(frame_count=args.frames, frame_interval_ms=args.frame_interval_ms)
+        if args.stream:
+            if args.duration_ms > 0:
+                summary = runtime.stream_frames(duration_ms=args.duration_ms)
+            else:
+                summary = runtime.stream_frames(frame_count=args.frames)
+        else:
+            summary = runtime.send_frames(frame_count=args.frames, frame_interval_ms=args.frame_interval_ms)
     finally:
-        close = getattr(encoder, "close", None)
-        if callable(close):
-            close()
+        runtime.close()
     if args.record_upload_once:
         if runtime.last_frame is None:
             print("cannot record upload before a frame has been encoded", file=sys.stderr)

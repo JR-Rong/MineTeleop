@@ -364,6 +364,7 @@ class DriverConsoleRuntime:
         encoded_at_ms: int | None = None,
         sent_at_ms: int | None = None,
         received_at_ms: int | None = None,
+        clock_offset_ms: int = 0,
     ) -> dict[str, Any]:
         if not camera_id:
             raise ValueError("camera_id is required")
@@ -417,7 +418,12 @@ class DriverConsoleRuntime:
         if size_bytes <= 0:
             raise RuntimeError("decoded frame is empty")
         current = self.dashboard.camera_status[camera_id]
-        latency = _non_negative_delta(decoded_at_ms, captured_at_ms)
+        # Express the vehicle-side capture/send timestamps in the console clock
+        # domain before computing cross-machine latency (H1). encode/decode
+        # latency are intra-host and need no correction.
+        captured_console_ms = None if captured_at_ms is None else captured_at_ms + clock_offset_ms
+        sent_console_ms = None if sent_at_ms is None else sent_at_ms + clock_offset_ms
+        latency = _non_negative_delta(decoded_at_ms, captured_console_ms)
         received_fps = self._record_frame_receive(camera_id, receive_time_ms)
         display_fps = current.fps
         if received_fps > 0:
@@ -441,7 +447,7 @@ class DriverConsoleRuntime:
             "received_at_ms": receive_time_ms,
             "decoded_at_ms": decoded_at_ms,
             "encode_latency_ms": _non_negative_delta(encoded_at_ms, captured_at_ms),
-            "transport_latency_ms": _non_negative_delta(receive_time_ms, sent_at_ms),
+            "transport_latency_ms": _non_negative_delta(receive_time_ms, sent_console_ms),
             "decode_latency_ms": decode_latency_ms,
             "end_to_end_latency_ms": latency,
             "received_fps": round(received_fps, 2),
@@ -555,10 +561,17 @@ class DriverConsoleHttpApp:
         app = self
 
         class Handler(BaseHTTPRequestHandler):
+            # HTTP/1.1 so the vehicle media sender can reuse one keep-alive
+            # connection across frames instead of a fresh TCP handshake per frame.
+            protocol_version = "HTTP/1.1"
+
             def do_GET(self) -> None:
                 path = urlparse(self.path).path
                 if path == "/health":
                     self._json_response(200, {"status": "ok"})
+                    return
+                if path == "/api/time":
+                    self._json_response(200, {"now_ms": _now_ms()})
                     return
                 if path == "/api/status":
                     self._json_response(200, app.runtime.snapshot())
@@ -687,6 +700,7 @@ class DriverConsoleHttpApp:
                             captured_at_ms=_optional_payload_int(payload, "captured_at_ms"),
                             encoded_at_ms=_optional_payload_int(payload, "encoded_at_ms"),
                             sent_at_ms=_optional_payload_int(payload, "sent_at_ms"),
+                            clock_offset_ms=_optional_signed_int(payload, "clock_offset_ms"),
                         )
                         self._json_response(200, frame | {"snapshot": app.runtime.snapshot()})
                         return
@@ -1180,6 +1194,15 @@ def _optional_payload_int(payload: dict[str, Any], key: str) -> int | None:
     if value is None:
         return None
     return _optional_non_negative_int(value, key)
+
+
+def _optional_signed_int(payload: dict[str, Any], key: str) -> int:
+    value = payload.get(key)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key} must be an integer")
+    return value
 
 
 def _require_non_empty_string(value: Any, field: str) -> str:

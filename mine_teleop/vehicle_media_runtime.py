@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import collections
+import http.client
 import json
 import os
 import select
 import subprocess
+import threading
 import time
-import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,89 +60,67 @@ class FrameSink(Protocol):
         ...
 
 
-class FfmpegH264FrameEncoder:
-    def __init__(self, config: VehicleConfig, *, ffmpeg_binary: str = "ffmpeg") -> None:
-        self.config = config
-        self.ffmpeg_binary = ffmpeg_binary
+class _PipedFfmpegStream:
+    """A long-lived ffmpeg process whose stdout is framed incrementally.
 
-    def encode(self, camera: CameraConfig, *, seq: int, now_ms: int) -> EncodedFrame:
-        profile = self.config.realtime_profiles[camera.realtime_profile]
-        width = int(profile.width)
-        height = int(profile.height)
-        fps = int(profile.fps)
-        command = self._command(camera, width=width, height=height, fps=fps, bitrate_kbps=profile.bitrate_kbps)
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"ffmpeg H.264 frame encode failed for {camera.camera_id}: {stderr}")
-        if not result.stdout:
-            raise RuntimeError(f"ffmpeg H.264 frame encode produced no payload for {camera.camera_id}")
-        return EncodedFrame(
-            camera_id=camera.camera_id,
-            seq=seq,
-            codec="h264",
-            payload=result.stdout,
-            captured_at_ms=now_ms,
-            encoded_at_ms=_now_ms(),
-            width=width,
-            height=height,
-            fps=fps,
-            bitrate_kbps=profile.bitrate_kbps,
-        )
+    stderr is drained on a daemon thread so a chatty ffmpeg cannot fill the
+    ~64KB pipe buffer and deadlock stdout frame production (H3).
+    """
 
-    def _command(self, camera: CameraConfig, *, width: int, height: int, fps: int, bitrate_kbps: int) -> list[str]:
-        command = [self.ffmpeg_binary, "-hide_banner", "-loglevel", "error", "-y"]
-        if camera.device == "testsrc":
-            command.extend(["-f", "lavfi", "-i", f"testsrc2=size={width}x{height}:rate={fps}"])
-        else:
-            command.extend(
-                [
-                    "-f",
-                    "v4l2",
-                    "-video_size",
-                    f"{camera.capture_width}x{camera.capture_height}",
-                    "-framerate",
-                    str(camera.capture_fps),
-                    "-i",
-                    camera.device,
-                    "-vf",
-                    f"scale={width}:{height}",
-                ]
-            )
-        command.extend(
-            [
-                "-frames:v",
-                "1",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-tune",
-                "zerolatency",
-                "-b:v",
-                f"{bitrate_kbps}k",
-                "-pix_fmt",
-                "yuv420p",
-                "-f",
-                "h264",
-                "pipe:1",
-            ]
-        )
-        return command
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        self.process = process
+        self.buffer = b""
+        self._stderr_chunks: collections.deque[bytes] = collections.deque(maxlen=64)
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    def _drain_stderr(self) -> None:
+        stderr = self.process.stderr
+        if stderr is None:
+            return
+        try:
+            for chunk in iter(lambda: stderr.read(4096), b""):
+                self._stderr_chunks.append(chunk)
+        except (ValueError, OSError):
+            return
+
+    def stderr_text(self) -> str:
+        return b"".join(self._stderr_chunks).decode("utf-8", errors="replace").strip()
+
+    def alive(self) -> bool:
+        return self.process.poll() is None
+
+    def close(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=2)
+        self._stderr_thread.join(timeout=1)
+        if self.process.stdout is not None:
+            try:
+                self.process.stdout.close()
+            except OSError:
+                pass
+        if self.process.stderr is not None:
+            try:
+                self.process.stderr.close()
+            except OSError:
+                pass
 
 
-@dataclass
-class _MjpegStream:
-    process: subprocess.Popen[bytes]
-    buffer: bytes = field(default_factory=bytes)
+class _PersistentFfmpegEncoder:
+    """Shared machinery for persistent (streamed) ffmpeg encoders."""
 
+    codec = ""
 
-class MjpegFrameEncoder:
     def __init__(self, config: VehicleConfig, *, ffmpeg_binary: str = "ffmpeg", frame_timeout_seconds: float = 2.0) -> None:
         self.config = config
         self.ffmpeg_binary = ffmpeg_binary
         self.frame_timeout_seconds = frame_timeout_seconds
-        self._streams: dict[str, _MjpegStream] = {}
+        self._streams: dict[str, _PipedFfmpegStream] = {}
 
     def encode(self, camera: CameraConfig, *, seq: int, now_ms: int) -> EncodedFrame:
         profile = self.config.realtime_profiles[camera.realtime_profile]
@@ -148,11 +128,11 @@ class MjpegFrameEncoder:
         height = int(profile.height)
         fps = int(profile.fps)
         stream = self._stream_for(camera, width=width, height=height, fps=fps)
-        payload = self._read_jpeg_frame(camera.camera_id, stream)
+        payload = self._read_unit(camera.camera_id, stream)
         return EncodedFrame(
             camera_id=camera.camera_id,
             seq=seq,
-            codec="mjpeg",
+            codec=self.codec,
             payload=payload,
             captured_at_ms=now_ms,
             encoded_at_ms=_now_ms(),
@@ -164,30 +144,58 @@ class MjpegFrameEncoder:
 
     def close(self) -> None:
         for stream in self._streams.values():
-            if stream.process.poll() is None:
-                stream.process.terminate()
-                try:
-                    stream.process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    stream.process.kill()
-                    stream.process.wait(timeout=2)
-            if stream.process.stdout is not None:
-                stream.process.stdout.close()
-            if stream.process.stderr is not None:
-                stream.process.stderr.close()
+            stream.close()
         self._streams.clear()
 
-    def _stream_for(self, camera: CameraConfig, *, width: int, height: int, fps: int) -> _MjpegStream:
+    def _stream_for(self, camera: CameraConfig, *, width: int, height: int, fps: int) -> _PipedFfmpegStream:
         stream = self._streams.get(camera.camera_id)
-        if stream is not None and stream.process.poll() is None:
+        if stream is not None and stream.alive():
             return stream
+        if stream is not None:
+            stream.close()
         command = self._command(camera, width=width, height=height, fps=fps)
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if process.stdout is None:
-            raise RuntimeError("ffmpeg MJPEG stream stdout is unavailable")
-        stream = _MjpegStream(process=process)
+            raise RuntimeError("ffmpeg stream stdout is unavailable")
+        stream = _PipedFfmpegStream(process)
         self._streams[camera.camera_id] = stream
         return stream
+
+    def _read_unit(self, camera_id: str, stream: _PipedFfmpegStream) -> bytes:
+        if stream.process.stdout is None:
+            raise RuntimeError(f"ffmpeg stream stdout closed for {camera_id}")
+        fd = stream.process.stdout.fileno()
+        deadline = time.monotonic() + self.frame_timeout_seconds
+        while True:
+            unit = self._extract_unit(stream)
+            if unit is not None:
+                return unit
+            if stream.process.poll() is not None:
+                raise RuntimeError(f"ffmpeg stream exited for {camera_id}: {stream.stderr_text()}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"timed out waiting for a frame from {camera_id}: {stream.stderr_text()}")
+            readable, _, _ = select.select([fd], [], [], remaining)
+            if not readable:
+                raise RuntimeError(f"timed out waiting for a frame from {camera_id}: {stream.stderr_text()}")
+            chunk = os.read(fd, 262144)
+            if not chunk:
+                raise RuntimeError(f"ffmpeg stream ended for {camera_id}: {stream.stderr_text()}")
+            stream.buffer += chunk
+            self._trim_buffer(stream)
+
+    def _extract_unit(self, stream: _PipedFfmpegStream) -> bytes | None:
+        raise NotImplementedError
+
+    def _trim_buffer(self, stream: _PipedFfmpegStream) -> None:
+        pass
+
+    def _command(self, camera: CameraConfig, *, width: int, height: int, fps: int) -> list[str]:
+        raise NotImplementedError
+
+
+class MjpegFrameEncoder(_PersistentFfmpegEncoder):
+    codec = "mjpeg"
 
     def _command(self, camera: CameraConfig, *, width: int, height: int, fps: int) -> list[str]:
         command = [self.ffmpeg_binary, "-hide_banner", "-loglevel", "error"]
@@ -213,72 +221,216 @@ class MjpegFrameEncoder:
         command.extend(["-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"])
         return command
 
-    def _read_jpeg_frame(self, camera_id: str, stream: _MjpegStream) -> bytes:
-        if stream.process.stdout is None:
-            raise RuntimeError(f"ffmpeg MJPEG stream stdout closed for {camera_id}")
-        fd = stream.process.stdout.fileno()
-        deadline = time.monotonic() + self.frame_timeout_seconds
-        while True:
-            frame = self._pop_jpeg_from_buffer(stream)
-            if frame is not None:
-                return frame
-            if stream.process.poll() is not None:
-                stderr = _read_process_stderr(stream.process)
-                raise RuntimeError(f"ffmpeg MJPEG stream exited for {camera_id}: {stderr}")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError(f"timed out waiting for MJPEG frame from {camera_id}")
-            readable, _, _ = select.select([fd], [], [], remaining)
-            if not readable:
-                raise RuntimeError(f"timed out waiting for MJPEG frame from {camera_id}")
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                stderr = _read_process_stderr(stream.process)
-                raise RuntimeError(f"ffmpeg MJPEG stream ended for {camera_id}: {stderr}")
-            stream.buffer += chunk
-            if len(stream.buffer) > 8 * 1024 * 1024:
-                start = stream.buffer.rfind(b"\xff\xd8")
-                stream.buffer = stream.buffer[start:] if start >= 0 else b""
-
-    @staticmethod
-    def _pop_jpeg_from_buffer(stream: _MjpegStream) -> bytes | None:
+    def _extract_unit(self, stream: _PipedFfmpegStream) -> bytes | None:
         start = stream.buffer.find(b"\xff\xd8")
         if start < 0:
             stream.buffer = b""
             return None
         if start > 0:
             stream.buffer = stream.buffer[start:]
-            start = 0
-        end = stream.buffer.find(b"\xff\xd9", start + 2)
+        end = stream.buffer.find(b"\xff\xd9", 2)
         if end < 0:
             return None
         end += 2
-        frame = stream.buffer[start:end]
+        frame = stream.buffer[:end]
         stream.buffer = stream.buffer[end:]
         return frame
 
+    def _trim_buffer(self, stream: _PipedFfmpegStream) -> None:
+        if len(stream.buffer) > 16 * 1024 * 1024:
+            start = stream.buffer.rfind(b"\xff\xd8")
+            stream.buffer = stream.buffer[start:] if start >= 0 else b""
+
+
+class FfmpegH264FrameEncoder(_PersistentFfmpegEncoder):
+    """Persistent all-intra H.264 encoder.
+
+    Every frame is an IDR (``-g 1``) with repeated SPS/PPS and an Access Unit
+    Delimiter, so each emitted access unit is independently decodable by the
+    driver console (which decodes one posted payload at a time). This avoids the
+    old per-frame ``ffmpeg`` spawn that reopened the camera every frame (H2).
+    """
+
+    codec = "h264"
+    _AUD = b"\x00\x00\x00\x01\x09"
+
+    def _command(self, camera: CameraConfig, *, width: int, height: int, fps: int) -> list[str]:
+        command = [self.ffmpeg_binary, "-hide_banner", "-loglevel", "error"]
+        if camera.device == "testsrc":
+            command.extend(["-f", "lavfi", "-i", f"testsrc2=size={width}x{height}:rate={fps}"])
+        else:
+            command.extend(
+                [
+                    "-f",
+                    "v4l2",
+                    "-video_size",
+                    f"{camera.capture_width}x{camera.capture_height}",
+                    "-framerate",
+                    str(camera.capture_fps),
+                    "-i",
+                    camera.device,
+                    "-vf",
+                    f"fps={fps},scale={width}:{height}",
+                ]
+            )
+        profile = self.config.realtime_profiles[camera.realtime_profile]
+        command.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-g",
+                "1",
+                "-bf",
+                "0",
+                "-x264-params",
+                "repeat-headers=1:keyint=1",
+                "-b:v",
+                f"{profile.bitrate_kbps}k",
+                "-pix_fmt",
+                "yuv420p",
+                "-bsf:v",
+                "h264_metadata=aud=insert",
+                "-f",
+                "h264",
+                "pipe:1",
+            ]
+        )
+        return command
+
+    def _extract_unit(self, stream: _PipedFfmpegStream) -> bytes | None:
+        start = stream.buffer.find(self._AUD)
+        if start < 0:
+            # Keep only a tail that might contain a partial start code.
+            if len(stream.buffer) > 4:
+                stream.buffer = stream.buffer[-4:]
+            return None
+        nxt = stream.buffer.find(self._AUD, start + len(self._AUD))
+        if nxt < 0:
+            if start > 0:
+                stream.buffer = stream.buffer[start:]
+            return None
+        unit = stream.buffer[start:nxt]
+        stream.buffer = stream.buffer[nxt:]
+        return unit
+
+    def _trim_buffer(self, stream: _PipedFfmpegStream) -> None:
+        if len(stream.buffer) > 32 * 1024 * 1024:
+            start = stream.buffer.rfind(self._AUD)
+            stream.buffer = stream.buffer[start:] if start >= 0 else b""
+
 
 class DriverConsoleFrameSink:
-    def __init__(self, driver_console_url: str) -> None:
+    """Posts encoded frames to the driver console over a reused keep-alive
+    connection (avoids a fresh TCP + slow-start handshake per frame across the
+    field SSH tunnel) and corrects cross-machine latency via a clock offset."""
+
+    def __init__(self, driver_console_url: str, *, clock_sync_interval_ms: int = 5000) -> None:
         self.driver_console_url = driver_console_url.rstrip("/")
         parsed = urlparse(self.driver_console_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("driver_console_url must be an http(s) URL")
+        self._scheme = parsed.scheme
+        self._host = parsed.hostname
+        self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        self._base_path = parsed.path.rstrip("/")
+        self._lock = threading.Lock()
+        self._conn: http.client.HTTPConnection | None = None
+        self.clock_offset_ms = 0
+        self.clock_sync_interval_ms = clock_sync_interval_ms
+        self._last_clock_sync_ms: int | None = None
+
+    def _new_connection(self) -> http.client.HTTPConnection:
+        if self._scheme == "https":
+            return http.client.HTTPSConnection(self._host, self._port, timeout=10)
+        return http.client.HTTPConnection(self._host, self._port, timeout=10)
+
+    def _request(self, method: str, path: str, body: bytes | None = None) -> dict[str, Any]:
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        with self._lock:
+            for attempt in range(2):
+                if self._conn is None:
+                    self._conn = self._new_connection()
+                try:
+                    self._conn.request(method, f"{self._base_path}{path}", body=body, headers=headers)
+                    response = self._conn.getresponse()
+                    data = response.read()
+                    if response.status < 200 or response.status >= 300:
+                        raise RuntimeError(f"{method} {path} failed with status {response.status}: {data[:256]!r}")
+                    parsed = json.loads(data.decode("utf-8"))
+                    if not isinstance(parsed, dict):
+                        raise RuntimeError("driver console response must be a JSON object")
+                    return parsed
+                except (http.client.HTTPException, ConnectionError, OSError):
+                    # Stale/broken keep-alive socket: drop it and retry once.
+                    self._close_locked()
+                    if attempt == 1:
+                        raise
+            raise RuntimeError("unreachable")
+
+    def _maybe_sync_clock(self) -> None:
+        now = _now_ms()
+        if self._last_clock_sync_ms is not None and now - self._last_clock_sync_ms < self.clock_sync_interval_ms:
+            return
+        try:
+            t0 = _now_ms()
+            payload = self._request("GET", "/api/time")
+            t3 = _now_ms()
+        except Exception:
+            return
+        console_now = payload.get("now_ms")
+        if isinstance(console_now, bool) or not isinstance(console_now, int):
+            return
+        # NTP-style single-sample offset to add to vehicle timestamps to express
+        # them in the console clock domain.
+        self.clock_offset_ms = console_now - (t0 + t3) // 2
+        self._last_clock_sync_ms = now
 
     def send_frame(self, frame: EncodedFrame, *, sent_at_ms: int) -> dict[str, Any]:
+        self._maybe_sync_clock()
         payload = frame.to_post_payload(sent_at_ms=sent_at_ms)
-        body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.driver_console_url}/api/media/frame",
-            data=body,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        if not isinstance(data, dict):
-            raise RuntimeError("driver console frame ingest response must be an object")
-        return data
+        payload["clock_offset_ms"] = self.clock_offset_ms
+        return self._request("POST", "/api/media/frame", json.dumps(payload).encode("utf-8"))
+
+    def _close_locked(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def close(self) -> None:
+        with self._lock:
+            self._close_locked()
+
+
+class _LatestFrameMailbox:
+    """Single-slot mailbox that always holds the freshest frame; stale frames
+    are dropped so a slow network never backs up capture (real-time teleop wants
+    the newest frame, not every frame)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._latest: EncodedFrame | None = None
+        self.published = 0
+        self.dropped = 0
+
+    def publish(self, frame: EncodedFrame) -> None:
+        with self._lock:
+            if self._latest is not None:
+                self.dropped += 1
+            self._latest = frame
+            self.published += 1
+
+    def pop(self) -> EncodedFrame | None:
+        with self._lock:
+            frame = self._latest
+            self._latest = None
+            return frame
 
 
 class VehicleMediaRuntime:
@@ -319,28 +471,111 @@ class VehicleMediaRuntime:
                 sent_at_ms = int(clock())
                 response = self.frame_sink.send_frame(frame, sent_at_ms=sent_at_ms)
                 sent_results.append(
-                    {
-                        "camera_id": camera.camera_id,
-                        "seq": seq,
-                        "sent_at_ms": sent_at_ms,
-                        "response": response,
-                    }
+                    {"camera_id": camera.camera_id, "seq": seq, "sent_at_ms": sent_at_ms, "response": response}
                 )
             if seq < frame_count and frame_interval_ms > 0:
                 sleeper(frame_interval_ms / 1000.0)
+        return self._summary("vehicle_media_teleop_summary", cameras, sent_results, dropped=0)
+
+    def stream_frames(
+        self,
+        *,
+        duration_ms: int | None = None,
+        frame_count: int | None = None,
+        capture_interval_ms: int = 0,
+        now_fn: Any = None,
+        sleep_fn: Any = None,
+    ) -> dict[str, Any]:
+        """Capture and send concurrently: a producer captures the freshest frame
+        into a single-slot mailbox while a background sender posts it, dropping
+        stale frames. Decouples capture rate from network round-trip so the
+        achieved frame rate rises to min(capture fps, network throughput)."""
+        if duration_ms is None and frame_count is None:
+            raise ValueError("stream_frames requires duration_ms or frame_count")
+        if duration_ms is not None and (isinstance(duration_ms, bool) or duration_ms < 0):
+            raise ValueError("duration_ms must be non-negative")
+        if frame_count is not None and (isinstance(frame_count, bool) or frame_count <= 0):
+            raise ValueError("frame_count must be positive")
+        cameras = list(self.config.enabled_cameras)
+        if not cameras:
+            raise RuntimeError("vehicle media runtime requires at least one enabled camera")
+        clock = now_fn or _now_ms
+        sleeper = sleep_fn or time.sleep
+        mailboxes = {camera.camera_id: _LatestFrameMailbox() for camera in cameras}
+        sent_results: list[dict[str, Any]] = []
+        sent_lock = threading.Lock()
+        stop_event = threading.Event()
+
+        def sender() -> None:
+            pending = True
+            while pending:
+                pending = not stop_event.is_set()
+                delivered_any = False
+                for camera in cameras:
+                    frame = mailboxes[camera.camera_id].pop()
+                    if frame is None:
+                        continue
+                    delivered_any = True
+                    sent_at_ms = int(clock())
+                    try:
+                        response = self.frame_sink.send_frame(frame, sent_at_ms=sent_at_ms)
+                    except Exception as exc:  # keep streaming; report per-frame errors
+                        response = {"error": str(exc)}
+                    with sent_lock:
+                        sent_results.append(
+                            {"camera_id": camera.camera_id, "seq": frame.seq, "sent_at_ms": sent_at_ms, "response": response}
+                        )
+                if not delivered_any and not stop_event.is_set():
+                    sleeper(0.002)
+
+        sender_thread = threading.Thread(target=sender, daemon=True)
+        sender_thread.start()
+        seq = 0
+        start_ms = int(clock())
+        try:
+            while True:
+                if frame_count is not None and seq >= frame_count:
+                    break
+                if duration_ms is not None and int(clock()) - start_ms >= duration_ms:
+                    break
+                seq += 1
+                for camera in cameras:
+                    frame = self.encoder.encode(camera, seq=seq, now_ms=int(clock()))
+                    self.last_frame = frame
+                    mailboxes[camera.camera_id].publish(frame)
+                if capture_interval_ms > 0:
+                    sleeper(capture_interval_ms / 1000.0)
+        finally:
+            stop_event.set()
+            sender_thread.join(timeout=15)
+        captured = seq * len(cameras)
+        dropped = sum(box.dropped for box in mailboxes.values())
+        summary = self._summary("vehicle_media_stream_summary", cameras, sent_results, dropped=dropped)
+        summary["captured_frames"] = captured
+        elapsed_ms = max(1, int(clock()) - start_ms)
+        summary["duration_ms"] = elapsed_ms
+        summary["achieved_fps"] = round(len(sent_results) * 1000.0 / elapsed_ms, 2)
+        return summary
+
+    def _summary(
+        self, event: str, cameras: list[CameraConfig], sent_results: list[dict[str, Any]], *, dropped: int
+    ) -> dict[str, Any]:
         latencies = [
             int(result["response"]["end_to_end_latency_ms"])
             for result in sent_results
             if isinstance(result.get("response"), dict)
-            and "end_to_end_latency_ms" in result["response"]
+            and isinstance(result["response"].get("end_to_end_latency_ms"), int)
             and not isinstance(result["response"]["end_to_end_latency_ms"], bool)
         ]
+        errors = sum(1 for result in sent_results if isinstance(result.get("response"), dict) and "error" in result["response"])
         return {
-            "event": "vehicle_media_teleop_summary",
-            "passed": len(sent_results) == frame_count * len(cameras),
+            "event": event,
+            "passed": bool(sent_results) and errors == 0,
             "vehicle_id": self.config.vehicle_id,
             "camera_ids": [camera.camera_id for camera in cameras],
             "sent_frames": len(sent_results),
+            "dropped_frames": dropped,
+            "send_errors": errors,
             "latency": {
                 "end_to_end_latency_ms_avg": _average(latencies),
                 "end_to_end_latency_ms_max": max(latencies) if latencies else 0,
@@ -386,6 +621,14 @@ class VehicleMediaRuntime:
         result = uploader.process_once(now_ms=timestamp, network_idle=True)
         return asdict(result)
 
+    def close(self) -> None:
+        close = getattr(self.encoder, "close", None)
+        if callable(close):
+            close()
+        close_sink = getattr(self.frame_sink, "close", None)
+        if callable(close_sink):
+            close_sink()
+
 
 def _average(values: list[int]) -> float:
     if not values:
@@ -395,16 +638,6 @@ def _average(values: list[int]) -> float:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def _read_process_stderr(process: subprocess.Popen[bytes]) -> str:
-    if process.stderr is None:
-        return ""
-    try:
-        data = process.stderr.read()
-    except Exception:
-        return ""
-    return data.decode("utf-8", errors="replace").strip()
 
 
 def _iso_ms(value_ms: int) -> str:

@@ -4,9 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 
-HOST="${MINE_TELEOP_VEHICLE_SSH_HOST:-60.205.213.254}"
-PORT="${MINE_TELEOP_VEHICLE_SSH_PORT:-6000}"
-USER_NAME="${MINE_TELEOP_VEHICLE_SSH_USER:-user}"
+HOST="${MINE_TELEOP_VEHICLE_SSH_HOST:-}"
+PORT="${MINE_TELEOP_VEHICLE_SSH_PORT:-22}"
+USER_NAME="${MINE_TELEOP_VEHICLE_SSH_USER:-}"
+SSH_KEY="${MINE_TELEOP_VEHICLE_SSH_KEY:-}"
+STRICT_HOST_KEY="${MINE_TELEOP_SSH_STRICT_HOST_KEY:-accept-new}"
 LOCAL_PORT="${MINE_TELEOP_DRIVER_CONSOLE_LOCAL_PORT:-8080}"
 REMOTE_PORT="${MINE_TELEOP_DRIVER_CONSOLE_REMOTE_PORT:-18080}"
 SIGNALING_LOCAL_PORT="${MINE_TELEOP_SIGNALING_LOCAL_PORT:-8765}"
@@ -15,6 +17,19 @@ SERVER_NAME="${MINE_TELEOP_CONTROL_PLANE_SERVER:-mine-teleop-signaling-preview}"
 CONSOLE_NAME="${MINE_TELEOP_CONTROL_PLANE_CONSOLE:-mine-teleop-driver-console-preview}"
 LOG_PATH="${MINE_TELEOP_CONTROL_PLANE_LOG:-$REPO_ROOT/.local/control-plane-live.log}"
 OPEN_BROWSER="${MINE_TELEOP_OPEN_BROWSER:-1}"
+
+if [[ -z "$HOST" || -z "$USER_NAME" ]]; then
+  echo "set MINE_TELEOP_VEHICLE_SSH_HOST and MINE_TELEOP_VEHICLE_SSH_USER (no hardcoded default host)" >&2
+  exit 1
+fi
+
+# Prefer key-based auth. StrictHostKeyChecking defaults to accept-new; set
+# MINE_TELEOP_SSH_STRICT_HOST_KEY=yes with a pre-seeded known_hosts to avoid
+# trust-on-first-use (MITM) exposure on untrusted networks.
+SSH_COMMON_OPTS=(-o "StrictHostKeyChecking=${STRICT_HOST_KEY}")
+if [[ -n "$SSH_KEY" ]]; then
+  SSH_COMMON_OPTS+=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
+fi
 
 health_url="http://127.0.0.1:${LOCAL_PORT}/health"
 signaling_health_url="http://127.0.0.1:${SIGNALING_LOCAL_PORT}/health"
@@ -63,6 +78,7 @@ start_reverse_tunnel() {
       MINE_TELEOP_TUNNEL_REMOTE_PORT="$REMOTE_PORT" \
       MINE_TELEOP_TUNNEL_SIGNALING_LOCAL_PORT="$SIGNALING_LOCAL_PORT" \
       MINE_TELEOP_TUNNEL_SIGNALING_REMOTE_PORT="$SIGNALING_REMOTE_PORT" \
+      MINE_TELEOP_TUNNEL_STRICT="$STRICT_HOST_KEY" \
       expect <<'EXP'
 set timeout 30
 set host $env(MINE_TELEOP_TUNNEL_HOST)
@@ -72,7 +88,8 @@ set local_port $env(MINE_TELEOP_TUNNEL_LOCAL_PORT)
 set remote_port $env(MINE_TELEOP_TUNNEL_REMOTE_PORT)
 set signaling_local_port $env(MINE_TELEOP_TUNNEL_SIGNALING_LOCAL_PORT)
 set remote_signaling_port $env(MINE_TELEOP_TUNNEL_SIGNALING_REMOTE_PORT)
-spawn ssh -p $port -fN -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -R ${remote_port}:127.0.0.1:${local_port} -R ${remote_signaling_port}:127.0.0.1:${signaling_local_port} ${user}@${host}
+set strict $env(MINE_TELEOP_TUNNEL_STRICT)
+spawn ssh -p $port -fN -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=$strict -R ${remote_port}:127.0.0.1:${local_port} -R ${remote_signaling_port}:127.0.0.1:${signaling_local_port} ${user}@${host}
 expect {
   -re "Are you sure.*" { send "yes\r"; exp_continue }
   -re "(?i)password:" { send "$env(MINE_TELEOP_VEHICLE_SSH_PASSWORD)\r"; exp_continue }
@@ -87,7 +104,7 @@ EXP
       -o ExitOnForwardFailure=yes \
       -o ServerAliveInterval=30 \
       -o ServerAliveCountMax=3 \
-      -o StrictHostKeyChecking=accept-new \
+      "${SSH_COMMON_OPTS[@]}" \
       -R "${REMOTE_PORT}:127.0.0.1:${LOCAL_PORT}" \
       -R "${SIGNALING_REMOTE_PORT}:127.0.0.1:${SIGNALING_LOCAL_PORT}" \
       "${USER_NAME}@${HOST}"
@@ -101,12 +118,14 @@ run_remote_command() {
       MINE_TELEOP_TUNNEL_PORT="$PORT" \
       MINE_TELEOP_TUNNEL_USER="$USER_NAME" \
       MINE_TELEOP_REMOTE_COMMAND="$command" \
+      MINE_TELEOP_TUNNEL_STRICT="$STRICT_HOST_KEY" \
       expect <<'EXP'
 set timeout 30
 set host $env(MINE_TELEOP_TUNNEL_HOST)
 set port $env(MINE_TELEOP_TUNNEL_PORT)
 set user $env(MINE_TELEOP_TUNNEL_USER)
-spawn ssh -p $port -o StrictHostKeyChecking=accept-new ${user}@${host} $env(MINE_TELEOP_REMOTE_COMMAND)
+set strict $env(MINE_TELEOP_TUNNEL_STRICT)
+spawn ssh -p $port -o StrictHostKeyChecking=$strict ${user}@${host} $env(MINE_TELEOP_REMOTE_COMMAND)
 expect {
   -re "Are you sure.*" { send "yes\r"; exp_continue }
   -re "(?i)password:" { send "$env(MINE_TELEOP_VEHICLE_SSH_PASSWORD)\r"; exp_continue }
@@ -116,7 +135,7 @@ catch wait result
 exit [lindex $result 3]
 EXP
   else
-    ssh -p "$PORT" -o StrictHostKeyChecking=accept-new "${USER_NAME}@${HOST}" "$command"
+    ssh -p "$PORT" "${SSH_COMMON_OPTS[@]}" "${USER_NAME}@${HOST}" "$command"
   fi
 }
 

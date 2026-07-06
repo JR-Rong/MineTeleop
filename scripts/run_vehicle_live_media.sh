@@ -10,6 +10,7 @@ FFMPEG_BIN="${MINE_TELEOP_FFMPEG_BIN:-$INSTALL_DIR/bin/ffmpeg}"
 LOG_PATH="${MINE_TELEOP_MEDIA_LOG:-$INSTALL_DIR/logs/vehicle-media-live.jsonl}"
 FRAMES="${MINE_TELEOP_MEDIA_FRAMES:-300}"
 FRAME_INTERVAL_MS="${MINE_TELEOP_FRAME_INTERVAL_MS:-33}"
+STREAM_DURATION_MS="${MINE_TELEOP_STREAM_DURATION_MS:-60000}"
 FRAME_CODEC="${MINE_TELEOP_FRAME_CODEC:-mjpeg}"
 CAPTURE_WIDTH="${MINE_TELEOP_CAPTURE_WIDTH:-1280}"
 CAPTURE_HEIGHT="${MINE_TELEOP_CAPTURE_HEIGHT:-720}"
@@ -191,6 +192,8 @@ while true; do
     --config "$CONFIG_LIVE" \
     --mode teleop \
     --driver-console-url "$DRIVER_CONSOLE_URL" \
+    --stream \
+    --duration-ms "$STREAM_DURATION_MS" \
     --frames "$FRAMES" \
     --frame-interval-ms "$FRAME_INTERVAL_MS" \
     --frame-codec "$FRAME_CODEC" \

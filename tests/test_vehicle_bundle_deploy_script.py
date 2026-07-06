@@ -78,15 +78,15 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         self.assertIn('VEHICLE_SIDE_SIGNALING_HTTP_URL=http://127.0.0.1:${SIGNALING_REMOTE_PORT}', text)
         self.assertIn('--teleop-log-controls', text)
 
-    def test_dry_run_targets_default_vehicle_ssh_tunnel_without_remote_docker(self):
+    def test_dry_run_targets_configured_vehicle_ssh_tunnel_without_remote_docker(self):
         result = subprocess.run(
-            ["bash", str(SCRIPT), "--dry-run"],
+            ["bash", str(SCRIPT), "--dry-run", "--host", "203.0.113.9", "--user", "fielduser", "--port", "6000"],
             text=True,
             capture_output=True,
             check=True,
         )
 
-        self.assertIn("user@60.205.213.254", result.stdout)
+        self.assertIn("fielduser@203.0.113.9", result.stdout)
         self.assertIn("ssh -p 6000", result.stdout)
         self.assertIn("scp -P 6000", result.stdout)
         self.assertIn("dist/mine-teleop-ubuntu-x86_64.tar.gz", result.stdout)
@@ -95,6 +95,15 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         self.assertIn("bin/ffmpeg -hide_banner -hwaccels", result.stdout)
         self.assertNotIn(" docker ", result.stdout)
         self.assertNotIn("sudo docker", result.stdout)
+
+    def test_dry_run_requires_host_and_user_when_not_dry(self):
+        result = subprocess.run(
+            ["bash", str(SCRIPT)],
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required", result.stderr)
 
     def test_dry_run_can_send_media_frames_to_driver_console_url(self):
         result = subprocess.run(
