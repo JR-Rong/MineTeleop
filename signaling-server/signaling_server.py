@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import os
 import ssl
 import sys
 from pathlib import Path
@@ -54,6 +55,15 @@ def main() -> int:
             if not args.device_credentials:
                 parser.error("--device-credentials is required for non-loopback hosts")
         if not loopback_host and insecure_dev_bind:
+            # The insecure dev path serves plaintext with built-in dev credentials.
+            # Refuse to expose it on a wildcard interface (reachable from the whole
+            # network) unless the operator very explicitly opts in; the intended
+            # use is a specific interface reached over an SSH tunnel.
+            if args.host in {"0.0.0.0", "::", ""} and os.environ.get("MINE_TELEOP_ALLOW_WILDCARD_BIND") != "1":
+                parser.error(
+                    "--allow-insecure-nonloopback-dev refuses to bind a wildcard address; "
+                    "bind a specific interface or set MINE_TELEOP_ALLOW_WILDCARD_BIND=1"
+                )
             print(
                 "warning: plaintext non-loopback dev signaling bind enabled; use only behind localhost/SSH field tunnels",
                 file=sys.stderr,

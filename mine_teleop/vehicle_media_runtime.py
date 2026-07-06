@@ -239,7 +239,11 @@ class MjpegFrameEncoder(_PersistentFfmpegEncoder):
     def _trim_buffer(self, stream: _PipedFfmpegStream) -> None:
         if len(stream.buffer) > 16 * 1024 * 1024:
             start = stream.buffer.rfind(b"\xff\xd8")
-            stream.buffer = stream.buffer[start:] if start >= 0 else b""
+            if start <= 0:
+                # A single in-progress image already exceeds the cap: fail
+                # cleanly instead of truncating forever.
+                raise RuntimeError("MJPEG frame exceeded 16MiB without a complete image")
+            stream.buffer = stream.buffer[start:]
 
 
 class FfmpegH264FrameEncoder(_PersistentFfmpegEncoder):
@@ -320,7 +324,9 @@ class FfmpegH264FrameEncoder(_PersistentFfmpegEncoder):
     def _trim_buffer(self, stream: _PipedFfmpegStream) -> None:
         if len(stream.buffer) > 32 * 1024 * 1024:
             start = stream.buffer.rfind(self._AUD)
-            stream.buffer = stream.buffer[start:] if start >= 0 else b""
+            if start <= 0:
+                raise RuntimeError("H.264 access unit exceeded 32MiB without a delimiter")
+            stream.buffer = stream.buffer[start:]
 
 
 class DriverConsoleFrameSink:
@@ -445,6 +451,7 @@ class VehicleMediaRuntime:
         self.frame_sink = frame_sink
         self.encoder = encoder or FfmpegH264FrameEncoder(config, ffmpeg_binary=config.hardware.encoding.ffmpeg_binary)
         self.last_frame: EncodedFrame | None = None
+        self._uploader: VehicleRecorderUploader | None = None
 
     def send_frames(
         self,
@@ -594,14 +601,16 @@ class VehicleMediaRuntime:
         now_ms: int | None = None,
     ) -> dict[str, Any]:
         timestamp = _now_ms() if now_ms is None else now_ms
-        uploader = VehicleRecorderUploader.from_config(
-            self.config,
-            recording_root=recording_root,
-            queue_state_path=queue_state_path,
-            archive_root=archive_root,
-            upload_api=upload_api,
-        )
-        uploader.upload_trigger_policy = UploadTriggerPolicy(trigger_segments=1)
+        if self._uploader is None:
+            self._uploader = VehicleRecorderUploader.from_config(
+                self.config,
+                recording_root=recording_root,
+                queue_state_path=queue_state_path,
+                archive_root=archive_root,
+                upload_api=upload_api,
+            )
+            self._uploader.upload_trigger_policy = UploadTriggerPolicy(trigger_segments=1)
+        uploader = self._uploader
         segment_id = f"{_utc_segment_prefix(timestamp)}_{frame.camera_id}_{frame.seq:06d}"
         metadata = SegmentMetadata(
             vehicle_id=self.config.vehicle_id,

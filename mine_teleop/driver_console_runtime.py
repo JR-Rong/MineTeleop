@@ -31,6 +31,11 @@ from .driver_console import (
 )
 
 
+# Cap the console request body so a malicious/buggy client cannot force an
+# unbounded allocation. Generous enough for a base64 720p intra frame.
+MAX_CONSOLE_BODY_BYTES = 8 * 1024 * 1024
+
+
 class ControlCommandSink(Protocol):
     def send(self, command: ControlCommand) -> None:
         ...
@@ -584,8 +589,13 @@ class DriverConsoleHttpApp:
                     self.end_headers()
                     self.wfile.write(body)
                     return
-                if path.startswith("/api/frame/") and path.endswith(".png"):
-                    camera_id = path[len("/api/frame/") : -len(".png")]
+                if path.startswith("/api/frame/"):
+                    segment = path[len("/api/frame/") :]
+                    camera_id = segment
+                    for ext in (".png", ".jpg", ".jpeg"):
+                        if segment.endswith(ext):
+                            camera_id = segment[: -len(ext)]
+                            break
                     try:
                         body = app.runtime.read_decoded_frame(camera_id)
                     except FileNotFoundError as exc:
@@ -717,6 +727,10 @@ class DriverConsoleHttpApp:
                     length = int(raw_length)
                 except ValueError:
                     raise ValueError("invalid Content-Length header")
+                if length < 0:
+                    raise ValueError("invalid Content-Length header")
+                if length > MAX_CONSOLE_BODY_BYTES:
+                    raise ValueError("request body too large")
                 raw = self.rfile.read(length).decode("utf-8") if length else "{}"
                 data = json.loads(raw)
                 if not isinstance(data, dict):

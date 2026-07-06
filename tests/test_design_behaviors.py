@@ -8142,6 +8142,7 @@ class CommandLineEntryPointTests(unittest.TestCase):
                 text=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
+                env={**os.environ, "MINE_TELEOP_ALLOW_WILDCARD_BIND": "1"},
             )
             try:
                 port = _wait_for_port_file(port_file)
@@ -8153,6 +8154,24 @@ class CommandLineEntryPointTests(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.communicate(timeout=5)
+
+    def test_signaling_server_cli_refuses_insecure_wildcard_bind_without_optin(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "signaling-server/signaling_server.py",
+                "--serve",
+                "--host",
+                "0.0.0.0",
+                "--allow-insecure-nonloopback-dev",
+            ],
+            cwd=Path.cwd(),
+            text=True,
+            capture_output=True,
+            env={key: value for key, value in os.environ.items() if key != "MINE_TELEOP_ALLOW_WILDCARD_BIND"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("wildcard", result.stderr)
 
     def test_netem_plan_cli_prints_dry_run_commands_without_executing_tc(self):
         result = subprocess.run(
