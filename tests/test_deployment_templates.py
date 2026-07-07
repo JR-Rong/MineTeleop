@@ -240,6 +240,7 @@ class ContainerTemplateTests(unittest.TestCase):
         self.assertIn("signaling-server/signaling_server.py --serve", runner_text)
         self.assertIn("--host 0.0.0.0", runner_text)
         self.assertIn("--allow-insecure-nonloopback-dev", runner_text)
+        self.assertIn("-e MINE_TELEOP_ALLOW_WILDCARD_BIND=\"1\"", runner_text)
         self.assertIn("/vehicles/online", runner_text)
         self.assertIn("dev-device-secret", runner_text)
         self.assertIn("-e MINE_TELEOP_DRIVER_CONSOLE_SIGNALING_HTTP_URL=\"http://127.0.0.1:8765\"", runner_text)

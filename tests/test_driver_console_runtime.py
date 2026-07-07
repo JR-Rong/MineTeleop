@@ -1015,6 +1015,100 @@ class DriverConsoleHttpAppTests(unittest.TestCase):
         self.assertNotIn("innerHTML = Object.keys(cameras).map", page)
         self.assertNotIn("?ts=${Date.now()}", page)
 
+    def test_http_page_exposes_custom_camera_layout_and_auto_brightness(self):
+        runtime = DriverConsoleRuntime.from_config(
+            "configs/driver-console.dev.yaml",
+            signaling_http_url="http://127.0.0.1:8765",
+            vehicle_id="vehicle-001",
+            password="dev-password",
+            control_sink=RecordingControlCommandSink(),
+        )
+        app = DriverConsoleHttpApp(runtime)
+        with app.running("127.0.0.1", 0) as console_url:
+            page = request.urlopen(f"{console_url}/", timeout=5).read().decode("utf-8")
+
+        self.assertNotIn("mineTeleopCameraLayoutV1", page)
+        self.assertNotIn("mineTeleopCameraLayoutV2", page)
+        self.assertIn("function defaultCameraLayout", page)
+        self.assertIn("function defaultThreeCameraLayout", page)
+        self.assertIn("function defaultSurroundCameraLayout", page)
+        self.assertIn("mineTeleopCameraLayoutV3", page)
+        self.assertIn("cameraIds.length === 3", page)
+        self.assertIn("cameraIds.length >= 4", page)
+        self.assertIn("{col: 1, row: 1, colSpan: 8, rowSpan: 10}", page)
+        self.assertIn("{col: 9, row: 1, colSpan: 4, rowSpan: 5}", page)
+        self.assertIn("{col: 9, row: 6, colSpan: 4, rowSpan: 5}", page)
+        self.assertIn("front: {col: 4, row: 3, colSpan: 6, rowSpan: 6}", page)
+        self.assertIn("left: {col: 1, row: 3, colSpan: 3, rowSpan: 6}", page)
+        self.assertIn("right: {col: 10, row: 3, colSpan: 3, rowSpan: 6}", page)
+        self.assertIn("rear: {col: 4, row: 1, colSpan: 6, rowSpan: 2}", page)
+        self.assertIn("hikrobot: {col: 4, row: 9, colSpan: 6, rowSpan: 2}", page)
+        self.assertIn("function applyCameraLayout", page)
+        self.assertIn("function toggleCameraLayoutEdit", page)
+        self.assertIn('data-layout-action="wider"', page)
+        self.assertIn('data-layout-action="taller"', page)
+        self.assertIn("function calibrateCameraBrightness", page)
+        self.assertIn("function sampleMediaLuminance", page)
+        self.assertIn("brightness(var(--camera-brightness", page)
+
+    def test_http_page_overlays_frame_stats_at_camera_bottom(self):
+        runtime = DriverConsoleRuntime.from_config(
+            "configs/driver-console.dev.yaml",
+            signaling_http_url="http://127.0.0.1:8765",
+            vehicle_id="vehicle-001",
+            password="dev-password",
+            control_sink=RecordingControlCommandSink(),
+        )
+        app = DriverConsoleHttpApp(runtime)
+        with app.running("127.0.0.1", 0) as console_url:
+            page = request.urlopen(f"{console_url}/", timeout=5).read().decode("utf-8")
+
+        self.assertIn(".camera-frame { position: absolute; inset: 0;", page)
+        self.assertIn(".camera-title { position: absolute; left: 0; right: 0; top: 0;", page)
+        self.assertIn(".camera-meta { position: absolute; left: 0; right: 0; bottom: 0;", page)
+        self.assertIn('class="camera-title"', page)
+        self.assertIn('aria-label="Remove manual camera"', page)
+
+    def test_http_page_allows_manual_camera_slots(self):
+        runtime = DriverConsoleRuntime.from_config(
+            "configs/driver-console.dev.yaml",
+            signaling_http_url="http://127.0.0.1:8765",
+            vehicle_id="vehicle-001",
+            password="dev-password",
+            control_sink=RecordingControlCommandSink(),
+        )
+        app = DriverConsoleHttpApp(runtime)
+        with app.running("127.0.0.1", 0) as console_url:
+            page = request.urlopen(f"{console_url}/", timeout=5).read().decode("utf-8")
+
+        self.assertIn("manual-camera-id", page)
+        self.assertIn("Add Camera", page)
+        self.assertIn("mineTeleopManualCameraIdsV1", page)
+        self.assertIn("function addManualCameraFromForm", page)
+        self.assertIn("function addManualCameraSlot", page)
+        self.assertIn("function removeManualCameraSlot", page)
+        self.assertIn("function applyDefaultLayoutForIds", page)
+        self.assertIn("function mergedCameraIds", page)
+        self.assertIn("manualCameraIds.add(id)", page)
+        self.assertIn("manualCameraIds.delete(id)", page)
+        self.assertIn("applyDefaultLayoutForIds(mergedCameraIds(lastSnapshot?.dashboard?.cameras || {}))", page)
+        self.assertIn("const cameraIds = mergedCameraIds(cameras)", page)
+        self.assertIn("cameras[id] || emptyManualCamera(id)", page)
+
+    def test_http_status_starts_without_phantom_camera_placeholders(self):
+        runtime = DriverConsoleRuntime.from_config(
+            "configs/driver-console.dev.yaml",
+            signaling_http_url="http://127.0.0.1:8765",
+            vehicle_id="vehicle-001",
+            password="dev-password",
+            control_sink=RecordingControlCommandSink(),
+        )
+
+        snapshot = runtime.snapshot()
+
+        self.assertEqual(snapshot["dashboard"]["cameras"], {})
+        self.assertEqual(snapshot["dashboard"]["visible_camera_ids"], [])
+
     def test_driver_console_cli_can_serve_http_control_program(self):
         with tempfile.TemporaryDirectory() as tmp:
             port_file = Path(tmp) / "driver-console.port"

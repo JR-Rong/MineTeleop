@@ -97,7 +97,7 @@ class DriverConsoleRuntime:
         vehicle_id: str,
         password: str,
         control_sink: ControlCommandSink | None = None,
-        camera_ids: tuple[str, ...] = ("front", "rear", "left", "right"),
+        camera_ids: tuple[str, ...] = (),
         operation_log: DriverOperationLog | None = None,
         config_version: str = "",
         frame_dir: str | Path = "/tmp/mine-teleop-driver-console/frames",
@@ -777,30 +777,45 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
   <title>Mine Teleop Driver Console</title>
   <style>
     :root { color-scheme: dark; font-family: Arial, sans-serif; background: #151819; color: #f3f5f2; }
-    body { margin: 0; min-height: 100vh; display: grid; grid-template-rows: auto 1fr auto; }
-    header, footer { display: flex; gap: 12px; align-items: center; padding: 10px 14px; background: #202624; border-bottom: 1px solid #39413d; }
-    footer { border-top: 1px solid #39413d; border-bottom: 0; font-size: 13px; color: #c6cec8; }
-    main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px; padding: 12px; }
-    .grid { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); grid-auto-rows: minmax(180px, 1fr); gap: 10px; min-height: 520px; }
-    .camera { border: 1px solid #404b46; background: #0b0d0d; display: grid; grid-template-rows: minmax(0, 1fr) auto; min-height: 0; }
-    .camera-frame { display: grid; place-items: center; min-height: 0; color: #9fa9a3; font-size: 14px; }
-    .camera-frame img, .camera-frame video { width: 100%; height: 100%; max-width: 100%; max-height: 100%; object-fit: contain; }
-    .camera strong { padding: 8px 10px 4px; background: #1f2523; font-size: 13px; }
-    .camera-meta { background: #1f2523; padding: 0 10px 8px; display: grid; gap: 4px; font-size: 11px; color: #c6cec8; }
+    body { margin: 0; height: 100vh; overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+    header, footer { display: flex; gap: 8px; align-items: center; padding: 8px 10px; background: #202624; border-bottom: 1px solid #39413d; }
+    header { flex-wrap: wrap; }
+    footer { border-top: 1px solid #39413d; border-bottom: 0; font-size: 12px; color: #c6cec8; min-height: 18px; }
+    main { min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 8px; padding: 8px; overflow: hidden; }
+    .grid { height: 100%; min-height: 0; display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); grid-template-rows: repeat(10, minmax(0, 1fr)); gap: 8px; }
+    .camera { border: 1px solid #404b46; background: #0b0d0d; min-height: 0; position: relative; overflow: hidden; }
+    .camera.dragging { outline: 2px solid #b8d8c3; outline-offset: -2px; }
+    .camera-frame { position: absolute; inset: 0; display: grid; place-items: center; min-height: 0; color: #9fa9a3; font-size: 14px; --camera-brightness: 1; --camera-contrast: 1; }
+    .camera-frame img, .camera-frame video { width: 100%; height: 100%; max-width: 100%; max-height: 100%; object-fit: contain; filter: brightness(var(--camera-brightness, 1)) contrast(var(--camera-contrast, 1)); transition: filter 180ms ease; }
+    .camera-title { position: absolute; left: 0; right: 0; top: 0; z-index: 2; padding: 6px 8px 3px; background: linear-gradient(to bottom, rgba(31, 37, 35, 0.88), rgba(31, 37, 35, 0.35)); font-size: 12px; pointer-events: none; }
+    .camera-meta { position: absolute; left: 0; right: 0; bottom: 0; z-index: 2; background: linear-gradient(to top, rgba(15, 18, 17, 0.92), rgba(15, 18, 17, 0.72)); padding: 5px 8px 6px; display: grid; gap: 3px; font-size: 10px; color: #c6cec8; max-height: 48%; overflow: auto; }
     .camera-meta .latency-total { color: #f3f5f2; font-weight: 700; }
     .timing-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px 8px; }
     .timing-grid span { overflow-wrap: anywhere; }
-    aside { display: grid; gap: 10px; align-content: start; }
-    .operator-panel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-    .status-tile { border: 1px solid #3d4843; background: #111514; padding: 8px; min-height: 58px; display: grid; gap: 4px; }
+    .camera-manual-remove { position: absolute; top: 8px; left: 8px; width: 28px; height: 28px; padding: 0; display: none; z-index: 3; background: rgba(56, 34, 34, 0.92); border-color: #8f5a5a; }
+    body.layout-editing .camera.manual .camera-manual-remove { display: block; }
+    .camera-layout-controls { position: absolute; top: 8px; right: 8px; display: none; grid-template-columns: repeat(4, 28px); gap: 4px; z-index: 3; }
+    body.layout-editing .camera-layout-controls { display: grid; }
+    .camera-layout-controls button { width: 28px; height: 28px; padding: 0; font-size: 11px; background: rgba(39, 48, 44, 0.92); }
+    .camera-resize-grip { position: absolute; right: 0; bottom: 0; width: 26px; height: 26px; display: none; cursor: nwse-resize; z-index: 2; }
+    .camera-resize-grip::after { content: ""; position: absolute; right: 6px; bottom: 6px; width: 10px; height: 10px; border-right: 2px solid #b8d8c3; border-bottom: 2px solid #b8d8c3; }
+    body.layout-editing .camera-resize-grip { display: block; }
+    aside { min-height: 0; max-height: 100%; overflow: auto; display: grid; gap: 8px; align-content: start; }
+    .operator-panel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+    .status-tile { border: 1px solid #3d4843; background: #111514; padding: 7px; min-height: 48px; display: grid; gap: 3px; }
     .status-tile span { color: #9fa9a3; font-size: 11px; text-transform: uppercase; }
     .status-tile strong { font-size: 14px; line-height: 1.2; overflow-wrap: anywhere; }
     .status-tile small { color: #c6cec8; overflow-wrap: anywhere; }
-    button, select, input { height: 34px; background: #27302c; color: #f3f5f2; border: 1px solid #526058; border-radius: 6px; padding: 0 10px; }
+    button, select, input { height: 30px; background: #27302c; color: #f3f5f2; border: 1px solid #526058; border-radius: 6px; padding: 0 8px; }
     button { cursor: pointer; }
     button.estop { background: #8f1f1f; border-color: #c34242; font-weight: 700; }
     label { display: grid; gap: 4px; color: #c6cec8; font-size: 12px; }
-    pre { margin: 0; padding: 10px; background: #101312; border: 1px solid #303934; overflow: auto; max-height: 260px; font-size: 12px; }
+    pre { margin: 0; padding: 8px; background: #101312; border: 1px solid #303934; overflow: auto; max-height: 150px; font-size: 11px; }
+    @media (max-width: 900px) {
+      body { height: auto; min-height: 100vh; overflow: auto; }
+      main { grid-template-columns: 1fr; }
+      .grid { min-height: 720px; grid-template-rows: repeat(10, minmax(52px, 1fr)); }
+    }
   </style>
 </head>
 <body>
@@ -810,6 +825,11 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
     <label>Password <input id="connect-password" type="password" value="__DEFAULT_PASSWORD__"></label>
     <button onclick="connectConsole()">Connect</button>
     <button onclick="pollSignaling()">Poll Video</button>
+    <button id="layout-edit-button" onclick="toggleCameraLayoutEdit()">Edit Layout</button>
+    <button onclick="applySurroundLayout()">Surround</button>
+    <button onclick="resetCameraLayout()">Reset Layout</button>
+    <label>Camera <input id="manual-camera-id" placeholder="front"></label>
+    <button onclick="addManualCameraFromForm()">Add Camera</button>
     <button class="estop" onclick="sendControl({estop:true, brake:1, gear:'N'})">ESTOP</button>
   </header>
   <main>
@@ -844,6 +864,17 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
     const operatorPanelState = {dataChannel: 'closed', webrtc: 'idle'};
     const knownCameraIds = new Set();
     const lastRenderedFrameSequenceByCamera = {};
+    const CAMERA_LAYOUT_STORAGE_KEY = 'mineTeleopCameraLayoutV3';
+    const CAMERA_MANUAL_STORAGE_KEY = 'mineTeleopManualCameraIdsV1';
+    const CAMERA_GRID_COLUMNS = 12;
+    const CAMERA_GRID_ROWS = 10;
+    const manualCameraIds = new Set(loadManualCameraIds());
+    let cameraLayoutEditEnabled = false;
+    let cameraLayoutByCamera = loadCameraLayout();
+    let cameraLayoutDrag = null;
+    let lastSnapshot = null;
+    const brightnessCanvas = document.createElement('canvas');
+    const brightnessContext = brightnessCanvas.getContext('2d', {willReadFrequently: true});
     async function postJson(path, payload) {
       const res = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
       const data = await res.json();
@@ -855,6 +886,7 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
       render(data);
     }
     function render(data) {
+      lastSnapshot = data;
       document.getElementById('status').textContent = JSON.stringify(data, null, 2);
       document.getElementById('footer').textContent = `${data.session.state} ${data.session.session_id || ''}`;
       renderOperatorStatus(data);
@@ -865,17 +897,21 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
     }
     function renderCameraGrid(cameras, timings) {
       const grid = document.getElementById('cameras');
-      const cameraIds = Object.keys(cameras);
+      const cameraIds = mergedCameraIds(cameras);
       for (const knownId of Array.from(knownCameraIds)) {
         if (!cameraIds.includes(knownId)) {
           document.getElementById(`camera-card-${knownId}`)?.remove();
           knownCameraIds.delete(knownId);
           delete lastRenderedFrameSequenceByCamera[knownId];
+          delete cameraLayoutByCamera[knownId];
         }
       }
+      ensureCameraLayout(cameraIds);
       for (const id of cameraIds) {
         if (!knownCameraIds.has(id)) createCameraCard(id);
-        updateCameraCard(id, cameras[id], timings[id] || {});
+        syncCameraCardManualState(id);
+        applyCameraLayout(id);
+        updateCameraCard(id, cameras[id] || emptyManualCamera(id), timings[id] || {});
       }
     }
     function createCameraCard(id) {
@@ -884,9 +920,18 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
       article.className = 'camera';
       article.id = `camera-card-${id}`;
       article.dataset.cameraId = id;
-      article.innerHTML = `<div class="camera-frame" id="camera-body-${id}"><span id="camera-placeholder-${id}">waiting</span><img id="camera-img-${id}" alt="${id}" hidden></div><strong id="camera-title-${id}"></strong>${renderFrameTiming({camera_id: id}, {})}`;
+      article.innerHTML = `<div class="camera-frame" id="camera-body-${id}"><span id="camera-placeholder-${id}">waiting</span><img id="camera-img-${id}" alt="${id}" hidden></div><strong class="camera-title" id="camera-title-${id}"></strong><button type="button" class="camera-manual-remove" title="Remove manual camera" aria-label="Remove manual camera" data-manual-remove="true">x</button>${renderCameraLayoutControls()}<div class="camera-resize-grip" data-layout-resize="true" title="Resize"></div>${renderFrameTiming({camera_id: id}, {})}`;
+      article.addEventListener('pointerdown', startCameraLayoutDrag);
       grid.appendChild(article);
       knownCameraIds.add(id);
+    }
+    function syncCameraCardManualState(id) {
+      const article = document.getElementById(`camera-card-${id}`);
+      if (!article) return;
+      const isManual = manualCameraIds.has(id);
+      article.classList.toggle('manual', isManual);
+      const removeButton = article.querySelector('[data-manual-remove]');
+      if (removeButton) removeButton.hidden = !isManual;
     }
     function updateCameraCard(id, cam, timing) {
       setText(`camera-title-${id}`, `${id} ${formatFps(timing.received_fps ?? cam.fps)}fps ${cam.bitrate_kbps}kbps`);
@@ -902,6 +947,10 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
       const img = document.getElementById(`camera-img-${id}`);
       const placeholder = document.getElementById(`camera-placeholder-${id}`);
       if (!img || !placeholder) return;
+      if (!img.dataset.brightnessBound) {
+        img.addEventListener('load', () => calibrateCameraBrightness(id, img));
+        img.dataset.brightnessBound = '1';
+      }
       if (Number.isFinite(Number(sequence)) && sequence > 0) {
         if (lastRenderedFrameSequenceByCamera[id] !== sequence) {
           img.src = `/api/frame/${id}.png?seq=${sequence}`;
@@ -926,6 +975,308 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
         <span id="camera-seq-${timing.camera_id || ''}">seq ${timing.frame_sequence ?? '-'}</span>
       </div></div>`;
     }
+    function renderCameraLayoutControls() {
+      return `<div class="camera-layout-controls" aria-label="camera layout controls">
+        <button type="button" title="Move up" data-layout-action="up">U</button>
+        <button type="button" title="Move down" data-layout-action="down">D</button>
+        <button type="button" title="Move left" data-layout-action="left">L</button>
+        <button type="button" title="Move right" data-layout-action="right">R</button>
+        <button type="button" title="Wider" data-layout-action="wider">W+</button>
+        <button type="button" title="Narrower" data-layout-action="narrower">W-</button>
+        <button type="button" title="Taller" data-layout-action="taller">H+</button>
+        <button type="button" title="Shorter" data-layout-action="shorter">H-</button>
+      </div>`;
+    }
+    function loadCameraLayout() {
+      try {
+        const raw = window.localStorage.getItem(CAMERA_LAYOUT_STORAGE_KEY);
+        return raw ? JSON.parse(raw) : {};
+      } catch (_err) {
+        return {};
+      }
+    }
+    function saveCameraLayout() {
+      window.localStorage.setItem(CAMERA_LAYOUT_STORAGE_KEY, JSON.stringify(cameraLayoutByCamera));
+    }
+    function loadManualCameraIds() {
+      try {
+        const raw = window.localStorage.getItem(CAMERA_MANUAL_STORAGE_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed.map(normalizeCameraId).filter(Boolean) : [];
+      } catch (_err) {
+        return [];
+      }
+    }
+    function saveManualCameraIds() {
+      window.localStorage.setItem(CAMERA_MANUAL_STORAGE_KEY, JSON.stringify(Array.from(manualCameraIds)));
+    }
+    function normalizeCameraId(value) {
+      return String(value || '').trim().replace(/\\s+/g, '-').replace(/[^A-Za-z0-9:_-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 64);
+    }
+    function mergedCameraIds(cameras) {
+      const ids = Object.keys(cameras);
+      for (const id of manualCameraIds) {
+        if (!ids.includes(id)) ids.push(id);
+      }
+      return ids;
+    }
+    function emptyManualCamera(id) {
+      return {camera_id: id, state: 'waiting', fps: 0, bitrate_kbps: 0, latency_ms: null};
+    }
+    function rerenderLastSnapshot() {
+      render(lastSnapshot || {session: {state: 'DISCONNECTED'}, status: {}, dashboard: {cameras: {}}, latest_frame_timing_by_camera: {}});
+    }
+    function addManualCameraFromForm() {
+      const input = document.getElementById('manual-camera-id');
+      const id = normalizeCameraId(input.value);
+      if (!id) {
+        input.focus();
+        return;
+      }
+      addManualCameraSlot(id);
+      input.value = '';
+      input.focus();
+    }
+    function addManualCameraSlot(id) {
+      id = normalizeCameraId(id);
+      if (!id) return;
+      manualCameraIds.add(id);
+      saveManualCameraIds();
+      applyDefaultLayoutForIds(mergedCameraIds(lastSnapshot?.dashboard?.cameras || {}));
+      rerenderLastSnapshot();
+    }
+    function removeManualCameraSlot(id) {
+      id = normalizeCameraId(id);
+      if (!id) return;
+      manualCameraIds.delete(id);
+      saveManualCameraIds();
+      if (!((lastSnapshot?.dashboard?.cameras || {})[id])) {
+        delete cameraLayoutByCamera[id];
+        saveCameraLayout();
+      }
+      applyDefaultLayoutForIds(mergedCameraIds(lastSnapshot?.dashboard?.cameras || {}));
+      rerenderLastSnapshot();
+    }
+    function ensureCameraLayout(cameraIds) {
+      let changed = false;
+      for (const id of cameraIds) {
+        const normalized = normalizeCameraLayout(cameraLayoutByCamera[id] || defaultCameraLayout(id, cameraIds));
+        if (JSON.stringify(cameraLayoutByCamera[id]) !== JSON.stringify(normalized)) {
+          cameraLayoutByCamera[id] = normalized;
+          changed = true;
+        }
+      }
+      if (changed) saveCameraLayout();
+    }
+    function defaultCameraLayout(id, cameraIds) {
+      if (cameraIds.length === 3) return defaultThreeCameraLayout(id, cameraIds);
+      if (cameraIds.length >= 4) return defaultSurroundCameraLayout(id, cameraIds);
+      const normalizedId = String(id).toLowerCase();
+      const named = {
+        front: {col: 1, row: 1, colSpan: 8, rowSpan: 10},
+        rear: {col: 9, row: 1, colSpan: 4, rowSpan: 5},
+        left: {col: 1, row: 1, colSpan: 3, rowSpan: 5},
+        right: {col: 10, row: 1, colSpan: 3, rowSpan: 5},
+        top: {col: 4, row: 1, colSpan: 6, rowSpan: 3},
+        bottom: {col: 4, row: 8, colSpan: 6, rowSpan: 3},
+      };
+      if (named[normalizedId]) return named[normalizedId];
+      const index = Math.max(0, cameraIds.indexOf(id));
+      const fallback = [
+        {col: 1, row: 1, colSpan: 8, rowSpan: 10},
+        {col: 9, row: 1, colSpan: 4, rowSpan: 5},
+        {col: 9, row: 6, colSpan: 4, rowSpan: 5},
+        {col: 1, row: 6, colSpan: 4, rowSpan: 5},
+        {col: 5, row: 6, colSpan: 4, rowSpan: 5},
+      ];
+      return fallback[index % fallback.length];
+    }
+    function defaultSurroundCameraLayout(id, cameraIds) {
+      const normalizedId = String(id).toLowerCase();
+      const named = {
+        front: {col: 4, row: 3, colSpan: 6, rowSpan: 6},
+        rear: {col: 4, row: 1, colSpan: 6, rowSpan: 2},
+        hikrobot: {col: 4, row: 9, colSpan: 6, rowSpan: 2},
+        left: {col: 1, row: 3, colSpan: 3, rowSpan: 6},
+        right: {col: 10, row: 3, colSpan: 3, rowSpan: 6},
+        top: {col: 4, row: 1, colSpan: 6, rowSpan: 2},
+        bottom: {col: 4, row: 9, colSpan: 6, rowSpan: 2},
+      };
+      if (named[normalizedId]) return named[normalizedId];
+      const index = Math.max(0, cameraIds.indexOf(id));
+      const fallback = [
+        {col: 4, row: 3, colSpan: 6, rowSpan: 6},
+        {col: 4, row: 1, colSpan: 6, rowSpan: 2},
+        {col: 4, row: 9, colSpan: 6, rowSpan: 2},
+        {col: 1, row: 3, colSpan: 3, rowSpan: 6},
+        {col: 10, row: 3, colSpan: 3, rowSpan: 6},
+        {col: 1, row: 1, colSpan: 3, rowSpan: 2},
+        {col: 10, row: 1, colSpan: 3, rowSpan: 2},
+      ];
+      return fallback[index % fallback.length];
+    }
+    function defaultThreeCameraLayout(id, cameraIds) {
+      const normalizedId = String(id).toLowerCase();
+      const named = {
+        front: {col: 1, row: 1, colSpan: 8, rowSpan: 10},
+        rear: {col: 9, row: 1, colSpan: 4, rowSpan: 5},
+        hikrobot: {col: 9, row: 6, colSpan: 4, rowSpan: 5},
+      };
+      if (named[normalizedId]) return named[normalizedId];
+      const index = Math.max(0, cameraIds.indexOf(id));
+      const fallback = [
+        {col: 1, row: 1, colSpan: 8, rowSpan: 10},
+        {col: 9, row: 1, colSpan: 4, rowSpan: 5},
+        {col: 9, row: 6, colSpan: 4, rowSpan: 5},
+      ];
+      return fallback[index % fallback.length];
+    }
+    function normalizeCameraLayout(layout) {
+      const colSpan = clamp(Math.round(Number(layout.colSpan || 3)), 2, CAMERA_GRID_COLUMNS);
+      const rowSpan = clamp(Math.round(Number(layout.rowSpan || 3)), 2, CAMERA_GRID_ROWS);
+      return {
+        col: clamp(Math.round(Number(layout.col || 1)), 1, CAMERA_GRID_COLUMNS - colSpan + 1),
+        row: clamp(Math.round(Number(layout.row || 1)), 1, CAMERA_GRID_ROWS - rowSpan + 1),
+        colSpan,
+        rowSpan,
+      };
+    }
+    function applyCameraLayout(id) {
+      const article = document.getElementById(`camera-card-${id}`);
+      if (!article) return;
+      const layout = normalizeCameraLayout(cameraLayoutByCamera[id] || defaultCameraLayout(id, Array.from(knownCameraIds)));
+      article.style.gridColumn = `${layout.col} / span ${layout.colSpan}`;
+      article.style.gridRow = `${layout.row} / span ${layout.rowSpan}`;
+      article.dataset.layout = `${layout.col},${layout.row},${layout.colSpan},${layout.rowSpan}`;
+    }
+    function toggleCameraLayoutEdit() {
+      cameraLayoutEditEnabled = !cameraLayoutEditEnabled;
+      document.body.classList.toggle('layout-editing', cameraLayoutEditEnabled);
+      setText('layout-edit-button', cameraLayoutEditEnabled ? 'Done Layout' : 'Edit Layout');
+    }
+    function applySurroundLayout() {
+      applyDefaultLayoutForIds(Array.from(knownCameraIds));
+    }
+    function applyDefaultLayoutForIds(ids) {
+      cameraLayoutByCamera = {};
+      for (const id of ids) {
+        cameraLayoutByCamera[id] = normalizeCameraLayout(defaultCameraLayout(id, ids));
+        applyCameraLayout(id);
+      }
+      saveCameraLayout();
+    }
+    function resetCameraLayout() {
+      window.localStorage.removeItem(CAMERA_LAYOUT_STORAGE_KEY);
+      cameraLayoutByCamera = {};
+      applyDefaultLayoutForIds(Array.from(knownCameraIds));
+    }
+    function nudgeCameraLayout(id, action) {
+      const deltas = {
+        up: {row: -1},
+        down: {row: 1},
+        left: {col: -1},
+        right: {col: 1},
+        wider: {colSpan: 1},
+        narrower: {colSpan: -1},
+        taller: {rowSpan: 1},
+        shorter: {rowSpan: -1},
+      };
+      const delta = deltas[action];
+      if (!delta) return;
+      const layout = normalizeCameraLayout(cameraLayoutByCamera[id] || defaultCameraLayout(id, Array.from(knownCameraIds)));
+      cameraLayoutByCamera[id] = normalizeCameraLayout({
+        col: layout.col + (delta.col || 0),
+        row: layout.row + (delta.row || 0),
+        colSpan: layout.colSpan + (delta.colSpan || 0),
+        rowSpan: layout.rowSpan + (delta.rowSpan || 0),
+      });
+      applyCameraLayout(id);
+      saveCameraLayout();
+    }
+    function startCameraLayoutDrag(event) {
+      if (!cameraLayoutEditEnabled) return;
+      if (event.target.closest('button')) return;
+      const article = event.currentTarget;
+      const id = article.dataset.cameraId;
+      if (!id) return;
+      cameraLayoutDrag = {
+        id,
+        resizing: Boolean(event.target.closest('[data-layout-resize]')),
+        startX: event.clientX,
+        startY: event.clientY,
+        startLayout: normalizeCameraLayout(cameraLayoutByCamera[id] || defaultCameraLayout(id, Array.from(knownCameraIds))),
+      };
+      article.classList.add('dragging');
+      article.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    }
+    function updateCameraLayoutDrag(event) {
+      if (!cameraLayoutDrag) return;
+      const grid = document.getElementById('cameras');
+      const rect = grid.getBoundingClientRect();
+      const cellWidth = rect.width / CAMERA_GRID_COLUMNS;
+      const cellHeight = rect.height / CAMERA_GRID_ROWS;
+      const colDelta = Math.round((event.clientX - cameraLayoutDrag.startX) / cellWidth);
+      const rowDelta = Math.round((event.clientY - cameraLayoutDrag.startY) / cellHeight);
+      const start = cameraLayoutDrag.startLayout;
+      cameraLayoutByCamera[cameraLayoutDrag.id] = normalizeCameraLayout(cameraLayoutDrag.resizing ? {
+        col: start.col,
+        row: start.row,
+        colSpan: start.colSpan + colDelta,
+        rowSpan: start.rowSpan + rowDelta,
+      } : {
+        col: start.col + colDelta,
+        row: start.row + rowDelta,
+        colSpan: start.colSpan,
+        rowSpan: start.rowSpan,
+      });
+      applyCameraLayout(cameraLayoutDrag.id);
+    }
+    function finishCameraLayoutDrag() {
+      if (!cameraLayoutDrag) return;
+      document.getElementById(`camera-card-${cameraLayoutDrag.id}`)?.classList.remove('dragging');
+      saveCameraLayout();
+      cameraLayoutDrag = null;
+    }
+    function sampleMediaLuminance(media) {
+      if (!brightnessContext || media.hidden) return null;
+      const width = 32;
+      const height = 18;
+      brightnessCanvas.width = width;
+      brightnessCanvas.height = height;
+      try {
+        brightnessContext.drawImage(media, 0, 0, width, height);
+        const pixels = brightnessContext.getImageData(0, 0, width, height).data;
+        let total = 0;
+        let count = 0;
+        for (let i = 0; i < pixels.length; i += 16) {
+          total += 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
+          count += 1;
+        }
+        return count ? total / count : null;
+      } catch (_err) {
+        return null;
+      }
+    }
+    function calibrateCameraBrightness(cameraId, media) {
+      const luminance = sampleMediaLuminance(media);
+      if (!Number.isFinite(Number(luminance))) return;
+      const body = document.getElementById(`camera-body-${cameraId}`);
+      if (!body) return;
+      const brightness = clamp(118 / Math.max(28, Number(luminance)), 0.65, 1.85);
+      const contrast = clamp(1 + Math.abs(128 - Number(luminance)) / 520, 1, 1.25);
+      body.style.setProperty('--camera-brightness', brightness.toFixed(2));
+      body.style.setProperty('--camera-contrast', contrast.toFixed(2));
+      body.dataset.luminance = String(Math.round(Number(luminance)));
+    }
+    function calibrateVisibleCameraBrightness() {
+      for (const id of knownCameraIds) {
+        const video = document.getElementById(`webrtc-video-${id}`);
+        const img = document.getElementById(`camera-img-${id}`);
+        const media = video || (img && !img.hidden ? img : null);
+        if (media) calibrateCameraBrightness(id, media);
+      }
+    }
     function formatMs(value) {
       return Number.isFinite(Number(value)) ? `${Math.round(Number(value))}ms` : '-';
     }
@@ -948,7 +1299,7 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
       const cameras = dashboard.cameras || {};
       const cameraList = Object.keys(cameras).map((id) => cameras[id]);
       const connectedCameras = cameraList.filter((camera) => camera.state === 'connected');
-      const visible = dashboard.visible_camera_ids || Object.keys(cameras);
+      const visible = mergedCameraIds(cameras);
       const command = data.last_command || null;
       setText('operator-session-state', session.state || 'DISCONNECTED');
       setText('operator-session-id', session.session_id || '-');
@@ -1077,6 +1428,7 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
         video = document.getElementById(`webrtc-video-${cameraId}`);
       }
       video.srcObject = stream;
+      video.onloadeddata = () => calibrateCameraBrightness(cameraId, video);
     }
     function restoreRemoteVideos() {
       for (const [cameraId, stream] of remoteStreamsByCamera.entries()) {
@@ -1151,9 +1503,26 @@ _CONTROL_CONSOLE_HTML = """<!doctype html>
     document.addEventListener('keyup', (event) => {
       pressedKeys.delete(event.key.toUpperCase());
     });
+    document.addEventListener('click', (event) => {
+      const removeButton = event.target.closest('[data-manual-remove]');
+      if (removeButton) {
+        const article = removeButton.closest('.camera');
+        if (article && article.dataset.cameraId) removeManualCameraSlot(article.dataset.cameraId);
+        return;
+      }
+      const button = event.target.closest('[data-layout-action]');
+      if (!button) return;
+      const article = button.closest('.camera');
+      if (!article || !article.dataset.cameraId) return;
+      nudgeCameraLayout(article.dataset.cameraId, button.dataset.layoutAction);
+    });
+    document.addEventListener('pointermove', updateCameraLayoutDrag);
+    document.addEventListener('pointerup', finishCameraLayoutDrag);
+    document.addEventListener('pointercancel', finishCameraLayoutDrag);
     setInterval(sendGamepadControl, 50);
     setInterval(sendKeyboardControl, 50);
     setInterval(pollSignaling, 1000);
+    setInterval(calibrateVisibleCameraBrightness, 2000);
     refresh();
   </script>
 </body>

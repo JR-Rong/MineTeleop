@@ -7,6 +7,7 @@ import hmac
 import json
 import re
 import secrets
+import socketserver
 import threading
 import time
 from contextlib import contextmanager
@@ -36,6 +37,14 @@ SIGNALING_MESSAGE_TYPES = {
 # controlled). Signaling payloads are small JSON objects.
 MAX_HTTP_BODY_BYTES = 256 * 1024
 MAX_WEBSOCKET_MESSAGE_BYTES = 256 * 1024
+
+
+class _SignalingThreadingHTTPServer(ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
 
 
 def _time_ms() -> int:
@@ -421,7 +430,7 @@ class SignalingHttpService:
         self.ice_config = ice_config
 
     def make_server(self, host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPServer:
-        return ThreadingHTTPServer((host, port), self._make_handler())
+        return _SignalingThreadingHTTPServer((host, port), self._make_handler())
 
     @contextmanager
     def running(self, host: str = "127.0.0.1", port: int = 0) -> Iterator[str]:

@@ -16,6 +16,7 @@ from mine_teleop import driver_console as _driver_console  # noqa: F401
 from mine_teleop import driver_console_runtime as _driver_console_runtime  # noqa: F401
 from mine_teleop import log_rotation as _log_rotation  # noqa: F401
 from mine_teleop import media as _media  # noqa: F401
+from mine_teleop import mvs_camera_bridge as _mvs_camera_bridge  # noqa: F401
 from mine_teleop import netem as _netem  # noqa: F401
 from mine_teleop import observability as _observability  # noqa: F401
 from mine_teleop import preflight as _preflight  # noqa: F401
@@ -42,6 +43,8 @@ ENTRYPOINTS: dict[str, Entrypoint] = {
     "vehicle-media-agent": Entrypoint("vehicle-media-agent/vehicle_media_agent.py", "Print media pipelines and hardware probe plans."),
     "vehicle-uploader": Entrypoint("vehicle-uploader/vehicle_uploader.py", "Run recorder/uploader demo or service smoke."),
     "driver-console": Entrypoint("driver-console/driver_console.py", "Run driver-console command demo or HTTP control program."),
+    "mvs-camera-bridge": Entrypoint("scripts/mvs_camera_bridge.py", "Stream Hikrobot MVS camera frames as MJPEG."),
+    "pylon-camera-bridge": Entrypoint("scripts/pylon_camera_bridge.py", "Stream Basler pylon camera frames as MJPEG."),
     "signaling-server": Entrypoint("signaling-server/signaling_server.py", "Run local signaling and upload API service."),
     "acceptance-metrics-report": Entrypoint("scripts/acceptance_metrics_report.py", "Summarize field acceptance JSONL samples."),
     "chassis-bridge-check": Entrypoint("scripts/chassis_bridge_check.py", "Validate/build the ChassisControl C shim bridge."),

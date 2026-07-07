@@ -353,6 +353,11 @@ C
           --add-data /workspace/mine-teleop/vehicle-uploader:vehicle-uploader \\
           --add-data /workspace/mine-teleop/driver-console:driver-console \\
           --add-data /workspace/mine-teleop/signaling-server:signaling-server \\
+          --collect-submodules mine_teleop \\
+          --hidden-import mine_teleop.vehicle_media_runtime \\
+          --hidden-import mine_teleop.vehicle_teleop_runtime \\
+          --hidden-import platform \\
+          --hidden-import copy \\
           /workspace/mine-teleop/mine_teleop/cli.py
         cp build/ubuntu-executable/dist/mine-teleop /workspace/output/bin/mine-teleop.real
         chmod +x /workspace/output/bin/mine-teleop.real
@@ -425,6 +430,7 @@ PY
         cp configs/driver-console.dev.yaml /workspace/output/configs/
         cp scripts/run_vehicle_live_media.sh /workspace/output/scripts/
         chmod +x /workspace/output/scripts/run_vehicle_live_media.sh
+        cp scripts/pylon_camera_bridge.cpp /workspace/output/scripts/pylon_camera_bridge.cpp
         cp scripts/setup_vehicle_timesync.sh /workspace/output/scripts/
         chmod +x /workspace/output/scripts/setup_vehicle_timesync.sh
         cp scripts/ipc_manual_smoke.sh /workspace/output/manual-smoke.sh

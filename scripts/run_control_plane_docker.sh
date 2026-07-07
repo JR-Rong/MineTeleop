@@ -35,6 +35,7 @@ docker run -d \
   --name "$server_name" \
   --security-opt "no-new-privileges:true" \
   --cap-drop ALL \
+  -e MINE_TELEOP_ALLOW_WILDCARD_BIND="1" \
   -p "127.0.0.1:${signaling_port}:8765" \
   -p "127.0.0.1:${console_port}:8080" \
   -w /opt/mine-teleop \

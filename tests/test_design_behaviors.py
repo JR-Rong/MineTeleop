@@ -6577,6 +6577,7 @@ class CommandLineEntryPointTests(unittest.TestCase):
 
         self.assertIn("vehicle-agent", list_result.stdout)
         self.assertIn("target-host-validation-plan", list_result.stdout)
+        self.assertIn("pylon-camera-bridge", list_result.stdout)
 
         plan_result = subprocess.run(
             [sys.executable, "-m", "mine_teleop.cli", "target-host-validation-plan", "--format", "jsonl"],

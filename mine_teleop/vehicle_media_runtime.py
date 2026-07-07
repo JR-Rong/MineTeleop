@@ -7,6 +7,7 @@ import json
 import os
 import select
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -194,10 +195,103 @@ class _PersistentFfmpegEncoder:
         raise NotImplementedError
 
 
+def _is_mvs_camera_device(device: str) -> bool:
+    normalized = device.strip().lower()
+    return normalized == "mvs" or normalized.startswith("mvs:") or normalized.startswith("hikrobot:")
+
+
+def _is_pylon_camera_device(device: str) -> bool:
+    normalized = device.strip().lower()
+    return normalized == "pylon" or normalized.startswith("pylon:") or normalized.startswith("basler:")
+
+
+def _mvs_bridge_command(camera: CameraConfig) -> list[str]:
+    command = _mvs_bridge_executable()
+    command.extend(["--sdk-root", os.environ.get("MINE_TELEOP_MVS_SDK_DIR", "/opt/MVS")])
+    selector = camera.device.split(":", 1)[1] if ":" in camera.device else "0"
+    selector = selector.strip() or "0"
+    if selector.startswith("index="):
+        command.extend(["--device-index", selector.split("=", 1)[1]])
+    elif selector.startswith("serial="):
+        command.extend(["--serial", selector.split("=", 1)[1]])
+    elif selector.startswith("model="):
+        command.extend(["--model", selector.split("=", 1)[1]])
+    elif selector.isdigit():
+        command.extend(["--device-index", selector])
+    else:
+        command.extend(["--serial", selector])
+    command.extend(
+        [
+            "--width",
+            str(camera.capture_width),
+            "--height",
+            str(camera.capture_height),
+            "--fps",
+            str(camera.capture_fps),
+            "--frames",
+            "0",
+        ]
+    )
+    return command
+
+
+def _mvs_bridge_executable() -> list[str]:
+    override = os.environ.get("MINE_TELEOP_MVS_BRIDGE_BIN")
+    if override:
+        return [override]
+    executable = Path(sys.executable)
+    if executable.name.startswith("mine-teleop"):
+        return [str(executable), "mvs-camera-bridge"]
+    return [sys.executable, "-m", "mine_teleop.mvs_camera_bridge"]
+
+
+def _pylon_bridge_command(camera: CameraConfig) -> list[str]:
+    command = _pylon_bridge_executable()
+    selector = camera.device.split(":", 1)[1] if ":" in camera.device else "0"
+    selector = selector.strip() or "0"
+    if selector.startswith("index="):
+        command.extend(["--device-index", selector.split("=", 1)[1]])
+    elif selector.startswith("serial="):
+        command.extend(["--serial", selector.split("=", 1)[1]])
+    elif selector.startswith("model="):
+        command.extend(["--model", selector.split("=", 1)[1]])
+    elif selector.isdigit():
+        command.extend(["--device-index", selector])
+    else:
+        command.extend(["--serial", selector])
+    command.extend(
+        [
+            "--width",
+            str(camera.capture_width),
+            "--height",
+            str(camera.capture_height),
+            "--fps",
+            str(camera.capture_fps),
+            "--frames",
+            "0",
+        ]
+    )
+    return command
+
+
+def _pylon_bridge_executable() -> list[str]:
+    override = os.environ.get("MINE_TELEOP_PYLON_BRIDGE_BIN")
+    if override:
+        return [override]
+    executable = Path(sys.executable)
+    if executable.name.startswith("mine-teleop"):
+        return [str(executable), "pylon-camera-bridge"]
+    return [sys.executable, "-m", "mine_teleop.cli", "pylon-camera-bridge"]
+
+
 class MjpegFrameEncoder(_PersistentFfmpegEncoder):
     codec = "mjpeg"
 
     def _command(self, camera: CameraConfig, *, width: int, height: int, fps: int) -> list[str]:
+        if _is_mvs_camera_device(camera.device):
+            return _mvs_bridge_command(camera)
+        if _is_pylon_camera_device(camera.device):
+            return _pylon_bridge_command(camera)
         command = [self.ffmpeg_binary, "-hide_banner", "-loglevel", "error"]
         if camera.device == "testsrc":
             command.extend(["-f", "lavfi", "-i", f"testsrc2=size={width}x{height}:rate={fps}"])
@@ -259,6 +353,8 @@ class FfmpegH264FrameEncoder(_PersistentFfmpegEncoder):
     _AUD = b"\x00\x00\x00\x01\x09"
 
     def _command(self, camera: CameraConfig, *, width: int, height: int, fps: int) -> list[str]:
+        if _is_mvs_camera_device(camera.device) or _is_pylon_camera_device(camera.device):
+            raise RuntimeError("SDK camera bridges require --frame-codec mjpeg")
         command = [self.ffmpeg_binary, "-hide_banner", "-loglevel", "error"]
         if camera.device == "testsrc":
             command.extend(["-f", "lavfi", "-i", f"testsrc2=size={width}x{height}:rate={fps}"])

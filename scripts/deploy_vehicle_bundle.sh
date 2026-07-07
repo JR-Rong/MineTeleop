@@ -243,9 +243,9 @@ set -euo pipefail
 rm -rf "$REMOTE_DIR/.extracting"
 mkdir -p "$REMOTE_DIR/.extracting"
 tar -xzf "$REMOTE_ARCHIVE" -C "$REMOTE_DIR/.extracting" --strip-components=1
-rm -rf "$REMOTE_DIR/bin" "$REMOTE_DIR/lib" "$REMOTE_DIR/configs" "$REMOTE_DIR/docs" "$REMOTE_DIR/manifest"
+rm -rf "$REMOTE_DIR/bin" "$REMOTE_DIR/lib" "$REMOTE_DIR/configs" "$REMOTE_DIR/docs" "$REMOTE_DIR/manifest" "$REMOTE_DIR/scripts"
 mv "$REMOTE_DIR/.extracting/"* "$REMOTE_DIR/"
-rmdir "$REMOTE_DIR/.extracting"
+rm -rf "$REMOTE_DIR/.extracting"
 rm -f "$REMOTE_ARCHIVE"
 cd "$REMOTE_DIR"
 test -x bin/mine-teleop

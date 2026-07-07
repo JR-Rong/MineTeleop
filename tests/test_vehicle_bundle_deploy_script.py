@@ -48,6 +48,25 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         self.assertIn("setup_vehicle_timesync.sh", text)
         self.assertIn("/workspace/output/scripts/setup_vehicle_timesync.sh", text)
 
+    def test_ubuntu_bundle_includes_pylon_bridge_source(self):
+        text = BUILD_BUNDLE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("pylon_camera_bridge.cpp", text)
+        self.assertIn("/workspace/output/scripts/pylon_camera_bridge.cpp", text)
+
+    def test_ubuntu_bundle_collects_runtime_dispatched_mine_teleop_modules(self):
+        text = BUILD_BUNDLE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("--collect-submodules mine_teleop", text)
+
+    def test_ubuntu_bundle_hidden_imports_runtime_dispatched_vehicle_modules(self):
+        text = BUILD_BUNDLE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("--hidden-import mine_teleop.vehicle_media_runtime", text)
+        self.assertIn("--hidden-import mine_teleop.vehicle_teleop_runtime", text)
+        self.assertIn("--hidden-import platform", text)
+        self.assertIn("--hidden-import copy", text)
+
     def test_live_media_script_exposes_low_light_camera_controls(self):
         text = LIVE_MEDIA_SCRIPT.read_text(encoding="utf-8")
 
@@ -62,12 +81,31 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         text = LIVE_MEDIA_SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn("MINE_TELEOP_CAMERA_DEVICES", text)
+        self.assertIn("MINE_TELEOP_ENABLE_MVS_CAMERA", text)
+        self.assertIn("MINE_TELEOP_MVS_SDK_DIR", text)
+        self.assertIn("find_mvs_camera_devices()", text)
+        self.assertIn("mvs-camera-bridge --sdk-root", text)
+        self.assertIn("hikrobot=mvs:0", text)
+        self.assertIn("is_mvs_camera_device", text)
+        self.assertIn("MINE_TELEOP_ENABLE_PYLON_CAMERA", text)
+        self.assertIn("MINE_TELEOP_PYLON_ROOT", text)
+        self.assertIn("find_pylon_camera_devices()", text)
+        self.assertIn("ensure_pylon_camera_bridge()", text)
+        self.assertIn('"$PYLON_BRIDGE_BIN" --list --json', text)
+        self.assertIn("basler=pylon:0", text)
+        self.assertIn("is_pylon_camera_device", text)
         self.assertIn("find_camera_devices()", text)
         self.assertIn("camera_device_pairs", text)
         self.assertIn("write_live_config \"${camera_device_pairs[@]}\"", text)
         self.assertIn('FRAMES="${MINE_TELEOP_MEDIA_FRAMES:-300}"', text)
         self.assertIn('FRAME_CODEC="${MINE_TELEOP_FRAME_CODEC:-mjpeg}"', text)
         self.assertIn('--frame-codec "$FRAME_CODEC"', text)
+
+    def test_live_media_config_generation_preserves_hardware_section_indentation(self):
+        text = LIVE_MEDIA_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("suffix.rstrip()", text)
+        self.assertNotIn("suffix.lstrip()", text)
 
     def test_live_control_tunnel_exposes_signaling_for_vehicle_control_feedback(self):
         text = LIVE_CONTROL_SCRIPT.read_text(encoding="utf-8")
@@ -95,6 +133,17 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         self.assertIn("bin/ffmpeg -hide_banner -hwaccels", result.stdout)
         self.assertNotIn(" docker ", result.stdout)
         self.assertNotIn("sudo docker", result.stdout)
+
+    def test_deploy_replaces_existing_scripts_directory_from_bundle(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('"$REMOTE_DIR/scripts"', text)
+
+    def test_deploy_removes_extracting_directory_after_move(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('rm -rf "$REMOTE_DIR/.extracting"', text)
+        self.assertNotIn('rmdir "$REMOTE_DIR/.extracting"', text)
 
     def test_dry_run_requires_host_and_user_when_not_dry(self):
         result = subprocess.run(

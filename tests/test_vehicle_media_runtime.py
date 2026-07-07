@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib import request
 
@@ -129,6 +129,56 @@ class VehicleMediaRuntimeTests(unittest.TestCase):
         self.assertEqual(first.payload, b"\xff\xd8first\xff\xd9")
         self.assertEqual(second.payload, b"\xff\xd8second\xff\xd9")
         self.assertEqual(launches_lines, ["launch"])
+
+    def test_mjpeg_frame_encoder_uses_mvs_bridge_for_hikrobot_camera(self):
+        config = load_vehicle_config(Path("configs/vehicle-agent.dev.yaml"))
+        camera = replace(
+            config.enabled_cameras[0],
+            camera_id="hikrobot",
+            device="mvs:0",
+            capture_width=1280,
+            capture_height=1024,
+            capture_fps=15,
+        )
+        encoder = MjpegFrameEncoder(config, ffmpeg_binary="/opt/mine-teleop/bin/ffmpeg")
+
+        command = encoder._command(camera, width=1280, height=720, fps=15)
+
+        self.assertNotIn("v4l2", command)
+        self.assertIn("mine_teleop.mvs_camera_bridge", command)
+        self.assertIn("--device-index", command)
+        self.assertIn("0", command)
+        self.assertIn("--width", command)
+        self.assertIn("1280", command)
+        self.assertIn("--height", command)
+        self.assertIn("1024", command)
+        self.assertIn("--fps", command)
+        self.assertIn("15", command)
+
+    def test_mjpeg_frame_encoder_uses_pylon_bridge_for_basler_camera(self):
+        config = load_vehicle_config(Path("configs/vehicle-agent.dev.yaml"))
+        camera = replace(
+            config.enabled_cameras[0],
+            camera_id="basler",
+            device="pylon:0",
+            capture_width=1280,
+            capture_height=1024,
+            capture_fps=15,
+        )
+        encoder = MjpegFrameEncoder(config, ffmpeg_binary="/opt/mine-teleop/bin/ffmpeg")
+
+        command = encoder._command(camera, width=1280, height=720, fps=15)
+
+        self.assertNotIn("v4l2", command)
+        self.assertIn("pylon-camera-bridge", command)
+        self.assertIn("--device-index", command)
+        self.assertIn("0", command)
+        self.assertIn("--width", command)
+        self.assertIn("1280", command)
+        self.assertIn("--height", command)
+        self.assertIn("1024", command)
+        self.assertIn("--fps", command)
+        self.assertIn("15", command)
 
 
 class VehicleMediaRuntimeCliTests(unittest.TestCase):
@@ -310,4 +360,3 @@ class DriverConsoleFrameSinkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
