@@ -1,0 +1,31 @@
+# Mine Teleop coturn configuration template.
+# Render ${MINE_TELEOP_TURN_REALM} and ${MINE_TELEOP_TURN_STATIC_AUTH_SECRET}
+# from the deployment secret store before starting turnserver.
+
+listening-port=3478
+tls-listening-port=5349
+min-port=49152
+max-port=49200
+
+realm=${MINE_TELEOP_TURN_REALM}
+fingerprint
+lt-cred-mech
+use-auth-secret
+static-auth-secret=${MINE_TELEOP_TURN_STATIC_AUTH_SECRET}
+
+cert=/etc/mine-teleop/tls/turn.crt
+pkey=/etc/mine-teleop/tls/turn.key
+
+# Keep the relay UDP-first for low-latency video fallback.
+no-tcp-relay
+no-multicast-peers
+no-loopback-peers
+
+# Capacity guards keep this relay isolated from other business traffic.
+total-quota=1200
+bps-capacity=0
+
+# Log allocations and bindings so relay usage can be audited per session user.
+verbose
+log-binding
+new-log-timestamp

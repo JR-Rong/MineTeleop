@@ -1,0 +1,30 @@
+[Unit]
+Description=Mine Teleop vehicle uploader
+After=network-online.target mine-teleop-vehicle-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mine-teleop
+EnvironmentFile=/etc/mine-teleop/mine-teleop.env
+LogsDirectory=mine-teleop
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+StateDirectory=mine-teleop/uploader
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=50
+IOWeight=50
+ExecStart=/usr/bin/python3 /opt/mine-teleop/vehicle-uploader/vehicle_uploader.py --service-mode --config /etc/mine-teleop/vehicle-agent.yaml --work-dir /var/lib/mine-teleop/uploader
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/mine-teleop/vehicle-uploader.log
+StandardError=append:/var/log/mine-teleop/vehicle-uploader.log
+
+[Install]
+WantedBy=multi-user.target

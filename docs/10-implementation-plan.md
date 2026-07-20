@@ -6,6 +6,9 @@
 
 每个阶段都必须产出可运行、可验证的软件闭环。
 
+当前代码实现、文档地图和工控机无 Docker 部署流程见
+[当前实现与工控机无 Docker 部署](14-current-status-and-ipc-deployment.md)。
+
 ## Phase 0: 项目骨架和开发环境
 
 目标：

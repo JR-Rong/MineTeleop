@@ -1,0 +1,33 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        gstreamer1.0-libav \
+        gstreamer1.0-plugins-bad \
+        gstreamer1.0-plugins-base \
+        gstreamer1.0-plugins-good \
+        gstreamer1.0-plugins-ugly \
+        gstreamer1.0-tools \
+        intel-media-va-driver \
+        python3 \
+        python3-yaml \
+        vainfo \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/mine-teleop
+
+# Run as a non-root user. Add it to the video/render groups so the media agent
+# can still reach the passed-through /dev/dri and /dev/video* devices. If the
+# host device GIDs differ, set `group_add:` for the service in compose.
+RUN groupadd --system mineteleop \
+    && useradd --system --gid mineteleop --home-dir /opt/mine-teleop --shell /usr/sbin/nologin mineteleop \
+    && (getent group video || groupadd --system video) \
+    && (getent group render || groupadd --system render) \
+    && usermod -aG video,render mineteleop \
+    && mkdir -p /var/lib/mine-teleop/recordings /var/lib/mine-teleop/uploader \
+    && chown -R mineteleop:mineteleop /var/lib/mine-teleop
+USER mineteleop

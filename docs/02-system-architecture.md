@@ -80,7 +80,7 @@ flowchart LR
 
 1. 驾驶端输入层产生控制状态。
 2. Control Client 以 20 Hz 发送包含 `protocol_version`、`seq` 和完整控制状态的 `ControlCommand`。
-3. 如果控制走 WebRTC DataChannel，通道必须配置为 unordered/unreliable，避免可靠有序重传造成队头阻塞和旧命令积压。
+3. 如果控制走 WebRTC DataChannel，通道必须配置为 unordered/unreliable，避免可靠有序重传造成队头阻塞和旧命令积压；本地配置对象通过 `to_webrtc_init()` 导出浏览器/WebRTC 初始化字段 `ordered=false`、`maxRetransmits=0` 和协议名。
 4. 车端接收后校验协议版本、序号、会话和控制权，并用本地到达间隔判断命令新鲜度。
 5. Safety State Machine 判断是否可执行。
 6. Vehicle Adapter 下发给真实车辆接口或 Mock Adapter。

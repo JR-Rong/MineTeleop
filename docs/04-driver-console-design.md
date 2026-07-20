@@ -61,6 +61,17 @@ Driver Console 运行在远端模拟驾驶器上，负责：
 
 不要在主画面堆叠说明性文字。遥操界面应优先可扫视、低干扰、状态清楚。
 
+本地参考实现提供 `DriverConsoleStatusSnapshot`，把 telemetry、adapter
+健康状态、视频面板状态、每路 fps/码率/延迟、控制权状态和丢包样本归一化为
+右侧状态栏与底部状态栏字段，用于后续 Qt 渲染层接入前固定 UI 数据契约。
+其中 `mock_telemetry=true` 的遥测必须透传为右侧状态栏 `mock_telemetry` 和
+`telemetry_source_label=MOCK TELEMETRY`，确保本地 Mock 反馈不会在 UI 上伪装成
+真实车辆反馈。
+
+本地参考实现还提供 `DriverToolbarSnapshot`，固定登录/退出、连接/断开、
+开始/结束会话、急停和设置动作的 enabled/visible 状态；其中急停动作始终
+visible，便于后续 UI 层保持常驻入口。
+
 ## 控制输入
 
 首版输入：
@@ -84,12 +95,26 @@ Driver Console 运行在远端模拟驾驶器上，负责：
 - 失去窗口焦点时应继续按固定周期发送安全控制心跳，但主动油门必须置 0，并按配置进入滑行、限速或渐进制动策略；不应主动停发来制造超时急刹。
 - 软件控件和键盘同时输入时需要明确优先级。
 
+本地参考实现的输入合成规则：
+
+- 急停取键盘和软件控件的并集，始终最高优先级。
+- 软件控件的连续转向、油门、刹车和档位优先于键盘离散输入。
+- 刹车优先于油门；存在刹车输入时油门输出为 0。
+- 窗口失焦时主动油门和转向归零，但仍按固定频率发送安全心跳。
+- 档位输出必须落在控制协议允许集合内；真实车辆额外档位由后续车辆适配器契约扩展。
+
 后续输入适配：
 
 - USB HID 方向盘。
 - 踏板。
 - 档位器。
 - 自定义串口/CAN 驾驶台。
+
+当前 Docker 友好的 HTTP 控制端程序先通过浏览器 Gamepad API 接入模拟驾驶器：
+方向盘/踏板仍由操作员浏览器读取，Docker 容器只接收已归一化的 steering、
+throttle、brake、estop 和 gear 状态，因此不要求容器直接挂载宿主
+`/dev/input` 或安装 HID 驱动。轴编号、踏板反向、deadzone 和急停按钮通过
+`control.gamepad` 配置暴露。
 
 ## 控制命令生成
 
@@ -112,6 +137,23 @@ Console 不应只在按键变化时发送控制，而应按固定周期发送当
 - 支持单路放大。
 - 支持布局保存。
 - 解码失败不能拖死整个 UI。
+
+当前 Docker 友好的 HTTP 控制端程序会把车端 `webrtc_offer` 返回给浏览器页面，
+页面用 `RTCPeerConnection` 创建 answer，并通过 `ontrack` 把远端视频流挂到对应
+camera 的 `<video>` 元素；控制 DataChannel 按 unordered/unreliable 配置创建。
+页面连接后会周期轮询信令并处理车端 remote ICE candidate，同时把浏览器 local
+ICE candidate 经控制端转发到车端。本地 Docker smoke 只验证 offer/answer/ICE
+信令和页面 wiring，不替代真实车端 RTP 媒体流与 DataChannel 端到端现场验证。
+页面右侧提供操作员可扫视状态面板，直接显示 session 状态、session id、控制权、
+信令连接状态、摄像头连接数量、WebRTC 状态、最近一条控制命令和 DataChannel 状态；
+原始 JSON 状态仍保留为调试输出，但不作为主要操作界面。
+
+本地参考实现的 `DriverVideoDashboard` 支持把布局偏好保存为 JSON 文件并恢复。
+该文件只持久化 layout、聚焦相机和相机 ID；每路连接状态、fps、码率、延迟和
+解码错误仍属于运行时状态，恢复布局时默认重新从 `disconnected` 状态开始，
+避免把旧的断流或码率样本误当成用户偏好。
+`DriverVideoDashboard.to_dict()` 同时输出 `visible_camera_ids`，用于 UI 渲染层
+直接确定当前 1/2/4 布局或单路放大时应该显示的相机列表。
 
 ## 安全交互
 
@@ -138,3 +180,8 @@ Console 不应只在按键变化时发送控制，而应按固定周期发送当
 - 重连。
 - UI 版本。
 - 配置版本。
+
+本地参考实现的 `DriverOperationLog` 写入 JSONL 操作日志，并支持按大小轮转为
+编号备份文件。`driver-console --operation-log` 可配合
+`--operation-log-max-bytes` 和 `--operation-log-backup-count` 使用，避免长期驾驶
+端运行时本地操作日志无限增长。

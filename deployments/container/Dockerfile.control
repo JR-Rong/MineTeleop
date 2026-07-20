@@ -1,0 +1,28 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        python3 \
+        python3-yaml \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/mine-teleop
+
+COPY configs/ configs/
+COPY driver-console/ driver-console/
+COPY mine_teleop/ mine_teleop/
+COPY scripts/control_plane_smoke.py scripts/control_plane_smoke.py
+COPY signaling-server/ signaling-server/
+
+RUN groupadd --system mineteleop \
+    && useradd --system --gid mineteleop --home-dir /opt/mine-teleop --shell /usr/sbin/nologin mineteleop
+
+USER mineteleop
+
+EXPOSE 8080
+
+CMD ["python3", "-m", "mine_teleop.control_console_container"]

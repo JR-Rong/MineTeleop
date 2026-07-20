@@ -1,0 +1,27 @@
+[Unit]
+Description=Mine Teleop TURN Relay
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mine-teleop
+EnvironmentFile=/etc/mine-teleop/mine-teleop.env
+LogsDirectory=mine-teleop
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ExecStart=/usr/bin/turnserver -c /etc/mine-teleop/turnserver.conf --no-cli
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/mine-teleop/turn-server.log
+StandardError=append:/var/log/mine-teleop/turn-server.err.log
+
+[Install]
+WantedBy=multi-user.target
