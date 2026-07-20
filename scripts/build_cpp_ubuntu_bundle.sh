@@ -40,7 +40,10 @@ docker buildx build \
 
 cp -a "$temporary/artifact/." "$output_root/"
 archive="$output_root.tar.gz"
-tar -C "$(dirname "$output_root")" -czf "$archive" "$(basename "$output_root")"
+COPYFILE_DISABLE=1 tar --no-xattrs \
+  -C "$(dirname "$output_root")" \
+  -czf "$archive" \
+  "$(basename "$output_root")"
 
 if command -v sha256sum >/dev/null 2>&1; then
   sha256sum "$archive" > "$archive.sha256"
