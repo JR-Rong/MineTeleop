@@ -837,6 +837,7 @@ class DriverConsoleHttpAppTests(unittest.TestCase):
 
         self.assertTrue(decoded["frame_received"])
         self.assertEqual(decoded["codec"], "mjpeg")
+        self.assertNotIn("snapshot", decoded)
         self.assertEqual(decoded["decode_latency_ms"], 0)
         self.assertEqual(frame_body, jpeg_payload)
         self.assertEqual(content_type, "image/jpeg")

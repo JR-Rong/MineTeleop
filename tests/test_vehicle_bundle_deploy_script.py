@@ -7,6 +7,8 @@ from pathlib import Path
 SCRIPT = Path("scripts/deploy_vehicle_bundle.sh")
 LIVE_CONTROL_SCRIPT = Path("scripts/start_live_control_plane_tunnel.sh")
 LIVE_MEDIA_SCRIPT = Path("scripts/run_vehicle_live_media.sh")
+LIVE_CONTROL_ONE_COMMAND_SCRIPT = Path("scripts/start_live_control_one_command.sh")
+LIVE_VEHICLE_ONE_COMMAND_SCRIPT = Path("scripts/start_live_vehicle_one_command.sh")
 TIMESYNC_SCRIPT = Path("scripts/setup_vehicle_timesync.sh")
 BUILD_BUNDLE_SCRIPT = Path("scripts/build_ubuntu_bundle.py")
 
@@ -21,11 +23,59 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_live_run_scripts_are_executable_and_have_valid_shell_syntax(self):
-        for script in (LIVE_CONTROL_SCRIPT, LIVE_MEDIA_SCRIPT, TIMESYNC_SCRIPT):
+        for script in (
+            LIVE_CONTROL_SCRIPT,
+            LIVE_MEDIA_SCRIPT,
+            LIVE_CONTROL_ONE_COMMAND_SCRIPT,
+            LIVE_VEHICLE_ONE_COMMAND_SCRIPT,
+            TIMESYNC_SCRIPT,
+        ):
             self.assertTrue(script.is_file(), f"{script} should exist")
             self.assertTrue(os.access(script, os.X_OK), f"{script} should be executable")
             result = subprocess.run(["bash", "-n", str(script)], text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_one_command_control_script_wraps_control_plane_and_tunnel_without_real_password(self):
+        text = LIVE_CONTROL_ONE_COMMAND_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('VEHICLE_SSH_HOST="60.205.213.254"', text)
+        self.assertIn('VEHICLE_SSH_PORT="6000"', text)
+        self.assertIn('VEHICLE_SSH_USER="user"', text)
+        self.assertIn('VEHICLE_SSH_PASSWORD="CHANGE_ME"', text)
+        self.assertIn("scripts/start_live_control_plane_tunnel.sh", text)
+        self.assertIn("MINE_TELEOP_VEHICLE_SSH_HOST", text)
+        self.assertIn("MINE_TELEOP_OPEN_BROWSER", text)
+        self.assertNotIn("cz666666", text)
+
+    def test_one_command_vehicle_script_pins_camera_mapping_and_adaptive_controls(self):
+        text = LIVE_VEHICLE_ONE_COMMAND_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('CAMERA_DEVICES="front=/dev/video0 rear=/dev/video2"', text)
+        self.assertIn('MVS_CAMERAS="hikrobot=mvs:0"', text)
+        self.assertIn('PYLON_CAMERAS="basler=pylon:0"', text)
+        self.assertIn('CAMERA_CONTROL_PROFILE="adaptive"', text)
+        self.assertIn('CAMERA_ADAPTIVE_BRIGHTNESS="0"', text)
+        self.assertIn('CAMERA_ADAPTIVE_CONTRAST="32"', text)
+        self.assertIn("MINE_TELEOP_CAMERA_GAIN_AUTOMATIC", text)
+        self.assertIn("MINE_TELEOP_CAMERA_WHITE_BALANCE_AUTO", text)
+        self.assertIn("scripts/run_vehicle_live_media.sh", text)
+        self.assertIn("MINE_TELEOP_CAMERA_DEVICES", text)
+        self.assertIn("MINE_TELEOP_CAMERA_CONTROL_PROFILE", text)
+
+    def test_one_command_vehicle_script_defaults_to_480p15_low_bandwidth_media(self):
+        text = LIVE_VEHICLE_ONE_COMMAND_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('REALTIME_PROFILE="realtime_480p15"', text)
+        self.assertIn('CAPTURE_WIDTH="640"', text)
+        self.assertIn('CAPTURE_HEIGHT="480"', text)
+        self.assertIn('CAPTURE_FPS="15"', text)
+        self.assertIn('MVS_CAPTURE_WIDTH="640"', text)
+        self.assertIn('MVS_CAPTURE_HEIGHT="512"', text)
+        self.assertIn('PYLON_CAPTURE_WIDTH="640"', text)
+        self.assertIn('PYLON_CAPTURE_HEIGHT="512"', text)
+        self.assertIn('MVS_JPEG_QUALITY="65"', text)
+        self.assertIn("MINE_TELEOP_REALTIME_PROFILE", text)
+        self.assertIn("MINE_TELEOP_MVS_JPEG_QUALITY", text)
 
     def test_timesync_script_configures_chrony_without_embedding_passwords(self):
         text = TIMESYNC_SCRIPT.read_text(encoding="utf-8")
@@ -48,6 +98,12 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         self.assertIn("setup_vehicle_timesync.sh", text)
         self.assertIn("/workspace/output/scripts/setup_vehicle_timesync.sh", text)
 
+    def test_ubuntu_bundle_includes_live_vehicle_one_command_script(self):
+        text = BUILD_BUNDLE_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("start_live_vehicle_one_command.sh", text)
+        self.assertIn("/workspace/output/scripts/start_live_vehicle_one_command.sh", text)
+
     def test_ubuntu_bundle_includes_pylon_bridge_source(self):
         text = BUILD_BUNDLE_SCRIPT.read_text(encoding="utf-8")
 
@@ -67,15 +123,22 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         self.assertIn("--hidden-import platform", text)
         self.assertIn("--hidden-import copy", text)
 
-    def test_live_media_script_exposes_low_light_camera_controls(self):
+    def test_live_media_script_exposes_adaptive_and_low_light_camera_controls(self):
         text = LIVE_MEDIA_SCRIPT.read_text(encoding="utf-8")
 
+        self.assertIn("MINE_TELEOP_CAMERA_CONTROL_PROFILE", text)
+        self.assertIn("adaptive", text)
+        self.assertIn("apply_adaptive_camera_controls", text)
+        self.assertIn("white_balance_temperature_auto", text)
+        self.assertIn("power_line_frequency", text)
         self.assertIn("MINE_TELEOP_CAMERA_LOW_LIGHT", text)
-        self.assertIn("brightness=", text)
-        self.assertIn("gain=", text)
-        self.assertIn("gamma=", text)
-        self.assertIn("backlight_compensation=", text)
-        self.assertIn("exposure_dynamic_framerate=", text)
+        self.assertIn("apply_low_light_camera_controls", text)
+        self.assertIn("brightness", text)
+        self.assertIn("contrast", text)
+        self.assertIn("gain", text)
+        self.assertIn("gamma", text)
+        self.assertIn("backlight_compensation", text)
+        self.assertIn("exposure_dynamic_framerate", text)
 
     def test_live_media_script_enables_all_detected_camera_devices_with_mjpeg_codec(self):
         text = LIVE_MEDIA_SCRIPT.read_text(encoding="utf-8")
@@ -91,6 +154,7 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         self.assertIn("MINE_TELEOP_PYLON_ROOT", text)
         self.assertIn("find_pylon_camera_devices()", text)
         self.assertIn("ensure_pylon_camera_bridge()", text)
+        self.assertIn("Basler/pylon camera mapping is configured but pylon bridge is unavailable", text)
         self.assertIn('"$PYLON_BRIDGE_BIN" --list --json', text)
         self.assertIn("basler=pylon:0", text)
         self.assertIn("is_pylon_camera_device", text)
@@ -99,6 +163,9 @@ class VehicleBundleDeployScriptTests(unittest.TestCase):
         self.assertIn("write_live_config \"${camera_device_pairs[@]}\"", text)
         self.assertIn('FRAMES="${MINE_TELEOP_MEDIA_FRAMES:-300}"', text)
         self.assertIn('FRAME_CODEC="${MINE_TELEOP_FRAME_CODEC:-mjpeg}"', text)
+        self.assertIn('REALTIME_PROFILE="${MINE_TELEOP_REALTIME_PROFILE:-realtime_720p}"', text)
+        self.assertIn("MINE_TELEOP_MVS_JPEG_QUALITY", text)
+        self.assertIn("f\"    realtime_profile: {realtime_profile}\"", text)
         self.assertIn('--frame-codec "$FRAME_CODEC"', text)
 
     def test_live_media_config_generation_preserves_hardware_section_indentation(self):

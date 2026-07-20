@@ -12,6 +12,7 @@ FRAMES="${MINE_TELEOP_MEDIA_FRAMES:-300}"
 FRAME_INTERVAL_MS="${MINE_TELEOP_FRAME_INTERVAL_MS:-33}"
 STREAM_DURATION_MS="${MINE_TELEOP_STREAM_DURATION_MS:-60000}"
 FRAME_CODEC="${MINE_TELEOP_FRAME_CODEC:-mjpeg}"
+REALTIME_PROFILE="${MINE_TELEOP_REALTIME_PROFILE:-realtime_720p}"
 CAPTURE_WIDTH="${MINE_TELEOP_CAPTURE_WIDTH:-1280}"
 CAPTURE_HEIGHT="${MINE_TELEOP_CAPTURE_HEIGHT:-720}"
 CAPTURE_FPS="${MINE_TELEOP_CAPTURE_FPS:-30}"
@@ -23,6 +24,7 @@ MVS_CAMERAS="${MINE_TELEOP_MVS_CAMERAS:-}"
 MVS_CAPTURE_WIDTH="${MINE_TELEOP_MVS_CAPTURE_WIDTH:-1280}"
 MVS_CAPTURE_HEIGHT="${MINE_TELEOP_MVS_CAPTURE_HEIGHT:-1024}"
 MVS_CAPTURE_FPS="${MINE_TELEOP_MVS_CAPTURE_FPS:-15}"
+MVS_JPEG_QUALITY="${MINE_TELEOP_MVS_JPEG_QUALITY:-80}"
 ENABLE_PYLON_CAMERA="${MINE_TELEOP_ENABLE_PYLON_CAMERA:-1}"
 PYLON_ROOT="${MINE_TELEOP_PYLON_ROOT:-/opt/pylon}"
 PYLON_BRIDGE_BIN="${MINE_TELEOP_PYLON_BRIDGE_BIN:-$INSTALL_DIR/bin/pylon-camera-bridge}"
@@ -30,6 +32,7 @@ PYLON_CAMERAS="${MINE_TELEOP_PYLON_CAMERAS:-}"
 PYLON_CAPTURE_WIDTH="${MINE_TELEOP_PYLON_CAPTURE_WIDTH:-1280}"
 PYLON_CAPTURE_HEIGHT="${MINE_TELEOP_PYLON_CAPTURE_HEIGHT:-1024}"
 PYLON_CAPTURE_FPS="${MINE_TELEOP_PYLON_CAPTURE_FPS:-15}"
+export MINE_TELEOP_MVS_JPEG_QUALITY="$MVS_JPEG_QUALITY"
 export MINE_TELEOP_PYLON_BRIDGE_BIN="$PYLON_BRIDGE_BIN"
 if [[ -d "$PYLON_ROOT/lib" ]]; then
   export LD_LIBRARY_PATH="$PYLON_ROOT/lib:${LD_LIBRARY_PATH:-}"
@@ -37,14 +40,31 @@ fi
 RETRY_SECONDS="${MINE_TELEOP_RETRY_SECONDS:-2}"
 HEALTH_RETRIES="${MINE_TELEOP_HEALTH_RETRIES:-5}"
 HEALTH_URL="${DRIVER_CONSOLE_URL%/}/health"
-LOW_LIGHT="${MINE_TELEOP_CAMERA_LOW_LIGHT:-1}"
+REQUESTED_CAMERA_CONTROL_PROFILE="${MINE_TELEOP_CAMERA_CONTROL_PROFILE:-}"
+if [[ -n "$REQUESTED_CAMERA_CONTROL_PROFILE" ]]; then
+  CAMERA_CONTROL_PROFILE="$REQUESTED_CAMERA_CONTROL_PROFILE"
+elif [[ "${MINE_TELEOP_CAMERA_LOW_LIGHT:-}" == "0" ]]; then
+  CAMERA_CONTROL_PROFILE="off"
+elif [[ "${MINE_TELEOP_CAMERA_LOW_LIGHT:-}" == "1" ]]; then
+  CAMERA_CONTROL_PROFILE="low_light"
+else
+  CAMERA_CONTROL_PROFILE="adaptive"
+fi
 CAMERA_BRIGHTNESS="${MINE_TELEOP_CAMERA_BRIGHTNESS:-24}"
+CAMERA_CONTRAST="${MINE_TELEOP_CAMERA_CONTRAST:-40}"
 CAMERA_GAIN="${MINE_TELEOP_CAMERA_GAIN:-96}"
 CAMERA_GAMMA="${MINE_TELEOP_CAMERA_GAMMA:-450}"
 CAMERA_BACKLIGHT="${MINE_TELEOP_CAMERA_BACKLIGHT:-2}"
 CAMERA_EXPOSURE_DYNAMIC_FRAMERATE="${MINE_TELEOP_CAMERA_EXPOSURE_DYNAMIC_FRAMERATE:-1}"
 CAMERA_AUTO_EXPOSURE="${MINE_TELEOP_CAMERA_AUTO_EXPOSURE:-3}"
 CAMERA_EXPOSURE_ABSOLUTE="${MINE_TELEOP_CAMERA_EXPOSURE_ABSOLUTE:-}"
+CAMERA_ADAPTIVE_BRIGHTNESS="${MINE_TELEOP_CAMERA_ADAPTIVE_BRIGHTNESS:-0}"
+CAMERA_ADAPTIVE_CONTRAST="${MINE_TELEOP_CAMERA_ADAPTIVE_CONTRAST:-32}"
+CAMERA_ADAPTIVE_GAMMA="${MINE_TELEOP_CAMERA_ADAPTIVE_GAMMA:-300}"
+CAMERA_ADAPTIVE_BACKLIGHT="${MINE_TELEOP_CAMERA_ADAPTIVE_BACKLIGHT:-1}"
+CAMERA_WHITE_BALANCE_AUTO="${MINE_TELEOP_CAMERA_WHITE_BALANCE_AUTO:-1}"
+CAMERA_GAIN_AUTOMATIC="${MINE_TELEOP_CAMERA_GAIN_AUTOMATIC:-1}"
+CAMERA_POWER_LINE_FREQUENCY="${MINE_TELEOP_CAMERA_POWER_LINE_FREQUENCY:-1}"
 
 camera_id_for_index() {
   case "$1" in
@@ -219,6 +239,10 @@ PY
 
 find_pylon_camera_devices() {
   if [[ -n "$PYLON_CAMERAS" ]]; then
+    ensure_pylon_camera_bridge || {
+      echo "Basler/pylon camera mapping is configured but pylon bridge is unavailable" >&2
+      return 1
+    }
     normalize_pylon_camera_pairs "$PYLON_CAMERAS"
     return
   fi
@@ -257,6 +281,44 @@ PY
   fi
 }
 
+set_camera_control() {
+  local camera_device="$1"
+  local control_name="$2"
+  local control_value="$3"
+  v4l2-ctl -d "$camera_device" -c "${control_name}=${control_value}" >/dev/null 2>&1 || true
+}
+
+apply_adaptive_camera_controls() {
+  local camera_device="$1"
+  set_camera_control "$camera_device" auto_exposure "$CAMERA_AUTO_EXPOSURE"
+  set_camera_control "$camera_device" exposure_dynamic_framerate "$CAMERA_EXPOSURE_DYNAMIC_FRAMERATE"
+  set_camera_control "$camera_device" gain_automatic "$CAMERA_GAIN_AUTOMATIC"
+  set_camera_control "$camera_device" white_balance_temperature_auto "$CAMERA_WHITE_BALANCE_AUTO"
+  set_camera_control "$camera_device" power_line_frequency "$CAMERA_POWER_LINE_FREQUENCY"
+  set_camera_control "$camera_device" brightness "$CAMERA_ADAPTIVE_BRIGHTNESS"
+  set_camera_control "$camera_device" contrast "$CAMERA_ADAPTIVE_CONTRAST"
+  set_camera_control "$camera_device" gamma "$CAMERA_ADAPTIVE_GAMMA"
+  set_camera_control "$camera_device" backlight_compensation "$CAMERA_ADAPTIVE_BACKLIGHT"
+}
+
+apply_low_light_camera_controls() {
+  local camera_device="$1"
+  set_camera_control "$camera_device" auto_exposure "$CAMERA_AUTO_EXPOSURE"
+  set_camera_control "$camera_device" brightness "$CAMERA_BRIGHTNESS"
+  set_camera_control "$camera_device" contrast "$CAMERA_CONTRAST"
+  set_camera_control "$camera_device" gain "$CAMERA_GAIN"
+  set_camera_control "$camera_device" gamma "$CAMERA_GAMMA"
+  set_camera_control "$camera_device" backlight_compensation "$CAMERA_BACKLIGHT"
+  set_camera_control "$camera_device" exposure_dynamic_framerate "$CAMERA_EXPOSURE_DYNAMIC_FRAMERATE"
+}
+
+apply_manual_exposure_override() {
+  local camera_device="$1"
+  [[ -n "$CAMERA_EXPOSURE_ABSOLUTE" ]] || return 0
+  set_camera_control "$camera_device" auto_exposure 1
+  set_camera_control "$camera_device" exposure_time_absolute "$CAMERA_EXPOSURE_ABSOLUTE"
+}
+
 configure_camera_device() {
   local camera_device="$1"
   is_bridge_camera_device "$camera_device" && return 0
@@ -264,20 +326,21 @@ configure_camera_device() {
     v4l2-ctl -d "$camera_device" \
       --set-fmt-video="width=${CAPTURE_WIDTH},height=${CAPTURE_HEIGHT},pixelformat=MJPG" \
       --set-parm="$CAPTURE_FPS" >/dev/null 2>&1 || true
-    if [[ "$LOW_LIGHT" == "1" ]]; then
-      v4l2-ctl -d "$camera_device" \
-        -c "auto_exposure=${CAMERA_AUTO_EXPOSURE}" \
-        -c "brightness=${CAMERA_BRIGHTNESS}" \
-        -c "gain=${CAMERA_GAIN}" \
-        -c "gamma=${CAMERA_GAMMA}" \
-        -c "backlight_compensation=${CAMERA_BACKLIGHT}" \
-        -c "exposure_dynamic_framerate=${CAMERA_EXPOSURE_DYNAMIC_FRAMERATE}" >/dev/null 2>&1 || true
-      if [[ -n "$CAMERA_EXPOSURE_ABSOLUTE" ]]; then
-        v4l2-ctl -d "$camera_device" \
-          -c auto_exposure=1 \
-          -c "exposure_time_absolute=${CAMERA_EXPOSURE_ABSOLUTE}" >/dev/null 2>&1 || true
-      fi
-    fi
+    case "$CAMERA_CONTROL_PROFILE" in
+      adaptive)
+        apply_adaptive_camera_controls "$camera_device"
+        ;;
+      low_light)
+        apply_low_light_camera_controls "$camera_device"
+        ;;
+      off|none|disabled)
+        ;;
+      *)
+        echo "unsupported MINE_TELEOP_CAMERA_CONTROL_PROFILE: $CAMERA_CONTROL_PROFILE" >&2
+        return 1
+        ;;
+    esac
+    apply_manual_exposure_override "$camera_device"
   fi
 }
 
@@ -299,12 +362,12 @@ EOF
 
 write_live_config() {
   mkdir -p "$(dirname "$CONFIG_LIVE")" "$(dirname "$LOG_PATH")"
-  python3 - "$CONFIG_SOURCE" "$CONFIG_LIVE" "$CAPTURE_WIDTH" "$CAPTURE_HEIGHT" "$CAPTURE_FPS" "$@" <<'PY'
+  python3 - "$CONFIG_SOURCE" "$CONFIG_LIVE" "$CAPTURE_WIDTH" "$CAPTURE_HEIGHT" "$CAPTURE_FPS" "$REALTIME_PROFILE" "$@" <<'PY'
 from pathlib import Path
 import os
 import sys
 
-source, dest, width, height, fps, *pairs = sys.argv[1:]
+source, dest, width, height, fps, realtime_profile, *pairs = sys.argv[1:]
 mvs_width = os.environ.get("MINE_TELEOP_MVS_CAPTURE_WIDTH", "1280")
 mvs_height = os.environ.get("MINE_TELEOP_MVS_CAPTURE_HEIGHT", "1024")
 mvs_fps = os.environ.get("MINE_TELEOP_MVS_CAPTURE_FPS", "15")
@@ -332,7 +395,7 @@ for pair in pairs:
             f"    capture_width: {camera_width}",
             f"    capture_height: {camera_height}",
             f"    capture_fps: {camera_fps}",
-            "    realtime_profile: realtime_720p",
+            f"    realtime_profile: {realtime_profile}",
             "    record_profile: record_source_h264",
         ]
     )
@@ -363,7 +426,8 @@ write_live_config "${camera_device_pairs[@]}"
 
 echo "Using cameras: ${camera_device_pairs[*]}"
 echo "Frame codec: $FRAME_CODEC"
-echo "Low light profile: $LOW_LIGHT"
+echo "Realtime profile: $REALTIME_PROFILE"
+echo "Camera control profile: $CAMERA_CONTROL_PROFILE"
 echo "Driver console: $DRIVER_CONSOLE_URL"
 echo "Driver console health: $HEALTH_URL"
 echo "Live config: $CONFIG_LIVE"

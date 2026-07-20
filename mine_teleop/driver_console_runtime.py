@@ -712,7 +712,7 @@ class DriverConsoleHttpApp:
                             sent_at_ms=_optional_payload_int(payload, "sent_at_ms"),
                             clock_offset_ms=_optional_signed_int(payload, "clock_offset_ms"),
                         )
-                        self._json_response(200, frame | {"snapshot": app.runtime.snapshot()})
+                        self._json_response(200, frame)
                         return
                     self._json_response(404, {"error": "not found"})
                 except Exception as exc:

@@ -430,6 +430,8 @@ PY
         cp configs/driver-console.dev.yaml /workspace/output/configs/
         cp scripts/run_vehicle_live_media.sh /workspace/output/scripts/
         chmod +x /workspace/output/scripts/run_vehicle_live_media.sh
+        cp scripts/start_live_vehicle_one_command.sh /workspace/output/scripts/
+        chmod +x /workspace/output/scripts/start_live_vehicle_one_command.sh
         cp scripts/pylon_camera_bridge.cpp /workspace/output/scripts/pylon_camera_bridge.cpp
         cp scripts/setup_vehicle_timesync.sh /workspace/output/scripts/
         chmod +x /workspace/output/scripts/setup_vehicle_timesync.sh

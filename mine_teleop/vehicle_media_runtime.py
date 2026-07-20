@@ -122,6 +122,7 @@ class _PersistentFfmpegEncoder:
         self.ffmpeg_binary = ffmpeg_binary
         self.frame_timeout_seconds = frame_timeout_seconds
         self._streams: dict[str, _PipedFfmpegStream] = {}
+        self._streams_lock = threading.Lock()
 
     def encode(self, camera: CameraConfig, *, seq: int, now_ms: int) -> EncodedFrame:
         profile = self.config.realtime_profiles[camera.realtime_profile]
@@ -144,23 +145,26 @@ class _PersistentFfmpegEncoder:
         )
 
     def close(self) -> None:
-        for stream in self._streams.values():
+        with self._streams_lock:
+            streams = list(self._streams.values())
+            self._streams.clear()
+        for stream in streams:
             stream.close()
-        self._streams.clear()
 
     def _stream_for(self, camera: CameraConfig, *, width: int, height: int, fps: int) -> _PipedFfmpegStream:
-        stream = self._streams.get(camera.camera_id)
-        if stream is not None and stream.alive():
+        with self._streams_lock:
+            stream = self._streams.get(camera.camera_id)
+            if stream is not None and stream.alive():
+                return stream
+            if stream is not None:
+                stream.close()
+            command = self._command(camera, width=width, height=height, fps=fps)
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if process.stdout is None:
+                raise RuntimeError("ffmpeg stream stdout is unavailable")
+            stream = _PipedFfmpegStream(process)
+            self._streams[camera.camera_id] = stream
             return stream
-        if stream is not None:
-            stream.close()
-        command = self._command(camera, width=width, height=height, fps=fps)
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if process.stdout is None:
-            raise RuntimeError("ffmpeg stream stdout is unavailable")
-        stream = _PipedFfmpegStream(process)
-        self._streams[camera.camera_id] = stream
-        return stream
 
     def _read_unit(self, camera_id: str, stream: _PipedFfmpegStream) -> bytes:
         if stream.process.stdout is None:
@@ -230,6 +234,8 @@ def _mvs_bridge_command(camera: CameraConfig) -> list[str]:
             str(camera.capture_fps),
             "--frames",
             "0",
+            "--jpeg-quality",
+            os.environ.get("MINE_TELEOP_MVS_JPEG_QUALITY", "80") or "80",
         ]
     )
     return command
@@ -426,9 +432,11 @@ class FfmpegH264FrameEncoder(_PersistentFfmpegEncoder):
 
 
 class DriverConsoleFrameSink:
-    """Posts encoded frames to the driver console over a reused keep-alive
-    connection (avoids a fresh TCP + slow-start handshake per frame across the
-    field SSH tunnel) and corrects cross-machine latency via a clock offset."""
+    """Posts encoded frames over per-sender keep-alive connections.
+
+    Each sender thread gets its own connection, so cameras can POST in parallel
+    without paying a fresh TCP handshake for every frame.
+    """
 
     def __init__(self, driver_console_url: str, *, clock_sync_interval_ms: int = 5000) -> None:
         self.driver_console_url = driver_console_url.rstrip("/")
@@ -440,7 +448,7 @@ class DriverConsoleFrameSink:
         self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
         self._base_path = parsed.path.rstrip("/")
         self._lock = threading.Lock()
-        self._conn: http.client.HTTPConnection | None = None
+        self._connections: dict[int, http.client.HTTPConnection] = {}
         self.clock_offset_ms = 0
         self.clock_sync_interval_ms = clock_sync_interval_ms
         self._last_clock_sync_ms: int | None = None
@@ -452,26 +460,34 @@ class DriverConsoleFrameSink:
 
     def _request(self, method: str, path: str, body: bytes | None = None) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"} if body is not None else {}
+        thread_id = threading.get_ident()
+        for attempt in range(2):
+            conn = self._connection_for_thread(thread_id)
+            try:
+                conn.request(method, f"{self._base_path}{path}", body=body, headers=headers)
+                response = conn.getresponse()
+                data = response.read()
+                if response.status < 200 or response.status >= 300:
+                    raise RuntimeError(f"{method} {path} failed with status {response.status}: {data[:256]!r}")
+                parsed = json.loads(data.decode("utf-8"))
+                if not isinstance(parsed, dict):
+                    raise RuntimeError("driver console response must be a JSON object")
+                return parsed
+            except (http.client.HTTPException, ConnectionError, OSError):
+                # Stale/broken keep-alive socket: drop only this sender's
+                # connection and retry once.
+                self._close_thread_connection(thread_id)
+                if attempt == 1:
+                    raise
+        raise RuntimeError("unreachable")
+
+    def _connection_for_thread(self, thread_id: int) -> http.client.HTTPConnection:
         with self._lock:
-            for attempt in range(2):
-                if self._conn is None:
-                    self._conn = self._new_connection()
-                try:
-                    self._conn.request(method, f"{self._base_path}{path}", body=body, headers=headers)
-                    response = self._conn.getresponse()
-                    data = response.read()
-                    if response.status < 200 or response.status >= 300:
-                        raise RuntimeError(f"{method} {path} failed with status {response.status}: {data[:256]!r}")
-                    parsed = json.loads(data.decode("utf-8"))
-                    if not isinstance(parsed, dict):
-                        raise RuntimeError("driver console response must be a JSON object")
-                    return parsed
-                except (http.client.HTTPException, ConnectionError, OSError):
-                    # Stale/broken keep-alive socket: drop it and retry once.
-                    self._close_locked()
-                    if attempt == 1:
-                        raise
-            raise RuntimeError("unreachable")
+            conn = self._connections.get(thread_id)
+            if conn is None:
+                conn = self._new_connection()
+                self._connections[thread_id] = conn
+            return conn
 
     def _maybe_sync_clock(self) -> None:
         now = _now_ms()
@@ -497,17 +513,24 @@ class DriverConsoleFrameSink:
         payload["clock_offset_ms"] = self.clock_offset_ms
         return self._request("POST", "/api/media/frame", json.dumps(payload).encode("utf-8"))
 
-    def _close_locked(self) -> None:
-        if self._conn is not None:
+    def _close_thread_connection(self, thread_id: int) -> None:
+        with self._lock:
+            conn = self._connections.pop(thread_id, None)
+        if conn is not None:
             try:
-                self._conn.close()
+                conn.close()
             except Exception:
                 pass
-            self._conn = None
 
     def close(self) -> None:
         with self._lock:
-            self._close_locked()
+            connections = list(self._connections.values())
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 class _LatestFrameMailbox:
@@ -533,6 +556,37 @@ class _LatestFrameMailbox:
             frame = self._latest
             self._latest = None
             return frame
+
+
+class _RealtimeFrameQueue:
+    """Bounded FIFO for real-time frames.
+
+    It preserves send order for fresh frames while dropping the oldest frames
+    when the network falls behind, avoiding unbounded latency growth.
+    """
+
+    def __init__(self, *, max_frames: int = 3) -> None:
+        if isinstance(max_frames, bool) or max_frames <= 0:
+            raise ValueError("max_frames must be positive")
+        self._lock = threading.Lock()
+        self._frames: collections.deque[EncodedFrame] = collections.deque()
+        self.max_frames = max_frames
+        self.published = 0
+        self.dropped = 0
+
+    def publish(self, frame: EncodedFrame) -> None:
+        with self._lock:
+            while len(self._frames) >= self.max_frames:
+                self._frames.popleft()
+                self.dropped += 1
+            self._frames.append(frame)
+            self.published += 1
+
+    def pop(self) -> EncodedFrame | None:
+        with self._lock:
+            if not self._frames:
+                return None
+            return self._frames.popleft()
 
 
 class VehicleMediaRuntime:
@@ -586,13 +640,16 @@ class VehicleMediaRuntime:
         duration_ms: int | None = None,
         frame_count: int | None = None,
         capture_interval_ms: int = 0,
+        frame_queue_depth: int | None = None,
         now_fn: Any = None,
         sleep_fn: Any = None,
     ) -> dict[str, Any]:
-        """Capture and send concurrently: a producer captures the freshest frame
-        into a single-slot mailbox while a background sender posts it, dropping
-        stale frames. Decouples capture rate from network round-trip so the
-        achieved frame rate rises to min(capture fps, network throughput)."""
+        """Capture and send concurrently per camera.
+
+        Each camera has its own capture producer and sender consumer connected
+        by a single-slot mailbox, so slow capture/encode or network work on one
+        camera does not block the other cameras. Stale frames are still dropped.
+        """
         if duration_ms is None and frame_count is None:
             raise ValueError("stream_frames requires duration_ms or frame_count")
         if duration_ms is not None and (isinstance(duration_ms, bool) or duration_ms < 0):
@@ -602,59 +659,81 @@ class VehicleMediaRuntime:
         cameras = list(self.config.enabled_cameras)
         if not cameras:
             raise RuntimeError("vehicle media runtime requires at least one enabled camera")
+        if frame_queue_depth is None:
+            frame_queue_depth = _frame_queue_depth_from_env()
+        if isinstance(frame_queue_depth, bool) or frame_queue_depth <= 0:
+            raise ValueError("frame_queue_depth must be positive")
         clock = now_fn or _now_ms
         sleeper = sleep_fn or time.sleep
-        mailboxes = {camera.camera_id: _LatestFrameMailbox() for camera in cameras}
+        mailboxes = {camera.camera_id: _RealtimeFrameQueue(max_frames=frame_queue_depth) for camera in cameras}
         sent_results: list[dict[str, Any]] = []
         sent_lock = threading.Lock()
+        capture_errors: list[dict[str, str]] = []
+        capture_errors_lock = threading.Lock()
         stop_event = threading.Event()
-
-        def sender() -> None:
-            pending = True
-            while pending:
-                pending = not stop_event.is_set()
-                delivered_any = False
-                for camera in cameras:
-                    frame = mailboxes[camera.camera_id].pop()
-                    if frame is None:
-                        continue
-                    delivered_any = True
-                    sent_at_ms = int(clock())
-                    try:
-                        response = self.frame_sink.send_frame(frame, sent_at_ms=sent_at_ms)
-                    except Exception as exc:  # keep streaming; report per-frame errors
-                        response = {"error": str(exc)}
-                    with sent_lock:
-                        sent_results.append(
-                            {"camera_id": camera.camera_id, "seq": frame.seq, "sent_at_ms": sent_at_ms, "response": response}
-                        )
-                if not delivered_any and not stop_event.is_set():
-                    sleeper(0.002)
-
-        sender_thread = threading.Thread(target=sender, daemon=True)
-        sender_thread.start()
-        seq = 0
         start_ms = int(clock())
-        try:
-            while True:
+
+        def capture(camera: CameraConfig) -> None:
+            seq = 0
+            while not stop_event.is_set():
                 if frame_count is not None and seq >= frame_count:
-                    break
+                    return
                 if duration_ms is not None and int(clock()) - start_ms >= duration_ms:
-                    break
+                    return
                 seq += 1
-                for camera in cameras:
+                try:
                     frame = self.encoder.encode(camera, seq=seq, now_ms=int(clock()))
-                    self.last_frame = frame
-                    mailboxes[camera.camera_id].publish(frame)
+                except Exception as exc:
+                    with capture_errors_lock:
+                        capture_errors.append({"camera_id": camera.camera_id, "error": str(exc)})
+                    stop_event.set()
+                    return
+                self.last_frame = frame
+                mailboxes[camera.camera_id].publish(frame)
                 if capture_interval_ms > 0:
                     sleeper(capture_interval_ms / 1000.0)
+
+        def sender(camera: CameraConfig) -> None:
+            mailbox = mailboxes[camera.camera_id]
+            while True:
+                frame = mailbox.pop()
+                if frame is None:
+                    if stop_event.is_set():
+                        return
+                    sleeper(0.002)
+                    continue
+                sent_at_ms = int(clock())
+                try:
+                    response = self.frame_sink.send_frame(frame, sent_at_ms=sent_at_ms)
+                except Exception as exc:  # keep streaming; report per-frame errors
+                    response = {"error": str(exc)}
+                with sent_lock:
+                    sent_results.append(
+                        {"camera_id": camera.camera_id, "seq": frame.seq, "sent_at_ms": sent_at_ms, "response": response}
+                    )
+
+        sender_threads = [threading.Thread(target=sender, args=(camera,), daemon=True) for camera in cameras]
+        capture_threads = [threading.Thread(target=capture, args=(camera,), daemon=True) for camera in cameras]
+        for thread in sender_threads:
+            thread.start()
+        for thread in capture_threads:
+            thread.start()
+        try:
+            for thread in capture_threads:
+                thread.join()
         finally:
             stop_event.set()
-            sender_thread.join(timeout=15)
-        captured = seq * len(cameras)
+            for thread in sender_threads:
+                thread.join(timeout=15)
+        captured = sum(box.published for box in mailboxes.values())
         dropped = sum(box.dropped for box in mailboxes.values())
         summary = self._summary("vehicle_media_stream_summary", cameras, sent_results, dropped=dropped)
         summary["captured_frames"] = captured
+        summary["capture_errors"] = len(capture_errors)
+        summary["frame_queue_depth"] = frame_queue_depth
+        if capture_errors:
+            summary["capture_error_details"] = capture_errors
+            summary["passed"] = False
         elapsed_ms = max(1, int(clock()) - start_ms)
         summary["duration_ms"] = elapsed_ms
         summary["achieved_fps"] = round(len(sent_results) * 1000.0 / elapsed_ms, 2)
@@ -743,6 +822,17 @@ def _average(values: list[int]) -> float:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _frame_queue_depth_from_env() -> int:
+    raw = os.environ.get("MINE_TELEOP_FRAME_QUEUE_DEPTH", "3")
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError("MINE_TELEOP_FRAME_QUEUE_DEPTH must be an integer") from None
+    if value <= 0:
+        raise ValueError("MINE_TELEOP_FRAME_QUEUE_DEPTH must be positive")
+    return value
 
 
 def _iso_ms(value_ms: int) -> str:
