@@ -140,21 +140,16 @@ class DriverConsoleRuntime {
 
   [[nodiscard]] Json connect();
   [[nodiscard]] Json poll_signaling();
+  [[nodiscard]] Json send_media_capabilities(const Json& input);
+  [[nodiscard]] Json send_media_fallback(const Json& input);
+  [[nodiscard]] Json send_webrtc_answer(const Json& input);
+  [[nodiscard]] Json send_webrtc_ice_candidate(const Json& input);
+  [[nodiscard]] Json ingest_webrtc_metrics(const Json& input);
   [[nodiscard]] Json send_control(const Json& input);
   [[nodiscard]] Json status() const;
-  [[nodiscard]] Json ingest_frame(const Json& payload);
-  [[nodiscard]] std::optional<std::pair<std::string, std::string>> frame(std::string_view camera_id) const;
 
  private:
-  struct FrameRecord {
-    std::string codec;
-    std::string content_type;
-    std::string bytes;
-    int width{0};
-    int height{0};
-    std::int64_t captured_at_ms{0};
-    std::uint64_t frame_count{0};
-  };
+  [[nodiscard]] Json send_signaling_message(std::string_view type, const Json& payload);
 
   DriverConfig config_;
   std::string vehicle_id_;
@@ -168,8 +163,8 @@ class DriverConsoleRuntime {
   std::uint64_t sequence_{0};
   std::int64_t connected_at_ms_{0};
   std::int64_t last_control_sent_ms_{0};
-  std::unordered_map<std::string, FrameRecord> frames_;
   Json signaling_messages_{Json::array()};
+  Json webrtc_metrics_{Json::object()};
 };
 
 class DriverConsoleHttpApp {
@@ -182,7 +177,5 @@ class DriverConsoleHttpApp {
 };
 
 std::string random_token(std::size_t bytes = 24);
-std::string base64_encode(std::string_view value);
-std::string base64_decode(std::string_view value);
 
 }  // namespace mine_teleop

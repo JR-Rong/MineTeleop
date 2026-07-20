@@ -1,0 +1,95 @@
+vehicle:
+  id: vehicle-bench-001
+  name: mine-teleop-multicamera-bench
+
+cloud:
+  signaling_url: ws://127.0.0.1:18765/signaling
+  auth_url: http://127.0.0.1:18765/auth
+
+control:
+  rate_hz: 20
+  max_command_gap_ms: 200
+  degraded_timeout_ms: 300
+  control_timeout_ms: 800
+  timeout_action:
+    deceleration_profile:
+      - after_ms: 0
+        brake: 0.3
+      - after_ms: 500
+        brake: 0.6
+      - after_ms: 1500
+        brake: vehicle_defined_max_safe
+
+media:
+  realtime_profiles:
+    realtime_720p30:
+      codec: h265
+      encoder: auto
+      width: 1280
+      height: 720
+      fps: 30
+      bitrate_kbps: 3000
+  record_profiles:
+    reuse_realtime:
+      codec: h265
+      encoder: reuse_realtime
+      width: source
+      height: source
+      fps: source
+      bitrate_kbps: 3000
+      segment_seconds: 2
+
+cameras:
+  - id: front_real
+    device: /dev/video0
+    realtime_profile: realtime_720p30
+    record_profile: reuse_realtime
+  - id: rear_synthetic
+    device: testsrc
+    realtime_profile: realtime_720p30
+    record_profile: reuse_realtime
+  - id: left_synthetic
+    device: testsrc
+    realtime_profile: realtime_720p30
+    record_profile: reuse_realtime
+  - id: right_synthetic
+    device: testsrc
+    realtime_profile: realtime_720p30
+    record_profile: reuse_realtime
+
+hardware:
+  can:
+    interface: can0
+    bitrate: 500000
+  encoding:
+    vaapi_render_device: /dev/dri/renderD128
+    dri_card_device: /dev/dri/card1
+    preferred_encoder: nvenc
+    fallback_encoder: vaapi
+    preferred_codec: h265
+    fallback_codec: h264
+    require_hardware_encoder: true
+    max_end_to_end_latency_ms: 200
+    min_realtime_fps: 20
+  network:
+    interface: lo
+
+field_safety:
+  commissioning_mode: bench
+  max_speed_kph: 0
+  require_can_feedback_before_control: false
+  require_local_estop_reset: true
+  require_time_sync: false
+
+recording:
+  root_dir: /tmp/mine-teleop-recordings
+  min_free_gb: 1
+  delete_uploaded_when_below_free_gb: 0.5
+  delete_unuploaded_when_below_free_gb: false
+
+upload:
+  enabled: false
+  backend: local_archive
+
+vehicle_adapter:
+  type: mock

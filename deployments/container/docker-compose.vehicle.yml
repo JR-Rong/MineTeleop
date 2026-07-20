@@ -39,12 +39,14 @@ services:
       - vehicle-media-agent
       - --config
       - /etc/mine-teleop/vehicle-agent.yaml
-      - --driver-console-url
-      - ${MINE_TELEOP_DRIVER_CONSOLE_URL:-http://host.docker.internal:8080}
+      - --signaling-http-url
+      - ${MINE_TELEOP_SIGNALING_HTTP_URL:-http://host.docker.internal:8765}
       - --service
       - --record
       - --recording-root
       - /var/lib/mine-teleop/recordings
+    environment:
+      MINE_TELEOP_DEVICE_TOKEN: ${MINE_TELEOP_DEVICE_TOKEN:-dev-device-secret}
     devices:
       - /dev/dri/renderD128:/dev/dri/renderD128
       - /dev/dri/card1:/dev/dri/card1

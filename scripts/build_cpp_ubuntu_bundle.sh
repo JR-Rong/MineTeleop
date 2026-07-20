@@ -39,15 +39,14 @@ docker buildx build \
   "$repo_root"
 
 cp -a "$temporary/artifact/." "$output_root/"
-tar -C "$output_root" -czf "$output_root/mine-teleop-ubuntu22.04-$architecture.tar.gz" \
-  --exclude "mine-teleop-ubuntu22.04-$architecture.tar.gz" .
+archive="$output_root.tar.gz"
+tar -C "$(dirname "$output_root")" -czf "$archive" "$(basename "$output_root")"
 
 if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum "$output_root/mine-teleop-ubuntu22.04-$architecture.tar.gz" \
-    > "$output_root/mine-teleop-ubuntu22.04-$architecture.tar.gz.sha256"
+  sha256sum "$archive" > "$archive.sha256"
 else
-  shasum -a 256 "$output_root/mine-teleop-ubuntu22.04-$architecture.tar.gz" \
-    > "$output_root/mine-teleop-ubuntu22.04-$architecture.tar.gz.sha256"
+  shasum -a 256 "$archive" > "$archive.sha256"
 fi
 
 printf 'BUNDLE_DIR=%s\n' "$output_root"
+printf 'BUNDLE_ARCHIVE=%s\n' "$archive"

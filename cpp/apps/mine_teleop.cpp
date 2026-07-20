@@ -3,6 +3,7 @@
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/upload.hpp"
+#include "mine_teleop/video.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -86,6 +87,7 @@ Usage:
   mine-teleop vehicle-uploader [options]
   mine-teleop signaling-server [options]
   mine-teleop driver-console [options]
+  mine-teleop media-probe
   mine-teleop http-health --url URL
   mine-teleop vehicle-online [options]
   mine-teleop control-smoke [options]
@@ -125,12 +127,15 @@ Driver console options:
 
 Vehicle media options:
   --config PATH                 vehicle YAML (default configs/vehicle-agent.dev.yaml)
-  --driver-console-url URL      frame sink (default http://127.0.0.1:8080)
+  --signaling-http-url URL      WebRTC signaling origin (defaults to config)
+  --device-token TOKEN          or set MINE_TELEOP_DEVICE_TOKEN
+  --codec h265|h264             force codec instead of browser negotiation
   --frames N                    frames per camera (default 30)
   --duration-ms N               optional duration limit
   --capture-interval-ms N       optional interval between capture rounds
-  --frame-timeout-ms N          camera/ffmpeg timeout (default 3000)
-  --record                      record H.264 MP4 segments while streaming
+  --frame-timeout-ms N          native camera timeout (default 3000)
+  --simulate-primary-failure-after-frames N  bench-only NVENC failover injection
+  --record                      reuse encoded H.264/H.265 packets for MP4 segments
   --recording-root PATH         recording destination (defaults to config)
 
 Vehicle uploader options:
@@ -332,14 +337,22 @@ int run_driver_console(const Arguments& arguments) {
 
 int run_vehicle_media_agent(const Arguments& arguments) {
   auto config = mine_teleop::load_vehicle_config(arguments.value("--config", "configs/vehicle-agent.dev.yaml"));
+  auto device_token = arguments.value("--device-token", environment("MINE_TELEOP_DEVICE_TOKEN"));
+  if (device_token.empty()) throw std::invalid_argument("--device-token or MINE_TELEOP_DEVICE_TOKEN is required");
   const auto recording_root = arguments.has("--record")
                                   ? std::filesystem::path(arguments.value("--recording-root", config.recording.root_dir.string()))
                                   : std::filesystem::path{};
+  const auto signaling_url = arguments.value("--signaling-http-url", config.cloud.signaling_url);
+  std::optional<std::string> forced_codec;
+  if (arguments.has("--codec")) forced_codec = arguments.value("--codec");
   mine_teleop::VehicleMediaRuntime runtime(
       std::move(config),
-      arguments.value("--driver-console-url", "http://127.0.0.1:8080"),
+      signaling_url,
+      std::move(device_token),
       arguments.integer("--frame-timeout-ms", 3000),
-      recording_root);
+      recording_root,
+      std::move(forced_codec),
+      arguments.integer("--simulate-primary-failure-after-frames", 0));
   const auto summary = runtime.run(
       arguments.has("--service") ? 0 : arguments.integer("--frames", 30),
       arguments.has("--service") ? 0 : arguments.integer("--duration-ms", -1),
@@ -407,21 +420,21 @@ int run_control_smoke(const Arguments& arguments) {
       signaling + "/vehicles/" + http.url_encode(vehicle_id) + "/session?device_token=" + http.url_encode(device_token));
   const auto messages = http.get_json(
       signaling + "/signaling/" + http.url_encode(session.at("session_id").get<std::string>()) +
-      "/messages?recipient=" + http.url_encode(vehicle_id) + "&device_token=" + http.url_encode(device_token));
-  auto vehicle_config = mine_teleop::load_vehicle_config(arguments.value("--config", "configs/vehicle-agent.dev.yaml"));
-  mine_teleop::VehicleMediaRuntime media(std::move(vehicle_config), console, 5000);
-  const auto media_summary = media.run(1);
+      "/messages?recipient=" + http.url_encode(vehicle_id) + "&device_token=" + http.url_encode(device_token) +
+      "&types=control_command");
+  const auto capabilities = http.post_json_response(
+      console + "/api/webrtc/capabilities", {{"codecs", {"h264", "h265"}}});
   const auto console_status = http.get_json(console + "/api/status");
   const bool passed = online.value("state", "") == "online" && connection.value("connected", false) &&
                       control.value("queued", 0) == 1 && messages.at("messages").size() == 1 &&
-                      media_summary.value("passed", false) && console_status.at("cameras").contains("front");
+                      capabilities.value("queued", 0) == 1 && console_status.value("connected", false);
   std::cout << Json({
                    {"event", "native_control_plane_smoke"},
                    {"runtime", "cpp"},
                    {"passed", passed},
                    {"session_id", session.value("session_id", "")},
                    {"control_messages", messages.at("messages").size()},
-                   {"media", media_summary},
+                   {"media_capabilities", capabilities},
                }).dump()
             << '\n';
   return passed ? 0 : 2;
@@ -458,6 +471,10 @@ int main(int argc, char** argv) {
     if (command == "control-smoke") return run_control_smoke(arguments);
     if (command == "signaling-server") return run_signaling_server(arguments);
     if (command == "driver-console") return run_driver_console(arguments);
+    if (command == "media-probe") {
+      std::cout << mine_teleop::probe_video_encoders().dump() << '\n';
+      return 0;
+    }
     throw std::invalid_argument("unknown command: " + command);
   } catch (const std::exception& error) {
     std::cerr << Json({

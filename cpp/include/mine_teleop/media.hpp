@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,7 +26,6 @@ struct EncodedFrame {
   int fps{0};
   int bitrate_kbps{0};
 
-  [[nodiscard]] Json post_payload(std::int64_t sent_at_ms) const;
 };
 
 class CameraFrameSource {
@@ -74,18 +74,22 @@ class VehicleMediaRuntime {
  public:
   VehicleMediaRuntime(
       VehicleConfig config,
-      std::string driver_console_url,
+      std::string signaling_url,
+      std::string device_token,
       int frame_timeout_ms = 3000,
-      std::filesystem::path recording_root = {});
+      std::filesystem::path recording_root = {},
+      std::optional<std::string> forced_codec = std::nullopt,
+      int simulate_primary_failure_after_frames = 0);
+  ~VehicleMediaRuntime();
+
+  VehicleMediaRuntime(const VehicleMediaRuntime&) = delete;
+  VehicleMediaRuntime& operator=(const VehicleMediaRuntime&) = delete;
 
   [[nodiscard]] Json run(int frame_count, int duration_ms = -1, int capture_interval_ms = 0);
 
  private:
-  VehicleConfig config_;
-  std::string driver_console_url_;
-  int frame_timeout_ms_;
-  std::filesystem::path recording_root_;
-  HttpClient http_{std::chrono::seconds(10)};
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace mine_teleop

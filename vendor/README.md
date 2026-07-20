@@ -20,6 +20,10 @@ vendor/
     bin/pylon-config
     include/pylon/...
     lib/pylon-redistributable-libraries
+  nvidia/
+    lib/libcuda.so.1
+    lib/libnvidia-encode.so.1
+    lib/libnvcuvid.so.1
 ```
 
 `deployments/cpp/Dockerfile.build` builds the matching camera C++ bridge whenever
@@ -31,3 +35,10 @@ bundle.
 The repository does not redistribute proprietary SDK binaries. Supply only the
 redistributable files allowed by the Hikrobot/Basler license. V4L2 and test
 sources work without either SDK.
+
+NVENC field bundles also need the NVIDIA userspace libraries matching the
+target kernel driver under `vendor/nvidia/lib`. The build copies them into the
+strict package's `lib/` directory so GStreamer's runtime `dlopen` calls do not
+fall through to libraries installed on the target host. The NVIDIA kernel
+driver and device nodes remain an unavoidable host boundary; verify NVIDIA's
+redistribution terms before publishing those binaries.

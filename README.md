@@ -11,8 +11,12 @@ entry points do not require Python.
 - `cpp/src/http.cpp`: bundled-cURL client and vehicle signaling loop.
 - `cpp/src/server.cpp`: native HTTP server, authenticated signaling service,
   and browser driver console.
-- `cpp/src/media.cpp`: direct V4L2 mmap capture, vendor-SDK camera capture,
-  native JPEG test frames, and MP4 recording.
+- `cpp/src/media.cpp`: direct V4L2 mmap capture, vendor-SDK camera capture, and
+  native JPEG test frames.
+- `cpp/src/video.cpp`: unified hardware `VideoEncoder` selection with NVIDIA
+  NVENC first and Intel VAAPI second.
+- `cpp/src/webrtc_media.cpp`: multi-camera WebRTC/SRTP publishing and
+  encoded-packet MP4 segmentation.
 - `cpp/src/upload.cpp`: atomic sidecar scanning, SHA-256 verification,
   bandwidth limiting, and resumable local archive upload.
 - `cpp/bridges/mvs_camera_bridge.cpp`: optional Hikrobot MVS bridge.
@@ -49,11 +53,13 @@ Build the Ubuntu 22.04 x86_64/amd64 bundle from any Docker-capable host:
 scripts/build_cpp_ubuntu_bundle.sh linux/amd64
 ```
 
-The resulting `dist/cpp-ubuntu22.04-*` directory contains the executable,
-FFmpeg/ffprobe for H.264 recording and MP4 muxing, V4L2/VAAPI tools, CA
-certificates, and all non-glibc shared
-libraries. The only host ABI baseline is Ubuntu 22.04 glibc/kernel. The launcher
-sets bundle-relative `PATH`, `LD_LIBRARY_PATH`, and `SSL_CERT_FILE`.
+The exported artifact directory contains only x86-64 ELF executables and shared
+libraries under `bin/` and `lib/`. It carries GStreamer WebRTC/RTP/MP4 plugins,
+Intel's VAAPI userspace driver, and the Ubuntu 22.04 dynamic loader/glibc. It
+does not carry FFmpeg, Python, configuration, certificates, or shell launchers.
+Configuration and credentials are mounted outside the package. NVIDIA's kernel
+driver remains a hardware/OS prerequisite; the matching redistributable NVIDIA
+userspace libraries must be copied into `lib/` for a field package.
 
 For the chassis integration or licensed Hikrobot/Basler cameras, place
 redistributable files under `vendor/chassis`, `vendor/mvs`, or `vendor/pylon`
@@ -64,26 +70,40 @@ installation or a source checkout.
 ## Commands
 
 ```bash
-./mine-teleop version
-./mine-teleop config-check --config /etc/mine-teleop/vehicle-agent.yaml
+package_root=/opt/mine-teleop
+export LD_LIBRARY_PATH="$package_root/lib:$package_root/lib/vendor/chassis:$package_root/lib/vendor/mvs:$package_root/lib/vendor/pylon"
+export GST_PLUGIN_SYSTEM_PATH_1_0=
+export GST_PLUGIN_PATH_1_0="$package_root/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER="$package_root/bin/gst-plugin-scanner"
+export GST_REGISTRY=/var/tmp/mine-teleop-gstreamer-registry.bin
+export LIBVA_DRIVERS_PATH="$package_root/lib/dri"
+mt() {
+  "$package_root/lib/ld-linux-x86-64.so.2" --library-path "$LD_LIBRARY_PATH" \
+    "$package_root/bin/mine-teleop" "$@"
+}
 
-./mine-teleop signaling-server --host 0.0.0.0 --port 8765
-./mine-teleop driver-console --host 0.0.0.0 --port 8080
+mt version
+mt config-check --config /etc/mine-teleop/vehicle-agent.yaml
 
-./mine-teleop vehicle-agent \
+mt signaling-server --host 0.0.0.0 --port 8765
+mt driver-console --host 0.0.0.0 --port 8080
+
+mt vehicle-agent \
   --config /etc/mine-teleop/vehicle-agent.yaml \
   --preflight
 
-./mine-teleop vehicle-agent \
+mt vehicle-agent \
   --config /etc/mine-teleop/vehicle-agent.yaml \
   --teleop --service
 
-./mine-teleop vehicle-media-agent \
+mt vehicle-media-agent \
   --config /etc/mine-teleop/vehicle-agent.yaml \
-  --driver-console-url http://control-host:8080 \
+  --signaling-http-url http://control-host:8765 \
+  --device-token "$MINE_TELEOP_DEVICE_TOKEN" \
+  --record --recording-root /var/lib/mine-teleop/recordings \
   --service
 
-./mine-teleop vehicle-uploader \
+mt vehicle-uploader \
   --config /etc/mine-teleop/vehicle-agent.yaml \
   --recording-root /var/lib/mine-teleop/recordings \
   --archive-root /var/lib/mine-teleop/uploader/archive \
@@ -103,20 +123,24 @@ scripts/run_control_plane_docker.sh
 ```
 
 The smoke creates native signaling and console containers, grants one vehicle
-session, sends a control command, pulls it as the vehicle, generates a real JPEG
-in C++, posts it to the console, and checks the retained frame status.
+session, verifies control-message isolation, and exchanges browser media codec
+capabilities without using the removed per-frame upload path.
 
 ## Operational boundaries
 
 - V4L2 acquisition uses native C++ `ioctl`/mmap/poll and accepts camera-native
   MJPEG; it does not launch FFmpeg. The test source is generated and JPEG
   encoded in-process.
-- FFmpeg is reserved for H.264 recording and MP4 muxing. It is carried in the
-  bundle and is not expected to exist on the target host.
+- Browser playback uses native WebRTC continuous video. H.265 is selected only
+  when the browser advertises it. If browser stats report any H.265 track below
+  20 fps for three consecutive samples, the vehicle skips the remaining H.265
+  backend and renegotiates H.264, preferring NVENC before VAAPI.
+- Realtime encoding defaults to NVENC and falls back to Intel VAAPI. Recording
+  tees the already encoded H.264/H.265 access units into `splitmuxsink/mp4mux`;
+  no second encoder process is launched.
 - MVS and pylon are compiled only when their redistributable SDK bundle is
   supplied; selecting one without its bridge fails explicitly.
 - `mock` is for bench validation only. Field configurations should use the
   dynamic chassis bridge and require CAN feedback.
-- The bundle does not carry the Ubuntu kernel, device drivers, or glibc. Those
-  are the declared Ubuntu 22.04 host baseline; every application-level library
-  is carried by the bundle.
+- The strict test artifact carries its userspace dynamic loader and libraries,
+  but not the Ubuntu kernel or kernel-mode GPU/camera drivers.

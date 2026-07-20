@@ -1,6 +1,8 @@
 # Ubuntu Bundle 使用说明
 
-> 迁移说明：旧打包方式已停用；当前使用 `scripts/build_cpp_ubuntu_bundle.sh` 生成 Ubuntu 22.04 自包含 C++ bundle。
+> 历史归档：下文旧 PyInstaller/FFmpeg 命令已经停用，不适用于当前交付。当前使用
+> `scripts/build_cpp_ubuntu_bundle.sh` 生成 Ubuntu 22.04 自包含 C++ bundle，运行方式
+> 以根目录 `README.md` 为准。
 
 本文给出从构建机打包到工控机现场 smoke 的命令流程。工控机不需要 Docker。
 

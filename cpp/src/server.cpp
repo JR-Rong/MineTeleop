@@ -3,7 +3,6 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -225,22 +224,33 @@ HttpRequest parse_request(int socket, std::size_t max_body_bytes) {
 std::string console_html() {
   return R"HTML(<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Mine Teleop C++ Console</title><style>
-body{background:#111827;color:#e5e7eb;font-family:system-ui;margin:0;padding:24px}button{font-size:18px;margin:4px;padding:12px 18px}
-.danger{background:#dc2626;color:#fff}.panel{max-width:960px;margin:auto}.camera{width:100%;background:#000;min-height:240px;object-fit:contain}
-pre{background:#030712;padding:12px;overflow:auto}.keys{color:#9ca3af}</style></head><body><main class="panel">
-<h1>Mine Teleop 原生 C++ 控制台</h1><p class="keys">方向键控制，空格制动，E 急停；松键自动回中/归零。</p>
-<button id="connect">连接</button><button id="estop" class="danger">急停</button><img id="camera" class="camera" alt="camera">
-<pre id="status">未连接</pre></main><script>
+<title>Mine Teleop WebRTC Console</title><style>
+body{background:#0b1220;color:#e5e7eb;font-family:system-ui;margin:0;padding:20px}button{font-size:17px;margin:4px;padding:10px 16px}
+.danger{background:#dc2626;color:#fff}.panel{max-width:1400px;margin:auto}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.camera{background:#000;min-height:240px;border-radius:8px;overflow:hidden;position:relative}.camera video{width:100%;height:100%;min-height:240px;object-fit:contain}
+.label{position:absolute;left:8px;top:8px;background:#000a;padding:4px 8px;border-radius:4px;z-index:2}pre{background:#030712;padding:12px;overflow:auto}.keys{color:#9ca3af}
+@media(max-width:800px){.grid{grid-template-columns:1fr}}</style></head><body><main class="panel">
+<h1>Mine Teleop WebRTC 控制台</h1><p class="keys">H.265 优先、H.264 回退；方向键控制，空格制动，E 急停。</p>
+<button id="connect">连接</button><button id="estop" class="danger">急停</button><strong id="webrtc">未连接</strong>
+<section id="cameras" class="grid"></section><pre id="status">等待连接</pre></main><script>
 const state={left:false,right:false,up:false,down:false,brake:false};
+const webrtcLabel=document.getElementById('webrtc'),cameraGrid=document.getElementById('cameras'),statusPanel=document.getElementById('status');
+let peer=null,pendingIce=[],remoteCameraIds=[],polling=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false;const previousStats=new Map(),cameraByMid=new Map();
 async function post(path,body={}){const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
 async function send(extra={}){return post('/api/control/keyboard',{...state,...extra})}
-document.querySelector('#connect').onclick=()=>post('/api/connect').catch(alert);
+function advertisedCodecs(){const caps=RTCRtpReceiver.getCapabilities&&RTCRtpReceiver.getCapabilities('video');const found=new Set(['h264']);for(const c of (caps&&caps.codecs)||[]){const m=(c.mimeType||'').toLowerCase();if(m.includes('h265')||m.includes('hevc'))found.add('h265');if(m.includes('h264')||m.includes('avc'))found.add('h264')}return [...found]}
+async function connect(){if(polling)return;await post('/api/connect');await post('/api/webrtc/capabilities',{codecs:advertisedCodecs()});polling=true;pollSignaling()}
+document.querySelector('#connect').onclick=()=>connect().catch(alert);
 document.querySelector('#estop').onclick=()=>send({estop:true}).catch(alert);
 const keys={ArrowLeft:'left',ArrowRight:'right',ArrowUp:'up',ArrowDown:'down',' ':'brake'};
 addEventListener('keydown',e=>{if(e.key==='e'||e.key==='E'){send({estop:true});return}if(keys[e.key]&&!state[keys[e.key]]){state[keys[e.key]]=true;send();e.preventDefault()}});
 addEventListener('keyup',e=>{if(keys[e.key]){state[keys[e.key]]=false;send();e.preventDefault()}});
-setInterval(async()=>{try{const s=await(await fetch('/api/status')).json();status.textContent=JSON.stringify(s,null,2);const cams=Object.keys(s.cameras||{});if(cams.length)camera.src='/api/frame/'+encodeURIComponent(cams[0])+'?t='+Date.now()}catch{}},500);
+async function pollSignaling(){while(polling){try{const data=await post('/api/poll-signaling');for(const message of data.messages||[]){if(message.type==='webrtc_offer')await startFromOffer(message.payload||{});if(message.type==='ice_candidate')await addIce(message.payload||{});if(message.type==='media_status')mediaStatus=message.payload||{lanes:[]}}}catch(e){webrtcLabel.textContent='信令错误: '+e.message}await new Promise(r=>setTimeout(r,100))}}
+async function addIce(candidate){if(!candidate.candidate)return;if(!peer||!peer.remoteDescription){pendingIce.push(candidate);return}await peer.addIceCandidate(candidate)}
+function attach(cameraId,stream){let box=document.getElementById('camera-'+cameraId);if(!box){box=document.createElement('article');box.id='camera-'+cameraId;box.className='camera';box.innerHTML='<span class="label"></span><video autoplay playsinline muted></video>';box.querySelector('.label').textContent=cameraId;cameraGrid.appendChild(box)}box.querySelector('video').srcObject=stream}
+async function startFromOffer(offer){if(peer)peer.close();pendingIce=[];cameraByMid.clear();previousStats.clear();h265FailureSamples=0;h265FallbackSent=false;remoteCameraIds=(offer.media_tracks||[]).map(t=>t.camera_id);peer=new RTCPeerConnection({bundlePolicy:'max-bundle'});webrtcLabel.textContent=`协商 ${offer.codec||''}/${offer.backend||''}`;peer.onconnectionstatechange=()=>webrtcLabel.textContent=peer.connectionState;peer.onicecandidate=e=>{if(e.candidate)post('/api/webrtc/ice-candidate',{candidate:e.candidate.toJSON()}).catch(console.error)};peer.ontrack=e=>{const id=remoteCameraIds.shift()||e.transceiver.mid||e.track.id;cameraByMid.set(e.transceiver.mid||'',id);attach(id,e.streams[0]||new MediaStream([e.track]))};await peer.setRemoteDescription({type:'offer',sdp:offer.sdp});while(pendingIce.length)await addIce(pendingIce.shift());const answer=await peer.createAnswer();await peer.setLocalDescription(answer);await post('/api/webrtc/answer',{type:'answer',sdp:peer.localDescription.sdp})}
+async function collectMetrics(){if(!peer)return;const report=await peer.getStats();let rtt=0;for(const s of report.values())if(s.type==='candidate-pair'&&s.state==='succeeded'&&s.nominated)rtt=Number(s.currentRoundTripTime||0);const streams=[];for(const s of report.values()){if(s.type!=='inbound-rtp'||(s.kind||s.mediaType)!=='video')continue;const prior=previousStats.get(s.id);let fps=Number(s.framesPerSecond||0);if(!fps&&prior){const seconds=(s.timestamp-prior.timestamp)/1000;if(seconds>0)fps=(Number(s.framesDecoded||0)-prior.framesDecoded)/seconds}previousStats.set(s.id,{timestamp:s.timestamp,framesDecoded:Number(s.framesDecoded||0)});const jitterMs=Number(s.jitterBufferEmittedCount||0)>0?Number(s.jitterBufferDelay||0)*1000/Number(s.jitterBufferEmittedCount):0;const processingMs=Number(s.framesDecoded||0)>0?Number(s.totalProcessingDelay||0)*1000/Number(s.framesDecoded):0;const cameraId=cameraByMid.get(s.mid||'')||'';const lane=(mediaStatus.lanes||[]).find(l=>l.camera_id===cameraId)||{};const captureEncodeMs=Number(lane.capture_to_encoded_ms||0);const latencyMs=captureEncodeMs+rtt*500+jitterMs+processingMs;streams.push({camera_id:cameraId,mid:s.mid||'',codec_id:s.codecId||'',fps,frames_decoded:Number(s.framesDecoded||0),frames_dropped:Number(s.framesDropped||0),packets_lost:Number(s.packetsLost||0),jitter_ms:Number(s.jitter||0)*1000,capture_to_encoded_ms:captureEncodeMs,jitter_buffer_ms:jitterMs,processing_ms:processingMs,round_trip_ms:rtt*1000,estimated_end_to_end_latency_ms:latencyMs,passed:fps>=20&&latencyMs<=200})}const metrics={sampled_at_ms:Date.now(),connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',latency_method:'capture-to-encoded + rtt/2 + jitter-buffer + browser-processing',streams,passed:streams.length>0&&streams.every(s=>s.passed)};await post('/api/webrtc/metrics',metrics);if(metrics.codec==='h265'&&metrics.connection_state==='connected'&&streams.length){h265FailureSamples=streams.some(s=>s.fps<20)?h265FailureSamples+1:0;if(h265FailureSamples>=3&&!h265FallbackSent){h265FallbackSent=true;await post('/api/webrtc/fallback',{codec:'h264',reason:'h265_decode_fps_below_20'})}}else h265FailureSamples=0;statusPanel.textContent=JSON.stringify(metrics,null,2)}
+setInterval(()=>collectMetrics().catch(console.error),1000);
 </script></body></html>)HTML";
 }
 
@@ -398,34 +408,6 @@ std::string random_token(std::size_t bytes) {
   return output.str();
 }
 
-std::string base64_encode(std::string_view value) {
-  if (value.empty()) return {};
-  std::string result(4 * ((value.size() + 2) / 3), '\0');
-  const auto written = EVP_EncodeBlock(
-      reinterpret_cast<unsigned char*>(result.data()),
-      reinterpret_cast<const unsigned char*>(value.data()),
-      static_cast<int>(value.size()));
-  if (written < 0) throw std::runtime_error("base64 encoding failed");
-  result.resize(static_cast<std::size_t>(written));
-  return result;
-}
-
-std::string base64_decode(std::string_view value) {
-  if (value.empty()) return {};
-  if (value.size() % 4 != 0) throw std::invalid_argument("invalid base64 frame data");
-  std::string result(3 * (value.size() / 4), '\0');
-  const auto written = EVP_DecodeBlock(
-      reinterpret_cast<unsigned char*>(result.data()),
-      reinterpret_cast<const unsigned char*>(value.data()),
-      static_cast<int>(value.size()));
-  if (written < 0) throw std::invalid_argument("invalid base64 frame data");
-  std::size_t padding = 0;
-  if (!value.empty() && value.back() == '=') ++padding;
-  if (value.size() > 1 && value[value.size() - 2] == '=') ++padding;
-  result.resize(static_cast<std::size_t>(written) - padding);
-  return result;
-}
-
 Json SignalingService::Session::to_json() const {
   return {{"session_id", session_id}, {"vehicle_id", vehicle_id}, {"driver_id", driver_id}, {"state", state}, {"control_token", control_token}};
 }
@@ -533,8 +515,34 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
     Json values = Json::array();
     auto found = messages_.find(message_key(parts[1], recipient));
     if (found != messages_.end()) {
-      for (const auto& message : found->second) values.push_back(message.to_json());
-      messages_.erase(found);
+      const auto requested = query_value(request, "types");
+      if (requested.empty()) {
+        for (const auto& message : found->second) values.push_back(message.to_json());
+        messages_.erase(found);
+      } else {
+        std::vector<std::string> types;
+        std::size_t start = 0;
+        while (start <= requested.size()) {
+          const auto end = requested.find(',', start);
+          const auto value = trim(requested.substr(start, end == std::string::npos ? requested.size() - start : end - start));
+          if (!value.empty()) types.push_back(value);
+          if (end == std::string::npos) break;
+          start = end + 1;
+        }
+        std::vector<Message> remaining;
+        for (const auto& message : found->second) {
+          if (std::find(types.begin(), types.end(), message.type) != types.end()) {
+            values.push_back(message.to_json());
+          } else {
+            remaining.push_back(message);
+          }
+        }
+        if (remaining.empty()) {
+          messages_.erase(found);
+        } else {
+          found->second = std::move(remaining);
+        }
+      }
     }
     return ServerResponse::json(200, {{"messages", std::move(values)}});
   }
@@ -638,11 +646,21 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
     const auto recipient = required_string(value, "recipient");
     const auto type = required_string(value, "type");
     static const std::vector<std::string> allowed{
-        "offer", "answer", "ice_candidate", "control_command", "telemetry", "media_status", "session_event"};
+        "webrtc_offer", "webrtc_answer", "ice_candidate", "media_capabilities", "media_fallback",
+        "control_command", "telemetry", "media_status", "session_event"};
     if (std::find(allowed.begin(), allowed.end(), type) == allowed.end()) throw std::invalid_argument("unsupported signaling message type");
     const auto& session = require_participant(parts[1], sender);
     validate_actor_credential(session, sender, value);
     if (recipient != session.driver_id && recipient != session.vehicle_id) throw Unauthorized("recipient is not current session participant");
+    const bool driver_to_vehicle = sender == session.driver_id && recipient == session.vehicle_id;
+    const bool vehicle_to_driver = sender == session.vehicle_id && recipient == session.driver_id;
+    if ((type == "media_capabilities" || type == "media_fallback" || type == "webrtc_answer") && !driver_to_vehicle) {
+      throw Unauthorized(type + " route is invalid");
+    }
+    if (type == "webrtc_offer" && !vehicle_to_driver) throw Unauthorized("webrtc_offer route is invalid");
+    if (type == "ice_candidate" && !driver_to_vehicle && !vehicle_to_driver) {
+      throw Unauthorized("ice_candidate route is invalid");
+    }
     const auto payload = value.value("payload", Json::object());
     if (!payload.is_object()) throw std::invalid_argument("payload must be an object");
     if (type == "control_command") {
@@ -685,6 +703,19 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
 }
 
 Json DriverConsoleRuntime::connect() {
+  {
+    std::lock_guard lock(mutex_);
+    if (!session_id_.empty()) {
+      return {
+          {"runtime", "cpp"},
+          {"driver_id", config_.driver_id},
+          {"vehicle_id", vehicle_id_},
+          {"connected", true},
+          {"session_id", session_id_},
+          {"connected_at_ms", connected_at_ms_},
+      };
+    }
+  }
   const auto login = http_.post_json_response(
       signaling_http_url_ + "/auth/driver_login", {{"driver_id", config_.driver_id}, {"password", password_}});
   const auto token = required_string(login, "token");
@@ -717,10 +748,75 @@ Json DriverConsoleRuntime::poll_signaling() {
   if (token.empty() || session.empty()) throw std::runtime_error("driver console is not connected");
   const auto response = http_.get_json(
       signaling_http_url_ + "/signaling/" + http_.url_encode(session) + "/messages?recipient=" +
-      http_.url_encode(config_.driver_id) + "&token=" + http_.url_encode(token));
+      http_.url_encode(config_.driver_id) + "&token=" + http_.url_encode(token) +
+      "&types=webrtc_offer,ice_candidate,media_status");
   std::lock_guard lock(mutex_);
   signaling_messages_ = response.value("messages", Json::array());
   return {{"session_id", session_id_}, {"messages", signaling_messages_}};
+}
+
+Json DriverConsoleRuntime::send_signaling_message(std::string_view type, const Json& payload) {
+  std::string token;
+  std::string session;
+  {
+    std::lock_guard lock(mutex_);
+    if (session_id_.empty() || driver_token_.empty()) throw std::runtime_error("driver console is not connected");
+    token = driver_token_;
+    session = session_id_;
+  }
+  const auto response = http_.post_json_response(
+      signaling_http_url_ + "/signaling/" + http_.url_encode(session) + "/messages",
+      {{"sender", config_.driver_id},
+       {"recipient", vehicle_id_},
+       {"token", token},
+       {"type", type},
+       {"payload", payload}});
+  return {{"queued", response.value("queued", 0)}, {"type", type}, {"session_id", session}};
+}
+
+Json DriverConsoleRuntime::send_media_capabilities(const Json& input) {
+  if (!input.is_object() || !input.contains("codecs") || !input.at("codecs").is_array()) {
+    throw std::invalid_argument("media capabilities must contain a codecs array");
+  }
+  Json codecs = Json::array();
+  for (const auto& value : input.at("codecs")) {
+    if (!value.is_string()) throw std::invalid_argument("media codec capability must be a string");
+    auto codec = lower(value.get<std::string>());
+    if (codec == "h265" || codec == "hevc" || codec == "h264" || codec == "avc") codecs.push_back(codec);
+  }
+  if (codecs.empty()) codecs.push_back("h264");
+  return send_signaling_message("media_capabilities", {{"codecs", std::move(codecs)}});
+}
+
+Json DriverConsoleRuntime::send_media_fallback(const Json& input) {
+  if (!input.is_object() || lower(input.value("codec", "")) != "h264") {
+    throw std::invalid_argument("media fallback must request H.264");
+  }
+  return send_signaling_message(
+      "media_fallback", {{"codec", "h264"}, {"reason", input.value("reason", "browser_decode_failure")}});
+}
+
+Json DriverConsoleRuntime::send_webrtc_answer(const Json& input) {
+  if (!input.is_object() || input.value("type", "") != "answer" || input.value("sdp", "").empty()) {
+    throw std::invalid_argument("WebRTC answer must contain type=answer and SDP");
+  }
+  return send_signaling_message("webrtc_answer", {{"type", "answer"}, {"sdp", input.at("sdp")}});
+}
+
+Json DriverConsoleRuntime::send_webrtc_ice_candidate(const Json& input) {
+  const auto candidate = input.contains("candidate") && input.at("candidate").is_object() ? input.at("candidate") : input;
+  if (!candidate.is_object() || candidate.value("candidate", "").empty()) {
+    throw std::invalid_argument("WebRTC ICE candidate is required");
+  }
+  return send_signaling_message("ice_candidate", candidate);
+}
+
+Json DriverConsoleRuntime::ingest_webrtc_metrics(const Json& input) {
+  if (!input.is_object()) throw std::invalid_argument("WebRTC metrics must be an object");
+  std::lock_guard lock(mutex_);
+  webrtc_metrics_ = input;
+  webrtc_metrics_["received_at_ms"] = now_ms();
+  return {{"accepted", true}, {"received_at_ms", webrtc_metrics_.at("received_at_ms")}};
 }
 
 Json DriverConsoleRuntime::send_control(const Json& input) {
@@ -764,11 +860,6 @@ Json DriverConsoleRuntime::send_control(const Json& input) {
 
 Json DriverConsoleRuntime::status() const {
   std::lock_guard lock(mutex_);
-  Json cameras = Json::object();
-  for (const auto& [id, frame] : frames_) {
-    cameras[id] = {{"codec", frame.codec}, {"width", frame.width}, {"height", frame.height},
-                   {"captured_at_ms", frame.captured_at_ms}, {"frame_count", frame.frame_count}, {"bytes", frame.bytes.size()}};
-  }
   return {
       {"runtime", "cpp"},
       {"driver_id", config_.driver_id},
@@ -778,39 +869,9 @@ Json DriverConsoleRuntime::status() const {
       {"sequence", sequence_},
       {"connected_at_ms", connected_at_ms_},
       {"last_control_sent_ms", last_control_sent_ms_},
-      {"cameras", std::move(cameras)},
+      {"webrtc_metrics", webrtc_metrics_},
       {"last_signaling_messages", signaling_messages_},
   };
-}
-
-Json DriverConsoleRuntime::ingest_frame(const Json& payload) {
-  const auto camera_id = required_string(payload, "camera_id");
-  const auto codec = required_string(payload, "codec");
-  const auto encoded = payload.contains("payload_base64")
-                           ? required_string(payload, "payload_base64")
-                           : required_string(payload, "data_base64");
-  if (codec != "mjpeg" && codec != "jpeg") throw std::invalid_argument("native browser frame endpoint currently accepts MJPEG/JPEG frames");
-  auto decoded = base64_decode(encoded);
-  if (decoded.size() < 4 || static_cast<unsigned char>(decoded[0]) != 0xFF || static_cast<unsigned char>(decoded[1]) != 0xD8) {
-    throw std::invalid_argument("media frame is not a JPEG image");
-  }
-  std::lock_guard lock(mutex_);
-  auto& frame = frames_[camera_id];
-  frame.codec = codec;
-  frame.content_type = "image/jpeg";
-  frame.bytes = std::move(decoded);
-  frame.width = payload.value("width", 0);
-  frame.height = payload.value("height", 0);
-  frame.captured_at_ms = payload.value("captured_at_ms", now_ms());
-  ++frame.frame_count;
-  return {{"camera_id", camera_id}, {"accepted", true}, {"frame_count", frame.frame_count}};
-}
-
-std::optional<std::pair<std::string, std::string>> DriverConsoleRuntime::frame(std::string_view camera_id) const {
-  std::lock_guard lock(mutex_);
-  const auto found = frames_.find(std::string(camera_id));
-  if (found == frames_.end()) return std::nullopt;
-  return std::make_pair(found->second.content_type, found->second.bytes);
 }
 
 DriverConsoleHttpApp::DriverConsoleHttpApp(std::shared_ptr<DriverConsoleRuntime> runtime) : runtime_(std::move(runtime)) {
@@ -823,14 +884,13 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
     if (request.method == "GET" && request.path == "/api/time") return ServerResponse::json(200, {{"now_ms", now_ms()}});
     if (request.method == "GET" && request.path == "/api/status") return ServerResponse::json(200, runtime_->status());
     if (request.method == "GET" && request.path == "/") return ServerResponse::text(200, console_html(), "text/html; charset=utf-8");
-    const auto parts = path_parts(request.path);
-    if (request.method == "GET" && parts.size() == 3 && parts[0] == "api" && parts[1] == "frame") {
-      const auto frame = runtime_->frame(parts[2]);
-      if (!frame) return ServerResponse::json(404, {{"error", "camera frame not available"}});
-      return ServerResponse::text(200, frame->second, frame->first);
-    }
     if (request.method == "POST" && request.path == "/api/connect") return ServerResponse::json(200, runtime_->connect());
     if (request.method == "POST" && request.path == "/api/poll-signaling") return ServerResponse::json(200, runtime_->poll_signaling());
+    if (request.method == "POST" && request.path == "/api/webrtc/capabilities") return ServerResponse::json(200, runtime_->send_media_capabilities(request.json_body()));
+    if (request.method == "POST" && request.path == "/api/webrtc/fallback") return ServerResponse::json(200, runtime_->send_media_fallback(request.json_body()));
+    if (request.method == "POST" && request.path == "/api/webrtc/answer") return ServerResponse::json(200, runtime_->send_webrtc_answer(request.json_body()));
+    if (request.method == "POST" && request.path == "/api/webrtc/ice-candidate") return ServerResponse::json(200, runtime_->send_webrtc_ice_candidate(request.json_body()));
+    if (request.method == "POST" && request.path == "/api/webrtc/metrics") return ServerResponse::json(200, runtime_->ingest_webrtc_metrics(request.json_body()));
     if (request.method == "POST" && request.path == "/api/control") return ServerResponse::json(200, runtime_->send_control(request.json_body()));
     if (request.method == "POST" && request.path == "/api/control/keyboard") {
       return ServerResponse::json(200, runtime_->send_control(keyboard_to_control(request.json_body())));
@@ -846,7 +906,6 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
       };
       return ServerResponse::json(200, runtime_->send_control(control));
     }
-    if (request.method == "POST" && request.path == "/api/media/frame") return ServerResponse::json(200, runtime_->ingest_frame(request.json_body()));
     return ServerResponse::json(404, {{"error", "not found"}});
   } catch (const std::invalid_argument& error) {
     return ServerResponse::json(400, {{"error", error.what()}});

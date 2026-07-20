@@ -4,7 +4,8 @@ set -euo pipefail
 # Edit this block once, then run this script on the vehicle:
 #   scripts/start_live_vehicle_one_command.sh
 INSTALL_DIR="/home/user/mine-teleop"
-DRIVER_CONSOLE_URL="http://127.0.0.1:18080"
+SIGNALING_HTTP_URL="http://127.0.0.1:8765"
+DEVICE_TOKEN="replace-with-device-token"
 CAMERA_DEVICES="front=/dev/video0 rear=/dev/video2"
 MVS_CAMERAS="hikrobot=mvs:0"
 PYLON_CAMERAS="basler=pylon:0"
@@ -37,8 +38,8 @@ stop_existing_media() {
   pids="$(
     ps -eo pid,args | awk -v install_dir="$INSTALL_DIR" '
       ($2=="bash" && ($3=="scripts/run_vehicle_live_media.sh" || $3==install_dir "/scripts/run_vehicle_live_media.sh")) ||
-      ($2==install_dir "/bin/mine-teleop.real" && ($0 ~ /vehicle-media-agent/ || $0 ~ /mvs-camera-bridge/)) ||
-      ($2==install_dir "/bin/ffmpeg.real" && $0 ~ /image2pipe/) ||
+      ($2==install_dir "/lib/ld-linux-x86-64.so.2" && $0 ~ /bin\/mine-teleop/ &&
+        ($0 ~ /vehicle-media-agent/ || $0 ~ /mvs-camera-bridge/)) ||
       ($2==install_dir "/bin/pylon-camera-bridge") {
         print $1
       }
@@ -58,7 +59,8 @@ fi
 cd "$INSTALL_DIR"
 exec env \
   MINE_TELEOP_INSTALL_DIR="$INSTALL_DIR" \
-  MINE_TELEOP_DRIVER_CONSOLE_URL="$DRIVER_CONSOLE_URL" \
+  MINE_TELEOP_SIGNALING_HTTP_URL="$SIGNALING_HTTP_URL" \
+  MINE_TELEOP_DEVICE_TOKEN="$DEVICE_TOKEN" \
   MINE_TELEOP_CAMERA_DEVICES="$CAMERA_DEVICES" \
   MINE_TELEOP_MVS_CAMERAS="$MVS_CAMERAS" \
   MINE_TELEOP_PYLON_CAMERAS="$PYLON_CAMERAS" \

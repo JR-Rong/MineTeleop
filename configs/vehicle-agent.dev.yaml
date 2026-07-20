@@ -35,8 +35,8 @@ control:
 media:
   realtime_profiles:
     realtime_720p:
-      codec: mjpeg
-      encoder: native
+      codec: h265
+      encoder: auto
       width: 1280
       height: 720
       fps: 30
@@ -44,8 +44,8 @@ media:
       keyframe_interval_frames: 30
       low_latency: true
     realtime_480p15:
-      codec: mjpeg
-      encoder: native
+      codec: h265
+      encoder: auto
       width: 854
       height: 480
       fps: 15
@@ -53,9 +53,9 @@ media:
       keyframe_interval_frames: 30
       low_latency: true
   record_profiles:
-    record_source_h264:
-      codec: h264
-      encoder: libx264
+    record_source_h265:
+      codec: h265
+      encoder: reuse_realtime
       width: source
       height: source
       fps: source
@@ -70,7 +70,7 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p
-    record_profile: record_source_h264
+    record_profile: record_source_h265
   - id: rear
     enabled: false
     device: testsrc
@@ -78,7 +78,7 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p
-    record_profile: record_source_h264
+    record_profile: record_source_h265
 
 hardware:
   can:
@@ -89,20 +89,13 @@ hardware:
   encoding:
     vaapi_render_device: /dev/dri/renderD128
     dri_card_device: /dev/dri/card1
-    require_hardware_encoder: false
-    gstreamer_hardware_plugins:
-      - vaapih264enc
-      - qsvh264enc
-      - vah264enc
-      - nvh264enc
-    gstreamer_fallback_plugins:
-      - x264enc
-    ffmpeg_probe_output_dir: /tmp/mine-teleop-vaapi
-    ffmpeg_binary: ffmpeg
-    ffprobe_binary: ffprobe
-    vainfo_binary: vainfo
-    libva_drivers_path: /usr/lib/x86_64-linux-gnu/dri
-    validation_duration_seconds: 5
+    preferred_encoder: nvenc
+    fallback_encoder: vaapi
+    preferred_codec: h265
+    fallback_codec: h264
+    require_hardware_encoder: true
+    max_end_to_end_latency_ms: 200
+    min_realtime_fps: 20
   network:
     interface: wwan0
 

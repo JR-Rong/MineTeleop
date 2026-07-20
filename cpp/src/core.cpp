@@ -511,8 +511,28 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   const auto encoding = hardware["encoding"];
   config.hardware.vaapi_render_device = optional<std::string>(encoding, "vaapi_render_device", "/dev/dri/renderD128");
   config.hardware.dri_card_device = optional<std::string>(encoding, "dri_card_device", "/dev/dri/card1");
-  config.hardware.ffmpeg_binary = optional<std::string>(encoding, "ffmpeg_binary", "ffmpeg");
-  config.hardware.ffprobe_binary = optional<std::string>(encoding, "ffprobe_binary", "ffprobe");
+  config.hardware.preferred_encoder = optional<std::string>(encoding, "preferred_encoder", "nvenc");
+  config.hardware.fallback_encoder = optional<std::string>(encoding, "fallback_encoder", "vaapi");
+  config.hardware.preferred_codec = optional<std::string>(encoding, "preferred_codec", "h265");
+  config.hardware.fallback_codec = optional<std::string>(encoding, "fallback_codec", "h264");
+  config.hardware.require_hardware_encoder = optional<bool>(encoding, "require_hardware_encoder", true);
+  config.hardware.max_end_to_end_latency_ms = optional<int>(encoding, "max_end_to_end_latency_ms", 200);
+  config.hardware.min_realtime_fps = optional<int>(encoding, "min_realtime_fps", 20);
+  if (config.hardware.preferred_encoder != "nvenc" && config.hardware.preferred_encoder != "vaapi") {
+    throw std::runtime_error("hardware.encoding.preferred_encoder must be nvenc or vaapi");
+  }
+  if (config.hardware.fallback_encoder != "nvenc" && config.hardware.fallback_encoder != "vaapi") {
+    throw std::runtime_error("hardware.encoding.fallback_encoder must be nvenc or vaapi");
+  }
+  if (config.hardware.preferred_codec != "h264" && config.hardware.preferred_codec != "h265") {
+    throw std::runtime_error("hardware.encoding.preferred_codec must be h264 or h265");
+  }
+  if (config.hardware.fallback_codec != "h264" && config.hardware.fallback_codec != "h265") {
+    throw std::runtime_error("hardware.encoding.fallback_codec must be h264 or h265");
+  }
+  if (config.hardware.max_end_to_end_latency_ms <= 0 || config.hardware.min_realtime_fps <= 0) {
+    throw std::runtime_error("hardware.encoding acceptance thresholds must be positive");
+  }
   config.hardware.network_interface = optional<std::string>(hardware["network"], "interface", "wwan0");
 
   const auto safety = root["field_safety"];

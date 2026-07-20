@@ -194,8 +194,13 @@ struct HardwareConfig {
   int can_bitrate{500000};
   std::filesystem::path vaapi_render_device{"/dev/dri/renderD128"};
   std::filesystem::path dri_card_device{"/dev/dri/card1"};
-  std::string ffmpeg_binary{"ffmpeg"};
-  std::string ffprobe_binary{"ffprobe"};
+  std::string preferred_encoder{"nvenc"};
+  std::string fallback_encoder{"vaapi"};
+  std::string preferred_codec{"h265"};
+  std::string fallback_codec{"h264"};
+  bool require_hardware_encoder{true};
+  int max_end_to_end_latency_ms{200};
+  int min_realtime_fps{20};
   std::string network_interface{"wwan0"};
 };
 

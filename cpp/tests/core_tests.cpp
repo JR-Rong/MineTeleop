@@ -3,6 +3,7 @@
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/upload.hpp"
+#include "mine_teleop/video.hpp"
 
 #include <cmath>
 #include <filesystem>
@@ -217,6 +218,15 @@ void test_native_signaling_http_control_round_trip() {
   const auto session = http.post_json_response(
       base + "/sessions", {{"driver_id", "driver-1"}, {"vehicle_id", "vehicle-001"}, {"token", driver_token}});
 
+  const auto media = http.post_json_response(
+      base + "/signaling/" + session.at("session_id").get<std::string>() + "/messages",
+      {{"sender", "driver-1"},
+       {"recipient", "vehicle-001"},
+       {"token", driver_token},
+       {"type", "media_capabilities"},
+       {"payload", {{"codecs", {"h264", "h265"}}}}});
+  expect(media.value("queued", 0) == 1, "media capabilities were not queued");
+
   auto control = command(1, mine_teleop::now_ms());
   control.session_id = session.at("session_id").get<std::string>();
   control.authority_token = session.at("control_token").get<std::string>();
@@ -227,54 +237,57 @@ void test_native_signaling_http_control_round_trip() {
        {"token", driver_token},
        {"type", "control_command"},
        {"payload", control.to_json()}});
-  expect(queued.value("queued", 0) == 1, "control command was not queued");
+  expect(queued.value("queued", 0) == 2, "control command was not queued behind media capabilities");
 
   const auto messages = http.get_json(
       base + "/signaling/" + control.session_id +
-      "/messages?recipient=vehicle-001&device_token=device-secret");
+      "/messages?recipient=vehicle-001&device_token=device-secret&types=control_command");
   expect(messages.at("messages").size() == 1, "vehicle did not receive queued control command");
   expect(messages.at("messages").at(0).value("type", "") == "control_command", "message type changed");
+  const auto media_messages = http.get_json(
+      base + "/signaling/" + control.session_id +
+      "/messages?recipient=vehicle-001&device_token=device-secret&types=media_capabilities");
+  expect(media_messages.at("messages").size() == 1, "control polling consumed WebRTC capabilities");
+  expect(media_messages.at("messages").at(0).value("type", "") == "media_capabilities", "media message type changed");
+  const auto fallback = http.post_json_response(
+      base + "/signaling/" + control.session_id + "/messages",
+      {{"sender", "driver-1"},
+       {"recipient", "vehicle-001"},
+       {"token", driver_token},
+       {"type", "media_fallback"},
+       {"payload", {{"codec", "h264"}, {"reason", "decode_fps_below_20"}}}});
+  expect(fallback.value("queued", 0) == 1, "media fallback was not queued");
+  const auto fallback_messages = http.get_json(
+      base + "/signaling/" + control.session_id +
+      "/messages?recipient=vehicle-001&device_token=device-secret&types=media_fallback");
+  expect(fallback_messages.at("messages").size() == 1, "vehicle did not receive media fallback");
+  expect(
+      fallback_messages.at("messages").at(0).value("type", "") == "media_fallback",
+      "media fallback message type changed");
   server.stop();
 }
 
-void test_driver_config_and_base64_round_trip() {
+void test_driver_config_and_hardware_encoder_priority() {
   const auto config = mine_teleop::load_driver_config("configs/driver-console.dev.yaml");
   expect(config.driver_id == "driver-console-001", "driver config id mismatch");
-  const std::string bytes("\xFF\xD8\x00\x01\xFF\xD9", 6);
-  expect(mine_teleop::base64_decode(mine_teleop::base64_encode(bytes)) == bytes, "base64 did not round trip binary bytes");
-}
-
-void test_native_media_testsrc_reaches_console() {
-  auto driver = mine_teleop::load_driver_config("configs/driver-console.dev.yaml");
-  auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(driver, "vehicle-001", "dev-password");
-  auto app = std::make_shared<mine_teleop::DriverConsoleHttpApp>(runtime);
-  mine_teleop::SimpleHttpServer server(
-      "127.0.0.1", 0, [app](const auto& request) { return app->handle(request); });
-  server.start();
-  auto vehicle = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
-  const auto recording_root = std::filesystem::path("/tmp") / ("mine-teleop-recording-test-" + mine_teleop::random_token(6));
-  mine_teleop::VehicleMediaRuntime media(
-      vehicle, "http://127.0.0.1:" + std::to_string(server.port()), 5000, recording_root);
-  const auto summary = media.run(2);
-  expect(summary.value("passed", false), "native media testsrc stream failed");
-  const auto status = runtime->status();
-  expect(status.at("cameras").contains("front"), "driver console did not retain front camera frame");
-  expect(status.at("cameras").at("front").value("bytes", 0) > 100, "retained JPEG frame was unexpectedly small");
-  std::size_t mp4_count = 0;
-  std::size_t metadata_count = 0;
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(recording_root)) {
-    if (entry.path().extension() == ".mp4") ++mp4_count;
-    if (entry.path().extension() == ".json") ++metadata_count;
-  }
-  expect(mp4_count == 1 && metadata_count == 1, "native recorder did not finalize MP4 and sidecar");
-  std::filesystem::remove_all(recording_root);
-  server.stop();
+  const auto vehicle = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  expect(vehicle.hardware.preferred_encoder == "nvenc", "NVIDIA is not the preferred encoder");
+  expect(vehicle.hardware.fallback_encoder == "vaapi", "Intel VAAPI is not the fallback encoder");
+  expect(vehicle.hardware.preferred_codec == "h265", "H.265 is not the preferred codec");
+  const auto candidates = mine_teleop::encoder_candidate_order(vehicle.hardware, mine_teleop::VideoCodec::H265);
+  expect(candidates.size() == 2, "hardware encoder fallback candidate is missing");
+  expect(candidates.at(0).backend == mine_teleop::EncoderBackend::Nvenc, "NVENC priority changed");
+  expect(candidates.at(1).backend == mine_teleop::EncoderBackend::Vaapi, "VAAPI fallback priority changed");
+  expect(candidates.at(0).codec == mine_teleop::VideoCodec::H265, "preferred candidate codec changed");
 }
 
 void test_native_testsrc_acquisition_does_not_spawn_ffmpeg() {
   const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   const auto camera = config.enabled_cameras().front();
-  mine_teleop::CameraFrameSource source(camera, config.realtime_profile(camera.realtime_profile));
+  auto capture_profile = config.realtime_profile(camera.realtime_profile);
+  capture_profile.codec = "mjpeg";
+  capture_profile.encoder = "native";
+  mine_teleop::CameraFrameSource source(camera, capture_profile);
   expect(source.command().empty(), "native test source unexpectedly configured an external media process");
   const auto frame = source.next(1);
   expect(frame.codec == "mjpeg", "native test source did not produce MJPEG");
@@ -305,6 +318,10 @@ void test_native_driver_to_vehicle_closed_loop() {
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
   const auto connection = driver.connect();
   expect(connection.value("connected", false), "driver failed to connect");
+  const auto reconnected = driver.connect();
+  expect(
+      reconnected.value("session_id", "") == connection.value("session_id", ""),
+      "driver reconnect did not reuse the active session");
   const auto queued = driver.send_control({{"gear", "D"}, {"steering", 0.1}, {"throttle", 0.2}, {"brake", 0.0}});
   expect(queued.value("queued", 0) == 1, "driver control command was not queued");
   expect(vehicle.discover_session(mine_teleop::now_ms()), "vehicle did not discover native session");
@@ -358,8 +375,7 @@ int main() {
       {"control_service_requires_feedback_before_actuation_but_allows_estop", test_control_service_requires_feedback_before_actuation_but_allows_estop},
       {"fault_output_fails_safe", test_fault_output_fails_safe},
       {"native_signaling_http_control_round_trip", test_native_signaling_http_control_round_trip},
-      {"driver_config_and_base64_round_trip", test_driver_config_and_base64_round_trip},
-      {"native_media_testsrc_reaches_console", test_native_media_testsrc_reaches_console},
+      {"driver_config_and_hardware_encoder_priority", test_driver_config_and_hardware_encoder_priority},
       {"native_testsrc_acquisition_does_not_spawn_ffmpeg", test_native_testsrc_acquisition_does_not_spawn_ffmpeg},
       {"native_driver_to_vehicle_closed_loop", test_native_driver_to_vehicle_closed_loop},
       {"local_archive_uploader_is_atomic_and_resumable", test_local_archive_uploader_is_atomic_and_resumable},

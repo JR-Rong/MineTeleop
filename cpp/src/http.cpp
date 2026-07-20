@@ -185,7 +185,8 @@ Json VehicleTeleopRuntime::poll_and_execute(std::int64_t timestamp_ms) {
   if (!service_ || session_id_.empty()) throw std::runtime_error("vehicle teleop runtime has no active session");
   const auto response = http_.get_json(
       signaling_http_url_ + "/signaling/" + http_.url_encode(session_id_) + "/messages?recipient=" +
-      http_.url_encode(config_.vehicle_id) + "&device_token=" + http_.url_encode(device_token_));
+      http_.url_encode(config_.vehicle_id) + "&device_token=" + http_.url_encode(device_token_) +
+      "&types=control_command");
   const auto messages = response.value("messages", Json::array());
   if (!messages.is_array()) throw std::runtime_error("signaling messages response must contain a messages list");
   std::uint64_t received = 0;

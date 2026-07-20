@@ -18,6 +18,13 @@ find_package(JPEG REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET
+  gstreamer-1.0
+  gstreamer-app-1.0
+  gstreamer-sdp-1.0
+  gstreamer-webrtc-1.0
+)
 include(GNUInstallDirs)
 
 add_library(mine_teleop_runtime
@@ -26,6 +33,8 @@ add_library(mine_teleop_runtime
   cpp/src/media.cpp
   cpp/src/server.cpp
   cpp/src/upload.cpp
+  cpp/src/video.cpp
+  cpp/src/webrtc_media.cpp
 )
 target_include_directories(mine_teleop_runtime
   PUBLIC
@@ -40,6 +49,7 @@ target_link_libraries(mine_teleop_runtime
     Threads::Threads
     yaml-cpp
     nlohmann_json::nlohmann_json
+    PkgConfig::GSTREAMER
     ${CMAKE_DL_LIBS}
 )
 target_compile_options(mine_teleop_runtime PRIVATE -Wall -Wextra -Wpedantic -Werror=return-type)

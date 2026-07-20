@@ -81,8 +81,8 @@ control:
 media:
   realtime_profiles:
     realtime_720p:
-      codec: h264
-      encoder: vaapi
+      codec: h265
+      encoder: auto
       width: 1280
       height: 720
       fps: 30
@@ -91,7 +91,7 @@ media:
       low_latency: true
     realtime_480p15:
       codec: h264
-      encoder: vaapi
+      encoder: auto
       width: 854
       height: 480
       fps: 15
@@ -99,9 +99,9 @@ media:
       keyframe_interval_frames: 30
       low_latency: true
   record_profiles:
-    record_source_h264:
-      codec: h264
-      encoder: vaapi
+    record_source_h265:
+      codec: h265
+      encoder: reuse_realtime
       width: source
       height: source
       fps: source
@@ -116,7 +116,7 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p
-    record_profile: record_source_h264
+    record_profile: record_source_h265
   - id: rear
     enabled: true
     device: /dev/video1
@@ -124,7 +124,7 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p
-    record_profile: record_source_h264
+    record_profile: record_source_h265
 
 hardware:
   can:
@@ -135,16 +135,13 @@ hardware:
   encoding:
     vaapi_render_device: /dev/dri/renderD128
     dri_card_device: /dev/dri/card1
+    preferred_encoder: nvenc
+    fallback_encoder: vaapi
+    preferred_codec: h265
+    fallback_codec: h264
     require_hardware_encoder: true
-    gstreamer_hardware_plugins:
-      - vaapih264enc
-      - qsvh264enc
-      - vah264enc
-      - nvh264enc
-    gstreamer_fallback_plugins:
-      - x264enc
-    ffmpeg_probe_output_dir: /tmp/mine-teleop-vaapi
-    validation_duration_seconds: 5
+    max_end_to_end_latency_ms: 200
+    min_realtime_fps: 20
   network:
     interface: wwan0
 
@@ -193,10 +190,11 @@ SocketCAN 接口名；真实 adapter 配置中
 用于现场 CAN 口配置记录和部署命令，应用进程不会自动改 Linux netdev，需要现场用 `ip link`
 按该值配置。
 
-`hardware.encoding` 暴露硬件编码相关现场变量。`vaapi_render_device`、`dri_card_device` 会进入
-preflight、`vainfo`、FFmpeg VAAPI probe 和硬编验收计划；`gstreamer_hardware_plugins` 与
-`gstreamer_fallback_plugins` 会进入 `gst-inspect-1.0` 探测命令。工控机如果换了 DRI 节点、
-编码插件或临时输出目录，只改这里。
+`hardware.encoding` 暴露硬件编码与实时验收变量。`preferred_encoder=nvenc`、
+`fallback_encoder=vaapi` 定义后端顺序；`preferred_codec=h265`、
+`fallback_codec=h264` 定义浏览器支持范围内的 codec 顺序。`media-probe` 直接检查随包
+GStreamer factory，`max_end_to_end_latency_ms` 与 `min_realtime_fps` 用于车端和浏览器
+验收汇总。DRI 节点变化只修改本节配置，不依赖宿主机 FFmpeg。
 
 `hardware.network.interface` 会进入弱网矩阵和目标主机验收脚本。`field_safety` 用来记录现场
 安全链路的最低门禁：调试阶段、速度上限、是否必须先收到 CAN feedback、是否必须本地确认

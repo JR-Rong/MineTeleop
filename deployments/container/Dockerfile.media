@@ -4,7 +4,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential ca-certificates cmake libcurl4-openssl-dev libjpeg-dev libssl-dev \
-        libyaml-cpp-dev nlohmann-json3-dev pkg-config \
+        libyaml-cpp-dev nlohmann-json3-dev pkg-config libgstreamer1.0-dev \
+        libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -21,7 +22,9 @@ FROM ubuntu:22.04
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates ffmpeg intel-media-va-driver libcurl4 libjpeg-turbo8 libssl3 libyaml-cpp0.7 vainfo v4l-utils \
+        ca-certificates intel-media-va-driver libcurl4 libjpeg-turbo8 libssl3 libyaml-cpp0.7 vainfo v4l-utils \
+        gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+        gstreamer1.0-plugins-bad gstreamer1.0-vaapi \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system mineteleop \
     && useradd --system --gid mineteleop --home-dir /opt/mine-teleop --shell /usr/sbin/nologin mineteleop \
