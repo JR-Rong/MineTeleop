@@ -119,6 +119,110 @@ HttpResponse HttpClient::request(std::string_view method, std::string_view url, 
   return response;
 }
 
+Json TimeSyncStatus::to_json() const {
+  return {
+      {"time_domain", "signaling_server"},
+      {"synchronized", synchronized},
+      {"offset_ms", offset_ms},
+      {"round_trip_ms", round_trip_ms},
+      {"uncertainty_ms", uncertainty_ms},
+      {"synchronized_at_local_ms", synchronized_at_local_ms},
+      {"sample_count", sample_count},
+  };
+}
+
+bool TimeSyncStatus::acceptable(int max_uncertainty_ms) const {
+  return max_uncertainty_ms >= 0 && synchronized && uncertainty_ms <= max_uncertainty_ms;
+}
+
+TimeSyncStatus SynchronizedClock::synchronize(
+    const HttpClient& http, std::string_view signaling_origin, int sample_count) {
+  if (sample_count < 3 || sample_count > 15) throw std::invalid_argument("time sync sample count must be between 3 and 15");
+  const auto origin = normalize_signaling_http_url(signaling_origin);
+  struct Sample {
+    std::int64_t offset_ms;
+    std::int64_t round_trip_ms;
+  };
+  std::vector<Sample> samples;
+  samples.reserve(static_cast<std::size_t>(sample_count));
+  for (int index = 0; index < sample_count; ++index) {
+    const auto client_send_ms = mine_teleop::now_ms();
+    const auto response = http.get_json(
+        origin + "/time?client_send_ms=" + std::to_string(client_send_ms));
+    const auto client_receive_ms = mine_teleop::now_ms();
+    const auto echoed_client_send_ms = response.at("client_send_ms").get<std::int64_t>();
+    const auto server_receive_ms = response.at("server_receive_ms").get<std::int64_t>();
+    const auto server_send_ms = response.at("server_send_ms").get<std::int64_t>();
+    if (echoed_client_send_ms != client_send_ms || server_send_ms < server_receive_ms) {
+      throw std::runtime_error("signaling time endpoint returned an invalid four-timestamp sample");
+    }
+    const auto server_processing_ms = server_send_ms - server_receive_ms;
+    const auto round_trip_ms = std::max<std::int64_t>(0, client_receive_ms - client_send_ms - server_processing_ms);
+    const auto offset_ms = ((server_receive_ms - client_send_ms) + (server_send_ms - client_receive_ms)) / 2;
+    samples.push_back({offset_ms, round_trip_ms});
+  }
+  std::sort(samples.begin(), samples.end(), [](const auto& left, const auto& right) {
+    return left.round_trip_ms < right.round_trip_ms;
+  });
+  const auto selected_count = std::min<std::size_t>(3, samples.size());
+  std::vector<std::int64_t> offsets;
+  offsets.reserve(selected_count);
+  for (std::size_t index = 0; index < selected_count; ++index) offsets.push_back(samples[index].offset_ms);
+  std::sort(offsets.begin(), offsets.end());
+  const auto selected_offset_ms = offsets[offsets.size() / 2];
+  std::int64_t offset_spread_ms = 0;
+  for (const auto offset_ms : offsets) {
+    offset_spread_ms = std::max(offset_spread_ms, std::abs(offset_ms - selected_offset_ms));
+  }
+  TimeSyncStatus next{
+      true,
+      selected_offset_ms,
+      samples.front().round_trip_ms,
+      std::max<std::int64_t>((samples.front().round_trip_ms + 1) / 2, offset_spread_ms),
+      mine_teleop::now_ms(),
+      static_cast<int>(samples.size()),
+  };
+
+  const auto next_steady_anchor = std::chrono::steady_clock::now();
+  const auto proposed_synchronized_ms = next.synchronized_at_local_ms + next.offset_ms;
+  std::lock_guard lock(mutex_);
+  if (status_.synchronized) {
+    const auto current_synchronized_ms = synchronized_anchor_ms_ +
+        std::chrono::duration_cast<std::chrono::milliseconds>(next_steady_anchor - steady_anchor_).count();
+    synchronized_anchor_ms_ = std::max(current_synchronized_ms, proposed_synchronized_ms);
+  } else {
+    synchronized_anchor_ms_ = proposed_synchronized_ms;
+  }
+  steady_anchor_ = next_steady_anchor;
+  status_ = next;
+  return status_;
+}
+
+std::int64_t SynchronizedClock::now_ms() const {
+  std::lock_guard lock(mutex_);
+  if (!status_.synchronized) return mine_teleop::now_ms();
+  return synchronized_anchor_ms_ +
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - steady_anchor_).count();
+}
+
+std::int64_t SynchronizedClock::from_local_system_ms(std::int64_t local_time_ms) const {
+  std::lock_guard lock(mutex_);
+  return status_.synchronized ? local_time_ms + status_.offset_ms : local_time_ms;
+}
+
+TimeSyncStatus SynchronizedClock::status() const {
+  std::lock_guard lock(mutex_);
+  return status_;
+}
+
+bool SynchronizedClock::refresh_due(int interval_ms) const {
+  if (interval_ms <= 0) throw std::invalid_argument("time sync refresh interval must be positive");
+  std::lock_guard lock(mutex_);
+  return !status_.synchronized ||
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - steady_anchor_).count() >=
+          interval_ms;
+}
+
 std::string normalize_signaling_http_url(std::string_view url) {
   std::string value(url);
   if (value.starts_with("ws://")) value.replace(0, 5, "http://");
@@ -149,6 +253,18 @@ VehicleTeleopRuntime::~VehicleTeleopRuntime() {
     if (service_) service_->close();
   } catch (...) {
   }
+}
+
+TimeSyncStatus VehicleTeleopRuntime::refresh_time_sync() {
+  const auto status = clock_.synchronize(
+      http_, signaling_http_url_, config_.field_safety.time_sync_samples);
+  if (config_.field_safety.require_time_sync &&
+      !status.acceptable(config_.field_safety.max_time_sync_uncertainty_ms)) {
+    throw std::runtime_error(
+        "vehicle time synchronization uncertainty " + std::to_string(status.uncertainty_ms) +
+        "ms exceeds limit " + std::to_string(config_.field_safety.max_time_sync_uncertainty_ms) + "ms");
+  }
+  return status;
 }
 
 Json VehicleTeleopRuntime::register_online() {
@@ -231,10 +347,15 @@ Json VehicleTeleopRuntime::run(int duration_ms, int poll_interval_ms, int sessio
   if (duration_ms < 0 || poll_interval_ms <= 0 || session_wait_ms < 0) {
     throw std::invalid_argument("teleop timing options are invalid");
   }
+  try {
+    static_cast<void>(refresh_time_sync());
+  } catch (...) {
+    if (config_.field_safety.require_time_sync) throw;
+  }
   register_online();
-  const auto session_deadline = now_ms() + session_wait_ms;
-  while (!discover_session(now_ms())) {
-    if (session_wait_ms > 0 && now_ms() >= session_deadline) {
+  const auto session_deadline = clock_.now_ms() + session_wait_ms;
+  while (!discover_session(clock_.now_ms())) {
+    if (session_wait_ms > 0 && clock_.now_ms() >= session_deadline) {
       return {
           {"event", "vehicle_teleop_run"},
           {"vehicle_id", config_.vehicle_id},
@@ -244,9 +365,16 @@ Json VehicleTeleopRuntime::run(int duration_ms, int poll_interval_ms, int sessio
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms));
   }
-  const auto deadline = now_ms() + duration_ms;
-  while (duration_ms == 0 || now_ms() < deadline) {
-    auto result = poll_and_execute(now_ms());
+  const auto deadline = clock_.now_ms() + duration_ms;
+  while (duration_ms == 0 || clock_.now_ms() < deadline) {
+    if (clock_.refresh_due(config_.field_safety.time_sync_interval_ms)) {
+      try {
+        static_cast<void>(refresh_time_sync());
+      } catch (...) {
+        if (config_.field_safety.require_time_sync) throw;
+      }
+    }
+    auto result = poll_and_execute(clock_.now_ms());
     if (log_controls) {
       for (const auto& record : result["control_receive_logs"]) std::cout << record.dump() << '\n';
     }
@@ -267,6 +395,7 @@ Json VehicleTeleopRuntime::summary() const {
       {"session_id", session_id_},
       {"processed_control_commands", processed_control_commands_},
       {"last_command", last_applied_command_ ? last_applied_command_->to_json() : Json(nullptr)},
+      {"time_sync", clock_.status().to_json()},
       {"control_receive_logs", std::move(logs)},
   };
   if (service_) {

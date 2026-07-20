@@ -130,6 +130,9 @@ struct DriverConfig {
   std::string signaling_url;
   int rate_hz{20};
   int estop_hold_ms{500};
+  int max_time_sync_uncertainty_ms{25};
+  int time_sync_interval_ms{30000};
+  int time_sync_samples{7};
 };
 
 DriverConfig load_driver_config(const std::string& path);
@@ -150,12 +153,14 @@ class DriverConsoleRuntime {
 
  private:
   [[nodiscard]] Json send_signaling_message(std::string_view type, const Json& payload);
+  TimeSyncStatus refresh_time_sync();
 
   DriverConfig config_;
   std::string vehicle_id_;
   std::string password_;
   std::string signaling_http_url_;
   HttpClient http_;
+  SynchronizedClock clock_;
   mutable std::mutex mutex_;
   std::string driver_token_;
   std::string session_id_;

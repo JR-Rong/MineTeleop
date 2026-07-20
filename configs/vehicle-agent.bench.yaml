@@ -40,20 +40,12 @@ media:
       segment_seconds: 2
 
 cameras:
-  - id: front_real
+  - id: front_uvc
     device: /dev/video0
     realtime_profile: realtime_720p30
     record_profile: reuse_realtime
-  - id: rear_synthetic
-    device: testsrc
-    realtime_profile: realtime_720p30
-    record_profile: reuse_realtime
-  - id: left_synthetic
-    device: testsrc
-    realtime_profile: realtime_720p30
-    record_profile: reuse_realtime
-  - id: right_synthetic
-    device: testsrc
+  - id: basler_25192546
+    device: basler:serial=25192546
     realtime_profile: realtime_720p30
     record_profile: reuse_realtime
 
@@ -79,7 +71,10 @@ field_safety:
   max_speed_kph: 0
   require_can_feedback_before_control: false
   require_local_estop_reset: true
-  require_time_sync: false
+  require_time_sync: true
+  max_time_sync_uncertainty_ms: 25
+  time_sync_interval_ms: 30000
+  time_sync_samples: 7
 
 recording:
   root_dir: /tmp/mine-teleop-recordings

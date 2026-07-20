@@ -9,8 +9,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(MINE_TELEOP_BUILD_TESTS "Build the native C++ test suite" ON)
 option(MINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES "Build camera bridges when bundled vendor SDKs are present" ON)
+option(MINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE "Build the lightweight Aravis USB3 Vision camera bridge" ON)
 set(MINE_TELEOP_MVS_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/mvs" CACHE PATH "Bundled Hikrobot MVS SDK root")
-set(MINE_TELEOP_PYLON_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/pylon" CACHE PATH "Bundled Basler pylon SDK root")
 
 find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
@@ -61,6 +61,23 @@ set_target_properties(mine-teleop PROPERTIES
   INSTALL_RPATH "$ORIGIN/../lib"
 )
 
+if(MINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE)
+  pkg_check_modules(ARAVIS QUIET IMPORTED_TARGET aravis-0.8)
+  if(ARAVIS_FOUND)
+    add_executable(mine-teleop-aravis-camera cpp/bridges/aravis_camera_bridge.cpp)
+    target_link_libraries(mine-teleop-aravis-camera PRIVATE PkgConfig::ARAVIS JPEG::JPEG)
+    target_compile_options(mine-teleop-aravis-camera PRIVATE -Wall -Wextra -Wpedantic -Werror=return-type)
+    set_target_properties(mine-teleop-aravis-camera PROPERTIES
+      BUILD_RPATH "$ORIGIN/../lib"
+      INSTALL_RPATH "$ORIGIN/../lib"
+    )
+    install(TARGETS mine-teleop-aravis-camera RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    message(STATUS "Aravis USB3 Vision bridge enabled")
+  else()
+    message(STATUS "Aravis 0.8 development files not found; Aravis camera bridge will not be installed")
+  endif()
+endif()
+
 if(MINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES)
   find_path(MINE_TELEOP_MVS_INCLUDE_DIR
     NAMES MvCameraControl.h
@@ -88,28 +105,6 @@ if(MINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES)
     message(STATUS "Hikrobot MVS SDK not bundled; MVS bridge will not be installed")
   endif()
 
-  find_program(MINE_TELEOP_PYLON_CONFIG
-    NAMES pylon-config
-    HINTS "${MINE_TELEOP_PYLON_SDK_ROOT}/bin"
-    NO_DEFAULT_PATH
-  )
-  if(MINE_TELEOP_PYLON_CONFIG)
-    execute_process(COMMAND "${MINE_TELEOP_PYLON_CONFIG}" --cflags OUTPUT_VARIABLE PYLON_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
-    execute_process(COMMAND "${MINE_TELEOP_PYLON_CONFIG}" --libs-rpath OUTPUT_VARIABLE PYLON_RPATH_FLAGS OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
-    execute_process(COMMAND "${MINE_TELEOP_PYLON_CONFIG}" --libs OUTPUT_VARIABLE PYLON_LINK_FLAGS OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
-    separate_arguments(PYLON_CFLAGS NATIVE_COMMAND "${PYLON_CFLAGS}")
-    separate_arguments(PYLON_RPATH_FLAGS NATIVE_COMMAND "${PYLON_RPATH_FLAGS}")
-    separate_arguments(PYLON_LINK_FLAGS NATIVE_COMMAND "${PYLON_LINK_FLAGS}")
-    add_executable(mine-teleop-pylon-camera scripts/pylon_camera_bridge.cpp)
-    target_compile_options(mine-teleop-pylon-camera PRIVATE ${PYLON_CFLAGS})
-    target_link_options(mine-teleop-pylon-camera PRIVATE ${PYLON_RPATH_FLAGS} ${PYLON_LINK_FLAGS})
-    install(TARGETS mine-teleop-pylon-camera RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-    install(DIRECTORY "${MINE_TELEOP_PYLON_SDK_ROOT}/lib/" DESTINATION ${CMAKE_INSTALL_LIBDIR}/vendor/pylon
-      FILES_MATCHING PATTERN "*.so" PATTERN "*.so.*")
-    message(STATUS "Basler pylon bridge enabled from ${MINE_TELEOP_PYLON_SDK_ROOT}")
-  else()
-    message(STATUS "Basler pylon SDK not bundled; pylon bridge will not be installed")
-  endif()
 endif()
 
 install(TARGETS mine-teleop mine_teleop_runtime

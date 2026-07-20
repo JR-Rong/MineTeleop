@@ -6,12 +6,14 @@
 #include "mine_teleop/video.hpp"
 
 #include <cmath>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -112,6 +114,30 @@ void test_control_receiver_enforces_token_sequence_and_gap() {
   expect(receiver.accept(late, 500).reason == "command_gap_exceeded", "large command gap was accepted");
   late.estop = true;
   expect(receiver.accept(late, 500).accepted, "estop should bypass command gap rejection");
+
+  mine_teleop::ControlReceiver recovery_receiver("vehicle-001", "session-001", 200, 1, true, "token");
+  auto recovery_first = command(1, 0);
+  recovery_first.authority_token = "token";
+  expect(recovery_receiver.accept(recovery_first, 0).accepted, "recovery first command was rejected");
+  auto recovery_gap = command(2, 500);
+  recovery_gap.authority_token = "token";
+  expect(recovery_receiver.accept(recovery_gap, 500).reason == "command_gap_exceeded", "recovery gap was not detected");
+  auto recovery_next = command(3, 550);
+  recovery_next.authority_token = "token";
+  expect(recovery_receiver.accept(recovery_next, 550).accepted, "receiver did not recover after command gap");
+
+  mine_teleop::ControlReceiver synchronized_receiver("vehicle-001", "session-001", 200, 1, true, "token");
+  auto stale = command(1, 0);
+  stale.authority_token = "token";
+  expect(synchronized_receiver.accept(stale, 201).reason == "command_age_exceeded", "stale command was accepted");
+  stale.ts_ms = 201;
+  stale.estop = true;
+  expect(synchronized_receiver.accept(stale, 500).accepted, "stale estop should remain acceptable");
+
+  mine_teleop::ControlReceiver future_receiver("vehicle-001", "session-001", 200, 1, true, "token");
+  auto future = command(1, 201);
+  future.authority_token = "token";
+  expect(future_receiver.accept(future, 0).reason == "command_timestamp_in_future", "future command was accepted");
 }
 
 void test_mailbox_keeps_only_latest_command() {
@@ -267,6 +293,28 @@ void test_native_signaling_http_control_round_trip() {
   server.stop();
 }
 
+void test_signaling_time_sync_common_domain() {
+  auto service = std::make_shared<mine_teleop::SignalingService>(mine_teleop::SignalingServerConfig{});
+  mine_teleop::SimpleHttpServer server(
+      "127.0.0.1", 0, [service](const auto& request) { return service->handle(request); });
+  server.start();
+  const auto base = "http://127.0.0.1:" + std::to_string(server.port());
+  mine_teleop::HttpClient http;
+  mine_teleop::SynchronizedClock clock;
+  const auto status = clock.synchronize(http, base, 7);
+  expect(status.synchronized, "clock did not synchronize to signaling time");
+  expect(status.sample_count == 7, "clock synchronization sample count changed");
+  expect(status.acceptable(25), "local signaling clock uncertainty exceeded 25ms");
+  const auto first = clock.now_ms();
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  const auto second = clock.now_ms();
+  expect(second >= first, "synchronized clock moved backwards");
+  const auto direct = http.get_json(base + "/time?client_send_ms=12345");
+  expect(direct.value("client_send_ms", 0) == 12345, "time endpoint did not echo the client timestamp");
+  expect(direct.value("time_domain", "") == "signaling_server", "time endpoint domain changed");
+  server.stop();
+}
+
 void test_driver_config_and_hardware_encoder_priority() {
   const auto config = mine_teleop::load_driver_config("configs/driver-console.dev.yaml");
   expect(config.driver_id == "driver-console-001", "driver config id mismatch");
@@ -298,6 +346,28 @@ void test_native_testsrc_acquisition_does_not_spawn_ffmpeg() {
           static_cast<unsigned char>(frame.payload.at(frame.payload.size() - 2)) == 0xFF &&
           static_cast<unsigned char>(frame.payload.back()) == 0xD9,
       "native test source payload is not a complete JPEG");
+}
+
+void test_basler_camera_uses_minimal_aravis_bridge() {
+  const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto camera = config.enabled_cameras().front();
+  camera.device = "basler:serial=25192546";
+  auto capture_profile = config.realtime_profile(camera.realtime_profile);
+  capture_profile.codec = "mjpeg";
+  capture_profile.encoder = "native";
+  mine_teleop::CameraFrameSource source(camera, capture_profile);
+  const auto& command = source.command();
+  expect(!command.empty(), "Basler camera did not configure an Aravis bridge");
+  expect(
+      std::filesystem::path(command.front()).filename() == "mine-teleop-aravis-camera",
+      "Basler camera selected a non-Aravis bridge");
+  expect(
+      std::find(command.begin(), command.end(), "--serial") != command.end() &&
+          std::find(command.begin(), command.end(), "25192546") != command.end(),
+      "Aravis bridge did not preserve the Basler serial selector");
+  expect(
+      std::find(command.begin(), command.end(), "--jpeg-quality") != command.end(),
+      "Aravis bridge did not receive the bounded JPEG quality setting");
 }
 
 void test_native_driver_to_vehicle_closed_loop() {
@@ -375,8 +445,10 @@ int main() {
       {"control_service_requires_feedback_before_actuation_but_allows_estop", test_control_service_requires_feedback_before_actuation_but_allows_estop},
       {"fault_output_fails_safe", test_fault_output_fails_safe},
       {"native_signaling_http_control_round_trip", test_native_signaling_http_control_round_trip},
+      {"signaling_time_sync_common_domain", test_signaling_time_sync_common_domain},
       {"driver_config_and_hardware_encoder_priority", test_driver_config_and_hardware_encoder_priority},
       {"native_testsrc_acquisition_does_not_spawn_ffmpeg", test_native_testsrc_acquisition_does_not_spawn_ffmpeg},
+      {"basler_camera_uses_minimal_aravis_bridge", test_basler_camera_uses_minimal_aravis_bridge},
       {"native_driver_to_vehicle_closed_loop", test_native_driver_to_vehicle_closed_loop},
       {"local_archive_uploader_is_atomic_and_resumable", test_local_archive_uploader_is_atomic_and_resumable},
   };

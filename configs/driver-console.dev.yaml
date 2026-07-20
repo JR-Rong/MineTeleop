@@ -27,3 +27,8 @@ control:
     throttle_inverted: true
     brake_inverted: true
     estop_button: 0
+
+time_sync:
+  max_uncertainty_ms: 25
+  interval_ms: 30000
+  samples: 7

@@ -31,13 +31,28 @@ bool is_mvs(std::string_view device) {
   return device == "mvs" || device.starts_with("mvs:") || device.starts_with("hikrobot:");
 }
 
-bool is_pylon(std::string_view device) {
-  return device == "pylon" || device.starts_with("pylon:") || device.starts_with("basler:");
+bool is_aravis(std::string_view device) {
+  return device == "aravis" || device.starts_with("aravis:") || device == "basler" ||
+         device.starts_with("basler:") || device == "pylon" || device.starts_with("pylon:");
 }
 
 std::string environment_or(std::string_view name, std::string fallback) {
   const char* value = std::getenv(std::string(name).c_str());
   return value == nullptr || *value == '\0' ? std::move(fallback) : std::string(value);
+}
+
+std::string bundled_executable(std::string_view name) {
+  if (const char* configured = std::getenv("MINE_TELEOP_EXECUTABLE_PATH"); configured != nullptr && *configured != '\0') {
+    const std::filesystem::path executable(configured);
+    if (executable.has_parent_path()) return (executable.parent_path() / name).string();
+  }
+  std::array<char, 4096> path{};
+  const auto length = ::readlink("/proc/self/exe", path.data(), path.size() - 1);
+  if (length > 0) {
+    path[static_cast<std::size_t>(length)] = '\0';
+    return (std::filesystem::path(path.data()).parent_path() / name).string();
+  }
+  return std::string(name);
 }
 
 void append_camera_selector(std::vector<std::string>& command, std::string_view device) {
@@ -59,7 +74,7 @@ void append_camera_selector(std::vector<std::string>& command, std::string_view 
 std::vector<std::string> build_vendor_bridge_command(const CameraConfig& camera, const MediaProfile& profile) {
   if (is_mvs(camera.device)) {
     std::vector<std::string> command{
-        environment_or("MINE_TELEOP_MVS_BRIDGE_BIN", "/opt/mine-teleop/bin/mine-teleop-mvs-camera")};
+        environment_or("MINE_TELEOP_MVS_BRIDGE_BIN", bundled_executable("mine-teleop-mvs-camera"))};
     append_camera_selector(command, camera.device);
     command.insert(command.end(), {
                                       "--width", std::to_string(profile.width),
@@ -70,15 +85,16 @@ std::vector<std::string> build_vendor_bridge_command(const CameraConfig& camera,
                                   });
     return command;
   }
-  if (is_pylon(camera.device)) {
+  if (is_aravis(camera.device)) {
     std::vector<std::string> command{
-        environment_or("MINE_TELEOP_PYLON_BRIDGE_BIN", "/opt/mine-teleop/bin/mine-teleop-pylon-camera")};
+        environment_or("MINE_TELEOP_ARAVIS_BRIDGE_BIN", bundled_executable("mine-teleop-aravis-camera"))};
     append_camera_selector(command, camera.device);
     command.insert(command.end(), {
                                       "--width", std::to_string(profile.width),
                                       "--height", std::to_string(profile.height),
                                       "--fps", std::to_string(profile.fps),
                                       "--frames", "0",
+                                      "--jpeg-quality", environment_or("MINE_TELEOP_ARAVIS_JPEG_QUALITY", "80"),
                                   });
     return command;
   }
@@ -163,7 +179,7 @@ CameraFrameSource::CameraFrameSource(CameraConfig camera, MediaProfile profile, 
   output_height_ = profile_.height;
   if (camera_.device == "testsrc") {
     mode_ = Mode::TestSource;
-  } else if (is_mvs(camera_.device) || is_pylon(camera_.device)) {
+  } else if (is_mvs(camera_.device) || is_aravis(camera_.device)) {
     mode_ = Mode::VendorBridge;
     command_ = build_vendor_bridge_command(camera_, profile_);
   } else {

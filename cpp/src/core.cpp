@@ -238,10 +238,20 @@ ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_
     return {false, "control_token_invalid", std::nullopt, {}};
   }
   if (last_seq_ && command.seq <= *last_seq_) return {false, "old_seq", std::nullopt, {}};
+  const auto timestamp_delta_ms = receive_time_ms - command.ts_ms;
+  if (!command.estop && timestamp_delta_ms > max_command_gap_ms_) {
+    return {false, "command_age_exceeded", std::nullopt, {}};
+  }
+  if (!command.estop && timestamp_delta_ms < -max_command_gap_ms_) {
+    return {false, "command_timestamp_in_future", std::nullopt, {}};
+  }
   if (last_valid_receive_ms_ && receive_time_ms < *last_valid_receive_ms_) {
     return {false, "receive_time_reversed", std::nullopt, {}};
   }
   if (last_valid_receive_ms_ && receive_time_ms - *last_valid_receive_ms_ > max_command_gap_ms_ && !command.estop) {
+    // Drop the first command after a gap, but re-arm timing so the next fresh
+    // heartbeat can recover instead of permanently locking out control.
+    last_valid_receive_ms_ = receive_time_ms;
     return {false, "command_gap_exceeded", std::nullopt, {}};
   }
   last_seq_ = command.seq;
@@ -408,6 +418,8 @@ Json VehicleConfig::redacted_summary() const {
       {"camera_count", enabled_cameras().size()},
       {"vehicle_adapter_type", vehicle_adapter.type},
       {"can_interface", hardware.can_interface},
+      {"require_time_sync", field_safety.require_time_sync},
+      {"max_time_sync_uncertainty_ms", field_safety.max_time_sync_uncertainty_ms},
       {"recording_root", recording.root_dir.string()},
       {"upload_enabled", upload.enabled},
   };
@@ -542,6 +554,15 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
       optional<bool>(safety, "require_can_feedback_before_control", true);
   config.field_safety.require_local_estop_reset = optional<bool>(safety, "require_local_estop_reset", true);
   config.field_safety.require_time_sync = optional<bool>(safety, "require_time_sync", true);
+  config.field_safety.max_time_sync_uncertainty_ms =
+      optional<int>(safety, "max_time_sync_uncertainty_ms", 25);
+  config.field_safety.time_sync_interval_ms = optional<int>(safety, "time_sync_interval_ms", 30000);
+  config.field_safety.time_sync_samples = optional<int>(safety, "time_sync_samples", 7);
+  if (config.field_safety.max_time_sync_uncertainty_ms < 0 ||
+      config.field_safety.time_sync_interval_ms <= 0 ||
+      config.field_safety.time_sync_samples < 3 || config.field_safety.time_sync_samples > 15) {
+    throw std::runtime_error("field_safety time sync settings are invalid");
+  }
 
   const auto recording = root["recording"];
   config.recording.root_dir = optional<std::string>(recording, "root_dir", ".local/recordings");

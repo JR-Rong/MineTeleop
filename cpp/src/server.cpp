@@ -235,9 +235,10 @@ body{background:#0b1220;color:#e5e7eb;font-family:system-ui;margin:0;padding:20p
 <section id="cameras" class="grid"></section><pre id="status">等待连接</pre></main><script>
 const state={left:false,right:false,up:false,down:false,brake:false};
 const webrtcLabel=document.getElementById('webrtc'),cameraGrid=document.getElementById('cameras'),statusPanel=document.getElementById('status');
-let peer=null,pendingIce=[],remoteCameraIds=[],polling=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false;const previousStats=new Map(),cameraByMid=new Map();
+let peer=null,pendingIce=[],remoteCameraIds=[],polling=false,heartbeatInFlight=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false;const previousStats=new Map(),cameraByMid=new Map();
 async function post(path,body={}){const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
 async function send(extra={}){return post('/api/control/keyboard',{...state,...extra})}
+async function heartbeat(){if(!polling||heartbeatInFlight)return;heartbeatInFlight=true;try{await send()}finally{heartbeatInFlight=false}}
 function advertisedCodecs(){const caps=RTCRtpReceiver.getCapabilities&&RTCRtpReceiver.getCapabilities('video');const found=new Set(['h264']);for(const c of (caps&&caps.codecs)||[]){const m=(c.mimeType||'').toLowerCase();if(m.includes('h265')||m.includes('hevc'))found.add('h265');if(m.includes('h264')||m.includes('avc'))found.add('h264')}return [...found]}
 async function connect(){if(polling)return;await post('/api/connect');await post('/api/webrtc/capabilities',{codecs:advertisedCodecs()});polling=true;pollSignaling()}
 document.querySelector('#connect').onclick=()=>connect().catch(alert);
@@ -248,9 +249,33 @@ addEventListener('keyup',e=>{if(keys[e.key]){state[keys[e.key]]=false;send();e.p
 async function pollSignaling(){while(polling){try{const data=await post('/api/poll-signaling');for(const message of data.messages||[]){if(message.type==='webrtc_offer')await startFromOffer(message.payload||{});if(message.type==='ice_candidate')await addIce(message.payload||{});if(message.type==='media_status')mediaStatus=message.payload||{lanes:[]}}}catch(e){webrtcLabel.textContent='信令错误: '+e.message}await new Promise(r=>setTimeout(r,100))}}
 async function addIce(candidate){if(!candidate.candidate)return;if(!peer||!peer.remoteDescription){pendingIce.push(candidate);return}await peer.addIceCandidate(candidate)}
 function attach(cameraId,stream){let box=document.getElementById('camera-'+cameraId);if(!box){box=document.createElement('article');box.id='camera-'+cameraId;box.className='camera';box.innerHTML='<span class="label"></span><video autoplay playsinline muted></video>';box.querySelector('.label').textContent=cameraId;cameraGrid.appendChild(box)}box.querySelector('video').srcObject=stream}
-async function startFromOffer(offer){if(peer)peer.close();pendingIce=[];cameraByMid.clear();previousStats.clear();h265FailureSamples=0;h265FallbackSent=false;remoteCameraIds=(offer.media_tracks||[]).map(t=>t.camera_id);peer=new RTCPeerConnection({bundlePolicy:'max-bundle'});webrtcLabel.textContent=`协商 ${offer.codec||''}/${offer.backend||''}`;peer.onconnectionstatechange=()=>webrtcLabel.textContent=peer.connectionState;peer.onicecandidate=e=>{if(e.candidate)post('/api/webrtc/ice-candidate',{candidate:e.candidate.toJSON()}).catch(console.error)};peer.ontrack=e=>{const id=remoteCameraIds.shift()||e.transceiver.mid||e.track.id;cameraByMid.set(e.transceiver.mid||'',id);attach(id,e.streams[0]||new MediaStream([e.track]))};await peer.setRemoteDescription({type:'offer',sdp:offer.sdp});while(pendingIce.length)await addIce(pendingIce.shift());const answer=await peer.createAnswer();await peer.setLocalDescription(answer);await post('/api/webrtc/answer',{type:'answer',sdp:peer.localDescription.sdp})}
-async function collectMetrics(){if(!peer)return;const report=await peer.getStats();let rtt=0;for(const s of report.values())if(s.type==='candidate-pair'&&s.state==='succeeded'&&s.nominated)rtt=Number(s.currentRoundTripTime||0);const streams=[];for(const s of report.values()){if(s.type!=='inbound-rtp'||(s.kind||s.mediaType)!=='video')continue;const prior=previousStats.get(s.id);let fps=Number(s.framesPerSecond||0);if(!fps&&prior){const seconds=(s.timestamp-prior.timestamp)/1000;if(seconds>0)fps=(Number(s.framesDecoded||0)-prior.framesDecoded)/seconds}previousStats.set(s.id,{timestamp:s.timestamp,framesDecoded:Number(s.framesDecoded||0)});const jitterMs=Number(s.jitterBufferEmittedCount||0)>0?Number(s.jitterBufferDelay||0)*1000/Number(s.jitterBufferEmittedCount):0;const processingMs=Number(s.framesDecoded||0)>0?Number(s.totalProcessingDelay||0)*1000/Number(s.framesDecoded):0;const cameraId=cameraByMid.get(s.mid||'')||'';const lane=(mediaStatus.lanes||[]).find(l=>l.camera_id===cameraId)||{};const captureEncodeMs=Number(lane.capture_to_encoded_ms||0);const latencyMs=captureEncodeMs+rtt*500+jitterMs+processingMs;streams.push({camera_id:cameraId,mid:s.mid||'',codec_id:s.codecId||'',fps,frames_decoded:Number(s.framesDecoded||0),frames_dropped:Number(s.framesDropped||0),packets_lost:Number(s.packetsLost||0),jitter_ms:Number(s.jitter||0)*1000,capture_to_encoded_ms:captureEncodeMs,jitter_buffer_ms:jitterMs,processing_ms:processingMs,round_trip_ms:rtt*1000,estimated_end_to_end_latency_ms:latencyMs,passed:fps>=20&&latencyMs<=200})}const metrics={sampled_at_ms:Date.now(),connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',latency_method:'capture-to-encoded + rtt/2 + jitter-buffer + browser-processing',streams,passed:streams.length>0&&streams.every(s=>s.passed)};await post('/api/webrtc/metrics',metrics);if(metrics.codec==='h265'&&metrics.connection_state==='connected'&&streams.length){h265FailureSamples=streams.some(s=>s.fps<20)?h265FailureSamples+1:0;if(h265FailureSamples>=3&&!h265FallbackSent){h265FallbackSent=true;await post('/api/webrtc/fallback',{codec:'h264',reason:'h265_decode_fps_below_20'})}}else h265FailureSamples=0;statusPanel.textContent=JSON.stringify(metrics,null,2)}
+async function startFromOffer(offer){if(peer)peer.close();cameraGrid.replaceChildren();pendingIce=[];cameraByMid.clear();previousStats.clear();h265FailureSamples=0;h265FallbackSent=false;remoteCameraIds=(offer.media_tracks||[]).map(t=>t.camera_id);peer=new RTCPeerConnection({bundlePolicy:'max-bundle'});webrtcLabel.textContent=`协商 ${offer.codec||''}/${offer.backend||''}`;peer.onconnectionstatechange=()=>webrtcLabel.textContent=peer.connectionState;peer.onicecandidate=e=>{if(e.candidate)post('/api/webrtc/ice-candidate',{candidate:e.candidate.toJSON()}).catch(console.error)};peer.ontrack=e=>{const id=remoteCameraIds.shift()||e.transceiver.mid||e.track.id;cameraByMid.set(e.transceiver.mid||'',id);attach(id,e.streams[0]||new MediaStream([e.track]))};await peer.setRemoteDescription({type:'offer',sdp:offer.sdp});while(pendingIce.length)await addIce(pendingIce.shift());const answer=await peer.createAnswer();await peer.setLocalDescription(answer);await post('/api/webrtc/answer',{type:'answer',sdp:peer.localDescription.sdp})}
+async function collectMetrics(){
+  if(!peer)return;
+  const report=await peer.getStats(),sampledAt=Date.now();
+  let rtt=0;
+  for(const s of report.values())if(s.type==='candidate-pair'&&s.state==='succeeded'&&s.nominated)rtt=Number(s.currentRoundTripTime||0);
+  const streams=[];
+  for(const s of report.values()){
+    if(s.type!=='inbound-rtp'||(s.kind||s.mediaType)!=='video')continue;
+    const statsKey=s.mid||String(s.ssrc||s.id),prior=previousStats.get(statsKey),decoded=Number(s.framesDecoded||0);
+    let fps=Number(s.framesPerSecond||0);
+    if(!fps&&prior){const seconds=(sampledAt-prior.sampledAt)/1000;if(seconds>0)fps=(decoded-prior.framesDecoded)/seconds}
+    previousStats.set(statsKey,{sampledAt,framesDecoded:decoded});
+    const jitterMs=Number(s.jitterBufferEmittedCount||0)>0?Number(s.jitterBufferDelay||0)*1000/Number(s.jitterBufferEmittedCount):0;
+    const processingMs=decoded>0?Number(s.totalProcessingDelay||0)*1000/decoded:0;
+    const cameraId=cameraByMid.get(s.mid||'')||'',lane=(mediaStatus.lanes||[]).find(l=>l.camera_id===cameraId)||{};
+    const captureEncodeMs=Number(lane.capture_to_encoded_ms||0),latencyMs=captureEncodeMs+rtt*500+jitterMs+processingMs;
+    streams.push({camera_id:cameraId,mid:s.mid||'',codec_id:s.codecId||'',fps,frames_decoded:decoded,frames_dropped:Number(s.framesDropped||0),packets_lost:Number(s.packetsLost||0),jitter_ms:Number(s.jitter||0)*1000,capture_to_encoded_ms:captureEncodeMs,jitter_buffer_ms:jitterMs,processing_ms:processingMs,round_trip_ms:rtt*1000,estimated_end_to_end_latency_ms:latencyMs,passed:fps>=20&&latencyMs<=200})
+  }
+  const timeSync=mediaStatus.time_sync||{};
+  const metrics={sampled_at_ms:sampledAt,connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',time_sync:timeSync,clock_uncertainty_ms:Number(timeSync.uncertainty_ms||0),latency_method:'capture-to-encoded + rtt/2 + jitter-buffer + browser-processing',streams,passed:streams.length>0&&streams.every(s=>s.passed)};
+  await post('/api/webrtc/metrics',metrics);
+  if(metrics.codec==='h265'&&metrics.connection_state==='connected'&&streams.length){h265FailureSamples=streams.some(s=>s.fps<20)?h265FailureSamples+1:0;if(h265FailureSamples>=3&&!h265FallbackSent){h265FallbackSent=true;await post('/api/webrtc/fallback',{codec:'h264',reason:'h265_decode_fps_below_20'})}}else h265FailureSamples=0;
+  statusPanel.textContent=JSON.stringify(metrics,null,2)
+}
 setInterval(()=>collectMetrics().catch(console.error),1000);
+setInterval(()=>heartbeat().catch(console.error),50);
 </script></body></html>)HTML";
 }
 
@@ -501,6 +526,27 @@ ServerResponse SignalingService::handle(const HttpRequest& request) {
 
 ServerResponse SignalingService::handle_get(const HttpRequest& request) {
   if (request.path == "/health") return ServerResponse::json(200, health());
+  if (request.path == "/time") {
+    const auto server_receive_ms = now_ms();
+    const auto encoded_client_send_ms = query_value(request, "client_send_ms");
+    if (encoded_client_send_ms.empty()) throw std::invalid_argument("client_send_ms is required");
+    std::size_t consumed = 0;
+    std::int64_t client_send_ms = 0;
+    try {
+      client_send_ms = std::stoll(encoded_client_send_ms, &consumed);
+    } catch (const std::exception&) {
+      throw std::invalid_argument("client_send_ms must be an integer");
+    }
+    if (consumed != encoded_client_send_ms.size()) {
+      throw std::invalid_argument("client_send_ms must be an integer");
+    }
+    return ServerResponse::json(
+        200,
+        {{"time_domain", "signaling_server"},
+         {"client_send_ms", client_send_ms},
+         {"server_receive_ms", server_receive_ms},
+         {"server_send_ms", now_ms()}});
+  }
   const auto parts = path_parts(request.path);
   std::lock_guard lock(mutex_);
   if (parts.size() == 3 && parts[0] == "signaling" && parts[2] == "messages") {
@@ -688,7 +734,15 @@ DriverConfig load_driver_config(const std::string& path) {
   config.signaling_url = root["cloud"]["signaling_url"].as<std::string>();
   if (root["control"] && root["control"]["rate_hz"]) config.rate_hz = root["control"]["rate_hz"].as<int>();
   if (root["control"] && root["control"]["estop_hold_ms"]) config.estop_hold_ms = root["control"]["estop_hold_ms"].as<int>();
-  if (config.driver_id.empty() || config.signaling_url.empty() || config.rate_hz <= 0 || config.estop_hold_ms < 0) {
+  const auto time_sync = root["time_sync"];
+  if (time_sync && time_sync["max_uncertainty_ms"]) {
+    config.max_time_sync_uncertainty_ms = time_sync["max_uncertainty_ms"].as<int>();
+  }
+  if (time_sync && time_sync["interval_ms"]) config.time_sync_interval_ms = time_sync["interval_ms"].as<int>();
+  if (time_sync && time_sync["samples"]) config.time_sync_samples = time_sync["samples"].as<int>();
+  if (config.driver_id.empty() || config.signaling_url.empty() || config.rate_hz <= 0 || config.estop_hold_ms < 0 ||
+      config.max_time_sync_uncertainty_ms < 0 || config.time_sync_interval_ms <= 0 ||
+      config.time_sync_samples < 3 || config.time_sync_samples > 15) {
     throw std::invalid_argument("driver configuration is invalid");
   }
   return config;
@@ -702,7 +756,18 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
   if (vehicle_id_.empty() || password_.empty()) throw std::invalid_argument("vehicle id and driver password are required");
 }
 
+TimeSyncStatus DriverConsoleRuntime::refresh_time_sync() {
+  const auto status = clock_.synchronize(http_, signaling_http_url_, config_.time_sync_samples);
+  if (!status.acceptable(config_.max_time_sync_uncertainty_ms)) {
+    throw std::runtime_error(
+        "driver time synchronization uncertainty " + std::to_string(status.uncertainty_ms) +
+        "ms exceeds limit " + std::to_string(config_.max_time_sync_uncertainty_ms) + "ms");
+  }
+  return status;
+}
+
 Json DriverConsoleRuntime::connect() {
+  if (clock_.refresh_due(config_.time_sync_interval_ms)) static_cast<void>(refresh_time_sync());
   {
     std::lock_guard lock(mutex_);
     if (!session_id_.empty()) {
@@ -713,6 +778,7 @@ Json DriverConsoleRuntime::connect() {
           {"connected", true},
           {"session_id", session_id_},
           {"connected_at_ms", connected_at_ms_},
+          {"time_sync", clock_.status().to_json()},
       };
     }
   }
@@ -726,7 +792,7 @@ Json DriverConsoleRuntime::connect() {
   session_id_ = required_string(session, "session_id");
   control_token_ = required_string(session, "control_token");
   sequence_ = 0;
-  connected_at_ms_ = now_ms();
+  connected_at_ms_ = clock_.now_ms();
   return {
       {"runtime", "cpp"},
       {"driver_id", config_.driver_id},
@@ -734,6 +800,7 @@ Json DriverConsoleRuntime::connect() {
       {"connected", true},
       {"session_id", session_id_},
       {"connected_at_ms", connected_at_ms_},
+      {"time_sync", clock_.status().to_json()},
   };
 }
 
@@ -820,6 +887,7 @@ Json DriverConsoleRuntime::ingest_webrtc_metrics(const Json& input) {
 }
 
 Json DriverConsoleRuntime::send_control(const Json& input) {
+  if (clock_.refresh_due(config_.time_sync_interval_ms)) static_cast<void>(refresh_time_sync());
   std::string token;
   std::string session;
   std::string control_token;
@@ -836,7 +904,7 @@ Json DriverConsoleRuntime::send_control(const Json& input) {
   command.vehicle_id = vehicle_id_;
   command.session_id = session;
   command.seq = sequence;
-  command.ts_ms = now_ms();
+  command.ts_ms = clock_.now_ms();
   command.gear = input.value("gear", "N");
   command.steering = input.value("steering", 0.0);
   command.throttle = input.value("throttle", 0.0);
@@ -869,6 +937,7 @@ Json DriverConsoleRuntime::status() const {
       {"sequence", sequence_},
       {"connected_at_ms", connected_at_ms_},
       {"last_control_sent_ms", last_control_sent_ms_},
+      {"time_sync", clock_.status().to_json()},
       {"webrtc_metrics", webrtc_metrics_},
       {"last_signaling_messages", signaling_messages_},
   };

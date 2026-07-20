@@ -88,6 +88,7 @@ Usage:
   mine-teleop signaling-server [options]
   mine-teleop driver-console [options]
   mine-teleop media-probe
+  mine-teleop time-sync --signaling-http-url URL [--samples N] [--max-uncertainty-ms N]
   mine-teleop http-health --url URL
   mine-teleop vehicle-online [options]
   mine-teleop control-smoke [options]
@@ -173,8 +174,9 @@ Json preflight(const VehicleConfig& config) {
   for (const auto& camera : config.enabled_cameras()) {
     const bool virtual_source = camera.device == "testsrc" || camera.device == "mvs" ||
                                 camera.device.starts_with("mvs:") || camera.device.starts_with("hikrobot:") ||
+                                camera.device == "aravis" || camera.device.starts_with("aravis:") ||
                                 camera.device == "pylon" || camera.device.starts_with("pylon:") ||
-                                camera.device.starts_with("basler:");
+                                camera.device == "basler" || camera.device.starts_with("basler:");
     add("camera:" + camera.id, virtual_source || std::filesystem::exists(camera.device), camera.device);
   }
 
@@ -354,7 +356,7 @@ int run_vehicle_media_agent(const Arguments& arguments) {
       std::move(forced_codec),
       arguments.integer("--simulate-primary-failure-after-frames", 0));
   const auto summary = runtime.run(
-      arguments.has("--service") ? 0 : arguments.integer("--frames", 30),
+      arguments.has("--service") ? 0 : arguments.integer("--frames", arguments.has("--duration-ms") ? 0 : 30),
       arguments.has("--service") ? 0 : arguments.integer("--duration-ms", -1),
       arguments.integer("--capture-interval-ms", 0));
   std::cout << summary.dump() << '\n';
@@ -387,6 +389,22 @@ int run_http_health(const Arguments& arguments) {
   const auto response = http.get_json(url);
   std::cout << Json({{"event", "http_health"}, {"passed", true}, {"url", url}, {"response", response}}).dump() << '\n';
   return 0;
+}
+
+int run_time_sync(const Arguments& arguments) {
+  const auto signaling = arguments.value("--signaling-http-url", "http://127.0.0.1:8765");
+  const auto samples = arguments.integer("--samples", 7);
+  const auto max_uncertainty_ms = arguments.integer("--max-uncertainty-ms", 25);
+  mine_teleop::HttpClient http;
+  mine_teleop::SynchronizedClock clock;
+  const auto status = clock.synchronize(http, signaling, samples);
+  auto result = status.to_json();
+  result["event"] = "time_sync_probe";
+  result["logical_now_ms"] = clock.now_ms();
+  result["max_uncertainty_ms"] = max_uncertainty_ms;
+  result["passed"] = status.acceptable(max_uncertainty_ms);
+  std::cout << result.dump() << '\n';
+  return result.at("passed").get<bool>() ? 0 : 2;
 }
 
 int run_vehicle_online(const Arguments& arguments) {
@@ -444,6 +462,13 @@ int run_control_smoke(const Arguments& arguments) {
 
 int main(int argc, char** argv) {
   try {
+    if (argc > 0 && argv[0] != nullptr && *argv[0] != '\0') {
+      std::error_code path_error;
+      const auto executable = std::filesystem::absolute(argv[0], path_error);
+      if (!path_error && std::filesystem::is_regular_file(executable, path_error) && !path_error) {
+        ::setenv("MINE_TELEOP_EXECUTABLE_PATH", executable.c_str(), 1);
+      }
+    }
     if (argc < 2 || std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "help") {
       print_help();
       return 0;
@@ -467,6 +492,7 @@ int main(int argc, char** argv) {
     if (command == "vehicle-media-agent") return run_vehicle_media_agent(arguments);
     if (command == "vehicle-uploader") return run_vehicle_uploader(arguments);
     if (command == "http-health") return run_http_health(arguments);
+    if (command == "time-sync") return run_time_sync(arguments);
     if (command == "vehicle-online") return run_vehicle_online(arguments);
     if (command == "control-smoke") return run_control_smoke(arguments);
     if (command == "signaling-server") return run_signaling_server(arguments);

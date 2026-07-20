@@ -20,7 +20,8 @@ entry points do not require Python.
 - `cpp/src/upload.cpp`: atomic sidecar scanning, SHA-256 verification,
   bandwidth limiting, and resumable local archive upload.
 - `cpp/bridges/mvs_camera_bridge.cpp`: optional Hikrobot MVS bridge.
-- `scripts/pylon_camera_bridge.cpp`: optional Basler pylon bridge.
+- `cpp/bridges/aravis_camera_bridge.cpp`: minimal Aravis/libusb USB3 Vision
+  bridge for Basler and other GenICam cameras.
 
 The stable chassis adapter ABI is in
 `deployments/chassis-control-bridge/mine_teleop_chassis_bridge.h`. A production
@@ -61,20 +62,22 @@ Configuration and credentials are mounted outside the package. NVIDIA's kernel
 driver remains a hardware/OS prerequisite; the matching redistributable NVIDIA
 userspace libraries must be copied into `lib/` for a field package.
 
-For the chassis integration or licensed Hikrobot/Basler cameras, place
-redistributable files under `vendor/chassis`, `vendor/mvs`, or `vendor/pylon`
-before building. See `vendor/README.md`. Their bridge and shared libraries are
-then carried in the same bundle; the target x64 Ubuntu host does not need an SDK
-installation or a source checkout.
+For the chassis integration or licensed Hikrobot cameras, place redistributable
+files under `vendor/chassis` or `vendor/mvs` before building. See
+`vendor/README.md`. Basler USB3 Vision cameras use the pinned, library-only
+Aravis/libusb build and do not require pylon. All bridge shared libraries are
+carried in the bundle; the target x64 Ubuntu host does not need an SDK
+installation or source checkout.
 
 ## Commands
 
 ```bash
 package_root=/opt/mine-teleop
-export LD_LIBRARY_PATH="$package_root/lib:$package_root/lib/vendor/chassis:$package_root/lib/vendor/mvs:$package_root/lib/vendor/pylon"
+export LD_LIBRARY_PATH="$package_root/lib:$package_root/lib/vendor/chassis:$package_root/lib/vendor/mvs"
 export GST_PLUGIN_SYSTEM_PATH_1_0=
 export GST_PLUGIN_PATH_1_0="$package_root/lib/gstreamer-1.0"
 export GST_PLUGIN_SCANNER="$package_root/bin/gst-plugin-scanner"
+export GST_REGISTRY_FORK=no
 export GST_REGISTRY=/var/tmp/mine-teleop-gstreamer-registry.bin
 export LIBVA_DRIVERS_PATH="$package_root/lib/dri"
 mt() {
@@ -84,6 +87,7 @@ mt() {
 
 mt version
 mt config-check --config /etc/mine-teleop/vehicle-agent.yaml
+mt time-sync --signaling-http-url http://control-host:8765 --samples 7 --max-uncertainty-ms 25
 
 mt signaling-server --host 0.0.0.0 --port 8765
 mt driver-console --host 0.0.0.0 --port 8080
@@ -111,9 +115,23 @@ mt vehicle-uploader \
 ```
 
 Credentials can be supplied with `MINE_TELEOP_DRIVER_PASSWORD` and
-`MINE_TELEOP_DEVICE_TOKEN`. For systemd, install the units from
-`deployments/systemd` and create `/etc/mine-teleop/mine-teleop.env` from the
-provided example.
+`MINE_TELEOP_DEVICE_TOKEN`. Vehicle deployment is foreground-only: run
+`vehicle-agent --teleop --service` and `vehicle-media-agent --service` in two
+terminals, `tmux`, or the caller's existing process supervisor. The deployment
+flow does not install or require systemd units. Without an external USB ACL,
+the media command must run as root so libusb can open a Basler USB3 Vision
+device for control and streaming.
+
+Both vehicle processes and the driver console synchronize to the signaling
+server's application time domain before opening a session. They use 7
+four-timestamp samples, select the lowest-RTT samples, report offset/RTT/
+uncertainty, and refresh every 30 seconds. With `require_time_sync: true`, the
+vehicle refuses remote operation when uncertainty exceeds
+`max_time_sync_uncertainty_ms`; no host NTP package is required for relative
+latency measurements. The browser sends the current control state at 20 Hz;
+non-emergency commands older than `max_command_gap_ms` (or too far in the
+future) are rejected in the shared time domain, while emergency stop remains
+available regardless of command age.
 
 ## Development control plane
 
@@ -138,8 +156,12 @@ capabilities without using the removed per-frame upload path.
 - Realtime encoding defaults to NVENC and falls back to Intel VAAPI. Recording
   tees the already encoded H.264/H.265 access units into `splitmuxsink/mp4mux`;
   no second encoder process is launched.
-- MVS and pylon are compiled only when their redistributable SDK bundle is
-  supplied; selecting one without its bridge fails explicitly.
+- The Aravis/libusb bridge is built from a pinned source revision with USB3
+  Vision enabled and viewer, GStreamer plugin, introspection, documentation,
+  tests, and packet-socket support disabled. `aravis:`, `basler:`, and legacy
+  `pylon:` device selectors all use this bridge; no pylon library is loaded.
+- MVS is compiled only when its redistributable SDK bundle is supplied;
+  selecting it without its bridge fails explicitly.
 - `mock` is for bench validation only. Field configurations should use the
   dynamic chassis bridge and require CAN feedback.
 - The strict test artifact carries its userspace dynamic loader and libraries,

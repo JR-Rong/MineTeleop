@@ -88,6 +88,17 @@ class MediaSignalingClient {
         origin_ + "/vehicles/online", {{"vehicle_id", vehicle_id_}, {"device_token", device_token_}}));
   }
 
+  TimeSyncStatus synchronize_time(int sample_count) {
+    return clock_.synchronize(http_, origin_, sample_count);
+  }
+
+  [[nodiscard]] TimeSyncStatus time_sync_status() const { return clock_.status(); }
+  [[nodiscard]] bool time_sync_refresh_due(int interval_ms) const { return clock_.refresh_due(interval_ms); }
+  [[nodiscard]] std::int64_t now_ms() const { return clock_.now_ms(); }
+  [[nodiscard]] std::int64_t from_local_system_ms(std::int64_t value) const {
+    return clock_.from_local_system_ms(value);
+  }
+
   bool discover_session() {
     const auto response = http_.get_json(
         origin_ + "/vehicles/" + http_.url_encode(vehicle_id_) + "/session?device_token=" +
@@ -127,6 +138,7 @@ class MediaSignalingClient {
   std::string vehicle_id_;
   std::string device_token_;
   HttpClient http_{std::chrono::seconds(5)};
+  SynchronizedClock clock_;
   std::string session_id_;
   std::string driver_id_;
 };
@@ -135,6 +147,7 @@ class MediaSignalingClient {
 
 struct VehicleMediaRuntime::Impl {
   struct Lane {
+    Impl* owner{nullptr};
     CameraConfig camera;
     MediaProfile profile;
     std::unique_ptr<CameraFrameSource> source;
@@ -188,7 +201,8 @@ struct VehicleMediaRuntime::Impl {
       GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
       if (buffer != nullptr && GST_BUFFER_PTS_IS_VALID(buffer)) {
         const auto captured_at_ms = lane->pipeline_started_ms + static_cast<std::int64_t>(GST_BUFFER_PTS(buffer) / GST_MSECOND);
-        const auto latency_ms = static_cast<std::uint64_t>(std::max<std::int64_t>(0, now_ms() - captured_at_ms));
+        const auto latency_ms = static_cast<std::uint64_t>(std::max<std::int64_t>(
+            0, lane->owner->signaling.now_ms() - captured_at_ms));
         ++lane->encode_latency_samples;
         lane->encode_latency_total_ms += latency_ms;
         auto observed = lane->encode_latency_max_ms.load();
@@ -276,7 +290,7 @@ struct VehicleMediaRuntime::Impl {
     if (forced_codec.has_value()) return {parse_video_codec(*forced_codec)};
     const auto preferred = parse_video_codec(config.hardware.preferred_codec);
     const auto fallback = parse_video_codec(config.hardware.fallback_codec);
-    const auto deadline = now_ms() + std::max(0, timeout_ms);
+    const auto deadline = signaling.now_ms() + std::max(0, timeout_ms);
     do {
       try {
         const auto response = signaling.poll("media_capabilities");
@@ -302,11 +316,11 @@ struct VehicleMediaRuntime::Impl {
           throw std::runtime_error("driver does not advertise H.264 or H.265 WebRTC decoding");
         }
       } catch (const std::exception& error) {
-        if (now_ms() >= deadline) throw;
+        if (signaling.now_ms() >= deadline) throw;
         last_negotiation_warning = error.what();
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    } while (now_ms() < deadline);
+    } while (signaling.now_ms() < deadline);
     return {fallback};
   }
 
@@ -347,7 +361,7 @@ struct VehicleMediaRuntime::Impl {
         const auto& record_profile = config.record_profile(lane->camera.record_profile);
         const auto directory = recording_root / config.vehicle_id / signaling.session_id() / lane->camera.id;
         std::filesystem::create_directories(directory);
-        const auto pattern = directory / (std::to_string(now_ms()) + "_" + lane->camera.id + "_%05d.mp4");
+        const auto pattern = directory / (std::to_string(signaling.now_ms()) + "_" + lane->camera.id + "_%05d.mp4");
         pipeline_text
             << "encoded_" << id << ". ! queue "
             << "! " << parser << " config-interval=-1 "
@@ -366,6 +380,7 @@ struct VehicleMediaRuntime::Impl {
     lanes.clear();
     for (const auto& camera : config.enabled_cameras()) {
       auto lane = std::make_unique<Lane>();
+      lane->owner = this;
       lane->camera = camera;
       lane->profile = config.realtime_profile(camera.realtime_profile);
       MediaProfile capture = lane->profile;
@@ -430,7 +445,7 @@ struct VehicleMediaRuntime::Impl {
       stop_pipeline();
       return false;
     }
-    started_ms = now_ms();
+    started_ms = signaling.now_ms();
     for (const auto& lane : lanes) {
       lane->pipeline_started_ms = started_ms;
       lane->thread = std::thread([this, lane = lane.get(), capture_interval_ms] {
@@ -451,6 +466,7 @@ struct VehicleMediaRuntime::Impl {
               }
             }
             auto frame = lane->source->next(++sequence);
+            frame.captured_at_ms = signaling.from_local_system_ms(frame.captured_at_ms);
             ++lane->captured;
             lane->last_capture_ms = frame.captured_at_ms;
             GstBuffer* buffer = gst_buffer_new_allocate(nullptr, frame.payload.size(), nullptr);
@@ -534,7 +550,7 @@ struct VehicleMediaRuntime::Impl {
       if (std::filesystem::exists(metadata_path)) continue;
       const auto camera_id = entry.path().parent_path().filename().string();
       const auto segment_id = entry.path().stem().string();
-      const auto timestamp = now_ms();
+      const auto timestamp = signaling.now_ms();
       const Json metadata = {
           {"vehicle_id", config.vehicle_id},
           {"session_id", signaling.session_id()},
@@ -671,10 +687,17 @@ struct VehicleMediaRuntime::Impl {
     if (capture_interval_ms < 0) throw std::invalid_argument("capture interval must be non-negative");
     failover_count = 0;
     last_negotiation_warning.clear();
+    const auto initial_time_sync = signaling.synchronize_time(config.field_safety.time_sync_samples);
+    if (config.field_safety.require_time_sync &&
+        !initial_time_sync.acceptable(config.field_safety.max_time_sync_uncertainty_ms)) {
+      throw std::runtime_error(
+          "media time synchronization uncertainty " + std::to_string(initial_time_sync.uncertainty_ms) +
+          "ms exceeds limit " + std::to_string(config.field_safety.max_time_sync_uncertainty_ms) + "ms");
+    }
     signaling.register_online();
-    const auto session_deadline = now_ms() + 5000;
+    const auto session_deadline = signaling.now_ms() + 5000;
     while (!signaling.discover_session()) {
-      if (now_ms() >= session_deadline) throw std::runtime_error("timed out waiting for an active driver session");
+      if (signaling.now_ms() >= session_deadline) throw std::runtime_error("timed out waiting for an active driver session");
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     const auto codecs = negotiate_codecs(3000);
@@ -687,7 +710,7 @@ struct VehicleMediaRuntime::Impl {
     Json attempts = Json::array();
     Json errors = Json::array();
     Json final_lanes = Json::array();
-    std::int64_t total_started_ms = now_ms();
+    std::int64_t total_started_ms = signaling.now_ms();
     EncoderCandidate successful = candidates.front();
 
     for (std::size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index) {
@@ -695,7 +718,7 @@ struct VehicleMediaRuntime::Impl {
       simulated_failure_fired = false;
       codec_fallback_requested = false;
       const auto candidate = candidates[candidate_index];
-      const auto attempt_started = now_ms();
+      const auto attempt_started = signaling.now_ms();
       if (!start_pipeline(candidate, capture_interval_ms)) {
         const auto error = current_pipeline_error();
         attempts.push_back({{"backend", to_string(candidate.backend)}, {"codec", to_string(candidate.codec)}, {"passed", false}, {"error", error}});
@@ -705,20 +728,34 @@ struct VehicleMediaRuntime::Impl {
         continue;
       }
       const auto deadline = duration_ms > 0 ? total_started_ms + duration_ms : std::numeric_limits<std::int64_t>::max();
-      auto next_media_status_ms = now_ms();
-      while (!frame_target_reached(frame_count) && (continuous || now_ms() < deadline)) {
+      auto next_media_status_ms = signaling.now_ms();
+      while (!frame_target_reached(frame_count) && (continuous || signaling.now_ms() < deadline)) {
         while (g_main_context_iteration(nullptr, false)) {
         }
         flush_outgoing_signals();
         process_signaling();
         poll_bus();
-        if (now_ms() >= next_media_status_ms) {
+        if (signaling.time_sync_refresh_due(config.field_safety.time_sync_interval_ms)) {
+          try {
+            const auto status = signaling.synchronize_time(config.field_safety.time_sync_samples);
+            if (config.field_safety.require_time_sync &&
+                !status.acceptable(config.field_safety.max_time_sync_uncertainty_ms)) {
+              set_pipeline_error(
+                  "media time synchronization uncertainty exceeds " +
+                  std::to_string(config.field_safety.max_time_sync_uncertainty_ms) + "ms");
+            }
+          } catch (const std::exception& error) {
+            if (config.field_safety.require_time_sync) set_pipeline_error("media time synchronization failed: " + std::string(error.what()));
+          }
+        }
+        if (signaling.now_ms() >= next_media_status_ms) {
           queue_signal(
               "media_status",
               {{"codec", to_string(candidate.codec)},
                {"backend", to_string(candidate.backend)},
-               {"lanes", lane_metrics(std::max<std::int64_t>(1, now_ms() - attempt_started))}});
-          next_media_status_ms = now_ms() + 1000;
+               {"time_sync", signaling.time_sync_status().to_json()},
+               {"lanes", lane_metrics(std::max<std::int64_t>(1, signaling.now_ms() - attempt_started))}});
+          next_media_status_ms = signaling.now_ms() + 1000;
         }
         if (simulate_primary_failure_after_frames > 0 && candidate_index == 0 && !simulated_failure_fired &&
             total_encoded() >= static_cast<std::uint64_t>(simulate_primary_failure_after_frames)) {
@@ -729,10 +766,10 @@ struct VehicleMediaRuntime::Impl {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
       }
       flush_outgoing_signals();
-      const auto elapsed = std::max<std::int64_t>(1, now_ms() - attempt_started);
+      const auto elapsed = std::max<std::int64_t>(1, signaling.now_ms() - attempt_started);
       final_lanes = lane_metrics(elapsed);
       const auto error = current_pipeline_error();
-      const bool passed = error.empty() && total_encoded() > 0;
+      const bool passed = error.empty() && answer_received && total_encoded() > 0;
       attempts.push_back({
           {"backend", to_string(candidate.backend)},
           {"codec", to_string(candidate.codec)},
@@ -756,7 +793,7 @@ struct VehicleMediaRuntime::Impl {
       if (candidate_index + 1 < candidates.size()) ++failover_count;
     }
 
-    const auto total_elapsed = std::max<std::int64_t>(1, now_ms() - total_started_ms);
+    const auto total_elapsed = std::max<std::int64_t>(1, signaling.now_ms() - total_started_ms);
     bool fps_passed = !final_lanes.empty();
     for (const auto& lane : final_lanes) {
       if (lane.value("encoded_fps", 0.0) < config.hardware.min_realtime_fps) fps_passed = false;
@@ -775,6 +812,7 @@ struct VehicleMediaRuntime::Impl {
         {"duration_ms", total_elapsed},
         {"minimum_fps", config.hardware.min_realtime_fps},
         {"max_end_to_end_latency_ms", config.hardware.max_end_to_end_latency_ms},
+        {"time_sync", signaling.time_sync_status().to_json()},
         {"fps_passed", fps_passed},
         {"recording_enabled", !recording_root.empty()},
         {"recording_root", recording_root.string()},

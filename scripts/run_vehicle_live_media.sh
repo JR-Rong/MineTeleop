@@ -4,7 +4,7 @@ set -euo pipefail
 install_dir="${MINE_TELEOP_INSTALL_DIR:-/opt/mine-teleop}"
 mine_teleop_bin="${MINE_TELEOP_BIN:-$install_dir/bin/mine-teleop}"
 mine_teleop_loader="${MINE_TELEOP_LOADER:-$install_dir/lib/ld-linux-x86-64.so.2}"
-mine_teleop_library_path="$install_dir/lib:$install_dir/lib/vendor/chassis:$install_dir/lib/vendor/mvs:$install_dir/lib/vendor/pylon"
+mine_teleop_library_path="$install_dir/lib:$install_dir/lib/vendor/chassis:$install_dir/lib/vendor/mvs"
 config="${MINE_TELEOP_CONFIG_LIVE:-/etc/mine-teleop/vehicle-agent.yaml}"
 signaling_http_url="${MINE_TELEOP_SIGNALING_HTTP_URL:-http://127.0.0.1:8765}"
 device_token="${MINE_TELEOP_DEVICE_TOKEN:-}"
@@ -32,6 +32,7 @@ mkdir -p "$(dirname "$log_path")"
 export GST_PLUGIN_SYSTEM_PATH_1_0=
 export GST_PLUGIN_PATH_1_0="$install_dir/lib/gstreamer-1.0"
 export GST_PLUGIN_SCANNER="$install_dir/bin/gst-plugin-scanner"
+export GST_REGISTRY_FORK=no
 export GST_REGISTRY="${MINE_TELEOP_GST_REGISTRY:-/var/tmp/mine-teleop-gstreamer-registry-${UID:-0}.bin}"
 export LIBVA_DRIVERS_PATH="$install_dir/lib/dri"
 export LD_LIBRARY_PATH="$mine_teleop_library_path"

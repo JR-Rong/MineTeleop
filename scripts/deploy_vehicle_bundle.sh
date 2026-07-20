@@ -261,6 +261,7 @@ test -x lib/ld-linux-x86-64.so.2
 export GST_PLUGIN_SYSTEM_PATH_1_0=
 export GST_PLUGIN_PATH_1_0="$REMOTE_DIR/lib/gstreamer-1.0"
 export GST_PLUGIN_SCANNER="$REMOTE_DIR/bin/gst-plugin-scanner"
+export GST_REGISTRY_FORK=no
 export GST_REGISTRY="$REMOTE_DIR/.gstreamer-registry.bin"
 export LIBVA_DRIVERS_PATH="$REMOTE_DIR/lib/dri"
 export LD_LIBRARY_PATH="$REMOTE_DIR/lib"
@@ -275,6 +276,7 @@ cd "$REMOTE_DIR"
 export GST_PLUGIN_SYSTEM_PATH_1_0=
 export GST_PLUGIN_PATH_1_0="$REMOTE_DIR/lib/gstreamer-1.0"
 export GST_PLUGIN_SCANNER="$REMOTE_DIR/bin/gst-plugin-scanner"
+export GST_REGISTRY_FORK=no
 export GST_REGISTRY="$REMOTE_DIR/.gstreamer-registry.bin"
 export LIBVA_DRIVERS_PATH="$REMOTE_DIR/lib/dri"
 export LD_LIBRARY_PATH="$REMOTE_DIR/lib"

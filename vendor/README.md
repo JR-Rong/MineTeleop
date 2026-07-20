@@ -16,10 +16,6 @@ vendor/
     include/MvCameraControl.h
     lib/libMvCameraControl.so
     lib/...other MVS redistributable libraries...
-  pylon/
-    bin/pylon-config
-    include/pylon/...
-    lib/pylon-redistributable-libraries
   nvidia/
     lib/libcuda.so.1
     lib/libnvidia-encode.so.1
@@ -33,8 +29,9 @@ RPATHs. The chassis bridge is built with
 redistributable dependency in `vendor/chassis/lib` before building the final
 bundle.
 The repository does not redistribute proprietary SDK binaries. Supply only the
-redistributable files allowed by the Hikrobot/Basler license. V4L2 and test
-sources work without either SDK.
+redistributable files allowed by the Hikrobot license. Basler USB3 Vision
+cameras use the source-built Aravis/libusb bridge and do not require pylon.
+V4L2 and test sources work without either bridge.
 
 NVENC field bundles also need the NVIDIA userspace libraries matching the
 target kernel driver under `vendor/nvidia/lib`. The build copies them into the
