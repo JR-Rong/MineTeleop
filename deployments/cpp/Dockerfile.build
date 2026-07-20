@@ -1,0 +1,101 @@
+FROM ubuntu:22.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        ffmpeg \
+        libcurl4-openssl-dev \
+        libjpeg-dev \
+        libssl-dev \
+        libyaml-cpp-dev \
+        nlohmann-json3-dev \
+        patchelf \
+        pkg-config \
+        v4l-utils \
+        vainfo \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG MINE_TELEOP_BUILD_JOBS=2
+
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B /tmp/mine-teleop-build \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_INSTALL_PREFIX=/opt/mine-teleop \
+    && cmake --build /tmp/mine-teleop-build --parallel "$MINE_TELEOP_BUILD_JOBS" \
+    && ctest --test-dir /tmp/mine-teleop-build --output-on-failure \
+    && cmake --install /tmp/mine-teleop-build \
+    && /opt/mine-teleop/bin/mine-teleop config-check --config /src/configs/vehicle-agent.dev.yaml \
+    && /opt/mine-teleop/bin/mine-teleop vehicle-agent \
+         --config /src/configs/vehicle-agent.dev.yaml \
+         --run-loop \
+         --duration-ms 1000 \
+         --disconnect-at-ms 200
+
+FROM build AS bundle
+
+RUN set -e; \
+    mkdir -p /bundle/bin /bundle/lib /bundle/share/mine-teleop /bundle/etc/ssl/certs /bundle/lib/vendor/chassis /bundle/lib/vendor/mvs /bundle/lib/vendor/pylon; \
+    cp -a /opt/mine-teleop/bin/. /bundle/bin/; \
+    cp -a /opt/mine-teleop/lib/. /bundle/lib/; \
+    cp -a /opt/mine-teleop/share/. /bundle/share/; \
+    cp -L /usr/bin/ffmpeg /usr/bin/ffprobe /usr/bin/v4l2-ctl /usr/bin/vainfo /bundle/bin/; \
+    cp -L /etc/ssl/certs/ca-certificates.crt /bundle/etc/ssl/certs/; \
+    if [ -d /src/vendor/chassis/lib ]; then cp -a /src/vendor/chassis/lib/. /bundle/lib/vendor/chassis/; fi; \
+    if [ -d /src/vendor/mvs/lib ]; then cp -a /src/vendor/mvs/lib/. /bundle/lib/vendor/mvs/; fi; \
+    if [ -d /src/vendor/pylon/lib ]; then cp -a /src/vendor/pylon/lib/. /bundle/lib/vendor/pylon/; fi; \
+    copy_dependencies() { \
+      ldd "$1" 2>/dev/null \
+        | awk '/=> \/.* \(/ {print $3} /^\// {print $1}' \
+        | while read -r library; do \
+            case "$(basename "$library")" in \
+              libc.so.*|ld-linux-*|libpthread.so.*|libdl.so.*|librt.so.*|libm.so.*) continue ;; \
+            esac; \
+            cp -L -n "$library" /bundle/lib/; \
+          done; \
+    }; \
+    pass=0; \
+    while [ "$pass" -lt 4 ]; do \
+      for object in /bundle/bin/* /bundle/lib/*.so* /bundle/lib/vendor/chassis/*.so* /bundle/lib/vendor/mvs/*.so* /bundle/lib/vendor/pylon/*.so*; do \
+        [ -f "$object" ] || continue; \
+        copy_dependencies "$object"; \
+      done; \
+      pass=$((pass + 1)); \
+    done; \
+    for object in /bundle/bin/* /bundle/lib/*.so* /bundle/lib/vendor/chassis/*.so* /bundle/lib/vendor/mvs/*.so* /bundle/lib/vendor/pylon/*.so*; do \
+      [ -f "$object" ] || continue; \
+      patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib/vendor/chassis:$ORIGIN/../lib/vendor/mvs:$ORIGIN/../lib/vendor/pylon:$ORIGIN' "$object" 2>/dev/null || true; \
+    done; \
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'set -euo pipefail' \
+      'root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"' \
+      'export PATH="$root/bin:${PATH:-/usr/bin:/bin}"' \
+      'export LD_LIBRARY_PATH="$root/lib:$root/lib/vendor/chassis:$root/lib/vendor/mvs:$root/lib/vendor/pylon:${LD_LIBRARY_PATH:-}"' \
+      'export SSL_CERT_FILE="${SSL_CERT_FILE:-$root/etc/ssl/certs/ca-certificates.crt}"' \
+      'exec "$root/bin/mine-teleop" "$@"' \
+      > /bundle/mine-teleop; \
+    chmod +x /bundle/mine-teleop; \
+    /bundle/mine-teleop version; \
+    LD_LIBRARY_PATH=/bundle/lib /bundle/bin/ffmpeg -version >/dev/null
+
+FROM ubuntu:22.04 AS runtime
+
+COPY --from=bundle /bundle /opt/mine-teleop
+ENV PATH="/opt/mine-teleop/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/mine-teleop/lib:/opt/mine-teleop/lib/vendor/chassis:/opt/mine-teleop/lib/vendor/mvs:/opt/mine-teleop/lib/vendor/pylon"
+ENV SSL_CERT_FILE="/opt/mine-teleop/etc/ssl/certs/ca-certificates.crt"
+RUN groupadd --system mineteleop \
+    && useradd --system --gid mineteleop --home-dir /opt/mine-teleop --shell /usr/sbin/nologin mineteleop \
+    && mkdir -p /var/lib/mine-teleop/recordings /var/lib/mine-teleop/uploader \
+    && chown -R mineteleop:mineteleop /var/lib/mine-teleop
+USER mineteleop
+WORKDIR /opt/mine-teleop
+ENTRYPOINT ["/opt/mine-teleop/mine-teleop"]
+CMD ["version"]
+
+FROM scratch AS artifact
+COPY --from=bundle /bundle/ /

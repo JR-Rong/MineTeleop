@@ -1,5 +1,7 @@
 # Ubuntu Bundle 架构说明
 
+> 迁移说明：旧打包方式已停用；当前架构以 `cpp/`、根目录 `CMakeLists.txt` 和 `deployments/cpp/Dockerfile.build` 为准。
+
 本文说明 `bin/mine-teleop`、`libmine_teleop_chassis_bridge.so` 和 `libchassis_control.so` 的边界。
 
 ## 总体结构

@@ -1,28 +1,33 @@
-FROM ubuntu:22.04
+FROM ubuntu:22.04 AS build
 
-ENV DEBIAN_FRONTEND=noninteractive
-
+ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        ffmpeg \
-        python3 \
-        python3-yaml \
+        build-essential ca-certificates cmake libcurl4-openssl-dev libjpeg-dev libssl-dev \
+        libyaml-cpp-dev nlohmann-json3-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /opt/mine-teleop
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B /tmp/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/mine-teleop \
+      -DMINE_TELEOP_BUILD_TESTS=OFF \
+    && cmake --build /tmp/build --parallel "$(nproc)" \
+    && cmake --install /tmp/build
 
-COPY configs/ configs/
-COPY driver-console/ driver-console/
-COPY mine_teleop/ mine_teleop/
-COPY scripts/control_plane_smoke.py scripts/control_plane_smoke.py
-COPY signaling-server/ signaling-server/
+FROM ubuntu:22.04
 
-RUN groupadd --system mineteleop \
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg libcurl4 libjpeg-turbo8 libssl3 libyaml-cpp0.7 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system mineteleop \
     && useradd --system --gid mineteleop --home-dir /opt/mine-teleop --shell /usr/sbin/nologin mineteleop
 
+COPY --from=build /opt/mine-teleop /opt/mine-teleop
+WORKDIR /opt/mine-teleop
 USER mineteleop
-
-EXPOSE 8080
-
-CMD ["python3", "-m", "mine_teleop.control_console_container"]
+EXPOSE 8080 8765
+ENTRYPOINT ["/opt/mine-teleop/bin/mine-teleop"]
+CMD ["driver-console", "--config", "/opt/mine-teleop/share/mine-teleop/configs/driver-console.dev.yaml", "--host", "0.0.0.0", "--port", "8080"]

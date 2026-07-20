@@ -10,11 +10,7 @@ signaling_url="${MINE_TELEOP_DRIVER_CONSOLE_SIGNALING_HTTP_URL:-http://host.dock
 vehicle_id="${MINE_TELEOP_DRIVER_CONSOLE_VEHICLE_ID:-vehicle-001}"
 password="${MINE_TELEOP_DRIVER_CONSOLE_PASSWORD:-dev-password}"
 
-docker build \
-  -f "$repo_root/deployments/container/Dockerfile.control" \
-  -t "$image" \
-  "$repo_root"
-
+docker build -f "$repo_root/deployments/container/Dockerfile.control" -t "$image" "$repo_root"
 docker rm -f "$container_name" >/dev/null 2>&1 || true
 
 exec docker run --rm \
@@ -22,11 +18,10 @@ exec docker run --rm \
   --security-opt "no-new-privileges:true" \
   --cap-drop ALL \
   --add-host host.docker.internal:host-gateway \
+  -e MINE_TELEOP_DRIVER_PASSWORD="$password" \
   -p "127.0.0.1:${host_port}:8080" \
-  -e MINE_TELEOP_DRIVER_CONSOLE_SIGNALING_HTTP_URL="$signaling_url" \
-  -e MINE_TELEOP_DRIVER_CONSOLE_VEHICLE_ID="$vehicle_id" \
-  -e MINE_TELEOP_DRIVER_CONSOLE_PASSWORD="$password" \
-  -e MINE_TELEOP_DRIVER_CONSOLE_HOST="0.0.0.0" \
-  -e MINE_TELEOP_DRIVER_CONSOLE_PORT="8080" \
-  -e MINE_TELEOP_DRIVER_CONSOLE_OPERATION_LOG="/tmp/mine-teleop-driver-console/operation-log.jsonl" \
-  "$image"
+  "$image" driver-console \
+    --config /opt/mine-teleop/share/mine-teleop/configs/driver-console.dev.yaml \
+    --host 0.0.0.0 --port 8080 \
+    --signaling-http-url "$signaling_url" \
+    --vehicle-id "$vehicle_id"

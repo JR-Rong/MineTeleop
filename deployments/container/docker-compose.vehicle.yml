@@ -9,13 +9,14 @@ services:
     cap_drop:
       - ALL
     command:
-      - python3
-      - vehicle-agent/vehicle_agent.py
-      - --run-loop
+      - vehicle-agent
       - --config
       - /etc/mine-teleop/vehicle-agent.yaml
+      - --teleop
+      - --service
+    environment:
+      MINE_TELEOP_DEVICE_TOKEN: ${MINE_TELEOP_DEVICE_TOKEN:-dev-device-secret}
     volumes:
-      - ../..:/opt/mine-teleop:ro
       - /etc/mine-teleop:/etc/mine-teleop:ro
       - mine-teleop-recordings:/var/lib/mine-teleop/recordings
     cpus: "1.0"
@@ -32,20 +33,24 @@ services:
       - "no-new-privileges:true"
     cap_drop:
       - ALL
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     command:
-      - python3
-      - vehicle-media-agent/vehicle_media_agent.py
+      - vehicle-media-agent
       - --config
       - /etc/mine-teleop/vehicle-agent.yaml
-      - --mode
-      - pipeline
+      - --driver-console-url
+      - ${MINE_TELEOP_DRIVER_CONSOLE_URL:-http://host.docker.internal:8080}
+      - --service
+      - --record
+      - --recording-root
+      - /var/lib/mine-teleop/recordings
     devices:
       - /dev/dri/renderD128:/dev/dri/renderD128
       - /dev/dri/card1:/dev/dri/card1
       - /dev/video0:/dev/video0
       - /dev/video1:/dev/video1
     volumes:
-      - ../..:/opt/mine-teleop:ro
       - /etc/mine-teleop:/etc/mine-teleop:ro
       - mine-teleop-recordings:/var/lib/mine-teleop/recordings
     cpus: "2.0"
@@ -63,15 +68,15 @@ services:
     cap_drop:
       - ALL
     command:
-      - python3
-      - vehicle-uploader/vehicle_uploader.py
-      - --service-mode
+      - vehicle-uploader
+      - --service
       - --config
       - /etc/mine-teleop/vehicle-agent.yaml
-      - --work-dir
-      - /var/lib/mine-teleop/uploader
+      - --recording-root
+      - /var/lib/mine-teleop/recordings
+      - --archive-root
+      - /var/lib/mine-teleop/uploader/archive
     volumes:
-      - ../..:/opt/mine-teleop:ro
       - /etc/mine-teleop:/etc/mine-teleop:ro
       - mine-teleop-recordings:/var/lib/mine-teleop/recordings
       - mine-teleop-uploader:/var/lib/mine-teleop/uploader

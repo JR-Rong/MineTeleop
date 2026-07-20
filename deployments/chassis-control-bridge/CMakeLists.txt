@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(mine_teleop_chassis_bridge LANGUAGES CXX)
 
-set(CHASSIS_CONTROL_ROOT "/Volumes/SystemDisk/Workspace/ChassisControl" CACHE PATH "ChassisControl checkout")
-set(MINEPILOT_ROOT "/Volumes/SystemDisk/Workspace/MinePilot" CACHE PATH "MinePilot checkout with low-level CAN, can_db, can_receiver, and can_sender headers")
+get_filename_component(MINE_TELEOP_REPOSITORY_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+set(MINE_TELEOP_CHASSIS_VENDOR_ROOT "${MINE_TELEOP_REPOSITORY_ROOT}/vendor/chassis" CACHE PATH "Bundled chassis integration root")
+set(CHASSIS_CONTROL_ROOT "${MINE_TELEOP_CHASSIS_VENDOR_ROOT}/chassis-control" CACHE PATH "Bundled ChassisControl source/header root")
+set(MINEPILOT_ROOT "${MINE_TELEOP_CHASSIS_VENDOR_ROOT}/minepilot" CACHE PATH "Bundled MinePilot CAN source/header root")
 set(MINEPILOT_CAN_COMMON_HEADER "${MINEPILOT_ROOT}/include/can/can_common.h" CACHE FILEPATH "MinePilot low-level can_common.h header")
 set(MINEPILOT_CAN_MESSAGE_HEADER "${MINEPILOT_ROOT}/include/can/can_message.h" CACHE FILEPATH "MinePilot low-level can_message.h header")
 set(MINEPILOT_CAN_DB_HEADER "${MINEPILOT_ROOT}/include/can_db.h" CACHE FILEPATH "MinePilot can_db.h header")
@@ -99,4 +101,8 @@ endif()
 target_link_libraries(mine_teleop_chassis_bridge PRIVATE "${CHASSIS_CONTROL_LIBRARY}")
 set_target_properties(mine_teleop_chassis_bridge PROPERTIES
   OUTPUT_NAME "mine_teleop_chassis_bridge"
+  INSTALL_RPATH "$ORIGIN"
 )
+
+include(GNUInstallDirs)
+install(TARGETS mine_teleop_chassis_bridge LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/vendor/chassis)

@@ -1,5 +1,7 @@
 # 测试与验收
 
+> 迁移说明：本文保留旧实现的设计背景；当前可执行入口与命令以根目录 `README.md` 中的 Ubuntu 22.04 原生 C++ 运行时为准。
+
 工控机现场联调的无 Docker 部署顺序、动态库放置、车端配置生成和
 `target_host_validation_plan.py` 归档流程见
 [当前实现与工控机无 Docker 部署](14-current-status-and-ipc-deployment.md)。

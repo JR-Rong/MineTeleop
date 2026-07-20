@@ -1,0 +1,9 @@
+.git
+.DS_Store
+.local
+build
+dist
+cpp-build
+__pycache__
+*.pyc
+docs/superpowers

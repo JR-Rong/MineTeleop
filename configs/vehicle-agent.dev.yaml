@@ -35,8 +35,8 @@ control:
 media:
   realtime_profiles:
     realtime_720p:
-      codec: h264
-      encoder: vaapi
+      codec: mjpeg
+      encoder: native
       width: 1280
       height: 720
       fps: 30
@@ -44,8 +44,8 @@ media:
       keyframe_interval_frames: 30
       low_latency: true
     realtime_480p15:
-      codec: h264
-      encoder: vaapi
+      codec: mjpeg
+      encoder: native
       width: 854
       height: 480
       fps: 15
@@ -55,7 +55,7 @@ media:
   record_profiles:
     record_source_h264:
       codec: h264
-      encoder: vaapi
+      encoder: libx264
       width: source
       height: source
       fps: source
@@ -89,7 +89,7 @@ hardware:
   encoding:
     vaapi_render_device: /dev/dri/renderD128
     dri_card_device: /dev/dri/card1
-    require_hardware_encoder: true
+    require_hardware_encoder: false
     gstreamer_hardware_plugins:
       - vaapih264enc
       - qsvh264enc

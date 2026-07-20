@@ -1,5 +1,7 @@
 # 控制端 Docker 程序与 Smoke
 
+> 迁移说明：当前 smoke 全部使用原生 C++ 容器，入口为 `scripts/run_control_plane_docker_smoke.sh`。
+
 `deployments/container/Dockerfile.control` 现在默认启动控制端完整程序入口：
 
 ```bash
