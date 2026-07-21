@@ -5,7 +5,7 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 
 BUNDLE="$REPO_ROOT/dist/cpp-ubuntu22.04-amd64.tar.gz"
-CONFIG="$REPO_ROOT/configs/vehicle-agent.dev.yaml"
+CONFIG="${MINE_TELEOP_VEHICLE_CONFIG:-}"
 SSH_USER=""
 SSH_HOST=""
 SSH_PORT="22"
@@ -34,8 +34,8 @@ Required: --host and --user (or MINE_TELEOP_VEHICLE_SSH_HOST / _USER). Prefer
 key-based auth via --ssh-key or MINE_TELEOP_VEHICLE_SSH_KEY.
 
 Options:
-  --bundle PATH                Local x64 ELF-only bundle archive.
-  --config PATH                Vehicle YAML uploaded outside the package.
+  --bundle PATH                Local x64 bundle archive.
+  --config PATH                Optional vehicle YAML override; the bundle carries a default.
   --user USER                  SSH user (required).
   --host HOST                  SSH host (required).
   --port PORT                  SSH port. Default: 22
@@ -187,7 +187,7 @@ fi
 if [[ "$DRY_RUN" != "true" && ! -f "$BUNDLE" ]]; then
   die "bundle archive not found: $BUNDLE"
 fi
-if [[ "$DRY_RUN" != "true" && ! -f "$CONFIG" ]]; then
+if [[ "$DRY_RUN" != "true" && -n "$CONFIG" && ! -f "$CONFIG" ]]; then
   die "vehicle config not found: $CONFIG"
 fi
 
@@ -242,8 +242,6 @@ EOF
 
 printf '==> uploading bundle archive\n'
 run_cmd "${SCP_BASE[@]}" "$BUNDLE" "$SSH_TARGET:$REMOTE_ARCHIVE"
-run_remote "prepare external configuration directory" "mkdir -p '$REMOTE_DIR/config'"
-run_cmd "${SCP_BASE[@]}" "$CONFIG" "$SSH_TARGET:$REMOTE_DIR/config/vehicle-agent.yaml"
 
 run_remote "unpack bundle and verify bundled executables" "$(cat <<EOF
 set -euo pipefail
@@ -251,12 +249,14 @@ rm -rf "$REMOTE_DIR/.extracting"
 mkdir -p "$REMOTE_DIR/.extracting"
 tar -xzf "$REMOTE_ARCHIVE" -C "$REMOTE_DIR/.extracting" --strip-components=1
 rm -rf "$REMOTE_DIR/bin" "$REMOTE_DIR/lib"
-mv "$REMOTE_DIR/.extracting/"* "$REMOTE_DIR/"
+cp -a "$REMOTE_DIR/.extracting/." "$REMOTE_DIR/"
 rm -rf "$REMOTE_DIR/.extracting"
 rm -f "$REMOTE_ARCHIVE"
 cd "$REMOTE_DIR"
 test -x bin/mine-teleop
+test -x bin/mine-teleop-run
 test -x bin/vainfo
+test -f config/vehicle-agent.yaml
 test -x lib/ld-linux-x86-64.so.2
 export GST_PLUGIN_SYSTEM_PATH_1_0=
 export GST_PLUGIN_PATH_1_0="$REMOTE_DIR/lib/gstreamer-1.0"
@@ -265,9 +265,21 @@ export GST_REGISTRY_FORK=no
 export GST_REGISTRY="$REMOTE_DIR/.gstreamer-registry.bin"
 export LIBVA_DRIVERS_PATH="$REMOTE_DIR/lib/dri"
 export LD_LIBRARY_PATH="$REMOTE_DIR/lib"
-lib/ld-linux-x86-64.so.2 --library-path "$REMOTE_DIR/lib" bin/mine-teleop version
+bin/mine-teleop-run version
+bin/mine-teleop-run config-check --config "$REMOTE_DIR/config/vehicle-agent.yaml"
 EOF
 )"
+
+if [[ -n "$CONFIG" ]]; then
+  printf '==> uploading vehicle configuration override\n'
+  run_cmd "${SCP_BASE[@]}" "$CONFIG" "$SSH_TARGET:$REMOTE_DIR/config/vehicle-agent.yaml"
+  run_remote "verify vehicle configuration override" "$(cat <<EOF
+set -euo pipefail
+cd "$REMOTE_DIR"
+bin/mine-teleop-run config-check --config "$REMOTE_DIR/config/vehicle-agent.yaml"
+EOF
+)"
+fi
 
 if [[ "$MEDIA_FRAMES" != "0" && -n "$SIGNALING_HTTP_URL" ]]; then
   run_remote "run WebRTC hardware media smoke" "$(cat <<EOF

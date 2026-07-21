@@ -176,9 +176,11 @@ FROM build AS bundle
 COPY --from=gstreamer /opt/gstreamer /opt/gstreamer
 
 RUN set -e; \
-    mkdir -p /bundle/bin /bundle/lib/gstreamer-1.0 /bundle/lib/dri /bundle/share/mine-teleop /bundle/etc/ssl/certs /bundle/lib/vendor/chassis /bundle/lib/vendor/mvs; \
+    mkdir -p /bundle/bin /bundle/config /bundle/lib/gstreamer-1.0 /bundle/lib/dri /bundle/share/mine-teleop /bundle/etc/ssl/certs /bundle/lib/vendor/chassis /bundle/lib/vendor/mvs; \
     cp -a /opt/mine-teleop/bin/. /bundle/bin/; \
     cp -a /opt/mine-teleop/lib/. /bundle/lib/; \
+    cp /src/configs/vehicle-agent.bench.yaml /bundle/config/vehicle-agent.yaml; \
+    cp /etc/ssl/certs/ca-certificates.crt /bundle/config/ca-certificates.crt; \
     cp -L /opt/aravis/lib/libaravis*.so* /bundle/lib/; \
     cp -a /opt/mine-teleop/share/. /bundle/share/; \
     cp -L /opt/gstreamer/bin/gst-inspect-1.0 /opt/gstreamer/bin/gst-launch-1.0 /usr/bin/v4l2-ctl /usr/bin/vainfo /bundle/bin/; \
@@ -234,6 +236,8 @@ RUN set -e; \
       > /bundle/mine-teleop; \
     chmod +x /bundle/mine-teleop; \
     /bundle/mine-teleop version; \
+    /bundle/bin/mine-teleop-run version; \
+    /bundle/bin/mine-teleop-run config-check --config /bundle/config/vehicle-agent.yaml; \
     /bundle/lib/ld-linux-x86-64.so.2 --library-path /bundle/lib /bundle/bin/mine-teleop-aravis-camera --list --json | grep -q '"device_count":0'; \
     GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib /bundle/bin/gst-inspect-1.0 srtpenc >/dev/null; \
     GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib \
@@ -264,4 +268,5 @@ CMD ["version"]
 
 FROM scratch AS artifact
 COPY --from=bundle /bundle/bin/ /bin/
+COPY --from=bundle /bundle/config/ /config/
 COPY --from=bundle /bundle/lib/ /lib/

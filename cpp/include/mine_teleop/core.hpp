@@ -142,6 +142,16 @@ struct ControlConfig {
 struct CloudConfig {
   std::string signaling_url;
   std::string auth_url;
+  std::filesystem::path device_token_file;
+};
+
+struct VehicleRuntimeConfig {
+  bool control_enabled{true};
+  bool media_enabled{true};
+  bool control_log_commands{false};
+  int teleop_poll_interval_ms{50};
+  int media_frame_timeout_ms{3000};
+  int media_capture_interval_ms{0};
 };
 
 struct MediaProfile {
@@ -167,6 +177,7 @@ struct CameraConfig {
 };
 
 struct RecordingConfig {
+  bool enabled{false};
   std::filesystem::path root_dir{".local/recordings"};
   double min_free_gb{5.0};
   double delete_uploaded_when_below_free_gb{2.0};
@@ -219,6 +230,7 @@ struct VehicleConfig {
   std::string vehicle_id;
   std::string vehicle_name;
   CloudConfig cloud;
+  VehicleRuntimeConfig runtime;
   ControlConfig control;
   std::vector<MediaProfile> realtime_profiles;
   std::vector<MediaProfile> record_profiles;

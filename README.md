@@ -54,11 +54,14 @@ Build the Ubuntu 22.04 x86_64/amd64 bundle from any Docker-capable host:
 scripts/build_cpp_ubuntu_bundle.sh linux/amd64
 ```
 
-The exported artifact directory contains only x86-64 ELF executables and shared
-libraries under `bin/` and `lib/`. It carries GStreamer WebRTC/RTP/MP4 plugins,
+The exported artifact directory contains x86-64 ELF executables and shared
+libraries under `bin/` and `lib/`, plus the ready-to-edit vehicle configuration
+under `config/vehicle-agent.yaml`. It carries GStreamer WebRTC/RTP/MP4 plugins,
 Intel's VAAPI userspace driver, and the Ubuntu 22.04 dynamic loader/glibc. It
-does not carry FFmpeg, Python, configuration, certificates, or shell launchers.
-Configuration and credentials are mounted outside the package. NVIDIA's kernel
+does not carry FFmpeg, Python, credentials, or shell launchers. The static
+`bin/mine-teleop-run` launcher discovers the bundle location, configures the
+bundled loader/media paths, and starts the configured C++ vehicle services.
+The device token remains outside the package. NVIDIA's kernel
 driver remains a hardware/OS prerequisite; the matching redistributable NVIDIA
 userspace libraries must be copied into `lib/` for a field package.
 
@@ -73,52 +76,34 @@ installation or source checkout.
 
 ```bash
 package_root=/opt/mine-teleop
-export LD_LIBRARY_PATH="$package_root/lib:$package_root/lib/vendor/chassis:$package_root/lib/vendor/mvs"
-export GST_PLUGIN_SYSTEM_PATH_1_0=
-export GST_PLUGIN_PATH_1_0="$package_root/lib/gstreamer-1.0"
-export GST_PLUGIN_SCANNER="$package_root/bin/gst-plugin-scanner"
-export GST_REGISTRY_FORK=no
-export GST_REGISTRY=/var/tmp/mine-teleop-gstreamer-registry.bin
-export LIBVA_DRIVERS_PATH="$package_root/lib/dri"
-mt() {
-  "$package_root/lib/ld-linux-x86-64.so.2" --library-path "$LD_LIBRARY_PATH" \
-    "$package_root/bin/mine-teleop" "$@"
-}
+printf '%s\n' 'replace-with-device-token' > "$package_root/config/device-token"
+chmod 600 "$package_root/config/device-token"
 
-mt version
-mt config-check --config /etc/mine-teleop/vehicle-agent.yaml
-mt time-sync --signaling-http-url http://control-host:8765 --samples 7 --max-uncertainty-ms 25
-
-mt signaling-server --host 0.0.0.0 --port 8765
-mt driver-console --host 0.0.0.0 --port 8080
-
-mt vehicle-agent \
-  --config /etc/mine-teleop/vehicle-agent.yaml \
-  --preflight
-
-mt vehicle-agent \
-  --config /etc/mine-teleop/vehicle-agent.yaml \
-  --teleop --service
-
-mt vehicle-media-agent \
-  --config /etc/mine-teleop/vehicle-agent.yaml \
-  --signaling-http-url http://control-host:8765 \
-  --device-token "$MINE_TELEOP_DEVICE_TOKEN" \
-  --record --recording-root /var/lib/mine-teleop/recordings \
-  --service
-
-mt vehicle-uploader \
-  --config /etc/mine-teleop/vehicle-agent.yaml \
-  --recording-root /var/lib/mine-teleop/recordings \
-  --archive-root /var/lib/mine-teleop/uploader/archive \
-  --service
+# One foreground command: control + media + recording from the bundled YAML.
+"$package_root/bin/mine-teleop-run"
 ```
 
-Credentials can be supplied with `MINE_TELEOP_DRIVER_PASSWORD` and
-`MINE_TELEOP_DEVICE_TOKEN`. Vehicle deployment is foreground-only: run
-`vehicle-agent --teleop --service` and `vehicle-media-agent --service` in two
-terminals, `tmux`, or the caller's existing process supervisor. The deployment
-flow does not install or require systemd units. Without an external USB ACL,
+For diagnostics or individual subcommands, pass the native command to the same
+launcher:
+
+```bash
+mt="$package_root/bin/mine-teleop-run"
+"$mt" version
+"$mt" config-check --config "$package_root/config/vehicle-agent.yaml"
+"$mt" time-sync --signaling-http-url http://control-host:8765 --samples 7 --max-uncertainty-ms 25
+
+"$mt" vehicle-agent \
+  --config "$package_root/config/vehicle-agent.yaml" \
+  --preflight
+"$mt" media-probe
+```
+
+Credentials can still be supplied with `MINE_TELEOP_DRIVER_PASSWORD` and
+`MINE_TELEOP_DEVICE_TOKEN`; the default vehicle config instead reads
+`config/device-token`. Vehicle deployment is foreground-only: the native
+`vehicle-runtime` supervisor starts both configured services and terminates the
+peer if either process fails. The deployment flow does not install or require
+systemd units. Without an external USB ACL,
 the media command must run as root so libusb can open a Basler USB3 Vision
 device for control and streaming.
 

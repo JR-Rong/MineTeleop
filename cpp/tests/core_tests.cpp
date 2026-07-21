@@ -91,6 +91,19 @@ void test_config_loads_current_vehicle_yaml() {
   expect(config.vehicle_adapter.type == "mock", "adapter type mismatch");
 }
 
+void test_bench_config_drives_unified_vehicle_runtime() {
+  const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.bench.yaml");
+  expect(config.runtime.control_enabled, "bench runtime control is disabled");
+  expect(config.runtime.media_enabled, "bench runtime media is disabled");
+  expect(config.runtime.control_log_commands, "bench runtime control logging is disabled");
+  expect(config.runtime.teleop_poll_interval_ms == 50, "bench teleop poll interval changed");
+  expect(config.runtime.media_frame_timeout_ms == 3000, "bench media frame timeout changed");
+  expect(config.recording.enabled, "bench recording is disabled");
+  expect(
+      config.cloud.device_token_file == std::filesystem::path("configs/device-token"),
+      "relative device token file was not resolved from the config directory");
+}
+
 void test_control_command_json_round_trip_and_validation() {
   const auto original = command(7, 1234);
   const auto parsed = ControlCommand::from_json(original.to_json());
@@ -437,6 +450,7 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"config_loads_current_vehicle_yaml", test_config_loads_current_vehicle_yaml},
+      {"bench_config_drives_unified_vehicle_runtime", test_bench_config_drives_unified_vehicle_runtime},
       {"control_command_json_round_trip_and_validation", test_control_command_json_round_trip_and_validation},
       {"control_receiver_enforces_token_sequence_and_gap", test_control_receiver_enforces_token_sequence_and_gap},
       {"mailbox_keeps_only_latest_command", test_mailbox_keeps_only_latest_command},

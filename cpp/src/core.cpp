@@ -415,12 +415,16 @@ Json VehicleConfig::redacted_summary() const {
       {"runtime", "cpp"},
       {"vehicle_id", vehicle_id},
       {"signaling_url", cloud.signaling_url},
+      {"device_token_file_configured", !cloud.device_token_file.empty()},
+      {"control_enabled", runtime.control_enabled},
+      {"media_enabled", runtime.media_enabled},
       {"camera_count", enabled_cameras().size()},
       {"vehicle_adapter_type", vehicle_adapter.type},
       {"can_interface", hardware.can_interface},
       {"require_time_sync", field_safety.require_time_sync},
       {"max_time_sync_uncertainty_ms", field_safety.max_time_sync_uncertainty_ms},
       {"recording_root", recording.root_dir.string()},
+      {"recording_enabled", recording.enabled},
       {"upload_enabled", upload.enabled},
   };
 }
@@ -441,6 +445,25 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   const auto cloud = root["cloud"];
   config.cloud.signaling_url = required<std::string>(cloud, "signaling_url", "cloud");
   config.cloud.auth_url = optional<std::string>(cloud, "auth_url", "");
+  config.cloud.device_token_file = optional<std::string>(cloud, "device_token_file", "");
+  if (!config.cloud.device_token_file.empty() && config.cloud.device_token_file.is_relative()) {
+    config.cloud.device_token_file = (path.parent_path() / config.cloud.device_token_file).lexically_normal();
+  }
+
+  const auto runtime = root["runtime"];
+  config.runtime.control_enabled = optional<bool>(runtime, "control_enabled", true);
+  config.runtime.media_enabled = optional<bool>(runtime, "media_enabled", true);
+  config.runtime.control_log_commands = optional<bool>(runtime, "control_log_commands", false);
+  config.runtime.teleop_poll_interval_ms = optional<int>(runtime, "teleop_poll_interval_ms", 50);
+  config.runtime.media_frame_timeout_ms = optional<int>(runtime, "media_frame_timeout_ms", 3000);
+  config.runtime.media_capture_interval_ms = optional<int>(runtime, "media_capture_interval_ms", 0);
+  if (!config.runtime.control_enabled && !config.runtime.media_enabled) {
+    throw std::runtime_error("runtime must enable control or media");
+  }
+  if (config.runtime.teleop_poll_interval_ms <= 0 || config.runtime.media_frame_timeout_ms <= 0 ||
+      config.runtime.media_capture_interval_ms < 0) {
+    throw std::runtime_error("runtime timing settings are invalid");
+  }
 
   const auto control = root["control"];
   config.control.rate_hz = optional<int>(control, "rate_hz", 20);
@@ -565,6 +588,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   }
 
   const auto recording = root["recording"];
+  config.recording.enabled = optional<bool>(recording, "enabled", false);
   config.recording.root_dir = optional<std::string>(recording, "root_dir", ".local/recordings");
   config.recording.min_free_gb = optional<double>(recording, "min_free_gb", 5.0);
   config.recording.delete_uploaded_when_below_free_gb =

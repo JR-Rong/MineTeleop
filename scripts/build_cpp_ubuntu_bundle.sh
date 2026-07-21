@@ -28,7 +28,7 @@ docker buildx build \
 
 docker run --rm "$image" version
 docker run --rm "$image" config-check \
-  --config /opt/mine-teleop/share/mine-teleop/configs/vehicle-agent.dev.yaml
+  --config /opt/mine-teleop/config/vehicle-agent.yaml
 
 docker buildx build \
   --platform "$platform" \

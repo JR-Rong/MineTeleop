@@ -27,6 +27,26 @@ config/driver-console.dev.yaml
 
 ## 车端配置示例
 
+当前安装包携带 `config/vehicle-agent.yaml`。其中 `runtime` 决定统一前台入口启动哪些服务，
+`cloud.device_token_file` 只保存令牌文件路径；令牌内容不进入安装包：
+
+```yaml
+runtime:
+  control_enabled: true
+  media_enabled: true
+  control_log_commands: true
+  teleop_poll_interval_ms: 50
+  media_frame_timeout_ms: 3000
+  media_capture_interval_ms: 0
+
+cloud:
+  signaling_url: ws://127.0.0.1:18765/signaling
+  device_token_file: device-token
+```
+
+相对的 `device_token_file` 按 YAML 所在目录解析。现场只需创建权限为 `0600` 的
+`config/device-token`，随后执行 `bin/mine-teleop-run`。
+
 ```yaml
 vehicle:
   id: vehicle-001

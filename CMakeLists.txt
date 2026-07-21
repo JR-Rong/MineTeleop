@@ -61,6 +61,10 @@ set_target_properties(mine-teleop PROPERTIES
   INSTALL_RPATH "$ORIGIN/../lib"
 )
 
+add_executable(mine-teleop-run cpp/apps/mine_teleop_launcher.cpp)
+target_compile_options(mine-teleop-run PRIVATE -Wall -Wextra -Wpedantic -Werror=return-type)
+target_link_options(mine-teleop-run PRIVATE -static)
+
 if(MINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE)
   pkg_check_modules(ARAVIS QUIET IMPORTED_TARGET aravis-0.8)
   if(ARAVIS_FOUND)
@@ -107,7 +111,7 @@ if(MINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES)
 
 endif()
 
-install(TARGETS mine-teleop mine_teleop_runtime
+install(TARGETS mine-teleop mine-teleop-run mine_teleop_runtime
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

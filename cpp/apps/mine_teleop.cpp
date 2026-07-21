@@ -6,9 +6,14 @@
 #include "mine_teleop/video.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <functional>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -18,6 +23,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 
@@ -76,6 +84,29 @@ std::string environment(std::string_view key) {
   return value == nullptr ? "" : value;
 }
 
+std::string trim(std::string value) {
+  const auto first = value.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) return {};
+  const auto last = value.find_last_not_of(" \t\r\n");
+  return value.substr(first, last - first + 1);
+}
+
+std::string device_token(const Arguments& arguments, const VehicleConfig& config) {
+  auto token = arguments.value("--device-token", environment("MINE_TELEOP_DEVICE_TOKEN"));
+  if (!token.empty()) return token;
+  if (config.cloud.device_token_file.empty()) {
+    throw std::invalid_argument(
+        "device token is required: configure cloud.device_token_file, --device-token, or MINE_TELEOP_DEVICE_TOKEN");
+  }
+  std::ifstream input(config.cloud.device_token_file);
+  if (!input) {
+    throw std::runtime_error("cannot read device token file: " + config.cloud.device_token_file.string());
+  }
+  token = trim(std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()));
+  if (token.empty()) throw std::runtime_error("device token file is empty: " + config.cloud.device_token_file.string());
+  return token;
+}
+
 void print_help() {
   std::cout << R"(Mine Teleop native C++ runtime
 
@@ -84,6 +115,7 @@ Usage:
   mine-teleop config-check [--config PATH]
   mine-teleop vehicle-agent [options]
   mine-teleop vehicle-media-agent [options]
+  mine-teleop vehicle-runtime [options]
   mine-teleop vehicle-uploader [options]
   mine-teleop signaling-server [options]
   mine-teleop driver-console [options]
@@ -138,6 +170,10 @@ Vehicle media options:
   --simulate-primary-failure-after-frames N  bench-only NVENC failover injection
   --record                      reuse encoded H.264/H.265 packets for MP4 segments
   --recording-root PATH         recording destination (defaults to config)
+
+Unified vehicle runtime:
+  vehicle-runtime reads control/media/recording settings and the device-token
+  file from the vehicle YAML, then supervises both foreground services.
 
 Vehicle uploader options:
   --config PATH                 vehicle YAML (default configs/vehicle-agent.dev.yaml)
@@ -248,15 +284,14 @@ int run_loop(const VehicleConfig& config, const Arguments& arguments) {
 }
 
 int run_teleop(const VehicleConfig& config, const Arguments& arguments) {
-  std::string token = arguments.value("--device-token", environment("MINE_TELEOP_DEVICE_TOKEN"));
-  if (token.empty()) throw std::invalid_argument("--device-token or MINE_TELEOP_DEVICE_TOKEN is required");
+  std::string token = device_token(arguments, config);
   const std::string signaling_url = arguments.value("--signaling-http-url", config.cloud.signaling_url);
   mine_teleop::VehicleTeleopRuntime runtime(config, signaling_url, std::move(token));
   const auto result = runtime.run(
       arguments.has("--service") ? 0 : arguments.integer("--teleop-duration-ms", 5000),
-      arguments.integer("--teleop-poll-interval-ms", 50),
+      arguments.integer("--teleop-poll-interval-ms", config.runtime.teleop_poll_interval_ms),
       arguments.has("--service") ? 0 : arguments.integer("--teleop-session-wait-ms", 5000),
-      arguments.has("--teleop-log-controls"));
+      arguments.has("--teleop-log-controls") || config.runtime.control_log_commands);
   std::cout << result.dump() << '\n';
   return result.value("session_discovered", false) ? 0 : 2;
 }
@@ -339,28 +374,154 @@ int run_driver_console(const Arguments& arguments) {
 
 int run_vehicle_media_agent(const Arguments& arguments) {
   auto config = mine_teleop::load_vehicle_config(arguments.value("--config", "configs/vehicle-agent.dev.yaml"));
-  auto device_token = arguments.value("--device-token", environment("MINE_TELEOP_DEVICE_TOKEN"));
-  if (device_token.empty()) throw std::invalid_argument("--device-token or MINE_TELEOP_DEVICE_TOKEN is required");
-  const auto recording_root = arguments.has("--record")
-                                  ? std::filesystem::path(arguments.value("--recording-root", config.recording.root_dir.string()))
-                                  : std::filesystem::path{};
+  auto token = device_token(arguments, config);
+  const auto recording_root =
+      arguments.has("--record") || config.recording.enabled
+          ? std::filesystem::path(arguments.value("--recording-root", config.recording.root_dir.string()))
+          : std::filesystem::path{};
   const auto signaling_url = arguments.value("--signaling-http-url", config.cloud.signaling_url);
+  const auto frame_timeout_ms = arguments.integer("--frame-timeout-ms", config.runtime.media_frame_timeout_ms);
+  const auto capture_interval_ms = arguments.integer("--capture-interval-ms", config.runtime.media_capture_interval_ms);
   std::optional<std::string> forced_codec;
   if (arguments.has("--codec")) forced_codec = arguments.value("--codec");
   mine_teleop::VehicleMediaRuntime runtime(
       std::move(config),
       signaling_url,
-      std::move(device_token),
-      arguments.integer("--frame-timeout-ms", 3000),
+      std::move(token),
+      frame_timeout_ms,
       recording_root,
       std::move(forced_codec),
       arguments.integer("--simulate-primary-failure-after-frames", 0));
   const auto summary = runtime.run(
       arguments.has("--service") ? 0 : arguments.integer("--frames", arguments.has("--duration-ms") ? 0 : 30),
       arguments.has("--service") ? 0 : arguments.integer("--duration-ms", -1),
-      arguments.integer("--capture-interval-ms", 0));
+      capture_interval_ms);
   std::cout << summary.dump() << '\n';
   return summary.value("passed", false) ? 0 : 2;
+}
+
+volatile std::sig_atomic_t termination_signal = 0;
+
+void handle_termination_signal(int signal) { termination_signal = signal; }
+
+struct ChildService {
+  std::string name;
+  pid_t pid{-1};
+  bool running{false};
+};
+
+pid_t spawn_service(std::string_view name, const std::function<int()>& run) {
+  std::cout.flush();
+  std::cerr.flush();
+  const auto pid = fork();
+  if (pid < 0) throw std::runtime_error("cannot start " + std::string(name) + ": " + std::strerror(errno));
+  if (pid != 0) return pid;
+  std::signal(SIGINT, SIG_DFL);
+  std::signal(SIGTERM, SIG_DFL);
+  int result = 2;
+  try {
+    result = run();
+  } catch (const std::exception& error) {
+    std::cerr << Json({
+                     {"event", "vehicle_runtime_child_error"},
+                     {"service", std::string(name)},
+                     {"error", error.what()},
+                 }).dump()
+              << '\n';
+  }
+  std::cout.flush();
+  std::cerr.flush();
+  _exit(result);
+}
+
+int wait_status_code(int status) {
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  return 2;
+}
+
+int run_vehicle_runtime(const Arguments& arguments) {
+  const auto config_path = arguments.value("--config", "config/vehicle-agent.yaml");
+  const auto config = mine_teleop::load_vehicle_config(config_path);
+  const auto token = device_token(arguments, config);
+  std::vector<ChildService> children;
+  auto stop_children = [&] {
+    for (auto& child : children) {
+      if (child.running) kill(child.pid, SIGTERM);
+    }
+    for (auto& child : children) {
+      if (!child.running) continue;
+      int status = 0;
+      while (waitpid(child.pid, &status, 0) < 0 && errno == EINTR) {
+      }
+      child.running = false;
+    }
+  };
+
+  termination_signal = 0;
+  const auto previous_int = std::signal(SIGINT, handle_termination_signal);
+  const auto previous_term = std::signal(SIGTERM, handle_termination_signal);
+
+  try {
+    if (config.runtime.control_enabled) {
+      const auto pid = spawn_service("control", [config, token] {
+        mine_teleop::VehicleTeleopRuntime runtime(config, config.cloud.signaling_url, token);
+        const auto result = runtime.run(
+            0, config.runtime.teleop_poll_interval_ms, 0, config.runtime.control_log_commands);
+        std::cout << result.dump() << '\n';
+        return result.value("session_discovered", false) ? 0 : 2;
+      });
+      children.push_back({"control", pid, true});
+    }
+    if (config.runtime.media_enabled) {
+      const auto pid = spawn_service("media", [config, token] {
+        const auto recording_root = config.recording.enabled ? config.recording.root_dir : std::filesystem::path{};
+        mine_teleop::VehicleMediaRuntime runtime(
+            config, config.cloud.signaling_url, token, config.runtime.media_frame_timeout_ms, recording_root);
+        const auto result = runtime.run(0, 0, config.runtime.media_capture_interval_ms);
+        std::cout << result.dump() << '\n';
+        return result.value("passed", false) ? 0 : 2;
+      });
+      children.push_back({"media", pid, true});
+    }
+  } catch (...) {
+    stop_children();
+    std::signal(SIGINT, previous_int);
+    std::signal(SIGTERM, previous_term);
+    throw;
+  }
+
+  std::cout << Json({
+                   {"event", "vehicle_runtime_started"},
+                   {"vehicle_id", config.vehicle_id},
+                   {"config", config_path},
+                   {"control_enabled", config.runtime.control_enabled},
+                   {"media_enabled", config.runtime.media_enabled},
+                   {"recording_enabled", config.recording.enabled},
+               }).dump()
+            << std::endl;
+
+  int first_status = 0;
+  bool child_exited = false;
+  while (termination_signal == 0) {
+    const auto pid = waitpid(-1, &first_status, WNOHANG);
+    if (pid > 0) {
+      for (auto& child : children) {
+        if (child.pid == pid) child.running = false;
+      }
+      child_exited = true;
+      break;
+    }
+    if (pid < 0 && errno != EINTR) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  stop_children();
+  std::signal(SIGINT, previous_int);
+  std::signal(SIGTERM, previous_term);
+  if (termination_signal != 0) return 128 + termination_signal;
+  if (!child_exited) return 2;
+  const auto code = wait_status_code(first_status);
+  return code == 0 ? 1 : code;
 }
 
 int run_vehicle_uploader(const Arguments& arguments) {
@@ -490,6 +651,7 @@ int main(int argc, char** argv) {
     }
     if (command == "vehicle-agent") return run_vehicle_agent(arguments);
     if (command == "vehicle-media-agent") return run_vehicle_media_agent(arguments);
+    if (command == "vehicle-runtime") return run_vehicle_runtime(arguments);
     if (command == "vehicle-uploader") return run_vehicle_uploader(arguments);
     if (command == "http-health") return run_http_health(arguments);
     if (command == "time-sync") return run_time_sync(arguments);

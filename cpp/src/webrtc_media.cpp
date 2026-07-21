@@ -697,7 +697,9 @@ struct VehicleMediaRuntime::Impl {
     signaling.register_online();
     const auto session_deadline = signaling.now_ms() + 5000;
     while (!signaling.discover_session()) {
-      if (signaling.now_ms() >= session_deadline) throw std::runtime_error("timed out waiting for an active driver session");
+      if (!continuous && signaling.now_ms() >= session_deadline) {
+        throw std::runtime_error("timed out waiting for an active driver session");
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     const auto codecs = negotiate_codecs(3000);

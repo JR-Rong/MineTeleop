@@ -5,6 +5,15 @@ vehicle:
 cloud:
   signaling_url: ws://127.0.0.1:18765/signaling
   auth_url: http://127.0.0.1:18765/auth
+  device_token_file: device-token
+
+runtime:
+  control_enabled: true
+  media_enabled: true
+  control_log_commands: true
+  teleop_poll_interval_ms: 50
+  media_frame_timeout_ms: 3000
+  media_capture_interval_ms: 0
 
 control:
   rate_hz: 20
@@ -77,7 +86,8 @@ field_safety:
   time_sync_samples: 7
 
 recording:
-  root_dir: /tmp/mine-teleop-recordings
+  enabled: true
+  root_dir: recordings
   min_free_gb: 1
   delete_uploaded_when_below_free_gb: 0.5
   delete_unuploaded_when_below_free_gb: false
