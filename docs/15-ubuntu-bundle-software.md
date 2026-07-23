@@ -1,5 +1,8 @@
 # Ubuntu Bundle 软件说明
 
+> 历史归档：下文旧 PyInstaller/FFmpeg 包已经停用，不适用于当前交付。当前自包含
+> C++ bundle 及依赖边界只以根目录 `README.md` 和 `deployments/cpp/Dockerfile.build` 为准。
+
 本文说明交付给 Ubuntu 工控机的 Mine Teleop 软件包内容。该包的目标是让目标机不安装 Docker，不在现场拉 Python 依赖，只运行一个主执行文件和随包动态库。
 
 ## 产物结构

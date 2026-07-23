@@ -1,18 +1,16 @@
 # Build artifacts and generated output must not be tracked in git.
 build/
+cpp-build/
 dist/
 *.tar.gz
+.DS_Store
+.playwright-cli/
+output/
 
 # Compiled shared objects / binaries
 *.so
 *.o
 *.a
-
-# Python caches
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
 
 # Local runtime/working directories
 .local/

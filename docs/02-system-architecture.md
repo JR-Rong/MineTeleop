@@ -112,10 +112,10 @@ flowchart LR
 
 首版可以先采用较少进程，但安全关键逻辑不能和媒体编码 pipeline 共故障域：
 
-- `vehicle-control-agent`：车端高优先级控制进程，包含 Control Receiver、Safety State Machine、Vehicle Adapter 和本地看门狗。它必须能在媒体 pipeline 卡死或重启时继续执行安全停车。
-- `vehicle-media-agent`：车端媒体进程，包含相机采集、实时编码、WebRTC 媒体和录像分段。若控制暂时复用 WebRTC DataChannel，媒体进程只负责把最新命令通过有界本地 IPC 转交给 `vehicle-control-agent`，不能承载最终安全状态机。
+- 当前 `vehicle-runtime` 由原生媒体进程建立 WebRTC 视频和 `control` DataChannel，并在车端运行 Control Receiver、Safety State Machine 与 Vehicle Adapter；DataChannel 关闭和进程正常退出都会本地全停。
+- 在接入真实 CAN 前，仍必须用进程强杀、媒体阻塞和底层控制器看门狗完成故障隔离验收；如果底层看门狗不能独立保证停车，再把安全执行拆为独立高优先级进程和有界本地 IPC。
 - `vehicle-uploader`：低优先级上传进程或独立服务，负责上传队列、限速和重试。
-- `driver-console`：驾驶端 Qt 应用。
+- `mine-teleop-control`：跨平台 C++ 回环服务，使用系统浏览器呈现驾驶页面。
 - `signaling-server`：云端信令和会话管理服务。
 - `turn-server`：coturn 或等价 TURN 服务。
 
@@ -147,7 +147,9 @@ flowchart LR
 
 ### 云端
 
-- 信令服务：Python FastAPI/WebSocket、Go 或 Node.js 均可。
+- 信令服务：当前为独立 C++ HTTP/WebSocket 后端，回环监听并由 Caddy 在 443
+  终止 TLS/WSS；单实例已有内存 delivery cursor、显式 ACK 和幂等发送确认，
+  多实例化前仍需增加持久状态、共享游标与跨实例投递。
 - TURN：coturn。
 - 存储：S3 兼容对象存储。
 - 部署：独立实时节点建议开启 UDP，避免与其他业务争抢。

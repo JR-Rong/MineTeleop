@@ -15,8 +15,8 @@
 
 ```yaml
 realtime_profile:
-  codec: h264
-  encoder: vaapi
+  codec: h265
+  encoder: auto
   width: 1280
   height: 720
   fps: 30
@@ -29,11 +29,18 @@ realtime_profile:
 
 优先级：
 
-1. `h264_vaapi` 或 GStreamer VAAPI/QSV H.264。
-2. CPU `x264` ultra-fast/zerolatency。
-3. 降帧或降分辨率。
+1. 浏览器支持的首选 codec：NVENC，然后 Intel VAAPI。
+2. 浏览器支持的 fallback codec：NVENC，然后 Intel VAAPI。
+3. 两种硬件后端都失败时显式报错，不静默切换 CPU 编码。
 
-H.264 是首版推荐，因为驾驶端兼容性最好。H.265/HEVC 码率更低，但解码兼容性、浏览器支持和部分硬件支持更复杂，不建议第一版实时流直接强依赖。
+H.265/HEVC 是配置首选，用来降低同等画质下的码率；H.264 仍是兼容性
+fallback。浏览器先通过 WebRTC 接收能力上报 codec，车端只会 offer 浏览器明确
+支持的 H.265，否则直接选择 H.264。
+
+浏览器声明 H.265 并不等价于能同时稳定解码所有相机轨道。驾驶端每秒读取
+`RTCPeerConnection.getStats()`；H.265 任一路连续 3 次低于 20 fps 时，通过已认证
+信令请求 H.264。车端此时跳过同 codec 的 VAAPI 重试，直接按 NVENC、VAAPI 顺序
+重新协商 H.264。编码器本身故障时仍先切换到同 codec 的 VAAPI。
 
 需要单独确认 WebRTC H.264 profile 协商。当前硬件验证看到 VAAPI 支持 H.264 High profile，但部分 WebRTC 端默认偏好 constrained-baseline。首版实现必须在 SDP 协商、编码器 profile/level 和驾驶端解码能力之间做一致性验证，避免编码成功但驾驶端无法接收或解码。
 本地 SDP 校验只接受 `a=rtpmap` 明确声明为 H264 的 payload type 对应
@@ -50,9 +57,9 @@ H.264 能力。
 - 使用 UDP 优先的 WebRTC 路径。
 - TURN 兜底节点必须支持 UDP。
 
-本地参考实现会保留实时 profile 的 `keyframe_interval_frames`，并把该值写入
-GStreamer 实时编码器参数：VAAPI/QSV 使用 `keyframe-period`，x264 使用
-`key-int-max`。
+实现保留实时 profile 的 `keyframe_interval_frames`，NVENC 关闭 B 帧并启用
+zero-latency/CBR，VAAPI 使用硬件低延迟属性。每路 capture/encode 前都有短的
+leaky queue，积压时丢弃旧帧。
 
 ## 多路相机
 
@@ -67,7 +74,7 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p
-    record_profile: record_source_h264
+    record_profile: record_source_h265
   - id: rear
     enabled: true
     device: /dev/video1
@@ -75,7 +82,7 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p
-    record_profile: record_source_h264
+    record_profile: record_source_h265
 ```
 
 每路相机必须能独立启停。单路故障不应导致全部视频中断。
@@ -86,9 +93,9 @@ cameras:
 
 ```yaml
 record_profiles:
-  record_source_h264:
-    codec: h264
-    encoder: vaapi
+  record_source_h265:
+    codec: h265
+    encoder: reuse_realtime
     width: source
     height: source
     fps: source
@@ -99,9 +106,10 @@ record_profiles:
 
 说明：
 
-- `source` 表示使用采集原始分辨率或帧率。
-- 如果磁盘或编码压力过高，可降低录像帧率或码率。
-- 录像和实时流可以分别使用不同 encoder instance。
+- `source` 表示复用实时 pipeline 的实际分辨率和帧率。
+- `tee` 位于硬件编码器之后；同一批 H.264/H.265 access unit 一路进入 RTP，
+  另一路经 parser 直接交给 `splitmuxsink/mp4mux`。
+- 录像不再启动 FFmpeg，也不再执行 `libx264` 二次编码。
 
 ### 容量规划
 

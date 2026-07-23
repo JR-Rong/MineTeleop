@@ -1,0 +1,16 @@
+{
+	admin off
+}
+
+{$MINE_TELEOP_PUBLIC_ORIGIN:https://teleop.example.com} {
+	handle_path /api/* {
+		reverse_proxy {$MINE_TELEOP_SIGNALING_UPSTREAM:127.0.0.1:8765}
+	}
+	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/*
+	handle @signaling_api {
+		reverse_proxy {$MINE_TELEOP_SIGNALING_UPSTREAM:127.0.0.1:8765}
+	}
+	handle {
+		respond "not found" 404
+	}
+}

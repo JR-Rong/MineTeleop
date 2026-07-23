@@ -1,7 +1,8 @@
 [Unit]
-Description=Mine Teleop vehicle media agent
-After=network-online.target mine-teleop-vehicle-agent.service
+Description=Mine Teleop legacy standalone vehicle media agent
+After=network-online.target
 Wants=network-online.target
+Conflicts=mine-teleop-vehicle-agent.service
 
 [Service]
 Type=simple
@@ -15,7 +16,14 @@ PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-ExecStart=/usr/bin/python3 /opt/mine-teleop/vehicle-media-agent/vehicle_media_agent.py --config /etc/mine-teleop/vehicle-agent.yaml
+StateDirectory=mine-teleop/recordings
+Environment=GST_PLUGIN_SYSTEM_PATH_1_0=
+Environment=GST_PLUGIN_PATH_1_0=/opt/mine-teleop/lib/gstreamer-1.0
+Environment=GST_PLUGIN_SCANNER=/opt/mine-teleop/bin/gst-plugin-scanner
+Environment=GST_REGISTRY=/var/lib/mine-teleop/recordings/.gstreamer-registry.bin
+Environment=LIBVA_DRIVERS_PATH=/opt/mine-teleop/lib/dri
+Environment=LD_LIBRARY_PATH=/opt/mine-teleop/lib:/opt/mine-teleop/lib/vendor/chassis:/opt/mine-teleop/lib/vendor/mvs:/opt/mine-teleop/lib/vendor/pylon
+ExecStart=/opt/mine-teleop/lib/ld-linux-x86-64.so.2 --library-path /opt/mine-teleop/lib:/opt/mine-teleop/lib/vendor/chassis:/opt/mine-teleop/lib/vendor/mvs:/opt/mine-teleop/lib/vendor/pylon /opt/mine-teleop/bin/mine-teleop vehicle-media-agent --config /etc/mine-teleop/vehicle-agent.yaml --signaling-http-url ${MINE_TELEOP_SIGNALING_HTTP_URL} --device-token ${MINE_TELEOP_DEVICE_TOKEN} --record --recording-root /var/lib/mine-teleop/recordings --service
 Restart=on-failure
 RestartSec=2
 StandardOutput=append:/var/log/mine-teleop/vehicle-media-agent.log

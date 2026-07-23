@@ -4,23 +4,31 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 
-BUNDLE="$REPO_ROOT/dist/mine-teleop-ubuntu-x86_64.tar.gz"
+BUNDLE="$REPO_ROOT/dist/cpp-ubuntu22.04-amd64.tar.gz"
+CONFIG="${MINE_TELEOP_VEHICLE_CONFIG:-}"
 SSH_USER=""
 SSH_HOST=""
 SSH_PORT="22"
 SSH_KEY="${MINE_TELEOP_VEHICLE_SSH_KEY:-}"
 REMOTE_DIR=""
 REMOTE_ARCHIVE="/tmp/mine-teleop-ubuntu-x86_64.tar.gz"
-DRIVER_CONSOLE_URL=""
 SIGNALING_HTTP_URL=""
 DEVICE_TOKEN="${MINE_TELEOP_VEHICLE_DEVICE_TOKEN:-}"
+DEVICE_TOKEN_FILE="${MINE_TELEOP_VEHICLE_DEVICE_TOKEN_FILE:-}"
+TEMP_DEVICE_TOKEN_FILE=""
 MEDIA_FRAMES="1"
 FRAME_INTERVAL_MS="33"
-RUN_CONTROL_TELEOP="false"
-TELEOP_DURATION_MS="15000"
-TELEOP_SESSION_WAIT_MS="15000"
+RUN_LIVE_TELEOP="false"
+LIVE_TELEOP_DURATION_MS="15000"
 DRY_RUN="false"
 SSH_OPTIONS=()
+
+cleanup() {
+  if [[ -n "$TEMP_DEVICE_TOKEN_FILE" && -f "$TEMP_DEVICE_TOKEN_FILE" ]]; then
+    rm -f "$TEMP_DEVICE_TOKEN_FILE"
+  fi
+}
+trap cleanup EXIT
 
 usage() {
   cat <<'EOF'
@@ -34,29 +42,28 @@ Required: --host and --user (or MINE_TELEOP_VEHICLE_SSH_HOST / _USER). Prefer
 key-based auth via --ssh-key or MINE_TELEOP_VEHICLE_SSH_KEY.
 
 Options:
-  --bundle PATH                Local bundle archive. Default: dist/mine-teleop-ubuntu-x86_64.tar.gz
+  --bundle PATH                Local x64 bundle archive.
+  --config PATH                Optional vehicle YAML override; the bundle carries a default.
   --user USER                  SSH user (required).
   --host HOST                  SSH host (required).
   --port PORT                  SSH port. Default: 22
   --ssh-key PATH               SSH identity file for key-based auth.
   --remote-dir PATH            Remote install directory. Default: /home/<user>/mine-teleop
   --remote-archive PATH        Remote temporary archive path. Default: /tmp/mine-teleop-ubuntu-x86_64.tar.gz
-  --driver-console-url URL     After deploy, send encoded test frames to this driver console URL.
-  --media-frames COUNT         Number of media frames to send when --driver-console-url is set. Default: 1
-  --frame-interval-ms MS       Delay between media frame ticks. Default: 33
-  --signaling-http-url URL     Signaling HTTP URL for vehicle-agent --teleop.
-  --run-control-teleop         Run vehicle-agent --teleop and print accepted control command JSONL logs.
-  --teleop-duration-ms MS      Control teleop run duration. Default: 15000
-  --teleop-session-wait-ms MS  How long to wait for an active session. Default: 15000
-  --device-token TOKEN         Vehicle device token for signaling/upload APIs (required for smoke calls).
+  --media-frames COUNT         WebRTC frames per camera. Default: 1; set 0 to skip.
+  --frame-interval-ms MS       Optional capture throttle. Default: 33
+  --signaling-http-url URL     Signaling URL for control and WebRTC media.
+  --run-live-teleop            Run the WebRTC media + DataChannel control agent.
+  --live-teleop-duration-ms MS Live WebRTC/DataChannel duration. Default: 15000
+  --device-token-file PATH     Vehicle device-token file; uploaded with mode 0600.
+  --device-token TOKEN         Compatibility input; converted to a protected temporary file.
   --ssh-option OPTION          Extra -o option passed to ssh/scp. Can be repeated.
   --dry-run                    Print commands without connecting or reading the bundle.
   -h, --help                   Show this help.
 
 Examples:
   scripts/deploy_vehicle_bundle.sh --host HOST --user USER --dry-run
-  scripts/deploy_vehicle_bundle.sh --host HOST --user USER --ssh-key ~/.ssh/id_ed25519 --driver-console-url http://CONTROL_HOST:8080
-  scripts/deploy_vehicle_bundle.sh --host HOST --user USER --signaling-http-url http://CONTROL_HOST:8765 --run-control-teleop
+  scripts/deploy_vehicle_bundle.sh --host HOST --user USER --signaling-http-url https://SIGNALING_HOST --device-token-file PATH
 EOF
 }
 
@@ -76,6 +83,11 @@ while [[ $# -gt 0 ]]; do
     --bundle)
       require_value "$1" "${2:-}"
       BUNDLE="$2"
+      shift 2
+      ;;
+    --config)
+      require_value "$1" "${2:-}"
+      CONFIG="$2"
       shift 2
       ;;
     --user)
@@ -108,11 +120,6 @@ while [[ $# -gt 0 ]]; do
       REMOTE_ARCHIVE="$2"
       shift 2
       ;;
-    --driver-console-url)
-      require_value "$1" "${2:-}"
-      DRIVER_CONSOLE_URL="$2"
-      shift 2
-      ;;
     --media-frames)
       require_value "$1" "${2:-}"
       MEDIA_FRAMES="$2"
@@ -128,23 +135,23 @@ while [[ $# -gt 0 ]]; do
       SIGNALING_HTTP_URL="$2"
       shift 2
       ;;
-    --run-control-teleop)
-      RUN_CONTROL_TELEOP="true"
+    --run-live-teleop)
+      RUN_LIVE_TELEOP="true"
       shift
       ;;
-    --teleop-duration-ms)
+    --live-teleop-duration-ms)
       require_value "$1" "${2:-}"
-      TELEOP_DURATION_MS="$2"
-      shift 2
-      ;;
-    --teleop-session-wait-ms)
-      require_value "$1" "${2:-}"
-      TELEOP_SESSION_WAIT_MS="$2"
+      LIVE_TELEOP_DURATION_MS="$2"
       shift 2
       ;;
     --device-token)
       require_value "$1" "${2:-}"
       DEVICE_TOKEN="$2"
+      shift 2
+      ;;
+    --device-token-file)
+      require_value "$1" "${2:-}"
+      DEVICE_TOKEN_FILE="$2"
       shift 2
       ;;
     --ssh-option)
@@ -169,8 +176,7 @@ done
 [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "--port must be an integer"
 [[ "$MEDIA_FRAMES" =~ ^[0-9]+$ ]] || die "--media-frames must be an integer"
 [[ "$FRAME_INTERVAL_MS" =~ ^[0-9]+$ ]] || die "--frame-interval-ms must be an integer"
-[[ "$TELEOP_DURATION_MS" =~ ^[0-9]+$ ]] || die "--teleop-duration-ms must be an integer"
-[[ "$TELEOP_SESSION_WAIT_MS" =~ ^[0-9]+$ ]] || die "--teleop-session-wait-ms must be an integer"
+[[ "$LIVE_TELEOP_DURATION_MS" =~ ^[0-9]+$ ]] || die "--live-teleop-duration-ms must be an integer"
 
 if [[ "$DRY_RUN" != "true" ]]; then
   [[ -n "$SSH_HOST" ]] || die "--host (or MINE_TELEOP_VEHICLE_SSH_HOST) is required"
@@ -179,11 +185,31 @@ fi
 if [[ -z "$REMOTE_DIR" ]]; then
   REMOTE_DIR="/home/${SSH_USER:-user}/mine-teleop"
 fi
-if [[ "$RUN_CONTROL_TELEOP" == "true" && -z "$SIGNALING_HTTP_URL" ]]; then
-  die "--run-control-teleop requires --signaling-http-url"
+if [[ "$RUN_LIVE_TELEOP" == "true" && -z "$SIGNALING_HTTP_URL" ]]; then
+  die "--run-live-teleop requires --signaling-http-url"
+fi
+if [[ -n "$SIGNALING_HTTP_URL" && ( "$MEDIA_FRAMES" != "0" || "$RUN_LIVE_TELEOP" == "true" ) &&
+      -z "$DEVICE_TOKEN" && -z "$DEVICE_TOKEN_FILE" ]]; then
+  die "WebRTC media/DataChannel run requires --device-token-file"
 fi
 if [[ "$DRY_RUN" != "true" && ! -f "$BUNDLE" ]]; then
   die "bundle archive not found: $BUNDLE"
+fi
+if [[ "$DRY_RUN" != "true" && -n "$CONFIG" && ! -f "$CONFIG" ]]; then
+  die "vehicle config not found: $CONFIG"
+fi
+if [[ "$DRY_RUN" != "true" && -n "$DEVICE_TOKEN_FILE" && ! -f "$DEVICE_TOKEN_FILE" ]]; then
+  die "vehicle device-token file not found: $DEVICE_TOKEN_FILE"
+fi
+if [[ -z "$DEVICE_TOKEN_FILE" && -n "$DEVICE_TOKEN" ]]; then
+  if [[ "$DRY_RUN" == "true" ]]; then
+    DEVICE_TOKEN_FILE="<generated-device-token-file>"
+  else
+    TEMP_DEVICE_TOKEN_FILE="$(mktemp)"
+    chmod 0600 "$TEMP_DEVICE_TOKEN_FILE"
+    printf '%s\n' "$DEVICE_TOKEN" >"$TEMP_DEVICE_TOKEN_FILE"
+    DEVICE_TOKEN_FILE="$TEMP_DEVICE_TOKEN_FILE"
+  fi
 fi
 
 SSH_TARGET="$SSH_USER@$SSH_HOST"
@@ -243,50 +269,86 @@ set -euo pipefail
 rm -rf "$REMOTE_DIR/.extracting"
 mkdir -p "$REMOTE_DIR/.extracting"
 tar -xzf "$REMOTE_ARCHIVE" -C "$REMOTE_DIR/.extracting" --strip-components=1
-rm -rf "$REMOTE_DIR/bin" "$REMOTE_DIR/lib" "$REMOTE_DIR/configs" "$REMOTE_DIR/docs" "$REMOTE_DIR/manifest" "$REMOTE_DIR/scripts"
-mv "$REMOTE_DIR/.extracting/"* "$REMOTE_DIR/"
+rm -rf "$REMOTE_DIR/bin" "$REMOTE_DIR/lib"
+cp -a "$REMOTE_DIR/.extracting/." "$REMOTE_DIR/"
 rm -rf "$REMOTE_DIR/.extracting"
 rm -f "$REMOTE_ARCHIVE"
 cd "$REMOTE_DIR"
 test -x bin/mine-teleop
-test -x bin/ffmpeg
-test -x bin/ffprobe
+test -x bin/mine-teleop-run
 test -x bin/vainfo
-test -f lib/libmine_teleop_chassis_bridge.so
-test -f lib/libchassis_control.so
-bin/mine-teleop --list
-bin/ffmpeg -hide_banner -hwaccels
+test -f config/vehicle-agent.yaml
+test -x lib/ld-linux-x86-64.so.2
+export GST_PLUGIN_SYSTEM_PATH_1_0=
+export GST_PLUGIN_PATH_1_0="$REMOTE_DIR/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER="$REMOTE_DIR/bin/gst-plugin-scanner"
+export GST_REGISTRY_FORK=no
+export GST_REGISTRY="$REMOTE_DIR/.gstreamer-registry.bin"
+export LIBVA_DRIVERS_PATH="$REMOTE_DIR/lib/dri"
+export LD_LIBRARY_PATH="$REMOTE_DIR/lib"
+bin/mine-teleop-run version
+bin/mine-teleop-run config-check --config "$REMOTE_DIR/config/vehicle-agent.yaml"
 EOF
 )"
 
-if [[ -n "$DRIVER_CONSOLE_URL" ]]; then
-  run_remote "send encoded camera frames to driver console" "$(cat <<EOF
+if [[ -n "$CONFIG" ]]; then
+  printf '==> uploading vehicle configuration override\n'
+  run_cmd "${SCP_BASE[@]}" "$CONFIG" "$SSH_TARGET:$REMOTE_DIR/config/vehicle-agent.yaml"
+  run_remote "verify vehicle configuration override" "$(cat <<EOF
 set -euo pipefail
 cd "$REMOTE_DIR"
-bin/mine-teleop vehicle-media-agent \\
-  --config "$REMOTE_DIR/configs/vehicle-agent.dev.yaml" \\
-  --mode teleop \\
-  --driver-console-url "$DRIVER_CONSOLE_URL" \\
-  --frames "$MEDIA_FRAMES" \\
-  --frame-interval-ms "$FRAME_INTERVAL_MS" \\
-  --ffmpeg-binary "$REMOTE_DIR/bin/ffmpeg" \\
-  --json
+bin/mine-teleop-run config-check --config "$REMOTE_DIR/config/vehicle-agent.yaml"
+EOF
+  )"
+fi
+
+if [[ -n "$DEVICE_TOKEN_FILE" ]]; then
+  printf '==> uploading protected vehicle device token\n'
+  run_cmd "${SCP_BASE[@]}" "$DEVICE_TOKEN_FILE" "$SSH_TARGET:$REMOTE_DIR/config/device-token"
+  run_remote "protect vehicle device token" "$(cat <<EOF
+set -euo pipefail
+chmod 0600 "$REMOTE_DIR/config/device-token"
+test -s "$REMOTE_DIR/config/device-token"
 EOF
 )"
 fi
 
-if [[ "$RUN_CONTROL_TELEOP" == "true" ]]; then
-  run_remote "receive control commands and print JSONL logs" "$(cat <<EOF
+if [[ "$MEDIA_FRAMES" != "0" && -n "$SIGNALING_HTTP_URL" ]]; then
+  run_remote "run WebRTC hardware media smoke" "$(cat <<EOF
 set -euo pipefail
 cd "$REMOTE_DIR"
-bin/mine-teleop vehicle-agent \\
-  --config "$REMOTE_DIR/configs/vehicle-agent.dev.yaml" \\
-  --teleop \\
+export GST_PLUGIN_SYSTEM_PATH_1_0=
+export GST_PLUGIN_PATH_1_0="$REMOTE_DIR/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER="$REMOTE_DIR/bin/gst-plugin-scanner"
+export GST_REGISTRY_FORK=no
+export GST_REGISTRY="$REMOTE_DIR/.gstreamer-registry.bin"
+export LIBVA_DRIVERS_PATH="$REMOTE_DIR/lib/dri"
+export LD_LIBRARY_PATH="$REMOTE_DIR/lib"
+bin/mine-teleop-run vehicle-media-agent \\
+  --config "$REMOTE_DIR/config/vehicle-agent.yaml" \\
   --signaling-http-url "$SIGNALING_HTTP_URL" \\
-  --device-token "$DEVICE_TOKEN" \\
-  --teleop-duration-ms "$TELEOP_DURATION_MS" \\
-  --teleop-session-wait-ms "$TELEOP_SESSION_WAIT_MS" \\
-  --teleop-log-controls
+  --frames "$MEDIA_FRAMES" \\
+  --capture-interval-ms "$FRAME_INTERVAL_MS"
+EOF
+)"
+fi
+
+if [[ "$RUN_LIVE_TELEOP" == "true" ]]; then
+  run_remote "run WebRTC media and DataChannel control" "$(cat <<EOF
+set -euo pipefail
+cd "$REMOTE_DIR"
+export GST_PLUGIN_SYSTEM_PATH_1_0=
+export GST_PLUGIN_PATH_1_0="$REMOTE_DIR/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER="$REMOTE_DIR/bin/gst-plugin-scanner"
+export GST_REGISTRY_FORK=no
+export GST_REGISTRY="$REMOTE_DIR/.gstreamer-registry.bin"
+export LIBVA_DRIVERS_PATH="$REMOTE_DIR/lib/dri"
+bin/mine-teleop-run vehicle-media-agent \\
+  --config "$REMOTE_DIR/config/vehicle-agent.yaml" \\
+  --signaling-http-url "$SIGNALING_HTTP_URL" \\
+  --frames 0 \\
+  --duration-ms "$LIVE_TELEOP_DURATION_MS" \\
+  --capture-interval-ms "$FRAME_INTERVAL_MS"
 EOF
 )"
 fi

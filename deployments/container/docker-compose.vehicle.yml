@@ -1,5 +1,5 @@
 services:
-  vehicle-agent:
+  vehicle-runtime:
     build:
       context: ../..
       dockerfile: deployments/container/Dockerfile.media
@@ -8,44 +8,22 @@ services:
       - "no-new-privileges:true"
     cap_drop:
       - ALL
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     command:
-      - python3
-      - vehicle-agent/vehicle_agent.py
-      - --run-loop
+      - vehicle-runtime
       - --config
       - /etc/mine-teleop/vehicle-agent.yaml
-    volumes:
-      - ../..:/opt/mine-teleop:ro
-      - /etc/mine-teleop:/etc/mine-teleop:ro
-      - mine-teleop-recordings:/var/lib/mine-teleop/recordings
-    cpus: "1.0"
-    cpu_shares: 1024
-    mem_limit: "1g"
-    restart: on-failure
-
-  vehicle-media-agent:
-    build:
-      context: ../..
-      dockerfile: deployments/container/Dockerfile.media
-    working_dir: /opt/mine-teleop
-    security_opt:
-      - "no-new-privileges:true"
-    cap_drop:
-      - ALL
-    command:
-      - python3
-      - vehicle-media-agent/vehicle_media_agent.py
-      - --config
-      - /etc/mine-teleop/vehicle-agent.yaml
-      - --mode
-      - pipeline
+      - --signaling-http-url
+      - ${MINE_TELEOP_SIGNALING_HTTP_URL:-http://host.docker.internal:8765}
+    environment:
+      MINE_TELEOP_DEVICE_TOKEN: ${MINE_TELEOP_DEVICE_TOKEN:-dev-device-secret}
     devices:
       - /dev/dri/renderD128:/dev/dri/renderD128
       - /dev/dri/card1:/dev/dri/card1
       - /dev/video0:/dev/video0
       - /dev/video1:/dev/video1
     volumes:
-      - ../..:/opt/mine-teleop:ro
       - /etc/mine-teleop:/etc/mine-teleop:ro
       - mine-teleop-recordings:/var/lib/mine-teleop/recordings
     cpus: "2.0"
@@ -63,15 +41,15 @@ services:
     cap_drop:
       - ALL
     command:
-      - python3
-      - vehicle-uploader/vehicle_uploader.py
-      - --service-mode
+      - vehicle-uploader
+      - --service
       - --config
       - /etc/mine-teleop/vehicle-agent.yaml
-      - --work-dir
-      - /var/lib/mine-teleop/uploader
+      - --recording-root
+      - /var/lib/mine-teleop/recordings
+      - --archive-root
+      - /var/lib/mine-teleop/uploader/archive
     volumes:
-      - ../..:/opt/mine-teleop:ro
       - /etc/mine-teleop:/etc/mine-teleop:ro
       - mine-teleop-recordings:/var/lib/mine-teleop/recordings
       - mine-teleop-uploader:/var/lib/mine-teleop/uploader
@@ -95,10 +73,12 @@ services:
       - --no-cli
     ports:
       - "3478:3478/udp"
+      - "3478:3478/tcp"
       - "5349:5349/udp"
+      - "5349:5349/tcp"
       - "49152-49200:49152-49200/udp"
     volumes:
-      - ../turnserver/turnserver.conf.template:/etc/mine-teleop/turnserver.conf:ro
+      - "${MINE_TELEOP_TURN_CONFIG_FILE:?set MINE_TELEOP_TURN_CONFIG_FILE to a rendered turnserver.conf}:/etc/mine-teleop/turnserver.conf:ro"
       - ../tls:/etc/mine-teleop/tls:ro
     cpus: "1.0"
     mem_limit: "512m"

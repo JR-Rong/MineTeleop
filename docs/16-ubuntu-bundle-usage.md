@@ -1,5 +1,9 @@
 # Ubuntu Bundle 使用说明
 
+> 历史归档：下文旧 PyInstaller/FFmpeg 命令已经停用，不适用于当前交付。当前使用
+> `scripts/build_cpp_ubuntu_bundle.sh` 生成 Ubuntu 22.04 自包含 C++ bundle，运行方式
+> 以根目录 `README.md` 为准。
+
 本文给出从构建机打包到工控机现场 smoke 的命令流程。工控机不需要 Docker。
 
 ## 1. 在构建机生成包
@@ -148,19 +152,9 @@ MINE_TELEOP_CAMERA_DEVICES="front=/dev/video0 rear=/dev/video2" \
 MINE_TELEOP_FRAME_CODEC=h264 scripts/run_vehicle_live_media.sh
 ```
 
-要在车端看到控制端按键/手柄发出的控制命令反馈，另开一个车端终端运行控制接收器。每条接受到的
-控制命令会以 JSONL 打印，包含 `seq`、`steering`、`throttle`、`brake`、`gear` 和
-`control_latency_ms`：
-
-```bash
-cd /home/user/mine-teleop
-bin/mine-teleop vehicle-agent \
-  --config configs/vehicle-agent.live.yaml \
-  --teleop \
-  --signaling-http-url http://127.0.0.1:18765 \
-  --teleop-log-controls \
-  --teleop-duration-ms 600000
-```
+实时媒体进程同时拥有 WebRTC `control` DataChannel，不再另启 HTTP 轮询控制接收器。
+每条控制命令的 `seq`、会话、UTC 发送/接收时间、接受结果和拒绝原因会写入
+`vehicle-media-live.jsonl`；控制令牌不会写入日志。DataChannel 关闭时同一进程立即调用本地全停。
 
 前端相机卡片会显示最新帧的细分时序：
 

@@ -2,6 +2,7 @@
 Description=Mine Teleop signaling server
 After=network-online.target
 Wants=network-online.target
+PartOf=mine-teleop-cloud.target
 
 [Service]
 Type=simple
@@ -15,7 +16,7 @@ PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-ExecStart=/usr/bin/python3 /opt/mine-teleop/signaling-server/signaling_server.py --serve --host 127.0.0.1 --vehicle-config /etc/mine-teleop/vehicle-agent.yaml --audit-log /var/log/mine-teleop/signaling-audit.jsonl
+ExecStart=/opt/mine-teleop/lib/ld-linux-x86-64.so.2 --library-path /opt/mine-teleop/lib /opt/mine-teleop/bin/mine-teleop-signaling-server --host ${MINE_TELEOP_SIGNALING_HOST} --port ${MINE_TELEOP_SIGNALING_PORT} --driver-id ${MINE_TELEOP_DRIVER_ID} --vehicle-id ${MINE_TELEOP_VEHICLE_ID} --api-rate-limit-requests 6000 --audit-log /var/log/mine-teleop/signaling-audit.jsonl
 Restart=on-failure
 RestartSec=2
 StandardOutput=append:/var/log/mine-teleop/signaling-server.log

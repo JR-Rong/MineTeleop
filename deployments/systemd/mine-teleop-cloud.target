@@ -1,0 +1,8 @@
+[Unit]
+Description=Mine Teleop cloud signaling and relay stack
+Wants=network-online.target
+Requires=mine-teleop-signaling-server.service mine-teleop-turn-server.service caddy.service haproxy.service
+After=network-online.target mine-teleop-signaling-server.service mine-teleop-turn-server.service caddy.service haproxy.service
+
+[Install]
+WantedBy=multi-user.target

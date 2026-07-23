@@ -1,0 +1,317 @@
+FROM ubuntu:22.04 AS gstreamer-source
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG GSTREAMER_VERSION=1.28.5
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bison \
+        build-essential \
+        ca-certificates \
+        flex \
+        git \
+        libdrm-dev \
+        libglib2.0-dev \
+        libgnutls28-dev \
+        libgudev-1.0-dev \
+        libjpeg-dev \
+        liborc-0.4-dev \
+        libsrtp2-dev \
+        libssl-dev \
+        libusrsctp-dev \
+        libva-dev \
+        pkg-config \
+        python3-pip \
+    && python3 -m pip install --no-cache-dir meson==1.7.2 ninja==1.11.1.4 \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch "$GSTREAMER_VERSION" --filter=blob:none \
+      https://github.com/GStreamer/gstreamer.git /tmp/gstreamer
+COPY deployments/cpp/gstreamer-1.28.5-no-doc.patch /tmp/gstreamer-1.28.5-no-doc.patch
+RUN git -C /tmp/gstreamer apply /tmp/gstreamer-1.28.5-no-doc.patch
+RUN cd /tmp/gstreamer && meson subprojects download orc libnice
+
+FROM gstreamer-source AS gstreamer
+RUN meson setup /tmp/gstreamer-build /tmp/gstreamer \
+         --buildtype=release \
+         --prefix=/opt/gstreamer \
+         --libdir=lib \
+         --auto-features=disabled \
+         -Dbase=enabled \
+         -Dgood=enabled \
+         -Dbad=enabled \
+         -Dugly=disabled \
+         -Dlibav=disabled \
+         -Ddevtools=disabled \
+         -Dges=disabled \
+         -Drtsp_server=disabled \
+         -Dpython=disabled \
+         -Dgst-examples=disabled \
+         -Dtools=enabled \
+         -Dtests=disabled \
+         -Dexamples=disabled \
+         -Dbenchmarks=disabled \
+         -Dintrospection=disabled \
+         -Dnls=disabled \
+         -Ddoc=disabled \
+         -Dorc=enabled \
+         -Dorc-compiler=enabled \
+         -Dwebrtc=enabled \
+         -Dgstreamer:doc=disabled \
+         -Dgst-plugins-base:doc=disabled \
+         -Dgst-plugins-good:doc=disabled \
+         -Dgst-plugins-bad:doc=disabled \
+         -Dorc-source=subproject \
+         -Dbuild-tools-source=system \
+         -Dlibnice=enabled \
+         -Dgst-plugins-base:app=enabled \
+         -Dgst-plugins-base:typefind=enabled \
+         -Dgst-plugins-base:videoconvertscale=enabled \
+         -Dgst-plugins-base:videotestsrc=enabled \
+         -Dgst-plugins-good:isomp4=enabled \
+         -Dgst-plugins-good:jpeg=enabled \
+         -Dgst-plugins-good:multifile=enabled \
+         -Dgst-plugins-good:rtp=enabled \
+         -Dgst-plugins-good:rtpmanager=enabled \
+         -Dgst-plugins-good:v4l2=enabled \
+         -Dgst-plugins-bad:dtls=enabled \
+         -Dgst-plugins-bad:nvcodec=enabled \
+         -Dgst-plugins-bad:rtp=enabled \
+         -Dgst-plugins-bad:sctp=enabled \
+         -Dgst-plugins-bad:srtp=enabled \
+         -Dgst-plugins-bad:va=enabled \
+         -Dgst-plugins-bad:videoparsers=enabled \
+         -Dgst-plugins-bad:webrtc=enabled \
+    && meson compile -C /tmp/gstreamer-build --jobs 1 \
+    && meson install -C /tmp/gstreamer-build \
+    && rm -rf /tmp/gstreamer /tmp/gstreamer-build /root/.cache
+
+FROM ubuntu:22.04 AS libsrtp
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG LIBSRTP_COMMIT=90d05bf8980d16e4ac3f16c19b77e296c4bc207b
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        git \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN git init /tmp/libsrtp \
+    && git -C /tmp/libsrtp remote add origin https://github.com/cisco/libsrtp.git \
+    && git -C /tmp/libsrtp fetch --depth 1 origin "$LIBSRTP_COMMIT" \
+    && git -C /tmp/libsrtp checkout --detach FETCH_HEAD \
+    && test "$(git -C /tmp/libsrtp rev-parse HEAD)" = "$LIBSRTP_COMMIT"
+RUN cmake -S /tmp/libsrtp -B /tmp/libsrtp-build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/libsrtp \
+      -DBUILD_SHARED_LIBS=ON \
+      -DENABLE_OPENSSL=ON \
+    && cmake --build /tmp/libsrtp-build --parallel 2 \
+    && ctest --test-dir /tmp/libsrtp-build --output-on-failure \
+    && cmake --install /tmp/libsrtp-build \
+    && rm -rf /tmp/libsrtp /tmp/libsrtp-build
+
+FROM ubuntu:22.04 AS aravis
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG ARAVIS_COMMIT=97ff5e330919d7a44b871df4eda669feeafdf342
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        git \
+        libglib2.0-dev \
+        libusb-1.0-0-dev \
+        libxml2-dev \
+        meson \
+        ninja-build \
+        pkg-config \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN git init /tmp/aravis \
+    && git -C /tmp/aravis remote add origin https://github.com/AravisProject/aravis.git \
+    && git -C /tmp/aravis fetch --depth 1 origin "$ARAVIS_COMMIT" \
+    && git -C /tmp/aravis checkout --detach FETCH_HEAD \
+    && test "$(git -C /tmp/aravis rev-parse HEAD)" = "$ARAVIS_COMMIT"
+RUN meson setup /tmp/aravis-build /tmp/aravis \
+         --buildtype=release \
+         -Doptimization=2 \
+         --prefix=/opt/aravis \
+         --libdir=lib \
+         --default-library=shared \
+         -Dviewer=disabled \
+         -Dgst-plugin=disabled \
+         -Dusb=enabled \
+         -Dpacket-socket=disabled \
+         -Dtests=false \
+         -Dintrospection=disabled \
+         -Ddocumentation=disabled \
+    && meson compile -C /tmp/aravis-build --jobs 1 \
+    && meson install -C /tmp/aravis-build \
+    && rm -rf /tmp/aravis /tmp/aravis-build
+
+FROM ubuntu:22.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG TARGETARCH
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        libcurl4-openssl-dev \
+        libgstreamer1.0-dev \
+        libgstreamer-plugins-base1.0-dev \
+        libgstreamer-plugins-bad1.0-dev \
+        libglib2.0-dev \
+        libjpeg-dev \
+        libusb-1.0-0-dev \
+        libxml2-dev \
+        libsrtp2-dev \
+        libssl-dev \
+        libyaml-cpp-dev \
+        nlohmann-json3-dev \
+        patchelf \
+        pkg-config \
+        v4l-utils \
+        vainfo \
+        zlib1g-dev \
+    && if [ "$TARGETARCH" = "amd64" ]; then \
+         apt-get install -y --no-install-recommends intel-media-va-driver; \
+       fi \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG MINE_TELEOP_BUILD_JOBS=2
+
+COPY --from=aravis /opt/aravis /opt/aravis
+ENV PKG_CONFIG_PATH="/opt/aravis/lib/pkgconfig"
+
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B /tmp/mine-teleop-build \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_INSTALL_PREFIX=/opt/mine-teleop \
+    && cmake --build /tmp/mine-teleop-build --parallel "$MINE_TELEOP_BUILD_JOBS" \
+    && ctest --test-dir /tmp/mine-teleop-build --output-on-failure \
+    && cmake --install /tmp/mine-teleop-build \
+    && LD_LIBRARY_PATH=/opt/aravis/lib /opt/mine-teleop/bin/mine-teleop-aravis-camera --help \
+    && /opt/mine-teleop/bin/mine-teleop config-check --config /src/configs/vehicle-agent.dev.yaml \
+    && /opt/mine-teleop/bin/mine-teleop vehicle-agent \
+         --config /src/configs/vehicle-agent.dev.yaml \
+         --run-loop \
+         --duration-ms 1000 \
+         --disconnect-at-ms 200
+
+FROM build AS bundle
+
+COPY --from=gstreamer /opt/gstreamer /opt/gstreamer
+COPY --from=libsrtp /opt/libsrtp /opt/libsrtp
+
+# Ubuntu 22.04's libsrtp fails the GStreamer SRTP session self-test on the
+# vehicle. The pinned OpenSSL build below is verified by the pipeline gate.
+RUN set -e; \
+    mkdir -p /bundle/bin /bundle/config /bundle/deployments/udev /bundle/lib/gstreamer-1.0 /bundle/lib/dri /bundle/scripts /bundle/share/mine-teleop /bundle/etc/ssl/certs /bundle/lib/vendor/chassis /bundle/lib/vendor/mvs; \
+    cp -a /opt/mine-teleop/bin/. /bundle/bin/; \
+    cp -a /opt/mine-teleop/lib/. /bundle/lib/; \
+    cp /src/configs/vehicle-agent.bench.yaml /bundle/config/vehicle-agent.yaml; \
+    cp /src/configs/mine-teleop-field-root.crt /bundle/config/mine-teleop-field-root.crt; \
+    cp /src/deployments/udev/99-mine-teleop-basler.rules /bundle/deployments/udev/; \
+    cp /src/scripts/setup_basler_usb_access.sh /bundle/scripts/; \
+    chmod +x /bundle/scripts/setup_basler_usb_access.sh; \
+    cp /etc/ssl/certs/ca-certificates.crt /bundle/config/ca-certificates.crt; \
+    cp -L /opt/aravis/lib/libaravis*.so* /bundle/lib/; \
+    cp -a /opt/mine-teleop/share/. /bundle/share/; \
+    cp -L /opt/gstreamer/bin/gst-inspect-1.0 /opt/gstreamer/bin/gst-launch-1.0 /usr/bin/v4l2-ctl /usr/bin/vainfo /bundle/bin/; \
+    cp -L /opt/gstreamer/lib/lib*.so* /bundle/lib/; \
+    cp -L /opt/libsrtp/lib/libsrtp2.so.2.4.2 /bundle/lib/libsrtp2.so.1; \
+    cp -L /opt/gstreamer/lib/gstreamer-1.0/*.so /bundle/lib/gstreamer-1.0/; \
+    cp -L /usr/lib/x86_64-linux-gnu/nss/libsoftokn3.so \
+      /usr/lib/x86_64-linux-gnu/nss/libfreebl3.so \
+      /usr/lib/x86_64-linux-gnu/nss/libfreeblpriv3.so \
+      /usr/lib/x86_64-linux-gnu/nss/libnssckbi.so \
+      /usr/lib/x86_64-linux-gnu/nss/libnssdbm3.so /bundle/lib/; \
+    cp -L /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so /bundle/lib/dri/; \
+    scanner="$(find /opt/gstreamer -path '*/gstreamer-1.0/gst-plugin-scanner' -type f | head -n 1)"; \
+    [ -n "$scanner" ] && cp -L "$scanner" /bundle/bin/gst-plugin-scanner; \
+    cp -L /etc/ssl/certs/ca-certificates.crt /bundle/etc/ssl/certs/; \
+    if [ -d /src/vendor/chassis/lib ]; then cp -a /src/vendor/chassis/lib/. /bundle/lib/vendor/chassis/; fi; \
+    if [ -d /src/vendor/mvs/lib ]; then cp -a /src/vendor/mvs/lib/. /bundle/lib/vendor/mvs/; fi; \
+    if [ -d /src/vendor/nvidia/lib ]; then cp -a /src/vendor/nvidia/lib/. /bundle/lib/; fi; \
+    cp -L /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libm.so.6 \
+      /lib/x86_64-linux-gnu/libpthread.so.0 /lib/x86_64-linux-gnu/libdl.so.2 \
+      /lib/x86_64-linux-gnu/librt.so.1 /lib64/ld-linux-x86-64.so.2 /bundle/lib/; \
+    find /bundle/lib -type f -name '*.a' -delete; \
+    copy_dependencies() { \
+      ldd "$1" 2>/dev/null \
+        | awk '/=> \/.* \(/ {print $3} /^\// {print $1}' \
+        | while read -r library; do \
+            cp -L -n "$library" /bundle/lib/; \
+          done; \
+    }; \
+    pass=0; \
+    while [ "$pass" -lt 4 ]; do \
+      for object in $(find /bundle/bin /bundle/lib -type f); do \
+        [ -f "$object" ] || continue; \
+        copy_dependencies "$object"; \
+      done; \
+      pass=$((pass + 1)); \
+    done; \
+    for object in $(find /bundle/bin -type f); do \
+      [ -f "$object" ] || continue; \
+      patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/..:$ORIGIN/../lib/vendor/chassis:$ORIGIN/../lib/vendor/mvs:$ORIGIN' "$object" 2>/dev/null || true; \
+    done; \
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'set -euo pipefail' \
+      'root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"' \
+      'export PATH="$root/bin:${PATH:-/usr/bin:/bin}"' \
+      'export LD_LIBRARY_PATH="$root/lib:$root/lib/vendor/chassis:$root/lib/vendor/mvs:${LD_LIBRARY_PATH:-}"' \
+      'export GST_PLUGIN_SYSTEM_PATH_1_0=""' \
+      'export GST_PLUGIN_PATH_1_0="$root/lib/gstreamer-1.0"' \
+      'export GST_PLUGIN_SCANNER="$root/bin/gst-plugin-scanner"' \
+      'export GST_REGISTRY_FORK=no' \
+      'export SSL_CERT_FILE="${SSL_CERT_FILE:-$root/etc/ssl/certs/ca-certificates.crt}"' \
+      'exec "$root/bin/mine-teleop" "$@"' \
+      > /bundle/mine-teleop; \
+    chmod +x /bundle/mine-teleop; \
+    /bundle/mine-teleop version; \
+    /bundle/bin/mine-teleop-run version; \
+    /bundle/bin/mine-teleop-run config-check --config /bundle/config/vehicle-agent.yaml; \
+    LD_LIBRARY_PATH=/bundle/lib /bundle/bin/mine-teleop-aravis-camera --list --json | grep -q '"device_count":0'; \
+    GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib /bundle/bin/gst-inspect-1.0 srtpenc >/dev/null; \
+    GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib \
+      /bundle/bin/gst-launch-1.0 -q fakesrc num-buffers=1 sizetype=fixed sizemax=100 filltype=zero \
+      '!' 'application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96,ssrc=(uint)1' \
+      '!' srtpenc random-key=true '!' fakesink; \
+    GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib /bundle/bin/gst-inspect-1.0 webrtcbin >/dev/null; \
+    GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib /bundle/bin/gst-inspect-1.0 sctpenc >/dev/null; \
+    GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib /bundle/bin/gst-inspect-1.0 sctpdec >/dev/null; \
+    GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib /bundle/bin/gst-inspect-1.0 dtlsenc >/dev/null; \
+    GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib /bundle/bin/gst-inspect-1.0 dtlsdec >/dev/null; \
+    GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib /bundle/bin/gst-inspect-1.0 v4l2src >/dev/null; \
+    GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib /bundle/bin/gst-inspect-1.0 va >/dev/null; \
+    GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib /bundle/bin/gst-inspect-1.0 h264parse >/dev/null; \
+    GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib /bundle/bin/gst-inspect-1.0 rtph264pay >/dev/null
+
+FROM ubuntu:22.04 AS runtime
+
+COPY --from=bundle /bundle /opt/mine-teleop
+ENV PATH="/opt/mine-teleop/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/mine-teleop/lib:/opt/mine-teleop/lib/vendor/chassis:/opt/mine-teleop/lib/vendor/mvs"
+ENV GST_PLUGIN_SYSTEM_PATH_1_0=""
+ENV GST_PLUGIN_PATH_1_0="/opt/mine-teleop/lib/gstreamer-1.0"
+ENV GST_PLUGIN_SCANNER="/opt/mine-teleop/bin/gst-plugin-scanner"
+ENV GST_REGISTRY_FORK="no"
+ENV GST_REGISTRY="/tmp/mine-teleop-gstreamer-registry.bin"
+ENV SSL_CERT_FILE="/opt/mine-teleop/etc/ssl/certs/ca-certificates.crt"
+RUN groupadd --system mineteleop \
+    && useradd --system --gid mineteleop --home-dir /opt/mine-teleop --shell /usr/sbin/nologin mineteleop \
+    && mkdir -p /var/lib/mine-teleop/recordings /var/lib/mine-teleop/uploader \
+    && chown -R mineteleop:mineteleop /var/lib/mine-teleop
+USER mineteleop
+WORKDIR /opt/mine-teleop
+ENTRYPOINT ["/opt/mine-teleop/mine-teleop"]
+CMD ["version"]
+
+FROM scratch AS artifact
+COPY --from=bundle /bundle/ /

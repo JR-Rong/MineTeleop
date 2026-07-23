@@ -1,0 +1,30 @@
+diff --git a/subprojects/gst-plugins-base/docs/meson.build b/subprojects/gst-plugins-base/docs/meson.build
+index 924a9d53d6..f9c1e0e08b 100644
+--- a/subprojects/gst-plugins-base/docs/meson.build
++++ b/subprojects/gst-plugins-base/docs/meson.build
+@@ -1,1 +1,5 @@
++if get_option('doc').disabled()
++  subdir_done()
++endif
++
+ build_hotdoc = false
+diff --git a/subprojects/gst-plugins-good/docs/meson.build b/subprojects/gst-plugins-good/docs/meson.build
+index 6d02a4f97e..e142f4b811 100644
+--- a/subprojects/gst-plugins-good/docs/meson.build
++++ b/subprojects/gst-plugins-good/docs/meson.build
+@@ -1,1 +1,5 @@
++if get_option('doc').disabled()
++  subdir_done()
++endif
++
+ build_hotdoc = false
+diff --git a/subprojects/gst-plugins-bad/docs/meson.build b/subprojects/gst-plugins-bad/docs/meson.build
+index 8aa34ae6aa..813eff24ef 100644
+--- a/subprojects/gst-plugins-bad/docs/meson.build
++++ b/subprojects/gst-plugins-bad/docs/meson.build
+@@ -1,1 +1,5 @@
++if get_option('doc').disabled()
++  subdir_done()
++endif
++
+ build_hotdoc = false
