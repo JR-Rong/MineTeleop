@@ -33,16 +33,10 @@ Vehicle Agent 运行在车端 Ubuntu 工控机，负责：
 - 输出最终生效配置到日志。
 - 支持后续热更新部分非危险配置。
 
-本地参考实现提供 `effective_vehicle_config_log_payload`，用于生成可
-JSON 序列化的最终生效配置摘要，并把设备证书、密钥和 TURN 凭据等敏感
-字段只标记为已配置/未配置，避免启动日志泄露路径或密钥内容。
-`vehicle-agent/vehicle_agent.py` 启动加载配置后会先输出一条
-`effective_vehicle_config` JSONL 记录，供 preflight、run-loop 和本地 demo
-归档使用。
-`--adapter-status` 会打开配置的 VehicleAdapter 并输出
-`vehicle_adapter_status`；联调真实 C shim 时可加 `--poll-feedback` 输出
-`vehicle_adapter_feedback_poll`，再加 `--require-feedback` 要求必须收到一帧
-MinePilot decoded CAN feedback，否则进程返回非 0，供目标 CAN 主机验收归档。
+原生 C++ 运行时会先输出脱敏后的有效配置摘要，设备 token、证书和 TURN
+凭据不会写入日志。`vehicle-agent --preflight` 检查相机、CAN interface 和
+bridge 动态库；`vehicle-agent --adapter-status` 会实际打开配置的
+VehicleAdapter、输出 `vehicle_adapter_status`，失败时返回非 0。
 
 危险配置如车辆控制适配器、设备证书路径、车辆 ID，不建议运行时热更新。
 
@@ -170,37 +164,28 @@ VehicleAdapter
 首版实现：
 
 - `MockVehicleAdapter`：打印/记录控制命令，不接真实车辆。
-- 本地参考实现只允许 `vehicle_adapter.type=mock` 直接创建可运行适配器；`can` 和 `dynamic_library` 必须先在配置中声明控制单位、档位、心跳、安全停车、急停、命令确认和 telemetry 字段契约，并提供 `control.timeout_calibration` 标定证据。配置为 `abi: c_shim` 且声明 `bridge_library_path` 后，`can` 与 `dynamic_library` 都可通过 ChassisControl bridge 创建真实 adapter；缺少 bridge 时必须启动失败，不能静默退回 Mock。
+- 原生运行时只允许 `vehicle_adapter.type=mock` 无外部依赖运行；`can` 和
+  `dynamic_library` 必须声明 C shim bridge、CAN interface 和超时标定证据。
+  缺少 bridge 时启动失败，不能静默退回 Mock。
 - `vehicle-agent` 的无模式默认闭环是开发 Mock demo，只能在 `vehicle_adapter.type=mock`
   配置下运行。真实 adapter 配置必须显式走 `--run-loop` 或 `--adapter-status`；
   否则进程返回非 0 并输出 `vehicle_agent_mode_error`，避免目标机误以为真实底盘链路已经启动。
-- `dynamic_library` 的首个真实接入目标是 `/Volumes/SystemDisk/Workspace/ChassisControl` 的 `chassis_control` 动态库和 `/Volumes/SystemDisk/Workspace/MinePilot` 的低层 CAN、`can_db`/receiver/sender。车端 Python 层通过稳定 C shim ABI 下发 ChassisControl 调用意图；由于该库当前暴露 C++ API，实际加载前必须提供 C++ bridge/C shim 来封装 `Initialize`、`UpdateVehicleState`、`RunArmingStateMachine`、`SendCanMessage` 和当前动态库导出的 `EmergencyStopWheels`，并把它封装为稳定 C ABI `mine_teleop_chassis_emergency_stop`。仓库内的 `deployments/chassis-control-bridge/` 提供 bridge 模板。
+- `dynamic_library` 通过原生 C++ `DynamicLibraryVehicleAdapter` 加载稳定 C shim
+  ABI。仓库内的 `deployments/chassis-control-bridge/` 把 ChassisControl 和
+  MinePilot CAN 接口封装为该 ABI。
 
 后续实现：
 
 - `CanVehicleAdapter`：当前可通过 ChassisControl C shim 间接使用 SocketCAN/厂商 CAN 后端；后续若需要绕过 ChassisControl，可再增加直接 SocketCAN 或厂商 CAN 卡 SDK adapter。
 
-本地参考实现已提供 ChassisControl C shim 接入路径：配置为
-`abi: c_shim` 且声明 `bridge_library_path` 后，`can` 与 `dynamic_library` 可通过 `ctypes` 调用
-`deployments/chassis-control-bridge/` 导出的稳定 C ABI；该 ABI 由
-`mine_teleop_chassis_bridge.h` 声明，供目标主机编译、Python `ctypes` 结构和联调审查共用。该路径已覆盖控制下发、
-急停、CAN feedback polling、telemetry 读取、adapter `get_status()` 打开/健康/错误状态与下发计数快照和 MinePilot decoded CAN feedback 转发；当链接 MinePilot
-提供的 `libchassis_control` 时，bridge CMake 会校验 MinePilot 的
-`include/can/can_common.h`、`include/can/can_message.h`、`can_db.h`、
-`can_receiver.h` 和 `can_sender.h` 均存在，并选择 MinePilot 的
-`chassis_control.h` 作为 ABI 头根，并把 decoded CAN 中的 4 路转向角反馈传给
-支持 `eps_angle` 的 ChassisControl arming feedback，缺失转向角以 NaN 标记，避免
-误判车轮已回正。目标 Ubuntu 车辆主机仍需完成真实 `.so` 构建、SocketCAN/CAN
-卡和底盘联调验证。
+`mine_teleop_chassis_bridge.h` 声明控制下发、急停、反馈轮询、telemetry 和关闭
+接口。bridge CMake 会校验所需的 ChassisControl/MinePilot 头文件和源码，并把
+decoded CAN feedback 交给原生 adapter。构建命令、依赖和启动前检查统一见
+`deployments/chassis-control-bridge/README.md`；目标 Ubuntu 车辆主机仍需完成
+真实 `.so` 构建、SocketCAN/CAN 卡和底盘联调验证。
 车端长期控制服务和 `vehicle-agent --run-loop` 摘要也只读取 adapter `get_status()`
 中的 `applied_command_count`，避免真实 C shim adapter 运行路径依赖 Mock 专用的
 内部命令列表。
-`scripts/chassis_bridge_check.py` 默认校验 ChassisControl checkout 位于
-`UI_Test` 分支、MinePilot checkout 位于 `merge_ui_test` 分支，并确认
-MinePilot 的 `can_db.h`、`can_receiver.h`、`can_sender.h`、
-`include/can/can_common.h`、`include/can/can_message.h`、`src/can_db.cpp`、
-`src/can_receiver.cpp`、`src/can_sender.cpp` 和
-`libchassis_control` 可被 bridge CMake 选中。
 
 ### Telemetry Publisher
 

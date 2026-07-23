@@ -320,7 +320,7 @@ vehicle_adapter:
       cmake_target: chassis_control
       library_output_name: libchassis_control.so
       can_interface: can0
-      # 当前 ChassisControl 头文件暴露 C++ API，不能直接作为 Python ctypes C ABI 调用。
+      # 当前 ChassisControl 头文件暴露 C++ API，需要稳定的 C shim ABI。
       abi: cplusplus
       requires_cpp_bridge: true
     minepilot:
@@ -359,30 +359,23 @@ vehicle_adapter:
       bridge_library_path: /opt/mine-teleop/lib/libmine_teleop_chassis_bridge.so
 ```
 
-可用下面的脚本从开发配置生成目标车端配置，再按现场 cloud/TURN/证书/录像路径
-做部署覆盖：
+以 `configs/vehicle-agent.three-machine.field.yaml` 为现场模板，在部署流程中复制为
+`config/vehicle-agent.yaml`，再填入 bridge、CAN、cloud、证书和录像路径。仓库不再
+保留旧 Python 配置生成器；修改后必须使用原生入口校验：
 
 ```bash
-python3 scripts/render_chassis_vehicle_config.py \
-  --base-config configs/vehicle-agent.dev.yaml \
-  --output /etc/mine-teleop/vehicle-agent.yaml \
-  --chassis-control-root /Volumes/SystemDisk/Workspace/ChassisControl \
-  --minepilot-root /Volumes/SystemDisk/Workspace/MinePilot \
-  --bridge-library /opt/mine-teleop/lib/libmine_teleop_chassis_bridge.so \
-  --chassis-control-library /Volumes/SystemDisk/Workspace/MinePilot/libchassis_control.so \
-  --can-interface can0 \
-  --max-control-timeout-ms 900 \
-  --calibration-evidence bench-brake-test-2026-06-24
+/opt/mine-teleop/bin/mine-teleop-run config-check \
+  --config /opt/mine-teleop/config/vehicle-agent.yaml
+/opt/mine-teleop/bin/mine-teleop-run vehicle-agent \
+  --config /opt/mine-teleop/config/vehicle-agent.yaml \
+  --preflight
+/opt/mine-teleop/bin/mine-teleop-run vehicle-agent \
+  --config /opt/mine-teleop/config/vehicle-agent.yaml \
+  --adapter-status
 ```
 
-脚本会注入 `abi: c_shim`、`requires_cpp_bridge: false`、MinePilot
-`include/can/*.h`、`include/can_db.h`、`include/can_receiver.h`、
-`include/can_sender.h` 和 `src/can_db.cpp`/receiver/sender 路径，并写入
-实际链接的 `libchassis_control` 路径与 `control.timeout_calibration`。输出的 YAML 仍需在目标机通过 `vehicle-agent
---adapter-status` 验证 bridge 能被 runtime 打开。
-
 仓库提供 `deployments/chassis-control-bridge/` 模板和
-`mine_teleop_chassis_bridge.h` 稳定 ABI 头，导出 Python adapter 所需的
+`mine_teleop_chassis_bridge.h` 稳定 ABI 头，导出原生 adapter 所需的
 `mine_teleop_chassis_open`、`mine_teleop_chassis_apply_state`、
 `mine_teleop_chassis_emergency_stop`、`mine_teleop_chassis_update_feedback`、
 `mine_teleop_chassis_poll_feedback`、`mine_teleop_chassis_read_telemetry` 和
