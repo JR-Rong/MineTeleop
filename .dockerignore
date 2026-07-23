@@ -6,4 +6,3 @@ dist
 cpp-build
 __pycache__
 *.pyc
-docs/superpowers

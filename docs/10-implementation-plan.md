@@ -6,8 +6,8 @@
 
 每个阶段都必须产出可运行、可验证的软件闭环。
 
-当前代码实现、文档地图和工控机无 Docker 部署流程见
-[当前实现与工控机无 Docker 部署](14-current-status-and-ipc-deployment.md)。
+当前实现状态见 [三端任务状态](20-three-end-taskbook-status.md)，已验证的三机
+交付路径见 [三机现场交付](22-three-machine-live-delivery.md)。
 
 ## Phase 0: 项目骨架和开发环境
 
@@ -22,12 +22,13 @@
 mine-teleop/
   README.md
   docs/
-  vehicle-agent/
-  driver-console/
-  signaling-server/
+  cpp/
+    apps/
+    include/
+    src/
+    tests/
   configs/
   scripts/
-  tests/
   deployments/
 ```
 

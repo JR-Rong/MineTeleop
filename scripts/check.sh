@@ -57,7 +57,6 @@ fi
 
 if find "$repo_root" \
   -path "$repo_root/.git" -prune -o \
-  -path "$repo_root/docs/superpowers" -prune -o \
   -name '*.py' -print -quit | grep -q .; then
   printf 'Python source remains in the active repository\n' >&2
   exit 2

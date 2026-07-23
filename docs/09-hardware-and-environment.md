@@ -122,21 +122,15 @@ sudo docker run --rm \
 
 ## 验证结果归档
 
-目标工控机完成并发编码后，把每路 `ffprobe` 的 `key=value` 输出保存为文件，
-再把 CPU/GPU/内存/磁盘/温度等采样保存为 JSON。然后用本仓库生成统一 JSONL
-验收记录：
+目标工控机先运行包内原生媒体探针，再执行真实多路媒体会话：
 
 ```bash
-python3 vehicle-media-agent/vehicle_media_agent.py \
-  --mode hardware-report \
-  --scenario four-camera-realtime-720p30 \
-  --ffprobe-output front-realtime-720p30=/tmp/front.ffprobe.txt \
-  --ffprobe-output rear-realtime-720p30=/tmp/rear.ffprobe.txt \
-  --ffprobe-output left-realtime-720p30=/tmp/left.ffprobe.txt \
-  --ffprobe-output right-realtime-720p30=/tmp/right.ffprobe.txt \
-  --metrics-json /tmp/mine-teleop-vaapi-metrics.json
+./bin/mine-teleop-run media-probe
+./bin/mine-teleop-run vehicle-agent \
+  --config config/vehicle-agent.yaml \
+  --preflight
 ```
 
-报告第一行是 `hardware_encoding_validation` 汇总，后续包含每路
-`hardware_encoding_lane` 和一条 `hardware_encoding_metrics`。任一路 codec、
-分辨率、fps 或码率不符合场景期望时返回 2；全部通过时返回 0。
+验收时保存 `vainfo`、GStreamer 探针、每路浏览器 WebRTC stats，以及
+CPU/GPU/内存/磁盘/温度采样。当前三机实测记录见
+`docs/22-three-machine-live-delivery.md`。
