@@ -1,0 +1,7 @@
+[wrap-git]
+directory = libnice
+url = https://github.com/libnice/libnice.git
+revision = 0a3890f1830d4c77ecbb41de835aa549e7645ed5
+
+[provide]
+nice = libnice_dep

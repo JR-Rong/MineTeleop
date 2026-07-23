@@ -1,9 +1,20 @@
-FROM ubuntu:22.04 AS gstreamer-source
+FROM ubuntu:22.04 AS ubuntu-build-base
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get -o Acquire::Retries=10 -o Acquire::http::Timeout=30 update \
+    && apt-get -o Acquire::Retries=10 -o Acquire::http::Timeout=30 install -y --no-install-recommends ca-certificates \
+    && sed -i \
+         -e 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g' \
+         -e 's|http://security.ubuntu.com|https://security.ubuntu.com|g' \
+         /etc/apt/sources.list \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM ubuntu-build-base AS gstreamer-source
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG GSTREAMER_VERSION=1.28.5
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
         bison \
         build-essential \
         ca-certificates \
@@ -27,6 +38,7 @@ RUN git clone --depth 1 --branch "$GSTREAMER_VERSION" --filter=blob:none \
       https://github.com/GStreamer/gstreamer.git /tmp/gstreamer
 COPY deployments/cpp/gstreamer-1.28.5-no-doc.patch /tmp/gstreamer-1.28.5-no-doc.patch
 RUN git -C /tmp/gstreamer apply /tmp/gstreamer-1.28.5-no-doc.patch
+COPY deployments/cpp/libnice.wrap /tmp/gstreamer/subprojects/libnice.wrap
 RUN cd /tmp/gstreamer && meson subprojects download orc libnice
 
 FROM gstreamer-source AS gstreamer
@@ -84,12 +96,12 @@ RUN meson setup /tmp/gstreamer-build /tmp/gstreamer \
     && meson install -C /tmp/gstreamer-build \
     && rm -rf /tmp/gstreamer /tmp/gstreamer-build /root/.cache
 
-FROM ubuntu:22.04 AS libsrtp
+FROM ubuntu-build-base AS libsrtp
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG LIBSRTP_COMMIT=90d05bf8980d16e4ac3f16c19b77e296c4bc207b
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         cmake \
@@ -111,12 +123,12 @@ RUN cmake -S /tmp/libsrtp -B /tmp/libsrtp-build \
     && cmake --install /tmp/libsrtp-build \
     && rm -rf /tmp/libsrtp /tmp/libsrtp-build
 
-FROM ubuntu:22.04 AS aravis
+FROM ubuntu-build-base AS aravis
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG ARAVIS_COMMIT=97ff5e330919d7a44b871df4eda669feeafdf342
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         git \
@@ -150,12 +162,12 @@ RUN meson setup /tmp/aravis-build /tmp/aravis \
     && meson install -C /tmp/aravis-build \
     && rm -rf /tmp/aravis /tmp/aravis-build
 
-FROM ubuntu:22.04 AS build
+FROM ubuntu-build-base AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         cmake \
@@ -177,7 +189,7 @@ RUN apt-get update \
         vainfo \
         zlib1g-dev \
     && if [ "$TARGETARCH" = "amd64" ]; then \
-         apt-get install -y --no-install-recommends intel-media-va-driver; \
+         apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends intel-media-va-driver; \
        fi \
     && rm -rf /var/lib/apt/lists/*
 
