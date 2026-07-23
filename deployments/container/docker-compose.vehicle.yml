@@ -1,30 +1,5 @@
 services:
-  vehicle-agent:
-    build:
-      context: ../..
-      dockerfile: deployments/container/Dockerfile.media
-    working_dir: /opt/mine-teleop
-    security_opt:
-      - "no-new-privileges:true"
-    cap_drop:
-      - ALL
-    command:
-      - vehicle-agent
-      - --config
-      - /etc/mine-teleop/vehicle-agent.yaml
-      - --teleop
-      - --service
-    environment:
-      MINE_TELEOP_DEVICE_TOKEN: ${MINE_TELEOP_DEVICE_TOKEN:-dev-device-secret}
-    volumes:
-      - /etc/mine-teleop:/etc/mine-teleop:ro
-      - mine-teleop-recordings:/var/lib/mine-teleop/recordings
-    cpus: "1.0"
-    cpu_shares: 1024
-    mem_limit: "1g"
-    restart: on-failure
-
-  vehicle-media-agent:
+  vehicle-runtime:
     build:
       context: ../..
       dockerfile: deployments/container/Dockerfile.media
@@ -36,15 +11,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     command:
-      - vehicle-media-agent
+      - vehicle-runtime
       - --config
       - /etc/mine-teleop/vehicle-agent.yaml
       - --signaling-http-url
       - ${MINE_TELEOP_SIGNALING_HTTP_URL:-http://host.docker.internal:8765}
-      - --service
-      - --record
-      - --recording-root
-      - /var/lib/mine-teleop/recordings
     environment:
       MINE_TELEOP_DEVICE_TOKEN: ${MINE_TELEOP_DEVICE_TOKEN:-dev-device-secret}
     devices:
@@ -102,10 +73,12 @@ services:
       - --no-cli
     ports:
       - "3478:3478/udp"
+      - "3478:3478/tcp"
       - "5349:5349/udp"
+      - "5349:5349/tcp"
       - "49152-49200:49152-49200/udp"
     volumes:
-      - ../turnserver/turnserver.conf.template:/etc/mine-teleop/turnserver.conf:ro
+      - "${MINE_TELEOP_TURN_CONFIG_FILE:?set MINE_TELEOP_TURN_CONFIG_FILE to a rendered turnserver.conf}:/etc/mine-teleop/turnserver.conf:ro"
       - ../tls:/etc/mine-teleop/tls:ro
     cpus: "1.0"
     mem_limit: "512m"

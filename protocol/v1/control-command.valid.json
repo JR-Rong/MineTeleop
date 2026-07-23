@@ -1,0 +1,18 @@
+{
+  "type": "control_command",
+  "protocol_version": 1,
+  "vehicle_id": "vehicle-001",
+  "driver_id": "driver-001",
+  "session_id": "session-001",
+  "seq": 1024,
+  "sent_at_utc_ms": 1780000000000,
+  "control_token": "control-token-test-vector",
+  "gear": "D",
+  "steering": 0.12,
+  "throttle": 0.2,
+  "brake": 0.0,
+  "estop": false,
+  "future_extension": {
+    "ignored": true
+  }
+}

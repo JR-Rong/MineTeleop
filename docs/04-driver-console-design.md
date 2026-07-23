@@ -15,90 +15,50 @@ Driver Console 运行在远端模拟驾驶器上，负责：
 
 ## 应用形态
 
-首版采用原生桌面程序。
+当前实现采用便携 C++20 本地进程与系统浏览器组合：C++ 进程只监听
+`127.0.0.1`，保存登录/会话/token、连接服务器并给控制命令补齐协议元数据；
+浏览器负责 WebRTC 解码、DataChannel、键盘和标准 Gamepad API。平台差异仅保留
+默认浏览器启动、动态库和文件路径适配。
 
-推荐：
-
-- C++ + Qt。
-- Windows 优先，Linux 兼容。
-- 媒体层可使用 GStreamer/WebRTC 或 WebRTC native。
-
-选择原生桌面的原因：
-
-- 更容易接入后续方向盘、踏板、档位器。
-- 多路视频解码和渲染更可控。
-- 低延迟键盘/硬件输入处理更稳定。
-- 可以更好支持多屏幕布局。
+这个形态让 macOS、Windows 和 Ubuntu 共享同一套核心与页面，同时不把长期设备
+凭证或 TURN 密钥放进浏览器。特殊方向盘、踏板和档位器如果不能通过标准 Gamepad
+API 表达，应放到独立平台适配器中，不能侵入会话或协议核心。
 
 ## UI 布局
 
-首版建议布局：
+当前布局：
 
-- 主区域：4 路视频网格，支持 1/2/4 路布局切换。
-- 右侧状态栏：
-  - 车速。
-  - 档位。
-  - 转向。
-  - 油门。
-  - 刹车。
-  - 急停状态。
-  - 故障状态。
-  - 控制连接状态。
-  - 视频连接状态。
-- 底部状态栏：
-  - RTT。
-  - 丢包率。
-  - 每路码率。
-  - 每路 fps。
-  - 会话 ID。
-  - 当前控制权状态。
-- 顶部工具栏：
-  - 登录/退出。
-  - 连接/断开。
-  - 开始/结束会话。
-  - 急停。
-  - 设置。
+- 顶部：驾驶员登录、授权车辆、连接/退出与常驻急停；
+- 输入区：Gamepad 名称、映射类型、归一化值和中心/量程校准；
+- 监控区：车辆、会话、控制权、编码/后端、RTT、ICE 路径、TURN 和时间同步；
+- 视频区：每个 `camera_id` 一个独立播放器；
+- 逐路指标表：FPS、码率、丢包和端到端时延；
+- 调试区：保留原始指标 JSON，不作为驾驶员的主要判断入口。
 
 不要在主画面堆叠说明性文字。遥操界面应优先可扫视、低干扰、状态清楚。
 
-本地参考实现提供 `DriverConsoleStatusSnapshot`，把 telemetry、adapter
-健康状态、视频面板状态、每路 fps/码率/延迟、控制权状态和丢包样本归一化为
-右侧状态栏与底部状态栏字段，用于后续 Qt 渲染层接入前固定 UI 数据契约。
-其中 `mock_telemetry=true` 的遥测必须透传为右侧状态栏 `mock_telemetry` 和
-`telemetry_source_label=MOCK TELEMETRY`，确保本地 Mock 反馈不会在 UI 上伪装成
-真实车辆反馈。
-
-本地参考实现还提供 `DriverToolbarSnapshot`，固定登录/退出、连接/断开、
-开始/结束会话、急停和设置动作的 enabled/visible 状态；其中急停动作始终
-visible，便于后续 UI 层保持常驻入口。
-
 ## 控制输入
 
-首版输入：
+当前输入：
 
 - 键盘。
-- 软件控件。
+- 标准映射 Gamepad。
+- 可配置轴的非标准方向盘/踏板。
 
 建议映射：
 
-- `W`：油门增加。
-- `S`：刹车增加。
-- `A`：左转。
-- `D`：右转。
-- `Space`：刹车或急停预备，具体需确认。
-- `E`：急停需要二次确认或长按。
-- `R/N/D`：档位切换，实际映射需结合车辆档位定义。
+- `ArrowUp`：前进油门。
+- `ArrowDown`：倒车油门。
+- `ArrowLeft` / `ArrowRight`：转向。
+- `Space`：制动。
+- `E`：立即锁存急停。
 
 注意：
 
 - 键盘控制必须有回中/回零策略。
 - 失去窗口焦点时应继续按固定周期发送安全控制心跳，但主动油门必须置 0，并按配置进入滑行、限速或渐进制动策略；不应主动停发来制造超时急刹。
-- 软件控件和键盘同时输入时需要明确优先级。
-
-本地参考实现的输入合成规则：
-
-- 急停取键盘和软件控件的并集，始终最高优先级。
-- 软件控件的连续转向、油门、刹车和档位优先于键盘离散输入。
+- 急停取键盘、页面按钮和 Gamepad 的并集，始终最高优先级。
+- 键盘离散输入覆盖同一时刻的 Gamepad 连续量；相反方向同时按下时输出归零。
 - 刹车优先于油门；存在刹车输入时油门输出为 0。
 - 窗口失焦时主动油门和转向归零，但仍按固定频率发送安全心跳。
 - 档位输出必须落在控制协议允许集合内；真实车辆额外档位由后续车辆适配器契约扩展。
@@ -110,11 +70,11 @@ visible，便于后续 UI 层保持常驻入口。
 - 档位器。
 - 自定义串口/CAN 驾驶台。
 
-当前 Docker 友好的 HTTP 控制端程序先通过浏览器 Gamepad API 接入模拟驾驶器：
-方向盘/踏板仍由操作员浏览器读取，Docker 容器只接收已归一化的 steering、
-throttle、brake、estop 和 gear 状态，因此不要求容器直接挂载宿主
-`/dev/input` 或安装 HID 驱动。轴编号、踏板反向、deadzone 和急停按钮通过
-`control.gamepad` 配置暴露。
+浏览器读取 Gamepad 后先执行死区、反向、中心/静止位和量程归一化，再与键盘
+合成为 `steering`、`throttle`、`brake`、`estop` 和 `gear`。标准映射手柄使用
+左摇杆 X 与左右扳机；非标准设备由 `control.gamepad` 的轴配置控制。页面校准仅对
+本次运行有效，需长期保留的现场校准值应回写 YAML。设备不存在、映射不完整或
+断开时，Gamepad 分量必须全部归零。
 
 ## 控制命令生成
 
@@ -123,8 +83,12 @@ Console 不应只在按键变化时发送控制，而应按固定周期发送当
 默认：
 
 - 频率：20 Hz。
-- 每条命令包含 seq 和 ts_ms。
+- 每条命令包含协议版本、车辆、驾驶员、会话、单调递增 `seq`、
+  `sent_at_utc_ms` 和短期 `control_token`。
 - 每条命令包含完整控制状态，而不是增量。
+- loopback C++ 运行时在控制权租约签发后约 1/3 处，用当前驾驶员 token
+  调用服务端续租；续租保持 session 和 DataChannel 中的 `control_token` 不变，
+  不把任一 token 暴露给浏览器 JavaScript。
 
 这样车端可以通过心跳判断驾驶端是否还活着。
 
@@ -138,22 +102,27 @@ Console 不应只在按键变化时发送控制，而应按固定周期发送当
 - 支持布局保存。
 - 解码失败不能拖死整个 UI。
 
-当前 Docker 友好的 HTTP 控制端程序会把车端 `webrtc_offer` 返回给浏览器页面，
+当前控制端会把车端 `webrtc_offer` 返回给浏览器页面，
 页面用 `RTCPeerConnection` 创建 answer，并通过 `ontrack` 把远端视频流挂到对应
 camera 的 `<video>` 元素；控制 DataChannel 按 unordered/unreliable 配置创建。
-页面连接后会周期轮询信令并处理车端 remote ICE candidate，同时把浏览器 local
-ICE candidate 经控制端转发到车端。本地 Docker smoke 只验证 offer/answer/ICE
+页面连接后周期读取本机 C++ 运行时的消息缓冲并处理车端 remote ICE candidate；
+跨网信令本身使用经证书校验的 WSS push/ack，不再使用 HTTPS 消息轮询。浏览器
+local ICE candidate 经本机 C++ WSS 客户端转发到车端。服务端推送带单调
+`delivery_cursor`，本机 C++ 先保存再确认；未确认消息在同会话 WSS 重连后补发，
+客户端按游标去重。控制端发出的信令带稳定 `message_id` 和序列号，ACK 不确定时
+用原消息自动重试，服务端只入队一次。本地 Docker smoke 只验证 offer/answer/ICE
 信令和页面 wiring，不替代真实车端 RTP 媒体流与 DataChannel 端到端现场验证。
-页面右侧提供操作员可扫视状态面板，直接显示 session 状态、session id、控制权、
-信令连接状态、摄像头连接数量、WebRTC 状态、最近一条控制命令和 DataChannel 状态；
-原始 JSON 状态仍保留为调试输出，但不作为主要操作界面。
-
-本地参考实现的 `DriverVideoDashboard` 支持把布局偏好保存为 JSON 文件并恢复。
-该文件只持久化 layout、聚焦相机和相机 ID；每路连接状态、fps、码率、延迟和
-解码错误仍属于运行时状态，恢复布局时默认重新从 `disconnected` 状态开始，
-避免把旧的断流或码率样本误当成用户偏好。
-`DriverVideoDashboard.to_dict()` 同时输出 `visible_camera_ids`，用于 UI 渲染层
-直接确定当前 1/2/4 布局或单路放大时应该显示的相机列表。
+切换车辆时页面先停止旧控制循环并关闭旧 PeerConnection，C++ 运行时必须收到旧
+会话结束确认后才允许为新车辆创建会话；释放失败时保持故障态，不能忽略错误后
+同时持有两辆车的控制权。仅结束会话使用 `/api/end-session`，保留驾驶员登录；
+安全退出则撤销登录并释放全部控制权。每代本地消息读取循环带 generation，旧循环不能
+在新会话建立后重新进入。
+安全退出和单独结束会话都必须先停止本地实时控制，再等待服务器确认撤销；服务器
+不可达时不能在 UI 中显示“已安全退出”，也不能丢弃用于重试释放的本地会话状态。
+此时车辆仍必须依靠车端超时状态机进入安全制动，服务端再由心跳超时回收控制权。
+页面状态卡直接显示 session、控制权、编码/后端、控制 RTT、Direct/STUN/TURN、
+TURN 使用状态和时间同步可信度。逐路指标超过 200 ms 或低于 20 FPS、控制通道
+中断、控制权丢失、急停锁存或时间不可信时必须显示明确告警。
 
 ## 安全交互
 
@@ -181,7 +150,10 @@ ICE candidate 经控制端转发到车端。本地 Docker smoke 只验证 offer/
 - UI 版本。
 - 配置版本。
 
-本地参考实现的 `DriverOperationLog` 写入 JSONL 操作日志，并支持按大小轮转为
-编号备份文件。`driver-console --operation-log` 可配合
-`--operation-log-max-bytes` 和 `--operation-log-backup-count` 使用，避免长期驾驶
-端运行时本地操作日志无限增长。
+当前 C++ 控制端把页面 UTC 事件通过回环接口 `/api/browser-event` 写入 JSONL，
+路径、单文件上限和保留文件数分别由 `logging.browser_event_log`、
+`logging.browser_event_log_max_bytes` 和 `logging.browser_event_log_files` 配置。
+达到上限后生成 `.1`、`.2` 等编号备份；文件数包含当前文件。键名包含
+`password`、`token`、`secret` 或 `credential` 的值会在写盘前递归替换为
+`[redacted]`，单条超出文件上限的事件会被拒绝。日志用于本地排障，不能替代服务端
+会话审计或车辆安全记录。

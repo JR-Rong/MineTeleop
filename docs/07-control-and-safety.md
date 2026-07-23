@@ -4,7 +4,10 @@
 
 控制链路必须简单、稳定、可追溯。视频可以丢帧，控制不能积压旧命令。
 
-如果控制命令使用 WebRTC DataChannel，通道必须配置为 unordered/unreliable。控制命令是 20 Hz 全量状态，车端依赖 `seq` 丢弃旧命令；可靠有序重传会造成队头阻塞，不适合作为默认控制模式。
+控制命令只通过 WebRTC DataChannel 传输，信令服务拒绝 `control_command`。通道固定为
+`label=control`、`protocol=mine-teleop-control-v1`、`ordered=false`、
+`maxRetransmits=0`。控制命令是 20 Hz 全量状态，车端依赖 `seq` 丢弃旧命令；
+可靠有序重传会造成队头阻塞，不适合作为控制模式。
 
 ## ControlCommand
 
@@ -15,9 +18,11 @@
   "type": "control_command",
   "protocol_version": 1,
   "vehicle_id": "vehicle-001",
+  "driver_id": "driver-001",
   "session_id": "session-001",
   "seq": 12345,
-  "ts_ms": 1780000000000,
+  "sent_at_utc_ms": 1780000000000,
+  "control_token": "short-lived-session-token",
   "gear": "D",
   "steering": 0.12,
   "throttle": 0.20,
@@ -30,15 +35,17 @@
 
 - `protocol_version`：控制协议版本，必须是 JSON integer，用于车端/驾驶端兼容性检查。
 - `vehicle_id`：目标车辆 ID，必须是 JSON string。
+- `driver_id`：当前获权驾驶员 ID，必须是 JSON string，并与会话记录一致。
 - `session_id`：当前控制会话 ID，必须是 JSON string。
 - `seq`：单调递增的非负 JSON integer，用于丢弃乱序旧命令。
-- `ts_ms`：驾驶端生成时间，必须是 JSON integer，用于审计、日志对齐和延迟估算；安全判定不能直接依赖两端系统时钟差，明显偏斜时只记录 warning。
+- `sent_at_utc_ms`：控制输入形成时的 UTC 毫秒时间，必须是 JSON integer；两端时间同步不确定度必须不超过 25 ms，否则时延数据标记为不可信。
+- `control_token`：当前会话的短期控制权令牌，必须是非空 JSON string；认证续租只延长
+  其服务端到期时间，不在活动 DataChannel 中轮换值；会话结束后立即失效，禁止写入日志。
 - `gear`：档位，必须是 JSON string，具体枚举待车辆接口确认。
 - `steering`：归一化转向，必须是 JSON number，范围 `[-1.0, 1.0]`。
 - `throttle`：归一化油门，必须是 JSON number，范围 `[0.0, 1.0]`。
 - `brake`：归一化刹车，必须是 JSON number，范围 `[0.0, 1.0]`。
 - `estop`：急停，必须是 JSON boolean，不能用 `"true"`/`"false"` 字符串。
-- `authority_token`：可选控制权令牌；如果出现，必须是 JSON string。
 
 控制命令中的 JSON string、number、integer 和 boolean 字段不能互相用字符串、
 布尔值或数字代替。
@@ -51,6 +58,8 @@
 
 - 固定周期发送完整状态。
 - 没有输入变化也要发送心跳式命令。
+- 浏览器失焦或页面隐藏时立即清空输入并发送中性状态。
+- DataChannel 未打开、关闭或缓冲超过上限时不继续生成有效油门，界面显示控制链路中断/拥塞。
 - 车端以最后一条有效命令的本地接收时间判断链路健康。
 
 ## 车端校验
@@ -59,8 +68,8 @@
 
 1. 校验消息格式。
 2. 校验 `protocol_version` 是否兼容。
-3. 校验 session_id。
-4. 校验控制权。
+3. 校验 `vehicle_id`、`driver_id` 和 `session_id` 均与当前会话一致。
+4. 校验当前 `control_token`；空令牌、旧会话令牌和其他会话令牌均拒绝。
 5. 校验 seq 是否大于已处理序号。
 6. 使用本地接收时间检查命令到达间隔是否超过配置阈值。
 7. 校验驾驶端时间戳是否明显异常，并记录到日志；除非有可靠时间同步，不直接用跨机器时间差拒绝控制。
@@ -72,8 +81,9 @@
 
 系统必须有最低限度的时间同步要求：
 
-- 车端、驾驶端和云端至少启用 NTP，启动时记录同步状态和当前偏差估计。
-- `ts_ms` 可用于审计、录像元数据对齐、延迟估算和多系统日志排障。
+- 车端和驾驶端启动后对服务器 `/time` 进行 7 次四时间戳采样，选取低 RTT 样本估算偏移、RTT 和不确定度，并定期刷新。
+- `sent_at_utc_ms` 可用于审计、录像元数据对齐、控制有效接收时延和多系统日志排障。
+- 不确定度超过 25 ms 时，车端不得进入远程控制，控制页面必须显示“时延数据不可信”。
 - 控制安全的新鲜度判定以车端本地接收时间、`seq` 和心跳间隔为准。
 - 如果后续需要多相机严格同步、事故复盘级时间线或更高精度闭环，再评估 PTP 或相机硬件同步。
 
@@ -144,8 +154,10 @@ control:
   "type": "telemetry",
   "protocol_version": 1,
   "vehicle_id": "vehicle-001",
+  "driver_id": "driver-001",
   "session_id": "session-001",
-  "ts_ms": 1780000000100,
+  "seq": 12346,
+  "sent_at_utc_ms": 1780000000100,
   "speed_mps": 2.5,
   "gear": "D",
   "steering_feedback": 0.10,

@@ -79,7 +79,8 @@ class VehicleMediaRuntime {
       int frame_timeout_ms = 3000,
       std::filesystem::path recording_root = {},
       std::optional<std::string> forced_codec = std::nullopt,
-      int simulate_primary_failure_after_frames = 0);
+      int simulate_primary_failure_after_frames = 0,
+      std::string connection_id = {});
   ~VehicleMediaRuntime();
 
   VehicleMediaRuntime(const VehicleMediaRuntime&) = delete;

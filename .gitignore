@@ -4,6 +4,8 @@ cpp-build/
 dist/
 *.tar.gz
 .DS_Store
+.playwright-cli/
+output/
 
 # Compiled shared objects / binaries
 *.so

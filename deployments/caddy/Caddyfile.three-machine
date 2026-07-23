@@ -1,0 +1,63 @@
+{
+	admin off
+	auto_https disable_redirects
+}
+
+# Public port 6000 is multiplexed by HAProxy: TLS ClientHello traffic reaches
+# Caddy on loopback 16000, while plain TURN/TCP reaches coturn on 3478. The
+# nip.io names are an alternate SNI/DNS path for networks that reset sslip.io.
+# All HTTP listeners expose only signaling/API routes.
+https://60-205-213-254.sslip.io:14443, https://60-205-213-254.sslip.io:16000, https://60-205-213-254.nip.io:14443, https://60-205-213-254.nip.io:16000 {
+	handle_path /api/* {
+		reverse_proxy 127.0.0.1:8765
+	}
+
+	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/*
+	handle @signaling_api {
+		reverse_proxy 127.0.0.1:8765
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}
+
+# Some field networks reset TLS ClientHello messages containing dynamic-DNS
+# names. This IP-SNI listener uses Caddy's private CA so the native clients can
+# verify a pinned field certificate without disabling TLS verification.
+https://60.205.213.254:14443, https://60.205.213.254:16000 {
+	tls internal
+
+	handle_path /api/* {
+		reverse_proxy 127.0.0.1:8765
+	}
+
+	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/*
+	handle @signaling_api {
+		reverse_proxy 127.0.0.1:8765
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}
+
+# Native clients resolve this private name to the public server address with
+# libcurl's per-application resolver. A hostname is required because libcurl
+# intentionally omits SNI for an IP-literal URL.
+https://teleop-field.internal:16000 {
+	tls internal
+
+	handle_path /api/* {
+		reverse_proxy 127.0.0.1:8765
+	}
+
+	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/*
+	handle @signaling_api {
+		reverse_proxy 127.0.0.1:8765
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}

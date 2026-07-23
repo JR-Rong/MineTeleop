@@ -56,7 +56,7 @@ MINE_TELEOP_CAMERA_DEVICES="front=/dev/video0 rear=/dev/video2" \
 - `scripts/start_live_control_plane_tunnel.sh` 同时建立：
   - `18080:127.0.0.1:8080`
   - `18765:127.0.0.1:8765`
-- 输出车端控制反馈命令，使用 `--teleop-log-controls` 打印 JSONL。
+- 输出车端 DataChannel 控制接受/拒绝与安全状态 JSONL。
 - 本机 Docker runner 显式映射 `127.0.0.1:8765:8765`。
 
 ### 本机 Docker 控制端 signaling 启动失败
@@ -143,21 +143,10 @@ MINE_TELEOP_CAMERA_DEVICES="front=/dev/video0 rear=/dev/video2" \
 MINE_TELEOP_FRAME_CODEC=h264 scripts/run_vehicle_live_media.sh
 ```
 
-### 车端打印控制反馈
+### 车端控制反馈
 
-另开一个车端终端：
-
-```bash
-cd /home/user/mine-teleop
-bin/mine-teleop vehicle-agent \
-  --config configs/vehicle-agent.live.yaml \
-  --teleop \
-  --signaling-http-url http://127.0.0.1:18765 \
-  --teleop-log-controls \
-  --teleop-duration-ms 600000
-```
-
-车端输出中应看到每条控制命令的 JSONL，重点字段：
+`scripts/run_vehicle_live_media.sh` 启动的同一原生进程接收 WebRTC DataChannel 控制，
+无需另开 HTTP 轮询控制进程。车端媒体 JSONL 日志应看到：
 
 ```text
 seq
@@ -165,7 +154,10 @@ steering
 throttle
 brake
 gear
-control_latency_ms
+sent_at_utc_ms
+received_at_utc_ms
+accepted
+reason
 ```
 
 ## 前端观测字段

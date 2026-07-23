@@ -1,0 +1,46 @@
+driver:
+  id: driver-console-002
+
+cloud:
+  auth_url: http://127.0.0.1:8765/auth
+  signaling_url: ws://127.0.0.1:8765/signaling
+
+logging:
+  browser_event_log: ../.local/logs/control-browser-events-002.jsonl
+  browser_event_log_max_bytes: 2097152
+  browser_event_log_files: 3
+
+ui:
+  default_layout: grid_4
+  show_debug_overlay: true
+
+control:
+  rate_hz: 20
+  estop_hold_ms: 500
+  keyboard:
+    steering_left: ArrowLeft
+    steering_right: ArrowRight
+    throttle: ArrowUp
+    brake: ArrowDown
+    estop: E
+  gamepad:
+    enabled: true
+    steering_axis: 0
+    throttle_axis: 2
+    brake_axis: 5
+    axis_deadzone: 0.05
+    steering_inverted: false
+    throttle_inverted: true
+    brake_inverted: true
+    steering_center: 0.0
+    steering_range: 1.0
+    throttle_rest: 1.0
+    throttle_range: 2.0
+    brake_rest: 1.0
+    brake_range: 2.0
+    estop_button: 0
+
+time_sync:
+  max_uncertainty_ms: 25
+  interval_ms: 30000
+  samples: 7

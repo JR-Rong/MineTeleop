@@ -41,6 +41,28 @@ systemd 目标：
 - 挂载录像目录。
 - 限制资源。
 
+### 云端统一启停入口
+
+云端不要把 signaling、coturn、Caddy 和 HAProxy 合并到一个进程。仓库提供
+`mine-teleop-cloud.target` 作为一个 systemd 操作入口，同时保留四个服务各自的
+故障隔离、自动重启和日志。安装方法见
+`deployments/systemd/README.md`。安装后常用命令为：
+
+```bash
+sudo systemctl start mine-teleop-cloud.target
+sudo systemctl restart mine-teleop-cloud.target
+sudo systemctl stop mine-teleop-cloud.target
+sudo systemctl --no-pager --full status \
+  mine-teleop-cloud.target \
+  mine-teleop-signaling-server.service \
+  mine-teleop-turn-server.service \
+  caddy.service \
+  haproxy.service
+```
+
+`target` 只合并生命周期操作，不吞并进程；其中一个守护进程失败时仍能从对应
+`journalctl -u <unit>` 独立定位。
+
 ## 关键检查命令
 
 ### 目标车端配置生成
@@ -189,17 +211,49 @@ bucket、region、对象路径、签名算法、过期时间和 signature/sessio
 
 ### TURN Usage Report
 
+启动 systemd 或 Compose 前，必须先把 realm 与共享 secret 写入真实配置；不能把
+`.template` 原样挂载给 Coturn：
+
+```bash
+scripts/render_turnserver_config.sh \
+  --realm turn.example.com \
+  --secret-file /etc/mine-teleop/secrets/turn-static-auth-secret \
+  --output /etc/mine-teleop/turnserver.conf
+```
+
+渲染器原子写入并把输出权限固定为 `0600`，不会回显 secret。Compose 还要求把
+`MINE_TELEOP_TURN_CONFIG_FILE` 指向该已渲染文件；未设置时会在启动前失败关闭，
+避免把字面占位符当成生产 realm/secret。
+
 归档 coturn `usage` 日志后，可以先在本地生成脱敏用量验收 JSONL：
 
 ```bash
-python3 scripts/coturn_usage_report.py \
-  --log /var/log/mine-teleop/coturn.log
+scripts/coturn_usage_report.sh \
+  --log /var/log/mine-teleop/coturn.log \
+  --require-relay-bytes
 ```
 
 该报告输出一条 `coturn_usage_report` 汇总记录和多条 `coturn_usage_sample`
-样本记录，统计解析样本数、忽略行数、会话数、relay bytes 累计量、duration
-累计量和平均带宽。报告只保留 session/actor 归属和用量字段，不回显 coturn
-原始 username；真实云端账单对账仍需在部署环境接入运营账单或云厂商流量数据。
+样本记录，统计解析样本数、会话数、TURN client bytes 和 peer relay payload
+bytes。报告只保留 session/actor 归属和包/字节计数，不回显 coturn 原始
+username。coturn 4.6.2 的结束用量行没有可靠 duration，不能由该报告单独计算
+平均带宽；真实带宽与云端账单对账仍需接入参与者 duration 指标及云厂商流量数据。
+
+在有 Docker 的开发机上，可先运行真实的 Coturn 4.6.2 UDP/TCP 中继、短期凭据、
+错误密码、匿名和过期凭据门禁：
+
+```bash
+scripts/check_coturn_relay.sh \
+  --log-output /tmp/mine-teleop-coturn.log
+```
+
+Mac 使用 Colima 且宿主 Docker socket 不可用时，可以设置
+`MINE_TELEOP_DOCKER_COMMAND="colima ssh -- docker"`。若要消费信令服务实际签发的
+凭据，把 REST username 和 credential 分两行写入权限为 `0600` 的临时文件，
+再传 `--credentials-file`；也可以分别放入 `MINE_TELEOP_TURN_USERNAME` 和
+`MINE_TELEOP_TURN_CREDENTIAL` 环境变量。脚本输出不会回显二者。该门禁是隔离
+Docker 网络内的真实分配和 relay payload 证明，不替代公网 NAT、TLS/DTLS 或
+强制 WebRTC relay。
 
 ### Acceptance Metrics Report
 
@@ -232,65 +286,109 @@ journalctl -u mine-teleop-vehicle-agent -f
 
 ### Signaling TLS
 
-`signaling-server --serve` 默认绑定 `127.0.0.1`，适合本机开发或由本机反向
-代理转发。若直接绑定 `0.0.0.0`、公网 IP 或其它非回环地址，必须同时提供
-`--tls-cert`、`--tls-key`、驾驶员凭据和车端设备凭据：
+独立 C++ `mine-teleop-signaling-server` 默认绑定 `127.0.0.1`，只作为 TLS
+反向代理的明文后端；没有显式开发开关时会拒绝非回环绑定。先用部署 secret
+环境向进程注入驾驶员与设备凭据。可先执行
+`mine-teleop-signaling-server --help` 核对完整参数；帮助和版本查询不会启动监听，
+未知参数会直接失败，避免拼写错误后意外使用默认值。再启动回环后端：
 
 ```bash
-python3 signaling-server/signaling_server.py \
-  --serve \
-  --host 0.0.0.0 \
+MINE_TELEOP_DRIVER_PASSWORD='<from-secret-store>' \
+MINE_TELEOP_DEVICE_TOKEN='<from-secret-store>' \
+/opt/mine-teleop/bin/mine-teleop-signaling-server \
+  --host 127.0.0.1 \
   --port 8765 \
-  --tls-cert /etc/mine-teleop/tls/signaling.crt \
-  --tls-key /etc/mine-teleop/tls/signaling.key \
-  --driver-credentials /etc/mine-teleop/driver-credentials.json \
-  --device-credentials /etc/mine-teleop/device-credentials.json
+  --driver-id driver-console-001 \
+  --vehicle-id vehicle-001 \
+  --login-max-failures 5 \
+  --login-failure-window-ms 60000 \
+  --login-lockout-ms 300000 \
+  --api-rate-limit-requests 600 \
+  --api-rate-limit-window-ms 60000 \
+  --api-rate-limit-max-sources 4096 \
+  --trusted-proxy-addresses 127.0.0.1,::1 \
+  --audit-log-max-bytes 67108864 \
+  --audit-log-files 5 \
+  --audit-log-retention-days 7 \
+  --audit-log /var/log/mine-teleop/signaling-audit.jsonl
 ```
 
-如果使用 nginx、Caddy 或云负载均衡终止 TLS，推荐让 signaling server 继续
-监听 `127.0.0.1`，公网入口只暴露 TLS 代理。
+上面的参数保留给单驾驶员/单车辆兼容模式。2×2 或更大部署必须改用身份配置文件；
+secret 由服务管理器注入配置声明的环境变量，或存放在权限为 `0600` 的独立文件中：
+
+```bash
+/opt/mine-teleop/bin/mine-teleop-signaling-server \
+  --config /etc/mine-teleop/signaling-server.yaml \
+  --validate-config
+
+/opt/mine-teleop/bin/mine-teleop-signaling-server \
+  --config /etc/mine-teleop/signaling-server.yaml \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --audit-log /var/log/mine-teleop/signaling-audit.jsonl
+```
+
+校验输出只包含 `driver_count`、`vehicle_count` 和 `permission_count`，不会打印 ID
+或 secret；该模式拒绝重复 ID、空白名单、未知车辆、缺失/双重 secret 来源以及和
+旧单身份参数混用。仓库中的 `configs/signaling-server.2x2.dev.yaml` 是可运行结构示例。
+
+`deployments/caddy/Caddyfile` 把 `/api/*`、原生 API 路径和 `/signaling/*`
+转发到该回环后端，其它路径返回 404，因此公网不会出现驾驶页面。Caddy 的
+`MINE_TELEOP_PUBLIC_ORIGIN` 必须是正式 HTTPS 域名，证书由 ACME 或部署环境的
+可信证书流程提供；防火墙只开放 443，8765 不得公网监听。模板启动示例：
+
+```bash
+export MINE_TELEOP_PUBLIC_ORIGIN=https://teleop.example.com
+export MINE_TELEOP_SIGNALING_UPSTREAM=127.0.0.1:8765
+docker compose -f deployments/caddy/compose.yaml up -d
+```
+
+该 compose 使用 Linux host networking，使 Caddy 能访问宿主机回环后端；它不是
+macOS Docker Desktop 模板。公网 443 只由 Caddy 监听，8765 仍保持回环。
+
+当前拓扑只把回环 Caddy 视为可信直接上游。Caddy 默认丢弃来自非可信客户端的
+`X-Forwarded-*` 值并为上游设置实际客户端来源，因此后端只在直接对端为
+`127.0.0.1`/`::1` 时使用它提供的 `X-Forwarded-For`。不要把公网地址或宽泛网段
+填入 `MINE_TELEOP_TRUSTED_PROXY_ADDRESSES`。如果以后在 Caddy 前增加 CDN/LB，必须
+先单独设计并验收完整代理链，不能直接沿用当前单跳配置。
+
+同一 NAT 出口下的多个控制端共享来源配额；正常容量应按现场并发留余量。出现
+HTTP/WSS 429 时检查 `Retry-After`、`api_rate_limited` 审计事件，以及 `/health` 的
+`api_rate_limit_tracked_sources`、`api_rate_limit_overflow_active` 和
+`api_rate_limited_requests`。单进程重启会清空窗口，多实例之间也不共享状态。
+
+`/health` 的 `alerts` 使用固定 `code`、`severity`、`count` 字段，不返回账号名或
+来源 IP。当前支持 `login_lockout_active` 和
+`api_rate_limit_source_capacity`；任一告警存在时顶层 `status=degraded`，窗口到期
+后恢复 `status=ok`。`login_locked_buckets` 只统计当前仍在锁定期内的聚合桶，
+`alert_count` 应与 `alerts` 数量一致。该接口适合本机探针和上游采集，但尚未实现
+邮件、短信或值班系统投递。
+
+信令服务为每个已处理的 HTTP 请求，以及每个命中信令路由的 WSS 握手生成
+`request-` 前缀的 `X-Request-ID`；WSS 101、握手拒绝和 HTTP 2xx/4xx/429 都会返回
+该字段。同一请求范围内写出的审计记录带相同的 `request_id`，可从客户端错误直接
+定位审计行。服务端不会信任或回显客户端提交的 `X-Request-ID`；排障时应以响应头
+为准。后台 reaper 等没有入站请求的事件仍依赖 `session_id`/对象 ID 关联。
+每次服务运行还生成一个 `service-` 前缀的 `service_instance_id`，同一次运行的
+`/health` 和全部审计记录保持一致，重启后更换；因此没有 `request_id` 的 reaper
+事件仍可先按服务实例再按会话/对象关联。它不是主机身份，也不能跨重启当作稳定 ID。
+
+`Caddyfile.local-wss` 的 `tls internal` 仅用于本机自动化验收。可导出内部根证书
+并通过 `CURL_CA_BUNDLE` 验证客户端确实执行证书校验；不得把该根证书或内部
+签发方式当作公网验收结果。
 
 ### Identity Credentials
 
-驾驶员登录默认只适合本机开发。联调或部署时配置 PBKDF2-SHA256 驾驶员凭据文件：
-
-```json
-{
-  "drivers": {
-    "driver-console-001": {
-      "algorithm": "pbkdf2_sha256",
-      "iterations": 120000,
-      "salt": "<base64-salt>",
-      "digest": "<base64-pbkdf2-digest>"
-    }
-  }
-}
-```
-
-车端设备 token 同样应通过文件显式配置：
-
-```json
-{
-  "vehicles": {
-    "vehicle-001": "<device-token>"
-  }
-}
-```
-
-然后启动服务时加载这些文件：
-
-```bash
-python3 signaling-server/signaling_server.py \
-  --serve \
-  --host 127.0.0.1 \
-  --port 8765 \
-  --driver-credentials /etc/mine-teleop/driver-credentials.json \
-  --device-credentials /etc/mine-teleop/device-credentials.json
-```
-
-配置后，文件内驾驶员不再接受默认 `dev-password`，文件内车辆必须使用对应
-`device_token`。真实生产账号生命周期、外部 IAM、设备证书和凭据轮换仍应由部署
-环境接入。
+内置 `dev-password`/`dev-device-secret` 只允许回环开发。部署时必须由 secret
+manager 或权限收紧的 systemd `EnvironmentFile` 设置
+`MINE_TELEOP_DRIVER_PASSWORD`、`MINE_TELEOP_DEVICE_TOKEN` 和可选 admin/TURN
+secret，不能把值写进仓库、命令行、Caddy 配置或日志。当前 C++ 单机参考服务
+仍使用内存账号和直接密码比较，尚未实现密码哈希、持久账号、外部 IAM 或设备
+mTLS。账号级登录失败保护已启用：默认一分钟内第 5 次失败锁定五分钟，返回
+`429`/`Retry-After`，并写入不含密码的失败和锁定审计；未知账号共用一个固定桶。
+若合法操作员被锁定，应先从审计确认攻击或误输，不能靠重启服务作为常规解锁
+流程。公网按来源/路由的 API 限流、持久限流状态和多实例共享仍是 S9 生产门禁，
+不能用本机账号锁定或 TLS 验收替代。
 
 ### 车端启动前检查
 
@@ -497,10 +595,20 @@ Snap Docker 的代理配置可能不同于 snapd 自身代理，需要确认 Doc
 `.1`、`.2` 等编号备份文件，便于长期运行时接入文件日志。组件日志同时支持
 `logging.level` 运行时更新，低于当前最小级别的记录不会写入文件。
 
-本地参考实现的 `AuditLog` 使用同一编号备份轮转语义；启动
-`signaling-server --serve` 时可配置 `--audit-log-max-bytes` 和
-`--audit-log-backup-count`，让登录、会话、控制权、急停和上传等审计记录长期
-落盘时也保持文件大小可控。
+C++ 信令服务的 `--audit-log` 追加 UTC JSONL；入站 HTTP/WSS 请求范围内的记录
+还带服务端生成的 `request_id`。服务启动时先写
+`signaling_service_started`。当前小时写入 `signaling-audit.jsonl`；小时切换时，
+当前文件和小时内大小分片原子改名为
+`signaling-audit.YYYYMMDDTHHMMSSZ.partNN.jsonl`，默认只保留最近 7 天。
+所有检查、改名、追加和 flush 使用同一专用锁，多个请求线程不会并发操作
+`ofstream` 或轮转文件。默认小时内单分片上限 64 MiB、最多 5 个活动分片；
+`--audit-log-max-bytes`/`MINE_TELEOP_AUDIT_LOG_MAX_BYTES` 和
+`--audit-log-files`/`MINE_TELEOP_AUDIT_LOG_FILES` 可调整大小边界；
+`--audit-log-retention-days`/`MINE_TELEOP_AUDIT_LOG_RETENTION_DAYS` 调整 1 到
+365 天保留期。轮转发生在完整 JSONL 记录写入前，不会拆分记录；审计目录缺失或
+不可写会让服务启动失败。外部日志采集器应读取当前文件、当前 `.1` 等大小分片和
+带 UTC 小时的归档，并保留顶层 `service_instance_id`；不要再由外部 logrotate
+同时重命名这些文件。进程外可查询审计存储仍是 S8 待办。
 
 关键事件：
 

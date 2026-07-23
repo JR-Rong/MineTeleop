@@ -76,16 +76,32 @@ std::string iso_time(std::int64_t timestamp_ms) {
 
 class MediaSignalingClient {
  public:
-  MediaSignalingClient(std::string origin, std::string vehicle_id, std::string device_token)
+  MediaSignalingClient(
+      std::string origin,
+      std::string vehicle_id,
+      std::string device_token,
+      std::string connection_id,
+      std::vector<std::string> resolve_entries,
+      std::filesystem::path ca_bundle)
       : origin_(trim_origin(std::move(origin))),
         vehicle_id_(std::move(vehicle_id)),
-        device_token_(std::move(device_token)) {
+        device_token_(std::move(device_token)),
+        connection_id_(std::move(connection_id)),
+        http_(std::chrono::seconds(5), std::move(resolve_entries), std::move(ca_bundle)) {
     if (vehicle_id_.empty() || device_token_.empty()) throw std::invalid_argument("vehicle id and device token are required");
+    if (connection_id_.empty()) {
+      connection_id_ = "vehicle-media-" + vehicle_id_ + "-" +
+          std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    }
   }
 
   void register_online() {
-    static_cast<void>(http_.post_json_response(
-        origin_ + "/vehicles/online", {{"vehicle_id", vehicle_id_}, {"device_token", device_token_}}));
+    const auto response = http_.post_json_response(
+        origin_ + "/vehicles/online",
+        {{"vehicle_id", vehicle_id_},
+         {"device_token", device_token_},
+         {"connection_id", connection_id_}});
+    connection_generation_ = response.at("connection_generation").get<std::uint64_t>();
   }
 
   TimeSyncStatus synchronize_time(int sample_count) {
@@ -100,47 +116,79 @@ class MediaSignalingClient {
   }
 
   bool discover_session() {
+    require_connection();
     const auto response = http_.get_json(
-        origin_ + "/vehicles/" + http_.url_encode(vehicle_id_) + "/session?device_token=" +
-        http_.url_encode(device_token_));
-    session_id_ = response.value("session_id", "");
+        origin_ + "/vehicles/" + http_.url_encode(vehicle_id_) + "/session?connection_generation=" +
+            std::to_string(connection_generation_),
+        {{"X-Mine-Teleop-Device-Token", device_token_}});
+    const auto next_session_id = response.value("session_id", "");
+    if (next_session_id != session_id_) sequence_ = 0;
+    session_id_ = next_session_id;
     driver_id_ = response.value("driver_id", "");
-    return !session_id_.empty() && !driver_id_.empty();
+    control_token_ = response.value("control_token", "");
+    return !session_id_.empty() && !driver_id_.empty() && !control_token_.empty();
   }
 
   Json poll(std::string_view types) {
     require_session();
     return http_.get_json(
         origin_ + "/signaling/" + http_.url_encode(session_id_) + "/messages?recipient=" +
-        http_.url_encode(vehicle_id_) + "&device_token=" + http_.url_encode(device_token_) +
-        "&types=" + http_.url_encode(types));
+            http_.url_encode(vehicle_id_) + "&connection_generation=" + std::to_string(connection_generation_) +
+            "&types=" + http_.url_encode(types),
+        {{"X-Mine-Teleop-Device-Token", device_token_}});
   }
+
+  Json ice_servers() {
+    require_session();
+    return http_.get_json(
+        origin_ + "/sessions/" + http_.url_encode(session_id_) + "/ice_servers?actor=" +
+            http_.url_encode(vehicle_id_) + "&connection_generation=" + std::to_string(connection_generation_),
+        {{"X-Mine-Teleop-Device-Token", device_token_}});
+  }
+
+  [[nodiscard]] std::string url_encode(std::string_view value) const { return http_.url_encode(value); }
 
   void send(std::string_view type, const Json& payload) {
     require_session();
+    const ProtocolMetadata metadata{
+        kProtocolVersion, vehicle_id_, driver_id_, session_id_, ++sequence_, clock_.now_ms()};
+    auto request = metadata.to_json();
+    request["sender"] = vehicle_id_;
+    request["recipient"] = driver_id_;
+    request["device_token"] = device_token_;
+    request["connection_generation"] = connection_generation_;
+    request["type"] = type;
+    request["payload"] = payload;
     static_cast<void>(http_.post_json_response(
         origin_ + "/signaling/" + http_.url_encode(session_id_) + "/messages",
-        {{"sender", vehicle_id_},
-         {"recipient", driver_id_},
-         {"device_token", device_token_},
-         {"type", type},
-         {"payload", payload}}));
+        request));
   }
 
   [[nodiscard]] const std::string& session_id() const { return session_id_; }
+  [[nodiscard]] const std::string& driver_id() const { return driver_id_; }
+  [[nodiscard]] const std::string& control_token() const { return control_token_; }
 
  private:
+  void require_connection() const {
+    if (connection_generation_ == 0) throw std::runtime_error("media signaling connection is not registered");
+  }
+
   void require_session() const {
+    require_connection();
     if (session_id_.empty() || driver_id_.empty()) throw std::runtime_error("media signaling session is unavailable");
   }
 
   std::string origin_;
   std::string vehicle_id_;
   std::string device_token_;
-  HttpClient http_{std::chrono::seconds(5)};
+  std::string connection_id_;
+  std::uint64_t connection_generation_{0};
+  HttpClient http_;
   SynchronizedClock clock_;
   std::string session_id_;
   std::string driver_id_;
+  std::string control_token_;
+  std::uint64_t sequence_{0};
 };
 
 }  // namespace
@@ -174,9 +222,16 @@ struct VehicleMediaRuntime::Impl {
       int next_frame_timeout_ms,
       std::filesystem::path next_recording_root,
       std::optional<std::string> next_forced_codec,
-      int next_simulate_primary_failure_after_frames)
+      int next_simulate_primary_failure_after_frames,
+      std::string connection_id)
       : config(std::move(next_config)),
-        signaling(std::move(signaling_url), config.vehicle_id, std::move(device_token)),
+        signaling(
+            std::move(signaling_url),
+            config.vehicle_id,
+            std::move(device_token),
+            std::move(connection_id),
+            config.cloud.resolve_entries,
+            config.cloud.ca_bundle),
         frame_timeout_ms(next_frame_timeout_ms),
         recording_root(std::move(next_recording_root)),
         forced_codec(std::move(next_forced_codec)),
@@ -214,10 +269,72 @@ struct VehicleMediaRuntime::Impl {
   }
 
   static void on_ice_candidate(GstElement*, guint mline_index, gchar* candidate, gpointer user_data) {
+    // GStreamer 1.28 emits a final empty candidate after ICE gathering is
+    // complete.  Trickle ICE endpoints accept only real candidates; the empty
+    // marker must not be sent as an application signaling message.
+    if (candidate == nullptr || *candidate == '\0') return;
     auto* self = static_cast<Impl*>(user_data);
     self->queue_signal(
         "ice_candidate",
-        {{"candidate", candidate == nullptr ? "" : candidate}, {"sdpMLineIndex", mline_index}});
+        {{"candidate", candidate}, {"sdpMLineIndex", mline_index}});
+  }
+
+  static void on_control_channel_open(GstWebRTCDataChannel*, gpointer user_data) {
+    auto* self = static_cast<Impl*>(user_data);
+    self->control_link_open = true;
+    self->control_link_ever_opened = true;
+    std::cout << Json({
+                     {"event", "vehicle_control_data_channel_open"},
+                     {"event_at_utc_ms", self->signaling.now_ms()},
+                     {"vehicle_id", self->config.vehicle_id},
+                     {"driver_id", self->signaling.driver_id()},
+                     {"session_id", self->signaling.session_id()},
+                     {"ordered", false},
+                     {"max_retransmits", 0},
+                 }).dump()
+              << '\n';
+  }
+
+  static void on_control_channel_close(GstWebRTCDataChannel*, gpointer user_data) {
+    auto* self = static_cast<Impl*>(user_data);
+    const bool was_open = self->control_link_open.exchange(false);
+    if (!was_open) return;
+    ++self->control_link_loss_count;
+    std::lock_guard lock(self->control_mutex);
+    if (self->control_service_started && self->control_service) {
+      self->control_service->close();
+      self->control_service_started = false;
+    }
+    std::cout << Json({
+                     {"event", "vehicle_control_data_channel_closed"},
+                     {"event_at_utc_ms", self->signaling.now_ms()},
+                     {"vehicle_id", self->config.vehicle_id},
+                     {"driver_id", self->signaling.driver_id()},
+                     {"session_id", self->signaling.session_id()},
+                     {"accepted_commands", self->accepted_control_commands.load()},
+                     {"rejected_commands", self->rejected_control_commands.load()},
+                     {"last_received_at_utc_ms", self->last_control_received_at_ms.load()},
+                     {"safety_action", "local_full_stop"},
+                 }).dump()
+              << '\n';
+  }
+
+  static void on_control_channel_error(GstWebRTCDataChannel* channel, GError* error, gpointer user_data) {
+    auto* self = static_cast<Impl*>(user_data);
+    std::cout << Json({
+                     {"event", "vehicle_control_data_channel_error"},
+                     {"event_at_utc_ms", self->signaling.now_ms()},
+                     {"vehicle_id", self->config.vehicle_id},
+                     {"session_id", self->signaling.session_id()},
+                     {"error", error == nullptr ? "unknown data channel error" : error->message},
+                 }).dump()
+              << '\n';
+    on_control_channel_close(channel, user_data);
+  }
+
+  static void on_control_message_string(GstWebRTCDataChannel*, gchar* data, gpointer user_data) {
+    auto* self = static_cast<Impl*>(user_data);
+    self->handle_control_message(data == nullptr ? "" : data);
   }
 
   static void on_offer_created(GstPromise* promise, gpointer user_data) {
@@ -276,6 +393,108 @@ struct VehicleMediaRuntime::Impl {
     pending_signals.emplace_back(std::move(type), std::move(payload));
   }
 
+  void handle_control_message(std::string_view data) {
+    if (data.empty() || data.size() > 64 * 1024) {
+      ++rejected_control_commands;
+      return;
+    }
+    try {
+      const auto command = ControlCommand::from_json(Json::parse(data));
+      std::lock_guard lock(control_mutex);
+      if (!control_service_started || !control_service || !control_link_open) {
+        ++rejected_control_commands;
+        return;
+      }
+      const auto received_at_ms = signaling.now_ms();
+      const auto result = control_service->receive_command(command, received_at_ms);
+      if (result.accepted && result.command) {
+        const auto accepted_count = ++accepted_control_commands;
+        last_control_received_at_ms = received_at_ms;
+        if (accepted_count == 1 || accepted_count % 100 == 0) {
+          std::cout << Json({
+                           {"event", "vehicle_data_channel_control_progress"},
+                           {"event_at_utc_ms", received_at_ms},
+                           {"vehicle_id", config.vehicle_id},
+                           {"driver_id", signaling.driver_id()},
+                           {"session_id", signaling.session_id()},
+                           {"accepted_commands", accepted_count},
+                           {"rejected_commands", rejected_control_commands.load()},
+                       }).dump()
+                    << '\n';
+        }
+      } else {
+        ++rejected_control_commands;
+      }
+      if (config.runtime.control_log_commands) {
+        std::cout << Json({
+                         {"event", "vehicle_data_channel_control_received"},
+                         {"protocol_version", command.protocol_version},
+                         {"vehicle_id", command.vehicle_id},
+                         {"driver_id", command.driver_id},
+                         {"session_id", command.session_id},
+                         {"seq", command.seq},
+                         {"sent_at_utc_ms", command.sent_at_utc_ms},
+                         {"received_at_utc_ms", received_at_ms},
+                         {"accepted", result.accepted},
+                         {"reason", result.reason},
+                     }).dump()
+                  << '\n';
+      }
+    } catch (const std::exception&) {
+      ++rejected_control_commands;
+      std::cout << Json({
+                       {"event", "vehicle_data_channel_control_rejected"},
+                       {"event_at_utc_ms", signaling.now_ms()},
+                       {"vehicle_id", config.vehicle_id},
+                       {"session_id", signaling.session_id()},
+                       {"reason", "invalid_control_message"},
+                   }).dump()
+                << '\n';
+    }
+  }
+
+  void configure_control_data_channel() {
+    if (!config.runtime.control_enabled) return;
+    {
+      std::lock_guard lock(control_mutex);
+      control_service = std::make_unique<VehicleControlService>(
+          config,
+          signaling.driver_id(),
+          signaling.session_id(),
+          signaling.control_token(),
+          create_vehicle_adapter(config));
+      control_service->start(signaling.now_ms());
+      control_service_started = true;
+    }
+    GstStructure* options = gst_structure_new(
+        "mine-teleop-control-data-channel",
+        "ordered",
+        G_TYPE_BOOLEAN,
+        FALSE,
+        "max-retransmits",
+        G_TYPE_INT,
+        0,
+        "protocol",
+        G_TYPE_STRING,
+        "mine-teleop-control-v1",
+        "negotiated",
+        G_TYPE_BOOLEAN,
+        FALSE,
+        nullptr);
+    g_signal_emit_by_name(webrtc, "create-data-channel", "control", options, &control_channel);
+    gst_structure_free(options);
+    if (control_channel == nullptr) throw std::runtime_error("webrtcbin failed to create the control data channel");
+    g_signal_connect(control_channel, "on-open", G_CALLBACK(on_control_channel_open), this);
+    g_signal_connect(control_channel, "on-close", G_CALLBACK(on_control_channel_close), this);
+    g_signal_connect(control_channel, "on-error", G_CALLBACK(on_control_channel_error), this);
+    g_signal_connect(control_channel, "on-message-string", G_CALLBACK(on_control_message_string), this);
+  }
+
+  void tick_control_service() {
+    std::lock_guard lock(control_mutex);
+    if (control_service_started && control_service) control_service->tick(signaling.now_ms());
+  }
+
   void set_pipeline_error(std::string value) {
     std::lock_guard lock(error_mutex);
     if (pipeline_error.empty()) pipeline_error = std::move(value);
@@ -326,7 +545,8 @@ struct VehicleMediaRuntime::Impl {
 
   [[nodiscard]] std::string build_pipeline(const VideoEncoder& encoder) {
     std::ostringstream pipeline_text;
-    pipeline_text << "webrtcbin name=webrtc bundle-policy=max-bundle latency=0 ";
+    pipeline_text << "webrtcbin name=webrtc bundle-policy=max-bundle latency=0 ice-transport-policy="
+                  << config.cloud.ice_transport_policy << ' ';
     int payload_type = 96;
     for (const auto& lane : lanes) {
       const auto id = pipeline_identifier(lane->camera.id);
@@ -376,6 +596,60 @@ struct VehicleMediaRuntime::Impl {
     return pipeline_text.str();
   }
 
+  [[nodiscard]] std::string gstreamer_ice_uri(std::string url) const {
+    const auto separator = url.find(':');
+    if (separator == std::string::npos) return url;
+    auto remainder = url.substr(separator + 1);
+    while (remainder.starts_with("//")) remainder.erase(0, 2);
+    return url.substr(0, separator) + "://" + remainder;
+  }
+
+  [[nodiscard]] std::string gstreamer_turn_uri(
+      std::string url,
+      std::string_view username,
+      std::string_view credential) const {
+    const auto separator = url.find(':');
+    if (separator == std::string::npos) throw std::invalid_argument("TURN URL has no scheme");
+    auto remainder = url.substr(separator + 1);
+    while (remainder.starts_with("//")) remainder.erase(0, 2);
+    return url.substr(0, separator) + "://" + signaling.url_encode(username) + ":" +
+        signaling.url_encode(credential) + "@" + remainder;
+  }
+
+  void configure_ice_servers() {
+    bool stun_configured = false;
+    bool turn_configured = false;
+    for (const auto& server : ice_configuration.value("ice_servers", Json::array())) {
+      if (!server.is_object()) continue;
+      Json urls = server.value("urls", Json::array());
+      if (urls.is_string()) urls = Json::array({urls});
+      if (!urls.is_array()) continue;
+      for (const auto& value : urls) {
+        if (!value.is_string()) continue;
+        const auto url = value.get<std::string>();
+        if (!stun_configured && (url.starts_with("stun:") || url.starts_with("stuns:"))) {
+          const auto configured = gstreamer_ice_uri(url);
+          g_object_set(webrtc, "stun-server", configured.c_str(), nullptr);
+          stun_configured = true;
+        }
+        if (url.starts_with("turn:") || url.starts_with("turns:")) {
+          const auto username = server.value("username", "");
+          const auto credential = server.value("credential", "");
+          if (username.empty() || credential.empty()) throw std::runtime_error("TURN ICE server lacks credentials");
+          const auto configured = gstreamer_turn_uri(url, username, credential);
+          if (!turn_configured) {
+            g_object_set(webrtc, "turn-server", configured.c_str(), nullptr);
+            turn_configured = true;
+          } else {
+            gboolean added = FALSE;
+            g_signal_emit_by_name(webrtc, "add-turn-server", configured.c_str(), &added);
+            if (!added) throw std::runtime_error("webrtcbin rejected an additional TURN server");
+          }
+        }
+      }
+    }
+  }
+
   void prepare_lanes() {
     lanes.clear();
     for (const auto& camera : config.enabled_cameras()) {
@@ -422,6 +696,18 @@ struct VehicleMediaRuntime::Impl {
     }
     g_signal_connect(webrtc, "on-negotiation-needed", G_CALLBACK(on_negotiation_needed), this);
     g_signal_connect(webrtc, "on-ice-candidate", G_CALLBACK(on_ice_candidate), this);
+    configure_ice_servers();
+
+    // GStreamer 1.28 keeps webrtcbin closed while it is in NULL.  Creating a
+    // DataChannel in that state returns nullptr, so transition the complete
+    // pipeline to READY before asking webrtcbin to create the control channel.
+    const auto ready_state = gst_element_set_state(pipeline, GST_STATE_READY);
+    if (ready_state == GST_STATE_CHANGE_FAILURE) {
+      set_pipeline_error("GStreamer WebRTC pipeline failed to enter READY state");
+      stop_pipeline();
+      return false;
+    }
+    configure_control_data_channel();
 
     for (const auto& lane : lanes) {
       const auto id = pipeline_identifier(lane->camera.id);
@@ -503,6 +789,19 @@ struct VehicleMediaRuntime::Impl {
 
   void stop_pipeline() {
     stop_requested = true;
+    if (control_channel != nullptr) {
+      g_signal_handlers_disconnect_by_data(control_channel, this);
+      gst_webrtc_data_channel_close(control_channel);
+      g_object_unref(control_channel);
+      control_channel = nullptr;
+    }
+    control_link_open = false;
+    {
+      std::lock_guard lock(control_mutex);
+      if (control_service_started && control_service) control_service->close();
+      control_service_started = false;
+      control_service.reset();
+    }
     if (pipeline != nullptr) {
       for (const auto& lane : lanes) {
         if (lane->appsrc != nullptr) gst_app_src_end_of_stream(GST_APP_SRC(lane->appsrc));
@@ -695,13 +994,21 @@ struct VehicleMediaRuntime::Impl {
           "ms exceeds limit " + std::to_string(config.field_safety.max_time_sync_uncertainty_ms) + "ms");
     }
     signaling.register_online();
+    std::cout << Json({
+                     {"event", "vehicle_media_waiting_for_session"},
+                     {"vehicle_id", config.vehicle_id},
+                     {"poll_interval_ms", config.runtime.teleop_poll_interval_ms},
+                 }).dump()
+              << std::endl;
     const auto session_deadline = signaling.now_ms() + 5000;
     while (!signaling.discover_session()) {
       if (!continuous && signaling.now_ms() >= session_deadline) {
         throw std::runtime_error("timed out waiting for an active driver session");
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(config.runtime.teleop_poll_interval_ms));
     }
+    ice_configuration = signaling.ice_servers();
     const auto codecs = negotiate_codecs(3000);
     std::vector<EncoderCandidate> candidates;
     for (const auto codec : codecs) {
@@ -737,6 +1044,7 @@ struct VehicleMediaRuntime::Impl {
         flush_outgoing_signals();
         process_signaling();
         poll_bus();
+        tick_control_service();
         if (signaling.time_sync_refresh_due(config.field_safety.time_sync_interval_ms)) {
           try {
             const auto status = signaling.synchronize_time(config.field_safety.time_sync_samples);
@@ -765,7 +1073,7 @@ struct VehicleMediaRuntime::Impl {
           set_pipeline_error("simulated primary encoder failure");
         }
         if (!current_pipeline_error().empty()) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
       }
       flush_outgoing_signals();
       const auto elapsed = std::max<std::int64_t>(1, signaling.now_ms() - attempt_started);
@@ -822,6 +1130,16 @@ struct VehicleMediaRuntime::Impl {
         {"attempts", std::move(attempts)},
         {"errors", std::move(errors)},
         {"negotiation_warning", last_negotiation_warning},
+        {"control_data_channel", {
+             {"configured", config.runtime.control_enabled},
+             {"ordered", false},
+             {"max_retransmits", 0},
+             {"ever_opened", control_link_ever_opened.load()},
+             {"accepted_commands", accepted_control_commands.load()},
+             {"rejected_commands", rejected_control_commands.load()},
+             {"link_loss_count", control_link_loss_count.load()},
+             {"last_received_at_utc_ms", last_control_received_at_ms.load()},
+         }},
     };
   }
 
@@ -833,6 +1151,7 @@ struct VehicleMediaRuntime::Impl {
   int simulate_primary_failure_after_frames;
   GstElement* pipeline{nullptr};
   GstElement* webrtc{nullptr};
+  GstWebRTCDataChannel* control_channel{nullptr};
   std::vector<std::unique_ptr<Lane>> lanes;
   std::atomic<bool> stop_requested{false};
   std::mutex signal_mutex;
@@ -846,6 +1165,16 @@ struct VehicleMediaRuntime::Impl {
   bool codec_fallback_requested{false};
   std::uint64_t failover_count{0};
   std::string last_negotiation_warning;
+  Json ice_configuration{Json::object()};
+  std::mutex control_mutex;
+  std::unique_ptr<VehicleControlService> control_service;
+  bool control_service_started{false};
+  std::atomic<bool> control_link_open{false};
+  std::atomic<bool> control_link_ever_opened{false};
+  std::atomic<std::uint64_t> accepted_control_commands{0};
+  std::atomic<std::uint64_t> rejected_control_commands{0};
+  std::atomic<std::uint64_t> control_link_loss_count{0};
+  std::atomic<std::int64_t> last_control_received_at_ms{0};
 };
 
 VehicleMediaRuntime::VehicleMediaRuntime(
@@ -855,7 +1184,8 @@ VehicleMediaRuntime::VehicleMediaRuntime(
     int frame_timeout_ms,
     std::filesystem::path recording_root,
     std::optional<std::string> forced_codec,
-    int simulate_primary_failure_after_frames)
+    int simulate_primary_failure_after_frames,
+    std::string connection_id)
     : impl_(std::make_unique<Impl>(
           std::move(config),
           std::move(signaling_url),
@@ -863,7 +1193,8 @@ VehicleMediaRuntime::VehicleMediaRuntime(
           frame_timeout_ms,
           std::move(recording_root),
           std::move(forced_codec),
-          simulate_primary_failure_after_frames)) {}
+          simulate_primary_failure_after_frames,
+          std::move(connection_id))) {}
 
 VehicleMediaRuntime::~VehicleMediaRuntime() = default;
 

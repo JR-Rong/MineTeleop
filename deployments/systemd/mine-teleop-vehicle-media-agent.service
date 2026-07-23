@@ -1,7 +1,8 @@
 [Unit]
-Description=Mine Teleop vehicle media agent
-After=network-online.target mine-teleop-vehicle-agent.service
+Description=Mine Teleop legacy standalone vehicle media agent
+After=network-online.target
 Wants=network-online.target
+Conflicts=mine-teleop-vehicle-agent.service
 
 [Service]
 Type=simple

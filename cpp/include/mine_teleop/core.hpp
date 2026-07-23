@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -15,20 +17,51 @@ namespace mine_teleop {
 
 using Json = nlohmann::json;
 
+inline constexpr int kProtocolVersion = 1;
+inline constexpr std::size_t kMaxVehicleTelemetryHistory = 1024;
+
 std::int64_t now_ms();
 
-struct ControlCommand {
-  int protocol_version{1};
+enum class SessionState {
+  Offline,
+  Online,
+  Reserved,
+  Connecting,
+  Active,
+  Degraded,
+  Stopping,
+  Closed,
+};
+
+std::string_view to_string(SessionState state);
+SessionState session_state_from_string(std::string_view value);
+
+struct ProtocolMetadata {
+  int protocol_version{kProtocolVersion};
   std::string vehicle_id;
+  std::string driver_id;
   std::string session_id;
   std::uint64_t seq{0};
-  std::int64_t ts_ms{0};
+  std::int64_t sent_at_utc_ms{0};
+
+  void validate() const;
+  [[nodiscard]] Json to_json() const;
+  static ProtocolMetadata from_json(const Json& value);
+};
+
+struct ControlCommand {
+  int protocol_version{kProtocolVersion};
+  std::string vehicle_id;
+  std::string driver_id;
+  std::string session_id;
+  std::uint64_t seq{0};
+  std::int64_t sent_at_utc_ms{0};
   std::string gear{"N"};
   double steering{0.0};
   double throttle{0.0};
   double brake{0.0};
   bool estop{false};
-  std::string authority_token;
+  std::string control_token;
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -59,17 +92,19 @@ class ControlReceiver {
  public:
   ControlReceiver(
       std::string vehicle_id,
+      std::string driver_id,
       std::string session_id,
       int max_command_gap_ms,
-      int protocol_version = 1,
-      bool control_authority = true,
-      std::string control_token = {},
+      int protocol_version,
+      bool control_authority,
+      std::string control_token,
       int timestamp_warning_skew_ms = 5000);
 
   ReceiveResult accept(const ControlCommand& command, std::int64_t receive_time_ms);
 
  private:
   std::string vehicle_id_;
+  std::string driver_id_;
   std::string session_id_;
   int max_command_gap_ms_;
   int protocol_version_;
@@ -143,7 +178,12 @@ struct CloudConfig {
   std::string signaling_url;
   std::string auth_url;
   std::filesystem::path device_token_file;
+  std::vector<std::string> resolve_entries;
+  std::filesystem::path ca_bundle;
+  std::string ice_transport_policy{"all"};
 };
+
+[[nodiscard]] bool ice_transport_policy_is_valid(std::string_view value);
 
 struct VehicleRuntimeConfig {
   bool control_enabled{true};
@@ -351,6 +391,7 @@ class VehicleControlService {
  public:
   VehicleControlService(
       const VehicleConfig& config,
+      std::string driver_id,
       std::string session_id,
       std::string control_token,
       std::unique_ptr<VehicleAdapter> adapter,
@@ -365,13 +406,14 @@ class VehicleControlService {
 
   [[nodiscard]] SafetyState safety_state() const { return safety_.state(); }
   [[nodiscard]] VehicleAdapterStatus adapter_status() const { return adapter_->status(); }
-  [[nodiscard]] const std::vector<Json>& telemetry_history() const { return telemetry_history_; }
+  [[nodiscard]] const std::deque<Json>& telemetry_history() const { return telemetry_history_; }
   [[nodiscard]] Json summary() const;
 
  private:
   [[nodiscard]] Json build_telemetry(std::int64_t now_ms);
 
   std::string vehicle_id_;
+  std::string driver_id_;
   std::string session_id_;
   ControlReceiver receiver_;
   SafetyStateMachine safety_;
@@ -379,7 +421,8 @@ class VehicleControlService {
   bool require_feedback_before_control_{true};
   int telemetry_interval_ms_;
   std::optional<std::int64_t> last_telemetry_ms_;
-  std::vector<Json> telemetry_history_;
+  std::uint64_t telemetry_sequence_{0};
+  std::deque<Json> telemetry_history_;
   bool started_{false};
 };
 

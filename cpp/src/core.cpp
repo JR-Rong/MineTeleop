@@ -3,11 +3,17 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <dlfcn.h>
 #include <limits>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #include <yaml-cpp/yaml.h>
 
@@ -91,6 +97,15 @@ struct BridgeFeedback {
 
 template <typename Function>
 Function load_symbol(void* handle, const char* name) {
+#if defined(_WIN32)
+  const auto symbol = GetProcAddress(static_cast<HMODULE>(handle), name);
+  if (symbol == nullptr) {
+    throw std::runtime_error(
+        std::string("dynamic library is missing required symbol ") + name +
+        " (Windows error " + std::to_string(GetLastError()) + ")");
+  }
+  return reinterpret_cast<Function>(symbol);
+#else
   dlerror();
   void* symbol = dlsym(handle, name);
   const char* error = dlerror();
@@ -99,6 +114,16 @@ Function load_symbol(void* handle, const char* name) {
                              (error == nullptr ? "" : std::string(": ") + error));
   }
   return reinterpret_cast<Function>(symbol);
+#endif
+}
+
+void unload_dynamic_library(void* handle) {
+  if (handle == nullptr) return;
+#if defined(_WIN32)
+  FreeLibrary(static_cast<HMODULE>(handle));
+#else
+  dlclose(handle);
+#endif
 }
 
 }  // namespace
@@ -109,15 +134,81 @@ std::int64_t now_ms() {
       .count();
 }
 
+std::string_view to_string(SessionState state) {
+  switch (state) {
+    case SessionState::Offline:
+      return "offline";
+    case SessionState::Online:
+      return "online";
+    case SessionState::Reserved:
+      return "reserved";
+    case SessionState::Connecting:
+      return "connecting";
+    case SessionState::Active:
+      return "active";
+    case SessionState::Degraded:
+      return "degraded";
+    case SessionState::Stopping:
+      return "stopping";
+    case SessionState::Closed:
+      return "closed";
+  }
+  throw std::invalid_argument("unknown session state");
+}
+
+SessionState session_state_from_string(std::string_view value) {
+  if (value == "offline") return SessionState::Offline;
+  if (value == "online") return SessionState::Online;
+  if (value == "reserved") return SessionState::Reserved;
+  if (value == "connecting") return SessionState::Connecting;
+  if (value == "active") return SessionState::Active;
+  if (value == "degraded") return SessionState::Degraded;
+  if (value == "stopping") return SessionState::Stopping;
+  if (value == "closed") return SessionState::Closed;
+  throw std::invalid_argument("unsupported session state");
+}
+
+void ProtocolMetadata::validate() const {
+  if (protocol_version != kProtocolVersion) throw std::invalid_argument("unsupported protocol_version");
+  if (vehicle_id.empty()) throw std::invalid_argument("vehicle_id is required");
+  if (driver_id.empty()) throw std::invalid_argument("driver_id is required");
+  if (session_id.empty()) throw std::invalid_argument("session_id is required");
+  if (seq == 0) throw std::invalid_argument("seq must be positive");
+  if (sent_at_utc_ms < 0) throw std::invalid_argument("sent_at_utc_ms must be non-negative");
+}
+
+Json ProtocolMetadata::to_json() const {
+  return {
+      {"protocol_version", protocol_version},
+      {"vehicle_id", vehicle_id},
+      {"driver_id", driver_id},
+      {"session_id", session_id},
+      {"seq", seq},
+      {"sent_at_utc_ms", sent_at_utc_ms},
+  };
+}
+
+ProtocolMetadata ProtocolMetadata::from_json(const Json& value) {
+  if (!value.is_object()) throw std::invalid_argument("protocol message must be a JSON object");
+  ProtocolMetadata metadata;
+  try {
+    metadata.protocol_version = value.at("protocol_version").get<int>();
+    metadata.vehicle_id = value.at("vehicle_id").get<std::string>();
+    metadata.driver_id = value.at("driver_id").get<std::string>();
+    metadata.session_id = value.at("session_id").get<std::string>();
+    metadata.seq = value.at("seq").get<std::uint64_t>();
+    metadata.sent_at_utc_ms = value.at("sent_at_utc_ms").get<std::int64_t>();
+  } catch (const Json::exception& error) {
+    throw std::invalid_argument(std::string("invalid protocol metadata: ") + error.what());
+  }
+  metadata.validate();
+  return metadata;
+}
+
 void ControlCommand::validate() const {
-  if (protocol_version != 1) {
-    throw std::invalid_argument("unsupported protocol_version");
-  }
-  if (vehicle_id.empty()) {
-    throw std::invalid_argument("vehicle_id is required");
-  }
-  if (session_id.empty()) {
-    throw std::invalid_argument("session_id is required");
+  ProtocolMetadata{protocol_version, vehicle_id, driver_id, session_id, seq, sent_at_utc_ms}.validate();
+  if (control_token.empty()) {
+    throw std::invalid_argument("control_token is required");
   }
   static const std::unordered_set<std::string> allowed_gears{"P", "R", "N", "D"};
   if (!allowed_gears.contains(gear)) {
@@ -129,20 +220,15 @@ void ControlCommand::validate() const {
 }
 
 Json ControlCommand::to_json() const {
-  return {
-      {"type", "control_command"},
-      {"protocol_version", protocol_version},
-      {"vehicle_id", vehicle_id},
-      {"session_id", session_id},
-      {"seq", seq},
-      {"ts_ms", ts_ms},
-      {"gear", gear},
-      {"steering", steering},
-      {"throttle", throttle},
-      {"brake", brake},
-      {"estop", estop},
-      {"authority_token", authority_token},
-  };
+  auto value = ProtocolMetadata{protocol_version, vehicle_id, driver_id, session_id, seq, sent_at_utc_ms}.to_json();
+  value["type"] = "control_command";
+  value["gear"] = gear;
+  value["steering"] = steering;
+  value["throttle"] = throttle;
+  value["brake"] = brake;
+  value["estop"] = estop;
+  value["control_token"] = control_token;
+  return value;
 }
 
 ControlCommand ControlCommand::from_json(const Json& value) {
@@ -154,17 +240,19 @@ ControlCommand ControlCommand::from_json(const Json& value) {
   }
   ControlCommand command;
   try {
-    command.protocol_version = value.at("protocol_version").get<int>();
-    command.vehicle_id = value.at("vehicle_id").get<std::string>();
-    command.session_id = value.at("session_id").get<std::string>();
-    command.seq = value.at("seq").get<std::uint64_t>();
-    command.ts_ms = value.at("ts_ms").get<std::int64_t>();
+    const auto metadata = ProtocolMetadata::from_json(value);
+    command.protocol_version = metadata.protocol_version;
+    command.vehicle_id = metadata.vehicle_id;
+    command.driver_id = metadata.driver_id;
+    command.session_id = metadata.session_id;
+    command.seq = metadata.seq;
+    command.sent_at_utc_ms = metadata.sent_at_utc_ms;
     command.gear = value.at("gear").get<std::string>();
     command.steering = value.at("steering").get<double>();
     command.throttle = value.at("throttle").get<double>();
     command.brake = value.at("brake").get<double>();
     command.estop = value.value("estop", false);
-    command.authority_token = value.value("authority_token", "");
+    command.control_token = value.at("control_token").get<std::string>();
   } catch (const Json::exception& error) {
     throw std::invalid_argument(std::string("invalid control command: ") + error.what());
   }
@@ -200,6 +288,7 @@ std::uint64_t LatestControlCommandMailbox::dropped_count() const {
 
 ControlReceiver::ControlReceiver(
     std::string vehicle_id,
+    std::string driver_id,
     std::string session_id,
     int max_command_gap_ms,
     int protocol_version,
@@ -207,14 +296,15 @@ ControlReceiver::ControlReceiver(
     std::string control_token,
     int timestamp_warning_skew_ms)
     : vehicle_id_(std::move(vehicle_id)),
+      driver_id_(std::move(driver_id)),
       session_id_(std::move(session_id)),
       max_command_gap_ms_(max_command_gap_ms),
       protocol_version_(protocol_version),
       control_authority_(control_authority),
       control_token_(std::move(control_token)),
       timestamp_warning_skew_ms_(timestamp_warning_skew_ms) {
-  if (vehicle_id_.empty() || session_id_.empty()) {
-    throw std::invalid_argument("vehicle_id and session_id are required");
+  if (vehicle_id_.empty() || driver_id_.empty() || session_id_.empty()) {
+    throw std::invalid_argument("vehicle_id, driver_id, and session_id are required");
   }
   if (max_command_gap_ms_ <= 0 || timestamp_warning_skew_ms_ < 0) {
     throw std::invalid_argument("control receiver timing values are invalid");
@@ -232,13 +322,14 @@ ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_
   }
   if (command.protocol_version != protocol_version_) return {false, "wrong_protocol_version", std::nullopt, {}};
   if (command.vehicle_id != vehicle_id_) return {false, "wrong_vehicle", std::nullopt, {}};
+  if (command.driver_id != driver_id_) return {false, "wrong_driver", std::nullopt, {}};
   if (command.session_id != session_id_) return {false, "wrong_session", std::nullopt, {}};
   if (!control_authority_) return {false, "control_authority_missing", std::nullopt, {}};
-  if (!control_token_.empty() && command.authority_token != control_token_) {
+  if (command.control_token != control_token_) {
     return {false, "control_token_invalid", std::nullopt, {}};
   }
   if (last_seq_ && command.seq <= *last_seq_) return {false, "old_seq", std::nullopt, {}};
-  const auto timestamp_delta_ms = receive_time_ms - command.ts_ms;
+  const auto timestamp_delta_ms = receive_time_ms - command.sent_at_utc_ms;
   if (!command.estop && timestamp_delta_ms > max_command_gap_ms_) {
     return {false, "command_age_exceeded", std::nullopt, {}};
   }
@@ -257,7 +348,7 @@ ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_
   last_seq_ = command.seq;
   last_valid_receive_ms_ = receive_time_ms;
   std::vector<std::string> warnings;
-  if (std::llabs(receive_time_ms - command.ts_ms) > timestamp_warning_skew_ms_) {
+  if (std::llabs(receive_time_ms - command.sent_at_utc_ms) > timestamp_warning_skew_ms_) {
     warnings.emplace_back("driver_timestamp_skew");
   }
   return {true, "accepted", command, std::move(warnings)};
@@ -409,15 +500,21 @@ std::vector<CameraConfig> VehicleConfig::enabled_cameras() const {
   return result;
 }
 
+bool ice_transport_policy_is_valid(std::string_view value) {
+  return value == "all" || value == "relay";
+}
+
 Json VehicleConfig::redacted_summary() const {
   return {
       {"event", "effective_vehicle_config"},
       {"runtime", "cpp"},
       {"vehicle_id", vehicle_id},
       {"signaling_url", cloud.signaling_url},
+      {"ice_transport_policy", cloud.ice_transport_policy},
       {"device_token_file_configured", !cloud.device_token_file.empty()},
       {"control_enabled", runtime.control_enabled},
       {"media_enabled", runtime.media_enabled},
+      {"teleop_poll_interval_ms", runtime.teleop_poll_interval_ms},
       {"camera_count", enabled_cameras().size()},
       {"vehicle_adapter_type", vehicle_adapter.type},
       {"can_interface", hardware.can_interface},
@@ -446,8 +543,22 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.cloud.signaling_url = required<std::string>(cloud, "signaling_url", "cloud");
   config.cloud.auth_url = optional<std::string>(cloud, "auth_url", "");
   config.cloud.device_token_file = optional<std::string>(cloud, "device_token_file", "");
+  config.cloud.resolve_entries = optional<std::vector<std::string>>(cloud, "resolve", {});
+  config.cloud.ca_bundle = optional<std::string>(cloud, "ca_bundle", "");
+  config.cloud.ice_transport_policy = optional<std::string>(cloud, "ice_transport_policy", "all");
   if (!config.cloud.device_token_file.empty() && config.cloud.device_token_file.is_relative()) {
     config.cloud.device_token_file = (path.parent_path() / config.cloud.device_token_file).lexically_normal();
+  }
+  if (!config.cloud.ca_bundle.empty() && config.cloud.ca_bundle.is_relative()) {
+    config.cloud.ca_bundle = (path.parent_path() / config.cloud.ca_bundle).lexically_normal();
+  }
+  for (const auto& entry : config.cloud.resolve_entries) {
+    if (entry.empty() || entry.find_first_of("\r\n") != std::string::npos) {
+      throw std::runtime_error("cloud.resolve contains an invalid entry");
+    }
+  }
+  if (!ice_transport_policy_is_valid(config.cloud.ice_transport_policy)) {
+    throw std::runtime_error("cloud.ice_transport_policy must be all or relay");
   }
 
   const auto runtime = root["runtime"];
@@ -692,16 +803,24 @@ DynamicLibraryVehicleAdapter::~DynamicLibraryVehicleAdapter() {
     close();
   } catch (...) {
   }
-  if (handle_ != nullptr) dlclose(handle_);
+  unload_dynamic_library(handle_);
 }
 
 void DynamicLibraryVehicleAdapter::ensure_loaded() {
   if (handle_ != nullptr) return;
+#if defined(_WIN32)
+  handle_ = static_cast<void*>(LoadLibraryW(library_path_.wstring().c_str()));
+  if (handle_ == nullptr) {
+    last_error_ = "failed to load dynamic library (Windows error " + std::to_string(GetLastError()) + ")";
+    throw std::runtime_error(last_error_);
+  }
+#else
   handle_ = dlopen(library_path_.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (handle_ == nullptr) {
     last_error_ = std::string("failed to load dynamic library: ") + dlerror();
     throw std::runtime_error(last_error_);
   }
+#endif
   try {
     open_fn_ = load_symbol<OpenFn>(handle_, "mine_teleop_chassis_open");
     apply_fn_ = load_symbol<ApplyFn>(handle_, "mine_teleop_chassis_apply_state");
@@ -710,7 +829,7 @@ void DynamicLibraryVehicleAdapter::ensure_loaded() {
     read_fn_ = load_symbol<ReadFn>(handle_, "mine_teleop_chassis_read_telemetry");
     close_fn_ = load_symbol<CloseFn>(handle_, "mine_teleop_chassis_close");
   } catch (...) {
-    dlclose(handle_);
+    unload_dynamic_library(handle_);
     handle_ = nullptr;
     throw;
   }
@@ -814,13 +933,22 @@ std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& conf
 
 VehicleControlService::VehicleControlService(
     const VehicleConfig& config,
+    std::string driver_id,
     std::string session_id,
     std::string control_token,
     std::unique_ptr<VehicleAdapter> adapter,
     int telemetry_interval_ms)
     : vehicle_id_(config.vehicle_id),
+      driver_id_(std::move(driver_id)),
       session_id_(std::move(session_id)),
-      receiver_(config.vehicle_id, session_id_, config.control.max_command_gap_ms, 1, true, std::move(control_token)),
+      receiver_(
+          config.vehicle_id,
+          driver_id_,
+          session_id_,
+          config.control.max_command_gap_ms,
+          kProtocolVersion,
+          true,
+          std::move(control_token)),
       safety_(
           config.control.degraded_timeout_ms,
           config.control.control_timeout_ms,
@@ -889,6 +1017,7 @@ void VehicleControlService::tick(std::int64_t timestamp_ms) {
     adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
   }
   if (!last_telemetry_ms_ || timestamp_ms - *last_telemetry_ms_ >= telemetry_interval_ms_) {
+    if (telemetry_history_.size() == kMaxVehicleTelemetryHistory) telemetry_history_.pop_front();
     telemetry_history_.push_back(build_telemetry(timestamp_ms));
     last_telemetry_ms_ = timestamp_ms;
   }
@@ -914,9 +1043,12 @@ Json VehicleControlService::build_telemetry(std::int64_t timestamp_ms) {
   const auto telemetry = adapter_->read_telemetry();
   return {
       {"event", "vehicle_telemetry"},
+      {"protocol_version", kProtocolVersion},
       {"vehicle_id", vehicle_id_},
+      {"driver_id", driver_id_},
       {"session_id", session_id_},
-      {"ts_ms", timestamp_ms},
+      {"seq", ++telemetry_sequence_},
+      {"sent_at_utc_ms", timestamp_ms},
       {"safety_state", to_string(safety_.state())},
       {"speed_mps", telemetry.speed_mps},
       {"gear", telemetry.gear},
@@ -934,7 +1066,8 @@ Json VehicleControlService::summary() const {
       {"vehicle_id", vehicle_id_},
       {"session_id", session_id_},
       {"safety_state", to_string(safety_.state())},
-      {"telemetry_count", telemetry_history_.size()},
+      {"telemetry_count", telemetry_sequence_},
+      {"telemetry_retained_count", telemetry_history_.size()},
       {"vehicle_adapter", adapter_->status().to_json()},
   };
 }

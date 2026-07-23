@@ -174,6 +174,6 @@ VEHICLE_SIDE_SIGNALING_HTTP_URL=http://127.0.0.1:${SIGNALING_REMOTE_PORT}
 Run media on the vehicle:
   /home/user/mine-teleop/scripts/run_vehicle_live_media.sh
 
-Run control feedback logging on the vehicle:
-  /home/user/mine-teleop/bin/mine-teleop vehicle-agent --config /home/user/mine-teleop/configs/vehicle-agent.live.yaml --teleop --signaling-http-url http://127.0.0.1:${SIGNALING_REMOTE_PORT} --teleop-log-controls --teleop-duration-ms 600000
+The same vehicle media process owns the unordered/unreliable WebRTC DataChannel,
+validates each control command, and writes redacted receive/safety events to its media log.
 EOF

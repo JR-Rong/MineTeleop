@@ -1,0 +1,114 @@
+vehicle:
+  id: vehicle-001
+  name: ubuntu-vehicle-field
+
+cloud:
+  signaling_url: wss://teleop-field.internal:6000/signaling
+  auth_url: https://teleop-field.internal:6000/auth
+  device_token_file: device-token
+  resolve:
+    - teleop-field.internal:6000:60.205.213.254
+  ca_bundle: mine-teleop-field-root.crt
+  ice_transport_policy: all
+
+runtime:
+  control_enabled: true
+  media_enabled: true
+  control_log_commands: false
+  teleop_poll_interval_ms: 500
+  media_frame_timeout_ms: 3000
+  media_capture_interval_ms: 0
+
+control:
+  rate_hz: 20
+  max_command_gap_ms: 200
+  degraded_timeout_ms: 300
+  control_timeout_ms: 800
+  timeout_action:
+    deceleration_profile:
+      - after_ms: 0
+        brake: 0.3
+      - after_ms: 500
+        brake: 0.6
+      - after_ms: 1500
+        brake: vehicle_defined_max_safe
+
+media:
+  realtime_profiles:
+    realtime_720p30:
+      codec: h264
+      encoder: auto
+      width: 1280
+      height: 720
+      fps: 30
+      bitrate_kbps: 2500
+  record_profiles:
+    reuse_realtime:
+      codec: h264
+      encoder: reuse_realtime
+      width: source
+      height: source
+      fps: source
+      bitrate_kbps: 2500
+      segment_seconds: 2
+
+cameras:
+  - id: front_uvc
+    enabled: true
+    device: /dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0
+    capture_width: 1280
+    capture_height: 720
+    capture_fps: 30
+    realtime_profile: realtime_720p30
+    record_profile: reuse_realtime
+  - id: basler_25192546
+    enabled: true
+    device: basler:serial=25192546
+    capture_width: 1280
+    capture_height: 720
+    capture_fps: 30
+    realtime_profile: realtime_720p30
+    record_profile: reuse_realtime
+
+hardware:
+  can:
+    interface: can0
+    bitrate: 500000
+  encoding:
+    vaapi_render_device: /dev/dri/renderD128
+    dri_card_device: /dev/dri/card1
+    preferred_encoder: nvenc
+    fallback_encoder: vaapi
+    preferred_codec: h264
+    fallback_codec: h264
+    require_hardware_encoder: true
+    max_end_to_end_latency_ms: 200
+    min_realtime_fps: 20
+  network:
+    interface: wlp3s0
+
+field_safety:
+  commissioning_mode: bench
+  max_speed_kph: 0
+  require_can_feedback_before_control: false
+  require_local_estop_reset: true
+  require_time_sync: true
+  max_time_sync_uncertainty_ms: 25
+  time_sync_interval_ms: 30000
+  time_sync_samples: 7
+
+recording:
+  enabled: false
+  root_dir: recordings
+  min_free_gb: 1
+  delete_uploaded_when_below_free_gb: 0.5
+  delete_unuploaded_when_below_free_gb: false
+
+upload:
+  enabled: false
+  backend: local_archive
+
+# This proves network delivery without energizing a chassis. Replace only after
+# a separate CAN/braking safety acceptance has supplied the required evidence.
+vehicle_adapter:
+  type: mock

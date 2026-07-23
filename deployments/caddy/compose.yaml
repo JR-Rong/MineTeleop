@@ -1,0 +1,24 @@
+services:
+  tls-entry:
+    image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    network_mode: host
+    environment:
+      MINE_TELEOP_PUBLIC_ORIGIN: ${MINE_TELEOP_PUBLIC_ORIGIN:?set the trusted public HTTPS origin}
+      MINE_TELEOP_SIGNALING_UPSTREAM: ${MINE_TELEOP_SIGNALING_UPSTREAM:-127.0.0.1:8765}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    cpus: "1.0"
+    mem_limit: 256m
+
+volumes:
+  caddy-data:
+  caddy-config:

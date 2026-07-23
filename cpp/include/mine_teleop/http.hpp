@@ -2,9 +2,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "mine_teleop/core.hpp"
 
@@ -15,20 +19,50 @@ struct HttpResponse {
   std::string body;
 };
 
+using HttpHeaders = std::vector<std::pair<std::string, std::string>>;
+
+class HttpStatusError : public std::runtime_error {
+ public:
+  HttpStatusError(long status, std::string message)
+      : std::runtime_error(std::move(message)), status_(status) {}
+
+  [[nodiscard]] long status() const noexcept { return status_; }
+
+ private:
+  long status_;
+};
+
+class HttpTransportError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 class HttpClient {
  public:
   explicit HttpClient(std::chrono::milliseconds timeout = std::chrono::seconds(5));
+  HttpClient(
+      std::chrono::milliseconds timeout,
+      std::vector<std::string> resolve_entries,
+      std::filesystem::path ca_bundle);
 
   [[nodiscard]] HttpResponse get(std::string_view url) const;
+  [[nodiscard]] HttpResponse get(std::string_view url, const HttpHeaders& headers) const;
   [[nodiscard]] HttpResponse post_json(std::string_view url, const Json& payload) const;
   [[nodiscard]] Json get_json(std::string_view url) const;
+  [[nodiscard]] Json get_json(std::string_view url, const HttpHeaders& headers) const;
   [[nodiscard]] Json post_json_response(std::string_view url, const Json& payload) const;
   [[nodiscard]] std::string url_encode(std::string_view value) const;
 
  private:
-  [[nodiscard]] HttpResponse request(std::string_view method, std::string_view url, std::string_view body) const;
+  struct Impl;
+  [[nodiscard]] HttpResponse request(
+      std::string_view method,
+      std::string_view url,
+      std::string_view body,
+      const HttpHeaders& headers) const;
 
   std::chrono::milliseconds timeout_;
+  std::shared_ptr<Impl> impl_;
 };
 
 struct TimeSyncStatus {
@@ -59,34 +93,5 @@ class SynchronizedClock {
 };
 
 std::string normalize_signaling_http_url(std::string_view url);
-
-class VehicleTeleopRuntime {
- public:
-  VehicleTeleopRuntime(VehicleConfig config, std::string signaling_url, std::string device_token, int telemetry_interval_ms = 100);
-  ~VehicleTeleopRuntime();
-
-  Json register_online();
-  Json register_offline();
-  bool discover_session(std::int64_t timestamp_ms);
-  Json poll_and_execute(std::int64_t timestamp_ms);
-  Json run(int duration_ms, int poll_interval_ms, int session_wait_ms, bool log_controls);
-  [[nodiscard]] Json summary() const;
-
- private:
-  void start_session(std::string session_id, std::int64_t timestamp_ms);
-  TimeSyncStatus refresh_time_sync();
-
-  VehicleConfig config_;
-  std::string signaling_http_url_;
-  std::string device_token_;
-  int telemetry_interval_ms_;
-  HttpClient http_;
-  SynchronizedClock clock_;
-  std::string session_id_;
-  std::unique_ptr<VehicleControlService> service_;
-  std::uint64_t processed_control_commands_{0};
-  std::optional<ControlCommand> last_applied_command_;
-  std::vector<Json> control_receive_logs_;
-};
 
 }  // namespace mine_teleop

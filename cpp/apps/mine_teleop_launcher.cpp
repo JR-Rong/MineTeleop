@@ -43,13 +43,8 @@ int main(int argc, char** argv) {
   set_environment("LIBVA_DRIVERS_PATH", (root / "lib/dri").string());
   set_environment("SSL_CERT_FILE", (root / "config/ca-certificates.crt").string());
 
-  const auto loader = (root / "lib/ld-linux-x86-64.so.2").string();
-  std::vector<std::string> arguments{
-      loader,
-      "--library-path",
-      library_path,
-      (root / "bin/mine-teleop").string(),
-  };
+  const auto runtime = (root / "bin/mine-teleop").string();
+  std::vector<std::string> arguments{runtime};
   if (argc == 1) {
     arguments.emplace_back("vehicle-runtime");
     arguments.emplace_back("--config");
@@ -62,7 +57,7 @@ int main(int argc, char** argv) {
   raw.reserve(arguments.size() + 1);
   for (auto& argument : arguments) raw.push_back(argument.data());
   raw.push_back(nullptr);
-  execv(loader.c_str(), raw.data());
+  execv(runtime.c_str(), raw.data());
   const auto saved_errno = errno;
   std::perror("mine-teleop-run");
   return saved_errno == ENOENT ? 127 : 126;
