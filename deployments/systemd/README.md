@@ -11,6 +11,25 @@ It starts and stops four independent daemons:
 Keeping separate services preserves failure isolation, restart policies, and
 per-component logs. The target is operational grouping, not a process merge.
 
+## Install from the cloud package
+
+The preferred production path is to build the cloud archive on macOS:
+
+```bash
+scripts/build_macos_cloud_bundle.sh
+```
+
+Upload and extract the resulting archive on Ubuntu 22.04 x86_64, then run its
+top-level `deploy-cloud.sh`. The script installs these units and their drop-ins,
+installs or verifies Caddy/HAProxy/coturn, generates the bundle-aware signaling
+override, validates configuration, enables the target, and checks the loopback
+health endpoint. Run `./deploy-cloud.sh --help` from the extracted archive for
+the credential and proxy configuration inputs.
+
+The manual checkout-based commands below remain useful for development and
+unit inspection. They do not copy the application binary or create the required
+runtime configuration.
+
 Install from a checkout on the cloud host:
 
 ```bash

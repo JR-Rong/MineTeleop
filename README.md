@@ -49,6 +49,42 @@ The build runs the native CTest suite, configuration validation, a deterministic
 safety timeout loop, authenticated driver-to-vehicle signaling, a native C++
 test-source frame path, and atomic uploader checks.
 
+### macOS cloud bundle
+
+Build and test the Ubuntu 22.04 x86_64 cloud package from an Intel or Apple
+Silicon Mac with Docker Desktop:
+
+```bash
+scripts/build_macos_cloud_bundle.sh
+```
+
+This uses a dedicated signaling-only Dockerfile and does not build GStreamer,
+camera bridges, or the vehicle runtime. It emits
+`dist/mine-teleop-cloud-ubuntu22.04-x64-YYYYMMDD-HHMMSS.tar.gz` plus a SHA-256
+file. The final package is self-contained for the native signaling binary and
+also carries the systemd, Caddy, HAProxy, and coturn deployment assets.
+
+After uploading and extracting the archive on Ubuntu 22.04 x86_64, deploy all
+four cloud services with the package-local script:
+
+```bash
+sudo ./deploy-cloud.sh \
+  --signaling-config /secure/staging/signaling-server.yaml \
+  --identity-secrets-dir /secure/staging/identity-secrets \
+  --turn-secret-file /secure/staging/turn-static-auth.secret \
+  --turn-realm 60-205-213-254.sslip.io \
+  --turn-host 60-205-213-254.sslip.io \
+  --caddy-config deployments/caddy/Caddyfile.three-machine \
+  --haproxy-config deployments/haproxy/haproxy.three-machine.cfg
+```
+
+The bundled three-machine proxy files contain the current field addresses.
+Inspect and edit copies before selecting them for another server. The deployer
+preserves configuration unless a replacement is explicitly supplied, backs up
+replaced files, validates all three application/proxy configurations, enables
+`mine-teleop-cloud.target`, and requires the loopback health check to pass.
+Use `sudo ./deploy-cloud.sh --no-start` to install without starting.
+
 ### macOS control client
 
 Build, test, sign, and package the native control client without GStreamer or

@@ -1,0 +1,106 @@
+FROM ubuntu:22.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG MINE_TELEOP_BUILD_JOBS=2
+
+RUN printf '%s\n' \
+      'Acquire::Retries "5";' \
+      'Acquire::http::Timeout "30";' \
+      'Acquire::https::Timeout "30";' \
+      > /etc/apt/apt.conf.d/80-mine-teleop-retries \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+      bash \
+      build-essential \
+      ca-certificates \
+      cmake \
+      libcurl4-openssl-dev \
+      libssl-dev \
+      libyaml-cpp-dev \
+      nlohmann-json3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -S . -B /tmp/mine-teleop-cloud-build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/mine-teleop \
+      -DMINE_TELEOP_BUILD_CONTROL_CLIENT=OFF \
+      -DMINE_TELEOP_BUILD_SIGNALING_SERVER=ON \
+      -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=OFF \
+      -DMINE_TELEOP_BUILD_TESTS=ON \
+    && cmake --build /tmp/mine-teleop-cloud-build \
+      --parallel "$MINE_TELEOP_BUILD_JOBS" \
+    && ctest --test-dir /tmp/mine-teleop-cloud-build --output-on-failure \
+    && cmake --install /tmp/mine-teleop-cloud-build
+
+FROM build AS bundle
+
+ARG MINE_TELEOP_SOURCE_COMMIT=unknown
+ARG MINE_TELEOP_BUILT_AT_UTC=unknown
+ARG MINE_TELEOP_TARGET_PLATFORM=linux/amd64
+
+RUN set -eu; \
+    mkdir -p \
+      /bundle/bin \
+      /bundle/lib \
+      /bundle/etc/ssl/certs \
+      /bundle/share/mine-teleop \
+      /bundle/deployments \
+      /bundle/scripts; \
+    install -m 0755 \
+      /opt/mine-teleop/bin/mine-teleop-signaling-server \
+      /bundle/bin/mine-teleop-signaling-server; \
+    cp -a /opt/mine-teleop/share/. /bundle/share/; \
+    cp -a /src/deployments/systemd /bundle/deployments/systemd; \
+    cp -a /src/deployments/caddy /bundle/deployments/caddy; \
+    cp -a /src/deployments/haproxy /bundle/deployments/haproxy; \
+    cp -a /src/deployments/turnserver /bundle/deployments/turnserver; \
+    install -m 0755 /src/scripts/deploy_cloud_bundle.sh /bundle/deploy-cloud.sh; \
+    install -m 0755 \
+      /src/scripts/render_turnserver_config.sh \
+      /bundle/scripts/render_turnserver_config.sh; \
+    install -m 0644 \
+      /src/packaging/ubuntu-cloud/signaling-server.yaml.example \
+      /bundle/signaling-server.yaml.example; \
+    install -m 0644 \
+      /src/packaging/ubuntu-cloud/README.txt \
+      /bundle/README.txt; \
+    install -m 0644 \
+      /etc/ssl/certs/ca-certificates.crt \
+      /bundle/etc/ssl/certs/ca-certificates.crt; \
+    cp -L /lib64/ld-linux-x86-64.so.2 /bundle/lib/ld-linux-x86-64.so.2; \
+    copy_dependencies() { \
+      ldd "$1" 2>/dev/null \
+        | awk '/=> \/.* \(/ {print $3} /^\// {print $1}' \
+        | while IFS= read -r library; do \
+            cp -L -n "$library" /bundle/lib/; \
+          done; \
+    }; \
+    pass=0; \
+    while [ "$pass" -lt 4 ]; do \
+      for object in $(find /bundle/bin /bundle/lib -type f); do \
+        copy_dependencies "$object"; \
+      done; \
+      pass=$((pass + 1)); \
+    done; \
+    find /bundle/lib -type f -name '*.a' -delete; \
+    printf '%s\n' \
+      "source_commit=$MINE_TELEOP_SOURCE_COMMIT" \
+      "target_platform=$MINE_TELEOP_TARGET_PLATFORM" \
+      "build_type=Release" \
+      "runtime=ubuntu22.04-self-contained" \
+      "tests_executed=yes" \
+      "built_at_utc=$MINE_TELEOP_BUILT_AT_UTC" \
+      > /bundle/BUILD-INFO.txt; \
+    bash -n /bundle/deploy-cloud.sh /bundle/scripts/render_turnserver_config.sh; \
+    /bundle/scripts/render_turnserver_config.sh --self-test; \
+    /bundle/lib/ld-linux-x86-64.so.2 \
+      --library-path /bundle/lib \
+      /bundle/bin/mine-teleop-signaling-server \
+      --version
+
+FROM scratch AS artifact
+
+COPY --from=bundle /bundle/ /
