@@ -1,0 +1,296 @@
+# syntax=docker/dockerfile:1
+
+ARG BUILDPLATFORM
+ARG TARGETPLATFORM
+
+FROM --platform=$TARGETPLATFORM ubuntu:22.04 AS target-deps
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN printf '%s\n' \
+      'Acquire::Retries "10";' \
+      'Acquire::http::Timeout "30";' \
+      'Acquire::https::Timeout "30";' \
+      > /etc/apt/apt.conf.d/80-mine-teleop-retries \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      gstreamer1.0-nice \
+      gstreamer1.0-plugins-bad \
+      gstreamer1.0-plugins-base \
+      gstreamer1.0-plugins-good \
+      gstreamer1.0-tools \
+      gstreamer1.0-vaapi \
+      intel-media-va-driver \
+      libaravis-dev \
+      libcurl4-openssl-dev \
+      libgstreamer-plugins-bad1.0-dev \
+      libgstreamer-plugins-base1.0-dev \
+      libgstreamer1.0-dev \
+      libjpeg-dev \
+      libssl-dev \
+      libusb-1.0-0-dev \
+      libyaml-cpp-dev \
+      nlohmann-json3-dev \
+      patchelf \
+      pkg-config \
+      v4l-utils \
+      vainfo \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pkg-config --print-errors --cflags --libs aravis-0.8
+
+FROM --platform=$BUILDPLATFORM ubuntu:22.04 AS cross-deps
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN printf '%s\n' \
+      'Acquire::Retries "10";' \
+      'Acquire::http::Timeout "30";' \
+      'Acquire::https::Timeout "30";' \
+      > /etc/apt/apt.conf.d/80-mine-teleop-retries \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      cmake \
+      crossbuild-essential-amd64 \
+      pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN test -f /usr/x86_64-linux-gnu/lib/libm.a \
+    && test -f /usr/x86_64-linux-gnu/lib/libm-2.35.a \
+    && test -f /usr/x86_64-linux-gnu/lib/libmvec.a \
+    && sed -i \
+      's#/usr/lib/x86_64-linux-gnu/#/usr/x86_64-linux-gnu/lib/#g' \
+      /usr/x86_64-linux-gnu/lib/libm.a
+
+COPY --from=target-deps /usr/include /opt/mine-teleop-amd64-sysroot/usr/include
+COPY --from=target-deps /usr/lib/x86_64-linux-gnu /opt/mine-teleop-amd64-sysroot/usr/lib/x86_64-linux-gnu
+COPY --from=target-deps /usr/lib/gcc/x86_64-linux-gnu /opt/mine-teleop-amd64-sysroot/usr/lib/gcc/x86_64-linux-gnu
+COPY --from=target-deps /usr/lib/cmake /opt/mine-teleop-amd64-sysroot/usr/lib/cmake
+COPY --from=target-deps /usr/share/cmake /opt/mine-teleop-amd64-sysroot/usr/share/cmake
+COPY --from=target-deps /usr/share/pkgconfig /opt/mine-teleop-amd64-sysroot/usr/share/pkgconfig
+COPY --from=target-deps /lib/x86_64-linux-gnu /opt/mine-teleop-amd64-sysroot/lib/x86_64-linux-gnu
+COPY --from=target-deps /lib64 /opt/mine-teleop-amd64-sysroot/lib64
+COPY cmake/toolchains/linux-amd64-from-arm64.cmake /opt/mine-teleop-linux-amd64-toolchain.cmake
+
+ENV PKG_CONFIG_SYSROOT_DIR=/opt/mine-teleop-amd64-sysroot
+ENV PKG_CONFIG_LIBDIR=/opt/mine-teleop-amd64-sysroot/usr/lib/x86_64-linux-gnu/pkgconfig:/opt/mine-teleop-amd64-sysroot/usr/share/pkgconfig
+
+ARG MINE_TELEOP_BUILD_JOBS=1
+
+RUN x86_64-linux-gnu-g++ --version \
+    && test -f /opt/mine-teleop-amd64-sysroot/usr/lib/x86_64-linux-gnu/cmake/yaml-cpp/yaml-cpp-config.cmake \
+    && test -f /opt/mine-teleop-amd64-sysroot/usr/lib/cmake/nlohmann_json/nlohmann_jsonConfig.cmake \
+    && pkg-config --print-errors --cflags --libs aravis-0.8 \
+    && pkg-config --print-errors --cflags --libs \
+      gstreamer-1.0 \
+      gstreamer-app-1.0 \
+      gstreamer-sdp-1.0 \
+      gstreamer-webrtc-1.0
+
+FROM cross-deps AS cross-build
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -S . -B /tmp/mine-teleop-build \
+      -DCMAKE_TOOLCHAIN_FILE=/opt/mine-teleop-linux-amd64-toolchain.cmake \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/mine-teleop \
+      -Dyaml-cpp_DIR=/opt/mine-teleop-amd64-sysroot/usr/lib/x86_64-linux-gnu/cmake/yaml-cpp \
+      -Dnlohmann_json_DIR=/opt/mine-teleop-amd64-sysroot/usr/lib/cmake/nlohmann_json \
+      -DJPEG_LIBRARY=/opt/mine-teleop-amd64-sysroot/usr/lib/x86_64-linux-gnu/libjpeg.so \
+      -DJPEG_INCLUDE_DIR=/opt/mine-teleop-amd64-sysroot/usr/include \
+      -DMINE_TELEOP_BUILD_TESTS=ON \
+      -DMINE_TELEOP_BUILD_CONTROL_CLIENT=ON \
+      -DMINE_TELEOP_BUILD_SIGNALING_SERVER=ON \
+      -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=ON \
+      -DMINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE=ON \
+    && cmake --build /tmp/mine-teleop-build \
+      --parallel "$MINE_TELEOP_BUILD_JOBS" \
+    && cmake --install /tmp/mine-teleop-build
+
+FROM cross-deps AS cross-libsrtp
+
+ARG LIBSRTP_COMMIT=90d05bf8980d16e4ac3f16c19b77e296c4bc207b
+ARG LIBSRTP_ARCHIVE_SHA256=0caec0cf84569463c1ff186fe6a92101fe9036375140dd4588170787925f5335
+
+RUN printf '%s\n' \
+      "file(DOWNLOAD \"https://codeload.github.com/cisco/libsrtp/tar.gz/${LIBSRTP_COMMIT}\"" \
+      '  "/tmp/libsrtp.tar.gz"' \
+      "  EXPECTED_HASH \"SHA256=${LIBSRTP_ARCHIVE_SHA256}\"" \
+      '  TLS_VERIFY ON)' \
+      > /tmp/download-libsrtp.cmake \
+    && cmake -P /tmp/download-libsrtp.cmake \
+    && mkdir -p /tmp/libsrtp-source \
+    && tar -xzf /tmp/libsrtp.tar.gz \
+      -C /tmp/libsrtp-source \
+      --strip-components=1 \
+    && cmake -S /tmp/libsrtp-source -B /tmp/libsrtp-build \
+      -DCMAKE_TOOLCHAIN_FILE=/opt/mine-teleop-linux-amd64-toolchain.cmake \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_FLAGS_RELEASE="-O1 -DNDEBUG" \
+      -DCMAKE_INSTALL_PREFIX=/opt/libsrtp \
+      -DBUILD_SHARED_LIBS=ON \
+      -DENABLE_OPENSSL=ON \
+    && cmake --build /tmp/libsrtp-build --parallel 1 \
+    && cmake --install /tmp/libsrtp-build
+
+FROM target-deps AS verify
+
+COPY --from=cross-build /src /src
+COPY --from=cross-build /tmp/mine-teleop-build /tmp/mine-teleop-build
+COPY --from=cross-build /opt/mine-teleop /opt/mine-teleop
+COPY --from=cross-libsrtp /tmp/libsrtp-source /tmp/libsrtp-source
+COPY --from=cross-libsrtp /tmp/libsrtp-build /tmp/libsrtp-build
+COPY --from=cross-libsrtp /opt/libsrtp /opt/libsrtp
+
+RUN readelf -h /opt/mine-teleop/bin/mine-teleop \
+      | grep -q 'Advanced Micro Devices X86-64' \
+    && readelf -h /opt/libsrtp/lib/libsrtp2.so.2.4.2 \
+      | grep -q 'Advanced Micro Devices X86-64' \
+    && ctest --test-dir /tmp/libsrtp-build --output-on-failure \
+    && ctest --test-dir /tmp/mine-teleop-build --output-on-failure \
+    && /opt/mine-teleop/bin/mine-teleop-aravis-camera --help \
+    && /opt/mine-teleop/bin/mine-teleop version \
+    && /opt/mine-teleop/bin/mine-teleop config-check \
+      --config /src/configs/vehicle-agent.dev.yaml \
+    && /opt/mine-teleop/bin/mine-teleop vehicle-agent \
+      --config /src/configs/vehicle-agent.dev.yaml \
+      --run-loop \
+      --duration-ms 1000 \
+      --disconnect-at-ms 200
+
+FROM verify AS bundle
+
+ARG MINE_TELEOP_SOURCE_COMMIT=unknown
+ARG MINE_TELEOP_BUILT_AT_UTC=unknown
+ARG LIBSRTP_COMMIT=90d05bf8980d16e4ac3f16c19b77e296c4bc207b
+ARG LIBSRTP_ARCHIVE_SHA256=0caec0cf84569463c1ff186fe6a92101fe9036375140dd4588170787925f5335
+
+RUN set -eu; \
+    mkdir -p \
+      /bundle/bin \
+      /bundle/config \
+      /bundle/deployments/udev \
+      /bundle/etc/ssl/certs \
+      /bundle/lib/dri \
+      /bundle/lib/gstreamer-1.0 \
+      /bundle/lib/vendor/chassis \
+      /bundle/lib/vendor/mvs \
+      /bundle/scripts \
+      /bundle/share/mine-teleop; \
+    cp -a /opt/mine-teleop/bin/. /bundle/bin/; \
+    cp -a /opt/mine-teleop/lib/. /bundle/lib/; \
+    cp -a /opt/mine-teleop/share/. /bundle/share/; \
+    cp -L /usr/lib/x86_64-linux-gnu/libaravis-0.8.so* /bundle/lib/; \
+    cp -L \
+      /usr/bin/gst-inspect-1.0 \
+      /usr/bin/gst-launch-1.0 \
+      /usr/bin/v4l2-ctl \
+      /usr/bin/vainfo \
+      /bundle/bin/; \
+    scanner="$(find /usr/lib/x86_64-linux-gnu -path '*/gstreamer-1.0/gst-plugin-scanner' -type f | head -n 1)"; \
+    [ -n "$scanner" ]; \
+    cp -L "$scanner" /bundle/bin/gst-plugin-scanner; \
+    cp -L /usr/lib/x86_64-linux-gnu/gstreamer-1.0/*.so /bundle/lib/gstreamer-1.0/; \
+    cp -L /usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so /bundle/lib/dri/; \
+    cp -L /etc/ssl/certs/ca-certificates.crt /bundle/etc/ssl/certs/; \
+    cp -L /etc/ssl/certs/ca-certificates.crt /bundle/config/ca-certificates.crt; \
+    cp /src/configs/vehicle-agent.bench.yaml /bundle/config/vehicle-agent.yaml; \
+    cp /src/configs/mine-teleop-field-root.crt /bundle/config/mine-teleop-field-root.crt; \
+    cp /src/deployments/udev/99-mine-teleop-basler.rules /bundle/deployments/udev/; \
+    cp /src/scripts/setup_basler_usb_access.sh /bundle/scripts/; \
+    chmod +x /bundle/scripts/setup_basler_usb_access.sh; \
+    if [ -d /src/vendor/chassis/lib ]; then \
+      cp -a /src/vendor/chassis/lib/. /bundle/lib/vendor/chassis/; \
+    fi; \
+    if [ -d /src/vendor/mvs/lib ]; then \
+      cp -a /src/vendor/mvs/lib/. /bundle/lib/vendor/mvs/; \
+    fi; \
+    if [ -d /src/vendor/nvidia/lib ]; then \
+      cp -a /src/vendor/nvidia/lib/. /bundle/lib/; \
+    fi; \
+    source_srtp="$(find /opt/libsrtp/lib -maxdepth 1 -type f -name 'libsrtp2.so.*' | head -n 1)"; \
+    [ -n "$source_srtp" ]; \
+    cp -L "$source_srtp" /bundle/lib/libsrtp2.so.1; \
+    cp -L /lib64/ld-linux-x86-64.so.2 /bundle/lib/ld-linux-x86-64.so.2; \
+    find /bundle/lib -type f -name '*.a' -delete; \
+    find /bundle/bin /bundle/lib -type f > /tmp/dependency-queue; \
+    while IFS= read -r object; do \
+      ldd "$object" 2>/dev/null \
+        | awk '/=> \/.* \(/ {print $3} /^\// {print $1}' \
+        > /tmp/object-dependencies || true; \
+      while IFS= read -r library; do \
+        destination="/bundle/lib/${library##*/}"; \
+        if [ ! -e "$destination" ]; then \
+          cp -L "$library" "$destination"; \
+          printf '%s\n' "$destination" >> /tmp/dependency-queue; \
+        fi; \
+      done < /tmp/object-dependencies; \
+    done < /tmp/dependency-queue; \
+    for object in $(find /bundle/bin -type f); do \
+      patchelf \
+        --set-rpath '$ORIGIN/../lib:$ORIGIN/..:$ORIGIN/../lib/vendor/chassis:$ORIGIN/../lib/vendor/mvs:$ORIGIN' \
+        "$object" 2>/dev/null || true; \
+    done; \
+    dpkg-query -W -f='${Package}=${Version}\n' \
+      gstreamer1.0-nice \
+      gstreamer1.0-plugins-bad \
+      gstreamer1.0-plugins-base \
+      gstreamer1.0-plugins-good \
+      gstreamer1.0-tools \
+      gstreamer1.0-vaapi \
+      intel-media-va-driver \
+      libaravis-dev \
+      libsrtp2-1 \
+      > /bundle/THIRD-PARTY-PACKAGES.txt; \
+    printf '%s\n' \
+      "libsrtp_source_commit=$LIBSRTP_COMMIT" \
+      "libsrtp_source_archive_sha256=$LIBSRTP_ARCHIVE_SHA256" \
+      >> /bundle/THIRD-PARTY-PACKAGES.txt; \
+    printf '%s\n' \
+      "source_commit=$MINE_TELEOP_SOURCE_COMMIT" \
+      'target_platform=linux/amd64' \
+      'build_type=Release' \
+      'third_party_runtime_source=ubuntu-22.04-packages+source-built-libsrtp' \
+      'runtime_tests_executed=yes' \
+      "built_at_utc=$MINE_TELEOP_BUILT_AT_UTC" \
+      > /bundle/BUILD-INFO.txt; \
+    /bundle/bin/mine-teleop-run version; \
+    /bundle/bin/mine-teleop-run config-check --config /bundle/config/vehicle-agent.yaml; \
+    LD_LIBRARY_PATH=/bundle/lib \
+      /bundle/bin/mine-teleop-aravis-camera --list --json \
+      | grep -q '"device_count":0'; \
+    export GST_REGISTRY_FORK=no; \
+    export GST_PLUGIN_SYSTEM_PATH_1_0=; \
+    export GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0; \
+    export GST_PLUGIN_SCANNER=/bundle/bin/gst-plugin-scanner; \
+    export LD_LIBRARY_PATH=/bundle/lib; \
+    for plugin in \
+      webrtcbin \
+      srtpenc \
+      sctpenc \
+      sctpdec \
+      dtlsenc \
+      dtlsdec \
+      nicesrc \
+      v4l2src \
+      va \
+      nvcodec \
+      h264parse \
+      rtph264pay; do \
+      /bundle/bin/gst-inspect-1.0 "$plugin" >/dev/null; \
+    done; \
+    /bundle/bin/gst-launch-1.0 -q \
+      fakesrc num-buffers=1 sizetype=fixed sizemax=100 filltype=zero \
+      '!' 'application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96,ssrc=(uint)1' \
+      '!' srtpenc random-key=true \
+      '!' fakesink
+
+FROM scratch AS artifact
+
+COPY --from=bundle /bundle/ /

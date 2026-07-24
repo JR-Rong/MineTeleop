@@ -16,6 +16,12 @@ build_image="$image-build"
 build_jobs="${MINE_TELEOP_BUILD_JOBS:-2}"
 vehicle_config="${MINE_TELEOP_VEHICLE_CONFIG:-$repo_root/configs/vehicle-agent.three-machine.field.yaml}"
 base_bundle_archive="${MINE_TELEOP_BASE_BUNDLE_ARCHIVE:-}"
+
+if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" &&
+      -z "$base_bundle_archive" ]]; then
+  exec "$script_dir/build_macos_vehicle_from_scratch.sh" "$@"
+fi
+
 temporary="$(mktemp -d)"
 temporary_container=""
 

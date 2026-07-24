@@ -191,9 +191,23 @@ Apple Silicon host without Rosetta, add `MINE_TELEOP_SKIP_RUN_TESTS=1`; the
 resulting `BUILD-INFO.txt` explicitly records that it is build-only and still
 requires runtime acceptance on an Intel Mac or a Rosetta-enabled host.
 
-## Self-contained Ubuntu x64 bundle
+## Self-contained Ubuntu x64 vehicle bundle
 
-Build the Ubuntu 22.04 x86_64/amd64 bundle from any Docker-capable host:
+On an Apple Silicon Mac, build the complete Ubuntu 22.04 x86_64/amd64 vehicle
+bundle without a previously accepted base archive:
+
+```bash
+scripts/build_macos_vehicle_from_scratch.sh
+```
+
+This path starts from a clean Ubuntu 22.04 amd64 container, installs the
+distribution's GStreamer/WebRTC, VAAPI, NVCodec, and Aravis packages, builds
+the small pinned OpenSSL libsrtp compatibility library and all current Mine
+Teleop C++ targets from source, runs CTest, collects the runtime dependency
+closure, and validates the exact final archive. It avoids the unreliable
+ARM-to-x86 QEMU build of the complete GStreamer source tree. The original
+command automatically selects this path on Apple Silicon when no
+`MINE_TELEOP_BASE_BUNDLE_ARCHIVE` is set:
 
 ```bash
 scripts/build_cpp_ubuntu_bundle.sh linux/amd64
@@ -214,7 +228,9 @@ The device token remains outside the package. NVIDIA's kernel
 driver remains a hardware/OS prerequisite; the matching redistributable NVIDIA
 userspace libraries must be copied into `lib/` for a field package.
 
-When only application code changed, a checksum-verified accepted bundle can
+On a native x86_64 Linux builder, `scripts/build_cpp_ubuntu_bundle.sh` retains
+the pinned third-party source-build path. When only application code changed,
+a checksum-verified accepted bundle can
 provide the unchanged third-party media runtime while every native binary is
 rebuilt and retested from current source:
 
