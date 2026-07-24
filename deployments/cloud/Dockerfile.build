@@ -1,18 +1,29 @@
-FROM ubuntu:22.04 AS build
+FROM ubuntu:22.04 AS ubuntu-cloud-build-base
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG MINE_TELEOP_BUILD_JOBS=2
 
 RUN printf '%s\n' \
-      'Acquire::Retries "5";' \
+      'Acquire::Retries "10";' \
       'Acquire::http::Timeout "30";' \
       'Acquire::https::Timeout "30";' \
       > /etc/apt/apt.conf.d/80-mine-teleop-retries \
     && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && sed -i \
+      -e 's|http://archive.ubuntu.com|https://archive.ubuntu.com|g' \
+      -e 's|http://security.ubuntu.com|https://security.ubuntu.com|g' \
+      /etc/apt/sources.list \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM ubuntu-cloud-build-base AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG MINE_TELEOP_BUILD_JOBS=2
+
+RUN apt-get update \
     && apt-get install -y --no-install-recommends \
       bash \
       build-essential \
-      ca-certificates \
       cmake \
       libcurl4-openssl-dev \
       libssl-dev \
