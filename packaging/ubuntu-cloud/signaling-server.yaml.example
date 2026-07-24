@@ -1,0 +1,9 @@
+auth:
+  drivers:
+    - id: driver-console-001
+      password_file: secrets/driver-console-001.password
+      vehicles:
+        - vehicle-001
+  vehicles:
+    - id: vehicle-001
+      device_token_file: secrets/vehicle-001.token
