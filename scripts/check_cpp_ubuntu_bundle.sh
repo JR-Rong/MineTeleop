@@ -85,7 +85,7 @@ container_id="$(docker create --platform linux/amd64 \
     export GST_PLUGIN_SCANNER="$root/bin/gst-plugin-scanner"
     export GST_REGISTRY_FORK=no
     export GST_REGISTRY=/tmp/mine-teleop-gstreamer-registry.bin
-    for plugin in webrtcbin srtpenc sctpenc sctpdec dtlsenc dtlsdec v4l2src va nvcodec h264parse rtph264pay; do
+    for plugin in webrtcbin srtpenc sctpenc sctpdec dtlsenc dtlsdec nicesrc v4l2src va nvcodec h264parse rtph264pay; do
       "$root/bin/gst-inspect-1.0" "$plugin" >/dev/null
     done
   ')"

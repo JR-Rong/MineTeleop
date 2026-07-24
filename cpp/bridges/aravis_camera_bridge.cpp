@@ -130,7 +130,13 @@ T* check_pointer(T* value, GError* error, std::string_view operation) {
 }
 
 struct AravisLifecycle {
-  AravisLifecycle() { arv_select_interface("USB3Vision"); }
+  AravisLifecycle() {
+#if ARAVIS_CHECK_VERSION(0, 8, 36)
+    arv_select_interface("USB3Vision");
+#else
+    arv_enable_interface("USB3Vision");
+#endif
+  }
   ~AravisLifecycle() { arv_shutdown(); }
 };
 
@@ -305,11 +311,17 @@ std::vector<unsigned char> frame_to_rgb(ArvBuffer* buffer) {
   if (width <= 0 || height <= 0) throw std::runtime_error("Aravis returned invalid image dimensions");
 
   size_t size = 0;
+#if ARAVIS_CHECK_VERSION(0, 8, 36)
   const auto* data = static_cast<const unsigned char*>(arv_buffer_get_image_data(buffer, &size));
+#else
+  const auto* data = static_cast<const unsigned char*>(arv_buffer_get_data(buffer, &size));
+#endif
   if (data == nullptr) throw std::runtime_error("Aravis returned an empty image buffer");
   gint x_padding = 0;
   gint y_padding = 0;
+#if ARAVIS_CHECK_VERSION(0, 8, 36)
   arv_buffer_get_image_padding(buffer, &x_padding, &y_padding);
+#endif
   if (x_padding < 0 || y_padding < 0) throw std::runtime_error("Aravis returned invalid image padding");
 
   if (pixel_format == ARV_PIXEL_FORMAT_RGB_8_PACKED) {
