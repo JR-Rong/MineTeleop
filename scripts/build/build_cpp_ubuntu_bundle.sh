@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 platform="${1:-linux/amd64}"
 architecture="${platform#linux/}"
 case "$architecture" in
@@ -16,6 +16,12 @@ build_image="$image-build"
 build_jobs="${MINE_TELEOP_BUILD_JOBS:-2}"
 vehicle_config="${MINE_TELEOP_VEHICLE_CONFIG:-$repo_root/configs/vehicle-agent.three-machine.field.yaml}"
 base_bundle_archive="${MINE_TELEOP_BASE_BUNDLE_ARCHIVE:-}"
+
+if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" &&
+      -z "$base_bundle_archive" ]]; then
+  exec "$script_dir/build_macos_vehicle_from_scratch.sh" "$@"
+fi
+
 temporary="$(mktemp -d)"
 temporary_container=""
 
@@ -125,7 +131,7 @@ install -m 0644 "$vehicle_config" "$output_root/config/vehicle-agent.yaml"
 install -m 0644 "$repo_root/configs/mine-teleop-field-root.crt" "$output_root/config/mine-teleop-field-root.crt"
 install -m 0644 "$repo_root/deployments/udev/99-mine-teleop-basler.rules" \
   "$output_root/deployments/udev/99-mine-teleop-basler.rules"
-install -m 0755 "$repo_root/scripts/setup_basler_usb_access.sh" \
+install -m 0755 "$repo_root/scripts/deploy/setup_basler_usb_access.sh" \
   "$output_root/scripts/setup_basler_usb_access.sh"
 install -m 0644 "$repo_root/packaging/ubuntu-vehicle/README.txt" "$output_root/README.txt"
 printf '%s\n' \
@@ -149,6 +155,6 @@ else
   shasum -a 256 "$archive" > "$archive.sha256"
 fi
 
-"$repo_root/scripts/check_cpp_ubuntu_bundle.sh" "$archive"
+"$repo_root/scripts/test/check_cpp_ubuntu_bundle.sh" "$archive"
 printf 'BUNDLE_DIR=%s\n' "$output_root"
 printf 'BUNDLE_ARCHIVE=%s\n' "$archive"

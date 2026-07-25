@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 image="${MINE_TELEOP_CONTROL_SMOKE_IMAGE:-mine-teleop-control-smoke:local}"
 server_name="${MINE_TELEOP_CONTROL_SMOKE_SERVER:-mine-teleop-signaling-smoke-$$}"
 console_name="${MINE_TELEOP_CONTROL_SMOKE_CONSOLE:-mine-teleop-driver-console-smoke-$$}"

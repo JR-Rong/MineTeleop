@@ -2,6 +2,8 @@
 .DS_Store
 .local
 build
+!scripts/build
+!scripts/build/**
 dist
 cpp-build
 __pycache__

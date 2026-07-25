@@ -4,8 +4,8 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/coturn_usage_report.sh --log PATH [--require-relay-bytes]
-  scripts/coturn_usage_report.sh --self-test
+  scripts/test/coturn_usage_report.sh --log PATH [--require-relay-bytes]
+  scripts/test/coturn_usage_report.sh --self-test
 
 Parse coturn "usage" and "peer usage" records into credential-free JSONL.
 The report keeps session/actor ownership and byte/packet counters, but never

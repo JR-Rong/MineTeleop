@@ -1,7 +1,7 @@
 # Build artifacts and generated output must not be tracked in git.
-build/
-cpp-build/
-dist/
+/build/
+/cpp-build/
+/dist/
 *.tar.gz
 .DS_Store
 .playwright-cli/

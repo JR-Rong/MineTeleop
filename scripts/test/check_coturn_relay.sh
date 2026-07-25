@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/check_coturn_relay.sh [options]
+  scripts/test/check_coturn_relay.sh [options]
 
 Options:
   --credentials-file PATH  Two lines: REST username, then REST credential.
@@ -24,7 +24,7 @@ EOF
 }
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 config_path="$repo_root/deployments/turnserver/turnserver.conf.template"
 credentials_file=""
 image="coturn/coturn:4.6.2"

@@ -9,7 +9,8 @@
 ### 1. 静态检查
 
 ```bash
-bash -n scripts/*.sh
+find scripts -type f -name '*.sh' -print0 \
+  | xargs -0 -n1 bash -n
 ```
 
 同时检查文档和脚本是否引用已删除的文件。静态检查只能证明仓库内部一致性，
@@ -18,7 +19,7 @@ bash -n scripts/*.sh
 ### 2. Ubuntu 22.04 原生构建
 
 ```bash
-scripts/check.sh
+scripts/test/check.sh
 ```
 
 该 Docker 门禁会：
@@ -35,11 +36,11 @@ scripts/check.sh
 ### 3. Ubuntu 车端成品
 
 ```bash
-scripts/build_cpp_ubuntu_bundle.sh linux/amd64
+scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64
 ```
 
 构建脚本生成带 SHA-256 的自包含压缩包，并自动调用
-`scripts/check_cpp_ubuntu_bundle.sh`。成品门禁校验架构、动态库、GStreamer
+`scripts/test/check_cpp_ubuntu_bundle.sh`。成品门禁校验架构、动态库、GStreamer
 插件、配置、启动器和基础运行命令。
 
 在目标车端解压后继续执行：
@@ -61,7 +62,7 @@ scripts/build_cpp_ubuntu_bundle.sh linux/amd64
 ### 4. macOS 控制端
 
 ```bash
-scripts/build_macos_control_bundle.sh
+scripts/build/build_macos_control_bundle.sh
 ```
 
 原生架构必须通过编译、CTest、签名、依赖、回环监听、端口冲突、页面脚本、
@@ -71,14 +72,14 @@ scripts/build_macos_control_bundle.sh
 双驾驶员、双车辆隔离门：
 
 ```bash
-scripts/check_macos_control_2x2.sh /path/to/cmake-build
+scripts/test/check_macos_control_2x2.sh /path/to/cmake-build
 ```
 
 ### 5. 控制面与 TURN
 
 ```bash
-scripts/run_control_plane_docker_smoke.sh
-scripts/check_coturn_relay.sh
+scripts/test/run_control_plane_docker_smoke.sh
+scripts/test/check_coturn_relay.sh
 ```
 
 控制面 smoke 验证信令、驾驶端页面和控制消息隔离。Coturn 门禁验证 UDP/TCP

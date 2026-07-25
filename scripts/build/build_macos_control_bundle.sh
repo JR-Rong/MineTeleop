@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 output_dir="${1:-$repo_root/dist}"
 host_machine_arch="$(uname -m)"
 requested_arch="${MINE_TELEOP_MACOS_ARCH:-$host_machine_arch}"
@@ -103,6 +103,6 @@ fi
 archive="$output_dir/$package_name.tar.gz"
 tar -czf "$archive" -C "$build_root" "$package_name"
 shasum -a 256 "$archive" | tee "$archive.sha256"
-"$repo_root/scripts/check_macos_control_bundle.sh" "$archive"
+"$repo_root/scripts/test/check_macos_control_bundle.sh" "$archive"
 echo "macos_control_bundle=$archive"
 echo "macos_control_bundle_root=$package_root"

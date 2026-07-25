@@ -284,7 +284,7 @@ TURN 用于 P2P 失败或网络不稳定时兜底。
 中的 `rp`、`rb`、`sp`、`sb` 后，可通过内部可信 ingest 写入同一套
 `turn_relay_usage` 汇总和审计。coturn 4.6.2 的这些结束记录不含可靠的会话时长，
 因此不能仅凭原始日志推导平均带宽；带宽仍应使用参与者上报的 `duration_ms` 或
-外部指标采样计算。`scripts/coturn_usage_report.sh` 可从 coturn 日志输出脱敏
+外部指标采样计算。`scripts/test/coturn_usage_report.sh` 可从 coturn 日志输出脱敏
 JSONL 验收报告，记录解析样本数、会话数、TURN client bytes 与实际 peer relay
 payload bytes，不回显原始 username。云端带宽账单对账仍需在部署环境中接入和验证。
 
