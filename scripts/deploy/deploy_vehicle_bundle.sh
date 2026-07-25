@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)"
 
 BUNDLE="$REPO_ROOT/dist/cpp-ubuntu22.04-amd64.tar.gz"
 CONFIG="${MINE_TELEOP_VEHICLE_CONFIG:-}"
@@ -33,7 +33,7 @@ trap cleanup EXIT
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/deploy_vehicle_bundle.sh [options]
+  scripts/deploy/deploy_vehicle_bundle.sh [options]
 
 Deploy the no-Docker-on-target Ubuntu vehicle bundle over SSH, unpack it under
 the remote user's home directory, and run smoke commands from the bundled files.
@@ -62,8 +62,8 @@ Options:
   -h, --help                   Show this help.
 
 Examples:
-  scripts/deploy_vehicle_bundle.sh --host HOST --user USER --dry-run
-  scripts/deploy_vehicle_bundle.sh --host HOST --user USER --signaling-http-url https://SIGNALING_HOST --device-token-file PATH
+  scripts/deploy/deploy_vehicle_bundle.sh --host HOST --user USER --dry-run
+  scripts/deploy/deploy_vehicle_bundle.sh --host HOST --user USER --signaling-http-url https://SIGNALING_HOST --device-token-file PATH
 EOF
 }
 

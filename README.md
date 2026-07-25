@@ -5,6 +5,12 @@ the separated browser-based control client now builds natively on macOS arm64.
 Production control, signaling, driver-console, vehicle-media, recorder/uploader,
 and camera bridge entry points do not require Python.
 
+## Guides
+
+- [编译教程](docs/BUILD.md)：从源码生成云端、控制端和车端安装包；
+- [部署教程](docs/DEPLOY.md)：凭据准备、三端安装、启动、验收和回滚；
+- [测试与验收](docs/11-testing-and-validation.md)：自动化测试和硬件验收边界。
+
 ## Runtime layout
 
 - `cpp/src/core.cpp`: control command validation, last-value mailbox, safety
@@ -42,7 +48,7 @@ The canonical build environment is Ubuntu 22.04:
 docker build --target build \
   -f deployments/cpp/Dockerfile.build .
 
-scripts/check.sh
+scripts/test/check.sh
 ```
 
 The build runs the native CTest suite, configuration validation, a deterministic
@@ -55,7 +61,7 @@ Build and test the Ubuntu 22.04 x86_64 cloud package from an Intel or Apple
 Silicon Mac with Docker Desktop:
 
 ```bash
-scripts/build_macos_cloud_bundle.sh
+scripts/build/build_macos_cloud_bundle.sh
 ```
 
 This uses a dedicated signaling-only Dockerfile and does not build GStreamer,
@@ -64,26 +70,8 @@ camera bridges, or the vehicle runtime. It emits
 file. The final package is self-contained for the native signaling binary and
 also carries the systemd, Caddy, HAProxy, and coturn deployment assets.
 
-After uploading and extracting the archive on Ubuntu 22.04 x86_64, deploy all
-four cloud services with the package-local script:
-
-```bash
-sudo ./deploy-cloud.sh \
-  --signaling-config /secure/staging/signaling-server.yaml \
-  --identity-secrets-dir /secure/staging/identity-secrets \
-  --turn-secret-file /secure/staging/turn-static-auth.secret \
-  --turn-realm 60-205-213-254.sslip.io \
-  --turn-host 60-205-213-254.sslip.io \
-  --caddy-config deployments/caddy/Caddyfile.three-machine \
-  --haproxy-config deployments/haproxy/haproxy.three-machine.cfg
-```
-
-The bundled three-machine proxy files contain the current field addresses.
-Inspect and edit copies before selecting them for another server. The deployer
-preserves configuration unless a replacement is explicitly supplied, backs up
-replaced files, validates all three application/proxy configurations, enables
-`mine-teleop-cloud.target`, and requires the loopback health check to pass.
-Use `sudo ./deploy-cloud.sh --no-start` to install without starting.
+Cloud installation, credentials, startup, health checks, and rollback are kept
+separately in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ### macOS control client
 
@@ -91,7 +79,7 @@ Build, test, sign, and package the native control client without GStreamer or
 camera dependencies:
 
 ```bash
-scripts/build_macos_control_bundle.sh
+scripts/build/build_macos_control_bundle.sh
 ```
 
 The generated `dist/mine-teleop-control-macos-arm64-*.tar.gz` contains the
@@ -99,7 +87,7 @@ executable, shared YAML, protocol-v1 vectors, CA bundle, build proof, and
 `run-control.command`. It uses the macOS Security/CommonCrypto system APIs and
 does not require Homebrew libraries. The process binds only to `127.0.0.1`, opens
 the default browser, and emits a clear error if the configured port is busy.
-Every build also runs `scripts/check_macos_control_bundle.sh` against the final
+Every build also runs `scripts/test/check_macos_control_bundle.sh` against the final
 archive. All targets verify checksum, signature, architecture, dependencies, and
 contents; native builds additionally verify extracted startup, loopback and
 port-conflict behavior, page syntax, the redacted local event log, and clean
@@ -133,7 +121,7 @@ On macOS, exercise a built signaling server and control client as two real
 control processes against one multi-identity server with:
 
 ```bash
-./scripts/check_macos_control_2x2.sh /path/to/cmake-build-directory
+./scripts/test/check_macos_control_2x2.sh /path/to/cmake-build-directory
 ```
 
 默认执行快速双车双控隔离门。要执行首轮 30 分钟稳定性门并保留 CSV、审计和进程日志：
@@ -141,7 +129,7 @@ control processes against one multi-identity server with:
 ```bash
 MINE_TELEOP_SOAK_SECONDS=1800 \
 MINE_TELEOP_KEEP_EVIDENCE=1 \
-  ./scripts/check_macos_control_2x2.sh /path/to/cmake-build-directory
+  ./scripts/test/check_macos_control_2x2.sh /path/to/cmake-build-directory
 ```
 
 稳定性模式每 5 秒维持车辆/驾驶员心跳、触发控制租约续期，并采样三进程 RSS、
@@ -197,7 +185,7 @@ On an Apple Silicon Mac, build the complete Ubuntu 22.04 x86_64/amd64 vehicle
 bundle without a previously accepted base archive:
 
 ```bash
-scripts/build_macos_vehicle_from_scratch.sh
+scripts/build/build_macos_vehicle_from_scratch.sh
 ```
 
 This path starts from a clean Ubuntu 22.04 amd64 container, installs the
@@ -210,12 +198,12 @@ command automatically selects this path on Apple Silicon when no
 `MINE_TELEOP_BASE_BUNDLE_ARCHIVE` is set:
 
 ```bash
-scripts/build_cpp_ubuntu_bundle.sh linux/amd64
+scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64
 ```
 
 The script emits
 `dist/mine-teleop-vehicle-ubuntu22.04-x64-YYYYMMDD-HHMMSS.tar.gz`, its SHA-256
-file, and runs `scripts/check_cpp_ubuntu_bundle.sh` against that exact archive
+file, and runs `scripts/test/check_cpp_ubuntu_bundle.sh` against that exact archive
 inside a fresh Ubuntu 22.04 amd64 container. The exported artifact contains
 x86-64 ELF executables and shared libraries under `bin/` and `lib/`, plus the
 field vehicle configuration, CA roots, Basler udev helper, protocol files,
@@ -228,7 +216,7 @@ The device token remains outside the package. NVIDIA's kernel
 driver remains a hardware/OS prerequisite; the matching redistributable NVIDIA
 userspace libraries must be copied into `lib/` for a field package.
 
-On a native x86_64 Linux builder, `scripts/build_cpp_ubuntu_bundle.sh` retains
+On a native x86_64 Linux builder, `scripts/build/build_cpp_ubuntu_bundle.sh` retains
 the pinned third-party source-build path. When only application code changed,
 a checksum-verified accepted bundle can
 provide the unchanged third-party media runtime while every native binary is
@@ -236,7 +224,7 @@ rebuilt and retested from current source:
 
 ```bash
 MINE_TELEOP_BASE_BUNDLE_ARCHIVE=/path/to/accepted-vehicle-bundle.tar.gz \
-  scripts/build_cpp_ubuntu_bundle.sh linux/amd64
+  scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64
 ```
 
 `BUILD-INFO.txt` records the base archive name, and the final archive still
@@ -249,40 +237,12 @@ Aravis/libusb build and do not require pylon. All bridge shared libraries are
 carried in the bundle; the target x64 Ubuntu host does not need an SDK
 installation or source checkout.
 
-## Commands
+## Deployment
 
-```bash
-package_root=/opt/mine-teleop
-printf '%s\n' 'replace-with-device-token' > "$package_root/config/device-token"
-chmod 600 "$package_root/config/device-token"
-
-# One foreground command: control + media + recording from the bundled YAML.
-"$package_root/bin/mine-teleop-run"
-```
-
-For diagnostics or individual subcommands, pass the native command to the same
-launcher:
-
-```bash
-mt="$package_root/bin/mine-teleop-run"
-"$mt" version
-"$mt" config-check --config "$package_root/config/vehicle-agent.yaml"
-"$mt" time-sync --signaling-http-url http://control-host:8765 --samples 7 --max-uncertainty-ms 25
-
-"$mt" vehicle-agent \
-  --config "$package_root/config/vehicle-agent.yaml" \
-  --preflight
-"$mt" media-probe
-```
-
-Credentials can still be supplied with `MINE_TELEOP_DRIVER_PASSWORD` and
-`MINE_TELEOP_DEVICE_TOKEN`; the default vehicle config instead reads
-`config/device-token`. Vehicle deployment is foreground-only: the native
-`vehicle-runtime` supervisor starts both configured services and terminates the
-peer if either process fails. The deployment flow does not install or require
-systemd units. Without an external USB ACL,
-the media command must run as root so libusb can open a Basler USB3 Vision
-device for control and streaming.
+The industrial PC does not compile source. After extraction and protected
+device-token provisioning, `./bin/mine-teleop-run` is the single foreground
+vehicle entry point. The full cloud, vehicle, and control-client procedure is
+in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 Both vehicle processes and the driver console synchronize to the signaling
 server's application time domain before opening a session. They use 7
@@ -305,8 +265,8 @@ clears the authority at the last issued deadline.
 ## Development control plane
 
 ```bash
-scripts/run_control_plane_docker_smoke.sh
-scripts/run_control_plane_docker.sh
+scripts/test/run_control_plane_docker_smoke.sh
+scripts/deploy/run_control_plane_docker.sh
 ```
 
 The smoke creates native signaling and console containers, grants one vehicle

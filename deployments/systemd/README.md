@@ -16,7 +16,7 @@ per-component logs. The target is operational grouping, not a process merge.
 The preferred production path is to build the cloud archive on macOS:
 
 ```bash
-scripts/build_macos_cloud_bundle.sh
+scripts/build/build_macos_cloud_bundle.sh
 ```
 
 Upload and extract the resulting archive on Ubuntu 22.04 x86_64, then run its

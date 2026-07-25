@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 platform="${1:-linux/amd64}"
 package_timestamp="$(date -u +%Y%m%d-%H%M%S)"
 output_root="${2:-$repo_root/dist/mine-teleop-vehicle-ubuntu22.04-x64-$package_timestamp}"
@@ -63,7 +63,7 @@ install -m 0644 \
   "$repo_root/deployments/udev/99-mine-teleop-basler.rules" \
   "$output_root/deployments/udev/99-mine-teleop-basler.rules"
 install -m 0755 \
-  "$repo_root/scripts/setup_basler_usb_access.sh" \
+  "$repo_root/scripts/deploy/setup_basler_usb_access.sh" \
   "$output_root/scripts/setup_basler_usb_access.sh"
 install -m 0644 \
   "$repo_root/packaging/ubuntu-vehicle/README.txt" \
@@ -92,7 +92,7 @@ else
   shasum -a 256 "$archive" > "$archive.sha256"
 fi
 
-"$repo_root/scripts/check_cpp_ubuntu_bundle.sh" "$archive"
+"$repo_root/scripts/test/check_cpp_ubuntu_bundle.sh" "$archive"
 printf 'VEHICLE_BUNDLE_DIR=%s\n' "$output_root"
 printf 'VEHICLE_BUNDLE_ARCHIVE=%s\n' "$archive"
 printf 'VEHICLE_BUNDLE_SHA256=%s\n' "$archive.sha256"

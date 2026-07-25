@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 platform="${1:-linux/amd64}"
 build_jobs="${MINE_TELEOP_BUILD_JOBS:-2}"
 package_timestamp="$(date -u +%Y%m%d-%H%M%S)"

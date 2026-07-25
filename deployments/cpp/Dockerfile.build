@@ -228,7 +228,7 @@ RUN set -e; \
     cp /src/configs/vehicle-agent.bench.yaml /bundle/config/vehicle-agent.yaml; \
     cp /src/configs/mine-teleop-field-root.crt /bundle/config/mine-teleop-field-root.crt; \
     cp /src/deployments/udev/99-mine-teleop-basler.rules /bundle/deployments/udev/; \
-    cp /src/scripts/setup_basler_usb_access.sh /bundle/scripts/; \
+    cp /src/scripts/deploy/setup_basler_usb_access.sh /bundle/scripts/; \
     chmod +x /bundle/scripts/setup_basler_usb_access.sh; \
     cp /etc/ssl/certs/ca-certificates.crt /bundle/config/ca-certificates.crt; \
     cp -L /opt/aravis/lib/libaravis*.so* /bundle/lib/; \

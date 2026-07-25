@@ -1,6 +1,6 @@
 # 原生 C++ 控制面 Docker smoke
 
-`scripts/run_control_plane_docker_smoke.sh` 是本地开发检查，不是浏览器、WebRTC
+`scripts/test/run_control_plane_docker_smoke.sh` 是本地开发检查，不是浏览器、WebRTC
 DataChannel 或现场车辆验收。它构建 Ubuntu 22.04 原生 C++ 镜像，启动：
 
 - loopback 开发信令服务器；
@@ -20,7 +20,7 @@ smoke 验证以下边界：
 运行：
 
 ```bash
-scripts/run_control_plane_docker_smoke.sh
+scripts/test/run_control_plane_docker_smoke.sh
 ```
 
 通过输出包含：
@@ -40,7 +40,7 @@ loopback smoke；不得用于公网。
 
 ## 浏览器边界
 
-`scripts/run_control_plane_browser_smoke.sh` 当前只是上述 HTTP/control-plane smoke 的
+`scripts/test/run_control_plane_browser_smoke.sh` 当前只是上述 HTTP/control-plane smoke 的
 包装器。它没有启动真实浏览器 peer，也不能证明视频轨、SCTP DataChannel、20 Hz、
 TURN relay 或链路关闭安全停车。
 

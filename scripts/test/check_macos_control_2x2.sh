@@ -7,7 +7,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 build_dir="${MINE_TELEOP_BUILD_DIR:-${1:-$repo_root/build/macos-control}}"
 server_binary="$build_dir/mine-teleop-signaling-server"
 control_binary="$build_dir/mine-teleop-control"

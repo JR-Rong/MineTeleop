@@ -2,7 +2,11 @@
 set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-package_root="$script_dir"
+if [[ -d "$script_dir/../../deployments" && -d "$script_dir/../../packaging" ]]; then
+  package_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
+else
+  package_root="$script_dir"
+fi
 
 prefix="/opt/mine-teleop"
 config_dir="/etc/mine-teleop"

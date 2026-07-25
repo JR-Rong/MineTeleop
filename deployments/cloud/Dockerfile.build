@@ -68,9 +68,9 @@ RUN set -eu; \
     cp -a /src/deployments/caddy /bundle/deployments/caddy; \
     cp -a /src/deployments/haproxy /bundle/deployments/haproxy; \
     cp -a /src/deployments/turnserver /bundle/deployments/turnserver; \
-    install -m 0755 /src/scripts/deploy_cloud_bundle.sh /bundle/deploy-cloud.sh; \
+    install -m 0755 /src/scripts/deploy/deploy_cloud_bundle.sh /bundle/deploy-cloud.sh; \
     install -m 0755 \
-      /src/scripts/render_turnserver_config.sh \
+      /src/scripts/deploy/render_turnserver_config.sh \
       /bundle/scripts/render_turnserver_config.sh; \
     install -m 0644 \
       /src/packaging/ubuntu-cloud/signaling-server.yaml.example \

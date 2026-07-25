@@ -7,7 +7,7 @@
 ## 构建压缩包
 
 ```bash
-scripts/build_macos_control_bundle.sh
+scripts/build/build_macos_control_bundle.sh
 ```
 
 脚本会执行以下门禁：
@@ -19,7 +19,7 @@ scripts/build_macos_control_bundle.sh
 5. 对可执行文件进行 ad-hoc 签名；
 6. 检查 Mach-O 不引用 `/opt/homebrew`、`/usr/local` 或 OpenSSL；
 7. 写入目标架构和测试状态 `BUILD-INFO.txt`，生成 `tar.gz` 与 SHA-256 文件；
-8. 对最终压缩包执行 `scripts/check_macos_control_bundle.sh`；所有架构检查校验和、
+8. 对最终压缩包执行 `scripts/test/check_macos_control_bundle.sh`；所有架构检查校验和、
    签名、架构、依赖和内容，原生架构再验证解压启动、回环监听、占用端口报错、
    页面脚本、本地日志脱敏和退出后端口释放。
 
@@ -47,7 +47,7 @@ Ubuntu 车端双摄/DataChannel 现场联通后的成品：
 也可以对已有包单独重复成品验收：
 
 ```bash
-scripts/check_macos_control_bundle.sh \
+scripts/test/check_macos_control_bundle.sh \
   dist/mine-teleop-control-macos-arm64-YYYYMMDD-HHMMSS.tar.gz
 ```
 
@@ -136,7 +136,7 @@ MINE_TELEOP_DRIVER_PASSWORD=dev-password \
   error、0 warning，审计包含两条会话关联且不含测试凭据；
 - 切车与退出会主动取消上一条浏览器信令长轮询，避免旧会话关闭后产生无害但误导的
   409 console error；忙碌或越权拒绝仍会在保留 Peer/DataChannel 的同时重启轮询；
-- `scripts/check_macos_control_2x2.sh <build-dir>` 已在本机实际运行通过：一个 YAML
+- `scripts/test/check_macos_control_2x2.sh <build-dir>` 已在本机实际运行通过：一个 YAML
   多身份信令进程、两个原生控制进程、两辆模拟在线车同时达到 `2/2/2`，两条控制命令
   指向各自会话，双向越权请求返回 400 且原 WSS/权限不变，最终安全释放为 `2/0/0`；
 - 同一脚本现可通过 `MINE_TELEOP_SOAK_SECONDS=1800` 切换到 30 分钟稳定性门，并用

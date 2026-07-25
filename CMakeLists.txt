@@ -312,11 +312,11 @@ if(MINE_TELEOP_BUILD_TESTS)
   if(UNIX)
     add_test(
       NAME mine-teleop-coturn-usage-report-self-test
-      COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/coturn_usage_report.sh --self-test
+      COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/coturn_usage_report.sh --self-test
     )
     add_test(
       NAME mine-teleop-turnserver-config-render-self-test
-      COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/render_turnserver_config.sh --self-test
+      COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/deploy/render_turnserver_config.sh --self-test
     )
   endif()
 

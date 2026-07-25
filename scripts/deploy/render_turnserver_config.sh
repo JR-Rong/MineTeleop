@@ -4,8 +4,8 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/render_turnserver_config.sh --realm REALM --secret-file PATH --output PATH [--template PATH]
-  scripts/render_turnserver_config.sh --self-test
+  render_turnserver_config.sh --realm REALM --secret-file PATH --output PATH [--template PATH]
+  render_turnserver_config.sh --self-test
 
 Render the coturn template atomically with mode 0600. The shared secret is read
 from a file and is never printed.
@@ -13,7 +13,11 @@ EOF
 }
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+if [[ -f "$script_dir/../../deployments/turnserver/turnserver.conf.template" ]]; then
+  repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
+else
+  repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+fi
 
 render_config() {
   local template_path="$1"

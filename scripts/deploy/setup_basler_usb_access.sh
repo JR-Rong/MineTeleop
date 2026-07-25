@@ -2,7 +2,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+if [[ -f "$SCRIPT_DIR/../../deployments/udev/99-mine-teleop-basler.rules" ]]; then
+  REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)"
+else
+  REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+fi
 RULE_SOURCE="$REPO_ROOT/deployments/udev/99-mine-teleop-basler.rules"
 RULE_DESTINATION="/etc/udev/rules.d/99-mine-teleop-basler.rules"
 TARGET_USER="${1:-${SUDO_USER:-}}"

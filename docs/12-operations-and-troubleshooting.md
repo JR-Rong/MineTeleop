@@ -111,7 +111,7 @@ ss -lntup
 渲染生产配置：
 
 ```bash
-scripts/render_turnserver_config.sh \
+scripts/deploy/render_turnserver_config.sh \
   --realm turn.example.com \
   --secret-file /etc/mine-teleop/secrets/turn-static-auth.secret \
   --output /etc/mine-teleop/turnserver.conf
@@ -120,8 +120,8 @@ scripts/render_turnserver_config.sh \
 检查中继：
 
 ```bash
-scripts/check_coturn_relay.sh
-scripts/coturn_usage_report.sh \
+scripts/test/check_coturn_relay.sh
+scripts/test/coturn_usage_report.sh \
   --log /var/log/mine-teleop/coturn.log \
   --require-relay-bytes
 ```
