@@ -755,7 +755,7 @@ const state={left:false,right:false,up:false,down:false,brake:false};
 const gamepadState={connected:false,steering:0,throttle:0,brake:0};
 const calibration={steeringCenter:gamepadConfig.steering_center,steeringRange:gamepadConfig.steering_range,throttleRest:gamepadConfig.throttle_rest,throttleRange:gamepadConfig.throttle_range,brakeRest:gamepadConfig.brake_rest,brakeRange:gamepadConfig.brake_range,collecting:false,min:[],max:[]};
 const webrtcLabel=document.getElementById('webrtc'),cameraGrid=document.getElementById('cameras'),statusPanel=document.getElementById('status'),loginPanel=document.getElementById('login-panel'),sessionPanel=document.getElementById('session-panel'),passwordInput=document.getElementById('password'),vehicleSelect=document.getElementById('vehicle'),connectButton=document.getElementById('connect'),authExpiry=document.getElementById('auth-expiry'),gamepadPanel=document.getElementById('gamepad-panel'),gamepadStatus=document.getElementById('gamepad-status'),gamepadValues=document.getElementById('gamepad-values'),estopStatus=document.getElementById('estop-status'),monitorPanel=document.getElementById('monitor-panel'),alertsPanel=document.getElementById('alerts'),streamMetrics=document.getElementById('stream-metrics');
-let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],iceServers=[],polling=false,connecting=false,authenticated=false,heartbeatInFlight=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,signalingGeneration=0,signalingPollAbort=null;const previousStats=new Map(),cameraByMid=new Map();
+let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,heartbeatInFlight=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,signalingGeneration=0,signalingPollAbort=null;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
 function responseError(response,body){const error=Error(body.error||response.status);error.status=response.status;return error}
 async function post(path,body={},signal=null){const options={method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)};if(signal)options.signal=signal;const r=await fetch(path,options);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 async function get(path){const r=await fetch(path);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
@@ -773,7 +773,7 @@ function axisValue(pad,index){return Number.isInteger(index)&&index>=0&&index<pa
 function buttonValue(pad,index){return Number.isInteger(index)&&index>=0&&index<pad.buttons.length?Number(pad.buttons[index].value||0):0}
 function clearControlInput(){for(const key of Object.keys(state))state[key]=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0}
 function suspendSignalingPoll(){const generation=++signalingGeneration;polling=false;if(signalingPollAbort){signalingPollAbort.abort();signalingPollAbort=null}return generation}
-function closeRealtimeSession(){const generation=suspendSignalingPoll();clearControlInput();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;pendingIce=[];remoteCameraIds=[];cameraByMid.clear();previousStats.clear();cameraGrid.replaceChildren();return generation}
+function closeRealtimeSession(){const generation=suspendSignalingPoll();clearControlInput();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();cameraGrid.replaceChildren();return generation}
 function renderGamepadValues(){gamepadValues.textContent=`转向 ${gamepadState.steering.toFixed(2)} · 油门 ${gamepadState.throttle.toFixed(2)} · 制动 ${gamepadState.brake.toFixed(2)}`}
 function latchEstop(source){if(estopLatched)return;estopLatched=true;estopStatus.hidden=false;estopStatus.textContent=`急停已触发（${source}）；车辆必须本地确认后才能复位。`;clientLog('control_estop_latched',{source});renderMonitoring()}
 function firstConnectedGamepad(){const pads=navigator.getGamepads?navigator.getGamepads():[];if(activeGamepadIndex!==null&&pads[activeGamepadIndex]?.connected)return pads[activeGamepadIndex];for(const pad of pads)if(pad?.connected){activeGamepadIndex=pad.index;return pad}activeGamepadIndex=null;return null}
@@ -809,7 +809,8 @@ addEventListener('keydown',e=>{if(!polling||editingTarget(e.target))return;if(e.
 addEventListener('keyup',e=>{if(!polling||editingTarget(e.target))return;if(keys[e.key]){state[keys[e.key]]=false;send().catch(console.error);e.preventDefault()}});
 async function pollSignaling(generation){const controller=new AbortController();signalingPollAbort=controller;while(polling&&generation===signalingGeneration){try{const data=await post('/api/poll-signaling',{},controller.signal);if(generation!==signalingGeneration)break;for(const message of data.messages||[]){if(message.type==='webrtc_offer')await startFromOffer(message.payload||{});if(message.type==='ice_candidate')await addIce(message.payload||{});if(message.type==='media_status'){mediaStatus=message.payload||{lanes:[]};renderMonitoring()}}}catch(e){if(generation!==signalingGeneration||e.name==='AbortError')break;closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='控制权或信令中断';statusPanel.textContent='信令轮询失败，已停止驾驶命令: '+e.message;post('/api/end-session',{reason:'signaling_poll_failed'}).catch(()=>{});clientLog('signaling_poll_failed',{error:e.message});renderMonitoring();break}await new Promise(r=>setTimeout(r,100))}if(signalingPollAbort===controller)signalingPollAbort=null}
 async function addIce(candidate){if(!candidate.candidate)return;if(!peer||!peer.remoteDescription){pendingIce.push(candidate);return}await peer.addIceCandidate(candidate)}
-function attach(cameraId,stream){let box=document.getElementById('camera-'+cameraId);if(!box){box=document.createElement('article');box.id='camera-'+cameraId;box.className='camera';box.innerHTML='<span class="label"></span><video autoplay playsinline muted></video>';box.querySelector('.label').textContent=cameraId;cameraGrid.appendChild(box)}box.querySelector('video').srcObject=stream}
+function offeredVideoCameraIds(sdp,tracks){const mapping=new Map(),cameraIds=(tracks||[]).map(track=>track.camera_id).filter(Boolean);let cameraIndex=0;for(const section of String(sdp||'').split(/\r?\nm=/).slice(1)){if(!section.startsWith('video '))continue;const match=section.match(/(?:^|\r?\n)a=mid:([^\r\n]+)/),cameraId=cameraIds[cameraIndex++];if(match&&cameraId)mapping.set(match[1],cameraId)}return mapping}
+function attach(cameraId,track){let box=document.getElementById('camera-'+cameraId);if(!box){box=document.createElement('article');box.id='camera-'+cameraId;box.className='camera';box.innerHTML='<span class="label"></span><video autoplay playsinline muted></video>';box.querySelector('.label').textContent=cameraId;cameraGrid.appendChild(box)}box.querySelector('video').srcObject=new MediaStream([track])}
 async function startFromOffer(offer){
   if(peer)peer.close();
   controlChannel=null;
@@ -817,10 +818,12 @@ async function startFromOffer(offer){
   cameraGrid.replaceChildren();
   pendingIce=[];
   cameraByMid.clear();
+  assignedCameraIds.clear();
   previousStats.clear();
   h265FailureSamples=0;
   h265FallbackSent=false;
   remoteCameraIds=(offer.media_tracks||[]).map(t=>t.camera_id);
+  offeredCameraByMid=offeredVideoCameraIds(offer.sdp,offer.media_tracks||[]);
   const nextPeer=new RTCPeerConnection({bundlePolicy:'max-bundle',iceServers,iceTransportPolicy:consoleConfig.ice_transport_policy});
   peer=nextPeer;
   webrtcLabel.textContent=`协商 ${offer.codec||''}/${offer.backend||''}`;
@@ -869,7 +872,7 @@ async function startFromOffer(offer){
     };
   };
   nextPeer.onicecandidate=e=>{if(e.candidate)post('/api/webrtc/ice-candidate',{candidate:e.candidate.toJSON()}).catch(console.error)};
-  nextPeer.ontrack=e=>{const id=remoteCameraIds.shift()||e.transceiver.mid||e.track.id;cameraByMid.set(e.transceiver.mid||'',id);attach(id,e.streams[0]||new MediaStream([e.track]))};
+  nextPeer.ontrack=e=>{const mid=e.transceiver.mid||'',id=offeredCameraByMid.get(mid)||remoteCameraIds.find(cameraId=>!assignedCameraIds.has(cameraId))||mid||e.track.id;assignedCameraIds.add(id);cameraByMid.set(mid,id);attach(id,e.track)};
   await nextPeer.setRemoteDescription({type:'offer',sdp:offer.sdp});
   while(pendingIce.length)await addIce(pendingIce.shift());
   const answer=await nextPeer.createAnswer();

@@ -405,6 +405,17 @@ void test_control_page_contract() {
       response.body.find("webrtc_ice_candidate_error") != std::string::npos,
       "browser does not record credential-free ICE candidate errors");
   expect(
+      response.body.find("offeredVideoCameraIds(offer.sdp,offer.media_tracks||[])") != std::string::npos &&
+          response.body.find("offeredCameraByMid.get(mid)") != std::string::npos,
+      "browser camera IDs are not mapped from the SDP video mids");
+  expect(
+      response.body.find("srcObject=new MediaStream([track])") != std::string::npos &&
+          response.body.find("attach(id,e.track)") != std::string::npos,
+      "browser video elements are not isolated to their individual WebRTC tracks");
+  expect(
+      response.body.find("e.streams[0]") == std::string::npos,
+      "browser can bind the same multi-track MediaStream to multiple camera elements");
+  expect(
       response.body.find("if(connectionState==='disconnected')") != std::string::npos &&
           response.body.find("if(['failed','closed'].includes(connectionState))") != std::string::npos &&
           response.body.find("peer!==nextPeer") != std::string::npos,
