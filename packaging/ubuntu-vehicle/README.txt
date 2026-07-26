@@ -39,6 +39,12 @@ Log out and back in after the group change, then verify discovery:
 
   LD_LIBRARY_PATH="$PWD/lib" ./bin/mine-teleop-aravis-camera --list --json
 
+The packaged Basler entry enables bounded auto exposure and gain. It prefers
+the camera-native full-frame loop, then falls back to the bridge's sampled
+software loop when the required GenICam auto-limit nodes are unavailable.
+Imaging diagnostics are written to the vehicle media log, never to the JPEG
+stream. UVC camera settings are unchanged.
+
 Diagnostics:
 
   ./bin/mine-teleop-run version

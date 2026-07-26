@@ -69,6 +69,17 @@ cameras:
     capture_fps: 30
     realtime_profile: realtime_720p30
     record_profile: reuse_realtime
+    imaging:
+      auto_exposure: true
+      auto_gain: true
+      target_luma: 80
+      luma_deadband: 8
+      exposure_min_us: 100
+      exposure_max_us: 20000
+      gain_min_fraction: 0.0
+      gain_max_fraction: 1.0
+      update_interval_frames: 6
+      metering: full
 
 hardware:
   can:

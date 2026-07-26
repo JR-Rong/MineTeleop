@@ -166,6 +166,16 @@ void test_field_config_pins_tls_route_without_system_dns() {
   expect(
       config.field_safety.max_time_sync_uncertainty_ms == 25,
       "field vehicle time synchronization limit is not 25ms");
+  const auto basler = std::find_if(config.cameras.begin(), config.cameras.end(), [](const auto& camera) {
+    return camera.id == "basler_25192546";
+  });
+  expect(basler != config.cameras.end(), "field Basler camera is missing");
+  expect(basler->imaging.auto_exposure, "field Basler auto exposure is disabled");
+  expect(basler->imaging.auto_gain, "field Basler auto gain is disabled");
+  expect(basler->imaging.target_luma == 80, "field Basler target luma changed");
+  expect_near(basler->imaging.exposure_max_us, 20000.0, 1e-9, "field Basler exposure limit changed");
+  expect_near(basler->imaging.gain_max_fraction, 1.0, 1e-9, "field Basler gain limit changed");
+  expect(basler->imaging.metering == "full", "field Basler metering mode changed");
 }
 
 void test_control_command_json_round_trip_and_validation() {
@@ -982,9 +992,12 @@ void test_native_testsrc_acquisition_does_not_spawn_ffmpeg() {
 }
 
 void test_basler_camera_uses_minimal_aravis_bridge() {
-  const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
-  auto camera = config.enabled_cameras().front();
-  camera.device = "basler:serial=25192546";
+  const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.three-machine.field.yaml");
+  const auto camera_iterator = std::find_if(config.cameras.begin(), config.cameras.end(), [](const auto& candidate) {
+    return candidate.id == "basler_25192546";
+  });
+  expect(camera_iterator != config.cameras.end(), "field Basler camera is missing");
+  const auto camera = *camera_iterator;
   auto capture_profile = config.realtime_profile(camera.realtime_profile);
   capture_profile.codec = "mjpeg";
   capture_profile.encoder = "native";
@@ -1001,6 +1014,22 @@ void test_basler_camera_uses_minimal_aravis_bridge() {
   expect(
       std::find(command.begin(), command.end(), "--jpeg-quality") != command.end(),
       "Aravis bridge did not receive the bounded JPEG quality setting");
+  for (const auto required : {
+           "--auto-exposure",
+           "--auto-gain",
+           "--target-luma",
+           "--luma-deadband",
+           "--exposure-min-us",
+           "--exposure-max-us",
+           "--gain-min-fraction",
+           "--gain-max-fraction",
+           "--update-interval-frames",
+           "--metering",
+       }) {
+    expect(
+        std::find(command.begin(), command.end(), required) != command.end(),
+        std::string("Aravis bridge did not receive imaging option ") + required);
+  }
 }
 
 void test_native_driver_to_vehicle_data_channel_payload() {
