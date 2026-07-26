@@ -79,6 +79,7 @@ container_id="$(docker create --platform linux/amd64 \
     export LD_LIBRARY_PATH="$library_path"
     "$root/bin/mine-teleop-signaling-server" --version
     "$root/bin/mine-teleop-control" --version
+    "$root/bin/mine-teleop-aravis-camera" --self-test | grep -F "aravis_imaging_self_test=passed" >/dev/null
     "$root/bin/mine-teleop-aravis-camera" --list --json | grep -E "\"device_count\":[0-9]+" >/dev/null
     export GST_PLUGIN_SYSTEM_PATH_1_0=
     export GST_PLUGIN_PATH_1_0="$root/lib/gstreamer-1.0"

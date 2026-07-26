@@ -5,16 +5,20 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <setjmp.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -22,6 +26,9 @@ namespace {
 struct Arguments {
   bool list{false};
   bool json{false};
+  bool self_test{false};
+  bool auto_exposure{false};
+  bool auto_gain{false};
   int device_index{0};
   std::string serial;
   std::string model;
@@ -31,6 +38,14 @@ struct Arguments {
   int frames{0};
   int timeout_ms{2000};
   int jpeg_quality{80};
+  int target_luma{80};
+  int luma_deadband{8};
+  double exposure_min_us{100.0};
+  double exposure_max_us{12000.0};
+  double gain_min_fraction{0.0};
+  double gain_max_fraction{0.35};
+  int update_interval_frames{6};
+  std::string metering{"full"};
 };
 
 struct DeviceDescription {
@@ -58,12 +73,29 @@ int integer(std::string_view value, std::string_view option) {
   return result;
 }
 
+double floating_point(std::string_view value, std::string_view option) {
+  std::size_t consumed = 0;
+  double result = 0.0;
+  try {
+    result = std::stod(std::string(value), &consumed);
+  } catch (const std::exception&) {
+    throw std::invalid_argument(std::string(option) + " must be a number");
+  }
+  if (consumed != value.size() || !std::isfinite(result)) {
+    throw std::invalid_argument(std::string(option) + " must be a finite number");
+  }
+  return result;
+}
+
 Arguments parse_arguments(int argc, char** argv) {
   Arguments arguments;
   for (int index = 1; index < argc; ++index) {
     const std::string option(argv[index]);
     if (option == "--list") arguments.list = true;
     else if (option == "--json") arguments.json = true;
+    else if (option == "--self-test") arguments.self_test = true;
+    else if (option == "--auto-exposure") arguments.auto_exposure = true;
+    else if (option == "--auto-gain") arguments.auto_gain = true;
     else if (option == "--device-index") arguments.device_index = integer(required_value(index, argc, argv, option), option);
     else if (option == "--serial") arguments.serial = required_value(index, argc, argv, option);
     else if (option == "--model") arguments.model = required_value(index, argc, argv, option);
@@ -73,10 +105,29 @@ Arguments parse_arguments(int argc, char** argv) {
     else if (option == "--frames") arguments.frames = integer(required_value(index, argc, argv, option), option);
     else if (option == "--timeout-ms") arguments.timeout_ms = integer(required_value(index, argc, argv, option), option);
     else if (option == "--jpeg-quality") arguments.jpeg_quality = integer(required_value(index, argc, argv, option), option);
+    else if (option == "--target-luma") arguments.target_luma = integer(required_value(index, argc, argv, option), option);
+    else if (option == "--luma-deadband") arguments.luma_deadband = integer(required_value(index, argc, argv, option), option);
+    else if (option == "--exposure-min-us") {
+      arguments.exposure_min_us = floating_point(required_value(index, argc, argv, option), option);
+    } else if (option == "--exposure-max-us") {
+      arguments.exposure_max_us = floating_point(required_value(index, argc, argv, option), option);
+    } else if (option == "--gain-min-fraction") {
+      arguments.gain_min_fraction = floating_point(required_value(index, argc, argv, option), option);
+    } else if (option == "--gain-max-fraction") {
+      arguments.gain_max_fraction = floating_point(required_value(index, argc, argv, option), option);
+    } else if (option == "--update-interval-frames") {
+      arguments.update_interval_frames = integer(required_value(index, argc, argv, option), option);
+    } else if (option == "--metering") {
+      arguments.metering = required_value(index, argc, argv, option);
+    }
     else if (option == "--help" || option == "-h") {
       std::cout << "Usage: mine-teleop-aravis-camera [--list --json] "
                    "[--device-index N|--serial S|--model M] [--width W] [--height H] "
-                   "[--fps FPS] [--frames N] [--timeout-ms MS] [--jpeg-quality 1..99]\n";
+                   "[--fps FPS] [--frames N] [--timeout-ms MS] [--jpeg-quality 1..99] "
+                   "[--auto-exposure] [--auto-gain] [--target-luma 1..254] "
+                   "[--luma-deadband 0..64] [--exposure-min-us US] [--exposure-max-us US] "
+                   "[--gain-min-fraction 0..1] [--gain-max-fraction 0..1] "
+                   "[--update-interval-frames N] [--metering center|full]\n";
       std::exit(0);
     } else {
       throw std::invalid_argument("unknown option: " + option);
@@ -86,6 +137,33 @@ Arguments parse_arguments(int argc, char** argv) {
       arguments.frames < 0 || arguments.timeout_ms <= 0 || arguments.jpeg_quality < 1 ||
       arguments.jpeg_quality > 99) {
     throw std::invalid_argument("Aravis camera numeric option is out of range");
+  }
+  if (arguments.auto_exposure || arguments.auto_gain) {
+    if (arguments.target_luma < 1 || arguments.target_luma > 254 ||
+        arguments.luma_deadband < 0 || arguments.luma_deadband > 64 ||
+        arguments.target_luma - arguments.luma_deadband < 0 ||
+        arguments.target_luma + arguments.luma_deadband > 255) {
+      throw std::invalid_argument("Aravis imaging target luma/deadband is out of range");
+    }
+    if (arguments.update_interval_frames <= 0 || arguments.update_interval_frames > arguments.fps * 10) {
+      throw std::invalid_argument("Aravis update interval is out of range");
+    }
+    if (arguments.metering != "center" && arguments.metering != "full") {
+      throw std::invalid_argument("Aravis metering must be center or full");
+    }
+  }
+  if (arguments.auto_exposure) {
+    const auto frame_period_us = 1000000.0 / static_cast<double>(arguments.fps);
+    if (arguments.exposure_min_us <= 0.0 ||
+        arguments.exposure_max_us < arguments.exposure_min_us ||
+        arguments.exposure_max_us > frame_period_us * 0.9) {
+      throw std::invalid_argument("Aravis exposure bounds do not preserve the requested frame rate");
+    }
+  }
+  if (arguments.auto_gain &&
+      (arguments.gain_min_fraction < 0.0 || arguments.gain_max_fraction > 1.0 ||
+       arguments.gain_max_fraction < arguments.gain_min_fraction)) {
+    throw std::invalid_argument("Aravis gain fractions must satisfy 0 <= min <= max <= 1");
   }
   return arguments;
 }
@@ -229,6 +307,154 @@ std::string select_pixel_format(ArvCamera* camera) {
     available += format;
   }
   throw std::runtime_error("camera has no supported 8-bit RGB/Bayer/Mono pixel format; available=" + available);
+}
+
+struct ImagingBounds {
+  double exposure_min_us{0.0};
+  double exposure_max_us{0.0};
+  double gain_min{0.0};
+  double gain_max{0.0};
+  bool exposure_available{false};
+  bool gain_available{false};
+};
+
+struct ImagingState {
+  double exposure_us{0.0};
+  double gain{0.0};
+};
+
+struct ImagingAdjustment {
+  ImagingState state;
+  bool exposure_changed{false};
+  bool gain_changed{false};
+};
+
+ImagingAdjustment next_imaging_adjustment(
+    const Arguments& arguments,
+    int luma,
+    const ImagingBounds& bounds,
+    ImagingState current) {
+  ImagingAdjustment result{current};
+  const auto dark = luma < arguments.target_luma - arguments.luma_deadband;
+  const auto bright = luma > arguments.target_luma + arguments.luma_deadband;
+  if (!dark && !bright) return result;
+
+  if (dark) {
+    if (bounds.exposure_available && current.exposure_us < bounds.exposure_max_us - 0.5) {
+      const auto error_fraction =
+          static_cast<double>(arguments.target_luma - luma) /
+          static_cast<double>(std::max(arguments.target_luma, 1));
+      const auto factor = 1.0 + std::clamp(error_fraction * 0.5, 0.05, 0.25);
+      result.state.exposure_us =
+          std::clamp(current.exposure_us * factor, bounds.exposure_min_us, bounds.exposure_max_us);
+      result.exposure_changed = std::abs(result.state.exposure_us - current.exposure_us) >= 0.5;
+    } else if (bounds.gain_available && current.gain < bounds.gain_max - 1e-6) {
+      const auto step = std::max((bounds.gain_max - bounds.gain_min) * 0.05, 0.01);
+      result.state.gain = std::clamp(current.gain + step, bounds.gain_min, bounds.gain_max);
+      result.gain_changed = std::abs(result.state.gain - current.gain) >= 1e-6;
+    }
+    return result;
+  }
+
+  if (bounds.gain_available && current.gain > bounds.gain_min + 1e-6) {
+    const auto step = std::max((bounds.gain_max - bounds.gain_min) * 0.05, 0.01);
+    result.state.gain = std::clamp(current.gain - step, bounds.gain_min, bounds.gain_max);
+    result.gain_changed = std::abs(result.state.gain - current.gain) >= 1e-6;
+  } else if (bounds.exposure_available && current.exposure_us > bounds.exposure_min_us + 0.5) {
+    const auto error_fraction =
+        static_cast<double>(luma - arguments.target_luma) /
+        static_cast<double>(std::max(255 - arguments.target_luma, 1));
+    const auto factor = 1.0 - std::clamp(error_fraction * 0.5, 0.05, 0.2);
+    result.state.exposure_us =
+        std::clamp(current.exposure_us * factor, bounds.exposure_min_us, bounds.exposure_max_us);
+    result.exposure_changed = std::abs(result.state.exposure_us - current.exposure_us) >= 0.5;
+  }
+  return result;
+}
+
+int sampled_luma(
+    const std::vector<unsigned char>& rgb,
+    int width,
+    int height,
+    std::string_view metering) {
+  if (width <= 0 || height <= 0 ||
+      rgb.size() < static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3U) {
+    throw std::invalid_argument("cannot meter an invalid RGB frame");
+  }
+  const int x_begin = metering == "center" ? width / 5 : 0;
+  const int x_end = metering == "center" ? width - width / 5 : width;
+  const int y_begin = metering == "center" ? height / 5 : 0;
+  const int y_end = metering == "center" ? height - height / 5 : height;
+  const int step = std::max(1, std::min(width, height) / 160);
+  std::array<std::size_t, 256> histogram{};
+  std::size_t samples = 0;
+  for (int y = y_begin; y < y_end; y += step) {
+    for (int x = x_begin; x < x_end; x += step) {
+      const auto offset =
+          (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+           static_cast<std::size_t>(x)) *
+          3U;
+      const auto luma =
+          (54U * rgb[offset] + 183U * rgb[offset + 1] + 19U * rgb[offset + 2] + 128U) >> 8U;
+      ++histogram.at(luma);
+      ++samples;
+    }
+  }
+  if (samples == 0) throw std::runtime_error("Aravis imaging metering selected no samples");
+  const auto midpoint = (samples + 1U) / 2U;
+  std::size_t cumulative = 0;
+  for (std::size_t value = 0; value < histogram.size(); ++value) {
+    cumulative += histogram[value];
+    if (cumulative >= midpoint) return static_cast<int>(value);
+  }
+  return 255;
+}
+
+void run_imaging_self_test() {
+  Arguments arguments;
+  arguments.auto_exposure = true;
+  arguments.auto_gain = true;
+  ImagingBounds bounds{100.0, 12000.0, 0.0, 12.0, true, true};
+
+  const auto dark = next_imaging_adjustment(arguments, 20, bounds, {1000.0, 0.0});
+  if (!dark.exposure_changed || dark.gain_changed || dark.state.exposure_us <= 1000.0) {
+    throw std::runtime_error("dark-frame self-test did not prioritize exposure");
+  }
+  const auto gain = next_imaging_adjustment(arguments, 20, bounds, {12000.0, 0.0});
+  if (gain.exposure_changed || !gain.gain_changed || gain.state.gain <= 0.0) {
+    throw std::runtime_error("dark-frame self-test did not use bounded gain after exposure");
+  }
+  const auto bright = next_imaging_adjustment(arguments, 180, bounds, {12000.0, 6.0});
+  if (bright.exposure_changed || !bright.gain_changed || bright.state.gain >= 6.0) {
+    throw std::runtime_error("bright-frame self-test did not reduce gain first");
+  }
+  const auto stable = next_imaging_adjustment(arguments, 80, bounds, {6000.0, 2.0});
+  if (stable.exposure_changed || stable.gain_changed) {
+    throw std::runtime_error("deadband self-test changed a stable image");
+  }
+
+  std::vector<unsigned char> rgb(9U * 3U, 0U);
+  for (std::size_t pixel = 0; pixel < 9U; ++pixel) {
+    rgb[pixel * 3U] = 80U;
+    rgb[pixel * 3U + 1U] = 80U;
+    rgb[pixel * 3U + 2U] = 80U;
+  }
+  if (sampled_luma(rgb, 3, 3, "full") != 80) {
+    throw std::runtime_error("luma metering self-test changed a neutral frame");
+  }
+  std::vector<unsigned char> center_rgb(25U * 3U, 10U);
+  for (int y = 1; y < 4; ++y) {
+    for (int x = 1; x < 4; ++x) {
+      const auto offset = (static_cast<std::size_t>(y) * 5U + static_cast<std::size_t>(x)) * 3U;
+      center_rgb[offset] = 90U;
+      center_rgb[offset + 1U] = 90U;
+      center_rgb[offset + 2U] = 90U;
+    }
+  }
+  if (sampled_luma(center_rgb, 5, 5, "center") != 90) {
+    throw std::runtime_error("center metering self-test included the frame border");
+  }
+  std::cout << "aravis_imaging_self_test=passed\n";
 }
 
 enum class BayerColor { Red, Green, Blue };
@@ -409,6 +635,180 @@ std::vector<unsigned char> encode_jpeg(
   return output;
 }
 
+void discard_error(GError*& error) {
+  if (error != nullptr) {
+    g_error_free(error);
+    error = nullptr;
+  }
+}
+
+bool feature_available(ArvCamera* camera, const char* feature) {
+  GError* error = nullptr;
+  const auto available = arv_camera_is_feature_available(camera, feature, &error);
+  discard_error(error);
+  return available;
+}
+
+bool set_numeric_feature(ArvCamera* camera, const char* feature, double value) {
+  if (!feature_available(camera, feature)) return false;
+  GError* error = nullptr;
+  arv_camera_set_float(camera, feature, value, &error);
+  if (error == nullptr) return true;
+  discard_error(error);
+  arv_camera_set_integer(camera, feature, static_cast<gint64>(std::llround(value)), &error);
+  if (error == nullptr) return true;
+  discard_error(error);
+  return false;
+}
+
+template <std::size_t Size>
+bool set_first_numeric_feature(
+    ArvCamera* camera,
+    const std::array<const char*, Size>& features,
+    double value) {
+  for (const auto* feature : features) {
+    if (set_numeric_feature(camera, feature, value)) return true;
+  }
+  return false;
+}
+
+bool set_normalized_feature(ArvCamera* camera, const char* feature, double normalized) {
+  if (!feature_available(camera, feature)) return false;
+  normalized = std::clamp(normalized, 0.0, 1.0);
+  GError* error = nullptr;
+  double float_min = 0.0;
+  double float_max = 0.0;
+  arv_camera_get_float_bounds(camera, feature, &float_min, &float_max, &error);
+  if (error == nullptr && float_max >= float_min) {
+    arv_camera_set_float(camera, feature, float_min + normalized * (float_max - float_min), &error);
+    if (error == nullptr) return true;
+  }
+  discard_error(error);
+  gint64 integer_min = 0;
+  gint64 integer_max = 0;
+  arv_camera_get_integer_bounds(camera, feature, &integer_min, &integer_max, &error);
+  if (error == nullptr && integer_max >= integer_min) {
+    const auto value =
+        integer_min + static_cast<gint64>(std::llround(normalized * static_cast<double>(integer_max - integer_min)));
+    arv_camera_set_integer(camera, feature, value, &error);
+    if (error == nullptr) return true;
+  }
+  discard_error(error);
+  return false;
+}
+
+bool set_auto_target(ArvCamera* camera, int target_luma) {
+  constexpr std::array<const char*, 3> features{
+      "AutoTargetBrightness",
+      "AutoTargetValue",
+      "AutoTargetGreyValue",
+  };
+  for (const auto* feature : features) {
+    if (set_normalized_feature(camera, feature, static_cast<double>(target_luma) / 255.0)) return true;
+  }
+  return false;
+}
+
+bool exposure_auto_available(ArvCamera* camera) {
+  GError* error = nullptr;
+  const auto available = arv_camera_is_exposure_auto_available(camera, &error);
+  discard_error(error);
+  return available;
+}
+
+bool gain_auto_available(ArvCamera* camera) {
+  GError* error = nullptr;
+  const auto available = arv_camera_is_gain_auto_available(camera, &error);
+  discard_error(error);
+  return available;
+}
+
+bool set_exposure_auto(ArvCamera* camera, ArvAuto mode) {
+  if (!exposure_auto_available(camera)) return false;
+  GError* error = nullptr;
+  arv_camera_set_exposure_time_auto(camera, mode, &error);
+  if (error == nullptr) return true;
+  discard_error(error);
+  return false;
+}
+
+bool set_gain_auto(ArvCamera* camera, ArvAuto mode) {
+  if (!gain_auto_available(camera)) return false;
+  GError* error = nullptr;
+  arv_camera_set_gain_auto(camera, mode, &error);
+  if (error == nullptr) return true;
+  discard_error(error);
+  return false;
+}
+
+std::optional<std::pair<double, double>> exposure_bounds(ArvCamera* camera) {
+  GError* error = nullptr;
+  if (!arv_camera_is_exposure_time_available(camera, &error) || error != nullptr) {
+    discard_error(error);
+    return std::nullopt;
+  }
+  double minimum = 0.0;
+  double maximum = 0.0;
+  arv_camera_get_exposure_time_bounds(camera, &minimum, &maximum, &error);
+  if (error != nullptr || !std::isfinite(minimum) || !std::isfinite(maximum) || maximum < minimum) {
+    discard_error(error);
+    return std::nullopt;
+  }
+  return std::pair{minimum, maximum};
+}
+
+std::optional<std::pair<double, double>> gain_bounds(ArvCamera* camera) {
+  GError* error = nullptr;
+  if (!arv_camera_is_gain_available(camera, &error) || error != nullptr) {
+    discard_error(error);
+    return std::nullopt;
+  }
+  double minimum = 0.0;
+  double maximum = 0.0;
+  arv_camera_get_gain_bounds(camera, &minimum, &maximum, &error);
+  if (error != nullptr || !std::isfinite(minimum) || !std::isfinite(maximum) || maximum < minimum) {
+    discard_error(error);
+    return std::nullopt;
+  }
+  return std::pair{minimum, maximum};
+}
+
+std::optional<double> current_exposure(ArvCamera* camera) {
+  GError* error = nullptr;
+  const auto value = arv_camera_get_exposure_time(camera, &error);
+  if (error != nullptr || !std::isfinite(value)) {
+    discard_error(error);
+    return std::nullopt;
+  }
+  return value;
+}
+
+std::optional<double> current_gain(ArvCamera* camera) {
+  GError* error = nullptr;
+  const auto value = arv_camera_get_gain(camera, &error);
+  if (error != nullptr || !std::isfinite(value)) {
+    discard_error(error);
+    return std::nullopt;
+  }
+  return value;
+}
+
+bool set_exposure(ArvCamera* camera, double value) {
+  GError* error = nullptr;
+  arv_camera_set_exposure_time(camera, value, &error);
+  if (error == nullptr) return true;
+  discard_error(error);
+  return false;
+}
+
+bool set_gain(ArvCamera* camera, double value) {
+  GError* error = nullptr;
+  arv_camera_set_gain(camera, value, &error);
+  if (error == nullptr) return true;
+  discard_error(error);
+  return false;
+}
+
 class Camera {
  public:
   Camera(const DeviceDescription& device, const Arguments& arguments)
@@ -440,6 +840,7 @@ class Camera {
     arv_camera_set_frame_rate(camera_.get(), static_cast<double>(arguments.fps), &error);
     check_error(error, "set acquisition frame rate");
     arv_camera_set_acquisition_mode(camera_.get(), ARV_ACQUISITION_MODE_CONTINUOUS, nullptr);
+    configure_imaging(arguments);
     if (arv_camera_is_uv_device(camera_.get())) {
       arv_camera_uv_set_usb_mode(camera_.get(), ARV_UV_USB_MODE_ASYNC);
     }
@@ -488,13 +889,187 @@ class Camera {
       const int width = arv_buffer_get_image_width(buffer);
       const int height = arv_buffer_get_image_height(buffer);
       if (width != width_ || height != height_) throw std::runtime_error("camera frame dimensions changed while streaming");
-      return encode_jpeg(frame_to_rgb(buffer), width, height, jpeg_quality_);
+      const auto rgb = frame_to_rgb(buffer);
+      update_imaging(rgb);
+      return encode_jpeg(rgb, width, height, jpeg_quality_);
     }
   }
 
  private:
+  enum class ImagingMode { Disabled, Native, Software };
+
+  void configure_imaging(const Arguments& arguments) {
+    imaging_arguments_ = arguments;
+    diagnostics_interval_frames_ = std::max(arguments.fps * 5, arguments.update_interval_frames);
+    if (!arguments.auto_exposure && !arguments.auto_gain) return;
+
+    const auto device_exposure_bounds = exposure_bounds(camera_.get());
+    if (arguments.auto_exposure && device_exposure_bounds) {
+      imaging_bounds_.exposure_min_us =
+          std::max(arguments.exposure_min_us, device_exposure_bounds->first);
+      imaging_bounds_.exposure_max_us =
+          std::min(arguments.exposure_max_us, device_exposure_bounds->second);
+      imaging_bounds_.exposure_available =
+          imaging_bounds_.exposure_max_us >= imaging_bounds_.exposure_min_us;
+    }
+
+    const auto device_gain_bounds = gain_bounds(camera_.get());
+    if (arguments.auto_gain && device_gain_bounds) {
+      const auto range = device_gain_bounds->second - device_gain_bounds->first;
+      imaging_bounds_.gain_min =
+          device_gain_bounds->first + arguments.gain_min_fraction * range;
+      imaging_bounds_.gain_max =
+          device_gain_bounds->first + arguments.gain_max_fraction * range;
+      imaging_bounds_.gain_available = imaging_bounds_.gain_max >= imaging_bounds_.gain_min;
+    }
+
+    constexpr std::array<const char*, 2> exposure_lower_features{
+        "AutoExposureTimeLowerLimit",
+        "AutoExposureTimeAbsLowerLimit",
+    };
+    constexpr std::array<const char*, 2> exposure_upper_features{
+        "AutoExposureTimeUpperLimit",
+        "AutoExposureTimeAbsUpperLimit",
+    };
+    constexpr std::array<const char*, 2> gain_lower_features{
+        "AutoGainLowerLimit",
+        "AutoGainRawLowerLimit",
+    };
+    constexpr std::array<const char*, 2> gain_upper_features{
+        "AutoGainUpperLimit",
+        "AutoGainRawUpperLimit",
+    };
+
+    // Generic camera auto-exposure uses the camera's full-frame metering
+    // defaults. Keep center metering in the software loop so the configured
+    // mode is never silently ignored.
+    bool native_ready =
+        arguments.metering == "full" && set_auto_target(camera_.get(), arguments.target_luma);
+    if (arguments.auto_exposure) {
+      native_ready =
+          native_ready && imaging_bounds_.exposure_available &&
+          set_first_numeric_feature(
+              camera_.get(), exposure_lower_features, imaging_bounds_.exposure_min_us) &&
+          set_first_numeric_feature(
+              camera_.get(), exposure_upper_features, imaging_bounds_.exposure_max_us);
+    }
+    if (arguments.auto_gain) {
+      native_ready =
+          native_ready && imaging_bounds_.gain_available &&
+          set_first_numeric_feature(camera_.get(), gain_lower_features, imaging_bounds_.gain_min) &&
+          set_first_numeric_feature(camera_.get(), gain_upper_features, imaging_bounds_.gain_max);
+    }
+
+    bool native_exposure_enabled = false;
+    bool native_gain_enabled = false;
+    if (native_ready) {
+      native_exposure_enabled =
+          !arguments.auto_exposure || set_exposure_auto(camera_.get(), ARV_AUTO_CONTINUOUS);
+      native_gain_enabled = !arguments.auto_gain || set_gain_auto(camera_.get(), ARV_AUTO_CONTINUOUS);
+      if (native_exposure_enabled && native_gain_enabled) {
+        imaging_mode_ = ImagingMode::Native;
+        log_imaging_state("aravis_imaging_configured", -1);
+        return;
+      }
+    }
+
+    if (arguments.auto_exposure) static_cast<void>(set_exposure_auto(camera_.get(), ARV_AUTO_OFF));
+    if (arguments.auto_gain) static_cast<void>(set_gain_auto(camera_.get(), ARV_AUTO_OFF));
+
+    if (imaging_bounds_.exposure_available) {
+      const auto initial = current_exposure(camera_.get()).value_or(imaging_bounds_.exposure_min_us);
+      imaging_state_.exposure_us =
+          std::clamp(initial, imaging_bounds_.exposure_min_us, imaging_bounds_.exposure_max_us);
+      if (!set_exposure(camera_.get(), imaging_state_.exposure_us)) {
+        imaging_bounds_.exposure_available = false;
+      }
+    }
+    if (imaging_bounds_.gain_available) {
+      const auto initial = current_gain(camera_.get()).value_or(imaging_bounds_.gain_min);
+      imaging_state_.gain = std::clamp(initial, imaging_bounds_.gain_min, imaging_bounds_.gain_max);
+      if (!set_gain(camera_.get(), imaging_state_.gain)) imaging_bounds_.gain_available = false;
+    }
+
+    imaging_mode_ =
+        imaging_bounds_.exposure_available || imaging_bounds_.gain_available
+        ? ImagingMode::Software
+        : ImagingMode::Disabled;
+    log_imaging_state(
+        imaging_mode_ == ImagingMode::Software
+            ? "aravis_imaging_software_fallback"
+            : "aravis_imaging_unavailable",
+        -1);
+  }
+
+  void update_imaging(const std::vector<unsigned char>& rgb) {
+    ++imaging_frame_count_;
+    if (imaging_mode_ == ImagingMode::Disabled) return;
+    const bool adjustment_due =
+        imaging_frame_count_ % static_cast<std::uint64_t>(imaging_arguments_.update_interval_frames) == 0;
+    const bool diagnostics_due =
+        imaging_frame_count_ % static_cast<std::uint64_t>(diagnostics_interval_frames_) == 0;
+    if (!adjustment_due && !diagnostics_due) return;
+
+    const auto luma = sampled_luma(rgb, width_, height_, imaging_arguments_.metering);
+    if (imaging_mode_ == ImagingMode::Software && adjustment_due) {
+      const auto adjustment =
+          next_imaging_adjustment(imaging_arguments_, luma, imaging_bounds_, imaging_state_);
+      if (adjustment.exposure_changed) {
+        if (set_exposure(camera_.get(), adjustment.state.exposure_us)) {
+          imaging_state_.exposure_us = adjustment.state.exposure_us;
+        } else {
+          imaging_bounds_.exposure_available = false;
+        }
+      }
+      if (adjustment.gain_changed) {
+        if (set_gain(camera_.get(), adjustment.state.gain)) {
+          imaging_state_.gain = adjustment.state.gain;
+        } else {
+          imaging_bounds_.gain_available = false;
+        }
+      }
+      if (!imaging_bounds_.exposure_available && !imaging_bounds_.gain_available) {
+        imaging_mode_ = ImagingMode::Disabled;
+        log_imaging_state("aravis_imaging_disabled_after_error", luma);
+        return;
+      }
+    }
+    if (diagnostics_due) log_imaging_state("aravis_imaging_status", luma);
+  }
+
+  void log_imaging_state(std::string_view event, int luma) {
+    auto exposure = imaging_state_.exposure_us;
+    auto gain = imaging_state_.gain;
+    if (imaging_mode_ == ImagingMode::Native) {
+      exposure = current_exposure(camera_.get()).value_or(exposure);
+      gain = current_gain(camera_.get()).value_or(gain);
+    }
+    const char* mode = "disabled";
+    if (imaging_mode_ == ImagingMode::Native) mode = "native";
+    else if (imaging_mode_ == ImagingMode::Software) mode = "software";
+    std::cerr << std::fixed << std::setprecision(2)
+              << "{\"event\":\"" << event
+              << "\",\"mode\":\"" << mode
+              << "\",\"target_luma\":" << imaging_arguments_.target_luma
+              << ",\"metering\":\"" << imaging_arguments_.metering << '"'
+              << ",\"luma\":" << luma
+              << ",\"exposure_us\":" << exposure
+              << ",\"exposure_min_us\":" << imaging_bounds_.exposure_min_us
+              << ",\"exposure_max_us\":" << imaging_bounds_.exposure_max_us
+              << ",\"gain\":" << gain
+              << ",\"gain_min\":" << imaging_bounds_.gain_min
+              << ",\"gain_max\":" << imaging_bounds_.gain_max
+              << "}\n";
+  }
+
   std::unique_ptr<ArvCamera, GObjectUnref> camera_;
   std::unique_ptr<ArvStream, GObjectUnref> stream_;
+  Arguments imaging_arguments_;
+  ImagingBounds imaging_bounds_;
+  ImagingState imaging_state_;
+  ImagingMode imaging_mode_{ImagingMode::Disabled};
+  std::uint64_t imaging_frame_count_{0};
+  int diagnostics_interval_frames_{150};
   int timeout_ms_{0};
   int jpeg_quality_{80};
   int width_{0};
@@ -508,6 +1083,10 @@ class Camera {
 int main(int argc, char** argv) {
   try {
     const auto arguments = parse_arguments(argc, argv);
+    if (arguments.self_test) {
+      run_imaging_self_test();
+      return 0;
+    }
     AravisLifecycle lifecycle;
     const auto devices = enumerate_devices();
     if (arguments.list) {

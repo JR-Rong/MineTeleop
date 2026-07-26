@@ -96,6 +96,20 @@ std::vector<std::string> build_vendor_bridge_command(const CameraConfig& camera,
                                       "--frames", "0",
                                       "--jpeg-quality", environment_or("MINE_TELEOP_ARAVIS_JPEG_QUALITY", "80"),
                                   });
+    if (camera.imaging.auto_exposure) command.push_back("--auto-exposure");
+    if (camera.imaging.auto_gain) command.push_back("--auto-gain");
+    if (camera.imaging.auto_exposure || camera.imaging.auto_gain) {
+      command.insert(command.end(), {
+                                        "--target-luma", std::to_string(camera.imaging.target_luma),
+                                        "--luma-deadband", std::to_string(camera.imaging.luma_deadband),
+                                        "--exposure-min-us", std::to_string(camera.imaging.exposure_min_us),
+                                        "--exposure-max-us", std::to_string(camera.imaging.exposure_max_us),
+                                        "--gain-min-fraction", std::to_string(camera.imaging.gain_min_fraction),
+                                        "--gain-max-fraction", std::to_string(camera.imaging.gain_max_fraction),
+                                        "--update-interval-frames", std::to_string(camera.imaging.update_interval_frames),
+                                        "--metering", camera.imaging.metering,
+                                    });
+    }
     return command;
   }
 
