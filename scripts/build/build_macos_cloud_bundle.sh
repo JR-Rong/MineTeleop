@@ -3,10 +3,23 @@ set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
-platform="${1:-linux/amd64}"
+run_tests="OFF"
+positional_args=()
+for argument in "$@"; do
+  if [[ "$argument" == "test" ]]; then
+    run_tests="ON"
+  else
+    positional_args+=("$argument")
+  fi
+done
+if [[ "${#positional_args[@]}" -gt 2 ]]; then
+  printf 'usage: %s [test] [platform] [output-directory]\n' "$0" >&2
+  exit 2
+fi
+platform="${positional_args[0]:-linux/amd64}"
 build_jobs="${MINE_TELEOP_BUILD_JOBS:-2}"
 package_timestamp="$(date -u +%Y%m%d-%H%M%S)"
-output_root="${2:-$repo_root/dist/mine-teleop-cloud-ubuntu22.04-x64-$package_timestamp}"
+output_root="${positional_args[1]:-$repo_root/dist/mine-teleop-cloud-ubuntu22.04-x64-$package_timestamp}"
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/mine-teleop-cloud-build.XXXXXX")"
 
 cleanup() {
@@ -43,6 +56,7 @@ printf '==> building Mine Teleop cloud package for %s\n' "$platform"
 docker buildx build \
   --platform "$platform" \
   --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
+  --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
   --build-arg "MINE_TELEOP_SOURCE_COMMIT=$source_commit" \
   --build-arg "MINE_TELEOP_BUILT_AT_UTC=$built_at_utc" \
   --build-arg "MINE_TELEOP_TARGET_PLATFORM=$platform" \
@@ -51,16 +65,18 @@ docker buildx build \
   -f "$repo_root/deployments/cloud/Dockerfile.build" \
   "$repo_root"
 
-printf '==> validating extracted package in Ubuntu 22.04 amd64\n'
-COPYFILE_DISABLE=1 tar --no-xattrs -C "$temporary/artifact" -cf - . \
-  | docker run --rm -i \
-      --platform "$platform" \
-      ubuntu:22.04 \
-      bash -c '
-        mkdir -p /opt/mine-teleop
-        tar -C /opt/mine-teleop -xf -
-        exec /opt/mine-teleop/deploy-cloud.sh --self-test
-      '
+if [[ "$run_tests" == "ON" ]]; then
+  printf '==> validating extracted package in Ubuntu 22.04 amd64\n'
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$temporary/artifact" -cf - . \
+    | docker run --rm -i \
+        --platform "$platform" \
+        ubuntu:22.04 \
+        bash -c '
+          mkdir -p /opt/mine-teleop
+          tar -C /opt/mine-teleop -xf -
+          exec /opt/mine-teleop/deploy-cloud.sh --self-test
+        '
+fi
 
 mv "$temporary/artifact" "$output_root"
 

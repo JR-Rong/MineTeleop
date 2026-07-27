@@ -3,14 +3,27 @@ set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
-platform="${1:-linux/amd64}"
+run_tests="OFF"
+positional_args=()
+for argument in "$@"; do
+  if [[ "$argument" == "test" ]]; then
+    run_tests="ON"
+  else
+    positional_args+=("$argument")
+  fi
+done
+if [[ "${#positional_args[@]}" -gt 2 ]]; then
+  printf 'usage: %s [test] [platform] [output-directory]\n' "$0" >&2
+  exit 2
+fi
+platform="${positional_args[0]:-linux/amd64}"
 architecture="${platform#linux/}"
 case "$architecture" in
   amd64) package_architecture="x64" ;;
   *) package_architecture="$architecture" ;;
 esac
 package_timestamp="$(date -u +%Y%m%d-%H%M%S)"
-output_root="${2:-$repo_root/dist/mine-teleop-vehicle-ubuntu22.04-$package_architecture-$package_timestamp}"
+output_root="${positional_args[1]:-$repo_root/dist/mine-teleop-vehicle-ubuntu22.04-$package_architecture-$package_timestamp}"
 image="mine-teleop-cpp-ubuntu22.04:$architecture"
 build_image="$image-build"
 build_jobs="${MINE_TELEOP_BUILD_JOBS:-2}"
@@ -49,19 +62,23 @@ if [[ -z "$base_bundle_archive" ]]; then
   docker buildx build \
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
+    --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
     --target runtime \
     --load \
     -t "$image" \
     -f "$repo_root/deployments/cpp/Dockerfile.build" \
     "$repo_root"
 
-  docker run --rm "$image" version
-  docker run --rm "$image" config-check \
-    --config /opt/mine-teleop/config/vehicle-agent.yaml
+  if [[ "$run_tests" == "ON" ]]; then
+    docker run --rm "$image" version
+    docker run --rm "$image" config-check \
+      --config /opt/mine-teleop/config/vehicle-agent.yaml
+  fi
 
   docker buildx build \
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
+    --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
     --target artifact \
     --output "type=local,dest=$temporary/artifact" \
     -f "$repo_root/deployments/cpp/Dockerfile.build" \
@@ -107,16 +124,19 @@ else
   docker buildx build \
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
+    --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
     --target build \
     --load \
     -t "$build_image" \
     -f "$repo_root/deployments/cpp/Dockerfile.build" \
     "$repo_root"
-  docker run --rm --platform "$platform" "$build_image" \
-    /opt/mine-teleop/bin/mine-teleop version
-  docker run --rm --platform "$platform" "$build_image" \
-    /opt/mine-teleop/bin/mine-teleop config-check \
-    --config /opt/mine-teleop/share/mine-teleop/configs/vehicle-agent.dev.yaml
+  if [[ "$run_tests" == "ON" ]]; then
+    docker run --rm --platform "$platform" "$build_image" \
+      /opt/mine-teleop/bin/mine-teleop version
+    docker run --rm --platform "$platform" "$build_image" \
+      /opt/mine-teleop/bin/mine-teleop config-check \
+      --config /opt/mine-teleop/share/mine-teleop/configs/vehicle-agent.dev.yaml
+  fi
 
   mkdir -p "$output_root"
   cp -a "${base_roots[0]}/." "$output_root/"
@@ -140,7 +160,7 @@ printf '%s\n' \
   "vehicle_config=$(basename "$vehicle_config")" \
   "third_party_runtime_source=$third_party_runtime_source" \
   "third_party_runtime_sha256=$third_party_runtime_sha256" \
-  "runtime_tests_executed=yes" \
+  "runtime_tests_executed=$([[ "$run_tests" == "ON" ]] && printf yes || printf no)" \
   "built_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   >"$output_root/BUILD-INFO.txt"
 archive="$output_root.tar.gz"
@@ -155,6 +175,8 @@ else
   shasum -a 256 "$archive" > "$archive.sha256"
 fi
 
-"$repo_root/scripts/test/check_cpp_ubuntu_bundle.sh" "$archive"
+if [[ "$run_tests" == "ON" ]]; then
+  "$repo_root/scripts/test/check_cpp_ubuntu_bundle.sh" "$archive"
+fi
 printf 'BUNDLE_DIR=%s\n' "$output_root"
 printf 'BUNDLE_ARCHIVE=%s\n' "$archive"

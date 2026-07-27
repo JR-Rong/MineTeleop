@@ -2,7 +2,20 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-output_dir="${1:-$repo_root/dist}"
+run_tests="OFF"
+positional_args=()
+for argument in "$@"; do
+  if [[ "$argument" == "test" ]]; then
+    run_tests="ON"
+  else
+    positional_args+=("$argument")
+  fi
+done
+if [[ "${#positional_args[@]}" -gt 1 ]]; then
+  printf 'usage: %s [test] [output-directory]\n' "$0" >&2
+  exit 2
+fi
+output_dir="${positional_args[0]:-$repo_root/dist}"
 host_machine_arch="$(uname -m)"
 requested_arch="${MINE_TELEOP_MACOS_ARCH:-$host_machine_arch}"
 case "$requested_arch" in
@@ -10,13 +23,8 @@ case "$requested_arch" in
   x64|x86_64) package_arch="x64"; cmake_arch="x86_64" ;;
   *) echo "unsupported MINE_TELEOP_MACOS_ARCH: $requested_arch (expected arm64 or x64)" >&2; exit 2 ;;
 esac
-skip_run_tests="${MINE_TELEOP_SKIP_RUN_TESTS:-0}"
-if [[ "$skip_run_tests" != "0" && "$skip_run_tests" != "1" ]]; then
-  echo "MINE_TELEOP_SKIP_RUN_TESTS must be 0 or 1" >&2
-  exit 2
-fi
-if [[ "$cmake_arch" != "$host_machine_arch" && "$skip_run_tests" != "1" ]]; then
-  echo "target $package_arch cannot be executed on host $host_machine_arch; install Rosetta or set MINE_TELEOP_SKIP_RUN_TESTS=1 for a clearly marked build-only package" >&2
+if [[ "$cmake_arch" != "$host_machine_arch" && "$run_tests" == "ON" ]]; then
+  echo "target $package_arch cannot be tested on host $host_machine_arch; install Rosetta or omit the test argument for a build-only package" >&2
   exit 2
 fi
 
@@ -41,7 +49,7 @@ cmake_args=(
   -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=OFF
   -DMINE_TELEOP_BUILD_CONTROL_CLIENT=ON
   -DMINE_TELEOP_BUILD_SIGNALING_SERVER=OFF
-  -DMINE_TELEOP_BUILD_TESTS=ON
+  "-DMINE_TELEOP_BUILD_TESTS=$run_tests"
   -DMINE_TELEOP_FETCH_MISSING_DEPS=ON
 )
 if [[ -n "${FETCHCONTENT_SOURCE_DIR_YAML_CPP:-}" ]]; then
@@ -51,19 +59,16 @@ if [[ -n "${FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON:-}" ]]; then
   cmake_args+=("-DFETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON=$FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON")
 fi
 
-if [[ "$reused_build_dir" == "no" ]]; then
-  cmake "${cmake_args[@]}"
-elif [[ ! -f "$build_dir/CMakeCache.txt" ]]; then
+if [[ "$reused_build_dir" == "yes" && ! -f "$build_dir/CMakeCache.txt" ]]; then
   echo "MINE_TELEOP_MACOS_BUILD_DIR is not a configured CMake build directory: $build_dir" >&2
   exit 2
 fi
+cmake "${cmake_args[@]}"
 cmake --build "$build_dir" --parallel "${MINE_TELEOP_BUILD_JOBS:-4}"
-tests_executed="yes"
-if [[ "$skip_run_tests" == "1" ]]; then
-  tests_executed="no (cross-compiled build only)"
-  echo "warning: runtime tests skipped for $package_arch" >&2
-else
+tests_executed="no"
+if [[ "$run_tests" == "ON" ]]; then
   ctest --test-dir "$build_dir" --output-on-failure
+  tests_executed="yes"
 fi
 
 install -m 0755 "$build_dir/mine-teleop-control" "$package_root/bin/mine-teleop-control"
@@ -103,6 +108,8 @@ fi
 archive="$output_dir/$package_name.tar.gz"
 tar -czf "$archive" -C "$build_root" "$package_name"
 shasum -a 256 "$archive" | tee "$archive.sha256"
-"$repo_root/scripts/test/check_macos_control_bundle.sh" "$archive"
+if [[ "$run_tests" == "ON" ]]; then
+  "$repo_root/scripts/test/check_macos_control_bundle.sh" "$archive"
+fi
 echo "macos_control_bundle=$archive"
 echo "macos_control_bundle_root=$package_root"

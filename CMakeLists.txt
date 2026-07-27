@@ -13,7 +13,7 @@ else()
   set(MINE_TELEOP_VEHICLE_DEFAULT ON)
 endif()
 
-option(MINE_TELEOP_BUILD_TESTS "Build the native C++ test suites" ON)
+option(MINE_TELEOP_BUILD_TESTS "Build the native C++ test suites" OFF)
 option(MINE_TELEOP_BUILD_CONTROL_CLIENT "Build the portable control client" ON)
 option(MINE_TELEOP_BUILD_SIGNALING_SERVER "Build the standalone signaling server" ON)
 option(MINE_TELEOP_BUILD_VEHICLE_RUNTIME "Build Linux vehicle media and packaging targets" ${MINE_TELEOP_VEHICLE_DEFAULT})

@@ -21,6 +21,7 @@ fi
 docker build \
   --platform "$platform" \
   --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
+  --build-arg "MINE_TELEOP_BUILD_TESTS=ON" \
   --target build \
   -t "$build_image" \
   -f "$repo_root/deployments/cpp/Dockerfile.build" \
@@ -34,6 +35,7 @@ if [[ "$target_arch" == "amd64" ]]; then
   docker build \
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
+    --build-arg "MINE_TELEOP_BUILD_TESTS=ON" \
     --target runtime \
     -t "$image" \
     -f "$repo_root/deployments/cpp/Dockerfile.build" \

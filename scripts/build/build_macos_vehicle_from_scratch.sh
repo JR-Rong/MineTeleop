@@ -3,9 +3,22 @@ set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
-platform="${1:-linux/amd64}"
+run_tests="OFF"
+positional_args=()
+for argument in "$@"; do
+  if [[ "$argument" == "test" ]]; then
+    run_tests="ON"
+  else
+    positional_args+=("$argument")
+  fi
+done
+if [[ "${#positional_args[@]}" -gt 2 ]]; then
+  printf 'usage: %s [test] [platform] [output-directory]\n' "$0" >&2
+  exit 2
+fi
+platform="${positional_args[0]:-linux/amd64}"
 package_timestamp="$(date -u +%Y%m%d-%H%M%S)"
-output_root="${2:-$repo_root/dist/mine-teleop-vehicle-ubuntu22.04-x64-$package_timestamp}"
+output_root="${positional_args[1]:-$repo_root/dist/mine-teleop-vehicle-ubuntu22.04-x64-$package_timestamp}"
 build_jobs="${MINE_TELEOP_BUILD_JOBS:-1}"
 vehicle_config="${MINE_TELEOP_VEHICLE_CONFIG:-$repo_root/configs/vehicle-agent.three-machine.field.yaml}"
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/mine-teleop-vehicle-from-scratch.XXXXXX")"
@@ -47,6 +60,7 @@ printf '==> no MINE_TELEOP_BASE_BUNDLE_ARCHIVE is used\n'
 docker buildx build \
   --platform "$platform" \
   --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
+  --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
   --build-arg "MINE_TELEOP_SOURCE_COMMIT=$source_commit" \
   --build-arg "MINE_TELEOP_BUILT_AT_UTC=$built_at_utc" \
   --target artifact \
@@ -76,7 +90,7 @@ printf '%s\n' \
   "vehicle_config=$(basename "$vehicle_config")" \
   'third_party_runtime_source=ubuntu-22.04-packages+source-built-libsrtp' \
   'third_party_runtime_sha256=not-applicable' \
-  'runtime_tests_executed=yes' \
+  "runtime_tests_executed=$([[ "$run_tests" == "ON" ]] && printf yes || printf no)" \
   "built_at_utc=$built_at_utc" \
   > "$output_root/BUILD-INFO.txt"
 
@@ -92,7 +106,9 @@ else
   shasum -a 256 "$archive" > "$archive.sha256"
 fi
 
-"$repo_root/scripts/test/check_cpp_ubuntu_bundle.sh" "$archive"
+if [[ "$run_tests" == "ON" ]]; then
+  "$repo_root/scripts/test/check_cpp_ubuntu_bundle.sh" "$archive"
+fi
 printf 'VEHICLE_BUNDLE_DIR=%s\n' "$output_root"
 printf 'VEHICLE_BUNDLE_ARCHIVE=%s\n' "$archive"
 printf 'VEHICLE_BUNDLE_SHA256=%s\n' "$archive.sha256"
