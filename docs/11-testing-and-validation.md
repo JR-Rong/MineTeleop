@@ -36,10 +36,10 @@ scripts/test/check.sh
 ### 3. Ubuntu 车端成品
 
 ```bash
-scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64
+scripts/build/build_cpp_ubuntu_bundle.sh test linux/amd64
 ```
 
-构建脚本生成带 SHA-256 的自包含压缩包，并自动调用
+`test` 模式生成带 SHA-256 的自包含压缩包，并自动调用
 `scripts/test/check_cpp_ubuntu_bundle.sh`。成品门禁校验架构、动态库、GStreamer
 插件、配置、启动器和基础运行命令。
 
@@ -62,7 +62,7 @@ scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64
 ### 4. macOS 控制端
 
 ```bash
-scripts/build/build_macos_control_bundle.sh
+scripts/build/build_macos_control_bundle.sh test
 ```
 
 原生架构必须通过编译、CTest、签名、依赖、回环监听、端口冲突、页面脚本、

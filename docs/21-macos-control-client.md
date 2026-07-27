@@ -10,7 +10,13 @@
 scripts/build/build_macos_control_bundle.sh
 ```
 
-脚本会执行以下门禁：
+默认只构建、签名和打包，不编译或运行测试。要执行完整测试门禁：
+
+```bash
+scripts/build/build_macos_control_bundle.sh test
+```
+
+`test` 模式会执行以下门禁：
 
 1. 固定提交的 `yaml-cpp` 与 `nlohmann-json` 依赖配置；
 2. `mine-teleop-control` 和控制端测试原生编译；
@@ -51,8 +57,8 @@ scripts/test/check_macos_control_bundle.sh \
   dist/mine-teleop-control-macos-arm64-YYYYMMDD-HHMMSS.tar.gz
 ```
 
-带 `runtime_tests_executed=no` 的交叉编译包只执行签名、架构、依赖和内容检查，
-不会伪装成目标架构运行验收。
+带 `runtime_tests_executed=no` 的默认构建包没有执行测试，不会伪装成已完成运行
+验收。对已有包单独运行上述成品验收脚本时，仍会执行签名、架构、依赖和内容检查。
 
 ## 解压启动
 

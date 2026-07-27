@@ -51,17 +51,24 @@ docker build --target build \
 scripts/test/check.sh
 ```
 
-The build runs the native CTest suite, configuration validation, a deterministic
-safety timeout loop, authenticated driver-to-vehicle signaling, a native C++
-test-source frame path, and atomic uploader checks.
+The build scripts compile and package only by default. Pass the exact `test`
+argument to a build script to compile its test targets and run its test gates.
+`scripts/test/check.sh` remains the explicit full validation entrypoint.
 
 ### macOS cloud bundle
 
-Build and test the Ubuntu 22.04 x86_64 cloud package from an Intel or Apple
-Silicon Mac with Docker Desktop:
+Build the Ubuntu 22.04 x86_64 cloud package from an Intel or Apple Silicon Mac
+with Docker Desktop:
 
 ```bash
 scripts/build/build_macos_cloud_bundle.sh
+```
+
+Append `test` to compile and run the native tests and the extracted-package
+self-test:
+
+```bash
+scripts/build/build_macos_cloud_bundle.sh test
 ```
 
 This uses a dedicated signaling-only Dockerfile and does not build GStreamer,
@@ -75,11 +82,17 @@ separately in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ### macOS control client
 
-Build, test, sign, and package the native control client without GStreamer or
-camera dependencies:
+Build, sign, and package the native control client without GStreamer or camera
+dependencies:
 
 ```bash
 scripts/build/build_macos_control_bundle.sh
+```
+
+To compile and run the test targets and validate the final archive:
+
+```bash
+scripts/build/build_macos_control_bundle.sh test
 ```
 
 The generated `dist/mine-teleop-control-macos-arm64-*.tar.gz` contains the
@@ -87,11 +100,11 @@ executable, shared YAML, protocol-v1 vectors, CA bundle, build proof, and
 `run-control.command`. It uses the macOS Security/CommonCrypto system APIs and
 does not require Homebrew libraries. The process binds only to `127.0.0.1`, opens
 the default browser, and emits a clear error if the configured port is busy.
-Every build also runs `scripts/test/check_macos_control_bundle.sh` against the final
-archive. All targets verify checksum, signature, architecture, dependencies, and
-contents; native builds additionally verify extracted startup, loopback and
-port-conflict behavior, page syntax, the redacted local event log, and clean
-shutdown. A cross-compiled build stops after static checks and remains build-only.
+With `test`, the script also runs `scripts/test/check_macos_control_bundle.sh`
+against the final archive. It verifies checksum, signature, architecture,
+dependencies, contents, extracted startup, loopback and port-conflict behavior,
+page syntax, the redacted local event log, and clean shutdown. A default build
+does not run these tests and records `runtime_tests_executed=no`.
 The native client keeps tokens outside browser JavaScript, uses HTTPS for the
 session API, and uses real WSS push/ack for offer/answer/ICE signaling. Server
 push remains queued until an authenticated delivery-cursor ACK; reconnects
@@ -174,10 +187,10 @@ vehicle forced offline and uncontrollable; it never restores the old session or
 control authority. Only a newly created control token is accepted by the
 vehicle receiver.
 
-Use `MINE_TELEOP_MACOS_ARCH=x64` for an Intel build. When cross-compiling on an
-Apple Silicon host without Rosetta, add `MINE_TELEOP_SKIP_RUN_TESTS=1`; the
-resulting `BUILD-INFO.txt` explicitly records that it is build-only and still
-requires runtime acceptance on an Intel Mac or a Rosetta-enabled host.
+Use `MINE_TELEOP_MACOS_ARCH=x64` for an Intel build. A default cross-compiled
+build records `runtime_tests_executed=no` and still requires runtime acceptance
+on an Intel Mac or a Rosetta-enabled host. Passing `test` is rejected when the
+target architecture cannot run on the current host.
 
 ## Self-contained Ubuntu x64 vehicle bundle
 
@@ -191,8 +204,9 @@ scripts/build/build_macos_vehicle_from_scratch.sh
 This path starts from a clean Ubuntu 22.04 amd64 container, installs the
 distribution's GStreamer/WebRTC, VAAPI, NVCodec, and Aravis packages, builds
 the small pinned OpenSSL libsrtp compatibility library and all current Mine
-Teleop C++ targets from source, runs CTest, collects the runtime dependency
-closure, and validates the exact final archive. It avoids the unreliable
+Teleop C++ targets from source, and collects the runtime dependency closure.
+Pass `test` to compile the test targets, run CTest, and validate the exact final
+archive. It avoids the unreliable
 ARM-to-x86 QEMU build of the complete GStreamer source tree. The original
 command automatically selects this path on Apple Silicon when no
 `MINE_TELEOP_BASE_BUNDLE_ARCHIVE` is set:
@@ -201,10 +215,16 @@ command automatically selects this path on Apple Silicon when no
 scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64
 ```
 
+Build and run tests with:
+
+```bash
+scripts/build/build_cpp_ubuntu_bundle.sh test linux/amd64
+```
+
 The script emits
 `dist/mine-teleop-vehicle-ubuntu22.04-x64-YYYYMMDD-HHMMSS.tar.gz`, its SHA-256
-file, and runs `scripts/test/check_cpp_ubuntu_bundle.sh` against that exact archive
-inside a fresh Ubuntu 22.04 amd64 container. The exported artifact contains
+file. In `test` mode it runs `scripts/test/check_cpp_ubuntu_bundle.sh` against
+that exact archive inside a fresh Ubuntu 22.04 amd64 container. The exported artifact contains
 x86-64 ELF executables and shared libraries under `bin/` and `lib/`, plus the
 field vehicle configuration, CA roots, Basler udev helper, protocol files,
 README, and build proof. It carries GStreamer WebRTC/RTP/MP4 plugins, Intel's
@@ -220,15 +240,15 @@ On a native x86_64 Linux builder, `scripts/build/build_cpp_ubuntu_bundle.sh` ret
 the pinned third-party source-build path. When only application code changed,
 a checksum-verified accepted bundle can
 provide the unchanged third-party media runtime while every native binary is
-rebuilt and retested from current source:
+rebuilt from current source:
 
 ```bash
 MINE_TELEOP_BASE_BUNDLE_ARCHIVE=/path/to/accepted-vehicle-bundle.tar.gz \
   scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64
 ```
 
-`BUILD-INFO.txt` records the base archive name, and the final archive still
-runs the complete clean-container package gate.
+`BUILD-INFO.txt` records the base archive name and whether tests ran. Add
+`test` to run the complete clean-container package gate.
 
 For the chassis integration or licensed Hikrobot cameras, place redistributable
 files under `vendor/chassis` or `vendor/mvs` before building. See
