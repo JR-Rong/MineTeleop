@@ -1,0 +1,33 @@
+FROM ubuntu:22.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        pkg-config \
+        python3-pip \
+    && python3 -m pip install --no-cache-dir cmake==3.28.3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG MINE_TELEOP_BUILD_JOBS=2
+ARG MINE_TELEOP_BUILD_TESTS=OFF
+
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B /tmp/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=OFF \
+      -DMINE_TELEOP_BUILD_CONTROL_CLIENT=ON \
+      -DMINE_TELEOP_BUILD_SIGNALING_SERVER=OFF \
+      -DMINE_TELEOP_BUILD_TESTS="$MINE_TELEOP_BUILD_TESTS" \
+      -DMINE_TELEOP_FETCH_MISSING_DEPS=ON \
+    && cmake --build /tmp/build --parallel "$MINE_TELEOP_BUILD_JOBS" \
+    && if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \
+         ctest --test-dir /tmp/build --output-on-failure; \
+       fi
+
+FROM scratch AS artifact
+COPY --from=build /tmp/build/mine-teleop-control /bin/mine-teleop-control
