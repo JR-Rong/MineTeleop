@@ -283,6 +283,7 @@ struct VehicleMediaRuntime::Impl {
     auto* self = static_cast<Impl*>(user_data);
     self->control_link_open = true;
     self->control_link_ever_opened = true;
+    self->send_vcu_handshake_status("driver_connected");
     std::cout << Json({
                      {"event", "vehicle_control_data_channel_open"},
                      {"event_at_utc_ms", self->signaling.now_ms()},
@@ -399,7 +400,36 @@ struct VehicleMediaRuntime::Impl {
       return;
     }
     try {
-      const auto command = ControlCommand::from_json(Json::parse(data));
+      const auto message = Json::parse(data);
+      if (message.value("event", "") == "vcu_handshake_command") {
+        const auto action = message.value("action", "");
+        std::lock_guard lock(control_mutex);
+        if (!control_service_started || !control_service || !control_link_open) {
+          send_vcu_handshake_status_locked("driver_not_connected");
+          return;
+        }
+        bool accepted = false;
+        if (action == "connect") {
+          accepted = control_service->request_vcu_handshake();
+        } else if (action == "disconnect") {
+          accepted = control_service->disconnect_vcu_handshake();
+        }
+        std::cout << Json({
+                         {"event", "vehicle_vcu_handshake_command"},
+                         {"event_at_utc_ms", signaling.now_ms()},
+                         {"vehicle_id", config.vehicle_id},
+                         {"driver_id", signaling.driver_id()},
+                         {"session_id", signaling.session_id()},
+                         {"action", action},
+                         {"accepted", accepted},
+                         {"vcu_handshake", control_service->vcu_handshake_status().to_json()},
+                     }).dump()
+                  << '\n';
+        send_vcu_handshake_status_locked(
+            accepted ? "command_accepted" : "command_rejected");
+        return;
+      }
+      const auto command = ControlCommand::from_json(message);
       std::lock_guard lock(control_mutex);
       if (!control_service_started || !control_service || !control_link_open) {
         ++rejected_control_commands;
@@ -426,19 +456,28 @@ struct VehicleMediaRuntime::Impl {
         ++rejected_control_commands;
       }
       if (config.runtime.control_log_commands) {
-        std::cout << Json({
-                         {"event", "vehicle_data_channel_control_received"},
-                         {"protocol_version", command.protocol_version},
-                         {"vehicle_id", command.vehicle_id},
-                         {"driver_id", command.driver_id},
-                         {"session_id", command.session_id},
-                         {"seq", command.seq},
-                         {"sent_at_utc_ms", command.sent_at_utc_ms},
-                         {"received_at_utc_ms", received_at_ms},
-                         {"accepted", result.accepted},
-                         {"reason", result.reason},
-                     }).dump()
-                  << '\n';
+        Json entry = {
+            {"event", "vehicle_data_channel_control_received"},
+            {"protocol_version", command.protocol_version},
+            {"vehicle_id", command.vehicle_id},
+            {"driver_id", command.driver_id},
+            {"session_id", command.session_id},
+            {"seq", command.seq},
+            {"sent_at_utc_ms", command.sent_at_utc_ms},
+            {"received_at_utc_ms", received_at_ms},
+            {"accepted", result.accepted},
+            {"reason", result.reason},
+            {"requested_steering", command.steering},
+            {"requested_throttle", command.throttle},
+            {"requested_brake", command.brake},
+            {"warnings", result.warnings},
+        };
+        if (result.command) {
+          entry["effective_steering"] = result.command->steering;
+          entry["effective_throttle"] = result.command->throttle;
+          entry["effective_brake"] = result.command->brake;
+        }
+        std::cout << entry.dump() << '\n';
       }
     } catch (const std::exception&) {
       ++rejected_control_commands;
@@ -448,6 +487,42 @@ struct VehicleMediaRuntime::Impl {
                        {"vehicle_id", config.vehicle_id},
                        {"session_id", signaling.session_id()},
                        {"reason", "invalid_control_message"},
+                   }).dump()
+                << '\n';
+    }
+  }
+
+  void send_vcu_handshake_status(std::string_view result) {
+    std::lock_guard lock(control_mutex);
+    send_vcu_handshake_status_locked(result);
+  }
+
+  void send_vcu_handshake_status_locked(std::string_view result) {
+    if (control_channel == nullptr || !control_link_open ||
+        !control_service_started || !control_service) {
+      return;
+    }
+    try {
+      const auto payload = Json({
+          {"event", "vcu_handshake_status"},
+          {"protocol_version", kProtocolVersion},
+          {"vehicle_id", config.vehicle_id},
+          {"driver_id", signaling.driver_id()},
+          {"session_id", signaling.session_id()},
+          {"sent_at_utc_ms", signaling.now_ms()},
+          {"driver_connected", true},
+          {"result", result},
+          {"status", control_service->vcu_handshake_status().to_json()},
+          {"hard_limits", control_service->control_limits()},
+      }).dump();
+      gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
+    } catch (const std::exception& error) {
+      std::cout << Json({
+                       {"event", "vehicle_vcu_handshake_status_failed"},
+                       {"event_at_utc_ms", signaling.now_ms()},
+                       {"vehicle_id", config.vehicle_id},
+                       {"session_id", signaling.session_id()},
+                       {"error", error.what()},
                    }).dump()
                 << '\n';
     }
@@ -492,7 +567,14 @@ struct VehicleMediaRuntime::Impl {
 
   void tick_control_service() {
     std::lock_guard lock(control_mutex);
-    if (control_service_started && control_service) control_service->tick(signaling.now_ms());
+    if (!control_service_started || !control_service) return;
+    const auto timestamp_ms = signaling.now_ms();
+    control_service->tick(timestamp_ms);
+    if (control_link_open &&
+        (!last_vcu_status_ms || timestamp_ms - *last_vcu_status_ms >= 500)) {
+      send_vcu_handshake_status_locked("status_update");
+      last_vcu_status_ms = timestamp_ms;
+    }
   }
 
   void set_pipeline_error(std::string value) {
@@ -1175,6 +1257,7 @@ struct VehicleMediaRuntime::Impl {
   std::atomic<std::uint64_t> rejected_control_commands{0};
   std::atomic<std::uint64_t> control_link_loss_count{0};
   std::atomic<std::int64_t> last_control_received_at_ms{0};
+  std::optional<std::int64_t> last_vcu_status_ms;
 };
 
 VehicleMediaRuntime::VehicleMediaRuntime(

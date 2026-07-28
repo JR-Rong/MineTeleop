@@ -277,6 +277,11 @@ struct GamepadConfig {
   int estop_button{0};
 };
 
+struct DriverControlLimitsConfig {
+  double initial_max_throttle{0.05};
+  double initial_max_steering_angle_deg{3.0};
+};
+
 struct DriverConfig {
   std::string driver_id;
   std::string signaling_url;
@@ -292,6 +297,7 @@ struct DriverConfig {
   int time_sync_interval_ms{30000};
   int time_sync_samples{7};
   GamepadConfig gamepad;
+  DriverControlLimitsConfig control_limits;
 };
 
 DriverConfig load_driver_config(const std::string& path);

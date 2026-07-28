@@ -20,6 +20,9 @@ ui:
 control:
   rate_hz: 20
   estop_hold_ms: 500
+  limits:
+    initial_max_throttle: 0.05
+    initial_max_steering_angle_deg: 3.0
   keyboard:
     steering_left: ArrowLeft
     steering_right: ArrowRight

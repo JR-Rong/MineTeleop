@@ -90,7 +90,10 @@ hardware:
 field_safety:
   commissioning_mode: bench
   max_speed_kph: 0
-  require_can_feedback_before_control: false
+  # These remain authoritative even if the browser requests a larger value.
+  max_throttle: 0.10
+  max_steering_angle_deg: 5.0
+  require_can_feedback_before_control: true
   require_local_estop_reset: true
   require_time_sync: true
   max_time_sync_uncertainty_ms: 25
@@ -112,3 +115,13 @@ upload:
 # a separate CAN/braking safety acceptance has supplied the required evidence.
 vehicle_adapter:
   type: mock
+
+# For an isolated JYR010 CAN bench, also set max_speed_kph to a positive
+# commissioning value, then replace the vehicle_adapter block above with:
+#
+# vehicle_adapter:
+#   type: can
+#   integration:
+#     chassis_control:
+#       can_interface: can0
+#       bridge_library_path: /opt/mine-teleop/lib/vendor/chassis/libmine_teleop_chassis_bridge.so

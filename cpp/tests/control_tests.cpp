@@ -354,6 +354,28 @@ void test_control_page_contract() {
       "successful reauthentication leaves a stale lost-authority label visible");
   expect(response.body.find("navigator.getGamepads") != std::string::npos, "Gamepad discovery is missing");
   expect(response.body.find("开始量程校准") != std::string::npos, "Gamepad range calibration is missing");
+  expect(
+      response.body.find("开始平行驾驶握手") != std::string::npos &&
+          response.body.find("断开 VCU 握手") != std::string::npos,
+      "explicit VCU handshake controls are missing");
+  expect(
+      response.body.find("event:'vcu_handshake_command'") != std::string::npos &&
+          response.body.find("message.event!=='vcu_handshake_status'") != std::string::npos,
+      "VCU handshake command/status DataChannel contract is missing");
+  expect(
+      response.body.find("vcu_handshake_not_ready") != std::string::npos &&
+          response.body.find("vcuHandshake.parking_ready") != std::string::npos,
+      "driving commands are not gated by explicit P-ready VCU handshake state");
+  expect(
+      response.body.find("实车调试限幅") != std::string::npos &&
+          response.body.find("max-throttle-percent") != std::string::npos &&
+          response.body.find("max-steering-deg") != std::string::npos,
+      "field commissioning control limit dialog is missing");
+  expect(
+      response.body.find("effectiveControlLimits") != std::string::npos &&
+          response.body.find("updateVehicleHardLimits(message.hard_limits)") != std::string::npos &&
+          response.body.find("我已确认车辆处于隔离台架") != std::string::npos,
+      "controller limits are not combined with vehicle hard limits and operator confirmation");
   expect(response.body.find("post('/api/control',currentControl(extra))") != std::string::npos, "control inputs do not share one normalized path");
   expect(response.body.find("driver_vehicle_switch_started") != std::string::npos, "safe vehicle switching UI is missing");
   const auto switch_request = response.body.find("session=await post('/api/connect'");
@@ -477,6 +499,12 @@ void test_driver_gamepad_config() {
   expect(std::filesystem::is_regular_file(field.ca_bundle), "field driver CA bundle is missing");
   expect(field.ice_transport_policy == "all", "field driver ICE policy is not the safe default");
   expect(field.max_time_sync_uncertainty_ms == 25, "field driver time synchronization limit is not 25ms");
+  expect(
+      field.control_limits.initial_max_throttle == 0.05,
+      "field driver initial throttle limit changed");
+  expect(
+      field.control_limits.initial_max_steering_angle_deg == 3.0,
+      "field driver initial steering limit changed");
 }
 
 std::string read_text_file(const std::filesystem::path& path) {

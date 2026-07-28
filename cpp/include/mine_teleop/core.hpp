@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -258,6 +259,8 @@ struct HardwareConfig {
 struct FieldSafetyConfig {
   std::string commissioning_mode{"bench"};
   double max_speed_kph{40.0};
+  double max_throttle{1.0};
+  double max_steering_angle_deg{30.0};
   bool require_can_feedback_before_control{true};
   bool require_local_estop_reset{true};
   bool require_time_sync{true};
@@ -312,6 +315,25 @@ struct VehicleAdapterStatus {
   [[nodiscard]] Json to_json() const;
 };
 
+struct VcuHandshakeStatus {
+  bool supported{false};
+  std::string state{"unsupported"};
+  bool requested{false};
+  bool ready{false};
+  bool disarming{false};
+  bool parking_ready{false};
+  int driver_gear_request{0};
+  bool driver_gear_request_valid{false};
+  int handshake_status{0};
+  bool handshake_valid{false};
+  std::array<int, 4> epb_status{};
+  std::array<bool, 4> epb_valid{};
+  double speed_mps{0.0};
+  bool speed_valid{false};
+
+  [[nodiscard]] Json to_json() const;
+};
+
 class VehicleAdapter {
  public:
   virtual ~VehicleAdapter() = default;
@@ -320,7 +342,10 @@ class VehicleAdapter {
   virtual void apply_control(const ControlCommand& command) = 0;
   virtual void apply_safe_stop(const ControlOutput& output) = 0;
   virtual bool poll_feedback() = 0;
+  virtual bool request_vcu_handshake() = 0;
+  virtual bool disconnect_vcu_handshake() = 0;
   [[nodiscard]] virtual bool feedback_ready() const = 0;
+  [[nodiscard]] virtual VcuHandshakeStatus vcu_handshake_status() const = 0;
   [[nodiscard]] virtual VehicleTelemetry read_telemetry() = 0;
   [[nodiscard]] virtual VehicleAdapterStatus status() const = 0;
 };
@@ -332,7 +357,10 @@ class MockVehicleAdapter final : public VehicleAdapter {
   void apply_control(const ControlCommand& command) override;
   void apply_safe_stop(const ControlOutput& output) override;
   bool poll_feedback() override;
+  bool request_vcu_handshake() override;
+  bool disconnect_vcu_handshake() override;
   [[nodiscard]] bool feedback_ready() const override;
+  [[nodiscard]] VcuHandshakeStatus vcu_handshake_status() const override;
   [[nodiscard]] VehicleTelemetry read_telemetry() override;
   [[nodiscard]] VehicleAdapterStatus status() const override;
 
@@ -353,7 +381,10 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   void apply_control(const ControlCommand& command) override;
   void apply_safe_stop(const ControlOutput& output) override;
   bool poll_feedback() override;
+  bool request_vcu_handshake() override;
+  bool disconnect_vcu_handshake() override;
   [[nodiscard]] bool feedback_ready() const override;
+  [[nodiscard]] VcuHandshakeStatus vcu_handshake_status() const override;
   [[nodiscard]] VehicleTelemetry read_telemetry() override;
   [[nodiscard]] VehicleAdapterStatus status() const override;
 
@@ -374,13 +405,18 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   using OpenFn = int (*)(const char*);
   using ApplyFn = int (*)(int, double, double, const double*, int);
   using StopFn = int (*)();
+  using HandshakeFn = int (*)();
   using PollFeedbackFn = int (*)(void*);
+  using ReadHandshakeFn = int (*)(void*);
   using ReadFn = int (*)(void*);
   using CloseFn = int (*)();
   OpenFn open_fn_{nullptr};
   ApplyFn apply_fn_{nullptr};
   StopFn stop_fn_{nullptr};
+  HandshakeFn request_handshake_fn_{nullptr};
+  HandshakeFn disconnect_handshake_fn_{nullptr};
   PollFeedbackFn poll_feedback_fn_{nullptr};
+  ReadHandshakeFn read_handshake_fn_{nullptr};
   ReadFn read_fn_{nullptr};
   CloseFn close_fn_{nullptr};
 };
@@ -401,11 +437,17 @@ class VehicleControlService {
   void start(std::int64_t now_ms);
   ReceiveResult receive_command(const ControlCommand& command, std::int64_t now_ms);
   void tick(std::int64_t now_ms);
+  bool request_vcu_handshake();
+  bool disconnect_vcu_handshake();
   bool reset_estop(bool local_confirmed, std::string_view authorized_by, std::int64_t now_ms);
   void close();
 
   [[nodiscard]] SafetyState safety_state() const { return safety_.state(); }
   [[nodiscard]] VehicleAdapterStatus adapter_status() const { return adapter_->status(); }
+  [[nodiscard]] VcuHandshakeStatus vcu_handshake_status() const {
+    return adapter_->vcu_handshake_status();
+  }
+  [[nodiscard]] Json control_limits() const;
   [[nodiscard]] const std::deque<Json>& telemetry_history() const { return telemetry_history_; }
   [[nodiscard]] Json summary() const;
 
@@ -419,6 +461,9 @@ class VehicleControlService {
   SafetyStateMachine safety_;
   std::unique_ptr<VehicleAdapter> adapter_;
   bool require_feedback_before_control_{true};
+  double max_speed_kph_{40.0};
+  double max_throttle_{1.0};
+  double max_steering_angle_deg_{30.0};
   int telemetry_interval_ms_;
   std::optional<std::int64_t> last_telemetry_ms_;
   std::uint64_t telemetry_sequence_{0};

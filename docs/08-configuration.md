@@ -217,6 +217,8 @@ hardware:
 field_safety:
   commissioning_mode: bench
   max_speed_kph: 40
+  max_throttle: 0.10
+  max_steering_angle_deg: 5.0
   require_can_feedback_before_control: true
   require_local_estop_reset: true
   require_time_sync: true
@@ -289,8 +291,10 @@ access key 和 secret。Secret 可以直接配置，也可以用
 `secret_access_key_file` 指向只读凭据文件；运行时有效配置日志只记录
 `configured`，不输出 secret 值或 secret 文件路径。
 
-当前参考实现只支持 `vehicle_adapter.type=mock` 直接无外部依赖运行。配置为
-`can` 或 `dynamic_library` 前必须先声明真实车辆接口契约，例如：
+`vehicle_adapter.type=mock` 可直接无外部依赖运行。配置为 `can` 或
+`dynamic_library` 时，必须显式填写 `field_safety.max_speed_kph`、
+`field_safety.max_throttle` 和 `field_safety.max_steering_angle_deg`，并先声明真实
+车辆接口契约，例如：
 
 ```yaml
 vehicle_adapter:
@@ -356,7 +360,8 @@ vehicle_adapter:
     chassis_control:
       abi: c_shim
       requires_cpp_bridge: false
-      bridge_library_path: /opt/mine-teleop/lib/libmine_teleop_chassis_bridge.so
+      can_interface: can0
+      bridge_library_path: /opt/mine-teleop/lib/vendor/chassis/libmine_teleop_chassis_bridge.so
 ```
 
 以 `configs/vehicle-agent.three-machine.field.yaml` 为现场模板，在部署流程中复制为

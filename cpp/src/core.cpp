@@ -93,7 +93,48 @@ struct BridgeFeedback {
   int ehb_mode[8];
   double vehicle_speed;
   int vehicle_speed_valid;
+  int driver_gear_request;
+  int driver_gear_request_valid;
 };
+
+struct BridgeHandshakeStatus {
+  int state;
+  int requested;
+  int ready;
+  int disarming;
+  int parking_ready;
+  int driver_gear_request;
+  int driver_gear_request_valid;
+  int handshake_status;
+  int handshake_valid;
+  int epb_status[4];
+  int epb_valid[4];
+  double speed_mps;
+  int speed_valid;
+};
+
+std::string bridge_handshake_state(int state) {
+  static constexpr std::array<std::string_view, 14> kStates{
+      "standby",
+      "initial",
+      "wait_parallel_handshake",
+      "wait_parking_brake_released",
+      "wait_gear",
+      "wait_actuator_modes",
+      "ready",
+      "disarm_torque",
+      "disarm_stop",
+      "disarm_neutral",
+      "disarm_parking_brake",
+      "disarm_manual",
+      "disarmed",
+      "fault",
+  };
+  if (state < 0 || static_cast<std::size_t>(state) >= kStates.size()) {
+    return "unknown";
+  }
+  return std::string(kStates[static_cast<std::size_t>(state)]);
+}
 
 template <typename Function>
 Function load_symbol(void* handle, const char* name) {
@@ -518,6 +559,9 @@ Json VehicleConfig::redacted_summary() const {
       {"camera_count", enabled_cameras().size()},
       {"vehicle_adapter_type", vehicle_adapter.type},
       {"can_interface", hardware.can_interface},
+      {"max_speed_kph", field_safety.max_speed_kph},
+      {"max_throttle", field_safety.max_throttle},
+      {"max_steering_angle_deg", field_safety.max_steering_angle_deg},
       {"require_time_sync", field_safety.require_time_sync},
       {"max_time_sync_uncertainty_ms", field_safety.max_time_sync_uncertainty_ms},
       {"recording_root", recording.root_dir.string()},
@@ -684,6 +728,9 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   const auto safety = root["field_safety"];
   config.field_safety.commissioning_mode = optional<std::string>(safety, "commissioning_mode", "bench");
   config.field_safety.max_speed_kph = optional<double>(safety, "max_speed_kph", 40.0);
+  config.field_safety.max_throttle = optional<double>(safety, "max_throttle", 1.0);
+  config.field_safety.max_steering_angle_deg =
+      optional<double>(safety, "max_steering_angle_deg", 30.0);
   config.field_safety.require_can_feedback_before_control =
       optional<bool>(safety, "require_can_feedback_before_control", true);
   config.field_safety.require_local_estop_reset = optional<bool>(safety, "require_local_estop_reset", true);
@@ -692,10 +739,18 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
       optional<int>(safety, "max_time_sync_uncertainty_ms", 25);
   config.field_safety.time_sync_interval_ms = optional<int>(safety, "time_sync_interval_ms", 30000);
   config.field_safety.time_sync_samples = optional<int>(safety, "time_sync_samples", 7);
-  if (config.field_safety.max_time_sync_uncertainty_ms < 0 ||
+  if (!std::isfinite(config.field_safety.max_speed_kph) ||
+      config.field_safety.max_speed_kph < 0.0 ||
+      !std::isfinite(config.field_safety.max_throttle) ||
+      config.field_safety.max_throttle < 0.0 ||
+      config.field_safety.max_throttle > 1.0 ||
+      !std::isfinite(config.field_safety.max_steering_angle_deg) ||
+      config.field_safety.max_steering_angle_deg < 0.0 ||
+      config.field_safety.max_steering_angle_deg > 30.0 ||
+      config.field_safety.max_time_sync_uncertainty_ms < 0 ||
       config.field_safety.time_sync_interval_ms <= 0 ||
       config.field_safety.time_sync_samples < 3 || config.field_safety.time_sync_samples > 15) {
-    throw std::runtime_error("field_safety time sync settings are invalid");
+    throw std::runtime_error("field_safety limits or time sync settings are invalid");
   }
 
   const auto recording = root["recording"];
@@ -732,6 +787,16 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   if (config.vehicle_adapter.type != "mock" && config.vehicle_adapter.bridge_library_path.empty()) {
     throw std::runtime_error("non-mock vehicle adapter requires bridge_library_path");
   }
+  if (config.vehicle_adapter.type != "mock" &&
+      (!safety || !safety["max_speed_kph"] || !safety["max_throttle"] ||
+       !safety["max_steering_angle_deg"])) {
+    throw std::runtime_error(
+        "non-mock vehicle adapter requires explicit field_safety max_speed_kph, "
+        "max_throttle, and max_steering_angle_deg");
+  }
+  if (config.vehicle_adapter.type != "mock" && config.field_safety.max_speed_kph <= 0.0) {
+    throw std::runtime_error("non-mock vehicle adapter requires field_safety.max_speed_kph > 0");
+  }
 
   return config;
 }
@@ -749,6 +814,25 @@ Json VehicleAdapterStatus::to_json() const {
   if (!library_path.empty()) value["library_path"] = library_path;
   if (!last_error.empty()) value["last_error"] = last_error;
   return value;
+}
+
+Json VcuHandshakeStatus::to_json() const {
+  return {
+      {"supported", supported},
+      {"state", state},
+      {"requested", requested},
+      {"ready", ready},
+      {"disarming", disarming},
+      {"parking_ready", parking_ready},
+      {"driver_gear_request", driver_gear_request},
+      {"driver_gear_request_valid", driver_gear_request_valid},
+      {"handshake_status", handshake_status},
+      {"handshake_valid", handshake_valid},
+      {"epb_status", epb_status},
+      {"epb_valid", epb_valid},
+      {"speed_mps", speed_mps},
+      {"speed_valid", speed_valid},
+  };
 }
 
 void MockVehicleAdapter::open() { opened_ = true; }
@@ -780,7 +864,15 @@ VehicleTelemetry MockVehicleAdapter::read_telemetry() {
 
 bool MockVehicleAdapter::poll_feedback() { return opened_; }
 
+bool MockVehicleAdapter::request_vcu_handshake() { return false; }
+
+bool MockVehicleAdapter::disconnect_vcu_handshake() { return false; }
+
 bool MockVehicleAdapter::feedback_ready() const { return opened_; }
+
+VcuHandshakeStatus MockVehicleAdapter::vcu_handshake_status() const {
+  return {};
+}
 
 VehicleAdapterStatus MockVehicleAdapter::status() const {
   return {"mock", opened_, true, "", "", applied_command_count_, safe_stop_count_, "", opened_};
@@ -825,7 +917,16 @@ void DynamicLibraryVehicleAdapter::ensure_loaded() {
     open_fn_ = load_symbol<OpenFn>(handle_, "mine_teleop_chassis_open");
     apply_fn_ = load_symbol<ApplyFn>(handle_, "mine_teleop_chassis_apply_state");
     stop_fn_ = load_symbol<StopFn>(handle_, "mine_teleop_chassis_emergency_stop");
+    request_handshake_fn_ = load_symbol<HandshakeFn>(
+        handle_,
+        "mine_teleop_chassis_request_parallel_handshake");
+    disconnect_handshake_fn_ = load_symbol<HandshakeFn>(
+        handle_,
+        "mine_teleop_chassis_disconnect_parallel_handshake");
     poll_feedback_fn_ = load_symbol<PollFeedbackFn>(handle_, "mine_teleop_chassis_poll_feedback");
+    read_handshake_fn_ = load_symbol<ReadHandshakeFn>(
+        handle_,
+        "mine_teleop_chassis_read_handshake_status");
     read_fn_ = load_symbol<ReadFn>(handle_, "mine_teleop_chassis_read_telemetry");
     close_fn_ = load_symbol<CloseFn>(handle_, "mine_teleop_chassis_close");
   } catch (...) {
@@ -891,7 +992,58 @@ bool DynamicLibraryVehicleAdapter::poll_feedback() {
   return true;
 }
 
+bool DynamicLibraryVehicleAdapter::request_vcu_handshake() {
+  if (!opened_) throw std::runtime_error("dynamic vehicle adapter is not open");
+  const int result = request_handshake_fn_();
+  if (result != 0) return false;
+  feedback_ready_ = false;
+  return true;
+}
+
+bool DynamicLibraryVehicleAdapter::disconnect_vcu_handshake() {
+  if (!opened_) throw std::runtime_error("dynamic vehicle adapter is not open");
+  check_result(
+      disconnect_handshake_fn_(),
+      "mine_teleop_chassis_disconnect_parallel_handshake");
+  feedback_ready_ = false;
+  return true;
+}
+
 bool DynamicLibraryVehicleAdapter::feedback_ready() const { return feedback_ready_; }
+
+VcuHandshakeStatus DynamicLibraryVehicleAdapter::vcu_handshake_status() const {
+  if (!opened_) {
+    VcuHandshakeStatus status;
+    status.supported = true;
+    status.state = "closed";
+    return status;
+  }
+  BridgeHandshakeStatus raw{};
+  const int result = read_handshake_fn_(&raw);
+  if (result != 0) {
+    throw std::runtime_error(
+        "mine_teleop_chassis_read_handshake_status failed with code " +
+        std::to_string(result));
+  }
+  VcuHandshakeStatus status;
+  status.supported = true;
+  status.state = bridge_handshake_state(raw.state);
+  status.requested = raw.requested != 0;
+  status.ready = raw.ready != 0;
+  status.disarming = raw.disarming != 0;
+  status.parking_ready = raw.parking_ready != 0;
+  status.driver_gear_request = raw.driver_gear_request;
+  status.driver_gear_request_valid = raw.driver_gear_request_valid != 0;
+  status.handshake_status = raw.handshake_status;
+  status.handshake_valid = raw.handshake_valid != 0;
+  for (std::size_t index = 0; index < status.epb_status.size(); ++index) {
+    status.epb_status[index] = raw.epb_status[index];
+    status.epb_valid[index] = raw.epb_valid[index] != 0;
+  }
+  status.speed_mps = raw.speed_mps;
+  status.speed_valid = raw.speed_valid != 0;
+  return status;
+}
 
 VehicleTelemetry DynamicLibraryVehicleAdapter::read_telemetry() {
   BridgeTelemetry telemetry{};
@@ -955,6 +1107,9 @@ VehicleControlService::VehicleControlService(
           config.control.deceleration_profile),
       adapter_(std::move(adapter)),
       require_feedback_before_control_(config.field_safety.require_can_feedback_before_control),
+      max_speed_kph_(config.field_safety.max_speed_kph),
+      max_throttle_(config.field_safety.max_throttle),
+      max_steering_angle_deg_(config.field_safety.max_steering_angle_deg),
       telemetry_interval_ms_(telemetry_interval_ms) {
   if (!adapter_) throw std::invalid_argument("vehicle adapter is required");
   if (telemetry_interval_ms_ <= 0) throw std::invalid_argument("telemetry interval must be positive");
@@ -978,6 +1133,19 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
   if (!started_) throw std::runtime_error("vehicle control service is not started");
   auto result = receiver_.accept(command, timestamp_ms);
   if (!result.accepted || !result.command) return result;
+  auto& effective = *result.command;
+  const auto limited_throttle = std::min(effective.throttle, max_throttle_);
+  const auto steering_limit = max_steering_angle_deg_ / 30.0;
+  const auto limited_steering =
+      std::clamp(effective.steering, -steering_limit, steering_limit);
+  if (limited_throttle != effective.throttle) {
+    result.warnings.emplace_back("vehicle_max_throttle_applied");
+    effective.throttle = limited_throttle;
+  }
+  if (limited_steering != effective.steering) {
+    result.warnings.emplace_back("vehicle_max_steering_applied");
+    effective.steering = limited_steering;
+  }
   if (!result.command->estop) {
     try {
       adapter_->poll_feedback();
@@ -1000,6 +1168,16 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
   }
   return result;
+}
+
+bool VehicleControlService::request_vcu_handshake() {
+  if (!started_) throw std::runtime_error("vehicle control service is not started");
+  return adapter_->request_vcu_handshake();
+}
+
+bool VehicleControlService::disconnect_vcu_handshake() {
+  if (!started_) throw std::runtime_error("vehicle control service is not started");
+  return adapter_->disconnect_vcu_handshake();
 }
 
 void VehicleControlService::tick(std::int64_t timestamp_ms) {
@@ -1057,6 +1235,16 @@ Json VehicleControlService::build_telemetry(std::int64_t timestamp_ms) {
       {"brake_feedback", telemetry.brake_feedback},
       {"estop", telemetry.estop},
       {"vehicle_adapter", adapter_->status().to_json()},
+      {"vcu_handshake", adapter_->vcu_handshake_status().to_json()},
+      {"control_limits", control_limits()},
+  };
+}
+
+Json VehicleControlService::control_limits() const {
+  return {
+      {"max_speed_kph", max_speed_kph_},
+      {"max_throttle", max_throttle_},
+      {"max_steering_angle_deg", max_steering_angle_deg_},
   };
 }
 
@@ -1069,6 +1257,8 @@ Json VehicleControlService::summary() const {
       {"telemetry_count", telemetry_sequence_},
       {"telemetry_retained_count", telemetry_history_.size()},
       {"vehicle_adapter", adapter_->status().to_json()},
+      {"vcu_handshake", adapter_->vcu_handshake_status().to_json()},
+      {"control_limits", control_limits()},
   };
 }
 

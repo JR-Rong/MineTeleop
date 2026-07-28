@@ -1,16 +1,16 @@
-# ChassisControl Bridge
+# JYR010 VCU Parallel-Control Bridge
 
 This directory provides the stable C ABI loaded by the native C++
 `DynamicLibraryVehicleAdapter`. The exported contract is declared in
-`mine_teleop_chassis_bridge.h` and covers open, control application, emergency
-stop, feedback polling, telemetry, and close.
+`mine_teleop_chassis_bridge.h` and covers explicit parallel handshake,
+control application, emergency stop, feedback polling, telemetry, and safe
+disconnect.
 
-Build it on Ubuntu 22.04 after producing ChassisControl and MinePilot:
+Build it on Ubuntu 22.04 after producing ChassisControl:
 
 ```bash
 cmake -S deployments/chassis-control-bridge -B build/chassis-control-bridge \
   -DCHASSIS_CONTROL_ROOT=/path/to/ChassisControl \
-  -DMINEPILOT_ROOT=/path/to/MinePilot \
   -DCHASSIS_CONTROL_LIBRARY=/path/to/libchassis_control.so
 cmake --build build/chassis-control-bridge --parallel
 ```
@@ -18,21 +18,61 @@ cmake --build build/chassis-control-bridge --parallel
 Copy `libmine_teleop_chassis_bridge.so`, `libchassis_control.so`, and their
 non-glibc dependencies into the release bundle. Set
 `vehicle_adapter.integration.chassis_control.bridge_library_path` to the
-bundle-relative installed path.
+installed path, normally
+`/opt/mine-teleop/lib/vendor/chassis/libmine_teleop_chassis_bridge.so`.
+
+The repository field template intentionally keeps `vehicle_adapter.type:
+mock`. On an isolated CAN bench, edit the deployed
+`/opt/mine-teleop/config/vehicle-agent.yaml`: choose `type: can`, set the
+bridge path above and matching `can0`, give `field_safety.max_speed_kph` a
+positive commissioning value, and set the authoritative
+`max_throttle`/`max_steering_angle_deg` limits. The browser limit dialog can
+only reduce those vehicle-side limits.
 
 Validate before service startup:
 
 ```bash
-/opt/mine-teleop/mine-teleop vehicle-agent \
-  --config /etc/mine-teleop/vehicle-agent.yaml \
+/opt/mine-teleop/bin/mine-teleop-run config-check \
+  --config /opt/mine-teleop/config/vehicle-agent.yaml
+
+/opt/mine-teleop/bin/mine-teleop-run vehicle-agent \
+  --config /opt/mine-teleop/config/vehicle-agent.yaml \
   --preflight
 
-/opt/mine-teleop/mine-teleop vehicle-agent \
-  --config /etc/mine-teleop/vehicle-agent.yaml \
+/opt/mine-teleop/bin/mine-teleop-run vehicle-agent \
+  --config /opt/mine-teleop/config/vehicle-agent.yaml \
   --adapter-status
 ```
 
-The bridge uses SocketCAN on Linux, ChassisControl for control output, and the
-MinePilot CAN database/receiver for decoded vehicle feedback. A configured
-dynamic adapter fails startup if the bridge or CAN interface is missing; it
-never falls back to the mock adapter.
+The bridge uses SocketCAN on Linux and the repository-owned JYR010 20260714
+codec. ChassisControl supplies the eight-wheel dynamics/control calculation.
+It does not use MinePilot's older generated CAN codec at runtime.
+
+Bridge open starts in standby. It sends the 16 low-request ADU frames every
+20 ms but does not request driving authority. An active driver must click the
+controller's start button, and the bridge accepts that request only when fresh
+feedback confirms:
+
+- physical selector P (`WVCU_GearCtrlReqSts=4`);
+- absolute speed no greater than 0.1 m/s;
+- all four EPBs parked (value 2);
+- VCU manual handshake state 3.
+
+The parallel path is `CloudShakeReq=2 -> WVCU_ShakeHandSts=6`;
+the intelligent/automatic-driving `ShakeReq` remains zero. The controller
+receives the detailed handshake status over the same DataChannel and enables
+driving commands only at `ready`.
+
+Disconnect performs the full reverse sequence: zero torque, zero speed, N,
+EPB park, clear `CloudShakeReq`, and wait for manual state 3.
+
+The required JSONL protocol log defaults to
+`/var/log/mine-teleop/vcu-can.jsonl` and includes every raw recognized RX
+frame, every 20 ms TX batch, physical control parameters, state transitions,
+accepted/rejected handshake commands with all gate values, faults, and
+disarm results. Configure rotation with `MINE_TELEOP_VCU_LOG_MAX_BYTES` and
+`MINE_TELEOP_VCU_LOG_ROTATIONS`.
+
+A configured dynamic adapter fails startup if the bridge, CAN interface, or
+log path is unavailable; it never falls back to the mock adapter. Real
+CAN/VCU acceptance remains a separate bench/vehicle task.

@@ -1,0 +1,2638 @@
+VERSION ""
+
+
+NS_ : 
+	NS_DESC_
+	CM_
+	BA_DEF_
+	BA_
+	VAL_
+	CAT_DEF_
+	CAT_
+	FILTER
+	BA_DEF_DEF_
+	EV_DATA_
+	ENVVAR_DATA_
+	SGTYPE_
+	SGTYPE_VAL_
+	BA_DEF_SGTYPE_
+	BA_SGTYPE_
+	SIG_TYPE_REF_
+	VAL_TABLE_
+	SIG_GROUP_
+	SIG_VALTYPE_
+	SIGTYPE_VALTYPE_
+	BO_TX_BU_
+	BA_DEF_REL_
+	BA_REL_
+	BA_DEF_DEF_REL_
+	BU_SG_REL_
+	BU_EV_REL_
+	BU_BO_REL_
+	SG_MUL_VAL_
+
+BS_:
+
+BU_: TMS WVCU GAM ICU ATS ACP DCDC AUX PDU SCU VCU TPMS OBC Meter MCU EPS EPBI BMS ADU
+VAL_TABLE_ WVCU_DOMSwReq 1 "开" 0 "关" ;
+VAL_TABLE_ VtSIg_WVCU_ShakeHandSts 19 "智驾SPB" 18 "遥控SPB" 17 "人工SPB" 6 "平行" 5 "智驾" 4 "遥控" 3 "人工" 0 "无" ;
+VAL_TABLE_ PrkSt 1 "release" 0 "park" ;
+VAL_TABLE_ ByWire 1 "ByWire" 0 "No ByWire" ;
+VAL_TABLE_ MCUHVILSt 1 "Lock" 0 "UnLock" ;
+VAL_TABLE_ MCUDischrgSt 3 "Discharge Failed" 2 "Discharge Succeed" 1 "Discharging" 0 "Idle" ;
+VAL_TABLE_ MCUFltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_TABLE_ MCUInvWrkSts 6 "Shutdown" 5 "Error" 4 "Enable PWM ON" 3 "Ready PWM OFF" 2 "Init succeed" 1 "init failed" 0 "init" ;
+VAL_TABLE_ GearPosn 4 "P" 3 "D" 2 "R" 1 "N" 0 "ini" ;
+VAL_TABLE_ MCUMotCtrlMod 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+
+
+BO_ 3221225472 VECTOR__INDEPENDENT_SIG_MSG: 0 Vector__XXX
+ SG_ WVCU_DOMSwReq : 0|1@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_Tx_1JobReq : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ RC_Tx_1HornReq : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ RC_Tx_1LgtRockerOpenReq : 0|12@1+ (0.1,-100) [-100|104.7] "perc" Vector__XXX
+ SG_ RC_Tx_1LatRockerOpenReq : 0|12@1+ (0.1,-100) [-100|104.7] "perc" Vector__XXX
+ SG_ RC_Tx_1StrModeReq : 0|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ RC_Tx_1RmtSts : 0|1@1+ (1,0) [0|1] "enum" Vector__XXX
+
+BO_ 2564027600 WVCU_BatStatus04: 8 Vector__XXX
+ SG_ WVCU_BMSTx6AccuDchgAh : 32|32@1+ (1,0) [0|4294967295] "Ah" Vector__XXX
+ SG_ WVCU_BMSTx6AccuChrgAh : 0|32@1+ (1,0) [0|4294967295] "Ah" Vector__XXX
+
+BO_ 2552037781 WVCU_FDOM2: 8 Vector__XXX
+ SG_ FDOM2TopDeadSw : 23|1@1+ (1,0) [0|1] "" Vector__XXX
+ SG_ FDOM2BottomDeadSw2 : 25|1@1+ (1,0) [0|1] "" Vector__XXX
+ SG_ FDOM2BottomDeadSw1 : 24|1@1+ (1,0) [0|1] "" Vector__XXX
+
+BO_ 337 RC_TX_2: 8 Vector__XXX
+ SG_ RC_Tx_2_RollCnt : 56|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ RC_Tx_2_RC_WorkRise : 3|1@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_Tx_2_RC_WorkDrop : 4|1@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_Tx_2_RC_State : 0|1@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_Tx_2_RC_Reserve1 : 5|1@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_Tx_2_RC_ParkReq : 8|2@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_Tx_2_RC_Horn : 2|1@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_Tx_2_RC_EmgcyParkReq : 1|1@1- (1,0) [0|0] "" Vector__XXX
+
+BO_ 513 RC_Rx_01: 8 Vector__XXX
+ SG_ RC_VehSpdFDBK : 8|16@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_SteerModeFDBK : 4|2@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_SOC : 24|8@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_RollCnt : 56|4@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_GearStatusFDBK : 2|2@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_FaultCodes : 32|8@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_ControlModeFDBK : 0|2@1- (1,0) [0|0] "" Vector__XXX
+
+BO_ 2551973954 WVCU_RDOM1: 8 Vector__XXX
+ SG_ RDOM_FuelLvlRGas_ohm : 16|16@1+ (0.1,0) [0|6553.5] "" Vector__XXX
+
+BO_ 2552038293 WVCU_FDOM: 8 Vector__XXX
+ SG_ FDOM_NTCR_ohm : 32|16@1+ (10,0) [0|655350] "" Vector__XXX
+ SG_ FDOM_FuelLvlR_ohm : 48|16@1+ (0.1,0) [0|6553.5] "" Vector__XXX
+
+BO_ 2552799731 BMS_Tx_9: 8 Vector__XXX
+ SG_ BMS_Tx_9_B2VPInsRValue : 0|16@1+ (1,0) [0|65535] "kohm" Vector__XXX
+ SG_ BMS_Tx_9_B2VNInsRValue : 16|16@1+ (1,0) [0|65535] "kohm" Vector__XXX
+
+BO_ 2417205747 BMS_Tx_B2V7: 8 Vector__XXX
+ SG_ BMS_Tx_B2V7_MinCellTNubInLECU : 40|8@1+ (1,0) [0|0] "" Vector__XXX
+ SG_ BMS_Tx_B2V7_MinCellTLECUNub : 32|8@1+ (1,0) [0|0] "" Vector__XXX
+ SG_ BMS_Tx_B2V7_MinCellT : 24|8@1+ (1,-40) [0|200] "C" Vector__XXX
+ SG_ BMS_Tx_B2V7_MaxCellTNubInLECU : 16|8@1+ (1,0) [0|0] "" Vector__XXX
+ SG_ BMS_Tx_B2V7_MaxCellTLECUNub : 8|8@1+ (1,0) [0|0] "" Vector__XXX
+ SG_ BMS_Tx_B2V7_MaxCellT : 0|8@1+ (1,-40) [0|200] "C" Vector__XXX
+
+BO_ 2417140211 BMS_Tx_B2V6: 8 Vector__XXX
+ SG_ BMS_Tx_B2V6_MinCellVNubInLECU : 56|8@1+ (1,0) [0|0] "" Vector__XXX
+ SG_ BMS_Tx_B2V6_MinCellVLECUNub : 48|8@1+ (1,0) [0|0] "" Vector__XXX
+ SG_ BMS_Tx_B2V6_MinCellV : 32|16@1+ (0.001,0) [0|0] "V" Vector__XXX
+ SG_ BMS_Tx_B2V6_MaxCellVNubInLECU : 24|8@1+ (1,0) [0|0] "" Vector__XXX
+ SG_ BMS_Tx_B2V6_MaxCellVLECUNub : 16|8@1+ (1,0) [0|0] "" Vector__XXX
+ SG_ BMS_Tx_B2V6_MaxCellV : 0|16@1+ (0.001,0) [0|0] "V" Vector__XXX
+
+BO_ 2565932240 PwrStrPump_Rx_01: 8 Vector__XXX
+ SG_ PwrStrPump_Rx_01_StroilPumpEnbl : 0|8@1+ (1,0) [0|0] "" Vector__XXX
+
+BO_ 2364933554 PwrStrPump_Tx_01: 8 Vector__XXX
+ SG_ PwrStrPump_Tx_01_HeatTemp : 32|8@1+ (1,-40) [-40|150] "℃" Vector__XXX
+ SG_ PwrStrPump_Tx_01_InputVoltage : 16|8@1+ (3,0) [0|750] "V" Vector__XXX
+ SG_ PwrStrPump_Tx_01_Faultcode : 56|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ PwrStrPump_Tx_01_Highestfltlevel : 48|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ PwrStrPump_Tx_01_HeatDsiptTemp : 40|8@1+ (1,-40) [-40|150] "℃" Vector__XXX
+ SG_ PwrStrPump_Tx_01_OutputCurrent : 24|8@1+ (0.1,0) [0|6553.5] "A" Vector__XXX
+ SG_ PwrStrPump_Tx_01_OutputVoltage : 8|8@1+ (3,0) [0|750] "V" Vector__XXX
+ SG_ PwrStrPump_Tx_01_PSPWorkSts : 0|8@1+ (1,0) [0|0] "" Vector__XXX
+
+BO_ 2552045717 WVCU_VCU2FDOM: 8 Vector__XXX
+ SG_ WVCU_FDOMUpSwReq : 51|1@1+ (1,0) [0|0] "" Vector__XXX
+ SG_ WVCU_FDOMDwnSwReq : 52|1@1+ (1,0) [0|0] "" Vector__XXX
+ SG_ WVCU_FDOMBackLampReq : 13|1@1+ (1,0) [0|0] "" Vector__XXX
+
+BO_ 2551980098 WVCU_VCU2RDOM: 8 Vector__XXX
+ SG_ WVCU_VCU2RDOMBackLampReq : 24|1@1+ (1,0) [0|1] "" Vector__XXX
+ SG_ WVCU_VCU2RDOMBrkLampReq : 38|1@1+ (1,0) [0|1] "" Vector__XXX
+
+BO_ 2565812240 WVCU_DCDC: 8 Vector__XXX
+ SG_ WVCU_DCDCOutputVoltCmd : 24|16@1+ (0.1,0) [0|6553.5] "V" Vector__XXX
+ SG_ WVCU_DCDCOutputCurCmd : 40|16@1+ (0.1,0) [0|6553.5] "A" Vector__XXX
+ SG_ WVCU_DCDCOnCmd : 18|2@1+ (1,0) [0|3] "" Vector__XXX
+
+BO_ 2566861383 DCDC_Tr: 8 Vector__XXX
+ SG_ DCDC_OutputVolt : 24|16@1+ (0.1,0) [0|6553.5] "V" Vector__XXX
+ SG_ DCDC_OutputTemp : 56|8@1+ (1,-50) [0|0] "C" Vector__XXX
+ SG_ DCDC_OutputCurr : 40|16@1+ (0.1,0) [0|6553.5] "A" Vector__XXX
+ SG_ DCDC_InputVolt : 8|16@1+ (1,0) [0|0] "V" Vector__XXX
+ SG_ DCDC_Flt : 0|8@1+ (1,0) [0|0] "" Vector__XXX
+
+BO_ 2565403856 WVCU_VehWhl8Centroid: 8 Vector__XXX
+ SG_ WVCU_VehWhl8CentroidZ : 32|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl8CentroidY : 16|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl8CentroidX : 0|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+
+BO_ 2565338320 WVCU_VehWhl7Centroid: 8 Vector__XXX
+ SG_ WVCU_VehWhl7CentroidZ : 32|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl7CentroidY : 16|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl7CentroidX : 0|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+
+BO_ 2565272784 WVCU_VehWhl6Centroid: 8 Vector__XXX
+ SG_ WVCU_VehWhl6CentroidZ : 32|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl6CentroidY : 16|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl6CentroidX : 0|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+
+BO_ 2565207248 WVCU_VehWhl5Centroid: 8 Vector__XXX
+ SG_ WVCU_VehWhl5CentroidZ : 32|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl5CentroidY : 16|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl5CentroidX : 0|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+
+BO_ 2565141712 WVCU_VehWhl4Centroid: 8 Vector__XXX
+ SG_ WVCU_VehWhl4CentroidZ : 32|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl4CentroidY : 16|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl4CentroidX : 0|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+
+BO_ 2565076176 WVCU_VehWhl3Centroid: 8 Vector__XXX
+ SG_ WVCU_VehWhl3CentroidZ : 32|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl3CentroidY : 16|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl3CentroidX : 0|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+
+BO_ 2565010640 WVCU_VehWhl2Centroid: 8 Vector__XXX
+ SG_ WVCU_VehWhl2CentroidZ : 32|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl2CentroidY : 16|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl2CentroidX : 0|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+
+BO_ 2564945104 WVCU_VehWhl1Centroid: 8 Vector__XXX
+ SG_ WVCU_VehWhl1CentroidZ : 32|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl1CentroidY : 16|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehWhl1CentroidX : 0|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+
+BO_ 2564879568 WVCU_VehCentroid: 8 Vector__XXX
+ SG_ WVCU_VehCentroidZ : 32|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehCentroidY : 16|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+ SG_ WVCU_VehCentroidX : 0|16@1+ (0.1,0) [0|6553.5] "cm" Vector__XXX
+
+BO_ 2566508790 EPSEHBEPB_Tx_01: 8 Vector__XXX
+ SG_ EPSEHBEPB_Tx_01EPSAngAxisSteer : 24|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01SmallPumpFiltWarn : 12|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01ReturnOilFiltWarn : 10|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01EmergyStop : 13|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01BigPumpFiltWarn : 11|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01BrkPdlPosn : 16|8@1+ (1,0) [0|255] "perc" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01CtrlrPwrSplyStat : 9|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01SelfChkCompleted : 8|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01PWM8OutPortFlt : 7|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01PWM7OutPortFlt : 6|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01PWM6OutPortFlt : 5|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01PWM5OutPortFlt : 4|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01PWM4OutPortFlt : 3|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01PWM3OutPortFlt : 2|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01PWM2OutPortFlt : 1|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ EPSEHBEPB_Tx_01PWM1OutPortFlt : 0|1@1+ (1,0) [0|1] "enum" Vector__XXX
+
+BO_ 336 RC_Tx_1: 8 Vector__XXX
+ SG_ RC_TX_1SteerReq : 8|16@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_TX_1SteerModeReq : 5|3@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_Tx_1RollCnt : 56|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ RC_TX_1BrakePedalReq : 40|16@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_TX_1AcceleratorPedalReq : 24|16@1- (1,0) [0|0] "" Vector__XXX
+ SG_ RC_Tx_1GearReq : 2|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ RC_Tx_1CtrlModeReq : 0|2@1+ (1,0) [0|1] "enum" Vector__XXX
+
+BO_ 2566836469 ADU_Tx_VehSpd: 8 Vector__XXX
+ SG_ ADU_Tx_VehSpdReq_Q : 8|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ADU_Tx_VehSpdReq : 0|8@1+ (1,0) [0|255] "kph" Vector__XXX
+
+BO_ 2566770933 ADU_Tx_Body: 8 Vector__XXX
+ SG_ ADU_Tx_BodyHorn : 12|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ADU_Tx_BodyBrkLamp : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ADU_Tx_BodyHighBeamLamp : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ADU_Tx_BodyLowBeamLamp : 6|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ADU_Tx_BodyTurnRLamp : 4|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ADU_Tx_BodyTurnLLamp : 2|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ADU_Tx_BodyJobAction : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2566705397 ADU_Tx_Shake: 8 Vector__XXX
+ SG_ ADU_Tx_GearReq : 8|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ADU_Tx_FltCodeRst : 24|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ ADU_Tx_CloudShakeReq : 16|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ADU_Tx_ShakeReq : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2566639861 ADU_Tx_EPB: 8 Vector__XXX
+ SG_ ADU_Tx_StrModReq : 32|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ ADU_Tx_EPB4CtrlReq : 24|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ADU_Tx_EPB3CtrlReq : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ADU_Tx_EPB2CtrlReq : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ADU_Tx_EPB1CtrlReq : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2566574325 ADU_Tx_EHB02: 8 Vector__XXX
+ SG_ ADU_Tx_EHB02Brk8PresReq : 52|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ ADU_Tx_EHB02Brk8ModeReq : 48|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ ADU_Tx_EHB02Brk7PresReq : 36|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ ADU_Tx_EHB02Brk7ModeReq : 32|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ ADU_Tx_EHB02Brk6PresReq : 20|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ ADU_Tx_EHB02Brk6ModeReq : 16|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ ADU_Tx_EHB02Brk5PresReq : 4|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ ADU_Tx_EHB02Brk5ModeReq : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2566902005 ADU_Tx_EHB01: 8 Vector__XXX
+ SG_ ADU_Tx_EHB01Brk4PresReq : 52|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ ADU_Tx_EHB01Brk4ModeReq : 48|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ ADU_Tx_EHB01Brk3PresReq : 36|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ ADU_Tx_EHB01Brk3ModeReq : 32|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ ADU_Tx_EHB01Brk2PresReq : 20|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ ADU_Tx_EHB01Brk2ModeReq : 16|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ ADU_Tx_EHB01Brk1PresReq : 4|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ ADU_Tx_EHB01Brk1ModeReq : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2566508789 ADU_Tx_EPS03: 8 Vector__XXX
+ SG_ ADU_Tx_EPS03Axis4AngSpdReq : 56|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ ADU_Tx_EPS03Axis4AngReq : 40|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ ADU_Tx_EPS03Axis4ModeReq : 32|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ADU_Tx_EPS03Axis3AngSpdReq : 24|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ ADU_Tx_EPS03Axis3AngReq : 8|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ ADU_Tx_EPS03Axis3ModeReq : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2566443253 ADU_Tx_EPS01: 8 Vector__XXX
+ SG_ ADU_Tx_EPS01Axis2AngSpdReq : 56|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ ADU_Tx_EPS01Axis2AngReq : 40|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ ADU_Tx_EPS01Axis2ModeReq : 32|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ADU_Tx_EPS01Axis1AngSpdReq : 24|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ ADU_Tx_EPS01Axis1AngReq : 8|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ ADU_Tx_EPS01Axis1ModeReq : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2566377717 ADU_Tx_MCU08: 8 Vector__XXX
+ SG_ ADU_Tx_MCU08MotTqReq : 8|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ ADU_Tx_MCU08MotSpdReq : 24|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+ SG_ ADU_Tx_MCU08MotCtrlMode : 3|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ ADU_Tx_MCU08MotCtrlCmd : 0|3@1+ (1,0) [0|7] "enum" Vector__XXX
+
+BO_ 2566312181 ADU_Tx_MCU07: 8 Vector__XXX
+ SG_ ADU_Tx_MCU07MotTqReq : 8|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ ADU_Tx_MCU07MotSpdReq : 24|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+ SG_ ADU_Tx_MCU07MotCtrlMode : 3|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ ADU_Tx_MCU07MotCtrlCmd : 0|3@1+ (1,0) [0|7] "enum" Vector__XXX
+
+BO_ 2566246645 ADU_Tx_MCU06: 8 Vector__XXX
+ SG_ ADU_Tx_MCU06MotTqReq : 8|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ ADU_Tx_MCU06MotSpdReq : 24|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+ SG_ ADU_Tx_MCU06MotCtrlMode : 3|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ ADU_Tx_MCU06MotCtrlCmd : 0|3@1+ (1,0) [0|7] "enum" Vector__XXX
+
+BO_ 2566181109 ADU_Tx_MCU05: 8 Vector__XXX
+ SG_ ADU_Tx_MCU05MotTqReq : 8|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ ADU_Tx_MCU05MotSpdReq : 24|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+ SG_ ADU_Tx_MCU05MotCtrlMode : 3|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ ADU_Tx_MCU05MotCtrlCmd : 0|3@1+ (1,0) [0|7] "enum" Vector__XXX
+
+BO_ 2566115573 ADU_Tx_MCU04: 8 Vector__XXX
+ SG_ ADU_Tx_MCU04MotTqReq : 8|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ ADU_Tx_MCU04MotSpdReq : 24|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+ SG_ ADU_Tx_MCU04MotCtrlMode : 3|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ ADU_Tx_MCU04MotCtrlCmd : 0|3@1+ (1,0) [0|7] "enum" Vector__XXX
+
+BO_ 2566050037 ADU_Tx_MCU03: 8 Vector__XXX
+ SG_ ADU_Tx_MCU03MotTqReq : 8|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ ADU_Tx_MCU03MotSpdReq : 24|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+ SG_ ADU_Tx_MCU03MotCtrlMode : 3|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ ADU_Tx_MCU03MotCtrlCmd : 0|3@1+ (1,0) [0|7] "enum" Vector__XXX
+
+BO_ 2565984501 ADU_Tx_MCU02: 8 Vector__XXX
+ SG_ ADU_Tx_MCU02MotTqReq : 8|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ ADU_Tx_MCU02MotSpdReq : 24|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+ SG_ ADU_Tx_MCU02MotCtrlMode : 3|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ ADU_Tx_MCU02MotCtrlCmd : 0|3@1+ (1,0) [0|7] "enum" Vector__XXX
+
+BO_ 2565918965 ADU_Tx_MCU01: 8 Vector__XXX
+ SG_ ADU_Tx_MCU01MotSpdReq : 24|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+ SG_ ADU_Tx_MCU01MotTqReq : 8|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ ADU_Tx_MCU01MotCtrlMode : 3|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ ADU_Tx_MCU01MotCtrlCmd : 0|3@1+ (1,0) [0|7] "enum" Vector__XXX
+
+BO_ 2565918966 EPS_Tx_01: 8 Vector__XXX
+ SG_ EPS_Tx_01_EPSFltLvlAxis1 : 56|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPS_Tx_01_EPSFltCodeAxis1 : 48|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ EPS_Tx_01_EPSOutCurrAxis1 : 32|16@1+ (1,0) [0|65535] "mA" Vector__XXX
+ SG_ EPS_Tx_01_EPSAngSpdAxis1 : 24|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ EPS_Tx_01_EPSAngAxis1 : 8|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ EPS_Tx_01_EPSModeAxis1 : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2566854608 ICU_Rx_15: 8 VCU
+ SG_ ICU_Rx_15_DCDC2FaultLevel : 48|8@1+ (1,0) [0|100] "enum" Vector__XXX
+ SG_ ICU_Rx_15_DCDC2FaultCode : 40|8@1+ (1,0) [0|100] "enum" Vector__XXX
+ SG_ ICU_Rx_15_ElectcFanFailure : 32|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_15_MinCellVol : 16|16@1+ (0.001,0) [0|65.535] "V" Vector__XXX
+ SG_ ICU_Rx_15_MaxCellVol : 0|16@1+ (0.001,0) [0|65.535] "V" Vector__XXX
+
+BO_ 2566789072 ICU_Rx_14: 8 VCU
+ SG_ ICU_Rx_14_TotalWorkingTime : 32|32@1+ (0.05,0) [0|210554060] "hr" Vector__XXX
+ SG_ ICU_Rx_14_TotalVorkingMileage : 0|32@1+ (1,0) [0|4294967295] "Km" Vector__XXX
+
+BO_ 2566723536 ICU_Rx_13: 8 VCU
+ SG_ ICU_Rx_13_Generator2Speed : 48|16@1+ (1,-32000) [-32000|33535] "rpm" Vector__XXX
+ SG_ ICU_Rx_13_Generator1Speed : 16|16@1+ (1,-32000) [-32000|33535] "rpm" Vector__XXX
+ SG_ ICU_Rx_13_Generator2Torque : 32|16@1+ (1,-32000) [-32000|33535] "Nm" Vector__XXX
+ SG_ ICU_Rx_13_Generator1Torque : 0|16@1+ (1,-32000) [-32000|33535] "Nm" Vector__XXX
+
+BO_ 2566658000 ICU_Rx_12: 8 VCU
+ SG_ ICU_Rx_12_GeneratorCtrl2Temp : 56|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ ICU_Rx_12_GeneratorCtrl1Temp : 40|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ ICU_Rx_12_Generator2Temp : 48|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ ICU_Rx_12_Generator1Temp : 32|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ ICU_Rx_12_GeneratorStat : 24|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_12_Generator2FaultCode : 16|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_12_Generator1FaultCode : 8|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_12_Generator2FaultLevel : 4|4@1+ (1,0) [0|5] "enum" Vector__XXX
+ SG_ ICU_Rx_12_Generator1FaultLevel : 0|4@1+ (1,0) [0|5] "enum" Vector__XXX
+
+BO_ 2566592464 ICU_Rx_11: 8 VCU
+ SG_ ICU_Rx_11_Generator1Current : 16|16@1+ (1,-1000) [-1000|64535] "A" Vector__XXX
+ SG_ ICU_Rx_11_Generator2Current : 48|16@1+ (1,-1000) [-1000|64535] "A" Vector__XXX
+ SG_ ICU_Rx_11_Generator2Voltage : 32|16@1+ (1,0) [0|65535] "V" Vector__XXX
+ SG_ ICU_Rx_11_Generator1Voltage : 0|16@1+ (1,0) [0|65535] "V" Vector__XXX
+
+BO_ 2566526928 ICU_Rx_10: 8 VCU
+ SG_ ICU_Rx_10_DCDCFaultCode : 56|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_10_AirPumpFaultCode : 40|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_10_OilPumpFaultCode : 48|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_10_HighVoltCabinFaultCode : 32|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_10_MotElectcCtrlFaultCode : 24|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_10_TMSFaultCode : 16|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_10_BatteryFaultCode : 8|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_10_TMSFaultLevel : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2566461392 ICU_Rx_9: 8 VCU
+ SG_ ICU_Rx_9_BatterFaultClass : 56|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_9_BatterySOC : 48|8@1+ (1,0) [0|255] "perc" Vector__XXX
+ SG_ ICU_Rx_9_BatteryCurrent : 32|16@1+ (0.1,-3200) [-3200|3353.5] "A" Vector__XXX
+ SG_ ICU_Rx_9_BatteryVoltage : 16|16@1+ (0.1,0) [0|6553.5] "V" Vector__XXX
+ SG_ ICU_Rx_9_TransOutputShaftTrq : 0|16@1+ (1,-32000) [-32000|32000] "Nm" Vector__XXX
+
+BO_ 2566395856 ICU_Rx_8: 8 VCU
+ SG_ ICU_Rx_8_GCU2SoftwareVerNum : 56|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_8_GCU1SoftwareVerNum : 48|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_8_MCU3SoftwareVerNum : 40|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_8_MCU2SoftwareVerNum : 32|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_8_MCU1SoftwareVerNum : 24|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_8_TCUSoftwareVerNum : 16|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_8_EMUSoftwareVerNum : 8|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_8_VCUSoftwareVerNum : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2566330320 ICU_Rx_7: 8 VCU
+ SG_ ICU_Rx_7_DriveMotor3FaultCode : 56|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_7_DriveMotor2FaultCode : 48|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_7_DriveMotor1FaultCode : 40|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_7_TCUFaultCode : 32|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_7_BattMinTemp : 24|8@1+ (1,-40) [-40|210] "C" Vector__XXX
+ SG_ ICU_Rx_7_BattMaxTemp : 16|8@1+ (1,-40) [-40|210] "C" Vector__XXX
+ SG_ ICU_Rx_7_DriveMotor3FaultLevel : 12|4@1+ (1,0) [0|5] "enum" Vector__XXX
+ SG_ ICU_Rx_7_DriveMotor2FaultLevel : 8|4@1+ (1,0) [0|5] "enum" Vector__XXX
+ SG_ ICU_Rx_7_DriveMotor1FaultLevel : 4|4@1+ (1,0) [0|5] "enum" Vector__XXX
+ SG_ ICU_Rx_7_TCUFaultLevel : 0|4@1+ (1,0) [0|5] "enum" Vector__XXX
+
+BO_ 2566264784 ICU_Rx_6: 6 VCU
+ SG_ ICU_Rx_6_MinBattInsulationR : 32|16@1+ (1,0) [0|65535] "Kohm" Vector__XXX
+ SG_ ICU_Rx_6_DriveMotor2Spd : 16|16@1+ (1,-32000) [-32000|32000] "rpm" Vector__XXX
+ SG_ ICU_Rx_6_DriveMotor2Trq : 0|16@1+ (1,-32000) [-32000|32000] "Nm" Vector__XXX
+
+BO_ 2566199248 ICU_Rx_5: 8 VCU
+ SG_ ICU_Rx_5_DriveMotor1Spd : 48|16@1+ (1,-32000) [-32000|32000] "rpm" Vector__XXX
+ SG_ ICU_Rx_5_DriveMotor1Trq : 32|16@1+ (1,-32000) [-32000|32000] "Nm" Vector__XXX
+ SG_ ICU_Rx_5_ChrgGunConnecteStat : 24|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ ICU_Rx_5_TrsmOilTemp : 16|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+
+BO_ 2566133712 ICU_Rx_4: 8 VCU
+ SG_ ICU_Rx_4_MotorCtrl2Temp : 56|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ ICU_Rx_4_DriveMotor2Temp : 48|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ ICU_Rx_4_MotorCtrl1Temp : 40|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ ICU_Rx_4_DriveMotor1Temp : 32|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ ICU_Rx_4_SingleWorkTime : 16|16@1+ (1,0) [0|65535] "min" Vector__XXX
+ SG_ ICU_Rx_4_SingleMileage : 0|16@1+ (1,0) [0|65535] "Km" Vector__XXX
+
+BO_ 2566068176 ICU_Rx_3: 8 VCU
+ SG_ ICU_Rx_3_DriveMotor2Curr : 48|16@1+ (1,-1000) [-1000|1000] "A" Vector__XXX
+ SG_ ICU_Rx_3_DriveMotor2Vol : 32|16@1+ (1,0) [0|1000] "V" Vector__XXX
+ SG_ ICU_Rx_3_DriveMotor1Curr : 16|16@1+ (1,-1000) [-1000|1000] "A" Vector__XXX
+ SG_ ICU_Rx_3_DriveMotor1Vol : 0|16@1+ (1,0) [0|1000] "V" Vector__XXX
+
+BO_ 2566002640 ICU_Rx_2: 8 VCU
+ SG_ ICU_Rx_2_PumpFailure : 56|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ ICU_Rx_2_RetarderGear : 52|4@1+ (1,0) [0|5] "enum" Vector__XXX
+ SG_ ICU_Rx_2_BackingLamp : 51|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ ICU_Rx_2_BrkLamp : 50|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ ICU_Rx_2_CylinderBrkStatus : 49|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ ICU_Rx_2_ForcedChrgMode : 48|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ ICU_Rx_2_TrmOutputShaftSpd : 32|16@1+ (1,-32000) [-32000|33535] "rpm" Vector__XXX
+ SG_ ICU_Rx_2_VehSpeed : 16|16@1+ (0.00390625,0) [0|255.99609375] "Kph" Vector__XXX
+ SG_ ICU_Rx_2_BrakePedalOpening : 8|8@1+ (0.4,0) [0|100] "perc" Vector__XXX
+ SG_ ICU_Rx_2_GasPedalOpening : 0|8@1+ (0.4,0) [0|100] "perc" Vector__XXX
+
+BO_ 2565937104 ICU_Rx_1: 8 VCU
+ SG_ ICU_Rx_1_VehFaultCode : 56|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_1_VehFaultLevel : 48|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_1_DCDC1FaultCode : 40|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ ICU_Rx_1_LeadAcidBattVolt : 32|8@1+ (0.2,0) [0|35] "V" Vector__XXX
+ SG_ ICU_Rx_1_GearState : 24|8@1+ (1,-125) [-125|130] "fac" Vector__XXX
+ SG_ ICU_Rx_1_DCDC1FaultLevel : 18|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ICU_Rx_1_30STurnPwrCutOff : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ICU_Rx_1_PTOState : 14|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ICU_Rx_1_DriveMotorStat : 22|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ICU_Rx_1_ScramSwitch : 12|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ICU_Rx_1_HandbrakeModePwrOut : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ICU_Rx_1_BrkCdnState : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ICU_Rx_1_HandbrakeState : 20|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ICU_Rx_1_VehRunState : 6|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ICU_Rx_1_VehReadyState : 4|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ICU_Rx_1_HighPressOnPwrSys : 2|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ ICU_Rx_1_VCUSelfCheckStatus : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2348872609 BMS_Rx_1: 8 Vector__XXX
+ SG_ BMS_Rx_1_VCULife : 56|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ BMS_Rx_1_HV_HVCmd : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2417271283 BMS_Tx_8: 8 Vector__XXX
+ SG_ BMS_Tx_8_REESSOverchrg4 : 7|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_8_SOCJump1 : 9|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_8_SOCTooHigh1 : 8|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_8_EngStorSysMismatch4 : 6|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_8_ConfigErrNubEleCoreStr4 : 5|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_8_TRP4 : 4|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_8_TRA4 : 3|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_8_FireDetectSensorAbn1 : 2|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_8_FireDetectCommLose1 : 1|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_8_PBMUMiddleCANCommFlt4 : 0|1@1+ (1,0) [0|1] "enum" Vector__XXX
+
+BO_ 2417074675 BMS_Tx_7: 8 Vector__XXX
+ SG_ BMS_Tx_7_PBMUKeyonLose4 : 63|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_PBMUHVILFlt4 : 62|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_MiddleCANCommFlt4 : 61|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_TMSSysFlt2 : 60|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_ChrgOvercurrent3 : 59|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_ChrgPort1TInRangeHigh3 : 57|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_ChrgPort1TInRangeHigh2 : 54|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_ChrgPort1TSampOpenCirc3 : 53|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_TMSRlyOpen2 : 52|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_TMSRlyAdh1 : 51|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_ChrgPort1PRlyOpen3 : 46|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_ChrgPort1PRlyAdh3 : 45|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_ChrgPort1NRlyOpen3 : 44|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_ChrgPort1NRlyAdh3 : 43|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_PrechrgFail4 : 42|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_MainNRlyOpen3 : 41|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_MainNRlyAdh4 : 40|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_MainPRlyOpen3 : 39|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_MainPPrechrgRlyAdh4 : 38|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_InnerCANCommFlt4 : 37|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_InnerCANCommFlt3 : 36|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_TMSCommFlt1 : 35|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_PowerCANCommFlt3 : 34|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_BlcCircultOpen1 : 33|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_LECUVoltChipTempHigh1 : 32|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_LECUBoardTempTooHigh1 : 31|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_CellStandTSnsDetectFlt2 : 30|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_CellStandTSnsDetectFlt1 : 29|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_CellVoltRangeFlt3 : 28|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_HVILFault4 : 27|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_HighVoltBusInsLow4 : 26|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_HighVoltBusInsLow2 : 25|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_LossKeyonSignal4 : 24|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_LossChrgSignal3 : 23|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_BMSAbnolOperatingVolt4 : 22|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_SOCTooLow2 : 21|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_SOCTooLow1 : 20|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_FeedbackOvercurrent2 : 19|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_DchgOvercurrent2 : 18|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_BatTempOutControl4 : 17|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_BatTempDiffTooLarge1 : 16|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_BatTempTooLow1 : 15|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_BatTempTooHigh4 : 14|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_BatTempTooHigh3 : 13|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_BatTempTooHigh2 : 12|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_SysConnError4 : 11|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_SysConnError3 : 10|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_TotalVoltDiffTooLarge4 : 9|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_TotalVoltTooLow4 : 8|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_TotalVoltTooHigh4 : 7|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_CellVoltDiffTooLarge1 : 6|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_CellVoltTooLow4 : 5|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_CellVoltTooLow3 : 4|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_CellVoltTooLow2 : 3|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_CellVoltTooHigh4 : 2|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_CellVoltTooHigh3 : 1|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ BMS_Tx_7_CellVoltTooHigh2 : 0|1@1+ (1,0) [0|1] "enum" Vector__XXX
+
+BO_ 2554372595 BMS_Tx_6: 8 Vector__XXX
+ SG_ BMS_Tx_6_AccuDchgAh : 0|32@1+ (1,0) [0|4294967295] "Ah" Vector__XXX
+ SG_ BMS_Tx_6_AccuChrgAh : 32|32@1+ (1,0) [0|4294967295] "Ah" Vector__XXX
+
+BO_ 2552472051 BMS_Tx_5: 8 Vector__XXX
+ SG_ BMS_Tx_5_BatPackNub : 52|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ BMS_Tx_5_BattType : 48|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ BMS_Tx_5_RateEgy : 32|16@1+ (0.1,0) [0|6553.5] "kWh" Vector__XXX
+ SG_ BMS_Tx_5_RateHVolt : 16|16@1+ (0.1,0) [0|6553.5] "V" Vector__XXX
+ SG_ BMS_Tx_5_RateCap : 0|16@1+ (1,0) [0|65535] "Ah" Vector__XXX
+
+BO_ 2552406515 BMS_Tx_4: 8 Vector__XXX
+ SG_ BMS_Tx_4_SOC : 48|16@1+ (0.1,0) [0|6553.5] "perc" Vector__XXX
+ SG_ BMS_Tx_4_HVP : 32|16@1+ (0.1,0) [0|6553.5] "V" Vector__XXX
+ SG_ BMS_Tx_4_HVB : 16|16@1+ (0.1,0) [0|6553.5] "V" Vector__XXX
+ SG_ BMS_Tx_4_TotalI : 0|16@1+ (0.1,-3200) [-3200|3353.5] "A" Vector__XXX
+
+BO_ 2552340979 BMS_Tx_3: 8 Vector__XXX
+ SG_ BMS_Tx_3_SOH : 48|8@1+ (1,0) [0|100] "perc" Vector__XXX
+ SG_ BMS_Tx_3_MinTemp : 40|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ BMS_Tx_3_MaxTemp : 32|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ BMS_Tx_3_MinDchgV : 16|16@1+ (0.1,0) [0|6553.5] "V" Vector__XXX
+ SG_ BMS_Tx_3_MaxChrgV : 0|16@1+ (0.1,0) [0|6553.5] "V" Vector__XXX
+
+BO_ 2552275443 BMS_Tx_2: 8 Vector__XXX
+ SG_ BMS_Tx_2_MaxDchgI : 48|16@1+ (0.1,0) [0|6553.5] "A" Vector__XXX
+ SG_ BMS_Tx_2_MaxFeedbackI : 32|16@1+ (0.1,0) [0|6553.5] "A" Vector__XXX
+ SG_ BMS_Tx_2_MaxPeakDchgI : 16|16@1+ (0.1,0) [0|6553.5] "A" Vector__XXX
+ SG_ BMS_Tx_2_MaxPeakFeedbackI : 0|16@1+ (0.1,0) [0|6553.5] "A" Vector__XXX
+
+BO_ 2348851699 BMS_Tx_1: 8 Vector__XXX
+ SG_ BMS_Tx_1_BMSRlyLife : 56|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ BMS_Tx_1_FaultCode : 48|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ BMS_Tx_1_Chrg1SignSta : 24|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ BMS_Tx_1_HVOffReq : 16|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ BMS_Tx_1_InsCheckSta : 12|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ BMS_Tx_1_HVSta : 4|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ BMS_Tx_1_HighFaultSta : 8|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ BMS_Tx_1_BMSSta : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2147492119 GAM_Tx_1: 8 Vector__XXX
+ SG_ GAM_1_OverWightLevel : 62|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ GAM_1_Right3SnsSts : 61|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ GAM_1_Right2SnsSts : 60|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ GAM_1_Right1SnsSts : 59|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ GAM_1_Left3SnsSts : 58|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ GAM_1_Left2SnsSts : 57|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ GAM_1_Left1SnsSts : 56|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ GAM_1_Right3Pressure : 48|8@1+ (0.1,0) [0|25.5] "Mpa" Vector__XXX
+ SG_ GAM_1_Right2Pressure : 40|8@1+ (0.1,0) [0|25.5] "Mpa" Vector__XXX
+ SG_ GAM_1_Right1Pressure : 32|8@1+ (0.1,0) [0|25.5] "Mpa" Vector__XXX
+ SG_ GAM_1_Left3Pressure : 24|8@1+ (0.1,0) [0|25.5] "Mpa" Vector__XXX
+ SG_ GAM_1_Left2Pressure : 16|8@1+ (0.1,0) [0|25.5] "Mpa" Vector__XXX
+ SG_ GAM_1_Left1Pressure : 8|8@1+ (0.1,0) [0|25.5] "Mpa" Vector__XXX
+ SG_ GAM_1_Weighingweight : 0|8@1+ (1,0) [0|255] "T" Vector__XXX
+
+BO_ 2558783475 PDU_Rx_1: 8 Vector__XXX
+ SG_ PDU_Rx_1_Mot8PreChrgCloCmd : 23|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot8MainPosCloCmd : 22|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot7PreChrgCloCmd : 21|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot7MainPosCloCmd : 20|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot6PreChrgCloCmd : 19|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot6MainPosCloCmd : 18|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot5PreChrgCloCmd : 17|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot5MainPosCloCmd : 16|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot4PreChrgCloCmd : 15|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot4MainPosCloCmd : 14|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot3PreChrgCloCmd : 13|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot3MainPosCloCmd : 12|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot2PreChrgCloCmd : 11|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot2MainPosCloCmd : 10|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot1PreChrgCloCmd : 9|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_Mot1MainPosCloCmd : 8|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ PDU_Rx_1_checksum : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2550330351 PDU_Tx_2: 8 Vector__XXX
+ SG_ PDU_Tx_2_CheckSum : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ PDU_Tx2_Mot8PreChrgFauSts : 14|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx2_Mot8PreChrgConSts : 12|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx2_Mot8MainPosFauSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx2_Mot8MainPosConSts : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2550264815 PDU_Tx_1: 8 Vector__XXX
+ SG_ PDU_Tx1_Mot7PreChrgFauSts : 62|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot7PreChrgConSts : 60|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot7MainPosFauSts : 58|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot7MainPosConSts : 56|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot6PreChrgFauSts : 54|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot6PreChrgConSts : 52|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot6MainPosFauSts : 50|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot6MainPosConSts : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot5PreChrgFauSts : 46|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot5PreChrgConSts : 44|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot5MainPosFauSts : 42|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot5MainPosConSts : 40|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot4PreChrgFauSts : 38|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot4PreChrgConSts : 36|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot4MainPosFauSts : 34|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot4MainPosConSts : 32|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot3PreChrgFauSts : 30|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot3PreChrgConSts : 28|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot3MainPosFauSts : 26|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot3MainPosConSts : 24|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot2PreChrgFauSts : 22|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot2PreChrgConSts : 20|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot2MainPosFauSts : 18|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot2MainPosConSts : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot1PreChrgFauSts : 14|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot1PreChrgConSts : 12|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot1MainPosFauSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx1_Mot1MainPosConSts : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDU_Tx_1_CheckSum : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2566901783 ICU_Tx_2: 8 ICU
+ SG_ ICU_Tx_2_RDOM_FuelLvlRGas : 56|8@1+ (1,0) [0|255] "perc" Vector__XXX
+ SG_ ICU_Tx_2_FDOM_FuelLvlR : 48|8@1+ (1,0) [0|255] "perc" Vector__XXX
+ SG_ ICU_Tx_2_TotalTripMile : 32|16@1+ (0.1,0) [0|6553] "km" Vector__XXX
+ SG_ ICU_Tx_2_TotalODOMile : 0|32@1+ (0.1,0) [0|429496730] "km"  VCU
+
+BO_ 2566836247 ICU_Tx_1: 3 ICU
+ SG_ ICU_Tx_1_ReReservoirPressureWarn : 18|2@1+ (1,0) [0|3] "enum"  VCU
+ SG_ ICU_Tx_1_FrReservoirPressureWarn : 16|2@1+ (1,0) [0|3] "enum"  VCU
+ SG_ ICU_Tx_1_ReReservoirPressure : 8|8@1+ (8,0) [0|2040] "Kpa"  VCU
+ SG_ ICU_Tx_1_FrReservoirPressure : 0|8@1+ (8,0) [0|2040] "Kpa"  VCU
+
+BO_ 2565866992 SCU_Tx_1: 8 Vector__XXX
+ SG_ SCU_Tx_1_GearReqStat : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ SCU_Tx_1_EPModeReqStat : 8|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2565984502 EPS_Tx_02: 8 Vector__XXX
+ SG_ EPS_Tx_02_EPSOutCurrAxis2 : 32|16@1+ (1,0) [0|65535] "mA" Vector__XXX
+ SG_ EPS_Tx_02_EPSModeAxis2 : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ EPS_Tx_02_EPSFltLvlAxis2 : 56|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPS_Tx_02_EPSFltCodeAxis2 : 48|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ EPS_Tx_02_EPSAngSpdAxis2 : 24|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ EPS_Tx_02_EPSAngAxis2 : 8|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+
+BO_ 2566115574 EPS_Tx_04: 8 Vector__XXX
+ SG_ EPS_Tx_04_EPSOutCurrAxis4 : 32|16@1+ (1,0) [0|65535] "mA" Vector__XXX
+ SG_ EPS_Tx_04_EPSModeAxis4 : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ EPS_Tx_04_EPSFltLvlAxis4 : 56|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPS_Tx_04_EPSFltCodeAxis4 : 48|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ EPS_Tx_04_EPSAngSpdAxis4 : 24|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ EPS_Tx_04_EPSAngAxis4 : 8|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+
+BO_ 2566050038 EPS_Tx_03: 8 Vector__XXX
+ SG_ EPS_Tx_03_EPSOutCurrAxis3 : 32|16@1+ (1,0) [0|65535] "mA" Vector__XXX
+ SG_ EPS_Tx_03_EPSModeAxis3 : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ EPS_Tx_03_EPSFltLvlAxis3 : 56|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPS_Tx_03_EPSFltCodeAxis3 : 48|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ EPS_Tx_03_EPSAngSpdAxis3 : 24|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ EPS_Tx_03_EPSAngAxis3 : 8|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+
+BO_ 2566246646 EHB_Tx_02: 8 Vector__XXX
+ SG_ EHB_Tx_02_EHB04PresSt : 36|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Tx_02_EHB04Mode : 32|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Tx_02_EHB04FltCode : 50|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ EHB_Tx_02_EHB04FltLvl : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EHB_Tx_02_EHB03PresSt : 4|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Tx_02_EHB03Mode : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Tx_02_EHB03FltCode : 18|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ EHB_Tx_02_EHB03FltLvl : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2566312182 EHB_Tx_03: 8 Vector__XXX
+ SG_ EHB_Tx_03_EHB06PresSt : 36|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Tx_03_EHB06Mode : 32|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Tx_03_EHB06FltCode : 50|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ EHB_Tx_03_EHB06FltLvl : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EHB_Tx_03_EHB05PresSt : 4|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Tx_03_EHB05Mode : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Tx_03_EHB05FltCode : 18|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ EHB_Tx_03_EHB05FltLvl : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2566377718 EHB_Tx_04: 8 Vector__XXX
+ SG_ EHB_Tx_04_EHB08PresSt : 36|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Tx_04_EHB08Mode : 32|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Tx_04_EHB08FltCode : 50|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ EHB_Tx_04_EHB08FltLvl : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EHB_Tx_04_EHB07PresSt : 4|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Tx_04_EHB07Mode : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Tx_04_EHB07FltCode : 18|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ EHB_Tx_04_EHB07FltLvl : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2566181110 EHB_Tx_01: 8 Vector__XXX
+ SG_ EHB_Tx_01_EHB02PresSt : 36|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Tx_01_EHB02Mode : 32|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Tx_01_EHB02FltCode : 50|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ EHB_Tx_01_EHB02FltLvl : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EHB_Tx_01_EHB01PresSt : 4|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Tx_01_EHB01Mode : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Tx_01_EHB01FltCode : 18|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ EHB_Tx_01_EHB01FltLvl : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2566880239 RECU_Rx_1: 8 Vector__XXX
+ SG_ RECU_Rx_1_VCU16PwrTakeOffCmd : 2|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ RECU_Rx_1_VCU16RollingCounter : 56|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ RECU_Rx_1_VCU16PwrRequest : 8|16@1+ (0.02,-654) [-654|656] "kw" Vector__XXX
+ SG_ RECU_Rx_1_VCU16RECUActDischrg : 1|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ RECU_Rx_1_VCU16RECtrlCmd : 0|1@1+ (1,0) [0|1] "enum" Vector__XXX
+
+BO_ 2566443254 EPB_Tx_01: 8 Vector__XXX
+ SG_ EPB_Tx_04_EPB4Sts : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPB_Tx_04_EPB4FltLvl : 50|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPB_Tx_04_EPB4FltCode : 52|12@1+ (1,0) [0|4095] "enum" Vector__XXX
+ SG_ EPB_Tx_03_EPB3Sts : 32|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPB_Tx_03_EPB3FltLvl : 34|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPB_Tx_03_EPB3FltCode : 36|12@1+ (1,0) [0|4095] "enum" Vector__XXX
+ SG_ EPB_Tx_02_EPB2Sts : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPB_Tx_02_EPB2FltLvl : 18|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPB_Tx_02_EPB2FltCode : 20|12@1+ (1,0) [0|4095] "enum" Vector__XXX
+ SG_ EPB_Tx_01_EPB1FltCode : 4|12@1+ (1,0) [0|4095] "enum" Vector__XXX
+ SG_ EPB_Tx_01_EPB1FltLvl : 2|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPB_Tx_01_EPB1Sts : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2565928656 EPS_Rx_01: 8 Vector__XXX
+ SG_ EPS_Rx_01_EPS2AxisAngSpdReq : 56|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ EPS_Rx_01_EPS2AxisAngReq : 40|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ EPS_Rx_01_EPS2AxisModeReq : 32|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ EPS_Rx_01_EPS1AxisAngSpdReq : 24|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ EPS_Rx_01_EPS1AxisAngReq : 8|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ EPS_Rx_01_EPS1AxisModeReq : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2565994192 EPS_Rx_02: 8 Vector__XXX
+ SG_ EPS_Rx_02_EPS4AxisAngSpdReq : 56|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ EPS_Rx_02_EPS4AxisAngReq : 40|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ EPS_Rx_02_EPS4AxisModeReq : 32|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ EPS_Rx_02_EPS3AxisAngSpdReq : 24|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ EPS_Rx_02_EPS3AxisAngReq : 8|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ EPS_Rx_02_EPS3AxisModeReq : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2566059728 EHB_Rx_01: 8 Vector__XXX
+ SG_ EHB_Rx_01_EHB4PresReq : 52|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Rx_01_EHB4ModeReq : 48|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Rx_01_EHB3PresReq : 36|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Rx_01_EHB3ModeReq : 32|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Rx_01_EHB2PresReq : 20|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Rx_01_EHB2ModeReq : 16|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Rx_01_EHB1PresReq : 4|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Rx_01_EHB1ModeReq : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2566125264 EHB_Rx_02: 8 Vector__XXX
+ SG_ EHB_Rx_02_EHB8PresReq : 52|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Rx_02_EHB8ModeReq : 48|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Rx_02_EHB7PresReq : 36|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Rx_02_EHB7ModeReq : 32|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Rx_02_EHB6PresReq : 20|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Rx_02_EHB6ModeReq : 16|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ EHB_Rx_02_EHB5PresReq : 4|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ EHB_Rx_02_EHB5ModeReq : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2566190800 EPB_Rx_01: 8 Vector__XXX
+ SG_ EPB_Rx_01_EPB4VehSpd : 40|8@1+ (1,0) [0|255] "kph" Vector__XXX
+ SG_ EPB_Rx_01_EPB4StrModReq : 32|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ EPB_Rx_01_EPB4CtlReq : 24|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPB_Rx_01_EPB3CtlReq : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPB_Rx_01_EPB2CtlReq : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ EPB_Rx_01_EPB1CtlReq : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2566264823 RECU_6: 8 Vector__XXX
+ SG_ RECU_6_RollingCounter : 56|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ RECU_6_RE_GrossGeneration_DP : 32|24@1+ (1,0) [0|999999] "kWh" Vector__XXX
+ SG_ RECU_6_EngineTq : 16|16@1+ (0.25,-8000) [-2000|8383.5] "Nm" Vector__XXX
+ SG_ RECU_6_EngineSpd : 0|16@1+ (0.25,-8000) [-2000|8383.5] "rpm" Vector__XXX
+
+BO_ 2566199287 RECU_5: 8 Vector__XXX
+ SG_ RECU_5_DTC_FaultCode : 32|32@1+ (1,0) [0|65535] "enum" Vector__XXX
+ SG_ RECU_5_EMS_TqCmd : 16|16@1+ (0.5,-1500) [-1500|1500] "Nm" Vector__XXX
+ SG_ RECU_5_EMS_SpdCmd : 0|16@1+ (1,-10000) [-10000|10000] "rpm" Vector__XXX
+
+BO_ 2566133751 RECU_4: 8 Vector__XXX
+ SG_ RECU_4_RE_ActISGTq2_DP : 48|16@1+ (1,-5000) [-5000|5000] "Nm" Vector__XXX
+ SG_ RECU_4_RE_ActISGSpd2_DP : 32|16@1+ (1,0) [0|8032] "rpm" Vector__XXX
+ SG_ RECU_4_MCU2_SpdCmd : 0|16@1+ (1,-10000) [-10000|10000] "rpm" Vector__XXX
+ SG_ RECU_4_MCU2_Tq_Cmd : 16|16@1+ (0.5,-1500) [-1500|1500] "Nm" Vector__XXX
+
+BO_ 2566068215 RECU_3: 8 Vector__XXX
+ SG_ RECU_3_RE_ActISGTq1_DP : 48|16@1+ (1,-5000) [-5000|5000] "Nm" Vector__XXX
+ SG_ RECU_3_RE_ActISGSpd1_DP : 32|16@1+ (1,0) [0|8032] "rpm" Vector__XXX
+ SG_ RECU_3_MCU1_Tq_Cmd : 16|16@1+ (0.5,-1500) [-1500|1500] "Nm" Vector__XXX
+ SG_ RECU_3_MCU1_SpdCmd : 0|16@1+ (1,-10000) [-10000|10000] "rpm" Vector__XXX
+
+BO_ 2566002679 RECU_2: 8 Vector__XXX
+ SG_ RECU_2_GCUTemp2 : 56|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ RECU_2_ActIsgTemp2_Act : 48|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ RECU_2_GCUTemp1 : 40|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ RECU_2_ActIsgTemp1_Act : 32|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ RECU_2_DCLinkCurr_Act : 16|16@1+ (0.02,-640) [-640|640] "A" Vector__XXX
+ SG_ RECU_2_DCLinkVol_Act : 0|16@1+ (0.1,0) [0|6553.4] "V" Vector__XXX
+
+BO_ 2565937143 RECU_1: 8 Vector__XXX
+ SG_ RECU_1_EMSTemp : 56|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ RECU_1_RE_SystemReady : 10|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ RECU_1_RollingCounter : 52|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ RECU_1_ATS_Fault : 51|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ RECU_1_START_ENABLE : 50|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ RECU_1_IsgSpdDirection : 49|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ RECU_1_GCU_Fault : 48|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ RECU_1_MaxPower : 32|16@1+ (0.02,-654) [-654|656] "kw" Vector__XXX
+ SG_ RECU_1_PowerFb_Act : 16|16@1+ (0.02,-654) [-654|656] "kw" Vector__XXX
+ SG_ RECU_1_ECUActive : 14|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ RECU_1_GCUActive : 13|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ RECU_1_MCU_En : 11|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ RECU_1_SelfCheck_State : 9|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ RECU_1_CutOffLV_Req : 8|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ RECU_1_ActiveDischg_FB : 5|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ RECU_1_FaultLevel : 2|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ RECU_1_WorkStatus_Act : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2566321616 WVCU_DrvrIntention2: 8 Vector__XXX
+ SG_ WVCU_PowerDownFit : 32|1@1- (1,0) [0|0] "" Vector__XXX
+ SG_ WVCU_LimpPowerFit : 34|1@1- (1,0) [0|0] "" Vector__XXX
+ SG_ WVCU_LimprFit : 35|1@1- (1,0) [0|0] "" Vector__XXX
+ SG_ WVCU_ForbEneryFit : 33|1@1- (1,0) [0|0] "" Vector__XXX
+ SG_ WVCU_OnGearKeySig : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_ChrgWakeUpSig : 2|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_EngyRecoveryDisblSw : 12|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_FExtrctrReqSw : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_STARTGearKeySig : 6|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_ACCGearKeySig : 4|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_ADUModeSwSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_EngyRecovery04GearSwSig : 20|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_EngyRecovery03GearSwSig : 18|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_EngyRecovery02GearSwSig : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_EngyRecovery01GearSwSig : 14|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_PrkBrkSwSig : 24|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_BrkPedallSigSts : 22|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_WaterPump2FltSts : 28|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_WaterPump1FltSts : 26|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2563503312 WVCU_Brk_7_Sts: 8 Vector__XXX
+ SG_ Brk_7_Sts08PresSts : 36|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ Brk_7_Sts08Mode : 32|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ Brk_7_Sts08FltLvl : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Brk_7_Sts08FltCode : 50|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ Brk_7_Sts07FltCode : 18|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ Brk_7_Sts07FltLvl : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Brk_7_Sts07PresSts : 4|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ Brk_7_Sts07Mode : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2563437776 WVCU_Brk_5_Sts: 8 Vector__XXX
+ SG_ Brk_5_Sts06PresSts : 36|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ Brk_5_Sts06Mode : 32|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ Brk_5_Sts06FltLvl : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Brk_5_Sts06FltCode : 50|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ Brk_5_Sts05FltCode : 18|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ Brk_5_Sts05FltLvl : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Brk_5_Sts05PresSts : 4|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ Brk_5_Sts05Mode : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2563372240 WVCU_Brk_3_Sts: 8 Vector__XXX
+ SG_ Brk_3_Sts04PresSts : 36|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ Brk_3_Sts04Mode : 32|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ Brk_3_Sts04FltLvl : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Brk_3_Sts04FltCode : 50|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ Brk_3_Sts03FltCode : 18|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ Brk_3_Sts03FltLvl : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Brk_3_Sts03PresSts : 4|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ Brk_3_Sts03Mode : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2563306704 WVCU_Brk_1_Sts: 8 Vector__XXX
+ SG_ Brk_1_Sts02PresSts : 36|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ Brk_1_Sts02Mode : 32|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ Brk_1_Sts02FltLvl : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Brk_1_Sts02FltCode : 50|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ Brk_1_Sts01FltCode : 18|14@1+ (1,0) [0|16383] "enum" Vector__XXX
+ SG_ Brk_1_Sts01FltLvl : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Brk_1_Sts01PresSts : 4|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ Brk_1_Sts01Mode : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2562979024 WVCU_Str_4_Sts: 8 Vector__XXX
+ SG_ Str_4_StsFltLvl : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Str_4_StsFltCode : 40|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ Str_4_StsOutCurr : 32|8@1+ (1,0) [0|255] "A" Vector__XXX
+ SG_ Str_4_AngSpdSts : 24|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ Str_4_AngSts : 8|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ Str_4_ModeSts : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2562913488 WVCU_Str_3_Sts: 8 Vector__XXX
+ SG_ Str_3_StsFltLvl : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Str_3_StsFltCode : 40|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ Str_3_StsOutCurr : 32|8@1+ (1,0) [0|255] "A" Vector__XXX
+ SG_ Str_3_AngSpdSts : 24|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ Str_3_AngSts : 8|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ Str_3_ModeSts : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2562847952 WVCU_Str_2_Sts_: 8 Vector__XXX
+ SG_ Str_2_StsFltLvl : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Str_2_StsFltCode : 40|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ Str_2_StsOutCurr : 32|8@1+ (1,0) [0|255] "A" Vector__XXX
+ SG_ Str_2_AngSpdSts : 24|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ Str_2_AngSts : 8|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ Str_2_ModeSts : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2562782416 WVCU_Str_1_Sts: 8 Vector__XXX
+ SG_ Str_1_StsFltLvl : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Str_1_StsFltCode : 40|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ Str_1_StsOutCurr : 32|8@1+ (1,0) [0|255] "A" Vector__XXX
+ SG_ Str_1_AngSpdSts : 24|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ Str_1_AngSts : 8|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ Str_1_ModeSts : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2562192592 WVCU_Mot_8_Sts03: 8 Vector__XXX
+ SG_ Mot_8_Sts03IGBTTemp_W : 36|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_8_Sts03IGBTTemp_V : 27|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_8_Sts03IGBTTemp_U : 18|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_8_Sts03MotTemp : 9|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_8_Sts03MCUTemp : 0|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+
+BO_ 2562127056 WVCU_Mot_8_Sts02: 8 Vector__XXX
+ SG_ Mot_8_Sts02MotMaxDisChrgTq : 32|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_8_Sts02MotMaxDrvTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_8_Sts02DisChrgSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_8_Sts02HVILST : 12|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_8_Sts02FltLvl : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_8_Sts02MotWorkMode : 4|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ Mot_8_Sts02IvtrSts : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2562061520 WVCU_Mot_8_Sts01: 8 Vector__XXX
+ SG_ Mot_8_Sts01MotTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_8_Sts01MotSpd_Q : 15|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_8_Sts01MotSpd : 0|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+
+BO_ 2561995984 WVCU_Mot_7_Sts03: 8 Vector__XXX
+ SG_ Mot_7_Sts03IGBTTemp_W : 36|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_7_Sts03IGBTTemp_V : 27|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_7_Sts03IGBTTemp_U : 18|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_7_Sts03MotTemp : 9|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_7_Sts03MCUTemp : 0|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+
+BO_ 2561930448 WVCU_Mot_7_Sts02: 8 Vector__XXX
+ SG_ Mot_7_Sts02MotMaxDisChrgTq : 32|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_7_Sts02MotMaxDrvTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_7_Sts02DisChrgSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_7_Sts02HVILST : 12|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_7_Sts02FltLvl : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_7_Sts02MotWorkMode : 4|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ Mot_7_Sts02IvtrSts : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2561864912 WVCU_Mot_7_Sts01: 8 Vector__XXX
+ SG_ Mot_7_Sts01MotTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_7_Sts01MotSpd_Q : 15|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_7_Sts01MotSpd : 0|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+
+BO_ 2561799376 WVCU_Mot_6_Sts03: 8 Vector__XXX
+ SG_ Mot_6_Sts03IGBTTemp_W : 36|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_6_Sts03IGBTTemp_V : 27|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_6_Sts03IGBTTemp_U : 18|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_6_Sts03MotTemp : 9|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_6_Sts03MCUTemp : 0|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+
+BO_ 2561733840 WVCU_Mot_6_Sts02: 8 Vector__XXX
+ SG_ Mot_6_Sts02MotMaxDisChrgTq : 32|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_6_Sts02MotMaxDrvTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_6_Sts02DisChrgSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_6_Sts02HVILST : 12|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_6_Sts02FltLvl : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_6_Sts02MotWorkMode : 4|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ Mot_6_Sts02IvtrSts : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2561668304 WVCU_Mot_6_Sts01: 8 Vector__XXX
+ SG_ Mot_6_Sts01MotTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_6_Sts01MotSpd_Q : 15|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_6_Sts01MotSpd : 0|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+
+BO_ 2561602768 WVCU_Mot_5_Sts03: 8 Vector__XXX
+ SG_ Mot_5_Sts03IGBTTemp_W : 36|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_5_Sts03IGBTTemp_V : 27|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_5_Sts03IGBTTemp_U : 18|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_5_Sts03MotTemp : 9|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_5_Sts03MCUTemp : 0|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+
+BO_ 2561537232 WVCU_Mot_5_Sts02: 8 Vector__XXX
+ SG_ Mot_5_Sts02MotMaxDisChrgTq : 32|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_5_Sts02MotMaxDrvTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_5_Sts02DisChrgSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_5_Sts02HVILST : 12|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_5_Sts02FltLvl : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_5_Sts02MotWorkMode : 4|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ Mot_5_Sts02IvtrSts : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2561471696 WVCU_Mot_5_Sts01: 8 Vector__XXX
+ SG_ Mot_5_Sts01MotTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_5_Sts01MotSpd_Q : 15|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_5_Sts01MotSpd : 0|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+
+BO_ 2561406160 WVCU_Mot_4_Sts03: 8 Vector__XXX
+ SG_ Mot_4_Sts03IGBTTemp_W : 36|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_4_Sts03IGBTTemp_V : 27|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_4_Sts03IGBTTemp_U : 18|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_4_Sts03MotTemp : 9|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_4_Sts03MCUTemp : 0|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+
+BO_ 2561340624 WVCU_Mot_4_Sts02: 8 Vector__XXX
+ SG_ Mot_4_Sts02MotMaxDisChrgTq : 32|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_4_Sts02MotMaxDrvTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_4_Sts02DisChrgSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_4_Sts02HVILST : 12|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_4_Sts02FltLvl : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_4_Sts02MotWorkMode : 4|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ Mot_4_Sts02IvtrSts : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2561275088 WVCU_Mot_4_Sts01: 8 Vector__XXX
+ SG_ Mot_4_Sts01MotTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_4_Sts01MotSpd_Q : 15|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_4_Sts01MotSpd : 0|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+
+BO_ 2561209552 WVCU_Mot_3_Sts03: 8 Vector__XXX
+ SG_ Mot_3_Sts03IGBTTemp_W : 36|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_3_Sts03IGBTTemp_V : 27|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_3_Sts03IGBTTemp_U : 18|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_3_Sts03MotTemp : 9|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_3_Sts03MCUTemp : 0|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+
+BO_ 2561144016 WVCU_Mot_3_Sts02: 8 Vector__XXX
+ SG_ Mot_3_Sts02MotMaxDisChrgTq : 32|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_3_Sts02MotMaxDrvTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_3_Sts02DisChrgSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_3_Sts02HVILST : 12|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_3_Sts02FltLvl : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_3_Sts02MotWorkMode : 4|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ Mot_3_Sts02IvtrSts : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2561078480 WVCU_Mot_3_Sts01: 8 Vector__XXX
+ SG_ Mot_3_Sts01MotTq : 16|14@1+ (0.1,-800) [-800|838.3] "rpm" Vector__XXX
+ SG_ Mot_3_Sts01MotSpd_Q : 15|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_3_Sts01MotSpd : 0|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+
+BO_ 2561012944 WVCU_Mot_2_Sts03: 8 Vector__XXX
+ SG_ Mot_2_Sts03IGBTTemp_W : 36|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_2_Sts03IGBTTemp_V : 27|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_2_Sts03IGBTTemp_U : 18|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_2_Sts03MotTemp : 9|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_2_Sts03MCUTemp : 0|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+
+BO_ 2560947408 WVCU_Mot_2_Sts02: 8 Vector__XXX
+ SG_ Mot_2_Sts02MotMaxDisChrgTq : 32|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_2_Sts02MotMaxDrvTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_2_Sts02DisChrgSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_2_Sts02HVILST : 12|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_2_Sts02FltLvl : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_2_Sts02MotWorkMode : 4|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ Mot_2_Sts02IvtrSts : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2560881872 WVCU_Mot_2_Sts01: 8 Vector__XXX
+ SG_ Mot_2_Sts01MotTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_2_Sts01MotSpd_Q : 15|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_2_Sts01MotSpd : 0|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+
+BO_ 2560816336 WVCU_Mot_1_Sts03: 8 Vector__XXX
+ SG_ Mot_1_Sts03IGBTTemp_W : 36|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_1_Sts03IGBTTemp_V : 27|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_1_Sts03IGBTTemp_U : 18|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_1_Sts03MotTemp : 9|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ Mot_1_Sts03MCUTemp : 0|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+
+BO_ 2560750800 WVCU_Mot_1_Sts02: 8 Vector__XXX
+ SG_ Mot_1_Sts02MotMaxDisChrgTq : 32|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_1_Sts02MotMaxDrvTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_1_Sts02DisChrgSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_1_Sts02HVILST : 12|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_1_Sts02FltLvl : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Mot_1_Sts02MotWorkMode : 4|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ Mot_1_Sts02IvtrSts : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2560685264 WVCU_Mot_1_Sts01: 8 Vector__XXX
+ SG_ Mot_1_Sts01MotTq : 16|14@1+ (0.1,-800) [-800|838.3] "Nm" Vector__XXX
+ SG_ Mot_1_Sts01MotSpd_Q : 15|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ Mot_1_Sts01MotSpd : 0|14@1+ (1,-8000) [-8000|8383] "rpm" Vector__XXX
+
+BO_ 2565928400 WVCU_VehShakeHandSts: 8 Vector__XXX
+ SG_ WVCU_EPSEHBTx01EPSAngAxisSteer : 16|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ WVCU_ShakeHandSts : 8|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2564420816 WVCU_VehPDUStatus02: 8 Vector__XXX
+ SG_ PDUSts_Mot8PrecFltSts : 14|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot8PrecCntctrSts : 12|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot8MainPosFltSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot8MainPosCntctrSts : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_RollCnt02 : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2564355280 WVCU_VehPDUStatus01: 8 Vector__XXX
+ SG_ PDUSts_Mot7PrecFltSts : 62|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot7PrecCntctrSts : 60|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot7MainPosFltSts : 58|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot7MainPosCntctrSts : 56|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot6PrecFltSts : 54|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot6PrecCntctrSts : 52|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot6MainPosFltSts : 50|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot6MainPosCntctrSts : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot5PrecFltSts : 46|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot5PrecCntctrSts : 44|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot5MainPosFltSts : 42|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot5MainPosCntctrSts : 40|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot4PrecFltSts : 38|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot4PrecCntctrSts : 36|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot4MainPosFltSts : 34|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot4MainPosCntctrSts : 32|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot3PrecFltSts : 30|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot3PrecCntctrSts : 28|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot3MainPosFltSts : 26|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot3MainPosCntctrSts : 24|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot2PrecFltSts : 22|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot2PrecCntctrSts : 20|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot2MainPosFltSts : 18|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot2MainPosCntctrSts : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot1PrecFltSts : 14|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot1PrecCntctrSts : 12|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot1MainPosFltSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_Mot1MainPosCntctrSts : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ PDUSts_RollCnt01 : 0|8@1+ (1,0) [0|255] "enum" Vector__XXX
+
+BO_ 2563962064 WVCU_BatStatus03: 8 Vector__XXX
+ SG_ BatSts03_SOC : 48|16@1+ (0.1,0) [0|6553.5] "perc" Vector__XXX
+ SG_ BatSts03_HVP : 32|16@1+ (0.1,0) [0|6553.5] "V" Vector__XXX
+ SG_ BatSts03_HVB : 16|16@1+ (0.1,0) [0|6553.5] "V" Vector__XXX
+ SG_ BatSts03_TotalCurr : 0|16@1+ (0.1,-3200) [-3200|3353.5] "A" Vector__XXX
+
+BO_ 2563896528 WVCU_BatStatus02: 8 Vector__XXX
+ SG_ BatSts02_MaxAllwblDchaCurr : 48|16@1+ (0.1,0) [0|6553.5] "A" Vector__XXX
+ SG_ BatSts02_MaxAllwblFbCurr : 32|16@1+ (0.1,0) [0|6553.5] "A" Vector__XXX
+ SG_ BatSts02_MaxAllwblPeakDchaCurr : 16|16@1+ (0.1,0) [0|6553.5] "A" Vector__XXX
+ SG_ BatSts02_MaxAllwblPeakFbCurr : 0|16@1+ (0.1,0) [0|6553.5] "A" Vector__XXX
+
+BO_ 2563830992 WVCU_BatStatus01: 8 Vector__XXX
+ SG_ WVCU_BMSTx3SOH : 16|8@1+ (1,0) [0|100] "perc" Vector__XXX
+ SG_ BatSts01_BMSMaxFltLvl : 8|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ BatSts01_BMSPwrUpSts : 4|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ BatSts01_BMSSts : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+BO_ 2563765456 WVCU_Prk_1_Sts: 8 Vector__XXX
+ SG_ Prk_1_Sts04Mode : 48|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Prk_1_Sts04FltLvl : 50|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Prk_1_Sts04FltCode : 52|12@1+ (1,0) [0|4095] "enum" Vector__XXX
+ SG_ Prk_1_Sts03Mode : 32|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Prk_1_Sts03FltLvl : 34|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Prk_1_Sts03FltCode : 36|12@1+ (1,0) [0|4095] "enum" Vector__XXX
+ SG_ Prk_1_Sts02Mode : 16|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Prk_1_Sts02FltLvl : 18|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Prk_1_Sts02FltCode : 20|12@1+ (1,0) [0|4095] "enum" Vector__XXX
+ SG_ Prk_1_Sts01Mode : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Prk_1_Sts01FltLvl : 2|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ Prk_1_Sts01FltCode : 4|12@1+ (1,0) [0|4095] "enum" Vector__XXX
+
+BO_ 2565993936 WVCU_BodyStatus: 8 Vector__XXX
+ SG_ Body_FuelLvlRGas_ohm : 32|16@1+ (0.1,0) [0|6553.5] "" Vector__XXX
+ SG_ Body_FuelLvlR_ohm : 16|16@1+ (0.1,0) [0|6553.5] "" Vector__XXX
+ SG_ BodySts_BrkLampSts : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ BodySts_HighBeamLampSts : 8|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ BodySts_LowBeamLampSts : 6|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ BodySts_TurnRLampSts : 4|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ BodySts_TurnLLampSts : 2|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ BodySts_JobActionSts : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2566387152 WVCU_RmtIntention: 8 Vector__XXX
+ SG_ WVCU_RmtJob : 34|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_RmtHorn : 32|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_RmtLgt : 20|12@1+ (0.1,-100) [-100|104.7] "perc" Vector__XXX
+ SG_ WVCU_RmtHozl : 8|12@1+ (0.1,-100) [-100|104.7] "perc" Vector__XXX
+ SG_ WVCU_RmtSteerModeReq : 5|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ WVCU_RmtConnectSts : 4|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ WVCU_RmtGearReq : 1|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ WVCU_RmtCtrlModeReq : 0|1@1+ (1,0) [0|1] "enum" Vector__XXX
+
+BO_ 2566256080 WVCU_DrvrIntention: 8 Vector__XXX
+ SG_ WVCU_WtrTempSnsr2Temp : 48|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ WVCU_WtrTempSnsr1Temp : 32|9@1+ (0.5,-40) [-40|215.5] "C" Vector__XXX
+ SG_ WVCU_GearCtrlReqSts : 57|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ WVCU_BrkPedallStk_Q : 26|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_BrkPedallStk : 16|10@1+ (0.1,0) [0|102.3] "perc" Vector__XXX
+ SG_ WVCU_APSSts_Q : 10|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_APSSts : 0|10@1+ (0.1,0) [0|102.3] "perc" Vector__XXX
+
+BO_ 2566190544 WVCU_VCUPwrReq: 8 Vector__XXX
+ SG_ WVCU_VehStrAngSpdReq : 48|8@1+ (1,0) [0|255] "degps" Vector__XXX
+ SG_ WVCU_VehStrAngReq : 32|16@1+ (0.1,-1575) [-1575|1575] "deg" Vector__XXX
+ SG_ WVCU_VehBrkPercReq : 20|12@1+ (0.1,0) [0|409.5] "bar" Vector__XXX
+ SG_ WVCU_VehPrkReq : 17|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_VehSpdReq_Q : 16|1@1+ (1,0) [0|1] "enum" Vector__XXX
+ SG_ WVCU_VehSpdReq : 0|16@1+ (1,-500) [-500|6053.5] "kph" Vector__XXX
+
+BO_ 2566125008 WVCU_VehSpdStsNow: 8 Vector__XXX
+ SG_ WVCU_RECU2DCLinkVol_Act : 32|16@1+ (0.1,0) [0|6553.4] "V" Vector__XXX
+ SG_ WVCU_RECU2DCLinkCurr_Act : 16|16@1+ (0.02,-640) [-640|640] "A" Vector__XXX
+ SG_ WVCU_RECU1EMSTemp : 48|8@1+ (1,-40) [-40|215] "C" Vector__XXX
+ SG_ WVCU_VehSpdNow : 0|16@1+ (0.1,-500) [-500|6053.5] "kph" Vector__XXX
+
+BO_ 2566059472 WVCU_VCUSts: 8 Vector__XXX
+ SG_ WVCU_REFltCode : 24|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ WVCU_VehRdySts : 52|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ WVCU_24VLowVolBat : 42|10@1+ (0.1,0) [0|102.3] "V" Vector__XXX
+ SG_ WVCU_MCUFltLvl : 40|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_EHBFltLvl : 38|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_EPSFltLvl : 36|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_EPBFltLvl : 34|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_BMSFltLvl : 32|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_VMCFltCode : 16|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ WVCU_PMCFltCode : 8|8@1+ (1,0) [0|255] "enum" Vector__XXX
+ SG_ WVCU_VehFltLvl : 4|3@1+ (1,0) [0|4] "enum" Vector__XXX
+ SG_ WVCU_GearStsNow : 2|2@1+ (1,0) [0|3] "enum" Vector__XXX
+ SG_ WVCU_EmgySwtchSts : 0|2@1+ (1,0) [0|3] "enum" Vector__XXX
+
+BO_ 2566897978 MasterTMS_Tx_BMS: 8 TMS
+ SG_ TMS_Tx_BMS_TMSFltLvl : 63|2@0+ (1,0) [0|3] "" Vector__XXX
+ SG_ TMS_Tx_BMS_TMSFltCode : 61|6@0+ (1,0) [0|63] "" Vector__XXX
+ SG_ TMS_Tx_BMS_TMSRequiredPwr : 47|16@0+ (0.1,0) [0|100] "Kw" Vector__XXX
+ SG_ TMS_Tx_BMS_InputWaterTemp : 23|8@0- (1,-40) [-40|87] "℃" Vector__XXX
+ SG_ TMS_Tx_BMS_OutputWaterTemp : 15|8@0- (1,-40) [-40|87] "℃" Vector__XXX
+ SG_ TMS_Tx_BMS_TMSHVRlySt : 3|2@0+ (1,0) [0|3] "" Vector__XXX
+ SG_ TMS_Tx_BMS_TMSWorkMode : 1|2@0+ (1,0) [0|3] "" Vector__XXX
+
+BO_ 2566866420 BMS_Tx_TMS: 8 BMS
+ SG_ BMS_Tx_TMS_CRCChk : 63|8@0+ (1,0) [0|255] "" Vector__XXX
+ SG_ BMS_Tx_TMS_BMSLive : 55|8@0+ (1,0) [0|255] "" Vector__XXX
+ SG_ BMS_Tx_TMS_SetTemp : 39|8@0- (1,-40) [-40|87] "℃" Vector__XXX
+ SG_ BMS_Tx_TMS_CurrVolt : 15|16@0+ (1,0) [0|1000] "V" Vector__XXX
+ SG_ BMS_Tx_TMS_BMSHVRlySt : 7|2@0+ (1,0) [0|3] "" Vector__XXX
+ SG_ BMS_Tx_TMS_ChargeSt : 5|2@0+ (1,0) [0|3] "" Vector__XXX
+ SG_ BMS_Tx_TMS_HVReqSt : 3|2@0+ (1,0) [0|3] "" Vector__XXX
+ SG_ BMS_Tx_TMS_BMSSetModeReq : 1|2@0+ (1,0) [0|3] "" Vector__XXX
+
+BO_ 2566898234 SlaveTMS_Tx_BMS: 8 Vector__XXX
+ SG_ TMS_Tx_BMS_SlaveTMSFltLvl : 63|2@0+ (1,0) [0|3] "" Vector__XXX
+ SG_ TMS_Tx_BMS_SlaveTMSFltCode : 61|6@0+ (1,0) [0|63] "" Vector__XXX
+ SG_ TMS_Tx_BMS_SlaveTMSRequiredPwr : 47|16@0+ (0.1,0) [0|100] "Kw" Vector__XXX
+ SG_ TMS_Tx_BMS_OutputWaterTemp : 23|8@0- (1,-40) [-40|87] "℃" Vector__XXX
+ SG_ TMS_Tx_BMS_InputWaterTemp : 15|8@0- (1,-40) [-40|87] "℃" Vector__XXX
+ SG_ TMS_Tx_BMS_SlaveTMSHVRlySt : 3|2@0+ (1,0) [0|3] "" Vector__XXX
+ SG_ TMS_Tx_BMS_SlaveTMSWorkMode : 1|2@0+ (1,0) [0|3] "" Vector__XXX
+
+BO_ 2566845491 TPMS_Tx_1: 8 Vector__XXX
+ SG_ TPMS_Tx_1_TirePressThresholdDect : 56|3@1+ (1,0) [0|7] "enum" Vector__XXX
+ SG_ TPMS_Tx_1_TireAirLeakageRate : 32|16@1+ (0.1,0) [0|6553.5] "paps" Vector__XXX
+ SG_ TPMS_Tx_1_TireTemperature : 16|16@1+ (0.03125,-273) [-273|1774.96875] "C" Vector__XXX
+ SG_ TPMS_Tx_1_TirePressure : 8|8@1+ (8,0) [0|2040] "Kpa" Vector__XXX
+ SG_ TPMS_Tx_1_TireLocationDirection : 4|4@1+ (1,0) [0|15] "enum" Vector__XXX
+ SG_ TPMS_Tx_1_TireLocationAxle : 0|4@1+ (1,0) [0|15] "enum" Vector__XXX
+
+
+
+CM_ BO_ 3221225472 "This is a message for not used signals, created by Vector CANdb++ DBC OLE DB Provider.";
+CM_ SG_ 3221225472 RC_Tx_1JobReq "作业请求";
+CM_ SG_ 3221225472 RC_Tx_1HornReq "喇叭请求";
+CM_ SG_ 3221225472 RC_Tx_1LgtRockerOpenReq "纵向摇杆开度请求";
+CM_ SG_ 3221225472 RC_Tx_1LatRockerOpenReq "横向摇杆开度请求";
+CM_ SG_ 3221225472 RC_Tx_1StrModeReq "转向模式请求";
+CM_ SG_ 3221225472 RC_Tx_1RmtSts "遥控器连接状态";
+CM_ SG_ 2564027600 WVCU_BMSTx6AccuDchgAh "总放电电量";
+CM_ SG_ 2564027600 WVCU_BMSTx6AccuChrgAh "总充电电量";
+CM_ SG_ 2552037781 FDOM2TopDeadSw "水温传感器2温度";
+CM_ SG_ 2552037781 FDOM2BottomDeadSw2 "水温传感器2温度";
+CM_ SG_ 2552037781 FDOM2BottomDeadSw1 "水温传感器2温度";
+CM_ SG_ 337 RC_Tx_2_RollCnt "循环计数";
+CM_ SG_ 2551973954 RDOM_FuelLvlRGas_ohm "汽油液位";
+CM_ SG_ 2552038293 FDOM_NTCR_ohm "水温传感器2温度";
+CM_ SG_ 2552038293 FDOM_FuelLvlR_ohm "甲醇液位";
+CM_ SG_ 2552799731 BMS_Tx_9_B2VPInsRValue "总充电电量";
+CM_ SG_ 2552799731 BMS_Tx_9_B2VNInsRValue "总充电电量";
+CM_ SG_ 2417205747 BMS_Tx_B2V7_MinCellTNubInLECU "总充电电量";
+CM_ SG_ 2417205747 BMS_Tx_B2V7_MinCellTLECUNub "总充电电量";
+CM_ SG_ 2417205747 BMS_Tx_B2V7_MinCellT "总充电电量";
+CM_ SG_ 2417205747 BMS_Tx_B2V7_MaxCellTNubInLECU "总充电电量";
+CM_ SG_ 2417205747 BMS_Tx_B2V7_MaxCellTLECUNub "总充电电量";
+CM_ SG_ 2417205747 BMS_Tx_B2V7_MaxCellT "总充电电量";
+CM_ SG_ 2417140211 BMS_Tx_B2V6_MinCellVNubInLECU "总充电电量";
+CM_ SG_ 2417140211 BMS_Tx_B2V6_MinCellVLECUNub "总充电电量";
+CM_ SG_ 2417140211 BMS_Tx_B2V6_MinCellV "总充电电量";
+CM_ SG_ 2417140211 BMS_Tx_B2V6_MaxCellVNubInLECU "总充电电量";
+CM_ SG_ 2417140211 BMS_Tx_B2V6_MaxCellVLECUNub "总充电电量";
+CM_ SG_ 2417140211 BMS_Tx_B2V6_MaxCellV "总充电电量";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01EPSAngAxisSteer "转向4轴角度状态";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01SmallPumpFiltWarn "控制器供电状态";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01ReturnOilFiltWarn "控制器供电状态";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01EmergyStop "控制器供电状态";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01BigPumpFiltWarn "控制器供电状态";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01BrkPdlPosn "PWM8输出口故障";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01CtrlrPwrSplyStat "控制器供电状态";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01SelfChkCompleted "自检完成";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01PWM8OutPortFlt "PWM8输出口故障";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01PWM7OutPortFlt "PWM7输出口故障";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01PWM6OutPortFlt "PWM6输出口故障";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01PWM5OutPortFlt "PWM5输出口故障";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01PWM4OutPortFlt "PWM4输出口故障";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01PWM3OutPortFlt "PWM3输出口故障";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01PWM2OutPortFlt "PWM2输出口故障";
+CM_ SG_ 2566508790 EPSEHBEPB_Tx_01PWM1OutPortFlt "PWM1输出口故障";
+CM_ SG_ 336 RC_Tx_1RollCnt "循环计数";
+CM_ SG_ 336 RC_Tx_1GearReq "挡位请求";
+CM_ SG_ 336 RC_Tx_1CtrlModeReq "控制模式请求";
+CM_ SG_ 2566836469 ADU_Tx_VehSpdReq_Q "车速请求有效位";
+CM_ SG_ 2566836469 ADU_Tx_VehSpdReq "车速请求";
+CM_ SG_ 2566770933 ADU_Tx_BodyHorn "喇叭";
+CM_ SG_ 2566770933 ADU_Tx_BodyBrkLamp "制动灯";
+CM_ SG_ 2566770933 ADU_Tx_BodyHighBeamLamp "远光灯";
+CM_ SG_ 2566770933 ADU_Tx_BodyLowBeamLamp "近光灯";
+CM_ SG_ 2566770933 ADU_Tx_BodyTurnRLamp "右转灯";
+CM_ SG_ 2566770933 ADU_Tx_BodyTurnLLamp "左转灯";
+CM_ SG_ 2566770933 ADU_Tx_BodyJobAction "作业动作";
+CM_ SG_ 2566705397 ADU_Tx_GearReq "握手请求";
+CM_ SG_ 2566705397 ADU_Tx_FltCodeRst "握手请求";
+CM_ SG_ 2566705397 ADU_Tx_CloudShakeReq "握手请求";
+CM_ SG_ 2566705397 ADU_Tx_ShakeReq "握手请求";
+CM_ SG_ 2566639861 ADU_Tx_StrModReq "驻车4控制请求";
+CM_ SG_ 2566639861 ADU_Tx_EPB4CtrlReq "驻车4控制请求";
+CM_ SG_ 2566639861 ADU_Tx_EPB3CtrlReq "驻车3控制请求";
+CM_ SG_ 2566639861 ADU_Tx_EPB2CtrlReq "驻车2控制请求";
+CM_ SG_ 2566639861 ADU_Tx_EPB1CtrlReq "驻车1控制请求";
+CM_ SG_ 2566574325 ADU_Tx_EHB02Brk8PresReq "制动8液压力请求";
+CM_ SG_ 2566574325 ADU_Tx_EHB02Brk8ModeReq "制动8模式请求";
+CM_ SG_ 2566574325 ADU_Tx_EHB02Brk7PresReq "制动7液压力请求";
+CM_ SG_ 2566574325 ADU_Tx_EHB02Brk7ModeReq "制动7模式请求";
+CM_ SG_ 2566574325 ADU_Tx_EHB02Brk6PresReq "制动6液压力请求";
+CM_ SG_ 2566574325 ADU_Tx_EHB02Brk6ModeReq "制动6模式请求";
+CM_ SG_ 2566574325 ADU_Tx_EHB02Brk5PresReq "制动5液压力请求";
+CM_ SG_ 2566574325 ADU_Tx_EHB02Brk5ModeReq "制动5模式请求";
+CM_ SG_ 2566902005 ADU_Tx_EHB01Brk4PresReq "制动4液压力请求";
+CM_ SG_ 2566902005 ADU_Tx_EHB01Brk4ModeReq "制动4模式请求";
+CM_ SG_ 2566902005 ADU_Tx_EHB01Brk3PresReq "制动3液压力请求";
+CM_ SG_ 2566902005 ADU_Tx_EHB01Brk3ModeReq "制动3模式请求";
+CM_ SG_ 2566902005 ADU_Tx_EHB01Brk2PresReq "制动2液压力请求";
+CM_ SG_ 2566902005 ADU_Tx_EHB01Brk2ModeReq "制动2模式请求";
+CM_ SG_ 2566902005 ADU_Tx_EHB01Brk1PresReq "制动1液压力请求";
+CM_ SG_ 2566902005 ADU_Tx_EHB01Brk1ModeReq "制动1模式请求";
+CM_ SG_ 2566508789 ADU_Tx_EPS03Axis4AngSpdReq "转向4轴角速度请求";
+CM_ SG_ 2566508789 ADU_Tx_EPS03Axis4AngReq "转向4轴角度请求";
+CM_ SG_ 2566508789 ADU_Tx_EPS03Axis4ModeReq "转向4轴模式请求";
+CM_ SG_ 2566508789 ADU_Tx_EPS03Axis3AngSpdReq "转向3轴角速度请求";
+CM_ SG_ 2566508789 ADU_Tx_EPS03Axis3AngReq "转向3轴角度请求";
+CM_ SG_ 2566508789 ADU_Tx_EPS03Axis3ModeReq "转向3轴模式请求";
+CM_ SG_ 2566443253 ADU_Tx_EPS01Axis2AngSpdReq "转向2轴角速度请求";
+CM_ SG_ 2566443253 ADU_Tx_EPS01Axis2AngReq "转向2轴角度请求";
+CM_ SG_ 2566443253 ADU_Tx_EPS01Axis2ModeReq "转向2轴模式请求";
+CM_ SG_ 2566443253 ADU_Tx_EPS01Axis1AngSpdReq "转向1轴角速度请求";
+CM_ SG_ 2566443253 ADU_Tx_EPS01Axis1AngReq "转向1轴角度请求";
+CM_ SG_ 2566443253 ADU_Tx_EPS01Axis1ModeReq "转向1轴模式请求";
+CM_ SG_ 2566377717 ADU_Tx_MCU08MotTqReq "电机08扭矩请求";
+CM_ SG_ 2566377717 ADU_Tx_MCU08MotSpdReq "电机08转速请求";
+CM_ SG_ 2566377717 ADU_Tx_MCU08MotCtrlMode "电机08控制模式指令";
+CM_ SG_ 2566377717 ADU_Tx_MCU08MotCtrlCmd "电机08控制指令";
+CM_ SG_ 2566312181 ADU_Tx_MCU07MotTqReq "电机07扭矩请求";
+CM_ SG_ 2566312181 ADU_Tx_MCU07MotSpdReq "电机07转速请求";
+CM_ SG_ 2566312181 ADU_Tx_MCU07MotCtrlMode "电机07控制模式指令";
+CM_ SG_ 2566312181 ADU_Tx_MCU07MotCtrlCmd "电机07控制指令";
+CM_ SG_ 2566246645 ADU_Tx_MCU06MotTqReq "电机06扭矩请求";
+CM_ SG_ 2566246645 ADU_Tx_MCU06MotSpdReq "电机06转速请求";
+CM_ SG_ 2566246645 ADU_Tx_MCU06MotCtrlMode "电机06控制模式指令";
+CM_ SG_ 2566246645 ADU_Tx_MCU06MotCtrlCmd "电机06控制指令";
+CM_ SG_ 2566181109 ADU_Tx_MCU05MotTqReq "电机05扭矩请求";
+CM_ SG_ 2566181109 ADU_Tx_MCU05MotSpdReq "电机05转速请求";
+CM_ SG_ 2566181109 ADU_Tx_MCU05MotCtrlMode "电机05控制模式指令";
+CM_ SG_ 2566181109 ADU_Tx_MCU05MotCtrlCmd "电机05控制指令";
+CM_ SG_ 2566115573 ADU_Tx_MCU04MotTqReq "电机04扭矩请求";
+CM_ SG_ 2566115573 ADU_Tx_MCU04MotSpdReq "电机04转速请求";
+CM_ SG_ 2566115573 ADU_Tx_MCU04MotCtrlMode "电机04控制模式指令";
+CM_ SG_ 2566115573 ADU_Tx_MCU04MotCtrlCmd "电机04控制指令";
+CM_ SG_ 2566050037 ADU_Tx_MCU03MotTqReq "电机03扭矩请求";
+CM_ SG_ 2566050037 ADU_Tx_MCU03MotSpdReq "电机03转速请求";
+CM_ SG_ 2566050037 ADU_Tx_MCU03MotCtrlMode "电机03控制模式指令";
+CM_ SG_ 2566050037 ADU_Tx_MCU03MotCtrlCmd "电机03控制指令";
+CM_ SG_ 2565984501 ADU_Tx_MCU02MotTqReq "电机02扭矩请求";
+CM_ SG_ 2565984501 ADU_Tx_MCU02MotSpdReq "电机02转速请求";
+CM_ SG_ 2565984501 ADU_Tx_MCU02MotCtrlMode "电机02控制模式指令";
+CM_ SG_ 2565984501 ADU_Tx_MCU02MotCtrlCmd "电机02控制指令";
+CM_ SG_ 2565918965 ADU_Tx_MCU01MotSpdReq "电机01转速请求";
+CM_ SG_ 2565918965 ADU_Tx_MCU01MotTqReq "电机01扭矩请求";
+CM_ SG_ 2565918965 ADU_Tx_MCU01MotCtrlMode "电机01控制模式指令";
+CM_ SG_ 2565918965 ADU_Tx_MCU01MotCtrlCmd "电机01控制指令";
+CM_ SG_ 2565918966 EPS_Tx_01_EPSFltLvlAxis1 "转向1轴故障等级";
+CM_ SG_ 2565918966 EPS_Tx_01_EPSFltCodeAxis1 "转向1轴故障码";
+CM_ SG_ 2565918966 EPS_Tx_01_EPSOutCurrAxis1 "转向1轴输出电流";
+CM_ SG_ 2565918966 EPS_Tx_01_EPSAngSpdAxis1 "转向1轴角速度状态";
+CM_ SG_ 2565918966 EPS_Tx_01_EPSAngAxis1 "转向1轴角度状态";
+CM_ SG_ 2565918966 EPS_Tx_01_EPSModeAxis1 "转向1轴模式状态";
+CM_ SG_ 2566854608 ICU_Rx_15_DCDC2FaultLevel "DCDC2故障等级";
+CM_ SG_ 2566854608 ICU_Rx_15_DCDC2FaultCode "DCDC2故障码";
+CM_ SG_ 2566854608 ICU_Rx_15_ElectcFanFailure "电子风扇故障";
+CM_ SG_ 2566854608 ICU_Rx_15_MinCellVol "单体最低电压";
+CM_ SG_ 2566854608 ICU_Rx_15_MaxCellVol "单体最高电压";
+CM_ SG_ 2566789072 ICU_Rx_14_TotalWorkingTime "工作总时间";
+CM_ SG_ 2566789072 ICU_Rx_14_TotalVorkingMileage "工作总里程";
+CM_ SG_ 2566723536 ICU_Rx_13_Generator2Speed "发电机2转速";
+CM_ SG_ 2566723536 ICU_Rx_13_Generator1Speed "发电机1转速";
+CM_ SG_ 2566723536 ICU_Rx_13_Generator2Torque "发电机2扭矩";
+CM_ SG_ 2566723536 ICU_Rx_13_Generator1Torque "发电机1扭矩";
+CM_ SG_ 2566658000 ICU_Rx_12_GeneratorCtrl2Temp "发电机控制器2温度";
+CM_ SG_ 2566658000 ICU_Rx_12_GeneratorCtrl1Temp "发电机控制器1温度";
+CM_ SG_ 2566658000 ICU_Rx_12_Generator2Temp "发电机2温度";
+CM_ SG_ 2566658000 ICU_Rx_12_Generator1Temp "发电机1温度";
+CM_ SG_ 2566658000 ICU_Rx_12_GeneratorStat "发动机状态";
+CM_ SG_ 2566658000 ICU_Rx_12_Generator2FaultCode "发电机2故障码";
+CM_ SG_ 2566658000 ICU_Rx_12_Generator1FaultCode "发电机1故障码";
+CM_ SG_ 2566658000 ICU_Rx_12_Generator2FaultLevel "发电机2故障等级";
+CM_ SG_ 2566658000 ICU_Rx_12_Generator1FaultLevel "发电机1故障等级";
+CM_ SG_ 2566592464 ICU_Rx_11_Generator1Current "发电机1电流";
+CM_ SG_ 2566592464 ICU_Rx_11_Generator2Current "发电机2电流";
+CM_ SG_ 2566592464 ICU_Rx_11_Generator2Voltage "发电机2电压";
+CM_ SG_ 2566592464 ICU_Rx_11_Generator1Voltage "发电机1电压";
+CM_ SG_ 2566526928 ICU_Rx_10_DCDCFaultCode "DCDC故障码";
+CM_ SG_ 2566526928 ICU_Rx_10_AirPumpFaultCode "气泵故障码";
+CM_ SG_ 2566526928 ICU_Rx_10_OilPumpFaultCode "油泵故障码";
+CM_ SG_ 2566526928 ICU_Rx_10_HighVoltCabinFaultCode "高压柜故障码";
+CM_ SG_ 2566526928 ICU_Rx_10_MotElectcCtrlFaultCode "电机电控故障码";
+CM_ SG_ 2566526928 ICU_Rx_10_TMSFaultCode "TMS故障码";
+CM_ SG_ 2566526928 ICU_Rx_10_BatteryFaultCode "电池故障码";
+CM_ SG_ 2566526928 ICU_Rx_10_TMSFaultLevel "TMS故障等级";
+CM_ SG_ 2566461392 ICU_Rx_9_BatterFaultClass "电池故障等级";
+CM_ SG_ 2566461392 ICU_Rx_9_BatterySOC "电池SOC";
+CM_ SG_ 2566461392 ICU_Rx_9_BatteryCurrent "电池电流";
+CM_ SG_ 2566461392 ICU_Rx_9_BatteryVoltage "电池电压";
+CM_ SG_ 2566461392 ICU_Rx_9_TransOutputShaftTrq "变速箱输出轴扭矩";
+CM_ SG_ 2566395856 ICU_Rx_8_GCU2SoftwareVerNum "GCU2软件版本号";
+CM_ SG_ 2566395856 ICU_Rx_8_GCU1SoftwareVerNum "GCU1软件版本号";
+CM_ SG_ 2566395856 ICU_Rx_8_MCU3SoftwareVerNum "MCU3软件版本号";
+CM_ SG_ 2566395856 ICU_Rx_8_MCU2SoftwareVerNum "MCU2软件版本号";
+CM_ SG_ 2566395856 ICU_Rx_8_MCU1SoftwareVerNum "MCU1软件版本号";
+CM_ SG_ 2566395856 ICU_Rx_8_TCUSoftwareVerNum "TCU软件版本号";
+CM_ SG_ 2566395856 ICU_Rx_8_EMUSoftwareVerNum "EMU软件版本号";
+CM_ SG_ 2566395856 ICU_Rx_8_VCUSoftwareVerNum "VCU软件版本号";
+CM_ SG_ 2566330320 ICU_Rx_7_DriveMotor3FaultCode "驱动电机3故障码";
+CM_ SG_ 2566330320 ICU_Rx_7_DriveMotor2FaultCode "驱动电机2故障码";
+CM_ SG_ 2566330320 ICU_Rx_7_DriveMotor1FaultCode "驱动电机1故障码";
+CM_ SG_ 2566330320 ICU_Rx_7_TCUFaultCode "TCU故障代码";
+CM_ SG_ 2566330320 ICU_Rx_7_BattMinTemp "电池单体最低温度";
+CM_ SG_ 2566330320 ICU_Rx_7_BattMaxTemp "电池单体最高温度";
+CM_ SG_ 2566330320 ICU_Rx_7_DriveMotor3FaultLevel "驱动电机3故障等级";
+CM_ SG_ 2566330320 ICU_Rx_7_DriveMotor2FaultLevel "驱动电机2故障等级";
+CM_ SG_ 2566330320 ICU_Rx_7_DriveMotor1FaultLevel "驱动电机1故障等级";
+CM_ SG_ 2566330320 ICU_Rx_7_TCUFaultLevel "TCU故障等级";
+CM_ SG_ 2566264784 ICU_Rx_6_MinBattInsulationR "电池最小绝缘电阻阻值";
+CM_ SG_ 2566264784 ICU_Rx_6_DriveMotor2Spd "驱动电机2转速";
+CM_ SG_ 2566264784 ICU_Rx_6_DriveMotor2Trq "驱动电机2扭矩";
+CM_ SG_ 2566199248 ICU_Rx_5_DriveMotor1Spd "驱动电机1转速";
+CM_ SG_ 2566199248 ICU_Rx_5_DriveMotor1Trq "驱动电机1扭矩";
+CM_ SG_ 2566199248 ICU_Rx_5_ChrgGunConnecteStat "充电枪连接状态";
+CM_ SG_ 2566199248 ICU_Rx_5_TrsmOilTemp "变速箱油温";
+CM_ SG_ 2566133712 ICU_Rx_4_MotorCtrl2Temp "电机控制器2温度";
+CM_ SG_ 2566133712 ICU_Rx_4_DriveMotor2Temp "驱动电机2温度";
+CM_ SG_ 2566133712 ICU_Rx_4_MotorCtrl1Temp "电机控制器1温度";
+CM_ SG_ 2566133712 ICU_Rx_4_DriveMotor1Temp "驱动电机1温度";
+CM_ SG_ 2566133712 ICU_Rx_4_SingleWorkTime "单次工作时间";
+CM_ SG_ 2566133712 ICU_Rx_4_SingleMileage "单次里程";
+CM_ SG_ 2566068176 ICU_Rx_3_DriveMotor2Curr "驱动电机2电流";
+CM_ SG_ 2566068176 ICU_Rx_3_DriveMotor2Vol "驱动电机2电压";
+CM_ SG_ 2566068176 ICU_Rx_3_DriveMotor1Curr "驱动电机1电流";
+CM_ SG_ 2566068176 ICU_Rx_3_DriveMotor1Vol "驱动电机1电压";
+CM_ SG_ 2566002640 ICU_Rx_2_PumpFailure "水泵故障";
+CM_ SG_ 2566002640 ICU_Rx_2_RetarderGear "缓速器档位";
+CM_ SG_ 2566002640 ICU_Rx_2_BackingLamp "倒车灯";
+CM_ SG_ 2566002640 ICU_Rx_2_BrkLamp "制动灯";
+CM_ SG_ 2566002640 ICU_Rx_2_CylinderBrkStatus "缸内制动状态";
+CM_ SG_ 2566002640 ICU_Rx_2_ForcedChrgMode "强制充电状态";
+CM_ SG_ 2566002640 ICU_Rx_2_TrmOutputShaftSpd "变速箱输出轴转速";
+CM_ SG_ 2566002640 ICU_Rx_2_VehSpeed "车速";
+CM_ SG_ 2566002640 ICU_Rx_2_BrakePedalOpening "刹车踏板开度";
+CM_ SG_ 2566002640 ICU_Rx_2_GasPedalOpening "油门踏板开度";
+CM_ SG_ 2565937104 ICU_Rx_1_VehFaultCode "整车故障代码（DTC）";
+CM_ SG_ 2565937104 ICU_Rx_1_VehFaultLevel "整车故障等级";
+CM_ SG_ 2565937104 ICU_Rx_1_DCDC1FaultCode "DCDC1故障码";
+CM_ SG_ 2565937104 ICU_Rx_1_LeadAcidBattVolt "铅酸蓄电池电压";
+CM_ SG_ 2565937104 ICU_Rx_1_GearState "档位状态";
+CM_ SG_ 2565937104 ICU_Rx_1_DCDC1FaultLevel "DCDC1故障等级";
+CM_ SG_ 2565937104 ICU_Rx_1_30STurnPwrCutOff "转向助力30S后切断";
+CM_ SG_ 2565937104 ICU_Rx_1_PTOState "PTO状态";
+CM_ SG_ 2565937104 ICU_Rx_1_DriveMotorStat "驱动电机状态";
+CM_ SG_ 2565937104 ICU_Rx_1_ScramSwitch "急停开关";
+CM_ SG_ 2565937104 ICU_Rx_1_HandbrakeModePwrOut "手刹模式下动力输出";
+CM_ SG_ 2565937104 ICU_Rx_1_BrkCdnState "制动踏板状态";
+CM_ SG_ 2565937104 ICU_Rx_1_HandbrakeState "手刹状态";
+CM_ SG_ 2565937104 ICU_Rx_1_VehRunState "车辆运行状态";
+CM_ SG_ 2565937104 ICU_Rx_1_VehReadyState "车辆Ready状态";
+CM_ SG_ 2565937104 ICU_Rx_1_HighPressOnPwrSys "动力系统上高压状态";
+CM_ SG_ 2565937104 ICU_Rx_1_VCUSelfCheckStatus "VCU自检状态";
+CM_ SG_ 2348872609 BMS_Rx_1_VCULife "VCU生命帧";
+CM_ SG_ 2348872609 BMS_Rx_1_HV_HVCmd "高压命令";
+CM_ SG_ 2417271283 BMS_Tx_8_REESSOverchrg4 "车载储能装置过充4级";
+CM_ SG_ 2417271283 BMS_Tx_8_SOCJump1 "SOC跳变1级";
+CM_ SG_ 2417271283 BMS_Tx_8_SOCTooHigh1 "SOC过高1级";
+CM_ SG_ 2417271283 BMS_Tx_8_EngStorSysMismatch4 "可充电储能系统不匹配报警4级";
+CM_ SG_ 2417271283 BMS_Tx_8_ConfigErrNubEleCoreStr4 "电芯串数配置错误4级";
+CM_ SG_ 2417271283 BMS_Tx_8_TRP4 "热失控保护TRP4级";
+CM_ SG_ 2417271283 BMS_Tx_8_TRA4 "热失控TRA4级";
+CM_ SG_ 2417271283 BMS_Tx_8_FireDetectSensorAbn1 "灭火探测器传感器异常1级";
+CM_ SG_ 2417271283 BMS_Tx_8_FireDetectCommLose1 "灭火探测器通讯丢失1级";
+CM_ SG_ 2417271283 BMS_Tx_8_PBMUMiddleCANCommFlt4 "从BMU中间CAN通讯异常4级";
+CM_ SG_ 2417074675 BMS_Tx_7_PBMUKeyonLose4 "从BMUKeyon丢失4级";
+CM_ SG_ 2417074675 BMS_Tx_7_PBMUHVILFlt4 "从BMU高压互锁故障4级";
+CM_ SG_ 2417074675 BMS_Tx_7_MiddleCANCommFlt4 "中间CAN通讯异常4级";
+CM_ SG_ 2417074675 BMS_Tx_7_TMSSysFlt2 "热管理系统故障2级";
+CM_ SG_ 2417074675 BMS_Tx_7_ChrgOvercurrent3 "充电机过流3级";
+CM_ SG_ 2417074675 BMS_Tx_7_ChrgPort1TInRangeHigh3 "充电口1温度过高3级";
+CM_ SG_ 2417074675 BMS_Tx_7_ChrgPort1TInRangeHigh2 "充电口1温度过高2级";
+CM_ SG_ 2417074675 BMS_Tx_7_ChrgPort1TSampOpenCirc3 "充电口1温度采样开路3级";
+CM_ SG_ 2417074675 BMS_Tx_7_TMSRlyOpen2 "热管理继电器开路2级";
+CM_ SG_ 2417074675 BMS_Tx_7_TMSRlyAdh1 "热管理继电器粘连1级";
+CM_ SG_ 2417074675 BMS_Tx_7_ChrgPort1PRlyOpen3 "充电口1_充电正接触器开路3级";
+CM_ SG_ 2417074675 BMS_Tx_7_ChrgPort1PRlyAdh3 "充电口1_充电正接触器粘连3级";
+CM_ SG_ 2417074675 BMS_Tx_7_ChrgPort1NRlyOpen3 "充电口1_充电负接触器开路3级";
+CM_ SG_ 2417074675 BMS_Tx_7_ChrgPort1NRlyAdh3 "充电口1_充电负接触器黏连3级";
+CM_ SG_ 2417074675 BMS_Tx_7_PrechrgFail4 "预充电失败4级";
+CM_ SG_ 2417074675 BMS_Tx_7_MainNRlyOpen3 "主负接触器开路3级";
+CM_ SG_ 2417074675 BMS_Tx_7_MainNRlyAdh4 "主负接触器粘连4级";
+CM_ SG_ 2417074675 BMS_Tx_7_MainPRlyOpen3 "主正接触器开路3级";
+CM_ SG_ 2417074675 BMS_Tx_7_MainPPrechrgRlyAdh4 "主正或预充接触器粘连4级";
+CM_ SG_ 2417074675 BMS_Tx_7_InnerCANCommFlt4 "内网CAN通讯异常4级";
+CM_ SG_ 2417074675 BMS_Tx_7_InnerCANCommFlt3 "内网CAN通讯异常3级";
+CM_ SG_ 2417074675 BMS_Tx_7_TMSCommFlt1 "TMS通讯故障1级";
+CM_ SG_ 2417074675 BMS_Tx_7_PowerCANCommFlt3 "动力CAN通讯异常3级";
+CM_ SG_ 2417074675 BMS_Tx_7_BlcCircultOpen1 "均衡短路(开路)1级";
+CM_ SG_ 2417074675 BMS_Tx_7_LECUVoltChipTempHigh1 "LECU采压芯片温度过高1级";
+CM_ SG_ 2417074675 BMS_Tx_7_LECUBoardTempTooHigh1 "LECU板温过高1级";
+CM_ SG_ 2417074675 BMS_Tx_7_CellStandTSnsDetectFlt2 "电芯温度传感器异常2级";
+CM_ SG_ 2417074675 BMS_Tx_7_CellStandTSnsDetectFlt1 "电芯温度传感器异常1级";
+CM_ SG_ 2417074675 BMS_Tx_7_CellVoltRangeFlt3 "电芯电压采样电路开路3级";
+CM_ SG_ 2417074675 BMS_Tx_7_HVILFault4 "高压互锁故障4级";
+CM_ SG_ 2417074675 BMS_Tx_7_HighVoltBusInsLow4 "绝缘阻值过低4级";
+CM_ SG_ 2417074675 BMS_Tx_7_HighVoltBusInsLow2 "绝缘阻值过低2级";
+CM_ SG_ 2417074675 BMS_Tx_7_LossKeyonSignal4 "Keyon信号丢失4级";
+CM_ SG_ 2417074675 BMS_Tx_7_LossChrgSignal3 "充电信号丢失3级";
+CM_ SG_ 2417074675 BMS_Tx_7_BMSAbnolOperatingVolt4 "BMS工作电压异常4级";
+CM_ SG_ 2417074675 BMS_Tx_7_SOCTooLow2 "SOC过低2级";
+CM_ SG_ 2417074675 BMS_Tx_7_SOCTooLow1 "SOC过低1级";
+CM_ SG_ 2417074675 BMS_Tx_7_FeedbackOvercurrent2 "回馈过流2级";
+CM_ SG_ 2417074675 BMS_Tx_7_DchgOvercurrent2 "放电过流2级";
+CM_ SG_ 2417074675 BMS_Tx_7_BatTempOutControl4 "热失控4级";
+CM_ SG_ 2417074675 BMS_Tx_7_BatTempDiffTooLarge1 "电池温差过大1级";
+CM_ SG_ 2417074675 BMS_Tx_7_BatTempTooLow1 "电池低温报警1级";
+CM_ SG_ 2417074675 BMS_Tx_7_BatTempTooHigh4 "电池温度过高4级";
+CM_ SG_ 2417074675 BMS_Tx_7_BatTempTooHigh3 "电池温度过高3级";
+CM_ SG_ 2417074675 BMS_Tx_7_BatTempTooHigh2 "电池温度过高2级";
+CM_ SG_ 2417074675 BMS_Tx_7_SysConnError4 "系统连接4级";
+CM_ SG_ 2417074675 BMS_Tx_7_SysConnError3 "系统连接3级";
+CM_ SG_ 2417074675 BMS_Tx_7_TotalVoltDiffTooLarge4 "组间压差过大4级";
+CM_ SG_ 2417074675 BMS_Tx_7_TotalVoltTooLow4 "总电压欠压4级";
+CM_ SG_ 2417074675 BMS_Tx_7_TotalVoltTooHigh4 "总电压过压4级";
+CM_ SG_ 2417074675 BMS_Tx_7_CellVoltDiffTooLarge1 "电芯压差过大1级";
+CM_ SG_ 2417074675 BMS_Tx_7_CellVoltTooLow4 "电芯欠压4级";
+CM_ SG_ 2417074675 BMS_Tx_7_CellVoltTooLow3 "电芯欠压3级";
+CM_ SG_ 2417074675 BMS_Tx_7_CellVoltTooLow2 "电芯欠压2级";
+CM_ SG_ 2417074675 BMS_Tx_7_CellVoltTooHigh4 "电芯过压4级";
+CM_ SG_ 2417074675 BMS_Tx_7_CellVoltTooHigh3 "电芯过压3级";
+CM_ SG_ 2417074675 BMS_Tx_7_CellVoltTooHigh2 "电芯过压2级";
+CM_ SG_ 2554372595 BMS_Tx_6_AccuDchgAh "总放电电量";
+CM_ SG_ 2554372595 BMS_Tx_6_AccuChrgAh "总充电电量";
+CM_ SG_ 2552472051 BMS_Tx_5_BatPackNub "电池总箱数";
+CM_ SG_ 2552472051 BMS_Tx_5_BattType "电池类型";
+CM_ SG_ 2552472051 BMS_Tx_5_RateEgy "电池包额定总能量";
+CM_ SG_ 2552472051 BMS_Tx_5_RateHVolt "电池包额定电压";
+CM_ SG_ 2552472051 BMS_Tx_5_RateCap "电池包额定容量";
+CM_ SG_ 2552406515 BMS_Tx_4_SOC "SOC";
+CM_ SG_ 2552406515 BMS_Tx_4_HVP "HVP";
+CM_ SG_ 2552406515 BMS_Tx_4_HVB "HVB";
+CM_ SG_ 2552406515 BMS_Tx_4_TotalI "总电流";
+CM_ SG_ 2552340979 BMS_Tx_3_SOH "SOH";
+CM_ SG_ 2552340979 BMS_Tx_3_MinTemp "最低允许温度（根据技术协议）";
+CM_ SG_ 2552340979 BMS_Tx_3_MaxTemp "最高允许温度（根据技术协议）";
+CM_ SG_ 2552340979 BMS_Tx_3_MinDchgV "最小允许放电电压（根据技术协议";
+CM_ SG_ 2552340979 BMS_Tx_3_MaxChrgV "最大允许充电电压（根据技术协议）";
+CM_ SG_ 2552275443 BMS_Tx_2_MaxDchgI "当前最大允许放电电流";
+CM_ SG_ 2552275443 BMS_Tx_2_MaxFeedbackI "当前最大允许回馈电流";
+CM_ SG_ 2552275443 BMS_Tx_2_MaxPeakDchgI "最大允许峰值放电电流";
+CM_ SG_ 2552275443 BMS_Tx_2_MaxPeakFeedbackI "最大允许峰值回馈电流";
+CM_ SG_ 2348851699 BMS_Tx_1_BMSRlyLife "BMS生命帧";
+CM_ SG_ 2348851699 BMS_Tx_1_FaultCode "BMS故障码";
+CM_ SG_ 2348851699 BMS_Tx_1_Chrg1SignSta "充电枪1连接状态";
+CM_ SG_ 2348851699 BMS_Tx_1_HVOffReq "下高压请求";
+CM_ SG_ 2348851699 BMS_Tx_1_InsCheckSta "绝缘监测开启状态";
+CM_ SG_ 2348851699 BMS_Tx_1_HVSta "BMS上电状态";
+CM_ SG_ 2348851699 BMS_Tx_1_HighFaultSta "BMS当前最高故障等级";
+CM_ SG_ 2348851699 BMS_Tx_1_BMSSta "BMS状态";
+CM_ SG_ 2147492119 GAM_1_OverWightLevel "超重等级";
+CM_ SG_ 2147492119 GAM_1_Right3SnsSts "右3传感器状态";
+CM_ SG_ 2147492119 GAM_1_Right2SnsSts "右2传感器状态";
+CM_ SG_ 2147492119 GAM_1_Right1SnsSts "右1传感器状态";
+CM_ SG_ 2147492119 GAM_1_Left3SnsSts "左3传感器状态";
+CM_ SG_ 2147492119 GAM_1_Left2SnsSts "左2传感器状态";
+CM_ SG_ 2147492119 GAM_1_Left1SnsSts "左1传感器状态";
+CM_ SG_ 2147492119 GAM_1_Right3Pressure "右3压力";
+CM_ SG_ 2147492119 GAM_1_Right2Pressure "右2压力";
+CM_ SG_ 2147492119 GAM_1_Right1Pressure "右1压力";
+CM_ SG_ 2147492119 GAM_1_Left3Pressure "左3压力";
+CM_ SG_ 2147492119 GAM_1_Left2Pressure "左2压力";
+CM_ SG_ 2147492119 GAM_1_Left1Pressure "左1压力";
+CM_ SG_ 2147492119 GAM_1_Weighingweight "称重重量";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot8PreChrgCloCmd "电机8预充吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot8MainPosCloCmd "电机8主正吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot7PreChrgCloCmd "电机7预充吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot7MainPosCloCmd "电机7主正吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot6PreChrgCloCmd "电机6预充吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot6MainPosCloCmd "电机6主正吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot5PreChrgCloCmd "电机5预充吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot5MainPosCloCmd "电机5主正吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot4PreChrgCloCmd "电机4预充吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot4MainPosCloCmd "电机4主正吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot3PreChrgCloCmd "电机3预充吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot3MainPosCloCmd "电机3主正吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot2PreChrgCloCmd "电机2预充吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot2MainPosCloCmd "电机2主正吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot1PreChrgCloCmd "电机1预充吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_Mot1MainPosCloCmd "电机1主正吸合指令";
+CM_ SG_ 2558783475 PDU_Rx_1_checksum "循环计数";
+CM_ SG_ 2550330351 PDU_Tx_2_CheckSum "循环计数";
+CM_ SG_ 2550330351 PDU_Tx2_Mot8PreChrgFauSts "电机8预充故障状态";
+CM_ SG_ 2550330351 PDU_Tx2_Mot8PreChrgConSts "电机8预充触点状态";
+CM_ SG_ 2550330351 PDU_Tx2_Mot8MainPosFauSts "电机8主正故障状态";
+CM_ SG_ 2550330351 PDU_Tx2_Mot8MainPosConSts "电机8主正触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot7PreChrgFauSts "电机7预充故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot7PreChrgConSts "电机7预充触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot7MainPosFauSts "电机7主正故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot7MainPosConSts "电机7主正触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot6PreChrgFauSts "电机6预充故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot6PreChrgConSts "电机6预充触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot6MainPosFauSts "电机6主正故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot6MainPosConSts "电机6主正触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot5PreChrgFauSts "电机5预充故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot5PreChrgConSts "电机5预充触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot5MainPosFauSts "电机5主正故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot5MainPosConSts "电机5主正触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot4PreChrgFauSts "电机4预充故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot4PreChrgConSts "电机4预充触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot4MainPosFauSts "电机4主正故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot4MainPosConSts "电机4主正触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot3PreChrgFauSts "电机3预充故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot3PreChrgConSts "电机3预充触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot3MainPosFauSts "电机3主正故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot3MainPosConSts "电机3主正触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot2PreChrgFauSts "电机2预充故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot2PreChrgConSts "电机2预充触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot2MainPosFauSts "电机2主正故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot2MainPosConSts "电机2主正触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot1PreChrgFauSts "电机1预充故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot1PreChrgConSts "电机1预充触点状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot1MainPosFauSts "电机1主正故障状态";
+CM_ SG_ 2550264815 PDU_Tx1_Mot1MainPosConSts "电机1主正触点状态";
+CM_ SG_ 2550264815 PDU_Tx_1_CheckSum "循环计数";
+CM_ SG_ 2566901783 ICU_Tx_2_RDOM_FuelLvlRGas "汽油液位";
+CM_ SG_ 2566901783 ICU_Tx_2_FDOM_FuelLvlR "甲醇液位";
+CM_ SG_ 2566901783 ICU_Tx_2_TotalTripMile "总里程";
+CM_ SG_ 2566901783 ICU_Tx_2_TotalODOMile "总里程";
+CM_ SG_ 2566836247 ICU_Tx_1_ReReservoirPressureWarn "后储气罐气压报警";
+CM_ SG_ 2566836247 ICU_Tx_1_FrReservoirPressureWarn "前储气罐气压报警";
+CM_ SG_ 2566836247 ICU_Tx_1_ReReservoirPressure "后储气罐气压";
+CM_ SG_ 2566836247 ICU_Tx_1_FrReservoirPressure "前储气罐气压";
+CM_ SG_ 2565866992 SCU_Tx_1_GearReqStat "档位请求状态";
+CM_ SG_ 2565866992 SCU_Tx_1_EPModeReqStat "EP模式请求状态";
+CM_ SG_ 2565984502 EPS_Tx_02_EPSOutCurrAxis2 "转向2轴输出电流";
+CM_ SG_ 2565984502 EPS_Tx_02_EPSModeAxis2 "转向2轴模式状态";
+CM_ SG_ 2565984502 EPS_Tx_02_EPSFltLvlAxis2 "转向2轴故障等级";
+CM_ SG_ 2565984502 EPS_Tx_02_EPSFltCodeAxis2 "转向2轴故障码";
+CM_ SG_ 2565984502 EPS_Tx_02_EPSAngSpdAxis2 "转向2轴角速度状态";
+CM_ SG_ 2565984502 EPS_Tx_02_EPSAngAxis2 "转向2轴角度状态";
+CM_ SG_ 2566115574 EPS_Tx_04_EPSOutCurrAxis4 "转向4轴输出电流";
+CM_ SG_ 2566115574 EPS_Tx_04_EPSModeAxis4 "转向4轴模式状态";
+CM_ SG_ 2566115574 EPS_Tx_04_EPSFltLvlAxis4 "转向4轴故障等级";
+CM_ SG_ 2566115574 EPS_Tx_04_EPSFltCodeAxis4 "转向4轴故障码";
+CM_ SG_ 2566115574 EPS_Tx_04_EPSAngSpdAxis4 "转向4轴角速度状态";
+CM_ SG_ 2566115574 EPS_Tx_04_EPSAngAxis4 "转向4轴角度状态";
+CM_ SG_ 2566050038 EPS_Tx_03_EPSOutCurrAxis3 "转向3轴输出电流";
+CM_ SG_ 2566050038 EPS_Tx_03_EPSModeAxis3 "转向3轴模式状态";
+CM_ SG_ 2566050038 EPS_Tx_03_EPSFltLvlAxis3 "转向3轴故障等级";
+CM_ SG_ 2566050038 EPS_Tx_03_EPSFltCodeAxis3 "转向3轴故障码";
+CM_ SG_ 2566050038 EPS_Tx_03_EPSAngSpdAxis3 "转向3轴角速度状态";
+CM_ SG_ 2566050038 EPS_Tx_03_EPSAngAxis3 "转向3轴角度状态";
+CM_ SG_ 2566246646 EHB_Tx_02_EHB04PresSt "充液阀压力";
+CM_ SG_ 2566246646 EHB_Tx_02_EHB04Mode "制动4模式状态";
+CM_ SG_ 2566246646 EHB_Tx_02_EHB04FltCode "制动4故障码";
+CM_ SG_ 2566246646 EHB_Tx_02_EHB04FltLvl "制动4故障等级";
+CM_ SG_ 2566246646 EHB_Tx_02_EHB03PresSt "EDC阀压力";
+CM_ SG_ 2566246646 EHB_Tx_02_EHB03Mode "制动3模式状态";
+CM_ SG_ 2566246646 EHB_Tx_02_EHB03FltCode "制动3故障码";
+CM_ SG_ 2566246646 EHB_Tx_02_EHB03FltLvl "制动3故障等级";
+CM_ SG_ 2566312182 EHB_Tx_03_EHB06PresSt "制动6液压力状态";
+CM_ SG_ 2566312182 EHB_Tx_03_EHB06Mode "制动6模式状态";
+CM_ SG_ 2566312182 EHB_Tx_03_EHB06FltCode "制动6故障码";
+CM_ SG_ 2566312182 EHB_Tx_03_EHB06FltLvl "制动6故障等级";
+CM_ SG_ 2566312182 EHB_Tx_03_EHB05PresSt "回油压力";
+CM_ SG_ 2566312182 EHB_Tx_03_EHB05Mode "制动5模式状态";
+CM_ SG_ 2566312182 EHB_Tx_03_EHB05FltCode "制动5故障码";
+CM_ SG_ 2566312182 EHB_Tx_03_EHB05FltLvl "制动5故障等级";
+CM_ SG_ 2566377718 EHB_Tx_04_EHB08PresSt "制动8液压力状态";
+CM_ SG_ 2566377718 EHB_Tx_04_EHB08Mode "制动8模式状态";
+CM_ SG_ 2566377718 EHB_Tx_04_EHB08FltCode "制动8故障码";
+CM_ SG_ 2566377718 EHB_Tx_04_EHB08FltLvl "制动8故障等级";
+CM_ SG_ 2566377718 EHB_Tx_04_EHB07PresSt "制动7液压力状态";
+CM_ SG_ 2566377718 EHB_Tx_04_EHB07Mode "制动7模式状态";
+CM_ SG_ 2566377718 EHB_Tx_04_EHB07FltCode "制动7故障码";
+CM_ SG_ 2566377718 EHB_Tx_04_EHB07FltLvl "制动7故障等级";
+CM_ SG_ 2566181110 EHB_Tx_01_EHB02PresSt "制动2液压力状态";
+CM_ SG_ 2566181110 EHB_Tx_01_EHB02Mode "制动2模式状态";
+CM_ SG_ 2566181110 EHB_Tx_01_EHB02FltCode "制动2故障码";
+CM_ SG_ 2566181110 EHB_Tx_01_EHB02FltLvl "制动2故障等级";
+CM_ SG_ 2566181110 EHB_Tx_01_EHB01PresSt "制动1液压力状态";
+CM_ SG_ 2566181110 EHB_Tx_01_EHB01Mode "制动1模式状态";
+CM_ SG_ 2566181110 EHB_Tx_01_EHB01FltCode "制动1故障码";
+CM_ SG_ 2566181110 EHB_Tx_01_EHB01FltLvl "制动1故障等级";
+CM_ SG_ 2566880239 RECU_Rx_1_VCU16PwrTakeOffCmd "增程器启停控制";
+CM_ SG_ 2566880239 RECU_Rx_1_VCU16RollingCounter "VCU16循环计数";
+CM_ SG_ 2566880239 RECU_Rx_1_VCU16PwrRequest "VCU请求增程器功率";
+CM_ SG_ 2566880239 RECU_Rx_1_VCU16RECUActDischrg "RECU主动控制放电指令";
+CM_ SG_ 2566880239 RECU_Rx_1_VCU16RECtrlCmd "增程器启停控制";
+CM_ SG_ 2566443254 EPB_Tx_04_EPB4Sts "驻车4状态";
+CM_ SG_ 2566443254 EPB_Tx_04_EPB4FltLvl "驻车4故障等级";
+CM_ SG_ 2566443254 EPB_Tx_04_EPB4FltCode "驻车4故障码";
+CM_ SG_ 2566443254 EPB_Tx_03_EPB3Sts "驻车3状态";
+CM_ SG_ 2566443254 EPB_Tx_03_EPB3FltLvl "驻车3故障等级";
+CM_ SG_ 2566443254 EPB_Tx_03_EPB3FltCode "驻车3故障码";
+CM_ SG_ 2566443254 EPB_Tx_02_EPB2Sts "驻车2状态";
+CM_ SG_ 2566443254 EPB_Tx_02_EPB2FltLvl "驻车2故障等级";
+CM_ SG_ 2566443254 EPB_Tx_02_EPB2FltCode "驻车2故障码";
+CM_ SG_ 2566443254 EPB_Tx_01_EPB1FltCode "驻车1故障码";
+CM_ SG_ 2566443254 EPB_Tx_01_EPB1FltLvl "驻车1故障等级";
+CM_ SG_ 2566443254 EPB_Tx_01_EPB1Sts "驻车1状态";
+CM_ SG_ 2565928656 EPS_Rx_01_EPS2AxisAngSpdReq "转向2轴角速度请求";
+CM_ SG_ 2565928656 EPS_Rx_01_EPS2AxisAngReq "转向2轴角度请求";
+CM_ SG_ 2565928656 EPS_Rx_01_EPS2AxisModeReq "转向2轴模式请求";
+CM_ SG_ 2565928656 EPS_Rx_01_EPS1AxisAngSpdReq "转向1轴角速度请求";
+CM_ SG_ 2565928656 EPS_Rx_01_EPS1AxisAngReq "转向1轴角度请求";
+CM_ SG_ 2565928656 EPS_Rx_01_EPS1AxisModeReq "转向1轴模式请求";
+CM_ SG_ 2565994192 EPS_Rx_02_EPS4AxisAngSpdReq "转向4轴角速度请求";
+CM_ SG_ 2565994192 EPS_Rx_02_EPS4AxisAngReq "转向4轴角度请求";
+CM_ SG_ 2565994192 EPS_Rx_02_EPS4AxisModeReq "转向4轴模式请求";
+CM_ SG_ 2565994192 EPS_Rx_02_EPS3AxisAngSpdReq "转向3轴角速度请求";
+CM_ SG_ 2565994192 EPS_Rx_02_EPS3AxisAngReq "转向3轴角度请求";
+CM_ SG_ 2565994192 EPS_Rx_02_EPS3AxisModeReq "转向3轴模式请求";
+CM_ SG_ 2566059728 EHB_Rx_01_EHB4PresReq "制动4液压力请求";
+CM_ SG_ 2566059728 EHB_Rx_01_EHB4ModeReq "制动4模式请求";
+CM_ SG_ 2566059728 EHB_Rx_01_EHB3PresReq "制动3液压力请求";
+CM_ SG_ 2566059728 EHB_Rx_01_EHB3ModeReq "制动3模式请求";
+CM_ SG_ 2566059728 EHB_Rx_01_EHB2PresReq "制动2液压力请求";
+CM_ SG_ 2566059728 EHB_Rx_01_EHB2ModeReq "制动2模式请求";
+CM_ SG_ 2566059728 EHB_Rx_01_EHB1PresReq "制动1液压力请求";
+CM_ SG_ 2566059728 EHB_Rx_01_EHB1ModeReq "制动1模式请求";
+CM_ SG_ 2566125264 EHB_Rx_02_EHB8PresReq "制动8液压力请求";
+CM_ SG_ 2566125264 EHB_Rx_02_EHB8ModeReq "制动8模式请求";
+CM_ SG_ 2566125264 EHB_Rx_02_EHB7PresReq "制动7液压力请求";
+CM_ SG_ 2566125264 EHB_Rx_02_EHB7ModeReq "制动7模式请求";
+CM_ SG_ 2566125264 EHB_Rx_02_EHB6PresReq "制动6液压力请求";
+CM_ SG_ 2566125264 EHB_Rx_02_EHB6ModeReq "制动6模式请求";
+CM_ SG_ 2566125264 EHB_Rx_02_EHB5PresReq "制动5液压力请求";
+CM_ SG_ 2566125264 EHB_Rx_02_EHB5ModeReq "制动5模式请求";
+CM_ SG_ 2566190800 EPB_Rx_01_EPB4VehSpd "驻车4控制请求";
+CM_ SG_ 2566190800 EPB_Rx_01_EPB4StrModReq "驻车4控制请求";
+CM_ SG_ 2566190800 EPB_Rx_01_EPB4CtlReq "驻车4控制请求";
+CM_ SG_ 2566190800 EPB_Rx_01_EPB3CtlReq "驻车3控制请求";
+CM_ SG_ 2566190800 EPB_Rx_01_EPB2CtlReq "驻车2控制请求";
+CM_ SG_ 2566190800 EPB_Rx_01_EPB1CtlReq "驻车1控制请求";
+CM_ SG_ 2566264823 RECU_6_RollingCounter "循环计数";
+CM_ SG_ 2566264823 RECU_6_RE_GrossGeneration_DP "增程器累积发电量";
+CM_ SG_ 2566264823 RECU_6_EngineTq "发动机实际扭矩";
+CM_ SG_ 2566264823 RECU_6_EngineSpd "发动机实际转速";
+CM_ SG_ 2566199287 RECU_5_DTC_FaultCode "故障码";
+CM_ SG_ 2566199287 RECU_5_EMS_TqCmd "发动机目标转矩指令";
+CM_ SG_ 2566199287 RECU_5_EMS_SpdCmd "发动机目标转速指令";
+CM_ SG_ 2566133751 RECU_4_RE_ActISGTq2_DP "发电机2实际扭矩反馈值";
+CM_ SG_ 2566133751 RECU_4_RE_ActISGSpd2_DP "发电机2实际转速反馈值";
+CM_ SG_ 2566133751 RECU_4_MCU2_SpdCmd "发电机2目标转速指令";
+CM_ SG_ 2566133751 RECU_4_MCU2_Tq_Cmd "发电机2目标转矩指令";
+CM_ SG_ 2566068215 RECU_3_RE_ActISGTq1_DP "发电机1实际扭矩反馈值";
+CM_ SG_ 2566068215 RECU_3_RE_ActISGSpd1_DP "发电机1实际转速反馈值";
+CM_ SG_ 2566068215 RECU_3_MCU1_Tq_Cmd "发电机1目标转矩指令";
+CM_ SG_ 2566068215 RECU_3_MCU1_SpdCmd "发电机1目标转速指令";
+CM_ SG_ 2566002679 RECU_2_GCUTemp2 "发电机控制器2温度";
+CM_ SG_ 2566002679 RECU_2_ActIsgTemp2_Act "当前发电机2温度";
+CM_ SG_ 2566002679 RECU_2_GCUTemp1 "发电机控制器1温度";
+CM_ SG_ 2566002679 RECU_2_ActIsgTemp1_Act "当前发电机1温度";
+CM_ SG_ 2566002679 RECU_2_DCLinkCurr_Act "直流母线电流";
+CM_ SG_ 2566002679 RECU_2_DCLinkVol_Act "直流母线电压";
+CM_ SG_ 2565937143 RECU_1_EMSTemp "发电机控制器1温度";
+CM_ SG_ 2565937143 RECU_1_RE_SystemReady "RECU系统上高压完成";
+CM_ SG_ 2565937143 RECU_1_RollingCounter "循环计数";
+CM_ SG_ 2565937143 RECU_1_ATS_Fault "散热系统故障";
+CM_ SG_ 2565937143 RECU_1_START_ENABLE "发动机启动马达使能信号";
+CM_ SG_ 2565937143 RECU_1_IsgSpdDirection "发电机旋转方向";
+CM_ SG_ 2565937143 RECU_1_GCU_Fault "发电机系统故障";
+CM_ SG_ 2565937143 RECU_1_MaxPower "增程器允许最大输出功率";
+CM_ SG_ 2565937143 RECU_1_PowerFb_Act "增程器实际功率";
+CM_ SG_ 2565937143 RECU_1_ECUActive "发动机工作状态";
+CM_ SG_ 2565937143 RECU_1_GCUActive "RECU激活信号";
+CM_ SG_ 2565937143 RECU_1_MCU_En "发电机MCU使能信号";
+CM_ SG_ 2565937143 RECU_1_SelfCheck_State "RECU自检状态";
+CM_ SG_ 2565937143 RECU_1_CutOffLV_Req "RECU下低压电请求";
+CM_ SG_ 2565937143 RECU_1_ActiveDischg_FB "RECU主动放电反馈";
+CM_ SG_ 2565937143 RECU_1_FaultLevel "RECU故障等级";
+CM_ SG_ 2565937143 RECU_1_WorkStatus_Act "增程器工作状态";
+CM_ SG_ 2566321616 WVCU_PowerDownFit "下电故障";
+CM_ SG_ 2566321616 WVCU_LimpPowerFit "限制功率故障";
+CM_ SG_ 2566321616 WVCU_LimprFit "跛行模式故障";
+CM_ SG_ 2566321616 WVCU_ForbEneryFit "禁止驱动故障";
+CM_ SG_ 2566321616 WVCU_OnGearKeySig "On档钥匙信号";
+CM_ SG_ 2566321616 WVCU_ChrgWakeUpSig "充电唤醒信号";
+CM_ SG_ 2566321616 WVCU_EngyRecoveryDisblSw "能量回收禁止开关";
+CM_ SG_ 2566321616 WVCU_FExtrctrReqSw "取力器请求开关信号";
+CM_ SG_ 2566321616 WVCU_STARTGearKeySig "START档钥匙信号";
+CM_ SG_ 2566321616 WVCU_ACCGearKeySig "ACC档钥匙信号";
+CM_ SG_ 2566321616 WVCU_ADUModeSwSts "智驾模式切换开关";
+CM_ SG_ 2566321616 WVCU_EngyRecovery04GearSwSig "能量回收四档开关信号";
+CM_ SG_ 2566321616 WVCU_EngyRecovery03GearSwSig "能量回收三档开关信号";
+CM_ SG_ 2566321616 WVCU_EngyRecovery02GearSwSig "能量回收二档开关信号";
+CM_ SG_ 2566321616 WVCU_EngyRecovery01GearSwSig "能量回收一档开关信号";
+CM_ SG_ 2566321616 WVCU_PrkBrkSwSig "驻车制动开关信号";
+CM_ SG_ 2566321616 WVCU_BrkPedallSigSts "刹车踏板信号（数字）";
+CM_ SG_ 2566321616 WVCU_WaterPump2FltSts "水泵2故障反馈";
+CM_ SG_ 2566321616 WVCU_WaterPump1FltSts "水泵1故障反馈";
+CM_ SG_ 2563503312 Brk_7_Sts08PresSts "制动8液压力状态";
+CM_ SG_ 2563503312 Brk_7_Sts08Mode "制动8模式状态";
+CM_ SG_ 2563503312 Brk_7_Sts08FltLvl "制动8故障等级";
+CM_ SG_ 2563503312 Brk_7_Sts08FltCode "制动8故障码";
+CM_ SG_ 2563503312 Brk_7_Sts07FltCode "制动7故障码";
+CM_ SG_ 2563503312 Brk_7_Sts07FltLvl "制动7故障等级";
+CM_ SG_ 2563503312 Brk_7_Sts07PresSts "制动7液压力状态";
+CM_ SG_ 2563503312 Brk_7_Sts07Mode "制动7模式状态";
+CM_ SG_ 2563437776 Brk_5_Sts06PresSts "制动6液压力状态";
+CM_ SG_ 2563437776 Brk_5_Sts06Mode "制动6模式状态";
+CM_ SG_ 2563437776 Brk_5_Sts06FltLvl "制动6故障等级";
+CM_ SG_ 2563437776 Brk_5_Sts06FltCode "制动6故障码";
+CM_ SG_ 2563437776 Brk_5_Sts05FltCode "制动5故障码";
+CM_ SG_ 2563437776 Brk_5_Sts05FltLvl "制动5故障等级";
+CM_ SG_ 2563437776 Brk_5_Sts05PresSts "制动5液压力状态";
+CM_ SG_ 2563437776 Brk_5_Sts05Mode "制动5模式状态";
+CM_ SG_ 2563372240 Brk_3_Sts04PresSts "制动4液压力状态";
+CM_ SG_ 2563372240 Brk_3_Sts04Mode "制动4模式状态";
+CM_ SG_ 2563372240 Brk_3_Sts04FltLvl "制动4故障等级";
+CM_ SG_ 2563372240 Brk_3_Sts04FltCode "制动4故障码";
+CM_ SG_ 2563372240 Brk_3_Sts03FltCode "制动3故障码";
+CM_ SG_ 2563372240 Brk_3_Sts03FltLvl "制动3故障等级";
+CM_ SG_ 2563372240 Brk_3_Sts03PresSts "制动3液压力状态";
+CM_ SG_ 2563372240 Brk_3_Sts03Mode "制动3模式状态";
+CM_ SG_ 2563306704 Brk_1_Sts02PresSts "制动2液压力状态";
+CM_ SG_ 2563306704 Brk_1_Sts02Mode "制动2模式状态";
+CM_ SG_ 2563306704 Brk_1_Sts02FltLvl "制动2故障等级";
+CM_ SG_ 2563306704 Brk_1_Sts02FltCode "制动2故障码";
+CM_ SG_ 2563306704 Brk_1_Sts01FltCode "制动1故障码";
+CM_ SG_ 2563306704 Brk_1_Sts01FltLvl "制动1故障等级";
+CM_ SG_ 2563306704 Brk_1_Sts01PresSts "制动1液压力状态";
+CM_ SG_ 2563306704 Brk_1_Sts01Mode "制动1模式状态";
+CM_ SG_ 2562979024 Str_4_StsFltLvl "04故障等级";
+CM_ SG_ 2562979024 Str_4_StsFltCode "04故障码";
+CM_ SG_ 2562979024 Str_4_StsOutCurr "04输出电流";
+CM_ SG_ 2562979024 Str_4_AngSpdSts "04角速度状态";
+CM_ SG_ 2562979024 Str_4_AngSts "04角度状态";
+CM_ SG_ 2562979024 Str_4_ModeSts "04模式状态";
+CM_ SG_ 2562913488 Str_3_StsFltLvl "03故障等级";
+CM_ SG_ 2562913488 Str_3_StsFltCode "03故障码";
+CM_ SG_ 2562913488 Str_3_StsOutCurr "03输出电流";
+CM_ SG_ 2562913488 Str_3_AngSpdSts "03角速度状态";
+CM_ SG_ 2562913488 Str_3_AngSts "03角度状态";
+CM_ SG_ 2562913488 Str_3_ModeSts "03模式状态";
+CM_ SG_ 2562847952 Str_2_StsFltLvl "02故障等级";
+CM_ SG_ 2562847952 Str_2_StsFltCode "02故障码";
+CM_ SG_ 2562847952 Str_2_StsOutCurr "02输出电流";
+CM_ SG_ 2562847952 Str_2_AngSpdSts "02角速度状态";
+CM_ SG_ 2562847952 Str_2_AngSts "02角度状态";
+CM_ SG_ 2562847952 Str_2_ModeSts "02模式状态";
+CM_ SG_ 2562782416 Str_1_StsFltLvl "01故障等级";
+CM_ SG_ 2562782416 Str_1_StsFltCode "01故障码";
+CM_ SG_ 2562782416 Str_1_StsOutCurr "01输出电流";
+CM_ SG_ 2562782416 Str_1_AngSpdSts "01角速度状态";
+CM_ SG_ 2562782416 Str_1_AngSts "01角度状态";
+CM_ SG_ 2562782416 Str_1_ModeSts "01模式状态";
+CM_ SG_ 2562192592 Mot_8_Sts03IGBTTemp_W "08W相IGBT温度";
+CM_ SG_ 2562192592 Mot_8_Sts03IGBTTemp_V "08V相IGBT温度";
+CM_ SG_ 2562192592 Mot_8_Sts03IGBTTemp_U "08U相IGBT温度";
+CM_ SG_ 2562192592 Mot_8_Sts03MotTemp "08电机温度";
+CM_ SG_ 2562192592 Mot_8_Sts03MCUTemp "08MCU温度";
+CM_ SG_ 2562127056 Mot_8_Sts02MotMaxDisChrgTq "08电机最大发电转矩";
+CM_ SG_ 2562127056 Mot_8_Sts02MotMaxDrvTq "08电机最大电动转矩";
+CM_ SG_ 2562127056 Mot_8_Sts02DisChrgSts "08放电状态";
+CM_ SG_ 2562127056 Mot_8_Sts02HVILST "08高压互锁状态";
+CM_ SG_ 2562127056 Mot_8_Sts02FltLvl "08故障等级";
+CM_ SG_ 2562127056 Mot_8_Sts02MotWorkMode "08当前电机控制模式";
+CM_ SG_ 2562127056 Mot_8_Sts02IvtrSts "08逆变器工作状态";
+CM_ SG_ 2562061520 Mot_8_Sts01MotTq "08当前扭矩";
+CM_ SG_ 2562061520 Mot_8_Sts01MotSpd_Q "08当前转速有效性";
+CM_ SG_ 2562061520 Mot_8_Sts01MotSpd "08当前转速";
+CM_ SG_ 2561995984 Mot_7_Sts03IGBTTemp_W "07W相IGBT温度";
+CM_ SG_ 2561995984 Mot_7_Sts03IGBTTemp_V "07V相IGBT温度";
+CM_ SG_ 2561995984 Mot_7_Sts03IGBTTemp_U "07U相IGBT温度";
+CM_ SG_ 2561995984 Mot_7_Sts03MotTemp "07电机温度";
+CM_ SG_ 2561995984 Mot_7_Sts03MCUTemp "07MCU温度";
+CM_ SG_ 2561930448 Mot_7_Sts02MotMaxDisChrgTq "07电机最大发电转矩";
+CM_ SG_ 2561930448 Mot_7_Sts02MotMaxDrvTq "07电机最大电动转矩";
+CM_ SG_ 2561930448 Mot_7_Sts02DisChrgSts "07放电状态";
+CM_ SG_ 2561930448 Mot_7_Sts02HVILST "07高压互锁状态";
+CM_ SG_ 2561930448 Mot_7_Sts02FltLvl "07故障等级";
+CM_ SG_ 2561930448 Mot_7_Sts02MotWorkMode "07当前电机控制模式";
+CM_ SG_ 2561930448 Mot_7_Sts02IvtrSts "07逆变器工作状态";
+CM_ SG_ 2561864912 Mot_7_Sts01MotTq "07当前扭矩";
+CM_ SG_ 2561864912 Mot_7_Sts01MotSpd_Q "07当前转速有效性";
+CM_ SG_ 2561864912 Mot_7_Sts01MotSpd "07当前转速";
+CM_ SG_ 2561799376 Mot_6_Sts03IGBTTemp_W "06W相IGBT温度";
+CM_ SG_ 2561799376 Mot_6_Sts03IGBTTemp_V "06V相IGBT温度";
+CM_ SG_ 2561799376 Mot_6_Sts03IGBTTemp_U "06U相IGBT温度";
+CM_ SG_ 2561799376 Mot_6_Sts03MotTemp "06电机温度";
+CM_ SG_ 2561799376 Mot_6_Sts03MCUTemp "06MCU温度";
+CM_ SG_ 2561733840 Mot_6_Sts02MotMaxDisChrgTq "06电机最大发电转矩";
+CM_ SG_ 2561733840 Mot_6_Sts02MotMaxDrvTq "06电机最大电动转矩";
+CM_ SG_ 2561733840 Mot_6_Sts02DisChrgSts "06放电状态";
+CM_ SG_ 2561733840 Mot_6_Sts02HVILST "06高压互锁状态";
+CM_ SG_ 2561733840 Mot_6_Sts02FltLvl "06故障等级";
+CM_ SG_ 2561733840 Mot_6_Sts02MotWorkMode "06当前电机控制模式";
+CM_ SG_ 2561733840 Mot_6_Sts02IvtrSts "06逆变器工作状态";
+CM_ SG_ 2561668304 Mot_6_Sts01MotTq "06当前扭矩";
+CM_ SG_ 2561668304 Mot_6_Sts01MotSpd_Q "06当前转速有效性";
+CM_ SG_ 2561668304 Mot_6_Sts01MotSpd "06当前转速";
+CM_ SG_ 2561602768 Mot_5_Sts03IGBTTemp_W "05W相IGBT温度";
+CM_ SG_ 2561602768 Mot_5_Sts03IGBTTemp_V "05V相IGBT温度";
+CM_ SG_ 2561602768 Mot_5_Sts03IGBTTemp_U "05U相IGBT温度";
+CM_ SG_ 2561602768 Mot_5_Sts03MotTemp "05电机温度";
+CM_ SG_ 2561602768 Mot_5_Sts03MCUTemp "05MCU温度";
+CM_ SG_ 2561537232 Mot_5_Sts02MotMaxDisChrgTq "05电机最大发电转矩";
+CM_ SG_ 2561537232 Mot_5_Sts02MotMaxDrvTq "05电机最大电动转矩";
+CM_ SG_ 2561537232 Mot_5_Sts02DisChrgSts "05放电状态";
+CM_ SG_ 2561537232 Mot_5_Sts02HVILST "05高压互锁状态";
+CM_ SG_ 2561537232 Mot_5_Sts02FltLvl "05故障等级";
+CM_ SG_ 2561537232 Mot_5_Sts02MotWorkMode "05当前电机控制模式";
+CM_ SG_ 2561537232 Mot_5_Sts02IvtrSts "05逆变器工作状态";
+CM_ SG_ 2561471696 Mot_5_Sts01MotTq "05当前扭矩";
+CM_ SG_ 2561471696 Mot_5_Sts01MotSpd_Q "05当前转速有效性";
+CM_ SG_ 2561471696 Mot_5_Sts01MotSpd "05当前转速";
+CM_ SG_ 2561406160 Mot_4_Sts03IGBTTemp_W "04W相IGBT温度";
+CM_ SG_ 2561406160 Mot_4_Sts03IGBTTemp_V "04V相IGBT温度";
+CM_ SG_ 2561406160 Mot_4_Sts03IGBTTemp_U "04U相IGBT温度";
+CM_ SG_ 2561406160 Mot_4_Sts03MotTemp "04电机温度";
+CM_ SG_ 2561406160 Mot_4_Sts03MCUTemp "04MCU温度";
+CM_ SG_ 2561340624 Mot_4_Sts02MotMaxDisChrgTq "04电机最大发电转矩";
+CM_ SG_ 2561340624 Mot_4_Sts02MotMaxDrvTq "04电机最大电动转矩";
+CM_ SG_ 2561340624 Mot_4_Sts02DisChrgSts "04放电状态";
+CM_ SG_ 2561340624 Mot_4_Sts02HVILST "04高压互锁状态";
+CM_ SG_ 2561340624 Mot_4_Sts02FltLvl "04故障等级";
+CM_ SG_ 2561340624 Mot_4_Sts02MotWorkMode "04当前电机控制模式";
+CM_ SG_ 2561340624 Mot_4_Sts02IvtrSts "04逆变器工作状态";
+CM_ SG_ 2561275088 Mot_4_Sts01MotTq "04当前扭矩";
+CM_ SG_ 2561275088 Mot_4_Sts01MotSpd_Q "04当前转速有效性";
+CM_ SG_ 2561275088 Mot_4_Sts01MotSpd "04当前转速";
+CM_ SG_ 2561209552 Mot_3_Sts03IGBTTemp_W "03W相IGBT温度";
+CM_ SG_ 2561209552 Mot_3_Sts03IGBTTemp_V "03V相IGBT温度";
+CM_ SG_ 2561209552 Mot_3_Sts03IGBTTemp_U "03U相IGBT温度";
+CM_ SG_ 2561209552 Mot_3_Sts03MotTemp "03电机温度";
+CM_ SG_ 2561209552 Mot_3_Sts03MCUTemp "03MCU温度";
+CM_ SG_ 2561144016 Mot_3_Sts02MotMaxDisChrgTq "03电机最大发电转矩";
+CM_ SG_ 2561144016 Mot_3_Sts02MotMaxDrvTq "03电机最大电动转矩";
+CM_ SG_ 2561144016 Mot_3_Sts02DisChrgSts "03放电状态";
+CM_ SG_ 2561144016 Mot_3_Sts02HVILST "03高压互锁状态";
+CM_ SG_ 2561144016 Mot_3_Sts02FltLvl "03故障等级";
+CM_ SG_ 2561144016 Mot_3_Sts02MotWorkMode "03当前电机控制模式";
+CM_ SG_ 2561144016 Mot_3_Sts02IvtrSts "03逆变器工作状态";
+CM_ SG_ 2561078480 Mot_3_Sts01MotTq "03当前扭矩";
+CM_ SG_ 2561078480 Mot_3_Sts01MotSpd_Q "03当前转速有效性";
+CM_ SG_ 2561078480 Mot_3_Sts01MotSpd "03当前转速";
+CM_ SG_ 2561012944 Mot_2_Sts03IGBTTemp_W "02W相IGBT温度";
+CM_ SG_ 2561012944 Mot_2_Sts03IGBTTemp_V "02V相IGBT温度";
+CM_ SG_ 2561012944 Mot_2_Sts03IGBTTemp_U "02U相IGBT温度";
+CM_ SG_ 2561012944 Mot_2_Sts03MotTemp "02电机温度";
+CM_ SG_ 2561012944 Mot_2_Sts03MCUTemp "02MCU温度";
+CM_ SG_ 2560947408 Mot_2_Sts02MotMaxDisChrgTq "02电机最大发电转矩";
+CM_ SG_ 2560947408 Mot_2_Sts02MotMaxDrvTq "02电机最大电动转矩";
+CM_ SG_ 2560947408 Mot_2_Sts02DisChrgSts "02放电状态";
+CM_ SG_ 2560947408 Mot_2_Sts02HVILST "02高压互锁状态";
+CM_ SG_ 2560947408 Mot_2_Sts02FltLvl "02故障等级";
+CM_ SG_ 2560947408 Mot_2_Sts02MotWorkMode "02当前电机控制模式";
+CM_ SG_ 2560947408 Mot_2_Sts02IvtrSts "02逆变器工作状态";
+CM_ SG_ 2560881872 Mot_2_Sts01MotTq "02当前扭矩";
+CM_ SG_ 2560881872 Mot_2_Sts01MotSpd_Q "02当前转速有效性";
+CM_ SG_ 2560881872 Mot_2_Sts01MotSpd "02当前转速";
+CM_ SG_ 2560816336 Mot_1_Sts03IGBTTemp_W "01W相IGBT温度";
+CM_ SG_ 2560816336 Mot_1_Sts03IGBTTemp_V "01V相IGBT温度";
+CM_ SG_ 2560816336 Mot_1_Sts03IGBTTemp_U "01U相IGBT温度";
+CM_ SG_ 2560816336 Mot_1_Sts03MotTemp "01电机温度";
+CM_ SG_ 2560816336 Mot_1_Sts03MCUTemp "01MCU温度";
+CM_ SG_ 2560750800 Mot_1_Sts02MotMaxDisChrgTq "01电机最大发电转矩";
+CM_ SG_ 2560750800 Mot_1_Sts02MotMaxDrvTq "01电机最大电动转矩";
+CM_ SG_ 2560750800 Mot_1_Sts02DisChrgSts "01放电状态";
+CM_ SG_ 2560750800 Mot_1_Sts02HVILST "01高压互锁状态";
+CM_ SG_ 2560750800 Mot_1_Sts02FltLvl "01故障等级";
+CM_ SG_ 2560750800 Mot_1_Sts02MotWorkMode "01当前电机控制模式";
+CM_ SG_ 2560750800 Mot_1_Sts02IvtrSts "01逆变器工作状态";
+CM_ SG_ 2560685264 Mot_1_Sts01MotTq "01当前扭矩";
+CM_ SG_ 2560685264 Mot_1_Sts01MotSpd_Q "01当前转速有效性";
+CM_ SG_ 2560685264 Mot_1_Sts01MotSpd "01当前转速";
+CM_ SG_ 2565928400 WVCU_EPSEHBTx01EPSAngAxisSteer "转向4轴角度状态";
+CM_ SG_ 2565928400 WVCU_ShakeHandSts "握手状态";
+CM_ SG_ 2564420816 PDUSts_Mot8PrecFltSts "电机8预充故障状态";
+CM_ SG_ 2564420816 PDUSts_Mot8PrecCntctrSts "电机8预充触点状态";
+CM_ SG_ 2564420816 PDUSts_Mot8MainPosFltSts "电机8主正故障状态";
+CM_ SG_ 2564420816 PDUSts_Mot8MainPosCntctrSts "电机8主正触点状态";
+CM_ SG_ 2564420816 PDUSts_RollCnt02 "循环计数";
+CM_ SG_ 2564355280 PDUSts_Mot7PrecFltSts "电机7预充故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot7PrecCntctrSts "电机7预充触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot7MainPosFltSts "电机7主正故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot7MainPosCntctrSts "电机7主正触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot6PrecFltSts "电机6预充故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot6PrecCntctrSts "电机6预充触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot6MainPosFltSts "电机6主正故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot6MainPosCntctrSts "电机6主正触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot5PrecFltSts "电机5预充故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot5PrecCntctrSts "电机5预充触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot5MainPosFltSts "电机5主正故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot5MainPosCntctrSts "电机5主正触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot4PrecFltSts "电机4预充故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot4PrecCntctrSts "电机4预充触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot4MainPosFltSts "电机4主正故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot4MainPosCntctrSts "电机4主正触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot3PrecFltSts "电机3预充故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot3PrecCntctrSts "电机3预充触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot3MainPosFltSts "电机3主正故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot3MainPosCntctrSts "电机3主正触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot2PrecFltSts "电机2预充故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot2PrecCntctrSts "电机2预充触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot2MainPosFltSts "电机2主正故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot2MainPosCntctrSts "电机2主正触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot1PrecFltSts "电机1预充故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot1PrecCntctrSts "电机1预充触点状态";
+CM_ SG_ 2564355280 PDUSts_Mot1MainPosFltSts "电机1主正故障状态";
+CM_ SG_ 2564355280 PDUSts_Mot1MainPosCntctrSts "电机1主正触点状态";
+CM_ SG_ 2564355280 PDUSts_RollCnt01 "循环计数";
+CM_ SG_ 2563962064 BatSts03_SOC "SOC";
+CM_ SG_ 2563962064 BatSts03_HVP "HVP";
+CM_ SG_ 2563962064 BatSts03_HVB "HVB";
+CM_ SG_ 2563962064 BatSts03_TotalCurr "总电流";
+CM_ SG_ 2563896528 BatSts02_MaxAllwblDchaCurr "当前最大允许放电电流";
+CM_ SG_ 2563896528 BatSts02_MaxAllwblFbCurr "当前最大允许回馈电流";
+CM_ SG_ 2563896528 BatSts02_MaxAllwblPeakDchaCurr "最大允许峰值放电电流";
+CM_ SG_ 2563896528 BatSts02_MaxAllwblPeakFbCurr "最大允许峰值回馈电流";
+CM_ SG_ 2563830992 WVCU_BMSTx3SOH "SOH";
+CM_ SG_ 2563830992 BatSts01_BMSMaxFltLvl "BMS当前最高故障等级";
+CM_ SG_ 2563830992 BatSts01_BMSPwrUpSts "BMS上电状态";
+CM_ SG_ 2563830992 BatSts01_BMSSts "BMS状态";
+CM_ SG_ 2563765456 Prk_1_Sts04Mode "驻车4模式状态";
+CM_ SG_ 2563765456 Prk_1_Sts04FltLvl "驻车4故障等级";
+CM_ SG_ 2563765456 Prk_1_Sts04FltCode "驻车4故障码";
+CM_ SG_ 2563765456 Prk_1_Sts03Mode "驻车3模式状态";
+CM_ SG_ 2563765456 Prk_1_Sts03FltLvl "驻车3故障等级";
+CM_ SG_ 2563765456 Prk_1_Sts03FltCode "驻车3故障码";
+CM_ SG_ 2563765456 Prk_1_Sts02Mode "驻车2模式状态";
+CM_ SG_ 2563765456 Prk_1_Sts02FltLvl "驻车2故障等级";
+CM_ SG_ 2563765456 Prk_1_Sts02FltCode "驻车2故障码";
+CM_ SG_ 2563765456 Prk_1_Sts01Mode "驻车1模式状态";
+CM_ SG_ 2563765456 Prk_1_Sts01FltLvl "驻车1故障等级";
+CM_ SG_ 2563765456 Prk_1_Sts01FltCode "驻车1故障码";
+CM_ SG_ 2565993936 Body_FuelLvlRGas_ohm "汽油液位";
+CM_ SG_ 2565993936 Body_FuelLvlR_ohm "甲醇液位";
+CM_ SG_ 2565993936 BodySts_BrkLampSts "制动灯状态";
+CM_ SG_ 2565993936 BodySts_HighBeamLampSts "远光灯状态";
+CM_ SG_ 2565993936 BodySts_LowBeamLampSts "近光灯状态";
+CM_ SG_ 2565993936 BodySts_TurnRLampSts "右转灯状态";
+CM_ SG_ 2565993936 BodySts_TurnLLampSts "左转灯状态";
+CM_ SG_ 2565993936 BodySts_JobActionSts "作业动作状态";
+CM_ SG_ 2566387152 WVCU_RmtJob "摇杆作业";
+CM_ SG_ 2566387152 WVCU_RmtHorn "摇杆喇叭";
+CM_ SG_ 2566387152 WVCU_RmtLgt "摇杆纵向开度";
+CM_ SG_ 2566387152 WVCU_RmtHozl "摇杆转向开度";
+CM_ SG_ 2566387152 WVCU_RmtSteerModeReq "转向模式请求";
+CM_ SG_ 2566387152 WVCU_RmtConnectSts "遥控器连接状态";
+CM_ SG_ 2566387152 WVCU_RmtGearReq "Rmt挡位请求";
+CM_ SG_ 2566387152 WVCU_RmtCtrlModeReq "Rmt控制模式请求";
+CM_ SG_ 2566256080 WVCU_WtrTempSnsr2Temp "水温传感器2温度";
+CM_ SG_ 2566256080 WVCU_WtrTempSnsr1Temp "水温传感器1温度";
+CM_ SG_ 2566256080 WVCU_GearCtrlReqSts "挡位控制器请求状态";
+CM_ SG_ 2566256080 WVCU_BrkPedallStk_Q "刹车踏板开度有效性";
+CM_ SG_ 2566256080 WVCU_BrkPedallStk "刹车踏板开度";
+CM_ SG_ 2566256080 WVCU_APSSts_Q "油门踏板开度有效性";
+CM_ SG_ 2566256080 WVCU_APSSts "油门踏板开度";
+CM_ SG_ 2566190544 WVCU_VehStrAngSpdReq "转向角速度请求";
+CM_ SG_ 2566190544 WVCU_VehStrAngReq "转向角度请求";
+CM_ SG_ 2566190544 WVCU_VehBrkPercReq "制动百分比请求";
+CM_ SG_ 2566190544 WVCU_VehPrkReq "驻车请求";
+CM_ SG_ 2566190544 WVCU_VehSpdReq_Q "车速请求有效性";
+CM_ SG_ 2566190544 WVCU_VehSpdReq "车速请求";
+CM_ SG_ 2566125008 WVCU_RECU2DCLinkVol_Act "直流母线电压";
+CM_ SG_ 2566125008 WVCU_RECU2DCLinkCurr_Act "直流母线电流";
+CM_ SG_ 2566125008 WVCU_RECU1EMSTemp "发电机控制器1温度";
+CM_ SG_ 2566125008 WVCU_VehSpdNow "车辆车速";
+CM_ SG_ 2566059472 WVCU_REFltCode "RE故障码";
+CM_ SG_ 2566059472 WVCU_VehRdySts "车辆Ready状态";
+CM_ SG_ 2566059472 WVCU_24VLowVolBat "24V低压电池电压";
+CM_ SG_ 2566059472 WVCU_MCUFltLvl "MCU故障等级";
+CM_ SG_ 2566059472 WVCU_EHBFltLvl "EHB故障等级";
+CM_ SG_ 2566059472 WVCU_EPSFltLvl "EPS故障等级";
+CM_ SG_ 2566059472 WVCU_EPBFltLvl "EPB故障等级";
+CM_ SG_ 2566059472 WVCU_BMSFltLvl "BMS故障等级";
+CM_ SG_ 2566059472 WVCU_VMCFltCode "VMC故障码";
+CM_ SG_ 2566059472 WVCU_PMCFltCode "PMC故障码";
+CM_ SG_ 2566059472 WVCU_VehFltLvl "整车故障等级";
+CM_ SG_ 2566059472 WVCU_GearStsNow "当前挡位";
+CM_ SG_ 2566059472 WVCU_EmgySwtchSts "急停开关状态";
+CM_ SG_ 2566897978 TMS_Tx_BMS_TMSFltLvl "主机组TMS故障等级";
+CM_ SG_ 2566897978 TMS_Tx_BMS_TMSFltCode "主机组TMS故障码";
+CM_ SG_ 2566897978 TMS_Tx_BMS_TMSRequiredPwr "主机组TMS需求功率";
+CM_ SG_ 2566897978 TMS_Tx_BMS_InputWaterTemp "主机组回水温度（电池到机组）";
+CM_ SG_ 2566897978 TMS_Tx_BMS_OutputWaterTemp "主机组出水温度（机组到电池）";
+CM_ SG_ 2566897978 TMS_Tx_BMS_TMSHVRlySt "主机组TMS高压继电器状态";
+CM_ SG_ 2566897978 TMS_Tx_BMS_TMSWorkMode "主机组TMS工作模式";
+CM_ SG_ 2566866420 BMS_Tx_TMS_CRCChk "CRC效验值";
+CM_ SG_ 2566866420 BMS_Tx_TMS_BMSLive "BMS生命帧";
+CM_ SG_ 2566866420 BMS_Tx_TMS_SetTemp "设定温度";
+CM_ SG_ 2566866420 BMS_Tx_TMS_CurrVolt "BMS当前电压";
+CM_ SG_ 2566866420 BMS_Tx_TMS_BMSHVRlySt "BMS高压继电器状态";
+CM_ SG_ 2566866420 BMS_Tx_TMS_ChargeSt "充电状态";
+CM_ SG_ 2566866420 BMS_Tx_TMS_HVReqSt "高压请求";
+CM_ SG_ 2566866420 BMS_Tx_TMS_BMSSetModeReq "BMS请求设定模式";
+CM_ SG_ 2566898234 TMS_Tx_BMS_SlaveTMSFltLvl "从机组TMS故障等级";
+CM_ SG_ 2566898234 TMS_Tx_BMS_SlaveTMSFltCode "从机组TMS故障码";
+CM_ SG_ 2566898234 TMS_Tx_BMS_SlaveTMSRequiredPwr "从机组TMS需求功率";
+CM_ SG_ 2566898234 TMS_Tx_BMS_OutputWaterTemp "从机组出水温度";
+CM_ SG_ 2566898234 TMS_Tx_BMS_InputWaterTemp "从机组进水温度";
+CM_ SG_ 2566898234 TMS_Tx_BMS_SlaveTMSHVRlySt "从机组高压继电器状态";
+CM_ SG_ 2566898234 TMS_Tx_BMS_SlaveTMSWorkMode "从机组TMS工作模式";
+CM_ SG_ 2566845491 TPMS_Tx_1_TirePressThresholdDect "压力检测";
+CM_ SG_ 2566845491 TPMS_Tx_1_TireAirLeakageRate "漏气检测";
+CM_ SG_ 2566845491 TPMS_Tx_1_TireTemperature "轮胎温度";
+CM_ SG_ 2566845491 TPMS_Tx_1_TirePressure "轮胎压力";
+CM_ SG_ 2566845491 TPMS_Tx_1_TireLocationDirection "轮胎定位方向";
+CM_ SG_ 2566845491 TPMS_Tx_1_TireLocationAxle "轮胎位置车轴";
+BA_DEF_ SG_  "SignalType" STRING ;
+BA_DEF_ BO_  "GenMsgCycleTime" INT 0 0;
+BA_DEF_DEF_  "SignalType" "";
+BA_DEF_DEF_  "GenMsgCycleTime" 0;
+BA_ "GenMsgCycleTime" BO_ 2564027600 1000;
+BA_ "GenMsgCycleTime" BO_ 2552037781 100;
+BA_ "GenMsgCycleTime" BO_ 2551973954 100;
+BA_ "GenMsgCycleTime" BO_ 2552038293 500;
+BA_ "GenMsgCycleTime" BO_ 2552799731 1000;
+BA_ "GenMsgCycleTime" BO_ 2417205747 1000;
+BA_ "GenMsgCycleTime" BO_ 2417140211 1000;
+BA_ "GenMsgCycleTime" BO_ 2565932240 100;
+BA_ "GenMsgCycleTime" BO_ 2364933554 100;
+BA_ "GenMsgCycleTime" BO_ 2552045717 20;
+BA_ "GenMsgCycleTime" BO_ 2551980098 20;
+BA_ "GenMsgCycleTime" BO_ 2565812240 100;
+BA_ "GenMsgCycleTime" BO_ 2566861383 200;
+BA_ "GenMsgCycleTime" BO_ 2566508790 50;
+BA_ "GenMsgCycleTime" BO_ 336 20;
+BA_ "GenMsgCycleTime" BO_ 2566836469 20;
+BA_ "GenMsgCycleTime" BO_ 2566770933 20;
+BA_ "GenMsgCycleTime" BO_ 2566705397 20;
+BA_ "GenMsgCycleTime" BO_ 2566639861 20;
+BA_ "GenMsgCycleTime" BO_ 2566574325 20;
+BA_ "GenMsgCycleTime" BO_ 2566902005 20;
+BA_ "GenMsgCycleTime" BO_ 2566508789 20;
+BA_ "GenMsgCycleTime" BO_ 2566443253 20;
+BA_ "GenMsgCycleTime" BO_ 2566377717 20;
+BA_ "GenMsgCycleTime" BO_ 2566312181 20;
+BA_ "GenMsgCycleTime" BO_ 2566246645 20;
+BA_ "GenMsgCycleTime" BO_ 2566181109 20;
+BA_ "GenMsgCycleTime" BO_ 2566115573 20;
+BA_ "GenMsgCycleTime" BO_ 2566050037 20;
+BA_ "GenMsgCycleTime" BO_ 2565984501 20;
+BA_ "GenMsgCycleTime" BO_ 2565918965 20;
+BA_ "GenMsgCycleTime" BO_ 2565918966 50;
+BA_ "GenMsgCycleTime" BO_ 2566854608 1000;
+BA_ "GenMsgCycleTime" BO_ 2566789072 5000;
+BA_ "GenMsgCycleTime" BO_ 2566723536 500;
+BA_ "GenMsgCycleTime" BO_ 2566658000 500;
+BA_ "GenMsgCycleTime" BO_ 2566592464 500;
+BA_ "GenMsgCycleTime" BO_ 2566526928 500;
+BA_ "GenMsgCycleTime" BO_ 2566461392 100;
+BA_ "GenMsgCycleTime" BO_ 2566395856 1000;
+BA_ "GenMsgCycleTime" BO_ 2566330320 500;
+BA_ "GenMsgCycleTime" BO_ 2566264784 500;
+BA_ "GenMsgCycleTime" BO_ 2566199248 500;
+BA_ "GenMsgCycleTime" BO_ 2566133712 500;
+BA_ "GenMsgCycleTime" BO_ 2566068176 500;
+BA_ "GenMsgCycleTime" BO_ 2566002640 100;
+BA_ "GenMsgCycleTime" BO_ 2565937104 500;
+BA_ "GenMsgCycleTime" BO_ 2348872609 100;
+BA_ "GenMsgCycleTime" BO_ 2417271283 100;
+BA_ "GenMsgCycleTime" BO_ 2417074675 100;
+BA_ "GenMsgCycleTime" BO_ 2554372595 1000;
+BA_ "GenMsgCycleTime" BO_ 2552472051 100;
+BA_ "GenMsgCycleTime" BO_ 2552406515 100;
+BA_ "GenMsgCycleTime" BO_ 2552340979 100;
+BA_ "GenMsgCycleTime" BO_ 2552275443 100;
+BA_ "GenMsgCycleTime" BO_ 2348851699 100;
+BA_ "GenMsgCycleTime" BO_ 2147492119 100;
+BA_ "GenMsgCycleTime" BO_ 2558783475 100;
+BA_ "GenMsgCycleTime" BO_ 2550330351 100;
+BA_ "GenMsgCycleTime" BO_ 2550264815 100;
+BA_ "GenMsgCycleTime" BO_ 2566901783 5000;
+BA_ "GenMsgCycleTime" BO_ 2566836247 500;
+BA_ "GenMsgCycleTime" BO_ 2565866992 100;
+BA_ "GenMsgCycleTime" BO_ 2565984502 50;
+BA_ "GenMsgCycleTime" BO_ 2566115574 50;
+BA_ "GenMsgCycleTime" BO_ 2566050038 50;
+BA_ "GenMsgCycleTime" BO_ 2566246646 50;
+BA_ "GenMsgCycleTime" BO_ 2566312182 50;
+BA_ "GenMsgCycleTime" BO_ 2566377718 50;
+BA_ "GenMsgCycleTime" BO_ 2566181110 50;
+BA_ "GenMsgCycleTime" BO_ 2566880239 10;
+BA_ "GenMsgCycleTime" BO_ 2566443254 50;
+BA_ "GenMsgCycleTime" BO_ 2565928656 50;
+BA_ "GenMsgCycleTime" BO_ 2565994192 50;
+BA_ "GenMsgCycleTime" BO_ 2566059728 50;
+BA_ "GenMsgCycleTime" BO_ 2566125264 50;
+BA_ "GenMsgCycleTime" BO_ 2566190800 50;
+BA_ "GenMsgCycleTime" BO_ 2566264823 100;
+BA_ "GenMsgCycleTime" BO_ 2566199287 100;
+BA_ "GenMsgCycleTime" BO_ 2566133751 100;
+BA_ "GenMsgCycleTime" BO_ 2566068215 100;
+BA_ "GenMsgCycleTime" BO_ 2566002679 100;
+BA_ "GenMsgCycleTime" BO_ 2565937143 10;
+BA_ "GenMsgCycleTime" BO_ 2566321616 20;
+BA_ "GenMsgCycleTime" BO_ 2563503312 20;
+BA_ "GenMsgCycleTime" BO_ 2563437776 20;
+BA_ "GenMsgCycleTime" BO_ 2563372240 20;
+BA_ "GenMsgCycleTime" BO_ 2563306704 20;
+BA_ "GenMsgCycleTime" BO_ 2562979024 20;
+BA_ "GenMsgCycleTime" BO_ 2562913488 20;
+BA_ "GenMsgCycleTime" BO_ 2562847952 20;
+BA_ "GenMsgCycleTime" BO_ 2562782416 20;
+BA_ "GenMsgCycleTime" BO_ 2562192592 500;
+BA_ "GenMsgCycleTime" BO_ 2562127056 100;
+BA_ "GenMsgCycleTime" BO_ 2562061520 20;
+BA_ "GenMsgCycleTime" BO_ 2561995984 500;
+BA_ "GenMsgCycleTime" BO_ 2561930448 100;
+BA_ "GenMsgCycleTime" BO_ 2561864912 20;
+BA_ "GenMsgCycleTime" BO_ 2561799376 500;
+BA_ "GenMsgCycleTime" BO_ 2561733840 100;
+BA_ "GenMsgCycleTime" BO_ 2561668304 20;
+BA_ "GenMsgCycleTime" BO_ 2561602768 500;
+BA_ "GenMsgCycleTime" BO_ 2561537232 100;
+BA_ "GenMsgCycleTime" BO_ 2561471696 20;
+BA_ "GenMsgCycleTime" BO_ 2561406160 500;
+BA_ "GenMsgCycleTime" BO_ 2561340624 100;
+BA_ "GenMsgCycleTime" BO_ 2561275088 20;
+BA_ "GenMsgCycleTime" BO_ 2561209552 500;
+BA_ "GenMsgCycleTime" BO_ 2561144016 100;
+BA_ "GenMsgCycleTime" BO_ 2561078480 20;
+BA_ "GenMsgCycleTime" BO_ 2561012944 500;
+BA_ "GenMsgCycleTime" BO_ 2560947408 100;
+BA_ "GenMsgCycleTime" BO_ 2560881872 20;
+BA_ "GenMsgCycleTime" BO_ 2560816336 500;
+BA_ "GenMsgCycleTime" BO_ 2560750800 100;
+BA_ "GenMsgCycleTime" BO_ 2560685264 20;
+BA_ "GenMsgCycleTime" BO_ 2565928400 20;
+BA_ "GenMsgCycleTime" BO_ 2564420816 500;
+BA_ "GenMsgCycleTime" BO_ 2564355280 500;
+BA_ "GenMsgCycleTime" BO_ 2563962064 500;
+BA_ "GenMsgCycleTime" BO_ 2563896528 100;
+BA_ "GenMsgCycleTime" BO_ 2563830992 500;
+BA_ "GenMsgCycleTime" BO_ 2563765456 20;
+BA_ "GenMsgCycleTime" BO_ 2565993936 20;
+BA_ "GenMsgCycleTime" BO_ 2566387152 100;
+BA_ "GenMsgCycleTime" BO_ 2566256080 20;
+BA_ "GenMsgCycleTime" BO_ 2566190544 20;
+BA_ "GenMsgCycleTime" BO_ 2566125008 20;
+BA_ "GenMsgCycleTime" BO_ 2566059472 20;
+BA_ "GenMsgCycleTime" BO_ 2566897978 1000;
+BA_ "GenMsgCycleTime" BO_ 2566866420 1000;
+BA_ "GenMsgCycleTime" BO_ 2566898234 1000;
+BA_ "GenMsgCycleTime" BO_ 2566845491 500;
+VAL_ 3221225472 WVCU_DOMSwReq 1 "开" 0 "关" ;
+VAL_ 3221225472 RC_Tx_1JobReq 2 "降" 1 "升" 0 "无" ;
+VAL_ 3221225472 RC_Tx_1StrModeReq 4 "最小转弯" 3 "蟹行" 2 "仅后轴转" 1 "仅前轴转" 0 "无" ;
+VAL_ 337 RC_Tx_2_RC_WorkRise 1 "升" 0 "无效" ;
+VAL_ 337 RC_Tx_2_RC_WorkDrop 1 "降" 0 "无效" ;
+VAL_ 337 RC_Tx_2_RC_State 1 "已连接发射机" 0 "未连接发射机" ;
+VAL_ 337 RC_Tx_2_RC_Reserve1 1 "按下" 0 "弹出" ;
+VAL_ 337 RC_Tx_2_RC_ParkReq 2 "释放" 1 "拉起" 0 "中立" ;
+VAL_ 337 RC_Tx_2_RC_Horn 1 "打开" 0 "关闭" ;
+VAL_ 337 RC_Tx_2_RC_EmgcyParkReq 1 "急停拍下" 0 "急停旋开" ;
+VAL_ 513 RC_SteerModeFDBK 2 "蟹行" 1 "最小" 0 "常规" ;
+VAL_ 513 RC_GearStatusFDBK 3 "D" 2 "N" 1 "R" 0 "P" ;
+VAL_ 513 RC_ControlModeFDBK 3 "智驾" 2 "遥控" 1 "人工" 0 "待机" ;
+VAL_ 2565932240 PwrStrPump_Rx_01_StroilPumpEnbl 1 "open" 0 "close" ;
+VAL_ 2364933554 PwrStrPump_Tx_01_Faultcode 263 "Phase Loss Fault(Level3)" 262 "Other Fault(Level3)" 261 "Overload(Level3)" 260 "Temperature Too High(Level3)" 259 "Output Current Too High(Level3)" 258 "Input Voltage Too Low(Level3)" 257 "Input Voltage Too High(Level3)" 87 "Phase Loss Fault(Level2)" 86 "Other Fault(Level2)" 85 "Overload(Level2)" 84 "Temperature Too High(Level2)" 83 "Output Current Too High(Level2)" 82 "Input Voltage Too Low(Level2)" 81 "Input Voltage Too High(Level2)" 8 "CAN communication (level1)" 7 "Phase Loss Fault(Level1)" 6 "Other Fault(Level1)" 5 "Overload(Level1)" 4 "Temperature Too High(Level1)" 3 "Output Current Too High(Level1)" 2 "Input Voltage Too Low(Level1)" 1 "Input Voltage Too High(Level1)" ;
+VAL_ 2364933554 PwrStrPump_Tx_01_Highestfltlevel 3 "Level3malfunction" 2 "Level2malfunction" 1 "Level1malfunction" 0 "No fault" ;
+VAL_ 2364933554 PwrStrPump_Tx_01_PSPWorkSts 2 "malfunction" 1 "running" 0 "shutdown" ;
+VAL_ 2552045717 WVCU_FDOMUpSwReq 1 "开" 0 "关" ;
+VAL_ 2552045717 WVCU_FDOMDwnSwReq 1 "开" 0 "关" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01SmallPumpFiltWarn 1 "高于9V" 0 "低于9V" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01ReturnOilFiltWarn 1 "高于9V" 0 "低于9V" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01EmergyStop 1 "高于9V" 0 "低于9V" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01BigPumpFiltWarn 1 "高于9V" 0 "低于9V" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01CtrlrPwrSplyStat 1 "高于9V" 0 "低于9V" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01SelfChkCompleted 1 "完成" 0 "未完成" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01PWM8OutPortFlt 1 "故障" 0 "正常" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01PWM7OutPortFlt 1 "故障" 0 "正常" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01PWM6OutPortFlt 1 "故障" 0 "正常" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01PWM5OutPortFlt 1 "故障" 0 "正常" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01PWM4OutPortFlt 1 "故障" 0 "正常" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01PWM3OutPortFlt 1 "故障" 0 "正常" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01PWM2OutPortFlt 1 "故障" 0 "正常" ;
+VAL_ 2566508790 EPSEHBEPB_Tx_01PWM1OutPortFlt 1 "故障" 0 "正常" ;
+VAL_ 336 RC_TX_1SteerModeReq 2 "蟹行" 1 "最小" 0 "常规" ;
+VAL_ 336 RC_Tx_1GearReq 4 "P" 3 "D" 2 "R" 1 "N" 0 "无" ;
+VAL_ 336 RC_Tx_1CtrlModeReq 1 "遥控模式" 0 "待机模式" ;
+VAL_ 2566836469 ADU_Tx_VehSpdReq_Q 1 "有效" 0 "无效" ;
+VAL_ 2566770933 ADU_Tx_BodyHorn 2 "关" 1 "开" 0 "无" ;
+VAL_ 2566770933 ADU_Tx_BodyBrkLamp 2 "关" 1 "开" 0 "无" ;
+VAL_ 2566770933 ADU_Tx_BodyHighBeamLamp 2 "关" 1 "开" 0 "无" ;
+VAL_ 2566770933 ADU_Tx_BodyLowBeamLamp 2 "关" 1 "开" 0 "无" ;
+VAL_ 2566770933 ADU_Tx_BodyTurnRLamp 2 "降" 1 "升" 0 "无" ;
+VAL_ 2566770933 ADU_Tx_BodyTurnLLamp 2 "降" 1 "升" 0 "无" ;
+VAL_ 2566770933 ADU_Tx_BodyJobAction 2 "降" 1 "升" 0 "无" ;
+VAL_ 2566705397 ADU_Tx_GearReq 4 "P" 3 "D" 2 "R" 1 "N" 0 "ini" ;
+VAL_ 2566705397 ADU_Tx_FltCodeRst 2 "智驾握手" 1 "保留" 0 "无" ;
+VAL_ 2566705397 ADU_Tx_CloudShakeReq 2 "平行握手" 1 "保留" 0 "无" ;
+VAL_ 2566705397 ADU_Tx_ShakeReq 2 "智驾握手" 1 "保留" 0 "无" ;
+VAL_ 2566639861 ADU_Tx_StrModReq 3 "最小转弯" 2 "蟹行" 1 "线控" 0 "ini" ;
+VAL_ 2566639861 ADU_Tx_EPB4CtrlReq 2 "驻车" 1 "释放" 0 "保持" ;
+VAL_ 2566639861 ADU_Tx_EPB3CtrlReq 2 "驻车" 1 "释放" 0 "保持" ;
+VAL_ 2566639861 ADU_Tx_EPB2CtrlReq 2 "驻车" 1 "释放" 0 "保持" ;
+VAL_ 2566639861 ADU_Tx_EPB1CtrlReq 2 "驻车" 1 "释放" 0 "保持" ;
+VAL_ 2566508789 ADU_Tx_EPS03Axis4ModeReq 1 "线控" 0 "无" ;
+VAL_ 2566508789 ADU_Tx_EPS03Axis3ModeReq 1 "线控" 0 "无" ;
+VAL_ 2566443253 ADU_Tx_EPS01Axis2ModeReq 1 "线控" 0 "无" ;
+VAL_ 2566443253 ADU_Tx_EPS01Axis1ModeReq 3 "最小转弯" 2 "蟹行" 1 "线控" 0 "ini" ;
+VAL_ 2566377717 ADU_Tx_MCU08MotCtrlMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2566377717 ADU_Tx_MCU08MotCtrlCmd 4 "Clear Error" 1 "Enable Motor Control" 0 "Disable Motor Control" ;
+VAL_ 2566312181 ADU_Tx_MCU07MotCtrlMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2566312181 ADU_Tx_MCU07MotCtrlCmd 4 "Clear Error" 1 "Enable Motor Control" 0 "Disable Motor Control" ;
+VAL_ 2566246645 ADU_Tx_MCU06MotCtrlMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2566246645 ADU_Tx_MCU06MotCtrlCmd 4 "Clear Error" 1 "Enable Motor Control" 0 "Disable Motor Control" ;
+VAL_ 2566181109 ADU_Tx_MCU05MotCtrlMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2566181109 ADU_Tx_MCU05MotCtrlCmd 4 "Clear Error" 1 "Enable Motor Control" 0 "Disable Motor Control" ;
+VAL_ 2566115573 ADU_Tx_MCU04MotCtrlMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2566115573 ADU_Tx_MCU04MotCtrlCmd 4 "Clear Error" 1 "Enable Motor Control" 0 "Disable Motor Control" ;
+VAL_ 2566050037 ADU_Tx_MCU03MotCtrlMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2566050037 ADU_Tx_MCU03MotCtrlCmd 4 "Clear Error" 1 "Enable Motor Control" 0 "Disable Motor Control" ;
+VAL_ 2565984501 ADU_Tx_MCU02MotCtrlMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2565984501 ADU_Tx_MCU02MotCtrlCmd 4 "Clear Error" 1 "Enable Motor Control" 0 "Disable Motor Control" ;
+VAL_ 2565918965 ADU_Tx_MCU01MotCtrlMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2565918965 ADU_Tx_MCU01MotCtrlCmd 4 "Clear Error" 1 "Enable Motor Control" 0 "Disable Motor Control" ;
+VAL_ 2565918966 EPS_Tx_01_EPSModeAxis1 1 "线控" 0 "无" ;
+VAL_ 2566854608 ICU_Rx_15_ElectcFanFailure 5 "电子风扇5故障" 4 "电子风扇4故障" 3 "电子风扇3故障" 2 "电子风扇2故障" 1 "电子风扇1故障" 0 "风扇无故障" ;
+VAL_ 2566002640 ICU_Rx_2_PumpFailure 3 "水泵3故障" 2 "水泵2故障" 1 "水泵1故障" 0 "水泵无故障" ;
+VAL_ 2565937104 ICU_Rx_1_GearState 3 "驻车(P)" 2 "前进档(D)" 1 "倒挡(R)" 0 "空挡(N)" ;
+VAL_ 2565937104 ICU_Rx_1_PTOState 1 "挂上" 0 "未挂上" ;
+VAL_ 2565937104 ICU_Rx_1_DriveMotorStat 3 "发电" 2 "电动(耗电模式)" 1 "准备" 0 "关闭" ;
+VAL_ 2565937104 ICU_Rx_1_HandbrakeModePwrOut 1 "有手刹，报警" 0 "无手刹，不报警" ;
+VAL_ 2348872609 BMS_Rx_1_HV_HVCmd 3 "无效" 2 "错误" 1 "高压上电" 0 "高压下电" ;
+VAL_ 2552472051 BMS_Tx_5_BattType 8 "其他" 7 "锰酸锂" 6 "超级电容" 5 "聚合物锂电池" 4 "三元材料" 3 "钴酸锂" 2 "钛酸锂" 1 "磷酸铁锂" ;
+VAL_ 2348851699 BMS_Tx_1_Chrg1SignSta 3 "无效" 1 "连接" 0 "未连接" ;
+VAL_ 2348851699 BMS_Tx_1_HVOffReq 1 "下高压" 0 "无请求" ;
+VAL_ 2348851699 BMS_Tx_1_InsCheckSta 1 "关闭" 0 "开启" ;
+VAL_ 2348851699 BMS_Tx_1_HVSta 4 "预充失败" 3 "下电中" 2 "上电完成" 1 "预充中" 0 "未开始充电" ;
+VAL_ 2348851699 BMS_Tx_1_HighFaultSta 4 "4级故障" 3 "3级故障" 2 "2级故障" 1 "1级故障" 0 "无故障" ;
+VAL_ 2348851699 BMS_Tx_1_BMSSta 2 "放电状态" 1 "充电状态" 0 "待机状态" ;
+VAL_ 2147492119 GAM_1_OverWightLevel 2 "不能启动" 1 "超载" 0 "标载" ;
+VAL_ 2147492119 GAM_1_Right3SnsSts 1 "故障" 0 "正常" ;
+VAL_ 2147492119 GAM_1_Right2SnsSts 1 "故障" 0 "正常" ;
+VAL_ 2147492119 GAM_1_Right1SnsSts 1 "故障" 0 "正常" ;
+VAL_ 2147492119 GAM_1_Left3SnsSts 1 "故障" 0 "正常" ;
+VAL_ 2147492119 GAM_1_Left2SnsSts 1 "故障" 0 "正常" ;
+VAL_ 2147492119 GAM_1_Left1SnsSts 1 "故障" 0 "正常" ;
+VAL_ 2558783475 PDU_Rx_1_Mot8PreChrgCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot8MainPosCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot7PreChrgCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot7MainPosCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot6PreChrgCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot6MainPosCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot5PreChrgCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot5MainPosCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot4PreChrgCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot4MainPosCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot3PreChrgCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot3MainPosCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot2PreChrgCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot2MainPosCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot1PreChrgCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2558783475 PDU_Rx_1_Mot1MainPosCloCmd 1 "吸合" 0 "断开" ;
+VAL_ 2550330351 PDU_Tx2_Mot8PreChrgFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550330351 PDU_Tx2_Mot8PreChrgConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550330351 PDU_Tx2_Mot8MainPosFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550330351 PDU_Tx2_Mot8MainPosConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot7PreChrgFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot7PreChrgConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot7MainPosFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot7MainPosConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot6PreChrgFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot6PreChrgConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot6MainPosFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot6MainPosConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot5PreChrgFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot5PreChrgConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot5MainPosFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot5MainPosConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot4PreChrgFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot4PreChrgConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot4MainPosFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot4MainPosConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot3PreChrgFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot3PreChrgConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot3MainPosFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot3MainPosConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot2PreChrgFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot2PreChrgConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot2MainPosFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot2MainPosConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot1PreChrgFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot1PreChrgConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2550264815 PDU_Tx1_Mot1MainPosFauSts 3 "无效" 2 "无法闭合" 1 "黏连" 0 "正常" ;
+VAL_ 2550264815 PDU_Tx1_Mot1MainPosConSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2566836247 ICU_Tx_1_ReReservoirPressureWarn 1 "报警" 0 "正常" ;
+VAL_ 2566836247 ICU_Tx_1_FrReservoirPressureWarn 1 "报警" 0 "正常" ;
+VAL_ 2565866992 SCU_Tx_1_GearReqStat 251 "P" 193 "D" 101 "M+" 100 "M" 99 "M-" 43 "R" 0 "N" ;
+VAL_ 2565866992 SCU_Tx_1_EPModeReqStat 1 "SPORT" 0 "ECO" ;
+VAL_ 2565984502 EPS_Tx_02_EPSModeAxis2 1 "线控" 0 "无" ;
+VAL_ 2566115574 EPS_Tx_04_EPSModeAxis4 1 "线控" 0 "无" ;
+VAL_ 2566050038 EPS_Tx_03_EPSModeAxis3 1 "线控" 0 "无" ;
+VAL_ 2566246646 EHB_Tx_02_EHB04Mode 1 "线控" 0 "无" ;
+VAL_ 2566246646 EHB_Tx_02_EHB03Mode 1 "线控" 0 "无" ;
+VAL_ 2566312182 EHB_Tx_03_EHB06Mode 1 "线控" 0 "无" ;
+VAL_ 2566312182 EHB_Tx_03_EHB05Mode 1 "线控" 0 "无" ;
+VAL_ 2566377718 EHB_Tx_04_EHB08Mode 1 "线控" 0 "无" ;
+VAL_ 2566377718 EHB_Tx_04_EHB07Mode 1 "线控" 0 "无" ;
+VAL_ 2566181110 EHB_Tx_01_EHB02Mode 1 "线控" 0 "无" ;
+VAL_ 2566181110 EHB_Tx_01_EHB01Mode 1 "线控" 0 "无" ;
+VAL_ 2566880239 RECU_Rx_1_VCU16PwrTakeOffCmd 1 "启动" 0 "停机" ;
+VAL_ 2566880239 RECU_Rx_1_VCU16RECtrlCmd 1 "启动" 0 "停机" ;
+VAL_ 2566443254 EPB_Tx_04_EPB4Sts 1 "释放" 0 "驻车" ;
+VAL_ 2566443254 EPB_Tx_03_EPB3Sts 1 "释放" 0 "驻车" ;
+VAL_ 2566443254 EPB_Tx_02_EPB2Sts 1 "释放" 0 "驻车" ;
+VAL_ 2566443254 EPB_Tx_01_EPB1Sts 1 "释放" 0 "驻车" ;
+VAL_ 2565928656 EPS_Rx_01_EPS2AxisModeReq 1 "线控" 0 "无" ;
+VAL_ 2565928656 EPS_Rx_01_EPS1AxisModeReq 1 "线控" 0 "无" ;
+VAL_ 2565994192 EPS_Rx_02_EPS4AxisModeReq 1 "线控" 0 "无" ;
+VAL_ 2565994192 EPS_Rx_02_EPS3AxisModeReq 1 "线控" 0 "无" ;
+VAL_ 2566190800 EPB_Rx_01_EPB4VehSpd 1 "释放" 0 "驻车" ;
+VAL_ 2566190800 EPB_Rx_01_EPB4StrModReq 3 "最小转弯" 2 "蟹行" 1 "线控" 0 "ini" ;
+VAL_ 2566190800 EPB_Rx_01_EPB4CtlReq 2 "驻车" 1 "释放" 0 "保持" ;
+VAL_ 2566190800 EPB_Rx_01_EPB3CtlReq 2 "驻车" 1 "释放" 0 "保持" ;
+VAL_ 2566190800 EPB_Rx_01_EPB2CtlReq 2 "驻车" 1 "释放" 0 "保持" ;
+VAL_ 2566190800 EPB_Rx_01_EPB1CtlReq 2 "驻车" 1 "释放" 0 "保持" ;
+VAL_ 2565937143 RECU_1_RE_SystemReady 1 "Ready" 0 "NotReady" ;
+VAL_ 2565937143 RECU_1_ATS_Fault 1 "有故障" 0 "无故障" ;
+VAL_ 2565937143 RECU_1_START_ENABLE 1 "enable-使能" 0 "not enable-未使能" ;
+VAL_ 2565937143 RECU_1_IsgSpdDirection 1 "反转" 0 "正转" ;
+VAL_ 2565937143 RECU_1_GCU_Fault 1 "有故障" 0 "无故障" ;
+VAL_ 2565937143 RECU_1_ECUActive 1 "active-启动" 0 "not active-熄火" ;
+VAL_ 2565937143 RECU_1_GCUActive 1 "active-已激活" 0 "not active-未激活" ;
+VAL_ 2565937143 RECU_1_MCU_En 1 "enable-使能" 0 "not enable-未使能" ;
+VAL_ 2565937143 RECU_1_SelfCheck_State 1 "自检正常" 0 "自检故障" ;
+VAL_ 2565937143 RECU_1_CutOffLV_Req 1 "allow--允许" 0 "not allow--禁止" ;
+VAL_ 2565937143 RECU_1_ActiveDischg_FB 3 "主动放电失败" 2 "主动放电进行中" 1 "主动放电完成" 0 "未进行主动放电" ;
+VAL_ 2565937143 RECU_1_FaultLevel 4 "Level4--四级故障（下高压故障）" 3 "Level3--三级故障" 2 "Level2--二级故障（降功率）" 1 "Leve1--一级故障（警告）" 0 "No error--无故障" ;
+VAL_ 2565937143 RECU_1_WorkStatus_Act 3 "制动" 2 "发电" 1 "待机" 0 "停止" ;
+VAL_ 2566321616 WVCU_PowerDownFit 1 "故障" 0 "正常" ;
+VAL_ 2566321616 WVCU_LimpPowerFit 1 "故障" 0 "正常" ;
+VAL_ 2566321616 WVCU_LimprFit 1 "故障" 0 "正常" ;
+VAL_ 2566321616 WVCU_ForbEneryFit 1 "故障" 0 "正常" ;
+VAL_ 2566321616 WVCU_OnGearKeySig 1 "上电" 0 "无" ;
+VAL_ 2566321616 WVCU_ChrgWakeUpSig 1 "上电" 0 "无" ;
+VAL_ 2566321616 WVCU_EngyRecoveryDisblSw 1 "开" 0 "关" ;
+VAL_ 2566321616 WVCU_FExtrctrReqSw 1 "开" 0 "关" ;
+VAL_ 2566321616 WVCU_STARTGearKeySig 1 "上电" 0 "无" ;
+VAL_ 2566321616 WVCU_ACCGearKeySig 1 "上电" 0 "无" ;
+VAL_ 2566321616 WVCU_ADUModeSwSts 1 "开" 0 "关" ;
+VAL_ 2566321616 WVCU_EngyRecovery04GearSwSig 1 "上电" 0 "无" ;
+VAL_ 2566321616 WVCU_EngyRecovery03GearSwSig 1 "开" 0 "关" ;
+VAL_ 2566321616 WVCU_EngyRecovery02GearSwSig 1 "开" 0 "关" ;
+VAL_ 2566321616 WVCU_EngyRecovery01GearSwSig 1 "开" 0 "关" ;
+VAL_ 2566321616 WVCU_PrkBrkSwSig 1 "开" 0 "关" ;
+VAL_ 2566321616 WVCU_BrkPedallSigSts 1 "开" 0 "关" ;
+VAL_ 2566321616 WVCU_WaterPump2FltSts 1 "故障" 0 "正常" ;
+VAL_ 2566321616 WVCU_WaterPump1FltSts 1 "上电" 0 "无" ;
+VAL_ 2563503312 Brk_7_Sts08Mode 1 "ByWire" 0 "No ByWire" ;
+VAL_ 2563503312 Brk_7_Sts08FltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2563503312 Brk_7_Sts07FltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2563503312 Brk_7_Sts07Mode 1 "ByWire" 0 "No ByWire" ;
+VAL_ 2563437776 Brk_5_Sts06Mode 1 "ByWire" 0 "No ByWire" ;
+VAL_ 2563437776 Brk_5_Sts06FltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2563437776 Brk_5_Sts05FltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2563437776 Brk_5_Sts05Mode 1 "ByWire" 0 "No ByWire" ;
+VAL_ 2563372240 Brk_3_Sts04Mode 1 "ByWire" 0 "No ByWire" ;
+VAL_ 2563372240 Brk_3_Sts04FltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2563372240 Brk_3_Sts03FltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2563372240 Brk_3_Sts03Mode 1 "ByWire" 0 "No ByWire" ;
+VAL_ 2563306704 Brk_1_Sts02Mode 1 "ByWire" 0 "No ByWire" ;
+VAL_ 2563306704 Brk_1_Sts02FltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2563306704 Brk_1_Sts01FltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2563306704 Brk_1_Sts01Mode 1 "ByWire" 0 "No ByWire" ;
+VAL_ 2562979024 Str_4_StsFltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2562979024 Str_4_ModeSts 1 "ByWire" 0 "No ByWire" ;
+VAL_ 2562913488 Str_3_StsFltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2562913488 Str_3_ModeSts 1 "ByWire" 0 "No ByWire" ;
+VAL_ 2562847952 Str_2_StsFltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2562847952 Str_2_ModeSts 1 "ByWire" 0 "No ByWire" ;
+VAL_ 2562782416 Str_1_StsFltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2562782416 Str_1_ModeSts 1 "ByWire" 0 "No ByWire" ;
+VAL_ 2562127056 Mot_8_Sts02DisChrgSts 3 "Discharge Failed" 2 "Discharge Succeed" 1 "Discharging" 0 "Idle" ;
+VAL_ 2562127056 Mot_8_Sts02HVILST 1 "Lock" 0 "UnLock" ;
+VAL_ 2562127056 Mot_8_Sts02FltLvl 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2562127056 Mot_8_Sts02MotWorkMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2562127056 Mot_8_Sts02IvtrSts 6 "Shutdown" 5 "Error" 4 "Enable PWM ON" 3 "Ready PWM OFF" 2 "Init succeed" 1 "init failed" 0 "init" ;
+VAL_ 2562061520 Mot_8_Sts01MotSpd_Q 1 "有效" 0 "无效" ;
+VAL_ 2561930448 Mot_7_Sts02DisChrgSts 3 "Discharge Failed" 2 "Discharge Succeed" 1 "Discharging" 0 "Idle" ;
+VAL_ 2561930448 Mot_7_Sts02HVILST 1 "Lock" 0 "UnLock" ;
+VAL_ 2561930448 Mot_7_Sts02FltLvl 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2561930448 Mot_7_Sts02MotWorkMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2561930448 Mot_7_Sts02IvtrSts 6 "Shutdown" 5 "Error" 4 "Enable PWM ON" 3 "Ready PWM OFF" 2 "Init succeed" 1 "init failed" 0 "init" ;
+VAL_ 2561864912 Mot_7_Sts01MotSpd_Q 1 "有效" 0 "无效" ;
+VAL_ 2561733840 Mot_6_Sts02DisChrgSts 3 "Discharge Failed" 2 "Discharge Succeed" 1 "Discharging" 0 "Idle" ;
+VAL_ 2561733840 Mot_6_Sts02HVILST 1 "Lock" 0 "UnLock" ;
+VAL_ 2561733840 Mot_6_Sts02FltLvl 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2561733840 Mot_6_Sts02MotWorkMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2561733840 Mot_6_Sts02IvtrSts 6 "Shutdown" 5 "Error" 4 "Enable PWM ON" 3 "Ready PWM OFF" 2 "Init succeed" 1 "init failed" 0 "init" ;
+VAL_ 2561668304 Mot_6_Sts01MotSpd_Q 1 "有效" 0 "无效" ;
+VAL_ 2561537232 Mot_5_Sts02HVILST 1 "Lock" 0 "UnLock" ;
+VAL_ 2561537232 Mot_5_Sts02FltLvl 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2561537232 Mot_5_Sts02MotWorkMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2561537232 Mot_5_Sts02IvtrSts 6 "Shutdown" 5 "Error" 4 "Enable PWM ON" 3 "Ready PWM OFF" 2 "Init succeed" 1 "init failed" 0 "init" ;
+VAL_ 2561471696 Mot_5_Sts01MotSpd_Q 1 "有效" 0 "无效" ;
+VAL_ 2561340624 Mot_4_Sts02DisChrgSts 3 "Discharge Failed" 2 "Discharge Succeed" 1 "Discharging" 0 "Idle" ;
+VAL_ 2561340624 Mot_4_Sts02HVILST 1 "Lock" 0 "UnLock" ;
+VAL_ 2561340624 Mot_4_Sts02FltLvl 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2561340624 Mot_4_Sts02MotWorkMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2561340624 Mot_4_Sts02IvtrSts 6 "Shutdown" 5 "Error" 4 "Enable PWM ON" 3 "Ready PWM OFF" 2 "Init succeed" 1 "init failed" 0 "init" ;
+VAL_ 2561275088 Mot_4_Sts01MotSpd_Q 1 "有效" 0 "无效" ;
+VAL_ 2561144016 Mot_3_Sts02DisChrgSts 3 "Discharge Failed" 2 "Discharge Succeed" 1 "Discharging" 0 "Idle" ;
+VAL_ 2561144016 Mot_3_Sts02HVILST 1 "Lock" 0 "UnLock" ;
+VAL_ 2561144016 Mot_3_Sts02FltLvl 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2561144016 Mot_3_Sts02MotWorkMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2561144016 Mot_3_Sts02IvtrSts 6 "Shutdown" 5 "Error" 4 "Enable PWM ON" 3 "Ready PWM OFF" 2 "Init succeed" 1 "init failed" 0 "init" ;
+VAL_ 2561078480 Mot_3_Sts01MotSpd_Q 1 "有效" 0 "无效" ;
+VAL_ 2560947408 Mot_2_Sts02DisChrgSts 3 "Discharge Failed" 2 "Discharge Succeed" 1 "Discharging" 0 "Idle" ;
+VAL_ 2560947408 Mot_2_Sts02HVILST 1 "Lock" 0 "UnLock" ;
+VAL_ 2560947408 Mot_2_Sts02FltLvl 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2560947408 Mot_2_Sts02MotWorkMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2560947408 Mot_2_Sts02IvtrSts 6 "Shutdown" 5 "Error" 4 "Enable PWM ON" 3 "Ready PWM OFF" 2 "Init succeed" 1 "init failed" 0 "init" ;
+VAL_ 2560881872 Mot_2_Sts01MotSpd_Q 1 "有效" 0 "无效" ;
+VAL_ 2560750800 Mot_1_Sts02DisChrgSts 3 "Discharge Failed" 2 "Discharge Succeed" 1 "Discharging" 0 "Idle" ;
+VAL_ 2560750800 Mot_1_Sts02HVILST 1 "Lock" 0 "UnLock" ;
+VAL_ 2560750800 Mot_1_Sts02FltLvl 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2560750800 Mot_1_Sts02MotWorkMode 2 "SpeedControlMode" 1 "TorqueControlMode" 0 "ini" ;
+VAL_ 2560750800 Mot_1_Sts02IvtrSts 6 "Shutdown" 5 "Error" 4 "Enable PWM ON" 3 "Ready PWM OFF" 2 "Init succeed" 1 "init failed" 0 "init" ;
+VAL_ 2560685264 Mot_1_Sts01MotSpd_Q 1 "有效" 0 "无效" ;
+VAL_ 2565928400 WVCU_ShakeHandSts 19 "智驾SPB" 18 "遥控SPB" 17 "人工SPB" 6 "平行" 5 "智驾" 4 "遥控" 3 "人工" 0 "无" ;
+VAL_ 2564420816 PDUSts_Mot8PrecFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564420816 PDUSts_Mot8PrecCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564420816 PDUSts_Mot8MainPosFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564420816 PDUSts_Mot8MainPosCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot7PrecFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot7PrecCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot7MainPosFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot7MainPosCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot6PrecFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot6PrecCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot6MainPosFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot6MainPosCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot5PrecFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot5PrecCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot5MainPosFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot5MainPosCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot4PrecFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot4PrecCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot4MainPosFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot4MainPosCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot3PrecFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot3PrecCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot3MainPosFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot3MainPosCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot2PrecFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot2PrecCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot2MainPosFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot2MainPosCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot1PrecFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot1PrecCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2564355280 PDUSts_Mot1MainPosFltSts 3 "无效" 2 "无法闭合" 1 "粘连" 0 "正常" ;
+VAL_ 2564355280 PDUSts_Mot1MainPosCntctrSts 3 "无效" 2 "闭合" 1 "断开" 0 "预留" ;
+VAL_ 2563830992 BatSts01_BMSMaxFltLvl 4 "4级故障" 3 "3级故障" 2 "2级故障" 1 "1级故障" 0 "无故障" ;
+VAL_ 2563830992 BatSts01_BMSPwrUpSts 4 "预充失败" 3 "下电中" 2 "上电完成" 1 "预充中" 0 "未开始充电" ;
+VAL_ 2563830992 BatSts01_BMSSts 2 "放电状态" 1 "充电状态" 0 "待机状态" ;
+VAL_ 2563765456 Prk_1_Sts04Mode 2 "驻车" 1 "释放" 0 "保持" ;
+VAL_ 2563765456 Prk_1_Sts04FltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2563765456 Prk_1_Sts03Mode 2 "驻车" 1 "释放" 0 "保持" ;
+VAL_ 2563765456 Prk_1_Sts03FltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2563765456 Prk_1_Sts02Mode 2 "驻车" 1 "释放" 0 "保持" ;
+VAL_ 2563765456 Prk_1_Sts02FltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2563765456 Prk_1_Sts01Mode 2 "驻车" 1 "释放" 0 "保持" ;
+VAL_ 2565993936 BodySts_BrkLampSts 2 "关" 1 "开" 0 "无" ;
+VAL_ 2565993936 BodySts_HighBeamLampSts 2 "关" 1 "开" 0 "无" ;
+VAL_ 2565993936 BodySts_LowBeamLampSts 2 "关" 1 "开" 0 "无" ;
+VAL_ 2565993936 BodySts_TurnRLampSts 2 "降" 1 "升" 0 "无" ;
+VAL_ 2565993936 BodySts_TurnLLampSts 2 "降" 1 "升" 0 "无" ;
+VAL_ 2565993936 BodySts_JobActionSts 2 "降" 1 "升" 0 "无" ;
+VAL_ 2566387152 WVCU_RmtJob 2 "降" 1 "升" 0 "关" ;
+VAL_ 2566387152 WVCU_RmtHorn 2 "请求不工作" 1 "请求工作" 0 "关" ;
+VAL_ 2566387152 WVCU_RmtSteerModeReq 1 "连接" 0 "无" ;
+VAL_ 2566387152 WVCU_RmtConnectSts 1 "连接" 0 "无" ;
+VAL_ 2566387152 WVCU_RmtGearReq 4 "P" 3 "D" 2 "R" 1 "N" 0 "无" ;
+VAL_ 2566387152 WVCU_RmtCtrlModeReq 1 "遥控" 0 "无" ;
+VAL_ 2566256080 WVCU_GearCtrlReqSts 4 "P" 3 "D" 2 "R" 1 "N" 0 "无" ;
+VAL_ 2566256080 WVCU_BrkPedallStk_Q 1 "有效" 0 "无效" ;
+VAL_ 2566256080 WVCU_APSSts_Q 1 "有效" 0 "无效" ;
+VAL_ 2566190544 WVCU_VehPrkReq 2 "驻车" 1 "释放" 0 "中位" ;
+VAL_ 2566190544 WVCU_VehSpdReq_Q 1 "有效" 0 "无效" ;
+VAL_ 2566059472 WVCU_VehRdySts 1 "ready" 0 "无" ;
+VAL_ 2566059472 WVCU_MCUFltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2566059472 WVCU_EHBFltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2566059472 WVCU_EPSFltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2566059472 WVCU_EPBFltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2566059472 WVCU_BMSFltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2566059472 WVCU_VehFltLvl 4 "Level 4" 3 "Level 3" 2 "Level 2" 1 "Level 1" 0 "No Error" ;
+VAL_ 2566059472 WVCU_GearStsNow 4 "P" 3 "D" 2 "R" 1 "N" 0 "无" ;
+VAL_ 2566059472 WVCU_EmgySwtchSts 1 "急停" 0 "无" ;
+VAL_ 2566845491 TPMS_Tx_1_TirePressThresholdDect 273 "无效" 272 "错误" 257 "无定义" 256 "极限欠压" 17 "欠压" 16 "正常压力" 1 "高压" 0 "极限高压" ;
+VAL_ 2566845491 TPMS_Tx_1_TireLocationDirection 3 "右外侧" 2 "右内侧" 1 "左内侧" 0 "左外侧" ;
+VAL_ 2566845491 TPMS_Tx_1_TireLocationAxle 3 "四轴" 2 "三轴" 1 "二轴" 0 "一轴" ;
+

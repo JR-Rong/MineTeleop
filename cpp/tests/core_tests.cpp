@@ -109,7 +109,12 @@ class NoFeedbackAdapter final : public mine_teleop::VehicleAdapter {
     ++safe_stops;
   }
   bool poll_feedback() override { return false; }
+  bool request_vcu_handshake() override { return false; }
+  bool disconnect_vcu_handshake() override { return false; }
   [[nodiscard]] bool feedback_ready() const override { return false; }
+  [[nodiscard]] mine_teleop::VcuHandshakeStatus vcu_handshake_status() const override {
+    return {};
+  }
   [[nodiscard]] mine_teleop::VehicleTelemetry read_telemetry() override { return {}; }
   [[nodiscard]] mine_teleop::VehicleAdapterStatus status() const override {
     return {"no_feedback", opened, true, "can0", "", applied_commands, safe_stops, "", false};
@@ -166,6 +171,19 @@ void test_field_config_pins_tls_route_without_system_dns() {
   expect(
       config.field_safety.max_time_sync_uncertainty_ms == 25,
       "field vehicle time synchronization limit is not 25ms");
+  expect_near(
+      config.field_safety.max_throttle,
+      0.10,
+      1e-9,
+      "field vehicle throttle hard limit changed");
+  expect_near(
+      config.field_safety.max_steering_angle_deg,
+      5.0,
+      1e-9,
+      "field vehicle steering hard limit changed");
+  expect(
+      config.field_safety.require_can_feedback_before_control,
+      "field vehicle CAN feedback gate is disabled");
 }
 
 void test_control_command_json_round_trip_and_validation() {
@@ -326,6 +344,41 @@ void test_control_service_reports_safe_stop_output_after_timeout() {
   const auto telemetry = adapter_view->read_telemetry();
   expect_near(telemetry.throttle_feedback, 0.0, 1e-9, "timeout telemetry retained stale throttle");
   expect_near(telemetry.brake_feedback, 0.6, 1e-9, "timeout telemetry did not report safe brake");
+  service.close();
+}
+
+void test_control_service_applies_vehicle_hard_limits() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  config.field_safety.max_throttle = 0.10;
+  config.field_safety.max_steering_angle_deg = 3.0;
+  auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+  auto* adapter_view = adapter.get();
+  mine_teleop::VehicleControlService service(
+      config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(0);
+
+  const auto result = service.receive_command(command(1, 0), 0);
+  expect(result.accepted && result.command.has_value(), "limited control command was rejected");
+  expect_near(result.command->throttle, 0.10, 1e-9, "vehicle throttle hard limit was not applied");
+  expect_near(result.command->steering, 0.10, 1e-9, "vehicle steering hard limit was not applied");
+  expect(
+      std::find(result.warnings.begin(), result.warnings.end(), "vehicle_max_throttle_applied") !=
+          result.warnings.end(),
+      "throttle limit application was not reported");
+  expect(
+      std::find(result.warnings.begin(), result.warnings.end(), "vehicle_max_steering_applied") !=
+          result.warnings.end(),
+      "steering limit application was not reported");
+  const auto telemetry = adapter_view->read_telemetry();
+  expect_near(telemetry.throttle_feedback, 0.10, 1e-9, "adapter received uncapped throttle");
+  expect_near(telemetry.steering_feedback, 0.10, 1e-9, "adapter received uncapped steering");
+  const auto limits = service.control_limits();
+  expect_near(limits.at("max_throttle").get<double>(), 0.10, 1e-9, "reported throttle limit mismatch");
+  expect_near(
+      limits.at("max_steering_angle_deg").get<double>(),
+      3.0,
+      1e-9,
+      "reported steering limit mismatch");
   service.close();
 }
 
@@ -1205,6 +1258,7 @@ int main() {
       {"mailbox_keeps_only_latest_command", test_mailbox_keeps_only_latest_command},
       {"safety_timeout_profile_and_estop_latch", test_safety_timeout_profile_and_estop_latch},
       {"control_service_reports_safe_stop_output_after_timeout", test_control_service_reports_safe_stop_output_after_timeout},
+      {"control_service_applies_vehicle_hard_limits", test_control_service_applies_vehicle_hard_limits},
       {"control_service_bounds_telemetry_history", test_control_service_bounds_telemetry_history},
       {"control_service_requires_feedback_before_actuation_but_allows_estop", test_control_service_requires_feedback_before_actuation_but_allows_estop},
       {"fault_output_fails_safe", test_fault_output_fails_safe},

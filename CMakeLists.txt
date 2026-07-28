@@ -79,6 +79,14 @@ function(mine_teleop_enable_warnings target)
   endif()
 endfunction()
 
+add_library(mine_teleop_vcu cpp/src/vcu.cpp)
+target_include_directories(mine_teleop_vcu
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>
+    $<INSTALL_INTERFACE:include>
+)
+mine_teleop_enable_warnings(mine_teleop_vcu)
+
 # This library is the shared protocol/session/HTTP core used by all control
 # packages. It intentionally has no camera, JPEG, or GStreamer dependency.
 add_library(mine_teleop_runtime
@@ -308,6 +316,11 @@ if(MINE_TELEOP_BUILD_TESTS)
   mine_teleop_enable_warnings(mine-teleop-control-tests)
   add_test(NAME mine-teleop-control-tests COMMAND mine-teleop-control-tests)
   set_tests_properties(mine-teleop-control-tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+  add_executable(mine-teleop-vcu-tests cpp/tests/vcu_tests.cpp)
+  target_link_libraries(mine-teleop-vcu-tests PRIVATE mine_teleop_vcu)
+  mine_teleop_enable_warnings(mine-teleop-vcu-tests)
+  add_test(NAME mine-teleop-vcu-tests COMMAND mine-teleop-vcu-tests)
 
   if(UNIX)
     add_test(
