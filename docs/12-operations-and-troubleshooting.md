@@ -146,6 +146,8 @@ sudo ./scripts/setup_basler_usb_access.sh <vehicle-user>
 
 重新登录后再启动运行时。若探针通过但浏览器无画面，检查每路 camera selector、
 GStreamer plugin path、signaling offer/answer/ICE 审计和浏览器 WebRTC stats。
+摄像头节点、编码器、offer/answer/ICE/DataChannel 的完整 `issue_code` 与过滤命令
+见 `docs/24-vehicle-runtime-diagnostics.md`。
 
 ## ChassisControl 与 CAN
 
@@ -164,6 +166,8 @@ ip -details link show can0
 动态 adapter 缺失、CAN interface 不存在或 bridge 打开失败时必须停止，不得
 切回 mock。真实 CAN feedback、控制单位、安全停车和急停仍需在车轮离地或动力
 隔离的安全台架上验收。
+VCU/CAN 启动、日志落盘、收发、反馈超时、握手门禁和 disarm 的完整事件表见
+`docs/24-vehicle-runtime-diagnostics.md`。
 
 ## 常见故障
 

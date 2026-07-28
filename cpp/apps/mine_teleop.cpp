@@ -560,7 +560,13 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
       const auto retry_delay = session_ended ? kSessionRestartDelay : kTransportRestartDelay;
       std::cout << Json({
                        {"event", session_ended ? "vehicle_media_session_ended" : "vehicle_media_signaling_retry"},
+                       {"issue_code", session_ended ? "active_media_session_ended" : "signaling_service_unavailable"},
+                       {"stage", session_ended ? "session_authority" : "signaling_service"},
                        {"http_status", error.status()},
+                       {"operator_action", session_ended
+                                               ? "Confirm the controller still owns an active session; reconnect only after fresh authority is granted."
+                                               : "Check signaling-server health and upstream proxy availability."},
+                       {"retryable", true},
                        {"safety_action", "local_full_stop"},
                        {"retry_after_ms", std::chrono::duration_cast<std::chrono::milliseconds>(retry_delay).count()},
                    }).dump()
@@ -570,7 +576,11 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
       if (!service) throw;
       std::cout << Json({
                        {"event", "vehicle_media_signaling_retry"},
+                       {"issue_code", "signaling_transport_failed"},
+                       {"stage", "signaling_transport"},
                        {"error", error.what()},
+                       {"operator_action", "Check DNS, routing, TLS, signaling-server health, and configured resolve overrides."},
+                       {"retryable", true},
                        {"retry_after_ms", std::chrono::duration_cast<std::chrono::milliseconds>(kTransportRestartDelay).count()},
                    }).dump()
                 << std::endl;
@@ -632,7 +642,11 @@ pid_t spawn_service(std::string_view name, const std::function<int()>& run) {
     std::cerr << Json({
                      {"event", "vehicle_runtime_child_error"},
                      {"service", std::string(name)},
+                     {"issue_code", "vehicle_runtime_child_failed"},
+                     {"stage", "child_service"},
                      {"error", error.what()},
+                     {"operator_action", "Use the preceding camera, WebRTC, signaling, or VCU diagnostic event to locate the failing stage."},
+                     {"safety_action", "local_full_stop"},
                  }).dump()
               << '\n';
   }
@@ -893,7 +907,10 @@ int main(int argc, char** argv) {
     std::cerr << Json({
                     {"event", "mine_teleop_error"},
                     {"runtime", "cpp"},
+                    {"issue_code", "runtime_entry_failed"},
+                    {"stage", "process_entry"},
                     {"error", error.what()},
+                    {"operator_action", "Run config-check/preflight, then use the error text and subsystem diagnostic events to locate the failing stage."},
                 }).dump()
               << '\n';
     return 2;

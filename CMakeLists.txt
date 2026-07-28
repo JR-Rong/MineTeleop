@@ -322,7 +322,49 @@ if(MINE_TELEOP_BUILD_TESTS)
   mine_teleop_enable_warnings(mine-teleop-vcu-tests)
   add_test(NAME mine-teleop-vcu-tests COMMAND mine-teleop-vcu-tests)
 
+  if(UNIX AND NOT APPLE)
+    # The production bridge links against the field-only ChassisControl
+    # package.  This object target compiles the complete bridge against a
+    # minimal ABI fixture so logging and SocketCAN changes are still covered
+    # in ordinary Docker CI without pretending to validate the vendor library.
+    add_library(mine-teleop-chassis-bridge-compile-test OBJECT
+      deployments/chassis-control-bridge/chassis_control_bridge.cpp
+    )
+    target_include_directories(mine-teleop-chassis-bridge-compile-test
+      PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/fixtures/chassis-control
+    )
+    mine_teleop_enable_warnings(mine-teleop-chassis-bridge-compile-test)
+
+    add_executable(mine-teleop-chassis-bridge-diagnostics-smoke
+      cpp/tests/chassis_bridge_diagnostics_smoke.cpp
+      $<TARGET_OBJECTS:mine-teleop-chassis-bridge-compile-test>
+    )
+    target_include_directories(mine-teleop-chassis-bridge-diagnostics-smoke
+      PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/fixtures/chassis-control
+        ${CMAKE_CURRENT_SOURCE_DIR}/deployments/chassis-control-bridge
+    )
+    target_link_libraries(mine-teleop-chassis-bridge-diagnostics-smoke
+      PRIVATE
+        mine_teleop_vcu
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    mine_teleop_enable_warnings(mine-teleop-chassis-bridge-diagnostics-smoke)
+    add_test(
+      NAME mine-teleop-chassis-bridge-diagnostics-smoke
+      COMMAND mine-teleop-chassis-bridge-diagnostics-smoke
+    )
+  endif()
+
   if(UNIX)
+    add_test(
+      NAME mine-teleop-runtime-diagnostics-contract
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_runtime_diagnostics.sh
+    )
     add_test(
       NAME mine-teleop-coturn-usage-report-self-test
       COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/coturn_usage_report.sh --self-test

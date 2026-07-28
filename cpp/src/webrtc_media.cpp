@@ -74,6 +74,113 @@ std::string iso_time(std::int64_t timestamp_ms) {
   return output.str();
 }
 
+struct CameraIssue {
+  std::string_view code;
+  std::string_view stage;
+  std::string_view action;
+  bool retryable;
+};
+
+CameraIssue classify_camera_issue(std::string_view error) {
+  const auto contains = [&](std::string_view value) {
+    return error.find(value) != std::string_view::npos;
+  };
+  if (contains("camera media source configuration is invalid") ||
+      contains("native camera acquisition requires an mjpeg")) {
+    return {"camera_config_invalid", "camera_config", "Check the camera ID, realtime profile, resolution, FPS, and MJPEG codec.", false};
+  }
+  if (contains("camera is not a vendor SDK source")) {
+    return {"camera_source_type_invalid", "camera_config", "Use testsrc, a V4L2 path, or a supported mvs/aravis camera selector.", false};
+  }
+  if (contains("cannot create media pipe")) {
+    return {"camera_bridge_pipe_failed", "vendor_bridge_start", "Check process file-descriptor limits and host resources.", true};
+  }
+  if (contains("cannot fork media process")) {
+    return {"camera_bridge_fork_failed", "vendor_bridge_start", "Check process limits and available memory.", true};
+  }
+  if (contains("camera process exited")) {
+    return {"camera_bridge_exited", "vendor_bridge_capture", "Run the configured vendor camera bridge directly and inspect its stderr.", true};
+  }
+  if (contains("MJPEG frame exceeded")) {
+    return {"camera_frame_too_large", "camera_capture", "Check camera output format and bridge framing; the MJPEG frame limit is 16 MiB.", false};
+  }
+  if (contains("timed out waiting for camera frame") ||
+      contains("timed out waiting for V4L2 frame")) {
+    return {"camera_frame_timeout", "camera_capture", "Check camera power, USB link, selected node, FPS, and whether another process owns the device.", true};
+  }
+  if (contains("media poll failed") || contains("V4L2 poll failed")) {
+    return {"camera_poll_failed", "camera_capture", "Check device health and kernel logs, then reconnect or restart the camera.", true};
+  }
+  if (contains("media read failed")) {
+    return {"camera_bridge_read_failed", "vendor_bridge_capture", "Inspect the vendor bridge process and camera SDK logs.", true};
+  }
+  if (contains("cannot open V4L2 camera")) {
+    return {"camera_open_failed", "v4l2_open", "Check that the device path exists, permissions allow access, and the node is not busy.", true};
+  }
+  if (contains("VIDIOC_QUERYCAP failed")) {
+    return {"camera_querycap_failed", "v4l2_capabilities", "Verify that the configured path is a V4L2 device node.", false};
+  }
+  if (contains("must support V4L2 capture and streaming")) {
+    return {"camera_node_not_capture_capable", "v4l2_capabilities", "Select the capture-capable video-index node reported by v4l2-ctl, not its metadata node.", false};
+  }
+  if (contains("VIDIOC_S_FMT MJPEG failed")) {
+    return {"camera_mjpeg_format_rejected", "v4l2_format", "Use a width, height, and MJPEG format advertised by v4l2-ctl.", false};
+  }
+  if (contains("does not provide native MJPEG")) {
+    return {"camera_native_mjpeg_unavailable", "v4l2_format", "Choose a native MJPEG camera mode or add a supported raw-frame conversion path.", false};
+  }
+  if (contains("VIDIOC_S_PARM failed")) {
+    return {"camera_fps_rejected", "v4l2_frame_rate", "Use an FPS advertised for the selected MJPEG resolution.", false};
+  }
+  if (contains("mmap buffers are unavailable")) {
+    return {"camera_mmap_buffers_unavailable", "v4l2_buffers", "Check driver streaming support and available memory.", true};
+  }
+  if (contains("VIDIOC_QUERYBUF failed")) {
+    return {"camera_query_buffer_failed", "v4l2_buffers", "Inspect the V4L2 driver and reconnect the camera.", true};
+  }
+  if (contains("mmap failed")) {
+    return {"camera_mmap_failed", "v4l2_buffers", "Check memory pressure and the V4L2 driver.", true};
+  }
+  if (contains("VIDIOC_QBUF failed")) {
+    return {"camera_queue_buffer_failed", "v4l2_stream", "Inspect the V4L2 driver and USB link, then restart capture.", true};
+  }
+  if (contains("VIDIOC_STREAMON failed")) {
+    return {"camera_stream_on_failed", "v4l2_stream", "Check for device contention, USB bandwidth limits, and a supported capture mode.", true};
+  }
+  if (contains("VIDIOC_DQBUF failed")) {
+    return {"camera_dequeue_buffer_failed", "v4l2_capture", "Inspect the V4L2 driver and USB link, then restart capture.", true};
+  }
+  if (contains("invalid capture buffer")) {
+    return {"camera_invalid_capture_buffer", "v4l2_capture", "Treat this as a V4L2 driver fault and inspect kernel logs.", true};
+  }
+  if (contains("invalid MJPEG frame")) {
+    return {"camera_invalid_mjpeg_frame", "camera_decode_boundary", "Verify camera/bridge MJPEG framing and USB data integrity.", true};
+  }
+  if (contains("native JPEG encoder failed")) {
+    return {"camera_test_jpeg_encode_failed", "test_source_encode", "Check the native JPEG runtime and requested test-source dimensions.", false};
+  }
+  if (contains("cannot allocate GStreamer camera buffer")) {
+    return {"camera_gstreamer_buffer_allocation_failed", "gstreamer_push", "Check memory pressure and GStreamer allocation errors.", true};
+  }
+  if (contains("GStreamer appsrc rejected camera frame")) {
+    return {"camera_appsrc_push_failed", "gstreamer_push", "Inspect the GStreamer bus error and downstream encoder state.", true};
+  }
+  return {"camera_capture_failed", "camera_capture", "Inspect the error text, camera device, and matching camera bridge or V4L2 diagnostics.", true};
+}
+
+std::string camera_source_kind(std::string_view device) {
+  if (device == "testsrc") return "testsrc";
+  if (device == "mvs" || device.starts_with("mvs:") ||
+      device == "pylon" || device.starts_with("pylon:")) {
+    return "vendor_sdk";
+  }
+  if (device == "aravis" || device.starts_with("aravis:") ||
+      device == "basler" || device.starts_with("basler:")) {
+    return "aravis";
+  }
+  return "v4l2";
+}
+
 class MediaSignalingClient {
  public:
   MediaSignalingClient(
@@ -210,6 +317,7 @@ struct VehicleMediaRuntime::Impl {
     std::atomic<std::uint64_t> encode_latency_samples{0};
     std::atomic<std::uint64_t> encode_latency_total_ms{0};
     std::atomic<std::uint64_t> encode_latency_max_ms{0};
+    std::atomic<bool> first_frame_reported{false};
     std::int64_t pipeline_started_ms{0};
     std::mutex error_mutex;
     std::string error;
@@ -274,6 +382,17 @@ struct VehicleMediaRuntime::Impl {
     // marker must not be sent as an application signaling message.
     if (candidate == nullptr || *candidate == '\0') return;
     auto* self = static_cast<Impl*>(user_data);
+    const auto count = ++self->local_ice_candidate_count;
+    if (count == 1) {
+      self->emit_diagnostic(
+          "vehicle_webrtc_ice_candidate_discovered",
+          "webrtc_local_ice_candidate_available",
+          "ice_gathering",
+          "",
+          "No action is required; this is a connectivity milestone.",
+          true,
+          {{"candidate_count", count}, {"sdp_mline_index", mline_index}});
+    }
     self->queue_signal(
         "ice_candidate",
         {{"candidate", candidate}, {"sdpMLineIndex", mline_index}});
@@ -303,7 +422,18 @@ struct VehicleMediaRuntime::Impl {
     ++self->control_link_loss_count;
     std::lock_guard lock(self->control_mutex);
     if (self->control_service_started && self->control_service) {
-      self->control_service->close();
+      try {
+        self->control_service->close();
+      } catch (const std::exception& error) {
+        self->emit_diagnostic(
+            "vehicle_vcu_safe_stop_failed",
+            "vcu_safe_stop_or_close_failed",
+            "vcu_data_channel_close",
+            error.what(),
+            "Keep the vehicle isolated and inspect the VCU JSONL log/CAN interface before restart.",
+            true,
+            {{"safety_action", "local_full_stop_requested"}});
+      }
       self->control_service_started = false;
     }
     std::cout << Json({
@@ -342,7 +472,12 @@ struct VehicleMediaRuntime::Impl {
     auto* self = static_cast<Impl*>(user_data);
     if (gst_promise_wait(promise) != GST_PROMISE_RESULT_REPLIED) {
       gst_promise_unref(promise);
-      self->set_pipeline_error("WebRTC offer promise failed");
+      self->set_pipeline_error(
+          "WebRTC offer promise failed",
+          "webrtc_offer_promise_failed",
+          "webrtc_offer",
+          "Inspect webrtcbin/GStreamer errors and verify that all media lanes are linked.",
+          true);
       return;
     }
     const auto* reply = gst_promise_get_reply(promise);
@@ -350,7 +485,12 @@ struct VehicleMediaRuntime::Impl {
     gst_structure_get(reply, "offer", GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &offer, nullptr);
     gst_promise_unref(promise);
     if (offer == nullptr) {
-      self->set_pipeline_error("WebRTC offer is missing");
+      self->set_pipeline_error(
+          "WebRTC offer is missing",
+          "webrtc_offer_missing",
+          "webrtc_offer",
+          "Inspect webrtcbin/GStreamer negotiation errors.",
+          true);
       return;
     }
 
@@ -379,6 +519,16 @@ struct VehicleMediaRuntime::Impl {
          {"codec", to_string(self->active_candidate.codec)},
          {"backend", to_string(self->active_candidate.backend)},
          {"media_tracks", std::move(tracks)}});
+    self->emit_diagnostic(
+        "vehicle_webrtc_offer_created",
+        "webrtc_offer_created",
+        "webrtc_offer",
+        "",
+        "No action is required; wait for the controller answer.",
+        true,
+        {{"track_count", self->lanes.size()},
+         {"codec", to_string(self->active_candidate.codec)},
+         {"backend", to_string(self->active_candidate.backend)}});
     g_free(text);
     gst_webrtc_session_description_free(offer);
   }
@@ -392,6 +542,89 @@ struct VehicleMediaRuntime::Impl {
   void queue_signal(std::string type, Json payload) {
     std::lock_guard lock(signal_mutex);
     pending_signals.emplace_back(std::move(type), std::move(payload));
+  }
+
+  void emit_diagnostic(
+      std::string_view event,
+      std::string_view issue_code,
+      std::string_view stage,
+      std::string_view error,
+      std::string_view operator_action,
+      bool retryable,
+      Json details = Json::object()) const {
+    details["event"] = event;
+    details["issue_code"] = issue_code;
+    details["stage"] = stage;
+    details["subsystem"] = "vehicle_media";
+    details["severity"] = error.empty() ? "info" : "error";
+    details["retryable"] = retryable;
+    details["event_at_utc_ms"] = signaling.now_ms();
+    details["vehicle_id"] = config.vehicle_id;
+    details["driver_id"] = signaling.driver_id();
+    details["session_id"] = signaling.session_id();
+    details["operator_action"] = operator_action;
+    if (!error.empty()) details["error"] = error;
+    std::lock_guard lock(diagnostic_mutex);
+    std::cout << details.dump() << std::endl;
+  }
+
+  void set_pipeline_error(
+      std::string value,
+      std::string issue_code,
+      std::string stage,
+      std::string operator_action,
+      bool retryable,
+      Json details = Json::object()) {
+    bool first = false;
+    {
+      std::lock_guard lock(error_mutex);
+      if (pipeline_error.empty()) {
+        pipeline_error = value;
+        pipeline_issue_code = issue_code;
+        pipeline_error_stage = stage;
+        pipeline_operator_action = operator_action;
+        pipeline_error_retryable = retryable;
+        first = true;
+      }
+    }
+    if (first) {
+      details["codec"] = to_string(active_candidate.codec);
+      details["backend"] = to_string(active_candidate.backend);
+      details["safety_action"] = "local_full_stop";
+      emit_diagnostic(
+          "vehicle_media_pipeline_failed",
+          issue_code,
+          stage,
+          value,
+          operator_action,
+          retryable,
+          std::move(details));
+    }
+  }
+
+  void emit_camera_failure(const Lane& lane, std::string_view error) const {
+    const auto issue = classify_camera_issue(error);
+    emit_diagnostic(
+        "vehicle_camera_failed",
+        issue.code,
+        issue.stage,
+        error,
+        issue.action,
+        issue.retryable,
+        {
+            {"camera_id", lane.camera.id},
+            {"device", lane.camera.device},
+            {"source_kind", camera_source_kind(lane.camera.device)},
+            {"profile", lane.camera.realtime_profile},
+            {"configured_width", lane.profile.width},
+            {"configured_height", lane.profile.height},
+            {"configured_fps", lane.profile.fps},
+            {"captured_frames", lane.captured.load()},
+            {"pushed_frames", lane.pushed.load()},
+            {"encoded_frames", lane.encoded.load()},
+            {"dropped_frames", lane.dropped.load()},
+            {"safety_action", "stop_media_lane_and_local_full_stop"},
+        });
   }
 
   void handle_control_message(std::string_view data) {
@@ -409,10 +642,22 @@ struct VehicleMediaRuntime::Impl {
           return;
         }
         bool accepted = false;
-        if (action == "connect") {
-          accepted = control_service->request_vcu_handshake();
-        } else if (action == "disconnect") {
-          accepted = control_service->disconnect_vcu_handshake();
+        try {
+          if (action == "connect") {
+            accepted = control_service->request_vcu_handshake();
+          } else if (action == "disconnect") {
+            accepted = control_service->disconnect_vcu_handshake();
+          }
+        } catch (const std::exception& error) {
+          emit_diagnostic(
+              "vehicle_vcu_handshake_command_failed",
+              "vcu_handshake_command_failed",
+              "vcu_handshake_command",
+              error.what(),
+              "Inspect the VCU JSONL log and CAN interface before retrying the handshake.",
+              true,
+              {{"action", action}, {"safety_action", "local_full_stop"}});
+          return;
         }
         std::cout << Json({
                          {"event", "vehicle_vcu_handshake_command"},
@@ -454,6 +699,26 @@ struct VehicleMediaRuntime::Impl {
         }
       } else {
         ++rejected_control_commands;
+        const auto now_ms = signaling.now_ms();
+        if (result.reason != last_control_rejection_reason ||
+            !last_control_rejection_log_ms ||
+            now_ms - *last_control_rejection_log_ms >= 5000) {
+          last_control_rejection_reason = result.reason;
+          last_control_rejection_log_ms = now_ms;
+          const bool feedback_problem =
+              result.reason == "can_feedback_missing" ||
+              result.reason == "can_feedback_poll_failed";
+          emit_diagnostic(
+              "vehicle_control_command_rejected",
+              feedback_problem ? "vcu_feedback_blocks_control" : "control_command_rejected",
+              feedback_problem ? "vcu_feedback_gate" : "control_validation",
+              result.reason,
+              feedback_problem
+                  ? "Inspect VCU feedback freshness and the VCU JSONL log before requesting control."
+                  : "Inspect command identity, sequence, timing, token, and configured safety limits.",
+              true,
+              {{"reason", result.reason}, {"safety_action", "local_full_stop"}});
+        }
       }
       if (config.runtime.control_log_commands) {
         Json entry = {
@@ -479,7 +744,7 @@ struct VehicleMediaRuntime::Impl {
         }
         std::cout << entry.dump() << '\n';
       }
-    } catch (const std::exception&) {
+    } catch (const std::exception& error) {
       ++rejected_control_commands;
       std::cout << Json({
                        {"event", "vehicle_data_channel_control_rejected"},
@@ -487,6 +752,7 @@ struct VehicleMediaRuntime::Impl {
                        {"vehicle_id", config.vehicle_id},
                        {"session_id", signaling.session_id()},
                        {"reason", "invalid_control_message"},
+                       {"error", error.what()},
                    }).dump()
                 << '\n';
     }
@@ -503,6 +769,7 @@ struct VehicleMediaRuntime::Impl {
       return;
     }
     try {
+      const auto status = control_service->vcu_handshake_status();
       const auto payload = Json({
           {"event", "vcu_handshake_status"},
           {"protocol_version", kProtocolVersion},
@@ -512,10 +779,25 @@ struct VehicleMediaRuntime::Impl {
           {"sent_at_utc_ms", signaling.now_ms()},
           {"driver_connected", true},
           {"result", result},
-          {"status", control_service->vcu_handshake_status().to_json()},
+          {"status", status.to_json()},
           {"hard_limits", control_service->control_limits()},
       }).dump();
       gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
+      if (status.state != last_vcu_handshake_state) {
+        emit_diagnostic(
+            "vehicle_vcu_handshake_state_changed",
+            "vcu_handshake_state_changed",
+            "vcu_handshake",
+            "",
+            status.ready
+                ? "No action is required; VCU control authority is ready."
+                : "Use the status fields and VCU JSONL gate events to determine the next handshake prerequisite.",
+            true,
+            {{"from", last_vcu_handshake_state},
+             {"to", status.state},
+             {"status", status.to_json()}});
+        last_vcu_handshake_state = status.state;
+      }
     } catch (const std::exception& error) {
       std::cout << Json({
                        {"event", "vehicle_vcu_handshake_status_failed"},
@@ -530,16 +812,47 @@ struct VehicleMediaRuntime::Impl {
 
   void configure_control_data_channel() {
     if (!config.runtime.control_enabled) return;
-    {
-      std::lock_guard lock(control_mutex);
-      control_service = std::make_unique<VehicleControlService>(
-          config,
-          signaling.driver_id(),
-          signaling.session_id(),
-          signaling.control_token(),
-          create_vehicle_adapter(config));
-      control_service->start(signaling.now_ms());
-      control_service_started = true;
+    try {
+      {
+        std::lock_guard lock(control_mutex);
+        control_service = std::make_unique<VehicleControlService>(
+            config,
+            signaling.driver_id(),
+            signaling.session_id(),
+            signaling.control_token(),
+            create_vehicle_adapter(config));
+        control_service->start(signaling.now_ms());
+        control_service_started = true;
+      }
+      emit_diagnostic(
+          "vehicle_vcu_adapter_ready",
+          "vcu_adapter_ready",
+          "vcu_adapter_start",
+          "",
+          "No action is required.",
+          true,
+          {{"adapter_type", config.vehicle_adapter.type},
+           {"can_interface", config.vehicle_adapter.can_interface},
+           {"bridge_library_path", config.vehicle_adapter.bridge_library_path.string()}});
+    } catch (const std::exception& error) {
+      emit_diagnostic(
+          "vehicle_vcu_adapter_start_failed",
+          "vcu_adapter_start_failed",
+          "vcu_adapter_start",
+          error.what(),
+          "Check the adapter type, bridge library and dependencies, CAN interface, and VCU log path.",
+          false,
+          {{"adapter_type", config.vehicle_adapter.type},
+           {"can_interface", config.vehicle_adapter.can_interface},
+           {"bridge_library_path", config.vehicle_adapter.bridge_library_path.string()},
+           {"safety_action", "control_not_started"}});
+      set_pipeline_error(
+          "VCU adapter start failed: " + std::string(error.what()),
+          "vcu_adapter_start_failed",
+          "vcu_adapter_start",
+          "Check the adapter type, bridge library and dependencies, CAN interface, and VCU log path.",
+          false);
+      throw;
     }
     GstStructure* options = gst_structure_new(
         "mine-teleop-control-data-channel",
@@ -558,7 +871,15 @@ struct VehicleMediaRuntime::Impl {
         nullptr);
     g_signal_emit_by_name(webrtc, "create-data-channel", "control", options, &control_channel);
     gst_structure_free(options);
-    if (control_channel == nullptr) throw std::runtime_error("webrtcbin failed to create the control data channel");
+    if (control_channel == nullptr) {
+      set_pipeline_error(
+          "webrtcbin failed to create the control data channel",
+          "control_data_channel_create_failed",
+          "webrtc_data_channel",
+          "Check GStreamer SCTP/DataChannel plugins and webrtcbin state.",
+          false);
+      throw std::runtime_error("webrtcbin failed to create the control data channel");
+    }
     g_signal_connect(control_channel, "on-open", G_CALLBACK(on_control_channel_open), this);
     g_signal_connect(control_channel, "on-close", G_CALLBACK(on_control_channel_close), this);
     g_signal_connect(control_channel, "on-error", G_CALLBACK(on_control_channel_error), this);
@@ -569,7 +890,25 @@ struct VehicleMediaRuntime::Impl {
     std::lock_guard lock(control_mutex);
     if (!control_service_started || !control_service) return;
     const auto timestamp_ms = signaling.now_ms();
-    control_service->tick(timestamp_ms);
+    try {
+      control_service->tick(timestamp_ms);
+    } catch (const std::exception& error) {
+      emit_diagnostic(
+          "vehicle_vcu_runtime_failed",
+          "vcu_runtime_operation_failed",
+          "vcu_control_tick",
+          error.what(),
+          "Inspect the VCU JSONL log and CAN interface; keep the vehicle stopped.",
+          true,
+          {{"safety_action", "local_full_stop"}});
+      set_pipeline_error(
+          "VCU control tick failed: " + std::string(error.what()),
+          "vcu_runtime_operation_failed",
+          "vcu_control_tick",
+          "Inspect the VCU JSONL log and CAN interface; keep the vehicle stopped.",
+          true);
+      return;
+    }
     if (control_link_open &&
         (!last_vcu_status_ms || timestamp_ms - *last_vcu_status_ms >= 500)) {
       send_vcu_handshake_status_locked("status_update");
@@ -577,14 +916,20 @@ struct VehicleMediaRuntime::Impl {
     }
   }
 
-  void set_pipeline_error(std::string value) {
-    std::lock_guard lock(error_mutex);
-    if (pipeline_error.empty()) pipeline_error = std::move(value);
-  }
-
   [[nodiscard]] std::string current_pipeline_error() const {
     std::lock_guard lock(error_mutex);
     return pipeline_error;
+  }
+
+  [[nodiscard]] Json current_pipeline_failure() const {
+    std::lock_guard lock(error_mutex);
+    return {
+        {"issue_code", pipeline_issue_code},
+        {"stage", pipeline_error_stage},
+        {"operator_action", pipeline_operator_action},
+        {"retryable", pipeline_error_retryable},
+        {"error", pipeline_error},
+    };
   }
 
   [[nodiscard]] std::vector<VideoCodec> negotiate_codecs(int timeout_ms) {
@@ -742,19 +1087,48 @@ struct VehicleMediaRuntime::Impl {
       MediaProfile capture = lane->profile;
       capture.codec = "mjpeg";
       capture.encoder = "native";
-      lane->source = std::make_unique<CameraFrameSource>(camera, capture, frame_timeout_ms);
+      try {
+        lane->source = std::make_unique<CameraFrameSource>(camera, capture, frame_timeout_ms);
+      } catch (const std::exception& error) {
+        emit_camera_failure(*lane, error.what());
+        const auto issue = classify_camera_issue(error.what());
+        set_pipeline_error(
+            "camera " + lane->camera.id + ": " + error.what(),
+            std::string(issue.code),
+            std::string(issue.stage),
+            std::string(issue.action),
+            issue.retryable,
+            {{"camera_id", lane->camera.id}, {"device", lane->camera.device}});
+        throw;
+      }
       lanes.push_back(std::move(lane));
     }
   }
 
   bool start_pipeline(const EncoderCandidate& candidate, int capture_interval_ms) {
     active_candidate = candidate;
-    pipeline_error.clear();
+    {
+      std::lock_guard lock(error_mutex);
+      pipeline_error.clear();
+      pipeline_issue_code.clear();
+      pipeline_error_stage.clear();
+      pipeline_operator_action.clear();
+      pipeline_error_retryable = false;
+    }
     stop_requested = false;
+    local_ice_candidate_count = 0;
+    remote_ice_candidate_count = 0;
+    answer_received_at_ms.reset();
+    control_not_open_warning_fired = false;
     prepare_lanes();
     auto encoder_choice = create_video_encoder(candidate);
     if (encoder_choice->factory_name().empty()) {
-      set_pipeline_error(to_string(candidate.backend) + " " + to_string(candidate.codec) + " encoder factory is unavailable");
+      set_pipeline_error(
+          to_string(candidate.backend) + " " + to_string(candidate.codec) + " encoder factory is unavailable",
+          "encoder_factory_unavailable",
+          "encoder_selection",
+          "Install/enable the requested hardware encoder or configure a working fallback backend.",
+          false);
       return false;
     }
     GError* parse_error = nullptr;
@@ -767,25 +1141,51 @@ struct VehicleMediaRuntime::Impl {
         gst_object_unref(pipeline);
         pipeline = nullptr;
       }
-      set_pipeline_error("cannot build GStreamer WebRTC pipeline: " + message);
+      set_pipeline_error(
+          "cannot build GStreamer WebRTC pipeline: " + message,
+          "gstreamer_pipeline_build_failed",
+          "pipeline_build",
+          "Check installed GStreamer plugins and the selected encoder/codec.",
+          false);
       return false;
     }
     webrtc = gst_bin_get_by_name(GST_BIN(pipeline), "webrtc");
     if (webrtc == nullptr) {
-      set_pipeline_error("WebRTC pipeline does not contain webrtcbin");
+      set_pipeline_error(
+          "WebRTC pipeline does not contain webrtcbin",
+          "gstreamer_webrtcbin_missing",
+          "pipeline_build",
+          "Install the GStreamer WebRTC plugin and verify the packaged plugin path.",
+          false);
       stop_pipeline();
       return false;
     }
     g_signal_connect(webrtc, "on-negotiation-needed", G_CALLBACK(on_negotiation_needed), this);
     g_signal_connect(webrtc, "on-ice-candidate", G_CALLBACK(on_ice_candidate), this);
-    configure_ice_servers();
+    try {
+      configure_ice_servers();
+    } catch (const std::exception& error) {
+      set_pipeline_error(
+          "ICE server configuration failed: " + std::string(error.what()),
+          "webrtc_ice_server_config_failed",
+          "ice_configuration",
+          "Check STUN/TURN URLs, TURN credentials, and the selected ICE transport policy.",
+          false);
+      stop_pipeline();
+      throw;
+    }
 
     // GStreamer 1.28 keeps webrtcbin closed while it is in NULL.  Creating a
     // DataChannel in that state returns nullptr, so transition the complete
     // pipeline to READY before asking webrtcbin to create the control channel.
     const auto ready_state = gst_element_set_state(pipeline, GST_STATE_READY);
     if (ready_state == GST_STATE_CHANGE_FAILURE) {
-      set_pipeline_error("GStreamer WebRTC pipeline failed to enter READY state");
+      set_pipeline_error(
+          "GStreamer WebRTC pipeline failed to enter READY state",
+          "gstreamer_ready_state_failed",
+          "pipeline_ready",
+          "Inspect GStreamer plugin, device, and encoder initialization errors.",
+          true);
       stop_pipeline();
       return false;
     }
@@ -796,7 +1196,13 @@ struct VehicleMediaRuntime::Impl {
       lane->appsrc = gst_bin_get_by_name(GST_BIN(pipeline), ("source_" + id).c_str());
       lane->encoder = gst_bin_get_by_name(GST_BIN(pipeline), ("encoder_" + id).c_str());
       if (lane->appsrc == nullptr || lane->encoder == nullptr) {
-        set_pipeline_error("media pipeline lane is incomplete: " + lane->camera.id);
+        set_pipeline_error(
+            "media pipeline lane is incomplete: " + lane->camera.id,
+            "gstreamer_camera_lane_incomplete",
+            "pipeline_link",
+            "Check that the camera ID produces valid GStreamer element names and that appsrc/encoder elements were created.",
+            false,
+            {{"camera_id", lane->camera.id}, {"device", lane->camera.device}});
         stop_pipeline();
         return false;
       }
@@ -809,7 +1215,12 @@ struct VehicleMediaRuntime::Impl {
 
     const auto state = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (state == GST_STATE_CHANGE_FAILURE) {
-      set_pipeline_error("GStreamer WebRTC pipeline failed to enter PLAYING state");
+      set_pipeline_error(
+          "GStreamer WebRTC pipeline failed to enter PLAYING state",
+          "gstreamer_playing_state_failed",
+          "pipeline_playing",
+          "Inspect the GStreamer bus, camera availability, and encoder initialization.",
+          true);
       stop_pipeline();
       return false;
     }
@@ -837,6 +1248,20 @@ struct VehicleMediaRuntime::Impl {
             frame.captured_at_ms = signaling.from_local_system_ms(frame.captured_at_ms);
             ++lane->captured;
             lane->last_capture_ms = frame.captured_at_ms;
+            if (!lane->first_frame_reported.exchange(true)) {
+              emit_diagnostic(
+                  "vehicle_camera_first_frame",
+                  "camera_first_frame_received",
+                  "camera_capture",
+                  "",
+                  "No action is required; camera capture is producing frames.",
+                  true,
+                  {{"camera_id", lane->camera.id},
+                   {"device", lane->camera.device},
+                   {"source_kind", camera_source_kind(lane->camera.device)},
+                   {"payload_bytes", frame.payload.size()},
+                   {"sequence", sequence}});
+            }
             GstBuffer* buffer = gst_buffer_new_allocate(nullptr, frame.payload.size(), nullptr);
             if (buffer == nullptr) throw std::runtime_error("cannot allocate GStreamer camera buffer");
             gst_buffer_fill(buffer, 0, frame.payload.data(), frame.payload.size());
@@ -860,9 +1285,19 @@ struct VehicleMediaRuntime::Impl {
             }
           }
         } catch (const std::exception& error) {
-          std::lock_guard lock(lane->error_mutex);
-          lane->error = error.what();
-          set_pipeline_error("camera " + lane->camera.id + ": " + error.what());
+          {
+            std::lock_guard lock(lane->error_mutex);
+            lane->error = error.what();
+          }
+          emit_camera_failure(*lane, error.what());
+          const auto issue = classify_camera_issue(error.what());
+          set_pipeline_error(
+              "camera " + lane->camera.id + ": " + error.what(),
+              std::string(issue.code),
+              std::string(issue.stage),
+              std::string(issue.action),
+              issue.retryable,
+              {{"camera_id", lane->camera.id}, {"device", lane->camera.device}});
         }
       });
     }
@@ -880,7 +1315,20 @@ struct VehicleMediaRuntime::Impl {
     control_link_open = false;
     {
       std::lock_guard lock(control_mutex);
-      if (control_service_started && control_service) control_service->close();
+      if (control_service_started && control_service) {
+        try {
+          control_service->close();
+        } catch (const std::exception& error) {
+          emit_diagnostic(
+              "vehicle_vcu_safe_stop_failed",
+              "vcu_safe_stop_or_close_failed",
+              "vcu_adapter_close",
+              error.what(),
+              "Keep the vehicle isolated and inspect the VCU JSONL log/CAN interface before restart.",
+              true,
+              {{"safety_action", "local_full_stop_requested"}});
+        }
+      }
       control_service_started = false;
       control_service.reset();
     }
@@ -918,7 +1366,18 @@ struct VehicleMediaRuntime::Impl {
       gst_object_unref(pipeline);
       pipeline = nullptr;
     }
-    write_recording_sidecars();
+    try {
+      write_recording_sidecars();
+    } catch (const std::exception& error) {
+      emit_diagnostic(
+          "vehicle_recording_sidecar_failed",
+          "recording_sidecar_write_failed",
+          "recording_finalize",
+          error.what(),
+          "Check recording directory permissions, free space, and filesystem health.",
+          true);
+      throw;
+    }
   }
 
   void write_recording_sidecars() const {
@@ -977,7 +1436,13 @@ struct VehicleMediaRuntime::Impl {
             gst_sdp_message_parse_buffer(
                 reinterpret_cast<const guint8*>(sdp_text.data()), sdp_text.size(), sdp) != GST_SDP_OK) {
           if (sdp != nullptr) gst_sdp_message_free(sdp);
-          throw std::runtime_error("driver returned an invalid WebRTC answer SDP");
+          set_pipeline_error(
+              "driver returned an invalid WebRTC answer SDP",
+              "webrtc_answer_sdp_invalid",
+              "webrtc_answer",
+              "Inspect the controller SDP and ensure browser/server codec negotiation matches the vehicle offer.",
+              false);
+          return;
         }
         auto* answer = gst_webrtc_session_description_new(GST_WEBRTC_SDP_TYPE_ANSWER, sdp);
         GstPromise* promise = gst_promise_new();
@@ -986,13 +1451,41 @@ struct VehicleMediaRuntime::Impl {
         gst_promise_unref(promise);
         gst_webrtc_session_description_free(answer);
         answer_received = true;
+        answer_received_at_ms = signaling.now_ms();
+        emit_diagnostic(
+            "vehicle_webrtc_answer_applied",
+            "webrtc_answer_applied",
+            "webrtc_answer",
+            "",
+            "No action is required; wait for ICE/DTLS connection and video frames.",
+            true,
+            {{"codec", to_string(active_candidate.codec)},
+             {"backend", to_string(active_candidate.backend)}});
       } else if (type == "ice_candidate") {
         const auto candidate = payload.value("candidate", "");
         const auto index = payload.value("sdpMLineIndex", 0U);
-        if (!candidate.empty()) g_signal_emit_by_name(webrtc, "add-ice-candidate", index, candidate.c_str());
+        if (!candidate.empty()) {
+          g_signal_emit_by_name(webrtc, "add-ice-candidate", index, candidate.c_str());
+          const auto count = ++remote_ice_candidate_count;
+          if (count == 1) {
+            emit_diagnostic(
+                "vehicle_webrtc_remote_ice_candidate_received",
+                "webrtc_remote_ice_candidate_available",
+                "ice_connectivity",
+                "",
+                "No action is required; this is a connectivity milestone.",
+                true,
+                {{"candidate_count", count}, {"sdp_mline_index", index}});
+          }
+        }
       } else if (type == "media_fallback" && active_candidate.codec == VideoCodec::H265) {
         codec_fallback_requested = true;
-        set_pipeline_error("browser requested H.264 fallback: " + payload.value("reason", "decode failure"));
+        set_pipeline_error(
+            "browser requested H.264 fallback: " + payload.value("reason", "decode failure"),
+            "browser_codec_fallback_requested",
+            "browser_decode",
+            "Verify browser codec support; the runtime will retry with H.264.",
+            true);
       }
     }
   }
@@ -1010,7 +1503,12 @@ struct VehicleMediaRuntime::Impl {
         if (debug != nullptr && *debug != '\0') value += ": " + std::string(debug);
         if (error != nullptr) g_error_free(error);
         g_free(debug);
-        set_pipeline_error(std::move(value));
+        set_pipeline_error(
+            std::move(value),
+            "gstreamer_bus_error",
+            "pipeline_runtime",
+            "Inspect the GStreamer error/debug text and the affected camera or encoder.",
+            true);
       }
       gst_message_unref(message);
     }
@@ -1068,14 +1566,46 @@ struct VehicleMediaRuntime::Impl {
     if (capture_interval_ms < 0) throw std::invalid_argument("capture interval must be non-negative");
     failover_count = 0;
     last_negotiation_warning.clear();
-    const auto initial_time_sync = signaling.synchronize_time(config.field_safety.time_sync_samples);
+    TimeSyncStatus initial_time_sync;
+    try {
+      initial_time_sync = signaling.synchronize_time(config.field_safety.time_sync_samples);
+    } catch (const std::exception& error) {
+      emit_diagnostic(
+          "vehicle_media_time_sync_failed",
+          "media_initial_time_sync_failed",
+          "time_sync",
+          error.what(),
+          "Check signaling-server reachability and system clock/network latency.",
+          true);
+      throw;
+    }
     if (config.field_safety.require_time_sync &&
         !initial_time_sync.acceptable(config.field_safety.max_time_sync_uncertainty_ms)) {
+      emit_diagnostic(
+          "vehicle_media_time_sync_failed",
+          "media_time_sync_uncertainty_exceeded",
+          "time_sync",
+          "uncertainty exceeds configured field-safety limit",
+          "Stabilize network time synchronization before enabling teleoperation.",
+          true,
+          {{"uncertainty_ms", initial_time_sync.uncertainty_ms},
+           {"limit_ms", config.field_safety.max_time_sync_uncertainty_ms}});
       throw std::runtime_error(
           "media time synchronization uncertainty " + std::to_string(initial_time_sync.uncertainty_ms) +
           "ms exceeds limit " + std::to_string(config.field_safety.max_time_sync_uncertainty_ms) + "ms");
     }
-    signaling.register_online();
+    try {
+      signaling.register_online();
+    } catch (const std::exception& error) {
+      emit_diagnostic(
+          "vehicle_media_signaling_failed",
+          "vehicle_signaling_registration_failed",
+          "signaling_register",
+          error.what(),
+          "Check the signaling URL, TLS trust, device token, DNS/resolve overrides, and server health.",
+          true);
+      throw;
+    }
     std::cout << Json({
                      {"event", "vehicle_media_waiting_for_session"},
                      {"vehicle_id", config.vehicle_id},
@@ -1083,21 +1613,74 @@ struct VehicleMediaRuntime::Impl {
                  }).dump()
               << std::endl;
     const auto session_deadline = signaling.now_ms() + 5000;
-    while (!signaling.discover_session()) {
+    while (true) {
+      bool discovered = false;
+      try {
+        discovered = signaling.discover_session();
+      } catch (const std::exception& error) {
+        emit_diagnostic(
+            "vehicle_media_signaling_failed",
+            "vehicle_session_discovery_failed",
+            "session_discovery",
+            error.what(),
+            "Check signaling-server health and whether this vehicle connection generation is current.",
+            true);
+        throw;
+      }
+      if (discovered) break;
       if (!continuous && signaling.now_ms() >= session_deadline) {
+        emit_diagnostic(
+            "vehicle_media_session_wait_failed",
+            "active_driver_session_timeout",
+            "session_discovery",
+            "timed out waiting for an active driver session",
+            "Log in on the controller and request control for this vehicle ID.",
+            true);
         throw std::runtime_error("timed out waiting for an active driver session");
       }
       std::this_thread::sleep_for(
           std::chrono::milliseconds(config.runtime.teleop_poll_interval_ms));
     }
-    ice_configuration = signaling.ice_servers();
-    const auto codecs = negotiate_codecs(3000);
+    try {
+      ice_configuration = signaling.ice_servers();
+    } catch (const std::exception& error) {
+      emit_diagnostic(
+          "vehicle_media_signaling_failed",
+          "ice_server_fetch_failed",
+          "ice_server_fetch",
+          error.what(),
+          "Check signaling-server/TURN configuration and session authorization.",
+          true);
+      throw;
+    }
+    std::vector<VideoCodec> codecs;
+    try {
+      codecs = negotiate_codecs(3000);
+    } catch (const std::exception& error) {
+      emit_diagnostic(
+          "vehicle_media_negotiation_failed",
+          "media_codec_negotiation_failed",
+          "codec_negotiation",
+          error.what(),
+          "Check browser-advertised codecs and vehicle preferred/fallback codec configuration.",
+          false);
+      throw;
+    }
     std::vector<EncoderCandidate> candidates;
     for (const auto codec : codecs) {
       const auto codec_candidates = encoder_candidate_order(config.hardware, codec);
       candidates.insert(candidates.end(), codec_candidates.begin(), codec_candidates.end());
     }
-    if (candidates.empty()) throw std::runtime_error("no video encoder candidates are configured");
+    if (candidates.empty()) {
+      emit_diagnostic(
+          "vehicle_media_negotiation_failed",
+          "video_encoder_candidates_empty",
+          "encoder_selection",
+          "no video encoder candidates are configured",
+          "Configure at least one supported codec and hardware encoder backend.",
+          false);
+      throw std::runtime_error("no video encoder candidates are configured");
+    }
     Json attempts = Json::array();
     Json errors = Json::array();
     Json final_lanes = Json::array();
@@ -1112,7 +1695,12 @@ struct VehicleMediaRuntime::Impl {
       const auto attempt_started = signaling.now_ms();
       if (!start_pipeline(candidate, capture_interval_ms)) {
         const auto error = current_pipeline_error();
-        attempts.push_back({{"backend", to_string(candidate.backend)}, {"codec", to_string(candidate.codec)}, {"passed", false}, {"error", error}});
+        attempts.push_back({
+            {"backend", to_string(candidate.backend)},
+            {"codec", to_string(candidate.codec)},
+            {"passed", false},
+            {"failure", current_pipeline_failure()},
+            {"error", error}});
         errors.push_back(error);
         stop_pipeline();
         if (candidate_index + 1 < candidates.size()) ++failover_count;
@@ -1123,8 +1711,20 @@ struct VehicleMediaRuntime::Impl {
       while (!frame_target_reached(frame_count) && (continuous || signaling.now_ms() < deadline)) {
         while (g_main_context_iteration(nullptr, false)) {
         }
-        flush_outgoing_signals();
-        process_signaling();
+        try {
+          flush_outgoing_signals();
+          process_signaling();
+        } catch (const std::exception& error) {
+          emit_diagnostic(
+              "vehicle_media_signaling_failed",
+              "session_signaling_exchange_failed",
+              "session_signaling",
+              error.what(),
+              "Check signaling-server reachability, session state, and connection generation.",
+              true,
+              {{"safety_action", "local_full_stop"}});
+          throw;
+        }
         poll_bus();
         tick_control_service();
         if (signaling.time_sync_refresh_due(config.field_safety.time_sync_interval_ms)) {
@@ -1134,10 +1734,21 @@ struct VehicleMediaRuntime::Impl {
                 !status.acceptable(config.field_safety.max_time_sync_uncertainty_ms)) {
               set_pipeline_error(
                   "media time synchronization uncertainty exceeds " +
-                  std::to_string(config.field_safety.max_time_sync_uncertainty_ms) + "ms");
+                      std::to_string(config.field_safety.max_time_sync_uncertainty_ms) + "ms",
+                  "media_runtime_time_sync_uncertainty_exceeded",
+                  "time_sync_refresh",
+                  "Stabilize network time synchronization before resuming teleoperation.",
+                  true);
             }
           } catch (const std::exception& error) {
-            if (config.field_safety.require_time_sync) set_pipeline_error("media time synchronization failed: " + std::string(error.what()));
+            if (config.field_safety.require_time_sync) {
+              set_pipeline_error(
+                  "media time synchronization failed: " + std::string(error.what()),
+                  "media_runtime_time_sync_failed",
+                  "time_sync_refresh",
+                  "Check signaling-server reachability and network latency before resuming.",
+                  true);
+            }
           }
         }
         if (signaling.now_ms() >= next_media_status_ms) {
@@ -1152,7 +1763,28 @@ struct VehicleMediaRuntime::Impl {
         if (simulate_primary_failure_after_frames > 0 && candidate_index == 0 && !simulated_failure_fired &&
             total_encoded() >= static_cast<std::uint64_t>(simulate_primary_failure_after_frames)) {
           simulated_failure_fired = true;
-          set_pipeline_error("simulated primary encoder failure");
+          set_pipeline_error(
+              "simulated primary encoder failure",
+              "simulated_encoder_failure",
+              "encoder_runtime",
+              "No operator action is required in a deliberate failover test.",
+              true);
+        }
+        if (config.runtime.control_enabled && answer_received_at_ms &&
+            !control_link_open && !control_not_open_warning_fired &&
+            signaling.now_ms() - *answer_received_at_ms >= 5000) {
+          control_not_open_warning_fired = true;
+          emit_diagnostic(
+              "vehicle_control_data_channel_not_ready",
+              "control_data_channel_open_timeout",
+              "webrtc_data_channel",
+              "control DataChannel did not open within 5000 ms after the WebRTC answer",
+              "Check ICE/DTLS connectivity, TURN reachability, browser console errors, and SCTP plugins.",
+              true,
+              {{"timeout_ms", 5000},
+               {"local_ice_candidates", local_ice_candidate_count.load()},
+               {"remote_ice_candidates", remote_ice_candidate_count.load()},
+               {"safety_action", "local_full_stop"}});
         }
         if (!current_pipeline_error().empty()) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1160,6 +1792,22 @@ struct VehicleMediaRuntime::Impl {
       flush_outgoing_signals();
       const auto elapsed = std::max<std::int64_t>(1, signaling.now_ms() - attempt_started);
       final_lanes = lane_metrics(elapsed);
+      if (current_pipeline_error().empty() && !answer_received) {
+        set_pipeline_error(
+            "controller WebRTC answer was not received",
+            "webrtc_answer_missing",
+            "webrtc_answer",
+            "Check controller login/session state, signaling messages, and browser WebRTC offer handling.",
+            true);
+      }
+      if (current_pipeline_error().empty() && total_encoded() == 0) {
+        set_pipeline_error(
+            "no encoded video frames were produced",
+            "video_frames_not_encoded",
+            "encoder_runtime",
+            "Inspect camera capture counters, GStreamer bus errors, and encoder availability.",
+            true);
+      }
       const auto error = current_pipeline_error();
       const bool passed = error.empty() && answer_received && total_encoded() > 0;
       attempts.push_back({
@@ -1169,6 +1817,7 @@ struct VehicleMediaRuntime::Impl {
           {"answer_received", answer_received},
           {"duration_ms", elapsed},
           {"lanes", final_lanes},
+          {"failure", current_pipeline_failure()},
           {"error", error},
       });
       stop_pipeline();
@@ -1188,7 +1837,35 @@ struct VehicleMediaRuntime::Impl {
     const auto total_elapsed = std::max<std::int64_t>(1, signaling.now_ms() - total_started_ms);
     bool fps_passed = !final_lanes.empty();
     for (const auto& lane : final_lanes) {
-      if (lane.value("encoded_fps", 0.0) < config.hardware.min_realtime_fps) fps_passed = false;
+      const auto encoded_fps = lane.value("encoded_fps", 0.0);
+      if (encoded_fps < config.hardware.min_realtime_fps) {
+        fps_passed = false;
+        emit_diagnostic(
+            "vehicle_camera_performance_failed",
+            "camera_encoded_fps_below_minimum",
+            "media_acceptance",
+            "encoded FPS is below the configured minimum",
+            "Check USB bandwidth, capture mode, encoder load, and pipeline backlog.",
+            true,
+            {{"camera_id", lane.value("camera_id", "")},
+             {"encoded_fps", encoded_fps},
+             {"minimum_fps", config.hardware.min_realtime_fps},
+             {"captured_frames", lane.value("captured_frames", 0)},
+             {"encoded_frames", lane.value("encoded_frames", 0)}});
+      }
+      const auto max_latency_ms = lane.value("capture_to_encoded_max_ms", 0);
+      if (max_latency_ms > config.hardware.max_end_to_end_latency_ms) {
+        emit_diagnostic(
+            "vehicle_camera_performance_warning",
+            "camera_capture_to_encode_latency_high",
+            "media_acceptance",
+            "capture-to-encode latency exceeds the configured end-to-end budget",
+            "Check encoder saturation, CPU/GPU load, and pipeline backlog.",
+            true,
+            {{"camera_id", lane.value("camera_id", "")},
+             {"capture_to_encoded_max_ms", max_latency_ms},
+             {"max_end_to_end_latency_ms", config.hardware.max_end_to_end_latency_ms}});
+      }
     }
     const bool passed = !attempts.empty() && attempts.back().value("passed", false) && fps_passed;
     return {
@@ -1240,9 +1917,16 @@ struct VehicleMediaRuntime::Impl {
   std::deque<std::pair<std::string, Json>> pending_signals;
   mutable std::mutex error_mutex;
   std::string pipeline_error;
+  std::string pipeline_issue_code;
+  std::string pipeline_error_stage;
+  std::string pipeline_operator_action;
+  bool pipeline_error_retryable{false};
+  mutable std::mutex diagnostic_mutex;
   EncoderCandidate active_candidate{EncoderBackend::Nvenc, VideoCodec::H265};
   std::int64_t started_ms{0};
   bool answer_received{false};
+  std::optional<std::int64_t> answer_received_at_ms;
+  bool control_not_open_warning_fired{false};
   bool simulated_failure_fired{false};
   bool codec_fallback_requested{false};
   std::uint64_t failover_count{0};
@@ -1258,6 +1942,11 @@ struct VehicleMediaRuntime::Impl {
   std::atomic<std::uint64_t> control_link_loss_count{0};
   std::atomic<std::int64_t> last_control_received_at_ms{0};
   std::optional<std::int64_t> last_vcu_status_ms;
+  std::string last_vcu_handshake_state;
+  std::string last_control_rejection_reason;
+  std::optional<std::int64_t> last_control_rejection_log_ms;
+  std::atomic<std::uint64_t> local_ice_candidate_count{0};
+  std::atomic<std::uint64_t> remote_ice_candidate_count{0};
 };
 
 VehicleMediaRuntime::VehicleMediaRuntime(

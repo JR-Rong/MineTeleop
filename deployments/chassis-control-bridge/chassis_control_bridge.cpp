@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <linux/can.h>
 #include <linux/can/raw.h>
@@ -223,6 +224,63 @@ std::string utc_timestamp() {
   return output.str();
 }
 
+std::string json_escape(std::string_view value) {
+  std::ostringstream output;
+  for (const unsigned char character : value) {
+    switch (character) {
+      case '"':
+        output << "\\\"";
+        break;
+      case '\\':
+        output << "\\\\";
+        break;
+      case '\b':
+        output << "\\b";
+        break;
+      case '\f':
+        output << "\\f";
+        break;
+      case '\n':
+        output << "\\n";
+        break;
+      case '\r':
+        output << "\\r";
+        break;
+      case '\t':
+        output << "\\t";
+        break;
+      default:
+        if (character < 0x20U) {
+          output << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                 << static_cast<int>(character) << std::dec;
+        } else {
+          output << static_cast<char>(character);
+        }
+    }
+  }
+  return output.str();
+}
+
+void emit_bridge_diagnostic(
+    std::string_view event,
+    std::string_view issue_code,
+    std::string_view stage,
+    std::string_view error,
+    std::string_view operator_action,
+    std::string_view extra = {}) {
+  std::cerr << "{\"ts\":\"" << utc_timestamp()
+            << "\",\"event\":\"" << json_escape(event)
+            << "\",\"subsystem\":\"vcu_can\",\"severity\":\"error\""
+            << ",\"issue_code\":\"" << json_escape(issue_code)
+            << "\",\"stage\":\"" << json_escape(stage)
+            << "\",\"retryable\":true"
+            << ",\"error\":\"" << json_escape(error)
+            << "\",\"operator_action\":\"" << json_escape(operator_action)
+            << "\",\"safety_action\":\"local_full_stop\"";
+  if (!extra.empty()) std::cerr << ',' << extra;
+  std::cerr << '}' << std::endl;
+}
+
 std::string frame_json(const CanFrame& frame) {
   std::ostringstream output;
   output << "{\"id\":\"0x" << std::uppercase << std::hex << std::setw(8)
@@ -291,10 +349,28 @@ class ProtocolLogger {
     std::error_code error;
     if (!path_.parent_path().empty()) {
       std::filesystem::create_directories(path_.parent_path(), error);
-      if (error) return false;
+      if (error) {
+        emit_bridge_diagnostic(
+            "vehicle_vcu_log_open_failed",
+            "vcu_log_directory_create_failed",
+            "vcu_log_open",
+            error.message(),
+            "Create the VCU log directory and grant the vehicle runtime write permission.",
+            "\"log_path\":\"" + json_escape(path_.string()) + "\"");
+        return false;
+      }
     }
     stream_.open(path_, std::ios::out | std::ios::app);
-    if (!stream_.is_open()) return false;
+    if (!stream_.is_open()) {
+      emit_bridge_diagnostic(
+          "vehicle_vcu_log_open_failed",
+          "vcu_log_file_open_failed",
+          "vcu_log_open",
+          std::strerror(errno),
+          "Check the VCU log path, parent permissions, free space, and read-only filesystem state.",
+          "\"log_path\":\"" + json_escape(path_.string()) + "\"");
+      return false;
+    }
     bytes_ = std::filesystem::exists(path_, error)
         ? std::filesystem::file_size(path_, error)
         : 0;
@@ -310,6 +386,14 @@ class ProtocolLogger {
             << ",\"log_max_bytes\":" << max_bytes_
             << ",\"log_rotations\":" << rotations_;
     event("session_start", details.str(), true);
+    std::cerr << "{\"ts\":\"" << utc_timestamp()
+              << "\",\"event\":\"vehicle_vcu_log_ready\""
+              << ",\"subsystem\":\"vcu_can\",\"severity\":\"info\""
+              << ",\"issue_code\":\"vcu_log_ready\",\"stage\":\"vcu_log_open\""
+              << ",\"log_path\":\"" << json_escape(path_.string())
+              << "\",\"can_interface\":\"" << json_escape(can_interface)
+              << "\",\"operator_action\":\"No action is required.\"}"
+              << std::endl;
     return true;
   }
 
@@ -329,6 +413,26 @@ class ProtocolLogger {
     if (!details.empty()) line << ',' << details;
     line << '}';
     write(line.str(), force_flush);
+  }
+
+  void issue(
+      const std::string& name,
+      std::string_view issue_code,
+      std::string_view stage,
+      std::string_view error,
+      std::string_view operator_action,
+      std::string_view safety_action,
+      const std::string& details = {},
+      bool force_flush = true) {
+    std::ostringstream fields;
+    fields << "\"issue_code\":\"" << json_escape(issue_code)
+           << "\",\"stage\":\"" << json_escape(stage)
+           << "\",\"retryable\":true"
+           << ",\"error\":\"" << json_escape(error)
+           << "\",\"operator_action\":\"" << json_escape(operator_action)
+           << "\",\"safety_action\":\"" << json_escape(safety_action) << "\"";
+    if (!details.empty()) fields << ',' << details;
+    event(name, fields.str(), force_flush);
   }
 
   void command(const std::string& name, const Command& command) {
@@ -432,30 +536,52 @@ class ProtocolLogger {
     stream_.flush();
     stream_.close();
     std::error_code error;
+    const auto report_rotation_error = [&] {
+      if (!error) return;
+      report_write_failure(
+          "vcu_log_rotation_failed",
+          error.message());
+      error.clear();
+    };
     if (rotations_ > 0) {
       std::filesystem::remove(
           path_.string() + "." + std::to_string(rotations_),
           error);
+      report_rotation_error();
       for (int index = rotations_ - 1; index >= 1; --index) {
         const auto source = std::filesystem::path(
             path_.string() + "." + std::to_string(index));
         const auto target = std::filesystem::path(
             path_.string() + "." + std::to_string(index + 1));
         if (std::filesystem::exists(source, error)) {
+          report_rotation_error();
           error.clear();
           std::filesystem::rename(source, target, error);
+          report_rotation_error();
+        } else {
+          report_rotation_error();
         }
       }
       error.clear();
       if (std::filesystem::exists(path_, error)) {
+        report_rotation_error();
         error.clear();
         std::filesystem::rename(path_, path_.string() + ".1", error);
+        report_rotation_error();
+      } else {
+        report_rotation_error();
       }
     } else {
       std::filesystem::remove(path_, error);
+      report_rotation_error();
     }
     stream_.open(path_, std::ios::out | std::ios::trunc);
     bytes_ = 0;
+    if (!stream_.is_open()) {
+      report_write_failure(
+          "vcu_log_rotation_reopen_failed",
+          "log rotation could not reopen the active VCU log file");
+    }
   }
 
   void write(const std::string& line, bool force_flush) {
@@ -464,13 +590,39 @@ class ProtocolLogger {
     if (bytes_ + line.size() + 1U > max_bytes_) rotate();
     if (!stream_.is_open()) return;
     stream_ << line << '\n';
+    if (!stream_) {
+      report_write_failure(
+          "vcu_log_write_failed",
+          "writing the VCU JSONL log failed");
+      return;
+    }
     bytes_ += line.size() + 1U;
     const auto now = Clock::now();
     if (force_flush ||
         std::chrono::duration<double>(now - last_flush_).count() >= 1.0) {
       stream_.flush();
+      if (!stream_) {
+        report_write_failure(
+            "vcu_log_flush_failed",
+            "flushing the VCU JSONL log failed");
+        return;
+      }
       last_flush_ = now;
     }
+  }
+
+  void report_write_failure(
+      std::string_view issue_code,
+      std::string_view error) {
+    if (write_failure_reported_) return;
+    write_failure_reported_ = true;
+    emit_bridge_diagnostic(
+        "vehicle_vcu_log_write_failed",
+        issue_code,
+        "vcu_log_write",
+        error,
+        "Stop field testing, preserve available logs, and repair filesystem space/permissions.",
+        "\"log_path\":\"" + json_escape(path_.string()) + "\"");
   }
 
   std::filesystem::path path_;
@@ -480,6 +632,7 @@ class ProtocolLogger {
   int rotations_{kDefaultLogRotations};
   Clock::time_point last_flush_{};
   std::mutex write_mutex_;
+  bool write_failure_reported_{false};
 };
 
 class SocketCan {
@@ -487,14 +640,22 @@ class SocketCan {
   ~SocketCan() { close(); }
 
   bool open(const std::string& interface_name) {
-    if (interface_name.empty() || interface_name.size() >= IFNAMSIZ) return false;
+    if (interface_name.empty() || interface_name.size() >= IFNAMSIZ) {
+      set_error("validate_interface", EINVAL);
+      return false;
+    }
     fd_ = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if (fd_ < 0) return false;
+    if (fd_ < 0) {
+      set_error("socket", errno);
+      return false;
+    }
 
     ifreq request{};
     std::memcpy(request.ifr_name, interface_name.c_str(), interface_name.size() + 1U);
     if (::ioctl(fd_, SIOCGIFINDEX, &request) < 0) {
+      const int error = errno;
       close();
+      set_error("resolve_interface_index", error);
       return false;
     }
 
@@ -502,15 +663,27 @@ class SocketCan {
     address.can_family = AF_CAN;
     address.can_ifindex = request.ifr_ifindex;
     if (::bind(fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+      const int error = errno;
       close();
+      set_error("bind", error);
       return false;
     }
 
     const int flags = ::fcntl(fd_, F_GETFL, 0);
-    if (flags < 0 || ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+    if (flags < 0) {
+      const int error = errno;
       close();
+      set_error("fcntl_get_flags", error);
       return false;
     }
+    if (::fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+      const int error = errno;
+      close();
+      set_error("fcntl_set_nonblocking", error);
+      return false;
+    }
+    last_errno_ = 0;
+    last_stage_ = "open";
     return true;
   }
 
@@ -526,10 +699,15 @@ class SocketCan {
     const auto read_size = ::read(fd_, &frame, sizeof(frame));
     if (read_size < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+      set_error("read", errno);
       return -errno;
     }
-    if (read_size != static_cast<ssize_t>(sizeof(frame))) return -EMSGSIZE;
+    if (read_size != static_cast<ssize_t>(sizeof(frame))) {
+      set_error("read_size", EMSGSIZE);
+      return -EMSGSIZE;
+    }
     if ((frame.can_id & CAN_ERR_FLAG) != 0U || (frame.can_id & CAN_RTR_FLAG) != 0U) {
+      last_frame_flags_ = frame.can_id;
       return 2;
     }
 
@@ -546,11 +724,26 @@ class SocketCan {
     frame.can_id = input.id | (input.extended ? CAN_EFF_FLAG : 0U);
     frame.can_dlc = std::min<std::uint8_t>(input.dlc, 8);
     std::copy_n(input.data.begin(), frame.can_dlc, frame.data);
-    return ::write(fd_, &frame, sizeof(frame)) == static_cast<ssize_t>(sizeof(frame));
+    const auto written = ::write(fd_, &frame, sizeof(frame));
+    if (written == static_cast<ssize_t>(sizeof(frame))) return true;
+    set_error("write", written < 0 ? errno : EIO);
+    return false;
   }
 
+  [[nodiscard]] int last_errno() const { return last_errno_; }
+  [[nodiscard]] const std::string& last_stage() const { return last_stage_; }
+  [[nodiscard]] canid_t last_frame_flags() const { return last_frame_flags_; }
+
  private:
+  void set_error(std::string stage, int error) const {
+    last_stage_ = std::move(stage);
+    last_errno_ = error;
+  }
+
   int fd_{-1};
+  mutable int last_errno_{0};
+  mutable std::string last_stage_;
+  mutable canid_t last_frame_flags_{0};
 };
 
 class BridgeRuntime {
@@ -573,6 +766,12 @@ class BridgeRuntime {
   int start(const Command& initial, const Command& emergency) {
     if (!controller_.set_command(initial) ||
         !controller_.set_emergency_command(emergency)) {
+      emit_bridge_diagnostic(
+          "vehicle_vcu_start_failed",
+          "vcu_initial_command_invalid",
+          "vcu_command_initialization",
+          "initial or emergency command is outside the JYR010 command limits",
+          "Check ChassisControl output units and configured vehicle parameters.");
       return -2;
     }
     if (!logger_.open(can_interface_)) return -4;
@@ -585,10 +784,26 @@ class BridgeRuntime {
     logger_.command("initial", initial);
     logger_.command("emergency", emergency);
     if (!socket_.open(can_interface_)) {
-      logger_.event("socket_open_failed", "\"errno\":" + std::to_string(errno), true);
+      const auto error = socket_.last_errno();
+      logger_.issue(
+          "socket_open_failed",
+          "socketcan_open_failed",
+          socket_.last_stage(),
+          std::strerror(error),
+          "Verify the CAN interface name, bring the interface up, and check SocketCAN permissions.",
+          "control_not_started",
+          "\"can_interface\":\"" + json_escape(can_interface_) +
+              "\",\"errno\":" + std::to_string(error));
       logger_.close();
       return -3;
     }
+    logger_.event(
+        "socket_opened",
+        "\"issue_code\":\"socketcan_ready\",\"stage\":\"socketcan_open\","
+        "\"can_interface\":\"" +
+            json_escape(can_interface_) +
+            "\",\"operator_action\":\"No action is required.\"",
+        true);
     running_.store(true);
     io_thread_ = std::thread(&BridgeRuntime::io_loop, this);
     return 0;
@@ -596,8 +811,24 @@ class BridgeRuntime {
 
   bool apply(const Command& command) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!running_.load() || io_error_ != 0) return false;
-    if (!controller_.set_command(command)) return false;
+    if (!running_.load() || io_error_ != 0) {
+      log_operation_rejected_locked(
+          "control_apply_rejected",
+          "vcu_control_runtime_unavailable",
+          "vcu_control_apply",
+          "VCU bridge is not running or has a latched I/O error",
+          "Inspect the preceding CAN fault and restart only after the interface/VCU is healthy.");
+      return false;
+    }
+    if (!controller_.set_command(command)) {
+      log_operation_rejected_locked(
+          "control_apply_rejected",
+          "vcu_control_command_invalid",
+          "vcu_control_validate",
+          "command is outside JYR010 limits or invalid for the current state",
+          "Check ChassisControl units, field limits, and the current VCU handshake state.");
+      return false;
+    }
     software_estop_ = false;
     logger_.command("driver", command);
     return true;
@@ -605,11 +836,23 @@ class BridgeRuntime {
 
   bool emergency_stop() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!running_.load()) return false;
+    if (!running_.load()) {
+      log_operation_rejected_locked(
+          "emergency_stop_rejected",
+          "vcu_emergency_stop_runtime_unavailable",
+          "vcu_emergency_stop",
+          "VCU bridge is not running",
+          "Use the independent hardware safety path and inspect why the bridge stopped.");
+      return false;
+    }
     controller_.emergency_stop();
     software_estop_ = true;
     logger_.event(
         "emergency_stop",
+        "\"issue_code\":\"vcu_emergency_stop_applied\","
+        "\"stage\":\"vcu_emergency_stop\","
+        "\"operator_action\":\"Confirm the stop state and investigate the trigger before reset\","
+        "\"safety_action\":\"local_full_stop\","
         "\"state\":\"" +
             std::string(mine_teleop::vcu::state_name(controller_.state())) + "\"",
         true);
@@ -618,20 +861,37 @@ class BridgeRuntime {
 
   bool request_parallel_handshake() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!running_.load() || io_error_ != 0) return false;
+    if (!running_.load() || io_error_ != 0) {
+      log_operation_rejected_locked(
+          "parallel_handshake_rejected",
+          "vcu_handshake_runtime_unavailable",
+          "vcu_handshake_request",
+          "VCU bridge is not running or has a latched I/O error",
+          "Repair the CAN/VCU fault before requesting control authority.");
+      return false;
+    }
     const auto now = Clock::now();
     const auto state_before = controller_.state();
     if (!parking_gate_fresh_locked(now) || !controller_.parking_ready() ||
         !controller_.request_parallel_handshake()) {
       logger_.event(
           "parallel_handshake_rejected",
-          handshake_gate_json_locked(now),
+          "\"issue_code\":\"vcu_handshake_gate_rejected\","
+          "\"stage\":\"vcu_handshake_gate\","
+          "\"retryable\":true,"
+          "\"operator_action\":\"Satisfy fresh feedback, P gear, zero speed, all EPBs parked, and manual handshake state 3\","
+          "\"safety_action\":\"remain_in_standby\"," +
+              handshake_gate_json_locked(now),
           true);
       return false;
     }
     software_estop_ = false;
     logger_.event(
         "parallel_handshake_requested",
+        "\"issue_code\":\"vcu_handshake_requested\","
+        "\"stage\":\"vcu_handshake_request\","
+        "\"operator_action\":\"Wait for VCU handshake state 6 and all actuator readiness feedback\","
+        "\"safety_action\":\"remain_stopped_until_ready\","
         "\"from\":\"" +
             std::string(mine_teleop::vcu::state_name(state_before)) +
             "\",\"to\":\"" +
@@ -644,13 +904,25 @@ class BridgeRuntime {
 
   bool request_park() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!running_.load()) return false;
+    if (!running_.load()) {
+      log_operation_rejected_locked(
+          "parallel_handshake_disconnect_rejected",
+          "vcu_disconnect_runtime_unavailable",
+          "vcu_disarm_request",
+          "VCU bridge is not running",
+          "Use the independent hardware safety path and inspect why the bridge stopped.");
+      return false;
+    }
     const auto state_before = controller_.state();
     controller_.request_disarm();
     software_estop_ = true;
     if (state_before != controller_.state()) {
       logger_.event(
           "parallel_handshake_disconnect_requested",
+          "\"issue_code\":\"vcu_disarm_requested\","
+          "\"stage\":\"vcu_disarm_request\","
+          "\"operator_action\":\"Wait for zero torque, N, EPB park, and manual handshake state 3\","
+          "\"safety_action\":\"local_full_stop\","
           "\"from\":\"" +
               std::string(mine_teleop::vcu::state_name(state_before)) +
               "\",\"to\":\"" +
@@ -782,6 +1054,23 @@ class BridgeRuntime {
     return telemetry_.speed_mps;
   }
 
+  void log_api_failure(
+      std::string_view operation,
+      std::string_view issue_code,
+      std::string_view error,
+      std::string_view operator_action) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    logger_.issue(
+        "bridge_api_operation_failed",
+        issue_code,
+        operation,
+        error,
+        operator_action,
+        "local_full_stop",
+        "\"running\":" + std::string(running_.load() ? "true" : "false") +
+            ",\"io_error\":" + std::to_string(io_error_));
+  }
+
   void close() {
     if (!running_.load()) {
       if (io_thread_.joinable()) io_thread_.join();
@@ -796,6 +1085,10 @@ class BridgeRuntime {
       software_estop_ = true;
       logger_.event(
           "disarm_requested",
+          "\"issue_code\":\"vcu_disarm_requested\","
+          "\"stage\":\"vcu_close\","
+          "\"operator_action\":\"Wait for disarm_complete before removing power\","
+          "\"safety_action\":\"local_full_stop\","
           "\"state\":\"" +
               std::string(mine_teleop::vcu::state_name(controller_.state())) + "\"",
           true);
@@ -810,17 +1103,27 @@ class BridgeRuntime {
     }
     if (!disarmed) {
       std::lock_guard<std::mutex> lock(mutex_);
-      logger_.event(
+      logger_.issue(
           "disarm_timeout",
+          "vcu_disarm_timeout",
+          "vcu_close",
+          "VCU did not complete the reverse handshake within the timeout",
+          "Keep the vehicle isolated; inspect feedback/state and use the independent hardware safety path.",
+          "local_full_stop",
           "\"timeout_ms\":" +
               std::to_string(static_cast<int>(kDisarmTimeoutSeconds * 1000.0)) +
               ",\"state\":\"" +
-              std::string(mine_teleop::vcu::state_name(controller_.state())) + "\"",
-          true);
+              std::string(mine_teleop::vcu::state_name(controller_.state())) + "\"");
       logger_.feedback(controller_.feedback(), controller_.state());
     } else {
       std::lock_guard<std::mutex> lock(mutex_);
-      logger_.event("disarm_complete", "", true);
+      logger_.event(
+          "disarm_complete",
+          "\"issue_code\":\"vcu_disarm_complete\","
+          "\"stage\":\"vcu_close\","
+          "\"operator_action\":\"No action is required.\","
+          "\"safety_action\":\"local_full_stop_confirmed\"",
+          true);
     }
     running_.store(false);
     condition_.notify_all();
@@ -831,7 +1134,11 @@ class BridgeRuntime {
 
  private:
   void ingest_locked(const CanFrame& frame) {
-    if (!controller_.ingest(frame)) return;
+    if (!controller_.ingest(frame)) {
+      ++ignored_rx_count_;
+      last_ignored_rx_id_ = frame.id;
+      return;
+    }
     logger_.received(frame, controller_.state());
     last_seen_[frame.id] = Clock::now();
     ++feedback_generation_;
@@ -920,6 +1227,95 @@ class BridgeRuntime {
     return output.str();
   }
 
+  std::string stale_feedback_ages_locked(Clock::time_point now) const {
+    std::ostringstream output;
+    output << "\"stale_feedback\":[";
+    bool first = true;
+    for (const auto id : kCriticalFeedbackIds) {
+      const auto found = last_seen_.find(id);
+      const auto age_ms = found == last_seen_.end()
+          ? -1
+          : std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - found->second)
+                .count();
+      if (age_ms >= 0 &&
+          age_ms <= static_cast<long long>(kFeedbackTimeoutSeconds * 1000.0)) {
+        continue;
+      }
+      if (!first) output << ',';
+      first = false;
+      output << "{\"id\":\"0x" << std::uppercase << std::hex << std::setw(8)
+             << std::setfill('0') << id << std::dec
+             << "\",\"age_ms\":" << age_ms << '}';
+    }
+    output << ']';
+    return output.str();
+  }
+
+  void log_operation_rejected_locked(
+      std::string_view name,
+      std::string_view issue_code,
+      std::string_view stage,
+      std::string_view error,
+      std::string_view operator_action) {
+    const auto now = Clock::now();
+    if (last_operation_rejection_code_ == issue_code &&
+        now - last_operation_rejection_log_ < std::chrono::seconds(1)) {
+      return;
+    }
+    last_operation_rejection_code_ = std::string(issue_code);
+    last_operation_rejection_log_ = now;
+    logger_.issue(
+        std::string(name),
+        issue_code,
+        stage,
+        error,
+        operator_action,
+        "local_full_stop",
+        "\"running\":" + std::string(running_.load() ? "true" : "false") +
+            ",\"io_error\":" + std::to_string(io_error_) +
+            ",\"state\":\"" +
+            std::string(mine_teleop::vcu::state_name(controller_.state())) + "\"");
+  }
+
+  void log_ignored_rx_locked(Clock::time_point now) {
+    if (now < next_ignored_rx_log_) return;
+    if (ignored_rx_count_ > 0) {
+      std::ostringstream details;
+      details << "\"ignored_count\":" << ignored_rx_count_
+              << ",\"last_id\":\"0x" << std::uppercase << std::hex
+              << std::setw(8) << std::setfill('0') << last_ignored_rx_id_
+              << "\"";
+      logger_.issue(
+          "can_rx_ignored_summary",
+          "can_rx_unrecognized_or_invalid",
+          "can_decode",
+          "CAN frames were not recognized by the JYR010 protocol decoder",
+          "If an expected feedback ID is missing, verify protocol version, extended-ID flags, and DLC.",
+          "none",
+          details.str(),
+          false);
+      ignored_rx_count_ = 0;
+    }
+    if (special_rx_count_ > 0) {
+      std::ostringstream details;
+      details << "\"ignored_count\":" << special_rx_count_
+              << ",\"last_can_flags\":\"0x" << std::uppercase << std::hex
+              << last_special_rx_flags_ << "\"";
+      logger_.issue(
+          "can_error_or_rtr_frame_ignored",
+          "can_error_or_rtr_frame_received",
+          "socketcan_receive",
+          "SocketCAN delivered CAN error or RTR frames that are not VCU feedback",
+          "Inspect interface error counters and kernel CAN diagnostics if this repeats.",
+          "none",
+          details.str(),
+          false);
+      special_rx_count_ = 0;
+    }
+    next_ignored_rx_log_ = now + std::chrono::seconds(1);
+  }
+
   void update_feedback_locked() {
     const auto& feedback = controller_.feedback();
     last_feedback_.shake_hand_status = feedback.handshake_status;
@@ -969,13 +1365,36 @@ class BridgeRuntime {
   void io_loop() noexcept {
     try {
       io_loop_impl();
+    } catch (const std::exception& error) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      io_error_ = -EFAULT;
+      controller_.transport_fault();
+      software_estop_ = true;
+      try {
+        logger_.issue(
+            "io_thread_exception",
+            "vcu_io_thread_exception",
+            "vcu_io_loop",
+            error.what(),
+            "Keep the vehicle stopped and inspect the exception plus preceding CAN events.",
+            "local_full_stop");
+      } catch (...) {
+      }
+      running_.store(false);
+      condition_.notify_all();
     } catch (...) {
       std::lock_guard<std::mutex> lock(mutex_);
       io_error_ = -EFAULT;
       controller_.transport_fault();
       software_estop_ = true;
       try {
-        logger_.event("io_thread_exception", "", true);
+        logger_.issue(
+            "io_thread_exception",
+            "vcu_io_thread_unknown_exception",
+            "vcu_io_loop",
+            "unknown non-standard exception",
+            "Keep the vehicle stopped and inspect the preceding CAN events.",
+            "local_full_stop");
       } catch (...) {
       }
       running_.store(false);
@@ -1001,10 +1420,17 @@ class BridgeRuntime {
           controller_.transport_fault();
           software_estop_ = true;
           if (!receive_failure_reported) {
-            logger_.event(
+            const auto error = -receive_result;
+            logger_.issue(
                 "can_receive_failed",
-                "\"error\":" + std::to_string(receive_result),
-                true);
+                "socketcan_receive_failed",
+                socket_.last_stage(),
+                std::strerror(error),
+                "Inspect CAN interface state, kernel logs, wiring, termination, and bus-off counters.",
+                "local_full_stop",
+                "\"error_code\":" + std::to_string(receive_result) +
+                    ",\"errno\":" + std::to_string(error) +
+                    ",\"can_interface\":\"" + json_escape(can_interface_) + "\"");
             receive_failure_reported = true;
           }
           break;
@@ -1012,6 +1438,10 @@ class BridgeRuntime {
         if (receive_result == 1) {
           std::lock_guard<std::mutex> lock(mutex_);
           ingest_locked(frame);
+        } else if (receive_result == 2) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          ++special_rx_count_;
+          last_special_rx_flags_ = socket_.last_frame_flags();
         }
       }
 
@@ -1021,16 +1451,22 @@ class BridgeRuntime {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto state_before = controller_.state();
         const auto now = Clock::now();
+        log_ignored_rx_locked(now);
         if (controller_.ready() && !feedback_fresh_locked(now)) {
           io_error_ = -ETIMEDOUT;
           controller_.transport_fault();
           software_estop_ = true;
-          logger_.event(
+          logger_.issue(
               "feedback_timeout",
+              "vcu_critical_feedback_timeout",
+              "vcu_feedback_watchdog",
+              "one or more critical VCU feedback IDs exceeded the freshness deadline",
+              "Inspect stale_feedback ages, CAN wiring/load, VCU power/state, and protocol ID mapping.",
+              "local_full_stop",
               "\"timeout_ms\":" +
                   std::to_string(static_cast<int>(kFeedbackTimeoutSeconds * 1000.0)) +
-                  "," + stale_feedback_ids_locked(now),
-              true);
+                  "," + stale_feedback_ids_locked(now) +
+                  "," + stale_feedback_ages_locked(now));
         }
         frames = controller_.tick();
         transmit_state = controller_.state();
@@ -1067,13 +1503,27 @@ class BridgeRuntime {
         io_error_ = -EIO;
         controller_.transport_fault();
         software_estop_ = true;
-        logger_.event(
+        std::ostringstream failed_ids;
+        failed_ids << "\"failed_ids\":[";
+        for (std::size_t index = 0; index < failed_send_ids.size(); ++index) {
+          if (index != 0) failed_ids << ',';
+          failed_ids << "\"0x" << std::uppercase << std::hex << std::setw(8)
+                     << std::setfill('0') << failed_send_ids[index] << "\"";
+        }
+        failed_ids << ']';
+        logger_.issue(
             "can_send_failed",
-            "\"consecutive_failures\":" +
+            "socketcan_send_failed",
+            socket_.last_stage(),
+            std::strerror(socket_.last_errno()),
+            "Inspect CAN interface state, bus-off counters, wiring, and kernel logs.",
+            "local_full_stop",
+            "\"errno\":" + std::to_string(socket_.last_errno()) +
+                ",\"consecutive_failures\":" +
                 std::to_string(consecutive_send_failures) +
                 ",\"failed_ids_count\":" +
-                std::to_string(failed_send_ids.size()),
-            true);
+                std::to_string(failed_send_ids.size()) + "," +
+                failed_ids.str());
       }
 
       next_tick += std::chrono::milliseconds(mine_teleop::vcu::kTransmitPeriodMs);
@@ -1085,6 +1535,11 @@ class BridgeRuntime {
         if (now >= next_deadline_log) {
           logger_.event(
               "tx_deadline_miss",
+              "\"issue_code\":\"vcu_tx_deadline_missed\","
+              "\"stage\":\"vcu_tx_scheduler\","
+              "\"retryable\":true,"
+              "\"operator_action\":\"Check CPU scheduling latency and system load\","
+              "\"safety_action\":\"monitor_and_stop_if_repeated\","
               "\"lag_ms\":" + std::to_string(lag_ms),
               false);
           next_deadline_log = now + std::chrono::seconds(1);
@@ -1109,6 +1564,13 @@ class BridgeRuntime {
   std::uint64_t last_polled_generation_{0};
   int io_error_{0};
   bool software_estop_{false};
+  std::uint64_t ignored_rx_count_{0};
+  std::uint32_t last_ignored_rx_id_{0};
+  std::uint64_t special_rx_count_{0};
+  canid_t last_special_rx_flags_{0};
+  Clock::time_point next_ignored_rx_log_{};
+  Clock::time_point last_operation_rejection_log_{};
+  std::string last_operation_rejection_code_;
   MineTeleopChassisFeedback last_feedback_{};
   MineTeleopChassisTelemetry telemetry_{0.0, 1, 0.0, 0.0, 0.0, 0};
 };
@@ -1120,10 +1582,28 @@ std::unique_ptr<BridgeRuntime> g_runtime;
 extern "C" int mine_teleop_chassis_open(const char* can_interface) {
   try {
     std::lock_guard<std::mutex> lock(g_api_mutex);
-    if (can_interface == nullptr || can_interface[0] == '\0' || g_runtime) return -1;
+    if (can_interface == nullptr || can_interface[0] == '\0' || g_runtime) {
+      emit_bridge_diagnostic(
+          "vehicle_vcu_start_failed",
+          g_runtime ? "vcu_bridge_already_open" : "vcu_can_interface_invalid",
+          "bridge_open",
+          g_runtime ? "VCU bridge is already open" : "CAN interface name is empty",
+          g_runtime
+              ? "Close the existing bridge instance before opening another."
+              : "Configure a non-empty SocketCAN interface such as can0.");
+      return -1;
+    }
 
     VehicleParam vehicle = make_vehicle_param();
-    if (!Initialize(vehicle, can_interface)) return -2;
+    if (!Initialize(vehicle, can_interface)) {
+      emit_bridge_diagnostic(
+          "vehicle_vcu_start_failed",
+          "chassis_control_initialize_failed",
+          "chassis_control_initialize",
+          "ChassisControl Initialize returned false",
+          "Check ChassisControl dependencies, vehicle parameters, and CAN channel configuration.");
+      return -2;
+    }
 
     const std::array<double, mine_teleop::vcu::kSteeringAxisCount> zero_steering{};
     if (!UpdateVehicleState(make_vehicle_state(
@@ -1133,6 +1613,12 @@ extern "C" int mine_teleop_chassis_open(const char* can_interface) {
             -8.0,
             zero_steering.data(),
             static_cast<int>(zero_steering.size())))) {
+      emit_bridge_diagnostic(
+          "vehicle_vcu_start_failed",
+          "chassis_control_emergency_seed_failed",
+          "chassis_control_initial_command",
+          "ChassisControl rejected the emergency-stop seed state",
+          "Check ChassisControl input ranges and units.");
       return -2;
     }
     const auto emergency = command_from_chassis_control(1);
@@ -1144,6 +1630,12 @@ extern "C" int mine_teleop_chassis_open(const char* can_interface) {
             0.0,
             zero_steering.data(),
             static_cast<int>(zero_steering.size())))) {
+      emit_bridge_diagnostic(
+          "vehicle_vcu_start_failed",
+          "chassis_control_initial_seed_failed",
+          "chassis_control_initial_command",
+          "ChassisControl rejected the initial neutral seed state",
+          "Check ChassisControl input ranges and units.");
       return -2;
     }
     const auto initial = command_from_chassis_control(1);
@@ -1153,7 +1645,21 @@ extern "C" int mine_teleop_chassis_open(const char* can_interface) {
     if (start_result != 0) return start_result;
     g_runtime = std::move(runtime);
     return 0;
+  } catch (const std::exception& error) {
+    emit_bridge_diagnostic(
+        "vehicle_vcu_start_failed",
+        "vcu_bridge_open_exception",
+        "bridge_open",
+        error.what(),
+        "Check the exception and bridge/ChassisControl runtime dependencies.");
+    return -5;
   } catch (...) {
+    emit_bridge_diagnostic(
+        "vehicle_vcu_start_failed",
+        "vcu_bridge_open_unknown_exception",
+        "bridge_open",
+        "unknown non-standard exception",
+        "Check bridge/ChassisControl runtime dependencies.");
     return -5;
   }
 }
@@ -1168,6 +1674,13 @@ extern "C" int mine_teleop_chassis_apply_state(
     std::lock_guard<std::mutex> lock(g_api_mutex);
     if (!g_runtime || steering_values == nullptr || steering_count < 0 ||
         target_gear < 1 || target_gear > 4) {
+      if (g_runtime) {
+        g_runtime->log_api_failure(
+            "bridge_apply_state",
+            "vcu_apply_arguments_invalid",
+            "invalid gear, steering pointer, or steering count",
+            "Check the runtime-to-bridge ABI arguments and configured steering axes.");
+      }
       return -1;
     }
     if (target_gear == 4) return g_runtime->request_park() ? 0 : -3;
@@ -1179,9 +1692,38 @@ extern "C" int mine_teleop_chassis_apply_state(
         target_ax,
         steering_values,
         steering_count);
-    if (!UpdateVehicleState(state)) return -2;
+    if (!UpdateVehicleState(state)) {
+      g_runtime->log_api_failure(
+          "chassis_control_update",
+          "chassis_control_update_failed",
+          "ChassisControl UpdateVehicleState returned false",
+          "Check command ranges, units, and current ChassisControl state.");
+      return -2;
+    }
     return g_runtime->apply(command_from_chassis_control(target_gear)) ? 0 : -3;
+  } catch (const std::exception& error) {
+    if (g_runtime) {
+      g_runtime->log_api_failure(
+          "bridge_apply_state",
+          "vcu_apply_exception",
+          error.what(),
+          "Check ChassisControl output size/values and the bridge ABI.");
+    } else {
+      emit_bridge_diagnostic(
+          "vehicle_vcu_api_failed",
+          "vcu_apply_exception",
+          "bridge_apply_state",
+          error.what(),
+          "Check ChassisControl output size/values and the bridge ABI.");
+    }
+    return -5;
   } catch (...) {
+    emit_bridge_diagnostic(
+        "vehicle_vcu_api_failed",
+        "vcu_apply_unknown_exception",
+        "bridge_apply_state",
+        "unknown non-standard exception",
+        "Check the bridge and ChassisControl runtime.");
     return -5;
   }
 }
