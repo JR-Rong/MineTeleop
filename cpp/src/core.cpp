@@ -642,6 +642,51 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
     camera.capture_width = optional<int>(node, "capture_width", 1280);
     camera.capture_height = optional<int>(node, "capture_height", 720);
     camera.capture_fps = optional<int>(node, "capture_fps", 30);
+    const auto imaging = node["imaging"];
+    if (imaging) {
+      if (!imaging.IsMap()) throw std::runtime_error(camera.id + ".imaging must be a map");
+      camera.imaging.auto_exposure = optional<bool>(imaging, "auto_exposure", false);
+      camera.imaging.auto_gain = optional<bool>(imaging, "auto_gain", false);
+      camera.imaging.target_luma = optional<int>(imaging, "target_luma", 80);
+      camera.imaging.luma_deadband = optional<int>(imaging, "luma_deadband", 8);
+      camera.imaging.exposure_min_us = optional<double>(imaging, "exposure_min_us", 100.0);
+      camera.imaging.exposure_max_us = optional<double>(imaging, "exposure_max_us", 12000.0);
+      camera.imaging.gain_min_fraction = optional<double>(imaging, "gain_min_fraction", 0.0);
+      camera.imaging.gain_max_fraction = optional<double>(imaging, "gain_max_fraction", 0.35);
+      camera.imaging.update_interval_frames = optional<int>(imaging, "update_interval_frames", 6);
+      camera.imaging.metering = optional<std::string>(imaging, "metering", "full");
+    }
+    if (camera.capture_width <= 0 || camera.capture_height <= 0 || camera.capture_fps <= 0) {
+      throw std::runtime_error(camera.id + " capture dimensions and fps must be positive");
+    }
+    if (camera.imaging.auto_exposure || camera.imaging.auto_gain) {
+      if (camera.imaging.target_luma < 1 || camera.imaging.target_luma > 254 ||
+          camera.imaging.luma_deadband < 0 || camera.imaging.luma_deadband > 64 ||
+          camera.imaging.target_luma - camera.imaging.luma_deadband < 0 ||
+          camera.imaging.target_luma + camera.imaging.luma_deadband > 255) {
+        throw std::runtime_error(camera.id + " imaging target_luma/deadband is out of range");
+      }
+      if (camera.imaging.update_interval_frames <= 0 ||
+          camera.imaging.update_interval_frames > camera.capture_fps * 10) {
+        throw std::runtime_error(camera.id + " imaging update_interval_frames is out of range");
+      }
+      if (camera.imaging.metering != "center" && camera.imaging.metering != "full") {
+        throw std::runtime_error(camera.id + " imaging metering must be center or full");
+      }
+    }
+    if (camera.imaging.auto_exposure) {
+      const auto frame_period_us = 1000000.0 / static_cast<double>(camera.capture_fps);
+      if (camera.imaging.exposure_min_us <= 0.0 ||
+          camera.imaging.exposure_max_us < camera.imaging.exposure_min_us ||
+          camera.imaging.exposure_max_us > frame_period_us * 0.9) {
+        throw std::runtime_error(camera.id + " imaging exposure bounds do not preserve the configured frame rate");
+      }
+    }
+    if (camera.imaging.auto_gain &&
+        (camera.imaging.gain_min_fraction < 0.0 || camera.imaging.gain_max_fraction > 1.0 ||
+         camera.imaging.gain_max_fraction < camera.imaging.gain_min_fraction)) {
+      throw std::runtime_error(camera.id + " imaging gain fractions must satisfy 0 <= min <= max <= 1");
+    }
     camera.realtime_profile = required<std::string>(node, "realtime_profile", camera.id);
     camera.record_profile = optional<std::string>(node, "record_profile", "");
     static_cast<void>(config.realtime_profile(camera.realtime_profile));

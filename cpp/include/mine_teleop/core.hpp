@@ -205,6 +205,19 @@ struct MediaProfile {
   int segment_seconds{60};
 };
 
+struct CameraImagingConfig {
+  bool auto_exposure{false};
+  bool auto_gain{false};
+  int target_luma{80};
+  int luma_deadband{8};
+  double exposure_min_us{100.0};
+  double exposure_max_us{12000.0};
+  double gain_min_fraction{0.0};
+  double gain_max_fraction{0.35};
+  int update_interval_frames{6};
+  std::string metering{"full"};
+};
+
 struct CameraConfig {
   std::string id;
   bool enabled{true};
@@ -214,6 +227,7 @@ struct CameraConfig {
   int capture_fps{30};
   std::string realtime_profile;
   std::string record_profile;
+  CameraImagingConfig imaging;
 };
 
 struct RecordingConfig {

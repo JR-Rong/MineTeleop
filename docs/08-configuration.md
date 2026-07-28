@@ -256,6 +256,40 @@ pipeline。控制端按车端 offer 中实际声明的轨道逐路渲染，云�
 信令，不决定路数。当前没有“控制端临时勾选部分轨道”的运行时协商；增减路数需要
 修改车端配置并重启车端媒体会话。
 
+Basler/Aravis 相机可以在车端启用有边界的自动曝光和自动增益；UVC 相机不会读取
+`imaging` 配置：
+
+```yaml
+cameras:
+  - id: basler_25192546
+    enabled: true
+    device: basler:serial=25192546
+    capture_width: 1280
+    capture_height: 720
+    capture_fps: 30
+    realtime_profile: realtime_720p30
+    imaging:
+      auto_exposure: true
+      auto_gain: true
+      target_luma: 80
+      luma_deadband: 8
+      exposure_min_us: 100
+      exposure_max_us: 20000
+      gain_min_fraction: 0.0
+      gain_max_fraction: 1.0
+      update_interval_frames: 6
+      metering: full
+```
+
+`target_luma` 使用 0–255 灰度尺度；`luma_deadband` 和
+`update_interval_frames` 用于软件回退环路，避免亮度在目标附近来回振荡并限制调节频率。
+`exposure_max_us` 必须小于单帧周期的 90%，以免自动提亮造成帧率下降和严重拖影。
+增益上下限按相机自身 GenICam 增益范围的比例计算，避免把不同型号的原始增益单位
+当成统一 dB。`metering: full` 优先使用相机原生自动控制；如果相机缺少可设置的
+目标或上下限节点，会自动退回车端桥接进程的软件调节。`metering: center` 始终使用
+中心区域的软件测光。两种模式都只在车端改变 Basler 曝光/增益，并把约每 5 秒一次
+的亮度、曝光和增益诊断写到 media 日志，不会污染标准输出中的 JPEG 数据。
+
 `cameras[].enabled` 必须写成 YAML/TOML boolean `true`/`false`，不能用带引号字符串。
 
 `hardware.can.interface` 是车端 adapter、MinePilot CAN smoke 和目标主机验收计划共同使用的
