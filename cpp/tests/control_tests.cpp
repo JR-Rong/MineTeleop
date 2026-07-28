@@ -339,7 +339,7 @@ void test_control_page_contract() {
   request.path = "/";
   const auto response = app.handle(request);
   expect(response.status == 200, "control page did not load");
-  expect(response.body.find("Mine Teleop WebRTC 控制台") != std::string::npos, "control page identity is missing");
+  expect(response.body.find("Mine Teleop 控制台") != std::string::npos, "control page identity is missing");
   expect(response.body.find("rel=\"icon\" href=\"data:,\"") != std::string::npos, "control page triggers a favicon 404");
   expect(response.body.find("登录并加载车辆") != std::string::npos, "driver login UI is missing");
   expect(response.body.find("授权车辆") != std::string::npos, "authorized vehicle selector is missing");
@@ -353,7 +353,42 @@ void test_control_page_contract() {
       response.body.find("controlAuthorityLost=false;webrtcLabel.textContent='未连接'") != std::string::npos,
       "successful reauthentication leaves a stale lost-authority label visible");
   expect(response.body.find("navigator.getGamepads") != std::string::npos, "Gamepad discovery is missing");
-  expect(response.body.find("开始量程校准") != std::string::npos, "Gamepad range calibration is missing");
+  expect(
+      response.body.find("id=\"gamepad-panel\"") == std::string::npos &&
+          response.body.find("未检测到 Gamepad") == std::string::npos &&
+          response.body.find("id=\"keyboard-panel\"") != std::string::npos,
+      "the obsolete Gamepad status panel was not replaced by keyboard control feedback");
+  expect(
+      response.body.find("class=\"workspace\"") != std::string::npos &&
+          response.body.find("class=\"sidebar\"") != std::string::npos &&
+          response.body.find("html,body{height:100%;overflow:hidden}") != std::string::npos,
+      "the control page is not organized as a single-screen workspace with a monitoring sidebar");
+  expect(
+      response.body.find("id=\"control-steering\"") != std::string::npos &&
+          response.body.find("id=\"control-throttle\"") != std::string::npos &&
+          response.body.find("id=\"control-brake\"") != std::string::npos &&
+          response.body.find("function renderControlState()") != std::string::npos,
+      "live steering, throttle, and brake feedback is missing");
+  expect(
+      response.body.find("ArrowLeft:'left',KeyA:'left'") != std::string::npos &&
+          response.body.find("ArrowRight:'right',KeyD:'right'") != std::string::npos &&
+          response.body.find("ArrowUp:'up',KeyW:'up'") != std::string::npos &&
+          response.body.find("ArrowDown:'down',KeyS:'down'") != std::string::npos &&
+          response.body.find("Space:'brake'") != std::string::npos,
+      "direction keys, WASD, and Space are not mapped to the shared control state");
+  const auto keyboard_handler = response.body.find("addEventListener('keydown'");
+  const auto keyboard_prevent_default = response.body.find("e.preventDefault()", keyboard_handler);
+  const auto keyboard_connection_gate = response.body.find("if(!polling)", keyboard_handler);
+  expect(
+      keyboard_handler != std::string::npos &&
+          keyboard_prevent_default != std::string::npos &&
+          keyboard_connection_gate != std::string::npos &&
+          keyboard_prevent_default < keyboard_connection_gate,
+      "control keys can still scroll the page before the connection gate runs");
+  expect(
+      response.body.find("lastKeyboardEvent.textContent") != std::string::npos &&
+          response.body.find("已截获 · 等待连接") != std::string::npos,
+      "keyboard capture does not provide visible operator feedback");
   expect(
       response.body.find("开始平行驾驶握手") != std::string::npos &&
           response.body.find("断开 VCU 握手") != std::string::npos,
@@ -414,7 +449,10 @@ void test_control_page_contract() {
       "a transient vehicle-list refresh failure can discard current authority");
   expect(response.body.find("post('/api/end-session'") != std::string::npos, "failed connection setup cannot release only its session");
   expect(response.body.find("pollSignaling(generation)") != std::string::npos, "stale signaling pollers are not isolated across vehicle switches");
-  expect(response.body.find("Gamepad 已断开（输出已归零）") != std::string::npos, "Gamepad disconnect does not expose the safe-zero state");
+  expect(
+      response.body.find("gamepaddisconnected") != std::string::npos &&
+          response.body.find("clearControlInput();clientLog('gamepad_disconnected'") != std::string::npos,
+      "Gamepad disconnect does not preserve the safe-zero behavior");
   expect(response.body.find("车辆必须本地确认后才能复位") != std::string::npos, "ESTOP latch feedback is missing");
   expect(response.body.find("运行监控") != std::string::npos, "operator monitoring panel is missing");
   expect(response.body.find("控制 RTT") != std::string::npos, "control RTT display is missing");
