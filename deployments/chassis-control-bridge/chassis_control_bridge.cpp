@@ -890,7 +890,7 @@ class BridgeRuntime {
         "parallel_handshake_requested",
         "\"issue_code\":\"vcu_handshake_requested\","
         "\"stage\":\"vcu_handshake_request\","
-        "\"operator_action\":\"Wait for VCU handshake state 6 and all actuator readiness feedback\","
+        "\"operator_action\":\"Wait for reused intelligent-driving handshake state 5 and all actuator readiness feedback\","
         "\"safety_action\":\"remain_stopped_until_ready\","
         "\"from\":\"" +
             std::string(mine_teleop::vcu::state_name(state_before)) +

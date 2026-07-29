@@ -62,9 +62,9 @@ mkdir -p "$(dirname "$output_root")"
 third_party_runtime_source="from-source"
 third_party_runtime_sha256="none"
 if [[ -z "$base_bundle_archive" ]]; then
-  if [[ ! -s "$chassis_bridge" || ! -s "$chassis_control" ]]; then
-    "$script_dir/prepare_chassis_runtime.sh"
-  fi
+  # The bridge compiles cpp/src/vcu.cpp into the shared object. Rebuild it for
+  # every source bundle so an existing vendor artifact cannot hide VCU changes.
+  "$script_dir/prepare_chassis_runtime.sh"
   if [[ ! -s "$chassis_bridge" || ! -s "$chassis_control" ]]; then
     printf 'required chassis runtime was not prepared under: %s\n' \
       "$chassis_vendor_dir" >&2

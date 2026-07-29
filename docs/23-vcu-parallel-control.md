@@ -14,10 +14,11 @@ CAN/VCU，因此已经完成的是协议编解码、状态机、20 ms 调度和�
 - `deployments/chassis-control-bridge/chassis_control_bridge.cpp`
 - `cpp/tests/vcu_tests.cpp`
 
-MinePilot 用于核对 SocketCAN 接收、反馈报文和单位；ChassisControl 用于核对八轮
-控制量、启动/退出顺序。运行时不再使用两者的旧 CAN 编解码和旧启动状态机，因为
-它们仍按智能驾驶 `ShakeReq=2 -> status=5` 工作，且 EPB 转发状态的枚举与本次
-DBC 不一致。
+MinePilot ControlUI 用于核对 SocketCAN 接收、反馈报文和实际操作顺序；
+ChassisControl 用于核对八轮控制量、启动/退出状态机。平行驾驶功能按 VCU 联调
+要求复用两者已经验证的智能驾驶握手步骤 `ShakeReq=2 -> status=5`，但仍使用
+本仓库基于 20260714 协议实现的 CAN 编解码和 EPB 枚举，不能照搬旧代码中不一致
+的 EPB 反馈值。
 
 ## 报文与状态机
 
@@ -29,7 +30,7 @@ DBC 不一致。
 | EPS01/03 | `0x18F8D0F5`, `0x18F9D0F5` | 2 | 四轴模式、角度、角速度 |
 | EHB01/02 | `0x18FFD0F5`, `0x18FAD0F5` | 2 | 八路模式、制动压力 |
 | EPB | `0x18FBD0F5` | 1 | 四路保持/释放/驻车、转向模式 |
-| Shake | `0x18FCD0F5` | 1 | 挡位、平行握手、故障复位 |
+| Shake | `0x18FCD0F5` | 1 | 挡位、智驾握手、故障复位 |
 | Body/VehSpd | `0x18FDD0F5`, `0x18FED0F5` | 2 | 当前保留为无请求 |
 
 车端启动 CAN bridge 后只进入 `standby`，继续发送 20 ms 的低请求报文，但不会
@@ -49,7 +50,8 @@ N/R/D 三个挡位；电子驻车通过四路 EPB 状态单独判断，不能用
 启动顺序：
 
 1. 满足上述门槛并收到显式开始命令后，连续发送 5 个周期的低握手和受限控制量。
-2. 发送 `CloudShakeReq=2`，等待 `WVCU_ShakeHandSts=6`。
+2. 复用智驾握手：发送 `ShakeReq=2`、保持 `CloudShakeReq=0`，等待
+   `WVCU_ShakeHandSts=5`。
 3. 发送 EPB 释放请求 1，等待四路转发状态都为 1。
 4. 发送 N/R/D 挡位和 EPS/EHB 模式，等待挡位反馈。
 5. 发送八路 MCU 扭矩模式，等待 MCU/EPS/EHB 全部模式反馈为 1。
@@ -62,7 +64,7 @@ N/R/D 三个挡位；电子驻车通过四路 EPB 状态单独判断，不能用
    0.1 m/s。
 3. 请求 N 并等待 N 反馈。
 4. 请求四路 EPB 驻车值 2，并等待四路状态都为 2。
-5. 清除 `CloudShakeReq`，等待人工状态 3。
+5. 清除 `ShakeReq`，等待人工状态 3。
 
 控制端通过同一条双向 DataChannel 每 500 ms 接收
 `vcu_handshake_status`，可见 N/R/D 选择器、车速、EPB、VCU 状态、当前状态机阶段

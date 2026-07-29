@@ -51,9 +51,9 @@ command -v docker >/dev/null 2>&1 || die "Docker Desktop or Colima is required"
 docker info >/dev/null 2>&1 || die "Docker is not running"
 docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
 
-if [[ ! -s "$chassis_bridge" || ! -s "$chassis_control" ]]; then
-  "$script_dir/prepare_chassis_runtime.sh"
-fi
+# The bridge compiles cpp/src/vcu.cpp into the shared object. Rebuild it for
+# every source bundle so an existing vendor artifact cannot hide VCU changes.
+"$script_dir/prepare_chassis_runtime.sh"
 [[ -s "$chassis_bridge" ]] || {
   die "required chassis bridge was not prepared: $chassis_bridge"
 }
