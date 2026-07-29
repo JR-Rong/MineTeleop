@@ -199,6 +199,7 @@ hardware:
   can:
     interface: can0
     bitrate: 500000
+    tx_queue_length: 100
     restart_ms: 100
     probe_timeout_seconds: 3
   encoding:
@@ -262,9 +263,13 @@ pipeline。控制端按车端 offer 中实际声明的轨道逐路渲染，云�
 
 `hardware.can.interface` 是车端 adapter、MinePilot CAN smoke 和目标主机验收计划共同使用的
 SocketCAN 接口名；真实 adapter 配置中
-`vehicle_adapter.integration.chassis_control.can_interface` 必须与它一致。`hardware.can.bitrate`
-用于现场 CAN 口配置记录和部署命令，应用进程不会自动改 Linux netdev，需要现场用 `ip link`
-按该值配置。
+`vehicle_adapter.integration.chassis_control.can_interface` 必须与它一致。
+`hardware.can.bitrate` 是运行时必须核对的仲裁波特率，`hardware.can.tx_queue_length`
+是运行时设置并复核的 Linux 发送队列长度。应用不会为修改波特率而自动把正在工作的
+CAN netdev 置为 DOWN：部署阶段仍需先用 `ip link` 按配置设置波特率并置为 UP；实际波特率
+不匹配或接口未 UP 时，真实 adapter 会拒绝启动并报告明确错误。JYR010 bridge 每周期突发
+16 个扩展帧，因此真实 adapter 的 `tx_queue_length` 不得小于 16，现场推荐 100。若实际
+队列长度不同，运行时设置该值需要 root 或 `CAP_NET_ADMIN`。
 
 `hardware.encoding` 暴露硬件编码与实时验收变量。`preferred_encoder=nvenc`、
 `fallback_encoder=vaapi` 定义后端顺序；`preferred_codec=h265`、

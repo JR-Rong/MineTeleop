@@ -84,6 +84,7 @@ hardware:
   can:
     interface: can0
     bitrate: 500000
+    tx_queue_length: 100
     restart_ms: 100
     probe_timeout_seconds: 3
   encoding:

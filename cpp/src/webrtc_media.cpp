@@ -833,6 +833,8 @@ struct VehicleMediaRuntime::Impl {
           true,
           {{"adapter_type", config.vehicle_adapter.type},
            {"can_interface", config.vehicle_adapter.can_interface},
+           {"can_bitrate", config.hardware.can_bitrate},
+           {"can_tx_queue_length", config.hardware.can_tx_queue_length},
            {"bridge_library_path", config.vehicle_adapter.bridge_library_path.string()}});
     } catch (const std::exception& error) {
       emit_diagnostic(
@@ -840,17 +842,21 @@ struct VehicleMediaRuntime::Impl {
           "vcu_adapter_start_failed",
           "vcu_adapter_start",
           error.what(),
-          "Check the adapter type, bridge library and dependencies, CAN interface, and VCU log path.",
+          "Check the adapter type, bridge library and dependencies, CAN interface state and bitrate, "
+          "configured tx queue length, and VCU log path.",
           false,
           {{"adapter_type", config.vehicle_adapter.type},
            {"can_interface", config.vehicle_adapter.can_interface},
+           {"can_bitrate", config.hardware.can_bitrate},
+           {"can_tx_queue_length", config.hardware.can_tx_queue_length},
            {"bridge_library_path", config.vehicle_adapter.bridge_library_path.string()},
            {"safety_action", "control_not_started"}});
       set_pipeline_error(
           "VCU adapter start failed: " + std::string(error.what()),
           "vcu_adapter_start_failed",
           "vcu_adapter_start",
-          "Check the adapter type, bridge library and dependencies, CAN interface, and VCU log path.",
+          "Check the adapter type, bridge library and dependencies, CAN interface state and bitrate, "
+          "configured tx queue length, and VCU log path.",
           false);
       throw;
     }

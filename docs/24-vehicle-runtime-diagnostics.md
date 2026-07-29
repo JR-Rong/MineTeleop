@@ -93,7 +93,7 @@ stderr；协议细节与高频 CAN 证据写入
 | `vehicle_media_pipeline_failed` / `gstreamer_webrtcbin_missing` | pipeline 中找不到 webrtcbin | backend/codec | 每个 candidate 一次 |
 | `vehicle_media_pipeline_failed` / `webrtc_ice_server_config_failed` | TURN 凭据/URI/add-turn-server 失败 | `error` | 每个 candidate 一次 |
 | `vehicle_media_pipeline_failed` / `gstreamer_ready_state_failed` | pipeline 不能进入 READY | backend/codec | 每个 candidate 一次 |
-| `vehicle_vcu_adapter_start_failed` / `vcu_adapter_start_failed` | 动态库、符号、CAN、日志路径或 adapter open 失败 | adapter/interface/library | 每个 candidate 一次 |
+| `vehicle_vcu_adapter_start_failed` / `vcu_adapter_start_failed` | 动态库、符号、CAN、日志路径或 adapter open 失败 | adapter/interface/bitrate/tx queue/library | 每个 candidate 一次 |
 | `vehicle_media_pipeline_failed` / `control_data_channel_create_failed` | webrtcbin 未创建 SCTP DataChannel | `error` | 每个 candidate 一次 |
 | `vehicle_media_pipeline_failed` / `gstreamer_camera_lane_incomplete` | 某路 appsrc/encoder 元素缺失 | `camera_id`, `device` | 即时 |
 | `vehicle_media_pipeline_failed` / `gstreamer_playing_state_failed` | pipeline 不能进入 PLAYING | backend/codec | 每个 candidate 一次 |
@@ -126,7 +126,7 @@ stderr；协议细节与高频 CAN 证据写入
 
 | `event` / `issue_code` | 触发条件 | 去哪里看 |
 | --- | --- | --- |
-| `vehicle_vcu_adapter_start_failed` / `vcu_adapter_start_failed` | dlopen、ABI symbol、bridge open 任一步失败 | runtime stderr |
+| `vehicle_vcu_adapter_start_failed` / `vcu_adapter_start_failed` | dlopen、ABI symbol、接口未 UP、波特率不匹配、发送队列设置或 bridge open 任一步失败 | runtime stderr |
 | `vehicle_vcu_start_failed` / `vcu_can_interface_invalid` | CAN interface 为空 | runtime stderr |
 | `vehicle_vcu_start_failed` / `vcu_bridge_already_open` | 重复 open | runtime stderr |
 | `vehicle_vcu_start_failed` / `chassis_control_initialize_failed` | `Initialize` 返回 false | runtime stderr |

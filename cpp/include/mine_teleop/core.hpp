@@ -244,6 +244,7 @@ struct VehicleAdapterConfig {
 struct HardwareConfig {
   std::string can_interface{"can0"};
   int can_bitrate{500000};
+  int can_tx_queue_length{100};
   std::filesystem::path vaapi_render_device{"/dev/dri/renderD128"};
   std::filesystem::path dri_card_device{"/dev/dri/card1"};
   std::string preferred_encoder{"nvenc"};
@@ -311,6 +312,8 @@ struct VehicleAdapterStatus {
   std::uint64_t safe_stop_count{0};
   std::string last_error;
   bool feedback_ready{false};
+  int can_bitrate{0};
+  int can_tx_queue_length{0};
 
   [[nodiscard]] Json to_json() const;
 };
@@ -373,7 +376,12 @@ class MockVehicleAdapter final : public VehicleAdapter {
 
 class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
  public:
-  DynamicLibraryVehicleAdapter(std::filesystem::path library_path, std::string can_interface, double max_speed_mps);
+  DynamicLibraryVehicleAdapter(
+      std::filesystem::path library_path,
+      std::string can_interface,
+      int can_bitrate,
+      int can_tx_queue_length,
+      double max_speed_mps);
   ~DynamicLibraryVehicleAdapter() override;
 
   void open() override;
@@ -394,6 +402,8 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
 
   std::filesystem::path library_path_;
   std::string can_interface_;
+  int can_bitrate_;
+  int can_tx_queue_length_;
   double max_speed_mps_;
   void* handle_{nullptr};
   bool opened_{false};

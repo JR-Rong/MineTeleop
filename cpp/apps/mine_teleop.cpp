@@ -728,6 +728,10 @@ int run_vehicle_runtime(const Arguments& arguments) {
                    {"control_transport", config.runtime.control_enabled ? "webrtc_data_channel" : "disabled"},
                    {"media_enabled", config.runtime.media_enabled},
                    {"recording_enabled", config.recording.enabled},
+                   {"vehicle_adapter_type", config.vehicle_adapter.type},
+                   {"can_interface", config.hardware.can_interface},
+                   {"can_bitrate", config.hardware.can_bitrate},
+                   {"can_tx_queue_length", config.hardware.can_tx_queue_length},
                }).dump()
             << std::endl;
 

@@ -1,9 +1,12 @@
 #include "mine_teleop/core.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -13,6 +16,18 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#endif
+
+#if defined(__linux__)
+#include <linux/can/netlink.h>
+#include <linux/if_link.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/sockios.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 #include <yaml-cpp/yaml.h>
@@ -166,6 +181,211 @@ void unload_dynamic_library(void* handle) {
   dlclose(handle);
 #endif
 }
+
+#if defined(__linux__)
+
+class ScopedFileDescriptor {
+ public:
+  explicit ScopedFileDescriptor(int value) : value_(value) {}
+  ~ScopedFileDescriptor() {
+    if (value_ >= 0) ::close(value_);
+  }
+
+  ScopedFileDescriptor(const ScopedFileDescriptor&) = delete;
+  ScopedFileDescriptor& operator=(const ScopedFileDescriptor&) = delete;
+
+  [[nodiscard]] int get() const { return value_; }
+
+ private:
+  int value_;
+};
+
+std::runtime_error socketcan_system_error(
+    std::string_view operation,
+    std::string_view interface,
+    int error_number = errno) {
+  return std::runtime_error(
+      "SocketCAN " + std::string(operation) + " failed for interface " +
+      std::string(interface) + ": " + std::strerror(error_number) +
+      " (errno " + std::to_string(error_number) + ")");
+}
+
+int socketcan_bitrate(int interface_index, std::string_view interface) {
+  ScopedFileDescriptor socket_fd(
+      ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE));
+  if (socket_fd.get() < 0) {
+    throw socketcan_system_error("netlink socket", interface);
+  }
+
+  struct LinkRequest {
+    nlmsghdr header;
+    ifinfomsg link;
+  };
+  LinkRequest request{};
+  request.header.nlmsg_len = NLMSG_LENGTH(sizeof(ifinfomsg));
+  request.header.nlmsg_type = RTM_GETLINK;
+  request.header.nlmsg_flags = NLM_F_REQUEST;
+  request.header.nlmsg_seq = 1;
+  request.link.ifi_family = AF_UNSPEC;
+  request.link.ifi_index = interface_index;
+
+  sockaddr_nl kernel{};
+  kernel.nl_family = AF_NETLINK;
+  if (::sendto(
+          socket_fd.get(),
+          &request,
+          request.header.nlmsg_len,
+          0,
+          reinterpret_cast<const sockaddr*>(&kernel),
+          sizeof(kernel)) < 0) {
+    throw socketcan_system_error("bitrate query", interface);
+  }
+
+  std::array<char, 8192> response{};
+  while (true) {
+    const ssize_t received = ::recv(socket_fd.get(), response.data(), response.size(), 0);
+    if (received < 0) {
+      if (errno == EINTR) continue;
+      throw socketcan_system_error("bitrate response", interface);
+    }
+    if (received == 0) {
+      throw std::runtime_error(
+          "SocketCAN bitrate query returned an empty response for interface " +
+          std::string(interface));
+    }
+
+    int remaining = static_cast<int>(received);
+    for (auto* message = reinterpret_cast<nlmsghdr*>(response.data());
+         NLMSG_OK(message, remaining);
+         message = NLMSG_NEXT(message, remaining)) {
+      if (message->nlmsg_seq != request.header.nlmsg_seq) continue;
+      if (message->nlmsg_type == NLMSG_ERROR) {
+        const auto* error = reinterpret_cast<const nlmsgerr*>(NLMSG_DATA(message));
+        if (error->error == 0) continue;
+        throw socketcan_system_error("bitrate query", interface, -error->error);
+      }
+      if (message->nlmsg_type == NLMSG_DONE) {
+        throw std::runtime_error(
+            "SocketCAN bitrate is unavailable for interface " +
+            std::string(interface));
+      }
+      if (message->nlmsg_type != RTM_NEWLINK) continue;
+
+      const auto* link = reinterpret_cast<const ifinfomsg*>(NLMSG_DATA(message));
+      if (link->ifi_index != interface_index) continue;
+
+      std::string link_kind;
+      std::optional<int> bitrate;
+      int attributes_length = IFLA_PAYLOAD(message);
+      for (auto* attribute = IFLA_RTA(link);
+           RTA_OK(attribute, attributes_length);
+           attribute = RTA_NEXT(attribute, attributes_length)) {
+        if (attribute->rta_type != IFLA_LINKINFO) continue;
+        int link_info_length = RTA_PAYLOAD(attribute);
+        for (auto* link_info = reinterpret_cast<rtattr*>(RTA_DATA(attribute));
+             RTA_OK(link_info, link_info_length);
+             link_info = RTA_NEXT(link_info, link_info_length)) {
+          if (link_info->rta_type == IFLA_INFO_KIND) {
+            const auto* begin = static_cast<const char*>(RTA_DATA(link_info));
+            const auto* end = begin + RTA_PAYLOAD(link_info);
+            link_kind.assign(begin, std::find(begin, end, '\0'));
+          } else if (link_info->rta_type == IFLA_INFO_DATA) {
+            int can_info_length = RTA_PAYLOAD(link_info);
+            for (auto* can_info = reinterpret_cast<rtattr*>(RTA_DATA(link_info));
+                 RTA_OK(can_info, can_info_length);
+                 can_info = RTA_NEXT(can_info, can_info_length)) {
+              if (can_info->rta_type != IFLA_CAN_BITTIMING ||
+                  RTA_PAYLOAD(can_info) < static_cast<int>(sizeof(can_bittiming))) {
+                continue;
+              }
+              can_bittiming bit_timing{};
+              std::memcpy(&bit_timing, RTA_DATA(can_info), sizeof(bit_timing));
+              bitrate = static_cast<int>(bit_timing.bitrate);
+            }
+          }
+        }
+      }
+      if (link_kind != "can") {
+        throw std::runtime_error(
+            "configured SocketCAN interface " + std::string(interface) +
+            " is not a CAN network device");
+      }
+      if (!bitrate || *bitrate <= 0) {
+        throw std::runtime_error(
+            "SocketCAN bitrate is unavailable for interface " +
+            std::string(interface));
+      }
+      return *bitrate;
+    }
+  }
+}
+
+ifreq socketcan_interface_request(
+    int socket_fd,
+    std::string_view interface,
+    unsigned long operation,
+    std::string_view operation_name) {
+  ifreq request{};
+  std::memcpy(request.ifr_name, interface.data(), interface.size());
+  request.ifr_name[interface.size()] = '\0';
+  if (::ioctl(socket_fd, operation, &request) < 0) {
+    throw socketcan_system_error(operation_name, interface);
+  }
+  return request;
+}
+
+void prepare_socketcan(
+    std::string_view interface,
+    int configured_bitrate,
+    int configured_tx_queue_length) {
+  if (interface.empty() || interface.size() >= IFNAMSIZ) {
+    throw std::runtime_error("configured SocketCAN interface name is invalid");
+  }
+  ScopedFileDescriptor socket_fd(
+      ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+  if (socket_fd.get() < 0) {
+    throw socketcan_system_error("control socket", interface);
+  }
+
+  const auto index_request =
+      socketcan_interface_request(socket_fd.get(), interface, SIOCGIFINDEX, "interface lookup");
+  const auto flags_request =
+      socketcan_interface_request(socket_fd.get(), interface, SIOCGIFFLAGS, "state query");
+  if ((flags_request.ifr_flags & IFF_UP) == 0) {
+    throw std::runtime_error(
+        "configured SocketCAN interface " + std::string(interface) +
+        " is down; bring it up with bitrate " +
+        std::to_string(configured_bitrate) + " before starting the vehicle runtime");
+  }
+
+  const int actual_bitrate = socketcan_bitrate(index_request.ifr_ifindex, interface);
+  if (actual_bitrate != configured_bitrate) {
+    throw std::runtime_error(
+        "SocketCAN bitrate mismatch for interface " + std::string(interface) +
+        ": configured " + std::to_string(configured_bitrate) +
+        ", actual " + std::to_string(actual_bitrate));
+  }
+
+  auto queue_request =
+      socketcan_interface_request(socket_fd.get(), interface, SIOCGIFTXQLEN, "tx queue query");
+  if (queue_request.ifr_qlen != configured_tx_queue_length) {
+    queue_request.ifr_qlen = configured_tx_queue_length;
+    if (::ioctl(socket_fd.get(), SIOCSIFTXQLEN, &queue_request) < 0) {
+      throw socketcan_system_error("tx queue configuration", interface);
+    }
+    queue_request =
+        socketcan_interface_request(socket_fd.get(), interface, SIOCGIFTXQLEN, "tx queue verification");
+    if (queue_request.ifr_qlen != configured_tx_queue_length) {
+      throw std::runtime_error(
+          "SocketCAN tx queue verification failed for interface " +
+          std::string(interface) + ": configured " +
+          std::to_string(configured_tx_queue_length) + ", actual " +
+          std::to_string(queue_request.ifr_qlen));
+    }
+  }
+}
+
+#endif
 
 }  // namespace
 
@@ -559,6 +779,8 @@ Json VehicleConfig::redacted_summary() const {
       {"camera_count", enabled_cameras().size()},
       {"vehicle_adapter_type", vehicle_adapter.type},
       {"can_interface", hardware.can_interface},
+      {"can_bitrate", hardware.can_bitrate},
+      {"can_tx_queue_length", hardware.can_tx_queue_length},
       {"max_speed_kph", field_safety.max_speed_kph},
       {"max_throttle", field_safety.max_throttle},
       {"max_steering_angle_deg", field_safety.max_steering_angle_deg},
@@ -698,6 +920,18 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   const auto can = hardware["can"];
   config.hardware.can_interface = optional<std::string>(can, "interface", "can0");
   config.hardware.can_bitrate = optional<int>(can, "bitrate", 500000);
+  config.hardware.can_tx_queue_length = optional<int>(can, "tx_queue_length", 100);
+  if (config.hardware.can_interface.empty() || config.hardware.can_interface.size() >= 16 ||
+      config.hardware.can_interface.find_first_of("\r\n/") != std::string::npos) {
+    throw std::runtime_error("hardware.can.interface is invalid");
+  }
+  if (config.hardware.can_bitrate <= 0 || config.hardware.can_bitrate > 1000000) {
+    throw std::runtime_error("hardware.can.bitrate must be in [1, 1000000]");
+  }
+  if (config.hardware.can_tx_queue_length <= 0 ||
+      config.hardware.can_tx_queue_length > 65535) {
+    throw std::runtime_error("hardware.can.tx_queue_length must be in [1, 65535]");
+  }
   const auto encoding = hardware["encoding"];
   config.hardware.vaapi_render_device = optional<std::string>(encoding, "vaapi_render_device", "/dev/dri/renderD128");
   config.hardware.dri_card_device = optional<std::string>(encoding, "dri_card_device", "/dev/dri/card1");
@@ -797,6 +1031,11 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   if (config.vehicle_adapter.type != "mock" && config.field_safety.max_speed_kph <= 0.0) {
     throw std::runtime_error("non-mock vehicle adapter requires field_safety.max_speed_kph > 0");
   }
+  if (config.vehicle_adapter.type != "mock" &&
+      config.hardware.can_tx_queue_length < 16) {
+    throw std::runtime_error(
+        "non-mock vehicle adapter requires hardware.can.tx_queue_length >= 16");
+  }
 
   return config;
 }
@@ -813,6 +1052,8 @@ Json VehicleAdapterStatus::to_json() const {
   if (!can_interface.empty()) value["can_interface"] = can_interface;
   if (!library_path.empty()) value["library_path"] = library_path;
   if (!last_error.empty()) value["last_error"] = last_error;
+  if (can_bitrate > 0) value["can_bitrate"] = can_bitrate;
+  if (can_tx_queue_length > 0) value["can_tx_queue_length"] = can_tx_queue_length;
   return value;
 }
 
@@ -875,17 +1116,34 @@ VcuHandshakeStatus MockVehicleAdapter::vcu_handshake_status() const {
 }
 
 VehicleAdapterStatus MockVehicleAdapter::status() const {
-  return {"mock", opened_, true, "", "", applied_command_count_, safe_stop_count_, "", opened_};
+  return {
+      "mock",
+      opened_,
+      true,
+      "",
+      "",
+      applied_command_count_,
+      safe_stop_count_,
+      "",
+      opened_,
+      0,
+      0,
+  };
 }
 
 DynamicLibraryVehicleAdapter::DynamicLibraryVehicleAdapter(
     std::filesystem::path library_path,
     std::string can_interface,
+    int can_bitrate,
+    int can_tx_queue_length,
     double max_speed_mps)
     : library_path_(std::move(library_path)),
       can_interface_(std::move(can_interface)),
+      can_bitrate_(can_bitrate),
+      can_tx_queue_length_(can_tx_queue_length),
       max_speed_mps_(max_speed_mps) {
-  if (library_path_.empty() || can_interface_.empty() || max_speed_mps_ <= 0.0) {
+  if (library_path_.empty() || can_interface_.empty() || can_bitrate_ <= 0 ||
+      can_tx_queue_length_ < 16 || max_speed_mps_ <= 0.0) {
     throw std::invalid_argument("dynamic adapter configuration is incomplete");
   }
 }
@@ -946,9 +1204,17 @@ void DynamicLibraryVehicleAdapter::check_result(int result, std::string_view ope
 }
 
 void DynamicLibraryVehicleAdapter::open() {
-  ensure_loaded();
-  check_result(open_fn_(can_interface_.c_str()), "mine_teleop_chassis_open");
-  opened_ = true;
+  try {
+    ensure_loaded();
+#if defined(__linux__)
+    prepare_socketcan(can_interface_, can_bitrate_, can_tx_queue_length_);
+#endif
+    check_result(open_fn_(can_interface_.c_str()), "mine_teleop_chassis_open");
+    opened_ = true;
+  } catch (const std::exception& error) {
+    last_error_ = error.what();
+    throw;
+  }
 }
 
 void DynamicLibraryVehicleAdapter::close() {
@@ -1069,6 +1335,8 @@ VehicleAdapterStatus DynamicLibraryVehicleAdapter::status() const {
       safe_stop_count_,
       last_error_,
       feedback_ready_,
+      can_bitrate_,
+      can_tx_queue_length_,
   };
 }
 
@@ -1078,6 +1346,8 @@ std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& conf
     return std::make_unique<DynamicLibraryVehicleAdapter>(
         config.vehicle_adapter.bridge_library_path,
         config.vehicle_adapter.can_interface,
+        config.hardware.can_bitrate,
+        config.hardware.can_tx_queue_length,
         config.field_safety.max_speed_kph / 3.6);
   }
   throw std::runtime_error("unsupported vehicle adapter type: " + config.vehicle_adapter.type);

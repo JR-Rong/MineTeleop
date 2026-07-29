@@ -36,7 +36,8 @@ installed path, normally
 The repository field template intentionally keeps `vehicle_adapter.type:
 mock`. On an isolated CAN bench, edit the deployed
 `/opt/mine-teleop/config/vehicle-agent.yaml`: choose `type: can`, set the
-bridge path above and matching `can0`, give `field_safety.max_speed_kph` a
+bridge path above and the same interface declared by `hardware.can.interface`
+(`can1` in the current field template), give `field_safety.max_speed_kph` a
 positive commissioning value, and set the authoritative
 `max_throttle`/`max_steering_angle_deg` limits. The browser limit dialog can
 only reduce those vehicle-side limits.

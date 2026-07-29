@@ -122,8 +122,9 @@ adapter。至少需要：
 ```yaml
 hardware:
   can:
-    interface: can0
+    interface: can1
     bitrate: 500000
+    tx_queue_length: 100
 
 field_safety:
   commissioning_mode: bench
@@ -136,13 +137,13 @@ vehicle_adapter:
   type: can
   integration:
     chassis_control:
-      can_interface: can0
+      can_interface: can1
       bridge_library_path: /opt/mine-teleop/lib/vendor/chassis/libmine_teleop_chassis_bridge.so
 ```
 
 `max_speed_kph` 对非 mock adapter 必须大于 0；当前扭矩模式下它不是可替代 VCU
 限速器的硬件速度闭环。修改后先运行 `config-check`、`--preflight` 和
-`--adapter-status`，确认 bridge、`libchassis_control.so`、`can0` 和日志目录都
+`--adapter-status`，确认 bridge、`libchassis_control.so`、`can1` 和日志目录都
 可用，再连接驾驶员。不得通过把 `require_can_feedback_before_control` 改成
 `false` 绕过反馈门禁。
 
@@ -159,7 +160,8 @@ vehicle_adapter:
 
 必须在车轮离地、动力隔离或同等风险控制的台架上执行，不能直接道路验证。
 
-1. 配置 `can0` 为 500 kbit/s，确认 error-active、无 bus-off、无持续错误计数。
+1. 配置 `can1` 为 500 kbit/s、`txqueuelen 100`，确认 error-active、无 bus-off、
+   无持续错误计数；运行时还会核对接口、波特率并设置发送队列。
 2. 仅启动 bridge，不给驾驶命令；核对 16 个 TX ID、扩展帧标志、8 字节 DLC、
    20 ms 周期和总线负载。
 3. 逐阶段核对日志中的 `state_transition` 与 VCU 反馈：
@@ -173,7 +175,7 @@ vehicle_adapter:
 7. 断开驾驶控制但保持 CAN，确认超时制动；再中断 VCU 反馈，确认 500 ms 通讯
    故障、日志和 VCU 自身超时策略。
 8. 执行正常关闭，确认扭矩归零、零速、N、EPB=2、人工状态 3 的完整退出结果。
-9. 保存日志、`ip -details -statistics link show can0`、VCU 版本、DBC/XLS 版本、
+9. 保存日志、`ip -details -statistics link show can1`、VCU 版本、DBC/XLS 版本、
    车辆载荷、轮胎状态和现场视频，作为验收记录。
 
 任何一步反馈值、方向或执行结果不一致，都应停止后续阶段，保留日志并按具体 CAN

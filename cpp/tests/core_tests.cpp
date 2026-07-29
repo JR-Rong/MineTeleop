@@ -117,7 +117,19 @@ class NoFeedbackAdapter final : public mine_teleop::VehicleAdapter {
   }
   [[nodiscard]] mine_teleop::VehicleTelemetry read_telemetry() override { return {}; }
   [[nodiscard]] mine_teleop::VehicleAdapterStatus status() const override {
-    return {"no_feedback", opened, true, "can0", "", applied_commands, safe_stops, "", false};
+    return {
+        "no_feedback",
+        opened,
+        true,
+        "can0",
+        "",
+        applied_commands,
+        safe_stops,
+        "",
+        false,
+        0,
+        0,
+    };
   }
 
   bool opened{false};
@@ -133,6 +145,8 @@ void test_config_loads_current_vehicle_yaml() {
   expect(config.enabled_cameras().size() == 1, "enabled camera count mismatch");
   expect(config.realtime_profile("realtime_720p").fps == 30, "profile fps mismatch");
   expect(config.vehicle_adapter.type == "mock", "adapter type mismatch");
+  expect(config.hardware.can_bitrate == 500000, "CAN bitrate mismatch");
+  expect(config.hardware.can_tx_queue_length == 100, "CAN tx queue length mismatch");
 }
 
 void test_bench_config_drives_unified_vehicle_runtime() {
@@ -184,6 +198,11 @@ void test_field_config_pins_tls_route_without_system_dns() {
   expect(
       config.field_safety.require_can_feedback_before_control,
       "field vehicle CAN feedback gate is disabled");
+  expect(config.hardware.can_interface == "can1", "field vehicle CAN interface is not can1");
+  expect(config.hardware.can_bitrate == 500000, "field vehicle CAN bitrate is not 500 kbit/s");
+  expect(
+      config.hardware.can_tx_queue_length == 100,
+      "field vehicle CAN tx queue length is not 100");
 }
 
 void test_control_command_json_round_trip_and_validation() {

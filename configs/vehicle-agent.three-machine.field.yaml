@@ -72,8 +72,9 @@ cameras:
 
 hardware:
   can:
-    interface: can0
+    interface: can1
     bitrate: 500000
+    tx_queue_length: 100
   encoding:
     vaapi_render_device: /dev/dri/renderD128
     dri_card_device: /dev/dri/card1
@@ -123,5 +124,5 @@ vehicle_adapter:
 #   type: can
 #   integration:
 #     chassis_control:
-#       can_interface: can0
+#       can_interface: can1
 #       bridge_library_path: /opt/mine-teleop/lib/vendor/chassis/libmine_teleop_chassis_bridge.so

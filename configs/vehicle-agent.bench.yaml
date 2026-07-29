@@ -62,6 +62,7 @@ hardware:
   can:
     interface: can0
     bitrate: 500000
+    tx_queue_length: 100
   encoding:
     vaapi_render_device: /dev/dri/renderD128
     dri_card_device: /dev/dri/card1
