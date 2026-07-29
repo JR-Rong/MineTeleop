@@ -29,6 +29,9 @@ build_image="$image-build"
 build_jobs="${MINE_TELEOP_BUILD_JOBS:-2}"
 vehicle_config="${MINE_TELEOP_VEHICLE_CONFIG:-$repo_root/configs/vehicle-agent.three-machine.field.yaml}"
 base_bundle_archive="${MINE_TELEOP_BASE_BUNDLE_ARCHIVE:-}"
+chassis_vendor_dir="$repo_root/vendor/chassis/lib"
+chassis_bridge="$chassis_vendor_dir/libmine_teleop_chassis_bridge.so"
+chassis_control="$chassis_vendor_dir/libchassis_control.so"
 
 if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" &&
       -z "$base_bundle_archive" ]]; then
@@ -59,10 +62,19 @@ mkdir -p "$(dirname "$output_root")"
 third_party_runtime_source="from-source"
 third_party_runtime_sha256="none"
 if [[ -z "$base_bundle_archive" ]]; then
+  if [[ ! -s "$chassis_bridge" || ! -s "$chassis_control" ]]; then
+    "$script_dir/prepare_chassis_runtime.sh"
+  fi
+  if [[ ! -s "$chassis_bridge" || ! -s "$chassis_control" ]]; then
+    printf 'required chassis runtime was not prepared under: %s\n' \
+      "$chassis_vendor_dir" >&2
+    exit 2
+  fi
   docker buildx build \
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
     --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
+    --build-arg "MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME=ON" \
     --target runtime \
     --load \
     -t "$image" \
@@ -79,6 +91,7 @@ if [[ -z "$base_bundle_archive" ]]; then
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
     --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
+    --build-arg "MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME=ON" \
     --target artifact \
     --output "type=local,dest=$temporary/artifact" \
     -f "$repo_root/deployments/cpp/Dockerfile.build" \
@@ -146,6 +159,27 @@ else
   temporary_container=""
   third_party_runtime_source="$(basename "$base_bundle_archive")"
 fi
+
+if [[ ! -s "$output_root/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" ||
+      ! -s "$output_root/lib/vendor/chassis/libchassis_control.so" ]] &&
+   [[ ! -s "$chassis_bridge" || ! -s "$chassis_control" ]]; then
+  "$script_dir/prepare_chassis_runtime.sh"
+fi
+if [[ -s "$chassis_bridge" && -s "$chassis_control" ]]; then
+  mkdir -p "$output_root/lib/vendor/chassis"
+  cp -a "$chassis_vendor_dir/." "$output_root/lib/vendor/chassis/"
+fi
+for required_library in \
+  libmine_teleop_chassis_bridge.so \
+  libchassis_control.so; do
+  if [[ ! -s "$output_root/lib/vendor/chassis/$required_library" ]]; then
+    printf 'required chassis runtime is missing from vehicle bundle: %s\n' \
+      "$output_root/lib/vendor/chassis/$required_library" >&2
+    printf 'prepare it with: %s\n' \
+      "$script_dir/prepare_chassis_runtime.sh" >&2
+    exit 2
+  fi
+done
 
 install -m 0644 "$vehicle_config" "$output_root/config/vehicle-agent.yaml"
 install -m 0644 "$repo_root/configs/mine-teleop-field-root.crt" "$output_root/config/mine-teleop-field-root.crt"

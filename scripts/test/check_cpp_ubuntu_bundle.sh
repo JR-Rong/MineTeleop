@@ -38,6 +38,8 @@ for required_path in \
   "$package_name/bin/mine-teleop" \
   "$package_name/bin/mine-teleop-run" \
   "$package_name/bin/mine-teleop-aravis-camera" \
+  "$package_name/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
+  "$package_name/lib/vendor/chassis/libchassis_control.so" \
   "$package_name/config/vehicle-agent.yaml" \
   "$package_name/config/mine-teleop-field-root.crt" \
   "$package_name/deployments/udev/99-mine-teleop-basler.rules" \
@@ -72,11 +74,16 @@ container_id="$(docker create --platform linux/amd64 \
     root="/tmp/check/$package_name"
     test -s "$root/config/vehicle-agent.yaml"
     test -s "$root/config/mine-teleop-field-root.crt"
+    test -s "$root/lib/vendor/chassis/libmine_teleop_chassis_bridge.so"
+    test -s "$root/lib/vendor/chassis/libchassis_control.so"
     test ! -e "$root/config/device-token"
     "$root/bin/mine-teleop-run" version
     "$root/bin/mine-teleop-run" config-check --config "$root/config/vehicle-agent.yaml"
     library_path="$root/lib:$root/lib/vendor/chassis:$root/lib/vendor/mvs"
     export LD_LIBRARY_PATH="$library_path"
+    ldd "$root/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
+      > /tmp/chassis-runtime-ldd.txt
+    ! grep -q "not found" /tmp/chassis-runtime-ldd.txt
     "$root/bin/mine-teleop-signaling-server" --version
     "$root/bin/mine-teleop-control" --version
     "$root/bin/mine-teleop-aravis-camera" --list --json | grep -E "\"device_count\":[0-9]+" >/dev/null

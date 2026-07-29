@@ -225,6 +225,7 @@ RUN cmake -S . -B /tmp/mine-teleop-build \
 FROM build AS bundle
 
 ARG MINE_TELEOP_BUILD_TESTS=OFF
+ARG MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME=OFF
 
 COPY --from=gstreamer /opt/gstreamer /opt/gstreamer
 COPY --from=libsrtp /opt/libsrtp /opt/libsrtp
@@ -256,7 +257,19 @@ RUN set -e; \
     scanner="$(find /opt/gstreamer -path '*/gstreamer-1.0/gst-plugin-scanner' -type f | head -n 1)"; \
     [ -n "$scanner" ] && cp -L "$scanner" /bundle/bin/gst-plugin-scanner; \
     cp -L /etc/ssl/certs/ca-certificates.crt /bundle/etc/ssl/certs/; \
+    if [ "$MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME" = "ON" ]; then \
+      test -s /src/vendor/chassis/lib/libmine_teleop_chassis_bridge.so; \
+      test -s /src/vendor/chassis/lib/libchassis_control.so; \
+    fi; \
     if [ -d /src/vendor/chassis/lib ]; then cp -a /src/vendor/chassis/lib/. /bundle/lib/vendor/chassis/; fi; \
+    if [ "$MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME" = "ON" ]; then \
+      test -s /bundle/lib/vendor/chassis/libmine_teleop_chassis_bridge.so; \
+      test -s /bundle/lib/vendor/chassis/libchassis_control.so; \
+      LD_LIBRARY_PATH=/bundle/lib/vendor/chassis \
+        ldd /bundle/lib/vendor/chassis/libmine_teleop_chassis_bridge.so \
+        | tee /tmp/chassis-runtime-ldd.txt; \
+      ! grep -q 'not found' /tmp/chassis-runtime-ldd.txt; \
+    fi; \
     if [ -d /src/vendor/mvs/lib ]; then cp -a /src/vendor/mvs/lib/. /bundle/lib/vendor/mvs/; fi; \
     if [ -d /src/vendor/nvidia/lib ]; then cp -a /src/vendor/nvidia/lib/. /bundle/lib/; fi; \
     cp -L /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libm.so.6 \

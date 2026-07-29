@@ -179,6 +179,7 @@ ARG MINE_TELEOP_BUILT_AT_UTC=unknown
 ARG LIBSRTP_COMMIT=90d05bf8980d16e4ac3f16c19b77e296c4bc207b
 ARG LIBSRTP_ARCHIVE_SHA256=0caec0cf84569463c1ff186fe6a92101fe9036375140dd4588170787925f5335
 ARG MINE_TELEOP_BUILD_TESTS=OFF
+ARG MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME=OFF
 
 RUN set -eu; \
     mkdir -p \
@@ -214,8 +215,20 @@ RUN set -eu; \
     cp /src/deployments/udev/99-mine-teleop-basler.rules /bundle/deployments/udev/; \
     cp /src/scripts/deploy/setup_basler_usb_access.sh /bundle/scripts/; \
     chmod +x /bundle/scripts/setup_basler_usb_access.sh; \
+    if [ "$MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME" = "ON" ]; then \
+      test -s /src/vendor/chassis/lib/libmine_teleop_chassis_bridge.so; \
+      test -s /src/vendor/chassis/lib/libchassis_control.so; \
+    fi; \
     if [ -d /src/vendor/chassis/lib ]; then \
       cp -a /src/vendor/chassis/lib/. /bundle/lib/vendor/chassis/; \
+    fi; \
+    if [ "$MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME" = "ON" ]; then \
+      test -s /bundle/lib/vendor/chassis/libmine_teleop_chassis_bridge.so; \
+      test -s /bundle/lib/vendor/chassis/libchassis_control.so; \
+      LD_LIBRARY_PATH=/bundle/lib/vendor/chassis \
+        ldd /bundle/lib/vendor/chassis/libmine_teleop_chassis_bridge.so \
+        | tee /tmp/chassis-runtime-ldd.txt; \
+      ! grep -q 'not found' /tmp/chassis-runtime-ldd.txt; \
     fi; \
     if [ -d /src/vendor/mvs/lib ]; then \
       cp -a /src/vendor/mvs/lib/. /bundle/lib/vendor/mvs/; \

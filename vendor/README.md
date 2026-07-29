@@ -24,10 +24,21 @@ vendor/
 
 `deployments/cpp/Dockerfile.build` builds the matching camera C++ bridge whenever
 an SDK is present, copies all runtime libraries, and sets bundle-relative
-RPATHs. The chassis bridge is built with
-`deployments/chassis-control-bridge/CMakeLists.txt`; place its output and every
-redistributable dependency in `vendor/chassis/lib` before building the final
-bundle.
+RPATHs. Prepare the chassis runtime with:
+
+```bash
+MINE_TELEOP_CHASSIS_CONTROL_ROOT=/path/to/ChassisControl \
+MINE_TELEOP_CHASSIS_CONTROL_LIBRARY=/path/to/libchassis_control.so \
+  scripts/build/prepare_chassis_runtime.sh
+```
+
+This Docker build installs the bridge and ChassisControl runtime under
+`vendor/chassis/lib`; the `.so` files remain ignored build inputs rather than
+Git content. Vehicle bundle entrypoints run the preparation automatically when
+the two required files are absent. Both the Docker bundle stage and final
+archive checker reject a vehicle package that omits either library or has an
+unresolved bridge dependency. Place any additional permitted redistributable
+dependencies in the same directory before building the final bundle.
 The repository does not redistribute proprietary SDK binaries. Supply only the
 redistributable files allowed by the Hikrobot license. Basler USB3 Vision
 cameras use the source-built Aravis/libusb bridge and do not require pylon.

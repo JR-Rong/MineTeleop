@@ -22,6 +22,9 @@ output_root="${positional_args[1]:-$repo_root/dist/mine-teleop-vehicle-ubuntu22.
 build_jobs="${MINE_TELEOP_BUILD_JOBS:-1}"
 vehicle_config="${MINE_TELEOP_VEHICLE_CONFIG:-$repo_root/configs/vehicle-agent.three-machine.field.yaml}"
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/mine-teleop-vehicle-from-scratch.XXXXXX")"
+chassis_vendor_dir="$repo_root/vendor/chassis/lib"
+chassis_bridge="$chassis_vendor_dir/libmine_teleop_chassis_bridge.so"
+chassis_control="$chassis_vendor_dir/libchassis_control.so"
 
 cleanup() {
   rm -rf "$temporary"
@@ -48,6 +51,16 @@ command -v docker >/dev/null 2>&1 || die "Docker Desktop or Colima is required"
 docker info >/dev/null 2>&1 || die "Docker is not running"
 docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
 
+if [[ ! -s "$chassis_bridge" || ! -s "$chassis_control" ]]; then
+  "$script_dir/prepare_chassis_runtime.sh"
+fi
+[[ -s "$chassis_bridge" ]] || {
+  die "required chassis bridge was not prepared: $chassis_bridge"
+}
+[[ -s "$chassis_control" ]] || {
+  die "required ChassisControl runtime was not prepared: $chassis_control"
+}
+
 mkdir -p "$(dirname "$output_root")"
 source_commit="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || printf unknown)"
 if [[ -n "$(git -C "$repo_root" status --porcelain 2>/dev/null || true)" ]]; then
@@ -61,6 +74,7 @@ docker buildx build \
   --platform "$platform" \
   --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
   --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
+  --build-arg "MINE_TELEOP_REQUIRE_CHASSIS_RUNTIME=ON" \
   --build-arg "MINE_TELEOP_SOURCE_COMMIT=$source_commit" \
   --build-arg "MINE_TELEOP_BUILT_AT_UTC=$built_at_utc" \
   --target artifact \
@@ -69,6 +83,13 @@ docker buildx build \
   "$repo_root"
 
 mv "$temporary/artifact" "$output_root"
+for required_library in \
+  libmine_teleop_chassis_bridge.so \
+  libchassis_control.so; do
+  [[ -s "$output_root/lib/vendor/chassis/$required_library" ]] || {
+    die "required chassis runtime is missing from vehicle bundle: $required_library"
+  }
+done
 install -m 0644 "$vehicle_config" "$output_root/config/vehicle-agent.yaml"
 install -m 0644 \
   "$repo_root/configs/mine-teleop-field-root.crt" \

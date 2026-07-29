@@ -6,6 +6,18 @@ This directory provides the stable C ABI loaded by the native C++
 control application, emergency stop, feedback polling, telemetry, and safe
 disconnect.
 
+The canonical packaging input is produced in Ubuntu 22.04 amd64 Docker:
+
+```bash
+MINE_TELEOP_CHASSIS_CONTROL_ROOT=/path/to/ChassisControl \
+MINE_TELEOP_CHASSIS_CONTROL_LIBRARY=/path/to/libchassis_control.so \
+  scripts/build/prepare_chassis_runtime.sh
+```
+
+The script writes the two ignored runtime libraries to `vendor/chassis/lib`.
+Every vehicle package requires both files; missing or unresolved libraries stop
+the build instead of producing an incomplete artifact.
+
 Build it on Ubuntu 22.04 after producing ChassisControl:
 
 ```bash

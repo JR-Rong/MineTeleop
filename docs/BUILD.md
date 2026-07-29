@@ -136,6 +136,24 @@ MINE_TELEOP_VEHICLE_CONFIG="$PWD/configs/my-vehicle.yaml" \
   scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64
 ```
 
+### 底盘 bridge 运行库
+
+车端安装包强制包含
+`lib/vendor/chassis/libmine_teleop_chassis_bridge.so` 和
+`lib/vendor/chassis/libchassis_control.so`。这两个构建/授权物料不提交到 Git。
+如果 `vendor/chassis/lib` 下缺失任一文件，统一打包入口会先执行：
+
+```bash
+MINE_TELEOP_CHASSIS_CONTROL_ROOT=/path/to/ChassisControl \
+MINE_TELEOP_CHASSIS_CONTROL_LIBRARY=/path/to/libchassis_control.so \
+  scripts/build/prepare_chassis_runtime.sh
+```
+
+未设置变量时，默认读取相邻目录 `../ChassisControl` 和
+`../MinePilot/libchassis_control.so`。Docker bundle 阶段和最终 tar.gz 检查都会
+验证文件存在且 bridge 的动态依赖全部可解析；因此缺少底盘库时构建会明确失败，
+不会再生成表面通过、运行时才报 `dlopen` 失败的安装包。
+
 ## 6. 原生 Ubuntu amd64 构建车端
 
 在 Ubuntu 22.04 amd64 构建机上仍使用统一入口：

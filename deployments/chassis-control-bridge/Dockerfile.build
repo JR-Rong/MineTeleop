@@ -1,0 +1,50 @@
+# syntax=docker/dockerfile:1
+
+FROM ubuntu:22.04 AS build
+
+ARG TARGETARCH
+ARG MINE_TELEOP_BUILD_JOBS=2
+
+RUN test "$TARGETARCH" = "amd64" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      file \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src/mine-teleop
+COPY deployments/chassis-control-bridge/ deployments/chassis-control-bridge/
+COPY cpp/include/ cpp/include/
+COPY cpp/src/vcu.cpp cpp/src/vcu.cpp
+COPY --from=chassis_control_headers / /src/chassis-control/include/
+COPY --from=chassis_runtime /libchassis_control.so /src/chassis-runtime/libchassis_control.so
+
+RUN test -s /src/chassis-control/include/global_variables.h \
+    && test -s /src/chassis-runtime/libchassis_control.so \
+    && cmake \
+      -S /src/mine-teleop/deployments/chassis-control-bridge \
+      -B /tmp/chassis-bridge-build \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_INSTALL_PREFIX=/out \
+      -DCHASSIS_CONTROL_ROOT=/src/chassis-control \
+      -DCHASSIS_CONTROL_LIBRARY=/src/chassis-runtime/libchassis_control.so \
+    && cmake --build /tmp/chassis-bridge-build --parallel "$MINE_TELEOP_BUILD_JOBS" \
+    && cmake --install /tmp/chassis-bridge-build \
+    && install -m 0755 \
+      /src/chassis-runtime/libchassis_control.so \
+      /out/lib/vendor/chassis/libchassis_control.so \
+    && file \
+      /out/lib/vendor/chassis/libmine_teleop_chassis_bridge.so \
+      /out/lib/vendor/chassis/libchassis_control.so \
+      | grep -c 'x86-64' \
+      | grep -q '^2$' \
+    && LD_LIBRARY_PATH=/out/lib/vendor/chassis \
+      ldd /out/lib/vendor/chassis/libmine_teleop_chassis_bridge.so \
+      | tee /tmp/chassis-bridge-ldd.txt \
+    && ! grep -q 'not found' /tmp/chassis-bridge-ldd.txt
+
+FROM scratch AS artifact
+
+COPY --from=build /out/ /

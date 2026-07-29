@@ -221,6 +221,15 @@ Build and run tests with:
 scripts/build/build_cpp_ubuntu_bundle.sh test linux/amd64
 ```
 
+Vehicle packages require the JYR010 chassis bridge and ChassisControl runtime.
+When either ignored vendor binary is absent, the build entrypoint first runs
+`scripts/build/prepare_chassis_runtime.sh`. By default it reads sibling
+`../ChassisControl` sources and `../MinePilot/libchassis_control.so`; override
+them with `MINE_TELEOP_CHASSIS_CONTROL_ROOT` and
+`MINE_TELEOP_CHASSIS_CONTROL_LIBRARY`. The package build and final archive
+checker both fail if either required `.so` is absent or has an unresolved
+dependency.
+
 The script emits
 `dist/mine-teleop-vehicle-ubuntu22.04-x64-YYYYMMDD-HHMMSS.tar.gz`, its SHA-256
 file. In `test` mode it runs `scripts/test/check_cpp_ubuntu_bundle.sh` against
