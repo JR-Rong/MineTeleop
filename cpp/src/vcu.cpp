@@ -12,7 +12,7 @@ constexpr int kNeutralGear = 1;
 constexpr int kParallelHandshakeRequest = 2;
 constexpr int kParallelHandshakeStatus = 6;
 constexpr int kManualHandshakeStatus = 3;
-constexpr int kParkGearRequest = 4;
+constexpr int kNeutralGearRequest = 1;
 constexpr int kParkingBrakeHold = 0;
 constexpr int kParkingBrakeRelease = 1;
 constexpr int kParkingBrakePark = 2;
@@ -686,7 +686,7 @@ bool ParallelController::handshake_requested() const {
 
 bool ParallelController::parking_ready() const {
   return feedback_.driver_gear_request_valid &&
-         feedback_.driver_gear_request == kParkGearRequest &&
+         feedback_.driver_gear_request == kNeutralGearRequest &&
          feedback_.handshake_valid &&
          feedback_.handshake_status == kManualHandshakeStatus &&
          feedback_.speed_valid &&

@@ -66,7 +66,7 @@ Bridge open starts in standby. It sends the 16 low-request ADU frames every
 controller's start button, and the bridge accepts that request only when fresh
 feedback confirms:
 
-- physical selector P (`WVCU_GearCtrlReqSts=4`);
+- physical selector N (`WVCU_GearCtrlReqSts=1`);
 - absolute speed no greater than 0.1 m/s;
 - all four EPBs parked (value 2);
 - VCU manual handshake state 3.

@@ -165,7 +165,7 @@ stderr；协议细节与高频 CAN 证据写入
 | `event`/VCU JSONL `name` / `issue_code` | 触发条件 | 安全结果 |
 | --- | --- | --- |
 | `parallel_handshake_rejected` / `vcu_handshake_runtime_unavailable` | bridge 停止或已有 I/O fault | 保持停车 |
-| `parallel_handshake_rejected` / `vcu_handshake_gate_rejected` | P/零速/EPB/manual state/新鲜度任一不满足 | 日志记录全部 gate 值 |
+| `parallel_handshake_rejected` / `vcu_handshake_gate_rejected` | N/零速/电子驻车/manual state/新鲜度任一不满足 | 日志记录全部 gate 值 |
 | `parallel_handshake_requested` / `vcu_handshake_requested` | 请求被接受 | 仍停车直至 Ready |
 | `vehicle_vcu_handshake_state_changed` / `vcu_handshake_state_changed` | browser 可见握手状态变化 | stdout 只在状态变化时输出 |
 | `control_apply_rejected` / `vcu_control_runtime_unavailable` | runtime/I/O fault 阻止控制 | 本地全停 |

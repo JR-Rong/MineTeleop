@@ -165,7 +165,7 @@ void send_mode_feedback(ParallelController& controller) {
   }
 }
 
-void prepare_parking_gate(ParallelController& controller, int driver_gear = 4) {
+void prepare_parking_gate(ParallelController& controller, int driver_gear = 1) {
   expect(controller.ingest(handshake_feedback(3)), "manual handshake feedback was rejected");
   expect(controller.ingest(parking_brake_feedback(2)), "parked EPB feedback was rejected");
   expect(controller.ingest(speed_feedback(0.0)), "zero speed feedback was rejected");
@@ -180,7 +180,7 @@ void advance_to_ready(ParallelController& controller, int gear = 3) {
   prepare_parking_gate(controller);
   expect(
       controller.request_parallel_handshake(),
-      "explicit parallel handshake request was rejected in P");
+      "explicit parallel handshake request was rejected in N with EPB parked");
   expect(controller.set_command(command), "valid command was rejected");
   for (int index = 0; index < 6; ++index) static_cast<void>(controller.tick());
   expect(
@@ -226,7 +226,7 @@ void test_protocol_frames_use_parallel_handshake_and_physical_zero_encoding() {
       "standby asserted parallel handshake without a driver request");
 
   prepare_parking_gate(controller);
-  expect(controller.request_parallel_handshake(), "explicit P-gated handshake request failed");
+  expect(controller.request_parallel_handshake(), "explicit N/EPB-gated handshake request failed");
   std::vector<CanFrame> handshake_frames;
   for (int index = 0; index < 6; ++index) handshake_frames = controller.tick();
   const auto& shake = find_frame(handshake_frames, mine_teleop::vcu::ids::kAduShake);
@@ -244,7 +244,7 @@ void test_arming_uses_current_epb_semantics_and_gates_control() {
   command.brake_pressure_bar.fill(4.5);
 
   prepare_parking_gate(controller);
-  expect(controller.request_parallel_handshake(), "explicit P-gated handshake request failed");
+  expect(controller.request_parallel_handshake(), "explicit N/EPB-gated handshake request failed");
   expect(controller.set_command(command), "valid command was rejected");
   for (int index = 0; index < 6; ++index) static_cast<void>(controller.tick());
   controller.ingest(handshake_feedback(6));
@@ -290,7 +290,7 @@ void test_feedback_decoding_uses_si_units_and_complete_snapshot() {
   controller.ingest(handshake_feedback(6));
   controller.ingest(parking_brake_feedback(1));
   controller.ingest(gear_feedback(3));
-  controller.ingest(driver_gear_request_feedback(4));
+  controller.ingest(driver_gear_request_feedback(1));
   send_mode_feedback(controller);
   expect(controller.feedback_complete(), "complete safety feedback snapshot was not recognized");
 
@@ -302,7 +302,7 @@ void test_feedback_decoding_uses_si_units_and_complete_snapshot() {
 void test_arming_requires_fresh_feedback_after_each_request() {
   ParallelController controller;
   prepare_parking_gate(controller);
-  expect(controller.request_parallel_handshake(), "explicit P-gated handshake request failed");
+  expect(controller.request_parallel_handshake(), "explicit N/EPB-gated handshake request failed");
   controller.ingest(handshake_feedback(6));
   for (int index = 0; index < 6; ++index) static_cast<void>(controller.tick());
   expect(
@@ -320,21 +320,36 @@ void test_arming_requires_fresh_feedback_after_each_request() {
       "fresh parallel handshake feedback was not accepted");
 }
 
-void test_handshake_requires_explicit_request_and_driver_p() {
+void test_handshake_requires_neutral_and_electronic_parking_brake() {
   ParallelController controller;
   for (int index = 0; index < 10; ++index) static_cast<void>(controller.tick());
   expect(
       controller.state() == State::Standby,
       "controller left standby without an explicit handshake request");
 
-  prepare_parking_gate(controller, 3);
+  for (const int driver_gear : {2, 3, 4}) {
+    prepare_parking_gate(controller, driver_gear);
+    expect(
+        !controller.request_parallel_handshake(),
+        "parallel handshake started while the driver selector was not N");
+    expect(
+        controller.state() == State::Standby,
+        "rejected non-N request changed controller state");
+  }
+
+  controller.ingest(driver_gear_request_feedback(1));
+  controller.ingest(parking_brake_feedback(1));
   expect(
       !controller.request_parallel_handshake(),
-      "parallel handshake started while the driver selector was not P");
-  expect(controller.state() == State::Standby, "rejected request changed controller state");
+      "parallel handshake started while the electronic parking brake was released");
+  expect(
+      controller.state() == State::Standby,
+      "rejected electronic parking brake request changed controller state");
 
-  controller.ingest(driver_gear_request_feedback(4));
-  expect(controller.parking_ready(), "valid P/manual/park/zero-speed gate was not recognized");
+  controller.ingest(parking_brake_feedback(2));
+  expect(
+      controller.parking_ready(),
+      "valid N/electronic-parking/manual/zero-speed gate was not recognized");
   expect(controller.request_parallel_handshake(), "valid explicit handshake request failed");
   expect(controller.state() == State::Initial, "accepted request did not start low-frame phase");
 }
@@ -342,7 +357,7 @@ void test_handshake_requires_explicit_request_and_driver_p() {
 void test_disconnect_during_handshake_clears_request_and_confirms_manual() {
   ParallelController controller;
   prepare_parking_gate(controller);
-  expect(controller.request_parallel_handshake(), "explicit P-gated handshake request failed");
+  expect(controller.request_parallel_handshake(), "explicit N/EPB-gated handshake request failed");
   for (int index = 0; index < 6; ++index) static_cast<void>(controller.tick());
   expect(
       controller.state() == State::WaitParallelHandshake,
@@ -431,7 +446,7 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
   expect(controller.disarmed(), "manual handshake status 3 did not complete disarm");
   expect(
       controller.request_parallel_handshake(),
-      "a fully disarmed P/park/manual controller could not start a new explicit handshake");
+      "a fully disarmed N/park/manual controller could not start a new explicit handshake");
   expect(
       controller.state() == State::Initial,
       "reconnect did not restart the five-frame low-handshake phase");
@@ -449,8 +464,8 @@ int main() {
        test_feedback_decoding_uses_si_units_and_complete_snapshot},
       {"arming_requires_fresh_feedback_after_each_request",
        test_arming_requires_fresh_feedback_after_each_request},
-      {"handshake_requires_explicit_request_and_driver_p",
-       test_handshake_requires_explicit_request_and_driver_p},
+      {"handshake_requires_neutral_and_electronic_parking_brake",
+       test_handshake_requires_neutral_and_electronic_parking_brake},
       {"disconnect_during_handshake_clears_request_and_confirms_manual",
        test_disconnect_during_handshake_clears_request_and_confirms_manual},
       {"handshake_loss_forces_zero_torque_and_calibrated_brake",

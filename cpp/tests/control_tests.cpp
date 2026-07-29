@@ -400,7 +400,15 @@ void test_control_page_contract() {
   expect(
       response.body.find("vcu_handshake_not_ready") != std::string::npos &&
           response.body.find("vcuHandshake.parking_ready") != std::string::npos,
-      "driving commands are not gated by explicit P-ready VCU handshake state");
+      "driving commands are not gated by explicit N/EPB-ready VCU handshake state");
+  expect(
+      response.body.find("只有 N 挡允许进入平行驾驶") != std::string::npos &&
+          response.body.find("电子驻车未全部拉起") != std::string::npos &&
+          response.body.find("反馈已过期") != std::string::npos &&
+          response.body.find("握手请求已发送") != std::string::npos &&
+          response.body.find("启动第 2/5 步未完成") != std::string::npos &&
+          response.body.find("退出第 4/5 步未完成") != std::string::npos,
+      "the control page does not explain the failed VCU gate or handshake step");
   expect(
       response.body.find("实车调试限幅") != std::string::npos &&
           response.body.find("max-throttle-percent") != std::string::npos &&

@@ -27,7 +27,7 @@ struct MineTeleopChassisFeedback {
     /* SI unit used by this ABI. Raw WVCU kph is converted to m/s. */
     double vehicle_speed;
     int vehicle_speed_valid;
-    /* Physical selector request from WVCU_GearCtrlReqSts. P=4. */
+    /* Physical selector request from WVCU_GearCtrlReqSts. N=1, R=2, D=3. */
     int driver_gear_request;
     int driver_gear_request_valid;
 };
@@ -74,7 +74,7 @@ int mine_teleop_chassis_apply_state(
     const double* steering_values,
     int steering_count);
 int mine_teleop_chassis_emergency_stop();
-/* Start is accepted only while the selector is P, EPB is parked, speed is
+/* Start is accepted only while the selector is N, EPB is parked, speed is
  * zero, and the VCU reports manual state. */
 int mine_teleop_chassis_request_parallel_handshake();
 /* Performs the full torque/stop/N/EPB/manual reverse sequence. */

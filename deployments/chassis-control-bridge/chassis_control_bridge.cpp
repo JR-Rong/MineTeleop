@@ -879,7 +879,7 @@ class BridgeRuntime {
           "\"issue_code\":\"vcu_handshake_gate_rejected\","
           "\"stage\":\"vcu_handshake_gate\","
           "\"retryable\":true,"
-          "\"operator_action\":\"Satisfy fresh feedback, P gear, zero speed, all EPBs parked, and manual handshake state 3\","
+          "\"operator_action\":\"Satisfy fresh feedback, N gear, zero speed, all electronic parking brakes applied, and manual handshake state 3\","
           "\"safety_action\":\"remain_in_standby\"," +
               handshake_gate_json_locked(now),
           true);

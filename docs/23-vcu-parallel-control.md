@@ -37,15 +37,14 @@ DBC 不一致。
 
 1. 驾驶员的 WebRTC `control` DataChannel 已连接；
 2. 驾驶员在控制端点击“开始平行驾驶握手”；
-3. `WVCU_GearCtrlReqSts=4`（物理选择器为 P）；
+3. `WVCU_GearCtrlReqSts=1`（物理选择器为 N）；
 4. VCU 车速反馈有效且绝对值不大于 0.1 m/s；
 5. 四路 EPB 转发状态均为 2（驻车）；
 6. `WVCU_ShakeHandSts=3`（VCU 处于人工状态）；
 7. 上述门槛反馈均在最近 500 ms 内收到。
 
-这里使用 `WVCU_GearCtrlReqSts` 判断 P，而不使用
-`WVCU_GearStsNow`：当前 DBC 把后者定义为 2 bit，却在枚举中列出无法由 2 bit
-表达的 `P=4`。
+这里使用 `WVCU_GearCtrlReqSts` 判断驾驶员的物理选择器是否为 N。实车只有
+N/R/D 三个挡位；电子驻车通过四路 EPB 状态单独判断，不能用不存在的 P 挡代替。
 
 启动顺序：
 
@@ -66,7 +65,8 @@ DBC 不一致。
 5. 清除 `CloudShakeReq`，等待人工状态 3。
 
 控制端通过同一条双向 DataChannel 每 500 ms 接收
-`vcu_handshake_status`，可见 P/车速/EPB/VCU 状态、当前状态机阶段和最终 `ready`。
+`vcu_handshake_status`，可见 N/R/D 选择器、车速、EPB、VCU 状态、当前状态机阶段
+和最终 `ready`。
 只有 `ready=true` 才放行普通驾驶命令。点击“断开 VCU 握手”、DataChannel
 断开或安全退出时，车端执行上述完整反向序列；不会只停发 CAN。
 
@@ -102,7 +102,7 @@ export MINE_TELEOP_VCU_LOG_ROTATIONS=10
 - `event/feedback_snapshot`：握手、EPB、挡位、模式、扭矩、转角、压力和车速；
 - `event/state_transition`：状态迁移；
 - `event/parallel_handshake_requested`、`parallel_handshake_rejected`：
-  开始请求及 P/零速/EPB/人工状态/反馈新鲜度门槛；
+  开始请求及 N/零速/EPB/人工状态/反馈新鲜度门槛；
 - `event/parallel_handshake_disconnect_requested`：控制端主动断开请求；
 - `event/emergency_stop`、`feedback_timeout`、`can_send_failed`、
   `can_receive_failed`、`tx_deadline_miss`、`disarm_complete`、
@@ -168,8 +168,8 @@ vehicle_adapter:
    `initial -> wait_parallel_handshake -> wait_parking_brake_released ->
    wait_gear -> wait_actuator_modes -> ready`。
 4. 在每一阶段人为缺失对应反馈，确认控制量不会越过当前门禁。
-5. 分别验证 N/R/D；P 命令应进入 N + EPB 驻车 + 退出平行握手流程，不按 DBC 中
-   无法由两位反馈表达的 4 做闭环。
+5. 分别验证 N/R/D；只有物理选择器为 N 且电子驻车已拉起时才允许开始握手，
+   D/R 均应被准入门禁拒绝。
 6. 小幅验证四轴正负转向、八路小扭矩和八路小压力，逐项核对物理方向、单位、符号、
    比例、饱和和反馈。
 7. 断开驾驶控制但保持 CAN，确认超时制动；再中断 VCU 反馈，确认 500 ms 通讯
