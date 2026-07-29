@@ -9,8 +9,8 @@ namespace {
 
 constexpr int kNoRequest = 0;
 constexpr int kNeutralGear = 1;
-constexpr int kParallelHandshakeRequest = 2;
-constexpr int kParallelHandshakeStatus = 6;
+constexpr int kIntelligentHandshakeRequest = 2;
+constexpr int kIntelligentHandshakeStatus = 5;
 constexpr int kManualHandshakeStatus = 3;
 constexpr int kNeutralGearRequest = 1;
 constexpr int kParkingBrakeHold = 0;
@@ -234,11 +234,11 @@ CanFrame make_epb_frame(
   return frame;
 }
 
-CanFrame make_shake_frame(int gear, int cloud_handshake, bool fault_reset) {
+CanFrame make_shake_frame(int gear, int handshake_request, bool fault_reset) {
   CanFrame frame{ids::kAduShake};
-  insert_signal(frame, 0, 8, kNoRequest);
+  insert_signal(frame, 0, 8, static_cast<std::uint64_t>(handshake_request));
   insert_signal(frame, 8, 8, static_cast<std::uint64_t>(gear));
-  insert_signal(frame, 16, 8, static_cast<std::uint64_t>(cloud_handshake));
+  insert_signal(frame, 16, 8, kNoRequest);
   insert_signal(frame, 24, 1, fault_reset ? 1U : 0U);
   return frame;
 }
@@ -448,7 +448,7 @@ void ParallelController::enter(State state) {
 
 void ParallelController::advance_state() {
   if (state_ == State::Ready && feedback_.handshake_valid &&
-      feedback_.handshake_status != kParallelHandshakeStatus) {
+      feedback_.handshake_status != kIntelligentHandshakeStatus) {
     transport_fault();
     return;
   }
@@ -466,7 +466,7 @@ void ParallelController::advance_state() {
     case State::WaitParallelHandshake:
       if (feedback_.handshake_valid &&
           handshake_generation_ > state_entry_generation_ &&
-          feedback_.handshake_status == kParallelHandshakeStatus) {
+          feedback_.handshake_status == kIntelligentHandshakeStatus) {
         enter(State::WaitParkingBrakeReleased);
       }
       break;
@@ -547,7 +547,7 @@ std::vector<CanFrame> ParallelController::tick() {
   advance_state();
 
   int gear = kNoRequest;
-  int cloud_handshake = kNoRequest;
+  int handshake_request = kNoRequest;
   int steering_mode = kNoRequest;
   std::array<int, kParkingBrakeCount> parking_brake{};
   parking_brake.fill(kParkingBrakeHold);
@@ -562,11 +562,13 @@ std::vector<CanFrame> ParallelController::tick() {
   std::array<double, kBrakeCount> brake_pressure{};
   bool fault_reset = false;
 
-  const bool parallel_requested =
+  const bool driving_authority_requested =
       state_ != State::Standby && state_ != State::Initial &&
       state_ != State::Disarmed &&
       state_ != State::DisarmManual;
-  if (parallel_requested) cloud_handshake = kParallelHandshakeRequest;
+  if (driving_authority_requested) {
+    handshake_request = kIntelligentHandshakeRequest;
+  }
 
   if (state_ == State::WaitParkingBrakeReleased ||
       state_ == State::WaitGear ||
@@ -638,7 +640,7 @@ std::vector<CanFrame> ParallelController::tick() {
     parking_brake.fill(kParkingBrakePark);
   } else if (state_ == State::DisarmManual) {
     gear = kNeutralGear;
-    cloud_handshake = kNoRequest;
+    handshake_request = kNoRequest;
     parking_brake.fill(kParkingBrakePark);
   }
 
@@ -661,7 +663,7 @@ std::vector<CanFrame> ParallelController::tick() {
   frames.push_back(make_brake_frame(
       ids::kAduEhb02, 4, brake_mode, brake_pressure));
   frames.push_back(make_epb_frame(parking_brake, steering_mode));
-  frames.push_back(make_shake_frame(gear, cloud_handshake, fault_reset));
+  frames.push_back(make_shake_frame(gear, handshake_request, fault_reset));
   frames.push_back(CanFrame{ids::kAduBody});
 
   CanFrame vehicle_speed{ids::kAduVehicleSpeed};

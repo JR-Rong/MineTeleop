@@ -187,11 +187,11 @@ void advance_to_ready(ParallelController& controller, int gear = 3) {
       controller.state() == State::WaitParallelHandshake,
       "controller did not establish the five-frame handshake low period");
 
-  controller.ingest(handshake_feedback(6));
+  controller.ingest(handshake_feedback(5));
   static_cast<void>(controller.tick());
   expect(
       controller.state() == State::WaitParkingBrakeReleased,
-      "parallel handshake status 6 was not accepted");
+      "intelligent-driving handshake status 5 was not accepted");
 
   controller.ingest(parking_brake_feedback(1));
   static_cast<void>(controller.tick());
@@ -206,7 +206,7 @@ void advance_to_ready(ParallelController& controller, int gear = 3) {
   expect(controller.state() == State::Ready, "actuator mode feedback did not arm control");
 }
 
-void test_protocol_frames_use_parallel_handshake_and_physical_zero_encoding() {
+void test_protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding() {
   ParallelController controller;
   const auto initial = controller.tick();
   expect(initial.size() == mine_teleop::vcu::kTransmitFrameCount, "not all 20 ms ADU frames were generated");
@@ -222,16 +222,17 @@ void test_protocol_frames_use_parallel_handshake_and_physical_zero_encoding() {
   expect(signal(initial_motor, 24, 14) == 8000, "zero speed was not encoded with its -8000 offset");
   const auto& standby_shake = find_frame(initial, mine_teleop::vcu::ids::kAduShake);
   expect(
-      signal(standby_shake, 16, 8) == 0,
-      "standby asserted parallel handshake without a driver request");
+      signal(standby_shake, 0, 8) == 0 &&
+          signal(standby_shake, 16, 8) == 0,
+      "standby asserted a handshake without a driver request");
 
   prepare_parking_gate(controller);
   expect(controller.request_parallel_handshake(), "explicit N/EPB-gated handshake request failed");
   std::vector<CanFrame> handshake_frames;
   for (int index = 0; index < 6; ++index) handshake_frames = controller.tick();
   const auto& shake = find_frame(handshake_frames, mine_teleop::vcu::ids::kAduShake);
-  expect(signal(shake, 0, 8) == 0, "intelligent-driving ShakeReq was used");
-  expect(signal(shake, 16, 8) == 2, "parallel-driving CloudShakeReq was not asserted");
+  expect(signal(shake, 0, 8) == 2, "intelligent-driving ShakeReq was not asserted");
+  expect(signal(shake, 16, 8) == 0, "CloudShakeReq was not kept clear");
 }
 
 void test_arming_uses_current_epb_semantics_and_gates_control() {
@@ -247,7 +248,7 @@ void test_arming_uses_current_epb_semantics_and_gates_control() {
   expect(controller.request_parallel_handshake(), "explicit N/EPB-gated handshake request failed");
   expect(controller.set_command(command), "valid command was rejected");
   for (int index = 0; index < 6; ++index) static_cast<void>(controller.tick());
-  controller.ingest(handshake_feedback(6));
+  controller.ingest(handshake_feedback(5));
   static_cast<void>(controller.tick());
 
   controller.ingest(parking_brake_feedback(2));
@@ -287,14 +288,14 @@ void test_feedback_decoding_uses_si_units_and_complete_snapshot() {
       "VCU kph feedback was not converted to m/s");
   expect(!controller.feedback_complete(), "one CAN frame was treated as a complete feedback snapshot");
 
-  controller.ingest(handshake_feedback(6));
+  controller.ingest(handshake_feedback(5));
   controller.ingest(parking_brake_feedback(1));
   controller.ingest(gear_feedback(3));
   controller.ingest(driver_gear_request_feedback(1));
   send_mode_feedback(controller);
   expect(controller.feedback_complete(), "complete safety feedback snapshot was not recognized");
 
-  CanFrame short_frame = handshake_feedback(6);
+  CanFrame short_frame = handshake_feedback(5);
   short_frame.dlc = 7;
   expect(!controller.ingest(short_frame), "short CAN feedback frame was accepted");
 }
@@ -303,11 +304,11 @@ void test_arming_requires_fresh_feedback_after_each_request() {
   ParallelController controller;
   prepare_parking_gate(controller);
   expect(controller.request_parallel_handshake(), "explicit N/EPB-gated handshake request failed");
-  controller.ingest(handshake_feedback(6));
+  controller.ingest(handshake_feedback(5));
   for (int index = 0; index < 6; ++index) static_cast<void>(controller.tick());
   expect(
       controller.state() == State::WaitParallelHandshake,
-      "a handshake status received before CloudShakeReq armed the controller");
+      "a handshake status received before ShakeReq armed the controller");
   static_cast<void>(controller.tick());
   expect(
       controller.state() == State::WaitParallelHandshake,
@@ -316,8 +317,14 @@ void test_arming_requires_fresh_feedback_after_each_request() {
   controller.ingest(handshake_feedback(6));
   static_cast<void>(controller.tick());
   expect(
+      controller.state() == State::WaitParallelHandshake,
+      "legacy parallel-driving status 6 was accepted");
+
+  controller.ingest(handshake_feedback(5));
+  static_cast<void>(controller.tick());
+  expect(
       controller.state() == State::WaitParkingBrakeReleased,
-      "fresh parallel handshake feedback was not accepted");
+      "fresh intelligent-driving handshake feedback was not accepted");
 }
 
 void test_handshake_requires_neutral_and_electronic_parking_brake() {
@@ -367,9 +374,10 @@ void test_disconnect_during_handshake_clears_request_and_confirms_manual() {
   auto frames = controller.tick();
   expect(
       controller.state() == State::DisarmManual,
-      "disconnect did not wait for VCU manual state after CloudShakeReq was asserted");
+      "disconnect did not wait for VCU manual state after ShakeReq was asserted");
   const auto& shake = find_frame(frames, mine_teleop::vcu::ids::kAduShake);
-  expect(signal(shake, 16, 8) == 0, "disconnect did not clear CloudShakeReq");
+  expect(signal(shake, 0, 8) == 0, "disconnect did not clear ShakeReq");
+  expect(signal(shake, 16, 8) == 0, "disconnect asserted CloudShakeReq");
 
   controller.ingest(handshake_feedback(3));
   static_cast<void>(controller.tick());
@@ -439,7 +447,8 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
   frames = controller.tick();
   expect(controller.state() == State::DisarmManual, "parked EPB feedback was not required");
   const auto& shake = find_frame(frames, mine_teleop::vcu::ids::kAduShake);
-  expect(signal(shake, 16, 8) == 0, "parallel handshake was not cleared after parking");
+  expect(signal(shake, 0, 8) == 0, "intelligent-driving handshake was not cleared after parking");
+  expect(signal(shake, 16, 8) == 0, "CloudShakeReq was asserted during disarm");
 
   controller.ingest(handshake_feedback(3));
   static_cast<void>(controller.tick());
@@ -456,8 +465,8 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
 
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
-      {"protocol_frames_use_parallel_handshake_and_physical_zero_encoding",
-       test_protocol_frames_use_parallel_handshake_and_physical_zero_encoding},
+      {"protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding",
+       test_protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding},
       {"arming_uses_current_epb_semantics_and_gates_control",
        test_arming_uses_current_epb_semantics_and_gates_control},
       {"feedback_decoding_uses_si_units_and_complete_snapshot",

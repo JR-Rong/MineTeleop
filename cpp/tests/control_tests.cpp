@@ -407,6 +407,7 @@ void test_control_page_contract() {
           response.body.find("反馈已过期") != std::string::npos &&
           response.body.find("握手请求已发送") != std::string::npos &&
           response.body.find("启动第 2/5 步未完成") != std::string::npos &&
+          response.body.find("复用智驾握手，等待 VCU 状态 5") != std::string::npos &&
           response.body.find("退出第 4/5 步未完成") != std::string::npos,
       "the control page does not explain the failed VCU gate or handshake step");
   expect(

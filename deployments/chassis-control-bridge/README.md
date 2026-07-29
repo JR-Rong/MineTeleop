@@ -71,13 +71,14 @@ feedback confirms:
 - all four EPBs parked (value 2);
 - VCU manual handshake state 3.
 
-The parallel path is `CloudShakeReq=2 -> WVCU_ShakeHandSts=6`;
-the intelligent/automatic-driving `ShakeReq` remains zero. The controller
-receives the detailed handshake status over the same DataChannel and enables
-driving commands only at `ready`.
+The parallel-driving feature intentionally reuses the vehicle's proven
+intelligent-driving handshake path:
+`ShakeReq=2 -> WVCU_ShakeHandSts=5`, while `CloudShakeReq` remains zero.
+The controller receives the detailed handshake status over the same
+DataChannel and enables driving commands only at `ready`.
 
 Disconnect performs the full reverse sequence: zero torque, zero speed, N,
-EPB park, clear `CloudShakeReq`, and wait for manual state 3.
+EPB park, clear `ShakeReq`, and wait for manual state 3.
 
 The required JSONL protocol log defaults to
 `/var/log/mine-teleop/vcu-can.jsonl` and includes every raw recognized RX
