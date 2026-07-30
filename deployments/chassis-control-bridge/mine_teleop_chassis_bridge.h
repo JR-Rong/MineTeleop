@@ -65,6 +65,39 @@ struct MineTeleopChassisHandshakeStatus {
     int speed_valid;
 };
 
+/*
+ * Optional versioned extension for complete measured CAN feedback. Keeping it
+ * separate from MineTeleopChassisTelemetry preserves compatibility with older
+ * bridge packages that expose only the summary ABI.
+ */
+struct MineTeleopChassisCanFeedbackV1 {
+    int feedback_fresh;
+    long long max_feedback_age_ms;
+    double speed_mps;
+    int speed_valid;
+    int gear;
+    int gear_valid;
+    int emergency_switch;
+    int driver_gear_request;
+    int driver_gear_request_valid;
+    int handshake_status;
+    int handshake_valid;
+    int epb_status[4];
+    int epb_valid[4];
+    int motor_mode[8];
+    int motor_mode_valid[8];
+    double motor_torque_nm[8];
+    int motor_torque_valid[8];
+    double motor_speed_rpm[8];
+    int motor_speed_valid[8];
+    int steering_mode[4];
+    int steering_valid[4];
+    double steering_angle_deg[4];
+    int brake_mode[8];
+    int brake_valid[8];
+    double brake_pressure_bar[8];
+};
+
 /* open: -2=ChassisControl/init, -3=SocketCAN, -4=protocol log path. */
 int mine_teleop_chassis_open(const char* can_interface);
 int mine_teleop_chassis_apply_state(
@@ -85,6 +118,8 @@ int mine_teleop_chassis_read_handshake_status(
 int mine_teleop_chassis_update_feedback(const struct MineTeleopChassisFeedback* feedback);
 int mine_teleop_chassis_poll_feedback(struct MineTeleopChassisFeedback* feedback);
 int mine_teleop_chassis_read_telemetry(struct MineTeleopChassisTelemetry* telemetry);
+int mine_teleop_chassis_read_can_feedback_v1(
+    struct MineTeleopChassisCanFeedbackV1* feedback);
 int mine_teleop_chassis_close();
 
 #ifdef __cplusplus

@@ -1049,6 +1049,57 @@ class BridgeRuntime {
     return telemetry_;
   }
 
+  MineTeleopChassisCanFeedbackV1 can_feedback_v1() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    MineTeleopChassisCanFeedbackV1 result{};
+    const auto& feedback = controller_.feedback();
+    const auto now = Clock::now();
+    result.feedback_fresh = feedback_fresh_locked(now) ? 1 : 0;
+    result.max_feedback_age_ms = 0;
+    for (const auto id : kCriticalFeedbackIds) {
+      const auto found = last_seen_.find(id);
+      if (found == last_seen_.end()) {
+        result.max_feedback_age_ms = -1;
+        break;
+      }
+      result.max_feedback_age_ms = std::max<long long>(
+          result.max_feedback_age_ms,
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - found->second).count());
+    }
+    result.speed_mps = feedback.speed_mps;
+    result.speed_valid = feedback.speed_valid ? 1 : 0;
+    result.gear = feedback.gear;
+    result.gear_valid = feedback.gear_valid ? 1 : 0;
+    result.emergency_switch = feedback.emergency_switch;
+    result.driver_gear_request = feedback.driver_gear_request;
+    result.driver_gear_request_valid =
+        feedback.driver_gear_request_valid ? 1 : 0;
+    result.handshake_status = feedback.handshake_status;
+    result.handshake_valid = feedback.handshake_valid ? 1 : 0;
+    for (std::size_t index = 0; index < mine_teleop::vcu::kParkingBrakeCount; ++index) {
+      result.epb_status[index] = feedback.parking_brake_status[index];
+      result.epb_valid[index] = feedback.parking_brake_valid[index] ? 1 : 0;
+    }
+    for (std::size_t index = 0; index < mine_teleop::vcu::kMotorCount; ++index) {
+      result.motor_mode[index] = feedback.motor_mode[index];
+      result.motor_mode_valid[index] = feedback.motor_mode_valid[index] ? 1 : 0;
+      result.motor_torque_nm[index] = feedback.motor_torque_nm[index];
+      result.motor_torque_valid[index] = feedback.motor_torque_valid[index] ? 1 : 0;
+      result.motor_speed_rpm[index] = feedback.motor_speed_rpm[index];
+      result.motor_speed_valid[index] = feedback.motor_speed_valid[index] ? 1 : 0;
+      result.brake_mode[index] = feedback.brake_mode[index];
+      result.brake_valid[index] = feedback.brake_valid[index] ? 1 : 0;
+      result.brake_pressure_bar[index] = feedback.brake_pressure_bar[index];
+    }
+    for (std::size_t index = 0; index < mine_teleop::vcu::kSteeringAxisCount; ++index) {
+      result.steering_mode[index] = feedback.steering_mode[index];
+      result.steering_valid[index] = feedback.steering_valid[index] ? 1 : 0;
+      result.steering_angle_deg[index] = feedback.steering_angle_deg[index];
+    }
+    return result;
+  }
+
   double speed_mps() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return telemetry_.speed_mps;
@@ -1799,6 +1850,18 @@ extern "C" int mine_teleop_chassis_read_telemetry(
     std::lock_guard<std::mutex> lock(g_api_mutex);
     if (!g_runtime || telemetry == nullptr) return -1;
     *telemetry = g_runtime->telemetry();
+    return 0;
+  } catch (...) {
+    return -5;
+  }
+}
+
+extern "C" int mine_teleop_chassis_read_can_feedback_v1(
+    MineTeleopChassisCanFeedbackV1* feedback) {
+  try {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_runtime || feedback == nullptr) return -1;
+    *feedback = g_runtime->can_feedback_v1();
     return 0;
   } catch (...) {
     return -5;

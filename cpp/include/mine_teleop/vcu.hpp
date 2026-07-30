@@ -72,6 +72,8 @@ struct Feedback {
   std::array<bool, kMotorCount> motor_mode_valid{};
   std::array<double, kMotorCount> motor_torque_nm{};
   std::array<bool, kMotorCount> motor_torque_valid{};
+  std::array<double, kMotorCount> motor_speed_rpm{};
+  std::array<bool, kMotorCount> motor_speed_valid{};
 
   std::array<int, kSteeringAxisCount> steering_mode{};
   std::array<bool, kSteeringAxisCount> steering_valid{};

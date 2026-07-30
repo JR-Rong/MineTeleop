@@ -425,6 +425,9 @@ void test_control_service_bounds_telemetry_history() {
   expect(
       history.back().at("seq").get<std::uint64_t>() == total_samples,
       "vehicle telemetry history did not retain its newest sample");
+  expect(
+      history.back().at("can_feedback").at("supported").get<bool>() == false,
+      "mock telemetry incorrectly advertised measured CAN feedback");
   const auto summary = service.summary();
   expect(summary.at("telemetry_count").get<std::uint64_t>() == total_samples, "telemetry total count was truncated");
   expect(

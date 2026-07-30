@@ -125,8 +125,17 @@ CanFrame motor_mode_feedback(std::size_t motor, int mode) {
   return frame;
 }
 
-CanFrame motor_torque_feedback(std::size_t motor, double torque_nm) {
+CanFrame motor_torque_feedback(
+    std::size_t motor,
+    double torque_nm,
+    double speed_rpm = 0.0,
+    bool speed_valid = true) {
   CanFrame frame{kMotorStatus01Ids.at(motor)};
+  const auto speed_raw =
+      static_cast<std::uint16_t>(std::llround(speed_rpm + 8000.0));
+  frame.data[0] = static_cast<std::uint8_t>(speed_raw & 0xFFU);
+  frame.data[1] = static_cast<std::uint8_t>(
+      ((speed_raw >> 8U) & 0x3FU) | (speed_valid ? 0x80U : 0U));
   const auto raw = static_cast<std::uint16_t>(std::llround((torque_nm + 800.0) / 0.1));
   frame.data[2] = static_cast<std::uint8_t>(raw & 0xFFU);
   frame.data[3] = static_cast<std::uint8_t>((raw >> 8U) & 0x3FU);
@@ -287,6 +296,21 @@ void test_feedback_decoding_uses_si_units_and_complete_snapshot() {
       std::abs(controller.feedback().speed_mps - 10.0) < 1e-9,
       "VCU kph feedback was not converted to m/s");
   expect(!controller.feedback_complete(), "one CAN frame was treated as a complete feedback snapshot");
+
+  expect(
+      controller.ingest(motor_torque_feedback(0, 123.4, 1450.0)),
+      "motor torque and speed feedback was rejected");
+  expect(
+      std::abs(controller.feedback().motor_torque_nm[0] - 123.4) < 1e-9,
+      "motor torque feedback was not decoded in Nm");
+  expect(
+      controller.feedback().motor_speed_valid[0] &&
+          std::abs(controller.feedback().motor_speed_rpm[0] - 1450.0) < 1e-9,
+      "valid motor speed feedback was not decoded in rpm");
+  expect(
+      controller.ingest(motor_torque_feedback(1, 0.0, -25.0, false)) &&
+          !controller.feedback().motor_speed_valid[1],
+      "invalid motor speed quality was exposed as valid");
 
   controller.ingest(handshake_feedback(5));
   controller.ingest(parking_brake_feedback(1));

@@ -763,6 +763,21 @@ struct VehicleMediaRuntime::Impl {
     send_vcu_handshake_status_locked(result);
   }
 
+  void send_latest_vehicle_telemetry_locked() {
+    if (control_channel == nullptr || !control_link_open ||
+        !control_service_started || !control_service) {
+      return;
+    }
+    const auto& history = control_service->telemetry_history();
+    if (history.empty()) return;
+    const auto& telemetry = history.back();
+    const auto sequence = telemetry.value("seq", std::uint64_t{0});
+    if (sequence == last_vehicle_telemetry_seq) return;
+    const auto payload = telemetry.dump();
+    gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
+    last_vehicle_telemetry_seq = sequence;
+  }
+
   void send_vcu_handshake_status_locked(std::string_view result) {
     if (control_channel == nullptr || !control_link_open ||
         !control_service_started || !control_service) {
@@ -823,6 +838,7 @@ struct VehicleMediaRuntime::Impl {
             create_vehicle_adapter(config));
         control_service->start(signaling.now_ms());
         control_service_started = true;
+        last_vehicle_telemetry_seq = 0;
       }
       emit_diagnostic(
           "vehicle_vcu_adapter_ready",
@@ -920,6 +936,7 @@ struct VehicleMediaRuntime::Impl {
       send_vcu_handshake_status_locked("status_update");
       last_vcu_status_ms = timestamp_ms;
     }
+    if (control_link_open) send_latest_vehicle_telemetry_locked();
   }
 
   [[nodiscard]] std::string current_pipeline_error() const {
@@ -1948,6 +1965,7 @@ struct VehicleMediaRuntime::Impl {
   std::atomic<std::uint64_t> control_link_loss_count{0};
   std::atomic<std::int64_t> last_control_received_at_ms{0};
   std::optional<std::int64_t> last_vcu_status_ms;
+  std::uint64_t last_vehicle_telemetry_seq{0};
   std::string last_vcu_handshake_state;
   std::string last_control_rejection_reason;
   std::optional<std::int64_t> last_control_rejection_log_ms;

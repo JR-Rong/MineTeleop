@@ -128,6 +128,34 @@ struct BridgeHandshakeStatus {
   int speed_valid;
 };
 
+struct BridgeCanFeedbackV1 {
+  int feedback_fresh;
+  long long max_feedback_age_ms;
+  double speed_mps;
+  int speed_valid;
+  int gear;
+  int gear_valid;
+  int emergency_switch;
+  int driver_gear_request;
+  int driver_gear_request_valid;
+  int handshake_status;
+  int handshake_valid;
+  int epb_status[4];
+  int epb_valid[4];
+  int motor_mode[8];
+  int motor_mode_valid[8];
+  double motor_torque_nm[8];
+  int motor_torque_valid[8];
+  double motor_speed_rpm[8];
+  int motor_speed_valid[8];
+  int steering_mode[4];
+  int steering_valid[4];
+  double steering_angle_deg[4];
+  int brake_mode[8];
+  int brake_valid[8];
+  double brake_pressure_bar[8];
+};
+
 std::string bridge_handshake_state(int state) {
   static constexpr std::array<std::string_view, 14> kStates{
       "standby",
@@ -169,6 +197,19 @@ Function load_symbol(void* handle, const char* name) {
     throw std::runtime_error(std::string("dynamic library is missing required symbol ") + name +
                              (error == nullptr ? "" : std::string(": ") + error));
   }
+  return reinterpret_cast<Function>(symbol);
+#endif
+}
+
+template <typename Function>
+Function load_optional_symbol(void* handle, const char* name) noexcept {
+#if defined(_WIN32)
+  return reinterpret_cast<Function>(
+      GetProcAddress(static_cast<HMODULE>(handle), name));
+#else
+  dlerror();
+  void* symbol = dlsym(handle, name);
+  if (dlerror() != nullptr) return nullptr;
   return reinterpret_cast<Function>(symbol);
 #endif
 }
@@ -1057,6 +1098,37 @@ Json VehicleAdapterStatus::to_json() const {
   return value;
 }
 
+Json VehicleCanFeedback::to_json() const {
+  return {
+      {"supported", supported},
+      {"feedback_fresh", feedback_fresh},
+      {"max_feedback_age_ms", max_feedback_age_ms},
+      {"speed_mps", speed_mps},
+      {"speed_valid", speed_valid},
+      {"gear", gear},
+      {"gear_valid", gear_valid},
+      {"emergency_switch", emergency_switch},
+      {"driver_gear_request", driver_gear_request},
+      {"driver_gear_request_valid", driver_gear_request_valid},
+      {"handshake_status", handshake_status},
+      {"handshake_valid", handshake_valid},
+      {"parking_brake_status", parking_brake_status},
+      {"parking_brake_valid", parking_brake_valid},
+      {"motor_mode", motor_mode},
+      {"motor_mode_valid", motor_mode_valid},
+      {"motor_torque_nm", motor_torque_nm},
+      {"motor_torque_valid", motor_torque_valid},
+      {"motor_speed_rpm", motor_speed_rpm},
+      {"motor_speed_valid", motor_speed_valid},
+      {"steering_mode", steering_mode},
+      {"steering_valid", steering_valid},
+      {"steering_angle_deg", steering_angle_deg},
+      {"brake_mode", brake_mode},
+      {"brake_valid", brake_valid},
+      {"brake_pressure_bar", brake_pressure_bar},
+  };
+}
+
 Json VcuHandshakeStatus::to_json() const {
   return {
       {"supported", supported},
@@ -1093,14 +1165,14 @@ void MockVehicleAdapter::apply_safe_stop(const ControlOutput& output) {
 
 VehicleTelemetry MockVehicleAdapter::read_telemetry() {
   if (!latest_output_) return {};
-  return {
-      latest_output_->throttle * 2.0,
-      latest_output_->gear,
-      latest_output_->steering,
-      latest_output_->throttle,
-      latest_output_->brake,
-      latest_output_->estop,
-  };
+  VehicleTelemetry telemetry;
+  telemetry.speed_mps = latest_output_->throttle * 2.0;
+  telemetry.gear = latest_output_->gear;
+  telemetry.steering_feedback = latest_output_->steering;
+  telemetry.throttle_feedback = latest_output_->throttle;
+  telemetry.brake_feedback = latest_output_->brake;
+  telemetry.estop = latest_output_->estop;
+  return telemetry;
 }
 
 bool MockVehicleAdapter::poll_feedback() { return opened_; }
@@ -1186,6 +1258,9 @@ void DynamicLibraryVehicleAdapter::ensure_loaded() {
         handle_,
         "mine_teleop_chassis_read_handshake_status");
     read_fn_ = load_symbol<ReadFn>(handle_, "mine_teleop_chassis_read_telemetry");
+    read_can_feedback_v1_fn_ = load_optional_symbol<ReadCanFeedbackV1Fn>(
+        handle_,
+        "mine_teleop_chassis_read_can_feedback_v1");
     close_fn_ = load_symbol<CloseFn>(handle_, "mine_teleop_chassis_close");
   } catch (...) {
     unload_dynamic_library(handle_);
@@ -1314,14 +1389,53 @@ VcuHandshakeStatus DynamicLibraryVehicleAdapter::vcu_handshake_status() const {
 VehicleTelemetry DynamicLibraryVehicleAdapter::read_telemetry() {
   BridgeTelemetry telemetry{};
   check_result(read_fn_(&telemetry), "mine_teleop_chassis_read_telemetry");
-  return {
-      telemetry.speed_mps,
-      bridge_value_to_gear(telemetry.gear),
-      telemetry.steering_feedback,
-      telemetry.throttle_feedback,
-      telemetry.brake_feedback,
-      telemetry.estop != 0,
-  };
+  VehicleTelemetry result;
+  result.speed_mps = telemetry.speed_mps;
+  result.gear = bridge_value_to_gear(telemetry.gear);
+  result.steering_feedback = telemetry.steering_feedback;
+  result.throttle_feedback = telemetry.throttle_feedback;
+  result.brake_feedback = telemetry.brake_feedback;
+  result.estop = telemetry.estop != 0;
+  if (read_can_feedback_v1_fn_ == nullptr) return result;
+
+  BridgeCanFeedbackV1 raw{};
+  check_result(
+      read_can_feedback_v1_fn_(&raw),
+      "mine_teleop_chassis_read_can_feedback_v1");
+  auto& feedback = result.can_feedback;
+  feedback.supported = true;
+  feedback.feedback_fresh = raw.feedback_fresh != 0;
+  feedback.max_feedback_age_ms = raw.max_feedback_age_ms;
+  feedback.speed_mps = raw.speed_mps;
+  feedback.speed_valid = raw.speed_valid != 0;
+  feedback.gear = raw.gear;
+  feedback.gear_valid = raw.gear_valid != 0;
+  feedback.emergency_switch = raw.emergency_switch;
+  feedback.driver_gear_request = raw.driver_gear_request;
+  feedback.driver_gear_request_valid = raw.driver_gear_request_valid != 0;
+  feedback.handshake_status = raw.handshake_status;
+  feedback.handshake_valid = raw.handshake_valid != 0;
+  for (std::size_t index = 0; index < feedback.parking_brake_status.size(); ++index) {
+    feedback.parking_brake_status[index] = raw.epb_status[index];
+    feedback.parking_brake_valid[index] = raw.epb_valid[index] != 0;
+  }
+  for (std::size_t index = 0; index < feedback.motor_mode.size(); ++index) {
+    feedback.motor_mode[index] = raw.motor_mode[index];
+    feedback.motor_mode_valid[index] = raw.motor_mode_valid[index] != 0;
+    feedback.motor_torque_nm[index] = raw.motor_torque_nm[index];
+    feedback.motor_torque_valid[index] = raw.motor_torque_valid[index] != 0;
+    feedback.motor_speed_rpm[index] = raw.motor_speed_rpm[index];
+    feedback.motor_speed_valid[index] = raw.motor_speed_valid[index] != 0;
+    feedback.brake_mode[index] = raw.brake_mode[index];
+    feedback.brake_valid[index] = raw.brake_valid[index] != 0;
+    feedback.brake_pressure_bar[index] = raw.brake_pressure_bar[index];
+  }
+  for (std::size_t index = 0; index < feedback.steering_mode.size(); ++index) {
+    feedback.steering_mode[index] = raw.steering_mode[index];
+    feedback.steering_valid[index] = raw.steering_valid[index] != 0;
+    feedback.steering_angle_deg[index] = raw.steering_angle_deg[index];
+  }
+  return result;
 }
 
 VehicleAdapterStatus DynamicLibraryVehicleAdapter::status() const {
@@ -1504,6 +1618,7 @@ Json VehicleControlService::build_telemetry(std::int64_t timestamp_ms) {
       {"throttle_feedback", telemetry.throttle_feedback},
       {"brake_feedback", telemetry.brake_feedback},
       {"estop", telemetry.estop},
+      {"can_feedback", telemetry.can_feedback.to_json()},
       {"vehicle_adapter", adapter_->status().to_json()},
       {"vcu_handshake", adapter_->vcu_handshake_status().to_json()},
       {"control_limits", control_limits()},
