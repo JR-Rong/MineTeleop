@@ -293,6 +293,37 @@ struct VehicleConfig {
 
 VehicleConfig load_vehicle_config(const std::filesystem::path& path);
 
+struct VehicleCanFeedback {
+  bool supported{false};
+  bool feedback_fresh{false};
+  std::int64_t max_feedback_age_ms{-1};
+  double speed_mps{0.0};
+  bool speed_valid{false};
+  int gear{0};
+  bool gear_valid{false};
+  int emergency_switch{0};
+  int driver_gear_request{0};
+  bool driver_gear_request_valid{false};
+  int handshake_status{0};
+  bool handshake_valid{false};
+  std::array<int, 4> parking_brake_status{};
+  std::array<bool, 4> parking_brake_valid{};
+  std::array<int, 8> motor_mode{};
+  std::array<bool, 8> motor_mode_valid{};
+  std::array<double, 8> motor_torque_nm{};
+  std::array<bool, 8> motor_torque_valid{};
+  std::array<double, 8> motor_speed_rpm{};
+  std::array<bool, 8> motor_speed_valid{};
+  std::array<int, 4> steering_mode{};
+  std::array<bool, 4> steering_valid{};
+  std::array<double, 4> steering_angle_deg{};
+  std::array<int, 8> brake_mode{};
+  std::array<bool, 8> brake_valid{};
+  std::array<double, 8> brake_pressure_bar{};
+
+  [[nodiscard]] Json to_json() const;
+};
+
 struct VehicleTelemetry {
   double speed_mps{0.0};
   std::string gear{"N"};
@@ -300,6 +331,7 @@ struct VehicleTelemetry {
   double throttle_feedback{0.0};
   double brake_feedback{0.0};
   bool estop{false};
+  VehicleCanFeedback can_feedback;
 };
 
 struct VehicleAdapterStatus {
@@ -419,6 +451,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   using PollFeedbackFn = int (*)(void*);
   using ReadHandshakeFn = int (*)(void*);
   using ReadFn = int (*)(void*);
+  using ReadCanFeedbackV1Fn = int (*)(void*);
   using CloseFn = int (*)();
   OpenFn open_fn_{nullptr};
   ApplyFn apply_fn_{nullptr};
@@ -428,6 +461,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   PollFeedbackFn poll_feedback_fn_{nullptr};
   ReadHandshakeFn read_handshake_fn_{nullptr};
   ReadFn read_fn_{nullptr};
+  ReadCanFeedbackV1Fn read_can_feedback_v1_fn_{nullptr};
   CloseFn close_fn_{nullptr};
 };
 

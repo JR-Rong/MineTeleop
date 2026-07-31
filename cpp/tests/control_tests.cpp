@@ -370,6 +370,16 @@ void test_control_page_contract() {
           response.body.find("function renderControlState()") != std::string::npos,
       "live steering, throttle, and brake feedback is missing");
   expect(
+      response.body.find("id=\"can-feedback-panel\"") != std::string::npos &&
+          response.body.find("id=\"wheel-feedback-grid\"") != std::string::npos &&
+          response.body.find("id=\"steering-feedback-grid\"") != std::string::npos &&
+          response.body.find("message.event==='vehicle_telemetry'") != std::string::npos &&
+          response.body.find("motor_torque_nm") != std::string::npos &&
+          response.body.find("motor_speed_rpm") != std::string::npos &&
+          response.body.find("steering_angle_deg") != std::string::npos &&
+          response.body.find("brake_pressure_bar") != std::string::npos,
+      "complete measured CAN feedback is not rendered from vehicle telemetry");
+  expect(
       response.body.find("ArrowLeft:'left',KeyA:'left'") != std::string::npos &&
           response.body.find("ArrowRight:'right',KeyD:'right'") != std::string::npos &&
           response.body.find("ArrowUp:'up',KeyW:'up'") != std::string::npos &&

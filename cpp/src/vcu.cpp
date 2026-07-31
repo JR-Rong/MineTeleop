@@ -398,6 +398,10 @@ bool ParallelController::ingest(const CanFrame& frame) {
   const auto motor_status01_index = find_id(frame.id, kMotorStatus01Ids);
   if (motor_status01_index < kMotorCount) {
     motor_torque_generation_[motor_status01_index] = ++receive_generation_;
+    feedback_.motor_speed_rpm[motor_status01_index] =
+        decode_physical(extract_signal(frame, 0, 14), 1.0, -8000.0);
+    feedback_.motor_speed_valid[motor_status01_index] =
+        extract_signal(frame, 15, 1) == 1U;
     feedback_.motor_torque_nm[motor_status01_index] =
         decode_physical(extract_signal(frame, 16, 14), 0.1, -800.0);
     feedback_.motor_torque_valid[motor_status01_index] = true;
