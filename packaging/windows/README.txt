@@ -6,19 +6,30 @@ Requirements:
   - 64-bit Windows 10 or Windows 11
   - A current Microsoft Edge, Chrome, or Firefox browser
 
-Start from PowerShell:
+Start the three-machine control client:
+
+  1. Open the bin folder.
+  2. Double-click mine-teleop-control.exe.
+  3. Enter the driver credentials in the browser page that opens.
+
+The executable loads config\driver-console.yaml automatically. That bundled
+default connects to the field three-machine signaling endpoint, resolves it
+inside the application, and verifies it with the bundled private CA.
+
+PowerShell remains available for diagnostics or overrides:
 
   powershell -ExecutionPolicy Bypass -File .\run-control.ps1
 
 The program binds only to 127.0.0.1 and opens the local control page in the
-default browser. The bundled config is a local-development baseline. To use
-the field-tested three-machine endpoint, select its config explicitly:
+default browser. To run the local-development endpoint instead, select its
+config explicitly:
 
-  powershell -ExecutionPolicy Bypass -File .\run-control.ps1 -Config config\driver-console.three-machine.yaml
+  powershell -ExecutionPolicy Bypass -File .\run-control.ps1 -Config config\driver-console.local-development.yaml
 
-The three-machine config resolves teleop-field.internal inside the application
-and verifies it with config\mine-teleop-field-root.crt. It does not require a
-hosts-file change, SSH, SOCKS, or FRP.
+The default three-machine path does not require a hosts-file change, SSH,
+SOCKS, or FRP. On Windows, certificate-chain and hostname verification remain
+enabled; the app accepts an unknown revocation status only when a custom CA
+bundle is explicitly configured and that private CA has no CRL/OCSP endpoint.
 
 Do not store the driver password in this directory, README, or YAML. Enter it
 in the local control page or provide it temporarily through the

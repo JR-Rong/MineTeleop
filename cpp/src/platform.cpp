@@ -10,6 +10,7 @@
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
 #include <shellapi.h>
 #include <windows.h>
 #else
@@ -26,7 +27,13 @@ namespace mine_teleop {
 void initialize_network_process() {
   static std::once_flag initialized;
   std::call_once(initialized, [] {
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    WSADATA data{};
+    const int result = WSAStartup(MAKEWORD(2, 2), &data);
+    if (result != 0) {
+      throw std::runtime_error("WSAStartup failed with code " + std::to_string(result));
+    }
+#else
     if (std::signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
       throw std::runtime_error("failed to ignore SIGPIPE for network transports");
     }

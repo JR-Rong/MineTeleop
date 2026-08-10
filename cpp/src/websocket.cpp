@@ -1,5 +1,15 @@
 #include "mine_teleop/websocket.hpp"
+#include "mine_teleop/curl_tls.hpp"
 #include "mine_teleop/platform.hpp"
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#else
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #include <curl/curl.h>
 
@@ -10,10 +20,6 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #endif
-
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -32,6 +38,38 @@ namespace mine_teleop {
 namespace {
 
 constexpr std::string_view kWebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+#if defined(_WIN32)
+using NativeSocket = SOCKET;
+constexpr short kPollRead = POLLRDNORM;
+constexpr short kPollWrite = POLLWRNORM;
+constexpr int kSendFlags = 0;
+
+int last_socket_error() { return WSAGetLastError(); }
+bool socket_error_interrupted(int error) { return error == WSAEINTR; }
+std::string socket_error_message(int error) {
+  return "Windows socket error " + std::to_string(error);
+}
+#else
+using NativeSocket = int;
+constexpr short kPollRead = POLLIN;
+constexpr short kPollWrite = POLLOUT;
+constexpr int kSendFlags = MSG_NOSIGNAL;
+
+int last_socket_error() { return errno; }
+bool socket_error_interrupted(int error) { return error == EINTR; }
+std::string socket_error_message(int error) { return std::strerror(error); }
+#endif
+
+NativeSocket native_socket(SocketHandle socket) {
+  return static_cast<NativeSocket>(socket);
+}
+
+int socket_buffer_size(std::size_t size) {
+  return static_cast<int>(std::min<std::size_t>(
+      size,
+      static_cast<std::size_t>(std::numeric_limits<int>::max())));
+}
 
 void ensure_curl_global() {
   static std::once_flag initialized;
@@ -212,24 +250,40 @@ void random_bytes(unsigned char* output, std::size_t size) {
 #endif
 }
 
-bool wait_socket(int socket, short events, std::chrono::milliseconds timeout) {
-  pollfd descriptor{socket, events, 0};
+bool wait_socket(SocketHandle socket, short events, std::chrono::milliseconds timeout) {
+#if defined(_WIN32)
+  WSAPOLLFD descriptor{native_socket(socket), events, 0};
+#else
+  pollfd descriptor{native_socket(socket), events, 0};
+#endif
   const auto bounded = std::clamp<std::int64_t>(timeout.count(), 0, std::numeric_limits<int>::max());
   while (true) {
+#if defined(_WIN32)
+    const int result = ::WSAPoll(&descriptor, 1, static_cast<int>(bounded));
+#else
     const int result = ::poll(&descriptor, 1, static_cast<int>(bounded));
+#endif
     if (result > 0) return (descriptor.revents & (events | POLLERR | POLLHUP)) != 0;
     if (result == 0) return false;
-    if (errno != EINTR) throw std::runtime_error(std::string("poll failed: ") + std::strerror(errno));
+    const int error = last_socket_error();
+    if (!socket_error_interrupted(error)) {
+      throw std::runtime_error("poll failed: " + socket_error_message(error));
+    }
   }
 }
 
-void socket_send_all(int socket, std::string_view value) {
+void socket_send_all(SocketHandle socket, std::string_view value) {
   std::size_t sent = 0;
   while (sent < value.size()) {
-    const auto result = ::send(socket, value.data() + sent, value.size() - sent, MSG_NOSIGNAL);
+    const auto result = ::send(
+        native_socket(socket),
+        value.data() + sent,
+        socket_buffer_size(value.size() - sent),
+        kSendFlags);
     if (result < 0) {
-      if (errno == EINTR) continue;
-      throw std::runtime_error(std::string("websocket send failed: ") + std::strerror(errno));
+      const int error = last_socket_error();
+      if (socket_error_interrupted(error)) continue;
+      throw std::runtime_error("websocket send failed: " + socket_error_message(error));
     }
     if (result == 0) throw std::runtime_error("websocket closed while sending");
     sent += static_cast<std::size_t>(result);
@@ -237,7 +291,7 @@ void socket_send_all(int socket, std::string_view value) {
 }
 
 bool socket_receive_exact(
-    int socket,
+    SocketHandle socket,
     char* output,
     std::size_t size,
     std::chrono::steady_clock::time_point deadline) {
@@ -246,14 +300,19 @@ bool socket_receive_exact(
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline || !wait_socket(
             socket,
-            POLLIN,
+            kPollRead,
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now))) {
       throw std::runtime_error("websocket frame timed out");
     }
-    const auto result = ::recv(socket, output + received, size - received, 0);
+    const auto result = ::recv(
+        native_socket(socket),
+        output + received,
+        socket_buffer_size(size - received),
+        0);
     if (result < 0) {
-      if (errno == EINTR) continue;
-      throw std::runtime_error(std::string("websocket receive failed: ") + std::strerror(errno));
+      const int error = last_socket_error();
+      if (socket_error_interrupted(error)) continue;
+      throw std::runtime_error("websocket receive failed: " + socket_error_message(error));
     }
     if (result == 0) return false;
     received += static_cast<std::size_t>(result);
@@ -338,7 +397,7 @@ std::string signaling_websocket_url(
   return url;
 }
 
-ServerWebSocketConnection::ServerWebSocketConnection(int socket, std::size_t max_message_bytes)
+ServerWebSocketConnection::ServerWebSocketConnection(SocketHandle socket, std::size_t max_message_bytes)
     : socket_(socket), max_message_bytes_(max_message_bytes) {
   if (socket_ < 0 || max_message_bytes_ == 0) throw std::invalid_argument("invalid server websocket connection");
 }
@@ -378,7 +437,7 @@ void ServerWebSocketConnection::send_close(std::uint16_t code, std::string_view 
 WebSocketReceiveResult ServerWebSocketConnection::receive_json(std::chrono::milliseconds timeout) {
   const auto first_deadline = std::chrono::steady_clock::now() + timeout;
   while (true) {
-    if (!wait_socket(socket_, POLLIN, timeout)) return {WebSocketReceiveStatus::Timeout, Json::object()};
+    if (!wait_socket(socket_, kPollRead, timeout)) return {WebSocketReceiveStatus::Timeout, Json::object()};
     std::array<char, 2> header{};
     if (!socket_receive_exact(socket_, header.data(), header.size(), first_deadline)) {
       return {WebSocketReceiveStatus::Closed, Json::object()};
@@ -492,8 +551,8 @@ struct WebSocketClient::Impl {
       if (result != CURLE_AGAIN) throw std::runtime_error(std::string("websocket send failed: ") + curl_easy_strerror(result));
       const auto now = std::chrono::steady_clock::now();
       if (now >= deadline || !wait_socket(
-              static_cast<int>(socket),
-              POLLOUT,
+              static_cast<SocketHandle>(socket),
+              kPollWrite,
               std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now))) {
         throw std::runtime_error("websocket send timed out");
       }
@@ -516,8 +575,8 @@ struct WebSocketClient::Impl {
       if (result != CURLE_AGAIN) throw std::runtime_error(std::string("websocket receive failed: ") + curl_easy_strerror(result));
       const auto now = std::chrono::steady_clock::now();
       if (now >= deadline || !wait_socket(
-              static_cast<int>(socket),
-              POLLIN,
+              static_cast<SocketHandle>(socket),
+              kPollRead,
               std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now))) {
         return false;
       }
@@ -617,7 +676,7 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
   curl_easy_setopt(impl_->curl, CURLOPT_USERAGENT, "mine-teleop-websocket/0.2");
   const auto ca_bundle = impl_->ca_bundle.string();
   if (!ca_bundle.empty()) {
-    curl_easy_setopt(impl_->curl, CURLOPT_CAINFO, ca_bundle.c_str());
+    configure_curl_custom_ca(impl_->curl, ca_bundle.c_str());
   } else if (const auto* ca_bundle = std::getenv("CURL_CA_BUNDLE"); ca_bundle != nullptr && *ca_bundle != '\0') {
     curl_easy_setopt(impl_->curl, CURLOPT_CAINFO, ca_bundle);
   } else if (const auto* ca_file = std::getenv("SSL_CERT_FILE"); ca_file != nullptr && *ca_file != '\0') {

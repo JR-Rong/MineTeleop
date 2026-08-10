@@ -1,4 +1,5 @@
 #include "mine_teleop/http.hpp"
+#include "mine_teleop/curl_tls.hpp"
 #include "mine_teleop/platform.hpp"
 
 #include <curl/curl.h>
@@ -161,7 +162,7 @@ HttpResponse HttpClient::request(
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error_buffer.data());
     if (!ca_bundle.empty()) {
-      curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle.c_str());
+      configure_curl_custom_ca(curl, ca_bundle.c_str());
     } else if (const auto* ca_bundle = std::getenv("CURL_CA_BUNDLE"); ca_bundle != nullptr && *ca_bundle != '\0') {
       curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle);
     } else if (const auto* ca_file = std::getenv("SSL_CERT_FILE"); ca_file != nullptr && *ca_file != '\0') {

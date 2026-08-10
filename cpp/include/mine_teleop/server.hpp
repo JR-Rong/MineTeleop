@@ -46,7 +46,7 @@ struct ServerResponse {
 class SimpleHttpServer {
  public:
   using Handler = std::function<ServerResponse(const HttpRequest&)>;
-  using WebSocketHandler = std::function<bool(int, const HttpRequest&)>;
+  using WebSocketHandler = std::function<bool(SocketHandle, const HttpRequest&)>;
 
   SimpleHttpServer(
       std::string host,
@@ -66,7 +66,7 @@ class SimpleHttpServer {
 
  private:
   void open_listener();
-  void serve_client(int client_fd) const;
+  void serve_client(SocketHandle client_fd) const;
 
   std::string host_;
   std::uint16_t requested_port_;
@@ -76,8 +76,8 @@ class SimpleHttpServer {
   std::atomic<bool> stopping_{false};
   mutable std::mutex clients_mutex_;
   mutable std::condition_variable clients_stopped_;
-  std::unordered_set<int> client_sockets_;
-  std::atomic<int> listener_fd_{-1};
+  std::unordered_set<SocketHandle> client_sockets_;
+  std::atomic<SocketHandle> listener_fd_{kInvalidSocket};
   std::uint16_t bound_port_{0};
   std::thread thread_;
 };
@@ -128,7 +128,7 @@ class SignalingService {
   ~SignalingService();
 
   [[nodiscard]] ServerResponse handle(const HttpRequest& request);
-  [[nodiscard]] bool handle_websocket(int socket, const HttpRequest& request);
+  [[nodiscard]] bool handle_websocket(SocketHandle socket, const HttpRequest& request);
   [[nodiscard]] Json health() const;
 
  private:

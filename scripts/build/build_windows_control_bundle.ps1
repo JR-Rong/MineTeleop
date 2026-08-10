@@ -158,10 +158,12 @@ Copy-Item -LiteralPath $Executable -Destination (Join-Path $PackageRoot "bin")
 Get-ChildItem -LiteralPath $ConfigurationDirectory -Filter "*.dll" -File | ForEach-Object {
   Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $PackageRoot "bin")
 }
-Copy-Item -LiteralPath (Join-Path $RepoRoot "configs\driver-console.dev.yaml") `
+Copy-Item -LiteralPath (Join-Path $RepoRoot "configs\driver-console.three-machine.dev.yaml") `
   -Destination (Join-Path $PackageRoot "config\driver-console.yaml")
 Copy-Item -LiteralPath (Join-Path $RepoRoot "configs\driver-console.three-machine.dev.yaml") `
   -Destination (Join-Path $PackageRoot "config\driver-console.three-machine.yaml")
+Copy-Item -LiteralPath (Join-Path $RepoRoot "configs\driver-console.dev.yaml") `
+  -Destination (Join-Path $PackageRoot "config\driver-console.local-development.yaml")
 Copy-Item -LiteralPath (Join-Path $RepoRoot "configs\mine-teleop-field-root.crt") `
   -Destination (Join-Path $PackageRoot "config\mine-teleop-field-root.crt")
 Copy-Item -Path (Join-Path $RepoRoot "protocol\v1\*") `
