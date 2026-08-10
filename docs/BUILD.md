@@ -9,6 +9,7 @@
 | --- | --- | --- | --- |
 | 云端 | Ubuntu 22.04 amd64 | `scripts/build/build_macos_cloud_bundle.sh` | `dist/mine-teleop-cloud-ubuntu22.04-x64-*.tar.gz` |
 | 控制端 | macOS arm64/x64 | `scripts/build/build_macos_control_bundle.sh` | `dist/mine-teleop-control-macos-*.tar.gz` |
+| 控制端 | Windows x64/arm64 | `scripts/build/build_windows_control_bundle.ps1` | `dist/mine-teleop-control-windows-*.zip` |
 | 车端 | Ubuntu 22.04 amd64 | `scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64` | `dist/mine-teleop-vehicle-ubuntu22.04-x64-*.tar.gz` |
 
 所有构建脚本都会同时生成 `.sha256` 文件。安装包不包含司机密码、车辆
@@ -92,7 +93,46 @@ MINE_TELEOP_MACOS_ARCH=x64 \
 
 build-only 包必须在同架构 Mac 上补做运行验收后才能交付。
 
-## 5. Apple Silicon Mac 从零构建车端
+## 5. 构建 Windows 控制端
+
+Windows 构建机需要：
+
+- Windows 10/11；
+- Visual Studio 2022，并安装“使用 C++ 的桌面开发”；
+- CMake；
+- vcpkg，且已设置 `VCPKG_ROOT`。
+
+在 PowerShell 中从仓库根目录运行：
+
+```powershell
+$env:VCPKG_ROOT = "C:\src\vcpkg"
+powershell -ExecutionPolicy Bypass -File .\scripts\build\build_windows_control_bundle.ps1
+```
+
+脚本默认使用 `x64-windows`，自动安装控制端依赖和收集 app-local DLL，只构建
+`mine-teleop-control`，并生成 ZIP 与 SHA-256。若依赖已准备好，可跳过安装：
+
+```powershell
+.\scripts\build\build_windows_control_bundle.ps1 -SkipDependencyInstall
+```
+
+生成包前额外运行 `mine-teleop-control.exe --help` 启动检查：
+
+```powershell
+.\scripts\build\build_windows_control_bundle.ps1 -SmokeTest
+```
+
+构建 arm64 包：
+
+```powershell
+.\scripts\build\build_windows_control_bundle.ps1 -Architecture arm64
+```
+
+当前仓库尚未记录 Windows 实机编译和运行验收证据，因此生成的 ZIP 必须在目标
+Windows 上完成启动、仅回环监听、浏览器、端口冲突、HTTPS/WSS 证书、登录、媒体、
+DataChannel、急停、安全释放和退出后端口清理检查，不能仅凭生成压缩包视为交付通过。
+
+## 6. Apple Silicon Mac 从零构建车端
 
 推荐沿用统一入口：
 
@@ -154,7 +194,7 @@ MINE_TELEOP_CHASSIS_CONTROL_LIBRARY=/path/to/libchassis_control.so \
 验证文件存在且 bridge 的动态依赖全部可解析；因此缺少底盘库时构建会明确失败，
 不会再生成表面通过、运行时才报 `dlopen` 失败的安装包。
 
-## 6. 原生 Ubuntu amd64 构建车端
+## 7. 原生 Ubuntu amd64 构建车端
 
 在 Ubuntu 22.04 amd64 构建机上仍使用统一入口：
 
@@ -173,7 +213,7 @@ MINE_TELEOP_BASE_BUNDLE_ARCHIVE=/path/to/accepted-vehicle-bundle.tar.gz \
 该模式仍会重新构建当前 Mine Teleop 二进制。需要重新验证最终安装包时追加
 `test` 参数。
 
-## 7. 构建后检查
+## 8. 构建后检查
 
 查看产物和校验和：
 
@@ -199,7 +239,7 @@ scripts/test/check_macos_control_bundle.sh "$control_archive"
 完整测试矩阵和硬件验收边界见
 [11-testing-and-validation.md](11-testing-and-validation.md)。
 
-## 8. 常见构建问题
+## 9. 常见构建问题
 
 ### Docker 未运行
 
