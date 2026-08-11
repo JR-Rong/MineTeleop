@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "mine_teleop/http.hpp"
+#include "mine_teleop/platform.hpp"
 
 namespace mine_teleop {
 
@@ -34,7 +35,7 @@ struct WebSocketReceiveResult {
 
 class ServerWebSocketConnection {
  public:
-  ServerWebSocketConnection(int socket, std::size_t max_message_bytes);
+  ServerWebSocketConnection(SocketHandle socket, std::size_t max_message_bytes);
 
   [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout);
   void send_json(const Json& value) const;
@@ -43,7 +44,7 @@ class ServerWebSocketConnection {
  private:
   void send_frame(std::uint8_t opcode, std::string_view payload) const;
 
-  int socket_;
+  SocketHandle socket_;
   std::size_t max_message_bytes_;
 };
 

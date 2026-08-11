@@ -1,8 +1,16 @@
 #include "mine_teleop/server.hpp"
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 #if defined(__APPLE__)
 #include <CommonCrypto/CommonHMAC.h>
 #include <Security/Security.h>
@@ -11,8 +19,6 @@
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #endif
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -35,6 +41,99 @@
 
 namespace mine_teleop {
 namespace {
+
+#if defined(_WIN32)
+using NativeSocket = SOCKET;
+using SocketLength = int;
+constexpr int kSendFlags = 0;
+constexpr int kShutdownBoth = SD_BOTH;
+
+int last_socket_error() { return WSAGetLastError(); }
+bool socket_error_interrupted(int error) { return error == WSAEINTR; }
+bool socket_error_closed(int error) {
+  return error == WSAENOTSOCK || error == WSAEINVAL;
+}
+std::string socket_error_message(int error) {
+  return "Windows socket error " + std::to_string(error);
+}
+std::string address_error_message(int error) {
+  return "Windows address resolution error " + std::to_string(error);
+}
+#else
+using NativeSocket = int;
+using SocketLength = socklen_t;
+constexpr int kSendFlags = MSG_NOSIGNAL;
+constexpr int kShutdownBoth = SHUT_RDWR;
+
+int last_socket_error() { return errno; }
+bool socket_error_interrupted(int error) { return error == EINTR; }
+bool socket_error_closed(int error) { return error == EBADF || error == EINVAL; }
+std::string socket_error_message(int error) { return std::strerror(error); }
+std::string address_error_message(int error) { return ::gai_strerror(error); }
+#endif
+
+NativeSocket native_socket(SocketHandle socket) {
+  return static_cast<NativeSocket>(socket);
+}
+
+int socket_buffer_size(std::size_t size) {
+  return static_cast<int>(std::min<std::size_t>(
+      size,
+      static_cast<std::size_t>(std::numeric_limits<int>::max())));
+}
+
+void close_socket(SocketHandle socket) {
+  if (socket == kInvalidSocket) return;
+#if defined(_WIN32)
+  ::closesocket(native_socket(socket));
+#else
+  ::close(native_socket(socket));
+#endif
+}
+
+void shutdown_socket(SocketHandle socket) {
+  if (socket != kInvalidSocket) {
+    ::shutdown(native_socket(socket), kShutdownBoth);
+  }
+}
+
+int socket_inet_pton(int family, const char* source, void* destination) {
+#if defined(_WIN32)
+  return ::InetPtonA(family, source, destination);
+#else
+  return ::inet_pton(family, source, destination);
+#endif
+}
+
+const char* socket_inet_ntop(
+    int family,
+    const void* source,
+    char* destination,
+    std::size_t destination_size) {
+#if defined(_WIN32)
+  return ::InetNtopA(
+      family,
+      const_cast<void*>(source),
+      destination,
+      static_cast<DWORD>(destination_size));
+#else
+  return ::inet_ntop(family, source, destination, destination_size);
+#endif
+}
+
+void configure_listener_socket(SocketHandle socket) {
+  int enabled = 1;
+#if defined(_WIN32)
+  ::setsockopt(
+      native_socket(socket),
+      SOL_SOCKET,
+      SO_EXCLUSIVEADDRUSE,
+      reinterpret_cast<const char*>(&enabled),
+      sizeof(enabled));
+#else
+  ::setsockopt(native_socket(socket), SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+#endif
+}
 
 class Unauthorized final : public std::runtime_error {
  public:
@@ -107,21 +206,23 @@ std::optional<std::string> canonical_ip_address(std::string value) {
 
   std::array<unsigned char, sizeof(in6_addr)> binary{};
   std::array<char, INET6_ADDRSTRLEN> text{};
-  if (::inet_pton(AF_INET, value.c_str(), binary.data()) == 1) {
-    if (::inet_ntop(AF_INET, binary.data(), text.data(), text.size()) == nullptr) return std::nullopt;
+  if (socket_inet_pton(AF_INET, value.c_str(), binary.data()) == 1) {
+    if (socket_inet_ntop(AF_INET, binary.data(), text.data(), text.size()) == nullptr) return std::nullopt;
     return std::string(text.data());
   }
-  if (::inet_pton(AF_INET6, value.c_str(), binary.data()) == 1) {
-    if (::inet_ntop(AF_INET6, binary.data(), text.data(), text.size()) == nullptr) return std::nullopt;
+  if (socket_inet_pton(AF_INET6, value.c_str(), binary.data()) == 1) {
+    if (socket_inet_ntop(AF_INET6, binary.data(), text.data(), text.size()) == nullptr) return std::nullopt;
     return std::string(text.data());
   }
   return std::nullopt;
 }
 
-std::string socket_peer_address(int socket) {
+std::string socket_peer_address(SocketHandle socket) {
   sockaddr_storage peer{};
-  socklen_t peer_size = sizeof(peer);
-  if (::getpeername(socket, reinterpret_cast<sockaddr*>(&peer), &peer_size) != 0) return "unknown";
+  SocketLength peer_size = sizeof(peer);
+  if (::getpeername(native_socket(socket), reinterpret_cast<sockaddr*>(&peer), &peer_size) != 0) {
+    return "unknown";
+  }
 
   std::array<char, INET6_ADDRSTRLEN> text{};
   const void* address = nullptr;
@@ -132,7 +233,7 @@ std::string socket_peer_address(int socket) {
   } else {
     return "unknown";
   }
-  if (::inet_ntop(peer.ss_family, address, text.data(), text.size()) == nullptr) return "unknown";
+  if (socket_inet_ntop(peer.ss_family, address, text.data(), text.size()) == nullptr) return "unknown";
   return std::string(text.data());
 }
 
@@ -590,20 +691,25 @@ std::string status_reason(int status) {
   }
 }
 
-void send_all(int socket, std::string_view value) {
+void send_all(SocketHandle socket, std::string_view value) {
   std::size_t sent = 0;
   while (sent < value.size()) {
-    const auto result = ::send(socket, value.data() + sent, value.size() - sent, MSG_NOSIGNAL);
+    const auto result = ::send(
+        native_socket(socket),
+        value.data() + sent,
+        socket_buffer_size(value.size() - sent),
+        kSendFlags);
     if (result < 0) {
-      if (errno == EINTR) continue;
-      throw std::runtime_error(std::string("send failed: ") + std::strerror(errno));
+      const int error = last_socket_error();
+      if (socket_error_interrupted(error)) continue;
+      throw std::runtime_error("send failed: " + socket_error_message(error));
     }
     if (result == 0) throw std::runtime_error("connection closed while sending response");
     sent += static_cast<std::size_t>(result);
   }
 }
 
-void send_http_response(int socket, const ServerResponse& response) {
+void send_http_response(SocketHandle socket, const ServerResponse& response) {
   std::ostringstream header;
   header << "HTTP/1.1 " << response.status << ' ' << status_reason(response.status) << "\r\n"
          << "Content-Type: " << response.content_type << "\r\n"
@@ -632,16 +738,18 @@ void add_request_id_header(ServerResponse& response, std::string_view request_id
   response.headers.emplace_back("X-Request-ID", request_id);
 }
 
-HttpRequest parse_request(int socket, std::size_t max_body_bytes) {
+HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
   constexpr std::size_t max_headers = 64 * 1024;
   std::string wire;
   std::array<char, 16 * 1024> buffer{};
   std::size_t header_end = std::string::npos;
   while ((header_end = wire.find("\r\n\r\n")) == std::string::npos) {
-    const auto received = ::recv(socket, buffer.data(), buffer.size(), 0);
+    const auto received = ::recv(
+        native_socket(socket), buffer.data(), socket_buffer_size(buffer.size()), 0);
     if (received < 0) {
-      if (errno == EINTR) continue;
-      throw std::runtime_error(std::string("recv failed: ") + std::strerror(errno));
+      const int error = last_socket_error();
+      if (socket_error_interrupted(error)) continue;
+      throw std::runtime_error("recv failed: " + socket_error_message(error));
     }
     if (received == 0) throw std::invalid_argument("client closed before sending HTTP headers");
     wire.append(buffer.data(), static_cast<std::size_t>(received));
@@ -680,10 +788,12 @@ HttpRequest parse_request(int socket, std::size_t max_body_bytes) {
   if (content_length > max_body_bytes) throw std::length_error("request body too large");
   const auto body_start = header_end + 4;
   while (wire.size() - body_start < content_length) {
-    const auto received = ::recv(socket, buffer.data(), buffer.size(), 0);
+    const auto received = ::recv(
+        native_socket(socket), buffer.data(), socket_buffer_size(buffer.size()), 0);
     if (received < 0) {
-      if (errno == EINTR) continue;
-      throw std::runtime_error(std::string("recv failed: ") + std::strerror(errno));
+      const int error = last_socket_error();
+      if (socket_error_interrupted(error)) continue;
+      throw std::runtime_error("recv failed: " + socket_error_message(error));
     }
     if (received == 0) throw std::invalid_argument("client closed before sending HTTP body");
     wire.append(buffer.data(), static_cast<std::size_t>(received));
@@ -1161,7 +1271,8 @@ SimpleHttpServer::SimpleHttpServer(
 SimpleHttpServer::~SimpleHttpServer() { stop(); }
 
 void SimpleHttpServer::open_listener() {
-  if (listener_fd_ >= 0) return;
+  if (listener_fd_ != kInvalidSocket) return;
+  initialize_network_process();
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
@@ -1169,34 +1280,47 @@ void SimpleHttpServer::open_listener() {
   addrinfo* addresses = nullptr;
   const auto service = std::to_string(requested_port_);
   const int resolve = ::getaddrinfo(host_.c_str(), service.c_str(), &hints, &addresses);
-  if (resolve != 0) throw std::runtime_error(std::string("cannot resolve HTTP bind address: ") + gai_strerror(resolve));
-  int saved_errno = 0;
+  if (resolve != 0) {
+    throw std::runtime_error("cannot resolve HTTP bind address: " + address_error_message(resolve));
+  }
+  int saved_error = 0;
   for (auto* address = addresses; address != nullptr; address = address->ai_next) {
-    listener_fd_ = ::socket(address->ai_family, address->ai_socktype, address->ai_protocol);
-    if (listener_fd_ < 0) {
-      saved_errno = errno;
+    const auto candidate = ::socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+#if defined(_WIN32)
+    if (candidate == INVALID_SOCKET) {
+#else
+    if (candidate < 0) {
+#endif
+      saved_error = last_socket_error();
       continue;
     }
-    int reuse = 1;
-    ::setsockopt(listener_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    if (::bind(listener_fd_, address->ai_addr, address->ai_addrlen) == 0 && ::listen(listener_fd_, 64) == 0) break;
-    saved_errno = errno;
-    ::close(listener_fd_);
-    listener_fd_ = -1;
+    listener_fd_ = static_cast<SocketHandle>(candidate);
+    configure_listener_socket(listener_fd_);
+    if (::bind(native_socket(listener_fd_), address->ai_addr, address->ai_addrlen) == 0 &&
+        ::listen(native_socket(listener_fd_), 64) == 0) {
+      break;
+    }
+    saved_error = last_socket_error();
+    close_socket(listener_fd_);
+    listener_fd_ = kInvalidSocket;
   }
   ::freeaddrinfo(addresses);
-  if (listener_fd_ < 0) throw std::runtime_error(std::string("cannot bind HTTP listener: ") + std::strerror(saved_errno));
+  if (listener_fd_ == kInvalidSocket) {
+    throw std::runtime_error(
+        "cannot bind HTTP listener: " + socket_error_message(saved_error));
+  }
 
   sockaddr_storage bound{};
-  socklen_t length = sizeof(bound);
-  if (::getsockname(listener_fd_, reinterpret_cast<sockaddr*>(&bound), &length) != 0) {
-    throw std::runtime_error(std::string("getsockname failed: ") + std::strerror(errno));
+  SocketLength length = sizeof(bound);
+  if (::getsockname(native_socket(listener_fd_), reinterpret_cast<sockaddr*>(&bound), &length) != 0) {
+    throw std::runtime_error(
+        "getsockname failed: " + socket_error_message(last_socket_error()));
   }
   if (bound.ss_family == AF_INET) bound_port_ = ntohs(reinterpret_cast<sockaddr_in*>(&bound)->sin_port);
   if (bound.ss_family == AF_INET6) bound_port_ = ntohs(reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port);
 }
 
-void SimpleHttpServer::serve_client(int client_fd) const {
+void SimpleHttpServer::serve_client(SocketHandle client_fd) const {
   ServerResponse response;
   try {
     auto request = parse_request(client_fd, max_body_bytes_);
@@ -1219,12 +1343,18 @@ void SimpleHttpServer::serve_client(int client_fd) const {
 void SimpleHttpServer::serve_forever() {
   open_listener();
   while (!stopping_) {
-    const int client = ::accept(listener_fd_, nullptr, nullptr);
-    if (client < 0) {
-      if (errno == EINTR) continue;
-      if (stopping_ || errno == EBADF || errno == EINVAL) break;
+    const auto accepted = ::accept(native_socket(listener_fd_), nullptr, nullptr);
+#if defined(_WIN32)
+    if (accepted == INVALID_SOCKET) {
+#else
+    if (accepted < 0) {
+#endif
+      const int error = last_socket_error();
+      if (socket_error_interrupted(error)) continue;
+      if (stopping_ || socket_error_closed(error)) break;
       continue;
     }
+    const auto client = static_cast<SocketHandle>(accepted);
     {
       std::lock_guard lock(clients_mutex_);
       client_sockets_.insert(client);
@@ -1232,8 +1362,8 @@ void SimpleHttpServer::serve_forever() {
     try {
       std::thread([this, client] {
         serve_client(client);
-        ::shutdown(client, SHUT_RDWR);
-        ::close(client);
+        shutdown_socket(client);
+        close_socket(client);
         {
           std::lock_guard lock(clients_mutex_);
           client_sockets_.erase(client);
@@ -1245,8 +1375,8 @@ void SimpleHttpServer::serve_forever() {
         std::lock_guard lock(clients_mutex_);
         client_sockets_.erase(client);
       }
-      ::shutdown(client, SHUT_RDWR);
-      ::close(client);
+      shutdown_socket(client);
+      close_socket(client);
       throw;
     }
   }
@@ -1261,15 +1391,15 @@ void SimpleHttpServer::start() {
 
 void SimpleHttpServer::stop() {
   stopping_ = true;
-  if (listener_fd_ >= 0) {
-    ::shutdown(listener_fd_, SHUT_RDWR);
-    ::close(listener_fd_);
-    listener_fd_ = -1;
+  if (listener_fd_ != kInvalidSocket) {
+    shutdown_socket(listener_fd_);
+    close_socket(listener_fd_);
+    listener_fd_ = kInvalidSocket;
   }
   if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) thread_.join();
   {
     std::lock_guard lock(clients_mutex_);
-    for (const auto client : client_sockets_) ::shutdown(client, SHUT_RDWR);
+    for (const auto client : client_sockets_) shutdown_socket(client);
   }
   std::unique_lock lock(clients_mutex_);
   clients_stopped_.wait(lock, [this] { return client_sockets_.empty(); });
@@ -1887,7 +2017,7 @@ ServerResponse SignalingService::handle(const HttpRequest& request) {
   return response;
 }
 
-bool SignalingService::handle_websocket(int socket, const HttpRequest& request) {
+bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& request) {
   const auto parts = path_parts(request.path);
   if (parts.size() != 3 || parts[0] != "signaling" || parts[2] != "ws") return false;
   RequestIdScope request_id("request-" + random_token(12));
