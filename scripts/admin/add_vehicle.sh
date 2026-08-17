@@ -482,8 +482,16 @@ select_yaml_engine
 
 config_path="$(CDPATH= cd -- "$(dirname -- "$config_path")" && pwd)/$(basename -- "$config_path")"
 config_dir="$(dirname -- "$config_path")"
-[[ -n "$secrets_dir" ]] || secrets_dir="$config_dir/secrets"
-token_path="${secrets_dir%/}/${vehicle_id}.token"
+# The default credential directory is resolved against the config directory so
+# the recorded device_token_file stays relative to the YAML. An explicit
+# --secrets-dir is resolved against the caller's CWD (matching add_driver.sh).
+if [[ -z "$secrets_dir" ]]; then
+  secrets_dir="$config_dir/secrets"
+elif [[ "$secrets_dir" != /* ]]; then
+  secrets_dir="$PWD/$secrets_dir"
+fi
+secrets_dir="${secrets_dir%/}"
+token_path="$secrets_dir/${vehicle_id}.token"
 
 # `device_token_file` is resolved relative to the config directory by the server,
 # so prefer a relative reference. The plain prefix strip keeps the common case
@@ -577,15 +585,30 @@ find_validator() {
   return 1
 }
 
+# Validate a rendered config. Returns 0 when the server accepts it, or when the
+# only failure is a pre-existing identity whose secret comes from the
+# environment (unrelated to the file-based vehicle added here). Any other
+# failure is propagated. The outcome is recorded in validation_note.
+validation_note=""
 validate_config() {
-  local file="$1"
-  env -u MINE_TELEOP_DRIVER_PASSWORD -u MINE_TELEOP_DEVICE_TOKEN \
+  local file="$1" output status=0
+  output="$(env -u MINE_TELEOP_DRIVER_PASSWORD -u MINE_TELEOP_DEVICE_TOKEN \
     -u MINE_TELEOP_SIGNALING_CONFIG \
-    "$validator" --validate-config --config "$file" 2>&1
+    "$validator" --validate-config --config "$file" 2>&1)" || status=$?
+  if [[ $status -eq 0 ]]; then
+    validation_note="passed"
+    return 0
+  fi
+  if grep -q 'environment variable is unset or empty' <<<"$output"; then
+    warn "skipped full validation: an existing identity reads its secret from the environment"
+    validation_note="skipped (an existing identity reads its secret from the environment)"
+    return 0
+  fi
+  printf '%s\n' "$output" >&2
+  return "$status"
 }
 
 validator=""
-baseline_valid="unknown"
 # Checked here rather than inside find_validator: that runs in a command
 # substitution, where an abort would only end the subshell.
 if [[ -n "${MINE_TELEOP_SIGNALING_BIN:-}" && ! -x "${MINE_TELEOP_SIGNALING_BIN}" ]]; then
@@ -593,13 +616,8 @@ if [[ -n "${MINE_TELEOP_SIGNALING_BIN:-}" && ! -x "${MINE_TELEOP_SIGNALING_BIN}"
 fi
 if validator="$(find_validator)"; then
   note "validator: $validator"
-  if validate_config "$config_path" >/dev/null 2>&1; then
-    baseline_valid="yes"
-  else
-    baseline_valid="no"
-    warn "the unmodified config does not validate in this environment; post-change validation will be skipped"
-  fi
 else
+  validator=""
   note "validator: not found (skipping --validate-config)"
 fi
 
@@ -631,6 +649,7 @@ fi
 # ---------------------------------------------------------------------------
 
 created_token="no"
+created_secrets_dir="no"
 temporary_config=""
 committed="no"
 
@@ -640,21 +659,29 @@ cleanup() {
     rm -f -- "$token_path"
     warn "removed the freshly generated token $token_path because the config was not updated"
   fi
+  if [[ "$committed" != "yes" && "$created_secrets_dir" == "yes" ]]; then
+    rmdir -- "$secrets_dir" 2>/dev/null || true
+  fi
+  return 0
 }
 trap cleanup EXIT
 
 step "generating device token"
 if [[ ! -d "$secrets_dir" ]]; then
   mkdir -p -- "$secrets_dir"
+  created_secrets_dir="yes"
   chmod 0700 -- "$secrets_dir"
   note "created $secrets_dir (mode 0700)"
 fi
 [[ -d "$secrets_dir" && -w "$secrets_dir" ]] || fail "secrets directory is not writable: $secrets_dir"
 
-(
+if ! (
   umask 077
   openssl rand -hex 32 >"$token_path"
-)
+); then
+  rm -f -- "$token_path"
+  fail "openssl failed to generate a device token for $vehicle_id"
+fi
 created_token="yes"
 chmod 0600 -- "$token_path"
 [[ -n "$(tr -d '[:space:]' <"$token_path")" ]] || fail "generated token file is empty: $token_path"
@@ -672,13 +699,26 @@ for driver in ${assign_drivers[@]+"${assign_drivers[@]}"}; do
   note "auth.drivers[$driver].vehicles += $vehicle_id"
 done
 
-if [[ "$baseline_valid" == "yes" ]]; then
+# Re-read the rendered config: the text backend edits by indentation, so confirm
+# the change landed exactly once before trusting it (validation may be partial).
+step "verifying the pending config"
+if [[ "$(yaml_ids "$temporary_config" vehicles | grep -c -x -F -- "$vehicle_id")" != "1" ]]; then
+  fail "the rendered config does not contain exactly one '$vehicle_id' vehicle; $config_path is unchanged"
+fi
+for driver in ${assign_drivers[@]+"${assign_drivers[@]}"}; do
+  if ! yaml_driver_vehicles "$temporary_config" "$driver" | grep -q -x -F -- "$vehicle_id"; then
+    fail "driver $driver did not gain $vehicle_id in the rendered config; $config_path is unchanged"
+  fi
+done
+
+if [[ -n "$validator" ]]; then
   step "validating the updated config"
-  if ! validation_output="$(validate_config "$temporary_config")"; then
-    printf '%s\n' "$validation_output" >&2
+  if ! validate_config "$temporary_config"; then
     fail "the updated config was rejected; $config_path is unchanged"
   fi
-  ok "mine-teleop-signaling-server --validate-config accepted the config"
+  if [[ "$validation_note" == "passed" ]]; then
+    ok "mine-teleop-signaling-server --validate-config accepted the config"
+  fi
 fi
 
 chmod "$config_mode" -- "$temporary_config"
@@ -701,11 +741,13 @@ if ((${#assign_drivers[@]})); then
 else
   printf '  drivers updated  none (no driver may reach %s yet)\n' "$vehicle_id"
 fi
-case "$baseline_valid" in
-  yes) printf '  validation       passed\n' ;;
-  no) printf '  validation       skipped (the config already failed validation before the change)\n' ;;
-  *) printf '  validation       skipped (mine-teleop-signaling-server not found)\n' ;;
-esac
+if [[ -z "$validator" ]]; then
+  printf '  validation       skipped (mine-teleop-signaling-server not found)\n'
+elif [[ "$validation_note" == "passed" ]]; then
+  printf '  validation       passed\n'
+else
+  printf '  validation       %s\n' "$validation_note"
+fi
 printf '\n%sReminder:%s restart the signaling server to load the new identity, e.g.\n' \
   "$color_yellow" "$color_reset"
 printf '  sudo systemctl restart mine-teleop-signaling-server.service\n'

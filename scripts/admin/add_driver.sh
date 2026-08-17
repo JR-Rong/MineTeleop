@@ -577,8 +577,15 @@ fi
 
 # Render the modified document into a sibling temp file: relative password_file
 # paths then resolve exactly as they will once the file is in place.
+created_secrets_dir="no"
+created_password="no"
 work_path="$(mktemp "$config_dir/.${config_name}.add-driver.XXXXXX")"
-cleanup() { rm -f -- "$work_path"; }
+cleanup() {
+  rm -f -- "$work_path"
+  [[ "$created_password" == "yes" ]] && rm -f -- "$password_path"
+  [[ "$created_secrets_dir" == "yes" ]] && rmdir -- "$secrets_dir" 2>/dev/null
+  return 0
+}
 trap cleanup EXIT
 cat -- "$config_path" >"$work_path"
 
@@ -613,16 +620,18 @@ fi
 # not exist yet.
 if [[ ! -d "$secrets_dir" ]]; then
   (umask 077 && mkdir -p -- "$secrets_dir") || die "cannot create secrets directory: $secrets_dir"
+  created_secrets_dir="yes"
   chmod 0700 -- "$secrets_dir"
   ok "created secrets directory $secrets_dir (mode 0700)"
 fi
 [[ -w "$secrets_dir" ]] || die "secrets directory is not writable: $secrets_dir"
 
-(umask 077 && openssl rand -base64 32 >"$password_path") ||
+if ! (umask 077 && openssl rand -base64 32 >"$password_path"); then
+  rm -f -- "$password_path"
   die "openssl failed to generate a password for $driver_id"
+fi
+created_password="yes"
 chmod 0600 -- "$password_path"
-password_cleanup() { rm -f -- "$password_path"; }
-trap 'cleanup; password_cleanup' EXIT
 [[ -n "$(tr -d '\r\n' <"$password_path")" ]] ||
   die "generated credential is empty after trimming: $password_path"
 ok "generated credential $password_path (mode 0600)"
