@@ -33,6 +33,9 @@
 #   NO_COLOR                          disable colored output
 #
 set -euo pipefail
+umask 077
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
   color_reset=$'\033[0m'
@@ -67,6 +70,7 @@ Required:
 
 Options:
   --secrets-dir DIR         credential directory (default: secrets/ next to the config)
+  --backup-dir DIR          config backup directory (default: backups/ next to the config)
   --dry-run                 report the planned changes without writing anything
   --help                    show this help
 
@@ -416,6 +420,7 @@ yaml_show_driver() {
 driver_id=''
 config_path=''
 secrets_dir=''
+backup_dir=''
 vehicles_csv=''
 dry_run=0
 
@@ -438,6 +443,11 @@ while [[ $# -gt 0 ]]; do
     --secrets-dir)
       require_value "$1" "${2:-}"
       secrets_dir="$2"
+      shift 2
+      ;;
+    --backup-dir)
+      require_value "$1" "${2:-}"
+      backup_dir="$2"
       shift 2
       ;;
     --vehicles)
@@ -468,6 +478,7 @@ done
   die "driver id must start alphanumeric and contain only letters, digits, '.', '_' or '-': $driver_id"
 
 command -v openssl >/dev/null 2>&1 || die "openssl is required but was not found in PATH"
+command -v flock >/dev/null 2>&1 || die "flock is required but was not found in PATH"
 select_yaml_engine
 
 [[ -f "$config_path" ]] || die "config file does not exist: $config_path"
@@ -489,6 +500,18 @@ elif [[ "$secrets_dir" != /* ]]; then
   secrets_dir="$PWD/$secrets_dir"
 fi
 secrets_dir="${secrets_dir%/}"
+if [[ -z "$backup_dir" ]]; then
+  backup_dir="$config_dir/backups"
+elif [[ "$backup_dir" != /* ]]; then
+  backup_dir="$PWD/$backup_dir"
+fi
+backup_dir="${backup_dir%/}"
+
+# Both provisioning scripts use the same advisory lock. Keep it for the full
+# read/validate/publish transaction so concurrent additions cannot overwrite
+# one another or leave a credential without its matching YAML entry.
+exec 9>"${config_path}.admin.lock"
+flock -x 9
 
 # Structural checks before touching anything: a malformed config would make the
 # append silently reshape the document.
@@ -573,12 +596,28 @@ if [[ -n "$signaling_binary" ]]; then
     die "$signaling_bin_variable is not executable: $signaling_binary"
 elif command -v mine-teleop-signaling-server >/dev/null 2>&1; then
   signaling_binary="$(command -v mine-teleop-signaling-server)"
+elif [[ -x "$script_dir/bin/mine-teleop-signaling-server" ]]; then
+  signaling_binary="$script_dir/bin/mine-teleop-signaling-server"
+fi
+
+validator_command=()
+if [[ -n "$signaling_binary" ]]; then
+  validator_command=("$signaling_binary")
+  signaling_prefix="$(CDPATH= cd -- "$(dirname -- "$signaling_binary")/.." && pwd)"
+  bundled_loader="$signaling_prefix/lib/ld-linux-x86-64.so.2"
+  if [[ -x "$bundled_loader" && -d "$signaling_prefix/lib" ]]; then
+    validator_command=(
+      "$bundled_loader"
+      --library-path "$signaling_prefix/lib"
+      "$signaling_binary")
+  fi
 fi
 
 # Render the modified document into a sibling temp file: relative password_file
 # paths then resolve exactly as they will once the file is in place.
 created_secrets_dir="no"
 created_password="no"
+backup_path=""
 work_path="$(mktemp "$config_dir/.${config_name}.add-driver.XXXXXX")"
 cleanup() {
   rm -f -- "$work_path"
@@ -611,8 +650,9 @@ if [[ $dry_run -eq 1 ]]; then
   fi
   if [[ -n "$signaling_binary" ]]; then
     printf '\n'
-    info "would validate with $signaling_binary --validate-config"
+    info "would validate with ${validator_command[*]} --validate-config"
   fi
+  printf '  config backup would be created under %s\n' "$backup_dir"
   exit 0
 fi
 
@@ -638,7 +678,7 @@ ok "generated credential $password_path (mode 0600)"
 
 validate_config() {
   local target="$1" label="$2" output status=0
-  output="$("$signaling_binary" --validate-config --config "$target" 2>&1)" || status=$?
+  output="$("${validator_command[@]}" --validate-config --config "$target" 2>&1)" || status=$?
   if [[ $status -eq 0 ]]; then
     ok "$label validated by mine-teleop-signaling-server"
     return 0
@@ -663,9 +703,21 @@ else
   warn "set MINE_TELEOP_SIGNALING_SERVER_BIN to validate with a locally built binary"
 fi
 
-# Publish the new config, preserving the original file mode.
+# Back up and publish the new config, preserving mode and ownership. The backup
+# is created only after the candidate has passed every available validation.
+if [[ ! -d "$backup_dir" ]]; then
+  mkdir -p -- "$backup_dir"
+  chmod 0700 -- "$backup_dir"
+fi
+[[ -w "$backup_dir" ]] || die "backup directory is not writable: $backup_dir"
+backup_path="$backup_dir/${config_name}.$(date -u +%Y%m%d-%H%M%S)-$$.bak"
+cp -p -- "$config_path" "$backup_path"
 config_mode="$(stat -c '%a' -- "$config_path" 2>/dev/null || stat -f '%Lp' -- "$config_path")"
 chmod "$config_mode" -- "$work_path"
+if [[ "$EUID" -eq 0 ]]; then
+  config_owner="$(stat -c '%u:%g' -- "$config_path" 2>/dev/null || stat -f '%u:%g' -- "$config_path")"
+  chown "$config_owner" -- "$work_path"
+fi
 mv -f -- "$work_path" "$config_path"
 trap - EXIT
 ok "updated $config_path"
@@ -678,11 +730,11 @@ fi
 printf '\n%sdriver added%s\n' "$color_bold$color_green" "$color_reset"
 printf '  driver id      %s\n' "$driver_id"
 printf '  config         %s\n' "$config_path"
+printf '  backup         %s\n' "$backup_path"
 printf '  password file  %s (password_file: %s)\n' "$password_path" "$password_file_value"
 printf '  vehicles       %s\n' "${requested_vehicles[*]}"
+printf '  activation     next matching driver login; cloud restart not required\n'
 printf '\n%snext steps%s\n' "$color_bold" "$color_reset"
-printf '  1. restart the signaling server so the new identity is loaded:\n'
-printf '       sudo systemctl restart mine-teleop-signaling-server\n'
-printf '  2. share the password with %s over a secure channel (never email or chat):\n' "$driver_id"
+printf '  1. share the password with %s over a secure channel (never email or chat):\n' "$driver_id"
 printf '       cat %s\n' "$password_path"
-printf '  3. keep %s out of version control and backed up with restricted access.\n' "$secrets_dir"
+printf '  2. keep %s out of version control and backed up with restricted access.\n' "$secrets_dir"

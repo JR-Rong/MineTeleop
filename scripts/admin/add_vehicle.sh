@@ -39,6 +39,7 @@
 #   NO_COLOR                   disable colored output
 #
 set -euo pipefail
+umask 077
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
@@ -71,6 +72,7 @@ Required:
 
 Options:
   --secrets-dir DIR            token directory (default: <yaml dir>/secrets)
+  --backup-dir DIR             config backup directory (default: <yaml dir>/backups)
   --assign-to-driver DRIVER_ID append the vehicle to this driver's permission
                                list; may be repeated
   --force                      overwrite an existing token file
@@ -408,6 +410,7 @@ yaml_assign_vehicle() {
 vehicle_id=""
 config_path=""
 secrets_dir=""
+backup_dir=""
 dry_run="no"
 force="no"
 drivers=()
@@ -427,6 +430,11 @@ while (($#)); do
     --secrets-dir)
       [[ $# -ge 2 ]] || fail "--secrets-dir requires a value"
       secrets_dir="$2"
+      shift 2
+      ;;
+    --backup-dir)
+      [[ $# -ge 2 && -n "$2" ]] || fail "--backup-dir requires a value"
+      backup_dir="$2"
       shift 2
       ;;
     --assign-to-driver)
@@ -478,6 +486,7 @@ done
 drivers=(${unique_drivers[@]+"${unique_drivers[@]}"})
 
 command -v openssl >/dev/null 2>&1 || fail "openssl is required to generate the device token"
+command -v flock >/dev/null 2>&1 || fail "flock is required to serialize config updates"
 select_yaml_engine
 
 config_path="$(CDPATH= cd -- "$(dirname -- "$config_path")" && pwd)/$(basename -- "$config_path")"
@@ -491,7 +500,17 @@ elif [[ "$secrets_dir" != /* ]]; then
   secrets_dir="$PWD/$secrets_dir"
 fi
 secrets_dir="${secrets_dir%/}"
+if [[ -z "$backup_dir" ]]; then
+  backup_dir="$config_dir/backups"
+elif [[ "$backup_dir" != /* ]]; then
+  backup_dir="$PWD/$backup_dir"
+fi
+backup_dir="${backup_dir%/}"
 token_path="$secrets_dir/${vehicle_id}.token"
+
+# Share one lock with add_driver.sh so all identity changes are serialized.
+exec 9>"${config_path}.admin.lock"
+flock -x 9
 
 # `device_token_file` is resolved relative to the config directory by the server,
 # so prefer a relative reference. The plain prefix strip keeps the common case
@@ -575,6 +594,10 @@ find_validator() {
     printf '%s' "$candidate"
     return 0
   fi
+  if [[ -x "$script_dir/bin/mine-teleop-signaling-server" ]]; then
+    printf '%s' "$script_dir/bin/mine-teleop-signaling-server"
+    return 0
+  fi
   for candidate in \
     "${MINE_TELEOP_BUILD_DIR:-$repo_root/build}/mine-teleop-signaling-server" \
     "$repo_root"/build/*/mine-teleop-signaling-server; do
@@ -594,7 +617,7 @@ validate_config() {
   local file="$1" output status=0
   output="$(env -u MINE_TELEOP_DRIVER_PASSWORD -u MINE_TELEOP_DEVICE_TOKEN \
     -u MINE_TELEOP_SIGNALING_CONFIG \
-    "$validator" --validate-config --config "$file" 2>&1)" || status=$?
+    "${validator_command[@]}" --validate-config --config "$file" 2>&1)" || status=$?
   if [[ $status -eq 0 ]]; then
     validation_note="passed"
     return 0
@@ -609,12 +632,22 @@ validate_config() {
 }
 
 validator=""
+validator_command=()
 # Checked here rather than inside find_validator: that runs in a command
 # substitution, where an abort would only end the subshell.
 if [[ -n "${MINE_TELEOP_SIGNALING_BIN:-}" && ! -x "${MINE_TELEOP_SIGNALING_BIN}" ]]; then
   fail "MINE_TELEOP_SIGNALING_BIN is not executable: $MINE_TELEOP_SIGNALING_BIN"
 fi
 if validator="$(find_validator)"; then
+  validator_command=("$validator")
+  validator_prefix="$(CDPATH= cd -- "$(dirname -- "$validator")/.." && pwd)"
+  bundled_loader="$validator_prefix/lib/ld-linux-x86-64.so.2"
+  if [[ -x "$bundled_loader" && -d "$validator_prefix/lib" ]]; then
+    validator_command=(
+      "$bundled_loader"
+      --library-path "$validator_prefix/lib"
+      "$validator")
+  fi
   note "validator: $validator"
 else
   validator=""
@@ -631,6 +664,7 @@ if [[ "$dry_run" == "yes" ]]; then
   note "secrets directory     $secrets_dir$([[ -d "$secrets_dir" ]] || printf ' (would be created, mode 0700)')"
   note "yaml                  $config_path"
   note "backend               $yaml_engine"
+  note "config backup         $backup_dir"
   printf '\n%sauth.vehicles gains:%s\n' "$color_bold" "$color_reset"
   printf '  - id: %s\n    device_token_file: %s\n' "$vehicle_id" "$token_reference"
   if ((${#assign_drivers[@]})); then
@@ -652,13 +686,25 @@ created_token="no"
 created_secrets_dir="no"
 temporary_config=""
 committed="no"
+token_staging=""
+token_rollback=""
+token_existed_before="no"
+backup_path=""
 
 cleanup() {
   [[ -z "$temporary_config" ]] || rm -f -- "$temporary_config"
+  [[ -z "$token_staging" ]] || rm -f -- "$token_staging"
   if [[ "$committed" != "yes" && "$created_token" == "yes" ]]; then
-    rm -f -- "$token_path"
-    warn "removed the freshly generated token $token_path because the config was not updated"
+    if [[ "$token_existed_before" == "yes" && -n "$token_rollback" ]]; then
+      mv -f -- "$token_rollback" "$token_path"
+      token_rollback=""
+      warn "restored the previous token because the config was not updated"
+    else
+      rm -f -- "$token_path"
+      warn "removed the freshly generated token $token_path because the config was not updated"
+    fi
   fi
+  [[ -z "$token_rollback" ]] || rm -f -- "$token_rollback"
   if [[ "$committed" != "yes" && "$created_secrets_dir" == "yes" ]]; then
     rmdir -- "$secrets_dir" 2>/dev/null || true
   fi
@@ -675,13 +721,18 @@ if [[ ! -d "$secrets_dir" ]]; then
 fi
 [[ -d "$secrets_dir" && -w "$secrets_dir" ]] || fail "secrets directory is not writable: $secrets_dir"
 
-if ! (
-  umask 077
-  openssl rand -hex 32 >"$token_path"
-); then
-  rm -f -- "$token_path"
+token_staging="$(mktemp "$secrets_dir/.${vehicle_id}.token.XXXXXX")"
+if ! openssl rand -hex 32 >"$token_staging"; then
   fail "openssl failed to generate a device token for $vehicle_id"
 fi
+chmod 0600 -- "$token_staging"
+if [[ -e "$token_path" ]]; then
+  token_existed_before="yes"
+  token_rollback="$(mktemp "$secrets_dir/.${vehicle_id}.token.rollback.XXXXXX")"
+  cp -p -- "$token_path" "$token_rollback"
+fi
+mv -f -- "$token_staging" "$token_path"
+token_staging=""
 created_token="yes"
 chmod 0600 -- "$token_path"
 [[ -n "$(tr -d '[:space:]' <"$token_path")" ]] || fail "generated token file is empty: $token_path"
@@ -721,7 +772,20 @@ if [[ -n "$validator" ]]; then
   fi
 fi
 
+# Back up only after the pending config passed validation.
+if [[ ! -d "$backup_dir" ]]; then
+  mkdir -p -- "$backup_dir"
+  chmod 0700 -- "$backup_dir"
+fi
+[[ -w "$backup_dir" ]] || fail "backup directory is not writable: $backup_dir"
+backup_path="$backup_dir/$(basename -- "$config_path").$(date -u +%Y%m%d-%H%M%S)-$$.bak"
+cp -p -- "$config_path" "$backup_path"
+
 chmod "$config_mode" -- "$temporary_config"
+if [[ "$EUID" -eq 0 ]]; then
+  config_owner="$(stat -c '%u:%g' -- "$config_path" 2>/dev/null || stat -f '%u:%g' -- "$config_path")"
+  chown "$config_owner" -- "$temporary_config"
+fi
 mv -f -- "$temporary_config" "$config_path"
 temporary_config=""
 committed="yes"
@@ -736,6 +800,7 @@ printf '  vehicle id       %s\n' "$vehicle_id"
 printf '  token file       %s\n' "$token_path"
 printf '  token reference  device_token_file: %s\n' "$token_reference"
 printf '  config           %s\n' "$config_path"
+printf '  backup           %s\n' "$backup_path"
 if ((${#assign_drivers[@]})); then
   printf '  drivers updated  %s\n' "${assign_drivers[*]}"
 else
@@ -748,8 +813,6 @@ elif [[ "$validation_note" == "passed" ]]; then
 else
   printf '  validation       %s\n' "$validation_note"
 fi
-printf '\n%sReminder:%s restart the signaling server to load the new identity, e.g.\n' \
-  "$color_yellow" "$color_reset"
-printf '  sudo systemctl restart mine-teleop-signaling-server.service\n'
+printf '  activation       next matching vehicle connection; cloud restart not required\n'
 printf 'Then provision %s on the vehicle: copy the token to its host and point\n' "$vehicle_id"
 printf 'cloud.device_token_file at it in the vehicle agent config.\n'

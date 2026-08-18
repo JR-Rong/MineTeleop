@@ -314,6 +314,14 @@ if(MINE_TELEOP_BUILD_TESTS)
       COMMAND mine-teleop-signaling-server --host 0.0.0.0 --port 0
     )
     set_tests_properties(mine-teleop-signaling-rejects-public-bind PROPERTIES WILL_FAIL TRUE)
+    if(UNIX AND NOT APPLE)
+      add_test(
+        NAME mine-teleop-admin-identity-scripts
+        COMMAND bash
+          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_admin_identity_scripts.sh
+          $<TARGET_FILE:mine-teleop-signaling-server>
+      )
+    endif()
   endif()
   add_executable(mine-teleop-control-tests cpp/tests/control_tests.cpp)
   target_link_libraries(mine-teleop-control-tests PRIVATE mine_teleop_runtime)

@@ -102,6 +102,38 @@ curl -fsS http://127.0.0.1:8765/health
 sudo journalctl -u mine-teleop-signaling-server -n 100 --no-pager
 ```
 
+### 3.1 无重启新增驾驶员或车辆
+
+已安装云包后，使用随包提供的脚本新增 driver，并按需重复 `--vehicle` 建立车辆
+白名单：
+
+```bash
+sudo /opt/mine-teleop/add-driver.sh \
+  --id driver-console-003 \
+  --config /etc/mine-teleop/signaling-server.yaml \
+  --vehicles vehicle-001
+```
+
+脚本自动完成配置锁、旧 YAML 备份、随机密码文件生成、候选配置验证和原子提交，
+但不会输出密码内容。根据输出的 `password_file` 路径，通过受保护的密码管理或
+交付通道把凭据提供给对应驾驶员；其控制端 `config/driver-console.yaml` 的
+`driver.id` 必须使用同一个 ID。
+
+新增账号在第一次匹配登录时热生效，不需要 `systemctl restart`。新增车辆使用：
+
+```bash
+sudo /opt/mine-teleop/add-vehicle.sh \
+  --id vehicle-003 \
+  --config /etc/mine-teleop/signaling-server.yaml \
+  --assign-to-driver driver-console-003
+```
+
+车辆在第一次携带匹配 token 上线时触发同一套增量热加载。可通过健康状态的
+`configured_drivers`、`configured_vehicles`、`identity_reload_successes` 和 signaling
+审计事件 `signaling_identity_config_reloaded` 确认。热加载只接受增量变化；删除
+账号、修改已有密码/token 或收缩权限必须走维护窗口和 signaling 重启。第一次部署
+包含该能力的 signaling 版本仍需正常重启一次；之后的增量新增不需要重启。
+
 ## 4. 部署车端工控机
 
 目标系统：Ubuntu 22.04 amd64。车端运行不依赖 Docker、Python、源码仓库或

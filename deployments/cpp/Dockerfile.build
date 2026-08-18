@@ -187,8 +187,11 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
         libssl-dev \
         libyaml-cpp-dev \
         nlohmann-json3-dev \
+        openssl \
         patchelf \
         pkg-config \
+        python3-yaml \
+        util-linux \
         v4l-utils \
         vainfo \
         zlib1g-dev \

@@ -60,6 +60,34 @@ mine-teleop-signaling-server \
 多身份配置不能与旧的 `--driver-id`、`--driver-password`、`--vehicle-id`、
 `--device-token` 或对应的单身份 secret 环境变量混用；混用会启动失败。
 
+生产云包提供 `/opt/mine-teleop/add-driver.sh` 和
+`/opt/mine-teleop/add-vehicle.sh`，用于原子新增驾驶员或车辆身份。两个脚本共用
+配置锁，拒绝重复 ID，生成权限为 `0600` 的随机凭据文件，暂存并验证 YAML，备份
+旧 YAML，再提交新配置；它们不会打印凭据，也不会重启云端服务：
+
+```bash
+sudo /opt/mine-teleop/add-driver.sh \
+  --id driver-console-003 \
+  --config /etc/mine-teleop/signaling-server.yaml \
+  --vehicles vehicle-001,vehicle-002
+
+sudo /opt/mine-teleop/add-vehicle.sh \
+  --id vehicle-003 \
+  --config /etc/mine-teleop/signaling-server.yaml \
+  --assign-to-driver driver-console-003
+```
+
+运行中的多身份 signaling 服务会在未知/密码不匹配的 driver 登录，或未知/token
+不匹配的 vehicle 首次连接时检查配置文件版本。版本变化后只接受增量更新：可以
+新增 driver、vehicle 或扩大已有 driver 的车辆白名单；不能热删除身份、修改已有
+密码/device token，或缩小已有白名单。无效或非增量更新会被审计并拒绝，服务继续
+使用最后一份有效身份快照，现有 session/token 不受影响。需要删除、轮换已有长期
+凭据或收缩权限时，仍应先无监听验证，再在维护窗口重启 signaling。
+
+驾驶端收到一次上游 `401` 凭据拒绝后，本地控制进程会返回 `429` 并强制冷却
+30 秒；页面禁用登录按钮并显示倒计时。云端原有的账号失败窗口、未知账号共享桶
+和来源级 API 限流仍继续生效，不能用本地冷却替代服务端防护。
+
 ## 车端配置示例
 
 当前安装包携带 `config/vehicle-agent.yaml`。其中 `runtime` 决定统一前台入口启动哪些服务，

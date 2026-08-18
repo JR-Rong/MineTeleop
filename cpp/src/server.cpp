@@ -890,14 +890,14 @@ const gamepadState={connected:false,steering:0,throttle:0,brake:0};
 const controlLimits={maxThrottle:limitConfig.initial_max_throttle,maxBrake:limitConfig.initial_max_brake,maxSteeringDeg:limitConfig.initial_max_steering_angle_deg};
 let vehicleHardLimits={max_throttle:1,max_brake:1,max_steering_angle_deg:limitConfig.steering_full_scale_deg,max_speed_kph:null,received:false};
 const calibration={steeringCenter:gamepadConfig.steering_center,steeringRange:gamepadConfig.steering_range,throttleRest:gamepadConfig.throttle_rest,throttleRange:gamepadConfig.throttle_range,brakeRest:gamepadConfig.brake_rest,brakeRange:gamepadConfig.brake_range};
-const webrtcLabel=document.getElementById('webrtc'),cameraGrid=document.getElementById('cameras'),statusPanel=document.getElementById('status'),loginPanel=document.getElementById('login-panel'),sessionPanel=document.getElementById('session-panel'),passwordInput=document.getElementById('password'),vehicleSelect=document.getElementById('vehicle'),connectButton=document.getElementById('connect'),authExpiry=document.getElementById('auth-expiry'),vcuPanel=document.getElementById('vcu-panel'),vcuStatus=document.getElementById('vcu-status'),vcuGate=document.getElementById('vcu-gate'),vcuConnectButton=document.getElementById('vcu-connect'),vcuDisconnectButton=document.getElementById('vcu-disconnect'),controlLimitsOpen=document.getElementById('control-limits-open'),controlLimitsSummary=document.getElementById('control-limits-summary'),controlLimitsDialog=document.getElementById('control-limits-dialog'),maxThrottlePercent=document.getElementById('max-throttle-percent'),maxSteeringDeg=document.getElementById('max-steering-deg'),vehicleHardLimitsLabel=document.getElementById('vehicle-hard-limits'),controlLimitsConfirm=document.getElementById('control-limits-confirm'),controlLimitsApply=document.getElementById('control-limits-apply'),controlLimitsCancel=document.getElementById('control-limits-cancel'),estopStatus=document.getElementById('estop-status'),monitorPanel=document.getElementById('monitor-panel'),alertsPanel=document.getElementById('alerts'),streamMetrics=document.getElementById('stream-metrics'),inputReadiness=document.getElementById('input-readiness'),lastKeyboardEvent=document.getElementById('last-keyboard-event'),emptyStage=document.getElementById('empty-stage');
+const webrtcLabel=document.getElementById('webrtc'),cameraGrid=document.getElementById('cameras'),statusPanel=document.getElementById('status'),loginPanel=document.getElementById('login-panel'),sessionPanel=document.getElementById('session-panel'),passwordInput=document.getElementById('password'),loginButton=document.getElementById('login'),vehicleSelect=document.getElementById('vehicle'),connectButton=document.getElementById('connect'),authExpiry=document.getElementById('auth-expiry'),vcuPanel=document.getElementById('vcu-panel'),vcuStatus=document.getElementById('vcu-status'),vcuGate=document.getElementById('vcu-gate'),vcuConnectButton=document.getElementById('vcu-connect'),vcuDisconnectButton=document.getElementById('vcu-disconnect'),controlLimitsOpen=document.getElementById('control-limits-open'),controlLimitsSummary=document.getElementById('control-limits-summary'),controlLimitsDialog=document.getElementById('control-limits-dialog'),maxThrottlePercent=document.getElementById('max-throttle-percent'),maxSteeringDeg=document.getElementById('max-steering-deg'),vehicleHardLimitsLabel=document.getElementById('vehicle-hard-limits'),controlLimitsConfirm=document.getElementById('control-limits-confirm'),controlLimitsApply=document.getElementById('control-limits-apply'),controlLimitsCancel=document.getElementById('control-limits-cancel'),estopStatus=document.getElementById('estop-status'),monitorPanel=document.getElementById('monitor-panel'),alertsPanel=document.getElementById('alerts'),streamMetrics=document.getElementById('stream-metrics'),inputReadiness=document.getElementById('input-readiness'),lastKeyboardEvent=document.getElementById('last-keyboard-event'),emptyStage=document.getElementById('empty-stage');
 const canFeedbackPanel=document.getElementById('can-feedback-panel'),canFeedbackStatus=document.getElementById('can-feedback-status'),canSpeed=document.getElementById('can-speed'),canGear=document.getElementById('can-gear'),canSelector=document.getElementById('can-selector'),canEpb=document.getElementById('can-epb'),canHandshake=document.getElementById('can-handshake'),canEmergency=document.getElementById('can-emergency'),canAge=document.getElementById('can-age'),wheelFeedbackGrid=document.getElementById('wheel-feedback-grid'),steeringFeedbackGrid=document.getElementById('steering-feedback-grid');
 const maxBrakePercent=document.getElementById('max-brake-percent'),operatorSpeed=document.getElementById('operator-speed'),operatorActualGear=document.getElementById('operator-actual-gear');
 const keyIndicators={left:document.getElementById('key-left'),right:document.getElementById('key-right'),up:document.getElementById('key-up'),down:document.getElementById('key-down'),brake:document.getElementById('key-brake')};
 const controlReadouts={gear:document.getElementById('control-gear'),steering:document.getElementById('control-steering'),throttle:document.getElementById('control-throttle'),brake:document.getElementById('control-brake')};
 const operatorControlReadouts={gear:document.getElementById('operator-control-gear'),steering:document.getElementById('operator-control-steering'),throttle:document.getElementById('operator-control-throttle'),brake:document.getElementById('operator-control-brake')};
-let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,heartbeatInFlight=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false};const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
-function responseError(response,body){const error=Error(body.error||response.status);error.status=response.status;return error}
+let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,heartbeatInFlight=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,signalingGeneration=0,signalingPollAbort=null,loginCooldownTimer=null,loginCooldownUntil=0,vehicleTelemetry=null,vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false};const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
+function responseError(response,body){const error=Error(body.error||response.status);error.status=response.status;error.retryAfterMs=Math.max(0,Number(body.retry_after_ms)||0);return error}
 async function post(path,body={},signal=null){const options={method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)};if(signal)options.signal=signal;const r=await fetch(path,options);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 async function get(path){const r=await fetch(path);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 function clientLog(event,details={}){const entry={event,sent_at_utc_ms:Date.now(),details};console.info(JSON.stringify(entry));fetch('/api/browser-event',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(entry),keepalive:true}).catch(()=>{})}
@@ -1003,7 +1003,9 @@ function renderVehicles(vehicles=[]){const previous=vehicleSelect.value,currentV
 function renderAuthExpiry(expiresAt){authExpiry.textContent=expiresAt?`认证有效至 ${new Date(expiresAt).toLocaleString()}`:''}
 function requireLogin(message){closeRealtimeSession();authenticated=false;controlAuthorityLost=false;connectButton.textContent='连接所选车辆';renderAuthExpiry(0);sessionPanel.hidden=true;vcuPanel.hidden=true;monitorPanel.hidden=true;loginPanel.hidden=false;statusPanel.textContent=message;clientLog('driver_reauthentication_required',{reason:message})}
 function handleVehicleRefreshError(error){if(error.status===401){requireLogin('登录已失效，请重新认证: '+error.message);return}statusPanel.textContent='车辆状态刷新失败，当前会话已保留: '+error.message;clientLog('vehicle_list_refresh_failed',{error:error.message})}
-async function login(){const password=passwordInput.value;if(!password)throw Error('请输入驾驶员密码');passwordInput.value='';const result=await post('/api/login',{password});authenticated=true;controlAuthorityLost=false;webrtcLabel.textContent='未连接';loginPanel.hidden=true;sessionPanel.hidden=false;vcuPanel.hidden=false;renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);sampleGamepad();latestRuntimeStatus=await get('/api/status');renderMonitoring();statusPanel.textContent=`已登录 ${result.driver_id}，请选择在线车辆`;clientLog('driver_login_succeeded',{driver_id:result.driver_id,authorized_vehicle_count:(result.vehicles||[]).length})}
+function startLoginCooldown(retryAfterMs){loginCooldownUntil=Date.now()+Math.max(1000,retryAfterMs);if(loginCooldownTimer)clearInterval(loginCooldownTimer);const update=()=>{const remaining=Math.max(0,loginCooldownUntil-Date.now());if(!remaining){clearInterval(loginCooldownTimer);loginCooldownTimer=null;loginButton.disabled=false;loginButton.textContent='登录并加载车辆';statusPanel.textContent='登录冷却已结束，可以重试';return}loginButton.disabled=true;loginButton.textContent=`登录冷却 ${Math.ceil(remaining/1000)}s`;statusPanel.textContent=`登录失败，控制端冷却 ${Math.ceil(remaining/1000)} 秒`};update();loginCooldownTimer=setInterval(update,250)}
+function handleLoginError(error){if(error.status===429&&error.retryAfterMs>0)startLoginCooldown(error.retryAfterMs);else statusPanel.textContent='登录失败: '+error.message}
+async function login(){if(loginButton.disabled)return;const password=passwordInput.value;if(!password)throw Error('请输入驾驶员密码');passwordInput.value='';const result=await post('/api/login',{password});authenticated=true;controlAuthorityLost=false;webrtcLabel.textContent='未连接';loginPanel.hidden=true;sessionPanel.hidden=false;vcuPanel.hidden=false;renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);sampleGamepad();latestRuntimeStatus=await get('/api/status');renderMonitoring();statusPanel.textContent=`已登录 ${result.driver_id}，请选择在线车辆`;clientLog('driver_login_succeeded',{driver_id:result.driver_id,authorized_vehicle_count:(result.vehicles||[]).length})}
 async function refreshVehicles(){if(!authenticated)return;const result=await get('/api/vehicles');renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);if(result.signaling_available===false){controlAuthorityLost=true;connectButton.disabled=true;statusPanel.textContent='信令服务暂时不可用；车辆列表为安全快照，禁止建立控制会话';renderMonitoring();return}if(result.signaling_restart_recovered){closeRealtimeSession();controlAuthorityLost=true;latestRuntimeStatus=await get('/api/status');connectButton.textContent='连接所选车辆';webrtcLabel.textContent='服务已恢复，需重新建立控制会话';statusPanel.textContent='信令服务已重启，驾驶员身份已自动恢复；旧控制权未恢复，请重新选择车辆';clientLog('signaling_restart_recovered',{previous_service_instance_id:result.previous_service_instance_id,service_instance_id:result.service_instance_id,control_authority_recovered:false});renderMonitoring()}}
 function sendVcuHandshakeCommand(action){if(!controlChannel||controlChannel.readyState!=='open')throw Error('控制 DataChannel 尚未连接');if(!['connect','disconnect'].includes(action))throw Error('VCU 握手命令非法');if(action==='disconnect'){clearControlInput();vcuHandshake={...vcuHandshake,ready:false,disarming:true}}else vcuHandshake={...vcuHandshake,requested:true};renderMonitoring();controlChannel.send(JSON.stringify({event:'vcu_handshake_command',action,sent_at_utc_ms:Date.now()}));clientLog('driver_vcu_handshake_command',{action});statusPanel.textContent=action==='connect'?'已请求开始 VCU 平行驾驶握手':'已请求安全断开 VCU 握手'}
 async function send(extra={},announceUnavailable=true){if(!peer||peer.connectionState!=='connected'||!controlChannel||controlChannel.readyState!=='open'){clearControlInput();if(announceUnavailable)webrtcLabel.textContent='控制链路中断';return{sent:false}}const vcuControlReady=vcuHandshake.ready||(!vcuHandshake.supported&&vcuHandshake.state==='unsupported');if(!vcuControlReady&&!extra.estop){clearControlInput();if(announceUnavailable)statusPanel.textContent='VCU 平行驾驶握手未成功，驾驶命令已阻止';return{sent:false,reason:'vcu_handshake_not_ready'}}if(controlChannel.bufferedAmount>4096){clearControlInput();webrtcLabel.textContent='控制链路拥塞';return{sent:false,reason:'buffered_amount_limit'}}const prepared=await post('/api/control',currentControl(extra));controlChannel.send(JSON.stringify(prepared.command));if(webrtcLabel.textContent==='控制链路拥塞')webrtcLabel.textContent='控制链路已连接';return{...prepared,sent:true}}
@@ -1014,8 +1016,8 @@ async function logout(){closeRealtimeSession();controlAuthorityLost=true;webrtcL
 addEventListener('pagehide',()=>{closeRealtimeSession();if(authenticated)fetch('/api/disconnect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({reason:'browser_page_closed'}),keepalive:true}).catch(()=>{})});
 function neutralizeInput(){clearControlInput();send({},false).catch(console.error)}
 addEventListener('blur',neutralizeInput);document.addEventListener('visibilitychange',()=>{if(document.hidden)neutralizeInput()});
-document.querySelector('#login').onclick=()=>login().catch(e=>{statusPanel.textContent='登录失败: '+e.message});
-passwordInput.addEventListener('keydown',e=>{if(e.key==='Enter')login().catch(error=>{statusPanel.textContent='登录失败: '+error.message})});
+loginButton.onclick=()=>login().catch(handleLoginError);
+passwordInput.addEventListener('keydown',e=>{if(e.key==='Enter')login().catch(handleLoginError)});
 document.querySelector('#connect').onclick=()=>connect().catch(e=>{webrtcLabel.textContent='连接失败';statusPanel.textContent=e.message});
 document.querySelector('#logout').onclick=()=>logout().catch(e=>{statusPanel.textContent='退出失败: '+e.message});
 document.querySelector('#estop').onclick=()=>{latchEstop('页面按钮');send({estop:true}).catch(alert)};
@@ -1183,9 +1185,10 @@ Json keyboard_to_control(const Json& payload) {
 
 SignalingServerConfig load_signaling_identity_config(const std::filesystem::path& path) {
   if (path.empty()) throw std::invalid_argument("signaling identity configuration path is required");
+  const auto absolute_path = std::filesystem::absolute(path).lexically_normal();
   YAML::Node root;
   try {
-    root = YAML::LoadFile(path.string());
+    root = YAML::LoadFile(absolute_path.string());
   } catch (const YAML::Exception& error) {
     throw std::invalid_argument("cannot load signaling identity configuration: " + std::string(error.what()));
   }
@@ -1202,10 +1205,11 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
   }
 
   SignalingServerConfig config;
+  config.identity_config_path = absolute_path;
   config.driver_passwords.clear();
   config.device_tokens.clear();
   config.driver_vehicle_permissions.clear();
-  const auto base_path = std::filesystem::absolute(path).parent_path();
+  const auto base_path = absolute_path.parent_path();
   for (std::size_t index = 0; index < drivers.size(); ++index) {
     const auto entry = drivers[index];
     const auto context = "auth.drivers[" + std::to_string(index) + "]";
@@ -1553,6 +1557,15 @@ SignalingService::SignalingService(
       }
     }
   }
+  if (!config_.identity_config_path.empty()) {
+    std::error_code error;
+    const auto write_time = std::filesystem::last_write_time(config_.identity_config_path, error);
+    if (error) {
+      throw std::invalid_argument(
+          "cannot inspect signaling identity configuration: " + error.message());
+    }
+    identity_config_observed_write_time_ = write_time;
+  }
   audit(
       "signaling_service_started",
       {{"runtime", "cpp"},
@@ -1622,6 +1635,8 @@ Json SignalingService::health() const {
       {"alert_count", alert_count},
       {"online_vehicles", online_vehicles_.size()},
       {"online_drivers", online_drivers_.size()},
+      {"configured_drivers", config_.driver_passwords.size()},
+      {"configured_vehicles", config_.device_tokens.size()},
       {"active_sessions", active_sessions},
       {"sessions", sessions_.size()},
       {"revoked_vehicles", revoked_vehicles_.size()},
@@ -1630,6 +1645,9 @@ Json SignalingService::health() const {
       {"api_rate_limit_tracked_sources", api_rate_limits_.size()},
       {"api_rate_limit_overflow_active", api_rate_limit_overflow_active},
       {"api_rate_limited_requests", api_rate_limited_requests_},
+      {"identity_hot_reload_enabled", !config_.identity_config_path.empty()},
+      {"identity_reload_successes", identity_reload_successes_},
+      {"identity_reload_failures", identity_reload_failures_},
       {"turn_usage_sessions", turn_usage_sessions},
       {"turn_relay_bytes_total", turn_relay_bytes_total},
   };
@@ -1884,6 +1902,77 @@ void SignalingService::record_login_failure(std::string_view driver_id, std::int
 
 void SignalingService::clear_login_failures(std::string_view driver_id) {
   login_failures_.erase("driver:" + std::string(driver_id));
+}
+
+bool SignalingService::reload_identity_config_if_changed() {
+  if (config_.identity_config_path.empty()) return false;
+
+  std::error_code write_time_error;
+  const auto write_time = std::filesystem::last_write_time(
+      config_.identity_config_path,
+      write_time_error);
+  if (write_time_error) {
+    ++identity_reload_failures_;
+    audit(
+        "signaling_identity_config_reload_failed",
+        {{"reason", "config_stat_failed"}, {"error", write_time_error.message()}});
+    return false;
+  }
+  if (identity_config_observed_write_time_.has_value() &&
+      write_time == *identity_config_observed_write_time_) {
+    return false;
+  }
+  identity_config_observed_write_time_ = write_time;
+
+  try {
+    auto candidate = load_signaling_identity_config(config_.identity_config_path);
+    for (const auto& [driver_id, password] : config_.driver_passwords) {
+      const auto found = candidate.driver_passwords.find(driver_id);
+      if (found == candidate.driver_passwords.end() || found->second != password) {
+        throw std::invalid_argument(
+            "hot identity reload cannot remove a driver or change an existing driver password");
+      }
+    }
+    for (const auto& [vehicle_id, token] : config_.device_tokens) {
+      const auto found = candidate.device_tokens.find(vehicle_id);
+      if (found == candidate.device_tokens.end() || found->second != token) {
+        throw std::invalid_argument(
+            "hot identity reload cannot remove a vehicle or change an existing device token");
+      }
+    }
+    for (const auto& [driver_id, permissions] : config_.driver_vehicle_permissions) {
+      const auto found = candidate.driver_vehicle_permissions.find(driver_id);
+      if (found == candidate.driver_vehicle_permissions.end()) {
+        throw std::invalid_argument("hot identity reload cannot remove existing driver permissions");
+      }
+      for (const auto& vehicle_id : permissions) {
+        if (!found->second.contains(vehicle_id)) {
+          throw std::invalid_argument("hot identity reload cannot reduce existing driver permissions");
+        }
+      }
+    }
+
+    config_.driver_passwords = std::move(candidate.driver_passwords);
+    config_.device_tokens = std::move(candidate.device_tokens);
+    config_.driver_vehicle_permissions = std::move(candidate.driver_vehicle_permissions);
+    ++identity_reload_successes_;
+    std::size_t permission_count = 0;
+    for (const auto& entry : config_.driver_vehicle_permissions) {
+      permission_count += entry.second.size();
+    }
+    audit(
+        "signaling_identity_config_reloaded",
+        {{"driver_count", config_.driver_passwords.size()},
+         {"vehicle_count", config_.device_tokens.size()},
+         {"permission_count", permission_count}});
+    return true;
+  } catch (const std::exception& error) {
+    ++identity_reload_failures_;
+    audit(
+        "signaling_identity_config_reload_failed",
+        {{"reason", "config_invalid_or_non_additive"}, {"error", error.what()}});
+    return false;
+  }
 }
 
 std::string SignalingService::request_source(const HttpRequest& request) const {
@@ -2584,8 +2673,12 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
     const auto driver_id = required_string(value, "driver_id");
     const auto password = optional_string(value, "password");
     const auto timestamp_ms = now_ms();
+    auto found = config_.driver_passwords.find(driver_id);
+    if (found == config_.driver_passwords.end() || found->second != password) {
+      static_cast<void>(reload_identity_config_if_changed());
+      found = config_.driver_passwords.find(driver_id);
+    }
     enforce_login_rate_limit(driver_id, timestamp_ms);
-    const auto found = config_.driver_passwords.find(driver_id);
     if (found == config_.driver_passwords.end() || found->second != password) {
       record_login_failure(driver_id, timestamp_ms);
       throw Unauthorized("invalid driver credentials");
@@ -2640,7 +2733,13 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   }
   if (request.path == "/vehicles/online") {
     const auto vehicle_id = required_string(value, "vehicle_id");
-    validate_device_token(vehicle_id, optional_string(value, "device_token"));
+    const auto device_token = optional_string(value, "device_token");
+    const auto configured_vehicle = config_.device_tokens.find(vehicle_id);
+    if (configured_vehicle == config_.device_tokens.end() ||
+        configured_vehicle->second != device_token) {
+      static_cast<void>(reload_identity_config_if_changed());
+    }
+    validate_device_token(vehicle_id, device_token);
     const auto connection_id = required_string(value, "connection_id");
     const auto timestamp_ms = now_ms();
     const auto current = online_vehicles_.find(vehicle_id);
@@ -3108,14 +3207,22 @@ DriverConfig load_driver_config(const std::string& path) {
   return config;
 }
 
-DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehicle_id, std::string password)
+DriverConsoleRuntime::DriverConsoleRuntime(
+    DriverConfig config,
+    std::string vehicle_id,
+    std::string password,
+    std::int64_t login_failure_cooldown_ms)
     : config_(std::move(config)),
       vehicle_id_(std::move(vehicle_id)),
       password_(std::move(password)),
       signaling_http_url_(normalize_signaling_http_url(config_.signaling_url)),
-      http_(std::chrono::seconds(5), config_.resolve_entries, config_.ca_bundle) {
+      http_(std::chrono::seconds(5), config_.resolve_entries, config_.ca_bundle),
+      login_failure_cooldown_ms_(login_failure_cooldown_ms) {
   if (vehicle_id_.empty() || password_.empty()) throw std::invalid_argument("vehicle id and driver password are required");
   max_brake_limit_.store(config_.control_limits.initial_max_brake);
+  if (login_failure_cooldown_ms_ <= 0) {
+    throw std::invalid_argument("driver login failure cooldown must be positive");
+  }
   if (!signaling_url_is_secure_or_loopback(config_.signaling_url)) {
     throw std::invalid_argument("public signaling URL must use HTTPS or WSS; HTTP/WS is allowed only on loopback");
   }
@@ -3336,7 +3443,28 @@ Json DriverConsoleRuntime::login_locked(std::string_view password) {
 
 Json DriverConsoleRuntime::login(std::string_view password) {
   std::lock_guard authentication_lock(authentication_mutex_);
-  return login_locked(password);
+  const auto cooldown_now = std::chrono::steady_clock::now();
+  if (login_cooldown_until_ > cooldown_now) {
+    throw TooManyRequests(
+        "driver login is cooling down after a failed credential attempt",
+        std::max<std::int64_t>(
+            1,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                login_cooldown_until_ - cooldown_now)
+                .count()));
+  }
+  try {
+    auto result = login_locked(password);
+    login_cooldown_until_ = {};
+    return result;
+  } catch (const HttpStatusError& error) {
+    if (error.status() != 401) throw;
+    login_cooldown_until_ =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(login_failure_cooldown_ms_);
+    throw TooManyRequests(
+        "driver credentials were rejected; this control endpoint is cooling down",
+        login_failure_cooldown_ms_);
+  }
 }
 
 Json DriverConsoleRuntime::fetch_authorized_vehicles(
@@ -4192,6 +4320,8 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
       return ServerResponse::json(200, runtime_->send_control(control));
     }
     return ServerResponse::json(404, {{"error", "not found"}});
+  } catch (const TooManyRequests& error) {
+    return too_many_requests_response(error);
   } catch (const HttpStatusError& error) {
     const auto status = error.status() >= 400 && error.status() <= 599
         ? static_cast<int>(error.status())

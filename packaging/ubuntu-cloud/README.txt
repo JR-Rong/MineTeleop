@@ -2,8 +2,9 @@ Mine Teleop Cloud for Ubuntu 22.04 x64
 ======================================
 
 This package contains the native signaling server, its Ubuntu 22.04 shared
-library closure, systemd units, Caddy/HAProxy/coturn configuration assets, and
-one deployment script. It contains no credentials.
+library closure, systemd units, Caddy/HAProxy/coturn configuration assets, the
+deployment script, and additive driver/vehicle management scripts. It contains
+no credentials.
 
 The deployment target must be Ubuntu 22.04 x86_64 with systemd. Run:
 
@@ -37,5 +38,27 @@ reused:
 
   sudo ./deploy-cloud.sh
 
-Use --skip-package-install only when caddy, coturn, curl, and haproxy are
-already installed. See ./deploy-cloud.sh --help for all options.
+Use --skip-package-install only when caddy, coturn, curl, haproxy, openssl,
+python3-yaml, and util-linux are already installed. See ./deploy-cloud.sh --help
+for all options.
+
+To add a driver without restarting signaling or the other cloud services:
+
+  sudo /opt/mine-teleop/add-driver.sh \
+    --id driver-console-003 \
+    --config /etc/mine-teleop/signaling-server.yaml \
+    --vehicles vehicle-001
+
+To add a vehicle and grant it to an existing driver without restarting:
+
+  sudo /opt/mine-teleop/add-vehicle.sh \
+    --id vehicle-003 \
+    --config /etc/mine-teleop/signaling-server.yaml \
+    --assign-to-driver driver-console-001
+
+The scripts lock, back up, and validate the identity YAML, create protected
+random secret files without printing their contents, and commit only additive
+identity updates. The running signaling service discovers a driver on its first
+matching login and a vehicle on its first matching connection. Deletion,
+existing-secret rotation, and permission reduction still require a validated
+maintenance-window restart.
