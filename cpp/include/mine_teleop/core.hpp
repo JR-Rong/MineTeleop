@@ -261,6 +261,7 @@ struct FieldSafetyConfig {
   std::string commissioning_mode{"bench"};
   double max_speed_kph{40.0};
   double max_throttle{1.0};
+  double max_brake{1.0};
   double max_steering_angle_deg{30.0};
   bool require_can_feedback_before_control{true};
   bool require_local_estop_reset{true};
@@ -507,6 +508,7 @@ class VehicleControlService {
   bool require_feedback_before_control_{true};
   double max_speed_kph_{40.0};
   double max_throttle_{1.0};
+  double max_brake_{1.0};
   double max_steering_angle_deg_{30.0};
   int telemetry_interval_ms_;
   std::optional<std::int64_t> last_telemetry_ms_;

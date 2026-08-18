@@ -219,6 +219,7 @@ field_safety:
   commissioning_mode: bench
   max_speed_kph: 40
   max_throttle: 0.10
+  max_brake: 1.0
   max_steering_angle_deg: 5.0
   require_can_feedback_before_control: true
   require_local_estop_reset: true
@@ -298,8 +299,8 @@ access key 和 secret。Secret 可以直接配置，也可以用
 
 `vehicle_adapter.type=mock` 可直接无外部依赖运行。配置为 `can` 或
 `dynamic_library` 时，必须显式填写 `field_safety.max_speed_kph`、
-`field_safety.max_throttle` 和 `field_safety.max_steering_angle_deg`，并先声明真实
-车辆接口契约，例如：
+`field_safety.max_throttle`、`field_safety.max_brake` 和
+`field_safety.max_steering_angle_deg`，并先声明真实车辆接口契约，例如：
 
 ```yaml
 vehicle_adapter:
@@ -430,6 +431,10 @@ ui:
 control:
   rate_hz: 20
   estop_hold_ms: 500
+  limits:
+    initial_max_throttle: 0.05
+    initial_max_brake: 1.0
+    initial_max_steering_angle_deg: 3.0
   keyboard:
     steering_left: A
     steering_right: D
@@ -460,6 +465,18 @@ control:
 左摇杆 X、右/左扳机，非标准方向盘/踏板使用这里的轴配置。`*_center`/`*_rest`
 和 `*_range` 可写入现场测量值，也可以在浏览器中做本次运行有效的中心与量程校准。
 如果轴顺序或方向不同，只需要调整配置，不需要改控制核心。
+`control.limits.initial_max_brake` 和 `field_safety.max_brake` 都是归一化的普通
+驾驶制动请求上限，取值 `[0, 1]`；前者限制当前控制页面，后者在车端再次强制
+截断。页面修改人工刹车上限时会同步写入本地控制进程，因此 `/api/control`、
+`/api/control/keyboard` 和 `/api/control/gamepad` 共用同一个当前会话上限；急停
+命令不经过这个普通驾驶上限。页面刷新或重新登录时会从本地控制进程回读当前值，
+车端硬上限自动下调时也会同步收紧控制进程，避免界面显示值、直接 API 和实际发送
+值不一致。控制端以及 mock/开发车端的缺省值 `1.0` 仅用于
+兼容；非 mock 车端必须
+显式填写 `max_brake`，升级旧实车配置时也必须补齐该键（尚未标定时可先显式写
+`1.0`）。现场下调值必须来自真实车辆制动标定，不能把归一化数值直接当作 bar。
+急停、控制超时、故障和断开停车走独立安全停车路径，不会被这两个普通驾驶刹车
+上限削弱。
 `logging.browser_event_log` 的相对路径以 YAML 文件所在目录为基准；默认值把日志
 写入控制端包根目录的 `.local/logs/`。`browser_event_log_files` 包含当前文件，
 因此值 `3` 表示当前文件加 `.1`、`.2` 两个备份。凭据类字段会被递归脱敏，但部署

@@ -370,6 +370,19 @@ void test_control_page_contract() {
           response.body.find("function renderControlState()") != std::string::npos,
       "live steering, throttle, and brake feedback is missing");
   expect(
+      response.body.find("id=\"operator-status-strip\"") != std::string::npos &&
+          response.body.find("id=\"operator-speed\"") != std::string::npos &&
+          response.body.find("id=\"operator-actual-gear\"") != std::string::npos &&
+          response.body.find("id=\"operator-control-brake\"") != std::string::npos &&
+          response.body.find("position:sticky;top:0;z-index:20") != std::string::npos &&
+          response.body.find("grid-auto-rows:clamp(190px,56vw,300px)") != std::string::npos &&
+          response.body.find(
+              ".can-feedback-panel .can-summary{grid-template-columns:repeat(2,minmax(0,1fr))") !=
+              std::string::npos &&
+          response.body.find(".visual-stage .camera>video{position:absolute;inset:0") !=
+              std::string::npos,
+      "camera-first responsive layout can still hide critical vehicle state");
+  expect(
       response.body.find("id=\"can-feedback-panel\"") != std::string::npos &&
           response.body.find("id=\"wheel-feedback-grid\"") != std::string::npos &&
           response.body.find("id=\"steering-feedback-grid\"") != std::string::npos &&
@@ -423,11 +436,23 @@ void test_control_page_contract() {
   expect(
       response.body.find("实车调试限幅") != std::string::npos &&
           response.body.find("max-throttle-percent") != std::string::npos &&
+          response.body.find("max-brake-percent") != std::string::npos &&
           response.body.find("max-steering-deg") != std::string::npos,
       "field commissioning control limit dialog is missing");
   expect(
       response.body.find("effectiveControlLimits") != std::string::npos &&
           response.body.find("updateVehicleHardLimits(message.hard_limits)") != std::string::npos &&
+          response.body.find("maxBrake:Math.min(controlLimits.maxBrake,vehicleHardLimits.max_brake)") !=
+              std::string::npos &&
+          response.body.find("brake:clamp(brake,0,1)*limits.maxBrake") != std::string::npos &&
+          response.body.find("post('/api/control-limits',{max_brake:brakePercent/100})") !=
+              std::string::npos &&
+          response.body.find("get('/api/control-limits').then") != std::string::npos &&
+          response.body.find(
+              "await post('/api/control-limits',{max_brake:controlLimits.maxBrake})") !=
+              std::string::npos &&
+          response.body.find("急停、超时、故障和断开停车不受人工刹车限幅削弱") !=
+              std::string::npos &&
           response.body.find("我已确认车辆处于隔离台架") != std::string::npos,
       "controller limits are not combined with vehicle hard limits and operator confirmation");
   expect(response.body.find("post('/api/control',currentControl(extra))") != std::string::npos, "control inputs do not share one normalized path");
@@ -559,6 +584,9 @@ void test_driver_gamepad_config() {
   expect(
       field.control_limits.initial_max_throttle == 0.05,
       "field driver initial throttle limit changed");
+  expect(
+      field.control_limits.initial_max_brake == 1.0,
+      "field driver initial ordinary-brake limit changed");
   expect(
       field.control_limits.initial_max_steering_angle_deg == 3.0,
       "field driver initial steering limit changed");
@@ -906,6 +934,7 @@ void test_driver_vehicle_switch_releases_old_session() {
   mine_teleop::DriverConfig driver_config;
   driver_config.driver_id = "driver-console-001";
   driver_config.signaling_url = base;
+  driver_config.control_limits.initial_max_brake = 0.25;
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
   const auto first = driver.connect("vehicle-001");
   const auto second = driver.connect("vehicle-002");
@@ -925,10 +954,38 @@ void test_driver_vehicle_switch_releases_old_session() {
       new_session.value("session_id", "") == second.value("session_id", ""),
       "vehicle switch did not activate the new session");
   const auto prepared = driver.send_control(
-      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0}});
+      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
   expect(
       prepared.at("command").value("vehicle_id", "") == "vehicle-002",
       "post-switch control command targeted the old vehicle");
+  expect(
+      prepared.at("command").value("brake", -1.0) == 0.25,
+      "driver runtime did not enforce the configured ordinary-brake limit");
+  static_cast<void>(driver.set_control_limits({{"max_brake", 0.10}}));
+  const auto reduced = driver.send_control(
+      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
+  expect(
+      reduced.at("command").value("brake", -1.0) == 0.10,
+      "driver runtime did not apply a reduced session brake limit");
+  static_cast<void>(driver.set_control_limits({{"max_brake", 0.50}}));
+  const auto raised = driver.send_control(
+      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
+  expect(
+      raised.at("command").value("brake", -1.0) == 0.50,
+      "driver runtime did not apply a raised session brake limit");
+  expect(
+      driver.control_limits().value("max_brake", -1.0) == 0.50,
+      "driver runtime did not expose the current session brake limit for page reload");
+  const auto estop = driver.send_control(
+      {{"gear", "N"},
+       {"steering", 0.0},
+       {"throttle", 0.0},
+       {"brake", 0.80},
+       {"estop", true}});
+  expect(
+      estop.at("command").value("brake", -1.0) == 0.80 &&
+          estop.at("command").value("estop", false),
+      "driver ordinary-brake limit weakened an emergency-stop command");
 
   const auto ended = driver.end_session("switch_test_complete");
   expect(!ended.value("connected", true), "explicit session end did not clear local authority");
