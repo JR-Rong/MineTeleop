@@ -191,6 +191,11 @@ void test_field_config_pins_tls_route_without_system_dns() {
       1e-9,
       "field vehicle throttle hard limit changed");
   expect_near(
+      config.field_safety.max_brake,
+      1.0,
+      1e-9,
+      "field vehicle ordinary-brake hard limit changed");
+  expect_near(
       config.field_safety.max_steering_angle_deg,
       5.0,
       1e-9,
@@ -351,6 +356,7 @@ void test_safety_timeout_profile_and_estop_latch() {
 
 void test_control_service_reports_safe_stop_output_after_timeout() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  config.field_safety.max_brake = 0.10;
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
@@ -369,6 +375,7 @@ void test_control_service_reports_safe_stop_output_after_timeout() {
 void test_control_service_applies_vehicle_hard_limits() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   config.field_safety.max_throttle = 0.10;
+  config.field_safety.max_brake = 0.25;
   config.field_safety.max_steering_angle_deg = 3.0;
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
   auto* adapter_view = adapter.get();
@@ -376,9 +383,12 @@ void test_control_service_applies_vehicle_hard_limits() {
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
 
-  const auto result = service.receive_command(command(1, 0), 0);
+  auto requested = command(1, 0);
+  requested.brake = 0.80;
+  const auto result = service.receive_command(requested, 0);
   expect(result.accepted && result.command.has_value(), "limited control command was rejected");
   expect_near(result.command->throttle, 0.10, 1e-9, "vehicle throttle hard limit was not applied");
+  expect_near(result.command->brake, 0.25, 1e-9, "vehicle brake hard limit was not applied");
   expect_near(result.command->steering, 0.10, 1e-9, "vehicle steering hard limit was not applied");
   expect(
       std::find(result.warnings.begin(), result.warnings.end(), "vehicle_max_throttle_applied") !=
@@ -388,17 +398,28 @@ void test_control_service_applies_vehicle_hard_limits() {
       std::find(result.warnings.begin(), result.warnings.end(), "vehicle_max_steering_applied") !=
           result.warnings.end(),
       "steering limit application was not reported");
+  expect(
+      std::find(result.warnings.begin(), result.warnings.end(), "vehicle_max_brake_applied") !=
+          result.warnings.end(),
+      "brake limit application was not reported");
   const auto telemetry = adapter_view->read_telemetry();
   expect_near(telemetry.throttle_feedback, 0.10, 1e-9, "adapter received uncapped throttle");
+  expect_near(telemetry.brake_feedback, 0.25, 1e-9, "adapter received uncapped brake");
   expect_near(telemetry.steering_feedback, 0.10, 1e-9, "adapter received uncapped steering");
   const auto limits = service.control_limits();
   expect_near(limits.at("max_throttle").get<double>(), 0.10, 1e-9, "reported throttle limit mismatch");
+  expect_near(limits.at("max_brake").get<double>(), 0.25, 1e-9, "reported brake limit mismatch");
   expect_near(
       limits.at("max_steering_angle_deg").get<double>(),
       3.0,
       1e-9,
       "reported steering limit mismatch");
   service.close();
+  expect_near(
+      adapter_view->read_telemetry().brake_feedback,
+      1.0,
+      1e-9,
+      "ordinary brake limit weakened disconnect safe-stop output");
 }
 
 void test_control_service_bounds_telemetry_history() {
@@ -439,6 +460,7 @@ void test_control_service_bounds_telemetry_history() {
 void test_control_service_requires_feedback_before_actuation_but_allows_estop() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   config.field_safety.require_can_feedback_before_control = true;
+  config.field_safety.max_brake = 0.10;
   auto adapter = std::make_unique<NoFeedbackAdapter>();
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
@@ -456,6 +478,11 @@ void test_control_service_requires_feedback_before_actuation_but_allows_estop() 
   const auto accepted_estop = service.receive_command(estop, 10);
   expect(accepted_estop.accepted, "estop must bypass the feedback gate");
   expect(service.safety_state() == mine_teleop::SafetyState::Estop, "estop did not latch without feedback");
+  expect_near(
+      adapter_view->last_safe_output.brake,
+      1.0,
+      1e-9,
+      "ordinary brake limit weakened emergency-stop output");
   service.close();
 }
 

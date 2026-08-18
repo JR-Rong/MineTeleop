@@ -39,8 +39,9 @@ mock`. On an isolated CAN bench, edit the deployed
 bridge path above and the same interface declared by `hardware.can.interface`
 (`can1` in the current field template), give `field_safety.max_speed_kph` a
 positive commissioning value, and set the authoritative
-`max_throttle`/`max_steering_angle_deg` limits. The browser limit dialog can
-only reduce those vehicle-side limits.
+`max_throttle`/`max_brake`/`max_steering_angle_deg` limits. `max_brake` limits
+ordinary driving commands only; safety-stop braking bypasses it. The browser
+limit dialog can only reduce those vehicle-side limits.
 
 Validate before service startup:
 

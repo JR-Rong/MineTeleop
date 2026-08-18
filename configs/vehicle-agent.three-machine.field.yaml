@@ -93,6 +93,9 @@ field_safety:
   max_speed_kph: 0
   # These remain authoritative even if the browser requests a larger value.
   max_throttle: 0.10
+  # Normalized ordinary-driving brake only. Set from vehicle brake calibration;
+  # ESTOP/timeout/fault/disconnect safe-stop output bypasses this hard limit.
+  max_brake: 1.0
   max_steering_angle_deg: 5.0
   require_can_feedback_before_control: true
   require_local_estop_reset: true

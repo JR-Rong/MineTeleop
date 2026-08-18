@@ -279,6 +279,7 @@ struct GamepadConfig {
 
 struct DriverControlLimitsConfig {
   double initial_max_throttle{0.05};
+  double initial_max_brake{1.0};
   double initial_max_steering_angle_deg{3.0};
 };
 
@@ -319,6 +320,8 @@ class DriverConsoleRuntime {
   [[nodiscard]] Json send_webrtc_answer(const Json& input);
   [[nodiscard]] Json send_webrtc_ice_candidate(const Json& input);
   [[nodiscard]] Json ingest_webrtc_metrics(const Json& input);
+  [[nodiscard]] Json control_limits() const;
+  [[nodiscard]] Json set_control_limits(const Json& input);
   [[nodiscard]] Json send_control(const Json& input);
   [[nodiscard]] Json record_browser_event(const Json& input);
   [[nodiscard]] Json status();
@@ -360,6 +363,7 @@ class DriverConsoleRuntime {
   std::uint64_t sequence_{0};
   std::int64_t connected_at_ms_{0};
   std::int64_t last_control_sent_ms_{0};
+  std::atomic<double> max_brake_limit_{1.0};
   Json signaling_messages_ = Json::array();
   Json pending_websocket_messages_ = Json::array();
   std::unique_ptr<WebSocketClient> signaling_websocket_;

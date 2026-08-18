@@ -824,6 +824,7 @@ Json VehicleConfig::redacted_summary() const {
       {"can_tx_queue_length", hardware.can_tx_queue_length},
       {"max_speed_kph", field_safety.max_speed_kph},
       {"max_throttle", field_safety.max_throttle},
+      {"max_brake", field_safety.max_brake},
       {"max_steering_angle_deg", field_safety.max_steering_angle_deg},
       {"require_time_sync", field_safety.require_time_sync},
       {"max_time_sync_uncertainty_ms", field_safety.max_time_sync_uncertainty_ms},
@@ -1004,6 +1005,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.field_safety.commissioning_mode = optional<std::string>(safety, "commissioning_mode", "bench");
   config.field_safety.max_speed_kph = optional<double>(safety, "max_speed_kph", 40.0);
   config.field_safety.max_throttle = optional<double>(safety, "max_throttle", 1.0);
+  config.field_safety.max_brake = optional<double>(safety, "max_brake", 1.0);
   config.field_safety.max_steering_angle_deg =
       optional<double>(safety, "max_steering_angle_deg", 30.0);
   config.field_safety.require_can_feedback_before_control =
@@ -1019,6 +1021,9 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
       !std::isfinite(config.field_safety.max_throttle) ||
       config.field_safety.max_throttle < 0.0 ||
       config.field_safety.max_throttle > 1.0 ||
+      !std::isfinite(config.field_safety.max_brake) ||
+      config.field_safety.max_brake < 0.0 ||
+      config.field_safety.max_brake > 1.0 ||
       !std::isfinite(config.field_safety.max_steering_angle_deg) ||
       config.field_safety.max_steering_angle_deg < 0.0 ||
       config.field_safety.max_steering_angle_deg > 30.0 ||
@@ -1064,10 +1069,10 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   }
   if (config.vehicle_adapter.type != "mock" &&
       (!safety || !safety["max_speed_kph"] || !safety["max_throttle"] ||
-       !safety["max_steering_angle_deg"])) {
+       !safety["max_brake"] || !safety["max_steering_angle_deg"])) {
     throw std::runtime_error(
         "non-mock vehicle adapter requires explicit field_safety max_speed_kph, "
-        "max_throttle, and max_steering_angle_deg");
+        "max_throttle, max_brake, and max_steering_angle_deg");
   }
   if (config.vehicle_adapter.type != "mock" && config.field_safety.max_speed_kph <= 0.0) {
     throw std::runtime_error("non-mock vehicle adapter requires field_safety.max_speed_kph > 0");
@@ -1493,6 +1498,7 @@ VehicleControlService::VehicleControlService(
       require_feedback_before_control_(config.field_safety.require_can_feedback_before_control),
       max_speed_kph_(config.field_safety.max_speed_kph),
       max_throttle_(config.field_safety.max_throttle),
+      max_brake_(config.field_safety.max_brake),
       max_steering_angle_deg_(config.field_safety.max_steering_angle_deg),
       telemetry_interval_ms_(telemetry_interval_ms) {
   if (!adapter_) throw std::invalid_argument("vehicle adapter is required");
@@ -1519,12 +1525,17 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
   if (!result.accepted || !result.command) return result;
   auto& effective = *result.command;
   const auto limited_throttle = std::min(effective.throttle, max_throttle_);
+  const auto limited_brake = std::min(effective.brake, max_brake_);
   const auto steering_limit = max_steering_angle_deg_ / 30.0;
   const auto limited_steering =
       std::clamp(effective.steering, -steering_limit, steering_limit);
   if (limited_throttle != effective.throttle) {
     result.warnings.emplace_back("vehicle_max_throttle_applied");
     effective.throttle = limited_throttle;
+  }
+  if (!effective.estop && limited_brake != effective.brake) {
+    result.warnings.emplace_back("vehicle_max_brake_applied");
+    effective.brake = limited_brake;
   }
   if (limited_steering != effective.steering) {
     result.warnings.emplace_back("vehicle_max_steering_applied");
@@ -1629,6 +1640,7 @@ Json VehicleControlService::control_limits() const {
   return {
       {"max_speed_kph", max_speed_kph_},
       {"max_throttle", max_throttle_},
+      {"max_brake", max_brake_},
       {"max_steering_angle_deg", max_steering_angle_deg_},
   };
 }

@@ -72,12 +72,15 @@ N/R/D 三个挡位；电子驻车通过四路 EPB 状态单独判断，不能用
 只有 `ready=true` 才放行普通驾驶命令。点击“断开 VCU 握手”、DataChannel
 断开或安全退出时，车端执行上述完整反向序列；不会只停发 CAN。
 
-控制页面的“实车调试限幅”窗口可设置当前浏览器会话的最大油门/纵向输入和最大
-四轴转向角。默认分别为 5% 和 3°，键盘与 Gamepad 共用这一限幅；修改限幅会先
-清零当前输入，而且每次应用都要求确认车辆处于隔离台架。车端
-`field_safety.max_throttle` 和 `field_safety.max_steering_angle_deg` 是不可由
-浏览器绕过的第二层硬上限，车端会通过 DataChannel 把实际硬上限回传给窗口。
-制动和急停不受油门限幅削弱。
+控制页面的“实车调试限幅”窗口可设置当前浏览器会话的最大油门/纵向输入、最大
+普通驾驶刹车和最大四轴转向角。默认分别为 5%、100% 和 3°，键盘与 Gamepad
+共用这一限幅；修改限幅会先清零当前输入，而且每次应用都要求确认车辆处于隔离
+台架。车端 `field_safety.max_throttle`、`field_safety.max_brake` 和
+`field_safety.max_steering_angle_deg` 是不可由浏览器绕过的第二层硬上限，车端会
+通过 DataChannel 把实际硬上限回传给窗口。归一化刹车上限必须来自车辆标定；
+急停、控制超时、故障和断开停车走独立安全停车路径，不受普通驾驶刹车限幅削弱。
+非 mock 车端升级后必须在 YAML 中显式补齐 `field_safety.max_brake`；未完成标定时
+先显式使用 `1.0`，不要臆造现场制动值。
 
 进入 Ready 前必须收到八路扭矩反馈。Ready 后会分别监视握手、VCU 状态、车速、
 物理挡位选择器、EPB、八路 MCU 模式、八路 MCU 扭矩、四轴 EPS 和四组 EHB 共
@@ -132,6 +135,7 @@ field_safety:
   commissioning_mode: bench
   max_speed_kph: 5
   max_throttle: 0.10
+  max_brake: 1.0
   max_steering_angle_deg: 5.0
   require_can_feedback_before_control: true
 
