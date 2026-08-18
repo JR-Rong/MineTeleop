@@ -104,8 +104,13 @@ sudo journalctl -u mine-teleop-signaling-server -n 100 --no-pager
 
 ### 3.1 无重启新增驾驶员或车辆
 
-已安装云包后，使用随包提供的脚本新增 driver，并按需重复 `--vehicle` 建立车辆
-白名单：
+以下工具只支持云端的 Ubuntu 22.04/Linux 环境；不要从 macOS 直接运行。正常云包
+部署会安装 `openssl`、`flock`（`util-linux`）和 `python3-yaml`，也可改用 Mike
+Farah `yq` v4。执行前确认 `/etc/mine-teleop`、其中的 `secrets`/`backups` 及目标凭据
+都不是符号链接；脚本会拒绝不安全的链接，并把管理目录收紧为 `0700`、凭据
+文件设为 `0600`。
+
+已安装云包后，使用随包提供的脚本新增 driver，并用 `--vehicles` 建立车辆白名单：
 
 ```bash
 sudo /opt/mine-teleop/add-driver.sh \
@@ -119,6 +124,10 @@ sudo /opt/mine-teleop/add-driver.sh \
 交付通道把凭据提供给对应驾驶员；其控制端 `config/driver-console.yaml` 的
 `driver.id` 必须使用同一个 ID。
 
+两个脚本在同一把配置锁内完成读取、验证、备份和提交。随包 signaling 校验器必须
+存在并完整通过 `--validate-config`；校验器缺失、已有身份所需的 secret 环境变量
+缺失或其他任何校验错误都会失败关闭，YAML 不会更新。
+
 新增账号在第一次匹配登录时热生效，不需要 `systemctl restart`。新增车辆使用：
 
 ```bash
@@ -127,6 +136,10 @@ sudo /opt/mine-teleop/add-vehicle.sh \
   --config /etc/mine-teleop/signaling-server.yaml \
   --assign-to-driver driver-console-003
 ```
+
+若 YAML 尚无该车辆、但 secrets 目录已有同名孤立 token，可显式传入 `--force`
+重新生成；若之后编辑、校验、备份或提交失败，脚本会恢复原 token。`--force` 不允许
+覆盖 YAML 中已有的车辆，也不是在线 token 轮换入口。
 
 车辆在第一次携带匹配 token 上线时触发同一套增量热加载。可通过健康状态的
 `configured_drivers`、`configured_vehicles`、`identity_reload_successes` 和 signaling
