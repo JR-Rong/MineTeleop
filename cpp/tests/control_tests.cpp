@@ -350,6 +350,11 @@ void test_control_page_contract() {
       response.body.find("passwordInput.value='';const result=await post('/api/login'") != std::string::npos,
       "driver credential is not cleared before the login request can fail");
   expect(
+      response.body.find("function startLoginCooldown(retryAfterMs)") != std::string::npos &&
+          response.body.find("loginButton.textContent=`登录冷却") != std::string::npos &&
+          response.body.find("error.retryAfterMs") != std::string::npos,
+      "failed login does not expose the controller-side cooldown countdown");
+  expect(
       response.body.find("controlAuthorityLost=false;webrtcLabel.textContent='未连接'") != std::string::npos,
       "successful reauthentication leaves a stale lost-authority label visible");
   expect(response.body.find("navigator.getGamepads") != std::string::npos, "Gamepad discovery is missing");
@@ -631,6 +636,9 @@ void test_signaling_multi_identity_config() {
       device_token_file: vehicle-2.token
 )YAML");
   const auto config = mine_teleop::load_signaling_identity_config(valid_path);
+  expect(
+      config.identity_config_path == std::filesystem::absolute(valid_path).lexically_normal(),
+      "multi-identity config did not retain its hot-reload source path");
   expect(config.driver_passwords.size() == 2, "multi-identity config lost a driver");
   expect(config.device_tokens.size() == 2, "multi-identity config lost a vehicle");
   expect(
@@ -719,6 +727,142 @@ void test_signaling_multi_identity_config() {
   expect_throws(
       [&] { static_cast<void>(mine_teleop::load_signaling_identity_config(ambiguous_secret_path)); },
       "identity with two secret sources was accepted");
+  std::filesystem::remove_all(root);
+}
+
+void test_signaling_identity_hot_add_is_additive() {
+  const auto root = std::filesystem::temp_directory_path() /
+      ("mine-teleop-signaling-hot-add-" + mine_teleop::random_token(6));
+  const auto secrets = root / "secrets";
+  const auto config_path = root / "signaling-server.yaml";
+  std::filesystem::create_directories(secrets);
+  write_text_file(secrets / "driver-console-001.password", "driver-password-1\n");
+  write_text_file(secrets / "vehicle-001.token", "vehicle-token-1\n");
+  write_text_file(
+      config_path,
+      R"YAML(auth:
+  drivers:
+    - id: driver-console-001
+      password_file: secrets/driver-console-001.password
+      vehicles: [vehicle-001]
+  vehicles:
+    - id: vehicle-001
+      device_token_file: secrets/vehicle-001.token
+)YAML");
+
+  auto config = mine_teleop::load_signaling_identity_config(config_path);
+  config.login_max_failures = 10;
+  mine_teleop::SignalingService service(config);
+  const auto login = [&](std::string_view driver_id, std::string_view password) {
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.target = "/auth/driver_login";
+    request.path = request.target;
+    request.body = mine_teleop::Json({
+        {"driver_id", std::string(driver_id)},
+        {"password", std::string(password)},
+    }).dump();
+    return service.handle(request);
+  };
+  const auto first_login = login("driver-console-001", "driver-password-1");
+  expect(first_login.status == 200, "initial driver could not log in before hot add");
+  const auto first_token = mine_teleop::Json::parse(first_login.body).value("token", "");
+
+  const auto initial_write_time = std::filesystem::last_write_time(config_path);
+  write_text_file(secrets / "vehicle-002.token", "vehicle-token-2\n");
+  write_text_file(
+      config_path,
+      R"YAML(auth:
+  drivers:
+    - id: driver-console-001
+      password_file: secrets/driver-console-001.password
+      vehicles: [vehicle-001, vehicle-002]
+  vehicles:
+    - id: vehicle-001
+      device_token_file: secrets/vehicle-001.token
+    - id: vehicle-002
+      device_token_file: secrets/vehicle-002.token
+)YAML");
+  const auto vehicle_add_write_time = initial_write_time + std::chrono::seconds(1);
+  std::filesystem::last_write_time(config_path, vehicle_add_write_time);
+
+  mine_teleop::HttpRequest vehicle_online;
+  vehicle_online.method = "POST";
+  vehicle_online.target = "/vehicles/online";
+  vehicle_online.path = vehicle_online.target;
+  vehicle_online.body = mine_teleop::Json({
+      {"vehicle_id", "vehicle-002"},
+      {"device_token", "vehicle-token-2"},
+      {"connection_id", "hot-added-vehicle-connection"},
+  }).dump();
+  expect(
+      service.handle(vehicle_online).status == 200,
+      "new vehicle was not discovered on its first connection without a signaling restart");
+
+  write_text_file(secrets / "driver-console-002.password", "driver-password-2\n");
+  write_text_file(
+      config_path,
+      R"YAML(auth:
+  drivers:
+    - id: driver-console-001
+      password_file: secrets/driver-console-001.password
+      vehicles: [vehicle-001, vehicle-002]
+    - id: driver-console-002
+      password_file: secrets/driver-console-002.password
+      vehicles: [vehicle-002]
+  vehicles:
+    - id: vehicle-001
+      device_token_file: secrets/vehicle-001.token
+    - id: vehicle-002
+      device_token_file: secrets/vehicle-002.token
+)YAML");
+  const auto additive_write_time = vehicle_add_write_time + std::chrono::seconds(1);
+  std::filesystem::last_write_time(config_path, additive_write_time);
+
+  const auto hot_login = login("driver-console-002", "driver-password-2");
+  expect(hot_login.status == 200, "new driver was not discovered without a signaling restart");
+  auto health = service.health();
+  expect(
+      health.value("configured_drivers", std::size_t{0}) == 2 &&
+          health.value("configured_vehicles", std::size_t{0}) == 2 &&
+          health.value("identity_hot_reload_enabled", false) &&
+          health.value("identity_reload_successes", std::uint64_t{0}) == 2 &&
+          health.value("identity_reload_failures", std::uint64_t{1}) == 0,
+      "successful identity hot add was not reflected in health");
+
+  mine_teleop::HttpRequest heartbeat;
+  heartbeat.method = "POST";
+  heartbeat.target = "/auth/driver_heartbeat";
+  heartbeat.path = heartbeat.target;
+  heartbeat.body = mine_teleop::Json({
+      {"driver_id", "driver-console-001"},
+      {"token", first_token},
+  }).dump();
+  expect(service.handle(heartbeat).status == 200, "hot add invalidated an existing driver token");
+
+  write_text_file(
+      config_path,
+      R"YAML(auth:
+  drivers:
+    - id: driver-console-002
+      password_file: secrets/driver-console-002.password
+      vehicles: [vehicle-002]
+  vehicles:
+    - id: vehicle-001
+      device_token_file: secrets/vehicle-001.token
+    - id: vehicle-002
+      device_token_file: secrets/vehicle-002.token
+)YAML");
+  std::filesystem::last_write_time(config_path, additive_write_time + std::chrono::seconds(1));
+  expect(login("driver-console-003", "not-configured").status == 401, "unknown driver bypassed authentication");
+  health = service.health();
+  expect(
+      health.value("configured_drivers", std::size_t{0}) == 2 &&
+          health.value("identity_reload_successes", std::uint64_t{0}) == 2 &&
+          health.value("identity_reload_failures", std::uint64_t{0}) == 1,
+      "non-additive identity update replaced the last valid snapshot");
+  expect(service.handle(heartbeat).status == 200, "rejected identity update invalidated existing authority");
+
   std::filesystem::remove_all(root);
 }
 
@@ -1279,6 +1423,75 @@ void test_local_proxy_preserves_upstream_auth_status() {
   const auto relogin = runtime->login("dev-password");
   expect(relogin.value("authenticated", false), "same driver could not log in after token expiry cleanup");
   static_cast<void>(runtime->disconnect("token_expiry_relogin_test_complete"));
+  server.stop();
+}
+
+void test_driver_control_endpoint_login_cooldown() {
+  mine_teleop::SignalingServerConfig signaling_config;
+  signaling_config.driver_passwords = {
+      {"driver-default-cooldown", "default-password"},
+      {"driver-short-cooldown", "short-password"},
+  };
+  signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
+  signaling_config.driver_vehicle_permissions = {
+      {"driver-default-cooldown", {"vehicle-001"}},
+      {"driver-short-cooldown", {"vehicle-001"}},
+  };
+  auto signaling = std::make_shared<mine_teleop::SignalingService>(std::move(signaling_config));
+  mine_teleop::SimpleHttpServer server(
+      "127.0.0.1",
+      0,
+      [signaling](const auto& request) { return signaling->handle(request); },
+      8 * 1024 * 1024,
+      [signaling](int socket, const auto& request) { return signaling->handle_websocket(socket, request); });
+  server.start();
+  const auto origin = "http://127.0.0.1:" + std::to_string(server.port());
+
+  const auto login_request = [](std::string_view password) {
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.path = "/api/login";
+    request.body = mine_teleop::Json({{"password", std::string(password)}}).dump();
+    return request;
+  };
+
+  mine_teleop::DriverConfig default_config;
+  default_config.driver_id = "driver-default-cooldown";
+  default_config.signaling_url = origin;
+  auto default_runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(
+      default_config, "vehicle-001", "default-password");
+  mine_teleop::DriverConsoleHttpApp default_app(default_runtime);
+  const auto rejected = default_app.handle(login_request("wrong-password"));
+  expect(rejected.status == 429, "failed local driver login did not enter cooldown");
+  const auto rejected_body = mine_teleop::Json::parse(rejected.body);
+  expect(
+      rejected_body.value("retry_after_ms", std::int64_t{0}) == 30 * 1000,
+      "default local driver login cooldown is not 30 seconds");
+  expect(
+      response_header(rejected, "Retry-After") == "30" &&
+          response_header(rejected, "Cache-Control") == "no-store",
+      "local login cooldown response omitted retry or cache controls");
+  expect(
+      default_app.handle(login_request("default-password")).status == 429,
+      "correct password bypassed the active local control-end cooldown");
+
+  mine_teleop::DriverConfig short_config;
+  short_config.driver_id = "driver-short-cooldown";
+  short_config.signaling_url = origin;
+  auto short_runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(
+      short_config, "vehicle-001", "short-password", 25);
+  mine_teleop::DriverConsoleHttpApp short_app(short_runtime);
+  expect(
+      short_app.handle(login_request("wrong-password")).status == 429,
+      "test cooldown did not start after a rejected password");
+  expect(
+      short_app.handle(login_request("short-password")).status == 429,
+      "test cooldown allowed an immediate retry");
+  std::this_thread::sleep_for(std::chrono::milliseconds(40));
+  expect(
+      short_app.handle(login_request("short-password")).status == 200,
+      "local driver login did not recover after cooldown expiry");
+  static_cast<void>(short_runtime->disconnect("login_cooldown_test_complete"));
   server.stop();
 }
 
@@ -3294,6 +3507,7 @@ int main() {
       {"control_page_contract", test_control_page_contract},
       {"driver_gamepad_config", test_driver_gamepad_config},
       {"signaling_multi_identity_config", test_signaling_multi_identity_config},
+      {"signaling_identity_hot_add_is_additive", test_signaling_identity_hot_add_is_additive},
       {"credential_purpose_separation_and_stale_control_replay",
        test_credential_purpose_separation_and_stale_control_replay},
       {"browser_event_logging_rotation_and_redaction", test_browser_event_logging_rotation_and_redaction},
@@ -3302,6 +3516,7 @@ int main() {
        test_two_driver_two_vehicle_wss_isolation_and_safe_rejection},
       {"failed_logout_keeps_retryable_local_authority", test_failed_logout_keeps_retryable_local_authority},
       {"local_proxy_preserves_upstream_auth_status", test_local_proxy_preserves_upstream_auth_status},
+      {"driver_control_endpoint_login_cooldown", test_driver_control_endpoint_login_cooldown},
       {"control_authority_lease_renews_without_rotating_token",
        test_control_authority_lease_renews_without_rotating_token},
       {"control_transport_and_loopback_policy", test_control_transport_and_loopback_policy},

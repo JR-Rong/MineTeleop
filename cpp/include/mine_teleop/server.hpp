@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -85,6 +86,7 @@ class SimpleHttpServer {
 struct SignalingServerConfig {
   std::string host{"127.0.0.1"};
   std::uint16_t port{8765};
+  std::filesystem::path identity_config_path;
   std::unordered_map<std::string, std::string> driver_passwords{{"driver-console-001", "dev-password"}};
   std::unordered_map<std::string, std::string> device_tokens{{"vehicle-001", "dev-device-secret"}};
   std::unordered_map<std::string, std::unordered_set<std::string>> driver_vehicle_permissions{
@@ -227,6 +229,7 @@ class SignalingService {
   void enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms);
   void record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms);
   void clear_login_failures(std::string_view driver_id);
+  [[nodiscard]] bool reload_identity_config_if_changed();
   [[nodiscard]] std::string request_source(const HttpRequest& request) const;
   void cleanup_api_rate_limits(std::int64_t timestamp_ms);
   void enforce_api_rate_limit(const HttpRequest& request, std::int64_t timestamp_ms);
@@ -256,6 +259,9 @@ class SignalingService {
   std::uint64_t api_rate_limited_requests_{0};
   std::uint64_t session_counter_{0};
   std::uint64_t connection_generation_{0};
+  std::optional<std::filesystem::file_time_type> identity_config_observed_write_time_;
+  std::uint64_t identity_reload_successes_{0};
+  std::uint64_t identity_reload_failures_{0};
   std::jthread connection_reaper_;
 };
 
@@ -305,7 +311,11 @@ DriverConfig load_driver_config(const std::string& path);
 
 class DriverConsoleRuntime {
  public:
-  DriverConsoleRuntime(DriverConfig config, std::string vehicle_id, std::string password);
+  DriverConsoleRuntime(
+      DriverConfig config,
+      std::string vehicle_id,
+      std::string password,
+      std::int64_t login_failure_cooldown_ms = 30 * 1000);
   ~DriverConsoleRuntime();
 
   [[nodiscard]] Json login(std::string_view password = {});
@@ -353,6 +363,8 @@ class DriverConsoleRuntime {
   mutable std::mutex signaling_websocket_mutex_;
   std::string driver_token_;
   std::int64_t driver_token_expires_at_ms_{0};
+  std::int64_t login_failure_cooldown_ms_{30 * 1000};
+  std::chrono::steady_clock::time_point login_cooldown_until_{};
   std::string signaling_service_instance_id_;
   std::uint64_t signaling_restart_recoveries_{0};
   bool signaling_available_{false};

@@ -2,8 +2,9 @@ Mine Teleop Cloud for Ubuntu 22.04 x64
 ======================================
 
 This package contains the native signaling server, its Ubuntu 22.04 shared
-library closure, systemd units, Caddy/HAProxy/coturn configuration assets, and
-one deployment script. It contains no credentials.
+library closure, systemd units, Caddy/HAProxy/coturn configuration assets, the
+deployment script, and additive driver/vehicle management scripts. It contains
+no credentials.
 
 The deployment target must be Ubuntu 22.04 x86_64 with systemd. Run:
 
@@ -37,5 +38,39 @@ reused:
 
   sudo ./deploy-cloud.sh
 
-Use --skip-package-install only when caddy, coturn, curl, and haproxy are
-already installed. See ./deploy-cloud.sh --help for all options.
+Use --skip-package-install only when caddy, coturn, curl, haproxy, openssl,
+python3-yaml, and util-linux are already installed. See ./deploy-cloud.sh --help
+for all options.
+
+To add a driver without restarting signaling or the other cloud services:
+
+  sudo /opt/mine-teleop/add-driver.sh \
+    --id driver-console-003 \
+    --config /etc/mine-teleop/signaling-server.yaml \
+    --vehicles vehicle-001
+
+To add a vehicle and grant it to an existing driver without restarting:
+
+  sudo /opt/mine-teleop/add-vehicle.sh \
+    --id vehicle-003 \
+    --config /etc/mine-teleop/signaling-server.yaml \
+    --assign-to-driver driver-console-001
+
+These are Ubuntu 22.04/Linux administration tools; macOS/BSD userlands are not
+supported. They require openssl, flock (util-linux), and either python3 with
+PyYAML or Mike Farah yq v4. The deployment script installs the Linux package
+dependencies unless --skip-package-install is selected.
+
+The scripts hold one shared lock across read, validation, backup, and commit;
+require the bundled signaling validator to pass --validate-config; and fail
+without publishing YAML if it is missing or reports any error. Secrets and
+backups use private directories (0700) and credential files (0600); symlink
+credential or managed-directory targets are rejected. They never print secret
+contents and commit only additive identity updates.
+
+add-vehicle.sh --force may replace an orphan token only when that vehicle is not
+already present in YAML. A later failure restores the previous token. It is not
+an online token-rotation mechanism. The running signaling service discovers a
+driver on its first matching login and a vehicle on its first matching
+connection. Deletion, existing-secret rotation, and permission reduction still
+require a validated maintenance-window restart.

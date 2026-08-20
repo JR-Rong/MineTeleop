@@ -78,6 +78,8 @@ require_package_layout() {
   local required
   for required in \
     "$package_root/bin/mine-teleop-signaling-server" \
+    "$package_root/add-driver.sh" \
+    "$package_root/add-vehicle.sh" \
     "$package_root/lib/ld-linux-x86-64.so.2" \
     "$package_root/deployments/systemd/mine-teleop-signaling-server.service" \
     "$package_root/deployments/systemd/mine-teleop-turn-server.service" \
@@ -160,6 +162,8 @@ require_package_layout
 
 if [[ "$self_test" == "true" ]]; then
   bash -n "$package_root/deploy-cloud.sh" \
+    "$package_root/add-driver.sh" \
+    "$package_root/add-vehicle.sh" \
     "$package_root/scripts/render_turnserver_config.sh"
   "$package_root/lib/ld-linux-x86-64.so.2" \
     --library-path "$package_root/lib" \
@@ -291,16 +295,22 @@ if [[ "$install_packages" == "true" ]]; then
     caddy \
     coturn \
     curl \
-    haproxy; then
+    haproxy \
+    openssl \
+    python3-yaml \
+    util-linux; then
     die "package installation failed; fix apt sources or preinstall packages and use --skip-package-install"
   fi
 fi
 
-for required_command in caddy curl haproxy turnserver; do
+for required_command in caddy curl flock haproxy openssl python3 turnserver; do
   command -v "$required_command" >/dev/null 2>&1 || {
     die "required command is missing: $required_command"
   }
 done
+python3 -c 'import yaml' >/dev/null 2>&1 || {
+  die "python3 PyYAML is required by the identity provisioning scripts (install python3-yaml)"
+}
 
 printf '==> stopping the existing cloud target\n'
 systemctl stop mine-teleop-cloud.target 2>/dev/null || true

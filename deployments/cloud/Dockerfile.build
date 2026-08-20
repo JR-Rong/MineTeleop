@@ -29,6 +29,9 @@ RUN apt-get update \
       libssl-dev \
       libyaml-cpp-dev \
       nlohmann-json3-dev \
+      openssl \
+      python3-yaml \
+      util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 ARG MINE_TELEOP_BUILD_TESTS=OFF
@@ -44,10 +47,11 @@ RUN cmake -S . -B /tmp/mine-teleop-cloud-build \
       -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=OFF \
       -DMINE_TELEOP_BUILD_TESTS="$MINE_TELEOP_BUILD_TESTS" \
     && cmake --build /tmp/mine-teleop-cloud-build \
-      --parallel "$MINE_TELEOP_BUILD_JOBS" \
-    && if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \
-         ctest --test-dir /tmp/mine-teleop-cloud-build --output-on-failure; \
-       fi \
+      --parallel "$MINE_TELEOP_BUILD_JOBS"
+
+RUN if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \
+      ctest --test-dir /tmp/mine-teleop-cloud-build --output-on-failure; \
+    fi \
     && cmake --install /tmp/mine-teleop-cloud-build
 
 FROM build AS bundle
@@ -74,6 +78,8 @@ RUN set -eu; \
     cp -a /src/deployments/haproxy /bundle/deployments/haproxy; \
     cp -a /src/deployments/turnserver /bundle/deployments/turnserver; \
     install -m 0755 /src/scripts/deploy/deploy_cloud_bundle.sh /bundle/deploy-cloud.sh; \
+    install -m 0755 /src/scripts/admin/add_driver.sh /bundle/add-driver.sh; \
+    install -m 0755 /src/scripts/admin/add_vehicle.sh /bundle/add-vehicle.sh; \
     install -m 0755 \
       /src/scripts/deploy/render_turnserver_config.sh \
       /bundle/scripts/render_turnserver_config.sh; \
@@ -112,7 +118,8 @@ RUN set -eu; \
       "tests_executed=$tests_executed" \
       "built_at_utc=$MINE_TELEOP_BUILT_AT_UTC" \
       > /bundle/BUILD-INFO.txt; \
-    bash -n /bundle/deploy-cloud.sh /bundle/scripts/render_turnserver_config.sh; \
+    bash -n /bundle/deploy-cloud.sh /bundle/add-driver.sh /bundle/add-vehicle.sh \
+      /bundle/scripts/render_turnserver_config.sh; \
     if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \
       /bundle/scripts/render_turnserver_config.sh --self-test; \
     fi; \
