@@ -62,8 +62,9 @@ mine-teleop-signaling-server \
 
 生产云包提供 `/opt/mine-teleop/add-driver.sh` 和
 `/opt/mine-teleop/add-vehicle.sh`，用于原子新增驾驶员或车辆身份。两个脚本共用
-配置锁，拒绝重复 ID，生成权限为 `0600` 的随机凭据文件，暂存并验证 YAML，备份
-旧 YAML，再提交新配置；它们不会打印凭据，也不会重启云端服务：
+配置锁，拒绝重复 ID，生成权限为 `0600` 的随机凭据文件，在权限为 `0700` 的目录中
+保存凭据和备份，暂存并验证 YAML，备份旧 YAML，再提交新配置；它们会拒绝
+符号链接凭据/管理目录，不会打印凭据，也不会重启云端服务：
 
 ```bash
 sudo /opt/mine-teleop/add-driver.sh \
@@ -76,6 +77,13 @@ sudo /opt/mine-teleop/add-vehicle.sh \
   --config /etc/mine-teleop/signaling-server.yaml \
   --assign-to-driver driver-console-003
 ```
+
+这些是 Ubuntu 22.04/Linux 管理工具，不承诺支持 macOS/BSD 用户空间；需要
+`openssl`、`flock`（`util-linux`），以及 Mike Farah `yq` v4 或带 PyYAML 的
+`python3`。生产执行还必须找到可执行的 `mine-teleop-signaling-server` 并完整通过
+`--validate-config`；校验器缺失、secret 环境变量未提供或任何校验错误都会终止，且
+不会提交 YAML。`add-vehicle.sh --force` 只允许替换尚未进入 YAML 的同名 token 文件；
+后续任一步失败都会恢复旧 token，不能用它在线轮换已有车辆身份。
 
 运行中的多身份 signaling 服务会在未知/密码不匹配的 driver 登录，或未知/token
 不匹配的 vehicle 首次连接时检查配置文件版本。版本变化后只接受增量更新：可以

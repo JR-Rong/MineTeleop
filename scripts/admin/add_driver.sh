@@ -56,6 +56,58 @@ die() {
   exit 2
 }
 
+path_mode() {
+  stat -c '%a' -- "$1" 2>/dev/null || stat -f '%Lp' -- "$1"
+}
+
+path_owner() {
+  stat -c '%u' -- "$1" 2>/dev/null || stat -f '%u' -- "$1"
+}
+
+normalize_managed_path() {
+  local candidate="$1" label="$2" lexical physical
+  lexical="$(realpath -ms -- "$candidate")" ||
+    die "cannot normalize $label path: $candidate"
+  physical="$(realpath -m -- "$candidate")" ||
+    die "cannot resolve $label path: $candidate"
+  [[ "$physical" == "$lexical" ]] ||
+    die "$label path must not contain symbolic links: $candidate"
+  printf '%s\n' "$lexical"
+}
+
+verify_managed_path() {
+  local candidate="$1" label="$2" lexical physical
+  lexical="$(realpath -ms -- "$candidate")" ||
+    die "cannot normalize $label path: $candidate"
+  physical="$(realpath -m -- "$candidate")" ||
+    die "cannot resolve $label path: $candidate"
+  [[ "$physical" == "$lexical" ]] ||
+    die "$label path became symbolic-link based: $candidate"
+}
+
+check_owned_directory() {
+  local directory="$1" label="$2" mode owner
+  [[ ! -L "$directory" ]] || die "$label must not be a symbolic link: $directory"
+  [[ -d "$directory" ]] || die "$label is not a directory: $directory"
+  owner="$(path_owner "$directory")" || die "cannot read owner of $label: $directory"
+  [[ "$owner" == "$EUID" ]] ||
+    die "$label must be owned by uid $EUID (found uid $owner): $directory"
+  mode="$(path_mode "$directory")" || die "cannot read mode of $label: $directory"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "cannot parse mode '$mode' for $label: $directory"
+  (( (8#$mode & 0022) == 0 )) ||
+    die "$label must not be group- or world-writable (mode $mode): $directory"
+  [[ -w "$directory" ]] || die "$label is not writable: $directory"
+}
+
+harden_private_directory() {
+  local directory="$1" label="$2"
+  verify_managed_path "$directory" "$label"
+  check_owned_directory "$directory" "$label"
+  chmod 0700 "$directory"
+  [[ "$(path_mode "$directory")" == '700' ]] ||
+    die "$label could not be restricted to mode 0700: $directory"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -71,7 +123,8 @@ Required:
 Options:
   --secrets-dir DIR         credential directory (default: secrets/ next to the config)
   --backup-dir DIR          config backup directory (default: backups/ next to the config)
-  --dry-run                 report the planned changes without writing anything
+  --dry-run                 render and report the plan without changing YAML,
+                            credentials, or backups
   --help                    show this help
 
 Requires: openssl, plus one YAML backend: yq (mikefarah/yq v4) or python3 with
@@ -106,6 +159,7 @@ select_yaml_engine() {
 # and indentation survive; PyYAML is only used for the read-only queries.
 python_yaml() {
   python3 - "$@" <<'PYTHON'
+import json
 import re
 import sys
 
@@ -166,14 +220,22 @@ def block_end(lines, key_index, limit=None):
 
 
 def find_key(lines, start, limit, key, indent=None):
-    pattern = re.compile(r"^( *)" + re.escape(key) + r":( *)(.*)$")
+    escaped = re.escape(key)
+    pattern = re.compile(
+        r"^( *)(?:%s|\"%s\"|'%s'):( *)(.*)$" %
+        (escaped, escaped, escaped))
+    matches = []
     for index in range(start, limit):
         match = pattern.match(lines[index])
         if match is None:
             continue
         if indent is not None and len(match.group(1)) != indent:
             continue
-        return index, match.group(3).strip()
+        matches.append((index, match.group(3).strip()))
+    if len(matches) > 1:
+        die("`%s` appears more than once at the same mapping level" % key)
+    if matches:
+        return matches[0]
     return -1, ""
 
 
@@ -209,9 +271,9 @@ def auth_section(lines, section):
 
 
 def quote(value):
-    if re.match(r"^[A-Za-z0-9._/-]+$", value):
-        return value
-    return '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"')
+    # Match yq's strenv semantics even for YAML-reserved scalars such as
+    # `true`, `null`, timestamps and numeric-looking identity values.
+    return json.dumps(value, ensure_ascii=False)
 
 
 def parsed_document():
@@ -252,12 +314,12 @@ def driver_span(lines, driver_id):
               if indent_of(lines[index]) == item and lines[index].lstrip().startswith("- ")]
     for position, start in enumerate(starts):
         stop = starts[position + 1] if position + 1 < len(starts) else drivers_limit
-        head = re.match(r"^ *- +id: *(.*)$", lines[start])
+        head = re.match(r"^ *- +(?:id|\"id\"|'id'): *(.*)$", lines[start])
         matched = head is not None and head.group(1).strip().strip("\"'") == driver_id
         if not matched:
-            body, _ = find_key(lines, start + 1, stop, "id", indent=item + 2)
+            body, value = find_key(lines, start + 1, stop, "id", indent=item + 2)
             if body >= 0:
-                matched = lines[body].split(":", 1)[1].strip().strip("\"'") == driver_id
+                matched = value.strip("\"'") == driver_id
         if matched:
             return start, stop, item
     return -1, -1, item
@@ -481,12 +543,14 @@ command -v openssl >/dev/null 2>&1 || die "openssl is required but was not found
 command -v flock >/dev/null 2>&1 || die "flock is required but was not found in PATH"
 select_yaml_engine
 
+[[ ! -L "$config_path" ]] || die "config file must not be a symbolic link: $config_path"
 [[ -f "$config_path" ]] || die "config file does not exist: $config_path"
 [[ -r "$config_path" ]] || die "config file is not readable: $config_path"
-config_dir="$(CDPATH= cd -- "$(dirname -- "$config_path")" && pwd)"
+config_dir="$(CDPATH= cd -- "$(dirname -- "$config_path")" && pwd -P)"
 config_name="$(basename -- "$config_path")"
 config_path="$config_dir/$config_name"
-[[ -w "$config_dir" ]] || die "config directory is not writable: $config_dir"
+[[ ! -L "$config_path" ]] || die "config file must not be a symbolic link: $config_path"
+check_owned_directory "$config_dir" "config directory"
 if [[ $dry_run -eq 0 ]]; then
   [[ -w "$config_path" ]] || die "config file is not writable: $config_path"
 fi
@@ -507,11 +571,26 @@ elif [[ "$backup_dir" != /* ]]; then
 fi
 backup_dir="${backup_dir%/}"
 
+secrets_dir="$(normalize_managed_path "$secrets_dir" "secrets directory")"
+backup_dir="$(normalize_managed_path "$backup_dir" "backup directory")"
+
+[[ ! -L "$secrets_dir" ]] || die "secrets directory must not be a symbolic link: $secrets_dir"
+[[ ! -L "$backup_dir" ]] || die "backup directory must not be a symbolic link: $backup_dir"
+if [[ -e "$secrets_dir" ]]; then
+  check_owned_directory "$secrets_dir" "secrets directory"
+fi
+if [[ -e "$backup_dir" ]]; then
+  check_owned_directory "$backup_dir" "backup directory"
+fi
+
 # Both provisioning scripts use the same advisory lock. Keep it for the full
 # read/validate/publish transaction so concurrent additions cannot overwrite
 # one another or leave a credential without its matching YAML entry.
-exec 9>"${config_path}.admin.lock"
+lock_path="${config_path}.admin.lock"
+[[ ! -L "$lock_path" ]] || die "config lock must not be a symbolic link: $lock_path"
+exec 9>>"$lock_path"
 flock -x 9
+[[ ! -L "$config_path" ]] || die "config file became a symbolic link while acquiring the lock: $config_path"
 
 # Structural checks before touching anything: a malformed config would make the
 # append silently reshape the document.
@@ -531,8 +610,14 @@ drivers_raw="$(yaml_ids "$config_path" drivers)" ||
   die "cannot read auth.drivers from $config_path (is it valid YAML?)"
 vehicles_raw="$(yaml_ids "$config_path" vehicles)" ||
   die "cannot read auth.vehicles from $config_path (is it valid YAML?)"
-mapfile -t existing_drivers <<<"$drivers_raw"
-mapfile -t known_vehicles <<<"$vehicles_raw"
+existing_drivers=()
+while IFS= read -r existing; do
+  [[ -n "$existing" ]] && existing_drivers+=("$existing")
+done <<<"$drivers_raw"
+known_vehicles=()
+while IFS= read -r known; do
+  [[ -n "$known" ]] && known_vehicles+=("$known")
+done <<<"$vehicles_raw"
 
 for existing in "${existing_drivers[@]}"; do
   [[ "$existing" == "$driver_id" ]] &&
@@ -561,7 +646,7 @@ done
 [[ ${#requested_vehicles[@]} -gt 0 ]] || die "--vehicles must list at least one vehicle"
 
 password_path="$secrets_dir/$driver_id.password"
-if [[ -e "$password_path" ]]; then
+if [[ -e "$password_path" || -L "$password_path" ]]; then
   die "credential file already exists: $password_path
       refusing to overwrite an existing credential; remove or rename it first"
 fi
@@ -617,10 +702,12 @@ fi
 # paths then resolve exactly as they will once the file is in place.
 created_secrets_dir="no"
 created_password="no"
+password_staging=""
 backup_path=""
 work_path="$(mktemp "$config_dir/.${config_name}.add-driver.XXXXXX")"
 cleanup() {
   rm -f -- "$work_path"
+  [[ -z "$password_staging" ]] || rm -f -- "$password_staging"
   [[ "$created_password" == "yes" ]] && rm -f -- "$password_path"
   [[ "$created_secrets_dir" == "yes" ]] && rmdir -- "$secrets_dir" 2>/dev/null
   return 0
@@ -636,7 +723,7 @@ yaml_add_driver "$work_path" "$driver_id" "$password_file_value" "$vehicles_disp
   die "the rendered config does not contain exactly one '$driver_id' entry; $config_name was not modified"
 
 if [[ $dry_run -eq 1 ]]; then
-  info "dry run: no files were created or modified"
+  info "dry run: YAML, credentials, and backups are unchanged"
   printf '\n%splanned credential%s\n' "$color_bold" "$color_reset"
   printf '  openssl rand -base64 32 > %s\n' "$password_path"
   printf '  chmod 0600 %s\n' "$password_path"
@@ -651,29 +738,39 @@ if [[ $dry_run -eq 1 ]]; then
   if [[ -n "$signaling_binary" ]]; then
     printf '\n'
     info "would validate with ${validator_command[*]} --validate-config"
+  else
+    die "mine-teleop-signaling-server validator is required; set MINE_TELEOP_SIGNALING_SERVER_BIN"
   fi
   printf '  config backup would be created under %s\n' "$backup_dir"
   exit 0
 fi
 
+[[ -n "$signaling_binary" ]] ||
+  die "mine-teleop-signaling-server validator is required; set MINE_TELEOP_SIGNALING_SERVER_BIN"
+
 # Credential first: the config must never reference a password file that does
 # not exist yet.
 if [[ ! -d "$secrets_dir" ]]; then
-  (umask 077 && mkdir -p -- "$secrets_dir") || die "cannot create secrets directory: $secrets_dir"
+  verify_managed_path "$secrets_dir" "secrets directory"
+  (umask 077 && mkdir -- "$secrets_dir") || die "cannot create secrets directory: $secrets_dir"
   created_secrets_dir="yes"
-  chmod 0700 -- "$secrets_dir"
   ok "created secrets directory $secrets_dir (mode 0700)"
 fi
-[[ -w "$secrets_dir" ]] || die "secrets directory is not writable: $secrets_dir"
+harden_private_directory "$secrets_dir" "secrets directory"
 
-if ! (umask 077 && openssl rand -base64 32 >"$password_path"); then
-  rm -f -- "$password_path"
+password_staging="$(mktemp "$secrets_dir/.${driver_id}.password.XXXXXX")"
+if ! openssl rand -base64 32 >"$password_staging"; then
   die "openssl failed to generate a password for $driver_id"
 fi
+chmod 0600 "$password_staging"
+[[ -n "$(tr -d '\r\n' <"$password_staging")" ]] ||
+  die "generated credential is empty after trimming"
+if ! ln -- "$password_staging" "$password_path"; then
+  die "credential target appeared while provisioning; refusing to overwrite it: $password_path"
+fi
 created_password="yes"
-chmod 0600 -- "$password_path"
-[[ -n "$(tr -d '\r\n' <"$password_path")" ]] ||
-  die "generated credential is empty after trimming: $password_path"
+rm -f -- "$password_staging"
+password_staging=""
 ok "generated credential $password_path (mode 0600)"
 
 validate_config() {
@@ -683,37 +780,24 @@ validate_config() {
     ok "$label validated by mine-teleop-signaling-server"
     return 0
   fi
-  # Pre-existing identities that read their secret from the environment cannot
-  # be validated without those variables exported; that failure is unrelated to
-  # the entry added here.
-  if grep -q 'environment variable is unset or empty' <<<"$output"; then
-    warn "skipped full validation of $label: an existing identity reads its secret from the environment"
-    warn "$output"
-    return 0
-  fi
   printf '%s\n' "$output" >&2
   return "$status"
 }
 
-if [[ -n "$signaling_binary" ]]; then
-  validate_config "$work_path" "pending config" ||
-    die "validation rejected the new driver entry; $config_name and the credential were left unchanged"
-else
-  warn "mine-teleop-signaling-server not found in PATH; skipped --validate-config"
-  warn "set MINE_TELEOP_SIGNALING_SERVER_BIN to validate with a locally built binary"
-fi
+validate_config "$work_path" "pending config" ||
+  die "validation rejected the new driver entry; $config_name and the credential were left unchanged"
 
 # Back up and publish the new config, preserving mode and ownership. The backup
 # is created only after the candidate has passed every available validation.
 if [[ ! -d "$backup_dir" ]]; then
-  mkdir -p -- "$backup_dir"
-  chmod 0700 -- "$backup_dir"
+  verify_managed_path "$backup_dir" "backup directory"
+  mkdir -- "$backup_dir"
 fi
-[[ -w "$backup_dir" ]] || die "backup directory is not writable: $backup_dir"
+harden_private_directory "$backup_dir" "backup directory"
 backup_path="$backup_dir/${config_name}.$(date -u +%Y%m%d-%H%M%S)-$$.bak"
 cp -p -- "$config_path" "$backup_path"
 config_mode="$(stat -c '%a' -- "$config_path" 2>/dev/null || stat -f '%Lp' -- "$config_path")"
-chmod "$config_mode" -- "$work_path"
+chmod "$config_mode" "$work_path"
 if [[ "$EUID" -eq 0 ]]; then
   config_owner="$(stat -c '%u:%g' -- "$config_path" 2>/dev/null || stat -f '%u:%g' -- "$config_path")"
   chown "$config_owner" -- "$work_path"
@@ -721,11 +805,6 @@ fi
 mv -f -- "$work_path" "$config_path"
 trap - EXIT
 ok "updated $config_path"
-
-if [[ -n "$signaling_binary" ]]; then
-  validate_config "$config_path" "$config_name" ||
-    warn "the installed config failed validation; inspect $config_path"
-fi
 
 printf '\n%sdriver added%s\n' "$color_bold$color_green" "$color_reset"
 printf '  driver id      %s\n' "$driver_id"

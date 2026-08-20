@@ -56,9 +56,21 @@ To add a vehicle and grant it to an existing driver without restarting:
     --config /etc/mine-teleop/signaling-server.yaml \
     --assign-to-driver driver-console-001
 
-The scripts lock, back up, and validate the identity YAML, create protected
-random secret files without printing their contents, and commit only additive
-identity updates. The running signaling service discovers a driver on its first
-matching login and a vehicle on its first matching connection. Deletion,
-existing-secret rotation, and permission reduction still require a validated
-maintenance-window restart.
+These are Ubuntu 22.04/Linux administration tools; macOS/BSD userlands are not
+supported. They require openssl, flock (util-linux), and either python3 with
+PyYAML or Mike Farah yq v4. The deployment script installs the Linux package
+dependencies unless --skip-package-install is selected.
+
+The scripts hold one shared lock across read, validation, backup, and commit;
+require the bundled signaling validator to pass --validate-config; and fail
+without publishing YAML if it is missing or reports any error. Secrets and
+backups use private directories (0700) and credential files (0600); symlink
+credential or managed-directory targets are rejected. They never print secret
+contents and commit only additive identity updates.
+
+add-vehicle.sh --force may replace an orphan token only when that vehicle is not
+already present in YAML. A later failure restores the previous token. It is not
+an online token-rotation mechanism. The running signaling service discovers a
+driver on its first matching login and a vehicle on its first matching
+connection. Deletion, existing-secret rotation, and permission reduction still
+require a validated maintenance-window restart.
