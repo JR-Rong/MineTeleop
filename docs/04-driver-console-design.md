@@ -105,6 +105,14 @@ Console 不应只在按键变化时发送控制，而应按固定周期发送当
 当前控制端会把车端 `webrtc_offer` 返回给浏览器页面，
 页面用 `RTCPeerConnection` 创建 answer，并通过 `ontrack` 把远端视频流挂到对应
 camera 的 `<video>` 元素；控制 DataChannel 按 unordered/unreliable 配置创建。
+视频轨道不以 VCU 握手或 CAN adapter ready 为显示前提：浏览器收到 `ontrack`
+就立即挂载画面。车端只在控制 DataChannel 打开后启动 VCU adapter；adapter
+启动或运行失败时继续保留视频，把握手状态上报为 `fault`，随后只关闭控制
+DataChannel 并阻止所有驾驶命令。关闭控制通道也保护不认识 `adapter_ready`
+字段的旧控制端，避免其误以为软件急停已经送达。页面把点击动作显示为“急停
+请求已锁定”，只有收到车端 `estop=true` 遥测后才显示车辆急停已确认；否则
+明确要求使用车辆物理急停。配置文件自身
+不合法、身份/信令失败或相机/编码链失败仍会阻止媒体启动。
 页面连接后周期读取本机 C++ 运行时的消息缓冲并处理车端 remote ICE candidate；
 跨网信令本身使用经证书校验的 WSS push/ack，不再使用 HTTPS 消息轮询。浏览器
 local ICE candidate 经本机 C++ WSS 客户端转发到车端。服务端推送带单调

@@ -40,10 +40,20 @@ std::size_t append_body(char* data, std::size_t size, std::size_t count, void* o
 
 Json decode_json_response(const HttpResponse& response) {
   if (response.status < 200 || response.status >= 300) {
+    std::string issue_code;
+    try {
+      const auto body = Json::parse(response.body);
+      if (body.is_object()) issue_code = body.value("issue_code", "");
+    } catch (const Json::exception&) {
+      // Preserve the original response below.  Error bodies from proxies or
+      // older servers are not required to be JSON.
+    }
     throw HttpStatusError(
         response.status,
         "HTTP request failed with status " + std::to_string(response.status) + ": " +
-            response.body.substr(0, 512));
+            response.body.substr(0, 512),
+        std::move(issue_code),
+        response.body.substr(0, 4096));
   }
   try {
     auto value = Json::parse(response.body);

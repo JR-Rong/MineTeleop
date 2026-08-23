@@ -5,6 +5,7 @@
 #include "mine_teleop/upload.hpp"
 #include "mine_teleop/video.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <chrono>
 #include <filesystem>
@@ -54,6 +55,35 @@ mine_teleop::Json read_json(const std::filesystem::path& path) {
   mine_teleop::Json value;
   input >> value;
   return value;
+}
+
+std::string read_text(const std::filesystem::path& path) {
+  std::ifstream input(path);
+  if (!input) throw TestFailure("cannot open test input: " + path.string());
+  return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+void replace_once(
+    std::string& value,
+    std::string_view needle,
+    std::string_view replacement) {
+  const auto position = value.find(needle);
+  if (position == std::string::npos) {
+    throw TestFailure("cannot find test config anchor: " + std::string(needle));
+  }
+  value.replace(position, needle.size(), replacement);
+}
+
+std::filesystem::path write_temp_vehicle_config(
+    std::string_view suffix,
+    const std::string& contents) {
+  const auto path = std::filesystem::path("/tmp") /
+      ("mine-teleop-vehicle-config-" + std::string(suffix) + "-" +
+       mine_teleop::random_token(6) + ".yaml");
+  std::ofstream output(path);
+  if (!output) throw TestFailure("cannot create temporary vehicle config");
+  output << contents;
+  return path;
 }
 
 ControlCommand command(std::uint64_t seq = 1, std::int64_t timestamp_ms = 0) {
@@ -147,6 +177,251 @@ void test_config_loads_current_vehicle_yaml() {
   expect(config.vehicle_adapter.type == "mock", "adapter type mismatch");
   expect(config.hardware.can_bitrate == 500000, "CAN bitrate mismatch");
   expect(config.hardware.can_tx_queue_length == 100, "CAN tx queue length mismatch");
+  expect_near(
+      config.field_safety.full_scale_motor_torque_nm,
+      41.25,
+      1e-9,
+      "safe default full-scale motor torque changed");
+}
+
+void test_vehicle_config_validates_full_scale_motor_torque() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  for (const std::string invalid : {"-0.1", "165.1", ".nan"}) {
+    auto contents = base;
+    replace_once(
+        contents,
+        "field_safety:\n",
+        "field_safety:\n  full_scale_motor_torque_nm: " + invalid + "\n");
+    const auto path = write_temp_vehicle_config("invalid-torque", contents);
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); },
+        "invalid full-scale motor torque was accepted");
+    std::error_code error;
+    std::filesystem::remove(path, error);
+  }
+
+  auto disabled_contents = base;
+  replace_once(
+      disabled_contents,
+      "field_safety:\n",
+      "field_safety:\n  full_scale_motor_torque_nm: 0\n");
+  const auto disabled_path = write_temp_vehicle_config("disabled-torque", disabled_contents);
+  const auto disabled_config = mine_teleop::load_vehicle_config(disabled_path);
+  expect_near(
+      disabled_config.field_safety.full_scale_motor_torque_nm,
+      0.0,
+      1e-9,
+      "zero full-scale torque did not disable traction");
+  std::error_code error;
+  std::filesystem::remove(disabled_path, error);
+
+  auto non_mock_contents = base;
+  replace_once(
+      non_mock_contents,
+      "field_safety:\n",
+      "field_safety:\n"
+      "  max_throttle: 0.10\n"
+      "  max_brake: 1.0\n"
+      "  max_steering_angle_deg: 5.0\n");
+  replace_once(
+      non_mock_contents,
+      "vehicle_adapter:\n  type: mock",
+      "vehicle_adapter:\n"
+      "  type: dynamic_library\n"
+      "  integration:\n"
+      "    chassis_control:\n"
+      "      can_interface: can0\n"
+      "      bridge_library_path: /tmp/libmine_teleop_chassis_bridge.so");
+  const auto non_mock_path = write_temp_vehicle_config("missing-explicit-torque", non_mock_contents);
+  expect_throws(
+      [&] { static_cast<void>(mine_teleop::load_vehicle_config(non_mock_path)); },
+      "non-mock adapter accepted an implicit full-scale motor torque");
+  std::filesystem::remove(non_mock_path, error);
+}
+
+void test_vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  const auto default_config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  const auto default_camera = default_config.enabled_cameras().front();
+  expect(default_camera.critical_for_control, "camera must default to control-critical");
+  expect(default_camera.reopen_attempts == 3, "camera reopen attempt default changed");
+  expect(default_camera.reopen_backoff_ms == 500, "camera reopen backoff default changed");
+
+  auto explicit_contents = "runtime:\n  control_enabled: false\n  media_enabled: true\n\n" + base;
+  replace_once(
+      explicit_contents,
+      "  - id: front\n",
+      "  - id: front\n"
+      "    critical_for_control: false\n"
+      "    reopen_attempts: 0\n"
+      "    reopen_backoff_ms: 60000\n");
+  const auto explicit_path = write_temp_vehicle_config("explicit-camera-recovery", explicit_contents);
+  const auto explicit_config = mine_teleop::load_vehicle_config(explicit_path);
+  const auto explicit_camera = explicit_config.enabled_cameras().front();
+  expect(!explicit_camera.critical_for_control, "explicit noncritical camera setting was ignored");
+  expect(explicit_camera.reopen_attempts == 0, "zero reopen attempts was not accepted");
+  expect(explicit_camera.reopen_backoff_ms == 60000, "maximum reopen backoff was not accepted");
+  std::error_code error;
+  std::filesystem::remove(explicit_path, error);
+
+  auto boundary_contents = base;
+  replace_once(
+      boundary_contents,
+      "  - id: front\n",
+      "  - id: front\n"
+      "    reopen_attempts: 10\n"
+      "    reopen_backoff_ms: 0\n");
+  const auto boundary_path = write_temp_vehicle_config("camera-recovery-boundaries", boundary_contents);
+  const auto boundary_camera = mine_teleop::load_vehicle_config(boundary_path).enabled_cameras().front();
+  expect(boundary_camera.reopen_attempts == 10, "maximum reopen attempts was not accepted");
+  expect(boundary_camera.reopen_backoff_ms == 0, "zero reopen backoff was not accepted");
+  std::filesystem::remove(boundary_path, error);
+
+  for (const int invalid_attempts : {-1, 11}) {
+    auto contents = base;
+    replace_once(
+        contents,
+        "  - id: front\n",
+        "  - id: front\n    reopen_attempts: " + std::to_string(invalid_attempts) + "\n");
+    const auto path = write_temp_vehicle_config("invalid-camera-reopen-attempts", contents);
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); },
+        "out-of-range camera reopen attempts was accepted");
+    std::filesystem::remove(path, error);
+  }
+  for (const int invalid_backoff_ms : {-1, 60001}) {
+    auto contents = base;
+    replace_once(
+        contents,
+        "  - id: front\n",
+        "  - id: front\n    reopen_backoff_ms: " + std::to_string(invalid_backoff_ms) + "\n");
+    const auto path = write_temp_vehicle_config("invalid-camera-reopen-backoff", contents);
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); },
+        "out-of-range camera reopen backoff was accepted");
+    std::filesystem::remove(path, error);
+  }
+}
+
+void test_control_enabled_vehicle_requires_an_enabled_critical_camera() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  auto no_critical_contents = base;
+  replace_once(
+      no_critical_contents,
+      "  - id: front\n",
+      "  - id: front\n    critical_for_control: false\n");
+  const auto no_critical_path = write_temp_vehicle_config("no-critical-camera", no_critical_contents);
+  expect_throws(
+      [&] { static_cast<void>(mine_teleop::load_vehicle_config(no_critical_path)); },
+      "control-enabled vehicle accepted no enabled critical cameras");
+  std::error_code error;
+  std::filesystem::remove(no_critical_path, error);
+
+  auto one_critical_contents = no_critical_contents;
+  replace_once(
+      one_critical_contents,
+      "  - id: rear\n    enabled: false\n",
+      "  - id: rear\n    enabled: true\n    critical_for_control: true\n");
+  const auto one_critical_path = write_temp_vehicle_config("one-critical-camera", one_critical_contents);
+  const auto enabled_cameras = mine_teleop::load_vehicle_config(one_critical_path).enabled_cameras();
+  expect(enabled_cameras.size() == 2, "expected both configured cameras to be enabled");
+  expect(
+      std::count_if(enabled_cameras.begin(), enabled_cameras.end(), [](const auto& camera) {
+        return camera.critical_for_control;
+      }) == 1,
+      "control-enabled vehicle did not preserve exactly one critical camera");
+  std::filesystem::remove(one_critical_path, error);
+}
+
+void test_camera_failure_decision_is_bounded_and_fail_closed() {
+  mine_teleop::CameraConfig camera;
+  camera.critical_for_control = true;
+  camera.reopen_attempts = 2;
+
+  const auto first_failure = mine_teleop::camera_failure_decision(camera, 1, true);
+  expect(first_failure.inhibit_control, "critical camera failure did not inhibit control");
+  expect(
+      first_failure.lane_action == mine_teleop::CameraFailureAction::ReopenLane,
+      "retryable critical camera failure did not reopen within its budget");
+
+  const auto exhausted = mine_teleop::camera_failure_decision(camera, 3, true);
+  expect(exhausted.inhibit_control, "exhausted critical camera failure released control");
+  expect(
+      exhausted.lane_action == mine_teleop::CameraFailureAction::DisableLane,
+      "critical camera reopened after exhausting its retry budget");
+
+  camera.critical_for_control = false;
+  const auto noncritical = mine_teleop::camera_failure_decision(camera, 2, true);
+  expect(!noncritical.inhibit_control, "noncritical camera failure inhibited control");
+  expect(
+      noncritical.lane_action == mine_teleop::CameraFailureAction::ReopenLane,
+      "retryable noncritical camera did not use its reopen budget");
+  const auto nonretryable = mine_teleop::camera_failure_decision(camera, 1, false);
+  expect(
+      nonretryable.lane_action == mine_teleop::CameraFailureAction::DisableLane,
+      "nonretryable camera failure attempted to reopen");
+  expect_throws(
+      [&] { static_cast<void>(mine_teleop::camera_failure_decision(camera, 0, true)); },
+      "nonpositive camera failure count was accepted");
+}
+
+void test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes() {
+  mine_teleop::MediaSignalingSequence sequence;
+  expect(sequence.current() == 0, "new media signaling sequence was not zero");
+  expect(sequence.next(7, "session-a") == 1, "first media sequence did not start at one");
+  expect(sequence.next(7, "session-a") == 2, "media sequence did not increase within one scope");
+  expect(sequence.current() == 2, "current media sequence did not track the last allocation");
+  expect(sequence.next(7, "session-b") == 1, "new session did not reset media sequence");
+  expect(sequence.next(8, "session-b") == 1, "new connection generation did not reset media sequence");
+  expect(sequence.next(8, "session-b") == 2, "new scope did not remain monotonic after reset");
+  expect_throws(
+      [&] { static_cast<void>(sequence.next(0, "session-b")); },
+      "zero connection generation was accepted as a media sequence scope");
+  expect_throws(
+      [&] { static_cast<void>(sequence.next(8, "")); },
+      "empty session id was accepted as a media sequence scope");
+}
+
+void test_media_signaling_error_classification_supports_structured_and_legacy_conflicts() {
+  using Kind = mine_teleop::MediaSignalingErrorKind;
+  struct ConflictCase {
+    std::string issue_code;
+    std::string legacy_message;
+    Kind expected;
+  };
+  const std::vector<ConflictCase> cases{
+      {"session_not_active", "session is not active", Kind::SessionEnded},
+      {"vehicle_offline", "vehicle is offline", Kind::ConnectionRefresh},
+      {"vehicle_connection_generation_stale", "vehicle connection generation is stale", Kind::ConnectionStale},
+      {"signaling_sequence_older", "signaling message sequence is older than the previous message", Kind::SequenceConflict},
+      {"signaling_sequence_reused", "signaling message sequence was reused with different content", Kind::SequenceConflict},
+  };
+  for (const auto& value : cases) {
+    expect(
+        mine_teleop::classify_media_signaling_error(
+            mine_teleop::HttpStatusError(409, "structured conflict", value.issue_code)) == value.expected,
+        "structured signaling conflict was misclassified: " + value.issue_code);
+    expect(
+        mine_teleop::classify_media_signaling_error(
+            mine_teleop::HttpStatusError(409, "legacy conflict: " + value.legacy_message)) == value.expected,
+        "legacy signaling conflict was misclassified: " + value.legacy_message);
+  }
+  expect(
+      mine_teleop::classify_media_signaling_error(mine_teleop::HttpStatusError(404, "missing")) ==
+          Kind::SessionEnded,
+      "404 signaling response was not treated as an ended session");
+  expect(
+      mine_teleop::classify_media_signaling_error(mine_teleop::HttpStatusError(503, "unavailable")) ==
+          Kind::ServiceUnavailable,
+      "5xx signaling response was not treated as service unavailable");
+  expect(
+      mine_teleop::classify_media_signaling_error(mine_teleop::HttpStatusError(409, "unknown conflict")) ==
+          Kind::Fatal,
+      "unknown 409 signaling conflict was not fail-closed");
+  expect(
+      mine_teleop::classify_media_signaling_error(mine_teleop::HttpStatusError(401, "unauthorized")) ==
+          Kind::Fatal,
+      "nonretryable signaling response was not fatal");
 }
 
 void test_bench_config_drives_unified_vehicle_runtime() {
@@ -190,6 +465,16 @@ void test_field_config_pins_tls_route_without_system_dns() {
       0.10,
       1e-9,
       "field vehicle throttle hard limit changed");
+  expect_near(
+      config.field_safety.full_scale_motor_torque_nm,
+      41.25,
+      1e-9,
+      "field vehicle full-scale motor torque changed");
+  expect_near(
+      config.redacted_summary().at("full_scale_motor_torque_nm").get<double>(),
+      41.25,
+      1e-9,
+      "effective vehicle config omitted full-scale motor torque");
   expect_near(
       config.field_safety.max_brake,
       1.0,
@@ -408,6 +693,11 @@ void test_control_service_applies_vehicle_hard_limits() {
   expect_near(telemetry.steering_feedback, 0.10, 1e-9, "adapter received uncapped steering");
   const auto limits = service.control_limits();
   expect_near(limits.at("max_throttle").get<double>(), 0.10, 1e-9, "reported throttle limit mismatch");
+  expect_near(
+      limits.at("full_scale_motor_torque_nm").get<double>(),
+      41.25,
+      1e-9,
+      "reported full-scale motor torque mismatch");
   expect_near(limits.at("max_brake").get<double>(), 0.25, 1e-9, "reported brake limit mismatch");
   expect_near(
       limits.at("max_steering_angle_deg").get<double>(),
@@ -606,9 +896,19 @@ void test_native_signaling_webrtc_message_isolation() {
       "identical signaling retry did not return its stable acknowledgement");
   auto conflicting_media = media_request;
   conflicting_media["payload"] = {{"codecs", {"h264"}}};
+  const auto conflicting_media_response =
+      http.post_json(base + "/signaling/" + session_id + "/messages", conflicting_media);
   expect(
-      http.post_json(base + "/signaling/" + session_id + "/messages", conflicting_media).status == 409,
+      conflicting_media_response.status == 409,
       "signaling sequence reuse with different content was accepted");
+  const auto conflicting_media_body = mine_teleop::Json::parse(conflicting_media_response.body);
+  expect(
+      conflicting_media_body.value("issue_code", "") == "signaling_sequence_reused",
+      "signaling sequence reuse conflict omitted its structured issue code");
+  expect(
+      conflicting_media_body.value("received_seq", std::uint64_t{0}) == 1 &&
+          conflicting_media_body.value("last_accepted_seq", std::uint64_t{0}) == 1,
+      "signaling sequence reuse conflict omitted its sequence details");
 
   expect(
       http.post_json(
@@ -707,6 +1007,56 @@ void test_native_signaling_webrtc_message_isolation() {
           "media_fallback",
           {{"codec", "h264"}, {"reason", "decode_fps_below_20"}}));
   expect(fallback.value("queued", 0) == 1, "media fallback was not queued");
+  const auto older_media_response = http.post_json(
+      base + "/signaling/" + control.session_id + "/messages",
+      signaling_request(
+          "vehicle-001",
+          "driver-1",
+          control.session_id,
+          2,
+          mine_teleop::now_ms(),
+          "driver-1",
+          "vehicle-001",
+          "token",
+          driver_token,
+          "media_capabilities",
+          {{"codecs", {"h264"}}}));
+  expect(older_media_response.status == 409, "older signaling sequence was accepted");
+  const auto older_media_body = mine_teleop::Json::parse(older_media_response.body);
+  expect(
+      older_media_body.value("issue_code", "") == "signaling_sequence_older",
+      "older signaling conflict omitted its structured issue code");
+  expect(
+      older_media_body.value("received_seq", std::uint64_t{0}) == 2 &&
+          older_media_body.value("last_accepted_seq", std::uint64_t{0}) == 3,
+      "older signaling conflict omitted its sequence details");
+  bool decoded_structured_conflict = false;
+  try {
+    static_cast<void>(http.post_json_response(
+        base + "/signaling/" + control.session_id + "/messages",
+        signaling_request(
+            "vehicle-001",
+            "driver-1",
+            control.session_id,
+            2,
+            mine_teleop::now_ms(),
+            "driver-1",
+            "vehicle-001",
+            "token",
+            driver_token,
+            "media_capabilities",
+            {{"codecs", {"h264"}}})));
+  } catch (const mine_teleop::HttpStatusError& error) {
+    decoded_structured_conflict =
+        error.status() == 409 &&
+        error.issue_code() == "signaling_sequence_older" &&
+        mine_teleop::classify_media_signaling_error(error) ==
+            mine_teleop::MediaSignalingErrorKind::SequenceConflict &&
+        error.response_body().find("last_accepted_seq") != std::string::npos;
+  }
+  expect(
+      decoded_structured_conflict,
+      "HTTP client did not preserve and classify the structured signaling conflict");
   const auto fallback_messages = http.get_json(
       base + "/signaling/" + control.session_id +
       "/messages?recipient=vehicle-001&device_token=device-secret&connection_generation=" +
@@ -1299,6 +1649,12 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"config_loads_current_vehicle_yaml", test_config_loads_current_vehicle_yaml},
+      {"vehicle_config_validates_full_scale_motor_torque", test_vehicle_config_validates_full_scale_motor_torque},
+      {"vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries", test_vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries},
+      {"control_enabled_vehicle_requires_an_enabled_critical_camera", test_control_enabled_vehicle_requires_an_enabled_critical_camera},
+      {"camera_failure_decision_is_bounded_and_fail_closed", test_camera_failure_decision_is_bounded_and_fail_closed},
+      {"media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes", test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes},
+      {"media_signaling_error_classification_supports_structured_and_legacy_conflicts", test_media_signaling_error_classification_supports_structured_and_legacy_conflicts},
       {"bench_config_drives_unified_vehicle_runtime", test_bench_config_drives_unified_vehicle_runtime},
       {"field_config_pins_tls_route_without_system_dns", test_field_config_pins_tls_route_without_system_dns},
       {"control_command_json_round_trip_and_validation", test_control_command_json_round_trip_and_validation},

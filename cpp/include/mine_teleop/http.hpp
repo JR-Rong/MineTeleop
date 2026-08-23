@@ -23,13 +23,24 @@ using HttpHeaders = std::vector<std::pair<std::string, std::string>>;
 
 class HttpStatusError : public std::runtime_error {
  public:
-  HttpStatusError(long status, std::string message)
-      : std::runtime_error(std::move(message)), status_(status) {}
+  HttpStatusError(
+      long status,
+      std::string message,
+      std::string issue_code = {},
+      std::string response_body = {})
+      : std::runtime_error(std::move(message)),
+        status_(status),
+        issue_code_(std::move(issue_code)),
+        response_body_(std::move(response_body)) {}
 
   [[nodiscard]] long status() const noexcept { return status_; }
+  [[nodiscard]] const std::string& issue_code() const noexcept { return issue_code_; }
+  [[nodiscard]] const std::string& response_body() const noexcept { return response_body_; }
 
  private:
   long status_;
+  std::string issue_code_;
+  std::string response_body_;
 };
 
 class HttpTransportError : public std::runtime_error {

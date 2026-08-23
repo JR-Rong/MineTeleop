@@ -82,6 +82,11 @@ cloud:
   ca_bundle: mine-teleop-field-root.crt
 ```
 
+`runtime.media_frame_timeout_ms` 是单路采集等待下一帧的超时，默认 `3000 ms`，
+必须为正数。对关键相机而言，这也是“持续无帧”被确认成采集故障前的默认安全确认
+窗口；它不是浏览器显示的端到端时延预算，后者由
+`hardware.encoding.max_end_to_end_latency_ms` 单独约束。
+
 相对的 `device_token_file` 按 YAML 所在目录解析。现场只需创建权限为 `0600` 的
 `config/device-token`，随后执行 `bin/mine-teleop-run`。`cloud.resolve` 的每一项使用
 libcurl 的 `host:port:address` 格式，只影响当前进程；连接仍以
@@ -180,6 +185,9 @@ media:
 cameras:
   - id: front
     enabled: true
+    critical_for_control: true
+    reopen_attempts: 3
+    reopen_backoff_ms: 500
     device: /dev/video0
     capture_width: 1920
     capture_height: 1080
@@ -188,6 +196,9 @@ cameras:
     record_profile: record_source_h265
   - id: rear
     enabled: true
+    critical_for_control: true
+    reopen_attempts: 3
+    reopen_backoff_ms: 500
     device: /dev/video1
     capture_width: 1920
     capture_height: 1080
@@ -219,6 +230,7 @@ field_safety:
   commissioning_mode: bench
   max_speed_kph: 40
   max_throttle: 0.10
+  full_scale_motor_torque_nm: 41.25
   max_brake: 1.0
   max_steering_angle_deg: 5.0
   require_can_feedback_before_control: true
@@ -260,7 +272,25 @@ pipeline。控制端按车端 offer 中实际声明的轨道逐路渲染，云�
 信令，不决定路数。当前没有“控制端临时勾选部分轨道”的运行时协商；增减路数需要
 修改车端配置并重启车端媒体会话。
 
-`cameras[].enabled` 必须写成 YAML/TOML boolean `true`/`false`，不能用带引号字符串。
+`cameras[].enabled` 和 `cameras[].critical_for_control` 必须写成 YAML/TOML boolean
+`true`/`false`，不能用带引号字符串。`critical_for_control` 默认 `true`，所以已有
+配置在升级后继续采用保守的安全语义；只有确实允许缺失且不影响驾驶视野的辅助相机
+才应显式设置为 `false`。当 `runtime.control_enabled=true` 时，至少要有一路
+`enabled: true` 且 `critical_for_control: true` 的相机，否则配置加载失败。
+
+`reopen_attempts` 表示同一次媒体运行尝试内、单路采集源允许重开的次数，默认 `3`，
+范围 `0..10`；设为 `0` 时首个采集故障直接禁用该 lane。计数不会因中途成功取帧
+而无限重置，因此不会形成无界重开循环。`reopen_backoff_ms` 是每次重开前的退避，
+默认 `500 ms`，范围 `0..60000 ms`。关键相机的首个已确认故障会立即锁止控制并
+触发本地安全停车，同时只重开故障 lane；即使该 lane 后续恢复画面，控制也不会
+自动恢复，必须结束当前 session，并在新 session 中重新完成 VCU 握手。非关键相机
+在重开额度耗尽后只禁用自身 lane，其他视频和当前控制不受影响。
+
+实时路径的每路 GStreamer `appsrc` 固定为最多缓存 2 帧，满时丢弃旧帧；其下游
+实时 queue 同样为 2 帧有界丢旧。该策略优先保证画面新鲜度，不能用扩大队列来掩盖
+编码吞吐不足；应结合 `appsrc_queued_buffers`、编码 FPS 和 capture-to-encode 时延
+定位性能瓶颈。启用录像时，编码 tee 的录像 queue 也显式限制为约 2 秒并丢弃旧帧，
+避免慢磁盘或 `splitmuxsink` 反压实时 WebRTC 分支。
 
 `hardware.can.interface` 是车端 adapter、MinePilot CAN smoke 和目标主机验收计划共同使用的
 SocketCAN 接口名；真实 adapter 配置中
@@ -279,8 +309,21 @@ GStreamer factory，`max_end_to_end_latency_ms` 与 `min_realtime_fps` 用于车
 验收汇总。DRI 节点变化只修改本节配置，不依赖宿主机 FFmpeg。
 
 `hardware.network.interface` 会进入弱网矩阵和目标主机验收脚本。`field_safety` 用来记录现场
-安全链路的最低门禁：调试阶段、速度上限、是否必须先收到 CAN feedback、是否必须本地确认
-急停复位、是否强制时间同步。它不替代现场安全员和物理急停，但会进入有效配置日志和验收记录。
+安全链路的最低门禁：调试阶段、速度上限、牵引转矩满量程、是否必须先收到 CAN feedback、
+是否必须本地确认急停复位、是否强制时间同步。它不替代现场安全员和物理急停，但会进入
+有效配置日志和验收记录。
+
+`field_safety.full_scale_motor_torque_nm` 的定义是：直行、制动为 0、稳态且车端收到的
+有效 `throttle=1.0` 时，每个电机通道的目标转矩。默认 `41.25 Nm` 保持既有
+18 吨、8 轮、轮半径 0.55 m、30:1 软件模型在 `1 m/s²` 下的映射；允许范围
+是 `0..165 Nm`，其中 `0` 明确禁用驱动力。车端仍先应用 `max_throttle`，因此
+实际配置上限是 `full_scale_motor_torque_nm × max_throttle`；例如二者分别为
+`82.5` 和 `0.10` 时，稳态目标约为 `8.25 Nm/通道`。ChassisControl 的
+`300 Nm/s` 转矩斜率仍然生效，瞬时请求不会跳到该稳态上限。只能在隔离台架上
+逐级调大，并以 CAN 请求和电机反馈共同验收；该值不是实测轮端转矩。
+启用该配置时必须同步升级车端 runtime 和 ChassisControl bridge：当前 runtime
+要求 bridge 导出版本化 `mine_teleop_chassis_open_v1`。旧 bridge 不会静默忽略转矩
+配置，而会在任何 CAN 初始化前因缺少该符号而启动失败。
 
 上传限速必须是有限正数；上传触发数量、URL 刷新安全余量和重试退避时间
 必须是正数；`retry_initial_seconds` 不能大于 `retry_max_seconds`。
@@ -299,7 +342,8 @@ access key 和 secret。Secret 可以直接配置，也可以用
 
 `vehicle_adapter.type=mock` 可直接无外部依赖运行。配置为 `can` 或
 `dynamic_library` 时，必须显式填写 `field_safety.max_speed_kph`、
-`field_safety.max_throttle`、`field_safety.max_brake` 和
+`field_safety.max_throttle`、`field_safety.full_scale_motor_torque_nm`、
+`field_safety.max_brake` 和
 `field_safety.max_steering_angle_deg`，并先声明真实车辆接口契约，例如：
 
 ```yaml
@@ -387,7 +431,8 @@ vehicle_adapter:
 
 仓库提供 `deployments/chassis-control-bridge/` 模板和
 `mine_teleop_chassis_bridge.h` 稳定 ABI 头，导出原生 adapter 所需的
-`mine_teleop_chassis_open`、`mine_teleop_chassis_apply_state`、
+`mine_teleop_chassis_open`、`mine_teleop_chassis_open_v1`、
+`mine_teleop_chassis_apply_state`、
 `mine_teleop_chassis_emergency_stop`、`mine_teleop_chassis_update_feedback`、
 `mine_teleop_chassis_poll_feedback`、`mine_teleop_chassis_read_telemetry` 和
 `mine_teleop_chassis_close`。该 bridge 会链接

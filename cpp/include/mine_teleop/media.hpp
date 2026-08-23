@@ -5,14 +5,54 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "mine_teleop/core.hpp"
 #include "mine_teleop/http.hpp"
 
 namespace mine_teleop {
+
+enum class CameraFailureAction { ReopenLane, DisableLane };
+
+struct CameraFailureDecision {
+  bool inhibit_control{false};
+  CameraFailureAction lane_action{CameraFailureAction::DisableLane};
+};
+
+[[nodiscard]] CameraFailureDecision camera_failure_decision(
+    const CameraConfig& camera,
+    int failures_in_media_attempt,
+    bool retryable);
+
+enum class MediaSignalingErrorKind {
+  SessionEnded,
+  ConnectionRefresh,
+  ConnectionStale,
+  SequenceConflict,
+  ServiceUnavailable,
+  Fatal,
+};
+
+[[nodiscard]] MediaSignalingErrorKind classify_media_signaling_error(
+    const HttpStatusError& error);
+
+class MediaSignalingSequence {
+ public:
+  [[nodiscard]] std::uint64_t next(
+      std::uint64_t connection_generation,
+      std::string_view session_id);
+  [[nodiscard]] std::uint64_t current() const;
+
+ private:
+  mutable std::mutex mutex_;
+  std::uint64_t connection_generation_{0};
+  std::string session_id_;
+  std::uint64_t value_{0};
+};
 
 struct EncodedFrame {
   std::string camera_id;
@@ -80,7 +120,8 @@ class VehicleMediaRuntime {
       std::filesystem::path recording_root = {},
       std::optional<std::string> forced_codec = std::nullopt,
       int simulate_primary_failure_after_frames = 0,
-      std::string connection_id = {});
+      std::string connection_id = {},
+      std::shared_ptr<MediaSignalingSequence> signaling_sequence = {});
   ~VehicleMediaRuntime();
 
   VehicleMediaRuntime(const VehicleMediaRuntime&) = delete;

@@ -1,6 +1,23 @@
 #ifndef MINE_TELEOP_CHASSIS_BRIDGE_H
 #define MINE_TELEOP_CHASSIS_BRIDGE_H
 
+#include <stdint.h>
+
+#define MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM 41.25
+#define MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM 165.0
+
+/* Convert the normalized longitudinal input used by the runtime into the
+ * ChassisControl acceleration input. Negative values are the independent
+ * braking path and are deliberately not scaled by the traction setting. */
+static inline double mine_teleop_chassis_scaled_target_acceleration(
+    double target_ax,
+    double full_scale_motor_torque_nm) {
+    return target_ax > 0.0
+        ? target_ax * full_scale_motor_torque_nm /
+            MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM
+        : target_ax;
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -98,8 +115,19 @@ struct MineTeleopChassisCanFeedbackV1 {
     double brake_pressure_bar[8];
 };
 
+struct MineTeleopChassisOpenConfigV1 {
+    uint32_t struct_size;
+    const char* can_interface;
+    /* Per motor channel at steady straight-line throttle=1.0, brake=0. */
+    double full_scale_motor_torque_nm;
+};
+
 /* open: -2=ChassisControl/init, -3=SocketCAN, -4=protocol log path. */
 int mine_teleop_chassis_open(const char* can_interface);
+/* Versioned open used by current runtimes. Invalid size/torque is rejected
+ * before ChassisControl or SocketCAN is touched. */
+int mine_teleop_chassis_open_v1(
+    const struct MineTeleopChassisOpenConfigV1* config);
 int mine_teleop_chassis_apply_state(
     int target_gear,
     double target_vx,

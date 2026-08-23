@@ -4,6 +4,7 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 media_source="$repository_root/cpp/src/media.cpp"
 media_runtime="$repository_root/cpp/src/webrtc_media.cpp"
+vehicle_app="$repository_root/cpp/apps/mine_teleop.cpp"
 vcu_bridge="$repository_root/deployments/chassis-control-bridge/chassis_control_bridge.cpp"
 catalog="$repository_root/docs/24-vehicle-runtime-diagnostics.md"
 
@@ -61,6 +62,63 @@ for text in \
   require_text "$media_runtime" "$text"
 done
 
+# Media must negotiate independently of VCU adapter availability.  The
+# adapter is started only after the WebRTC DataChannel opens; adapter startup
+# and runtime failures disable control but must not become media-pipeline
+# errors that tear down the camera tracks.
+control_open_block="$(sed -n '/static void on_control_channel_open/,/static void on_control_channel_close/p' "$media_runtime")"
+control_message_block="$(sed -n '/  void handle_control_message(/,/  void send_vcu_handshake_status(/p' "$media_runtime")"
+control_start_block="$(sed -n '/  \[\[nodiscard\]\] bool start_control_service()/,/  void configure_control_data_channel()/p' "$media_runtime")"
+control_channel_block="$(sed -n '/  void configure_control_data_channel()/,/  void tick_control_service()/p' "$media_runtime")"
+control_tick_block="$(sed -n '/  void tick_control_service()/,/  \[\[nodiscard\]\] std::string current_pipeline_error/p' "$media_runtime")"
+
+for contract in \
+  'control DataChannel open starts the VCU adapter|self->start_control_service()' \
+  'session teardown cannot resurrect the VCU adapter|stop_requested || !control_link_open || control_channel == nullptr' \
+  'adapter startup failure keeps video alive|control_not_started_video_continues' \
+  'adapter startup failure closes only the unsafe control channel|gst_webrtc_data_channel_close(channel)' \
+  'adapter runtime failure reports a control-only fault|adapter_runtime_failed' \
+  'adapter runtime failure keeps video alive|local_full_stop_control_disabled_video_continues' \
+  'adapter runtime failure closes the unsafe control channel|gst_webrtc_data_channel_close(channel_to_close)'; do
+  description="${contract%%|*}"
+  text="${contract#*|}"
+  if ! grep -F --quiet "$text" <<<"$control_open_block$control_start_block$control_tick_block"; then
+    printf 'media/control isolation contract missing: %s\n' "$description" >&2
+    exit 1
+  fi
+done
+require_text "$media_runtime" '!control_link_opened_this_attempt'
+if [[ "$(grep -F -c 'stop_requested || control_inhibited || control_channel != channel' <<<"$control_message_block")" -lt 2 ]]; then
+  printf 'media/control isolation contract missing: stale or tearing-down DataChannel commands are rejected\n' >&2
+  exit 1
+fi
+
+for text in \
+  'kCameraAppSrcMaxBuffers = 2' \
+  '<< " max-bytes=524288 max-time=0 leaky-type=downstream "' \
+  'camera_failure_decision' \
+  'inhibit_control_for_critical_camera' \
+  'stop_control_for_pipeline_fault(issue_code)' \
+  'enforce_critical_camera_freshness' \
+  'last_encoded_steady_ms.load() > 0' \
+  'camera_lane_reopen_scheduled' \
+  'camera_reopen_exhausted'; do
+  require_text "$media_runtime" "$text"
+done
+
+if grep -F --quiet 'control_service->start' <<<"$control_channel_block"; then
+  printf 'media/control isolation contract failed: VCU adapter still starts before media PLAYING\n' >&2
+  exit 1
+fi
+if grep -F --quiet 'set_pipeline_error' <<<"$control_start_block"; then
+  printf 'media/control isolation contract failed: adapter startup can still fail the media pipeline\n' >&2
+  exit 1
+fi
+if grep -F --quiet 'set_pipeline_error' <<<"$control_tick_block"; then
+  printf 'media/control isolation contract failed: adapter runtime failure can still stop video\n' >&2
+  exit 1
+fi
+
 for issue_code in \
   vcu_log_directory_create_failed \
   vcu_log_file_open_failed \
@@ -79,6 +137,14 @@ for issue_code in \
   vcu_disarm_timeout; do
   require_text "$vcu_bridge" "$issue_code"
   require_text "$catalog" "$issue_code"
+done
+
+for text in \
+  'auto signaling_sequence = std::make_shared<mine_teleop::MediaSignalingSequence>()' \
+  'classify_media_signaling_error(error)' \
+  'vehicle_media_signaling_sequence_conflict' \
+  'server_issue_code'; do
+  require_text "$vehicle_app" "$text"
 done
 
 printf 'runtime_diagnostics_contract=passed camera_mappings=%d\n' "${#camera_contract[@]}"

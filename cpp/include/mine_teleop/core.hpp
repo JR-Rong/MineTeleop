@@ -209,6 +209,9 @@ struct MediaProfile {
 struct CameraConfig {
   std::string id;
   bool enabled{true};
+  bool critical_for_control{true};
+  int reopen_attempts{3};
+  int reopen_backoff_ms{500};
   std::string device;
   int capture_width{1280};
   int capture_height{720};
@@ -261,6 +264,7 @@ struct FieldSafetyConfig {
   std::string commissioning_mode{"bench"};
   double max_speed_kph{40.0};
   double max_throttle{1.0};
+  double full_scale_motor_torque_nm{41.25};
   double max_brake{1.0};
   double max_steering_angle_deg{30.0};
   bool require_can_feedback_before_control{true};
@@ -414,7 +418,8 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
       std::string can_interface,
       int can_bitrate,
       int can_tx_queue_length,
-      double max_speed_mps);
+      double max_speed_mps,
+      double full_scale_motor_torque_nm);
   ~DynamicLibraryVehicleAdapter() override;
 
   void open() override;
@@ -438,6 +443,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   int can_bitrate_;
   int can_tx_queue_length_;
   double max_speed_mps_;
+  double full_scale_motor_torque_nm_;
   void* handle_{nullptr};
   bool opened_{false};
   bool feedback_ready_{false};
@@ -445,7 +451,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   std::uint64_t safe_stop_count_{0};
   std::string last_error_;
 
-  using OpenFn = int (*)(const char*);
+  using OpenV1Fn = int (*)(const void*);
   using ApplyFn = int (*)(int, double, double, const double*, int);
   using StopFn = int (*)();
   using HandshakeFn = int (*)();
@@ -454,7 +460,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   using ReadFn = int (*)(void*);
   using ReadCanFeedbackV1Fn = int (*)(void*);
   using CloseFn = int (*)();
-  OpenFn open_fn_{nullptr};
+  OpenV1Fn open_v1_fn_{nullptr};
   ApplyFn apply_fn_{nullptr};
   StopFn stop_fn_{nullptr};
   HandshakeFn request_handshake_fn_{nullptr};
@@ -508,6 +514,7 @@ class VehicleControlService {
   bool require_feedback_before_control_{true};
   double max_speed_kph_{40.0};
   double max_throttle_{1.0};
+  double full_scale_motor_torque_nm_{41.25};
   double max_brake_{1.0};
   double max_steering_angle_deg_{30.0};
   int telemetry_interval_ms_;

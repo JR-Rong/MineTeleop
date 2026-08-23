@@ -516,6 +516,16 @@ void test_control_page_contract() {
       response.body.find("srcObject=new MediaStream([track])") != std::string::npos &&
           response.body.find("attach(id,e.track)") != std::string::npos,
       "browser video elements are not isolated to their individual WebRTC tracks");
+  const auto ontrack_handler = response.body.find("nextPeer.ontrack=e=>");
+  const auto remote_description = response.body.find("await nextPeer.setRemoteDescription", ontrack_handler);
+  expect(
+      ontrack_handler != std::string::npos &&
+          remote_description != std::string::npos &&
+          response.body.substr(ontrack_handler, remote_description - ontrack_handler).find("vcuHandshake") ==
+              std::string::npos &&
+          response.body.substr(ontrack_handler, remote_description - ontrack_handler).find("controlChannel") ==
+              std::string::npos,
+      "browser camera attachment is gated on the VCU handshake or control DataChannel");
   expect(
       response.body.find("e.streams[0]") == std::string::npos,
       "browser can bind the same multi-track MediaStream to multiple camera elements");
@@ -527,6 +537,31 @@ void test_control_page_contract() {
   expect(
       response.body.find("peer.connectionState!=='connected'") != std::string::npos,
       "control commands can be sent while the current WebRTC peer is disconnected");
+  expect(
+      response.body.find("const estopRequested=estopLatched||Boolean(extra.estop)") !=
+              std::string::npos &&
+          response.body.find("estopRequested&&vcuHandshake.adapter_ready===false") !=
+              std::string::npos &&
+          response.body.find("vcu_adapter_unavailable") != std::string::npos &&
+          response.body.find("请使用车辆物理急停") != std::string::npos &&
+          response.body.find("return vcuHandshake.adapter_ready===true&&handshakeReady") !=
+              std::string::npos,
+      "the controller can claim that remote ESTOP was sent while the VCU adapter is unavailable");
+  expect(
+      response.body.find("!vcuDrivingReady()&&!estopRequested") != std::string::npos &&
+          response.body.find("async function heartbeat()") != std::string::npos &&
+          response.body.find("await send({},false)") != std::string::npos,
+      "a latched ESTOP is not retransmitted by heartbeat while the VCU handshake is incomplete");
+  expect(
+      response.body.find("if(explicit===true||explicit===false)return explicit") != std::string::npos &&
+          response.body.find("['unavailable','closed','fault'].includes(state))return null") !=
+              std::string::npos,
+      "an older vehicle without adapter_ready cannot use the compatibility-safe unknown state");
+  expect(
+      response.body.find("急停请求已锁定；等待车端遥测确认") != std::string::npos &&
+          response.body.find("vehicleTelemetry?.estop===true") != std::string::npos &&
+          response.body.find("车辆急停已由车端遥测确认") != std::string::npos,
+      "the page can report a vehicle ESTOP before telemetry confirms it");
   expect(
       response.body.find("webrtcLabel.textContent==='控制链路拥塞'") != std::string::npos,
       "the operator label cannot recover after DataChannel backpressure clears");

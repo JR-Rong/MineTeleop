@@ -150,10 +150,10 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
   find_package(JPEG REQUIRED)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET
-    gstreamer-1.0
-    gstreamer-app-1.0
-    gstreamer-sdp-1.0
-    gstreamer-webrtc-1.0
+    gstreamer-1.0>=1.20
+    gstreamer-app-1.0>=1.20
+    gstreamer-sdp-1.0>=1.20
+    gstreamer-webrtc-1.0>=1.20
   )
 
   add_library(mine_teleop_vehicle_runtime

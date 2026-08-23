@@ -76,6 +76,27 @@ stderr；协议细节与高频 CAN 证据写入
 `vehicle_camera_first_frame`，随后出现 `vehicle_camera_failed`”可以直接判定为采集
 侧问题；不会再等到最终 `vehicle_media_webrtc_summary` 才能看到。
 
+### 单路有界恢复与控制安全
+
+`runtime.media_frame_timeout_ms` 默认 `3000 ms`，表示单路等待下一帧的最长时间；
+它是持续无帧被确认成采集故障前的默认 3 秒安全确认窗口，不是浏览器端到端时延
+阈值。实时 `appsrc` 最多缓存 2 帧并在满时丢弃旧帧，下游实时 queue 也采用 2 帧
+有界丢旧，因此编码拥塞不会累积成数秒历史画面。
+
+| `event` / `issue_code` | 条件 | 控制与媒体结果 |
+| --- | --- | --- |
+| `vehicle_camera_failed` / 具体 camera issue | 单路采集首次或再次失败 | `critical_for_control=true` 时首个已确认故障立即本地安全停车、锁止控制并关闭控制 DataChannel；非关键 lane 不改变控制权限 |
+| `vehicle_camera_reopen_scheduled` / `camera_lane_reopen_scheduled` | 故障可重试且累计失败次数未超过 `reopen_attempts` | 只销毁并重开故障采集源，其他 lane 不重建；关键相机的控制锁止保持不变 |
+| `vehicle_camera_recovered` / `camera_lane_recovered` | 重开后的第一帧到达 | 视频恢复；若为关键相机，控制仍保持锁止，不能把该事件当作恢复驾驶权限 |
+| `vehicle_camera_lane_disabled` / `camera_reopen_exhausted` | 不可重试或重开额度耗尽 | 关键 lane 禁用且继续保持停车；非关键 lane 只结束自身视频，其他 lane 与当前控制继续 |
+| `vehicle_control_inhibited_by_camera` / `critical_camera_control_inhibited` | 关键相机首次确认失败 | 保持车辆停止；必须结束当前 session，在相机修复后创建新 session 并重新完成 VCU 握手 |
+
+默认 `reopen_attempts=3` 是同一次媒体运行尝试内的累计上限：前三次可重试采集故障
+各触发一次单路重开，第四次禁用 lane；成功取帧不会把额度恢复成无限重试。
+允许范围是 `0..10`，`0` 表示首故障直接禁用；`reopen_backoff_ms` 默认
+`500 ms`、范围 `0..60000 ms`。关键相机的安全锁存不会因
+`vehicle_camera_recovered` 自动清除，避免“画面短暂恢复即自行重新获得驱动权限”。
+
 ## 编码、WebRTC、DataChannel 与信令故障全集
 
 | `event` / `issue_code` | 触发条件 | 关键附加字段 | 频率 |
@@ -93,7 +114,8 @@ stderr；协议细节与高频 CAN 证据写入
 | `vehicle_media_pipeline_failed` / `gstreamer_webrtcbin_missing` | pipeline 中找不到 webrtcbin | backend/codec | 每个 candidate 一次 |
 | `vehicle_media_pipeline_failed` / `webrtc_ice_server_config_failed` | TURN 凭据/URI/add-turn-server 失败 | `error` | 每个 candidate 一次 |
 | `vehicle_media_pipeline_failed` / `gstreamer_ready_state_failed` | pipeline 不能进入 READY | backend/codec | 每个 candidate 一次 |
-| `vehicle_vcu_adapter_start_failed` / `vcu_adapter_start_failed` | 动态库、符号、CAN、日志路径或 adapter open 失败 | adapter/interface/bitrate/tx queue/library | 每个 candidate 一次 |
+| `vehicle_vcu_adapter_start_failed` / `vcu_adapter_start_failed` | 控制 DataChannel 打开后，动态库、符号、CAN、日志路径或 adapter open 失败；控制通道关闭、视频继续 | adapter/interface/bitrate/tx queue/library、`control_not_started_video_continues` | 每次 DataChannel 启动尝试一次 |
+| `vehicle_vcu_runtime_failed` / `vcu_runtime_operation_failed` | adapter tick、反馈读取或遥测构建失败；尝试本地安全停车、关闭控制通道，视频继续 | error、`local_full_stop_control_disabled_video_continues` | 每次控制服务故障一次 |
 | `vehicle_media_pipeline_failed` / `control_data_channel_create_failed` | webrtcbin 未创建 SCTP DataChannel | `error` | 每个 candidate 一次 |
 | `vehicle_media_pipeline_failed` / `gstreamer_camera_lane_incomplete` | 某路 appsrc/encoder 元素缺失 | `camera_id`, `device` | 即时 |
 | `vehicle_media_pipeline_failed` / `gstreamer_playing_state_failed` | pipeline 不能进入 PLAYING | backend/codec | 每个 candidate 一次 |
@@ -110,6 +132,11 @@ stderr；协议细节与高频 CAN 证据写入
 | `vehicle_media_pipeline_failed` / `media_runtime_time_sync_failed` | session 中刷新时间同步失败 | `error` | 每个 candidate 首错一次 |
 | `vehicle_media_pipeline_failed` / `media_runtime_time_sync_uncertainty_exceeded` | 刷新不确定度越界 | limit | 每个 candidate 首错一次 |
 | `vehicle_media_signaling_failed` / `session_signaling_exchange_failed` | offer/answer/ICE 消息收发失败 | `error` | 每次 session 失败 |
+| `vehicle_media_session_ended` / `active_media_session_ended` | HTTP 404 或 409 `session_not_active` | `http_status`, `server_issue_code`, retry delay | 等待新的有效会话 |
+| `vehicle_media_connection_refresh` / `vehicle_registration_refresh_required` | HTTP 409 `vehicle_offline` | `server_issue_code` | 刷新车辆在线注册 |
+| `vehicle_media_connection_stale` / `vehicle_connection_generation_stale` | HTTP 409 `vehicle_connection_generation_stale` | `server_issue_code`, `safety_action=local_full_stop` | 非自动重试，进程 fail-closed |
+| `vehicle_media_signaling_sequence_conflict` / `signaling_sequence_conflict` | HTTP 409 `signaling_sequence_older` 或 `signaling_sequence_reused` | `server_issue_code`, `safety_action=local_full_stop` | 非自动重试，进程 fail-closed |
+| `vehicle_media_signaling_conflict` / `unclassified_signaling_conflict` | 其他无法安全分类的 HTTP 409 | `server_issue_code`, `safety_action=local_full_stop` | 非自动重试，进程 fail-closed |
 | `vehicle_recording_sidecar_failed` / `recording_sidecar_write_failed` | 录像 sidecar 创建/rename 失败 | `error` | 每次 finalize 失败 |
 | `vehicle_camera_performance_failed` / `camera_encoded_fps_below_minimum` | 任一路编码 FPS 低于阈值 | camera/FPS/frame counts | 每次 summary |
 | `vehicle_camera_performance_warning` / `camera_capture_to_encode_latency_high` | capture→encode 峰值超过预算 | camera/latency/budget | 每次 summary |
@@ -120,13 +147,32 @@ stderr；协议细节与高频 CAN 证据写入
 `vehicle_control_data_channel_open`。页面出现“等待视频轨道”或“DataChannel 尚未
 就绪”时，应从最后一个已出现的里程碑之后开始排查。
 
+### HTTP 409 与 signaling sequence
+
+服务端 409 响应携带结构化 `issue_code`，车端必须按上表区分“会话已结束”、
+“车辆需刷新注册”、“连接 generation 已过期”和“消息 sequence 冲突”。仅
+`session_not_active` 能作为 409 会话结束证据；不能再把所有 409 统一记成
+`vehicle_media_session_ended`。
+
+车端以 `(connection_generation, session_id)` 为 sequence 作用域。媒体 service loop
+重建 `VehicleMediaRuntime` 时继续复用同一个 sequence cursor，保证同一作用域内严格
+单调递增；只有 connection generation 或 session 改变时才从新作用域重新计数。发送路径
+还会串行化 cursor 分配和 HTTP 提交，避免并发 ICE 消息在服务端表现为倒序。
+
+`signaling_sequence_older` 和 `signaling_sequence_reused` 表示客户端/服务端状态已经
+不一致，不代表 session 已结束。车端记录
+`vehicle_media_signaling_sequence_conflict` 后本地安全停车并退出当前媒体子进程，
+不会自动重建 runtime 再从较小 sequence 重试，因此不会进入 409 死循环。现场若仍
+出现该事件，应先排除旧版本或重复车端进程，再结束旧 session、建立新 session；
+重启云端不能修复仍在发送旧 sequence 的客户端。
+
 ## VCU/CAN 故障全集
 
 ### 启动、动态库与日志
 
 | `event` / `issue_code` | 触发条件 | 去哪里看 |
 | --- | --- | --- |
-| `vehicle_vcu_adapter_start_failed` / `vcu_adapter_start_failed` | dlopen、ABI symbol、接口未 UP、波特率不匹配、发送队列设置或 bridge open 任一步失败 | runtime stderr |
+| `vehicle_vcu_adapter_start_failed` / `vcu_adapter_start_failed` | DataChannel 打开后 dlopen、ABI symbol、接口未 UP、波特率不匹配、发送队列设置或 bridge open 任一步失败；控制通道关闭但视频继续 | runtime stderr；新控制端在关闭前可能收到 `fault` |
 | `vehicle_vcu_start_failed` / `vcu_can_interface_invalid` | CAN interface 为空 | runtime stderr |
 | `vehicle_vcu_start_failed` / `vcu_bridge_already_open` | 重复 open | runtime stderr |
 | `vehicle_vcu_start_failed` / `chassis_control_initialize_failed` | `Initialize` 返回 false | runtime stderr |
@@ -174,7 +220,7 @@ stderr；协议细节与高频 CAN 证据写入
 | `bridge_api_operation_failed` / `vcu_apply_arguments_invalid` | ABI gear/pointer/count 非法 | 本地全停 |
 | `vehicle_control_command_rejected` / `vcu_feedback_blocks_control` | feedback missing/poll failed 阻止 DataChannel 命令 | 本地全停；结合 VCU JSONL |
 | `vehicle_vcu_handshake_command_failed` / `vcu_handshake_command_failed` | handshake ABI 调用抛错 | 本地全停 |
-| `vehicle_vcu_runtime_failed` / `vcu_runtime_operation_failed` | tick/telemetry/safe-stop 路径抛错 | media attempt 停止并重试 |
+| `vehicle_vcu_runtime_failed` / `vcu_runtime_operation_failed` | tick/telemetry/safe-stop 路径抛错 | 尝试本地全停并关闭控制 DataChannel；视频继续 |
 | `emergency_stop` / `vcu_emergency_stop_applied` | 软件急停已下发 | 本地全停 |
 | `emergency_stop_rejected` / `vcu_emergency_stop_runtime_unavailable` | bridge 已停止，软件急停无法下发 | 必须使用独立硬件安全路径 |
 | `parallel_handshake_disconnect_requested` / `vcu_disarm_requested` | 主动断开 | 零扭矩、N、EPB、清握手 |
