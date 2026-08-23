@@ -38,18 +38,38 @@ mock`. On an isolated CAN bench, edit the deployed
 `/opt/mine-teleop/config/vehicle-agent.yaml`: choose `type: can`, set the
 bridge path above and the same interface declared by `hardware.can.interface`
 (`can1` in the current field template), give `field_safety.max_speed_kph` a
-positive commissioning value, and set the authoritative
+commissioning value of at least `1 km/h` (the VCU field resolution), and set the authoritative
 `max_throttle`/`full_scale_motor_torque_nm`/`max_brake`/
 `max_steering_angle_deg` limits. `full_scale_motor_torque_nm` is the steady
 per-channel target at straight-line effective throttle 1.0 and brake 0; it is
 multiplied by the vehicle `max_throttle`, and the ChassisControl 300 Nm/s slew
-remains active. `max_brake` limits
-ordinary driving commands only; safety-stop braking bypasses it. The browser
-limit dialog can only reduce those vehicle-side limits.
+remains active. After ChassisControl steering compensation and rate limiting,
+the bridge applies a final symmetric per-motor clamp of
+`full_scale_motor_torque_nm * normalized_throttle`, including reverse torque.
+While D or R traction is requested without braking, `max_speed_kph` is the
+speed request and throttle controls the torque request.
+Releasing traction, applying brake, or configuring zero traction
+torque withdraws the speed request as `0 km/h / Q=0`; D/R gear and steering
+authority remain unchanged. A valid positive speed request is never emitted
+without positive traction capability.
+`max_brake` limits ordinary driving commands only; safety-stop braking bypasses
+it. The browser limit dialog can only reduce those vehicle-side limits.
+Any positive brake request dominates throttle. If ChassisControl rejects an
+update or returns a non-finite actuator value, the bridge latches a local
+emergency stop immediately instead of retaining the previous traction command
+until the upstream watchdog expires.
 
-Upgrade the runtime and this bridge together. The current runtime requires the
-versioned `mine_teleop_chassis_open_v1` symbol. An older bridge fails before
-any CAN initialization instead of silently ignoring the torque configuration.
+The runtime passes `control.control_timeout_ms` through the versioned bridge
+open ABI. While the VCU controller is Ready, the bridge withdraws the speed
+request, commands zero torque and calibrated safety braking if no successful
+upstream apply arrives before that deadline. The event is logged once as
+`vcu_control_apply_timeout`; the next valid apply clears this watchdog latch.
+
+Upgrade the runtime and this bridge together. The current runtime requires
+`mine_teleop_chassis_open_v2`; a bridge that only exports V1 fails before any
+CAN initialization instead of silently ignoring the watchdog configuration.
+The bridge continues to export `mine_teleop_chassis_open_v1` for older runtimes,
+using the default 800 ms control timeout on that compatibility path.
 
 Validate before service startup:
 

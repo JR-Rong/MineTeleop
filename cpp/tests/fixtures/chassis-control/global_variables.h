@@ -42,6 +42,7 @@ struct VehicleState {
 };
 
 struct ControlInfo {
+  double wheel_speed{0.0};
   double wheel_torque{0.0};
   double ehb_brk_pres_req{0.0};
   double eps_ang_req{0.0};

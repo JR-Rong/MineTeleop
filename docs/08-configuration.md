@@ -312,9 +312,9 @@ GStreamer factory，`max_end_to_end_latency_ms` 与 `min_realtime_fps` 用于车
 验收汇总。DRI 节点变化只修改本节配置，不依赖宿主机 FFmpeg。
 
 `hardware.network.interface` 会进入弱网矩阵和目标主机验收脚本。`field_safety` 用来记录现场
-安全链路的最低门禁：调试阶段、速度上限、牵引转矩满量程、是否必须先收到 CAN feedback、
-是否必须本地确认急停复位、是否强制时间同步。它不替代现场安全员和物理急停，但会进入
-有效配置日志和验收记录。
+安全链路的最低门禁：调试阶段、目标车速、牵引转矩满量程、是否必须先收到 CAN feedback、
+是否必须本地确认急停复位、是否强制时间同步。这些软件门禁不替代现场安全员和物理急停，
+但会进入有效配置日志和验收记录。
 
 `field_safety.full_scale_motor_torque_nm` 的定义是：直行、制动为 0、稳态且车端收到的
 有效 `throttle=1.0` 时，每个电机通道的目标转矩。默认 `41.25 Nm` 保持既有
@@ -323,10 +323,25 @@ GStreamer factory，`max_end_to_end_latency_ms` 与 `min_realtime_fps` 用于车
 实际配置上限是 `full_scale_motor_torque_nm × max_throttle`；例如二者分别为
 `82.5` 和 `0.10` 时，稳态目标约为 `8.25 Nm/通道`。ChassisControl 的
 `300 Nm/s` 转矩斜率仍然生效，瞬时请求不会跳到该稳态上限。只能在隔离台架上
-逐级调大，并以 CAN 请求和电机反馈共同验收；该值不是实测轮端转矩。
-启用该配置时必须同步升级车端 runtime 和 ChassisControl bridge：当前 runtime
-要求 bridge 导出版本化 `mine_teleop_chassis_open_v1`。旧 bridge 不会静默忽略转矩
-配置，而会在任何 CAN 初始化前因缺少该符号而启动失败。
+逐级调大，并以 CAN 请求和电机反馈共同验收；该值不是实测轮端转矩。bridge 在
+ChassisControl 的转向补偿和斜率限制之后按每路电机对称硬截断，保证 D/R 扭矩都不超过该乘积；
+它不缩放普通制动或安全停车。
+
+`max_speed_kph` 是与油门/扭矩比例解耦的目标车速：D/R、牵引请求大于 0 且
+`full_scale_motor_torque_nm > 0` 时，adapter 把该配置值传给 bridge，bridge 再用 1 km/h
+分辨率向下量化并编码 `ADU_Tx_VehSpdReq`，不会因四舍五入超过配置目标。松开牵引、制动或把
+牵引能力配置为 0 时发送 `0/Q=0`，即撤销车速请求而不是请求 VCU 主动保持零速。当前
+ChassisControl 接口的目标速度范围是 `0..20 m/s`，且 VCU 字段分辨率是 `1 km/h`；因此
+非 mock 配置必须在 `1..72 km/h` 范围内。bridge 对低于 1 km/h 的外部调用也会保持 `Q=0`。
+该报文在扭矩模式下的仲裁/保速语义必须由 VCU 协议方或隔离台架确认；仅有 DBC 字段和软件编解码测试不等于闭环已验收。
+
+启用上述配置时必须同步升级车端 runtime 和 ChassisControl bridge：当前 runtime
+要求 bridge 导出 `mine_teleop_chassis_open_v2`。只提供 V1 的旧 bridge 不会静默忽略
+控制超时配置，而会在任何 CAN 初始化前因 ABI 不匹配而启动失败；新 bridge 仍保留
+`mine_teleop_chassis_open_v1` 供旧 runtime 使用，该兼容路径采用默认 `800 ms` 超时。
+进入 Ready 后，若连续
+`control.control_timeout_ms` 没有成功 apply，bridge 会撤销车速请求、将转矩置零并施加
+标定的安全制动；下一条有效 apply 才会清除该 watchdog 锁存。
 
 上传限速必须是有限正数；上传触发数量、URL 刷新安全余量和重试退避时间
 必须是正数；`retry_initial_seconds` 不能大于 `retry_max_seconds`。
@@ -435,6 +450,7 @@ vehicle_adapter:
 仓库提供 `deployments/chassis-control-bridge/` 模板和
 `mine_teleop_chassis_bridge.h` 稳定 ABI 头，导出原生 adapter 所需的
 `mine_teleop_chassis_open`、`mine_teleop_chassis_open_v1`、
+`mine_teleop_chassis_open_v2`、
 `mine_teleop_chassis_apply_state`、
 `mine_teleop_chassis_emergency_stop`、`mine_teleop_chassis_update_feedback`、
 `mine_teleop_chassis_poll_feedback`、`mine_teleop_chassis_read_telemetry` 和
@@ -481,13 +497,16 @@ control:
   estop_hold_ms: 500
   limits:
     initial_max_throttle: 0.05
-    initial_max_brake: 1.0
+    initial_service_brake: 0.30
+    initial_hard_brake: 1.0
     initial_max_steering_angle_deg: 3.0
   keyboard:
     steering_left: A
     steering_right: D
     throttle: W
-    brake: S
+    reverse: S
+    service_brake: Space
+    hard_brake: B
     estop: E
   gamepad:
     enabled: true
@@ -513,16 +532,14 @@ control:
 左摇杆 X、右/左扳机，非标准方向盘/踏板使用这里的轴配置。`*_center`/`*_rest`
 和 `*_range` 可写入现场测量值，也可以在浏览器中做本次运行有效的中心与量程校准。
 如果轴顺序或方向不同，只需要调整配置，不需要改控制核心。
-`control.limits.initial_max_brake` 和 `field_safety.max_brake` 都是归一化的普通
-驾驶制动请求上限，取值 `[0, 1]`；前者限制当前控制页面，后者在车端再次强制
-截断。页面修改人工刹车上限时会同步写入本地控制进程，因此 `/api/control`、
-`/api/control/keyboard` 和 `/api/control/gamepad` 共用同一个当前会话上限；急停
-命令不经过这个普通驾驶上限。页面刷新或重新登录时会从本地控制进程回读当前值，
-车端硬上限自动下调时也会同步收紧控制进程，避免界面显示值、直接 API 和实际发送
-值不一致。控制端以及 mock/开发车端的缺省值 `1.0` 仅用于
-兼容；非 mock 车端必须
-显式填写 `max_brake`，升级旧实车配置时也必须补齐该键（尚未标定时可先显式写
-`1.0`）。现场下调值必须来自真实车辆制动标定，不能把归一化数值直接当作 bar。
+`control.limits.initial_service_brake`、`control.limits.initial_hard_brake` 和
+`field_safety.max_brake` 都是归一化的普通驾驶制动请求，取值 `[0, 1]`，且必须满足
+`service <= hard <= vehicle max_brake`。驾驶端的 `Space` 缓刹和 `B` 急刹仍映射到同一个 v1
+`brake` 标量；同时按下时急刹优先。车端 `max_brake` 是不可绕过的总上限。页面修改两档时会同步写入本地
+控制进程，因此 `/api/control`、`/api/control/keyboard` 和 `/api/control/gamepad` 共用当前会话限幅；
+急停命令不经过普通驾驶限幅。页面刷新或重新登录时会从本地控制进程回读当前值，车端总上限自动下调时也会
+同步收紧两档。非 mock 车端必须显式填写 `max_brake`。现场值必须来自真实车辆制动标定，
+不能把归一化数值直接当作 bar 或制动力 N。
 急停、控制超时、故障和断开停车走独立安全停车路径，不会被这两个普通驾驶刹车
 上限削弱。
 `logging.browser_event_log` 的相对路径以 YAML 文件所在目录为基准；默认值把日志

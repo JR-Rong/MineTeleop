@@ -43,6 +43,8 @@ struct CanFrame {
 
 struct Command {
   int gear{1};
+  double vehicle_speed_request_kph{0.0};
+  bool vehicle_speed_request_valid{false};
   std::array<double, kMotorCount> motor_torque_nm{};
   std::array<double, kMotorCount> motor_speed_rpm{};
   std::array<double, kSteeringAxisCount> steering_angle_deg{};

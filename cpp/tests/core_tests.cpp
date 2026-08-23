@@ -232,7 +232,8 @@ void test_vehicle_config_validates_full_scale_motor_torque() {
       "    chassis_control:\n"
       "      can_interface: can0\n"
       "      bridge_library_path: /tmp/libmine_teleop_chassis_bridge.so");
-  const auto non_mock_path = write_temp_vehicle_config("missing-explicit-torque", non_mock_contents);
+  const auto non_mock_path = write_temp_vehicle_config(
+      "missing-explicit-torque", non_mock_contents);
   expect_throws(
       [&] { static_cast<void>(mine_teleop::load_vehicle_config(non_mock_path)); },
       "non-mock adapter accepted an implicit full-scale motor torque");
@@ -504,6 +505,129 @@ void test_media_signaling_error_classification_supports_structured_and_legacy_co
       mine_teleop::classify_media_signaling_error(mine_teleop::HttpStatusError(401, "unauthorized")) ==
           Kind::Fatal,
       "nonretryable signaling response was not fatal");
+}
+
+void test_vehicle_config_validates_chassis_control_speed_range() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+
+  auto boundary_contents = base;
+  replace_once(boundary_contents, "max_speed_kph: 40", "max_speed_kph: 72");
+  const auto boundary_path = write_temp_vehicle_config("speed-boundary", boundary_contents);
+  const auto boundary_config = mine_teleop::load_vehicle_config(boundary_path);
+  expect_near(
+      boundary_config.field_safety.max_speed_kph,
+      72.0,
+      1e-9,
+      "20 m/s ChassisControl speed boundary was rejected");
+  std::error_code error;
+  std::filesystem::remove(boundary_path, error);
+
+  auto excessive_contents = base;
+  replace_once(excessive_contents, "max_speed_kph: 40", "max_speed_kph: 72.1");
+  const auto excessive_path = write_temp_vehicle_config("speed-excessive", excessive_contents);
+  expect_throws(
+      [&] { static_cast<void>(mine_teleop::load_vehicle_config(excessive_path)); },
+      "target speed above the ChassisControl 20 m/s limit was accepted");
+  std::filesystem::remove(excessive_path, error);
+
+  auto non_mock_boundary_contents = base;
+  replace_once(
+      non_mock_boundary_contents,
+      "field_safety:\n",
+      "field_safety:\n"
+      "  max_throttle: 0.10\n"
+      "  full_scale_motor_torque_nm: 41.25\n"
+      "  max_brake: 1.0\n"
+      "  max_steering_angle_deg: 5.0\n");
+  replace_once(
+      non_mock_boundary_contents,
+      "vehicle_adapter:\n  type: mock",
+      "vehicle_adapter:\n"
+      "  type: dynamic_library\n"
+      "  integration:\n"
+      "    chassis_control:\n"
+      "      can_interface: can0\n"
+      "      bridge_library_path: /tmp/libmine_teleop_chassis_bridge.so");
+  replace_once(
+      non_mock_boundary_contents, "max_speed_kph: 40", "max_speed_kph: 1");
+  const auto non_mock_boundary_path = write_temp_vehicle_config(
+      "speed-minimum-boundary", non_mock_boundary_contents);
+  const auto non_mock_boundary_config =
+      mine_teleop::load_vehicle_config(non_mock_boundary_path);
+  expect_near(
+      non_mock_boundary_config.field_safety.max_speed_kph,
+      1.0,
+      1e-9,
+      "one km/h VCU speed boundary was rejected");
+  std::filesystem::remove(non_mock_boundary_path, error);
+
+  auto sub_resolution_contents = non_mock_boundary_contents;
+  replace_once(
+      sub_resolution_contents, "max_speed_kph: 1", "max_speed_kph: 0.5");
+  const auto sub_resolution_path = write_temp_vehicle_config(
+      "speed-below-vcu-resolution", sub_resolution_contents);
+  expect_throws(
+      [&] { static_cast<void>(mine_teleop::load_vehicle_config(sub_resolution_path)); },
+      "non-mock target speed below the VCU field resolution was accepted");
+  std::filesystem::remove(sub_resolution_path, error);
+}
+
+void test_dynamic_adapter_target_speed_uses_configured_ceiling() {
+  auto value = command();
+  value.throttle = 0.01;
+  constexpr double max_speed_mps = 7.5;
+
+  for (const std::string gear : {"D", "R"}) {
+    value.gear = gear;
+    expect_near(
+        mine_teleop::dynamic_adapter_target_speed_mps(value, max_speed_mps),
+        max_speed_mps,
+        1e-9,
+        "partial traction scaled the configured target speed");
+  }
+
+  value.gear = "D";
+  value.throttle = 0.0;
+  expect_near(
+      mine_teleop::dynamic_adapter_target_speed_mps(value, max_speed_mps),
+      0.0,
+      1e-9,
+      "released traction retained a target speed");
+  value.throttle = 0.5;
+  value.brake = 0.01;
+  expect_near(
+      mine_teleop::dynamic_adapter_target_speed_mps(value, max_speed_mps),
+      0.0,
+      1e-9,
+      "braking retained a target speed");
+
+  value.brake = 0.0;
+  for (const std::string gear : {"N", "P"}) {
+    value.gear = gear;
+    expect_near(
+        mine_teleop::dynamic_adapter_target_speed_mps(value, max_speed_mps),
+        0.0,
+        1e-9,
+        "non-driving gear exposed a target speed");
+  }
+}
+
+void test_dynamic_adapter_brake_overrides_throttle() {
+  auto value = command();
+  value.throttle = 0.8;
+  value.brake = 0.3;
+  expect_near(
+      mine_teleop::dynamic_adapter_target_acceleration(value),
+      -0.3,
+      1e-9,
+      "simultaneous throttle and brake produced traction");
+
+  value.brake = 0.0;
+  expect_near(
+      mine_teleop::dynamic_adapter_target_acceleration(value),
+      0.8,
+      1e-9,
+      "released brake did not restore the requested traction");
 }
 
 void test_bench_config_drives_unified_vehicle_runtime() {
@@ -1740,6 +1864,9 @@ int main() {
       {"media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes", test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes},
       {"critical_camera_control_latch_persists_until_a_new_session", test_critical_camera_control_latch_persists_until_a_new_session},
       {"media_signaling_error_classification_supports_structured_and_legacy_conflicts", test_media_signaling_error_classification_supports_structured_and_legacy_conflicts},
+      {"vehicle_config_validates_chassis_control_speed_range", test_vehicle_config_validates_chassis_control_speed_range},
+      {"dynamic_adapter_target_speed_uses_configured_ceiling", test_dynamic_adapter_target_speed_uses_configured_ceiling},
+      {"dynamic_adapter_brake_overrides_throttle", test_dynamic_adapter_brake_overrides_throttle},
       {"bench_config_drives_unified_vehicle_runtime", test_bench_config_drives_unified_vehicle_runtime},
       {"field_config_pins_tls_route_without_system_dns", test_field_config_pins_tls_route_without_system_dns},
       {"control_command_json_round_trip_and_validation", test_control_command_json_round_trip_and_validation},

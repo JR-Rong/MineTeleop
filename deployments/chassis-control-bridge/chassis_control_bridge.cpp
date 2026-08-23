@@ -187,17 +187,45 @@ VehicleState make_vehicle_state(
   return state;
 }
 
-Command command_from_chassis_control(int gear) {
+Command command_from_chassis_control(
+    int gear,
+    double target_vx_mps,
+    double target_ax,
+    double full_scale_motor_torque_nm) {
   const auto& controls = GetControlInfo();
   if (controls.size() < mine_teleop::vcu::kMotorCount) {
     throw std::runtime_error("ChassisControl did not produce eight wheel controls");
   }
+  for (std::size_t index = 0; index < mine_teleop::vcu::kMotorCount; ++index) {
+    const auto& control = controls[index];
+    if (!mine_teleop_chassis_control_output_is_finite(
+            control.wheel_torque,
+            control.wheel_speed,
+            control.eps_ang_req,
+            control.eps_ang_spd_req,
+            control.ehb_brk_pres_req)) {
+      throw std::runtime_error(
+          "ChassisControl produced a non-finite output at wheel " +
+          std::to_string(index));
+    }
+  }
 
   Command command;
   command.gear = gear;
+  command.vehicle_speed_request_kph =
+      mine_teleop_chassis_target_speed_request_kph(target_vx_mps);
+  command.vehicle_speed_request_valid =
+      mine_teleop_chassis_vehicle_speed_request_valid(
+          gear,
+          target_vx_mps,
+          target_ax,
+          full_scale_motor_torque_nm) != 0;
   for (std::size_t index = 0; index < mine_teleop::vcu::kMotorCount; ++index) {
     command.motor_torque_nm[index] =
-        clamp_value(controls[index].wheel_torque, -800.0, 838.3);
+        mine_teleop_chassis_clamp_motor_torque_nm(
+            controls[index].wheel_torque,
+            target_ax,
+            full_scale_motor_torque_nm);
     // This integration uses torque mode. ChassisControl's wheel_speed is wheel
     // rad/s, while the DBC field is motor rpm, so no dimensionally invalid value
     // is placed in the ignored speed request.
@@ -443,6 +471,10 @@ class ProtocolLogger {
   void command(const std::string& name, const Command& command) {
     std::ostringstream details;
     details << "\"command\":\"" << name << "\",\"gear\":" << command.gear
+            << ",\"vehicle_speed_request_kph\":"
+            << command.vehicle_speed_request_kph
+            << ",\"vehicle_speed_request_valid\":"
+            << (command.vehicle_speed_request_valid ? "true" : "false")
             << ",\"motor_torque_nm\":";
     append_double_array(details, command.motor_torque_nm);
     details << ",\"motor_speed_rpm\":";
@@ -753,9 +785,13 @@ class SocketCan {
 
 class BridgeRuntime {
  public:
-  BridgeRuntime(std::string can_interface, double full_scale_motor_torque_nm)
+  BridgeRuntime(
+      std::string can_interface,
+      double full_scale_motor_torque_nm,
+      int control_timeout_ms)
       : can_interface_(std::move(can_interface)),
-        full_scale_motor_torque_nm_(full_scale_motor_torque_nm) {
+        full_scale_motor_torque_nm_(full_scale_motor_torque_nm),
+        control_timeout_ms_(control_timeout_ms) {
     last_feedback_.vehicle_speed_valid = 0;
     for (double& angle : last_feedback_.eps_angle) {
       angle = std::numeric_limits<double>::quiet_NaN();
@@ -787,7 +823,9 @@ class BridgeRuntime {
         "\"track_m\":2.2,\"wheelbase_m\":4.4,\"max_steering_angle_deg\":30.0,"
         "\"emergency_deceleration_mps2\":-8.0,\"motor_control_mode\":\"torque\","
         "\"full_scale_motor_torque_nm\":" +
-            std::to_string(full_scale_motor_torque_nm_),
+            std::to_string(full_scale_motor_torque_nm_) +
+            ",\"control_timeout_ms\":" +
+            std::to_string(control_timeout_ms_),
         true);
     logger_.command("initial", initial);
     logger_.command("emergency", emergency);
@@ -837,6 +875,9 @@ class BridgeRuntime {
           "Check ChassisControl units, field limits, and the current VCU handshake state.");
       return false;
     }
+    last_successful_apply_ = Clock::now();
+    last_successful_apply_valid_ = true;
+    control_watchdog_latched_ = false;
     software_estop_ = false;
     logger_.command("driver", command);
     return true;
@@ -893,6 +934,9 @@ class BridgeRuntime {
           true);
       return false;
     }
+    last_successful_apply_valid_ = false;
+    ready_since_valid_ = false;
+    control_watchdog_latched_ = false;
     software_estop_ = false;
     logger_.event(
         "parallel_handshake_requested",
@@ -1134,6 +1178,25 @@ class BridgeRuntime {
             ",\"io_error\":" + std::to_string(io_error_));
   }
 
+  void fail_control_apply(
+      std::string_view issue_code,
+      std::string_view error,
+      std::string_view operator_action) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    controller_.emergency_stop();
+    software_estop_ = true;
+    control_watchdog_latched_ = true;
+    logger_.issue(
+        "control_apply_failed_safe",
+        issue_code,
+        "bridge_apply_state",
+        error,
+        operator_action,
+        "local_full_stop",
+        "\"running\":" + std::string(running_.load() ? "true" : "false") +
+            ",\"io_error\":" + std::to_string(io_error_));
+  }
+
   void close() {
     if (!running_.load()) {
       if (io_thread_.joinable()) io_thread_.join();
@@ -1218,6 +1281,48 @@ class BridgeRuntime {
       }
     }
     return true;
+  }
+
+  void check_control_watchdog_locked(Clock::time_point now) {
+    Clock::time_point reference{};
+    bool has_reference = false;
+    if (ready_since_valid_) {
+      reference = ready_since_;
+      has_reference = true;
+    }
+    if (last_successful_apply_valid_ &&
+        (!has_reference || last_successful_apply_ > reference)) {
+      reference = last_successful_apply_;
+      has_reference = true;
+    }
+    const auto elapsed_count = has_reference
+        ? std::chrono::duration_cast<std::chrono::milliseconds>(now - reference).count()
+        : 0;
+    const auto elapsed_ms = static_cast<std::uint64_t>(
+        std::max<std::int64_t>(0, elapsed_count));
+    if (!mine_teleop_chassis_control_watchdog_expired(
+            controller_.ready() ? 1 : 0,
+            has_reference ? 1 : 0,
+            control_watchdog_latched_ ? 1 : 0,
+            elapsed_ms,
+            control_timeout_ms_)) {
+      return;
+    }
+
+    controller_.emergency_stop();
+    software_estop_ = true;
+    control_watchdog_latched_ = true;
+    logger_.issue(
+        "control_apply_timeout",
+        "vcu_control_apply_timeout",
+        "vcu_control_watchdog",
+        "no successful upstream control apply arrived before the configured deadline",
+        "Keep the vehicle stopped and inspect the vehicle-agent control loop before resuming.",
+        "local_full_stop",
+        "\"timeout_ms\":" + std::to_string(control_timeout_ms_) +
+            ",\"last_apply_age_ms\":" + std::to_string(elapsed_ms) +
+            ",\"state\":\"" +
+            std::string(mine_teleop::vcu::state_name(controller_.state())) + "\"");
   }
 
   bool feedback_id_fresh_locked(
@@ -1531,8 +1636,17 @@ class BridgeRuntime {
                   "," + stale_feedback_ids_locked(now) +
                   "," + stale_feedback_ages_locked(now));
         }
+        check_control_watchdog_locked(now);
         frames = controller_.tick();
         transmit_state = controller_.state();
+        if (state_before != mine_teleop::vcu::State::Ready &&
+            transmit_state == mine_teleop::vcu::State::Ready) {
+          ready_since_ = now;
+          ready_since_valid_ = true;
+          control_watchdog_latched_ = false;
+        } else if (transmit_state != mine_teleop::vcu::State::Ready) {
+          ready_since_valid_ = false;
+        }
         if (state_before != transmit_state) {
           logger_.event(
               "state_transition",
@@ -1616,6 +1730,7 @@ class BridgeRuntime {
 
   std::string can_interface_;
   double full_scale_motor_torque_nm_;
+  int control_timeout_ms_;
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   SocketCan socket_;
@@ -1628,6 +1743,11 @@ class BridgeRuntime {
   std::uint64_t last_polled_generation_{0};
   int io_error_{0};
   bool software_estop_{false};
+  Clock::time_point last_successful_apply_{};
+  Clock::time_point ready_since_{};
+  bool last_successful_apply_valid_{false};
+  bool ready_since_valid_{false};
+  bool control_watchdog_latched_{false};
   std::uint64_t ignored_rx_count_{0};
   std::uint32_t last_ignored_rx_id_{0};
   std::uint64_t special_rx_count_{0};
@@ -1643,7 +1763,8 @@ std::unique_ptr<BridgeRuntime> g_runtime;
 
 int open_bridge_locked(
     const char* can_interface,
-    double full_scale_motor_torque_nm) {
+    double full_scale_motor_torque_nm,
+    int control_timeout_ms) {
   if (can_interface == nullptr || can_interface[0] == '\0' || g_runtime) {
     emit_bridge_diagnostic(
         "vehicle_vcu_start_failed",
@@ -1684,7 +1805,8 @@ int open_bridge_locked(
         "Check ChassisControl input ranges and units.");
     return -2;
   }
-  const auto emergency = command_from_chassis_control(1);
+  const auto emergency = command_from_chassis_control(
+      1, 0.0, -8.0, full_scale_motor_torque_nm);
 
   if (!UpdateVehicleState(make_vehicle_state(
           0.0,
@@ -1702,10 +1824,11 @@ int open_bridge_locked(
         "Check ChassisControl input ranges and units.");
     return -2;
   }
-  const auto initial = command_from_chassis_control(1);
+  const auto initial = command_from_chassis_control(
+      1, 0.0, 0.0, full_scale_motor_torque_nm);
 
   auto runtime = std::make_unique<BridgeRuntime>(
-      can_interface, full_scale_motor_torque_nm);
+      can_interface, full_scale_motor_torque_nm, control_timeout_ms);
   const int start_result = runtime->start(initial, emergency);
   if (start_result != 0) return start_result;
   g_runtime = std::move(runtime);
@@ -1714,10 +1837,12 @@ int open_bridge_locked(
 
 int open_bridge(
     const char* can_interface,
-    double full_scale_motor_torque_nm) noexcept {
+    double full_scale_motor_torque_nm,
+    int control_timeout_ms) noexcept {
   try {
     std::lock_guard<std::mutex> lock(g_api_mutex);
-    return open_bridge_locked(can_interface, full_scale_motor_torque_nm);
+    return open_bridge_locked(
+        can_interface, full_scale_motor_torque_nm, control_timeout_ms);
   } catch (const std::exception& error) {
     emit_bridge_diagnostic(
         "vehicle_vcu_start_failed",
@@ -1742,7 +1867,8 @@ int open_bridge(
 extern "C" int mine_teleop_chassis_open(const char* can_interface) {
   return open_bridge(
       can_interface,
-      MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM);
+      MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM,
+      MINE_TELEOP_CHASSIS_DEFAULT_CONTROL_TIMEOUT_MS);
 }
 
 extern "C" int mine_teleop_chassis_open_v1(
@@ -1752,17 +1878,21 @@ extern "C" int mine_teleop_chassis_open_v1(
       !std::isfinite(config->full_scale_motor_torque_nm) ||
       config->full_scale_motor_torque_nm < 0.0 ||
       config->full_scale_motor_torque_nm >
-          MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM) {
+          MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM ||
+      !mine_teleop_chassis_control_timeout_is_valid(
+          config->control_timeout_ms)) {
     emit_bridge_diagnostic(
         "vehicle_vcu_start_failed",
         "vcu_open_config_invalid",
         "bridge_open_config",
-        "open_v1 config size or full-scale motor torque is invalid",
-        "Provide the current V1 struct and a finite torque in [0, 165] Nm.");
+        "open_v1 config size, full-scale motor torque, or control timeout is invalid",
+        "Provide the current V1 struct, torque in [0, 165] Nm, and timeout in [20, 60000] ms.");
     return -1;
   }
   return open_bridge(
-      config->can_interface, config->full_scale_motor_torque_nm);
+      config->can_interface,
+      config->full_scale_motor_torque_nm,
+      config->control_timeout_ms);
 }
 
 extern "C" int mine_teleop_chassis_apply_state(
@@ -1773,13 +1903,23 @@ extern "C" int mine_teleop_chassis_apply_state(
     int steering_count) {
   try {
     std::lock_guard<std::mutex> lock(g_api_mutex);
+    const int checked_steering_count = std::max(
+        0,
+        std::min(
+            steering_count,
+            static_cast<int>(mine_teleop::vcu::kSteeringAxisCount)));
+    const bool steering_finite = steering_values != nullptr &&
+        std::all_of(
+            steering_values,
+            steering_values + checked_steering_count,
+            [](double value) { return std::isfinite(value); });
     if (!g_runtime || steering_values == nullptr || steering_count < 0 ||
-        target_gear < 1 || target_gear > 4) {
+        target_gear < 1 || target_gear > 4 || !std::isfinite(target_vx) ||
+        target_vx < 0.0 || !std::isfinite(target_ax) || !steering_finite) {
       if (g_runtime) {
-        g_runtime->log_api_failure(
-            "bridge_apply_state",
+        g_runtime->fail_control_apply(
             "vcu_apply_arguments_invalid",
-            "invalid gear, steering pointer, or steering count",
+            "invalid gear, target speed/acceleration, steering pointer, or steering values",
             "Check the runtime-to-bridge ABI arguments and configured steering axes.");
       }
       return -1;
@@ -1795,37 +1935,62 @@ extern "C" int mine_teleop_chassis_apply_state(
         steering_values,
         steering_count);
     if (!UpdateVehicleState(state)) {
-      g_runtime->log_api_failure(
-          "chassis_control_update",
+      g_runtime->fail_control_apply(
           "chassis_control_update_failed",
           "ChassisControl UpdateVehicleState returned false",
           "Check command ranges, units, and current ChassisControl state.");
       return -2;
     }
-    return g_runtime->apply(command_from_chassis_control(target_gear)) ? 0 : -3;
+    const auto command = command_from_chassis_control(
+        target_gear,
+        target_vx,
+        target_ax,
+        g_runtime->full_scale_motor_torque_nm());
+    if (!g_runtime->apply(command)) {
+      g_runtime->fail_control_apply(
+          "vcu_control_apply_rejected",
+          "the VCU controller rejected the generated command",
+          "Keep the vehicle stopped and inspect the current controller state and generated command.");
+      return -3;
+    }
+    return 0;
   } catch (const std::exception& error) {
-    if (g_runtime) {
-      g_runtime->log_api_failure(
-          "bridge_apply_state",
-          "vcu_apply_exception",
-          error.what(),
-          "Check ChassisControl output size/values and the bridge ABI.");
-    } else {
-      emit_bridge_diagnostic(
-          "vehicle_vcu_api_failed",
-          "vcu_apply_exception",
-          "bridge_apply_state",
-          error.what(),
-          "Check ChassisControl output size/values and the bridge ABI.");
+    try {
+      std::lock_guard<std::mutex> lock(g_api_mutex);
+      if (g_runtime) {
+        g_runtime->fail_control_apply(
+            "vcu_apply_exception",
+            error.what(),
+            "Check ChassisControl output size/values and the bridge ABI.");
+      } else {
+        emit_bridge_diagnostic(
+            "vehicle_vcu_api_failed",
+            "vcu_apply_exception",
+            "bridge_apply_state",
+            error.what(),
+            "Check ChassisControl output size/values and the bridge ABI.");
+      }
+    } catch (...) {
     }
     return -5;
   } catch (...) {
-    emit_bridge_diagnostic(
-        "vehicle_vcu_api_failed",
-        "vcu_apply_unknown_exception",
-        "bridge_apply_state",
-        "unknown non-standard exception",
-        "Check the bridge and ChassisControl runtime.");
+    try {
+      std::lock_guard<std::mutex> lock(g_api_mutex);
+      if (g_runtime) {
+        g_runtime->fail_control_apply(
+            "vcu_apply_unknown_exception",
+            "unknown non-standard exception",
+            "Check the bridge and ChassisControl runtime.");
+      } else {
+        emit_bridge_diagnostic(
+            "vehicle_vcu_api_failed",
+            "vcu_apply_unknown_exception",
+            "bridge_apply_state",
+            "unknown non-standard exception",
+            "Check the bridge and ChassisControl runtime.");
+      }
+    } catch (...) {
+    }
     return -5;
   }
 }

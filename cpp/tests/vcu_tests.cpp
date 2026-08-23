@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -289,6 +290,156 @@ void test_arming_uses_current_epb_semantics_and_gates_control() {
   expect(signal(brake, 4, 12) == 45, "4.5 bar brake pressure encoded incorrectly");
 }
 
+void test_vehicle_speed_request_is_ready_only_and_keeps_torque_mode() {
+  ParallelController controller;
+  Command command;
+  command.gear = 3;
+  command.vehicle_speed_request_kph = 12.6;
+  command.vehicle_speed_request_valid = true;
+
+  expect(controller.set_command(command), "valid vehicle speed request was rejected");
+  auto frames = controller.tick();
+  const auto& standby_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(standby_speed, 0, 8) == 0 && signal(standby_speed, 8, 8) == 0,
+      "standby exposed a valid vehicle speed request");
+
+  advance_to_ready(controller);
+  expect(controller.set_command(command), "ready vehicle speed request was rejected");
+  frames = controller.tick();
+  const auto& ready_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(ready_speed, 0, 8) == 12,
+      "vehicle speed request was not quantized down to its 1 km/h field");
+  expect(signal(ready_speed, 8, 8) == 1, "ready vehicle speed request was not marked valid");
+
+  const auto& motor = find_frame(frames, mine_teleop::vcu::ids::kAduMcu01);
+  expect(
+      signal(motor, 0, 3) == 1 && signal(motor, 3, 3) == 1,
+      "vehicle speed request changed the motor out of torque mode");
+
+  for (const auto& [request_kph, expected_raw] :
+       std::array<std::pair<double, std::uint64_t>, 2>{{{0.0, 0U}, {255.0, 255U}}}) {
+    command.vehicle_speed_request_kph = request_kph;
+    expect(controller.set_command(command), "vehicle speed encoding boundary was rejected");
+    frames = controller.tick();
+    const auto& boundary_speed =
+        find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+    expect(
+        signal(boundary_speed, 0, 8) == expected_raw &&
+            signal(boundary_speed, 8, 8) == 1,
+        "vehicle speed encoding boundary was incorrect");
+  }
+
+  command.vehicle_speed_request_kph = 12.6;
+  command.vehicle_speed_request_valid = false;
+  expect(controller.set_command(command), "disabled vehicle speed request was rejected");
+  frames = controller.tick();
+  const auto& disabled_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(disabled_speed, 0, 8) == 0 && signal(disabled_speed, 8, 8) == 0,
+      "explicitly invalid vehicle speed request was exposed as valid");
+}
+
+void test_motor_torque_resolution_preserves_quantized_ceiling() {
+  ParallelController controller;
+  advance_to_ready(controller);
+
+  Command command;
+  command.gear = 3;
+  for (const double requested_torque_nm : {4.1, -4.1}) {
+    command.motor_torque_nm.fill(requested_torque_nm);
+    expect(controller.set_command(command), "quantized motor torque was rejected");
+    const auto frames = controller.tick();
+    const auto& motor = find_frame(frames, mine_teleop::vcu::ids::kAduMcu01);
+    const double decoded_torque_nm =
+        static_cast<double>(signal(motor, 8, 14)) * 0.1 - 800.0;
+    expect(
+        std::abs(decoded_torque_nm - requested_torque_nm) < 1e-9,
+        "0.1 Nm motor torque ceiling changed during CAN encoding");
+  }
+}
+
+void test_vehicle_speed_request_is_invalidated_by_safety_and_disarm_states() {
+  ParallelController controller;
+  advance_to_ready(controller);
+
+  Command command;
+  command.gear = 3;
+  command.vehicle_speed_request_kph = 20.0;
+  command.vehicle_speed_request_valid = true;
+  expect(controller.set_command(command), "ready vehicle speed request was rejected");
+
+  controller.emergency_stop();
+  auto frames = controller.tick();
+  const auto& emergency_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(emergency_speed, 0, 8) == 0 && signal(emergency_speed, 8, 8) == 0,
+      "emergency stop left the vehicle speed request valid");
+
+  controller.clear_emergency_stop();
+  auto emergency_switch = gear_feedback(3);
+  emergency_switch.data[0] |= 1U;
+  expect(controller.ingest(emergency_switch), "VCU emergency switch feedback was rejected");
+  frames = controller.tick();
+  const auto& emergency_switch_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(emergency_switch_speed, 0, 8) == 0 &&
+          signal(emergency_switch_speed, 8, 8) == 0,
+      "VCU emergency switch left the vehicle speed request valid");
+
+  expect(controller.ingest(gear_feedback(3)), "VCU emergency switch did not clear");
+  controller.request_disarm();
+  frames = controller.tick();
+  const auto& disarm_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(disarm_speed, 0, 8) == 0 && signal(disarm_speed, 8, 8) == 0,
+      "disarm left the vehicle speed request valid");
+
+  ParallelController faulted;
+  advance_to_ready(faulted);
+  expect(faulted.set_command(command), "fault-path vehicle speed request was rejected");
+  faulted.transport_fault();
+  frames = faulted.tick();
+  const auto& fault_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(fault_speed, 0, 8) == 0 && signal(fault_speed, 8, 8) == 0,
+      "transport fault left the vehicle speed request valid");
+}
+
+void test_vehicle_speed_request_validation_is_finite_and_bounded() {
+  ParallelController controller;
+  Command command;
+
+  for (const double boundary : {0.0, 255.0}) {
+    command.vehicle_speed_request_kph = boundary;
+    command.vehicle_speed_request_valid = true;
+    expect(controller.set_command(command), "vehicle speed boundary was rejected");
+  }
+
+  for (const double invalid : {
+           -0.1,
+           255.1,
+           std::numeric_limits<double>::quiet_NaN(),
+           std::numeric_limits<double>::infinity()}) {
+    command.vehicle_speed_request_kph = invalid;
+    expect(!controller.set_command(command), "invalid vehicle speed request was accepted");
+  }
+
+  command.vehicle_speed_request_valid = false;
+  command.vehicle_speed_request_kph = std::numeric_limits<double>::quiet_NaN();
+  expect(
+      !controller.set_command(command),
+      "non-finite vehicle speed request bypassed validation while marked invalid");
+}
+
 void test_feedback_decoding_uses_si_units_and_complete_snapshot() {
   ParallelController controller;
   expect(controller.ingest(speed_feedback(36.0)), "speed feedback was rejected");
@@ -493,6 +644,14 @@ int main() {
        test_protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding},
       {"arming_uses_current_epb_semantics_and_gates_control",
        test_arming_uses_current_epb_semantics_and_gates_control},
+      {"vehicle_speed_request_is_ready_only_and_keeps_torque_mode",
+       test_vehicle_speed_request_is_ready_only_and_keeps_torque_mode},
+      {"motor_torque_resolution_preserves_quantized_ceiling",
+       test_motor_torque_resolution_preserves_quantized_ceiling},
+      {"vehicle_speed_request_is_invalidated_by_safety_and_disarm_states",
+       test_vehicle_speed_request_is_invalidated_by_safety_and_disarm_states},
+      {"vehicle_speed_request_validation_is_finite_and_bounded",
+       test_vehicle_speed_request_validation_is_finite_and_bounded},
       {"feedback_decoding_uses_si_units_and_complete_snapshot",
        test_feedback_decoding_uses_si_units_and_complete_snapshot},
       {"arming_requires_fresh_feedback_after_each_request",

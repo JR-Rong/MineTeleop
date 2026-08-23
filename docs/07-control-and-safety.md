@@ -44,7 +44,8 @@
 - `gear`：档位，必须是 JSON string，具体枚举待车辆接口确认。
 - `steering`：归一化转向，必须是 JSON number，范围 `[-1.0, 1.0]`。
 - `throttle`：归一化油门，必须是 JSON number，范围 `[0.0, 1.0]`。
-- `brake`：归一化刹车，必须是 JSON number，范围 `[0.0, 1.0]`。
+- `brake`：归一化普通行车制动，必须是 JSON number，范围 `[0.0, 1.0]`。驾驶端的缓刹和
+  急刹是两个可配置请求值，但在 v1 中仍共用这一标量；该值不是 EHB bar 或制动力 N。
 - `estop`：急停，必须是 JSON boolean，不能用 `"true"`/`"false"` 字符串。
 
 控制命令中的 JSON string、number、integer 和 boolean 字段不能互相用字符串、
@@ -58,7 +59,14 @@
 
 - 固定周期发送完整状态。
 - 没有输入变化也要发送心跳式命令。
-- 浏览器失焦或页面隐藏时立即清空输入并发送中性状态。
+- 浏览器只允许一个 async writer 串行执行 `/api/control` 和 DataChannel `send`；键盘、Gamepad 和
+  心跳只更新 latest-wins 快照，不排队积压过时命令。
+- 车端对 `vehicle_telemetry` 与 `vcu_handshake_status` 共用单调递增的 `control_status_seq`；浏览器在
+  unordered DataChannel 上只接受严格递增状态，禁止旧 Ready 覆盖较新的 fault/disarm。
+- D/R 选择与油门按键状态分离；松开前进/倒车键只归零牵引请求，普通制动也不自动切 N。
+  真实断链、控制权丢失和 VCU 故障/退出仍重置控制资格，并要求新的 keydown 才能恢复。
+- 浏览器失焦或页面隐藏时立即清空物理输入，保持已选 D/R，但发送零牵引、零转向、零普通制动的
+  安全快照；旧按键不能在窗口恢复焦点后自动恢复控制。
 - DataChannel 未打开、关闭或缓冲超过上限时不继续生成有效油门，界面显示控制链路中断/拥塞。
 - 车端以最后一条有效命令的本地接收时间判断链路健康。
 

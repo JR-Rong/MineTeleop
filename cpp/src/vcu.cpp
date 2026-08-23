@@ -154,6 +154,9 @@ bool all_finite_in_range(
 
 bool command_valid(const Command& command) {
   return command.gear >= 1 && command.gear <= 3 &&
+         std::isfinite(command.vehicle_speed_request_kph) &&
+         command.vehicle_speed_request_kph >= 0.0 &&
+         command.vehicle_speed_request_kph <= 255.0 &&
          all_finite_in_range(command.motor_torque_nm, -800.0, 838.3) &&
          all_finite_in_range(command.motor_speed_rpm, -8000.0, 8383.0) &&
          all_finite_in_range(command.steering_angle_deg, -30.0, 30.0) &&
@@ -240,6 +243,23 @@ CanFrame make_shake_frame(int gear, int handshake_request, bool fault_reset) {
   insert_signal(frame, 8, 8, static_cast<std::uint64_t>(gear));
   insert_signal(frame, 16, 8, kNoRequest);
   insert_signal(frame, 24, 1, fault_reset ? 1U : 0U);
+  return frame;
+}
+
+CanFrame make_vehicle_speed_frame(double speed_request_kph, bool valid) {
+  CanFrame frame{ids::kAduVehicleSpeed};
+  insert_signal(
+      frame,
+      0,
+      8,
+      encode_physical(
+          valid ? std::floor(speed_request_kph) : 0.0,
+          1.0,
+          0.0,
+          8,
+          0.0,
+          255.0));
+  insert_signal(frame, 8, 8, valid ? 1U : 0U);
   return frame;
 }
 
@@ -564,6 +584,8 @@ std::vector<CanFrame> ParallelController::tick() {
   std::array<double, kSteeringAxisCount> steering_angle{};
   std::array<double, kSteeringAxisCount> steering_speed{};
   std::array<double, kBrakeCount> brake_pressure{};
+  double vehicle_speed_request_kph = 0.0;
+  bool vehicle_speed_request_valid = false;
   bool fault_reset = false;
 
   const bool driving_authority_requested =
@@ -609,6 +631,8 @@ std::vector<CanFrame> ParallelController::tick() {
     steering_angle = desired_.steering_angle_deg;
     steering_speed = desired_.steering_speed_degps;
     brake_pressure = desired_.brake_pressure_bar;
+    vehicle_speed_request_kph = desired_.vehicle_speed_request_kph;
+    vehicle_speed_request_valid = desired_.vehicle_speed_request_valid;
     fault_reset = desired_.fault_reset;
   }
 
@@ -621,6 +645,8 @@ std::vector<CanFrame> ParallelController::tick() {
     motor_torque.fill(0.0);
     motor_speed.fill(0.0);
     brake_pressure = emergency_.brake_pressure_bar;
+    vehicle_speed_request_kph = 0.0;
+    vehicle_speed_request_valid = false;
     if (state_ == State::Ready || state_ == State::Fault ||
         state_ == State::DisarmTorque || state_ == State::DisarmStop) {
       motor_command.fill(kMotorEnable);
@@ -669,11 +695,9 @@ std::vector<CanFrame> ParallelController::tick() {
   frames.push_back(make_epb_frame(parking_brake, steering_mode));
   frames.push_back(make_shake_frame(gear, handshake_request, fault_reset));
   frames.push_back(CanFrame{ids::kAduBody});
-
-  CanFrame vehicle_speed{ids::kAduVehicleSpeed};
-  insert_signal(vehicle_speed, 0, 8, 0);
-  insert_signal(vehicle_speed, 8, 8, 0);
-  frames.push_back(vehicle_speed);
+  frames.push_back(make_vehicle_speed_frame(
+      vehicle_speed_request_kph,
+      vehicle_speed_request_valid));
   return frames;
 }
 

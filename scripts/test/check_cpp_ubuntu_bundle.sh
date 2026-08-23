@@ -76,6 +76,11 @@ container_id="$(docker create --platform linux/amd64 \
     test -s "$root/config/mine-teleop-field-root.crt"
     test -s "$root/lib/vendor/chassis/libmine_teleop_chassis_bridge.so"
     test -s "$root/lib/vendor/chassis/libchassis_control.so"
+    if ! grep -a -q "mine_teleop_chassis_open_v1" \
+        "$root/lib/vendor/chassis/libmine_teleop_chassis_bridge.so"; then
+      printf "chassis bridge is missing required open_v1 ABI symbol\n" >&2
+      exit 2
+    fi
     test ! -e "$root/config/device-token"
     "$root/bin/mine-teleop-run" version
     "$root/bin/mine-teleop-run" config-check --config "$root/config/vehicle-agent.yaml"

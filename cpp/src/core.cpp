@@ -35,6 +35,13 @@
 namespace mine_teleop {
 namespace {
 
+constexpr double kChassisControlMaxTargetSpeedMps = 20.0;
+constexpr double kChassisControlMaxTargetSpeedKph =
+    kChassisControlMaxTargetSpeedMps * 3.6;
+constexpr double kChassisControlMinTargetSpeedKph = 1.0;
+constexpr double kChassisControlMinTargetSpeedMps =
+    kChassisControlMinTargetSpeedKph / 3.6;
+
 template <typename T>
 T required(const YAML::Node& node, const char* key, std::string_view context) {
   const auto value = node[key];
@@ -102,6 +109,7 @@ struct BridgeOpenConfigV1 {
   std::uint32_t struct_size;
   const char* can_interface;
   double full_scale_motor_torque_nm;
+  std::int32_t control_timeout_ms;
 };
 
 struct BridgeFeedback {
@@ -566,6 +574,26 @@ ControlCommand ControlCommand::from_json(const Json& value) {
   }
   command.validate();
   return command;
+}
+
+double dynamic_adapter_target_speed_mps(
+    const ControlCommand& command,
+    double max_speed_mps) {
+  command.validate();
+  if (!std::isfinite(max_speed_mps) || max_speed_mps < 0.0) {
+    throw std::invalid_argument("max_speed_mps must be finite and non-negative");
+  }
+  const bool driving_gear = command.gear == "D" || command.gear == "R";
+  return driving_gear && command.throttle > 0.0 && command.brake == 0.0
+             ? max_speed_mps
+             : 0.0;
+}
+
+double dynamic_adapter_target_acceleration(const ControlCommand& command) {
+  command.validate();
+  // Treat braking as an independent, dominant request. A malformed or stale
+  // producer must never turn simultaneous throttle and brake into traction.
+  return command.brake > 0.0 ? -command.brake : command.throttle;
 }
 
 void LatestControlCommandMailbox::publish(ControlCommand command) {
@@ -1056,7 +1084,19 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   }
   if (!std::isfinite(config.field_safety.max_speed_kph) ||
       config.field_safety.max_speed_kph < 0.0 ||
-      !std::isfinite(config.field_safety.max_throttle) ||
+      config.field_safety.max_speed_kph > kChassisControlMaxTargetSpeedKph) {
+    throw std::runtime_error(
+        "field_safety.max_speed_kph must be finite and in [0, 72] km/h; "
+        "the current ChassisControl target-speed input is limited to 20 m/s");
+  }
+  if (!std::isfinite(config.field_safety.full_scale_motor_torque_nm) ||
+      config.field_safety.full_scale_motor_torque_nm < 0.0 ||
+      config.field_safety.full_scale_motor_torque_nm > 165.0) {
+    throw std::runtime_error(
+        "field_safety.full_scale_motor_torque_nm must be finite and in [0, 165] Nm; "
+        "higher values require a validated chassis torque mapping");
+  }
+  if (!std::isfinite(config.field_safety.max_throttle) ||
       config.field_safety.max_throttle < 0.0 ||
       config.field_safety.max_throttle > 1.0 ||
       !std::isfinite(config.field_safety.max_brake) ||
@@ -1114,8 +1154,11 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
         "max_throttle, full_scale_motor_torque_nm, max_brake, and "
         "max_steering_angle_deg");
   }
-  if (config.vehicle_adapter.type != "mock" && config.field_safety.max_speed_kph <= 0.0) {
-    throw std::runtime_error("non-mock vehicle adapter requires field_safety.max_speed_kph > 0");
+  if (config.vehicle_adapter.type != "mock" &&
+      config.field_safety.max_speed_kph < kChassisControlMinTargetSpeedKph) {
+    throw std::runtime_error(
+        "non-mock vehicle adapter requires field_safety.max_speed_kph >= 1; "
+        "the VCU request field has 1 km/h resolution");
   }
   if (config.vehicle_adapter.type != "mock" &&
       config.hardware.can_tx_queue_length < 16) {
@@ -1254,17 +1297,22 @@ DynamicLibraryVehicleAdapter::DynamicLibraryVehicleAdapter(
     int can_bitrate,
     int can_tx_queue_length,
     double max_speed_mps,
-    double full_scale_motor_torque_nm)
+    double full_scale_motor_torque_nm,
+    int control_timeout_ms)
     : library_path_(std::move(library_path)),
       can_interface_(std::move(can_interface)),
       can_bitrate_(can_bitrate),
       can_tx_queue_length_(can_tx_queue_length),
       max_speed_mps_(max_speed_mps),
-      full_scale_motor_torque_nm_(full_scale_motor_torque_nm) {
+      full_scale_motor_torque_nm_(full_scale_motor_torque_nm),
+      control_timeout_ms_(control_timeout_ms) {
   if (library_path_.empty() || can_interface_.empty() || can_bitrate_ <= 0 ||
-      can_tx_queue_length_ < 16 || max_speed_mps_ <= 0.0 ||
+      can_tx_queue_length_ < 16 || !std::isfinite(max_speed_mps_) ||
+      max_speed_mps_ < kChassisControlMinTargetSpeedMps ||
+      max_speed_mps_ > kChassisControlMaxTargetSpeedMps ||
       !std::isfinite(full_scale_motor_torque_nm_) ||
-      full_scale_motor_torque_nm_ < 0.0 || full_scale_motor_torque_nm_ > 165.0) {
+      full_scale_motor_torque_nm_ < 0.0 || full_scale_motor_torque_nm_ > 165.0 ||
+      control_timeout_ms_ < 20 || control_timeout_ms_ > 60000) {
     throw std::invalid_argument("dynamic adapter configuration is incomplete");
   }
 }
@@ -1334,7 +1382,10 @@ void DynamicLibraryVehicleAdapter::open() {
     prepare_socketcan(can_interface_, can_bitrate_, can_tx_queue_length_);
 #endif
     const BridgeOpenConfigV1 config{
-        sizeof(BridgeOpenConfigV1), can_interface_.c_str(), full_scale_motor_torque_nm_};
+        sizeof(BridgeOpenConfigV1),
+        can_interface_.c_str(),
+        full_scale_motor_torque_nm_,
+        control_timeout_ms_};
     check_result(open_v1_fn_(&config), "mine_teleop_chassis_open_v1");
     opened_ = true;
   } catch (const std::exception& error) {
@@ -1352,8 +1403,8 @@ void DynamicLibraryVehicleAdapter::close() {
 
 void DynamicLibraryVehicleAdapter::apply_control(const ControlCommand& command) {
   if (!opened_) throw std::runtime_error("dynamic vehicle adapter is not open");
-  const double velocity = command.throttle * (1.0 - command.brake) * max_speed_mps_;
-  const double acceleration = command.throttle - command.brake;
+  const double velocity = dynamic_adapter_target_speed_mps(command, max_speed_mps_);
+  const double acceleration = dynamic_adapter_target_acceleration(command);
   const double steering[4]{command.steering, command.steering, command.steering, command.steering};
   check_result(
       apply_fn_(gear_to_bridge_value(command.gear), velocity, acceleration, steering, 4),
@@ -1514,7 +1565,8 @@ std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& conf
         config.hardware.can_bitrate,
         config.hardware.can_tx_queue_length,
         config.field_safety.max_speed_kph / 3.6,
-        config.field_safety.full_scale_motor_torque_nm);
+        config.field_safety.full_scale_motor_torque_nm,
+        config.control.control_timeout_ms);
   }
   throw std::runtime_error("unsupported vehicle adapter type: " + config.vehicle_adapter.type);
 }

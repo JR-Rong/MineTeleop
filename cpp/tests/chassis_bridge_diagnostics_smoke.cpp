@@ -93,6 +93,33 @@ int main() {
         mine_teleop_chassis_open_v1(&invalid_config) == -1,
         "unreachable full-scale torque was accepted");
     expect(g_initialize_calls == 0, "invalid open_v1 config reached ChassisControl Initialize");
+
+    MineTeleopChassisOpenConfigV2 invalid_v2_config{};
+    invalid_v2_config.struct_size = sizeof(invalid_v2_config) - 1;
+    invalid_v2_config.can_interface = "mtmissing0";
+    invalid_v2_config.full_scale_motor_torque_nm = 41.25;
+    invalid_v2_config.control_timeout_ms = 800;
+    expect(
+        mine_teleop_chassis_open_v2(&invalid_v2_config) == -1,
+        "incorrect open_v2 struct size was accepted");
+    invalid_v2_config.struct_size = sizeof(invalid_v2_config);
+    invalid_v2_config.full_scale_motor_torque_nm =
+        std::numeric_limits<double>::quiet_NaN();
+    expect(
+        mine_teleop_chassis_open_v2(&invalid_v2_config) == -1,
+        "open_v2 accepted non-finite full-scale torque");
+    invalid_v2_config.full_scale_motor_torque_nm = 41.25;
+    invalid_v2_config.control_timeout_ms =
+        MINE_TELEOP_CHASSIS_MIN_CONTROL_TIMEOUT_MS - 1;
+    expect(
+        mine_teleop_chassis_open_v2(&invalid_v2_config) == -1,
+        "control timeout below one transmit period was accepted");
+    invalid_v2_config.control_timeout_ms =
+        MINE_TELEOP_CHASSIS_MAX_CONTROL_TIMEOUT_MS + 1;
+    expect(
+        mine_teleop_chassis_open_v2(&invalid_v2_config) == -1,
+        "unbounded control timeout was accepted");
+    expect(g_initialize_calls == 0, "invalid open_v2 config reached ChassisControl Initialize");
     expect(
         std::abs(mine_teleop_chassis_scaled_target_acceleration(1.0, 82.5) - 2.0) < 1e-9,
         "full throttle did not map to the configured traction acceleration");
@@ -105,30 +132,119 @@ int main() {
     expect(
         std::abs(mine_teleop_chassis_scaled_target_acceleration(-1.0, 165.0) + 1.0) < 1e-9,
         "traction configuration changed the braking path");
+    expect(
+        std::abs(mine_teleop_chassis_motor_torque_limit_nm(0.10, 41.25) - 4.1) <
+            1e-9 &&
+            std::abs(mine_teleop_chassis_motor_torque_limit_nm(2.0, 41.25) - 41.2) <
+                1e-9 &&
+            std::abs(mine_teleop_chassis_motor_torque_limit_nm(-0.30, 41.25)) <
+                1e-9,
+        "per-channel motor torque ceiling does not follow normalized traction");
+    expect(
+        std::abs(
+            mine_teleop_chassis_clamp_motor_torque_nm(100.0, 0.10, 41.25) -
+            4.1) < 1e-9 &&
+            std::abs(
+                mine_teleop_chassis_clamp_motor_torque_nm(-100.0, 0.10, 41.25) +
+                4.1) < 1e-9 &&
+            std::abs(
+                mine_teleop_chassis_clamp_motor_torque_nm(3.0, 0.10, 41.25) -
+                3.0) < 1e-9 &&
+            std::abs(
+                mine_teleop_chassis_clamp_motor_torque_nm(100.0, -0.30, 41.25)) <
+                1e-9 &&
+            std::abs(
+                mine_teleop_chassis_clamp_motor_torque_nm(100.0, 0.10, 41.6) -
+                4.1) < 1e-9 &&
+            std::abs(
+                mine_teleop_chassis_clamp_motor_torque_nm(-100.0, 0.10, 41.6) +
+                4.1) < 1e-9,
+        "vendor motor torque was not quantized toward zero before the authoritative clamp");
+    expect(
+        std::abs(mine_teleop_chassis_target_speed_request_kph(7.5) - 27.0) < 1e-9,
+        "target speed was not converted from m/s to km/h");
+    expect(
+        std::abs(mine_teleop_chassis_target_speed_request_kph(0.0)) < 1e-9,
+        "zero target speed did not remain zero");
+    expect(
+        std::abs(mine_teleop_chassis_target_speed_request_kph(100.0) - 255.0) < 1e-9,
+        "target speed was not bounded to the VCU field");
+    expect(
+        mine_teleop_chassis_vehicle_speed_request_valid(3, 7.5, 0.10, 41.25) == 1 &&
+            mine_teleop_chassis_vehicle_speed_request_valid(2, 7.5, 0.10, 41.25) == 1,
+        "D/R positive traction did not enable the vehicle-speed request");
+    expect(
+        mine_teleop_chassis_vehicle_speed_request_valid(3, 0.0, 0.0, 41.25) == 0,
+        "released traction retained a valid zero-speed request");
+    expect(
+        mine_teleop_chassis_vehicle_speed_request_valid(
+            3, 0.5 / 3.6, 0.10, 41.25) == 0,
+        "a sub-resolution target exposed a valid zero-speed VCU request");
+    expect(
+        mine_teleop_chassis_vehicle_speed_request_valid(3, 0.0, -0.30, 41.25) == 0,
+        "ordinary braking retained a valid zero-speed request");
+    expect(
+        mine_teleop_chassis_vehicle_speed_request_valid(3, 7.5, 0.10, 0.0) == 0,
+        "disabled traction exposed a valid VCU speed request");
+    expect(
+        mine_teleop_chassis_vehicle_speed_request_valid(1, 7.5, 0.10, 41.25) == 0,
+        "neutral exposed a valid VCU speed request");
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    expect(
+        mine_teleop_chassis_control_output_is_finite(0.0, 0.0, 0.0, 0.0, 0.0) == 1,
+        "finite ChassisControl output was rejected");
+    expect(
+        mine_teleop_chassis_control_output_is_finite(nan, 0.0, 0.0, 0.0, 0.0) == 0 &&
+            mine_teleop_chassis_control_output_is_finite(0.0, nan, 0.0, 0.0, 0.0) == 0 &&
+            mine_teleop_chassis_control_output_is_finite(0.0, 0.0, nan, 0.0, 0.0) == 0 &&
+            mine_teleop_chassis_control_output_is_finite(0.0, 0.0, 0.0, nan, 0.0) == 0 &&
+            mine_teleop_chassis_control_output_is_finite(0.0, 0.0, 0.0, 0.0, nan) == 0,
+        "non-finite ChassisControl output was not rejected before saturation");
+
+    expect(
+        mine_teleop_chassis_control_watchdog_expired(1, 1, 0, 799, 800) == 0 &&
+            mine_teleop_chassis_control_watchdog_expired(1, 1, 0, 800, 800) == 1 &&
+            mine_teleop_chassis_control_watchdog_expired(0, 1, 0, 800, 800) == 0 &&
+            mine_teleop_chassis_control_watchdog_expired(1, 0, 0, 800, 800) == 0 &&
+            mine_teleop_chassis_control_watchdog_expired(1, 1, 1, 800, 800) == 0,
+        "control-apply watchdog readiness, deadline, or one-shot latch policy is incorrect");
 
     const auto log_path =
         std::filesystem::path("/tmp/mine-teleop-vcu-diagnostics-smoke.jsonl");
     std::error_code error;
     std::filesystem::remove(log_path, error);
     ::setenv("MINE_TELEOP_VCU_LOG_PATH", log_path.c_str(), 1);
-    const MineTeleopChassisOpenConfigV1 valid_config{
+    const MineTeleopChassisOpenConfigV1 valid_v1_config{
         sizeof(MineTeleopChassisOpenConfigV1), "mtmissing0", 82.5};
-    const int socket_result = mine_teleop_chassis_open_v1(&valid_config);
+    const int v1_socket_result = mine_teleop_chassis_open_v1(&valid_v1_config);
+    const MineTeleopChassisOpenConfigV2 valid_v2_config{
+        sizeof(MineTeleopChassisOpenConfigV2), "mtmissing0", 82.5, 900};
+    const int v2_socket_result = mine_teleop_chassis_open_v2(&valid_v2_config);
     ::unsetenv("MINE_TELEOP_VCU_LOG_PATH");
-    expect(socket_result == -3, "missing SocketCAN interface was not rejected");
+    expect(
+        v1_socket_result == -3 && v2_socket_result == -3,
+        "missing SocketCAN interface was not rejected by both versioned open paths");
+    expect(
+        g_initialize_calls == 2,
+        "valid open_v1/open_v2 did not each reach ChassisControl Initialize");
 
     const auto events = read_json_lines(log_path);
-    bool socket_failure_found = false;
-    bool vehicle_parameters_found = false;
+    int socket_failure_count = 0;
+    bool v1_default_parameters_found = false;
+    bool v2_configured_parameters_found = false;
     for (const auto& event : events) {
       if (event.value("name", "") == "vehicle_parameters") {
-        vehicle_parameters_found = true;
         expect(
             std::abs(event.value("full_scale_motor_torque_nm", -1.0) - 82.5) < 1e-9,
             "configured full-scale torque is missing from bridge log");
+        const int timeout_ms = event.value("control_timeout_ms", -1);
+        v1_default_parameters_found |=
+            timeout_ms == MINE_TELEOP_CHASSIS_DEFAULT_CONTROL_TIMEOUT_MS;
+        v2_configured_parameters_found |= timeout_ms == 900;
       }
       if (event.value("name", "") != "socket_open_failed") continue;
-      socket_failure_found = true;
+      ++socket_failure_count;
       expect(
           event.value("issue_code", "") == "socketcan_open_failed",
           "SocketCAN issue_code is missing");
@@ -145,8 +261,13 @@ int main() {
           !event.value("operator_action", "").empty(),
           "SocketCAN operator action is missing");
     }
-    expect(vehicle_parameters_found, "vehicle parameter event is missing");
-    expect(socket_failure_found, "SocketCAN failure event is missing");
+    expect(
+        v1_default_parameters_found,
+        "open_v1 did not use the compatible default control timeout");
+    expect(
+        v2_configured_parameters_found,
+        "open_v2 configured control timeout is missing from bridge log");
+    expect(socket_failure_count == 2, "versioned SocketCAN failure events are missing");
     std::filesystem::remove(log_path, error);
 
     std::cout << "chassis_bridge_diagnostics_smoke=passed\n";

@@ -394,11 +394,19 @@ void test_control_page_contract() {
       "complete measured CAN feedback is not rendered from vehicle telemetry");
   expect(
       response.body.find("ArrowLeft:'left',KeyA:'left'") != std::string::npos &&
-          response.body.find("ArrowRight:'right',KeyD:'right'") != std::string::npos &&
-          response.body.find("ArrowUp:'up',KeyW:'up'") != std::string::npos &&
-          response.body.find("ArrowDown:'down',KeyS:'down'") != std::string::npos &&
-          response.body.find("Space:'brake'") != std::string::npos,
-      "direction keys, WASD, and Space are not mapped to the shared control state");
+      response.body.find("ArrowRight:'right',KeyD:'right'") != std::string::npos &&
+      response.body.find("ArrowUp:'up',KeyW:'up'") != std::string::npos &&
+      response.body.find("ArrowDown:'down',KeyS:'down'") != std::string::npos &&
+      response.body.find("Space:'service_brake',KeyB:'hard_brake'") != std::string::npos &&
+      response.body.find("e.code==='KeyE'") != std::string::npos,
+      "direction keys, two brake keys, and ESTOP are not mapped to the shared control state");
+  expect(
+      response.body.find("const pressedControlKeys=new Set(),blockedControlKeys=new Set()") !=
+              std::string::npos &&
+          response.body.find("pressedControlKeys.add(e.code)") != std::string::npos &&
+          response.body.find("pressedControlKeys.delete(e.code)") != std::string::npos &&
+          response.body.find("syncControlKeyState()") != std::string::npos,
+      "physical key codes are not reduced into held control actions");
   const auto keyboard_handler = response.body.find("addEventListener('keydown'");
   const auto keyboard_prevent_default = response.body.find("e.preventDefault()", keyboard_handler);
   const auto keyboard_connection_gate = response.body.find("if(!polling)", keyboard_handler);
@@ -410,8 +418,26 @@ void test_control_page_contract() {
       "control keys can still scroll the page before the connection gate runs");
   expect(
       response.body.find("lastKeyboardEvent.textContent") != std::string::npos &&
-          response.body.find("已截获 · 等待连接") != std::string::npos,
-      "keyboard capture does not provide visible operator feedback");
+          response.body.find("已截获 · 等待连接") != std::string::npos &&
+          response.body.find("需释放后重新按下") != std::string::npos,
+      "keyboard capture and fresh-keydown interlock do not provide visible operator feedback");
+  expect(
+      response.body.find("selectedGear='N'") != std::string::npos &&
+          response.body.find("updateSelectedGearFromHeldDirections") != std::string::npos &&
+          response.body.find("return{gear:selectedGear") != std::string::npos &&
+          response.body.find("requestedGear===selectedGear?1:0") != std::string::npos &&
+          response.body.find("vcuAllowsGearChange") != std::string::npos &&
+          response.body.find("Math.abs(speed)<=0.1") != std::string::npos &&
+          response.body.find("换挡已阻止：需有效零速反馈") != std::string::npos &&
+          response.body.find("if(gear!=='R')gear='N'") == std::string::npos,
+      "D/R latching or fail-safe direction reversal is missing");
+  expect(
+      response.body.find("if(state.service_brake)brake=Math.max(brake,limits.serviceBrake)") !=
+              std::string::npos &&
+          response.body.find("if(state.hard_brake)brake=limits.hardBrake") !=
+              std::string::npos &&
+          response.body.find("if(brakeRequested)throttle=0") != std::string::npos,
+      "service/hard brake priority does not suppress throttle while preserving steering");
   expect(
       response.body.find("开始平行驾驶握手") != std::string::npos &&
           response.body.find("断开 VCU 握手") != std::string::npos,
@@ -436,26 +462,100 @@ void test_control_page_contract() {
   expect(
       response.body.find("实车调试限幅") != std::string::npos &&
           response.body.find("max-throttle-percent") != std::string::npos &&
-          response.body.find("max-brake-percent") != std::string::npos &&
+          response.body.find("service-brake-percent") != std::string::npos &&
+          response.body.find("hard-brake-percent") != std::string::npos &&
           response.body.find("max-steering-deg") != std::string::npos,
       "field commissioning control limit dialog is missing");
   expect(
       response.body.find("effectiveControlLimits") != std::string::npos &&
           response.body.find("updateVehicleHardLimits(message.hard_limits)") != std::string::npos &&
-          response.body.find("maxBrake:Math.min(controlLimits.maxBrake,vehicleHardLimits.max_brake)") !=
+          response.body.find("serviceBrake:Math.min(controlLimits.serviceBrake,vehicleHardLimits.max_brake)") !=
               std::string::npos &&
-          response.body.find("brake:clamp(brake,0,1)*limits.maxBrake") != std::string::npos &&
-          response.body.find("post('/api/control-limits',{max_brake:brakePercent/100})") !=
+          response.body.find("hardBrake:Math.min(controlLimits.hardBrake,vehicleHardLimits.max_brake)") !=
+              std::string::npos &&
+          response.body.find("brake:clamp(brake,0,limits.hardBrake)") != std::string::npos &&
+          response.body.find(
+              "post('/api/control-limits',{service_brake:servicePercent/100,hard_brake:hardPercent/100})") !=
               std::string::npos &&
           response.body.find("get('/api/control-limits').then") != std::string::npos &&
           response.body.find(
-              "await post('/api/control-limits',{max_brake:controlLimits.maxBrake})") !=
+              "await post('/api/control-limits',{service_brake:controlLimits.serviceBrake,hard_brake:controlLimits.hardBrake})") !=
               std::string::npos &&
+          response.body.find("if(servicePercent>hardPercent)") != std::string::npos &&
           response.body.find("急停、超时、故障和断开停车不受人工刹车限幅削弱") !=
               std::string::npos &&
           response.body.find("我已确认车辆处于隔离台架") != std::string::npos,
       "controller limits are not combined with vehicle hard limits and operator confirmation");
-  expect(response.body.find("post('/api/control',currentControl(extra))") != std::string::npos, "control inputs do not share one normalized path");
+  const auto control_post = response.body.find("post('/api/control',outgoing)");
+  expect(
+      control_post != std::string::npos &&
+          response.body.find("post('/api/control'", control_post + 1) == std::string::npos &&
+          response.body.find("async function drainControlWrites()") != std::string::npos &&
+          response.body.find("pendingControlWrite") != std::string::npos &&
+          response.body.find("controlWriteActive") != std::string::npos &&
+          response.body.find("const outgoingSnapshot=JSON.stringify(outgoing)") !=
+              std::string::npos &&
+          response.body.find("const estopRequested=estopLatched||Boolean(extra.estop)") !=
+              std::string::npos &&
+          response.body.find("activeChannel.bufferedAmount>4096&&!estopRequested") !=
+              std::string::npos &&
+          response.body.find("!outgoing.estop&&JSON.stringify(latestOutgoing)!==outgoingSnapshot") !=
+              std::string::npos &&
+          response.body.find("reason:'control_intent_superseded'") !=
+              std::string::npos,
+      "browser control writes are not merged through one ordered writer");
+  expect(
+      response.body.find("function vcuStateRequiresFreshInput") != std::string::npos &&
+          response.body.find("stateName.startsWith('disarm_')") != std::string::npos &&
+          response.body.find("function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}") !=
+              std::string::npos &&
+          response.body.find("if(!vcuEverReady&&!vcuMockUnsupported())") != std::string::npos &&
+          response.body.find("首次握手完成后请重新按下") != std::string::npos,
+      "initial authority, fault, or disarm does not require fresh control input");
+  expect(
+      response.body.find("lastControlStatusSeq=0") != std::string::npos &&
+          response.body.find("function acceptControlStatusMessage(message)") !=
+              std::string::npos &&
+          response.body.find("!Number.isSafeInteger(sequence)||sequence<=lastControlStatusSeq") !=
+              std::string::npos &&
+          response.body.find("if(!acceptControlStatusMessage(message))return") !=
+              std::string::npos &&
+          response.body.find("control_status_message_dropped") != std::string::npos,
+      "unordered vehicle status messages can replay stale VCU authority");
+  expect(
+      response.body.find("function vcuStateKeepsHeldInput") != std::string::npos &&
+          response.body.find("['wait_gear','wait_actuator_modes']") != std::string::npos &&
+          response.body.find("if(retainedWait&&!estopRequested)outgoing.throttle=0") !=
+              std::string::npos &&
+          response.body.find("if(!stillVcuReady&&!estopRequested)") !=
+              std::string::npos &&
+          response.body.find("换挡闭环中（输入保持）") != std::string::npos &&
+          response.body.find("执行器闭环中（输入保持）") != std::string::npos &&
+          response.body.find("输入已清除，等待新鲜 VCU Ready") != std::string::npos,
+      "authorized VCU convergence waits do not retain inputs with zero-throttle heartbeats");
+  const auto telemetry_vcu_update = response.body.find(
+      "if(message.vcu_handshake)updateVcuHandshakeState({...message.vcu_handshake,driver_connected:true})");
+  const auto telemetry_limits_await = response.body.find(
+      "await updateVehicleHardLimits(message.control_limits)", telemetry_vcu_update);
+  const auto handshake_vcu_update = response.body.find(
+      "updateVcuHandshakeState({...(message.status||{}),driver_connected:Boolean(message.driver_connected)})");
+  const auto handshake_limits_await = response.body.find(
+      "await updateVehicleHardLimits(message.hard_limits)", handshake_vcu_update);
+  expect(
+      telemetry_vcu_update != std::string::npos &&
+          telemetry_limits_await != std::string::npos &&
+          telemetry_vcu_update < telemetry_limits_await &&
+          handshake_vcu_update != std::string::npos &&
+          handshake_limits_await != std::string::npos &&
+          handshake_vcu_update < handshake_limits_await,
+      "an older async hard-limit update can overwrite a newer VCU authority state");
+  expect(
+      response.body.find("gamepadRequiresNeutral=true") != std::string::npos &&
+          response.body.find("const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported()") !=
+              std::string::npos &&
+          response.body.find("if(pedalsNeutral)gamepadRequiresNeutral=false") !=
+              std::string::npos,
+      "Gamepad pedals can resume automatically across an authority or focus reset");
   expect(response.body.find("driver_vehicle_switch_started") != std::string::npos, "safe vehicle switching UI is missing");
   const auto switch_request = response.body.find("session=await post('/api/connect'");
   const auto realtime_close = response.body.find("generation=closeRealtimeSession()", switch_request);
@@ -495,8 +595,9 @@ void test_control_page_contract() {
   expect(response.body.find("pollSignaling(generation)") != std::string::npos, "stale signaling pollers are not isolated across vehicle switches");
   expect(
       response.body.find("gamepaddisconnected") != std::string::npos &&
-          response.body.find("clearControlInput();clientLog('gamepad_disconnected'") != std::string::npos,
-      "Gamepad disconnect does not preserve the safe-zero behavior");
+          response.body.find("gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;renderControlState();clientLog('gamepad_disconnected'") !=
+              std::string::npos,
+      "Gamepad disconnect does not zero its own axes without clearing keyboard input");
   expect(response.body.find("车辆必须本地确认后才能复位") != std::string::npos, "ESTOP latch feedback is missing");
   expect(response.body.find("运行监控") != std::string::npos, "operator monitoring panel is missing");
   expect(response.body.find("控制 RTT") != std::string::npos, "control RTT display is missing");
@@ -534,8 +635,16 @@ void test_control_page_contract() {
           response.body.find("if(['failed','closed'].includes(connectionState))") != std::string::npos &&
           response.body.find("peer!==nextPeer") != std::string::npos,
       "a transient or stale peer state change can discard a recoverable control DataChannel");
+  const auto offer_start = response.body.find("async function startFromOffer");
+  const auto offer_authority_reset = response.body.find("resetControlAuthorityInput()", offer_start);
+  const auto offer_peer_create = response.body.find("new RTCPeerConnection", offer_start);
   expect(
-      response.body.find("peer.connectionState!=='connected'") != std::string::npos,
+      offer_start != std::string::npos && offer_authority_reset != std::string::npos &&
+          offer_peer_create != std::string::npos && offer_authority_reset < offer_peer_create &&
+          response.body.find("channel.onclose=()=>{") != std::string::npos,
+      "a new peer or closed DataChannel can inherit stale VCU authority/input state");
+  expect(
+      response.body.find("activePeer.connectionState!=='connected'") != std::string::npos,
       "control commands can be sent while the current WebRTC peer is disconnected");
   expect(
       response.body.find("if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}") !=
@@ -567,8 +676,11 @@ void test_control_page_contract() {
           response.body.find("车辆急停已由车端遥测确认") != std::string::npos,
       "the page can report a vehicle ESTOP before telemetry confirms it");
   expect(
-      response.body.find("webrtcLabel.textContent==='控制链路拥塞'") != std::string::npos,
-      "the operator label cannot recover after DataChannel backpressure clears");
+      response.body.find("activeChannel.bufferedAmount>4096&&!estopRequested){") !=
+              std::string::npos &&
+          response.body.find("webrtcLabel.textContent==='控制链路拥塞，输入已清除'") !=
+              std::string::npos,
+      "DataChannel backpressure does not clear stale input or recover its operator label");
   expect(response.body.find("时延超过 200 ms") != std::string::npos, "latency threshold alarm is missing");
   expect(response.body.find("低于 20 FPS") != std::string::npos, "FPS threshold alarm is missing");
   expect(response.body.find("sent_at_utc_ms:Date.now()") != std::string::npos, "browser-local logs do not use UTC milliseconds");
@@ -624,8 +736,11 @@ void test_driver_gamepad_config() {
       field.control_limits.initial_max_throttle == 0.05,
       "field driver initial throttle limit changed");
   expect(
-      field.control_limits.initial_max_brake == 1.0,
-      "field driver initial ordinary-brake limit changed");
+      field.control_limits.initial_service_brake == 0.30,
+      "field driver initial service-brake request changed");
+  expect(
+      field.control_limits.initial_hard_brake == 1.0,
+      "field driver initial hard-brake request changed");
   expect(
       field.control_limits.initial_max_steering_angle_deg == 3.0,
       "field driver initial steering limit changed");
@@ -642,6 +757,50 @@ void write_text_file(const std::filesystem::path& path, std::string_view value) 
   expect(output.good(), "cannot create test file: " + path.string());
   output << value;
   expect(output.good(), "cannot write test file: " + path.string());
+}
+
+void test_driver_brake_limit_config_validation() {
+  const auto root = std::filesystem::temp_directory_path() /
+      ("mine-teleop-driver-brake-limits-" + mine_teleop::random_token(6));
+  std::filesystem::create_directories(root);
+  try {
+    const auto invalid_path = root / "invalid-order.yaml";
+    write_text_file(
+        invalid_path,
+        R"YAML(driver:
+  id: driver-console-001
+cloud:
+  signaling_url: http://127.0.0.1:8765/signaling
+control:
+  limits:
+    initial_service_brake: 0.8
+    initial_hard_brake: 0.2
+)YAML");
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_driver_config(invalid_path.string())); },
+        "driver config accepted service brake above hard brake");
+
+    const auto legacy_path = root / "legacy-max-brake.yaml";
+    write_text_file(
+        legacy_path,
+        R"YAML(driver:
+  id: driver-console-001
+cloud:
+  signaling_url: http://127.0.0.1:8765/signaling
+control:
+  limits:
+    initial_max_brake: 0.1
+)YAML");
+    const auto legacy = mine_teleop::load_driver_config(legacy_path.string());
+    expect(
+        legacy.control_limits.initial_service_brake == 0.1 &&
+            legacy.control_limits.initial_hard_brake == 0.1,
+        "legacy initial_max_brake was not mapped to a valid two-brake profile");
+  } catch (...) {
+    std::filesystem::remove_all(root);
+    throw;
+  }
+  std::filesystem::remove_all(root);
 }
 
 void test_signaling_multi_identity_config() {
@@ -973,7 +1132,8 @@ void test_driver_vehicle_switch_releases_old_session() {
   mine_teleop::DriverConfig driver_config;
   driver_config.driver_id = "driver-console-001";
   driver_config.signaling_url = base;
-  driver_config.control_limits.initial_max_brake = 0.25;
+  driver_config.control_limits.initial_service_brake = 0.10;
+  driver_config.control_limits.initial_hard_brake = 0.25;
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
   const auto first = driver.connect("vehicle-001");
   const auto second = driver.connect("vehicle-002");
@@ -1000,21 +1160,40 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(
       prepared.at("command").value("brake", -1.0) == 0.25,
       "driver runtime did not enforce the configured ordinary-brake limit");
-  static_cast<void>(driver.set_control_limits({{"max_brake", 0.10}}));
+  static_cast<void>(driver.set_control_limits(
+      {{"service_brake", 0.05}, {"hard_brake", 0.10}}));
   const auto reduced = driver.send_control(
       {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
   expect(
       reduced.at("command").value("brake", -1.0) == 0.10,
-      "driver runtime did not apply a reduced session brake limit");
-  static_cast<void>(driver.set_control_limits({{"max_brake", 0.50}}));
+      "driver runtime did not apply a reduced hard-brake limit");
+  static_cast<void>(driver.set_control_limits(
+      {{"service_brake", 0.20}, {"hard_brake", 0.50}}));
   const auto raised = driver.send_control(
       {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
   expect(
       raised.at("command").value("brake", -1.0) == 0.50,
-      "driver runtime did not apply a raised session brake limit");
+      "driver runtime did not apply a raised hard-brake limit");
   expect(
-      driver.control_limits().value("max_brake", -1.0) == 0.50,
-      "driver runtime did not expose the current session brake limit for page reload");
+      driver.control_limits().value("service_brake", -1.0) == 0.20 &&
+          driver.control_limits().value("hard_brake", -1.0) == 0.50 &&
+          driver.control_limits().value("max_brake", -1.0) == 0.50,
+      "driver runtime did not expose both brake requests for page reload");
+  expect_throws(
+      [&] {
+        static_cast<void>(driver.set_control_limits(
+            {{"service_brake", 0.60}, {"hard_brake", 0.50}}));
+      },
+      "driver runtime accepted service_brake above hard_brake");
+  expect(
+      driver.control_limits().value("service_brake", -1.0) == 0.20 &&
+          driver.control_limits().value("hard_brake", -1.0) == 0.50,
+      "rejected brake limits partially changed the active profile");
+  const auto legacy_limit = driver.set_control_limits({{"max_brake", 0.40}});
+  expect(
+      legacy_limit.value("service_brake", -1.0) == 0.20 &&
+          legacy_limit.value("hard_brake", -1.0) == 0.40,
+      "legacy max_brake compatibility did not retain a safe service request");
   const auto estop = driver.send_control(
       {{"gear", "N"},
        {"steering", 0.0},
@@ -3332,6 +3511,7 @@ int main() {
        test_signaling_time_sync_applies_backward_utc_correction},
       {"control_page_contract", test_control_page_contract},
       {"driver_gamepad_config", test_driver_gamepad_config},
+      {"driver_brake_limit_config_validation", test_driver_brake_limit_config_validation},
       {"signaling_multi_identity_config", test_signaling_multi_identity_config},
       {"credential_purpose_separation_and_stale_control_replay",
        test_credential_purpose_separation_and_stale_control_replay},

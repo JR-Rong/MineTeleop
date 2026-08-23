@@ -69,6 +69,13 @@ struct ControlCommand {
   static ControlCommand from_json(const Json& value);
 };
 
+[[nodiscard]] double dynamic_adapter_target_speed_mps(
+    const ControlCommand& command,
+    double max_speed_mps);
+
+[[nodiscard]] double dynamic_adapter_target_acceleration(
+    const ControlCommand& command);
+
 struct ReceiveResult {
   bool accepted{false};
   std::string reason;
@@ -419,7 +426,8 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
       int can_bitrate,
       int can_tx_queue_length,
       double max_speed_mps,
-      double full_scale_motor_torque_nm);
+      double full_scale_motor_torque_nm,
+      int control_timeout_ms);
   ~DynamicLibraryVehicleAdapter() override;
 
   void open() override;
@@ -444,6 +452,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   int can_tx_queue_length_;
   double max_speed_mps_;
   double full_scale_motor_torque_nm_;
+  int control_timeout_ms_;
   void* handle_{nullptr};
   bool opened_{false};
   bool feedback_ready_{false};

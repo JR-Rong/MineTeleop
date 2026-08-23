@@ -1003,7 +1003,9 @@ struct VehicleMediaRuntime::Impl {
     const auto& telemetry = history.back();
     const auto sequence = telemetry.value("seq", std::uint64_t{0});
     if (sequence == last_vehicle_telemetry_seq) return;
-    const auto payload = telemetry.dump();
+    auto payload_value = telemetry;
+    payload_value["control_status_seq"] = ++control_status_seq;
+    const auto payload = payload_value.dump();
     gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
     last_vehicle_telemetry_seq = sequence;
   }
@@ -1040,6 +1042,7 @@ struct VehicleMediaRuntime::Impl {
           {"vehicle_id", config.vehicle_id},
           {"driver_id", signaling.driver_id()},
           {"session_id", signaling.session_id()},
+          {"control_status_seq", ++control_status_seq},
           {"sent_at_utc_ms", signaling.now_ms()},
           {"driver_connected", true},
           {"result", result},
@@ -1251,6 +1254,7 @@ struct VehicleMediaRuntime::Impl {
         }
         control_service_started = true;
         last_vehicle_telemetry_seq = 0;
+        control_status_seq = 0;
       }
       emit_diagnostic(
           "vehicle_vcu_adapter_ready",
@@ -2556,6 +2560,7 @@ struct VehicleMediaRuntime::Impl {
   std::atomic<std::int64_t> last_control_received_at_ms{0};
   std::optional<std::int64_t> last_vcu_status_ms;
   std::uint64_t last_vehicle_telemetry_seq{0};
+  std::uint64_t control_status_seq{0};
   std::string last_vcu_handshake_state;
   std::string last_control_rejection_reason;
   std::optional<std::int64_t> last_control_rejection_log_ms;
