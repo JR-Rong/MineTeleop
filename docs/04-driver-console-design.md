@@ -50,8 +50,8 @@ API 表达，应放到独立平台适配器中，不能侵入会话或协议核�
 - `ArrowUp` / `W`：前进目标车速比例。
 - `ArrowDown` / `S`：倒车目标车速比例。
 - `ArrowLeft` / `A` 与 `ArrowRight` / `D`：转向。
-- `Space`：缓刹，输出控制台配置的归一化缓刹请求。
-- `B`：急刹，输出控制台配置的归一化急刹请求。
+- `Space`：缓刹，选择当前会话配置的每路 EHB 缓刹压力。
+- `B`：急刹，立即选择当前会话配置的每路 EHB 急刹压力。
 - `E`：立即锁存急停。
 
 注意：
@@ -79,10 +79,16 @@ API 表达，应放到独立平台适配器中，不能侵入会话或协议核�
 
 浏览器读取 Gamepad 后先执行死区、反向、中心/静止位和量程归一化，再与键盘
 合成为 `steering`、`throttle`、单一 v1 `brake`、`estop` 和 `gear`。协议字段
-`throttle` 为兼容保留名，其实际语义是归一化目标车速比例：车端目标车速为
-`throttle × field_safety.max_speed_kph`。该比例不是转矩上限；每路最大转矩只由车端
-`field_safety.full_scale_motor_torque_nm` 及纵向控制器限制。缓刹与急刹
-只在控制台输入层选择不同的归一化 `brake` 请求，不改变车端协议。标准映射手柄使用
+`throttle` 为兼容保留名。控制端把踏板比例乘以已确认的会话目标车速，再除以车端
+`field_safety.max_speed_kph`，车端仍按 `throttle × max_speed_kph` 得到 PID 目标。
+该比例不是转矩上限；PID 输出同时受已确认的会话单电机转矩上限与车端
+`field_safety.full_scale_motor_torque_nm` 限制。
+
+会话中的三项制动值是每路 EHB 物理压力请求，单位 `bar`、分辨率 `0.1 bar`，不是
+百分比、踏板行程或整车制动力。v1 wire `brake` 保持 `[0,1]`：缓刹和急刹分别发送
+`service/max`、`hard/max`，模拟踏板按最大普通压力线性映射；最大压力为 0 时三种普通
+制动输入都发送 0。车端按已确认的会话最大压力还原为 bar，并继续受车端硬上限截断。
+标准映射手柄使用
 左摇杆 X 与左右扳机；非标准设备由 `control.gamepad` 的轴配置控制。页面校准仅对
 本次运行有效，需长期保留的现场校准值应回写 YAML。设备不存在、映射不完整或
 断开时，Gamepad 分量必须全部归零。
@@ -102,6 +108,38 @@ Console 不应只在按键变化时发送控制，而应按固定周期发送当
   不把任一 token 暴露给浏览器 JavaScript。
 
 这样车端可以通过心跳判断驾驶端是否还活着。
+
+### 会话控制参数确认
+
+控制端 YAML 给出新会话默认值：目标车速 `2.0 km/h`、单电机最大驱动转矩
+`300.0 Nm`、每路 EHB 最大普通/缓刹/急刹压力 `100.0/30.0/100.0 bar`。`300 Nm`
+和 `100 bar` 只是未完成台架或实车标定的软件请求默认值。控制端 schema 上限为
+`640.0 Nm/路` 与 `327.6 bar/路`，实际可用值还必须被车端 hard limits 下调。转向上限
+继续是控制端本地输入限幅并受车端静态硬上限约束，不进入会话 profile。
+对真实 VCU adapter，提高目标车速、转矩或转向上限，以及修改任一制动压力字段（包括
+降低），都要求 N 挡、有效零速和电子驻车已拉起；控制端先预检，车端再次 fail closed。
+
+页面通过 `POST /api/control-profile` 准备 `type=session_control_profile` 的鉴权
+DataChannel envelope；五个 profile 字段位于 envelope 顶层，并与普通控制命令复用
+车辆、驾驶员、session、`control_token` 和单调递增 `seq`。由于 control DataChannel
+是 unordered/unreliable，浏览器每隔至少 200 ms 重发同一 envelope 和同一 `seq`，直到
+收到共享 `control_status_seq` 排序后的 `session_control_profile_status`，或 telemetry
+中的同一 canonical `session_control_profile`。只有 `active=true`、
+`last_request_seq` 匹配 pending 序号且 `effective_profile` 合法时才视为已确认。
+旧 `GET /api/control-limits` 仅保留归一化制动比例的只读兼容；`POST` 固定返回
+`410 Gone`，不能绕过 profile 的停车、鉴权和 ACK 门禁修改会话制动参数。旧的
+`POST /api/control/keyboard` 与 `POST /api/control/gamepad` 同样固定返回 `410 Gone`：
+它们无法证明车端已经确认了与本地预设一致的物理压力 profile，继续发送会产生 ACK
+前后单位解释不一致。浏览器和新集成都只使用标准 `POST /api/control` 准备 v1 命令。
+
+未确认时页面清空输入并禁止 VCU connect 握手和所有普通驾驶命令；`estop=true` 不受
+profile ACK 门禁阻止。后续 telemetry 报告 profile inactive、序号不再等于当前 effective
+序号或 effective profile 非法时，页面立即撤销确认并再次清空输入。Peer/DataChannel
+断开、切换车辆、会话结束或登录失效会清除 requested override、pending envelope、
+effective profile 和 hard limits，恢复 YAML 默认值；旧会话设置不得跨会话自动重放。
+默认 profile 仅在收到 `parking_ready=true`，或车端明确报告 mock/无需握手且 adapter ready
+后自动提交；每个链路 generation 最多自动尝试一次。车端拒绝后必须由驾驶员显式重试，
+不得借后续 telemetry/hard-limit 更新循环生成新 `seq`。
 
 按键集合、挡位门禁、刹车优先级、VCU 状态迁移、状态序号与
 latest-wins 判定由可在浏览器和 Node.js 共用的无 DOM 模块实现。生产页面

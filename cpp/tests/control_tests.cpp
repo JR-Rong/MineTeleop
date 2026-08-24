@@ -543,7 +543,8 @@ void test_control_page_contract() {
       "explicit VCU handshake controls are missing");
   expect(
       response.body.find("event:'vcu_handshake_command'") != std::string::npos &&
-          response.body.find("message.event!=='vcu_handshake_status'") != std::string::npos,
+          response.body.find("'vcu_handshake_status','session_control_profile_status'") !=
+              std::string::npos,
       "VCU handshake command/status DataChannel contract is missing");
   expect(
       response.body.find("vcu_handshake_not_ready") != std::string::npos &&
@@ -560,32 +561,71 @@ void test_control_page_contract() {
       "the control page does not explain the failed VCU gate or handshake step");
   expect(
       response.body.find("实车调试限幅") != std::string::npos &&
-          response.body.find("最大目标车速比例（%）") != std::string::npos &&
-          response.body.find("max-throttle-percent") != std::string::npos &&
-          response.body.find("service-brake-percent") != std::string::npos &&
-          response.body.find("hard-brake-percent") != std::string::npos &&
-          response.body.find("max-steering-deg") != std::string::npos,
+          response.body.find("目标车速上限（km/h）") != std::string::npos &&
+          response.body.find("max-motor-torque-nm") != std::string::npos &&
+          response.body.find("max=\"640.0\"") != std::string::npos &&
+          response.body.find("max-brake-pressure-bar") != std::string::npos &&
+          response.body.find("service-brake-pressure-bar") != std::string::npos &&
+          response.body.find("hard-brake-pressure-bar") != std::string::npos &&
+          response.body.find("max-steering-deg") != std::string::npos &&
+          response.body.find("上游控制超时先按 0.3/0.6 档普通压力减速，最终 1.0 阶段才切到 409.5 bar/路") !=
+              std::string::npos,
       "field commissioning control limit dialog is missing");
   expect(
       response.body.find("effectiveControlLimits") != std::string::npos &&
           response.body.find("updateVehicleHardLimits(message.hard_limits)") != std::string::npos &&
-          response.body.find("serviceBrake:Math.min(controlLimits.serviceBrake,vehicleHardLimits.max_brake)") !=
+          response.body.find("controlLogic.normalizeControlProfile(value)") !=
               std::string::npos &&
-          response.body.find("hardBrake:Math.min(controlLimits.hardBrake,vehicleHardLimits.max_brake)") !=
+          response.body.find("controlLogic.mergeControlProfileWithHardLimits") !=
               std::string::npos &&
           response.body.find("controlLogic.deriveControl") != std::string::npos &&
-          response.body.find(
-              "post('/api/control-limits',{service_brake:servicePercent/100,hard_brake:hardPercent/100})") !=
-              std::string::npos &&
-          response.body.find("get('/api/control-limits').then") != std::string::npos &&
-          response.body.find(
-              "await post('/api/control-limits',{service_brake:controlLimits.serviceBrake,hard_brake:controlLimits.hardBrake})") !=
-              std::string::npos &&
-          response.body.find("if(servicePercent>hardPercent)") != std::string::npos &&
-          response.body.find("急停、超时、故障和断开停车不受人工刹车限幅削弱") !=
+          response.body.find("post('/api/control-profile',requested)") != std::string::npos &&
+          response.body.find("get('/api/control-limits').then") == std::string::npos &&
+          response.body.find("sendPendingControlProfile()") != std::string::npos &&
+          response.body.find("now-lastControlProfileSendAt<200") != std::string::npos &&
+          response.body.find("每路 EHB 压力请求，单位 bar、分辨率 0.1 bar") !=
               std::string::npos &&
           response.body.find("我已确认车辆处于隔离台架") != std::string::npos,
       "controller limits are not combined with vehicle hard limits and operator confirmation");
+  expect(
+      response.body.find("control_profile_not_acknowledged") != std::string::npos &&
+          response.body.find("action==='connect'&&!controlProfileState.acknowledged") !=
+              std::string::npos &&
+          response.body.find("applyControlProfileStatus(message.session_control_profile)") !=
+              std::string::npos &&
+          response.body.find("applyControlProfileStatus(message);", response.body.find(
+              "message.event==='session_control_profile_status'")) != std::string::npos &&
+          response.body.find("resetControlProfileSession()") != std::string::npos,
+      "ordinary driving is not fail-closed on session control profile acknowledgement");
+  expect(
+      response.body.find("defaultProfileAutoAttempted=false") != std::string::npos &&
+          response.body.find(
+              "controlProfilePrepareInFlight=false;defaultProfileAutoAttempted=false;"
+              "controlLimits.maxSteeringDeg") != std::string::npos &&
+          response.body.find(
+              "function defaultControlProfileAutoReady(){return "
+              "vcuHandshake.parking_ready===true||(vcuMockUnsupported()&&"
+              "vcuHandshake.adapter_ready===true)}") != std::string::npos &&
+          response.body.find(
+              "if(defaultProfileAutoAttempted||controlChannel?.readyState!=='open'") !=
+              std::string::npos &&
+          response.body.find(
+              "defaultProfileAutoAttempted=true;prepareControlProfile(defaults,false)") !=
+              std::string::npos,
+      "default profile can auto-submit before parking readiness or repeatedly after rejection");
+  expect(
+      response.body.find(
+              "requested.target_speed_kph>prior.target_speed_kph||"
+              "requested.max_motor_torque_nm>prior.max_motor_torque_nm") !=
+              std::string::npos &&
+          response.body.find(
+              "requested.max_brake_pressure_bar!==prior.max_brake_pressure_bar||"
+              "requested.service_brake_pressure_bar!==prior.service_brake_pressure_bar||"
+              "requested.hard_brake_pressure_bar!==prior.hard_brake_pressure_bar") !=
+              std::string::npos &&
+          response.body.find("if(requiresParking&&!defaultControlProfileAutoReady())") !=
+              std::string::npos,
+      "profile editing does not preflight vehicle parking rules for speed, torque, and brake changes");
   const auto control_post = response.body.find("post('/api/control',outgoing)");
   expect(
       control_post != std::string::npos &&
@@ -670,20 +710,24 @@ void test_control_page_contract() {
       "authorized VCU convergence waits do not retain inputs with zero-throttle heartbeats");
   const auto telemetry_vcu_update = response.body.find(
       "adapter_ready:vcuAdapterReady(message.vcu_handshake,message.vehicle_adapter?.opened)};updateVcuHandshakeState(nextVcuStatus)");
-  const auto telemetry_limits_await = response.body.find(
-      "await updateVehicleHardLimits(message.control_limits)", telemetry_vcu_update);
+  const auto telemetry_profile_update = response.body.find(
+      "applyControlProfileStatus(message.session_control_profile)", telemetry_vcu_update);
+  const auto telemetry_limits_update = response.body.find(
+      "updateVehicleHardLimits(message.control_limits)", telemetry_profile_update);
   const auto handshake_vcu_update = response.body.find(
       "updateVcuHandshakeState({...nextVcuStatus,driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)})");
-  const auto handshake_limits_await = response.body.find(
-      "await updateVehicleHardLimits(message.hard_limits)", handshake_vcu_update);
+  const auto handshake_limits_update = response.body.find(
+      "updateVehicleHardLimits(message.hard_limits)", handshake_vcu_update);
   expect(
       telemetry_vcu_update != std::string::npos &&
-          telemetry_limits_await != std::string::npos &&
-          telemetry_vcu_update < telemetry_limits_await &&
+          telemetry_profile_update != std::string::npos &&
+          telemetry_limits_update != std::string::npos &&
+          telemetry_vcu_update < telemetry_profile_update &&
+          telemetry_profile_update < telemetry_limits_update &&
           handshake_vcu_update != std::string::npos &&
-          handshake_limits_await != std::string::npos &&
-          handshake_vcu_update < handshake_limits_await,
-      "an older async hard-limit update can overwrite a newer VCU authority state");
+          handshake_limits_update != std::string::npos &&
+          handshake_vcu_update < handshake_limits_update,
+      "vehicle status does not update VCU, profile, and hard-limit state in a deterministic order");
   expect(
       response.body.find("gamepadRequiresNeutral=true") != std::string::npos &&
           response.body.find("const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported()") !=
@@ -833,7 +877,7 @@ void test_control_page_contract() {
               std::string::npos &&
           response.body.find("vcu_adapter_unavailable") != std::string::npos &&
           response.body.find("请使用车辆物理急停") != std::string::npos &&
-          response.body.find("function vcuDrivingReady(){return controlLogic.drivingReady(vcuHandshake)}") !=
+          response.body.find("function vcuDrivingReady(){return controlProfileState.acknowledged&&controlLogic.drivingReady(vcuHandshake)}") !=
               std::string::npos,
       "the controller can claim that remote ESTOP was sent while the VCU adapter is unavailable");
   expect(
@@ -923,14 +967,16 @@ void test_driver_gamepad_config() {
   expect(field.ice_transport_policy == "all", "field driver ICE policy is not the safe default");
   expect(field.max_time_sync_uncertainty_ms == 25, "field driver time synchronization limit is not 25ms");
   expect(
-      field.control_limits.initial_max_throttle == 0.05,
-      "field driver initial throttle limit changed");
+      field.control_limits.initial_target_speed_kph == 2.0,
+      "field driver initial target speed changed");
   expect(
-      field.control_limits.initial_service_brake == 0.30,
-      "field driver initial service-brake request changed");
+      field.control_limits.initial_max_motor_torque_nm == 300.0,
+      "field driver initial per-motor torque request changed");
   expect(
-      field.control_limits.initial_hard_brake == 1.0,
-      "field driver initial hard-brake request changed");
+      field.control_limits.initial_max_brake_pressure_bar == 100.0 &&
+          field.control_limits.initial_service_brake_pressure_bar == 30.0 &&
+          field.control_limits.initial_hard_brake_pressure_bar == 100.0,
+      "field driver initial per-EHB pressure requests changed");
   expect(
       field.control_limits.initial_max_steering_angle_deg == 3.0,
       "field driver initial steering limit changed");
@@ -996,6 +1042,47 @@ void test_vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter
       "delayed adapter readiness did not remain newer than driver_connected");
 }
 
+void test_stale_control_data_channel_callbacks_are_fail_silent() {
+  const auto source = read_text_file("cpp/src/webrtc_media.cpp");
+  const auto handler = cpp_function_contract(source, "void handle_control_message(");
+  const auto profile_begin = handler.find(
+      "if (message.value(\"type\", \"\") == \"session_control_profile\")");
+  const auto handshake_begin = handler.find(
+      "if (message.value(\"event\", \"\") == \"vcu_handshake_command\")");
+  const auto command_begin = handler.find("const auto command = ControlCommand::from_json(message)");
+  expect(
+      profile_begin != std::string::npos && handshake_begin != std::string::npos &&
+          command_begin != std::string::npos && profile_begin < handshake_begin &&
+          handshake_begin < command_begin,
+      "control message branches could not be isolated for stale-channel review");
+
+  const auto profile_branch = handler.substr(profile_begin, handshake_begin - profile_begin);
+  const auto handshake_branch = handler.substr(handshake_begin, command_begin - handshake_begin);
+  constexpr std::string_view stale_guard = "if (control_channel != channel) return;";
+  const auto profile_stale = profile_branch.find(stale_guard);
+  const auto profile_unavailable = profile_branch.find(
+      "if (stop_requested || control_inhibited || !control_service_started");
+  const auto profile_status = profile_branch.find("send_session_control_profile_status_locked(result)");
+  expect(
+      profile_stale != std::string::npos && profile_unavailable != std::string::npos &&
+          profile_status != std::string::npos && profile_stale < profile_unavailable &&
+          profile_unavailable < profile_status &&
+          profile_branch.find("control_channel != channel ||") == std::string::npos,
+      "a stale profile callback can publish a rejection on the replacement control channel");
+
+  const auto handshake_stale = handshake_branch.find(stale_guard);
+  const auto handshake_unavailable = handshake_branch.find(
+      "if (stop_requested || control_inhibited || !control_service_started");
+  const auto handshake_status = handshake_branch.find(
+      "send_vcu_handshake_status_locked(\"driver_not_connected\")");
+  expect(
+      handshake_stale != std::string::npos && handshake_unavailable != std::string::npos &&
+          handshake_status != std::string::npos && handshake_stale < handshake_unavailable &&
+          handshake_unavailable < handshake_status &&
+          handshake_branch.find("control_channel != channel ||") == std::string::npos,
+      "a stale handshake callback can publish a rejection on the replacement control channel");
+}
+
 void write_text_file(const std::filesystem::path& path, std::string_view value) {
   std::ofstream output(path);
   expect(output.good(), "cannot create test file: " + path.string());
@@ -1017,8 +1104,9 @@ cloud:
   signaling_url: http://127.0.0.1:8765/signaling
 control:
   limits:
-    initial_service_brake: 0.8
-    initial_hard_brake: 0.2
+    initial_max_brake_pressure_bar: 100.0
+    initial_service_brake_pressure_bar: 80.0
+    initial_hard_brake_pressure_bar: 20.0
 )YAML");
     expect_throws(
         [&] { static_cast<void>(mine_teleop::load_driver_config(invalid_path.string())); },
@@ -1035,11 +1123,24 @@ control:
   limits:
     initial_max_brake: 0.1
 )YAML");
-    const auto legacy = mine_teleop::load_driver_config(legacy_path.string());
-    expect(
-        legacy.control_limits.initial_service_brake == 0.1 &&
-            legacy.control_limits.initial_hard_brake == 0.1,
-        "legacy initial_max_brake was not mapped to a valid two-brake profile");
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_driver_config(legacy_path.string())); },
+        "driver config silently reinterpreted a legacy normalized brake value as bar");
+
+    const auto legacy_throttle_path = root / "legacy-throttle.yaml";
+    write_text_file(
+        legacy_throttle_path,
+        R"YAML(driver:
+  id: driver-console-001
+cloud:
+  signaling_url: http://127.0.0.1:8765/signaling
+control:
+  limits:
+    initial_max_throttle: 0.05
+)YAML");
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_driver_config(legacy_throttle_path.string())); },
+        "driver config silently converted legacy throttle ratio without a vehicle hard limit");
 
     const auto obsolete_keyboard_path = root / "obsolete-keyboard.yaml";
     write_text_file(
@@ -1391,8 +1492,9 @@ void test_driver_vehicle_switch_releases_old_session() {
   mine_teleop::DriverConfig driver_config;
   driver_config.driver_id = "driver-console-001";
   driver_config.signaling_url = base;
-  driver_config.control_limits.initial_service_brake = 0.10;
-  driver_config.control_limits.initial_hard_brake = 0.25;
+  driver_config.control_limits.initial_max_brake_pressure_bar = 100.0;
+  driver_config.control_limits.initial_service_brake_pressure_bar = 10.0;
+  driver_config.control_limits.initial_hard_brake_pressure_bar = 25.0;
   auto driver_runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(
       driver_config, "vehicle-001", "dev-password");
   auto& driver = *driver_runtime;
@@ -1415,59 +1517,98 @@ void test_driver_vehicle_switch_releases_old_session() {
       "vehicle switch did not activate the new session");
 
   mine_teleop::DriverConsoleHttpApp control_app(driver_runtime);
-  const auto post_keyboard = [&](const mine_teleop::Json& input) {
+  mine_teleop::HttpRequest profile_request;
+  profile_request.method = "POST";
+  profile_request.path = "/api/control-profile";
+  profile_request.body = mine_teleop::Json({
+      {"target_speed_kph", 3.0},
+      {"max_motor_torque_nm", 250.0},
+      {"max_brake_pressure_bar", 80.0},
+      {"service_brake_pressure_bar", 8.0},
+      {"hard_brake_pressure_bar", 20.0},
+  }).dump();
+  const auto profile_response = control_app.handle(profile_request);
+  expect(profile_response.status == 200, "session control profile could not be prepared");
+  const auto profile_result = mine_teleop::Json::parse(profile_response.body);
+  const auto& profile_envelope = profile_result.at("request");
+  expect(
+      profile_result.value("prepared", false) &&
+          profile_result.value("transport", "") == "webrtc_data_channel" &&
+          profile_result.value("delivery_state", "") == "browser_data_channel_pending" &&
+          profile_envelope.value("type", "") == "session_control_profile" &&
+          profile_envelope.value("vehicle_id", "") == "vehicle-002" &&
+          profile_envelope.value("driver_id", "") == "driver-console-001" &&
+          profile_envelope.value("session_id", "") == second.value("session_id", "") &&
+          !profile_envelope.value("control_token", "").empty() &&
+          profile_envelope.value("seq", std::uint64_t{0}) > 0,
+      "prepared session profile lost authenticated envelope identity");
+  expect(
+      !profile_envelope.contains("profile") &&
+          profile_envelope.value("target_speed_kph", -1.0) == 3.0 &&
+          profile_envelope.value("max_motor_torque_nm", -1.0) == 250.0 &&
+          profile_envelope.value("max_brake_pressure_bar", -1.0) == 80.0 &&
+          profile_envelope.value("service_brake_pressure_bar", -1.0) == 8.0 &&
+          profile_envelope.value("hard_brake_pressure_bar", -1.0) == 20.0,
+      "session profile request is not the canonical flat DataChannel schema");
+
+  mine_teleop::HttpRequest get_profile_request;
+  get_profile_request.method = "GET";
+  get_profile_request.path = "/api/control-profile";
+  const auto get_profile_response = control_app.handle(get_profile_request);
+  expect(get_profile_response.status == 200, "prepared session control profile is not readable");
+  const auto prepared_profile = mine_teleop::Json::parse(get_profile_response.body);
+  expect(
+      prepared_profile.value("target_speed_kph", -1.0) == 3.0 &&
+          prepared_profile.value("max_motor_torque_nm", -1.0) == 250.0 &&
+          prepared_profile.value("last_prepared_seq", std::uint64_t{0}) ==
+              profile_envelope.value("seq", std::uint64_t{0}),
+      "prepared session profile state does not match its DataChannel envelope");
+
+  profile_request.body = mine_teleop::Json({
+      {"target_speed_kph", 3.0},
+      {"max_motor_torque_nm", 640.1},
+      {"max_brake_pressure_bar", 80.0},
+      {"service_brake_pressure_bar", 8.0},
+      {"hard_brake_pressure_bar", 20.0},
+  }).dump();
+  expect(
+      control_app.handle(profile_request).status == 400,
+      "session profile accepted torque above the controller schema ceiling");
+  profile_request.body = mine_teleop::Json({
+      {"target_speed_kph", 3.0},
+      {"max_motor_torque_nm", 250.0},
+      {"max_brake_pressure_bar", 327.7},
+      {"service_brake_pressure_bar", 8.0},
+      {"hard_brake_pressure_bar", 20.0},
+  }).dump();
+  expect(
+      control_app.handle(profile_request).status == 400,
+      "session profile accepted ordinary EHB pressure above the schema ceiling");
+  const auto profile_analog_brake = driver.send_control(
+      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
+  expect(
+      profile_analog_brake.at("command").value("brake", -1.0) == 0.80,
+      "session hard-brake key pressure incorrectly capped the analog brake range");
+
+  for (const auto* path : {"/api/control/keyboard", "/api/control/gamepad"}) {
     mine_teleop::HttpRequest request;
     request.method = "POST";
-    request.path = "/api/control/keyboard";
-    request.body = input.dump();
-    return control_app.handle(request);
-  };
-  const auto service_response = post_keyboard(
-      {{"left", true}, {"up", true}, {"service_brake", true}});
-  expect(service_response.status == 200, "legacy service-brake request failed");
-  const auto service_command = mine_teleop::Json::parse(service_response.body);
-  expect(
-      service_command.value("delivery_state", "") == "browser_data_channel_pending" &&
-          service_command.value("transport", "") == "webrtc_data_channel",
-      "prepared control response lost its compatible transport or pending-delivery state");
-  expect(
-      service_command.at("command").value("gear", "") == "D" &&
-          service_command.at("command").value("steering", 0.0) == -1.0 &&
-          service_command.at("command").value("throttle", -1.0) == 0.0 &&
-          service_command.at("command").value("brake", -1.0) == 0.10,
-      "legacy service brake did not suppress throttle while preserving steering");
-
-  const auto hard_response = post_keyboard(
-      {{"right", true}, {"up", true}, {"service_brake", true}, {"hard_brake", true}});
-  expect(hard_response.status == 200, "legacy hard-brake request failed");
-  const auto hard_command = mine_teleop::Json::parse(hard_response.body);
-  expect(
-      hard_command.at("command").value("steering", 0.0) == 1.0 &&
-          hard_command.at("command").value("throttle", -1.0) == 0.0 &&
-          hard_command.at("command").value("brake", -1.0) == 0.25,
-      "legacy hard brake did not override service brake and preserve steering");
-  expect(
-      hard_command.at("command").value("seq", std::uint64_t{0}) ==
-          service_command.at("command").value("seq", std::uint64_t{0}) + 1,
-      "consecutive prepared keyboard commands did not use monotonic sequences");
-
-  const auto old_brake_response = post_keyboard({{"down", true}, {"brake", true}});
-  expect(old_brake_response.status == 200, "legacy brake alias request failed");
-  const auto old_brake_command = mine_teleop::Json::parse(old_brake_response.body);
-  expect(
-      old_brake_command.at("command").value("gear", "") == "R" &&
-          old_brake_command.at("command").value("brake", -1.0) == 0.25 &&
-          old_brake_command.at("command").value("throttle", -1.0) == 0.0,
-      "legacy brake alias was not mapped to the hard brake");
-
-  for (const auto* field : {"left", "right", "up", "down", "service_brake", "hard_brake", "brake", "estop"}) {
+    request.path = path;
+    request.body = mine_teleop::Json({
+        {"gear", "D"},
+        {"up", true},
+        {"service_brake", true},
+        {"brake", 1.0},
+    }).dump();
+    const auto response = control_app.handle(request);
     expect(
-        post_keyboard({{field, "true"}}).status == 400,
-        std::string("legacy keyboard accepted a non-boolean ") + field);
+        response.status == 410 &&
+            response.body.find("acknowledged session profile") != std::string::npos,
+        std::string("legacy specialized control endpoint did not fail closed: ") + path);
   }
   const auto prepared_status = driver.status();
   expect(
-      prepared_status.value("control_commands_prepared_total", std::uint64_t{0}) == 3 &&
+      prepared_status.value("control_commands_prepared_total", std::uint64_t{0}) == 1 &&
           prepared_status.value("last_control_prepared_at_utc_ms", std::int64_t{0}) > 0 &&
           !prepared_status.contains("last_control_sent_ms"),
       "control preparation metrics still imply browser DataChannel delivery or count rejected input");
@@ -1478,42 +1619,60 @@ void test_driver_vehicle_switch_releases_old_session() {
       prepared.at("command").value("vehicle_id", "") == "vehicle-002",
       "post-switch control command targeted the old vehicle");
   expect(
-      prepared.at("command").value("brake", -1.0) == 0.25,
-      "driver runtime did not enforce the configured ordinary-brake limit");
-  static_cast<void>(driver.set_control_limits(
-      {{"service_brake", 0.05}, {"hard_brake", 0.10}}));
-  const auto reduced = driver.send_control(
-      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
+      prepared.at("command").value("brake", -1.0) == 0.80,
+      "driver runtime treated the hard-brake key preset as the analog-pedal ceiling");
+
+  mine_teleop::HttpRequest get_legacy_limits_request;
+  get_legacy_limits_request.method = "GET";
+  get_legacy_limits_request.path = "/api/control-limits";
+  const auto get_legacy_limits_response = control_app.handle(get_legacy_limits_request);
+  expect(get_legacy_limits_response.status == 200, "legacy control-limit read compatibility failed");
+  const auto legacy_limits = mine_teleop::Json::parse(get_legacy_limits_response.body);
   expect(
-      reduced.at("command").value("brake", -1.0) == 0.10,
-      "driver runtime did not apply a reduced hard-brake limit");
-  static_cast<void>(driver.set_control_limits(
-      {{"service_brake", 0.20}, {"hard_brake", 0.50}}));
-  const auto raised = driver.send_control(
-      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
+      legacy_limits.value("service_brake", -1.0) == 0.10 &&
+          legacy_limits.value("hard_brake", -1.0) == 0.25 &&
+          legacy_limits.value("max_brake", -1.0) == 0.25,
+      "legacy control-limit read did not reflect the prepared physical-pressure profile");
+
+  mine_teleop::HttpRequest mutate_legacy_limits_request;
+  mutate_legacy_limits_request.method = "POST";
+  mutate_legacy_limits_request.path = "/api/control-limits";
+  mutate_legacy_limits_request.body = mine_teleop::Json({
+      {"service_brake", 0.20},
+      {"hard_brake", 1.0},
+  }).dump();
+  const auto mutate_legacy_limits_response = control_app.handle(mutate_legacy_limits_request);
   expect(
-      raised.at("command").value("brake", -1.0) == 0.50,
-      "driver runtime did not apply a raised hard-brake limit");
-  expect(
-      driver.control_limits().value("service_brake", -1.0) == 0.20 &&
-          driver.control_limits().value("hard_brake", -1.0) == 0.50 &&
-          driver.control_limits().value("max_brake", -1.0) == 0.50,
-      "driver runtime did not expose both brake requests for page reload");
+      mutate_legacy_limits_response.status == 410 &&
+          mutate_legacy_limits_response.body.find("/api/control-profile") != std::string::npos,
+      "legacy control-limit mutation did not fail closed with an explicit profile migration");
   expect_throws(
       [&] {
         static_cast<void>(driver.set_control_limits(
-            {{"service_brake", 0.60}, {"hard_brake", 0.50}}));
+            {{"service_brake", 0.20}, {"hard_brake", 1.0}}));
       },
-      "driver runtime accepted service_brake above hard_brake");
+      "direct legacy control-limit mutation bypassed the authenticated session profile");
   expect(
-      driver.control_limits().value("service_brake", -1.0) == 0.20 &&
-          driver.control_limits().value("hard_brake", -1.0) == 0.50,
-      "rejected brake limits partially changed the active profile");
-  const auto legacy_limit = driver.set_control_limits({{"max_brake", 0.40}});
+      driver.control_limits().value("service_brake", -1.0) == 0.10 &&
+          driver.control_limits().value("hard_brake", -1.0) == 0.25,
+      "rejected legacy control-limit mutation changed the active profile");
+
+  profile_request.body = mine_teleop::Json({
+      {"target_speed_kph", 0.0},
+      {"max_motor_torque_nm", 0.0},
+      {"max_brake_pressure_bar", 0.0},
+      {"service_brake_pressure_bar", 0.0},
+      {"hard_brake_pressure_bar", 0.0},
+  }).dump();
   expect(
-      legacy_limit.value("service_brake", -1.0) == 0.20 &&
-          legacy_limit.value("hard_brake", -1.0) == 0.40,
-      "legacy max_brake compatibility did not retain a safe service request");
+      control_app.handle(profile_request).status == 200,
+      "zero pending profile could not be prepared");
+  const auto pending_zero_profile_control = driver.send_control(
+      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
+  expect(
+      pending_zero_profile_control.at("command").value("brake", -1.0) == 0.80,
+      "unacknowledged local profile state altered the generic control wire value");
+
   const auto estop = driver.send_control(
       {{"gear", "N"},
        {"steering", 0.0},
@@ -1527,6 +1686,15 @@ void test_driver_vehicle_switch_releases_old_session() {
 
   const auto ended = driver.end_session("switch_test_complete");
   expect(!ended.value("connected", true), "explicit session end did not clear local authority");
+  const auto reset_profile = driver.control_profile();
+  expect(
+      reset_profile.value("target_speed_kph", -1.0) == 2.0 &&
+          reset_profile.value("max_motor_torque_nm", -1.0) == 300.0 &&
+          reset_profile.value("max_brake_pressure_bar", -1.0) == 100.0 &&
+          reset_profile.value("service_brake_pressure_bar", -1.0) == 10.0 &&
+          reset_profile.value("hard_brake_pressure_bar", -1.0) == 25.0 &&
+          reset_profile.value("last_prepared_seq", std::uint64_t{1}) == 0,
+      "session end retained a prepared control profile instead of YAML defaults");
   expect(driver.vehicles().value("authenticated", false), "session end unexpectedly logged out the driver");
   static_cast<void>(driver.disconnect("switch_test_logout"));
   server.stop();
@@ -3888,6 +4056,8 @@ int main() {
       {"driver_gamepad_config", test_driver_gamepad_config},
       {"vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start",
        test_vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start},
+      {"stale_control_data_channel_callbacks_are_fail_silent",
+       test_stale_control_data_channel_callbacks_are_fail_silent},
       {"driver_brake_limit_config_validation", test_driver_brake_limit_config_validation},
       {"signaling_multi_identity_config", test_signaling_multi_identity_config},
       {"credential_purpose_separation_and_stale_control_replay",

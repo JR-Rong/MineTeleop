@@ -259,7 +259,8 @@ Command command_from_chassis_control(
     // is placed in the ignored speed request.
     command.motor_speed_rpm[index] = 0.0;
     command.brake_pressure_bar[index] =
-        clamp_value(controls[index].ehb_brk_pres_req, 0.0, 409.5);
+        mine_teleop_chassis_quantize_brake_pressure_bar(
+            controls[index].ehb_brk_pres_req);
   }
   for (std::size_t axis = 0; axis < mine_teleop::vcu::kSteeringAxisCount; ++axis) {
     const auto& control = controls[axis * 2U];
@@ -849,11 +850,15 @@ class BridgeRuntime {
       std::string can_interface,
       double full_scale_motor_torque_nm,
       int control_timeout_ms,
-      SpeedControlSettings speed_control)
+      SpeedControlSettings speed_control,
+      bool physical_brake_input,
+      double max_ordinary_brake_pressure_bar)
       : can_interface_(std::move(can_interface)),
         full_scale_motor_torque_nm_(full_scale_motor_torque_nm),
         control_timeout_ms_(control_timeout_ms),
-        speed_control_(speed_control) {
+        speed_control_(speed_control),
+        physical_brake_input_(physical_brake_input),
+        max_ordinary_brake_pressure_bar_(max_ordinary_brake_pressure_bar) {
     last_feedback_.vehicle_speed_valid = 0;
     for (double& angle : last_feedback_.eps_angle) {
       angle = std::numeric_limits<double>::quiet_NaN();
@@ -895,7 +900,11 @@ class BridgeRuntime {
             ",\"speed_feedback_timeout_ms\":" +
             std::to_string(speed_control_.speed_feedback_timeout_ms) +
             ",\"hard_overspeed_margin_mps\":" +
-            std::to_string(speed_control_.hard_overspeed_margin_mps),
+            std::to_string(speed_control_.hard_overspeed_margin_mps) +
+            ",\"physical_brake_input\":" +
+            std::string(physical_brake_input_ ? "true" : "false") +
+            ",\"max_ordinary_brake_pressure_bar\":" +
+            std::to_string(max_ordinary_brake_pressure_bar_),
         true);
     logger_.command("initial", initial);
     logger_.command("emergency", emergency);
@@ -1686,12 +1695,15 @@ class BridgeRuntime {
           &speed_pid_state_,
           intent.target_speed_mps,
           measured_along_gear_mps,
-          1.0,
+          std::clamp(intent.normalized_longitudinal, 0.0, 1.0),
           dt_seconds);
     } else {
       reset_speed_pid_locked();
     }
 
+    const bool direct_pressure_brake = physical_brake_input_ && brake_requested;
+    const double chassis_control_longitudinal =
+        direct_pressure_brake ? 0.0 : normalized_output;
     const double measured_speed = speed_fresh ? feedback.speed_mps : 0.0;
     Command command;
     try {
@@ -1699,7 +1711,7 @@ class BridgeRuntime {
           measured_speed,
           intent.gear,
           intent.target_speed_mps,
-          normalized_output,
+          chassis_control_longitudinal,
           full_scale_motor_torque_nm_,
           intent.steering.data(),
           static_cast<int>(intent.steering.size()));
@@ -1711,8 +1723,19 @@ class BridgeRuntime {
       command = command_from_chassis_control(
           intent.gear,
           intent.target_speed_mps,
-          normalized_output,
+          chassis_control_longitudinal,
           full_scale_motor_torque_nm_);
+      if (physical_brake_input_) {
+        const double requested_pressure_bar = direct_pressure_brake
+            ? mine_teleop_chassis_quantize_brake_pressure_bar(
+                  -intent.normalized_longitudinal *
+                  max_ordinary_brake_pressure_bar_)
+            : 0.0;
+        if (direct_pressure_brake) {
+          command.motor_torque_nm.fill(0.0);
+        }
+        command.brake_pressure_bar.fill(requested_pressure_bar);
+      }
     } catch (const std::exception& error) {
       latch_chassis_control_fault_locked(error.what());
       return;
@@ -2216,6 +2239,8 @@ class BridgeRuntime {
   double full_scale_motor_torque_nm_;
   int control_timeout_ms_;
   SpeedControlSettings speed_control_;
+  bool physical_brake_input_{false};
+  double max_ordinary_brake_pressure_bar_{0.0};
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   SocketCan socket_;
@@ -2268,7 +2293,9 @@ int open_bridge_locked(
     const char* can_interface,
     double full_scale_motor_torque_nm,
     int control_timeout_ms,
-    SpeedControlSettings speed_control) {
+    SpeedControlSettings speed_control,
+    bool physical_brake_input,
+    double max_ordinary_brake_pressure_bar) {
   if (can_interface == nullptr || can_interface[0] == '\0' || g_runtime) {
     emit_bridge_diagnostic(
         "vehicle_vcu_start_failed",
@@ -2309,8 +2336,11 @@ int open_bridge_locked(
         "Check ChassisControl input ranges and units.");
     return -2;
   }
-  const auto emergency = command_from_chassis_control(
+  auto emergency = command_from_chassis_control(
       1, 0.0, -8.0, full_scale_motor_torque_nm);
+  emergency.motor_torque_nm.fill(0.0);
+  emergency.brake_pressure_bar.fill(
+      MINE_TELEOP_CHASSIS_MAX_EMERGENCY_BRAKE_PRESSURE_BAR);
 
   if (!UpdateVehicleState(make_vehicle_state(
           0.0,
@@ -2335,7 +2365,9 @@ int open_bridge_locked(
       can_interface,
       full_scale_motor_torque_nm,
       control_timeout_ms,
-      speed_control);
+      speed_control,
+      physical_brake_input,
+      max_ordinary_brake_pressure_bar);
   const int start_result = runtime->start(initial, emergency);
   if (start_result != 0) return start_result;
   g_runtime = std::move(runtime);
@@ -2346,14 +2378,18 @@ int open_bridge(
     const char* can_interface,
     double full_scale_motor_torque_nm,
     int control_timeout_ms,
-    SpeedControlSettings speed_control) noexcept {
+    SpeedControlSettings speed_control,
+    bool physical_brake_input,
+    double max_ordinary_brake_pressure_bar) noexcept {
   try {
     std::lock_guard<std::mutex> lock(g_api_mutex);
     return open_bridge_locked(
         can_interface,
         full_scale_motor_torque_nm,
         control_timeout_ms,
-        speed_control);
+        speed_control,
+        physical_brake_input,
+        max_ordinary_brake_pressure_bar);
   } catch (const std::exception& error) {
     emit_bridge_diagnostic(
         "vehicle_vcu_start_failed",
@@ -2375,10 +2411,14 @@ int open_bridge(
 
 }  // namespace
 
-extern "C" std::uint32_t mine_teleop_chassis_abi_version() { return 2U; }
+extern "C" std::uint32_t mine_teleop_chassis_abi_version() { return 3U; }
 
 extern "C" std::uint32_t mine_teleop_chassis_open_config_v2_size() {
   return static_cast<std::uint32_t>(sizeof(MineTeleopChassisOpenConfigV2));
+}
+
+extern "C" std::uint32_t mine_teleop_chassis_open_config_v3_size() {
+  return static_cast<std::uint32_t>(sizeof(MineTeleopChassisOpenConfigV3));
 }
 
 extern "C" int mine_teleop_chassis_open(const char* can_interface) {
@@ -2388,7 +2428,9 @@ extern "C" int mine_teleop_chassis_open(const char* can_interface) {
       can_interface,
       MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM,
       MINE_TELEOP_CHASSIS_DEFAULT_CONTROL_TIMEOUT_MS,
-      SpeedControlSettings{});
+      SpeedControlSettings{},
+      false,
+      0.0);
 }
 
 extern "C" int mine_teleop_chassis_open_v1(
@@ -2404,14 +2446,16 @@ extern "C" int mine_teleop_chassis_open_v1(
         "vcu_open_config_invalid",
         "bridge_open_config",
         "open_v1 config size or full-scale motor torque is invalid",
-        "Provide the original three-field V1 struct and torque in [0, 165] Nm.");
+        "Provide the original three-field V1 struct and torque in [0, 640.0] Nm.");
     return -1;
   }
   return open_bridge(
       config->can_interface,
       config->full_scale_motor_torque_nm,
       MINE_TELEOP_CHASSIS_DEFAULT_CONTROL_TIMEOUT_MS,
-      SpeedControlSettings{});
+      SpeedControlSettings{},
+      false,
+      0.0);
 }
 
 extern "C" int mine_teleop_chassis_open_v2(
@@ -2463,7 +2507,67 @@ extern "C" int mine_teleop_chassis_open_v2(
       config->can_interface,
       config->full_scale_motor_torque_nm,
       config->control_timeout_ms,
-      speed_control);
+      speed_control,
+      false,
+      0.0);
+}
+
+extern "C" int mine_teleop_chassis_open_v3(
+    const MineTeleopChassisOpenConfigV3* config) {
+  const MineTeleopChassisSpeedPidConfig pid = config == nullptr
+      ? MineTeleopChassisSpeedPidConfig{}
+      : MineTeleopChassisSpeedPidConfig{
+            config->speed_pid_kp,
+            config->speed_pid_ki,
+            config->speed_pid_kd,
+            config->speed_pid_derivative_filter_tau_ms,
+            config->speed_pid_max_dt_ms};
+  if (config == nullptr ||
+      config->struct_size != sizeof(MineTeleopChassisOpenConfigV3) ||
+      !std::isfinite(config->full_scale_motor_torque_nm) ||
+      config->full_scale_motor_torque_nm < 0.0 ||
+      config->full_scale_motor_torque_nm >
+          MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM ||
+      !std::isfinite(config->hard_speed_limit_mps) ||
+      config->hard_speed_limit_mps < 0.0 ||
+      config->hard_speed_limit_mps > 20.0 ||
+      !mine_teleop_chassis_control_timeout_is_valid(config->control_timeout_ms) ||
+      config->speed_feedback_timeout_ms <
+          MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS ||
+      config->speed_feedback_timeout_ms >
+          MINE_TELEOP_CHASSIS_MAX_SPEED_FEEDBACK_TIMEOUT_MS ||
+      config->speed_feedback_timeout_ms > config->control_timeout_ms ||
+      !mine_teleop_chassis_speed_pid_config_is_valid(&pid) ||
+      !std::isfinite(config->hard_overspeed_margin_mps) ||
+      config->hard_overspeed_margin_mps <= 0.0 ||
+      config->hard_overspeed_margin_mps >
+          MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS ||
+      !std::isfinite(config->max_ordinary_brake_pressure_bar) ||
+      config->max_ordinary_brake_pressure_bar < 0.0 ||
+      config->max_ordinary_brake_pressure_bar >
+          MINE_TELEOP_CHASSIS_MAX_ORDINARY_BRAKE_PRESSURE_BAR) {
+    emit_bridge_diagnostic(
+        "vehicle_vcu_start_failed",
+        "vcu_open_config_invalid",
+        "bridge_open_config",
+        "open_v3 config size, torque, pressure, timeout, PID, or overspeed margin is invalid",
+        "Provide the current V3 struct with physical ordinary-brake pressure inside documented bounds.");
+    return -1;
+  }
+  SpeedControlSettings speed_control;
+  speed_control.enabled = true;
+  speed_control.hard_speed_limit_mps = config->hard_speed_limit_mps;
+  speed_control.speed_feedback_timeout_ms = config->speed_feedback_timeout_ms;
+  speed_control.pid = pid;
+  speed_control.hard_overspeed_margin_mps =
+      config->hard_overspeed_margin_mps;
+  return open_bridge(
+      config->can_interface,
+      config->full_scale_motor_torque_nm,
+      config->control_timeout_ms,
+      speed_control,
+      true,
+      config->max_ordinary_brake_pressure_bar);
 }
 
 extern "C" int mine_teleop_chassis_apply_state(

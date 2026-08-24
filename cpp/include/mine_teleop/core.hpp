@@ -20,6 +20,14 @@ using Json = nlohmann::json;
 
 inline constexpr int kProtocolVersion = 1;
 inline constexpr std::size_t kMaxVehicleTelemetryHistory = 1024;
+inline constexpr double kDefaultFullScaleMotorTorqueNm = 300.0;
+inline constexpr double kMaxFullScaleMotorTorqueNm = 640.0;
+inline constexpr double kDefaultMaxBrakePressureBar = 100.0;
+inline constexpr double kMaxOrdinaryBrakePressureBar = 327.6;
+inline constexpr double kMaxEmergencyBrakePressureBar = 409.5;
+inline constexpr int kSessionControlProfileMaxAgeMs = 2000;
+static_assert(kMaxFullScaleMotorTorqueNm <= 800.0 * 0.8);
+static_assert(kMaxFullScaleMotorTorqueNm <= 838.3 * 0.8);
 
 std::int64_t now_ms();
 
@@ -69,12 +77,62 @@ struct ControlCommand {
   static ControlCommand from_json(const Json& value);
 };
 
+struct SessionControlProfile {
+  double target_speed_kph{0.0};
+  double max_motor_torque_nm{0.0};
+  double max_brake_pressure_bar{0.0};
+  double service_brake_pressure_bar{0.0};
+  double hard_brake_pressure_bar{0.0};
+
+  void validate() const;
+  [[nodiscard]] Json to_json() const;
+  static SessionControlProfile from_json(const Json& value);
+  bool operator==(const SessionControlProfile&) const = default;
+};
+
+struct SessionControlProfileRequest {
+  int protocol_version{kProtocolVersion};
+  std::string vehicle_id;
+  std::string driver_id;
+  std::string session_id;
+  std::uint64_t seq{0};
+  std::int64_t sent_at_utc_ms{0};
+  std::string control_token;
+  SessionControlProfile profile;
+
+  void validate() const;
+  [[nodiscard]] Json to_json() const;
+  static SessionControlProfileRequest from_json(const Json& value);
+  bool operator==(const SessionControlProfileRequest&) const = default;
+};
+
+struct SessionControlProfileResult {
+  int protocol_version{kProtocolVersion};
+  std::string vehicle_id;
+  std::string driver_id;
+  std::string session_id;
+  std::uint64_t seq{0};
+  std::int64_t sent_at_utc_ms{0};
+  bool accepted{false};
+  bool idempotent{false};
+  std::string reason;
+  std::optional<SessionControlProfile> effective_profile;
+
+  void validate() const;
+  [[nodiscard]] Json to_json() const;
+  static SessionControlProfileResult from_json(const Json& value);
+  bool operator==(const SessionControlProfileResult&) const = default;
+};
+
 [[nodiscard]] double dynamic_adapter_target_speed_mps(
     const ControlCommand& command,
     double max_speed_mps);
 
 [[nodiscard]] double dynamic_adapter_target_acceleration(
-    const ControlCommand& command);
+    const ControlCommand& command,
+    double traction_ceiling = 1.0,
+    double session_max_brake_pressure_bar = 1.0,
+    double vehicle_max_brake_pressure_bar = 1.0);
 
 struct ReceiveResult {
   bool accepted{false};
@@ -146,6 +204,7 @@ struct ControlOutput {
   double throttle{0.0};
   double brake{0.0};
   bool estop{false};
+  bool full_emergency_brake{false};
 };
 
 class SafetyStateMachine {
@@ -273,7 +332,7 @@ struct FieldSafetyConfig {
   std::string commissioning_mode{"bench"};
   double max_speed_kph{40.0};
   double max_throttle{1.0};
-  double full_scale_motor_torque_nm{41.25};
+  double full_scale_motor_torque_nm{kDefaultFullScaleMotorTorqueNm};
   int speed_feedback_timeout_ms{200};
   double speed_pid_kp{1.0};
   double speed_pid_ki{0.2};
@@ -281,7 +340,7 @@ struct FieldSafetyConfig {
   double speed_pid_derivative_filter_tau_ms{100.0};
   int speed_pid_max_dt_ms{100};
   double hard_overspeed_margin_kph{3.6};
-  double max_brake{1.0};
+  double max_brake_pressure_bar{kDefaultMaxBrakePressureBar};
   double max_steering_angle_deg{30.0};
   bool require_can_feedback_before_control{true};
   bool require_local_estop_reset{true};
@@ -396,6 +455,11 @@ class VehicleAdapter {
   virtual ~VehicleAdapter() = default;
   virtual void open() = 0;
   virtual void close() = 0;
+  virtual void set_session_control_limits(
+      double max_motor_torque_nm,
+      double max_brake_pressure_bar) = 0;
+  [[nodiscard]] virtual double session_motor_torque_limit_nm() const = 0;
+  [[nodiscard]] virtual double session_brake_pressure_limit_bar() const = 0;
   virtual void apply_control(const ControlCommand& command) = 0;
   virtual void apply_safe_stop(const ControlOutput& output) = 0;
   virtual bool poll_feedback() = 0;
@@ -411,6 +475,11 @@ class MockVehicleAdapter final : public VehicleAdapter {
  public:
   void open() override;
   void close() override;
+  void set_session_control_limits(
+      double max_motor_torque_nm,
+      double max_brake_pressure_bar) override;
+  [[nodiscard]] double session_motor_torque_limit_nm() const override;
+  [[nodiscard]] double session_brake_pressure_limit_bar() const override;
   void apply_control(const ControlCommand& command) override;
   void apply_safe_stop(const ControlOutput& output) override;
   bool poll_feedback() override;
@@ -426,6 +495,8 @@ class MockVehicleAdapter final : public VehicleAdapter {
   std::optional<ControlOutput> latest_output_;
   std::uint64_t applied_command_count_{0};
   std::uint64_t safe_stop_count_{0};
+  double session_motor_torque_limit_nm_{0.0};
+  double session_brake_pressure_limit_bar_{0.0};
 };
 
 class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
@@ -437,6 +508,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
       int can_tx_queue_length,
       double max_speed_mps,
       double full_scale_motor_torque_nm,
+      double max_ordinary_brake_pressure_bar,
       int control_timeout_ms,
       int speed_feedback_timeout_ms,
       double speed_pid_kp,
@@ -449,6 +521,11 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
 
   void open() override;
   void close() override;
+  void set_session_control_limits(
+      double max_motor_torque_nm,
+      double max_brake_pressure_bar) override;
+  [[nodiscard]] double session_motor_torque_limit_nm() const override;
+  [[nodiscard]] double session_brake_pressure_limit_bar() const override;
   void apply_control(const ControlCommand& command) override;
   void apply_safe_stop(const ControlOutput& output) override;
   bool poll_feedback() override;
@@ -469,6 +546,9 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   int can_tx_queue_length_;
   double max_speed_mps_;
   double full_scale_motor_torque_nm_;
+  double max_ordinary_brake_pressure_bar_;
+  double session_motor_torque_limit_nm_;
+  double session_brake_pressure_limit_bar_;
   int control_timeout_ms_;
   int speed_feedback_timeout_ms_;
   double speed_pid_kp_;
@@ -484,7 +564,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   std::uint64_t safe_stop_count_{0};
   std::string last_error_;
 
-  using OpenV2Fn = int (*)(const void*);
+  using OpenV3Fn = int (*)(const void*);
   using ApplyFn = int (*)(int, double, double, const double*, int);
   using StopFn = int (*)();
   using HandshakeFn = int (*)();
@@ -493,7 +573,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   using ReadFn = int (*)(void*);
   using ReadCanFeedbackV1Fn = int (*)(void*);
   using CloseFn = int (*)();
-  OpenV2Fn open_v2_fn_{nullptr};
+  OpenV3Fn open_v3_fn_{nullptr};
   ApplyFn apply_fn_{nullptr};
   StopFn stop_fn_{nullptr};
   HandshakeFn request_handshake_fn_{nullptr};
@@ -520,6 +600,9 @@ class VehicleControlService {
 
   void start(std::int64_t now_ms);
   ReceiveResult receive_command(const ControlCommand& command, std::int64_t now_ms);
+  SessionControlProfileResult receive_session_profile(
+      const SessionControlProfileRequest& request,
+      std::int64_t now_ms);
   void tick(std::int64_t now_ms);
   bool request_vcu_handshake();
   bool disconnect_vcu_handshake();
@@ -532,29 +615,43 @@ class VehicleControlService {
     return adapter_->vcu_handshake_status();
   }
   [[nodiscard]] Json control_limits() const;
+  [[nodiscard]] Json session_control_profile() const;
   [[nodiscard]] const std::deque<Json>& telemetry_history() const { return telemetry_history_; }
   [[nodiscard]] Json summary() const;
 
  private:
   [[nodiscard]] bool refresh_adapter_safe_stop_state() noexcept;
+  void clear_session_profile() noexcept;
+  [[nodiscard]] SessionControlProfileResult profile_result(
+      const SessionControlProfileRequest& request,
+      std::int64_t now_ms,
+      bool accepted,
+      bool idempotent,
+      std::string reason) const;
   [[nodiscard]] Json build_telemetry(std::int64_t now_ms);
 
   std::string vehicle_id_;
   std::string driver_id_;
   std::string session_id_;
+  std::string control_token_;
+  std::string commissioning_mode_;
   ControlReceiver receiver_;
   SafetyStateMachine safety_;
   std::unique_ptr<VehicleAdapter> adapter_;
   bool require_feedback_before_control_{true};
   double max_speed_kph_{40.0};
   double max_throttle_{1.0};
-  double full_scale_motor_torque_nm_{41.25};
-  double max_brake_{1.0};
+  double full_scale_motor_torque_nm_{kDefaultFullScaleMotorTorqueNm};
+  double max_brake_pressure_bar_{kDefaultMaxBrakePressureBar};
   double max_steering_angle_deg_{30.0};
   int telemetry_interval_ms_;
   std::optional<std::int64_t> last_telemetry_ms_;
   std::uint64_t telemetry_sequence_{0};
   std::deque<Json> telemetry_history_;
+  std::optional<SessionControlProfile> active_session_profile_;
+  std::optional<SessionControlProfileRequest> last_session_profile_request_;
+  std::optional<SessionControlProfileResult> last_session_profile_result_;
+  std::optional<ControlCommand> last_effective_command_;
   bool adapter_safe_stop_active_{false};
   bool started_{false};
 };

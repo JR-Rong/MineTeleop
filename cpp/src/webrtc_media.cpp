@@ -862,11 +862,47 @@ struct VehicleMediaRuntime::Impl {
     }
     try {
       const auto message = Json::parse(data);
+      if (message.value("type", "") == "session_control_profile") {
+        const auto request = SessionControlProfileRequest::from_json(message);
+        std::lock_guard lock(control_mutex);
+        if (control_channel != channel) return;
+        SessionControlProfileResult result;
+        if (stop_requested || control_inhibited || !control_service_started ||
+            !control_service || !control_link_open) {
+          result.protocol_version = request.protocol_version;
+          result.vehicle_id = request.vehicle_id;
+          result.driver_id = request.driver_id;
+          result.session_id = request.session_id;
+          result.seq = request.seq;
+          result.sent_at_utc_ms = signaling.now_ms();
+          result.accepted = false;
+          result.reason = "driver_not_connected";
+        } else {
+          result = control_service->receive_session_profile(
+              request,
+              signaling.now_ms());
+        }
+        send_session_control_profile_status_locked(result);
+        std::cout << Json({
+                         {"event", "vehicle_session_control_profile_received"},
+                         {"event_at_utc_ms", signaling.now_ms()},
+                         {"vehicle_id", config.vehicle_id},
+                         {"driver_id", signaling.driver_id()},
+                         {"session_id", signaling.session_id()},
+                         {"request_seq", request.seq},
+                         {"accepted", result.accepted},
+                         {"idempotent", result.idempotent},
+                         {"reason", result.reason},
+                     }).dump()
+                  << '\n';
+        return;
+      }
       if (message.value("event", "") == "vcu_handshake_command") {
         const auto action = message.value("action", "");
         std::lock_guard lock(control_mutex);
-        if (stop_requested || control_inhibited || control_channel != channel ||
-            !control_service_started || !control_service || !control_link_open) {
+        if (control_channel != channel) return;
+        if (stop_requested || control_inhibited || !control_service_started ||
+            !control_service || !control_link_open) {
           send_vcu_handshake_status_locked("driver_not_connected");
           return;
         }
@@ -1010,12 +1046,30 @@ struct VehicleMediaRuntime::Impl {
     last_vehicle_telemetry_seq = sequence;
   }
 
+  void send_session_control_profile_status_locked(
+      const SessionControlProfileResult& result) {
+    if (control_channel == nullptr || !control_link_open) return;
+    auto message = result.to_json();
+    message["event"] = "session_control_profile_status";
+    message["control_status_seq"] = ++control_status_seq;
+    if (control_service_started && control_service) {
+      message["hard_limits"] = control_service->control_limits();
+      message["session_control_profile"] =
+          control_service->session_control_profile();
+    }
+    const auto payload = message.dump();
+    gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
+  }
+
   [[nodiscard]] Json configured_control_limits() const {
     return {
         {"max_speed_kph", config.field_safety.max_speed_kph},
         {"max_throttle", config.field_safety.max_throttle},
+        {"max_target_speed_kph",
+         config.field_safety.max_speed_kph * config.field_safety.max_throttle},
         {"full_scale_motor_torque_nm", config.field_safety.full_scale_motor_torque_nm},
-        {"max_brake", config.field_safety.max_brake},
+        {"max_brake_pressure_bar",
+         config.field_safety.max_brake_pressure_bar},
         {"max_steering_angle_deg", config.field_safety.max_steering_angle_deg},
     };
   }

@@ -35,6 +35,211 @@
     return Number.isFinite(number) ? number : fallback;
   }
 
+  function requireFiniteRange(value, minimum, maximum, name) {
+    if (typeof value !== 'number' || !Number.isFinite(value) ||
+        value < minimum || value > maximum) {
+      throw new TypeError(`${name} must be finite and in [${minimum}, ${maximum}]`);
+    }
+    return value;
+  }
+
+  function normalizeControlProfile(value) {
+    if (!value || typeof value !== 'object') throw new TypeError('control profile must be an object');
+    const profile = {
+      target_speed_kph: requireFiniteRange(value.target_speed_kph, 0, 72, 'target_speed_kph'),
+      max_motor_torque_nm: requireFiniteRange(
+          value.max_motor_torque_nm, 0, 640.0, 'max_motor_torque_nm'),
+      max_brake_pressure_bar: requireFiniteRange(
+          value.max_brake_pressure_bar, 0, 327.6, 'max_brake_pressure_bar'),
+      service_brake_pressure_bar: requireFiniteRange(
+          value.service_brake_pressure_bar, 0, 327.6, 'service_brake_pressure_bar'),
+      hard_brake_pressure_bar: requireFiniteRange(
+          value.hard_brake_pressure_bar, 0, 327.6, 'hard_brake_pressure_bar'),
+    };
+    if (profile.service_brake_pressure_bar > profile.hard_brake_pressure_bar ||
+        profile.hard_brake_pressure_bar > profile.max_brake_pressure_bar) {
+      throw new TypeError(
+          'brake pressures must satisfy service_brake_pressure_bar <= hard_brake_pressure_bar <= max_brake_pressure_bar');
+    }
+    return profile;
+  }
+
+  function normalizeVehicleHardLimits(value) {
+    if (!value || typeof value !== 'object') throw new TypeError('vehicle hard limits must be an object');
+    const maxSpeedKph = requireFiniteRange(value.max_speed_kph, 0, 72, 'max_speed_kph');
+    const maxThrottle = requireFiniteRange(value.max_throttle, 0, 1, 'max_throttle');
+    const computedTargetSpeedKph = maxSpeedKph * maxThrottle;
+    const explicitTargetSpeedKph = typeof value.max_target_speed_kph === 'number'
+        ? requireFiniteRange(value.max_target_speed_kph, 0, 72, 'max_target_speed_kph')
+        : computedTargetSpeedKph;
+    return {
+      max_speed_kph: maxSpeedKph,
+      max_throttle: maxThrottle,
+      max_target_speed_kph: Math.min(
+          maxSpeedKph, computedTargetSpeedKph, explicitTargetSpeedKph),
+      full_scale_motor_torque_nm: requireFiniteRange(
+          value.full_scale_motor_torque_nm, 0, 640.0, 'full_scale_motor_torque_nm'),
+      max_brake_pressure_bar: requireFiniteRange(
+          value.max_brake_pressure_bar, 0, 327.6, 'max_brake_pressure_bar'),
+    };
+  }
+
+  function mergeControlProfileWithHardLimits(requestedValue, hardLimitValue) {
+    const requested = normalizeControlProfile(requestedValue);
+    const hard = normalizeVehicleHardLimits(hardLimitValue);
+    const maxBrake = Math.min(
+        requested.max_brake_pressure_bar, hard.max_brake_pressure_bar);
+    return {
+      target_speed_kph: Math.min(requested.target_speed_kph, hard.max_target_speed_kph),
+      max_motor_torque_nm: Math.min(
+          requested.max_motor_torque_nm, hard.full_scale_motor_torque_nm),
+      max_brake_pressure_bar: maxBrake,
+      service_brake_pressure_bar: Math.min(requested.service_brake_pressure_bar, maxBrake),
+      hard_brake_pressure_bar: Math.min(requested.hard_brake_pressure_bar, maxBrake),
+    };
+  }
+
+  function controlProfileThrottleLimit(profileValue, hardLimitValue) {
+    const profile = normalizeControlProfile(profileValue);
+    const hard = normalizeVehicleHardLimits(hardLimitValue);
+    if (hard.max_speed_kph === 0) return 0;
+    return clamp(profile.target_speed_kph / hard.max_speed_kph, 0, hard.max_throttle);
+  }
+
+  function controlProfilesEqual(leftValue, rightValue) {
+    let left;
+    let right;
+    try {
+      left = normalizeControlProfile(leftValue);
+      right = normalizeControlProfile(rightValue);
+    } catch (_) {
+      return false;
+    }
+    return left.target_speed_kph === right.target_speed_kph &&
+        left.max_motor_torque_nm === right.max_motor_torque_nm &&
+        left.max_brake_pressure_bar === right.max_brake_pressure_bar &&
+        left.service_brake_pressure_bar === right.service_brake_pressure_bar &&
+        left.hard_brake_pressure_bar === right.hard_brake_pressure_bar;
+  }
+
+  function reduceControlProfileStatus(stateValue, statusValue) {
+    const state = Object.assign({
+      requestedProfile: null,
+      pendingRequestSeq: 0,
+      effectiveProfile: null,
+      effectiveRequestSeq: 0,
+      acknowledged: false,
+      reason: '',
+    }, stateValue || {});
+    const status = statusValue && typeof statusValue === 'object' ? statusValue : {};
+    const requestSeq = status.last_request_seq;
+    const pendingRequestSeq = state.pendingRequestSeq;
+    const effectiveRequestSeq = state.effectiveRequestSeq;
+    if (Number.isSafeInteger(pendingRequestSeq) && pendingRequestSeq > 0) {
+      if (!Number.isSafeInteger(requestSeq) || requestSeq !== pendingRequestSeq) {
+        return {...state, matched: false, invalidated: false};
+      }
+      if (status.accepted !== true || status.active !== true) {
+        return {
+          ...state,
+          pendingRequestSeq: 0,
+          effectiveProfile: null,
+          effectiveRequestSeq: 0,
+          acknowledged: false,
+          reason: String(status.reason || 'profile_rejected'),
+          matched: true,
+          invalidated: true,
+        };
+      }
+      let effectiveProfile;
+      try {
+        effectiveProfile = normalizeControlProfile(status.effective_profile);
+      } catch (error) {
+        return {
+          ...state,
+          pendingRequestSeq: 0,
+          effectiveProfile: null,
+          effectiveRequestSeq: 0,
+          acknowledged: false,
+          reason: `invalid_effective_profile: ${error.message}`,
+          matched: true,
+          invalidated: true,
+        };
+      }
+      if (!controlProfilesEqual(effectiveProfile, state.requestedProfile)) {
+        return {
+          ...state,
+          pendingRequestSeq: 0,
+          effectiveProfile: null,
+          effectiveRequestSeq: 0,
+          acknowledged: false,
+          reason: 'effective_profile_mismatch',
+          matched: true,
+          invalidated: true,
+        };
+      }
+      return {
+        ...state,
+        pendingRequestSeq: 0,
+        effectiveProfile,
+        effectiveRequestSeq: requestSeq,
+        acknowledged: true,
+        reason: String(status.reason || 'accepted'),
+        matched: true,
+        invalidated: false,
+      };
+    }
+
+    if (state.acknowledged === true) {
+      if (status.accepted !== true || status.active !== true ||
+          !Number.isSafeInteger(requestSeq) ||
+          requestSeq !== effectiveRequestSeq) {
+        return {
+          ...state,
+          effectiveProfile: null,
+          effectiveRequestSeq: 0,
+          acknowledged: false,
+          reason: String(status.reason || 'profile_inactive_or_replaced'),
+          matched: true,
+          invalidated: true,
+        };
+      }
+      let effectiveProfile;
+      try {
+        effectiveProfile = normalizeControlProfile(status.effective_profile);
+      } catch (error) {
+        return {
+          ...state,
+          effectiveProfile: null,
+          effectiveRequestSeq: 0,
+          acknowledged: false,
+          reason: `invalid_effective_profile: ${error.message}`,
+          matched: true,
+          invalidated: true,
+        };
+      }
+      if (!controlProfilesEqual(effectiveProfile, state.effectiveProfile)) {
+        return {
+          ...state,
+          effectiveProfile: null,
+          effectiveRequestSeq: 0,
+          acknowledged: false,
+          reason: 'effective_profile_changed',
+          matched: true,
+          invalidated: true,
+        };
+      }
+      return {
+        ...state,
+        effectiveProfile,
+        reason: String(status.reason || state.reason || 'accepted'),
+        matched: true,
+        invalidated: false,
+      };
+    }
+    return {...state, matched: false, invalidated: false};
+  }
+
   function requireKeySet(value, name) {
     if (!(value instanceof Set)) throw new TypeError(`${name} must be a Set`);
   }
@@ -166,8 +371,16 @@
     const pad = gamepad || {};
     const activeLimits = limits || {};
     const maxThrottle = clamp(finiteNumber(activeLimits.maxThrottle), 0, 1);
-    const hardBrake = clamp(finiteNumber(activeLimits.hardBrake), 0, 1);
-    const serviceBrake = clamp(finiteNumber(activeLimits.serviceBrake), 0, hardBrake);
+    const maxBrakePressureBar = clamp(
+        finiteNumber(activeLimits.maxBrakePressureBar), 0, 327.6);
+    const hardBrakePressureBar = clamp(
+        finiteNumber(activeLimits.hardBrakePressureBar), 0, maxBrakePressureBar);
+    const serviceBrakePressureBar = clamp(
+        finiteNumber(activeLimits.serviceBrakePressureBar), 0, hardBrakePressureBar);
+    const hardBrake = maxBrakePressureBar > 0
+        ? hardBrakePressureBar / maxBrakePressureBar : 0;
+    const serviceBrake = maxBrakePressureBar > 0
+        ? serviceBrakePressureBar / maxBrakePressureBar : 0;
     const maxSteeringDeg = Math.max(0, finiteNumber(activeLimits.maxSteeringDeg));
     const steeringScale = Math.max(Number.EPSILON, finiteNumber(steeringFullScaleDeg, 1));
     const gear = ['N', 'R', 'D'].includes(selectedGear) ? selectedGear : 'N';
@@ -182,16 +395,16 @@
     if (gear === 'N') throttle = 0;
 
     const gamepadBrake = clamp(finiteNumber(pad.brake), 0, 1);
-    let brake = gamepadBrake * hardBrake;
+    let brake = maxBrakePressureBar > 0 ? gamepadBrake : 0;
     if (state.service_brake) brake = Math.max(brake, serviceBrake);
-    if (state.hard_brake) brake = hardBrake;
+    if (state.hard_brake) brake = Math.max(brake, hardBrake);
     if (state.service_brake || state.hard_brake || gamepadBrake > 0) throttle = 0;
 
     return {
       gear,
       steering: clamp(steering, -1, 1) * (maxSteeringDeg / steeringScale),
       throttle: throttle * maxThrottle,
-      brake: clamp(brake, 0, hardBrake),
+      brake: clamp(brake, 0, maxBrakePressureBar > 0 ? 1 : 0),
       estop: Boolean(estop),
     };
   }
@@ -365,6 +578,11 @@
     allowsGearChange,
     deriveGearSelection,
     deriveControl,
+    normalizeControlProfile,
+    normalizeVehicleHardLimits,
+    mergeControlProfileWithHardLimits,
+    controlProfileThrottleLimit,
+    reduceControlProfileStatus,
     reduceGamepadNeutralInterlock,
     reduceStatusSequence,
     deriveEstopPresentation,

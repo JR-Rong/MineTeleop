@@ -28,6 +28,8 @@ std::mutex g_vendor_mutex;
 std::vector<ControlInfo> g_controls(8);
 std::vector<VehicleState> g_vehicle_states;
 std::set<std::thread::id> g_vendor_update_threads;
+double g_forced_vendor_motor_torque_nm = -1.0;
+double g_forced_vendor_brake_pressure_bar = -1.0;
 
 bool Initialize(const VehicleParam&, const std::string&) {
   ++g_initialize_calls;
@@ -44,15 +46,20 @@ bool UpdateVehicleState(const VehicleState& state) {
   g_vendor_update_threads.insert(std::this_thread::get_id());
   const double normalized = state.target_acceleration[0];
   const double direction = state.target_gear == 2 ? -1.0 : 1.0;
-  for (auto& control : g_controls) {
+  for (std::size_t index = 0; index < g_controls.size(); ++index) {
+    auto& control = g_controls[index];
     control.wheel_torque = normalized > 0.0
-        ? direction * normalized * 41.25
+        ? direction * (g_forced_vendor_motor_torque_nm >= 0.0
+              ? g_forced_vendor_motor_torque_nm
+              : normalized * 300.0)
         : 0.0;
     control.wheel_speed = 0.0;
-    control.ehb_brk_pres_req = normalized < 0.0
-        ? std::min(-normalized * 10.0, 409.5)
-        : 0.0;
-    control.eps_ang_req = 0.0;
+    control.ehb_brk_pres_req = g_forced_vendor_brake_pressure_bar >= 0.0
+        ? g_forced_vendor_brake_pressure_bar
+        : (normalized < 0.0
+               ? std::min(-normalized * 10.0, 409.5)
+               : 0.0);
+    control.eps_ang_req = state.target_steering_angle[index];
     control.eps_ang_spd_req = 0.0;
   }
   return true;
@@ -82,6 +89,26 @@ MineTeleopChassisOpenConfigV2 valid_v2_config(
       100.0,
       100,
       1.0,
+  };
+}
+
+MineTeleopChassisOpenConfigV3 valid_v3_config(
+    const char* can_interface,
+    int control_timeout_ms = 800) {
+  return {
+      sizeof(MineTeleopChassisOpenConfigV3),
+      can_interface,
+      300.0,
+      10.0,
+      control_timeout_ms,
+      200,
+      1.0,
+      0.2,
+      0.0,
+      100.0,
+      100,
+      1.0,
+      100.0,
   };
 }
 
@@ -303,6 +330,34 @@ const can_frame& last_frame_with_id(
   return *found;
 }
 
+void expect_all_motor_torque_raw(
+    const std::vector<can_frame>& frames,
+    std::uint64_t expected_raw,
+    const std::string& context) {
+  for (std::uint32_t index = 0; index < 8; ++index) {
+    expect(
+        can_signal(
+            last_frame_with_id(frames, 0x18F0D0F5U + (index << 16U)),
+            8,
+            14) == expected_raw,
+        context + " motor channel " + std::to_string(index) + " mismatch");
+  }
+}
+
+void expect_all_brake_pressure_raw(
+    const std::vector<can_frame>& frames,
+    std::uint64_t expected_raw,
+    const std::string& context) {
+  for (const auto id : {0x18FFD0F5U, 0x18FAD0F5U}) {
+    const auto& frame = last_frame_with_id(frames, id);
+    for (unsigned local = 0; local < 4; ++local) {
+      expect(
+          can_signal(frame, local * 16U + 4U, 12) == expected_raw,
+          context + " brake channel mismatch");
+    }
+  }
+}
+
 std::vector<Json> read_json_lines(const std::filesystem::path& path) {
   std::ifstream input(path);
   expect(static_cast<bool>(input), "VCU JSONL smoke log was not created");
@@ -333,10 +388,12 @@ std::size_t count_logged_events(
 int main() {
   try {
     expect(
-        mine_teleop_chassis_abi_version() == 2U &&
+        mine_teleop_chassis_abi_version() == 3U &&
             mine_teleop_chassis_open_config_v2_size() ==
-                sizeof(MineTeleopChassisOpenConfigV2),
-        "bridge ABI version or V2 open-config size query is inconsistent");
+                sizeof(MineTeleopChassisOpenConfigV2) &&
+            mine_teleop_chassis_open_config_v3_size() ==
+                sizeof(MineTeleopChassisOpenConfigV3),
+        "bridge ABI version or versioned open-config size query is inconsistent");
     std::ostringstream diagnostics;
     auto* previous = std::cerr.rdbuf(diagnostics.rdbuf());
     const int invalid_result = mine_teleop_chassis_open("");
@@ -374,7 +431,7 @@ int main() {
     expect(
         mine_teleop_chassis_open_v1(&invalid_config) == -1,
         "negative full-scale torque was accepted");
-    invalid_config.full_scale_motor_torque_nm = 165.1;
+    invalid_config.full_scale_motor_torque_nm = 640.1;
     expect(
         mine_teleop_chassis_open_v1(&invalid_config) == -1,
         "unreachable full-scale torque was accepted");
@@ -426,18 +483,45 @@ int main() {
         mine_teleop_chassis_open_v2(&invalid_v2_config) == -1,
         "zero hard overspeed margin was accepted");
     expect(g_initialize_calls == 0, "invalid open_v2 config reached ChassisControl Initialize");
+
+    auto invalid_v3_config = valid_v3_config("mtmissing0");
+    invalid_v3_config.struct_size = sizeof(MineTeleopChassisOpenConfigV2);
     expect(
-        std::abs(mine_teleop_chassis_scaled_target_acceleration(1.0, 82.5) - 2.0) < 1e-9,
+        mine_teleop_chassis_open_v3(&invalid_v3_config) == -1,
+        "V2-sized struct was accepted by open_v3");
+    invalid_v3_config.struct_size = sizeof(invalid_v3_config);
+    invalid_v3_config.max_ordinary_brake_pressure_bar = 327.7;
+    expect(
+        mine_teleop_chassis_open_v3(&invalid_v3_config) == -1,
+        "open_v3 accepted ordinary brake pressure above the code cap");
+    invalid_v3_config.max_ordinary_brake_pressure_bar =
+        std::numeric_limits<double>::quiet_NaN();
+    expect(
+        mine_teleop_chassis_open_v3(&invalid_v3_config) == -1,
+        "open_v3 accepted non-finite ordinary brake pressure");
+    invalid_v2_config = valid_v2_config("mtmissing0");
+    invalid_v2_config.struct_size = sizeof(MineTeleopChassisOpenConfigV3);
+    expect(
+        mine_teleop_chassis_open_v2(&invalid_v2_config) == -1,
+        "V3-sized struct was accepted by legacy open_v2");
+    expect(g_initialize_calls == 0, "invalid open_v3 config reached ChassisControl Initialize");
+    expect(
+        std::abs(mine_teleop_chassis_scaled_target_acceleration(1.0, 82.5) - 0.275) < 1e-9,
         "full throttle did not map to the configured traction acceleration");
     expect(
-        std::abs(mine_teleop_chassis_scaled_target_acceleration(0.10, 82.5) - 0.20) < 1e-9,
+        std::abs(mine_teleop_chassis_scaled_target_acceleration(0.10, 82.5) - 0.0275) < 1e-9,
         "partial throttle did not scale linearly");
     expect(
         std::abs(mine_teleop_chassis_scaled_target_acceleration(1.0, 0.0)) < 1e-9,
         "zero full-scale torque did not disable traction");
     expect(
-        std::abs(mine_teleop_chassis_scaled_target_acceleration(-1.0, 165.0) + 1.0) < 1e-9,
+        std::abs(mine_teleop_chassis_scaled_target_acceleration(-1.0, 640.0) + 1.0) < 1e-9,
         "traction configuration changed the braking path");
+    expect(
+        std::abs(mine_teleop_chassis_quantize_brake_pressure_bar(100.09) - 100.0) < 1e-9 &&
+            std::abs(mine_teleop_chassis_quantize_brake_pressure_bar(327.7) - 327.6) < 1e-9 &&
+            mine_teleop_chassis_quantize_brake_pressure_bar(0.0) == 0.0,
+        "ordinary brake pressure was not capped and quantized toward zero");
     expect(
         std::abs(mine_teleop_chassis_motor_torque_limit_nm(0.10, 41.25) - 4.1) <
             1e-9 &&
@@ -594,7 +678,13 @@ int main() {
             mine_teleop_chassis_clamp_directional_motor_torque_nm(
                 -100.0, 3, 1.0, 41.25) == 0.0 &&
             mine_teleop_chassis_clamp_directional_motor_torque_nm(
-                100.0, 2, 1.0, 41.25) == 0.0,
+                100.0, 2, 1.0, 41.25) == 0.0 &&
+            std::abs(mine_teleop_chassis_clamp_directional_motor_torque_nm(
+                         1000.0, 3, 1.0, 640.0) -
+                     640.0) < 1e-9 &&
+            std::abs(mine_teleop_chassis_clamp_directional_motor_torque_nm(
+                         -1000.0, 2, 1.0, 640.0) +
+                     640.0) < 1e-9,
         "D/R directional torque hard limit admitted opposite-sign torque");
 
     expect(
@@ -616,18 +706,24 @@ int main() {
     auto configured_v2 = valid_v2_config("mtmissing0", 900);
     configured_v2.full_scale_motor_torque_nm = 82.5;
     const int v2_socket_result = mine_teleop_chassis_open_v2(&configured_v2);
+    auto configured_v3 = valid_v3_config("mtmissing0", 950);
+    configured_v3.full_scale_motor_torque_nm = 82.5;
+    configured_v3.max_ordinary_brake_pressure_bar = 100.0;
+    const int v3_socket_result = mine_teleop_chassis_open_v3(&configured_v3);
     ::unsetenv("MINE_TELEOP_VCU_LOG_PATH");
     expect(
-        v1_socket_result == -3 && v2_socket_result == -3,
-        "missing SocketCAN interface was not rejected by both versioned open paths");
+        v1_socket_result == -3 && v2_socket_result == -3 &&
+            v3_socket_result == -3,
+        "missing SocketCAN interface was not rejected by every versioned open path");
     expect(
-        g_initialize_calls == 2,
-        "valid open_v1/open_v2 did not each reach ChassisControl Initialize");
+        g_initialize_calls == 3,
+        "valid open_v1/open_v2/open_v3 did not each reach ChassisControl Initialize");
 
     const auto events = read_json_lines(log_path);
     int socket_failure_count = 0;
     bool v1_default_parameters_found = false;
     bool v2_configured_parameters_found = false;
+    bool v3_physical_pressure_parameters_found = false;
     for (const auto& event : events) {
       if (event.value("name", "") == "vehicle_parameters") {
         expect(
@@ -637,6 +733,11 @@ int main() {
         v1_default_parameters_found |=
             timeout_ms == MINE_TELEOP_CHASSIS_DEFAULT_CONTROL_TIMEOUT_MS;
         v2_configured_parameters_found |= timeout_ms == 900;
+        v3_physical_pressure_parameters_found |=
+            timeout_ms == 950 &&
+            event.value("physical_brake_input", false) &&
+            std::abs(event.value("max_ordinary_brake_pressure_bar", -1.0) -
+                     100.0) < 1e-9;
       }
       if (event.value("name", "") != "socket_open_failed") continue;
       ++socket_failure_count;
@@ -662,7 +763,10 @@ int main() {
     expect(
         v2_configured_parameters_found,
         "open_v2 configured control timeout is missing from bridge log");
-    expect(socket_failure_count == 2, "versioned SocketCAN failure events are missing");
+    expect(
+        v3_physical_pressure_parameters_found,
+        "open_v3 physical pressure contract is missing from bridge log");
+    expect(socket_failure_count == 3, "versioned SocketCAN failure events are missing");
     std::filesystem::remove(log_path, error);
 
     int transport[2]{-1, -1};
@@ -722,8 +826,8 @@ int main() {
     const auto& pid_motor = last_frame_with_id(pid_frames, 0x18F0D0F5U);
     const auto& pid_speed = last_frame_with_id(pid_frames, 0x18FED0F5U);
     expect(
-        can_signal(pid_motor, 8, 14) == 8412,
-        "0.01 traction enable did not allow PID output up to the 41.2 Nm quantized full-scale ceiling");
+        can_signal(pid_motor, 8, 14) == 8004,
+        "0.01 session traction ceiling did not cap PID output at 0.4 Nm");
     expect(
         can_signal(pid_speed, 0, 8) == 0 && can_signal(pid_speed, 8, 8) == 0,
         "Ready local PID emitted a VCU vehicle-speed request");
@@ -736,8 +840,9 @@ int main() {
           g_vendor_update_threads.size() == 1,
           "runtime vendor updates executed from more than the single IO thread");
       expect(
-          g_vehicle_states.back().target_acceleration[0] > 0.99F,
-          "large PID error did not saturate normalized traction at full scale");
+          g_vehicle_states.back().target_acceleration[0] > 0.0013F &&
+              g_vehicle_states.back().target_acceleration[0] < 0.0015F,
+          "large PID error did not saturate at the session torque ceiling");
     }
 
     expect(
@@ -841,6 +946,28 @@ int main() {
             can_signal(brake_speed, 8, 8) == 0,
         "brake intent emitted a VCU vehicle-speed request");
 
+    {
+      std::lock_guard<std::mutex> lock(g_vendor_mutex);
+      g_forced_vendor_brake_pressure_bar = 400.0;
+    }
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 0.0, -0.3, steering.data(), steering.size()) == 0,
+        "legacy vendor-pressure cap test intent was rejected");
+    const auto vendor_pressure_cap_frames = drain_can_frames(transport[1], 45);
+    expect_all_motor_torque_raw(
+        vendor_pressure_cap_frames,
+        8000,
+        "legacy vendor pressure cap");
+    expect_all_brake_pressure_raw(
+        vendor_pressure_cap_frames,
+        3276,
+        "legacy vendor pressure cap");
+    {
+      std::lock_guard<std::mutex> lock(g_vendor_mutex);
+      g_forced_vendor_brake_pressure_bar = -1.0;
+    }
+
     const auto preexisting_control_apply_timeouts =
         count_logged_events(runtime_log_path, "control_apply_timeout");
     expect(
@@ -877,20 +1004,16 @@ int main() {
             [] {
               std::lock_guard<std::mutex> lock(g_vendor_mutex);
               return !g_vehicle_states.empty() &&
-                  g_vehicle_states.back().target_acceleration[0] >= 0.099F;
+                  g_vehicle_states.back().target_acceleration[0] >= 0.0013F;
             },
             100),
         "post-timeout apply did not run the reset PID in the 20 ms IO loop");
     {
       std::lock_guard<std::mutex> lock(g_vendor_mutex);
-      const double reset_proportional_output =
-          5.0 - timeout_telemetry.speed_mps;
       expect(
           !g_vehicle_states.empty() &&
-              g_vehicle_states.back().target_acceleration[0] >=
-                  reset_proportional_output &&
-              g_vehicle_states.back().target_acceleration[0] <
-                  reset_proportional_output + 0.0015,
+              g_vehicle_states.back().target_acceleration[0] >= 0.0013F &&
+              g_vehicle_states.back().target_acceleration[0] < 0.0015F,
           "post-timeout PID retained pre-stop integral instead of restarting from reset state");
     }
     feedback = runtime_feedback(5, 3, 1, 0.0);
@@ -1102,6 +1225,167 @@ int main() {
         }) == 1,
         "post-Ready retained-state critical feedback did not time out exactly once");
     std::filesystem::remove(runtime_log_path, error);
+
+    int pressure_transport[2]{-1, -1};
+    expect(
+        ::socketpair(AF_UNIX, SOCK_DGRAM, 0, pressure_transport) == 0,
+        "V3 pressure-mode adopted transport could not be created");
+    const auto pressure_log_path =
+        std::filesystem::path("/tmp/mine-teleop-vcu-pressure-smoke.jsonl");
+    std::filesystem::remove(pressure_log_path, error);
+    ::setenv("MINE_TELEOP_VCU_LOG_PATH", pressure_log_path.c_str(), 1);
+    const auto pressure_adopted_fd = std::to_string(pressure_transport[0]);
+    ::setenv("MINE_TELEOP_CHASSIS_TEST_FD", pressure_adopted_fd.c_str(), 1);
+    auto pressure_config = valid_v3_config("mt-test", 800);
+    pressure_config.full_scale_motor_torque_nm = 640.0;
+    pressure_config.max_ordinary_brake_pressure_bar = 327.6;
+    expect(
+        mine_teleop_chassis_open_v3(&pressure_config) == 0,
+        "V3 bridge did not adopt the physical-pressure smoke transport");
+    ::unsetenv("MINE_TELEOP_CHASSIS_TEST_FD");
+    ::unsetenv("MINE_TELEOP_VCU_LOG_PATH");
+    {
+      std::lock_guard<std::mutex> lock(g_vendor_mutex);
+      g_vehicle_states.clear();
+    }
+    feedback = runtime_feedback(3, 1, 2, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            mine_teleop_chassis_request_parallel_handshake() == 0 &&
+            mine_teleop_chassis_apply_state(
+                3, 0.0, 0.0, steering.data(), steering.size()) == 0,
+        "V3 pressure runtime initial gate, handshake, or D intent failed");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "V3 pressure runtime did not begin arming");
+    complete_runtime_arming_to_ready(3);
+    feedback = runtime_feedback(5, 3, 1, 0.0);
+    static_cast<void>(drain_can_frames(pressure_transport[1], 20));
+
+    {
+      std::lock_guard<std::mutex> lock(g_vendor_mutex);
+      g_forced_vendor_motor_torque_nm = 1000.0;
+    }
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            mine_teleop_chassis_apply_state(
+                3, 5.0, 1.0, steering.data(), steering.size()) == 0,
+        "V3 forward torque-cap intent was rejected");
+    const auto forward_cap_frames = drain_can_frames(pressure_transport[1], 45);
+    expect_all_motor_torque_raw(
+        forward_cap_frames,
+        14400,
+        "V3 D +640 Nm symmetric code cap");
+
+    expect(
+        mine_teleop_chassis_apply_state(
+            2, 5.0, 1.0, steering.data(), steering.size()) == 0,
+        "V3 stopped D-to-R torque-cap intent was rejected");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR),
+        "V3 stopped D-to-R change did not enter gear wait");
+    feedback = runtime_feedback(5, 2, 1, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_ACTUATOR_MODES),
+        "V3 stopped D-to-R change did not accept reverse feedback");
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            wait_for_handshake_state(MINE_TELEOP_VCU_READY),
+        "V3 stopped D-to-R change did not return to Ready");
+    static_cast<void>(drain_can_frames(pressure_transport[1], 20));
+    expect(
+        mine_teleop_chassis_apply_state(
+            2, 5.0, 1.0, steering.data(), steering.size()) == 0,
+        "V3 reverse torque-cap intent was rejected");
+    const auto reverse_cap_frames = drain_can_frames(pressure_transport[1], 45);
+    expect_all_motor_torque_raw(
+        reverse_cap_frames,
+        1600,
+        "V3 R -640 Nm symmetric code cap");
+    {
+      std::lock_guard<std::mutex> lock(g_vendor_mutex);
+      g_forced_vendor_motor_torque_nm = -1.0;
+    }
+
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            mine_teleop_chassis_apply_state(
+                2, 0.0, -(30.0 / 327.6), steering.data(), steering.size()) == 0,
+        "V3 30 bar service-brake intent was rejected");
+    const auto service_brake_frames = drain_can_frames(pressure_transport[1], 45);
+    expect_all_motor_torque_raw(
+        service_brake_frames,
+        8000,
+        "V3 service brake");
+    expect_all_brake_pressure_raw(
+        service_brake_frames,
+        300,
+        "V3 service brake");
+    {
+      std::lock_guard<std::mutex> lock(g_vendor_mutex);
+      expect(
+          !g_vehicle_states.empty() &&
+              std::abs(g_vehicle_states.back().target_acceleration[0]) < 1e-9 &&
+              std::abs(g_vehicle_states.back().target_steering_angle[0]) > 1e-6,
+          "V3 service brake retained traction input or discarded steering");
+    }
+
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            mine_teleop_chassis_apply_state(
+                2, 0.0, -(100.0 / 327.6), steering.data(), steering.size()) == 0,
+        "V3 100 bar hard-brake intent was rejected");
+    const auto hard_brake_frames = drain_can_frames(pressure_transport[1], 45);
+    expect_all_motor_torque_raw(hard_brake_frames, 8000, "V3 hard brake");
+    expect_all_brake_pressure_raw(hard_brake_frames, 1000, "V3 hard brake");
+    MineTeleopChassisTelemetry ordinary_brake_telemetry{};
+    expect(
+        mine_teleop_chassis_read_telemetry(&ordinary_brake_telemetry) == 0 &&
+            ordinary_brake_telemetry.estop == 0,
+        "ordinary 100 bar pressure incorrectly latched ESTOP");
+
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            mine_teleop_chassis_apply_state(
+                2, 0.0, -1.0, steering.data(), steering.size()) == 0,
+        "V3 ordinary code-maximum brake intent was rejected");
+    const auto max_ordinary_brake_frames =
+        drain_can_frames(pressure_transport[1], 45);
+    expect_all_motor_torque_raw(
+        max_ordinary_brake_frames,
+        8000,
+        "V3 maximum ordinary brake");
+    expect_all_brake_pressure_raw(
+        max_ordinary_brake_frames,
+        3276,
+        "V3 maximum ordinary brake");
+    expect(
+        mine_teleop_chassis_read_telemetry(&ordinary_brake_telemetry) == 0 &&
+            ordinary_brake_telemetry.estop == 0,
+        "ordinary 327.6 bar code maximum incorrectly latched ESTOP");
+
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            mine_teleop_chassis_apply_state(
+                2, 0.0, 0.0, steering.data(), steering.size()) == 0,
+        "V3 ordinary brake release was rejected");
+    const auto release_frames = drain_can_frames(pressure_transport[1], 45);
+    expect_all_motor_torque_raw(release_frames, 8000, "V3 brake release");
+    expect_all_brake_pressure_raw(release_frames, 0, "V3 brake release");
+
+    expect(
+        mine_teleop_chassis_emergency_stop() == 0,
+        "V3 software ESTOP was rejected");
+    const auto v3_estop_frames = drain_can_frames(pressure_transport[1], 45);
+    expect_all_motor_torque_raw(v3_estop_frames, 8000, "V3 ESTOP");
+    expect_all_brake_pressure_raw(v3_estop_frames, 4095, "V3 ESTOP");
+    expect(
+        mine_teleop_chassis_close() == 0,
+        "V3 pressure runtime did not close cleanly");
+    ::close(pressure_transport[0]);
+    ::close(pressure_transport[1]);
+    std::filesystem::remove(pressure_log_path, error);
 
     int arming_transport[2]{-1, -1};
     expect(
