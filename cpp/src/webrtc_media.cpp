@@ -190,6 +190,11 @@ CameraIssue classify_camera_issue(std::string_view error) {
   if (contains("media read failed")) {
     return {"camera_bridge_read_failed", "vendor_bridge_capture", "Inspect the vendor bridge process and camera SDK logs.", true};
   }
+  if (contains("device does not exist")) {
+    return {"camera_device_missing", "v4l2_open",
+            "Check the configured device path and the physical camera connection before restarting; a missing path is not retried.",
+            false};
+  }
   if (contains("cannot open V4L2 camera")) {
     return {"camera_open_failed", "v4l2_open", "Check that the device path exists, permissions allow access, and the node is not busy.", true};
   }
@@ -460,6 +465,7 @@ struct VehicleMediaRuntime::Impl {
       const auto encoded_at_ms = lane->owner->signaling.now_ms();
       lane->last_encoded_ms = encoded_at_ms;
       lane->last_encoded_steady_ms = steady_now_ms();
+      if (lane->camera.critical_for_control) lane->owner->clear_control_inhibition_if_recovered();
       GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
       if (buffer != nullptr && GST_BUFFER_PTS_IS_VALID(buffer)) {
         const auto captured_at_ms = lane->pipeline_started_ms + static_cast<std::int64_t>(GST_BUFFER_PTS(buffer) / GST_MSECOND);
@@ -575,6 +581,7 @@ struct VehicleMediaRuntime::Impl {
             {{"safety_action", "local_full_stop_requested"}});
       }
       self->control_service_started = false;
+      self->control_service.reset();
     }
     std::cout << Json({
                      {"event", "vehicle_control_data_channel_closed"},
@@ -1078,7 +1085,7 @@ struct VehicleMediaRuntime::Impl {
         "critical_camera_control_inhibited",
         "camera_safety",
         std::string(failure),
-        "Keep the vehicle stopped. Camera recovery restores video only; end this session and complete a fresh VCU handshake before driving again.",
+        "Keep the vehicle stopped and close the control channel. The inhibit clears automatically once this camera is fresh again, but the closed control channel does not reopen itself; reconnect the driver console to regain control.",
         false,
         {{"camera_id", lane.camera.id},
          {"device", lane.camera.device},
@@ -1098,6 +1105,32 @@ struct VehicleMediaRuntime::Impl {
       gst_webrtc_data_channel_close(channel_to_close);
       g_object_unref(channel_to_close);
     }
+  }
+
+  // Mirrors inhibit_control_for_critical_camera: once every critical lane is
+  // fresh again, lift the latch so a newly opened control channel is allowed
+  // to start the adapter immediately. This does not reopen the control
+  // DataChannel that was closed when control was inhibited -- that channel
+  // stays closed by design so the driver console gets an unambiguous
+  // disconnect signal rather than silently regaining authority mid-session.
+  void clear_control_inhibition_if_recovered() {
+    if (!control_inhibited.load()) return;
+    if (!critical_cameras_ready()) return;
+    if (!control_inhibited.exchange(false)) return;
+    {
+      std::lock_guard lock(control_mutex);
+      if (control_service_issue_code == "critical_camera_failed") {
+        control_service_issue_code = "critical_camera_not_ready";
+      }
+    }
+    emit_diagnostic(
+        "vehicle_control_inhibition_cleared",
+        "critical_camera_control_restored",
+        "camera_safety",
+        "",
+        "All critical camera lanes are fresh again; the internal control lock has cleared. Reconnect the driver console (the previously closed control channel does not reopen itself) to resume control.",
+        true,
+        {{"safety_action", "control_inhibition_cleared_awaiting_new_control_channel"}});
   }
 
   [[nodiscard]] bool critical_cameras_ready() const {
@@ -1513,6 +1546,18 @@ struct VehicleMediaRuntime::Impl {
   }
 
   [[nodiscard]] std::unique_ptr<CameraFrameSource> create_camera_source(const Lane& lane) const {
+    // A V4L2 device node that does not exist at all (unplugged camera, wrong
+    // path) is not the kind of transient fault the reopen backoff is meant to
+    // absorb: the path will not appear a few hundred milliseconds later just
+    // because the runtime waited. Detecting it here, before paying for a
+    // CameraFrameSource open attempt, lets classify_camera_issue() flag it as
+    // non-retryable so the lane fails on the very first attempt instead of
+    // only after reopen_attempts retries have all been exhausted.
+    if (camera_source_kind(lane.camera.device) == "v4l2" &&
+        !std::filesystem::exists(lane.camera.device)) {
+      throw std::runtime_error(
+          "cannot open V4L2 camera: device does not exist: " + lane.camera.device);
+    }
     MediaProfile capture = lane.profile;
     capture.codec = "mjpeg";
     capture.encoder = "native";
@@ -1690,7 +1735,7 @@ struct VehicleMediaRuntime::Impl {
                   "camera_reopen",
                   "",
                   lane->camera.critical_for_control
-                      ? "Video resumed, but vehicle control remains inhibited until a fresh session and VCU handshake."
+                      ? "Video resumed. Once every critical lane is fresh, the internal control lock clears automatically, but the control channel closed by the earlier failure does not reopen itself -- reconnect the driver console to resume control."
                       : "No action is required; this optional camera lane resumed without changing vehicle control authority.",
                   true,
                   {{"camera_id", lane->camera.id},
