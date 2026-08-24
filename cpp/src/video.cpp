@@ -54,13 +54,12 @@ class NvencVideoEncoder final : public VideoEncoder {
       std::string_view element_name) const override {
     const auto factory = factory_name();
     if (factory.empty()) throw std::runtime_error("NVIDIA " + to_string(codec_) + " encoder is unavailable");
-    std::ostringstream value;
-    value << factory << " name=" << element_name
-          << " bitrate=" << settings.bitrate_kbps
-          << " gop-size=" << settings.keyframe_interval_frames
-          << " bframes=0 zerolatency=true rc-lookahead=0"
-          << " preset=p1 tune=ultra-low-latency rc-mode=cbr";
-    return value.str();
+    guint major = 0;
+    guint minor = 0;
+    guint micro = 0;
+    guint nano = 0;
+    gst_version(&major, &minor, &micro, &nano);
+    return build_nvenc_pipeline_stage(factory, settings, element_name, major, minor);
   }
 
  private:
@@ -98,6 +97,26 @@ class VaapiVideoEncoder final : public VideoEncoder {
 };
 
 }  // namespace
+
+std::string build_nvenc_pipeline_stage(
+    std::string_view factory_name,
+    const VideoEncoderSettings& settings,
+    std::string_view element_name,
+    unsigned int gstreamer_major,
+    unsigned int gstreamer_minor) {
+  std::ostringstream value;
+  value << factory_name << " name=" << element_name
+        << " bitrate=" << settings.bitrate_kbps
+        << " gop-size=" << settings.keyframe_interval_frames
+        << " bframes=0 zerolatency=true rc-lookahead=0 rc-mode=cbr";
+  const auto version_at_least = [=](unsigned int major, unsigned int minor) {
+    return gstreamer_major > major ||
+        (gstreamer_major == major && gstreamer_minor >= minor);
+  };
+  if (version_at_least(1, 22)) value << " preset=p1";
+  if (version_at_least(1, 24)) value << " tune=ultra-low-latency";
+  return value.str();
+}
 
 std::string to_string(VideoCodec codec) {
   return codec == VideoCodec::H265 ? "h265" : "h264";

@@ -16,10 +16,38 @@
 
 namespace mine_teleop {
 
-enum class CameraSourceKind { TestSource, Mvs, Aravis, V4l2 };
+enum class CameraSourceKind { TestSource, Mvs, Aravis, V4l2, Ccg2 };
 
 [[nodiscard]] CameraSourceKind classify_camera_source(std::string_view device);
+[[nodiscard]] CameraSourceKind classify_camera_source(const CameraConfig& camera);
 [[nodiscard]] std::string_view camera_source_kind_name(CameraSourceKind kind);
+
+inline constexpr std::uint64_t kCameraAppSrcMaxBuffers = 2;
+
+struct CameraInputSpec {
+  std::string codec{"mjpeg"};
+  int width{0};
+  int height{0};
+  int fps{0};
+};
+
+// Existing sources retain their realtime-profile capture behavior.  CCG2 is
+// explicit because its V4L2 driver reports YUYV while the DMA bytes are UYVY.
+[[nodiscard]] CameraInputSpec camera_input_spec(
+    const CameraConfig& camera,
+    const MediaProfile& realtime_profile);
+[[nodiscard]] std::string pack_uyvy_rows(
+    std::string_view frame,
+    int width,
+    int height,
+    std::size_t bytes_per_line);
+[[nodiscard]] std::uint64_t v4l2_sequence_gap(
+    std::optional<std::uint32_t> previous_sequence,
+    std::uint32_t current_sequence);
+[[nodiscard]] std::string build_camera_input_pipeline(
+    std::string_view source_name,
+    const CameraInputSpec& input,
+    const MediaProfile& output_profile);
 
 struct CameraIssue {
   std::string_view code;
@@ -99,6 +127,14 @@ struct EncodedFrame {
   int height{0};
   int fps{0};
   int bitrate_kbps{0};
+  std::size_t source_bytes_per_line{0};
+  std::size_t source_size_image{0};
+  std::size_t source_bytes_used{0};
+  bool source_sequence_valid{false};
+  std::uint64_t source_sequence{0};
+  std::uint64_t source_sequence_gap{0};
+  std::uint32_t source_timeperframe_numerator{0};
+  std::uint32_t source_timeperframe_denominator{0};
 
 };
 
@@ -113,9 +149,15 @@ class CameraFrameSource {
   [[nodiscard]] EncodedFrame next(std::uint64_t sequence);
   [[nodiscard]] const std::string& camera_id() const { return camera_.id; }
   [[nodiscard]] const std::vector<std::string>& command() const { return command_; }
+  [[nodiscard]] std::optional<std::uint32_t> last_v4l2_sequence() const {
+    return last_dequeued_v4l2_sequence_;
+  }
+  [[nodiscard]] std::uint64_t last_v4l2_sequence_gap() const {
+    return last_dequeued_v4l2_sequence_gap_;
+  }
 
  private:
-  enum class Mode { TestSource, V4l2, VendorBridge };
+  enum class Mode { TestSource, V4l2, Ccg2, VendorBridge };
   struct MappedBuffer {
     void* address{nullptr};
     std::size_t length{0};
@@ -127,6 +169,7 @@ class CameraFrameSource {
   void start_v4l2();
   void stop_v4l2();
   [[nodiscard]] std::string read_v4l2_jpeg();
+  [[nodiscard]] std::string read_v4l2_uyvy();
   [[nodiscard]] std::string generate_test_jpeg(std::uint64_t sequence) const;
 
   CameraConfig camera_;
@@ -141,6 +184,14 @@ class CameraFrameSource {
   bool streaming_{false};
   int output_width_{0};
   int output_height_{0};
+  std::size_t v4l2_bytes_per_line_{0};
+  std::size_t v4l2_size_image_{0};
+  std::size_t last_v4l2_bytes_used_{0};
+  std::uint32_t v4l2_timeperframe_numerator_{0};
+  std::uint32_t v4l2_timeperframe_denominator_{0};
+  std::optional<std::uint32_t> last_delivered_v4l2_sequence_;
+  std::optional<std::uint32_t> last_dequeued_v4l2_sequence_;
+  std::uint64_t last_dequeued_v4l2_sequence_gap_{0};
   std::vector<MappedBuffer> mapped_buffers_;
 };
 

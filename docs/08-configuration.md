@@ -188,6 +188,7 @@ cameras:
     critical_for_control: true
     reopen_attempts: 3
     reopen_backoff_ms: 500
+    backend: auto
     device: /dev/video0
     capture_width: 1920
     capture_height: 1080
@@ -199,6 +200,7 @@ cameras:
     critical_for_control: true
     reopen_attempts: 3
     reopen_backoff_ms: 500
+    backend: auto
     device: /dev/video1
     capture_width: 1920
     capture_height: 1080
@@ -288,6 +290,46 @@ session 内的 `VehicleMediaRuntime` 重建保持不变。必须结束当前 ses
 在 USB 拔插或 udev 重建期间
 暂时不存在时，仍按 `reopen_attempts` 做有限重试；永久路径错误应由启动 preflight
 报告。非关键相机在重开额度耗尽后只禁用自身 lane，其他视频和当前控制不受影响。
+
+`cameras[].backend` 支持 `auto`（默认值）和 `ccg2`。不写该字段等价于 `auto`，继续按
+现有规则识别 `testsrc`、普通 V4L2/MJPEG、Aravis/Basler 和 MVS selector，因此旧配置
+无需修改。CCG2-8M 必须显式选择 `ccg2`；仓库中的
+`configs/vehicle-agent.ccg2-8m.yaml` 给出两路 `/dev/ccg2-channel-0`、
+`/dev/ccg2-channel-1` 的
+`1920x1080@30` 联调配置。
+
+```yaml
+cameras:
+  - id: ccg2_channel_0
+    backend: ccg2
+    device: /dev/ccg2-channel-0
+    capture_width: 1920
+    capture_height: 1080
+    capture_fps: 30
+    realtime_profile: realtime_720p30
+```
+
+`ccg2` 是对该板卡驱动格式约定的显式兼容边界：V4L2 ioctl 请求并校验驱动报告的
+YUYV，但实际 buffer 按 UYVY 字节顺序处理。`capture_width`/`capture_height` 使用
+V4L2 协商后应用可见的 `1920x1080`；板卡工具显示的 `1920x1536` input status 只用于
+链路诊断，不能填成应用采集高度。配置不会安装内核驱动或初始化板卡；这些步骤仍由
+目标机部署流程在启动 MineTeleop 前完成。
+ccg2-support 会按 `xdma0_video` 的 sysfs channel index 建立
+`/dev/ccg2-channel-0` 至 `/dev/ccg2-channel-7`；生产配置必须引用这些稳定链接，
+不要引用枚举顺序不稳定的 `/dev/videoN`。
+
+对 CCG2 而言，`capture_fps` 是 V4L2 输入帧率，realtime profile 的 `fps` 是编码输出
+帧率。两者不同时，仅 CCG2 raw pipeline 使用 `videorate` 做显式帧率适配；旧的
+MJPEG/testsrc/vendor pipeline 保持原状。`VIDIOC_S_PARM` 成功返回后，其
+`timeperframe` 分子、分母必须非零，且必须精确等于配置的 `1/capture_fps`；驱动返回
+其它速率时启动失败并报告 `camera_ccg2_fps_mismatch`，不会按近似值继续运行。
+
+示例的 `hardware.encoding` 有意使用 `preferred_encoder: vaapi`、
+`fallback_encoder: nvenc`。Ubuntu 22.04/GStreamer 1.20.3 的目标机上，RTX 2000 Ada
+NVCodec 会在运行期报告 `Selected preset not supported`，而 Intel VAAPI 已用同一
+CCG2 raw 帧验证成功。GStreamer 1.20 的 NVENC pipeline 不写 `preset`/`tune`；1.22
+才支持 `preset=p1`，1.24 才同时支持 `tune=ultra-low-latency`。只有升级到 1.24+
+并重新完成硬编码验收后，才应在该目标机上改成 NVENC 优先。
 
 实时路径的每路 GStreamer `appsrc` 固定为最多缓存 2 帧，满时丢弃旧帧；其下游
 实时 queue 同样为 2 帧有界丢旧。该策略优先保证画面新鲜度，不能用扩大队列来掩盖

@@ -304,9 +304,30 @@ capabilities without using the removed per-frame upload path.
 
 ## Operational boundaries
 
-- V4L2 acquisition uses native C++ `ioctl`/mmap/poll and accepts camera-native
-  MJPEG; it does not launch FFmpeg. The test source is generated and JPEG
-  encoded in-process.
+- The default camera `backend: auto` preserves the existing selectors: ordinary
+  V4L2 devices use native C++ `ioctl`/mmap/poll and must provide camera-native
+  MJPEG, while `testsrc` and vendor bridge selectors keep their existing paths.
+  Acquisition does not launch FFmpeg; the test source is generated and JPEG
+  encoded in-process as before.
+- CCG2-8M channels must opt in with `backend: ccg2`; see
+  `configs/vehicle-agent.ccg2-8m.yaml`. This backend requests the driver's
+  reported YUYV format, treats the actual packed bytes as UYVY, and sends the
+  tightly packed raw frame directly into GStreamer before hardware encoding.
+  Only this raw path inserts `videorate` when capture and output FPS differ;
+  the legacy MJPEG pipeline is unchanged. CCG2 startup also requires the
+  driver's returned `timeperframe` to exactly match the configured capture FPS.
+  The negotiated V4L2 `1920x1080` is the application-visible frame; a board
+  input status of `1920x1536` is diagnostic metadata, not a capture height.
+  Error-flagged buffers are requeued without becoming fresh frames, while V4L2
+  sequence/gap metadata remains visible in diagnostics. Kernel driver
+  installation and board initialization remain deployment tasks. The CCG2
+  support package creates stable `/dev/ccg2-channel-0` through
+  `/dev/ccg2-channel-7` links from the XDMA channel index; use those links in
+  configuration instead of enumeration-dependent `/dev/videoN` names. The CCG2
+  Ubuntu 22.04 example selects Intel VAAPI first: the validated GStreamer
+  1.20.3/RTX 2000 Ada host rejects NVCodec presets at runtime, while VAAPI
+  successfully encodes the same raw input. Select NVENC first on this host only
+  after upgrading to GStreamer 1.24 or newer and re-running the encoder probe.
 - Browser playback uses native WebRTC continuous video. H.265 is selected only
   when the browser advertises it. If browser stats report any H.265 track below
   20 fps for three consecutive samples, the vehicle skips the remaining H.265
