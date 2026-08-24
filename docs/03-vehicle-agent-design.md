@@ -256,12 +256,12 @@ video/metadata 两类凭证后恢复上传队列；已在队列中的片段不�
 1. 加载配置。
 2. 初始化日志。
 3. 检查设备和权限。
-4. 初始化车辆适配器。
-5. 初始化相机。
-6. 初始化媒体 pipeline。
-7. 连接云端信令。
-8. 进入待命状态。
-9. 会话建立后启动实时推流和控制接收。
+4. 完成时间同步并注册到云端信令。
+5. 进入待命状态，等待有效驾驶会话。
+6. 会话建立后初始化相机和媒体 pipeline，先启动实时视频。
+7. 创建控制 DataChannel，但在关键相机尚无首个编码帧时不启动车辆适配器。
+8. 控制 DataChannel 已打开且所有关键相机均已实际编码出帧后，才初始化车辆适配器。
+9. 驾驶员随后显式完成 VCU 握手，控制才可进入 Ready。
 10. 根据配置启动录像和上传队列。
 
 本地参考实现提供只读 `VehiclePreflightChecker`：启动前检查启用相机设备、
@@ -278,36 +278,48 @@ systemd `ExecStartPre` 或部署脚本阻止带缺失设备的真实车端启动
 - 单路相机失败不应导致全车端退出。
 - 驾驶端 UI 显示对应相机故障。
 - 录像和实时流分别记录错误。
+- 每路实时 `appsrc` 和下游 queue 均使用 2 帧有界丢旧，录像 tee 也使用约 2 秒的
+  有界丢旧 queue，禁止让实时控制画面被慢磁盘反压。
+- 采集源按该相机的 `reopen_attempts` / `reopen_backoff_ms` 只重开故障 lane。
+- 关键相机首个已确认故障立即安全停车、锁止控制并关闭当前控制 DataChannel。
+  相机重新出帧只恢复视频；控制锁存保存在媒体 service loop，因而同一云端 session
+  内重建 `VehicleMediaRuntime` 也不会解除锁存。必须结束当前
+  session，并在新 session 中建立新的控制 DataChannel、重新完成 VCU 握手后才能
+  恢复驾驶权限。这样不会让故障前排队帧或多关键相机的交错恢复自动重新授权控制。
+- V4L2 设备节点暂时不存在（包括 USB 拔插或 udev 重建）仍属于有界重试范围；
+  永久路径错误应由启动 preflight 报告，运行期不以一次 `exists()` 结果永久禁用 lane。
+- 非关键相机重开耗尽后只禁用自身 lane，不影响其他视频或当前控制。
 
 ### 编码异常
 
-- 优先尝试重启对应相机 pipeline。
-- 如果硬编失败，可按配置降级 CPU 编码。
-- 降级必须写日志和上报状态。
+- 相机采集故障使用上一节的单路 source 重开，不重建共享编码 pipeline。
+- 共享 GStreamer/编码器故障结束当前 encoder candidate，再按配置尝试下一硬编
+  candidate（当前支持 NVENC/VAAPI）。
+- candidate 切换必须写日志和上报状态，不能静默切换或退回未配置的 CPU 编码。
 
-本地参考实现提供 `MediaFaultRecoveryPolicy`：watchdog 判定单路 pipeline
-卡死后生成 `restart_camera_pipeline` 恢复动作、`media_pipeline_restart_requested`
-组件日志和该相机的 `reconnecting` 视频状态；硬编失败且存在 CPU fallback
-时生成 `fallback_encoder` 动作、`media_encoder_fallback` 组件日志和
-`degraded` 视频状态。`MediaFaultRecoveryExecutor` 可把这些决策绑定到媒体主循环
-控制器的 `restart_camera_pipeline(camera_id)` 和
-`switch_camera_encoder(camera_id, encoder)` 方法；真实 GStreamer pipeline 重启和
-编码器切换仍需在目标车端运行时端到端验证。
+当前 GStreamer 车端实现会在 V4L2/vendor 采集故障后销毁并重建该 lane 的
+`CameraFrameSource`，不会为单路采集故障重建整个 WebRTC runtime。不可重试故障或
+重开额度耗尽时，该 lane 进入 EOS/disabled；真实拔插、USB 带宽耗尽和连续恢复仍需
+在目标车端做端到端验证。GStreamer buffer 分配或 appsrc push 失败属于共享 pipeline
+故障边界，不会伪装成可安全单路重开的设备故障。
 
 ### 网络异常
 
-- 信令断开：尝试重连。
-- 媒体断开：尝试 ICE restart 或重建会话。
-
-本地参考实现提供 `RealtimeConnectionRecoveryPolicy`：信令断开时生成
-`reconnect_signaling` 决策、退避延迟和 `signaling_reconnect_requested`
-组件日志；媒体断开时先生成 `ice_restart` 决策，超过配置次数后生成
-`rebuild_session` 决策，并分别写入 `media_ice_restart_requested` 或
-`media_session_rebuild_requested` 组件日志。`RealtimeConnectionRecoveryExecutor`
-可把这些决策绑定到实时连接控制器的 `reconnect_signaling(retry_delay_ms)`、
-`restart_ice(camera_id)` 和 `rebuild_media_session(camera_id)` 方法；真实
-WebRTC reconnect、ICE restart 和 session rebuild 操作仍需目标运行时端到端验证。
+- 短暂传输错误或 HTTP 5xx：本地安全停车后按有界退避重试。
+- `session_not_active`：结束当前媒体会话并等待新的有效权限。
+- `signaling_sequence_older` / `signaling_sequence_reused` 或过期 connection
+  generation：fail-closed，不得当作 session 已结束而循环重建。
+- 控制 DataChannel 关闭：立即安全停车；共享 WebRTC/GStreamer 故障结束当前
+  encoder candidate，再由候选/媒体 service loop 决定是否重建。
 - 控制心跳超时：立即安全停车。
+
+媒体 service loop 把 signaling sequence cursor 和关键相机控制锁存都保存在
+`VehicleMediaRuntime` 生命周期之外；同一 `(connection_generation, session_id)` 内的
+runtime 重建继续单调递增 sequence，并保留关键相机造成的控制锁止，
+避免恢复过程从 1 重新发送并进入 409 死循环。不同 409 使用服务端结构化
+`issue_code` 分类；未知 409 同样 fail-closed。真实 WebRTC reconnect、ICE restart
+和服务重启恢复仍需单独实现或在目标车端端到端验证，不能把单路相机 source 重开
+当成这些网络恢复能力的证据。
 
 ### 磁盘异常
 

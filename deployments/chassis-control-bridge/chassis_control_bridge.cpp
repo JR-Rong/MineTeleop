@@ -158,12 +158,17 @@ VehicleState make_vehicle_state(
     int target_gear,
     double target_vx,
     double target_ax,
+    double full_scale_motor_torque_nm,
     const double* steering_values,
     int steering_count) {
   VehicleState state{};
   state.cur_velocity = clamp_float(current_speed_mps, -20.0, 20.0);
   state.target_velocity = {clamp_float(target_vx, 0.0, 20.0), 0.0F};
-  state.target_acceleration = {clamp_float(target_ax, -8.0, 4.0), 0.0F};
+  // The runtime sends normalized longitudinal input. Scale traction only;
+  // negative acceleration remains the independently calibrated braking path.
+  const double scaled_target_ax = mine_teleop_chassis_scaled_target_acceleration(
+      target_ax, full_scale_motor_torque_nm);
+  state.target_acceleration = {clamp_float(scaled_target_ax, -8.0, 4.0), 0.0F};
   state.target_gear = target_gear;
   state.target_position = {0.0F, 0.0F, 0.0F};
   state.vehicle_posture = {0.0F, 0.0F, 0.0F};
@@ -748,8 +753,9 @@ class SocketCan {
 
 class BridgeRuntime {
  public:
-  explicit BridgeRuntime(std::string can_interface)
-      : can_interface_(std::move(can_interface)) {
+  BridgeRuntime(std::string can_interface, double full_scale_motor_torque_nm)
+      : can_interface_(std::move(can_interface)),
+        full_scale_motor_torque_nm_(full_scale_motor_torque_nm) {
     last_feedback_.vehicle_speed_valid = 0;
     for (double& angle : last_feedback_.eps_angle) {
       angle = std::numeric_limits<double>::quiet_NaN();
@@ -779,7 +785,9 @@ class BridgeRuntime {
         "vehicle_parameters",
         "\"wheel_count\":8,\"mass_kg\":18000.0,\"wheel_radius_m\":0.55,"
         "\"track_m\":2.2,\"wheelbase_m\":4.4,\"max_steering_angle_deg\":30.0,"
-        "\"emergency_deceleration_mps2\":-8.0,\"motor_control_mode\":\"torque\"",
+        "\"emergency_deceleration_mps2\":-8.0,\"motor_control_mode\":\"torque\","
+        "\"full_scale_motor_torque_nm\":" +
+            std::to_string(full_scale_motor_torque_nm_),
         true);
     logger_.command("initial", initial);
     logger_.command("emergency", emergency);
@@ -1103,6 +1111,10 @@ class BridgeRuntime {
   double speed_mps() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return telemetry_.speed_mps;
+  }
+
+  double full_scale_motor_torque_nm() const {
+    return full_scale_motor_torque_nm_;
   }
 
   void log_api_failure(
@@ -1603,6 +1615,7 @@ class BridgeRuntime {
   }
 
   std::string can_interface_;
+  double full_scale_motor_torque_nm_;
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   SocketCan socket_;
@@ -1628,74 +1641,83 @@ class BridgeRuntime {
 
 std::unique_ptr<BridgeRuntime> g_runtime;
 
-}  // namespace
+int open_bridge_locked(
+    const char* can_interface,
+    double full_scale_motor_torque_nm) {
+  if (can_interface == nullptr || can_interface[0] == '\0' || g_runtime) {
+    emit_bridge_diagnostic(
+        "vehicle_vcu_start_failed",
+        g_runtime ? "vcu_bridge_already_open" : "vcu_can_interface_invalid",
+        "bridge_open",
+        g_runtime ? "VCU bridge is already open" : "CAN interface name is empty",
+        g_runtime
+            ? "Close the existing bridge instance before opening another."
+            : "Configure a non-empty SocketCAN interface such as can0.");
+    return -1;
+  }
 
-extern "C" int mine_teleop_chassis_open(const char* can_interface) {
+  VehicleParam vehicle = make_vehicle_param();
+  if (!Initialize(vehicle, can_interface)) {
+    emit_bridge_diagnostic(
+        "vehicle_vcu_start_failed",
+        "chassis_control_initialize_failed",
+        "chassis_control_initialize",
+        "ChassisControl Initialize returned false",
+        "Check ChassisControl dependencies, vehicle parameters, and CAN channel configuration.");
+    return -2;
+  }
+
+  const std::array<double, mine_teleop::vcu::kSteeringAxisCount> zero_steering{};
+  if (!UpdateVehicleState(make_vehicle_state(
+          0.0,
+          1,
+          0.0,
+          -8.0,
+          full_scale_motor_torque_nm,
+          zero_steering.data(),
+          static_cast<int>(zero_steering.size())))) {
+    emit_bridge_diagnostic(
+        "vehicle_vcu_start_failed",
+        "chassis_control_emergency_seed_failed",
+        "chassis_control_initial_command",
+        "ChassisControl rejected the emergency-stop seed state",
+        "Check ChassisControl input ranges and units.");
+    return -2;
+  }
+  const auto emergency = command_from_chassis_control(1);
+
+  if (!UpdateVehicleState(make_vehicle_state(
+          0.0,
+          1,
+          0.0,
+          0.0,
+          full_scale_motor_torque_nm,
+          zero_steering.data(),
+          static_cast<int>(zero_steering.size())))) {
+    emit_bridge_diagnostic(
+        "vehicle_vcu_start_failed",
+        "chassis_control_initial_seed_failed",
+        "chassis_control_initial_command",
+        "ChassisControl rejected the initial neutral seed state",
+        "Check ChassisControl input ranges and units.");
+    return -2;
+  }
+  const auto initial = command_from_chassis_control(1);
+
+  auto runtime = std::make_unique<BridgeRuntime>(
+      can_interface, full_scale_motor_torque_nm);
+  const int start_result = runtime->start(initial, emergency);
+  if (start_result != 0) return start_result;
+  g_runtime = std::move(runtime);
+  return 0;
+}
+
+int open_bridge(
+    const char* can_interface,
+    double full_scale_motor_torque_nm) noexcept {
   try {
     std::lock_guard<std::mutex> lock(g_api_mutex);
-    if (can_interface == nullptr || can_interface[0] == '\0' || g_runtime) {
-      emit_bridge_diagnostic(
-          "vehicle_vcu_start_failed",
-          g_runtime ? "vcu_bridge_already_open" : "vcu_can_interface_invalid",
-          "bridge_open",
-          g_runtime ? "VCU bridge is already open" : "CAN interface name is empty",
-          g_runtime
-              ? "Close the existing bridge instance before opening another."
-              : "Configure a non-empty SocketCAN interface such as can0.");
-      return -1;
-    }
-
-    VehicleParam vehicle = make_vehicle_param();
-    if (!Initialize(vehicle, can_interface)) {
-      emit_bridge_diagnostic(
-          "vehicle_vcu_start_failed",
-          "chassis_control_initialize_failed",
-          "chassis_control_initialize",
-          "ChassisControl Initialize returned false",
-          "Check ChassisControl dependencies, vehicle parameters, and CAN channel configuration.");
-      return -2;
-    }
-
-    const std::array<double, mine_teleop::vcu::kSteeringAxisCount> zero_steering{};
-    if (!UpdateVehicleState(make_vehicle_state(
-            0.0,
-            1,
-            0.0,
-            -8.0,
-            zero_steering.data(),
-            static_cast<int>(zero_steering.size())))) {
-      emit_bridge_diagnostic(
-          "vehicle_vcu_start_failed",
-          "chassis_control_emergency_seed_failed",
-          "chassis_control_initial_command",
-          "ChassisControl rejected the emergency-stop seed state",
-          "Check ChassisControl input ranges and units.");
-      return -2;
-    }
-    const auto emergency = command_from_chassis_control(1);
-
-    if (!UpdateVehicleState(make_vehicle_state(
-            0.0,
-            1,
-            0.0,
-            0.0,
-            zero_steering.data(),
-            static_cast<int>(zero_steering.size())))) {
-      emit_bridge_diagnostic(
-          "vehicle_vcu_start_failed",
-          "chassis_control_initial_seed_failed",
-          "chassis_control_initial_command",
-          "ChassisControl rejected the initial neutral seed state",
-          "Check ChassisControl input ranges and units.");
-      return -2;
-    }
-    const auto initial = command_from_chassis_control(1);
-
-    auto runtime = std::make_unique<BridgeRuntime>(can_interface);
-    const int start_result = runtime->start(initial, emergency);
-    if (start_result != 0) return start_result;
-    g_runtime = std::move(runtime);
-    return 0;
+    return open_bridge_locked(can_interface, full_scale_motor_torque_nm);
   } catch (const std::exception& error) {
     emit_bridge_diagnostic(
         "vehicle_vcu_start_failed",
@@ -1713,6 +1735,34 @@ extern "C" int mine_teleop_chassis_open(const char* can_interface) {
         "Check bridge/ChassisControl runtime dependencies.");
     return -5;
   }
+}
+
+}  // namespace
+
+extern "C" int mine_teleop_chassis_open(const char* can_interface) {
+  return open_bridge(
+      can_interface,
+      MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM);
+}
+
+extern "C" int mine_teleop_chassis_open_v1(
+    const MineTeleopChassisOpenConfigV1* config) {
+  if (config == nullptr ||
+      config->struct_size != sizeof(MineTeleopChassisOpenConfigV1) ||
+      !std::isfinite(config->full_scale_motor_torque_nm) ||
+      config->full_scale_motor_torque_nm < 0.0 ||
+      config->full_scale_motor_torque_nm >
+          MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM) {
+    emit_bridge_diagnostic(
+        "vehicle_vcu_start_failed",
+        "vcu_open_config_invalid",
+        "bridge_open_config",
+        "open_v1 config size or full-scale motor torque is invalid",
+        "Provide the current V1 struct and a finite torque in [0, 165] Nm.");
+    return -1;
+  }
+  return open_bridge(
+      config->can_interface, config->full_scale_motor_torque_nm);
 }
 
 extern "C" int mine_teleop_chassis_apply_state(
@@ -1741,6 +1791,7 @@ extern "C" int mine_teleop_chassis_apply_state(
         target_gear,
         target_vx,
         target_ax,
+        g_runtime->full_scale_motor_torque_nm(),
         steering_values,
         steering_count);
     if (!UpdateVehicleState(state)) {

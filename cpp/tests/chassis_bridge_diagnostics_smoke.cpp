@@ -3,16 +3,23 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-bool Initialize(const VehicleParam&, const std::string&) { return true; }
+int g_initialize_calls = 0;
+
+bool Initialize(const VehicleParam&, const std::string&) {
+  ++g_initialize_calls;
+  return true;
+}
 
 const std::vector<ControlInfo>& GetControlInfo() {
   static const std::vector<ControlInfo> controls(8);
@@ -62,20 +69,64 @@ int main() {
     expect(
         invalid_event.value("safety_action", "") == "local_full_stop",
         "bootstrap safety action is missing");
+    expect(g_initialize_calls == 0, "empty interface reached ChassisControl Initialize");
+
+    MineTeleopChassisOpenConfigV1 invalid_config{};
+    invalid_config.struct_size = sizeof(invalid_config) - 1;
+    invalid_config.can_interface = "mtmissing0";
+    invalid_config.full_scale_motor_torque_nm = 41.25;
+    expect(
+        mine_teleop_chassis_open_v1(&invalid_config) == -1,
+        "incorrect open_v1 struct size was accepted");
+    invalid_config.struct_size = sizeof(invalid_config);
+    invalid_config.full_scale_motor_torque_nm =
+        std::numeric_limits<double>::quiet_NaN();
+    expect(
+        mine_teleop_chassis_open_v1(&invalid_config) == -1,
+        "non-finite full-scale torque was accepted");
+    invalid_config.full_scale_motor_torque_nm = -0.1;
+    expect(
+        mine_teleop_chassis_open_v1(&invalid_config) == -1,
+        "negative full-scale torque was accepted");
+    invalid_config.full_scale_motor_torque_nm = 165.1;
+    expect(
+        mine_teleop_chassis_open_v1(&invalid_config) == -1,
+        "unreachable full-scale torque was accepted");
+    expect(g_initialize_calls == 0, "invalid open_v1 config reached ChassisControl Initialize");
+    expect(
+        std::abs(mine_teleop_chassis_scaled_target_acceleration(1.0, 82.5) - 2.0) < 1e-9,
+        "full throttle did not map to the configured traction acceleration");
+    expect(
+        std::abs(mine_teleop_chassis_scaled_target_acceleration(0.10, 82.5) - 0.20) < 1e-9,
+        "partial throttle did not scale linearly");
+    expect(
+        std::abs(mine_teleop_chassis_scaled_target_acceleration(1.0, 0.0)) < 1e-9,
+        "zero full-scale torque did not disable traction");
+    expect(
+        std::abs(mine_teleop_chassis_scaled_target_acceleration(-1.0, 165.0) + 1.0) < 1e-9,
+        "traction configuration changed the braking path");
 
     const auto log_path =
         std::filesystem::path("/tmp/mine-teleop-vcu-diagnostics-smoke.jsonl");
     std::error_code error;
     std::filesystem::remove(log_path, error);
     ::setenv("MINE_TELEOP_VCU_LOG_PATH", log_path.c_str(), 1);
-    const int socket_result =
-        mine_teleop_chassis_open("mtmissing0");
+    const MineTeleopChassisOpenConfigV1 valid_config{
+        sizeof(MineTeleopChassisOpenConfigV1), "mtmissing0", 82.5};
+    const int socket_result = mine_teleop_chassis_open_v1(&valid_config);
     ::unsetenv("MINE_TELEOP_VCU_LOG_PATH");
     expect(socket_result == -3, "missing SocketCAN interface was not rejected");
 
     const auto events = read_json_lines(log_path);
     bool socket_failure_found = false;
+    bool vehicle_parameters_found = false;
     for (const auto& event : events) {
+      if (event.value("name", "") == "vehicle_parameters") {
+        vehicle_parameters_found = true;
+        expect(
+            std::abs(event.value("full_scale_motor_torque_nm", -1.0) - 82.5) < 1e-9,
+            "configured full-scale torque is missing from bridge log");
+      }
       if (event.value("name", "") != "socket_open_failed") continue;
       socket_failure_found = true;
       expect(
@@ -94,6 +145,7 @@ int main() {
           !event.value("operator_action", "").empty(),
           "SocketCAN operator action is missing");
     }
+    expect(vehicle_parameters_found, "vehicle parameter event is missing");
     expect(socket_failure_found, "SocketCAN failure event is missing");
     std::filesystem::remove(log_path, error);
 

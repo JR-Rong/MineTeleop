@@ -98,6 +98,12 @@ struct BridgeTelemetry {
   int estop;
 };
 
+struct BridgeOpenConfigV1 {
+  std::uint32_t struct_size;
+  const char* can_interface;
+  double full_scale_motor_torque_nm;
+};
+
 struct BridgeFeedback {
   int shake_hand_status;
   int epb_status[4];
@@ -807,6 +813,10 @@ bool ice_transport_policy_is_valid(std::string_view value) {
 }
 
 Json VehicleConfig::redacted_summary() const {
+  const auto enabled = enabled_cameras();
+  const auto critical_camera_count = std::count_if(enabled.begin(), enabled.end(), [](const auto& camera) {
+    return camera.critical_for_control;
+  });
   return {
       {"event", "effective_vehicle_config"},
       {"runtime", "cpp"},
@@ -817,13 +827,15 @@ Json VehicleConfig::redacted_summary() const {
       {"control_enabled", runtime.control_enabled},
       {"media_enabled", runtime.media_enabled},
       {"teleop_poll_interval_ms", runtime.teleop_poll_interval_ms},
-      {"camera_count", enabled_cameras().size()},
+      {"camera_count", enabled.size()},
+      {"critical_camera_count", critical_camera_count},
       {"vehicle_adapter_type", vehicle_adapter.type},
       {"can_interface", hardware.can_interface},
       {"can_bitrate", hardware.can_bitrate},
       {"can_tx_queue_length", hardware.can_tx_queue_length},
       {"max_speed_kph", field_safety.max_speed_kph},
       {"max_throttle", field_safety.max_throttle},
+      {"full_scale_motor_torque_nm", field_safety.full_scale_motor_torque_nm},
       {"max_brake", field_safety.max_brake},
       {"max_steering_angle_deg", field_safety.max_steering_angle_deg},
       {"require_time_sync", field_safety.require_time_sync},
@@ -946,17 +958,34 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
     CameraConfig camera;
     camera.id = required<std::string>(node, "id", "camera");
     camera.enabled = optional<bool>(node, "enabled", true);
+    camera.critical_for_control = optional<bool>(node, "critical_for_control", true);
+    camera.reopen_attempts = optional<int>(node, "reopen_attempts", 3);
+    camera.reopen_backoff_ms = optional<int>(node, "reopen_backoff_ms", 500);
     camera.device = required<std::string>(node, "device", camera.id);
     camera.capture_width = optional<int>(node, "capture_width", 1280);
     camera.capture_height = optional<int>(node, "capture_height", 720);
     camera.capture_fps = optional<int>(node, "capture_fps", 30);
     camera.realtime_profile = required<std::string>(node, "realtime_profile", camera.id);
     camera.record_profile = optional<std::string>(node, "record_profile", "");
+    if (camera.reopen_attempts < 0 || camera.reopen_attempts > 10) {
+      throw std::runtime_error(camera.id + ".reopen_attempts must be in [0, 10]");
+    }
+    if (camera.reopen_backoff_ms < 0 || camera.reopen_backoff_ms > 60000) {
+      throw std::runtime_error(camera.id + ".reopen_backoff_ms must be in [0, 60000]");
+    }
     static_cast<void>(config.realtime_profile(camera.realtime_profile));
     if (!camera.record_profile.empty()) static_cast<void>(config.record_profile(camera.record_profile));
     config.cameras.push_back(std::move(camera));
   }
-  if (config.enabled_cameras().empty()) throw std::runtime_error("at least one camera must be enabled");
+  const auto enabled_cameras = config.enabled_cameras();
+  if (enabled_cameras.empty()) throw std::runtime_error("at least one camera must be enabled");
+  if (config.runtime.control_enabled &&
+      std::none_of(enabled_cameras.begin(), enabled_cameras.end(), [](const auto& camera) {
+        return camera.critical_for_control;
+      })) {
+    throw std::runtime_error(
+        "control-enabled vehicle requires at least one enabled camera with critical_for_control: true");
+  }
 
   const auto hardware = root["hardware"];
   const auto can = hardware["can"];
@@ -1005,6 +1034,8 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.field_safety.commissioning_mode = optional<std::string>(safety, "commissioning_mode", "bench");
   config.field_safety.max_speed_kph = optional<double>(safety, "max_speed_kph", 40.0);
   config.field_safety.max_throttle = optional<double>(safety, "max_throttle", 1.0);
+  config.field_safety.full_scale_motor_torque_nm =
+      optional<double>(safety, "full_scale_motor_torque_nm", 41.25);
   config.field_safety.max_brake = optional<double>(safety, "max_brake", 1.0);
   config.field_safety.max_steering_angle_deg =
       optional<double>(safety, "max_steering_angle_deg", 30.0);
@@ -1016,6 +1047,13 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
       optional<int>(safety, "max_time_sync_uncertainty_ms", 25);
   config.field_safety.time_sync_interval_ms = optional<int>(safety, "time_sync_interval_ms", 30000);
   config.field_safety.time_sync_samples = optional<int>(safety, "time_sync_samples", 7);
+  if (!std::isfinite(config.field_safety.full_scale_motor_torque_nm) ||
+      config.field_safety.full_scale_motor_torque_nm < 0.0 ||
+      config.field_safety.full_scale_motor_torque_nm > 165.0) {
+    throw std::runtime_error(
+        "field_safety.full_scale_motor_torque_nm must be finite and in [0, 165] Nm; "
+        "higher values require a validated chassis torque mapping");
+  }
   if (!std::isfinite(config.field_safety.max_speed_kph) ||
       config.field_safety.max_speed_kph < 0.0 ||
       !std::isfinite(config.field_safety.max_throttle) ||
@@ -1069,10 +1107,12 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   }
   if (config.vehicle_adapter.type != "mock" &&
       (!safety || !safety["max_speed_kph"] || !safety["max_throttle"] ||
-       !safety["max_brake"] || !safety["max_steering_angle_deg"])) {
+       !safety["full_scale_motor_torque_nm"] || !safety["max_brake"] ||
+       !safety["max_steering_angle_deg"])) {
     throw std::runtime_error(
         "non-mock vehicle adapter requires explicit field_safety max_speed_kph, "
-        "max_throttle, max_brake, and max_steering_angle_deg");
+        "max_throttle, full_scale_motor_torque_nm, max_brake, and "
+        "max_steering_angle_deg");
   }
   if (config.vehicle_adapter.type != "mock" && config.field_safety.max_speed_kph <= 0.0) {
     throw std::runtime_error("non-mock vehicle adapter requires field_safety.max_speed_kph > 0");
@@ -1213,14 +1253,18 @@ DynamicLibraryVehicleAdapter::DynamicLibraryVehicleAdapter(
     std::string can_interface,
     int can_bitrate,
     int can_tx_queue_length,
-    double max_speed_mps)
+    double max_speed_mps,
+    double full_scale_motor_torque_nm)
     : library_path_(std::move(library_path)),
       can_interface_(std::move(can_interface)),
       can_bitrate_(can_bitrate),
       can_tx_queue_length_(can_tx_queue_length),
-      max_speed_mps_(max_speed_mps) {
+      max_speed_mps_(max_speed_mps),
+      full_scale_motor_torque_nm_(full_scale_motor_torque_nm) {
   if (library_path_.empty() || can_interface_.empty() || can_bitrate_ <= 0 ||
-      can_tx_queue_length_ < 16 || max_speed_mps_ <= 0.0) {
+      can_tx_queue_length_ < 16 || max_speed_mps_ <= 0.0 ||
+      !std::isfinite(full_scale_motor_torque_nm_) ||
+      full_scale_motor_torque_nm_ < 0.0 || full_scale_motor_torque_nm_ > 165.0) {
     throw std::invalid_argument("dynamic adapter configuration is incomplete");
   }
 }
@@ -1249,7 +1293,7 @@ void DynamicLibraryVehicleAdapter::ensure_loaded() {
   }
 #endif
   try {
-    open_fn_ = load_symbol<OpenFn>(handle_, "mine_teleop_chassis_open");
+    open_v1_fn_ = load_symbol<OpenV1Fn>(handle_, "mine_teleop_chassis_open_v1");
     apply_fn_ = load_symbol<ApplyFn>(handle_, "mine_teleop_chassis_apply_state");
     stop_fn_ = load_symbol<StopFn>(handle_, "mine_teleop_chassis_emergency_stop");
     request_handshake_fn_ = load_symbol<HandshakeFn>(
@@ -1289,7 +1333,9 @@ void DynamicLibraryVehicleAdapter::open() {
 #if defined(__linux__)
     prepare_socketcan(can_interface_, can_bitrate_, can_tx_queue_length_);
 #endif
-    check_result(open_fn_(can_interface_.c_str()), "mine_teleop_chassis_open");
+    const BridgeOpenConfigV1 config{
+        sizeof(BridgeOpenConfigV1), can_interface_.c_str(), full_scale_motor_torque_nm_};
+    check_result(open_v1_fn_(&config), "mine_teleop_chassis_open_v1");
     opened_ = true;
   } catch (const std::exception& error) {
     last_error_ = error.what();
@@ -1467,7 +1513,8 @@ std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& conf
         config.vehicle_adapter.can_interface,
         config.hardware.can_bitrate,
         config.hardware.can_tx_queue_length,
-        config.field_safety.max_speed_kph / 3.6);
+        config.field_safety.max_speed_kph / 3.6,
+        config.field_safety.full_scale_motor_torque_nm);
   }
   throw std::runtime_error("unsupported vehicle adapter type: " + config.vehicle_adapter.type);
 }
@@ -1498,6 +1545,7 @@ VehicleControlService::VehicleControlService(
       require_feedback_before_control_(config.field_safety.require_can_feedback_before_control),
       max_speed_kph_(config.field_safety.max_speed_kph),
       max_throttle_(config.field_safety.max_throttle),
+      full_scale_motor_torque_nm_(config.field_safety.full_scale_motor_torque_nm),
       max_brake_(config.field_safety.max_brake),
       max_steering_angle_deg_(config.field_safety.max_steering_angle_deg),
       telemetry_interval_ms_(telemetry_interval_ms) {
@@ -1640,6 +1688,7 @@ Json VehicleControlService::control_limits() const {
   return {
       {"max_speed_kph", max_speed_kph_},
       {"max_throttle", max_throttle_},
+      {"full_scale_motor_torque_nm", full_scale_motor_torque_nm_},
       {"max_brake", max_brake_},
       {"max_steering_angle_deg", max_steering_angle_deg_},
   };

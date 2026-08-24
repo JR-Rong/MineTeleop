@@ -55,6 +55,9 @@ media:
 cameras:
   - id: front_uvc
     enabled: true
+    critical_for_control: true
+    reopen_attempts: 3
+    reopen_backoff_ms: 500
     device: /dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0
     capture_width: 1280
     capture_height: 720
@@ -63,6 +66,9 @@ cameras:
     record_profile: reuse_realtime
   - id: basler_25192546
     enabled: true
+    critical_for_control: true
+    reopen_attempts: 3
+    reopen_backoff_ms: 500
     device: basler:serial=25192546
     capture_width: 1280
     capture_height: 720
@@ -93,6 +99,9 @@ field_safety:
   max_speed_kph: 0
   # These remain authoritative even if the browser requests a larger value.
   max_throttle: 0.10
+  # Per motor channel at steady straight-line throttle=1.0 and brake=0.
+  # The effective ceiling is this value multiplied by max_throttle; 0 disables traction.
+  full_scale_motor_torque_nm: 41.25
   # Normalized ordinary-driving brake only. Set from vehicle brake calibration;
   # ESTOP/timeout/fault/disconnect safe-stop output bypasses this hard limit.
   max_brake: 1.0

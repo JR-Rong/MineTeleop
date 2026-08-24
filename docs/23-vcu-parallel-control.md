@@ -135,6 +135,7 @@ field_safety:
   commissioning_mode: bench
   max_speed_kph: 5
   max_throttle: 0.10
+  full_scale_motor_torque_nm: 41.25
   max_brake: 1.0
   max_steering_angle_deg: 5.0
   require_can_feedback_before_control: true
@@ -147,11 +148,23 @@ vehicle_adapter:
       bridge_library_path: /opt/mine-teleop/lib/vendor/chassis/libmine_teleop_chassis_bridge.so
 ```
 
-`max_speed_kph` 对非 mock adapter 必须大于 0；当前扭矩模式下它不是可替代 VCU
-限速器的硬件速度闭环。修改后先运行 `config-check`、`--preflight` 和
+`full_scale_motor_torque_nm` 表示直行、制动为 0、稳态、有效 `throttle=1.0`
+时的单电机通道目标值，允许 `0..165 Nm`，`0` 禁用驱动力。实际稳态上限仍会
+乘以 `max_throttle`，而且受 ChassisControl `300 Nm/s` 斜率限制，不能把它理解
+为瞬间跳变值或实测轮端转矩。`max_speed_kph` 对非 mock adapter 必须大于 0；
+当前扭矩模式下它不是可替代 VCU 限速器的硬件速度闭环。修改后先运行
+`config-check`、`--preflight` 和
 `--adapter-status`，确认 bridge、`libchassis_control.so`、`can1` 和日志目录都
 可用，再连接驾驶员。不得通过把 `require_can_feedback_before_control` 改成
 `false` 绕过反馈门禁。
+
+runtime 与 bridge 必须成套升级。当前 runtime 要求 bridge 提供
+`mine_teleop_chassis_open_v1`；旧 bridge 会在任何 CAN 初始化前明确启动失败，
+不会继续控制车辆并静默忽略 `full_scale_motor_torque_nm`。WebRTC 视频链与这一
+控制故障隔离：视频先协商并显示，控制 DataChannel 打开后才尝试启动 adapter；
+adapter 启动或运行失败会短暂上报握手 `fault`、关闭控制 DataChannel、拒绝
+驾驶命令并继续视频；关闭控制通道同时保护旧版本控制端不误报远程急停。该隔离不
+绕过配置校验，缺少实车必填 `field_safety` 键时进程仍会在媒体启动前拒绝运行。
 
 ```bash
 /opt/mine-teleop/bin/mine-teleop-run config-check \

@@ -39,9 +39,17 @@ mock`. On an isolated CAN bench, edit the deployed
 bridge path above and the same interface declared by `hardware.can.interface`
 (`can1` in the current field template), give `field_safety.max_speed_kph` a
 positive commissioning value, and set the authoritative
-`max_throttle`/`max_brake`/`max_steering_angle_deg` limits. `max_brake` limits
+`max_throttle`/`full_scale_motor_torque_nm`/`max_brake`/
+`max_steering_angle_deg` limits. `full_scale_motor_torque_nm` is the steady
+per-channel target at straight-line effective throttle 1.0 and brake 0; it is
+multiplied by the vehicle `max_throttle`, and the ChassisControl 300 Nm/s slew
+remains active. `max_brake` limits
 ordinary driving commands only; safety-stop braking bypasses it. The browser
 limit dialog can only reduce those vehicle-side limits.
+
+Upgrade the runtime and this bridge together. The current runtime requires the
+versioned `mine_teleop_chassis_open_v1` symbol. An older bridge fails before
+any CAN initialization instead of silently ignoring the torque configuration.
 
 Validate before service startup:
 
