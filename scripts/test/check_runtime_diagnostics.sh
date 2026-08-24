@@ -100,7 +100,14 @@ for contract in \
   fi
 done
 require_text "$media_runtime" '!control_link_opened_this_attempt'
-if [[ "$(grep -F -c 'stop_requested || control_inhibited || control_channel != channel' <<<"$control_message_block")" -lt 2 ]]; then
+# Profile and handshake callbacks must reject a stale DataChannel before they
+# can publish a rejection/status to the replacement channel. Ordinary control
+# has no response, so it may keep the identity check in its combined gate. The
+# executable control contract test verifies the ordering inside both branches;
+# this package-level check makes sure neither form disappears from production.
+if [[ "$(grep -F -c 'if (control_channel != channel) return;' <<<"$control_message_block")" -lt 2 ]] ||
+   [[ "$(grep -F -c 'stop_requested || control_inhibited || control_channel != channel' <<<"$control_message_block")" -lt 1 ]] ||
+   [[ "$(grep -F -c 'stop_requested || control_inhibited || !control_service_started' <<<"$control_message_block")" -lt 2 ]]; then
   printf 'media/control isolation contract missing: stale or tearing-down DataChannel commands are rejected\n' >&2
   exit 1
 fi
