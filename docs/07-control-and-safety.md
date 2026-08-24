@@ -85,6 +85,38 @@
 9. 如果 `estop=true`，立即锁存进入急停状态。
 10. 将命令交给安全状态机。
 
+## 车端本地车速闭环与换挡门禁
+
+真实底盘适配器把 `throttle` 解释为目标车速比例，车端目标为
+`clamp(throttle, 0, 1) * field_safety.max_speed_kph`。API 线程只保存最新意图；
+bridge 的单一 SocketCAN I/O 线程每 20 ms 用新鲜的带符号 VCU 车速运行 PID，并在
+同一线程串行调用 ChassisControl。PID 输出范围是 `[0, 1]`，到达目标点时积分项
+可以保留维持车速所需的正扭矩；每个电机通道的唯一牵引上限是
+`full_scale_motor_torque_nm`，`max_throttle` 不是额外扭矩系数。PID 以固定目标参考
+应用 0.05 m/s 复位死区：手柄小抖动不丢积分，累计偏移越过死区或目标明显下降才复位。
+
+制动优先于牵引：任何正制动都复位 PID、将八路电机扭矩置零，同时继续通过
+ChassisControl 生成 EHB 压力。零油门、非 Ready、换挡、实际挡位不匹配、车速
+反馈无效/过期或异常控制周期也复位 PID 并归零牵引。未经台架验证的 VCU 车速请求
+不参与闭环，`ADU_Tx_VehSpdReq` 在所有状态固定为 `0 km/h / Q=0`。
+
+车端和 VCU 状态机都要求进入 D/R 或 D/R 互换时具有新鲜有效的挡位/车速反馈，且
+绝对车速不大于 0.1 m/s；拒绝换挡时先撤销旧牵引。换挡闭环期间保持转角和 EHB
+压力连续，但八路扭矩保持为零。`WaitParkingBrakeReleased`、`WaitGear` 和
+`WaitActuatorModes` 都要求静止，车速超过 0.1 m/s 立即锁存停车并转入反向退出；
+每个首次启动等待态还有 500 ms 分层反馈宽限，超时后 CAN 静默不能无限保持 EPB
+释放。曾到达 Ready 后，apply 和 29 路关键反馈 watchdog 在后续换挡等待态继续生效。
+Ready 阶段即使零牵引或制动，车速超过配置最大值与独立 margin，或运动方向与所选
+D/R 相反超过 0.1 m/s，仍会锁存本地安全停车；普通控制命令不能解除。ESTOP 在
+WaitParallel 阶段撤销握手并保持 EPB 驻车，在之后的启动阶段立即进入带 EHB 安全
+制动的完整退出。恢复必须
+完成退出流程，并在新鲜反馈满足 N、零速、EPB 驻车、人工状态后显式重新握手。
+
+升级时必须重新标定 `full_scale_motor_torque_nm`。旧实现的有效上限曾是
+`full_scale_motor_torque_nm * max_throttle`；新版 PID 可以使用完整 full-scale，
+直接复用旧值可能把请求放大到原来的十倍。仓库 field 配置中的 PID 参数只是通过
+schema 范围校验的占位值，不是台架或实车验收值。
+
 ## 时间同步
 
 系统必须有最低限度的时间同步要求：

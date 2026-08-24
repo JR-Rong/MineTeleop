@@ -3,18 +3,31 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <linux/can.h>
+#include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/socket.h>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 int g_initialize_calls = 0;
+std::mutex g_vendor_mutex;
+std::vector<ControlInfo> g_controls(8);
+std::vector<VehicleState> g_vehicle_states;
+std::set<std::thread::id> g_vendor_update_threads;
 
 bool Initialize(const VehicleParam&, const std::string&) {
   ++g_initialize_calls;
@@ -22,11 +35,28 @@ bool Initialize(const VehicleParam&, const std::string&) {
 }
 
 const std::vector<ControlInfo>& GetControlInfo() {
-  static const std::vector<ControlInfo> controls(8);
-  return controls;
+  return g_controls;
 }
 
-bool UpdateVehicleState(const VehicleState&) { return true; }
+bool UpdateVehicleState(const VehicleState& state) {
+  std::lock_guard<std::mutex> lock(g_vendor_mutex);
+  g_vehicle_states.push_back(state);
+  g_vendor_update_threads.insert(std::this_thread::get_id());
+  const double normalized = state.target_acceleration[0];
+  const double direction = state.target_gear == 2 ? -1.0 : 1.0;
+  for (auto& control : g_controls) {
+    control.wheel_torque = normalized > 0.0
+        ? direction * normalized * 41.25
+        : 0.0;
+    control.wheel_speed = 0.0;
+    control.ehb_brk_pres_req = normalized < 0.0
+        ? std::min(-normalized * 10.0, 409.5)
+        : 0.0;
+    control.eps_ang_req = 0.0;
+    control.eps_ang_spd_req = 0.0;
+  }
+  return true;
+}
 
 namespace {
 
@@ -34,6 +64,243 @@ using Json = nlohmann::json;
 
 void expect(bool condition, const std::string& message) {
   if (!condition) throw std::runtime_error(message);
+}
+
+MineTeleopChassisOpenConfigV2 valid_v2_config(
+    const char* can_interface,
+    int control_timeout_ms = 800) {
+  return {
+      sizeof(MineTeleopChassisOpenConfigV2),
+      can_interface,
+      41.25,
+      10.0,
+      control_timeout_ms,
+      200,
+      1.0,
+      0.2,
+      0.0,
+      100.0,
+      100,
+      1.0,
+  };
+}
+
+MineTeleopChassisFeedback runtime_feedback(
+    int handshake,
+    int gear,
+    int parking_brake,
+    double speed_mps) {
+  MineTeleopChassisFeedback feedback{};
+  feedback.shake_hand_status = handshake;
+  feedback.gear_status = gear;
+  feedback.vehicle_speed = speed_mps;
+  feedback.vehicle_speed_valid = 1;
+  feedback.driver_gear_request = 1;
+  feedback.driver_gear_request_valid = 1;
+  for (int& value : feedback.epb_status) value = parking_brake;
+  for (int& value : feedback.mcu_mode) value = 1;
+  for (int& value : feedback.eps_mode) value = 1;
+  for (double& value : feedback.eps_angle) value = 0.0;
+  for (int& value : feedback.ehb_mode) value = 1;
+  return feedback;
+}
+
+void send_vehicle_status_feedback_frame(
+    int fd,
+    int gear,
+    int emergency_switch) {
+  can_frame frame{};
+  frame.can_id = 0x18F2F5D0U | CAN_EFF_FLAG;
+  frame.can_dlc = 8;
+  frame.data[0] = static_cast<std::uint8_t>(
+      ((gear & 0x03) << 2) | (emergency_switch & 0x03));
+  expect(
+      ::send(fd, &frame, sizeof(frame), 0) ==
+          static_cast<ssize_t>(sizeof(frame)),
+      "vehicle-status feedback frame injection failed");
+}
+
+template <typename Predicate>
+bool wait_until(Predicate predicate, int timeout_ms) {
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(timeout_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (predicate()) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return predicate();
+}
+
+bool wait_for_handshake_state(int expected, int timeout_ms = 500) {
+  return wait_until(
+      [&] {
+        MineTeleopChassisHandshakeStatus status{};
+        return mine_teleop_chassis_read_handshake_status(&status) == 0 &&
+            status.state == expected;
+      },
+      timeout_ms);
+}
+
+void complete_runtime_arming_to_ready(int drive_gear) {
+  auto feedback = runtime_feedback(5, 1, 2, 0.0);
+  expect(
+      mine_teleop_chassis_update_feedback(&feedback) == 0,
+      "runtime handshake feedback injection failed");
+  expect(
+      wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARKING_BRAKE_RELEASED),
+      "runtime did not accept intelligent handshake status");
+  feedback = runtime_feedback(5, 1, 1, 0.0);
+  expect(
+      mine_teleop_chassis_update_feedback(&feedback) == 0,
+      "runtime EPB release feedback injection failed");
+  expect(
+      wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR),
+      "runtime did not reach gear wait");
+  feedback = runtime_feedback(5, drive_gear, 1, 0.0);
+  expect(
+      mine_teleop_chassis_update_feedback(&feedback) == 0,
+      "runtime drive-gear feedback injection failed");
+  expect(
+      wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_ACTUATOR_MODES),
+      "runtime did not reach actuator-mode wait");
+  expect(
+      mine_teleop_chassis_update_feedback(&feedback) == 0,
+      "runtime actuator feedback injection failed");
+  expect(
+      wait_for_handshake_state(MINE_TELEOP_VCU_READY),
+      "runtime did not become Ready");
+}
+
+void drive_runtime_disarm_phase(
+    int source_state,
+    int target_state,
+    const MineTeleopChassisFeedback& feedback,
+    const char* scenario,
+    const char* phase) {
+  constexpr int kTestOnlyPhaseTimeoutMs = 1500;
+  const std::string context =
+      std::string(scenario) + " disarm " + phase;
+  int observed_state = -1;
+  const bool reached = wait_until(
+      [&] {
+        MineTeleopChassisHandshakeStatus status{};
+        expect(
+            mine_teleop_chassis_read_handshake_status(&status) == 0,
+            context + " status read failed");
+        observed_state = status.state;
+        if (observed_state == target_state) return true;
+        expect(
+            observed_state == source_state,
+            context + " reached unexpected state=" +
+                std::to_string(observed_state) +
+                " source=" + std::to_string(source_state) +
+                " target=" + std::to_string(target_state));
+        expect(
+            mine_teleop_chassis_update_feedback(&feedback) == 0,
+            context + " feedback injection failed");
+        return false;
+      },
+      kTestOnlyPhaseTimeoutMs);
+  expect(
+      reached,
+      context + " timed out in state=" + std::to_string(observed_state) +
+          " waiting for=" + std::to_string(target_state));
+}
+
+void complete_runtime_disarm(int actual_gear, const char* scenario) {
+  auto feedback = runtime_feedback(5, actual_gear, 1, 0.0);
+  // Hold DisarmStop until the test has observed it. A full compatibility
+  // feedback batch would otherwise also provide the next phase's fresh zero
+  // speed and can make this exact intermediate state scheduler-dependent.
+  feedback.vehicle_speed_valid = 0;
+  drive_runtime_disarm_phase(
+      MINE_TELEOP_VCU_DISARM_TORQUE,
+      MINE_TELEOP_VCU_DISARM_STOP,
+      feedback,
+      scenario,
+      "zero-torque confirmation");
+
+  feedback = runtime_feedback(5, actual_gear, 1, 0.0);
+  drive_runtime_disarm_phase(
+      MINE_TELEOP_VCU_DISARM_STOP,
+      MINE_TELEOP_VCU_DISARM_NEUTRAL,
+      feedback,
+      scenario,
+      "zero-speed confirmation");
+
+  feedback = runtime_feedback(5, 1, 1, 0.0);
+  drive_runtime_disarm_phase(
+      MINE_TELEOP_VCU_DISARM_NEUTRAL,
+      MINE_TELEOP_VCU_DISARM_PARKING_BRAKE,
+      feedback,
+      scenario,
+      "neutral confirmation");
+
+  feedback = runtime_feedback(5, 1, 2, 0.0);
+  drive_runtime_disarm_phase(
+      MINE_TELEOP_VCU_DISARM_PARKING_BRAKE,
+      MINE_TELEOP_VCU_DISARM_MANUAL,
+      feedback,
+      scenario,
+      "parking-brake confirmation");
+
+  feedback = runtime_feedback(3, 1, 2, 0.0);
+  drive_runtime_disarm_phase(
+      MINE_TELEOP_VCU_DISARM_MANUAL,
+      MINE_TELEOP_VCU_DISARMED,
+      feedback,
+      scenario,
+      "manual-handshake confirmation");
+}
+
+std::vector<can_frame> drain_can_frames(int fd, int duration_ms) {
+  std::vector<can_frame> frames;
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(duration_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    can_frame frame{};
+    const auto received = ::recv(fd, &frame, sizeof(frame), MSG_DONTWAIT);
+    if (received == static_cast<ssize_t>(sizeof(frame))) {
+      frames.push_back(frame);
+      continue;
+    }
+    if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+      throw std::runtime_error("failed to read adopted bridge transport");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return frames;
+}
+
+std::uint64_t little_endian_payload(const can_frame& frame) {
+  std::uint64_t value = 0;
+  for (std::size_t index = 0; index < 8; ++index) {
+    value |= static_cast<std::uint64_t>(frame.data[index]) << (index * 8U);
+  }
+  return value;
+}
+
+std::uint64_t can_signal(
+    const can_frame& frame,
+    unsigned start,
+    unsigned length) {
+  const auto mask = length == 64
+      ? std::numeric_limits<std::uint64_t>::max()
+      : (std::uint64_t{1} << length) - 1U;
+  return (little_endian_payload(frame) >> start) & mask;
+}
+
+const can_frame& last_frame_with_id(
+    const std::vector<can_frame>& frames,
+    std::uint32_t id) {
+  const auto found = std::find_if(
+      frames.rbegin(),
+      frames.rend(),
+      [&](const auto& frame) { return (frame.can_id & CAN_EFF_MASK) == id; });
+  if (found == frames.rend()) {
+    throw std::runtime_error("expected CAN frame was not transmitted");
+  }
+  return *found;
 }
 
 std::vector<Json> read_json_lines(const std::filesystem::path& path) {
@@ -47,10 +314,29 @@ std::vector<Json> read_json_lines(const std::filesystem::path& path) {
   return result;
 }
 
+std::size_t count_logged_events(
+    const std::filesystem::path& path,
+    const std::string& event_name) {
+  std::ifstream input(path);
+  expect(static_cast<bool>(input), "VCU JSONL smoke log was not created");
+  const auto needle = "\"name\":\"" + event_name + "\"";
+  std::size_t count = 0;
+  std::string line;
+  while (std::getline(input, line)) {
+    if (line.find(needle) != std::string::npos) ++count;
+  }
+  return count;
+}
+
 }  // namespace
 
 int main() {
   try {
+    expect(
+        mine_teleop_chassis_abi_version() == 2U &&
+            mine_teleop_chassis_open_config_v2_size() ==
+                sizeof(MineTeleopChassisOpenConfigV2),
+        "bridge ABI version or V2 open-config size query is inconsistent");
     std::ostringstream diagnostics;
     auto* previous = std::cerr.rdbuf(diagnostics.rdbuf());
     const int invalid_result = mine_teleop_chassis_open("");
@@ -94,11 +380,8 @@ int main() {
         "unreachable full-scale torque was accepted");
     expect(g_initialize_calls == 0, "invalid open_v1 config reached ChassisControl Initialize");
 
-    MineTeleopChassisOpenConfigV2 invalid_v2_config{};
+    auto invalid_v2_config = valid_v2_config("mtmissing0");
     invalid_v2_config.struct_size = sizeof(invalid_v2_config) - 1;
-    invalid_v2_config.can_interface = "mtmissing0";
-    invalid_v2_config.full_scale_motor_torque_nm = 41.25;
-    invalid_v2_config.control_timeout_ms = 800;
     expect(
         mine_teleop_chassis_open_v2(&invalid_v2_config) == -1,
         "incorrect open_v2 struct size was accepted");
@@ -119,6 +402,29 @@ int main() {
     expect(
         mine_teleop_chassis_open_v2(&invalid_v2_config) == -1,
         "unbounded control timeout was accepted");
+    invalid_v2_config.control_timeout_ms = 800;
+    invalid_v2_config.speed_feedback_timeout_ms =
+        MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS - 1;
+    expect(
+        mine_teleop_chassis_open_v2(&invalid_v2_config) == -1,
+        "sub-period speed feedback timeout was accepted");
+    invalid_v2_config.speed_feedback_timeout_ms = 200;
+    invalid_v2_config.speed_pid_kp =
+        std::numeric_limits<double>::quiet_NaN();
+    expect(
+        mine_teleop_chassis_open_v2(&invalid_v2_config) == -1,
+        "non-finite speed PID gain was accepted");
+    invalid_v2_config.speed_pid_kp = 1.0;
+    invalid_v2_config.speed_pid_max_dt_ms =
+        MINE_TELEOP_CHASSIS_MAX_SPEED_PID_MAX_DT_MS + 1;
+    expect(
+        mine_teleop_chassis_open_v2(&invalid_v2_config) == -1,
+        "unbounded speed PID dt was accepted");
+    invalid_v2_config.speed_pid_max_dt_ms = 100;
+    invalid_v2_config.hard_overspeed_margin_mps = 0.0;
+    expect(
+        mine_teleop_chassis_open_v2(&invalid_v2_config) == -1,
+        "zero hard overspeed margin was accepted");
     expect(g_initialize_calls == 0, "invalid open_v2 config reached ChassisControl Initialize");
     expect(
         std::abs(mine_teleop_chassis_scaled_target_acceleration(1.0, 82.5) - 2.0) < 1e-9,
@@ -136,6 +442,8 @@ int main() {
         std::abs(mine_teleop_chassis_motor_torque_limit_nm(0.10, 41.25) - 4.1) <
             1e-9 &&
             std::abs(mine_teleop_chassis_motor_torque_limit_nm(2.0, 41.25) - 41.2) <
+                1e-9 &&
+            std::abs(mine_teleop_chassis_motor_torque_limit_nm(1.0, 41.2) - 41.2) <
                 1e-9 &&
             std::abs(mine_teleop_chassis_motor_torque_limit_nm(-0.30, 41.25)) <
                 1e-9,
@@ -161,35 +469,13 @@ int main() {
                 4.1) < 1e-9,
         "vendor motor torque was not quantized toward zero before the authoritative clamp");
     expect(
-        std::abs(mine_teleop_chassis_target_speed_request_kph(7.5) - 27.0) < 1e-9,
-        "target speed was not converted from m/s to km/h");
-    expect(
-        std::abs(mine_teleop_chassis_target_speed_request_kph(0.0)) < 1e-9,
-        "zero target speed did not remain zero");
-    expect(
-        std::abs(mine_teleop_chassis_target_speed_request_kph(100.0) - 255.0) < 1e-9,
-        "target speed was not bounded to the VCU field");
-    expect(
-        mine_teleop_chassis_vehicle_speed_request_valid(3, 7.5, 0.10, 41.25) == 1 &&
-            mine_teleop_chassis_vehicle_speed_request_valid(2, 7.5, 0.10, 41.25) == 1,
-        "D/R positive traction did not enable the vehicle-speed request");
-    expect(
-        mine_teleop_chassis_vehicle_speed_request_valid(3, 0.0, 0.0, 41.25) == 0,
-        "released traction retained a valid zero-speed request");
-    expect(
-        mine_teleop_chassis_vehicle_speed_request_valid(
-            3, 0.5 / 3.6, 0.10, 41.25) == 0,
-        "a sub-resolution target exposed a valid zero-speed VCU request");
-    expect(
-        mine_teleop_chassis_vehicle_speed_request_valid(3, 0.0, -0.30, 41.25) == 0,
-        "ordinary braking retained a valid zero-speed request");
-    expect(
-        mine_teleop_chassis_vehicle_speed_request_valid(3, 7.5, 0.10, 0.0) == 0,
-        "disabled traction exposed a valid VCU speed request");
-    expect(
-        mine_teleop_chassis_vehicle_speed_request_valid(1, 7.5, 0.10, 41.25) == 0,
-        "neutral exposed a valid VCU speed request");
-
+        std::abs(
+            mine_teleop_chassis_clamp_motor_torque_nm(4.19, 1.0, 41.25) -
+            4.1) < 1e-9 &&
+            std::abs(
+                mine_teleop_chassis_clamp_motor_torque_nm(-4.19, 1.0, 41.25) +
+                4.1) < 1e-9,
+        "in-range vendor torque was not quantized toward zero at 0.1 Nm");
     const double nan = std::numeric_limits<double>::quiet_NaN();
     expect(
         mine_teleop_chassis_control_output_is_finite(0.0, 0.0, 0.0, 0.0, 0.0) == 1,
@@ -201,6 +487,115 @@ int main() {
             mine_teleop_chassis_control_output_is_finite(0.0, 0.0, 0.0, nan, 0.0) == 0 &&
             mine_teleop_chassis_control_output_is_finite(0.0, 0.0, 0.0, 0.0, nan) == 0,
         "non-finite ChassisControl output was not rejected before saturation");
+
+    const MineTeleopChassisSpeedPidConfig pid_config{
+        1.0, 0.5, 0.1, 100.0, 100};
+    MineTeleopChassisSpeedPidState pid_state{};
+    const double saturated_pid = mine_teleop_chassis_speed_pid_step(
+        &pid_config, &pid_state, 5.0, 0.0, 1.0, 0.02);
+    expect(
+        std::abs(saturated_pid - 1.0) < 1e-9,
+        "large local speed error did not saturate at the sole normalized full-scale ceiling");
+    expect(
+        std::abs(pid_state.integral) < 1e-9,
+        "speed PID integrated further into positive output saturation");
+
+    pid_state = MineTeleopChassisSpeedPidState{0.25, 0.0, 5.0, 1};
+    const double hold_pid = mine_teleop_chassis_speed_pid_step(
+        &pid_config, &pid_state, 5.0, 5.0, 1.0, 0.02);
+    expect(
+        hold_pid > 0.0 && std::abs(hold_pid - 0.25) < 1e-9,
+        "target-speed regulation forced a positive integral hold torque to zero");
+
+    expect(
+        mine_teleop_chassis_speed_pid_setpoint_requires_reset(
+            1, 3, 3, 5.0, 5.03) == 0 &&
+            mine_teleop_chassis_speed_pid_setpoint_requires_reset(
+                1, 3, 3, 5.0, 5.049) == 0,
+        "small analog target-speed jitter reset the fixed PID reference");
+    pid_state = MineTeleopChassisSpeedPidState{0.25, 0.0, 5.03, 1};
+    const double jitter_hold_pid = mine_teleop_chassis_speed_pid_step(
+        &pid_config, &pid_state, 5.03, 5.03, 1.0, 0.02);
+    expect(
+        std::abs(jitter_hold_pid - 0.25) < 1e-9 &&
+            std::abs(pid_state.integral - 0.25) < 1e-9,
+        "sub-deadband target jitter discarded the PID integral hold state");
+    expect(
+        mine_teleop_chassis_speed_pid_setpoint_requires_reset(
+            1, 3, 3, 5.0, 5.051) == 1 &&
+            mine_teleop_chassis_speed_pid_setpoint_requires_reset(
+                1, 3, 3, 5.0, 4.94) == 1 &&
+            mine_teleop_chassis_speed_pid_setpoint_requires_reset(
+                1, 3, 2, 5.0, 5.0) == 1,
+        "cumulative target drift, a material decrease, or D/R change did not reset the PID reference");
+    mine_teleop_chassis_speed_pid_reset(&pid_state);
+    const double reset_target_pid = mine_teleop_chassis_speed_pid_step(
+        &pid_config, &pid_state, 4.94, 4.94, 1.0, 0.02);
+    expect(
+        reset_target_pid == 0.0 && pid_state.integral == 0.0,
+        "material target decrease retained stale integral torque after reset");
+
+    MineTeleopChassisSpeedPidState d_pid_state{};
+    MineTeleopChassisSpeedPidState r_pid_state{};
+    const double d_output = mine_teleop_chassis_speed_pid_step(
+        &pid_config, &d_pid_state, 5.0, 4.5, 1.0, 0.02);
+    const double r_output = mine_teleop_chassis_speed_pid_step(
+        &pid_config, &r_pid_state, 5.0, -(-4.5), 1.0, 0.02);
+    expect(
+        std::abs(d_output - r_output) < 1e-9,
+        "D/R direction normalization produced materially different PID output");
+    expect(
+        mine_teleop_chassis_opposite_direction_motion(3, -0.11) == 1 &&
+            mine_teleop_chassis_opposite_direction_motion(2, 0.11) == 1 &&
+            mine_teleop_chassis_opposite_direction_motion(3, 0.11) == 0 &&
+            mine_teleop_chassis_opposite_direction_motion(2, -0.11) == 0,
+        "opposite-direction D/R motion was not rejected symmetrically");
+
+    pid_state.integral = 0.5;
+    pid_state.initialized = 1;
+    expect(
+        mine_teleop_chassis_speed_pid_step(
+            &pid_config,
+            &pid_state,
+            5.0,
+            std::numeric_limits<double>::quiet_NaN(),
+            1.0,
+            0.02) == 0.0 &&
+            pid_state.initialized == 0 && pid_state.integral == 0.0,
+        "non-finite speed feedback did not reset the PID to zero traction");
+    pid_state.integral = std::numeric_limits<double>::quiet_NaN();
+    pid_state.initialized = 1;
+    expect(
+        mine_teleop_chassis_speed_pid_step(
+            &pid_config, &pid_state, 5.0, 4.0, 1.0, 0.02) == 0.0 &&
+            pid_state.initialized == 0 && pid_state.integral == 0.0,
+        "non-finite PID state did not fail closed and reset");
+    pid_state.integral = 0.5;
+    pid_state.initialized = 1;
+    expect(
+        mine_teleop_chassis_speed_pid_step(
+            &pid_config, &pid_state, 5.0, 4.0, 1.0, 0.101) == 0.0 &&
+            pid_state.initialized == 0 && pid_state.integral == 0.0,
+        "abnormal control dt did not reset the PID to zero traction");
+
+    expect(
+        mine_teleop_chassis_hard_overspeed_latch(0, 10.0, 11.0, 1.0) == 0 &&
+            mine_teleop_chassis_hard_overspeed_latch(0, 10.0, 11.01, 1.0) == 1 &&
+            mine_teleop_chassis_hard_overspeed_latch(0, 0.0, 1.01, 1.0) == 1 &&
+            mine_teleop_chassis_hard_overspeed_latch(1, 10.0, 0.0, 1.0) == 1,
+        "hard overspeed boundary or latch persistence is incorrect");
+    expect(
+        std::abs(mine_teleop_chassis_clamp_directional_motor_torque_nm(
+                     100.0, 3, 1.0, 41.25) -
+                 41.2) < 1e-9 &&
+            std::abs(mine_teleop_chassis_clamp_directional_motor_torque_nm(
+                         -100.0, 2, 1.0, 41.25) +
+                     41.2) < 1e-9 &&
+            mine_teleop_chassis_clamp_directional_motor_torque_nm(
+                -100.0, 3, 1.0, 41.25) == 0.0 &&
+            mine_teleop_chassis_clamp_directional_motor_torque_nm(
+                100.0, 2, 1.0, 41.25) == 0.0,
+        "D/R directional torque hard limit admitted opposite-sign torque");
 
     expect(
         mine_teleop_chassis_control_watchdog_expired(1, 1, 0, 799, 800) == 0 &&
@@ -218,9 +613,9 @@ int main() {
     const MineTeleopChassisOpenConfigV1 valid_v1_config{
         sizeof(MineTeleopChassisOpenConfigV1), "mtmissing0", 82.5};
     const int v1_socket_result = mine_teleop_chassis_open_v1(&valid_v1_config);
-    const MineTeleopChassisOpenConfigV2 valid_v2_config{
-        sizeof(MineTeleopChassisOpenConfigV2), "mtmissing0", 82.5, 900};
-    const int v2_socket_result = mine_teleop_chassis_open_v2(&valid_v2_config);
+    auto configured_v2 = valid_v2_config("mtmissing0", 900);
+    configured_v2.full_scale_motor_torque_nm = 82.5;
+    const int v2_socket_result = mine_teleop_chassis_open_v2(&configured_v2);
     ::unsetenv("MINE_TELEOP_VCU_LOG_PATH");
     expect(
         v1_socket_result == -3 && v2_socket_result == -3,
@@ -269,6 +664,617 @@ int main() {
         "open_v2 configured control timeout is missing from bridge log");
     expect(socket_failure_count == 2, "versioned SocketCAN failure events are missing");
     std::filesystem::remove(log_path, error);
+
+    int transport[2]{-1, -1};
+    expect(
+        ::socketpair(AF_UNIX, SOCK_DGRAM, 0, transport) == 0,
+        "unprivileged adopted bridge transport could not be created");
+    const auto runtime_log_path =
+        std::filesystem::path("/tmp/mine-teleop-vcu-runtime-smoke.jsonl");
+    std::filesystem::remove(runtime_log_path, error);
+    ::setenv("MINE_TELEOP_VCU_LOG_PATH", runtime_log_path.c_str(), 1);
+    const auto adopted_fd = std::to_string(transport[0]);
+    ::setenv("MINE_TELEOP_CHASSIS_TEST_FD", adopted_fd.c_str(), 1);
+    auto runtime_config = valid_v2_config("mt-test", 180);
+    runtime_config.speed_feedback_timeout_ms = 100;
+    expect(
+        mine_teleop_chassis_open_v2(&runtime_config) == 0,
+        "V2 bridge did not adopt the unprivileged smoke transport");
+    ::unsetenv("MINE_TELEOP_CHASSIS_TEST_FD");
+    ::unsetenv("MINE_TELEOP_VCU_LOG_PATH");
+    {
+      std::lock_guard<std::mutex> lock(g_vendor_mutex);
+      g_vehicle_states.clear();
+      g_vendor_update_threads.clear();
+    }
+
+    auto feedback = runtime_feedback(3, 1, 2, 11.1);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "standby high-speed feedback injection failed");
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));
+    feedback = runtime_feedback(3, 1, 2, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "initial runtime feedback injection failed");
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == 0,
+        "standby speed incorrectly latched an authority-state hard fuse or the fresh gate rejected the initial handshake");
+    const std::array<double, 4> steering{0.2, 0.2, 0.2, 0.2};
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 5.0, 0.01, steering.data(), steering.size()) == 0,
+        "fresh zero-speed N-to-D intent was rejected");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "runtime did not reach parallel-handshake wait");
+    static_cast<void>(drain_can_frames(transport[1], 540));
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "first handshake wait incorrectly armed the post-Ready apply or critical-feedback watchdog");
+    complete_runtime_arming_to_ready(3);
+    feedback = runtime_feedback(5, 3, 1, 0.0);
+
+    static_cast<void>(drain_can_frames(transport[1], 10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(70));
+    expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "ready feedback refresh failed");
+    const auto pid_frames = drain_can_frames(transport[1], 40);
+    const auto& pid_motor = last_frame_with_id(pid_frames, 0x18F0D0F5U);
+    const auto& pid_speed = last_frame_with_id(pid_frames, 0x18FED0F5U);
+    expect(
+        can_signal(pid_motor, 8, 14) == 8412,
+        "0.01 traction enable did not allow PID output up to the 41.2 Nm quantized full-scale ceiling");
+    expect(
+        can_signal(pid_speed, 0, 8) == 0 && can_signal(pid_speed, 8, 8) == 0,
+        "Ready local PID emitted a VCU vehicle-speed request");
+    {
+      std::lock_guard<std::mutex> lock(g_vendor_mutex);
+      expect(
+          g_vehicle_states.size() >= 3,
+          "vendor control was not recalculated over multiple 20 ms ticks without another apply");
+      expect(
+          g_vendor_update_threads.size() == 1,
+          "runtime vendor updates executed from more than the single IO thread");
+      expect(
+          g_vehicle_states.back().target_acceleration[0] > 0.99F,
+          "large PID error did not saturate normalized traction at full scale");
+    }
+
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "pre-software-ESTOP Ready-D feedback refresh failed");
+    static_cast<void>(drain_can_frames(transport[1], 10));
+    expect(
+        mine_teleop_chassis_emergency_stop() == 0,
+        "Ready-D software emergency stop was rejected");
+    const auto software_stop_frames = drain_can_frames(transport[1], 40);
+    expect(
+        can_signal(
+            last_frame_with_id(software_stop_frames, 0x18F0D0F5U), 8, 14) ==
+                8000 &&
+            can_signal(
+                last_frame_with_id(software_stop_frames, 0x18FFD0F5U), 4, 12) >
+                0 &&
+            can_signal(
+                last_frame_with_id(software_stop_frames, 0x18FED0F5U), 0, 8) ==
+                0 &&
+            can_signal(
+                last_frame_with_id(software_stop_frames, 0x18FED0F5U), 8, 8) ==
+                0,
+        "Ready-D software emergency did not produce zero torque, EHB braking, and speed Q0");
+    MineTeleopChassisTelemetry software_stop_telemetry{};
+    MineTeleopChassisHandshakeStatus software_stop_status{};
+    expect(
+        mine_teleop_chassis_read_telemetry(&software_stop_telemetry) == 0 &&
+            software_stop_telemetry.estop == 1 &&
+            mine_teleop_chassis_read_handshake_status(&software_stop_status) == 0 &&
+            software_stop_status.state == MINE_TELEOP_VCU_READY &&
+            software_stop_status.ready == 1 &&
+            software_stop_status.disarming == 0,
+        "Ready-D software emergency unexpectedly left Ready before reset");
+
+    const std::array<double, 4> zero_steering{};
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            mine_teleop_chassis_apply_state(
+                3, 0.0, 0.0, zero_steering.data(), zero_steering.size()) == 0,
+        "same-D zero-output software ESTOP reset was rejected");
+    expect(
+        wait_until(
+            [] {
+              MineTeleopChassisTelemetry telemetry{};
+              MineTeleopChassisHandshakeStatus status{};
+              return mine_teleop_chassis_read_telemetry(&telemetry) == 0 &&
+                  mine_teleop_chassis_read_handshake_status(&status) == 0 &&
+                  telemetry.estop == 0 &&
+                  status.state == MINE_TELEOP_VCU_READY &&
+                  status.ready == 1 &&
+                  status.disarming == 0;
+            },
+            100),
+        "same-D zero output did not clear software ESTOP while retaining Ready");
+    const auto software_reset_frames = drain_can_frames(transport[1], 30);
+    expect(
+        can_signal(
+            last_frame_with_id(software_reset_frames, 0x18F0D0F5U), 8, 14) ==
+                8000 &&
+            can_signal(
+                last_frame_with_id(software_reset_frames, 0x18FFD0F5U), 4, 12) ==
+                0,
+        "same-D zero-output reset retained stale traction or braking");
+
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            mine_teleop_chassis_apply_state(
+                3, 5.0, 0.01, steering.data(), steering.size()) == 0,
+        "fresh D traction was rejected after software ESTOP reset");
+    const auto software_recovery_frames = drain_can_frames(transport[1], 40);
+    expect(
+        can_signal(
+            last_frame_with_id(software_recovery_frames, 0x18F0D0F5U), 8, 14) >
+            8000,
+        "fresh D intent did not restore traction after software ESTOP reset");
+    expect(
+        mine_teleop_chassis_read_telemetry(&software_stop_telemetry) == 0 &&
+            software_stop_telemetry.estop == 0 &&
+            mine_teleop_chassis_read_handshake_status(&software_stop_status) == 0 &&
+            software_stop_status.state == MINE_TELEOP_VCU_READY,
+        "fresh D traction did not retain cleared ESTOP and Ready state");
+
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 0.0, -0.3, steering.data(), steering.size()) == 0,
+        "ordinary brake intent was rejected");
+    std::this_thread::sleep_for(std::chrono::milliseconds(45));
+    const auto brake_frames = drain_can_frames(transport[1], 25);
+    const auto& brake_motor = last_frame_with_id(brake_frames, 0x18F0D0F5U);
+    const auto& brake_ehb = last_frame_with_id(brake_frames, 0x18FFD0F5U);
+    const auto& brake_speed = last_frame_with_id(brake_frames, 0x18FED0F5U);
+    expect(
+        can_signal(brake_motor, 8, 14) == 8000,
+        "brake intent retained traction torque");
+    expect(
+        can_signal(brake_ehb, 4, 12) == 30,
+        "brake intent did not continue through ChassisControl to EHB pressure");
+    expect(
+        can_signal(brake_speed, 0, 8) == 0 &&
+            can_signal(brake_speed, 8, 8) == 0,
+        "brake intent emitted a VCU vehicle-speed request");
+
+    const auto preexisting_control_apply_timeouts =
+        count_logged_events(runtime_log_path, "control_apply_timeout");
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 5.0, 0.01, steering.data(), steering.size()) == 0,
+        "traction did not resume after ordinary brake release");
+    feedback = runtime_feedback(5, 3, 1, 4.9);
+    for (int index = 0; index < 4; ++index) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(55));
+      expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "watchdog feedback refresh failed");
+    }
+    const auto watchdog_frames = drain_can_frames(transport[1], 40);
+    const auto& watchdog_motor = last_frame_with_id(watchdog_frames, 0x18F0D0F5U);
+    const auto& watchdog_ehb = last_frame_with_id(watchdog_frames, 0x18FFD0F5U);
+    const auto& watchdog_speed = last_frame_with_id(watchdog_frames, 0x18FED0F5U);
+    expect(
+        can_signal(watchdog_motor, 8, 14) == 8000 &&
+            can_signal(watchdog_ehb, 4, 12) > 0 &&
+            can_signal(watchdog_speed, 0, 8) == 0 &&
+            can_signal(watchdog_speed, 8, 8) == 0,
+        "apply timeout did not produce zero torque, EHB safe braking, and Q0");
+    MineTeleopChassisTelemetry timeout_telemetry{};
+    expect(
+        mine_teleop_chassis_read_telemetry(&timeout_telemetry) == 0 &&
+            timeout_telemetry.estop == 1,
+        "apply timeout did not expose the local ESTOP state");
+
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 5.0, 0.01, steering.data(), steering.size()) == 0,
+        "normal apply did not recover the non-hard apply watchdog latch");
+    expect(
+        wait_until(
+            [] {
+              std::lock_guard<std::mutex> lock(g_vendor_mutex);
+              return !g_vehicle_states.empty() &&
+                  g_vehicle_states.back().target_acceleration[0] >= 0.099F;
+            },
+            100),
+        "post-timeout apply did not run the reset PID in the 20 ms IO loop");
+    {
+      std::lock_guard<std::mutex> lock(g_vendor_mutex);
+      const double reset_proportional_output =
+          5.0 - timeout_telemetry.speed_mps;
+      expect(
+          !g_vehicle_states.empty() &&
+              g_vehicle_states.back().target_acceleration[0] >=
+                  reset_proportional_output &&
+              g_vehicle_states.back().target_acceleration[0] <
+                  reset_proportional_output + 0.0015,
+          "post-timeout PID retained pre-stop integral instead of restarting from reset state");
+    }
+    feedback = runtime_feedback(5, 3, 1, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "pre-shift feedback refresh failed");
+    expect(
+        mine_teleop_chassis_apply_state(
+            2, 0.0, 0.0, steering.data(), steering.size()) == 0,
+        "fresh stopped D-to-R intent was rejected");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR),
+        "post-Ready gear change did not enter retained WaitGear");
+    expect(
+        wait_until(
+            [&] {
+              expect(
+                  mine_teleop_chassis_update_feedback(&feedback) == 0,
+                  "retained WaitGear watchdog feedback refresh failed");
+              MineTeleopChassisHandshakeStatus status{};
+              return mine_teleop_chassis_read_handshake_status(&status) == 0 &&
+                  status.state == MINE_TELEOP_VCU_DISARM_TORQUE;
+            },
+            1500),
+        "post-Ready WaitGear did not retain the apply watchdog or enter safe disarm");
+    const auto retained_watchdog_frames = drain_can_frames(transport[1], 40);
+    expect(
+        can_signal(
+            last_frame_with_id(retained_watchdog_frames, 0x18F0D0F5U),
+            8,
+            14) == 8000 &&
+            can_signal(
+                last_frame_with_id(retained_watchdog_frames, 0x18FFD0F5U),
+                4,
+                12) > 0,
+        "retained WaitGear apply timeout did not produce zero torque and EHB safety braking");
+    complete_runtime_disarm(3, "retained WaitGear apply-watchdog");
+
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == 0,
+        "post-watchdog disarmed controller could not request a new handshake");
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 5.0, 0.01, steering.data(), steering.size()) == 0,
+        "post-watchdog D intent was rejected");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "post-watchdog runtime did not restart the handshake");
+    complete_runtime_arming_to_ready(3);
+
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 0.0, 0.0, steering.data(), steering.size()) == 0,
+        "zero-traction intent was rejected before Ready overspeed checking");
+    feedback = runtime_feedback(5, 3, 1, 11.1);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "Ready overspeed feedback injection failed");
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));
+    MineTeleopChassisTelemetry hard_speed_telemetry{};
+    expect(
+        mine_teleop_chassis_read_telemetry(&hard_speed_telemetry) == 0 &&
+            hard_speed_telemetry.estop == 1,
+        "Ready zero-traction overspeed did not latch the local ESTOP");
+    const auto hard_speed_frames = drain_can_frames(transport[1], 40);
+    expect(
+        can_signal(last_frame_with_id(hard_speed_frames, 0x18F0D0F5U), 8, 14) ==
+                8000 &&
+            can_signal(last_frame_with_id(hard_speed_frames, 0x18FFD0F5U), 4, 12) >
+                0,
+        "Ready hard-speed fuse did not produce zero torque and EHB safety braking");
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 5.0, 0.01, steering.data(), steering.size()) == -3,
+        "ordinary apply cleared the Ready hard-speed latch");
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == -2,
+        "hard-speed latch cleared without completed Disarmed recovery");
+    expect(
+        mine_teleop_chassis_disconnect_parallel_handshake() == 0,
+        "hard-speed latch prevented explicit disarm");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_DISARM_TORQUE),
+        "explicit hard-speed recovery did not start the reverse handshake");
+    complete_runtime_disarm(3, "hard-speed recovery");
+
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == 0,
+        "fresh stopped N/EPB/manual handshake did not clear the hard-speed latch");
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 0.0, 0.0, steering.data(), steering.size()) == 0,
+        "post-hard-speed D intent was rejected");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "post-hard-speed runtime did not restart the handshake");
+    complete_runtime_arming_to_ready(3);
+
+    feedback = runtime_feedback(5, 3, 1, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "pre-arming-motion feedback refresh failed");
+    expect(
+        mine_teleop_chassis_apply_state(
+            2, 0.0, 0.0, steering.data(), steering.size()) == 0,
+        "fresh stopped shift intent before arming-motion test was rejected");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR),
+        "arming-motion test did not reach WaitGear");
+    feedback = runtime_feedback(5, 3, 1, 0.2);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "WaitGear motion feedback injection failed");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_DISARM_TORQUE),
+        "fresh WaitGear motion above 0.1 m/s did not latch and enter safe disarm");
+    const auto arming_motion_frames = drain_can_frames(transport[1], 40);
+    expect(
+        can_signal(
+            last_frame_with_id(arming_motion_frames, 0x18F0D0F5U), 8, 14) ==
+                8000 &&
+            can_signal(
+                last_frame_with_id(arming_motion_frames, 0x18FFD0F5U), 4, 12) >
+                0,
+        "WaitGear motion latch did not produce zero torque and EHB safety braking");
+    expect(
+        mine_teleop_chassis_apply_state(
+            2, 0.0, 0.0, steering.data(), steering.size()) == -3,
+        "ordinary apply cleared the WaitGear motion latch");
+    expect(
+        mine_teleop_chassis_disconnect_parallel_handshake() == 0,
+        "WaitGear motion latch prevented explicit disarm");
+    complete_runtime_disarm(3, "WaitGear motion recovery");
+
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == 0,
+        "post-arming-motion handshake recovery failed");
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 0.0, 0.0, steering.data(), steering.size()) == 0,
+        "post-arming-motion D intent was rejected");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "post-arming-motion runtime did not restart the handshake");
+    complete_runtime_arming_to_ready(3);
+
+    feedback = runtime_feedback(5, 3, 1, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "pre-critical-watchdog feedback refresh failed");
+    expect(
+        mine_teleop_chassis_apply_state(
+            2, 0.0, 0.0, steering.data(), steering.size()) == 0,
+        "critical-watchdog shift intent was rejected");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR),
+        "critical-watchdog test did not reach retained WaitGear");
+    feedback = runtime_feedback(5, 2, 1, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "critical-watchdog R feedback injection failed");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_ACTUATOR_MODES),
+        "critical-watchdog test did not reach retained WaitActuatorModes");
+    for (int index = 0; index < 4; ++index) {
+      static_cast<void>(drain_can_frames(transport[1], 100));
+      expect(
+          mine_teleop_chassis_apply_state(
+              2, 0.0, 0.0, steering.data(), steering.size()) == 0,
+          "fresh apply was rejected before the retained critical-feedback deadline");
+    }
+    static_cast<void>(drain_can_frames(transport[1], 140));
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_FAULT),
+        "post-Ready WaitActuatorModes did not retain the critical-feedback watchdog");
+    const auto critical_frames = drain_can_frames(transport[1], 40);
+    expect(
+        can_signal(last_frame_with_id(critical_frames, 0x18F0D0F5U), 8, 14) ==
+                8000 &&
+            can_signal(last_frame_with_id(critical_frames, 0x18FFD0F5U), 4, 12) >
+                0,
+        "retained critical-feedback timeout did not produce zero torque and EHB safety braking");
+    expect(
+        mine_teleop_chassis_disconnect_parallel_handshake() == 0,
+        "critical-feedback fault prevented explicit disarm");
+    complete_runtime_disarm(2, "critical-feedback fault recovery");
+    expect(mine_teleop_chassis_close() == 0, "runtime smoke bridge did not close cleanly");
+    ::close(transport[0]);
+    ::close(transport[1]);
+
+    const auto runtime_events = read_json_lines(runtime_log_path);
+    expect(
+        count_logged_events(runtime_log_path, "control_apply_timeout") ==
+            preexisting_control_apply_timeouts + 2,
+        "Ready and retained-WaitGear apply watchdogs did not each add one latch/log");
+    expect(
+        std::count_if(runtime_events.begin(), runtime_events.end(), [](const auto& event) {
+          return event.value("name", "") == "hard_overspeed_latched";
+        }) == 1,
+        "Ready hard overspeed did not latch/log exactly once");
+    expect(
+        std::count_if(runtime_events.begin(), runtime_events.end(), [](const auto& event) {
+          return event.value("name", "") == "arming_motion_latched";
+        }) == 1,
+        "stationary WaitGear motion did not latch/log exactly once");
+    expect(
+        std::count_if(runtime_events.begin(), runtime_events.end(), [](const auto& event) {
+          return event.value("name", "") == "feedback_timeout";
+        }) == 1,
+        "post-Ready retained-state critical feedback did not time out exactly once");
+    std::filesystem::remove(runtime_log_path, error);
+
+    int arming_transport[2]{-1, -1};
+    expect(
+        ::socketpair(AF_UNIX, SOCK_DGRAM, 0, arming_transport) == 0,
+        "arming-watchdog adopted transport could not be created");
+    const auto arming_log_path =
+        std::filesystem::path("/tmp/mine-teleop-vcu-arming-watchdog-smoke.jsonl");
+    std::filesystem::remove(arming_log_path, error);
+    ::setenv("MINE_TELEOP_VCU_LOG_PATH", arming_log_path.c_str(), 1);
+    const auto arming_adopted_fd = std::to_string(arming_transport[0]);
+    ::setenv("MINE_TELEOP_CHASSIS_TEST_FD", arming_adopted_fd.c_str(), 1);
+    expect(
+        mine_teleop_chassis_open_v2(&runtime_config) == 0,
+        "arming-watchdog bridge did not adopt the unprivileged transport");
+    ::unsetenv("MINE_TELEOP_CHASSIS_TEST_FD");
+    ::unsetenv("MINE_TELEOP_VCU_LOG_PATH");
+    feedback = runtime_feedback(3, 1, 2, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            mine_teleop_chassis_request_parallel_handshake() == 0,
+        "arming-watchdog initial gate or handshake failed");
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 0.0, 0.0, steering.data(), steering.size()) == 0,
+        "arming-watchdog D intent was rejected");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "arming-watchdog runtime did not reach handshake wait");
+    feedback = runtime_feedback(5, 1, 2, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            wait_for_handshake_state(
+                MINE_TELEOP_VCU_WAIT_PARKING_BRAKE_RELEASED),
+        "arming-watchdog runtime did not reach EPB-release wait");
+    feedback = runtime_feedback(5, 1, 1, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR),
+        "arming-watchdog runtime did not reach WaitGear after EPB release");
+    static_cast<void>(drain_can_frames(arming_transport[1], 540));
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_FAULT),
+        "initial WaitGear CAN silence exceeded its entry grace without a safe fault");
+    const auto arming_timeout_frames = drain_can_frames(arming_transport[1], 40);
+    expect(
+        can_signal(
+            last_frame_with_id(arming_timeout_frames, 0x18F0D0F5U), 8, 14) ==
+                8000 &&
+            can_signal(
+                last_frame_with_id(arming_timeout_frames, 0x18FFD0F5U), 4, 12) >
+                0,
+        "initial arming CAN silence did not produce zero torque and EHB safety braking");
+    expect(
+        mine_teleop_chassis_disconnect_parallel_handshake() == 0,
+        "initial arming feedback fault prevented explicit disarm");
+    complete_runtime_disarm(1, "initial-arming feedback-fault recovery");
+    expect(
+        mine_teleop_chassis_close() == 0,
+        "arming-watchdog runtime did not close cleanly");
+    ::close(arming_transport[0]);
+    ::close(arming_transport[1]);
+    const auto arming_events = read_json_lines(arming_log_path);
+    expect(
+        std::count_if(arming_events.begin(), arming_events.end(), [](const auto& event) {
+          return event.value("name", "") == "arming_feedback_timeout";
+        }) == 1,
+        "initial arming feedback deadline did not latch/log exactly once");
+    std::filesystem::remove(arming_log_path, error);
+
+    int physical_transport[2]{-1, -1};
+    expect(
+        ::socketpair(AF_UNIX, SOCK_DGRAM, 0, physical_transport) == 0,
+        "physical-ESTOP adopted transport could not be created");
+    const auto physical_log_path =
+        std::filesystem::path("/tmp/mine-teleop-vcu-physical-estop-smoke.jsonl");
+    std::filesystem::remove(physical_log_path, error);
+    ::setenv("MINE_TELEOP_VCU_LOG_PATH", physical_log_path.c_str(), 1);
+    const auto physical_adopted_fd = std::to_string(physical_transport[0]);
+    ::setenv("MINE_TELEOP_CHASSIS_TEST_FD", physical_adopted_fd.c_str(), 1);
+    auto physical_config = valid_v2_config("mt-test", 800);
+    expect(
+        mine_teleop_chassis_open_v2(&physical_config) == 0,
+        "physical-ESTOP bridge did not adopt the unprivileged transport");
+    ::unsetenv("MINE_TELEOP_CHASSIS_TEST_FD");
+    ::unsetenv("MINE_TELEOP_VCU_LOG_PATH");
+
+    feedback = runtime_feedback(3, 1, 2, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            mine_teleop_chassis_request_parallel_handshake() == 0,
+        "physical-ESTOP runtime initial gate or handshake failed");
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 5.0, 0.01, steering.data(), steering.size()) == 0,
+        "physical-ESTOP runtime D intent was rejected");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "physical-ESTOP runtime did not begin arming");
+    complete_runtime_arming_to_ready(3);
+    static_cast<void>(drain_can_frames(physical_transport[1], 30));
+
+    // Send an asserted and released VehicleStatus back-to-back. The ingest-time
+    // latch must retain even when both frames are drained in one 20 ms cycle.
+    send_vehicle_status_feedback_frame(physical_transport[1], 3, 1);
+    send_vehicle_status_feedback_frame(physical_transport[1], 3, 0);
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_DISARM_TORQUE),
+        "physical emergency pulse did not latch and enter reverse disarm");
+    const auto physical_stop_frames = drain_can_frames(physical_transport[1], 40);
+    expect(
+        can_signal(
+            last_frame_with_id(physical_stop_frames, 0x18F0D0F5U), 8, 14) ==
+                8000 &&
+            can_signal(
+                last_frame_with_id(physical_stop_frames, 0x18FFD0F5U), 4, 12) >
+                0 &&
+            can_signal(
+                last_frame_with_id(physical_stop_frames, 0x18FED0F5U), 8, 8) ==
+                0,
+        "physical emergency did not transmit zero torque, EHB braking, and speed Q0");
+    MineTeleopChassisTelemetry physical_telemetry{};
+    expect(
+        mine_teleop_chassis_read_telemetry(&physical_telemetry) == 0 &&
+            physical_telemetry.estop == 1,
+        "released physical emergency pulse did not remain visible as latched ESTOP");
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 5.0, 0.01, steering.data(), steering.size()) == -3,
+        "ordinary apply cleared the physical emergency latch");
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == -2,
+        "physical emergency latch recovered before completed disarm");
+
+    complete_runtime_disarm(3, "physical-emergency recovery");
+    expect(
+        mine_teleop_chassis_read_telemetry(&physical_telemetry) == 0 &&
+            physical_telemetry.estop == 1,
+        "completed disarm implicitly cleared physical emergency telemetry");
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == 0,
+        "released physical emergency did not recover through explicit stopped handshake");
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 5.0, 0.01, steering.data(), steering.size()) == 0,
+        "post-physical-emergency D intent was rejected");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "post-physical-emergency runtime did not restart arming");
+    complete_runtime_arming_to_ready(3);
+    const auto recovered_frames = drain_can_frames(physical_transport[1], 40);
+    expect(
+        can_signal(
+            last_frame_with_id(recovered_frames, 0x18F0D0F5U), 8, 14) > 8000,
+        "explicit post-disarm handshake did not restore PID traction authority");
+    expect(
+        mine_teleop_chassis_disconnect_parallel_handshake() == 0,
+        "post-physical-emergency runtime could not explicitly disarm");
+    complete_runtime_disarm(3, "post-physical-emergency disconnect");
+    expect(
+        mine_teleop_chassis_close() == 0,
+        "physical-ESTOP runtime did not close cleanly");
+    ::close(physical_transport[0]);
+    ::close(physical_transport[1]);
+    const auto physical_events = read_json_lines(physical_log_path);
+    expect(
+        std::count_if(
+            physical_events.begin(),
+            physical_events.end(),
+            [](const auto& event) {
+              return event.value("name", "") == "physical_emergency_latched";
+            }) == 1,
+        "physical emergency pulse did not latch/log exactly once");
+    std::filesystem::remove(physical_log_path, error);
 
     std::cout << "chassis_bridge_diagnostics_smoke=passed\n";
     return 0;

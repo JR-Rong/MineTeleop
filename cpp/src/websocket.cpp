@@ -38,6 +38,7 @@ namespace mine_teleop {
 namespace {
 
 constexpr std::string_view kWebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+constexpr auto kWebSocketFrameAssemblyTimeout = std::chrono::seconds(5);
 
 #if defined(_WIN32)
 using NativeSocket = SOCKET;
@@ -435,11 +436,15 @@ void ServerWebSocketConnection::send_close(std::uint16_t code, std::string_view 
 }
 
 WebSocketReceiveResult ServerWebSocketConnection::receive_json(std::chrono::milliseconds timeout) {
-  const auto first_deadline = std::chrono::steady_clock::now() + timeout;
   while (true) {
     if (!wait_socket(socket_, kPollRead, timeout)) return {WebSocketReceiveStatus::Timeout, Json::object()};
+    // The caller's short timeout is an idle poll interval. Once any part of a
+    // frame is readable, allow a separate bounded window for the rest of that
+    // valid TCP frame to arrive instead of consuming the poll's remaining few
+    // milliseconds as the frame-assembly deadline.
+    const auto frame_deadline = std::chrono::steady_clock::now() + kWebSocketFrameAssemblyTimeout;
     std::array<char, 2> header{};
-    if (!socket_receive_exact(socket_, header.data(), header.size(), first_deadline)) {
+    if (!socket_receive_exact(socket_, header.data(), header.size(), frame_deadline)) {
       return {WebSocketReceiveStatus::Closed, Json::object()};
     }
     const auto first = static_cast<unsigned char>(header[0]);
@@ -452,14 +457,14 @@ WebSocketReceiveResult ServerWebSocketConnection::receive_json(std::chrono::mill
     std::uint64_t length = second & 0x7fU;
     if (length == 126) {
       std::array<unsigned char, 2> extended{};
-      if (!socket_receive_exact(socket_, reinterpret_cast<char*>(extended.data()), extended.size(), first_deadline)) {
+      if (!socket_receive_exact(socket_, reinterpret_cast<char*>(extended.data()), extended.size(), frame_deadline)) {
         return {WebSocketReceiveStatus::Closed, Json::object()};
       }
       length = (static_cast<std::uint64_t>(extended[0]) << 8U) | extended[1];
       if (length < 126U) throw std::invalid_argument("websocket frame length is not minimally encoded");
     } else if (length == 127) {
       std::array<unsigned char, 8> extended{};
-      if (!socket_receive_exact(socket_, reinterpret_cast<char*>(extended.data()), extended.size(), first_deadline)) {
+      if (!socket_receive_exact(socket_, reinterpret_cast<char*>(extended.data()), extended.size(), frame_deadline)) {
         return {WebSocketReceiveStatus::Closed, Json::object()};
       }
       if ((extended[0] & 0x80U) != 0) throw std::invalid_argument("invalid websocket frame length");
@@ -473,11 +478,11 @@ WebSocketReceiveResult ServerWebSocketConnection::receive_json(std::chrono::mill
     }
     if (length > max_message_bytes_) throw std::invalid_argument("websocket message too large");
     std::array<unsigned char, 4> mask{};
-    if (!socket_receive_exact(socket_, reinterpret_cast<char*>(mask.data()), mask.size(), first_deadline)) {
+    if (!socket_receive_exact(socket_, reinterpret_cast<char*>(mask.data()), mask.size(), frame_deadline)) {
       return {WebSocketReceiveStatus::Closed, Json::object()};
     }
     std::string payload(static_cast<std::size_t>(length), '\0');
-    if (length > 0 && !socket_receive_exact(socket_, payload.data(), payload.size(), first_deadline)) {
+    if (length > 0 && !socket_receive_exact(socket_, payload.data(), payload.size(), frame_deadline)) {
       return {WebSocketReceiveStatus::Closed, Json::object()};
     }
     for (std::size_t index = 0; index < payload.size(); ++index) {

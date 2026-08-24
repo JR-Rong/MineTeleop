@@ -38,9 +38,13 @@ namespace {
 constexpr double kChassisControlMaxTargetSpeedMps = 20.0;
 constexpr double kChassisControlMaxTargetSpeedKph =
     kChassisControlMaxTargetSpeedMps * 3.6;
-constexpr double kChassisControlMinTargetSpeedKph = 1.0;
-constexpr double kChassisControlMinTargetSpeedMps =
-    kChassisControlMinTargetSpeedKph / 3.6;
+constexpr int kMinSpeedFeedbackTimeoutMs = 20;
+constexpr int kMaxSpeedFeedbackTimeoutMs = 500;
+constexpr int kMinSpeedPidMaxDtMs = 20;
+constexpr int kMaxSpeedPidMaxDtMs = 200;
+constexpr double kMaxSpeedPidGain = 100.0;
+constexpr double kMaxSpeedPidDerivativeFilterTauMs = 2000.0;
+constexpr double kMaxHardOverspeedMarginKph = 36.0;
 
 template <typename T>
 T required(const YAML::Node& node, const char* key, std::string_view context) {
@@ -109,7 +113,21 @@ struct BridgeOpenConfigV1 {
   std::uint32_t struct_size;
   const char* can_interface;
   double full_scale_motor_torque_nm;
+};
+
+struct BridgeOpenConfigV2 {
+  std::uint32_t struct_size;
+  const char* can_interface;
+  double full_scale_motor_torque_nm;
+  double hard_speed_limit_mps;
   std::int32_t control_timeout_ms;
+  std::int32_t speed_feedback_timeout_ms;
+  double speed_pid_kp;
+  double speed_pid_ki;
+  double speed_pid_kd;
+  double speed_pid_derivative_filter_tau_ms;
+  std::int32_t speed_pid_max_dt_ms;
+  double hard_overspeed_margin_mps;
 };
 
 struct BridgeFeedback {
@@ -235,6 +253,41 @@ void unload_dynamic_library(void* handle) {
 #else
   dlclose(handle);
 #endif
+}
+
+void* open_dynamic_library(const std::filesystem::path& path) {
+#if defined(_WIN32)
+  void* handle = static_cast<void*>(LoadLibraryW(path.wstring().c_str()));
+  if (handle == nullptr) {
+    throw std::runtime_error(
+        "failed to load dynamic library (Windows error " +
+        std::to_string(GetLastError()) + ")");
+  }
+#else
+  void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (handle == nullptr) {
+    throw std::runtime_error(
+        std::string("failed to load dynamic library: ") + dlerror());
+  }
+#endif
+  return handle;
+}
+
+void validate_chassis_bridge_abi_handle(void* handle) {
+  using QueryFn = std::uint32_t (*)();
+  using OpenV2Fn = int (*)(const BridgeOpenConfigV2*);
+  const auto version = load_symbol<QueryFn>(
+      handle, "mine_teleop_chassis_abi_version")();
+  const auto config_size = load_symbol<QueryFn>(
+      handle, "mine_teleop_chassis_open_config_v2_size")();
+  static_cast<void>(load_symbol<OpenV2Fn>(
+      handle, "mine_teleop_chassis_open_v2"));
+  if (version != 2U || config_size != sizeof(BridgeOpenConfigV2)) {
+    throw std::runtime_error(
+        "chassis bridge ABI mismatch: expected version 2 and V2 config size " +
+        std::to_string(sizeof(BridgeOpenConfigV2)) + ", got version " +
+        std::to_string(version) + " and size " + std::to_string(config_size));
+  }
 }
 
 #if defined(__linux__)
@@ -444,6 +497,20 @@ void prepare_socketcan(
 
 }  // namespace
 
+void validate_chassis_bridge_abi(const std::filesystem::path& library_path) {
+  if (library_path.empty()) {
+    throw std::invalid_argument("chassis bridge library path is empty");
+  }
+  void* handle = open_dynamic_library(library_path);
+  try {
+    validate_chassis_bridge_abi_handle(handle);
+  } catch (...) {
+    unload_dynamic_library(handle);
+    throw;
+  }
+  unload_dynamic_library(handle);
+}
+
 std::int64_t now_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::system_clock::now().time_since_epoch())
@@ -584,9 +651,12 @@ double dynamic_adapter_target_speed_mps(
     throw std::invalid_argument("max_speed_mps must be finite and non-negative");
   }
   const bool driving_gear = command.gear == "D" || command.gear == "R";
-  return driving_gear && command.throttle > 0.0 && command.brake == 0.0
-             ? max_speed_mps
-             : 0.0;
+  // This is only the local PID setpoint; it is never forwarded as a VCU
+  // vehicle-speed request. Analog throttle selects a proportional target
+  // speed, while the independent hard limit is passed in the V2 open config.
+  return driving_gear && command.brake == 0.0
+      ? std::clamp(command.throttle, 0.0, 1.0) * max_speed_mps
+      : 0.0;
 }
 
 double dynamic_adapter_target_acceleration(const ControlCommand& command) {
@@ -793,11 +863,21 @@ bool SafetyStateMachine::reset_estop(
     std::string_view authorized_by,
     std::int64_t /*now_ms*/) {
   if (state_ != SafetyState::Estop || !local_confirmed || authorized_by.empty()) return false;
+  enter_standby();
+  return true;
+}
+
+bool SafetyStateMachine::reset_to_standby() {
+  if (state_ == SafetyState::Estop || state_ == SafetyState::Fault) return false;
+  enter_standby();
+  return true;
+}
+
+void SafetyStateMachine::enter_standby() {
   last_valid_command_.reset();
   last_valid_receive_ms_.reset();
   timeout_entered_ms_.reset();
   state_ = SafetyState::Standby;
-  return true;
 }
 
 void SafetyStateMachine::mark_fault() { state_ = SafetyState::Fault; }
@@ -864,6 +944,13 @@ Json VehicleConfig::redacted_summary() const {
       {"max_speed_kph", field_safety.max_speed_kph},
       {"max_throttle", field_safety.max_throttle},
       {"full_scale_motor_torque_nm", field_safety.full_scale_motor_torque_nm},
+      {"speed_feedback_timeout_ms", field_safety.speed_feedback_timeout_ms},
+      {"speed_pid_kp", field_safety.speed_pid_kp},
+      {"speed_pid_ki", field_safety.speed_pid_ki},
+      {"speed_pid_kd", field_safety.speed_pid_kd},
+      {"speed_pid_derivative_filter_tau_ms", field_safety.speed_pid_derivative_filter_tau_ms},
+      {"speed_pid_max_dt_ms", field_safety.speed_pid_max_dt_ms},
+      {"hard_overspeed_margin_kph", field_safety.hard_overspeed_margin_kph},
       {"max_brake", field_safety.max_brake},
       {"max_steering_angle_deg", field_safety.max_steering_angle_deg},
       {"require_time_sync", field_safety.require_time_sync},
@@ -1064,6 +1151,17 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.field_safety.max_throttle = optional<double>(safety, "max_throttle", 1.0);
   config.field_safety.full_scale_motor_torque_nm =
       optional<double>(safety, "full_scale_motor_torque_nm", 41.25);
+  config.field_safety.speed_feedback_timeout_ms =
+      optional<int>(safety, "speed_feedback_timeout_ms", 200);
+  config.field_safety.speed_pid_kp = optional<double>(safety, "speed_pid_kp", 1.0);
+  config.field_safety.speed_pid_ki = optional<double>(safety, "speed_pid_ki", 0.2);
+  config.field_safety.speed_pid_kd = optional<double>(safety, "speed_pid_kd", 0.0);
+  config.field_safety.speed_pid_derivative_filter_tau_ms =
+      optional<double>(safety, "speed_pid_derivative_filter_tau_ms", 100.0);
+  config.field_safety.speed_pid_max_dt_ms =
+      optional<int>(safety, "speed_pid_max_dt_ms", 100);
+  config.field_safety.hard_overspeed_margin_kph =
+      optional<double>(safety, "hard_overspeed_margin_kph", 3.6);
   config.field_safety.max_brake = optional<double>(safety, "max_brake", 1.0);
   config.field_safety.max_steering_angle_deg =
       optional<double>(safety, "max_steering_angle_deg", 30.0);
@@ -1089,13 +1187,6 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
         "field_safety.max_speed_kph must be finite and in [0, 72] km/h; "
         "the current ChassisControl target-speed input is limited to 20 m/s");
   }
-  if (!std::isfinite(config.field_safety.full_scale_motor_torque_nm) ||
-      config.field_safety.full_scale_motor_torque_nm < 0.0 ||
-      config.field_safety.full_scale_motor_torque_nm > 165.0) {
-    throw std::runtime_error(
-        "field_safety.full_scale_motor_torque_nm must be finite and in [0, 165] Nm; "
-        "higher values require a validated chassis torque mapping");
-  }
   if (!std::isfinite(config.field_safety.max_throttle) ||
       config.field_safety.max_throttle < 0.0 ||
       config.field_safety.max_throttle > 1.0 ||
@@ -1109,6 +1200,31 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
       config.field_safety.time_sync_interval_ms <= 0 ||
       config.field_safety.time_sync_samples < 3 || config.field_safety.time_sync_samples > 15) {
     throw std::runtime_error("field_safety limits or time sync settings are invalid");
+  }
+  if (config.field_safety.speed_feedback_timeout_ms < kMinSpeedFeedbackTimeoutMs ||
+      config.field_safety.speed_feedback_timeout_ms > kMaxSpeedFeedbackTimeoutMs ||
+      config.field_safety.speed_feedback_timeout_ms > config.control.control_timeout_ms ||
+      !std::isfinite(config.field_safety.speed_pid_kp) ||
+      config.field_safety.speed_pid_kp <= 0.0 ||
+      config.field_safety.speed_pid_kp > kMaxSpeedPidGain ||
+      !std::isfinite(config.field_safety.speed_pid_ki) ||
+      config.field_safety.speed_pid_ki < 0.0 ||
+      config.field_safety.speed_pid_ki > kMaxSpeedPidGain ||
+      !std::isfinite(config.field_safety.speed_pid_kd) ||
+      config.field_safety.speed_pid_kd < 0.0 ||
+      config.field_safety.speed_pid_kd > kMaxSpeedPidGain ||
+      !std::isfinite(config.field_safety.speed_pid_derivative_filter_tau_ms) ||
+      config.field_safety.speed_pid_derivative_filter_tau_ms < 0.0 ||
+      config.field_safety.speed_pid_derivative_filter_tau_ms >
+          kMaxSpeedPidDerivativeFilterTauMs ||
+      config.field_safety.speed_pid_max_dt_ms < kMinSpeedPidMaxDtMs ||
+      config.field_safety.speed_pid_max_dt_ms > kMaxSpeedPidMaxDtMs ||
+      !std::isfinite(config.field_safety.hard_overspeed_margin_kph) ||
+      config.field_safety.hard_overspeed_margin_kph <= 0.0 ||
+      config.field_safety.hard_overspeed_margin_kph >
+          kMaxHardOverspeedMarginKph) {
+    throw std::runtime_error(
+        "field_safety local speed PID, feedback timeout, max dt, or hard overspeed margin is invalid");
   }
 
   const auto recording = root["recording"];
@@ -1148,17 +1264,16 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   if (config.vehicle_adapter.type != "mock" &&
       (!safety || !safety["max_speed_kph"] || !safety["max_throttle"] ||
        !safety["full_scale_motor_torque_nm"] || !safety["max_brake"] ||
-       !safety["max_steering_angle_deg"])) {
+       !safety["max_steering_angle_deg"] ||
+       !safety["speed_feedback_timeout_ms"] || !safety["speed_pid_kp"] ||
+       !safety["speed_pid_ki"] || !safety["speed_pid_kd"] ||
+       !safety["speed_pid_derivative_filter_tau_ms"] ||
+       !safety["speed_pid_max_dt_ms"] ||
+       !safety["hard_overspeed_margin_kph"])) {
     throw std::runtime_error(
         "non-mock vehicle adapter requires explicit field_safety max_speed_kph, "
-        "max_throttle, full_scale_motor_torque_nm, max_brake, and "
-        "max_steering_angle_deg");
-  }
-  if (config.vehicle_adapter.type != "mock" &&
-      config.field_safety.max_speed_kph < kChassisControlMinTargetSpeedKph) {
-    throw std::runtime_error(
-        "non-mock vehicle adapter requires field_safety.max_speed_kph >= 1; "
-        "the VCU request field has 1 km/h resolution");
+        "max_throttle, full_scale_motor_torque_nm, brake/steering limits, "
+        "speed PID gains/timing, feedback timeout, and hard overspeed margin");
   }
   if (config.vehicle_adapter.type != "mock" &&
       config.hardware.can_tx_queue_length < 16) {
@@ -1298,21 +1413,52 @@ DynamicLibraryVehicleAdapter::DynamicLibraryVehicleAdapter(
     int can_tx_queue_length,
     double max_speed_mps,
     double full_scale_motor_torque_nm,
-    int control_timeout_ms)
+    int control_timeout_ms,
+    int speed_feedback_timeout_ms,
+    double speed_pid_kp,
+    double speed_pid_ki,
+    double speed_pid_kd,
+    double speed_pid_derivative_filter_tau_ms,
+    int speed_pid_max_dt_ms,
+    double hard_overspeed_margin_mps)
     : library_path_(std::move(library_path)),
       can_interface_(std::move(can_interface)),
       can_bitrate_(can_bitrate),
       can_tx_queue_length_(can_tx_queue_length),
       max_speed_mps_(max_speed_mps),
       full_scale_motor_torque_nm_(full_scale_motor_torque_nm),
-      control_timeout_ms_(control_timeout_ms) {
+      control_timeout_ms_(control_timeout_ms),
+      speed_feedback_timeout_ms_(speed_feedback_timeout_ms),
+      speed_pid_kp_(speed_pid_kp),
+      speed_pid_ki_(speed_pid_ki),
+      speed_pid_kd_(speed_pid_kd),
+      speed_pid_derivative_filter_tau_ms_(speed_pid_derivative_filter_tau_ms),
+      speed_pid_max_dt_ms_(speed_pid_max_dt_ms),
+      hard_overspeed_margin_mps_(hard_overspeed_margin_mps) {
   if (library_path_.empty() || can_interface_.empty() || can_bitrate_ <= 0 ||
       can_tx_queue_length_ < 16 || !std::isfinite(max_speed_mps_) ||
-      max_speed_mps_ < kChassisControlMinTargetSpeedMps ||
+      max_speed_mps_ < 0.0 ||
       max_speed_mps_ > kChassisControlMaxTargetSpeedMps ||
       !std::isfinite(full_scale_motor_torque_nm_) ||
       full_scale_motor_torque_nm_ < 0.0 || full_scale_motor_torque_nm_ > 165.0 ||
-      control_timeout_ms_ < 20 || control_timeout_ms_ > 60000) {
+      control_timeout_ms_ < 20 || control_timeout_ms_ > 60000 ||
+      speed_feedback_timeout_ms_ < kMinSpeedFeedbackTimeoutMs ||
+      speed_feedback_timeout_ms_ > kMaxSpeedFeedbackTimeoutMs ||
+      speed_feedback_timeout_ms_ > control_timeout_ms_ ||
+      !std::isfinite(speed_pid_kp_) || speed_pid_kp_ <= 0.0 ||
+      speed_pid_kp_ > kMaxSpeedPidGain ||
+      !std::isfinite(speed_pid_ki_) || speed_pid_ki_ < 0.0 ||
+      speed_pid_ki_ > kMaxSpeedPidGain ||
+      !std::isfinite(speed_pid_kd_) || speed_pid_kd_ < 0.0 ||
+      speed_pid_kd_ > kMaxSpeedPidGain ||
+      !std::isfinite(speed_pid_derivative_filter_tau_ms_) ||
+      speed_pid_derivative_filter_tau_ms_ < 0.0 ||
+      speed_pid_derivative_filter_tau_ms_ > kMaxSpeedPidDerivativeFilterTauMs ||
+      speed_pid_max_dt_ms_ < kMinSpeedPidMaxDtMs ||
+      speed_pid_max_dt_ms_ > kMaxSpeedPidMaxDtMs ||
+      !std::isfinite(hard_overspeed_margin_mps_) ||
+      hard_overspeed_margin_mps_ <= 0.0 ||
+      hard_overspeed_margin_mps_ > kMaxHardOverspeedMarginKph / 3.6) {
     throw std::invalid_argument("dynamic adapter configuration is incomplete");
   }
 }
@@ -1327,21 +1473,10 @@ DynamicLibraryVehicleAdapter::~DynamicLibraryVehicleAdapter() {
 
 void DynamicLibraryVehicleAdapter::ensure_loaded() {
   if (handle_ != nullptr) return;
-#if defined(_WIN32)
-  handle_ = static_cast<void*>(LoadLibraryW(library_path_.wstring().c_str()));
-  if (handle_ == nullptr) {
-    last_error_ = "failed to load dynamic library (Windows error " + std::to_string(GetLastError()) + ")";
-    throw std::runtime_error(last_error_);
-  }
-#else
-  handle_ = dlopen(library_path_.c_str(), RTLD_NOW | RTLD_LOCAL);
-  if (handle_ == nullptr) {
-    last_error_ = std::string("failed to load dynamic library: ") + dlerror();
-    throw std::runtime_error(last_error_);
-  }
-#endif
+  handle_ = open_dynamic_library(library_path_);
   try {
-    open_v1_fn_ = load_symbol<OpenV1Fn>(handle_, "mine_teleop_chassis_open_v1");
+    validate_chassis_bridge_abi_handle(handle_);
+    open_v2_fn_ = load_symbol<OpenV2Fn>(handle_, "mine_teleop_chassis_open_v2");
     apply_fn_ = load_symbol<ApplyFn>(handle_, "mine_teleop_chassis_apply_state");
     stop_fn_ = load_symbol<StopFn>(handle_, "mine_teleop_chassis_emergency_stop");
     request_handshake_fn_ = load_symbol<HandshakeFn>(
@@ -1381,12 +1516,20 @@ void DynamicLibraryVehicleAdapter::open() {
 #if defined(__linux__)
     prepare_socketcan(can_interface_, can_bitrate_, can_tx_queue_length_);
 #endif
-    const BridgeOpenConfigV1 config{
-        sizeof(BridgeOpenConfigV1),
+    const BridgeOpenConfigV2 config{
+        sizeof(BridgeOpenConfigV2),
         can_interface_.c_str(),
         full_scale_motor_torque_nm_,
-        control_timeout_ms_};
-    check_result(open_v1_fn_(&config), "mine_teleop_chassis_open_v1");
+        max_speed_mps_,
+        control_timeout_ms_,
+        speed_feedback_timeout_ms_,
+        speed_pid_kp_,
+        speed_pid_ki_,
+        speed_pid_kd_,
+        speed_pid_derivative_filter_tau_ms_,
+        speed_pid_max_dt_ms_,
+        hard_overspeed_margin_mps_};
+    check_result(open_v2_fn_(&config), "mine_teleop_chassis_open_v2");
     opened_ = true;
   } catch (const std::exception& error) {
     last_error_ = error.what();
@@ -1566,7 +1709,14 @@ std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& conf
         config.hardware.can_tx_queue_length,
         config.field_safety.max_speed_kph / 3.6,
         config.field_safety.full_scale_motor_torque_nm,
-        config.control.control_timeout_ms);
+        config.control.control_timeout_ms,
+        config.field_safety.speed_feedback_timeout_ms,
+        config.field_safety.speed_pid_kp,
+        config.field_safety.speed_pid_ki,
+        config.field_safety.speed_pid_kd,
+        config.field_safety.speed_pid_derivative_filter_tau_ms,
+        config.field_safety.speed_pid_max_dt_ms,
+        config.field_safety.hard_overspeed_margin_kph / 3.6);
   }
   throw std::runtime_error("unsupported vehicle adapter type: " + config.vehicle_adapter.type);
 }
@@ -1641,15 +1791,28 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     result.warnings.emplace_back("vehicle_max_steering_applied");
     effective.steering = limited_steering;
   }
+  bool feedback_poll_failed = false;
   if (!result.command->estop) {
     try {
       adapter_->poll_feedback();
     } catch (const std::exception&) {
-      if (require_feedback_before_control_) {
-        safety_.mark_fault();
-        adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
-        return {false, "can_feedback_poll_failed", std::nullopt, result.warnings};
-      }
+      feedback_poll_failed = true;
+    }
+  }
+  const bool adapter_safety_observed = refresh_adapter_safe_stop_state();
+  if (!result.command->estop && adapter_safe_stop_active_) {
+    return {false, "adapter_safe_stop_active", std::nullopt, result.warnings};
+  }
+  if (!result.command->estop) {
+    if (!adapter_safety_observed) {
+      safety_.mark_fault();
+      adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+      return {false, "adapter_safety_status_unavailable", std::nullopt, result.warnings};
+    }
+    if (feedback_poll_failed && require_feedback_before_control_) {
+      safety_.mark_fault();
+      adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+      return {false, "can_feedback_poll_failed", std::nullopt, result.warnings};
     }
     if (require_feedback_before_control_ && !adapter_->feedback_ready()) {
       adapter_->apply_safe_stop(ControlOutput{"N", 0.0, 0.0, 1.0, false});
@@ -1659,7 +1822,9 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
   safety_.on_valid_command(*result.command, timestamp_ms);
   if (safety_.state() == SafetyState::ControlActive) {
     adapter_->apply_control(*result.command);
-  } else {
+  } else if (!adapter_safe_stop_active_ ||
+             safety_.state() == SafetyState::Estop ||
+             safety_.state() == SafetyState::Fault) {
     adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
   }
   return result;
@@ -1667,32 +1832,60 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
 
 bool VehicleControlService::request_vcu_handshake() {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
-  return adapter_->request_vcu_handshake();
+  if (safety_.state() == SafetyState::Estop ||
+      safety_.state() == SafetyState::Fault) {
+    return false;
+  }
+  if (!adapter_->request_vcu_handshake()) return false;
+  if (!safety_.reset_to_standby()) return false;
+  adapter_safe_stop_active_ = false;
+  return true;
 }
 
 bool VehicleControlService::disconnect_vcu_handshake() {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
-  return adapter_->disconnect_vcu_handshake();
+  const bool disconnected = adapter_->disconnect_vcu_handshake();
+  if (disconnected) adapter_safe_stop_active_ = true;
+  return disconnected;
 }
 
 void VehicleControlService::tick(std::int64_t timestamp_ms) {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
+  bool feedback_poll_failed = false;
   try {
     adapter_->poll_feedback();
   } catch (const std::exception&) {
-    if (require_feedback_before_control_ && safety_.state() == SafetyState::ControlActive) {
-      safety_.mark_fault();
-    }
+    feedback_poll_failed = true;
+  }
+  const bool adapter_safety_observed = refresh_adapter_safe_stop_state();
+  if ((!adapter_safety_observed || feedback_poll_failed) &&
+      !adapter_safe_stop_active_ &&
+      require_feedback_before_control_ &&
+      safety_.state() != SafetyState::Estop &&
+      safety_.state() != SafetyState::Fault) {
+    safety_.mark_fault();
   }
   safety_.tick(timestamp_ms);
   if (safety_.state() == SafetyState::Degraded || safety_.state() == SafetyState::TimeoutBrake ||
       safety_.state() == SafetyState::Estop || safety_.state() == SafetyState::Fault) {
-    adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+    const bool adapter_owns_recoverable_stop =
+        adapter_safe_stop_active_ &&
+        (safety_.state() == SafetyState::Degraded ||
+         safety_.state() == SafetyState::TimeoutBrake);
+    if (!adapter_owns_recoverable_stop) {
+      adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+    }
   }
   if (!last_telemetry_ms_ || timestamp_ms - *last_telemetry_ms_ >= telemetry_interval_ms_) {
-    if (telemetry_history_.size() == kMaxVehicleTelemetryHistory) telemetry_history_.pop_front();
-    telemetry_history_.push_back(build_telemetry(timestamp_ms));
-    last_telemetry_ms_ = timestamp_ms;
+    try {
+      if (telemetry_history_.size() == kMaxVehicleTelemetryHistory) telemetry_history_.pop_front();
+      telemetry_history_.push_back(build_telemetry(timestamp_ms));
+      last_telemetry_ms_ = timestamp_ms;
+    } catch (...) {
+      // Control safety was already evaluated above from the same adapter. A
+      // failed observability snapshot must not tear down an adapter-owned stop
+      // or prevent the outer fault path from keeping the vehicle stopped.
+    }
   }
 }
 
@@ -1700,9 +1893,37 @@ bool VehicleControlService::reset_estop(
     bool local_confirmed,
     std::string_view authorized_by,
     std::int64_t timestamp_ms) {
+  if (safety_.state() != SafetyState::Estop || !local_confirmed || authorized_by.empty()) {
+    return false;
+  }
+  std::string adapter_gear;
+  try {
+    const auto telemetry = adapter_->read_telemetry();
+    const auto handshake = adapter_->vcu_handshake_status();
+    adapter_gear = telemetry.gear;
+    adapter_safe_stop_active_ = telemetry.estop || handshake.disarming;
+    if (handshake.disarming) return false;
+  } catch (...) {
+    return false;
+  }
+
+  // Clear only the adapter's recoverable software stop before releasing the
+  // outer ESTOP latch. Preserve the actual gear so a stopped D/R vehicle does
+  // not enter WaitGear before the bridge can clear its software stop. A
+  // physical or hard safety latch rejects this ordinary zero-output apply;
+  // keep the outer latch and service alive in that case.
+  try {
+    adapter_->apply_safe_stop(ControlOutput{adapter_gear, 0.0, 0.0, 0.0, false});
+  } catch (...) {
+    adapter_safe_stop_active_ = true;
+    return false;
+  }
+
   const bool reset = safety_.reset_estop(local_confirmed, authorized_by, timestamp_ms);
-  if (reset) adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
-  return reset;
+  if (!reset) return false;
+  adapter_safe_stop_active_ = false;
+  static_cast<void>(refresh_adapter_safe_stop_state());
+  return true;
 }
 
 void VehicleControlService::close() {
@@ -1734,6 +1955,19 @@ Json VehicleControlService::build_telemetry(std::int64_t timestamp_ms) {
       {"vcu_handshake", adapter_->vcu_handshake_status().to_json()},
       {"control_limits", control_limits()},
   };
+}
+
+bool VehicleControlService::refresh_adapter_safe_stop_state() noexcept {
+  try {
+    const auto telemetry = adapter_->read_telemetry();
+    const auto handshake = adapter_->vcu_handshake_status();
+    adapter_safe_stop_active_ = telemetry.estop || handshake.disarming;
+    return true;
+  } catch (...) {
+    // Preserve an already observed adapter-owned stop. Otherwise callers move
+    // active control into their existing outer fault/safe-stop path.
+    return false;
+  }
 }
 
 Json VehicleControlService::control_limits() const {

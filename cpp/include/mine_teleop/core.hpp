@@ -157,12 +157,14 @@ class SafetyStateMachine {
   void tick(std::int64_t now_ms);
   [[nodiscard]] ControlOutput current_output(std::int64_t now_ms) const;
   bool reset_estop(bool local_confirmed, std::string_view authorized_by, std::int64_t now_ms);
+  bool reset_to_standby();
   void mark_fault();
 
   [[nodiscard]] SafetyState state() const { return state_; }
   [[nodiscard]] std::optional<std::int64_t> last_valid_receive_ms() const { return last_valid_receive_ms_; }
 
  private:
+  void enter_standby();
   [[nodiscard]] double brake_for_timeout(std::int64_t now_ms) const;
 
   int degraded_timeout_ms_;
@@ -272,6 +274,13 @@ struct FieldSafetyConfig {
   double max_speed_kph{40.0};
   double max_throttle{1.0};
   double full_scale_motor_torque_nm{41.25};
+  int speed_feedback_timeout_ms{200};
+  double speed_pid_kp{1.0};
+  double speed_pid_ki{0.2};
+  double speed_pid_kd{0.0};
+  double speed_pid_derivative_filter_tau_ms{100.0};
+  int speed_pid_max_dt_ms{100};
+  double hard_overspeed_margin_kph{3.6};
   double max_brake{1.0};
   double max_steering_angle_deg{30.0};
   bool require_can_feedback_before_control{true};
@@ -304,6 +313,7 @@ struct VehicleConfig {
 };
 
 VehicleConfig load_vehicle_config(const std::filesystem::path& path);
+void validate_chassis_bridge_abi(const std::filesystem::path& library_path);
 
 struct VehicleCanFeedback {
   bool supported{false};
@@ -427,7 +437,14 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
       int can_tx_queue_length,
       double max_speed_mps,
       double full_scale_motor_torque_nm,
-      int control_timeout_ms);
+      int control_timeout_ms,
+      int speed_feedback_timeout_ms,
+      double speed_pid_kp,
+      double speed_pid_ki,
+      double speed_pid_kd,
+      double speed_pid_derivative_filter_tau_ms,
+      int speed_pid_max_dt_ms,
+      double hard_overspeed_margin_mps);
   ~DynamicLibraryVehicleAdapter() override;
 
   void open() override;
@@ -453,6 +470,13 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   double max_speed_mps_;
   double full_scale_motor_torque_nm_;
   int control_timeout_ms_;
+  int speed_feedback_timeout_ms_;
+  double speed_pid_kp_;
+  double speed_pid_ki_;
+  double speed_pid_kd_;
+  double speed_pid_derivative_filter_tau_ms_;
+  int speed_pid_max_dt_ms_;
+  double hard_overspeed_margin_mps_;
   void* handle_{nullptr};
   bool opened_{false};
   bool feedback_ready_{false};
@@ -460,7 +484,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   std::uint64_t safe_stop_count_{0};
   std::string last_error_;
 
-  using OpenV1Fn = int (*)(const void*);
+  using OpenV2Fn = int (*)(const void*);
   using ApplyFn = int (*)(int, double, double, const double*, int);
   using StopFn = int (*)();
   using HandshakeFn = int (*)();
@@ -469,7 +493,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   using ReadFn = int (*)(void*);
   using ReadCanFeedbackV1Fn = int (*)(void*);
   using CloseFn = int (*)();
-  OpenV1Fn open_v1_fn_{nullptr};
+  OpenV2Fn open_v2_fn_{nullptr};
   ApplyFn apply_fn_{nullptr};
   StopFn stop_fn_{nullptr};
   HandshakeFn request_handshake_fn_{nullptr};
@@ -512,6 +536,7 @@ class VehicleControlService {
   [[nodiscard]] Json summary() const;
 
  private:
+  [[nodiscard]] bool refresh_adapter_safe_stop_state() noexcept;
   [[nodiscard]] Json build_telemetry(std::int64_t now_ms);
 
   std::string vehicle_id_;
@@ -530,6 +555,7 @@ class VehicleControlService {
   std::optional<std::int64_t> last_telemetry_ms_;
   std::uint64_t telemetry_sequence_{0};
   std::deque<Json> telemetry_history_;
+  bool adapter_safe_stop_active_{false};
   bool started_{false};
 };
 

@@ -21,20 +21,13 @@ control:
   rate_hz: 20
   estop_hold_ms: 500
   limits:
+    # Protocol-compatible throttle field: target-speed ratio, not a torque limit.
     initial_max_throttle: 0.05
     # Normalized ordinary-driving brake requests; calibrate on an isolated rig.
     # Keep 0 <= service <= hard <= 1. ESTOP/timeout/fault/disconnect bypass both.
     initial_service_brake: 0.30
     initial_hard_brake: 1.0
     initial_max_steering_angle_deg: 3.0
-  keyboard:
-    steering_left: ArrowLeft
-    steering_right: ArrowRight
-    throttle_forward: ArrowUp
-    throttle_reverse: ArrowDown
-    service_brake: Space
-    hard_brake: KeyB
-    estop: KeyE
   gamepad:
     enabled: true
     steering_axis: 0

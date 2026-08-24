@@ -31,7 +31,7 @@ ChassisControl 用于核对八轮控制量、启动/退出状态机。平行驾�
 | EHB01/02 | `0x18FFD0F5`, `0x18FAD0F5` | 2 | 八路模式、制动压力 |
 | EPB | `0x18FBD0F5` | 1 | 四路保持/释放/驻车、转向模式 |
 | Shake | `0x18FCD0F5` | 1 | 挡位、智驾握手、故障复位 |
-| Body/VehSpd | `0x18FDD0F5`, `0x18FED0F5` | 2 | Body 保留；Ready 时发送独立车辆目标车速及有效位 |
+| Body/VehSpd | `0x18FDD0F5`, `0x18FED0F5` | 2 | Body 保留；VehSpd 永久发送 `0 km/h / Q=0` |
 
 车端启动 CAN bridge 后只进入 `standby`，继续发送 20 ms 的低请求报文，但不会
 自动声明平行驾驶控制权。开始握手同时要求：
@@ -53,14 +53,49 @@ N/R/D 三个挡位；电子驻车通过四路 EPB 状态单独判断，不能用
 2. 复用智驾握手：发送 `ShakeReq=2`、保持 `CloudShakeReq=0`，等待
    `WVCU_ShakeHandSts=5`。
 3. 发送 EPB 释放请求 1，等待四路转发状态都为 1。
-4. 发送 N/R/D 挡位和 EPS/EHB 模式，等待挡位反馈。
+4. 发送 N/R/D 挡位和 EPS/EHB 模式，等待挡位反馈；进入驱动挡或 D/R 互换都要求
+   新鲜有效车速不大于 0.1 m/s。
 5. 发送八路 MCU 扭矩模式，等待 MCU/EPS/EHB 全部模式反馈为 1。
-6. 只有完成以上反馈闭环后才发送扭矩、独立车辆目标车速、转角和制动压力。
+6. 只有完成以上反馈闭环后才发送本地 PID 计算出的扭矩、转角和制动压力。
 
 电机八路始终使用 `MotCtrlMode=1` 扭矩模式，不会在扭矩模式和电机转速模式之间往返切换。
-`ADU_Tx_VehSpdReq` 是另一条独立的车辆车速请求，分辨率为 1 km/h，并向下量化以免超过
-配置目标。只有 Ready、D/R 正牵引有效、牵引能力大于 0 且无制动时才置 `Q=1`；松开牵引、
-普通制动、牵引能力为 0、Standby、换挡闭环、急停、故障和断开流程都发送 `0/Q=0`。
+本实现不启用未经台架验证的 VCU 车速闭环；无论 Ready、制动、换挡或故障，
+`ADU_Tx_VehSpdReq` 都固定编码为 `0 km/h / Q=0`。
+
+车速控制在车端 bridge 的唯一 SocketCAN I/O 线程执行。API 线程只保存最新控制意图；
+I/O 线程每个 20 ms 周期用带符号的 VCU 车速反馈运行一次 PID，再串行调用
+ChassisControl，避免 vendor 接口并发。油门是目标车速比例：
+`target_speed = clamp(throttle, 0, 1) * max_speed_kph`。任何正油门只表示启用 PID，
+不是第二个扭矩上限；PID 输出固定截断到 `[0, 1]`，到达目标点后允许积分项保留
+克服滚阻或坡度所需的正扭矩。D 使用正向速度和正扭矩，R 使用反向速度和负扭矩，
+最终每路仍按 `full_scale_motor_torque_nm`、挡位方向和 0.1 Nm 向零量化硬限幅。
+PID 目标参考采用固定 0.05 m/s 复位死区；参考不随每次小抖动移动，因此累计偏差
+越界时仍会复位，目标明显下降或 D/R 改变也会复位。
+
+普通制动、零油门、非 Ready、换挡、实际挡位不匹配、车速无效/过期、异常 PID
+周期都会清空 PID 并输出零牵引。制动请求仍传入 ChassisControl 生成 EHB 压力。
+`WaitGear` 和 `WaitActuatorModes` 阶段保持最新转角和 EHB 请求连续，但八路扭矩始终为零。
+
+`WaitParkingBrakeReleased`、`WaitGear` 和 `WaitActuatorModes` 是静止收敛阶段；新鲜
+车速绝对值超过 0.1 m/s 就锁存停车，不能等到最大车速加 margin。首次启动进入每个
+阶段后有 500 ms 宽限，随后按阶段检查必要反馈：WaitParking 检查握手、选择器、
+车速和 EPB，WaitGear 另加实际挡位，WaitActuatorModes 检查全部关键反馈。这样最后
+一帧 EPB 释放反馈后 CAN 静默不会无限保持释放请求。
+
+Ready 阶段的独立硬超速门限使用 `max_speed_kph + hard_overspeed_margin_kph`，
+在零牵引或制动时也持续监测，不随瞬时油门目标降低；实际运动方向与 D/R 期望
+相反且超过 0.1 m/s 也锁存安全停车。普通 apply
+不能清除此锁存。只有完成完整退出，且新鲜反馈再次满足 N、绝对车速不大于
+0.1 m/s、四路 EPB 驻车和人工状态 3 后，显式重新请求握手才会清除。
+
+ESTOP 不允许启动状态机继续正向推进：在 `WaitParallelHandshake` 撤销 ShakeReq 并
+维持 EPB 驻车；从 `WaitParkingBrakeReleased` 起则立即进入 `DisarmTorque`，下一拍
+启用 EHB 安全制动并按零扭矩、零速、N、EPB 驻车、人工状态的完整顺序退出。
+WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉冲在同一个 20 ms
+周期内恢复也不会重新使用旧牵引命令；普通 apply 或软急停清除不能解除。只有开关
+已释放、完整退出到 Disarmed，且新鲜反馈再次满足 N、零速、EPB 驻车和人工状态后，
+显式重新请求握手才清除该锁存。首次尚未取得控制权的 Standby 场景也必须通过相同
+驻车门禁显式请求握手。
 
 安全退出顺序：
 
@@ -83,7 +118,8 @@ N/R/D 三个挡位；电子驻车通过四路 EPB 状态单独判断，不能用
 车端对同时出现的油门和制动采用制动优先，任何正制动请求都会撤销牵引。ChassisControl
 更新失败或输出 NaN/Inf 时，bridge 立即锁存本地安全停车，不等待上游控制超时。
 键盘与 Gamepad 共用限幅；修改限幅会先清零当前输入，而且每次应用都要求确认车辆处于隔离
-台架。车端 `field_safety.max_throttle`、`field_safety.full_scale_motor_torque_nm`、
+台架。车端 `field_safety.max_throttle`（目标车速比例上限）、
+`field_safety.full_scale_motor_torque_nm`、
 `field_safety.max_brake` 和
 `field_safety.max_steering_angle_deg` 是不可由浏览器绕过的第二层硬上限，车端会
 通过 DataChannel 把实际硬上限回传给窗口。归一化刹车上限必须来自车辆标定；
@@ -91,17 +127,22 @@ N/R/D 三个挡位；电子驻车通过四路 EPB 状态单独判断，不能用
 非 mock 车端升级后必须在 YAML 中显式补齐 `field_safety.max_brake`；未完成标定时
 先显式使用 `1.0`，不要臆造现场制动值。
 
-Ready 阶段还会按 `control.control_timeout_ms` 监视成功 apply 的新鲜度；到期时
-撤销车速请求、将八路扭矩置零并施加标定的安全制动，只记录一次
-`vcu_control_apply_timeout`。下一条有效 apply 会清除该锁存。它与下述 CAN feedback
-新鲜度 watchdog 相互独立。
+首次到达 Ready 后，会按 `control.control_timeout_ms` 监视成功 apply 的新鲜度，且
+该会话标志在后续 `WaitGear`/`WaitActuatorModes` 不清除；到期时将八路扭矩置零、
+施加标定安全制动，并只记录一次 `vcu_control_apply_timeout`。Ready 内下一条有效
+apply 可清除软锁存；换挡等待态超时会进入完整退出，不能靠普通 apply 继续启动。
+它与下述 CAN feedback 新鲜度 watchdog 相互独立。
 
 进入 Ready 前必须收到八路扭矩反馈。Ready 后会分别监视握手、VCU 状态、车速、
 物理挡位选择器、EPB、八路 MCU 模式、八路 MCU 扭矩、四轴 EPS 和四组 EHB 共
-29 个关键反馈 ID；
+29 个关键反馈 ID；这个 watchdog 在曾 Ready 后的换挡等待态继续保持，直到退出或
+新握手重置；
 任一 ID 超过 500 ms 未更新，bridge 都会记录具体 `stale_ids`、锁存通讯故障并
 发送零扭矩和安全制动控制。这个软件动作不能替代 VCU 自身的报文超时保护，后者必须
 在实车验收中独立确认。
+其中本地 PID 对车速反馈使用更短、独立配置的
+`field_safety.speed_feedback_timeout_ms`；过期时当周期清 PID 并归零牵引，不等
+500 ms 全量 watchdog。
 
 ## 日志落盘
 
@@ -150,6 +191,14 @@ field_safety:
   max_speed_kph: 5
   max_throttle: 0.10
   full_scale_motor_torque_nm: 41.25
+  # 以下 PID 值必须由隔离台架标定，不能直接照抄示例上车。
+  speed_feedback_timeout_ms: 200
+  speed_pid_kp: 1.0
+  speed_pid_ki: 0.2
+  speed_pid_kd: 0.0
+  speed_pid_derivative_filter_tau_ms: 100.0
+  speed_pid_max_dt_ms: 100
+  hard_overspeed_margin_kph: 3.6
   max_brake: 1.0
   max_steering_angle_deg: 5.0
   require_can_feedback_before_control: true
@@ -162,25 +211,26 @@ vehicle_adapter:
       bridge_library_path: /opt/mine-teleop/lib/vendor/chassis/libmine_teleop_chassis_bridge.so
 ```
 
-`full_scale_motor_torque_nm` 表示直行、制动为 0、稳态、有效 `throttle=1.0`
-时的单电机通道目标值，允许 `0..165 Nm`，`0` 禁用驱动力。实际稳态上限仍会
-乘以 `max_throttle`，而且受 ChassisControl `300 Nm/s` 斜率限制，不能把它理解
-为瞬间跳变值或实测轮端转矩。bridge 在 vendor 计算后再次按该乘积对 D/R
-电机扭矩做对称硬截断。
+`full_scale_motor_torque_nm` 是本地 PID 可使用的唯一单电机通道牵引上限，允许
+`0..165 Nm`，`0` 禁用驱动力；`max_throttle` 只限制可选目标车速比例。旧版本把
+有效通道上限理解为 `full_scale_motor_torque_nm * max_throttle`，例如
+`41.25 * 0.10 = 4.125 Nm`；新版可使用完整 `41.25 Nm`（0.1 Nm 向零量化后为
+41.2 Nm）。迁移时必须按期望的新通道上限重算 `full_scale_motor_torque_nm`，否则
+可能放大十倍。未完成隔离 CAN 台架标定前不得切换真实 adapter。
 
-`max_speed_kph` 对非 mock adapter 必须不小于 VCU 字段分辨率 `1 km/h`，且不大于当前
-ChassisControl 接口上限 `72 km/h`；它与牵引扭矩限幅解耦，在驱动请求有效时通过
-`ADU_Tx_VehSpdReq` 发给 VCU。这些字段的存在不证明 VCU 已经在
-扭矩模式下完成保速仲裁，也不是可替代 VCU 限速器的已验证硬件闭环。修改后先运行 `config-check`、`--preflight` 和
+`max_speed_kph` 不大于当前 ChassisControl 接口上限 `72 km/h`，用于计算本地 PID
+目标及独立硬超速基准，不再受未使用的 VCU 1 km/h 请求分辨率约束。这个软件 PID
+和限幅不是已验证的 VCU/底盘硬件限速器。修改后先运行 `config-check`、`--preflight` 和
 `--adapter-status`，确认 bridge、`libchassis_control.so`、`can1` 和日志目录都
 可用，再连接驾驶员。不得通过把 `require_can_feedback_before_control` 改成
 `false` 绕过反馈门禁。
 
 runtime 与 bridge 必须成套升级。当前 runtime 要求 bridge 提供
-`mine_teleop_chassis_open_v2`；只提供 V1 的旧 bridge 会在任何 CAN 初始化前明确
-启动失败，不会继续控制车辆并静默忽略 `control_timeout_ms`。新 bridge 仍导出
-`mine_teleop_chassis_open_v1` 供旧 runtime 使用，并在该兼容路径采用默认 `800 ms`
-控制超时。WebRTC 视频链与这一
+ABI version 2、完全一致的 V2 配置结构大小以及 `mine_teleop_chassis_open_v2`；
+查询在任何 SocketCAN 初始化前完成。只提供 V1 的旧 bridge 会明确启动失败，
+不会静默忽略 PID/watchdog 配置。新 bridge 仍导出严格三字段的
+`mine_teleop_chassis_open_v1` 供旧 runtime 链接，但该兼容路径因为没有安全 PID
+配置而只允许零牵引。WebRTC 视频链与这一
 控制故障隔离：视频先协商并显示，控制 DataChannel 打开后才尝试启动 adapter；
 adapter 启动或运行失败会短暂上报握手 `fault`、关闭控制 DataChannel、拒绝
 驾驶命令并继续视频；关闭控制通道同时保护旧版本控制端不误报远程急停。该隔离不
@@ -188,7 +238,8 @@ adapter 启动或运行失败会短暂上报握手 `fault`、关闭控制 DataCh
 
 ```bash
 /opt/mine-teleop/bin/mine-teleop-run config-check \
-  --config /opt/mine-teleop/config/vehicle-agent.yaml
+  --config /opt/mine-teleop/config/vehicle-agent.yaml \
+  --chassis-bridge-library /opt/mine-teleop/lib/vendor/chassis/libmine_teleop_chassis_bridge.so
 /opt/mine-teleop/bin/mine-teleop-run vehicle-agent \
   --config /opt/mine-teleop/config/vehicle-agent.yaml --preflight
 /opt/mine-teleop/bin/mine-teleop-run vehicle-agent \
@@ -209,12 +260,16 @@ adapter 启动或运行失败会短暂上报握手 `fault`、关闭控制 DataCh
 4. 在每一阶段人为缺失对应反馈，确认控制量不会越过当前门禁。
 5. 分别验证 N/R/D；只有物理选择器为 N 且电子驻车已拉起时才允许开始握手，
    D/R 均应被准入门禁拒绝。
-6. 小幅验证四轴正负转向、八路小扭矩和八路小压力，逐项核对物理方向、单位、符号、
-   比例、饱和和反馈。
+6. 从重新标定后的极小 `full_scale_motor_torque_nm` 开始，小幅验证四轴正负转向、
+   D/R 八路小扭矩和八路小压力，逐项核对物理方向、单位、符号、比例、饱和和反馈。
+   特别核对轻油门只选择较低目标车速、PID 在目标点可保持正扭矩，以及制动时八路
+   扭矩为零但 EHB 压力连续。
 7. 断开驾驶控制但保持 CAN，确认超时制动；再中断 VCU 反馈，确认 500 ms 通讯
    故障、日志和 VCU 自身超时策略。
-8. 执行正常关闭，确认扭矩归零、零速、N、EPB=2、人工状态 3 的完整退出结果。
-9. 保存日志、`ip -details -statistics link show can1`、VCU 版本、DBC/XLS 版本、
+8. 在安全可控的低速条件验证硬超速和反向运动检测，仅能通过完整退出、零速驻车
+   门禁和显式重新握手恢复；普通控制 apply 不得恢复牵引。
+9. 执行正常关闭，确认扭矩归零、N、EPB=2、人工状态 3 的完整退出结果。
+10. 保存日志、`ip -details -statistics link show can1`、VCU 版本、DBC/XLS 版本、
    车辆载荷、轮胎状态和现场视频，作为验收记录。
 
 任何一步反馈值、方向或执行结果不一致，都应停止后续阶段，保留日志并按具体 CAN

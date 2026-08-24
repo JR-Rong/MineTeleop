@@ -74,6 +74,20 @@ else()
 endif()
 include(GNUInstallDirs)
 
+set(MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_logic.js")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}")
+file(READ "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}" MINE_TELEOP_CONTROL_LOGIC_JS)
+string(FIND "${MINE_TELEOP_CONTROL_LOGIC_JS}" ")MT_CONTROL_JS\"" MINE_TELEOP_CONTROL_LOGIC_DELIMITER)
+if(NOT MINE_TELEOP_CONTROL_LOGIC_DELIMITER EQUAL -1)
+  message(FATAL_ERROR "cpp/web/control_logic.js contains the generated C++ raw-string delimiter")
+endif()
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop")
+configure_file(
+  cmake/control_logic_js.hpp.in
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop/control_logic_js.hpp"
+  @ONLY
+)
+
 function(mine_teleop_enable_warnings target)
   if(MSVC)
     target_compile_options(${target} PRIVATE /W4 /permissive-)
@@ -103,6 +117,8 @@ target_include_directories(mine_teleop_runtime
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>
     $<INSTALL_INTERFACE:include>
+  PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 target_link_libraries(mine_teleop_runtime
   PUBLIC
@@ -249,6 +265,13 @@ install(DIRECTORY protocol/ DESTINATION share/mine-teleop/protocol)
 
 if(MINE_TELEOP_BUILD_TESTS)
   enable_testing()
+  if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
+    find_program(MINE_TELEOP_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
+    add_test(
+      NAME mine-teleop-control-logic-js-tests
+      COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/control_logic.test.cjs
+    )
+  endif()
   if(MINE_TELEOP_BUILD_SIGNALING_SERVER)
     add_test(NAME mine-teleop-signaling-help COMMAND mine-teleop-signaling-server --help)
     set_tests_properties(
@@ -338,6 +361,9 @@ if(MINE_TELEOP_BUILD_TESTS)
       PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
         ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/fixtures/chassis-control
+    )
+    target_compile_definitions(mine-teleop-chassis-bridge-compile-test
+      PRIVATE MINE_TELEOP_CHASSIS_TESTING=1
     )
     mine_teleop_enable_warnings(mine-teleop-chassis-bridge-compile-test)
 

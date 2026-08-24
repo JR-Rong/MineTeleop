@@ -168,6 +168,117 @@ class NoFeedbackAdapter final : public mine_teleop::VehicleAdapter {
   mine_teleop::ControlOutput last_safe_output;
 };
 
+class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
+ public:
+  AdapterOwnedSafeStopAdapter() {
+    handshake.supported = true;
+    handshake.state = "ready";
+    handshake.ready = true;
+  }
+
+  void open() override { opened = true; }
+  void close() override { opened = false; }
+
+  void apply_control(const ControlCommand& command) override {
+    ++control_attempts;
+    if (owns_safe_stop()) {
+      throw std::runtime_error("adapter-owned safe stop rejected ordinary control");
+    }
+    last_control = command;
+    ++applied_commands;
+  }
+
+  void apply_safe_stop(const mine_teleop::ControlOutput& output) override {
+    ++safe_stop_attempts;
+    if (owns_safe_stop() && !output.estop && output.brake < 1.0) {
+      ++rejected_ordinary_safe_stops;
+      throw std::runtime_error(
+          "adapter-owned safe stop rejected duplicate ordinary safe stop");
+    }
+    last_safe_output = output;
+    ++safe_stops;
+  }
+
+  bool poll_feedback() override {
+    if (poll_throws) throw std::runtime_error("adapter feedback poll failed");
+    return true;
+  }
+
+  bool request_vcu_handshake() override {
+    ++handshake_requests;
+    if (!handshake_succeeds) return false;
+    telemetry.estop = false;
+    handshake.state = "initial";
+    handshake.ready = false;
+    handshake.disarming = false;
+    return true;
+  }
+
+  bool disconnect_vcu_handshake() override {
+    telemetry.estop = true;
+    handshake.state = "disarm_torque";
+    handshake.ready = false;
+    handshake.disarming = true;
+    return true;
+  }
+
+  [[nodiscard]] bool feedback_ready() const override {
+    return opened && (!handshake.supported || handshake.ready);
+  }
+  [[nodiscard]] mine_teleop::VcuHandshakeStatus vcu_handshake_status() const override {
+    if (handshake_status_throws) {
+      throw std::runtime_error("adapter handshake status failed");
+    }
+    return handshake;
+  }
+  [[nodiscard]] mine_teleop::VehicleTelemetry read_telemetry() override {
+    if (telemetry_throws) throw std::runtime_error("adapter telemetry failed");
+    return telemetry;
+  }
+  [[nodiscard]] mine_teleop::VehicleAdapterStatus status() const override {
+    return {
+        "adapter_owned_safe_stop",
+        opened,
+        true,
+        "can0",
+        "",
+        applied_commands,
+        safe_stops,
+        "",
+        true,
+        500000,
+        1000,
+    };
+  }
+
+  void set_safe_stop(bool estop, bool ready, bool disarming) {
+    telemetry.estop = estop;
+    handshake.state = disarming ? "disarm_torque" : (ready ? "ready" : "disarmed");
+    handshake.ready = ready;
+    handshake.disarming = disarming;
+  }
+
+  [[nodiscard]] bool owns_safe_stop() const {
+    return telemetry.estop || handshake.disarming;
+  }
+
+  bool opened{false};
+  bool poll_throws{false};
+  bool telemetry_throws{false};
+  bool handshake_status_throws{false};
+  bool handshake_succeeds{true};
+  std::uint64_t control_attempts{0};
+  std::uint64_t applied_commands{0};
+  std::uint64_t safe_stop_attempts{0};
+  std::uint64_t safe_stops{0};
+  std::uint64_t rejected_ordinary_safe_stops{0};
+  std::uint64_t handshake_requests{0};
+  std::optional<ControlCommand> last_control;
+  mine_teleop::ControlOutput last_safe_output;
+  mine_teleop::VehicleTelemetry telemetry;
+  mine_teleop::VcuHandshakeStatus handshake;
+};
+
 void test_config_loads_current_vehicle_yaml() {
   const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   expect(config.vehicle_id == "vehicle-001", "vehicle id mismatch");
@@ -221,6 +332,13 @@ void test_vehicle_config_validates_full_scale_motor_torque() {
       "field_safety:\n",
       "field_safety:\n"
       "  max_throttle: 0.10\n"
+      "  speed_feedback_timeout_ms: 200\n"
+      "  speed_pid_kp: 1.0\n"
+      "  speed_pid_ki: 0.2\n"
+      "  speed_pid_kd: 0.0\n"
+      "  speed_pid_derivative_filter_tau_ms: 100.0\n"
+      "  speed_pid_max_dt_ms: 100\n"
+      "  hard_overspeed_margin_kph: 3.6\n"
       "  max_brake: 1.0\n"
       "  max_steering_angle_deg: 5.0\n");
   replace_once(
@@ -238,6 +356,36 @@ void test_vehicle_config_validates_full_scale_motor_torque() {
       [&] { static_cast<void>(mine_teleop::load_vehicle_config(non_mock_path)); },
       "non-mock adapter accepted an implicit full-scale motor torque");
   std::filesystem::remove(non_mock_path, error);
+}
+
+void test_vehicle_config_validates_local_speed_pid_safety_fields() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  const std::vector<std::pair<std::string, std::string>> invalid_fields{
+      {"speed_feedback_timeout_ms", "19"},
+      {"speed_feedback_timeout_ms", "501"},
+      {"speed_pid_kp", "0"},
+      {"speed_pid_kp", ".nan"},
+      {"speed_pid_ki", "-0.1"},
+      {"speed_pid_kd", "100.1"},
+      {"speed_pid_derivative_filter_tau_ms", "2000.1"},
+      {"speed_pid_max_dt_ms", "19"},
+      {"speed_pid_max_dt_ms", "201"},
+      {"hard_overspeed_margin_kph", "0"},
+      {"hard_overspeed_margin_kph", "36.1"},
+  };
+  std::error_code error;
+  for (const auto& [name, value] : invalid_fields) {
+    auto contents = base;
+    replace_once(
+        contents,
+        "field_safety:\n",
+        "field_safety:\n  " + name + ": " + value + "\n");
+    const auto path = write_temp_vehicle_config("invalid-local-speed-pid", contents);
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); },
+        "invalid local speed PID safety field was accepted: " + name);
+    std::filesystem::remove(path, error);
+  }
 }
 
 void test_vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries() {
@@ -537,6 +685,13 @@ void test_vehicle_config_validates_chassis_control_speed_range() {
       "field_safety:\n"
       "  max_throttle: 0.10\n"
       "  full_scale_motor_torque_nm: 41.25\n"
+      "  speed_feedback_timeout_ms: 200\n"
+      "  speed_pid_kp: 1.0\n"
+      "  speed_pid_ki: 0.2\n"
+      "  speed_pid_kd: 0.0\n"
+      "  speed_pid_derivative_filter_tau_ms: 100.0\n"
+      "  speed_pid_max_dt_ms: 100\n"
+      "  hard_overspeed_margin_kph: 3.6\n"
       "  max_brake: 1.0\n"
       "  max_steering_angle_deg: 5.0\n");
   replace_once(
@@ -558,17 +713,28 @@ void test_vehicle_config_validates_chassis_control_speed_range() {
       non_mock_boundary_config.field_safety.max_speed_kph,
       1.0,
       1e-9,
-      "one km/h VCU speed boundary was rejected");
+      "one km/h local PID target-speed boundary was rejected");
   std::filesystem::remove(non_mock_boundary_path, error);
+
+  auto missing_pid_contents = non_mock_boundary_contents;
+  replace_once(missing_pid_contents, "  speed_pid_kd: 0.0\n", "");
+  const auto missing_pid_path = write_temp_vehicle_config(
+      "missing-explicit-speed-pid", missing_pid_contents);
+  expect_throws(
+      [&] { static_cast<void>(mine_teleop::load_vehicle_config(missing_pid_path)); },
+      "non-mock adapter accepted an implicit speed PID gain");
+  std::filesystem::remove(missing_pid_path, error);
 
   auto sub_resolution_contents = non_mock_boundary_contents;
   replace_once(
       sub_resolution_contents, "max_speed_kph: 1", "max_speed_kph: 0.5");
   const auto sub_resolution_path = write_temp_vehicle_config(
       "speed-below-vcu-resolution", sub_resolution_contents);
-  expect_throws(
-      [&] { static_cast<void>(mine_teleop::load_vehicle_config(sub_resolution_path)); },
-      "non-mock target speed below the VCU field resolution was accepted");
+  expect_near(
+      mine_teleop::load_vehicle_config(sub_resolution_path).field_safety.max_speed_kph,
+      0.5,
+      1e-9,
+      "local PID rejected a target below the unused VCU speed-request resolution");
   std::filesystem::remove(sub_resolution_path, error);
 }
 
@@ -581,12 +747,18 @@ void test_dynamic_adapter_target_speed_uses_configured_ceiling() {
     value.gear = gear;
     expect_near(
         mine_teleop::dynamic_adapter_target_speed_mps(value, max_speed_mps),
-        max_speed_mps,
+        0.01 * max_speed_mps,
         1e-9,
-        "partial traction scaled the configured target speed");
+        "analog throttle did not select a proportional local PID target speed");
   }
 
   value.gear = "D";
+  value.throttle = 1.0;
+  expect_near(
+      mine_teleop::dynamic_adapter_target_speed_mps(value, max_speed_mps),
+      max_speed_mps,
+      1e-9,
+      "full analog throttle did not select the configured maximum target speed");
   value.throttle = 0.0;
   expect_near(
       mine_teleop::dynamic_adapter_target_speed_mps(value, max_speed_mps),
@@ -676,6 +848,25 @@ void test_field_config_pins_tls_route_without_system_dns() {
       41.25,
       1e-9,
       "field vehicle full-scale motor torque changed");
+  expect(
+      config.field_safety.speed_feedback_timeout_ms == 200 &&
+          config.field_safety.speed_pid_max_dt_ms == 100,
+      "field vehicle local speed PID timing changed");
+  expect_near(
+      config.field_safety.speed_pid_kp,
+      1.0,
+      1e-9,
+      "field vehicle speed PID Kp changed");
+  expect_near(
+      config.field_safety.speed_pid_ki,
+      0.2,
+      1e-9,
+      "field vehicle speed PID Ki changed");
+  expect_near(
+      config.field_safety.hard_overspeed_margin_kph,
+      3.6,
+      1e-9,
+      "field vehicle hard overspeed margin changed");
   expect_near(
       config.redacted_summary().at("full_scale_motor_torque_nm").get<double>(),
       41.25,
@@ -860,6 +1051,214 @@ void test_control_service_reports_safe_stop_output_after_timeout() {
   const auto telemetry = adapter_view->read_telemetry();
   expect_near(telemetry.throttle_feedback, 0.0, 1e-9, "timeout telemetry retained stale throttle");
   expect_near(telemetry.brake_feedback, 0.6, 1e-9, "timeout telemetry did not report safe brake");
+  service.close();
+}
+
+void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshake() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
+  auto* adapter_view = adapter.get();
+  mine_teleop::VehicleControlService service(
+      config, "driver-001", "session-001", "token", std::move(adapter), 10000);
+  service.start(0);
+
+  expect(
+      service.receive_command(command(1, 0), 0).accepted,
+      "initial control command was rejected");
+  expect(
+      adapter_view->applied_commands == 1 && adapter_view->control_attempts == 1,
+      "initial control command did not reach the adapter exactly once");
+
+  adapter_view->set_safe_stop(true, true, false);
+  service.tick(100);
+  const auto blocked = service.receive_command(command(2, 110), 110);
+  expect(
+      !blocked.accepted && blocked.reason == "adapter_safe_stop_active",
+      "ordinary control was not rejected during adapter-owned safe stop");
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::ControlActive &&
+          adapter_view->control_attempts == 1,
+      "blocked control refreshed outer safety state or reached the adapter");
+
+  adapter_view->handshake_status_throws = true;
+  service.tick(350);
+  adapter_view->handshake_status_throws = false;
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::Degraded,
+      "outer safety state did not survive an unreadable adapter interlock");
+  adapter_view->set_safe_stop(false, false, true);
+  service.tick(900);
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::TimeoutBrake,
+      "outer safety state did not reach timeout while the adapter disarmed");
+  expect(
+      adapter_view->safe_stop_attempts == 0 &&
+          adapter_view->rejected_ordinary_safe_stops == 0,
+      "outer timeout repeated an ordinary safe stop owned by the adapter");
+
+  adapter_view->handshake_succeeds = false;
+  expect(
+      !service.request_vcu_handshake(),
+      "failed adapter handshake was reported as successful");
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
+          adapter_view->handshake_requests == 1,
+      "failed adapter handshake cleared the recoverable outer state");
+
+  adapter_view->handshake_succeeds = true;
+  expect(
+      service.request_vcu_handshake(),
+      "explicit adapter handshake recovery was rejected");
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::Standby,
+      "successful adapter handshake did not reset the recoverable outer state to Standby");
+  service.tick(2000);
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::Standby &&
+          adapter_view->applied_commands == 1 &&
+          adapter_view->safe_stop_attempts == 0,
+      "post-handshake Standby replayed an old command or timeout output");
+
+  expect(
+      !adapter_view->feedback_ready(),
+      "fake adapter incorrectly reported Ready while the handshake was Initial");
+  adapter_view->set_safe_stop(false, true, false);
+  const auto gap_rearm = service.receive_command(command(3, 2010), 2010);
+  expect(
+      !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
+      "first heartbeat after the intentional handshake gap did not re-arm timing");
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::Standby &&
+          adapter_view->control_attempts == 1,
+      "gap re-arm heartbeat replayed control after the handshake");
+  const auto fresh = service.receive_command(command(4, 2020), 2020);
+  expect(fresh.accepted, "fresh post-handshake control command was rejected");
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::ControlActive &&
+          adapter_view->applied_commands == 2 &&
+          adapter_view->last_control && adapter_view->last_control->seq == 4,
+      "fresh post-handshake command did not exclusively restore control");
+  service.close();
+}
+
+void test_adapter_handshake_does_not_clear_outer_estop_or_fault() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  {
+    auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
+    auto* adapter_view = adapter.get();
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    adapter_view->set_safe_stop(true, true, false);
+    auto estop = command(1, 0);
+    estop.estop = true;
+    expect(
+        service.receive_command(estop, 0).accepted &&
+            service.safety_state() == mine_teleop::SafetyState::Estop,
+        "outer ESTOP command did not latch while the adapter owned the stop");
+    expect(
+        adapter_view->safe_stop_attempts == 1 &&
+            adapter_view->last_safe_output.estop &&
+            adapter_view->rejected_ordinary_safe_stops == 0,
+        "outer ESTOP did not safely reassert the emergency stop");
+    expect(
+        !service.request_vcu_handshake() && adapter_view->handshake_requests == 0,
+        "outer ESTOP allowed the adapter handshake to start");
+    expect(
+        service.safety_state() == mine_teleop::SafetyState::Estop,
+        "rejected adapter handshake incorrectly cleared outer ESTOP");
+    service.close();
+  }
+
+  {
+    auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
+    auto* adapter_view = adapter.get();
+    adapter_view->telemetry_throws = true;
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    const auto failed = service.receive_command(command(1, 0), 0);
+    expect(
+        !failed.accepted && failed.reason == "adapter_safety_status_unavailable" &&
+            service.safety_state() == mine_teleop::SafetyState::Fault,
+        "adapter safety observation failure did not establish the outer Fault guard");
+    adapter_view->telemetry_throws = false;
+    expect(
+        !service.request_vcu_handshake() && adapter_view->handshake_requests == 0,
+        "outer Fault allowed the adapter handshake to start");
+    expect(
+        service.safety_state() == mine_teleop::SafetyState::Fault,
+        "rejected adapter handshake incorrectly cleared outer Fault");
+    service.close();
+  }
+}
+
+void test_reset_estop_rejects_unreadable_disarming_and_hard_adapter_stops() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
+  auto* adapter_view = adapter.get();
+  mine_teleop::VehicleControlService service(
+      config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(0);
+
+  auto estop = command(1, 0);
+  estop.estop = true;
+  expect(service.receive_command(estop, 0).accepted, "outer ESTOP command was rejected");
+  expect(adapter_view->safe_stop_attempts == 1, "outer ESTOP was not applied");
+
+  adapter_view->set_safe_stop(false, false, true);
+  expect(
+      !service.reset_estop(true, "operator", 5) &&
+          service.safety_state() == mine_teleop::SafetyState::Estop &&
+          adapter_view->safe_stop_attempts == 1,
+      "adapter disarming allowed an outer ESTOP reset or ordinary apply");
+
+  adapter_view->set_safe_stop(true, true, false);
+  adapter_view->telemetry_throws = true;
+  expect(
+      !service.reset_estop(true, "operator", 10) &&
+          service.safety_state() == mine_teleop::SafetyState::Estop,
+      "unreadable adapter interlock allowed the outer ESTOP reset");
+  adapter_view->telemetry_throws = false;
+  expect(
+      !service.reset_estop(true, "operator", 20) &&
+          service.safety_state() == mine_teleop::SafetyState::Estop,
+      "physical or hard adapter stop incorrectly cleared the outer ESTOP");
+  expect(
+      adapter_view->safe_stop_attempts == 2 &&
+          adapter_view->rejected_ordinary_safe_stops == 1,
+      "physical or hard adapter stop did not reject exactly one same-gear zero reset attempt");
+  service.close();
+}
+
+void test_reset_estop_clears_soft_stop_before_fresh_control() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+  auto* adapter_view = adapter.get();
+  mine_teleop::VehicleControlService service(
+      config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(0);
+
+  auto estop = command(1, 0);
+  estop.estop = true;
+  expect(
+      service.receive_command(estop, 0).accepted &&
+          service.safety_state() == mine_teleop::SafetyState::Estop &&
+          adapter_view->read_telemetry().estop,
+      "soft outer ESTOP did not reach the mock adapter");
+  expect(
+      service.reset_estop(true, "operator", 10) &&
+          service.safety_state() == mine_teleop::SafetyState::Standby &&
+          !adapter_view->read_telemetry().estop &&
+          adapter_view->read_telemetry().gear == "D",
+      "authorized reset did not clear the adapter soft stop while preserving actual D");
+
+  const auto fresh = service.receive_command(command(2, 20), 20);
+  expect(
+      fresh.accepted &&
+          service.safety_state() == mine_teleop::SafetyState::ControlActive &&
+          adapter_view->read_telemetry().throttle_feedback > 0.0,
+      "fresh control did not recover after the authorized soft ESTOP reset");
   service.close();
 }
 
@@ -1856,6 +2255,7 @@ int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"config_loads_current_vehicle_yaml", test_config_loads_current_vehicle_yaml},
       {"vehicle_config_validates_full_scale_motor_torque", test_vehicle_config_validates_full_scale_motor_torque},
+      {"vehicle_config_validates_local_speed_pid_safety_fields", test_vehicle_config_validates_local_speed_pid_safety_fields},
       {"vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries", test_vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries},
       {"control_enabled_vehicle_requires_an_enabled_critical_camera", test_control_enabled_vehicle_requires_an_enabled_critical_camera},
       {"camera_failure_decision_is_bounded_and_fail_closed", test_camera_failure_decision_is_bounded_and_fail_closed},
@@ -1875,6 +2275,14 @@ int main() {
       {"mailbox_keeps_only_latest_command", test_mailbox_keeps_only_latest_command},
       {"safety_timeout_profile_and_estop_latch", test_safety_timeout_profile_and_estop_latch},
       {"control_service_reports_safe_stop_output_after_timeout", test_control_service_reports_safe_stop_output_after_timeout},
+      {"control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshake",
+       test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshake},
+      {"adapter_handshake_does_not_clear_outer_estop_or_fault",
+       test_adapter_handshake_does_not_clear_outer_estop_or_fault},
+      {"reset_estop_rejects_unreadable_disarming_and_hard_adapter_stops",
+       test_reset_estop_rejects_unreadable_disarming_and_hard_adapter_stops},
+      {"reset_estop_clears_soft_stop_before_fresh_control",
+       test_reset_estop_clears_soft_stop_before_fresh_control},
       {"control_service_applies_vehicle_hard_limits", test_control_service_applies_vehicle_hard_limits},
       {"control_service_bounds_telemetry_history", test_control_service_bounds_telemetry_history},
       {"control_service_requires_feedback_before_actuation_but_allows_estop", test_control_service_requires_feedback_before_actuation_but_allows_estop},

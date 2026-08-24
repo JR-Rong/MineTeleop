@@ -1,0 +1,9 @@
+#pragma once
+
+#include <string_view>
+
+namespace mine_teleop::web {
+
+inline constexpr std::string_view kControlLogicJavaScript = R"MT_CONTROL_JS(@MINE_TELEOP_CONTROL_LOGIC_JS@)MT_CONTROL_JS";
+
+}  // namespace mine_teleop::web

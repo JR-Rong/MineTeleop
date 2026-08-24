@@ -231,6 +231,13 @@ field_safety:
   max_speed_kph: 40
   max_throttle: 0.10
   full_scale_motor_torque_nm: 41.25
+  speed_feedback_timeout_ms: 200
+  speed_pid_kp: 1.0
+  speed_pid_ki: 0.2
+  speed_pid_kd: 0.0
+  speed_pid_derivative_filter_tau_ms: 100.0
+  speed_pid_max_dt_ms: 100
+  hard_overspeed_margin_kph: 3.6
   max_brake: 1.0
   max_steering_angle_deg: 5.0
   require_can_feedback_before_control: true
@@ -316,29 +323,27 @@ GStreamer factory，`max_end_to_end_latency_ms` 与 `min_realtime_fps` 用于车
 是否必须本地确认急停复位、是否强制时间同步。这些软件门禁不替代现场安全员和物理急停，
 但会进入有效配置日志和验收记录。
 
-`field_safety.full_scale_motor_torque_nm` 的定义是：直行、制动为 0、稳态且车端收到的
-有效 `throttle=1.0` 时，每个电机通道的目标转矩。默认 `41.25 Nm` 保持既有
-18 吨、8 轮、轮半径 0.55 m、30:1 软件模型在 `1 m/s²` 下的映射；允许范围
-是 `0..165 Nm`，其中 `0` 明确禁用驱动力。车端仍先应用 `max_throttle`，因此
-实际配置上限是 `full_scale_motor_torque_nm × max_throttle`；例如二者分别为
-`82.5` 和 `0.10` 时，稳态目标约为 `8.25 Nm/通道`。ChassisControl 的
-`300 Nm/s` 转矩斜率仍然生效，瞬时请求不会跳到该稳态上限。只能在隔离台架上
-逐级调大，并以 CAN 请求和电机反馈共同验收；该值不是实测轮端转矩。bridge 在
-ChassisControl 的转向补偿和斜率限制之后按每路电机对称硬截断，保证 D/R 扭矩都不超过该乘积；
-它不缩放普通制动或安全停车。
+`field_safety.full_scale_motor_torque_nm` 是车速 PID 对每个电机通道可请求的
+对称最大转矩。默认 `41.25 Nm` 来自既有 18 吨、8 轮、轮半径 0.55 m、
+30:1 软件模型在 `1 m/s²` 下的映射；允许范围是 `0..165 Nm`，其中 `0`
+明确禁用驱动力。`max_throttle` 不按比例缩小这个转矩上限；例如
+`max_throttle=0.10` 表示目标车速最多为 `max_speed_kph` 的 10%，PID 在追踪该目标时
+仍可在纵向控制器和斜率限制内请求最多 `full_scale_motor_torque_nm`。只能在隔离
+台架上逐级调大该转矩上限，并以 CAN 请求和电机反馈共同验收；配置值不是
+实测轮端转矩。普通制动和安全停车不由该转矩上限缩放。
 
-`max_speed_kph` 是与油门/扭矩比例解耦的目标车速：D/R、牵引请求大于 0 且
-`full_scale_motor_torque_nm > 0` 时，adapter 把该配置值传给 bridge，bridge 再用 1 km/h
-分辨率向下量化并编码 `ADU_Tx_VehSpdReq`，不会因四舍五入超过配置目标。松开牵引、制动或把
-牵引能力配置为 0 时发送 `0/Q=0`，即撤销车速请求而不是请求 VCU 主动保持零速。当前
-ChassisControl 接口的目标速度范围是 `0..20 m/s`，且 VCU 字段分辨率是 `1 km/h`；因此
-非 mock 配置必须在 `1..72 km/h` 范围内。bridge 对低于 1 km/h 的外部调用也会保持 `Q=0`。
-该报文在扭矩模式下的仲裁/保速语义必须由 VCU 协议方或隔离台架确认；仅有 DBC 字段和软件编解码测试不等于闭环已验收。
+`max_speed_kph` 是本地车速 PID 的硬车速上限。D/R 且制动为 0 时，目标车速为
+`clamp(throttle, 0, max_throttle) × max_speed_kph`；松开纵向输入、刹车或切到 N 挡时目标归零。
+车端始终把 `ADU_Tx_VehSpdReq` 按无效的 `0/Q=0` 发送，不让 VCU 同时追踪另一个
+车速闭环目标。所有 adapter 的配置范围都是 `0..72 km/h`，`0` 表示明确禁用牵引。
+车速闭环、转矩上限和超速熔断必须由隔离台架与实车
+分阶段验收；软件单测不等于闭环已验收。
 
 启用上述配置时必须同步升级车端 runtime 和 ChassisControl bridge：当前 runtime
 要求 bridge 导出 `mine_teleop_chassis_open_v2`。只提供 V1 的旧 bridge 不会静默忽略
 控制超时配置，而会在任何 CAN 初始化前因 ABI 不匹配而启动失败；新 bridge 仍保留
-`mine_teleop_chassis_open_v1` 供旧 runtime 使用，该兼容路径采用默认 `800 ms` 超时。
+`mine_teleop_chassis_open_v1` 供旧 runtime 使用，该 fail-safe 兼容路径禁用正牵引、
+保持车速请求无效，并采用默认 `800 ms` 超时；它只用于安全迁移，不提供实车驾驶能力。
 进入 Ready 后，若连续
 `control.control_timeout_ms` 没有成功 apply，bridge 会撤销车速请求、将转矩置零并施加
 标定的安全制动；下一条有效 apply 才会清除该 watchdog 锁存。
@@ -361,8 +366,12 @@ access key 和 secret。Secret 可以直接配置，也可以用
 `vehicle_adapter.type=mock` 可直接无外部依赖运行。配置为 `can` 或
 `dynamic_library` 时，必须显式填写 `field_safety.max_speed_kph`、
 `field_safety.max_throttle`、`field_safety.full_scale_motor_torque_nm`、
-`field_safety.max_brake` 和
-`field_safety.max_steering_angle_deg`，并先声明真实车辆接口契约，例如：
+`field_safety.speed_feedback_timeout_ms`、`field_safety.speed_pid_kp`、
+`field_safety.speed_pid_ki`、`field_safety.speed_pid_kd`、
+`field_safety.speed_pid_derivative_filter_tau_ms`、`field_safety.speed_pid_max_dt_ms`、
+`field_safety.hard_overspeed_margin_kph`、`field_safety.max_brake` 和
+`field_safety.max_steering_angle_deg`，并先声明真实车辆接口契约。上述 PID 与超速值只能使用
+隔离台架标定结果，不得把示例默认值当作实车验收值。接口契约例如：
 
 ```yaml
 vehicle_adapter:
@@ -500,14 +509,6 @@ control:
     initial_service_brake: 0.30
     initial_hard_brake: 1.0
     initial_max_steering_angle_deg: 3.0
-  keyboard:
-    steering_left: A
-    steering_right: D
-    throttle: W
-    reverse: S
-    service_brake: Space
-    hard_brake: B
-    estop: E
   gamepad:
     enabled: true
     steering_axis: 0
@@ -528,6 +529,15 @@ control:
 
 `ui.show_debug_overlay` 必须写成 YAML/TOML boolean `true`/`false`，不能用带引号
 字符串，避免调试层在正式驾驶端被误启用或误关闭。
+`control.limits.initial_max_throttle` 保留了 v1 协议命名，但它是控制端初始的
+“最大目标车速比例”，取值 `[0, 1]`。车端目标车速为该比例与
+`field_safety.max_speed_kph` 的乘积；它不限制转矩。每路最大转矩由车端
+`field_safety.full_scale_motor_torque_nm` 及纵向控制器限制。
+`control.keyboard` 已删除且不再是可配置接口。键位固定为
+`ArrowLeft`/`A` 左转、`ArrowRight`/`D` 右转、`ArrowUp`/`W` 前进、
+`ArrowDown`/`S` 倒车、`Space` 缓刹、`B` 急刹、`E` 急停。加载器如果
+发现仓库外旧配置仍包含 `control.keyboard`，会直接拒绝启动，避免运维误以为
+某个未生效的键位绑定已被应用。
 `control.gamepad` 的轴编号来自浏览器 Gamepad API；标准映射手柄使用浏览器规定的
 左摇杆 X、右/左扳机，非标准方向盘/踏板使用这里的轴配置。`*_center`/`*_rest`
 和 `*_range` 可写入现场测量值，也可以在浏览器中做本次运行有效的中心与量程校准。
@@ -542,6 +552,25 @@ control:
 不能把归一化数值直接当作 bar 或制动力 N。
 急停、控制超时、故障和断开停车走独立安全停车路径，不会被这两个普通驾驶刹车
 上限削弱。
+旧的 `/api/control/keyboard` 仍作为回环兼容接口：`service_brake` 和
+`hard_brake` 分别选择两档请求，两者同时为真时急刹优先；旧 `brake=true`
+按急刹处理。刹车会把目标车速比例压到 0 但保留转向，所有键值都必须是 JSON boolean，
+不接受字符串 `"true"`。该兼容接口是无状态的：每次请求独立派生挡位，`up` / `down`
+都为 `false` 时输出 `N`。浏览器控制页的 D/R 会话锁存与按键保持语义不适用于这个 legacy
+接口；旧调用方如果依赖持续 D/R，必须在每个请求中显式携带对应方向键状态。
+
+### 升级迁移
+
+- 升级前从所有仓库外驾驶端 YAML 删除整个 `control.keyboard` 段；键位不会从旧值自动迁移。
+- 检查所有仓库外车端的 `field_safety.max_speed_kph`。加载器通用范围已收紧为
+  `[0, 72] km/h`，`0` 明确禁用牵引；大于 `72` 的旧值会启动失败，不会静默截断。
+  必须根据本地 PID 车速上限和隔离台架结果显式选择新值。
+- 不得原样复用旧非 mock 配置的 `full_scale_motor_torque_nm`。旧语义下有效转矩上限约为
+  `full_scale_motor_torque_nm × max_throttle`；新语义下 `full_scale_motor_torque_nm` 是唯一的每路上限。
+  例如旧值 `41.25 Nm × 0.10` 的软件上限约为 `4.125 Nm/路`；升级时必须以这个
+  旧有效上限为起点重新配置，再经隔离台架逐级标定，不能留在 `41.25 Nm` 而将最大
+  软件请求无意中放大约 10 倍。非 mock 配置缺少上述任一必填车速、比例、转矩、PID/反馈、
+  超速、制动或转向门禁时继续 fail closed，不会补默认值启动真实 adapter。
 `logging.browser_event_log` 的相对路径以 YAML 文件所在目录为基准；默认值把日志
 写入控制端包根目录的 `.local/logs/`。`browser_event_log_files` 包含当前文件，
 因此值 `3` 表示当前文件加 `.1`、`.2` 两个备份。凭据类字段会被递归脱敏，但部署

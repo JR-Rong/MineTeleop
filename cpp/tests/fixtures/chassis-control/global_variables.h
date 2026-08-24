@@ -1,5 +1,6 @@
 #pragma once
 
+// Minimal ChassisControl ABI fixture for the unprivileged bridge smoke target.
 #include <array>
 #include <string>
 #include <vector>

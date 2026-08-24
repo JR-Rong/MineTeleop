@@ -8,11 +8,17 @@
 #define MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM 41.25
 #define MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM 165.0
 #define MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM 0.1
-#define MINE_TELEOP_CHASSIS_MIN_SPEED_REQUEST_KPH 1.0
-#define MINE_TELEOP_CHASSIS_MAX_SPEED_REQUEST_KPH 255.0
 #define MINE_TELEOP_CHASSIS_DEFAULT_CONTROL_TIMEOUT_MS 800
 #define MINE_TELEOP_CHASSIS_MIN_CONTROL_TIMEOUT_MS 20
 #define MINE_TELEOP_CHASSIS_MAX_CONTROL_TIMEOUT_MS 60000
+#define MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS 20
+#define MINE_TELEOP_CHASSIS_MAX_SPEED_FEEDBACK_TIMEOUT_MS 500
+#define MINE_TELEOP_CHASSIS_MIN_SPEED_PID_MAX_DT_MS 20
+#define MINE_TELEOP_CHASSIS_MAX_SPEED_PID_MAX_DT_MS 200
+#define MINE_TELEOP_CHASSIS_MAX_SPEED_PID_GAIN 100.0
+#define MINE_TELEOP_CHASSIS_MAX_DERIVATIVE_FILTER_TAU_MS 2000.0
+#define MINE_TELEOP_CHASSIS_SPEED_PID_SETPOINT_RESET_DEADBAND_MPS 0.05
+#define MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS 10.0
 
 /* Convert the normalized longitudinal input used by the runtime into the
  * ChassisControl acceleration input. Negative values are the independent
@@ -26,9 +32,9 @@ static inline double mine_teleop_chassis_scaled_target_acceleration(
         : target_ax;
 }
 
-/* Final per-channel traction ceiling. ChassisControl may compensate wheel
- * force for steering angle or retain a higher prior value while rate-limiting;
- * neither is allowed to exceed the configured normalized torque request. */
+/* Final per-channel traction ceiling. target_ax is the local PID output, not
+ * the upstream analog throttle. ChassisControl steering compensation and
+ * rate-limiting may not exceed this authoritative result. */
 static inline double mine_teleop_chassis_motor_torque_limit_nm(
     double target_ax,
     double full_scale_motor_torque_nm) {
@@ -36,7 +42,9 @@ static inline double mine_teleop_chassis_motor_torque_limit_nm(
     const double normalized_traction = target_ax < 1.0 ? target_ax : 1.0;
     const double requested_limit = normalized_traction * full_scale_motor_torque_nm;
     return floor(
-        requested_limit / MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM) *
+        nextafter(
+            requested_limit / MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM,
+            DBL_MAX)) *
         MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM;
 }
 
@@ -46,35 +54,27 @@ static inline double mine_teleop_chassis_clamp_motor_torque_nm(
     double full_scale_motor_torque_nm) {
     const double limit = mine_teleop_chassis_motor_torque_limit_nm(
         target_ax, full_scale_motor_torque_nm);
-    if (motor_torque_nm < -limit) return -limit;
-    if (motor_torque_nm > limit) return limit;
-    return motor_torque_nm;
+    double bounded = motor_torque_nm;
+    if (bounded < -limit) bounded = -limit;
+    if (bounded > limit) bounded = limit;
+    const double magnitude_steps = floor(nextafter(
+        fabs(bounded) / MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM,
+        DBL_MAX));
+    const double quantized = magnitude_steps *
+        MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM;
+    return bounded < 0.0 ? -quantized : quantized;
 }
 
-/* The VCU speed request is an unsigned 1 km/h field. The apply ABI rejects
- * non-finite inputs before this conversion is used. */
-static inline double mine_teleop_chassis_target_speed_request_kph(
-    double target_vx_mps) {
-    if (!(target_vx_mps > 0.0)) return 0.0;
-    const double target_kph = target_vx_mps * 3.6;
-    return target_kph < MINE_TELEOP_CHASSIS_MAX_SPEED_REQUEST_KPH
-        ? target_kph
-        : MINE_TELEOP_CHASSIS_MAX_SPEED_REQUEST_KPH;
-}
-
-/* A valid speed request is an active traction request, not merely a D/R gear
- * selection. Keeping this false at zero traction preserves steering and gear
- * authority without asking the VCU to actively regulate vehicle speed to 0. */
-static inline int mine_teleop_chassis_vehicle_speed_request_valid(
+static inline double mine_teleop_chassis_clamp_directional_motor_torque_nm(
+    double motor_torque_nm,
     int target_gear,
-    double target_vx_mps,
-    double target_ax,
+    double normalized_traction,
     double full_scale_motor_torque_nm) {
-    return (target_gear == 2 || target_gear == 3) &&
-        mine_teleop_chassis_target_speed_request_kph(target_vx_mps) >=
-            MINE_TELEOP_CHASSIS_MIN_SPEED_REQUEST_KPH &&
-        target_ax > 0.0 &&
-        full_scale_motor_torque_nm > 0.0;
+    const double clamped = mine_teleop_chassis_clamp_motor_torque_nm(
+        motor_torque_nm, normalized_traction, full_scale_motor_torque_nm);
+    if (target_gear == 3) return clamped > 0.0 ? clamped : 0.0;
+    if (target_gear == 2) return clamped < 0.0 ? clamped : 0.0;
+    return 0.0;
 }
 
 static inline int mine_teleop_chassis_finite(double value) {
@@ -102,13 +102,163 @@ static inline int mine_teleop_chassis_control_timeout_is_valid(
         control_timeout_ms <= MINE_TELEOP_CHASSIS_MAX_CONTROL_TIMEOUT_MS;
 }
 
+struct MineTeleopChassisSpeedPidConfig {
+    double kp;
+    double ki;
+    double kd;
+    double derivative_filter_tau_ms;
+    int32_t max_dt_ms;
+};
+
+struct MineTeleopChassisSpeedPidState {
+    double integral;
+    double filtered_measurement_derivative;
+    double previous_measurement;
+    int initialized;
+};
+
+static inline int mine_teleop_chassis_speed_pid_config_is_valid(
+    const struct MineTeleopChassisSpeedPidConfig* config) {
+    return config != 0 &&
+        mine_teleop_chassis_finite(config->kp) && config->kp > 0.0 &&
+        config->kp <= MINE_TELEOP_CHASSIS_MAX_SPEED_PID_GAIN &&
+        mine_teleop_chassis_finite(config->ki) && config->ki >= 0.0 &&
+        config->ki <= MINE_TELEOP_CHASSIS_MAX_SPEED_PID_GAIN &&
+        mine_teleop_chassis_finite(config->kd) && config->kd >= 0.0 &&
+        config->kd <= MINE_TELEOP_CHASSIS_MAX_SPEED_PID_GAIN &&
+        mine_teleop_chassis_finite(config->derivative_filter_tau_ms) &&
+        config->derivative_filter_tau_ms >= 0.0 &&
+        config->derivative_filter_tau_ms <=
+            MINE_TELEOP_CHASSIS_MAX_DERIVATIVE_FILTER_TAU_MS &&
+        config->max_dt_ms >= MINE_TELEOP_CHASSIS_MIN_SPEED_PID_MAX_DT_MS &&
+        config->max_dt_ms <= MINE_TELEOP_CHASSIS_MAX_SPEED_PID_MAX_DT_MS;
+}
+
+static inline void mine_teleop_chassis_speed_pid_reset(
+    struct MineTeleopChassisSpeedPidState* state) {
+    if (state == 0) return;
+    state->integral = 0.0;
+    state->filtered_measurement_derivative = 0.0;
+    state->previous_measurement = 0.0;
+    state->initialized = 0;
+}
+
+/* Keep a fixed reference through small analog setpoint jitter so integral
+ * state survives, but reset after cumulative drift crosses the deadband. */
+static inline int mine_teleop_chassis_speed_pid_setpoint_requires_reset(
+    int reference_valid,
+    int reference_gear,
+    int target_gear,
+    double reference_speed_mps,
+    double target_speed_mps) {
+    return !reference_valid || reference_gear != target_gear ||
+        !mine_teleop_chassis_finite(reference_speed_mps) ||
+        !mine_teleop_chassis_finite(target_speed_mps) ||
+        fabs(target_speed_mps - reference_speed_mps) >
+            MINE_TELEOP_CHASSIS_SPEED_PID_SETPOINT_RESET_DEADBAND_MPS;
+}
+
+/* Pure local speed PID. Production passes a normalized ceiling of 1.0 whenever
+ * traction is enabled, making full_scale_motor_torque_nm the sole per-channel
+ * torque limit. Derivative-on-measurement avoids target-step kick; conditional
+ * integration prevents windup while retaining a positive I term at target. */
+static inline double mine_teleop_chassis_speed_pid_step(
+    const struct MineTeleopChassisSpeedPidConfig* config,
+    struct MineTeleopChassisSpeedPidState* state,
+    double target_speed_mps,
+    double measured_speed_along_gear_mps,
+    double traction_ceiling,
+    double dt_seconds) {
+    if (!mine_teleop_chassis_speed_pid_config_is_valid(config) || state == 0 ||
+        !mine_teleop_chassis_finite(state->integral) ||
+        !mine_teleop_chassis_finite(state->filtered_measurement_derivative) ||
+        !mine_teleop_chassis_finite(state->previous_measurement) ||
+        (state->initialized != 0 && state->initialized != 1) ||
+        !mine_teleop_chassis_finite(target_speed_mps) || target_speed_mps <= 0.0 ||
+        !mine_teleop_chassis_finite(measured_speed_along_gear_mps) ||
+        !mine_teleop_chassis_finite(traction_ceiling) || traction_ceiling <= 0.0 ||
+        !mine_teleop_chassis_finite(dt_seconds) || dt_seconds <= 0.0 ||
+        dt_seconds * 1000.0 > (double)config->max_dt_ms) {
+        mine_teleop_chassis_speed_pid_reset(state);
+        return 0.0;
+    }
+
+    if (traction_ceiling > 1.0) traction_ceiling = 1.0;
+    const double error = target_speed_mps - measured_speed_along_gear_mps;
+    double derivative = 0.0;
+    if (state->initialized) {
+        const double raw_derivative =
+            (measured_speed_along_gear_mps - state->previous_measurement) /
+            dt_seconds;
+        const double tau_seconds = config->derivative_filter_tau_ms / 1000.0;
+        const double alpha = tau_seconds <= 0.0
+            ? 1.0
+            : dt_seconds / (tau_seconds + dt_seconds);
+        state->filtered_measurement_derivative +=
+            alpha * (raw_derivative - state->filtered_measurement_derivative);
+        derivative = state->filtered_measurement_derivative;
+    } else {
+        state->initialized = 1;
+    }
+    state->previous_measurement = measured_speed_along_gear_mps;
+    if (state->integral < 0.0) state->integral = 0.0;
+    if (state->integral > traction_ceiling) state->integral = traction_ceiling;
+
+    const double unconstrained = config->kp * error + state->integral -
+        config->kd * derivative;
+    const int saturated_high = unconstrained >= traction_ceiling;
+    const int saturated_low = unconstrained <= 0.0;
+    if ((!saturated_high && !saturated_low) ||
+        (saturated_high && error < 0.0) ||
+        (saturated_low && error > 0.0)) {
+        state->integral += config->ki * error * dt_seconds;
+        if (state->integral < 0.0) state->integral = 0.0;
+        if (state->integral > traction_ceiling) state->integral = traction_ceiling;
+    }
+
+    double output = config->kp * error + state->integral -
+        config->kd * derivative;
+    if (output < 0.0) output = 0.0;
+    if (output > traction_ceiling) output = traction_ceiling;
+    return output;
+}
+
+static inline int mine_teleop_chassis_hard_overspeed(
+    double target_speed_mps,
+    double measured_speed_along_gear_mps,
+    double margin_mps) {
+    return mine_teleop_chassis_finite(target_speed_mps) &&
+        mine_teleop_chassis_finite(measured_speed_along_gear_mps) &&
+        mine_teleop_chassis_finite(margin_mps) && target_speed_mps >= 0.0 &&
+        margin_mps > 0.0 &&
+        measured_speed_along_gear_mps > target_speed_mps + margin_mps;
+}
+
+static inline int mine_teleop_chassis_hard_overspeed_latch(
+    int already_latched,
+    double target_speed_mps,
+    double measured_speed_mps,
+    double margin_mps) {
+    return already_latched || mine_teleop_chassis_hard_overspeed(
+        target_speed_mps, measured_speed_mps, margin_mps);
+}
+
+static inline int mine_teleop_chassis_opposite_direction_motion(
+    int target_gear,
+    double signed_speed_mps) {
+    if (!mine_teleop_chassis_finite(signed_speed_mps)) return 1;
+    if (target_gear == 3) return signed_speed_mps < -0.1;
+    if (target_gear == 2) return signed_speed_mps > 0.1;
+    return 0;
+}
+
 static inline int mine_teleop_chassis_control_watchdog_expired(
-    int ready,
+    int active_control_state,
     int has_reference,
     int already_latched,
     uint64_t elapsed_ms,
     int control_timeout_ms) {
-    return ready && has_reference && !already_latched &&
+    return active_control_state && has_reference && !already_latched &&
         mine_teleop_chassis_control_timeout_is_valid(control_timeout_ms) &&
         elapsed_ms >= (uint64_t)control_timeout_ms;
 }
@@ -212,30 +362,50 @@ struct MineTeleopChassisCanFeedbackV1 {
 struct MineTeleopChassisOpenConfigV1 {
     uint32_t struct_size;
     const char* can_interface;
-    /* Per motor channel at steady straight-line throttle=1.0, brake=0. */
+    /* Legacy torque-scale field; the V1 compatibility path disables traction. */
     double full_scale_motor_torque_nm;
+};
+
+struct MineTeleopChassisOpenConfigV2 {
+    uint32_t struct_size;
+    const char* can_interface;
+    /* Sole per-channel hard ceiling at normalized local-PID output=1.0. */
+    double full_scale_motor_torque_nm;
+    /* Independent configured vehicle-speed ceiling used only by local safety. */
+    double hard_speed_limit_mps;
     /* Fresh upstream apply deadline while the VCU controller is Ready. */
     int32_t control_timeout_ms;
+    int32_t speed_feedback_timeout_ms;
+    double speed_pid_kp;
+    double speed_pid_ki;
+    double speed_pid_kd;
+    double speed_pid_derivative_filter_tau_ms;
+    int32_t speed_pid_max_dt_ms;
+    double hard_overspeed_margin_mps;
 };
 
 /* open: -2=ChassisControl/init, -3=SocketCAN, -4=protocol log path. */
+uint32_t mine_teleop_chassis_abi_version(void);
+uint32_t mine_teleop_chassis_open_config_v2_size(void);
 int mine_teleop_chassis_open(const char* can_interface);
 /* Versioned open used by current runtimes. Invalid size/torque is rejected
  * before ChassisControl or SocketCAN is touched. */
 int mine_teleop_chassis_open_v1(
     const struct MineTeleopChassisOpenConfigV1* config);
+int mine_teleop_chassis_open_v2(
+    const struct MineTeleopChassisOpenConfigV2* config);
 int mine_teleop_chassis_apply_state(
     int target_gear,
     double target_vx,
     double target_ax,
     const double* steering_values,
     int steering_count);
-int mine_teleop_chassis_emergency_stop();
+int mine_teleop_chassis_emergency_stop(void);
 /* Start is accepted only while the selector is N, EPB is parked, speed is
  * zero, and the VCU reports manual state. */
-int mine_teleop_chassis_request_parallel_handshake();
+int mine_teleop_chassis_request_parallel_handshake(void);
 /* Performs the full torque/stop/N/EPB/manual reverse sequence. */
-int mine_teleop_chassis_disconnect_parallel_handshake();
+int mine_teleop_chassis_disconnect_parallel_handshake(void);
 int mine_teleop_chassis_read_handshake_status(
     struct MineTeleopChassisHandshakeStatus* status);
 /* Optional bench injection hook. Production feedback is drained directly from SocketCAN. */
@@ -244,7 +414,7 @@ int mine_teleop_chassis_poll_feedback(struct MineTeleopChassisFeedback* feedback
 int mine_teleop_chassis_read_telemetry(struct MineTeleopChassisTelemetry* telemetry);
 int mine_teleop_chassis_read_can_feedback_v1(
     struct MineTeleopChassisCanFeedbackV1* feedback);
-int mine_teleop_chassis_close();
+int mine_teleop_chassis_close(void);
 
 #ifdef __cplusplus
 }  // extern "C"

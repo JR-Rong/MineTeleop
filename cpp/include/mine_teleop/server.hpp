@@ -363,7 +363,8 @@ class DriverConsoleRuntime {
   std::int64_t control_token_renew_at_ms_{0};
   std::uint64_t sequence_{0};
   std::int64_t connected_at_ms_{0};
-  std::int64_t last_control_sent_ms_{0};
+  std::int64_t last_control_prepared_at_utc_ms_{0};
+  std::uint64_t control_commands_prepared_total_{0};
   std::atomic<double> service_brake_limit_{0.3};
   std::atomic<double> hard_brake_limit_{1.0};
   Json signaling_messages_ = Json::array();

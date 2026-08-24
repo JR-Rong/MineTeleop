@@ -1254,7 +1254,6 @@ struct VehicleMediaRuntime::Impl {
         }
         control_service_started = true;
         last_vehicle_telemetry_seq = 0;
-        control_status_seq = 0;
       }
       emit_diagnostic(
           "vehicle_vcu_adapter_ready",
@@ -1336,6 +1335,12 @@ struct VehicleMediaRuntime::Impl {
         g_object_unref(channel);
         return;
       }
+      // Status ordering is scoped to the DataChannel, not the adapter.  A
+      // channel may publish driver_connected before critical cameras become
+      // ready and then start the adapter later without replacing the channel.
+      // Resetting in start_control_service would make that later status replay
+      // an already-used sequence number and be rejected by the controller.
+      control_status_seq = 0;
       control_channel = channel;
     }
   }

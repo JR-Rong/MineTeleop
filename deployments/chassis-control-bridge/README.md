@@ -33,25 +33,43 @@ non-glibc dependencies into the release bundle. Set
 installed path, normally
 `/opt/mine-teleop/lib/vendor/chassis/libmine_teleop_chassis_bridge.so`.
 
-The repository field template intentionally keeps `vehicle_adapter.type:
-mock`. On an isolated CAN bench, edit the deployed
+The repository field template intentionally keeps `vehicle_adapter.type: mock`.
+On an isolated CAN bench, edit the deployed
 `/opt/mine-teleop/config/vehicle-agent.yaml`: choose `type: can`, set the
 bridge path above and the same interface declared by `hardware.can.interface`
-(`can1` in the current field template), give `field_safety.max_speed_kph` a
-commissioning value of at least `1 km/h` (the VCU field resolution), and set the authoritative
-`max_throttle`/`full_scale_motor_torque_nm`/`max_brake`/
-`max_steering_angle_deg` limits. `full_scale_motor_torque_nm` is the steady
-per-channel target at straight-line effective throttle 1.0 and brake 0; it is
-multiplied by the vehicle `max_throttle`, and the ChassisControl 300 Nm/s slew
-remains active. After ChassisControl steering compensation and rate limiting,
-the bridge applies a final symmetric per-motor clamp of
-`full_scale_motor_torque_nm * normalized_throttle`, including reverse torque.
-While D or R traction is requested without braking, `max_speed_kph` is the
-speed request and throttle controls the torque request.
-Releasing traction, applying brake, or configuring zero traction
-torque withdraws the speed request as `0 km/h / Q=0`; D/R gear and steering
-authority remain unchanged. A valid positive speed request is never emitted
-without positive traction capability.
+(`can1` in the current field template), set a commissioning
+`field_safety.max_speed_kph`, and explicitly configure the local speed PID,
+speed-feedback deadline, hard-overspeed margin, `max_throttle`,
+`full_scale_motor_torque_nm`, `max_brake`, and steering limits.
+
+The runtime converts analog throttle to a local target speed:
+`target_speed = clamp(throttle, 0, 1) * max_speed_kph`. The bridge's single
+SocketCAN I/O thread runs the PID once per 20 ms cycle from fresh signed VCU
+speed feedback. Any positive throttle enables the PID, but is not a second
+torque ceiling. The PID output is clamped to `[0, 1]`; at the target the
+integral term may retain positive torque. ChassisControl maps that normalized
+output to eight channels, after which the bridge clamps D to positive-only and
+R to negative-only torque, quantizes toward zero at 0.1 Nm, and limits every
+channel to `full_scale_motor_torque_nm`. A fixed 0.05 m/s setpoint-reference
+deadband preserves the integral through small gamepad jitter; cumulative target
+movement beyond that band, including a material target decrease, resets it.
+
+`ADU_Tx_VehSpdReq` is intentionally always encoded as `0 km/h / Q=0`; the
+runtime does not depend on the unverified VCU target-speed loop. Braking resets
+the PID and forces all motor torque to zero while still passing the negative
+longitudinal request through ChassisControl to produce EHB pressure. No
+traction, stale/invalid speed, non-Ready state, a gear mismatch, or an abnormal
+PID interval likewise resets the PID and commands zero traction.
+
+This changes the torque-limit migration contract. Older deployments effectively
+limited a channel to `full_scale_motor_torque_nm * max_throttle` (for example,
+`41.25 * 0.10 = 4.125 Nm`). The local-PID runtime can use the complete
+`full_scale_motor_torque_nm` value (`41.2 Nm` after 0.1 Nm quantization in that
+example). Recalculate `full_scale_motor_torque_nm`, add all V2 PID keys, and
+repeat isolated bench calibration before using a real adapter; copying the old
+value can increase requested torque by a factor of ten. The field template's
+PID gains are schema-bounded placeholders, not vehicle calibration.
+
 `max_brake` limits ordinary driving commands only; safety-stop braking bypasses
 it. The browser limit dialog can only reduce those vehicle-side limits.
 Any positive brake request dominates throttle. If ChassisControl rejects an
@@ -60,22 +78,44 @@ emergency stop immediately instead of retaining the previous traction command
 until the upstream watchdog expires.
 
 The runtime passes `control.control_timeout_ms` through the versioned bridge
-open ABI. While the VCU controller is Ready, the bridge withdraws the speed
-request, commands zero torque and calibrated safety braking if no successful
-upstream apply arrives before that deadline. The event is logged once as
-`vcu_control_apply_timeout`; the next valid apply clears this watchdog latch.
+open ABI. After a session first reaches Ready, this apply watchdog remains
+armed through `WaitGear` and `WaitActuatorModes`. If no successful upstream
+apply arrives before the deadline, the bridge commands zero torque and
+calibrated safety braking and logs `vcu_control_apply_timeout` once. A timeout
+in Ready can be cleared by the next valid Ready apply; a timeout during a shift
+enters the reverse disarm sequence and must complete that sequence before a new
+handshake.
+
+The configurable speed-feedback deadline is independent from the 500 ms
+all-feedback watchdog. `WaitParkingBrakeReleased`, `WaitGear`, and
+`WaitActuatorModes` are stationary convergence phases: fresh absolute speed
+above 0.1 m/s latches a safe stop and immediately enters the reverse sequence.
+Each first-arming phase also has a 500 ms entry grace; after that deadline its
+state-specific required feedback must remain fresh, so CAN silence cannot leave
+EPB release asserted indefinitely. After the session reaches Ready, all 29
+critical feedback IDs remain watched across later gear/mode waits. In Ready,
+including zero-traction or braking intents, speed beyond
+`max_speed_kph + hard_overspeed_margin_kph`, or signed motion opposite the
+selected D/R direction by more than 0.1 m/s, latches a local safe stop. Ordinary
+apply calls cannot clear it. Recovery requires the full disarm sequence, fresh
+valid zero speed, N, all EPBs parked and manual VCU state, followed by an
+explicit new parallel-handshake request.
 
 Upgrade the runtime and this bridge together. The current runtime requires
-`mine_teleop_chassis_open_v2`; a bridge that only exports V1 fails before any
-CAN initialization instead of silently ignoring the watchdog configuration.
+ABI version 2, an exact V2 struct-size match, and
+`mine_teleop_chassis_open_v2`; the runtime queries all three before any CAN
+initialization. A bridge that only exports V1 fails closed instead of silently
+ignoring the PID/watchdog configuration.
 The bridge continues to export `mine_teleop_chassis_open_v1` for older runtimes,
-using the default 800 ms control timeout on that compatibility path.
+but that three-field compatibility path deliberately disables traction because
+it cannot supply a validated local-PID safety configuration.
 
 Validate before service startup:
 
 ```bash
 /opt/mine-teleop/bin/mine-teleop-run config-check \
-  --config /opt/mine-teleop/config/vehicle-agent.yaml
+  --config /opt/mine-teleop/config/vehicle-agent.yaml \
+  --chassis-bridge-library /opt/mine-teleop/lib/vendor/chassis/libmine_teleop_chassis_bridge.so
 
 /opt/mine-teleop/bin/mine-teleop-run vehicle-agent \
   --config /opt/mine-teleop/config/vehicle-agent.yaml \
@@ -106,7 +146,25 @@ intelligent-driving handshake path:
 The controller receives the detailed handshake status over the same
 DataChannel and enables driving commands only at `ready`.
 
-Disconnect performs the full reverse sequence: zero torque, zero speed, N,
+Drive-gear changes require fresh valid gear and speed feedback at or below
+0.1 m/s in both the bridge and the VCU state machine. A rejected change first
+withdraws the previous traction command. While `WaitGear` or
+`WaitActuatorModes` completes, steering and requested EHB pressure remain
+continuous but all eight motor torque requests remain zero.
+
+An ESTOP cannot let an arming state continue forward. In
+`WaitParallelHandshake` it withdraws ShakeReq while retaining EPB park; from
+`WaitParkingBrakeReleased` onward it immediately enters the EHB-braked reverse
+sequence.
+
+The WVCU physical emergency switch is latched when VehicleStatus is ingested,
+so even an asserted-and-released pulse drained within one 20 ms cycle cannot
+restore an old traction intent. Ordinary apply/soft-clear calls cannot reset
+this latch. After the switch is released, recovery requires the complete
+Disarmed sequence plus fresh actual N, zero speed, EPB park, manual state, and
+an explicit new handshake request.
+
+Disconnect performs the full reverse sequence: zero torque, N,
 EPB park, clear `ShakeReq`, and wait for manual state 3.
 
 The required JSONL protocol log defaults to
