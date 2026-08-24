@@ -53,8 +53,7 @@ stderr；协议细节与高频 CAN 证据写入
 | `camera_frame_too_large` | 单帧 MJPEG 超过 16 MiB | `camera_capture` | 检查输出格式和帧边界 |
 | `camera_frame_timeout` | V4L2 或 vendor bridge 在超时内无帧 | `camera_capture` | 检查供电、链路、节点、占用与 FPS |
 | `camera_poll_failed` | poll 系统调用失败 | `camera_capture` | 查内核日志并重连设备 |
-| `camera_device_missing` | 配置的 V4L2 设备路径在打开前已确认完全不存在 | `v4l2_open` | 检查路径拼写和物理连接；不可重试，首次失败即禁用该 lane |
-| `camera_open_failed` | V4L2 open 失败（路径存在但权限、busy 等原因打不开） | `v4l2_open` | 检查权限和占用 |
+| `camera_open_failed` | V4L2 open 失败，包括 USB 拔插/udev 重建期间节点暂时不存在、权限或 busy | `v4l2_open` | 检查路径、物理连接、权限和占用；运行期按配置执行有界单路重试 |
 | `camera_querycap_failed` | `VIDIOC_QUERYCAP` 失败 | `v4l2_capabilities` | 确认路径确为 V4L2 节点 |
 | `camera_node_not_capture_capable` | 节点没有 capture+streaming capability | `v4l2_capabilities` | 选择 `v4l2-ctl` 显示的 capture 节点 |
 | `camera_mjpeg_format_rejected` | 驱动拒绝 MJPEG 宽高 | `v4l2_format` | 使用驱动公布的 MJPEG mode |
@@ -88,16 +87,18 @@ stderr；协议细节与高频 CAN 证据写入
 | --- | --- | --- |
 | `vehicle_camera_failed` / 具体 camera issue | 单路采集首次或再次失败 | `critical_for_control=true` 时首个已确认故障立即本地安全停车、锁止控制并关闭控制 DataChannel；非关键 lane 不改变控制权限 |
 | `vehicle_camera_reopen_scheduled` / `camera_lane_reopen_scheduled` | 故障可重试且累计失败次数未超过 `reopen_attempts` | 只销毁并重开故障采集源，其他 lane 不重建；关键相机的控制锁止保持不变 |
-| `vehicle_camera_recovered` / `camera_lane_recovered` | 重开后的第一帧到达 | 视频恢复；若为关键相机，控制锁止不会因这一事件本身解除，要等编码输出也重新变新鲜（见下一行） |
+| `vehicle_camera_recovered` / `camera_lane_recovered` | 重开后的第一帧到达 | 视频恢复；若为关键相机，同一云端 session 的控制锁止保持不变，不能把该事件当作恢复驾驶权限 |
 | `vehicle_camera_lane_disabled` / `camera_reopen_exhausted` | 不可重试或重开额度耗尽 | 关键 lane 禁用且继续保持停车；非关键 lane 只结束自身视频，其他 lane 与当前控制继续 |
-| `vehicle_control_inhibited_by_camera` / `critical_camera_control_inhibited` | 关键相机首次确认失败 | 保持车辆停止并关闭控制 DataChannel；该锁止不是永久性的，见下一行 |
-| `vehicle_control_inhibition_cleared` / `critical_camera_control_restored` | 全部关键相机的编码输出重新变新鲜（`last_encoded_steady_ms` 恢复更新） | 解除内部控制锁存；被关闭的控制 DataChannel 不会自己重新打开，驾驶端需要重新建立控制连接才能真正拿回控制权 |
+| `vehicle_control_inhibited_by_camera` / `critical_camera_control_inhibited` | 关键相机首次确认失败 | 保持车辆停止并关闭控制 DataChannel；必须结束当前 session，在新 session 建立控制 DataChannel 并重新完成 VCU 握手 |
+| `vehicle_control_inhibition_retained` / `critical_camera_control_inhibition_retained` | 媒体 service 在同一云端 session 内重建 runtime | 继续拒绝控制并保留视频能力；结束当前 session 后才能在新 session 重新握手 |
+| `vehicle_control_inhibition_latch_failed` / `critical_camera_control_latch_failed` | 内部 session 作用域不一致，无法更新共享锁存 | runtime-local 锁存仍立即安全停车；保持物理隔离并结束当前 session，禁止继续驾驶 |
 
 默认 `reopen_attempts=3` 是同一次媒体运行尝试内的累计上限：前三次可重试采集故障
 各触发一次单路重开，第四次禁用 lane；成功取帧不会把额度恢复成无限重试。
 允许范围是 `0..10`，`0` 表示首故障直接禁用；`reopen_backoff_ms` 默认
-`500 ms`、范围 `0..60000 ms`。关键相机的安全锁存不会因
-`vehicle_camera_recovered` 自动清除，避免“画面短暂恢复即自行重新获得驱动权限”。
+`500 ms`、范围 `0..60000 ms`。关键相机的安全锁存不会因捕获、编码恢复或同一云端
+session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧、多关键相机交错
+恢复、短暂画面恢复或媒体 transport 重试自行重新获得驾驶权限。
 
 ## 编码、WebRTC、DataChannel 与信令故障全集
 

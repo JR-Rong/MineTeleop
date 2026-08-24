@@ -538,6 +538,10 @@ void test_control_page_contract() {
       response.body.find("peer.connectionState!=='connected'") != std::string::npos,
       "control commands can be sent while the current WebRTC peer is disconnected");
   expect(
+      response.body.find("if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}") !=
+          std::string::npos,
+      "the controller can silently recreate a control DataChannel inside an inhibited media session");
+  expect(
       response.body.find("const estopRequested=estopLatched||Boolean(extra.estop)") !=
               std::string::npos &&
           response.body.find("estopRequested&&vcuHandshake.adapter_ready===false") !=

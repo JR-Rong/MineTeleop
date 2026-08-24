@@ -365,6 +365,64 @@ void test_camera_failure_decision_is_bounded_and_fail_closed() {
       "nonpositive camera failure count was accepted");
 }
 
+void test_camera_source_classification_is_canonical() {
+  using mine_teleop::CameraSourceKind;
+  const std::vector<std::pair<std::string_view, CameraSourceKind>> cases{
+      {"testsrc", CameraSourceKind::TestSource},
+      {"mvs", CameraSourceKind::Mvs},
+      {"mvs:index=1", CameraSourceKind::Mvs},
+      {"hikrobot", CameraSourceKind::Mvs},
+      {"hikrobot:serial=DA123", CameraSourceKind::Mvs},
+      {"aravis", CameraSourceKind::Aravis},
+      {"aravis:model=ace", CameraSourceKind::Aravis},
+      {"basler", CameraSourceKind::Aravis},
+      {"basler:serial=25192546", CameraSourceKind::Aravis},
+      {"pylon", CameraSourceKind::Aravis},
+      {"pylon:serial=legacy", CameraSourceKind::Aravis},
+      {"/dev/video0", CameraSourceKind::V4l2},
+      {"/dev/v4l/by-path/example-video-index0", CameraSourceKind::V4l2},
+  };
+
+  for (const auto& [selector, expected] : cases) {
+    expect(
+        mine_teleop::classify_camera_source(selector) == expected,
+        "camera selector was assigned to the wrong source kind: " + std::string(selector));
+  }
+  expect(
+      mine_teleop::camera_source_kind_name(CameraSourceKind::TestSource) == "testsrc" &&
+          mine_teleop::camera_source_kind_name(CameraSourceKind::Mvs) == "vendor_sdk" &&
+          mine_teleop::camera_source_kind_name(CameraSourceKind::Aravis) == "aravis" &&
+          mine_teleop::camera_source_kind_name(CameraSourceKind::V4l2) == "v4l2",
+      "camera source diagnostic names changed");
+}
+
+void test_missing_v4l2_path_remains_retryable() {
+  const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto camera = config.enabled_cameras().front();
+  camera.device = (std::filesystem::path("/tmp") /
+                   ("mine-teleop-missing-camera-" + mine_teleop::random_token(8)))
+                      .string();
+  auto capture_profile = config.realtime_profile(camera.realtime_profile);
+  capture_profile.codec = "mjpeg";
+  capture_profile.encoder = "native";
+  mine_teleop::CameraFrameSource source(camera, capture_profile);
+
+  try {
+    static_cast<void>(source.next(1));
+  } catch (const std::exception& error) {
+    const auto issue = mine_teleop::classify_camera_issue(error.what());
+    expect(issue.code == "camera_open_failed", "missing V4L2 node used the wrong issue code");
+    expect(issue.retryable, "missing V4L2 node was marked nonretryable");
+    camera.reopen_attempts = 2;
+    const auto decision = mine_teleop::camera_failure_decision(camera, 1, issue.retryable);
+    expect(
+        decision.lane_action == mine_teleop::CameraFailureAction::ReopenLane,
+        "missing V4L2 node bypassed the bounded lane reopen policy");
+    return;
+  }
+  throw TestFailure("missing V4L2 node unexpectedly produced a frame");
+}
+
 void test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes() {
   mine_teleop::MediaSignalingSequence sequence;
   expect(sequence.current() == 0, "new media signaling sequence was not zero");
@@ -380,6 +438,30 @@ void test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_
   expect_throws(
       [&] { static_cast<void>(sequence.next(8, "")); },
       "empty session id was accepted as a media sequence scope");
+}
+
+void test_critical_camera_control_latch_persists_until_a_new_session() {
+  mine_teleop::CriticalCameraControlLatch latch;
+  expect(!latch.enter_session("session-a"), "new session unexpectedly inherited camera inhibition");
+  expect(!latch.inhibited_for("session-a"), "new session started inhibited");
+  expect(latch.inhibit("session-a"), "first camera fault did not transition the session latch");
+  expect(latch.inhibited_for("session-a"), "camera fault did not remain latched");
+  expect(!latch.inhibit("session-a"), "repeated camera fault was not idempotent");
+  expect(
+      latch.enter_session("session-a"),
+      "same-session runtime reconstruction cleared camera control inhibition");
+  expect(!latch.enter_session("session-b"), "new session retained the previous session's inhibition");
+  expect(!latch.inhibited_for("session-b"), "new session did not start uninhibited");
+  expect_throws(
+      [&] { static_cast<void>(latch.inhibit("session-a")); },
+      "stale runtime was allowed to inhibit a different active session");
+  expect(!latch.inhibited_for("session-b"), "stale-session fault changed the active session latch");
+  expect_throws(
+      [&] { static_cast<void>(latch.enter_session("")); },
+      "empty session id was accepted by the critical-camera latch");
+  expect_throws(
+      [&] { static_cast<void>(latch.inhibited_for("session-a")); },
+      "latch state was exposed for a non-active session");
 }
 
 void test_media_signaling_error_classification_supports_structured_and_legacy_conflicts() {
@@ -1653,7 +1735,10 @@ int main() {
       {"vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries", test_vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries},
       {"control_enabled_vehicle_requires_an_enabled_critical_camera", test_control_enabled_vehicle_requires_an_enabled_critical_camera},
       {"camera_failure_decision_is_bounded_and_fail_closed", test_camera_failure_decision_is_bounded_and_fail_closed},
+      {"camera_source_classification_is_canonical", test_camera_source_classification_is_canonical},
+      {"missing_v4l2_path_remains_retryable", test_missing_v4l2_path_remains_retryable},
       {"media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes", test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes},
+      {"critical_camera_control_latch_persists_until_a_new_session", test_critical_camera_control_latch_persists_until_a_new_session},
       {"media_signaling_error_classification_supports_structured_and_legacy_conflicts", test_media_signaling_error_classification_supports_structured_and_legacy_conflicts},
       {"bench_config_drives_unified_vehicle_runtime", test_bench_config_drives_unified_vehicle_runtime},
       {"field_config_pins_tls_route_without_system_dns", test_field_config_pins_tls_route_without_system_dns},

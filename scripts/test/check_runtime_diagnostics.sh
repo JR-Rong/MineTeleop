@@ -3,6 +3,7 @@ set -euo pipefail
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 media_source="$repository_root/cpp/src/media.cpp"
+media_header="$repository_root/cpp/include/mine_teleop/media.hpp"
 media_runtime="$repository_root/cpp/src/webrtc_media.cpp"
 vehicle_app="$repository_root/cpp/apps/mine_teleop.cpp"
 vcu_bridge="$repository_root/deployments/chassis-control-bridge/chassis_control_bridge.cpp"
@@ -52,6 +53,17 @@ for contract in "${camera_contract[@]}"; do
   require_text "$media_runtime" "$issue_code"
   require_text "$catalog" "$issue_code"
 done
+
+require_text "$media_header" 'enum class CameraSourceKind { TestSource, Mvs, Aravis, V4l2 }'
+for source_classifier_consumer in "$media_source" "$media_runtime" "$vehicle_app"; do
+  require_text "$source_classifier_consumer" 'classify_camera_source('
+done
+if grep -F --quiet 'camera_device_missing' "$media_runtime" ||
+   grep -F --quiet 'camera_device_missing' "$catalog" ||
+   grep -F --quiet 'device does not exist' "$media_runtime"; then
+  printf 'camera recovery contract failed: a transiently missing V4L2 node bypasses bounded reopen\n' >&2
+  exit 1
+fi
 
 for text in \
   '"vehicle_camera_failed"' \
@@ -105,6 +117,37 @@ for text in \
   'camera_reopen_exhausted'; do
   require_text "$media_runtime" "$text"
 done
+
+# A critical-camera fault is a session-scoped safety latch.  Encoded frames
+# may still drain from bounded queues after the source has failed, and another
+# critical lane may remain healthy, so no media callback may clear the latch
+# inside the same VehicleMediaRuntime or while the service reconstructs it for
+# the same cloud session. Recovery requires a new session, DataChannel, and VCU
+# handshake.
+if grep -F --quiet 'control_inhibited.exchange(false)' "$media_runtime" ||
+   grep -F --quiet 'vehicle_control_inhibition_cleared' "$media_runtime" ||
+   grep -F --quiet 'clear_control_inhibition_if_recovered' "$media_runtime"; then
+  printf 'media/control isolation contract failed: critical-camera inhibition can clear inside one cloud session\n' >&2
+  exit 1
+fi
+require_text "$media_runtime" 'Camera recovery restores video only; end this session and complete a fresh VCU handshake before driving again.'
+require_text "$catalog" '必须结束当前 session，在新 session 建立控制 DataChannel 并重新完成 VCU 握手'
+require_text "$media_runtime" 'critical_camera_control_latch->enter_session(signaling.session_id())'
+require_text "$media_runtime" 'critical_camera_control_latch->inhibit(signaling.session_id())'
+require_text "$vehicle_app" 'std::make_shared<mine_teleop::CriticalCameraControlLatch>()'
+require_text "$vehicle_app" 'critical_camera_control_latch);'
+
+service_loop_block="$(sed -n '/int run_vehicle_media_loop/,/^}/p' "$vehicle_app")"
+latch_line="$(grep -n -m1 'std::make_shared<mine_teleop::CriticalCameraControlLatch>()' <<<"$service_loop_block" | cut -d: -f1)"
+loop_line="$(grep -n -m1 '  while (true)' <<<"$service_loop_block" | cut -d: -f1)"
+if [[ -z "$latch_line" || -z "$loop_line" || "$latch_line" -ge "$loop_line" ]]; then
+  printf 'media/control isolation contract failed: critical-camera latch is not shared across runtime reconstruction\n' >&2
+  exit 1
+fi
+if [[ "$(grep -F -c 'configure_control_data_channel();' "$media_runtime")" -ne 1 ]]; then
+  printf 'media/control isolation contract failed: control DataChannel is recreated inside one media attempt\n' >&2
+  exit 1
+fi
 
 if grep -F --quiet 'control_service->start' <<<"$control_channel_block"; then
   printf 'media/control isolation contract failed: VCU adapter still starts before media PLAYING\n' >&2

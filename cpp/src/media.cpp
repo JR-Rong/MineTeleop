@@ -25,16 +25,36 @@
 #include <thread>
 
 namespace mine_teleop {
+
+CameraSourceKind classify_camera_source(std::string_view device) {
+  if (device == "testsrc") return CameraSourceKind::TestSource;
+  if (device == "mvs" || device.starts_with("mvs:") ||
+      device == "hikrobot" || device.starts_with("hikrobot:")) {
+    return CameraSourceKind::Mvs;
+  }
+  if (device == "aravis" || device.starts_with("aravis:") ||
+      device == "basler" || device.starts_with("basler:") ||
+      device == "pylon" || device.starts_with("pylon:")) {
+    return CameraSourceKind::Aravis;
+  }
+  return CameraSourceKind::V4l2;
+}
+
+std::string_view camera_source_kind_name(CameraSourceKind kind) {
+  switch (kind) {
+    case CameraSourceKind::TestSource:
+      return "testsrc";
+    case CameraSourceKind::Mvs:
+      return "vendor_sdk";
+    case CameraSourceKind::Aravis:
+      return "aravis";
+    case CameraSourceKind::V4l2:
+      return "v4l2";
+  }
+  throw std::invalid_argument("unknown camera source kind");
+}
+
 namespace {
-
-bool is_mvs(std::string_view device) {
-  return device == "mvs" || device.starts_with("mvs:") || device.starts_with("hikrobot:");
-}
-
-bool is_aravis(std::string_view device) {
-  return device == "aravis" || device.starts_with("aravis:") || device == "basler" ||
-         device.starts_with("basler:") || device == "pylon" || device.starts_with("pylon:");
-}
 
 std::string environment_or(std::string_view name, std::string fallback) {
   const char* value = std::getenv(std::string(name).c_str());
@@ -72,7 +92,7 @@ void append_camera_selector(std::vector<std::string>& command, std::string_view 
 }
 
 std::vector<std::string> build_vendor_bridge_command(const CameraConfig& camera, const MediaProfile& profile) {
-  if (is_mvs(camera.device)) {
+  if (classify_camera_source(camera.device) == CameraSourceKind::Mvs) {
     std::vector<std::string> command{
         environment_or("MINE_TELEOP_MVS_BRIDGE_BIN", bundled_executable("mine-teleop-mvs-camera"))};
     append_camera_selector(command, camera.device);
@@ -85,7 +105,7 @@ std::vector<std::string> build_vendor_bridge_command(const CameraConfig& camera,
                                   });
     return command;
   }
-  if (is_aravis(camera.device)) {
+  if (classify_camera_source(camera.device) == CameraSourceKind::Aravis) {
     std::vector<std::string> command{
         environment_or("MINE_TELEOP_ARAVIS_BRIDGE_BIN", bundled_executable("mine-teleop-aravis-camera"))};
     append_camera_selector(command, camera.device);
@@ -177,13 +197,18 @@ CameraFrameSource::CameraFrameSource(CameraConfig camera, MediaProfile profile, 
   }
   output_width_ = profile_.width;
   output_height_ = profile_.height;
-  if (camera_.device == "testsrc") {
-    mode_ = Mode::TestSource;
-  } else if (is_mvs(camera_.device) || is_aravis(camera_.device)) {
-    mode_ = Mode::VendorBridge;
-    command_ = build_vendor_bridge_command(camera_, profile_);
-  } else {
-    mode_ = Mode::V4l2;
+  switch (classify_camera_source(camera_.device)) {
+    case CameraSourceKind::TestSource:
+      mode_ = Mode::TestSource;
+      break;
+    case CameraSourceKind::Mvs:
+    case CameraSourceKind::Aravis:
+      mode_ = Mode::VendorBridge;
+      command_ = build_vendor_bridge_command(camera_, profile_);
+      break;
+    case CameraSourceKind::V4l2:
+      mode_ = Mode::V4l2;
+      break;
   }
 }
 

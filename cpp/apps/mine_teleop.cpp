@@ -276,12 +276,11 @@ Json preflight(const VehicleConfig& config) {
   }
 
   for (const auto& camera : config.enabled_cameras()) {
-    const bool virtual_source = camera.device == "testsrc" || camera.device == "mvs" ||
-                                camera.device.starts_with("mvs:") || camera.device.starts_with("hikrobot:") ||
-                                camera.device == "aravis" || camera.device.starts_with("aravis:") ||
-                                camera.device == "pylon" || camera.device.starts_with("pylon:") ||
-                                camera.device == "basler" || camera.device.starts_with("basler:");
-    add("camera:" + camera.id, virtual_source || std::filesystem::exists(camera.device), camera.device);
+    const auto source_kind = mine_teleop::classify_camera_source(camera.device);
+    add(
+        "camera:" + camera.id,
+        source_kind != mine_teleop::CameraSourceKind::V4l2 || std::filesystem::exists(camera.device),
+        camera.device);
   }
 
   const bool ready = std::all_of(checks.begin(), checks.end(), [](const auto& check) {
@@ -535,8 +534,11 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
   constexpr auto kTransportRestartDelay = std::chrono::seconds(1);
   // The service reconstructs VehicleMediaRuntime after recoverable camera or
   // encoder failures while retaining the same cloud connection/session.  Keep
-  // its signaling cursor outside that reconstruction loop.
+  // its signaling cursor and critical-camera control latch outside that
+  // reconstruction loop.
   auto signaling_sequence = std::make_shared<mine_teleop::MediaSignalingSequence>();
+  auto critical_camera_control_latch =
+      std::make_shared<mine_teleop::CriticalCameraControlLatch>();
   while (true) {
     try {
       mine_teleop::VehicleMediaRuntime runtime(
@@ -548,7 +550,8 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
           launch.forced_codec,
           launch.simulate_primary_failure_after_frames,
           launch.connection_id,
-          signaling_sequence);
+          signaling_sequence,
+          critical_camera_control_latch);
       const auto summary = runtime.run(launch.frame_count, launch.duration_ms, launch.capture_interval_ms);
       std::cout << summary.dump() << '\n';
       if (!service) return summary.value("passed", false) ? 0 : 2;

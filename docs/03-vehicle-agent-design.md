@@ -282,13 +282,12 @@ systemd `ExecStartPre` 或部署脚本阻止带缺失设备的真实车端启动
   有界丢旧 queue，禁止让实时控制画面被慢磁盘反压。
 - 采集源按该相机的 `reopen_attempts` / `reopen_backoff_ms` 只重开故障 lane。
 - 关键相机首个已确认故障立即安全停车、锁止控制并关闭当前控制 DataChannel。
-  该相机重新变新鲜后，内部控制锁存会自动解除；但被关闭的控制 DataChannel 不会
-  自己重新打开，驾驶端需要重新建立控制连接才能真正恢复控制。若该关键相机的
-  `reopen_attempts` 额度耗尽而被禁用（见下一条），控制锁存不会再有机会自动
-  解除，必须结束当前 session 并在新 session 中重新完成 VCU 握手。
-- 配置的 V4L2 设备路径在打开前如果完全不存在（拔线/路径写错），首次尝试即判定
-  为不可重试并直接禁用该 lane，不再等待 `reopen_attempts`/`reopen_backoff_ms`
-  的完整重试周期。
+  相机重新出帧只恢复视频；控制锁存保存在媒体 service loop，因而同一云端 session
+  内重建 `VehicleMediaRuntime` 也不会解除锁存。必须结束当前
+  session，并在新 session 中建立新的控制 DataChannel、重新完成 VCU 握手后才能
+  恢复驾驶权限。这样不会让故障前排队帧或多关键相机的交错恢复自动重新授权控制。
+- V4L2 设备节点暂时不存在（包括 USB 拔插或 udev 重建）仍属于有界重试范围；
+  永久路径错误应由启动 preflight 报告，运行期不以一次 `exists()` 结果永久禁用 lane。
 - 非关键相机重开耗尽后只禁用自身 lane，不影响其他视频或当前控制。
 
 ### 编码异常
@@ -314,8 +313,9 @@ systemd `ExecStartPre` 或部署脚本阻止带缺失设备的真实车端启动
   encoder candidate，再由候选/媒体 service loop 决定是否重建。
 - 控制心跳超时：立即安全停车。
 
-媒体 service loop 把 signaling sequence cursor 保存在 `VehicleMediaRuntime` 生命周期
-之外；同一 `(connection_generation, session_id)` 内的 runtime 重建继续单调递增，
+媒体 service loop 把 signaling sequence cursor 和关键相机控制锁存都保存在
+`VehicleMediaRuntime` 生命周期之外；同一 `(connection_generation, session_id)` 内的
+runtime 重建继续单调递增 sequence，并保留关键相机造成的控制锁止，
 避免恢复过程从 1 重新发送并进入 409 死循环。不同 409 使用服务端结构化
 `issue_code` 分类；未知 409 同样 fail-closed。真实 WebRTC reconnect、ICE restart
 和服务重启恢复仍需单独实现或在目标车端端到端验证，不能把单路相机 source 重开

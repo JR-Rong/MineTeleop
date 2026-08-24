@@ -99,6 +99,45 @@ std::uint64_t MediaSignalingSequence::current() const {
   return value_;
 }
 
+bool CriticalCameraControlLatch::enter_session(std::string_view session_id) {
+  if (session_id.empty()) {
+    throw std::invalid_argument("critical camera control latch requires a non-empty session id");
+  }
+  std::lock_guard lock(mutex_);
+  if (session_id_ != session_id) {
+    session_id_ = session_id;
+    inhibited_ = false;
+  }
+  return inhibited_;
+}
+
+bool CriticalCameraControlLatch::inhibit(std::string_view session_id) {
+  if (session_id.empty()) {
+    throw std::invalid_argument("critical camera control latch requires a non-empty session id");
+  }
+  std::lock_guard lock(mutex_);
+  if (session_id_.empty()) {
+    throw std::logic_error("critical camera control latch session was not entered");
+  }
+  if (session_id_ != session_id) {
+    throw std::logic_error("critical camera control latch session does not match the active session");
+  }
+  const bool first_inhibition = !inhibited_;
+  inhibited_ = true;
+  return first_inhibition;
+}
+
+bool CriticalCameraControlLatch::inhibited_for(std::string_view session_id) const {
+  if (session_id.empty()) {
+    throw std::invalid_argument("critical camera control latch requires a non-empty session id");
+  }
+  std::lock_guard lock(mutex_);
+  if (session_id_ != session_id) {
+    throw std::logic_error("critical camera control latch session does not match the active session");
+  }
+  return inhibited_;
+}
+
 namespace {
 
 inline constexpr guint64 kCameraAppSrcMaxBuffers = 2;
@@ -150,14 +189,7 @@ std::string iso_time(std::int64_t timestamp_ms) {
   return output.str();
 }
 
-struct CameraIssue {
-  std::string_view code;
-  std::string_view stage;
-  std::string_view action;
-  bool retryable;
-};
-
-CameraIssue classify_camera_issue(std::string_view error) {
+CameraIssue classify_camera_issue_impl(std::string_view error) {
   const auto contains = [&](std::string_view value) {
     return error.find(value) != std::string_view::npos;
   };
@@ -190,13 +222,8 @@ CameraIssue classify_camera_issue(std::string_view error) {
   if (contains("media read failed")) {
     return {"camera_bridge_read_failed", "vendor_bridge_capture", "Inspect the vendor bridge process and camera SDK logs.", true};
   }
-  if (contains("device does not exist")) {
-    return {"camera_device_missing", "v4l2_open",
-            "Check the configured device path and the physical camera connection before restarting; a missing path is not retried.",
-            false};
-  }
   if (contains("cannot open V4L2 camera")) {
-    return {"camera_open_failed", "v4l2_open", "Check that the device path exists, permissions allow access, and the node is not busy.", true};
+    return {"camera_open_failed", "v4l2_open", "Check the configured device path, camera connection, permissions, and whether another process owns the node; runtime reopen attempts are bounded.", true};
   }
   if (contains("VIDIOC_QUERYCAP failed")) {
     return {"camera_querycap_failed", "v4l2_capabilities", "Verify that the configured path is a V4L2 device node.", false};
@@ -247,19 +274,6 @@ CameraIssue classify_camera_issue(std::string_view error) {
     return {"camera_appsrc_push_failed", "gstreamer_push", "Inspect the GStreamer bus error and downstream encoder state.", true};
   }
   return {"camera_capture_failed", "camera_capture", "Inspect the error text, camera device, and matching camera bridge or V4L2 diagnostics.", true};
-}
-
-std::string camera_source_kind(std::string_view device) {
-  if (device == "testsrc") return "testsrc";
-  if (device == "mvs" || device.starts_with("mvs:") ||
-      device == "pylon" || device.starts_with("pylon:")) {
-    return "vendor_sdk";
-  }
-  if (device == "aravis" || device.starts_with("aravis:") ||
-      device == "basler" || device.starts_with("basler:")) {
-    return "aravis";
-  }
-  return "v4l2";
 }
 
 class MediaSignalingClient {
@@ -393,6 +407,10 @@ class MediaSignalingClient {
 
 }  // namespace
 
+CameraIssue classify_camera_issue(std::string_view error) {
+  return classify_camera_issue_impl(error);
+}
+
 struct VehicleMediaRuntime::Impl {
   struct Lane {
     Impl* owner{nullptr};
@@ -431,7 +449,8 @@ struct VehicleMediaRuntime::Impl {
       std::optional<std::string> next_forced_codec,
       int next_simulate_primary_failure_after_frames,
       std::string connection_id,
-      std::shared_ptr<MediaSignalingSequence> signaling_sequence)
+      std::shared_ptr<MediaSignalingSequence> signaling_sequence,
+      std::shared_ptr<CriticalCameraControlLatch> next_critical_camera_control_latch)
       : config(std::move(next_config)),
         signaling(
             std::move(signaling_url),
@@ -441,6 +460,10 @@ struct VehicleMediaRuntime::Impl {
             std::move(signaling_sequence),
             config.cloud.resolve_entries,
             config.cloud.ca_bundle),
+        critical_camera_control_latch(
+            next_critical_camera_control_latch
+                ? std::move(next_critical_camera_control_latch)
+                : std::make_shared<CriticalCameraControlLatch>()),
         frame_timeout_ms(next_frame_timeout_ms),
         recording_root(std::move(next_recording_root)),
         forced_codec(std::move(next_forced_codec)),
@@ -465,7 +488,6 @@ struct VehicleMediaRuntime::Impl {
       const auto encoded_at_ms = lane->owner->signaling.now_ms();
       lane->last_encoded_ms = encoded_at_ms;
       lane->last_encoded_steady_ms = steady_now_ms();
-      if (lane->camera.critical_for_control) lane->owner->clear_control_inhibition_if_recovered();
       GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
       if (buffer != nullptr && GST_BUFFER_PTS_IS_VALID(buffer)) {
         const auto captured_at_ms = lane->pipeline_started_ms + static_cast<std::int64_t>(GST_BUFFER_PTS(buffer) / GST_MSECOND);
@@ -817,7 +839,7 @@ struct VehicleMediaRuntime::Impl {
         {
             {"camera_id", lane.camera.id},
             {"device", lane.camera.device},
-            {"source_kind", camera_source_kind(lane.camera.device)},
+            {"source_kind", camera_source_kind_name(classify_camera_source(lane.camera.device))},
             {"profile", lane.camera.realtime_profile},
             {"configured_width", lane.profile.width},
             {"configured_height", lane.profile.height},
@@ -1060,6 +1082,16 @@ struct VehicleMediaRuntime::Impl {
   void inhibit_control_for_critical_camera(const Lane& lane, std::string_view failure) {
     if (control_inhibited.exchange(true)) return;
 
+    std::optional<std::string> latch_error;
+    try {
+      static_cast<void>(critical_camera_control_latch->inhibit(signaling.session_id()));
+    } catch (const std::exception& error) {
+      // The runtime-local latch already blocks commands.  Continue the safe
+      // stop even if a programming or lifecycle error prevents the shared
+      // session latch from being updated.
+      latch_error = error.what();
+    }
+
     std::optional<std::string> close_error;
     GstWebRTCDataChannel* channel_to_close = nullptr;
     {
@@ -1085,11 +1117,22 @@ struct VehicleMediaRuntime::Impl {
         "critical_camera_control_inhibited",
         "camera_safety",
         std::string(failure),
-        "Keep the vehicle stopped and close the control channel. The inhibit clears automatically once this camera is fresh again, but the closed control channel does not reopen itself; reconnect the driver console to regain control.",
+        "Keep the vehicle stopped. Camera recovery restores video only; end this session and complete a fresh VCU handshake before driving again.",
         false,
         {{"camera_id", lane.camera.id},
          {"device", lane.camera.device},
          {"safety_action", "local_full_stop_control_channel_closed_video_continues"}});
+    if (latch_error) {
+      emit_diagnostic(
+          "vehicle_control_inhibition_latch_failed",
+          "critical_camera_control_latch_failed",
+          "camera_safety",
+          *latch_error,
+          "Keep the vehicle stopped, end the current session, and do not resume control until a fresh session and VCU handshake succeed.",
+          false,
+          {{"camera_id", lane.camera.id},
+           {"safety_action", "local_full_stop_physical_estop_if_state_uncertain"}});
+    }
     if (close_error) {
       emit_diagnostic(
           "vehicle_vcu_safe_stop_failed",
@@ -1105,32 +1148,6 @@ struct VehicleMediaRuntime::Impl {
       gst_webrtc_data_channel_close(channel_to_close);
       g_object_unref(channel_to_close);
     }
-  }
-
-  // Mirrors inhibit_control_for_critical_camera: once every critical lane is
-  // fresh again, lift the latch so a newly opened control channel is allowed
-  // to start the adapter immediately. This does not reopen the control
-  // DataChannel that was closed when control was inhibited -- that channel
-  // stays closed by design so the driver console gets an unambiguous
-  // disconnect signal rather than silently regaining authority mid-session.
-  void clear_control_inhibition_if_recovered() {
-    if (!control_inhibited.load()) return;
-    if (!critical_cameras_ready()) return;
-    if (!control_inhibited.exchange(false)) return;
-    {
-      std::lock_guard lock(control_mutex);
-      if (control_service_issue_code == "critical_camera_failed") {
-        control_service_issue_code = "critical_camera_not_ready";
-      }
-    }
-    emit_diagnostic(
-        "vehicle_control_inhibition_cleared",
-        "critical_camera_control_restored",
-        "camera_safety",
-        "",
-        "All critical camera lanes are fresh again; the internal control lock has cleared. Reconnect the driver console (the previously closed control channel does not reopen itself) to resume control.",
-        true,
-        {{"safety_action", "control_inhibition_cleared_awaiting_new_control_channel"}});
   }
 
   [[nodiscard]] bool critical_cameras_ready() const {
@@ -1546,18 +1563,6 @@ struct VehicleMediaRuntime::Impl {
   }
 
   [[nodiscard]] std::unique_ptr<CameraFrameSource> create_camera_source(const Lane& lane) const {
-    // A V4L2 device node that does not exist at all (unplugged camera, wrong
-    // path) is not the kind of transient fault the reopen backoff is meant to
-    // absorb: the path will not appear a few hundred milliseconds later just
-    // because the runtime waited. Detecting it here, before paying for a
-    // CameraFrameSource open attempt, lets classify_camera_issue() flag it as
-    // non-retryable so the lane fails on the very first attempt instead of
-    // only after reopen_attempts retries have all been exhausted.
-    if (camera_source_kind(lane.camera.device) == "v4l2" &&
-        !std::filesystem::exists(lane.camera.device)) {
-      throw std::runtime_error(
-          "cannot open V4L2 camera: device does not exist: " + lane.camera.device);
-    }
     MediaProfile capture = lane.profile;
     capture.codec = "mjpeg";
     capture.encoder = "native";
@@ -1701,7 +1706,9 @@ struct VehicleMediaRuntime::Impl {
       lane->thread = std::thread([this, lane = lane.get(), capture_interval_ms] {
         std::uint64_t sequence = 0;
         bool recovery_pending = false;
-        const bool pace_test_source = lane->camera.device == "testsrc" && capture_interval_ms == 0;
+        const bool pace_test_source =
+            classify_camera_source(lane->camera.device) == CameraSourceKind::TestSource &&
+            capture_interval_ms == 0;
         const auto test_source_interval =
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(1)) /
             static_cast<std::int64_t>(std::max(1, lane->profile.fps));
@@ -1735,7 +1742,7 @@ struct VehicleMediaRuntime::Impl {
                   "camera_reopen",
                   "",
                   lane->camera.critical_for_control
-                      ? "Video resumed. Once every critical lane is fresh, the internal control lock clears automatically, but the control channel closed by the earlier failure does not reopen itself -- reconnect the driver console to resume control."
+                      ? "Video resumed, but vehicle control remains inhibited until a fresh session and VCU handshake."
                       : "No action is required; this optional camera lane resumed without changing vehicle control authority.",
                   true,
                   {{"camera_id", lane->camera.id},
@@ -1754,7 +1761,7 @@ struct VehicleMediaRuntime::Impl {
                   true,
                   {{"camera_id", lane->camera.id},
                    {"device", lane->camera.device},
-                   {"source_kind", camera_source_kind(lane->camera.device)},
+                   {"source_kind", camera_source_kind_name(classify_camera_source(lane->camera.device))},
                    {"payload_bytes", frame.payload.size()},
                    {"sequence", sequence}});
             }
@@ -2224,6 +2231,19 @@ struct VehicleMediaRuntime::Impl {
       std::this_thread::sleep_for(
           std::chrono::milliseconds(config.runtime.teleop_poll_interval_ms));
     }
+    const bool inherited_control_inhibition =
+        critical_camera_control_latch->enter_session(signaling.session_id());
+    control_inhibited.store(inherited_control_inhibition);
+    if (inherited_control_inhibition) {
+      emit_diagnostic(
+          "vehicle_control_inhibition_retained",
+          "critical_camera_control_inhibition_retained",
+          "camera_safety",
+          "a critical-camera fault already inhibited control for this active session",
+          "Keep the vehicle stopped. End this session, start a new session, and complete a fresh VCU handshake before driving again.",
+          false,
+          {{"safety_action", "control_disabled_video_may_continue"}});
+    }
     try {
       ice_configuration = signaling.ice_servers();
     } catch (const std::exception& error) {
@@ -2493,6 +2513,7 @@ struct VehicleMediaRuntime::Impl {
 
   VehicleConfig config;
   MediaSignalingClient signaling;
+  std::shared_ptr<CriticalCameraControlLatch> critical_camera_control_latch;
   int frame_timeout_ms;
   std::filesystem::path recording_root;
   std::optional<std::string> forced_codec;
@@ -2551,7 +2572,8 @@ VehicleMediaRuntime::VehicleMediaRuntime(
     std::optional<std::string> forced_codec,
     int simulate_primary_failure_after_frames,
     std::string connection_id,
-    std::shared_ptr<MediaSignalingSequence> signaling_sequence)
+    std::shared_ptr<MediaSignalingSequence> signaling_sequence,
+    std::shared_ptr<CriticalCameraControlLatch> critical_camera_control_latch)
     : impl_(std::make_unique<Impl>(
           std::move(config),
           std::move(signaling_url),
@@ -2561,7 +2583,8 @@ VehicleMediaRuntime::VehicleMediaRuntime(
           std::move(forced_codec),
           simulate_primary_failure_after_frames,
           std::move(connection_id),
-          std::move(signaling_sequence))) {}
+          std::move(signaling_sequence),
+          std::move(critical_camera_control_latch))) {}
 
 VehicleMediaRuntime::~VehicleMediaRuntime() = default;
 
