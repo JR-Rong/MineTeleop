@@ -156,6 +156,12 @@ latest-wins 判定由可在浏览器和 Node.js 共用的无 DOM 模块实现。
 `control_outcomes_balanced` 合并到现有 1 Hz `/api/webrtc/metrics` 上报，便于核对乱序
 拒绝和 latest-wins 产生的序号空洞，同时避免 20 Hz 控制心跳淹没日志或增加控制负载。
 
+车端若在实际 apply 阶段拒绝命令，会发送带共享 `control_status_seq` 和原命令
+`command_seq` 的 `control_command_rejected`。页面只解释本地 allowlist 中的
+`issue_code`，不展示车端异常文本；换挡移动/反馈过期会立即清空按键与 Gamepad 输入、
+回 N 挡并要求释放后重试。相同拒绝由车端限频重发，以覆盖 unordered/unreliable
+DataChannel 的单包丢失，同时避免拒绝风暴。
+
 ## 视频显示
 
 要求：

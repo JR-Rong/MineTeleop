@@ -8,8 +8,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -135,10 +137,38 @@ struct SessionControlProfileResult {
     double vehicle_max_brake_pressure_bar = 1.0);
 
 struct ReceiveResult {
+  ReceiveResult() = default;
+  ReceiveResult(
+      bool accepted_value,
+      std::string reason_value,
+      std::optional<ControlCommand> command_value,
+      std::vector<std::string> warnings_value,
+      std::string issue_code_value = {})
+      : accepted(accepted_value),
+        reason(std::move(reason_value)),
+        command(std::move(command_value)),
+        warnings(std::move(warnings_value)),
+        issue_code(std::move(issue_code_value)) {}
+
   bool accepted{false};
   std::string reason;
   std::optional<ControlCommand> command;
   std::vector<std::string> warnings;
+  std::string issue_code;
+};
+
+class VehicleAdapterControlRejected final : public std::runtime_error {
+ public:
+  VehicleAdapterControlRejected(std::string issue_code, int result_code);
+
+  [[nodiscard]] const std::string& issue_code() const noexcept {
+    return issue_code_;
+  }
+  [[nodiscard]] int result_code() const noexcept { return result_code_; }
+
+ private:
+  std::string issue_code_;
+  int result_code_;
 };
 
 class LatestControlCommandMailbox {
@@ -566,6 +596,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
 
   using OpenV3Fn = int (*)(const void*);
   using ApplyFn = int (*)(int, double, double, const double*, int);
+  using ApplyV2Fn = int (*)(int, double, double, const double*, int, void*);
   using StopFn = int (*)();
   using HandshakeFn = int (*)();
   using PollFeedbackFn = int (*)(void*);
@@ -575,6 +606,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   using CloseFn = int (*)();
   OpenV3Fn open_v3_fn_{nullptr};
   ApplyFn apply_fn_{nullptr};
+  ApplyV2Fn apply_v2_fn_{nullptr};
   StopFn stop_fn_{nullptr};
   HandshakeFn request_handshake_fn_{nullptr};
   HandshakeFn disconnect_handshake_fn_{nullptr};

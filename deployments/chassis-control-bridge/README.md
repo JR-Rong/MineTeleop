@@ -125,10 +125,15 @@ explicit new parallel-handshake request.
 Upgrade the vehicle-agent runtime and this bridge atomically. The current
 runtime requires
 ABI version 3, an exact V3 struct-size match, and
-`mine_teleop_chassis_open_v3`; the runtime queries all three before any CAN
+`mine_teleop_chassis_open_v3` plus the additive
+`mine_teleop_chassis_apply_state_v2`; the runtime queries these capabilities before any CAN
 initialization. A V1/V2-only bridge fails closed instead of silently ignoring the
 physical ordinary-brake ceiling or interpreting the negative apply value as
 legacy deceleration.
+`apply_state_v2` returns a fixed-size POD result in the same locked call. It
+distinguishes the D/R moving-or-stale gate from other rejected applies without
+exporting bridge log strings or requiring a racy last-error getter. The legacy
+`apply_state` symbol remains a fail-closed integer wrapper.
 The bridge continues to export `mine_teleop_chassis_open_v1` and
 `mine_teleop_chassis_open_v2` for direct ABI callers and compatibility tests.
 V1 deliberately disables traction because it cannot supply a validated

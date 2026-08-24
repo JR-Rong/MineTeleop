@@ -182,12 +182,21 @@ for issue_code in \
   socketcan_send_failed \
   vcu_tx_deadline_missed \
   vcu_handshake_gate_rejected \
+  vcu_drive_gear_change_moving_or_stale \
   vcu_control_runtime_unavailable \
   vcu_control_command_invalid \
   vcu_disarm_timeout; do
   require_text "$vcu_bridge" "$issue_code"
   require_text "$catalog" "$issue_code"
 done
+
+for issue_code in \
+  vcu_drive_gear_change_moving_or_stale \
+  vcu_control_apply_rejected; do
+  require_text "$media_runtime" "$issue_code"
+  require_text "$catalog" "$issue_code"
+done
+require_text "$media_runtime" 'control_command_rejected'
 
 for text in \
   'auto signaling_sequence = std::make_shared<mine_teleop::MediaSignalingSequence>()' \

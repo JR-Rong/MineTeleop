@@ -392,7 +392,8 @@ int main() {
             mine_teleop_chassis_open_config_v2_size() ==
                 sizeof(MineTeleopChassisOpenConfigV2) &&
             mine_teleop_chassis_open_config_v3_size() ==
-                sizeof(MineTeleopChassisOpenConfigV3),
+                sizeof(MineTeleopChassisOpenConfigV3) &&
+            sizeof(MineTeleopChassisApplyResultV1) == 16U,
         "bridge ABI version or versioned open-config size query is inconsistent");
     std::ostringstream diagnostics;
     auto* previous = std::cerr.rdbuf(diagnostics.rdbuf());
@@ -1016,14 +1017,54 @@ int main() {
               g_vehicle_states.back().target_acceleration[0] < 0.0015F,
           "post-timeout PID retained pre-stop integral instead of restarting from reset state");
     }
+    feedback = runtime_feedback(5, 3, 1, 1.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "pre-shift moving feedback refresh failed");
+    MineTeleopChassisApplyResultV1 moving_shift_result{};
+    expect(
+        mine_teleop_chassis_apply_state_v2(
+            2,
+            0.0,
+            0.0,
+            steering.data(),
+            steering.size(),
+            &moving_shift_result) == -3 &&
+            moving_shift_result.struct_size ==
+                sizeof(MineTeleopChassisApplyResultV1) &&
+            moving_shift_result.result_code == -3 &&
+            moving_shift_result.issue_id ==
+                MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE,
+        "moving D-to-R rejection did not return the stable gear-gate issue");
+    expect(
+        mine_teleop_chassis_apply_state(
+            2, 0.0, 0.0, steering.data(), steering.size()) == -3,
+        "legacy apply entry point did not remain fail-closed for a moving shift");
+
     feedback = runtime_feedback(5, 3, 1, 0.0);
     expect(
         mine_teleop_chassis_update_feedback(&feedback) == 0,
         "pre-shift feedback refresh failed");
+    MineTeleopChassisApplyResultV1 recovered_shift_result{
+        0U,
+        -99,
+        MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE,
+        99U};
     expect(
-        mine_teleop_chassis_apply_state(
-            2, 0.0, 0.0, steering.data(), steering.size()) == 0,
-        "fresh stopped D-to-R intent was rejected");
+        mine_teleop_chassis_apply_state_v2(
+            2,
+            0.0,
+            0.0,
+            steering.data(),
+            steering.size(),
+            &recovered_shift_result) == 0 &&
+            recovered_shift_result.struct_size ==
+                sizeof(MineTeleopChassisApplyResultV1) &&
+            recovered_shift_result.result_code == 0 &&
+            recovered_shift_result.issue_id ==
+                MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE &&
+            recovered_shift_result.reserved == 0U,
+        "fresh stopped D-to-R intent was rejected or retained the stale issue");
     expect(
         wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR),
         "post-Ready gear change did not enter retained WaitGear");
@@ -1085,10 +1126,25 @@ int main() {
             can_signal(last_frame_with_id(hard_speed_frames, 0x18FFD0F5U), 4, 12) >
                 0,
         "Ready hard-speed fuse did not produce zero torque and EHB safety braking");
+    MineTeleopChassisApplyResultV1 hard_speed_apply_result{};
+    expect(
+        mine_teleop_chassis_apply_state_v2(
+            3,
+            5.0,
+            0.01,
+            steering.data(),
+            steering.size(),
+            &hard_speed_apply_result) == -3 &&
+            hard_speed_apply_result.result_code == -3 &&
+            hard_speed_apply_result.issue_id ==
+                MINE_TELEOP_CHASSIS_APPLY_ISSUE_HARD_OVERSPEED_LATCHED &&
+            hard_speed_apply_result.issue_id !=
+                MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE,
+        "ordinary apply cleared or misclassified the Ready hard-speed latch");
     expect(
         mine_teleop_chassis_apply_state(
             3, 5.0, 0.01, steering.data(), steering.size()) == -3,
-        "ordinary apply cleared the Ready hard-speed latch");
+        "legacy apply entry point cleared the Ready hard-speed latch");
     expect(
         mine_teleop_chassis_request_parallel_handshake() == -2,
         "hard-speed latch cleared without completed Disarmed recovery");
@@ -1511,10 +1567,21 @@ int main() {
         mine_teleop_chassis_read_telemetry(&physical_telemetry) == 0 &&
             physical_telemetry.estop == 1,
         "released physical emergency pulse did not remain visible as latched ESTOP");
+    MineTeleopChassisApplyResultV1 physical_apply_result{};
     expect(
-        mine_teleop_chassis_apply_state(
-            3, 5.0, 0.01, steering.data(), steering.size()) == -3,
-        "ordinary apply cleared the physical emergency latch");
+        mine_teleop_chassis_apply_state_v2(
+            3,
+            5.0,
+            0.01,
+            steering.data(),
+            steering.size(),
+            &physical_apply_result) == -3 &&
+            physical_apply_result.result_code == -3 &&
+            physical_apply_result.issue_id ==
+                MINE_TELEOP_CHASSIS_APPLY_ISSUE_PHYSICAL_EMERGENCY_LATCHED &&
+            physical_apply_result.issue_id !=
+                MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE,
+        "ordinary apply cleared or misclassified the physical emergency latch");
     expect(
         mine_teleop_chassis_request_parallel_handshake() == -2,
         "physical emergency latch recovered before completed disarm");

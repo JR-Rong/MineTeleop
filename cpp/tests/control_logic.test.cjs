@@ -196,6 +196,24 @@ test('status sequence rejects stale values and reports accepted gaps', () => {
   assert.deepEqual(logic.reduceStatusSequence(3, 'bad'), {accepted: false, lastSequence: 3, gap: 0});
 });
 
+test('control rejection presentation exposes only stable issue-code guidance', () => {
+  const gearRejected = logic.deriveControlCommandRejection(
+      'vcu_drive_gear_change_moving_or_stale');
+  assert.deepEqual(gearRejected, {
+    issueCode: 'vcu_drive_gear_change_moving_or_stale',
+    clearInput: true,
+    severity: 'critical',
+    text: '换挡被车端拒绝：车辆仍在移动，或挡位/速度反馈已过期；请停车并恢复新鲜反馈后，释放再重新选择 D/R。',
+  });
+
+  const unknown = logic.deriveControlCommandRejection(
+      'untrusted exception text / secret sentinel');
+  assert.equal(unknown.issueCode, 'vcu_control_apply_rejected');
+  assert.equal(unknown.clearInput, true);
+  assert.equal(unknown.severity, 'critical');
+  assert(!unknown.text.includes('secret sentinel'));
+});
+
 test('session control profile validation and hard-limit merge preserve brake ordering', () => {
   const requested = {
     target_speed_kph: 12,

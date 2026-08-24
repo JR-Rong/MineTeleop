@@ -934,7 +934,7 @@ class BridgeRuntime {
     return 0;
   }
 
-  bool store_intent(
+  std::uint32_t store_intent(
       int gear,
       double target_speed_mps,
       double normalized_longitudinal,
@@ -948,7 +948,7 @@ class BridgeRuntime {
           "vcu_control_apply",
           "VCU bridge is not running or has a latched I/O error",
           "Inspect the preceding CAN fault and restart only after the interface/VCU is healthy.");
-      return false;
+      return MINE_TELEOP_CHASSIS_APPLY_ISSUE_RUNTIME_UNAVAILABLE;
     }
     const auto now = Clock::now();
     const bool driving_gear = gear == 2 || gear == 3;
@@ -961,7 +961,7 @@ class BridgeRuntime {
           "vcu_physical_emergency_gate",
           "physical emergency switch safe stop remains latched",
           "Release the switch, complete the stopped disarm sequence, then request a new VCU handshake.");
-      return false;
+      return MINE_TELEOP_CHASSIS_APPLY_ISSUE_PHYSICAL_EMERGENCY_LATCHED;
     }
     if (hard_overspeed_latched_) {
       withdraw_latest_traction_locked();
@@ -971,7 +971,7 @@ class BridgeRuntime {
           "vcu_hard_overspeed_gate",
           "hard overspeed safe stop remains latched",
           "Complete the stopped disarm sequence and request a new VCU handshake before resuming.");
-      return false;
+      return MINE_TELEOP_CHASSIS_APPLY_ISSUE_HARD_OVERSPEED_LATCHED;
     }
     if (gear_changed && driving_gear &&
         (!speed_feedback_fresh_locked(now) ||
@@ -984,7 +984,7 @@ class BridgeRuntime {
           "vcu_gear_change_gate",
           "drive gear selection requires fresh valid gear/speed feedback at or below 0.1 m/s",
           "Stop the vehicle, restore fresh speed/gear feedback, then select D or R again.");
-      return false;
+      return MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE;
     }
 
     ControlIntent intent;
@@ -1001,7 +1001,7 @@ class BridgeRuntime {
     last_successful_apply_ = now;
     last_successful_apply_valid_ = true;
     clear_soft_stop_requested_ = true;
-    return true;
+    return MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE;
   }
 
   bool emergency_stop() {
@@ -2570,12 +2570,36 @@ extern "C" int mine_teleop_chassis_open_v3(
       config->max_ordinary_brake_pressure_bar);
 }
 
-extern "C" int mine_teleop_chassis_apply_state(
+namespace {
+
+int finish_apply(
+    MineTeleopChassisApplyResultV1* result,
+    int result_code,
+    std::uint32_t issue_id) noexcept {
+  if (result != nullptr) {
+    *result = MineTeleopChassisApplyResultV1{
+        static_cast<std::uint32_t>(sizeof(MineTeleopChassisApplyResultV1)),
+        result_code,
+        issue_id,
+        0U};
+  }
+  return result_code;
+}
+
+}  // namespace
+
+extern "C" int mine_teleop_chassis_apply_state_v2(
     int target_gear,
     double target_vx,
     double target_ax,
     const double* steering_values,
-    int steering_count) {
+    int steering_count,
+    MineTeleopChassisApplyResultV1* result) {
+  if (result == nullptr) return -1;
+  finish_apply(
+      result,
+      -1,
+      MINE_TELEOP_CHASSIS_APPLY_ISSUE_GENERIC_REJECTED);
   try {
     std::lock_guard<std::mutex> lock(g_api_mutex);
     const int checked_steering_count = std::max(
@@ -2588,27 +2612,44 @@ extern "C" int mine_teleop_chassis_apply_state(
             steering_values,
             steering_values + checked_steering_count,
             [](double value) { return std::isfinite(value); });
-    if (!g_runtime || steering_values == nullptr || steering_count < 0 ||
+    if (!g_runtime) {
+      return finish_apply(
+          result,
+          -1,
+          MINE_TELEOP_CHASSIS_APPLY_ISSUE_RUNTIME_UNAVAILABLE);
+    }
+    if (steering_values == nullptr || steering_count < 0 ||
         target_gear < 1 || target_gear > 4 || !std::isfinite(target_vx) ||
         target_vx < 0.0 || target_vx > 20.0 || !std::isfinite(target_ax) ||
         target_ax < -1.0 || target_ax > 1.0 || !steering_finite) {
-      if (g_runtime) {
-        g_runtime->fail_control_apply(
-            "vcu_apply_arguments_invalid",
-            "invalid gear, target speed/acceleration, steering pointer, or steering values",
-            "Check the runtime-to-bridge ABI arguments and configured steering axes.");
-      }
-      return -1;
+      g_runtime->fail_control_apply(
+          "vcu_apply_arguments_invalid",
+          "invalid gear, target speed/acceleration, steering pointer, or steering values",
+          "Check the runtime-to-bridge ABI arguments and configured steering axes.");
+      return finish_apply(
+          result,
+          -1,
+          MINE_TELEOP_CHASSIS_APPLY_ISSUE_ARGUMENTS_INVALID);
     }
-    if (target_gear == 4) return g_runtime->request_park() ? 0 : -3;
-    return g_runtime->store_intent(
-               target_gear,
-               target_vx,
-               target_ax,
-               steering_values,
-               steering_count)
-        ? 0
-        : -3;
+    if (target_gear == 4) {
+      const bool accepted = g_runtime->request_park();
+      return finish_apply(
+          result,
+          accepted ? 0 : -3,
+          accepted
+              ? MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE
+              : MINE_TELEOP_CHASSIS_APPLY_ISSUE_GENERIC_REJECTED);
+    }
+    const auto issue_id = g_runtime->store_intent(
+        target_gear,
+        target_vx,
+        target_ax,
+        steering_values,
+        steering_count);
+    return finish_apply(
+        result,
+        issue_id == MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE ? 0 : -3,
+        issue_id);
   } catch (const std::exception& error) {
     try {
       std::lock_guard<std::mutex> lock(g_api_mutex);
@@ -2627,7 +2668,10 @@ extern "C" int mine_teleop_chassis_apply_state(
       }
     } catch (...) {
     }
-    return -5;
+    return finish_apply(
+        result,
+        -5,
+        MINE_TELEOP_CHASSIS_APPLY_ISSUE_INTERNAL_ERROR);
   } catch (...) {
     try {
       std::lock_guard<std::mutex> lock(g_api_mutex);
@@ -2646,8 +2690,27 @@ extern "C" int mine_teleop_chassis_apply_state(
       }
     } catch (...) {
     }
-    return -5;
+    return finish_apply(
+        result,
+        -5,
+        MINE_TELEOP_CHASSIS_APPLY_ISSUE_INTERNAL_ERROR);
   }
+}
+
+extern "C" int mine_teleop_chassis_apply_state(
+    int target_gear,
+    double target_vx,
+    double target_ax,
+    const double* steering_values,
+    int steering_count) {
+  MineTeleopChassisApplyResultV1 result{};
+  return mine_teleop_chassis_apply_state_v2(
+      target_gear,
+      target_vx,
+      target_ax,
+      steering_values,
+      steering_count,
+      &result);
 }
 
 extern "C" int mine_teleop_chassis_emergency_stop() {

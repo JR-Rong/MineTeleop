@@ -434,6 +434,29 @@ struct MineTeleopChassisOpenConfigV3 {
     double max_ordinary_brake_pressure_bar;
 };
 
+/* Stable, string-free apply rejection identifiers. Unknown future values must
+ * be treated as MINE_TELEOP_CHASSIS_APPLY_ISSUE_GENERIC_REJECTED by callers. */
+enum MineTeleopChassisApplyIssueV1 {
+    MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE = 0,
+    MINE_TELEOP_CHASSIS_APPLY_ISSUE_GENERIC_REJECTED = 1,
+    MINE_TELEOP_CHASSIS_APPLY_ISSUE_RUNTIME_UNAVAILABLE = 2,
+    MINE_TELEOP_CHASSIS_APPLY_ISSUE_PHYSICAL_EMERGENCY_LATCHED = 3,
+    MINE_TELEOP_CHASSIS_APPLY_ISSUE_HARD_OVERSPEED_LATCHED = 4,
+    MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE = 5,
+    MINE_TELEOP_CHASSIS_APPLY_ISSUE_ARGUMENTS_INVALID = 6,
+    MINE_TELEOP_CHASSIS_APPLY_ISSUE_INTERNAL_ERROR = 7,
+};
+
+/* Versioned POD result returned atomically with apply_state_v2. The bridge
+ * overwrites every field on each call, so a successful call cannot retain a
+ * stale rejection identifier from an earlier attempt. */
+struct MineTeleopChassisApplyResultV1 {
+    uint32_t struct_size;
+    int32_t result_code;
+    uint32_t issue_id;
+    uint32_t reserved;
+};
+
 #ifdef __cplusplus
 static_assert(
     MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM <=
@@ -463,9 +486,12 @@ static_assert(
 static_assert(
     sizeof(MineTeleopChassisOpenConfigV3) ==
     sizeof(MineTeleopChassisOpenConfigV2) + sizeof(double));
+static_assert(sizeof(MineTeleopChassisApplyResultV1) == 16U);
 #endif
 
-/* open: -2=ChassisControl/init, -3=SocketCAN, -4=protocol log path. */
+/* open stage/result order: -1=arguments/config/already open,
+ * -2=ChassisControl/init, -4=protocol log path, -3=SocketCAN;
+ * -5=unexpected exception at any stage. */
 uint32_t mine_teleop_chassis_abi_version(void);
 uint32_t mine_teleop_chassis_open_config_v2_size(void);
 uint32_t mine_teleop_chassis_open_config_v3_size(void);
@@ -484,6 +510,16 @@ int mine_teleop_chassis_apply_state(
     double target_ax,
     const double* steering_values,
     int steering_count);
+/* Additive V3 capability. The legacy apply_state entry point remains
+ * available and preserves the same integer result codes. A non-null result is
+ * required; it is filled in the same call while the bridge API lock is held. */
+int mine_teleop_chassis_apply_state_v2(
+    int target_gear,
+    double target_vx,
+    double target_ax,
+    const double* steering_values,
+    int steering_count,
+    struct MineTeleopChassisApplyResultV1* result);
 int mine_teleop_chassis_emergency_stop(void);
 /* Start is accepted only while the selector is N, EPB is parked, speed is
  * zero, and the VCU reports manual state. */

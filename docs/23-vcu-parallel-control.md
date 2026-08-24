@@ -255,7 +255,10 @@ vehicle_adapter:
 
 vehicle-agent runtime 与 bridge 必须原子成套升级。当前 runtime 要求 bridge 提供
 ABI version 3、完全一致的 V3 配置结构大小以及 `mine_teleop_chassis_open_v3`；
-查询在任何 SocketCAN 初始化前完成。只提供 V1 的旧 bridge 会明确启动失败，
+同时要求同次返回结构化拒绝结果的 `mine_teleop_chassis_apply_state_v2`。这些查询在
+任何 SocketCAN 初始化前完成。`apply_state_v2` 只返回固定枚举，不传递日志字符串；
+其中 D/R 移动或反馈过期可由 runtime 安全映射成稳定 issue code，未知值统一降级为
+通用拒绝。旧 `apply_state` 继续保留整数 fail-closed 包装。只提供 V1 的旧 bridge 会明确启动失败，
 V2 bridge 也会因缺少物理普通制动压力上限而失败，不会静默沿用旧的负加速度
 语义。新 bridge 仍为直接 ABI 调用方和兼容性测试导出
 `mine_teleop_chassis_open_v1` 与 `mine_teleop_chassis_open_v2`：V1 因为没有安全

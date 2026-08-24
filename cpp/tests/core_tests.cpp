@@ -250,6 +250,14 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
 
   void apply_control(const ControlCommand& command) override {
     ++control_attempts;
+    if (structured_rejection_issue_code) {
+      throw mine_teleop::VehicleAdapterControlRejected(
+          *structured_rejection_issue_code,
+          -3);
+    }
+    if (rejected_control_gear && command.gear == *rejected_control_gear) {
+      throw std::runtime_error("adapter rejected control gear");
+    }
     if (owns_safe_stop()) {
       throw std::runtime_error("adapter-owned safe stop rejected ordinary control");
     }
@@ -259,6 +267,9 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
 
   void apply_safe_stop(const mine_teleop::ControlOutput& output) override {
     ++safe_stop_attempts;
+    if (safe_stop_throws) {
+      throw std::runtime_error("adapter safe stop failed");
+    }
     if (owns_safe_stop() && !output.estop && output.brake < 1.0) {
       ++rejected_ordinary_safe_stops;
       throw std::runtime_error(
@@ -337,6 +348,7 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
   bool handshake_status_throws{false};
   bool handshake_succeeds{true};
   bool control_limit_update_throws{false};
+  bool safe_stop_throws{false};
   std::uint64_t control_attempts{0};
   std::uint64_t applied_commands{0};
   std::uint64_t safe_stop_attempts{0};
@@ -346,6 +358,8 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
   std::uint64_t control_limit_updates{0};
   double session_motor_torque_limit{0.0};
   double session_brake_pressure_limit{0.0};
+  std::optional<std::string> structured_rejection_issue_code;
+  std::optional<std::string> rejected_control_gear;
   std::optional<ControlCommand> last_control;
   mine_teleop::ControlOutput last_safe_output;
   mine_teleop::VehicleTelemetry telemetry;
@@ -521,11 +535,25 @@ void test_vehicle_config_requires_monotonic_final_full_safety_brake() {
       [&] { static_cast<void>(mine_teleop::load_vehicle_config(duplicate_time_path)); },
       "timeout profile with duplicate stage times was accepted");
 
+  auto unordered = base;
+  replace_once(
+      unordered,
+      "      - after_ms: 0\n        brake: 0.3\n"
+      "      - after_ms: 500\n        brake: 0.6",
+      "      - after_ms: 500\n        brake: 0.6\n"
+      "      - after_ms: 0\n        brake: 0.3");
+  const auto unordered_path =
+      write_temp_vehicle_config("timeout-unordered-stage", unordered);
+  expect_throws(
+      [&] { static_cast<void>(mine_teleop::load_vehicle_config(unordered_path)); },
+      "timeout profile declared out of order was silently reordered");
+
   std::error_code error;
   std::filesystem::remove(missing_full_path, error);
   std::filesystem::remove(decreasing_path, error);
   std::filesystem::remove(delayed_first_path, error);
   std::filesystem::remove(duplicate_time_path, error);
+  std::filesystem::remove(unordered_path, error);
 }
 
 void test_vehicle_config_validates_local_speed_pid_safety_fields() {
@@ -1281,10 +1309,16 @@ void test_safety_timeout_profile_and_estop_latch() {
             300, 800, {{0, 0.3}, {0, 0.6}, {1500, 1.0}});
       },
       "SafetyStateMachine accepted duplicate timeout stage times");
+  expect_throws(
+      [] {
+        mine_teleop::SafetyStateMachine invalid(
+            300, 800, {{500, 0.6}, {0, 0.3}, {1500, 1.0}});
+      },
+      "SafetyStateMachine silently reordered timeout stages");
   mine_teleop::SafetyStateMachine safety(
       300,
       800,
-      {{1500, 1.0}, {0, 0.3}, {500, 0.6}});
+      {{0, 0.3}, {500, 0.6}, {1500, 1.0}});
   safety.mark_ready(0);
   auto value = command(1, 0);
   safety.on_valid_command(value, 0);
@@ -1536,6 +1570,101 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
       "profile was ACKed before adapter application completed");
   adapter_view->control_limit_update_throws = false;
   service.close();
+}
+
+void test_control_service_commits_only_successfully_applied_commands() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  const mine_teleop::VehicleAdapterControlRejected unknown_rejection(
+      "untrusted adapter detail / secret sentinel",
+      -3);
+  expect(
+      unknown_rejection.issue_code() == "vcu_control_apply_rejected" &&
+          std::string(unknown_rejection.what()).find("secret sentinel") ==
+              std::string::npos,
+      "adapter rejection exposed an issue outside the stable allowlist");
+  {
+    auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
+    auto* adapter_view = adapter.get();
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 10000);
+    service.start(0);
+    activate_session_profile(service);
+
+    adapter_view->structured_rejection_issue_code =
+        "vcu_drive_gear_change_moving_or_stale";
+    const auto rejected = service.receive_command(command(1, 0), 0);
+    expect(
+        !rejected.accepted && !rejected.command &&
+            rejected.reason == "adapter_control_rejected" &&
+            rejected.issue_code == "vcu_drive_gear_change_moving_or_stale" &&
+            service.safety_state() == mine_teleop::SafetyState::Standby,
+        "structured adapter rejection was not returned without committing safety state");
+    adapter_view->structured_rejection_issue_code.reset();
+    expect(
+        service.receive_command(command(2, 1), 1).accepted,
+        "fresh command did not recover after a structured adapter rejection");
+    service.close();
+  }
+
+  {
+    auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
+    auto* adapter_view = adapter.get();
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 10000);
+    service.start(0);
+    activate_session_profile(service);
+
+    expect(
+        service.receive_command(command(1, 0), 0).accepted,
+        "initial D command was rejected");
+    adapter_view->rejected_control_gear = "R";
+    auto rejected_reverse = command(2, 100);
+    rejected_reverse.gear = "R";
+    expect_throws(
+        [&] { static_cast<void>(service.receive_command(rejected_reverse, 100)); },
+        "adapter control rejection did not propagate");
+
+    adapter_view->rejected_control_gear.reset();
+    const auto replay = service.receive_command(rejected_reverse, 110);
+    expect(
+        !replay.accepted && replay.reason == "old_seq",
+        "failed adapter application did not consume its command sequence");
+
+    service.tick(300);
+    expect(
+        service.safety_state() == mine_teleop::SafetyState::Degraded,
+        "failed adapter application refreshed the outer safety watchdog");
+    expect(
+        adapter_view->last_safe_output.gear == "D",
+        "failed reverse application replaced the last successfully applied gear");
+    service.close();
+  }
+
+  {
+    auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
+    auto* adapter_view = adapter.get();
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 10000);
+    service.start(0);
+
+    auto estop = command(1, 0);
+    estop.estop = true;
+    adapter_view->safe_stop_throws = true;
+    expect_throws(
+        [&] { static_cast<void>(service.receive_command(estop, 0)); },
+        "adapter ESTOP failure did not propagate");
+    expect(
+        service.safety_state() == mine_teleop::SafetyState::Estop,
+        "adapter ESTOP failure rolled back the outer ESTOP latch");
+
+    adapter_view->safe_stop_throws = false;
+    const auto replay = service.receive_command(estop, 1);
+    expect(
+        !replay.accepted && replay.reason == "old_seq" &&
+            service.safety_state() == mine_teleop::SafetyState::Estop,
+        "failed ESTOP application did not remain latched with its sequence consumed");
+    service.close();
+  }
 }
 
 void test_control_service_reports_safe_stop_output_after_timeout() {
@@ -2881,6 +3010,8 @@ int main() {
       {"session_control_profile_ack_sequence_limits_and_clear", test_session_control_profile_ack_sequence_limits_and_clear},
       {"session_control_profile_uses_independent_two_second_age_window", test_session_control_profile_uses_independent_two_second_age_window},
       {"real_adapter_profile_changes_require_parking_and_apply_before_ack", test_real_adapter_profile_changes_require_parking_and_apply_before_ack},
+      {"control_service_commits_only_successfully_applied_commands",
+       test_control_service_commits_only_successfully_applied_commands},
       {"control_service_reports_safe_stop_output_after_timeout", test_control_service_reports_safe_stop_output_after_timeout},
       {"control_service_preserves_physical_brake_across_degraded_timeout", test_control_service_preserves_physical_brake_across_degraded_timeout},
       {"control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshake",

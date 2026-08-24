@@ -222,6 +222,8 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `bridge_api_operation_failed` / `chassis_control_update_failed` | ChassisControl 拒绝新的 vehicle state | 本地全停 |
 | `bridge_api_operation_failed` / `vcu_apply_arguments_invalid` | ABI gear/pointer/count 非法 | 本地全停 |
 | `vehicle_control_command_rejected` / `vcu_feedback_blocks_control` | feedback missing/poll failed 阻止 DataChannel 命令 | 本地全停；结合 VCU JSONL |
+| `control_apply_rejected`、`control_command_rejected` / `vcu_drive_gear_change_moving_or_stale` | D/R 切换时车辆仍在移动，或速度/挡位反馈无效、过期 | 先撤牵引；当前驾驶端清空输入并回 N，停车且恢复新鲜反馈后释放并重新选择 D/R |
+| `control_command_rejected` / `vcu_control_apply_rejected` | bridge 拒绝控制但原因不属于浏览器 allowlist | 清空驾驶输入并保持安全状态；查 VCU JSONL 获取本地详细原因 |
 | `vehicle_vcu_handshake_command_failed` / `vcu_handshake_command_failed` | handshake ABI 调用抛错 | 本地全停 |
 | `vehicle_vcu_runtime_failed` / `vcu_runtime_operation_failed` | tick/telemetry/safe-stop 路径抛错 | 尝试本地全停并关闭控制 DataChannel；视频继续 |
 | `emergency_stop` / `vcu_emergency_stop_applied` | 软件急停已下发 | 本地全停 |
@@ -231,8 +233,9 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `disarm_timeout` / `vcu_disarm_timeout` | 15 秒内未完成反向握手 | 保持隔离并使用硬件安全路径 |
 | `vehicle_vcu_safe_stop_failed` / `vcu_safe_stop_or_close_failed` | adapter close/safe stop 抛错 | 保持隔离，禁止仅凭软件判断安全 |
 
-控制/握手操作拒绝按“原因变化或每秒一次”限频；DataChannel 普通控制拒绝按“原因
-变化或每 5 秒一次”限频。安全状态变化、I/O fault、feedback timeout 与
+控制/握手操作拒绝按“原因变化或每秒一次”限频；车端本地普通控制拒绝日志按“原因
+变化或每 5 秒一次”限频。发给当前驾驶端的结构化控制拒绝只包含 allowlist issue code，
+不包含原始异常文本；相同原因最多每 500 ms 重发一次。安全状态变化、I/O fault、feedback timeout 与
 disarm 结果立即 flush。
 
 ## 推荐排查命令

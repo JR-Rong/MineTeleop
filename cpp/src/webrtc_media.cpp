@@ -966,6 +966,9 @@ struct VehicleMediaRuntime::Impl {
       } else {
         ++rejected_control_commands;
         const auto now_ms = signaling.now_ms();
+        if (!result.issue_code.empty()) {
+          send_control_command_rejected_locked(command.seq, result.issue_code);
+        }
         if (result.reason != last_control_rejection_reason ||
             !last_control_rejection_log_ms ||
             now_ms - *last_control_rejection_log_ms >= 5000) {
@@ -974,12 +977,19 @@ struct VehicleMediaRuntime::Impl {
           const bool feedback_problem =
               result.reason == "can_feedback_missing" ||
               result.reason == "can_feedback_poll_failed";
+          const auto diagnostic_issue_code = result.issue_code.empty()
+              ? (feedback_problem
+                     ? std::string("vcu_feedback_blocks_control")
+                     : std::string("control_command_rejected"))
+              : result.issue_code;
           emit_diagnostic(
               "vehicle_control_command_rejected",
-              feedback_problem ? "vcu_feedback_blocks_control" : "control_command_rejected",
+              diagnostic_issue_code,
               feedback_problem ? "vcu_feedback_gate" : "control_validation",
               result.reason,
-              feedback_problem
+              result.issue_code == "vcu_drive_gear_change_moving_or_stale"
+                  ? "Stop the vehicle, restore fresh speed and gear feedback, release the direction control, and select D/R again."
+                  : feedback_problem
                   ? "Inspect VCU feedback freshness and the VCU JSONL log before requesting control."
                   : "Inspect command identity, sequence, timing, token, and configured safety limits.",
               true,
@@ -1022,6 +1032,36 @@ struct VehicleMediaRuntime::Impl {
                    }).dump()
                 << '\n';
     }
+  }
+
+  void send_control_command_rejected_locked(
+      std::uint64_t command_seq,
+      std::string_view issue_code) {
+    if (control_channel == nullptr || !control_link_open) return;
+    const std::string stable_issue_code =
+        issue_code == "vcu_drive_gear_change_moving_or_stale"
+        ? "vcu_drive_gear_change_moving_or_stale"
+        : "vcu_control_apply_rejected";
+    const auto timestamp_ms = signaling.now_ms();
+    if (stable_issue_code == last_control_rejection_status_issue_code &&
+        last_control_rejection_status_ms &&
+        timestamp_ms - *last_control_rejection_status_ms < 500) {
+      return;
+    }
+    last_control_rejection_status_issue_code = stable_issue_code;
+    last_control_rejection_status_ms = timestamp_ms;
+    const auto payload = Json({
+        {"event", "control_command_rejected"},
+        {"protocol_version", kProtocolVersion},
+        {"vehicle_id", config.vehicle_id},
+        {"driver_id", signaling.driver_id()},
+        {"session_id", signaling.session_id()},
+        {"control_status_seq", ++control_status_seq},
+        {"command_seq", command_seq},
+        {"accepted", false},
+        {"issue_code", stable_issue_code},
+    }).dump();
+    gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
   }
 
   void send_vcu_handshake_status(std::string_view result) {
@@ -1395,6 +1435,8 @@ struct VehicleMediaRuntime::Impl {
       // Resetting in start_control_service would make that later status replay
       // an already-used sequence number and be rejected by the controller.
       control_status_seq = 0;
+      last_control_rejection_status_issue_code.clear();
+      last_control_rejection_status_ms.reset();
       control_channel = channel;
     }
   }
@@ -2623,6 +2665,8 @@ struct VehicleMediaRuntime::Impl {
   std::string last_vcu_handshake_state;
   std::string last_control_rejection_reason;
   std::optional<std::int64_t> last_control_rejection_log_ms;
+  std::string last_control_rejection_status_issue_code;
+  std::optional<std::int64_t> last_control_rejection_status_ms;
   std::atomic<std::uint64_t> local_ice_candidate_count{0};
   std::atomic<std::uint64_t> remote_ice_candidate_count{0};
 };

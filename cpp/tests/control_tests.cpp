@@ -547,6 +547,16 @@ void test_control_page_contract() {
               std::string::npos,
       "VCU handshake command/status DataChannel contract is missing");
   expect(
+      response.body.find("'control_command_rejected'") != std::string::npos &&
+          response.body.find(
+              "controlLogic.deriveControlCommandRejection(message.issue_code)") !=
+              std::string::npos &&
+          response.body.find("if(rejection.clearInput)clearControlInput()") !=
+              std::string::npos &&
+          response.body.find("driver_control_command_rejected") !=
+              std::string::npos,
+      "structured vehicle control rejection is not surfaced fail-closed to the driver");
+  expect(
       response.body.find("vcu_handshake_not_ready") != std::string::npos &&
           response.body.find("vcuHandshake.parking_ready") != std::string::npos,
       "driving commands are not gated by explicit N/EPB-ready VCU handshake state");
@@ -1081,6 +1091,36 @@ void test_stale_control_data_channel_callbacks_are_fail_silent() {
           handshake_unavailable < handshake_status &&
           handshake_branch.find("control_channel != channel ||") == std::string::npos,
       "a stale handshake callback can publish a rejection on the replacement control channel");
+}
+
+void test_structured_control_rejection_is_safe_and_rate_limited() {
+  const auto source = read_text_file("cpp/src/webrtc_media.cpp");
+  const auto handler = cpp_function_contract(source, "void handle_control_message(");
+  const auto sender = cpp_function_contract(
+      source,
+      "void send_control_command_rejected_locked(");
+  expect(
+      handler.find(
+          "send_control_command_rejected_locked(command.seq, result.issue_code)") !=
+          std::string::npos,
+      "an adapter control rejection is not returned to the active driver channel");
+  expect(
+      sender.find("vcu_drive_gear_change_moving_or_stale") != std::string::npos &&
+          sender.find("vcu_control_apply_rejected") != std::string::npos,
+      "control rejection sender does not enforce the stable issue-code allowlist");
+  expect(
+      sender.find("{\"vehicle_id\", config.vehicle_id}") != std::string::npos &&
+          sender.find("{\"driver_id\", signaling.driver_id()}") != std::string::npos &&
+          sender.find("{\"session_id\", signaling.session_id()}") != std::string::npos &&
+          sender.find("{\"control_status_seq\", ++control_status_seq}") !=
+              std::string::npos &&
+          sender.find("{\"command_seq\", command_seq}") != std::string::npos,
+      "control rejection status is not bound to authoritative identity and sequence state");
+  expect(
+      sender.find("< 500") != std::string::npos &&
+          sender.find("\"error\"") == std::string::npos &&
+          sender.find("error.what()") == std::string::npos,
+      "control rejection status can flood the channel or leak raw exception text");
 }
 
 void write_text_file(const std::filesystem::path& path, std::string_view value) {
@@ -4058,6 +4098,8 @@ int main() {
        test_vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start},
       {"stale_control_data_channel_callbacks_are_fail_silent",
        test_stale_control_data_channel_callbacks_are_fail_silent},
+      {"structured_control_rejection_is_safe_and_rate_limited",
+       test_structured_control_rejection_is_safe_and_rate_limited},
       {"driver_brake_limit_config_validation", test_driver_brake_limit_config_validation},
       {"signaling_multi_identity_config", test_signaling_multi_identity_config},
       {"credential_purpose_separation_and_stale_control_replay",

@@ -108,9 +108,6 @@ void normalize_and_validate_deceleration_profile(
   if (profile.empty()) {
     throw std::invalid_argument("deceleration profile must not be empty");
   }
-  std::sort(profile.begin(), profile.end(), [](const auto& left, const auto& right) {
-    return left.after_ms < right.after_ms;
-  });
   if (profile.front().after_ms != 0) {
     throw std::invalid_argument(
         "deceleration profile must start at after_ms 0");
@@ -209,6 +206,24 @@ struct BridgeOpenConfigV3 {
   double hard_overspeed_margin_mps;
   double max_ordinary_brake_pressure_bar;
 };
+
+struct BridgeApplyResultV1 {
+  std::uint32_t struct_size;
+  std::int32_t result_code;
+  std::uint32_t issue_id;
+  std::uint32_t reserved;
+};
+
+static_assert(sizeof(BridgeApplyResultV1) == 16U);
+
+constexpr std::uint32_t kBridgeApplyIssueNone = 0U;
+constexpr std::uint32_t kBridgeApplyIssueDriveGearChangeMovingOrStale = 5U;
+
+std::string bridge_apply_issue_code(std::uint32_t issue_id) {
+  return issue_id == kBridgeApplyIssueDriveGearChangeMovingOrStale
+      ? "vcu_drive_gear_change_moving_or_stale"
+      : "vcu_control_apply_rejected";
+}
 
 #define MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(field) \
   static_assert(offsetof(BridgeOpenConfigV3, field) == \
@@ -380,6 +395,13 @@ void validate_chassis_bridge_abi_handle(void* handle) {
   using OpenV1Fn = int (*)(const BridgeOpenConfigV1*);
   using OpenV2Fn = int (*)(const BridgeOpenConfigV2*);
   using OpenV3Fn = int (*)(const BridgeOpenConfigV3*);
+  using ApplyV2Fn = int (*)(
+      int,
+      double,
+      double,
+      const double*,
+      int,
+      BridgeApplyResultV1*);
   const auto version = load_symbol<QueryFn>(
       handle, "mine_teleop_chassis_abi_version")();
   const auto config_size = load_symbol<QueryFn>(
@@ -392,6 +414,8 @@ void validate_chassis_bridge_abi_handle(void* handle) {
       handle, "mine_teleop_chassis_open_v2"));
   static_cast<void>(load_symbol<OpenV3Fn>(
       handle, "mine_teleop_chassis_open_v3"));
+  static_cast<void>(load_symbol<ApplyV2Fn>(
+      handle, "mine_teleop_chassis_apply_state_v2"));
   if (version != 3U || config_size != sizeof(BridgeOpenConfigV3) ||
       legacy_v2_config_size != sizeof(BridgeOpenConfigV2)) {
     throw std::runtime_error(
@@ -610,6 +634,18 @@ void prepare_socketcan(
 #endif
 
 }  // namespace
+
+VehicleAdapterControlRejected::VehicleAdapterControlRejected(
+    std::string issue_code,
+    int result_code)
+    : std::runtime_error(
+          "vehicle adapter rejected control with code " +
+          std::to_string(result_code)),
+      issue_code_(
+          issue_code == "vcu_drive_gear_change_moving_or_stale"
+              ? std::move(issue_code)
+              : std::string("vcu_control_apply_rejected")),
+      result_code_(result_code) {}
 
 void validate_chassis_bridge_abi(const std::filesystem::path& library_path) {
   if (library_path.empty()) {
@@ -1834,6 +1870,8 @@ void DynamicLibraryVehicleAdapter::ensure_loaded() {
     validate_chassis_bridge_abi_handle(handle_);
     open_v3_fn_ = load_symbol<OpenV3Fn>(handle_, "mine_teleop_chassis_open_v3");
     apply_fn_ = load_symbol<ApplyFn>(handle_, "mine_teleop_chassis_apply_state");
+    apply_v2_fn_ = load_symbol<ApplyV2Fn>(
+        handle_, "mine_teleop_chassis_apply_state_v2");
     stop_fn_ = load_symbol<StopFn>(handle_, "mine_teleop_chassis_emergency_stop");
     request_handshake_fn_ = load_symbol<HandshakeFn>(
         handle_,
@@ -1938,9 +1976,28 @@ void DynamicLibraryVehicleAdapter::apply_control(const ControlCommand& command) 
       session_brake_pressure_limit_bar_,
       max_ordinary_brake_pressure_bar_);
   const double steering[4]{command.steering, command.steering, command.steering, command.steering};
-  check_result(
-      apply_fn_(gear_to_bridge_value(command.gear), velocity, acceleration, steering, 4),
-      "mine_teleop_chassis_apply_state");
+  BridgeApplyResultV1 apply_result{};
+  const int result = apply_v2_fn_(
+      gear_to_bridge_value(command.gear),
+      velocity,
+      acceleration,
+      steering,
+      4,
+      &apply_result);
+  if (apply_result.struct_size != sizeof(BridgeApplyResultV1) ||
+      apply_result.result_code != result || apply_result.reserved != 0U ||
+      (result == 0 && apply_result.issue_id != kBridgeApplyIssueNone)) {
+    last_error_ = "mine_teleop_chassis_apply_state_v2 returned an invalid result structure";
+    throw std::runtime_error(last_error_);
+  }
+  if (result != 0) {
+    last_error_ = "mine_teleop_chassis_apply_state_v2 rejected control with code " +
+        std::to_string(result);
+    throw VehicleAdapterControlRejected(
+        bridge_apply_issue_code(apply_result.issue_id),
+        result);
+  }
+  last_error_.clear();
   ++applied_command_count_;
 }
 
@@ -2236,7 +2293,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
     }
     if (request.seq == last_session_profile_request_->seq) {
       const auto& previous = *last_session_profile_request_;
-      const bool same_fingerprint =
+      const bool is_identical_request =
           request.protocol_version == previous.protocol_version &&
           request.vehicle_id == previous.vehicle_id &&
           request.driver_id == previous.driver_id &&
@@ -2244,7 +2301,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
           request.seq == previous.seq &&
           request.control_token == previous.control_token &&
           request.profile == previous.profile;
-      if (!same_fingerprint) {
+      if (!is_identical_request) {
         return profile_result(
             request,
             timestamp_ms,
@@ -2494,18 +2551,35 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
         active_session_profile_->max_brake_pressure_bar,
         max_brake_pressure_bar_);
   }
-  safety_.on_valid_command(safety_command, timestamp_ms);
-  if (safety_.state() == SafetyState::ControlActive) {
-    adapter_->apply_control(*result.command);
+  if (!safety_command.estop &&
+      safety_.state() != SafetyState::Estop &&
+      safety_.state() != SafetyState::Fault) {
+    try {
+      adapter_->apply_control(*result.command);
+    } catch (const VehicleAdapterControlRejected& error) {
+      result.accepted = false;
+      result.reason = "adapter_control_rejected";
+      result.command.reset();
+      result.issue_code = error.issue_code();
+      return result;
+    }
+    safety_.on_valid_command(safety_command, timestamp_ms);
     last_effective_command_ = *result.command;
-  } else if (!adapter_safe_stop_active_ ||
-             safety_.state() == SafetyState::Estop ||
-             safety_.state() == SafetyState::Fault) {
-    adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+    return result;
+  }
+
+  // ESTOP is a safety latch, not an ordinary actuator transaction: preserve
+  // it even when the adapter cannot apply the physical stop. Ordinary commands
+  // received while ESTOP/Fault is already latched must not reach apply_control.
+  safety_.on_valid_command(safety_command, timestamp_ms);
+  if (!adapter_safe_stop_active_ ||
+      safety_.state() == SafetyState::Estop ||
+      safety_.state() == SafetyState::Fault) {
     if (safety_.state() == SafetyState::Estop ||
         safety_.state() == SafetyState::Fault) {
       clear_session_profile();
     }
+    adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
   }
   return result;
 }

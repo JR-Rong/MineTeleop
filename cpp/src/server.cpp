@@ -1218,8 +1218,17 @@ async function startFromOffer(offer){
       if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
       try{
         const message=JSON.parse(event.data);
-        if(!['vehicle_telemetry','vcu_handshake_status','session_control_profile_status'].includes(message.event))return;
+        if(!['vehicle_telemetry','vcu_handshake_status','session_control_profile_status','control_command_rejected'].includes(message.event))return;
         if(!acceptControlStatusMessage(message))return;
+        if(message.event==='control_command_rejected'){
+          const rejection=controlLogic.deriveControlCommandRejection(message.issue_code);
+          if(rejection.clearInput)clearControlInput();
+          statusPanel.textContent=rejection.text;
+          const commandSeq=Number(message.command_seq);
+          clientLog('driver_control_command_rejected',{issue_code:rejection.issueCode,command_seq:Number.isSafeInteger(commandSeq)&&commandSeq>0?commandSeq:null});
+          renderMonitoring();
+          return;
+        }
         if(message.event==='session_control_profile_status'){
           applyControlProfileStatus(message);
           updateVehicleHardLimits(message.hard_limits);

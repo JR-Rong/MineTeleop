@@ -145,6 +145,12 @@ WaitParallel 阶段撤销握手并保持 EPB 驻车，在之后的启动阶段�
 制动的完整退出。恢复必须
 完成退出流程，并在新鲜反馈满足 N、零速、EPB 驻车、人工状态后显式重新握手。
 
+Bridge 拒绝 D/R 请求时，现有牵引意图先在车端撤销。拒绝结果通过同一次 ABI 调用返回
+枚举原因，vehicle runtime 再用 `control_command_rejected` 状态事件向当前 DataChannel
+发送 allowlist 中的稳定 `issue_code`。`vcu_drive_gear_change_moving_or_stale` 会让控制页
+清空油门/制动、回到 N 挡并要求驾驶员释放方向键后重新选择；原始异常字符串不会发送给
+浏览器。相同原因最多每 500 ms 重发一次，以兼顾 unordered/unreliable 通道丢包与限频。
+
 急停、物理急停、故障、断开停车和 bridge 本地 apply watchdog 走独立安全路径：
 八路牵引归零并可请求 DBC 全量 `409.5 bar/路`，不受会话的 327.6 bar 代码上限或
 车端 100 bar 普通默认值削弱。上游控制心跳超时仍按配置的 0.3/0.6/1.0 分段执行，

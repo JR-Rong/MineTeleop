@@ -471,6 +471,24 @@
     return {kind: 'none', visible: false, severity: '', banner: '', alert: ''};
   }
 
+  function deriveControlCommandRejection(issueCodeValue) {
+    const issueCode = String(issueCodeValue || '');
+    if (issueCode === 'vcu_drive_gear_change_moving_or_stale') {
+      return {
+        issueCode,
+        clearInput: true,
+        severity: 'critical',
+        text: '换挡被车端拒绝：车辆仍在移动，或挡位/速度反馈已过期；请停车并恢复新鲜反馈后，释放再重新选择 D/R。',
+      };
+    }
+    return {
+      issueCode: 'vcu_control_apply_rejected',
+      clearInput: true,
+      severity: 'critical',
+      text: '控制命令被车端拒绝，车辆已保持安全状态；请检查车端 VCU 日志 issue_code 后再重试。',
+    };
+  }
+
   function isCurrentPeer(activePeer, callbackPeer) {
     return Boolean(activePeer) && activePeer === callbackPeer;
   }
@@ -586,6 +604,7 @@
     reduceGamepadNeutralInterlock,
     reduceStatusSequence,
     deriveEstopPresentation,
+    deriveControlCommandRejection,
     isCurrentPeer,
     isCurrentControlChannel,
     controlSnapshot,

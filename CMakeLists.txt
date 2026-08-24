@@ -350,6 +350,58 @@ if(MINE_TELEOP_BUILD_TESTS)
   add_test(NAME mine-teleop-vcu-tests COMMAND mine-teleop-vcu-tests)
 
   if(UNIX AND NOT APPLE)
+    enable_language(C)
+
+    function(mine_teleop_add_chassis_abi_fixture target version wrong_size has_apply_v2)
+      add_library(${target} SHARED
+        cpp/tests/fixtures/chassis-bridge-abi/chassis_bridge_abi_fixture.c
+      )
+      target_include_directories(${target}
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/deployments/chassis-control-bridge
+      )
+      target_compile_definitions(${target}
+        PRIVATE
+          MINE_TELEOP_TEST_CHASSIS_ABI_VERSION=${version}
+          MINE_TELEOP_TEST_CHASSIS_WRONG_V3_SIZE=${wrong_size}
+          MINE_TELEOP_TEST_CHASSIS_HAS_APPLY_V2=${has_apply_v2}
+      )
+      set_target_properties(${target} PROPERTIES
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS OFF
+      )
+    endfunction()
+
+    mine_teleop_add_chassis_abi_fixture(
+      mine-teleop-chassis-abi-v2-fixture 2U 0 1)
+    mine_teleop_add_chassis_abi_fixture(
+      mine-teleop-chassis-abi-v3-wrong-size-fixture 3U 1 1)
+    mine_teleop_add_chassis_abi_fixture(
+      mine-teleop-chassis-abi-v3-missing-apply-v2-fixture 3U 0 0)
+
+    add_executable(mine-teleop-chassis-bridge-abi-loader-tests
+      cpp/tests/chassis_bridge_abi_loader_tests.cpp
+    )
+    target_include_directories(mine-teleop-chassis-bridge-abi-loader-tests
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/deployments/chassis-control-bridge
+    )
+    target_link_libraries(mine-teleop-chassis-bridge-abi-loader-tests
+      PRIVATE mine_teleop_runtime
+    )
+    add_dependencies(mine-teleop-chassis-bridge-abi-loader-tests
+      mine-teleop-chassis-abi-v2-fixture
+      mine-teleop-chassis-abi-v3-wrong-size-fixture
+      mine-teleop-chassis-abi-v3-missing-apply-v2-fixture
+    )
+    mine_teleop_enable_warnings(mine-teleop-chassis-bridge-abi-loader-tests)
+    add_test(
+      NAME mine-teleop-chassis-bridge-abi-loader-tests
+      COMMAND mine-teleop-chassis-bridge-abi-loader-tests
+        $<TARGET_FILE:mine-teleop-chassis-abi-v2-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v3-wrong-size-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v3-missing-apply-v2-fixture>
+    )
+
     # The production bridge links against the field-only ChassisControl
     # package.  This object target compiles the complete bridge against a
     # minimal ABI fixture so logging and SocketCAN changes are still covered
