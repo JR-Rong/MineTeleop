@@ -44,7 +44,10 @@
 - `gear`：档位，必须是 JSON string，具体枚举待车辆接口确认。
 - `steering`：归一化转向，必须是 JSON number，范围 `[-1.0, 1.0]`。
 - `throttle`：归一化油门，必须是 JSON number，范围 `[0.0, 1.0]`。
-- `brake`：归一化刹车，必须是 JSON number，范围 `[0.0, 1.0]`。
+- `brake`：v1 线协议中的归一化普通行车制动，必须是 JSON number，范围
+  `[0.0, 1.0]`。它本身不是 EHB bar 或制动力 N；车端只在已经确认的当前会话控制
+  参数内，将它换算成明确的 EHB 压力请求。驾驶端的缓刹和急刹都以 bar 配置，再映射
+  到这一线协议标量。
 - `estop`：急停，必须是 JSON boolean，不能用 `"true"`/`"false"` 字符串。
 
 控制命令中的 JSON string、number、integer 和 boolean 字段不能互相用字符串、
@@ -58,7 +61,14 @@
 
 - 固定周期发送完整状态。
 - 没有输入变化也要发送心跳式命令。
-- 浏览器失焦或页面隐藏时立即清空输入并发送中性状态。
+- 浏览器只允许一个 async writer 串行执行 `/api/control` 和 DataChannel `send`；键盘、Gamepad 和
+  心跳只更新 latest-wins 快照，不排队积压过时命令。
+- 车端对 `vehicle_telemetry` 与 `vcu_handshake_status` 共用单调递增的 `control_status_seq`；浏览器在
+  unordered DataChannel 上只接受严格递增状态，禁止旧 Ready 覆盖较新的 fault/disarm。
+- D/R 选择与油门按键状态分离；松开前进/倒车键只归零牵引请求，普通制动也不自动切 N。
+  真实断链、控制权丢失和 VCU 故障/退出仍重置控制资格，并要求新的 keydown 才能恢复。
+- 浏览器失焦或页面隐藏时立即清空物理输入，保持已选 D/R，但发送零牵引、零转向、零普通制动的
+  安全快照；旧按键不能在窗口恢复焦点后自动恢复控制。
 - DataChannel 未打开、关闭或缓冲超过上限时不继续生成有效油门，界面显示控制链路中断/拥塞。
 - 车端以最后一条有效命令的本地接收时间判断链路健康。
 
@@ -77,6 +87,81 @@
 9. 如果 `estop=true`，立即锁存进入急停状态。
 10. 将命令交给安全状态机。
 
+## 会话控制参数
+
+普通驾驶开始前，驾驶端必须先通过同一条 DataChannel 发送
+`type=session_control_profile`，由车端确认目标车速、单电机最大转矩、普通制动最大
+压力、缓刹压力和急刹压力。车端只有在实际应用这些上限后才发送
+`event=session_control_profile_status` 的成功状态；未确认参数时拒绝 VCU 握手和非
+急停驾驶命令。参数在断链、控制权/会话替换、故障或 adapter 自有安全停车时清除，
+重连后不能沿用旧确认；急停始终绕过普通参数门禁。
+
+非 mock 车端会把会话参数限制在车端 YAML 的不可绕过上限内：目标车速不超过
+`max_speed_kph * max_throttle`，单电机转矩不超过
+`full_scale_motor_torque_nm`，三项普通制动压力满足
+`service <= hard <= max <= max_brake_pressure_bar`。首次设置、提高目标车速/转矩或
+修改任一制动压力还要求新鲜的 N 挡、零速和 EPB 驻车反馈。PID 增益、反馈超时和
+超速门限只在车端 YAML 中配置，控制端不能在会话中改 PID。
+
+## 车端本地车速闭环与换挡门禁
+
+真实底盘适配器把 `throttle` 解释为已确认会话目标车速内的比例，车端目标不超过
+该会话的 `target_speed_kph`，同时仍受 `field_safety.max_speed_kph` 和
+`field_safety.max_throttle` 约束。API 线程只保存最新意图；
+bridge 的单一 SocketCAN I/O 线程每 20 ms 用新鲜的带符号 VCU 车速运行 PID，并在
+同一线程串行调用 ChassisControl。PID 输出范围是 `[0, 1]`，到达目标点时积分项
+可以保留维持车速所需的正扭矩；每个电机通道的唯一牵引上限是
+已确认会话上限与 `full_scale_motor_torque_nm` 的较小值，`max_throttle` 不是额外
+扭矩系数。PID 以固定目标参考
+应用 0.05 m/s 复位死区：手柄小抖动不丢积分，累计偏移越过死区或目标明显下降才复位。
+
+DBC 中八路 `ADU_Tx_MCUxxMotTqReq` 都是 0.1 Nm 分辨率，物理范围
+`[-800, 838.3] Nm`。普通驾驶采用 D/R 对称代码上限
+`min(800 * 0.8, 838.3 * 0.8)`，并按 0.1 Nm 向零量化为
+`640.0 Nm/单电机`：反向恰为 DBC 下界绝对值的 80%，正向约为上界的 76.34%。
+车端默认上限为 `300 Nm/单电机`，会话只能继续收紧。
+这些值是 CAN 转矩请求上限，不是实测电机或轮端转矩。
+
+DBC 中 EHB01/EHB02 的八路压力请求都是 12-bit、0.1 bar 分辨率，物理范围
+`0..409.5 bar`。普通驾驶代码上限取 80%，即 `327.6 bar/路`；车端默认普通最大
+压力为 `100 bar/路`，控制端默认普通最大/缓刹/急刹分别为
+`100/30/100 bar/路`。本 PR 的缓刹和急刹都是直接压力请求：缓刹不运行独立制动
+PID，也没有 ramp/jerk 曲线；急刹直接请求会话中配置的急刹压力。
+
+制动优先于牵引：任何正制动都把油门和目标车速置零、复位车速 PID、将八路电机
+扭矩置零，并在保留转向请求的同时向八路 EHB 写入 0.1 bar 量化后的直接压力。零油门、非 Ready、换挡、实际挡位不匹配、车速
+反馈无效/过期或异常控制周期也复位 PID 并归零牵引。未经台架验证的 VCU 车速请求
+不参与闭环，`ADU_Tx_VehSpdReq` 在所有状态固定为 `0 km/h / Q=0`。
+
+车端和 VCU 状态机都要求进入 D/R 或 D/R 互换时具有新鲜有效的挡位/车速反馈，且
+绝对车速不大于 0.1 m/s；拒绝换挡时先撤销旧牵引。换挡闭环期间保持转角和 EHB
+压力连续，但八路扭矩保持为零。`WaitParkingBrakeReleased`、`WaitGear` 和
+`WaitActuatorModes` 都要求静止，车速超过 0.1 m/s 立即锁存停车并转入反向退出；
+每个首次启动等待态还有 500 ms 分层反馈宽限，超时后 CAN 静默不能无限保持 EPB
+释放。曾到达 Ready 后，apply 和 29 路关键反馈 watchdog 在后续换挡等待态继续生效。
+Ready 阶段即使零牵引或制动，车速超过配置最大值与独立 margin，或运动方向与所选
+D/R 相反超过 0.1 m/s，仍会锁存本地安全停车；普通控制命令不能解除。ESTOP 在
+WaitParallel 阶段撤销握手并保持 EPB 驻车，在之后的启动阶段立即进入带 EHB 安全
+制动的完整退出。恢复必须
+完成退出流程，并在新鲜反馈满足 N、零速、EPB 驻车、人工状态后显式重新握手。
+
+Bridge 拒绝 D/R 请求时，现有牵引意图先在车端撤销。拒绝结果通过同一次 ABI 调用返回
+枚举原因，vehicle runtime 再用 `control_command_rejected` 状态事件向当前 DataChannel
+发送 allowlist 中的稳定 `issue_code`。`vcu_drive_gear_change_moving_or_stale` 会让控制页
+清空油门/制动、回到 N 挡并要求驾驶员释放方向键后重新选择；原始异常字符串不会发送给
+浏览器。相同原因最多每 500 ms 重发一次，以兼顾 unordered/unreliable 通道丢包与限频。
+
+急停、物理急停、故障、断开停车和 bridge 本地 apply watchdog 走独立安全路径：
+八路牵引归零并可请求 DBC 全量 `409.5 bar/路`，不受会话的 327.6 bar 代码上限或
+车端 100 bar 普通默认值削弱。上游控制心跳超时仍按配置的 0.3/0.6/1.0 分段执行，
+Degraded 阶段会先把会话归一化制动换算成车端普通压力比例，因此保持原物理压力；
+即使普通压力比例为 1.0，也不会被误判为全量急停。最终超时 1.0 阶段才通过显式
+安全标志使用 409.5 bar。仓库 field 配置中的 PID、转矩和压力值只是软件
+默认/门禁值，不是台架或实车验收值；软件构建、单测和虚拟 CAN 通过也不等于实车
+制动或车速闭环已验收。
+`deceleration_profile` 首段必须从 `after_ms: 0` 开始、时间严格递增、制动比例不下降，
+并最终达到显式 1.0；否则车端配置加载直接失败，避免超时策略永远缺少最终全量安全制动。
+
 ## 时间同步
 
 系统必须有最低限度的时间同步要求：
@@ -93,7 +178,9 @@
 
 - 控制心跳短暂异常先进入降级控制：油门置 0、限制速度、提示驾驶端链路抖动。
 - 超过 `control_timeout_ms` 后进入 `TIMEOUT_BRAKE`。
-- 刹车按分级减速曲线渐进施加，不默认阶跃到 `brake=1.0`。
+- 普通驾驶的缓刹/急刹按会话中已确认的 bar 值直接施加；本 PR 不实现制动 PID 或
+  ramp。控制心跳超时按配置的 0.3/0.6/1.0 分段执行，故障、断链、急停以及最终
+  1.0 阶段使用独立安全停车路径，不能被普通会话上限削弱。
 - 车辆未停稳前不默认挂 N；是否保持当前驱动档、进入低速档或切换安全档位必须结合车型制动语义确认。
 - 车辆停稳后，才执行驻车/手刹/安全档位等停稳后动作。
 - 维持安全停车直到重新建立有效会话并完成复位流程，或由现场人员复位。
@@ -108,7 +195,6 @@ control:
   degraded_timeout_ms: 300
   control_timeout_ms: 800
   timeout_action:
-    throttle: 0.0
     deceleration_profile:
       - after_ms: 0
         brake: 0.3
@@ -116,19 +202,15 @@ control:
         brake: 0.6
       - after_ms: 1500
         brake: vehicle_defined_max_safe
-    gear_before_stopped: hold_current_or_vehicle_safe_mode
-    stopped_action:
-      gear: N
-      apply_parking_brake: true
 ```
 
 参数语义：
 
 - `max_command_gap_ms`：单次有效命令到达间隔上限。超过该值时，车端应丢弃过旧命令、记录链路异常，并可提示驾驶端网络抖动；它不是状态机进入降级态的持续时间。
-- `degraded_timeout_ms`：链路异常持续时间阈值。超过该持续时间后进入降级控制，例如油门置 0、限速、告警或按配置开始柔和减速。
+- `degraded_timeout_ms`：链路异常持续时间阈值。超过该持续时间后进入降级控制，例如油门置 0、限速或告警；本 PR 不在普通制动路径内生成压力 ramp。
 - `control_timeout_ms`：持续未收到有效控制心跳后进入 `TIMEOUT_BRAKE` 的阈值。该值必须小于按车辆制动距离、安全边界和场地速度上限反推得到的最大允许值。
 
-`degraded_timeout_ms=300` 只能作为首版弱网告警/降级参考值，不应直接等同于急刹阈值。5G 抖动可能达到几十到上百毫秒，最终 `max_command_gap_ms`、`degraded_timeout_ms`、`control_timeout_ms` 和制动曲线必须结合真实网络、车辆制动距离、坡道/松散路面和底层控制器心跳机制实测标定。
+`degraded_timeout_ms=300` 只能作为首版弱网告警/降级参考值，不应直接等同于急刹阈值。5G 抖动可能达到几十到上百毫秒，最终 `max_command_gap_ms`、`degraded_timeout_ms`、`control_timeout_ms` 和安全制动动作必须结合真实网络、车辆制动距离、坡道/松散路面和底层控制器心跳机制实测标定。
 
 ## 急停
 

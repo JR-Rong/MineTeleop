@@ -278,8 +278,11 @@ struct GamepadConfig {
 };
 
 struct DriverControlLimitsConfig {
-  double initial_max_throttle{0.05};
-  double initial_max_brake{1.0};
+  double initial_target_speed_kph{2.0};
+  double initial_max_motor_torque_nm{300.0};
+  double initial_max_brake_pressure_bar{100.0};
+  double initial_service_brake_pressure_bar{30.0};
+  double initial_hard_brake_pressure_bar{100.0};
   double initial_max_steering_angle_deg{3.0};
 };
 
@@ -322,6 +325,8 @@ class DriverConsoleRuntime {
   [[nodiscard]] Json ingest_webrtc_metrics(const Json& input);
   [[nodiscard]] Json control_limits() const;
   [[nodiscard]] Json set_control_limits(const Json& input);
+  [[nodiscard]] Json control_profile() const;
+  [[nodiscard]] Json prepare_control_profile(const Json& input);
   [[nodiscard]] Json send_control(const Json& input);
   [[nodiscard]] Json record_browser_event(const Json& input);
   [[nodiscard]] Json status();
@@ -337,6 +342,8 @@ class DriverConsoleRuntime {
   [[nodiscard]] bool remote_session_is_active(std::string_view session_id, std::string_view token) const;
   TimeSyncStatus refresh_time_sync();
   Json renew_control_authority();
+  void reset_control_profile_locked();
+  [[nodiscard]] Json control_profile_locked() const;
 
   DriverConfig config_;
   std::string vehicle_id_;
@@ -362,8 +369,16 @@ class DriverConsoleRuntime {
   std::int64_t control_token_renew_at_ms_{0};
   std::uint64_t sequence_{0};
   std::int64_t connected_at_ms_{0};
-  std::int64_t last_control_sent_ms_{0};
-  std::atomic<double> max_brake_limit_{1.0};
+  std::int64_t last_control_prepared_at_utc_ms_{0};
+  std::uint64_t control_commands_prepared_total_{0};
+  double target_speed_kph_{2.0};
+  double max_motor_torque_nm_{300.0};
+  double max_brake_pressure_bar_{100.0};
+  double service_brake_pressure_bar_{30.0};
+  double hard_brake_pressure_bar_{100.0};
+  std::uint64_t last_control_profile_prepared_seq_{0};
+  std::atomic<double> service_brake_limit_{0.3};
+  std::atomic<double> hard_brake_limit_{1.0};
   Json signaling_messages_ = Json::array();
   Json pending_websocket_messages_ = Json::array();
   std::unique_ptr<WebSocketClient> signaling_websocket_;

@@ -181,7 +181,8 @@ MINE_TELEOP_VEHICLE_CONFIG="$PWD/configs/my-vehicle.yaml" \
 车端安装包强制包含
 `lib/vendor/chassis/libmine_teleop_chassis_bridge.so` 和
 `lib/vendor/chassis/libchassis_control.so`。这两个构建/授权物料不提交到 Git。
-如果 `vendor/chassis/lib` 下缺失任一文件，统一打包入口会先执行：
+统一打包入口每次都执行以下流程，从当前 checkout 重建 bridge；不会复用
+`vendor/chassis/lib` 中残留的旧 bridge：
 
 ```bash
 MINE_TELEOP_CHASSIS_CONTROL_ROOT=/path/to/ChassisControl \
@@ -203,15 +204,17 @@ scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64
 ```
 
 如果只有应用源码变化，并且已有经过验收且带校验和的基础包，可以复用其中
-第三方媒体运行库：
+体积较大的 codec/GStreamer 运行库：
 
 ```bash
 MINE_TELEOP_BASE_BUNDLE_ARCHIVE=/path/to/accepted-vehicle-bundle.tar.gz \
   scripts/build/build_cpp_ubuntu_bundle.sh linux/amd64
 ```
 
-该模式仍会重新构建当前 Mine Teleop 二进制。需要重新验证最终安装包时追加
-`test` 参数。
+该模式仍会重新构建当前 Mine Teleop 二进制和 Chassis bridge，并从当前固定
+源码刷新整组 Aravis 运行库，避免新 camera binary 与旧同 SONAME 库发生符号
+不匹配；因此同样需要 ChassisControl headers 与运行库输入。需要重新验证最终
+安装包时追加 `test` 参数。
 
 ## 8. 构建后检查
 
@@ -228,6 +231,12 @@ shasum -a 256 "$vehicle_archive"
 ```bash
 scripts/test/check_cpp_ubuntu_bundle.sh "$vehicle_archive"
 ```
+
+该检查会在干净的 Ubuntu 22.04 amd64 容器内同时加载随包的 chassis bridge，
+运行 `config-check --chassis-bridge-library ...`，并明确要求输出
+`chassis_bridge_abi.version=3`。ABI 版本、V3 配置结构大小或
+`mine_teleop_chassis_open_v3` 任一不匹配都会使安装包复验失败；runtime 与 bridge
+必须成套发布。
 
 独立复验控制端包：
 

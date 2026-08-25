@@ -74,6 +74,20 @@ else()
 endif()
 include(GNUInstallDirs)
 
+set(MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_logic.js")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}")
+file(READ "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}" MINE_TELEOP_CONTROL_LOGIC_JS)
+string(FIND "${MINE_TELEOP_CONTROL_LOGIC_JS}" ")MT_CONTROL_JS\"" MINE_TELEOP_CONTROL_LOGIC_DELIMITER)
+if(NOT MINE_TELEOP_CONTROL_LOGIC_DELIMITER EQUAL -1)
+  message(FATAL_ERROR "cpp/web/control_logic.js contains the generated C++ raw-string delimiter")
+endif()
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop")
+configure_file(
+  cmake/control_logic_js.hpp.in
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop/control_logic_js.hpp"
+  @ONLY
+)
+
 function(mine_teleop_enable_warnings target)
   if(MSVC)
     target_compile_options(${target} PRIVATE /W4 /permissive-)
@@ -103,6 +117,8 @@ target_include_directories(mine_teleop_runtime
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>
     $<INSTALL_INTERFACE:include>
+  PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 target_link_libraries(mine_teleop_runtime
   PUBLIC
@@ -249,6 +265,13 @@ install(DIRECTORY protocol/ DESTINATION share/mine-teleop/protocol)
 
 if(MINE_TELEOP_BUILD_TESTS)
   enable_testing()
+  if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
+    find_program(MINE_TELEOP_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
+    add_test(
+      NAME mine-teleop-control-logic-js-tests
+      COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/control_logic.test.cjs
+    )
+  endif()
   if(MINE_TELEOP_BUILD_SIGNALING_SERVER)
     add_test(NAME mine-teleop-signaling-help COMMAND mine-teleop-signaling-server --help)
     set_tests_properties(
@@ -327,6 +350,58 @@ if(MINE_TELEOP_BUILD_TESTS)
   add_test(NAME mine-teleop-vcu-tests COMMAND mine-teleop-vcu-tests)
 
   if(UNIX AND NOT APPLE)
+    enable_language(C)
+
+    function(mine_teleop_add_chassis_abi_fixture target version wrong_size has_apply_v2)
+      add_library(${target} SHARED
+        cpp/tests/fixtures/chassis-bridge-abi/chassis_bridge_abi_fixture.c
+      )
+      target_include_directories(${target}
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/deployments/chassis-control-bridge
+      )
+      target_compile_definitions(${target}
+        PRIVATE
+          MINE_TELEOP_TEST_CHASSIS_ABI_VERSION=${version}
+          MINE_TELEOP_TEST_CHASSIS_WRONG_V3_SIZE=${wrong_size}
+          MINE_TELEOP_TEST_CHASSIS_HAS_APPLY_V2=${has_apply_v2}
+      )
+      set_target_properties(${target} PROPERTIES
+        C_STANDARD 11
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS OFF
+      )
+    endfunction()
+
+    mine_teleop_add_chassis_abi_fixture(
+      mine-teleop-chassis-abi-v2-fixture 2U 0 1)
+    mine_teleop_add_chassis_abi_fixture(
+      mine-teleop-chassis-abi-v3-wrong-size-fixture 3U 1 1)
+    mine_teleop_add_chassis_abi_fixture(
+      mine-teleop-chassis-abi-v3-missing-apply-v2-fixture 3U 0 0)
+
+    add_executable(mine-teleop-chassis-bridge-abi-loader-tests
+      cpp/tests/chassis_bridge_abi_loader_tests.cpp
+    )
+    target_include_directories(mine-teleop-chassis-bridge-abi-loader-tests
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/deployments/chassis-control-bridge
+    )
+    target_link_libraries(mine-teleop-chassis-bridge-abi-loader-tests
+      PRIVATE mine_teleop_runtime
+    )
+    add_dependencies(mine-teleop-chassis-bridge-abi-loader-tests
+      mine-teleop-chassis-abi-v2-fixture
+      mine-teleop-chassis-abi-v3-wrong-size-fixture
+      mine-teleop-chassis-abi-v3-missing-apply-v2-fixture
+    )
+    mine_teleop_enable_warnings(mine-teleop-chassis-bridge-abi-loader-tests)
+    add_test(
+      NAME mine-teleop-chassis-bridge-abi-loader-tests
+      COMMAND mine-teleop-chassis-bridge-abi-loader-tests
+        $<TARGET_FILE:mine-teleop-chassis-abi-v2-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v3-wrong-size-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v3-missing-apply-v2-fixture>
+    )
+
     # The production bridge links against the field-only ChassisControl
     # package.  This object target compiles the complete bridge against a
     # minimal ABI fixture so logging and SocketCAN changes are still covered
@@ -338,6 +413,9 @@ if(MINE_TELEOP_BUILD_TESTS)
       PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
         ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/fixtures/chassis-control
+    )
+    target_compile_definitions(mine-teleop-chassis-bridge-compile-test
+      PRIVATE MINE_TELEOP_CHASSIS_TESTING=1
     )
     mine_teleop_enable_warnings(mine-teleop-chassis-bridge-compile-test)
 

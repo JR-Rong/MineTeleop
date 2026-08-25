@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -178,6 +179,7 @@ void prepare_parking_gate(ParallelController& controller, int driver_gear = 1) {
   expect(controller.ingest(handshake_feedback(3)), "manual handshake feedback was rejected");
   expect(controller.ingest(parking_brake_feedback(2)), "parked EPB feedback was rejected");
   expect(controller.ingest(speed_feedback(0.0)), "zero speed feedback was rejected");
+  expect(controller.ingest(gear_feedback(1)), "neutral actual-gear feedback was rejected");
   expect(
       controller.ingest(driver_gear_request_feedback(driver_gear)),
       "driver gear request feedback was rejected");
@@ -213,6 +215,66 @@ void advance_to_ready(ParallelController& controller, int gear = 3) {
   send_mode_feedback(controller);
   static_cast<void>(controller.tick());
   expect(controller.state() == State::Ready, "actuator mode feedback did not arm control");
+}
+
+void advance_to_arming_state(ParallelController& controller, State target) {
+  Command command;
+  command.gear = 3;
+  command.motor_torque_nm.fill(80.0);
+  command.vehicle_speed_request_kph = 20.0;
+  command.vehicle_speed_request_valid = true;
+  prepare_parking_gate(controller);
+  expect(controller.request_parallel_handshake(), "arming-state setup handshake failed");
+  expect(controller.set_command(command), "arming-state setup command failed");
+  for (int index = 0; index < 6; ++index) static_cast<void>(controller.tick());
+  if (target == State::WaitParallelHandshake) return;
+
+  expect(controller.ingest(handshake_feedback(5)), "arming-state handshake feedback failed");
+  static_cast<void>(controller.tick());
+  if (target == State::WaitParkingBrakeReleased) return;
+
+  expect(controller.ingest(parking_brake_feedback(1)), "arming-state EPB feedback failed");
+  static_cast<void>(controller.tick());
+  if (target == State::WaitGear) return;
+
+  expect(controller.ingest(gear_feedback(3)), "arming-state gear feedback failed");
+  static_cast<void>(controller.tick());
+  expect(
+      target == State::WaitActuatorModes &&
+          controller.state() == State::WaitActuatorModes,
+      "unsupported or unreachable arming-state test target");
+}
+
+void complete_emergency_disarm(ParallelController& controller) {
+  if (controller.state() == State::DisarmManual) {
+    expect(controller.ingest(handshake_feedback(3)), "manual disarm feedback failed");
+    static_cast<void>(controller.tick());
+    expect(controller.state() == State::Disarmed, "early arming ESTOP did not disarm");
+    return;
+  }
+
+  expect(
+      controller.state() == State::DisarmTorque,
+      "armed actuator ESTOP did not enter the full reverse sequence");
+  for (std::size_t index = 0; index < kMotorStatus01Ids.size(); ++index) {
+    expect(
+        controller.ingest(motor_torque_feedback(index, 0.0)),
+        "emergency-disarm torque feedback failed");
+  }
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmStop, "emergency disarm skipped torque zero");
+  expect(controller.ingest(speed_feedback(0.0)), "emergency-disarm speed feedback failed");
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmNeutral, "emergency disarm skipped zero speed");
+  expect(controller.ingest(gear_feedback(1)), "emergency-disarm neutral feedback failed");
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmParkingBrake, "emergency disarm skipped N");
+  expect(controller.ingest(parking_brake_feedback(2)), "emergency-disarm EPB feedback failed");
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmManual, "emergency disarm skipped EPB park");
+  expect(controller.ingest(handshake_feedback(3)), "emergency-disarm manual feedback failed");
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::Disarmed, "emergency disarm did not complete");
 }
 
 void test_protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding() {
@@ -287,6 +349,331 @@ void test_arming_uses_current_epb_semantics_and_gates_control() {
   const auto& brake = find_frame(frames, mine_teleop::vcu::ids::kAduEhb01);
   expect(signal(brake, 0, 4) == 1, "EHB by-wire mode is not enabled");
   expect(signal(brake, 4, 12) == 45, "4.5 bar brake pressure encoded incorrectly");
+}
+
+void test_vehicle_speed_request_is_permanently_zero_quality_zero() {
+  ParallelController controller;
+  Command command;
+  command.gear = 3;
+  command.vehicle_speed_request_kph = 12.6;
+  command.vehicle_speed_request_valid = true;
+
+  expect(controller.ingest(speed_feedback(0.0)), "zero speed feedback was rejected");
+  expect(controller.ingest(gear_feedback(1)), "neutral gear feedback was rejected");
+  expect(controller.set_command(command), "valid vehicle speed request was rejected");
+  auto frames = controller.tick();
+  const auto& standby_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(standby_speed, 0, 8) == 0 && signal(standby_speed, 8, 8) == 0,
+      "standby exposed a valid vehicle speed request");
+
+  advance_to_ready(controller);
+  expect(controller.set_command(command), "ready vehicle speed request was rejected");
+  frames = controller.tick();
+  const auto& ready_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(ready_speed, 0, 8) == 0 && signal(ready_speed, 8, 8) == 0,
+      "Ready exposed the unverified VCU vehicle-speed request");
+
+  const auto& motor = find_frame(frames, mine_teleop::vcu::ids::kAduMcu01);
+  expect(
+      signal(motor, 0, 3) == 1 && signal(motor, 3, 3) == 1,
+      "vehicle speed request changed the motor out of torque mode");
+
+  for (const auto& [request_kph, expected_raw] :
+       std::array<std::pair<double, std::uint64_t>, 2>{{{0.0, 0U}, {255.0, 255U}}}) {
+    command.vehicle_speed_request_kph = request_kph;
+    expect(controller.set_command(command), "vehicle speed encoding boundary was rejected");
+    frames = controller.tick();
+    const auto& boundary_speed =
+        find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+    expect(
+        signal(boundary_speed, 0, 8) == 0 &&
+            signal(boundary_speed, 8, 8) == 0,
+        "a caller-supplied speed request bypassed permanent Q0");
+    static_cast<void>(expected_raw);
+  }
+
+  command.vehicle_speed_request_kph = 12.6;
+  command.vehicle_speed_request_valid = false;
+  expect(controller.set_command(command), "disabled vehicle speed request was rejected");
+  frames = controller.tick();
+  const auto& disabled_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(disabled_speed, 0, 8) == 0 && signal(disabled_speed, 8, 8) == 0,
+      "explicitly invalid vehicle speed request was exposed as valid");
+}
+
+void test_motor_torque_resolution_preserves_quantized_ceiling() {
+  ParallelController controller;
+  advance_to_ready(controller);
+
+  Command command;
+  command.gear = 3;
+  for (const double requested_torque_nm : {4.1, -4.1}) {
+    command.motor_torque_nm.fill(requested_torque_nm);
+    expect(controller.set_command(command), "quantized motor torque was rejected");
+    const auto frames = controller.tick();
+    const auto& motor = find_frame(frames, mine_teleop::vcu::ids::kAduMcu01);
+    const double decoded_torque_nm =
+        static_cast<double>(signal(motor, 8, 14)) * 0.1 - 800.0;
+    expect(
+        std::abs(decoded_torque_nm - requested_torque_nm) < 1e-9,
+        "0.1 Nm motor torque ceiling changed during CAN encoding");
+  }
+}
+
+void test_drive_gear_gate_withdraws_traction_and_preserves_steering_brake() {
+  ParallelController missing_gear_feedback;
+  Command initial_drive;
+  initial_drive.gear = 3;
+  initial_drive.motor_torque_nm.fill(80.0);
+  expect(
+      missing_gear_feedback.ingest(speed_feedback(0.0)),
+      "initial zero-speed feedback was rejected");
+  expect(
+      !missing_gear_feedback.set_command(initial_drive),
+      "drive gear was accepted without valid actual-gear feedback");
+  expect(
+      signal(
+          find_frame(
+              missing_gear_feedback.tick(),
+              mine_teleop::vcu::ids::kAduMcu01),
+          8,
+          14) == 8000,
+      "missing gear feedback did not keep traction at zero");
+
+  ParallelController controller;
+  advance_to_ready(controller, 3);
+
+  Command drive;
+  drive.gear = 3;
+  drive.motor_torque_nm.fill(80.0);
+  expect(controller.set_command(drive), "ready D traction was rejected");
+  auto frames = controller.tick();
+  expect(
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) == 8800,
+      "ready D traction did not reach the motor frame");
+
+  expect(controller.ingest(speed_feedback(2.0)), "moving speed feedback was rejected");
+  Command reverse = drive;
+  reverse.gear = 2;
+  reverse.motor_torque_nm.fill(-80.0);
+  reverse.steering_angle_deg.fill(12.0);
+  reverse.steering_speed_degps.fill(20.0);
+  reverse.brake_pressure_bar.fill(4.5);
+  reverse.vehicle_speed_request_kph = 255.0;
+  reverse.vehicle_speed_request_valid = true;
+  expect(!controller.set_command(reverse), "moving D-to-R change was accepted");
+  frames = controller.tick();
+  expect(
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) == 8000,
+      "rejected moving gear change retained the previous traction");
+  expect(
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed), 8, 8) == 0,
+      "rejected moving gear change exposed a vehicle-speed request");
+
+  controller.clear_emergency_stop();
+  expect(controller.ingest(speed_feedback(0.0)), "stopped speed feedback was rejected");
+  expect(controller.set_command(reverse), "fresh zero-speed D-to-R change was rejected");
+  frames = controller.tick();
+  expect(controller.state() == State::WaitGear, "accepted reverse change did not enter WaitGear");
+  const auto& wait_gear_motor = find_frame(frames, mine_teleop::vcu::ids::kAduMcu01);
+  const auto& wait_gear_steering = find_frame(frames, mine_teleop::vcu::ids::kAduEps01);
+  const auto& wait_gear_brake = find_frame(frames, mine_teleop::vcu::ids::kAduEhb01);
+  expect(signal(wait_gear_motor, 8, 14) == 8000, "WaitGear emitted motor torque");
+  expect(
+      signal(wait_gear_steering, 8, 16) == 15870,
+      "WaitGear did not preserve desired steering angle");
+  expect(
+      signal(wait_gear_brake, 4, 12) == 45,
+      "WaitGear did not preserve desired EHB pressure");
+  expect(
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed), 8, 8) == 0,
+      "WaitGear emitted a VCU vehicle-speed request");
+
+  expect(controller.ingest(gear_feedback(2)), "reverse gear feedback was rejected");
+  frames = controller.tick();
+  expect(
+      controller.state() == State::WaitActuatorModes,
+      "reverse gear feedback did not enter WaitActuatorModes");
+  expect(
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) == 8000,
+      "WaitActuatorModes emitted motor torque");
+  expect(
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduEps01), 8, 16) == 15870 &&
+          signal(find_frame(frames, mine_teleop::vcu::ids::kAduEhb01), 4, 12) == 45,
+      "WaitActuatorModes interrupted steering or EHB pressure");
+}
+
+void test_ready_actual_gear_mismatch_forces_safe_wait() {
+  ParallelController controller;
+  advance_to_ready(controller, 3);
+  Command command;
+  command.gear = 3;
+  command.motor_torque_nm.fill(80.0);
+  expect(controller.set_command(command), "ready D command was rejected");
+  expect(controller.ingest(gear_feedback(2)), "mismatched actual gear feedback was rejected");
+  const auto frames = controller.tick();
+  expect(controller.state() == State::WaitGear, "actual gear mismatch remained Ready");
+  expect(
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) == 8000,
+      "actual gear mismatch retained traction torque");
+  expect(
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduEhb01), 4, 12) > 0,
+      "actual gear mismatch did not apply the safety brake");
+}
+
+void test_vehicle_speed_request_is_invalidated_by_safety_and_disarm_states() {
+  ParallelController controller;
+  advance_to_ready(controller);
+
+  Command command;
+  command.gear = 3;
+  command.vehicle_speed_request_kph = 20.0;
+  command.vehicle_speed_request_valid = true;
+  expect(controller.set_command(command), "ready vehicle speed request was rejected");
+
+  controller.emergency_stop();
+  auto frames = controller.tick();
+  const auto& emergency_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(emergency_speed, 0, 8) == 0 && signal(emergency_speed, 8, 8) == 0,
+      "emergency stop left the vehicle speed request valid");
+
+  controller.clear_emergency_stop();
+  auto emergency_switch = gear_feedback(3);
+  emergency_switch.data[0] |= 1U;
+  expect(controller.ingest(emergency_switch), "VCU emergency switch feedback was rejected");
+  frames = controller.tick();
+  const auto& emergency_switch_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(emergency_switch_speed, 0, 8) == 0 &&
+          signal(emergency_switch_speed, 8, 8) == 0,
+      "VCU emergency switch left the vehicle speed request valid");
+
+  expect(controller.ingest(gear_feedback(3)), "VCU emergency switch did not clear");
+  controller.request_disarm();
+  frames = controller.tick();
+  const auto& disarm_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(disarm_speed, 0, 8) == 0 && signal(disarm_speed, 8, 8) == 0,
+      "disarm left the vehicle speed request valid");
+
+  ParallelController faulted;
+  advance_to_ready(faulted);
+  expect(faulted.set_command(command), "fault-path vehicle speed request was rejected");
+  faulted.transport_fault();
+  frames = faulted.tick();
+  const auto& fault_speed =
+      find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+  expect(
+      signal(fault_speed, 0, 8) == 0 && signal(fault_speed, 8, 8) == 0,
+      "transport fault left the vehicle speed request valid");
+}
+
+void test_physical_emergency_latches_until_disarm_and_explicit_handshake() {
+  ParallelController controller;
+  advance_to_ready(controller, 3);
+
+  Command drive;
+  drive.gear = 3;
+  drive.motor_torque_nm.fill(80.0);
+  expect(controller.set_command(drive), "physical ESTOP setup traction was rejected");
+  expect(
+      signal(
+          find_frame(controller.tick(), mine_teleop::vcu::ids::kAduMcu01),
+          8,
+          14) == 8800,
+      "physical ESTOP setup did not transmit traction");
+
+  auto physical_emergency = gear_feedback(3);
+  physical_emergency.data[0] |= 1U;
+  expect(
+      controller.ingest(physical_emergency),
+      "physical emergency VehicleStatus feedback was rejected");
+  expect(
+      controller.physical_emergency_latched() &&
+          controller.state() == State::DisarmTorque,
+      "physical emergency did not latch and immediately start reverse disarm");
+
+  auto frames = controller.tick();
+  expect(
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) ==
+              8000 &&
+          signal(find_frame(frames, mine_teleop::vcu::ids::kAduEhb01), 4, 12) >
+              0 &&
+          signal(
+              find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed),
+              8,
+              8) == 0,
+      "physical emergency did not command zero torque, EHB braking, and speed Q0");
+
+  expect(
+      controller.ingest(gear_feedback(3)),
+      "released physical emergency feedback was rejected");
+  controller.clear_emergency_stop();
+  expect(
+      controller.physical_emergency_latched(),
+      "ordinary emergency clear removed the physical emergency latch");
+  expect(
+      !controller.request_parallel_handshake(),
+      "physical emergency latch recovered before full disarm");
+
+  complete_emergency_disarm(controller);
+  expect(
+      controller.physical_emergency_latched(),
+      "full disarm implicitly cleared the physical emergency latch");
+  expect(
+      controller.request_parallel_handshake(),
+      "released physical emergency did not recover through explicit stopped handshake");
+  expect(
+      !controller.physical_emergency_latched(),
+      "explicit stopped handshake did not clear the physical emergency latch");
+
+  ParallelController standby;
+  auto standby_emergency = gear_feedback(1);
+  standby_emergency.data[0] |= 1U;
+  expect(
+      standby.ingest(standby_emergency) && standby.physical_emergency_latched(),
+      "standby physical emergency pulse was not latched at ingest");
+  prepare_parking_gate(standby);
+  expect(
+      standby.request_parallel_handshake() &&
+          !standby.physical_emergency_latched(),
+      "released pre-authority standby emergency could not recover through the explicit parking gate");
+}
+
+void test_vehicle_speed_request_validation_is_finite_and_bounded() {
+  ParallelController controller;
+  Command command;
+
+  for (const double boundary : {0.0, 255.0}) {
+    command.vehicle_speed_request_kph = boundary;
+    command.vehicle_speed_request_valid = true;
+    expect(controller.set_command(command), "vehicle speed boundary was rejected");
+  }
+
+  for (const double invalid : {
+           -0.1,
+           255.1,
+           std::numeric_limits<double>::quiet_NaN(),
+           std::numeric_limits<double>::infinity()}) {
+    command.vehicle_speed_request_kph = invalid;
+    expect(!controller.set_command(command), "invalid vehicle speed request was accepted");
+  }
+
+  command.vehicle_speed_request_valid = false;
+  command.vehicle_speed_request_kph = std::numeric_limits<double>::quiet_NaN();
+  expect(
+      !controller.set_command(command),
+      "non-finite vehicle speed request bypassed validation while marked invalid");
 }
 
 void test_feedback_decoding_uses_si_units_and_complete_snapshot() {
@@ -485,6 +872,124 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
       "reconnect did not restart the five-frame low-handshake phase");
 }
 
+void test_arming_estop_reverses_handshake_without_forward_progress() {
+  for (const auto arming_state : {
+           State::WaitParallelHandshake,
+           State::WaitParkingBrakeReleased,
+           State::WaitGear,
+           State::WaitActuatorModes}) {
+    ParallelController controller;
+    advance_to_arming_state(controller, arming_state);
+    expect(controller.state() == arming_state, "arming ESTOP setup reached the wrong state");
+
+    Command emergency;
+    emergency.gear = 1;
+    emergency.brake_pressure_bar.fill(25.0);
+    expect(controller.set_emergency_command(emergency), "arming ESTOP calibration failed");
+    controller.emergency_stop();
+    expect(
+        controller.state() ==
+            (arming_state == State::WaitParallelHandshake
+                 ? State::DisarmManual
+                 : State::DisarmTorque),
+        "arming ESTOP did not immediately enter the reverse handshake");
+
+    const auto frames = controller.tick();
+    expect(
+        signal(
+            find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) ==
+            8000,
+        "arming ESTOP emitted traction torque");
+    const auto& speed =
+        find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
+    expect(
+        signal(speed, 0, 8) == 0 && signal(speed, 8, 8) == 0,
+        "arming ESTOP emitted a VCU speed request");
+    if (arming_state == State::WaitParallelHandshake) {
+      const auto& epb = find_frame(frames, mine_teleop::vcu::ids::kAduEpb);
+      const auto& shake = find_frame(frames, mine_teleop::vcu::ids::kAduShake);
+      expect(
+          signal(epb, 0, 2) == 2 && signal(shake, 0, 8) == 0,
+          "early arming ESTOP did not retain EPB park and withdraw ShakeReq");
+    } else {
+      const auto& brake = find_frame(frames, mine_teleop::vcu::ids::kAduEhb01);
+      expect(
+          signal(brake, 0, 4) == 1 && signal(brake, 4, 12) == 250,
+          "post-EPB arming ESTOP did not enable calibrated EHB safety braking");
+    }
+    complete_emergency_disarm(controller);
+  }
+
+  ParallelController faulted;
+  advance_to_arming_state(faulted, State::WaitParkingBrakeReleased);
+  Command emergency;
+  emergency.gear = 1;
+  emergency.brake_pressure_bar.fill(25.0);
+  expect(faulted.set_emergency_command(emergency), "arming fault calibration failed");
+  faulted.transport_fault();
+  const auto fault_frames = faulted.tick();
+  expect(faulted.state() == State::Fault, "arming transport fault advanced the handshake");
+  expect(
+      signal(
+          find_frame(fault_frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) ==
+          8000 &&
+          signal(
+              find_frame(fault_frames, mine_teleop::vcu::ids::kAduEhb01), 4, 12) ==
+              250,
+      "arming transport fault did not produce zero torque and EHB safety braking");
+  faulted.request_disarm();
+  complete_emergency_disarm(faulted);
+}
+
+void test_arming_physical_emergency_is_latched_and_recoverable_only_after_disarm() {
+  for (const auto arming_state : {
+           State::WaitParallelHandshake,
+           State::WaitParkingBrakeReleased,
+           State::WaitGear,
+           State::WaitActuatorModes}) {
+    ParallelController controller;
+    advance_to_arming_state(controller, arming_state);
+    Command emergency;
+    emergency.gear = 1;
+    emergency.brake_pressure_bar.fill(25.0);
+    expect(
+        controller.set_emergency_command(emergency),
+        "physical arming ESTOP calibration failed");
+
+    auto physical_emergency = gear_feedback(1);
+    physical_emergency.data[0] |= 1U;
+    expect(
+        controller.ingest(physical_emergency),
+        "physical arming ESTOP VehicleStatus feedback failed");
+    expect(
+        controller.physical_emergency_latched() &&
+            controller.state() ==
+                (arming_state == State::WaitParallelHandshake
+                     ? State::DisarmManual
+                     : State::DisarmTorque),
+        "physical arming ESTOP did not latch and reverse the handshake");
+
+    expect(
+        controller.ingest(gear_feedback(1)),
+        "physical arming ESTOP release feedback failed");
+    controller.clear_emergency_stop();
+    const auto frames = controller.tick();
+    expect(
+        signal(
+            find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) ==
+            8000,
+        "released physical arming ESTOP resumed traction before recovery");
+    complete_emergency_disarm(controller);
+    expect(
+        controller.physical_emergency_latched(),
+        "physical arming ESTOP latch cleared during disarm");
+    expect(
+        controller.request_parallel_handshake() &&
+            !controller.physical_emergency_latched(),
+        "physical arming ESTOP did not require explicit post-disarm handshake recovery");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -493,6 +998,20 @@ int main() {
        test_protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding},
       {"arming_uses_current_epb_semantics_and_gates_control",
        test_arming_uses_current_epb_semantics_and_gates_control},
+      {"vehicle_speed_request_is_permanently_zero_quality_zero",
+       test_vehicle_speed_request_is_permanently_zero_quality_zero},
+      {"motor_torque_resolution_preserves_quantized_ceiling",
+       test_motor_torque_resolution_preserves_quantized_ceiling},
+      {"drive_gear_gate_withdraws_traction_and_preserves_steering_brake",
+       test_drive_gear_gate_withdraws_traction_and_preserves_steering_brake},
+      {"ready_actual_gear_mismatch_forces_safe_wait",
+       test_ready_actual_gear_mismatch_forces_safe_wait},
+      {"vehicle_speed_request_is_invalidated_by_safety_and_disarm_states",
+       test_vehicle_speed_request_is_invalidated_by_safety_and_disarm_states},
+      {"physical_emergency_latches_until_disarm_and_explicit_handshake",
+       test_physical_emergency_latches_until_disarm_and_explicit_handshake},
+      {"vehicle_speed_request_validation_is_finite_and_bounded",
+       test_vehicle_speed_request_validation_is_finite_and_bounded},
       {"feedback_decoding_uses_si_units_and_complete_snapshot",
        test_feedback_decoding_uses_si_units_and_complete_snapshot},
       {"arming_requires_fresh_feedback_after_each_request",
@@ -505,6 +1024,10 @@ int main() {
        test_handshake_loss_forces_zero_torque_and_calibrated_brake},
       {"disarm_waits_for_torque_stop_neutral_park_and_manual",
        test_disarm_waits_for_torque_stop_neutral_park_and_manual},
+      {"arming_estop_reverses_handshake_without_forward_progress",
+       test_arming_estop_reverses_handshake_without_forward_progress},
+      {"arming_physical_emergency_is_latched_and_recoverable_only_after_disarm",
+       test_arming_physical_emergency_is_latched_and_recoverable_only_after_disarm},
   };
 
   int failed = 0;

@@ -913,11 +913,47 @@ struct VehicleMediaRuntime::Impl {
     }
     try {
       const auto message = Json::parse(data);
+      if (message.value("type", "") == "session_control_profile") {
+        const auto request = SessionControlProfileRequest::from_json(message);
+        std::lock_guard lock(control_mutex);
+        if (control_channel != channel) return;
+        SessionControlProfileResult result;
+        if (stop_requested || control_inhibited || !control_service_started ||
+            !control_service || !control_link_open) {
+          result.protocol_version = request.protocol_version;
+          result.vehicle_id = request.vehicle_id;
+          result.driver_id = request.driver_id;
+          result.session_id = request.session_id;
+          result.seq = request.seq;
+          result.sent_at_utc_ms = signaling.now_ms();
+          result.accepted = false;
+          result.reason = "driver_not_connected";
+        } else {
+          result = control_service->receive_session_profile(
+              request,
+              signaling.now_ms());
+        }
+        send_session_control_profile_status_locked(result);
+        std::cout << Json({
+                         {"event", "vehicle_session_control_profile_received"},
+                         {"event_at_utc_ms", signaling.now_ms()},
+                         {"vehicle_id", config.vehicle_id},
+                         {"driver_id", signaling.driver_id()},
+                         {"session_id", signaling.session_id()},
+                         {"request_seq", request.seq},
+                         {"accepted", result.accepted},
+                         {"idempotent", result.idempotent},
+                         {"reason", result.reason},
+                     }).dump()
+                  << '\n';
+        return;
+      }
       if (message.value("event", "") == "vcu_handshake_command") {
         const auto action = message.value("action", "");
         std::lock_guard lock(control_mutex);
-        if (stop_requested || control_inhibited || control_channel != channel ||
-            !control_service_started || !control_service || !control_link_open) {
+        if (control_channel != channel) return;
+        if (stop_requested || control_inhibited || !control_service_started ||
+            !control_service || !control_link_open) {
           send_vcu_handshake_status_locked("driver_not_connected");
           return;
         }
@@ -981,6 +1017,9 @@ struct VehicleMediaRuntime::Impl {
       } else {
         ++rejected_control_commands;
         const auto now_ms = signaling.now_ms();
+        if (!result.issue_code.empty()) {
+          send_control_command_rejected_locked(command.seq, result.issue_code);
+        }
         if (result.reason != last_control_rejection_reason ||
             !last_control_rejection_log_ms ||
             now_ms - *last_control_rejection_log_ms >= 5000) {
@@ -989,12 +1028,19 @@ struct VehicleMediaRuntime::Impl {
           const bool feedback_problem =
               result.reason == "can_feedback_missing" ||
               result.reason == "can_feedback_poll_failed";
+          const auto diagnostic_issue_code = result.issue_code.empty()
+              ? (feedback_problem
+                     ? std::string("vcu_feedback_blocks_control")
+                     : std::string("control_command_rejected"))
+              : result.issue_code;
           emit_diagnostic(
               "vehicle_control_command_rejected",
-              feedback_problem ? "vcu_feedback_blocks_control" : "control_command_rejected",
+              diagnostic_issue_code,
               feedback_problem ? "vcu_feedback_gate" : "control_validation",
               result.reason,
-              feedback_problem
+              result.issue_code == "vcu_drive_gear_change_moving_or_stale"
+                  ? "Stop the vehicle, restore fresh speed and gear feedback, release the direction control, and select D/R again."
+                  : feedback_problem
                   ? "Inspect VCU feedback freshness and the VCU JSONL log before requesting control."
                   : "Inspect command identity, sequence, timing, token, and configured safety limits.",
               true,
@@ -1039,6 +1085,36 @@ struct VehicleMediaRuntime::Impl {
     }
   }
 
+  void send_control_command_rejected_locked(
+      std::uint64_t command_seq,
+      std::string_view issue_code) {
+    if (control_channel == nullptr || !control_link_open) return;
+    const std::string stable_issue_code =
+        issue_code == "vcu_drive_gear_change_moving_or_stale"
+        ? "vcu_drive_gear_change_moving_or_stale"
+        : "vcu_control_apply_rejected";
+    const auto timestamp_ms = signaling.now_ms();
+    if (stable_issue_code == last_control_rejection_status_issue_code &&
+        last_control_rejection_status_ms &&
+        timestamp_ms - *last_control_rejection_status_ms < 500) {
+      return;
+    }
+    last_control_rejection_status_issue_code = stable_issue_code;
+    last_control_rejection_status_ms = timestamp_ms;
+    const auto payload = Json({
+        {"event", "control_command_rejected"},
+        {"protocol_version", kProtocolVersion},
+        {"vehicle_id", config.vehicle_id},
+        {"driver_id", signaling.driver_id()},
+        {"session_id", signaling.session_id()},
+        {"control_status_seq", ++control_status_seq},
+        {"command_seq", command_seq},
+        {"accepted", false},
+        {"issue_code", stable_issue_code},
+    }).dump();
+    gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
+  }
+
   void send_vcu_handshake_status(std::string_view result) {
     std::lock_guard lock(control_mutex);
     send_vcu_handshake_status_locked(result);
@@ -1054,17 +1130,37 @@ struct VehicleMediaRuntime::Impl {
     const auto& telemetry = history.back();
     const auto sequence = telemetry.value("seq", std::uint64_t{0});
     if (sequence == last_vehicle_telemetry_seq) return;
-    const auto payload = telemetry.dump();
+    auto payload_value = telemetry;
+    payload_value["control_status_seq"] = ++control_status_seq;
+    const auto payload = payload_value.dump();
     gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
     last_vehicle_telemetry_seq = sequence;
+  }
+
+  void send_session_control_profile_status_locked(
+      const SessionControlProfileResult& result) {
+    if (control_channel == nullptr || !control_link_open) return;
+    auto message = result.to_json();
+    message["event"] = "session_control_profile_status";
+    message["control_status_seq"] = ++control_status_seq;
+    if (control_service_started && control_service) {
+      message["hard_limits"] = control_service->control_limits();
+      message["session_control_profile"] =
+          control_service->session_control_profile();
+    }
+    const auto payload = message.dump();
+    gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
   }
 
   [[nodiscard]] Json configured_control_limits() const {
     return {
         {"max_speed_kph", config.field_safety.max_speed_kph},
         {"max_throttle", config.field_safety.max_throttle},
+        {"max_target_speed_kph",
+         config.field_safety.max_speed_kph * config.field_safety.max_throttle},
         {"full_scale_motor_torque_nm", config.field_safety.full_scale_motor_torque_nm},
-        {"max_brake", config.field_safety.max_brake},
+        {"max_brake_pressure_bar",
+         config.field_safety.max_brake_pressure_bar},
         {"max_steering_angle_deg", config.field_safety.max_steering_angle_deg},
     };
   }
@@ -1091,6 +1187,7 @@ struct VehicleMediaRuntime::Impl {
           {"vehicle_id", config.vehicle_id},
           {"driver_id", signaling.driver_id()},
           {"session_id", signaling.session_id()},
+          {"control_status_seq", ++control_status_seq},
           {"sent_at_utc_ms", signaling.now_ms()},
           {"driver_connected", true},
           {"result", result},
@@ -1383,6 +1480,14 @@ struct VehicleMediaRuntime::Impl {
         g_object_unref(channel);
         return;
       }
+      // Status ordering is scoped to the DataChannel, not the adapter.  A
+      // channel may publish driver_connected before critical cameras become
+      // ready and then start the adapter later without replacing the channel.
+      // Resetting in start_control_service would make that later status replay
+      // an already-used sequence number and be rejected by the controller.
+      control_status_seq = 0;
+      last_control_rejection_status_issue_code.clear();
+      last_control_rejection_status_ms.reset();
       control_channel = channel;
     }
   }
@@ -2647,9 +2752,12 @@ struct VehicleMediaRuntime::Impl {
   std::atomic<std::int64_t> last_control_received_at_ms{0};
   std::optional<std::int64_t> last_vcu_status_ms;
   std::uint64_t last_vehicle_telemetry_seq{0};
+  std::uint64_t control_status_seq{0};
   std::string last_vcu_handshake_state;
   std::string last_control_rejection_reason;
   std::optional<std::int64_t> last_control_rejection_log_ms;
+  std::string last_control_rejection_status_issue_code;
+  std::optional<std::int64_t> last_control_rejection_status_ms;
   std::atomic<std::uint64_t> local_ice_candidate_count{0};
   std::atomic<std::uint64_t> remote_ice_candidate_count{0};
 };

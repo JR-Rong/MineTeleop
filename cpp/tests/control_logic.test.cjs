@@ -1,0 +1,501 @@
+'use strict';
+
+const assert = require('assert').strict;
+const logic = require('../web/control_logic.js');
+
+let passed = 0;
+let failed = 0;
+function test(name, body) {
+  try {
+    body();
+    passed += 1;
+    console.log(`[PASS] ${name}`);
+  } catch (error) {
+    failed += 1;
+    console.error(`[FAIL] ${name}`);
+    console.error(error && error.stack ? error.stack : error);
+  }
+}
+
+const readyVcu = {
+  supported: true,
+  state: 'ready',
+  ready: true,
+  adapter_ready: true,
+  speed_valid: true,
+  speed_mps: 0,
+};
+
+test('fixed keyboard bindings expose two brakes and paired direction keys', () => {
+  assert.deepEqual(logic.KEY_BINDINGS, {
+    ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right',
+    ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down',
+    Space: 'service_brake', KeyB: 'hard_brake',
+  });
+  assert.equal(Object.isFrozen(logic.KEY_BINDINGS), true);
+});
+
+test('physical key set keeps an action held until every mapped key is released', () => {
+  const pressed = logic.createKeySet();
+  const blocked = logic.createKeySet();
+  assert.equal(logic.pressKey(pressed, blocked, 'ArrowUp').changed, true);
+  assert.equal(logic.pressKey(pressed, blocked, 'KeyW').changed, true);
+  assert.equal(logic.deriveKeyState(pressed).up, true);
+  assert.equal(logic.releaseKey(pressed, blocked, 'ArrowUp').changed, true);
+  assert.equal(logic.deriveKeyState(pressed).up, true);
+  assert.equal(logic.releaseKey(pressed, blocked, 'KeyW').changed, true);
+  assert.equal(logic.deriveKeyState(pressed).up, false);
+});
+
+test('blocked keys require a physical release before a fresh press', () => {
+  const pressed = logic.createKeySet(['ArrowLeft']);
+  const blocked = logic.createKeySet();
+  logic.blockAndClearKeys(pressed, blocked);
+  assert.equal(pressed.size, 0);
+  assert.equal(logic.pressKey(pressed, blocked, 'ArrowLeft').reason, 'blocked_until_release');
+  logic.releaseKey(pressed, blocked, 'ArrowLeft');
+  assert.equal(logic.pressKey(pressed, blocked, 'ArrowLeft').accepted, true);
+});
+
+test('gear selection latches on release and gates every new D/R selection on valid zero speed', () => {
+  const forward = {up: true, down: false};
+  const released = {up: false, down: false};
+  const reverse = {up: false, down: true};
+  assert.deepEqual(logic.deriveGearSelection('N', forward, readyVcu), {
+    selectedGear: 'D', pendingGearRequest: null, changed: true,
+  });
+  assert.deepEqual(logic.deriveGearSelection('D', released, readyVcu), {
+    selectedGear: 'D', pendingGearRequest: null, changed: false,
+  });
+  assert.deepEqual(logic.deriveGearSelection('N', forward, {...readyVcu, speed_valid: false}), {
+    selectedGear: 'N', pendingGearRequest: 'D', changed: false,
+  });
+  assert.equal(logic.allowsGearChange('P', 'D', {...readyVcu, speed_valid: false}), false);
+  assert.equal(logic.allowsGearChange('P', 'D', readyVcu), true);
+  assert.deepEqual(logic.deriveGearSelection('D', reverse, {...readyVcu, speed_valid: false}), {
+    selectedGear: 'D', pendingGearRequest: 'R', changed: false,
+  });
+  assert.equal(
+      logic.deriveGearSelection('D', reverse, {...readyVcu, speed_mps: 0.1}).selectedGear,
+      'R');
+  assert.equal(
+      logic.deriveGearSelection('D', reverse, {...readyVcu, speed_mps: -0.1}).selectedGear,
+      'R');
+  assert.equal(
+      logic.deriveGearSelection('D', reverse, {...readyVcu, speed_mps: 0.1001}).pendingGearRequest,
+      'R');
+  assert.equal(
+      logic.deriveGearSelection('D', reverse, {supported: false, state: 'unsupported'}).selectedGear,
+      'R');
+});
+
+test('deriveControl applies brake priority, suppresses throttle, and preserves steering', () => {
+  const limits = {maxThrottle: 0.05, maxBrakePressureBar: 100,
+    serviceBrakePressureBar: 30, hardBrakePressureBar: 80, maxSteeringDeg: 3};
+  const base = {gamepad: {steering: 0, throttle: 0, brake: 0}, selectedGear: 'D', limits,
+    steeringFullScaleDeg: 30};
+  const driving = logic.deriveControl({...base, keyState: {left: true, up: true}});
+  assert.equal(driving.steering, -0.1);
+  assert.equal(driving.throttle, 0.05);
+  assert.equal(driving.brake, 0);
+
+  const service = logic.deriveControl({
+    ...base, keyState: {left: true, up: true, service_brake: true},
+  });
+  assert.equal(service.steering, -0.1);
+  assert.equal(service.throttle, 0);
+  assert.equal(service.brake, 0.3);
+
+  const hard = logic.deriveControl({
+    ...base, keyState: {right: true, up: true, service_brake: true, hard_brake: true},
+  });
+  assert.equal(hard.steering, 0.1);
+  assert.equal(hard.throttle, 0);
+  assert.equal(hard.brake, 0.8);
+
+  const pedal = logic.deriveControl({
+    ...base,
+    keyState: {},
+    gamepad: {steering: 0.5, throttle: 1, brake: 0.5},
+  });
+  assert.equal(pedal.steering, 0.05);
+  assert.equal(pedal.throttle, 0);
+  assert.equal(pedal.brake, 0.5);
+
+  const fullPedal = logic.deriveControl({
+    ...base,
+    keyState: {},
+    gamepad: {steering: 0, throttle: 0, brake: 1},
+  });
+  assert.equal(fullPedal.brake, 1);
+  const fullPedalWithHardKey = logic.deriveControl({
+    ...base,
+    keyState: {hard_brake: true},
+    gamepad: {steering: 0, throttle: 0, brake: 1},
+  });
+  assert.equal(fullPedalWithHardKey.brake, 1);
+});
+
+test('deriveControl keeps mismatched or opposing direction requests at zero throttle', () => {
+  const common = {
+    gamepad: {steering: 0, throttle: 0, brake: 0},
+    limits: {maxThrottle: 1, maxBrakePressureBar: 100,
+      serviceBrakePressureBar: 20, hardBrakePressureBar: 100, maxSteeringDeg: 30},
+    steeringFullScaleDeg: 30,
+  };
+  assert.equal(logic.deriveControl({...common, selectedGear: 'D', keyState: {down: true}}).throttle, 0);
+  assert.equal(
+      logic.deriveControl({...common, selectedGear: 'D', keyState: {up: true, down: true}}).throttle,
+      0);
+  assert.equal(
+      logic.deriveControl({...common, selectedGear: 'N', keyState: {},
+        gamepad: {steering: 0, throttle: 1, brake: 0}}).throttle,
+      0);
+});
+
+test('a blocked Gamepad gear request requires physical pedal neutral before retry', () => {
+  let gate = logic.reduceGamepadNeutralInterlock({
+    requiresNeutral: false,
+    authorityReady: true,
+    throttle: 0.7,
+    brake: 0,
+    gearRequestPending: true,
+  });
+  assert.deepEqual(gate, {requiresNeutral: true, throttle: 0, brake: 0});
+
+  gate = logic.reduceGamepadNeutralInterlock({
+    requiresNeutral: gate.requiresNeutral,
+    authorityReady: true,
+    throttle: 0.7,
+    brake: 0,
+  });
+  assert.deepEqual(gate, {requiresNeutral: true, throttle: 0, brake: 0});
+
+  gate = logic.reduceGamepadNeutralInterlock({
+    requiresNeutral: gate.requiresNeutral,
+    authorityReady: true,
+    throttle: 0,
+    brake: 0,
+  });
+  assert.deepEqual(gate, {requiresNeutral: false, throttle: 0, brake: 0});
+
+  gate = logic.reduceGamepadNeutralInterlock({
+    requiresNeutral: gate.requiresNeutral,
+    authorityReady: true,
+    throttle: 0.7,
+    brake: 0,
+  });
+  assert.deepEqual(gate, {requiresNeutral: false, throttle: 0.7, brake: 0});
+});
+
+test('status sequence rejects stale values and reports accepted gaps', () => {
+  assert.deepEqual(logic.reduceStatusSequence(0, 1), {accepted: true, lastSequence: 1, gap: 0});
+  assert.deepEqual(logic.reduceStatusSequence(1, 3), {accepted: true, lastSequence: 3, gap: 1});
+  assert.deepEqual(logic.reduceStatusSequence(3, 2), {accepted: false, lastSequence: 3, gap: 0});
+  assert.deepEqual(logic.reduceStatusSequence(3, 3), {accepted: false, lastSequence: 3, gap: 0});
+  assert.deepEqual(logic.reduceStatusSequence(3, 'bad'), {accepted: false, lastSequence: 3, gap: 0});
+});
+
+test('control rejection presentation exposes only stable issue-code guidance', () => {
+  const gearRejected = logic.deriveControlCommandRejection(
+      'vcu_drive_gear_change_moving_or_stale');
+  assert.deepEqual(gearRejected, {
+    issueCode: 'vcu_drive_gear_change_moving_or_stale',
+    clearInput: true,
+    severity: 'critical',
+    text: '换挡被车端拒绝：车辆仍在移动，或挡位/速度反馈已过期；请停车并恢复新鲜反馈后，释放再重新选择 D/R。',
+  });
+
+  const unknown = logic.deriveControlCommandRejection(
+      'untrusted exception text / secret sentinel');
+  assert.equal(unknown.issueCode, 'vcu_control_apply_rejected');
+  assert.equal(unknown.clearInput, true);
+  assert.equal(unknown.severity, 'critical');
+  assert(!unknown.text.includes('secret sentinel'));
+});
+
+test('session control profile validation and hard-limit merge preserve brake ordering', () => {
+  const requested = {
+    target_speed_kph: 12,
+    max_motor_torque_nm: 300,
+    max_brake_pressure_bar: 90,
+    service_brake_pressure_bar: 30,
+    hard_brake_pressure_bar: 80,
+  };
+  const hard = {
+    max_speed_kph: 40,
+    max_throttle: 0.1,
+    full_scale_motor_torque_nm: 165,
+    max_brake_pressure_bar: 50,
+  };
+  assert.deepEqual(logic.mergeControlProfileWithHardLimits(requested, hard), {
+    target_speed_kph: 4,
+    max_motor_torque_nm: 165,
+    max_brake_pressure_bar: 50,
+    service_brake_pressure_bar: 30,
+    hard_brake_pressure_bar: 50,
+  });
+  assert.equal(logic.controlProfileThrottleLimit(
+      {...requested, target_speed_kph: 2}, hard), 0.05);
+  assert.equal(logic.controlProfileThrottleLimit(
+      {...requested, target_speed_kph: 2}, {...hard, max_speed_kph: 0}), 0);
+  assert.equal(logic.normalizeVehicleHardLimits(
+      {...hard, max_target_speed_kph: 20}).max_target_speed_kph, 4);
+  assert.throws(
+      () => logic.normalizeControlProfile({...requested, service_brake_pressure_bar: 80.1}),
+      /service_brake_pressure_bar <= hard_brake_pressure_bar/);
+  assert.throws(
+      () => logic.normalizeControlProfile({...requested, max_motor_torque_nm: 640.1}),
+      /max_motor_torque_nm/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({...hard, full_scale_motor_torque_nm: 640.1}),
+      /full_scale_motor_torque_nm/);
+  assert.throws(
+      () => logic.normalizeControlProfile({...requested, target_speed_kph: '2'}),
+      /target_speed_kph/);
+});
+
+test('session control profile ACK only activates the matching pending request', () => {
+  const requested = {
+    target_speed_kph: 2,
+    max_motor_torque_nm: 100,
+    max_brake_pressure_bar: 80,
+    service_brake_pressure_bar: 30,
+    hard_brake_pressure_bar: 80,
+  };
+  const pending = {
+    requestedProfile: requested,
+    pendingRequestSeq: 7,
+    effectiveProfile: null,
+    effectiveRequestSeq: 0,
+    acknowledged: false,
+  };
+  const stale = logic.reduceControlProfileStatus(pending, {
+    active: true, accepted: true, last_request_seq: 6, effective_profile: requested,
+  });
+  assert.equal(stale.matched, false);
+  assert.equal(stale.acknowledged, false);
+  assert.equal(stale.pendingRequestSeq, 7);
+
+  const mismatched = logic.reduceControlProfileStatus(pending, {
+    active: true,
+    accepted: true,
+    reason: 'accepted',
+    last_request_seq: 7,
+    effective_profile: {...requested, max_motor_torque_nm: 80},
+  });
+  assert.equal(mismatched.matched, true);
+  assert.equal(mismatched.acknowledged, false);
+  assert.equal(mismatched.invalidated, true);
+  assert.equal(mismatched.reason, 'effective_profile_mismatch');
+
+  const effective = {...requested};
+  const accepted = logic.reduceControlProfileStatus(pending, {
+    active: true,
+    accepted: true,
+    reason: 'accepted',
+    last_request_seq: 7,
+    effective_profile: effective,
+  });
+  assert.equal(accepted.matched, true);
+  assert.equal(accepted.acknowledged, true);
+  assert.equal(accepted.pendingRequestSeq, 0);
+  assert.equal(accepted.effectiveRequestSeq, 7);
+  assert.deepEqual(accepted.effectiveProfile, effective);
+
+  const prior = {...pending, effectiveProfile: effective, effectiveRequestSeq: 5, acknowledged: true};
+  const rejected = logic.reduceControlProfileStatus(prior, {
+    event: 'session_control_profile_status',
+    control_status_seq: 12,
+    active: false,
+    accepted: false,
+    reason: 'vehicle_not_parked',
+    last_request_seq: 7,
+    effective_profile: null,
+    session_control_profile: {
+      active: true,
+      accepted: true,
+      last_request_seq: 5,
+      effective_profile: effective,
+    },
+  });
+  assert.equal(rejected.matched, true);
+  assert.equal(rejected.acknowledged, false);
+  assert.equal(rejected.effectiveProfile, null);
+  assert.equal(rejected.effectiveRequestSeq, 0);
+  assert.equal(rejected.invalidated, true);
+  assert.equal(rejected.reason, 'vehicle_not_parked');
+});
+
+test('session control profile telemetry revokes stale or inactive effective state', () => {
+  const effective = {
+    target_speed_kph: 2,
+    max_motor_torque_nm: 100,
+    max_brake_pressure_bar: 80,
+    service_brake_pressure_bar: 30,
+    hard_brake_pressure_bar: 80,
+  };
+  const active = {
+    requestedProfile: effective,
+    pendingRequestSeq: 0,
+    effectiveProfile: effective,
+    effectiveRequestSeq: 7,
+    acknowledged: true,
+  };
+  const refreshed = logic.reduceControlProfileStatus(active, {
+    active: true, accepted: true, last_request_seq: 7, effective_profile: effective,
+  });
+  assert.equal(refreshed.acknowledged, true);
+  assert.equal(refreshed.invalidated, false);
+  assert.deepEqual(refreshed.effectiveProfile, effective);
+
+  for (const status of [
+    {active: false, accepted: false, last_request_seq: 7, effective_profile: effective},
+    {active: true, accepted: true, last_request_seq: 8, effective_profile: effective},
+    {active: true, accepted: true, last_request_seq: 7,
+      effective_profile: {...effective, max_motor_torque_nm: 90}},
+    {active: true, accepted: true, last_request_seq: 7,
+      effective_profile: {...effective, max_brake_pressure_bar: 10}},
+  ]) {
+    const revoked = logic.reduceControlProfileStatus(active, status);
+    assert.equal(revoked.acknowledged, false);
+    assert.equal(revoked.invalidated, true);
+    assert.equal(revoked.effectiveProfile, null);
+  }
+});
+
+test('zero maximum brake pressure disables analog, service, and hard brake scalars', () => {
+  const base = {
+    gamepad: {steering: 0.5, throttle: 0.5, brake: 1},
+    selectedGear: 'D',
+    limits: {maxThrottle: 0.05, maxBrakePressureBar: 0,
+      serviceBrakePressureBar: 0, hardBrakePressureBar: 0, maxSteeringDeg: 3},
+    steeringFullScaleDeg: 30,
+  };
+  for (const keyState of [{}, {service_brake: true}, {hard_brake: true}]) {
+    const control = logic.deriveControl({...base, keyState});
+    assert.equal(control.throttle, 0);
+    assert.equal(control.brake, 0);
+    assert.equal(control.steering, 0.05);
+  }
+});
+
+test('ESTOP presentation distinguishes local and vehicle telemetry states', () => {
+  assert.deepEqual(logic.deriveEstopPresentation(false, false), {
+    kind: 'none', visible: false, severity: '', banner: '', alert: '',
+  });
+
+  const localPending = logic.deriveEstopPresentation(true, false);
+  assert.equal(localPending.kind, 'local_pending');
+  assert.equal(localPending.visible, true);
+  assert.equal(localPending.severity, 'critical');
+  assert.match(localPending.banner, /等待车端遥测确认/);
+
+  const localConfirmed = logic.deriveEstopPresentation(true, true);
+  assert.equal(localConfirmed.kind, 'local_confirmed');
+  assert.equal(localConfirmed.severity, 'critical');
+  assert.match(localConfirmed.banner, /已由车端遥测确认/);
+
+  const vehicleOnly = logic.deriveEstopPresentation(false, true);
+  assert.equal(vehicleOnly.kind, 'vehicle_only');
+  assert.equal(vehicleOnly.visible, true);
+  assert.equal(vehicleOnly.severity, 'critical');
+  assert.match(vehicleOnly.banner, /不是由本页面请求/);
+
+  assert.equal(logic.deriveEstopPresentation(false, false).visible, false);
+});
+
+test('peer and channel identity gates reject stale lifecycle callbacks', () => {
+  const oldPeer = {};
+  const currentPeer = {};
+  const oldChannel = {};
+  const currentChannel = {};
+
+  assert.equal(logic.isCurrentPeer(currentPeer, oldPeer), false);
+  assert.equal(logic.isCurrentPeer(currentPeer, currentPeer), true);
+  assert.equal(
+      logic.isCurrentControlChannel(currentPeer, oldPeer, currentChannel, oldChannel),
+      false);
+  assert.equal(
+      logic.isCurrentControlChannel(currentPeer, currentPeer, currentChannel, oldChannel),
+      false);
+  assert.equal(
+      logic.isCurrentControlChannel(currentPeer, currentPeer, currentChannel, currentChannel),
+      true);
+
+  let acceptedCallbacks = 0;
+  const applyCallback = (callbackPeer, callbackChannel) => {
+    if (!logic.isCurrentControlChannel(
+        currentPeer, callbackPeer, currentChannel, callbackChannel)) return false;
+    acceptedCallbacks += 1;
+    return true;
+  };
+  assert.equal(applyCallback(oldPeer, oldChannel), false);
+  assert.equal(applyCallback(currentPeer, oldChannel), false);
+  assert.equal(acceptedCallbacks, 0);
+  assert.equal(applyCallback(currentPeer, currentChannel), true);
+  assert.equal(acceptedCallbacks, 1);
+});
+
+test('latest intent supersedes ordinary prepared commands but never an ESTOP', () => {
+  const ordinary = logic.controlSnapshot({gear: 'D', steering: 0, throttle: 0.1, brake: 0, estop: false});
+  assert.equal(logic.controlIntentSuperseded(ordinary, {...ordinary, throttle: 0}), true);
+  assert.equal(logic.controlIntentSuperseded(ordinary, ordinary), false);
+  const estop = logic.controlSnapshot({...ordinary, estop: true});
+  assert.equal(logic.controlIntentSuperseded(estop, {...ordinary, throttle: 0}), false);
+});
+
+test('every prepared browser command has exactly one named terminal outcome', () => {
+  assert.equal(logic.shouldLogControlOutcome('prepared'), false);
+  assert.equal(logic.shouldLogControlOutcome('forwarded'), false);
+  assert.equal(logic.shouldLogControlOutcome('superseded'), true);
+  assert.equal(logic.shouldLogControlOutcome('post_prepare_link_changed'), true);
+  assert.equal(logic.shouldLogControlOutcome('post_prepare_vcu_not_ready'), true);
+  assert.throws(() => logic.shouldLogControlOutcome('delivered'), /unknown control outcome/);
+  let metrics = logic.createControlOutcomeMetrics();
+  let sequence = 10;
+  for (const outcome of logic.CONTROL_OUTCOMES) {
+    metrics = logic.reduceControlOutcome(metrics, 'prepared', sequence);
+    assert.equal(logic.controlOutcomesBalanced(metrics), false);
+    metrics = logic.reduceControlOutcome(metrics, outcome, sequence);
+    assert.equal(logic.controlOutcomesBalanced(metrics), true);
+    sequence += 1;
+  }
+  assert.deepEqual(metrics, {
+    prepared: 4,
+    forwarded: 1,
+    superseded: 1,
+    post_prepare_link_changed: 1,
+    post_prepare_vcu_not_ready: 1,
+    last_prepared_seq: 13,
+    last_forwarded_seq: 10,
+  });
+  assert.throws(
+      () => logic.reduceControlOutcome(metrics, 'forwarded', 13),
+      /does not match/);
+});
+
+test('VCU reducer retains only authorized convergence waits and resets terminal or adapter loss', () => {
+  assert.equal(logic.adapterReady({state: 'unsupported'}), true);
+  assert.equal(logic.adapterReady({state: 'fault'}), null);
+  assert.equal(logic.adapterReady({state: 'ready'}, false), false);
+  assert.equal(logic.drivingReady(readyVcu), true);
+  assert.equal(logic.drivingReady({...readyVcu, adapter_ready: false}), false);
+
+  assert.deepEqual(
+      logic.transitionVcuState(true, {...readyVcu, state: 'wait_gear', ready: false}),
+      {everReady: true, resetInput: false, retainedWait: true});
+  assert.deepEqual(
+      logic.transitionVcuState(true, {...readyVcu, state: 'wait_actuator_modes', ready: false}),
+      {everReady: true, resetInput: false, retainedWait: true});
+  assert.equal(logic.transitionVcuState(true, {...readyVcu, state: 'fault', ready: false}).resetInput, true);
+  assert.equal(logic.transitionVcuState(true, {...readyVcu, adapter_ready: false}).resetInput, true);
+  assert.equal(logic.transitionVcuState(false, readyVcu).everReady, true);
+});
+
+if (failed > 0) {
+  console.error(`${failed} of ${passed + failed} control logic tests failed`);
+  process.exitCode = 1;
+} else {
+  console.log(`${passed} control logic tests passed`);
+}

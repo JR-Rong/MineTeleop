@@ -43,6 +43,8 @@ struct CanFrame {
 
 struct Command {
   int gear{1};
+  double vehicle_speed_request_kph{0.0};
+  bool vehicle_speed_request_valid{false};
   std::array<double, kMotorCount> motor_torque_nm{};
   std::array<double, kMotorCount> motor_speed_rpm{};
   std::array<double, kSteeringAxisCount> steering_angle_deg{};
@@ -122,11 +124,13 @@ class ParallelController {
   [[nodiscard]] bool disarmed() const;
   [[nodiscard]] bool handshake_requested() const;
   [[nodiscard]] bool parking_ready() const;
+  [[nodiscard]] bool physical_emergency_latched() const;
   [[nodiscard]] bool feedback_complete() const;
   [[nodiscard]] const Feedback& feedback() const;
 
  private:
   void advance_state();
+  bool begin_arming_emergency_disarm();
   void enter(State state);
 
   Command desired_{};
@@ -135,6 +139,7 @@ class ParallelController {
   State state_{State::Standby};
   int initial_frame_count_{0};
   bool emergency_stop_{false};
+  bool physical_emergency_latched_{false};
   std::uint64_t receive_generation_{0};
   std::uint64_t state_entry_generation_{0};
   std::uint64_t handshake_generation_{0};

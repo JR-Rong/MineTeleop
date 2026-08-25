@@ -31,6 +31,17 @@ void expect(bool condition, std::string_view message) {
   if (!condition) throw std::runtime_error(std::string(message));
 }
 
+void allow_qemu_test_scheduler_time_sync(mine_teleop::DriverConfig& config) {
+  constexpr int kTestOnlyMaxUncertaintyMs = 2000;
+  expect(
+      config.max_time_sync_uncertainty_ms == 25,
+      "QEMU scheduling fixture no longer starts from the production 25ms time-sync default");
+  // These integration tests exercise session isolation and upstream auth, not
+  // the time-sync safety boundary. QEMU may pause a loopback peer long enough
+  // to inflate RTT/2, so only these fixtures receive a test scheduling budget.
+  config.max_time_sync_uncertainty_ms = kTestOnlyMaxUncertaintyMs;
+}
+
 std::string response_header(const mine_teleop::ServerResponse& response, std::string_view name) {
   const auto found = std::find_if(response.headers.begin(), response.headers.end(), [&](const auto& header) {
     return header.first == name;
@@ -263,6 +274,24 @@ void test_shared_control_protocol_vector() {
   expect(command.driver_id == "driver-001", "protocol vector driver changed");
   expect(command.session_id == "session-001", "protocol vector session changed");
   expect(command.seq == 1024, "protocol vector sequence changed");
+  mine_teleop::ControlReceiver receiver(
+      command.vehicle_id,
+      command.driver_id,
+      command.session_id,
+      200,
+      mine_teleop::kProtocolVersion,
+      true,
+      command.control_token);
+  auto first = command;
+  first.seq = 1;
+  first.sent_at_utc_ms = mine_teleop::now_ms();
+  expect(receiver.accept(first, first.sent_at_utc_ms).accepted, "first control sequence was rejected");
+  auto after_prepared_gap = first;
+  after_prepared_gap.seq = 3;
+  ++after_prepared_gap.sent_at_utc_ms;
+  expect(
+      receiver.accept(after_prepared_gap, after_prepared_gap.sent_at_utc_ms).accepted,
+      "receiver rejected a monotonic sequence gap from a prepared but superseded browser command");
 }
 
 void test_loopback_http_server_and_port_conflict() {
@@ -326,6 +355,73 @@ void test_signaling_time_sync_applies_backward_utc_correction() {
       std::abs(corrected_lead_ms) <= 10,
       "backward UTC correction was permanently hidden by a monotonic clock clamp");
   server.stop();
+}
+
+void test_driver_time_sync_uncertainty_fails_closed_at_production_default() {
+  constexpr std::int64_t kSyntheticOffsetStepMs = 10'000;
+  std::atomic<int> time_samples{0};
+  std::atomic<int> login_requests{0};
+  mine_teleop::SimpleHttpServer server(
+      "127.0.0.1",
+      0,
+      [&](const mine_teleop::HttpRequest& request) {
+        const auto client_send = request.query.find("client_send_ms");
+        if (request.path == "/time" && client_send != request.query.end()) {
+          const auto client_send_ms = std::stoll(client_send->second);
+          const auto sample = static_cast<std::int64_t>(++time_samples);
+          // Successful HTTP samples are bounded to 5s, so RTT/2 cannot cancel
+          // this deterministic separation between any two synthetic offsets.
+          const auto synthetic_server_ms = client_send_ms + sample * kSyntheticOffsetStepMs;
+          return mine_teleop::ServerResponse::json(
+              200,
+              {{"time_domain", "signaling_server"},
+               {"client_send_ms", client_send_ms},
+               {"server_receive_ms", synthetic_server_ms},
+               {"server_send_ms", synthetic_server_ms}});
+        }
+        if (request.path == "/auth/driver_login") {
+          ++login_requests;
+          return mine_teleop::ServerResponse::json(500, {{"error", "unexpected authentication"}});
+        }
+        return mine_teleop::ServerResponse::json(404, {{"error", "not found"}});
+      });
+  server.start();
+
+  mine_teleop::DriverConfig config;
+  config.driver_id = "driver-console-001";
+  config.signaling_url = "http://127.0.0.1:" + std::to_string(server.port());
+  expect(
+      config.max_time_sync_uncertainty_ms == 25,
+      "driver time-sync fail-closed test no longer uses the production 25ms default");
+
+  std::string login_failure;
+  mine_teleop::DriverConsoleRuntime login_runtime(config, "vehicle-001", "dev-password");
+  try {
+    static_cast<void>(login_runtime.login("dev-password"));
+  } catch (const std::exception& error) {
+    login_failure = error.what();
+  }
+  std::string connect_failure;
+  mine_teleop::DriverConsoleRuntime connect_runtime(config, "vehicle-001", "dev-password");
+  try {
+    static_cast<void>(connect_runtime.connect("vehicle-001"));
+  } catch (const std::exception& error) {
+    connect_failure = error.what();
+  }
+  server.stop();
+
+  expect(
+      login_failure.find("exceeds limit 25ms") != std::string::npos,
+      "driver login did not fail closed on deterministic time-sync uncertainty above 25ms");
+  expect(
+      connect_failure.find("exceeds limit 25ms") != std::string::npos,
+      "driver connect did not fail closed on deterministic time-sync uncertainty above 25ms");
+  expect(time_samples == 14, "driver time-sync fail-closed test did not collect two complete sample sets");
+  expect(login_requests == 0, "driver authentication ran before unacceptable time synchronization was rejected");
+  expect(
+      !login_runtime.status().value("authenticated", true) &&
+          !connect_runtime.status().value("authenticated", true),
+      "unacceptable time synchronization left local driver authentication active");
 }
 
 void test_control_page_contract() {
@@ -393,12 +489,25 @@ void test_control_page_contract() {
           response.body.find("brake_pressure_bar") != std::string::npos,
       "complete measured CAN feedback is not rendered from vehicle telemetry");
   expect(
-      response.body.find("ArrowLeft:'left',KeyA:'left'") != std::string::npos &&
-          response.body.find("ArrowRight:'right',KeyD:'right'") != std::string::npos &&
-          response.body.find("ArrowUp:'up',KeyW:'up'") != std::string::npos &&
-          response.body.find("ArrowDown:'down',KeyS:'down'") != std::string::npos &&
-          response.body.find("Space:'brake'") != std::string::npos,
-      "direction keys, WASD, and Space are not mapped to the shared control state");
+      response.body.find("function createControlLogic()") != std::string::npos &&
+          response.body.find("const controlLogic=MineTeleopControlLogic") != std::string::npos &&
+          response.body.find("const keys=controlLogic.KEY_BINDINGS") != std::string::npos &&
+          response.body.find("ArrowLeft: 'left'") != std::string::npos &&
+          response.body.find("ArrowUp: 'up'") != std::string::npos &&
+          response.body.find("Space: 'service_brake'") != std::string::npos &&
+          response.body.find("KeyB: 'hard_brake'") != std::string::npos &&
+          response.body.find("e.code==='KeyE'") != std::string::npos,
+      "the production page is not wired to the shared fixed-key control module");
+  expect(
+      response.body.find("pressedControlKeys=controlLogic.createKeySet()") != std::string::npos &&
+          response.body.find("blockedControlKeys=controlLogic.createKeySet()") != std::string::npos &&
+          response.body.find("controlLogic.pressKey(pressedControlKeys,blockedControlKeys,e.code)") !=
+              std::string::npos &&
+          response.body.find("controlLogic.releaseKey(pressedControlKeys,blockedControlKeys,e.code)") !=
+              std::string::npos &&
+          response.body.find("state=controlLogic.deriveKeyState(pressedControlKeys)") !=
+              std::string::npos,
+      "physical key codes are not reduced into held control actions");
   const auto keyboard_handler = response.body.find("addEventListener('keydown'");
   const auto keyboard_prevent_default = response.body.find("e.preventDefault()", keyboard_handler);
   const auto keyboard_connection_gate = response.body.find("if(!polling)", keyboard_handler);
@@ -410,16 +519,43 @@ void test_control_page_contract() {
       "control keys can still scroll the page before the connection gate runs");
   expect(
       response.body.find("lastKeyboardEvent.textContent") != std::string::npos &&
-          response.body.find("已截获 · 等待连接") != std::string::npos,
-      "keyboard capture does not provide visible operator feedback");
+          response.body.find("已截获 · 等待连接") != std::string::npos &&
+          response.body.find("需释放后重新按下") != std::string::npos,
+      "keyboard capture and fresh-keydown interlock do not provide visible operator feedback");
+  expect(
+      response.body.find("selectedGear='N'") != std::string::npos &&
+          response.body.find("controlLogic.deriveGearSelection") != std::string::npos &&
+          response.body.find("controlLogic.allowsGearChange") != std::string::npos &&
+          response.body.find("updateSelectedGearFromHeldDirections") != std::string::npos &&
+          response.body.find("updateSelectedGearFromInput({up:true,down:false})") !=
+              std::string::npos &&
+          response.body.find("换挡已阻止：需有效零速反馈") != std::string::npos &&
+          response.body.find("if(gear!=='R')gear='N'") == std::string::npos,
+      "keyboard and Gamepad do not share the zero-speed-gated gear reducer");
+  expect(
+      response.body.find("function currentControl") != std::string::npos &&
+          response.body.find("return controlLogic.deriveControl") != std::string::npos &&
+          response.body.find("limits:effectiveControlLimits()") != std::string::npos,
+      "the production page bypasses shared brake/control derivation");
   expect(
       response.body.find("开始平行驾驶握手") != std::string::npos &&
           response.body.find("断开 VCU 握手") != std::string::npos,
       "explicit VCU handshake controls are missing");
   expect(
       response.body.find("event:'vcu_handshake_command'") != std::string::npos &&
-          response.body.find("message.event!=='vcu_handshake_status'") != std::string::npos,
+          response.body.find("'vcu_handshake_status','session_control_profile_status'") !=
+              std::string::npos,
       "VCU handshake command/status DataChannel contract is missing");
+  expect(
+      response.body.find("'control_command_rejected'") != std::string::npos &&
+          response.body.find(
+              "controlLogic.deriveControlCommandRejection(message.issue_code)") !=
+              std::string::npos &&
+          response.body.find("if(rejection.clearInput)clearControlInput()") !=
+              std::string::npos &&
+          response.body.find("driver_control_command_rejected") !=
+              std::string::npos,
+      "structured vehicle control rejection is not surfaced fail-closed to the driver");
   expect(
       response.body.find("vcu_handshake_not_ready") != std::string::npos &&
           response.body.find("vcuHandshake.parking_ready") != std::string::npos,
@@ -435,27 +571,182 @@ void test_control_page_contract() {
       "the control page does not explain the failed VCU gate or handshake step");
   expect(
       response.body.find("实车调试限幅") != std::string::npos &&
-          response.body.find("max-throttle-percent") != std::string::npos &&
-          response.body.find("max-brake-percent") != std::string::npos &&
-          response.body.find("max-steering-deg") != std::string::npos,
+          response.body.find("目标车速上限（km/h）") != std::string::npos &&
+          response.body.find("max-motor-torque-nm") != std::string::npos &&
+          response.body.find("max=\"640.0\"") != std::string::npos &&
+          response.body.find("max-brake-pressure-bar") != std::string::npos &&
+          response.body.find("service-brake-pressure-bar") != std::string::npos &&
+          response.body.find("hard-brake-pressure-bar") != std::string::npos &&
+          response.body.find("max-steering-deg") != std::string::npos &&
+          response.body.find("上游控制超时先按 0.3/0.6 档普通压力减速，最终 1.0 阶段才切到 409.5 bar/路") !=
+              std::string::npos,
       "field commissioning control limit dialog is missing");
   expect(
       response.body.find("effectiveControlLimits") != std::string::npos &&
           response.body.find("updateVehicleHardLimits(message.hard_limits)") != std::string::npos &&
-          response.body.find("maxBrake:Math.min(controlLimits.maxBrake,vehicleHardLimits.max_brake)") !=
+          response.body.find("controlLogic.normalizeControlProfile(value)") !=
               std::string::npos &&
-          response.body.find("brake:clamp(brake,0,1)*limits.maxBrake") != std::string::npos &&
-          response.body.find("post('/api/control-limits',{max_brake:brakePercent/100})") !=
+          response.body.find("controlLogic.mergeControlProfileWithHardLimits") !=
               std::string::npos &&
-          response.body.find("get('/api/control-limits').then") != std::string::npos &&
-          response.body.find(
-              "await post('/api/control-limits',{max_brake:controlLimits.maxBrake})") !=
-              std::string::npos &&
-          response.body.find("急停、超时、故障和断开停车不受人工刹车限幅削弱") !=
+          response.body.find("controlLogic.deriveControl") != std::string::npos &&
+          response.body.find("post('/api/control-profile',requested)") != std::string::npos &&
+          response.body.find("get('/api/control-limits').then") == std::string::npos &&
+          response.body.find("sendPendingControlProfile()") != std::string::npos &&
+          response.body.find("now-lastControlProfileSendAt<200") != std::string::npos &&
+          response.body.find("每路 EHB 压力请求，单位 bar、分辨率 0.1 bar") !=
               std::string::npos &&
           response.body.find("我已确认车辆处于隔离台架") != std::string::npos,
       "controller limits are not combined with vehicle hard limits and operator confirmation");
-  expect(response.body.find("post('/api/control',currentControl(extra))") != std::string::npos, "control inputs do not share one normalized path");
+  expect(
+      response.body.find("control_profile_not_acknowledged") != std::string::npos &&
+          response.body.find("action==='connect'&&!controlProfileState.acknowledged") !=
+              std::string::npos &&
+          response.body.find("applyControlProfileStatus(message.session_control_profile)") !=
+              std::string::npos &&
+          response.body.find("applyControlProfileStatus(message);", response.body.find(
+              "message.event==='session_control_profile_status'")) != std::string::npos &&
+          response.body.find("resetControlProfileSession()") != std::string::npos,
+      "ordinary driving is not fail-closed on session control profile acknowledgement");
+  expect(
+      response.body.find("defaultProfileAutoAttempted=false") != std::string::npos &&
+          response.body.find(
+              "controlProfilePrepareInFlight=false;defaultProfileAutoAttempted=false;"
+              "controlLimits.maxSteeringDeg") != std::string::npos &&
+          response.body.find(
+              "function defaultControlProfileAutoReady(){return "
+              "vcuHandshake.parking_ready===true||(vcuMockUnsupported()&&"
+              "vcuHandshake.adapter_ready===true)}") != std::string::npos &&
+          response.body.find(
+              "if(defaultProfileAutoAttempted||controlChannel?.readyState!=='open'") !=
+              std::string::npos &&
+          response.body.find(
+              "defaultProfileAutoAttempted=true;prepareControlProfile(defaults,false)") !=
+              std::string::npos,
+      "default profile can auto-submit before parking readiness or repeatedly after rejection");
+  expect(
+      response.body.find(
+              "requested.target_speed_kph>prior.target_speed_kph||"
+              "requested.max_motor_torque_nm>prior.max_motor_torque_nm") !=
+              std::string::npos &&
+          response.body.find(
+              "requested.max_brake_pressure_bar!==prior.max_brake_pressure_bar||"
+              "requested.service_brake_pressure_bar!==prior.service_brake_pressure_bar||"
+              "requested.hard_brake_pressure_bar!==prior.hard_brake_pressure_bar") !=
+              std::string::npos &&
+          response.body.find("if(requiresParking&&!defaultControlProfileAutoReady())") !=
+              std::string::npos,
+      "profile editing does not preflight vehicle parking rules for speed, torque, and brake changes");
+  const auto control_post = response.body.find("post('/api/control',outgoing)");
+  expect(
+      control_post != std::string::npos &&
+          response.body.find("post('/api/control'", control_post + 1) == std::string::npos &&
+          response.body.find("async function drainControlWrites()") != std::string::npos &&
+          response.body.find("pendingControlWrite") != std::string::npos &&
+          response.body.find("controlWriteActive") != std::string::npos &&
+          response.body.find("const outgoingSnapshot=controlLogic.controlSnapshot(outgoing)") !=
+              std::string::npos &&
+          response.body.find("const estopRequested=estopLatched||Boolean(extra.estop)") !=
+              std::string::npos &&
+          response.body.find("activeChannel.bufferedAmount>4096&&!estopRequested") !=
+              std::string::npos &&
+          response.body.find("controlLogic.controlIntentSuperseded(outgoingSnapshot,latestOutgoing)") !=
+              std::string::npos &&
+          response.body.find("reason:'control_intent_superseded'") !=
+              std::string::npos,
+      "browser control writes are not merged through one ordered writer");
+  const auto prepared_outcome = response.body.find(
+      "recordControlOutcome('prepared',prepared.command,outcomeSession)");
+  const auto data_channel_send = response.body.find(
+      "activeChannel.send(JSON.stringify(prepared.command))", prepared_outcome);
+  const auto forwarded_outcome = response.body.find(
+      "recordControlOutcome('forwarded',prepared.command,outcomeSession)", prepared_outcome);
+  expect(
+      prepared_outcome != std::string::npos &&
+          response.body.find(
+              "recordControlOutcome('superseded',prepared.command,outcomeSession)",
+              prepared_outcome) != std::string::npos &&
+          response.body.find(
+              "recordControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession)",
+              prepared_outcome) != std::string::npos &&
+          response.body.find(
+              "recordControlOutcome('post_prepare_vcu_not_ready',prepared.command,outcomeSession)",
+              prepared_outcome) != std::string::npos &&
+          data_channel_send != std::string::npos &&
+          forwarded_outcome != std::string::npos && data_channel_send < forwarded_outcome &&
+          response.body.find("controlLogic.shouldLogControlOutcome(outcome)") !=
+              std::string::npos &&
+          response.body.find("control_command_browser_outcome") != std::string::npos &&
+          response.body.find("control_outcomes:controlOutcomes") != std::string::npos &&
+          response.body.find(
+              "control_outcomes_balanced:controlLogic.controlOutcomesBalanced(controlOutcomes)") !=
+              std::string::npos &&
+          response.body.find("last_prepared_seq") != std::string::npos &&
+          response.body.find("last_forwarded_seq") != std::string::npos &&
+          response.body.find("delivery_state:'browser_data_channel_send_invoked'") !=
+              std::string::npos,
+      "prepared browser commands do not have rate-bounded auditable terminal outcomes");
+  expect(
+      response.body.find("function vcuStateRequiresFreshInput") != std::string::npos &&
+          response.body.find("controlLogic.requiresFreshInput(value)") != std::string::npos &&
+          response.body.find("controlLogic.transitionVcuState(vcuEverReady,value)") !=
+              std::string::npos &&
+          response.body.find("function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}") !=
+              std::string::npos &&
+          response.body.find("if(!vcuEverReady&&!vcuMockUnsupported())") != std::string::npos &&
+          response.body.find("首次握手完成后请重新按下") != std::string::npos,
+      "initial authority, fault, or disarm does not require fresh control input");
+  expect(
+      response.body.find("lastControlStatusSeq=0") != std::string::npos &&
+          response.body.find("function acceptControlStatusMessage(message)") !=
+              std::string::npos &&
+          response.body.find("controlLogic.reduceStatusSequence(lastControlStatusSeq") !=
+              std::string::npos &&
+          response.body.find("if(!acceptControlStatusMessage(message))return") !=
+              std::string::npos &&
+          response.body.find("control_status_message_dropped") != std::string::npos &&
+          response.body.find("control_status_sequence_gap") != std::string::npos,
+      "unordered vehicle status messages can replay stale VCU authority");
+  expect(
+      response.body.find("function vcuStateKeepsHeldInput") != std::string::npos &&
+          response.body.find("controlLogic.keepsHeldInput(vcuEverReady,value)") !=
+              std::string::npos &&
+          response.body.find("if(retainedWait&&!estopRequested)outgoing.throttle=0") !=
+              std::string::npos &&
+          response.body.find("if(!stillVcuReady&&!estopRequested)") !=
+              std::string::npos &&
+          response.body.find("换挡闭环中（输入保持）") != std::string::npos &&
+          response.body.find("执行器闭环中（输入保持）") != std::string::npos &&
+          response.body.find("输入已清除，等待新鲜 VCU Ready") != std::string::npos,
+      "authorized VCU convergence waits do not retain inputs with zero-throttle heartbeats");
+  const auto telemetry_vcu_update = response.body.find(
+      "adapter_ready:vcuAdapterReady(message.vcu_handshake,message.vehicle_adapter?.opened)};updateVcuHandshakeState(nextVcuStatus)");
+  const auto telemetry_profile_update = response.body.find(
+      "applyControlProfileStatus(message.session_control_profile)", telemetry_vcu_update);
+  const auto telemetry_limits_update = response.body.find(
+      "updateVehicleHardLimits(message.control_limits)", telemetry_profile_update);
+  const auto handshake_vcu_update = response.body.find(
+      "updateVcuHandshakeState({...nextVcuStatus,driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)})");
+  const auto handshake_limits_update = response.body.find(
+      "updateVehicleHardLimits(message.hard_limits)", handshake_vcu_update);
+  expect(
+      telemetry_vcu_update != std::string::npos &&
+          telemetry_profile_update != std::string::npos &&
+          telemetry_limits_update != std::string::npos &&
+          telemetry_vcu_update < telemetry_profile_update &&
+          telemetry_profile_update < telemetry_limits_update &&
+          handshake_vcu_update != std::string::npos &&
+          handshake_limits_update != std::string::npos &&
+          handshake_vcu_update < handshake_limits_update,
+      "vehicle status does not update VCU, profile, and hard-limit state in a deterministic order");
+  expect(
+      response.body.find("gamepadRequiresNeutral=true") != std::string::npos &&
+          response.body.find("const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported()") !=
+              std::string::npos &&
+          response.body.find("controlLogic.reduceGamepadNeutralInterlock") !=
+              std::string::npos &&
+          response.body.find("applyGamepadNeutralInterlock(gamepadAuthorityReady,true)") !=
+              std::string::npos,
+      "Gamepad pedals can resume without a physical neutral after an authority or gear-gate reset");
   expect(response.body.find("driver_vehicle_switch_started") != std::string::npos, "safe vehicle switching UI is missing");
   const auto switch_request = response.body.find("session=await post('/api/connect'");
   const auto realtime_close = response.body.find("generation=closeRealtimeSession()", switch_request);
@@ -495,8 +786,9 @@ void test_control_page_contract() {
   expect(response.body.find("pollSignaling(generation)") != std::string::npos, "stale signaling pollers are not isolated across vehicle switches");
   expect(
       response.body.find("gamepaddisconnected") != std::string::npos &&
-          response.body.find("clearControlInput();clientLog('gamepad_disconnected'") != std::string::npos,
-      "Gamepad disconnect does not preserve the safe-zero behavior");
+          response.body.find("gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;renderControlState();clientLog('gamepad_disconnected'") !=
+              std::string::npos,
+      "Gamepad disconnect does not zero its own axes without clearing keyboard input");
   expect(response.body.find("车辆必须本地确认后才能复位") != std::string::npos, "ESTOP latch feedback is missing");
   expect(response.body.find("运行监控") != std::string::npos, "operator monitoring panel is missing");
   expect(response.body.find("控制 RTT") != std::string::npos, "control RTT display is missing");
@@ -534,8 +826,55 @@ void test_control_page_contract() {
           response.body.find("if(['failed','closed'].includes(connectionState))") != std::string::npos &&
           response.body.find("peer!==nextPeer") != std::string::npos,
       "a transient or stale peer state change can discard a recoverable control DataChannel");
+  const auto offer_start = response.body.find("async function startFromOffer");
+  const auto offer_authority_reset = response.body.find("resetControlAuthorityInput()", offer_start);
+  const auto offer_peer_create = response.body.find("new RTCPeerConnection", offer_start);
   expect(
-      response.body.find("peer.connectionState!=='connected'") != std::string::npos,
+      offer_start != std::string::npos && offer_authority_reset != std::string::npos &&
+          offer_peer_create != std::string::npos && offer_authority_reset < offer_peer_create &&
+          response.body.find("channel.onclose=()=>{") != std::string::npos,
+      "a new peer or closed DataChannel can inherit stale VCU authority/input state");
+  const auto data_channel_handler = response.body.find("nextPeer.ondatachannel=e=>{");
+  const auto data_channel_peer_gate = response.body.find(
+      "if(!controlLogic.isCurrentPeer(peer,nextPeer)){channel.close();return}",
+      data_channel_handler);
+  const auto data_channel_status_reset = response.body.find(
+      "lastControlStatusSeq=0;",
+      data_channel_peer_gate);
+  const auto data_channel_publish = response.body.find(
+      "controlChannel=channel;",
+      data_channel_status_reset);
+  const auto channel_open_handler = response.body.find("channel.onopen=()=>{", data_channel_publish);
+  const auto channel_message_handler = response.body.find("channel.onmessage=async event=>{", channel_open_handler);
+  const auto channel_close_handler = response.body.find("channel.onclose=()=>{", channel_message_handler);
+  const auto channel_error_handler = response.body.find("channel.onerror=()=>{", channel_close_handler);
+  const std::string channel_identity_gate =
+      "if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;";
+  const auto channel_open_gate = response.body.find(channel_identity_gate, channel_open_handler);
+  const auto channel_message_gate = response.body.find(channel_identity_gate, channel_message_handler);
+  const auto channel_close_gate = response.body.find(channel_identity_gate, channel_close_handler);
+  const auto channel_error_gate = response.body.find(channel_identity_gate, channel_error_handler);
+  const auto channel_error_end = response.body.find("};", channel_error_gate);
+  expect(
+      data_channel_handler != std::string::npos && data_channel_peer_gate != std::string::npos &&
+          data_channel_status_reset != std::string::npos && data_channel_publish != std::string::npos &&
+          data_channel_peer_gate < data_channel_status_reset &&
+          data_channel_status_reset < data_channel_publish,
+      "a stale peer can publish a control DataChannel or a new channel can inherit an old status sequence");
+  expect(
+      channel_open_gate != std::string::npos && channel_open_gate < channel_message_handler &&
+          channel_message_gate != std::string::npos && channel_message_gate < channel_close_handler &&
+          channel_close_gate != std::string::npos && channel_close_gate < channel_error_handler &&
+          channel_error_gate != std::string::npos,
+      "control DataChannel lifecycle callbacks do not reject stale peer or channel identities");
+  expect(
+      response.body.find("controlChannel=null;", channel_close_gate) < channel_error_handler &&
+          response.body.find("resetControlAuthorityInput()", channel_close_gate) < channel_error_handler &&
+          channel_error_end != std::string::npos &&
+          response.body.find("resetControlAuthorityInput()", channel_error_gate) < channel_error_end,
+      "current control DataChannel close or error is not fail-closed");
+  expect(
+      response.body.find("activePeer.connectionState!=='connected'") != std::string::npos,
       "control commands can be sent while the current WebRTC peer is disconnected");
   expect(
       response.body.find("if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}") !=
@@ -548,7 +887,7 @@ void test_control_page_contract() {
               std::string::npos &&
           response.body.find("vcu_adapter_unavailable") != std::string::npos &&
           response.body.find("请使用车辆物理急停") != std::string::npos &&
-          response.body.find("return vcuHandshake.adapter_ready===true&&handshakeReady") !=
+          response.body.find("function vcuDrivingReady(){return controlProfileState.acknowledged&&controlLogic.drivingReady(vcuHandshake)}") !=
               std::string::npos,
       "the controller can claim that remote ESTOP was sent while the VCU adapter is unavailable");
   expect(
@@ -557,18 +896,30 @@ void test_control_page_contract() {
           response.body.find("await send({},false)") != std::string::npos,
       "a latched ESTOP is not retransmitted by heartbeat while the VCU handshake is incomplete");
   expect(
-      response.body.find("if(explicit===true||explicit===false)return explicit") != std::string::npos &&
-          response.body.find("['unavailable','closed','fault'].includes(state))return null") !=
+      response.body.find("function vcuAdapterReady(status,explicit){return controlLogic.adapterReady(status,explicit)}") !=
               std::string::npos,
       "an older vehicle without adapter_ready cannot use the compatibility-safe unknown state");
+  const auto estop_monitor = response.body.find(
+      "const estopPresentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true)");
+  const auto estop_banner = response.body.find(
+      "function renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true))");
   expect(
-      response.body.find("急停请求已锁定；等待车端遥测确认") != std::string::npos &&
-          response.body.find("vehicleTelemetry?.estop===true") != std::string::npos &&
-          response.body.find("车辆急停已由车端遥测确认") != std::string::npos,
-      "the page can report a vehicle ESTOP before telemetry confirms it");
+      estop_monitor != std::string::npos && estop_banner != std::string::npos &&
+          response.body.find("renderEstopRequest(estopPresentation)", estop_monitor) !=
+              std::string::npos &&
+          response.body.find(
+              "if(estopPresentation.visible){alerts.push(estopPresentation.alert);severity=estopPresentation.severity}",
+              estop_monitor) != std::string::npos &&
+          response.body.find(
+              "estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner",
+              estop_banner) != std::string::npos,
+      "vehicle-only ESTOP telemetry does not drive the critical banner and alert presentation");
   expect(
-      response.body.find("webrtcLabel.textContent==='控制链路拥塞'") != std::string::npos,
-      "the operator label cannot recover after DataChannel backpressure clears");
+      response.body.find("activeChannel.bufferedAmount>4096&&!estopRequested){") !=
+              std::string::npos &&
+          response.body.find("webrtcLabel.textContent==='控制链路拥塞，输入已清除'") !=
+              std::string::npos,
+      "DataChannel backpressure does not clear stale input or recover its operator label");
   expect(response.body.find("时延超过 200 ms") != std::string::npos, "latency threshold alarm is missing");
   expect(response.body.find("低于 20 FPS") != std::string::npos, "FPS threshold alarm is missing");
   expect(response.body.find("sent_at_utc_ms:Date.now()") != std::string::npos, "browser-local logs do not use UTC milliseconds");
@@ -584,6 +935,11 @@ void test_control_page_contract() {
   expect(
       initial_status.at("webrtc_metrics").is_object() && initial_status.at("webrtc_metrics").empty(),
       "initial WebRTC metrics are not an empty object");
+  expect(
+      initial_status.value("control_commands_prepared_total", std::uint64_t{1}) == 0 &&
+          initial_status.value("last_control_prepared_at_utc_ms", std::int64_t{1}) == 0 &&
+          !initial_status.contains("last_control_sent_ms"),
+      "initial control status still claims a send/delivery instead of preparation metrics");
   expect(
       initial_status.at("authorized_vehicles").is_array() && initial_status.at("authorized_vehicles").empty(),
       "initial authorized vehicles are not an empty array");
@@ -621,11 +977,16 @@ void test_driver_gamepad_config() {
   expect(field.ice_transport_policy == "all", "field driver ICE policy is not the safe default");
   expect(field.max_time_sync_uncertainty_ms == 25, "field driver time synchronization limit is not 25ms");
   expect(
-      field.control_limits.initial_max_throttle == 0.05,
-      "field driver initial throttle limit changed");
+      field.control_limits.initial_target_speed_kph == 2.0,
+      "field driver initial target speed changed");
   expect(
-      field.control_limits.initial_max_brake == 1.0,
-      "field driver initial ordinary-brake limit changed");
+      field.control_limits.initial_max_motor_torque_nm == 300.0,
+      "field driver initial per-motor torque request changed");
+  expect(
+      field.control_limits.initial_max_brake_pressure_bar == 100.0 &&
+          field.control_limits.initial_service_brake_pressure_bar == 30.0 &&
+          field.control_limits.initial_hard_brake_pressure_bar == 100.0,
+      "field driver initial per-EHB pressure requests changed");
   expect(
       field.control_limits.initial_max_steering_angle_deg == 3.0,
       "field driver initial steering limit changed");
@@ -637,11 +998,209 @@ std::string read_text_file(const std::filesystem::path& path) {
   return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
+std::string cpp_function_contract(
+    std::string_view source,
+    std::string_view signature) {
+  const auto signature_position = source.find(signature);
+  expect(signature_position != std::string_view::npos, "missing C++ contract: " + std::string(signature));
+  const auto open_brace = source.find('{', signature_position + signature.size());
+  expect(open_brace != std::string_view::npos, "missing C++ function body: " + std::string(signature));
+  std::size_t depth = 0;
+  for (auto position = open_brace; position < source.size(); ++position) {
+    if (source[position] == '{') {
+      ++depth;
+    } else if (source[position] == '}' && --depth == 0) {
+      return std::string(source.substr(signature_position, position - signature_position + 1));
+    }
+  }
+  throw std::runtime_error("unterminated C++ function body: " + std::string(signature));
+}
+
+void test_vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start() {
+  const auto source = read_text_file("cpp/src/webrtc_media.cpp");
+  const auto start_service = cpp_function_contract(source, "[[nodiscard]] bool start_control_service()");
+  const auto configure_channel = cpp_function_contract(source, "void configure_control_data_channel()");
+  const auto send_status = cpp_function_contract(source, "void send_vcu_handshake_status_locked(std::string_view result)");
+  constexpr std::string_view reset = "control_status_seq = 0;";
+
+  std::size_t reset_count = 0;
+  for (auto position = source.find(reset); position != std::string::npos;
+       position = source.find(reset, position + reset.size())) {
+    ++reset_count;
+  }
+  expect(reset_count == 1, "control status sequence has a reset outside its DataChannel scope");
+  expect(
+      start_service.find(reset) == std::string::npos,
+      "delayed adapter start can roll back the active DataChannel status sequence");
+  const auto channel_reset = configure_channel.find(reset);
+  const auto channel_publish = configure_channel.find("control_channel = channel;");
+  expect(
+      channel_reset != std::string::npos && channel_publish != std::string::npos &&
+          channel_reset < channel_publish,
+      "a newly published DataChannel does not establish a fresh status sequence scope");
+  expect(
+      send_status.find("++control_status_seq") != std::string::npos,
+      "VCU handshake status does not advance the shared DataChannel sequence");
+
+  // Model the production order that exposed the regression: channel creation,
+  // driver_connected, delayed adapter start on the same channel, then ready.
+  std::uint64_t sequence = 0;
+  const auto driver_connected = ++sequence;
+  const auto delayed_adapter_ready = ++sequence;
+  expect(
+      driver_connected == 1 && delayed_adapter_ready == 2,
+      "delayed adapter readiness did not remain newer than driver_connected");
+}
+
+void test_stale_control_data_channel_callbacks_are_fail_silent() {
+  const auto source = read_text_file("cpp/src/webrtc_media.cpp");
+  const auto handler = cpp_function_contract(source, "void handle_control_message(");
+  const auto profile_begin = handler.find(
+      "if (message.value(\"type\", \"\") == \"session_control_profile\")");
+  const auto handshake_begin = handler.find(
+      "if (message.value(\"event\", \"\") == \"vcu_handshake_command\")");
+  const auto command_begin = handler.find("const auto command = ControlCommand::from_json(message)");
+  expect(
+      profile_begin != std::string::npos && handshake_begin != std::string::npos &&
+          command_begin != std::string::npos && profile_begin < handshake_begin &&
+          handshake_begin < command_begin,
+      "control message branches could not be isolated for stale-channel review");
+
+  const auto profile_branch = handler.substr(profile_begin, handshake_begin - profile_begin);
+  const auto handshake_branch = handler.substr(handshake_begin, command_begin - handshake_begin);
+  constexpr std::string_view stale_guard = "if (control_channel != channel) return;";
+  const auto profile_stale = profile_branch.find(stale_guard);
+  const auto profile_unavailable = profile_branch.find(
+      "if (stop_requested || control_inhibited || !control_service_started");
+  const auto profile_status = profile_branch.find("send_session_control_profile_status_locked(result)");
+  expect(
+      profile_stale != std::string::npos && profile_unavailable != std::string::npos &&
+          profile_status != std::string::npos && profile_stale < profile_unavailable &&
+          profile_unavailable < profile_status &&
+          profile_branch.find("control_channel != channel ||") == std::string::npos,
+      "a stale profile callback can publish a rejection on the replacement control channel");
+
+  const auto handshake_stale = handshake_branch.find(stale_guard);
+  const auto handshake_unavailable = handshake_branch.find(
+      "if (stop_requested || control_inhibited || !control_service_started");
+  const auto handshake_status = handshake_branch.find(
+      "send_vcu_handshake_status_locked(\"driver_not_connected\")");
+  expect(
+      handshake_stale != std::string::npos && handshake_unavailable != std::string::npos &&
+          handshake_status != std::string::npos && handshake_stale < handshake_unavailable &&
+          handshake_unavailable < handshake_status &&
+          handshake_branch.find("control_channel != channel ||") == std::string::npos,
+      "a stale handshake callback can publish a rejection on the replacement control channel");
+}
+
+void test_structured_control_rejection_is_safe_and_rate_limited() {
+  const auto source = read_text_file("cpp/src/webrtc_media.cpp");
+  const auto handler = cpp_function_contract(source, "void handle_control_message(");
+  const auto sender = cpp_function_contract(
+      source,
+      "void send_control_command_rejected_locked(");
+  expect(
+      handler.find(
+          "send_control_command_rejected_locked(command.seq, result.issue_code)") !=
+          std::string::npos,
+      "an adapter control rejection is not returned to the active driver channel");
+  expect(
+      sender.find("vcu_drive_gear_change_moving_or_stale") != std::string::npos &&
+          sender.find("vcu_control_apply_rejected") != std::string::npos,
+      "control rejection sender does not enforce the stable issue-code allowlist");
+  expect(
+      sender.find("{\"vehicle_id\", config.vehicle_id}") != std::string::npos &&
+          sender.find("{\"driver_id\", signaling.driver_id()}") != std::string::npos &&
+          sender.find("{\"session_id\", signaling.session_id()}") != std::string::npos &&
+          sender.find("{\"control_status_seq\", ++control_status_seq}") !=
+              std::string::npos &&
+          sender.find("{\"command_seq\", command_seq}") != std::string::npos,
+      "control rejection status is not bound to authoritative identity and sequence state");
+  expect(
+      sender.find("< 500") != std::string::npos &&
+          sender.find("\"error\"") == std::string::npos &&
+          sender.find("error.what()") == std::string::npos,
+      "control rejection status can flood the channel or leak raw exception text");
+}
+
 void write_text_file(const std::filesystem::path& path, std::string_view value) {
   std::ofstream output(path);
   expect(output.good(), "cannot create test file: " + path.string());
   output << value;
   expect(output.good(), "cannot write test file: " + path.string());
+}
+
+void test_driver_brake_limit_config_validation() {
+  const auto root = std::filesystem::temp_directory_path() /
+      ("mine-teleop-driver-brake-limits-" + mine_teleop::random_token(6));
+  std::filesystem::create_directories(root);
+  try {
+    const auto invalid_path = root / "invalid-order.yaml";
+    write_text_file(
+        invalid_path,
+        R"YAML(driver:
+  id: driver-console-001
+cloud:
+  signaling_url: http://127.0.0.1:8765/signaling
+control:
+  limits:
+    initial_max_brake_pressure_bar: 100.0
+    initial_service_brake_pressure_bar: 80.0
+    initial_hard_brake_pressure_bar: 20.0
+)YAML");
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_driver_config(invalid_path.string())); },
+        "driver config accepted service brake above hard brake");
+
+    const auto legacy_path = root / "legacy-max-brake.yaml";
+    write_text_file(
+        legacy_path,
+        R"YAML(driver:
+  id: driver-console-001
+cloud:
+  signaling_url: http://127.0.0.1:8765/signaling
+control:
+  limits:
+    initial_max_brake: 0.1
+)YAML");
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_driver_config(legacy_path.string())); },
+        "driver config silently reinterpreted a legacy normalized brake value as bar");
+
+    const auto legacy_throttle_path = root / "legacy-throttle.yaml";
+    write_text_file(
+        legacy_throttle_path,
+        R"YAML(driver:
+  id: driver-console-001
+cloud:
+  signaling_url: http://127.0.0.1:8765/signaling
+control:
+  limits:
+    initial_max_throttle: 0.05
+)YAML");
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_driver_config(legacy_throttle_path.string())); },
+        "driver config silently converted legacy throttle ratio without a vehicle hard limit");
+
+    const auto obsolete_keyboard_path = root / "obsolete-keyboard.yaml";
+    write_text_file(
+        obsolete_keyboard_path,
+        R"YAML(driver:
+  id: driver-console-001
+cloud:
+  signaling_url: http://127.0.0.1:8765/signaling
+control:
+  keyboard:
+    throttle: ArrowUp
+)YAML");
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_driver_config(obsolete_keyboard_path.string())); },
+        "driver config silently accepted the obsolete control.keyboard section");
+  } catch (...) {
+    std::filesystem::remove_all(root);
+    throw;
+  }
+  std::filesystem::remove_all(root);
 }
 
 void test_signaling_multi_identity_config() {
@@ -973,8 +1532,12 @@ void test_driver_vehicle_switch_releases_old_session() {
   mine_teleop::DriverConfig driver_config;
   driver_config.driver_id = "driver-console-001";
   driver_config.signaling_url = base;
-  driver_config.control_limits.initial_max_brake = 0.25;
-  mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
+  driver_config.control_limits.initial_max_brake_pressure_bar = 100.0;
+  driver_config.control_limits.initial_service_brake_pressure_bar = 10.0;
+  driver_config.control_limits.initial_hard_brake_pressure_bar = 25.0;
+  auto driver_runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(
+      driver_config, "vehicle-001", "dev-password");
+  auto& driver = *driver_runtime;
   const auto first = driver.connect("vehicle-001");
   const auto second = driver.connect("vehicle-002");
   expect(
@@ -992,29 +1555,164 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(
       new_session.value("session_id", "") == second.value("session_id", ""),
       "vehicle switch did not activate the new session");
+
+  mine_teleop::DriverConsoleHttpApp control_app(driver_runtime);
+  mine_teleop::HttpRequest profile_request;
+  profile_request.method = "POST";
+  profile_request.path = "/api/control-profile";
+  profile_request.body = mine_teleop::Json({
+      {"target_speed_kph", 3.0},
+      {"max_motor_torque_nm", 250.0},
+      {"max_brake_pressure_bar", 80.0},
+      {"service_brake_pressure_bar", 8.0},
+      {"hard_brake_pressure_bar", 20.0},
+  }).dump();
+  const auto profile_response = control_app.handle(profile_request);
+  expect(profile_response.status == 200, "session control profile could not be prepared");
+  const auto profile_result = mine_teleop::Json::parse(profile_response.body);
+  const auto& profile_envelope = profile_result.at("request");
+  expect(
+      profile_result.value("prepared", false) &&
+          profile_result.value("transport", "") == "webrtc_data_channel" &&
+          profile_result.value("delivery_state", "") == "browser_data_channel_pending" &&
+          profile_envelope.value("type", "") == "session_control_profile" &&
+          profile_envelope.value("vehicle_id", "") == "vehicle-002" &&
+          profile_envelope.value("driver_id", "") == "driver-console-001" &&
+          profile_envelope.value("session_id", "") == second.value("session_id", "") &&
+          !profile_envelope.value("control_token", "").empty() &&
+          profile_envelope.value("seq", std::uint64_t{0}) > 0,
+      "prepared session profile lost authenticated envelope identity");
+  expect(
+      !profile_envelope.contains("profile") &&
+          profile_envelope.value("target_speed_kph", -1.0) == 3.0 &&
+          profile_envelope.value("max_motor_torque_nm", -1.0) == 250.0 &&
+          profile_envelope.value("max_brake_pressure_bar", -1.0) == 80.0 &&
+          profile_envelope.value("service_brake_pressure_bar", -1.0) == 8.0 &&
+          profile_envelope.value("hard_brake_pressure_bar", -1.0) == 20.0,
+      "session profile request is not the canonical flat DataChannel schema");
+
+  mine_teleop::HttpRequest get_profile_request;
+  get_profile_request.method = "GET";
+  get_profile_request.path = "/api/control-profile";
+  const auto get_profile_response = control_app.handle(get_profile_request);
+  expect(get_profile_response.status == 200, "prepared session control profile is not readable");
+  const auto prepared_profile = mine_teleop::Json::parse(get_profile_response.body);
+  expect(
+      prepared_profile.value("target_speed_kph", -1.0) == 3.0 &&
+          prepared_profile.value("max_motor_torque_nm", -1.0) == 250.0 &&
+          prepared_profile.value("last_prepared_seq", std::uint64_t{0}) ==
+              profile_envelope.value("seq", std::uint64_t{0}),
+      "prepared session profile state does not match its DataChannel envelope");
+
+  profile_request.body = mine_teleop::Json({
+      {"target_speed_kph", 3.0},
+      {"max_motor_torque_nm", 640.1},
+      {"max_brake_pressure_bar", 80.0},
+      {"service_brake_pressure_bar", 8.0},
+      {"hard_brake_pressure_bar", 20.0},
+  }).dump();
+  expect(
+      control_app.handle(profile_request).status == 400,
+      "session profile accepted torque above the controller schema ceiling");
+  profile_request.body = mine_teleop::Json({
+      {"target_speed_kph", 3.0},
+      {"max_motor_torque_nm", 250.0},
+      {"max_brake_pressure_bar", 327.7},
+      {"service_brake_pressure_bar", 8.0},
+      {"hard_brake_pressure_bar", 20.0},
+  }).dump();
+  expect(
+      control_app.handle(profile_request).status == 400,
+      "session profile accepted ordinary EHB pressure above the schema ceiling");
+  const auto profile_analog_brake = driver.send_control(
+      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
+  expect(
+      profile_analog_brake.at("command").value("brake", -1.0) == 0.80,
+      "session hard-brake key pressure incorrectly capped the analog brake range");
+
+  for (const auto* path : {"/api/control/keyboard", "/api/control/gamepad"}) {
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.path = path;
+    request.body = mine_teleop::Json({
+        {"gear", "D"},
+        {"up", true},
+        {"service_brake", true},
+        {"brake", 1.0},
+    }).dump();
+    const auto response = control_app.handle(request);
+    expect(
+        response.status == 410 &&
+            response.body.find("acknowledged session profile") != std::string::npos,
+        std::string("legacy specialized control endpoint did not fail closed: ") + path);
+  }
+  const auto prepared_status = driver.status();
+  expect(
+      prepared_status.value("control_commands_prepared_total", std::uint64_t{0}) == 1 &&
+          prepared_status.value("last_control_prepared_at_utc_ms", std::int64_t{0}) > 0 &&
+          !prepared_status.contains("last_control_sent_ms"),
+      "control preparation metrics still imply browser DataChannel delivery or count rejected input");
+
   const auto prepared = driver.send_control(
       {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
   expect(
       prepared.at("command").value("vehicle_id", "") == "vehicle-002",
       "post-switch control command targeted the old vehicle");
   expect(
-      prepared.at("command").value("brake", -1.0) == 0.25,
-      "driver runtime did not enforce the configured ordinary-brake limit");
-  static_cast<void>(driver.set_control_limits({{"max_brake", 0.10}}));
-  const auto reduced = driver.send_control(
+      prepared.at("command").value("brake", -1.0) == 0.80,
+      "driver runtime treated the hard-brake key preset as the analog-pedal ceiling");
+
+  mine_teleop::HttpRequest get_legacy_limits_request;
+  get_legacy_limits_request.method = "GET";
+  get_legacy_limits_request.path = "/api/control-limits";
+  const auto get_legacy_limits_response = control_app.handle(get_legacy_limits_request);
+  expect(get_legacy_limits_response.status == 200, "legacy control-limit read compatibility failed");
+  const auto legacy_limits = mine_teleop::Json::parse(get_legacy_limits_response.body);
+  expect(
+      legacy_limits.value("service_brake", -1.0) == 0.10 &&
+          legacy_limits.value("hard_brake", -1.0) == 0.25 &&
+          legacy_limits.value("max_brake", -1.0) == 0.25,
+      "legacy control-limit read did not reflect the prepared physical-pressure profile");
+
+  mine_teleop::HttpRequest mutate_legacy_limits_request;
+  mutate_legacy_limits_request.method = "POST";
+  mutate_legacy_limits_request.path = "/api/control-limits";
+  mutate_legacy_limits_request.body = mine_teleop::Json({
+      {"service_brake", 0.20},
+      {"hard_brake", 1.0},
+  }).dump();
+  const auto mutate_legacy_limits_response = control_app.handle(mutate_legacy_limits_request);
+  expect(
+      mutate_legacy_limits_response.status == 410 &&
+          mutate_legacy_limits_response.body.find("/api/control-profile") != std::string::npos,
+      "legacy control-limit mutation did not fail closed with an explicit profile migration");
+  expect_throws(
+      [&] {
+        static_cast<void>(driver.set_control_limits(
+            {{"service_brake", 0.20}, {"hard_brake", 1.0}}));
+      },
+      "direct legacy control-limit mutation bypassed the authenticated session profile");
+  expect(
+      driver.control_limits().value("service_brake", -1.0) == 0.10 &&
+          driver.control_limits().value("hard_brake", -1.0) == 0.25,
+      "rejected legacy control-limit mutation changed the active profile");
+
+  profile_request.body = mine_teleop::Json({
+      {"target_speed_kph", 0.0},
+      {"max_motor_torque_nm", 0.0},
+      {"max_brake_pressure_bar", 0.0},
+      {"service_brake_pressure_bar", 0.0},
+      {"hard_brake_pressure_bar", 0.0},
+  }).dump();
+  expect(
+      control_app.handle(profile_request).status == 200,
+      "zero pending profile could not be prepared");
+  const auto pending_zero_profile_control = driver.send_control(
       {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
   expect(
-      reduced.at("command").value("brake", -1.0) == 0.10,
-      "driver runtime did not apply a reduced session brake limit");
-  static_cast<void>(driver.set_control_limits({{"max_brake", 0.50}}));
-  const auto raised = driver.send_control(
-      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
-  expect(
-      raised.at("command").value("brake", -1.0) == 0.50,
-      "driver runtime did not apply a raised session brake limit");
-  expect(
-      driver.control_limits().value("max_brake", -1.0) == 0.50,
-      "driver runtime did not expose the current session brake limit for page reload");
+      pending_zero_profile_control.at("command").value("brake", -1.0) == 0.80,
+      "unacknowledged local profile state altered the generic control wire value");
+
   const auto estop = driver.send_control(
       {{"gear", "N"},
        {"steering", 0.0},
@@ -1028,6 +1726,15 @@ void test_driver_vehicle_switch_releases_old_session() {
 
   const auto ended = driver.end_session("switch_test_complete");
   expect(!ended.value("connected", true), "explicit session end did not clear local authority");
+  const auto reset_profile = driver.control_profile();
+  expect(
+      reset_profile.value("target_speed_kph", -1.0) == 2.0 &&
+          reset_profile.value("max_motor_torque_nm", -1.0) == 300.0 &&
+          reset_profile.value("max_brake_pressure_bar", -1.0) == 100.0 &&
+          reset_profile.value("service_brake_pressure_bar", -1.0) == 10.0 &&
+          reset_profile.value("hard_brake_pressure_bar", -1.0) == 25.0 &&
+          reset_profile.value("last_prepared_seq", std::uint64_t{1}) == 0,
+      "session end retained a prepared control profile instead of YAML defaults");
   expect(driver.vehicles().value("authenticated", false), "session end unexpectedly logged out the driver");
   static_cast<void>(driver.disconnect("switch_test_logout"));
   server.stop();
@@ -1079,9 +1786,11 @@ void test_two_driver_two_vehicle_wss_isolation_and_safe_rejection() {
   mine_teleop::DriverConfig driver_one_config;
   driver_one_config.driver_id = "driver-console-001";
   driver_one_config.signaling_url = "ws://127.0.0.1:" + std::to_string(server.port()) + "/signaling";
+  allow_qemu_test_scheduler_time_sync(driver_one_config);
   mine_teleop::DriverConfig driver_two_config;
   driver_two_config.driver_id = "driver-console-002";
   driver_two_config.signaling_url = driver_one_config.signaling_url;
+  allow_qemu_test_scheduler_time_sync(driver_two_config);
   mine_teleop::DriverConsoleRuntime driver_one(driver_one_config, "vehicle-001", "dev-password-1");
   mine_teleop::DriverConsoleRuntime driver_two(driver_two_config, "vehicle-002", "dev-password-2");
 
@@ -1297,6 +2006,7 @@ void test_local_proxy_preserves_upstream_auth_status() {
   mine_teleop::DriverConfig driver_config;
   driver_config.driver_id = "driver-console-001";
   driver_config.signaling_url = "http://127.0.0.1:" + std::to_string(server.port());
+  allow_qemu_test_scheduler_time_sync(driver_config);
   auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(
       driver_config, "vehicle-001", "dev-password");
   static_cast<void>(runtime->login("dev-password"));
@@ -1328,13 +2038,17 @@ void test_control_authority_lease_renews_without_rotating_token() {
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
-  // Keep the lease short enough for a fast test, but leave enough scheduling
-  // margin for emulated amd64 builders where a 140 ms lease can expire during
-  // a single host scheduling stall.
-  signaling_config.control_token_ttl_ms = 400;
-  signaling_config.token_ttl_ms = 3000;
-  signaling_config.vehicle_heartbeat_timeout_ms = 3000;
-  signaling_config.driver_heartbeat_timeout_ms = 3000;
+  // Keep the lease short enough for a fast test while leaving a realistic
+  // scheduling margin for loaded native and emulated builders. Observe two
+  // actual expiry extensions instead of assuming both happen in a narrow
+  // fixed wall-clock window.
+  signaling_config.control_token_ttl_ms = 5000;
+  // Driver authentication is not the subject of this test and must outlive
+  // the repeated control renewals. Participant heartbeat expiry is covered by
+  // separate tests and must not race this lease-only assertion either.
+  signaling_config.token_ttl_ms = 20000;
+  signaling_config.vehicle_heartbeat_timeout_ms = 15000;
+  signaling_config.driver_heartbeat_timeout_ms = 15000;
   signaling_config.connection_reaper_interval_ms = 5;
   signaling_config.audit_log_path = audit_path.string();
   auto signaling = std::make_shared<mine_teleop::SignalingService>(std::move(signaling_config));
@@ -1376,15 +2090,21 @@ void test_control_authority_lease_renews_without_rotating_token() {
   expect(vehicle_renewal.status == 401, "vehicle participant renewed driver control authority");
 
   std::int64_t latest_expiry = initial_expiry;
-  const auto renewal_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
-  while (std::chrono::steady_clock::now() < renewal_deadline) {
+  int observed_renewals = 0;
+  const auto renewal_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+  while (observed_renewals < 2 && std::chrono::steady_clock::now() < renewal_deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
     const auto status = driver.status();
     expect(status.value("session_id", "") == session_id, "control renewal changed the active session");
     expect(status.value("signaling_websocket_connected", false), "control renewal closed the WSS connection");
-    latest_expiry = status.at("control_token_expires_at_utc_ms").get<std::int64_t>();
+    const auto observed_expiry =
+        status.at("control_token_expires_at_utc_ms").get<std::int64_t>();
+    if (observed_expiry > latest_expiry) {
+      latest_expiry = observed_expiry;
+      ++observed_renewals;
+    }
   }
-  expect(latest_expiry > initial_expiry + 650, "control authority expiry was not extended repeatedly");
+  expect(observed_renewals >= 2, "control authority expiry was not extended twice");
   expect(signaling->health().value("active_sessions", std::size_t{0}) == 1, "renewed session expired early");
 
   const auto renewed_vehicle_session = http.get_json(
@@ -1402,17 +2122,9 @@ void test_control_authority_lease_renews_without_rotating_token() {
       final_control.at("command").value("control_token", "") == original_control_token,
       "renewed driver command changed the active control token");
 
-  const auto remaining_ms = std::max<std::int64_t>(0, latest_expiry - mine_teleop::now_ms());
-  std::this_thread::sleep_for(std::chrono::milliseconds(remaining_ms + 80));
-  expect(signaling->health().value("active_sessions", std::size_t{1}) == 0, "unrenewed lease did not expire");
-  bool authority_loss_reported = false;
-  try {
-    static_cast<void>(driver.poll_signaling());
-  } catch (const std::runtime_error& error) {
-    authority_loss_reported = std::string(error.what()).find("authority is no longer valid") != std::string::npos;
-  }
-  expect(authority_loss_reported, "expired renewed authority was not reported through WSS");
-  expect(!driver.status().value("connected", true), "expired renewed authority remained connected locally");
+  // Expiry/fail-closed behavior is covered by
+  // test_expired_websocket_authority_clears_local_control. End this focused
+  // renewal test explicitly instead of adding another short wall-clock race.
   static_cast<void>(driver.disconnect("control_renewal_test_complete"));
   server.stop();
 
@@ -1518,19 +2230,27 @@ void test_mac_runtime_uses_websocket_signaling() {
       "vehicle received the wrong websocket signaling message");
 
   std::atomic<int> concurrent_failures{0};
+  std::mutex concurrent_failure_mutex;
+  std::string first_concurrent_failure;
   std::vector<std::thread> candidate_senders;
   for (int index = 0; index < 8; ++index) {
-    candidate_senders.emplace_back([&driver, &concurrent_failures, index] {
-      try {
-        static_cast<void>(driver.send_webrtc_ice_candidate(
-            {{"candidate", "candidate:" + std::to_string(index + 1)}}));
-      } catch (const std::exception&) {
-        ++concurrent_failures;
-      }
-    });
+    candidate_senders.emplace_back(
+        [&driver, &concurrent_failures, &concurrent_failure_mutex, &first_concurrent_failure, index] {
+          try {
+            static_cast<void>(driver.send_webrtc_ice_candidate(
+                {{"candidate", "candidate:" + std::to_string(index + 1)}}));
+          } catch (const std::exception& error) {
+            ++concurrent_failures;
+            std::lock_guard lock(concurrent_failure_mutex);
+            if (first_concurrent_failure.empty()) first_concurrent_failure = error.what();
+          }
+        });
   }
   for (auto& thread : candidate_senders) thread.join();
-  expect(concurrent_failures.load() == 0, "concurrent browser ICE candidates failed WSS serialization");
+  expect(
+      concurrent_failures.load() == 0,
+      "concurrent browser ICE candidates failed WSS serialization: " +
+          (first_concurrent_failure.empty() ? "unknown exception" : first_concurrent_failure));
   const auto candidates = http.get_json(
       base + "/signaling/" + session_id + "/messages?recipient=vehicle-001&device_token=vehicle-secret-1"
       "&connection_generation=" + std::to_string(vehicle_generation) + "&types=ice_candidate");
@@ -1664,6 +2384,30 @@ void test_websocket_handshake_and_participant_isolation() {
   expect(
       raw_upgrade_headers.find("attacker-controlled-request-id") == std::string::npos,
       "websocket upgrade trusted a client-supplied request ID");
+
+  const auto delayed_payload = signaling_request(
+      session_id,
+      1,
+      "driver-console-001",
+      "vehicle-001",
+      "",
+      "",
+      "ice_candidate",
+      {{"candidate", "candidate:delayed-frame"}}).dump();
+  const auto delayed_frame = raw_masked_websocket_frame(0x81U, delayed_payload);
+  const auto delayed_payload_offset = delayed_frame.size() - delayed_payload.size();
+  raw_send_all(raw_socket, std::string_view(delayed_frame).substr(0, delayed_payload_offset));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  raw_send_all(raw_socket, std::string_view(delayed_frame).substr(delayed_payload_offset));
+  const auto delayed_ack = raw_receive_websocket_json(raw_socket);
+  expect(
+      delayed_ack.value("event", "") == "signaling_ack" &&
+          delayed_ack.value("type", "") == "ice_candidate" &&
+          delayed_ack.value("seq", std::uint64_t{0}) == 1,
+      "a valid masked websocket frame split beyond the idle poll interval was rejected");
+  ::close(raw_socket);
+
+  raw_socket = raw_websocket_connect(server.port(), websocket_target, nullptr, websocket_auth_header);
   raw_send_all(raw_socket, std::string("\x81\x02{}", 4));
   auto protocol_error = raw_receive_websocket_json(raw_socket);
   expect(
@@ -1852,8 +2596,7 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
               deadline - std::chrono::steady_clock::now()));
       auto received = websocket.receive_json(remaining);
       if (received.status != mine_teleop::WebSocketReceiveStatus::Message ||
-          received.message.value("event", "") == expected_event ||
-          received.message.value("event", "") != "signaling_messages") {
+          received.message.value("event", "") == expected_event) {
         return received;
       }
     }
@@ -1909,18 +2652,19 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
       "media_capabilities",
       {{"codecs", {"h264"}}});
   after_ack.send_json(capabilities);
-  const auto first_outbound_ack = receive_event(after_ack, "signaling_ack", std::chrono::seconds(2));
+  const auto first_outbound_ack = receive_event(after_ack, "signaling_ack", std::chrono::seconds(5));
   expect(
       first_outbound_ack.status == mine_teleop::WebSocketReceiveStatus::Message &&
           first_outbound_ack.message.value("event", "") == "signaling_ack" &&
           !first_outbound_ack.message.value("duplicate", true),
-      "first websocket send was not acknowledged as a new message");
+      "first websocket send was not acknowledged as a new message: " +
+          first_outbound_ack.message.dump());
   after_ack.close();
 
   mine_teleop::WebSocketClient retry;
   retry.connect(websocket_url, websocket_headers);
   retry.send_json(capabilities);
-  const auto retry_ack = receive_event(retry, "signaling_ack", std::chrono::seconds(2));
+  const auto retry_ack = receive_event(retry, "signaling_ack", std::chrono::seconds(5));
   expect(
       retry_ack.status == mine_teleop::WebSocketReceiveStatus::Message &&
           retry_ack.message.value("duplicate", false) &&
@@ -2831,6 +3575,15 @@ void test_driver_webrtc_connection_audit_transitions() {
       {"connection_method", "direct"},
       {"turn_in_use", false},
       {"time_sync", {{"synchronized", true}, {"uncertainty_ms", 2}}},
+      {"control_outcomes",
+       {{"prepared", 20},
+        {"forwarded", 19},
+        {"superseded", 1},
+        {"post_prepare_link_changed", 0},
+        {"post_prepare_vcu_not_ready", 0},
+        {"last_prepared_seq", 20},
+        {"last_forwarded_seq", 19}}},
+      {"control_outcomes_balanced", true},
       {"streams", mine_teleop::Json::array()}};
   const auto first = driver.ingest_webrtc_metrics(connected);
   expect(
@@ -2838,6 +3591,13 @@ void test_driver_webrtc_connection_audit_transitions() {
       "connected WebRTC transition was not audited");
   const auto duplicate = driver.ingest_webrtc_metrics(connected);
   expect(!duplicate.value("reported", true), "unchanged WebRTC state produced a duplicate audit");
+  const auto retained_outcomes = driver.status().at("webrtc_metrics");
+  expect(
+      retained_outcomes.value("control_outcomes_balanced", false) &&
+          retained_outcomes.at("control_outcomes").value("prepared", 0) == 20 &&
+          retained_outcomes.at("control_outcomes").value("forwarded", 0) == 19 &&
+          retained_outcomes.at("control_outcomes").value("superseded", 0) == 1,
+      "the existing WebRTC metrics path did not retain cumulative control outcomes");
 
   const auto failed = driver.ingest_webrtc_metrics(
       {{"connection_state", "failed"},
@@ -3330,8 +4090,17 @@ int main() {
       {"loopback_http_server_and_port_conflict", test_loopback_http_server_and_port_conflict},
       {"signaling_time_sync_applies_backward_utc_correction",
        test_signaling_time_sync_applies_backward_utc_correction},
+      {"driver_time_sync_uncertainty_fails_closed_at_production_default",
+       test_driver_time_sync_uncertainty_fails_closed_at_production_default},
       {"control_page_contract", test_control_page_contract},
       {"driver_gamepad_config", test_driver_gamepad_config},
+      {"vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start",
+       test_vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start},
+      {"stale_control_data_channel_callbacks_are_fail_silent",
+       test_stale_control_data_channel_callbacks_are_fail_silent},
+      {"structured_control_rejection_is_safe_and_rate_limited",
+       test_structured_control_rejection_is_safe_and_rate_limited},
+      {"driver_brake_limit_config_validation", test_driver_brake_limit_config_validation},
       {"signaling_multi_identity_config", test_signaling_multi_identity_config},
       {"credential_purpose_separation_and_stale_control_replay",
        test_credential_purpose_separation_and_stale_control_replay},

@@ -97,14 +97,26 @@ hardware:
 field_safety:
   commissioning_mode: bench
   max_speed_kph: 0
-  # These remain authoritative even if the browser requests a larger value.
+  # Analog target-speed proportion gate. Session target speed must remain at
+  # or below max_speed_kph * max_throttle.
   max_throttle: 0.10
-  # Per motor channel at steady straight-line throttle=1.0 and brake=0.
-  # The effective ceiling is this value multiplied by max_throttle; 0 disables traction.
-  full_scale_motor_torque_nm: 41.25
-  # Normalized ordinary-driving brake only. Set from vehicle brake calibration;
-  # ESTOP/timeout/fault/disconnect safe-stop output bypasses this hard limit.
-  max_brake: 1.0
+  # Vehicle-side per-motor hard request ceiling. 300 Nm is a software default,
+  # not measured vehicle capability; ordinary code is capped at 640.0 Nm.
+  full_scale_motor_torque_nm: 300.0
+  # Local 20 ms speed PID parameters. These are schema-valid, bounded
+  # placeholders only and have NOT passed isolated CAN bench or vehicle calibration.
+  # max_speed_kph: 0 plus the mock adapter is the current traction-enable gate.
+  speed_feedback_timeout_ms: 200
+  speed_pid_kp: 1.0
+  speed_pid_ki: 0.2
+  speed_pid_kd: 0.0
+  speed_pid_derivative_filter_tau_ms: 100.0
+  speed_pid_max_dt_ms: 100
+  hard_overspeed_margin_kph: 3.6
+  # Vehicle-side ordinary EHB hard ceiling in physical bar. 100 bar is a
+  # software default, not a calibrated vehicle value. Ordinary code is capped
+  # at 327.6 bar; ESTOP/physical emergency/fault uses 409.5 bar independently.
+  max_brake_pressure_bar: 100.0
   max_steering_angle_deg: 5.0
   require_can_feedback_before_control: true
   require_local_estop_reset: true

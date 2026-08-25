@@ -1,5 +1,6 @@
 #pragma once
 
+// Minimal ChassisControl ABI fixture for the unprivileged bridge smoke target.
 #include <array>
 #include <string>
 #include <vector>
@@ -42,6 +43,7 @@ struct VehicleState {
 };
 
 struct ControlInfo {
+  double wheel_speed{0.0};
   double wheel_torque{0.0};
   double ehb_brk_pres_req{0.0};
   double eps_ang_req{0.0};

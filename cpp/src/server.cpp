@@ -1,4 +1,5 @@
 #include "mine_teleop/server.hpp"
+#include "mine_teleop/control_logic_js.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -837,8 +838,11 @@ std::string console_html(const DriverConfig& config) {
       {"ice_transport_policy", config.ice_transport_policy},
       {"control_limits",
        {
-           {"initial_max_throttle", config.control_limits.initial_max_throttle},
-           {"initial_max_brake", config.control_limits.initial_max_brake},
+           {"initial_target_speed_kph", config.control_limits.initial_target_speed_kph},
+           {"initial_max_motor_torque_nm", config.control_limits.initial_max_motor_torque_nm},
+           {"initial_max_brake_pressure_bar", config.control_limits.initial_max_brake_pressure_bar},
+           {"initial_service_brake_pressure_bar", config.control_limits.initial_service_brake_pressure_bar},
+           {"initial_hard_brake_pressure_bar", config.control_limits.initial_hard_brake_pressure_bar},
            {"initial_max_steering_angle_deg",
             config.control_limits.initial_max_steering_angle_deg},
            {"steering_full_scale_deg", 30.0},
@@ -879,38 +883,46 @@ body .app-shell{grid-template-rows:auto auto minmax(0,1fr)}
 @media(max-height:760px){.operator-status-item{padding:4px 6px}.operator-status-item span{font-size:8px}.operator-status-item strong{font-size:14px}}
 @media(max-width:900px){body .operator-status-strip{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:720px){body .operator-status-strip{position:sticky;top:0;z-index:20;grid-template-columns:repeat(3,minmax(0,1fr))}.workspace>.visual-stage{min-height:0}.visual-stage>.grid{grid-template-columns:1fr;grid-template-rows:none;grid-auto-rows:clamp(190px,56vw,300px);overflow:visible}.can-feedback-panel .can-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
-*{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;padding:12px}button,input,select{font:inherit}button,input,select{border:1px solid var(--line);border-radius:7px;background:#0b1422;color:var(--text);padding:8px 10px}button{cursor:pointer}button:hover{border-color:#58708e}button:focus-visible,input:focus-visible,select:focus-visible,main:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.danger{background:#be123c;border-color:#fb7185;color:#fff}.app-shell{height:calc(100svh - 24px);min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr);gap:10px;max-width:1920px;margin:auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;min-width:0}.brand{display:flex;align-items:baseline;gap:12px;min-width:max-content}.brand h1{font-size:21px;line-height:1.1;margin:0;letter-spacing:-.02em}.brand p{font-size:12px;color:var(--muted);margin:0}.auth{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap;margin:0;min-width:0}.auth label{font-size:12px;color:var(--muted)}.auth input{width:170px}.auth select{max-width:220px}.auth strong{font-size:12px;color:var(--ok)}.workspace{display:grid;grid-template-columns:minmax(0,1fr) clamp(300px,25vw,390px);gap:10px;min-height:0}.visual-stage{display:grid;grid-template-rows:auto minmax(0,1fr) auto auto;gap:8px;min-width:0;min-height:0}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:8px;min-height:0}.camera{background:#020617;border:1px solid #162338;border-radius:8px;overflow:hidden;position:relative;min-width:0;min-height:0}.camera video{display:block;width:100%;height:100%;object-fit:contain}.label{position:absolute;left:7px;top:7px;background:#020617cc;padding:3px 7px;border-radius:5px;font-size:11px;z-index:2}.empty-stage{grid-column:1/-1;grid-row:1/-1;display:grid;place-items:center;border:1px dashed var(--line);border-radius:8px;color:var(--muted);font-size:13px}.can-feedback-panel{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:7px;min-width:0}.can-feedback-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px}.can-feedback-heading h2{font-size:11px;letter-spacing:.05em;text-transform:uppercase;margin:0}.can-summary{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:5px;overflow:hidden;margin-bottom:5px}.can-summary-item{background:var(--surface-2);padding:3px 5px;min-width:0}.can-summary-item span{display:block;color:var(--muted);font-size:8px}.can-summary-item strong{display:block;font:700 10px/1.25 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.can-feedback-body{display:grid;grid-template-columns:minmax(0,4fr) minmax(150px,1fr);gap:5px}.wheel-feedback-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:3px}.wheel-feedback,.steering-feedback{background:#0b1422;border:1px solid #1f3047;border-radius:5px;padding:3px 5px;min-width:0}.feedback-title{display:flex;justify-content:space-between;gap:4px;color:#cbd5e1;font-size:8px}.feedback-values{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-top:2px}.feedback-value{min-width:0}.feedback-value span{display:block;color:var(--muted);font-size:7px}.feedback-value strong{display:block;font:700 9px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.steering-feedback-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px}.steering-feedback .feedback-values{grid-template-columns:minmax(0,1fr) auto}.sidebar{min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding-right:2px}.side-section{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:10px}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.section-heading h2{font-size:13px;letter-spacing:.04em;text-transform:uppercase;margin:0}.status-chip{font-size:11px;color:var(--muted)}.key-help,.gate-copy{font-size:11px;color:var(--muted);margin:0 0 8px;line-height:1.35}.keyboard-grid{display:grid;grid-template-columns:repeat(3,46px);grid-template-rows:repeat(2,40px);justify-content:center;gap:5px;margin:8px 0}.keycap{display:flex;align-items:center;justify-content:center;gap:4px;border:1px solid #41536d;border-radius:7px;background:#0a1321;color:#aebdd0;font:700 15px/1 ui-monospace,SFMono-Regular,Menlo,monospace;transition:background .08s ease,border-color .08s ease,color .08s ease,transform .08s ease}.keycap small{font-size:9px;color:#71839b}.keycap.active{background:#075985;border-color:var(--accent);color:#fff;transform:translateY(1px);box-shadow:0 0 0 2px #38bdf826}.keycap.active small{color:#bae6fd}.key-up{grid-column:2}.key-left{grid-column:1;grid-row:2}.key-down{grid-column:2;grid-row:2}.key-right{grid-column:3;grid-row:2}.brake-key{display:flex;align-items:center;justify-content:center;margin:7px auto 10px;width:148px;height:30px;font-size:11px}.last-input{display:block;text-align:center;min-height:17px;font-size:11px;color:var(--accent)}.control-readouts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:7px;overflow:hidden}.control-readout{background:var(--surface-2);padding:8px}.control-readout span{display:block;font-size:10px;color:var(--muted);margin-bottom:3px}.control-readout strong{display:block;font:700 18px/1.1 ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}.control-readout.active strong{color:var(--accent)}.side-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px}.side-actions button{font-size:11px;padding:7px 6px}.limit-inline{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 7px;color:var(--muted);font-size:10px}.side-section .limit-inline strong{font-size:11px}.metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:7px;overflow:hidden}.metric{background:var(--surface-2);padding:7px}.metric span{display:block;color:var(--muted);font-size:9px;margin-bottom:3px}.metric strong{display:block;font-size:12px;line-height:1.25;overflow-wrap:anywhere}.ok{color:var(--ok)}.warn{color:var(--warn)}.critical{color:var(--critical)}.alerts{border-left:3px solid #475569;background:#0b1422;padding:7px 8px;margin:8px 0;font-size:11px;line-height:1.35}.alerts.warn{border-color:#f59e0b}.alerts.critical{border-color:#e11d48}table{width:100%;border-collapse:collapse;background:#0b1422;font-size:9px;table-layout:fixed}th,td{text-align:left;padding:5px 3px;border-bottom:1px solid #26364d;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}th:first-child,td:first-child{width:30%}.estop-banner{border:1px solid #fb7185;background:#881337;color:#fff;border-radius:7px;padding:7px 10px;margin:0;font-size:12px}.status-line{background:#020617;border:1px solid #162338;border-radius:7px;color:#9fb0c6;font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;padding:7px 9px;min-height:31px;max-height:48px;overflow:auto;white-space:pre-wrap}.muted{color:var(--muted)}[hidden]{display:none!important}dialog{color:var(--text);background:var(--surface);border:1px solid #4b5563;border-radius:10px;max-width:520px;width:calc(100% - 40px);padding:18px}dialog::backdrop{background:#000a}dialog h2{margin:0 0 12px;font-size:18px}.limit-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.limit-grid label{display:flex;flex-direction:column;gap:5px;font-size:12px}.limit-warning{border-left:4px solid #f59e0b;padding:8px 10px;background:#1f2937;font-size:12px;line-height:1.45}
-@media(max-height:760px){body{padding:8px}.app-shell{height:calc(100svh - 16px);gap:7px}.brand p{display:none}.sidebar{gap:7px}.side-section{padding:7px}.section-heading{margin-bottom:5px}.key-help,.gate-copy{margin-bottom:4px;line-height:1.25}.keyboard-grid{grid-template-columns:repeat(3,40px);grid-template-rows:repeat(2,30px);margin:3px 0}.brake-key{height:26px;margin:3px auto}.last-input{min-height:14px;font-size:10px}.control-readout{padding:4px 6px}.control-readout span{font-size:9px;margin-bottom:2px}.control-readout strong{font-size:16px}.side-actions button{padding:5px 4px}.limit-inline{margin-bottom:4px}.metric{padding:3px 5px}.metric span{margin-bottom:2px}.metric strong{font-size:11px}.alerts{margin:4px 0;padding:4px 6px;font-size:10px;line-height:1.25}th,td{padding:3px 2px}}
+*{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;padding:12px}button,input,select{font:inherit}button,input,select{border:1px solid var(--line);border-radius:7px;background:#0b1422;color:var(--text);padding:8px 10px}button{cursor:pointer}button:hover{border-color:#58708e}button:focus-visible,input:focus-visible,select:focus-visible,main:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.danger{background:#be123c;border-color:#fb7185;color:#fff}.app-shell{height:calc(100svh - 24px);min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr);gap:10px;max-width:1920px;margin:auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;min-width:0}.brand{display:flex;align-items:baseline;gap:12px;min-width:max-content}.brand h1{font-size:21px;line-height:1.1;margin:0;letter-spacing:-.02em}.brand p{font-size:12px;color:var(--muted);margin:0}.auth{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap;margin:0;min-width:0}.auth label{font-size:12px;color:var(--muted)}.auth input{width:170px}.auth select{max-width:220px}.auth strong{font-size:12px;color:var(--ok)}.workspace{display:grid;grid-template-columns:minmax(0,1fr) clamp(300px,25vw,390px);gap:10px;min-height:0}.visual-stage{display:grid;grid-template-rows:auto minmax(0,1fr) auto auto;gap:8px;min-width:0;min-height:0}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:8px;min-height:0}.camera{background:#020617;border:1px solid #162338;border-radius:8px;overflow:hidden;position:relative;min-width:0;min-height:0}.camera video{display:block;width:100%;height:100%;object-fit:contain}.label{position:absolute;left:7px;top:7px;background:#020617cc;padding:3px 7px;border-radius:5px;font-size:11px;z-index:2}.empty-stage{grid-column:1/-1;grid-row:1/-1;display:grid;place-items:center;border:1px dashed var(--line);border-radius:8px;color:var(--muted);font-size:13px}.can-feedback-panel{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:7px;min-width:0}.can-feedback-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px}.can-feedback-heading h2{font-size:11px;letter-spacing:.05em;text-transform:uppercase;margin:0}.can-summary{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:5px;overflow:hidden;margin-bottom:5px}.can-summary-item{background:var(--surface-2);padding:3px 5px;min-width:0}.can-summary-item span{display:block;color:var(--muted);font-size:8px}.can-summary-item strong{display:block;font:700 10px/1.25 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.can-feedback-body{display:grid;grid-template-columns:minmax(0,4fr) minmax(150px,1fr);gap:5px}.wheel-feedback-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:3px}.wheel-feedback,.steering-feedback{background:#0b1422;border:1px solid #1f3047;border-radius:5px;padding:3px 5px;min-width:0}.feedback-title{display:flex;justify-content:space-between;gap:4px;color:#cbd5e1;font-size:8px}.feedback-values{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-top:2px}.feedback-value{min-width:0}.feedback-value span{display:block;color:var(--muted);font-size:7px}.feedback-value strong{display:block;font:700 9px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.steering-feedback-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px}.steering-feedback .feedback-values{grid-template-columns:minmax(0,1fr) auto}.sidebar{min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding-right:2px}.side-section{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:10px}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.section-heading h2{font-size:13px;letter-spacing:.04em;text-transform:uppercase;margin:0}.status-chip{font-size:11px;color:var(--muted)}.key-help,.gate-copy{font-size:11px;color:var(--muted);margin:0 0 8px;line-height:1.35}.keyboard-grid{display:grid;grid-template-columns:repeat(3,46px);grid-template-rows:repeat(2,40px);justify-content:center;gap:5px;margin:8px 0}.keycap{display:flex;align-items:center;justify-content:center;gap:4px;border:1px solid #41536d;border-radius:7px;background:#0a1321;color:#aebdd0;font:700 15px/1 ui-monospace,SFMono-Regular,Menlo,monospace;transition:background .08s ease,border-color .08s ease,color .08s ease,transform .08s ease}.keycap small{font-size:9px;color:#71839b}.keycap.active{background:#075985;border-color:var(--accent);color:#fff;transform:translateY(1px);box-shadow:0 0 0 2px #38bdf826}.keycap.active small{color:#bae6fd}.key-up{grid-column:2}.key-left{grid-column:1;grid-row:2}.key-down{grid-column:2;grid-row:2}.key-right{grid-column:3;grid-row:2}.brake-keys{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin:7px 0 10px}.brake-key{height:30px;font-size:11px}.last-input{display:block;text-align:center;min-height:17px;font-size:11px;color:var(--accent)}.control-readouts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:7px;overflow:hidden}.control-readout{background:var(--surface-2);padding:8px}.control-readout span{display:block;font-size:10px;color:var(--muted);margin-bottom:3px}.control-readout strong{display:block;font:700 18px/1.1 ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}.control-readout.active strong{color:var(--accent)}.side-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px}.side-actions button{font-size:11px;padding:7px 6px}.limit-inline{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 7px;color:var(--muted);font-size:10px}.side-section .limit-inline strong{font-size:11px}.metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:7px;overflow:hidden}.metric{background:var(--surface-2);padding:7px}.metric span{display:block;color:var(--muted);font-size:9px;margin-bottom:3px}.metric strong{display:block;font-size:12px;line-height:1.25;overflow-wrap:anywhere}.ok{color:var(--ok)}.warn{color:var(--warn)}.critical{color:var(--critical)}.alerts{border-left:3px solid #475569;background:#0b1422;padding:7px 8px;margin:8px 0;font-size:11px;line-height:1.35}.alerts.warn{border-color:#f59e0b}.alerts.critical{border-color:#e11d48}table{width:100%;border-collapse:collapse;background:#0b1422;font-size:9px;table-layout:fixed}th,td{text-align:left;padding:5px 3px;border-bottom:1px solid #26364d;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}th:first-child,td:first-child{width:30%}.estop-banner{border:1px solid #fb7185;background:#881337;color:#fff;border-radius:7px;padding:7px 10px;margin:0;font-size:12px}.status-line{background:#020617;border:1px solid #162338;border-radius:7px;color:#9fb0c6;font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;padding:7px 9px;min-height:31px;max-height:48px;overflow:auto;white-space:pre-wrap}.muted{color:var(--muted)}[hidden]{display:none!important}dialog{color:var(--text);background:var(--surface);border:1px solid #4b5563;border-radius:10px;max-width:520px;width:calc(100% - 40px);padding:18px}dialog::backdrop{background:#000a}dialog h2{margin:0 0 12px;font-size:18px}.limit-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.limit-grid label{display:flex;flex-direction:column;gap:5px;font-size:12px}.limit-warning{border-left:4px solid #f59e0b;padding:8px 10px;background:#1f2937;font-size:12px;line-height:1.45}
+@media(max-height:760px){body{padding:8px}.app-shell{height:calc(100svh - 16px);gap:7px}.brand p{display:none}.sidebar{gap:7px}.side-section{padding:7px}.section-heading{margin-bottom:5px}.key-help,.gate-copy{margin-bottom:4px;line-height:1.25}.keyboard-grid{grid-template-columns:repeat(3,40px);grid-template-rows:repeat(2,30px);margin:3px 0}.brake-keys{margin:3px 0}.brake-key{height:26px}.last-input{min-height:14px;font-size:10px}.control-readout{padding:4px 6px}.control-readout span{font-size:9px;margin-bottom:2px}.control-readout strong{font-size:16px}.side-actions button{padding:5px 4px}.limit-inline{margin-bottom:4px}.metric{padding:3px 5px}.metric span{margin-bottom:2px}.metric strong{font-size:11px}.alerts{margin:4px 0;padding:4px 6px;font-size:10px;line-height:1.25}th,td{padding:3px 2px}}
 @media(max-width:900px){.workspace{grid-template-columns:minmax(0,1fr) 290px}.brand p{display:none}.auth label,.auth-expiry{display:none}}
 @media(max-width:720px){html,body{overflow:auto}.app-shell{height:auto;min-height:100svh}.topbar{align-items:flex-start;flex-direction:column}.auth{justify-content:flex-start}.workspace{grid-template-columns:1fr}.visual-stage{min-height:58svh}.sidebar{overflow:visible}.grid{grid-template-columns:1fr}.can-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.can-feedback-body{grid-template-columns:1fr}.wheel-feedback-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.steering-feedback-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.limit-grid{grid-template-columns:1fr}}</style></head><body><main class="app-shell" tabindex="-1">
-<header class="topbar"><div class="brand"><h1>Mine Teleop 控制台</h1><p>方向键 / WASD 控制 · 空格制动 · E 急停</p></div>
+<header class="topbar"><div class="brand"><h1>Mine Teleop 控制台</h1><p>方向键 / WASD 控制 · Space 缓刹 · B 急刹 · E 急停</p></div>
 <section id="login-panel" class="auth"><label for="password">驾驶员密码</label><input id="password" type="password" autocomplete="current-password"><button id="login">登录并加载车辆</button></section>
 <section id="session-panel" class="auth" hidden><label for="vehicle">授权车辆</label><select id="vehicle"></select><button id="connect">连接所选车辆</button><button id="control-limits-open">实车调试限幅</button><button id="logout">安全退出</button><button id="estop" class="danger">急停</button><strong id="webrtc">未连接</strong><span id="auth-expiry" class="muted auth-expiry"></span></section></header>
-<section id="operator-status-strip" class="operator-status-strip" aria-label="关键车辆状态"><article class="operator-status-item"><span>实测车速</span><strong id="operator-speed">—</strong></article><article class="operator-status-item"><span>实际挡位</span><strong id="operator-actual-gear">—</strong></article><article id="operator-readout-gear" class="operator-status-item"><span>指令挡位</span><strong id="operator-control-gear">N</strong></article><article id="operator-readout-steering" class="operator-status-item"><span>转向</span><strong id="operator-control-steering">0.00</strong></article><article id="operator-readout-throttle" class="operator-status-item"><span>油门</span><strong id="operator-control-throttle">0.00</strong></article><article id="operator-readout-brake" class="operator-status-item"><span>刹车</span><strong id="operator-control-brake">0.00</strong></article></section>
+<section id="operator-status-strip" class="operator-status-strip" aria-label="关键车辆状态"><article class="operator-status-item"><span>实测车速</span><strong id="operator-speed">—</strong></article><article class="operator-status-item"><span>实际挡位</span><strong id="operator-actual-gear">—</strong></article><article id="operator-readout-gear" class="operator-status-item"><span>指令挡位</span><strong id="operator-control-gear">N</strong></article><article id="operator-readout-steering" class="operator-status-item"><span>转向</span><strong id="operator-control-steering">0.00</strong></article><article id="operator-readout-throttle" class="operator-status-item"><span>目标车速比例</span><strong id="operator-control-throttle">0.00</strong></article><article id="operator-readout-brake" class="operator-status-item"><span>刹车</span><strong id="operator-control-brake">0.00</strong></article></section>
 <div class="workspace"><section class="visual-stage"><p id="estop-status" class="estop-banner" hidden>急停请求已锁定；等待车端遥测确认，未确认时请使用车辆物理急停。</p><section id="cameras" class="grid"><div id="empty-stage" class="empty-stage">登录并连接车辆后显示实时视频</div></section><section id="can-feedback-panel" class="can-feedback-panel" hidden aria-label="CAN 实时反馈"><div class="can-feedback-heading"><h2>CAN 实时反馈 · 测量值</h2><strong id="can-feedback-status" class="status-chip warn">等待车端遥测</strong></div><div class="can-summary"><div class="can-summary-item"><span>车速</span><strong id="can-speed">—</strong></div><div class="can-summary-item"><span>实际挡位</span><strong id="can-gear">—</strong></div><div class="can-summary-item"><span>物理选择器</span><strong id="can-selector">—</strong></div><div class="can-summary-item"><span>电子驻车 1-4</span><strong id="can-epb">—</strong></div><div class="can-summary-item"><span>VCU 状态</span><strong id="can-handshake">—</strong></div><div class="can-summary-item"><span>紧急开关</span><strong id="can-emergency">—</strong></div><div class="can-summary-item"><span>反馈时效</span><strong id="can-age">—</strong></div></div><div class="can-feedback-body"><div id="wheel-feedback-grid" class="wheel-feedback-grid" aria-label="八路轮端反馈"></div><div id="steering-feedback-grid" class="steering-feedback-grid" aria-label="四路转向反馈"></div></div></section><pre id="status" class="status-line">请先登录</pre></section>
-<aside class="sidebar"><section id="keyboard-panel" class="side-section" aria-label="键盘控制状态"><div class="section-heading"><h2>键盘控制</h2><span id="input-readiness" class="status-chip">等待连接</span></div><p class="key-help">方向键与 WASD 等效；页面失焦时自动归零。</p><div class="keyboard-grid" aria-label="方向键状态"><span id="key-up" class="keycap key-up" aria-pressed="false">↑<small>W</small></span><span id="key-left" class="keycap key-left" aria-pressed="false">←<small>A</small></span><span id="key-down" class="keycap key-down" aria-pressed="false">↓<small>S</small></span><span id="key-right" class="keycap key-right" aria-pressed="false">→<small>D</small></span></div><span id="key-brake" class="keycap brake-key" aria-pressed="false">SPACE · 刹车</span><span id="last-keyboard-event" class="last-input">等待键盘输入</span><div class="control-readouts"><div id="readout-gear" class="control-readout"><span>挡位</span><strong id="control-gear">N</strong></div><div id="readout-steering" class="control-readout"><span>转向</span><strong id="control-steering">0.00</strong></div><div id="readout-throttle" class="control-readout"><span>油门</span><strong id="control-throttle">0.00</strong></div><div id="readout-brake" class="control-readout"><span>刹车</span><strong id="control-brake">0.00</strong></div></div></section>
-<section id="vcu-panel" class="side-section" hidden><div class="section-heading"><h2>VCU 平行驾驶</h2><strong id="vcu-status" class="status-chip warn">等待车端 VCU 状态</strong></div><p class="limit-inline"><span>当前会话限幅</span><strong id="control-limits-summary" class="warn">油门 ≤5% · 转向 ≤3.0°</strong></p><p id="vcu-gate" class="gate-copy warn" role="status" aria-live="polite">准入检查：需要 N 挡、电子驻车已拉起、车辆零速及 VCU 人工状态</p><div class="side-actions"><button id="vcu-connect" disabled>开始平行驾驶握手</button><button id="vcu-disconnect" disabled>断开 VCU 握手</button></div></section>
+<aside class="sidebar"><section id="keyboard-panel" class="side-section" aria-label="键盘控制状态"><div class="section-heading"><h2>键盘控制</h2><span id="input-readiness" class="status-chip">等待连接</span></div><p class="key-help">方向键与 WASD 等效；D/R 在会话内锁存，松开前进/倒车只将目标车速比例归零。</p><div class="keyboard-grid" aria-label="方向键状态"><span id="key-up" class="keycap key-up" aria-pressed="false">↑<small>W</small></span><span id="key-left" class="keycap key-left" aria-pressed="false">←<small>A</small></span><span id="key-down" class="keycap key-down" aria-pressed="false">↓<small>S</small></span><span id="key-right" class="keycap key-right" aria-pressed="false">→<small>D</small></span></div><div class="brake-keys"><span id="key-service-brake" class="keycap brake-key" aria-pressed="false">SPACE · 缓刹</span><span id="key-hard-brake" class="keycap brake-key" aria-pressed="false">B · 急刹</span></div><span id="last-keyboard-event" class="last-input">等待键盘输入</span><div class="control-readouts"><div id="readout-gear" class="control-readout"><span>挡位</span><strong id="control-gear">N</strong></div><div id="readout-steering" class="control-readout"><span>转向</span><strong id="control-steering">0.00</strong></div><div id="readout-throttle" class="control-readout"><span>目标车速比例</span><strong id="control-throttle">0.00</strong></div><div id="readout-brake" class="control-readout"><span>刹车</span><strong id="control-brake">0.00</strong></div></div></section>
+<section id="vcu-panel" class="side-section" hidden><div class="section-heading"><h2>VCU 平行驾驶</h2><strong id="vcu-status" class="status-chip warn">等待车端 VCU 状态</strong></div><p class="limit-inline"><span>当前会话限幅</span><strong id="control-limits-summary" class="warn">等待车端确认会话控制参数</strong></p><p id="vcu-gate" class="gate-copy warn" role="status" aria-live="polite">准入检查：需要车端确认会话控制参数、N 挡、电子驻车、零速及 VCU 人工状态</p><div class="side-actions"><button id="vcu-connect" disabled>开始平行驾驶握手</button><button id="vcu-disconnect" disabled>断开 VCU 握手</button></div></section>
 <section id="monitor-panel" class="side-section" hidden><div class="section-heading"><h2>运行监控</h2><span class="status-chip">实时</span></div><div class="metrics"><article class="metric"><span>车辆在线</span><strong id="metric-vehicle">未知</strong></article><article class="metric"><span>当前会话</span><strong id="metric-session">未连接</strong></article><article class="metric"><span>当前控制权</span><strong id="metric-authority">无</strong></article><article class="metric"><span>视频编码 / 后端</span><strong id="metric-video">等待媒体</strong></article><article class="metric"><span>控制 RTT</span><strong id="metric-rtt">未知</strong></article><article class="metric"><span>网络连接</span><strong id="metric-network">未知</strong></article><article class="metric"><span>TURN</span><strong id="metric-turn">未配置</strong></article><article class="metric"><span>时间同步</span><strong id="metric-time">未知</strong></article></div><div id="alerts" class="alerts">尚无媒体指标；控制命令不会在链路未就绪时发送。</div><table><thead><tr><th>camera</th><th>FPS</th><th>kbps</th><th>loss</th><th>latency</th></tr></thead><tbody id="stream-metrics"><tr><td colspan="5" class="muted">等待视频轨道</td></tr></tbody></table></section></aside></div>
-<dialog id="control-limits-dialog"><h2>实车调试限幅</h2><p class="limit-warning">这是控制端普通驾驶会话限幅；车端 <code>field_safety</code> 硬上限仍会再次截断。急停、超时、故障和断开停车不受人工刹车限幅削弱。修改时立即清零当前输入。</p><div class="limit-grid"><label for="max-throttle-percent">最大油门/纵向输入（%）<input id="max-throttle-percent" type="number" min="0" max="100" step="1" inputmode="decimal"></label><label for="max-brake-percent">最大人工刹车（%）<input id="max-brake-percent" type="number" min="0" max="100" step="1" inputmode="decimal"></label><label for="max-steering-deg">最大四轴转向角（°）<input id="max-steering-deg" type="number" min="0" max="30" step="0.5" inputmode="decimal"></label></div><p id="vehicle-hard-limits" class="muted">等待车端硬上限</p><label><input id="control-limits-confirm" type="checkbox">我已确认车辆处于隔离台架，并理解四轴当前使用同方向转角</label><div><button id="control-limits-apply" disabled>应用限幅</button><button id="control-limits-cancel">取消</button></div></dialog></main><script>
+<dialog id="control-limits-dialog"><h2>实车调试限幅</h2><p class="limit-warning">这些值仅用于当前控制会话，必须由车端确认后才生效；车端本地硬上限仍会再次截断。三个制动字段都是每路 EHB 压力请求，单位 bar、分辨率 0.1 bar，不是百分比或整车制动力。300 Nm 是未完成台架/实车标定的软件请求默认值。急停、物理急停、故障、断开停车和 bridge 本地 watchdog 直接使用独立 409.5 bar/路安全制动；上游控制超时先按 0.3/0.6 档普通压力减速，最终 1.0 阶段才切到 409.5 bar/路，普通 profile 不能削弱这些安全路径。修改时立即清零当前输入。</p><div class="limit-grid"><label for="target-speed-kph">目标车速上限（km/h）<input id="target-speed-kph" type="number" min="0" max="72" step="0.1" inputmode="decimal"></label><label for="max-motor-torque-nm">单电机最大驱动转矩（Nm）<input id="max-motor-torque-nm" type="number" min="0" max="640.0" step="0.1" inputmode="decimal"></label><label for="max-brake-pressure-bar">每路 EHB 最大普通压力（bar）<input id="max-brake-pressure-bar" type="number" min="0" max="327.6" step="0.1" inputmode="decimal"></label><label for="service-brake-pressure-bar">每路 EHB 缓刹压力（bar）<input id="service-brake-pressure-bar" type="number" min="0" max="327.6" step="0.1" inputmode="decimal"></label><label for="hard-brake-pressure-bar">每路 EHB 急刹压力（bar）<input id="hard-brake-pressure-bar" type="number" min="0" max="327.6" step="0.1" inputmode="decimal"></label><label for="max-steering-deg">最大四轴转向角（°）<input id="max-steering-deg" type="number" min="0" max="30" step="0.5" inputmode="decimal"></label></div><p id="vehicle-hard-limits" class="muted">等待车端硬上限</p><label><input id="control-limits-confirm" type="checkbox">我已确认车辆处于隔离台架，并理解这些软件请求值尚未替代压力/转矩标定</label><div><button id="control-limits-apply" disabled>发送并等待车端确认</button><button id="control-limits-cancel">取消</button></div></dialog></main><script>)HTML" + std::string(web::kControlLogicJavaScript) + R"HTML(</script><script>
+const controlLogic=MineTeleopControlLogic;
 const consoleConfig=)HTML" + page_config.dump() + R"HTML(;
 const gamepadConfig=consoleConfig.gamepad;
 const limitConfig=consoleConfig.control_limits;
-const state={left:false,right:false,up:false,down:false,brake:false};
+const keys=controlLogic.KEY_BINDINGS;
+let state=controlLogic.deriveKeyState(controlLogic.createKeySet());
+const pressedControlKeys=controlLogic.createKeySet(),blockedControlKeys=controlLogic.createKeySet();
 const gamepadState={connected:false,steering:0,throttle:0,brake:0};
-const controlLimits={maxThrottle:limitConfig.initial_max_throttle,maxBrake:limitConfig.initial_max_brake,maxSteeringDeg:limitConfig.initial_max_steering_angle_deg};
-let vehicleHardLimits={max_throttle:1,max_brake:1,max_steering_angle_deg:limitConfig.steering_full_scale_deg,max_speed_kph:null,received:false};
+const controlProfileDefaults=controlLogic.normalizeControlProfile({target_speed_kph:limitConfig.initial_target_speed_kph,max_motor_torque_nm:limitConfig.initial_max_motor_torque_nm,max_brake_pressure_bar:limitConfig.initial_max_brake_pressure_bar,service_brake_pressure_bar:limitConfig.initial_service_brake_pressure_bar,hard_brake_pressure_bar:limitConfig.initial_hard_brake_pressure_bar});
+const controlLimits={maxSteeringDeg:limitConfig.initial_max_steering_angle_deg};
+let controlProfileState={requestedProfile:{...controlProfileDefaults},pendingRequestSeq:0,effectiveProfile:null,effectiveRequestSeq:0,acknowledged:false,reason:''},pendingControlProfileEnvelope=null,lastControlProfileSendAt=0,controlProfilePrepareInFlight=false,controlProfileGeneration=0,defaultProfileAutoAttempted=false;
+let vehicleHardLimits={max_throttle:0,max_brake_pressure_bar:0,max_steering_angle_deg:limitConfig.steering_full_scale_deg,max_speed_kph:0,max_target_speed_kph:0,full_scale_motor_torque_nm:0,received:false};
 const calibration={steeringCenter:gamepadConfig.steering_center,steeringRange:gamepadConfig.steering_range,throttleRest:gamepadConfig.throttle_rest,throttleRange:gamepadConfig.throttle_range,brakeRest:gamepadConfig.brake_rest,brakeRange:gamepadConfig.brake_range};
-const webrtcLabel=document.getElementById('webrtc'),cameraGrid=document.getElementById('cameras'),statusPanel=document.getElementById('status'),loginPanel=document.getElementById('login-panel'),sessionPanel=document.getElementById('session-panel'),passwordInput=document.getElementById('password'),vehicleSelect=document.getElementById('vehicle'),connectButton=document.getElementById('connect'),authExpiry=document.getElementById('auth-expiry'),vcuPanel=document.getElementById('vcu-panel'),vcuStatus=document.getElementById('vcu-status'),vcuGate=document.getElementById('vcu-gate'),vcuConnectButton=document.getElementById('vcu-connect'),vcuDisconnectButton=document.getElementById('vcu-disconnect'),controlLimitsOpen=document.getElementById('control-limits-open'),controlLimitsSummary=document.getElementById('control-limits-summary'),controlLimitsDialog=document.getElementById('control-limits-dialog'),maxThrottlePercent=document.getElementById('max-throttle-percent'),maxSteeringDeg=document.getElementById('max-steering-deg'),vehicleHardLimitsLabel=document.getElementById('vehicle-hard-limits'),controlLimitsConfirm=document.getElementById('control-limits-confirm'),controlLimitsApply=document.getElementById('control-limits-apply'),controlLimitsCancel=document.getElementById('control-limits-cancel'),estopStatus=document.getElementById('estop-status'),monitorPanel=document.getElementById('monitor-panel'),alertsPanel=document.getElementById('alerts'),streamMetrics=document.getElementById('stream-metrics'),inputReadiness=document.getElementById('input-readiness'),lastKeyboardEvent=document.getElementById('last-keyboard-event'),emptyStage=document.getElementById('empty-stage');
+const webrtcLabel=document.getElementById('webrtc'),cameraGrid=document.getElementById('cameras'),statusPanel=document.getElementById('status'),loginPanel=document.getElementById('login-panel'),sessionPanel=document.getElementById('session-panel'),passwordInput=document.getElementById('password'),vehicleSelect=document.getElementById('vehicle'),connectButton=document.getElementById('connect'),authExpiry=document.getElementById('auth-expiry'),vcuPanel=document.getElementById('vcu-panel'),vcuStatus=document.getElementById('vcu-status'),vcuGate=document.getElementById('vcu-gate'),vcuConnectButton=document.getElementById('vcu-connect'),vcuDisconnectButton=document.getElementById('vcu-disconnect'),controlLimitsOpen=document.getElementById('control-limits-open'),controlLimitsSummary=document.getElementById('control-limits-summary'),controlLimitsDialog=document.getElementById('control-limits-dialog'),targetSpeedKph=document.getElementById('target-speed-kph'),maxMotorTorqueNm=document.getElementById('max-motor-torque-nm'),maxBrakePressureBar=document.getElementById('max-brake-pressure-bar'),serviceBrakePressureBar=document.getElementById('service-brake-pressure-bar'),hardBrakePressureBar=document.getElementById('hard-brake-pressure-bar'),maxSteeringDeg=document.getElementById('max-steering-deg'),vehicleHardLimitsLabel=document.getElementById('vehicle-hard-limits'),controlLimitsConfirm=document.getElementById('control-limits-confirm'),controlLimitsApply=document.getElementById('control-limits-apply'),controlLimitsCancel=document.getElementById('control-limits-cancel'),estopStatus=document.getElementById('estop-status'),monitorPanel=document.getElementById('monitor-panel'),alertsPanel=document.getElementById('alerts'),streamMetrics=document.getElementById('stream-metrics'),inputReadiness=document.getElementById('input-readiness'),lastKeyboardEvent=document.getElementById('last-keyboard-event'),emptyStage=document.getElementById('empty-stage');
 const canFeedbackPanel=document.getElementById('can-feedback-panel'),canFeedbackStatus=document.getElementById('can-feedback-status'),canSpeed=document.getElementById('can-speed'),canGear=document.getElementById('can-gear'),canSelector=document.getElementById('can-selector'),canEpb=document.getElementById('can-epb'),canHandshake=document.getElementById('can-handshake'),canEmergency=document.getElementById('can-emergency'),canAge=document.getElementById('can-age'),wheelFeedbackGrid=document.getElementById('wheel-feedback-grid'),steeringFeedbackGrid=document.getElementById('steering-feedback-grid');
-const maxBrakePercent=document.getElementById('max-brake-percent'),operatorSpeed=document.getElementById('operator-speed'),operatorActualGear=document.getElementById('operator-actual-gear');
-const keyIndicators={left:document.getElementById('key-left'),right:document.getElementById('key-right'),up:document.getElementById('key-up'),down:document.getElementById('key-down'),brake:document.getElementById('key-brake')};
+const operatorSpeed=document.getElementById('operator-speed'),operatorActualGear=document.getElementById('operator-actual-gear');
+const keyIndicators={left:document.getElementById('key-left'),right:document.getElementById('key-right'),up:document.getElementById('key-up'),down:document.getElementById('key-down'),service_brake:document.getElementById('key-service-brake'),hard_brake:document.getElementById('key-hard-brake')};
 const controlReadouts={gear:document.getElementById('control-gear'),steering:document.getElementById('control-steering'),throttle:document.getElementById('control-throttle'),brake:document.getElementById('control-brake')};
 const operatorControlReadouts={gear:document.getElementById('operator-control-gear'),steering:document.getElementById('operator-control-steering'),throttle:document.getElementById('operator-control-throttle'),brake:document.getElementById('operator-control-brake')};
-let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,heartbeatInFlight=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
+let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,heartbeatInFlight=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,controlWriteActive=false,pendingControlWrite=null,lastControlStatusSeq=0;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
+let controlOutcomeSession={metrics:controlLogic.createControlOutcomeMetrics()};
 function responseError(response,body){const error=Error(body.error||response.status);error.status=response.status;return error}
 async function post(path,body={},signal=null){const options={method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)};if(signal)options.signal=signal;const r=await fetch(path,options);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 async function get(path){const r=await fetch(path);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 function clientLog(event,details={}){const entry={event,sent_at_utc_ms:Date.now(),details};console.info(JSON.stringify(entry));fetch('/api/browser-event',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(entry),keepalive:true}).catch(()=>{})}
+function resetControlOutcomeSession(){controlOutcomeSession={metrics:controlLogic.createControlOutcomeMetrics()}}
+function recordControlOutcome(outcome,command,session=controlOutcomeSession){const sequence=Number(command&&command.seq);session.metrics=controlLogic.reduceControlOutcome(session.metrics,outcome,sequence);if(controlLogic.shouldLogControlOutcome(outcome))clientLog('control_command_browser_outcome',{session_id:String(command&&command.session_id||''),vehicle_id:String(command&&command.vehicle_id||''),outcome,control_seq:sequence,...session.metrics})}
 function hasTurnServer(){return iceServers.some(server=>String(server.urls||'').includes('turn:')||(Array.isArray(server.urls)&&server.urls.some(url=>String(url).startsWith('turn:'))))}
 function safeIceEndpoint(value){const match=String(value||'').match(/^([a-z]+):(?:\/\/)?(?:[^@]*@)?(\[[^\]]+\]|[^:?/]+)(?::(\d+))?/i);return match?`${match[1].toLowerCase()}:${match[2]}${match[3]?`:${match[3]}`:''}`:'unknown'}
 function setMetric(id,text,level=''){const element=document.getElementById(id);element.textContent=text;element.classList.remove('ok','warn','critical');if(level)element.classList.add(level)}
@@ -945,10 +957,11 @@ function renderCanFeedback(){
 }
 function vcuGearLabel(value){const labels={1:'N',2:'R',3:'D'};return labels[Number(value)]||`不支持(${String(value)})`}
 function vcuEpbLabel(value){const labels={0:'保持',1:'释放',2:'已拉起'};return labels[Number(value)]||`异常(${String(value)})`}
-function vcuAdapterReady(status,explicit){if(explicit===true||explicit===false)return explicit;const state=status?.state||'unavailable';if(state==='unsupported')return true;if(['unavailable','closed','fault'].includes(state))return null;return true}
-function vcuDrivingReady(){const handshakeReady=vcuHandshake.ready||(!vcuHandshake.supported&&vcuHandshake.state==='unsupported');return vcuHandshake.adapter_ready===true&&handshakeReady}
+function vcuAdapterReady(status,explicit){return controlLogic.adapterReady(status,explicit)}
+function vcuDrivingReady(){return controlProfileState.acknowledged&&controlLogic.drivingReady(vcuHandshake)}
 function diagnoseVcuHandshake(channelOpen){
   if(!channelOpen)return{level:'warn',text:'连接步骤未完成：控制 DataChannel 尚未连接。'};
+  if(!controlProfileState.acknowledged)return{level:'warn',text:controlProfileState.pendingRequestSeq?`连接步骤未完成：等待车端确认会话控制参数序号 ${controlProfileState.pendingRequestSeq}。`:'连接步骤未完成：尚未发送或确认会话控制参数。'};
   if(!vcuHandshake.supported){
     if(vcuHandshake.state==='unsupported')return{level:'ok',text:'当前适配器不需要 VCU 平行驾驶握手。'};
     return{level:'warn',text:'连接步骤未完成：尚未收到车端 VCU 状态。'};
@@ -989,43 +1002,136 @@ function diagnoseVcuHandshake(channelOpen){
   };
   return{level:stateName==='ready'?'ok':'warn',text:stages[stateName]||`VCU 状态无法识别：${stateName}。`};
 }
-function renderVcuHandshake(){const labels={unavailable:'等待车端状态',unsupported:'当前适配器不支持 VCU 握手',closed:'车端适配器已关闭',standby:'待机（未请求）',initial:'启动 1/5 · 低握手帧',wait_parallel_handshake:'启动 2/5 · 智驾状态 5',wait_parking_brake_released:'启动 3/5 · 电子驻车释放',wait_gear:'启动 4/5 · 挡位闭环',wait_actuator_modes:'启动 5/5 · 执行器模式',ready:'握手成功（平行驾驶）',disarm_torque:'退出 1/5 · 扭矩归零',disarm_stop:'退出 2/5 · 车辆零速',disarm_neutral:'退出 3/5 · N 挡',disarm_parking_brake:'退出 4/5 · 电子驻车',disarm_manual:'退出 5/5 · 人工状态 3',disarmed:'已安全断开',fault:'VCU 通讯故障'};const channelOpen=Boolean(controlChannel&&controlChannel.readyState==='open'),supported=Boolean(vcuHandshake.supported),ready=Boolean(vcuHandshake.ready),disarming=Boolean(vcuHandshake.disarming),requested=Boolean(vcuHandshake.requested),adapterReady=vcuHandshake.adapter_ready===true,diagnostic=diagnoseVcuHandshake(channelOpen);vcuStatus.textContent=labels[vcuHandshake.state]||vcuHandshake.state||'未知';vcuStatus.className=ready&&adapterReady?'ok':(diagnostic.level==='critical'?'critical':'warn');vcuGate.textContent=diagnostic.text;vcuGate.className=`gate-copy ${diagnostic.level}`;const selector=vcuHandshake.driver_gear_request_valid?vcuGearLabel(vcuHandshake.driver_gear_request):'未知',speed=vcuHandshake.speed_valid?`${Number(vcuHandshake.speed_mps).toFixed(2)} m/s`:'未知',manual=vcuHandshake.handshake_valid?String(vcuHandshake.handshake_status):'未知',epb=Array.isArray(vcuHandshake.epb_status)?vcuHandshake.epb_status.map(vcuEpbLabel).join('/'):'未知';vcuGate.title=`控制链路 ${channelOpen?'已连接':'未连接'} · 选择器 ${selector} · 车速 ${speed} · 电子驻车 ${epb} · VCU状态 ${manual}`;vcuConnectButton.disabled=!channelOpen||!adapterReady||!supported||!vcuHandshake.parking_ready||requested||ready||disarming;vcuDisconnectButton.disabled=!channelOpen||!adapterReady||!supported||(!requested&&!ready&&!disarming)}
-function renderMonitoring(){renderVcuHandshake();renderCanFeedback();renderControlState();if(!authenticated){monitorPanel.hidden=true;return}monitorPanel.hidden=false;const runtime=latestRuntimeStatus||{},metrics=latestMetrics||{streams:[]},vehicles=runtime.authorized_vehicles||[],selected=vehicles.find(v=>v.vehicle_id===(runtime.vehicle_id||vehicleSelect.value));setMetric('metric-vehicle',selected?(selected.online?`${selected.vehicle_id} 在线`:`${selected.vehicle_id} 离线`):'未知',selected?.online?'ok':'warn');setMetric('metric-session',runtime.connected?`${runtime.session_id||'活动'} · ${metrics.connection_state||'等待媒体'}`:'未连接',runtime.connected?'ok':'warn');const authority=runtime.connected&&!controlAuthorityLost;setMetric('metric-authority',authority?'已获得':'无',authority?'ok':(controlAuthorityLost?'critical':'warn'));const codec=metrics.codec||mediaStatus.codec||'',backend=metrics.backend||mediaStatus.backend||'';setMetric('metric-video',codec||backend?`${codec||'未知'} / ${backend||'未知'}`:'等待媒体',codec?'ok':'warn');setMetric('metric-rtt',formatMetric(metrics.control_rtt_ms,1,' ms'),Number(metrics.control_rtt_ms)>200?'critical':(Number.isFinite(Number(metrics.control_rtt_ms))?'ok':'warn'));setMetric('metric-network',metrics.connection_method||'未知',metrics.connection_method==='TURN'?'warn':(metrics.connection_method&&metrics.connection_method!=='unknown'?'ok':'warn'));const turnConfigured=Boolean(metrics.turn_configured??hasTurnServer());setMetric('metric-turn',metrics.turn_in_use?'正在中继':(turnConfigured?'已配置，未使用':'未配置'),metrics.turn_in_use?'warn':(turnConfigured?'ok':'warn'));const sync=runtime.time_sync||metrics.time_sync||{},timeTrusted=runtime.signaling_available!==false&&Boolean(sync.synchronized)&&Number(sync.uncertainty_ms)<=consoleConfig.max_time_sync_uncertainty_ms;setMetric('metric-time',timeTrusted?`可信 ±${sync.uncertainty_ms} ms`:`不可信${Number.isFinite(Number(sync.uncertainty_ms))?` ±${sync.uncertainty_ms} ms`:''}`,timeTrusted?'ok':'critical');streamMetrics.replaceChildren();const streams=metrics.streams||[];if(!streams.length){const row=document.createElement('tr');const cell=document.createElement('td');cell.colSpan=5;cell.className='muted';cell.textContent='等待视频轨道';row.appendChild(cell);streamMetrics.appendChild(row)}for(const stream of streams){const row=document.createElement('tr');const loss=Number(stream.packet_loss_percent||0),fps=Number(stream.fps||0),latency=Number(stream.estimated_end_to_end_latency_ms||0);for(const [text,level] of [[stream.camera_id||stream.mid||'unknown',''],[formatMetric(fps,1),fps<20?'critical':'ok'],[formatMetric(stream.bitrate_kbps,0,' kbps'),''],[formatMetric(loss,2,'%'),loss>2?'warn':''],[formatMetric(latency,1,' ms'),latency>200?'critical':'ok']]){const cell=document.createElement('td');cell.textContent=text;if(level)cell.className=level;row.appendChild(cell)}streamMetrics.appendChild(row)}const alerts=[];let severity='';if(estopLatched){const confirmed=vehicleTelemetry?.estop===true;alerts.push(confirmed?'车辆急停已由车端遥测确认，仍需本地确认后复位':'急停请求已锁定但尚未收到车端确认；请准备使用车辆物理急停');severity='critical'}if(controlAuthorityLost){alerts.push('控制权或信令已丢失，当前页面不会继续发送驾驶命令');severity='critical'}else if(runtime.connected&&(!controlChannel||controlChannel.readyState!=='open')){alerts.push('控制 DataChannel 尚未就绪');if(!severity)severity='warn'}if(vcuHandshake.supported&&!vcuHandshake.ready){const diagnostic=diagnoseVcuHandshake(Boolean(controlChannel&&controlChannel.readyState==='open'));alerts.push(diagnostic.text);if(diagnostic.level==='critical')severity='critical';else if(!severity)severity='warn'}if(!timeTrusted){alerts.push('时间同步不可信，端到端时延只作参考');severity='critical'}for(const stream of streams){if(Number(stream.estimated_end_to_end_latency_ms)>200){alerts.push(`${stream.camera_id||'视频'} 时延超过 200 ms`);severity='critical'}if(Number(stream.fps)<20){alerts.push(`${stream.camera_id||'视频'} 低于 20 FPS`);severity='critical'}}if(!alerts.length)alerts.push(streams.length?'当前指标在目标范围内':'尚无媒体指标；控制命令不会在链路未就绪时发送');alertsPanel.textContent=alerts.join('；');alertsPanel.className=`alerts ${severity}`.trim();const alertKey=`${severity}:${alerts.join('|')}`;if(alertKey!==lastAlertKey){clientLog('control_monitor_state',{severity:severity||'ok',alerts});lastAlertKey=alertKey}}
-async function refreshRuntimeStatus(){if(!authenticated)return;try{latestRuntimeStatus=await get('/api/status');if(polling&&!latestRuntimeStatus.connected){closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='控制权丢失'}renderMonitoring()}catch(error){controlAuthorityLost=true;clearControlInput();webrtcLabel.textContent='本地状态读取失败';alertsPanel.textContent='无法读取本地运行状态: '+error.message;alertsPanel.className='alerts critical'}}
+function renderVcuHandshake(){const labels={unavailable:'等待车端状态',unsupported:'当前适配器不支持 VCU 握手',closed:'车端适配器已关闭',standby:'待机（未请求）',initial:'启动 1/5 · 低握手帧',wait_parallel_handshake:'启动 2/5 · 智驾状态 5',wait_parking_brake_released:'启动 3/5 · 电子驻车释放',wait_gear:'启动 4/5 · 挡位闭环',wait_actuator_modes:'启动 5/5 · 执行器模式',ready:'握手成功（平行驾驶）',disarm_torque:'退出 1/5 · 扭矩归零',disarm_stop:'退出 2/5 · 车辆零速',disarm_neutral:'退出 3/5 · N 挡',disarm_parking_brake:'退出 4/5 · 电子驻车',disarm_manual:'退出 5/5 · 人工状态 3',disarmed:'已安全断开',fault:'VCU 通讯故障'};const channelOpen=Boolean(controlChannel&&controlChannel.readyState==='open'),supported=Boolean(vcuHandshake.supported),ready=Boolean(vcuHandshake.ready),disarming=Boolean(vcuHandshake.disarming),requested=Boolean(vcuHandshake.requested),adapterReady=vcuHandshake.adapter_ready===true,diagnostic=diagnoseVcuHandshake(channelOpen);vcuStatus.textContent=labels[vcuHandshake.state]||vcuHandshake.state||'未知';vcuStatus.className=ready&&adapterReady&&controlProfileState.acknowledged?'ok':(diagnostic.level==='critical'?'critical':'warn');vcuGate.textContent=diagnostic.text;vcuGate.className=`gate-copy ${diagnostic.level}`;const selector=vcuHandshake.driver_gear_request_valid?vcuGearLabel(vcuHandshake.driver_gear_request):'未知',speed=vcuHandshake.speed_valid?`${Number(vcuHandshake.speed_mps).toFixed(2)} m/s`:'未知',manual=vcuHandshake.handshake_valid?String(vcuHandshake.handshake_status):'未知',epb=Array.isArray(vcuHandshake.epb_status)?vcuHandshake.epb_status.map(vcuEpbLabel).join('/'):'未知';vcuGate.title=`控制链路 ${channelOpen?'已连接':'未连接'} · 参数 ${controlProfileState.acknowledged?'已确认':'未确认'} · 选择器 ${selector} · 车速 ${speed} · 电子驻车 ${epb} · VCU状态 ${manual}`;vcuConnectButton.disabled=!channelOpen||!controlProfileState.acknowledged||!adapterReady||!supported||!vcuHandshake.parking_ready||requested||ready||disarming;vcuDisconnectButton.disabled=!channelOpen||!adapterReady||!supported||(!requested&&!ready&&!disarming)}
+function renderMonitoring(){const estopPresentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true);renderEstopRequest(estopPresentation);renderVcuHandshake();renderCanFeedback();renderControlState();if(!authenticated){monitorPanel.hidden=true;return}monitorPanel.hidden=false;const runtime=latestRuntimeStatus||{},metrics=latestMetrics||{streams:[]},vehicles=runtime.authorized_vehicles||[],selected=vehicles.find(v=>v.vehicle_id===(runtime.vehicle_id||vehicleSelect.value));setMetric('metric-vehicle',selected?(selected.online?`${selected.vehicle_id} 在线`:`${selected.vehicle_id} 离线`):'未知',selected?.online?'ok':'warn');setMetric('metric-session',runtime.connected?`${runtime.session_id||'活动'} · ${metrics.connection_state||'等待媒体'}`:'未连接',runtime.connected?'ok':'warn');const authority=runtime.connected&&!controlAuthorityLost;setMetric('metric-authority',authority?'已获得':'无',authority?'ok':(controlAuthorityLost?'critical':'warn'));const codec=metrics.codec||mediaStatus.codec||'',backend=metrics.backend||mediaStatus.backend||'';setMetric('metric-video',codec||backend?`${codec||'未知'} / ${backend||'未知'}`:'等待媒体',codec?'ok':'warn');setMetric('metric-rtt',formatMetric(metrics.control_rtt_ms,1,' ms'),Number(metrics.control_rtt_ms)>200?'critical':(Number.isFinite(Number(metrics.control_rtt_ms))?'ok':'warn'));setMetric('metric-network',metrics.connection_method||'未知',metrics.connection_method==='TURN'?'warn':(metrics.connection_method&&metrics.connection_method!=='unknown'?'ok':'warn'));const turnConfigured=Boolean(metrics.turn_configured??hasTurnServer());setMetric('metric-turn',metrics.turn_in_use?'正在中继':(turnConfigured?'已配置，未使用':'未配置'),metrics.turn_in_use?'warn':(turnConfigured?'ok':'warn'));const sync=runtime.time_sync||metrics.time_sync||{},timeTrusted=runtime.signaling_available!==false&&Boolean(sync.synchronized)&&Number(sync.uncertainty_ms)<=consoleConfig.max_time_sync_uncertainty_ms;setMetric('metric-time',timeTrusted?`可信 ±${sync.uncertainty_ms} ms`:`不可信${Number.isFinite(Number(sync.uncertainty_ms))?` ±${sync.uncertainty_ms} ms`:''}`,timeTrusted?'ok':'critical');streamMetrics.replaceChildren();const streams=metrics.streams||[];if(!streams.length){const row=document.createElement('tr');const cell=document.createElement('td');cell.colSpan=5;cell.className='muted';cell.textContent='等待视频轨道';row.appendChild(cell);streamMetrics.appendChild(row)}for(const stream of streams){const row=document.createElement('tr');const loss=Number(stream.packet_loss_percent||0),fps=Number(stream.fps||0),latency=Number(stream.estimated_end_to_end_latency_ms||0);for(const [text,level] of [[stream.camera_id||stream.mid||'unknown',''],[formatMetric(fps,1),fps<20?'critical':'ok'],[formatMetric(stream.bitrate_kbps,0,' kbps'),''],[formatMetric(loss,2,'%'),loss>2?'warn':''],[formatMetric(latency,1,' ms'),latency>200?'critical':'ok']]){const cell=document.createElement('td');cell.textContent=text;if(level)cell.className=level;row.appendChild(cell)}streamMetrics.appendChild(row)}const alerts=[];let severity='';if(estopPresentation.visible){alerts.push(estopPresentation.alert);severity=estopPresentation.severity}if(controlAuthorityLost){alerts.push('控制权或信令已丢失，当前页面不会继续发送驾驶命令');severity='critical'}else if(runtime.connected&&(!controlChannel||controlChannel.readyState!=='open')){alerts.push('控制 DataChannel 尚未就绪');if(!severity)severity='warn'}if(vcuHandshake.supported&&!vcuHandshake.ready){const diagnostic=diagnoseVcuHandshake(Boolean(controlChannel&&controlChannel.readyState==='open'));alerts.push(diagnostic.text);if(diagnostic.level==='critical')severity='critical';else if(!severity)severity='warn'}if(!timeTrusted){alerts.push('时间同步不可信，端到端时延只作参考');severity='critical'}for(const stream of streams){if(Number(stream.estimated_end_to_end_latency_ms)>200){alerts.push(`${stream.camera_id||'视频'} 时延超过 200 ms`);severity='critical'}if(Number(stream.fps)<20){alerts.push(`${stream.camera_id||'视频'} 低于 20 FPS`);severity='critical'}}if(!alerts.length)alerts.push(streams.length?'当前指标在目标范围内':'尚无媒体指标；控制命令不会在链路未就绪时发送');alertsPanel.textContent=alerts.join('；');alertsPanel.className=`alerts ${severity}`.trim();const alertKey=`${severity}:${alerts.join('|')}`;if(alertKey!==lastAlertKey){clientLog('control_monitor_state',{severity:severity||'ok',alerts});lastAlertKey=alertKey}}
+async function refreshRuntimeStatus(){if(!authenticated)return;try{latestRuntimeStatus=await get('/api/status');if(polling&&!latestRuntimeStatus.connected){closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='控制权丢失'}renderMonitoring()}catch(error){controlAuthorityLost=true;resetControlAuthorityInput();webrtcLabel.textContent='本地状态读取失败';alertsPanel.textContent='无法读取本地运行状态: '+error.message;alertsPanel.className='alerts critical'}}
 function clamp(value,min,max){return Math.min(max,Math.max(min,value))}
-function effectiveControlLimits(){return{maxThrottle:Math.min(controlLimits.maxThrottle,vehicleHardLimits.max_throttle),maxBrake:Math.min(controlLimits.maxBrake,vehicleHardLimits.max_brake),maxSteeringDeg:Math.min(controlLimits.maxSteeringDeg,vehicleHardLimits.max_steering_angle_deg)}}
-function renderControlLimits(){const effective=effectiveControlLimits();controlLimitsSummary.textContent=`油门 ≤${(effective.maxThrottle*100).toFixed(0)}% · 刹车 ≤${(effective.maxBrake*100).toFixed(0)}% · 转向 ≤${effective.maxSteeringDeg.toFixed(1)}°`;controlLimitsSummary.className=effective.maxThrottle<=0.1&&effective.maxBrake<=1&&effective.maxSteeringDeg<=5?'ok':'warn';maxThrottlePercent.max=String(vehicleHardLimits.max_throttle*100);maxBrakePercent.max=String(vehicleHardLimits.max_brake*100);maxSteeringDeg.max=String(vehicleHardLimits.max_steering_angle_deg);vehicleHardLimitsLabel.textContent=vehicleHardLimits.received?`车端硬上限：油门 ${(vehicleHardLimits.max_throttle*100).toFixed(0)}% · 人工刹车 ${(vehicleHardLimits.max_brake*100).toFixed(0)}% · 转向 ${vehicleHardLimits.max_steering_angle_deg.toFixed(1)}° · 配置速度 ${Number(vehicleHardLimits.max_speed_kph).toFixed(1)} km/h`:'等待车端硬上限；应用值仍会被车端再次截断'}
-async function updateVehicleHardLimits(value){if(!value||typeof value!=='object')return;const throttle=Number(value.max_throttle),brake=value.max_brake===undefined?1:Number(value.max_brake),steering=Number(value.max_steering_angle_deg),speed=Number(value.max_speed_kph);if(!Number.isFinite(throttle)||throttle<0||throttle>1||!Number.isFinite(brake)||brake<0||brake>1||!Number.isFinite(steering)||steering<0||steering>limitConfig.steering_full_scale_deg||!Number.isFinite(speed)||speed<0)return;vehicleHardLimits={max_throttle:throttle,max_brake:brake,max_steering_angle_deg:steering,max_speed_kph:speed,received:true};const previous={...controlLimits};controlLimits.maxThrottle=Math.min(controlLimits.maxThrottle,throttle);controlLimits.maxBrake=Math.min(controlLimits.maxBrake,brake);controlLimits.maxSteeringDeg=Math.min(controlLimits.maxSteeringDeg,steering);if(previous.maxThrottle!==controlLimits.maxThrottle||previous.maxBrake!==controlLimits.maxBrake||previous.maxSteeringDeg!==controlLimits.maxSteeringDeg){clearControlInput();if(previous.maxBrake!==controlLimits.maxBrake)await post('/api/control-limits',{max_brake:controlLimits.maxBrake});clientLog('control_limits_reduced_by_vehicle',{requested_max_throttle:previous.maxThrottle,requested_max_brake:previous.maxBrake,requested_max_steering_angle_deg:previous.maxSteeringDeg,effective_max_throttle:controlLimits.maxThrottle,effective_max_brake:controlLimits.maxBrake,effective_max_steering_angle_deg:controlLimits.maxSteeringDeg})}renderControlLimits()}
-function openControlLimits(){maxThrottlePercent.value=(controlLimits.maxThrottle*100).toFixed(0);maxBrakePercent.value=(controlLimits.maxBrake*100).toFixed(0);maxSteeringDeg.value=controlLimits.maxSteeringDeg.toFixed(1);controlLimitsConfirm.checked=false;controlLimitsApply.disabled=true;renderControlLimits();controlLimitsDialog.showModal()}
-async function applyControlLimits(){if(!controlLimitsConfirm.checked)throw Error('请先确认隔离台架条件');if(vcuHandshake.supported&&(!vcuHandshake.speed_valid||Math.abs(Number(vcuHandshake.speed_mps))>0.1))throw Error('VCU 车速未确认归零，禁止修改实车限幅');const throttlePercent=Number(maxThrottlePercent.value),brakePercent=Number(maxBrakePercent.value),steeringDeg=Number(maxSteeringDeg.value);if(!Number.isFinite(throttlePercent)||throttlePercent<0||throttlePercent>vehicleHardLimits.max_throttle*100)throw Error('油门上限超出车端硬上限');if(!Number.isFinite(brakePercent)||brakePercent<0||brakePercent>vehicleHardLimits.max_brake*100)throw Error('人工刹车上限超出车端硬上限');if(!Number.isFinite(steeringDeg)||steeringDeg<0||steeringDeg>vehicleHardLimits.max_steering_angle_deg)throw Error('转向上限超出车端硬上限');clearControlInput();const applied=await post('/api/control-limits',{max_brake:brakePercent/100});controlLimits.maxThrottle=throttlePercent/100;controlLimits.maxBrake=Number(applied.max_brake);controlLimits.maxSteeringDeg=steeringDeg;controlLimitsDialog.close();renderControlLimits();clientLog('driver_control_limits_applied',{max_throttle:controlLimits.maxThrottle,max_brake:controlLimits.maxBrake,max_steering_angle_deg:controlLimits.maxSteeringDeg,vehicle_hard_limits:vehicleHardLimits});statusPanel.textContent=`调试限幅已应用：油门 ${throttlePercent.toFixed(0)}%，人工刹车 ${brakePercent.toFixed(0)}%，转向 ${steeringDeg.toFixed(1)}°`;send({},false).catch(console.error)}
+function resetControlProfileSession(){controlProfileGeneration+=1;controlProfileState={requestedProfile:{...controlProfileDefaults},pendingRequestSeq:0,effectiveProfile:null,effectiveRequestSeq:0,acknowledged:false,reason:''};pendingControlProfileEnvelope=null;lastControlProfileSendAt=0;controlProfilePrepareInFlight=false;defaultProfileAutoAttempted=false;controlLimits.maxSteeringDeg=limitConfig.initial_max_steering_angle_deg;vehicleHardLimits={max_throttle:0,max_brake_pressure_bar:0,max_steering_angle_deg:limitConfig.steering_full_scale_deg,max_speed_kph:0,max_target_speed_kph:0,full_scale_motor_torque_nm:0,received:false}}
+function effectiveControlLimits(){const profile=controlProfileState.acknowledged?controlProfileState.effectiveProfile:null;if(!profile||!vehicleHardLimits.received)return{maxThrottle:0,maxBrakePressureBar:0,serviceBrakePressureBar:0,hardBrakePressureBar:0,maxSteeringDeg:0};return{maxThrottle:controlLogic.controlProfileThrottleLimit(profile,vehicleHardLimits),maxBrakePressureBar:profile.max_brake_pressure_bar,serviceBrakePressureBar:profile.service_brake_pressure_bar,hardBrakePressureBar:profile.hard_brake_pressure_bar,maxSteeringDeg:Math.min(controlLimits.maxSteeringDeg,vehicleHardLimits.max_steering_angle_deg)}}
+function renderControlLimits(){const profile=controlProfileState.effectiveProfile;if(controlProfileState.pendingRequestSeq)controlLimitsSummary.textContent=`等待车端确认参数序号 ${controlProfileState.pendingRequestSeq}`;else if(!controlProfileState.acknowledged||!profile)controlLimitsSummary.textContent='未获得车端会话参数确认';else controlLimitsSummary.textContent=`目标 ${profile.target_speed_kph.toFixed(1)} km/h · 单电机 ${profile.max_motor_torque_nm.toFixed(1)} Nm · EHB ${profile.service_brake_pressure_bar.toFixed(1)}/${profile.hard_brake_pressure_bar.toFixed(1)}/${profile.max_brake_pressure_bar.toFixed(1)} bar · 转向 ≤${Math.min(controlLimits.maxSteeringDeg,vehicleHardLimits.max_steering_angle_deg).toFixed(1)}°`;controlLimitsSummary.className=controlProfileState.acknowledged&&!controlProfileState.pendingRequestSeq?'ok':'warn';if(vehicleHardLimits.received){targetSpeedKph.max=String(vehicleHardLimits.max_target_speed_kph);maxMotorTorqueNm.max=String(vehicleHardLimits.full_scale_motor_torque_nm);maxBrakePressureBar.max=String(vehicleHardLimits.max_brake_pressure_bar);serviceBrakePressureBar.max=String(vehicleHardLimits.max_brake_pressure_bar);hardBrakePressureBar.max=String(vehicleHardLimits.max_brake_pressure_bar);maxSteeringDeg.max=String(vehicleHardLimits.max_steering_angle_deg)}vehicleHardLimitsLabel.textContent=vehicleHardLimits.received?`车端硬上限：目标 ${vehicleHardLimits.max_target_speed_kph.toFixed(1)} km/h · 单电机 ${vehicleHardLimits.full_scale_motor_torque_nm.toFixed(1)} Nm · 每路 EHB 普通压力 ${vehicleHardLimits.max_brake_pressure_bar.toFixed(1)} bar · 转向 ${vehicleHardLimits.max_steering_angle_deg.toFixed(1)}°`:'等待车端硬上限；普通驾驶保持禁用'}
+function sendPendingControlProfile(force=false){if(controlAuthorityLost||!pendingControlProfileEnvelope||!controlProfileState.pendingRequestSeq||controlProfileState.acknowledged||Number(pendingControlProfileEnvelope.seq)!==Number(controlProfileState.pendingRequestSeq)||!peer||peer.connectionState!=='connected'||!controlChannel||controlChannel.readyState!=='open')return false;const now=Date.now();if(!force&&now-lastControlProfileSendAt<200)return false;controlChannel.send(JSON.stringify(pendingControlProfileEnvelope));lastControlProfileSendAt=now;return true}
+async function prepareControlProfile(value,announce=true){if(controlProfilePrepareInFlight)throw Error('已有会话控制参数正在准备');if(!vehicleHardLimits.received)throw Error('尚未收到车端硬上限');const requested=controlLogic.normalizeControlProfile(value),bounded=controlLogic.mergeControlProfileWithHardLimits(requested,vehicleHardLimits);if(JSON.stringify(requested)!==JSON.stringify(bounded))throw Error('请求超出当前车辆硬上限');const activePeer=peer,activeChannel=controlChannel,activeProfileGeneration=controlProfileGeneration;if(!activePeer||activePeer.connectionState!=='connected'||!activeChannel||activeChannel.readyState!=='open')throw Error('控制 DataChannel 尚未连接');clearControlInput(false);controlProfilePrepareInFlight=true;try{const prepared=await post('/api/control-profile',requested);if(controlProfileGeneration!==activeProfileGeneration||controlAuthorityLost||peer!==activePeer||controlChannel!==activeChannel||activePeer.connectionState!=='connected'||activeChannel.readyState!=='open')throw Error('准备参数期间控制链路已变化');controlProfileState={...controlProfileState,requestedProfile:requested,pendingRequestSeq:Number(prepared.request.seq),acknowledged:false,reason:'pending'};pendingControlProfileEnvelope=prepared.request;lastControlProfileSendAt=0;sendPendingControlProfile(true);renderControlLimits();renderMonitoring();if(announce)statusPanel.textContent=`会话控制参数序号 ${prepared.request.seq} 已发送，等待车端确认`;return prepared}finally{if(controlProfileGeneration===activeProfileGeneration)controlProfilePrepareInFlight=false}}
+function applyControlProfileStatus(value){const wasAcknowledged=controlProfileState.acknowledged,next=controlLogic.reduceControlProfileStatus(controlProfileState,value);if(!next.matched)return false;controlProfileState=next;if(!controlProfileState.pendingRequestSeq)pendingControlProfileEnvelope=null;if(!controlProfileState.acknowledged&&(wasAcknowledged||next.invalidated))resetControlAuthorityInput();if(controlProfileState.acknowledged){statusPanel.textContent=`车端已确认会话控制参数序号 ${controlProfileState.effectiveRequestSeq}`;clientLog('session_control_profile_accepted',{request_seq:controlProfileState.effectiveRequestSeq,effective_profile:controlProfileState.effectiveProfile,reason:controlProfileState.reason})}else{statusPanel.textContent=`车端会话控制参数无效：${controlProfileState.reason}`;clientLog('session_control_profile_invalidated',{reason:controlProfileState.reason})}renderControlLimits();renderMonitoring();return true}
+function defaultControlProfileAutoReady(){return vcuHandshake.parking_ready===true||(vcuMockUnsupported()&&vcuHandshake.adapter_ready===true)}
+function updateVehicleHardLimits(value){if(!value||typeof value!=='object')return;try{const hard=controlLogic.normalizeVehicleHardLimits(value),steering=value.max_steering_angle_deg;if(typeof steering!=='number'||!Number.isFinite(steering)||steering<0||steering>limitConfig.steering_full_scale_deg)return;vehicleHardLimits={...hard,max_steering_angle_deg:steering,received:true};controlLimits.maxSteeringDeg=Math.min(controlLimits.maxSteeringDeg,steering);renderControlLimits();if(defaultProfileAutoAttempted||controlChannel?.readyState!=='open'||controlProfileState.acknowledged||controlProfileState.pendingRequestSeq||controlProfilePrepareInFlight||!defaultControlProfileAutoReady())return;const defaults=controlLogic.mergeControlProfileWithHardLimits(controlProfileDefaults,vehicleHardLimits);defaultProfileAutoAttempted=true;prepareControlProfile(defaults,false).catch(error=>{statusPanel.textContent='默认会话参数发送失败: '+error.message})}catch(error){clientLog('vehicle_hard_limits_invalid',{error:error.message})}}
+function openControlLimits(){const requested=controlProfileState.requestedProfile;targetSpeedKph.value=requested.target_speed_kph.toFixed(1);maxMotorTorqueNm.value=requested.max_motor_torque_nm.toFixed(1);maxBrakePressureBar.value=requested.max_brake_pressure_bar.toFixed(1);serviceBrakePressureBar.value=requested.service_brake_pressure_bar.toFixed(1);hardBrakePressureBar.value=requested.hard_brake_pressure_bar.toFixed(1);maxSteeringDeg.value=controlLimits.maxSteeringDeg.toFixed(1);controlLimitsConfirm.checked=false;controlLimitsApply.disabled=true;renderControlLimits();controlLimitsDialog.showModal()}
+async function applyControlLimits(){if(!controlLimitsConfirm.checked)throw Error('请先确认隔离台架条件');const requested=controlLogic.normalizeControlProfile({target_speed_kph:Number(targetSpeedKph.value),max_motor_torque_nm:Number(maxMotorTorqueNm.value),max_brake_pressure_bar:Number(maxBrakePressureBar.value),service_brake_pressure_bar:Number(serviceBrakePressureBar.value),hard_brake_pressure_bar:Number(hardBrakePressureBar.value)}),steeringDeg=Number(maxSteeringDeg.value);if(!Number.isFinite(steeringDeg)||steeringDeg<0||steeringDeg>vehicleHardLimits.max_steering_angle_deg)throw Error('转向上限超出车端硬上限');const prior=controlProfileState.effectiveProfile||{target_speed_kph:0,max_motor_torque_nm:0,max_brake_pressure_bar:0,service_brake_pressure_bar:0,hard_brake_pressure_bar:0};const requiresParking=requested.target_speed_kph>prior.target_speed_kph||requested.max_motor_torque_nm>prior.max_motor_torque_nm||requested.max_brake_pressure_bar!==prior.max_brake_pressure_bar||requested.service_brake_pressure_bar!==prior.service_brake_pressure_bar||requested.hard_brake_pressure_bar!==prior.hard_brake_pressure_bar||steeringDeg>controlLimits.maxSteeringDeg;if(requiresParking&&!defaultControlProfileAutoReady())throw Error('提高目标车速、转矩或转向上限，以及修改任一制动压力，都需要 N 挡、零速且电子驻车已拉起');defaultProfileAutoAttempted=true;await prepareControlProfile(requested);controlLimits.maxSteeringDeg=steeringDeg;controlLimitsDialog.close();clientLog('driver_control_profile_requested',{requested_profile:requested,max_steering_angle_deg:steeringDeg,vehicle_hard_limits:vehicleHardLimits})}
 function applyDeadzone(value){const magnitude=Math.abs(value),deadzone=gamepadConfig.axis_deadzone;if(magnitude<=deadzone)return 0;return Math.sign(value)*(magnitude-deadzone)/(1-deadzone)}
+)HTML" + R"HTML(
 function applyPedalDeadzone(value){const deadzone=gamepadConfig.axis_deadzone;return value<=deadzone?0:(value-deadzone)/(1-deadzone)}
 function axisValue(pad,index){return Number.isInteger(index)&&index>=0&&index<pad.axes.length&&Number.isFinite(pad.axes[index])?pad.axes[index]:null}
 function buttonValue(pad,index){return Number.isInteger(index)&&index>=0&&index<pad.buttons.length?Number(pad.buttons[index].value||0):0}
-function clearControlInput(){for(const key of Object.keys(state))state[key]=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState()}
+function syncControlKeyState(){state=controlLogic.deriveKeyState(pressedControlKeys)}
+function vcuMockUnsupported(value=vcuHandshake){return controlLogic.mockUnsupported(value)}
+function vcuAllowsGearChange(requestedGear){return controlLogic.allowsGearChange(selectedGear,requestedGear,vcuHandshake)}
+function updateSelectedGearFromInput(inputState){const next=controlLogic.deriveGearSelection(selectedGear,inputState,vcuHandshake);selectedGear=next.selectedGear;pendingGearRequest=next.pendingGearRequest;if(pendingGearRequest)statusPanel.textContent=`${selectedGear}→${pendingGearRequest} 换挡已阻止：需有效零速反馈；请停车后释放并重新按下方向键`;return next}
+function updateSelectedGearFromHeldDirections(){return updateSelectedGearFromInput(state)}
+function clearControlInput(resetGear=true){controlLogic.blockAndClearKeys(pressedControlKeys,blockedControlKeys);syncControlKeyState();gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;if(resetGear){selectedGear='N';pendingGearRequest=null}renderControlState()}
+function vcuStateRequiresFreshInput(value=vcuHandshake){return controlLogic.requiresFreshInput(value)}
+function vcuStateKeepsHeldInput(value=vcuHandshake){return controlLogic.keepsHeldInput(vcuEverReady,value)}
+function acceptControlStatusMessage(message){const decision=controlLogic.reduceStatusSequence(lastControlStatusSeq,message?.control_status_seq);if(!decision.accepted){const sequence=Number(message?.control_status_seq);clientLog('control_status_message_dropped',{event:message?.event||'unknown',control_status_seq:Number.isFinite(sequence)?sequence:null,last_control_status_seq:lastControlStatusSeq});return false}if(decision.gap>0)clientLog('control_status_sequence_gap',{event:message?.event||'unknown',control_status_seq:decision.lastSequence,last_control_status_seq:lastControlStatusSeq,missing_status_count:decision.gap});lastControlStatusSeq=decision.lastSequence;return true}
+function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}
+function updateVcuHandshakeState(value){const transition=controlLogic.transitionVcuState(vcuEverReady,value);vcuHandshake=value;vcuEverReady=transition.everReady;if(transition.resetInput)resetControlAuthorityInput()}
 function suspendSignalingPoll(){const generation=++signalingGeneration;polling=false;if(signalingPollAbort){signalingPollAbort.abort();signalingPollAbort=null}return generation}
-function closeRealtimeSession(){const generation=suspendSignalingPoll();clearControlInput();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
-function renderEstopRequest(){if(!estopLatched)return;const confirmed=vehicleTelemetry?.estop===true;estopStatus.hidden=false;estopStatus.textContent=confirmed?'车辆急停已由车端遥测确认；车辆必须本地确认后才能复位。':'急停请求已锁定；等待车端遥测确认，未确认时请使用车辆物理急停。'}
+function closeRealtimeSession(){const generation=suspendSignalingPoll();resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
+function renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true)){estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner}
 function latchEstop(source){if(estopLatched)return;estopLatched=true;clientLog('control_estop_request_latched',{source});renderEstopRequest();renderMonitoring()}
 function firstConnectedGamepad(){const pads=navigator.getGamepads?navigator.getGamepads():[];if(activeGamepadIndex!==null&&pads[activeGamepadIndex]?.connected)return pads[activeGamepadIndex];for(const pad of pads)if(pad?.connected){activeGamepadIndex=pad.index;return pad}activeGamepadIndex=null;return null}
-function sampleGamepad(){if(!gamepadConfig.enabled||document.hidden||!document.hasFocus()){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}const pad=firstConnectedGamepad();if(!pad){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}gamepadState.connected=true;const standard=pad.mapping==='standard';if(standard){const steering=axisValue(pad,0);let steeringValue=steering===null?0:(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);gamepadState.throttle=clamp(applyPedalDeadzone(buttonValue(pad,7)),0,1);gamepadState.brake=clamp(applyPedalDeadzone(buttonValue(pad,6)),0,1)}else{const steering=axisValue(pad,gamepadConfig.steering_axis),throttle=axisValue(pad,gamepadConfig.throttle_axis),brake=axisValue(pad,gamepadConfig.brake_axis);if(steering===null||throttle===null||brake===null){gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}let steeringValue=(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);const throttleDelta=gamepadConfig.throttle_inverted?calibration.throttleRest-throttle:throttle-calibration.throttleRest;const brakeDelta=gamepadConfig.brake_inverted?calibration.brakeRest-brake:brake-calibration.brakeRest;gamepadState.throttle=clamp(applyPedalDeadzone(throttleDelta/calibration.throttleRange),0,1);gamepadState.brake=clamp(applyPedalDeadzone(brakeDelta/calibration.brakeRange),0,1)}const estopPressed=buttonValue(pad,gamepadConfig.estop_button)>=0.5;if(estopPressed){if(!gamepadEstopPressedAt)gamepadEstopPressedAt=performance.now();if(performance.now()-gamepadEstopPressedAt>=consoleConfig.estop_hold_ms)latchEstop('Gamepad')}else gamepadEstopPressedAt=0;renderControlState()}
-function currentControl(extra={}){let steering=(state.left||state.right)?(state.left===state.right?0:(state.left?-1:1)):gamepadState.steering,throttle=gamepadState.throttle,brake=gamepadState.brake,gear='N';if(state.up!==state.down){throttle=1;gear=state.up?'D':'R'}else if(state.up&&state.down)throttle=0;else if(throttle>0)gear='D';if(state.brake)brake=1;if(brake>0){throttle=0;if(gear!=='R')gear='N'}const limits=effectiveControlLimits();return{gear,steering:clamp(steering,-1,1)*(limits.maxSteeringDeg/limitConfig.steering_full_scale_deg),throttle:clamp(throttle,0,1)*limits.maxThrottle,brake:clamp(brake,0,1)*limits.maxBrake,estop:estopLatched||Boolean(extra.estop)}}
+function applyGamepadNeutralInterlock(authorityReady,gearRequestPending=false){const next=controlLogic.reduceGamepadNeutralInterlock({requiresNeutral:gamepadRequiresNeutral,authorityReady,throttle:gamepadState.throttle,brake:gamepadState.brake,gearRequestPending});gamepadRequiresNeutral=next.requiresNeutral;gamepadState.throttle=next.throttle;gamepadState.brake=next.brake;return next}
+function sampleGamepad(){if(!gamepadConfig.enabled||document.hidden||!document.hasFocus()){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}const pad=firstConnectedGamepad();if(!pad){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}gamepadState.connected=true;const standard=pad.mapping==='standard';if(standard){const steering=axisValue(pad,0);let steeringValue=steering===null?0:(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);gamepadState.throttle=clamp(applyPedalDeadzone(buttonValue(pad,7)),0,1);gamepadState.brake=clamp(applyPedalDeadzone(buttonValue(pad,6)),0,1)}else{const steering=axisValue(pad,gamepadConfig.steering_axis),throttle=axisValue(pad,gamepadConfig.throttle_axis),brake=axisValue(pad,gamepadConfig.brake_axis);if(steering===null||throttle===null||brake===null){gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}let steeringValue=(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);const throttleDelta=gamepadConfig.throttle_inverted?calibration.throttleRest-throttle:throttle-calibration.throttleRest;const brakeDelta=gamepadConfig.brake_inverted?calibration.brakeRest-brake:brake-calibration.brakeRest;gamepadState.throttle=clamp(applyPedalDeadzone(throttleDelta/calibration.throttleRange),0,1);gamepadState.brake=clamp(applyPedalDeadzone(brakeDelta/calibration.brakeRange),0,1)}const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported();applyGamepadNeutralInterlock(gamepadAuthorityReady);if(gamepadState.throttle>0&&selectedGear==='N'){const nextGear=updateSelectedGearFromInput({up:true,down:false});if(nextGear.pendingGearRequest)applyGamepadNeutralInterlock(gamepadAuthorityReady,true)}const estopPressed=buttonValue(pad,gamepadConfig.estop_button)>=0.5;if(estopPressed){if(!gamepadEstopPressedAt)gamepadEstopPressedAt=performance.now();if(performance.now()-gamepadEstopPressedAt>=consoleConfig.estop_hold_ms)latchEstop('Gamepad')}else gamepadEstopPressedAt=0;renderControlState()}
+function currentControl(extra={}){return controlLogic.deriveControl({keyState:state,gamepad:gamepadState,selectedGear,limits:effectiveControlLimits(),steeringFullScaleDeg:limitConfig.steering_full_scale_deg,estop:estopLatched||Boolean(extra.estop)})}
 function setControlReadout(name,text,active=false){for(const element of [controlReadouts[name],operatorControlReadouts[name]]){element.textContent=text;element.parentElement?.classList.toggle('active',active)}}
-function renderControlState(){const control=currentControl();for(const [name,element] of Object.entries(keyIndicators)){const active=Boolean(state[name]);element.classList.toggle('active',active);element.setAttribute('aria-pressed',String(active))}setControlReadout('gear',control.gear);setControlReadout('steering',control.steering.toFixed(2),Math.abs(control.steering)>0.001);setControlReadout('throttle',control.throttle.toFixed(2),control.throttle>0.001);setControlReadout('brake',control.brake.toFixed(2),control.brake>0.001);const linkReady=polling&&peer?.connectionState==='connected'&&controlChannel?.readyState==='open',ready=linkReady&&vcuDrivingReady();inputReadiness.textContent=estopLatched?'急停请求锁定':(ready?'控制已就绪':(linkReady?'等待 VCU 握手':(polling?'等待控制链路':'等待连接')));inputReadiness.className=`status-chip ${estopLatched?'critical':(ready?'ok':'warn')}`}
+function renderControlState(){const control=currentControl();for(const [name,element] of Object.entries(keyIndicators)){const active=Boolean(state[name]);element.classList.toggle('active',active);element.setAttribute('aria-pressed',String(active))}setControlReadout('gear',control.gear);setControlReadout('steering',control.steering.toFixed(2),Math.abs(control.steering)>0.001);setControlReadout('throttle',control.throttle.toFixed(2),control.throttle>0.001);setControlReadout('brake',control.brake.toFixed(2),control.brake>0.001);const linkReady=polling&&peer?.connectionState==='connected'&&controlChannel?.readyState==='open',vcuReady=vcuDrivingReady(),ready=linkReady&&vcuReady,retainedWait=vcuHandshake.adapter_ready===true&&vcuEverReady&&vcuHandshake.state==='wait_gear'?'换挡闭环中（输入保持）':(vcuHandshake.adapter_ready===true&&vcuEverReady&&vcuHandshake.state==='wait_actuator_modes'?'执行器闭环中（输入保持）':''),terminalState=vcuStateRequiresFreshInput(vcuHandshake),freshReadyRequired=linkReady&&vcuHandshake.ready&&!vcuEverReady;inputReadiness.textContent=estopLatched?'急停请求锁定':(pendingGearRequest?`等待有效零速后重新选择 ${pendingGearRequest}`:(ready?'控制已就绪':(retainedWait||(terminalState?'VCU 故障/退出，输入已清除':(freshReadyRequired?'输入已清除，等待新鲜 VCU Ready':(linkReady?'等待 VCU 握手':(polling?'等待控制链路':'等待连接')))))));inputReadiness.className=`status-chip ${estopLatched||terminalState?'critical':(ready?'ok':'warn')}`}
 function renderVehicles(vehicles=[]){const previous=vehicleSelect.value,currentVehicle=latestRuntimeStatus.connected?latestRuntimeStatus.vehicle_id:'';vehicleSelect.replaceChildren();let firstSelectable='',previousAvailable=false;const labels={online:'在线可控',offline:'离线',active:'控制中',reserved:'已预留',connecting:'连接中',revoked:'已撤销'};for(const vehicle of vehicles){const option=document.createElement('option'),current=vehicle.vehicle_id===currentVehicle,selectable=vehicle.controllable||current;option.value=vehicle.vehicle_id;option.textContent=`${vehicle.vehicle_id} · ${current?'当前会话':(labels[vehicle.state]||vehicle.state)}`;option.disabled=!selectable;if(selectable&&!firstSelectable)firstSelectable=vehicle.vehicle_id;if(selectable&&vehicle.vehicle_id===previous)previousAvailable=true;vehicleSelect.appendChild(option)}vehicleSelect.value=previousAvailable?previous:firstSelectable;connectButton.disabled=connecting||!vehicleSelect.value}
 function renderAuthExpiry(expiresAt){authExpiry.textContent=expiresAt?`认证有效至 ${new Date(expiresAt).toLocaleString()}`:''}
 function requireLogin(message){closeRealtimeSession();authenticated=false;controlAuthorityLost=false;connectButton.textContent='连接所选车辆';renderAuthExpiry(0);sessionPanel.hidden=true;vcuPanel.hidden=true;monitorPanel.hidden=true;loginPanel.hidden=false;statusPanel.textContent=message;clientLog('driver_reauthentication_required',{reason:message})}
 function handleVehicleRefreshError(error){if(error.status===401){requireLogin('登录已失效，请重新认证: '+error.message);return}statusPanel.textContent='车辆状态刷新失败，当前会话已保留: '+error.message;clientLog('vehicle_list_refresh_failed',{error:error.message})}
 async function login(){const password=passwordInput.value;if(!password)throw Error('请输入驾驶员密码');passwordInput.value='';const result=await post('/api/login',{password});authenticated=true;controlAuthorityLost=false;webrtcLabel.textContent='未连接';loginPanel.hidden=true;sessionPanel.hidden=false;vcuPanel.hidden=false;renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);sampleGamepad();latestRuntimeStatus=await get('/api/status');renderMonitoring();statusPanel.textContent=`已登录 ${result.driver_id}，请选择在线车辆`;clientLog('driver_login_succeeded',{driver_id:result.driver_id,authorized_vehicle_count:(result.vehicles||[]).length})}
-async function refreshVehicles(){if(!authenticated)return;const result=await get('/api/vehicles');renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);if(result.signaling_available===false){controlAuthorityLost=true;connectButton.disabled=true;statusPanel.textContent='信令服务暂时不可用；车辆列表为安全快照，禁止建立控制会话';renderMonitoring();return}if(result.signaling_restart_recovered){closeRealtimeSession();controlAuthorityLost=true;latestRuntimeStatus=await get('/api/status');connectButton.textContent='连接所选车辆';webrtcLabel.textContent='服务已恢复，需重新建立控制会话';statusPanel.textContent='信令服务已重启，驾驶员身份已自动恢复；旧控制权未恢复，请重新选择车辆';clientLog('signaling_restart_recovered',{previous_service_instance_id:result.previous_service_instance_id,service_instance_id:result.service_instance_id,control_authority_recovered:false});renderMonitoring()}}
-function sendVcuHandshakeCommand(action){if(!controlChannel||controlChannel.readyState!=='open')throw Error('控制 DataChannel 尚未连接');if(vcuHandshake.adapter_ready!==true)throw Error('VCU 适配器尚未就绪');if(!['connect','disconnect'].includes(action))throw Error('VCU 握手命令非法');if(action==='disconnect'){clearControlInput();vcuHandshake={...vcuHandshake,ready:false,disarming:true}}else vcuHandshake={...vcuHandshake,requested:true};renderMonitoring();controlChannel.send(JSON.stringify({event:'vcu_handshake_command',action,sent_at_utc_ms:Date.now()}));clientLog('driver_vcu_handshake_command',{action});statusPanel.textContent=action==='connect'?'已请求开始 VCU 平行驾驶握手':'已请求安全断开 VCU 握手'}
-async function send(extra={},announceUnavailable=true){if(!peer||peer.connectionState!=='connected'||!controlChannel||controlChannel.readyState!=='open'){clearControlInput();if(announceUnavailable)webrtcLabel.textContent='控制链路中断';return{sent:false}}const estopRequested=estopLatched||Boolean(extra.estop);if(estopRequested&&vcuHandshake.adapter_ready===false){clearControlInput();if(announceUnavailable)statusPanel.textContent='VCU 适配器明确不可用，远程急停未发送；请使用车辆物理急停';return{sent:false,reason:'vcu_adapter_unavailable'}}if(!vcuDrivingReady()&&!estopRequested){clearControlInput();if(announceUnavailable)statusPanel.textContent='VCU 平行驾驶握手未成功，驾驶命令已阻止';return{sent:false,reason:'vcu_handshake_not_ready'}}if(controlChannel.bufferedAmount>4096){clearControlInput();webrtcLabel.textContent='控制链路拥塞';return{sent:false,reason:'buffered_amount_limit'}}const prepared=await post('/api/control',currentControl(extra));controlChannel.send(JSON.stringify(prepared.command));if(webrtcLabel.textContent==='控制链路拥塞')webrtcLabel.textContent='控制链路已连接';return{...prepared,sent:true}}
-async function heartbeat(){if(!polling||heartbeatInFlight)return;heartbeatInFlight=true;try{sampleGamepad();await send({},false)}finally{heartbeatInFlight=false}}
+async function refreshVehicles(){if(!authenticated)return;const result=await get('/api/vehicles');renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);if(result.signaling_available===false){controlAuthorityLost=true;resetControlAuthorityInput();connectButton.disabled=true;statusPanel.textContent='信令服务暂时不可用；车辆列表为安全快照，禁止建立控制会话';renderMonitoring();return}if(result.signaling_restart_recovered){closeRealtimeSession();controlAuthorityLost=true;latestRuntimeStatus=await get('/api/status');connectButton.textContent='连接所选车辆';webrtcLabel.textContent='服务已恢复，需重新建立控制会话';statusPanel.textContent='信令服务已重启，驾驶员身份已自动恢复；旧控制权未恢复，请重新选择车辆';clientLog('signaling_restart_recovered',{previous_service_instance_id:result.previous_service_instance_id,service_instance_id:result.service_instance_id,control_authority_recovered:false});renderMonitoring()}}
+function sendVcuHandshakeCommand(action){if(!controlChannel||controlChannel.readyState!=='open')throw Error('控制 DataChannel 尚未连接');if(action==='connect'&&!controlProfileState.acknowledged)throw Error('会话控制参数尚未获得车端确认');if(vcuHandshake.adapter_ready!==true)throw Error('VCU 适配器尚未就绪');if(!['connect','disconnect'].includes(action))throw Error('VCU 握手命令非法');if(action==='disconnect'){resetControlAuthorityInput();vcuHandshake={...vcuHandshake,ready:false,disarming:true}}else vcuHandshake={...vcuHandshake,requested:true};renderMonitoring();controlChannel.send(JSON.stringify({event:'vcu_handshake_command',action,sent_at_utc_ms:Date.now()}));clientLog('driver_vcu_handshake_command',{action});statusPanel.textContent=action==='connect'?'已请求开始 VCU 平行驾驶握手':'已请求安全断开 VCU 握手'}
+async function writeControl(extra,announceUnavailable){
+  const activePeer=peer,activeChannel=controlChannel,outcomeSession=controlOutcomeSession;
+  if(controlAuthorityLost||!activePeer||activePeer.connectionState!=='connected'||!activeChannel||activeChannel.readyState!=='open'){
+    resetControlAuthorityInput();
+    if(announceUnavailable)webrtcLabel.textContent=controlAuthorityLost?'控制权丢失':'控制链路中断';
+    return{sent:false,reason:controlAuthorityLost?'control_authority_lost':'control_link_unavailable'};
+  }
+  const estopRequested=estopLatched||Boolean(extra.estop);
+  if(!estopRequested&&!controlProfileState.acknowledged){
+    resetControlAuthorityInput();
+    if(announceUnavailable)statusPanel.textContent='会话控制参数尚未获得车端确认，驾驶命令已阻止';
+    return{sent:false,reason:'control_profile_not_acknowledged'};
+  }
+  const retainedWait=vcuHandshake.adapter_ready===true&&vcuStateKeepsHeldInput(vcuHandshake);
+  if(estopRequested&&vcuHandshake.adapter_ready===false){
+    resetControlAuthorityInput();
+    if(announceUnavailable)statusPanel.textContent='VCU 适配器明确不可用，远程急停未发送；请使用车辆物理急停';
+    return{sent:false,reason:'vcu_adapter_unavailable'};
+  }
+  if(!vcuDrivingReady()&&!estopRequested){
+    if(!retainedWait){
+      if(vcuHandshake.adapter_ready!==true||vcuStateRequiresFreshInput(vcuHandshake))resetControlAuthorityInput();
+      if(announceUnavailable)statusPanel.textContent='VCU 平行驾驶握手未成功，驾驶命令已阻止';
+      return{sent:false,reason:'vcu_handshake_not_ready'};
+    }
+  }
+  if(activeChannel.bufferedAmount>4096&&!estopRequested){
+    resetControlAuthorityInput();
+    webrtcLabel.textContent='控制链路拥塞，输入已清除';
+    return{sent:false,reason:'buffered_amount_limit'};
+  }
+  const outgoing=currentControl(extra);
+  if(retainedWait&&!estopRequested)outgoing.throttle=0;
+  const outgoingSnapshot=controlLogic.controlSnapshot(outgoing);
+  let prepared;
+  try{prepared=await post('/api/control',outgoing)}catch(error){
+    if([401,403,409].includes(error.status)){controlAuthorityLost=true;resetControlAuthorityInput();resetControlProfileSession()}
+    throw error;
+  }
+  recordControlOutcome('prepared',prepared.command,outcomeSession);
+  if(controlAuthorityLost||peer!==activePeer||controlChannel!==activeChannel||activePeer.connectionState!=='connected'||activeChannel.readyState!=='open'){
+    recordControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession);
+    resetControlAuthorityInput();
+    return{sent:false,reason:'control_link_changed'};
+  }
+  if(estopRequested&&vcuHandshake.adapter_ready===false){
+    recordControlOutcome('post_prepare_vcu_not_ready',prepared.command,outcomeSession);
+    resetControlAuthorityInput();
+    if(announceUnavailable)statusPanel.textContent='VCU 适配器明确不可用，远程急停未发送；请使用车辆物理急停';
+    return{sent:false,reason:'vcu_adapter_unavailable'};
+  }
+  const stillVcuReady=vcuDrivingReady(),stillRetainedWait=vcuHandshake.adapter_ready===true&&vcuStateKeepsHeldInput(vcuHandshake);
+  if(!stillVcuReady&&!estopRequested){
+    if(!stillRetainedWait||!retainedWait){
+      recordControlOutcome('post_prepare_vcu_not_ready',prepared.command,outcomeSession);
+      if(vcuHandshake.adapter_ready!==true||vcuStateRequiresFreshInput(vcuHandshake))resetControlAuthorityInput();
+      return{sent:false,reason:'vcu_handshake_not_ready'};
+    }
+  }
+  const latestOutgoing=currentControl(extra);
+  if(stillRetainedWait&&!estopRequested)latestOutgoing.throttle=0;
+  if(controlLogic.controlIntentSuperseded(outgoingSnapshot,latestOutgoing)){
+    recordControlOutcome('superseded',prepared.command,outcomeSession);
+    return{sent:false,reason:'control_intent_superseded'};
+  }
+  try{activeChannel.send(JSON.stringify(prepared.command))}catch(error){
+    recordControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession);
+    resetControlAuthorityInput();
+    throw error;
+  }
+  recordControlOutcome('forwarded',prepared.command,outcomeSession);
+  if(webrtcLabel.textContent==='控制链路拥塞，输入已清除')webrtcLabel.textContent='控制链路已连接';
+  return{...prepared,delivery_state:'browser_data_channel_send_invoked'};
+}
+function enqueueControlWrite(extra,announceUnavailable){return new Promise((resolve,reject)=>{if(pendingControlWrite){pendingControlWrite.extra={...pendingControlWrite.extra,...extra,estop:Boolean(pendingControlWrite.extra.estop||extra.estop)};pendingControlWrite.announceUnavailable=pendingControlWrite.announceUnavailable||announceUnavailable;pendingControlWrite.waiters.push({resolve,reject})}else pendingControlWrite={extra:{...extra},announceUnavailable,waiters:[{resolve,reject}]};drainControlWrites().catch(console.error)})}
+async function drainControlWrites(){if(controlWriteActive)return;controlWriteActive=true;try{while(pendingControlWrite){const request=pendingControlWrite;pendingControlWrite=null;try{const result=await writeControl(request.extra,request.announceUnavailable);for(const waiter of request.waiters)waiter.resolve(result)}catch(error){for(const waiter of request.waiters)waiter.reject(error)}}}finally{controlWriteActive=false;if(pendingControlWrite)drainControlWrites().catch(console.error)}}
+async function send(extra={},announceUnavailable=true){return enqueueControlWrite(extra,announceUnavailable)}
+async function heartbeat(){if(!polling||heartbeatInFlight)return;heartbeatInFlight=true;try{sampleGamepad();sendPendingControlProfile();await send({},false)}finally{heartbeatInFlight=false}}
 function advertisedCodecs(){const caps=RTCRtpReceiver.getCapabilities&&RTCRtpReceiver.getCapabilities('video');const found=new Set(['h264']);for(const c of (caps&&caps.codecs)||[]){const m=(c.mimeType||'').toLowerCase();if(m.includes('h265')||m.includes('hevc'))found.add('h265');if(m.includes('h264')||m.includes('avc'))found.add('h264')}return [...found]}
 async function connect(){if(connecting)return;const target=vehicleSelect.value;if(!target)throw Error('没有可连接的在线车辆');const fromVehicle=latestRuntimeStatus.connected?latestRuntimeStatus.vehicle_id:'';if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}const changingVehicle=Boolean(fromVehicle)&&fromVehicle!==target;const reconnecting=Boolean(fromVehicle)&&fromVehicle===target;const hadRealtime=polling;let suspendedGeneration=signalingGeneration;if((changingVehicle||reconnecting)&&hadRealtime){suspendedGeneration=suspendSignalingPoll();clearControlInput()}connecting=true;connectButton.disabled=true;if(changingVehicle){webrtcLabel.textContent='正在安全切换车辆';statusPanel.textContent=`正在验证 ${target}，成功后释放 ${fromVehicle}`;clientLog('driver_vehicle_switch_started',{from_vehicle_id:fromVehicle,to_vehicle_id:target})}let session=null,generation=signalingGeneration;try{session=await post('/api/connect',{vehicle_id:target});generation=closeRealtimeSession();controlAuthorityLost=true;const ice=await post('/api/webrtc/ice-servers');iceServers=ice.ice_servers||[];await post('/api/webrtc/capabilities',{codecs:advertisedCodecs()});polling=true;controlAuthorityLost=false;latestRuntimeStatus=await get('/api/status');webrtcLabel.textContent='等待车端媒体';statusPanel.textContent=`会话 ${session.session_id} · ${session.vehicle_id}`;connectButton.textContent='切换所选车辆';document.querySelector('main').focus();renderMonitoring();clientLog(changingVehicle?'driver_vehicle_switched':(reconnecting?'driver_session_reconnected':'driver_session_connected'),{from_vehicle_id:fromVehicle||undefined,session_id:session.session_id,vehicle_id:session.vehicle_id});pollSignaling(generation)}catch(error){if(session)await post('/api/end-session',{reason:'driver_connect_setup_failed'}).catch(()=>{});latestRuntimeStatus=await get('/api/status').catch(()=>({connected:false}));const retained=Boolean(!session&&latestRuntimeStatus.connected&&hadRealtime);if(retained){polling=true;controlAuthorityLost=false;webrtcLabel.textContent=controlChannel&&controlChannel.readyState==='open'?'控制链路已连接':'当前会话已保留';statusPanel.textContent=`切换失败，当前会话已保留: ${error.message}`;clientLog('driver_vehicle_switch_rejected',{from_vehicle_id:fromVehicle,to_vehicle_id:target,error:error.message});pollSignaling(suspendedGeneration)}else{controlAuthorityLost=Boolean(latestRuntimeStatus.connected)}connectButton.textContent=latestRuntimeStatus.connected?'切换所选车辆':'连接所选车辆';renderMonitoring();if(!retained)throw error}finally{connecting=false;connectButton.disabled=!vehicleSelect.value}}
 async function logout(){const estopConfirmed=vehicleTelemetry?.estop===true;closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='正在释放控制权';await post('/api/disconnect',{reason:'driver_safe_logout'});authenticated=false;controlAuthorityLost=false;connectButton.textContent='连接所选车辆';renderAuthExpiry(0);sessionPanel.hidden=true;vcuPanel.hidden=true;canFeedbackPanel.hidden=true;monitorPanel.hidden=true;loginPanel.hidden=false;webrtcLabel.textContent='未连接';statusPanel.textContent=estopLatched?(estopConfirmed?'已安全退出；车辆急停已确认，仍需本地确认复位':'已安全退出；急停请求未获车端确认，请在车辆本地核实'):'已安全退出';clientLog('driver_safe_logout',{estop_request_latched:estopLatched,estop_confirmed:estopConfirmed})}
 addEventListener('pagehide',()=>{closeRealtimeSession();if(authenticated)fetch('/api/disconnect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({reason:'browser_page_closed'}),keepalive:true}).catch(()=>{})});
-function neutralizeInput(){clearControlInput();send({},false).catch(console.error)}
+function neutralizeInput(){clearControlInput(false);send({},false).catch(console.error)}
 addEventListener('blur',neutralizeInput);document.addEventListener('visibilitychange',()=>{if(document.hidden)neutralizeInput()});
 document.querySelector('#login').onclick=()=>login().catch(e=>{statusPanel.textContent='登录失败: '+e.message});
 passwordInput.addEventListener('keydown',e=>{if(e.key==='Enter')login().catch(error=>{statusPanel.textContent='登录失败: '+error.message})});
@@ -1038,15 +1144,13 @@ controlLimitsApply.onclick=()=>applyControlLimits().catch(error=>{statusPanel.te
 controlLimitsCancel.onclick=()=>controlLimitsDialog.close();
 vcuConnectButton.onclick=()=>{try{sendVcuHandshakeCommand('connect')}catch(error){statusPanel.textContent='开始握手失败: '+error.message}};
 vcuDisconnectButton.onclick=()=>{try{sendVcuHandshakeCommand('disconnect')}catch(error){statusPanel.textContent='断开握手失败: '+error.message}};
-const keys={ArrowLeft:'left',KeyA:'left',ArrowRight:'right',KeyD:'right',ArrowUp:'up',KeyW:'up',ArrowDown:'down',KeyS:'down',Space:'brake'};
-const keyNames={left:'左转',right:'右转',up:'前进',down:'倒车',brake:'刹车'};
+const keyNames={left:'左转',right:'右转',up:'前进',down:'倒车',service_brake:'缓刹',hard_brake:'急刹'};
 renderControlLimits();
-get('/api/control-limits').then(value=>{const maxBrake=Number(value.max_brake);if(Number.isFinite(maxBrake)&&maxBrake>=0&&maxBrake<=1){controlLimits.maxBrake=maxBrake;renderControlLimits()}}).catch(console.error);
 renderControlState();
-addEventListener('gamepadconnected',e=>{activeGamepadIndex=e.gamepad.index;sampleGamepad();clientLog('gamepad_connected',{id:e.gamepad.id,mapping:e.gamepad.mapping,axes:e.gamepad.axes.length,buttons:e.gamepad.buttons.length})});addEventListener('gamepaddisconnected',e=>{if(activeGamepadIndex===e.gamepad.index)activeGamepadIndex=null;clearControlInput();clientLog('gamepad_disconnected',{id:e.gamepad.id})});
+addEventListener('gamepadconnected',e=>{activeGamepadIndex=e.gamepad.index;sampleGamepad();clientLog('gamepad_connected',{id:e.gamepad.id,mapping:e.gamepad.mapping,axes:e.gamepad.axes.length,buttons:e.gamepad.buttons.length})});addEventListener('gamepaddisconnected',e=>{if(activeGamepadIndex===e.gamepad.index)activeGamepadIndex=null;gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;renderControlState();clientLog('gamepad_disconnected',{id:e.gamepad.id})});
 function editingTarget(target){return ['INPUT','SELECT','TEXTAREA','BUTTON'].includes(target?.tagName)||Boolean(target?.isContentEditable)}
-addEventListener('keydown',e=>{const binding=keys[e.code],estopKey=e.code==='KeyE';if(!binding&&!estopKey)return;if(editingTarget(e.target))return;e.preventDefault();if(!polling){lastKeyboardEvent.textContent=`${estopKey?'急停':keyNames[binding]}已截获 · 等待连接`;return}if(estopKey){if(!e.repeat){lastKeyboardEvent.textContent='急停请求已锁定 · E';latchEstop('键盘 E');send({estop:true}).catch(console.error)}return}if(!state[binding]){state[binding]=true;lastKeyboardEvent.textContent=`${keyNames[binding]}按下 · ${e.code}`;renderControlState();send().catch(console.error)}});
-addEventListener('keyup',e=>{const binding=keys[e.code];if(!binding||editingTarget(e.target))return;e.preventDefault();state[binding]=false;lastKeyboardEvent.textContent=`${keyNames[binding]}释放 · ${e.code}`;renderControlState();if(polling)send().catch(console.error)});
+addEventListener('keydown',e=>{const binding=keys[e.code],estopKey=e.code==='KeyE';if(!binding&&!estopKey)return;if(editingTarget(e.target))return;e.preventDefault();if(!polling){if(binding)controlLogic.blockKey(blockedControlKeys,e.code);lastKeyboardEvent.textContent=`${estopKey?'急停':keyNames[binding]}已截获 · 等待连接`;return}if(estopKey){if(!e.repeat){lastKeyboardEvent.textContent='急停请求已锁定 · E';latchEstop('键盘 E');send({estop:true}).catch(console.error)}return}if(blockedControlKeys.has(e.code)){lastKeyboardEvent.textContent=`${keyNames[binding]}需释放后重新按下 · ${e.code}`;return}if(vcuStateRequiresFreshInput(vcuHandshake)){controlLogic.blockKey(blockedControlKeys,e.code);lastKeyboardEvent.textContent=`${keyNames[binding]}已阻止 · 等待 VCU 恢复后重新按下`;return}if(!vcuEverReady&&!vcuMockUnsupported()){controlLogic.blockKey(blockedControlKeys,e.code);lastKeyboardEvent.textContent=`${keyNames[binding]}已阻止 · 首次握手完成后请重新按下`;return}const pressed=controlLogic.pressKey(pressedControlKeys,blockedControlKeys,e.code);if(pressed.changed){syncControlKeyState();updateSelectedGearFromHeldDirections();lastKeyboardEvent.textContent=`${keyNames[binding]}按下 · ${e.code}`;renderControlState();send().catch(console.error)}});
+addEventListener('keyup',e=>{const binding=keys[e.code];if(!binding)return;if(!editingTarget(e.target))e.preventDefault();const released=controlLogic.releaseKey(pressedControlKeys,blockedControlKeys,e.code);syncControlKeyState();updateSelectedGearFromHeldDirections();lastKeyboardEvent.textContent=`${keyNames[binding]}释放 · ${e.code}`;renderControlState();if(released.changed&&polling)send().catch(console.error)});
 async function pollSignaling(generation){const controller=new AbortController();signalingPollAbort=controller;while(polling&&generation===signalingGeneration){try{const data=await post('/api/poll-signaling',{},controller.signal);if(generation!==signalingGeneration)break;for(const message of data.messages||[]){if(message.type==='webrtc_offer')await startFromOffer(message.payload||{});if(message.type==='ice_candidate')await addIce(message.payload||{});if(message.type==='media_status'){mediaStatus=message.payload||{lanes:[]};renderMonitoring()}}}catch(e){if(generation!==signalingGeneration||e.name==='AbortError')break;closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='控制权或信令中断';statusPanel.textContent='信令轮询失败，已停止驾驶命令: '+e.message;post('/api/end-session',{reason:'signaling_poll_failed'}).catch(()=>{});clientLog('signaling_poll_failed',{error:e.message});renderMonitoring();break}await new Promise(r=>setTimeout(r,100))}if(signalingPollAbort===controller)signalingPollAbort=null}
 async function addIce(candidate){if(!candidate.candidate)return;if(!peer||!peer.remoteDescription){pendingIce.push(candidate);return}await peer.addIceCandidate(candidate)}
 function offeredVideoCameraIds(sdp,tracks){const mapping=new Map(),cameraIds=(tracks||[]).map(track=>track.camera_id).filter(Boolean);let cameraIndex=0;for(const section of String(sdp||'').split(/\r?\nm=/).slice(1)){if(!section.startsWith('video '))continue;const match=section.match(/(?:^|\r?\n)a=mid:([^\r\n]+)/),cameraId=cameraIds[cameraIndex++];if(match&&cameraId)mapping.set(match[1],cameraId)}return mapping}
@@ -1054,9 +1158,11 @@ function attach(cameraId,track){if(emptyStage.isConnected)emptyStage.remove();le
 async function startFromOffer(offer){
   if(peer)peer.close();
   controlChannel=null;
+  resetControlProfileSession();
+  lastControlStatusSeq=0;
   vehicleTelemetry=null;
   vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};
-  clearControlInput();
+  resetControlAuthorityInput();
   cameraGrid.replaceChildren();
   pendingIce=[];
   cameraByMid.clear();
@@ -1074,12 +1180,14 @@ async function startFromOffer(offer){
     const connectionState=nextPeer.connectionState;
     webrtcLabel.textContent=connectionState;
     if(connectionState==='disconnected'){
-      clearControlInput();
+      resetControlAuthorityInput();
+      resetControlProfileSession();
       clientLog('webrtc_peer_disconnected');
     }
     if(['failed','closed'].includes(connectionState)){
       controlChannel=null;
-      clearControlInput();
+      resetControlAuthorityInput();
+      resetControlProfileSession();
     }
     if(connectionState==='connected'&&controlChannel?.readyState==='open')webrtcLabel.textContent='控制链路已连接';
     renderMonitoring();
@@ -1087,57 +1195,85 @@ async function startFromOffer(offer){
   nextPeer.onicecandidateerror=e=>clientLog('webrtc_ice_candidate_error',{endpoint:safeIceEndpoint(e.url),error_code:Number(e.errorCode||0)});
   nextPeer.ondatachannel=e=>{
     const channel=e.channel;
+    if(!controlLogic.isCurrentPeer(peer,nextPeer)){channel.close();return}
     if(channel.label!=='control'||channel.protocol!=='mine-teleop-control-v1'||channel.ordered||channel.maxRetransmits!==0){
       channel.close();
       webrtcLabel.textContent='控制通道参数非法';
       clientLog('control_datachannel_rejected',{label:channel.label,protocol:channel.protocol,ordered:channel.ordered,max_retransmits:channel.maxRetransmits});
       return;
     }
+    lastControlStatusSeq=0;
     controlChannel=channel;
     channel.bufferedAmountLowThreshold=1024;
     channel.onopen=()=>{
-      if(peer!==nextPeer)return;
+      if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
       webrtcLabel.textContent='控制链路已连接';
+      resetControlAuthorityInput();
+      resetControlProfileSession();
       vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:true,adapter_ready:null};
       clientLog('control_datachannel_open');
       renderMonitoring();
     };
     channel.onmessage=async event=>{
-      if(peer!==nextPeer)return;
+      if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
       try{
         const message=JSON.parse(event.data);
+        if(!['vehicle_telemetry','vcu_handshake_status','session_control_profile_status','control_command_rejected'].includes(message.event))return;
+        if(!acceptControlStatusMessage(message))return;
+        if(message.event==='control_command_rejected'){
+          const rejection=controlLogic.deriveControlCommandRejection(message.issue_code);
+          if(rejection.clearInput)clearControlInput();
+          statusPanel.textContent=rejection.text;
+          const commandSeq=Number(message.command_seq);
+          clientLog('driver_control_command_rejected',{issue_code:rejection.issueCode,command_seq:Number.isSafeInteger(commandSeq)&&commandSeq>0?commandSeq:null});
+          renderMonitoring();
+          return;
+        }
+        if(message.event==='session_control_profile_status'){
+          applyControlProfileStatus(message);
+          updateVehicleHardLimits(message.hard_limits);
+          renderMonitoring();
+          return;
+        }
         if(message.event==='vehicle_telemetry'){
           vehicleTelemetry=message;
-          await updateVehicleHardLimits(message.control_limits);
-          if(message.vcu_handshake)vcuHandshake={...message.vcu_handshake,driver_connected:true,adapter_ready:vcuAdapterReady(message.vcu_handshake,message.vehicle_adapter?.opened)};
+          if(message.vcu_handshake){const nextVcuStatus={...message.vcu_handshake,driver_connected:true,adapter_ready:vcuAdapterReady(message.vcu_handshake,message.vehicle_adapter?.opened)};updateVcuHandshakeState(nextVcuStatus)}
           renderEstopRequest();
+          applyControlProfileStatus(message.session_control_profile);
+          updateVehicleHardLimits(message.control_limits);
           renderMonitoring();
           return;
         }
         if(message.event!=='vcu_handshake_status')return;
-        await updateVehicleHardLimits(message.hard_limits);
         const nextVcuStatus=message.status||{};
-        vcuHandshake={...nextVcuStatus,driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)};
+        updateVcuHandshakeState({...nextVcuStatus,driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)});
+        updateVehicleHardLimits(message.hard_limits);
+        if(message.session_control_profile)applyControlProfileStatus(message.session_control_profile);
         if(vcuHandshake.adapter_ready===false)statusPanel.textContent='VCU 适配器明确不可用；视频保持在线，驾驶命令已阻止';
         else if(vcuHandshake.adapter_ready===null)statusPanel.textContent='VCU 适配器状态未确认；视频保持在线，驾驶命令已阻止';
-        if(message.result==='command_rejected')statusPanel.textContent='开始握手失败：'+diagnoseVcuHandshake(true).text;
-        if(vcuHandshake.ready)statusPanel.textContent='VCU 平行驾驶握手成功，可以发送驾驶命令';
-        if(vcuHandshake.state==='disarmed')statusPanel.textContent='VCU 握手已安全断开';
+        else if(message.result==='command_rejected')statusPanel.textContent='开始握手失败：'+diagnoseVcuHandshake(true).text;
+        else if(vcuDrivingReady())statusPanel.textContent='VCU 平行驾驶握手成功，可以发送驾驶命令';
+        else if(vcuHandshake.state==='disarmed')statusPanel.textContent='VCU 握手已安全断开';
         clientLog('driver_vcu_handshake_status',{result:message.result,state:vcuHandshake.state,ready:Boolean(vcuHandshake.ready),parking_ready:Boolean(vcuHandshake.parking_ready)});
         renderMonitoring();
       }catch(error){clientLog('control_datachannel_message_invalid',{error:error.message})}
     };
     channel.onclose=()=>{
-      if(controlChannel===channel)controlChannel=null;
-      clearControlInput();
+      if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
+      controlChannel=null;
+      resetControlAuthorityInput();
+      resetControlProfileSession();
       vehicleTelemetry=null;
       vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};
-      if(peer===nextPeer)webrtcLabel.textContent='控制链路中断';
+      webrtcLabel.textContent='控制链路中断';
       clientLog('control_datachannel_closed');
       renderMonitoring();
     };
     channel.onerror=()=>{
-      if(peer===nextPeer)webrtcLabel.textContent='控制链路错误';
+      if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
+      resetControlAuthorityInput();
+      resetControlProfileSession();
+      webrtcLabel.textContent='控制链路错误';
       renderMonitoring();
     };
   };
@@ -1169,7 +1305,8 @@ async function collectMetrics(){
     streams.push({camera_id:cameraId,mid:s.mid||'',codec_id:s.codecId||'',fps,bitrate_kbps:bitrateKbps,frames_decoded:decoded,frames_dropped:Number(s.framesDropped||0),packets_lost:packetsLost,packets_received:packetsReceived,packet_loss_percent:(packetsLost+packetsReceived)>0?100*packetsLost/(packetsLost+packetsReceived):0,jitter_ms:Number(s.jitter||0)*1000,capture_to_encoded_ms:captureEncodeMs,jitter_buffer_ms:jitterMs,processing_ms:processingMs,round_trip_ms:rtt*1000,estimated_end_to_end_latency_ms:latencyMs,passed:fps>=20&&latencyMs<=200})
   }
   const timeSync=latestRuntimeStatus.time_sync||mediaStatus.time_sync||{},turnConfigured=hasTurnServer();
-  const metrics={sampled_at_ms:sampledAt,connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',control_rtt_ms:rtt*1000,connection_method:connectionMethod,turn_configured:turnConfigured,turn_in_use:turnInUse,time_sync:timeSync,clock_uncertainty_ms:Number(timeSync.uncertainty_ms||0),latency_method:'capture-to-encoded + rtt/2 + jitter-buffer + browser-processing',streams,passed:streams.length>0&&streams.every(s=>s.passed)};
+  const controlOutcomes={...controlOutcomeSession.metrics};
+  const metrics={sampled_at_ms:sampledAt,connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',control_rtt_ms:rtt*1000,connection_method:connectionMethod,turn_configured:turnConfigured,turn_in_use:turnInUse,time_sync:timeSync,clock_uncertainty_ms:Number(timeSync.uncertainty_ms||0),latency_method:'capture-to-encoded + rtt/2 + jitter-buffer + browser-processing',control_outcomes:controlOutcomes,control_outcomes_balanced:controlLogic.controlOutcomesBalanced(controlOutcomes),streams,passed:streams.length>0&&streams.every(s=>s.passed)};
   await post('/api/webrtc/metrics',metrics);
   if(metrics.codec==='h265'&&metrics.connection_state==='connected'&&streams.length){h265FailureSamples=streams.some(s=>s.fps<20)?h265FailureSamples+1:0;if(h265FailureSamples>=3&&!h265FallbackSent){h265FallbackSent=true;await post('/api/webrtc/fallback',{codec:'h264',reason:'h265_decode_fps_below_20'})}}else h265FailureSamples=0;
   latestMetrics=metrics;renderMonitoring();statusPanel.textContent=`${metrics.connection_state||'等待连接'} · ${streams.length} 路视频 · RTT ${formatMetric(metrics.control_rtt_ms,1,' ms')} · ${metrics.connection_method||'unknown'}`
@@ -1179,21 +1316,6 @@ setInterval(()=>refreshRuntimeStatus().catch(console.error),1000);
 setInterval(()=>heartbeat().catch(console.error),50);
 setInterval(()=>{if(authenticated&&!connecting)refreshVehicles().catch(handleVehicleRefreshError)},5000);
 </script></body></html>)HTML";
-}
-
-Json keyboard_to_control(const Json& payload) {
-  const bool left = payload.value("left", false);
-  const bool right = payload.value("right", false);
-  const bool up = payload.value("up", false);
-  const bool down = payload.value("down", false);
-  const bool brake_key = payload.value("brake", false);
-  return {
-      {"gear", up ? "D" : (down ? "R" : "N")},
-      {"steering", left == right ? 0.0 : (left ? -1.0 : 1.0)},
-      {"throttle", (up || down) && !brake_key ? 0.35 : 0.0},
-      {"brake", brake_key ? 1.0 : 0.0},
-      {"estop", payload.value("estop", false)},
-  };
 }
 
 }  // namespace
@@ -3069,17 +3191,47 @@ DriverConfig load_driver_config(const std::string& path) {
   if (logging && logging["browser_event_log_files"]) {
     config.browser_event_log_files = logging["browser_event_log_files"].as<int>();
   }
+  if (root["control"] && root["control"].IsMap() && root["control"]["keyboard"].IsDefined()) {
+    throw std::invalid_argument(
+        "control.keyboard is no longer supported; keyboard bindings are fixed: "
+        "Arrow/WASD directions, Space service brake, B hard brake, E ESTOP");
+  }
   if (root["control"] && root["control"]["rate_hz"]) config.rate_hz = root["control"]["rate_hz"].as<int>();
   if (root["control"] && root["control"]["estop_hold_ms"]) config.estop_hold_ms = root["control"]["estop_hold_ms"].as<int>();
   const auto limits = root["control"] ? root["control"]["limits"] : YAML::Node{};
   if (limits) {
     if (limits["initial_max_throttle"]) {
-      config.control_limits.initial_max_throttle =
-          limits["initial_max_throttle"].as<double>();
+      throw std::invalid_argument(
+          "control.limits.initial_max_throttle is no longer accepted because a ratio cannot be "
+          "safely converted without the selected vehicle hard limit; migrate to "
+          "initial_target_speed_kph");
     }
-    if (limits["initial_max_brake"]) {
-      config.control_limits.initial_max_brake =
-          limits["initial_max_brake"].as<double>();
+    if (limits["initial_target_speed_kph"]) {
+      config.control_limits.initial_target_speed_kph =
+          limits["initial_target_speed_kph"].as<double>();
+    }
+    if (limits["initial_max_motor_torque_nm"]) {
+      config.control_limits.initial_max_motor_torque_nm =
+          limits["initial_max_motor_torque_nm"].as<double>();
+    }
+    if (limits["initial_max_brake_request"] || limits["initial_service_brake"] ||
+        limits["initial_hard_brake"] || limits["initial_max_brake"]) {
+      throw std::invalid_argument(
+          "normalized control brake configuration is no longer accepted; migrate to "
+          "initial_max_brake_pressure_bar, initial_service_brake_pressure_bar, and "
+          "initial_hard_brake_pressure_bar");
+    }
+    if (limits["initial_max_brake_pressure_bar"]) {
+      config.control_limits.initial_max_brake_pressure_bar =
+          limits["initial_max_brake_pressure_bar"].as<double>();
+    }
+    if (limits["initial_service_brake_pressure_bar"]) {
+      config.control_limits.initial_service_brake_pressure_bar =
+          limits["initial_service_brake_pressure_bar"].as<double>();
+    }
+    if (limits["initial_hard_brake_pressure_bar"]) {
+      config.control_limits.initial_hard_brake_pressure_bar =
+          limits["initial_hard_brake_pressure_bar"].as<double>();
     }
     if (limits["initial_max_steering_angle_deg"]) {
       config.control_limits.initial_max_steering_angle_deg =
@@ -3120,12 +3272,22 @@ DriverConfig load_driver_config(const std::string& path) {
       config.gamepad.steering_center < -1.0 || config.gamepad.steering_center > 1.0 ||
       config.gamepad.throttle_rest < -1.0 || config.gamepad.throttle_rest > 1.0 ||
       config.gamepad.brake_rest < -1.0 || config.gamepad.brake_rest > 1.0 ||
-      !std::isfinite(config.control_limits.initial_max_throttle) ||
-      config.control_limits.initial_max_throttle < 0.0 ||
-      config.control_limits.initial_max_throttle > 1.0 ||
-      !std::isfinite(config.control_limits.initial_max_brake) ||
-      config.control_limits.initial_max_brake < 0.0 ||
-      config.control_limits.initial_max_brake > 1.0 ||
+      !std::isfinite(config.control_limits.initial_target_speed_kph) ||
+      config.control_limits.initial_target_speed_kph < 0.0 ||
+      config.control_limits.initial_target_speed_kph > 72.0 ||
+      !std::isfinite(config.control_limits.initial_max_motor_torque_nm) ||
+      config.control_limits.initial_max_motor_torque_nm < 0.0 ||
+      config.control_limits.initial_max_motor_torque_nm > 640.0 ||
+      !std::isfinite(config.control_limits.initial_max_brake_pressure_bar) ||
+      config.control_limits.initial_max_brake_pressure_bar < 0.0 ||
+      config.control_limits.initial_max_brake_pressure_bar > 327.6 ||
+      !std::isfinite(config.control_limits.initial_service_brake_pressure_bar) ||
+      config.control_limits.initial_service_brake_pressure_bar < 0.0 ||
+      !std::isfinite(config.control_limits.initial_hard_brake_pressure_bar) ||
+      config.control_limits.initial_hard_brake_pressure_bar <
+          config.control_limits.initial_service_brake_pressure_bar ||
+      config.control_limits.initial_hard_brake_pressure_bar >
+          config.control_limits.initial_max_brake_pressure_bar ||
       !std::isfinite(config.control_limits.initial_max_steering_angle_deg) ||
       config.control_limits.initial_max_steering_angle_deg < 0.0 ||
       config.control_limits.initial_max_steering_angle_deg > 30.0 ||
@@ -3144,7 +3306,7 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
       signaling_http_url_(normalize_signaling_http_url(config_.signaling_url)),
       http_(std::chrono::seconds(5), config_.resolve_entries, config_.ca_bundle) {
   if (vehicle_id_.empty() || password_.empty()) throw std::invalid_argument("vehicle id and driver password are required");
-  max_brake_limit_.store(config_.control_limits.initial_max_brake);
+  reset_control_profile_locked();
   if (!signaling_url_is_secure_or_loopback(config_.signaling_url)) {
     throw std::invalid_argument("public signaling URL must use HTTPS or WSS; HTTP/WS is allowed only on loopback");
   }
@@ -3292,6 +3454,7 @@ Json DriverConsoleRuntime::renew_control_authority() {
         control_token_expires_at_ms_ = 0;
         control_token_renew_at_ms_ = 0;
         sequence_ = 0;
+        reset_control_profile_locked();
         connected_at_ms_ = 0;
       }
     }
@@ -3340,6 +3503,7 @@ Json DriverConsoleRuntime::login_locked(std::string_view password) {
       control_token_expires_at_ms_ = 0;
       control_token_renew_at_ms_ = 0;
       sequence_ = 0;
+      reset_control_profile_locked();
       connected_at_ms_ = 0;
     }
   }
@@ -3428,6 +3592,7 @@ Json DriverConsoleRuntime::vehicles() {
       control_token_expires_at_ms_ = 0;
       control_token_renew_at_ms_ = 0;
       sequence_ = 0;
+      reset_control_profile_locked();
       connected_at_ms_ = 0;
       authorized_vehicles_ = Json::array();
     }
@@ -3536,6 +3701,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       control_token_expires_at_ms_ = 0;
       control_token_renew_at_ms_ = 0;
       sequence_ = 0;
+      reset_control_profile_locked();
       connected_at_ms_ = 0;
     }
   }
@@ -3559,6 +3725,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
     control_token_expires_at_ms_ = control_token_expires_at_ms;
     control_token_renew_at_ms_ = control_lease_renew_at(connected_at_ms, control_token_expires_at_ms);
     sequence_ = 0;
+    reset_control_profile_locked();
     connected_at_ms_ = connected_at_ms;
   }
   try {
@@ -3575,6 +3742,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
         control_token_expires_at_ms_ = 0;
         control_token_renew_at_ms_ = 0;
         sequence_ = 0;
+        reset_control_profile_locked();
         connected_at_ms_ = 0;
       }
     }
@@ -3605,6 +3773,8 @@ Json DriverConsoleRuntime::end_session(std::string_view reason) {
     session = session_id_;
   }
   if (session.empty()) {
+    std::lock_guard lock(mutex_);
+    reset_control_profile_locked();
     return {{"driver_id", config_.driver_id}, {"connected", false}, {"session_id", ""}};
   }
   if (token.empty()) throw std::runtime_error("driver login is required to end the session");
@@ -3620,6 +3790,7 @@ Json DriverConsoleRuntime::end_session(std::string_view reason) {
       control_token_expires_at_ms_ = 0;
       control_token_renew_at_ms_ = 0;
       sequence_ = 0;
+      reset_control_profile_locked();
       connected_at_ms_ = 0;
     }
   }
@@ -3645,6 +3816,7 @@ Json DriverConsoleRuntime::disconnect(std::string_view reason) {
     control_token_expires_at_ms_ = 0;
     control_token_renew_at_ms_ = 0;
     sequence_ = 0;
+    reset_control_profile_locked();
     connected_at_ms_ = 0;
     authorized_vehicles_ = Json::array();
     return {{"driver_id", config_.driver_id}, {"state", "offline"}, {"session_id", session}};
@@ -3663,6 +3835,7 @@ Json DriverConsoleRuntime::disconnect(std::string_view reason) {
       control_token_expires_at_ms_ = 0;
       control_token_renew_at_ms_ = 0;
       sequence_ = 0;
+      reset_control_profile_locked();
       connected_at_ms_ = 0;
       authorized_vehicles_ = Json::array();
     }
@@ -3736,6 +3909,7 @@ Json DriverConsoleRuntime::poll_signaling() {
           control_token_expires_at_ms_ = 0;
           control_token_renew_at_ms_ = 0;
           sequence_ = 0;
+          reset_control_profile_locked();
           connected_at_ms_ = 0;
         }
       }
@@ -3849,6 +4023,7 @@ Json DriverConsoleRuntime::send_signaling_message(std::string_view type, const J
             control_token_expires_at_ms_ = 0;
             control_token_renew_at_ms_ = 0;
             sequence_ = 0;
+            reset_control_profile_locked();
             connected_at_ms_ = 0;
           }
         }
@@ -3981,20 +4156,119 @@ Json DriverConsoleRuntime::ingest_webrtc_metrics(const Json& input) {
 }
 
 Json DriverConsoleRuntime::control_limits() const {
-  return {{"max_brake", max_brake_limit_.load()}};
+  std::lock_guard lock(mutex_);
+  const auto service_brake = service_brake_limit_.load();
+  const auto hard_brake = hard_brake_limit_.load();
+  return {
+      {"service_brake", service_brake},
+      {"hard_brake", hard_brake},
+      {"max_brake", hard_brake},
+  };
 }
 
-Json DriverConsoleRuntime::set_control_limits(const Json& input) {
-  if (!input.is_object() || !input.contains("max_brake") ||
-      !input.at("max_brake").is_number()) {
-    throw std::invalid_argument("control limits require numeric max_brake");
+Json DriverConsoleRuntime::control_profile_locked() const {
+  return {
+      {"target_speed_kph", target_speed_kph_},
+      {"max_motor_torque_nm", max_motor_torque_nm_},
+      {"max_brake_pressure_bar", max_brake_pressure_bar_},
+      {"service_brake_pressure_bar", service_brake_pressure_bar_},
+      {"hard_brake_pressure_bar", hard_brake_pressure_bar_},
+      {"last_prepared_seq", last_control_profile_prepared_seq_},
+  };
+}
+
+void DriverConsoleRuntime::reset_control_profile_locked() {
+  target_speed_kph_ = config_.control_limits.initial_target_speed_kph;
+  max_motor_torque_nm_ = config_.control_limits.initial_max_motor_torque_nm;
+  max_brake_pressure_bar_ = config_.control_limits.initial_max_brake_pressure_bar;
+  service_brake_pressure_bar_ = config_.control_limits.initial_service_brake_pressure_bar;
+  hard_brake_pressure_bar_ = config_.control_limits.initial_hard_brake_pressure_bar;
+  service_brake_limit_.store(
+      max_brake_pressure_bar_ > 0.0 ? service_brake_pressure_bar_ / max_brake_pressure_bar_ : 0.0);
+  hard_brake_limit_.store(
+      max_brake_pressure_bar_ > 0.0 ? hard_brake_pressure_bar_ / max_brake_pressure_bar_ : 0.0);
+  last_control_profile_prepared_seq_ = 0;
+}
+
+Json DriverConsoleRuntime::control_profile() const {
+  std::lock_guard lock(mutex_);
+  return control_profile_locked();
+}
+
+Json DriverConsoleRuntime::prepare_control_profile(const Json& input) {
+  if (!input.is_object()) {
+    throw std::invalid_argument("control profile requires an object");
   }
-  const auto max_brake = input.at("max_brake").get<double>();
-  if (!std::isfinite(max_brake) || max_brake < 0.0 || max_brake > 1.0) {
-    throw std::invalid_argument("control max_brake must be within [0, 1]");
+  for (const auto* field : {
+           "target_speed_kph",
+           "max_motor_torque_nm",
+           "max_brake_pressure_bar",
+           "service_brake_pressure_bar",
+           "hard_brake_pressure_bar"}) {
+    if (!input.contains(field) || !input.at(field).is_number()) {
+      throw std::invalid_argument(std::string("control profile requires numeric ") + field);
+    }
   }
-  max_brake_limit_.store(max_brake);
-  return {{"max_brake", max_brake}};
+  const auto target_speed_kph = input.at("target_speed_kph").get<double>();
+  const auto max_motor_torque_nm = input.at("max_motor_torque_nm").get<double>();
+  const auto max_brake_pressure_bar = input.at("max_brake_pressure_bar").get<double>();
+  const auto service_brake_pressure_bar = input.at("service_brake_pressure_bar").get<double>();
+  const auto hard_brake_pressure_bar = input.at("hard_brake_pressure_bar").get<double>();
+  if (!std::isfinite(target_speed_kph) || target_speed_kph < 0.0 ||
+      target_speed_kph > 72.0 || !std::isfinite(max_motor_torque_nm) ||
+      max_motor_torque_nm < 0.0 || max_motor_torque_nm > 640.0 ||
+      !std::isfinite(max_brake_pressure_bar) || max_brake_pressure_bar < 0.0 ||
+      max_brake_pressure_bar > 327.6 || !std::isfinite(service_brake_pressure_bar) ||
+      !std::isfinite(hard_brake_pressure_bar) || service_brake_pressure_bar < 0.0 ||
+      service_brake_pressure_bar > hard_brake_pressure_bar ||
+      hard_brake_pressure_bar > max_brake_pressure_bar) {
+    throw std::invalid_argument(
+        "control profile must satisfy target_speed_kph in [0,72], "
+        "max_motor_torque_nm in [0,640.0], and 0 <= service_brake_pressure_bar <= "
+        "hard_brake_pressure_bar <= max_brake_pressure_bar <= 327.6");
+  }
+
+  std::lock_guard lock(mutex_);
+  if (driver_token_.empty() || session_id_.empty() || control_token_.empty()) {
+    throw std::runtime_error("driver console is not connected");
+  }
+  target_speed_kph_ = target_speed_kph;
+  max_motor_torque_nm_ = max_motor_torque_nm;
+  max_brake_pressure_bar_ = max_brake_pressure_bar;
+  service_brake_pressure_bar_ = service_brake_pressure_bar;
+  hard_brake_pressure_bar_ = hard_brake_pressure_bar;
+  service_brake_limit_.store(
+      max_brake_pressure_bar > 0.0 ? service_brake_pressure_bar / max_brake_pressure_bar : 0.0);
+  hard_brake_limit_.store(
+      max_brake_pressure_bar > 0.0 ? hard_brake_pressure_bar / max_brake_pressure_bar : 0.0);
+  const auto sequence = ++sequence_;
+  last_control_profile_prepared_seq_ = sequence;
+  auto request = ProtocolMetadata{
+      kProtocolVersion,
+      vehicle_id_,
+      config_.driver_id,
+      session_id_,
+      sequence,
+      clock_.now_ms()}.to_json();
+  request["type"] = "session_control_profile";
+  request["control_token"] = control_token_;
+  request["target_speed_kph"] = target_speed_kph;
+  request["max_motor_torque_nm"] = max_motor_torque_nm;
+  request["max_brake_pressure_bar"] = max_brake_pressure_bar;
+  request["service_brake_pressure_bar"] = service_brake_pressure_bar;
+  request["hard_brake_pressure_bar"] = hard_brake_pressure_bar;
+  return {
+      {"prepared", true},
+      {"transport", "webrtc_data_channel"},
+      {"delivery_state", "browser_data_channel_pending"},
+      {"request", std::move(request)},
+      {"control_profile", control_profile_locked()},
+  };
+}
+
+Json DriverConsoleRuntime::set_control_limits(const Json&) {
+  throw std::runtime_error(
+      "legacy POST /api/control-limits is retired; use authenticated /api/control-profile");
 }
 
 Json DriverConsoleRuntime::send_control(const Json& input) {
@@ -4023,16 +4297,15 @@ Json DriverConsoleRuntime::send_control(const Json& input) {
   command.estop = input.value("estop", false);
   command.control_token = control_token;
   command.validate();
-  if (!command.estop) {
-    command.brake = std::min(command.brake, max_brake_limit_.load());
-  }
   {
     std::lock_guard lock(mutex_);
-    last_control_sent_ms_ = command.sent_at_utc_ms;
+    last_control_prepared_at_utc_ms_ = command.sent_at_utc_ms;
+    ++control_commands_prepared_total_;
   }
   return {
       {"prepared", true},
       {"transport", "webrtc_data_channel"},
+      {"delivery_state", "browser_data_channel_pending"},
       {"command", command.to_json()},
   };
 }
@@ -4086,7 +4359,8 @@ Json DriverConsoleRuntime::status() {
       {"control_token_expires_at_utc_ms", control_token_expires_at_ms_},
       {"sequence", sequence_},
       {"connected_at_ms", connected_at_ms_},
-      {"last_control_sent_ms", last_control_sent_ms_},
+      {"last_control_prepared_at_utc_ms", last_control_prepared_at_utc_ms_},
+      {"control_commands_prepared_total", control_commands_prepared_total_},
       {"signaling_transport", "websocket"},
       {"signaling_websocket_connected", websocket_connected},
       {"signaling_websocket_reconnects", websocket_reconnects},
@@ -4177,6 +4451,7 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
     if (request.method == "GET" && request.path == "/api/status") return ServerResponse::json(200, runtime_->status());
     if (request.method == "GET" && request.path == "/api/vehicles") return ServerResponse::json(200, runtime_->vehicles());
     if (request.method == "GET" && request.path == "/api/control-limits") return ServerResponse::json(200, runtime_->control_limits());
+    if (request.method == "GET" && request.path == "/api/control-profile") return ServerResponse::json(200, runtime_->control_profile());
     if (request.method == "GET" && request.path == "/") {
       return ServerResponse::text(200, console_html(runtime_->config()), "text/html; charset=utf-8");
     }
@@ -4204,21 +4479,20 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
     if (request.method == "POST" && request.path == "/api/webrtc/ice-candidate") return ServerResponse::json(200, runtime_->send_webrtc_ice_candidate(request.json_body()));
     if (request.method == "POST" && request.path == "/api/webrtc/metrics") return ServerResponse::json(200, runtime_->ingest_webrtc_metrics(request.json_body()));
     if (request.method == "POST" && request.path == "/api/browser-event") return ServerResponse::json(200, runtime_->record_browser_event(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/control-limits") return ServerResponse::json(200, runtime_->set_control_limits(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/control") return ServerResponse::json(200, runtime_->send_control(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/control/keyboard") {
-      return ServerResponse::json(200, runtime_->send_control(keyboard_to_control(request.json_body())));
+    if (request.method == "POST" && request.path == "/api/control-limits") {
+      return ServerResponse::json(
+          410,
+          {{"error", "legacy control-limit mutation is retired; use /api/control-profile"}});
     }
-    if (request.method == "POST" && request.path == "/api/control/gamepad") {
-      const auto input = request.json_body();
-      Json control = {
-          {"gear", input.value("gear", "D")},
-          {"steering", input.value("steering", 0.0)},
-          {"throttle", input.value("throttle", 0.0)},
-          {"brake", input.value("brake", 0.0)},
-          {"estop", input.value("estop", false)},
-      };
-      return ServerResponse::json(200, runtime_->send_control(control));
+    if (request.method == "POST" && request.path == "/api/control-profile") return ServerResponse::json(200, runtime_->prepare_control_profile(request.json_body()));
+    if (request.method == "POST" && request.path == "/api/control") return ServerResponse::json(200, runtime_->send_control(request.json_body()));
+    if (request.method == "POST" &&
+        (request.path == "/api/control/keyboard" ||
+         request.path == "/api/control/gamepad")) {
+      return ServerResponse::json(
+          410,
+          {{"error",
+            "legacy specialized control endpoint is retired; use /api/control with an acknowledged session profile"}});
     }
     return ServerResponse::json(404, {{"error", "not found"}});
   } catch (const HttpStatusError& error) {

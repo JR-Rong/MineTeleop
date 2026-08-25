@@ -161,7 +161,7 @@ void print_help() {
 
 Usage:
   mine-teleop version
-  mine-teleop config-check [--config PATH]
+  mine-teleop config-check [--config PATH] [--chassis-bridge-library PATH]
   mine-teleop vehicle-agent [options]
   mine-teleop vehicle-media-agent [options]
   mine-teleop vehicle-runtime [options]
@@ -176,6 +176,7 @@ Usage:
 
 Vehicle options:
   --config PATH                 vehicle YAML (default configs/vehicle-agent.dev.yaml)
+  --chassis-bridge-library PATH validate bridge ABI only; does not open CAN
   --preflight                   validate local runtime/device prerequisites
   --adapter-status              open adapter, print status, close
   --run-loop                    run deterministic local control-loop smoke
@@ -943,6 +944,17 @@ int main(int argc, char** argv) {
       const auto config = mine_teleop::load_vehicle_config(
           arguments.value("--config", "configs/vehicle-agent.dev.yaml"));
       auto result = config.redacted_summary();
+      if (arguments.has("--chassis-bridge-library")) {
+        const auto library_path = arguments.value("--chassis-bridge-library");
+        if (library_path.empty()) {
+          throw std::invalid_argument("--chassis-bridge-library requires a path");
+        }
+        mine_teleop::validate_chassis_bridge_abi(library_path);
+        result["chassis_bridge_abi"] = {
+            {"version", 3},
+            {"passed", true},
+        };
+      }
       result["event"] = "vehicle_config_check";
       result["passed"] = true;
       std::cout << result.dump() << '\n';

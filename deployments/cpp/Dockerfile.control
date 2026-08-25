@@ -7,6 +7,7 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
         ca-certificates \
         libcurl4-openssl-dev \
         libssl-dev \
+        nodejs \
         pkg-config \
         python3-pip \
     && python3 -m pip install --no-cache-dir cmake==3.28.3 \

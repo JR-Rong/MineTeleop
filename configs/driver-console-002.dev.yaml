@@ -17,12 +17,6 @@ ui:
 control:
   rate_hz: 20
   estop_hold_ms: 500
-  keyboard:
-    steering_left: ArrowLeft
-    steering_right: ArrowRight
-    throttle: ArrowUp
-    brake: ArrowDown
-    estop: E
   gamepad:
     enabled: true
     steering_axis: 0

@@ -154,6 +154,9 @@ bool all_finite_in_range(
 
 bool command_valid(const Command& command) {
   return command.gear >= 1 && command.gear <= 3 &&
+         std::isfinite(command.vehicle_speed_request_kph) &&
+         command.vehicle_speed_request_kph >= 0.0 &&
+         command.vehicle_speed_request_kph <= 255.0 &&
          all_finite_in_range(command.motor_torque_nm, -800.0, 838.3) &&
          all_finite_in_range(command.motor_speed_rpm, -8000.0, 8383.0) &&
          all_finite_in_range(command.steering_angle_deg, -30.0, 30.0) &&
@@ -243,6 +246,23 @@ CanFrame make_shake_frame(int gear, int handshake_request, bool fault_reset) {
   return frame;
 }
 
+CanFrame make_vehicle_speed_frame(double speed_request_kph, bool valid) {
+  CanFrame frame{ids::kAduVehicleSpeed};
+  insert_signal(
+      frame,
+      0,
+      8,
+      encode_physical(
+          valid ? std::floor(speed_request_kph) : 0.0,
+          1.0,
+          0.0,
+          8,
+          0.0,
+          255.0));
+  insert_signal(frame, 8, 8, valid ? 1U : 0U);
+  return frame;
+}
+
 std::size_t find_id(
     const std::uint32_t id,
     const std::array<std::uint32_t, kMotorCount>& ids_to_search) {
@@ -274,6 +294,7 @@ void ParallelController::reset() {
   state_ = State::Standby;
   initial_frame_count_ = 0;
   emergency_stop_ = false;
+  physical_emergency_latched_ = false;
   receive_generation_ = 0;
   state_entry_generation_ = 0;
   handshake_generation_ = 0;
@@ -297,8 +318,17 @@ bool ParallelController::set_command(const Command& command) {
     return false;
   }
   const bool gear_changed = desired_.gear != command.gear;
+  if (gear_changed && (command.gear == 2 || command.gear == 3) &&
+      (!feedback_.speed_valid || !feedback_.gear_valid ||
+       std::abs(feedback_.speed_mps) > kStoppedSpeedToleranceMps)) {
+    desired_.motor_torque_nm.fill(0.0);
+    desired_.motor_speed_rpm.fill(0.0);
+    desired_.vehicle_speed_request_kph = 0.0;
+    desired_.vehicle_speed_request_valid = false;
+    emergency_stop();
+    return false;
+  }
   desired_ = command;
-  emergency_stop_ = false;
   if (gear_changed && state_ == State::Ready) enter(State::WaitGear);
   return true;
 }
@@ -311,9 +341,14 @@ bool ParallelController::set_emergency_command(const Command& command) {
   return true;
 }
 
-void ParallelController::emergency_stop() { emergency_stop_ = true; }
+void ParallelController::emergency_stop() {
+  emergency_stop_ = true;
+  static_cast<void>(begin_arming_emergency_disarm());
+}
 
-void ParallelController::clear_emergency_stop() { emergency_stop_ = false; }
+void ParallelController::clear_emergency_stop() {
+  if (!physical_emergency_latched_) emergency_stop_ = false;
+}
 
 bool ParallelController::request_parallel_handshake() {
   if ((state_ != State::Standby && state_ != State::Disarmed) ||
@@ -322,6 +357,7 @@ bool ParallelController::request_parallel_handshake() {
   }
   desired_ = Command{};
   desired_.gear = kNeutralGear;
+  physical_emergency_latched_ = false;
   emergency_stop_ = false;
   initial_frame_count_ = 0;
   enter(State::Initial);
@@ -369,6 +405,17 @@ bool ParallelController::ingest(const CanFrame& frame) {
     feedback_.emergency_switch = static_cast<int>(extract_signal(frame, 0, 2));
     feedback_.gear = static_cast<int>(extract_signal(frame, 2, 2));
     feedback_.gear_valid = true;
+    if (feedback_.emergency_switch != 0) {
+      // Latch at ingest time so a short physical-switch pulse cannot disappear
+      // while the bridge drains multiple CAN frames before the next 20 ms tick.
+      physical_emergency_latched_ = true;
+      emergency_stop_ = true;
+      if (state_ == State::Ready) {
+        enter(State::DisarmTorque);
+      } else {
+        static_cast<void>(begin_arming_emergency_disarm());
+      }
+    }
     return true;
   }
   if (frame.id == ids::kWvcuVehicleSpeed) {
@@ -450,10 +497,43 @@ void ParallelController::enter(State state) {
   state_entry_generation_ = receive_generation_;
 }
 
+bool ParallelController::begin_arming_emergency_disarm() {
+  switch (state_) {
+    case State::Initial:
+      enter(State::Disarmed);
+      return true;
+    case State::WaitParallelHandshake:
+      // The parking brake is still applied here. Withdraw ShakeReq and require
+      // a fresh manual-handshake confirmation before another arming attempt.
+      enter(State::DisarmManual);
+      return true;
+    case State::WaitParkingBrakeReleased:
+    case State::WaitGear:
+    case State::WaitActuatorModes:
+      // These phases may already have released the EPB or selected a drive
+      // gear. Enter the full torque/stop/N/EPB/manual reverse sequence so the
+      // next frame enables EHB safety braking instead of continuing arming.
+      enter(State::DisarmTorque);
+      return true;
+    default:
+      return false;
+  }
+}
+
 void ParallelController::advance_state() {
+  if ((emergency_stop_ || feedback_.emergency_switch != 0) &&
+      begin_arming_emergency_disarm()) {
+    return;
+  }
   if (state_ == State::Ready && feedback_.handshake_valid &&
       feedback_.handshake_status != kIntelligentHandshakeStatus) {
     transport_fault();
+    return;
+  }
+  if (state_ == State::Ready &&
+      (!feedback_.gear_valid || feedback_.gear != desired_.gear)) {
+    emergency_stop_ = true;
+    enter(State::WaitGear);
     return;
   }
 
@@ -564,6 +644,8 @@ std::vector<CanFrame> ParallelController::tick() {
   std::array<double, kSteeringAxisCount> steering_angle{};
   std::array<double, kSteeringAxisCount> steering_speed{};
   std::array<double, kBrakeCount> brake_pressure{};
+  double vehicle_speed_request_kph = 0.0;
+  bool vehicle_speed_request_valid = false;
   bool fault_reset = false;
 
   const bool driving_authority_requested =
@@ -603,12 +685,21 @@ std::vector<CanFrame> ParallelController::tick() {
     motor_mode.fill(kMotorTorqueMode);
   }
 
-  if (state_ == State::Ready) {
-    motor_torque = desired_.motor_torque_nm;
-    motor_speed = desired_.motor_speed_rpm;
+  if (state_ == State::WaitGear ||
+      state_ == State::WaitActuatorModes ||
+      state_ == State::Ready) {
     steering_angle = desired_.steering_angle_deg;
     steering_speed = desired_.steering_speed_degps;
     brake_pressure = desired_.brake_pressure_bar;
+  }
+
+  if (state_ == State::Ready) {
+    motor_torque = desired_.motor_torque_nm;
+    motor_speed = desired_.motor_speed_rpm;
+    // Vehicle-speed arbitration is unverified on the target VCU. Local PID
+    // control keeps ADU_Tx_VehSpdReq at physical zero with Q=0 permanently.
+    vehicle_speed_request_kph = 0.0;
+    vehicle_speed_request_valid = false;
     fault_reset = desired_.fault_reset;
   }
 
@@ -621,6 +712,8 @@ std::vector<CanFrame> ParallelController::tick() {
     motor_torque.fill(0.0);
     motor_speed.fill(0.0);
     brake_pressure = emergency_.brake_pressure_bar;
+    vehicle_speed_request_kph = 0.0;
+    vehicle_speed_request_valid = false;
     if (state_ == State::Ready || state_ == State::Fault ||
         state_ == State::DisarmTorque || state_ == State::DisarmStop) {
       motor_command.fill(kMotorEnable);
@@ -669,11 +762,9 @@ std::vector<CanFrame> ParallelController::tick() {
   frames.push_back(make_epb_frame(parking_brake, steering_mode));
   frames.push_back(make_shake_frame(gear, handshake_request, fault_reset));
   frames.push_back(CanFrame{ids::kAduBody});
-
-  CanFrame vehicle_speed{ids::kAduVehicleSpeed};
-  insert_signal(vehicle_speed, 0, 8, 0);
-  insert_signal(vehicle_speed, 8, 8, 0);
-  frames.push_back(vehicle_speed);
+  frames.push_back(make_vehicle_speed_frame(
+      vehicle_speed_request_kph,
+      vehicle_speed_request_valid));
   return frames;
 }
 
@@ -691,7 +782,9 @@ bool ParallelController::handshake_requested() const {
 }
 
 bool ParallelController::parking_ready() const {
-  return feedback_.driver_gear_request_valid &&
+  return feedback_.gear_valid && feedback_.gear == kNeutralGear &&
+         feedback_.emergency_switch == 0 &&
+         feedback_.driver_gear_request_valid &&
          feedback_.driver_gear_request == kNeutralGearRequest &&
          feedback_.handshake_valid &&
          feedback_.handshake_status == kManualHandshakeStatus &&
@@ -701,6 +794,10 @@ bool ParallelController::parking_ready() const {
              feedback_.parking_brake_status,
              feedback_.parking_brake_valid,
              kParkingBrakePark);
+}
+
+bool ParallelController::physical_emergency_latched() const {
+  return physical_emergency_latched_;
 }
 
 bool ParallelController::feedback_complete() const {
