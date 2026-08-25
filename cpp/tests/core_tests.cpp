@@ -5,6 +5,8 @@
 #include "mine_teleop/upload.hpp"
 #include "mine_teleop/video.hpp"
 
+#include <gst/gst.h>
+
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -13,6 +15,8 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -730,17 +734,269 @@ void test_camera_source_classification_is_canonical() {
       {"/dev/v4l/by-path/example-video-index0", CameraSourceKind::V4l2},
   };
 
+  mine_teleop::CameraConfig camera;
+  expect(camera.backend == "auto", "camera backend default changed from auto");
   for (const auto& [selector, expected] : cases) {
     expect(
         mine_teleop::classify_camera_source(selector) == expected,
         "camera selector was assigned to the wrong source kind: " + std::string(selector));
+    camera.device = selector;
+    expect(
+        mine_teleop::classify_camera_source(camera) == expected,
+        "auto backend changed legacy camera selector classification: " + std::string(selector));
   }
+  camera.backend = "ccg2";
+  camera.device = "/dev/video0";
+  expect(
+      mine_teleop::classify_camera_source(camera) == CameraSourceKind::Ccg2,
+      "explicit CCG2 backend did not override the ordinary V4L2 selector");
   expect(
       mine_teleop::camera_source_kind_name(CameraSourceKind::TestSource) == "testsrc" &&
           mine_teleop::camera_source_kind_name(CameraSourceKind::Mvs) == "vendor_sdk" &&
           mine_teleop::camera_source_kind_name(CameraSourceKind::Aravis) == "aravis" &&
-          mine_teleop::camera_source_kind_name(CameraSourceKind::V4l2) == "v4l2",
+          mine_teleop::camera_source_kind_name(CameraSourceKind::V4l2) == "v4l2" &&
+          mine_teleop::camera_source_kind_name(CameraSourceKind::Ccg2) == "ccg2",
       "camera source diagnostic names changed");
+}
+
+void test_camera_input_spec_is_explicit_for_ccg2_and_legacy_safe() {
+  mine_teleop::MediaProfile realtime;
+  realtime.width = 1280;
+  realtime.height = 720;
+  realtime.fps = 25;
+
+  mine_teleop::CameraConfig legacy;
+  legacy.id = "legacy-v4l2";
+  legacy.device = "/dev/video2";
+  legacy.capture_width = 1920;
+  legacy.capture_height = 1080;
+  legacy.capture_fps = 30;
+  const auto legacy_input = mine_teleop::camera_input_spec(legacy, realtime);
+  expect(
+      legacy_input.codec == "mjpeg" && legacy_input.width == realtime.width &&
+          legacy_input.height == realtime.height && legacy_input.fps == realtime.fps,
+      "legacy camera input stopped following the realtime MJPEG profile");
+
+  auto ccg2 = legacy;
+  ccg2.id = "ccg2-channel";
+  ccg2.backend = "ccg2";
+  ccg2.device = "/dev/video0";
+  const auto ccg2_input = mine_teleop::camera_input_spec(ccg2, realtime);
+  expect(
+      ccg2_input.codec == "uyvy" && ccg2_input.width == ccg2.capture_width &&
+          ccg2_input.height == ccg2.capture_height && ccg2_input.fps == ccg2.capture_fps,
+      "CCG2 input did not use the configured raw capture dimensions and FPS");
+}
+
+void test_camera_backend_config_rejects_unknown_and_invalid_ccg2_modes() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  auto unknown_backend = base;
+  replace_once(
+      unknown_backend,
+      "  - id: front\n",
+      "  - id: front\n    backend: typo\n");
+  const auto unknown_path = write_temp_vehicle_config("unknown-camera-backend", unknown_backend);
+  expect_throws(
+      [&] { static_cast<void>(mine_teleop::load_vehicle_config(unknown_path)); },
+      "unknown camera backend was accepted");
+  std::error_code error;
+  std::filesystem::remove(unknown_path, error);
+
+  auto odd_width = base;
+  replace_once(
+      odd_width,
+      "  - id: front\n",
+      "  - id: front\n    backend: ccg2\n");
+  replace_once(odd_width, "    capture_width: 1920\n", "    capture_width: 1919\n");
+  const auto odd_width_path = write_temp_vehicle_config("odd-ccg2-width", odd_width);
+  expect_throws(
+      [&] { static_cast<void>(mine_teleop::load_vehicle_config(odd_width_path)); },
+      "odd CCG2 capture width was accepted");
+  std::filesystem::remove(odd_width_path, error);
+}
+
+void test_ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames() {
+  const std::string tight = "ABCDEFGHIJKLMNOP";
+  expect(
+      mine_teleop::pack_uyvy_rows(tight, 4, 2, 8) == tight,
+      "tightly packed UYVY frame changed during row packing");
+
+  const std::string padded = "ABCDEFGHxyIJKLMNOPzz";
+  expect(
+      mine_teleop::pack_uyvy_rows(padded, 4, 2, 10) == tight,
+      "UYVY row padding was copied into the visible frame");
+
+  const std::string trailing = "ABCDEFGHtrailing-driver-bytes";
+  expect(
+      mine_teleop::pack_uyvy_rows(trailing, 2, 2, 4) == "ABCDEFGH",
+      "CCG2 trailing driver bytes changed the negotiated visible image");
+
+  expect_throws(
+      [&] { static_cast<void>(mine_teleop::pack_uyvy_rows("ABCDEF", 3, 1, 6)); },
+      "odd-width UYVY frame was accepted");
+  expect_throws(
+      [&] { static_cast<void>(mine_teleop::pack_uyvy_rows(padded.substr(0, 17), 4, 2, 10)); },
+      "short padded UYVY frame was accepted");
+}
+
+void test_camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2() {
+  mine_teleop::MediaProfile output;
+  output.width = 1280;
+  output.height = 720;
+  output.fps = 30;
+
+  const mine_teleop::CameraInputSpec legacy{"mjpeg", 1280, 720, 30};
+  const auto legacy_pipeline =
+      mine_teleop::build_camera_input_pipeline("source_legacy", legacy, output);
+  expect(
+      legacy_pipeline.find("caps=image/jpeg") != std::string::npos &&
+          legacy_pipeline.find("jpegdec") != std::string::npos &&
+          legacy_pipeline.find("max-bytes=524288") != std::string::npos,
+      "legacy camera pipeline no longer preserves bounded MJPEG decode input");
+
+  const mine_teleop::CameraInputSpec ccg2{"uyvy", 1920, 1080, 30};
+  const auto ccg2_pipeline =
+      mine_teleop::build_camera_input_pipeline("source_ccg2", ccg2, output);
+  expect(
+      ccg2_pipeline.find("video/x-raw,format=UYVY") != std::string::npos &&
+          ccg2_pipeline.find("width=1920,height=1080,framerate=30/1") != std::string::npos,
+      "CCG2 pipeline does not advertise its negotiated raw UYVY input");
+  expect(
+      ccg2_pipeline.find("jpegdec") == std::string::npos &&
+          ccg2_pipeline.find("max-bytes=0") != std::string::npos,
+      "CCG2 pipeline retained the legacy JPEG decoder or byte cap");
+}
+
+void test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps() {
+  mine_teleop::MediaProfile output;
+  output.width = 1280;
+  output.height = 720;
+  output.fps = 25;
+
+  const mine_teleop::CameraInputSpec ccg2_30_fps{"uyvy", 1920, 1080, 30};
+  const auto converted =
+      mine_teleop::build_camera_input_pipeline("source_ccg2_30", ccg2_30_fps, output);
+  expect(
+      converted.find("videorate") != std::string::npos,
+      "CCG2 30 FPS input did not add videorate for a 25 FPS output");
+
+  const mine_teleop::CameraInputSpec ccg2_25_fps{"uyvy", 1920, 1080, 25};
+  const auto unchanged =
+      mine_teleop::build_camera_input_pipeline("source_ccg2_25", ccg2_25_fps, output);
+  expect(
+      unchanged.find("videorate") == std::string::npos,
+      "CCG2 input added videorate even though input and output FPS match");
+
+  const mine_teleop::CameraInputSpec legacy_30_fps{"mjpeg", 1280, 720, 30};
+  const auto legacy =
+      mine_teleop::build_camera_input_pipeline("source_legacy_30", legacy_30_fps, output);
+  expect(
+      legacy.find("videorate") == std::string::npos,
+      "legacy MJPEG pipeline behavior changed when input and output FPS differ");
+}
+
+void test_ccg2_camera_input_pipeline_is_gstreamer_parseable() {
+  mine_teleop::MediaProfile output;
+  output.width = 1280;
+  output.height = 720;
+  output.fps = 25;
+  const mine_teleop::CameraInputSpec input{"uyvy", 1920, 1080, 30};
+  const auto description =
+      mine_teleop::build_camera_input_pipeline("source_ccg2_parse", input, output) +
+      "! fakesink sync=false";
+
+  GError* init_error = nullptr;
+  if (!gst_init_check(nullptr, nullptr, &init_error)) {
+    const std::string message = init_error == nullptr ? "unknown error" : init_error->message;
+    if (init_error != nullptr) g_error_free(init_error);
+    throw TestFailure("GStreamer initialization failed: " + message);
+  }
+
+  GError* parse_error = nullptr;
+  GstElement* pipeline = gst_parse_launch(description.c_str(), &parse_error);
+  const std::string error = parse_error == nullptr ? "" : parse_error->message;
+  const bool parsed = pipeline != nullptr && error.empty();
+  if (parse_error != nullptr) g_error_free(parse_error);
+  if (pipeline != nullptr) gst_object_unref(pipeline);
+  expect(
+      parsed,
+      "GStreamer could not parse the CCG2 30-to-25 FPS input pipeline: " + error);
+}
+
+void test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap() {
+  expect(
+      mine_teleop::v4l2_sequence_gap(std::nullopt, 42U) == 0,
+      "first V4L2 frame was reported as a sequence gap");
+  expect(
+      mine_teleop::v4l2_sequence_gap(std::optional<std::uint32_t>{41U}, 42U) == 0,
+      "consecutive V4L2 frames were reported as a sequence gap");
+  expect(
+      mine_teleop::v4l2_sequence_gap(std::optional<std::uint32_t>{41U}, 45U) == 3,
+      "V4L2 sequence gap did not count all missing frames");
+  expect(
+      mine_teleop::v4l2_sequence_gap(
+          std::optional<std::uint32_t>{std::numeric_limits<std::uint32_t>::max()},
+          0U) == 0,
+      "V4L2 sequence wrap was reported as a missing frame");
+}
+
+void test_camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults() {
+  for (const std::string_view error : {
+           "CCG2 driver returned invalid timeperframe for /dev/video0: numerator=0, denominator=30",
+           "CCG2 driver returned unexpected timeperframe for /dev/video0: requested_fps=30, numerator=1, denominator=25",
+       }) {
+    const auto issue = mine_teleop::classify_camera_issue(error);
+    expect(
+        issue.code == "camera_ccg2_fps_mismatch",
+        "CCG2 timeperframe validation did not use the dedicated FPS mismatch issue code");
+    expect(!issue.retryable, "CCG2 timeperframe mismatch was marked retryable");
+  }
+
+  const auto buffer_error = mine_teleop::classify_camera_issue(
+      "CCG2 V4L2 buffer flagged error for /dev/video0: sequence=42, gap_from_last_delivered=1");
+  expect(
+      buffer_error.code == "camera_ccg2_buffer_error",
+      "CCG2 errored capture buffer did not use the dedicated issue code");
+  expect(buffer_error.retryable, "CCG2 errored capture buffer was marked nonretryable");
+
+  const auto generic_fps = mine_teleop::classify_camera_issue(
+      "VIDIOC_S_PARM failed for /dev/video0: Invalid argument");
+  expect(
+      generic_fps.code == "camera_fps_rejected",
+      "generic V4L2 FPS rejection changed issue code");
+  expect(
+      generic_fps.action.find("MJPEG") == std::string_view::npos,
+      "generic V4L2 FPS recovery action incorrectly assumes MJPEG input");
+}
+
+void test_ccg2_example_config_defines_two_explicit_capture_lanes() {
+  const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.ccg2-8m.yaml");
+  expect(
+      config.hardware.preferred_encoder == "vaapi",
+      "CCG2 example config does not prefer the Intel VAAPI encoder");
+  expect(
+      config.hardware.fallback_encoder == "nvenc",
+      "CCG2 example config does not retain NVENC as the fallback encoder");
+  const auto cameras = config.enabled_cameras();
+  expect(cameras.size() == 2, "CCG2 example config does not enable exactly two capture lanes");
+  for (std::size_t index = 0; index < cameras.size(); ++index) {
+    const auto& camera = cameras.at(index);
+    expect(
+        camera.id == "ccg2_channel_" + std::to_string(index),
+        "CCG2 example camera ID no longer matches its channel index");
+    expect(
+        camera.backend == "ccg2" &&
+            camera.device == "/dev/ccg2-channel-" + std::to_string(index),
+        "CCG2 example camera does not explicitly bind the expected V4L2 node");
+    expect(
+        camera.capture_width == 1920 && camera.capture_height == 1080 &&
+            camera.capture_fps == 30,
+        "CCG2 example camera capture mode is not 1920x1080 at 30 FPS");
+    expect(
+        camera.realtime_profile == "realtime_720p30" &&
+            camera.record_profile == "reuse_realtime",
+        "CCG2 example camera profile bindings changed");
+  }
 }
 
 void test_missing_v4l2_path_remains_retryable() {
@@ -2742,6 +2998,47 @@ void test_driver_config_and_hardware_encoder_priority() {
   expect(candidates.at(0).codec == mine_teleop::VideoCodec::H265, "preferred candidate codec changed");
 }
 
+void test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility() {
+  const mine_teleop::VideoEncoderSettings settings{2500, 30};
+  const auto stage_120 =
+      mine_teleop::build_nvenc_pipeline_stage("nvh264enc", settings, "encoder_front", 1, 20);
+  const auto stage_122 =
+      mine_teleop::build_nvenc_pipeline_stage("nvh264enc", settings, "encoder_front", 1, 22);
+  const auto stage_124 =
+      mine_teleop::build_nvenc_pipeline_stage("nvh264enc", settings, "encoder_front", 1, 24);
+
+  for (const auto* stage : {&stage_120, &stage_122, &stage_124}) {
+    expect(
+        stage->starts_with("nvh264enc name=encoder_front "),
+        "NVENC pipeline stage lost its selected factory or element name");
+    for (const std::string_view property : {
+             "bitrate=2500",
+             "gop-size=30",
+             "bframes=0",
+             "zerolatency=true",
+             "rc-lookahead=0",
+             "rc-mode=cbr",
+         }) {
+      expect(
+          stage->find(property) != std::string::npos,
+          "NVENC pipeline stage lost common low-latency property " + std::string(property));
+    }
+  }
+
+  expect(
+      stage_120.find("preset=") == std::string::npos &&
+          stage_120.find("tune=") == std::string::npos,
+      "GStreamer 1.20 NVENC stage included unsupported preset or tune properties");
+  expect(
+      stage_122.find("preset=p1") != std::string::npos &&
+          stage_122.find("tune=") == std::string::npos,
+      "GStreamer 1.22 NVENC stage did not apply only the supported preset property");
+  expect(
+      stage_124.find("preset=p1") != std::string::npos &&
+          stage_124.find("tune=ultra-low-latency") != std::string::npos,
+      "GStreamer 1.24 NVENC stage did not apply preset and ultra-low-latency tune");
+}
+
 void test_native_testsrc_acquisition_does_not_spawn_ffmpeg() {
   const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   const auto camera = config.enabled_cameras().front();
@@ -2992,6 +3289,15 @@ int main() {
       {"control_enabled_vehicle_requires_an_enabled_critical_camera", test_control_enabled_vehicle_requires_an_enabled_critical_camera},
       {"camera_failure_decision_is_bounded_and_fail_closed", test_camera_failure_decision_is_bounded_and_fail_closed},
       {"camera_source_classification_is_canonical", test_camera_source_classification_is_canonical},
+      {"camera_input_spec_is_explicit_for_ccg2_and_legacy_safe", test_camera_input_spec_is_explicit_for_ccg2_and_legacy_safe},
+      {"camera_backend_config_rejects_unknown_and_invalid_ccg2_modes", test_camera_backend_config_rejects_unknown_and_invalid_ccg2_modes},
+      {"ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames", test_ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames},
+      {"camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2", test_camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2},
+      {"camera_input_pipeline_resamples_only_mismatched_ccg2_fps", test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps},
+      {"ccg2_camera_input_pipeline_is_gstreamer_parseable", test_ccg2_camera_input_pipeline_is_gstreamer_parseable},
+      {"v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap", test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap},
+      {"camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults", test_camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults},
+      {"ccg2_example_config_defines_two_explicit_capture_lanes", test_ccg2_example_config_defines_two_explicit_capture_lanes},
       {"missing_v4l2_path_remains_retryable", test_missing_v4l2_path_remains_retryable},
       {"media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes", test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes},
       {"critical_camera_control_latch_persists_until_a_new_session", test_critical_camera_control_latch_persists_until_a_new_session},
@@ -3030,6 +3336,7 @@ int main() {
       {"signaling_presence_generation_and_automatic_release", test_signaling_presence_generation_and_automatic_release},
       {"signaling_time_sync_common_domain", test_signaling_time_sync_common_domain},
       {"driver_config_and_hardware_encoder_priority", test_driver_config_and_hardware_encoder_priority},
+      {"nvenc_pipeline_stage_tracks_gstreamer_property_compatibility", test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility},
       {"native_testsrc_acquisition_does_not_spawn_ffmpeg", test_native_testsrc_acquisition_does_not_spawn_ffmpeg},
       {"basler_camera_uses_minimal_aravis_bridge", test_basler_camera_uses_minimal_aravis_bridge},
       {"native_driver_to_vehicle_data_channel_payload", test_native_driver_to_vehicle_data_channel_payload},

@@ -1423,6 +1423,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
     camera.critical_for_control = optional<bool>(node, "critical_for_control", true);
     camera.reopen_attempts = optional<int>(node, "reopen_attempts", 3);
     camera.reopen_backoff_ms = optional<int>(node, "reopen_backoff_ms", 500);
+    camera.backend = optional<std::string>(node, "backend", "auto");
     camera.device = required<std::string>(node, "device", camera.id);
     camera.capture_width = optional<int>(node, "capture_width", 1280);
     camera.capture_height = optional<int>(node, "capture_height", 720);
@@ -1434,6 +1435,15 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
     }
     if (camera.reopen_backoff_ms < 0 || camera.reopen_backoff_ms > 60000) {
       throw std::runtime_error(camera.id + ".reopen_backoff_ms must be in [0, 60000]");
+    }
+    if (camera.backend != "auto" && camera.backend != "ccg2") {
+      throw std::runtime_error(camera.id + ".backend must be auto or ccg2");
+    }
+    if (camera.backend == "ccg2" &&
+        (camera.capture_width <= 0 || camera.capture_height <= 0 || camera.capture_fps <= 0 ||
+         camera.capture_width % 2 != 0)) {
+      throw std::runtime_error(
+          camera.id + ".capture_width must be positive and even; capture_height and capture_fps must be positive");
     }
     static_cast<void>(config.realtime_profile(camera.realtime_profile));
     if (!camera.record_profile.empty()) static_cast<void>(config.record_profile(camera.record_profile));

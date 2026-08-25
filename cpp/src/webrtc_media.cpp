@@ -140,8 +140,6 @@ bool CriticalCameraControlLatch::inhibited_for(std::string_view session_id) cons
 
 namespace {
 
-inline constexpr guint64 kCameraAppSrcMaxBuffers = 2;
-
 std::int64_t steady_now_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -194,8 +192,13 @@ CameraIssue classify_camera_issue_impl(std::string_view error) {
     return error.find(value) != std::string_view::npos;
   };
   if (contains("camera media source configuration is invalid") ||
-      contains("native camera acquisition requires an mjpeg")) {
-    return {"camera_config_invalid", "camera_config", "Check the camera ID, realtime profile, resolution, FPS, and MJPEG codec.", false};
+      contains("native camera acquisition requires an mjpeg") ||
+      contains("CCG2 camera acquisition requires a uyvy") ||
+      contains("CCG2 capture requires") ||
+      contains("unsupported camera backend") ||
+      contains("camera input pipeline configuration is invalid") ||
+      contains("camera input pipeline codec is unsupported")) {
+    return {"camera_config_invalid", "camera_config", "Check the camera ID, backend, realtime/capture profiles, resolution, FPS, and input codec.", false};
   }
   if (contains("camera is not a vendor SDK source")) {
     return {"camera_source_type_invalid", "camera_config", "Use testsrc, a V4L2 path, or a supported mvs/aravis camera selector.", false};
@@ -234,11 +237,37 @@ CameraIssue classify_camera_issue_impl(std::string_view error) {
   if (contains("VIDIOC_S_FMT MJPEG failed")) {
     return {"camera_mjpeg_format_rejected", "v4l2_format", "Use a width, height, and MJPEG format advertised by v4l2-ctl.", false};
   }
+  if (contains("VIDIOC_S_FMT CCG2 YUYV failed") ||
+      contains("CCG2 driver did not negotiate reported YUYV")) {
+    return {"camera_ccg2_yuyv_format_rejected", "v4l2_format", "Confirm the CCG2 node advertises YUYV at the configured width, height, and FPS.", false};
+  }
+  if (contains("CCG2 driver negotiated unexpected dimensions") ||
+      contains("CCG2 driver returned invalid UYVY dimensions")) {
+    return {"camera_ccg2_dimensions_mismatch", "v4l2_format", "Use the exact CCG2 V4L2 capture dimensions; board input status is diagnostic and is not the application frame height.", false};
+  }
+  if (contains("CCG2 driver returned bytesperline") ||
+      contains("CCG2 driver returned sizeimage") ||
+      contains("CCG2 driver returned an overflowing UYVY layout") ||
+      contains("CCG2 UYVY bytesperline") ||
+      contains("CCG2 UYVY frame layout overflows") ||
+      contains("CCG2 UYVY packed frame size overflows")) {
+    return {"camera_ccg2_layout_invalid", "v4l2_format", "Inspect the negotiated bytesperline/sizeimage and CCG2 driver version before capturing again.", false};
+  }
+  if (contains("CCG2 UYVY frame is shorter")) {
+    return {"camera_ccg2_frame_short", "v4l2_capture", "Inspect bytesused, bytesperline, sizeimage, PCIe link health, and the CCG2 driver log.", true};
+  }
+  if (contains("CCG2 driver returned invalid timeperframe") ||
+      contains("CCG2 driver returned unexpected timeperframe")) {
+    return {"camera_ccg2_fps_mismatch", "v4l2_frame_rate", "Use a CCG2 capture FPS accepted exactly by the driver for the configured capture resolution.", false};
+  }
+  if (contains("CCG2 V4L2 buffer flagged error")) {
+    return {"camera_ccg2_buffer_error", "v4l2_capture", "Inspect the reported V4L2 sequence/gap, PCIe link health, camera link status, and the CCG2 driver log.", true};
+  }
   if (contains("does not provide native MJPEG")) {
     return {"camera_native_mjpeg_unavailable", "v4l2_format", "Choose a native MJPEG camera mode or add a supported raw-frame conversion path.", false};
   }
   if (contains("VIDIOC_S_PARM failed")) {
-    return {"camera_fps_rejected", "v4l2_frame_rate", "Use an FPS advertised for the selected MJPEG resolution.", false};
+    return {"camera_fps_rejected", "v4l2_frame_rate", "Use an FPS advertised for the selected camera backend and capture resolution.", false};
   }
   if (contains("mmap buffers are unavailable")) {
     return {"camera_mmap_buffers_unavailable", "v4l2_buffers", "Check driver streaming support and available memory.", true};
@@ -263,6 +292,9 @@ CameraIssue classify_camera_issue_impl(std::string_view error) {
   }
   if (contains("invalid MJPEG frame")) {
     return {"camera_invalid_mjpeg_frame", "camera_decode_boundary", "Verify camera/bridge MJPEG framing and USB data integrity.", true};
+  }
+  if (contains("camera frame does not match configured input caps")) {
+    return {"camera_input_caps_mismatch", "camera_decode_boundary", "Check the selected backend and capture dimensions before restarting the media lane.", false};
   }
   if (contains("native JPEG encoder failed")) {
     return {"camera_test_jpeg_encode_failed", "test_source_encode", "Check the native JPEG runtime and requested test-source dimensions.", false};
@@ -416,6 +448,7 @@ struct VehicleMediaRuntime::Impl {
     Impl* owner{nullptr};
     CameraConfig camera;
     MediaProfile profile;
+    CameraInputSpec input;
     std::unique_ptr<CameraFrameSource> source;
     GstElement* appsrc{nullptr};
     GstElement* encoder{nullptr};
@@ -424,6 +457,11 @@ struct VehicleMediaRuntime::Impl {
     std::atomic<std::uint64_t> pushed{0};
     std::atomic<std::uint64_t> encoded{0};
     std::atomic<std::uint64_t> dropped{0};
+    std::atomic<bool> source_sequence_valid{false};
+    std::atomic<std::uint64_t> source_sequence{0};
+    std::atomic<std::uint64_t> source_sequence_gap{0};
+    std::atomic<std::uint32_t> source_timeperframe_numerator{0};
+    std::atomic<std::uint32_t> source_timeperframe_denominator{0};
     std::atomic<std::int64_t> last_capture_ms{0};
     std::atomic<std::int64_t> last_encoded_ms{0};
     std::atomic<std::int64_t> last_encoded_steady_ms{0};
@@ -822,6 +860,12 @@ struct VehicleMediaRuntime::Impl {
       int failure_count,
       const CameraFailureDecision& decision) const {
     const auto issue = classify_camera_issue(error);
+    const auto failed_source_sequence = lane.source == nullptr
+        ? std::optional<std::uint32_t>{}
+        : lane.source->last_v4l2_sequence();
+    const auto failed_source_sequence_gap = lane.source == nullptr
+        ? std::uint64_t{0}
+        : lane.source->last_v4l2_sequence_gap();
     const auto safety_action = decision.inhibit_control
         ? (decision.lane_action == CameraFailureAction::ReopenLane
                ? "local_full_stop_and_reopen_camera_lane"
@@ -839,15 +883,22 @@ struct VehicleMediaRuntime::Impl {
         {
             {"camera_id", lane.camera.id},
             {"device", lane.camera.device},
-            {"source_kind", camera_source_kind_name(classify_camera_source(lane.camera.device))},
+            {"source_kind", camera_source_kind_name(classify_camera_source(lane.camera))},
             {"profile", lane.camera.realtime_profile},
             {"configured_width", lane.profile.width},
             {"configured_height", lane.profile.height},
             {"configured_fps", lane.profile.fps},
+            {"capture_codec", lane.input.codec},
+            {"capture_width", lane.input.width},
+            {"capture_height", lane.input.height},
+            {"capture_fps", lane.input.fps},
             {"captured_frames", lane.captured.load()},
             {"pushed_frames", lane.pushed.load()},
             {"encoded_frames", lane.encoded.load()},
             {"dropped_frames", lane.dropped.load()},
+            {"source_sequence_valid", failed_source_sequence.has_value()},
+            {"source_sequence", failed_source_sequence.value_or(0)},
+            {"source_sequence_gap", failed_source_sequence_gap},
             {"critical_for_control", lane.camera.critical_for_control},
             {"failure_count", failure_count},
             {"reopen_attempts", lane.camera.reopen_attempts},
@@ -1559,17 +1610,7 @@ struct VehicleMediaRuntime::Impl {
       const auto recording_stream_format = encoder.codec() == VideoCodec::H265 ? "hvc1" : "avc";
       VideoEncoderSettings settings{lane->profile.bitrate_kbps, std::max(1, lane->profile.fps)};
       pipeline_text
-          << "appsrc name=source_" << id
-          << " is-live=true format=time do-timestamp=false emit-signals=false block=false max-buffers="
-          << kCameraAppSrcMaxBuffers
-          << " max-bytes=524288 max-time=0 leaky-type=downstream "
-          << "caps=image/jpeg,width=" << lane->profile.width << ",height=" << lane->profile.height
-          << ",framerate=" << lane->profile.fps << "/1 "
-          << "! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream "
-          << "! jpegdec ! videoconvert ! videoscale "
-          << "! video/x-raw,format=NV12,width=" << lane->profile.width << ",height=" << lane->profile.height
-          << ",framerate=" << lane->profile.fps << "/1 "
-          << "! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream "
+          << build_camera_input_pipeline("source_" + id, lane->input, lane->profile)
           << "! " << encoder.pipeline_stage(settings, "encoder_" + id) << ' '
           << "! " << parser << " config-interval=-1 "
           << "! " << elementary_caps << ",stream-format=byte-stream,alignment=au "
@@ -1663,13 +1704,17 @@ struct VehicleMediaRuntime::Impl {
       lane->owner = this;
       lane->camera = camera;
       lane->profile = config.realtime_profile(camera.realtime_profile);
+      lane->input = camera_input_spec(camera, lane->profile);
       lanes.push_back(std::move(lane));
     }
   }
 
   [[nodiscard]] std::unique_ptr<CameraFrameSource> create_camera_source(const Lane& lane) const {
     MediaProfile capture = lane.profile;
-    capture.codec = "mjpeg";
+    capture.codec = lane.input.codec;
+    capture.width = lane.input.width;
+    capture.height = lane.input.height;
+    capture.fps = lane.input.fps;
     capture.encoder = "native";
     return std::make_unique<CameraFrameSource>(lane.camera, std::move(capture), frame_timeout_ms);
   }
@@ -1812,7 +1857,7 @@ struct VehicleMediaRuntime::Impl {
         std::uint64_t sequence = 0;
         bool recovery_pending = false;
         const bool pace_test_source =
-            classify_camera_source(lane->camera.device) == CameraSourceKind::TestSource &&
+            classify_camera_source(lane->camera) == CameraSourceKind::TestSource &&
             capture_interval_ms == 0;
         const auto test_source_interval =
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds(1)) /
@@ -1831,6 +1876,31 @@ struct VehicleMediaRuntime::Impl {
             }
             auto frame = lane->source->next(++sequence);
             if (stop_requested) break;
+            if (classify_camera_source(lane->camera) == CameraSourceKind::Ccg2 &&
+                (frame.codec != lane->input.codec || frame.width != lane->input.width ||
+                 frame.height != lane->input.height)) {
+              throw std::runtime_error(
+                  "camera frame does not match configured input caps: " + lane->camera.id);
+            }
+            lane->source_sequence_valid = frame.source_sequence_valid;
+            lane->source_sequence = frame.source_sequence;
+            lane->source_sequence_gap = frame.source_sequence_gap;
+            lane->source_timeperframe_numerator = frame.source_timeperframe_numerator;
+            lane->source_timeperframe_denominator = frame.source_timeperframe_denominator;
+            if (frame.source_sequence_valid && frame.source_sequence_gap > 0) {
+              lane->dropped.fetch_add(frame.source_sequence_gap);
+              emit_diagnostic(
+                  "vehicle_camera_sequence_gap",
+                  "camera_v4l2_sequence_gap",
+                  "v4l2_capture",
+                  "V4L2 capture sequence skipped one or more buffers.",
+                  "Inspect the reported sequence/gap, PCIe link health, camera link status, and the CCG2 driver log.",
+                  true,
+                  {{"camera_id", lane->camera.id},
+                   {"device", lane->camera.device},
+                   {"source_sequence", frame.source_sequence},
+                   {"source_sequence_gap", frame.source_sequence_gap}});
+            }
             frame.captured_at_ms = signaling.from_local_system_ms(frame.captured_at_ms);
             ++lane->captured;
             lane->last_capture_ms = frame.captured_at_ms;
@@ -1866,8 +1936,20 @@ struct VehicleMediaRuntime::Impl {
                   true,
                   {{"camera_id", lane->camera.id},
                    {"device", lane->camera.device},
-                   {"source_kind", camera_source_kind_name(classify_camera_source(lane->camera.device))},
+                   {"source_kind", camera_source_kind_name(classify_camera_source(lane->camera))},
+                   {"frame_codec", frame.codec},
+                   {"frame_width", frame.width},
+                   {"frame_height", frame.height},
+                   {"frame_fps", frame.fps},
                    {"payload_bytes", frame.payload.size()},
+                   {"source_bytes_per_line", frame.source_bytes_per_line},
+                   {"source_size_image", frame.source_size_image},
+                   {"source_bytes_used", frame.source_bytes_used},
+                   {"source_sequence_valid", frame.source_sequence_valid},
+                   {"source_sequence", frame.source_sequence},
+                   {"source_sequence_gap", frame.source_sequence_gap},
+                   {"source_timeperframe_numerator", frame.source_timeperframe_numerator},
+                   {"source_timeperframe_denominator", frame.source_timeperframe_denominator},
                    {"sequence", sequence}});
             }
             GstBuffer* buffer = gst_buffer_new_allocate(nullptr, frame.payload.size(), nullptr);
@@ -1876,7 +1958,7 @@ struct VehicleMediaRuntime::Impl {
             const auto elapsed_ms = std::max<std::int64_t>(0, frame.captured_at_ms - started_ms);
             GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(elapsed_ms) * GST_MSECOND;
             GST_BUFFER_DTS(buffer) = GST_CLOCK_TIME_NONE;
-            GST_BUFFER_DURATION(buffer) = GST_SECOND / static_cast<GstClockTime>(std::max(1, lane->profile.fps));
+            GST_BUFFER_DURATION(buffer) = GST_SECOND / static_cast<GstClockTime>(std::max(1, lane->input.fps));
             if (recovered_this_frame) {
               GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DISCONT);
             }
@@ -2247,6 +2329,15 @@ struct VehicleMediaRuntime::Impl {
           {"width", lane->profile.width},
           {"height", lane->profile.height},
           {"target_fps", lane->profile.fps},
+          {"capture_codec", lane->input.codec},
+          {"capture_width", lane->input.width},
+          {"capture_height", lane->input.height},
+          {"capture_fps", lane->input.fps},
+          {"source_sequence_valid", lane->source_sequence_valid.load()},
+          {"source_sequence", lane->source_sequence.load()},
+          {"source_sequence_gap", lane->source_sequence_gap.load()},
+          {"source_timeperframe_numerator", lane->source_timeperframe_numerator.load()},
+          {"source_timeperframe_denominator", lane->source_timeperframe_denominator.load()},
           {"error", error},
       });
     }

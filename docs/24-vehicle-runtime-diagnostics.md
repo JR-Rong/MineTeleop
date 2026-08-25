@@ -30,6 +30,30 @@ stderr；协议细节与高频 CAN 证据写入
 `VIDEO_CAPTURE + STREAMING` capability；后者由下面的
 `camera_node_not_capture_capable` 精确报告。
 
+CCG2-8M 还必须在部署阶段先完成内核驱动安装和板卡初始化；MineTeleop 不执行这两
+步。`backend: ccg2` 下，驱动报告 YUYV 而实际 buffer 按 UYVY 解释是已知约定，不应
+误判为普通 V4L2 格式异常。排查原始帧时以 V4L2 协商的 `1920x1080`、
+`bytesperline`、`bytesused` 为准；板卡显示的 `1920x1536` input status 只证明输入
+链路状态，不代表应用应读取 1536 行。示例配置见
+`configs/vehicle-agent.ccg2-8m.yaml`。ccg2-support 按 XDMA sysfs channel index 建立
+`/dev/ccg2-channel-0` 至 `/dev/ccg2-channel-7`；排障和配置都应使用这些稳定链接，
+不要绑定枚举顺序可能变化的 `/dev/videoN`。
+
+CCG2 的 `vehicle_camera_first_frame`、`vehicle_camera_failed` 和 lane metrics 会携带
+`source_sequence_valid`、`source_sequence`、`source_sequence_gap`，用于区分应用
+拥塞与 V4L2/驱动丢帧。
+其中 gap 是相对上一帧已交付给 pipeline 的 V4L2 sequence 计算，并处理 32 位回绕。
+非零 gap 另行输出 `vehicle_camera_sequence_gap` / `camera_v4l2_sequence_gap`，缺失数
+计入 `dropped_frames`；可与 appsrc backlog 对照区分驱动/链路丢帧和下游拥塞。
+带 `V4L2_BUF_FLAG_ERROR` 的 buffer 会先执行 `QBUF` 归还驱动，再作为可重试的
+`camera_ccg2_buffer_error` 上报；该 buffer 不会增加已采集帧计数，也不会刷新
+`last_capture_ms`/画面 freshness。
+
+当前 CCG2 Ubuntu 22.04 基线应保持示例配置的 VAAPI 优先顺序。目标机的 GStreamer
+1.20.3/RTX 2000 Ada 会对 NVCodec 报 `Selected preset not supported`，不是相机采集
+故障；同一 raw 输入已由 `vaapih264enc` 验证成功。升级到 GStreamer 1.24+ 后再验证
+`preset=p1`/`tune=ultra-low-latency` 并考虑切回 NVENC 优先。
+
 `vehicle-runtime` 的 media 子进程若因未处理异常退出，会输出
 `vehicle_runtime_child_error`、`service=media`、
 `issue_code=vehicle_runtime_child_failed` 与 `safety_action=local_full_stop`。
@@ -44,7 +68,7 @@ stderr；协议细节与高频 CAN 证据写入
 
 | `issue_code` | 触发条件/根因边界 | `stage` | 首要排查动作 |
 | --- | --- | --- | --- |
-| `camera_config_invalid` | ID、分辨率、FPS 或 native acquisition profile 非法 | `camera_config` | 检查 camera 与 realtime profile |
+| `camera_config_invalid` | ID、backend、采集分辨率/FPS 或 input profile 非法 | `camera_config` | 检查 camera backend、capture 字段与 realtime profile |
 | `camera_source_type_invalid` | 既不是 testsrc/V4L2，也不是支持的 SDK selector | `camera_config` | 修正 `device` selector |
 | `camera_bridge_pipe_failed` | vendor bridge stdout pipe 创建失败 | `vendor_bridge_start` | 检查 fd 上限和系统资源 |
 | `camera_bridge_fork_failed` | vendor bridge 进程 fork 失败 | `vendor_bridge_start` | 检查进程上限和内存 |
@@ -56,9 +80,15 @@ stderr；协议细节与高频 CAN 证据写入
 | `camera_open_failed` | V4L2 open 失败，包括 USB 拔插/udev 重建期间节点暂时不存在、权限或 busy | `v4l2_open` | 检查路径、物理连接、权限和占用；运行期按配置执行有界单路重试 |
 | `camera_querycap_failed` | `VIDIOC_QUERYCAP` 失败 | `v4l2_capabilities` | 确认路径确为 V4L2 节点 |
 | `camera_node_not_capture_capable` | 节点没有 capture+streaming capability | `v4l2_capabilities` | 选择 `v4l2-ctl` 显示的 capture 节点 |
-| `camera_mjpeg_format_rejected` | 驱动拒绝 MJPEG 宽高 | `v4l2_format` | 使用驱动公布的 MJPEG mode |
-| `camera_native_mjpeg_unavailable` | 实际协商结果不是 MJPEG | `v4l2_format` | 换 native MJPEG mode 或实现转换 |
-| `camera_fps_rejected` | 驱动拒绝目标 FPS | `v4l2_frame_rate` | 使用该分辨率公布的 FPS |
+| `camera_mjpeg_format_rejected` | `backend=auto` 的普通 V4L2 驱动拒绝 MJPEG 宽高 | `v4l2_format` | 使用驱动公布的 MJPEG mode；CCG2 必须显式配置 `backend: ccg2` |
+| `camera_native_mjpeg_unavailable` | `backend=auto` 的普通 V4L2 实际协商结果不是 MJPEG | `v4l2_format` | 换 native MJPEG mode；不要用 `ccg2` 绕过非 CCG2 相机的格式检查 |
+| `camera_ccg2_yuyv_format_rejected` | CCG2 节点拒绝 YUYV，或实际协商 FOURCC 不是驱动约定的 YUYV | `v4l2_format` | 确认节点、驱动版本及 `1920x1080@30` mode |
+| `camera_ccg2_dimensions_mismatch` | CCG2 实际协商尺寸与配置不符，或 UYVY 宽高非法 | `v4l2_format` | 使用 V4L2 应用可见尺寸；不要把 `1920x1536` input status 写入 capture 高度 |
+| `camera_ccg2_layout_invalid` | `bytesperline`/`sizeimage` 小于可见 UYVY 图像或发生尺寸溢出 | `v4l2_format` | 记录协商布局并检查驱动版本 |
+| `camera_ccg2_frame_short` | `bytesused` 不足以覆盖按 stride 计算的 `1920x1080` 可见帧 | `v4l2_capture` | 查 PCIe/GMSL 链路、驱动日志和 buffer 统计；允许有尾部数据但不能缺可见行 |
+| `camera_ccg2_buffer_error` | CCG2 DQBUF 带 `V4L2_BUF_FLAG_ERROR`；buffer 已归还但不作为新帧 | `v4l2_capture` | 结合 sequence/gap 查 PCIe/GMSL 链路与驱动日志；允许单路有界重试 |
+| `camera_fps_rejected` | `VIDIOC_S_PARM` 拒绝目标 FPS | `v4l2_frame_rate` | 使用所选 backend 在该分辨率公布的 FPS |
+| `camera_ccg2_fps_mismatch` | CCG2 返回的 `timeperframe` 无效或不精确等于 `1/capture_fps` | `v4l2_frame_rate` | 修正 capture FPS 或板卡/驱动模式；不要接受静默降帧 |
 | `camera_mmap_buffers_unavailable` | `REQBUFS` 失败或少于两个 buffer | `v4l2_buffers` | 查驱动 streaming 支持与内存 |
 | `camera_query_buffer_failed` | `QUERYBUF` 失败 | `v4l2_buffers` | 查驱动/USB 链路 |
 | `camera_mmap_failed` | 用户态 mmap 失败 | `v4l2_buffers` | 查内存压力与驱动 |
@@ -67,6 +97,7 @@ stderr；协议细节与高频 CAN 证据写入
 | `camera_dequeue_buffer_failed` | `DQBUF` 失败 | `v4l2_capture` | 查驱动/USB 错误 |
 | `camera_invalid_capture_buffer` | 驱动返回越界 index/bytesused | `v4l2_capture` | 按驱动故障处理并查 kernel log |
 | `camera_invalid_mjpeg_frame` | JPEG SOI/EOI 校验失败 | `camera_decode_boundary` | 查相机/bridge 帧边界和数据完整性 |
+| `camera_input_caps_mismatch` | 采集帧的 codec/宽高与该 lane 的 GStreamer input caps 不一致 | `camera_decode_boundary` | 检查 backend 和 capture 字段后重启该 lane |
 | `camera_test_jpeg_encode_failed` | testsrc native JPEG 编码失败 | `test_source_encode` | 查 JPEG runtime 与目标尺寸 |
 | `camera_gstreamer_buffer_allocation_failed` | GstBuffer 分配失败 | `gstreamer_push` | 查内存压力 |
 | `camera_appsrc_push_failed` | appsrc 拒绝非 flushing/EOS 帧 | `gstreamer_push` | 结合 GStreamer bus error 排查下游 |

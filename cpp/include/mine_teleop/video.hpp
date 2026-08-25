@@ -28,6 +28,13 @@ struct VideoEncoderSettings {
   int keyframe_interval_frames{30};
 };
 
+[[nodiscard]] std::string build_nvenc_pipeline_stage(
+    std::string_view factory_name,
+    const VideoEncoderSettings& settings,
+    std::string_view element_name,
+    unsigned int gstreamer_major,
+    unsigned int gstreamer_minor);
+
 class VideoEncoder {
  public:
   virtual ~VideoEncoder() = default;

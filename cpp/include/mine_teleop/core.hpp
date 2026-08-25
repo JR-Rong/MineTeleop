@@ -310,6 +310,7 @@ struct CameraConfig {
   bool critical_for_control{true};
   int reopen_attempts{3};
   int reopen_backoff_ms{500};
+  std::string backend{"auto"};
   std::string device;
   int capture_width{1280};
   int capture_height{720};

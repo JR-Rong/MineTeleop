@@ -69,6 +69,7 @@ leaky queue，积压时丢弃旧帧。
 cameras:
   - id: front
     enabled: true
+    backend: auto
     device: /dev/video0
     capture_width: 1920
     capture_height: 1080
@@ -77,6 +78,7 @@ cameras:
     record_profile: record_source_h265
   - id: rear
     enabled: true
+    backend: auto
     device: /dev/video1
     capture_width: 1920
     capture_height: 1080
@@ -86,6 +88,33 @@ cameras:
 ```
 
 每路相机必须能独立启停。单路故障不应导致全部视频中断。
+
+`backend: auto` 是默认兼容路径，普通 V4L2 相机仍必须提供 native MJPEG，现有
+Aravis/Basler、MVS 和 testsrc 路径也不改变。CCG2-8M 使用显式
+`backend: ccg2`：采集端向驱动请求/校验其报告的 YUYV，同时按实测的 UYVY 内存
+顺序逐行去除 stride padding，再以 `video/x-raw,format=UYVY` 直接送入 GStreamer 的
+`videoconvert`/`videoscale` 和现有硬件编码器。仅当 `capture_fps` 与 realtime profile
+输出 FPS 不同时，这条 raw pipeline 才在输出 caps 前插入 `videorate`；相同时不插入，
+legacy MJPEG pipeline 仍沿用 realtime profile 的 input caps 且不插入 `videorate`。
+CCG2 路径不先转成 JPEG，避免双路 `1920x1080@30` 多一次 CPU JPEG 编解码。
+配置必须使用 ccg2-support 按 XDMA channel index 建立的稳定链接
+`/dev/ccg2-channel-0` 至 `/dev/ccg2-channel-7`，不能依赖可能随枚举顺序改变的
+`/dev/videoN`。
+
+V4L2 协商得到的宽高、`bytesperline` 和 `bytesused` 是应用读取 buffer 的依据；当前
+应用可见尺寸是 `1920x1080`。板卡状态工具中的 `1920x1536` input status 仅描述板端
+输入链路，不能据此把 1536 行送入 pipeline。CCG2 内核驱动安装、设备节点创建和
+板卡初始化都属于部署前置条件，不由媒体 runtime 代办。CCG2 启动时还会校验
+`VIDIOC_S_PARM` 返回的 `timeperframe`：分子/分母必须有效，且有理数必须精确等于
+`1 / capture_fps`，不能把驱动静默降帧当成已满足配置。
+
+CCG2 的 Ubuntu 22.04 实机基线使用 Intel VAAPI 优先、NVENC 备用。该机的 GStreamer
+1.20.3 配合 RTX 2000 Ada/595.84 驱动时，NVCodec 即使不传新版属性仍在启动阶段报告
+`Selected preset not supported`，而同一 raw 帧已由 `vaapih264enc` 成功编码。因此
+`configs/vehicle-agent.ccg2-8m.yaml` 不沿用通用配置的 NVENC 优先顺序。NVENC stage 在
+1.20 不写 `preset`/`tune`，1.22 起才写 `preset=p1`，1.24 起才同时写
+`tune=ultra-low-latency`；升级到 GStreamer 1.24+ 并重新完成实机编码验收后，才能把
+该目标机改回 NVENC 优先。
 
 ## 录像
 

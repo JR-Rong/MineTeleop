@@ -1,0 +1,121 @@
+# CCG2-8M two-channel media commissioning example.
+# The token file is a local deployment input; never commit its contents.
+vehicle:
+  id: vehicle-ccg2-bench-001
+  name: mine-teleop-ccg2-8m-bench
+
+cloud:
+  signaling_url: ws://127.0.0.1:18765/signaling
+  auth_url: http://127.0.0.1:18765/auth
+  device_token_file: device-token
+
+runtime:
+  control_enabled: false
+  media_enabled: true
+  control_log_commands: false
+  teleop_poll_interval_ms: 50
+  media_frame_timeout_ms: 3000
+  media_capture_interval_ms: 0
+
+control:
+  rate_hz: 20
+  max_command_gap_ms: 200
+  degraded_timeout_ms: 300
+  control_timeout_ms: 800
+  timeout_action:
+    deceleration_profile:
+      - after_ms: 0
+        brake: 0.3
+      - after_ms: 500
+        brake: 0.6
+      - after_ms: 1500
+        brake: vehicle_defined_max_safe
+
+media:
+  realtime_profiles:
+    realtime_720p30:
+      codec: h264
+      encoder: auto
+      width: 1280
+      height: 720
+      fps: 30
+      bitrate_kbps: 2500
+  record_profiles:
+    reuse_realtime:
+      codec: h264
+      encoder: reuse_realtime
+      width: source
+      height: source
+      fps: source
+      bitrate_kbps: 2500
+      segment_seconds: 2
+
+cameras:
+  - id: ccg2_channel_0
+    enabled: true
+    critical_for_control: false
+    reopen_attempts: 3
+    reopen_backoff_ms: 500
+    backend: ccg2
+    device: /dev/ccg2-channel-0
+    capture_width: 1920
+    capture_height: 1080
+    capture_fps: 30
+    realtime_profile: realtime_720p30
+    record_profile: reuse_realtime
+  - id: ccg2_channel_1
+    enabled: true
+    critical_for_control: false
+    reopen_attempts: 3
+    reopen_backoff_ms: 500
+    backend: ccg2
+    device: /dev/ccg2-channel-1
+    capture_width: 1920
+    capture_height: 1080
+    capture_fps: 30
+    realtime_profile: realtime_720p30
+    record_profile: reuse_realtime
+
+hardware:
+  can:
+    interface: can0
+    bitrate: 500000
+    tx_queue_length: 100
+  encoding:
+    vaapi_render_device: /dev/dri/renderD128
+    dri_card_device: /dev/dri/card1
+    # Ubuntu 22.04 / GStreamer 1.20.3 on the validated RTX 2000 Ada host
+    # rejects the NVCodec preset at runtime; Intel VAAPI is the proven path.
+    preferred_encoder: vaapi
+    fallback_encoder: nvenc
+    preferred_codec: h264
+    fallback_codec: h264
+    require_hardware_encoder: true
+    max_end_to_end_latency_ms: 200
+    min_realtime_fps: 20
+  network:
+    interface: lo
+
+field_safety:
+  commissioning_mode: bench
+  max_speed_kph: 0
+  require_can_feedback_before_control: false
+  require_local_estop_reset: true
+  require_time_sync: true
+  max_time_sync_uncertainty_ms: 25
+  time_sync_interval_ms: 30000
+  time_sync_samples: 7
+
+recording:
+  enabled: true
+  root_dir: recordings
+  min_free_gb: 1
+  delete_uploaded_when_below_free_gb: 0.5
+  delete_unuploaded_when_below_free_gb: false
+
+upload:
+  enabled: false
+  backend: local_archive
+
+vehicle_adapter:
+  type: mock
