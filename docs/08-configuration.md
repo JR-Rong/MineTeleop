@@ -133,7 +133,6 @@ control:
     max_control_timeout_ms: 900
     evidence: bench-brake-test-2026-06-24
   timeout_action:
-    throttle: 0.0
     deceleration_profile:
       - after_ms: 0
         brake: 0.3
@@ -141,10 +140,6 @@ control:
         brake: 0.6
       - after_ms: 1500
         brake: vehicle_defined_max_safe
-    gear_before_stopped: hold_current_or_vehicle_safe_mode
-    stopped_action:
-      gear: N
-      apply_parking_brake: true
   estop:
     latch: true
     reset_requires_local_confirmation: true
@@ -230,8 +225,15 @@ field_safety:
   commissioning_mode: bench
   max_speed_kph: 40
   max_throttle: 0.10
-  full_scale_motor_torque_nm: 41.25
-  max_brake: 1.0
+  full_scale_motor_torque_nm: 300.0
+  speed_feedback_timeout_ms: 200
+  speed_pid_kp: 1.0
+  speed_pid_ki: 0.2
+  speed_pid_kd: 0.0
+  speed_pid_derivative_filter_tau_ms: 100.0
+  speed_pid_max_dt_ms: 100
+  hard_overspeed_margin_kph: 3.6
+  max_brake_pressure_bar: 100.0
   max_steering_angle_deg: 5.0
   require_can_feedback_before_control: true
   require_local_estop_reset: true
@@ -312,21 +314,50 @@ GStreamer factory，`max_end_to_end_latency_ms` 与 `min_realtime_fps` 用于车
 验收汇总。DRI 节点变化只修改本节配置，不依赖宿主机 FFmpeg。
 
 `hardware.network.interface` 会进入弱网矩阵和目标主机验收脚本。`field_safety` 用来记录现场
-安全链路的最低门禁：调试阶段、速度上限、牵引转矩满量程、是否必须先收到 CAN feedback、
-是否必须本地确认急停复位、是否强制时间同步。它不替代现场安全员和物理急停，但会进入
-有效配置日志和验收记录。
+安全链路的最低门禁：调试阶段、目标车速、牵引转矩满量程、是否必须先收到 CAN feedback、
+是否必须本地确认急停复位、是否强制时间同步。这些软件门禁不替代现场安全员和物理急停，
+但会进入有效配置日志和验收记录。
 
-`field_safety.full_scale_motor_torque_nm` 的定义是：直行、制动为 0、稳态且车端收到的
-有效 `throttle=1.0` 时，每个电机通道的目标转矩。默认 `41.25 Nm` 保持既有
-18 吨、8 轮、轮半径 0.55 m、30:1 软件模型在 `1 m/s²` 下的映射；允许范围
-是 `0..165 Nm`，其中 `0` 明确禁用驱动力。车端仍先应用 `max_throttle`，因此
-实际配置上限是 `full_scale_motor_torque_nm × max_throttle`；例如二者分别为
-`82.5` 和 `0.10` 时，稳态目标约为 `8.25 Nm/通道`。ChassisControl 的
-`300 Nm/s` 转矩斜率仍然生效，瞬时请求不会跳到该稳态上限。只能在隔离台架上
-逐级调大，并以 CAN 请求和电机反馈共同验收；该值不是实测轮端转矩。
-启用该配置时必须同步升级车端 runtime 和 ChassisControl bridge：当前 runtime
-要求 bridge 导出版本化 `mine_teleop_chassis_open_v1`。旧 bridge 不会静默忽略转矩
-配置，而会在任何 CAN 初始化前因缺少该符号而启动失败。
+`field_safety.full_scale_motor_torque_nm` 是车端车速 PID 对每个电机通道可请求的
+对称最大转矩。DBC 的八路转矩请求分辨率为 `0.1 Nm`、范围为
+`[-800, 838.3] Nm`；普通驾驶会话代码上限取正反方向共同可用幅值 `800 Nm` 的 80%，
+即 `640.0 Nm/路`。车端默认值是 `300 Nm/路`，`0` 明确禁用驱动力。
+`max_throttle` 不按比例缩小这个转矩上限；例如
+`max_throttle=0.10` 表示目标车速最多为 `max_speed_kph` 的 10%，PID 在追踪该目标时
+仍可在纵向控制器和斜率限制内请求最多 `full_scale_motor_torque_nm`。只能在隔离
+台架上逐级调大该转矩上限，并以 CAN 请求和电机反馈共同验收；配置值不是
+实测轮端转矩。普通制动和安全停车不由该转矩上限缩放。
+
+`field_safety.max_brake_pressure_bar` 是八路 EHB 普通驾驶压力的车端硬上限，单位
+为 `bar/路`。DBC 每路为 12-bit、`0.1 bar` 分辨率、范围 `0..409.5 bar`；普通驾驶
+代码上限取 80%，即 `327.6 bar/路`，车端默认值为 `100 bar/路`。旧的归一化
+`field_safety.max_brake` 会被明确拒绝，必须迁移到物理压力字段。控制心跳超时按
+`timeout_action.deceleration_profile` 分段执行：在 V3 直接压力模式下，小于 1.0 的
+`brake` 按 `max_brake_pressure_bar` 换算，例如默认 100 bar 上限下 0.3/0.6 分别为
+30/60 bar；最终 `vehicle_defined_max_safe` 对应 1.0，并切到 409.5 bar 安全停车。
+急停、物理急停、故障、断开停车以及 bridge 完全收不到上游 apply 时的本地 watchdog
+也直接使用 DBC 全量 `409.5 bar/路`，不受普通驾驶上限削弱。所有压力都是 CAN 请求，
+不是实测管路压力或制动力。
+
+`max_speed_kph` 是本地车速 PID 的硬车速上限。D/R 且制动为 0 时，目标车速为
+`clamp(throttle, 0, max_throttle) × max_speed_kph`；松开纵向输入、刹车或切到 N 挡时目标归零。
+车端始终把 `ADU_Tx_VehSpdReq` 按无效的 `0/Q=0` 发送，不让 VCU 同时追踪另一个
+车速闭环目标。所有 adapter 的配置范围都是 `0..72 km/h`，`0` 表示明确禁用牵引。
+车速闭环、转矩上限和超速熔断必须由隔离台架与实车
+分阶段验收；软件单测不等于闭环已验收。
+
+启用上述配置时必须同步升级车端 runtime 和 ChassisControl bridge：当前 runtime
+要求 ABI version 3、完全一致的 V3 配置结构大小以及
+`mine_teleop_chassis_open_v3`。V3 在 V2 的车速 PID/watchdog 配置后新增不可变的普通
+制动压力上限；旧 bridge 不会静默忽略压力语义，而会在任何 CAN 初始化前因 ABI
+不匹配而启动失败。新 bridge 仍为直接 ABI 调用方和兼容性测试保留
+`mine_teleop_chassis_open_v1` 与 `mine_teleop_chassis_open_v2`；V1 禁用正牵引并采用默认
+`800 ms` 超时，V2 保留负值表示减速度的旧语义。旧 vehicle-agent 会被全局 ABI
+version 3 门禁明确拒绝，不能依靠这些入口加载新 bridge；runtime 与 bridge 必须原子
+成套升级。
+进入 Ready 后，若连续
+`control.control_timeout_ms` 没有成功 apply，bridge 会撤销车速请求、将转矩置零并施加
+标定的安全制动；下一条有效 apply 才会清除该 watchdog 锁存。
 
 上传限速必须是有限正数；上传触发数量、URL 刷新安全余量和重试退避时间
 必须是正数；`retry_initial_seconds` 不能大于 `retry_max_seconds`。
@@ -346,8 +377,12 @@ access key 和 secret。Secret 可以直接配置，也可以用
 `vehicle_adapter.type=mock` 可直接无外部依赖运行。配置为 `can` 或
 `dynamic_library` 时，必须显式填写 `field_safety.max_speed_kph`、
 `field_safety.max_throttle`、`field_safety.full_scale_motor_torque_nm`、
-`field_safety.max_brake` 和
-`field_safety.max_steering_angle_deg`，并先声明真实车辆接口契约，例如：
+`field_safety.speed_feedback_timeout_ms`、`field_safety.speed_pid_kp`、
+`field_safety.speed_pid_ki`、`field_safety.speed_pid_kd`、
+`field_safety.speed_pid_derivative_filter_tau_ms`、`field_safety.speed_pid_max_dt_ms`、
+`field_safety.hard_overspeed_margin_kph`、`field_safety.max_brake_pressure_bar` 和
+`field_safety.max_steering_angle_deg`，并先声明真实车辆接口契约。上述 PID 与超速值只能使用
+隔离台架标定结果，不得把示例默认值当作实车验收值。接口契约例如：
 
 ```yaml
 vehicle_adapter:
@@ -355,8 +390,8 @@ vehicle_adapter:
   contract:
     steering_unit: normalized
     throttle_unit: normalized
-    brake_unit: normalized
-    brake_semantics: normalized_service_brake
+    brake_unit: normalized_on_wire
+    brake_semantics: session_scaled_ehb_pressure_bar
     gear_values: [P, R, N, D]
     heartbeat_period_ms: 50
     safe_stop_supported: true
@@ -423,7 +458,8 @@ vehicle_adapter:
 
 ```bash
 /opt/mine-teleop/bin/mine-teleop-run config-check \
-  --config /opt/mine-teleop/config/vehicle-agent.yaml
+  --config /opt/mine-teleop/config/vehicle-agent.yaml \
+  --chassis-bridge-library /opt/mine-teleop/lib/vendor/chassis/libmine_teleop_chassis_bridge.so
 /opt/mine-teleop/bin/mine-teleop-run vehicle-agent \
   --config /opt/mine-teleop/config/vehicle-agent.yaml \
   --preflight
@@ -435,6 +471,7 @@ vehicle_adapter:
 仓库提供 `deployments/chassis-control-bridge/` 模板和
 `mine_teleop_chassis_bridge.h` 稳定 ABI 头，导出原生 adapter 所需的
 `mine_teleop_chassis_open`、`mine_teleop_chassis_open_v1`、
+`mine_teleop_chassis_open_v2`、`mine_teleop_chassis_open_v3`、
 `mine_teleop_chassis_apply_state`、
 `mine_teleop_chassis_emergency_stop`、`mine_teleop_chassis_update_feedback`、
 `mine_teleop_chassis_poll_feedback`、`mine_teleop_chassis_read_telemetry` 和
@@ -455,7 +492,7 @@ ChassisControl `chassis_control` 动态库；MinePilot `include/can/can_common.h
 - `degraded_timeout_ms`：链路异常持续多久后进入降级控制，用于区分偶发丢包和连续抖动。
 - `control_timeout_ms`：持续没有有效控制心跳多久后进入 `TIMEOUT_BRAKE`。
 
-`control_timeout_ms` 不能只按网络体验调大。配置前必须结合车速上限、制动曲线、坡道/松散路面和矿区安全距离，反推允许的最大控制超时。本地参考实现会在非 `mock` 车辆适配器配置中要求 `timeout_calibration` 标定证据，并拒绝超过标定上限的 `control_timeout_ms`。
+`control_timeout_ms` 不能只按网络体验调大。配置前必须结合车速上限、独立安全制动动作、坡道/松散路面和矿区安全距离，反推允许的最大控制超时。本地参考实现会在非 `mock` 车辆适配器配置中要求 `timeout_calibration` 标定证据，并拒绝超过标定上限的 `control_timeout_ms`。
 
 ## 驾驶端配置示例
 
@@ -480,15 +517,12 @@ control:
   rate_hz: 20
   estop_hold_ms: 500
   limits:
-    initial_max_throttle: 0.05
-    initial_max_brake: 1.0
+    initial_target_speed_kph: 2.0
+    initial_max_motor_torque_nm: 300.0
+    initial_max_brake_pressure_bar: 100.0
+    initial_service_brake_pressure_bar: 30.0
+    initial_hard_brake_pressure_bar: 100.0
     initial_max_steering_angle_deg: 3.0
-  keyboard:
-    steering_left: A
-    steering_right: D
-    throttle: W
-    brake: S
-    estop: E
   gamepad:
     enabled: true
     steering_axis: 0
@@ -509,22 +543,59 @@ control:
 
 `ui.show_debug_overlay` 必须写成 YAML/TOML boolean `true`/`false`，不能用带引号
 字符串，避免调试层在正式驾驶端被误启用或误关闭。
+`control.limits` 的前五个字段构成驾驶端要提交给车端确认的初始会话控制参数：
+目标车速 `2 km/h`、单电机最大转矩 `300 Nm`、普通制动最大/缓刹/急刹压力
+`100/30/100 bar/路`。它们分别受车端 `max_speed_kph * max_throttle`、
+`full_scale_motor_torque_nm` 和 `max_brake_pressure_bar` 硬上限约束；控制端设置不能
+提高车端上限。车速 PID 的增益、反馈超时和超速 margin 只在车端配置，驾驶端不能
+覆盖。
+`control.keyboard` 已删除且不再是可配置接口。键位固定为
+`ArrowLeft`/`A` 左转、`ArrowRight`/`D` 右转、`ArrowUp`/`W` 前进、
+`ArrowDown`/`S` 倒车、`Space` 缓刹、`B` 急刹、`E` 急停。加载器如果
+发现仓库外旧配置仍包含 `control.keyboard`，会直接拒绝启动，避免运维误以为
+某个未生效的键位绑定已被应用。
 `control.gamepad` 的轴编号来自浏览器 Gamepad API；标准映射手柄使用浏览器规定的
 左摇杆 X、右/左扳机，非标准方向盘/踏板使用这里的轴配置。`*_center`/`*_rest`
 和 `*_range` 可写入现场测量值，也可以在浏览器中做本次运行有效的中心与量程校准。
 如果轴顺序或方向不同，只需要调整配置，不需要改控制核心。
-`control.limits.initial_max_brake` 和 `field_safety.max_brake` 都是归一化的普通
-驾驶制动请求上限，取值 `[0, 1]`；前者限制当前控制页面，后者在车端再次强制
-截断。页面修改人工刹车上限时会同步写入本地控制进程，因此 `/api/control`、
-`/api/control/keyboard` 和 `/api/control/gamepad` 共用同一个当前会话上限；急停
-命令不经过这个普通驾驶上限。页面刷新或重新登录时会从本地控制进程回读当前值，
-车端硬上限自动下调时也会同步收紧控制进程，避免界面显示值、直接 API 和实际发送
-值不一致。控制端以及 mock/开发车端的缺省值 `1.0` 仅用于
-兼容；非 mock 车端必须
-显式填写 `max_brake`，升级旧实车配置时也必须补齐该键（尚未标定时可先显式写
-`1.0`）。现场下调值必须来自真实车辆制动标定，不能把归一化数值直接当作 bar。
-急停、控制超时、故障和断开停车走独立安全停车路径，不会被这两个普通驾驶刹车
-上限削弱。
+三个 `*_brake_pressure_bar` 都是物理 EHB 压力请求，必须满足
+`0 <= service <= hard <= max <= vehicle max_brake_pressure_bar`，同时不得超过普通
+驾驶代码上限 `327.6 bar/路`。驾驶端的 `Space` 缓刹和 `B` 急刹仍映射到同一个 v1
+`brake` 线协议标量；同时按下时急刹优先，车端按已确认会话最大压力还原成 bar。
+本 PR 中缓刹为直接 `service_brake_pressure_bar`，不运行制动 PID，也不做压力 ramp；
+急刹直接请求 `hard_brake_pressure_bar`。任何制动会把油门与目标车速置零、复位车速
+PID、清零八路电机扭矩，同时保留转向。页面修改参数会先清空输入并要求车端确认，
+标准 `/api/control` 只准备 0..1 的模拟制动标量；物理压力始终由车端当前已确认的
+会话 profile 还原。
+默认 profile 只在驻车准入已满足（或车端明确报告 mock/无需握手且 adapter ready）后，
+每个控制链路 generation 自动提交一次；若车端拒绝，后续状态消息不会自动换新序号重试，
+必须由驾驶员显式确认后再次提交。
+对真实 VCU adapter，提高目标车速、转矩或转向上限，以及修改任一制动压力字段（即使
+降低）都必须先满足 N 挡、有效零速和电子驻车已拉起；浏览器预检与车端门禁使用同一口径。
+旧 `GET /api/control-limits` 只保留归一化比例的只读兼容；旧 `POST /api/control-limits`
+固定返回 `410 Gone`，调用方必须迁移到带会话鉴权与车端 ACK 的 `/api/control-profile`。
+急停、物理急停、故障、断开停车和 bridge 本地 apply watchdog 走独立
+`409.5 bar/路` 安全路径，不受这些普通驾驶压力上限削弱。控制心跳超时先按
+`timeout_action.deceleration_profile` 的普通压力分段执行，最终 1.0 阶段才切到
+409.5 bar。
+旧的 `POST /api/control/keyboard` 与 `POST /api/control/gamepad` 固定返回 `410 Gone`。
+这两个接口无法携带或验证车端 profile ACK；若在新 profile 被拒绝时继续按本地预设生成
+制动标量，车辆会按旧 active profile 还原成不同的 bar 值。旧调用方必须迁移到
+`/api/control-profile` 等待精确 ACK，再用标准 `/api/control` 发送明确的 v1 控制命令。
+
+### 升级迁移
+
+- 升级前从所有仓库外驾驶端 YAML 删除整个 `control.keyboard` 段；键位不会从旧值自动迁移。
+- 删除旧的 `initial_max_throttle`、`initial_service_brake`、`initial_hard_brake` 和
+  车端 `field_safety.max_brake`；加载器会拒绝这些归一化旧字段。按上述物理单位显式
+  配置目标速度、单电机转矩以及三项 EHB bar 值。
+- 检查所有仓库外车端的 `field_safety.max_speed_kph`。加载器通用范围已收紧为
+  `[0, 72] km/h`，`0` 明确禁用牵引；大于 `72` 的旧值会启动失败，不会静默截断。
+  必须根据本地 PID 车速上限和隔离台架结果显式选择新值。
+- 不得把默认 `300 Nm/路` 或普通最大 `100 bar/路` 当作已标定实车值。旧语义下有效
+  转矩上限可能约为 `full_scale_motor_torque_nm × max_throttle`；升级时应从旧有效上限
+  或更小值开始，经隔离台架逐级标定。非 mock 配置缺少上述任一必填车速、比例、转矩、PID/反馈、
+  超速、制动或转向门禁时继续 fail closed，不会补默认值启动真实 adapter。
 `logging.browser_event_log` 的相对路径以 YAML 文件所在目录为基准；默认值把日志
 写入控制端包根目录的 `.local/logs/`。`browser_event_log_files` 包含当前文件，
 因此值 `3` 表示当前文件加 `.1`、`.2` 两个备份。凭据类字段会被递归脱敏，但部署
@@ -576,7 +647,9 @@ control:
   写入锁保护。每次服务构造会先写入 UTC `signaling_service_started`，审计目录
   不存在或不可写时启动失败。
 - 控制超时大于命令周期。
-- 安全停车制动曲线存在且不是单步全力制动。
+- 已单独确认控制超时 0.3/0.6 分段的物理压力、最终 1.0 阶段以及故障/断链/急停的
+  八路 `409.5 bar` 安全制动语义和 VCU 硬件响应；409.5 bar 路径不受普通会话压力
+  上限影响。
 - `max_command_gap_ms`、`degraded_timeout_ms`、`control_timeout_ms` 按递增关系配置。
 - `control_timeout_ms` 有基于真实车辆制动距离或台架标定的上限依据。
 - 急停锁存和复位策略已配置。

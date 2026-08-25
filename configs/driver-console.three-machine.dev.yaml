@@ -21,17 +21,17 @@ control:
   rate_hz: 20
   estop_hold_ms: 500
   limits:
-    initial_max_throttle: 0.05
-    # Normalized ordinary-driving brake only; calibrate before reducing.
-    # ESTOP/timeout/fault/disconnect braking bypasses this session limit.
-    initial_max_brake: 1.0
+    # Session defaults. The vehicle applies its own hard limits and must ACK the
+    # effective profile before ordinary driving is enabled.
+    initial_target_speed_kph: 2.0
+    # Per-motor software request default; not a measured or calibrated capability.
+    initial_max_motor_torque_nm: 300.0
+    # Physical pressure request for each EHB channel, in bar (0.1 bar resolution).
+    # Keep 0 <= service <= hard <= max. Emergency safe-stop pressure is independent.
+    initial_max_brake_pressure_bar: 100.0
+    initial_service_brake_pressure_bar: 30.0
+    initial_hard_brake_pressure_bar: 100.0
     initial_max_steering_angle_deg: 3.0
-  keyboard:
-    steering_left: ArrowLeft
-    steering_right: ArrowRight
-    throttle: ArrowUp
-    brake: ArrowDown
-    estop: E
   gamepad:
     enabled: true
     steering_axis: 0

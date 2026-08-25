@@ -222,7 +222,7 @@ http://127.0.0.1:28080
 1. `mine-teleop-cloud.target` 健康；
 2. 车端 `./bin/mine-teleop-run` 已注册并保持在线；
 3. 控制端登录并选择 `vehicle-001`；
-4. 确认控制权、视频轨道、时间同步和 DataChannel；
+4. 确认控制权、视频轨道、时间同步和 DataChannel，并等待页面显示车端已确认会话控制参数；
 5. 释放会话后确认车辆回到安全状态。
 
 推荐检查：
@@ -239,8 +239,40 @@ curl -fsS http://127.0.0.1:8080/health
 ```
 
 真实底盘上线前必须单独验收 CAN 反馈、制动、断链安全停车和本地急停。
+控制页面默认的 `300 Nm/路`、`100 bar/路` 以及软件/配置测试结果都不是实车能力或
+压力标定证据。普通驾驶前应在隔离台架确认 profile ACK 的 effective 值、目标车速 PID、
+CAN 请求、实测反馈、缓刹/急刹压力和断链撤销；不得用页面显示“已确认”替代硬件验收。
 
 ## 7. 升级和回滚
+
+本版本启动前先迁移仓库外配置：
+
+- 从驾驶端 YAML 删除已废弃的 `control.keyboard` 整段。键盘固定为方向键/
+  `WASD`、`Space` 缓刹、`B` 急刹和 `E` 急停；保留旧段会使控制端启动失败。
+- 删除驾驶端旧的 `initial_max_throttle`、`initial_service_brake`、
+  `initial_hard_brake`、`initial_max_brake` 和 `initial_max_brake_request`。加载器不会把
+  比例静默解释成 km/h 或 bar；按配置文档显式填写 `initial_target_speed_kph`、
+  `initial_max_motor_torque_nm` 以及最大普通/缓刹/急刹三个 `*_brake_pressure_bar`。
+- 三项普通制动值表示每路 EHB 压力，必须满足 `0 <= service <= hard <= max`，控制端
+  schema 上限为 `327.6 bar/路`；急停、物理急停、故障、断开停车和 bridge 本地 apply
+  watchdog 的 `409.5 bar/路` 安全请求不属于会话 profile。上游控制心跳超时先按
+  `deceleration_profile` 的 0.3/0.6 普通压力分段执行，最终 1.0 阶段才切到 409.5 bar。
+  单电机转矩的控制端 schema 上限为 `640.0 Nm/路`。两者仍会被具体车辆 hard
+  limits 下调，不能通过控制端设置提高车端上限。
+- 将所有写旧 `/api/control-limits` 的集成迁移到 `/api/control-profile`。旧 GET 仅保留
+  归一化比例只读兼容，旧 POST 固定返回 `410 Gone`，不会再直接修改当前会话制动参数。
+- 将旧 `POST /api/control/keyboard`、`POST /api/control/gamepad` 调用迁移到标准
+  `/api/control`；两个 specialized endpoint 现在固定返回 `410 Gone`，避免在 profile
+  尚未被车端 ACK 或已被拒绝时按错误的物理压力比例发送命令。
+- 检查车端 `field_safety.max_speed_kph`：所有 adapter 的范围均为 `[0, 72] km/h`，
+  `0` 明确禁用牵引。旧配置如果大于 `72` 会启动失败，必须根据本地 PID 车速上限和
+  隔离台架结果显式修改，不得为通过校验而盲目压到 `72`。
+- 重新计算非 mock 车端的 `full_scale_motor_torque_nm`。旧语义的有效每路上限约为
+  `full_scale_motor_torque_nm × max_throttle`，新语义中 `full_scale_motor_torque_nm` 本身就是唯一上限。
+  例如旧 `41.25 × 0.10 ≈ 4.125 Nm/路`，不得原样保留 `41.25 Nm`。要从旧有效上限起步并
+  重做隔离台架标定；缺少新版非 mock 必填安全字段时应保持启动失败，不得补默认值绕过。
+
+升级与回滚时还要遵守：
 
 - 云端部署脚本会备份被替换的应用目录和配置；升级后先检查 loopback health；
 - 车端升级前保留上一版 `.tar.gz` 和 `.sha256`，失败时停止当前进程并重新解压

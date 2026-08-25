@@ -222,8 +222,9 @@ scripts/build/build_cpp_ubuntu_bundle.sh test linux/amd64
 ```
 
 Vehicle packages require the JYR010 chassis bridge and ChassisControl runtime.
-When either ignored vendor binary is absent, the build entrypoint first runs
-`scripts/build/prepare_chassis_runtime.sh`. By default it reads sibling
+Every vehicle bundle rebuilds the bridge from the current checkout with
+`scripts/build/prepare_chassis_runtime.sh`; a stale ignored bridge is never
+reused. By default it reads sibling
 `../ChassisControl` sources and `../MinePilot/libchassis_control.so`; override
 them with `MINE_TELEOP_CHASSIS_CONTROL_ROOT` and
 `MINE_TELEOP_CHASSIS_CONTROL_LIBRARY`. The package build and final archive
@@ -247,9 +248,10 @@ userspace libraries must be copied into `lib/` for a field package.
 
 On a native x86_64 Linux builder, `scripts/build/build_cpp_ubuntu_bundle.sh` retains
 the pinned third-party source-build path. When only application code changed,
-a checksum-verified accepted bundle can
-provide the unchanged third-party media runtime while every native binary is
-rebuilt from current source:
+a checksum-verified accepted bundle can provide the unchanged heavy codec and
+GStreamer runtime. Mine Teleop binaries, the pinned Aravis runtime, and the
+chassis bridge are still rebuilt/refreshed from current source; the
+ChassisControl headers and runtime library remain required inputs:
 
 ```bash
 MINE_TELEOP_BASE_BUNDLE_ARCHIVE=/path/to/accepted-vehicle-bundle.tar.gz \

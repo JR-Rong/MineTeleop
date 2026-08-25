@@ -45,22 +45,29 @@ API 表达，应放到独立平台适配器中，不能侵入会话或协议核�
 - 标准映射 Gamepad。
 - 可配置轴的非标准方向盘/踏板。
 
-建议映射：
+固定映射（不从 YAML 读取或覆盖）：
 
-- `ArrowUp`：前进油门。
-- `ArrowDown`：倒车油门。
-- `ArrowLeft` / `ArrowRight`：转向。
-- `Space`：制动。
+- `ArrowUp` / `W`：前进目标车速比例。
+- `ArrowDown` / `S`：倒车目标车速比例。
+- `ArrowLeft` / `A` 与 `ArrowRight` / `D`：转向。
+- `Space`：缓刹，选择当前会话配置的每路 EHB 缓刹压力。
+- `B`：急刹，立即选择当前会话配置的每路 EHB 急刹压力。
 - `E`：立即锁存急停。
 
 注意：
 
 - 键盘控制必须有回中/回零策略。
-- 失去窗口焦点时应继续按固定周期发送安全控制心跳，但主动油门必须置 0，并按配置进入滑行、限速或渐进制动策略；不应主动停发来制造超时急刹。
+- 失去窗口焦点时应继续按固定周期发送安全控制心跳，但主动目标车速比例必须置 0，并按配置进入滑行、限速或渐进制动策略；不应主动停发来制造超时急刹。
 - 急停取键盘、页面按钮和 Gamepad 的并集，始终最高优先级。
 - 键盘离散输入覆盖同一时刻的 Gamepad 连续量；相反方向同时按下时输出归零。
-- 刹车优先于油门；存在刹车输入时油门输出为 0。
-- 窗口失焦时主动油门和转向归零，但仍按固定频率发送安全心跳。
+- 急刹优先于缓刹；任一刹车输入存在时目标车速比例输出为 0，转向输入保持独立。
+- 前进/倒车键选择的 `D`/`R` 在当前控制会话内锁存；松开按键只将目标车速比例归零，普通刹车不得把挡位切回 `N`。
+- 任何新的 `D`/`R` 选择（包括 `N`/`P`→`D`/`R` 以及 `D`↔`R`）都必须有 VCU 有效且绝对值不大于 `0.1 m/s` 的零速反馈；唯一例外是明确不支持 VCU 握手的 mock。键盘和 Gamepad 必须调用同一挡位 reducer；门禁未满足时目标车速比例保持 0，并提示驾驶员停车后释放、重新操作。
+- 多个物理键映射到同一方向时必须按键码集合派生状态；例如同时按住 `ArrowUp` 和 `W`，释放其中一个不能清除前进状态。
+- 首次获得 VCU Ready 前不得记录运动按键；只有当前会话曾经 Ready 后的 `wait_gear` / `wait_actuator_modes` 闭环等待才保留按键集合，并继续按 20 Hz 发送目标车速比例强制为 0 的完整安全快照。
+- 真实链路中断、控制权丢失、VCU fault 或 disarm 必须清空输入并重置 Ready 资格，要求释放后重新按键，禁止旧按键自动恢复。
+- Gamepad 在首次 Ready、链路/控制权重置或窗口失焦后进入踏板回零互锁；只有观测到油门与刹车都回零后，后续的新踏板动作才可生效。
+- 窗口失焦时主动目标车速比例和转向归零，但仍按固定频率发送安全心跳。
 - 档位输出必须落在控制协议允许集合内；真实车辆额外档位由后续车辆适配器契约扩展。
 
 后续输入适配：
@@ -71,7 +78,17 @@ API 表达，应放到独立平台适配器中，不能侵入会话或协议核�
 - 自定义串口/CAN 驾驶台。
 
 浏览器读取 Gamepad 后先执行死区、反向、中心/静止位和量程归一化，再与键盘
-合成为 `steering`、`throttle`、`brake`、`estop` 和 `gear`。标准映射手柄使用
+合成为 `steering`、`throttle`、单一 v1 `brake`、`estop` 和 `gear`。协议字段
+`throttle` 为兼容保留名。控制端把踏板比例乘以已确认的会话目标车速，再除以车端
+`field_safety.max_speed_kph`，车端仍按 `throttle × max_speed_kph` 得到 PID 目标。
+该比例不是转矩上限；PID 输出同时受已确认的会话单电机转矩上限与车端
+`field_safety.full_scale_motor_torque_nm` 限制。
+
+会话中的三项制动值是每路 EHB 物理压力请求，单位 `bar`、分辨率 `0.1 bar`，不是
+百分比、踏板行程或整车制动力。v1 wire `brake` 保持 `[0,1]`：缓刹和急刹分别发送
+`service/max`、`hard/max`，模拟踏板按最大普通压力线性映射；最大压力为 0 时三种普通
+制动输入都发送 0。车端按已确认的会话最大压力还原为 bar，并继续受车端硬上限截断。
+标准映射手柄使用
 左摇杆 X 与左右扳机；非标准设备由 `control.gamepad` 的轴配置控制。页面校准仅对
 本次运行有效，需长期保留的现场校准值应回写 YAML。设备不存在、映射不完整或
 断开时，Gamepad 分量必须全部归零。
@@ -91,6 +108,59 @@ Console 不应只在按键变化时发送控制，而应按固定周期发送当
   不把任一 token 暴露给浏览器 JavaScript。
 
 这样车端可以通过心跳判断驾驶端是否还活着。
+
+### 会话控制参数确认
+
+控制端 YAML 给出新会话默认值：目标车速 `2.0 km/h`、单电机最大驱动转矩
+`300.0 Nm`、每路 EHB 最大普通/缓刹/急刹压力 `100.0/30.0/100.0 bar`。`300 Nm`
+和 `100 bar` 只是未完成台架或实车标定的软件请求默认值。控制端 schema 上限为
+`640.0 Nm/路` 与 `327.6 bar/路`，实际可用值还必须被车端 hard limits 下调。转向上限
+继续是控制端本地输入限幅并受车端静态硬上限约束，不进入会话 profile。
+对真实 VCU adapter，提高目标车速、转矩或转向上限，以及修改任一制动压力字段（包括
+降低），都要求 N 挡、有效零速和电子驻车已拉起；控制端先预检，车端再次 fail closed。
+
+页面通过 `POST /api/control-profile` 准备 `type=session_control_profile` 的鉴权
+DataChannel envelope；五个 profile 字段位于 envelope 顶层，并与普通控制命令复用
+车辆、驾驶员、session、`control_token` 和单调递增 `seq`。由于 control DataChannel
+是 unordered/unreliable，浏览器每隔至少 200 ms 重发同一 envelope 和同一 `seq`，直到
+收到共享 `control_status_seq` 排序后的 `session_control_profile_status`，或 telemetry
+中的同一 canonical `session_control_profile`。只有 `active=true`、
+`last_request_seq` 匹配 pending 序号且 `effective_profile` 合法时才视为已确认。
+旧 `GET /api/control-limits` 仅保留归一化制动比例的只读兼容；`POST` 固定返回
+`410 Gone`，不能绕过 profile 的停车、鉴权和 ACK 门禁修改会话制动参数。旧的
+`POST /api/control/keyboard` 与 `POST /api/control/gamepad` 同样固定返回 `410 Gone`：
+它们无法证明车端已经确认了与本地预设一致的物理压力 profile，继续发送会产生 ACK
+前后单位解释不一致。浏览器和新集成都只使用标准 `POST /api/control` 准备 v1 命令。
+
+未确认时页面清空输入并禁止 VCU connect 握手和所有普通驾驶命令；`estop=true` 不受
+profile ACK 门禁阻止。后续 telemetry 报告 profile inactive、序号不再等于当前 effective
+序号或 effective profile 非法时，页面立即撤销确认并再次清空输入。Peer/DataChannel
+断开、切换车辆、会话结束或登录失效会清除 requested override、pending envelope、
+effective profile 和 hard limits，恢复 YAML 默认值；旧会话设置不得跨会话自动重放。
+默认 profile 仅在收到 `parking_ready=true`，或车端明确报告 mock/无需握手且 adapter ready
+后自动提交；每个链路 generation 最多自动尝试一次。车端拒绝后必须由驾驶员显式重试，
+不得借后续 telemetry/hard-limit 更新循环生成新 `seq`。
+
+按键集合、挡位门禁、刹车优先级、VCU 状态迁移、状态序号与
+latest-wins 判定由可在浏览器和 Node.js 共用的无 DOM 模块实现。生产页面
+实际调用该模块；Node.js 测试执行行为矩阵，C++ 页面测试只核对 wiring。
+
+`POST /api/control` 返回只表示本机 C++ 运行时已为命令补齐元数据（prepared），
+不表示 DataChannel 已发送、对端已接收或车端已接受。浏览器在每次 prepared 后
+记录且仅记录一个终态：`forwarded`、`superseded`、
+`post_prepare_link_changed` 或 `post_prepare_vcu_not_ready`。只有
+`RTCDataChannel.send()` 正常返回后才计入 `forwarded`；这仍不是 delivered/accepted 证据。
+`superseded`、链路变化和 VCU 未就绪会立即写入结构化浏览器日志；正常的
+`prepared` / `forwarded` 心跳不逐条写日志或发起额外 HTTP 请求。浏览器把上述会话内
+累计值、`last_prepared_seq` / `last_forwarded_seq` 和守恒标志
+`control_outcomes_balanced` 合并到现有 1 Hz `/api/webrtc/metrics` 上报，便于核对乱序
+拒绝和 latest-wins 产生的序号空洞，同时避免 20 Hz 控制心跳淹没日志或增加控制负载。
+
+车端若在实际 apply 阶段拒绝命令，会发送带共享 `control_status_seq` 和原命令
+`command_seq` 的 `control_command_rejected`。页面只解释本地 allowlist 中的
+`issue_code`，不展示车端异常文本；换挡移动/反馈过期会立即清空按键与 Gamepad 输入、
+回 N 挡并要求释放后重试。相同拒绝由车端限频重发，以覆盖 unordered/unreliable
+DataChannel 的单包丢失，同时避免拒绝风暴。
 
 ## 视频显示
 

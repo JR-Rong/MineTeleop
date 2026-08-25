@@ -68,6 +68,22 @@ constexpr std::array<std::uint32_t, 29> kCriticalFeedbackIds{
     0x18C8F4D0U, 0x18C9F4D0U, 0x18CAF4D0U, 0x18CBF4D0U,
 };
 
+struct SpeedControlSettings {
+  bool enabled{false};
+  double hard_speed_limit_mps{0.0};
+  int speed_feedback_timeout_ms{MINE_TELEOP_CHASSIS_MAX_SPEED_FEEDBACK_TIMEOUT_MS};
+  MineTeleopChassisSpeedPidConfig pid{1.0, 0.0, 0.0, 0.0, 100};
+  double hard_overspeed_margin_mps{1.0};
+};
+
+struct ControlIntent {
+  int gear{1};
+  double target_speed_mps{0.0};
+  double normalized_longitudinal{0.0};
+  std::array<double, mine_teleop::vcu::kSteeringAxisCount> steering{};
+  std::uint64_t generation{0};
+};
+
 std::mutex g_api_mutex;
 
 int handshake_state_code(mine_teleop::vcu::State state) {
@@ -112,6 +128,20 @@ bool is_disarming(mine_teleop::vcu::State state) {
          state == State::DisarmNeutral ||
          state == State::DisarmParkingBrake ||
          state == State::DisarmManual;
+}
+
+bool speed_safety_active_state(mine_teleop::vcu::State state) {
+  using State = mine_teleop::vcu::State;
+  return state == State::WaitGear ||
+         state == State::WaitActuatorModes ||
+         state == State::Ready;
+}
+
+bool stationary_arming_state(mine_teleop::vcu::State state) {
+  using State = mine_teleop::vcu::State;
+  return state == State::WaitParkingBrakeReleased ||
+         state == State::WaitGear ||
+         state == State::WaitActuatorModes;
 }
 
 double clamp_value(double value, double minimum, double maximum) {
@@ -187,23 +217,50 @@ VehicleState make_vehicle_state(
   return state;
 }
 
-Command command_from_chassis_control(int gear) {
+Command command_from_chassis_control(
+    int gear,
+    double target_vx_mps,
+    double target_ax,
+    double full_scale_motor_torque_nm) {
   const auto& controls = GetControlInfo();
   if (controls.size() < mine_teleop::vcu::kMotorCount) {
     throw std::runtime_error("ChassisControl did not produce eight wheel controls");
   }
+  for (std::size_t index = 0; index < mine_teleop::vcu::kMotorCount; ++index) {
+    const auto& control = controls[index];
+    if (!mine_teleop_chassis_control_output_is_finite(
+            control.wheel_torque,
+            control.wheel_speed,
+            control.eps_ang_req,
+            control.eps_ang_spd_req,
+            control.ehb_brk_pres_req)) {
+      throw std::runtime_error(
+          "ChassisControl produced a non-finite output at wheel " +
+          std::to_string(index));
+    }
+  }
 
   Command command;
   command.gear = gear;
+  // ADU_Tx_VehSpdReq arbitration has not been validated on the target VCU.
+  // Local speed regulation therefore keeps this field permanently disabled.
+  static_cast<void>(target_vx_mps);
+  command.vehicle_speed_request_kph = 0.0;
+  command.vehicle_speed_request_valid = false;
   for (std::size_t index = 0; index < mine_teleop::vcu::kMotorCount; ++index) {
     command.motor_torque_nm[index] =
-        clamp_value(controls[index].wheel_torque, -800.0, 838.3);
+        mine_teleop_chassis_clamp_directional_motor_torque_nm(
+            controls[index].wheel_torque,
+            gear,
+            target_ax,
+            full_scale_motor_torque_nm);
     // This integration uses torque mode. ChassisControl's wheel_speed is wheel
     // rad/s, while the DBC field is motor rpm, so no dimensionally invalid value
     // is placed in the ignored speed request.
     command.motor_speed_rpm[index] = 0.0;
     command.brake_pressure_bar[index] =
-        clamp_value(controls[index].ehb_brk_pres_req, 0.0, 409.5);
+        mine_teleop_chassis_quantize_brake_pressure_bar(
+            controls[index].ehb_brk_pres_req);
   }
   for (std::size_t axis = 0; axis < mine_teleop::vcu::kSteeringAxisCount; ++axis) {
     const auto& control = controls[axis * 2U];
@@ -443,6 +500,10 @@ class ProtocolLogger {
   void command(const std::string& name, const Command& command) {
     std::ostringstream details;
     details << "\"command\":\"" << name << "\",\"gear\":" << command.gear
+            << ",\"vehicle_speed_request_kph\":"
+            << command.vehicle_speed_request_kph
+            << ",\"vehicle_speed_request_valid\":"
+            << (command.vehicle_speed_request_valid ? "true" : "false")
             << ",\"motor_torque_nm\":";
     append_double_array(details, command.motor_torque_nm);
     details << ",\"motor_speed_rpm\":";
@@ -645,6 +706,38 @@ class SocketCan {
   ~SocketCan() { close(); }
 
   bool open(const std::string& interface_name) {
+#if defined(MINE_TELEOP_CHASSIS_TESTING)
+    if (interface_name == "mt-test") {
+      const char* configured_fd = std::getenv("MINE_TELEOP_CHASSIS_TEST_FD");
+      if (configured_fd == nullptr || configured_fd[0] == '\0') {
+        set_error("adopt_test_fd", EINVAL);
+        return false;
+      }
+      char* end = nullptr;
+      errno = 0;
+      const long parsed_fd = std::strtol(configured_fd, &end, 10);
+      if (errno != 0 || end == configured_fd || *end != '\0' ||
+          parsed_fd < 0 || parsed_fd > std::numeric_limits<int>::max()) {
+        set_error("adopt_test_fd", EINVAL);
+        return false;
+      }
+      fd_ = ::dup(static_cast<int>(parsed_fd));
+      if (fd_ < 0) {
+        set_error("adopt_test_fd", errno);
+        return false;
+      }
+      const int flags = ::fcntl(fd_, F_GETFL, 0);
+      if (flags < 0 || ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+        const int error = errno;
+        close();
+        set_error("adopt_test_fd_nonblocking", error);
+        return false;
+      }
+      last_errno_ = 0;
+      last_stage_ = "adopt_test_fd";
+      return true;
+    }
+#endif
     if (interface_name.empty() || interface_name.size() >= IFNAMSIZ) {
       set_error("validate_interface", EINVAL);
       return false;
@@ -753,9 +846,19 @@ class SocketCan {
 
 class BridgeRuntime {
  public:
-  BridgeRuntime(std::string can_interface, double full_scale_motor_torque_nm)
+  BridgeRuntime(
+      std::string can_interface,
+      double full_scale_motor_torque_nm,
+      int control_timeout_ms,
+      SpeedControlSettings speed_control,
+      bool physical_brake_input,
+      double max_ordinary_brake_pressure_bar)
       : can_interface_(std::move(can_interface)),
-        full_scale_motor_torque_nm_(full_scale_motor_torque_nm) {
+        full_scale_motor_torque_nm_(full_scale_motor_torque_nm),
+        control_timeout_ms_(control_timeout_ms),
+        speed_control_(speed_control),
+        physical_brake_input_(physical_brake_input),
+        max_ordinary_brake_pressure_bar_(max_ordinary_brake_pressure_bar) {
     last_feedback_.vehicle_speed_valid = 0;
     for (double& angle : last_feedback_.eps_angle) {
       angle = std::numeric_limits<double>::quiet_NaN();
@@ -787,7 +890,21 @@ class BridgeRuntime {
         "\"track_m\":2.2,\"wheelbase_m\":4.4,\"max_steering_angle_deg\":30.0,"
         "\"emergency_deceleration_mps2\":-8.0,\"motor_control_mode\":\"torque\","
         "\"full_scale_motor_torque_nm\":" +
-            std::to_string(full_scale_motor_torque_nm_),
+            std::to_string(full_scale_motor_torque_nm_) +
+            ",\"control_timeout_ms\":" +
+            std::to_string(control_timeout_ms_) +
+            ",\"local_speed_pid_enabled\":" +
+            std::string(speed_control_.enabled ? "true" : "false") +
+            ",\"hard_speed_limit_mps\":" +
+            std::to_string(speed_control_.hard_speed_limit_mps) +
+            ",\"speed_feedback_timeout_ms\":" +
+            std::to_string(speed_control_.speed_feedback_timeout_ms) +
+            ",\"hard_overspeed_margin_mps\":" +
+            std::to_string(speed_control_.hard_overspeed_margin_mps) +
+            ",\"physical_brake_input\":" +
+            std::string(physical_brake_input_ ? "true" : "false") +
+            ",\"max_ordinary_brake_pressure_bar\":" +
+            std::to_string(max_ordinary_brake_pressure_bar_),
         true);
     logger_.command("initial", initial);
     logger_.command("emergency", emergency);
@@ -817,7 +934,12 @@ class BridgeRuntime {
     return 0;
   }
 
-  bool apply(const Command& command) {
+  std::uint32_t store_intent(
+      int gear,
+      double target_speed_mps,
+      double normalized_longitudinal,
+      const double* steering_values,
+      int steering_count) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!running_.load() || io_error_ != 0) {
       log_operation_rejected_locked(
@@ -826,20 +948,60 @@ class BridgeRuntime {
           "vcu_control_apply",
           "VCU bridge is not running or has a latched I/O error",
           "Inspect the preceding CAN fault and restart only after the interface/VCU is healthy.");
-      return false;
+      return MINE_TELEOP_CHASSIS_APPLY_ISSUE_RUNTIME_UNAVAILABLE;
     }
-    if (!controller_.set_command(command)) {
+    const auto now = Clock::now();
+    const bool driving_gear = gear == 2 || gear == 3;
+    const bool gear_changed = !latest_intent_valid_ || latest_intent_.gear != gear;
+    if (controller_.physical_emergency_latched()) {
+      withdraw_latest_traction_locked();
       log_operation_rejected_locked(
           "control_apply_rejected",
-          "vcu_control_command_invalid",
-          "vcu_control_validate",
-          "command is outside JYR010 limits or invalid for the current state",
-          "Check ChassisControl units, field limits, and the current VCU handshake state.");
-      return false;
+          "vcu_physical_emergency_latched",
+          "vcu_physical_emergency_gate",
+          "physical emergency switch safe stop remains latched",
+          "Release the switch, complete the stopped disarm sequence, then request a new VCU handshake.");
+      return MINE_TELEOP_CHASSIS_APPLY_ISSUE_PHYSICAL_EMERGENCY_LATCHED;
     }
-    software_estop_ = false;
-    logger_.command("driver", command);
-    return true;
+    if (hard_overspeed_latched_) {
+      withdraw_latest_traction_locked();
+      log_operation_rejected_locked(
+          "control_apply_rejected",
+          "vcu_hard_overspeed_latched",
+          "vcu_hard_overspeed_gate",
+          "hard overspeed safe stop remains latched",
+          "Complete the stopped disarm sequence and request a new VCU handshake before resuming.");
+      return MINE_TELEOP_CHASSIS_APPLY_ISSUE_HARD_OVERSPEED_LATCHED;
+    }
+    if (gear_changed && driving_gear &&
+        (!speed_feedback_fresh_locked(now) ||
+         !gear_feedback_fresh_locked(now) ||
+         std::abs(controller_.feedback().speed_mps) > 0.1)) {
+      withdraw_latest_traction_locked();
+      log_operation_rejected_locked(
+          "control_apply_rejected",
+          "vcu_drive_gear_change_moving_or_stale",
+          "vcu_gear_change_gate",
+          "drive gear selection requires fresh valid gear/speed feedback at or below 0.1 m/s",
+          "Stop the vehicle, restore fresh speed/gear feedback, then select D or R again.");
+      return MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE;
+    }
+
+    ControlIntent intent;
+    intent.gear = gear;
+    intent.target_speed_mps = target_speed_mps;
+    intent.normalized_longitudinal = normalized_longitudinal;
+    std::copy_n(
+        steering_values,
+        std::min<int>(steering_count, intent.steering.size()),
+        intent.steering.begin());
+    intent.generation = ++intent_generation_;
+    latest_intent_ = intent;
+    latest_intent_valid_ = true;
+    last_successful_apply_ = now;
+    last_successful_apply_valid_ = true;
+    clear_soft_stop_requested_ = true;
+    return MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE;
   }
 
   bool emergency_stop() {
@@ -854,6 +1016,8 @@ class BridgeRuntime {
       return false;
     }
     controller_.emergency_stop();
+    clear_soft_stop_requested_ = false;
+    withdraw_latest_traction_locked();
     software_estop_ = true;
     logger_.event(
         "emergency_stop",
@@ -880,19 +1044,46 @@ class BridgeRuntime {
     }
     const auto now = Clock::now();
     const auto state_before = controller_.state();
+    const auto& feedback = controller_.feedback();
+    const bool hard_latch_recovery_ready =
+        !hard_overspeed_latched_ ||
+        (state_before == mine_teleop::vcu::State::Disarmed &&
+         speed_feedback_fresh_locked(now) && gear_feedback_fresh_locked(now) &&
+         feedback.gear == 1 && std::abs(feedback.speed_mps) <= 0.1);
+    const bool physical_latch_recovery_ready =
+        !controller_.physical_emergency_latched() ||
+        ((state_before == mine_teleop::vcu::State::Disarmed ||
+          state_before == mine_teleop::vcu::State::Standby) &&
+         speed_feedback_fresh_locked(now) && gear_feedback_fresh_locked(now) &&
+         feedback.emergency_switch == 0 && feedback.gear == 1 &&
+         std::abs(feedback.speed_mps) <= 0.1);
     if (!parking_gate_fresh_locked(now) || !controller_.parking_ready() ||
+        !hard_latch_recovery_ready || !physical_latch_recovery_ready ||
         !controller_.request_parallel_handshake()) {
       logger_.event(
           "parallel_handshake_rejected",
           "\"issue_code\":\"vcu_handshake_gate_rejected\","
           "\"stage\":\"vcu_handshake_gate\","
           "\"retryable\":true,"
-          "\"operator_action\":\"Satisfy fresh feedback, N gear, zero speed, all electronic parking brakes applied, and manual handshake state 3\","
+          "\"operator_action\":\"Satisfy fresh feedback, N gear, zero speed, all electronic parking brakes applied, and manual handshake state 3; a hard speed latch additionally requires completed Disarmed state and fresh actual N feedback\","
           "\"safety_action\":\"remain_in_standby\"," +
               handshake_gate_json_locked(now),
           true);
       return false;
     }
+    last_successful_apply_valid_ = false;
+    ready_since_valid_ = false;
+    session_ready_latched_ = false;
+    feedback_watchdog_armed_ = false;
+    arming_feedback_deadline_valid_ = false;
+    control_watchdog_latched_ = false;
+    hard_overspeed_latched_ = false;
+    physical_emergency_reported_ = false;
+    clear_soft_stop_requested_ = false;
+    latest_intent_ = ControlIntent{};
+    latest_intent_.generation = ++intent_generation_;
+    latest_intent_valid_ = true;
+    reset_speed_pid_locked();
     software_estop_ = false;
     logger_.event(
         "parallel_handshake_requested",
@@ -923,6 +1114,7 @@ class BridgeRuntime {
     }
     const auto state_before = controller_.state();
     controller_.request_disarm();
+    withdraw_latest_traction_locked();
     software_estop_ = true;
     if (state_before != controller_.state()) {
       logger_.event(
@@ -1134,6 +1326,27 @@ class BridgeRuntime {
             ",\"io_error\":" + std::to_string(io_error_));
   }
 
+  void fail_control_apply(
+      std::string_view issue_code,
+      std::string_view error,
+      std::string_view operator_action) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    controller_.emergency_stop();
+    clear_soft_stop_requested_ = false;
+    withdraw_latest_traction_locked();
+    software_estop_ = true;
+    control_watchdog_latched_ = true;
+    logger_.issue(
+        "control_apply_failed_safe",
+        issue_code,
+        "bridge_apply_state",
+        error,
+        operator_action,
+        "local_full_stop",
+        "\"running\":" + std::string(running_.load() ? "true" : "false") +
+            ",\"io_error\":" + std::to_string(io_error_));
+  }
+
   void close() {
     if (!running_.load()) {
       if (io_thread_.joinable()) io_thread_.join();
@@ -1196,6 +1409,46 @@ class BridgeRuntime {
   }
 
  private:
+  void reset_speed_pid_locked() {
+    mine_teleop_chassis_speed_pid_reset(&speed_pid_state_);
+    speed_pid_reference_valid_ = false;
+  }
+
+  void latch_chassis_control_fault_locked(std::string_view error) {
+    chassis_control_fault_latched_ = true;
+    io_error_ = -EFAULT;
+    controller_.transport_fault();
+    software_estop_ = true;
+    clear_soft_stop_requested_ = false;
+    withdraw_latest_traction_locked();
+    try {
+      logger_.issue(
+          "chassis_control_fault_latched",
+          "vcu_chassis_control_fault",
+          "local_speed_controller",
+          error,
+          "Keep the vehicle stopped, inspect ChassisControl, and restart only after the fault is repaired.",
+          "local_full_stop");
+    } catch (...) {
+    }
+  }
+
+  void withdraw_latest_traction_locked() {
+    if (!latest_intent_valid_) {
+      latest_intent_.gear =
+          controller_.feedback().gear_valid &&
+                  controller_.feedback().gear >= 1 &&
+                  controller_.feedback().gear <= 3
+              ? controller_.feedback().gear
+              : 1;
+      latest_intent_.target_speed_mps = 0.0;
+      latest_intent_valid_ = true;
+    }
+    latest_intent_.normalized_longitudinal = 0.0;
+    latest_intent_.generation = ++intent_generation_;
+    reset_speed_pid_locked();
+  }
+
   void ingest_locked(const CanFrame& frame) {
     if (!controller_.ingest(frame)) {
       ++ignored_rx_count_;
@@ -1220,6 +1473,52 @@ class BridgeRuntime {
     return true;
   }
 
+  void check_control_watchdog_locked(Clock::time_point now) {
+    Clock::time_point reference{};
+    bool has_reference = false;
+    if (ready_since_valid_) {
+      reference = ready_since_;
+      has_reference = true;
+    }
+    if (last_successful_apply_valid_ &&
+        (!has_reference || last_successful_apply_ > reference)) {
+      reference = last_successful_apply_;
+      has_reference = true;
+    }
+    const auto elapsed_count = has_reference
+        ? std::chrono::duration_cast<std::chrono::milliseconds>(now - reference).count()
+        : 0;
+    const auto elapsed_ms = static_cast<std::uint64_t>(
+        std::max<std::int64_t>(0, elapsed_count));
+    const bool retained_control_state =
+        session_ready_latched_ && speed_safety_active_state(controller_.state());
+    if (!mine_teleop_chassis_control_watchdog_expired(
+            retained_control_state ? 1 : 0,
+            has_reference ? 1 : 0,
+            control_watchdog_latched_ ? 1 : 0,
+            elapsed_ms,
+            control_timeout_ms_)) {
+      return;
+    }
+
+    controller_.emergency_stop();
+    software_estop_ = true;
+    control_watchdog_latched_ = true;
+    clear_soft_stop_requested_ = false;
+    withdraw_latest_traction_locked();
+    logger_.issue(
+        "control_apply_timeout",
+        "vcu_control_apply_timeout",
+        "vcu_control_watchdog",
+        "no successful upstream control apply arrived before the configured deadline",
+        "Keep the vehicle stopped and inspect the vehicle-agent control loop before resuming.",
+        "local_full_stop",
+        "\"timeout_ms\":" + std::to_string(control_timeout_ms_) +
+            ",\"last_apply_age_ms\":" + std::to_string(elapsed_ms) +
+            ",\"state\":\"" +
+            std::string(mine_teleop::vcu::state_name(controller_.state())) + "\"");
+  }
+
   bool feedback_id_fresh_locked(
       std::uint32_t id,
       Clock::time_point now) const {
@@ -1227,6 +1526,253 @@ class BridgeRuntime {
     return found != last_seen_.end() &&
            std::chrono::duration<double>(now - found->second).count() <=
                kFeedbackTimeoutSeconds;
+  }
+
+  bool speed_feedback_fresh_locked(Clock::time_point now) const {
+    const auto& feedback = controller_.feedback();
+    const auto found = last_seen_.find(mine_teleop::vcu::ids::kWvcuVehicleSpeed);
+    return feedback.speed_valid && std::isfinite(feedback.speed_mps) &&
+           found != last_seen_.end() &&
+           std::chrono::duration_cast<std::chrono::milliseconds>(
+               now - found->second).count() <= speed_control_.speed_feedback_timeout_ms;
+  }
+
+  bool gear_feedback_fresh_locked(Clock::time_point now) const {
+    const auto& feedback = controller_.feedback();
+    return feedback.gear_valid && feedback.gear >= 1 && feedback.gear <= 3 &&
+           feedback_id_fresh_locked(
+               mine_teleop::vcu::ids::kWvcuVehicleStatus, now);
+  }
+
+  void update_command_from_intent_locked(
+      Clock::time_point now,
+      double dt_seconds) {
+    if (chassis_control_fault_latched_) {
+      controller_.transport_fault();
+      software_estop_ = true;
+      reset_speed_pid_locked();
+      return;
+    }
+    ControlIntent intent;
+    if (latest_intent_valid_) intent = latest_intent_;
+    const auto& feedback = controller_.feedback();
+    const bool driving_gear = intent.gear == 2 || intent.gear == 3;
+    const bool brake_requested = intent.normalized_longitudinal < 0.0;
+    const bool traction_requested = intent.normalized_longitudinal > 0.0;
+    const bool speed_fresh = speed_feedback_fresh_locked(now);
+    const bool gear_fresh = gear_feedback_fresh_locked(now);
+    const bool actual_gear_matches =
+        gear_fresh && feedback.gear == intent.gear;
+    const double direction = intent.gear == 2 ? -1.0 : 1.0;
+    const double measured_along_gear_mps = direction * feedback.speed_mps;
+    const auto controller_state = controller_.state();
+
+    const bool physical_emergency_latched =
+        controller_.physical_emergency_latched();
+    if (physical_emergency_latched) {
+      clear_soft_stop_requested_ = false;
+      software_estop_ = true;
+      reset_speed_pid_locked();
+      if (!physical_emergency_reported_) {
+        physical_emergency_reported_ = true;
+        withdraw_latest_traction_locked();
+        logger_.issue(
+            "physical_emergency_latched",
+            "vcu_physical_emergency_latched",
+            "vcu_vehicle_status",
+            "the physical emergency switch asserted and the safe stop was latched",
+            "Release the switch, complete disarm to N/zero speed/EPB/manual, then explicitly request a new handshake.",
+            "local_full_stop",
+            "\"state\":\"" +
+                std::string(mine_teleop::vcu::state_name(controller_state)) +
+                "\"");
+      }
+    }
+
+    if (!physical_emergency_latched && !hard_overspeed_latched_ &&
+        speed_control_.enabled &&
+        stationary_arming_state(controller_state) && speed_fresh &&
+        std::abs(feedback.speed_mps) > 0.1) {
+      hard_overspeed_latched_ = true;
+      controller_.emergency_stop();
+      software_estop_ = true;
+      reset_speed_pid_locked();
+      logger_.issue(
+          "arming_motion_latched",
+          "vcu_arming_state_motion",
+          "local_speed_controller",
+          "vehicle motion exceeded 0.1 m/s while an arming state required a stationary chassis",
+          "Keep the vehicle stopped, complete disarm, inspect gear/speed feedback, then request a new handshake.",
+          "local_full_stop",
+          "\"state\":\"" +
+              std::string(mine_teleop::vcu::state_name(controller_state)) +
+              "\",\"measured_speed_mps\":" +
+              std::to_string(feedback.speed_mps));
+    }
+
+    if (!physical_emergency_latched && !hard_overspeed_latched_ &&
+        speed_control_.enabled &&
+        controller_state == mine_teleop::vcu::State::Ready && driving_gear &&
+        speed_fresh && actual_gear_matches &&
+        mine_teleop_chassis_opposite_direction_motion(
+            intent.gear, feedback.speed_mps)) {
+      hard_overspeed_latched_ = true;
+      controller_.emergency_stop();
+      software_estop_ = true;
+      reset_speed_pid_locked();
+      logger_.issue(
+          "opposite_direction_motion_latched",
+          "vcu_opposite_direction_motion",
+          "local_speed_controller",
+          "measured vehicle motion opposed the selected drive direction",
+          "Keep the vehicle stopped, inspect gear/speed sign and driveline state, complete disarm, then request a new handshake.",
+          "local_full_stop",
+          "\"target_gear\":" + std::to_string(intent.gear) +
+              ",\"measured_speed_mps\":" +
+              std::to_string(feedback.speed_mps));
+    }
+
+    if (!physical_emergency_latched && !hard_overspeed_latched_ &&
+        speed_control_.enabled &&
+        speed_safety_active_state(controller_state) && speed_fresh &&
+        mine_teleop_chassis_hard_overspeed_latch(
+            hard_overspeed_latched_ ? 1 : 0,
+            speed_control_.hard_speed_limit_mps,
+            std::abs(feedback.speed_mps),
+            speed_control_.hard_overspeed_margin_mps)) {
+      hard_overspeed_latched_ = true;
+      controller_.emergency_stop();
+      software_estop_ = true;
+      reset_speed_pid_locked();
+      logger_.issue(
+          "hard_overspeed_latched",
+          "vcu_hard_overspeed",
+          "local_speed_controller",
+          "measured vehicle speed exceeded the configured local speed ceiling and margin",
+          "Keep the vehicle stopped, complete disarm, inspect calibration/feedback, then request a new handshake.",
+          "local_full_stop",
+          "\"hard_speed_limit_mps\":" +
+              std::to_string(speed_control_.hard_speed_limit_mps) +
+              ",\"measured_speed_mps\":" +
+              std::to_string(feedback.speed_mps) +
+              ",\"margin_mps\":" +
+              std::to_string(speed_control_.hard_overspeed_margin_mps));
+    }
+
+    if (clear_soft_stop_requested_ && !physical_emergency_latched &&
+        !hard_overspeed_latched_ &&
+        controller_.ready() && speed_fresh && actual_gear_matches) {
+      controller_.clear_emergency_stop();
+      software_estop_ = false;
+      control_watchdog_latched_ = false;
+      clear_soft_stop_requested_ = false;
+    }
+
+    double normalized_output = 0.0;
+    if (brake_requested && !physical_emergency_latched &&
+        !hard_overspeed_latched_) {
+      reset_speed_pid_locked();
+      normalized_output = intent.normalized_longitudinal;
+    } else if (speed_control_.enabled && !physical_emergency_latched &&
+               !hard_overspeed_latched_ &&
+               !control_watchdog_latched_ && !software_estop_ &&
+               traction_requested && driving_gear && controller_.ready() &&
+               speed_fresh && actual_gear_matches &&
+               intent.target_speed_mps > 0.0) {
+      if (mine_teleop_chassis_speed_pid_setpoint_requires_reset(
+              speed_pid_reference_valid_ ? 1 : 0,
+              speed_pid_gear_,
+              intent.gear,
+              speed_pid_target_mps_,
+              intent.target_speed_mps)) {
+        mine_teleop_chassis_speed_pid_reset(&speed_pid_state_);
+        speed_pid_reference_valid_ = true;
+        speed_pid_gear_ = intent.gear;
+        speed_pid_target_mps_ = intent.target_speed_mps;
+      }
+      normalized_output = mine_teleop_chassis_speed_pid_step(
+          &speed_control_.pid,
+          &speed_pid_state_,
+          intent.target_speed_mps,
+          measured_along_gear_mps,
+          std::clamp(intent.normalized_longitudinal, 0.0, 1.0),
+          dt_seconds);
+    } else {
+      reset_speed_pid_locked();
+    }
+
+    const bool direct_pressure_brake = physical_brake_input_ && brake_requested;
+    const double chassis_control_longitudinal =
+        direct_pressure_brake ? 0.0 : normalized_output;
+    const double measured_speed = speed_fresh ? feedback.speed_mps : 0.0;
+    Command command;
+    try {
+      const auto state = make_vehicle_state(
+          measured_speed,
+          intent.gear,
+          intent.target_speed_mps,
+          chassis_control_longitudinal,
+          full_scale_motor_torque_nm_,
+          intent.steering.data(),
+          static_cast<int>(intent.steering.size()));
+      if (!UpdateVehicleState(state)) {
+        latch_chassis_control_fault_locked(
+            "ChassisControl UpdateVehicleState returned false");
+        return;
+      }
+      command = command_from_chassis_control(
+          intent.gear,
+          intent.target_speed_mps,
+          chassis_control_longitudinal,
+          full_scale_motor_torque_nm_);
+      if (physical_brake_input_) {
+        const double requested_pressure_bar = direct_pressure_brake
+            ? mine_teleop_chassis_quantize_brake_pressure_bar(
+                  -intent.normalized_longitudinal *
+                  max_ordinary_brake_pressure_bar_)
+            : 0.0;
+        if (direct_pressure_brake) {
+          command.motor_torque_nm.fill(0.0);
+        }
+        command.brake_pressure_bar.fill(requested_pressure_bar);
+      }
+    } catch (const std::exception& error) {
+      latch_chassis_control_fault_locked(error.what());
+      return;
+    } catch (...) {
+      latch_chassis_control_fault_locked(
+          "ChassisControl raised an unknown non-standard exception");
+      return;
+    }
+    const auto command_state = controller_.state();
+    const bool accepts_intent =
+        command_state != mine_teleop::vcu::State::DisarmTorque &&
+        command_state != mine_teleop::vcu::State::DisarmStop &&
+        command_state != mine_teleop::vcu::State::DisarmNeutral &&
+        command_state != mine_teleop::vcu::State::DisarmParkingBrake &&
+        command_state != mine_teleop::vcu::State::DisarmManual &&
+        command_state != mine_teleop::vcu::State::Disarmed &&
+        command_state != mine_teleop::vcu::State::Fault;
+    if (accepts_intent && !controller_.set_command(command)) {
+      controller_.emergency_stop();
+      software_estop_ = true;
+      reset_speed_pid_locked();
+      logger_.issue(
+          "control_intent_rejected_safe",
+          "vcu_control_command_invalid",
+          "local_speed_controller",
+          "the VCU controller rejected the command generated from the latest intent",
+          "Keep the vehicle stopped and inspect gear/speed feedback plus generated command limits.",
+          "local_full_stop");
+    }
+    if (physical_emergency_latched || hard_overspeed_latched_) {
+      controller_.emergency_stop();
+    }
+    if (intent.generation != 0 &&
+        intent.generation != last_logged_intent_generation_) {
+      logger_.command("driver", command);
+      last_logged_intent_generation_ = intent.generation;
+    }
   }
 
   bool parking_gate_fresh_locked(Clock::time_point now) const {
@@ -1240,8 +1786,28 @@ class BridgeRuntime {
                mine_teleop::vcu::ids::kWvcuVehicleSpeed,
                now) &&
            feedback_id_fresh_locked(
+               mine_teleop::vcu::ids::kWvcuVehicleStatus,
+               now) &&
+           feedback_id_fresh_locked(
                mine_teleop::vcu::ids::kWvcuParkingBrake,
                now);
+  }
+
+  bool arming_feedback_fresh_locked(
+      mine_teleop::vcu::State state,
+      Clock::time_point now) const {
+    if (state == mine_teleop::vcu::State::WaitParkingBrakeReleased) {
+      return parking_gate_fresh_locked(now);
+    }
+    if (state == mine_teleop::vcu::State::WaitGear) {
+      return parking_gate_fresh_locked(now) &&
+          feedback_id_fresh_locked(
+              mine_teleop::vcu::ids::kWvcuVehicleStatus, now);
+    }
+    if (state == mine_teleop::vcu::State::WaitActuatorModes) {
+      return feedback_fresh_locked(now);
+    }
+    return true;
   }
 
   std::string handshake_gate_json_locked(Clock::time_point now) const {
@@ -1467,6 +2033,8 @@ class BridgeRuntime {
 
   void io_loop_impl() {
     auto next_tick = Clock::now();
+    auto last_control_tick = next_tick;
+    bool last_control_tick_valid = false;
     auto next_feedback_log = Clock::now();
     auto next_deadline_log = Clock::now();
     int consecutive_send_failures = 0;
@@ -1514,25 +2082,78 @@ class BridgeRuntime {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto state_before = controller_.state();
         const auto now = Clock::now();
+        const double control_dt_seconds = last_control_tick_valid
+            ? std::chrono::duration<double>(now - last_control_tick).count()
+            : static_cast<double>(mine_teleop::vcu::kTransmitPeriodMs) / 1000.0;
+        last_control_tick = now;
+        last_control_tick_valid = true;
         log_ignored_rx_locked(now);
-        if (controller_.ready() && !feedback_fresh_locked(now)) {
+        const auto current_state = controller_.state();
+        const bool retained_feedback_timeout =
+            feedback_watchdog_armed_ &&
+            speed_safety_active_state(current_state) &&
+            !feedback_fresh_locked(now);
+        const bool first_arming_feedback_timeout =
+            !feedback_watchdog_armed_ &&
+            arming_feedback_deadline_valid_ &&
+            current_state == arming_feedback_state_ &&
+            now - arming_feedback_state_entry_ >=
+                std::chrono::duration_cast<Clock::duration>(
+                    std::chrono::duration<double>(kFeedbackTimeoutSeconds)) &&
+            !arming_feedback_fresh_locked(current_state, now);
+        if (retained_feedback_timeout || first_arming_feedback_timeout) {
           io_error_ = -ETIMEDOUT;
           controller_.transport_fault();
           software_estop_ = true;
+          withdraw_latest_traction_locked();
           logger_.issue(
-              "feedback_timeout",
-              "vcu_critical_feedback_timeout",
+              first_arming_feedback_timeout
+                  ? "arming_feedback_timeout"
+                  : "feedback_timeout",
+              first_arming_feedback_timeout
+                  ? "vcu_arming_feedback_timeout"
+                  : "vcu_critical_feedback_timeout",
               "vcu_feedback_watchdog",
-              "one or more critical VCU feedback IDs exceeded the freshness deadline",
+              first_arming_feedback_timeout
+                  ? "feedback required by the current arming phase did not remain fresh through its 500 ms entry grace"
+                  : "one or more critical VCU feedback IDs exceeded the freshness deadline",
               "Inspect stale_feedback ages, CAN wiring/load, VCU power/state, and protocol ID mapping.",
               "local_full_stop",
               "\"timeout_ms\":" +
                   std::to_string(static_cast<int>(kFeedbackTimeoutSeconds * 1000.0)) +
+                  ",\"state\":\"" +
+                  std::string(mine_teleop::vcu::state_name(current_state)) +
+                  "\"" +
                   "," + stale_feedback_ids_locked(now) +
                   "," + stale_feedback_ages_locked(now));
         }
+        check_control_watchdog_locked(now);
+        update_command_from_intent_locked(now, control_dt_seconds);
         frames = controller_.tick();
         transmit_state = controller_.state();
+        if (!session_ready_latched_ &&
+            transmit_state == mine_teleop::vcu::State::Ready) {
+          session_ready_latched_ = true;
+          feedback_watchdog_armed_ = true;
+          ready_since_ = now;
+          ready_since_valid_ = true;
+          control_watchdog_latched_ = false;
+        } else if (session_ready_latched_ &&
+                   !speed_safety_active_state(transmit_state)) {
+          session_ready_latched_ = false;
+          feedback_watchdog_armed_ = false;
+          ready_since_valid_ = false;
+        }
+        if (!feedback_watchdog_armed_ &&
+            stationary_arming_state(transmit_state) &&
+            (!arming_feedback_deadline_valid_ ||
+             arming_feedback_state_ != transmit_state)) {
+          arming_feedback_state_ = transmit_state;
+          arming_feedback_state_entry_ = now;
+          arming_feedback_deadline_valid_ = true;
+        } else if (!stationary_arming_state(transmit_state)) {
+          arming_feedback_deadline_valid_ = false;
+        }
         if (state_before != transmit_state) {
           logger_.event(
               "state_transition",
@@ -1616,6 +2237,10 @@ class BridgeRuntime {
 
   std::string can_interface_;
   double full_scale_motor_torque_nm_;
+  int control_timeout_ms_;
+  SpeedControlSettings speed_control_;
+  bool physical_brake_input_{false};
+  double max_ordinary_brake_pressure_bar_{0.0};
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   SocketCan socket_;
@@ -1628,6 +2253,29 @@ class BridgeRuntime {
   std::uint64_t last_polled_generation_{0};
   int io_error_{0};
   bool software_estop_{false};
+  Clock::time_point last_successful_apply_{};
+  Clock::time_point ready_since_{};
+  bool last_successful_apply_valid_{false};
+  bool ready_since_valid_{false};
+  bool session_ready_latched_{false};
+  bool feedback_watchdog_armed_{false};
+  Clock::time_point arming_feedback_state_entry_{};
+  mine_teleop::vcu::State arming_feedback_state_{
+      mine_teleop::vcu::State::Standby};
+  bool arming_feedback_deadline_valid_{false};
+  bool control_watchdog_latched_{false};
+  bool hard_overspeed_latched_{false};
+  bool physical_emergency_reported_{false};
+  bool chassis_control_fault_latched_{false};
+  bool clear_soft_stop_requested_{false};
+  ControlIntent latest_intent_{};
+  bool latest_intent_valid_{false};
+  std::uint64_t intent_generation_{0};
+  std::uint64_t last_logged_intent_generation_{0};
+  MineTeleopChassisSpeedPidState speed_pid_state_{};
+  bool speed_pid_reference_valid_{false};
+  int speed_pid_gear_{1};
+  double speed_pid_target_mps_{0.0};
   std::uint64_t ignored_rx_count_{0};
   std::uint32_t last_ignored_rx_id_{0};
   std::uint64_t special_rx_count_{0};
@@ -1643,7 +2291,11 @@ std::unique_ptr<BridgeRuntime> g_runtime;
 
 int open_bridge_locked(
     const char* can_interface,
-    double full_scale_motor_torque_nm) {
+    double full_scale_motor_torque_nm,
+    int control_timeout_ms,
+    SpeedControlSettings speed_control,
+    bool physical_brake_input,
+    double max_ordinary_brake_pressure_bar) {
   if (can_interface == nullptr || can_interface[0] == '\0' || g_runtime) {
     emit_bridge_diagnostic(
         "vehicle_vcu_start_failed",
@@ -1684,7 +2336,11 @@ int open_bridge_locked(
         "Check ChassisControl input ranges and units.");
     return -2;
   }
-  const auto emergency = command_from_chassis_control(1);
+  auto emergency = command_from_chassis_control(
+      1, 0.0, -8.0, full_scale_motor_torque_nm);
+  emergency.motor_torque_nm.fill(0.0);
+  emergency.brake_pressure_bar.fill(
+      MINE_TELEOP_CHASSIS_MAX_EMERGENCY_BRAKE_PRESSURE_BAR);
 
   if (!UpdateVehicleState(make_vehicle_state(
           0.0,
@@ -1702,10 +2358,16 @@ int open_bridge_locked(
         "Check ChassisControl input ranges and units.");
     return -2;
   }
-  const auto initial = command_from_chassis_control(1);
+  const auto initial = command_from_chassis_control(
+      1, 0.0, 0.0, full_scale_motor_torque_nm);
 
   auto runtime = std::make_unique<BridgeRuntime>(
-      can_interface, full_scale_motor_torque_nm);
+      can_interface,
+      full_scale_motor_torque_nm,
+      control_timeout_ms,
+      speed_control,
+      physical_brake_input,
+      max_ordinary_brake_pressure_bar);
   const int start_result = runtime->start(initial, emergency);
   if (start_result != 0) return start_result;
   g_runtime = std::move(runtime);
@@ -1714,10 +2376,20 @@ int open_bridge_locked(
 
 int open_bridge(
     const char* can_interface,
-    double full_scale_motor_torque_nm) noexcept {
+    double full_scale_motor_torque_nm,
+    int control_timeout_ms,
+    SpeedControlSettings speed_control,
+    bool physical_brake_input,
+    double max_ordinary_brake_pressure_bar) noexcept {
   try {
     std::lock_guard<std::mutex> lock(g_api_mutex);
-    return open_bridge_locked(can_interface, full_scale_motor_torque_nm);
+    return open_bridge_locked(
+        can_interface,
+        full_scale_motor_torque_nm,
+        control_timeout_ms,
+        speed_control,
+        physical_brake_input,
+        max_ordinary_brake_pressure_bar);
   } catch (const std::exception& error) {
     emit_bridge_diagnostic(
         "vehicle_vcu_start_failed",
@@ -1739,10 +2411,26 @@ int open_bridge(
 
 }  // namespace
 
+extern "C" std::uint32_t mine_teleop_chassis_abi_version() { return 3U; }
+
+extern "C" std::uint32_t mine_teleop_chassis_open_config_v2_size() {
+  return static_cast<std::uint32_t>(sizeof(MineTeleopChassisOpenConfigV2));
+}
+
+extern "C" std::uint32_t mine_teleop_chassis_open_config_v3_size() {
+  return static_cast<std::uint32_t>(sizeof(MineTeleopChassisOpenConfigV3));
+}
+
 extern "C" int mine_teleop_chassis_open(const char* can_interface) {
+  // Legacy entry points cannot supply a validated local speed controller.
+  // They remain ABI-compatible but intentionally keep traction disabled.
   return open_bridge(
       can_interface,
-      MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM);
+      MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM,
+      MINE_TELEOP_CHASSIS_DEFAULT_CONTROL_TIMEOUT_MS,
+      SpeedControlSettings{},
+      false,
+      0.0);
 }
 
 extern "C" int mine_teleop_chassis_open_v1(
@@ -1758,11 +2446,255 @@ extern "C" int mine_teleop_chassis_open_v1(
         "vcu_open_config_invalid",
         "bridge_open_config",
         "open_v1 config size or full-scale motor torque is invalid",
-        "Provide the current V1 struct and a finite torque in [0, 165] Nm.");
+        "Provide the original three-field V1 struct and torque in [0, 640.0] Nm.");
     return -1;
   }
   return open_bridge(
-      config->can_interface, config->full_scale_motor_torque_nm);
+      config->can_interface,
+      config->full_scale_motor_torque_nm,
+      MINE_TELEOP_CHASSIS_DEFAULT_CONTROL_TIMEOUT_MS,
+      SpeedControlSettings{},
+      false,
+      0.0);
+}
+
+extern "C" int mine_teleop_chassis_open_v2(
+    const MineTeleopChassisOpenConfigV2* config) {
+  const MineTeleopChassisSpeedPidConfig pid = config == nullptr
+      ? MineTeleopChassisSpeedPidConfig{}
+      : MineTeleopChassisSpeedPidConfig{
+            config->speed_pid_kp,
+            config->speed_pid_ki,
+            config->speed_pid_kd,
+            config->speed_pid_derivative_filter_tau_ms,
+            config->speed_pid_max_dt_ms};
+  if (config == nullptr ||
+      config->struct_size != sizeof(MineTeleopChassisOpenConfigV2) ||
+      !std::isfinite(config->full_scale_motor_torque_nm) ||
+      config->full_scale_motor_torque_nm < 0.0 ||
+      config->full_scale_motor_torque_nm >
+          MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM ||
+      !std::isfinite(config->hard_speed_limit_mps) ||
+      config->hard_speed_limit_mps < 0.0 ||
+      config->hard_speed_limit_mps > 20.0 ||
+      !mine_teleop_chassis_control_timeout_is_valid(config->control_timeout_ms) ||
+      config->speed_feedback_timeout_ms <
+          MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS ||
+      config->speed_feedback_timeout_ms >
+          MINE_TELEOP_CHASSIS_MAX_SPEED_FEEDBACK_TIMEOUT_MS ||
+      config->speed_feedback_timeout_ms > config->control_timeout_ms ||
+      !mine_teleop_chassis_speed_pid_config_is_valid(&pid) ||
+      !std::isfinite(config->hard_overspeed_margin_mps) ||
+      config->hard_overspeed_margin_mps <= 0.0 ||
+      config->hard_overspeed_margin_mps >
+          MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS) {
+    emit_bridge_diagnostic(
+        "vehicle_vcu_start_failed",
+        "vcu_open_config_invalid",
+        "bridge_open_config",
+        "open_v2 config size, torque, timeout, PID, or overspeed margin is invalid",
+        "Provide the current V2 struct with finite bench-calibrated values inside documented bounds.");
+    return -1;
+  }
+  SpeedControlSettings speed_control;
+  speed_control.enabled = true;
+  speed_control.hard_speed_limit_mps = config->hard_speed_limit_mps;
+  speed_control.speed_feedback_timeout_ms = config->speed_feedback_timeout_ms;
+  speed_control.pid = pid;
+  speed_control.hard_overspeed_margin_mps =
+      config->hard_overspeed_margin_mps;
+  return open_bridge(
+      config->can_interface,
+      config->full_scale_motor_torque_nm,
+      config->control_timeout_ms,
+      speed_control,
+      false,
+      0.0);
+}
+
+extern "C" int mine_teleop_chassis_open_v3(
+    const MineTeleopChassisOpenConfigV3* config) {
+  const MineTeleopChassisSpeedPidConfig pid = config == nullptr
+      ? MineTeleopChassisSpeedPidConfig{}
+      : MineTeleopChassisSpeedPidConfig{
+            config->speed_pid_kp,
+            config->speed_pid_ki,
+            config->speed_pid_kd,
+            config->speed_pid_derivative_filter_tau_ms,
+            config->speed_pid_max_dt_ms};
+  if (config == nullptr ||
+      config->struct_size != sizeof(MineTeleopChassisOpenConfigV3) ||
+      !std::isfinite(config->full_scale_motor_torque_nm) ||
+      config->full_scale_motor_torque_nm < 0.0 ||
+      config->full_scale_motor_torque_nm >
+          MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM ||
+      !std::isfinite(config->hard_speed_limit_mps) ||
+      config->hard_speed_limit_mps < 0.0 ||
+      config->hard_speed_limit_mps > 20.0 ||
+      !mine_teleop_chassis_control_timeout_is_valid(config->control_timeout_ms) ||
+      config->speed_feedback_timeout_ms <
+          MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS ||
+      config->speed_feedback_timeout_ms >
+          MINE_TELEOP_CHASSIS_MAX_SPEED_FEEDBACK_TIMEOUT_MS ||
+      config->speed_feedback_timeout_ms > config->control_timeout_ms ||
+      !mine_teleop_chassis_speed_pid_config_is_valid(&pid) ||
+      !std::isfinite(config->hard_overspeed_margin_mps) ||
+      config->hard_overspeed_margin_mps <= 0.0 ||
+      config->hard_overspeed_margin_mps >
+          MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS ||
+      !std::isfinite(config->max_ordinary_brake_pressure_bar) ||
+      config->max_ordinary_brake_pressure_bar < 0.0 ||
+      config->max_ordinary_brake_pressure_bar >
+          MINE_TELEOP_CHASSIS_MAX_ORDINARY_BRAKE_PRESSURE_BAR) {
+    emit_bridge_diagnostic(
+        "vehicle_vcu_start_failed",
+        "vcu_open_config_invalid",
+        "bridge_open_config",
+        "open_v3 config size, torque, pressure, timeout, PID, or overspeed margin is invalid",
+        "Provide the current V3 struct with physical ordinary-brake pressure inside documented bounds.");
+    return -1;
+  }
+  SpeedControlSettings speed_control;
+  speed_control.enabled = true;
+  speed_control.hard_speed_limit_mps = config->hard_speed_limit_mps;
+  speed_control.speed_feedback_timeout_ms = config->speed_feedback_timeout_ms;
+  speed_control.pid = pid;
+  speed_control.hard_overspeed_margin_mps =
+      config->hard_overspeed_margin_mps;
+  return open_bridge(
+      config->can_interface,
+      config->full_scale_motor_torque_nm,
+      config->control_timeout_ms,
+      speed_control,
+      true,
+      config->max_ordinary_brake_pressure_bar);
+}
+
+namespace {
+
+int finish_apply(
+    MineTeleopChassisApplyResultV1* result,
+    int result_code,
+    std::uint32_t issue_id) noexcept {
+  if (result != nullptr) {
+    *result = MineTeleopChassisApplyResultV1{
+        static_cast<std::uint32_t>(sizeof(MineTeleopChassisApplyResultV1)),
+        result_code,
+        issue_id,
+        0U};
+  }
+  return result_code;
+}
+
+}  // namespace
+
+extern "C" int mine_teleop_chassis_apply_state_v2(
+    int target_gear,
+    double target_vx,
+    double target_ax,
+    const double* steering_values,
+    int steering_count,
+    MineTeleopChassisApplyResultV1* result) {
+  if (result == nullptr) return -1;
+  finish_apply(
+      result,
+      -1,
+      MINE_TELEOP_CHASSIS_APPLY_ISSUE_GENERIC_REJECTED);
+  try {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    const int checked_steering_count = std::max(
+        0,
+        std::min(
+            steering_count,
+            static_cast<int>(mine_teleop::vcu::kSteeringAxisCount)));
+    const bool steering_finite = steering_values != nullptr &&
+        std::all_of(
+            steering_values,
+            steering_values + checked_steering_count,
+            [](double value) { return std::isfinite(value); });
+    if (!g_runtime) {
+      return finish_apply(
+          result,
+          -1,
+          MINE_TELEOP_CHASSIS_APPLY_ISSUE_RUNTIME_UNAVAILABLE);
+    }
+    if (steering_values == nullptr || steering_count < 0 ||
+        target_gear < 1 || target_gear > 4 || !std::isfinite(target_vx) ||
+        target_vx < 0.0 || target_vx > 20.0 || !std::isfinite(target_ax) ||
+        target_ax < -1.0 || target_ax > 1.0 || !steering_finite) {
+      g_runtime->fail_control_apply(
+          "vcu_apply_arguments_invalid",
+          "invalid gear, target speed/acceleration, steering pointer, or steering values",
+          "Check the runtime-to-bridge ABI arguments and configured steering axes.");
+      return finish_apply(
+          result,
+          -1,
+          MINE_TELEOP_CHASSIS_APPLY_ISSUE_ARGUMENTS_INVALID);
+    }
+    if (target_gear == 4) {
+      const bool accepted = g_runtime->request_park();
+      return finish_apply(
+          result,
+          accepted ? 0 : -3,
+          accepted
+              ? MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE
+              : MINE_TELEOP_CHASSIS_APPLY_ISSUE_GENERIC_REJECTED);
+    }
+    const auto issue_id = g_runtime->store_intent(
+        target_gear,
+        target_vx,
+        target_ax,
+        steering_values,
+        steering_count);
+    return finish_apply(
+        result,
+        issue_id == MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE ? 0 : -3,
+        issue_id);
+  } catch (const std::exception& error) {
+    try {
+      std::lock_guard<std::mutex> lock(g_api_mutex);
+      if (g_runtime) {
+        g_runtime->fail_control_apply(
+            "vcu_apply_exception",
+            error.what(),
+            "Check ChassisControl output size/values and the bridge ABI.");
+      } else {
+        emit_bridge_diagnostic(
+            "vehicle_vcu_api_failed",
+            "vcu_apply_exception",
+            "bridge_apply_state",
+            error.what(),
+            "Check ChassisControl output size/values and the bridge ABI.");
+      }
+    } catch (...) {
+    }
+    return finish_apply(
+        result,
+        -5,
+        MINE_TELEOP_CHASSIS_APPLY_ISSUE_INTERNAL_ERROR);
+  } catch (...) {
+    try {
+      std::lock_guard<std::mutex> lock(g_api_mutex);
+      if (g_runtime) {
+        g_runtime->fail_control_apply(
+            "vcu_apply_unknown_exception",
+            "unknown non-standard exception",
+            "Check the bridge and ChassisControl runtime.");
+      } else {
+        emit_bridge_diagnostic(
+            "vehicle_vcu_api_failed",
+            "vcu_apply_unknown_exception",
+            "bridge_apply_state",
+            "unknown non-standard exception",
+            "Check the bridge and ChassisControl runtime.");
+      }
+    } catch (...) {
+    }
+    return finish_apply(
+        result,
+        -5,
+        MINE_TELEOP_CHASSIS_APPLY_ISSUE_INTERNAL_ERROR);
+  }
 }
 
 extern "C" int mine_teleop_chassis_apply_state(
@@ -1771,63 +2703,14 @@ extern "C" int mine_teleop_chassis_apply_state(
     double target_ax,
     const double* steering_values,
     int steering_count) {
-  try {
-    std::lock_guard<std::mutex> lock(g_api_mutex);
-    if (!g_runtime || steering_values == nullptr || steering_count < 0 ||
-        target_gear < 1 || target_gear > 4) {
-      if (g_runtime) {
-        g_runtime->log_api_failure(
-            "bridge_apply_state",
-            "vcu_apply_arguments_invalid",
-            "invalid gear, steering pointer, or steering count",
-            "Check the runtime-to-bridge ABI arguments and configured steering axes.");
-      }
-      return -1;
-    }
-    if (target_gear == 4) return g_runtime->request_park() ? 0 : -3;
-
-    const auto state = make_vehicle_state(
-        g_runtime->speed_mps(),
-        target_gear,
-        target_vx,
-        target_ax,
-        g_runtime->full_scale_motor_torque_nm(),
-        steering_values,
-        steering_count);
-    if (!UpdateVehicleState(state)) {
-      g_runtime->log_api_failure(
-          "chassis_control_update",
-          "chassis_control_update_failed",
-          "ChassisControl UpdateVehicleState returned false",
-          "Check command ranges, units, and current ChassisControl state.");
-      return -2;
-    }
-    return g_runtime->apply(command_from_chassis_control(target_gear)) ? 0 : -3;
-  } catch (const std::exception& error) {
-    if (g_runtime) {
-      g_runtime->log_api_failure(
-          "bridge_apply_state",
-          "vcu_apply_exception",
-          error.what(),
-          "Check ChassisControl output size/values and the bridge ABI.");
-    } else {
-      emit_bridge_diagnostic(
-          "vehicle_vcu_api_failed",
-          "vcu_apply_exception",
-          "bridge_apply_state",
-          error.what(),
-          "Check ChassisControl output size/values and the bridge ABI.");
-    }
-    return -5;
-  } catch (...) {
-    emit_bridge_diagnostic(
-        "vehicle_vcu_api_failed",
-        "vcu_apply_unknown_exception",
-        "bridge_apply_state",
-        "unknown non-standard exception",
-        "Check the bridge and ChassisControl runtime.");
-    return -5;
-  }
+  MineTeleopChassisApplyResultV1 result{};
+  return mine_teleop_chassis_apply_state_v2(
+      target_gear,
+      target_vx,
+      target_ax,
+      steering_values,
+      steering_count,
+      &result);
 }
 
 extern "C" int mine_teleop_chassis_emergency_stop() {

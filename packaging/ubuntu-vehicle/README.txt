@@ -42,7 +42,8 @@ Log out and back in after the group change, then verify discovery:
 Diagnostics:
 
   ./bin/mine-teleop-run version
-  ./bin/mine-teleop-run config-check --config config/vehicle-agent.yaml
+  ./bin/mine-teleop-run config-check --config config/vehicle-agent.yaml \
+    --chassis-bridge-library lib/vendor/chassis/libmine_teleop_chassis_bridge.so
   ./bin/mine-teleop-run vehicle-agent --config config/vehicle-agent.yaml --preflight
 
 The package intentionally contains no device token. Vehicle registration uses

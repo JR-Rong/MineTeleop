@@ -134,6 +134,17 @@ else
     exit 2
   fi
 
+  # A base bundle may carry an older chassis bridge or Aravis library whose
+  # public symbol set no longer matches the current binaries. Rebuild the
+  # bridge and refresh the complete pinned Aravis runtime from this checkout;
+  # the base archive is reused only for the heavier codec/GStreamer closure.
+  "$script_dir/prepare_chassis_runtime.sh"
+  if [[ ! -s "$chassis_bridge" || ! -s "$chassis_control" ]]; then
+    printf 'current-source chassis runtime was not prepared under: %s\n' \
+      "$chassis_vendor_dir" >&2
+    exit 2
+  fi
+
   docker buildx build \
     --platform "$platform" \
     --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
@@ -155,6 +166,19 @@ else
   cp -a "${base_roots[0]}/." "$output_root/"
   temporary_container="$(docker create --platform "$platform" "$build_image")"
   docker cp "$temporary_container:/opt/mine-teleop/bin/." "$output_root/bin/"
+  mkdir -p "$temporary/aravis-lib"
+  docker cp "$temporary_container:/opt/aravis/lib/." "$temporary/aravis-lib/"
+  aravis_libraries=("$temporary/aravis-lib"/libaravis*.so*)
+  if [[ ! -e "${aravis_libraries[0]}" ]]; then
+    printf 'current build image did not contain the pinned Aravis runtime\n' >&2
+    exit 2
+  fi
+  for existing_library in "$output_root"/lib/libaravis*.so*; do
+    if [[ -e "$existing_library" || -L "$existing_library" ]]; then
+      rm -f -- "$existing_library"
+    fi
+  done
+  cp -L -- "${aravis_libraries[@]}" "$output_root/lib/"
   docker rm "$temporary_container" >/dev/null
   temporary_container=""
   third_party_runtime_source="$(basename "$base_bundle_archive")"

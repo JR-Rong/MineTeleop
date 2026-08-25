@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -34,6 +35,17 @@
 
 namespace mine_teleop {
 namespace {
+
+constexpr double kChassisControlMaxTargetSpeedMps = 20.0;
+constexpr double kChassisControlMaxTargetSpeedKph =
+    kChassisControlMaxTargetSpeedMps * 3.6;
+constexpr int kMinSpeedFeedbackTimeoutMs = 20;
+constexpr int kMaxSpeedFeedbackTimeoutMs = 500;
+constexpr int kMinSpeedPidMaxDtMs = 20;
+constexpr int kMaxSpeedPidMaxDtMs = 200;
+constexpr double kMaxSpeedPidGain = 100.0;
+constexpr double kMaxSpeedPidDerivativeFilterTauMs = 2000.0;
+constexpr double kMaxHardOverspeedMarginKph = 36.0;
 
 template <typename T>
 T required(const YAML::Node& node, const char* key, std::string_view context) {
@@ -66,6 +78,66 @@ void require_finite_range(double value, double minimum, double maximum, std::str
     throw std::invalid_argument(std::string(label) + " must be a finite value in [" +
                                 std::to_string(minimum) + ", " + std::to_string(maximum) + "]");
   }
+}
+
+double vehicle_normalized_brake_request(
+    double session_normalized_brake,
+    double session_max_brake_pressure_bar,
+    double vehicle_max_brake_pressure_bar) {
+  require_finite_range(
+      session_normalized_brake, 0.0, 1.0, "session_normalized_brake");
+  require_finite_range(
+      vehicle_max_brake_pressure_bar,
+      0.0,
+      kMaxOrdinaryBrakePressureBar,
+      "vehicle_max_brake_pressure_bar");
+  require_finite_range(
+      session_max_brake_pressure_bar,
+      0.0,
+      vehicle_max_brake_pressure_bar,
+      "session_max_brake_pressure_bar");
+  return vehicle_max_brake_pressure_bar > 0.0
+      ? session_normalized_brake * session_max_brake_pressure_bar /
+          vehicle_max_brake_pressure_bar
+      : 0.0;
+}
+
+void normalize_and_validate_deceleration_profile(
+    std::vector<DecelerationStage>& profile) {
+  constexpr double kBrakeComparisonTolerance = 1e-9;
+  if (profile.empty()) {
+    throw std::invalid_argument("deceleration profile must not be empty");
+  }
+  if (profile.front().after_ms != 0) {
+    throw std::invalid_argument(
+        "deceleration profile must start at after_ms 0");
+  }
+  double previous_brake = 0.0;
+  int previous_after_ms = -1;
+  for (auto& stage : profile) {
+    if (stage.after_ms < 0) {
+      throw std::invalid_argument(
+          "deceleration after_ms must be non-negative");
+    }
+    if (previous_after_ms >= 0 && stage.after_ms <= previous_after_ms) {
+      throw std::invalid_argument(
+          "deceleration after_ms values must be strictly increasing");
+    }
+    require_finite_range(stage.brake, 0.0, 1.0, "deceleration brake");
+    if (stage.brake + kBrakeComparisonTolerance < previous_brake) {
+      throw std::invalid_argument(
+          "deceleration brake stages must be non-decreasing");
+    }
+    if (stage.brake < previous_brake) stage.brake = previous_brake;
+    previous_brake = stage.brake;
+    previous_after_ms = stage.after_ms;
+  }
+  if (std::abs(profile.back().brake - 1.0) >
+      kBrakeComparisonTolerance) {
+    throw std::invalid_argument(
+        "deceleration profile must end with full safety brake 1.0");
+  }
+  profile.back().brake = 1.0;
 }
 
 int gear_to_bridge_value(std::string_view gear) {
@@ -103,6 +175,77 @@ struct BridgeOpenConfigV1 {
   const char* can_interface;
   double full_scale_motor_torque_nm;
 };
+
+struct BridgeOpenConfigV2 {
+  std::uint32_t struct_size;
+  const char* can_interface;
+  double full_scale_motor_torque_nm;
+  double hard_speed_limit_mps;
+  std::int32_t control_timeout_ms;
+  std::int32_t speed_feedback_timeout_ms;
+  double speed_pid_kp;
+  double speed_pid_ki;
+  double speed_pid_kd;
+  double speed_pid_derivative_filter_tau_ms;
+  std::int32_t speed_pid_max_dt_ms;
+  double hard_overspeed_margin_mps;
+};
+
+struct BridgeOpenConfigV3 {
+  std::uint32_t struct_size;
+  const char* can_interface;
+  double full_scale_motor_torque_nm;
+  double hard_speed_limit_mps;
+  std::int32_t control_timeout_ms;
+  std::int32_t speed_feedback_timeout_ms;
+  double speed_pid_kp;
+  double speed_pid_ki;
+  double speed_pid_kd;
+  double speed_pid_derivative_filter_tau_ms;
+  std::int32_t speed_pid_max_dt_ms;
+  double hard_overspeed_margin_mps;
+  double max_ordinary_brake_pressure_bar;
+};
+
+struct BridgeApplyResultV1 {
+  std::uint32_t struct_size;
+  std::int32_t result_code;
+  std::uint32_t issue_id;
+  std::uint32_t reserved;
+};
+
+static_assert(sizeof(BridgeApplyResultV1) == 16U);
+
+constexpr std::uint32_t kBridgeApplyIssueNone = 0U;
+constexpr std::uint32_t kBridgeApplyIssueDriveGearChangeMovingOrStale = 5U;
+
+std::string bridge_apply_issue_code(std::uint32_t issue_id) {
+  return issue_id == kBridgeApplyIssueDriveGearChangeMovingOrStale
+      ? "vcu_drive_gear_change_moving_or_stale"
+      : "vcu_control_apply_rejected";
+}
+
+#define MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(field) \
+  static_assert(offsetof(BridgeOpenConfigV3, field) == \
+      offsetof(BridgeOpenConfigV2, field))
+MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(struct_size);
+MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(can_interface);
+MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(full_scale_motor_torque_nm);
+MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(hard_speed_limit_mps);
+MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(control_timeout_ms);
+MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(speed_feedback_timeout_ms);
+MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(speed_pid_kp);
+MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(speed_pid_ki);
+MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(speed_pid_kd);
+MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(speed_pid_derivative_filter_tau_ms);
+MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(speed_pid_max_dt_ms);
+MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(hard_overspeed_margin_mps);
+#undef MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD
+static_assert(
+    offsetof(BridgeOpenConfigV3, max_ordinary_brake_pressure_bar) ==
+    sizeof(BridgeOpenConfigV2));
+static_assert(
+    sizeof(BridgeOpenConfigV3) == sizeof(BridgeOpenConfigV2) + sizeof(double));
 
 struct BridgeFeedback {
   int shake_hand_status;
@@ -227,6 +370,62 @@ void unload_dynamic_library(void* handle) {
 #else
   dlclose(handle);
 #endif
+}
+
+void* open_dynamic_library(const std::filesystem::path& path) {
+#if defined(_WIN32)
+  void* handle = static_cast<void*>(LoadLibraryW(path.wstring().c_str()));
+  if (handle == nullptr) {
+    throw std::runtime_error(
+        "failed to load dynamic library (Windows error " +
+        std::to_string(GetLastError()) + ")");
+  }
+#else
+  void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (handle == nullptr) {
+    throw std::runtime_error(
+        std::string("failed to load dynamic library: ") + dlerror());
+  }
+#endif
+  return handle;
+}
+
+void validate_chassis_bridge_abi_handle(void* handle) {
+  using QueryFn = std::uint32_t (*)();
+  using OpenV1Fn = int (*)(const BridgeOpenConfigV1*);
+  using OpenV2Fn = int (*)(const BridgeOpenConfigV2*);
+  using OpenV3Fn = int (*)(const BridgeOpenConfigV3*);
+  using ApplyV2Fn = int (*)(
+      int,
+      double,
+      double,
+      const double*,
+      int,
+      BridgeApplyResultV1*);
+  const auto version = load_symbol<QueryFn>(
+      handle, "mine_teleop_chassis_abi_version")();
+  const auto config_size = load_symbol<QueryFn>(
+      handle, "mine_teleop_chassis_open_config_v3_size")();
+  const auto legacy_v2_config_size = load_symbol<QueryFn>(
+      handle, "mine_teleop_chassis_open_config_v2_size")();
+  static_cast<void>(load_symbol<OpenV1Fn>(
+      handle, "mine_teleop_chassis_open_v1"));
+  static_cast<void>(load_symbol<OpenV2Fn>(
+      handle, "mine_teleop_chassis_open_v2"));
+  static_cast<void>(load_symbol<OpenV3Fn>(
+      handle, "mine_teleop_chassis_open_v3"));
+  static_cast<void>(load_symbol<ApplyV2Fn>(
+      handle, "mine_teleop_chassis_apply_state_v2"));
+  if (version != 3U || config_size != sizeof(BridgeOpenConfigV3) ||
+      legacy_v2_config_size != sizeof(BridgeOpenConfigV2)) {
+    throw std::runtime_error(
+        "chassis bridge ABI mismatch: expected version 3 and V3 config size " +
+        std::to_string(sizeof(BridgeOpenConfigV3)) + ", got version " +
+        std::to_string(version) + " and size " + std::to_string(config_size) +
+        "; legacy V2 size expected " +
+        std::to_string(sizeof(BridgeOpenConfigV2)) + ", got " +
+        std::to_string(legacy_v2_config_size));
+  }
 }
 
 #if defined(__linux__)
@@ -436,6 +635,32 @@ void prepare_socketcan(
 
 }  // namespace
 
+VehicleAdapterControlRejected::VehicleAdapterControlRejected(
+    std::string issue_code,
+    int result_code)
+    : std::runtime_error(
+          "vehicle adapter rejected control with code " +
+          std::to_string(result_code)),
+      issue_code_(
+          issue_code == "vcu_drive_gear_change_moving_or_stale"
+              ? std::move(issue_code)
+              : std::string("vcu_control_apply_rejected")),
+      result_code_(result_code) {}
+
+void validate_chassis_bridge_abi(const std::filesystem::path& library_path) {
+  if (library_path.empty()) {
+    throw std::invalid_argument("chassis bridge library path is empty");
+  }
+  void* handle = open_dynamic_library(library_path);
+  try {
+    validate_chassis_bridge_abi_handle(handle);
+  } catch (...) {
+    unload_dynamic_library(handle);
+    throw;
+  }
+  unload_dynamic_library(handle);
+}
+
 std::int64_t now_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::system_clock::now().time_since_epoch())
@@ -568,6 +793,230 @@ ControlCommand ControlCommand::from_json(const Json& value) {
   return command;
 }
 
+void SessionControlProfile::validate() const {
+  require_finite_range(target_speed_kph, 0.0, kChassisControlMaxTargetSpeedKph, "target_speed_kph");
+  require_finite_range(
+      max_motor_torque_nm,
+      0.0,
+      kMaxFullScaleMotorTorqueNm,
+      "max_motor_torque_nm");
+  require_finite_range(
+      max_brake_pressure_bar,
+      0.0,
+      kMaxOrdinaryBrakePressureBar,
+      "max_brake_pressure_bar");
+  require_finite_range(
+      service_brake_pressure_bar,
+      0.0,
+      kMaxOrdinaryBrakePressureBar,
+      "service_brake_pressure_bar");
+  require_finite_range(
+      hard_brake_pressure_bar,
+      0.0,
+      kMaxOrdinaryBrakePressureBar,
+      "hard_brake_pressure_bar");
+  if (service_brake_pressure_bar > hard_brake_pressure_bar ||
+      hard_brake_pressure_bar > max_brake_pressure_bar) {
+    throw std::invalid_argument(
+        "brake pressure must satisfy service <= hard <= max");
+  }
+}
+
+Json SessionControlProfile::to_json() const {
+  validate();
+  return {
+      {"target_speed_kph", target_speed_kph},
+      {"max_motor_torque_nm", max_motor_torque_nm},
+      {"max_brake_pressure_bar", max_brake_pressure_bar},
+      {"service_brake_pressure_bar", service_brake_pressure_bar},
+      {"hard_brake_pressure_bar", hard_brake_pressure_bar},
+  };
+}
+
+SessionControlProfile SessionControlProfile::from_json(const Json& value) {
+  if (!value.is_object()) {
+    throw std::invalid_argument("session control profile must be a JSON object");
+  }
+  SessionControlProfile profile;
+  try {
+    profile.target_speed_kph = value.at("target_speed_kph").get<double>();
+    profile.max_motor_torque_nm = value.at("max_motor_torque_nm").get<double>();
+    profile.max_brake_pressure_bar =
+        value.at("max_brake_pressure_bar").get<double>();
+    profile.service_brake_pressure_bar =
+        value.at("service_brake_pressure_bar").get<double>();
+    profile.hard_brake_pressure_bar =
+        value.at("hard_brake_pressure_bar").get<double>();
+  } catch (const Json::exception& error) {
+    throw std::invalid_argument(
+        std::string("invalid session control profile: ") + error.what());
+  }
+  profile.validate();
+  return profile;
+}
+
+void SessionControlProfileRequest::validate() const {
+  ProtocolMetadata{
+      protocol_version, vehicle_id, driver_id, session_id, seq, sent_at_utc_ms}
+      .validate();
+  if (control_token.empty()) {
+    throw std::invalid_argument("control_token is required");
+  }
+  profile.validate();
+}
+
+Json SessionControlProfileRequest::to_json() const {
+  validate();
+  auto value = ProtocolMetadata{
+                   protocol_version,
+                   vehicle_id,
+                   driver_id,
+                   session_id,
+                   seq,
+                   sent_at_utc_ms}
+                   .to_json();
+  value["type"] = "session_control_profile";
+  value["control_token"] = control_token;
+  const auto profile_json = profile.to_json();
+  for (const auto& [key, field] : profile_json.items()) value[key] = field;
+  return value;
+}
+
+SessionControlProfileRequest SessionControlProfileRequest::from_json(
+    const Json& value) {
+  if (!value.is_object() ||
+      value.value("type", "") != "session_control_profile") {
+    throw std::invalid_argument(
+        "type must be session_control_profile");
+  }
+  SessionControlProfileRequest request;
+  try {
+    const auto metadata = ProtocolMetadata::from_json(value);
+    request.protocol_version = metadata.protocol_version;
+    request.vehicle_id = metadata.vehicle_id;
+    request.driver_id = metadata.driver_id;
+    request.session_id = metadata.session_id;
+    request.seq = metadata.seq;
+    request.sent_at_utc_ms = metadata.sent_at_utc_ms;
+    request.control_token = value.at("control_token").get<std::string>();
+    request.profile = SessionControlProfile::from_json(value);
+  } catch (const Json::exception& error) {
+    throw std::invalid_argument(
+        std::string("invalid session control profile request: ") + error.what());
+  }
+  request.validate();
+  return request;
+}
+
+void SessionControlProfileResult::validate() const {
+  ProtocolMetadata{
+      protocol_version, vehicle_id, driver_id, session_id, seq, sent_at_utc_ms}
+      .validate();
+  if (reason.empty()) throw std::invalid_argument("profile result reason is required");
+  if (effective_profile) effective_profile->validate();
+  if (accepted && !effective_profile) {
+    throw std::invalid_argument("accepted profile result requires an effective profile");
+  }
+}
+
+Json SessionControlProfileResult::to_json() const {
+  validate();
+  auto value = ProtocolMetadata{
+                   protocol_version,
+                   vehicle_id,
+                   driver_id,
+                   session_id,
+                   seq,
+                   sent_at_utc_ms}
+                   .to_json();
+  value["event"] = "session_control_profile_result";
+  value["last_request_seq"] = seq;
+  value["active"] = effective_profile.has_value();
+  value["accepted"] = accepted;
+  value["idempotent"] = idempotent;
+  value["reason"] = reason;
+  value["effective_profile"] = effective_profile
+      ? effective_profile->to_json()
+      : Json(nullptr);
+  return value;
+}
+
+SessionControlProfileResult SessionControlProfileResult::from_json(
+    const Json& value) {
+  if (!value.is_object() ||
+      value.value("event", "") != "session_control_profile_result") {
+    throw std::invalid_argument("event must be session_control_profile_result");
+  }
+  SessionControlProfileResult result;
+  std::uint64_t last_request_seq = 0;
+  bool active = false;
+  try {
+    const auto metadata = ProtocolMetadata::from_json(value);
+    result.protocol_version = metadata.protocol_version;
+    result.vehicle_id = metadata.vehicle_id;
+    result.driver_id = metadata.driver_id;
+    result.session_id = metadata.session_id;
+    result.seq = metadata.seq;
+    result.sent_at_utc_ms = metadata.sent_at_utc_ms;
+    last_request_seq = value.at("last_request_seq").get<std::uint64_t>();
+    active = value.at("active").get<bool>();
+    result.accepted = value.at("accepted").get<bool>();
+    result.idempotent = value.at("idempotent").get<bool>();
+    result.reason = value.at("reason").get<std::string>();
+    if (!value.at("effective_profile").is_null()) {
+      result.effective_profile =
+          SessionControlProfile::from_json(value.at("effective_profile"));
+    }
+  } catch (const Json::exception& error) {
+    throw std::invalid_argument(
+        std::string("invalid session control profile result: ") + error.what());
+  }
+  if (last_request_seq != result.seq) {
+    throw std::invalid_argument(
+        "session control profile result last_request_seq does not match seq");
+  }
+  if (active != result.effective_profile.has_value()) {
+    throw std::invalid_argument(
+        "session control profile result active flag does not match effective_profile");
+  }
+  result.validate();
+  return result;
+}
+
+double dynamic_adapter_target_speed_mps(
+    const ControlCommand& command,
+    double max_speed_mps) {
+  command.validate();
+  if (!std::isfinite(max_speed_mps) || max_speed_mps < 0.0) {
+    throw std::invalid_argument("max_speed_mps must be finite and non-negative");
+  }
+  const bool driving_gear = command.gear == "D" || command.gear == "R";
+  // This is only the local PID setpoint; it is never forwarded as a VCU
+  // vehicle-speed request. Analog throttle selects a proportional target
+  // speed, while the independent hard limit is passed in the V3 open config.
+  return driving_gear && command.brake == 0.0
+      ? std::clamp(command.throttle, 0.0, 1.0) * max_speed_mps
+      : 0.0;
+}
+
+double dynamic_adapter_target_acceleration(
+    const ControlCommand& command,
+    double traction_ceiling,
+    double session_max_brake_pressure_bar,
+    double vehicle_max_brake_pressure_bar) {
+  command.validate();
+  require_finite_range(traction_ceiling, 0.0, 1.0, "traction_ceiling");
+  // Treat braking as an independent, dominant request. A malformed or stale
+  // producer must never turn simultaneous throttle and brake into traction.
+  const double brake_ratio = vehicle_normalized_brake_request(
+      command.brake,
+      session_max_brake_pressure_bar,
+      vehicle_max_brake_pressure_bar);
+  return command.brake > 0.0
+      ? -brake_ratio
+      : (command.throttle > 0.0 ? traction_ceiling : 0.0);
+}
+
 void LatestControlCommandMailbox::publish(ControlCommand command) {
   command.validate();
   std::lock_guard lock(mutex_);
@@ -692,16 +1141,7 @@ SafetyStateMachine::SafetyStateMachine(
   if (degraded_timeout_ms_ <= 0 || control_timeout_ms_ <= degraded_timeout_ms_) {
     throw std::invalid_argument("control timeout must be greater than degraded timeout");
   }
-  if (profile_.empty()) {
-    throw std::invalid_argument("deceleration profile must not be empty");
-  }
-  std::sort(profile_.begin(), profile_.end(), [](const auto& left, const auto& right) {
-    return left.after_ms < right.after_ms;
-  });
-  for (const auto& stage : profile_) {
-    if (stage.after_ms < 0) throw std::invalid_argument("deceleration after_ms must be non-negative");
-    require_finite_range(stage.brake, 0.0, 1.0, "deceleration brake");
-  }
+  normalize_and_validate_deceleration_profile(profile_);
 }
 
 void SafetyStateMachine::mark_ready(std::int64_t /*now_ms*/) {
@@ -748,11 +1188,14 @@ ControlOutput SafetyStateMachine::current_output(std::int64_t timestamp_ms) cons
     case SafetyState::Degraded:
       return {gear, steering, 0.0, last_valid_command_ ? last_valid_command_->brake : 0.0, false};
     case SafetyState::TimeoutBrake:
-      return {gear, 0.0, 0.0, brake_for_timeout(timestamp_ms), false};
+      {
+        const double brake = brake_for_timeout(timestamp_ms);
+        return {gear, 0.0, 0.0, brake, false, brake >= 1.0};
+      }
     case SafetyState::Estop:
-      return {gear, 0.0, 0.0, 1.0, true};
+      return {gear, 0.0, 0.0, 1.0, true, true};
     case SafetyState::Fault:
-      return {gear, 0.0, 0.0, 1.0, false};
+      return {gear, 0.0, 0.0, 1.0, false, true};
     case SafetyState::Init:
     case SafetyState::Standby:
       break;
@@ -765,11 +1208,21 @@ bool SafetyStateMachine::reset_estop(
     std::string_view authorized_by,
     std::int64_t /*now_ms*/) {
   if (state_ != SafetyState::Estop || !local_confirmed || authorized_by.empty()) return false;
+  enter_standby();
+  return true;
+}
+
+bool SafetyStateMachine::reset_to_standby() {
+  if (state_ == SafetyState::Estop || state_ == SafetyState::Fault) return false;
+  enter_standby();
+  return true;
+}
+
+void SafetyStateMachine::enter_standby() {
   last_valid_command_.reset();
   last_valid_receive_ms_.reset();
   timeout_entered_ms_.reset();
   state_ = SafetyState::Standby;
-  return true;
 }
 
 void SafetyStateMachine::mark_fault() { state_ = SafetyState::Fault; }
@@ -836,7 +1289,14 @@ Json VehicleConfig::redacted_summary() const {
       {"max_speed_kph", field_safety.max_speed_kph},
       {"max_throttle", field_safety.max_throttle},
       {"full_scale_motor_torque_nm", field_safety.full_scale_motor_torque_nm},
-      {"max_brake", field_safety.max_brake},
+      {"speed_feedback_timeout_ms", field_safety.speed_feedback_timeout_ms},
+      {"speed_pid_kp", field_safety.speed_pid_kp},
+      {"speed_pid_ki", field_safety.speed_pid_ki},
+      {"speed_pid_kd", field_safety.speed_pid_kd},
+      {"speed_pid_derivative_filter_tau_ms", field_safety.speed_pid_derivative_filter_tau_ms},
+      {"speed_pid_max_dt_ms", field_safety.speed_pid_max_dt_ms},
+      {"hard_overspeed_margin_kph", field_safety.hard_overspeed_margin_kph},
+      {"max_brake_pressure_bar", field_safety.max_brake_pressure_bar},
       {"max_steering_angle_deg", field_safety.max_steering_angle_deg},
       {"require_time_sync", field_safety.require_time_sync},
       {"max_time_sync_uncertainty_ms", field_safety.max_time_sync_uncertainty_ms},
@@ -915,6 +1375,8 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
     }
     config.control.deceleration_profile.push_back(stage);
   }
+  normalize_and_validate_deceleration_profile(
+      config.control.deceleration_profile);
 
   const auto realtime = root["media"]["realtime_profiles"];
   if (!realtime || !realtime.IsMap()) throw std::runtime_error("media.realtime_profiles is required");
@@ -1035,8 +1497,29 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.field_safety.max_speed_kph = optional<double>(safety, "max_speed_kph", 40.0);
   config.field_safety.max_throttle = optional<double>(safety, "max_throttle", 1.0);
   config.field_safety.full_scale_motor_torque_nm =
-      optional<double>(safety, "full_scale_motor_torque_nm", 41.25);
-  config.field_safety.max_brake = optional<double>(safety, "max_brake", 1.0);
+      optional<double>(
+          safety,
+          "full_scale_motor_torque_nm",
+          kDefaultFullScaleMotorTorqueNm);
+  config.field_safety.speed_feedback_timeout_ms =
+      optional<int>(safety, "speed_feedback_timeout_ms", 200);
+  config.field_safety.speed_pid_kp = optional<double>(safety, "speed_pid_kp", 1.0);
+  config.field_safety.speed_pid_ki = optional<double>(safety, "speed_pid_ki", 0.2);
+  config.field_safety.speed_pid_kd = optional<double>(safety, "speed_pid_kd", 0.0);
+  config.field_safety.speed_pid_derivative_filter_tau_ms =
+      optional<double>(safety, "speed_pid_derivative_filter_tau_ms", 100.0);
+  config.field_safety.speed_pid_max_dt_ms =
+      optional<int>(safety, "speed_pid_max_dt_ms", 100);
+  config.field_safety.hard_overspeed_margin_kph =
+      optional<double>(safety, "hard_overspeed_margin_kph", 3.6);
+  if (safety && safety["max_brake"]) {
+    throw std::runtime_error(
+        "field_safety.max_brake used legacy normalized units; migrate explicitly to max_brake_pressure_bar");
+  }
+  config.field_safety.max_brake_pressure_bar = optional<double>(
+      safety,
+      "max_brake_pressure_bar",
+      kDefaultMaxBrakePressureBar);
   config.field_safety.max_steering_angle_deg =
       optional<double>(safety, "max_steering_angle_deg", 30.0);
   config.field_safety.require_can_feedback_before_control =
@@ -1049,19 +1532,25 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.field_safety.time_sync_samples = optional<int>(safety, "time_sync_samples", 7);
   if (!std::isfinite(config.field_safety.full_scale_motor_torque_nm) ||
       config.field_safety.full_scale_motor_torque_nm < 0.0 ||
-      config.field_safety.full_scale_motor_torque_nm > 165.0) {
+      config.field_safety.full_scale_motor_torque_nm >
+          kMaxFullScaleMotorTorqueNm) {
     throw std::runtime_error(
-        "field_safety.full_scale_motor_torque_nm must be finite and in [0, 165] Nm; "
-        "higher values require a validated chassis torque mapping");
+        "field_safety.full_scale_motor_torque_nm must be finite and in [0, 640.0] Nm");
   }
   if (!std::isfinite(config.field_safety.max_speed_kph) ||
       config.field_safety.max_speed_kph < 0.0 ||
-      !std::isfinite(config.field_safety.max_throttle) ||
+      config.field_safety.max_speed_kph > kChassisControlMaxTargetSpeedKph) {
+    throw std::runtime_error(
+        "field_safety.max_speed_kph must be finite and in [0, 72] km/h; "
+        "the current ChassisControl target-speed input is limited to 20 m/s");
+  }
+  if (!std::isfinite(config.field_safety.max_throttle) ||
       config.field_safety.max_throttle < 0.0 ||
       config.field_safety.max_throttle > 1.0 ||
-      !std::isfinite(config.field_safety.max_brake) ||
-      config.field_safety.max_brake < 0.0 ||
-      config.field_safety.max_brake > 1.0 ||
+      !std::isfinite(config.field_safety.max_brake_pressure_bar) ||
+      config.field_safety.max_brake_pressure_bar < 0.0 ||
+      config.field_safety.max_brake_pressure_bar >
+          kMaxOrdinaryBrakePressureBar ||
       !std::isfinite(config.field_safety.max_steering_angle_deg) ||
       config.field_safety.max_steering_angle_deg < 0.0 ||
       config.field_safety.max_steering_angle_deg > 30.0 ||
@@ -1069,6 +1558,31 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
       config.field_safety.time_sync_interval_ms <= 0 ||
       config.field_safety.time_sync_samples < 3 || config.field_safety.time_sync_samples > 15) {
     throw std::runtime_error("field_safety limits or time sync settings are invalid");
+  }
+  if (config.field_safety.speed_feedback_timeout_ms < kMinSpeedFeedbackTimeoutMs ||
+      config.field_safety.speed_feedback_timeout_ms > kMaxSpeedFeedbackTimeoutMs ||
+      config.field_safety.speed_feedback_timeout_ms > config.control.control_timeout_ms ||
+      !std::isfinite(config.field_safety.speed_pid_kp) ||
+      config.field_safety.speed_pid_kp <= 0.0 ||
+      config.field_safety.speed_pid_kp > kMaxSpeedPidGain ||
+      !std::isfinite(config.field_safety.speed_pid_ki) ||
+      config.field_safety.speed_pid_ki < 0.0 ||
+      config.field_safety.speed_pid_ki > kMaxSpeedPidGain ||
+      !std::isfinite(config.field_safety.speed_pid_kd) ||
+      config.field_safety.speed_pid_kd < 0.0 ||
+      config.field_safety.speed_pid_kd > kMaxSpeedPidGain ||
+      !std::isfinite(config.field_safety.speed_pid_derivative_filter_tau_ms) ||
+      config.field_safety.speed_pid_derivative_filter_tau_ms < 0.0 ||
+      config.field_safety.speed_pid_derivative_filter_tau_ms >
+          kMaxSpeedPidDerivativeFilterTauMs ||
+      config.field_safety.speed_pid_max_dt_ms < kMinSpeedPidMaxDtMs ||
+      config.field_safety.speed_pid_max_dt_ms > kMaxSpeedPidMaxDtMs ||
+      !std::isfinite(config.field_safety.hard_overspeed_margin_kph) ||
+      config.field_safety.hard_overspeed_margin_kph <= 0.0 ||
+      config.field_safety.hard_overspeed_margin_kph >
+          kMaxHardOverspeedMarginKph) {
+    throw std::runtime_error(
+        "field_safety local speed PID, feedback timeout, max dt, or hard overspeed margin is invalid");
   }
 
   const auto recording = root["recording"];
@@ -1107,15 +1621,18 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   }
   if (config.vehicle_adapter.type != "mock" &&
       (!safety || !safety["max_speed_kph"] || !safety["max_throttle"] ||
-       !safety["full_scale_motor_torque_nm"] || !safety["max_brake"] ||
-       !safety["max_steering_angle_deg"])) {
+       !safety["full_scale_motor_torque_nm"] ||
+       !safety["max_brake_pressure_bar"] ||
+       !safety["max_steering_angle_deg"] ||
+       !safety["speed_feedback_timeout_ms"] || !safety["speed_pid_kp"] ||
+       !safety["speed_pid_ki"] || !safety["speed_pid_kd"] ||
+       !safety["speed_pid_derivative_filter_tau_ms"] ||
+       !safety["speed_pid_max_dt_ms"] ||
+       !safety["hard_overspeed_margin_kph"])) {
     throw std::runtime_error(
         "non-mock vehicle adapter requires explicit field_safety max_speed_kph, "
-        "max_throttle, full_scale_motor_torque_nm, max_brake, and "
-        "max_steering_angle_deg");
-  }
-  if (config.vehicle_adapter.type != "mock" && config.field_safety.max_speed_kph <= 0.0) {
-    throw std::runtime_error("non-mock vehicle adapter requires field_safety.max_speed_kph > 0");
+        "max_throttle, full_scale_motor_torque_nm, max_brake_pressure_bar, steering limits, "
+        "speed PID gains/timing, feedback timeout, and hard overspeed margin");
   }
   if (config.vehicle_adapter.type != "mock" &&
       config.hardware.can_tx_queue_length < 16) {
@@ -1196,6 +1713,31 @@ Json VcuHandshakeStatus::to_json() const {
 void MockVehicleAdapter::open() { opened_ = true; }
 void MockVehicleAdapter::close() { opened_ = false; }
 
+void MockVehicleAdapter::set_session_control_limits(
+    double max_motor_torque_nm,
+    double max_brake_pressure_bar) {
+  require_finite_range(
+      max_motor_torque_nm,
+      0.0,
+      kMaxFullScaleMotorTorqueNm,
+      "max_motor_torque_nm");
+  require_finite_range(
+      max_brake_pressure_bar,
+      0.0,
+      kMaxOrdinaryBrakePressureBar,
+      "max_brake_pressure_bar");
+  session_motor_torque_limit_nm_ = max_motor_torque_nm;
+  session_brake_pressure_limit_bar_ = max_brake_pressure_bar;
+}
+
+double MockVehicleAdapter::session_motor_torque_limit_nm() const {
+  return session_motor_torque_limit_nm_;
+}
+
+double MockVehicleAdapter::session_brake_pressure_limit_bar() const {
+  return session_brake_pressure_limit_bar_;
+}
+
 void MockVehicleAdapter::apply_control(const ControlCommand& command) {
   if (!opened_) throw std::runtime_error("mock vehicle adapter is not open");
   latest_output_ = ControlOutput{command.gear, command.steering, command.throttle, command.brake, command.estop};
@@ -1254,17 +1796,61 @@ DynamicLibraryVehicleAdapter::DynamicLibraryVehicleAdapter(
     int can_bitrate,
     int can_tx_queue_length,
     double max_speed_mps,
-    double full_scale_motor_torque_nm)
+    double full_scale_motor_torque_nm,
+    double max_ordinary_brake_pressure_bar,
+    int control_timeout_ms,
+    int speed_feedback_timeout_ms,
+    double speed_pid_kp,
+    double speed_pid_ki,
+    double speed_pid_kd,
+    double speed_pid_derivative_filter_tau_ms,
+    int speed_pid_max_dt_ms,
+    double hard_overspeed_margin_mps)
     : library_path_(std::move(library_path)),
       can_interface_(std::move(can_interface)),
       can_bitrate_(can_bitrate),
       can_tx_queue_length_(can_tx_queue_length),
       max_speed_mps_(max_speed_mps),
-      full_scale_motor_torque_nm_(full_scale_motor_torque_nm) {
+      full_scale_motor_torque_nm_(full_scale_motor_torque_nm),
+      max_ordinary_brake_pressure_bar_(max_ordinary_brake_pressure_bar),
+      session_motor_torque_limit_nm_(0.0),
+      session_brake_pressure_limit_bar_(0.0),
+      control_timeout_ms_(control_timeout_ms),
+      speed_feedback_timeout_ms_(speed_feedback_timeout_ms),
+      speed_pid_kp_(speed_pid_kp),
+      speed_pid_ki_(speed_pid_ki),
+      speed_pid_kd_(speed_pid_kd),
+      speed_pid_derivative_filter_tau_ms_(speed_pid_derivative_filter_tau_ms),
+      speed_pid_max_dt_ms_(speed_pid_max_dt_ms),
+      hard_overspeed_margin_mps_(hard_overspeed_margin_mps) {
   if (library_path_.empty() || can_interface_.empty() || can_bitrate_ <= 0 ||
-      can_tx_queue_length_ < 16 || max_speed_mps_ <= 0.0 ||
+      can_tx_queue_length_ < 16 || !std::isfinite(max_speed_mps_) ||
+      max_speed_mps_ < 0.0 ||
+      max_speed_mps_ > kChassisControlMaxTargetSpeedMps ||
       !std::isfinite(full_scale_motor_torque_nm_) ||
-      full_scale_motor_torque_nm_ < 0.0 || full_scale_motor_torque_nm_ > 165.0) {
+      full_scale_motor_torque_nm_ < 0.0 ||
+      full_scale_motor_torque_nm_ > kMaxFullScaleMotorTorqueNm ||
+      !std::isfinite(max_ordinary_brake_pressure_bar_) ||
+      max_ordinary_brake_pressure_bar_ < 0.0 ||
+      max_ordinary_brake_pressure_bar_ > kMaxOrdinaryBrakePressureBar ||
+      control_timeout_ms_ < 20 || control_timeout_ms_ > 60000 ||
+      speed_feedback_timeout_ms_ < kMinSpeedFeedbackTimeoutMs ||
+      speed_feedback_timeout_ms_ > kMaxSpeedFeedbackTimeoutMs ||
+      speed_feedback_timeout_ms_ > control_timeout_ms_ ||
+      !std::isfinite(speed_pid_kp_) || speed_pid_kp_ <= 0.0 ||
+      speed_pid_kp_ > kMaxSpeedPidGain ||
+      !std::isfinite(speed_pid_ki_) || speed_pid_ki_ < 0.0 ||
+      speed_pid_ki_ > kMaxSpeedPidGain ||
+      !std::isfinite(speed_pid_kd_) || speed_pid_kd_ < 0.0 ||
+      speed_pid_kd_ > kMaxSpeedPidGain ||
+      !std::isfinite(speed_pid_derivative_filter_tau_ms_) ||
+      speed_pid_derivative_filter_tau_ms_ < 0.0 ||
+      speed_pid_derivative_filter_tau_ms_ > kMaxSpeedPidDerivativeFilterTauMs ||
+      speed_pid_max_dt_ms_ < kMinSpeedPidMaxDtMs ||
+      speed_pid_max_dt_ms_ > kMaxSpeedPidMaxDtMs ||
+      !std::isfinite(hard_overspeed_margin_mps_) ||
+      hard_overspeed_margin_mps_ <= 0.0 ||
+      hard_overspeed_margin_mps_ > kMaxHardOverspeedMarginKph / 3.6) {
     throw std::invalid_argument("dynamic adapter configuration is incomplete");
   }
 }
@@ -1279,22 +1865,13 @@ DynamicLibraryVehicleAdapter::~DynamicLibraryVehicleAdapter() {
 
 void DynamicLibraryVehicleAdapter::ensure_loaded() {
   if (handle_ != nullptr) return;
-#if defined(_WIN32)
-  handle_ = static_cast<void*>(LoadLibraryW(library_path_.wstring().c_str()));
-  if (handle_ == nullptr) {
-    last_error_ = "failed to load dynamic library (Windows error " + std::to_string(GetLastError()) + ")";
-    throw std::runtime_error(last_error_);
-  }
-#else
-  handle_ = dlopen(library_path_.c_str(), RTLD_NOW | RTLD_LOCAL);
-  if (handle_ == nullptr) {
-    last_error_ = std::string("failed to load dynamic library: ") + dlerror();
-    throw std::runtime_error(last_error_);
-  }
-#endif
+  handle_ = open_dynamic_library(library_path_);
   try {
-    open_v1_fn_ = load_symbol<OpenV1Fn>(handle_, "mine_teleop_chassis_open_v1");
+    validate_chassis_bridge_abi_handle(handle_);
+    open_v3_fn_ = load_symbol<OpenV3Fn>(handle_, "mine_teleop_chassis_open_v3");
     apply_fn_ = load_symbol<ApplyFn>(handle_, "mine_teleop_chassis_apply_state");
+    apply_v2_fn_ = load_symbol<ApplyV2Fn>(
+        handle_, "mine_teleop_chassis_apply_state_v2");
     stop_fn_ = load_symbol<StopFn>(handle_, "mine_teleop_chassis_emergency_stop");
     request_handshake_fn_ = load_symbol<HandshakeFn>(
         handle_,
@@ -1333,9 +1910,21 @@ void DynamicLibraryVehicleAdapter::open() {
 #if defined(__linux__)
     prepare_socketcan(can_interface_, can_bitrate_, can_tx_queue_length_);
 #endif
-    const BridgeOpenConfigV1 config{
-        sizeof(BridgeOpenConfigV1), can_interface_.c_str(), full_scale_motor_torque_nm_};
-    check_result(open_v1_fn_(&config), "mine_teleop_chassis_open_v1");
+    const BridgeOpenConfigV3 config{
+        sizeof(BridgeOpenConfigV3),
+        can_interface_.c_str(),
+        full_scale_motor_torque_nm_,
+        max_speed_mps_,
+        control_timeout_ms_,
+        speed_feedback_timeout_ms_,
+        speed_pid_kp_,
+        speed_pid_ki_,
+        speed_pid_kd_,
+        speed_pid_derivative_filter_tau_ms_,
+        speed_pid_max_dt_ms_,
+        hard_overspeed_margin_mps_,
+        max_ordinary_brake_pressure_bar_};
+    check_result(open_v3_fn_(&config), "mine_teleop_chassis_open_v3");
     opened_ = true;
   } catch (const std::exception& error) {
     last_error_ = error.what();
@@ -1350,20 +1939,71 @@ void DynamicLibraryVehicleAdapter::close() {
   feedback_ready_ = false;
 }
 
+void DynamicLibraryVehicleAdapter::set_session_control_limits(
+    double max_motor_torque_nm,
+    double max_brake_pressure_bar) {
+  require_finite_range(
+      max_motor_torque_nm,
+      0.0,
+      full_scale_motor_torque_nm_,
+      "max_motor_torque_nm");
+  require_finite_range(
+      max_brake_pressure_bar,
+      0.0,
+      max_ordinary_brake_pressure_bar_,
+      "max_brake_pressure_bar");
+  session_motor_torque_limit_nm_ = max_motor_torque_nm;
+  session_brake_pressure_limit_bar_ = max_brake_pressure_bar;
+}
+
+double DynamicLibraryVehicleAdapter::session_motor_torque_limit_nm() const {
+  return session_motor_torque_limit_nm_;
+}
+
+double DynamicLibraryVehicleAdapter::session_brake_pressure_limit_bar() const {
+  return session_brake_pressure_limit_bar_;
+}
+
 void DynamicLibraryVehicleAdapter::apply_control(const ControlCommand& command) {
   if (!opened_) throw std::runtime_error("dynamic vehicle adapter is not open");
-  const double velocity = command.throttle * (1.0 - command.brake) * max_speed_mps_;
-  const double acceleration = command.throttle - command.brake;
+  const double velocity = dynamic_adapter_target_speed_mps(command, max_speed_mps_);
+  const double traction_ceiling = full_scale_motor_torque_nm_ > 0.0
+      ? session_motor_torque_limit_nm_ / full_scale_motor_torque_nm_
+      : 0.0;
+  const double acceleration = dynamic_adapter_target_acceleration(
+      command,
+      traction_ceiling,
+      session_brake_pressure_limit_bar_,
+      max_ordinary_brake_pressure_bar_);
   const double steering[4]{command.steering, command.steering, command.steering, command.steering};
-  check_result(
-      apply_fn_(gear_to_bridge_value(command.gear), velocity, acceleration, steering, 4),
-      "mine_teleop_chassis_apply_state");
+  BridgeApplyResultV1 apply_result{};
+  const int result = apply_v2_fn_(
+      gear_to_bridge_value(command.gear),
+      velocity,
+      acceleration,
+      steering,
+      4,
+      &apply_result);
+  if (apply_result.struct_size != sizeof(BridgeApplyResultV1) ||
+      apply_result.result_code != result || apply_result.reserved != 0U ||
+      (result == 0 && apply_result.issue_id != kBridgeApplyIssueNone)) {
+    last_error_ = "mine_teleop_chassis_apply_state_v2 returned an invalid result structure";
+    throw std::runtime_error(last_error_);
+  }
+  if (result != 0) {
+    last_error_ = "mine_teleop_chassis_apply_state_v2 rejected control with code " +
+        std::to_string(result);
+    throw VehicleAdapterControlRejected(
+        bridge_apply_issue_code(apply_result.issue_id),
+        result);
+  }
+  last_error_.clear();
   ++applied_command_count_;
 }
 
 void DynamicLibraryVehicleAdapter::apply_safe_stop(const ControlOutput& output) {
   if (!opened_) throw std::runtime_error("dynamic vehicle adapter is not open");
-  if (output.estop || output.brake >= 1.0) {
+  if (output.estop || output.full_emergency_brake) {
     check_result(stop_fn_(), "mine_teleop_chassis_emergency_stop");
   } else {
     const double steering[4]{output.steering, output.steering, output.steering, output.steering};
@@ -1514,7 +2154,16 @@ std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& conf
         config.hardware.can_bitrate,
         config.hardware.can_tx_queue_length,
         config.field_safety.max_speed_kph / 3.6,
-        config.field_safety.full_scale_motor_torque_nm);
+        config.field_safety.full_scale_motor_torque_nm,
+        config.field_safety.max_brake_pressure_bar,
+        config.control.control_timeout_ms,
+        config.field_safety.speed_feedback_timeout_ms,
+        config.field_safety.speed_pid_kp,
+        config.field_safety.speed_pid_ki,
+        config.field_safety.speed_pid_kd,
+        config.field_safety.speed_pid_derivative_filter_tau_ms,
+        config.field_safety.speed_pid_max_dt_ms,
+        config.field_safety.hard_overspeed_margin_kph / 3.6);
   }
   throw std::runtime_error("unsupported vehicle adapter type: " + config.vehicle_adapter.type);
 }
@@ -1529,6 +2178,8 @@ VehicleControlService::VehicleControlService(
     : vehicle_id_(config.vehicle_id),
       driver_id_(std::move(driver_id)),
       session_id_(std::move(session_id)),
+      control_token_(std::move(control_token)),
+      commissioning_mode_(config.field_safety.commissioning_mode),
       receiver_(
           config.vehicle_id,
           driver_id_,
@@ -1536,7 +2187,7 @@ VehicleControlService::VehicleControlService(
           config.control.max_command_gap_ms,
           kProtocolVersion,
           true,
-          std::move(control_token)),
+          control_token_),
       safety_(
           config.control.degraded_timeout_ms,
           config.control.control_timeout_ms,
@@ -1546,7 +2197,7 @@ VehicleControlService::VehicleControlService(
       max_speed_kph_(config.field_safety.max_speed_kph),
       max_throttle_(config.field_safety.max_throttle),
       full_scale_motor_torque_nm_(config.field_safety.full_scale_motor_torque_nm),
-      max_brake_(config.field_safety.max_brake),
+      max_brake_pressure_bar_(config.field_safety.max_brake_pressure_bar),
       max_steering_angle_deg_(config.field_safety.max_steering_angle_deg),
       telemetry_interval_ms_(telemetry_interval_ms) {
   if (!adapter_) throw std::invalid_argument("vehicle adapter is required");
@@ -1563,8 +2214,264 @@ VehicleControlService::~VehicleControlService() {
 void VehicleControlService::start(std::int64_t timestamp_ms) {
   if (started_) return;
   adapter_->open();
+  try {
+    adapter_->set_session_control_limits(0.0, 0.0);
+  } catch (...) {
+    adapter_->close();
+    throw;
+  }
   safety_.mark_ready(timestamp_ms);
   started_ = true;
+}
+
+SessionControlProfileResult VehicleControlService::profile_result(
+    const SessionControlProfileRequest& request,
+    std::int64_t timestamp_ms,
+    bool accepted,
+    bool idempotent,
+    std::string reason) const {
+  SessionControlProfileResult result;
+  result.vehicle_id = vehicle_id_;
+  result.driver_id = driver_id_;
+  result.session_id = session_id_;
+  result.seq = request.seq == 0 ? 1 : request.seq;
+  result.sent_at_utc_ms = std::max<std::int64_t>(timestamp_ms, 0);
+  result.accepted = accepted;
+  result.idempotent = idempotent;
+  result.reason = std::move(reason);
+  result.effective_profile = active_session_profile_;
+  return result;
+}
+
+SessionControlProfileResult VehicleControlService::receive_session_profile(
+    const SessionControlProfileRequest& request,
+    std::int64_t timestamp_ms) {
+  if (!started_) throw std::runtime_error("vehicle control service is not started");
+  if (timestamp_ms < 0) {
+    throw std::invalid_argument("receive_time_ms must be non-negative");
+  }
+  try {
+    ProtocolMetadata{
+        request.protocol_version,
+        request.vehicle_id,
+        request.driver_id,
+        request.session_id,
+        request.seq,
+        request.sent_at_utc_ms}
+        .validate();
+    if (request.control_token.empty()) {
+      throw std::invalid_argument("control_token is required");
+    }
+  } catch (const std::exception& error) {
+    return profile_result(
+        request,
+        timestamp_ms,
+        false,
+        false,
+        std::string("invalid_profile:") + error.what());
+  }
+  if (request.vehicle_id != vehicle_id_) {
+    return profile_result(request, timestamp_ms, false, false, "wrong_vehicle");
+  }
+  if (request.driver_id != driver_id_) {
+    return profile_result(request, timestamp_ms, false, false, "wrong_driver");
+  }
+  if (request.session_id != session_id_) {
+    return profile_result(request, timestamp_ms, false, false, "wrong_session");
+  }
+  if (request.control_token != control_token_) {
+    return profile_result(
+        request,
+        timestamp_ms,
+        false,
+        false,
+        "control_token_invalid");
+  }
+  if (last_session_profile_request_) {
+    if (request.seq < last_session_profile_request_->seq) {
+      return profile_result(request, timestamp_ms, false, false, "old_seq");
+    }
+    if (request.seq == last_session_profile_request_->seq) {
+      const auto& previous = *last_session_profile_request_;
+      const bool is_identical_request =
+          request.protocol_version == previous.protocol_version &&
+          request.vehicle_id == previous.vehicle_id &&
+          request.driver_id == previous.driver_id &&
+          request.session_id == previous.session_id &&
+          request.seq == previous.seq &&
+          request.control_token == previous.control_token &&
+          request.profile == previous.profile;
+      if (!is_identical_request) {
+        return profile_result(
+            request,
+            timestamp_ms,
+            false,
+            false,
+            "profile_seq_conflict");
+      }
+      if (!active_session_profile_ && last_session_profile_result_ &&
+          last_session_profile_result_->accepted) {
+        return profile_result(
+            request,
+            timestamp_ms,
+            false,
+            true,
+            "session_profile_cleared");
+      }
+      auto replay = *last_session_profile_result_;
+      replay.sent_at_utc_ms = timestamp_ms;
+      replay.idempotent = true;
+      replay.effective_profile = active_session_profile_;
+      last_session_profile_result_ = replay;
+      return replay;
+    }
+  }
+  try {
+    request.profile.validate();
+  } catch (const std::exception& error) {
+    return profile_result(
+        request,
+        timestamp_ms,
+        false,
+        false,
+        std::string("invalid_profile:") + error.what());
+  }
+  const auto timestamp_delta_ms = timestamp_ms - request.sent_at_utc_ms;
+  if (timestamp_delta_ms > kSessionControlProfileMaxAgeMs) {
+    return profile_result(
+        request,
+        timestamp_ms,
+        false,
+        false,
+        "profile_age_exceeded");
+  }
+  if (timestamp_delta_ms < -kSessionControlProfileMaxAgeMs) {
+    return profile_result(
+        request,
+        timestamp_ms,
+        false,
+        false,
+        "profile_timestamp_in_future");
+  }
+
+  const auto cache_result = [&](SessionControlProfileResult result) {
+    last_session_profile_request_ = request;
+    last_session_profile_result_ = result;
+    return result;
+  };
+  const double target_speed_ceiling_kph = max_speed_kph_ * max_throttle_;
+  if (request.profile.target_speed_kph > target_speed_ceiling_kph + 1e-9) {
+    return cache_result(profile_result(
+        request,
+        timestamp_ms,
+        false,
+        false,
+        "target_speed_exceeds_vehicle_limit"));
+  }
+  if (request.profile.max_motor_torque_nm >
+      full_scale_motor_torque_nm_ + 1e-9) {
+    return cache_result(profile_result(
+        request,
+        timestamp_ms,
+        false,
+        false,
+        "motor_torque_exceeds_vehicle_limit"));
+  }
+  if (request.profile.max_brake_pressure_bar >
+      max_brake_pressure_bar_ + 1e-9) {
+    return cache_result(profile_result(
+        request,
+        timestamp_ms,
+        false,
+        false,
+        "brake_pressure_exceeds_vehicle_limit"));
+  }
+
+  const double current_torque_limit = active_session_profile_
+      ? active_session_profile_->max_motor_torque_nm
+      : 0.0;
+  const double current_target_speed = active_session_profile_
+      ? active_session_profile_->target_speed_kph
+      : 0.0;
+  const bool torque_increase =
+      request.profile.max_motor_torque_nm > current_torque_limit + 1e-9;
+  const bool target_speed_increase =
+      request.profile.target_speed_kph > current_target_speed + 1e-9;
+  const bool torque_decrease =
+      request.profile.max_motor_torque_nm + 1e-9 < current_torque_limit;
+  const bool target_speed_decrease =
+      request.profile.target_speed_kph + 1e-9 < current_target_speed;
+  const SessionControlProfile empty_profile{};
+  const auto& current_profile = active_session_profile_
+      ? *active_session_profile_
+      : empty_profile;
+  const bool brake_parameters_changed =
+      request.profile.max_brake_pressure_bar !=
+          current_profile.max_brake_pressure_bar ||
+      request.profile.service_brake_pressure_bar !=
+          current_profile.service_brake_pressure_bar ||
+      request.profile.hard_brake_pressure_bar !=
+          current_profile.hard_brake_pressure_bar;
+  const auto adapter_status = adapter_->status();
+  const bool mock_bench_bypass =
+      commissioning_mode_ == "bench" && adapter_status.adapter_type == "mock";
+  if ((target_speed_increase || torque_increase || brake_parameters_changed) &&
+      !mock_bench_bypass) {
+    bool parking_ready = false;
+    try {
+      parking_ready = adapter_->vcu_handshake_status().parking_ready;
+    } catch (...) {
+      parking_ready = false;
+    }
+    if (!parking_ready) {
+      return cache_result(profile_result(
+          request,
+          timestamp_ms,
+          false,
+          false,
+          "parking_ready_required_for_profile_increase"));
+    }
+  }
+
+  try {
+    adapter_->set_session_control_limits(
+        request.profile.max_motor_torque_nm,
+        request.profile.max_brake_pressure_bar);
+    if ((target_speed_decrease || torque_decrease) &&
+        last_effective_command_ &&
+        safety_.state() == SafetyState::ControlActive) {
+      auto reapplied = *last_effective_command_;
+      const double profile_throttle_limit = max_speed_kph_ > 0.0
+          ? request.profile.target_speed_kph / max_speed_kph_
+          : 0.0;
+      reapplied.throttle = std::min(
+          reapplied.throttle,
+          std::min(max_throttle_, profile_throttle_limit));
+      adapter_->apply_control(reapplied);
+      last_effective_command_ = std::move(reapplied);
+    }
+  } catch (...) {
+    try {
+      adapter_->apply_safe_stop(
+          ControlOutput{"N", 0.0, 0.0, 1.0, true});
+    } catch (...) {
+    }
+    clear_session_profile();
+    return cache_result(profile_result(
+        request,
+        timestamp_ms,
+        false,
+        false,
+        "adapter_session_profile_apply_failed"));
+  }
+
+  active_session_profile_ = request.profile;
+  return cache_result(profile_result(
+      request,
+      timestamp_ms,
+      true,
+      false,
+      "accepted"));
 }
 
 ReceiveResult VehicleControlService::receive_command(const ControlCommand& command, std::int64_t timestamp_ms) {
@@ -1572,42 +2479,106 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
   auto result = receiver_.accept(command, timestamp_ms);
   if (!result.accepted || !result.command) return result;
   auto& effective = *result.command;
-  const auto limited_throttle = std::min(effective.throttle, max_throttle_);
-  const auto limited_brake = std::min(effective.brake, max_brake_);
+  if (!effective.estop && !active_session_profile_) {
+    if (!adapter_safe_stop_active_) {
+      adapter_->apply_safe_stop(
+          ControlOutput{"N", 0.0, 0.0, 1.0, false, true});
+    }
+    return {false, "session_control_profile_required", std::nullopt, {}};
+  }
+  const auto vehicle_limited_throttle =
+      std::min(effective.throttle, max_throttle_);
+  const double session_throttle_limit = active_session_profile_
+      ? (max_speed_kph_ > 0.0
+             ? active_session_profile_->target_speed_kph / max_speed_kph_
+             : 0.0)
+      : max_throttle_;
+  const auto limited_throttle = std::min(
+      vehicle_limited_throttle,
+      session_throttle_limit);
   const auto steering_limit = max_steering_angle_deg_ / 30.0;
   const auto limited_steering =
       std::clamp(effective.steering, -steering_limit, steering_limit);
-  if (limited_throttle != effective.throttle) {
+  if (vehicle_limited_throttle != effective.throttle) {
     result.warnings.emplace_back("vehicle_max_throttle_applied");
-    effective.throttle = limited_throttle;
   }
-  if (!effective.estop && limited_brake != effective.brake) {
-    result.warnings.emplace_back("vehicle_max_brake_applied");
-    effective.brake = limited_brake;
+  if (limited_throttle != vehicle_limited_throttle) {
+    result.warnings.emplace_back("session_target_speed_applied");
+  }
+  if (limited_throttle != effective.throttle) {
+    effective.throttle = limited_throttle;
   }
   if (limited_steering != effective.steering) {
     result.warnings.emplace_back("vehicle_max_steering_applied");
     effective.steering = limited_steering;
   }
+  bool feedback_poll_failed = false;
   if (!result.command->estop) {
     try {
       adapter_->poll_feedback();
     } catch (const std::exception&) {
-      if (require_feedback_before_control_) {
-        safety_.mark_fault();
-        adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
-        return {false, "can_feedback_poll_failed", std::nullopt, result.warnings};
-      }
+      feedback_poll_failed = true;
+    }
+  }
+  const bool adapter_safety_observed = refresh_adapter_safe_stop_state();
+  if (!result.command->estop && adapter_safe_stop_active_) {
+    return {false, "adapter_safe_stop_active", std::nullopt, result.warnings};
+  }
+  if (!result.command->estop) {
+    if (!adapter_safety_observed) {
+      safety_.mark_fault();
+      adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+      clear_session_profile();
+      return {false, "adapter_safety_status_unavailable", std::nullopt, result.warnings};
+    }
+    if (feedback_poll_failed && require_feedback_before_control_) {
+      safety_.mark_fault();
+      adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+      clear_session_profile();
+      return {false, "can_feedback_poll_failed", std::nullopt, result.warnings};
     }
     if (require_feedback_before_control_ && !adapter_->feedback_ready()) {
-      adapter_->apply_safe_stop(ControlOutput{"N", 0.0, 0.0, 1.0, false});
+      adapter_->apply_safe_stop(
+          ControlOutput{"N", 0.0, 0.0, 1.0, false, true});
+      clear_session_profile();
       return {false, "can_feedback_missing", std::nullopt, result.warnings};
     }
   }
-  safety_.on_valid_command(*result.command, timestamp_ms);
-  if (safety_.state() == SafetyState::ControlActive) {
-    adapter_->apply_control(*result.command);
-  } else {
+  auto safety_command = *result.command;
+  if (!safety_command.estop && active_session_profile_) {
+    safety_command.brake = vehicle_normalized_brake_request(
+        safety_command.brake,
+        active_session_profile_->max_brake_pressure_bar,
+        max_brake_pressure_bar_);
+  }
+  if (!safety_command.estop &&
+      safety_.state() != SafetyState::Estop &&
+      safety_.state() != SafetyState::Fault) {
+    try {
+      adapter_->apply_control(*result.command);
+    } catch (const VehicleAdapterControlRejected& error) {
+      result.accepted = false;
+      result.reason = "adapter_control_rejected";
+      result.command.reset();
+      result.issue_code = error.issue_code();
+      return result;
+    }
+    safety_.on_valid_command(safety_command, timestamp_ms);
+    last_effective_command_ = *result.command;
+    return result;
+  }
+
+  // ESTOP is a safety latch, not an ordinary actuator transaction: preserve
+  // it even when the adapter cannot apply the physical stop. Ordinary commands
+  // received while ESTOP/Fault is already latched must not reach apply_control.
+  safety_.on_valid_command(safety_command, timestamp_ms);
+  if (!adapter_safe_stop_active_ ||
+      safety_.state() == SafetyState::Estop ||
+      safety_.state() == SafetyState::Fault) {
+    if (safety_.state() == SafetyState::Estop ||
+        safety_.state() == SafetyState::Fault) {
+      clear_session_profile();
+    }
     adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
   }
   return result;
@@ -1615,32 +2586,65 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
 
 bool VehicleControlService::request_vcu_handshake() {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
-  return adapter_->request_vcu_handshake();
+  if (!active_session_profile_) return false;
+  if (safety_.state() == SafetyState::Estop ||
+      safety_.state() == SafetyState::Fault) {
+    return false;
+  }
+  if (!adapter_->request_vcu_handshake()) return false;
+  if (!safety_.reset_to_standby()) return false;
+  adapter_safe_stop_active_ = false;
+  return true;
 }
 
 bool VehicleControlService::disconnect_vcu_handshake() {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
-  return adapter_->disconnect_vcu_handshake();
+  const bool disconnected = adapter_->disconnect_vcu_handshake();
+  if (disconnected) {
+    adapter_safe_stop_active_ = true;
+    clear_session_profile();
+  }
+  return disconnected;
 }
 
 void VehicleControlService::tick(std::int64_t timestamp_ms) {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
+  bool feedback_poll_failed = false;
   try {
     adapter_->poll_feedback();
   } catch (const std::exception&) {
-    if (require_feedback_before_control_ && safety_.state() == SafetyState::ControlActive) {
-      safety_.mark_fault();
-    }
+    feedback_poll_failed = true;
+  }
+  const bool adapter_safety_observed = refresh_adapter_safe_stop_state();
+  if ((!adapter_safety_observed || feedback_poll_failed) &&
+      !adapter_safe_stop_active_ &&
+      require_feedback_before_control_ &&
+      safety_.state() != SafetyState::Estop &&
+      safety_.state() != SafetyState::Fault) {
+    safety_.mark_fault();
   }
   safety_.tick(timestamp_ms);
   if (safety_.state() == SafetyState::Degraded || safety_.state() == SafetyState::TimeoutBrake ||
       safety_.state() == SafetyState::Estop || safety_.state() == SafetyState::Fault) {
-    adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+    const bool adapter_owns_recoverable_stop =
+        adapter_safe_stop_active_ &&
+        (safety_.state() == SafetyState::Degraded ||
+         safety_.state() == SafetyState::TimeoutBrake);
+    if (!adapter_owns_recoverable_stop) {
+      adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+    }
+    clear_session_profile();
   }
   if (!last_telemetry_ms_ || timestamp_ms - *last_telemetry_ms_ >= telemetry_interval_ms_) {
-    if (telemetry_history_.size() == kMaxVehicleTelemetryHistory) telemetry_history_.pop_front();
-    telemetry_history_.push_back(build_telemetry(timestamp_ms));
-    last_telemetry_ms_ = timestamp_ms;
+    try {
+      if (telemetry_history_.size() == kMaxVehicleTelemetryHistory) telemetry_history_.pop_front();
+      telemetry_history_.push_back(build_telemetry(timestamp_ms));
+      last_telemetry_ms_ = timestamp_ms;
+    } catch (...) {
+      // Control safety was already evaluated above from the same adapter. A
+      // failed observability snapshot must not tear down an adapter-owned stop
+      // or prevent the outer fault path from keeping the vehicle stopped.
+    }
   }
 }
 
@@ -1648,14 +2652,43 @@ bool VehicleControlService::reset_estop(
     bool local_confirmed,
     std::string_view authorized_by,
     std::int64_t timestamp_ms) {
+  if (safety_.state() != SafetyState::Estop || !local_confirmed || authorized_by.empty()) {
+    return false;
+  }
+  std::string adapter_gear;
+  try {
+    const auto telemetry = adapter_->read_telemetry();
+    const auto handshake = adapter_->vcu_handshake_status();
+    adapter_gear = telemetry.gear;
+    adapter_safe_stop_active_ = telemetry.estop || handshake.disarming;
+    if (handshake.disarming) return false;
+  } catch (...) {
+    return false;
+  }
+
+  // Clear only the adapter's recoverable software stop before releasing the
+  // outer ESTOP latch. Preserve the actual gear so a stopped D/R vehicle does
+  // not enter WaitGear before the bridge can clear its software stop. A
+  // physical or hard safety latch rejects this ordinary zero-output apply;
+  // keep the outer latch and service alive in that case.
+  try {
+    adapter_->apply_safe_stop(ControlOutput{adapter_gear, 0.0, 0.0, 0.0, false});
+  } catch (...) {
+    adapter_safe_stop_active_ = true;
+    return false;
+  }
+
   const bool reset = safety_.reset_estop(local_confirmed, authorized_by, timestamp_ms);
-  if (reset) adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
-  return reset;
+  if (!reset) return false;
+  adapter_safe_stop_active_ = false;
+  static_cast<void>(refresh_adapter_safe_stop_state());
+  return true;
 }
 
 void VehicleControlService::close() {
   if (!started_) return;
   adapter_->apply_safe_stop(ControlOutput{"N", 0.0, 0.0, 1.0, true});
+  clear_session_profile();
   adapter_->close();
   started_ = false;
 }
@@ -1681,7 +2714,37 @@ Json VehicleControlService::build_telemetry(std::int64_t timestamp_ms) {
       {"vehicle_adapter", adapter_->status().to_json()},
       {"vcu_handshake", adapter_->vcu_handshake_status().to_json()},
       {"control_limits", control_limits()},
+      {"session_control_profile", session_control_profile()},
   };
+}
+
+bool VehicleControlService::refresh_adapter_safe_stop_state() noexcept {
+  try {
+    const auto telemetry = adapter_->read_telemetry();
+    const auto handshake = adapter_->vcu_handshake_status();
+    adapter_safe_stop_active_ = telemetry.estop || handshake.disarming;
+    if (adapter_safe_stop_active_) clear_session_profile();
+    return true;
+  } catch (...) {
+    // Preserve an already observed adapter-owned stop. Otherwise callers move
+    // active control into their existing outer fault/safe-stop path.
+    return false;
+  }
+}
+
+void VehicleControlService::clear_session_profile() noexcept {
+  active_session_profile_.reset();
+  last_effective_command_.reset();
+  if (last_session_profile_result_) {
+    last_session_profile_result_->accepted = false;
+    last_session_profile_result_->idempotent = false;
+    last_session_profile_result_->reason = "session_profile_cleared";
+    last_session_profile_result_->effective_profile.reset();
+  }
+  try {
+    adapter_->set_session_control_limits(0.0, 0.0);
+  } catch (...) {
+  }
 }
 
 Json VehicleControlService::control_limits() const {
@@ -1689,8 +2752,29 @@ Json VehicleControlService::control_limits() const {
       {"max_speed_kph", max_speed_kph_},
       {"max_throttle", max_throttle_},
       {"full_scale_motor_torque_nm", full_scale_motor_torque_nm_},
-      {"max_brake", max_brake_},
+      {"max_brake_pressure_bar", max_brake_pressure_bar_},
       {"max_steering_angle_deg", max_steering_angle_deg_},
+  };
+}
+
+Json VehicleControlService::session_control_profile() const {
+  return {
+      {"last_request_seq", last_session_profile_request_
+           ? Json(last_session_profile_request_->seq)
+           : Json(nullptr)},
+      {"active", active_session_profile_.has_value()},
+      {"accepted", last_session_profile_result_
+           ? last_session_profile_result_->accepted
+           : false},
+      {"idempotent", last_session_profile_result_
+           ? last_session_profile_result_->idempotent
+           : false},
+      {"reason", last_session_profile_result_
+           ? last_session_profile_result_->reason
+           : "not_received"},
+      {"effective_profile", active_session_profile_
+           ? active_session_profile_->to_json()
+           : Json(nullptr)},
   };
 }
 
@@ -1705,6 +2789,7 @@ Json VehicleControlService::summary() const {
       {"vehicle_adapter", adapter_->status().to_json()},
       {"vcu_handshake", adapter_->vcu_handshake_status().to_json()},
       {"control_limits", control_limits()},
+      {"session_control_profile", session_control_profile()},
   };
 }
 
