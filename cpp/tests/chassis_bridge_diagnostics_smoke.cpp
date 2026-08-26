@@ -112,6 +112,28 @@ MineTeleopChassisOpenConfigV3 valid_v3_config(
   };
 }
 
+MineTeleopChassisRuntimeControlConfigV1 valid_runtime_control_config(
+    std::uint64_t revision,
+    double target_speed_limit_mps,
+    double max_motor_torque_nm,
+    double max_brake_pressure_bar) {
+  return {
+      sizeof(MineTeleopChassisRuntimeControlConfigV1),
+      MINE_TELEOP_CHASSIS_SESSION_CONTROL_PROFILE_VERSION,
+      revision,
+      target_speed_limit_mps,
+      max_motor_torque_nm,
+      max_brake_pressure_bar,
+      1.0,
+      1.0,
+      0.2,
+      0.0,
+      100.0,
+      100,
+      0U,
+  };
+}
+
 MineTeleopChassisFeedback runtime_feedback(
     int handshake,
     int gear,
@@ -393,7 +415,10 @@ int main() {
                 sizeof(MineTeleopChassisOpenConfigV2) &&
             mine_teleop_chassis_open_config_v3_size() ==
                 sizeof(MineTeleopChassisOpenConfigV3) &&
-            sizeof(MineTeleopChassisApplyResultV1) == 16U,
+            mine_teleop_chassis_runtime_control_config_v1_size() ==
+                sizeof(MineTeleopChassisRuntimeControlConfigV1) &&
+            sizeof(MineTeleopChassisApplyResultV1) == 16U &&
+            sizeof(MineTeleopChassisRuntimeControlResultV1) == 24U,
         "bridge ABI version or versioned open-config size query is inconsistent");
     std::ostringstream diagnostics;
     auto* previous = std::cerr.rdbuf(diagnostics.rdbuf());
@@ -802,6 +827,28 @@ int main() {
     expect(
         mine_teleop_chassis_update_feedback(&feedback) == 0,
         "initial runtime feedback injection failed");
+    auto runtime_profile =
+        valid_runtime_control_config(1, 5.0, 41.25, 0.0);
+    MineTeleopChassisRuntimeControlResultV1 runtime_profile_result{};
+    const int initial_profile_result =
+        mine_teleop_chassis_configure_runtime_control_v1(
+            &runtime_profile, &runtime_profile_result);
+    expect(
+        initial_profile_result == 0 &&
+            runtime_profile_result.result_code == 0 &&
+            runtime_profile_result.issue_id ==
+                MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_NONE &&
+            runtime_profile_result.applied_revision == 1,
+        "initial parked Standby runtime profile was not applied atomically: code=" +
+            std::to_string(initial_profile_result) + " issue=" +
+            std::to_string(runtime_profile_result.issue_id));
+    expect(
+        mine_teleop_chassis_configure_runtime_control_v1(
+            &runtime_profile, &runtime_profile_result) == -3 &&
+            runtime_profile_result.issue_id ==
+                MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_STALE_REVISION &&
+            runtime_profile_result.applied_revision == 0,
+        "duplicate runtime profile revision was not rejected without partial commit");
     expect(
         mine_teleop_chassis_request_parallel_handshake() == 0,
         "standby speed incorrectly latched an authority-state hard fuse or the fresh gate rejected the initial handshake");
@@ -819,6 +866,17 @@ int main() {
         "first handshake wait incorrectly armed the post-Ready apply or critical-feedback watchdog");
     complete_runtime_arming_to_ready(3);
     feedback = runtime_feedback(5, 3, 1, 0.0);
+
+    auto ready_pid_update = runtime_profile;
+    ready_pid_update.profile_revision = 2;
+    ready_pid_update.speed_pid_kp = 2.0;
+    expect(
+        mine_teleop_chassis_configure_runtime_control_v1(
+            &ready_pid_update, &runtime_profile_result) == -3 &&
+            runtime_profile_result.issue_id ==
+                MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_PARKING_REQUIRED &&
+            runtime_profile_result.applied_revision == 0,
+        "Ready-state PID update bypassed the stopped Standby/Disarmed gate");
 
     static_cast<void>(drain_can_frames(transport[1], 10));
     std::this_thread::sleep_for(std::chrono::milliseconds(70));
@@ -1306,7 +1364,14 @@ int main() {
     }
     feedback = runtime_feedback(3, 1, 2, 0.0);
     expect(
-        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "V3 pressure runtime initial feedback failed");
+    auto pressure_profile =
+        valid_runtime_control_config(1, 10.0, 640.0, 327.6);
+    expect(
+        mine_teleop_chassis_configure_runtime_control_v1(
+            &pressure_profile, &runtime_profile_result) == 0 &&
+            runtime_profile_result.applied_revision == 1 &&
             mine_teleop_chassis_request_parallel_handshake() == 0 &&
             mine_teleop_chassis_apply_state(
                 3, 0.0, 0.0, steering.data(), steering.size()) == 0,
@@ -1530,7 +1595,14 @@ int main() {
 
     feedback = runtime_feedback(3, 1, 2, 0.0);
     expect(
-        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "physical-ESTOP runtime initial feedback failed");
+    auto physical_profile =
+        valid_runtime_control_config(1, 5.0, 41.25, 0.0);
+    expect(
+        mine_teleop_chassis_configure_runtime_control_v1(
+            &physical_profile, &runtime_profile_result) == 0 &&
+            runtime_profile_result.applied_revision == 1 &&
             mine_teleop_chassis_request_parallel_handshake() == 0,
         "physical-ESTOP runtime initial gate or handshake failed");
     expect(
@@ -1567,6 +1639,12 @@ int main() {
         mine_teleop_chassis_read_telemetry(&physical_telemetry) == 0 &&
             physical_telemetry.estop == 1,
         "released physical emergency pulse did not remain visible as latched ESTOP");
+    expect(
+        mine_teleop_chassis_clear_runtime_control_v1(
+            &runtime_profile_result) == 0 &&
+            runtime_profile_result.result_code == 0 &&
+            runtime_profile_result.applied_revision == 0,
+        "runtime profile clear was rejected while a physical stop was latched");
     MineTeleopChassisApplyResultV1 physical_apply_result{};
     expect(
         mine_teleop_chassis_apply_state_v2(
@@ -1591,6 +1669,12 @@ int main() {
         mine_teleop_chassis_read_telemetry(&physical_telemetry) == 0 &&
             physical_telemetry.estop == 1,
         "completed disarm implicitly cleared physical emergency telemetry");
+    physical_profile.profile_revision = 2;
+    expect(
+        mine_teleop_chassis_configure_runtime_control_v1(
+            &physical_profile, &runtime_profile_result) == 0 &&
+            runtime_profile_result.applied_revision == 2,
+        "parked Disarmed runtime profile reconfiguration was rejected");
     expect(
         mine_teleop_chassis_request_parallel_handshake() == 0,
         "released physical emergency did not recover through explicit stopped handshake");

@@ -214,26 +214,92 @@ test('control rejection presentation exposes only stable issue-code guidance', (
   assert(!unknown.text.includes('secret sentinel'));
 });
 
-test('session control profile validation and hard-limit merge preserve brake ordering', () => {
-  const requested = {
+function controlProfile(overrides = {}) {
+  return {
+    profile_version: 2,
     target_speed_kph: 12,
     max_motor_torque_nm: 300,
     max_brake_pressure_bar: 90,
     service_brake_pressure_bar: 30,
     hard_brake_pressure_bar: 80,
+    max_steering_angle_deg: 6,
+    speed_pid_kp: 2,
+    speed_pid_ki: 0.3,
+    speed_pid_kd: 0.2,
+    speed_pid_derivative_filter_tau_ms: 60,
+    speed_pid_max_dt_ms: 80,
+    ...overrides,
   };
-  const hard = {
+}
+
+function readOnlyControlSafety(overrides = {}) {
+  return {
+    control_rate_hz: 20,
+    max_command_gap_ms: 200,
+    degraded_timeout_ms: 300,
+    control_timeout_ms: 800,
+    deceleration_profile: [
+      {after_ms: 0, brake: 0.3},
+      {after_ms: 500, brake: 0.6},
+      {after_ms: 1500, brake: 1},
+    ],
+    speed_feedback_timeout_ms: 200,
+    hard_overspeed_margin_kph: 3.6,
+    require_can_feedback_before_control: true,
+    require_local_estop_reset: true,
+    require_time_sync: true,
+    max_time_sync_uncertainty_ms: 25,
+    time_sync_interval_ms: 30000,
+    time_sync_samples: 7,
+    commissioning_mode: 'bench',
+    ...overrides,
+  };
+}
+
+function vehicleHardLimits(overrides = {}) {
+  return {
     max_speed_kph: 40,
     max_throttle: 0.1,
     full_scale_motor_torque_nm: 165,
     max_brake_pressure_bar: 50,
+    max_steering_angle_deg: 8,
+    default_speed_pid_kp: 1.5,
+    default_speed_pid_ki: 0.2,
+    default_speed_pid_kd: 0.1,
+    default_speed_pid_derivative_filter_tau_ms: 50,
+    default_speed_pid_max_dt_ms: 100,
+    speed_pid_limits: {
+      kp: {min: 0, max: 10},
+      ki: {min: 0, max: 10},
+      kd: {min: 0, max: 10},
+      derivative_filter_tau_ms: {min: 0, max: 500},
+      max_dt_ms: {min: 20, max: 200},
+    },
+    speed_feedback_timeout_ms: 200,
+    hard_overspeed_margin_kph: 3.6,
+    speed_feedback_timeout_ms_read_only: true,
+    hard_overspeed_margin_kph_read_only: true,
+    read_only_control_safety: readOnlyControlSafety(),
+    ...overrides,
   };
+}
+
+test('session control profile V2 validation and hard-limit merge preserve ordering', () => {
+  const requested = controlProfile();
+  const hard = vehicleHardLimits();
   assert.deepEqual(logic.mergeControlProfileWithHardLimits(requested, hard), {
+    profile_version: 2,
     target_speed_kph: 4,
     max_motor_torque_nm: 165,
     max_brake_pressure_bar: 50,
     service_brake_pressure_bar: 30,
     hard_brake_pressure_bar: 50,
+    max_steering_angle_deg: 6,
+    speed_pid_kp: 2,
+    speed_pid_ki: 0.3,
+    speed_pid_kd: 0.2,
+    speed_pid_derivative_filter_tau_ms: 60,
+    speed_pid_max_dt_ms: 80,
   });
   assert.equal(logic.controlProfileThrottleLimit(
       {...requested, target_speed_kph: 2}, hard), 0.05);
@@ -253,16 +319,134 @@ test('session control profile validation and hard-limit merge preserve brake ord
   assert.throws(
       () => logic.normalizeControlProfile({...requested, target_speed_kph: '2'}),
       /target_speed_kph/);
+  assert.throws(
+      () => logic.normalizeControlProfile({...requested, speed_pid_kp: 0}),
+      /speed_pid_kp must be greater than 0/);
+  assert.throws(
+      () => logic.normalizeControlProfile({...requested, speed_pid_max_dt_ms: 80.5}),
+      /speed_pid_max_dt_ms must be an integer/);
+  assert.throws(
+      () => logic.normalizeControlProfile({...requested, profile_version: 1}),
+      /profile_version must be 2/);
+  assert.throws(
+      () => logic.normalizeControlProfile({...requested, unexpected_field: 1}),
+      /exactly the V2 fields/);
+});
+
+test('PID defaults come only from complete vehicle limits and accept kp hard min zero', () => {
+  const hard = vehicleHardLimits({
+    default_speed_pid_kp: 3.25,
+    default_speed_pid_ki: 0.75,
+    default_speed_pid_kd: 0.5,
+    default_speed_pid_derivative_filter_tau_ms: 75,
+    default_speed_pid_max_dt_ms: 120,
+  });
+  const profile = logic.controlProfileFromVehicleDefaults({
+    target_speed_kph: 2,
+    max_motor_torque_nm: 100,
+    max_brake_pressure_bar: 50,
+    service_brake_pressure_bar: 20,
+    hard_brake_pressure_bar: 50,
+    max_steering_angle_deg: 3,
+  }, hard);
+  assert.equal(profile.speed_pid_kp, 3.25);
+  assert.equal(profile.speed_pid_ki, 0.75);
+  assert.equal(profile.speed_pid_kd, 0.5);
+  assert.equal(profile.speed_pid_derivative_filter_tau_ms, 75);
+  assert.equal(profile.speed_pid_max_dt_ms, 120);
+  assert.equal(logic.normalizeVehicleHardLimits(hard).speed_pid_limits.kp.min, 0);
+
+  const missingDefault = vehicleHardLimits();
+  delete missingDefault.default_speed_pid_kd;
+  assert.throws(() => logic.normalizeVehicleHardLimits(missingDefault), /default_speed_pid_kd/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({...vehicleHardLimits(), speed_pid_limits: null}),
+      /speed_pid_limits/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({
+        ...vehicleHardLimits(), default_speed_pid_kp: 0,
+      }),
+      /default_speed_pid_kp must be greater than 0/);
+});
+
+test('vehicle fixed safety limits are exact, read-only, consistent, and preserved', () => {
+  const normalized = logic.normalizeVehicleHardLimits(vehicleHardLimits());
+  assert.equal(normalized.speed_feedback_timeout_ms, 200);
+  assert.equal(normalized.hard_overspeed_margin_kph, 3.6);
+  assert.deepEqual(normalized.read_only_control_safety, readOnlyControlSafety());
+
+  const missingSafety = vehicleHardLimits();
+  delete missingSafety.read_only_control_safety;
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits(missingSafety),
+      /read_only_control_safety/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({
+        ...vehicleHardLimits(), speed_feedback_timeout_ms_read_only: false,
+      }),
+      /explicitly read-only/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({
+        ...vehicleHardLimits(), speed_feedback_timeout_ms: 201,
+      }),
+      /must match/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({
+        ...vehicleHardLimits(),
+        read_only_control_safety: readOnlyControlSafety({unexpected_field: 1}),
+      }),
+      /exactly the fixed fields/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({
+        ...vehicleHardLimits(),
+        read_only_control_safety: readOnlyControlSafety({
+          deceleration_profile: [
+            {after_ms: 0, brake: 0.6},
+            {after_ms: 500, brake: 0.3},
+            {after_ms: 1500, brake: 1},
+          ],
+        }),
+      }),
+      /brake must not decrease/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({
+        ...vehicleHardLimits(),
+        read_only_control_safety: readOnlyControlSafety({
+          require_time_sync: 'true',
+        }),
+      }),
+      /require_time_sync must be boolean/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({
+        ...vehicleHardLimits(),
+        read_only_control_safety: readOnlyControlSafety({control_rate_hz: 19}),
+      }),
+      /control_rate_hz/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({
+        ...vehicleHardLimits(),
+        read_only_control_safety: readOnlyControlSafety({
+          deceleration_profile: [
+            {after_ms: 0, brake: 0.3},
+            {after_ms: 2147483648, brake: 1},
+          ],
+        }),
+      }),
+      /after_ms/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({
+        ...vehicleHardLimits(),
+        read_only_control_safety: readOnlyControlSafety({
+          speed_feedback_timeout_ms: 500,
+          control_timeout_ms: 400,
+        }),
+        speed_feedback_timeout_ms: 500,
+      }),
+      /timeout ordering is invalid/);
 });
 
 test('session control profile ACK only activates the matching pending request', () => {
-  const requested = {
-    target_speed_kph: 2,
-    max_motor_torque_nm: 100,
-    max_brake_pressure_bar: 80,
-    service_brake_pressure_bar: 30,
-    hard_brake_pressure_bar: 80,
-  };
+  const requested = controlProfile({target_speed_kph: 2, max_motor_torque_nm: 100});
   const pending = {
     requestedProfile: requested,
     pendingRequestSeq: 7,
@@ -282,6 +466,7 @@ test('session control profile ACK only activates the matching pending request', 
     accepted: true,
     reason: 'accepted',
     last_request_seq: 7,
+    applied_revision: 7,
     effective_profile: {...requested, max_motor_torque_nm: 80},
   });
   assert.equal(mismatched.matched, true);
@@ -289,18 +474,26 @@ test('session control profile ACK only activates the matching pending request', 
   assert.equal(mismatched.invalidated, true);
   assert.equal(mismatched.reason, 'effective_profile_mismatch');
 
+  const missingRevision = logic.reduceControlProfileStatus(pending, {
+    active: true, accepted: true, last_request_seq: 7, effective_profile: requested,
+  });
+  assert.equal(missingRevision.acknowledged, false);
+  assert.equal(missingRevision.reason, 'applied_revision_mismatch');
+
   const effective = {...requested};
   const accepted = logic.reduceControlProfileStatus(pending, {
     active: true,
     accepted: true,
     reason: 'accepted',
     last_request_seq: 7,
+    applied_revision: 7,
     effective_profile: effective,
   });
   assert.equal(accepted.matched, true);
   assert.equal(accepted.acknowledged, true);
   assert.equal(accepted.pendingRequestSeq, 0);
   assert.equal(accepted.effectiveRequestSeq, 7);
+  assert.equal(accepted.effectiveAppliedRevision, 7);
   assert.deepEqual(accepted.effectiveProfile, effective);
 
   const prior = {...pending, effectiveProfile: effective, effectiveRequestSeq: 5, acknowledged: true};
@@ -328,34 +521,34 @@ test('session control profile ACK only activates the matching pending request', 
 });
 
 test('session control profile telemetry revokes stale or inactive effective state', () => {
-  const effective = {
-    target_speed_kph: 2,
-    max_motor_torque_nm: 100,
-    max_brake_pressure_bar: 80,
-    service_brake_pressure_bar: 30,
-    hard_brake_pressure_bar: 80,
-  };
+  const effective = controlProfile({target_speed_kph: 2, max_motor_torque_nm: 100});
   const active = {
     requestedProfile: effective,
     pendingRequestSeq: 0,
     effectiveProfile: effective,
     effectiveRequestSeq: 7,
+    effectiveAppliedRevision: 7,
     acknowledged: true,
   };
   const refreshed = logic.reduceControlProfileStatus(active, {
-    active: true, accepted: true, last_request_seq: 7, effective_profile: effective,
+    active: true, accepted: true, last_request_seq: 7, applied_revision: 7,
+    effective_profile: effective,
   });
   assert.equal(refreshed.acknowledged, true);
   assert.equal(refreshed.invalidated, false);
   assert.deepEqual(refreshed.effectiveProfile, effective);
 
   for (const status of [
-    {active: false, accepted: false, last_request_seq: 7, effective_profile: effective},
-    {active: true, accepted: true, last_request_seq: 8, effective_profile: effective},
-    {active: true, accepted: true, last_request_seq: 7,
+    {active: false, accepted: false, last_request_seq: 7, applied_revision: 7,
+      effective_profile: effective},
+    {active: true, accepted: true, last_request_seq: 8, applied_revision: 7,
+      effective_profile: effective},
+    {active: true, accepted: true, last_request_seq: 7, applied_revision: 8,
+      effective_profile: effective},
+    {active: true, accepted: true, last_request_seq: 7, applied_revision: 7,
       effective_profile: {...effective, max_motor_torque_nm: 90}},
-    {active: true, accepted: true, last_request_seq: 7,
-      effective_profile: {...effective, max_brake_pressure_bar: 10}},
+    {active: true, accepted: true, last_request_seq: 7, applied_revision: 7,
+      effective_profile: {...effective, speed_pid_kd: 0.25}},
   ]) {
     const revoked = logic.reduceControlProfileStatus(active, status);
     assert.equal(revoked.acknowledged, false);

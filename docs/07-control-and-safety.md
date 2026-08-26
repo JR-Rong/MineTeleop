@@ -90,18 +90,23 @@
 ## 会话控制参数
 
 普通驾驶开始前，驾驶端必须先通过同一条 DataChannel 发送
-`type=session_control_profile`，由车端确认目标车速、单电机最大转矩、普通制动最大
-压力、缓刹压力和急刹压力。车端只有在实际应用这些上限后才发送
+`type=session_control_profile`。当前 `profile_version=2` 是完整快照，包含目标车速、
+单电机最大转矩、普通制动最大/缓刹/急刹压力、最大转角，以及车速 PID 的
+`kp/ki/kd/derivative_filter_tau_ms/max_dt_ms`。车端只有在 bridge 原子应用整份快照后才发送
 `event=session_control_profile_status` 的成功状态；未确认参数时拒绝 VCU 握手和非
 急停驾驶命令。参数在断链、控制权/会话替换、故障或 adapter 自有安全停车时清除，
-重连后不能沿用旧确认；急停始终绕过普通参数门禁。
+重连后不能沿用旧确认；急停始终绕过普通参数门禁。成功状态的 `applied_revision`
+必须等于请求 `seq`，拒绝时为 0，浏览器不能用不同 revision 的 ACK 解锁控制。
 
 非 mock 车端会把会话参数限制在车端 YAML 的不可绕过上限内：目标车速不超过
 `max_speed_kph * max_throttle`，单电机转矩不超过
 `full_scale_motor_torque_nm`，三项普通制动压力满足
-`service <= hard <= max <= max_brake_pressure_bar`。首次设置、提高目标车速/转矩或
-修改任一制动压力还要求新鲜的 N 挡、零速和 EPB 驻车反馈。PID 增益、反馈超时和
-超速门限只在车端 YAML 中配置，控制端不能在会话中改 PID。
+`service <= hard <= max <= max_brake_pressure_bar`，转角不超过
+`max_steering_angle_deg`，PID 仍受车端绝对范围约束。首次设置、提高目标车速/转矩、
+修改任一制动压力/转角/PID 还要求新鲜的 N 挡、零速和 EPB 驻车反馈，且 bridge
+必须处于 `standby` 或 `disarmed`；Ready 中不能热改这些参数。会话清除会撤销牵引、
+复位 PID 并恢复车端 YAML 的默认 PID。反馈超时、硬超速 margin、命令超时和降速曲线
+始终是车端只读安全参数，控制端不能覆盖。
 
 ## 车端本地车速闭环与换挡门禁
 
@@ -189,7 +194,7 @@ Degraded 阶段会先把会话归一化制动换算成车端普通压力比例�
 
 ```yaml
 control:
-  rate_hz: 20
+  rate_hz: 20 # 固定的上游命令频率（50 ms）；bridge CAN I/O 独立固定为 20 ms/50 Hz
   freshness_mode: local_receive_interval_and_seq
   max_command_gap_ms: 200
   degraded_timeout_ms: 300
@@ -206,11 +211,16 @@ control:
 
 参数语义：
 
+- `rate_hz`：当前只支持固定 `20 Hz` 上游命令频率；其他值在配置加载时 fail closed。
+  这不是 bridge 的 `20 ms` SocketCAN 发送/PID 周期。
 - `max_command_gap_ms`：单次有效命令到达间隔上限。超过该值时，车端应丢弃过旧命令、记录链路异常，并可提示驾驶端网络抖动；它不是状态机进入降级态的持续时间。
 - `degraded_timeout_ms`：链路异常持续时间阈值。超过该持续时间后进入降级控制，例如油门置 0、限速或告警；本 PR 不在普通制动路径内生成压力 ramp。
 - `control_timeout_ms`：持续未收到有效控制心跳后进入 `TIMEOUT_BRAKE` 的阈值。该值必须小于按车辆制动距离、安全边界和场地速度上限反推得到的最大允许值。
 
 `degraded_timeout_ms=300` 只能作为首版弱网告警/降级参考值，不应直接等同于急刹阈值。5G 抖动可能达到几十到上百毫秒，最终 `max_command_gap_ms`、`degraded_timeout_ms`、`control_timeout_ms` 和安全制动动作必须结合真实网络、车辆制动距离、坡道/松散路面和底层控制器心跳机制实测标定。
+三个毫秒参数都必须为正且不大于 60000，并满足
+`degraded_timeout_ms < control_timeout_ms`。`deceleration_profile.after_ms` 从进入
+`TIMEOUT_BRAKE` 起算，沿用非负、声明顺序严格递增和最终 1.0 的语义。
 
 ## 急停
 

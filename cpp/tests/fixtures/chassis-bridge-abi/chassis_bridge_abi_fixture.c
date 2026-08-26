@@ -12,6 +12,14 @@
 #define MINE_TELEOP_TEST_CHASSIS_HAS_APPLY_V2 1
 #endif
 
+#ifndef MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL
+#define MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL 1
+#endif
+
+#ifndef MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_SIZE
+#define MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_SIZE 0
+#endif
+
 uint32_t mine_teleop_chassis_abi_version(void) {
     return MINE_TELEOP_TEST_CHASSIS_ABI_VERSION;
 }
@@ -25,6 +33,14 @@ uint32_t mine_teleop_chassis_open_config_v3_size(void) {
     return (uint32_t)(sizeof(struct MineTeleopChassisOpenConfigV3) - 1U);
 #else
     return (uint32_t)sizeof(struct MineTeleopChassisOpenConfigV3);
+#endif
+}
+
+uint32_t mine_teleop_chassis_runtime_control_config_v1_size(void) {
+#if MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_SIZE
+    return (uint32_t)(sizeof(struct MineTeleopChassisRuntimeControlConfigV1) - 1U);
+#else
+    return (uint32_t)sizeof(struct MineTeleopChassisRuntimeControlConfigV1);
 #endif
 }
 
@@ -88,6 +104,33 @@ int mine_teleop_chassis_apply_state_v2(
     return 0;
 }
 #endif
+
+#if MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL
+int mine_teleop_chassis_configure_runtime_control_v1(
+    const struct MineTeleopChassisRuntimeControlConfigV1* config,
+    struct MineTeleopChassisRuntimeControlResultV1* result) {
+    if (config == NULL || result == NULL) return -1;
+    result->struct_size =
+        (uint32_t)sizeof(struct MineTeleopChassisRuntimeControlResultV1);
+    result->result_code = 0;
+    result->issue_id = MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_NONE;
+    result->reserved = 0U;
+    result->applied_revision = config->profile_revision;
+    return 0;
+}
+#endif
+
+int mine_teleop_chassis_clear_runtime_control_v1(
+    struct MineTeleopChassisRuntimeControlResultV1* result) {
+    if (result == NULL) return -1;
+    result->struct_size =
+        (uint32_t)sizeof(struct MineTeleopChassisRuntimeControlResultV1);
+    result->result_code = 0;
+    result->issue_id = MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_NONE;
+    result->reserved = 0U;
+    result->applied_revision = 0U;
+    return 0;
+}
 
 int mine_teleop_chassis_emergency_stop(void) {
     return 0;

@@ -111,21 +111,37 @@ Console 不应只在按键变化时发送控制，而应按固定周期发送当
 
 ### 会话控制参数确认
 
-控制端 YAML 给出新会话默认值：目标车速 `2.0 km/h`、单电机最大驱动转矩
-`300.0 Nm`、每路 EHB 最大普通/缓刹/急刹压力 `100.0/30.0/100.0 bar`。`300 Nm`
-和 `100 bar` 只是未完成台架或实车标定的软件请求默认值。控制端 schema 上限为
-`640.0 Nm/路` 与 `327.6 bar/路`，实际可用值还必须被车端 hard limits 下调。转向上限
-继续是控制端本地输入限幅并受车端静态硬上限约束，不进入会话 profile。
-对真实 VCU adapter，提高目标车速、转矩或转向上限，以及修改任一制动压力字段（包括
-降低），都要求 N 挡、有效零速和电子驻车已拉起；控制端先预检，车端再次 fail closed。
+控制端 YAML 给出新会话的驾驶参数默认值：目标车速 `2.0 km/h`、单电机最大驱动转矩
+`300.0 Nm`、每路 EHB 最大普通/缓刹/急刹压力 `100.0/30.0/100.0 bar`，以及最大转向角。
+`300 Nm` 和 `100 bar` 只是未完成台架或实车标定的软件请求默认值。控制端 schema 上限为
+`640.0 Nm/路` 与 `327.6 bar/路`，实际可用值还必须被车端 hard limits 下调。
+
+速度 PID 默认值不在控制端 YAML 或 JavaScript 中保存。页面只有在车端 `control_limits`
+同时上报 `default_speed_pid_kp/ki/kd`、`default_speed_pid_derivative_filter_tau_ms`、
+`default_speed_pid_max_dt_ms` 以及嵌套 `speed_pid_limits` 的五组 min/max 后，才初始化
+PID 表单。车端还必须同时上报顶层 `speed_feedback_timeout_ms`、
+`hard_overspeed_margin_kph` 和 exact `read_only_control_safety` 对象；对象包含固定 20 Hz
+上游命令频率、命令间隔、degraded/control watchdog、减速曲线、速度反馈超时、超速余量、
+CAN/本地急停/时间同步门禁及 commissioning mode。重复的速度超时和超速余量必须与顶层
+数值相同。页面只读展示原始 `max_speed_kph`、`max_throttle`、派生目标车速和上述固定值；
+缺少、越界、类型/字段错误或重复值不一致都撤销驾驶授权，不能由会话 profile 修改。
+
+首次应用 profile、任一 PID 修改、提高目标车速/转矩、转向上限任意变化，以及修改任一
+制动压力字段（包括降低），都要求 N 挡、有效零速、电子驻车已拉起且 VCU 状态为
+`standby` 或 `disarmed`；明确不支持 VCU 握手且 `adapter_ready=true` 的隔离 mock 台架
+例外。控制端先预检，车端再次 fail closed。
 
 页面通过 `POST /api/control-profile` 准备 `type=session_control_profile` 的鉴权
-DataChannel envelope；五个 profile 字段位于 envelope 顶层，并与普通控制命令复用
-车辆、驾驶员、session、`control_token` 和单调递增 `seq`。由于 control DataChannel
+DataChannel envelope。V2 profile 在 envelope 顶层包含 `profile_version=2`、目标车速、
+单电机最大转矩、三项普通制动压力、最大转向角，以及 `speed_pid_kp/ki/kd`、
+`speed_pid_derivative_filter_tau_ms`、`speed_pid_max_dt_ms`；它与普通控制命令复用车辆、
+驾驶员、session、`control_token` 和单调递增 `seq`。由于 control DataChannel
 是 unordered/unreliable，浏览器每隔至少 200 ms 重发同一 envelope 和同一 `seq`，直到
 收到共享 `control_status_seq` 排序后的 `session_control_profile_status`，或 telemetry
-中的同一 canonical `session_control_profile`。只有 `active=true`、
-`last_request_seq` 匹配 pending 序号且 `effective_profile` 合法时才视为已确认。
+中的同一 canonical `session_control_profile`。只有 `active=true`、`accepted=true`、
+`last_request_seq` 匹配 pending 序号、顶层正整数 `applied_revision` 等于该请求 `seq`，且
+`effective_profile` 的全部 V2 字段和值与请求精确一致时才视为已确认；同一 revision 的
+幂等重 ACK 可保持授权。
 旧 `GET /api/control-limits` 仅保留归一化制动比例的只读兼容；`POST` 固定返回
 `410 Gone`，不能绕过 profile 的停车、鉴权和 ACK 门禁修改会话制动参数。旧的
 `POST /api/control/keyboard` 与 `POST /api/control/gamepad` 同样固定返回 `410 Gone`：
@@ -133,13 +149,14 @@ DataChannel envelope；五个 profile 字段位于 envelope 顶层，并与普�
 前后单位解释不一致。浏览器和新集成都只使用标准 `POST /api/control` 准备 v1 命令。
 
 未确认时页面清空输入并禁止 VCU connect 握手和所有普通驾驶命令；`estop=true` 不受
-profile ACK 门禁阻止。后续 telemetry 报告 profile inactive、序号不再等于当前 effective
-序号或 effective profile 非法时，页面立即撤销确认并再次清空输入。Peer/DataChannel
-断开、切换车辆、会话结束或登录失效会清除 requested override、pending envelope、
-effective profile 和 hard limits，恢复 YAML 默认值；旧会话设置不得跨会话自动重放。
-默认 profile 仅在收到 `parking_ready=true`，或车端明确报告 mock/无需握手且 adapter ready
-后自动提交；每个链路 generation 最多自动尝试一次。车端拒绝后必须由驾驶员显式重试，
-不得借后续 telemetry/hard-limit 更新循环生成新 `seq`。
+profile ACK 门禁阻止。后续 telemetry 报告 profile inactive/rejected、请求序号或
+`applied_revision` 不再等于当前 effective revision、effective profile 非法或任一字段
+变化时，页面立即撤销确认并再次清空输入。Peer/DataChannel 断开、切换车辆、会话结束或
+登录失效会清除 requested profile、pending envelope、effective profile、revision 和 hard
+limits；新会话必须重新等待车端 PID 默认值，不得跨会话自动重放旧设置。
+默认 profile 仅在收到 `parking_ready=true` 且 VCU 为 `standby`/`disarmed`，或车端明确
+报告 mock/无需握手且 adapter ready 后自动提交；每个链路 generation 最多自动尝试一次。
+车端拒绝后必须由驾驶员显式重试，不得借后续 telemetry/hard-limit 更新循环生成新 `seq`。
 
 按键集合、挡位门禁、刹车优先级、VCU 状态迁移、状态序号与
 latest-wins 判定由可在浏览器和 Node.js 共用的无 DOM 模块实现。生产页面

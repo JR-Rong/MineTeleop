@@ -120,11 +120,19 @@ mine_teleop::SessionControlProfileRequest session_profile_request(
   request.seq = seq;
   request.sent_at_utc_ms = timestamp_ms;
   request.control_token = "token";
+  request.profile.profile_version =
+      mine_teleop::kSessionControlProfileVersion;
   request.profile.target_speed_kph = target_speed_kph;
   request.profile.max_motor_torque_nm = max_motor_torque_nm;
   request.profile.max_brake_pressure_bar = max_brake_pressure_bar;
   request.profile.service_brake_pressure_bar = service_brake_pressure_bar;
   request.profile.hard_brake_pressure_bar = hard_brake_pressure_bar;
+  request.profile.max_steering_angle_deg = 3.0;
+  request.profile.speed_pid_kp = 1.0;
+  request.profile.speed_pid_ki = 0.2;
+  request.profile.speed_pid_kd = 0.0;
+  request.profile.speed_pid_derivative_filter_tau_ms = 100.0;
+  request.profile.speed_pid_max_dt_ms = 100;
   return request;
 }
 
@@ -170,11 +178,18 @@ class NoFeedbackAdapter final : public mine_teleop::VehicleAdapter {
  public:
   void open() override { opened = true; }
   void close() override { opened = false; }
-  void set_session_control_limits(
-      double max_motor_torque_nm,
-      double max_brake_pressure_bar) override {
-    session_motor_torque_limit = max_motor_torque_nm;
-    session_brake_pressure_limit = max_brake_pressure_bar;
+  [[nodiscard]] std::uint64_t configure_runtime_control_profile(
+      const mine_teleop::SessionControlProfile& profile,
+      std::uint64_t revision) override {
+    session_motor_torque_limit = profile.max_motor_torque_nm;
+    session_brake_pressure_limit = profile.max_brake_pressure_bar;
+    runtime_profile_revision = revision;
+    return revision;
+  }
+  void clear_runtime_control_profile() override {
+    session_motor_torque_limit = 0.0;
+    session_brake_pressure_limit = 0.0;
+    runtime_profile_revision = 0;
   }
   [[nodiscard]] double session_motor_torque_limit_nm() const override {
     return session_motor_torque_limit;
@@ -193,6 +208,8 @@ class NoFeedbackAdapter final : public mine_teleop::VehicleAdapter {
   [[nodiscard]] bool feedback_ready() const override { return false; }
   [[nodiscard]] mine_teleop::VcuHandshakeStatus vcu_handshake_status() const override {
     mine_teleop::VcuHandshakeStatus status;
+    status.supported = true;
+    status.state = "standby";
     status.parking_ready = true;
     return status;
   }
@@ -218,6 +235,7 @@ class NoFeedbackAdapter final : public mine_teleop::VehicleAdapter {
   std::uint64_t safe_stops{0};
   double session_motor_torque_limit{0.0};
   double session_brake_pressure_limit{0.0};
+  std::uint64_t runtime_profile_revision{0};
   mine_teleop::ControlOutput last_safe_output;
 };
 
@@ -233,15 +251,23 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
   void open() override { opened = true; }
   void close() override { opened = false; }
 
-  void set_session_control_limits(
-      double max_motor_torque_nm,
-      double max_brake_pressure_bar) override {
+  [[nodiscard]] std::uint64_t configure_runtime_control_profile(
+      const mine_teleop::SessionControlProfile& profile,
+      std::uint64_t revision) override {
     ++control_limit_updates;
     if (control_limit_update_throws) {
       throw std::runtime_error("adapter control limit apply failed");
     }
-    session_motor_torque_limit = max_motor_torque_nm;
-    session_brake_pressure_limit = max_brake_pressure_bar;
+    session_motor_torque_limit = profile.max_motor_torque_nm;
+    session_brake_pressure_limit = profile.max_brake_pressure_bar;
+    runtime_profile_revision = revision;
+    return revision;
+  }
+
+  void clear_runtime_control_profile() override {
+    session_motor_torque_limit = 0.0;
+    session_brake_pressure_limit = 0.0;
+    runtime_profile_revision = 0;
   }
 
   [[nodiscard]] double session_motor_torque_limit_nm() const override {
@@ -362,6 +388,7 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
   std::uint64_t control_limit_updates{0};
   double session_motor_torque_limit{0.0};
   double session_brake_pressure_limit{0.0};
+  std::uint64_t runtime_profile_revision{0};
   std::optional<std::string> structured_rejection_issue_code;
   std::optional<std::string> rejected_control_gear;
   std::optional<ControlCommand> last_control;
@@ -369,6 +396,19 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
   mine_teleop::VehicleTelemetry telemetry;
   mine_teleop::VcuHandshakeStatus handshake;
 };
+
+void activate_adapter_owned_session_profile(
+    mine_teleop::VehicleControlService& service,
+    AdapterOwnedSafeStopAdapter& adapter,
+    std::uint64_t seq = 1,
+    std::int64_t timestamp_ms = 0) {
+  adapter.handshake.state = "standby";
+  adapter.handshake.ready = false;
+  adapter.handshake.disarming = false;
+  adapter.handshake.parking_ready = true;
+  activate_session_profile(service, seq, timestamp_ms);
+  adapter.set_safe_stop(false, true, false);
+}
 
 void test_config_loads_current_vehicle_yaml() {
   const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
@@ -389,6 +429,58 @@ void test_config_loads_current_vehicle_yaml() {
       100.0,
       1e-9,
       "safe default ordinary brake pressure changed");
+}
+
+void test_vehicle_config_rejects_unimplemented_control_safety_options() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  auto variable_rate = base;
+  replace_once(variable_rate, "rate_hz: 20", "rate_hz: 25");
+  const auto variable_rate_path =
+      write_temp_vehicle_config("variable-control-rate", variable_rate);
+  expect_throws(
+      [&] {
+        static_cast<void>(
+            mine_teleop::load_vehicle_config(variable_rate_path));
+      },
+      "non-20Hz configuration was accepted by the fixed upstream command rate");
+
+  const std::vector<std::pair<std::string, std::string>> invalid_timing{
+      {"max_command_gap_ms: 200", "max_command_gap_ms: 0"},
+      {"degraded_timeout_ms: 300", "degraded_timeout_ms: 60001"},
+      {"control_timeout_ms: 800", "control_timeout_ms: 60001"},
+      {"control_timeout_ms: 800", "control_timeout_ms: 300"},
+  };
+  std::vector<std::filesystem::path> invalid_timing_paths;
+  for (const auto& [from, to] : invalid_timing) {
+    auto invalid = base;
+    replace_once(invalid, from, to);
+    const auto path = write_temp_vehicle_config("invalid-control-timing", invalid);
+    invalid_timing_paths.push_back(path);
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); },
+        "invalid or unbounded control timing was accepted");
+  }
+
+  auto remote_only_reset = base;
+  replace_once(
+      remote_only_reset,
+      "require_local_estop_reset: true",
+      "require_local_estop_reset: false");
+  const auto remote_only_reset_path =
+      write_temp_vehicle_config("remote-only-estop-reset", remote_only_reset);
+  expect_throws(
+      [&] {
+        static_cast<void>(
+            mine_teleop::load_vehicle_config(remote_only_reset_path));
+      },
+      "remote-only ESTOP reset configuration was accepted despite local confirmation being mandatory");
+
+  std::error_code error;
+  std::filesystem::remove(variable_rate_path, error);
+  std::filesystem::remove(remote_only_reset_path, error);
+  for (const auto& path : invalid_timing_paths) {
+    std::filesystem::remove(path, error);
+  }
 }
 
 void test_vehicle_config_validates_full_scale_motor_torque() {
@@ -1387,11 +1479,13 @@ void test_session_control_profile_json_round_trip_and_physical_units() {
   result.seq = request.seq;
   result.sent_at_utc_ms = request.sent_at_utc_ms;
   result.accepted = true;
+  result.applied_revision = request.seq;
   result.reason = "accepted";
   result.effective_profile = request.profile;
   const auto ack = result.to_json();
   expect(
       ack.at("last_request_seq") == request.seq &&
+          ack.at("applied_revision") == request.seq &&
           ack.at("active").get<bool>() && ack.at("accepted").get<bool>() &&
           ack.at("effective_profile").is_object(),
       "profile ACK did not expose the canonical reducer shape");
@@ -1406,6 +1500,22 @@ void test_session_control_profile_json_round_trip_and_physical_units() {
             mine_teleop::SessionControlProfileResult::from_json(inconsistent_ack));
       },
       "profile ACK accepted an active flag inconsistent with its effective profile");
+  inconsistent_ack = ack;
+  inconsistent_ack.erase("applied_revision");
+  expect_throws(
+      [&] {
+        static_cast<void>(
+            mine_teleop::SessionControlProfileResult::from_json(inconsistent_ack));
+      },
+      "profile ACK accepted a missing applied_revision");
+  inconsistent_ack = ack;
+  inconsistent_ack["applied_revision"] = request.seq + 1;
+  expect_throws(
+      [&] {
+        static_cast<void>(
+            mine_teleop::SessionControlProfileResult::from_json(inconsistent_ack));
+      },
+      "profile ACK accepted an applied_revision different from its seq");
   inconsistent_ack = ack;
   inconsistent_ack["last_request_seq"] = request.seq + 1;
   expect_throws(
@@ -1432,6 +1542,21 @@ void test_session_control_profile_json_round_trip_and_physical_units() {
   expect_throws(
       [&] { invalid.validate(); },
       "ordinary brake pressure above the 80-percent code cap was accepted");
+  invalid = request;
+  invalid.profile.profile_version = 1;
+  expect_throws(
+      [&] { invalid.validate(); },
+      "legacy session profile version was accepted");
+  invalid = request;
+  invalid.profile.speed_pid_kp = 0.0;
+  expect_throws(
+      [&] { invalid.validate(); },
+      "zero proportional PID gain was accepted");
+  invalid = request;
+  invalid.profile.speed_pid_max_dt_ms = 201;
+  expect_throws(
+      [&] { invalid.validate(); },
+      "out-of-range PID max dt was accepted");
 }
 
 void test_shared_protocol_v1_vectors_and_session_states() {
@@ -1621,10 +1746,13 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
 
   const auto first_request = session_profile_request(1, 0, 20.0, 100.0, 100.0, 30.0, 80.0);
   const auto first = service.receive_session_profile(first_request, 0);
-  expect(first.accepted && !first.idempotent, "first session profile was rejected");
+  expect(
+      first.accepted && !first.idempotent && first.applied_revision == 1,
+      "first session profile was rejected or ACKed with the wrong revision");
   const auto first_status = service.session_control_profile();
   expect(
       first_status.at("last_request_seq") == 1 &&
+          first_status.at("applied_revision") == 1 &&
           first_status.at("active").get<bool>() &&
           first_status.at("accepted").get<bool>() &&
           !first_status.at("idempotent").get<bool>() &&
@@ -1790,35 +1918,46 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
       "rejected profile partially changed adapter brake authority");
 
   adapter_view->handshake.parking_ready = true;
-  const auto accepted = service.receive_session_profile(
+  const auto ready_blocked = service.receive_session_profile(
       session_profile_request(2, 10, 10.0, 100.0, 100.0, 30.0, 80.0),
       10);
+  expect(
+      !ready_blocked.accepted &&
+          ready_blocked.reason ==
+              "standby_or_disarmed_required_for_profile_change",
+      "parked Ready state bypassed the profile configuration state gate");
+  adapter_view->handshake.state = "standby";
+  const auto accepted = service.receive_session_profile(
+      session_profile_request(3, 20, 10.0, 100.0, 100.0, 30.0, 80.0),
+      20);
   expect(accepted.accepted, "parking-ready real-adapter profile was rejected");
+  adapter_view->handshake.state = "ready";
   adapter_view->handshake.parking_ready = false;
   const auto decreased = service.receive_session_profile(
-      session_profile_request(3, 20, 8.0, 80.0, 100.0, 30.0, 80.0),
-      20);
+      session_profile_request(4, 30, 8.0, 80.0, 100.0, 30.0, 80.0),
+      30);
   expect(decreased.accepted, "target/torque decrease required parking_ready");
   const auto brake_change = service.receive_session_profile(
-      session_profile_request(4, 30, 8.0, 80.0, 90.0, 20.0, 70.0),
-      30);
+      session_profile_request(5, 40, 8.0, 80.0, 90.0, 20.0, 70.0),
+      40);
   expect(
       !brake_change.accepted &&
           brake_change.reason == "parking_ready_required_for_profile_increase",
       "brake pressure change bypassed parking_ready");
   const auto target_raise = service.receive_session_profile(
-      session_profile_request(5, 40, 9.0, 80.0, 100.0, 30.0, 80.0),
-      40);
+      session_profile_request(6, 50, 9.0, 80.0, 100.0, 30.0, 80.0),
+      50);
   expect(
       !target_raise.accepted &&
           target_raise.reason == "parking_ready_required_for_profile_increase",
       "target-speed increase bypassed parking_ready");
 
   adapter_view->handshake.parking_ready = true;
+  adapter_view->handshake.state = "disarmed";
   adapter_view->control_limit_update_throws = true;
   const auto apply_failed = service.receive_session_profile(
-      session_profile_request(6, 50, 8.0, 70.0, 90.0, 20.0, 70.0),
-      50);
+      session_profile_request(7, 60, 8.0, 70.0, 90.0, 20.0, 70.0),
+      60);
   expect(
       !apply_failed.accepted &&
           apply_failed.reason == "adapter_session_profile_apply_failed" &&
@@ -1844,7 +1983,7 @@ void test_control_service_commits_only_successfully_applied_commands() {
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
     service.start(0);
-    activate_session_profile(service);
+    activate_adapter_owned_session_profile(service, *adapter_view);
 
     adapter_view->structured_rejection_issue_code =
         "vcu_drive_gear_change_moving_or_stale";
@@ -1868,7 +2007,7 @@ void test_control_service_commits_only_successfully_applied_commands() {
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
     service.start(0);
-    activate_session_profile(service);
+    activate_adapter_owned_session_profile(service, *adapter_view);
 
     expect(
         service.receive_command(command(1, 0), 0).accepted,
@@ -1949,10 +2088,13 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
     service.start(0);
+    adapter_view->handshake.state = "standby";
+    adapter_view->handshake.ready = false;
     const auto profile = service.receive_session_profile(
         session_profile_request(1, 0, 20.0, 100.0, 20.0, 10.0, 20.0),
         0);
     expect(profile.accepted, "20 bar session profile was rejected");
+    adapter_view->set_safe_stop(false, true, false);
     auto braking = command(1, 0);
     braking.throttle = 0.8;
     braking.brake = 0.5;
@@ -2005,7 +2147,7 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
     service.start(0);
-    activate_session_profile(service);
+    activate_adapter_owned_session_profile(service, *adapter_view);
     auto full_ordinary_brake = command(1, 0);
     full_ordinary_brake.throttle = 0.0;
     full_ordinary_brake.brake = 1.0;
@@ -2028,7 +2170,7 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 10000);
   service.start(0);
-  activate_session_profile(service);
+  activate_adapter_owned_session_profile(service, *adapter_view);
 
   expect(
       service.receive_command(command(1, 0), 0).accepted,
@@ -2064,6 +2206,7 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
           adapter_view->rejected_ordinary_safe_stops == 0,
       "outer timeout repeated an ordinary safe stop owned by the adapter");
 
+  adapter_view->set_safe_stop(false, false, false);
   activate_session_profile(service, 2, 900);
 
   adapter_view->handshake_succeeds = false;
@@ -2147,7 +2290,7 @@ void test_adapter_handshake_does_not_clear_outer_estop_or_fault() {
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
     service.start(0);
-    activate_session_profile(service);
+    activate_adapter_owned_session_profile(service, *adapter_view);
     const auto failed = service.receive_command(command(1, 0), 0);
     expect(
         !failed.accepted && failed.reason == "adapter_safety_status_unavailable" &&
@@ -2286,12 +2429,94 @@ void test_control_service_applies_vehicle_hard_limits() {
       3.0,
       1e-9,
       "reported steering limit mismatch");
+  expect_near(
+      limits.at("default_speed_pid_kp").get<double>(),
+      config.field_safety.speed_pid_kp,
+      1e-9,
+      "reported default PID kp mismatch");
+  expect(
+      limits.at("default_speed_pid_max_dt_ms") ==
+              config.field_safety.speed_pid_max_dt_ms &&
+          limits.at("speed_pid_limits").at("kp").at("min") == 0.0 &&
+          limits.at("speed_pid_limits").at("kp").at("max") == 100.0 &&
+          limits.at("speed_pid_limits").at("max_dt_ms").at("min") == 20 &&
+          limits.at("speed_pid_limits").at("max_dt_ms").at("max") == 200,
+      "reported PID defaults or absolute bounds mismatch");
+  mine_teleop::Json expected_deceleration_profile =
+      mine_teleop::Json::array();
+  for (const auto& stage : config.control.deceleration_profile) {
+    expected_deceleration_profile.push_back(
+        {{"after_ms", stage.after_ms}, {"brake", stage.brake}});
+  }
+  const mine_teleop::Json expected_read_only_control_safety{
+      {"control_rate_hz", config.control.rate_hz},
+      {"max_command_gap_ms", config.control.max_command_gap_ms},
+      {"degraded_timeout_ms", config.control.degraded_timeout_ms},
+      {"control_timeout_ms", config.control.control_timeout_ms},
+      {"deceleration_profile", expected_deceleration_profile},
+      {"speed_feedback_timeout_ms",
+       config.field_safety.speed_feedback_timeout_ms},
+      {"hard_overspeed_margin_kph",
+       config.field_safety.hard_overspeed_margin_kph},
+      {"require_can_feedback_before_control",
+       config.field_safety.require_can_feedback_before_control},
+      {"require_local_estop_reset",
+       config.field_safety.require_local_estop_reset},
+      {"require_time_sync", config.field_safety.require_time_sync},
+      {"max_time_sync_uncertainty_ms",
+       config.field_safety.max_time_sync_uncertainty_ms},
+      {"time_sync_interval_ms", config.field_safety.time_sync_interval_ms},
+      {"time_sync_samples", config.field_safety.time_sync_samples},
+      {"commissioning_mode", config.field_safety.commissioning_mode},
+  };
+  expect(
+      limits.at("read_only_control_safety") ==
+          expected_read_only_control_safety,
+      "read-only control safety report omitted or altered validated vehicle settings");
   service.close();
   expect_near(
       adapter_view->read_telemetry().brake_feedback,
       1.0,
       1e-9,
       "ordinary brake limit weakened disconnect safe-stop output");
+}
+
+void test_control_service_applies_session_steering_limit() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  config.field_safety.max_steering_angle_deg = 5.0;
+  auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+  auto* adapter_view = adapter.get();
+  mine_teleop::VehicleControlService service(
+      config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(0);
+  auto profile = session_profile_request(1, 0);
+  profile.profile.max_steering_angle_deg = 3.0;
+  const auto profile_result = service.receive_session_profile(profile, 0);
+  expect(profile_result.accepted, "session steering profile was rejected");
+
+  auto requested = command(1, 0);
+  requested.steering = 0.25;
+  const auto result = service.receive_command(requested, 0);
+  expect(
+      result.accepted && result.command.has_value(),
+      "session steering-limited command was rejected");
+  expect_near(
+      result.command->steering,
+      0.10,
+      1e-9,
+      "active session steering ceiling was not applied");
+  expect(
+      std::find(
+          result.warnings.begin(),
+          result.warnings.end(),
+          "session_max_steering_applied") != result.warnings.end(),
+      "session steering ceiling application was not reported");
+  expect_near(
+      adapter_view->read_telemetry().steering_feedback,
+      0.10,
+      1e-9,
+      "adapter received steering above the active session ceiling");
+  service.close();
 }
 
 void test_control_service_bounds_telemetry_history() {
@@ -3281,6 +3506,7 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"config_loads_current_vehicle_yaml", test_config_loads_current_vehicle_yaml},
+      {"vehicle_config_rejects_unimplemented_control_safety_options", test_vehicle_config_rejects_unimplemented_control_safety_options},
       {"vehicle_config_validates_full_scale_motor_torque", test_vehicle_config_validates_full_scale_motor_torque},
       {"vehicle_config_requires_physical_brake_pressure_units", test_vehicle_config_requires_physical_brake_pressure_units},
       {"vehicle_config_requires_monotonic_final_full_safety_brake", test_vehicle_config_requires_monotonic_final_full_safety_brake},
@@ -3329,6 +3555,7 @@ int main() {
       {"reset_estop_clears_soft_stop_before_fresh_control",
        test_reset_estop_clears_soft_stop_before_fresh_control},
       {"control_service_applies_vehicle_hard_limits", test_control_service_applies_vehicle_hard_limits},
+      {"control_service_applies_session_steering_limit", test_control_service_applies_session_steering_limit},
       {"control_service_bounds_telemetry_history", test_control_service_bounds_telemetry_history},
       {"control_service_requires_feedback_before_actuation_but_allows_estop", test_control_service_requires_feedback_before_actuation_but_allows_estop},
       {"fault_output_fails_safe", test_fault_output_fails_safe},

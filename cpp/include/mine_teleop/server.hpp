@@ -376,6 +376,13 @@ class DriverConsoleRuntime {
   double max_brake_pressure_bar_{100.0};
   double service_brake_pressure_bar_{30.0};
   double hard_brake_pressure_bar_{100.0};
+  double max_steering_angle_deg_{3.0};
+  double speed_pid_kp_{0.0};
+  double speed_pid_ki_{0.0};
+  double speed_pid_kd_{0.0};
+  double speed_pid_derivative_filter_tau_ms_{0.0};
+  int speed_pid_max_dt_ms_{0};
+  bool control_profile_initialized_{false};
   std::uint64_t last_control_profile_prepared_seq_{0};
   std::atomic<double> service_brake_limit_{0.3};
   std::atomic<double> hard_brake_limit_{1.0};

@@ -22,7 +22,8 @@ control:
   estop_hold_ms: 500
   limits:
     # Session defaults. The vehicle applies its own hard limits and must ACK the
-    # effective profile before ordinary driving is enabled.
+    # effective profile before ordinary driving is enabled. Speed PID defaults
+    # and bounds come only from vehicle control_limits telemetry.
     initial_target_speed_kph: 2.0
     # Per-motor software request default; not a measured or calibrated capability.
     initial_max_motor_torque_nm: 300.0

@@ -17,6 +17,8 @@ ui:
 control:
   rate_hz: 20
   estop_hold_ms: 500
+  # Speed PID defaults and bounds are vehicle-owned control_limits telemetry;
+  # do not add controller-side PID fallbacks here.
   gamepad:
     enabled: true
     steering_axis: 0
