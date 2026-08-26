@@ -222,7 +222,7 @@ http://127.0.0.1:28080
 1. `mine-teleop-cloud.target` 健康；
 2. 车端 `./bin/mine-teleop-run` 已注册并保持在线；
 3. 控制端登录并选择 `vehicle-001`；
-4. 确认控制权、视频轨道、时间同步和 DataChannel，并等待页面显示车端已确认会话控制参数；
+4. 确认控制权、视频轨道、时间同步和 DataChannel，并等待页面显示车端已确认 V2 会话控制参数及匹配的 `applied_revision`；
 5. 释放会话后确认车辆回到安全状态。
 
 推荐检查：
@@ -240,8 +240,10 @@ curl -fsS http://127.0.0.1:8080/health
 
 真实底盘上线前必须单独验收 CAN 反馈、制动、断链安全停车和本地急停。
 控制页面默认的 `300 Nm/路`、`100 bar/路` 以及软件/配置测试结果都不是实车能力或
-压力标定证据。普通驾驶前应在隔离台架确认 profile ACK 的 effective 值、目标车速 PID、
-CAN 请求、实测反馈、缓刹/急刹压力和断链撤销；不得用页面显示“已确认”替代硬件验收。
+压力标定证据。普通驾驶前应在隔离台架确认 profile ACK 的全部 effective V2 字段、
+`applied_revision == request.seq`、目标车速 PID、
+页面只读的原始 `max_speed_kph`/`max_throttle`、速度反馈超时、硬超速余量、watchdog/
+减速曲线，CAN 请求、实测反馈、缓刹/急刹压力和断链撤销；不得用页面显示“已确认”替代硬件验收。
 
 ## 7. 升级和回滚
 
@@ -259,6 +261,17 @@ CAN 请求、实测反馈、缓刹/急刹压力和断链撤销；不得用页面
   `deceleration_profile` 的 0.3/0.6 普通压力分段执行，最终 1.0 阶段才切到 409.5 bar。
   单电机转矩的控制端 schema 上限为 `640.0 Nm/路`。两者仍会被具体车辆 hard
   limits 下调，不能通过控制端设置提高车端上限。
+- `session_control_profile` 已升级为 `profile_version=2`：除原五项驾驶参数外，新增
+  `max_steering_angle_deg`、`speed_pid_kp/ki/kd`、
+  `speed_pid_derivative_filter_tau_ms` 和整数 `speed_pid_max_dt_ms`。控制端 YAML 不配置
+  PID 默认值；车端必须通过 `control_limits` 上报五个 `default_speed_pid_*` 字段和嵌套
+  `speed_pid_limits` min/max，以及顶层速度反馈超时、硬超速余量和 exact
+  `read_only_control_safety`（20 Hz 上游命令频率、命令间隔、watchdog、减速曲线、反馈超时、
+  超速余量、CAN/急停/时间同步门禁和 commissioning mode）。顶层与对象中的重复值必须一致。
+  缺少完整默认值/边界/固定安全对象、`kp <= 0` 或 ACK 缺少匹配的正整数
+  `applied_revision` 时，页面保持 fail closed。首次 profile、任一 PID 修改及转向上限任意
+  变化只能在 `parking_ready` 且 VCU 为 `standby`/`disarmed`，或明确的隔离 mock bench
+  条件下提交。
 - 将所有写旧 `/api/control-limits` 的集成迁移到 `/api/control-profile`。旧 GET 仅保留
   归一化比例只读兼容，旧 POST 固定返回 `410 Gone`，不会再直接修改当前会话制动参数。
 - 将旧 `POST /api/control/keyboard`、`POST /api/control/gamepad` 调用迁移到标准

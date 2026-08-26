@@ -76,6 +76,15 @@ struct SpeedControlSettings {
   double hard_overspeed_margin_mps{1.0};
 };
 
+struct RuntimeControlSettings {
+  bool active{false};
+  std::uint64_t revision{0};
+  double target_speed_limit_mps{0.0};
+  double max_motor_torque_nm{0.0};
+  double max_brake_pressure_bar{0.0};
+  double max_steering_request{0.0};
+};
+
 struct ControlIntent {
   int gear{1};
   double target_speed_mps{0.0};
@@ -856,6 +865,7 @@ class BridgeRuntime {
       : can_interface_(std::move(can_interface)),
         full_scale_motor_torque_nm_(full_scale_motor_torque_nm),
         control_timeout_ms_(control_timeout_ms),
+        open_speed_control_(speed_control),
         speed_control_(speed_control),
         physical_brake_input_(physical_brake_input),
         max_ordinary_brake_pressure_bar_(max_ordinary_brake_pressure_bar) {
@@ -973,6 +983,48 @@ class BridgeRuntime {
           "Complete the stopped disarm sequence and request a new VCU handshake before resuming.");
       return MINE_TELEOP_CHASSIS_APPLY_ISSUE_HARD_OVERSPEED_LATCHED;
     }
+    const bool traction_requested = normalized_longitudinal > 0.0;
+    if (traction_requested && !runtime_control_.active) {
+      withdraw_latest_traction_locked();
+      log_operation_rejected_locked(
+          "control_apply_rejected",
+          "vcu_runtime_control_profile_inactive",
+          "runtime_control_config",
+          "traction requires an active atomic runtime control profile",
+          "Apply and acknowledge a current session control profile before sending traction.");
+      return MINE_TELEOP_CHASSIS_APPLY_ISSUE_ARGUMENTS_INVALID;
+    }
+    if (runtime_control_.active) {
+      const double traction_limit = full_scale_motor_torque_nm_ > 0.0
+          ? runtime_control_.max_motor_torque_nm /
+              full_scale_motor_torque_nm_
+          : 0.0;
+      const int checked_steering_count = std::max(
+          0,
+          std::min(
+              steering_count,
+              static_cast<int>(mine_teleop::vcu::kSteeringAxisCount)));
+      const bool steering_exceeds_limit = std::any_of(
+          steering_values,
+          steering_values + checked_steering_count,
+          [&](double value) {
+            return std::abs(value) >
+                runtime_control_.max_steering_request + 1e-9;
+          });
+      if (target_speed_mps >
+              runtime_control_.target_speed_limit_mps + 1e-9 ||
+          normalized_longitudinal > traction_limit + 1e-9 ||
+          steering_exceeds_limit) {
+        withdraw_latest_traction_locked();
+        log_operation_rejected_locked(
+            "control_apply_rejected",
+            "vcu_runtime_control_profile_limit_exceeded",
+            "runtime_control_config",
+            "target speed, traction, or steering exceeded the active runtime profile",
+            "Keep commands within the acknowledged effective session profile.");
+        return MINE_TELEOP_CHASSIS_APPLY_ISSUE_ARGUMENTS_INVALID;
+      }
+    }
     if (gear_changed && driving_gear &&
         (!speed_feedback_fresh_locked(now) ||
          !gear_feedback_fresh_locked(now) ||
@@ -1002,6 +1054,120 @@ class BridgeRuntime {
     last_successful_apply_valid_ = true;
     clear_soft_stop_requested_ = true;
     return MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE;
+  }
+
+  std::uint32_t configure_runtime_control(
+      const MineTeleopChassisRuntimeControlConfigV1& config,
+      std::uint64_t& applied_revision) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    applied_revision = 0;
+    const MineTeleopChassisSpeedPidConfig pid{
+        config.speed_pid_kp,
+        config.speed_pid_ki,
+        config.speed_pid_kd,
+        config.speed_pid_derivative_filter_tau_ms,
+        config.speed_pid_max_dt_ms};
+    if (!running_.load() || io_error_ != 0) {
+      return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_RUNTIME_UNAVAILABLE;
+    }
+    if (config.struct_size != sizeof(MineTeleopChassisRuntimeControlConfigV1) ||
+        config.profile_version !=
+            MINE_TELEOP_CHASSIS_SESSION_CONTROL_PROFILE_VERSION ||
+        config.profile_revision == 0 || config.reserved != 0U ||
+        !std::isfinite(config.target_speed_limit_mps) ||
+        config.target_speed_limit_mps < 0.0 ||
+        config.target_speed_limit_mps > speed_control_.hard_speed_limit_mps ||
+        !std::isfinite(config.max_motor_torque_nm) ||
+        config.max_motor_torque_nm < 0.0 ||
+        config.max_motor_torque_nm > full_scale_motor_torque_nm_ ||
+        !std::isfinite(config.max_brake_pressure_bar) ||
+        config.max_brake_pressure_bar < 0.0 ||
+        config.max_brake_pressure_bar > max_ordinary_brake_pressure_bar_ ||
+        !std::isfinite(config.max_steering_request) ||
+        config.max_steering_request < 0.0 ||
+        config.max_steering_request >
+            MINE_TELEOP_CHASSIS_MAX_STEERING_REQUEST ||
+        !mine_teleop_chassis_speed_pid_config_is_valid(&pid)) {
+      return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_ARGUMENTS_INVALID;
+    }
+    if (runtime_control_.active &&
+        config.profile_revision <= runtime_control_.revision) {
+      return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_STALE_REVISION;
+    }
+
+    const auto& current_pid = speed_control_.pid;
+    const bool pid_changed =
+        pid.kp != current_pid.kp || pid.ki != current_pid.ki ||
+        pid.kd != current_pid.kd ||
+        pid.derivative_filter_tau_ms !=
+            current_pid.derivative_filter_tau_ms ||
+        pid.max_dt_ms != current_pid.max_dt_ms;
+    const bool requires_parking =
+        !runtime_control_.active || pid_changed ||
+        config.target_speed_limit_mps >
+            runtime_control_.target_speed_limit_mps + 1e-9 ||
+        config.max_motor_torque_nm >
+            runtime_control_.max_motor_torque_nm + 1e-9 ||
+        config.max_brake_pressure_bar !=
+            runtime_control_.max_brake_pressure_bar ||
+        config.max_steering_request !=
+            runtime_control_.max_steering_request;
+    const auto now = Clock::now();
+    const auto controller_state = controller_.state();
+    const bool configuration_state_allowed =
+        controller_state == mine_teleop::vcu::State::Standby ||
+        controller_state == mine_teleop::vcu::State::Disarmed;
+    if (requires_parking &&
+        (!configuration_state_allowed || !parking_gate_fresh_locked(now) ||
+         !controller_.parking_ready())) {
+      return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_PARKING_REQUIRED;
+    }
+
+    RuntimeControlSettings next;
+    next.active = true;
+    next.revision = config.profile_revision;
+    next.target_speed_limit_mps = config.target_speed_limit_mps;
+    next.max_motor_torque_nm = config.max_motor_torque_nm;
+    next.max_brake_pressure_bar = config.max_brake_pressure_bar;
+    next.max_steering_request = config.max_steering_request;
+    auto next_speed_control = speed_control_;
+    next_speed_control.pid = pid;
+
+    withdraw_latest_traction_locked();
+    latest_intent_.target_speed_mps = 0.0;
+    speed_control_ = next_speed_control;
+    runtime_control_ = next;
+    applied_revision = runtime_control_.revision;
+    try {
+      logger_.event(
+          "runtime_control_profile_applied",
+          "\"issue_code\":\"vcu_runtime_control_profile_applied\","
+          "\"stage\":\"runtime_control_config\","
+          "\"profile_revision\":" + std::to_string(applied_revision) +
+              ",\"safety_action\":\"traction_withdrawn_until_fresh_command\"",
+          true);
+    } catch (...) {
+    }
+    return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_NONE;
+  }
+
+  std::uint32_t clear_runtime_control(std::uint64_t& applied_revision) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    applied_revision = 0;
+    withdraw_latest_traction_locked();
+    latest_intent_.target_speed_mps = 0.0;
+    speed_control_.pid = open_speed_control_.pid;
+    runtime_control_ = RuntimeControlSettings{};
+    try {
+      logger_.event(
+          "runtime_control_profile_cleared",
+          "\"issue_code\":\"vcu_runtime_control_profile_cleared\","
+          "\"stage\":\"runtime_control_config\","
+          "\"safety_action\":\"traction_withdrawn\"",
+          true);
+    } catch (...) {
+    }
+    return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_NONE;
   }
 
   bool emergency_stop() {
@@ -2238,7 +2404,9 @@ class BridgeRuntime {
   std::string can_interface_;
   double full_scale_motor_torque_nm_;
   int control_timeout_ms_;
+  SpeedControlSettings open_speed_control_;
   SpeedControlSettings speed_control_;
+  RuntimeControlSettings runtime_control_;
   bool physical_brake_input_{false};
   double max_ordinary_brake_pressure_bar_{0.0};
   mutable std::mutex mutex_;
@@ -2421,6 +2589,12 @@ extern "C" std::uint32_t mine_teleop_chassis_open_config_v3_size() {
   return static_cast<std::uint32_t>(sizeof(MineTeleopChassisOpenConfigV3));
 }
 
+extern "C" std::uint32_t
+mine_teleop_chassis_runtime_control_config_v1_size() {
+  return static_cast<std::uint32_t>(
+      sizeof(MineTeleopChassisRuntimeControlConfigV1));
+}
+
 extern "C" int mine_teleop_chassis_open(const char* can_interface) {
   // Legacy entry points cannot supply a validated local speed controller.
   // They remain ABI-compatible but intentionally keep traction disabled.
@@ -2586,7 +2760,107 @@ int finish_apply(
   return result_code;
 }
 
+int finish_runtime_control(
+    MineTeleopChassisRuntimeControlResultV1* result,
+    int result_code,
+    std::uint32_t issue_id,
+    std::uint64_t applied_revision = 0) noexcept {
+  if (result != nullptr) {
+    *result = MineTeleopChassisRuntimeControlResultV1{
+        static_cast<std::uint32_t>(
+            sizeof(MineTeleopChassisRuntimeControlResultV1)),
+        result_code,
+        issue_id,
+        0U,
+        applied_revision};
+  }
+  return result_code;
+}
+
+int runtime_control_result_code(std::uint32_t issue_id) noexcept {
+  if (issue_id == MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_NONE) return 0;
+  if (issue_id ==
+      MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_ARGUMENTS_INVALID) {
+    return -1;
+  }
+  if (issue_id ==
+      MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_RUNTIME_UNAVAILABLE) {
+    return -2;
+  }
+  return -3;
+}
+
 }  // namespace
+
+extern "C" int mine_teleop_chassis_configure_runtime_control_v1(
+    const MineTeleopChassisRuntimeControlConfigV1* config,
+    MineTeleopChassisRuntimeControlResultV1* result) {
+  if (result == nullptr) return -1;
+  finish_runtime_control(
+      result,
+      -1,
+      MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_GENERIC_REJECTED);
+  try {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (config == nullptr) {
+      return finish_runtime_control(
+          result,
+          -1,
+          MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_ARGUMENTS_INVALID);
+    }
+    if (!g_runtime) {
+      return finish_runtime_control(
+          result,
+          -2,
+          MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_RUNTIME_UNAVAILABLE);
+    }
+    std::uint64_t applied_revision = 0;
+    const auto issue_id =
+        g_runtime->configure_runtime_control(*config, applied_revision);
+    return finish_runtime_control(
+        result,
+        runtime_control_result_code(issue_id),
+        issue_id,
+        issue_id == MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_NONE
+            ? applied_revision
+            : 0);
+  } catch (...) {
+    return finish_runtime_control(
+        result,
+        -5,
+        MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_INTERNAL_ERROR);
+  }
+}
+
+extern "C" int mine_teleop_chassis_clear_runtime_control_v1(
+    MineTeleopChassisRuntimeControlResultV1* result) {
+  if (result == nullptr) return -1;
+  finish_runtime_control(
+      result,
+      -1,
+      MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_GENERIC_REJECTED);
+  try {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_runtime) {
+      return finish_runtime_control(
+          result,
+          -2,
+          MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_RUNTIME_UNAVAILABLE);
+    }
+    std::uint64_t applied_revision = 0;
+    const auto issue_id = g_runtime->clear_runtime_control(applied_revision);
+    return finish_runtime_control(
+        result,
+        runtime_control_result_code(issue_id),
+        issue_id,
+        0);
+  } catch (...) {
+    return finish_runtime_control(
+        result,
+        -5,
+        MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_INTERNAL_ERROR);
+  }
+}
 
 extern "C" int mine_teleop_chassis_apply_state_v2(
     int target_gear,

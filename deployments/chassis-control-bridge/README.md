@@ -42,13 +42,18 @@ bridge path above and the same interface declared by `hardware.can.interface`
 speed-feedback deadline, hard-overspeed margin, `max_throttle`,
 `full_scale_motor_torque_nm`, `max_brake_pressure_bar`, and steering limits.
 
-Before ordinary driving, the controller submits a per-session profile containing
-target speed, maximum per-motor torque, maximum ordinary EHB pressure, service
-brake pressure, and hard-brake pressure. The vehicle applies and acknowledges
+Before ordinary driving, the controller submits a complete `profile_version=2`
+snapshot containing target speed, maximum per-motor torque, maximum ordinary
+EHB pressure, service and hard-brake pressure, maximum steering, and the five
+speed-PID settings. The vehicle applies and acknowledges
 that profile before it permits the VCU handshake. The profile can only reduce
 the immutable vehicle-side YAML limits and is cleared on disconnect, authority
-or session replacement, adapter-owned safety stop, and fault. Speed PID gains,
-feedback timing, and overspeed settings remain vehicle-side only.
+or session replacement, adapter-owned safety stop, and fault. First apply,
+steering/PID/brake changes, and target/torque increases require fresh parked-N
+feedback in Standby or Disarmed. A clear withdraws traction, resets the PID,
+and restores the YAML PID defaults without clearing a safety latch. Feedback
+timing, overspeed, command timeouts, and other reported safety settings remain
+vehicle-side read-only. A successful `applied_revision` equals the request seq.
 
 The runtime converts analog throttle to a local target speed within the
 acknowledged session target. The bridge's single
@@ -130,6 +135,10 @@ ABI version 3, an exact V3 struct-size match, and
 initialization. A V1/V2-only bridge fails closed instead of silently ignoring the
 physical ordinary-brake ceiling or interpreting the negative apply value as
 legacy deceleration.
+ABI version 3 also requires the runtime-control V1 size query plus
+`mine_teleop_chassis_configure_runtime_control_v1` and
+`mine_teleop_chassis_clear_runtime_control_v1`; missing symbols or a wrong POD
+size are rejected before SocketCAN initialization.
 `apply_state_v2` returns a fixed-size POD result in the same locked call. It
 distinguishes the D/R moving-or-stale gate from other rejected applies without
 exporting bridge log strings or requiring a racy last-error getter. The legacy
@@ -170,6 +179,9 @@ feedback confirms:
 - absolute speed no greater than 0.1 m/s;
 - all four EPBs parked (value 2);
 - VCU manual handshake state 3.
+
+This 20 ms period is the bridge's fixed 50 Hz SocketCAN I/O/PID loop. The
+upstream `control.rate_hz` is independently fixed at 20 Hz (50 ms).
 
 The parallel-driving feature intentionally reuses the vehicle's proven
 intelligent-driving handshake path:

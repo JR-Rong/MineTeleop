@@ -26,6 +26,8 @@
 #define MINE_TELEOP_CHASSIS_MAX_DERIVATIVE_FILTER_TAU_MS 2000.0
 #define MINE_TELEOP_CHASSIS_SPEED_PID_SETPOINT_RESET_DEADBAND_MPS 0.05
 #define MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS 10.0
+#define MINE_TELEOP_CHASSIS_SESSION_CONTROL_PROFILE_VERSION 2U
+#define MINE_TELEOP_CHASSIS_MAX_STEERING_REQUEST 1.0
 
 /* Convert the normalized longitudinal input used by the runtime into the
  * ChassisControl acceleration input. Negative values are the independent
@@ -434,6 +436,42 @@ struct MineTeleopChassisOpenConfigV3 {
     double max_ordinary_brake_pressure_bar;
 };
 
+/* Complete session-scoped runtime control snapshot. The immutable physical
+ * ceilings and safety watchdogs remain owned by OpenConfigV3. */
+struct MineTeleopChassisRuntimeControlConfigV1 {
+    uint32_t struct_size;
+    uint32_t profile_version;
+    uint64_t profile_revision;
+    double target_speed_limit_mps;
+    double max_motor_torque_nm;
+    double max_brake_pressure_bar;
+    double max_steering_request;
+    double speed_pid_kp;
+    double speed_pid_ki;
+    double speed_pid_kd;
+    double speed_pid_derivative_filter_tau_ms;
+    int32_t speed_pid_max_dt_ms;
+    uint32_t reserved;
+};
+
+enum MineTeleopChassisRuntimeControlIssueV1 {
+    MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_NONE = 0,
+    MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_GENERIC_REJECTED = 1,
+    MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_RUNTIME_UNAVAILABLE = 2,
+    MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_ARGUMENTS_INVALID = 3,
+    MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_PARKING_REQUIRED = 4,
+    MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_STALE_REVISION = 5,
+    MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_INTERNAL_ERROR = 6,
+};
+
+struct MineTeleopChassisRuntimeControlResultV1 {
+    uint32_t struct_size;
+    int32_t result_code;
+    uint32_t issue_id;
+    uint32_t reserved;
+    uint64_t applied_revision;
+};
+
 /* Stable, string-free apply rejection identifiers. Unknown future values must
  * be treated as MINE_TELEOP_CHASSIS_APPLY_ISSUE_GENERIC_REJECTED by callers. */
 enum MineTeleopChassisApplyIssueV1 {
@@ -487,6 +525,8 @@ static_assert(
     sizeof(MineTeleopChassisOpenConfigV3) ==
     sizeof(MineTeleopChassisOpenConfigV2) + sizeof(double));
 static_assert(sizeof(MineTeleopChassisApplyResultV1) == 16U);
+static_assert(sizeof(MineTeleopChassisRuntimeControlConfigV1) == 88U);
+static_assert(sizeof(MineTeleopChassisRuntimeControlResultV1) == 24U);
 #endif
 
 /* open stage/result order: -1=arguments/config/already open,
@@ -495,6 +535,7 @@ static_assert(sizeof(MineTeleopChassisApplyResultV1) == 16U);
 uint32_t mine_teleop_chassis_abi_version(void);
 uint32_t mine_teleop_chassis_open_config_v2_size(void);
 uint32_t mine_teleop_chassis_open_config_v3_size(void);
+uint32_t mine_teleop_chassis_runtime_control_config_v1_size(void);
 int mine_teleop_chassis_open(const char* can_interface);
 /* Versioned open used by current runtimes. Invalid size/torque is rejected
  * before ChassisControl or SocketCAN is touched. */
@@ -520,6 +561,15 @@ int mine_teleop_chassis_apply_state_v2(
     const double* steering_values,
     int steering_count,
     struct MineTeleopChassisApplyResultV1* result);
+/* Atomically withdraws the old traction intent, resets PID state, and installs
+ * one complete session snapshot. The revision is the wire profile request seq. */
+int mine_teleop_chassis_configure_runtime_control_v1(
+    const struct MineTeleopChassisRuntimeControlConfigV1* config,
+    struct MineTeleopChassisRuntimeControlResultV1* result);
+/* May be called from any bridge state. It never clears an existing safety
+ * latch and restores the PID gains supplied at open_v3. */
+int mine_teleop_chassis_clear_runtime_control_v1(
+    struct MineTeleopChassisRuntimeControlResultV1* result);
 int mine_teleop_chassis_emergency_stop(void);
 /* Start is accepted only while the selector is N, EPB is parked, speed is
  * zero, and the VCU reports manual state. */

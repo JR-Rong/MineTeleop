@@ -7,6 +7,9 @@
 CAN/VCU，因此已经完成的是协议编解码、状态机、20 ms 调度和日志实现；没有完成
 实车握手、执行器响应、制动效果或总线负载验收。
 
+这里的 `20 ms` 是 bridge SocketCAN I/O/PID 的固定 50 Hz 周期；上游
+`control.rate_hz` 独立固定为 `20 Hz`（50 ms），loader 会拒绝其他值。
+
 实现入口：
 
 - `cpp/include/mine_teleop/vcu.hpp`
@@ -76,8 +79,8 @@ N/R/D 三个挡位；电子驻车通过四路 EPB 状态单独判断，不能用
 本实现不启用未经台架验证的 VCU 车速闭环；无论 Ready、制动、换挡或故障，
 `ADU_Tx_VehSpdReq` 都固定编码为 `0 km/h / Q=0`。
 
-车速控制在车端 bridge 的唯一 SocketCAN I/O 线程执行，PID 参数来自车端 YAML，
-不由控制端下发。API 线程只保存最新控制意图；
+车速控制在车端 bridge 的唯一 SocketCAN I/O 线程执行。PID 启动默认值来自车端 YAML；
+`profile_version=2` 可在安全驻车门禁内由控制端按会话提交五个 PID 参数。API 线程只保存最新控制意图；
 I/O 线程每个 20 ms 周期用带符号的 VCU 车速反馈运行一次 PID，再串行调用
 ChassisControl，避免 vendor 接口并发。油门是已确认会话目标车速内的比例，最终
 目标同时受 `field_safety.max_speed_kph * max_throttle` 约束。任何正油门只表示启用 PID，
@@ -138,9 +141,11 @@ WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉
 车端对同时出现的油门和制动采用制动优先，任何正制动请求都会撤销牵引。ChassisControl
 更新失败或输出 NaN/Inf 时，bridge 立即锁存本地安全停车，不等待上游控制超时。
 键盘与 Gamepad 共用会话参数；修改参数会先清零当前输入。真实 adapter 的首次设置、
-提高目标车速/转矩或修改任一制动压力都要求新鲜的 N 挡、零速和 EPB 驻车反馈。
+提高目标车速/转矩或修改任一制动压力/转角/PID 都要求新鲜的 N 挡、零速和 EPB
+驻车反馈，且 controller 必须为 Standby 或 Disarmed。
 车端仅在实际应用参数后确认；未确认参数时不能请求 VCU 握手或发送普通驾驶命令。
-参数会在断链、故障、控制权/会话替换和 adapter 安全停车时清除。
+参数会在断链、故障、控制权/会话替换和 adapter 安全停车时清除；bridge 同时撤销牵引、
+复位 PID 并恢复 open_v3 时的 YAML 默认 PID。成功 ACK 的 `applied_revision` 必须等于请求 `seq`。
 车端 `field_safety.max_throttle`（目标车速比例上限）、
 `field_safety.full_scale_motor_torque_nm`、
 `field_safety.max_brake_pressure_bar` 和
@@ -255,8 +260,9 @@ vehicle_adapter:
 
 vehicle-agent runtime 与 bridge 必须原子成套升级。当前 runtime 要求 bridge 提供
 ABI version 3、完全一致的 V3 配置结构大小以及 `mine_teleop_chassis_open_v3`；
-同时要求同次返回结构化拒绝结果的 `mine_teleop_chassis_apply_state_v2`。这些查询在
-任何 SocketCAN 初始化前完成。`apply_state_v2` 只返回固定枚举，不传递日志字符串；
+同时要求同次返回结构化拒绝结果的 `mine_teleop_chassis_apply_state_v2`、runtime-control
+V1 大小查询，以及原子 configure/clear 符号。任一大小或必需符号不匹配都会在
+任何 SocketCAN 初始化前被拒绝。`apply_state_v2` 只返回固定枚举，不传递日志字符串；
 其中 D/R 移动或反馈过期可由 runtime 安全映射成稳定 issue code，未知值统一降级为
 通用拒绝。旧 `apply_state` 继续保留整数 fail-closed 包装。只提供 V1 的旧 bridge 会明确启动失败，
 V2 bridge 也会因缺少物理普通制动压力上限而失败，不会静默沿用旧的负加速度

@@ -28,6 +28,7 @@ inline constexpr double kDefaultMaxBrakePressureBar = 100.0;
 inline constexpr double kMaxOrdinaryBrakePressureBar = 327.6;
 inline constexpr double kMaxEmergencyBrakePressureBar = 409.5;
 inline constexpr int kSessionControlProfileMaxAgeMs = 2000;
+inline constexpr int kSessionControlProfileVersion = 2;
 static_assert(kMaxFullScaleMotorTorqueNm <= 800.0 * 0.8);
 static_assert(kMaxFullScaleMotorTorqueNm <= 838.3 * 0.8);
 
@@ -80,11 +81,18 @@ struct ControlCommand {
 };
 
 struct SessionControlProfile {
+  int profile_version{kSessionControlProfileVersion};
   double target_speed_kph{0.0};
   double max_motor_torque_nm{0.0};
   double max_brake_pressure_bar{0.0};
   double service_brake_pressure_bar{0.0};
   double hard_brake_pressure_bar{0.0};
+  double max_steering_angle_deg{0.0};
+  double speed_pid_kp{1.0};
+  double speed_pid_ki{0.2};
+  double speed_pid_kd{0.0};
+  double speed_pid_derivative_filter_tau_ms{100.0};
+  int speed_pid_max_dt_ms{100};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -117,6 +125,7 @@ struct SessionControlProfileResult {
   std::int64_t sent_at_utc_ms{0};
   bool accepted{false};
   bool idempotent{false};
+  std::uint64_t applied_revision{0};
   std::string reason;
   std::optional<SessionControlProfile> effective_profile;
 
@@ -486,9 +495,10 @@ class VehicleAdapter {
   virtual ~VehicleAdapter() = default;
   virtual void open() = 0;
   virtual void close() = 0;
-  virtual void set_session_control_limits(
-      double max_motor_torque_nm,
-      double max_brake_pressure_bar) = 0;
+  [[nodiscard]] virtual std::uint64_t configure_runtime_control_profile(
+      const SessionControlProfile& profile,
+      std::uint64_t profile_revision) = 0;
+  virtual void clear_runtime_control_profile() = 0;
   [[nodiscard]] virtual double session_motor_torque_limit_nm() const = 0;
   [[nodiscard]] virtual double session_brake_pressure_limit_bar() const = 0;
   virtual void apply_control(const ControlCommand& command) = 0;
@@ -506,9 +516,10 @@ class MockVehicleAdapter final : public VehicleAdapter {
  public:
   void open() override;
   void close() override;
-  void set_session_control_limits(
-      double max_motor_torque_nm,
-      double max_brake_pressure_bar) override;
+  [[nodiscard]] std::uint64_t configure_runtime_control_profile(
+      const SessionControlProfile& profile,
+      std::uint64_t profile_revision) override;
+  void clear_runtime_control_profile() override;
   [[nodiscard]] double session_motor_torque_limit_nm() const override;
   [[nodiscard]] double session_brake_pressure_limit_bar() const override;
   void apply_control(const ControlCommand& command) override;
@@ -528,6 +539,7 @@ class MockVehicleAdapter final : public VehicleAdapter {
   std::uint64_t safe_stop_count_{0};
   double session_motor_torque_limit_nm_{0.0};
   double session_brake_pressure_limit_bar_{0.0};
+  std::uint64_t runtime_control_profile_revision_{0};
 };
 
 class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
@@ -552,9 +564,10 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
 
   void open() override;
   void close() override;
-  void set_session_control_limits(
-      double max_motor_torque_nm,
-      double max_brake_pressure_bar) override;
+  [[nodiscard]] std::uint64_t configure_runtime_control_profile(
+      const SessionControlProfile& profile,
+      std::uint64_t profile_revision) override;
+  void clear_runtime_control_profile() override;
   [[nodiscard]] double session_motor_torque_limit_nm() const override;
   [[nodiscard]] double session_brake_pressure_limit_bar() const override;
   void apply_control(const ControlCommand& command) override;
@@ -580,6 +593,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   double max_ordinary_brake_pressure_bar_;
   double session_motor_torque_limit_nm_;
   double session_brake_pressure_limit_bar_;
+  std::uint64_t runtime_control_profile_revision_{0};
   int control_timeout_ms_;
   int speed_feedback_timeout_ms_;
   double speed_pid_kp_;
@@ -598,6 +612,8 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   using OpenV3Fn = int (*)(const void*);
   using ApplyFn = int (*)(int, double, double, const double*, int);
   using ApplyV2Fn = int (*)(int, double, double, const double*, int, void*);
+  using ConfigureRuntimeControlFn = int (*)(const void*, void*);
+  using ClearRuntimeControlFn = int (*)(void*);
   using StopFn = int (*)();
   using HandshakeFn = int (*)();
   using PollFeedbackFn = int (*)(void*);
@@ -608,6 +624,8 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   OpenV3Fn open_v3_fn_{nullptr};
   ApplyFn apply_fn_{nullptr};
   ApplyV2Fn apply_v2_fn_{nullptr};
+  ConfigureRuntimeControlFn configure_runtime_control_fn_{nullptr};
+  ClearRuntimeControlFn clear_runtime_control_fn_{nullptr};
   StopFn stop_fn_{nullptr};
   HandshakeFn request_handshake_fn_{nullptr};
   HandshakeFn disconnect_handshake_fn_{nullptr};
@@ -677,6 +695,14 @@ class VehicleControlService {
   double full_scale_motor_torque_nm_{kDefaultFullScaleMotorTorqueNm};
   double max_brake_pressure_bar_{kDefaultMaxBrakePressureBar};
   double max_steering_angle_deg_{30.0};
+  double default_speed_pid_kp_{1.0};
+  double default_speed_pid_ki_{0.2};
+  double default_speed_pid_kd_{0.0};
+  double default_speed_pid_derivative_filter_tau_ms_{100.0};
+  int default_speed_pid_max_dt_ms_{100};
+  int speed_feedback_timeout_ms_{200};
+  double hard_overspeed_margin_kph_{3.6};
+  Json read_only_control_safety_;
   int telemetry_interval_ms_;
   std::optional<std::int64_t> last_telemetry_ms_;
   std::uint64_t telemetry_sequence_{0};

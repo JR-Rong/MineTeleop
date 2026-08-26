@@ -25,6 +25,37 @@
     'service_brake',
     'hard_brake',
   ]);
+  const CONTROL_PROFILE_VERSION = 2;
+  const CONTROL_PROFILE_FIELDS = Object.freeze([
+    'profile_version',
+    'target_speed_kph',
+    'max_motor_torque_nm',
+    'max_brake_pressure_bar',
+    'service_brake_pressure_bar',
+    'hard_brake_pressure_bar',
+    'max_steering_angle_deg',
+    'speed_pid_kp',
+    'speed_pid_ki',
+    'speed_pid_kd',
+    'speed_pid_derivative_filter_tau_ms',
+    'speed_pid_max_dt_ms',
+  ]);
+  const READ_ONLY_CONTROL_SAFETY_FIELDS = Object.freeze([
+    'control_rate_hz',
+    'max_command_gap_ms',
+    'degraded_timeout_ms',
+    'control_timeout_ms',
+    'deceleration_profile',
+    'speed_feedback_timeout_ms',
+    'hard_overspeed_margin_kph',
+    'require_can_feedback_before_control',
+    'require_local_estop_reset',
+    'require_time_sync',
+    'max_time_sync_uncertainty_ms',
+    'time_sync_interval_ms',
+    'time_sync_samples',
+    'commissioning_mode',
+  ]);
 
   function clamp(value, minimum, maximum) {
     return Math.min(maximum, Math.max(minimum, value));
@@ -43,9 +74,161 @@
     return value;
   }
 
+  function requireIntegerRange(value, minimum, maximum, name) {
+    const number = requireFiniteRange(value, minimum, maximum, name);
+    if (!Number.isSafeInteger(number)) throw new TypeError(`${name} must be an integer`);
+    return number;
+  }
+
+  function normalizeSpeedPidLimits(value) {
+    if (!value || typeof value !== 'object') {
+      throw new TypeError('speed_pid_limits must be an object');
+    }
+    const normalizeRange = (rangeValue, minimum, maximum, name) => {
+      if (!rangeValue || typeof rangeValue !== 'object') {
+        throw new TypeError(`${name} must be an object`);
+      }
+      const normalized = {
+        min: requireFiniteRange(rangeValue.min, minimum, maximum, `${name}.min`),
+        max: requireFiniteRange(rangeValue.max, minimum, maximum, `${name}.max`),
+      };
+      if (normalized.min > normalized.max) throw new TypeError(`${name}.min must not exceed max`);
+      return normalized;
+    };
+    const maxDt = normalizeRange(value.max_dt_ms, 20, 200, 'speed_pid_limits.max_dt_ms');
+    if (!Number.isSafeInteger(maxDt.min) || !Number.isSafeInteger(maxDt.max)) {
+      throw new TypeError('speed_pid_limits.max_dt_ms bounds must be integers');
+    }
+    return {
+      kp: normalizeRange(value.kp, 0, 100, 'speed_pid_limits.kp'),
+      ki: normalizeRange(value.ki, 0, 100, 'speed_pid_limits.ki'),
+      kd: normalizeRange(value.kd, 0, 100, 'speed_pid_limits.kd'),
+      derivative_filter_tau_ms: normalizeRange(
+          value.derivative_filter_tau_ms, 0, 2000,
+          'speed_pid_limits.derivative_filter_tau_ms'),
+      max_dt_ms: maxDt,
+    };
+  }
+
+  function normalizeReadOnlyControlSafety(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new TypeError('read_only_control_safety must be an object');
+    }
+    const keys = Object.keys(value);
+    if (keys.length !== READ_ONLY_CONTROL_SAFETY_FIELDS.length ||
+        !READ_ONLY_CONTROL_SAFETY_FIELDS.every(
+            field => Object.prototype.hasOwnProperty.call(value, field))) {
+      throw new TypeError('read_only_control_safety must contain exactly the fixed fields');
+    }
+    const requireBoolean = (field) => {
+      if (typeof value[field] !== 'boolean') {
+        throw new TypeError(`read_only_control_safety.${field} must be boolean`);
+      }
+      return value[field];
+    };
+    const commissioningMode = value.commissioning_mode;
+    if (typeof commissioningMode !== 'string' || commissioningMode.length < 1) {
+      throw new TypeError(
+          'read_only_control_safety.commissioning_mode must be a non-empty string');
+    }
+    if (!Array.isArray(value.deceleration_profile) ||
+        value.deceleration_profile.length < 1) {
+      throw new TypeError(
+          'read_only_control_safety.deceleration_profile must be a non-empty array');
+    }
+    let previousAfterMs = -1;
+    let previousBrake = 0;
+    const decelerationProfile = value.deceleration_profile.map((stage, index) => {
+      if (!stage || typeof stage !== 'object' || Array.isArray(stage) ||
+          Object.keys(stage).length !== 2 ||
+          !Object.prototype.hasOwnProperty.call(stage, 'after_ms') ||
+          !Object.prototype.hasOwnProperty.call(stage, 'brake')) {
+        throw new TypeError(
+            'read_only_control_safety.deceleration_profile stages require exactly after_ms and brake');
+      }
+      const afterMs = requireIntegerRange(
+          stage.after_ms, 0, 2147483647,
+          `read_only_control_safety.deceleration_profile[${index}].after_ms`);
+      const brake = requireFiniteRange(
+          stage.brake, 0, 1,
+          `read_only_control_safety.deceleration_profile[${index}].brake`);
+      if ((index === 0 && afterMs !== 0) || afterMs <= previousAfterMs) {
+        throw new TypeError(
+            'read_only_control_safety.deceleration_profile after_ms must start at 0 and strictly increase');
+      }
+      if (brake < previousBrake) {
+        throw new TypeError(
+            'read_only_control_safety.deceleration_profile brake must not decrease');
+      }
+      previousAfterMs = afterMs;
+      previousBrake = brake;
+      return {after_ms: afterMs, brake};
+    });
+    if (Math.abs(
+        decelerationProfile[decelerationProfile.length - 1].brake - 1) > 1e-9) {
+      throw new TypeError(
+          'read_only_control_safety.deceleration_profile must end at brake 1');
+    }
+    const normalized = {
+      control_rate_hz: requireIntegerRange(
+          value.control_rate_hz, 20, 20,
+          'read_only_control_safety.control_rate_hz'),
+      max_command_gap_ms: requireIntegerRange(
+          value.max_command_gap_ms, 1, 60000,
+          'read_only_control_safety.max_command_gap_ms'),
+      degraded_timeout_ms: requireIntegerRange(
+          value.degraded_timeout_ms, 1, 60000,
+          'read_only_control_safety.degraded_timeout_ms'),
+      control_timeout_ms: requireIntegerRange(
+          value.control_timeout_ms, 1, 60000,
+          'read_only_control_safety.control_timeout_ms'),
+      deceleration_profile: decelerationProfile,
+      speed_feedback_timeout_ms: requireIntegerRange(
+          value.speed_feedback_timeout_ms, 20, 500,
+          'read_only_control_safety.speed_feedback_timeout_ms'),
+      hard_overspeed_margin_kph: requireFiniteRange(
+          value.hard_overspeed_margin_kph, 0, 36,
+          'read_only_control_safety.hard_overspeed_margin_kph'),
+      require_can_feedback_before_control:
+          requireBoolean('require_can_feedback_before_control'),
+      require_local_estop_reset: requireBoolean('require_local_estop_reset'),
+      require_time_sync: requireBoolean('require_time_sync'),
+      max_time_sync_uncertainty_ms: requireIntegerRange(
+          value.max_time_sync_uncertainty_ms, 0, 2147483647,
+          'read_only_control_safety.max_time_sync_uncertainty_ms'),
+      time_sync_interval_ms: requireIntegerRange(
+          value.time_sync_interval_ms, 1, 2147483647,
+          'read_only_control_safety.time_sync_interval_ms'),
+      time_sync_samples: requireIntegerRange(
+          value.time_sync_samples, 3, 15,
+          'read_only_control_safety.time_sync_samples'),
+      commissioning_mode: commissioningMode,
+    };
+    if (normalized.degraded_timeout_ms >= normalized.control_timeout_ms ||
+        normalized.speed_feedback_timeout_ms > normalized.control_timeout_ms) {
+      throw new TypeError(
+          'read_only_control_safety timeout ordering is invalid');
+    }
+    if (normalized.hard_overspeed_margin_kph <= 0) {
+      throw new TypeError(
+          'read_only_control_safety.hard_overspeed_margin_kph must be greater than 0');
+    }
+    return normalized;
+  }
+
   function normalizeControlProfile(value) {
     if (!value || typeof value !== 'object') throw new TypeError('control profile must be an object');
+    const keys = Object.keys(value);
+    if (keys.length !== CONTROL_PROFILE_FIELDS.length ||
+        !CONTROL_PROFILE_FIELDS.every(
+            field => Object.prototype.hasOwnProperty.call(value, field))) {
+      throw new TypeError('control profile must contain exactly the V2 fields');
+    }
+    if (value.profile_version !== CONTROL_PROFILE_VERSION) {
+      throw new TypeError(`profile_version must be ${CONTROL_PROFILE_VERSION}`);
+    }
     const profile = {
+      profile_version: CONTROL_PROFILE_VERSION,
       target_speed_kph: requireFiniteRange(value.target_speed_kph, 0, 72, 'target_speed_kph'),
       max_motor_torque_nm: requireFiniteRange(
           value.max_motor_torque_nm, 0, 640.0, 'max_motor_torque_nm'),
@@ -55,7 +238,18 @@
           value.service_brake_pressure_bar, 0, 327.6, 'service_brake_pressure_bar'),
       hard_brake_pressure_bar: requireFiniteRange(
           value.hard_brake_pressure_bar, 0, 327.6, 'hard_brake_pressure_bar'),
+      max_steering_angle_deg: requireFiniteRange(
+          value.max_steering_angle_deg, 0, 30, 'max_steering_angle_deg'),
+      speed_pid_kp: requireFiniteRange(value.speed_pid_kp, 0, 100, 'speed_pid_kp'),
+      speed_pid_ki: requireFiniteRange(value.speed_pid_ki, 0, 100, 'speed_pid_ki'),
+      speed_pid_kd: requireFiniteRange(value.speed_pid_kd, 0, 100, 'speed_pid_kd'),
+      speed_pid_derivative_filter_tau_ms: requireFiniteRange(
+          value.speed_pid_derivative_filter_tau_ms, 0, 2000,
+          'speed_pid_derivative_filter_tau_ms'),
+      speed_pid_max_dt_ms: requireIntegerRange(
+          value.speed_pid_max_dt_ms, 20, 200, 'speed_pid_max_dt_ms'),
     };
+    if (profile.speed_pid_kp <= 0) throw new TypeError('speed_pid_kp must be greater than 0');
     if (profile.service_brake_pressure_bar > profile.hard_brake_pressure_bar ||
         profile.hard_brake_pressure_bar > profile.max_brake_pressure_bar) {
       throw new TypeError(
@@ -72,7 +266,10 @@
     const explicitTargetSpeedKph = typeof value.max_target_speed_kph === 'number'
         ? requireFiniteRange(value.max_target_speed_kph, 0, 72, 'max_target_speed_kph')
         : computedTargetSpeedKph;
-    return {
+    const speedPidLimits = normalizeSpeedPidLimits(value.speed_pid_limits);
+    const readOnlyControlSafety =
+        normalizeReadOnlyControlSafety(value.read_only_control_safety);
+    const normalized = {
       max_speed_kph: maxSpeedKph,
       max_throttle: maxThrottle,
       max_target_speed_kph: Math.min(
@@ -81,7 +278,53 @@
           value.full_scale_motor_torque_nm, 0, 640.0, 'full_scale_motor_torque_nm'),
       max_brake_pressure_bar: requireFiniteRange(
           value.max_brake_pressure_bar, 0, 327.6, 'max_brake_pressure_bar'),
+      max_steering_angle_deg: requireFiniteRange(
+          value.max_steering_angle_deg, 0, 30, 'max_steering_angle_deg'),
+      default_speed_pid_kp: requireFiniteRange(
+          value.default_speed_pid_kp, speedPidLimits.kp.min, speedPidLimits.kp.max,
+          'default_speed_pid_kp'),
+      default_speed_pid_ki: requireFiniteRange(
+          value.default_speed_pid_ki, speedPidLimits.ki.min, speedPidLimits.ki.max,
+          'default_speed_pid_ki'),
+      default_speed_pid_kd: requireFiniteRange(
+          value.default_speed_pid_kd, speedPidLimits.kd.min, speedPidLimits.kd.max,
+          'default_speed_pid_kd'),
+      default_speed_pid_derivative_filter_tau_ms: requireFiniteRange(
+          value.default_speed_pid_derivative_filter_tau_ms,
+          speedPidLimits.derivative_filter_tau_ms.min,
+          speedPidLimits.derivative_filter_tau_ms.max,
+          'default_speed_pid_derivative_filter_tau_ms'),
+      default_speed_pid_max_dt_ms: requireIntegerRange(
+          value.default_speed_pid_max_dt_ms, speedPidLimits.max_dt_ms.min,
+          speedPidLimits.max_dt_ms.max, 'default_speed_pid_max_dt_ms'),
+      speed_pid_limits: speedPidLimits,
+      speed_feedback_timeout_ms: requireIntegerRange(
+          value.speed_feedback_timeout_ms, 20, 500, 'speed_feedback_timeout_ms'),
+      hard_overspeed_margin_kph: requireFiniteRange(
+          value.hard_overspeed_margin_kph, 0, 36, 'hard_overspeed_margin_kph'),
+      speed_feedback_timeout_ms_read_only:
+          value.speed_feedback_timeout_ms_read_only,
+      hard_overspeed_margin_kph_read_only:
+          value.hard_overspeed_margin_kph_read_only,
+      read_only_control_safety: readOnlyControlSafety,
     };
+    if (normalized.default_speed_pid_kp <= 0) {
+      throw new TypeError('default_speed_pid_kp must be greater than 0');
+    }
+    if (normalized.hard_overspeed_margin_kph <= 0) {
+      throw new TypeError('hard_overspeed_margin_kph must be greater than 0');
+    }
+    if (value.speed_feedback_timeout_ms_read_only !== true ||
+        value.hard_overspeed_margin_kph_read_only !== true) {
+      throw new TypeError('vehicle speed safety fields must be explicitly read-only');
+    }
+    if (normalized.speed_feedback_timeout_ms !==
+            readOnlyControlSafety.speed_feedback_timeout_ms ||
+        normalized.hard_overspeed_margin_kph !==
+            readOnlyControlSafety.hard_overspeed_margin_kph) {
+      throw new TypeError('flat and read_only_control_safety speed values must match');
+    }
+    return normalized;
   }
 
   function mergeControlProfileWithHardLimits(requestedValue, hardLimitValue) {
@@ -90,13 +333,54 @@
     const maxBrake = Math.min(
         requested.max_brake_pressure_bar, hard.max_brake_pressure_bar);
     return {
+      profile_version: CONTROL_PROFILE_VERSION,
       target_speed_kph: Math.min(requested.target_speed_kph, hard.max_target_speed_kph),
       max_motor_torque_nm: Math.min(
           requested.max_motor_torque_nm, hard.full_scale_motor_torque_nm),
       max_brake_pressure_bar: maxBrake,
       service_brake_pressure_bar: Math.min(requested.service_brake_pressure_bar, maxBrake),
       hard_brake_pressure_bar: Math.min(requested.hard_brake_pressure_bar, maxBrake),
+      max_steering_angle_deg: Math.min(
+          requested.max_steering_angle_deg, hard.max_steering_angle_deg),
+      speed_pid_kp: clamp(
+          requested.speed_pid_kp, hard.speed_pid_limits.kp.min,
+          hard.speed_pid_limits.kp.max),
+      speed_pid_ki: clamp(
+          requested.speed_pid_ki, hard.speed_pid_limits.ki.min,
+          hard.speed_pid_limits.ki.max),
+      speed_pid_kd: clamp(
+          requested.speed_pid_kd, hard.speed_pid_limits.kd.min,
+          hard.speed_pid_limits.kd.max),
+      speed_pid_derivative_filter_tau_ms: clamp(
+          requested.speed_pid_derivative_filter_tau_ms,
+          hard.speed_pid_limits.derivative_filter_tau_ms.min,
+          hard.speed_pid_limits.derivative_filter_tau_ms.max),
+      speed_pid_max_dt_ms: clamp(
+          requested.speed_pid_max_dt_ms, hard.speed_pid_limits.max_dt_ms.min,
+          hard.speed_pid_limits.max_dt_ms.max),
     };
+  }
+
+  function controlProfileFromVehicleDefaults(actuationValue, hardLimitValue) {
+    if (!actuationValue || typeof actuationValue !== 'object') {
+      throw new TypeError('control actuation defaults must be an object');
+    }
+    const hard = normalizeVehicleHardLimits(hardLimitValue);
+    return mergeControlProfileWithHardLimits({
+      profile_version: CONTROL_PROFILE_VERSION,
+      target_speed_kph: actuationValue.target_speed_kph,
+      max_motor_torque_nm: actuationValue.max_motor_torque_nm,
+      max_brake_pressure_bar: actuationValue.max_brake_pressure_bar,
+      service_brake_pressure_bar: actuationValue.service_brake_pressure_bar,
+      hard_brake_pressure_bar: actuationValue.hard_brake_pressure_bar,
+      max_steering_angle_deg: actuationValue.max_steering_angle_deg,
+      speed_pid_kp: hard.default_speed_pid_kp,
+      speed_pid_ki: hard.default_speed_pid_ki,
+      speed_pid_kd: hard.default_speed_pid_kd,
+      speed_pid_derivative_filter_tau_ms:
+          hard.default_speed_pid_derivative_filter_tau_ms,
+      speed_pid_max_dt_ms: hard.default_speed_pid_max_dt_ms,
+    }, hard);
   }
 
   function controlProfileThrottleLimit(profileValue, hardLimitValue) {
@@ -119,7 +403,14 @@
         left.max_motor_torque_nm === right.max_motor_torque_nm &&
         left.max_brake_pressure_bar === right.max_brake_pressure_bar &&
         left.service_brake_pressure_bar === right.service_brake_pressure_bar &&
-        left.hard_brake_pressure_bar === right.hard_brake_pressure_bar;
+        left.hard_brake_pressure_bar === right.hard_brake_pressure_bar &&
+        left.max_steering_angle_deg === right.max_steering_angle_deg &&
+        left.speed_pid_kp === right.speed_pid_kp &&
+        left.speed_pid_ki === right.speed_pid_ki &&
+        left.speed_pid_kd === right.speed_pid_kd &&
+        left.speed_pid_derivative_filter_tau_ms ===
+            right.speed_pid_derivative_filter_tau_ms &&
+        left.speed_pid_max_dt_ms === right.speed_pid_max_dt_ms;
   }
 
   function reduceControlProfileStatus(stateValue, statusValue) {
@@ -128,6 +419,7 @@
       pendingRequestSeq: 0,
       effectiveProfile: null,
       effectiveRequestSeq: 0,
+      effectiveAppliedRevision: 0,
       acknowledged: false,
       reason: '',
     }, stateValue || {});
@@ -135,6 +427,7 @@
     const requestSeq = status.last_request_seq;
     const pendingRequestSeq = state.pendingRequestSeq;
     const effectiveRequestSeq = state.effectiveRequestSeq;
+    const appliedRevision = status.applied_revision;
     if (Number.isSafeInteger(pendingRequestSeq) && pendingRequestSeq > 0) {
       if (!Number.isSafeInteger(requestSeq) || requestSeq !== pendingRequestSeq) {
         return {...state, matched: false, invalidated: false};
@@ -145,8 +438,23 @@
           pendingRequestSeq: 0,
           effectiveProfile: null,
           effectiveRequestSeq: 0,
+          effectiveAppliedRevision: 0,
           acknowledged: false,
           reason: String(status.reason || 'profile_rejected'),
+          matched: true,
+          invalidated: true,
+        };
+      }
+      if (!Number.isSafeInteger(appliedRevision) || appliedRevision <= 0 ||
+          appliedRevision !== pendingRequestSeq) {
+        return {
+          ...state,
+          pendingRequestSeq: 0,
+          effectiveProfile: null,
+          effectiveRequestSeq: 0,
+          effectiveAppliedRevision: 0,
+          acknowledged: false,
+          reason: 'applied_revision_mismatch',
           matched: true,
           invalidated: true,
         };
@@ -160,6 +468,7 @@
           pendingRequestSeq: 0,
           effectiveProfile: null,
           effectiveRequestSeq: 0,
+          effectiveAppliedRevision: 0,
           acknowledged: false,
           reason: `invalid_effective_profile: ${error.message}`,
           matched: true,
@@ -172,6 +481,7 @@
           pendingRequestSeq: 0,
           effectiveProfile: null,
           effectiveRequestSeq: 0,
+          effectiveAppliedRevision: 0,
           acknowledged: false,
           reason: 'effective_profile_mismatch',
           matched: true,
@@ -183,6 +493,7 @@
         pendingRequestSeq: 0,
         effectiveProfile,
         effectiveRequestSeq: requestSeq,
+        effectiveAppliedRevision: appliedRevision,
         acknowledged: true,
         reason: String(status.reason || 'accepted'),
         matched: true,
@@ -193,11 +504,14 @@
     if (state.acknowledged === true) {
       if (status.accepted !== true || status.active !== true ||
           !Number.isSafeInteger(requestSeq) ||
-          requestSeq !== effectiveRequestSeq) {
+          requestSeq !== effectiveRequestSeq ||
+          !Number.isSafeInteger(appliedRevision) || appliedRevision <= 0 ||
+          appliedRevision !== state.effectiveAppliedRevision) {
         return {
           ...state,
           effectiveProfile: null,
           effectiveRequestSeq: 0,
+          effectiveAppliedRevision: 0,
           acknowledged: false,
           reason: String(status.reason || 'profile_inactive_or_replaced'),
           matched: true,
@@ -212,6 +526,7 @@
           ...state,
           effectiveProfile: null,
           effectiveRequestSeq: 0,
+          effectiveAppliedRevision: 0,
           acknowledged: false,
           reason: `invalid_effective_profile: ${error.message}`,
           matched: true,
@@ -223,6 +538,7 @@
           ...state,
           effectiveProfile: null,
           effectiveRequestSeq: 0,
+          effectiveAppliedRevision: 0,
           acknowledged: false,
           reason: 'effective_profile_changed',
           matched: true,
@@ -599,6 +915,7 @@
     normalizeControlProfile,
     normalizeVehicleHardLimits,
     mergeControlProfileWithHardLimits,
+    controlProfileFromVehicleDefaults,
     controlProfileThrottleLimit,
     reduceControlProfileStatus,
     reduceGamepadNeutralInterlock,

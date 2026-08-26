@@ -571,6 +571,8 @@ void test_control_page_contract() {
       "the control page does not explain the failed VCU gate or handshake step");
   expect(
       response.body.find("实车调试限幅") != std::string::npos &&
+          response.body.find("驾驶参数") != std::string::npos &&
+          response.body.find("速度 PID 标定") != std::string::npos &&
           response.body.find("目标车速上限（km/h）") != std::string::npos &&
           response.body.find("max-motor-torque-nm") != std::string::npos &&
           response.body.find("max=\"640.0\"") != std::string::npos &&
@@ -578,8 +580,11 @@ void test_control_page_contract() {
           response.body.find("service-brake-pressure-bar") != std::string::npos &&
           response.body.find("hard-brake-pressure-bar") != std::string::npos &&
           response.body.find("max-steering-deg") != std::string::npos &&
-          response.body.find("上游控制超时先按 0.3/0.6 档普通压力减速，最终 1.0 阶段才切到 409.5 bar/路") !=
-              std::string::npos,
+          response.body.find("speed-pid-kp") != std::string::npos &&
+          response.body.find("speed-pid-ki") != std::string::npos &&
+          response.body.find("speed-pid-kd") != std::string::npos &&
+          response.body.find("speed-pid-derivative-filter-tau-ms") != std::string::npos &&
+          response.body.find("speed-pid-max-dt-ms") != std::string::npos,
       "field commissioning control limit dialog is missing");
   expect(
       response.body.find("effectiveControlLimits") != std::string::npos &&
@@ -595,7 +600,29 @@ void test_control_page_contract() {
           response.body.find("now-lastControlProfileSendAt<200") != std::string::npos &&
           response.body.find("每路 EHB 压力请求，单位 bar、分辨率 0.1 bar") !=
               std::string::npos &&
-          response.body.find("我已确认车辆处于隔离台架") != std::string::npos,
+          response.body.find("我已确认车辆处于 N 挡、零速、电子驻车或隔离 mock 台架") !=
+              std::string::npos &&
+          response.body.find("硬安全制动与 watchdog 参数不可编辑") != std::string::npos &&
+          response.body.find("vehicleHardLimits.max_speed_kph.toFixed(1)") !=
+              std::string::npos &&
+          response.body.find("vehicleHardLimits.max_throttle.toFixed(3)") !=
+              std::string::npos &&
+          response.body.find("vehicleHardLimits.speed_feedback_timeout_ms") !=
+              std::string::npos &&
+          response.body.find("vehicleHardLimits.hard_overspeed_margin_kph") !=
+              std::string::npos &&
+          response.body.find("readOnlyControlSafetyText(") != std::string::npos &&
+          response.body.find("safety.control_rate_hz") != std::string::npos &&
+          response.body.find("safety.deceleration_profile.map") != std::string::npos &&
+          response.body.find(
+              "read_only_control_safety must contain exactly the fixed fields") !=
+              std::string::npos &&
+          response.body.find("value.control_rate_hz, 20, 20") != std::string::npos &&
+          response.body.find(
+              "flat and read_only_control_safety speed values must match") !=
+              std::string::npos &&
+          response.body.find("等待车端完整硬上限、PID 默认值与固定安全参数") !=
+              std::string::npos,
       "controller limits are not combined with vehicle hard limits and operator confirmation");
   expect(
       response.body.find("control_profile_not_acknowledged") != std::string::npos &&
@@ -605,25 +632,35 @@ void test_control_page_contract() {
               std::string::npos &&
           response.body.find("applyControlProfileStatus(message);", response.body.find(
               "message.event==='session_control_profile_status'")) != std::string::npos &&
-          response.body.find("resetControlProfileSession()") != std::string::npos,
+          response.body.find("resetControlProfileSession()") != std::string::npos &&
+          response.body.find("effectiveAppliedRevision") != std::string::npos &&
+          response.body.find("applied_revision:controlProfileState.effectiveAppliedRevision") !=
+              std::string::npos,
       "ordinary driving is not fail-closed on session control profile acknowledgement");
   expect(
       response.body.find("defaultProfileAutoAttempted=false") != std::string::npos &&
           response.body.find(
               "controlProfilePrepareInFlight=false;defaultProfileAutoAttempted=false;"
-              "controlLimits.maxSteeringDeg") != std::string::npos &&
+              "vehicleHardLimits={received:false}") != std::string::npos &&
           response.body.find(
-              "function defaultControlProfileAutoReady(){return "
-              "vcuHandshake.parking_ready===true||(vcuMockUnsupported()&&"
-              "vcuHandshake.adapter_ready===true)}") != std::string::npos &&
+              "controlLogic.controlProfileFromVehicleDefaults(driverActuationDefaults,hard)") !=
+              std::string::npos &&
+          response.body.find(
+              "parkedStandby=vcuHandshake.parking_ready===true&&"
+              "(vcuHandshake.state==='standby'||vcuHandshake.state==='disarmed')") !=
+              std::string::npos &&
+          response.body.find("return mockBench||parkedStandby") != std::string::npos &&
           response.body.find(
               "if(defaultProfileAutoAttempted||controlChannel?.readyState!=='open'") !=
               std::string::npos &&
           response.body.find(
-              "defaultProfileAutoAttempted=true;prepareControlProfile(defaults,false)") !=
+              "defaultProfileAutoAttempted=true;prepareControlProfile("
+              "controlProfileState.requestedProfile,false)") !=
               std::string::npos,
       "default profile can auto-submit before parking readiness or repeatedly after rejection");
   expect(
+      response.body.find("pidChanged=!prior||requested.speed_pid_kp!==prior.speed_pid_kp") !=
+              std::string::npos &&
       response.body.find(
               "requested.target_speed_kph>prior.target_speed_kph||"
               "requested.max_motor_torque_nm>prior.max_motor_torque_nm") !=
@@ -633,9 +670,14 @@ void test_control_page_contract() {
               "requested.service_brake_pressure_bar!==prior.service_brake_pressure_bar||"
               "requested.hard_brake_pressure_bar!==prior.hard_brake_pressure_bar") !=
               std::string::npos &&
+          response.body.find(
+              "requested.max_steering_angle_deg!==prior.max_steering_angle_deg") !=
+              std::string::npos &&
           response.body.find("if(requiresParking&&!defaultControlProfileAutoReady())") !=
+              std::string::npos &&
+          response.body.find("VCU 为 standby/disarmed") !=
               std::string::npos,
-      "profile editing does not preflight vehicle parking rules for speed, torque, and brake changes");
+      "profile editing does not preflight parking rules for speed, torque, brake, steering, and PID changes");
   const auto control_post = response.body.find("post('/api/control',outgoing)");
   expect(
       control_post != std::string::npos &&
@@ -1560,13 +1602,21 @@ void test_driver_vehicle_switch_releases_old_session() {
   mine_teleop::HttpRequest profile_request;
   profile_request.method = "POST";
   profile_request.path = "/api/control-profile";
-  profile_request.body = mine_teleop::Json({
+  const mine_teleop::Json valid_profile = {
+      {"profile_version", 2},
       {"target_speed_kph", 3.0},
       {"max_motor_torque_nm", 250.0},
       {"max_brake_pressure_bar", 80.0},
       {"service_brake_pressure_bar", 8.0},
       {"hard_brake_pressure_bar", 20.0},
-  }).dump();
+      {"max_steering_angle_deg", 3.0},
+      {"speed_pid_kp", 1.5},
+      {"speed_pid_ki", 0.2},
+      {"speed_pid_kd", 0.1},
+      {"speed_pid_derivative_filter_tau_ms", 50.0},
+      {"speed_pid_max_dt_ms", 100},
+  };
+  profile_request.body = valid_profile.dump();
   const auto profile_response = control_app.handle(profile_request);
   expect(profile_response.status == 200, "session control profile could not be prepared");
   const auto profile_result = mine_teleop::Json::parse(profile_response.body);
@@ -1584,11 +1634,18 @@ void test_driver_vehicle_switch_releases_old_session() {
       "prepared session profile lost authenticated envelope identity");
   expect(
       !profile_envelope.contains("profile") &&
+          profile_envelope.value("profile_version", 0) == 2 &&
           profile_envelope.value("target_speed_kph", -1.0) == 3.0 &&
           profile_envelope.value("max_motor_torque_nm", -1.0) == 250.0 &&
           profile_envelope.value("max_brake_pressure_bar", -1.0) == 80.0 &&
           profile_envelope.value("service_brake_pressure_bar", -1.0) == 8.0 &&
-          profile_envelope.value("hard_brake_pressure_bar", -1.0) == 20.0,
+          profile_envelope.value("hard_brake_pressure_bar", -1.0) == 20.0 &&
+          profile_envelope.value("max_steering_angle_deg", -1.0) == 3.0 &&
+          profile_envelope.value("speed_pid_kp", -1.0) == 1.5 &&
+          profile_envelope.value("speed_pid_ki", -1.0) == 0.2 &&
+          profile_envelope.value("speed_pid_kd", -1.0) == 0.1 &&
+          profile_envelope.value("speed_pid_derivative_filter_tau_ms", -1.0) == 50.0 &&
+          profile_envelope.value("speed_pid_max_dt_ms", -1) == 100,
       "session profile request is not the canonical flat DataChannel schema");
 
   mine_teleop::HttpRequest get_profile_request;
@@ -1600,30 +1657,45 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(
       prepared_profile.value("target_speed_kph", -1.0) == 3.0 &&
           prepared_profile.value("max_motor_torque_nm", -1.0) == 250.0 &&
+          prepared_profile.value("profile_version", 0) == 2 &&
+          prepared_profile.value("initialized", false) &&
+          prepared_profile.value("max_steering_angle_deg", -1.0) == 3.0 &&
+          prepared_profile.value("speed_pid_kp", -1.0) == 1.5 &&
+          prepared_profile.value("speed_pid_max_dt_ms", -1) == 100 &&
           prepared_profile.value("last_prepared_seq", std::uint64_t{0}) ==
               profile_envelope.value("seq", std::uint64_t{0}),
       "prepared session profile state does not match its DataChannel envelope");
 
-  profile_request.body = mine_teleop::Json({
-      {"target_speed_kph", 3.0},
-      {"max_motor_torque_nm", 640.1},
-      {"max_brake_pressure_bar", 80.0},
-      {"service_brake_pressure_bar", 8.0},
-      {"hard_brake_pressure_bar", 20.0},
-  }).dump();
+  auto invalid_profile = valid_profile;
+  invalid_profile["max_motor_torque_nm"] = 640.1;
+  profile_request.body = invalid_profile.dump();
   expect(
       control_app.handle(profile_request).status == 400,
       "session profile accepted torque above the controller schema ceiling");
-  profile_request.body = mine_teleop::Json({
-      {"target_speed_kph", 3.0},
-      {"max_motor_torque_nm", 250.0},
-      {"max_brake_pressure_bar", 327.7},
-      {"service_brake_pressure_bar", 8.0},
-      {"hard_brake_pressure_bar", 20.0},
-  }).dump();
+  invalid_profile = valid_profile;
+  invalid_profile["max_brake_pressure_bar"] = 327.7;
+  profile_request.body = invalid_profile.dump();
   expect(
       control_app.handle(profile_request).status == 400,
       "session profile accepted ordinary EHB pressure above the schema ceiling");
+  invalid_profile = valid_profile;
+  invalid_profile["speed_pid_kp"] = 0.0;
+  profile_request.body = invalid_profile.dump();
+  expect(
+      control_app.handle(profile_request).status == 400,
+      "session profile accepted a non-positive speed PID kp");
+  invalid_profile = valid_profile;
+  invalid_profile["speed_pid_max_dt_ms"] = 100.5;
+  profile_request.body = invalid_profile.dump();
+  expect(
+      control_app.handle(profile_request).status == 400,
+      "session profile accepted a fractional speed PID max dt");
+  invalid_profile = valid_profile;
+  invalid_profile["unexpected_field"] = 1;
+  profile_request.body = invalid_profile.dump();
+  expect(
+      control_app.handle(profile_request).status == 400,
+      "session profile accepted fields outside the V2 schema");
   const auto profile_analog_brake = driver.send_control(
       {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
   expect(
@@ -1698,11 +1770,18 @@ void test_driver_vehicle_switch_releases_old_session() {
       "rejected legacy control-limit mutation changed the active profile");
 
   profile_request.body = mine_teleop::Json({
+      {"profile_version", 2},
       {"target_speed_kph", 0.0},
       {"max_motor_torque_nm", 0.0},
       {"max_brake_pressure_bar", 0.0},
       {"service_brake_pressure_bar", 0.0},
       {"hard_brake_pressure_bar", 0.0},
+      {"max_steering_angle_deg", 0.0},
+      {"speed_pid_kp", 1.5},
+      {"speed_pid_ki", 0.2},
+      {"speed_pid_kd", 0.1},
+      {"speed_pid_derivative_filter_tau_ms", 50.0},
+      {"speed_pid_max_dt_ms", 100},
   }).dump();
   expect(
       control_app.handle(profile_request).status == 200,
@@ -1733,6 +1812,10 @@ void test_driver_vehicle_switch_releases_old_session() {
           reset_profile.value("max_brake_pressure_bar", -1.0) == 100.0 &&
           reset_profile.value("service_brake_pressure_bar", -1.0) == 10.0 &&
           reset_profile.value("hard_brake_pressure_bar", -1.0) == 25.0 &&
+          reset_profile.value("profile_version", 0) == 2 &&
+          !reset_profile.value("initialized", true) &&
+          reset_profile.value("speed_pid_kp", -1.0) == 0.0 &&
+          reset_profile.value("speed_pid_max_dt_ms", -1) == 0 &&
           reset_profile.value("last_prepared_seq", std::uint64_t{1}) == 0,
       "session end retained a prepared control profile instead of YAML defaults");
   expect(driver.vehicles().value("authenticated", false), "session end unexpectedly logged out the driver");
