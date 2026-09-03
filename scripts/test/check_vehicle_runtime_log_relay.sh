@@ -50,6 +50,18 @@ fake_runtime="$package_root/bin/mine-teleop"
   printf '%s\n' '    printf "burst-%03d-abcdefghijklmnopqrstuvwxyz0123456789\\n" "$index"'
   printf '%s\n' '  done'
   printf '%s\n' 'fi'
+  printf '%s\n' 'if [[ "${MINE_TELEOP_TEST_VENDOR_CHATTER:-0}" == "1" ]]; then'
+  printf '%s\n' '  printf "[2026-09-03 07:34:12.345] [I] [1234] [GLOBAL] vendor-info-chatter\\n"'
+  printf '%s\n' '  printf "\\033[1m\\033[32m[2026-09-03 07:34:12.346] [I] [1234] [GLOBAL] vendor-color-chatter\\n"'
+  printf '%s\n' '  printf "\\033[0m\\033[36m[2026-09-03 07:34:12.347] [D] [1234] [GLOBAL] vendor-debug-chatter\\n\\033[0m"'
+  printf '%s\n' '  printf "\\033[0m[2026-09-03 07:34:12.348] [W] [1234] [GLOBAL] vendor-warning-kept\\n"'
+  printf '%s\n' '  printf "[2026-09-03 07:34:12.349] [E] [1234] [GLOBAL] vendor-error-kept\\n"'
+  printf '%s\n' '  printf "[2026-09-03 07:34:12.350] [C] [1234] [GLOBAL] vendor-critical-kept\\n"'
+  printf '%s\n' '  printf '\''{"event":"json-split'\'''
+  printf '%s\n' '  sleep 0.2'
+  printf '%s\n' '  printf -- '\''-line"}\n'\'''
+  printf '%s\n' '  printf "unterminated-tail"'
+  printf '%s\n' 'fi'
   printf '%s\n' 'if [[ "${MINE_TELEOP_TEST_WAIT:-0}" == "1" ]]; then'
   printf '%s\n' '  trap '\''printf "runtime-term-observed\\n"; exit 143'\'' TERM'
   printf '%s\n' '  while :; do sleep 0.1; done'
@@ -192,5 +204,38 @@ set -e
 [[ "$symlink_status" -eq 126 ]]
 grep -F 'runtime_log_open_failed' "$temporary/symlink.stderr" >/dev/null
 [[ ! -s "$symlink_target" ]]
+
+filter_log="$temporary/filter/vehicle-runtime.log"
+set +e
+MINE_TELEOP_VEHICLE_RUNTIME_LOG_PATH="$filter_log" \
+MINE_TELEOP_TEST_VENDOR_CHATTER=1 \
+  "$package_root/bin/mine-teleop-run" >"$temporary/filter.stdout" 2>"$temporary/filter.stderr"
+filter_status=$?
+set -e
+[[ "$filter_status" -eq 7 ]]
+# Vendor debug/info chatter stays on the terminal but is not persisted.
+grep -F 'vendor-info-chatter' "$temporary/filter.stdout" >/dev/null
+grep -F 'vendor-color-chatter' "$temporary/filter.stdout" >/dev/null
+grep -F 'vendor-debug-chatter' "$temporary/filter.stdout" >/dev/null
+if grep -F 'vendor-info-chatter' "$filter_log" >/dev/null; then
+  printf 'plain vendor info chatter was persisted to the runtime log\n' >&2
+  exit 1
+fi
+if grep -F 'vendor-color-chatter' "$filter_log" >/dev/null; then
+  printf 'colored vendor info chatter was persisted to the runtime log\n' >&2
+  exit 1
+fi
+if grep -F 'vendor-debug-chatter' "$filter_log" >/dev/null; then
+  printf 'vendor debug chatter was persisted to the runtime log\n' >&2
+  exit 1
+fi
+# Vendor warning-and-above lines and runtime diagnostics are still recorded.
+grep -F 'vendor-warning-kept' "$filter_log" >/dev/null
+grep -F 'vendor-error-kept' "$filter_log" >/dev/null
+grep -F 'vendor-critical-kept' "$filter_log" >/dev/null
+# A line split across reads is reassembled, and an unterminated tail is
+# flushed when the stream closes.
+grep -F '{"event":"json-split-line"}' "$filter_log" >/dev/null
+grep -F 'unterminated-tail' "$filter_log" >/dev/null
 
 printf 'vehicle_runtime_log_relay_check=passed\n'

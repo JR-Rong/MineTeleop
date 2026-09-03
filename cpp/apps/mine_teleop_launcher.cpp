@@ -28,6 +28,10 @@ constexpr std::uintmax_t kDefaultRuntimeLogMaxBytes = 64U * 1024U * 1024U;
 constexpr int kDefaultRuntimeLogRotations = 5;
 constexpr std::size_t kRelayBufferBytes = 16U * 1024U;
 constexpr int kRelayReadsPerStream = 16;
+// Bound the partial-line buffer kept while splitting relayed output into
+// lines; a writer that never emits a newline must not grow memory without
+// limit, so an over-long pending fragment is persisted as-is.
+constexpr std::size_t kMaxPendingLogLineBytes = 64U * 1024U;
 
 volatile std::sig_atomic_t relay_signal = 0;
 
@@ -369,7 +373,119 @@ struct RelayStream {
   int descriptor{-1};
   int terminal_descriptor{-1};
   bool terminal_enabled{true};
+  std::string log_pending;
 };
+
+bool ascii_digit(char character) {
+  return character >= '0' && character <= '9';
+}
+
+// The vendor ChassisControl library dumps its full global state through its
+// log_printf helper once per control cycle (see UpdateVehicleState ->
+// CalculateWheelControlData -> SendCanMessage). Those lines keep value on a
+// live operator terminal but bury the persisted runtime log, so lines in the
+// vendor format at debug/info level are relayed to the terminal only.
+// Vendor format, optionally wrapped in ANSI colour escapes:
+//   [2026-09-03 07:34:12.345] [I] [1234] [TAG] message
+std::string_view strip_leading_ansi_escapes(std::string_view line) {
+  while (line.size() >= 2 && line[0] == '\x1b' && line[1] == '[') {
+    std::size_t index = 2;
+    while (index < line.size() &&
+           (line[index] < 0x40 || line[index] > 0x7e)) {
+      ++index;
+    }
+    if (index >= line.size()) return line;
+    line.remove_prefix(index + 1);
+  }
+  return line;
+}
+
+// Returns the vendor log level character when the line matches the vendor
+// log_printf prefix, or '\0' when it does not.
+char vendor_log_line_level(std::string_view raw_line) {
+  const std::string_view line = strip_leading_ansi_escapes(raw_line);
+  // "[YYYY-MM-DD HH:MM:SS.mmm] [L] [" is 31 characters.
+  if (line.size() < 32) return '\0';
+  if (line[0] != '[') return '\0';
+  for (const std::size_t index :
+       {1, 2, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22, 23}) {
+    if (!ascii_digit(line[index])) return '\0';
+  }
+  if (line[5] != '-' || line[8] != '-' || line[11] != ' ' ||
+      line[14] != ':' || line[17] != ':' || line[20] != '.' ||
+      line[24] != ']' || line[25] != ' ' || line[26] != '[' ||
+      line[28] != ']' || line[29] != ' ' || line[30] != '[') {
+    return '\0';
+  }
+  std::size_t index = 31;
+  if (!ascii_digit(line[index])) return '\0';
+  while (index < line.size() && ascii_digit(line[index])) ++index;
+  if (index + 2 >= line.size() || line[index] != ']' ||
+      line[index + 1] != ' ' || line[index + 2] != '[') {
+    return '\0';
+  }
+  return line[27];
+}
+
+bool vendor_chatter_line(std::string_view line) {
+  const char level = vendor_log_line_level(line);
+  return level == 'D' || level == 'I';
+}
+
+// Buffers relayed output per stream, splits it into lines, and persists
+// everything except vendor debug/info chatter (see vendor_chatter_line).
+// Terminal output is unaffected: it is written raw before this helper runs.
+void persist_stream_log(
+    RelayStream& stream,
+    RotatingRuntimeLog& log,
+    bool& log_enabled,
+    bool& log_failure_reported,
+    std::string_view chunk,
+    bool flush_partial) {
+  if (!log_enabled) return;
+  stream.log_pending.append(chunk.data(), chunk.size());
+
+  const auto report_failure = [&](std::string_view error) {
+    log_enabled = false;
+    if (log_failure_reported) return;
+    const auto diagnostic = runtime_log_event(
+        "vehicle_runtime_log_write_failed",
+        "runtime_log_write_failed",
+        "critical",
+        log.path(),
+        error,
+        "Keep the vehicle in a safe state, free disk space or repair the log filesystem, then restart the runtime in a controlled maintenance window.");
+    write_all(STDERR_FILENO, diagnostic.data(), diagnostic.size());
+    log_failure_reported = true;
+  };
+
+  std::size_t consumed = 0;
+  while (log_enabled) {
+    const auto newline = stream.log_pending.find('\n', consumed);
+    if (newline == std::string::npos) break;
+    const auto line = std::string_view(stream.log_pending)
+                          .substr(consumed, newline - consumed + 1);
+    consumed = newline + 1;
+    if (vendor_chatter_line(line)) continue;
+    std::string error;
+    if (!log.append(line, error)) report_failure(error);
+  }
+  stream.log_pending.erase(0, consumed);
+
+  if (!log_enabled) {
+    stream.log_pending.clear();
+    return;
+  }
+  if ((flush_partial || stream.log_pending.size() > kMaxPendingLogLineBytes) &&
+      !stream.log_pending.empty()) {
+    std::string error;
+    if (!vendor_chatter_line(stream.log_pending) &&
+        !log.append(stream.log_pending, error)) {
+      report_failure(error);
+    }
+    stream.log_pending.clear();
+  }
+}
 
 bool drain_stream(
     RelayStream& stream,
@@ -391,32 +507,24 @@ bool drain_stream(
               true)) {
         stream.terminal_enabled = false;
       }
-      if (log_enabled) {
-        std::string error;
-        if (!log.append(std::string_view(buffer.data(), size), error)) {
-          log_enabled = false;
-          if (!log_failure_reported) {
-            const auto diagnostic = runtime_log_event(
-                "vehicle_runtime_log_write_failed",
-                "runtime_log_write_failed",
-                "critical",
-                log.path(),
-                error,
-                "Keep the vehicle in a safe state, free disk space or repair the log filesystem, then restart the runtime in a controlled maintenance window.");
-            write_all(STDERR_FILENO, diagnostic.data(), diagnostic.size());
-            log_failure_reported = true;
-          }
-        }
-      }
+      persist_stream_log(
+          stream,
+          log,
+          log_enabled,
+          log_failure_reported,
+          std::string_view(buffer.data(), size),
+          false);
       continue;
     }
     if (count == 0) {
+      persist_stream_log(stream, log, log_enabled, log_failure_reported, {}, true);
       ::close(stream.descriptor);
       stream.descriptor = -1;
       return read_any;
     }
     if (errno == EINTR) continue;
     if (errno == EAGAIN || errno == EWOULDBLOCK) return read_any;
+    persist_stream_log(stream, log, log_enabled, log_failure_reported, {}, true);
     ::close(stream.descriptor);
     stream.descriptor = -1;
     return read_any;
@@ -563,8 +671,8 @@ int relay_runtime(
 
   ::sigprocmask(SIG_SETMASK, &prior_signal_mask, nullptr);
 
-  RelayStream stdout_stream{stdout_pipe[0], STDOUT_FILENO, true};
-  RelayStream stderr_stream{stderr_pipe[0], STDERR_FILENO, true};
+  RelayStream stdout_stream{stdout_pipe[0], STDOUT_FILENO, true, {}};
+  RelayStream stderr_stream{stderr_pipe[0], STDERR_FILENO, true, {}};
   bool log_enabled = true;
   bool log_failure_reported = false;
   bool child_reaped = false;

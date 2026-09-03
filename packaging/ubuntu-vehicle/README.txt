@@ -18,7 +18,11 @@ The foreground launcher starts the configured control and media services.
 Stop it with Ctrl-C. It preserves stdout/stderr in the terminal and also writes
 them to /var/log/mine-teleop/vehicle-runtime.log. That mixed runtime log rotates
 at 64 MiB with five retained files; high-frequency CAN evidence remains in the
-separately rotated vcu-can.jsonl. The default field configuration uses the mock adapter and
+separately rotated vcu-can.jsonl. The vendor ChassisControl per-cycle state
+dump (debug/info lines in its "[timestamp] [level] [pid] [tag]" format) stays
+on the terminal only and is not persisted; vendor warning/error lines and all
+structured runtime diagnostics are still recorded. The default field
+configuration uses the mock adapter and
 max_speed_kph=0; do not enable a physical chassis before the separate CAN,
 braking, and local emergency-stop acceptance is complete.
 
