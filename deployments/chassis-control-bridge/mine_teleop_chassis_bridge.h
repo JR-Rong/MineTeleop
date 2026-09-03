@@ -28,7 +28,7 @@
 #define MINE_TELEOP_CHASSIS_MAX_DERIVATIVE_FILTER_TAU_MS 2000.0
 #define MINE_TELEOP_CHASSIS_SPEED_PID_SETPOINT_RESET_DEADBAND_MPS 0.05
 #define MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS 10.0
-#define MINE_TELEOP_CHASSIS_SESSION_CONTROL_PROFILE_VERSION 2U
+#define MINE_TELEOP_CHASSIS_SESSION_CONTROL_PROFILE_VERSION 3U
 #define MINE_TELEOP_CHASSIS_MAX_STEERING_REQUEST 1.0
 
 static inline int mine_teleop_chassis_finite(double value) {
@@ -483,7 +483,11 @@ struct MineTeleopChassisOpenConfigV4 {
 };
 
 /* Complete session-scoped runtime control snapshot. The immutable physical
- * ceilings and safety watchdogs remain owned by the current open config. */
+ * ceilings and safety watchdogs remain owned by the current open config.
+ * motor_torque_rise_rate_nm_per_s was appended after reserved for profile
+ * version 3; every earlier field keeps its original offset, and the exact
+ * struct size stays negotiated through
+ * mine_teleop_chassis_runtime_control_config_v1_size. */
 struct MineTeleopChassisRuntimeControlConfigV1 {
     uint32_t struct_size;
     uint32_t profile_version;
@@ -498,6 +502,7 @@ struct MineTeleopChassisRuntimeControlConfigV1 {
     double speed_pid_derivative_filter_tau_ms;
     int32_t speed_pid_max_dt_ms;
     uint32_t reserved;
+    double motor_torque_rise_rate_nm_per_s;
 };
 
 enum MineTeleopChassisRuntimeControlIssueV1 {
@@ -594,7 +599,9 @@ static_assert(
     sizeof(MineTeleopChassisOpenConfigV4) ==
     sizeof(MineTeleopChassisOpenConfigV3) + sizeof(double));
 static_assert(sizeof(MineTeleopChassisApplyResultV1) == 16U);
-static_assert(sizeof(MineTeleopChassisRuntimeControlConfigV1) == 88U);
+static_assert(
+    offsetof(MineTeleopChassisRuntimeControlConfigV1, reserved) == 84U);
+static_assert(sizeof(MineTeleopChassisRuntimeControlConfigV1) == 96U);
 static_assert(sizeof(MineTeleopChassisRuntimeControlResultV1) == 24U);
 #endif
 

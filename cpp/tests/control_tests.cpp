@@ -588,7 +588,7 @@ void test_control_page_contract() {
   expect(
       response.body.find("实车调试限幅") != std::string::npos &&
           response.body.find("驾驶参数") != std::string::npos &&
-          response.body.find("速度 PID 标定") != std::string::npos &&
+          response.body.find("速度 PID 与升扭标定") != std::string::npos &&
           response.body.find("目标车速上限（km/h）") != std::string::npos &&
           response.body.find("max-motor-torque-nm") != std::string::npos &&
           response.body.find("max=\"640.0\"") != std::string::npos &&
@@ -600,7 +600,8 @@ void test_control_page_contract() {
           response.body.find("speed-pid-ki") != std::string::npos &&
           response.body.find("speed-pid-kd") != std::string::npos &&
           response.body.find("speed-pid-derivative-filter-tau-ms") != std::string::npos &&
-          response.body.find("speed-pid-max-dt-ms") != std::string::npos,
+          response.body.find("speed-pid-max-dt-ms") != std::string::npos &&
+          response.body.find("motor-torque-rise-rate") != std::string::npos,
       "field commissioning control limit dialog is missing");
   expect(
       response.body.find("effectiveControlLimits") != std::string::npos &&
@@ -676,6 +677,9 @@ void test_control_page_contract() {
       "default profile can auto-submit before parking readiness or repeatedly after rejection");
   expect(
       response.body.find("pidChanged=!prior||requested.speed_pid_kp!==prior.speed_pid_kp") !=
+              std::string::npos &&
+      response.body.find(
+              "requested.motor_torque_rise_rate_nm_per_s!==prior.motor_torque_rise_rate_nm_per_s") !=
               std::string::npos &&
       response.body.find(
               "requested.target_speed_kph>prior.target_speed_kph||"
@@ -1621,7 +1625,7 @@ void test_driver_vehicle_switch_releases_old_session() {
   profile_request.method = "POST";
   profile_request.path = "/api/control-profile";
   const mine_teleop::Json valid_profile = {
-      {"profile_version", 2},
+      {"profile_version", 3},
       {"target_speed_kph", 3.0},
       {"max_motor_torque_nm", 250.0},
       {"max_brake_pressure_bar", 80.0},
@@ -1633,6 +1637,7 @@ void test_driver_vehicle_switch_releases_old_session() {
       {"speed_pid_kd", 0.1},
       {"speed_pid_derivative_filter_tau_ms", 50.0},
       {"speed_pid_max_dt_ms", 100},
+      {"motor_torque_rise_rate_nm_per_s", 120.0},
   };
   profile_request.body = valid_profile.dump();
   const auto profile_response = control_app.handle(profile_request);
@@ -1652,7 +1657,7 @@ void test_driver_vehicle_switch_releases_old_session() {
       "prepared session profile lost authenticated envelope identity");
   expect(
       !profile_envelope.contains("profile") &&
-          profile_envelope.value("profile_version", 0) == 2 &&
+          profile_envelope.value("profile_version", 0) == 3 &&
           profile_envelope.value("target_speed_kph", -1.0) == 3.0 &&
           profile_envelope.value("max_motor_torque_nm", -1.0) == 250.0 &&
           profile_envelope.value("max_brake_pressure_bar", -1.0) == 80.0 &&
@@ -1663,7 +1668,8 @@ void test_driver_vehicle_switch_releases_old_session() {
           profile_envelope.value("speed_pid_ki", -1.0) == 0.2 &&
           profile_envelope.value("speed_pid_kd", -1.0) == 0.1 &&
           profile_envelope.value("speed_pid_derivative_filter_tau_ms", -1.0) == 50.0 &&
-          profile_envelope.value("speed_pid_max_dt_ms", -1) == 100,
+          profile_envelope.value("speed_pid_max_dt_ms", -1) == 100 &&
+          profile_envelope.value("motor_torque_rise_rate_nm_per_s", -1.0) == 120.0,
       "session profile request is not the canonical flat DataChannel schema");
 
   mine_teleop::HttpRequest get_profile_request;
@@ -1675,11 +1681,12 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(
       prepared_profile.value("target_speed_kph", -1.0) == 3.0 &&
           prepared_profile.value("max_motor_torque_nm", -1.0) == 250.0 &&
-          prepared_profile.value("profile_version", 0) == 2 &&
+          prepared_profile.value("profile_version", 0) == 3 &&
           prepared_profile.value("initialized", false) &&
           prepared_profile.value("max_steering_angle_deg", -1.0) == 3.0 &&
           prepared_profile.value("speed_pid_kp", -1.0) == 1.5 &&
           prepared_profile.value("speed_pid_max_dt_ms", -1) == 100 &&
+          prepared_profile.value("motor_torque_rise_rate_nm_per_s", -1.0) == 120.0 &&
           prepared_profile.value("last_prepared_seq", std::uint64_t{0}) ==
               profile_envelope.value("seq", std::uint64_t{0}),
       "prepared session profile state does not match its DataChannel envelope");
@@ -1713,7 +1720,25 @@ void test_driver_vehicle_switch_releases_old_session() {
   profile_request.body = invalid_profile.dump();
   expect(
       control_app.handle(profile_request).status == 400,
-      "session profile accepted fields outside the V2 schema");
+      "session profile accepted fields outside the V3 schema");
+  invalid_profile = valid_profile;
+  invalid_profile.erase("motor_torque_rise_rate_nm_per_s");
+  profile_request.body = invalid_profile.dump();
+  expect(
+      control_app.handle(profile_request).status == 400,
+      "session profile accepted a V2-shaped request without the rise-rate field");
+  invalid_profile = valid_profile;
+  invalid_profile["motor_torque_rise_rate_nm_per_s"] = 32000.1;
+  profile_request.body = invalid_profile.dump();
+  expect(
+      control_app.handle(profile_request).status == 400,
+      "session profile accepted a rise rate above the schema ceiling");
+  invalid_profile = valid_profile;
+  invalid_profile["motor_torque_rise_rate_nm_per_s"] = -1.0;
+  profile_request.body = invalid_profile.dump();
+  expect(
+      control_app.handle(profile_request).status == 400,
+      "session profile accepted a negative rise rate");
   const auto profile_analog_brake = driver.send_control(
       {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
   expect(
@@ -1788,7 +1813,7 @@ void test_driver_vehicle_switch_releases_old_session() {
       "rejected legacy control-limit mutation changed the active profile");
 
   profile_request.body = mine_teleop::Json({
-      {"profile_version", 2},
+      {"profile_version", 3},
       {"target_speed_kph", 0.0},
       {"max_motor_torque_nm", 0.0},
       {"max_brake_pressure_bar", 0.0},
@@ -1800,6 +1825,7 @@ void test_driver_vehicle_switch_releases_old_session() {
       {"speed_pid_kd", 0.1},
       {"speed_pid_derivative_filter_tau_ms", 50.0},
       {"speed_pid_max_dt_ms", 100},
+      {"motor_torque_rise_rate_nm_per_s", 0.0},
   }).dump();
   expect(
       control_app.handle(profile_request).status == 200,
@@ -1830,10 +1856,11 @@ void test_driver_vehicle_switch_releases_old_session() {
           reset_profile.value("max_brake_pressure_bar", -1.0) == 100.0 &&
           reset_profile.value("service_brake_pressure_bar", -1.0) == 10.0 &&
           reset_profile.value("hard_brake_pressure_bar", -1.0) == 25.0 &&
-          reset_profile.value("profile_version", 0) == 2 &&
+          reset_profile.value("profile_version", 0) == 3 &&
           !reset_profile.value("initialized", true) &&
           reset_profile.value("speed_pid_kp", -1.0) == 0.0 &&
           reset_profile.value("speed_pid_max_dt_ms", -1) == 0 &&
+          reset_profile.value("motor_torque_rise_rate_nm_per_s", -1.0) == 0.0 &&
           reset_profile.value("last_prepared_seq", std::uint64_t{1}) == 0,
       "session end retained a prepared control profile instead of YAML defaults");
   expect(driver.vehicles().value("authenticated", false), "session end unexpectedly logged out the driver");

@@ -132,9 +132,10 @@ CAN/本地急停/时间同步门禁及 commissioning mode。重复的速度超�
 例外。控制端先预检，车端再次 fail closed。
 
 页面通过 `POST /api/control-profile` 准备 `type=session_control_profile` 的鉴权
-DataChannel envelope。V2 profile 在 envelope 顶层包含 `profile_version=2`、目标车速、
-单电机最大转矩、三项普通制动压力、最大转向角，以及 `speed_pid_kp/ki/kd`、
-`speed_pid_derivative_filter_tau_ms`、`speed_pid_max_dt_ms`；它与普通控制命令复用车辆、
+DataChannel envelope。V3 profile 在 envelope 顶层包含 `profile_version=3`、目标车速、
+单电机最大转矩、三项普通制动压力、最大转向角，`speed_pid_kp/ki/kd`、
+`speed_pid_derivative_filter_tau_ms`、`speed_pid_max_dt_ms`，以及
+`motor_torque_rise_rate_nm_per_s`；它与普通控制命令复用车辆、
 驾驶员、session、`control_token` 和单调递增 `seq`。由于 control DataChannel
 是 unordered/unreliable，浏览器每隔至少 200 ms 重发同一 envelope 和同一 `seq`，直到
 收到共享 `control_status_seq` 排序后的 `session_control_profile_status`，或 telemetry

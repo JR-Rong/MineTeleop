@@ -318,7 +318,7 @@ test('control rejection presentation exposes only stable issue-code guidance', (
 
 function controlProfile(overrides = {}) {
   return {
-    profile_version: 2,
+    profile_version: 3,
     target_speed_kph: 12,
     max_motor_torque_nm: 300,
     max_brake_pressure_bar: 90,
@@ -330,6 +330,7 @@ function controlProfile(overrides = {}) {
     speed_pid_kd: 0.2,
     speed_pid_derivative_filter_tau_ms: 60,
     speed_pid_max_dt_ms: 80,
+    motor_torque_rise_rate_nm_per_s: 120,
     ...overrides,
   };
 }
@@ -370,6 +371,8 @@ function vehicleHardLimits(overrides = {}) {
     default_speed_pid_kd: 0.1,
     default_speed_pid_derivative_filter_tau_ms: 50,
     default_speed_pid_max_dt_ms: 100,
+    default_motor_torque_rise_rate_nm_per_s: 150,
+    motor_torque_rise_rate_limits_nm_per_s: {min: 0, max: 400},
     speed_pid_limits: {
       kp: {min: 0, max: 10},
       ki: {min: 0, max: 10},
@@ -386,11 +389,11 @@ function vehicleHardLimits(overrides = {}) {
   };
 }
 
-test('session control profile V2 validation and hard-limit merge preserve ordering', () => {
+test('session control profile V3 validation and hard-limit merge preserve ordering', () => {
   const requested = controlProfile();
   const hard = vehicleHardLimits();
   assert.deepEqual(logic.mergeControlProfileWithHardLimits(requested, hard), {
-    profile_version: 2,
+    profile_version: 3,
     target_speed_kph: 4,
     max_motor_torque_nm: 165,
     max_brake_pressure_bar: 50,
@@ -402,7 +405,11 @@ test('session control profile V2 validation and hard-limit merge preserve orderi
     speed_pid_kd: 0.2,
     speed_pid_derivative_filter_tau_ms: 60,
     speed_pid_max_dt_ms: 80,
+    motor_torque_rise_rate_nm_per_s: 120,
   });
+  assert.equal(logic.mergeControlProfileWithHardLimits(
+      {...requested, motor_torque_rise_rate_nm_per_s: 999}, hard)
+      .motor_torque_rise_rate_nm_per_s, 400);
   assert.equal(logic.controlProfileThrottleLimit(
       {...requested, target_speed_kph: 2}, hard), 0.05);
   assert.equal(logic.controlProfileThrottleLimit(
@@ -429,10 +436,26 @@ test('session control profile V2 validation and hard-limit merge preserve orderi
       /speed_pid_max_dt_ms must be an integer/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, profile_version: 1}),
-      /profile_version must be 2/);
+      /profile_version must be 3/);
+  assert.throws(
+      () => logic.normalizeControlProfile({...requested, profile_version: 2}),
+      /profile_version must be 3/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, unexpected_field: 1}),
-      /exactly the V2 fields/);
+      /exactly the V3 fields/);
+  assert.throws(
+      () => logic.normalizeControlProfile(
+          {...requested, motor_torque_rise_rate_nm_per_s: -1}),
+      /motor_torque_rise_rate_nm_per_s/);
+  assert.throws(
+      () => logic.normalizeControlProfile(
+          {...requested, motor_torque_rise_rate_nm_per_s: 32000.1}),
+      /motor_torque_rise_rate_nm_per_s/);
+  const v2Profile = controlProfile();
+  delete v2Profile.motor_torque_rise_rate_nm_per_s;
+  assert.throws(
+      () => logic.normalizeControlProfile(v2Profile),
+      /exactly the V3 fields/);
 });
 
 test('PID defaults come only from complete vehicle limits and accept kp hard min zero', () => {
@@ -456,11 +479,28 @@ test('PID defaults come only from complete vehicle limits and accept kp hard min
   assert.equal(profile.speed_pid_kd, 0.5);
   assert.equal(profile.speed_pid_derivative_filter_tau_ms, 75);
   assert.equal(profile.speed_pid_max_dt_ms, 120);
+  assert.equal(profile.motor_torque_rise_rate_nm_per_s, 150);
   assert.equal(logic.normalizeVehicleHardLimits(hard).speed_pid_limits.kp.min, 0);
 
   const missingDefault = vehicleHardLimits();
   delete missingDefault.default_speed_pid_kd;
   assert.throws(() => logic.normalizeVehicleHardLimits(missingDefault), /default_speed_pid_kd/);
+  const missingRiseRate = vehicleHardLimits();
+  delete missingRiseRate.default_motor_torque_rise_rate_nm_per_s;
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits(missingRiseRate),
+      /default_motor_torque_rise_rate_nm_per_s/);
+  const missingRiseRateLimits = vehicleHardLimits();
+  delete missingRiseRateLimits.motor_torque_rise_rate_limits_nm_per_s;
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits(missingRiseRateLimits),
+      /motor_torque_rise_rate_limits_nm_per_s/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({
+        ...vehicleHardLimits(),
+        motor_torque_rise_rate_limits_nm_per_s: {min: 500, max: 400},
+      }),
+      /must not exceed max/);
   assert.throws(
       () => logic.normalizeVehicleHardLimits({...vehicleHardLimits(), speed_pid_limits: null}),
       /speed_pid_limits/);

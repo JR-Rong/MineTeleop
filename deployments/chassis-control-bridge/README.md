@@ -43,16 +43,19 @@ speed-feedback deadline, hard-overspeed margin, `max_throttle`,
 `full_scale_motor_torque_nm`, `motor_torque_rise_rate_nm_per_s`,
 `max_brake_pressure_bar`, and steering limits.
 
-Before ordinary driving, the controller submits a complete `profile_version=2`
+Before ordinary driving, the controller submits a complete `profile_version=3`
 snapshot containing target speed, maximum per-motor torque, maximum ordinary
-EHB pressure, service and hard-brake pressure, maximum steering, and the five
-speed-PID settings. The vehicle applies and acknowledges
+EHB pressure, service and hard-brake pressure, maximum steering, the five
+speed-PID settings, and the motor torque rise rate. The vehicle applies and
+acknowledges
 that profile before it permits the VCU handshake. The profile can only reduce
 the immutable vehicle-side YAML limits and is cleared on disconnect, authority
 or session replacement, adapter-owned safety stop, and fault. First apply,
-steering/PID/brake changes, and target/torque increases require fresh parked-N
+steering/PID/brake/rise-rate changes, and target/torque increases require fresh
+parked-N
 feedback in Standby or Disarmed. A clear withdraws traction, resets the PID,
-and restores the YAML PID defaults without clearing a safety latch. Feedback
+and restores the YAML PID and rise-rate defaults without clearing a safety
+latch. Feedback
 timing, overspeed, command timeouts, and other reported safety settings remain
 vehicle-side read-only. A successful `applied_revision` equals the request seq.
 
@@ -65,8 +68,10 @@ integral term may retain positive torque. The bridge multiplies that output
 directly by the acknowledged per-motor session torque limit and writes the
 same magnitude to all eight traction channels. It clamps D to positive-only
 and R to negative-only torque, and quantizes toward zero at 0.1 Nm. The
-vehicle-side `motor_torque_rise_rate_nm_per_s` optionally limits only rising
-torque; `0` disables this extra shaping. When enabled, the current reachable
+vehicle-side `motor_torque_rise_rate_nm_per_s` seeds the session-tunable
+rising-torque limit; `0` disables this extra shaping. The session profile
+overrides it per session within the physical `[0, 32000] Nm/s` envelope and a
+clear restores the open-config value. When enabled, the current reachable
 torque is fed into the PID as its dynamic output ceiling so conditional
 integration sees the actuator limit instead of winding up behind a second
 clamp. Every torque decrease remains immediate. The acknowledged session limit

@@ -1595,6 +1595,24 @@ void test_session_control_profile_json_round_trip_and_physical_units() {
   expect_throws(
       [&] { invalid.validate(); },
       "out-of-range PID max dt was accepted");
+  invalid = request;
+  invalid.profile.motor_torque_rise_rate_nm_per_s = -1.0;
+  expect_throws(
+      [&] { invalid.validate(); },
+      "negative motor torque rise rate was accepted");
+  invalid = request;
+  invalid.profile.motor_torque_rise_rate_nm_per_s = 32000.1;
+  expect_throws(
+      [&] { invalid.validate(); },
+      "motor torque rise rate above the physical envelope was accepted");
+  auto missing_rise_rate = encoded;
+  missing_rise_rate.erase("motor_torque_rise_rate_nm_per_s");
+  expect_throws(
+      [&] {
+        static_cast<void>(
+            mine_teleop::SessionControlProfileRequest::from_json(missing_rise_rate));
+      },
+      "session profile without the rise rate field was accepted");
 }
 
 void test_shared_protocol_v1_vectors_and_session_states() {
@@ -2002,6 +2020,25 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
           !service.session_control_profile().at("active").get<bool>(),
       "profile was ACKed before adapter application completed");
   adapter_view->control_limit_update_throws = false;
+
+  // A rise-rate-only change joins the PID parking gate: identical envelope
+  // values with only motor_torque_rise_rate_nm_per_s changed still requires
+  // parking, and is applied once parked.
+  adapter_view->handshake.parking_ready = false;
+  auto rise_rate_change = session_profile_request(8, 70, 8.0, 80.0, 100.0, 30.0, 80.0);
+  rise_rate_change.profile.motor_torque_rise_rate_nm_per_s = 50.0;
+  const auto rise_rate_blocked = service.receive_session_profile(rise_rate_change, 70);
+  expect(
+      !rise_rate_blocked.accepted &&
+          rise_rate_blocked.reason == "parking_ready_required_for_profile_increase",
+      "motor torque rise-rate change bypassed parking_ready");
+  adapter_view->handshake.parking_ready = true;
+  auto rise_rate_apply = session_profile_request(9, 80, 8.0, 80.0, 100.0, 30.0, 80.0);
+  rise_rate_apply.profile.motor_torque_rise_rate_nm_per_s = 50.0;
+  const auto rise_rate_accepted = service.receive_session_profile(rise_rate_apply, 80);
+  expect(
+      rise_rate_accepted.accepted,
+      "parked rise-rate change was rejected");
   service.close();
 }
 
@@ -2480,6 +2517,14 @@ void test_control_service_applies_vehicle_hard_limits() {
           limits.at("speed_pid_limits").at("max_dt_ms").at("min") == 20 &&
           limits.at("speed_pid_limits").at("max_dt_ms").at("max") == 200,
       "reported PID defaults or absolute bounds mismatch");
+  expect(
+      limits.at("default_motor_torque_rise_rate_nm_per_s") ==
+              config.field_safety.motor_torque_rise_rate_nm_per_s &&
+          limits.at("motor_torque_rise_rate_limits_nm_per_s").at("min") ==
+              0.0 &&
+          limits.at("motor_torque_rise_rate_limits_nm_per_s").at("max") ==
+              mine_teleop::kMaxMotorTorqueRiseRateNmPerSecond,
+      "reported rise-rate default or absolute bounds mismatch");
   mine_teleop::Json expected_deceleration_profile =
       mine_teleop::Json::array();
   for (const auto& stage : config.control.deceleration_profile) {

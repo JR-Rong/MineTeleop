@@ -85,6 +85,8 @@ struct RuntimeControlSettings {
   double max_motor_torque_nm{0.0};
   double max_brake_pressure_bar{0.0};
   double max_steering_request{0.0};
+  double motor_torque_rise_rate_nm_per_s{
+      MINE_TELEOP_CHASSIS_DEFAULT_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND};
 };
 
 struct ControlIntent {
@@ -1112,6 +1114,10 @@ class BridgeRuntime {
         config.max_steering_request < 0.0 ||
         config.max_steering_request >
             MINE_TELEOP_CHASSIS_MAX_STEERING_REQUEST ||
+        !std::isfinite(config.motor_torque_rise_rate_nm_per_s) ||
+        config.motor_torque_rise_rate_nm_per_s < 0.0 ||
+        config.motor_torque_rise_rate_nm_per_s >
+            MINE_TELEOP_CHASSIS_MAX_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND ||
         !mine_teleop_chassis_speed_pid_config_is_valid(&pid)) {
       return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_ARGUMENTS_INVALID;
     }
@@ -1127,8 +1133,13 @@ class BridgeRuntime {
         pid.derivative_filter_tau_ms !=
             current_pid.derivative_filter_tau_ms ||
         pid.max_dt_ms != current_pid.max_dt_ms;
+    // Torque-rise shaping changes alter traction dynamics the same way PID
+    // gain changes do, so they share the parking gate.
+    const bool torque_shaping_changed =
+        config.motor_torque_rise_rate_nm_per_s !=
+        speed_control_.motor_torque_rise_rate_nm_per_s;
     const bool requires_parking =
-        !runtime_control_.active || pid_changed ||
+        !runtime_control_.active || pid_changed || torque_shaping_changed ||
         config.target_speed_limit_mps >
             runtime_control_.target_speed_limit_mps + 1e-9 ||
         config.max_motor_torque_nm >
@@ -1155,8 +1166,12 @@ class BridgeRuntime {
     next.max_motor_torque_nm = config.max_motor_torque_nm;
     next.max_brake_pressure_bar = config.max_brake_pressure_bar;
     next.max_steering_request = config.max_steering_request;
+    next.motor_torque_rise_rate_nm_per_s =
+        config.motor_torque_rise_rate_nm_per_s;
     auto next_speed_control = speed_control_;
     next_speed_control.pid = pid;
+    next_speed_control.motor_torque_rise_rate_nm_per_s =
+        config.motor_torque_rise_rate_nm_per_s;
 
     withdraw_latest_traction_locked();
     latest_intent_.target_speed_mps = 0.0;
@@ -1182,6 +1197,8 @@ class BridgeRuntime {
     withdraw_latest_traction_locked();
     latest_intent_.target_speed_mps = 0.0;
     speed_control_.pid = open_speed_control_.pid;
+    speed_control_.motor_torque_rise_rate_nm_per_s =
+        open_speed_control_.motor_torque_rise_rate_nm_per_s;
     runtime_control_ = RuntimeControlSettings{};
     try {
       logger_.event(

@@ -91,9 +91,10 @@
 ## 会话控制参数
 
 普通驾驶开始前，驾驶端必须先通过同一条 DataChannel 发送
-`type=session_control_profile`。当前 `profile_version=2` 是完整快照，包含目标车速、
-单电机最大转矩、普通制动最大/缓刹/急刹压力、最大转角，以及车速 PID 的
-`kp/ki/kd/derivative_filter_tau_ms/max_dt_ms`。车端只有在 bridge 原子应用整份快照后才发送
+`type=session_control_profile`。当前 `profile_version=3` 是完整快照，包含目标车速、
+单电机最大转矩、普通制动最大/缓刹/急刹压力、最大转角、车速 PID 的
+`kp/ki/kd/derivative_filter_tau_ms/max_dt_ms`，以及电机升扭斜率
+`motor_torque_rise_rate_nm_per_s`。车端只有在 bridge 原子应用整份快照后才发送
 `event=session_control_profile_status` 的成功状态；未确认参数时拒绝 VCU 握手和非
 急停驾驶命令。参数在断链、控制权/会话替换、故障或 adapter 自有安全停车时清除，
 重连后不能沿用旧确认；急停始终绕过普通参数门禁。成功状态的 `applied_revision`
@@ -104,9 +105,9 @@
 `full_scale_motor_torque_nm`，三项普通制动压力满足
 `service <= hard <= max <= max_brake_pressure_bar`，转角不超过
 `max_steering_angle_deg`，PID 仍受车端绝对范围约束。首次设置、提高目标车速/转矩、
-修改任一制动压力/转角/PID 还要求新鲜的 N 挡、零速和 EPB 驻车反馈，且 bridge
+修改任一制动压力/转角/PID/升扭斜率还要求新鲜的 N 挡、零速和 EPB 驻车反馈，且 bridge
 必须处于 `standby` 或 `disarmed`；Ready 中不能热改这些参数。会话清除会撤销牵引、
-复位 PID 并恢复车端 YAML 的默认 PID。反馈超时、硬超速 margin、命令超时和降速曲线
+复位 PID 并恢复车端 YAML 的默认 PID 与默认升扭斜率。反馈超时、硬超速 margin、命令超时和降速曲线
 始终是车端只读安全参数，控制端不能覆盖。
 
 ## 车端本地车速闭环与换挡门禁
@@ -118,8 +119,9 @@ bridge 的单一 SocketCAN I/O 线程每 20 ms 用新鲜的带符号 VCU 车速�
 同一线程串行调用 ChassisControl 计算转向和制动。PID 输出范围是 `[0, 1]`，直接乘以
 已确认的会话单电机转矩上限，并以相同幅值写入八路牵引通道；不再把 PID 输出解释为
 理想加速度后通过整车质量、轮径和减速比二次换算。车端
-`field_safety.motor_torque_rise_rate_nm_per_s` 可选地只限制加扭速度；`0` 表示关闭
-额外斜率，严格按 PID 输出直接换算。启用正值时，当周期可达转矩会作为 PID 的动态输出
+`field_safety.motor_torque_rise_rate_nm_per_s` 给出加扭斜率默认标定，会话 V3 起
+控制端面板可在 `[0, 32000] Nm/s` 包络内按会话调整该斜率（修改共享 PID 驻车门槛）；
+`0` 表示关闭额外斜率，严格按 PID 输出直接换算。启用正值时，当周期可达转矩会作为 PID 的动态输出
 上限，因此条件积分能感知斜率限制，不会在外层限幅器后继续积累；任何减扭仍立即生效。
 到达目标点时积分项可以保留维持车速所需的正扭矩；每个电机通道的唯一牵引上限是
 已确认会话上限与 `full_scale_motor_torque_nm` 的较小值，`max_throttle` 不是额外

@@ -265,11 +265,13 @@ curl -fsS http://127.0.0.1:8080/health
   `deceleration_profile` 的 0.3/0.6 普通压力分段执行，最终 1.0 阶段才切到 409.5 bar。
   单电机转矩的控制端 schema 上限为 `640.0 Nm/路`。两者仍会被具体车辆 hard
   limits 下调，不能通过控制端设置提高车端上限。
-- `session_control_profile` 已升级为 `profile_version=2`：除原五项驾驶参数外，新增
+- `session_control_profile` 已升级为 `profile_version=3`：除原五项驾驶参数外，新增
   `max_steering_angle_deg`、`speed_pid_kp/ki/kd`、
-  `speed_pid_derivative_filter_tau_ms` 和整数 `speed_pid_max_dt_ms`。控制端 YAML 不配置
-  PID 默认值；车端必须通过 `control_limits` 上报五个 `default_speed_pid_*` 字段和嵌套
-  `speed_pid_limits` min/max，以及顶层速度反馈超时、硬超速余量和 exact
+  `speed_pid_derivative_filter_tau_ms`、整数 `speed_pid_max_dt_ms` 和
+  `motor_torque_rise_rate_nm_per_s`。控制端 YAML 不配置
+  PID/升扭默认值；车端必须通过 `control_limits` 上报五个 `default_speed_pid_*` 字段、
+  嵌套 `speed_pid_limits` min/max、`default_motor_torque_rise_rate_nm_per_s` 与
+  `motor_torque_rise_rate_limits_nm_per_s` min/max，以及顶层速度反馈超时、硬超速余量和 exact
   `read_only_control_safety`（20 Hz 上游命令频率、命令间隔、watchdog、减速曲线、反馈超时、
   超速余量、CAN/急停/时间同步门禁和 commissioning mode）。顶层与对象中的重复值必须一致。
   缺少完整默认值/边界/固定安全对象、`kp <= 0` 或 ACK 缺少匹配的正整数

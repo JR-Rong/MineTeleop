@@ -386,8 +386,11 @@ GStreamer factory，`max_end_to_end_latency_ms` 与 `min_realtime_fps` 用于车
 允许 `0..32000 Nm/s`。`0` 明确关闭额外斜率，PID 输出直接换算为单电机转矩；
 正值只限制增加方向，所有减扭、松油、制动、急停和故障清零仍立即生效。启用正值时，
 bridge 先计算本周期可达转矩并把它换算为 PID 的动态输出上限，条件积分因而能感知
-执行器限制，不是在 PID 之后再盲目截断。该值是车型/执行器标定，不属于会话参数；
-非 mock 车端必须显式填写，修改后需重启 runtime。未完成隔离台架标定时应填 `0`，
+执行器限制，不是在 PID 之后再盲目截断。该值是车型/执行器标定，同时作为会话 V3
+起会话控制参数 `motor_torque_rise_rate_nm_per_s` 的车端默认值与可调范围依据：控制端
+面板可在 `[0, 32000] Nm/s` 物理包络内按当前会话修改，修改与 PID 增益变更共享
+驻车门槛（N 挡、零速、EPB 驻车、standby/disarmed），会话参数清除后恢复此 YAML
+默认值。非 mock 车端必须显式填写；未完成隔离台架标定时应填 `0`，
 不能把未经验证的固定斜率当作通用安全值。配置很小的正斜率时，受 DBC `0.1 Nm`
 分辨率影响，CAN 请求会表现为若干周期不变后再跳变 `0.1 Nm`，而不是每周期都有变化。
 
@@ -409,9 +412,10 @@ bridge 先计算本周期可达转矩并把它换算为 PID 的动态输出上�
 车速闭环、转矩上限和超速熔断必须由隔离台架与实车
 分阶段验收；软件单测不等于闭环已验收。
 
-车端 YAML 的五个 `speed_pid_*` 字段是启动默认值，也是会话清除后的恢复值；
-`profile_version=2` 允许控制端在满足 N 挡、零速、EPB 驻车且 bridge 为
-`standby/disarmed` 时提交一整套 PID 快照，无需重启车端。更新会撤销旧牵引并复位
+车端 YAML 的五个 `speed_pid_*` 字段与 `motor_torque_rise_rate_nm_per_s` 是启动默认值，
+也是会话清除后的恢复值；
+`profile_version=3` 允许控制端在满足 N 挡、零速、EPB 驻车且 bridge 为
+`standby/disarmed` 时提交一整套 PID 与升扭斜率快照，无需重启车端。更新会撤销旧牵引并复位
 PID，成功 ACK 的 `applied_revision` 必须与请求 `seq` 相同。反馈超时、硬超速 margin、
 命令超时、降速曲线、时间同步和本地急停复位要求仍只能由车端 YAML 配置，并通过
 `control_limits.read_only_control_safety` 只读上报。
@@ -619,8 +623,9 @@ control:
 `ui.show_debug_overlay` 必须写成 YAML/TOML boolean `true`/`false`，不能用带引号
 字符串，避免调试层在正式驾驶端被误启用或误关闭。
 `control.limits` 提供目标车速、转矩、压力和最大转角等驾驶参数；页面再合并车端
-`control_limits` 上报的五个 `default_speed_pid_*` 默认值，组成提交给车端确认的
-`profile_version=2` 初始完整快照。示例默认驾驶参数是目标车速 `2 km/h`、单电机最大转矩
+`control_limits` 上报的五个 `default_speed_pid_*` 默认值与
+`default_motor_torque_rise_rate_nm_per_s`，组成提交给车端确认的
+`profile_version=3` 初始完整快照。示例默认驾驶参数是目标车速 `2 km/h`、单电机最大转矩
 `300 Nm`、普通制动最大/缓刹/急刹压力 `100/30/100 bar/路` 和最大转角。它们分别受车端 `max_speed_kph * max_throttle`、
 `full_scale_motor_torque_nm` 和 `max_brake_pressure_bar` 硬上限约束；控制端设置不能
 提高车端上限。PID 可在安全驻车门禁内按会话热更新；反馈超时、超速 margin 和其他

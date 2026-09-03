@@ -382,6 +382,7 @@ class DriverConsoleRuntime {
   double speed_pid_kd_{0.0};
   double speed_pid_derivative_filter_tau_ms_{0.0};
   int speed_pid_max_dt_ms_{0};
+  double motor_torque_rise_rate_nm_per_s_{0.0};
   bool control_profile_initialized_{false};
   std::uint64_t last_control_profile_prepared_seq_{0};
   std::atomic<double> service_brake_limit_{0.3};

@@ -80,7 +80,8 @@ N/R/D 三个挡位；电子驻车通过四路 EPB 状态单独判断，不能用
 `ADU_Tx_VehSpdReq` 都固定编码为 `0 km/h / Q=0`。
 
 车速控制在车端 bridge 的唯一 SocketCAN I/O 线程执行。PID 启动默认值来自车端 YAML；
-`profile_version=2` 可在安全驻车门禁内由控制端按会话提交五个 PID 参数。API 线程只保存最新控制意图；
+`profile_version=3` 可在安全驻车门禁内由控制端按会话提交五个 PID 参数和升扭斜率
+`motor_torque_rise_rate_nm_per_s`。API 线程只保存最新控制意图；
 I/O 线程每个 20 ms 周期用带符号的 VCU 车速反馈运行一次 PID，再串行调用
 ChassisControl，避免 vendor 接口并发。油门是已确认会话目标车速内的比例，最终
 目标同时受 `field_safety.max_speed_kph * max_throttle` 约束。任何正油门只表示启用 PID，
@@ -145,17 +146,20 @@ WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉
 车端对同时出现的油门和制动采用制动优先，任何正制动请求都会撤销牵引。ChassisControl
 更新失败或输出 NaN/Inf 时，bridge 立即锁存本地安全停车，不等待上游控制超时。
 键盘与 Gamepad 共用会话参数；修改参数会先清零当前输入。真实 adapter 的首次设置、
-提高目标车速/转矩或修改任一制动压力/转角/PID 都要求新鲜的 N 挡、零速和 EPB
+提高目标车速/转矩或修改任一制动压力/转角/PID/升扭斜率都要求新鲜的 N 挡、零速和 EPB
 驻车反馈，且 controller 必须为 Standby 或 Disarmed。
 车端仅在实际应用参数后确认；未确认参数时不能请求 VCU 握手或发送普通驾驶命令。
 参数会在断链、故障、控制权/会话替换和 adapter 安全停车时清除；bridge 同时撤销牵引、
-复位 PID 并恢复当前 open 配置中的 YAML 默认 PID。成功 ACK 的 `applied_revision` 必须等于请求 `seq`。
+复位 PID 并恢复当前 open 配置中的 YAML 默认 PID 与默认升扭斜率。成功 ACK 的 `applied_revision` 必须等于请求 `seq`。
 车端 `field_safety.max_throttle`（目标车速比例上限）、
 `field_safety.full_scale_motor_torque_nm`、
 `field_safety.max_brake_pressure_bar` 和
 `field_safety.max_steering_angle_deg` 是不可由浏览器绕过的第二层硬上限，车端会
 通过 DataChannel 把实际硬上限回传给窗口。
-`field_safety.motor_torque_rise_rate_nm_per_s` 是车端启动配置，不进入会话参数；
+`field_safety.motor_torque_rise_rate_nm_per_s` 是车端启动默认值；会话 V3 起它进入
+会话控制参数（`motor_torque_rise_rate_nm_per_s`，物理包络 [0, 32000] Nm/s），可由
+控制端面板在当前会话内修改；修改升扭斜率与修改 PID 增益共享上述驻车门槛，清除
+会话参数后恢复启动默认值。车端把该默认值和可调范围随硬上限一起回传给窗口；
 实际值记录在有效配置日志和 bridge 的 `vehicle_parameters` 事件中。压力上限必须来自车辆标定；
 急停、故障、断开停车和 bridge 本地 apply watchdog 走独立安全停车路径；上游控制
 超时的最终 1.0 阶段同样不受普通驾驶刹车限幅削弱，之前的 0.3/0.6 阶段仍按车端

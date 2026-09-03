@@ -30,7 +30,7 @@ inline constexpr double kDefaultMaxBrakePressureBar = 100.0;
 inline constexpr double kMaxOrdinaryBrakePressureBar = 327.6;
 inline constexpr double kMaxEmergencyBrakePressureBar = 409.5;
 inline constexpr int kSessionControlProfileMaxAgeMs = 2000;
-inline constexpr int kSessionControlProfileVersion = 2;
+inline constexpr int kSessionControlProfileVersion = 3;
 static_assert(kMaxFullScaleMotorTorqueNm <= 800.0 * 0.8);
 static_assert(kMaxFullScaleMotorTorqueNm <= 838.3 * 0.8);
 
@@ -95,6 +95,7 @@ struct SessionControlProfile {
   double speed_pid_kd{0.0};
   double speed_pid_derivative_filter_tau_ms{100.0};
   int speed_pid_max_dt_ms{100};
+  double motor_torque_rise_rate_nm_per_s{kDefaultMotorTorqueRiseRateNmPerSecond};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -706,6 +707,8 @@ class VehicleControlService {
   double default_speed_pid_kd_{0.0};
   double default_speed_pid_derivative_filter_tau_ms_{100.0};
   int default_speed_pid_max_dt_ms_{100};
+  double default_motor_torque_rise_rate_nm_per_s_{
+      kDefaultMotorTorqueRiseRateNmPerSecond};
   int speed_feedback_timeout_ms_{200};
   double hard_overspeed_margin_kph_{3.6};
   Json read_only_control_safety_;

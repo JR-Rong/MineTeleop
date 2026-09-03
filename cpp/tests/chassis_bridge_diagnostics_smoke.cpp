@@ -138,7 +138,8 @@ MineTeleopChassisRuntimeControlConfigV1 valid_runtime_control_config(
     std::uint64_t revision,
     double target_speed_limit_mps,
     double max_motor_torque_nm,
-    double max_brake_pressure_bar) {
+    double max_brake_pressure_bar,
+    double motor_torque_rise_rate_nm_per_s = 0.0) {
   return {
       sizeof(MineTeleopChassisRuntimeControlConfigV1),
       MINE_TELEOP_CHASSIS_SESSION_CONTROL_PROFILE_VERSION,
@@ -153,6 +154,7 @@ MineTeleopChassisRuntimeControlConfigV1 valid_runtime_control_config(
       100.0,
       100,
       0U,
+      motor_torque_rise_rate_nm_per_s,
   };
 }
 
@@ -961,6 +963,36 @@ int main() {
                 MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_STALE_REVISION &&
             runtime_profile_result.applied_revision == 0,
         "duplicate runtime profile revision was not rejected without partial commit");
+
+    for (const double invalid_rise_rate :
+         {std::numeric_limits<double>::quiet_NaN(), -1.0, 32000.1}) {
+      auto invalid_rise_profile =
+          valid_runtime_control_config(2, 5.0, 41.25, 0.0, invalid_rise_rate);
+      expect(
+          mine_teleop_chassis_configure_runtime_control_v1(
+              &invalid_rise_profile, &runtime_profile_result) == -1 &&
+              runtime_profile_result.issue_id ==
+                  MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_ARGUMENTS_INVALID &&
+              runtime_profile_result.applied_revision == 0,
+          "out-of-envelope rise rate was not rejected before any commit");
+    }
+    // A rise-rate-only change shares the PID parking gate: it applies while
+    // parked in Standby, and restoring the open-config value keeps the
+    // downstream torque expectations valid.
+    auto rise_rate_profile =
+        valid_runtime_control_config(2, 5.0, 41.25, 0.0, 50.0);
+    expect(
+        mine_teleop_chassis_configure_runtime_control_v1(
+            &rise_rate_profile, &runtime_profile_result) == 0 &&
+            runtime_profile_result.applied_revision == 2,
+        "parked Standby rise-rate-only profile change was rejected");
+    auto restore_rise_rate_profile =
+        valid_runtime_control_config(3, 5.0, 41.25, 0.0, 0.0);
+    expect(
+        mine_teleop_chassis_configure_runtime_control_v1(
+            &restore_rise_rate_profile, &runtime_profile_result) == 0 &&
+            runtime_profile_result.applied_revision == 3,
+        "parked Standby rise-rate restore was rejected");
     expect(
         mine_teleop_chassis_request_parallel_handshake() == 0,
         "standby speed incorrectly latched an authority-state hard fuse or the fresh gate rejected the initial handshake");
@@ -980,7 +1012,7 @@ int main() {
     feedback = runtime_feedback(5, 3, 1, 0.0);
 
     auto ready_pid_update = runtime_profile;
-    ready_pid_update.profile_revision = 2;
+    ready_pid_update.profile_revision = 4;
     ready_pid_update.speed_pid_kp = 2.0;
     expect(
         mine_teleop_chassis_configure_runtime_control_v1(
@@ -989,6 +1021,16 @@ int main() {
                 MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_PARKING_REQUIRED &&
             runtime_profile_result.applied_revision == 0,
         "Ready-state PID update bypassed the stopped Standby/Disarmed gate");
+    auto ready_rise_rate_update = runtime_profile;
+    ready_rise_rate_update.profile_revision = 4;
+    ready_rise_rate_update.motor_torque_rise_rate_nm_per_s = 50.0;
+    expect(
+        mine_teleop_chassis_configure_runtime_control_v1(
+            &ready_rise_rate_update, &runtime_profile_result) == -3 &&
+            runtime_profile_result.issue_id ==
+                MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_PARKING_REQUIRED &&
+            runtime_profile_result.applied_revision == 0,
+        "Ready-state rise-rate update bypassed the stopped Standby/Disarmed gate");
 
     {
       std::lock_guard<std::mutex> lock(g_vendor_mutex);
@@ -1633,7 +1675,7 @@ int main() {
         mine_teleop_chassis_update_feedback(&feedback) == 0,
         "V4 pressure/rise-rate runtime initial feedback failed");
     auto pressure_profile =
-        valid_runtime_control_config(1, 10.0, 100.0, 327.6);
+        valid_runtime_control_config(1, 10.0, 100.0, 327.6, 300.0);
     pressure_profile.speed_pid_kp = 0.19;
     pressure_profile.speed_pid_ki = 1.0;
     pressure_profile.speed_pid_kd = 0.0;

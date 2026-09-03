@@ -105,6 +105,9 @@ field_safety:
   full_scale_motor_torque_nm: 300.0
   # Optional per-motor rising-torque shaping in Nm/s. Zero disables the extra
   # ramp and applies PID output x the acknowledged session torque limit directly.
+  # This is the startup default; since session profile V3 the driver console may
+  # retune it per session within [0, 32000] behind the same parking gate as the
+  # PID gains, and a profile clear restores this value.
   # Use a positive value only after isolated bench calibration.
   motor_torque_rise_rate_nm_per_s: 0.0
   # Local 20 ms speed PID parameters. Its [0, 1] output directly scales the

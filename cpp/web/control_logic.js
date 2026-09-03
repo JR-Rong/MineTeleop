@@ -25,7 +25,7 @@
     'service_brake',
     'hard_brake',
   ]);
-  const CONTROL_PROFILE_VERSION = 2;
+  const CONTROL_PROFILE_VERSION = 3;
   const CONTROL_PROFILE_FIELDS = Object.freeze([
     'profile_version',
     'target_speed_kph',
@@ -39,6 +39,7 @@
     'speed_pid_kd',
     'speed_pid_derivative_filter_tau_ms',
     'speed_pid_max_dt_ms',
+    'motor_torque_rise_rate_nm_per_s',
   ]);
   const READ_ONLY_CONTROL_SAFETY_FIELDS = Object.freeze([
     'control_rate_hz',
@@ -222,7 +223,7 @@
     if (keys.length !== CONTROL_PROFILE_FIELDS.length ||
         !CONTROL_PROFILE_FIELDS.every(
             field => Object.prototype.hasOwnProperty.call(value, field))) {
-      throw new TypeError('control profile must contain exactly the V2 fields');
+      throw new TypeError('control profile must contain exactly the V3 fields');
     }
     if (value.profile_version !== CONTROL_PROFILE_VERSION) {
       throw new TypeError(`profile_version must be ${CONTROL_PROFILE_VERSION}`);
@@ -248,6 +249,9 @@
           'speed_pid_derivative_filter_tau_ms'),
       speed_pid_max_dt_ms: requireIntegerRange(
           value.speed_pid_max_dt_ms, 20, 200, 'speed_pid_max_dt_ms'),
+      motor_torque_rise_rate_nm_per_s: requireFiniteRange(
+          value.motor_torque_rise_rate_nm_per_s, 0, 32000,
+          'motor_torque_rise_rate_nm_per_s'),
     };
     if (profile.speed_pid_kp <= 0) throw new TypeError('speed_pid_kp must be greater than 0');
     if (profile.service_brake_pressure_bar > profile.hard_brake_pressure_bar ||
@@ -269,6 +273,25 @@
     const speedPidLimits = normalizeSpeedPidLimits(value.speed_pid_limits);
     const readOnlyControlSafety =
         normalizeReadOnlyControlSafety(value.read_only_control_safety);
+    // Pre-V3 vehicles do not publish the rise-rate keys; treat them like any
+    // other incomplete hard-limits report and fail closed.
+    if (!value.motor_torque_rise_rate_limits_nm_per_s ||
+        typeof value.motor_torque_rise_rate_limits_nm_per_s !== 'object') {
+      throw new TypeError('motor_torque_rise_rate_limits_nm_per_s must be an object');
+    }
+    const riseRateLimitsValue = value.motor_torque_rise_rate_limits_nm_per_s;
+    const riseRateLimits = {
+      min: requireFiniteRange(
+          riseRateLimitsValue.min, 0, 32000,
+          'motor_torque_rise_rate_limits_nm_per_s.min'),
+      max: requireFiniteRange(
+          riseRateLimitsValue.max, 0, 32000,
+          'motor_torque_rise_rate_limits_nm_per_s.max'),
+    };
+    if (riseRateLimits.min > riseRateLimits.max) {
+      throw new TypeError(
+          'motor_torque_rise_rate_limits_nm_per_s.min must not exceed max');
+    }
     const normalized = {
       max_speed_kph: maxSpeedKph,
       max_throttle: maxThrottle,
@@ -297,6 +320,11 @@
       default_speed_pid_max_dt_ms: requireIntegerRange(
           value.default_speed_pid_max_dt_ms, speedPidLimits.max_dt_ms.min,
           speedPidLimits.max_dt_ms.max, 'default_speed_pid_max_dt_ms'),
+      default_motor_torque_rise_rate_nm_per_s: requireFiniteRange(
+          value.default_motor_torque_rise_rate_nm_per_s,
+          riseRateLimits.min, riseRateLimits.max,
+          'default_motor_torque_rise_rate_nm_per_s'),
+      motor_torque_rise_rate_limits_nm_per_s: riseRateLimits,
       speed_pid_limits: speedPidLimits,
       speed_feedback_timeout_ms: requireIntegerRange(
           value.speed_feedback_timeout_ms, 20, 500, 'speed_feedback_timeout_ms'),
@@ -358,6 +386,10 @@
       speed_pid_max_dt_ms: clamp(
           requested.speed_pid_max_dt_ms, hard.speed_pid_limits.max_dt_ms.min,
           hard.speed_pid_limits.max_dt_ms.max),
+      motor_torque_rise_rate_nm_per_s: clamp(
+          requested.motor_torque_rise_rate_nm_per_s,
+          hard.motor_torque_rise_rate_limits_nm_per_s.min,
+          hard.motor_torque_rise_rate_limits_nm_per_s.max),
     };
   }
 
@@ -380,6 +412,8 @@
       speed_pid_derivative_filter_tau_ms:
           hard.default_speed_pid_derivative_filter_tau_ms,
       speed_pid_max_dt_ms: hard.default_speed_pid_max_dt_ms,
+      motor_torque_rise_rate_nm_per_s:
+          hard.default_motor_torque_rise_rate_nm_per_s,
     }, hard);
   }
 
@@ -410,7 +444,9 @@
         left.speed_pid_kd === right.speed_pid_kd &&
         left.speed_pid_derivative_filter_tau_ms ===
             right.speed_pid_derivative_filter_tau_ms &&
-        left.speed_pid_max_dt_ms === right.speed_pid_max_dt_ms;
+        left.speed_pid_max_dt_ms === right.speed_pid_max_dt_ms &&
+        left.motor_torque_rise_rate_nm_per_s ===
+            right.motor_torque_rise_rate_nm_per_s;
   }
 
   function reduceControlProfileStatus(stateValue, statusValue) {

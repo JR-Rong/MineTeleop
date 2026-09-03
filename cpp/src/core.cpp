@@ -246,6 +246,7 @@ struct BridgeRuntimeControlConfigV1 {
   double speed_pid_derivative_filter_tau_ms;
   std::int32_t speed_pid_max_dt_ms;
   std::uint32_t reserved;
+  double motor_torque_rise_rate_nm_per_s;
 };
 
 struct BridgeRuntimeControlResultV1 {
@@ -257,7 +258,8 @@ struct BridgeRuntimeControlResultV1 {
 };
 
 static_assert(sizeof(BridgeApplyResultV1) == 16U);
-static_assert(sizeof(BridgeRuntimeControlConfigV1) == 88U);
+static_assert(offsetof(BridgeRuntimeControlConfigV1, reserved) == 84U);
+static_assert(sizeof(BridgeRuntimeControlConfigV1) == 96U);
 static_assert(sizeof(BridgeRuntimeControlResultV1) == 24U);
 
 constexpr std::uint32_t kBridgeApplyIssueNone = 0U;
@@ -884,7 +886,7 @@ ControlCommand ControlCommand::from_json(const Json& value) {
 
 void SessionControlProfile::validate() const {
   if (profile_version != kSessionControlProfileVersion) {
-    throw std::invalid_argument("session control profile version must be 2");
+    throw std::invalid_argument("session control profile version must be 3");
   }
   require_finite_range(target_speed_kph, 0.0, kChassisControlMaxTargetSpeedKph, "target_speed_kph");
   require_finite_range(
@@ -932,6 +934,11 @@ void SessionControlProfile::validate() const {
       speed_pid_max_dt_ms > kMaxSpeedPidMaxDtMs) {
     throw std::invalid_argument("speed_pid_max_dt_ms must be in [20, 200]");
   }
+  require_finite_range(
+      motor_torque_rise_rate_nm_per_s,
+      0.0,
+      kMaxMotorTorqueRiseRateNmPerSecond,
+      "motor_torque_rise_rate_nm_per_s");
 }
 
 Json SessionControlProfile::to_json() const {
@@ -949,6 +956,7 @@ Json SessionControlProfile::to_json() const {
       {"speed_pid_kd", speed_pid_kd},
       {"speed_pid_derivative_filter_tau_ms", speed_pid_derivative_filter_tau_ms},
       {"speed_pid_max_dt_ms", speed_pid_max_dt_ms},
+      {"motor_torque_rise_rate_nm_per_s", motor_torque_rise_rate_nm_per_s},
   };
 }
 
@@ -976,6 +984,8 @@ SessionControlProfile SessionControlProfile::from_json(const Json& value) {
         value.at("speed_pid_derivative_filter_tau_ms").get<double>();
     profile.speed_pid_max_dt_ms =
         value.at("speed_pid_max_dt_ms").get<int>();
+    profile.motor_torque_rise_rate_nm_per_s =
+        value.at("motor_torque_rise_rate_nm_per_s").get<double>();
   } catch (const Json::exception& error) {
     throw std::invalid_argument(
         std::string("invalid session control profile: ") + error.what());
@@ -2159,7 +2169,8 @@ std::uint64_t DynamicLibraryVehicleAdapter::configure_runtime_control_profile(
       profile.speed_pid_kd,
       profile.speed_pid_derivative_filter_tau_ms,
       profile.speed_pid_max_dt_ms,
-      0U};
+      0U,
+      profile.motor_torque_rise_rate_nm_per_s};
   BridgeRuntimeControlResultV1 result{};
   const int result_code = configure_runtime_control_fn_(&config, &result);
   if (result.struct_size != sizeof(BridgeRuntimeControlResultV1) ||
@@ -2448,6 +2459,8 @@ VehicleControlService::VehicleControlService(
       default_speed_pid_derivative_filter_tau_ms_(
           config.field_safety.speed_pid_derivative_filter_tau_ms),
       default_speed_pid_max_dt_ms_(config.field_safety.speed_pid_max_dt_ms),
+      default_motor_torque_rise_rate_nm_per_s_(
+          config.field_safety.motor_torque_rise_rate_nm_per_s),
       speed_feedback_timeout_ms_(config.field_safety.speed_feedback_timeout_ms),
       hard_overspeed_margin_kph_(config.field_safety.hard_overspeed_margin_kph),
       telemetry_interval_ms_(telemetry_interval_ms) {
@@ -2695,6 +2708,8 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
   empty_profile.speed_pid_derivative_filter_tau_ms =
       default_speed_pid_derivative_filter_tau_ms_;
   empty_profile.speed_pid_max_dt_ms = default_speed_pid_max_dt_ms_;
+  empty_profile.motor_torque_rise_rate_nm_per_s =
+      default_motor_torque_rise_rate_nm_per_s_;
   const auto& current_profile = active_session_profile_
       ? *active_session_profile_
       : empty_profile;
@@ -2715,7 +2730,9 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
       request.profile.speed_pid_derivative_filter_tau_ms !=
           current_profile.speed_pid_derivative_filter_tau_ms ||
       request.profile.speed_pid_max_dt_ms !=
-          current_profile.speed_pid_max_dt_ms;
+          current_profile.speed_pid_max_dt_ms ||
+      request.profile.motor_torque_rise_rate_nm_per_s !=
+          current_profile.motor_torque_rise_rate_nm_per_s;
   const auto adapter_status = adapter_->status();
   const bool mock_bench_bypass =
       commissioning_mode_ == "bench" && adapter_status.adapter_type == "mock";
@@ -3092,6 +3109,10 @@ Json VehicleControlService::control_limits() const {
       {"default_speed_pid_derivative_filter_tau_ms",
        default_speed_pid_derivative_filter_tau_ms_},
       {"default_speed_pid_max_dt_ms", default_speed_pid_max_dt_ms_},
+      {"default_motor_torque_rise_rate_nm_per_s",
+       default_motor_torque_rise_rate_nm_per_s_},
+      {"motor_torque_rise_rate_limits_nm_per_s",
+       {{"min", 0.0}, {"max", kMaxMotorTorqueRiseRateNmPerSecond}}},
       {"speed_pid_limits",
        {
            {"kp", {{"min", 0.0}, {"max", kMaxSpeedPidGain}}},
