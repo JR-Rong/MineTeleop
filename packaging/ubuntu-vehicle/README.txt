@@ -11,10 +11,14 @@ First start:
   cd /path/to/this/package
   printf '%s\n' '<device-token-from-secret-store>' > config/device-token
   chmod 600 config/device-token
+  sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /var/log/mine-teleop
   ./bin/mine-teleop-run
 
 The foreground launcher starts the configured control and media services.
-Stop it with Ctrl-C. The default field configuration uses the mock adapter and
+Stop it with Ctrl-C. It preserves stdout/stderr in the terminal and also writes
+them to /var/log/mine-teleop/vehicle-runtime.log. That mixed runtime log rotates
+at 64 MiB with five retained files; high-frequency CAN evidence remains in the
+separately rotated vcu-can.jsonl. The default field configuration uses the mock adapter and
 max_speed_kph=0; do not enable a physical chassis before the separate CAN,
 braking, and local emergency-stop acceptance is complete.
 
@@ -41,10 +45,16 @@ Log out and back in after the group change, then verify discovery:
 
 Diagnostics:
 
+  tail -F /var/log/mine-teleop/vehicle-runtime.log
   ./bin/mine-teleop-run version
   ./bin/mine-teleop-run config-check --config config/vehicle-agent.yaml \
     --chassis-bridge-library lib/vendor/chassis/libmine_teleop_chassis_bridge.so
   ./bin/mine-teleop-run vehicle-agent --config config/vehicle-agent.yaml --preflight
+
+The runtime log can be overridden with MINE_TELEOP_VEHICLE_RUNTIME_LOG_PATH,
+MINE_TELEOP_VEHICLE_RUNTIME_LOG_MAX_BYTES, and
+MINE_TELEOP_VEHICLE_RUNTIME_LOG_ROTATIONS. Only the long-running
+vehicle-runtime command uses this log; one-shot diagnostics stay on the terminal.
 
 The package intentionally contains no device token. Vehicle registration uses
 a TLS-protected POST body; follow-up GET/WSS authentication uses

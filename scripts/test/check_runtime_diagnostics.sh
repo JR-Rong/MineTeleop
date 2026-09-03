@@ -6,6 +6,7 @@ media_source="$repository_root/cpp/src/media.cpp"
 media_header="$repository_root/cpp/include/mine_teleop/media.hpp"
 media_runtime="$repository_root/cpp/src/webrtc_media.cpp"
 vehicle_app="$repository_root/cpp/apps/mine_teleop.cpp"
+vehicle_launcher="$repository_root/cpp/apps/mine_teleop_launcher.cpp"
 vcu_bridge="$repository_root/deployments/chassis-control-bridge/chassis_control_bridge.cpp"
 catalog="$repository_root/docs/24-vehicle-runtime-diagnostics.md"
 
@@ -196,6 +197,18 @@ for issue_code in \
   vcu_control_command_invalid \
   vcu_disarm_timeout; do
   require_text "$vcu_bridge" "$issue_code"
+  require_text "$catalog" "$issue_code"
+done
+
+for issue_code in \
+  runtime_log_ready \
+  runtime_log_open_failed \
+  runtime_log_pipe_failed \
+  runtime_log_initial_write_failed \
+  runtime_log_signal_setup_failed \
+  runtime_log_fork_failed \
+  runtime_log_write_failed; do
+  require_text "$vehicle_launcher" "$issue_code"
   require_text "$catalog" "$issue_code"
 done
 

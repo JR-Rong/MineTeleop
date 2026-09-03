@@ -51,4 +51,4 @@ struct ControlInfo {
 };
 
 const std::vector<ControlInfo>& GetControlInfo();
-bool UpdateVehicleState(const VehicleState& state);
+void UpdateGlobalVariables(const VehicleState& state);

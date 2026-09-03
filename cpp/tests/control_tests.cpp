@@ -548,14 +548,30 @@ void test_control_page_contract() {
       "VCU handshake command/status DataChannel contract is missing");
   expect(
       response.body.find("'control_command_rejected'") != std::string::npos &&
-          response.body.find(
+      response.body.find(
               "controlLogic.deriveControlCommandRejection(message.issue_code)") !=
               std::string::npos &&
-          response.body.find("if(rejection.clearInput)clearControlInput()") !=
+          response.body.find(
+              "pendingGearTransition=controlLogic.createGearTransition") !=
+              std::string::npos &&
+          response.body.find(
+              "pendingGearTransition=controlLogic.recordForwardedGearCommand") !=
+              std::string::npos &&
+          response.body.find("controlLogic.reduceGearChangeRejection") !=
+              std::string::npos &&
+          response.body.find("selectedGear=gearRejectionState.selectedGear") !=
+              std::string::npos &&
+          response.body.find("clearControlInput(false)") !=
+              std::string::npos &&
+          response.body.find("gearRejectionState.inhibitOrdinaryControl") !=
+              std::string::npos &&
+          response.body.find("reason:'gear_rejection_unresolved'") !=
+              std::string::npos &&
+          response.body.find("send({},false).catch(console.error)") !=
               std::string::npos &&
           response.body.find("driver_control_command_rejected") !=
               std::string::npos,
-      "structured vehicle control rejection is not surfaced fail-closed to the driver");
+      "structured gear rejection does not restore the retained gear with zero input");
   expect(
       response.body.find("vcu_handshake_not_ready") != std::string::npos &&
           response.body.find("vcuHandshake.parking_ready") != std::string::npos,
@@ -746,6 +762,8 @@ void test_control_page_contract() {
           response.body.find("if(!acceptControlStatusMessage(message))return") !=
               std::string::npos &&
           response.body.find("control_status_message_dropped") != std::string::npos &&
+          response.body.find("if(!acceptControlStatusMessage(message))return;") <
+              response.body.find("const gearRejectionMatched=") &&
           response.body.find("control_status_sequence_gap") != std::string::npos,
       "unordered vehicle status messages can replay stale VCU authority");
   expect(

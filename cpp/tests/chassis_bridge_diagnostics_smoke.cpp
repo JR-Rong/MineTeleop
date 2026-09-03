@@ -40,7 +40,7 @@ const std::vector<ControlInfo>& GetControlInfo() {
   return g_controls;
 }
 
-bool UpdateVehicleState(const VehicleState& state) {
+void UpdateGlobalVariables(const VehicleState& state) {
   std::lock_guard<std::mutex> lock(g_vendor_mutex);
   g_vehicle_states.push_back(state);
   g_vendor_update_threads.insert(std::this_thread::get_id());
@@ -62,7 +62,6 @@ bool UpdateVehicleState(const VehicleState& state) {
     control.eps_ang_req = state.target_steering_angle[index];
     control.eps_ang_spd_req = 0.0;
   }
-  return true;
 }
 
 namespace {
@@ -1079,6 +1078,34 @@ int main() {
     expect(
         mine_teleop_chassis_update_feedback(&feedback) == 0,
         "pre-shift moving feedback refresh failed");
+    MineTeleopChassisApplyResultV1 initial_moving_neutral_result{};
+    expect(
+        mine_teleop_chassis_apply_state_v2(
+            1,
+            0.0,
+            0.0,
+            steering.data(),
+            steering.size(),
+            &initial_moving_neutral_result) == -3 &&
+            initial_moving_neutral_result.issue_id ==
+                MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE,
+        "initial moving D-to-N request bypassed the post-Ready gear-change gate");
+    const auto initial_moving_neutral_frames = drain_can_frames(transport[1], 35);
+    expect_all_motor_torque_raw(
+        initial_moving_neutral_frames,
+        8000,
+        "initial moving D-to-N rejection");
+    expect(
+        can_signal(
+            last_frame_with_id(initial_moving_neutral_frames, 0x18FCD0F5U),
+            8,
+            8) == 3,
+        "initial moving D-to-N rejection did not retain D");
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 0.0, 0.0, steering.data(), steering.size()) == 0,
+        "retained D zero-traction command did not clear the initial N rejection");
+
     MineTeleopChassisApplyResultV1 moving_shift_result{};
     expect(
         mine_teleop_chassis_apply_state_v2(
@@ -1099,7 +1126,110 @@ int main() {
             2, 0.0, 0.0, steering.data(), steering.size()) == -3,
         "legacy apply entry point did not remain fail-closed for a moving shift");
 
+    MineTeleopChassisApplyResultV1 moving_neutral_result{};
+    expect(
+        mine_teleop_chassis_apply_state_v2(
+            1,
+            0.0,
+            0.0,
+            steering.data(),
+            steering.size(),
+            &moving_neutral_result) == -3 &&
+            moving_neutral_result.result_code == -3 &&
+            moving_neutral_result.issue_id ==
+                MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE,
+        "moving D-to-N request bypassed the post-Ready gear-change gate");
+    const auto moving_neutral_frames = drain_can_frames(transport[1], 35);
+    expect_all_motor_torque_raw(
+        moving_neutral_frames,
+        8000,
+        "moving D-to-N rejection");
+    expect(
+        can_signal(
+            last_frame_with_id(
+                moving_neutral_frames,
+                0x18FCD0F5U),
+            8,
+            8) == 3,
+        "moving D-to-N rejection did not retain the accepted D request");
+    MineTeleopChassisTelemetry moving_neutral_telemetry{};
+    MineTeleopChassisHandshakeStatus moving_neutral_status{};
+    expect(
+        mine_teleop_chassis_read_telemetry(&moving_neutral_telemetry) == 0 &&
+            moving_neutral_telemetry.estop == 0 &&
+            mine_teleop_chassis_read_handshake_status(&moving_neutral_status) == 0 &&
+            moving_neutral_status.state == MINE_TELEOP_VCU_READY,
+        "moving D-to-N rejection entered WaitGear or latched ESTOP");
+
     feedback = runtime_feedback(5, 3, 1, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "stopped feedback refresh after moving shift rejection failed");
+    MineTeleopChassisApplyResultV1 stopped_repeated_shift_result{};
+    expect(
+        mine_teleop_chassis_apply_state_v2(
+            2,
+            0.0,
+            0.0,
+            steering.data(),
+            steering.size(),
+            &stopped_repeated_shift_result) == -3 &&
+            stopped_repeated_shift_result.issue_id ==
+                MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE,
+        "rejected R heartbeat became accepted automatically after speed reached zero");
+    MineTeleopChassisApplyResultV1 retained_drive_traction_result{};
+    expect(
+        mine_teleop_chassis_apply_state_v2(
+            3,
+            5.0,
+            0.01,
+            steering.data(),
+            steering.size(),
+            &retained_drive_traction_result) == -3 &&
+            retained_drive_traction_result.issue_id ==
+                MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE,
+        "positive traction in retained D cleared the rejected-gear interlock");
+    MineTeleopChassisApplyResultV1 rejected_shift_brake_result{};
+    expect(
+        mine_teleop_chassis_apply_state_v2(
+            2,
+            0.0,
+            -0.3,
+            steering.data(),
+            steering.size(),
+            &rejected_shift_brake_result) == -3 &&
+            rejected_shift_brake_result.issue_id ==
+                MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE,
+        "braking alongside the inhibited R request unexpectedly cleared the interlock");
+    const auto rejected_shift_brake_frames = drain_can_frames(transport[1], 35);
+    expect_all_motor_torque_raw(
+        rejected_shift_brake_frames,
+        8000,
+        "braking during rejected gear change");
+    expect_all_brake_pressure_raw(
+        rejected_shift_brake_frames,
+        30,
+        "braking during rejected gear change");
+    expect(
+        can_signal(
+            last_frame_with_id(rejected_shift_brake_frames, 0x18FCD0F5U),
+            8,
+            8) == 3,
+        "braking during rejected R request did not retain D");
+
+    MineTeleopChassisApplyResultV1 retained_drive_result{};
+    expect(
+        mine_teleop_chassis_apply_state_v2(
+            3,
+            0.0,
+            0.0,
+            steering.data(),
+            steering.size(),
+            &retained_drive_result) == 0 &&
+            retained_drive_result.result_code == 0 &&
+            retained_drive_result.issue_id == MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE,
+        "retained D zero-traction heartbeat did not recover after moving shift rejection");
+
     expect(
         mine_teleop_chassis_update_feedback(&feedback) == 0,
         "pre-shift feedback refresh failed");
@@ -1338,6 +1468,15 @@ int main() {
           return event.value("name", "") == "feedback_timeout";
         }) == 1,
         "post-Ready retained-state critical feedback did not time out exactly once");
+    expect(
+        std::any_of(runtime_events.begin(), runtime_events.end(), [](const auto& event) {
+          return event.value("name", "") == "control_apply_rejected" &&
+              event.value("issue_code", "") ==
+                  "vcu_drive_gear_change_moving_or_stale" &&
+              event.value("safety_action", "") ==
+                  "traction_withdrawn_retained_gear";
+        }),
+        "gear rejection log did not distinguish retained-gear traction withdrawal from ESTOP");
     std::filesystem::remove(runtime_log_path, error);
 
     int pressure_transport[2]{-1, -1};

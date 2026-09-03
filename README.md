@@ -272,7 +272,11 @@ installation or source checkout.
 
 The industrial PC does not compile source. After extraction and protected
 device-token provisioning, `./bin/mine-teleop-run` is the single foreground
-vehicle entry point. The full cloud, vehicle, and control-client procedure is
+vehicle entry point. Before the first start, provision `/var/log/mine-teleop`
+as mode `0750` and owned by the runtime user. The launcher mirrors runtime
+stdout/stderr to `/var/log/mine-teleop/vehicle-runtime.log`, with an internal
+64 MiB limit and five retained rotations; VCU/CAN evidence remains in its own
+`vcu-can.jsonl` rotation set. The full cloud, vehicle, and control-client procedure is
 in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 Both vehicle processes and the driver console synchronize to the signaling

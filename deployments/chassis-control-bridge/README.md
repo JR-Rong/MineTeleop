@@ -189,9 +189,12 @@ intelligent-driving handshake path:
 The controller receives the detailed handshake status over the same
 DataChannel and enables driving commands only at `ready`.
 
-Drive-gear changes require fresh valid gear and speed feedback at or below
-0.1 m/s in both the bridge and the VCU state machine. A rejected change first
-withdraws the previous traction command. While `WaitGear` or
+Every post-Ready gear change, including a request for neutral, requires fresh
+valid gear and speed feedback at or below 0.1 m/s. A rejected change first
+withdraws the previous traction command and retains the last valid gear. The
+rejected target remains inhibited even if speed later reaches zero; a zero-traction
+command in the retained gear must arrive before a new gear selection can be attempted.
+Ordinary braking remains available while this interlock is active. While `WaitGear` or
 `WaitActuatorModes` completes, steering and requested EHB pressure remain
 continuous but all eight motor torque requests remain zero.
 

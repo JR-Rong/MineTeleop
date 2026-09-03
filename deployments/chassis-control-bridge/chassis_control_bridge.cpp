@@ -961,7 +961,6 @@ class BridgeRuntime {
       return MINE_TELEOP_CHASSIS_APPLY_ISSUE_RUNTIME_UNAVAILABLE;
     }
     const auto now = Clock::now();
-    const bool driving_gear = gear == 2 || gear == 3;
     const bool gear_changed = !latest_intent_valid_ || latest_intent_.gear != gear;
     if (controller_.physical_emergency_latched()) {
       withdraw_latest_traction_locked();
@@ -1025,17 +1024,46 @@ class BridgeRuntime {
         return MINE_TELEOP_CHASSIS_APPLY_ISSUE_ARGUMENTS_INVALID;
       }
     }
-    if (gear_changed && driving_gear &&
+    if (gear_rejection_latched_) {
+      const bool retained_zero_output =
+          gear == gear_rejection_retained_gear_ &&
+          target_speed_mps <= 1e-9 && normalized_longitudinal <= 0.0;
+      if (retained_zero_output) {
+        gear_rejection_latched_ = false;
+      } else {
+        hold_rejected_gear_locked(normalized_longitudinal);
+        log_operation_rejected_locked(
+            "control_apply_rejected",
+            "vcu_drive_gear_change_moving_or_stale",
+            "vcu_gear_change_gate",
+            "a previously rejected gear change remains inhibited until the retained gear receives a zero-traction command",
+            "Release the direction control and send the retained gear with zero traction before selecting another gear.",
+            "traction_withdrawn_retained_gear");
+        return MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE;
+      }
+    }
+    if (gear_changed &&
         (!speed_feedback_fresh_locked(now) ||
          !gear_feedback_fresh_locked(now) ||
          std::abs(controller_.feedback().speed_mps) > 0.1)) {
-      withdraw_latest_traction_locked();
+      gear_rejection_retained_gear_ =
+          latest_intent_valid_ && latest_intent_.gear >= 1 &&
+                  latest_intent_.gear <= 3
+              ? latest_intent_.gear
+              : (controller_.feedback().gear_valid &&
+                         controller_.feedback().gear >= 1 &&
+                         controller_.feedback().gear <= 3
+                     ? controller_.feedback().gear
+                     : 1);
+      gear_rejection_latched_ = true;
+      hold_rejected_gear_locked(normalized_longitudinal);
       log_operation_rejected_locked(
           "control_apply_rejected",
           "vcu_drive_gear_change_moving_or_stale",
           "vcu_gear_change_gate",
-          "drive gear selection requires fresh valid gear/speed feedback at or below 0.1 m/s",
-          "Stop the vehicle, restore fresh speed/gear feedback, then select D or R again.");
+          "gear change was rejected and inhibited because fresh valid gear/speed feedback at or below 0.1 m/s was unavailable",
+          "Send the retained gear with zero traction, stop the vehicle, restore fresh feedback, release the direction control, then select the intended gear again.",
+          "traction_withdrawn_retained_gear");
       return MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE;
     }
 
@@ -1245,6 +1273,8 @@ class BridgeRuntime {
     control_watchdog_latched_ = false;
     hard_overspeed_latched_ = false;
     physical_emergency_reported_ = false;
+    gear_rejection_latched_ = false;
+    gear_rejection_retained_gear_ = 1;
     clear_soft_stop_requested_ = false;
     latest_intent_ = ControlIntent{};
     latest_intent_.generation = ++intent_generation_;
@@ -1279,6 +1309,8 @@ class BridgeRuntime {
       return false;
     }
     const auto state_before = controller_.state();
+    gear_rejection_latched_ = false;
+    gear_rejection_retained_gear_ = 1;
     controller_.request_disarm();
     withdraw_latest_traction_locked();
     software_estop_ = true;
@@ -1615,6 +1647,19 @@ class BridgeRuntime {
     reset_speed_pid_locked();
   }
 
+  void hold_rejected_gear_locked(double requested_longitudinal) {
+    if (!latest_intent_valid_) {
+      latest_intent_ = ControlIntent{};
+      latest_intent_valid_ = true;
+    }
+    latest_intent_.gear = gear_rejection_retained_gear_;
+    latest_intent_.target_speed_mps = 0.0;
+    latest_intent_.normalized_longitudinal =
+        std::min(0.0, requested_longitudinal);
+    latest_intent_.generation = ++intent_generation_;
+    reset_speed_pid_locked();
+  }
+
   void ingest_locked(const CanFrame& frame) {
     if (!controller_.ingest(frame)) {
       ++ignored_rx_count_;
@@ -1881,11 +1926,10 @@ class BridgeRuntime {
           full_scale_motor_torque_nm_,
           intent.steering.data(),
           static_cast<int>(intent.steering.size()));
-      if (!UpdateVehicleState(state)) {
-        latch_chassis_control_fault_locked(
-            "ChassisControl UpdateVehicleState returned false");
-        return;
-      }
+      // The vendor UpdateVehicleState wrapper only updates these globals and
+      // then prints its function name on every 20 ms tick. Use the underlying
+      // public state update directly so runtime diagnostics are not flooded.
+      UpdateGlobalVariables(state);
       command = command_from_chassis_control(
           intent.gear,
           intent.target_speed_mps,
@@ -2052,7 +2096,8 @@ class BridgeRuntime {
       std::string_view issue_code,
       std::string_view stage,
       std::string_view error,
-      std::string_view operator_action) {
+      std::string_view operator_action,
+      std::string_view safety_action = "local_full_stop") {
     const auto now = Clock::now();
     if (last_operation_rejection_code_ == issue_code &&
         now - last_operation_rejection_log_ < std::chrono::seconds(1)) {
@@ -2066,7 +2111,7 @@ class BridgeRuntime {
         stage,
         error,
         operator_action,
-        "local_full_stop",
+        safety_action,
         "\"running\":" + std::string(running_.load() ? "true" : "false") +
             ",\"io_error\":" + std::to_string(io_error_) +
             ",\"state\":\"" +
@@ -2438,6 +2483,8 @@ class BridgeRuntime {
   bool clear_soft_stop_requested_{false};
   ControlIntent latest_intent_{};
   bool latest_intent_valid_{false};
+  bool gear_rejection_latched_{false};
+  int gear_rejection_retained_gear_{1};
   std::uint64_t intent_generation_{0};
   std::uint64_t last_logged_intent_generation_{0};
   MineTeleopChassisSpeedPidState speed_pid_state_{};
@@ -2488,44 +2535,28 @@ int open_bridge_locked(
   }
 
   const std::array<double, mine_teleop::vcu::kSteeringAxisCount> zero_steering{};
-  if (!UpdateVehicleState(make_vehicle_state(
-          0.0,
-          1,
-          0.0,
-          -8.0,
-          full_scale_motor_torque_nm,
-          zero_steering.data(),
-          static_cast<int>(zero_steering.size())))) {
-    emit_bridge_diagnostic(
-        "vehicle_vcu_start_failed",
-        "chassis_control_emergency_seed_failed",
-        "chassis_control_initial_command",
-        "ChassisControl rejected the emergency-stop seed state",
-        "Check ChassisControl input ranges and units.");
-    return -2;
-  }
+  UpdateGlobalVariables(make_vehicle_state(
+      0.0,
+      1,
+      0.0,
+      -8.0,
+      full_scale_motor_torque_nm,
+      zero_steering.data(),
+      static_cast<int>(zero_steering.size())));
   auto emergency = command_from_chassis_control(
       1, 0.0, -8.0, full_scale_motor_torque_nm);
   emergency.motor_torque_nm.fill(0.0);
   emergency.brake_pressure_bar.fill(
       MINE_TELEOP_CHASSIS_MAX_EMERGENCY_BRAKE_PRESSURE_BAR);
 
-  if (!UpdateVehicleState(make_vehicle_state(
-          0.0,
-          1,
-          0.0,
-          0.0,
-          full_scale_motor_torque_nm,
-          zero_steering.data(),
-          static_cast<int>(zero_steering.size())))) {
-    emit_bridge_diagnostic(
-        "vehicle_vcu_start_failed",
-        "chassis_control_initial_seed_failed",
-        "chassis_control_initial_command",
-        "ChassisControl rejected the initial neutral seed state",
-        "Check ChassisControl input ranges and units.");
-    return -2;
-  }
+  UpdateGlobalVariables(make_vehicle_state(
+      0.0,
+      1,
+      0.0,
+      0.0,
+      full_scale_motor_torque_nm,
+      zero_steering.data(),
+      static_cast<int>(zero_steering.size())));
   const auto initial = command_from_chassis_control(
       1, 0.0, 0.0, full_scale_motor_torque_nm);
 

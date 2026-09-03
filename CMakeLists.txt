@@ -470,6 +470,16 @@ if(MINE_TELEOP_BUILD_TESTS)
   endif()
 
   if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
+    add_test(
+      NAME mine-teleop-vehicle-runtime-log-relay
+      COMMAND bash
+        ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_vehicle_runtime_log_relay.sh
+        $<TARGET_FILE:mine-teleop-run>
+    )
+    set_tests_properties(
+      mine-teleop-vehicle-runtime-log-relay
+      PROPERTIES TIMEOUT 30
+    )
     add_executable(mine-teleop-cpp-tests cpp/tests/core_tests.cpp)
     target_link_libraries(mine-teleop-cpp-tests PRIVATE mine_teleop_vehicle_runtime)
     mine_teleop_enable_warnings(mine-teleop-cpp-tests)

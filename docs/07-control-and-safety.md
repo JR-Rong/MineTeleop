@@ -64,7 +64,8 @@
 - 浏览器只允许一个 async writer 串行执行 `/api/control` 和 DataChannel `send`；键盘、Gamepad 和
   心跳只更新 latest-wins 快照，不排队积压过时命令。
 - 车端对 `vehicle_telemetry` 与 `vcu_handshake_status` 共用单调递增的 `control_status_seq`；浏览器在
-  unordered DataChannel 上只接受严格递增状态，禁止旧 Ready 覆盖较新的 fault/disarm。
+  unordered DataChannel 上只接受严格递增状态，禁止旧 Ready 覆盖较新的 fault/disarm。只有同时通过 `control_status_seq` 门禁并且通过
+  `command_seq` 关联到当前换挡事务的拒绝才能改变本地挡位。
 - D/R 选择与油门按键状态分离；松开前进/倒车键只归零牵引请求，普通制动也不自动切 N。
   真实断链、控制权丢失和 VCU 故障/退出仍重置控制资格，并要求新的 keydown 才能恢复。
 - 浏览器失焦或页面隐藏时立即清空物理输入，保持已选 D/R，但发送零牵引、零转向、零普通制动的
@@ -138,8 +139,8 @@ PID，也没有 ramp/jerk 曲线；急刹直接请求会话中配置的急刹压
 反馈无效/过期或异常控制周期也复位 PID 并归零牵引。未经台架验证的 VCU 车速请求
 不参与闭环，`ADU_Tx_VehSpdReq` 在所有状态固定为 `0 km/h / Q=0`。
 
-车端和 VCU 状态机都要求进入 D/R 或 D/R 互换时具有新鲜有效的挡位/车速反馈，且
-绝对车速不大于 0.1 m/s；拒绝换挡时先撤销旧牵引。换挡闭环期间保持转角和 EHB
+进入 Ready 后，bridge 对任何挡位变更（包括切入 N）都要求新鲜有效的挡位/车速反馈，
+且绝对车速不大于 0.1 m/s；拒绝换挡时先撤销旧牵引并保留上一有效挡位。换挡闭环期间保持转角和 EHB
 压力连续，但八路扭矩保持为零。`WaitParkingBrakeReleased`、`WaitGear` 和
 `WaitActuatorModes` 都要求静止，车速超过 0.1 m/s 立即锁存停车并转入反向退出；
 每个首次启动等待态还有 500 ms 分层反馈宽限，超时后 CAN 静默不能无限保持 EPB
@@ -150,11 +151,14 @@ WaitParallel 阶段撤销握手并保持 EPB 驻车，在之后的启动阶段�
 制动的完整退出。恢复必须
 完成退出流程，并在新鲜反馈满足 N、零速、EPB 驻车、人工状态后显式重新握手。
 
-Bridge 拒绝 D/R 请求时，现有牵引意图先在车端撤销。拒绝结果通过同一次 ABI 调用返回
+Bridge 拒绝未停稳或反馈过期时的任何换挡请求时，现有牵引意图先在车端撤销。拒绝结果通过同一次 ABI 调用返回
 枚举原因，vehicle runtime 再用 `control_command_rejected` 状态事件向当前 DataChannel
 发送 allowlist 中的稳定 `issue_code`。`vcu_drive_gear_change_moving_or_stale` 会让控制页
-清空油门/制动、回到 N 挡并要求驾驶员释放方向键后重新选择；原始异常字符串不会发送给
-浏览器。相同原因最多每 500 ms 重发一次，以兼顾 unordered/unreliable 通道丢包与限频。
+清空油门/制动、按 `command_seq` 恢复拒绝前挡位，立即发送该挡位零牵引，并要求驾驶员释放方向键后重新选择；不会因拒绝自动回 N。原始异常字符串不会发送给
+浏览器。无法关联的拒绝会冻结普通控制（急停和显式断开仍可用），直到安全断开并重新
+握手。bridge 还会锁存被拒绝的换挡：旧目标挡在之后降到零速时也不会自动生效；只有
+上一有效挡位的零牵引或制动命令、显式断开，或新握手才能解除。锁存期间旧挡上的普通
+制动保持可用。相同原因最多每 500 ms 重发一次，以兼顾 unordered/unreliable 通道丢包与限频。
 
 急停、物理急停、故障、断开停车和 bridge 本地 apply watchdog 走独立安全路径：
 八路牵引归零并可请求 DBC 全量 `409.5 bar/路`，不受会话的 327.6 bar 代码上限或

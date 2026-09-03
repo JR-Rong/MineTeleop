@@ -152,11 +152,15 @@ sudo ./scripts/setup_basler_usb_access.sh "$USER"
 重新登录后，车端只需要一个前台启动命令：
 
 ```bash
+sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /var/log/mine-teleop
 ./bin/mine-teleop-run
 ```
 
 它会自动加载 `config/vehicle-agent.yaml`、`config/device-token`、打包内动态库
-和 GStreamer 插件，并同时监管控制与媒体进程。使用 `Ctrl-C` 停止。
+和 GStreamer 插件，并同时监管控制与媒体进程。使用 `Ctrl-C` 停止。终端
+stdout/stderr 同时合并保存为 `/var/log/mine-teleop/vehicle-runtime.log`（单文件
+64 MiB、保留 `.1` 到 `.5`）；VCU/CAN 高频证据继续使用独立的
+`vcu-can.jsonl*` 轮转集合。
 
 ### 4.2 从管理机自动部署
 

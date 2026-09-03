@@ -682,6 +682,97 @@
     };
   }
 
+  function createGearTransition(fromGearValue, toGearValue, statusFloorValue, generationValue) {
+    const fromGear = String(fromGearValue || '');
+    const toGear = String(toGearValue || '');
+    const statusFloor = Number(statusFloorValue);
+    const generation = Number(generationValue);
+    if (!['N', 'R', 'D'].includes(fromGear) || !['N', 'R', 'D'].includes(toGear) ||
+        fromGear === toGear) {
+      throw new TypeError('gear transition requires distinct N/R/D gears');
+    }
+    if (!Number.isSafeInteger(statusFloor) || statusFloor < 0) {
+      throw new TypeError('gear transition status floor must be a non-negative safe integer');
+    }
+    if (!Number.isSafeInteger(generation) || generation <= 0) {
+      throw new TypeError('gear transition generation must be a positive safe integer');
+    }
+    return {generation, fromGear, toGear, statusFloor, forwardedSeqs: []};
+  }
+
+  function recordForwardedGearCommand(
+      transition, generationValue, commandSequenceValue, commandGearValue) {
+    if (!transition || Number(generationValue) !== transition.generation ||
+        String(commandGearValue || '') !== transition.toGear) {
+      return transition;
+    }
+    const sequence = Number(commandSequenceValue);
+    if (!Number.isSafeInteger(sequence) || sequence <= 0) return transition;
+    const prior = Array.isArray(transition.forwardedSeqs) ? transition.forwardedSeqs : [];
+    if (prior.includes(sequence)) return transition;
+    return {...transition, forwardedSeqs: [...prior, sequence].slice(-64)};
+  }
+
+  function matchesGearChangeRejection(transition, message, selectedGearValue) {
+    if (!transition || !message ||
+        message.issue_code !== 'vcu_drive_gear_change_moving_or_stale' ||
+        String(selectedGearValue || '') !== transition.toGear) {
+      return false;
+    }
+    const commandSequence = Number(message.command_seq);
+    const statusSequence = Number(message.control_status_seq);
+    return Number.isSafeInteger(commandSequence) && commandSequence > 0 &&
+        Number.isSafeInteger(statusSequence) && statusSequence > transition.statusFloor &&
+        Array.isArray(transition.forwardedSeqs) &&
+        transition.forwardedSeqs.includes(commandSequence);
+  }
+
+  function reduceGearChangeRejection(transition, message, selectedGearValue) {
+    const selectedGear = ['N', 'R', 'D'].includes(String(selectedGearValue || ''))
+      ? String(selectedGearValue) : 'N';
+    const matched = matchesGearChangeRejection(transition, message, selectedGear);
+    if (!matched) {
+      return {
+        matched: false,
+        selectedGear,
+        pendingGearRequest: null,
+        pendingGearTransition: null,
+        inhibitOrdinaryControl: true,
+        sendRollback: false,
+      };
+    }
+    return {
+      matched: true,
+      selectedGear: transition.fromGear,
+      pendingGearRequest: transition.toGear,
+      pendingGearTransition: null,
+      inhibitOrdinaryControl: false,
+      sendRollback: true,
+    };
+  }
+
+  function telemetryConfirmsGearTransition(transition, message) {
+    if (!transition || !message || message.event !== 'vehicle_telemetry') return false;
+    if (!Array.isArray(transition.forwardedSeqs) || !transition.forwardedSeqs.length) {
+      return false;
+    }
+    const statusSequence = Number(message.control_status_seq);
+    if (!Number.isSafeInteger(statusSequence) || statusSequence <= transition.statusFloor) {
+      return false;
+    }
+    const feedback = message.can_feedback;
+    let actualGear = '';
+    if (feedback && feedback.supported === true) {
+      if (feedback.feedback_fresh !== true || feedback.gear_valid !== true) return false;
+      actualGear = ({1: 'N', 2: 'R', 3: 'D', 4: 'P'})[Number(feedback.gear)] || '';
+    } else if (feedback && feedback.supported === false) {
+      actualGear = String(message.gear || '');
+    } else {
+      return false;
+    }
+    return actualGear === transition.toGear;
+  }
+
   function deriveControl({keyState, gamepad, selectedGear, limits, steeringFullScaleDeg, estop = false}) {
     const state = keyState || {};
     const pad = gamepad || {};
@@ -792,13 +883,15 @@
     if (issueCode === 'vcu_drive_gear_change_moving_or_stale') {
       return {
         issueCode,
+        action: 'rollback_gear_change',
         clearInput: true,
-        severity: 'critical',
-        text: '换挡被车端拒绝：车辆仍在移动，或挡位/速度反馈已过期；请停车并恢复新鲜反馈后，释放再重新选择 D/R。',
+        severity: 'warn',
+        text: '换挡被车端拒绝：已撤销牵引并保持拒绝前挡位；请停车、恢复新鲜反馈，释放后再重新选择方向。',
       };
     }
     return {
       issueCode: 'vcu_control_apply_rejected',
+      action: 'reset_neutral',
       clearInput: true,
       severity: 'critical',
       text: '控制命令被车端拒绝，车辆已保持安全状态；请检查车端 VCU 日志 issue_code 后再重试。',
@@ -911,6 +1004,11 @@
     transitionVcuState,
     allowsGearChange,
     deriveGearSelection,
+    createGearTransition,
+    recordForwardedGearCommand,
+    matchesGearChangeRejection,
+    reduceGearChangeRejection,
+    telemetryConfirmsGearTransition,
     deriveControl,
     normalizeControlProfile,
     normalizeVehicleHardLimits,

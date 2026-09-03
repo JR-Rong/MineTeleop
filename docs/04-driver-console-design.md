@@ -175,9 +175,15 @@ latest-wins 判定由可在浏览器和 Node.js 共用的无 DOM 模块实现。
 
 车端若在实际 apply 阶段拒绝命令，会发送带共享 `control_status_seq` 和原命令
 `command_seq` 的 `control_command_rejected`。页面只解释本地 allowlist 中的
-`issue_code`，不展示车端异常文本；换挡移动/反馈过期会立即清空按键与 Gamepad 输入、
-回 N 挡并要求释放后重试。相同拒绝由车端限频重发，以覆盖 unordered/unreliable
-DataChannel 的单包丢失，同时避免拒绝风暴。
+`issue_code`，不展示车端异常文本；换挡移动/反馈过期时，页面用
+`command_seq` 关联当前换挡尝试，立即清空按键与 Gamepad 输入、恢复到拒绝前已选挡位，
+并发送该挡位的零牵引快照；不再自动回 N。按住的方向输入必须物理释放后才能重试。
+车端同时锁存该次拒绝；即使车速随后降到零，持续发送旧目标挡也不会自动生效，只有
+拒绝前挡位的零牵引（或制动）帧才能解除该次门禁。
+无法关联到当前事务的换挡拒绝不会猜测或重发挡位，而是冻结普通控制，保留急停和
+显式断开，并要求完成安全断开后重新握手。
+相同拒绝由车端限频重发，以覆盖 unordered/unreliable DataChannel 的单包丢失，
+同时避免拒绝风暴。
 
 ## 视频显示
 

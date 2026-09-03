@@ -1039,12 +1039,16 @@ struct VehicleMediaRuntime::Impl {
               feedback_problem ? "vcu_feedback_gate" : "control_validation",
               result.reason,
               result.issue_code == "vcu_drive_gear_change_moving_or_stale"
-                  ? "Stop the vehicle, restore fresh speed and gear feedback, release the direction control, and select D/R again."
+                  ? "Stop the vehicle, restore fresh speed and gear feedback, release the direction control, and select the intended gear again."
                   : feedback_problem
                   ? "Inspect VCU feedback freshness and the VCU JSONL log before requesting control."
                   : "Inspect command identity, sequence, timing, token, and configured safety limits.",
               true,
-              {{"reason", result.reason}, {"safety_action", "local_full_stop"}});
+              {{"reason", result.reason},
+               {"safety_action",
+                result.issue_code == "vcu_drive_gear_change_moving_or_stale"
+                    ? "traction_withdrawn_retained_gear"
+                    : "local_full_stop"}});
         }
       }
       if (config.runtime.control_log_commands) {

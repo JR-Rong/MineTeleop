@@ -16,12 +16,29 @@
 - `vehicle_id`、`driver_id`、`session_id`：会话关联字段（可用时）；
 - `safety_action`：故障后的控制安全动作（涉及控制时）。
 
-摄像头/WebRTC 诊断写入车端 runtime 的 stdout/stderr。VCU 的启动可见性事件也写入
-stderr；协议细节与高频 CAN 证据写入
+摄像头/WebRTC 诊断写入车端 runtime 的 stdout/stderr。由打包入口启动
+`vehicle-runtime` 时，这两路仍显示在原终端，同时合并落盘到
+`MINE_TELEOP_VEHICLE_RUNTIME_LOG_PATH`（默认
+`/var/log/mine-teleop/vehicle-runtime.log`）。它可能包含 GStreamer/vendor 裸文本，
+因此是 `.log` 而不是严格 JSONL；默认单文件 64 MiB、保留 5 份，可分别通过
+`MINE_TELEOP_VEHICLE_RUNTIME_LOG_MAX_BYTES` 和
+`MINE_TELEOP_VEHICLE_RUNTIME_LOG_ROTATIONS` 覆盖。VCU 的启动可见性事件也进入该
+runtime 日志；协议细节与高频 CAN 证据写入
 `MINE_TELEOP_VCU_LOG_PATH`（默认
 `/var/log/mine-teleop/vcu-can.jsonl`）。
 
 ## 配置加载与子进程边界
+
+长期 runtime 启动前，必须由管理员为实际运行用户准备日志目录：
+
+```bash
+sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /var/log/mine-teleop
+```
+
+日志目标或锁文件无法安全打开时，launcher 以 126 退出且不会启动车辆 runtime；
+运行中若磁盘写入失败，只报告一次 `runtime_log_write_failed` 并继续向终端转发，
+避免日志故障阻塞已有安全控制。`.lock` 文件还阻止两个 runtime 同时操作同一套
+轮转文件。
 
 配置尚未成功加载时，无法可靠判断错误属于哪一路 camera/VCU，因此入口统一输出
 `mine_teleop_error`，包含 `issue_code=runtime_entry_failed`、`stage=process_entry` 和
@@ -206,6 +223,13 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 
 | `event` / `issue_code` | 触发条件 | 去哪里看 |
 | --- | --- | --- |
+| `vehicle_runtime_log_ready` / `runtime_log_ready` | runtime 日志文件、容量与轮转锁已就绪 | 终端与 `vehicle-runtime.log` |
+| `vehicle_runtime_log_start_failed` / `runtime_log_open_failed` | 目录、权限、常规文件或单实例锁门禁失败 | launcher stderr；runtime 尚未启动 |
+| `vehicle_runtime_log_start_failed` / `runtime_log_pipe_failed` | stdout/stderr 中继 pipe 创建失败 | launcher stderr 与可用的 runtime log |
+| `vehicle_runtime_log_start_failed` / `runtime_log_initial_write_failed` | 首条日志无法写入 | launcher stderr；runtime 尚未启动 |
+| `vehicle_runtime_log_start_failed` / `runtime_log_signal_setup_failed` | 无法建立安全的 SIGINT/SIGTERM 转发 | launcher stderr；runtime 尚未启动 |
+| `vehicle_runtime_log_start_failed` / `runtime_log_fork_failed` | 无法创建受监管 runtime 子进程 | launcher stderr 与 runtime log |
+| `vehicle_runtime_log_write_failed` / `runtime_log_write_failed` | 运行中写入或轮转失败 | 终端 stderr；runtime 继续安全运行 |
 | `vehicle_vcu_adapter_start_failed` / `vcu_adapter_start_failed` | DataChannel 打开后 dlopen、ABI symbol、接口未 UP、波特率不匹配、发送队列设置或 bridge open 任一步失败；控制通道关闭但视频继续 | runtime stderr；新控制端在关闭前可能收到 `fault` |
 | `vehicle_vcu_start_failed` / `vcu_can_interface_invalid` | CAN interface 为空 | runtime stderr |
 | `vehicle_vcu_start_failed` / `vcu_bridge_already_open` | 重复 open | runtime stderr |
@@ -250,10 +274,9 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `vehicle_vcu_handshake_state_changed` / `vcu_handshake_state_changed` | browser 可见握手状态变化 | stdout 只在状态变化时输出 |
 | `control_apply_rejected` / `vcu_control_runtime_unavailable` | runtime/I/O fault 阻止控制 | 本地全停 |
 | `control_apply_rejected` / `vcu_control_command_invalid` | command 越界或状态不允许 | 本地全停 |
-| `bridge_api_operation_failed` / `chassis_control_update_failed` | ChassisControl 拒绝新的 vehicle state | 本地全停 |
 | `bridge_api_operation_failed` / `vcu_apply_arguments_invalid` | ABI gear/pointer/count 非法 | 本地全停 |
 | `vehicle_control_command_rejected` / `vcu_feedback_blocks_control` | feedback missing/poll failed 阻止 DataChannel 命令 | 本地全停；结合 VCU JSONL |
-| `control_apply_rejected`、`control_command_rejected` / `vcu_drive_gear_change_moving_or_stale` | D/R 切换时车辆仍在移动，或速度/挡位反馈无效、过期 | 先撤牵引；当前驾驶端清空输入并回 N，停车且恢复新鲜反馈后释放并重新选择 D/R |
+| `control_apply_rejected`、`control_command_rejected` / `vcu_drive_gear_change_moving_or_stale` | 任何挡位切换（包括 N）时车辆仍在移动，或速度/挡位反馈无效、过期 | 以 `traction_withdrawn_retained_gear` 撤牵引并锁存上一有效挡位；旧目标不会在随后零速时自动生效。驾驶端能关联 `command_seq` 时回滚且发送旧挡零牵引；无法关联时冻结普通控制但保留急停/显式断开，需安全断开并重新握手 |
 | `control_command_rejected` / `vcu_control_apply_rejected` | bridge 拒绝控制但原因不属于浏览器 allowlist | 清空驾驶输入并保持安全状态；查 VCU JSONL 获取本地详细原因 |
 | `vehicle_vcu_handshake_command_failed` / `vcu_handshake_command_failed` | handshake ABI 调用抛错 | 本地全停 |
 | `vehicle_vcu_runtime_failed` / `vcu_runtime_operation_failed` | tick/telemetry/safe-stop 路径抛错 | 尝试本地全停并关闭控制 DataChannel；视频继续 |
@@ -271,12 +294,12 @@ disarm 结果立即 flush。
 
 ## 推荐排查命令
 
-车端 runtime 只看失败和关键里程碑：
+车端 runtime 只看失败和关键里程碑（`-R` 忽略混合日志中的非 JSON 行）：
 
 ```bash
-./bin/mine-teleop-run 2>&1 |
-  jq -c 'select(
-    (.severity == "error") or
+sudo tail -n 0 -F /var/log/mine-teleop/vehicle-runtime.log |
+  jq -R -c 'fromjson? | select(
+    (.severity == "error") or (.severity == "critical") or
     (.event | test("first_frame|offer_created|answer_applied|ice_candidate|data_channel_open|vcu_adapter_ready"))
   )'
 ```
@@ -284,8 +307,8 @@ disarm 结果立即 flush。
 定位某一路摄像头：
 
 ```bash
-./bin/mine-teleop-run 2>&1 |
-  jq -c 'select(.camera_id == "front_uvc2" or .issue_code == "camera_node_not_capture_capable")'
+sudo tail -n 0 -F /var/log/mine-teleop/vehicle-runtime.log |
+  jq -R -c 'fromjson? | select(.camera_id == "front_uvc2" or .issue_code == "camera_node_not_capture_capable")'
 ```
 
 VCU 结论事件：

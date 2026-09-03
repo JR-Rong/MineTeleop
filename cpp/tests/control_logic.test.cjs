@@ -89,6 +89,106 @@ test('gear selection latches on release and gates every new D/R selection on val
       'R');
 });
 
+test('gear rejection matches only a forwarded command from the active transition', () => {
+  let transition = logic.createGearTransition('D', 'R', 40, 7);
+  assert.deepEqual(transition, {
+    generation: 7,
+    fromGear: 'D',
+    toGear: 'R',
+    statusFloor: 40,
+    forwardedSeqs: [],
+  });
+  assert.strictEqual(
+      logic.recordForwardedGearCommand(transition, 6, 100, 'R'), transition);
+  assert.strictEqual(
+      logic.recordForwardedGearCommand(transition, 7, 100, 'D'), transition);
+  transition = logic.recordForwardedGearCommand(transition, 7, 101, 'R');
+  transition = logic.recordForwardedGearCommand(transition, 7, 102, 'R');
+  assert.deepEqual(transition.forwardedSeqs, [101, 102]);
+  assert.equal(logic.matchesGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    command_seq: 101,
+    control_status_seq: 41,
+  }, 'R'), true);
+  assert.equal(logic.matchesGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    command_seq: 103,
+    control_status_seq: 41,
+  }, 'R'), false);
+  assert.equal(logic.matchesGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    command_seq: 101,
+    control_status_seq: 40,
+  }, 'R'), false);
+  assert.equal(logic.matchesGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    command_seq: 101,
+    control_status_seq: 41,
+  }, 'D'), false);
+
+  assert.deepEqual(logic.reduceGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    command_seq: 101,
+    control_status_seq: 41,
+  }, 'R'), {
+    matched: true,
+    selectedGear: 'D',
+    pendingGearRequest: 'R',
+    pendingGearTransition: null,
+    inhibitOrdinaryControl: false,
+    sendRollback: true,
+  });
+  assert.deepEqual(logic.reduceGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    command_seq: 999,
+    control_status_seq: 41,
+  }, 'R'), {
+    matched: false,
+    selectedGear: 'R',
+    pendingGearRequest: null,
+    pendingGearTransition: null,
+    inhibitOrdinaryControl: true,
+    sendRollback: false,
+  });
+});
+
+test('only fresh authoritative telemetry confirms an active gear transition', () => {
+  const unforwarded = logic.createGearTransition('D', 'R', 50, 8);
+  const telemetry = {
+    event: 'vehicle_telemetry',
+    control_status_seq: 51,
+    gear: 'N',
+    can_feedback: {supported: true, feedback_fresh: true, gear_valid: true, gear: 2},
+  };
+  assert.equal(logic.telemetryConfirmsGearTransition(unforwarded, telemetry), false);
+  const transition = logic.recordForwardedGearCommand(unforwarded, 8, 201, 'R');
+  assert.equal(logic.telemetryConfirmsGearTransition(transition, telemetry), true);
+  assert.equal(logic.telemetryConfirmsGearTransition(
+      transition, {...telemetry, control_status_seq: 50}), false);
+  assert.equal(logic.telemetryConfirmsGearTransition(
+      transition, {...telemetry, can_feedback: {...telemetry.can_feedback, feedback_fresh: false}}),
+      false);
+  assert.equal(logic.telemetryConfirmsGearTransition(
+      transition, {...telemetry, can_feedback: {...telemetry.can_feedback, gear_valid: false}}),
+      false);
+  assert.equal(logic.telemetryConfirmsGearTransition(
+      transition, {...telemetry, can_feedback: {...telemetry.can_feedback, gear: 3}}), false);
+  assert.equal(logic.telemetryConfirmsGearTransition(transition, {
+    event: 'vehicle_telemetry',
+    control_status_seq: 52,
+    gear: 'R',
+    can_feedback: {supported: false},
+  }), true);
+  for (const canFeedback of [undefined, {}, {supported: null}, {supported: 'false'}]) {
+    assert.equal(logic.telemetryConfirmsGearTransition(transition, {
+      event: 'vehicle_telemetry',
+      control_status_seq: 52,
+      gear: 'R',
+      can_feedback: canFeedback,
+    }), false);
+  }
+});
+
 test('deriveControl applies brake priority, suppresses throttle, and preserves steering', () => {
   const limits = {maxThrottle: 0.05, maxBrakePressureBar: 100,
     serviceBrakePressureBar: 30, hardBrakePressureBar: 80, maxSteeringDeg: 3};
@@ -201,14 +301,16 @@ test('control rejection presentation exposes only stable issue-code guidance', (
       'vcu_drive_gear_change_moving_or_stale');
   assert.deepEqual(gearRejected, {
     issueCode: 'vcu_drive_gear_change_moving_or_stale',
+    action: 'rollback_gear_change',
     clearInput: true,
-    severity: 'critical',
-    text: '换挡被车端拒绝：车辆仍在移动，或挡位/速度反馈已过期；请停车并恢复新鲜反馈后，释放再重新选择 D/R。',
+    severity: 'warn',
+    text: '换挡被车端拒绝：已撤销牵引并保持拒绝前挡位；请停车、恢复新鲜反馈，释放后再重新选择方向。',
   });
 
   const unknown = logic.deriveControlCommandRejection(
       'untrusted exception text / secret sentinel');
   assert.equal(unknown.issueCode, 'vcu_control_apply_rejected');
+  assert.equal(unknown.action, 'reset_neutral');
   assert.equal(unknown.clearInput, true);
   assert.equal(unknown.severity, 'critical');
   assert(!unknown.text.includes('secret sentinel'));
