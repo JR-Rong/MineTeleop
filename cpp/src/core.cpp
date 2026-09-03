@@ -208,6 +208,23 @@ struct BridgeOpenConfigV3 {
   double max_ordinary_brake_pressure_bar;
 };
 
+struct BridgeOpenConfigV4 {
+  std::uint32_t struct_size;
+  const char* can_interface;
+  double full_scale_motor_torque_nm;
+  double hard_speed_limit_mps;
+  std::int32_t control_timeout_ms;
+  std::int32_t speed_feedback_timeout_ms;
+  double speed_pid_kp;
+  double speed_pid_ki;
+  double speed_pid_kd;
+  double speed_pid_derivative_filter_tau_ms;
+  std::int32_t speed_pid_max_dt_ms;
+  double hard_overspeed_margin_mps;
+  double max_ordinary_brake_pressure_bar;
+  double motor_torque_rise_rate_nm_per_s;
+};
+
 struct BridgeApplyResultV1 {
   std::uint32_t struct_size;
   std::int32_t result_code;
@@ -273,6 +290,28 @@ static_assert(
     sizeof(BridgeOpenConfigV2));
 static_assert(
     sizeof(BridgeOpenConfigV3) == sizeof(BridgeOpenConfigV2) + sizeof(double));
+#define MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(field) \
+  static_assert(offsetof(BridgeOpenConfigV4, field) == \
+      offsetof(BridgeOpenConfigV3, field))
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(struct_size);
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(can_interface);
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(full_scale_motor_torque_nm);
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(hard_speed_limit_mps);
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(control_timeout_ms);
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(speed_feedback_timeout_ms);
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(speed_pid_kp);
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(speed_pid_ki);
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(speed_pid_kd);
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(speed_pid_derivative_filter_tau_ms);
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(speed_pid_max_dt_ms);
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(hard_overspeed_margin_mps);
+MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD(max_ordinary_brake_pressure_bar);
+#undef MINE_TELEOP_ASSERT_BRIDGE_V4_PREFIX_FIELD
+static_assert(
+    offsetof(BridgeOpenConfigV4, motor_torque_rise_rate_nm_per_s) ==
+    sizeof(BridgeOpenConfigV3));
+static_assert(
+    sizeof(BridgeOpenConfigV4) == sizeof(BridgeOpenConfigV3) + sizeof(double));
 
 struct BridgeFeedback {
   int shake_hand_status;
@@ -422,6 +461,7 @@ void validate_chassis_bridge_abi_handle(void* handle) {
   using OpenV1Fn = int (*)(const BridgeOpenConfigV1*);
   using OpenV2Fn = int (*)(const BridgeOpenConfigV2*);
   using OpenV3Fn = int (*)(const BridgeOpenConfigV3*);
+  using OpenV4Fn = int (*)(const BridgeOpenConfigV4*);
   using ApplyV2Fn = int (*)(
       int,
       double,
@@ -436,6 +476,8 @@ void validate_chassis_bridge_abi_handle(void* handle) {
   const auto version = load_symbol<QueryFn>(
       handle, "mine_teleop_chassis_abi_version")();
   const auto config_size = load_symbol<QueryFn>(
+      handle, "mine_teleop_chassis_open_config_v4_size")();
+  const auto legacy_v3_config_size = load_symbol<QueryFn>(
       handle, "mine_teleop_chassis_open_config_v3_size")();
   const auto legacy_v2_config_size = load_symbol<QueryFn>(
       handle, "mine_teleop_chassis_open_config_v2_size")();
@@ -447,19 +489,25 @@ void validate_chassis_bridge_abi_handle(void* handle) {
       handle, "mine_teleop_chassis_open_v2"));
   static_cast<void>(load_symbol<OpenV3Fn>(
       handle, "mine_teleop_chassis_open_v3"));
+  static_cast<void>(load_symbol<OpenV4Fn>(
+      handle, "mine_teleop_chassis_open_v4"));
   static_cast<void>(load_symbol<ApplyV2Fn>(
       handle, "mine_teleop_chassis_apply_state_v2"));
   static_cast<void>(load_symbol<ConfigureRuntimeControlFn>(
       handle, "mine_teleop_chassis_configure_runtime_control_v1"));
   static_cast<void>(load_symbol<ClearRuntimeControlFn>(
       handle, "mine_teleop_chassis_clear_runtime_control_v1"));
-  if (version != 3U || config_size != sizeof(BridgeOpenConfigV3) ||
+  if (version != 4U || config_size != sizeof(BridgeOpenConfigV4) ||
+      legacy_v3_config_size != sizeof(BridgeOpenConfigV3) ||
       legacy_v2_config_size != sizeof(BridgeOpenConfigV2) ||
       runtime_control_config_size != sizeof(BridgeRuntimeControlConfigV1)) {
     throw std::runtime_error(
-        "chassis bridge ABI mismatch: expected version 3 and V3 config size " +
-        std::to_string(sizeof(BridgeOpenConfigV3)) + ", got version " +
+        "chassis bridge ABI mismatch: expected version 4 and V4 config size " +
+        std::to_string(sizeof(BridgeOpenConfigV4)) + ", got version " +
         std::to_string(version) + " and size " + std::to_string(config_size) +
+        "; legacy V3 size expected " +
+        std::to_string(sizeof(BridgeOpenConfigV3)) + ", got " +
+        std::to_string(legacy_v3_config_size) +
         "; legacy V2 size expected " +
         std::to_string(sizeof(BridgeOpenConfigV2)) + ", got " +
         std::to_string(legacy_v2_config_size) +
@@ -1085,7 +1133,8 @@ double dynamic_adapter_target_speed_mps(
   const bool driving_gear = command.gear == "D" || command.gear == "R";
   // This is only the local PID setpoint; it is never forwarded as a VCU
   // vehicle-speed request. Analog throttle selects a proportional target
-  // speed, while the independent hard limit is passed in the V3 open config.
+  // speed, while the independent hard limit is passed in the current
+  // versioned open config.
   return driving_gear && command.brake == 0.0
       ? std::clamp(command.throttle, 0.0, 1.0) * max_speed_mps
       : 0.0;
@@ -1381,6 +1430,8 @@ Json VehicleConfig::redacted_summary() const {
       {"max_speed_kph", field_safety.max_speed_kph},
       {"max_throttle", field_safety.max_throttle},
       {"full_scale_motor_torque_nm", field_safety.full_scale_motor_torque_nm},
+      {"motor_torque_rise_rate_nm_per_s",
+       field_safety.motor_torque_rise_rate_nm_per_s},
       {"speed_feedback_timeout_ms", field_safety.speed_feedback_timeout_ms},
       {"speed_pid_kp", field_safety.speed_pid_kp},
       {"speed_pid_ki", field_safety.speed_pid_ki},
@@ -1616,6 +1667,10 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
           safety,
           "full_scale_motor_torque_nm",
           kDefaultFullScaleMotorTorqueNm);
+  config.field_safety.motor_torque_rise_rate_nm_per_s = optional<double>(
+      safety,
+      "motor_torque_rise_rate_nm_per_s",
+      kDefaultMotorTorqueRiseRateNmPerSecond);
   config.field_safety.speed_feedback_timeout_ms =
       optional<int>(safety, "speed_feedback_timeout_ms", 200);
   config.field_safety.speed_pid_kp = optional<double>(safety, "speed_pid_kp", 1.0);
@@ -1655,6 +1710,13 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
           kMaxFullScaleMotorTorqueNm) {
     throw std::runtime_error(
         "field_safety.full_scale_motor_torque_nm must be finite and in [0, 640.0] Nm");
+  }
+  if (!std::isfinite(config.field_safety.motor_torque_rise_rate_nm_per_s) ||
+      config.field_safety.motor_torque_rise_rate_nm_per_s < 0.0 ||
+      config.field_safety.motor_torque_rise_rate_nm_per_s >
+          kMaxMotorTorqueRiseRateNmPerSecond) {
+    throw std::runtime_error(
+        "field_safety.motor_torque_rise_rate_nm_per_s must be finite and in [0, 32000.0] Nm/s; zero disables additional rise limiting");
   }
   if (!std::isfinite(config.field_safety.max_speed_kph) ||
       config.field_safety.max_speed_kph < 0.0 ||
@@ -1741,6 +1803,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   if (config.vehicle_adapter.type != "mock" &&
       (!safety || !safety["max_speed_kph"] || !safety["max_throttle"] ||
        !safety["full_scale_motor_torque_nm"] ||
+       !safety["motor_torque_rise_rate_nm_per_s"] ||
        !safety["max_brake_pressure_bar"] ||
        !safety["max_steering_angle_deg"] ||
        !safety["speed_feedback_timeout_ms"] || !safety["speed_pid_kp"] ||
@@ -1750,8 +1813,9 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
        !safety["hard_overspeed_margin_kph"])) {
     throw std::runtime_error(
         "non-mock vehicle adapter requires explicit field_safety max_speed_kph, "
-        "max_throttle, full_scale_motor_torque_nm, max_brake_pressure_bar, steering limits, "
-        "speed PID gains/timing, feedback timeout, and hard overspeed margin");
+        "max_throttle, full_scale_motor_torque_nm, motor_torque_rise_rate_nm_per_s, "
+        "max_brake_pressure_bar, steering limits, speed PID gains/timing, feedback "
+        "timeout, and hard overspeed margin");
   }
   if (config.vehicle_adapter.type != "mock" &&
       config.hardware.can_tx_queue_length < 16) {
@@ -1918,6 +1982,7 @@ DynamicLibraryVehicleAdapter::DynamicLibraryVehicleAdapter(
     int can_tx_queue_length,
     double max_speed_mps,
     double full_scale_motor_torque_nm,
+    double motor_torque_rise_rate_nm_per_s,
     double max_ordinary_brake_pressure_bar,
     int control_timeout_ms,
     int speed_feedback_timeout_ms,
@@ -1933,6 +1998,7 @@ DynamicLibraryVehicleAdapter::DynamicLibraryVehicleAdapter(
       can_tx_queue_length_(can_tx_queue_length),
       max_speed_mps_(max_speed_mps),
       full_scale_motor_torque_nm_(full_scale_motor_torque_nm),
+      motor_torque_rise_rate_nm_per_s_(motor_torque_rise_rate_nm_per_s),
       max_ordinary_brake_pressure_bar_(max_ordinary_brake_pressure_bar),
       session_motor_torque_limit_nm_(0.0),
       session_brake_pressure_limit_bar_(0.0),
@@ -1951,6 +2017,10 @@ DynamicLibraryVehicleAdapter::DynamicLibraryVehicleAdapter(
       !std::isfinite(full_scale_motor_torque_nm_) ||
       full_scale_motor_torque_nm_ < 0.0 ||
       full_scale_motor_torque_nm_ > kMaxFullScaleMotorTorqueNm ||
+      !std::isfinite(motor_torque_rise_rate_nm_per_s_) ||
+      motor_torque_rise_rate_nm_per_s_ < 0.0 ||
+      motor_torque_rise_rate_nm_per_s_ >
+          kMaxMotorTorqueRiseRateNmPerSecond ||
       !std::isfinite(max_ordinary_brake_pressure_bar_) ||
       max_ordinary_brake_pressure_bar_ < 0.0 ||
       max_ordinary_brake_pressure_bar_ > kMaxOrdinaryBrakePressureBar ||
@@ -1989,7 +2059,7 @@ void DynamicLibraryVehicleAdapter::ensure_loaded() {
   handle_ = open_dynamic_library(library_path_);
   try {
     validate_chassis_bridge_abi_handle(handle_);
-    open_v3_fn_ = load_symbol<OpenV3Fn>(handle_, "mine_teleop_chassis_open_v3");
+    open_v4_fn_ = load_symbol<OpenV4Fn>(handle_, "mine_teleop_chassis_open_v4");
     apply_fn_ = load_symbol<ApplyFn>(handle_, "mine_teleop_chassis_apply_state");
     apply_v2_fn_ = load_symbol<ApplyV2Fn>(
         handle_, "mine_teleop_chassis_apply_state_v2");
@@ -2035,8 +2105,8 @@ void DynamicLibraryVehicleAdapter::open() {
 #if defined(__linux__)
     prepare_socketcan(can_interface_, can_bitrate_, can_tx_queue_length_);
 #endif
-    const BridgeOpenConfigV3 config{
-        sizeof(BridgeOpenConfigV3),
+    const BridgeOpenConfigV4 config{
+        sizeof(BridgeOpenConfigV4),
         can_interface_.c_str(),
         full_scale_motor_torque_nm_,
         max_speed_mps_,
@@ -2048,8 +2118,9 @@ void DynamicLibraryVehicleAdapter::open() {
         speed_pid_derivative_filter_tau_ms_,
         speed_pid_max_dt_ms_,
         hard_overspeed_margin_mps_,
-        max_ordinary_brake_pressure_bar_};
-    check_result(open_v3_fn_(&config), "mine_teleop_chassis_open_v3");
+        max_ordinary_brake_pressure_bar_,
+        motor_torque_rise_rate_nm_per_s_};
+    check_result(open_v4_fn_(&config), "mine_teleop_chassis_open_v4");
     opened_ = true;
   } catch (const std::exception& error) {
     last_error_ = error.what();
@@ -2326,6 +2397,7 @@ std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& conf
         config.hardware.can_tx_queue_length,
         config.field_safety.max_speed_kph / 3.6,
         config.field_safety.full_scale_motor_torque_nm,
+        config.field_safety.motor_torque_rise_rate_nm_per_s,
         config.field_safety.max_brake_pressure_bar,
         config.control.control_timeout_ms,
         config.field_safety.speed_feedback_timeout_ms,

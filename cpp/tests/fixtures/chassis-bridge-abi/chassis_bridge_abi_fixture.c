@@ -4,8 +4,8 @@
 #error "MINE_TELEOP_TEST_CHASSIS_ABI_VERSION must be defined"
 #endif
 
-#ifndef MINE_TELEOP_TEST_CHASSIS_WRONG_V3_SIZE
-#define MINE_TELEOP_TEST_CHASSIS_WRONG_V3_SIZE 0
+#ifndef MINE_TELEOP_TEST_CHASSIS_WRONG_V4_SIZE
+#define MINE_TELEOP_TEST_CHASSIS_WRONG_V4_SIZE 0
 #endif
 
 #ifndef MINE_TELEOP_TEST_CHASSIS_HAS_APPLY_V2
@@ -29,10 +29,14 @@ uint32_t mine_teleop_chassis_open_config_v2_size(void) {
 }
 
 uint32_t mine_teleop_chassis_open_config_v3_size(void) {
-#if MINE_TELEOP_TEST_CHASSIS_WRONG_V3_SIZE
-    return (uint32_t)(sizeof(struct MineTeleopChassisOpenConfigV3) - 1U);
-#else
     return (uint32_t)sizeof(struct MineTeleopChassisOpenConfigV3);
+}
+
+uint32_t mine_teleop_chassis_open_config_v4_size(void) {
+#if MINE_TELEOP_TEST_CHASSIS_WRONG_V4_SIZE
+    return (uint32_t)(sizeof(struct MineTeleopChassisOpenConfigV4) - 1U);
+#else
+    return (uint32_t)sizeof(struct MineTeleopChassisOpenConfigV4);
 #endif
 }
 
@@ -63,6 +67,12 @@ int mine_teleop_chassis_open_v2(
 
 int mine_teleop_chassis_open_v3(
     const struct MineTeleopChassisOpenConfigV3* config) {
+    (void)config;
+    return 0;
+}
+
+int mine_teleop_chassis_open_v4(
+    const struct MineTeleopChassisOpenConfigV4* config) {
     (void)config;
     return 0;
 }

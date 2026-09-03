@@ -40,7 +40,8 @@ bridge path above and the same interface declared by `hardware.can.interface`
 (`can1` in the current field template), set a commissioning
 `field_safety.max_speed_kph`, and explicitly configure the local speed PID,
 speed-feedback deadline, hard-overspeed margin, `max_throttle`,
-`full_scale_motor_torque_nm`, `max_brake_pressure_bar`, and steering limits.
+`full_scale_motor_torque_nm`, `motor_torque_rise_rate_nm_per_s`,
+`max_brake_pressure_bar`, and steering limits.
 
 Before ordinary driving, the controller submits a complete `profile_version=2`
 snapshot containing target speed, maximum per-motor torque, maximum ordinary
@@ -60,21 +61,29 @@ acknowledged session target. The bridge's single
 SocketCAN I/O thread runs the PID once per 20 ms cycle from fresh signed VCU
 speed feedback. Any positive throttle enables the PID, but is not a second
 torque ceiling. The PID output is clamped to `[0, 1]`; at the target the
-integral term may retain positive torque. ChassisControl maps that normalized
-output to eight channels, after which the bridge clamps D to positive-only and
-R to negative-only torque, quantizes toward zero at 0.1 Nm, and limits every
-channel to the smaller of the acknowledged session limit and
-`full_scale_motor_torque_nm`. A fixed 0.05 m/s setpoint-reference
+integral term may retain positive torque. The bridge multiplies that output
+directly by the acknowledged per-motor session torque limit and writes the
+same magnitude to all eight traction channels. It clamps D to positive-only
+and R to negative-only torque, and quantizes toward zero at 0.1 Nm. The
+vehicle-side `motor_torque_rise_rate_nm_per_s` optionally limits only rising
+torque; `0` disables this extra shaping. When enabled, the current reachable
+torque is fed into the PID as its dynamic output ceiling so conditional
+integration sees the actuator limit instead of winding up behind a second
+clamp. Every torque decrease remains immediate. The acknowledged session limit
+cannot exceed `full_scale_motor_torque_nm`. ChassisControl remains in the loop
+for steering and braking, but its acceleration-to-torque result is not used. A
+fixed 0.05 m/s setpoint-reference
 deadband preserves the integral through small gamepad jitter; cumulative target
 movement beyond that band, including a material target decrease, resets it.
 
 `ADU_Tx_VehSpdReq` is intentionally always encoded as `0 km/h / Q=0`; the
 runtime does not depend on the unverified VCU target-speed loop. Any brake
 zeros throttle and target speed, resets the PID, and forces all eight motor
-torques to zero while retaining steering. ABI V3 transports the acknowledged
-physical brake pressure through the apply call; the bridge invokes
-ChassisControl for steering, then overwrites all eight EHB channels with the
-direct pressure quantized to 0.1 bar. No
+torques to zero while retaining steering. ABI V4 preserves the V3 physical
+brake-pressure contract and transports the optional rising-torque rate at open;
+the acknowledged physical brake pressure still travels through the apply call.
+The bridge invokes ChassisControl for steering, then overwrites all eight EHB
+channels with the direct pressure quantized to 0.1 bar. No
 traction, stale/invalid speed, non-Ready state, a gear mismatch, or an abnormal
 PID interval likewise resets the PID and commands zero traction.
 
@@ -129,13 +138,13 @@ explicit new parallel-handshake request.
 
 Upgrade the vehicle-agent runtime and this bridge atomically. The current
 runtime requires
-ABI version 3, an exact V3 struct-size match, and
-`mine_teleop_chassis_open_v3` plus the additive
+ABI version 4, exact V4 and legacy V3/V2 struct-size matches, and
+`mine_teleop_chassis_open_v4` plus the additive
 `mine_teleop_chassis_apply_state_v2`; the runtime queries these capabilities before any CAN
 initialization. A V1/V2-only bridge fails closed instead of silently ignoring the
 physical ordinary-brake ceiling or interpreting the negative apply value as
 legacy deceleration.
-ABI version 3 also requires the runtime-control V1 size query plus
+ABI version 4 also requires the runtime-control V1 size query plus
 `mine_teleop_chassis_configure_runtime_control_v1` and
 `mine_teleop_chassis_clear_runtime_control_v1`; missing symbols or a wrong POD
 size are rejected before SocketCAN initialization.
@@ -143,12 +152,15 @@ size are rejected before SocketCAN initialization.
 distinguishes the D/R moving-or-stale gate from other rejected applies without
 exporting bridge log strings or requiring a racy last-error getter. The legacy
 `apply_state` symbol remains a fail-closed integer wrapper.
-The bridge continues to export `mine_teleop_chassis_open_v1` and
-`mine_teleop_chassis_open_v2` for direct ABI callers and compatibility tests.
+The bridge continues to export `mine_teleop_chassis_open_v1`,
+`mine_teleop_chassis_open_v2`, and `mine_teleop_chassis_open_v3` for direct ABI
+callers and compatibility tests. V3 has no rise-rate field, so direct PID torque
+has no additional rise shaping; V4 uses the explicitly configured value, where
+zero also means immediate output.
 V1 deliberately disables traction because it cannot supply a validated
 local-PID safety configuration; V2 retains its legacy negative-deceleration
 apply semantics. These exports do not let an older vehicle-agent pass the
-global ABI-version-3 startup gate.
+global ABI-version-4 startup gate.
 
 Validate before service startup:
 
@@ -167,8 +179,9 @@ Validate before service startup:
 ```
 
 The bridge uses SocketCAN on Linux and the repository-owned JYR010 20260714
-codec. ChassisControl supplies the eight-wheel dynamics/control calculation.
-It does not use MinePilot's older generated CAN codec at runtime.
+codec. ChassisControl supplies steering and braking calculations; the bridge
+owns direct traction torque and CAN encoding. It does not use MinePilot's
+older generated CAN codec at runtime.
 
 Bridge open starts in standby. It sends the 16 low-request ADU frames every
 20 ms but does not request driving authority. An active driver must click the

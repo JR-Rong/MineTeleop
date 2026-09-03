@@ -24,6 +24,8 @@ inline constexpr int kProtocolVersion = 1;
 inline constexpr std::size_t kMaxVehicleTelemetryHistory = 1024;
 inline constexpr double kDefaultFullScaleMotorTorqueNm = 300.0;
 inline constexpr double kMaxFullScaleMotorTorqueNm = 640.0;
+inline constexpr double kDefaultMotorTorqueRiseRateNmPerSecond = 0.0;
+inline constexpr double kMaxMotorTorqueRiseRateNmPerSecond = 32000.0;
 inline constexpr double kDefaultMaxBrakePressureBar = 100.0;
 inline constexpr double kMaxOrdinaryBrakePressureBar = 327.6;
 inline constexpr double kMaxEmergencyBrakePressureBar = 409.5;
@@ -373,6 +375,8 @@ struct FieldSafetyConfig {
   double max_speed_kph{40.0};
   double max_throttle{1.0};
   double full_scale_motor_torque_nm{kDefaultFullScaleMotorTorqueNm};
+  double motor_torque_rise_rate_nm_per_s{
+      kDefaultMotorTorqueRiseRateNmPerSecond};
   int speed_feedback_timeout_ms{200};
   double speed_pid_kp{1.0};
   double speed_pid_ki{0.2};
@@ -551,6 +555,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
       int can_tx_queue_length,
       double max_speed_mps,
       double full_scale_motor_torque_nm,
+      double motor_torque_rise_rate_nm_per_s,
       double max_ordinary_brake_pressure_bar,
       int control_timeout_ms,
       int speed_feedback_timeout_ms,
@@ -590,6 +595,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   int can_tx_queue_length_;
   double max_speed_mps_;
   double full_scale_motor_torque_nm_;
+  double motor_torque_rise_rate_nm_per_s_;
   double max_ordinary_brake_pressure_bar_;
   double session_motor_torque_limit_nm_;
   double session_brake_pressure_limit_bar_;
@@ -609,7 +615,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   std::uint64_t safe_stop_count_{0};
   std::string last_error_;
 
-  using OpenV3Fn = int (*)(const void*);
+  using OpenV4Fn = int (*)(const void*);
   using ApplyFn = int (*)(int, double, double, const double*, int);
   using ApplyV2Fn = int (*)(int, double, double, const double*, int, void*);
   using ConfigureRuntimeControlFn = int (*)(const void*, void*);
@@ -621,7 +627,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   using ReadFn = int (*)(void*);
   using ReadCanFeedbackV1Fn = int (*)(void*);
   using CloseFn = int (*)();
-  OpenV3Fn open_v3_fn_{nullptr};
+  OpenV4Fn open_v4_fn_{nullptr};
   ApplyFn apply_fn_{nullptr};
   ApplyV2Fn apply_v2_fn_{nullptr};
   ConfigureRuntimeControlFn configure_runtime_control_fn_{nullptr};

@@ -86,13 +86,17 @@ ChassisControl，避免 vendor 接口并发。油门是已确认会话目标车�
 目标同时受 `field_safety.max_speed_kph * max_throttle` 约束。任何正油门只表示启用 PID，
 不是第二个扭矩上限；PID 输出固定截断到 `[0, 1]`，到达目标点后允许积分项保留
 克服滚阻或坡度所需的正扭矩。D 使用正向速度和正扭矩，R 使用反向速度和负扭矩，
-最终每路仍按会话转矩上限与 `full_scale_motor_torque_nm` 的较小值、挡位方向和
-0.1 Nm 向零量化硬限幅。
+PID 输出直接乘以会话单电机转矩上限后以相同幅值写入八路牵引通道，不再经过
+`m*a`、轮径和减速比的理想车辆模型换算。最终每路仍按会话转矩上限与
+`full_scale_motor_torque_nm` 的较小值、挡位方向和 0.1 Nm 向零量化硬限幅。
+`motor_torque_rise_rate_nm_per_s=0` 表示不增加额外斜率；配置正值时，当周期可达
+转矩直接作为 PID 的动态 ceiling，条件积分能感知限制。任何减扭立即生效。
+ChassisControl 继续负责转向和制动计算。
 PID 目标参考采用固定 0.05 m/s 复位死区；参考不随每次小抖动移动，因此累计偏差
 越界时仍会复位，目标明显下降或 D/R 改变也会复位。
 
 普通制动、零油门、非 Ready、换挡、实际挡位不匹配、车速无效/过期、异常 PID
-周期都会清空 PID 并输出零牵引。V3 普通制动是物理压力输入：bridge 仍调用
+周期都会清空 PID 并输出零牵引。V4 继承 V3 的物理压力制动输入：bridge 仍调用
 ChassisControl 保持转向计算，但随后把八路电机扭矩强制置零，并用 0.1 bar 量化后的
 会话压力直接覆盖八路 EHB 请求。本 PR 的缓刹是直接 `service_brake_pressure_bar`，
 没有独立制动 PID 或 ramp/jerk 曲线；急刹直接使用 `hard_brake_pressure_bar`。
@@ -145,12 +149,14 @@ WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉
 驻车反馈，且 controller 必须为 Standby 或 Disarmed。
 车端仅在实际应用参数后确认；未确认参数时不能请求 VCU 握手或发送普通驾驶命令。
 参数会在断链、故障、控制权/会话替换和 adapter 安全停车时清除；bridge 同时撤销牵引、
-复位 PID 并恢复 open_v3 时的 YAML 默认 PID。成功 ACK 的 `applied_revision` 必须等于请求 `seq`。
+复位 PID 并恢复当前 open 配置中的 YAML 默认 PID。成功 ACK 的 `applied_revision` 必须等于请求 `seq`。
 车端 `field_safety.max_throttle`（目标车速比例上限）、
 `field_safety.full_scale_motor_torque_nm`、
 `field_safety.max_brake_pressure_bar` 和
 `field_safety.max_steering_angle_deg` 是不可由浏览器绕过的第二层硬上限，车端会
-通过 DataChannel 把实际硬上限回传给窗口。压力上限必须来自车辆标定；
+通过 DataChannel 把实际硬上限回传给窗口。
+`field_safety.motor_torque_rise_rate_nm_per_s` 是车端启动配置，不进入会话参数；
+实际值记录在有效配置日志和 bridge 的 `vehicle_parameters` 事件中。压力上限必须来自车辆标定；
 急停、故障、断开停车和 bridge 本地 apply watchdog 走独立安全停车路径；上游控制
 超时的最终 1.0 阶段同样不受普通驾驶刹车限幅削弱，之前的 0.3/0.6 阶段仍按车端
 普通压力上限换算。Degraded 保持上一条普通制动的物理压力：会话比例先换算为车端
@@ -159,7 +165,8 @@ WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉
 超时分段首项必须为 `after_ms: 0`、时间严格递增、制动比例不下降并最终包含 1.0；
 重复时间、缺少最终全量阶段或中途降低制动的配置都会 fail closed。
 非 mock 车端升级后必须在 YAML 中显式补齐
-`field_safety.max_brake_pressure_bar`；旧的归一化 `max_brake` 会被拒绝。
+`field_safety.max_brake_pressure_bar` 和
+`field_safety.motor_torque_rise_rate_nm_per_s`；旧的归一化 `max_brake` 会被拒绝。
 
 首次到达 Ready 后，会按 `control.control_timeout_ms` 监视成功 apply 的新鲜度，且
 该会话标志在后续 `WaitGear`/`WaitActuatorModes` 不清除；到期时将八路扭矩置零、
@@ -225,6 +232,8 @@ field_safety:
   max_speed_kph: 5
   max_throttle: 0.10
   full_scale_motor_torque_nm: 300.0
+  # 0 表示关闭额外升扭斜率；正值必须经隔离台架标定。
+  motor_torque_rise_rate_nm_per_s: 0.0
   # 以下 PID 值必须由隔离台架标定，不能直接照抄示例上车。
   speed_feedback_timeout_ms: 200
   speed_pid_kp: 1.0
@@ -259,7 +268,8 @@ vehicle_adapter:
 `false` 绕过反馈门禁。
 
 vehicle-agent runtime 与 bridge 必须原子成套升级。当前 runtime 要求 bridge 提供
-ABI version 3、完全一致的 V3 配置结构大小以及 `mine_teleop_chassis_open_v3`；
+ABI version 4、完全一致的 V4 配置结构大小、兼容 V3/V2 大小查询以及
+`mine_teleop_chassis_open_v4`；
 同时要求同次返回结构化拒绝结果的 `mine_teleop_chassis_apply_state_v2`、runtime-control
 V1 大小查询，以及原子 configure/clear 符号。任一大小或必需符号不匹配都会在
 任何 SocketCAN 初始化前被拒绝。`apply_state_v2` 只返回固定枚举，不传递日志字符串；
@@ -267,9 +277,10 @@ V1 大小查询，以及原子 configure/clear 符号。任一大小或必需符
 通用拒绝。旧 `apply_state` 继续保留整数 fail-closed 包装。只提供 V1 的旧 bridge 会明确启动失败，
 V2 bridge 也会因缺少物理普通制动压力上限而失败，不会静默沿用旧的负加速度
 语义。新 bridge 仍为直接 ABI 调用方和兼容性测试导出
-`mine_teleop_chassis_open_v1` 与 `mine_teleop_chassis_open_v2`：V1 因为没有安全
-PID 配置而只允许零牵引，V2 保留负值表示减速度的旧语义；这些入口不能使旧
-vehicle-agent 通过全局 ABI version 3 启动门禁。WebRTC 视频链与这一
+`mine_teleop_chassis_open_v1`、`mine_teleop_chassis_open_v2` 与
+`mine_teleop_chassis_open_v3`：V1 因为没有安全 PID 配置而只允许零牵引，V2 保留
+负值表示减速度的旧语义，V3 没有斜率字段，因此直接 PID 转矩不增加额外升扭斜率；这些入口不能使旧
+vehicle-agent 通过全局 ABI version 4 启动门禁。WebRTC 视频链与这一
 控制故障隔离：视频先协商并显示，控制 DataChannel 打开后才尝试启动 adapter；
 adapter 启动或运行失败会短暂上报握手 `fault`、关闭控制 DataChannel、拒绝
 驾驶命令并继续视频；关闭控制通道同时保护旧版本控制端不误报远程急停。该隔离不

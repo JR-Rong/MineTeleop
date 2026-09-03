@@ -228,6 +228,7 @@ field_safety:
   max_speed_kph: 40
   max_throttle: 0.10
   full_scale_motor_torque_nm: 300.0
+  motor_torque_rise_rate_nm_per_s: 0.0
   speed_feedback_timeout_ms: 200
   speed_pid_kp: 1.0
   speed_pid_ki: 0.2
@@ -375,15 +376,26 @@ GStreamer factory，`max_end_to_end_latency_ms` 与 `min_realtime_fps` 用于车
 即 `640.0 Nm/路`。车端默认值是 `300 Nm/路`，`0` 明确禁用驱动力。
 `max_throttle` 不按比例缩小这个转矩上限；例如
 `max_throttle=0.10` 表示目标车速最多为 `max_speed_kph` 的 10%，PID 在追踪该目标时
-仍可在纵向控制器和斜率限制内请求最多 `full_scale_motor_torque_nm`。只能在隔离
+将 `[0,1]` 输出直接乘以会话单电机转矩上限，并可请求最多
+`full_scale_motor_torque_nm`。该路径不再使用理想 `m*a` 车辆模型
+换算牵引转矩。只能在隔离
 台架上逐级调大该转矩上限，并以 CAN 请求和电机反馈共同验收；配置值不是
 实测轮端转矩。普通制动和安全停车不由该转矩上限缩放。
+
+`field_safety.motor_torque_rise_rate_nm_per_s` 是车端每个电机的可选加扭斜率，
+允许 `0..32000 Nm/s`。`0` 明确关闭额外斜率，PID 输出直接换算为单电机转矩；
+正值只限制增加方向，所有减扭、松油、制动、急停和故障清零仍立即生效。启用正值时，
+bridge 先计算本周期可达转矩并把它换算为 PID 的动态输出上限，条件积分因而能感知
+执行器限制，不是在 PID 之后再盲目截断。该值是车型/执行器标定，不属于会话参数；
+非 mock 车端必须显式填写，修改后需重启 runtime。未完成隔离台架标定时应填 `0`，
+不能把未经验证的固定斜率当作通用安全值。配置很小的正斜率时，受 DBC `0.1 Nm`
+分辨率影响，CAN 请求会表现为若干周期不变后再跳变 `0.1 Nm`，而不是每周期都有变化。
 
 `field_safety.max_brake_pressure_bar` 是八路 EHB 普通驾驶压力的车端硬上限，单位
 为 `bar/路`。DBC 每路为 12-bit、`0.1 bar` 分辨率、范围 `0..409.5 bar`；普通驾驶
 代码上限取 80%，即 `327.6 bar/路`，车端默认值为 `100 bar/路`。旧的归一化
 `field_safety.max_brake` 会被明确拒绝，必须迁移到物理压力字段。控制心跳超时按
-`timeout_action.deceleration_profile` 分段执行：在 V3 直接压力模式下，小于 1.0 的
+`timeout_action.deceleration_profile` 分段执行：自 V3 起的直接压力模式中，小于 1.0 的
 `brake` 按 `max_brake_pressure_bar` 换算，例如默认 100 bar 上限下 0.3/0.6 分别为
 30/60 bar；最终 `vehicle_defined_max_safe` 对应 1.0，并切到 409.5 bar 安全停车。
 急停、物理急停、故障、断开停车以及 bridge 完全收不到上游 apply 时的本地 watchdog
@@ -405,15 +417,16 @@ PID，成功 ACK 的 `applied_revision` 必须与请求 `seq` 相同。反馈超
 `control_limits.read_only_control_safety` 只读上报。
 
 启用上述配置时必须同步升级车端 runtime 和 ChassisControl bridge：当前 runtime
-要求 ABI version 3、完全一致的 V3 配置结构大小以及
-`mine_teleop_chassis_open_v3`，并强制要求 runtime-control V1 配置结构大小查询、
+要求 ABI version 4、完全一致的 V4 配置结构大小、兼容 V3/V2 大小查询以及
+`mine_teleop_chassis_open_v4`，并强制要求 runtime-control V1 配置结构大小查询、
 `mine_teleop_chassis_configure_runtime_control_v1` 和
-`mine_teleop_chassis_clear_runtime_control_v1`。V3 在 V2 的车速 PID/watchdog 配置后新增不可变的普通
-制动压力上限；旧 bridge 不会静默忽略压力语义，而会在任何 CAN 初始化前因 ABI
+`mine_teleop_chassis_clear_runtime_control_v1`。V4 在 V3 的普通制动压力上限后新增
+不可变的单电机加扭斜率；旧 bridge 不会静默忽略该语义，而会在任何 CAN 初始化前因 ABI
 不匹配而启动失败。新 bridge 仍为直接 ABI 调用方和兼容性测试保留
-`mine_teleop_chassis_open_v1` 与 `mine_teleop_chassis_open_v2`；V1 禁用正牵引并采用默认
-`800 ms` 超时，V2 保留负值表示减速度的旧语义。旧 vehicle-agent 会被全局 ABI
-version 3 门禁明确拒绝，不能依靠这些入口加载新 bridge；runtime 与 bridge 必须原子
+`mine_teleop_chassis_open_v1`、`mine_teleop_chassis_open_v2` 与
+`mine_teleop_chassis_open_v3`；V1 禁用正牵引并采用默认 `800 ms` 超时，V2 保留负值
+表示减速度的旧语义，V3 没有斜率字段，因此直接 PID 转矩不增加额外升扭斜率。旧 vehicle-agent 会被全局 ABI
+version 4 门禁明确拒绝，不能依靠这些入口加载新 bridge；runtime 与 bridge 必须原子
 成套升级。
 进入 Ready 后，若连续
 `control.control_timeout_ms` 没有成功 apply，bridge 会撤销车速请求、将转矩置零并施加
@@ -437,6 +450,7 @@ access key 和 secret。Secret 可以直接配置，也可以用
 `vehicle_adapter.type=mock` 可直接无外部依赖运行。配置为 `can` 或
 `dynamic_library` 时，必须显式填写 `field_safety.max_speed_kph`、
 `field_safety.max_throttle`、`field_safety.full_scale_motor_torque_nm`、
+`field_safety.motor_torque_rise_rate_nm_per_s`、
 `field_safety.speed_feedback_timeout_ms`、`field_safety.speed_pid_kp`、
 `field_safety.speed_pid_ki`、`field_safety.speed_pid_kd`、
 `field_safety.speed_pid_derivative_filter_tau_ms`、`field_safety.speed_pid_max_dt_ms`、
@@ -532,6 +546,7 @@ vehicle_adapter:
 `mine_teleop_chassis_bridge.h` 稳定 ABI 头，导出原生 adapter 所需的
 `mine_teleop_chassis_open`、`mine_teleop_chassis_open_v1`、
 `mine_teleop_chassis_open_v2`、`mine_teleop_chassis_open_v3`、
+`mine_teleop_chassis_open_v4`、
 `mine_teleop_chassis_apply_state`、
 `mine_teleop_chassis_emergency_stop`、`mine_teleop_chassis_update_feedback`、
 `mine_teleop_chassis_poll_feedback`、`mine_teleop_chassis_read_telemetry` 和

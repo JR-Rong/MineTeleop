@@ -425,6 +425,11 @@ void test_config_loads_current_vehicle_yaml() {
       1e-9,
       "safe default full-scale motor torque changed");
   expect_near(
+      config.field_safety.motor_torque_rise_rate_nm_per_s,
+      0.0,
+      1e-9,
+      "safe default motor torque rise shaping changed");
+  expect_near(
       config.field_safety.max_brake_pressure_bar,
       100.0,
       1e-9,
@@ -520,6 +525,7 @@ void test_vehicle_config_validates_full_scale_motor_torque() {
       "field_safety:\n",
       "field_safety:\n"
       "  max_throttle: 0.10\n"
+      "  motor_torque_rise_rate_nm_per_s: 0.0\n"
       "  speed_feedback_timeout_ms: 200\n"
       "  speed_pid_kp: 1.0\n"
       "  speed_pid_ki: 0.2\n"
@@ -657,6 +663,9 @@ void test_vehicle_config_validates_local_speed_pid_safety_fields() {
   const std::vector<std::pair<std::string, std::string>> invalid_fields{
       {"speed_feedback_timeout_ms", "19"},
       {"speed_feedback_timeout_ms", "501"},
+      {"motor_torque_rise_rate_nm_per_s", "-0.1"},
+      {"motor_torque_rise_rate_nm_per_s", "32000.1"},
+      {"motor_torque_rise_rate_nm_per_s", ".nan"},
       {"speed_pid_kp", "0"},
       {"speed_pid_kp", ".nan"},
       {"speed_pid_ki", "-0.1"},
@@ -1231,6 +1240,7 @@ void test_vehicle_config_validates_chassis_control_speed_range() {
       "field_safety:\n"
       "  max_throttle: 0.10\n"
       "  full_scale_motor_torque_nm: 41.25\n"
+      "  motor_torque_rise_rate_nm_per_s: 0.0\n"
       "  speed_feedback_timeout_ms: 200\n"
       "  speed_pid_kp: 1.0\n"
       "  speed_pid_ki: 0.2\n"
@@ -1261,6 +1271,22 @@ void test_vehicle_config_validates_chassis_control_speed_range() {
       1e-9,
       "one km/h local PID target-speed boundary was rejected");
   std::filesystem::remove(non_mock_boundary_path, error);
+
+  auto missing_rise_rate_contents = non_mock_boundary_contents;
+  replace_once(
+      missing_rise_rate_contents,
+      "  motor_torque_rise_rate_nm_per_s: 0.0\n",
+      "");
+  const auto missing_rise_rate_path = write_temp_vehicle_config(
+      "missing-explicit-motor-torque-rise-rate",
+      missing_rise_rate_contents);
+  expect_throws(
+      [&] {
+        static_cast<void>(
+            mine_teleop::load_vehicle_config(missing_rise_rate_path));
+      },
+      "non-mock adapter accepted an implicit motor torque rise rate");
+  std::filesystem::remove(missing_rise_rate_path, error);
 
   auto missing_pid_contents = non_mock_boundary_contents;
   replace_once(missing_pid_contents, "  speed_pid_kd: 0.0\n", "");
@@ -1404,6 +1430,11 @@ void test_field_config_pins_tls_route_without_system_dns() {
       300.0,
       1e-9,
       "field vehicle full-scale motor torque changed");
+  expect_near(
+      config.field_safety.motor_torque_rise_rate_nm_per_s,
+      0.0,
+      1e-9,
+      "field vehicle motor torque rise shaping is not explicitly disabled");
   expect(
       config.field_safety.speed_feedback_timeout_ms == 200 &&
           config.field_safety.speed_pid_max_dt_ms == 100,
@@ -1428,6 +1459,13 @@ void test_field_config_pins_tls_route_without_system_dns() {
       300.0,
       1e-9,
       "effective vehicle config omitted full-scale motor torque");
+  expect_near(
+      config.redacted_summary()
+          .at("motor_torque_rise_rate_nm_per_s")
+          .get<double>(),
+      0.0,
+      1e-9,
+      "effective vehicle config omitted motor torque rise shaping");
   expect_near(
       config.field_safety.max_brake_pressure_bar,
       100.0,

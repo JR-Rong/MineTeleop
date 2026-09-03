@@ -115,8 +115,13 @@
 该会话的 `target_speed_kph`，同时仍受 `field_safety.max_speed_kph` 和
 `field_safety.max_throttle` 约束。API 线程只保存最新意图；
 bridge 的单一 SocketCAN I/O 线程每 20 ms 用新鲜的带符号 VCU 车速运行 PID，并在
-同一线程串行调用 ChassisControl。PID 输出范围是 `[0, 1]`，到达目标点时积分项
-可以保留维持车速所需的正扭矩；每个电机通道的唯一牵引上限是
+同一线程串行调用 ChassisControl 计算转向和制动。PID 输出范围是 `[0, 1]`，直接乘以
+已确认的会话单电机转矩上限，并以相同幅值写入八路牵引通道；不再把 PID 输出解释为
+理想加速度后通过整车质量、轮径和减速比二次换算。车端
+`field_safety.motor_torque_rise_rate_nm_per_s` 可选地只限制加扭速度；`0` 表示关闭
+额外斜率，严格按 PID 输出直接换算。启用正值时，当周期可达转矩会作为 PID 的动态输出
+上限，因此条件积分能感知斜率限制，不会在外层限幅器后继续积累；任何减扭仍立即生效。
+到达目标点时积分项可以保留维持车速所需的正扭矩；每个电机通道的唯一牵引上限是
 已确认会话上限与 `full_scale_motor_torque_nm` 的较小值，`max_throttle` 不是额外
 扭矩系数。PID 以固定目标参考
 应用 0.05 m/s 复位死区：手柄小抖动不丢积分，累计偏移越过死区或目标明显下降才复位。
