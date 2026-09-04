@@ -203,16 +203,45 @@ MineTeleopChassisFeedback runtime_feedback(
 void send_vehicle_status_feedback_frame(
     int fd,
     int gear,
-    int emergency_switch) {
+    int emergency_switch,
+    int vmc_fault_code = 0) {
   can_frame frame{};
   frame.can_id = 0x18F2F5D0U | CAN_EFF_FLAG;
   frame.can_dlc = 8;
   frame.data[0] = static_cast<std::uint8_t>(
       ((gear & 0x03) << 2) | (emergency_switch & 0x03));
+  frame.data[2] = static_cast<std::uint8_t>(vmc_fault_code);
   expect(
       ::send(fd, &frame, sizeof(frame), 0) ==
           static_cast<ssize_t>(sizeof(frame)),
       "vehicle-status feedback frame injection failed");
+}
+
+void send_handshake_feedback_frame(int fd, int handshake_status) {
+  can_frame frame{};
+  frame.can_id = 0x18F0F5D0U | CAN_EFF_FLAG;
+  frame.can_dlc = 8;
+  frame.data[1] = static_cast<std::uint8_t>(handshake_status);
+  expect(
+      ::send(fd, &frame, sizeof(frame), 0) ==
+          static_cast<ssize_t>(sizeof(frame)),
+      "handshake feedback frame injection failed");
+}
+
+void send_driver_switch_feedback_frame(
+    int fd,
+    int parking_brake_switch,
+    int brake_pedal_switch) {
+  can_frame frame{};
+  frame.can_id = 0x18F6F5D0U | CAN_EFF_FLAG;
+  frame.can_dlc = 8;
+  frame.data[2] = static_cast<std::uint8_t>(
+      (brake_pedal_switch & 0x03) << 6);
+  frame.data[3] = static_cast<std::uint8_t>(parking_brake_switch & 0x03);
+  expect(
+      ::send(fd, &frame, sizeof(frame), 0) ==
+          static_cast<ssize_t>(sizeof(frame)),
+      "driver-switch feedback frame injection failed");
 }
 
 template <typename Predicate>
@@ -456,7 +485,7 @@ std::size_t count_logged_events(
 int main() {
   try {
     expect(
-        mine_teleop_chassis_abi_version() == 5U &&
+        mine_teleop_chassis_abi_version() == 6U &&
             mine_teleop_chassis_open_config_v2_size() ==
                 sizeof(MineTeleopChassisOpenConfigV2) &&
             mine_teleop_chassis_open_config_v3_size() ==
@@ -467,8 +496,12 @@ int main() {
                 sizeof(MineTeleopChassisRuntimeControlConfigV1) &&
             mine_teleop_chassis_runtime_control_config_v2_size() ==
                 sizeof(MineTeleopChassisRuntimeControlConfigV2) &&
+            mine_teleop_chassis_stop_context_v1_size() ==
+                sizeof(MineTeleopChassisStopContextV1) &&
             sizeof(MineTeleopChassisRuntimeControlConfigV1) == 88U &&
             sizeof(MineTeleopChassisRuntimeControlConfigV2) == 96U &&
+            sizeof(MineTeleopChassisStopContextV1) == 16U &&
+            sizeof(MineTeleopChassisTelemetry) == 64U &&
             sizeof(MineTeleopChassisApplyResultV1) == 16U &&
             sizeof(MineTeleopChassisRuntimeControlResultV1) == 24U,
         "bridge ABI version or versioned open-config size query is inconsistent");
@@ -967,6 +1000,11 @@ int main() {
     expect(
         mine_teleop_chassis_update_feedback(&feedback) == 0,
         "initial runtime feedback injection failed");
+    const std::array<double, 4> steering{0.2, 0.2, 0.2, 0.2};
+    expect(
+        mine_teleop_chassis_apply_state(
+            1, 1.0, 0.01, steering.data(), steering.size()) == -3,
+        "traction without an active runtime profile was not rejected");
     auto runtime_profile =
         valid_runtime_control_config(1, 5.0, 41.25, 0.0);
     MineTeleopChassisRuntimeControlResultV1 runtime_profile_result{};
@@ -1030,9 +1068,12 @@ int main() {
             runtime_profile_result.applied_revision == 3,
         "parked Standby rise-rate restore was rejected");
     expect(
+        mine_teleop_chassis_apply_state(
+            1, 5.1, 0.01, steering.data(), steering.size()) == -3,
+        "runtime profile limit violation was not rejected");
+    expect(
         mine_teleop_chassis_request_parallel_handshake() == 0,
         "standby speed incorrectly latched an authority-state hard fuse or the fresh gate rejected the initial handshake");
-    const std::array<double, 4> steering{0.2, 0.2, 0.2, 0.2};
     expect(
         mine_teleop_chassis_apply_state(
             3, 5.0, 0.01, steering.data(), steering.size()) == 0,
@@ -1115,8 +1156,14 @@ int main() {
         mine_teleop_chassis_update_feedback(&feedback) == 0,
         "pre-software-ESTOP Ready-D feedback refresh failed");
     static_cast<void>(drain_can_frames(transport[1], 10));
+    const MineTeleopChassisStopContextV1 operator_stop_context{
+        sizeof(MineTeleopChassisStopContextV1),
+        MINE_TELEOP_CHASSIS_STOP_SOURCE_DRIVER_PAGE,
+        MINE_TELEOP_CHASSIS_STOP_REASON_OPERATOR_ESTOP,
+        0U};
     expect(
-        mine_teleop_chassis_emergency_stop() == 0,
+        mine_teleop_chassis_set_stop_context_v1(&operator_stop_context) == 0 &&
+            mine_teleop_chassis_emergency_stop() == 0,
         "Ready-D software emergency stop was rejected");
     const auto software_stop_frames = drain_can_frames(transport[1], 40);
     expect(
@@ -1138,6 +1185,11 @@ int main() {
     expect(
         mine_teleop_chassis_read_telemetry(&software_stop_telemetry) == 0 &&
             software_stop_telemetry.estop == 1 &&
+            software_stop_telemetry.stop_source ==
+                MINE_TELEOP_CHASSIS_STOP_SOURCE_DRIVER_PAGE &&
+            software_stop_telemetry.stop_reason ==
+                MINE_TELEOP_CHASSIS_STOP_REASON_OPERATOR_ESTOP &&
+            software_stop_telemetry.stop_sequence > 0 &&
             mine_teleop_chassis_read_handshake_status(&software_stop_status) == 0 &&
             software_stop_status.state == MINE_TELEOP_VCU_READY &&
             software_stop_status.ready == 1 &&
@@ -1258,7 +1310,11 @@ int main() {
     MineTeleopChassisTelemetry timeout_telemetry{};
     expect(
         mine_teleop_chassis_read_telemetry(&timeout_telemetry) == 0 &&
-            timeout_telemetry.estop == 1,
+            timeout_telemetry.estop == 1 &&
+            timeout_telemetry.stop_source ==
+                MINE_TELEOP_CHASSIS_STOP_SOURCE_WATCHDOG &&
+            timeout_telemetry.stop_reason ==
+                MINE_TELEOP_CHASSIS_STOP_REASON_CONTROL_APPLY_TIMEOUT,
         "apply timeout did not expose the local ESTOP state");
 
     expect(
@@ -1561,6 +1617,92 @@ int main() {
         "post-hard-speed runtime did not restart the handshake");
     complete_runtime_arming_to_ready(3);
 
+    feedback = runtime_feedback(5, 3, 1, -0.2);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "Ready-D opposite-direction feedback injection failed");
+    MineTeleopChassisTelemetry opposite_direction_telemetry{};
+    expect(
+        wait_until(
+            [&] {
+              return mine_teleop_chassis_read_telemetry(
+                         &opposite_direction_telemetry) == 0 &&
+                  opposite_direction_telemetry.estop == 1 &&
+                  opposite_direction_telemetry.stop_source ==
+                      MINE_TELEOP_CHASSIS_STOP_SOURCE_SOFTWARE_FAULT &&
+                  opposite_direction_telemetry.stop_reason ==
+                      MINE_TELEOP_CHASSIS_STOP_REASON_OPPOSITE_DIRECTION_MOTION;
+            },
+            100),
+        "Ready-D reverse motion did not latch opposite-direction stop provenance");
+    expect(
+        opposite_direction_telemetry.stop_sequence > 0,
+        "opposite-direction stop did not advance its provenance sequence");
+    const auto opposite_direction_stop_sequence =
+        opposite_direction_telemetry.stop_sequence;
+    const auto opposite_direction_frames = drain_can_frames(transport[1], 40);
+    expect_all_motor_torque_raw(
+        opposite_direction_frames,
+        8000,
+        "Ready-D opposite-direction stop");
+    expect(
+        can_signal(
+            last_frame_with_id(opposite_direction_frames, 0x18FFD0F5U),
+            4,
+            12) > 0 &&
+            can_signal(
+                last_frame_with_id(opposite_direction_frames, 0x18FED0F5U),
+                8,
+                8) == 0,
+        "opposite-direction stop did not produce EHB safety braking and speed Q0");
+    MineTeleopChassisApplyResultV1 opposite_direction_apply_result{};
+    expect(
+        mine_teleop_chassis_apply_state_v2(
+            3,
+            5.0,
+            0.01,
+            steering.data(),
+            steering.size(),
+            &opposite_direction_apply_result) == -3 &&
+            opposite_direction_apply_result.result_code == -3 &&
+            opposite_direction_apply_result.issue_id ==
+                MINE_TELEOP_CHASSIS_APPLY_ISSUE_HARD_OVERSPEED_LATCHED,
+        "ordinary apply cleared the opposite-direction safety latch");
+    MineTeleopChassisTelemetry retained_opposite_direction_telemetry{};
+    expect(
+        mine_teleop_chassis_read_telemetry(
+            &retained_opposite_direction_telemetry) == 0 &&
+            retained_opposite_direction_telemetry.estop == 1 &&
+            retained_opposite_direction_telemetry.stop_source ==
+                MINE_TELEOP_CHASSIS_STOP_SOURCE_SOFTWARE_FAULT &&
+            retained_opposite_direction_telemetry.stop_reason ==
+                MINE_TELEOP_CHASSIS_STOP_REASON_OPPOSITE_DIRECTION_MOTION &&
+            retained_opposite_direction_telemetry.stop_sequence ==
+                opposite_direction_stop_sequence,
+        "rejected apply replaced the latched opposite-direction root cause");
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == -2,
+        "opposite-direction latch cleared without completed Disarmed recovery");
+    expect(
+        mine_teleop_chassis_disconnect_parallel_handshake() == 0,
+        "opposite-direction latch prevented explicit disarm");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_DISARM_TORQUE),
+        "explicit opposite-direction recovery did not start the reverse handshake");
+    complete_runtime_disarm(3, "opposite-direction recovery");
+
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == 0,
+        "post-opposite-direction handshake recovery failed");
+    expect(
+        mine_teleop_chassis_apply_state(
+            3, 0.0, 0.0, steering.data(), steering.size()) == 0,
+        "post-opposite-direction D intent was rejected");
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "post-opposite-direction runtime did not restart the handshake");
+    complete_runtime_arming_to_ready(3);
+
     feedback = runtime_feedback(5, 3, 1, 0.0);
     expect(
         mine_teleop_chassis_update_feedback(&feedback) == 0,
@@ -1665,6 +1807,15 @@ int main() {
         "Ready hard overspeed did not latch/log exactly once");
     expect(
         std::count_if(runtime_events.begin(), runtime_events.end(), [](const auto& event) {
+          return event.value("name", "") ==
+                  "opposite_direction_motion_latched" &&
+              event.value("issue_code", "") ==
+                  "vcu_opposite_direction_motion" &&
+              event.value("safety_action", "") == "local_full_stop";
+        }) == 1,
+        "Ready opposite-direction motion did not latch/log exactly once");
+    expect(
+        std::count_if(runtime_events.begin(), runtime_events.end(), [](const auto& event) {
           return event.value("name", "") == "arming_motion_latched";
         }) == 1,
         "stationary WaitGear motion did not latch/log exactly once");
@@ -1682,6 +1833,20 @@ int main() {
                   "traction_withdrawn_retained_gear";
         }),
         "gear rejection log did not distinguish retained-gear traction withdrawal from ESTOP");
+    for (const std::string issue_code : {
+             "vcu_runtime_control_profile_inactive",
+             "vcu_runtime_control_profile_limit_exceeded"}) {
+      expect(
+          std::any_of(
+              runtime_events.begin(),
+              runtime_events.end(),
+              [&](const auto& event) {
+                return event.value("name", "") == "control_apply_rejected" &&
+                    event.value("issue_code", "") == issue_code &&
+                    event.value("safety_action", "") == "traction_withdrawn";
+              }),
+          issue_code + " log incorrectly claimed a full stop");
+    }
     std::filesystem::remove(runtime_log_path, error);
 
     int pressure_transport[2]{-1, -1};
@@ -2007,8 +2172,12 @@ int main() {
     ::unsetenv("MINE_TELEOP_CHASSIS_TEST_FD");
     ::unsetenv("MINE_TELEOP_VCU_LOG_PATH");
     feedback = runtime_feedback(3, 1, 2, 0.0);
+    auto arming_profile =
+        valid_runtime_control_config(1, 5.0, 41.25, 0.0);
     expect(
         mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            mine_teleop_chassis_configure_runtime_control_v2(
+                &arming_profile, &runtime_profile_result) == 0 &&
             mine_teleop_chassis_request_parallel_handshake() == 0,
         "arming-watchdog initial gate or handshake failed");
     expect(
@@ -2045,7 +2214,52 @@ int main() {
     expect(
         mine_teleop_chassis_disconnect_parallel_handshake() == 0,
         "initial arming feedback fault prevented explicit disarm");
+    expect(
+        mine_teleop_chassis_clear_runtime_control_v1(
+            &runtime_profile_result) == 0,
+        "initial arming feedback fault prevented session profile clear");
     complete_runtime_disarm(1, "initial-arming feedback-fault recovery");
+    arming_profile.profile_revision = 2;
+    expect(
+        mine_teleop_chassis_configure_runtime_control_v2(
+            &arming_profile, &runtime_profile_result) == 0 &&
+            runtime_profile_result.applied_revision == 2 &&
+            mine_teleop_chassis_request_parallel_handshake() == 0 &&
+            wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "profile plus handshake reconnect did not recover the completed arming-only timeout");
+    expect(
+        mine_teleop_chassis_disconnect_parallel_handshake() == 0,
+        "recovered arming-timeout handshake could not be disconnected");
+    feedback = runtime_feedback(3, 1, 2, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            wait_for_handshake_state(MINE_TELEOP_VCU_DISARMED),
+        "recovered arming-timeout disconnect did not complete manual disarm");
+    MineTeleopChassisTelemetry disconnect_telemetry{};
+    expect(
+        mine_teleop_chassis_read_telemetry(&disconnect_telemetry) == 0 &&
+            disconnect_telemetry.estop == 1 &&
+            disconnect_telemetry.stop_source ==
+                MINE_TELEOP_CHASSIS_STOP_SOURCE_DRIVER_PAGE &&
+            disconnect_telemetry.stop_reason ==
+                MINE_TELEOP_CHASSIS_STOP_REASON_VCU_HANDSHAKE_DISCONNECT,
+        "explicit page disconnect did not expose page-disconnect provenance");
+    const MineTeleopChassisStopContextV1 session_stop_context{
+        sizeof(MineTeleopChassisStopContextV1),
+        MINE_TELEOP_CHASSIS_STOP_SOURCE_SESSION,
+        MINE_TELEOP_CHASSIS_STOP_REASON_SESSION_LOST,
+        0U};
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == 0 &&
+            mine_teleop_chassis_set_stop_context_v1(&session_stop_context) == 0 &&
+            mine_teleop_chassis_emergency_stop() == 0 &&
+            mine_teleop_chassis_read_telemetry(&disconnect_telemetry) == 0 &&
+            disconnect_telemetry.estop == 1 &&
+            disconnect_telemetry.stop_source ==
+                MINE_TELEOP_CHASSIS_STOP_SOURCE_SESSION &&
+            disconnect_telemetry.stop_reason ==
+                MINE_TELEOP_CHASSIS_STOP_REASON_SESSION_LOST,
+        "session-loss stop context was not consumed by the next stop action");
     expect(
         mine_teleop_chassis_close() == 0,
         "arming-watchdog runtime did not close cleanly");
@@ -2120,7 +2334,11 @@ int main() {
     MineTeleopChassisTelemetry physical_telemetry{};
     expect(
         mine_teleop_chassis_read_telemetry(&physical_telemetry) == 0 &&
-            physical_telemetry.estop == 1,
+            physical_telemetry.estop == 1 &&
+            physical_telemetry.stop_source ==
+                MINE_TELEOP_CHASSIS_STOP_SOURCE_PHYSICAL_EMERGENCY &&
+            physical_telemetry.stop_reason ==
+                MINE_TELEOP_CHASSIS_STOP_REASON_PHYSICAL_EMERGENCY_SWITCH,
         "released physical emergency pulse did not remain visible as latched ESTOP");
     expect(
         mine_teleop_chassis_clear_runtime_control_v1(
@@ -2178,6 +2396,73 @@ int main() {
         mine_teleop_chassis_disconnect_parallel_handshake() == 0,
         "post-physical-emergency runtime could not explicitly disarm");
     complete_runtime_disarm(3, "post-physical-emergency disconnect");
+
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == 0 &&
+            wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "handshake-revocation scenario could not start a fresh handshake");
+    feedback = runtime_feedback(5, 1, 2, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            wait_for_handshake_state(
+                MINE_TELEOP_VCU_WAIT_PARKING_BRAKE_RELEASED),
+        "handshake-revocation scenario did not accept status 5");
+    send_vehicle_status_feedback_frame(physical_transport[1], 1, 0, 8);
+    send_driver_switch_feedback_frame(physical_transport[1], 2, 1);
+    expect(
+        wait_until(
+            [] {
+              MineTeleopChassisHandshakeStatus status{};
+              return mine_teleop_chassis_read_handshake_status(&status) == 0 &&
+                  status.vmc_fault_code_valid == 1 &&
+                  status.vmc_fault_code == 8 &&
+                  status.parking_brake_switch_valid == 1 &&
+                  status.parking_brake_switch == 2 &&
+                  status.brake_pedal_switch_valid == 1 &&
+                  status.brake_pedal_switch == 1;
+            },
+            200),
+        "0x18F2/0x18F6 diagnostic fields were not exposed by the bridge");
+    send_handshake_feedback_frame(physical_transport[1], 3);
+    expect(
+        wait_for_handshake_state(MINE_TELEOP_VCU_DISARM_TORQUE),
+        "fresh status 3 did not revoke accepted status 5 and enter staged safe disarm");
+    MineTeleopChassisHandshakeStatus revoked_status{};
+    MineTeleopChassisTelemetry revoked_telemetry{};
+    expect(
+        mine_teleop_chassis_read_handshake_status(&revoked_status) == 0 &&
+            revoked_status.handshake_revoked == 1 &&
+            revoked_status.revoked_handshake_status == 3 &&
+            revoked_status.vmc_fault_code_valid == 1 &&
+            revoked_status.vmc_fault_code == 8 &&
+            mine_teleop_chassis_read_telemetry(&revoked_telemetry) == 0 &&
+            revoked_telemetry.estop == 1 &&
+            revoked_telemetry.stop_source ==
+                MINE_TELEOP_CHASSIS_STOP_SOURCE_SOFTWARE_FAULT &&
+            revoked_telemetry.stop_reason ==
+                MINE_TELEOP_CHASSIS_STOP_REASON_HANDSHAKE_REVOKED,
+        "handshake revoke did not expose its status, VMC code, and stop provenance");
+    const auto revoked_frames = drain_can_frames(physical_transport[1], 40);
+    expect(
+        can_signal(
+            last_frame_with_id(revoked_frames, 0x18FCD0F5U), 0, 8) == 0,
+        "handshake revoke continued transmitting ShakeReq instead of withdrawing it");
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == -2,
+        "handshake revoke recovered without completing disarm first");
+    complete_runtime_disarm(1, "handshake-revoked recovery");
+    expect(
+        mine_teleop_chassis_request_parallel_handshake() == 0 &&
+            wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+        "handshake revoke did not require and accept a new explicit request");
+    expect(
+        mine_teleop_chassis_disconnect_parallel_handshake() == 0,
+        "post-revocation explicit retry could not be disconnected");
+    feedback = runtime_feedback(3, 1, 2, 0.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            wait_for_handshake_state(MINE_TELEOP_VCU_DISARMED),
+        "post-revocation retry did not complete manual disarm");
     expect(
         mine_teleop_chassis_close() == 0,
         "physical-ESTOP runtime did not close cleanly");
@@ -2192,6 +2477,26 @@ int main() {
               return event.value("name", "") == "physical_emergency_latched";
             }) == 1,
         "physical emergency pulse did not latch/log exactly once");
+    const auto revoked_event = std::find_if(
+        physical_events.begin(),
+        physical_events.end(),
+        [](const auto& event) {
+          return event.value("name", "") == "handshake_revoked";
+        });
+    expect(
+        revoked_event != physical_events.end() &&
+            std::count_if(
+                physical_events.begin(),
+                physical_events.end(),
+                [](const auto& event) {
+                  return event.value("name", "") == "handshake_revoked";
+                }) == 1 &&
+            revoked_event->value("vmc_fault_code", -1) == 8 &&
+            revoked_event->value("parking_brake_switch", -1) == 2 &&
+            revoked_event->value("brake_pedal_switch", -1) == 1 &&
+            revoked_event->value("stop_source", "") == "software_fault" &&
+            revoked_event->value("stop_reason", "") == "handshake_revoked",
+        "handshake revoke diagnostic was missing, duplicated, or incomplete");
     std::filesystem::remove(physical_log_path, error);
 
     std::cout << "chassis_bridge_diagnostics_smoke=passed\n";

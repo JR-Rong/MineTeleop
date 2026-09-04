@@ -786,7 +786,9 @@ struct VehicleMediaRuntime::Impl {
           // close() applies the local safe-stop output before closing the
           // adapter.  This must happen in the faulting thread rather than wait
           // for a potentially blocked HTTP/media main loop.
-          control_service->close();
+          control_service->close({
+              VehicleStopSource::SoftwareFault,
+              VehicleStopReason::MediaPipelineFailed});
         } catch (const std::exception& error) {
           close_error = error.what();
         }
@@ -1251,7 +1253,9 @@ struct VehicleMediaRuntime::Impl {
       control_service_issue_code = "critical_camera_failed";
       if (control_service_started && control_service) {
         try {
-          control_service->close();
+          control_service->close({
+              VehicleStopSource::SoftwareFault,
+              VehicleStopReason::CriticalCameraFailed});
         } catch (const std::exception& error) {
           close_error = error.what();
         }
@@ -1384,7 +1388,14 @@ struct VehicleMediaRuntime::Impl {
         // again before publishing the adapter as ready or accepting commands.
         if (stop_requested || control_inhibited) {
           try {
-            control_service->close();
+            control_service->close(
+                control_inhibited
+                    ? VehicleStopContext{
+                          VehicleStopSource::SoftwareFault,
+                          VehicleStopReason::CriticalCameraFailed}
+                    : VehicleStopContext{
+                          VehicleStopSource::Session,
+                          VehicleStopReason::SessionLost});
           } catch (const std::exception& error) {
             emit_diagnostic(
                 "vehicle_vcu_safe_stop_failed",
@@ -1512,7 +1523,9 @@ struct VehicleMediaRuntime::Impl {
           true,
           {{"safety_action", "local_full_stop_control_disabled_video_continues"}});
       try {
-        control_service->close();
+        control_service->close({
+            VehicleStopSource::SoftwareFault,
+            VehicleStopReason::VcuStateFault});
       } catch (const std::exception& close_error) {
         emit_diagnostic(
             "vehicle_vcu_safe_stop_failed",

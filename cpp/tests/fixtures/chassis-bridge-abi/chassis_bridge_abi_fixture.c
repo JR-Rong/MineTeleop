@@ -32,6 +32,18 @@
 #define MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_V2_SIZE 0
 #endif
 
+#ifndef MINE_TELEOP_TEST_CHASSIS_HAS_STOP_CONTEXT_V1_SIZE_QUERY
+#define MINE_TELEOP_TEST_CHASSIS_HAS_STOP_CONTEXT_V1_SIZE_QUERY 1
+#endif
+
+#ifndef MINE_TELEOP_TEST_CHASSIS_WRONG_STOP_CONTEXT_V1_SIZE
+#define MINE_TELEOP_TEST_CHASSIS_WRONG_STOP_CONTEXT_V1_SIZE 0
+#endif
+
+#ifndef MINE_TELEOP_TEST_CHASSIS_HAS_SET_STOP_CONTEXT_V1
+#define MINE_TELEOP_TEST_CHASSIS_HAS_SET_STOP_CONTEXT_V1 1
+#endif
+
 uint32_t mine_teleop_chassis_abi_version(void) {
     return MINE_TELEOP_TEST_CHASSIS_ABI_VERSION;
 }
@@ -66,6 +78,16 @@ uint32_t mine_teleop_chassis_runtime_control_config_v2_size(void) {
     return (uint32_t)(sizeof(struct MineTeleopChassisRuntimeControlConfigV2) - 1U);
 #else
     return (uint32_t)sizeof(struct MineTeleopChassisRuntimeControlConfigV2);
+#endif
+}
+#endif
+
+#if MINE_TELEOP_TEST_CHASSIS_HAS_STOP_CONTEXT_V1_SIZE_QUERY
+uint32_t mine_teleop_chassis_stop_context_v1_size(void) {
+#if MINE_TELEOP_TEST_CHASSIS_WRONG_STOP_CONTEXT_V1_SIZE
+    return (uint32_t)(sizeof(struct MineTeleopChassisStopContextV1) - 1U);
+#else
+    return (uint32_t)sizeof(struct MineTeleopChassisStopContextV1);
 #endif
 }
 #endif
@@ -178,6 +200,14 @@ int mine_teleop_chassis_clear_runtime_control_v1(
     result->applied_revision = 0U;
     return 0;
 }
+
+#if MINE_TELEOP_TEST_CHASSIS_HAS_SET_STOP_CONTEXT_V1
+int mine_teleop_chassis_set_stop_context_v1(
+    const struct MineTeleopChassisStopContextV1* context) {
+    (void)context;
+    return 0;
+}
+#endif
 
 int mine_teleop_chassis_emergency_stop(void) {
     return 0;

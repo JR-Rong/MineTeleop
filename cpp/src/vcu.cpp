@@ -295,6 +295,8 @@ void ParallelController::reset() {
   initial_frame_count_ = 0;
   emergency_stop_ = false;
   physical_emergency_latched_ = false;
+  handshake_revoked_ = false;
+  revoked_handshake_status_ = 0;
   receive_generation_ = 0;
   state_entry_generation_ = 0;
   handshake_generation_ = 0;
@@ -347,7 +349,9 @@ void ParallelController::emergency_stop() {
 }
 
 void ParallelController::clear_emergency_stop() {
-  if (!physical_emergency_latched_) emergency_stop_ = false;
+  if (!physical_emergency_latched_ && !handshake_revoked_) {
+    emergency_stop_ = false;
+  }
 }
 
 bool ParallelController::request_parallel_handshake() {
@@ -359,6 +363,8 @@ bool ParallelController::request_parallel_handshake() {
   desired_.gear = kNeutralGear;
   physical_emergency_latched_ = false;
   emergency_stop_ = false;
+  handshake_revoked_ = false;
+  revoked_handshake_status_ = 0;
   initial_frame_count_ = 0;
   enter(State::Initial);
   return true;
@@ -405,6 +411,8 @@ bool ParallelController::ingest(const CanFrame& frame) {
     feedback_.emergency_switch = static_cast<int>(extract_signal(frame, 0, 2));
     feedback_.gear = static_cast<int>(extract_signal(frame, 2, 2));
     feedback_.gear_valid = true;
+    feedback_.vmc_fault_code = static_cast<int>(extract_signal(frame, 16, 8));
+    feedback_.vmc_fault_code_valid = true;
     if (feedback_.emergency_switch != 0) {
       // Latch at ingest time so a short physical-switch pulse cannot disappear
       // while the bridge drains multiple CAN frames before the next 20 ms tick.
@@ -430,6 +438,16 @@ bool ParallelController::ingest(const CanFrame& frame) {
     feedback_.driver_gear_request =
         static_cast<int>(extract_signal(frame, 57, 3));
     feedback_.driver_gear_request_valid = true;
+    return true;
+  }
+  if (frame.id == ids::kWvcuDriverIntention2) {
+    ++receive_generation_;
+    feedback_.brake_pedal_switch =
+        static_cast<int>(extract_signal(frame, 22, 2));
+    feedback_.brake_pedal_switch_valid = true;
+    feedback_.parking_brake_switch =
+        static_cast<int>(extract_signal(frame, 24, 2));
+    feedback_.parking_brake_switch_valid = true;
     return true;
   }
   if (frame.id == ids::kWvcuParkingBrake) {
@@ -525,6 +543,23 @@ void ParallelController::advance_state() {
       begin_arming_emergency_disarm()) {
     return;
   }
+  const bool post_parallel_handshake_arming =
+      state_ == State::WaitParkingBrakeReleased ||
+      state_ == State::WaitGear ||
+      state_ == State::WaitActuatorModes;
+  if (post_parallel_handshake_arming && feedback_.handshake_valid &&
+      handshake_generation_ > state_entry_generation_ &&
+      feedback_.handshake_status == kManualHandshakeStatus) {
+    // State 5 was already accepted before these phases. A fresh return to
+    // manual state 3 revokes that authority. Withdraw ShakeReq immediately and
+    // run the full torque/stop/N/EPB/manual sequence; the next attempt must come
+    // from a new explicit page request after safe shutdown is confirmed.
+    handshake_revoked_ = true;
+    revoked_handshake_status_ = feedback_.handshake_status;
+    emergency_stop_ = true;
+    enter(State::DisarmTorque);
+    return;
+  }
   if (state_ == State::Ready && feedback_.handshake_valid &&
       feedback_.handshake_status != kIntelligentHandshakeStatus) {
     transport_fault();
@@ -617,7 +652,16 @@ void ParallelController::advance_state() {
     case State::DisarmManual:
       if (feedback_.handshake_valid &&
           handshake_generation_ > state_entry_generation_ &&
-          feedback_.handshake_status == kManualHandshakeStatus) {
+          feedback_.handshake_status == kManualHandshakeStatus &&
+          feedback_.gear_valid && gear_generation_ > state_entry_generation_ &&
+          feedback_.gear == kNeutralGear && feedback_.speed_valid &&
+          speed_generation_ > state_entry_generation_ &&
+          std::abs(feedback_.speed_mps) <= kStoppedSpeedToleranceMps &&
+          parking_brake_generation_ > state_entry_generation_ &&
+          all_equal_valid(
+              feedback_.parking_brake_status,
+              feedback_.parking_brake_valid,
+              kParkingBrakePark)) {
         enter(State::Disarmed);
       }
       break;
@@ -652,7 +696,7 @@ std::vector<CanFrame> ParallelController::tick() {
       state_ != State::Standby && state_ != State::Initial &&
       state_ != State::Disarmed &&
       state_ != State::DisarmManual;
-  if (driving_authority_requested) {
+  if (driving_authority_requested && !handshake_revoked_) {
     handshake_request = kIntelligentHandshakeRequest;
   }
 
@@ -663,7 +707,11 @@ std::vector<CanFrame> ParallelController::tick() {
       state_ == State::DisarmTorque ||
       state_ == State::DisarmStop ||
       state_ == State::DisarmNeutral) {
-    parking_brake.fill(kParkingBrakeRelease);
+    // Once state 5 has been revoked, do not keep asking the VCU to release the
+    // EPB while the staged shutdown removes torque and stops the vehicle.
+    if (!handshake_revoked_) {
+      parking_brake.fill(kParkingBrakeRelease);
+    }
     steering_mode = kByWireMode;
   }
 
@@ -798,6 +846,14 @@ bool ParallelController::parking_ready() const {
 
 bool ParallelController::physical_emergency_latched() const {
   return physical_emergency_latched_;
+}
+
+bool ParallelController::handshake_revoked() const {
+  return handshake_revoked_;
+}
+
+int ParallelController::revoked_handshake_status() const {
+  return revoked_handshake_status_;
 }
 
 bool ParallelController::feedback_complete() const {

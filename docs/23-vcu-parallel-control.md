@@ -143,6 +143,9 @@ WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉
 `2 km/h`、`300 Nm/路`、`100/30/100 bar/路` 和 `3°`；`Space` 是可释放的缓刹，
 `B` 是可释放的急刹，`E` 仍是锁存安全急停。两档行车制动在 v1 线上仍通过
 `brake` 归一化标量传输，但车端只在已经确认的会话最大压力内还原为明确 bar 值。
+这些默认值仅用于预填窗口，不会自动下发。直接转矩模式按 PID 的 `0..1` 输出乘以
+会话单电机最大转矩；升级后不得照搬旧 PID 标定，驾驶员必须在驻车门禁内逐项核对并
+勾选确认后显式发送，车端 ACK 前不能申请握手。
 车端对同时出现的油门和制动采用制动优先，任何正制动请求都会撤销牵引。ChassisControl
 更新失败或输出 NaN/Inf 时，bridge 立即锁存本地安全停车，不等待上游控制超时。
 键盘与 Gamepad 共用会话参数；修改参数会先清零当前输入。真实 adapter 的首次设置、
@@ -272,10 +275,12 @@ vehicle_adapter:
 `false` 绕过反馈门禁。
 
 vehicle-agent runtime 与 bridge 必须原子成套升级。当前 runtime 要求 bridge 提供
-ABI version 5、完全一致的 V4 配置结构大小、兼容 V3/V2 大小查询以及
+ABI version 6、完全一致的 V4 配置结构大小、V3/V2 大小查询以及
 `mine_teleop_chassis_open_v4`；
 同时要求同次返回结构化拒绝结果的 `mine_teleop_chassis_apply_state_v2`、runtime-control
-V1/V2 的 88/96 字节大小查询、两个 configure 符号，以及原子 clear 符号。V1 仅接收旧
+V1/V2 的 88/96 字节大小查询、两个 configure 符号，以及原子 clear 符号；stop-context
+V1 必须提供 16 字节大小查询和 `mine_teleop_chassis_set_stop_context_v1`，供页面断开、
+会话丢失、watchdog、软件故障与物理急停的来源/原因穿透到遥测。V1 仅接收旧
 profile version 2 并沿用 open-time 升扭斜率；V2 接收 profile version 3 的会话斜率。任一大小或必需符号不匹配都会在
 任何 SocketCAN 初始化前被拒绝。`apply_state_v2` 只返回固定枚举，不传递日志字符串；
 其中 D/R 移动或反馈过期可由 runtime 安全映射成稳定 issue code，未知值统一降级为
@@ -285,7 +290,7 @@ V2 bridge 也会因缺少物理普通制动压力上限而失败，不会静默�
 `mine_teleop_chassis_open_v1`、`mine_teleop_chassis_open_v2` 与
 `mine_teleop_chassis_open_v3`：V1 因为没有安全 PID 配置而只允许零牵引，V2 保留
 负值表示减速度的旧语义，V3 没有斜率字段，因此直接 PID 转矩不增加额外升扭斜率；这些入口不能使旧
-vehicle-agent 通过全局 ABI version 5 启动门禁。WebRTC 视频链与这一
+vehicle-agent 通过全局 ABI version 6 启动门禁，ABI 5 bridge 也会明确失败。WebRTC 视频链与这一
 控制故障隔离：视频先协商并显示，控制 DataChannel 打开后才尝试启动 adapter；
 adapter 启动或运行失败会短暂上报握手 `fault`、关闭控制 DataChannel、拒绝
 驾驶命令并继续视频；关闭控制通道同时保护旧版本控制端不误报远程急停。该隔离不

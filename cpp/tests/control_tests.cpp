@@ -539,8 +539,28 @@ void test_control_page_contract() {
       "the production page bypasses shared brake/control derivation");
   expect(
       response.body.find("开始平行驾驶握手") != std::string::npos &&
-          response.body.find("断开 VCU 握手") != std::string::npos,
+          response.body.find("断开 VCU 握手") != std::string::npos &&
+          response.body.find("can-vmc-fault") != std::string::npos &&
+          response.body.find("can-parking-switch") != std::string::npos &&
+          response.body.find("can-brake-pedal") != std::string::npos &&
+          response.body.find("vcuHandshake.handshake_revoked") !=
+              std::string::npos &&
+          response.body.find("握手已被 VCU 撤销") != std::string::npos &&
+          response.body.find("完成后请从页面重新申请 VCU 握手") !=
+              std::string::npos,
       "explicit VCU handshake controls are missing");
+  const auto diagnose_handshake =
+      response.body.find("function diagnoseVcuHandshake");
+  const auto handshake_revoked_gate = response.body.find(
+      "if(vcuHandshake.handshake_revoked)", diagnose_handshake);
+  const auto profile_ack_gate = response.body.find(
+      "if(!controlProfileState.acknowledged)", diagnose_handshake);
+  expect(
+      diagnose_handshake != std::string::npos &&
+          handshake_revoked_gate != std::string::npos &&
+          profile_ack_gate != std::string::npos &&
+          handshake_revoked_gate < profile_ack_gate,
+      "handshake revocation can be hidden by the cleared session profile gate");
   expect(
       response.body.find("event:'vcu_handshake_command'") != std::string::npos &&
           response.body.find("'vcu_handshake_status','session_control_profile_status'") !=
@@ -663,26 +683,22 @@ void test_control_page_contract() {
               std::string::npos,
       "ordinary driving is not fail-closed on session control profile acknowledgement");
   expect(
-      response.body.find("defaultProfileAutoAttempted=false") != std::string::npos &&
-          response.body.find(
-              "controlProfilePrepareInFlight=false;defaultProfileAutoAttempted=false;"
-              "vehicleHardLimits={received:false}") != std::string::npos &&
-          response.body.find(
+      response.body.find(
               "controlLogic.controlProfileFromVehicleDefaults(driverActuationDefaults,hard)") !=
+              std::string::npos &&
+          response.body.find("function controlProfileParkingReady()") !=
               std::string::npos &&
           response.body.find(
               "parkedStandby=vcuHandshake.parking_ready===true&&"
               "(vcuHandshake.state==='standby'||vcuHandshake.state==='disarmed')") !=
               std::string::npos &&
           response.body.find("return mockBench||parkedStandby") != std::string::npos &&
+          response.body.find("需人工打开并发送") != std::string::npos &&
+          response.body.find("defaultProfileAutoAttempted") == std::string::npos &&
           response.body.find(
-              "if(defaultProfileAutoAttempted||controlChannel?.readyState!=='open'") !=
-              std::string::npos &&
-          response.body.find(
-              "defaultProfileAutoAttempted=true;prepareControlProfile("
-              "controlProfileState.requestedProfile,false)") !=
+              "prepareControlProfile(controlProfileState.requestedProfile,false)") ==
               std::string::npos,
-      "default profile can auto-submit before parking readiness or repeatedly after rejection");
+      "legacy PID defaults can still auto-submit without explicit operator confirmation");
   expect(
       response.body.find("pidChanged=!prior||requested.speed_pid_kp!==prior.speed_pid_kp") !=
               std::string::npos &&
@@ -701,7 +717,7 @@ void test_control_page_contract() {
           response.body.find(
               "requested.max_steering_angle_deg!==prior.max_steering_angle_deg") !=
               std::string::npos &&
-          response.body.find("if(requiresParking&&!defaultControlProfileAutoReady())") !=
+          response.body.find("if(requiresParking&&!controlProfileParkingReady())") !=
               std::string::npos &&
           response.body.find("VCU 为 standby/disarmed") !=
               std::string::npos,
@@ -972,9 +988,9 @@ void test_control_page_contract() {
               std::string::npos,
       "an older vehicle without adapter_ready cannot use the compatibility-safe unknown state");
   const auto estop_monitor = response.body.find(
-      "const estopPresentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true)");
+      "const estopPresentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason)");
   const auto estop_banner = response.body.find(
-      "function renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true))");
+      "function renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason))");
   expect(
       estop_monitor != std::string::npos && estop_banner != std::string::npos &&
           response.body.find("renderEstopRequest(estopPresentation)", estop_monitor) !=
@@ -986,6 +1002,14 @@ void test_control_page_contract() {
               "estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner",
               estop_banner) != std::string::npos,
       "vehicle-only ESTOP telemetry does not drive the critical banner and alert presentation");
+  expect(
+      response.body.find("function controlProfileParkingReady()") !=
+              std::string::npos &&
+          response.body.find("defaultProfileAutoAttempted") == std::string::npos &&
+          response.body.find(
+              "prepareControlProfile(controlProfileState.requestedProfile,false)") ==
+              std::string::npos,
+      "a completed VCU disconnect can silently reapply a legacy session profile");
   expect(
       response.body.find("activeChannel.bufferedAmount>4096&&!estopRequested){") !=
               std::string::npos &&

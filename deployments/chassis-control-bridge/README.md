@@ -85,8 +85,9 @@ movement beyond that band, including a material target decrease, resets it.
 `ADU_Tx_VehSpdReq` is intentionally always encoded as `0 km/h / Q=0`; the
 runtime does not depend on the unverified VCU target-speed loop. Any brake
 zeros throttle and target speed, resets the PID, and forces all eight motor
-torques to zero while retaining steering. ABI V5 preserves the V4 open-config
-contract, including the optional rising-torque rate;
+torques to zero while retaining steering. ABI V6 keeps the V4 open-config
+shape, including the optional rising-torque rate, while extending telemetry
+and stop-context contracts; ABI V5 bridge packages are intentionally rejected;
 the acknowledged physical brake pressure still travels through the apply call.
 The bridge invokes ChassisControl for steering, then overwrites all eight EHB
 channels with the direct pressure quantized to 0.1 bar. No
@@ -144,31 +145,33 @@ explicit new parallel-handshake request.
 
 Upgrade the vehicle-agent runtime and this bridge atomically. The current
 runtime requires
-ABI version 5, exact V4 and legacy V3/V2 open-config struct-size matches, and
+ABI version 6, exact V4 and V3/V2 open-config struct-size matches, and
 `mine_teleop_chassis_open_v4` plus the additive
 `mine_teleop_chassis_apply_state_v2`; the runtime queries these capabilities before any CAN
 initialization. A V1/V2-only bridge fails closed instead of silently ignoring the
 physical ordinary-brake ceiling or interpreting the negative apply value as
 legacy deceleration.
-ABI version 5 also requires the immutable 88-byte runtime-control V1 and
+ABI version 6 also requires the immutable 88-byte runtime-control V1 and
 96-byte runtime-control V2 size queries, both versioned configure symbols, and
 `mine_teleop_chassis_clear_runtime_control_v1`; missing symbols or a wrong POD
 size are rejected before SocketCAN initialization. V1 accepts only legacy
 profile version 2 and retains the open-time rise rate. V2 accepts profile
-version 3 and carries the session rise rate.
+version 3 and carries the session rise rate. The same gate requires the
+16-byte stop-context V1 size query and `mine_teleop_chassis_set_stop_context_v1`;
+ABI 5 is rejected, so the runtime and bridge must be deployed together.
 `apply_state_v2` returns a fixed-size POD result in the same locked call. It
 distinguishes the D/R moving-or-stale gate from other rejected applies without
 exporting bridge log strings or requiring a racy last-error getter. The legacy
 `apply_state` symbol remains a fail-closed integer wrapper.
 The bridge continues to export `mine_teleop_chassis_open_v1`,
 `mine_teleop_chassis_open_v2`, and `mine_teleop_chassis_open_v3` for direct ABI
-callers and compatibility tests. V3 has no rise-rate field, so direct PID torque
+callers and unit fixtures. V3 has no rise-rate field, so direct PID torque
 has no additional rise shaping; V4 uses the explicitly configured value, where
 zero also means immediate output.
 V1 deliberately disables traction because it cannot supply a validated
 local-PID safety configuration; V2 retains its legacy negative-deceleration
 apply semantics. These exports do not let an older vehicle-agent pass the
-global ABI-version-5 startup gate.
+global ABI-version-6 startup gate.
 
 Validate before service startup:
 

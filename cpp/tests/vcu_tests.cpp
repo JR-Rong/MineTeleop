@@ -100,9 +100,11 @@ CanFrame parking_brake_feedback(int status) {
   return frame;
 }
 
-CanFrame gear_feedback(int gear) {
+CanFrame gear_feedback(int gear, int emergency_switch = 0, int vmc_fault_code = 0) {
   CanFrame frame{mine_teleop::vcu::ids::kWvcuVehicleStatus};
-  frame.data[0] = static_cast<std::uint8_t>(gear << 2);
+  frame.data[0] = static_cast<std::uint8_t>(
+      ((gear & 0x03) << 2) | (emergency_switch & 0x03));
+  frame.data[2] = static_cast<std::uint8_t>(vmc_fault_code);
   return frame;
 }
 
@@ -117,6 +119,13 @@ CanFrame speed_feedback(double speed_kph) {
 CanFrame driver_gear_request_feedback(int gear) {
   CanFrame frame{mine_teleop::vcu::ids::kWvcuDriverIntention};
   frame.data[7] = static_cast<std::uint8_t>((gear & 0x07) << 1);
+  return frame;
+}
+
+CanFrame driver_switch_feedback(int parking_brake_switch, int brake_pedal_switch) {
+  CanFrame frame{mine_teleop::vcu::ids::kWvcuDriverIntention2};
+  frame.data[2] = static_cast<std::uint8_t>((brake_pedal_switch & 0x03) << 6);
+  frame.data[3] = static_cast<std::uint8_t>(parking_brake_switch & 0x03);
   return frame;
 }
 
@@ -247,7 +256,7 @@ void advance_to_arming_state(ParallelController& controller, State target) {
 
 void complete_emergency_disarm(ParallelController& controller) {
   if (controller.state() == State::DisarmManual) {
-    expect(controller.ingest(handshake_feedback(3)), "manual disarm feedback failed");
+    prepare_parking_gate(controller);
     static_cast<void>(controller.tick());
     expect(controller.state() == State::Disarmed, "early arming ESTOP did not disarm");
     return;
@@ -272,7 +281,7 @@ void complete_emergency_disarm(ParallelController& controller) {
   expect(controller.ingest(parking_brake_feedback(2)), "emergency-disarm EPB feedback failed");
   static_cast<void>(controller.tick());
   expect(controller.state() == State::DisarmManual, "emergency disarm skipped EPB park");
-  expect(controller.ingest(handshake_feedback(3)), "emergency-disarm manual feedback failed");
+  prepare_parking_gate(controller);
   static_cast<void>(controller.tick());
   expect(controller.state() == State::Disarmed, "emergency disarm did not complete");
 }
@@ -701,14 +710,165 @@ void test_feedback_decoding_uses_si_units_and_complete_snapshot() {
 
   controller.ingest(handshake_feedback(5));
   controller.ingest(parking_brake_feedback(1));
-  controller.ingest(gear_feedback(3));
+  controller.ingest(gear_feedback(3, 0, 8));
+  controller.ingest(driver_switch_feedback(2, 1));
   controller.ingest(driver_gear_request_feedback(1));
   send_mode_feedback(controller);
+  expect(
+      controller.feedback().vmc_fault_code_valid &&
+          controller.feedback().vmc_fault_code == 8,
+      "WVCU_VMCFltCode was not decoded from 0x18F2F5D0");
+  expect(
+      controller.feedback().parking_brake_switch_valid &&
+          controller.feedback().parking_brake_switch == 2 &&
+          controller.feedback().brake_pedal_switch_valid &&
+          controller.feedback().brake_pedal_switch == 1,
+      "physical parking-brake/brake-pedal switches were not decoded from 0x18F6F5D0");
   expect(controller.feedback_complete(), "complete safety feedback snapshot was not recognized");
 
   CanFrame short_frame = handshake_feedback(5);
   short_frame.dlc = 7;
   expect(!controller.ingest(short_frame), "short CAN feedback frame was accepted");
+}
+
+void test_fresh_manual_status_revokes_each_post_handshake_arming_phase() {
+  for (const auto arming_state : {
+           State::WaitParkingBrakeReleased,
+           State::WaitGear,
+           State::WaitActuatorModes}) {
+    ParallelController controller;
+    advance_to_arming_state(controller, arming_state);
+    expect(
+        !controller.handshake_revoked(),
+        "arming setup unexpectedly carried a revoked-handshake latch");
+
+    expect(
+        controller.ingest(gear_feedback(3, 0, 8)) &&
+            controller.ingest(parking_brake_feedback(1)),
+        "VMC fault-code feedback was rejected during revocation setup");
+    expect(
+        controller.ingest(handshake_feedback(3)),
+        "fresh manual handshake feedback was rejected");
+    auto frames = controller.tick();
+    expect(
+        controller.state() == State::DisarmTorque &&
+            controller.handshake_revoked() &&
+            controller.revoked_handshake_status() == 3,
+        "fresh state 3 did not latch revocation and enter staged disarm");
+
+    const auto& shake = find_frame(frames, mine_teleop::vcu::ids::kAduShake);
+    const auto& epb = find_frame(frames, mine_teleop::vcu::ids::kAduEpb);
+    const auto& motor = find_frame(frames, mine_teleop::vcu::ids::kAduMcu01);
+    const auto& brake = find_frame(frames, mine_teleop::vcu::ids::kAduEhb01);
+    expect(
+        signal(shake, 0, 8) == 0 && signal(shake, 16, 8) == 0,
+        "revoked handshake did not immediately withdraw both handshake requests");
+    expect(
+        signal(epb, 0, 2) == 0 && signal(epb, 8, 2) == 0 &&
+            signal(epb, 16, 2) == 0 && signal(epb, 24, 2) == 0,
+        "revoked handshake released or parked EPB before zero-speed confirmation");
+    expect(
+        signal(motor, 0, 3) == 1 && signal(motor, 3, 3) == 1 &&
+            signal(motor, 8, 14) == 8000,
+        "revoked handshake did not retain torque mode with a zero-torque request");
+    expect(
+        signal(brake, 0, 4) == 1 && signal(brake, 4, 12) == 4095,
+        "revoked handshake did not immediately enable safe EHB braking");
+
+    controller.clear_emergency_stop();
+    expect(
+        controller.handshake_revoked(),
+        "ordinary emergency clear removed the handshake-revoked latch");
+
+    for (std::size_t index = 0; index < kMotorStatus01Ids.size(); ++index) {
+      expect(
+          controller.ingest(motor_torque_feedback(index, 0.0)),
+          "post-revocation zero-torque feedback was rejected");
+    }
+    frames = controller.tick();
+    expect(
+        controller.state() == State::DisarmStop,
+        "post-revocation shutdown skipped fresh zero-torque confirmation");
+    expect(
+        signal(find_frame(frames, mine_teleop::vcu::ids::kAduShake), 0, 8) == 0 &&
+            signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 0,
+        "post-revocation stop phase restored handshake or released EPB");
+
+    expect(
+        controller.ingest(speed_feedback(3.6)),
+        "post-revocation nonzero-speed feedback was rejected");
+    frames = controller.tick();
+    expect(
+        controller.state() == State::DisarmStop &&
+            signal(find_frame(frames, mine_teleop::vcu::ids::kAduShake), 0, 8) == 0 &&
+            signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 0 &&
+            signal(find_frame(frames, mine_teleop::vcu::ids::kAduEhb01), 4, 12) == 4095,
+        "nonzero speed advanced shutdown or removed its safe stop outputs");
+
+    expect(
+        controller.ingest(speed_feedback(0.0)),
+        "post-revocation zero-speed feedback was rejected");
+    frames = controller.tick();
+    expect(
+        controller.state() == State::DisarmNeutral &&
+            signal(find_frame(frames, mine_teleop::vcu::ids::kAduShake), 0, 8) == 0 &&
+            signal(find_frame(frames, mine_teleop::vcu::ids::kAduShake), 8, 8) == 1 &&
+            signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 0,
+        "zero speed did not enter neutral with handshake withdrawn and EPB held");
+
+    expect(
+        controller.ingest(gear_feedback(1, 0, 8)),
+        "post-revocation neutral feedback was rejected");
+    frames = controller.tick();
+    expect(
+        controller.state() == State::DisarmParkingBrake &&
+            signal(find_frame(frames, mine_teleop::vcu::ids::kAduShake), 0, 8) == 0 &&
+            signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 2,
+        "neutral confirmation did not enter the EPB-park phase safely");
+
+    expect(
+        controller.ingest(parking_brake_feedback(2)),
+        "post-revocation parked-EPB feedback was rejected");
+    frames = controller.tick();
+    expect(
+        controller.state() == State::DisarmManual &&
+            signal(find_frame(frames, mine_teleop::vcu::ids::kAduShake), 0, 8) == 0 &&
+            signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 2,
+        "park confirmation did not enter manual-handshake confirmation safely");
+
+    expect(
+        controller.ingest(handshake_feedback(3)),
+        "manual confirmation after revocation was rejected");
+    static_cast<void>(controller.tick());
+    expect(
+        controller.state() == State::DisarmManual &&
+            controller.handshake_revoked(),
+        "repeated manual status bypassed N/zero-speed/EPB confirmation");
+    prepare_parking_gate(controller);
+    static_cast<void>(controller.tick());
+    expect(
+        controller.state() == State::Disarmed &&
+            controller.handshake_revoked() &&
+            !controller.handshake_requested(),
+        "N/zero-speed/EPB confirmation did not settle revoked state as disarmed");
+
+    controller.ingest(parking_brake_feedback(1));
+    expect(
+        !controller.request_parallel_handshake() &&
+            controller.handshake_revoked(),
+        "a rejected retry cleared the handshake-revoked latch");
+    prepare_parking_gate(controller);
+    expect(
+        controller.request_parallel_handshake() &&
+            !controller.handshake_revoked() &&
+            controller.revoked_handshake_status() == 0,
+        "a valid explicit retry did not clear the revocation latch");
+    for (int index = 0; index < 6; ++index) frames = controller.tick();
+    expect(
+        signal(find_frame(frames, mine_teleop::vcu::ids::kAduShake), 0, 8) == 2 &&
+            signal(find_frame(frames, mine_teleop::vcu::ids::kAduShake), 16, 8) == 0,
+        "explicit retry did not retain ShakeReq=2 with CloudShakeReq=0");
+  }
 }
 
 void test_arming_requires_fresh_feedback_after_each_request() {
@@ -790,7 +950,7 @@ void test_disconnect_during_handshake_clears_request_and_confirms_manual() {
   expect(signal(shake, 0, 8) == 0, "disconnect did not clear ShakeReq");
   expect(signal(shake, 16, 8) == 0, "disconnect asserted CloudShakeReq");
 
-  controller.ingest(handshake_feedback(3));
+  prepare_parking_gate(controller);
   static_cast<void>(controller.tick());
   expect(controller.disarmed(), "fresh manual status did not confirm early disconnect");
 }
@@ -861,7 +1021,7 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
   expect(signal(shake, 0, 8) == 0, "intelligent-driving handshake was not cleared after parking");
   expect(signal(shake, 16, 8) == 0, "CloudShakeReq was asserted during disarm");
 
-  controller.ingest(handshake_feedback(3));
+  prepare_parking_gate(controller);
   static_cast<void>(controller.tick());
   expect(controller.disarmed(), "manual handshake status 3 did not complete disarm");
   expect(
@@ -1018,6 +1178,8 @@ int main() {
        test_arming_requires_fresh_feedback_after_each_request},
       {"handshake_requires_neutral_and_electronic_parking_brake",
        test_handshake_requires_neutral_and_electronic_parking_brake},
+      {"fresh_manual_status_revokes_each_post_handshake_arming_phase",
+       test_fresh_manual_status_revokes_each_post_handshake_arming_phase},
       {"disconnect_during_handshake_clears_request_and_confirms_manual",
        test_disconnect_during_handshake_clears_request_and_confirms_manual},
       {"handshake_loss_forces_zero_torque_and_calibrated_brake",

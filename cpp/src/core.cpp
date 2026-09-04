@@ -169,6 +169,16 @@ struct BridgeTelemetry {
   double throttle_feedback;
   double brake_feedback;
   int estop;
+  std::uint32_t stop_source;
+  std::uint32_t stop_reason;
+  std::uint64_t stop_sequence;
+};
+
+struct BridgeStopContextV1 {
+  std::uint32_t struct_size;
+  std::uint32_t stop_source;
+  std::uint32_t stop_reason;
+  std::uint32_t reserved;
 };
 
 struct BridgeOpenConfigV1 {
@@ -362,6 +372,14 @@ struct BridgeHandshakeStatus {
   int epb_valid[4];
   double speed_mps;
   int speed_valid;
+  int handshake_revoked;
+  int revoked_handshake_status;
+  int vmc_fault_code;
+  int vmc_fault_code_valid;
+  int parking_brake_switch;
+  int parking_brake_switch_valid;
+  int brake_pedal_switch;
+  int brake_pedal_switch_valid;
 };
 
 struct BridgeCanFeedbackV1 {
@@ -390,7 +408,101 @@ struct BridgeCanFeedbackV1 {
   int brake_mode[8];
   int brake_valid[8];
   double brake_pressure_bar[8];
+  int vmc_fault_code;
+  int vmc_fault_code_valid;
+  int parking_brake_switch;
+  int parking_brake_switch_valid;
+  int brake_pedal_switch;
+  int brake_pedal_switch_valid;
 };
+
+static_assert(sizeof(BridgeTelemetry) == 64U);
+static_assert(sizeof(BridgeStopContextV1) == 16U);
+
+std::string bridge_stop_source(
+    std::uint32_t source_value,
+    std::uint32_t reason_value) {
+  const auto source = static_cast<VehicleStopSource>(source_value);
+  const auto reason = static_cast<VehicleStopReason>(reason_value);
+  switch (source) {
+    case VehicleStopSource::None:
+      return "none";
+    case VehicleStopSource::DriverPage:
+      return reason == VehicleStopReason::VcuHandshakeDisconnect ||
+              reason == VehicleStopReason::DriverDisconnect
+          ? "page_disconnect"
+          : "page_request";
+    case VehicleStopSource::Session:
+      return "session_loss";
+    case VehicleStopSource::Watchdog:
+      return "watchdog";
+    case VehicleStopSource::SoftwareFault:
+      return "software_fault";
+    case VehicleStopSource::PhysicalEmergency:
+      return "physical_estop";
+    case VehicleStopSource::Unknown:
+      return "unknown";
+  }
+  return "unknown";
+}
+
+std::string bridge_stop_reason(std::uint32_t value) {
+  switch (static_cast<VehicleStopReason>(value)) {
+    case VehicleStopReason::None:
+      return "none";
+    case VehicleStopReason::OperatorEstop:
+      return "operator_estop";
+    case VehicleStopReason::VcuHandshakeDisconnect:
+      return "vcu_handshake_disconnect";
+    case VehicleStopReason::DriverDisconnect:
+      return "driver_disconnect";
+    case VehicleStopReason::SessionLost:
+      return "session_lost";
+    case VehicleStopReason::ControlApplyTimeout:
+      return "control_apply_timeout";
+    case VehicleStopReason::OuterControlTimeout:
+      return "outer_control_timeout";
+    case VehicleStopReason::FeedbackTimeout:
+      return "feedback_timeout";
+    case VehicleStopReason::ControlApplyFailed:
+      return "control_apply_failed";
+    case VehicleStopReason::ChassisControlFault:
+      return "chassis_control_fault";
+    case VehicleStopReason::CanReceiveFailed:
+      return "can_receive_failed";
+    case VehicleStopReason::CanSendFailed:
+      return "can_send_failed";
+    case VehicleStopReason::IoThreadException:
+      return "io_thread_exception";
+    case VehicleStopReason::HardOverspeed:
+      return "hard_overspeed";
+    case VehicleStopReason::OppositeDirectionMotion:
+      return "opposite_direction_motion";
+    case VehicleStopReason::ArmingMotion:
+      return "arming_motion";
+    case VehicleStopReason::ControlCommandInvalid:
+      return "control_command_invalid";
+    case VehicleStopReason::PhysicalEmergencySwitch:
+      return "physical_emergency_switch";
+    case VehicleStopReason::HandshakeRevoked:
+      return "handshake_revoked";
+    case VehicleStopReason::CriticalCameraFailed:
+      return "critical_camera_failed";
+    case VehicleStopReason::MediaPipelineFailed:
+      return "media_pipeline_failed";
+    case VehicleStopReason::VcuStateFault:
+      return "vcu_state_fault";
+    case VehicleStopReason::SessionProfileRequired:
+      return "session_profile_required";
+    case VehicleStopReason::CanFeedbackMissing:
+      return "can_feedback_missing";
+    case VehicleStopReason::AdapterSafetyStatusUnavailable:
+      return "adapter_safety_status_unavailable";
+    case VehicleStopReason::LegacyUnspecified:
+      return "legacy_unspecified";
+  }
+  return "unknown";
+}
 
 std::string bridge_handshake_state(int state) {
   static constexpr std::array<std::string_view, 14> kStates{
@@ -497,6 +609,7 @@ void validate_chassis_bridge_abi_handle(void* handle) {
       const BridgeRuntimeControlConfigV2*,
       BridgeRuntimeControlResultV1*);
   using ClearRuntimeControlFn = int (*)(BridgeRuntimeControlResultV1*);
+  using SetStopContextV1Fn = int (*)(const BridgeStopContextV1*);
   const auto version = load_symbol<QueryFn>(
       handle, "mine_teleop_chassis_abi_version")();
   const auto config_size = load_symbol<QueryFn>(
@@ -509,6 +622,8 @@ void validate_chassis_bridge_abi_handle(void* handle) {
       handle, "mine_teleop_chassis_runtime_control_config_v1_size")();
   const auto runtime_control_v2_config_size = load_symbol<QueryFn>(
       handle, "mine_teleop_chassis_runtime_control_config_v2_size")();
+  const auto stop_context_v1_size = load_symbol<QueryFn>(
+      handle, "mine_teleop_chassis_stop_context_v1_size")();
   static_cast<void>(load_symbol<OpenV1Fn>(
       handle, "mine_teleop_chassis_open_v1"));
   static_cast<void>(load_symbol<OpenV2Fn>(
@@ -525,13 +640,16 @@ void validate_chassis_bridge_abi_handle(void* handle) {
       handle, "mine_teleop_chassis_configure_runtime_control_v2"));
   static_cast<void>(load_symbol<ClearRuntimeControlFn>(
       handle, "mine_teleop_chassis_clear_runtime_control_v1"));
-  if (version != 5U || config_size != sizeof(BridgeOpenConfigV4) ||
+  static_cast<void>(load_symbol<SetStopContextV1Fn>(
+      handle, "mine_teleop_chassis_set_stop_context_v1"));
+  if (version != 6U || config_size != sizeof(BridgeOpenConfigV4) ||
       legacy_v3_config_size != sizeof(BridgeOpenConfigV3) ||
       legacy_v2_config_size != sizeof(BridgeOpenConfigV2) ||
       runtime_control_v1_config_size != sizeof(BridgeRuntimeControlConfigV1) ||
-      runtime_control_v2_config_size != sizeof(BridgeRuntimeControlConfigV2)) {
+      runtime_control_v2_config_size != sizeof(BridgeRuntimeControlConfigV2) ||
+      stop_context_v1_size != sizeof(BridgeStopContextV1)) {
     throw std::runtime_error(
-        "chassis bridge ABI mismatch: expected version 5 and V4 config size " +
+        "chassis bridge ABI mismatch: expected version 6 and V4 config size " +
         std::to_string(sizeof(BridgeOpenConfigV4)) + ", got version " +
         std::to_string(version) + " and size " + std::to_string(config_size) +
         "; legacy V3 size expected " +
@@ -545,7 +663,10 @@ void validate_chassis_bridge_abi_handle(void* handle) {
         std::to_string(runtime_control_v1_config_size) +
         "; runtime control V2 size expected " +
         std::to_string(sizeof(BridgeRuntimeControlConfigV2)) + ", got " +
-        std::to_string(runtime_control_v2_config_size));
+        std::to_string(runtime_control_v2_config_size) +
+        "; stop context V1 size expected " +
+        std::to_string(sizeof(BridgeStopContextV1)) + ", got " +
+        std::to_string(stop_context_v1_size));
   }
 }
 
@@ -1897,6 +2018,12 @@ Json VehicleCanFeedback::to_json() const {
       {"driver_gear_request_valid", driver_gear_request_valid},
       {"handshake_status", handshake_status},
       {"handshake_valid", handshake_valid},
+      {"vmc_fault_code", vmc_fault_code},
+      {"vmc_fault_code_valid", vmc_fault_code_valid},
+      {"parking_brake_switch", parking_brake_switch},
+      {"parking_brake_switch_valid", parking_brake_switch_valid},
+      {"brake_pedal_switch", brake_pedal_switch},
+      {"brake_pedal_switch_valid", brake_pedal_switch_valid},
       {"parking_brake_status", parking_brake_status},
       {"parking_brake_valid", parking_brake_valid},
       {"motor_mode", motor_mode},
@@ -1926,6 +2053,14 @@ Json VcuHandshakeStatus::to_json() const {
       {"driver_gear_request_valid", driver_gear_request_valid},
       {"handshake_status", handshake_status},
       {"handshake_valid", handshake_valid},
+      {"handshake_revoked", handshake_revoked},
+      {"revoked_handshake_status", revoked_handshake_status},
+      {"vmc_fault_code", vmc_fault_code},
+      {"vmc_fault_code_valid", vmc_fault_code_valid},
+      {"parking_brake_switch", parking_brake_switch},
+      {"parking_brake_switch_valid", parking_brake_switch_valid},
+      {"brake_pedal_switch", brake_pedal_switch},
+      {"brake_pedal_switch_valid", brake_pedal_switch_valid},
       {"epb_status", epb_status},
       {"epb_valid", epb_valid},
       {"speed_mps", speed_mps},
@@ -1969,9 +2104,20 @@ void MockVehicleAdapter::apply_control(const ControlCommand& command) {
   ++applied_command_count_;
 }
 
-void MockVehicleAdapter::apply_safe_stop(const ControlOutput& output) {
+void MockVehicleAdapter::apply_safe_stop(
+    const ControlOutput& output,
+    VehicleStopContext context) {
   if (!opened_) throw std::runtime_error("mock vehicle adapter is not open");
+  const bool stop_was_active =
+      latest_output_ && latest_output_->estop;
+  const bool stop_is_active = output.estop;
   latest_output_ = output;
+  if (stop_is_active && !stop_was_active) {
+    latest_stop_context_ = context;
+    ++stop_sequence_;
+  } else if (!stop_is_active) {
+    latest_stop_context_ = {};
+  }
   ++safe_stop_count_;
 }
 
@@ -1984,6 +2130,14 @@ VehicleTelemetry MockVehicleAdapter::read_telemetry() {
   telemetry.throttle_feedback = latest_output_->throttle;
   telemetry.brake_feedback = latest_output_->brake;
   telemetry.estop = latest_output_->estop;
+  if (latest_output_->estop) {
+    telemetry.stop_source = bridge_stop_source(
+        static_cast<std::uint32_t>(latest_stop_context_.source),
+        static_cast<std::uint32_t>(latest_stop_context_.reason));
+    telemetry.stop_reason = bridge_stop_reason(
+        static_cast<std::uint32_t>(latest_stop_context_.reason));
+    telemetry.stop_sequence = stop_sequence_;
+  }
   return telemetry;
 }
 
@@ -2119,9 +2273,12 @@ void DynamicLibraryVehicleAdapter::ensure_loaded() {
         handle_,
         "mine_teleop_chassis_read_handshake_status");
     read_fn_ = load_symbol<ReadFn>(handle_, "mine_teleop_chassis_read_telemetry");
-    read_can_feedback_v1_fn_ = load_optional_symbol<ReadCanFeedbackV1Fn>(
+    read_can_feedback_v1_fn_ = load_symbol<ReadCanFeedbackV1Fn>(
         handle_,
         "mine_teleop_chassis_read_can_feedback_v1");
+    set_stop_context_v1_fn_ = load_symbol<SetStopContextV1Fn>(
+        handle_,
+        "mine_teleop_chassis_set_stop_context_v1");
     close_fn_ = load_symbol<CloseFn>(handle_, "mine_teleop_chassis_close");
   } catch (...) {
     unload_dynamic_library(handle_);
@@ -2284,9 +2441,19 @@ void DynamicLibraryVehicleAdapter::apply_control(const ControlCommand& command) 
   ++applied_command_count_;
 }
 
-void DynamicLibraryVehicleAdapter::apply_safe_stop(const ControlOutput& output) {
+void DynamicLibraryVehicleAdapter::apply_safe_stop(
+    const ControlOutput& output,
+    VehicleStopContext context) {
   if (!opened_) throw std::runtime_error("dynamic vehicle adapter is not open");
   if (output.estop || output.full_emergency_brake) {
+    const BridgeStopContextV1 raw_context{
+        sizeof(BridgeStopContextV1),
+        static_cast<std::uint32_t>(context.source),
+        static_cast<std::uint32_t>(context.reason),
+        0U};
+    check_result(
+        set_stop_context_v1_fn_(&raw_context),
+        "mine_teleop_chassis_set_stop_context_v1");
     check_result(stop_fn_(), "mine_teleop_chassis_emergency_stop");
   } else {
     const double steering[4]{output.steering, output.steering, output.steering, output.steering};
@@ -2351,6 +2518,14 @@ VcuHandshakeStatus DynamicLibraryVehicleAdapter::vcu_handshake_status() const {
   status.driver_gear_request_valid = raw.driver_gear_request_valid != 0;
   status.handshake_status = raw.handshake_status;
   status.handshake_valid = raw.handshake_valid != 0;
+  status.handshake_revoked = raw.handshake_revoked != 0;
+  status.revoked_handshake_status = raw.revoked_handshake_status;
+  status.vmc_fault_code = raw.vmc_fault_code;
+  status.vmc_fault_code_valid = raw.vmc_fault_code_valid != 0;
+  status.parking_brake_switch = raw.parking_brake_switch;
+  status.parking_brake_switch_valid = raw.parking_brake_switch_valid != 0;
+  status.brake_pedal_switch = raw.brake_pedal_switch;
+  status.brake_pedal_switch_valid = raw.brake_pedal_switch_valid != 0;
   for (std::size_t index = 0; index < status.epb_status.size(); ++index) {
     status.epb_status[index] = raw.epb_status[index];
     status.epb_valid[index] = raw.epb_valid[index] != 0;
@@ -2370,7 +2545,11 @@ VehicleTelemetry DynamicLibraryVehicleAdapter::read_telemetry() {
   result.throttle_feedback = telemetry.throttle_feedback;
   result.brake_feedback = telemetry.brake_feedback;
   result.estop = telemetry.estop != 0;
-  if (read_can_feedback_v1_fn_ == nullptr) return result;
+  result.stop_source = bridge_stop_source(
+      telemetry.stop_source,
+      telemetry.stop_reason);
+  result.stop_reason = bridge_stop_reason(telemetry.stop_reason);
+  result.stop_sequence = telemetry.stop_sequence;
 
   BridgeCanFeedbackV1 raw{};
   check_result(
@@ -2389,6 +2568,12 @@ VehicleTelemetry DynamicLibraryVehicleAdapter::read_telemetry() {
   feedback.driver_gear_request_valid = raw.driver_gear_request_valid != 0;
   feedback.handshake_status = raw.handshake_status;
   feedback.handshake_valid = raw.handshake_valid != 0;
+  feedback.vmc_fault_code = raw.vmc_fault_code;
+  feedback.vmc_fault_code_valid = raw.vmc_fault_code_valid != 0;
+  feedback.parking_brake_switch = raw.parking_brake_switch;
+  feedback.parking_brake_switch_valid = raw.parking_brake_switch_valid != 0;
+  feedback.brake_pedal_switch = raw.brake_pedal_switch;
+  feedback.brake_pedal_switch_valid = raw.brake_pedal_switch_valid != 0;
   for (std::size_t index = 0; index < feedback.parking_brake_status.size(); ++index) {
     feedback.parking_brake_status[index] = raw.epb_status[index];
     feedback.parking_brake_valid[index] = raw.epb_valid[index] != 0;
@@ -2823,7 +3008,9 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
   } catch (...) {
     try {
       adapter_->apply_safe_stop(
-          ControlOutput{"N", 0.0, 0.0, 1.0, true});
+          ControlOutput{"N", 0.0, 0.0, 1.0, true},
+          {VehicleStopSource::SoftwareFault,
+           VehicleStopReason::ControlApplyFailed});
     } catch (...) {
     }
     clear_session_profile();
@@ -2852,7 +3039,9 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
   if (!effective.estop && !active_session_profile_) {
     if (!adapter_safe_stop_active_) {
       adapter_->apply_safe_stop(
-          ControlOutput{"N", 0.0, 0.0, 1.0, false, true});
+          ControlOutput{"N", 0.0, 0.0, 1.0, false, true},
+          {VehicleStopSource::SoftwareFault,
+           VehicleStopReason::SessionProfileRequired});
     }
     return {false, "session_control_profile_required", std::nullopt, {}};
   }
@@ -2905,19 +3094,27 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
   if (!result.command->estop) {
     if (!adapter_safety_observed) {
       safety_.mark_fault();
-      adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+      adapter_->apply_safe_stop(
+          safety_.current_output(timestamp_ms),
+          {VehicleStopSource::SoftwareFault,
+           VehicleStopReason::AdapterSafetyStatusUnavailable});
       clear_session_profile();
       return {false, "adapter_safety_status_unavailable", std::nullopt, result.warnings};
     }
     if (feedback_poll_failed && require_feedback_before_control_) {
       safety_.mark_fault();
-      adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+      adapter_->apply_safe_stop(
+          safety_.current_output(timestamp_ms),
+          {VehicleStopSource::SoftwareFault,
+           VehicleStopReason::CanFeedbackMissing});
       clear_session_profile();
       return {false, "can_feedback_poll_failed", std::nullopt, result.warnings};
     }
     if (require_feedback_before_control_ && !adapter_->feedback_ready()) {
       adapter_->apply_safe_stop(
-          ControlOutput{"N", 0.0, 0.0, 1.0, false, true});
+          ControlOutput{"N", 0.0, 0.0, 1.0, false, true},
+          {VehicleStopSource::SoftwareFault,
+           VehicleStopReason::CanFeedbackMissing});
       clear_session_profile();
       return {false, "can_feedback_missing", std::nullopt, result.warnings};
     }
@@ -2957,7 +3154,16 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
         safety_.state() == SafetyState::Fault) {
       clear_session_profile();
     }
-    adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+    const VehicleStopContext stop_context = safety_.state() == SafetyState::Estop
+        ? VehicleStopContext{
+              VehicleStopSource::DriverPage,
+              VehicleStopReason::OperatorEstop}
+        : VehicleStopContext{
+              VehicleStopSource::SoftwareFault,
+              VehicleStopReason::VcuStateFault};
+    adapter_->apply_safe_stop(
+        safety_.current_output(timestamp_ms),
+        stop_context);
   }
   return result;
 }
@@ -3009,7 +3215,22 @@ void VehicleControlService::tick(std::int64_t timestamp_ms) {
         (safety_.state() == SafetyState::Degraded ||
          safety_.state() == SafetyState::TimeoutBrake);
     if (!adapter_owns_recoverable_stop) {
-      adapter_->apply_safe_stop(safety_.current_output(timestamp_ms));
+      VehicleStopContext stop_context{
+          VehicleStopSource::SoftwareFault,
+          VehicleStopReason::VcuStateFault};
+      if (safety_.state() == SafetyState::Degraded ||
+          safety_.state() == SafetyState::TimeoutBrake) {
+        stop_context = {
+            VehicleStopSource::Watchdog,
+            VehicleStopReason::OuterControlTimeout};
+      } else if (safety_.state() == SafetyState::Estop) {
+        stop_context = {
+            VehicleStopSource::DriverPage,
+            VehicleStopReason::OperatorEstop};
+      }
+      adapter_->apply_safe_stop(
+          safety_.current_output(timestamp_ms),
+          stop_context);
     }
     clear_session_profile();
   }
@@ -3050,7 +3271,9 @@ bool VehicleControlService::reset_estop(
   // physical or hard safety latch rejects this ordinary zero-output apply;
   // keep the outer latch and service alive in that case.
   try {
-    adapter_->apply_safe_stop(ControlOutput{adapter_gear, 0.0, 0.0, 0.0, false});
+    adapter_->apply_safe_stop(
+        ControlOutput{adapter_gear, 0.0, 0.0, 0.0, false},
+        {});
   } catch (...) {
     adapter_safe_stop_active_ = true;
     return false;
@@ -3063,9 +3286,11 @@ bool VehicleControlService::reset_estop(
   return true;
 }
 
-void VehicleControlService::close() {
+void VehicleControlService::close(VehicleStopContext context) {
   if (!started_) return;
-  adapter_->apply_safe_stop(ControlOutput{"N", 0.0, 0.0, 1.0, true});
+  adapter_->apply_safe_stop(
+      ControlOutput{"N", 0.0, 0.0, 1.0, true},
+      context);
   clear_session_profile();
   adapter_->close();
   started_ = false;
@@ -3088,6 +3313,9 @@ Json VehicleControlService::build_telemetry(std::int64_t timestamp_ms) {
       {"throttle_feedback", telemetry.throttle_feedback},
       {"brake_feedback", telemetry.brake_feedback},
       {"estop", telemetry.estop},
+      {"stop_source", telemetry.stop_source},
+      {"stop_reason", telemetry.stop_reason},
+      {"stop_sequence", telemetry.stop_sequence},
       {"can_feedback", telemetry.can_feedback.to_json()},
       {"vehicle_adapter", adapter_->status().to_json()},
       {"vcu_handshake", adapter_->vcu_handshake_status().to_json()},

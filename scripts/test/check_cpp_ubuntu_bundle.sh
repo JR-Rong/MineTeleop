@@ -86,7 +86,7 @@ container_id="$(docker create --platform linux/amd64 \
       "$root/lib/vendor/chassis/libmine_teleop_chassis_bridge.so")"
     printf "%s\n" "$config_check_output"
     printf "%s\n" "$config_check_output" | \
-      grep -Eq "\"chassis_bridge_abi\":\\{[^}]*\"passed\":true[^}]*\"version\":5[^}]*\\}"
+      grep -Eq "\"chassis_bridge_abi\":\\{[^}]*\"passed\":true[^}]*\"version\":6[^}]*\\}"
     ldd "$root/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
       > /tmp/chassis-runtime-ldd.txt
     ! grep -q "not found" /tmp/chassis-runtime-ldd.txt

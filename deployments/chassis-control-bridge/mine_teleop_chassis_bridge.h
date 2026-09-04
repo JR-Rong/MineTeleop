@@ -334,6 +334,58 @@ struct MineTeleopChassisTelemetry {
     double throttle_feedback;
     double brake_feedback;
     int estop;
+    uint32_t stop_source;
+    uint32_t stop_reason;
+    uint64_t stop_sequence;
+};
+
+/* Stable stop provenance carried from the caller into the bridge and returned
+ * with telemetry. The first stop cause remains authoritative until the stop is
+ * cleared; a subsequently asserted physical emergency may supersede it. */
+enum MineTeleopChassisStopSource {
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_NONE = 0,
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_DRIVER_PAGE = 1,
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_SESSION = 2,
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_WATCHDOG = 3,
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_SOFTWARE_FAULT = 4,
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_PHYSICAL_EMERGENCY = 5,
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_UNKNOWN = 255,
+};
+
+enum MineTeleopChassisStopReason {
+    MINE_TELEOP_CHASSIS_STOP_REASON_NONE = 0,
+    MINE_TELEOP_CHASSIS_STOP_REASON_OPERATOR_ESTOP = 1,
+    MINE_TELEOP_CHASSIS_STOP_REASON_VCU_HANDSHAKE_DISCONNECT = 2,
+    MINE_TELEOP_CHASSIS_STOP_REASON_DRIVER_DISCONNECT = 3,
+    MINE_TELEOP_CHASSIS_STOP_REASON_SESSION_LOST = 4,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CONTROL_APPLY_TIMEOUT = 5,
+    MINE_TELEOP_CHASSIS_STOP_REASON_OUTER_CONTROL_TIMEOUT = 6,
+    MINE_TELEOP_CHASSIS_STOP_REASON_FEEDBACK_TIMEOUT = 7,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CONTROL_APPLY_FAILED = 8,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CHASSIS_CONTROL_FAULT = 9,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CAN_RECEIVE_FAILED = 10,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CAN_SEND_FAILED = 11,
+    MINE_TELEOP_CHASSIS_STOP_REASON_IO_THREAD_EXCEPTION = 12,
+    MINE_TELEOP_CHASSIS_STOP_REASON_HARD_OVERSPEED = 13,
+    MINE_TELEOP_CHASSIS_STOP_REASON_OPPOSITE_DIRECTION_MOTION = 14,
+    MINE_TELEOP_CHASSIS_STOP_REASON_ARMING_MOTION = 15,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CONTROL_COMMAND_INVALID = 16,
+    MINE_TELEOP_CHASSIS_STOP_REASON_PHYSICAL_EMERGENCY_SWITCH = 17,
+    MINE_TELEOP_CHASSIS_STOP_REASON_HANDSHAKE_REVOKED = 18,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CRITICAL_CAMERA_FAILED = 19,
+    MINE_TELEOP_CHASSIS_STOP_REASON_MEDIA_PIPELINE_FAILED = 20,
+    MINE_TELEOP_CHASSIS_STOP_REASON_VCU_STATE_FAULT = 21,
+    MINE_TELEOP_CHASSIS_STOP_REASON_SESSION_PROFILE_REQUIRED = 22,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CAN_FEEDBACK_MISSING = 23,
+    MINE_TELEOP_CHASSIS_STOP_REASON_ADAPTER_SAFETY_STATUS_UNAVAILABLE = 24,
+    MINE_TELEOP_CHASSIS_STOP_REASON_LEGACY_UNSPECIFIED = 255,
+};
+
+struct MineTeleopChassisStopContextV1 {
+    uint32_t struct_size;
+    uint32_t stop_source;
+    uint32_t stop_reason;
+    uint32_t reserved;
 };
 
 struct MineTeleopChassisFeedback {
@@ -385,12 +437,19 @@ struct MineTeleopChassisHandshakeStatus {
     int epb_valid[4];
     double speed_mps;
     int speed_valid;
+    int handshake_revoked;
+    int revoked_handshake_status;
+    int vmc_fault_code;
+    int vmc_fault_code_valid;
+    int parking_brake_switch;
+    int parking_brake_switch_valid;
+    int brake_pedal_switch;
+    int brake_pedal_switch_valid;
 };
 
-/*
- * Optional versioned extension for complete measured CAN feedback. Keeping it
- * separate from MineTeleopChassisTelemetry preserves compatibility with older
- * bridge packages that expose only the summary ABI.
+/* Complete measured CAN feedback required by ABI version 6. It remains
+ * separate from MineTeleopChassisTelemetry so summary and detailed telemetry
+ * have distinct responsibilities; ABI version 5 packages are not compatible.
  */
 struct MineTeleopChassisCanFeedbackV1 {
     int feedback_fresh;
@@ -418,6 +477,12 @@ struct MineTeleopChassisCanFeedbackV1 {
     int brake_mode[8];
     int brake_valid[8];
     double brake_pressure_bar[8];
+    int vmc_fault_code;
+    int vmc_fault_code_valid;
+    int parking_brake_switch;
+    int parking_brake_switch_valid;
+    int brake_pedal_switch;
+    int brake_pedal_switch_valid;
 };
 
 struct MineTeleopChassisOpenConfigV1 {
@@ -614,6 +679,8 @@ static_assert(
     sizeof(MineTeleopChassisOpenConfigV4) ==
     sizeof(MineTeleopChassisOpenConfigV3) + sizeof(double));
 static_assert(sizeof(MineTeleopChassisApplyResultV1) == 16U);
+static_assert(sizeof(MineTeleopChassisStopContextV1) == 16U);
+static_assert(sizeof(MineTeleopChassisTelemetry) == 64U);
 static_assert(sizeof(MineTeleopChassisRuntimeControlConfigV1) == 88U);
 #define MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(field) \
     static_assert(offsetof(MineTeleopChassisRuntimeControlConfigV2, field) == \
@@ -651,6 +718,7 @@ uint32_t mine_teleop_chassis_open_config_v3_size(void);
 uint32_t mine_teleop_chassis_open_config_v4_size(void);
 uint32_t mine_teleop_chassis_runtime_control_config_v1_size(void);
 uint32_t mine_teleop_chassis_runtime_control_config_v2_size(void);
+uint32_t mine_teleop_chassis_stop_context_v1_size(void);
 int mine_teleop_chassis_open(const char* can_interface);
 /* Versioned open used by current runtimes. Invalid size/torque is rejected
  * before ChassisControl or SocketCAN is touched. */
@@ -690,6 +758,10 @@ int mine_teleop_chassis_configure_runtime_control_v2(
  * latch and restores the PID gains supplied by the current open config. */
 int mine_teleop_chassis_clear_runtime_control_v1(
     struct MineTeleopChassisRuntimeControlResultV1* result);
+/* Sets the trusted origin for the next exported stop/disconnect/close action.
+ * The context is consumed once and does not itself actuate the vehicle. */
+int mine_teleop_chassis_set_stop_context_v1(
+    const struct MineTeleopChassisStopContextV1* context);
 int mine_teleop_chassis_emergency_stop(void);
 /* Start is accepted only while the selector is N, EPB is parked, speed is
  * zero, and the VCU reports manual state. */

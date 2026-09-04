@@ -952,7 +952,7 @@ int main(int argc, char** argv) {
         }
         mine_teleop::validate_chassis_bridge_abi(library_path);
         result["chassis_bridge_abi"] = {
-            {"version", 5},
+            {"version", 6},
             {"passed", true},
         };
       }

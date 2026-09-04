@@ -198,7 +198,9 @@ class NoFeedbackAdapter final : public mine_teleop::VehicleAdapter {
     return session_brake_pressure_limit;
   }
   void apply_control(const ControlCommand&) override { ++applied_commands; }
-  void apply_safe_stop(const mine_teleop::ControlOutput& output) override {
+  void apply_safe_stop(
+      const mine_teleop::ControlOutput& output,
+      mine_teleop::VehicleStopContext) override {
     last_safe_output = output;
     ++safe_stops;
   }
@@ -295,7 +297,9 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
     ++applied_commands;
   }
 
-  void apply_safe_stop(const mine_teleop::ControlOutput& output) override {
+  void apply_safe_stop(
+      const mine_teleop::ControlOutput& output,
+      mine_teleop::VehicleStopContext) override {
     ++safe_stop_attempts;
     if (safe_stop_throws) {
       throw std::runtime_error("adapter safe stop failed");
@@ -2636,12 +2640,84 @@ void test_control_service_bounds_telemetry_history() {
   expect(
       history.back().at("can_feedback").at("supported").get<bool>() == false,
       "mock telemetry incorrectly advertised measured CAN feedback");
+  expect(
+      history.back().at("stop_source").get<std::string>() == "none" &&
+          history.back().at("stop_reason").get<std::string>() == "none" &&
+          history.back().at("stop_sequence").get<std::uint64_t>() == 0,
+      "idle telemetry omitted or misreported stop provenance");
   const auto summary = service.summary();
   expect(summary.at("telemetry_count").get<std::uint64_t>() == total_samples, "telemetry total count was truncated");
   expect(
       summary.at("telemetry_retained_count").get<std::size_t>() == mine_teleop::kMaxVehicleTelemetryHistory,
       "telemetry retained count does not match the bounded history");
+
+  auto estop = command(
+      static_cast<std::uint64_t>(total_samples + 1),
+      static_cast<std::int64_t>(total_samples + 1));
+  estop.estop = true;
+  expect(
+      service.receive_command(
+          estop,
+          static_cast<std::int64_t>(total_samples + 1)).accepted,
+      "page ESTOP was rejected while checking telemetry provenance");
+  service.tick(static_cast<std::int64_t>(total_samples + 2));
+  const auto& stopped = service.telemetry_history().back();
+  expect(
+      stopped.at("stop_source").get<std::string>() == "page_request" &&
+          stopped.at("stop_reason").get<std::string>() == "operator_estop" &&
+          stopped.at("stop_sequence").get<std::uint64_t>() > 0,
+      "page ESTOP provenance did not reach vehicle telemetry");
   service.close();
+}
+
+void test_control_service_close_preserves_stop_provenance() {
+  const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  {
+    auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+    auto* adapter_view = adapter.get();
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    service.close({
+        mine_teleop::VehicleStopSource::SoftwareFault,
+        mine_teleop::VehicleStopReason::CriticalCameraFailed});
+    const auto telemetry = adapter_view->read_telemetry();
+    expect(
+        telemetry.estop && telemetry.stop_source == "software_fault" &&
+            telemetry.stop_reason == "critical_camera_failed" &&
+            telemetry.stop_sequence == 1,
+        "critical-camera close lost its software-fault stop provenance");
+  }
+  {
+    auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+    auto* adapter_view = adapter.get();
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    service.close({
+        mine_teleop::VehicleStopSource::SoftwareFault,
+        mine_teleop::VehicleStopReason::MediaPipelineFailed});
+    const auto telemetry = adapter_view->read_telemetry();
+    expect(
+        telemetry.estop && telemetry.stop_source == "software_fault" &&
+            telemetry.stop_reason == "media_pipeline_failed" &&
+            telemetry.stop_sequence == 1,
+        "media-pipeline close lost its software-fault stop provenance");
+  }
+  {
+    auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+    auto* adapter_view = adapter.get();
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    service.close();
+    const auto telemetry = adapter_view->read_telemetry();
+    expect(
+        telemetry.estop && telemetry.stop_source == "session_loss" &&
+            telemetry.stop_reason == "session_lost" &&
+            telemetry.stop_sequence == 1,
+        "ordinary service close no longer reports session-loss provenance");
+  }
 }
 
 void test_control_service_requires_feedback_before_actuation_but_allows_estop() {
@@ -3647,6 +3723,8 @@ int main() {
       {"control_service_applies_vehicle_hard_limits", test_control_service_applies_vehicle_hard_limits},
       {"control_service_applies_session_steering_limit", test_control_service_applies_session_steering_limit},
       {"control_service_bounds_telemetry_history", test_control_service_bounds_telemetry_history},
+      {"control_service_close_preserves_stop_provenance",
+       test_control_service_close_preserves_stop_provenance},
       {"control_service_requires_feedback_before_actuation_but_allows_estop", test_control_service_requires_feedback_before_actuation_but_allows_estop},
       {"fault_output_fails_safe", test_fault_output_fails_safe},
       {"native_signaling_webrtc_message_isolation", test_native_signaling_webrtc_message_isolation},

@@ -8,7 +8,11 @@ media_runtime="$repository_root/cpp/src/webrtc_media.cpp"
 vehicle_app="$repository_root/cpp/apps/mine_teleop.cpp"
 vehicle_launcher="$repository_root/cpp/apps/mine_teleop_launcher.cpp"
 vcu_bridge="$repository_root/deployments/chassis-control-bridge/chassis_control_bridge.cpp"
+vcu_header="$repository_root/cpp/include/mine_teleop/vcu.hpp"
+vcu_source="$repository_root/cpp/src/vcu.cpp"
+control_core="$repository_root/cpp/src/core.cpp"
 catalog="$repository_root/docs/24-vehicle-runtime-diagnostics.md"
+vehicle_deployer="$repository_root/scripts/deploy/deploy_vehicle_bundle.sh"
 
 require_text() {
   local file="$1"
@@ -88,6 +92,8 @@ control_message_block="$(sed -n '/  void handle_control_message(/,/  void send_v
 control_start_block="$(sed -n '/  \[\[nodiscard\]\] bool start_control_service()/,/  void configure_control_data_channel()/p' "$media_runtime")"
 control_channel_block="$(sed -n '/  void configure_control_data_channel()/,/  void tick_control_service()/p' "$media_runtime")"
 control_tick_block="$(sed -n '/  void tick_control_service()/,/  \[\[nodiscard\]\] std::string current_pipeline_error/p' "$media_runtime")"
+pipeline_fault_block="$(sed -n '/  void stop_control_for_pipeline_fault(/,/  void set_pipeline_error(/p' "$media_runtime")"
+critical_camera_block="$(sed -n '/  void inhibit_control_for_critical_camera(/,/  \[\[nodiscard\]\] bool critical_cameras_ready()/p' "$media_runtime")"
 
 for contract in \
   'control DataChannel open starts the VCU adapter|self->start_control_service()' \
@@ -105,6 +111,18 @@ for contract in \
   fi
 done
 require_text "$media_runtime" '!control_link_opened_this_attempt'
+if ! grep -F --quiet 'VehicleStopReason::MediaPipelineFailed' <<<"$pipeline_fault_block"; then
+  printf 'media/control isolation contract missing: media pipeline close provenance\n' >&2
+  exit 1
+fi
+if ! grep -F --quiet 'VehicleStopReason::CriticalCameraFailed' <<<"$critical_camera_block"; then
+  printf 'media/control isolation contract missing: critical camera close provenance\n' >&2
+  exit 1
+fi
+if ! grep -F --quiet 'VehicleStopReason::VcuStateFault' <<<"$control_tick_block"; then
+  printf 'media/control isolation contract missing: adapter runtime fault close provenance\n' >&2
+  exit 1
+fi
 # Profile and handshake callbacks must reject a stale DataChannel before they
 # can publish a rejection/status to the replacement channel. Ordinary control
 # has no response, so it may keep the identity check in its combined gate. The
@@ -189,9 +207,24 @@ for issue_code in \
   can_error_or_rtr_frame_received \
   can_rx_unrecognized_or_invalid \
   vcu_critical_feedback_timeout \
+  vcu_arming_feedback_timeout \
+  vcu_arming_feedback_timeout_recovered \
   socketcan_send_failed \
   vcu_tx_deadline_missed \
   vcu_handshake_gate_rejected \
+  vcu_handshake_revoked \
+  vcu_vmc_fault_code_changed \
+  vcu_stop_provenance_latched \
+  vcu_stop_provenance_cleared \
+  vcu_control_apply_timeout \
+  vcu_physical_emergency_latched \
+  vcu_arming_state_motion \
+  vcu_opposite_direction_motion \
+  vcu_hard_overspeed \
+  vcu_hard_overspeed_latched \
+  vcu_chassis_control_fault \
+  vcu_runtime_control_profile_inactive \
+  vcu_runtime_control_profile_limit_exceeded \
   vcu_drive_gear_change_moving_or_stale \
   vcu_control_runtime_unavailable \
   vcu_control_command_invalid \
@@ -199,6 +232,65 @@ for issue_code in \
   require_text "$vcu_bridge" "$issue_code"
   require_text "$catalog" "$issue_code"
 done
+
+for event_name in \
+  arming_feedback_timeout \
+  arming_feedback_timeout_recovered \
+  handshake_revoked \
+  vmc_fault_code_changed \
+  stop_provenance_latched \
+  stop_provenance_cleared; do
+  require_text "$vcu_bridge" "\"$event_name\""
+  require_text "$catalog" "$event_name"
+done
+
+for field in \
+  stop_source \
+  stop_reason \
+  stop_sequence; do
+  require_text "$vcu_bridge" "$field"
+  require_text "$control_core" "$field"
+  require_text "$catalog" "$field"
+done
+
+for source_name in \
+  page_disconnect \
+  page_request \
+  session_loss \
+  watchdog \
+  software_fault \
+  physical_estop; do
+  require_text "$control_core" "\"$source_name\""
+  require_text "$catalog" "$source_name"
+done
+
+require_text "$vcu_header" 'kWvcuDriverIntention2 = 0x18F6F5D0U'
+for decoded_field in \
+  vmc_fault_code \
+  parking_brake_switch \
+  brake_pedal_switch; do
+  require_text "$vcu_source" "$decoded_field"
+  require_text "$vcu_bridge" "$decoded_field"
+  require_text "$catalog" "$decoded_field"
+done
+require_text "$catalog" '0x18F2F5D0'
+require_text "$catalog" '0x18F6F5D0'
+
+# A bundle with an ABI-incompatible bridge must fail before the deployer
+# removes the currently installed runtime. The installed and override-config
+# checks must keep using the same explicit bridge gate.
+require_text "$vehicle_deployer" '"$REMOTE_DIR/.extracting/bin/mine-teleop-run" config-check'
+require_text "$vehicle_deployer" '"version":6'
+if [[ "$(grep -F -c -- '--chassis-bridge-library' "$vehicle_deployer")" -lt 3 ]]; then
+  printf 'vehicle deployment contract failed: ABI gate is missing from one or more config checks\n' >&2
+  exit 1
+fi
+preflight_line="$(grep -n -m1 -F '"$REMOTE_DIR/.extracting/bin/mine-teleop-run" config-check' "$vehicle_deployer" | cut -d: -f1)"
+replacement_line="$(grep -n -m1 -F 'rm -rf "$REMOTE_DIR/bin" "$REMOTE_DIR/lib"' "$vehicle_deployer" | cut -d: -f1)"
+if [[ -z "$preflight_line" || -z "$replacement_line" || "$preflight_line" -ge "$replacement_line" ]]; then
+  printf 'vehicle deployment contract failed: ABI preflight does not precede installed runtime replacement\n' >&2
+  exit 1
+fi
 
 for issue_code in \
   runtime_log_ready \

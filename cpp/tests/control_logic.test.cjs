@@ -737,6 +737,45 @@ test('ESTOP presentation distinguishes local and vehicle telemetry states', () =
   assert.equal(vehicleOnly.severity, 'critical');
   assert.match(vehicleOnly.banner, /不是由本页面请求/);
 
+  const pageDisconnect = logic.deriveEstopPresentation(
+      false, true, 'page_disconnect', 'vcu_handshake_disconnect');
+  assert.equal(pageDisconnect.kind, 'page_disconnect');
+  assert.equal(pageDisconnect.severity, 'warn');
+  assert.match(pageDisconnect.banner, /重新确认参数并申请握手/);
+  assert.doesNotMatch(pageDisconnect.banner, /不是由本页面请求/);
+
+  const pageRequest = logic.deriveEstopPresentation(
+      false, true, 'page_request', 'operator_estop');
+  assert.equal(pageRequest.kind, 'page_request');
+  assert.match(pageRequest.banner, /控制页面急停请求/);
+  assert.doesNotMatch(pageRequest.banner, /不是由本页面请求/);
+
+  const sessionLoss = logic.deriveEstopPresentation(
+      false, true, 'session_loss', 'control_session_closed');
+  assert.equal(sessionLoss.kind, 'session_loss');
+  assert.match(sessionLoss.banner, /控制会话丢失/);
+
+  const watchdog = logic.deriveEstopPresentation(
+      false, true, 'watchdog', 'control_apply_timeout');
+  assert.equal(watchdog.kind, 'watchdog');
+  assert.match(watchdog.banner, /watchdog/);
+
+  const softwareFault = logic.deriveEstopPresentation(
+      false, true, 'software_fault', 'can_receive_failed');
+  assert.equal(softwareFault.kind, 'software_fault');
+  assert.match(softwareFault.banner, /软件故障/);
+
+  const physicalEstop = logic.deriveEstopPresentation(
+      false, true, 'physical_estop', 'physical_emergency_switch');
+  assert.equal(physicalEstop.kind, 'physical_estop');
+  assert.match(physicalEstop.banner, /物理急停/);
+
+  const physicalOverridesLocal = logic.deriveEstopPresentation(
+      true, true, 'physical_estop', 'physical_emergency_switch');
+  assert.equal(physicalOverridesLocal.kind, 'physical_estop');
+  assert.match(physicalOverridesLocal.banner, /物理急停/);
+  assert.doesNotMatch(physicalOverridesLocal.banner, /本页面急停/);
+
   assert.equal(logic.deriveEstopPresentation(false, false).visible, false);
 });
 

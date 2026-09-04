@@ -421,17 +421,19 @@ PID，成功 ACK 的 `applied_revision` 必须与请求 `seq` 相同。反馈超
 `control_limits.read_only_control_safety` 只读上报。
 
 启用上述配置时必须同步升级车端 runtime 和 ChassisControl bridge：当前 runtime
-要求 ABI version 5、完全一致的 V4 配置结构大小、兼容 V3/V2 大小查询以及
+要求 ABI version 6、完全一致的 V4 配置结构大小、V3/V2 大小查询以及
 `mine_teleop_chassis_open_v4`，并强制要求 runtime-control V1/V2 配置结构分别为
 88/96 字节、两个 size query、两个 configure 符号以及
-`mine_teleop_chassis_clear_runtime_control_v1`。V1 仅接受旧 profile version 2 并沿用
+`mine_teleop_chassis_clear_runtime_control_v1`；stop-context V1 还必须提供 16 字节
+size query 与 `mine_teleop_chassis_set_stop_context_v1`，遥测直接携带
+`stop_source`、`stop_reason` 和单调递增的 `stop_sequence`。V1 仅接受旧 profile version 2 并沿用
 open-time 升扭斜率；V2 接受 profile version 3 并携带会话斜率。V4 在 V3 的普通制动压力上限后新增
 单电机加扭斜率启动默认值；旧 bridge 不会静默忽略该语义，而会在任何 CAN 初始化前因 ABI
 不匹配而启动失败。新 bridge 仍为直接 ABI 调用方和兼容性测试保留
 `mine_teleop_chassis_open_v1`、`mine_teleop_chassis_open_v2` 与
 `mine_teleop_chassis_open_v3`；V1 禁用正牵引并采用默认 `800 ms` 超时，V2 保留负值
 表示减速度的旧语义，V3 没有斜率字段，因此直接 PID 转矩不增加额外升扭斜率。旧 vehicle-agent 会被全局 ABI
-version 5 门禁明确拒绝，不能依靠这些入口加载新 bridge；runtime 与 bridge 必须原子
+version 6 门禁明确拒绝，ABI 5 bridge 也不会被加载；runtime 与 bridge 必须原子
 成套升级。
 进入 Ready 后，若连续
 `control.control_timeout_ms` 没有成功 apply，bridge 会撤销车速请求、将转矩置零并施加
@@ -649,9 +651,11 @@ control:
 PID、清零八路电机扭矩，同时保留转向。页面修改参数会先清空输入并要求车端确认，
 标准 `/api/control` 只准备 0..1 的模拟制动标量；物理压力始终由车端当前已确认的
 会话 profile 还原。
-默认 profile 只在驻车准入已满足（或车端明确报告 mock/无需握手且 adapter ready）后，
-每个控制链路 generation 自动提交一次；若车端拒绝，后续状态消息不会自动换新序号重试，
-必须由驾驶员显式确认后再次提交。
+页面只把这些默认值填入“实车调试限幅”窗口，不会自动提交 profile。新直接转矩语义下
+`PID 输出 × 单电机最大转矩`，旧 Kp/Ki 与 `300 Nm` 默认组合可能产生明显转矩阶跃；
+驾驶员必须在驻车准入已满足（或车端明确报告 mock/无需握手且 adapter ready）后打开
+窗口、逐项核对、勾选安全确认并显式发送。断开、故障或车端拒绝后也不会自动重提，
+必须再次人工确认；未获 ACK 时握手和普通驾驶保持禁止。
 对真实 VCU adapter，首次 profile、提高目标车速/转矩，以及修改任一转向、PID 或制动
 压力字段（即使降低）都必须先满足 N 挡、有效零速、电子驻车已拉起，并处于
 `standby/disarmed`；浏览器预检、core 与 bridge 门禁使用同一口径。

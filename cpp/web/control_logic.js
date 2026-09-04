@@ -881,9 +881,28 @@
     return {accepted: true, lastSequence: candidate, gap: Math.max(0, candidate - last - 1)};
   }
 
-  function deriveEstopPresentation(localLatched, vehicleActive) {
+  function deriveEstopPresentation(
+      localLatched,
+      vehicleActive,
+      stopSourceValue = '',
+      stopReasonValue = '') {
     const local = Boolean(localLatched);
     const vehicle = Boolean(vehicleActive);
+    const stopSource = String(stopSourceValue || '').trim();
+    const stopReason = String(stopReasonValue || '').trim();
+    const reasonSuffix = stopReason ? `（${stopReason}）` : '';
+    // Physical emergency is authoritative even when a page ESTOP was already
+    // latched; the bridge deliberately allows this source to supersede an
+    // earlier software stop so the operator sees the higher-priority cause.
+    if (vehicle && stopSource === 'physical_estop') {
+      return {
+        kind: 'physical_estop',
+        visible: true,
+        severity: 'critical',
+        banner: `车辆物理急停已触发${reasonSuffix}；请立即核实现场并按现场流程复位。`,
+        alert: `车辆物理急停已触发${reasonSuffix}；请立即核实现场`,
+      };
+    }
     if (local && vehicle) {
       return {
         kind: 'local_confirmed',
@@ -903,6 +922,51 @@
       };
     }
     if (vehicle) {
+      if (stopSource === 'page_disconnect') {
+        return {
+          kind: 'page_disconnect',
+          visible: true,
+          severity: 'warn',
+          banner: `车端已按页面断开 VCU 握手请求进入安全停车${reasonSuffix}；重新连接后请重新确认参数并申请握手。`,
+          alert: `页面断开触发车端安全停车${reasonSuffix}；恢复驾驶前需要重新申请 VCU 握手`,
+        };
+      }
+      if (stopSource === 'page_request') {
+        return {
+          kind: 'page_request',
+          visible: true,
+          severity: 'critical',
+          banner: `车端已执行控制页面急停请求${reasonSuffix}；车辆必须本地确认后才能复位。`,
+          alert: `控制页面请求的车辆急停已由车端确认${reasonSuffix}`,
+        };
+      }
+      if (stopSource === 'session_loss') {
+        return {
+          kind: 'session_loss',
+          visible: true,
+          severity: 'critical',
+          banner: `控制会话丢失，车端已主动安全停车${reasonSuffix}；请确认链路后重新连接。`,
+          alert: `控制会话丢失触发车端安全停车${reasonSuffix}`,
+        };
+      }
+      if (stopSource === 'watchdog') {
+        return {
+          kind: 'watchdog',
+          visible: true,
+          severity: 'critical',
+          banner: `车端 watchdog 已触发安全停车${reasonSuffix}；请检查控制指令时序后重新连接。`,
+          alert: `车端 watchdog 触发安全停车${reasonSuffix}`,
+        };
+      }
+      if (stopSource === 'software_fault') {
+        return {
+          kind: 'software_fault',
+          visible: true,
+          severity: 'critical',
+          banner: `车端软件故障已触发安全停车${reasonSuffix}；请先检查车端日志再复位。`,
+          alert: `车端软件故障触发安全停车${reasonSuffix}`,
+        };
+      }
       return {
         kind: 'vehicle_only',
         visible: true,
