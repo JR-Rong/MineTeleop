@@ -234,7 +234,8 @@ scripts/test/check_cpp_ubuntu_bundle.sh "$vehicle_archive"
 
 该检查会在干净的 Ubuntu 22.04 amd64 容器内同时加载随包的 chassis bridge，
 运行 `config-check --chassis-bridge-library ...`，并明确要求输出
-`chassis_bridge_abi.version=4`。ABI 版本、V4 配置结构大小或
+`chassis_bridge_abi.version=5`。ABI 版本、V4 配置结构大小、runtime-control
+V1/V2 的 88/96 字节结构大小或
 `mine_teleop_chassis_open_v4` 任一不匹配都会使安装包复验失败；runtime 与 bridge
 必须成套发布。
 

@@ -48,9 +48,10 @@ snapshot containing target speed, maximum per-motor torque, maximum ordinary
 EHB pressure, service and hard-brake pressure, maximum steering, the five
 speed-PID settings, and the motor torque rise rate. The vehicle applies and
 acknowledges
-that profile before it permits the VCU handshake. The profile can only reduce
-the immutable vehicle-side YAML limits and is cleared on disconnect, authority
-or session replacement, adapter-owned safety stop, and fault. First apply,
+that profile before it permits the VCU handshake. Speed, torque, brake, and
+steering values can only reduce the immutable vehicle-side YAML limits; PID and
+rise-rate values remain inside their advertised calibration ranges. The profile
+is cleared on disconnect, authority or session replacement, adapter-owned safety stop, and fault. First apply,
 steering/PID/brake/rise-rate changes, and target/torque increases require fresh
 parked-N
 feedback in Standby or Disarmed. A clear withdraws traction, resets the PID,
@@ -84,8 +85,8 @@ movement beyond that band, including a material target decrease, resets it.
 `ADU_Tx_VehSpdReq` is intentionally always encoded as `0 km/h / Q=0`; the
 runtime does not depend on the unverified VCU target-speed loop. Any brake
 zeros throttle and target speed, resets the PID, and forces all eight motor
-torques to zero while retaining steering. ABI V4 preserves the V3 physical
-brake-pressure contract and transports the optional rising-torque rate at open;
+torques to zero while retaining steering. ABI V5 preserves the V4 open-config
+contract, including the optional rising-torque rate;
 the acknowledged physical brake pressure still travels through the apply call.
 The bridge invokes ChassisControl for steering, then overwrites all eight EHB
 channels with the direct pressure quantized to 0.1 bar. No
@@ -143,16 +144,18 @@ explicit new parallel-handshake request.
 
 Upgrade the vehicle-agent runtime and this bridge atomically. The current
 runtime requires
-ABI version 4, exact V4 and legacy V3/V2 struct-size matches, and
+ABI version 5, exact V4 and legacy V3/V2 open-config struct-size matches, and
 `mine_teleop_chassis_open_v4` plus the additive
 `mine_teleop_chassis_apply_state_v2`; the runtime queries these capabilities before any CAN
 initialization. A V1/V2-only bridge fails closed instead of silently ignoring the
 physical ordinary-brake ceiling or interpreting the negative apply value as
 legacy deceleration.
-ABI version 4 also requires the runtime-control V1 size query plus
-`mine_teleop_chassis_configure_runtime_control_v1` and
+ABI version 5 also requires the immutable 88-byte runtime-control V1 and
+96-byte runtime-control V2 size queries, both versioned configure symbols, and
 `mine_teleop_chassis_clear_runtime_control_v1`; missing symbols or a wrong POD
-size are rejected before SocketCAN initialization.
+size are rejected before SocketCAN initialization. V1 accepts only legacy
+profile version 2 and retains the open-time rise rate. V2 accepts profile
+version 3 and carries the session rise rate.
 `apply_state_v2` returns a fixed-size POD result in the same locked call. It
 distinguishes the D/R moving-or-stale gate from other rejected applies without
 exporting bridge log strings or requiring a racy last-error getter. The legacy
@@ -165,7 +168,7 @@ zero also means immediate output.
 V1 deliberately disables traction because it cannot supply a validated
 local-PID safety configuration; V2 retains its legacy negative-deceleration
 apply semantics. These exports do not let an older vehicle-agent pass the
-global ABI-version-4 startup gate.
+global ABI-version-5 startup gate.
 
 Validate before service startup:
 

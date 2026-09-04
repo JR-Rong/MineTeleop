@@ -23,11 +23,10 @@
 因此是 `.log` 而不是严格 JSONL；默认单文件 64 MiB、保留 5 份，可分别通过
 `MINE_TELEOP_VEHICLE_RUNTIME_LOG_MAX_BYTES` 和
 `MINE_TELEOP_VEHICLE_RUNTIME_LOG_ROTATIONS` 覆盖。
-例外：vendor ChassisControl 每个控制周期经 `UpdateVehicleState` →
-`SendCanMessage` 打印的全量状态 dump（其 log_printf 格式的
-`[YYYY-MM-DD HH:MM:SS.mmm] [级别] [pid] [tag]` 行，可带 ANSI 颜色）只保留在终端，
-**不写入该落盘日志**——debug/info 级别的这类行会被 launcher 按行过滤；vendor 的
-warning/error/critical 行与全部结构化 runtime 诊断仍照常记录。VCU
+例外：可识别的 vendor ChassisControl 输出只保留在终端，**不写入该落盘日志**：包括
+`UpdateVehicleState` wrapper 每个控制周期打印的完整裸行，以及 vendor `log_printf` 的
+`[YYYY-MM-DD HH:MM:SS.mmm] [级别] [pid] [tag]` 格式行（可带 ANSI 颜色）。过滤按完整
+行匹配；同名但带诊断内容的非 vendor 行与 Mine Teleop 结构化 runtime 诊断仍照常记录。VCU
 的启动可见性事件也进入该 runtime 日志；协议细节与高频 CAN 证据写入
 `MINE_TELEOP_VCU_LOG_PATH`（默认
 `/var/log/mine-teleop/vcu-can.jsonl`）。

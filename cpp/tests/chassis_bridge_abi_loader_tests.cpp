@@ -17,9 +17,10 @@ void expect(bool condition, std::string_view message) {
 std::string expected_mismatch(
     std::uint32_t actual_version,
     std::uint32_t actual_v4_size,
-    std::uint32_t actual_runtime_control_size) {
+    std::uint32_t actual_runtime_control_v1_size,
+    std::uint32_t actual_runtime_control_v2_size) {
   return
-      "chassis bridge ABI mismatch: expected version 4 and V4 config size " +
+      "chassis bridge ABI mismatch: expected version 5 and V4 config size " +
       std::to_string(sizeof(MineTeleopChassisOpenConfigV4)) +
       ", got version " + std::to_string(actual_version) + " and size " +
       std::to_string(actual_v4_size) + "; legacy V3 size expected " +
@@ -31,21 +32,27 @@ std::string expected_mismatch(
       "; runtime control V1 size expected " +
       std::to_string(sizeof(MineTeleopChassisRuntimeControlConfigV1)) +
       ", got " +
-      std::to_string(actual_runtime_control_size);
+      std::to_string(actual_runtime_control_v1_size) +
+      "; runtime control V2 size expected " +
+      std::to_string(sizeof(MineTeleopChassisRuntimeControlConfigV2)) +
+      ", got " +
+      std::to_string(actual_runtime_control_v2_size);
 }
 
 void expect_rejected(
     const std::filesystem::path& library_path,
     std::uint32_t actual_version,
     std::uint32_t actual_v4_size,
-    std::uint32_t actual_runtime_control_size) {
+    std::uint32_t actual_runtime_control_v1_size,
+    std::uint32_t actual_runtime_control_v2_size) {
   expect(
       std::filesystem::is_regular_file(library_path),
       "ABI fixture shared library is missing");
   const auto expected = expected_mismatch(
       actual_version,
       actual_v4_size,
-      actual_runtime_control_size);
+      actual_runtime_control_v1_size,
+      actual_runtime_control_v2_size);
   try {
     mine_teleop::validate_chassis_bridge_abi(library_path);
   } catch (const std::runtime_error& error) {
@@ -75,8 +82,9 @@ void expect_missing_apply_v2_rejected(
   throw std::runtime_error("V4 bridge without apply_state_v2 was accepted");
 }
 
-void expect_missing_runtime_control_rejected(
-    const std::filesystem::path& library_path) {
+void expect_missing_symbol_rejected(
+    const std::filesystem::path& library_path,
+    std::string_view symbol) {
   expect(
       std::filesystem::is_regular_file(library_path),
       "missing-runtime-control ABI fixture shared library is missing");
@@ -85,14 +93,13 @@ void expect_missing_runtime_control_rejected(
   } catch (const std::runtime_error& error) {
     expect(
         std::string_view(error.what()).find(
-            "dynamic library is missing required symbol "
-            "mine_teleop_chassis_configure_runtime_control_v1") !=
-            std::string_view::npos,
-        "V4 bridge without runtime configuration was rejected for an unexpected reason");
+            std::string("dynamic library is missing required symbol ") +
+            std::string(symbol)) != std::string_view::npos,
+        "bridge with a missing capability was rejected for an unexpected reason");
     return;
   }
   throw std::runtime_error(
-      "V4 bridge without runtime configuration was accepted");
+      "bridge with a missing capability was accepted");
 }
 
 }  // namespace
@@ -100,29 +107,48 @@ void expect_missing_runtime_control_rejected(
 int main(int argc, char** argv) {
   try {
     expect(
-        argc == 6,
-        "expected legacy V3, malformed V4, and three capability/size V4 fixture paths");
-    expect_rejected(
-        argv[1],
-        3U,
-        static_cast<std::uint32_t>(sizeof(MineTeleopChassisOpenConfigV4)),
-        static_cast<std::uint32_t>(
-            sizeof(MineTeleopChassisRuntimeControlConfigV1)));
+        argc == 9,
+        "expected two legacy V4 and six capability/size V5 fixture paths");
+    expect_missing_symbol_rejected(
+        argv[1], "mine_teleop_chassis_runtime_control_config_v2_size");
     expect_rejected(
         argv[2],
         4U,
+        static_cast<std::uint32_t>(sizeof(MineTeleopChassisOpenConfigV4)),
+        static_cast<std::uint32_t>(
+            sizeof(MineTeleopChassisRuntimeControlConfigV1)),
+        static_cast<std::uint32_t>(
+            sizeof(MineTeleopChassisRuntimeControlConfigV2)));
+    expect_rejected(
+        argv[3],
+        5U,
         static_cast<std::uint32_t>(
             sizeof(MineTeleopChassisOpenConfigV4) - 1U),
         static_cast<std::uint32_t>(
-            sizeof(MineTeleopChassisRuntimeControlConfigV1)));
-    expect_missing_apply_v2_rejected(argv[3]);
-    expect_missing_runtime_control_rejected(argv[4]);
+            sizeof(MineTeleopChassisRuntimeControlConfigV1)),
+        static_cast<std::uint32_t>(
+            sizeof(MineTeleopChassisRuntimeControlConfigV2)));
+    expect_missing_apply_v2_rejected(argv[4]);
+    expect_missing_symbol_rejected(
+        argv[5], "mine_teleop_chassis_configure_runtime_control_v1");
+    expect_missing_symbol_rejected(
+        argv[6], "mine_teleop_chassis_configure_runtime_control_v2");
     expect_rejected(
-        argv[5],
-        4U,
+        argv[7],
+        5U,
         static_cast<std::uint32_t>(sizeof(MineTeleopChassisOpenConfigV4)),
         static_cast<std::uint32_t>(
-            sizeof(MineTeleopChassisRuntimeControlConfigV1) - 1U));
+            sizeof(MineTeleopChassisRuntimeControlConfigV1) - 1U),
+        static_cast<std::uint32_t>(
+            sizeof(MineTeleopChassisRuntimeControlConfigV2)));
+    expect_rejected(
+        argv[8],
+        5U,
+        static_cast<std::uint32_t>(sizeof(MineTeleopChassisOpenConfigV4)),
+        static_cast<std::uint32_t>(
+            sizeof(MineTeleopChassisRuntimeControlConfigV1)),
+        static_cast<std::uint32_t>(
+            sizeof(MineTeleopChassisRuntimeControlConfigV2) - 1U));
     std::cout << "chassis_bridge_abi_loader_tests=passed\n";
     return 0;
   } catch (const std::exception& error) {

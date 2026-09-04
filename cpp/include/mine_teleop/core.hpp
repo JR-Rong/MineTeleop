@@ -619,7 +619,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   using OpenV4Fn = int (*)(const void*);
   using ApplyFn = int (*)(int, double, double, const double*, int);
   using ApplyV2Fn = int (*)(int, double, double, const double*, int, void*);
-  using ConfigureRuntimeControlFn = int (*)(const void*, void*);
+  using ConfigureRuntimeControlV2Fn = int (*)(const void*, void*);
   using ClearRuntimeControlFn = int (*)(void*);
   using StopFn = int (*)();
   using HandshakeFn = int (*)();
@@ -631,7 +631,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   OpenV4Fn open_v4_fn_{nullptr};
   ApplyFn apply_fn_{nullptr};
   ApplyV2Fn apply_v2_fn_{nullptr};
-  ConfigureRuntimeControlFn configure_runtime_control_fn_{nullptr};
+  ConfigureRuntimeControlV2Fn configure_runtime_control_v2_fn_{nullptr};
   ClearRuntimeControlFn clear_runtime_control_fn_{nullptr};
   StopFn stop_fn_{nullptr};
   HandshakeFn request_handshake_fn_{nullptr};

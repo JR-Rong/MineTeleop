@@ -353,8 +353,10 @@ if(MINE_TELEOP_BUILD_TESTS)
     enable_language(C)
 
     function(mine_teleop_add_chassis_abi_fixture
-        target version wrong_v4_size has_apply_v2 has_runtime_control
-        wrong_runtime_control_size)
+        target version wrong_v4_size has_apply_v2 has_runtime_control_v1
+        has_runtime_control_v2_size_query has_runtime_control_v2
+        wrong_runtime_control_v1_size
+        wrong_runtime_control_v2_size)
       add_library(${target} SHARED
         cpp/tests/fixtures/chassis-bridge-abi/chassis_bridge_abi_fixture.c
       )
@@ -366,8 +368,11 @@ if(MINE_TELEOP_BUILD_TESTS)
           MINE_TELEOP_TEST_CHASSIS_ABI_VERSION=${version}
           MINE_TELEOP_TEST_CHASSIS_WRONG_V4_SIZE=${wrong_v4_size}
           MINE_TELEOP_TEST_CHASSIS_HAS_APPLY_V2=${has_apply_v2}
-          MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL=${has_runtime_control}
-          MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_SIZE=${wrong_runtime_control_size}
+          MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V1=${has_runtime_control_v1}
+          MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V2_SIZE_QUERY=${has_runtime_control_v2_size_query}
+          MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V2=${has_runtime_control_v2}
+          MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_V1_SIZE=${wrong_runtime_control_v1_size}
+          MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_V2_SIZE=${wrong_runtime_control_v2_size}
       )
       set_target_properties(${target} PROPERTIES
         C_STANDARD 11
@@ -377,15 +382,21 @@ if(MINE_TELEOP_BUILD_TESTS)
     endfunction()
 
     mine_teleop_add_chassis_abi_fixture(
-      mine-teleop-chassis-abi-v3-fixture 3U 0 1 1 0)
+      mine-teleop-chassis-abi-v4-legacy-fixture 4U 0 1 1 0 0 0 0)
     mine_teleop_add_chassis_abi_fixture(
-      mine-teleop-chassis-abi-v4-wrong-size-fixture 4U 1 1 1 0)
+      mine-teleop-chassis-abi-v4-complete-fixture 4U 0 1 1 1 1 0 0)
     mine_teleop_add_chassis_abi_fixture(
-      mine-teleop-chassis-abi-v4-missing-apply-v2-fixture 4U 0 0 1 0)
+      mine-teleop-chassis-abi-v5-wrong-size-fixture 5U 1 1 1 1 1 0 0)
     mine_teleop_add_chassis_abi_fixture(
-      mine-teleop-chassis-abi-v4-missing-runtime-control-fixture 4U 0 1 0 0)
+      mine-teleop-chassis-abi-v5-missing-apply-v2-fixture 5U 0 0 1 1 1 0 0)
     mine_teleop_add_chassis_abi_fixture(
-      mine-teleop-chassis-abi-v4-wrong-runtime-size-fixture 4U 0 1 1 1)
+      mine-teleop-chassis-abi-v5-missing-runtime-control-v1-fixture 5U 0 1 0 1 1 0 0)
+    mine_teleop_add_chassis_abi_fixture(
+      mine-teleop-chassis-abi-v5-missing-runtime-control-v2-fixture 5U 0 1 1 1 0 0 0)
+    mine_teleop_add_chassis_abi_fixture(
+      mine-teleop-chassis-abi-v5-wrong-runtime-v1-size-fixture 5U 0 1 1 1 1 1 0)
+    mine_teleop_add_chassis_abi_fixture(
+      mine-teleop-chassis-abi-v5-wrong-runtime-v2-size-fixture 5U 0 1 1 1 1 0 1)
 
     add_executable(mine-teleop-chassis-bridge-abi-loader-tests
       cpp/tests/chassis_bridge_abi_loader_tests.cpp
@@ -397,21 +408,27 @@ if(MINE_TELEOP_BUILD_TESTS)
       PRIVATE mine_teleop_runtime
     )
     add_dependencies(mine-teleop-chassis-bridge-abi-loader-tests
-      mine-teleop-chassis-abi-v3-fixture
-      mine-teleop-chassis-abi-v4-wrong-size-fixture
-      mine-teleop-chassis-abi-v4-missing-apply-v2-fixture
-      mine-teleop-chassis-abi-v4-missing-runtime-control-fixture
-      mine-teleop-chassis-abi-v4-wrong-runtime-size-fixture
+      mine-teleop-chassis-abi-v4-legacy-fixture
+      mine-teleop-chassis-abi-v4-complete-fixture
+      mine-teleop-chassis-abi-v5-wrong-size-fixture
+      mine-teleop-chassis-abi-v5-missing-apply-v2-fixture
+      mine-teleop-chassis-abi-v5-missing-runtime-control-v1-fixture
+      mine-teleop-chassis-abi-v5-missing-runtime-control-v2-fixture
+      mine-teleop-chassis-abi-v5-wrong-runtime-v1-size-fixture
+      mine-teleop-chassis-abi-v5-wrong-runtime-v2-size-fixture
     )
     mine_teleop_enable_warnings(mine-teleop-chassis-bridge-abi-loader-tests)
     add_test(
       NAME mine-teleop-chassis-bridge-abi-loader-tests
       COMMAND mine-teleop-chassis-bridge-abi-loader-tests
-        $<TARGET_FILE:mine-teleop-chassis-abi-v3-fixture>
-        $<TARGET_FILE:mine-teleop-chassis-abi-v4-wrong-size-fixture>
-        $<TARGET_FILE:mine-teleop-chassis-abi-v4-missing-apply-v2-fixture>
-        $<TARGET_FILE:mine-teleop-chassis-abi-v4-missing-runtime-control-fixture>
-        $<TARGET_FILE:mine-teleop-chassis-abi-v4-wrong-runtime-size-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v4-legacy-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v4-complete-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v5-wrong-size-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v5-missing-apply-v2-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v5-missing-runtime-control-v1-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v5-missing-runtime-control-v2-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v5-wrong-runtime-v1-size-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v5-wrong-runtime-v2-size-fixture>
     )
 
     # The production bridge links against the field-only ChassisControl

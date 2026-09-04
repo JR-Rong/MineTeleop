@@ -1083,11 +1083,40 @@ class BridgeRuntime {
     return MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE;
   }
 
-  std::uint32_t configure_runtime_control(
+  std::uint32_t configure_runtime_control_v1(
       const MineTeleopChassisRuntimeControlConfigV1& config,
+      std::uint64_t& applied_revision) {
+    return configure_runtime_control(
+        config,
+        MINE_TELEOP_CHASSIS_LEGACY_SESSION_CONTROL_PROFILE_VERSION,
+        false,
+        0.0,
+        applied_revision);
+  }
+
+  std::uint32_t configure_runtime_control_v2(
+      const MineTeleopChassisRuntimeControlConfigV2& config,
+      std::uint64_t& applied_revision) {
+    return configure_runtime_control(
+        config,
+        MINE_TELEOP_CHASSIS_SESSION_CONTROL_PROFILE_VERSION,
+        true,
+        config.motor_torque_rise_rate_nm_per_s,
+        applied_revision);
+  }
+
+  template <typename Config>
+  std::uint32_t configure_runtime_control(
+      const Config& config,
+      std::uint32_t expected_profile_version,
+      bool has_session_rise_rate,
+      double session_rise_rate_nm_per_s,
       std::uint64_t& applied_revision) {
     std::lock_guard<std::mutex> lock(mutex_);
     applied_revision = 0;
+    const double motor_torque_rise_rate_nm_per_s = has_session_rise_rate
+        ? session_rise_rate_nm_per_s
+        : open_speed_control_.motor_torque_rise_rate_nm_per_s;
     const MineTeleopChassisSpeedPidConfig pid{
         config.speed_pid_kp,
         config.speed_pid_ki,
@@ -1097,9 +1126,8 @@ class BridgeRuntime {
     if (!running_.load() || io_error_ != 0) {
       return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_RUNTIME_UNAVAILABLE;
     }
-    if (config.struct_size != sizeof(MineTeleopChassisRuntimeControlConfigV1) ||
-        config.profile_version !=
-            MINE_TELEOP_CHASSIS_SESSION_CONTROL_PROFILE_VERSION ||
+    if (config.struct_size != sizeof(Config) ||
+        config.profile_version != expected_profile_version ||
         config.profile_revision == 0 || config.reserved != 0U ||
         !std::isfinite(config.target_speed_limit_mps) ||
         config.target_speed_limit_mps < 0.0 ||
@@ -1114,9 +1142,9 @@ class BridgeRuntime {
         config.max_steering_request < 0.0 ||
         config.max_steering_request >
             MINE_TELEOP_CHASSIS_MAX_STEERING_REQUEST ||
-        !std::isfinite(config.motor_torque_rise_rate_nm_per_s) ||
-        config.motor_torque_rise_rate_nm_per_s < 0.0 ||
-        config.motor_torque_rise_rate_nm_per_s >
+        !std::isfinite(motor_torque_rise_rate_nm_per_s) ||
+        motor_torque_rise_rate_nm_per_s < 0.0 ||
+        motor_torque_rise_rate_nm_per_s >
             MINE_TELEOP_CHASSIS_MAX_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND ||
         !mine_teleop_chassis_speed_pid_config_is_valid(&pid)) {
       return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_ARGUMENTS_INVALID;
@@ -1136,7 +1164,7 @@ class BridgeRuntime {
     // Torque-rise shaping changes alter traction dynamics the same way PID
     // gain changes do, so they share the parking gate.
     const bool torque_shaping_changed =
-        config.motor_torque_rise_rate_nm_per_s !=
+        motor_torque_rise_rate_nm_per_s !=
         speed_control_.motor_torque_rise_rate_nm_per_s;
     const bool requires_parking =
         !runtime_control_.active || pid_changed || torque_shaping_changed ||
@@ -1167,11 +1195,11 @@ class BridgeRuntime {
     next.max_brake_pressure_bar = config.max_brake_pressure_bar;
     next.max_steering_request = config.max_steering_request;
     next.motor_torque_rise_rate_nm_per_s =
-        config.motor_torque_rise_rate_nm_per_s;
+        motor_torque_rise_rate_nm_per_s;
     auto next_speed_control = speed_control_;
     next_speed_control.pid = pid;
     next_speed_control.motor_torque_rise_rate_nm_per_s =
-        config.motor_torque_rise_rate_nm_per_s;
+        motor_torque_rise_rate_nm_per_s;
 
     withdraw_latest_traction_locked();
     latest_intent_.target_speed_mps = 0.0;
@@ -2695,7 +2723,7 @@ int open_bridge(
 
 }  // namespace
 
-extern "C" std::uint32_t mine_teleop_chassis_abi_version() { return 4U; }
+extern "C" std::uint32_t mine_teleop_chassis_abi_version() { return 5U; }
 
 extern "C" std::uint32_t mine_teleop_chassis_open_config_v2_size() {
   return static_cast<std::uint32_t>(sizeof(MineTeleopChassisOpenConfigV2));
@@ -2713,6 +2741,12 @@ extern "C" std::uint32_t
 mine_teleop_chassis_runtime_control_config_v1_size() {
   return static_cast<std::uint32_t>(
       sizeof(MineTeleopChassisRuntimeControlConfigV1));
+}
+
+extern "C" std::uint32_t
+mine_teleop_chassis_runtime_control_config_v2_size() {
+  return static_cast<std::uint32_t>(
+      sizeof(MineTeleopChassisRuntimeControlConfigV2));
 }
 
 extern "C" int mine_teleop_chassis_open(const char* can_interface) {
@@ -2942,11 +2976,13 @@ int runtime_control_result_code(std::uint32_t issue_id) noexcept {
   return -3;
 }
 
-}  // namespace
-
-extern "C" int mine_teleop_chassis_configure_runtime_control_v1(
-    const MineTeleopChassisRuntimeControlConfigV1* config,
-    MineTeleopChassisRuntimeControlResultV1* result) {
+template <typename Config>
+int configure_runtime_control_entrypoint(
+    const Config* config,
+    MineTeleopChassisRuntimeControlResultV1* result,
+    std::uint32_t (BridgeRuntime::*configure)(
+        const Config&,
+        std::uint64_t&)) noexcept {
   if (result == nullptr) return -1;
   finish_runtime_control(
       result,
@@ -2968,7 +3004,7 @@ extern "C" int mine_teleop_chassis_configure_runtime_control_v1(
     }
     std::uint64_t applied_revision = 0;
     const auto issue_id =
-        g_runtime->configure_runtime_control(*config, applied_revision);
+        ((*g_runtime).*configure)(*config, applied_revision);
     return finish_runtime_control(
         result,
         runtime_control_result_code(issue_id),
@@ -2982,6 +3018,26 @@ extern "C" int mine_teleop_chassis_configure_runtime_control_v1(
         -5,
         MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_INTERNAL_ERROR);
   }
+}
+
+}  // namespace
+
+extern "C" int mine_teleop_chassis_configure_runtime_control_v1(
+    const MineTeleopChassisRuntimeControlConfigV1* config,
+    MineTeleopChassisRuntimeControlResultV1* result) {
+  return configure_runtime_control_entrypoint(
+      config,
+      result,
+      &BridgeRuntime::configure_runtime_control_v1);
+}
+
+extern "C" int mine_teleop_chassis_configure_runtime_control_v2(
+    const MineTeleopChassisRuntimeControlConfigV2* config,
+    MineTeleopChassisRuntimeControlResultV1* result) {
+  return configure_runtime_control_entrypoint(
+      config,
+      result,
+      &BridgeRuntime::configure_runtime_control_v2);
 }
 
 extern "C" int mine_teleop_chassis_clear_runtime_control_v1(

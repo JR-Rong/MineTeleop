@@ -134,14 +134,36 @@ MineTeleopChassisOpenConfigV4 valid_v4_config(
   };
 }
 
-MineTeleopChassisRuntimeControlConfigV1 valid_runtime_control_config(
+MineTeleopChassisRuntimeControlConfigV1 valid_legacy_runtime_control_config(
+    std::uint64_t revision,
+    double target_speed_limit_mps,
+    double max_motor_torque_nm,
+    double max_brake_pressure_bar) {
+  return {
+      sizeof(MineTeleopChassisRuntimeControlConfigV1),
+      MINE_TELEOP_CHASSIS_LEGACY_SESSION_CONTROL_PROFILE_VERSION,
+      revision,
+      target_speed_limit_mps,
+      max_motor_torque_nm,
+      max_brake_pressure_bar,
+      1.0,
+      1.0,
+      0.2,
+      0.0,
+      100.0,
+      100,
+      0U,
+  };
+}
+
+MineTeleopChassisRuntimeControlConfigV2 valid_runtime_control_config(
     std::uint64_t revision,
     double target_speed_limit_mps,
     double max_motor_torque_nm,
     double max_brake_pressure_bar,
     double motor_torque_rise_rate_nm_per_s = 0.0) {
   return {
-      sizeof(MineTeleopChassisRuntimeControlConfigV1),
+      sizeof(MineTeleopChassisRuntimeControlConfigV2),
       MINE_TELEOP_CHASSIS_SESSION_CONTROL_PROFILE_VERSION,
       revision,
       target_speed_limit_mps,
@@ -434,7 +456,7 @@ std::size_t count_logged_events(
 int main() {
   try {
     expect(
-        mine_teleop_chassis_abi_version() == 4U &&
+        mine_teleop_chassis_abi_version() == 5U &&
             mine_teleop_chassis_open_config_v2_size() ==
                 sizeof(MineTeleopChassisOpenConfigV2) &&
             mine_teleop_chassis_open_config_v3_size() ==
@@ -443,6 +465,10 @@ int main() {
                 sizeof(MineTeleopChassisOpenConfigV4) &&
             mine_teleop_chassis_runtime_control_config_v1_size() ==
                 sizeof(MineTeleopChassisRuntimeControlConfigV1) &&
+            mine_teleop_chassis_runtime_control_config_v2_size() ==
+                sizeof(MineTeleopChassisRuntimeControlConfigV2) &&
+            sizeof(MineTeleopChassisRuntimeControlConfigV1) == 88U &&
+            sizeof(MineTeleopChassisRuntimeControlConfigV2) == 96U &&
             sizeof(MineTeleopChassisApplyResultV1) == 16U &&
             sizeof(MineTeleopChassisRuntimeControlResultV1) == 24U,
         "bridge ABI version or versioned open-config size query is inconsistent");
@@ -944,8 +970,18 @@ int main() {
     auto runtime_profile =
         valid_runtime_control_config(1, 5.0, 41.25, 0.0);
     MineTeleopChassisRuntimeControlResultV1 runtime_profile_result{};
+    auto wrong_size_runtime_profile = runtime_profile;
+    wrong_size_runtime_profile.struct_size =
+        sizeof(MineTeleopChassisRuntimeControlConfigV1);
+    expect(
+        mine_teleop_chassis_configure_runtime_control_v2(
+            &wrong_size_runtime_profile, &runtime_profile_result) == -1 &&
+            runtime_profile_result.issue_id ==
+                MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_ARGUMENTS_INVALID &&
+            runtime_profile_result.applied_revision == 0,
+        "runtime-control V2 accepted the legacy V1 struct size");
     const int initial_profile_result =
-        mine_teleop_chassis_configure_runtime_control_v1(
+        mine_teleop_chassis_configure_runtime_control_v2(
             &runtime_profile, &runtime_profile_result);
     expect(
         initial_profile_result == 0 &&
@@ -957,7 +993,7 @@ int main() {
             std::to_string(initial_profile_result) + " issue=" +
             std::to_string(runtime_profile_result.issue_id));
     expect(
-        mine_teleop_chassis_configure_runtime_control_v1(
+        mine_teleop_chassis_configure_runtime_control_v2(
             &runtime_profile, &runtime_profile_result) == -3 &&
             runtime_profile_result.issue_id ==
                 MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_STALE_REVISION &&
@@ -969,7 +1005,7 @@ int main() {
       auto invalid_rise_profile =
           valid_runtime_control_config(2, 5.0, 41.25, 0.0, invalid_rise_rate);
       expect(
-          mine_teleop_chassis_configure_runtime_control_v1(
+          mine_teleop_chassis_configure_runtime_control_v2(
               &invalid_rise_profile, &runtime_profile_result) == -1 &&
               runtime_profile_result.issue_id ==
                   MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_ARGUMENTS_INVALID &&
@@ -982,14 +1018,14 @@ int main() {
     auto rise_rate_profile =
         valid_runtime_control_config(2, 5.0, 41.25, 0.0, 50.0);
     expect(
-        mine_teleop_chassis_configure_runtime_control_v1(
+        mine_teleop_chassis_configure_runtime_control_v2(
             &rise_rate_profile, &runtime_profile_result) == 0 &&
             runtime_profile_result.applied_revision == 2,
         "parked Standby rise-rate-only profile change was rejected");
     auto restore_rise_rate_profile =
         valid_runtime_control_config(3, 5.0, 41.25, 0.0, 0.0);
     expect(
-        mine_teleop_chassis_configure_runtime_control_v1(
+        mine_teleop_chassis_configure_runtime_control_v2(
             &restore_rise_rate_profile, &runtime_profile_result) == 0 &&
             runtime_profile_result.applied_revision == 3,
         "parked Standby rise-rate restore was rejected");
@@ -1015,7 +1051,7 @@ int main() {
     ready_pid_update.profile_revision = 4;
     ready_pid_update.speed_pid_kp = 2.0;
     expect(
-        mine_teleop_chassis_configure_runtime_control_v1(
+        mine_teleop_chassis_configure_runtime_control_v2(
             &ready_pid_update, &runtime_profile_result) == -3 &&
             runtime_profile_result.issue_id ==
                 MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_PARKING_REQUIRED &&
@@ -1025,7 +1061,7 @@ int main() {
     ready_rise_rate_update.profile_revision = 4;
     ready_rise_rate_update.motor_torque_rise_rate_nm_per_s = 50.0;
     expect(
-        mine_teleop_chassis_configure_runtime_control_v1(
+        mine_teleop_chassis_configure_runtime_control_v2(
             &ready_rise_rate_update, &runtime_profile_result) == -3 &&
             runtime_profile_result.issue_id ==
                 MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_PARKING_REQUIRED &&
@@ -1674,11 +1710,24 @@ int main() {
     expect(
         mine_teleop_chassis_update_feedback(&feedback) == 0,
         "V4 pressure/rise-rate runtime initial feedback failed");
+    // The legacy 88-byte V1 profile cannot override rise-rate shaping; the
+    // following ramp therefore proves that the V4 open-time 300 Nm/s value is
+    // retained while the old symbol remains usable.
     auto pressure_profile =
-        valid_runtime_control_config(1, 10.0, 100.0, 327.6, 300.0);
+        valid_legacy_runtime_control_config(1, 10.0, 100.0, 327.6);
     pressure_profile.speed_pid_kp = 0.19;
     pressure_profile.speed_pid_ki = 1.0;
     pressure_profile.speed_pid_kd = 0.0;
+    auto wrong_size_legacy_profile = pressure_profile;
+    wrong_size_legacy_profile.struct_size =
+        sizeof(MineTeleopChassisRuntimeControlConfigV2);
+    expect(
+        mine_teleop_chassis_configure_runtime_control_v1(
+            &wrong_size_legacy_profile, &runtime_profile_result) == -1 &&
+            runtime_profile_result.issue_id ==
+                MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_ARGUMENTS_INVALID &&
+            runtime_profile_result.applied_revision == 0,
+        "runtime-control V1 accepted the V2 struct size");
     expect(
         mine_teleop_chassis_configure_runtime_control_v1(
             &pressure_profile, &runtime_profile_result) == 0 &&
@@ -2034,7 +2083,7 @@ int main() {
     auto physical_profile =
         valid_runtime_control_config(1, 5.0, 41.25, 0.0);
     expect(
-        mine_teleop_chassis_configure_runtime_control_v1(
+        mine_teleop_chassis_configure_runtime_control_v2(
             &physical_profile, &runtime_profile_result) == 0 &&
             runtime_profile_result.applied_revision == 1 &&
             mine_teleop_chassis_request_parallel_handshake() == 0,
@@ -2105,7 +2154,7 @@ int main() {
         "completed disarm implicitly cleared physical emergency telemetry");
     physical_profile.profile_revision = 2;
     expect(
-        mine_teleop_chassis_configure_runtime_control_v1(
+        mine_teleop_chassis_configure_runtime_control_v2(
             &physical_profile, &runtime_profile_result) == 0 &&
             runtime_profile_result.applied_revision == 2,
         "parked Disarmed runtime profile reconfiguration was rejected");

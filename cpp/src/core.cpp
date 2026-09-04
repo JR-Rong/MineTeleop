@@ -246,6 +246,22 @@ struct BridgeRuntimeControlConfigV1 {
   double speed_pid_derivative_filter_tau_ms;
   std::int32_t speed_pid_max_dt_ms;
   std::uint32_t reserved;
+};
+
+struct BridgeRuntimeControlConfigV2 {
+  std::uint32_t struct_size;
+  std::uint32_t profile_version;
+  std::uint64_t profile_revision;
+  double target_speed_limit_mps;
+  double max_motor_torque_nm;
+  double max_brake_pressure_bar;
+  double max_steering_request;
+  double speed_pid_kp;
+  double speed_pid_ki;
+  double speed_pid_kd;
+  double speed_pid_derivative_filter_tau_ms;
+  std::int32_t speed_pid_max_dt_ms;
+  std::uint32_t reserved;
   double motor_torque_rise_rate_nm_per_s;
 };
 
@@ -258,8 +274,11 @@ struct BridgeRuntimeControlResultV1 {
 };
 
 static_assert(sizeof(BridgeApplyResultV1) == 16U);
-static_assert(offsetof(BridgeRuntimeControlConfigV1, reserved) == 84U);
-static_assert(sizeof(BridgeRuntimeControlConfigV1) == 96U);
+static_assert(sizeof(BridgeRuntimeControlConfigV1) == 88U);
+static_assert(
+    offsetof(BridgeRuntimeControlConfigV2, motor_torque_rise_rate_nm_per_s) ==
+    sizeof(BridgeRuntimeControlConfigV1));
+static_assert(sizeof(BridgeRuntimeControlConfigV2) == 96U);
 static_assert(sizeof(BridgeRuntimeControlResultV1) == 24U);
 
 constexpr std::uint32_t kBridgeApplyIssueNone = 0U;
@@ -471,8 +490,11 @@ void validate_chassis_bridge_abi_handle(void* handle) {
       const double*,
       int,
       BridgeApplyResultV1*);
-  using ConfigureRuntimeControlFn = int (*)(
+  using ConfigureRuntimeControlV1Fn = int (*)(
       const BridgeRuntimeControlConfigV1*,
+      BridgeRuntimeControlResultV1*);
+  using ConfigureRuntimeControlV2Fn = int (*)(
+      const BridgeRuntimeControlConfigV2*,
       BridgeRuntimeControlResultV1*);
   using ClearRuntimeControlFn = int (*)(BridgeRuntimeControlResultV1*);
   const auto version = load_symbol<QueryFn>(
@@ -483,8 +505,10 @@ void validate_chassis_bridge_abi_handle(void* handle) {
       handle, "mine_teleop_chassis_open_config_v3_size")();
   const auto legacy_v2_config_size = load_symbol<QueryFn>(
       handle, "mine_teleop_chassis_open_config_v2_size")();
-  const auto runtime_control_config_size = load_symbol<QueryFn>(
+  const auto runtime_control_v1_config_size = load_symbol<QueryFn>(
       handle, "mine_teleop_chassis_runtime_control_config_v1_size")();
+  const auto runtime_control_v2_config_size = load_symbol<QueryFn>(
+      handle, "mine_teleop_chassis_runtime_control_config_v2_size")();
   static_cast<void>(load_symbol<OpenV1Fn>(
       handle, "mine_teleop_chassis_open_v1"));
   static_cast<void>(load_symbol<OpenV2Fn>(
@@ -495,16 +519,19 @@ void validate_chassis_bridge_abi_handle(void* handle) {
       handle, "mine_teleop_chassis_open_v4"));
   static_cast<void>(load_symbol<ApplyV2Fn>(
       handle, "mine_teleop_chassis_apply_state_v2"));
-  static_cast<void>(load_symbol<ConfigureRuntimeControlFn>(
+  static_cast<void>(load_symbol<ConfigureRuntimeControlV1Fn>(
       handle, "mine_teleop_chassis_configure_runtime_control_v1"));
+  static_cast<void>(load_symbol<ConfigureRuntimeControlV2Fn>(
+      handle, "mine_teleop_chassis_configure_runtime_control_v2"));
   static_cast<void>(load_symbol<ClearRuntimeControlFn>(
       handle, "mine_teleop_chassis_clear_runtime_control_v1"));
-  if (version != 4U || config_size != sizeof(BridgeOpenConfigV4) ||
+  if (version != 5U || config_size != sizeof(BridgeOpenConfigV4) ||
       legacy_v3_config_size != sizeof(BridgeOpenConfigV3) ||
       legacy_v2_config_size != sizeof(BridgeOpenConfigV2) ||
-      runtime_control_config_size != sizeof(BridgeRuntimeControlConfigV1)) {
+      runtime_control_v1_config_size != sizeof(BridgeRuntimeControlConfigV1) ||
+      runtime_control_v2_config_size != sizeof(BridgeRuntimeControlConfigV2)) {
     throw std::runtime_error(
-        "chassis bridge ABI mismatch: expected version 4 and V4 config size " +
+        "chassis bridge ABI mismatch: expected version 5 and V4 config size " +
         std::to_string(sizeof(BridgeOpenConfigV4)) + ", got version " +
         std::to_string(version) + " and size " + std::to_string(config_size) +
         "; legacy V3 size expected " +
@@ -515,7 +542,10 @@ void validate_chassis_bridge_abi_handle(void* handle) {
         std::to_string(legacy_v2_config_size) +
         "; runtime control V1 size expected " +
         std::to_string(sizeof(BridgeRuntimeControlConfigV1)) + ", got " +
-        std::to_string(runtime_control_config_size));
+        std::to_string(runtime_control_v1_config_size) +
+        "; runtime control V2 size expected " +
+        std::to_string(sizeof(BridgeRuntimeControlConfigV2)) + ", got " +
+        std::to_string(runtime_control_v2_config_size));
   }
 }
 
@@ -2073,8 +2103,8 @@ void DynamicLibraryVehicleAdapter::ensure_loaded() {
     apply_fn_ = load_symbol<ApplyFn>(handle_, "mine_teleop_chassis_apply_state");
     apply_v2_fn_ = load_symbol<ApplyV2Fn>(
         handle_, "mine_teleop_chassis_apply_state_v2");
-    configure_runtime_control_fn_ = load_symbol<ConfigureRuntimeControlFn>(
-        handle_, "mine_teleop_chassis_configure_runtime_control_v1");
+    configure_runtime_control_v2_fn_ = load_symbol<ConfigureRuntimeControlV2Fn>(
+        handle_, "mine_teleop_chassis_configure_runtime_control_v2");
     clear_runtime_control_fn_ = load_symbol<ClearRuntimeControlFn>(
         handle_, "mine_teleop_chassis_clear_runtime_control_v1");
     stop_fn_ = load_symbol<StopFn>(handle_, "mine_teleop_chassis_emergency_stop");
@@ -2156,8 +2186,8 @@ std::uint64_t DynamicLibraryVehicleAdapter::configure_runtime_control_profile(
       profile.max_brake_pressure_bar > max_ordinary_brake_pressure_bar_ + 1e-9) {
     throw std::invalid_argument("runtime control profile exceeds vehicle limits");
   }
-  const BridgeRuntimeControlConfigV1 config{
-      sizeof(BridgeRuntimeControlConfigV1),
+  const BridgeRuntimeControlConfigV2 config{
+      sizeof(BridgeRuntimeControlConfigV2),
       static_cast<std::uint32_t>(profile.profile_version),
       profile_revision,
       profile.target_speed_kph / 3.6,
@@ -2172,17 +2202,17 @@ std::uint64_t DynamicLibraryVehicleAdapter::configure_runtime_control_profile(
       0U,
       profile.motor_torque_rise_rate_nm_per_s};
   BridgeRuntimeControlResultV1 result{};
-  const int result_code = configure_runtime_control_fn_(&config, &result);
+  const int result_code = configure_runtime_control_v2_fn_(&config, &result);
   if (result.struct_size != sizeof(BridgeRuntimeControlResultV1) ||
       result.result_code != result_code || result.reserved != 0U ||
       (result_code == 0 &&
        (result.issue_id != 0U || result.applied_revision != profile_revision))) {
     throw std::runtime_error(
-        "mine_teleop_chassis_configure_runtime_control_v1 returned an invalid result structure");
+        "mine_teleop_chassis_configure_runtime_control_v2 returned an invalid result structure");
   }
   if (result_code != 0) {
     throw std::runtime_error(
-        "mine_teleop_chassis_configure_runtime_control_v1 rejected profile with code " +
+        "mine_teleop_chassis_configure_runtime_control_v2 rejected profile with code " +
         std::to_string(result_code) + " and issue " +
         std::to_string(result.issue_id));
   }

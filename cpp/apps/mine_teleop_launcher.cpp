@@ -380,13 +380,6 @@ bool ascii_digit(char character) {
   return character >= '0' && character <= '9';
 }
 
-// The vendor ChassisControl library dumps its full global state through its
-// log_printf helper once per control cycle (see UpdateVehicleState ->
-// CalculateWheelControlData -> SendCanMessage). Those lines keep value on a
-// live operator terminal but bury the persisted runtime log, so lines in the
-// vendor format at debug/info level are relayed to the terminal only.
-// Vendor format, optionally wrapped in ANSI colour escapes:
-//   [2026-09-03 07:34:12.345] [I] [1234] [TAG] message
 std::string_view strip_leading_ansi_escapes(std::string_view line) {
   while (line.size() >= 2 && line[0] == '\x1b' && line[1] == '[') {
     std::size_t index = 2;
@@ -400,40 +393,102 @@ std::string_view strip_leading_ansi_escapes(std::string_view line) {
   return line;
 }
 
-// Returns the vendor log level character when the line matches the vendor
-// log_printf prefix, or '\0' when it does not.
-char vendor_log_line_level(std::string_view raw_line) {
-  const std::string_view line = strip_leading_ansi_escapes(raw_line);
-  // "[YYYY-MM-DD HH:MM:SS.mmm] [L] [" is 31 characters.
-  if (line.size() < 32) return '\0';
-  if (line[0] != '[') return '\0';
+std::string_view strip_leading_vendor_resets(std::string_view line) {
+  constexpr std::string_view kAnsiReset{"\x1b[0m"};
+  while (line.size() >= kAnsiReset.size() &&
+         line.substr(0, kAnsiReset.size()) == kAnsiReset) {
+    line.remove_prefix(kAnsiReset.size());
+  }
+  return line;
+}
+
+bool vendor_formatted_log_line(std::string_view raw_line) {
+  const auto line = strip_leading_ansi_escapes(raw_line);
+  // ChassisControl log_printf format:
+  //   [YYYY-MM-DD HH:MM:SS.mmm] [L] [pid] [tag] message
+  if (line.size() < 32 || line[0] != '[') return false;
   for (const std::size_t index :
        {1, 2, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22, 23}) {
-    if (!ascii_digit(line[index])) return '\0';
+    if (!ascii_digit(line[index])) return false;
   }
   if (line[5] != '-' || line[8] != '-' || line[11] != ' ' ||
       line[14] != ':' || line[17] != ':' || line[20] != '.' ||
       line[24] != ']' || line[25] != ' ' || line[26] != '[' ||
-      line[28] != ']' || line[29] != ' ' || line[30] != '[') {
-    return '\0';
+      line[28] != ']' || line[29] != ' ' || line[30] != '[' ||
+      std::string_view("DIWEC").find(line[27]) == std::string_view::npos) {
+    return false;
   }
   std::size_t index = 31;
-  if (!ascii_digit(line[index])) return '\0';
+  if (!ascii_digit(line[index])) return false;
   while (index < line.size() && ascii_digit(line[index])) ++index;
-  if (index + 2 >= line.size() || line[index] != ']' ||
-      line[index + 1] != ' ' || line[index + 2] != '[') {
-    return '\0';
-  }
-  return line[27];
+  return index + 2 < line.size() && line[index] == ']' &&
+      line[index + 1] == ' ' && line[index + 2] == '[';
 }
 
-bool vendor_chatter_line(std::string_view line) {
-  const char level = vendor_log_line_level(line);
-  return level == 'D' || level == 'I';
+bool terminal_only_vendor_line(std::string_view raw_line) {
+  if (vendor_formatted_log_line(raw_line)) return true;
+  auto line = strip_leading_ansi_escapes(raw_line);
+  if (!line.empty() && line.back() == '\n') line.remove_suffix(1);
+  if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+  // Bare iostream diagnostics exported by the same vendor API. Only the two
+  // calls used by this bridge are normally observed, but keep the complete
+  // known wrapper set together so it cannot silently start polluting storage.
+  return line == "LoadConfig" || line == "Initialize" ||
+      line == "UpdateVehicleState" || line == "UpdateDynamicParam";
+}
+
+std::string sanitize_persisted_line(std::string_view raw_line) {
+  auto line = strip_leading_vendor_resets(raw_line);
+  if (terminal_only_vendor_line(line)) return {};
+
+  std::string_view ending;
+  if (!line.empty() && line.back() == '\n') {
+    ending = "\n";
+    line.remove_suffix(1);
+    if (!line.empty() && line.back() == '\r') {
+      ending = "\r\n";
+      line.remove_suffix(1);
+    }
+  }
+
+  // The vendor iostream wrappers write their marker and newline separately.
+  // If a structured Mine Teleop record is scheduled between those writes,
+  // remove only a marker attached directly to the JSON boundary. A marker
+  // inside a JSON string or a longer diagnostic remains untouched.
+  constexpr std::array<std::string_view, 4> kBareVendorMarkers{
+      "LoadConfig", "Initialize", "UpdateVehicleState", "UpdateDynamicParam"};
+  bool changed = true;
+  while (changed && !line.empty()) {
+    changed = false;
+    for (const auto marker : kBareVendorMarkers) {
+      if (line.size() >= marker.size() &&
+          line.substr(0, marker.size()) == marker) {
+        const auto remainder = line.substr(marker.size());
+        if (remainder.empty() || remainder.front() == '{') {
+          line = remainder;
+          changed = true;
+          break;
+        }
+      }
+      if (line.size() >= marker.size() &&
+          line.substr(line.size() - marker.size()) == marker) {
+        const auto prefix = line.substr(0, line.size() - marker.size());
+        if (prefix.empty() || (prefix.front() == '{' && prefix.back() == '}')) {
+          line = prefix;
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+  if (line.empty()) return {};
+  std::string sanitized(line);
+  sanitized.append(ending);
+  return sanitized;
 }
 
 // Buffers relayed output per stream, splits it into lines, and persists
-// everything except vendor debug/info chatter (see vendor_chatter_line).
+// everything except recognizable ChassisControl vendor output.
 // Terminal output is unaffected: it is written raw before this helper runs.
 void persist_stream_log(
     RelayStream& stream,
@@ -463,12 +518,14 @@ void persist_stream_log(
   while (log_enabled) {
     const auto newline = stream.log_pending.find('\n', consumed);
     if (newline == std::string::npos) break;
-    const auto line = std::string_view(stream.log_pending)
-                          .substr(consumed, newline - consumed + 1);
+    const auto line = strip_leading_vendor_resets(
+        std::string_view(stream.log_pending)
+            .substr(consumed, newline - consumed + 1));
     consumed = newline + 1;
-    if (vendor_chatter_line(line)) continue;
+    const auto sanitized = sanitize_persisted_line(line);
+    if (sanitized.empty()) continue;
     std::string error;
-    if (!log.append(line, error)) report_failure(error);
+    if (!log.append(sanitized, error)) report_failure(error);
   }
   stream.log_pending.erase(0, consumed);
 
@@ -478,9 +535,9 @@ void persist_stream_log(
   }
   if ((flush_partial || stream.log_pending.size() > kMaxPendingLogLineBytes) &&
       !stream.log_pending.empty()) {
+    const auto pending = sanitize_persisted_line(stream.log_pending);
     std::string error;
-    if (!vendor_chatter_line(stream.log_pending) &&
-        !log.append(stream.log_pending, error)) {
+    if (!pending.empty() && !log.append(pending, error)) {
       report_failure(error);
     }
     stream.log_pending.clear();
@@ -718,8 +775,16 @@ int relay_runtime(
     } else if (stdout_stream.descriptor >= 0 || stderr_stream.descriptor >= 0) {
       static_cast<void>(read_any);
       if (std::chrono::steady_clock::now() >= drain_deadline) {
-        if (stdout_stream.descriptor >= 0) ::close(stdout_stream.descriptor);
-        if (stderr_stream.descriptor >= 0) ::close(stderr_stream.descriptor);
+        if (stdout_stream.descriptor >= 0) {
+          persist_stream_log(
+              stdout_stream, log, log_enabled, log_failure_reported, {}, true);
+          ::close(stdout_stream.descriptor);
+        }
+        if (stderr_stream.descriptor >= 0) {
+          persist_stream_log(
+              stderr_stream, log, log_enabled, log_failure_reported, {}, true);
+          ::close(stderr_stream.descriptor);
+        }
         stdout_stream.descriptor = -1;
         stderr_stream.descriptor = -1;
       }

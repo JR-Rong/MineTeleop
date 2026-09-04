@@ -20,6 +20,9 @@ cleanup() {
     kill -TERM "$waiting_pid" >/dev/null 2>&1 || true
     wait "$waiting_pid" >/dev/null 2>&1 || true
   fi
+  if [[ -n "${tail_holder_pid:-}" ]]; then
+    kill -KILL "$tail_holder_pid" >/dev/null 2>&1 || true
+  fi
   rm -rf "$temporary"
 }
 trap cleanup EXIT
@@ -51,16 +54,23 @@ fake_runtime="$package_root/bin/mine-teleop"
   printf '%s\n' '  done'
   printf '%s\n' 'fi'
   printf '%s\n' 'if [[ "${MINE_TELEOP_TEST_VENDOR_CHATTER:-0}" == "1" ]]; then'
-  printf '%s\n' '  printf "[2026-09-03 07:34:12.345] [I] [1234] [GLOBAL] vendor-info-chatter\\n"'
-  printf '%s\n' '  printf "\\033[1m\\033[32m[2026-09-03 07:34:12.346] [I] [1234] [GLOBAL] vendor-color-chatter\\n"'
-  printf '%s\n' '  printf "\\033[0m\\033[36m[2026-09-03 07:34:12.347] [D] [1234] [GLOBAL] vendor-debug-chatter\\n\\033[0m"'
-  printf '%s\n' '  printf "\\033[0m[2026-09-03 07:34:12.348] [W] [1234] [GLOBAL] vendor-warning-kept\\n"'
-  printf '%s\n' '  printf "[2026-09-03 07:34:12.349] [E] [1234] [GLOBAL] vendor-error-kept\\n"'
-  printf '%s\n' '  printf "[2026-09-03 07:34:12.350] [C] [1234] [GLOBAL] vendor-critical-kept\\n"'
+  printf '%s\n' '  printf "UpdateVehicle"'
+  printf '%s\n' '  sleep 0.2'
+  printf '%s\n' '  printf "State\\n"'
+  printf '%s\n' '  printf "UpdateVehicleState diagnostic detail\\n"'
+  printf '%s\n' '  printf '\''UpdateVehicleState{"event":"runtime-interleaved-after"}\n'\'''
+  printf '%s\n' '  printf '\''{"event":"runtime-interleaved-before"}UpdateVehicleState\n'\'''
+  printf '%s\n' '  printf "[2026-09-03 07:34:12.345] [I] [1234] [Arming] vendor-info-chatter\\n"'
+  printf '%s\n' '  printf "\\033[1m\\033[31m[2026-09-03 07:34:12.346] [E] [1234] [GLOBAL] vendor-error-chatter\\n\\033[0m"'
+  printf '%s\n' '  printf '\''{"event":"runtime-kept","detail":"UpdateVehicleState"}\n'\'''
   printf '%s\n' '  printf '\''{"event":"json-split'\'''
   printf '%s\n' '  sleep 0.2'
   printf '%s\n' '  printf -- '\''-line"}\n'\'''
   printf '%s\n' '  printf "unterminated-tail"'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'if [[ "${MINE_TELEOP_TEST_TAIL_HOLDER:-0}" == "1" ]]; then'
+  printf '%s\n' '  (printf "forced-drain-unterminated-tail"; sleep 30) &'
+  printf '%s\n' '  printf "%s\\n" "$!" > "$MINE_TELEOP_TEST_TAIL_HOLDER_PID_FILE"'
   printf '%s\n' 'fi'
   printf '%s\n' 'if [[ "${MINE_TELEOP_TEST_WAIT:-0}" == "1" ]]; then'
   printf '%s\n' '  trap '\''printf "runtime-term-observed\\n"; exit 143'\'' TERM'
@@ -213,29 +223,47 @@ MINE_TELEOP_TEST_VENDOR_CHATTER=1 \
 filter_status=$?
 set -e
 [[ "$filter_status" -eq 7 ]]
-# Vendor debug/info chatter stays on the terminal but is not persisted.
+# Recognizable vendor chatter stays on the terminal but is not persisted.
+grep -Fx 'UpdateVehicleState' "$temporary/filter.stdout" >/dev/null
 grep -F 'vendor-info-chatter' "$temporary/filter.stdout" >/dev/null
-grep -F 'vendor-color-chatter' "$temporary/filter.stdout" >/dev/null
-grep -F 'vendor-debug-chatter' "$temporary/filter.stdout" >/dev/null
-if grep -F 'vendor-info-chatter' "$filter_log" >/dev/null; then
-  printf 'plain vendor info chatter was persisted to the runtime log\n' >&2
+grep -F 'vendor-error-chatter' "$temporary/filter.stdout" >/dev/null
+if grep -Fx 'UpdateVehicleState' "$filter_log" >/dev/null; then
+  printf 'exact UpdateVehicleState stdout chatter was persisted to the runtime log\n' >&2
   exit 1
 fi
-if grep -F 'vendor-color-chatter' "$filter_log" >/dev/null; then
-  printf 'colored vendor info chatter was persisted to the runtime log\n' >&2
+if grep -F 'vendor-info-chatter' "$filter_log" >/dev/null ||
+   grep -F 'vendor-error-chatter' "$filter_log" >/dev/null; then
+  printf 'formatted vendor chatter was persisted to the runtime log\n' >&2
   exit 1
 fi
-if grep -F 'vendor-debug-chatter' "$filter_log" >/dev/null; then
-  printf 'vendor debug chatter was persisted to the runtime log\n' >&2
+if LC_ALL=C grep -q $'\033' "$filter_log"; then
+  printf 'vendor ANSI escape residue was persisted to the runtime log\n' >&2
   exit 1
 fi
-# Vendor warning-and-above lines and runtime diagnostics are still recorded.
-grep -F 'vendor-warning-kept' "$filter_log" >/dev/null
-grep -F 'vendor-error-kept' "$filter_log" >/dev/null
-grep -F 'vendor-critical-kept' "$filter_log" >/dev/null
+# Similar diagnostics and structured runtime output remain recorded.
+grep -F 'UpdateVehicleState diagnostic detail' "$filter_log" >/dev/null
+grep -F '"event":"runtime-kept"' "$filter_log" >/dev/null
+grep -Fx '{"event":"runtime-interleaved-after"}' "$filter_log" >/dev/null
+grep -Fx '{"event":"runtime-interleaved-before"}' "$filter_log" >/dev/null
 # A line split across reads is reassembled, and an unterminated tail is
 # flushed when the stream closes.
 grep -F '{"event":"json-split-line"}' "$filter_log" >/dev/null
 grep -F 'unterminated-tail' "$filter_log" >/dev/null
+
+forced_tail_log="$temporary/forced-tail/vehicle-runtime.log"
+forced_tail_pid_file="$temporary/forced-tail.pid"
+set +e
+MINE_TELEOP_VEHICLE_RUNTIME_LOG_PATH="$forced_tail_log" \
+MINE_TELEOP_TEST_TAIL_HOLDER=1 \
+MINE_TELEOP_TEST_TAIL_HOLDER_PID_FILE="$forced_tail_pid_file" \
+  "$package_root/bin/mine-teleop-run" >/dev/null 2>/dev/null
+forced_tail_status=$?
+set -e
+[[ "$forced_tail_status" -eq 7 ]]
+[[ -s "$forced_tail_pid_file" ]]
+tail_holder_pid="$(<"$forced_tail_pid_file")"
+grep -F 'forced-drain-unterminated-tail' "$forced_tail_log" >/dev/null
+kill -KILL "$tail_holder_pid" >/dev/null 2>&1 || true
+tail_holder_pid=""
 
 printf 'vehicle_runtime_log_relay_check=passed\n'

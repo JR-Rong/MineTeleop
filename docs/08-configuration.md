@@ -421,16 +421,17 @@ PID，成功 ACK 的 `applied_revision` 必须与请求 `seq` 相同。反馈超
 `control_limits.read_only_control_safety` 只读上报。
 
 启用上述配置时必须同步升级车端 runtime 和 ChassisControl bridge：当前 runtime
-要求 ABI version 4、完全一致的 V4 配置结构大小、兼容 V3/V2 大小查询以及
-`mine_teleop_chassis_open_v4`，并强制要求 runtime-control V1 配置结构大小查询、
-`mine_teleop_chassis_configure_runtime_control_v1` 和
-`mine_teleop_chassis_clear_runtime_control_v1`。V4 在 V3 的普通制动压力上限后新增
-不可变的单电机加扭斜率；旧 bridge 不会静默忽略该语义，而会在任何 CAN 初始化前因 ABI
+要求 ABI version 5、完全一致的 V4 配置结构大小、兼容 V3/V2 大小查询以及
+`mine_teleop_chassis_open_v4`，并强制要求 runtime-control V1/V2 配置结构分别为
+88/96 字节、两个 size query、两个 configure 符号以及
+`mine_teleop_chassis_clear_runtime_control_v1`。V1 仅接受旧 profile version 2 并沿用
+open-time 升扭斜率；V2 接受 profile version 3 并携带会话斜率。V4 在 V3 的普通制动压力上限后新增
+单电机加扭斜率启动默认值；旧 bridge 不会静默忽略该语义，而会在任何 CAN 初始化前因 ABI
 不匹配而启动失败。新 bridge 仍为直接 ABI 调用方和兼容性测试保留
 `mine_teleop_chassis_open_v1`、`mine_teleop_chassis_open_v2` 与
 `mine_teleop_chassis_open_v3`；V1 禁用正牵引并采用默认 `800 ms` 超时，V2 保留负值
 表示减速度的旧语义，V3 没有斜率字段，因此直接 PID 转矩不增加额外升扭斜率。旧 vehicle-agent 会被全局 ABI
-version 4 门禁明确拒绝，不能依靠这些入口加载新 bridge；runtime 与 bridge 必须原子
+version 5 门禁明确拒绝，不能依靠这些入口加载新 bridge；runtime 与 bridge 必须原子
 成套升级。
 进入 Ready 后，若连续
 `control.control_timeout_ms` 没有成功 apply，bridge 会撤销车速请求、将转矩置零并施加
@@ -766,7 +767,7 @@ encoder 的 `bitrate` property update，且可绑定到 GStreamer pipeline 命�
 同时提供 profile 级弱网降级 hook，可从当前实时 profile 切到预声明的低
 fps/低分辨率 profile，pipeline hook 成功后才更新活动状态。
 控制安全 YAML 本身仍不热重载；唯一例外是已鉴权会话通过
-`session_control_profile` V2 原子设置受限的目标车速、转矩、普通压力、转角和 PID，
+`session_control_profile` V3 原子设置受限的目标车速、转矩、普通压力、转角、PID 和升扭斜率，
 断链/故障/会话替换时立即清除并恢复车端默认 PID。
 目标媒体主循环仍需在 Ubuntu 工控机端到端验证。
 - 安全停车策略。

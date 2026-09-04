@@ -601,7 +601,11 @@ void test_control_page_contract() {
           response.body.find("speed-pid-kd") != std::string::npos &&
           response.body.find("speed-pid-derivative-filter-tau-ms") != std::string::npos &&
           response.body.find("speed-pid-max-dt-ms") != std::string::npos &&
-          response.body.find("motor-torque-rise-rate") != std::string::npos,
+          response.body.find("motor-torque-rise-rate") != std::string::npos &&
+          response.body.find("inputmode=\"decimal\" required") !=
+              std::string::npos &&
+          response.body.find("0 不是禁用驱动，而是直接跟随 PID 输出") !=
+              std::string::npos,
       "field commissioning control limit dialog is missing");
   expect(
       response.body.find("effectiveControlLimits") != std::string::npos &&
@@ -618,6 +622,10 @@ void test_control_page_contract() {
           response.body.find("每路 EHB 压力请求，单位 bar、分辨率 0.1 bar") !=
               std::string::npos &&
           response.body.find("我已确认车辆处于 N 挡、零速、电子驻车或隔离 mock 台架") !=
+              std::string::npos &&
+          response.body.find("motorTorqueRiseRate.valueAsNumber") !=
+              std::string::npos &&
+          response.body.find("if(!motorTorqueRiseRate.checkValidity())") !=
               std::string::npos &&
           response.body.find("硬安全制动与 watchdog 参数不可编辑") != std::string::npos &&
           response.body.find("vehicleHardLimits.max_speed_kph.toFixed(1)") !=

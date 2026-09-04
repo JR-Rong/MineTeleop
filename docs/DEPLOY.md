@@ -226,7 +226,7 @@ http://127.0.0.1:28080
 1. `mine-teleop-cloud.target` 健康；
 2. 车端 `./bin/mine-teleop-run` 已注册并保持在线；
 3. 控制端登录并选择 `vehicle-001`；
-4. 确认控制权、视频轨道、时间同步和 DataChannel，并等待页面显示车端已确认 V2 会话控制参数及匹配的 `applied_revision`；
+4. 确认控制权、视频轨道、时间同步和 DataChannel，并等待页面显示车端已确认 V3 会话控制参数及匹配的 `applied_revision`；
 5. 释放会话后确认车辆回到安全状态。
 
 推荐检查：
@@ -244,7 +244,7 @@ curl -fsS http://127.0.0.1:8080/health
 
 真实底盘上线前必须单独验收 CAN 反馈、制动、断链安全停车和本地急停。
 控制页面默认的 `300 Nm/路`、`100 bar/路` 以及软件/配置测试结果都不是实车能力或
-压力标定证据。普通驾驶前应在隔离台架确认 profile ACK 的全部 effective V2 字段、
+压力标定证据。普通驾驶前应在隔离台架确认 profile ACK 的全部 effective V3 字段、
 `applied_revision == request.seq`、目标车速 PID、
 页面只读的原始 `max_speed_kph`/`max_throttle`、速度反馈超时、硬超速余量、watchdog/
 减速曲线，CAN 请求、实测反馈、缓刹/急刹压力和断链撤销；不得用页面显示“已确认”替代硬件验收。

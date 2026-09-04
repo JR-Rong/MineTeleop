@@ -12,12 +12,24 @@
 #define MINE_TELEOP_TEST_CHASSIS_HAS_APPLY_V2 1
 #endif
 
-#ifndef MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL
-#define MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL 1
+#ifndef MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V1
+#define MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V1 1
 #endif
 
-#ifndef MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_SIZE
-#define MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_SIZE 0
+#ifndef MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V2
+#define MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V2 1
+#endif
+
+#ifndef MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V2_SIZE_QUERY
+#define MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V2_SIZE_QUERY 1
+#endif
+
+#ifndef MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_V1_SIZE
+#define MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_V1_SIZE 0
+#endif
+
+#ifndef MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_V2_SIZE
+#define MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_V2_SIZE 0
 #endif
 
 uint32_t mine_teleop_chassis_abi_version(void) {
@@ -41,12 +53,22 @@ uint32_t mine_teleop_chassis_open_config_v4_size(void) {
 }
 
 uint32_t mine_teleop_chassis_runtime_control_config_v1_size(void) {
-#if MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_SIZE
+#if MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_V1_SIZE
     return (uint32_t)(sizeof(struct MineTeleopChassisRuntimeControlConfigV1) - 1U);
 #else
     return (uint32_t)sizeof(struct MineTeleopChassisRuntimeControlConfigV1);
 #endif
 }
+
+#if MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V2_SIZE_QUERY
+uint32_t mine_teleop_chassis_runtime_control_config_v2_size(void) {
+#if MINE_TELEOP_TEST_CHASSIS_WRONG_RUNTIME_CONTROL_V2_SIZE
+    return (uint32_t)(sizeof(struct MineTeleopChassisRuntimeControlConfigV2) - 1U);
+#else
+    return (uint32_t)sizeof(struct MineTeleopChassisRuntimeControlConfigV2);
+#endif
+}
+#endif
 
 int mine_teleop_chassis_open(const char* can_interface) {
     (void)can_interface;
@@ -115,9 +137,24 @@ int mine_teleop_chassis_apply_state_v2(
 }
 #endif
 
-#if MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL
+#if MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V1
 int mine_teleop_chassis_configure_runtime_control_v1(
     const struct MineTeleopChassisRuntimeControlConfigV1* config,
+    struct MineTeleopChassisRuntimeControlResultV1* result) {
+    if (config == NULL || result == NULL) return -1;
+    result->struct_size =
+        (uint32_t)sizeof(struct MineTeleopChassisRuntimeControlResultV1);
+    result->result_code = 0;
+    result->issue_id = MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_NONE;
+    result->reserved = 0U;
+    result->applied_revision = config->profile_revision;
+    return 0;
+}
+#endif
+
+#if MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V2
+int mine_teleop_chassis_configure_runtime_control_v2(
+    const struct MineTeleopChassisRuntimeControlConfigV2* config,
     struct MineTeleopChassisRuntimeControlResultV1* result) {
     if (config == NULL || result == NULL) return -1;
     result->struct_size =

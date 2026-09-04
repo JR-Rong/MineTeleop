@@ -141,7 +141,7 @@ DataChannel envelope。V3 profile 在 envelope 顶层包含 `profile_version=3`�
 收到共享 `control_status_seq` 排序后的 `session_control_profile_status`，或 telemetry
 中的同一 canonical `session_control_profile`。只有 `active=true`、`accepted=true`、
 `last_request_seq` 匹配 pending 序号、顶层正整数 `applied_revision` 等于该请求 `seq`，且
-`effective_profile` 的全部 V2 字段和值与请求精确一致时才视为已确认；同一 revision 的
+`effective_profile` 的全部 V3 字段和值与请求精确一致时才视为已确认；同一 revision 的
 幂等重 ACK 可保持授权。
 旧 `GET /api/control-limits` 仅保留归一化制动比例的只读兼容；`POST` 固定返回
 `410 Gone`，不能绕过 profile 的停车、鉴权和 ACK 门禁修改会话制动参数。旧的

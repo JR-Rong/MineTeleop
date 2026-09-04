@@ -28,6 +28,7 @@
 #define MINE_TELEOP_CHASSIS_MAX_DERIVATIVE_FILTER_TAU_MS 2000.0
 #define MINE_TELEOP_CHASSIS_SPEED_PID_SETPOINT_RESET_DEADBAND_MPS 0.05
 #define MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS 10.0
+#define MINE_TELEOP_CHASSIS_LEGACY_SESSION_CONTROL_PROFILE_VERSION 2U
 #define MINE_TELEOP_CHASSIS_SESSION_CONTROL_PROFILE_VERSION 3U
 #define MINE_TELEOP_CHASSIS_MAX_STEERING_REQUEST 1.0
 
@@ -482,13 +483,27 @@ struct MineTeleopChassisOpenConfigV4 {
     double motor_torque_rise_rate_nm_per_s;
 };
 
-/* Complete session-scoped runtime control snapshot. The immutable physical
- * ceilings and safety watchdogs remain owned by the current open config.
- * motor_torque_rise_rate_nm_per_s was appended after reserved for profile
- * version 3; every earlier field keeps its original offset, and the exact
- * struct size stays negotiated through
- * mine_teleop_chassis_runtime_control_config_v1_size. */
+/* Legacy profile-version-2 runtime snapshot. Its 88-byte ABI is immutable.
+ * The bridge retains the motor-torque rise rate supplied at open time. */
 struct MineTeleopChassisRuntimeControlConfigV1 {
+    uint32_t struct_size;
+    uint32_t profile_version;
+    uint64_t profile_revision;
+    double target_speed_limit_mps;
+    double max_motor_torque_nm;
+    double max_brake_pressure_bar;
+    double max_steering_request;
+    double speed_pid_kp;
+    double speed_pid_ki;
+    double speed_pid_kd;
+    double speed_pid_derivative_filter_tau_ms;
+    int32_t speed_pid_max_dt_ms;
+    uint32_t reserved;
+};
+
+/* Profile-version-3 runtime snapshot. V2 keeps the complete V1 prefix and
+ * adds the session-scoped rising-torque rate. */
+struct MineTeleopChassisRuntimeControlConfigV2 {
     uint32_t struct_size;
     uint32_t profile_version;
     uint64_t profile_revision;
@@ -599,9 +614,31 @@ static_assert(
     sizeof(MineTeleopChassisOpenConfigV4) ==
     sizeof(MineTeleopChassisOpenConfigV3) + sizeof(double));
 static_assert(sizeof(MineTeleopChassisApplyResultV1) == 16U);
+static_assert(sizeof(MineTeleopChassisRuntimeControlConfigV1) == 88U);
+#define MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(field) \
+    static_assert(offsetof(MineTeleopChassisRuntimeControlConfigV2, field) == \
+        offsetof(MineTeleopChassisRuntimeControlConfigV1, field))
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(struct_size);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(profile_version);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(profile_revision);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(target_speed_limit_mps);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(max_motor_torque_nm);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(max_brake_pressure_bar);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(max_steering_request);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(speed_pid_kp);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(speed_pid_ki);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(speed_pid_kd);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(
+    speed_pid_derivative_filter_tau_ms);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(speed_pid_max_dt_ms);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(reserved);
+#undef MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD
 static_assert(
-    offsetof(MineTeleopChassisRuntimeControlConfigV1, reserved) == 84U);
-static_assert(sizeof(MineTeleopChassisRuntimeControlConfigV1) == 96U);
+    offsetof(
+        MineTeleopChassisRuntimeControlConfigV2,
+        motor_torque_rise_rate_nm_per_s) ==
+    sizeof(MineTeleopChassisRuntimeControlConfigV1));
+static_assert(sizeof(MineTeleopChassisRuntimeControlConfigV2) == 96U);
 static_assert(sizeof(MineTeleopChassisRuntimeControlResultV1) == 24U);
 #endif
 
@@ -613,6 +650,7 @@ uint32_t mine_teleop_chassis_open_config_v2_size(void);
 uint32_t mine_teleop_chassis_open_config_v3_size(void);
 uint32_t mine_teleop_chassis_open_config_v4_size(void);
 uint32_t mine_teleop_chassis_runtime_control_config_v1_size(void);
+uint32_t mine_teleop_chassis_runtime_control_config_v2_size(void);
 int mine_teleop_chassis_open(const char* can_interface);
 /* Versioned open used by current runtimes. Invalid size/torque is rejected
  * before ChassisControl or SocketCAN is touched. */
@@ -644,6 +682,9 @@ int mine_teleop_chassis_apply_state_v2(
  * one complete session snapshot. The revision is the wire profile request seq. */
 int mine_teleop_chassis_configure_runtime_control_v1(
     const struct MineTeleopChassisRuntimeControlConfigV1* config,
+    struct MineTeleopChassisRuntimeControlResultV1* result);
+int mine_teleop_chassis_configure_runtime_control_v2(
+    const struct MineTeleopChassisRuntimeControlConfigV2* config,
     struct MineTeleopChassisRuntimeControlResultV1* result);
 /* May be called from any bridge state. It never clears an existing safety
  * latch and restores the PID gains supplied by the current open config. */

@@ -64,9 +64,9 @@ sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /var/log/mine-teleop
 `Ctrl-C` 停止。现场配置应从 `configs/vehicle-agent.three-machine.field.yaml`
 生成，并在运行前通过 `config-check`。启动器继续把 stdout/stderr 显示在终端，
 同时合并写入 `/var/log/mine-teleop/vehicle-runtime.log`；该混合日志不是严格
-JSONL，默认每份 64 MiB、保留 `.1` 到 `.5`。vendor ChassisControl 每个控制周期的
-全量状态 dump（debug/info 级）只留在终端，不写入该落盘日志；vendor warning 及
-以上级别和全部结构化诊断仍照常记录。VCU 原始协议日志仍单独写入
+JSONL，默认每份 64 MiB、保留 `.1` 到 `.5`。可识别的 vendor ChassisControl 输出
+（包括每周期裸行 `UpdateVehicleState` 及其 `[timestamp] [level] [pid] [tag]` 日志）
+只留在终端，不写入该落盘日志；Mine Teleop 结构化诊断仍照常记录。VCU 原始协议日志仍单独写入
 `vcu-can.jsonl*`。
 
 实时查看车端运行日志：

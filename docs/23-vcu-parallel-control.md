@@ -272,10 +272,11 @@ vehicle_adapter:
 `false` 绕过反馈门禁。
 
 vehicle-agent runtime 与 bridge 必须原子成套升级。当前 runtime 要求 bridge 提供
-ABI version 4、完全一致的 V4 配置结构大小、兼容 V3/V2 大小查询以及
+ABI version 5、完全一致的 V4 配置结构大小、兼容 V3/V2 大小查询以及
 `mine_teleop_chassis_open_v4`；
 同时要求同次返回结构化拒绝结果的 `mine_teleop_chassis_apply_state_v2`、runtime-control
-V1 大小查询，以及原子 configure/clear 符号。任一大小或必需符号不匹配都会在
+V1/V2 的 88/96 字节大小查询、两个 configure 符号，以及原子 clear 符号。V1 仅接收旧
+profile version 2 并沿用 open-time 升扭斜率；V2 接收 profile version 3 的会话斜率。任一大小或必需符号不匹配都会在
 任何 SocketCAN 初始化前被拒绝。`apply_state_v2` 只返回固定枚举，不传递日志字符串；
 其中 D/R 移动或反馈过期可由 runtime 安全映射成稳定 issue code，未知值统一降级为
 通用拒绝。旧 `apply_state` 继续保留整数 fail-closed 包装。只提供 V1 的旧 bridge 会明确启动失败，
@@ -284,7 +285,7 @@ V2 bridge 也会因缺少物理普通制动压力上限而失败，不会静默�
 `mine_teleop_chassis_open_v1`、`mine_teleop_chassis_open_v2` 与
 `mine_teleop_chassis_open_v3`：V1 因为没有安全 PID 配置而只允许零牵引，V2 保留
 负值表示减速度的旧语义，V3 没有斜率字段，因此直接 PID 转矩不增加额外升扭斜率；这些入口不能使旧
-vehicle-agent 通过全局 ABI version 4 启动门禁。WebRTC 视频链与这一
+vehicle-agent 通过全局 ABI version 5 启动门禁。WebRTC 视频链与这一
 控制故障隔离：视频先协商并显示，控制 DataChannel 打开后才尝试启动 adapter；
 adapter 启动或运行失败会短暂上报握手 `fault`、关闭控制 DataChannel、拒绝
 驾驶命令并继续视频；关闭控制通道同时保护旧版本控制端不误报远程急停。该隔离不
