@@ -3750,7 +3750,8 @@ void test_driver_console_page_keeps_waiting_state_during_background_safety_ticks
       response.body.find("function enqueueControlHeartbeat()") != std::string::npos &&
           response.body.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
               std::string::npos &&
-          response.body.find("sendPendingControlProfile();enqueueControlHeartbeat()") !=
+          response.body.find(
+              "sendPendingControlProfile();const enqueued=enqueueControlHeartbeat()") !=
               std::string::npos,
       "background safety tick still announces a control fault while waiting for media");
   expect(
