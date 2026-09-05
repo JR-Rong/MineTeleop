@@ -428,6 +428,7 @@ void test_control_page_contract() {
   mine_teleop::DriverConfig config;
   config.driver_id = "driver-console-001";
   config.signaling_url = "https://signal.example.test";
+  config.control_trace_commands = true;
   auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(config, "vehicle-001", "dev-password");
   mine_teleop::DriverConsoleHttpApp app(runtime);
   mine_teleop::HttpRequest request;
@@ -768,20 +769,20 @@ void test_control_page_contract() {
   const auto data_channel_send = response.body.find(
       "activeChannel.send(JSON.stringify(prepared.command))", prepared_outcome);
   const auto forwarded_outcome = response.body.find(
-      "recordControlOutcome('forwarded',prepared.command,outcomeSession)", prepared_outcome);
+      "recordTerminalControlOutcome('forwarded',prepared.command,outcomeSession", prepared_outcome);
   expect(
       prepared_outcome != std::string::npos &&
           response.body.find(
-              "recordControlOutcome('superseded',prepared.command,outcomeSession)",
+              "recordTerminalControlOutcome('superseded',prepared.command,outcomeSession",
               prepared_outcome) != std::string::npos &&
           response.body.find(
-              "recordControlOutcome('expired_before_forward',prepared.command,outcomeSession",
+              "recordTerminalControlOutcome('expired_before_forward',prepared.command,outcomeSession",
               prepared_outcome) != std::string::npos &&
           response.body.find(
-              "recordControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession)",
+              "recordTerminalControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession",
               prepared_outcome) != std::string::npos &&
           response.body.find(
-              "recordControlOutcome('post_prepare_vcu_not_ready',prepared.command,outcomeSession)",
+              "recordTerminalControlOutcome('post_prepare_vcu_not_ready',prepared.command,outcomeSession",
               prepared_outcome) != std::string::npos &&
           data_channel_send != std::string::npos &&
           forwarded_outcome != std::string::npos && data_channel_send < forwarded_outcome &&
@@ -1020,7 +1021,7 @@ void test_control_page_contract() {
   expect(
       response.body.find("!vcuDrivingReady()&&!estopRequested") != std::string::npos &&
           response.body.find("async function heartbeat()") != std::string::npos &&
-          response.body.find("sendPendingControlProfile();enqueueControlHeartbeat()") !=
+          response.body.find("sendPendingControlProfile();const enqueued=enqueueControlHeartbeat()") !=
               std::string::npos,
       "a latched ESTOP is not retransmitted by heartbeat while the VCU handshake is incomplete");
   expect(
@@ -1054,11 +1055,15 @@ void test_control_page_contract() {
       "activeChannel.bufferedAmount>4096&&!estopRequested){");
   const auto backpressure_return = response.body.find(
       "return{sent:false,reason:'buffered_amount_limit'}", backpressure_gate);
+  const auto backpressure_trace = response.body.find(
+      "noteControlBackpressure(activeChannel.bufferedAmount)", backpressure_gate);
   expect(
       backpressure_gate != std::string::npos &&
+          backpressure_trace != std::string::npos &&
           backpressure_return != std::string::npos &&
           response.body.find("clearControlInput(false)", backpressure_gate) <
               backpressure_return &&
+          backpressure_trace < backpressure_return &&
           response.body.find("resetControlAuthorityInput()", backpressure_gate) >
               backpressure_return &&
           response.body.find("webrtcLabel.textContent==='控制链路拥塞，输入已清除'") !=
@@ -1068,14 +1073,122 @@ void test_control_page_contract() {
   expect(response.body.find("低于 20 FPS") != std::string::npos, "FPS threshold alarm is missing");
   expect(response.body.find("sent_at_utc_ms:Date.now()") != std::string::npos, "browser-local logs do not use UTC milliseconds");
   expect(response.body.find("fetch('/api/browser-event'") != std::string::npos, "browser events are not persisted by the local runtime");
+  expect(
+      response.body.find("\"control_trace_commands\":true") != std::string::npos &&
+          response.body.find("const controlTraceEnabled=Boolean(consoleConfig.control_trace_commands)") !=
+              std::string::npos &&
+          response.body.find(
+              "clientLog('control_trace_batch',{reason,trace_session_id:String(scope&&scope.session_id||''),"
+              "trace_vehicle_id:String(scope&&scope.vehicle_id||''),commands,summary})") !=
+              std::string::npos &&
+          response.body.find("controlTraceBuffer.length>=48") != std::string::npos &&
+          response.body.find("setInterval(()=>flushControlTrace('interval'),1000)") !=
+              std::string::npos &&
+          response.body.find("clientLog('control_trace_command'") == std::string::npos,
+      "control command tracing is not enabled through a bounded one-second batch");
+  for (const std::string_view field : {
+           "session_id", "browser_prepare_started_at_utc_ms", "native_command_sent_at_utc_ms",
+           "prepare_elapsed_ms", "data_channel_send_invoked_at_utc_ms", "buffered_amount_bytes",
+           "outcome", "trace_session_id", "trace_vehicle_id", "heartbeat_tick_count",
+           "heartbeat_enqueued_count",
+           "heartbeat_coalesced_count", "timer_lag_max_ms", "backpressure_count",
+           "prepare_timeout_count", "prepare_expired_count", "prepare_preempted_by_estop_count",
+           "queue_unhandled_error_count"}) {
+    expect(
+        response.body.find(field) != std::string::npos,
+        "control trace field is missing from the page: " + std::string(field));
+  }
+  const auto trace_flush = response.body.find("function flushControlTrace(");
+  expect(
+      trace_flush != std::string::npos &&
+          response.body.find("summary.prepare_timeout_count", trace_flush) != std::string::npos &&
+          response.body.find("summary.prepare_expired_count", trace_flush) != std::string::npos &&
+          response.body.find("summary.prepare_preempted_by_estop_count", trace_flush) !=
+              std::string::npos,
+      "summary-only control prepare failures can be discarded during trace flush");
+  const auto terminal_trace_queue = response.body.find("function queueTerminalControlTrace(");
+  const auto terminal_trace_flush = response.body.find("function flushControlTrace(", terminal_trace_queue);
+  const auto terminal_trace_contract =
+      terminal_trace_queue != std::string::npos && terminal_trace_flush != std::string::npos
+          ? response.body.substr(
+                terminal_trace_queue, terminal_trace_flush - terminal_trace_queue)
+          : std::string{};
+  expect(
+      terminal_trace_queue != std::string::npos && terminal_trace_flush != std::string::npos &&
+          terminal_trace_contract.find("emitControlTraceBatch('late_terminal'") !=
+              std::string::npos &&
+          terminal_trace_contract.find("setControlTraceScope") == std::string::npos &&
+          response.body.find(
+              "commandTrace=controlTraceEnabled?{scope:writeTraceScope,") != std::string::npos &&
+          response.body.find(
+              "noteScopedControlTraceCounter('prepare_timeout_count',writeTraceScope)") !=
+              std::string::npos &&
+          response.body.find(
+              "noteScopedControlTraceCounter('prepare_expired_count',writeTraceScope)") !=
+              std::string::npos,
+      "a late command can mutate the active trace scope or attribute delayed prepare counters to the new session");
+  const auto connect_handler = response.body.find("async function connect()");
+  const auto connect_close = response.body.find("generation=closeRealtimeSession()", connect_handler);
+  const auto connect_trace_scope =
+      response.body.find("setControlTraceScope(session.session_id,session.vehicle_id)", connect_close);
+  expect(
+      connect_handler != std::string::npos && connect_close != std::string::npos &&
+          connect_trace_scope != std::string::npos && connect_close < connect_trace_scope,
+      "new browser control traces are not scoped after the previous realtime session is flushed");
+  const auto peer_state_handler = response.body.find("nextPeer.onconnectionstatechange=()=>{");
+  const auto peer_terminal_flush =
+      response.body.find("flushControlTrace(`peer_${connectionState}`)", peer_state_handler);
+  const auto peer_terminal_log =
+      response.body.find("clientLog('webrtc_peer_terminal'", peer_state_handler);
+  const auto peer_terminal_clear = response.body.find(
+      "if(controlChannel===terminalChannel)controlChannel=null", peer_state_handler);
+  expect(
+      peer_state_handler != std::string::npos && peer_terminal_flush != std::string::npos &&
+          peer_terminal_log != std::string::npos && peer_terminal_clear != std::string::npos &&
+          peer_terminal_flush < peer_terminal_log && peer_terminal_log < peer_terminal_clear,
+      "terminal peer state can clear the DataChannel before its trace and failure context are persisted");
+  const auto data_channel_error_handler = response.body.find("channel.onerror=()=>{");
+  const auto data_channel_error_log =
+      response.body.find("clientLog('control_datachannel_error'", data_channel_error_handler);
+  const auto data_channel_error_flush =
+      response.body.find("flushControlTrace('datachannel_error')", data_channel_error_handler);
+  const auto data_channel_error_reset =
+      response.body.find("resetControlAuthorityInput()", data_channel_error_handler);
+  expect(
+      data_channel_error_handler != std::string::npos &&
+          data_channel_error_flush != std::string::npos &&
+          data_channel_error_log != std::string::npos &&
+          data_channel_error_reset != std::string::npos &&
+          data_channel_error_flush < data_channel_error_log &&
+          data_channel_error_log < data_channel_error_reset,
+      "DataChannel errors are not persisted before control input is cleared");
+  const auto data_channel_close_handler = response.body.find("channel.onclose=()=>{");
+  const auto data_channel_close_flush =
+      response.body.find("flushControlTrace('datachannel_close')", data_channel_close_handler);
+  const auto data_channel_close_clear =
+      response.body.find("controlChannel=null", data_channel_close_handler);
+  expect(
+      data_channel_close_handler != std::string::npos &&
+          data_channel_close_flush != std::string::npos &&
+          data_channel_close_clear != std::string::npos &&
+          data_channel_close_flush < data_channel_close_clear,
+      "DataChannel close does not flush the pending control trace");
   expect(response.body.find("dev-password") == std::string::npos, "driver credential leaked into the control page");
   expect(
       response.body.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
               std::string::npos &&
-          response.body.find("sendPendingControlProfile();enqueueControlHeartbeat()") !=
+          response.body.find("sendPendingControlProfile();const enqueued=enqueueControlHeartbeat()") !=
               std::string::npos,
       "background safety ticks can override waiting state");
-  expect(response.body.find("addEventListener('pagehide'") != std::string::npos, "page close does not release the session");
+  const auto pagehide = response.body.find("addEventListener('pagehide'");
+  const auto pagehide_flush = response.body.find("flushControlTrace('pagehide')", pagehide);
+  const auto pagehide_close = response.body.find("closeRealtimeSession()", pagehide);
+  const auto pagehide_disconnect = response.body.find("fetch('/api/disconnect'", pagehide);
+  expect(
+      pagehide != std::string::npos && pagehide_flush != std::string::npos &&
+          pagehide_close != std::string::npos && pagehide_disconnect != std::string::npos &&
+          pagehide_flush < pagehide_close && pagehide_close < pagehide_disconnect,
+      "page close does not flush control trace before releasing the session");
   const auto initial_status = runtime->status();
   expect(
       initial_status.at("last_signaling_messages").is_array() &&
@@ -1110,6 +1223,7 @@ void test_driver_gamepad_config() {
       "browser event log filename changed");
   expect(config.browser_event_log_max_bytes == 2097152, "browser event log rotation size changed");
   expect(config.browser_event_log_files == 3, "browser event log retention count changed");
+  expect(!config.control_trace_commands, "high-rate control trace must remain opt-in by default");
 
   const auto field = mine_teleop::load_driver_config("configs/driver-console.three-machine.dev.yaml");
   expect(
@@ -1124,6 +1238,11 @@ void test_driver_gamepad_config() {
       "field driver CA path was not resolved relative to its config");
   expect(std::filesystem::is_regular_file(field.ca_bundle), "field driver CA bundle is missing");
   expect(field.ice_transport_policy == "all", "field driver ICE policy is not the safe default");
+  expect(field.control_trace_commands, "field driver control trace is not enabled");
+  expect(
+      field.browser_event_log_max_bytes == 16 * 1024 * 1024 &&
+          field.browser_event_log_files == 4,
+      "field driver log rotation capacity is too small for batched command traces");
   expect(field.max_time_sync_uncertainty_ms == 25, "field driver time synchronization limit is not 25ms");
   expect(
       field.control_limits.initial_target_speed_kph == 2.0,
@@ -1240,6 +1359,134 @@ void test_stale_control_data_channel_callbacks_are_fail_silent() {
           handshake_unavailable < handshake_status &&
           handshake_branch.find("control_channel != channel ||") == std::string::npos,
       "a stale handshake callback can publish a rejection on the replacement control channel");
+}
+
+void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
+  const auto source = read_text_file("cpp/src/webrtc_media.cpp");
+  const auto handler = cpp_function_contract(source, "void handle_control_message(");
+  const auto enqueue = cpp_function_contract(source, "void enqueue_control_trace(");
+  const auto worker = cpp_function_contract(source, "void control_trace_worker_loop_impl()");
+  const auto trace_output = cpp_function_contract(source, "void write_control_trace_batch_line(");
+  const auto stop_worker = cpp_function_contract(source, "void stop_control_trace_worker()");
+  const auto run = cpp_function_contract(source, "Json run(int frame_count, int duration_ms, int capture_interval_ms)");
+  const auto callback_timestamp = handler.find("callback_entered_at_utc_ms = signaling.now_ms()");
+  const auto command_parse = handler.find("const auto command = ControlCommand::from_json(message)");
+  const auto lock_wait_started = handler.find("control_mutex_wait_started_monotonic_ms = steady_now_ms()");
+  const auto lock_acquired = handler.find("control_mutex_acquired_monotonic_ms = steady_now_ms()");
+  expect(
+      callback_timestamp != std::string::npos && command_parse != std::string::npos &&
+          lock_wait_started != std::string::npos && lock_acquired != std::string::npos &&
+          callback_timestamp < command_parse && command_parse < lock_wait_started &&
+          lock_wait_started < lock_acquired,
+      "vehicle control trace does not separate callback entry, parsing, and mutex wait");
+  for (const auto field : {
+           "callback_entered_at_utc_ms",
+           "callback_entered_monotonic_ms",
+           "received_at_utc_ms",
+           "control_mutex_acquired_at_utc_ms",
+           "control_mutex_acquired_monotonic_ms",
+           "control_mutex_wait_ms",
+           "callback_to_mutex_acquired_ms",
+           "receive_apply_invoked",
+           "receive_apply_started_at_utc_ms",
+           "receive_apply_started_monotonic_ms",
+           "receive_apply_completed_at_utc_ms",
+           "receive_apply_completed_monotonic_ms",
+           "receive_apply_processing_ms",
+           "control_path_completed_before_trace_at_utc_ms",
+           "control_path_completed_before_trace_monotonic_ms",
+           "control_path_processing_before_trace_ms",
+           "accepted",
+           "reason"}) {
+    expect(
+        handler.find(std::string("{\"") + field + "\"") != std::string::npos,
+        std::string("vehicle control trace omits diagnostic field ") + field);
+  }
+  expect(
+      source.find("callback_completed_at_utc_ms") == std::string::npos &&
+          source.find("callback_completed_monotonic_ms") == std::string::npos &&
+          source.find("callback_processing_ms") == std::string::npos,
+      "trace labels queue preparation as DataChannel callback completion");
+  const auto early_reason = handler.find("const std::string_view reason = stop_requested");
+  const auto early_unlock = handler.find("lock.unlock();", early_reason);
+  const auto early_trace = handler.find("queue_control_trace(", early_unlock);
+  const auto early_return = handler.find("return;", early_trace);
+  expect(
+      early_reason != std::string::npos &&
+          handler.find("\"runtime_stop_requested\"") != std::string::npos &&
+          handler.find("\"control_inhibited\"") != std::string::npos &&
+          handler.find("\"stale_control_channel\"") != std::string::npos &&
+          handler.find("\"control_service_unavailable\"") != std::string::npos &&
+          handler.find("\"control_link_not_open\"") != std::string::npos &&
+          handler.find("\"receive_apply_exception\"") != std::string::npos &&
+          early_unlock != std::string::npos && early_trace != std::string::npos &&
+          early_return != std::string::npos && early_reason < early_unlock &&
+          early_unlock < early_trace && early_trace < early_return,
+      "early or exceptional control drops do not retain a precise trace reason");
+  expect(
+      handler.find("receive_apply_completed_at_utc_ms\n                                                         ? Json(*receive_apply_completed_at_utc_ms)") !=
+              std::string::npos &&
+          handler.find("receive_apply_started_monotonic_ms && receive_apply_completed_monotonic_ms") !=
+              std::string::npos,
+      "an early drop can be misreported as receive/apply processing");
+
+  const auto trace_lambda = handler.find("const auto queue_control_trace");
+  const auto first_control_guard = handler.find(
+      "if (stop_requested || control_inhibited || control_channel != channel", trace_lambda);
+  expect(
+      trace_lambda != std::string::npos && first_control_guard != std::string::npos,
+      "vehicle control trace producer could not be isolated");
+  const auto producer = handler.substr(trace_lambda, first_control_guard - trace_lambda);
+  expect(
+      producer.find(") noexcept {") != std::string::npos &&
+          producer.find("enqueue_control_trace(std::move(record))") != std::string::npos &&
+          producer.find("bounded_control_trace_text") != std::string::npos &&
+          producer.find("std::cout") == std::string::npos &&
+          producer.find("write_control_trace_batch_line") == std::string::npos &&
+          producer.find("control_token") == std::string::npos,
+      "DataChannel callback trace producer can write output, leak a token, or throw");
+  expect(
+      handler.find("lock.unlock();\n        queue_control_trace") != std::string::npos &&
+          handler.find("queue_control_trace(\n          &result", early_return) != std::string::npos,
+      "vehicle control trace is queued while holding the vehicle control mutex");
+  const auto exception_reason = handler.find("\"receive_apply_exception\"");
+  const auto exception_rethrow = handler.find("throw;", exception_reason);
+  expect(
+      exception_reason != std::string::npos && exception_rethrow != std::string::npos &&
+          exception_reason < exception_rethrow,
+      "trace failure can mask the original receive/apply exception");
+
+  expect(
+      source.find("kControlTraceQueueCapacity = 256") != std::string::npos &&
+          enqueue.find("std::try_to_lock") != std::string::npos &&
+          enqueue.find("kControlTraceQueueCapacity") != std::string::npos &&
+          enqueue.find("note_control_trace_drop()") != std::string::npos,
+      "control trace producer does not use a bounded non-blocking queue");
+  expect(
+      worker.find("std::chrono::seconds(1)") != std::string::npos &&
+          worker.find("kControlTraceBatchMaxRecords") != std::string::npos &&
+          worker.find("kControlTraceBatchCommandsMaxBytes") != std::string::npos &&
+          worker.find("\"vehicle_control_trace_batch\"") != std::string::npos &&
+          worker.find("\"dropped_since_last\"") != std::string::npos &&
+          worker.find("\"dropped_total\"") != std::string::npos &&
+          worker.find("\"final\"") != std::string::npos,
+      "trace worker does not batch by time/size or expose loss accounting");
+  expect(
+      trace_output.find("kControlTraceBatchLineMaxBytes") != std::string::npos &&
+          trace_output.find("std::osyncstream output(std::cout)") != std::string::npos &&
+          trace_output.find("diagnostic_mutex") == std::string::npos,
+      "trace output can exceed the launcher line limit or block callbacks on a shared log mutex");
+  expect(
+      stop_worker.find("control_trace_accepting.store(false") != std::string::npos &&
+          stop_worker.find("control_trace_worker.joinable()") != std::string::npos &&
+          stop_worker.find("control_mutex") == std::string::npos,
+      "trace shutdown joins while holding the control mutex");
+  const auto run_stop_trace = run.rfind("stop_control_trace_worker()");
+  const auto run_return = run.rfind("return summary;");
+  expect(
+      run_stop_trace != std::string::npos && run_return != std::string::npos &&
+          run_stop_trace < run_return,
+      "media summary can be written before the final trace batch is drained");
 }
 
 void test_structured_control_rejection_is_safe_and_rate_limited() {
@@ -1639,6 +1886,31 @@ void test_browser_event_logging_rotation_and_redaction() {
   expect(persisted.find("control_monitor_state") != std::string::npos, "browser event name was not written");
   expect(persisted.find("[redacted]") != std::string::npos, "browser event credentials were not redacted");
   expect(persisted.find("never-write-this") == std::string::npos, "browser event log contains a credential");
+
+  request.body = mine_teleop::Json({
+      {"event", "control_trace_batch"},
+      {"sent_at_utc_ms", mine_teleop::now_ms()},
+      {"details",
+       {{"reason", "interval"},
+        {"commands",
+         mine_teleop::Json::array(
+             {{{"session_id", "session-001"},
+               {"seq", 42},
+               {"outcome", "forwarded"},
+               {"control_token", "must-not-be-written"}}})},
+        {"summary", {{"heartbeat_tick_count", 20}, {"timer_lag_max_ms", 3.0}}}}},
+  }).dump();
+  expect(app.handle(request).status == 200, "batched control trace could not be persisted");
+  const auto trace_persisted = read_text_file(log_path);
+  expect(
+      trace_persisted.find("control_trace_batch") != std::string::npos &&
+          trace_persisted.find("\"seq\":42") != std::string::npos &&
+          trace_persisted.find("\"outcome\":\"forwarded\"") != std::string::npos,
+      "batched terminal control trace fields were not written");
+  expect(
+      trace_persisted.find("[redacted]") != std::string::npos &&
+          trace_persisted.find("must-not-be-written") == std::string::npos,
+      "batched control trace credentials were not redacted");
 
   request.body = R"({"event":"bad event","details":{}})";
   expect(app.handle(request).status == 400, "invalid browser event name was accepted");
@@ -4311,6 +4583,8 @@ int main() {
        test_vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start},
       {"stale_control_data_channel_callbacks_are_fail_silent",
        test_stale_control_data_channel_callbacks_are_fail_silent},
+      {"vehicle_control_command_trace_is_bounded_async_and_timed",
+       test_vehicle_control_command_trace_is_bounded_async_and_timed},
       {"structured_control_rejection_is_safe_and_rate_limited",
        test_structured_control_rejection_is_safe_and_rate_limited},
       {"driver_brake_limit_config_validation", test_driver_brake_limit_config_validation},

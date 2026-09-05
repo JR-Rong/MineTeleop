@@ -295,6 +295,7 @@ struct DriverConfig {
   std::filesystem::path browser_event_log_path;
   std::uint64_t browser_event_log_max_bytes{2 * 1024 * 1024};
   int browser_event_log_files{3};
+  bool control_trace_commands{false};
   int rate_hz{20};
   int estop_hold_ms{500};
   int max_time_sync_uncertainty_ms{25};

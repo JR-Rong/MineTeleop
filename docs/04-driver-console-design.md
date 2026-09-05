@@ -262,3 +262,11 @@ TURN 使用状态和时间同步可信度。逐路指标超过 200 ms 或低于 
 `password`、`token`、`secret` 或 `credential` 的值会在写盘前递归替换为
 `[redacted]`，单条超出文件上限的事件会被拒绝。日志用于本地排障，不能替代服务端
 会话审计或车辆安全记录。
+
+现场排查可显式开启 `logging.control_trace_commands`。页面把控制命令 terminal
+结果与 heartbeat/timer/queue/backpressure 摘要缓存在内存中，约每秒批量写入一条
+`control_trace_batch`，并在 `pagehide` 和会话关闭时尽力刷新。批次只记录选定的
+序号和时间字段，并用 `trace_session_id`、`trace_vehicle_id` 固定标记该批次的原始
+会话归属，不记录 `control_token` 或完整命令；这样既能关联控制端 prepare、
+浏览器 DataChannel 调用与车端逐命令日志，也避免 20 Hz 逐命令回环 HTTP 请求反过来
+干扰控制调度。

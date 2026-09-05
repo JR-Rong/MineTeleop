@@ -1417,6 +1417,9 @@ void test_field_config_pins_tls_route_without_system_dns() {
   expect(
       config.runtime.teleop_poll_interval_ms == 500,
       "field vehicle session discovery interval is not rate-limit safe");
+  expect(
+      config.runtime.control_log_commands,
+      "field vehicle per-command diagnostic tracing is disabled");
   expect(config.cloud.ice_transport_policy == "all", "field vehicle ICE policy is not the safe default");
   expect(mine_teleop::ice_transport_policy_is_valid("all"), "all ICE policy was rejected");
   expect(mine_teleop::ice_transport_policy_is_valid("relay"), "relay ICE policy was rejected");
