@@ -47,6 +47,7 @@ tar -xzf mine-teleop-vehicle-ubuntu22.04-x64-*.tar.gz
 cd mine-teleop-vehicle-ubuntu22.04-x64-*
 printf '%s\n' '<device-token-from-secret-store>' > config/device-token
 chmod 600 config/device-token
+sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /var/log/mine-teleop
 
 ./bin/mine-teleop-run config-check --config config/vehicle-agent.yaml
 ./bin/mine-teleop-run vehicle-agent \
@@ -61,7 +62,18 @@ chmod 600 config/device-token
 
 最后一条命令在前台监督控制和媒体进程；任一子进程失败时结束同伴进程。使用
 `Ctrl-C` 停止。现场配置应从 `configs/vehicle-agent.three-machine.field.yaml`
-生成，并在运行前通过 `config-check`。
+生成，并在运行前通过 `config-check`。启动器继续把 stdout/stderr 显示在终端，
+同时合并写入 `/var/log/mine-teleop/vehicle-runtime.log`；该混合日志不是严格
+JSONL，默认每份 64 MiB、保留 `.1` 到 `.5`。可识别的 vendor ChassisControl 输出
+（包括每周期裸行 `UpdateVehicleState` 及其 `[timestamp] [level] [pid] [tag]` 日志）
+只留在终端，不写入该落盘日志；Mine Teleop 结构化诊断仍照常记录。VCU 原始协议日志仍单独写入
+`vcu-can.jsonl*`。
+
+实时查看车端运行日志：
+
+```bash
+sudo tail -F /var/log/mine-teleop/vehicle-runtime.log
+```
 
 ## macOS 控制端
 

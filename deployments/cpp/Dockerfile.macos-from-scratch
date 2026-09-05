@@ -34,6 +34,7 @@ RUN printf '%s\n' \
       libusb-1.0-0-dev \
       libyaml-cpp-dev \
       nlohmann-json3-dev \
+      nodejs \
       patchelf \
       pkg-config \
       v4l-utils \
@@ -56,6 +57,7 @@ RUN printf '%s\n' \
       ca-certificates \
       cmake \
       crossbuild-essential-amd64 \
+      nodejs \
       pkg-config \
     && rm -rf /var/lib/apt/lists/*
 

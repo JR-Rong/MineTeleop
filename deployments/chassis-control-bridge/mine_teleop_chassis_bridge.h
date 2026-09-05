@@ -11,6 +11,8 @@
 #define MINE_TELEOP_CHASSIS_MIN_DBC_MOTOR_TORQUE_NM -800.0
 #define MINE_TELEOP_CHASSIS_MAX_DBC_MOTOR_TORQUE_NM 838.3
 #define MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM 0.1
+#define MINE_TELEOP_CHASSIS_DEFAULT_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND 0.0
+#define MINE_TELEOP_CHASSIS_MAX_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND 32000.0
 #define MINE_TELEOP_CHASSIS_DEFAULT_MAX_BRAKE_PRESSURE_BAR 100.0
 #define MINE_TELEOP_CHASSIS_MAX_ORDINARY_BRAKE_PRESSURE_BAR 327.6
 #define MINE_TELEOP_CHASSIS_MAX_EMERGENCY_BRAKE_PRESSURE_BAR 409.5
@@ -26,30 +28,49 @@
 #define MINE_TELEOP_CHASSIS_MAX_DERIVATIVE_FILTER_TAU_MS 2000.0
 #define MINE_TELEOP_CHASSIS_SPEED_PID_SETPOINT_RESET_DEADBAND_MPS 0.05
 #define MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS 10.0
-#define MINE_TELEOP_CHASSIS_SESSION_CONTROL_PROFILE_VERSION 2U
+#define MINE_TELEOP_CHASSIS_LEGACY_SESSION_CONTROL_PROFILE_VERSION 2U
+#define MINE_TELEOP_CHASSIS_SESSION_CONTROL_PROFILE_VERSION 3U
 #define MINE_TELEOP_CHASSIS_MAX_STEERING_REQUEST 1.0
 
-/* Convert the normalized longitudinal input used by the runtime into the
- * ChassisControl acceleration input. Negative values are the independent
- * braking path and are deliberately not scaled by the traction setting. */
-static inline double mine_teleop_chassis_scaled_target_acceleration(
-    double target_ax,
-    double full_scale_motor_torque_nm) {
-    return target_ax > 0.0
-        ? target_ax * full_scale_motor_torque_nm /
-            MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM
-        : target_ax;
+static inline int mine_teleop_chassis_finite(double value) {
+    return value == value && value >= -DBL_MAX && value <= DBL_MAX;
 }
 
-/* Final per-channel traction ceiling. target_ax is the local PID output, not
- * the upstream analog throttle. ChassisControl steering compensation and
- * rate-limiting may not exceed this authoritative result. */
+/* Field WVCU integrations report vehicle-speed magnitude in both D and R.
+ * Keep the PID measurement unsigned; gear selection alone determines the
+ * requested motor-torque direction. */
+static inline double mine_teleop_chassis_speed_magnitude_mps(double speed_mps) {
+    return fabs(speed_mps);
+}
+
+static inline double mine_teleop_chassis_bounded_motor_torque_nm(
+    double normalized_pid_output,
+    double max_motor_torque_nm) {
+    if (!mine_teleop_chassis_finite(normalized_pid_output) ||
+        !mine_teleop_chassis_finite(max_motor_torque_nm) ||
+        !(normalized_pid_output > 0.0) || !(max_motor_torque_nm > 0.0)) {
+        return 0.0;
+    }
+    const double normalized_traction =
+        normalized_pid_output < 1.0 ? normalized_pid_output : 1.0;
+    double authoritative_limit = max_motor_torque_nm;
+    if (authoritative_limit > MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM) {
+        authoritative_limit = MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM;
+    }
+    if (authoritative_limit > MINE_TELEOP_CHASSIS_MAX_DBC_MOTOR_TORQUE_NM) {
+        authoritative_limit = MINE_TELEOP_CHASSIS_MAX_DBC_MOTOR_TORQUE_NM;
+    }
+    return normalized_traction * authoritative_limit;
+}
+
+/* Convert the normalized local speed-PID output directly to the requested
+ * per-motor torque. The session limit is authoritative and the result is
+ * quantized toward zero to the DBC's 0.1 Nm resolution. */
 static inline double mine_teleop_chassis_motor_torque_limit_nm(
-    double target_ax,
-    double full_scale_motor_torque_nm) {
-    if (!(target_ax > 0.0) || !(full_scale_motor_torque_nm > 0.0)) return 0.0;
-    const double normalized_traction = target_ax < 1.0 ? target_ax : 1.0;
-    const double requested_limit = normalized_traction * full_scale_motor_torque_nm;
+    double normalized_pid_output,
+    double max_motor_torque_nm) {
+    const double requested_limit = mine_teleop_chassis_bounded_motor_torque_nm(
+        normalized_pid_output, max_motor_torque_nm);
     return floor(
         nextafter(
             requested_limit / MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM,
@@ -57,41 +78,57 @@ static inline double mine_teleop_chassis_motor_torque_limit_nm(
         MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM;
 }
 
-static inline double mine_teleop_chassis_clamp_motor_torque_nm(
-    double motor_torque_nm,
-    double target_ax,
-    double full_scale_motor_torque_nm) {
-    const double limit = mine_teleop_chassis_motor_torque_limit_nm(
-        target_ax, full_scale_motor_torque_nm);
-    double bounded = motor_torque_nm;
-    if (bounded < -limit) bounded = -limit;
-    if (bounded > limit) bounded = limit;
-    const double magnitude_steps = floor(nextafter(
-        fabs(bounded) / MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM,
-        DBL_MAX));
-    const double quantized = magnitude_steps *
-        MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM;
-    return bounded < 0.0 ? -quantized : quantized;
+/* Limit only rising traction. Any decrease, including normal release, is
+ * applied immediately so stale positive torque cannot survive a stop path. */
+static inline double mine_teleop_chassis_rise_limited_motor_torque_nm(
+    double previous_motor_torque_nm,
+    double target_motor_torque_nm,
+    double rise_rate_nm_per_second,
+    double dt_seconds) {
+    if (!mine_teleop_chassis_finite(previous_motor_torque_nm) ||
+        !mine_teleop_chassis_finite(target_motor_torque_nm) ||
+        previous_motor_torque_nm < 0.0 || target_motor_torque_nm <= 0.0) {
+        return 0.0;
+    }
+    if (target_motor_torque_nm <= previous_motor_torque_nm) {
+        return target_motor_torque_nm;
+    }
+    if (rise_rate_nm_per_second == 0.0) return target_motor_torque_nm;
+    if (!mine_teleop_chassis_finite(rise_rate_nm_per_second) ||
+        rise_rate_nm_per_second < 0.0 ||
+        rise_rate_nm_per_second >
+            MINE_TELEOP_CHASSIS_MAX_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND ||
+        !mine_teleop_chassis_finite(dt_seconds) || dt_seconds <= 0.0) {
+        return 0.0;
+    }
+    return fmin(
+        target_motor_torque_nm,
+        previous_motor_torque_nm +
+            rise_rate_nm_per_second *
+                dt_seconds);
 }
 
-static inline double mine_teleop_chassis_clamp_directional_motor_torque_nm(
-    double motor_torque_nm,
+static inline double mine_teleop_chassis_directional_motor_torque_nm(
     int target_gear,
-    double normalized_traction,
-    double full_scale_motor_torque_nm) {
-    const double clamped = mine_teleop_chassis_clamp_motor_torque_nm(
-        motor_torque_nm, normalized_traction, full_scale_motor_torque_nm);
+    double motor_torque_magnitude_nm) {
+    if (!mine_teleop_chassis_finite(motor_torque_magnitude_nm) ||
+        motor_torque_magnitude_nm <= 0.0) {
+        return 0.0;
+    }
+    const double quantized_magnitude = floor(nextafter(
+        motor_torque_magnitude_nm /
+            MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM,
+        DBL_MAX)) * MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM;
     if (target_gear == 3) {
-        if (clamped <= 0.0) return 0.0;
-        return clamped > MINE_TELEOP_CHASSIS_MAX_DBC_MOTOR_TORQUE_NM
+        return quantized_magnitude > MINE_TELEOP_CHASSIS_MAX_DBC_MOTOR_TORQUE_NM
             ? MINE_TELEOP_CHASSIS_MAX_DBC_MOTOR_TORQUE_NM
-            : clamped;
+            : quantized_magnitude;
     }
     if (target_gear == 2) {
-        if (clamped >= 0.0) return 0.0;
-        return clamped < MINE_TELEOP_CHASSIS_MIN_DBC_MOTOR_TORQUE_NM
+        const double requested = -quantized_magnitude;
+        return requested < MINE_TELEOP_CHASSIS_MIN_DBC_MOTOR_TORQUE_NM
             ? MINE_TELEOP_CHASSIS_MIN_DBC_MOTOR_TORQUE_NM
-            : clamped;
+            : requested;
     }
     return 0.0;
 }
@@ -109,10 +146,6 @@ static inline double mine_teleop_chassis_quantize_brake_pressure_bar(
                bounded / MINE_TELEOP_CHASSIS_BRAKE_PRESSURE_RESOLUTION_BAR,
                DBL_MAX)) *
         MINE_TELEOP_CHASSIS_BRAKE_PRESSURE_RESOLUTION_BAR;
-}
-
-static inline int mine_teleop_chassis_finite(double value) {
-    return value == value && value >= -DBL_MAX && value <= DBL_MAX;
 }
 
 /* Validate every numeric ChassisControl output before applying saturation.
@@ -192,15 +225,16 @@ static inline int mine_teleop_chassis_speed_pid_setpoint_requires_reset(
             MINE_TELEOP_CHASSIS_SPEED_PID_SETPOINT_RESET_DEADBAND_MPS;
 }
 
-/* Pure local speed PID. Production passes the session torque limit divided by
- * full_scale_motor_torque_nm as the normalized ceiling. Derivative-on-
- * measurement avoids target-step kick; conditional integration prevents
- * windup while retaining a positive I term at target. */
+/* Pure local speed PID. Production uses normalized output up to 1.0, or the
+ * lower actuator-reachable ceiling when rising-torque shaping is enabled; the
+ * acknowledged per-motor session torque limit is applied afterwards.
+ * Derivative-on-measurement avoids target-step kick; conditional integration
+ * prevents windup while retaining a positive I term at target. */
 static inline double mine_teleop_chassis_speed_pid_step(
     const struct MineTeleopChassisSpeedPidConfig* config,
     struct MineTeleopChassisSpeedPidState* state,
     double target_speed_mps,
-    double measured_speed_along_gear_mps,
+    double measured_speed_magnitude_mps,
     double traction_ceiling,
     double dt_seconds) {
     if (!mine_teleop_chassis_speed_pid_config_is_valid(config) || state == 0 ||
@@ -209,7 +243,7 @@ static inline double mine_teleop_chassis_speed_pid_step(
         !mine_teleop_chassis_finite(state->previous_measurement) ||
         (state->initialized != 0 && state->initialized != 1) ||
         !mine_teleop_chassis_finite(target_speed_mps) || target_speed_mps <= 0.0 ||
-        !mine_teleop_chassis_finite(measured_speed_along_gear_mps) ||
+        !mine_teleop_chassis_finite(measured_speed_magnitude_mps) ||
         !mine_teleop_chassis_finite(traction_ceiling) || traction_ceiling <= 0.0 ||
         !mine_teleop_chassis_finite(dt_seconds) || dt_seconds <= 0.0 ||
         dt_seconds * 1000.0 > (double)config->max_dt_ms) {
@@ -218,11 +252,11 @@ static inline double mine_teleop_chassis_speed_pid_step(
     }
 
     if (traction_ceiling > 1.0) traction_ceiling = 1.0;
-    const double error = target_speed_mps - measured_speed_along_gear_mps;
+    const double error = target_speed_mps - measured_speed_magnitude_mps;
     double derivative = 0.0;
     if (state->initialized) {
         const double raw_derivative =
-            (measured_speed_along_gear_mps - state->previous_measurement) /
+            (measured_speed_magnitude_mps - state->previous_measurement) /
             dt_seconds;
         const double tau_seconds = config->derivative_filter_tau_ms / 1000.0;
         const double alpha = tau_seconds <= 0.0
@@ -234,7 +268,7 @@ static inline double mine_teleop_chassis_speed_pid_step(
     } else {
         state->initialized = 1;
     }
-    state->previous_measurement = measured_speed_along_gear_mps;
+    state->previous_measurement = measured_speed_magnitude_mps;
     if (state->integral < 0.0) state->integral = 0.0;
     if (state->integral > traction_ceiling) state->integral = traction_ceiling;
 
@@ -259,13 +293,14 @@ static inline double mine_teleop_chassis_speed_pid_step(
 
 static inline int mine_teleop_chassis_hard_overspeed(
     double target_speed_mps,
-    double measured_speed_along_gear_mps,
+    double measured_speed_mps,
     double margin_mps) {
     return mine_teleop_chassis_finite(target_speed_mps) &&
-        mine_teleop_chassis_finite(measured_speed_along_gear_mps) &&
+        mine_teleop_chassis_finite(measured_speed_mps) &&
         mine_teleop_chassis_finite(margin_mps) && target_speed_mps >= 0.0 &&
         margin_mps > 0.0 &&
-        measured_speed_along_gear_mps > target_speed_mps + margin_mps;
+        mine_teleop_chassis_speed_magnitude_mps(measured_speed_mps) >
+            target_speed_mps + margin_mps;
 }
 
 static inline int mine_teleop_chassis_hard_overspeed_latch(
@@ -275,15 +310,6 @@ static inline int mine_teleop_chassis_hard_overspeed_latch(
     double margin_mps) {
     return already_latched || mine_teleop_chassis_hard_overspeed(
         target_speed_mps, measured_speed_mps, margin_mps);
-}
-
-static inline int mine_teleop_chassis_opposite_direction_motion(
-    int target_gear,
-    double signed_speed_mps) {
-    if (!mine_teleop_chassis_finite(signed_speed_mps)) return 1;
-    if (target_gear == 3) return signed_speed_mps < -0.1;
-    if (target_gear == 2) return signed_speed_mps > 0.1;
-    return 0;
 }
 
 static inline int mine_teleop_chassis_control_watchdog_expired(
@@ -307,6 +333,59 @@ struct MineTeleopChassisTelemetry {
     double throttle_feedback;
     double brake_feedback;
     int estop;
+    uint32_t stop_source;
+    uint32_t stop_reason;
+    uint64_t stop_sequence;
+};
+
+/* Stable stop provenance carried from the caller into the bridge and returned
+ * with telemetry. The first stop cause remains authoritative until the stop is
+ * cleared; a subsequently asserted physical emergency may supersede it. */
+enum MineTeleopChassisStopSource {
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_NONE = 0,
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_DRIVER_PAGE = 1,
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_SESSION = 2,
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_WATCHDOG = 3,
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_SOFTWARE_FAULT = 4,
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_PHYSICAL_EMERGENCY = 5,
+    MINE_TELEOP_CHASSIS_STOP_SOURCE_UNKNOWN = 255,
+};
+
+enum MineTeleopChassisStopReason {
+    MINE_TELEOP_CHASSIS_STOP_REASON_NONE = 0,
+    MINE_TELEOP_CHASSIS_STOP_REASON_OPERATOR_ESTOP = 1,
+    MINE_TELEOP_CHASSIS_STOP_REASON_VCU_HANDSHAKE_DISCONNECT = 2,
+    MINE_TELEOP_CHASSIS_STOP_REASON_DRIVER_DISCONNECT = 3,
+    MINE_TELEOP_CHASSIS_STOP_REASON_SESSION_LOST = 4,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CONTROL_APPLY_TIMEOUT = 5,
+    MINE_TELEOP_CHASSIS_STOP_REASON_OUTER_CONTROL_TIMEOUT = 6,
+    MINE_TELEOP_CHASSIS_STOP_REASON_FEEDBACK_TIMEOUT = 7,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CONTROL_APPLY_FAILED = 8,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CHASSIS_CONTROL_FAULT = 9,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CAN_RECEIVE_FAILED = 10,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CAN_SEND_FAILED = 11,
+    MINE_TELEOP_CHASSIS_STOP_REASON_IO_THREAD_EXCEPTION = 12,
+    MINE_TELEOP_CHASSIS_STOP_REASON_HARD_OVERSPEED = 13,
+    /* Reserved for compatibility with runtimes that emitted this retired reason. */
+    MINE_TELEOP_CHASSIS_STOP_REASON_OPPOSITE_DIRECTION_MOTION = 14,
+    MINE_TELEOP_CHASSIS_STOP_REASON_ARMING_MOTION = 15,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CONTROL_COMMAND_INVALID = 16,
+    MINE_TELEOP_CHASSIS_STOP_REASON_PHYSICAL_EMERGENCY_SWITCH = 17,
+    MINE_TELEOP_CHASSIS_STOP_REASON_HANDSHAKE_REVOKED = 18,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CRITICAL_CAMERA_FAILED = 19,
+    MINE_TELEOP_CHASSIS_STOP_REASON_MEDIA_PIPELINE_FAILED = 20,
+    MINE_TELEOP_CHASSIS_STOP_REASON_VCU_STATE_FAULT = 21,
+    MINE_TELEOP_CHASSIS_STOP_REASON_SESSION_PROFILE_REQUIRED = 22,
+    MINE_TELEOP_CHASSIS_STOP_REASON_CAN_FEEDBACK_MISSING = 23,
+    MINE_TELEOP_CHASSIS_STOP_REASON_ADAPTER_SAFETY_STATUS_UNAVAILABLE = 24,
+    MINE_TELEOP_CHASSIS_STOP_REASON_LEGACY_UNSPECIFIED = 255,
+};
+
+struct MineTeleopChassisStopContextV1 {
+    uint32_t struct_size;
+    uint32_t stop_source;
+    uint32_t stop_reason;
+    uint32_t reserved;
 };
 
 struct MineTeleopChassisFeedback {
@@ -358,12 +437,19 @@ struct MineTeleopChassisHandshakeStatus {
     int epb_valid[4];
     double speed_mps;
     int speed_valid;
+    int handshake_revoked;
+    int revoked_handshake_status;
+    int vmc_fault_code;
+    int vmc_fault_code_valid;
+    int parking_brake_switch;
+    int parking_brake_switch_valid;
+    int brake_pedal_switch;
+    int brake_pedal_switch_valid;
 };
 
-/*
- * Optional versioned extension for complete measured CAN feedback. Keeping it
- * separate from MineTeleopChassisTelemetry preserves compatibility with older
- * bridge packages that expose only the summary ABI.
+/* Complete measured CAN feedback required by ABI version 6. It remains
+ * separate from MineTeleopChassisTelemetry so summary and detailed telemetry
+ * have distinct responsibilities; ABI version 5 packages are not compatible.
  */
 struct MineTeleopChassisCanFeedbackV1 {
     int feedback_fresh;
@@ -391,6 +477,12 @@ struct MineTeleopChassisCanFeedbackV1 {
     int brake_mode[8];
     int brake_valid[8];
     double brake_pressure_bar[8];
+    int vmc_fault_code;
+    int vmc_fault_code_valid;
+    int parking_brake_switch;
+    int parking_brake_switch_valid;
+    int brake_pedal_switch;
+    int brake_pedal_switch_valid;
 };
 
 struct MineTeleopChassisOpenConfigV1 {
@@ -436,8 +528,28 @@ struct MineTeleopChassisOpenConfigV3 {
     double max_ordinary_brake_pressure_bar;
 };
 
-/* Complete session-scoped runtime control snapshot. The immutable physical
- * ceilings and safety watchdogs remain owned by OpenConfigV3. */
+/* V4 keeps the V3 prefix intact and adds an optional per-motor rising-torque
+ * rate. Zero disables additional slew shaping; torque reductions stay
+ * immediate for every value. */
+struct MineTeleopChassisOpenConfigV4 {
+    uint32_t struct_size;
+    const char* can_interface;
+    double full_scale_motor_torque_nm;
+    double hard_speed_limit_mps;
+    int32_t control_timeout_ms;
+    int32_t speed_feedback_timeout_ms;
+    double speed_pid_kp;
+    double speed_pid_ki;
+    double speed_pid_kd;
+    double speed_pid_derivative_filter_tau_ms;
+    int32_t speed_pid_max_dt_ms;
+    double hard_overspeed_margin_mps;
+    double max_ordinary_brake_pressure_bar;
+    double motor_torque_rise_rate_nm_per_s;
+};
+
+/* Legacy profile-version-2 runtime snapshot. Its 88-byte ABI is immutable.
+ * The bridge retains the motor-torque rise rate supplied at open time. */
 struct MineTeleopChassisRuntimeControlConfigV1 {
     uint32_t struct_size;
     uint32_t profile_version;
@@ -452,6 +564,25 @@ struct MineTeleopChassisRuntimeControlConfigV1 {
     double speed_pid_derivative_filter_tau_ms;
     int32_t speed_pid_max_dt_ms;
     uint32_t reserved;
+};
+
+/* Profile-version-3 runtime snapshot. V2 keeps the complete V1 prefix and
+ * adds the session-scoped rising-torque rate. */
+struct MineTeleopChassisRuntimeControlConfigV2 {
+    uint32_t struct_size;
+    uint32_t profile_version;
+    uint64_t profile_revision;
+    double target_speed_limit_mps;
+    double max_motor_torque_nm;
+    double max_brake_pressure_bar;
+    double max_steering_request;
+    double speed_pid_kp;
+    double speed_pid_ki;
+    double speed_pid_kd;
+    double speed_pid_derivative_filter_tau_ms;
+    int32_t speed_pid_max_dt_ms;
+    uint32_t reserved;
+    double motor_torque_rise_rate_nm_per_s;
 };
 
 enum MineTeleopChassisRuntimeControlIssueV1 {
@@ -524,8 +655,57 @@ static_assert(
 static_assert(
     sizeof(MineTeleopChassisOpenConfigV3) ==
     sizeof(MineTeleopChassisOpenConfigV2) + sizeof(double));
+#define MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(field) \
+    static_assert(offsetof(MineTeleopChassisOpenConfigV4, field) == \
+        offsetof(MineTeleopChassisOpenConfigV3, field))
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(struct_size);
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(can_interface);
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(full_scale_motor_torque_nm);
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(hard_speed_limit_mps);
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(control_timeout_ms);
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(speed_feedback_timeout_ms);
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(speed_pid_kp);
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(speed_pid_ki);
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(speed_pid_kd);
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(speed_pid_derivative_filter_tau_ms);
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(speed_pid_max_dt_ms);
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(hard_overspeed_margin_mps);
+MINE_TELEOP_ASSERT_V4_PREFIX_FIELD(max_ordinary_brake_pressure_bar);
+#undef MINE_TELEOP_ASSERT_V4_PREFIX_FIELD
+static_assert(
+    offsetof(MineTeleopChassisOpenConfigV4, motor_torque_rise_rate_nm_per_s) ==
+    sizeof(MineTeleopChassisOpenConfigV3));
+static_assert(
+    sizeof(MineTeleopChassisOpenConfigV4) ==
+    sizeof(MineTeleopChassisOpenConfigV3) + sizeof(double));
 static_assert(sizeof(MineTeleopChassisApplyResultV1) == 16U);
+static_assert(sizeof(MineTeleopChassisStopContextV1) == 16U);
+static_assert(sizeof(MineTeleopChassisTelemetry) == 64U);
 static_assert(sizeof(MineTeleopChassisRuntimeControlConfigV1) == 88U);
+#define MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(field) \
+    static_assert(offsetof(MineTeleopChassisRuntimeControlConfigV2, field) == \
+        offsetof(MineTeleopChassisRuntimeControlConfigV1, field))
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(struct_size);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(profile_version);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(profile_revision);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(target_speed_limit_mps);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(max_motor_torque_nm);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(max_brake_pressure_bar);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(max_steering_request);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(speed_pid_kp);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(speed_pid_ki);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(speed_pid_kd);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(
+    speed_pid_derivative_filter_tau_ms);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(speed_pid_max_dt_ms);
+MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD(reserved);
+#undef MINE_TELEOP_ASSERT_RUNTIME_CONTROL_V2_PREFIX_FIELD
+static_assert(
+    offsetof(
+        MineTeleopChassisRuntimeControlConfigV2,
+        motor_torque_rise_rate_nm_per_s) ==
+    sizeof(MineTeleopChassisRuntimeControlConfigV1));
+static_assert(sizeof(MineTeleopChassisRuntimeControlConfigV2) == 96U);
 static_assert(sizeof(MineTeleopChassisRuntimeControlResultV1) == 24U);
 #endif
 
@@ -535,7 +715,10 @@ static_assert(sizeof(MineTeleopChassisRuntimeControlResultV1) == 24U);
 uint32_t mine_teleop_chassis_abi_version(void);
 uint32_t mine_teleop_chassis_open_config_v2_size(void);
 uint32_t mine_teleop_chassis_open_config_v3_size(void);
+uint32_t mine_teleop_chassis_open_config_v4_size(void);
 uint32_t mine_teleop_chassis_runtime_control_config_v1_size(void);
+uint32_t mine_teleop_chassis_runtime_control_config_v2_size(void);
+uint32_t mine_teleop_chassis_stop_context_v1_size(void);
 int mine_teleop_chassis_open(const char* can_interface);
 /* Versioned open used by current runtimes. Invalid size/torque is rejected
  * before ChassisControl or SocketCAN is touched. */
@@ -545,13 +728,15 @@ int mine_teleop_chassis_open_v2(
     const struct MineTeleopChassisOpenConfigV2* config);
 int mine_teleop_chassis_open_v3(
     const struct MineTeleopChassisOpenConfigV3* config);
+int mine_teleop_chassis_open_v4(
+    const struct MineTeleopChassisOpenConfigV4* config);
 int mine_teleop_chassis_apply_state(
     int target_gear,
     double target_vx,
     double target_ax,
     const double* steering_values,
     int steering_count);
-/* Additive V3 capability. The legacy apply_state entry point remains
+/* Additive structured-result capability. The legacy apply_state entry point remains
  * available and preserves the same integer result codes. A non-null result is
  * required; it is filled in the same call while the bridge API lock is held. */
 int mine_teleop_chassis_apply_state_v2(
@@ -566,10 +751,17 @@ int mine_teleop_chassis_apply_state_v2(
 int mine_teleop_chassis_configure_runtime_control_v1(
     const struct MineTeleopChassisRuntimeControlConfigV1* config,
     struct MineTeleopChassisRuntimeControlResultV1* result);
+int mine_teleop_chassis_configure_runtime_control_v2(
+    const struct MineTeleopChassisRuntimeControlConfigV2* config,
+    struct MineTeleopChassisRuntimeControlResultV1* result);
 /* May be called from any bridge state. It never clears an existing safety
- * latch and restores the PID gains supplied at open_v3. */
+ * latch and restores the PID gains supplied by the current open config. */
 int mine_teleop_chassis_clear_runtime_control_v1(
     struct MineTeleopChassisRuntimeControlResultV1* result);
+/* Sets the trusted origin for the next exported stop/disconnect/close action.
+ * The context is consumed once and does not itself actuate the vehicle. */
+int mine_teleop_chassis_set_stop_context_v1(
+    const struct MineTeleopChassisStopContextV1* context);
 int mine_teleop_chassis_emergency_stop(void);
 /* Start is accepted only while the selector is N, EPB is parked, speed is
  * zero, and the VCU reports manual state. */

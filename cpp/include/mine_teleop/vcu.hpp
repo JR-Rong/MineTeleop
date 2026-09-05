@@ -30,6 +30,7 @@ constexpr std::uint32_t kWvcuHandshake = 0x18F0F5D0U;
 constexpr std::uint32_t kWvcuVehicleStatus = 0x18F2F5D0U;
 constexpr std::uint32_t kWvcuVehicleSpeed = 0x18F3F5D0U;
 constexpr std::uint32_t kWvcuDriverIntention = 0x18F5F5D0U;
+constexpr std::uint32_t kWvcuDriverIntention2 = 0x18F6F5D0U;
 constexpr std::uint32_t kWvcuParkingBrake = 0x18CFF4D0U;
 
 }  // namespace ids
@@ -60,9 +61,15 @@ struct Feedback {
   int gear{0};
   bool gear_valid{false};
   int emergency_switch{0};
+  int vmc_fault_code{0};
+  bool vmc_fault_code_valid{false};
 
   int driver_gear_request{0};
   bool driver_gear_request_valid{false};
+  int parking_brake_switch{0};
+  bool parking_brake_switch_valid{false};
+  int brake_pedal_switch{0};
+  bool brake_pedal_switch_valid{false};
 
   double speed_mps{0.0};
   bool speed_valid{false};
@@ -125,6 +132,8 @@ class ParallelController {
   [[nodiscard]] bool handshake_requested() const;
   [[nodiscard]] bool parking_ready() const;
   [[nodiscard]] bool physical_emergency_latched() const;
+  [[nodiscard]] bool handshake_revoked() const;
+  [[nodiscard]] int revoked_handshake_status() const;
   [[nodiscard]] bool feedback_complete() const;
   [[nodiscard]] const Feedback& feedback() const;
 
@@ -140,6 +149,8 @@ class ParallelController {
   int initial_frame_count_{0};
   bool emergency_stop_{false};
   bool physical_emergency_latched_{false};
+  bool handshake_revoked_{false};
+  int revoked_handshake_status_{0};
   std::uint64_t receive_generation_{0};
   std::uint64_t state_entry_generation_{0};
   std::uint64_t handshake_generation_{0};

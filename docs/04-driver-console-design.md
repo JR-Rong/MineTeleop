@@ -132,15 +132,16 @@ CAN/本地急停/时间同步门禁及 commissioning mode。重复的速度超�
 例外。控制端先预检，车端再次 fail closed。
 
 页面通过 `POST /api/control-profile` 准备 `type=session_control_profile` 的鉴权
-DataChannel envelope。V2 profile 在 envelope 顶层包含 `profile_version=2`、目标车速、
-单电机最大转矩、三项普通制动压力、最大转向角，以及 `speed_pid_kp/ki/kd`、
-`speed_pid_derivative_filter_tau_ms`、`speed_pid_max_dt_ms`；它与普通控制命令复用车辆、
+DataChannel envelope。V3 profile 在 envelope 顶层包含 `profile_version=3`、目标车速、
+单电机最大转矩、三项普通制动压力、最大转向角，`speed_pid_kp/ki/kd`、
+`speed_pid_derivative_filter_tau_ms`、`speed_pid_max_dt_ms`，以及
+`motor_torque_rise_rate_nm_per_s`；它与普通控制命令复用车辆、
 驾驶员、session、`control_token` 和单调递增 `seq`。由于 control DataChannel
 是 unordered/unreliable，浏览器每隔至少 200 ms 重发同一 envelope 和同一 `seq`，直到
 收到共享 `control_status_seq` 排序后的 `session_control_profile_status`，或 telemetry
 中的同一 canonical `session_control_profile`。只有 `active=true`、`accepted=true`、
 `last_request_seq` 匹配 pending 序号、顶层正整数 `applied_revision` 等于该请求 `seq`，且
-`effective_profile` 的全部 V2 字段和值与请求精确一致时才视为已确认；同一 revision 的
+`effective_profile` 的全部 V3 字段和值与请求精确一致时才视为已确认；同一 revision 的
 幂等重 ACK 可保持授权。
 旧 `GET /api/control-limits` 仅保留归一化制动比例的只读兼容；`POST` 固定返回
 `410 Gone`，不能绕过 profile 的停车、鉴权和 ACK 门禁修改会话制动参数。旧的
@@ -175,9 +176,15 @@ latest-wins 判定由可在浏览器和 Node.js 共用的无 DOM 模块实现。
 
 车端若在实际 apply 阶段拒绝命令，会发送带共享 `control_status_seq` 和原命令
 `command_seq` 的 `control_command_rejected`。页面只解释本地 allowlist 中的
-`issue_code`，不展示车端异常文本；换挡移动/反馈过期会立即清空按键与 Gamepad 输入、
-回 N 挡并要求释放后重试。相同拒绝由车端限频重发，以覆盖 unordered/unreliable
-DataChannel 的单包丢失，同时避免拒绝风暴。
+`issue_code`，不展示车端异常文本；换挡移动/反馈过期时，页面用
+`command_seq` 关联当前换挡尝试，立即清空按键与 Gamepad 输入、恢复到拒绝前已选挡位，
+并发送该挡位的零牵引快照；不再自动回 N。按住的方向输入必须物理释放后才能重试。
+车端同时锁存该次拒绝；即使车速随后降到零，持续发送旧目标挡也不会自动生效，只有
+拒绝前挡位的零牵引（或制动）帧才能解除该次门禁。
+无法关联到当前事务的换挡拒绝不会猜测或重发挡位，而是冻结普通控制，保留急停和
+显式断开，并要求完成安全断开后重新握手。
+相同拒绝由车端限频重发，以覆盖 unordered/unreliable DataChannel 的单包丢失，
+同时避免拒绝风暴。
 
 ## 视频显示
 

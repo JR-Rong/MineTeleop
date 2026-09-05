@@ -25,7 +25,7 @@
     'service_brake',
     'hard_brake',
   ]);
-  const CONTROL_PROFILE_VERSION = 2;
+  const CONTROL_PROFILE_VERSION = 3;
   const CONTROL_PROFILE_FIELDS = Object.freeze([
     'profile_version',
     'target_speed_kph',
@@ -39,6 +39,7 @@
     'speed_pid_kd',
     'speed_pid_derivative_filter_tau_ms',
     'speed_pid_max_dt_ms',
+    'motor_torque_rise_rate_nm_per_s',
   ]);
   const READ_ONLY_CONTROL_SAFETY_FIELDS = Object.freeze([
     'control_rate_hz',
@@ -222,7 +223,7 @@
     if (keys.length !== CONTROL_PROFILE_FIELDS.length ||
         !CONTROL_PROFILE_FIELDS.every(
             field => Object.prototype.hasOwnProperty.call(value, field))) {
-      throw new TypeError('control profile must contain exactly the V2 fields');
+      throw new TypeError('control profile must contain exactly the V3 fields');
     }
     if (value.profile_version !== CONTROL_PROFILE_VERSION) {
       throw new TypeError(`profile_version must be ${CONTROL_PROFILE_VERSION}`);
@@ -248,6 +249,9 @@
           'speed_pid_derivative_filter_tau_ms'),
       speed_pid_max_dt_ms: requireIntegerRange(
           value.speed_pid_max_dt_ms, 20, 200, 'speed_pid_max_dt_ms'),
+      motor_torque_rise_rate_nm_per_s: requireFiniteRange(
+          value.motor_torque_rise_rate_nm_per_s, 0, 32000,
+          'motor_torque_rise_rate_nm_per_s'),
     };
     if (profile.speed_pid_kp <= 0) throw new TypeError('speed_pid_kp must be greater than 0');
     if (profile.service_brake_pressure_bar > profile.hard_brake_pressure_bar ||
@@ -269,6 +273,25 @@
     const speedPidLimits = normalizeSpeedPidLimits(value.speed_pid_limits);
     const readOnlyControlSafety =
         normalizeReadOnlyControlSafety(value.read_only_control_safety);
+    // Pre-V3 vehicles do not publish the rise-rate keys; treat them like any
+    // other incomplete hard-limits report and fail closed.
+    if (!value.motor_torque_rise_rate_limits_nm_per_s ||
+        typeof value.motor_torque_rise_rate_limits_nm_per_s !== 'object') {
+      throw new TypeError('motor_torque_rise_rate_limits_nm_per_s must be an object');
+    }
+    const riseRateLimitsValue = value.motor_torque_rise_rate_limits_nm_per_s;
+    const riseRateLimits = {
+      min: requireFiniteRange(
+          riseRateLimitsValue.min, 0, 32000,
+          'motor_torque_rise_rate_limits_nm_per_s.min'),
+      max: requireFiniteRange(
+          riseRateLimitsValue.max, 0, 32000,
+          'motor_torque_rise_rate_limits_nm_per_s.max'),
+    };
+    if (riseRateLimits.min > riseRateLimits.max) {
+      throw new TypeError(
+          'motor_torque_rise_rate_limits_nm_per_s.min must not exceed max');
+    }
     const normalized = {
       max_speed_kph: maxSpeedKph,
       max_throttle: maxThrottle,
@@ -297,6 +320,11 @@
       default_speed_pid_max_dt_ms: requireIntegerRange(
           value.default_speed_pid_max_dt_ms, speedPidLimits.max_dt_ms.min,
           speedPidLimits.max_dt_ms.max, 'default_speed_pid_max_dt_ms'),
+      default_motor_torque_rise_rate_nm_per_s: requireFiniteRange(
+          value.default_motor_torque_rise_rate_nm_per_s,
+          riseRateLimits.min, riseRateLimits.max,
+          'default_motor_torque_rise_rate_nm_per_s'),
+      motor_torque_rise_rate_limits_nm_per_s: riseRateLimits,
       speed_pid_limits: speedPidLimits,
       speed_feedback_timeout_ms: requireIntegerRange(
           value.speed_feedback_timeout_ms, 20, 500, 'speed_feedback_timeout_ms'),
@@ -358,6 +386,10 @@
       speed_pid_max_dt_ms: clamp(
           requested.speed_pid_max_dt_ms, hard.speed_pid_limits.max_dt_ms.min,
           hard.speed_pid_limits.max_dt_ms.max),
+      motor_torque_rise_rate_nm_per_s: clamp(
+          requested.motor_torque_rise_rate_nm_per_s,
+          hard.motor_torque_rise_rate_limits_nm_per_s.min,
+          hard.motor_torque_rise_rate_limits_nm_per_s.max),
     };
   }
 
@@ -380,6 +412,8 @@
       speed_pid_derivative_filter_tau_ms:
           hard.default_speed_pid_derivative_filter_tau_ms,
       speed_pid_max_dt_ms: hard.default_speed_pid_max_dt_ms,
+      motor_torque_rise_rate_nm_per_s:
+          hard.default_motor_torque_rise_rate_nm_per_s,
     }, hard);
   }
 
@@ -410,7 +444,9 @@
         left.speed_pid_kd === right.speed_pid_kd &&
         left.speed_pid_derivative_filter_tau_ms ===
             right.speed_pid_derivative_filter_tau_ms &&
-        left.speed_pid_max_dt_ms === right.speed_pid_max_dt_ms;
+        left.speed_pid_max_dt_ms === right.speed_pid_max_dt_ms &&
+        left.motor_torque_rise_rate_nm_per_s ===
+            right.motor_torque_rise_rate_nm_per_s;
   }
 
   function reduceControlProfileStatus(stateValue, statusValue) {
@@ -682,6 +718,97 @@
     };
   }
 
+  function createGearTransition(fromGearValue, toGearValue, statusFloorValue, generationValue) {
+    const fromGear = String(fromGearValue || '');
+    const toGear = String(toGearValue || '');
+    const statusFloor = Number(statusFloorValue);
+    const generation = Number(generationValue);
+    if (!['N', 'R', 'D'].includes(fromGear) || !['N', 'R', 'D'].includes(toGear) ||
+        fromGear === toGear) {
+      throw new TypeError('gear transition requires distinct N/R/D gears');
+    }
+    if (!Number.isSafeInteger(statusFloor) || statusFloor < 0) {
+      throw new TypeError('gear transition status floor must be a non-negative safe integer');
+    }
+    if (!Number.isSafeInteger(generation) || generation <= 0) {
+      throw new TypeError('gear transition generation must be a positive safe integer');
+    }
+    return {generation, fromGear, toGear, statusFloor, forwardedSeqs: []};
+  }
+
+  function recordForwardedGearCommand(
+      transition, generationValue, commandSequenceValue, commandGearValue) {
+    if (!transition || Number(generationValue) !== transition.generation ||
+        String(commandGearValue || '') !== transition.toGear) {
+      return transition;
+    }
+    const sequence = Number(commandSequenceValue);
+    if (!Number.isSafeInteger(sequence) || sequence <= 0) return transition;
+    const prior = Array.isArray(transition.forwardedSeqs) ? transition.forwardedSeqs : [];
+    if (prior.includes(sequence)) return transition;
+    return {...transition, forwardedSeqs: [...prior, sequence].slice(-64)};
+  }
+
+  function matchesGearChangeRejection(transition, message, selectedGearValue) {
+    if (!transition || !message ||
+        message.issue_code !== 'vcu_drive_gear_change_moving_or_stale' ||
+        String(selectedGearValue || '') !== transition.toGear) {
+      return false;
+    }
+    const commandSequence = Number(message.command_seq);
+    const statusSequence = Number(message.control_status_seq);
+    return Number.isSafeInteger(commandSequence) && commandSequence > 0 &&
+        Number.isSafeInteger(statusSequence) && statusSequence > transition.statusFloor &&
+        Array.isArray(transition.forwardedSeqs) &&
+        transition.forwardedSeqs.includes(commandSequence);
+  }
+
+  function reduceGearChangeRejection(transition, message, selectedGearValue) {
+    const selectedGear = ['N', 'R', 'D'].includes(String(selectedGearValue || ''))
+      ? String(selectedGearValue) : 'N';
+    const matched = matchesGearChangeRejection(transition, message, selectedGear);
+    if (!matched) {
+      return {
+        matched: false,
+        selectedGear,
+        pendingGearRequest: null,
+        pendingGearTransition: null,
+        inhibitOrdinaryControl: true,
+        sendRollback: false,
+      };
+    }
+    return {
+      matched: true,
+      selectedGear: transition.fromGear,
+      pendingGearRequest: transition.toGear,
+      pendingGearTransition: null,
+      inhibitOrdinaryControl: false,
+      sendRollback: true,
+    };
+  }
+
+  function telemetryConfirmsGearTransition(transition, message) {
+    if (!transition || !message || message.event !== 'vehicle_telemetry') return false;
+    if (!Array.isArray(transition.forwardedSeqs) || !transition.forwardedSeqs.length) {
+      return false;
+    }
+    const statusSequence = Number(message.control_status_seq);
+    if (!Number.isSafeInteger(statusSequence) || statusSequence <= transition.statusFloor) {
+      return false;
+    }
+    const feedback = message.can_feedback;
+    let actualGear = '';
+    if (feedback && feedback.supported === true) {
+      if (feedback.feedback_fresh !== true || feedback.gear_valid !== true) return false;
+      actualGear = ({1: 'N', 2: 'R', 3: 'D', 4: 'P'})[Number(feedback.gear)] || '';
+    } else if (feedback && feedback.supported === false) {
+      actualGear = String(message.gear || '');
+    } else {
+      return false;
+    }
+    return actualGear === transition.toGear;
+  }
+
   function deriveControl({keyState, gamepad, selectedGear, limits, steeringFullScaleDeg, estop = false}) {
     const state = keyState || {};
     const pad = gamepad || {};
@@ -754,9 +881,28 @@
     return {accepted: true, lastSequence: candidate, gap: Math.max(0, candidate - last - 1)};
   }
 
-  function deriveEstopPresentation(localLatched, vehicleActive) {
+  function deriveEstopPresentation(
+      localLatched,
+      vehicleActive,
+      stopSourceValue = '',
+      stopReasonValue = '') {
     const local = Boolean(localLatched);
     const vehicle = Boolean(vehicleActive);
+    const stopSource = String(stopSourceValue || '').trim();
+    const stopReason = String(stopReasonValue || '').trim();
+    const reasonSuffix = stopReason ? `（${stopReason}）` : '';
+    // Physical emergency is authoritative even when a page ESTOP was already
+    // latched; the bridge deliberately allows this source to supersede an
+    // earlier software stop so the operator sees the higher-priority cause.
+    if (vehicle && stopSource === 'physical_estop') {
+      return {
+        kind: 'physical_estop',
+        visible: true,
+        severity: 'critical',
+        banner: `车辆物理急停已触发${reasonSuffix}；请立即核实现场并按现场流程复位。`,
+        alert: `车辆物理急停已触发${reasonSuffix}；请立即核实现场`,
+      };
+    }
     if (local && vehicle) {
       return {
         kind: 'local_confirmed',
@@ -776,6 +922,51 @@
       };
     }
     if (vehicle) {
+      if (stopSource === 'page_disconnect') {
+        return {
+          kind: 'page_disconnect',
+          visible: true,
+          severity: 'warn',
+          banner: `车端已按页面断开 VCU 握手请求进入安全停车${reasonSuffix}；重新连接后请重新确认参数并申请握手。`,
+          alert: `页面断开触发车端安全停车${reasonSuffix}；恢复驾驶前需要重新申请 VCU 握手`,
+        };
+      }
+      if (stopSource === 'page_request') {
+        return {
+          kind: 'page_request',
+          visible: true,
+          severity: 'critical',
+          banner: `车端已执行控制页面急停请求${reasonSuffix}；车辆必须本地确认后才能复位。`,
+          alert: `控制页面请求的车辆急停已由车端确认${reasonSuffix}`,
+        };
+      }
+      if (stopSource === 'session_loss') {
+        return {
+          kind: 'session_loss',
+          visible: true,
+          severity: 'critical',
+          banner: `控制会话丢失，车端已主动安全停车${reasonSuffix}；请确认链路后重新连接。`,
+          alert: `控制会话丢失触发车端安全停车${reasonSuffix}`,
+        };
+      }
+      if (stopSource === 'watchdog') {
+        return {
+          kind: 'watchdog',
+          visible: true,
+          severity: 'critical',
+          banner: `车端 watchdog 已触发安全停车${reasonSuffix}；请检查控制指令时序后重新连接。`,
+          alert: `车端 watchdog 触发安全停车${reasonSuffix}`,
+        };
+      }
+      if (stopSource === 'software_fault') {
+        return {
+          kind: 'software_fault',
+          visible: true,
+          severity: 'critical',
+          banner: `车端软件故障已触发安全停车${reasonSuffix}；请先检查车端日志再复位。`,
+          alert: `车端软件故障触发安全停车${reasonSuffix}`,
+        };
+      }
       return {
         kind: 'vehicle_only',
         visible: true,
@@ -792,13 +983,15 @@
     if (issueCode === 'vcu_drive_gear_change_moving_or_stale') {
       return {
         issueCode,
+        action: 'rollback_gear_change',
         clearInput: true,
-        severity: 'critical',
-        text: '换挡被车端拒绝：车辆仍在移动，或挡位/速度反馈已过期；请停车并恢复新鲜反馈后，释放再重新选择 D/R。',
+        severity: 'warn',
+        text: '换挡被车端拒绝：已撤销牵引并保持拒绝前挡位；请停车、恢复新鲜反馈，释放后再重新选择方向。',
       };
     }
     return {
       issueCode: 'vcu_control_apply_rejected',
+      action: 'reset_neutral',
       clearInput: true,
       severity: 'critical',
       text: '控制命令被车端拒绝，车辆已保持安全状态；请检查车端 VCU 日志 issue_code 后再重试。',
@@ -911,6 +1104,11 @@
     transitionVcuState,
     allowsGearChange,
     deriveGearSelection,
+    createGearTransition,
+    recordForwardedGearCommand,
+    matchesGearChangeRejection,
+    reduceGearChangeRejection,
+    telemetryConfirmsGearTransition,
     deriveControl,
     normalizeControlProfile,
     normalizeVehicleHardLimits,

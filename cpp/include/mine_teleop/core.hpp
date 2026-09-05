@@ -24,11 +24,13 @@ inline constexpr int kProtocolVersion = 1;
 inline constexpr std::size_t kMaxVehicleTelemetryHistory = 1024;
 inline constexpr double kDefaultFullScaleMotorTorqueNm = 300.0;
 inline constexpr double kMaxFullScaleMotorTorqueNm = 640.0;
+inline constexpr double kDefaultMotorTorqueRiseRateNmPerSecond = 0.0;
+inline constexpr double kMaxMotorTorqueRiseRateNmPerSecond = 32000.0;
 inline constexpr double kDefaultMaxBrakePressureBar = 100.0;
 inline constexpr double kMaxOrdinaryBrakePressureBar = 327.6;
 inline constexpr double kMaxEmergencyBrakePressureBar = 409.5;
 inline constexpr int kSessionControlProfileMaxAgeMs = 2000;
-inline constexpr int kSessionControlProfileVersion = 2;
+inline constexpr int kSessionControlProfileVersion = 3;
 static_assert(kMaxFullScaleMotorTorqueNm <= 800.0 * 0.8);
 static_assert(kMaxFullScaleMotorTorqueNm <= 838.3 * 0.8);
 
@@ -93,6 +95,7 @@ struct SessionControlProfile {
   double speed_pid_kd{0.0};
   double speed_pid_derivative_filter_tau_ms{100.0};
   int speed_pid_max_dt_ms{100};
+  double motor_torque_rise_rate_nm_per_s{kDefaultMotorTorqueRiseRateNmPerSecond};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -246,6 +249,50 @@ struct ControlOutput {
   bool full_emergency_brake{false};
 };
 
+enum class VehicleStopSource : std::uint32_t {
+  None = 0,
+  DriverPage = 1,
+  Session = 2,
+  Watchdog = 3,
+  SoftwareFault = 4,
+  PhysicalEmergency = 5,
+  Unknown = 255,
+};
+
+enum class VehicleStopReason : std::uint32_t {
+  None = 0,
+  OperatorEstop = 1,
+  VcuHandshakeDisconnect = 2,
+  DriverDisconnect = 3,
+  SessionLost = 4,
+  ControlApplyTimeout = 5,
+  OuterControlTimeout = 6,
+  FeedbackTimeout = 7,
+  ControlApplyFailed = 8,
+  ChassisControlFault = 9,
+  CanReceiveFailed = 10,
+  CanSendFailed = 11,
+  IoThreadException = 12,
+  HardOverspeed = 13,
+  OppositeDirectionMotion = 14,
+  ArmingMotion = 15,
+  ControlCommandInvalid = 16,
+  PhysicalEmergencySwitch = 17,
+  HandshakeRevoked = 18,
+  CriticalCameraFailed = 19,
+  MediaPipelineFailed = 20,
+  VcuStateFault = 21,
+  SessionProfileRequired = 22,
+  CanFeedbackMissing = 23,
+  AdapterSafetyStatusUnavailable = 24,
+  LegacyUnspecified = 255,
+};
+
+struct VehicleStopContext {
+  VehicleStopSource source{VehicleStopSource::None};
+  VehicleStopReason reason{VehicleStopReason::None};
+};
+
 class SafetyStateMachine {
  public:
   SafetyStateMachine(int degraded_timeout_ms, int control_timeout_ms, std::vector<DecelerationStage> profile);
@@ -373,6 +420,8 @@ struct FieldSafetyConfig {
   double max_speed_kph{40.0};
   double max_throttle{1.0};
   double full_scale_motor_torque_nm{kDefaultFullScaleMotorTorqueNm};
+  double motor_torque_rise_rate_nm_per_s{
+      kDefaultMotorTorqueRiseRateNmPerSecond};
   int speed_feedback_timeout_ms{200};
   double speed_pid_kp{1.0};
   double speed_pid_ki{0.2};
@@ -427,6 +476,12 @@ struct VehicleCanFeedback {
   bool driver_gear_request_valid{false};
   int handshake_status{0};
   bool handshake_valid{false};
+  int vmc_fault_code{0};
+  bool vmc_fault_code_valid{false};
+  int parking_brake_switch{0};
+  bool parking_brake_switch_valid{false};
+  int brake_pedal_switch{0};
+  bool brake_pedal_switch_valid{false};
   std::array<int, 4> parking_brake_status{};
   std::array<bool, 4> parking_brake_valid{};
   std::array<int, 8> motor_mode{};
@@ -452,6 +507,9 @@ struct VehicleTelemetry {
   double throttle_feedback{0.0};
   double brake_feedback{0.0};
   bool estop{false};
+  std::string stop_source{"none"};
+  std::string stop_reason{"none"};
+  std::uint64_t stop_sequence{0};
   VehicleCanFeedback can_feedback;
 };
 
@@ -482,6 +540,14 @@ struct VcuHandshakeStatus {
   bool driver_gear_request_valid{false};
   int handshake_status{0};
   bool handshake_valid{false};
+  bool handshake_revoked{false};
+  int revoked_handshake_status{0};
+  int vmc_fault_code{0};
+  bool vmc_fault_code_valid{false};
+  int parking_brake_switch{0};
+  bool parking_brake_switch_valid{false};
+  int brake_pedal_switch{0};
+  bool brake_pedal_switch_valid{false};
   std::array<int, 4> epb_status{};
   std::array<bool, 4> epb_valid{};
   double speed_mps{0.0};
@@ -502,7 +568,9 @@ class VehicleAdapter {
   [[nodiscard]] virtual double session_motor_torque_limit_nm() const = 0;
   [[nodiscard]] virtual double session_brake_pressure_limit_bar() const = 0;
   virtual void apply_control(const ControlCommand& command) = 0;
-  virtual void apply_safe_stop(const ControlOutput& output) = 0;
+  virtual void apply_safe_stop(
+      const ControlOutput& output,
+      VehicleStopContext context) = 0;
   virtual bool poll_feedback() = 0;
   virtual bool request_vcu_handshake() = 0;
   virtual bool disconnect_vcu_handshake() = 0;
@@ -523,7 +591,9 @@ class MockVehicleAdapter final : public VehicleAdapter {
   [[nodiscard]] double session_motor_torque_limit_nm() const override;
   [[nodiscard]] double session_brake_pressure_limit_bar() const override;
   void apply_control(const ControlCommand& command) override;
-  void apply_safe_stop(const ControlOutput& output) override;
+  void apply_safe_stop(
+      const ControlOutput& output,
+      VehicleStopContext context) override;
   bool poll_feedback() override;
   bool request_vcu_handshake() override;
   bool disconnect_vcu_handshake() override;
@@ -535,6 +605,8 @@ class MockVehicleAdapter final : public VehicleAdapter {
  private:
   bool opened_{false};
   std::optional<ControlOutput> latest_output_;
+  VehicleStopContext latest_stop_context_{};
+  std::uint64_t stop_sequence_{0};
   std::uint64_t applied_command_count_{0};
   std::uint64_t safe_stop_count_{0};
   double session_motor_torque_limit_nm_{0.0};
@@ -551,6 +623,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
       int can_tx_queue_length,
       double max_speed_mps,
       double full_scale_motor_torque_nm,
+      double motor_torque_rise_rate_nm_per_s,
       double max_ordinary_brake_pressure_bar,
       int control_timeout_ms,
       int speed_feedback_timeout_ms,
@@ -571,7 +644,9 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   [[nodiscard]] double session_motor_torque_limit_nm() const override;
   [[nodiscard]] double session_brake_pressure_limit_bar() const override;
   void apply_control(const ControlCommand& command) override;
-  void apply_safe_stop(const ControlOutput& output) override;
+  void apply_safe_stop(
+      const ControlOutput& output,
+      VehicleStopContext context) override;
   bool poll_feedback() override;
   bool request_vcu_handshake() override;
   bool disconnect_vcu_handshake() override;
@@ -590,6 +665,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   int can_tx_queue_length_;
   double max_speed_mps_;
   double full_scale_motor_torque_nm_;
+  double motor_torque_rise_rate_nm_per_s_;
   double max_ordinary_brake_pressure_bar_;
   double session_motor_torque_limit_nm_;
   double session_brake_pressure_limit_bar_;
@@ -609,10 +685,10 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   std::uint64_t safe_stop_count_{0};
   std::string last_error_;
 
-  using OpenV3Fn = int (*)(const void*);
+  using OpenV4Fn = int (*)(const void*);
   using ApplyFn = int (*)(int, double, double, const double*, int);
   using ApplyV2Fn = int (*)(int, double, double, const double*, int, void*);
-  using ConfigureRuntimeControlFn = int (*)(const void*, void*);
+  using ConfigureRuntimeControlV2Fn = int (*)(const void*, void*);
   using ClearRuntimeControlFn = int (*)(void*);
   using StopFn = int (*)();
   using HandshakeFn = int (*)();
@@ -620,11 +696,12 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   using ReadHandshakeFn = int (*)(void*);
   using ReadFn = int (*)(void*);
   using ReadCanFeedbackV1Fn = int (*)(void*);
+  using SetStopContextV1Fn = int (*)(const void*);
   using CloseFn = int (*)();
-  OpenV3Fn open_v3_fn_{nullptr};
+  OpenV4Fn open_v4_fn_{nullptr};
   ApplyFn apply_fn_{nullptr};
   ApplyV2Fn apply_v2_fn_{nullptr};
-  ConfigureRuntimeControlFn configure_runtime_control_fn_{nullptr};
+  ConfigureRuntimeControlV2Fn configure_runtime_control_v2_fn_{nullptr};
   ClearRuntimeControlFn clear_runtime_control_fn_{nullptr};
   StopFn stop_fn_{nullptr};
   HandshakeFn request_handshake_fn_{nullptr};
@@ -633,6 +710,7 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   ReadHandshakeFn read_handshake_fn_{nullptr};
   ReadFn read_fn_{nullptr};
   ReadCanFeedbackV1Fn read_can_feedback_v1_fn_{nullptr};
+  SetStopContextV1Fn set_stop_context_v1_fn_{nullptr};
   CloseFn close_fn_{nullptr};
 };
 
@@ -658,7 +736,9 @@ class VehicleControlService {
   bool request_vcu_handshake();
   bool disconnect_vcu_handshake();
   bool reset_estop(bool local_confirmed, std::string_view authorized_by, std::int64_t now_ms);
-  void close();
+  void close(VehicleStopContext context = {
+      VehicleStopSource::Session,
+      VehicleStopReason::SessionLost});
 
   [[nodiscard]] SafetyState safety_state() const { return safety_.state(); }
   [[nodiscard]] VehicleAdapterStatus adapter_status() const { return adapter_->status(); }
@@ -700,6 +780,8 @@ class VehicleControlService {
   double default_speed_pid_kd_{0.0};
   double default_speed_pid_derivative_filter_tau_ms_{100.0};
   int default_speed_pid_max_dt_ms_{100};
+  double default_motor_torque_rise_rate_nm_per_s_{
+      kDefaultMotorTorqueRiseRateNmPerSecond};
   int speed_feedback_timeout_ms_{200};
   double hard_overspeed_margin_kph_{3.6};
   Json read_only_control_safety_;

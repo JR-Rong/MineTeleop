@@ -80,19 +80,24 @@ N/R/D 三个挡位；电子驻车通过四路 EPB 状态单独判断，不能用
 `ADU_Tx_VehSpdReq` 都固定编码为 `0 km/h / Q=0`。
 
 车速控制在车端 bridge 的唯一 SocketCAN I/O 线程执行。PID 启动默认值来自车端 YAML；
-`profile_version=2` 可在安全驻车门禁内由控制端按会话提交五个 PID 参数。API 线程只保存最新控制意图；
+`profile_version=3` 可在安全驻车门禁内由控制端按会话提交五个 PID 参数和升扭斜率
+`motor_torque_rise_rate_nm_per_s`。API 线程只保存最新控制意图；
 I/O 线程每个 20 ms 周期用带符号的 VCU 车速反馈运行一次 PID，再串行调用
 ChassisControl，避免 vendor 接口并发。油门是已确认会话目标车速内的比例，最终
 目标同时受 `field_safety.max_speed_kph * max_throttle` 约束。任何正油门只表示启用 PID，
 不是第二个扭矩上限；PID 输出固定截断到 `[0, 1]`，到达目标点后允许积分项保留
 克服滚阻或坡度所需的正扭矩。D 使用正向速度和正扭矩，R 使用反向速度和负扭矩，
-最终每路仍按会话转矩上限与 `full_scale_motor_torque_nm` 的较小值、挡位方向和
-0.1 Nm 向零量化硬限幅。
+PID 输出直接乘以会话单电机转矩上限后以相同幅值写入八路牵引通道，不再经过
+`m*a`、轮径和减速比的理想车辆模型换算。最终每路仍按会话转矩上限与
+`full_scale_motor_torque_nm` 的较小值、挡位方向和 0.1 Nm 向零量化硬限幅。
+`motor_torque_rise_rate_nm_per_s=0` 表示不增加额外斜率；配置正值时，当周期可达
+转矩直接作为 PID 的动态 ceiling，条件积分能感知限制。任何减扭立即生效。
+ChassisControl 继续负责转向和制动计算。
 PID 目标参考采用固定 0.05 m/s 复位死区；参考不随每次小抖动移动，因此累计偏差
 越界时仍会复位，目标明显下降或 D/R 改变也会复位。
 
 普通制动、零油门、非 Ready、换挡、实际挡位不匹配、车速无效/过期、异常 PID
-周期都会清空 PID 并输出零牵引。V3 普通制动是物理压力输入：bridge 仍调用
+周期都会清空 PID 并输出零牵引。V4 继承 V3 的物理压力制动输入：bridge 仍调用
 ChassisControl 保持转向计算，但随后把八路电机扭矩强制置零，并用 0.1 bar 量化后的
 会话压力直接覆盖八路 EHB 请求。本 PR 的缓刹是直接 `service_brake_pressure_bar`，
 没有独立制动 PID 或 ramp/jerk 曲线；急刹直接使用 `hard_brake_pressure_bar`。
@@ -104,10 +109,11 @@ ChassisControl 保持转向计算，但随后把八路电机扭矩强制置零�
 车速和 EPB，WaitGear 另加实际挡位，WaitActuatorModes 检查全部关键反馈。这样最后
 一帧 EPB 释放反馈后 CAN 静默不会无限保持释放请求。
 
-Ready 阶段的独立硬超速门限使用 `max_speed_kph + hard_overspeed_margin_kph`，
-在零牵引或制动时也持续监测，不随瞬时油门目标降低；实际运动方向与 D/R 期望
-相反且超过 0.1 m/s 也锁存安全停车。普通 apply
-不能清除此锁存。只有完成完整退出，且新鲜反馈再次满足 N、绝对车速不大于
+Ready 阶段的速度 PID 与独立硬超速门限都使用车速绝对值，D/R 档只决定电机
+扭矩方向。硬超速门限使用 `max_speed_kph + hard_overspeed_margin_kph`，在零牵引
+或制动时也持续监测，不随瞬时油门目标降低，不再根据车速正负推断 D/R 实际
+运动方向。普通 apply 不能清除硬超速锁存。
+只有完成完整退出，且新鲜反馈再次满足 N、绝对车速不大于
 0.1 m/s、四路 EPB 驻车和人工状态 3 后，显式重新请求握手才会清除。
 
 ESTOP 不允许启动状态机继续正向推进：在 `WaitParallelHandshake` 撤销 ShakeReq 并
@@ -118,6 +124,10 @@ WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉
 已释放、完整退出到 Disarmed，且新鲜反馈再次满足 N、零速、EPB 驻车和人工状态后，
 显式重新请求握手才清除该锁存。首次尚未取得控制权的 Standby 场景也必须通过相同
 驻车门禁显式请求握手。
+
+状态 5 已被接受后，每一帧人工状态 3 也在 CAN 接收时立即锁存为握手撤销；即使同一
+接收批次随后又出现状态 5，仍保持零牵引并进入安全退出，不允许继续收敛到 Ready 或
+恢复 Ready 扭矩。该锁存同样只能在完整退出后由新的页面握手请求清除。
 
 安全退出顺序：
 
@@ -138,19 +148,27 @@ WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉
 `2 km/h`、`300 Nm/路`、`100/30/100 bar/路` 和 `3°`；`Space` 是可释放的缓刹，
 `B` 是可释放的急刹，`E` 仍是锁存安全急停。两档行车制动在 v1 线上仍通过
 `brake` 归一化标量传输，但车端只在已经确认的会话最大压力内还原为明确 bar 值。
+这些默认值仅用于预填窗口，不会自动下发。直接转矩模式按 PID 的 `0..1` 输出乘以
+会话单电机最大转矩；升级后不得照搬旧 PID 标定，驾驶员必须在驻车门禁内逐项核对并
+勾选确认后显式发送，车端 ACK 前不能申请握手。
 车端对同时出现的油门和制动采用制动优先，任何正制动请求都会撤销牵引。ChassisControl
 更新失败或输出 NaN/Inf 时，bridge 立即锁存本地安全停车，不等待上游控制超时。
 键盘与 Gamepad 共用会话参数；修改参数会先清零当前输入。真实 adapter 的首次设置、
-提高目标车速/转矩或修改任一制动压力/转角/PID 都要求新鲜的 N 挡、零速和 EPB
+提高目标车速/转矩或修改任一制动压力/转角/PID/升扭斜率都要求新鲜的 N 挡、零速和 EPB
 驻车反馈，且 controller 必须为 Standby 或 Disarmed。
 车端仅在实际应用参数后确认；未确认参数时不能请求 VCU 握手或发送普通驾驶命令。
 参数会在断链、故障、控制权/会话替换和 adapter 安全停车时清除；bridge 同时撤销牵引、
-复位 PID 并恢复 open_v3 时的 YAML 默认 PID。成功 ACK 的 `applied_revision` 必须等于请求 `seq`。
+复位 PID 并恢复当前 open 配置中的 YAML 默认 PID 与默认升扭斜率。成功 ACK 的 `applied_revision` 必须等于请求 `seq`。
 车端 `field_safety.max_throttle`（目标车速比例上限）、
 `field_safety.full_scale_motor_torque_nm`、
 `field_safety.max_brake_pressure_bar` 和
 `field_safety.max_steering_angle_deg` 是不可由浏览器绕过的第二层硬上限，车端会
-通过 DataChannel 把实际硬上限回传给窗口。压力上限必须来自车辆标定；
+通过 DataChannel 把实际硬上限回传给窗口。
+`field_safety.motor_torque_rise_rate_nm_per_s` 是车端启动默认值；会话 V3 起它进入
+会话控制参数（`motor_torque_rise_rate_nm_per_s`，物理包络 [0, 32000] Nm/s），可由
+控制端面板在当前会话内修改；修改升扭斜率与修改 PID 增益共享上述驻车门槛，清除
+会话参数后恢复启动默认值。车端把该默认值和可调范围随硬上限一起回传给窗口；
+实际值记录在有效配置日志和 bridge 的 `vehicle_parameters` 事件中。压力上限必须来自车辆标定；
 急停、故障、断开停车和 bridge 本地 apply watchdog 走独立安全停车路径；上游控制
 超时的最终 1.0 阶段同样不受普通驾驶刹车限幅削弱，之前的 0.3/0.6 阶段仍按车端
 普通压力上限换算。Degraded 保持上一条普通制动的物理压力：会话比例先换算为车端
@@ -159,7 +177,8 @@ WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉
 超时分段首项必须为 `after_ms: 0`、时间严格递增、制动比例不下降并最终包含 1.0；
 重复时间、缺少最终全量阶段或中途降低制动的配置都会 fail closed。
 非 mock 车端升级后必须在 YAML 中显式补齐
-`field_safety.max_brake_pressure_bar`；旧的归一化 `max_brake` 会被拒绝。
+`field_safety.max_brake_pressure_bar` 和
+`field_safety.motor_torque_rise_rate_nm_per_s`；旧的归一化 `max_brake` 会被拒绝。
 
 首次到达 Ready 后，会按 `control.control_timeout_ms` 监视成功 apply 的新鲜度，且
 该会话标志在后续 `WaitGear`/`WaitActuatorModes` 不清除；到期时将八路扭矩置零、
@@ -225,6 +244,8 @@ field_safety:
   max_speed_kph: 5
   max_throttle: 0.10
   full_scale_motor_torque_nm: 300.0
+  # 0 表示关闭额外升扭斜率；正值必须经隔离台架标定。
+  motor_torque_rise_rate_nm_per_s: 0.0
   # 以下 PID 值必须由隔离台架标定，不能直接照抄示例上车。
   speed_feedback_timeout_ms: 200
   speed_pid_kp: 1.0
@@ -259,17 +280,22 @@ vehicle_adapter:
 `false` 绕过反馈门禁。
 
 vehicle-agent runtime 与 bridge 必须原子成套升级。当前 runtime 要求 bridge 提供
-ABI version 3、完全一致的 V3 配置结构大小以及 `mine_teleop_chassis_open_v3`；
+ABI version 6、完全一致的 V4 配置结构大小、V3/V2 大小查询以及
+`mine_teleop_chassis_open_v4`；
 同时要求同次返回结构化拒绝结果的 `mine_teleop_chassis_apply_state_v2`、runtime-control
-V1 大小查询，以及原子 configure/clear 符号。任一大小或必需符号不匹配都会在
+V1/V2 的 88/96 字节大小查询、两个 configure 符号，以及原子 clear 符号；stop-context
+V1 必须提供 16 字节大小查询和 `mine_teleop_chassis_set_stop_context_v1`，供页面断开、
+会话丢失、watchdog、软件故障与物理急停的来源/原因穿透到遥测。V1 仅接收旧
+profile version 2 并沿用 open-time 升扭斜率；V2 接收 profile version 3 的会话斜率。任一大小或必需符号不匹配都会在
 任何 SocketCAN 初始化前被拒绝。`apply_state_v2` 只返回固定枚举，不传递日志字符串；
 其中 D/R 移动或反馈过期可由 runtime 安全映射成稳定 issue code，未知值统一降级为
 通用拒绝。旧 `apply_state` 继续保留整数 fail-closed 包装。只提供 V1 的旧 bridge 会明确启动失败，
 V2 bridge 也会因缺少物理普通制动压力上限而失败，不会静默沿用旧的负加速度
 语义。新 bridge 仍为直接 ABI 调用方和兼容性测试导出
-`mine_teleop_chassis_open_v1` 与 `mine_teleop_chassis_open_v2`：V1 因为没有安全
-PID 配置而只允许零牵引，V2 保留负值表示减速度的旧语义；这些入口不能使旧
-vehicle-agent 通过全局 ABI version 3 启动门禁。WebRTC 视频链与这一
+`mine_teleop_chassis_open_v1`、`mine_teleop_chassis_open_v2` 与
+`mine_teleop_chassis_open_v3`：V1 因为没有安全 PID 配置而只允许零牵引，V2 保留
+负值表示减速度的旧语义，V3 没有斜率字段，因此直接 PID 转矩不增加额外升扭斜率；这些入口不能使旧
+vehicle-agent 通过全局 ABI version 6 启动门禁，ABI 5 bridge 也会明确失败。WebRTC 视频链与这一
 控制故障隔离：视频先协商并显示，控制 DataChannel 打开后才尝试启动 adapter；
 adapter 启动或运行失败会短暂上报握手 `fault`、关闭控制 DataChannel、拒绝
 驾驶命令并继续视频；关闭控制通道同时保护旧版本控制端不误报远程急停。该隔离不
@@ -305,8 +331,8 @@ adapter 启动或运行失败会短暂上报握手 `fault`、关闭控制 DataCh
    扭矩为零但 EHB 压力连续。
 7. 断开驾驶控制但保持 CAN，确认超时制动；再中断 VCU 反馈，确认 500 ms 通讯
    故障、日志和 VCU 自身超时策略。
-8. 在安全可控的低速条件验证硬超速和反向运动检测，仅能通过完整退出、零速驻车
-   门禁和显式重新握手恢复；普通控制 apply 不得恢复牵引。
+8. 在安全可控的低速条件验证硬超速检测，仅能通过完整退出、零速驻车门禁和显式
+   重新握手恢复；普通控制 apply 不得恢复牵引。D/R 物理方向仍须现场单独核对。
 9. 执行正常关闭，确认扭矩归零、N、EPB=2、人工状态 3 的完整退出结果。
 10. 保存日志、`ip -details -statistics link show can1`、VCU 版本、DBC/XLS 版本、
    车辆载荷、轮胎状态和现场视频，作为验收记录。

@@ -152,11 +152,15 @@ sudo ./scripts/setup_basler_usb_access.sh "$USER"
 重新登录后，车端只需要一个前台启动命令：
 
 ```bash
+sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /var/log/mine-teleop
 ./bin/mine-teleop-run
 ```
 
 它会自动加载 `config/vehicle-agent.yaml`、`config/device-token`、打包内动态库
-和 GStreamer 插件，并同时监管控制与媒体进程。使用 `Ctrl-C` 停止。
+和 GStreamer 插件，并同时监管控制与媒体进程。使用 `Ctrl-C` 停止。终端
+stdout/stderr 同时合并保存为 `/var/log/mine-teleop/vehicle-runtime.log`（单文件
+64 MiB、保留 `.1` 到 `.5`）；VCU/CAN 高频证据继续使用独立的
+`vcu-can.jsonl*` 轮转集合。
 
 ### 4.2 从管理机自动部署
 
@@ -222,7 +226,7 @@ http://127.0.0.1:28080
 1. `mine-teleop-cloud.target` 健康；
 2. 车端 `./bin/mine-teleop-run` 已注册并保持在线；
 3. 控制端登录并选择 `vehicle-001`；
-4. 确认控制权、视频轨道、时间同步和 DataChannel，并等待页面显示车端已确认 V2 会话控制参数及匹配的 `applied_revision`；
+4. 确认控制权、视频轨道、时间同步和 DataChannel，并等待页面显示车端已确认 V3 会话控制参数及匹配的 `applied_revision`；
 5. 释放会话后确认车辆回到安全状态。
 
 推荐检查：
@@ -240,7 +244,7 @@ curl -fsS http://127.0.0.1:8080/health
 
 真实底盘上线前必须单独验收 CAN 反馈、制动、断链安全停车和本地急停。
 控制页面默认的 `300 Nm/路`、`100 bar/路` 以及软件/配置测试结果都不是实车能力或
-压力标定证据。普通驾驶前应在隔离台架确认 profile ACK 的全部 effective V2 字段、
+压力标定证据。普通驾驶前应在隔离台架确认 profile ACK 的全部 effective V3 字段、
 `applied_revision == request.seq`、目标车速 PID、
 页面只读的原始 `max_speed_kph`/`max_throttle`、速度反馈超时、硬超速余量、watchdog/
 减速曲线，CAN 请求、实测反馈、缓刹/急刹压力和断链撤销；不得用页面显示“已确认”替代硬件验收。
@@ -261,11 +265,13 @@ curl -fsS http://127.0.0.1:8080/health
   `deceleration_profile` 的 0.3/0.6 普通压力分段执行，最终 1.0 阶段才切到 409.5 bar。
   单电机转矩的控制端 schema 上限为 `640.0 Nm/路`。两者仍会被具体车辆 hard
   limits 下调，不能通过控制端设置提高车端上限。
-- `session_control_profile` 已升级为 `profile_version=2`：除原五项驾驶参数外，新增
+- `session_control_profile` 已升级为 `profile_version=3`：除原五项驾驶参数外，新增
   `max_steering_angle_deg`、`speed_pid_kp/ki/kd`、
-  `speed_pid_derivative_filter_tau_ms` 和整数 `speed_pid_max_dt_ms`。控制端 YAML 不配置
-  PID 默认值；车端必须通过 `control_limits` 上报五个 `default_speed_pid_*` 字段和嵌套
-  `speed_pid_limits` min/max，以及顶层速度反馈超时、硬超速余量和 exact
+  `speed_pid_derivative_filter_tau_ms`、整数 `speed_pid_max_dt_ms` 和
+  `motor_torque_rise_rate_nm_per_s`。控制端 YAML 不配置
+  PID/升扭默认值；车端必须通过 `control_limits` 上报五个 `default_speed_pid_*` 字段、
+  嵌套 `speed_pid_limits` min/max、`default_motor_torque_rise_rate_nm_per_s` 与
+  `motor_torque_rise_rate_limits_nm_per_s` min/max，以及顶层速度反馈超时、硬超速余量和 exact
   `read_only_control_safety`（20 Hz 上游命令频率、命令间隔、watchdog、减速曲线、反馈超时、
   超速余量、CAN/急停/时间同步门禁和 commissioning mode）。顶层与对象中的重复值必须一致。
   缺少完整默认值/边界/固定安全对象、`kp <= 0` 或 ACK 缺少匹配的正整数

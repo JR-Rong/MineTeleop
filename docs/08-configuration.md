@@ -228,6 +228,7 @@ field_safety:
   max_speed_kph: 40
   max_throttle: 0.10
   full_scale_motor_torque_nm: 300.0
+  motor_torque_rise_rate_nm_per_s: 0.0
   speed_feedback_timeout_ms: 200
   speed_pid_kp: 1.0
   speed_pid_ki: 0.2
@@ -375,15 +376,29 @@ GStreamer factory，`max_end_to_end_latency_ms` 与 `min_realtime_fps` 用于车
 即 `640.0 Nm/路`。车端默认值是 `300 Nm/路`，`0` 明确禁用驱动力。
 `max_throttle` 不按比例缩小这个转矩上限；例如
 `max_throttle=0.10` 表示目标车速最多为 `max_speed_kph` 的 10%，PID 在追踪该目标时
-仍可在纵向控制器和斜率限制内请求最多 `full_scale_motor_torque_nm`。只能在隔离
+将 `[0,1]` 输出直接乘以会话单电机转矩上限，并可请求最多
+`full_scale_motor_torque_nm`。该路径不再使用理想 `m*a` 车辆模型
+换算牵引转矩。只能在隔离
 台架上逐级调大该转矩上限，并以 CAN 请求和电机反馈共同验收；配置值不是
 实测轮端转矩。普通制动和安全停车不由该转矩上限缩放。
+
+`field_safety.motor_torque_rise_rate_nm_per_s` 是车端每个电机的可选加扭斜率，
+允许 `0..32000 Nm/s`。`0` 明确关闭额外斜率，PID 输出直接换算为单电机转矩；
+正值只限制增加方向，所有减扭、松油、制动、急停和故障清零仍立即生效。启用正值时，
+bridge 先计算本周期可达转矩并把它换算为 PID 的动态输出上限，条件积分因而能感知
+执行器限制，不是在 PID 之后再盲目截断。该值是车型/执行器标定，同时作为会话 V3
+起会话控制参数 `motor_torque_rise_rate_nm_per_s` 的车端默认值与可调范围依据：控制端
+面板可在 `[0, 32000] Nm/s` 物理包络内按当前会话修改，修改与 PID 增益变更共享
+驻车门槛（N 挡、零速、EPB 驻车、standby/disarmed），会话参数清除后恢复此 YAML
+默认值。非 mock 车端必须显式填写；未完成隔离台架标定时应填 `0`，
+不能把未经验证的固定斜率当作通用安全值。配置很小的正斜率时，受 DBC `0.1 Nm`
+分辨率影响，CAN 请求会表现为若干周期不变后再跳变 `0.1 Nm`，而不是每周期都有变化。
 
 `field_safety.max_brake_pressure_bar` 是八路 EHB 普通驾驶压力的车端硬上限，单位
 为 `bar/路`。DBC 每路为 12-bit、`0.1 bar` 分辨率、范围 `0..409.5 bar`；普通驾驶
 代码上限取 80%，即 `327.6 bar/路`，车端默认值为 `100 bar/路`。旧的归一化
 `field_safety.max_brake` 会被明确拒绝，必须迁移到物理压力字段。控制心跳超时按
-`timeout_action.deceleration_profile` 分段执行：在 V3 直接压力模式下，小于 1.0 的
+`timeout_action.deceleration_profile` 分段执行：自 V3 起的直接压力模式中，小于 1.0 的
 `brake` 按 `max_brake_pressure_bar` 换算，例如默认 100 bar 上限下 0.3/0.6 分别为
 30/60 bar；最终 `vehicle_defined_max_safe` 对应 1.0，并切到 409.5 bar 安全停车。
 急停、物理急停、故障、断开停车以及 bridge 完全收不到上游 apply 时的本地 watchdog
@@ -397,23 +412,28 @@ GStreamer factory，`max_end_to_end_latency_ms` 与 `min_realtime_fps` 用于车
 车速闭环、转矩上限和超速熔断必须由隔离台架与实车
 分阶段验收；软件单测不等于闭环已验收。
 
-车端 YAML 的五个 `speed_pid_*` 字段是启动默认值，也是会话清除后的恢复值；
-`profile_version=2` 允许控制端在满足 N 挡、零速、EPB 驻车且 bridge 为
-`standby/disarmed` 时提交一整套 PID 快照，无需重启车端。更新会撤销旧牵引并复位
+车端 YAML 的五个 `speed_pid_*` 字段与 `motor_torque_rise_rate_nm_per_s` 是启动默认值，
+也是会话清除后的恢复值；
+`profile_version=3` 允许控制端在满足 N 挡、零速、EPB 驻车且 bridge 为
+`standby/disarmed` 时提交一整套 PID 与升扭斜率快照，无需重启车端。更新会撤销旧牵引并复位
 PID，成功 ACK 的 `applied_revision` 必须与请求 `seq` 相同。反馈超时、硬超速 margin、
 命令超时、降速曲线、时间同步和本地急停复位要求仍只能由车端 YAML 配置，并通过
 `control_limits.read_only_control_safety` 只读上报。
 
 启用上述配置时必须同步升级车端 runtime 和 ChassisControl bridge：当前 runtime
-要求 ABI version 3、完全一致的 V3 配置结构大小以及
-`mine_teleop_chassis_open_v3`，并强制要求 runtime-control V1 配置结构大小查询、
-`mine_teleop_chassis_configure_runtime_control_v1` 和
-`mine_teleop_chassis_clear_runtime_control_v1`。V3 在 V2 的车速 PID/watchdog 配置后新增不可变的普通
-制动压力上限；旧 bridge 不会静默忽略压力语义，而会在任何 CAN 初始化前因 ABI
+要求 ABI version 6、完全一致的 V4 配置结构大小、V3/V2 大小查询以及
+`mine_teleop_chassis_open_v4`，并强制要求 runtime-control V1/V2 配置结构分别为
+88/96 字节、两个 size query、两个 configure 符号以及
+`mine_teleop_chassis_clear_runtime_control_v1`；stop-context V1 还必须提供 16 字节
+size query 与 `mine_teleop_chassis_set_stop_context_v1`，遥测直接携带
+`stop_source`、`stop_reason` 和单调递增的 `stop_sequence`。V1 仅接受旧 profile version 2 并沿用
+open-time 升扭斜率；V2 接受 profile version 3 并携带会话斜率。V4 在 V3 的普通制动压力上限后新增
+单电机加扭斜率启动默认值；旧 bridge 不会静默忽略该语义，而会在任何 CAN 初始化前因 ABI
 不匹配而启动失败。新 bridge 仍为直接 ABI 调用方和兼容性测试保留
-`mine_teleop_chassis_open_v1` 与 `mine_teleop_chassis_open_v2`；V1 禁用正牵引并采用默认
-`800 ms` 超时，V2 保留负值表示减速度的旧语义。旧 vehicle-agent 会被全局 ABI
-version 3 门禁明确拒绝，不能依靠这些入口加载新 bridge；runtime 与 bridge 必须原子
+`mine_teleop_chassis_open_v1`、`mine_teleop_chassis_open_v2` 与
+`mine_teleop_chassis_open_v3`；V1 禁用正牵引并采用默认 `800 ms` 超时，V2 保留负值
+表示减速度的旧语义，V3 没有斜率字段，因此直接 PID 转矩不增加额外升扭斜率。旧 vehicle-agent 会被全局 ABI
+version 6 门禁明确拒绝，ABI 5 bridge 也不会被加载；runtime 与 bridge 必须原子
 成套升级。
 进入 Ready 后，若连续
 `control.control_timeout_ms` 没有成功 apply，bridge 会撤销车速请求、将转矩置零并施加
@@ -437,6 +457,7 @@ access key 和 secret。Secret 可以直接配置，也可以用
 `vehicle_adapter.type=mock` 可直接无外部依赖运行。配置为 `can` 或
 `dynamic_library` 时，必须显式填写 `field_safety.max_speed_kph`、
 `field_safety.max_throttle`、`field_safety.full_scale_motor_torque_nm`、
+`field_safety.motor_torque_rise_rate_nm_per_s`、
 `field_safety.speed_feedback_timeout_ms`、`field_safety.speed_pid_kp`、
 `field_safety.speed_pid_ki`、`field_safety.speed_pid_kd`、
 `field_safety.speed_pid_derivative_filter_tau_ms`、`field_safety.speed_pid_max_dt_ms`、
@@ -532,6 +553,7 @@ vehicle_adapter:
 `mine_teleop_chassis_bridge.h` 稳定 ABI 头，导出原生 adapter 所需的
 `mine_teleop_chassis_open`、`mine_teleop_chassis_open_v1`、
 `mine_teleop_chassis_open_v2`、`mine_teleop_chassis_open_v3`、
+`mine_teleop_chassis_open_v4`、
 `mine_teleop_chassis_apply_state`、
 `mine_teleop_chassis_emergency_stop`、`mine_teleop_chassis_update_feedback`、
 `mine_teleop_chassis_poll_feedback`、`mine_teleop_chassis_read_telemetry` 和
@@ -604,8 +626,9 @@ control:
 `ui.show_debug_overlay` 必须写成 YAML/TOML boolean `true`/`false`，不能用带引号
 字符串，避免调试层在正式驾驶端被误启用或误关闭。
 `control.limits` 提供目标车速、转矩、压力和最大转角等驾驶参数；页面再合并车端
-`control_limits` 上报的五个 `default_speed_pid_*` 默认值，组成提交给车端确认的
-`profile_version=2` 初始完整快照。示例默认驾驶参数是目标车速 `2 km/h`、单电机最大转矩
+`control_limits` 上报的五个 `default_speed_pid_*` 默认值与
+`default_motor_torque_rise_rate_nm_per_s`，组成提交给车端确认的
+`profile_version=3` 初始完整快照。示例默认驾驶参数是目标车速 `2 km/h`、单电机最大转矩
 `300 Nm`、普通制动最大/缓刹/急刹压力 `100/30/100 bar/路` 和最大转角。它们分别受车端 `max_speed_kph * max_throttle`、
 `full_scale_motor_torque_nm` 和 `max_brake_pressure_bar` 硬上限约束；控制端设置不能
 提高车端上限。PID 可在安全驻车门禁内按会话热更新；反馈超时、超速 margin 和其他
@@ -628,9 +651,11 @@ control:
 PID、清零八路电机扭矩，同时保留转向。页面修改参数会先清空输入并要求车端确认，
 标准 `/api/control` 只准备 0..1 的模拟制动标量；物理压力始终由车端当前已确认的
 会话 profile 还原。
-默认 profile 只在驻车准入已满足（或车端明确报告 mock/无需握手且 adapter ready）后，
-每个控制链路 generation 自动提交一次；若车端拒绝，后续状态消息不会自动换新序号重试，
-必须由驾驶员显式确认后再次提交。
+页面只把这些默认值填入“实车调试限幅”窗口，不会自动提交 profile。新直接转矩语义下
+`PID 输出 × 单电机最大转矩`，旧 Kp/Ki 与 `300 Nm` 默认组合可能产生明显转矩阶跃；
+驾驶员必须在驻车准入已满足（或车端明确报告 mock/无需握手且 adapter ready）后打开
+窗口、逐项核对、勾选安全确认并显式发送。断开、故障或车端拒绝后也不会自动重提，
+必须再次人工确认；未获 ACK 时握手和普通驾驶保持禁止。
 对真实 VCU adapter，首次 profile、提高目标车速/转矩，以及修改任一转向、PID 或制动
 压力字段（即使降低）都必须先满足 N 挡、有效零速、电子驻车已拉起，并处于
 `standby/disarmed`；浏览器预检、core 与 bridge 门禁使用同一口径。
@@ -746,7 +771,7 @@ encoder 的 `bitrate` property update，且可绑定到 GStreamer pipeline 命�
 同时提供 profile 级弱网降级 hook，可从当前实时 profile 切到预声明的低
 fps/低分辨率 profile，pipeline hook 成功后才更新活动状态。
 控制安全 YAML 本身仍不热重载；唯一例外是已鉴权会话通过
-`session_control_profile` V2 原子设置受限的目标车速、转矩、普通压力、转角和 PID，
+`session_control_profile` V3 原子设置受限的目标车速、转矩、普通压力、转角、PID 和升扭斜率，
 断链/故障/会话替换时立即清除并恢复车端默认 PID。
 目标媒体主循环仍需在 Ubuntu 工控机端到端验证。
 - 安全停车策略。

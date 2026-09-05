@@ -64,7 +64,8 @@
 - 浏览器只允许一个 async writer 串行执行 `/api/control` 和 DataChannel `send`；键盘、Gamepad 和
   心跳只更新 latest-wins 快照，不排队积压过时命令。
 - 车端对 `vehicle_telemetry` 与 `vcu_handshake_status` 共用单调递增的 `control_status_seq`；浏览器在
-  unordered DataChannel 上只接受严格递增状态，禁止旧 Ready 覆盖较新的 fault/disarm。
+  unordered DataChannel 上只接受严格递增状态，禁止旧 Ready 覆盖较新的 fault/disarm。只有同时通过 `control_status_seq` 门禁并且通过
+  `command_seq` 关联到当前换挡事务的拒绝才能改变本地挡位。
 - D/R 选择与油门按键状态分离；松开前进/倒车键只归零牵引请求，普通制动也不自动切 N。
   真实断链、控制权丢失和 VCU 故障/退出仍重置控制资格，并要求新的 keydown 才能恢复。
 - 浏览器失焦或页面隐藏时立即清空物理输入，保持已选 D/R，但发送零牵引、零转向、零普通制动的
@@ -90,9 +91,10 @@
 ## 会话控制参数
 
 普通驾驶开始前，驾驶端必须先通过同一条 DataChannel 发送
-`type=session_control_profile`。当前 `profile_version=2` 是完整快照，包含目标车速、
-单电机最大转矩、普通制动最大/缓刹/急刹压力、最大转角，以及车速 PID 的
-`kp/ki/kd/derivative_filter_tau_ms/max_dt_ms`。车端只有在 bridge 原子应用整份快照后才发送
+`type=session_control_profile`。当前 `profile_version=3` 是完整快照，包含目标车速、
+单电机最大转矩、普通制动最大/缓刹/急刹压力、最大转角、车速 PID 的
+`kp/ki/kd/derivative_filter_tau_ms/max_dt_ms`，以及电机升扭斜率
+`motor_torque_rise_rate_nm_per_s`。车端只有在 bridge 原子应用整份快照后才发送
 `event=session_control_profile_status` 的成功状态；未确认参数时拒绝 VCU 握手和非
 急停驾驶命令。参数在断链、控制权/会话替换、故障或 adapter 自有安全停车时清除，
 重连后不能沿用旧确认；急停始终绕过普通参数门禁。成功状态的 `applied_revision`
@@ -103,9 +105,9 @@
 `full_scale_motor_torque_nm`，三项普通制动压力满足
 `service <= hard <= max <= max_brake_pressure_bar`，转角不超过
 `max_steering_angle_deg`，PID 仍受车端绝对范围约束。首次设置、提高目标车速/转矩、
-修改任一制动压力/转角/PID 还要求新鲜的 N 挡、零速和 EPB 驻车反馈，且 bridge
+修改任一制动压力/转角/PID/升扭斜率还要求新鲜的 N 挡、零速和 EPB 驻车反馈，且 bridge
 必须处于 `standby` 或 `disarmed`；Ready 中不能热改这些参数。会话清除会撤销牵引、
-复位 PID 并恢复车端 YAML 的默认 PID。反馈超时、硬超速 margin、命令超时和降速曲线
+复位 PID 并恢复车端 YAML 的默认 PID 与默认升扭斜率。反馈超时、硬超速 margin、命令超时和降速曲线
 始终是车端只读安全参数，控制端不能覆盖。
 
 ## 车端本地车速闭环与换挡门禁
@@ -114,8 +116,14 @@
 该会话的 `target_speed_kph`，同时仍受 `field_safety.max_speed_kph` 和
 `field_safety.max_throttle` 约束。API 线程只保存最新意图；
 bridge 的单一 SocketCAN I/O 线程每 20 ms 用新鲜的带符号 VCU 车速运行 PID，并在
-同一线程串行调用 ChassisControl。PID 输出范围是 `[0, 1]`，到达目标点时积分项
-可以保留维持车速所需的正扭矩；每个电机通道的唯一牵引上限是
+同一线程串行调用 ChassisControl 计算转向和制动。PID 输出范围是 `[0, 1]`，直接乘以
+已确认的会话单电机转矩上限，并以相同幅值写入八路牵引通道；不再把 PID 输出解释为
+理想加速度后通过整车质量、轮径和减速比二次换算。车端
+`field_safety.motor_torque_rise_rate_nm_per_s` 给出加扭斜率默认标定，会话 V3 起
+控制端面板可在 `[0, 32000] Nm/s` 包络内按会话调整该斜率（修改共享 PID 驻车门槛）；
+`0` 表示关闭额外斜率，严格按 PID 输出直接换算。启用正值时，当周期可达转矩会作为 PID 的动态输出
+上限，因此条件积分能感知斜率限制，不会在外层限幅器后继续积累；任何减扭仍立即生效。
+到达目标点时积分项可以保留维持车速所需的正扭矩；每个电机通道的唯一牵引上限是
 已确认会话上限与 `full_scale_motor_torque_nm` 的较小值，`max_throttle` 不是额外
 扭矩系数。PID 以固定目标参考
 应用 0.05 m/s 复位死区：手柄小抖动不丢积分，累计偏移越过死区或目标明显下降才复位。
@@ -138,23 +146,27 @@ PID，也没有 ramp/jerk 曲线；急刹直接请求会话中配置的急刹压
 反馈无效/过期或异常控制周期也复位 PID 并归零牵引。未经台架验证的 VCU 车速请求
 不参与闭环，`ADU_Tx_VehSpdReq` 在所有状态固定为 `0 km/h / Q=0`。
 
-车端和 VCU 状态机都要求进入 D/R 或 D/R 互换时具有新鲜有效的挡位/车速反馈，且
-绝对车速不大于 0.1 m/s；拒绝换挡时先撤销旧牵引。换挡闭环期间保持转角和 EHB
+进入 Ready 后，bridge 对任何挡位变更（包括切入 N）都要求新鲜有效的挡位/车速反馈，
+且绝对车速不大于 0.1 m/s；拒绝换挡时先撤销旧牵引并保留上一有效挡位。换挡闭环期间保持转角和 EHB
 压力连续，但八路扭矩保持为零。`WaitParkingBrakeReleased`、`WaitGear` 和
 `WaitActuatorModes` 都要求静止，车速超过 0.1 m/s 立即锁存停车并转入反向退出；
 每个首次启动等待态还有 500 ms 分层反馈宽限，超时后 CAN 静默不能无限保持 EPB
 释放。曾到达 Ready 后，apply 和 29 路关键反馈 watchdog 在后续换挡等待态继续生效。
-Ready 阶段即使零牵引或制动，车速超过配置最大值与独立 margin，或运动方向与所选
-D/R 相反超过 0.1 m/s，仍会锁存本地安全停车；普通控制命令不能解除。ESTOP 在
+Ready 阶段即使零牵引或制动，车速超过配置最大值与独立 margin，仍会锁存本地安全
+停车；普通控制命令不能解除。现场 WVCU 车速反馈按速度大小处理，速度 PID 与
+硬超速保护都使用绝对值，不根据正负推断 D/R 实际运动方向；档位只决定扭矩方向。ESTOP 在
 WaitParallel 阶段撤销握手并保持 EPB 驻车，在之后的启动阶段立即进入带 EHB 安全
 制动的完整退出。恢复必须
 完成退出流程，并在新鲜反馈满足 N、零速、EPB 驻车、人工状态后显式重新握手。
 
-Bridge 拒绝 D/R 请求时，现有牵引意图先在车端撤销。拒绝结果通过同一次 ABI 调用返回
+Bridge 拒绝未停稳或反馈过期时的任何换挡请求时，现有牵引意图先在车端撤销。拒绝结果通过同一次 ABI 调用返回
 枚举原因，vehicle runtime 再用 `control_command_rejected` 状态事件向当前 DataChannel
 发送 allowlist 中的稳定 `issue_code`。`vcu_drive_gear_change_moving_or_stale` 会让控制页
-清空油门/制动、回到 N 挡并要求驾驶员释放方向键后重新选择；原始异常字符串不会发送给
-浏览器。相同原因最多每 500 ms 重发一次，以兼顾 unordered/unreliable 通道丢包与限频。
+清空油门/制动、按 `command_seq` 恢复拒绝前挡位，立即发送该挡位零牵引，并要求驾驶员释放方向键后重新选择；不会因拒绝自动回 N。原始异常字符串不会发送给
+浏览器。无法关联的拒绝会冻结普通控制（急停和显式断开仍可用），直到安全断开并重新
+握手。bridge 还会锁存被拒绝的换挡：旧目标挡在之后降到零速时也不会自动生效；只有
+上一有效挡位的零牵引或制动命令、显式断开，或新握手才能解除。锁存期间旧挡上的普通
+制动保持可用。相同原因最多每 500 ms 重发一次，以兼顾 unordered/unreliable 通道丢包与限频。
 
 急停、物理急停、故障、断开停车和 bridge 本地 apply watchdog 走独立安全路径：
 八路牵引归零并可请求 DBC 全量 `409.5 bar/路`，不受会话的 327.6 bar 代码上限或

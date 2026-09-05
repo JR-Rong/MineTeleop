@@ -264,11 +264,21 @@ EOF
 printf '==> uploading bundle archive\n'
 run_cmd "${SCP_BASE[@]}" "$BUNDLE" "$SSH_TARGET:$REMOTE_ARCHIVE"
 
-run_remote "unpack bundle and verify bundled executables" "$(cat <<EOF
+run_remote "preflight bundle, install, and verify bundled executables" "$(cat <<EOF
 set -euo pipefail
 rm -rf "$REMOTE_DIR/.extracting"
 mkdir -p "$REMOTE_DIR/.extracting"
 tar -xzf "$REMOTE_ARCHIVE" -C "$REMOTE_DIR/.extracting" --strip-components=1
+test -x "$REMOTE_DIR/.extracting/bin/mine-teleop"
+test -x "$REMOTE_DIR/.extracting/bin/mine-teleop-run"
+test -s "$REMOTE_DIR/.extracting/lib/vendor/chassis/libmine_teleop_chassis_bridge.so"
+export LD_LIBRARY_PATH="$REMOTE_DIR/.extracting/lib:$REMOTE_DIR/.extracting/lib/vendor/chassis:$REMOTE_DIR/.extracting/lib/vendor/mvs"
+"$REMOTE_DIR/.extracting/bin/mine-teleop-run" version
+"$REMOTE_DIR/.extracting/bin/mine-teleop-run" config-check \
+  --config "$REMOTE_DIR/.extracting/config/vehicle-agent.yaml" \
+  --chassis-bridge-library "$REMOTE_DIR/.extracting/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
+  | tee /dev/stderr \
+  | grep -Eq '"chassis_bridge_abi":\\{[^}]*"passed":true[^}]*"version":6[^}]*\\}'
 rm -rf "$REMOTE_DIR/bin" "$REMOTE_DIR/lib"
 cp -a "$REMOTE_DIR/.extracting/." "$REMOTE_DIR/"
 rm -rf "$REMOTE_DIR/.extracting"
@@ -285,9 +295,13 @@ export GST_PLUGIN_SCANNER="$REMOTE_DIR/bin/gst-plugin-scanner"
 export GST_REGISTRY_FORK=no
 export GST_REGISTRY="$REMOTE_DIR/.gstreamer-registry.bin"
 export LIBVA_DRIVERS_PATH="$REMOTE_DIR/lib/dri"
-export LD_LIBRARY_PATH="$REMOTE_DIR/lib"
+export LD_LIBRARY_PATH="$REMOTE_DIR/lib:$REMOTE_DIR/lib/vendor/chassis:$REMOTE_DIR/lib/vendor/mvs"
 bin/mine-teleop-run version
-bin/mine-teleop-run config-check --config "$REMOTE_DIR/config/vehicle-agent.yaml"
+bin/mine-teleop-run config-check \
+  --config "$REMOTE_DIR/config/vehicle-agent.yaml" \
+  --chassis-bridge-library "$REMOTE_DIR/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
+  | tee /dev/stderr \
+  | grep -Eq '"chassis_bridge_abi":\\{[^}]*"passed":true[^}]*"version":6[^}]*\\}'
 EOF
 )"
 
@@ -297,7 +311,12 @@ if [[ -n "$CONFIG" ]]; then
   run_remote "verify vehicle configuration override" "$(cat <<EOF
 set -euo pipefail
 cd "$REMOTE_DIR"
-bin/mine-teleop-run config-check --config "$REMOTE_DIR/config/vehicle-agent.yaml"
+export LD_LIBRARY_PATH="$REMOTE_DIR/lib:$REMOTE_DIR/lib/vendor/chassis:$REMOTE_DIR/lib/vendor/mvs"
+bin/mine-teleop-run config-check \
+  --config "$REMOTE_DIR/config/vehicle-agent.yaml" \
+  --chassis-bridge-library "$REMOTE_DIR/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
+  | tee /dev/stderr \
+  | grep -Eq '"chassis_bridge_abi":\\{[^}]*"passed":true[^}]*"version":6[^}]*\\}'
 EOF
   )"
 fi

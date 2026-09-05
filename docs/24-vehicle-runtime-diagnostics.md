@@ -16,12 +16,47 @@
 - `vehicle_id`、`driver_id`、`session_id`：会话关联字段（可用时）；
 - `safety_action`：故障后的控制安全动作（涉及控制时）。
 
-摄像头/WebRTC 诊断写入车端 runtime 的 stdout/stderr。VCU 的启动可见性事件也写入
-stderr；协议细节与高频 CAN 证据写入
+当车辆遥测报告停车锁存时，还会携带 `stop_source`、`stop_reason` 和
+`stop_sequence`。控制服务对页面暴露的 `stop_source` 为 `page_disconnect`、
+`page_request`、`session_loss`、`watchdog`、`software_fault`、
+`physical_estop` 或 `unknown`；`stop_reason` 给出更精确的原因，例如
+`vcu_handshake_disconnect`、`feedback_timeout`、`handshake_revoked` 或
+`physical_emergency_switch`。关键摄像头和媒体管线故障分别使用
+`software_fault/critical_camera_failed` 与
+`software_fault/media_pipeline_failed`，不会再被普通会话关闭覆盖成
+`session_loss/session_lost`。`stop_sequence` 在新的根因被锁存时递增。VCU
+JSONL 中的原始 bridge 来源名为 `driver_page`、`session`、`watchdog`、
+`software_fault`、`physical_emergency` 或 `unknown`。同一次停车默认保留最先
+锁存的原因，但后续确认的物理急停可以覆盖软件来源；不要再仅根据
+`estop=true` 推测是否由当前页面发起。
+
+摄像头/WebRTC 诊断写入车端 runtime 的 stdout/stderr。由打包入口启动
+`vehicle-runtime` 时，这两路仍显示在原终端，同时合并落盘到
+`MINE_TELEOP_VEHICLE_RUNTIME_LOG_PATH`（默认
+`/var/log/mine-teleop/vehicle-runtime.log`）。它可能包含 GStreamer/vendor 裸文本，
+因此是 `.log` 而不是严格 JSONL；默认单文件 64 MiB、保留 5 份，可分别通过
+`MINE_TELEOP_VEHICLE_RUNTIME_LOG_MAX_BYTES` 和
+`MINE_TELEOP_VEHICLE_RUNTIME_LOG_ROTATIONS` 覆盖。
+例外：可识别的 vendor ChassisControl 输出只保留在终端，**不写入该落盘日志**：包括
+`UpdateVehicleState` wrapper 每个控制周期打印的完整裸行，以及 vendor `log_printf` 的
+`[YYYY-MM-DD HH:MM:SS.mmm] [级别] [pid] [tag]` 格式行（可带 ANSI 颜色）。过滤按完整
+行匹配；同名但带诊断内容的非 vendor 行与 Mine Teleop 结构化 runtime 诊断仍照常记录。VCU
+的启动可见性事件也进入该 runtime 日志；协议细节与高频 CAN 证据写入
 `MINE_TELEOP_VCU_LOG_PATH`（默认
 `/var/log/mine-teleop/vcu-can.jsonl`）。
 
 ## 配置加载与子进程边界
+
+长期 runtime 启动前，必须由管理员为实际运行用户准备日志目录：
+
+```bash
+sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /var/log/mine-teleop
+```
+
+日志目标或锁文件无法安全打开时，launcher 以 126 退出且不会启动车辆 runtime；
+运行中若磁盘写入失败，只报告一次 `runtime_log_write_failed` 并继续向终端转发，
+避免日志故障阻塞已有安全控制。`.lock` 文件还阻止两个 runtime 同时操作同一套
+轮转文件。
 
 配置尚未成功加载时，无法可靠判断错误属于哪一路 camera/VCU，因此入口统一输出
 `mine_teleop_error`，包含 `issue_code=runtime_entry_failed`、`stage=process_entry` 和
@@ -206,6 +241,13 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 
 | `event` / `issue_code` | 触发条件 | 去哪里看 |
 | --- | --- | --- |
+| `vehicle_runtime_log_ready` / `runtime_log_ready` | runtime 日志文件、容量与轮转锁已就绪 | 终端与 `vehicle-runtime.log` |
+| `vehicle_runtime_log_start_failed` / `runtime_log_open_failed` | 目录、权限、常规文件或单实例锁门禁失败 | launcher stderr；runtime 尚未启动 |
+| `vehicle_runtime_log_start_failed` / `runtime_log_pipe_failed` | stdout/stderr 中继 pipe 创建失败 | launcher stderr 与可用的 runtime log |
+| `vehicle_runtime_log_start_failed` / `runtime_log_initial_write_failed` | 首条日志无法写入 | launcher stderr；runtime 尚未启动 |
+| `vehicle_runtime_log_start_failed` / `runtime_log_signal_setup_failed` | 无法建立安全的 SIGINT/SIGTERM 转发 | launcher stderr；runtime 尚未启动 |
+| `vehicle_runtime_log_start_failed` / `runtime_log_fork_failed` | 无法创建受监管 runtime 子进程 | launcher stderr 与 runtime log |
+| `vehicle_runtime_log_write_failed` / `runtime_log_write_failed` | 运行中写入或轮转失败 | 终端 stderr；runtime 继续安全运行 |
 | `vehicle_vcu_adapter_start_failed` / `vcu_adapter_start_failed` | DataChannel 打开后 dlopen、ABI symbol、接口未 UP、波特率不匹配、发送队列设置或 bridge open 任一步失败；控制通道关闭但视频继续 | runtime stderr；新控制端在关闭前可能收到 `fault` |
 | `vehicle_vcu_start_failed` / `vcu_can_interface_invalid` | CAN interface 为空 | runtime stderr |
 | `vehicle_vcu_start_failed` / `vcu_bridge_already_open` | 重复 open | runtime stderr |
@@ -231,7 +273,9 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `can_receive_failed` / `socketcan_receive_failed` | read 或短帧失败 | `stage/errno/error/interface`；本地全停 |
 | `can_error_or_rtr_frame_ignored` / `can_error_or_rtr_frame_received` | 收到 CAN error/RTR frame | 每秒聚合；查 bus-off/error counter |
 | `can_rx_ignored_summary` / `can_rx_unrecognized_or_invalid` | JYR010 decoder 不识别或 DLC 不合法 | 每秒聚合 count/last ID |
+| `vmc_fault_code_changed` / `vcu_vmc_fault_code_changed` | `0x18F2F5D0` 中 `WVCU_VMCFltCode` 首次可用或发生变化 | `previous_valid`、`previous_vmc_fault_code`、`vmc_fault_code`；非零时按整车厂故障码表排查，本事件本身不自动触发停车 |
 | `feedback_timeout` / `vcu_critical_feedback_timeout` | Ready 后 29 个关键 ID 任一超过 500 ms | `stale_ids` 与逐 ID `age_ms`；锁存故障并全停 |
+| `arming_feedback_timeout` / `vcu_arming_feedback_timeout` | 握手某阶段必需反馈未在 500 ms 入口宽限内保持新鲜 | 全停并记录当前 `state`、`stale_ids` 和逐 ID `age_ms`；先断开完成 `Disarmed`，再从页面重新连接 |
 | `can_send_failed` / `socketcan_send_failed` | 连续 3 个 TX 周期有发送失败 | errno、失败 ID；锁存故障并全停 |
 | `tx_deadline_miss` / `vcu_tx_deadline_missed` | 20 ms 调度 deadline 落后 | 每秒至多一次，含 `lag_ms` |
 | `io_thread_exception` / `vcu_io_thread_exception` | I/O 线程标准异常 | 原始 exception；本地全停 |
@@ -239,6 +283,10 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 
 原始证据不做抽样：每个识别的 RX frame 使用 `kind=can_rx`，每个 20 ms 的完整 16
 帧 TX 使用 `kind=can_tx_batch`。结论事件与原始帧可以按时间戳关联。
+`0x18F2F5D0` 的 bit 16..23 解码为 `vmc_fault_code`。`0x18F6F5D0` 已纳入
+识别帧，bit 22..23 解码为 `brake_pedal_switch`，bit 24..25 解码为
+`parking_brake_switch`；原始帧记录在 `can_rx`，解码值同时出现在周期性
+`feedback_snapshot`、握手 gate 拒绝与 `handshake_revoked` 证据中。
 
 ### 握手、控制与安全停车
 
@@ -247,17 +295,28 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `parallel_handshake_rejected` / `vcu_handshake_runtime_unavailable` | bridge 停止或已有 I/O fault | 保持停车 |
 | `parallel_handshake_rejected` / `vcu_handshake_gate_rejected` | N/零速/电子驻车/manual state/新鲜度任一不满足 | 日志记录全部 gate 值 |
 | `parallel_handshake_requested` / `vcu_handshake_requested` | 请求被接受 | 仍停车直至 Ready |
+| `arming_feedback_timeout_recovered` / `vcu_arming_feedback_timeout_recovered` | 上一次握手阶段反馈超时，用户完成断开且车辆回到 `Disarmed` 后，新鲜驻车 gate 通过并接受新页面握手请求 | 清除仅属于该握手超时的 I/O 锁存，继续停车直至新握手 Ready；其他 I/O 故障不借此清除 |
+| `handshake_revoked` / `vcu_handshake_revoked` | 握手状态 5 已被接受，但在驻车释放/挡位/执行器准备或 Ready 阶段收到新的状态 3；同批后续状态 5 不清除锁存 | 立即撤销握手请求并安全退出；记录 `revoked_handshake_status`、`vmc_fault_code`、四路 EPB、`parking_brake_switch`、`brake_pedal_switch` 及停车来源，必须在页面重新申请握手 |
 | `vehicle_vcu_handshake_state_changed` / `vcu_handshake_state_changed` | browser 可见握手状态变化 | stdout 只在状态变化时输出 |
 | `control_apply_rejected` / `vcu_control_runtime_unavailable` | runtime/I/O fault 阻止控制 | 本地全停 |
+| `control_apply_rejected` / `vcu_runtime_control_profile_inactive` | 请求牵引时当前会话参数尚未原子应用或已被清除 | 仅撤销牵引并复位 PID，保留安全转向/挡位状态；页面重新确认并下发完整 profile 后重试，不得误判成已实施全制动 |
+| `control_apply_rejected` / `vcu_runtime_control_profile_limit_exceeded` | 目标速度、牵引比例或转向请求超过已确认的会话 profile | 以 `traction_withdrawn` 撤销牵引并复位 PID；按页面有效上限修正请求，不自动升级为急停 |
+| `control_apply_timeout` / `vcu_control_apply_timeout` | Ready 或保留控制状态下，成功上游控制 apply 超过 `control_timeout_ms` 未刷新 | `watchdog/control_apply_timeout` 锁存，本地全停；检查 DataChannel、vehicle-agent 控制循环和命令时序，完成安全退出后重新握手 |
+| `physical_emergency_latched`、`control_apply_rejected` / `vcu_physical_emergency_latched` | `WVCU_EmergencySwitch` 非零，或物理急停锁存期间仍收到普通控制 | `physical_estop/physical_emergency_switch` 本地全停；只能在现场释放开关、完成 N/零速/EPB/manual 反向握手后重新申请，物理来源可覆盖此前软件来源 |
+| `arming_motion_latched` / `vcu_arming_state_motion` | 要求静止的握手阶段实测速度超过 0.1 m/s | `software_fault/arming_motion` 本地全停；完成反向握手并检查速度/挡位反馈后重新申请 |
+| `hard_overspeed_latched` / `vcu_hard_overspeed` | 实测绝对速度超过本地硬速度上限与 margin | `software_fault/hard_overspeed` 本地全停并锁存；检查速度标定和 profile，完成 Disarmed 且 N/零速反馈新鲜后才允许新握手 |
+| `control_apply_rejected` / `vcu_hard_overspeed_latched` | 硬超速已经锁存后仍收到普通控制 | 保持既有全停，不允许普通控制清除；完成安全退出并从页面重新申请握手 |
+| `chassis_control_fault_latched` / `vcu_chassis_control_fault` | 本地 PID/转矩计算调用 ChassisControl 抛出标准或未知异常 | `software_fault/chassis_control_fault` 本地全停并锁存 I/O fault；检查 vendor ChassisControl 与输入标定，修复后重启，不能靠普通重连清除 |
 | `control_apply_rejected` / `vcu_control_command_invalid` | command 越界或状态不允许 | 本地全停 |
-| `bridge_api_operation_failed` / `chassis_control_update_failed` | ChassisControl 拒绝新的 vehicle state | 本地全停 |
 | `bridge_api_operation_failed` / `vcu_apply_arguments_invalid` | ABI gear/pointer/count 非法 | 本地全停 |
 | `vehicle_control_command_rejected` / `vcu_feedback_blocks_control` | feedback missing/poll failed 阻止 DataChannel 命令 | 本地全停；结合 VCU JSONL |
-| `control_apply_rejected`、`control_command_rejected` / `vcu_drive_gear_change_moving_or_stale` | D/R 切换时车辆仍在移动，或速度/挡位反馈无效、过期 | 先撤牵引；当前驾驶端清空输入并回 N，停车且恢复新鲜反馈后释放并重新选择 D/R |
+| `control_apply_rejected`、`control_command_rejected` / `vcu_drive_gear_change_moving_or_stale` | 任何挡位切换（包括 N）时车辆仍在移动，或速度/挡位反馈无效、过期 | 以 `traction_withdrawn_retained_gear` 撤牵引并锁存上一有效挡位；旧目标不会在随后零速时自动生效。驾驶端能关联 `command_seq` 时回滚且发送旧挡零牵引；无法关联时冻结普通控制但保留急停/显式断开，需安全断开并重新握手 |
 | `control_command_rejected` / `vcu_control_apply_rejected` | bridge 拒绝控制但原因不属于浏览器 allowlist | 清空驾驶输入并保持安全状态；查 VCU JSONL 获取本地详细原因 |
 | `vehicle_vcu_handshake_command_failed` / `vcu_handshake_command_failed` | handshake ABI 调用抛错 | 本地全停 |
-| `vehicle_vcu_runtime_failed` / `vcu_runtime_operation_failed` | tick/telemetry/safe-stop 路径抛错 | 尝试本地全停并关闭控制 DataChannel；视频继续 |
+| `vehicle_vcu_runtime_failed` / `vcu_runtime_operation_failed` | tick/telemetry/safe-stop 路径抛错 | 以 `software_fault/vcu_state_fault` 尝试本地全停并关闭控制 DataChannel；视频继续；若 bridge 已先锁存更精确根因则保留首因 |
 | `emergency_stop` / `vcu_emergency_stop_applied` | 软件急停已下发 | 本地全停 |
+| `stop_provenance_latched` / `vcu_stop_provenance_latched` | 新的停车根因被锁存，或物理急停覆盖先前的软件来源 | 立即 flush `stop_source`、`stop_reason`、对应 ID 和 `stop_sequence`；遥测保留该根因直至明确清除 |
+| `stop_provenance_cleared` / `vcu_stop_provenance_cleared` | 新握手请求通过安全 gate 被接受，或 Ready 状态满足软件停车清除条件 | 记录 `previous` 根因和当前 `stop_sequence`；清除事件不会倒退 sequence |
 | `emergency_stop_rejected` / `vcu_emergency_stop_runtime_unavailable` | bridge 已停止，软件急停无法下发 | 必须使用独立硬件安全路径 |
 | `parallel_handshake_disconnect_requested` / `vcu_disarm_requested` | 主动断开 | 零扭矩、N、EPB、清握手 |
 | `disarm_complete` / `vcu_disarm_complete` | 反向握手完成 | 全停已确认 |
@@ -271,12 +330,12 @@ disarm 结果立即 flush。
 
 ## 推荐排查命令
 
-车端 runtime 只看失败和关键里程碑：
+车端 runtime 只看失败和关键里程碑（`-R` 忽略混合日志中的非 JSON 行）：
 
 ```bash
-./bin/mine-teleop-run 2>&1 |
-  jq -c 'select(
-    (.severity == "error") or
+sudo tail -n 0 -F /var/log/mine-teleop/vehicle-runtime.log |
+  jq -R -c 'fromjson? | select(
+    (.severity == "error") or (.severity == "critical") or
     (.event | test("first_frame|offer_created|answer_applied|ice_candidate|data_channel_open|vcu_adapter_ready"))
   )'
 ```
@@ -284,8 +343,8 @@ disarm 结果立即 flush。
 定位某一路摄像头：
 
 ```bash
-./bin/mine-teleop-run 2>&1 |
-  jq -c 'select(.camera_id == "front_uvc2" or .issue_code == "camera_node_not_capture_capable")'
+sudo tail -n 0 -F /var/log/mine-teleop/vehicle-runtime.log |
+  jq -R -c 'fromjson? | select(.camera_id == "front_uvc2" or .issue_code == "camera_node_not_capture_capable")'
 ```
 
 VCU 结论事件：

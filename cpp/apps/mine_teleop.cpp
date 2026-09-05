@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -951,7 +952,7 @@ int main(int argc, char** argv) {
         }
         mine_teleop::validate_chassis_bridge_abi(library_path);
         result["chassis_bridge_abi"] = {
-            {"version", 3},
+            {"version", 6},
             {"passed", true},
         };
       }
@@ -962,7 +963,15 @@ int main(int argc, char** argv) {
     }
     if (command == "vehicle-agent") return run_vehicle_agent(arguments);
     if (command == "vehicle-media-agent") return run_vehicle_media_agent(arguments);
-    if (command == "vehicle-runtime") return run_vehicle_runtime(arguments);
+    if (command == "vehicle-runtime") {
+      if (environment("MINE_TELEOP_RUNTIME_LOG_RELAY") == "1") {
+        std::setvbuf(stdout, nullptr, _IOLBF, 0);
+        std::setvbuf(stderr, nullptr, _IONBF, 0);
+        std::cout << std::unitbuf;
+        std::cerr << std::unitbuf;
+      }
+      return run_vehicle_runtime(arguments);
+    }
     if (command == "vehicle-uploader") return run_vehicle_uploader(arguments);
     if (command == "http-health") return run_http_health(arguments);
     if (command == "time-sync") return run_time_sync(arguments);

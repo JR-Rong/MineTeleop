@@ -89,6 +89,106 @@ test('gear selection latches on release and gates every new D/R selection on val
       'R');
 });
 
+test('gear rejection matches only a forwarded command from the active transition', () => {
+  let transition = logic.createGearTransition('D', 'R', 40, 7);
+  assert.deepEqual(transition, {
+    generation: 7,
+    fromGear: 'D',
+    toGear: 'R',
+    statusFloor: 40,
+    forwardedSeqs: [],
+  });
+  assert.strictEqual(
+      logic.recordForwardedGearCommand(transition, 6, 100, 'R'), transition);
+  assert.strictEqual(
+      logic.recordForwardedGearCommand(transition, 7, 100, 'D'), transition);
+  transition = logic.recordForwardedGearCommand(transition, 7, 101, 'R');
+  transition = logic.recordForwardedGearCommand(transition, 7, 102, 'R');
+  assert.deepEqual(transition.forwardedSeqs, [101, 102]);
+  assert.equal(logic.matchesGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    command_seq: 101,
+    control_status_seq: 41,
+  }, 'R'), true);
+  assert.equal(logic.matchesGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    command_seq: 103,
+    control_status_seq: 41,
+  }, 'R'), false);
+  assert.equal(logic.matchesGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    command_seq: 101,
+    control_status_seq: 40,
+  }, 'R'), false);
+  assert.equal(logic.matchesGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    command_seq: 101,
+    control_status_seq: 41,
+  }, 'D'), false);
+
+  assert.deepEqual(logic.reduceGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    command_seq: 101,
+    control_status_seq: 41,
+  }, 'R'), {
+    matched: true,
+    selectedGear: 'D',
+    pendingGearRequest: 'R',
+    pendingGearTransition: null,
+    inhibitOrdinaryControl: false,
+    sendRollback: true,
+  });
+  assert.deepEqual(logic.reduceGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    command_seq: 999,
+    control_status_seq: 41,
+  }, 'R'), {
+    matched: false,
+    selectedGear: 'R',
+    pendingGearRequest: null,
+    pendingGearTransition: null,
+    inhibitOrdinaryControl: true,
+    sendRollback: false,
+  });
+});
+
+test('only fresh authoritative telemetry confirms an active gear transition', () => {
+  const unforwarded = logic.createGearTransition('D', 'R', 50, 8);
+  const telemetry = {
+    event: 'vehicle_telemetry',
+    control_status_seq: 51,
+    gear: 'N',
+    can_feedback: {supported: true, feedback_fresh: true, gear_valid: true, gear: 2},
+  };
+  assert.equal(logic.telemetryConfirmsGearTransition(unforwarded, telemetry), false);
+  const transition = logic.recordForwardedGearCommand(unforwarded, 8, 201, 'R');
+  assert.equal(logic.telemetryConfirmsGearTransition(transition, telemetry), true);
+  assert.equal(logic.telemetryConfirmsGearTransition(
+      transition, {...telemetry, control_status_seq: 50}), false);
+  assert.equal(logic.telemetryConfirmsGearTransition(
+      transition, {...telemetry, can_feedback: {...telemetry.can_feedback, feedback_fresh: false}}),
+      false);
+  assert.equal(logic.telemetryConfirmsGearTransition(
+      transition, {...telemetry, can_feedback: {...telemetry.can_feedback, gear_valid: false}}),
+      false);
+  assert.equal(logic.telemetryConfirmsGearTransition(
+      transition, {...telemetry, can_feedback: {...telemetry.can_feedback, gear: 3}}), false);
+  assert.equal(logic.telemetryConfirmsGearTransition(transition, {
+    event: 'vehicle_telemetry',
+    control_status_seq: 52,
+    gear: 'R',
+    can_feedback: {supported: false},
+  }), true);
+  for (const canFeedback of [undefined, {}, {supported: null}, {supported: 'false'}]) {
+    assert.equal(logic.telemetryConfirmsGearTransition(transition, {
+      event: 'vehicle_telemetry',
+      control_status_seq: 52,
+      gear: 'R',
+      can_feedback: canFeedback,
+    }), false);
+  }
+});
+
 test('deriveControl applies brake priority, suppresses throttle, and preserves steering', () => {
   const limits = {maxThrottle: 0.05, maxBrakePressureBar: 100,
     serviceBrakePressureBar: 30, hardBrakePressureBar: 80, maxSteeringDeg: 3};
@@ -201,14 +301,16 @@ test('control rejection presentation exposes only stable issue-code guidance', (
       'vcu_drive_gear_change_moving_or_stale');
   assert.deepEqual(gearRejected, {
     issueCode: 'vcu_drive_gear_change_moving_or_stale',
+    action: 'rollback_gear_change',
     clearInput: true,
-    severity: 'critical',
-    text: '换挡被车端拒绝：车辆仍在移动，或挡位/速度反馈已过期；请停车并恢复新鲜反馈后，释放再重新选择 D/R。',
+    severity: 'warn',
+    text: '换挡被车端拒绝：已撤销牵引并保持拒绝前挡位；请停车、恢复新鲜反馈，释放后再重新选择方向。',
   });
 
   const unknown = logic.deriveControlCommandRejection(
       'untrusted exception text / secret sentinel');
   assert.equal(unknown.issueCode, 'vcu_control_apply_rejected');
+  assert.equal(unknown.action, 'reset_neutral');
   assert.equal(unknown.clearInput, true);
   assert.equal(unknown.severity, 'critical');
   assert(!unknown.text.includes('secret sentinel'));
@@ -216,7 +318,7 @@ test('control rejection presentation exposes only stable issue-code guidance', (
 
 function controlProfile(overrides = {}) {
   return {
-    profile_version: 2,
+    profile_version: 3,
     target_speed_kph: 12,
     max_motor_torque_nm: 300,
     max_brake_pressure_bar: 90,
@@ -228,6 +330,7 @@ function controlProfile(overrides = {}) {
     speed_pid_kd: 0.2,
     speed_pid_derivative_filter_tau_ms: 60,
     speed_pid_max_dt_ms: 80,
+    motor_torque_rise_rate_nm_per_s: 120,
     ...overrides,
   };
 }
@@ -268,6 +371,8 @@ function vehicleHardLimits(overrides = {}) {
     default_speed_pid_kd: 0.1,
     default_speed_pid_derivative_filter_tau_ms: 50,
     default_speed_pid_max_dt_ms: 100,
+    default_motor_torque_rise_rate_nm_per_s: 150,
+    motor_torque_rise_rate_limits_nm_per_s: {min: 0, max: 400},
     speed_pid_limits: {
       kp: {min: 0, max: 10},
       ki: {min: 0, max: 10},
@@ -284,11 +389,11 @@ function vehicleHardLimits(overrides = {}) {
   };
 }
 
-test('session control profile V2 validation and hard-limit merge preserve ordering', () => {
+test('session control profile V3 validation and hard-limit merge preserve ordering', () => {
   const requested = controlProfile();
   const hard = vehicleHardLimits();
   assert.deepEqual(logic.mergeControlProfileWithHardLimits(requested, hard), {
-    profile_version: 2,
+    profile_version: 3,
     target_speed_kph: 4,
     max_motor_torque_nm: 165,
     max_brake_pressure_bar: 50,
@@ -300,7 +405,11 @@ test('session control profile V2 validation and hard-limit merge preserve orderi
     speed_pid_kd: 0.2,
     speed_pid_derivative_filter_tau_ms: 60,
     speed_pid_max_dt_ms: 80,
+    motor_torque_rise_rate_nm_per_s: 120,
   });
+  assert.equal(logic.mergeControlProfileWithHardLimits(
+      {...requested, motor_torque_rise_rate_nm_per_s: 999}, hard)
+      .motor_torque_rise_rate_nm_per_s, 400);
   assert.equal(logic.controlProfileThrottleLimit(
       {...requested, target_speed_kph: 2}, hard), 0.05);
   assert.equal(logic.controlProfileThrottleLimit(
@@ -327,10 +436,26 @@ test('session control profile V2 validation and hard-limit merge preserve orderi
       /speed_pid_max_dt_ms must be an integer/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, profile_version: 1}),
-      /profile_version must be 2/);
+      /profile_version must be 3/);
+  assert.throws(
+      () => logic.normalizeControlProfile({...requested, profile_version: 2}),
+      /profile_version must be 3/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, unexpected_field: 1}),
-      /exactly the V2 fields/);
+      /exactly the V3 fields/);
+  assert.throws(
+      () => logic.normalizeControlProfile(
+          {...requested, motor_torque_rise_rate_nm_per_s: -1}),
+      /motor_torque_rise_rate_nm_per_s/);
+  assert.throws(
+      () => logic.normalizeControlProfile(
+          {...requested, motor_torque_rise_rate_nm_per_s: 32000.1}),
+      /motor_torque_rise_rate_nm_per_s/);
+  const v2Profile = controlProfile();
+  delete v2Profile.motor_torque_rise_rate_nm_per_s;
+  assert.throws(
+      () => logic.normalizeControlProfile(v2Profile),
+      /exactly the V3 fields/);
 });
 
 test('PID defaults come only from complete vehicle limits and accept kp hard min zero', () => {
@@ -354,11 +479,28 @@ test('PID defaults come only from complete vehicle limits and accept kp hard min
   assert.equal(profile.speed_pid_kd, 0.5);
   assert.equal(profile.speed_pid_derivative_filter_tau_ms, 75);
   assert.equal(profile.speed_pid_max_dt_ms, 120);
+  assert.equal(profile.motor_torque_rise_rate_nm_per_s, 150);
   assert.equal(logic.normalizeVehicleHardLimits(hard).speed_pid_limits.kp.min, 0);
 
   const missingDefault = vehicleHardLimits();
   delete missingDefault.default_speed_pid_kd;
   assert.throws(() => logic.normalizeVehicleHardLimits(missingDefault), /default_speed_pid_kd/);
+  const missingRiseRate = vehicleHardLimits();
+  delete missingRiseRate.default_motor_torque_rise_rate_nm_per_s;
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits(missingRiseRate),
+      /default_motor_torque_rise_rate_nm_per_s/);
+  const missingRiseRateLimits = vehicleHardLimits();
+  delete missingRiseRateLimits.motor_torque_rise_rate_limits_nm_per_s;
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits(missingRiseRateLimits),
+      /motor_torque_rise_rate_limits_nm_per_s/);
+  assert.throws(
+      () => logic.normalizeVehicleHardLimits({
+        ...vehicleHardLimits(),
+        motor_torque_rise_rate_limits_nm_per_s: {min: 500, max: 400},
+      }),
+      /must not exceed max/);
   assert.throws(
       () => logic.normalizeVehicleHardLimits({...vehicleHardLimits(), speed_pid_limits: null}),
       /speed_pid_limits/);
@@ -594,6 +736,45 @@ test('ESTOP presentation distinguishes local and vehicle telemetry states', () =
   assert.equal(vehicleOnly.visible, true);
   assert.equal(vehicleOnly.severity, 'critical');
   assert.match(vehicleOnly.banner, /不是由本页面请求/);
+
+  const pageDisconnect = logic.deriveEstopPresentation(
+      false, true, 'page_disconnect', 'vcu_handshake_disconnect');
+  assert.equal(pageDisconnect.kind, 'page_disconnect');
+  assert.equal(pageDisconnect.severity, 'warn');
+  assert.match(pageDisconnect.banner, /重新确认参数并申请握手/);
+  assert.doesNotMatch(pageDisconnect.banner, /不是由本页面请求/);
+
+  const pageRequest = logic.deriveEstopPresentation(
+      false, true, 'page_request', 'operator_estop');
+  assert.equal(pageRequest.kind, 'page_request');
+  assert.match(pageRequest.banner, /控制页面急停请求/);
+  assert.doesNotMatch(pageRequest.banner, /不是由本页面请求/);
+
+  const sessionLoss = logic.deriveEstopPresentation(
+      false, true, 'session_loss', 'control_session_closed');
+  assert.equal(sessionLoss.kind, 'session_loss');
+  assert.match(sessionLoss.banner, /控制会话丢失/);
+
+  const watchdog = logic.deriveEstopPresentation(
+      false, true, 'watchdog', 'control_apply_timeout');
+  assert.equal(watchdog.kind, 'watchdog');
+  assert.match(watchdog.banner, /watchdog/);
+
+  const softwareFault = logic.deriveEstopPresentation(
+      false, true, 'software_fault', 'can_receive_failed');
+  assert.equal(softwareFault.kind, 'software_fault');
+  assert.match(softwareFault.banner, /软件故障/);
+
+  const physicalEstop = logic.deriveEstopPresentation(
+      false, true, 'physical_estop', 'physical_emergency_switch');
+  assert.equal(physicalEstop.kind, 'physical_estop');
+  assert.match(physicalEstop.banner, /物理急停/);
+
+  const physicalOverridesLocal = logic.deriveEstopPresentation(
+      true, true, 'physical_estop', 'physical_emergency_switch');
+  assert.equal(physicalOverridesLocal.kind, 'physical_estop');
+  assert.match(physicalOverridesLocal.banner, /物理急停/);
+  assert.doesNotMatch(physicalOverridesLocal.banner, /本页面急停/);
 
   assert.equal(logic.deriveEstopPresentation(false, false).visible, false);
 });

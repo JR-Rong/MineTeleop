@@ -198,7 +198,9 @@ class NoFeedbackAdapter final : public mine_teleop::VehicleAdapter {
     return session_brake_pressure_limit;
   }
   void apply_control(const ControlCommand&) override { ++applied_commands; }
-  void apply_safe_stop(const mine_teleop::ControlOutput& output) override {
+  void apply_safe_stop(
+      const mine_teleop::ControlOutput& output,
+      mine_teleop::VehicleStopContext) override {
     last_safe_output = output;
     ++safe_stops;
   }
@@ -295,7 +297,9 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
     ++applied_commands;
   }
 
-  void apply_safe_stop(const mine_teleop::ControlOutput& output) override {
+  void apply_safe_stop(
+      const mine_teleop::ControlOutput& output,
+      mine_teleop::VehicleStopContext) override {
     ++safe_stop_attempts;
     if (safe_stop_throws) {
       throw std::runtime_error("adapter safe stop failed");
@@ -425,6 +429,11 @@ void test_config_loads_current_vehicle_yaml() {
       1e-9,
       "safe default full-scale motor torque changed");
   expect_near(
+      config.field_safety.motor_torque_rise_rate_nm_per_s,
+      0.0,
+      1e-9,
+      "safe default motor torque rise shaping changed");
+  expect_near(
       config.field_safety.max_brake_pressure_bar,
       100.0,
       1e-9,
@@ -520,6 +529,7 @@ void test_vehicle_config_validates_full_scale_motor_torque() {
       "field_safety:\n",
       "field_safety:\n"
       "  max_throttle: 0.10\n"
+      "  motor_torque_rise_rate_nm_per_s: 0.0\n"
       "  speed_feedback_timeout_ms: 200\n"
       "  speed_pid_kp: 1.0\n"
       "  speed_pid_ki: 0.2\n"
@@ -657,6 +667,9 @@ void test_vehicle_config_validates_local_speed_pid_safety_fields() {
   const std::vector<std::pair<std::string, std::string>> invalid_fields{
       {"speed_feedback_timeout_ms", "19"},
       {"speed_feedback_timeout_ms", "501"},
+      {"motor_torque_rise_rate_nm_per_s", "-0.1"},
+      {"motor_torque_rise_rate_nm_per_s", "32000.1"},
+      {"motor_torque_rise_rate_nm_per_s", ".nan"},
       {"speed_pid_kp", "0"},
       {"speed_pid_kp", ".nan"},
       {"speed_pid_ki", "-0.1"},
@@ -1231,6 +1244,7 @@ void test_vehicle_config_validates_chassis_control_speed_range() {
       "field_safety:\n"
       "  max_throttle: 0.10\n"
       "  full_scale_motor_torque_nm: 41.25\n"
+      "  motor_torque_rise_rate_nm_per_s: 0.0\n"
       "  speed_feedback_timeout_ms: 200\n"
       "  speed_pid_kp: 1.0\n"
       "  speed_pid_ki: 0.2\n"
@@ -1261,6 +1275,22 @@ void test_vehicle_config_validates_chassis_control_speed_range() {
       1e-9,
       "one km/h local PID target-speed boundary was rejected");
   std::filesystem::remove(non_mock_boundary_path, error);
+
+  auto missing_rise_rate_contents = non_mock_boundary_contents;
+  replace_once(
+      missing_rise_rate_contents,
+      "  motor_torque_rise_rate_nm_per_s: 0.0\n",
+      "");
+  const auto missing_rise_rate_path = write_temp_vehicle_config(
+      "missing-explicit-motor-torque-rise-rate",
+      missing_rise_rate_contents);
+  expect_throws(
+      [&] {
+        static_cast<void>(
+            mine_teleop::load_vehicle_config(missing_rise_rate_path));
+      },
+      "non-mock adapter accepted an implicit motor torque rise rate");
+  std::filesystem::remove(missing_rise_rate_path, error);
 
   auto missing_pid_contents = non_mock_boundary_contents;
   replace_once(missing_pid_contents, "  speed_pid_kd: 0.0\n", "");
@@ -1404,6 +1434,11 @@ void test_field_config_pins_tls_route_without_system_dns() {
       300.0,
       1e-9,
       "field vehicle full-scale motor torque changed");
+  expect_near(
+      config.field_safety.motor_torque_rise_rate_nm_per_s,
+      0.0,
+      1e-9,
+      "field vehicle motor torque rise shaping is not explicitly disabled");
   expect(
       config.field_safety.speed_feedback_timeout_ms == 200 &&
           config.field_safety.speed_pid_max_dt_ms == 100,
@@ -1428,6 +1463,13 @@ void test_field_config_pins_tls_route_without_system_dns() {
       300.0,
       1e-9,
       "effective vehicle config omitted full-scale motor torque");
+  expect_near(
+      config.redacted_summary()
+          .at("motor_torque_rise_rate_nm_per_s")
+          .get<double>(),
+      0.0,
+      1e-9,
+      "effective vehicle config omitted motor torque rise shaping");
   expect_near(
       config.field_safety.max_brake_pressure_bar,
       100.0,
@@ -1557,6 +1599,24 @@ void test_session_control_profile_json_round_trip_and_physical_units() {
   expect_throws(
       [&] { invalid.validate(); },
       "out-of-range PID max dt was accepted");
+  invalid = request;
+  invalid.profile.motor_torque_rise_rate_nm_per_s = -1.0;
+  expect_throws(
+      [&] { invalid.validate(); },
+      "negative motor torque rise rate was accepted");
+  invalid = request;
+  invalid.profile.motor_torque_rise_rate_nm_per_s = 32000.1;
+  expect_throws(
+      [&] { invalid.validate(); },
+      "motor torque rise rate above the physical envelope was accepted");
+  auto missing_rise_rate = encoded;
+  missing_rise_rate.erase("motor_torque_rise_rate_nm_per_s");
+  expect_throws(
+      [&] {
+        static_cast<void>(
+            mine_teleop::SessionControlProfileRequest::from_json(missing_rise_rate));
+      },
+      "session profile without the rise rate field was accepted");
 }
 
 void test_shared_protocol_v1_vectors_and_session_states() {
@@ -1964,6 +2024,32 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
           !service.session_control_profile().at("active").get<bool>(),
       "profile was ACKed before adapter application completed");
   adapter_view->control_limit_update_throws = false;
+
+  const auto restored = service.receive_session_profile(
+      session_profile_request(8, 70, 8.0, 80.0, 100.0, 30.0, 80.0),
+      70);
+  expect(
+      restored.accepted,
+      "parking-ready baseline profile was not restored after apply failure");
+
+  // A rise-rate-only change joins the PID parking gate: identical envelope
+  // values with only motor_torque_rise_rate_nm_per_s changed still requires
+  // parking, and is applied once parked.
+  adapter_view->handshake.parking_ready = false;
+  auto rise_rate_change = session_profile_request(9, 80, 8.0, 80.0, 100.0, 30.0, 80.0);
+  rise_rate_change.profile.motor_torque_rise_rate_nm_per_s = 50.0;
+  const auto rise_rate_blocked = service.receive_session_profile(rise_rate_change, 80);
+  expect(
+      !rise_rate_blocked.accepted &&
+          rise_rate_blocked.reason == "parking_ready_required_for_profile_increase",
+      "motor torque rise-rate change bypassed parking_ready");
+  adapter_view->handshake.parking_ready = true;
+  auto rise_rate_apply = session_profile_request(10, 90, 8.0, 80.0, 100.0, 30.0, 80.0);
+  rise_rate_apply.profile.motor_torque_rise_rate_nm_per_s = 50.0;
+  const auto rise_rate_accepted = service.receive_session_profile(rise_rate_apply, 90);
+  expect(
+      rise_rate_accepted.accepted,
+      "parked rise-rate change was rejected");
   service.close();
 }
 
@@ -2442,6 +2528,14 @@ void test_control_service_applies_vehicle_hard_limits() {
           limits.at("speed_pid_limits").at("max_dt_ms").at("min") == 20 &&
           limits.at("speed_pid_limits").at("max_dt_ms").at("max") == 200,
       "reported PID defaults or absolute bounds mismatch");
+  expect(
+      limits.at("default_motor_torque_rise_rate_nm_per_s") ==
+              config.field_safety.motor_torque_rise_rate_nm_per_s &&
+          limits.at("motor_torque_rise_rate_limits_nm_per_s").at("min") ==
+              0.0 &&
+          limits.at("motor_torque_rise_rate_limits_nm_per_s").at("max") ==
+              mine_teleop::kMaxMotorTorqueRiseRateNmPerSecond,
+      "reported rise-rate default or absolute bounds mismatch");
   mine_teleop::Json expected_deceleration_profile =
       mine_teleop::Json::array();
   for (const auto& stage : config.control.deceleration_profile) {
@@ -2546,12 +2640,84 @@ void test_control_service_bounds_telemetry_history() {
   expect(
       history.back().at("can_feedback").at("supported").get<bool>() == false,
       "mock telemetry incorrectly advertised measured CAN feedback");
+  expect(
+      history.back().at("stop_source").get<std::string>() == "none" &&
+          history.back().at("stop_reason").get<std::string>() == "none" &&
+          history.back().at("stop_sequence").get<std::uint64_t>() == 0,
+      "idle telemetry omitted or misreported stop provenance");
   const auto summary = service.summary();
   expect(summary.at("telemetry_count").get<std::uint64_t>() == total_samples, "telemetry total count was truncated");
   expect(
       summary.at("telemetry_retained_count").get<std::size_t>() == mine_teleop::kMaxVehicleTelemetryHistory,
       "telemetry retained count does not match the bounded history");
+
+  auto estop = command(
+      static_cast<std::uint64_t>(total_samples + 1),
+      static_cast<std::int64_t>(total_samples + 1));
+  estop.estop = true;
+  expect(
+      service.receive_command(
+          estop,
+          static_cast<std::int64_t>(total_samples + 1)).accepted,
+      "page ESTOP was rejected while checking telemetry provenance");
+  service.tick(static_cast<std::int64_t>(total_samples + 2));
+  const auto& stopped = service.telemetry_history().back();
+  expect(
+      stopped.at("stop_source").get<std::string>() == "page_request" &&
+          stopped.at("stop_reason").get<std::string>() == "operator_estop" &&
+          stopped.at("stop_sequence").get<std::uint64_t>() > 0,
+      "page ESTOP provenance did not reach vehicle telemetry");
   service.close();
+}
+
+void test_control_service_close_preserves_stop_provenance() {
+  const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  {
+    auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+    auto* adapter_view = adapter.get();
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    service.close({
+        mine_teleop::VehicleStopSource::SoftwareFault,
+        mine_teleop::VehicleStopReason::CriticalCameraFailed});
+    const auto telemetry = adapter_view->read_telemetry();
+    expect(
+        telemetry.estop && telemetry.stop_source == "software_fault" &&
+            telemetry.stop_reason == "critical_camera_failed" &&
+            telemetry.stop_sequence == 1,
+        "critical-camera close lost its software-fault stop provenance");
+  }
+  {
+    auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+    auto* adapter_view = adapter.get();
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    service.close({
+        mine_teleop::VehicleStopSource::SoftwareFault,
+        mine_teleop::VehicleStopReason::MediaPipelineFailed});
+    const auto telemetry = adapter_view->read_telemetry();
+    expect(
+        telemetry.estop && telemetry.stop_source == "software_fault" &&
+            telemetry.stop_reason == "media_pipeline_failed" &&
+            telemetry.stop_sequence == 1,
+        "media-pipeline close lost its software-fault stop provenance");
+  }
+  {
+    auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+    auto* adapter_view = adapter.get();
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    service.close();
+    const auto telemetry = adapter_view->read_telemetry();
+    expect(
+        telemetry.estop && telemetry.stop_source == "session_loss" &&
+            telemetry.stop_reason == "session_lost" &&
+            telemetry.stop_sequence == 1,
+        "ordinary service close no longer reports session-loss provenance");
+  }
 }
 
 void test_control_service_requires_feedback_before_actuation_but_allows_estop() {
@@ -3557,6 +3723,8 @@ int main() {
       {"control_service_applies_vehicle_hard_limits", test_control_service_applies_vehicle_hard_limits},
       {"control_service_applies_session_steering_limit", test_control_service_applies_session_steering_limit},
       {"control_service_bounds_telemetry_history", test_control_service_bounds_telemetry_history},
+      {"control_service_close_preserves_stop_provenance",
+       test_control_service_close_preserves_stop_provenance},
       {"control_service_requires_feedback_before_actuation_but_allows_estop", test_control_service_requires_feedback_before_actuation_but_allows_estop},
       {"fault_output_fails_safe", test_fault_output_fails_safe},
       {"native_signaling_webrtc_message_isolation", test_native_signaling_webrtc_message_isolation},

@@ -103,8 +103,17 @@ field_safety:
   # Vehicle-side per-motor hard request ceiling. 300 Nm is a software default,
   # not measured vehicle capability; ordinary code is capped at 640.0 Nm.
   full_scale_motor_torque_nm: 300.0
-  # Local 20 ms speed PID parameters. These are schema-valid, bounded
-  # placeholders only and have NOT passed isolated CAN bench or vehicle calibration.
+  # Optional per-motor rising-torque shaping in Nm/s. Zero disables the extra
+  # ramp and applies PID output x the acknowledged session torque limit directly.
+  # This is the startup default; since session profile V3 the driver console may
+  # retune it per session within [0, 32000] behind the same parking gate as the
+  # PID gains, and a profile clear restores this value.
+  # Use a positive value only after isolated bench calibration.
+  motor_torque_rise_rate_nm_per_s: 0.0
+  # Local 20 ms speed PID parameters. Its [0, 1] output directly scales the
+  # acknowledged per-motor session torque limit. These are schema-valid, bounded
+  # placeholders only and have NOT passed isolated CAN bench or vehicle calibration;
+  # reduce the session torque limit before re-tuning any previously used gains.
   # max_speed_kph: 0 plus the mock adapter is the current traction-enable gate.
   speed_feedback_timeout_ms: 200
   speed_pid_kp: 1.0
