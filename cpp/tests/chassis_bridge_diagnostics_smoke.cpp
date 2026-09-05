@@ -2423,7 +2423,10 @@ int main() {
             },
             200),
         "0x18F2/0x18F6 diagnostic fields were not exposed by the bridge");
+    // Both frames may be drained before one 20 ms control tick. The later
+    // status 5 must not overwrite the status-3 revocation event.
     send_handshake_feedback_frame(physical_transport[1], 3);
+    send_handshake_feedback_frame(physical_transport[1], 5);
     expect(
         wait_for_handshake_state(MINE_TELEOP_VCU_DISARM_TORQUE),
         "fresh status 3 did not revoke accepted status 5 and enter staged safe disarm");
@@ -2431,6 +2434,7 @@ int main() {
     MineTeleopChassisTelemetry revoked_telemetry{};
     expect(
         mine_teleop_chassis_read_handshake_status(&revoked_status) == 0 &&
+            revoked_status.handshake_status == 5 &&
             revoked_status.handshake_revoked == 1 &&
             revoked_status.revoked_handshake_status == 3 &&
             revoked_status.vmc_fault_code_valid == 1 &&

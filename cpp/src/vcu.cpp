@@ -404,6 +404,26 @@ bool ParallelController::ingest(const CanFrame& frame) {
     handshake_generation_ = ++receive_generation_;
     feedback_.handshake_status = static_cast<int>(extract_signal(frame, 8, 8));
     feedback_.handshake_valid = true;
+    const bool accepted_parallel_handshake =
+        state_ == State::WaitParkingBrakeReleased ||
+        state_ == State::WaitGear ||
+        state_ == State::WaitActuatorModes ||
+        state_ == State::Ready;
+    if (accepted_parallel_handshake &&
+        feedback_.handshake_status == kManualHandshakeStatus &&
+        !handshake_revoked_) {
+      // The bridge can drain several CAN frames before the next 20 ms tick.
+      // Latch every return to manual state as it is ingested so a later state
+      // 5 frame in the same receive batch cannot erase the revocation event.
+      handshake_revoked_ = true;
+      revoked_handshake_status_ = feedback_.handshake_status;
+      emergency_stop_ = true;
+      if (state_ == State::Ready) {
+        transport_fault();
+      } else {
+        enter(State::DisarmTorque);
+      }
+    }
     return true;
   }
   if (frame.id == ids::kWvcuVehicleStatus) {
@@ -541,23 +561,6 @@ bool ParallelController::begin_arming_emergency_disarm() {
 void ParallelController::advance_state() {
   if ((emergency_stop_ || feedback_.emergency_switch != 0) &&
       begin_arming_emergency_disarm()) {
-    return;
-  }
-  const bool post_parallel_handshake_arming =
-      state_ == State::WaitParkingBrakeReleased ||
-      state_ == State::WaitGear ||
-      state_ == State::WaitActuatorModes;
-  if (post_parallel_handshake_arming && feedback_.handshake_valid &&
-      handshake_generation_ > state_entry_generation_ &&
-      feedback_.handshake_status == kManualHandshakeStatus) {
-    // State 5 was already accepted before these phases. A fresh return to
-    // manual state 3 revokes that authority. Withdraw ShakeReq immediately and
-    // run the full torque/stop/N/EPB/manual sequence; the next attempt must come
-    // from a new explicit page request after safe shutdown is confirmed.
-    handshake_revoked_ = true;
-    revoked_handshake_status_ = feedback_.handshake_status;
-    emergency_stop_ = true;
-    enter(State::DisarmTorque);
     return;
   }
   if (state_ == State::Ready && feedback_.handshake_valid &&

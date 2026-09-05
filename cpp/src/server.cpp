@@ -1092,7 +1092,10 @@ async function writeControl(extra,announceUnavailable){
     }
   }
   if(activeChannel.bufferedAmount>4096&&!estopRequested){
-    resetControlAuthorityInput();
+    // Backpressure is transient: clear live actuation, but retain the last
+    // confirmed gear and any in-flight transition so recovery cannot invent an
+    // unrelated N request whose rejection has no matching transaction.
+    clearControlInput(false);
     webrtcLabel.textContent='控制链路拥塞，输入已清除';
     return{sent:false,reason:'buffered_amount_limit'};
   }

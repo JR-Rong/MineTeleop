@@ -2879,7 +2879,7 @@ class BridgeRuntime {
               "handshake_revoked",
               "vcu_handshake_revoked",
               "vcu_handshake",
-              "VCU returned from accepted intelligent-driving status 5 to manual status 3 during arming",
+              "VCU returned from accepted intelligent-driving status 5 to manual status 3 during arming or Ready",
               "Keep the vehicle stopped, inspect WVCU_VMCFltCode and EPB feedback, then request a new VCU handshake from the page.",
               "local_full_stop_new_page_handshake_required",
               details.str());

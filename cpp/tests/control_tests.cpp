@@ -1010,12 +1010,20 @@ void test_control_page_contract() {
               "prepareControlProfile(controlProfileState.requestedProfile,false)") ==
               std::string::npos,
       "a completed VCU disconnect can silently reapply a legacy session profile");
+  const auto backpressure_gate = response.body.find(
+      "activeChannel.bufferedAmount>4096&&!estopRequested){");
+  const auto backpressure_return = response.body.find(
+      "return{sent:false,reason:'buffered_amount_limit'}", backpressure_gate);
   expect(
-      response.body.find("activeChannel.bufferedAmount>4096&&!estopRequested){") !=
-              std::string::npos &&
+      backpressure_gate != std::string::npos &&
+          backpressure_return != std::string::npos &&
+          response.body.find("clearControlInput(false)", backpressure_gate) <
+              backpressure_return &&
+          response.body.find("resetControlAuthorityInput()", backpressure_gate) >
+              backpressure_return &&
           response.body.find("webrtcLabel.textContent==='控制链路拥塞，输入已清除'") !=
               std::string::npos,
-      "DataChannel backpressure does not clear stale input or recover its operator label");
+      "DataChannel backpressure does not clear actuation while preserving gear state and recover its operator label");
   expect(response.body.find("时延超过 200 ms") != std::string::npos, "latency threshold alarm is missing");
   expect(response.body.find("低于 20 FPS") != std::string::npos, "FPS threshold alarm is missing");
   expect(response.body.find("sent_at_utc_ms:Date.now()") != std::string::npos, "browser-local logs do not use UTC milliseconds");

@@ -510,7 +510,7 @@ void persist_stream_log(
         log.path(),
         error,
         "Keep the vehicle in a safe state, free disk space or repair the log filesystem, then restart the runtime in a controlled maintenance window.");
-    write_all(STDERR_FILENO, diagnostic.data(), diagnostic.size());
+    write_all(STDERR_FILENO, diagnostic.data(), diagnostic.size(), true);
     log_failure_reported = true;
   };
 

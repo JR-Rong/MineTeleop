@@ -296,7 +296,7 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `parallel_handshake_rejected` / `vcu_handshake_gate_rejected` | N/零速/电子驻车/manual state/新鲜度任一不满足 | 日志记录全部 gate 值 |
 | `parallel_handshake_requested` / `vcu_handshake_requested` | 请求被接受 | 仍停车直至 Ready |
 | `arming_feedback_timeout_recovered` / `vcu_arming_feedback_timeout_recovered` | 上一次握手阶段反馈超时，用户完成断开且车辆回到 `Disarmed` 后，新鲜驻车 gate 通过并接受新页面握手请求 | 清除仅属于该握手超时的 I/O 锁存，继续停车直至新握手 Ready；其他 I/O 故障不借此清除 |
-| `handshake_revoked` / `vcu_handshake_revoked` | 握手状态 5 已被接受，但在驻车释放/挡位/执行器准备阶段收到新的状态 3 | 立即撤销握手请求并安全退出；记录 `revoked_handshake_status`、`vmc_fault_code`、四路 EPB、`parking_brake_switch`、`brake_pedal_switch` 及停车来源，必须在页面重新申请握手 |
+| `handshake_revoked` / `vcu_handshake_revoked` | 握手状态 5 已被接受，但在驻车释放/挡位/执行器准备或 Ready 阶段收到新的状态 3；同批后续状态 5 不清除锁存 | 立即撤销握手请求并安全退出；记录 `revoked_handshake_status`、`vmc_fault_code`、四路 EPB、`parking_brake_switch`、`brake_pedal_switch` 及停车来源，必须在页面重新申请握手 |
 | `vehicle_vcu_handshake_state_changed` / `vcu_handshake_state_changed` | browser 可见握手状态变化 | stdout 只在状态变化时输出 |
 | `control_apply_rejected` / `vcu_control_runtime_unavailable` | runtime/I/O fault 阻止控制 | 本地全停 |
 | `control_apply_rejected` / `vcu_runtime_control_profile_inactive` | 请求牵引时当前会话参数尚未原子应用或已被清除 | 仅撤销牵引并复位 PID，保留安全转向/挡位状态；页面重新确认并下发完整 profile 后重试，不得误判成已实施全制动 |

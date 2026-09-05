@@ -871,6 +871,51 @@ void test_fresh_manual_status_revokes_each_post_handshake_arming_phase() {
   }
 }
 
+void test_manual_handshake_revocation_survives_newer_status_before_tick() {
+  ParallelController controller;
+  advance_to_arming_state(controller, State::WaitActuatorModes);
+
+  expect(
+      controller.ingest(handshake_feedback(3)) &&
+          controller.state() == State::DisarmTorque &&
+          controller.handshake_revoked(),
+      "manual status was not latched immediately at CAN ingest");
+  expect(
+      controller.ingest(handshake_feedback(5)),
+      "same-batch intelligent handshake feedback was rejected");
+  for (std::size_t index = 0; index < kMotorStatus02Ids.size(); ++index) {
+    expect(
+        controller.ingest(motor_mode_feedback(index, 1)) &&
+            controller.ingest(motor_torque_feedback(index, 10.0)),
+        "same-batch motor readiness feedback was rejected");
+  }
+  for (std::size_t index = 0; index < kSteeringStatusIds.size(); ++index) {
+    expect(
+        controller.ingest(steering_feedback(index, 1)),
+        "same-batch steering readiness feedback was rejected");
+  }
+  for (std::size_t index = 0; index < kBrakeStatusIds.size(); ++index) {
+    expect(
+        controller.ingest(brake_feedback(index, 1)),
+        "same-batch brake readiness feedback was rejected");
+  }
+
+  const auto frames = controller.tick();
+  expect(
+      controller.state() == State::DisarmTorque &&
+          controller.feedback().handshake_status == 5 &&
+          controller.handshake_revoked() &&
+          controller.revoked_handshake_status() == 3,
+      "a newer same-batch status 5 erased the latched status-3 revocation");
+  expect(
+      signal(
+          find_frame(frames, mine_teleop::vcu::ids::kAduShake), 0, 8) == 0 &&
+          signal(
+              find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) ==
+              8000,
+      "same-batch 3-to-5 revocation continued handshake or torque output");
+}
+
 void test_arming_requires_fresh_feedback_after_each_request() {
   ParallelController controller;
   prepare_parking_gate(controller);
@@ -1180,6 +1225,8 @@ int main() {
        test_handshake_requires_neutral_and_electronic_parking_brake},
       {"fresh_manual_status_revokes_each_post_handshake_arming_phase",
        test_fresh_manual_status_revokes_each_post_handshake_arming_phase},
+      {"manual_handshake_revocation_survives_newer_status_before_tick",
+       test_manual_handshake_revocation_survives_newer_status_before_tick},
       {"disconnect_during_handshake_clears_request_and_confirms_manual",
        test_disconnect_during_handshake_clears_request_and_confirms_manual},
       {"handshake_loss_forces_zero_torque_and_calibrated_brake",

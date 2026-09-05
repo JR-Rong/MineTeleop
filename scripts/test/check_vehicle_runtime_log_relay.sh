@@ -9,6 +9,17 @@ fi
 launcher="$(cd "$(dirname "$launcher")" && pwd)/$(basename "$launcher")"
 temporary="$(mktemp -d)"
 cleanup() {
+  if [[ -n "${log_failure_launcher_pid:-}" ]]; then
+    kill -KILL "$log_failure_launcher_pid" >/dev/null 2>&1 || true
+    wait "$log_failure_launcher_pid" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${log_failure_child_pid:-}" ]]; then
+    kill -KILL "$log_failure_child_pid" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${stderr_fill_pid:-}" ]]; then
+    kill -KILL "$stderr_fill_pid" >/dev/null 2>&1 || true
+    wait "$stderr_fill_pid" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${flood_launcher_pid:-}" ]]; then
     kill -KILL "$flood_launcher_pid" >/dev/null 2>&1 || true
     wait "$flood_launcher_pid" >/dev/null 2>&1 || true
@@ -40,9 +51,11 @@ fake_runtime="$package_root/bin/mine-teleop"
   printf '%s\n' '  exit 0'
   printf '%s\n' 'fi'
   printf '%s\n' 'printf "runtime-stdout-ready\\n"'
-  printf '%s\n' 'printf "runtime-stderr-ready\\n" >&2'
-  printf '%s\n' '(printf "grandchild-stderr\\n" >&2) &'
-  printf '%s\n' 'wait $!'
+  printf '%s\n' 'if [[ "${MINE_TELEOP_TEST_LOG_FAILURE:-0}" != "1" ]]; then'
+  printf '%s\n' '  printf "runtime-stderr-ready\\n" >&2'
+  printf '%s\n' '  (printf "grandchild-stderr\\n" >&2) &'
+  printf '%s\n' '  wait $!'
+  printf '%s\n' 'fi'
   printf '%s\n' 'if [[ "${MINE_TELEOP_TEST_FLOOD:-0}" == "1" ]]; then'
   printf '%s\n' '  trap '\''printf "runtime-flood-term-observed\\n" > "$MINE_TELEOP_TEST_TERM_MARKER"; exit 143'\'' TERM'
   printf '%s\n' '  printf "%s\\n" "$$" > "$MINE_TELEOP_TEST_CHILD_PID_FILE"'
@@ -71,6 +84,12 @@ fake_runtime="$package_root/bin/mine-teleop"
   printf '%s\n' 'if [[ "${MINE_TELEOP_TEST_TAIL_HOLDER:-0}" == "1" ]]; then'
   printf '%s\n' '  (printf "forced-drain-unterminated-tail"; sleep 30) &'
   printf '%s\n' '  printf "%s\\n" "$!" > "$MINE_TELEOP_TEST_TAIL_HOLDER_PID_FILE"'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'if [[ "${MINE_TELEOP_TEST_LOG_FAILURE:-0}" == "1" ]]; then'
+  printf '%s\n' '  trap '\''printf "runtime-log-failure-term-observed\\n" > "$MINE_TELEOP_TEST_TERM_MARKER"; exit 143'\'' TERM'
+  printf '%s\n' '  printf "%s\\n" "$$" > "$MINE_TELEOP_TEST_CHILD_PID_FILE"'
+  printf '%s\n' '  while [[ ! -e "$MINE_TELEOP_TEST_TRIGGER_FILE" ]]; do sleep 0.01; done'
+  printf '%s\n' '  while :; do printf "runtime-log-failure-abcdefghijklmnopqrstuvwxyz0123456789\\n"; done'
   printf '%s\n' 'fi'
   printf '%s\n' 'if [[ "${MINE_TELEOP_TEST_WAIT:-0}" == "1" ]]; then'
   printf '%s\n' '  trap '\''printf "runtime-term-observed\\n"; exit 143'\'' TERM'
@@ -152,6 +171,71 @@ waiting_pid=""
   exit 1
 }
 grep -F 'runtime-term-observed' "$locked_log" >/dev/null
+
+# Force the first runtime-log rotation to fail while launcher stderr is full.
+# SIGTERM must interrupt the failure diagnostic write so the launcher can relay
+# the signal to the runtime child and preserve the normal 143 exit status.
+log_failure_fifo="$temporary/log-failure-stderr.fifo"
+log_failure_log="$temporary/log-failure/vehicle-runtime.log"
+log_failure_child_file="$temporary/log-failure-child.pid"
+log_failure_term_marker="$temporary/log-failure-term.marker"
+log_failure_trigger="$temporary/log-failure.trigger"
+mkdir -p "$log_failure_log.1"
+mkfifo "$log_failure_fifo"
+exec 8<>"$log_failure_fifo"
+MINE_TELEOP_VEHICLE_RUNTIME_LOG_PATH="$log_failure_log" \
+MINE_TELEOP_VEHICLE_RUNTIME_LOG_MAX_BYTES=4096 \
+MINE_TELEOP_VEHICLE_RUNTIME_LOG_ROTATIONS=1 \
+MINE_TELEOP_TEST_LOG_FAILURE=1 \
+MINE_TELEOP_TEST_CHILD_PID_FILE="$log_failure_child_file" \
+MINE_TELEOP_TEST_TERM_MARKER="$log_failure_term_marker" \
+MINE_TELEOP_TEST_TRIGGER_FILE="$log_failure_trigger" \
+  "$package_root/bin/mine-teleop-run" >/dev/null 2>"$log_failure_fifo" &
+log_failure_launcher_pid=$!
+for _ in $(seq 1 100); do
+  [[ -s "$log_failure_child_file" ]] && break
+  sleep 0.02
+done
+[[ -s "$log_failure_child_file" ]]
+log_failure_child_pid="$(<"$log_failure_child_file")"
+dd if=/dev/zero of="$log_failure_fifo" bs=4096 2>/dev/null &
+stderr_fill_pid=$!
+sleep 0.2
+touch "$log_failure_trigger"
+for _ in $(seq 1 100); do
+  [[ -f "$log_failure_log" ]] &&
+    [[ "$(stat -c '%s' "$log_failure_log")" -eq 4096 ]] && break
+  sleep 0.02
+done
+[[ "$(stat -c '%s' "$log_failure_log")" -eq 4096 ]]
+kill -TERM "$log_failure_launcher_pid"
+for _ in $(seq 1 100); do
+  if ! kill -0 "$log_failure_launcher_pid" >/dev/null 2>&1; then break; fi
+  sleep 0.02
+done
+if kill -0 "$log_failure_launcher_pid" >/dev/null 2>&1; then
+  printf 'launcher did not forward SIGTERM after a log failure blocked stderr\n' >&2
+  exit 1
+fi
+set +e
+wait "$log_failure_launcher_pid"
+log_failure_status=$?
+set -e
+log_failure_launcher_pid=""
+kill -KILL "$stderr_fill_pid" >/dev/null 2>&1 || true
+wait "$stderr_fill_pid" >/dev/null 2>&1 || true
+stderr_fill_pid=""
+exec 8>&-
+[[ "$log_failure_status" -eq 143 ]] || {
+  printf 'log-failure SIGTERM exit status was not preserved: %s\n' "$log_failure_status" >&2
+  exit 1
+}
+grep -F 'runtime-log-failure-term-observed' "$log_failure_term_marker" >/dev/null
+if kill -0 "$log_failure_child_pid" >/dev/null 2>&1; then
+  printf 'runtime child survived log-failure SIGTERM relay\n' >&2
+  exit 1
+fi
+log_failure_child_pid=""
 
 blocked_fifo="$temporary/blocked-terminal.fifo"
 flood_child_file="$temporary/flood-child.pid"
