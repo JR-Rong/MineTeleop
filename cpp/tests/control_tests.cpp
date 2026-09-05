@@ -31,6 +31,17 @@ void expect(bool condition, std::string_view message) {
   if (!condition) throw std::runtime_error(std::string(message));
 }
 
+void authorize_local_post(
+    const mine_teleop::DriverConsoleHttpApp& app,
+    mine_teleop::HttpRequest& request,
+    std::string_view authority = "127.0.0.1:8080") {
+  request.headers["host"] = std::string(authority);
+  request.headers["origin"] = "http://" + std::string(authority);
+  request.headers["content-type"] = "application/json";
+  request.headers["sec-fetch-site"] = "same-origin";
+  request.headers["x-mine-teleop-page-capability"] = app.page_capability();
+}
+
 void allow_qemu_test_scheduler_time_sync(mine_teleop::DriverConfig& config) {
   constexpr int kTestOnlyMaxUncertaintyMs = 2000;
   expect(
@@ -444,11 +455,50 @@ void test_control_page_contract() {
   expect(response.body.find("登录已失效，请重新认证") != std::string::npos, "driver re-authentication UX is missing");
   expect(response.body.find("post('/api/login'") != std::string::npos, "driver credential is not handled by the local runtime");
   expect(
+      response.body.find("'x-mine-teleop-page-capability':pageCapability") != std::string::npos &&
+          response.body.find(app.page_capability()) != std::string::npos,
+      "local control page does not bind mutations to its random page capability");
+  expect(
       response.body.find("passwordInput.value='';const result=await post('/api/login'") != std::string::npos,
       "driver credential is not cleared before the login request can fail");
   expect(
       response.body.find("controlAuthorityLost=false;webrtcLabel.textContent='未连接'") != std::string::npos,
       "successful reauthentication leaves a stale lost-authority label visible");
+
+  mine_teleop::HttpRequest mutation;
+  mutation.method = "POST";
+  mutation.path = "/api/browser-event";
+  mutation.body = R"({"event":"local_origin_contract","details":{}})";
+  authorize_local_post(app, mutation);
+  expect(app.handle(mutation).status == 200, "valid same-origin local mutation was rejected");
+  authorize_local_post(app, mutation, "127.0.0.1");
+  expect(app.handle(mutation).status == 200, "default-port IPv4 local mutation was rejected");
+  authorize_local_post(app, mutation, "localhost");
+  expect(app.handle(mutation).status == 200, "default-port localhost mutation was rejected");
+  authorize_local_post(app, mutation, "[::1]");
+  expect(app.handle(mutation).status == 200, "default-port IPv6 local mutation was rejected");
+  authorize_local_post(app, mutation, "127.0.0.1:80");
+  mutation.headers["origin"] = "http://127.0.0.1";
+  expect(app.handle(mutation).status == 200, "equivalent explicit/default port origins did not match");
+  authorize_local_post(app, mutation, "localhost");
+  mutation.headers["origin"] = "http://127.0.0.1";
+  expect(app.handle(mutation).status == 403, "different loopback host origins were treated as same-origin");
+  mutation.headers["origin"] = "http://untrusted.example";
+  mutation.headers["sec-fetch-site"] = "cross-site";
+  expect(app.handle(mutation).status == 403, "foreign-origin local mutation was accepted");
+  mutation.headers.erase("origin");
+  mutation.headers["sec-fetch-site"] = "none";
+  expect(app.handle(mutation).status == 403, "null or missing Origin local mutation was accepted");
+  authorize_local_post(app, mutation);
+  mutation.headers["host"] = "untrusted.example:8080";
+  mutation.headers["origin"] = "http://untrusted.example:8080";
+  expect(app.handle(mutation).status == 403, "non-loopback Host local mutation was accepted");
+  authorize_local_post(app, mutation);
+  mutation.headers["content-type"] = "text/plain";
+  expect(app.handle(mutation).status == 415, "text/plain local mutation was accepted");
+  authorize_local_post(app, mutation);
+  mutation.headers["x-mine-teleop-page-capability"] = "wrong-capability";
+  expect(app.handle(mutation).status == 403, "invalid local page capability was accepted");
   expect(response.body.find("navigator.getGamepads") != std::string::npos, "Gamepad discovery is missing");
   expect(
       response.body.find("id=\"gamepad-panel\"") == std::string::npos &&
@@ -1866,6 +1916,7 @@ void test_browser_event_logging_rotation_and_redaction() {
   mine_teleop::HttpRequest request;
   request.method = "POST";
   request.path = "/api/browser-event";
+  authorize_local_post(app, request);
   for (int index = 0; index < 3; ++index) {
     request.body = mine_teleop::Json({
         {"event", "control_monitor_state"},
@@ -1981,6 +2032,7 @@ void test_driver_vehicle_switch_releases_old_session() {
   mine_teleop::HttpRequest profile_request;
   profile_request.method = "POST";
   profile_request.path = "/api/control-profile";
+  authorize_local_post(control_app, profile_request);
   const mine_teleop::Json valid_profile = {
       {"profile_version", 3},
       {"target_speed_kph", 3.0},
@@ -2106,6 +2158,7 @@ void test_driver_vehicle_switch_releases_old_session() {
     mine_teleop::HttpRequest request;
     request.method = "POST";
     request.path = path;
+    authorize_local_post(control_app, request);
     request.body = mine_teleop::Json({
         {"gear", "D"},
         {"up", true},
@@ -2149,6 +2202,7 @@ void test_driver_vehicle_switch_releases_old_session() {
   mine_teleop::HttpRequest mutate_legacy_limits_request;
   mutate_legacy_limits_request.method = "POST";
   mutate_legacy_limits_request.path = "/api/control-limits";
+  authorize_local_post(control_app, mutate_legacy_limits_request);
   mutate_legacy_limits_request.body = mine_teleop::Json({
       {"service_brake", 0.20},
       {"hard_brake", 1.0},
@@ -3167,6 +3221,88 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
   server.stop();
 }
 
+void test_websocket_participant_rate_limit_survives_reconnect_and_parallel_sockets() {
+  mine_teleop::SignalingServerConfig config;
+  config.driver_passwords = {{"driver-console-001", "dev-password"}};
+  config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
+  config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
+  config.websocket_rate_limit_messages = 2;
+  config.websocket_rate_limit_bytes = 1024 * 1024;
+  config.websocket_rate_limit_window_ms = 5000;
+  auto signaling = std::make_shared<mine_teleop::SignalingService>(std::move(config));
+  mine_teleop::SimpleHttpServer server(
+      "127.0.0.1",
+      0,
+      [signaling](const auto& request) { return signaling->handle(request); },
+      8 * 1024 * 1024,
+      [signaling](int socket, const auto& request) { return signaling->handle_websocket(socket, request); });
+  server.start();
+  const auto base = "http://127.0.0.1:" + std::to_string(server.port());
+  mine_teleop::HttpClient http;
+  static_cast<void>(http.post_json_response(
+      base + "/vehicles/online",
+      {{"vehicle_id", "vehicle-001"},
+       {"device_token", "vehicle-secret-1"},
+       {"connection_id", "wss-rate-vehicle"}}));
+  const auto login = http.post_json_response(
+      base + "/auth/driver_login",
+      {{"driver_id", "driver-console-001"}, {"password", "dev-password"}});
+  const auto token = login.at("token").get<std::string>();
+  const auto session = http.post_json_response(
+      base + "/sessions",
+      {{"driver_id", "driver-console-001"}, {"vehicle_id", "vehicle-001"}, {"token", token}});
+  const auto websocket_url = mine_teleop::signaling_websocket_url(
+      base,
+      session.at("session_id").get<std::string>(),
+      "driver-console-001");
+  const mine_teleop::HttpHeaders websocket_headers{{"X-Mine-Teleop-Driver-Token", token}};
+  const mine_teleop::Json quota_message = {
+      {"event", "signaling_delivery_ack"}, {"delivery_cursor", std::uint64_t{0}}};
+
+  mine_teleop::WebSocketClient first;
+  first.connect(websocket_url, websocket_headers);
+  first.send_json(quota_message);
+  const auto first_result = first.receive_json(std::chrono::seconds(1));
+  expect(
+      first_result.status == mine_teleop::WebSocketReceiveStatus::Message &&
+          first_result.message.value("event", "") == "signaling_delivery_acknowledged",
+      "first websocket quota message was not accepted");
+  first.close();
+
+  mine_teleop::WebSocketClient second;
+  mine_teleop::WebSocketClient third;
+  second.connect(websocket_url, websocket_headers);
+  third.connect(websocket_url, websocket_headers);
+  std::atomic<bool> send_parallel{false};
+  std::array<std::string, 2> events;
+  std::array<std::thread, 2> senders{
+      std::thread([&] {
+        while (!send_parallel.load()) std::this_thread::yield();
+        second.send_json(quota_message);
+        const auto result = second.receive_json(std::chrono::seconds(1));
+        if (result.status == mine_teleop::WebSocketReceiveStatus::Message) {
+          events[0] = result.message.value("event", "");
+        }
+      }),
+      std::thread([&] {
+        while (!send_parallel.load()) std::this_thread::yield();
+        third.send_json(quota_message);
+        const auto result = third.receive_json(std::chrono::seconds(1));
+        if (result.status == mine_teleop::WebSocketReceiveStatus::Message) {
+          events[1] = result.message.value("event", "");
+        }
+      })};
+  send_parallel.store(true);
+  for (auto& sender : senders) sender.join();
+  expect(
+      std::count(events.begin(), events.end(), "signaling_delivery_acknowledged") == 1 &&
+          std::count(events.begin(), events.end(), "signaling_rate_limited") == 1,
+      "reconnect or parallel websocket sockets received independent participant quotas");
+  if (events[0] == "signaling_delivery_acknowledged") second.close();
+  if (events[1] == "signaling_delivery_acknowledged") third.close();
+  server.stop();
+}
+
 void test_mac_runtime_retries_uncertain_websocket_send_without_duplication() {
   mine_teleop::SignalingServerConfig signaling_config;
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
@@ -3231,6 +3367,124 @@ void test_mac_runtime_retries_uncertain_websocket_send_without_duplication() {
       "&connection_generation=" + std::to_string(vehicle_generation));
   expect(vehicle_messages.at("messages").size() == 1, "uncertain websocket retry duplicated the message");
   static_cast<void>(driver.disconnect("uncertain_send_test_complete"));
+  server.stop();
+}
+
+void test_websocket_client_retains_split_server_frame() {
+  auto frame_header_sent = std::make_shared<std::atomic<bool>>(false);
+  auto release_payload = std::make_shared<std::atomic<bool>>(false);
+  mine_teleop::SimpleHttpServer server(
+      "127.0.0.1",
+      0,
+      [](const auto&) {
+        return mine_teleop::ServerResponse::json(404, {{"error", "not found"}});
+      },
+      8 * 1024 * 1024,
+      [frame_header_sent, release_payload](int socket, const auto& request) {
+        const auto key = request.headers.find("sec-websocket-key");
+        if (request.path != "/split-frame" || key == request.headers.end()) return false;
+        raw_send_all(
+            socket,
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: " +
+                mine_teleop::websocket_accept_key(key->second) + "\r\n\r\n");
+        const auto payload = mine_teleop::Json{{"event", "split-frame-complete"}}.dump();
+        std::string header;
+        header.push_back(static_cast<char>(0x81U));
+        header.push_back(static_cast<char>(payload.size()));
+        raw_send_all(socket, header);
+        frame_header_sent->store(true);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!release_payload->load() && std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (release_payload->load()) raw_send_all(socket, payload);
+        return true;
+      });
+  server.start();
+
+  mine_teleop::WebSocketClient client;
+  client.connect("ws://127.0.0.1:" + std::to_string(server.port()) + "/split-frame");
+  const auto header_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!frame_header_sent->load() && std::chrono::steady_clock::now() < header_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  expect(frame_header_sent->load(), "split-frame fixture did not send the frame header");
+  const auto partial = client.receive_json(std::chrono::milliseconds(20));
+  expect(
+      partial.status == mine_teleop::WebSocketReceiveStatus::Timeout,
+      "partial server websocket frame was treated as a corrupt message");
+  release_payload->store(true);
+  const auto completed = client.receive_json(std::chrono::seconds(1));
+  expect(
+      completed.status == mine_teleop::WebSocketReceiveStatus::Message &&
+          completed.message.value("event", "") == "split-frame-complete",
+      "split server websocket frame was not retained across receive calls");
+  client.close();
+  server.stop();
+}
+
+void test_signaling_queue_prunes_expired_messages_and_backpressures() {
+  mine_teleop::SignalingServerConfig config;
+  config.signaling_message_ttl_ms = 200;
+  config.max_signaling_queue_messages = 2;
+  config.max_signaling_queue_bytes = 1024 * 1024;
+  auto signaling = std::make_shared<mine_teleop::SignalingService>(config);
+  mine_teleop::SimpleHttpServer server(
+      "127.0.0.1",
+      0,
+      [signaling](const auto& request) { return signaling->handle(request); });
+  server.start();
+  const auto base = "http://127.0.0.1:" + std::to_string(server.port());
+  mine_teleop::HttpClient http;
+  const auto online = http.post_json_response(
+      base + "/vehicles/online",
+      {{"vehicle_id", "vehicle-001"},
+       {"device_token", "dev-device-secret"},
+       {"connection_id", "queue-capacity-vehicle"}});
+  const auto generation = online.at("connection_generation").get<std::uint64_t>();
+  const auto login = http.post_json_response(
+      base + "/auth/driver_login",
+      {{"driver_id", "driver-console-001"}, {"password", "dev-password"}});
+  const auto token = login.at("token").get<std::string>();
+  const auto session = http.post_json_response(
+      base + "/sessions",
+      {{"driver_id", "driver-console-001"}, {"vehicle_id", "vehicle-001"}, {"token", token}});
+  const auto session_id = session.at("session_id").get<std::string>();
+  const auto message = [&](std::uint64_t sequence) {
+    auto value = signaling_request(
+        session_id,
+        sequence,
+        "vehicle-001",
+        "driver-console-001",
+        "device_token",
+        "dev-device-secret",
+        "ice_candidate",
+        {{"candidate", "candidate:queue-" + std::to_string(sequence)}});
+    value["connection_generation"] = generation;
+    return value;
+  };
+  const auto endpoint = base + "/signaling/" + session_id + "/messages";
+  expect(
+      http.post_json_response(endpoint, message(1)).value("queued", std::size_t{0}) == 1,
+      "first signaling queue item was not accepted");
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  expect(
+      http.post_json_response(endpoint, message(2)).value("queued", std::size_t{0}) == 1,
+      "expired signaling queue item was not pruned at enqueue");
+  expect(
+      http.post_json_response(endpoint, message(3)).value("queued", std::size_t{0}) == 2,
+      "signaling queue did not reach its configured capacity");
+  const auto rejected = http.post_json(endpoint, message(4));
+  expect(rejected.status == 429, "full signaling queue did not return explicit backpressure");
+  expect(
+      mine_teleop::Json::parse(rejected.body).value("error", "").find("capacity") != std::string::npos,
+      "signaling queue backpressure response did not explain the capacity limit");
+  const auto health = signaling->health();
+  expect(
+      health.value("queued_signaling_messages", std::size_t{0}) == 2 &&
+          health.value("signaling_queue_rejections", std::uint64_t{0}) == 1,
+      "signaling queue health counters do not reflect capacity backpressure");
   server.stop();
 }
 
@@ -4271,9 +4525,15 @@ void test_driver_login_failure_rate_limit_and_recovery() {
     }).dump();
     return unavailable_audit_service.handle(request);
   };
-  expect_throws(
-      [&] { static_cast<void>(unavailable_audit_login("wrong")); },
-      "unavailable audit sink did not fail closed");
+  expect(
+      unavailable_audit_login("wrong").status == 429,
+      "unavailable audit sink bypassed the configured first-failure lockout");
+  const auto unavailable_health = unavailable_audit_service.health();
+  expect(
+      unavailable_health.value("status", "") == "degraded" &&
+          !unavailable_health.value("audit_healthy", true) &&
+          unavailable_health.value("audit_write_failures", std::uint64_t{0}) > 0,
+      "unavailable audit sink was not reported as degraded");
   expect(
       unavailable_audit_login("correct-password").status == 429,
       "audit sink failure bypassed the established login lockout");
@@ -4288,6 +4548,80 @@ void test_driver_login_failure_rate_limit_and_recovery() {
   expect(audit_log.find("wrong-1") == std::string::npos, "audit log leaked a rejected password");
   expect(audit_log.find("random-account-a") == std::string::npos, "audit log retained attacker-controlled unknown IDs");
   std::filesystem::remove(audit_path);
+}
+
+void test_signaling_audit_failure_does_not_abort_reaper() {
+  const auto root = std::filesystem::temp_directory_path() /
+      ("mine-teleop-audit-reaper-test-" + mine_teleop::random_token(6));
+  std::filesystem::create_directories(root);
+  const auto audit_path = root / "audit.jsonl";
+  mine_teleop::SignalingServerConfig config;
+  config.audit_log_path = audit_path.string();
+  config.token_ttl_ms = 60;
+  config.connection_reaper_interval_ms = 5;
+  config.vehicle_heartbeat_timeout_ms = 2000;
+  config.driver_heartbeat_timeout_ms = 2000;
+  mine_teleop::SignalingService service(config);
+
+  const auto post = [&](std::string path, const mine_teleop::Json& body) {
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.target = path;
+    request.path = std::move(path);
+    request.body = body.dump();
+    return service.handle(request);
+  };
+  expect(
+      post(
+          "/auth/driver_login",
+          {{"driver_id", "driver-console-001"}, {"password", "dev-password"}})
+              .status == 200,
+      "audit-reaper fixture could not log in the driver");
+
+  std::filesystem::remove(audit_path);
+  std::filesystem::create_directory(audit_path);
+  mine_teleop::Json expired_health;
+  const auto reaper_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  do {
+    expired_health = service.health();
+    if (expired_health.value("online_drivers", std::size_t{1}) == 0 &&
+        !expired_health.value("audit_healthy", true)) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  } while (std::chrono::steady_clock::now() < reaper_deadline);
+  expect(
+      expired_health.value("online_drivers", std::size_t{1}) == 0,
+      "audit failure interrupted expired-driver revocation in the reaper");
+  expect(
+      expired_health.value("status", "") == "degraded" &&
+          !expired_health.value("audit_healthy", true) &&
+          expired_health.value("connection_reaper_healthy", false),
+      "audit failure did not leave the service alive with explicit degraded health");
+
+  expect(
+      post(
+          "/vehicles/online",
+          {{"vehicle_id", "vehicle-001"},
+           {"device_token", "dev-device-secret"},
+           {"connection_id", "audit-failure-vehicle"}})
+              .status == 200,
+      "audit failure prevented non-authority vehicle recovery");
+  const auto login = post(
+      "/auth/driver_login",
+      {{"driver_id", "driver-console-001"}, {"password", "dev-password"}});
+  expect(login.status == 200, "audit failure prevented driver authentication recovery");
+  const auto token = mine_teleop::Json::parse(login.body).at("token").get<std::string>();
+  const auto session = post(
+      "/sessions",
+      {{"driver_id", "driver-console-001"}, {"vehicle_id", "vehicle-001"}, {"token", token}});
+  expect(
+      session.status == 503 && session.body.find("audit_log_unavailable") != std::string::npos,
+      "new control authority was granted while the audit sink was unavailable");
+  expect(
+      service.health().value("active_sessions", std::size_t{1}) == 0,
+      "failed audit admission left an active control session");
+  std::filesystem::remove_all(root);
 }
 
 void test_request_correlation_ids() {
@@ -4604,14 +4938,20 @@ int main() {
       {"websocket_handshake_and_participant_isolation", test_websocket_handshake_and_participant_isolation},
       {"websocket_delivery_replay_and_idempotent_acknowledgement",
        test_websocket_delivery_replay_and_idempotent_acknowledgement},
+      {"websocket_participant_rate_limit_survives_reconnect_and_parallel_sockets",
+       test_websocket_participant_rate_limit_survives_reconnect_and_parallel_sockets},
       {"mac_runtime_retries_uncertain_websocket_send_without_duplication",
        test_mac_runtime_retries_uncertain_websocket_send_without_duplication},
+      {"websocket_client_retains_split_server_frame", test_websocket_client_retains_split_server_frame},
+      {"signaling_queue_prunes_expired_messages_and_backpressures",
+       test_signaling_queue_prunes_expired_messages_and_backpressures},
       {"expired_websocket_authority_clears_local_control", test_expired_websocket_authority_clears_local_control},
       {"websocket_reconnect_preserves_active_authority", test_websocket_reconnect_preserves_active_authority},
       {"signaling_process_restart_requires_fresh_authority",
        test_signaling_process_restart_requires_fresh_authority},
       {"signaling_audit_rotation_and_service_start", test_signaling_audit_rotation_and_service_start},
       {"signaling_audit_redacts_authenticated_reports", test_signaling_audit_redacts_authenticated_reports},
+      {"signaling_audit_failure_does_not_abort_reaper", test_signaling_audit_failure_does_not_abort_reaper},
       {"driver_webrtc_connection_audit_transitions", test_driver_webrtc_connection_audit_transitions},
       {"driver_login_failure_rate_limit_and_recovery", test_driver_login_failure_rate_limit_and_recovery},
       {"request_correlation_ids", test_request_correlation_ids},

@@ -29,9 +29,11 @@ Usage:
   sudo ./deploy-cloud.sh [options]
 
 Install or upgrade the Mine Teleop cloud bundle on Ubuntu 22.04 x86_64. The
-script installs the signaling service under /opt/mine-teleop, installs and
-groups signaling/coturn/Caddy/HAProxy with mine-teleop-cloud.target, validates
-configuration, starts the target, and checks http://127.0.0.1:8765/health.
+script stages and validates the complete candidate before cutover, installs the
+signaling service under /opt/mine-teleop, groups signaling/coturn/Caddy/HAProxy
+with mine-teleop-cloud.target, starts the target, and checks
+http://127.0.0.1:8765/health. A failed cutover restores the prior files,
+application bundle, enablement state, and running services.
 
 Configuration options:
   --signaling-config PATH      Identity YAML installed as signaling-server.yaml.
@@ -46,7 +48,7 @@ Configuration options:
 
 Behavior options:
   --skip-package-install       Do not apt-install caddy, coturn, curl, haproxy.
-  --no-start                   Install files and units without starting services.
+  --no-start                   Validate and install without stopping or starting services.
   --dry-run                    Validate inputs and print the deployment plan.
   --self-test                  Validate only the extracted package itself.
   -h, --help                   Show this help.
@@ -302,14 +304,38 @@ for required_command in caddy curl haproxy turnserver; do
   }
 done
 
-printf '==> stopping the existing cloud target\n'
-systemctl stop mine-teleop-cloud.target 2>/dev/null || true
-systemctl disable --now coturn.service 2>/dev/null || true
-
 deployment_timestamp="$(date -u +%Y%m%d-%H%M%S)"
-backup_root="/var/backups/mine-teleop/$deployment_timestamp"
+backup_root="/var/backups/mine-teleop/${deployment_timestamp}-$$"
 previous_prefix=""
-mkdir -p "$backup_root"
+candidate_root="$(mktemp -d /var/tmp/mine-teleop-cloud-candidate.XXXXXX)"
+candidate_prefix="$package_root"
+candidate_prefix_cleanup=""
+mutation_started="false"
+deployment_committed="false"
+prefix_replacement_started="false"
+prefix_had_existing="false"
+changed_paths=()
+managed_units=(
+  mine-teleop-signaling-server.service
+  mine-teleop-turn-server.service
+  caddy.service
+  haproxy.service
+)
+previously_active_units=()
+cloud_target_was_active="false"
+cloud_target_was_enabled="false"
+distribution_coturn_was_active="false"
+distribution_coturn_was_enabled="false"
+service_state_mutated="false"
+
+record_changed_path() {
+  local path="$1"
+  local recorded
+  for recorded in "${changed_paths[@]:-}"; do
+    [[ "$recorded" != "$path" ]] || return
+  done
+  changed_paths+=("$path")
+}
 
 backup_existing() {
   local path="$1"
@@ -330,8 +356,106 @@ install_config_file() {
     return
   fi
   backup_existing "$destination"
-  install -D -m "$mode" "$source" "$destination"
+  record_changed_path "$destination"
+  local staged_destination="${destination}.candidate.$$"
+  rm -f -- "$staged_destination"
+  install -D -m "$mode" "$source" "$staged_destination" || {
+    rm -f -- "$staged_destination"
+    return 1
+  }
+  mv -f "$staged_destination" "$destination" || {
+    rm -f -- "$staged_destination"
+    return 1
+  }
 }
+
+unit_was_active() {
+  local expected="$1"
+  local unit
+  for unit in "${previously_active_units[@]:-}"; do
+    [[ "$unit" != "$expected" ]] || return 0
+  done
+  return 1
+}
+
+rollback_deployment() {
+  local index
+  local path
+  local saved
+
+  set +e
+  printf '==> deployment failed; restoring the previous cloud installation\n' >&2
+  if [[ "$service_state_mutated" == "true" ]]; then
+    systemctl stop mine-teleop-cloud.target >/dev/null 2>&1 || true
+  fi
+
+  for ((index = ${#changed_paths[@]} - 1; index >= 0; --index)); do
+    path="${changed_paths[$index]}"
+    saved="$backup_root$path"
+    rm -rf -- "$path"
+    if [[ -e "$saved" || -L "$saved" ]]; then
+      mkdir -p "$(dirname -- "$path")"
+      cp -a "$saved" "$path"
+    fi
+  done
+
+  if [[ "$prefix_replacement_started" == "true" ]]; then
+    if [[ -n "$previous_prefix" && ( -e "$previous_prefix" || -L "$previous_prefix" ) ]]; then
+      rm -rf -- "$prefix"
+      mv "$previous_prefix" "$prefix"
+    elif [[ "$prefix_had_existing" != "true" && ! -e "$candidate_prefix" && ! -L "$candidate_prefix" ]]; then
+      # The candidate move completed before a signal was delivered, but there
+      # was no prior installation to restore.
+      rm -rf -- "$prefix"
+    fi
+  fi
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ "$service_state_mutated" == "true" ]]; then
+    if [[ "$cloud_target_was_enabled" == "true" ]]; then
+      systemctl enable mine-teleop-cloud.target >/dev/null 2>&1 || true
+    else
+      systemctl disable mine-teleop-cloud.target >/dev/null 2>&1 || true
+    fi
+    if [[ "$distribution_coturn_was_enabled" == "true" ]]; then
+      systemctl enable coturn.service >/dev/null 2>&1 || true
+    else
+      systemctl disable coturn.service >/dev/null 2>&1 || true
+    fi
+
+    if [[ "$cloud_target_was_active" == "true" ]]; then
+      systemctl start mine-teleop-cloud.target >/dev/null 2>&1 || true
+    else
+      for path in "${managed_units[@]}"; do
+        if unit_was_active "$path"; then
+          systemctl start "$path" >/dev/null 2>&1 || true
+        else
+          systemctl stop "$path" >/dev/null 2>&1 || true
+        fi
+      done
+    fi
+    if [[ "$distribution_coturn_was_active" == "true" ]]; then
+      systemctl start coturn.service >/dev/null 2>&1 || true
+    else
+      systemctl stop coturn.service >/dev/null 2>&1 || true
+    fi
+  fi
+  printf 'rollback_backup=%s\n' "$backup_root" >&2
+}
+
+finish_deployment() {
+  local status=$?
+  trap - EXIT
+  if [[ "$status" -ne 0 && "$mutation_started" == "true" && "$deployment_committed" != "true" ]]; then
+    rollback_deployment
+  fi
+  if [[ -n "$candidate_prefix_cleanup" ]]; then
+    rm -rf -- "$candidate_prefix_cleanup"
+  fi
+  rm -rf -- "$candidate_root"
+  exit "$status"
+}
+trap finish_deployment EXIT
 
 package_real="$(CDPATH= cd -- "$package_root" && pwd -P)"
 prefix_real=""
@@ -339,56 +463,208 @@ if [[ -d "$prefix" ]]; then
   prefix_real="$(CDPATH= cd -- "$prefix" && pwd -P)"
 fi
 if [[ "$package_real" != "$prefix_real" ]]; then
-  printf '==> installing application bundle under %s\n' "$prefix"
-  staging_prefix="${prefix}.new.$$"
-  [[ ! -e "$staging_prefix" ]] || die "staging path already exists: $staging_prefix"
-  mkdir -p "$staging_prefix"
-  cp -a "$package_root/." "$staging_prefix/"
+  candidate_prefix="${prefix}.candidate.$$"
+  candidate_prefix_cleanup="$candidate_prefix"
+  [[ ! -e "$candidate_prefix" && ! -L "$candidate_prefix" ]] || {
+    die "candidate application path already exists: $candidate_prefix"
+  }
+  mkdir -p "$candidate_prefix"
+  cp -a "$package_root/." "$candidate_prefix/"
+fi
+
+candidate_config_dir="$candidate_root/etc/mine-teleop"
+candidate_signaling_config="$candidate_config_dir/signaling-server.yaml"
+candidate_environment_file="$candidate_config_dir/mine-teleop.env"
+candidate_turn_secret="$candidate_config_dir/secrets/turn-static-auth.secret"
+candidate_turn_config="$candidate_config_dir/turnserver.conf"
+candidate_state_file="$candidate_config_dir/cloud-bundle.env"
+candidate_override="$candidate_root$override_path"
+candidate_caddy_dir="$candidate_root/etc/caddy"
+candidate_haproxy_dir="$candidate_root/etc/haproxy"
+candidate_caddy_config="$candidate_caddy_dir/Caddyfile"
+candidate_haproxy_config="$candidate_haproxy_dir/haproxy.cfg"
+
+mkdir -p \
+  "$candidate_config_dir/secrets" \
+  "$candidate_config_dir/tls" \
+  "$candidate_caddy_dir" \
+  "$candidate_haproxy_dir" \
+  "$(dirname -- "$candidate_override")"
+if [[ -d "$config_dir" ]]; then
+  cp -a "$config_dir/." "$candidate_config_dir/"
+fi
+if [[ -d /etc/caddy ]]; then
+  cp -a /etc/caddy/. "$candidate_caddy_dir/"
+fi
+if [[ -d /etc/haproxy ]]; then
+  cp -a /etc/haproxy/. "$candidate_haproxy_dir/"
+fi
+
+if [[ -n "$environment_file" ]]; then
+  install -m 0600 "$environment_file" "$candidate_environment_file"
+elif [[ ! -f "$candidate_environment_file" ]]; then
+  install -m 0600 /dev/null "$candidate_environment_file"
+fi
+if [[ -n "$signaling_config" ]]; then
+  install -m 0640 "$signaling_config" "$candidate_signaling_config"
+fi
+if [[ -n "$identity_secrets_dir" ]]; then
+  while IFS= read -r -d '' secret_path; do
+    install -m 0600 \
+      "$secret_path" \
+      "$candidate_config_dir/secrets/$(basename -- "$secret_path")"
+  done < <(find "$identity_secrets_dir" -maxdepth 1 -type f -print0)
+fi
+if [[ -n "$turn_secret_file" ]]; then
+  install -m 0600 "$turn_secret_file" "$candidate_turn_secret"
+fi
+if [[ -n "$caddy_config" ]]; then
+  install -m 0644 "$caddy_config" "$candidate_caddy_config"
+fi
+if [[ -n "$haproxy_config" ]]; then
+  install -m 0644 "$haproxy_config" "$candidate_haproxy_config"
+fi
+
+if [[ -n "$turn_realm" ]]; then
+  [[ -f "$candidate_turn_secret" ]] || die "TURN secret is missing from the candidate configuration"
+  "$candidate_prefix/scripts/render_turnserver_config.sh" \
+    --template "$candidate_prefix/deployments/turnserver/turnserver.conf.template" \
+    --realm "$turn_realm" \
+    --secret-file "$candidate_turn_secret" \
+    --output "$candidate_turn_config"
+fi
+
+if [[ -n "$turn_realm" && -n "$turn_host" ]]; then
+  cat >"$candidate_override" <<EOF
+[Service]
+ExecStart=
+ExecStart=/opt/mine-teleop/lib/ld-linux-x86-64.so.2 --library-path /opt/mine-teleop/lib /opt/mine-teleop/bin/mine-teleop-signaling-server --config /etc/mine-teleop/signaling-server.yaml --host 127.0.0.1 --port 8765 --driver-token-ttl-ms 3600000 --control-token-ttl-ms 300000 --vehicle-heartbeat-ms 15000 --driver-heartbeat-ms 15000 --trusted-proxy-addresses 127.0.0.1,::1 --stun-urls stun:${turn_host}:3478 --turn-urls turn:${turn_host}:3478?transport=udp,turn:${turn_host}:3478?transport=tcp,turn:${turn_host}:6000?transport=tcp,turn:${turn_host}:443?transport=tcp --turn-realm ${turn_realm} --turn-static-auth-secret-file /etc/mine-teleop/secrets/turn-static-auth.secret --turn-credential-ttl-seconds 600 --api-rate-limit-requests 6000 --audit-log /var/log/mine-teleop/signaling-audit.jsonl --audit-log-retention-days 7
+EOF
+  printf '%s\n' \
+    "MINE_TELEOP_TURN_REALM=$turn_realm" \
+    "MINE_TELEOP_TURN_HOST=$turn_host" \
+    >"$candidate_state_file"
+fi
+
+printf '==> validating the complete candidate configuration before cutover\n'
+if [[ -f "$candidate_signaling_config" ]]; then
+  signaling_validation=(
+    "$candidate_prefix/lib/ld-linux-x86-64.so.2"
+    --library-path "$candidate_prefix/lib"
+    "$candidate_prefix/bin/mine-teleop-signaling-server"
+    --config "$candidate_signaling_config"
+  )
+  if [[ -n "$turn_realm" ]]; then
+    signaling_validation+=(
+      --turn-realm "$turn_realm"
+      --turn-static-auth-secret-file "$candidate_turn_secret"
+    )
+  fi
+  signaling_validation+=(--validate-config)
+  if grep -Eq '^[[:space:]]*(password_env|device_token_env):' "$candidate_signaling_config"; then
+    command -v systemd-run >/dev/null 2>&1 || {
+      die "systemd-run is required to validate identity variables from the candidate environment file"
+    }
+    systemd-run \
+      --quiet \
+      --wait \
+      --pipe \
+      --collect \
+      --service-type=exec \
+      --unit="mine-teleop-config-validate-$$" \
+      --property="EnvironmentFile=$candidate_environment_file" \
+      "${signaling_validation[@]}"
+  else
+    "${signaling_validation[@]}"
+  fi
+elif [[ "$start_services" == "true" ]]; then
+  die "signaling configuration is missing from the candidate installation"
+fi
+if [[ -f "$candidate_caddy_config" ]]; then
+  caddy validate --config "$candidate_caddy_config"
+elif [[ "$start_services" == "true" ]]; then
+  die "Caddy configuration is missing from the candidate installation"
+fi
+if [[ -f "$candidate_haproxy_config" ]]; then
+  haproxy -c -f "$candidate_haproxy_config"
+elif [[ "$start_services" == "true" ]]; then
+  die "HAProxy configuration is missing from the candidate installation"
+fi
+if [[ "$start_services" == "true" ]]; then
+  [[ -f "$candidate_turn_config" ]] || die "coturn configuration is missing from the candidate installation"
+  [[ -f "$candidate_override" ]] || die "signaling systemd override is missing from the candidate installation"
+fi
+
+mkdir -p "$backup_root"
+if systemctl is-active --quiet mine-teleop-cloud.target; then
+  cloud_target_was_active="true"
+fi
+if systemctl is-enabled --quiet mine-teleop-cloud.target; then
+  cloud_target_was_enabled="true"
+fi
+if systemctl is-active --quiet coturn.service; then
+  distribution_coturn_was_active="true"
+fi
+if systemctl is-enabled --quiet coturn.service; then
+  distribution_coturn_was_enabled="true"
+fi
+for unit in "${managed_units[@]}"; do
+  if systemctl is-active --quiet "$unit"; then
+    previously_active_units+=("$unit")
+  fi
+done
+
+mutation_started="true"
+if [[ "$start_services" == "true" ]]; then
+  printf '==> candidate passed; stopping the existing cloud target for cutover\n'
+  service_state_mutated="true"
+  systemctl stop mine-teleop-cloud.target 2>/dev/null || true
+  systemctl disable --now coturn.service 2>/dev/null || true
+fi
+
+if [[ "$package_real" != "$prefix_real" ]]; then
+  printf '==> switching the application bundle under %s\n' "$prefix"
+  previous_prefix="${prefix}.previous-$deployment_timestamp"
+  [[ ! -e "$previous_prefix" && ! -L "$previous_prefix" ]] || {
+    die "backup path already exists: $previous_prefix"
+  }
+  prefix_replacement_started="true"
   if [[ -e "$prefix" || -L "$prefix" ]]; then
-    previous_prefix="${prefix}.previous-$deployment_timestamp"
-    [[ ! -e "$previous_prefix" ]] || die "backup path already exists: $previous_prefix"
+    prefix_had_existing="true"
     mv "$prefix" "$previous_prefix"
   fi
-  mv "$staging_prefix" "$prefix"
+  mkdir -p "$(dirname -- "$prefix")"
+  mv "$candidate_prefix" "$prefix"
 else
   printf '==> application bundle is already installed under %s\n' "$prefix"
 fi
 
 install -d -m 0750 "$config_dir" "$config_dir/secrets" "$config_dir/tls"
-if [[ -n "$environment_file" ]]; then
-  install_config_file "$environment_file" "$config_dir/mine-teleop.env" 0600
-elif [[ ! -f "$config_dir/mine-teleop.env" ]]; then
-  install -m 0600 /dev/null "$config_dir/mine-teleop.env"
+if [[ -n "$environment_file" || ! -f "$config_dir/mine-teleop.env" ]]; then
+  install_config_file "$candidate_environment_file" "$config_dir/mine-teleop.env" 0600
 fi
 if [[ -n "$signaling_config" ]]; then
-  install_config_file "$signaling_config" "$signaling_config_path" 0640
+  install_config_file "$candidate_signaling_config" "$signaling_config_path" 0640
 fi
 if [[ -n "$identity_secrets_dir" ]]; then
   while IFS= read -r -d '' secret_path; do
     install_config_file \
-      "$secret_path" \
+      "$candidate_config_dir/secrets/$(basename -- "$secret_path")" \
       "$config_dir/secrets/$(basename -- "$secret_path")" \
       0600
   done < <(find "$identity_secrets_dir" -maxdepth 1 -type f -print0)
 fi
 if [[ -n "$turn_secret_file" ]]; then
-  install_config_file "$turn_secret_file" "$turn_secret_path" 0600
+  install_config_file "$candidate_turn_secret" "$turn_secret_path" 0600
 fi
 if [[ -n "$caddy_config" ]]; then
-  install_config_file "$caddy_config" "$caddy_config_path" 0644
+  install_config_file "$candidate_caddy_config" "$caddy_config_path" 0644
 fi
 if [[ -n "$haproxy_config" ]]; then
-  install_config_file "$haproxy_config" "$haproxy_config_path" 0644
+  install_config_file "$candidate_haproxy_config" "$haproxy_config_path" 0644
 fi
-
 if [[ -n "$turn_realm" ]]; then
-  [[ -f "$turn_secret_path" ]] || die "TURN secret is missing: $turn_secret_path"
-  backup_existing "$turn_config_path"
-  "$prefix/scripts/render_turnserver_config.sh" \
-    --template "$prefix/deployments/turnserver/turnserver.conf.template" \
-    --realm "$turn_realm" \
-    --secret-file "$turn_secret_path" \
-    --output "$turn_config_path"
+  install_config_file "$candidate_turn_config" "$turn_config_path" 0640
 fi
 
 printf '==> installing systemd units\n'
@@ -409,42 +685,39 @@ install_config_file \
   "$prefix/deployments/systemd/haproxy.service.d/mine-teleop-cloud.conf" \
   "/etc/systemd/system/haproxy.service.d/mine-teleop-cloud.conf" \
   0644
-
 if [[ -n "$turn_realm" && -n "$turn_host" ]]; then
-  override_temporary="$(mktemp)"
-  cat >"$override_temporary" <<EOF
-[Service]
-ExecStart=
-ExecStart=/opt/mine-teleop/lib/ld-linux-x86-64.so.2 --library-path /opt/mine-teleop/lib /opt/mine-teleop/bin/mine-teleop-signaling-server --config /etc/mine-teleop/signaling-server.yaml --host 127.0.0.1 --port 8765 --driver-token-ttl-ms 3600000 --control-token-ttl-ms 300000 --vehicle-heartbeat-ms 15000 --driver-heartbeat-ms 15000 --trusted-proxy-addresses 127.0.0.1,::1 --stun-urls stun:${turn_host}:3478 --turn-urls turn:${turn_host}:3478?transport=udp,turn:${turn_host}:3478?transport=tcp,turn:${turn_host}:6000?transport=tcp,turn:${turn_host}:443?transport=tcp --turn-realm ${turn_realm} --turn-static-auth-secret-file /etc/mine-teleop/secrets/turn-static-auth.secret --turn-credential-ttl-seconds 600 --api-rate-limit-requests 6000 --audit-log /var/log/mine-teleop/signaling-audit.jsonl --audit-log-retention-days 7
-EOF
-  install_config_file "$override_temporary" "$override_path" 0644
-  rm -f "$override_temporary"
-
-  state_temporary="$(mktemp)"
-  printf '%s\n' \
-    "MINE_TELEOP_TURN_REALM=$turn_realm" \
-    "MINE_TELEOP_TURN_HOST=$turn_host" \
-    >"$state_temporary"
-  install_config_file "$state_temporary" "$state_file" 0644
-  rm -f "$state_temporary"
+  install_config_file "$candidate_override" "$override_path" 0644
+  install_config_file "$candidate_state_file" "$state_file" 0644
 fi
 
 printf '==> validating installed configuration\n'
 if [[ -f "$signaling_config_path" ]]; then
-  signaling_validation=(
+  installed_signaling_validation=(
     "$prefix/lib/ld-linux-x86-64.so.2"
     --library-path "$prefix/lib"
     "$prefix/bin/mine-teleop-signaling-server"
     --config "$signaling_config_path"
   )
   if [[ -n "$turn_realm" ]]; then
-    signaling_validation+=(
+    installed_signaling_validation+=(
       --turn-realm "$turn_realm"
       --turn-static-auth-secret-file "$turn_secret_path"
     )
   fi
-  signaling_validation+=(--validate-config)
-  "${signaling_validation[@]}"
+  installed_signaling_validation+=(--validate-config)
+  if grep -Eq '^[[:space:]]*(password_env|device_token_env):' "$signaling_config_path"; then
+    systemd-run \
+      --quiet \
+      --wait \
+      --pipe \
+      --collect \
+      --service-type=exec \
+      --unit="mine-teleop-installed-config-validate-$$" \
+      --property="EnvironmentFile=$config_dir/mine-teleop.env" \
+      "${installed_signaling_validation[@]}"
+  else
+    "${installed_signaling_validation[@]}"
+  fi
 elif [[ "$start_services" == "true" ]]; then
   die "signaling configuration is missing: $signaling_config_path"
 fi
@@ -458,14 +731,11 @@ if [[ -f "$haproxy_config_path" ]]; then
 elif [[ "$start_services" == "true" ]]; then
   die "HAProxy configuration is missing: $haproxy_config_path"
 fi
-if [[ "$start_services" == "true" ]]; then
-  [[ -f "$turn_config_path" ]] || die "coturn configuration is missing: $turn_config_path"
-  [[ -f "$override_path" ]] || die "signaling systemd override is missing: $override_path"
-fi
 
 systemctl daemon-reload
 
 if [[ "$start_services" == "false" ]]; then
+  deployment_committed="true"
   printf '%s\n' \
     "cloud_bundle_deploy=installed-not-started" \
     "backup_root=$backup_root" \
@@ -499,11 +769,12 @@ if [[ "$health_ok" != "true" ]]; then
   die "cloud target started without a healthy signaling endpoint"
 fi
 
+candidate_managed_marker="$candidate_config_dir/.cloud-bundle-managed"
 printf '%s\n' \
   "installed_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   "application_prefix=$prefix" \
-  >"$config_dir/.cloud-bundle-managed"
-chmod 0644 "$config_dir/.cloud-bundle-managed"
+  >"$candidate_managed_marker"
+install_config_file "$candidate_managed_marker" "$config_dir/.cloud-bundle-managed" 0644
 
 systemctl --no-pager --full status \
   mine-teleop-cloud.target \
@@ -512,6 +783,7 @@ systemctl --no-pager --full status \
   caddy.service \
   haproxy.service
 
+deployment_committed="true"
 printf '%s\n' \
   "cloud_bundle_deploy=passed" \
   "health_url=http://127.0.0.1:8765/health" \

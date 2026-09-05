@@ -282,7 +282,22 @@ install(TARGETS mine_teleop_runtime
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(DIRECTORY cpp/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(DIRECTORY configs/ DESTINATION share/mine-teleop/configs)
+set(MINE_TELEOP_DISTRIBUTABLE_CONFIGS
+  configs/driver-console-002.dev.yaml
+  configs/driver-console.dev.yaml
+  configs/driver-console.three-machine.dev.yaml
+  configs/mine-teleop-field-root.crt
+  configs/signaling-server.2x2.dev.yaml
+  configs/signaling-server.browser-switch.dev.yaml
+  configs/vehicle-agent.bench.yaml
+  configs/vehicle-agent.ccg2-8m.yaml
+  configs/vehicle-agent.dev.yaml
+  configs/vehicle-agent.three-machine.field.yaml
+)
+install(
+  FILES ${MINE_TELEOP_DISTRIBUTABLE_CONFIGS}
+  DESTINATION share/mine-teleop/configs
+)
 install(DIRECTORY protocol/ DESTINATION share/mine-teleop/protocol)
 
 if(MINE_TELEOP_BUILD_TESTS)
@@ -530,6 +545,45 @@ if(MINE_TELEOP_BUILD_TESTS)
       NAME mine-teleop-runtime-diagnostics-contract
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_runtime_diagnostics.sh
     )
+    if(TARGET mine-teleop-run)
+      add_test(
+        NAME mine-teleop-vehicle-deploy-transaction
+        COMMAND bash
+          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_vehicle_deploy_transaction.sh
+          $<TARGET_FILE:mine-teleop-run>
+      )
+    else()
+      add_test(
+        NAME mine-teleop-vehicle-deploy-transaction
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_vehicle_deploy_transaction.sh
+      )
+    endif()
+    if(TARGET mine-teleop)
+      add_test(
+        NAME mine-teleop-configured-ca-bundle
+        COMMAND bash
+          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_configured_ca_bundle.sh
+          $<TARGET_FILE:mine-teleop>
+          ${CMAKE_CURRENT_SOURCE_DIR}/configs/vehicle-agent.three-machine.field.yaml
+          ${CMAKE_CURRENT_SOURCE_DIR}/configs/mine-teleop-field-root.crt
+      )
+    endif()
+    add_test(
+      NAME mine-teleop-admin-credential-transaction
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_admin_credentials.sh
+    )
+    set_tests_properties(
+      mine-teleop-admin-credential-transaction
+      PROPERTIES SKIP_REGULAR_EXPRESSION "admin_credentials_test=skipped"
+    )
+    add_test(
+      NAME mine-teleop-cloud-no-start-rollback
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_cloud_no_start_rollback.sh
+    )
+    set_tests_properties(
+      mine-teleop-cloud-no-start-rollback
+      PROPERTIES SKIP_REGULAR_EXPRESSION "cloud_no_start_rollback=skipped"
+    )
     add_test(
       NAME mine-teleop-coturn-usage-report-self-test
       COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/coturn_usage_report.sh --self-test
@@ -541,6 +595,18 @@ if(MINE_TELEOP_BUILD_TESTS)
   endif()
 
   if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
+    add_test(
+      NAME mine-teleop-uploader-disabled-does-not-scan
+      COMMAND $<TARGET_FILE:mine-teleop>
+        vehicle-uploader
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/configs/vehicle-agent.bench.yaml
+        --recording-root /mine-teleop-test/disabled-uploader-must-not-scan
+        --archive-root /mine-teleop-test/disabled-uploader-must-not-write
+    )
+    set_tests_properties(
+      mine-teleop-uploader-disabled-does-not-scan
+      PROPERTIES PASS_REGULAR_EXPRESSION "\"action\":\"disabled\""
+    )
     add_test(
       NAME mine-teleop-vehicle-runtime-log-relay
       COMMAND bash

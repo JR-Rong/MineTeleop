@@ -13,6 +13,7 @@ vcu_source="$repository_root/cpp/src/vcu.cpp"
 control_core="$repository_root/cpp/src/core.cpp"
 catalog="$repository_root/docs/24-vehicle-runtime-diagnostics.md"
 vehicle_deployer="$repository_root/scripts/deploy/deploy_vehicle_bundle.sh"
+cloud_deployer="$repository_root/scripts/deploy/deploy_cloud_bundle.sh"
 
 require_text() {
   local file="$1"
@@ -227,6 +228,7 @@ for issue_code in \
   vcu_drive_gear_change_moving_or_stale \
   vcu_control_runtime_unavailable \
   vcu_control_command_invalid \
+  vcu_disarm_transport_stopped \
   vcu_disarm_timeout; do
   require_text "$vcu_bridge" "$issue_code"
   require_text "$catalog" "$issue_code"
@@ -276,18 +278,31 @@ require_text "$catalog" '0x18F2F5D0'
 require_text "$catalog" '0x18F6F5D0'
 
 # A bundle with an ABI-incompatible bridge must fail before the deployer
-# removes the currently installed runtime. The installed and override-config
+# atomically changes the current release symlink. Candidate and activated
 # checks must keep using the same explicit bridge gate.
-require_text "$vehicle_deployer" '"$REMOTE_DIR/.extracting/bin/mine-teleop-run" config-check'
+require_text "$vehicle_deployer" '"\$staging_release/bin/mine-teleop-run" config-check'
 require_text "$vehicle_deployer" '"version":6'
-if [[ "$(grep -F -c -- '--chassis-bridge-library' "$vehicle_deployer")" -lt 3 ]]; then
+if [[ "$(grep -F -c -- '--chassis-bridge-library' "$vehicle_deployer")" -lt 2 ]]; then
   printf 'vehicle deployment contract failed: ABI gate is missing from one or more config checks\n' >&2
   exit 1
 fi
-preflight_line="$(grep -n -m1 -F '"$REMOTE_DIR/.extracting/bin/mine-teleop-run" config-check' "$vehicle_deployer" | cut -d: -f1)"
-replacement_line="$(grep -n -m1 -F 'rm -rf "$REMOTE_DIR/bin" "$REMOTE_DIR/lib"' "$vehicle_deployer" | cut -d: -f1)"
+preflight_line="$(grep -n -m1 -F '"\$staging_release/bin/mine-teleop-run" config-check' "$vehicle_deployer" | cut -d: -f1)"
+replacement_line="$(grep -n -m1 -F 'mv -Tf "$REMOTE_DIR/.current.next-\$release_id" "\$current_link"' "$vehicle_deployer" | cut -d: -f1)"
 if [[ -z "$preflight_line" || -z "$replacement_line" || "$preflight_line" -ge "$replacement_line" ]]; then
   printf 'vehicle deployment contract failed: ABI preflight does not precede installed runtime replacement\n' >&2
+  exit 1
+fi
+require_text "$vehicle_deployer" 'elif [[ -s "\$final_config" ]]'
+require_text "$vehicle_deployer" 'trap finish EXIT'
+
+# Cloud candidates must be validated before the existing target is stopped;
+# any later failure must enter the rollback path and restore service state.
+require_text "$cloud_deployer" 'validating the complete candidate configuration before cutover'
+require_text "$cloud_deployer" 'deployment failed; restoring the previous cloud installation'
+cloud_validation_line="$(grep -n -m1 -F 'validating the complete candidate configuration before cutover' "$cloud_deployer" | cut -d: -f1)"
+cloud_stop_line="$(grep -n -m1 -F 'candidate passed; stopping the existing cloud target for cutover' "$cloud_deployer" | cut -d: -f1)"
+if [[ -z "$cloud_validation_line" || -z "$cloud_stop_line" || "$cloud_validation_line" -ge "$cloud_stop_line" ]]; then
+  printf 'cloud deployment contract failed: candidate validation does not precede service stop\n' >&2
   exit 1
 fi
 

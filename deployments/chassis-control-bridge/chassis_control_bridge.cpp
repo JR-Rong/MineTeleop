@@ -1834,21 +1834,28 @@ class BridgeRuntime {
               "\"," + stop_provenance_json_locked(),
           true);
     }
+    bool disarm_wait_completed = false;
     bool disarmed = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      disarmed = condition_.wait_for(
+      disarm_wait_completed = condition_.wait_for(
           lock,
           std::chrono::duration<double>(kDisarmTimeoutSeconds),
           [&] { return controller_.disarmed() || !running_.load(); });
+      disarmed = controller_.disarmed();
     }
     if (!disarmed) {
       std::lock_guard<std::mutex> lock(mutex_);
+      const bool transport_stopped = disarm_wait_completed && !running_.load();
       logger_.issue(
-          "disarm_timeout",
-          "vcu_disarm_timeout",
+          transport_stopped ? "disarm_transport_stopped" : "disarm_timeout",
+          transport_stopped
+              ? "vcu_disarm_transport_stopped"
+              : "vcu_disarm_timeout",
           "vcu_close",
-          "VCU did not complete the reverse handshake within the timeout",
+          transport_stopped
+              ? "VCU bridge I/O stopped before the reverse handshake was confirmed"
+              : "VCU did not complete the reverse handshake within the timeout",
           "Keep the vehicle isolated; inspect feedback/state and use the independent hardware safety path.",
           "local_full_stop",
           "\"timeout_ms\":" +
@@ -2018,7 +2025,11 @@ class BridgeRuntime {
       latest_intent_.target_speed_mps = 0.0;
       latest_intent_valid_ = true;
     }
-    latest_intent_.normalized_longitudinal = 0.0;
+    // Runtime-profile invalidation must remove traction without undoing an
+    // already requested ordinary brake. Positive values are traction; negative
+    // values are direct/service braking and remain valid without a profile.
+    latest_intent_.normalized_longitudinal =
+        std::min(0.0, latest_intent_.normalized_longitudinal);
     latest_intent_.generation = ++intent_generation_;
     reset_speed_pid_locked();
     reset_direct_traction_locked();

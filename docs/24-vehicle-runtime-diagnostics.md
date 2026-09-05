@@ -155,7 +155,7 @@ CCG2 的 `vehicle_camera_first_frame`、`vehicle_camera_failed` 和 lane metrics
 | `vehicle_camera_reopen_scheduled` / `camera_lane_reopen_scheduled` | 故障可重试且累计失败次数未超过 `reopen_attempts` | 只销毁并重开故障采集源，其他 lane 不重建；关键相机的控制锁止保持不变 |
 | `vehicle_camera_recovered` / `camera_lane_recovered` | 重开后的第一帧到达 | 视频恢复；若为关键相机，同一云端 session 的控制锁止保持不变，不能把该事件当作恢复驾驶权限 |
 | `vehicle_camera_lane_disabled` / `camera_reopen_exhausted` | 不可重试或重开额度耗尽 | 关键 lane 禁用且继续保持停车；非关键 lane 只结束自身视频，其他 lane 与当前控制继续 |
-| `vehicle_control_inhibited_by_camera` / `critical_camera_control_inhibited` | 关键相机首次确认失败 | 保持车辆停止并关闭控制 DataChannel；必须结束当前 session，在新 session 建立控制 DataChannel 并重新完成 VCU 握手 |
+| `vehicle_control_inhibited_by_camera` / `critical_camera_control_inhibited` | 关键相机首次确认失败，或最后编码帧超过 `media_frame_timeout_ms` | 每条 DataChannel 控制命令在本地准入前独立检查编码 freshness，不依赖可能阻塞的主信令循环；超时即保持车辆停止并关闭控制 DataChannel，必须结束当前 session，在新 session 建立控制 DataChannel 并重新完成 VCU 握手 |
 | `vehicle_control_inhibition_retained` / `critical_camera_control_inhibition_retained` | 媒体 service 在同一云端 session 内重建 runtime | 继续拒绝控制并保留视频能力；结束当前 session 后才能在新 session 重新握手 |
 | `vehicle_control_inhibition_latch_failed` / `critical_camera_control_latch_failed` | 内部 session 作用域不一致，无法更新共享锁存 | runtime-local 锁存仍立即安全停车；保持物理隔离并结束当前 session，禁止继续驾驶 |
 
@@ -206,7 +206,14 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `vehicle_media_connection_stale` / `vehicle_connection_generation_stale` | HTTP 409 `vehicle_connection_generation_stale` | `server_issue_code`, `safety_action=local_full_stop` | 非自动重试，进程 fail-closed |
 | `vehicle_media_signaling_sequence_conflict` / `signaling_sequence_conflict` | HTTP 409 `signaling_sequence_older` 或 `signaling_sequence_reused` | `server_issue_code`, `safety_action=local_full_stop` | 非自动重试，进程 fail-closed |
 | `vehicle_media_signaling_conflict` / `unclassified_signaling_conflict` | 其他无法安全分类的 HTTP 409 | `server_issue_code`, `safety_action=local_full_stop` | 非自动重试，进程 fail-closed |
-| `vehicle_recording_sidecar_failed` / `recording_sidecar_write_failed` | 录像 sidecar 创建/rename 失败 | `error` | 每次 finalize 失败 |
+| `vehicle_recording_retention_cleanup` / `recording_low_space_cleanup` | 录像盘低水位并按策略删除旧片段 | available/required bytes、已上传/未上传删除数 | 每次实际清理 |
+| `vehicle_recording_suspended` / `recording_low_space` | 允许的清理后仍低于 `min_free_gb`，录像 valve 暂停；实时视频与控制继续 | storage、`recording_paused_live_media_and_control_continue` | 状态转为暂停时一次 |
+| `vehicle_recording_resumed` / `recording_space_recovered` | 可用空间恢复，录像 valve 恢复 | storage | 状态转为恢复时一次 |
+| `vehicle_recording_suspended` / `recording_space_check_failed` | 空间查询/目录扫描失败，录像保守暂停 | `error`、`recording_paused_live_media_and_control_continue` | 首次变化或强制检查 |
+| `vehicle_recording_suspended` / `recording_pipeline_error` | splitmux/muxer/filesink 分支报错，禁用录像但不升级成全媒体故障 | `error`、`recording_disabled_live_media_and_control_continue` | 每个 recorder bus error |
+| `vehicle_recording_sidecar_failed` / `recording_fragment_sidecar_write_failed` | 已完成片段的 sidecar 哈希或原子写入失败 | `error`、`recording_degraded_live_media_and_control_continue` | 每次 fragment-closed 失败 |
+| `vehicle_recording_sidecar_failed` / `recording_sidecar_write_failed` | 停流时孤立片段隔离 sidecar 创建失败 | `error` | 每次 finalize 失败 |
+| `vehicle_recording_recovery_failed` / `recording_orphan_recovery_failed` | 启动扫描孤立 MP4 失败；无 sidecar 的文件不进入上传 | `error`、`recording_degraded_live_media_and_control_continue` | 每次 session 恢复扫描失败 |
 | `vehicle_camera_performance_failed` / `camera_encoded_fps_below_minimum` | 任一路编码 FPS 低于阈值 | camera/FPS/frame counts | 每次 summary |
 | `vehicle_camera_performance_warning` / `camera_capture_to_encode_latency_high` | capture→encode 峰值超过预算 | camera/latency/budget | 每次 summary |
 
@@ -320,6 +327,7 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `emergency_stop_rejected` / `vcu_emergency_stop_runtime_unavailable` | bridge 已停止，软件急停无法下发 | 必须使用独立硬件安全路径 |
 | `parallel_handshake_disconnect_requested` / `vcu_disarm_requested` | 主动断开 | 零扭矩、N、EPB、清握手 |
 | `disarm_complete` / `vcu_disarm_complete` | 反向握手完成 | 全停已确认 |
+| `disarm_transport_stopped` / `vcu_disarm_transport_stopped` | 等待反向握手时 bridge I/O 已停止，未获得 controller disarmed 确认 | 不得记录为安全停车完成；保持隔离、检查 CAN/I/O 日志并使用独立硬件安全路径 |
 | `disarm_timeout` / `vcu_disarm_timeout` | 15 秒内未完成反向握手 | 保持隔离并使用硬件安全路径 |
 | `vehicle_vcu_safe_stop_failed` / `vcu_safe_stop_or_close_failed` | adapter close/safe stop 抛错 | 保持隔离，禁止仅凭软件判断安全 |
 
