@@ -9,6 +9,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(WIN32)
   set(MINE_TELEOP_VEHICLE_DEFAULT OFF)
+  # winsock2.h/windows.h otherwise define min/max macros before several
+  # translation units reach <algorithm> and <limits>. Keep this directory-wide
+  # so every current and future Windows target shares the same header contract.
+  add_compile_definitions(NOMINMAX)
 else()
   set(MINE_TELEOP_VEHICLE_DEFAULT ON)
 endif()
@@ -73,20 +77,38 @@ else()
   set(MINE_TELEOP_YAML_TARGET yaml-cpp)
 endif()
 include(GNUInstallDirs)
+include(cmake/SplitMsvcStringLiterals.cmake)
 
 set(MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_logic.js")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}")
 file(READ "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}" MINE_TELEOP_CONTROL_LOGIC_JS)
-string(FIND "${MINE_TELEOP_CONTROL_LOGIC_JS}" ")MT_CONTROL_JS\"" MINE_TELEOP_CONTROL_LOGIC_DELIMITER)
-if(NOT MINE_TELEOP_CONTROL_LOGIC_DELIMITER EQUAL -1)
-  message(FATAL_ERROR "cpp/web/control_logic.js contains the generated C++ raw-string delimiter")
-endif()
+string(REPLACE "\r\n" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
+string(REPLACE "\r" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
+mine_teleop_make_adjacent_raw_literals(
+  "${MINE_TELEOP_CONTROL_LOGIC_JS}"
+  "MT_CONTROL_JS"
+  MINE_TELEOP_CONTROL_LOGIC_JS_LITERALS
+  MINE_TELEOP_CONTROL_LOGIC_JS_CHUNK_COUNT
+  MINE_TELEOP_CONTROL_LOGIC_JS_MAX_CHUNK_BYTES
+)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop")
 configure_file(
   cmake/control_logic_js.hpp.in
   "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop/control_logic_js.hpp"
   @ONLY
 )
+
+set(MINE_TELEOP_SERVER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/server.cpp")
+set(MINE_TELEOP_GENERATED_SERVER_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/src/server.cpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_SERVER_SOURCE}")
+# Keep server.cpp as the canonical source while compiling a byte-equivalent
+# generated copy whose large HTML raw strings are safe for MSVC.
+mine_teleop_split_cpp_raw_literals(
+  "${MINE_TELEOP_SERVER_SOURCE}"
+  "${MINE_TELEOP_GENERATED_SERVER_SOURCE}"
+  "HTML"
+)
+set_source_files_properties("${MINE_TELEOP_GENERATED_SERVER_SOURCE}" PROPERTIES GENERATED TRUE)
 
 function(mine_teleop_enable_warnings target)
   if(MSVC)
@@ -110,7 +132,7 @@ add_library(mine_teleop_runtime
   cpp/src/core.cpp
   cpp/src/http.cpp
   cpp/src/platform.cpp
-  cpp/src/server.cpp
+  "${MINE_TELEOP_GENERATED_SERVER_SOURCE}"
   cpp/src/websocket.cpp
 )
 target_include_directories(mine_teleop_runtime
