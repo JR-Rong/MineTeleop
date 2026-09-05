@@ -114,13 +114,14 @@ RUN git init /tmp/libsrtp \
     && git -C /tmp/libsrtp checkout --detach FETCH_HEAD \
     && test "$(git -C /tmp/libsrtp rev-parse HEAD)" = "$LIBSRTP_COMMIT"
 ARG MINE_TELEOP_BUILD_TESTS=OFF
+ARG MINE_TELEOP_BUILD_JOBS=2
 RUN cmake -S /tmp/libsrtp -B /tmp/libsrtp-build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX=/opt/libsrtp \
       -DBUILD_SHARED_LIBS=ON \
       -DENABLE_OPENSSL=ON \
       -DTEST_APPS="$MINE_TELEOP_BUILD_TESTS" \
-    && cmake --build /tmp/libsrtp-build --parallel 2 \
+    && cmake --build /tmp/libsrtp-build --parallel "$MINE_TELEOP_BUILD_JOBS" \
     && if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \
          ctest --test-dir /tmp/libsrtp-build --output-on-failure; \
        fi \

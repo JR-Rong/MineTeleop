@@ -119,10 +119,8 @@ upload:
   enabled: true
   backend: local_archive
   max_bandwidth_mbps: 5
-  trigger_segments: 20
-  trigger_network_idle: true
-  direct_file_upload: true
-  presigned_url_refresh_margin_seconds: 300
+  trigger_segments: 1
+  trigger_network_idle: false
   retry_initial_seconds: 10
   retry_max_seconds: 600
 

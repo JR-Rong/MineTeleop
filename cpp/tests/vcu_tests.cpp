@@ -1058,6 +1058,12 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
   expect(
       signal(epb, 0, 2) == 2 && signal(epb, 16, 2) == 2,
       "disarm did not request EPB parked value 2");
+  const auto& parking_brake_hold =
+      find_frame(frames, mine_teleop::vcu::ids::kAduEhb01);
+  expect(
+      signal(parking_brake_hold, 0, 4) == 1 &&
+          signal(parking_brake_hold, 4, 12) == 250,
+      "disarm released EHB pressure before EPB park confirmation");
 
   controller.ingest(parking_brake_feedback(2));
   frames = controller.tick();

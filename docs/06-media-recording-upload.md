@@ -152,9 +152,12 @@ record_profiles:
 - 典型和最差 5G 上行带宽。
 - 上传追不上时的处理策略：降录像码率、暂停上传以保护实时链路、扩大磁盘、只删除已上传文件、或在明确告警后接受未上传片段丢弃。
 
-本地水位策略默认只删除 `upload_state=uploaded` 的片段；若现场配置显式允许
-删除未上传片段，返回动作必须标记为 `deleted_unuploaded_segments`，并带
-`explicit unuploaded deletion policy` 原因，避免运维误认为只是普通已上传清理。
+媒体进程每秒检查录像文件系统。可用空间低于 `min_free_gb` 时暂停录像分支的
+输入，实时 WebRTC 和独立控制安全路径继续运行；空间恢复后自动恢复录像。
+只有可用空间同时低于 `delete_uploaded_when_below_free_gb` 时才从最旧的
+`upload_state=uploaded` 片段开始清理。`delete_unuploaded_when_below_free_gb=false`
+是默认保护边界；只有显式设为 `true` 才允许删除未上传片段。每次清理、暂停、恢复
+或空间检查失败都会输出带删除数量和 `safety_action` 的结构化诊断。
 
 ### 文件组织
 
@@ -180,67 +183,52 @@ record_profiles:
   "session_id": "session-20260624-001",
   "camera_id": "front",
   "segment_id": "20260624T101500Z_front_000001",
-  "started_at": "2026-06-24T10:15:00Z",
-  "ended_at": "2026-06-24T10:16:00Z",
+  "started_at": "2026-06-24T10:15:00.000Z",
+  "ended_at": "2026-06-24T10:16:00.000Z",
+  "timing_source": "splitmux_running_time",
   "codec": "h264",
   "encoder": "vaapi",
-  "width": 1920,
-  "height": 1080,
-  "fps": 30,
+  "video_file": "20260624T101500Z_front_000001.mp4",
   "file_size_bytes": 64000000,
-  "video_sha256": "4b8c...",
+  "video_sha256": "50d858e0985ecc7f60418aaf0cc5ab587f42c2570a884095a9e8ccacd0f6545c",
   "upload_state": "pending"
 }
 ```
 
+正常运行时，sidecar 在 `splitmuxsink-fragment-closed` 到达时立即原子写入，片段
+起止时间来自 pipeline running-time，因此已完成片段无需等到整条媒体流停止即可被
+上传器发现。进程启动或停流时发现“有 MP4、无 sidecar”的片段，只会生成
+`upload_state=quarantined`、时间和 codec/encoder 均未确认的恢复元数据；这类片段
+不会被上传器当作 `pending` 自动归档，需人工确认。
+
 ## 上传队列
 
-### 触发策略
+当前原生实现只支持 `upload.backend=local_archive`，按单个已完成片段立即调度，
+因此启用上传时必须配置 `trigger_segments: 1`、`trigger_network_idle: false`。
+S3、预签名 URL、累计字节/定时/网络空闲触发尚未实现，配置为其它 backend 会在
+启动配置检查中明确失败，不能静默退回本地归档。
 
-可配置：
+`vehicle-uploader --service-mode` 反复扫描 `recording.root_dir` 中
+`upload_state=pending` 的 sidecar。每个片段在复制前必须提供 64 位
+`video_sha256`，上传器先验证当前源文件仍等于录像时哈希，再验证原子临时目标；
+哈希不一致的文件不会进入归档。sidecar 只能引用同目录的普通非符号链接视频文件，
+拒绝绝对路径和 `..` 目录逃逸。
 
-- 每 N 个视频片段上传。
-- 每累计 N MB 上传。
-- 每 N 分钟上传。
-- 网络空闲时上传。
-
-触发策略只决定何时调度上传；默认上传单位是单个视频片段和对应 sidecar 元数据，不做 zip/tar 打包。
-本地 uploader 会接入数量、累计字节、等待时间和网络空闲四类触发条件；
-`network_idle` 由调用方根据链路策略传入，真实 5G modem/网络空闲采样仍需车端环境接入。
-
-本地 recorder/uploader 闭环会同时申请 video 和 metadata 两类上传凭证，
-队列持久化两个对象路径，以及视频文件和 sidecar 元数据文件的 SHA-256
-校验值和 `enqueued_at_ms` 入队时间；上传调度的时间窗口按最早 pending
-片段的入队时间计算。上传成功后分别登记视频片段和 sidecar 元数据，并将源
-sidecar 与归档 sidecar 的 `upload_state` 原子更新为 `uploaded`。
-`upload.backend=s3` 时，车端会把视频和 sidecar 直接 HTTP PUT 到签发的
-URL；`local_archive` 后端只用于本地开发归档。
-当 `upload.enabled=false` 时，本地录像和 sidecar 写入保持可用，但 uploader
-不会申请凭证、入队、扫描 pending sidecar 或执行上传；单次调度返回
-`disabled`。
-部署入口必须使用 `vehicle-uploader --service-mode`，从
-`recording.root_dir` 扫描已有 pending sidecar，并把队列状态和本地归档写入
-独立 work dir；默认不带 `--service-mode` 的入口只用于本地闭环 demo，会创建
-演示片段后退出。目标主机 smoke 可加 `--process-once --json`，把单次调度结果
-输出为 `vehicle_uploader_process_once` JSONL 证据，便于归档报告区分
-`uploaded`、`idle`、`wait`、`disabled` 和 `failed`。
-本地归档适配器会校验对象路径必须落在归档根目录内，拒绝 `../` 或绝对路径
-造成的目录逃逸。
+单个损坏 sidecar 会进入由 `retry_initial_seconds` 到 `retry_max_seconds` 控制的
+指数退避，扫描继续处理后续健康片段；服务循环对 `failed`、`retry_wait` 和 `idle`
+都执行有界休眠，避免紧密失败循环。退避状态只存在于当前上传进程内，进程重启后
+会重新尝试；源 sidecar 成功后原子标为 `uploaded`。当 `upload.enabled=false`
+时，入口在构造或扫描上传器之前返回 `disabled`，录像与 sidecar 仍保留。
 
 ### 上传状态
 
-状态建议：
+当前持久化到 sidecar 的状态：
 
 - `pending`
-- `uploading`
 - `uploaded`
-- `failed`
-- `retry_wait`
-- `credential_refresh`
 
-上传队列需要持久化，避免车端重启后丢失状态。
-
-使用预签名 URL 时，队列持久化的是片段 ID、对象路径、校验信息和上传状态。预签名 URL 本身可能过期，车端在 `uploading` 前应检查剩余有效期，过期或低于安全余量时进入 `credential_refresh`，重新向云端申请同一对象路径的上传凭证。
+`failed`、`retry_wait`、`idle` 和 `disabled` 是单次处理结果，不会伪装成已持久化
+远端队列状态。`quarantined` 属于录像恢复状态，默认不参与上传。
 
 不增加打包状态。已编码视频再次 zip/tar 通常不能显著省流量，还会增加 CPU 和磁盘双写；省流量应通过编码 profile、码率、分辨率、保留周期和上传调度控制。
 

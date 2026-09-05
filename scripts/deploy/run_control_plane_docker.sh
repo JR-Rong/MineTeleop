@@ -12,6 +12,17 @@ vehicle_id="${MINE_TELEOP_CONTROL_PLANE_VEHICLE_ID:-vehicle-001}"
 password="${MINE_TELEOP_CONTROL_PLANE_PASSWORD:-dev-password}"
 device_token="${MINE_TELEOP_DEVICE_TOKEN:-dev-device-secret}"
 
+for port in "$console_port" "$signaling_port"; do
+  [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || {
+    printf 'invalid loopback port: %s\n' "$port" >&2
+    exit 2
+  }
+done
+[[ "$console_port" != "$signaling_port" ]] || {
+  printf 'console and signaling ports must be different\n' >&2
+  exit 2
+}
+
 cleanup() {
   docker rm -f "$console_name" >/dev/null 2>&1 || true
   docker rm -f "$server_name" >/dev/null 2>&1 || true
@@ -28,6 +39,7 @@ docker run -d \
   -e MINE_TELEOP_DRIVER_PASSWORD="$password" \
   -e MINE_TELEOP_DEVICE_TOKEN="$device_token" \
   -p "127.0.0.1:${signaling_port}:8765" \
+  -p "127.0.0.1:${console_port}:8080" \
   "$image" signaling-server \
     --host 0.0.0.0 --port 8765 \
     --vehicle-id "$vehicle_id" \

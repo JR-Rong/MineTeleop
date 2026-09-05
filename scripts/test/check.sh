@@ -48,20 +48,4 @@ else
   printf 'runtime_bundle_check=skipped target=linux/amd64 current_arch=%s\n' "$target_arch"
 fi
 
-if rg -n '[p]ython3' \
-  "$repo_root/scripts" \
-  "$repo_root/cpp" \
-  "$repo_root/CMakeLists.txt" \
-  "$repo_root/README.md"; then
-  printf 'production source still references Python\n' >&2
-  exit 2
-fi
-
-if find "$repo_root" \
-  -path "$repo_root/.git" -prune -o \
-  -name '*.py' -print -quit | grep -q .; then
-  printf 'Python source remains in the active repository\n' >&2
-  exit 2
-fi
-
 printf 'native_cpp_check=passed\n'

@@ -52,6 +52,7 @@ Diagnostics:
   tail -F /var/log/mine-teleop/vehicle-runtime.log
   ./bin/mine-teleop-run version
   ./bin/mine-teleop-run config-check --config config/vehicle-agent.yaml \
+    --verify-configured-ca-bundle \
     --chassis-bridge-library lib/vendor/chassis/libmine_teleop_chassis_bridge.so
   ./bin/mine-teleop-run vehicle-agent --config config/vehicle-agent.yaml --preflight
 

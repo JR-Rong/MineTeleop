@@ -12,6 +12,10 @@ SSH_PORT="22"
 SSH_KEY="${MINE_TELEOP_VEHICLE_SSH_KEY:-}"
 REMOTE_DIR=""
 REMOTE_ARCHIVE="/tmp/mine-teleop-ubuntu-x86_64.tar.gz"
+REMOTE_CONFIG_OVERRIDE=""
+REMOTE_DEVICE_TOKEN_OVERRIDE=""
+CONFIG_OVERRIDE_REQUESTED="false"
+DEVICE_TOKEN_OVERRIDE_REQUESTED="false"
 SIGNALING_HTTP_URL=""
 DEVICE_TOKEN="${MINE_TELEOP_VEHICLE_DEVICE_TOKEN:-}"
 DEVICE_TOKEN_FILE="${MINE_TELEOP_VEHICLE_DEVICE_TOKEN_FILE:-}"
@@ -213,6 +217,14 @@ if [[ -z "$DEVICE_TOKEN_FILE" && -n "$DEVICE_TOKEN" ]]; then
 fi
 
 SSH_TARGET="$SSH_USER@$SSH_HOST"
+REMOTE_CONFIG_OVERRIDE="$REMOTE_ARCHIVE.vehicle-agent.yaml"
+REMOTE_DEVICE_TOKEN_OVERRIDE="$REMOTE_ARCHIVE.device-token"
+if [[ -n "$CONFIG" ]]; then
+  CONFIG_OVERRIDE_REQUESTED="true"
+fi
+if [[ -n "$DEVICE_TOKEN_FILE" ]]; then
+  DEVICE_TOKEN_OVERRIDE_REQUESTED="true"
+fi
 SSH_BASE=(ssh -p "$SSH_PORT")
 SCP_BASE=(scp -P "$SSH_PORT")
 if [[ -n "$SSH_KEY" ]]; then
@@ -257,93 +269,242 @@ run_remote() {
 printf '==> deploying %s to %s:%s\n' "$BUNDLE" "$SSH_TARGET" "$REMOTE_DIR"
 run_remote "prepare remote directory" "$(cat <<EOF
 set -euo pipefail
-mkdir -p "$REMOTE_DIR" "$REMOTE_DIR/logs" "$REMOTE_DIR/data/recordings" "$REMOTE_DIR/data/uploader" "$REMOTE_DIR/data/uploader-archive"
+mkdir -p "$REMOTE_DIR" "$REMOTE_DIR/.releases" "$REMOTE_DIR/config" "$REMOTE_DIR/logs" "$REMOTE_DIR/data/recordings" "$REMOTE_DIR/data/uploader" "$REMOTE_DIR/data/uploader-archive"
 EOF
 )"
 
 printf '==> uploading bundle archive\n'
 run_cmd "${SCP_BASE[@]}" "$BUNDLE" "$SSH_TARGET:$REMOTE_ARCHIVE"
 
-run_remote "preflight bundle, install, and verify bundled executables" "$(cat <<EOF
+if [[ -n "$CONFIG" ]]; then
+  printf '==> uploading vehicle configuration override for preflight\n'
+  run_cmd "${SCP_BASE[@]}" "$CONFIG" "$SSH_TARGET:$REMOTE_CONFIG_OVERRIDE"
+fi
+if [[ -n "$DEVICE_TOKEN_FILE" ]]; then
+  printf '==> uploading protected vehicle device token candidate\n'
+  run_cmd "${SCP_BASE[@]}" "$DEVICE_TOKEN_FILE" "$SSH_TARGET:$REMOTE_DEVICE_TOKEN_OVERRIDE"
+fi
+
+run_remote "preflight candidate config and atomically activate release" "$(cat <<EOF
 set -euo pipefail
-rm -rf "$REMOTE_DIR/.extracting"
-mkdir -p "$REMOTE_DIR/.extracting"
-tar -xzf "$REMOTE_ARCHIVE" -C "$REMOTE_DIR/.extracting" --strip-components=1
-test -x "$REMOTE_DIR/.extracting/bin/mine-teleop"
-test -x "$REMOTE_DIR/.extracting/bin/mine-teleop-run"
-test -s "$REMOTE_DIR/.extracting/lib/vendor/chassis/libmine_teleop_chassis_bridge.so"
-export LD_LIBRARY_PATH="$REMOTE_DIR/.extracting/lib:$REMOTE_DIR/.extracting/lib/vendor/chassis:$REMOTE_DIR/.extracting/lib/vendor/mvs"
-"$REMOTE_DIR/.extracting/bin/mine-teleop-run" version
-"$REMOTE_DIR/.extracting/bin/mine-teleop-run" config-check \
-  --config "$REMOTE_DIR/.extracting/config/vehicle-agent.yaml" \
-  --chassis-bridge-library "$REMOTE_DIR/.extracting/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
+release_id="\$(date -u +%Y%m%d-%H%M%S)-\$\$"
+release_root="$REMOTE_DIR/.releases"
+staging_release="\$release_root/.staging-\$release_id"
+release_dir="\$release_root/\$release_id"
+current_link="$REMOTE_DIR/current"
+stable_bin="$REMOTE_DIR/bin"
+stable_lib="$REMOTE_DIR/lib"
+final_config="$REMOTE_DIR/config/vehicle-agent.yaml"
+pending_config="$REMOTE_DIR/config/.vehicle-agent.yaml.next-\$release_id"
+final_token="$REMOTE_DIR/config/device-token"
+pending_token="$REMOTE_DIR/config/.device-token.next-\$release_id"
+config_backup=""
+token_backup=""
+stable_bin_backup=""
+stable_lib_backup=""
+config_published="false"
+token_published="false"
+stable_bin_activation_started="false"
+stable_lib_activation_started="false"
+managed_ca_published=()
+previous_current=""
+activation_started="false"
+committed="false"
+
+rollback() {
+  set +e
+  if [[ "\$stable_lib_activation_started" == "true" ]]; then
+    rm -rf "\$stable_lib"
+    if [[ -n "\$stable_lib_backup" && ( -e "\$stable_lib_backup" || -L "\$stable_lib_backup" ) ]]; then
+      mv "\$stable_lib_backup" "\$stable_lib"
+    fi
+  fi
+  if [[ "\$stable_bin_activation_started" == "true" ]]; then
+    rm -rf "\$stable_bin"
+    if [[ -n "\$stable_bin_backup" && ( -e "\$stable_bin_backup" || -L "\$stable_bin_backup" ) ]]; then
+      mv "\$stable_bin_backup" "\$stable_bin"
+    fi
+  fi
+  if [[ "\$activation_started" == "true" ]]; then
+    if [[ -n "\$previous_current" ]]; then
+      ln -s "\$previous_current" "$REMOTE_DIR/.current.rollback-\$release_id"
+      mv -Tf "$REMOTE_DIR/.current.rollback-\$release_id" "\$current_link"
+    else
+      rm -f "\$current_link"
+    fi
+  fi
+  if [[ -n "\$config_backup" && -f "\$config_backup" ]]; then
+    mv -f "\$config_backup" "\$final_config"
+  elif [[ "\$config_published" == "true" ]]; then
+    rm -f "\$final_config"
+  fi
+  if [[ -n "\$token_backup" && -f "\$token_backup" ]]; then
+    mv -f "\$token_backup" "\$final_token"
+  elif [[ "\$token_published" == "true" ]]; then
+    rm -f "\$final_token"
+  fi
+  for managed_ca in "\${managed_ca_published[@]:-}"; do
+    [[ -z "\$managed_ca" ]] || rm -f "\$managed_ca"
+  done
+  rm -rf "\$staging_release"
+  rm -rf "\$release_dir"
+  rm -f \
+    "\$pending_config" \
+    "\$pending_token" \
+    "$REMOTE_DIR/.bin.next-\$release_id" \
+    "$REMOTE_DIR/.lib.next-\$release_id" \
+    "$REMOTE_DIR/config/".*.next-"\$release_id" \
+    "$REMOTE_DIR/.current.next-\$release_id" \
+    "$REMOTE_DIR/.current.rollback-\$release_id" \
+    "$REMOTE_ARCHIVE" \
+    "$REMOTE_CONFIG_OVERRIDE" \
+    "$REMOTE_DEVICE_TOKEN_OVERRIDE"
+}
+
+finish() {
+  status=\$?
+  trap - EXIT
+  if [[ "\$status" -ne 0 && "\$committed" != "true" ]]; then
+    rollback
+  fi
+  exit "\$status"
+}
+trap finish EXIT
+
+rm -rf "\$staging_release"
+mkdir -p "\$staging_release"
+tar -xzf "$REMOTE_ARCHIVE" -C "\$staging_release" --strip-components=1
+test -x "\$staging_release/bin/mine-teleop"
+test -x "\$staging_release/bin/mine-teleop-run"
+test -s "\$staging_release/lib/vendor/chassis/libmine_teleop_chassis_bridge.so"
+
+candidate_config="\$staging_release/config/vehicle-agent.yaml"
+if [[ "$CONFIG_OVERRIDE_REQUESTED" == "true" && -s "$REMOTE_CONFIG_OVERRIDE" ]]; then
+  candidate_config="$REMOTE_CONFIG_OVERRIDE"
+elif [[ -s "\$final_config" ]]; then
+  candidate_config="\$final_config"
+fi
+test -s "\$candidate_config"
+
+export LD_LIBRARY_PATH="\$staging_release/lib:\$staging_release/lib/vendor/chassis:\$staging_release/lib/vendor/mvs"
+"\$staging_release/bin/mine-teleop-run" version
+"\$staging_release/bin/mine-teleop-run" config-check \
+  --config "\$candidate_config" \
+  --chassis-bridge-library "\$staging_release/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
   | tee /dev/stderr \
   | grep -Eq '"chassis_bridge_abi":\\{[^}]*"passed":true[^}]*"version":6[^}]*\\}'
-rm -rf "$REMOTE_DIR/bin" "$REMOTE_DIR/lib"
-cp -a "$REMOTE_DIR/.extracting/." "$REMOTE_DIR/"
-rm -rf "$REMOTE_DIR/.extracting"
-rm -f "$REMOTE_ARCHIVE"
+
+cp -p "\$candidate_config" "\$pending_config"
+if [[ -f "\$final_config" ]]; then
+  config_backup="$REMOTE_DIR/config/.vehicle-agent.yaml.backup-\$release_id"
+  cp -p "\$final_config" "\$config_backup"
+fi
+if [[ "$DEVICE_TOKEN_OVERRIDE_REQUESTED" == "true" ]]; then
+  test -s "$REMOTE_DEVICE_TOKEN_OVERRIDE"
+  install -m 0600 "$REMOTE_DEVICE_TOKEN_OVERRIDE" "\$pending_token"
+  if [[ -f "\$final_token" ]]; then
+    token_backup="$REMOTE_DIR/config/.device-token.backup-\$release_id"
+    cp -p "\$final_token" "\$token_backup"
+  fi
+fi
+mv "\$staging_release" "\$release_dir"
+if [[ -L "\$current_link" ]]; then
+  previous_current="\$(readlink "\$current_link")"
+elif [[ -e "\$current_link" ]]; then
+  echo "current activation path exists and is not a symlink: \$current_link" >&2
+  false
+fi
+activation_started="true"
+ln -s "\$release_dir" "$REMOTE_DIR/.current.next-\$release_id"
+mv -Tf "$REMOTE_DIR/.current.next-\$release_id" "\$current_link"
+
+ln -s current/bin "$REMOTE_DIR/.bin.next-\$release_id"
+if [[ -L "\$stable_bin" && "\$(readlink "\$stable_bin")" == "current/bin" ]]; then
+  rm -f "$REMOTE_DIR/.bin.next-\$release_id"
+else
+  stable_bin_activation_started="true"
+  if [[ -e "\$stable_bin" || -L "\$stable_bin" ]]; then
+    stable_bin_backup="$REMOTE_DIR/.bin.backup-\$release_id"
+    mv "\$stable_bin" "\$stable_bin_backup"
+  fi
+  mv -Tf "$REMOTE_DIR/.bin.next-\$release_id" "\$stable_bin"
+fi
+
+ln -s current/lib "$REMOTE_DIR/.lib.next-\$release_id"
+if [[ -L "\$stable_lib" && "\$(readlink "\$stable_lib")" == "current/lib" ]]; then
+  rm -f "$REMOTE_DIR/.lib.next-\$release_id"
+else
+  stable_lib_activation_started="true"
+  if [[ -e "\$stable_lib" || -L "\$stable_lib" ]]; then
+    stable_lib_backup="$REMOTE_DIR/.lib.backup-\$release_id"
+    mv "\$stable_lib" "\$stable_lib_backup"
+  fi
+  mv -Tf "$REMOTE_DIR/.lib.next-\$release_id" "\$stable_lib"
+fi
+
+for bundled_ca in "\$release_dir"/config/*.crt "\$release_dir"/config/*.pem; do
+  [[ -f "\$bundled_ca" ]] || continue
+  ca_name="\$(basename -- "\$bundled_ca")"
+  final_ca="$REMOTE_DIR/config/\$ca_name"
+  if [[ ! -e "\$final_ca" && ! -L "\$final_ca" ]]; then
+    pending_ca="$REMOTE_DIR/config/.\$ca_name.next-\$release_id"
+    install -m 0644 "\$bundled_ca" "\$pending_ca"
+    managed_ca_published+=("\$final_ca")
+    mv -f "\$pending_ca" "\$final_ca"
+  fi
+done
+if [[ "$DEVICE_TOKEN_OVERRIDE_REQUESTED" == "true" ]]; then
+  token_published="true"
+  mv -f "\$pending_token" "\$final_token"
+fi
+config_published="true"
+mv -f "\$pending_config" "\$final_config"
+
 cd "$REMOTE_DIR"
-test -x bin/mine-teleop
-test -x bin/mine-teleop-run
-test -x bin/vainfo
+test -x current/bin/mine-teleop
+test -x current/bin/mine-teleop-run
+test -x current/bin/vainfo
 test -f config/vehicle-agent.yaml
-test -x lib/ld-linux-x86-64.so.2
+test -x current/lib/ld-linux-x86-64.so.2
 export GST_PLUGIN_SYSTEM_PATH_1_0=
-export GST_PLUGIN_PATH_1_0="$REMOTE_DIR/lib/gstreamer-1.0"
-export GST_PLUGIN_SCANNER="$REMOTE_DIR/bin/gst-plugin-scanner"
+export GST_PLUGIN_PATH_1_0="$REMOTE_DIR/current/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER="$REMOTE_DIR/current/bin/gst-plugin-scanner"
 export GST_REGISTRY_FORK=no
 export GST_REGISTRY="$REMOTE_DIR/.gstreamer-registry.bin"
-export LIBVA_DRIVERS_PATH="$REMOTE_DIR/lib/dri"
-export LD_LIBRARY_PATH="$REMOTE_DIR/lib:$REMOTE_DIR/lib/vendor/chassis:$REMOTE_DIR/lib/vendor/mvs"
-bin/mine-teleop-run version
-bin/mine-teleop-run config-check \
+export LIBVA_DRIVERS_PATH="$REMOTE_DIR/current/lib/dri"
+export LD_LIBRARY_PATH="$REMOTE_DIR/current/lib:$REMOTE_DIR/current/lib/vendor/chassis:$REMOTE_DIR/current/lib/vendor/mvs"
+current/bin/mine-teleop-run version
+current/bin/mine-teleop-run config-check \
   --config "$REMOTE_DIR/config/vehicle-agent.yaml" \
-  --chassis-bridge-library "$REMOTE_DIR/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
+  --verify-configured-ca-bundle \
+  --chassis-bridge-library "$REMOTE_DIR/current/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
   | tee /dev/stderr \
   | grep -Eq '"chassis_bridge_abi":\\{[^}]*"passed":true[^}]*"version":6[^}]*\\}'
+committed="true"
+rm -f \
+  "\$config_backup" \
+  "\$token_backup" \
+  "$REMOTE_ARCHIVE" \
+  "$REMOTE_CONFIG_OVERRIDE" \
+  "$REMOTE_DEVICE_TOKEN_OVERRIDE" || true
+[[ -z "\$stable_bin_backup" ]] || rm -rf "\$stable_bin_backup"
+[[ -z "\$stable_lib_backup" ]] || rm -rf "\$stable_lib_backup"
+printf 'active_release=%s\n' "\$release_dir"
 EOF
 )"
-
-if [[ -n "$CONFIG" ]]; then
-  printf '==> uploading vehicle configuration override\n'
-  run_cmd "${SCP_BASE[@]}" "$CONFIG" "$SSH_TARGET:$REMOTE_DIR/config/vehicle-agent.yaml"
-  run_remote "verify vehicle configuration override" "$(cat <<EOF
-set -euo pipefail
-cd "$REMOTE_DIR"
-export LD_LIBRARY_PATH="$REMOTE_DIR/lib:$REMOTE_DIR/lib/vendor/chassis:$REMOTE_DIR/lib/vendor/mvs"
-bin/mine-teleop-run config-check \
-  --config "$REMOTE_DIR/config/vehicle-agent.yaml" \
-  --chassis-bridge-library "$REMOTE_DIR/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
-  | tee /dev/stderr \
-  | grep -Eq '"chassis_bridge_abi":\\{[^}]*"passed":true[^}]*"version":6[^}]*\\}'
-EOF
-  )"
-fi
-
-if [[ -n "$DEVICE_TOKEN_FILE" ]]; then
-  printf '==> uploading protected vehicle device token\n'
-  run_cmd "${SCP_BASE[@]}" "$DEVICE_TOKEN_FILE" "$SSH_TARGET:$REMOTE_DIR/config/device-token"
-  run_remote "protect vehicle device token" "$(cat <<EOF
-set -euo pipefail
-chmod 0600 "$REMOTE_DIR/config/device-token"
-test -s "$REMOTE_DIR/config/device-token"
-EOF
-)"
-fi
 
 if [[ "$MEDIA_FRAMES" != "0" && -n "$SIGNALING_HTTP_URL" ]]; then
   run_remote "run WebRTC hardware media smoke" "$(cat <<EOF
 set -euo pipefail
 cd "$REMOTE_DIR"
 export GST_PLUGIN_SYSTEM_PATH_1_0=
-export GST_PLUGIN_PATH_1_0="$REMOTE_DIR/lib/gstreamer-1.0"
-export GST_PLUGIN_SCANNER="$REMOTE_DIR/bin/gst-plugin-scanner"
+export GST_PLUGIN_PATH_1_0="$REMOTE_DIR/current/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER="$REMOTE_DIR/current/bin/gst-plugin-scanner"
 export GST_REGISTRY_FORK=no
 export GST_REGISTRY="$REMOTE_DIR/.gstreamer-registry.bin"
-export LIBVA_DRIVERS_PATH="$REMOTE_DIR/lib/dri"
-export LD_LIBRARY_PATH="$REMOTE_DIR/lib"
-bin/mine-teleop-run vehicle-media-agent \\
+export LIBVA_DRIVERS_PATH="$REMOTE_DIR/current/lib/dri"
+export LD_LIBRARY_PATH="$REMOTE_DIR/current/lib"
+current/bin/mine-teleop-run vehicle-media-agent \\
   --config "$REMOTE_DIR/config/vehicle-agent.yaml" \\
   --signaling-http-url "$SIGNALING_HTTP_URL" \\
   --frames "$MEDIA_FRAMES" \\
@@ -357,12 +518,12 @@ if [[ "$RUN_LIVE_TELEOP" == "true" ]]; then
 set -euo pipefail
 cd "$REMOTE_DIR"
 export GST_PLUGIN_SYSTEM_PATH_1_0=
-export GST_PLUGIN_PATH_1_0="$REMOTE_DIR/lib/gstreamer-1.0"
-export GST_PLUGIN_SCANNER="$REMOTE_DIR/bin/gst-plugin-scanner"
+export GST_PLUGIN_PATH_1_0="$REMOTE_DIR/current/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER="$REMOTE_DIR/current/bin/gst-plugin-scanner"
 export GST_REGISTRY_FORK=no
 export GST_REGISTRY="$REMOTE_DIR/.gstreamer-registry.bin"
-export LIBVA_DRIVERS_PATH="$REMOTE_DIR/lib/dri"
-bin/mine-teleop-run vehicle-media-agent \\
+export LIBVA_DRIVERS_PATH="$REMOTE_DIR/current/lib/dri"
+current/bin/mine-teleop-run vehicle-media-agent \\
   --config "$REMOTE_DIR/config/vehicle-agent.yaml" \\
   --signaling-http-url "$SIGNALING_HTTP_URL" \\
   --frames 0 \\

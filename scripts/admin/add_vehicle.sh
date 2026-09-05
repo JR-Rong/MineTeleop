@@ -70,7 +70,8 @@ Required:
   --config YAML_PATH           signaling server multi-identity YAML
 
 Options:
-  --secrets-dir DIR            token directory (default: <yaml dir>/secrets)
+  --secrets-dir DIR            token directory (default: .local for repo configs,
+                               otherwise <yaml dir>/secrets)
   --assign-to-driver DRIVER_ID append the vehicle to this driver's permission
                                list; may be repeated
   --force                      overwrite an existing token file
@@ -482,31 +483,38 @@ select_yaml_engine
 
 config_path="$(CDPATH= cd -- "$(dirname -- "$config_path")" && pwd)/$(basename -- "$config_path")"
 config_dir="$(dirname -- "$config_path")"
-# The default credential directory is resolved against the config directory so
-# the recorded device_token_file stays relative to the YAML. An explicit
-# --secrets-dir is resolved against the caller's CWD (matching add_driver.sh).
+# Keep credentials generated for repository development configs out of the
+# distributable configs tree. Installed /etc-style configs continue to use a
+# sibling secrets directory. An explicit --secrets-dir is resolved against the
+# caller's CWD (matching add_driver.sh).
 if [[ -z "$secrets_dir" ]]; then
-  secrets_dir="$config_dir/secrets"
+  if [[ "$config_dir" == "$repo_root/configs" ]]; then
+    secrets_dir="$repo_root/.local/secrets/$(basename -- "$config_path" .yaml)"
+  else
+    secrets_dir="$config_dir/secrets"
+  fi
 elif [[ "$secrets_dir" != /* ]]; then
   secrets_dir="$PWD/$secrets_dir"
 fi
 secrets_dir="${secrets_dir%/}"
 token_path="$secrets_dir/${vehicle_id}.token"
 
-# `device_token_file` is resolved relative to the config directory by the server,
-# so prefer a relative reference. The plain prefix strip keeps the common case
-# working without GNU realpath (BSD/macOS lacks --relative-to).
-case "$token_path" in
-  "$config_dir"/*)
-    token_reference="${token_path#"$config_dir"/}"
-    ;;
-  *)
-    token_reference="$(realpath --relative-to="$config_dir" -m -- "$token_path" 2>/dev/null || true)"
-    if [[ -z "$token_reference" || "$token_reference" == ..* ]]; then
-      token_reference="$(realpath -m -- "$token_path" 2>/dev/null || printf '%s' "$token_path")"
-    fi
-    ;;
-esac
+# `device_token_file` is resolved relative to the config directory by the server.
+# The repository's `configs/` and `.local/` directories are siblings, but that
+# relationship must not be assumed for an arbitrary YAML supplied by the caller.
+token_reference="$token_path"
+if [[ "$config_dir" == "$repo_root/configs" && "$token_path" == "$repo_root/.local/"* ]]; then
+  token_reference="../${token_path#"$repo_root"/}"
+elif [[ "$token_path" == "$config_dir/"* ]]; then
+  token_reference="${token_path#"$config_dir"/}"
+else
+  relative="$(realpath --relative-to="$config_dir" -m -- "$token_path" 2>/dev/null || true)"
+  if [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
+    token_reference="$relative"
+  else
+    token_reference="$(realpath -m -- "$token_path" 2>/dev/null || printf '%s' "$token_path")"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Validation against the current config
@@ -651,14 +659,24 @@ fi
 created_token="no"
 created_secrets_dir="no"
 temporary_config=""
+temporary_token=""
+token_backup=""
 committed="no"
 
 cleanup() {
   [[ -z "$temporary_config" ]] || rm -f -- "$temporary_config"
+  [[ -z "$temporary_token" ]] || rm -f -- "$temporary_token"
   if [[ "$committed" != "yes" && "$created_token" == "yes" ]]; then
-    rm -f -- "$token_path"
-    warn "removed the freshly generated token $token_path because the config was not updated"
+    if [[ -n "$token_backup" && -f "$token_backup" ]]; then
+      mv -f -- "$token_backup" "$token_path"
+      token_backup=""
+      warn "restored the previous token because the config was not updated"
+    else
+      rm -f -- "$token_path"
+      warn "removed the freshly generated token $token_path because the config was not updated"
+    fi
   fi
+  [[ -z "$token_backup" ]] || rm -f -- "$token_backup"
   if [[ "$committed" != "yes" && "$created_secrets_dir" == "yes" ]]; then
     rmdir -- "$secrets_dir" 2>/dev/null || true
   fi
@@ -670,21 +688,34 @@ step "generating device token"
 if [[ ! -d "$secrets_dir" ]]; then
   mkdir -p -- "$secrets_dir"
   created_secrets_dir="yes"
-  chmod 0700 -- "$secrets_dir"
+  chmod 0700 "$secrets_dir"
   note "created $secrets_dir (mode 0700)"
 fi
 [[ -d "$secrets_dir" && -w "$secrets_dir" ]] || fail "secrets directory is not writable: $secrets_dir"
 
+temporary_token="$(mktemp "$secrets_dir/.${vehicle_id}.token.XXXXXX")"
 if ! (
   umask 077
-  openssl rand -hex 32 >"$token_path"
+  openssl rand -hex 32 >"$temporary_token"
 ); then
-  rm -f -- "$token_path"
+  rm -f -- "$temporary_token"
+  temporary_token=""
   fail "openssl failed to generate a device token for $vehicle_id"
 fi
+chmod 0600 "$temporary_token"
+[[ -n "$(tr -d '[:space:]' <"$temporary_token")" ]] || fail "generated token file is empty"
+if [[ -e "$token_path" ]]; then
+  backup_candidate="$(mktemp "$secrets_dir/.${vehicle_id}.token.backup.XXXXXX")"
+  if ! cp -p "$token_path" "$backup_candidate"; then
+    rm -f -- "$backup_candidate"
+    fail "cannot back up the existing token: $token_path"
+  fi
+  chmod 0600 "$backup_candidate"
+  token_backup="$backup_candidate"
+fi
 created_token="yes"
-chmod 0600 -- "$token_path"
-[[ -n "$(tr -d '[:space:]' <"$token_path")" ]] || fail "generated token file is empty: $token_path"
+mv -f -- "$temporary_token" "$token_path"
+temporary_token=""
 ok "wrote $token_path (mode 0600)"
 
 step "updating $config_path"
@@ -721,10 +752,12 @@ if [[ -n "$validator" ]]; then
   fi
 fi
 
-chmod "$config_mode" -- "$temporary_config"
+chmod "$config_mode" "$temporary_config"
 mv -f -- "$temporary_config" "$config_path"
 temporary_config=""
 committed="yes"
+[[ -z "$token_backup" ]] || rm -f -- "$token_backup"
+token_backup=""
 ok "updated $config_path"
 
 # ---------------------------------------------------------------------------

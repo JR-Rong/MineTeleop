@@ -51,7 +51,17 @@ for required_path in \
     exit 2
   fi
 done
-if printf '%s\n' "$entries" | awk 'tolower($0) ~ /(^|\/)(device-token|driver-password|turn-static-auth\.secret)$/ {found=1} END {exit !found}'; then
+if printf '%s\n' "$entries" | awk '
+  {
+    path = tolower($0)
+    if (path ~ /(^|\/)secrets(\/|$)/ ||
+        path ~ /(^|\/)(device-token|driver-password|turn-static-auth\.secret)$/ ||
+        path ~ /\.(password|token)$/) {
+      found = 1
+    }
+  }
+  END {exit !found}
+'; then
   printf 'bundle contains a credential file\n' >&2
   exit 2
 fi
