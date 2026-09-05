@@ -840,7 +840,9 @@ test('latest-write queue bounds heartbeat backlog and preserves a pending ESTOP'
       error => unhandled.push(error),
       () => {
         urgentWrites += 1;
-        deferred[0]?.resolve({sent: false, reason: 'control_prepare_preempted_by_estop'});
+        if (deferred[0]) {
+          deferred[0].resolve({sent: false, reason: 'control_prepare_preempted_by_estop'});
+        }
       });
 
   const first = queue.send({throttle: 0.4}, false);
