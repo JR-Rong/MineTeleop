@@ -836,6 +836,7 @@ std::string console_html(const DriverConfig& config) {
       {"estop_hold_ms", config.estop_hold_ms},
       {"max_time_sync_uncertainty_ms", config.max_time_sync_uncertainty_ms},
       {"ice_transport_policy", config.ice_transport_policy},
+      {"control_trace_commands", config.control_trace_commands},
       {"control_limits",
        {
            {"initial_target_speed_kph", config.control_limits.initial_target_speed_kph},
@@ -907,6 +908,8 @@ const gamepadState={connected:false,steering:0,throttle:0,brake:0};
 const driverActuationDefaults={target_speed_kph:limitConfig.initial_target_speed_kph,max_motor_torque_nm:limitConfig.initial_max_motor_torque_nm,max_brake_pressure_bar:limitConfig.initial_max_brake_pressure_bar,service_brake_pressure_bar:limitConfig.initial_service_brake_pressure_bar,hard_brake_pressure_bar:limitConfig.initial_hard_brake_pressure_bar,max_steering_angle_deg:limitConfig.initial_max_steering_angle_deg};
 let controlProfileState={requestedProfile:null,pendingRequestSeq:0,effectiveProfile:null,effectiveRequestSeq:0,effectiveAppliedRevision:0,acknowledged:false,reason:''},pendingControlProfileEnvelope=null,lastControlProfileSendAt=0,controlProfilePrepareInFlight=false,controlProfileGeneration=0;
 let vehicleHardLimits={received:false};
+const controlTraceEnabled=Boolean(consoleConfig.control_trace_commands),controlHeartbeatIntervalMs=50,controlTraceBuffer=[],controlTraceErrorScopes=new WeakMap();
+let controlTraceSummary=createControlTraceSummary(),controlTraceScope={session_id:'',vehicle_id:''},lastHeartbeatTraceAt=null;
 const calibration={steeringCenter:gamepadConfig.steering_center,steeringRange:gamepadConfig.steering_range,throttleRest:gamepadConfig.throttle_rest,throttleRange:gamepadConfig.throttle_range,brakeRest:gamepadConfig.brake_rest,brakeRange:gamepadConfig.brake_range};
 const webrtcLabel=document.getElementById('webrtc'),cameraGrid=document.getElementById('cameras'),statusPanel=document.getElementById('status'),loginPanel=document.getElementById('login-panel'),sessionPanel=document.getElementById('session-panel'),passwordInput=document.getElementById('password'),vehicleSelect=document.getElementById('vehicle'),connectButton=document.getElementById('connect'),authExpiry=document.getElementById('auth-expiry'),vcuPanel=document.getElementById('vcu-panel'),vcuStatus=document.getElementById('vcu-status'),vcuGate=document.getElementById('vcu-gate'),vcuConnectButton=document.getElementById('vcu-connect'),vcuDisconnectButton=document.getElementById('vcu-disconnect'),controlLimitsOpen=document.getElementById('control-limits-open'),controlLimitsSummary=document.getElementById('control-limits-summary'),controlLimitsDialog=document.getElementById('control-limits-dialog'),targetSpeedKph=document.getElementById('target-speed-kph'),maxMotorTorqueNm=document.getElementById('max-motor-torque-nm'),maxBrakePressureBar=document.getElementById('max-brake-pressure-bar'),serviceBrakePressureBar=document.getElementById('service-brake-pressure-bar'),hardBrakePressureBar=document.getElementById('hard-brake-pressure-bar'),maxSteeringDeg=document.getElementById('max-steering-deg'),speedPidKp=document.getElementById('speed-pid-kp'),speedPidKi=document.getElementById('speed-pid-ki'),speedPidKd=document.getElementById('speed-pid-kd'),speedPidDerivativeFilterTauMs=document.getElementById('speed-pid-derivative-filter-tau-ms'),speedPidMaxDtMs=document.getElementById('speed-pid-max-dt-ms'),motorTorqueRiseRate=document.getElementById('motor-torque-rise-rate'),vehicleHardLimitsLabel=document.getElementById('vehicle-hard-limits'),controlLimitsConfirm=document.getElementById('control-limits-confirm'),controlLimitsApply=document.getElementById('control-limits-apply'),controlLimitsCancel=document.getElementById('control-limits-cancel'),estopStatus=document.getElementById('estop-status'),monitorPanel=document.getElementById('monitor-panel'),alertsPanel=document.getElementById('alerts'),streamMetrics=document.getElementById('stream-metrics'),inputReadiness=document.getElementById('input-readiness'),lastKeyboardEvent=document.getElementById('last-keyboard-event'),emptyStage=document.getElementById('empty-stage');
 const canFeedbackPanel=document.getElementById('can-feedback-panel'),canFeedbackStatus=document.getElementById('can-feedback-status'),canSpeed=document.getElementById('can-speed'),canGear=document.getElementById('can-gear'),canSelector=document.getElementById('can-selector'),canEpb=document.getElementById('can-epb'),canHandshake=document.getElementById('can-handshake'),canVmcFault=document.getElementById('can-vmc-fault'),canParkingSwitch=document.getElementById('can-parking-switch'),canBrakePedal=document.getElementById('can-brake-pedal'),canEmergency=document.getElementById('can-emergency'),canAge=document.getElementById('can-age'),wheelFeedbackGrid=document.getElementById('wheel-feedback-grid'),steeringFeedbackGrid=document.getElementById('steering-feedback-grid');
@@ -914,14 +917,26 @@ const operatorSpeed=document.getElementById('operator-speed'),operatorActualGear
 const keyIndicators={left:document.getElementById('key-left'),right:document.getElementById('key-right'),up:document.getElementById('key-up'),down:document.getElementById('key-down'),service_brake:document.getElementById('key-service-brake'),hard_brake:document.getElementById('key-hard-brake')};
 const controlReadouts={gear:document.getElementById('control-gear'),steering:document.getElementById('control-steering'),throttle:document.getElementById('control-throttle'),brake:document.getElementById('control-brake')};
 const operatorControlReadouts={gear:document.getElementById('operator-control-gear'),steering:document.getElementById('operator-control-steering'),throttle:document.getElementById('operator-control-throttle'),brake:document.getElementById('operator-control-brake')};
-let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,heartbeatInFlight=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,gearRejectionInhibited=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,pendingGearTransition=null,gearTransitionGeneration=0,controlWriteActive=false,pendingControlWrite=null,lastControlStatusSeq=0;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
+let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,gearRejectionInhibited=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,lastVehicleSafetyState='',vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,pendingGearTransition=null,gearTransitionGeneration=0,lastControlStatusSeq=0,lastControlPrepareTimeoutLogAt=0,lastControlPrepareExpiredLogAt=0,activeControlPrepareAbort=null,activeControlPrepareIsEstop=false,activeControlPreparePreemptedByEstop=false;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
 let controlOutcomeSession={metrics:controlLogic.createControlOutcomeMetrics()};
 function responseError(response,body){const error=Error(body.error||response.status);error.status=response.status;return error}
 async function post(path,body={},signal=null){const options={method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)};if(signal)options.signal=signal;const r=await fetch(path,options);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 async function get(path){const r=await fetch(path);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 function clientLog(event,details={}){const entry={event,sent_at_utc_ms:Date.now(),details};console.info(JSON.stringify(entry));fetch('/api/browser-event',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(entry),keepalive:true}).catch(()=>{})}
+function createControlTraceSummary(){return{interval_started_at_utc_ms:Date.now(),heartbeat_tick_count:0,heartbeat_enqueued_count:0,heartbeat_coalesced_count:0,timer_lag_sample_count:0,timer_lag_total_ms:0,timer_lag_max_ms:0,explicit_send_count:0,backpressure_count:0,max_buffered_amount_bytes:0,prepare_timeout_count:0,prepare_expired_count:0,prepare_preempted_by_estop_count:0,queue_unhandled_error_count:0}}
+function noteControlHeartbeat(now){if(!controlTraceEnabled)return;controlTraceSummary.heartbeat_tick_count++;if(lastHeartbeatTraceAt!==null){const lag=Math.max(0,now-lastHeartbeatTraceAt-controlHeartbeatIntervalMs);controlTraceSummary.timer_lag_sample_count++;controlTraceSummary.timer_lag_total_ms+=lag;controlTraceSummary.timer_lag_max_ms=Math.max(controlTraceSummary.timer_lag_max_ms,lag)}lastHeartbeatTraceAt=now}
+function noteControlBackpressure(bufferedAmount){if(!controlTraceEnabled)return;const bytes=Math.max(0,Number(bufferedAmount)||0);controlTraceSummary.backpressure_count++;controlTraceSummary.max_buffered_amount_bytes=Math.max(controlTraceSummary.max_buffered_amount_bytes,bytes)}
+function setControlTraceScope(sessionId='',vehicleId=''){if(!controlTraceEnabled)return;const next={session_id:String(sessionId||''),vehicle_id:String(vehicleId||'')};if(next.session_id===controlTraceScope.session_id&&next.vehicle_id===controlTraceScope.vehicle_id)return;if(controlTraceScope.session_id||controlTraceScope.vehicle_id)flushControlTrace('session_scope_change');controlTraceScope=next}
+function sameControlTraceScope(scope){return Boolean(scope)&&String(scope.session_id||'')===controlTraceScope.session_id&&String(scope.vehicle_id||'')===controlTraceScope.vehicle_id}
+function emitControlTraceBatch(reason,scope,commands,summary,sampleTransport=true){const samples=summary.timer_lag_sample_count;summary.interval_ended_at_utc_ms=Date.now();summary.timer_lag_average_ms=samples?summary.timer_lag_total_ms/samples:0;summary.peer_connection_state=sampleTransport?(peer?.connectionState||'none'):null;summary.data_channel_ready_state=sampleTransport?(controlChannel?.readyState||'none'):null;summary.data_channel_buffered_amount_bytes=sampleTransport?Math.max(0,Number(controlChannel?.bufferedAmount)||0):null;clientLog('control_trace_batch',{reason,trace_session_id:String(scope&&scope.session_id||''),trace_vehicle_id:String(scope&&scope.vehicle_id||''),commands,summary})}
+function noteScopedControlTraceCounter(field,scope){if(!controlTraceEnabled)return;if(sameControlTraceScope(scope)){controlTraceSummary[field]++;return}const summary=createControlTraceSummary();summary[field]=1;emitControlTraceBatch(`late_${field}`,scope,[],summary,false)}
+function queueTerminalControlTrace(outcome,command,trace){if(!controlTraceEnabled||!trace)return;const seq=Number(command&&command.seq);if(!Number.isSafeInteger(seq)||seq<=0)return;const scope={session_id:String(command&&command.session_id||trace.scope&&trace.scope.session_id||''),vehicle_id:String(command&&command.vehicle_id||trace.scope&&trace.scope.vehicle_id||'')},item={session_id:scope.session_id,seq,browser_prepare_started_at_utc_ms:trace.browserPrepareStartedAtUtcMs,native_command_sent_at_utc_ms:Number(command&&command.sent_at_utc_ms)||null,prepare_elapsed_ms:trace.prepareElapsedMs,data_channel_send_invoked_at_utc_ms:trace.dataChannelSendInvokedAtUtcMs,buffered_amount_bytes:trace.bufferedAmountBytes,outcome,browser_terminal_at_utc_ms:Date.now(),estop:Boolean(trace.estop)};if(!sameControlTraceScope(scope)){const summary=createControlTraceSummary();summary.interval_started_at_utc_ms=Number(trace.browserPrepareStartedAtUtcMs)||summary.interval_started_at_utc_ms;emitControlTraceBatch('late_terminal',scope,[item],summary,false);return}controlTraceBuffer.push(item);if(controlTraceBuffer.length>=48)flushControlTrace('capacity')}
+function flushControlTrace(reason='interval'){if(!controlTraceEnabled)return false;const summary=controlTraceSummary,scope=controlTraceScope,commands=controlTraceBuffer.splice(0,controlTraceBuffer.length),hasActivity=commands.length||summary.heartbeat_tick_count||summary.explicit_send_count||summary.backpressure_count||summary.prepare_timeout_count||summary.prepare_expired_count||summary.prepare_preempted_by_estop_count||summary.queue_unhandled_error_count;controlTraceSummary=createControlTraceSummary();if(!hasActivity)return false;emitControlTraceBatch(reason,scope,commands,summary);return true}
+function recordTerminalControlOutcome(outcome,command,session,trace,details={}){recordControlOutcome(outcome,command,session,details);queueTerminalControlTrace(outcome,command,trace)}
 function resetControlOutcomeSession(){controlOutcomeSession={metrics:controlLogic.createControlOutcomeMetrics()}}
-function recordControlOutcome(outcome,command,session=controlOutcomeSession){const sequence=Number(command&&command.seq);session.metrics=controlLogic.reduceControlOutcome(session.metrics,outcome,sequence);if(controlLogic.shouldLogControlOutcome(outcome))clientLog('control_command_browser_outcome',{session_id:String(command&&command.session_id||''),vehicle_id:String(command&&command.vehicle_id||''),outcome,control_seq:sequence,...session.metrics})}
+function recordControlOutcome(outcome,command,session=controlOutcomeSession,details={}){const sequence=Number(command&&command.seq);session.metrics=controlLogic.reduceControlOutcome(session.metrics,outcome,sequence);if(controlLogic.shouldLogControlOutcome(outcome))clientLog('control_command_browser_outcome',{session_id:String(command&&command.session_id||''),vehicle_id:String(command&&command.vehicle_id||''),outcome,control_seq:sequence,...session.metrics,...details})}
+function controlPrepareDeadlineMs(){return controlLogic.controlPrepareDeadlineMs(vehicleHardLimits?.read_only_control_safety?.max_command_gap_ms)}
+function logControlPrepareFailure(event,details){const now=Date.now(),last=event==='control_prepare_timeout'?lastControlPrepareTimeoutLogAt:lastControlPrepareExpiredLogAt;if(now-last<1000)return;if(event==='control_prepare_timeout')lastControlPrepareTimeoutLogAt=now;else lastControlPrepareExpiredLogAt=now;clientLog(event,details)}
 function hasTurnServer(){return iceServers.some(server=>String(server.urls||'').includes('turn:')||(Array.isArray(server.urls)&&server.urls.some(url=>String(url).startsWith('turn:'))))}
 function safeIceEndpoint(value){const match=String(value||'').match(/^([a-z]+):(?:\/\/)?(?:[^@]*@)?(\[[^\]]+\]|[^:?/]+)(?::(\d+))?/i);return match?`${match[1].toLowerCase()}:${match[2]}${match[3]?`:${match[3]}`:''}`:'unknown'}
 function setMetric(id,text,level=''){const element=document.getElementById(id);element.textContent=text;element.classList.remove('ok','warn','critical');if(level)element.classList.add(level)}
@@ -1038,13 +1053,14 @@ function vcuStateKeepsHeldInput(value=vcuHandshake){return controlLogic.keepsHel
 function acceptControlStatusMessage(message){const decision=controlLogic.reduceStatusSequence(lastControlStatusSeq,message?.control_status_seq);if(!decision.accepted){const sequence=Number(message?.control_status_seq);clientLog('control_status_message_dropped',{event:message?.event||'unknown',control_status_seq:Number.isFinite(sequence)?sequence:null,last_control_status_seq:lastControlStatusSeq});return false}if(decision.gap>0)clientLog('control_status_sequence_gap',{event:message?.event||'unknown',control_status_seq:decision.lastSequence,last_control_status_seq:lastControlStatusSeq,missing_status_count:decision.gap});lastControlStatusSeq=decision.lastSequence;return true}
 function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}
 function updateVcuHandshakeState(value){const transition=controlLogic.transitionVcuState(vcuEverReady,value);vcuHandshake=value;vcuEverReady=transition.everReady;if(transition.resetInput)resetControlAuthorityInput()}
+function applyVehicleSafetyState(value){const next=String(value||'');if(next==='DEGRADED'){clearControlInput(false);if(lastVehicleSafetyState!=='DEGRADED'){lastKeyboardEvent.textContent='控制命令短暂中断，输入已清除 · 请释放后重新按下';statusPanel.textContent='车端进入可恢复降级：牵引已清零；请释放控制键后重新按下';clientLog('driver_input_cleared_on_degraded',{previous_safety_state:lastVehicleSafetyState||null})}}lastVehicleSafetyState=next}
 function suspendSignalingPoll(){const generation=++signalingGeneration;polling=false;if(signalingPollAbort){signalingPollAbort.abort();signalingPollAbort=null}return generation}
-function closeRealtimeSession(){const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
+function closeRealtimeSession(){flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;lastVehicleSafetyState='';vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
 function renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason)){estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner}
-function latchEstop(source){if(estopLatched)return;estopLatched=true;clientLog('control_estop_request_latched',{source});renderEstopRequest();renderMonitoring()}
+function latchEstop(source){if(estopLatched)return false;estopLatched=true;clientLog('control_estop_request_latched',{source});renderEstopRequest();renderMonitoring();return true}
 function firstConnectedGamepad(){const pads=navigator.getGamepads?navigator.getGamepads():[];if(activeGamepadIndex!==null&&pads[activeGamepadIndex]?.connected)return pads[activeGamepadIndex];for(const pad of pads)if(pad?.connected){activeGamepadIndex=pad.index;return pad}activeGamepadIndex=null;return null}
 function applyGamepadNeutralInterlock(authorityReady,gearRequestPending=false){const next=controlLogic.reduceGamepadNeutralInterlock({requiresNeutral:gamepadRequiresNeutral,authorityReady,throttle:gamepadState.throttle,brake:gamepadState.brake,gearRequestPending});gamepadRequiresNeutral=next.requiresNeutral;gamepadState.throttle=next.throttle;gamepadState.brake=next.brake;return next}
-function sampleGamepad(){if(!gamepadConfig.enabled||document.hidden||!document.hasFocus()){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}const pad=firstConnectedGamepad();if(!pad){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}gamepadState.connected=true;const standard=pad.mapping==='standard';if(standard){const steering=axisValue(pad,0);let steeringValue=steering===null?0:(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);gamepadState.throttle=clamp(applyPedalDeadzone(buttonValue(pad,7)),0,1);gamepadState.brake=clamp(applyPedalDeadzone(buttonValue(pad,6)),0,1)}else{const steering=axisValue(pad,gamepadConfig.steering_axis),throttle=axisValue(pad,gamepadConfig.throttle_axis),brake=axisValue(pad,gamepadConfig.brake_axis);if(steering===null||throttle===null||brake===null){gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}let steeringValue=(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);const throttleDelta=gamepadConfig.throttle_inverted?calibration.throttleRest-throttle:throttle-calibration.throttleRest;const brakeDelta=gamepadConfig.brake_inverted?calibration.brakeRest-brake:brake-calibration.brakeRest;gamepadState.throttle=clamp(applyPedalDeadzone(throttleDelta/calibration.throttleRange),0,1);gamepadState.brake=clamp(applyPedalDeadzone(brakeDelta/calibration.brakeRange),0,1)}const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported();applyGamepadNeutralInterlock(gamepadAuthorityReady);if(gamepadState.throttle>0&&selectedGear==='N'){const nextGear=updateSelectedGearFromInput({up:true,down:false});if(nextGear.pendingGearRequest)applyGamepadNeutralInterlock(gamepadAuthorityReady,true)}const estopPressed=buttonValue(pad,gamepadConfig.estop_button)>=0.5;if(estopPressed){if(!gamepadEstopPressedAt)gamepadEstopPressedAt=performance.now();if(performance.now()-gamepadEstopPressedAt>=consoleConfig.estop_hold_ms)latchEstop('Gamepad')}else gamepadEstopPressedAt=0;renderControlState()}
+function sampleGamepad(){if(!gamepadConfig.enabled||document.hidden||!document.hasFocus()){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}const pad=firstConnectedGamepad();if(!pad){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}gamepadState.connected=true;const standard=pad.mapping==='standard';if(standard){const steering=axisValue(pad,0);let steeringValue=steering===null?0:(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);gamepadState.throttle=clamp(applyPedalDeadzone(buttonValue(pad,7)),0,1);gamepadState.brake=clamp(applyPedalDeadzone(buttonValue(pad,6)),0,1)}else{const steering=axisValue(pad,gamepadConfig.steering_axis),throttle=axisValue(pad,gamepadConfig.throttle_axis),brake=axisValue(pad,gamepadConfig.brake_axis);if(steering===null||throttle===null||brake===null){gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}let steeringValue=(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);const throttleDelta=gamepadConfig.throttle_inverted?calibration.throttleRest-throttle:throttle-calibration.throttleRest;const brakeDelta=gamepadConfig.brake_inverted?calibration.brakeRest-brake:brake-calibration.brakeRest;gamepadState.throttle=clamp(applyPedalDeadzone(throttleDelta/calibration.throttleRange),0,1);gamepadState.brake=clamp(applyPedalDeadzone(brakeDelta/calibration.brakeRange),0,1)}const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported();applyGamepadNeutralInterlock(gamepadAuthorityReady);if(gamepadState.throttle>0&&selectedGear==='N'){const nextGear=updateSelectedGearFromInput({up:true,down:false});if(nextGear.pendingGearRequest)applyGamepadNeutralInterlock(gamepadAuthorityReady,true)}const estopPressed=buttonValue(pad,gamepadConfig.estop_button)>=0.5;if(estopPressed){if(!gamepadEstopPressedAt)gamepadEstopPressedAt=performance.now();if(performance.now()-gamepadEstopPressedAt>=consoleConfig.estop_hold_ms&&latchEstop('Gamepad'))send({estop:true},false).catch(console.error)}else gamepadEstopPressedAt=0;renderControlState()}
 function currentControl(extra={}){return controlLogic.deriveControl({keyState:state,gamepad:gamepadState,selectedGear,limits:effectiveControlLimits(),steeringFullScaleDeg:limitConfig.steering_full_scale_deg,estop:estopLatched||Boolean(extra.estop)})}
 function setControlReadout(name,text,active=false){for(const element of [controlReadouts[name],operatorControlReadouts[name]]){element.textContent=text;element.parentElement?.classList.toggle('active',active)}}
 function renderControlState(){
@@ -1063,7 +1079,7 @@ async function login(){const password=passwordInput.value;if(!password)throw Err
 async function refreshVehicles(){if(!authenticated)return;const result=await get('/api/vehicles');renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);if(result.signaling_available===false){controlAuthorityLost=true;resetControlAuthorityInput();connectButton.disabled=true;statusPanel.textContent='信令服务暂时不可用；车辆列表为安全快照，禁止建立控制会话';renderMonitoring();return}if(result.signaling_restart_recovered){closeRealtimeSession();controlAuthorityLost=true;latestRuntimeStatus=await get('/api/status');connectButton.textContent='连接所选车辆';webrtcLabel.textContent='服务已恢复，需重新建立控制会话';statusPanel.textContent='信令服务已重启，驾驶员身份已自动恢复；旧控制权未恢复，请重新选择车辆';clientLog('signaling_restart_recovered',{previous_service_instance_id:result.previous_service_instance_id,service_instance_id:result.service_instance_id,control_authority_recovered:false});renderMonitoring()}}
 function sendVcuHandshakeCommand(action){if(!controlChannel||controlChannel.readyState!=='open')throw Error('控制 DataChannel 尚未连接');if(action==='connect'&&!controlProfileState.acknowledged)throw Error('会话控制参数尚未获得车端确认');if(vcuHandshake.adapter_ready!==true)throw Error('VCU 适配器尚未就绪');if(!['connect','disconnect'].includes(action))throw Error('VCU 握手命令非法');if(action==='disconnect'){resetControlAuthorityInput();vcuHandshake={...vcuHandshake,ready:false,disarming:true}}else{gearRejectionInhibited=false;vcuHandshake={...vcuHandshake,requested:true}}renderMonitoring();controlChannel.send(JSON.stringify({event:'vcu_handshake_command',action,sent_at_utc_ms:Date.now()}));clientLog('driver_vcu_handshake_command',{action});statusPanel.textContent=action==='connect'?'已请求开始 VCU 平行驾驶握手':'已请求安全断开 VCU 握手'}
 async function writeControl(extra,announceUnavailable){
-  const activePeer=peer,activeChannel=controlChannel,outcomeSession=controlOutcomeSession;
+  const activePeer=peer,activeChannel=controlChannel,outcomeSession=controlOutcomeSession,writeTraceScope=controlTraceEnabled?{...controlTraceScope}:null;
   if(controlAuthorityLost||!activePeer||activePeer.connectionState!=='connected'||!activeChannel||activeChannel.readyState!=='open'){
     resetControlAuthorityInput();
     if(announceUnavailable)webrtcLabel.textContent=controlAuthorityLost?'控制权丢失':'控制链路中断';
@@ -1096,6 +1112,7 @@ async function writeControl(extra,announceUnavailable){
     // confirmed gear and any in-flight transition so recovery cannot invent an
     // unrelated N request whose rejection has no matching transaction.
     clearControlInput(false);
+    noteControlBackpressure(activeChannel.bufferedAmount);
     webrtcLabel.textContent='控制链路拥塞，输入已清除';
     return{sent:false,reason:'buffered_amount_limit'};
   }
@@ -1104,18 +1121,29 @@ async function writeControl(extra,announceUnavailable){
   const outgoingSnapshot=controlLogic.controlSnapshot(outgoing);
   const outgoingGearTransitionGeneration=!estopRequested&&pendingGearTransition?pendingGearTransition.generation:0;
   let prepared;
-  try{prepared=await post('/api/control',outgoing)}catch(error){
+  const prepareStartedAt=performance.now(),prepareStartedAtUtcMs=Date.now(),prepareDeadlineMs=controlPrepareDeadlineMs(),controlPrepareAbort=new AbortController(),prepareTimer=setTimeout(()=>controlPrepareAbort.abort(),prepareDeadlineMs),commandTrace=controlTraceEnabled?{scope:writeTraceScope,browserPrepareStartedAtUtcMs:prepareStartedAtUtcMs,prepareElapsedMs:null,dataChannelSendInvokedAtUtcMs:null,bufferedAmountBytes:Math.max(0,Number(activeChannel.bufferedAmount)||0),estop:estopRequested}:null;
+  activeControlPrepareAbort=controlPrepareAbort;activeControlPrepareIsEstop=estopRequested;
+  try{prepared=await post('/api/control',outgoing,controlPrepareAbort.signal)}catch(error){
+    if(error.name==='AbortError'){
+      clearControlInput(false);
+      if(activeControlPreparePreemptedByEstop&&!estopRequested){noteScopedControlTraceCounter('prepare_preempted_by_estop_count',writeTraceScope);clientLog('control_prepare_preempted_by_estop',{trace_session_id:writeTraceScope?.session_id||null,trace_vehicle_id:writeTraceScope?.vehicle_id||null,elapsed_ms:Math.ceil(performance.now()-prepareStartedAt),deadline_ms:prepareDeadlineMs});return{sent:false,reason:'control_prepare_preempted_by_estop'}}
+      noteScopedControlTraceCounter('prepare_timeout_count',writeTraceScope);
+      logControlPrepareFailure('control_prepare_timeout',{trace_session_id:writeTraceScope?.session_id||null,trace_vehicle_id:writeTraceScope?.vehicle_id||null,elapsed_ms:Math.ceil(performance.now()-prepareStartedAt),deadline_ms:prepareDeadlineMs,estop:estopRequested});
+      return{sent:false,reason:estopRequested?'estop_prepare_timeout':'control_prepare_timeout'};
+    }
     if([401,403,409].includes(error.status)){controlAuthorityLost=true;resetControlAuthorityInput();resetControlProfileSession()}
+    if(controlTraceEnabled&&error&&typeof error==='object')controlTraceErrorScopes.set(error,writeTraceScope);
     throw error;
-  }
+  }finally{clearTimeout(prepareTimer);if(activeControlPrepareAbort===controlPrepareAbort){activeControlPrepareAbort=null;activeControlPrepareIsEstop=false;activeControlPreparePreemptedByEstop=false}}
+  if(commandTrace)commandTrace.prepareElapsedMs=Math.ceil(performance.now()-prepareStartedAt);
   recordControlOutcome('prepared',prepared.command,outcomeSession);
   if(controlAuthorityLost||peer!==activePeer||controlChannel!==activeChannel||activePeer.connectionState!=='connected'||activeChannel.readyState!=='open'){
-    recordControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession);
+    recordTerminalControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession,commandTrace);
     resetControlAuthorityInput();
     return{sent:false,reason:'control_link_changed'};
   }
   if(estopRequested&&vcuHandshake.adapter_ready===false){
-    recordControlOutcome('post_prepare_vcu_not_ready',prepared.command,outcomeSession);
+    recordTerminalControlOutcome('post_prepare_vcu_not_ready',prepared.command,outcomeSession,commandTrace);
     resetControlAuthorityInput();
     if(announceUnavailable)statusPanel.textContent='VCU 适配器明确不可用，远程急停未发送；请使用车辆物理急停';
     return{sent:false,reason:'vcu_adapter_unavailable'};
@@ -1123,7 +1151,7 @@ async function writeControl(extra,announceUnavailable){
   const stillVcuReady=vcuDrivingReady(),stillRetainedWait=vcuHandshake.adapter_ready===true&&vcuStateKeepsHeldInput(vcuHandshake);
   if(!stillVcuReady&&!estopRequested){
     if(!stillRetainedWait||!retainedWait){
-      recordControlOutcome('post_prepare_vcu_not_ready',prepared.command,outcomeSession);
+      recordTerminalControlOutcome('post_prepare_vcu_not_ready',prepared.command,outcomeSession,commandTrace);
       if(vcuHandshake.adapter_ready!==true||vcuStateRequiresFreshInput(vcuHandshake))resetControlAuthorityInput();
       return{sent:false,reason:'vcu_handshake_not_ready'};
     }
@@ -1131,27 +1159,38 @@ async function writeControl(extra,announceUnavailable){
   const latestOutgoing=currentControl(extra);
   if(stillRetainedWait&&!estopRequested)latestOutgoing.throttle=0;
   if(controlLogic.controlIntentSuperseded(outgoingSnapshot,latestOutgoing)){
-    recordControlOutcome('superseded',prepared.command,outcomeSession);
+    recordTerminalControlOutcome('superseded',prepared.command,outcomeSession,commandTrace);
     return{sent:false,reason:'control_intent_superseded'};
   }
+  const preparedAgeMs=Math.ceil(performance.now()-prepareStartedAt);
+  if(!estopRequested&&preparedAgeMs>=prepareDeadlineMs){
+    clearControlInput(false);
+    noteScopedControlTraceCounter('prepare_expired_count',writeTraceScope);
+    recordTerminalControlOutcome('expired_before_forward',prepared.command,outcomeSession,commandTrace,{prepared_age_ms:preparedAgeMs,deadline_ms:prepareDeadlineMs});
+    logControlPrepareFailure('control_command_expired_before_forward',{trace_session_id:writeTraceScope?.session_id||null,trace_vehicle_id:writeTraceScope?.vehicle_id||null,prepared_age_ms:preparedAgeMs,deadline_ms:prepareDeadlineMs});
+    return{sent:false,reason:'control_command_expired_before_forward'};
+  }
+  if(commandTrace){commandTrace.dataChannelSendInvokedAtUtcMs=Date.now();commandTrace.bufferedAmountBytes=Math.max(0,Number(activeChannel.bufferedAmount)||0)}
   try{activeChannel.send(JSON.stringify(prepared.command))}catch(error){
-    recordControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession);
+    recordTerminalControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession,commandTrace);
     resetControlAuthorityInput();
+    if(controlTraceEnabled&&error&&typeof error==='object')controlTraceErrorScopes.set(error,writeTraceScope);
     throw error;
   }
   pendingGearTransition=controlLogic.recordForwardedGearCommand(pendingGearTransition,outgoingGearTransitionGeneration,prepared.command?.seq,outgoingSnapshot.gear);
-  recordControlOutcome('forwarded',prepared.command,outcomeSession);
+  recordTerminalControlOutcome('forwarded',prepared.command,outcomeSession,commandTrace);
   if(webrtcLabel.textContent==='控制链路拥塞，输入已清除')webrtcLabel.textContent='控制链路已连接';
   return{...prepared,delivery_state:'browser_data_channel_send_invoked'};
 }
-function enqueueControlWrite(extra,announceUnavailable){return new Promise((resolve,reject)=>{if(pendingControlWrite){pendingControlWrite.extra={...pendingControlWrite.extra,...extra,estop:Boolean(pendingControlWrite.extra.estop||extra.estop)};pendingControlWrite.announceUnavailable=pendingControlWrite.announceUnavailable||announceUnavailable;pendingControlWrite.waiters.push({resolve,reject})}else pendingControlWrite={extra:{...extra},announceUnavailable,waiters:[{resolve,reject}]};drainControlWrites().catch(console.error)})}
-async function drainControlWrites(){if(controlWriteActive)return;controlWriteActive=true;try{while(pendingControlWrite){const request=pendingControlWrite;pendingControlWrite=null;try{const result=await writeControl(request.extra,request.announceUnavailable);for(const waiter of request.waiters)waiter.resolve(result)}catch(error){for(const waiter of request.waiters)waiter.reject(error)}}}finally{controlWriteActive=false;if(pendingControlWrite)drainControlWrites().catch(console.error)}}
-async function send(extra={},announceUnavailable=true){return enqueueControlWrite(extra,announceUnavailable)}
-async function heartbeat(){if(!polling||heartbeatInFlight)return;heartbeatInFlight=true;try{sampleGamepad();sendPendingControlProfile();await send({},false)}finally{heartbeatInFlight=false}}
+function reportControlQueueError(error){if(controlTraceEnabled)noteScopedControlTraceCounter('queue_unhandled_error_count',error&&typeof error==='object'?(controlTraceErrorScopes.get(error)||controlTraceScope):controlTraceScope);console.error(error)}
+const controlWriteQueue=controlLogic.createLatestControlWriteQueue(writeControl,reportControlQueueError,()=>{if(activeControlPrepareAbort&&!activeControlPrepareIsEstop){activeControlPreparePreemptedByEstop=true;activeControlPrepareAbort.abort()}});
+function enqueueControlHeartbeat(){return controlWriteQueue.enqueueHeartbeat()}
+async function send(extra={},announceUnavailable=true){if(controlTraceEnabled)controlTraceSummary.explicit_send_count++;return controlWriteQueue.send(extra,announceUnavailable)}
+async function heartbeat(){const now=performance.now();if(!polling){lastHeartbeatTraceAt=null;return}noteControlHeartbeat(now);sampleGamepad();sendPendingControlProfile();const enqueued=enqueueControlHeartbeat();if(controlTraceEnabled){if(enqueued)controlTraceSummary.heartbeat_enqueued_count++;else controlTraceSummary.heartbeat_coalesced_count++}}
 function advertisedCodecs(){const caps=RTCRtpReceiver.getCapabilities&&RTCRtpReceiver.getCapabilities('video');const found=new Set(['h264']);for(const c of (caps&&caps.codecs)||[]){const m=(c.mimeType||'').toLowerCase();if(m.includes('h265')||m.includes('hevc'))found.add('h265');if(m.includes('h264')||m.includes('avc'))found.add('h264')}return [...found]}
-async function connect(){if(connecting)return;const target=vehicleSelect.value;if(!target)throw Error('没有可连接的在线车辆');const fromVehicle=latestRuntimeStatus.connected?latestRuntimeStatus.vehicle_id:'';if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}const changingVehicle=Boolean(fromVehicle)&&fromVehicle!==target;const reconnecting=Boolean(fromVehicle)&&fromVehicle===target;const hadRealtime=polling;let suspendedGeneration=signalingGeneration;if((changingVehicle||reconnecting)&&hadRealtime){suspendedGeneration=suspendSignalingPoll();clearControlInput()}connecting=true;connectButton.disabled=true;if(changingVehicle){webrtcLabel.textContent='正在安全切换车辆';statusPanel.textContent=`正在验证 ${target}，成功后释放 ${fromVehicle}`;clientLog('driver_vehicle_switch_started',{from_vehicle_id:fromVehicle,to_vehicle_id:target})}let session=null,generation=signalingGeneration;try{session=await post('/api/connect',{vehicle_id:target});generation=closeRealtimeSession();controlAuthorityLost=true;const ice=await post('/api/webrtc/ice-servers');iceServers=ice.ice_servers||[];await post('/api/webrtc/capabilities',{codecs:advertisedCodecs()});polling=true;controlAuthorityLost=false;latestRuntimeStatus=await get('/api/status');webrtcLabel.textContent='等待车端媒体';statusPanel.textContent=`会话 ${session.session_id} · ${session.vehicle_id}`;connectButton.textContent='切换所选车辆';document.querySelector('main').focus();renderMonitoring();clientLog(changingVehicle?'driver_vehicle_switched':(reconnecting?'driver_session_reconnected':'driver_session_connected'),{from_vehicle_id:fromVehicle||undefined,session_id:session.session_id,vehicle_id:session.vehicle_id});pollSignaling(generation)}catch(error){if(session)await post('/api/end-session',{reason:'driver_connect_setup_failed'}).catch(()=>{});latestRuntimeStatus=await get('/api/status').catch(()=>({connected:false}));const retained=Boolean(!session&&latestRuntimeStatus.connected&&hadRealtime);if(retained){polling=true;controlAuthorityLost=false;webrtcLabel.textContent=controlChannel&&controlChannel.readyState==='open'?'控制链路已连接':'当前会话已保留';statusPanel.textContent=`切换失败，当前会话已保留: ${error.message}`;clientLog('driver_vehicle_switch_rejected',{from_vehicle_id:fromVehicle,to_vehicle_id:target,error:error.message});pollSignaling(suspendedGeneration)}else{controlAuthorityLost=Boolean(latestRuntimeStatus.connected)}connectButton.textContent=latestRuntimeStatus.connected?'切换所选车辆':'连接所选车辆';renderMonitoring();if(!retained)throw error}finally{connecting=false;connectButton.disabled=!vehicleSelect.value}}
+async function connect(){if(connecting)return;const target=vehicleSelect.value;if(!target)throw Error('没有可连接的在线车辆');const fromVehicle=latestRuntimeStatus.connected?latestRuntimeStatus.vehicle_id:'';if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}const changingVehicle=Boolean(fromVehicle)&&fromVehicle!==target;const reconnecting=Boolean(fromVehicle)&&fromVehicle===target;const hadRealtime=polling;let suspendedGeneration=signalingGeneration;if((changingVehicle||reconnecting)&&hadRealtime){suspendedGeneration=suspendSignalingPoll();clearControlInput()}connecting=true;connectButton.disabled=true;if(changingVehicle){webrtcLabel.textContent='正在安全切换车辆';statusPanel.textContent=`正在验证 ${target}，成功后释放 ${fromVehicle}`;clientLog('driver_vehicle_switch_started',{from_vehicle_id:fromVehicle,to_vehicle_id:target})}let session=null,generation=signalingGeneration;try{session=await post('/api/connect',{vehicle_id:target});generation=closeRealtimeSession();setControlTraceScope(session.session_id,session.vehicle_id);controlAuthorityLost=true;const ice=await post('/api/webrtc/ice-servers');iceServers=ice.ice_servers||[];await post('/api/webrtc/capabilities',{codecs:advertisedCodecs()});polling=true;controlAuthorityLost=false;latestRuntimeStatus=await get('/api/status');webrtcLabel.textContent='等待车端媒体';statusPanel.textContent=`会话 ${session.session_id} · ${session.vehicle_id}`;connectButton.textContent='切换所选车辆';document.querySelector('main').focus();renderMonitoring();clientLog(changingVehicle?'driver_vehicle_switched':(reconnecting?'driver_session_reconnected':'driver_session_connected'),{from_vehicle_id:fromVehicle||undefined,session_id:session.session_id,vehicle_id:session.vehicle_id});pollSignaling(generation)}catch(error){if(session){flushControlTrace('connect_setup_failed');controlTraceScope={session_id:'',vehicle_id:''};await post('/api/end-session',{reason:'driver_connect_setup_failed'}).catch(()=>{})}latestRuntimeStatus=await get('/api/status').catch(()=>({connected:false}));const retained=Boolean(!session&&latestRuntimeStatus.connected&&hadRealtime);if(retained){polling=true;controlAuthorityLost=false;webrtcLabel.textContent=controlChannel&&controlChannel.readyState==='open'?'控制链路已连接':'当前会话已保留';statusPanel.textContent=`切换失败，当前会话已保留: ${error.message}`;clientLog('driver_vehicle_switch_rejected',{from_vehicle_id:fromVehicle,to_vehicle_id:target,error:error.message});pollSignaling(suspendedGeneration)}else{controlAuthorityLost=Boolean(latestRuntimeStatus.connected)}connectButton.textContent=latestRuntimeStatus.connected?'切换所选车辆':'连接所选车辆';renderMonitoring();if(!retained)throw error}finally{connecting=false;connectButton.disabled=!vehicleSelect.value}}
 async function logout(){const estopConfirmed=vehicleTelemetry?.estop===true;closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='正在释放控制权';await post('/api/disconnect',{reason:'driver_safe_logout'});authenticated=false;controlAuthorityLost=false;connectButton.textContent='连接所选车辆';renderAuthExpiry(0);sessionPanel.hidden=true;vcuPanel.hidden=true;canFeedbackPanel.hidden=true;monitorPanel.hidden=true;loginPanel.hidden=false;webrtcLabel.textContent='未连接';statusPanel.textContent=estopLatched?(estopConfirmed?'已安全退出；车辆急停已确认，仍需本地确认复位':'已安全退出；急停请求未获车端确认，请在车辆本地核实'):'已安全退出';clientLog('driver_safe_logout',{estop_request_latched:estopLatched,estop_confirmed:estopConfirmed})}
-addEventListener('pagehide',()=>{closeRealtimeSession();if(authenticated)fetch('/api/disconnect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({reason:'browser_page_closed'}),keepalive:true}).catch(()=>{})});
+addEventListener('pagehide',()=>{flushControlTrace('pagehide');closeRealtimeSession();if(authenticated)fetch('/api/disconnect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({reason:'browser_page_closed'}),keepalive:true}).catch(()=>{})});
 function neutralizeInput(){clearControlInput(false);send({},false).catch(console.error)}
 addEventListener('blur',neutralizeInput);document.addEventListener('visibilitychange',()=>{if(document.hidden)neutralizeInput()});
 document.querySelector('#login').onclick=()=>login().catch(e=>{statusPanel.textContent='登录失败: '+e.message});
@@ -1182,6 +1221,7 @@ async function startFromOffer(offer){
   resetControlProfileSession();
   lastControlStatusSeq=0;
   vehicleTelemetry=null;
+  lastVehicleSafetyState='';
   vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};
   resetControlAuthorityInput();
   cameraGrid.replaceChildren();
@@ -1201,12 +1241,17 @@ async function startFromOffer(offer){
     const connectionState=nextPeer.connectionState;
     webrtcLabel.textContent=connectionState;
     if(connectionState==='disconnected'){
+      lastVehicleSafetyState='';
       resetControlAuthorityInput();
       resetControlProfileSession();
       clientLog('webrtc_peer_disconnected');
     }
     if(['failed','closed'].includes(connectionState)){
-      controlChannel=null;
+      const terminalChannel=controlChannel;
+      flushControlTrace(`peer_${connectionState}`);
+      clientLog('webrtc_peer_terminal',{connection_state:connectionState,trace_session_id:controlTraceScope.session_id||null,trace_vehicle_id:controlTraceScope.vehicle_id||null,data_channel_ready_state:terminalChannel?.readyState||'none',buffered_amount_bytes:Math.max(0,Number(terminalChannel?.bufferedAmount)||0)});
+      if(controlChannel===terminalChannel)controlChannel=null;
+      lastVehicleSafetyState='';
       resetControlAuthorityInput();
       resetControlProfileSession();
     }
@@ -1232,6 +1277,7 @@ async function startFromOffer(offer){
       webrtcLabel.textContent='控制链路已连接';
       resetControlAuthorityInput();
       resetControlProfileSession();
+      lastVehicleSafetyState='';
       vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:true,adapter_ready:null};
       clientLog('control_datachannel_open');
       renderMonitoring();
@@ -1271,6 +1317,7 @@ async function startFromOffer(offer){
           renderEstopRequest();
           applyControlProfileStatus(message.session_control_profile);
           updateVehicleHardLimits(message.control_limits);
+          applyVehicleSafetyState(message.safety_state);
           renderMonitoring();
           return;
         }
@@ -1291,10 +1338,12 @@ async function startFromOffer(offer){
     };
     channel.onclose=()=>{
       if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
+      flushControlTrace('datachannel_close');
       controlChannel=null;
       resetControlAuthorityInput();
       resetControlProfileSession();
       vehicleTelemetry=null;
+      lastVehicleSafetyState='';
       vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};
       webrtcLabel.textContent='控制链路中断';
       clientLog('control_datachannel_closed');
@@ -1302,8 +1351,11 @@ async function startFromOffer(offer){
     };
     channel.onerror=()=>{
       if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
+      flushControlTrace('datachannel_error');
+      clientLog('control_datachannel_error',{ready_state:channel.readyState,buffered_amount_bytes:Math.max(0,Number(channel.bufferedAmount)||0),peer_connection_state:nextPeer.connectionState});
       resetControlAuthorityInput();
       resetControlProfileSession();
+      lastVehicleSafetyState='';
       webrtcLabel.textContent='控制链路错误';
       renderMonitoring();
     };
@@ -1344,7 +1396,8 @@ async function collectMetrics(){
 }
 setInterval(()=>collectMetrics().catch(console.error),1000);
 setInterval(()=>refreshRuntimeStatus().catch(console.error),1000);
-setInterval(()=>heartbeat().catch(console.error),50);
+setInterval(()=>flushControlTrace('interval'),1000);
+setInterval(()=>heartbeat().catch(console.error),controlHeartbeatIntervalMs);
 setInterval(()=>{if(authenticated&&!connecting)refreshVehicles().catch(handleVehicleRefreshError)},5000);
 </script></body></html>)HTML";
 }
@@ -3221,6 +3274,9 @@ DriverConfig load_driver_config(const std::string& path) {
   }
   if (logging && logging["browser_event_log_files"]) {
     config.browser_event_log_files = logging["browser_event_log_files"].as<int>();
+  }
+  if (logging && logging["control_trace_commands"]) {
+    config.control_trace_commands = logging["control_trace_commands"].as<bool>();
   }
   if (root["control"] && root["control"].IsMap() && root["control"]["keyboard"].IsDefined()) {
     throw std::invalid_argument(

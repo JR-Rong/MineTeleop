@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <ctime>
 #include <deque>
 #include <filesystem>
@@ -26,6 +27,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <syncstream>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -444,6 +446,13 @@ CameraIssue classify_camera_issue(std::string_view error) {
 }
 
 struct VehicleMediaRuntime::Impl {
+  static constexpr std::size_t kControlTraceQueueCapacity = 256;
+  static constexpr std::size_t kControlTraceBatchMaxRecords = 32;
+  static constexpr std::size_t kControlTraceBatchCommandsMaxBytes = 40U * 1024U;
+  static constexpr std::size_t kControlTraceBatchLineMaxBytes = 48U * 1024U;
+  static constexpr std::size_t kControlTraceTextMaxBytes = 128;
+  static constexpr std::size_t kControlTraceMaxWarnings = 8;
+
   struct Lane {
     Impl* owner{nullptr};
     CameraConfig camera;
@@ -510,6 +519,7 @@ struct VehicleMediaRuntime::Impl {
     if (simulate_primary_failure_after_frames < 0) {
       throw std::invalid_argument("simulated primary failure frame count must be non-negative");
     }
+    start_control_trace_worker();
   }
 
   ~Impl() {
@@ -517,6 +527,196 @@ struct VehicleMediaRuntime::Impl {
       stop_pipeline();
     } catch (...) {
     }
+    stop_control_trace_worker();
+  }
+
+  static std::string bounded_control_trace_text(std::string_view value) {
+    if (value.size() <= kControlTraceTextMaxBytes) return std::string(value);
+    return std::string(value.substr(0, kControlTraceTextMaxBytes)) + "...[truncated]";
+  }
+
+  void write_control_trace_batch_line(const Json& entry) const {
+    const auto line = entry.dump();
+    if (line.size() > kControlTraceBatchLineMaxBytes) {
+      throw std::length_error("vehicle control trace batch exceeds the JSONL line limit");
+    }
+    std::osyncstream output(std::cout);
+    output << line << '\n' << std::flush;
+    output.emit();
+    if (!output) throw std::runtime_error("cannot write vehicle control trace batch");
+  }
+
+  void note_control_trace_drop() noexcept {
+    control_trace_dropped_total.fetch_add(1, std::memory_order_relaxed);
+    control_trace_cv.notify_one();
+  }
+
+  void enqueue_control_trace(Json record) noexcept {
+    if (!control_trace_accepting.load(std::memory_order_acquire)) {
+      note_control_trace_drop();
+      return;
+    }
+    try {
+      std::unique_lock lock(control_trace_mutex, std::try_to_lock);
+      if (!lock.owns_lock()) {
+        note_control_trace_drop();
+        return;
+      }
+      if (control_trace_stop_requested) {
+        lock.unlock();
+        note_control_trace_drop();
+        return;
+      }
+      if (control_trace_queue.size() >= kControlTraceQueueCapacity) {
+        lock.unlock();
+        note_control_trace_drop();
+        return;
+      }
+      control_trace_queue.push_back(std::move(record));
+      control_trace_enqueued_total.fetch_add(1, std::memory_order_relaxed);
+      lock.unlock();
+      control_trace_cv.notify_one();
+    } catch (...) {
+      note_control_trace_drop();
+    }
+  }
+
+  void control_trace_worker_loop_impl() {
+    std::uint64_t reported_dropped_total = 0;
+    std::uint64_t emitted_total = 0;
+    std::uint64_t output_error_total = 0;
+    std::uint64_t batch_seq = 0;
+    for (;;) {
+      std::vector<Json> records;
+      bool final = false;
+      {
+        std::unique_lock lock(control_trace_mutex);
+        control_trace_cv.wait_for(
+            lock,
+            std::chrono::seconds(1),
+            [this] {
+              return control_trace_stop_requested ||
+                  control_trace_queue.size() >= kControlTraceBatchMaxRecords;
+            });
+        const auto count = std::min(
+            control_trace_queue.size(),
+            kControlTraceBatchMaxRecords);
+        records.reserve(count);
+        for (std::size_t index = 0; index < count; ++index) {
+          records.push_back(std::move(control_trace_queue.front()));
+          control_trace_queue.pop_front();
+        }
+        final = control_trace_stop_requested && control_trace_queue.empty();
+      }
+
+      const auto emit_batch = [this,
+                               &reported_dropped_total,
+                               &emitted_total,
+                               &output_error_total,
+                               &batch_seq](Json commands,
+                                           std::size_t command_count,
+                                           bool final) noexcept {
+        const auto dropped_total = control_trace_dropped_total.load(std::memory_order_relaxed);
+        const auto dropped_since_last = dropped_total - reported_dropped_total;
+        try {
+          const auto next_emitted_total = emitted_total + command_count;
+          write_control_trace_batch_line({
+              {"event", "vehicle_control_trace_batch"},
+              {"event_at_utc_ms", signaling.now_ms()},
+              {"vehicle_id", bounded_control_trace_text(config.vehicle_id)},
+              {"batch_seq", ++batch_seq},
+              {"final", final},
+              {"queue_capacity", kControlTraceQueueCapacity},
+              {"commands", std::move(commands)},
+              {"enqueued_total", control_trace_enqueued_total.load(std::memory_order_relaxed)},
+              {"emitted_total", next_emitted_total},
+              {"dropped_since_last", dropped_since_last},
+              {"dropped_total", dropped_total},
+              {"output_error_total", output_error_total},
+          });
+          emitted_total = next_emitted_total;
+          reported_dropped_total = dropped_total;
+          return true;
+        } catch (...) {
+          ++output_error_total;
+          control_trace_dropped_total.fetch_add(command_count, std::memory_order_relaxed);
+          return false;
+        }
+      };
+
+      std::size_t record_index = 0;
+      bool final_batch_written = false;
+      while (record_index < records.size()) {
+        Json commands = Json::array();
+        std::size_t commands_bytes = 2;
+        std::size_t command_count = 0;
+        while (record_index < records.size()) {
+          std::size_t command_bytes = 0;
+          try {
+            command_bytes = records[record_index].dump().size();
+          } catch (...) {
+            ++output_error_total;
+            note_control_trace_drop();
+            ++record_index;
+            continue;
+          }
+          if (command_bytes > kControlTraceBatchCommandsMaxBytes) {
+            note_control_trace_drop();
+            ++record_index;
+            continue;
+          }
+          const auto separator_bytes = command_count == 0 ? 0U : 1U;
+          if (command_count > 0 &&
+              commands_bytes + separator_bytes + command_bytes >
+                  kControlTraceBatchCommandsMaxBytes) {
+            break;
+          }
+          commands.push_back(std::move(records[record_index++]));
+          commands_bytes += separator_bytes + command_bytes;
+          ++command_count;
+        }
+        if (command_count > 0) {
+          const bool last = final && record_index == records.size();
+          const bool written = emit_batch(std::move(commands), command_count, last);
+          final_batch_written = last && written;
+        }
+      }
+
+      const auto dropped_total = control_trace_dropped_total.load(std::memory_order_relaxed);
+      if ((final && !final_batch_written) ||
+          (records.empty() && dropped_total != reported_dropped_total)) {
+        static_cast<void>(emit_batch(Json::array(), 0, final));
+      }
+      if (final) return;
+    }
+  }
+
+  void control_trace_worker_loop() noexcept {
+    try {
+      control_trace_worker_loop_impl();
+    } catch (...) {
+      // Diagnostic tracing must never terminate or alter the control runtime.
+    }
+  }
+
+  void start_control_trace_worker() noexcept {
+    if (!config.runtime.control_log_commands) return;
+    try {
+      control_trace_worker = std::thread([this] { control_trace_worker_loop(); });
+      control_trace_accepting.store(true, std::memory_order_release);
+    } catch (...) {
+      control_trace_accepting.store(false, std::memory_order_release);
+    }
+  }
+
+  void stop_control_trace_worker() {
+    control_trace_accepting.store(false, std::memory_order_release);
+    {
+      std::lock_guard lock(control_trace_mutex);
+      control_trace_stop_requested = true;
+    }
+    control_trace_cv.notify_all();
+    if (control_trace_worker.joinable()) control_trace_worker.join();
   }
 
   static GstPadProbeReturn count_encoded(GstPad*, GstPadProbeInfo* info, gpointer user_data) {
@@ -909,6 +1109,8 @@ struct VehicleMediaRuntime::Impl {
   }
 
   void handle_control_message(GstWebRTCDataChannel* channel, std::string_view data) {
+    const auto callback_entered_monotonic_ms = steady_now_ms();
+    const auto callback_entered_at_utc_ms = signaling.now_ms();
     if (data.empty() || data.size() > 64 * 1024) {
       ++rejected_control_commands;
       return;
@@ -993,14 +1195,156 @@ struct VehicleMediaRuntime::Impl {
         return;
       }
       const auto command = ControlCommand::from_json(message);
-      std::lock_guard lock(control_mutex);
+      const auto control_mutex_wait_started_monotonic_ms = steady_now_ms();
+      std::unique_lock lock(control_mutex);
+      const auto control_mutex_acquired_monotonic_ms = steady_now_ms();
+      const auto control_mutex_acquired_at_utc_ms = signaling.now_ms();
+      const auto active_session_id = signaling.session_id();
+      const bool control_log_commands = config.runtime.control_log_commands;
+      const auto queue_control_trace = [this,
+                                        &command,
+                                        callback_entered_at_utc_ms,
+                                        callback_entered_monotonic_ms,
+                                        control_mutex_wait_started_monotonic_ms,
+                                        control_mutex_acquired_at_utc_ms,
+                                        control_mutex_acquired_monotonic_ms,
+                                        active_session_id,
+                                        control_log_commands](
+                                           const ReceiveResult* result,
+                                           std::string_view reason,
+                                           bool receive_apply_invoked,
+                                           std::optional<std::int64_t> receive_apply_started_at_utc_ms,
+                                           std::optional<std::int64_t> receive_apply_started_monotonic_ms,
+                                           std::optional<std::int64_t> receive_apply_completed_at_utc_ms,
+                                           std::optional<std::int64_t> receive_apply_completed_monotonic_ms) noexcept {
+        if (!control_log_commands) return;
+        try {
+          const auto completed_monotonic_ms = steady_now_ms();
+          const auto completed_at_utc_ms = signaling.now_ms();
+          Json warnings = Json::array();
+          if (result != nullptr) {
+            for (std::size_t index = 0;
+                 index < std::min(result->warnings.size(), kControlTraceMaxWarnings);
+                 ++index) {
+              warnings.push_back(bounded_control_trace_text(result->warnings[index]));
+            }
+          }
+          Json record = {
+              {"protocol_version", command.protocol_version},
+              {"vehicle_id", bounded_control_trace_text(command.vehicle_id)},
+              {"driver_id", bounded_control_trace_text(command.driver_id)},
+              {"session_id", bounded_control_trace_text(command.session_id)},
+              {"active_session_id", bounded_control_trace_text(active_session_id)},
+              {"seq", command.seq},
+              {"sent_at_utc_ms", command.sent_at_utc_ms},
+              {"callback_entered_at_utc_ms", callback_entered_at_utc_ms},
+              {"callback_entered_monotonic_ms", callback_entered_monotonic_ms},
+              {"control_mutex_wait_started_monotonic_ms", control_mutex_wait_started_monotonic_ms},
+              {"received_at_utc_ms", control_mutex_acquired_at_utc_ms},
+              {"control_mutex_acquired_at_utc_ms", control_mutex_acquired_at_utc_ms},
+              {"control_mutex_acquired_monotonic_ms", control_mutex_acquired_monotonic_ms},
+              {"control_mutex_wait_ms", std::max<std::int64_t>(
+                                            0,
+                                            control_mutex_acquired_monotonic_ms -
+                                                control_mutex_wait_started_monotonic_ms)},
+              {"callback_to_mutex_acquired_ms", std::max<std::int64_t>(
+                                                      0,
+                                                      control_mutex_acquired_monotonic_ms -
+                                                          callback_entered_monotonic_ms)},
+              {"receive_apply_invoked", receive_apply_invoked},
+              {"receive_apply_started_at_utc_ms", receive_apply_started_at_utc_ms
+                                                       ? Json(*receive_apply_started_at_utc_ms)
+                                                       : Json(nullptr)},
+              {"receive_apply_started_monotonic_ms", receive_apply_started_monotonic_ms
+                                                       ? Json(*receive_apply_started_monotonic_ms)
+                                                       : Json(nullptr)},
+              {"receive_apply_completed_at_utc_ms", receive_apply_completed_at_utc_ms
+                                                         ? Json(*receive_apply_completed_at_utc_ms)
+                                                         : Json(nullptr)},
+              {"receive_apply_completed_monotonic_ms", receive_apply_completed_monotonic_ms
+                                                         ? Json(*receive_apply_completed_monotonic_ms)
+                                                         : Json(nullptr)},
+              {"receive_apply_processing_ms",
+               receive_apply_started_monotonic_ms && receive_apply_completed_monotonic_ms
+                   ? Json(std::max<std::int64_t>(
+                         0,
+                         *receive_apply_completed_monotonic_ms -
+                             *receive_apply_started_monotonic_ms))
+                   : Json(nullptr)},
+              {"control_path_completed_before_trace_at_utc_ms", completed_at_utc_ms},
+              {"control_path_completed_before_trace_monotonic_ms", completed_monotonic_ms},
+              {"control_path_processing_before_trace_ms", std::max<std::int64_t>(
+                                                              0,
+                                                              completed_monotonic_ms -
+                                                                  callback_entered_monotonic_ms)},
+              {"accepted", result != nullptr && result->accepted},
+              {"reason", bounded_control_trace_text(reason)},
+              {"requested_gear", bounded_control_trace_text(command.gear)},
+              {"requested_steering", command.steering},
+              {"requested_throttle", command.throttle},
+              {"requested_brake", command.brake},
+              {"requested_estop", command.estop},
+              {"warnings", std::move(warnings)},
+          };
+          if (result != nullptr && result->command) {
+            record["effective_gear"] = bounded_control_trace_text(result->command->gear);
+            record["effective_steering"] = result->command->steering;
+            record["effective_throttle"] = result->command->throttle;
+            record["effective_brake"] = result->command->brake;
+            record["effective_estop"] = result->command->estop;
+          }
+          enqueue_control_trace(std::move(record));
+        } catch (...) {
+          note_control_trace_drop();
+        }
+      };
       if (stop_requested || control_inhibited || control_channel != channel ||
           !control_service_started || !control_service || !control_link_open) {
         ++rejected_control_commands;
+        const std::string_view reason = stop_requested
+            ? "runtime_stop_requested"
+            : control_inhibited
+            ? "control_inhibited"
+            : control_channel != channel
+            ? "stale_control_channel"
+            : (!control_service_started || !control_service)
+            ? "control_service_unavailable"
+            : "control_link_not_open";
+        lock.unlock();
+        queue_control_trace(
+            nullptr,
+            reason,
+            false,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt);
         return;
       }
-      const auto received_at_ms = signaling.now_ms();
-      const auto result = control_service->receive_command(command, received_at_ms);
+      const auto received_at_ms = control_mutex_acquired_at_utc_ms;
+      const auto receive_apply_started_at_utc_ms = signaling.now_ms();
+      const auto receive_apply_started_monotonic_ms = steady_now_ms();
+      ReceiveResult result;
+      std::int64_t receive_apply_completed_at_utc_ms = 0;
+      std::int64_t receive_apply_completed_monotonic_ms = 0;
+      try {
+        result = control_service->receive_command(command, received_at_ms);
+        receive_apply_completed_at_utc_ms = signaling.now_ms();
+        receive_apply_completed_monotonic_ms = steady_now_ms();
+      } catch (...) {
+        const auto completed_at_utc_ms = signaling.now_ms();
+        const auto completed_monotonic_ms = steady_now_ms();
+        lock.unlock();
+        queue_control_trace(
+            nullptr,
+            "receive_apply_exception",
+            true,
+            receive_apply_started_at_utc_ms,
+            receive_apply_started_monotonic_ms,
+            completed_at_utc_ms,
+            completed_monotonic_ms);
+        throw;
+      }
       if (result.accepted && result.command) {
         const auto accepted_count = ++accepted_control_commands;
         last_control_received_at_ms = received_at_ms;
@@ -1053,30 +1397,15 @@ struct VehicleMediaRuntime::Impl {
                     : "local_full_stop"}});
         }
       }
-      if (config.runtime.control_log_commands) {
-        Json entry = {
-            {"event", "vehicle_data_channel_control_received"},
-            {"protocol_version", command.protocol_version},
-            {"vehicle_id", command.vehicle_id},
-            {"driver_id", command.driver_id},
-            {"session_id", command.session_id},
-            {"seq", command.seq},
-            {"sent_at_utc_ms", command.sent_at_utc_ms},
-            {"received_at_utc_ms", received_at_ms},
-            {"accepted", result.accepted},
-            {"reason", result.reason},
-            {"requested_steering", command.steering},
-            {"requested_throttle", command.throttle},
-            {"requested_brake", command.brake},
-            {"warnings", result.warnings},
-        };
-        if (result.command) {
-          entry["effective_steering"] = result.command->steering;
-          entry["effective_throttle"] = result.command->throttle;
-          entry["effective_brake"] = result.command->brake;
-        }
-        std::cout << entry.dump() << '\n';
-      }
+      lock.unlock();
+      queue_control_trace(
+          &result,
+          result.reason,
+          true,
+          receive_apply_started_at_utc_ms,
+          receive_apply_started_monotonic_ms,
+          receive_apply_completed_at_utc_ms,
+          receive_apply_completed_monotonic_ms);
     } catch (const std::exception& error) {
       ++rejected_control_commands;
       std::cout << Json({
@@ -2689,7 +3018,7 @@ struct VehicleMediaRuntime::Impl {
     }
     const bool passed = !attempts.empty() && attempts.back().value("passed", false) &&
         fps_passed && !control_inhibited;
-    return {
+    Json summary = {
         {"event", "vehicle_media_webrtc_summary"},
         {"runtime", "cpp"},
         {"passed", passed},
@@ -2722,6 +3051,10 @@ struct VehicleMediaRuntime::Impl {
              {"last_received_at_utc_ms", last_control_received_at_ms.load()},
          }},
     };
+    // The caller writes the summary after run() returns.  Drain and join the
+    // trace worker first so a late final trace line cannot interleave with it.
+    stop_control_trace_worker();
+    return summary;
   }
 
   VehicleConfig config;
@@ -2755,6 +3088,14 @@ struct VehicleMediaRuntime::Impl {
   std::uint64_t failover_count{0};
   std::string last_negotiation_warning;
   Json ice_configuration{Json::object()};
+  std::mutex control_trace_mutex;
+  std::condition_variable control_trace_cv;
+  std::deque<Json> control_trace_queue;
+  std::thread control_trace_worker;
+  bool control_trace_stop_requested{false};
+  std::atomic<bool> control_trace_accepting{false};
+  std::atomic<std::uint64_t> control_trace_enqueued_total{0};
+  std::atomic<std::uint64_t> control_trace_dropped_total{0};
   std::mutex control_mutex;
   std::unique_ptr<VehicleControlService> control_service;
   bool control_service_started{false};

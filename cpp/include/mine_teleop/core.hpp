@@ -752,6 +752,7 @@ class VehicleControlService {
 
  private:
   [[nodiscard]] bool refresh_adapter_safe_stop_state() noexcept;
+  void evaluate_control_watchdog(std::int64_t now_ms);
   void clear_session_profile() noexcept;
   [[nodiscard]] SessionControlProfileResult profile_result(
       const SessionControlProfileRequest& request,

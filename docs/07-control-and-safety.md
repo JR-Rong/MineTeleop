@@ -63,6 +63,10 @@
 - 没有输入变化也要发送心跳式命令。
 - 浏览器只允许一个 async writer 串行执行 `/api/control` 和 DataChannel `send`；键盘、Gamepad 和
   心跳只更新 latest-wins 快照，不排队积压过时命令。
+- 慢 `/api/control` 准备不能抑制后续心跳：writer 最多保留一条 pending 最新快照，所有命令准备
+  都以 `min(100 ms, max_command_gap_ms / 2)` 为本地截止期。超时会中止 HTTP 并清空普通驾驶输入；
+  ESTOP 锁存不随中止解除，后续心跳立即重试。普通 prepared 命令在发送前还按同一单调时钟截止期
+  丢弃；ESTOP 入队时会中止正在准备的普通命令，成功 prepared 后不作普通新鲜度丢弃。
 - 车端对 `vehicle_telemetry` 与 `vcu_handshake_status` 共用单调递增的 `control_status_seq`；浏览器在
   unordered DataChannel 上只接受严格递增状态，禁止旧 Ready 覆盖较新的 fault/disarm。只有同时通过 `control_status_seq` 门禁并且通过
   `command_seq` 关联到当前换挡事务的拒绝才能改变本地挡位。
@@ -193,7 +197,10 @@ Degraded 阶段会先把会话归一化制动换算成车端普通压力比例�
 
 默认策略：
 
-- 控制心跳短暂异常先进入降级控制：油门置 0、限制速度、提示驾驶端链路抖动。
+- 控制心跳短暂异常先进入降级控制：油门置 0、限制速度、提示驾驶端链路抖动。`DEGRADED`
+  保留已确认的会话 profile；首个新鲜命令只重整接收时序，车端随后只允许一条新鲜中立命令
+  （油门与转向为 0，制动仍可用）恢复 `CONTROL_ACTIVE`。驾驶端同时清空并锁住当前物理输入，
+  要求释放后重新按下，避免恢复旧的按住意图。
 - 超过 `control_timeout_ms` 后进入 `TIMEOUT_BRAKE`。
 - 普通驾驶的缓刹/急刹按会话中已确认的 bar 值直接施加；本 PR 不实现制动 PID 或
   ramp。控制心跳超时按配置的 0.3/0.6/1.0 分段执行，故障、断链、急停以及最终
@@ -228,6 +235,9 @@ control:
 - `max_command_gap_ms`：单次有效命令到达间隔上限。超过该值时，车端应丢弃过旧命令、记录链路异常，并可提示驾驶端网络抖动；它不是状态机进入降级态的持续时间。
 - `degraded_timeout_ms`：链路异常持续时间阈值。超过该持续时间后进入降级控制，例如油门置 0、限速或告警；本 PR 不在普通制动路径内生成压力 ramp。
 - `control_timeout_ms`：持续未收到有效控制心跳后进入 `TIMEOUT_BRAKE` 的阈值。该值必须小于按车辆制动距离、安全边界和场地速度上限反推得到的最大允许值。
+
+只有可恢复的 `DEGRADED` 保留 session profile；`TIMEOUT_BRAKE`、`ESTOP`、`FAULT`、显式断开和
+adapter 已接管的停车仍撤销 profile 与牵引上限，后续必须重新授权。
 
 `degraded_timeout_ms=300` 只能作为首版弱网告警/降级参考值，不应直接等同于急刹阈值。5G 抖动可能达到几十到上百毫秒，最终 `max_command_gap_ms`、`degraded_timeout_ms`、`control_timeout_ms` 和安全制动动作必须结合真实网络、车辆制动距离、坡道/松散路面和底层控制器心跳机制实测标定。
 三个毫秒参数都必须为正且不大于 60000，并满足

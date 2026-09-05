@@ -87,6 +87,22 @@ cloud:
 窗口；它不是浏览器显示的端到端时延预算，后者由
 `hardware.encoding.max_end_to_end_latency_ms` 单独约束。
 
+`runtime.control_log_commands=true` 会把已解析的 DataChannel 控制命令约每秒汇总为一条
+`vehicle_control_trace_batch`；队列累计 32 条也会提前刷新。现场模板默认开启该追踪。每个
+`commands[]` 项用 `session_id + seq` 关联命令，并记录 callback 入场 UTC/单调时钟、
+`control_mutex` 获取时刻与等待毫秒、`VehicleControlService::receive_command`（含 adapter
+apply）完成时刻与处理毫秒，以及 `accepted/reason`。调用控制服务前因 runtime 停止、控制
+被禁止、旧 channel、服务不可用或链路未打开而丢弃时仍有明确 reason；控制服务抛错记为
+`receive_apply_exception`，早期丢弃的 receive/apply 时间与耗时为 `null`。
+
+`control_path_completed_before_trace_*` 只表示控制路径完成、即将构造追踪记录的时刻，不是
+callback 真正返回的时刻，也不包含追踪构造/入队耗时。单调时钟值只能在同一车端进程内比较。
+追踪仅复制限长白名单字段，不含 control token；DataChannel callback 用容量 256 的有界队列
+非阻塞入队，日志序列化和 stdout 输出由专用 worker 完成。队列锁忙、队满、构造或输出失败时
+只丢追踪，不影响控制命令，批次用 `dropped_since_last/dropped_total` 暴露缺口。worker 会按
+40 KiB 命令预算拆批并拒绝超过 48 KiB 的 JSONL 行；退出时在安全停车、pipeline 停止后排空
+并写 `final=true`。stdout 永久阻塞不会卡住控制 callback，但可能延迟进程退出。
+
 相对的 `device_token_file` 按 YAML 所在目录解析。现场只需创建权限为 `0600` 的
 `config/device-token`，随后执行 `bin/mine-teleop-run`。`cloud.resolve` 的每一项使用
 libcurl 的 `host:port:address` 格式，只影响当前进程；连接仍以
@@ -590,6 +606,7 @@ logging:
   browser_event_log: ../.local/logs/control-browser-events.jsonl
   browser_event_log_max_bytes: 2097152
   browser_event_log_files: 3
+  control_trace_commands: false
 
 ui:
   default_layout: grid_4
@@ -687,6 +704,17 @@ PID、清零八路电机扭矩，同时保留转向。页面修改参数会先�
 写入控制端包根目录的 `.local/logs/`。`browser_event_log_files` 包含当前文件，
 因此值 `3` 表示当前文件加 `.1`、`.2` 两个备份。凭据类字段会被递归脱敏，但部署
 时仍应限制日志目录权限，并按现场保留策略采集或销毁日志。
+
+`logging.control_trace_commands` 默认关闭。启用后，浏览器不会为每条 20 Hz 控制
+命令单独发日志请求，而是约每秒写一条 `control_trace_batch`。每条 terminal trace
+包含会话与控制序号、浏览器 prepare 开始 UTC、原生运行时命令时间、prepare 耗时、
+DataChannel `send()` 调用 UTC、调用时 `bufferedAmount` 和浏览器终态；同批摘要包含
+heartbeat 定时器 lag、heartbeat 入队/合并、显式发送、prepare timeout/expired、
+队列异常和背压计数。批次的 `trace_session_id`、`trace_vehicle_id` 是浏览器采集时
+固定的会话归属；会话切换边界排查应使用这两个字段，而不是写盘时控制端进程的当前
+会话字段。该事件只证明浏览器已调用 `send()`，不能作为车端收到命令的
+ACK。现场三机配置启用此项，并使用 `16 MiB × 4` 轮转容量；复现完成后应按现场保留
+策略归档或删除。
 
 ## 配置校验
 

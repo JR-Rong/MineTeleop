@@ -1023,15 +1023,93 @@
     return JSON.stringify(prepared) !== JSON.stringify(controlSnapshot(latestValue));
   }
 
+  function controlPrepareDeadlineMs(maxCommandGapMs) {
+    const gap = Number(maxCommandGapMs);
+    return Number.isFinite(gap) && gap > 0
+      ? Math.max(1, Math.min(100, Math.floor(gap / 2)))
+      : 100;
+  }
+
+  function createLatestControlWriteQueue(writeControl, onUnhandledError, onUrgentWrite) {
+    if (typeof writeControl !== 'function') throw new TypeError('writeControl must be a function');
+    const reportUnhandled = typeof onUnhandledError === 'function'
+      ? onUnhandledError
+      : function noop() {};
+    const notifyUrgent = typeof onUrgentWrite === 'function'
+      ? onUrgentWrite
+      : function noop() {};
+    let active = false;
+    let pending = null;
+
+    function mergeExtra(current, incoming) {
+      return Object.assign({}, current, incoming, {
+        estop: Boolean((current && current.estop) || (incoming && incoming.estop)),
+      });
+    }
+
+    async function drain() {
+      if (active) return;
+      active = true;
+      try {
+        while (pending) {
+          const request = pending;
+          pending = null;
+          try {
+            const result = await writeControl(request.extra, request.announceUnavailable);
+            for (const waiter of request.waiters) waiter.resolve(result);
+          } catch (error) {
+            if (!request.waiters.length) reportUnhandled(error);
+            for (const waiter of request.waiters) waiter.reject(error);
+          }
+        }
+      } finally {
+        active = false;
+        if (pending) drain().catch(reportUnhandled);
+      }
+    }
+
+    function send(extra, announceUnavailable) {
+      return new Promise(function enqueue(resolve, reject) {
+        const urgent = Boolean(extra && extra.estop);
+        if (pending) {
+          pending.extra = mergeExtra(pending.extra, extra);
+          pending.announceUnavailable = pending.announceUnavailable || announceUnavailable;
+          pending.waiters.push({resolve, reject});
+        } else {
+          pending = {
+            extra: Object.assign({}, extra),
+            announceUnavailable: Boolean(announceUnavailable),
+            waiters: [{resolve, reject}],
+          };
+        }
+        if (urgent && active) notifyUrgent();
+        drain().catch(reportUnhandled);
+      });
+    }
+
+    function enqueueHeartbeat() {
+      if (pending) return false;
+      pending = {extra: {}, announceUnavailable: false, waiters: []};
+      drain().catch(reportUnhandled);
+      return true;
+    }
+
+    return Object.freeze({send, enqueueHeartbeat});
+  }
+
   const CONTROL_OUTCOMES = Object.freeze([
     'forwarded',
     'superseded',
+    'expired_before_forward',
     'post_prepare_link_changed',
     'post_prepare_vcu_not_ready',
   ]);
 
   function shouldLogControlOutcome(outcome) {
-    if (outcome === 'prepared' || outcome === 'forwarded') return false;
+    // High-rate normal and expiry outcomes stay in the 1 Hz aggregate. The
+    // page emits a separately throttled diagnostic for preparation expiry.
+    if (outcome === 'prepared' || outcome === 'forwarded' ||
+        outcome === 'superseded' || outcome === 'expired_before_forward') return false;
     if (!CONTROL_OUTCOMES.includes(outcome)) throw new TypeError('unknown control outcome');
     return true;
   }
@@ -1041,6 +1119,7 @@
       prepared: 0,
       forwarded: 0,
       superseded: 0,
+      expired_before_forward: 0,
       post_prepare_link_changed: 0,
       post_prepare_vcu_not_ready: 0,
       last_prepared_seq: 0,
@@ -1124,6 +1203,8 @@
     isCurrentControlChannel,
     controlSnapshot,
     controlIntentSuperseded,
+    controlPrepareDeadlineMs,
+    createLatestControlWriteQueue,
     CONTROL_OUTCOMES,
     shouldLogControlOutcome,
     createControlOutcomeMetrics,
