@@ -722,13 +722,16 @@ void test_control_page_contract() {
           response.body.find("VCU 为 standby/disarmed") !=
               std::string::npos,
       "profile editing does not preflight parking rules for speed, torque, brake, steering, and PID changes");
-  const auto control_post = response.body.find("post('/api/control',outgoing)");
+  const auto control_post = response.body.find(
+      "post('/api/control',outgoing,controlPrepareAbort.signal)");
   expect(
       control_post != std::string::npos &&
           response.body.find("post('/api/control'", control_post + 1) == std::string::npos &&
-          response.body.find("async function drainControlWrites()") != std::string::npos &&
-          response.body.find("pendingControlWrite") != std::string::npos &&
-          response.body.find("controlWriteActive") != std::string::npos &&
+          response.body.find("function createLatestControlWriteQueue(writeControl") !=
+              std::string::npos &&
+          response.body.find(
+              "const controlWriteQueue=controlLogic.createLatestControlWriteQueue(writeControl") !=
+              std::string::npos &&
           response.body.find("const outgoingSnapshot=controlLogic.controlSnapshot(outgoing)") !=
               std::string::npos &&
           response.body.find("const estopRequested=estopLatched||Boolean(extra.estop)") !=
@@ -740,6 +743,26 @@ void test_control_page_contract() {
           response.body.find("reason:'control_intent_superseded'") !=
               std::string::npos,
       "browser control writes are not merged through one ordered writer");
+  expect(
+      response.body.find("function enqueueControlHeartbeat()") != std::string::npos &&
+          response.body.find("controlWriteQueue.enqueueHeartbeat()") != std::string::npos &&
+          response.body.find("enqueueControlHeartbeat()") != std::string::npos &&
+          response.body.find("heartbeatInFlight") == std::string::npos &&
+          response.body.find("controlPrepareAbort=new AbortController()") != std::string::npos &&
+          response.body.find("controlPrepareAbort.abort()") != std::string::npos &&
+          response.body.find("activeControlPrepareAbort&&!activeControlPrepareIsEstop") !=
+              std::string::npos &&
+          response.body.find("reason:'control_prepare_preempted_by_estop'") !=
+              std::string::npos &&
+          response.body.find("latchEstop('Gamepad'))send({estop:true},false)") !=
+              std::string::npos &&
+          response.body.find("estopRequested?'estop_prepare_timeout':'control_prepare_timeout'") !=
+              std::string::npos &&
+          response.body.find("performance.now()-prepareStartedAt") != std::string::npos &&
+          response.body.find("preparedAgeMs>=prepareDeadlineMs") != std::string::npos &&
+          response.body.find("reason:'control_command_expired_before_forward'") !=
+              std::string::npos,
+      "slow command preparation can starve heartbeats or forward stale commands");
   const auto prepared_outcome = response.body.find(
       "recordControlOutcome('prepared',prepared.command,outcomeSession)");
   const auto data_channel_send = response.body.find(
@@ -750,6 +773,9 @@ void test_control_page_contract() {
       prepared_outcome != std::string::npos &&
           response.body.find(
               "recordControlOutcome('superseded',prepared.command,outcomeSession)",
+              prepared_outcome) != std::string::npos &&
+          response.body.find(
+              "recordControlOutcome('expired_before_forward',prepared.command,outcomeSession",
               prepared_outcome) != std::string::npos &&
           response.body.find(
               "recordControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession)",
@@ -771,6 +797,19 @@ void test_control_page_contract() {
           response.body.find("delivery_state:'browser_data_channel_send_invoked'") !=
               std::string::npos,
       "prepared browser commands do not have rate-bounded auditable terminal outcomes");
+  expect(
+      response.body.find("function applyVehicleSafetyState(value)") !=
+              std::string::npos &&
+          response.body.find("next==='DEGRADED'){clearControlInput(false)") !=
+              std::string::npos &&
+          response.body.find("next==='DEGRADED'&&lastVehicleSafetyState") ==
+              std::string::npos &&
+          response.body.find("clearControlInput(false)") != std::string::npos &&
+          response.body.find("driver_input_cleared_on_degraded") !=
+              std::string::npos &&
+          response.body.find("applyVehicleSafetyState(message.safety_state)") !=
+              std::string::npos,
+      "recoverable vehicle degradation can replay held driver input");
   expect(
       response.body.find("function vcuStateRequiresFreshInput") != std::string::npos &&
           response.body.find("controlLogic.requiresFreshInput(value)") != std::string::npos &&
@@ -981,7 +1020,8 @@ void test_control_page_contract() {
   expect(
       response.body.find("!vcuDrivingReady()&&!estopRequested") != std::string::npos &&
           response.body.find("async function heartbeat()") != std::string::npos &&
-          response.body.find("await send({},false)") != std::string::npos,
+          response.body.find("sendPendingControlProfile();enqueueControlHeartbeat()") !=
+              std::string::npos,
       "a latched ESTOP is not retransmitted by heartbeat while the VCU handshake is incomplete");
   expect(
       response.body.find("function vcuAdapterReady(status,explicit){return controlLogic.adapterReady(status,explicit)}") !=
@@ -1029,7 +1069,12 @@ void test_control_page_contract() {
   expect(response.body.find("sent_at_utc_ms:Date.now()") != std::string::npos, "browser-local logs do not use UTC milliseconds");
   expect(response.body.find("fetch('/api/browser-event'") != std::string::npos, "browser events are not persisted by the local runtime");
   expect(response.body.find("dev-password") == std::string::npos, "driver credential leaked into the control page");
-  expect(response.body.find("await send({},false)") != std::string::npos, "background safety ticks can override waiting state");
+  expect(
+      response.body.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
+              std::string::npos &&
+          response.body.find("sendPendingControlProfile();enqueueControlHeartbeat()") !=
+              std::string::npos,
+      "background safety ticks can override waiting state");
   expect(response.body.find("addEventListener('pagehide'") != std::string::npos, "page close does not release the session");
   const auto initial_status = runtime->status();
   expect(

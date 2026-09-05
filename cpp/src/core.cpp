@@ -3033,7 +3033,24 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
 
 ReceiveResult VehicleControlService::receive_command(const ControlCommand& command, std::int64_t timestamp_ms) {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
-  auto result = receiver_.accept(command, timestamp_ms);
+  ReceiveResult result;
+  if (command.estop) {
+    result = receiver_.accept(command, timestamp_ms);
+    if (result.accepted && result.command) {
+      // Latch a valid ESTOP and revoke traction authority before any adapter
+      // call. A failed physical stop must never lose the outer safety latch.
+      safety_.on_valid_command(*result.command, timestamp_ms);
+      clear_session_profile();
+    } else {
+      evaluate_control_watchdog(timestamp_ms);
+    }
+  } else {
+    // The receive path can keep running even if the periodic loop is delayed.
+    // Advance the same watchdog here so fresh packets cannot bypass a hard
+    // timeout merely because tick() has not been scheduled.
+    evaluate_control_watchdog(timestamp_ms);
+    result = receiver_.accept(command, timestamp_ms);
+  }
   if (!result.accepted || !result.command) return result;
   auto& effective = *result.command;
   if (!effective.estop && !active_session_profile_) {
@@ -3044,6 +3061,16 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
            VehicleStopReason::SessionProfileRequired});
     }
     return {false, "session_control_profile_required", std::nullopt, {}};
+  }
+  if (!effective.estop && safety_.state() == SafetyState::Degraded &&
+      (effective.throttle > 1e-9 || std::abs(effective.steering) > 1e-9)) {
+    // Recovery is intentionally explicit: a command gap withdraws traction,
+    // and a fresh neutral command must be applied before any prior held input
+    // can produce torque again. Brake remains allowed during this re-arm.
+    result.accepted = false;
+    result.reason = "degraded_neutral_required";
+    result.command.reset();
+    return result;
   }
   const auto vehicle_limited_throttle =
       std::min(effective.throttle, max_throttle_);
@@ -3207,9 +3234,29 @@ void VehicleControlService::tick(std::int64_t timestamp_ms) {
       safety_.state() != SafetyState::Fault) {
     safety_.mark_fault();
   }
+  evaluate_control_watchdog(timestamp_ms);
+  if (!last_telemetry_ms_ || timestamp_ms - *last_telemetry_ms_ >= telemetry_interval_ms_) {
+    try {
+      if (telemetry_history_.size() == kMaxVehicleTelemetryHistory) telemetry_history_.pop_front();
+      telemetry_history_.push_back(build_telemetry(timestamp_ms));
+      last_telemetry_ms_ = timestamp_ms;
+    } catch (...) {
+      // Control safety was already evaluated above from the same adapter. A
+      // failed observability snapshot must not tear down an adapter-owned stop
+      // or prevent the outer fault path from keeping the vehicle stopped.
+    }
+  }
+}
+
+void VehicleControlService::evaluate_control_watchdog(std::int64_t timestamp_ms) {
   safety_.tick(timestamp_ms);
   if (safety_.state() == SafetyState::Degraded || safety_.state() == SafetyState::TimeoutBrake ||
       safety_.state() == SafetyState::Estop || safety_.state() == SafetyState::Fault) {
+    // Revoke software traction authority before touching the adapter. This
+    // remains true even when the physical safe-stop call reports an error.
+    if (safety_.state() != SafetyState::Degraded) {
+      clear_session_profile();
+    }
     const bool adapter_owns_recoverable_stop =
         adapter_safe_stop_active_ &&
         (safety_.state() == SafetyState::Degraded ||
@@ -3232,18 +3279,12 @@ void VehicleControlService::tick(std::int64_t timestamp_ms) {
           safety_.current_output(timestamp_ms),
           stop_context);
     }
-    clear_session_profile();
-  }
-  if (!last_telemetry_ms_ || timestamp_ms - *last_telemetry_ms_ >= telemetry_interval_ms_) {
-    try {
-      if (telemetry_history_.size() == kMaxVehicleTelemetryHistory) telemetry_history_.pop_front();
-      telemetry_history_.push_back(build_telemetry(timestamp_ms));
-      last_telemetry_ms_ = timestamp_ms;
-    } catch (...) {
-      // Control safety was already evaluated above from the same adapter. A
-      // failed observability snapshot must not tear down an adapter-owned stop
-      // or prevent the outer fault path from keeping the vehicle stopped.
-    }
+    // DEGRADED is the recoverable 300 ms control-gap state: traction has
+    // already been withdrawn above, but the acknowledged session limits must
+    // remain installed so one fresh packet can re-arm receiver timing and a
+    // subsequent fresh neutral command can restore active control before the
+    // hard timeout. Hard-timeout/latching states still require a new parked
+    // handshake after the profile has been revoked above.
   }
 }
 

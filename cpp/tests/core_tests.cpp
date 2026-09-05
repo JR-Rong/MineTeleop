@@ -2127,19 +2127,28 @@ void test_control_service_commits_only_successfully_applied_commands() {
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
     service.start(0);
+    activate_adapter_owned_session_profile(service, *adapter_view);
+    expect(
+        service.receive_command(command(1, 0), 0).accepted,
+        "control command before overdue ESTOP was rejected");
+    service.tick(300);
 
-    auto estop = command(1, 0);
+    auto estop = command(2, 810);
     estop.estop = true;
     adapter_view->safe_stop_throws = true;
     expect_throws(
-        [&] { static_cast<void>(service.receive_command(estop, 0)); },
-        "adapter ESTOP failure did not propagate");
+        [&] { static_cast<void>(service.receive_command(estop, 810)); },
+        "overdue adapter ESTOP failure did not propagate");
     expect(
         service.safety_state() == mine_teleop::SafetyState::Estop,
-        "adapter ESTOP failure rolled back the outer ESTOP latch");
+        "overdue adapter ESTOP failure rolled back the outer ESTOP latch");
+    expect(
+        !service.session_control_profile().at("active").get<bool>() &&
+            adapter_view->session_motor_torque_limit_nm() == 0.0,
+        "overdue adapter ESTOP failure retained session traction authority");
 
     adapter_view->safe_stop_throws = false;
-    const auto replay = service.receive_command(estop, 1);
+    const auto replay = service.receive_command(estop, 811);
     expect(
         !replay.accepted && replay.reason == "old_seq" &&
             service.safety_state() == mine_teleop::SafetyState::Estop,
@@ -2158,11 +2167,117 @@ void test_control_service_reports_safe_stop_output_after_timeout() {
   activate_session_profile(service);
   expect(service.receive_command(command(1, 0), 0).accepted, "control command was rejected");
   service.tick(800);
-  service.tick(1300);
   expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake, "service did not enter timeout");
+  expect(
+      !service.session_control_profile().at("active").get<bool>(),
+      "hard control timeout retained the session control profile");
+  expect_near(
+      adapter_view->session_motor_torque_limit_nm(),
+      0.0,
+      1e-9,
+      "hard control timeout retained session traction authority");
+  service.tick(1300);
   const auto telemetry = adapter_view->read_telemetry();
   expect_near(telemetry.throttle_feedback, 0.0, 1e-9, "timeout telemetry retained stale throttle");
   expect_near(telemetry.brake_feedback, 0.6, 1e-9, "timeout telemetry did not report safe brake");
+  const auto gap_rearm = service.receive_command(command(2, 1310), 1310);
+  expect(
+      !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
+      "hard-timeout receiver did not re-arm on the first fresh command");
+  const auto blocked = service.receive_command(command(3, 1320), 1320);
+  expect(
+      !blocked.accepted && blocked.reason == "session_control_profile_required",
+      "hard control timeout recovered without explicit profile re-authorization");
+  service.close();
+}
+
+void test_control_service_recovers_from_degraded_command_gap_without_profile_reapply() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+  auto* adapter_view = adapter.get();
+  mine_teleop::VehicleControlService service(
+      config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(0);
+  activate_session_profile(service);
+  expect(service.receive_command(command(1, 0), 0).accepted, "control command was rejected");
+
+  service.tick(300);
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::Degraded,
+      "service did not enter the recoverable degraded state");
+  expect(
+      service.session_control_profile().at("active").get<bool>(),
+      "recoverable command jitter revoked the session control profile");
+  expect_near(
+      adapter_view->session_motor_torque_limit_nm(),
+      100.0,
+      1e-9,
+      "recoverable command jitter withdrew the acknowledged torque ceiling");
+  const auto degraded_telemetry = adapter_view->read_telemetry();
+  expect_near(
+      degraded_telemetry.throttle_feedback,
+      0.0,
+      1e-9,
+      "degraded state retained stale traction while preserving the profile");
+
+  const auto gap_rearm = service.receive_command(command(2, 350), 350);
+  expect(
+      !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
+      "first fresh command after the gap did not re-arm receiver timing");
+  const auto held_input = service.receive_command(command(3, 360), 360);
+  expect(
+      !held_input.accepted && held_input.reason == "degraded_neutral_required",
+      "degraded control resumed stale held input before an explicit neutral command");
+  auto neutral = command(4, 370);
+  neutral.steering = 0.0;
+  neutral.throttle = 0.0;
+  const auto recovered = service.receive_command(neutral, 370);
+  expect(recovered.accepted, "fresh neutral command did not recover degraded control");
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::ControlActive,
+      "fresh neutral command did not restore active control");
+  expect(
+      service.receive_command(command(5, 380), 380).accepted,
+      "fresh input remained blocked after explicit neutral recovery");
+  expect(
+      service.session_control_profile().at("active").get<bool>() &&
+          adapter_view->session_motor_torque_limit_nm() == 100.0,
+      "degraded recovery required an unsafe profile re-application");
+  service.close();
+}
+
+void test_control_service_receive_path_cannot_bypass_hard_timeout() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+  auto* adapter_view = adapter.get();
+  mine_teleop::VehicleControlService service(
+      config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(0);
+  activate_session_profile(service);
+  expect(service.receive_command(command(1, 0), 0).accepted, "control command was rejected");
+  const auto controls_before_timeout = adapter_view->status().applied_command_count;
+
+  service.tick(300);
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::Degraded,
+      "service did not enter degraded before receive-path timeout test");
+
+  const auto gap_rearm = service.receive_command(command(2, 810), 810);
+  expect(
+      !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
+      "first packet after a hard timeout did not re-arm receiver timing");
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
+          !service.session_control_profile().at("active").get<bool>(),
+      "receive path failed to advance the hard timeout and revoke the profile");
+
+  const auto blocked = service.receive_command(command(3, 820), 820);
+  expect(
+      !blocked.accepted && blocked.reason == "session_control_profile_required",
+      "fresh packets bypassed profile re-authorization after the hard timeout");
+  expect(
+      adapter_view->status().applied_command_count == controls_before_timeout,
+      "a command reached the adapter after receive-path hard timeout");
   service.close();
 }
 
@@ -3629,7 +3744,11 @@ void test_driver_console_page_keeps_waiting_state_during_background_safety_ticks
       response.body.find("async function send(extra={},announceUnavailable=true)") != std::string::npos,
       "driver console page cannot distinguish background safety ticks from user control attempts");
   expect(
-      response.body.find("await send({},false)") != std::string::npos,
+      response.body.find("function enqueueControlHeartbeat()") != std::string::npos &&
+          response.body.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
+              std::string::npos &&
+          response.body.find("sendPendingControlProfile();enqueueControlHeartbeat()") !=
+              std::string::npos,
       "background safety tick still announces a control fault while waiting for media");
   expect(
       response.body.find("webrtcLabel.textContent='等待车端媒体'") != std::string::npos,
@@ -3711,6 +3830,10 @@ int main() {
       {"control_service_commits_only_successfully_applied_commands",
        test_control_service_commits_only_successfully_applied_commands},
       {"control_service_reports_safe_stop_output_after_timeout", test_control_service_reports_safe_stop_output_after_timeout},
+      {"control_service_recovers_from_degraded_command_gap_without_profile_reapply",
+       test_control_service_recovers_from_degraded_command_gap_without_profile_reapply},
+      {"control_service_receive_path_cannot_bypass_hard_timeout",
+       test_control_service_receive_path_cannot_bypass_hard_timeout},
       {"control_service_preserves_physical_brake_across_degraded_timeout", test_control_service_preserves_physical_brake_across_degraded_timeout},
       {"control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshake",
        test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshake},

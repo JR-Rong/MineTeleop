@@ -1984,18 +1984,21 @@ int main() {
         2,
         7000,
         "V4 R -100 Nm direct session cap");
+    // Move the target beyond the PID reference deadband so this assertion
+    // isolates positive-magnitude R feedback instead of scheduler-dependent
+    // integral hold torque accumulated while the ramp reached its cap.
     feedback = runtime_feedback(5, 2, 1, 5.0);
     expect(
         mine_teleop_chassis_update_feedback(&feedback) == 0 &&
             mine_teleop_chassis_apply_state(
-                2, 5.0, 0.1, steering.data(), steering.size()) == 0,
+                2, 4.0, 0.1, steering.data(), steering.size()) == 0,
         "V4 reverse positive-magnitude speed feedback was rejected");
     bool reverse_torque_withdrawn = false;
     for (int attempt = 0; attempt < 20 && !reverse_torque_withdrawn; ++attempt) {
       expect(
           mine_teleop_chassis_update_feedback(&feedback) == 0 &&
               mine_teleop_chassis_apply_state(
-                  2, 5.0, 0.1, steering.data(), steering.size()) == 0,
+                  2, 4.0, 0.1, steering.data(), steering.size()) == 0,
           "V4 reverse target-speed refresh failed");
       const auto frames = drain_can_frames(pressure_transport[1], 45);
       const auto latest_first_motor = std::find_if(
@@ -2006,7 +2009,20 @@ int main() {
           });
       reverse_torque_withdrawn =
           latest_first_motor != frames.rend() &&
-          can_signal(*latest_first_motor, 8, 14) >= 7900;
+          can_signal(*latest_first_motor, 8, 14) == 8000;
+      if (reverse_torque_withdrawn) {
+        expect(
+            mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+                mine_teleop_chassis_apply_state(
+                    2, 4.0, 0.1, steering.data(), steering.size()) == 0,
+            "V4 reverse target-speed stable withdrawal refresh failed");
+        const auto stable_frames =
+            drain_can_frames(pressure_transport[1], 80);
+        expect_all_motor_torque_raw(
+            stable_frames,
+            8000,
+            "V4 reverse positive-magnitude speed feedback");
+      }
     }
     expect(
         reverse_torque_withdrawn,

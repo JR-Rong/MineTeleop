@@ -166,9 +166,12 @@ latest-wins 判定由可在浏览器和 Node.js 共用的无 DOM 模块实现。
 `POST /api/control` 返回只表示本机 C++ 运行时已为命令补齐元数据（prepared），
 不表示 DataChannel 已发送、对端已接收或车端已接受。浏览器在每次 prepared 后
 记录且仅记录一个终态：`forwarded`、`superseded`、
-`post_prepare_link_changed` 或 `post_prepare_vcu_not_ready`。只有
+`expired_before_forward`、`post_prepare_link_changed` 或 `post_prepare_vcu_not_ready`。只有
 `RTCDataChannel.send()` 正常返回后才计入 `forwarded`；这仍不是 delivered/accepted 证据。
-`superseded`、链路变化和 VCU 未就绪会立即写入结构化浏览器日志；正常的
+高频的 `superseded` 与发送前过期只进入 1 Hz 聚合指标（过期另有 1 Hz 限频诊断）；链路变化和
+VCU 未就绪写入逐事件结构化浏览器日志。所有命令的
+本机准备超过安全截止期时都会中止该 HTTP 请求并保留唯一一条 latest-wins pending 快照。
+普通输入同时清零；ESTOP 会抢占仍在准备的普通命令，已锁存状态不会解除，并由后续心跳重试。正常的
 `prepared` / `forwarded` 心跳不逐条写日志或发起额外 HTTP 请求。浏览器把上述会话内
 累计值、`last_prepared_seq` / `last_forwarded_seq` 和守恒标志
 `control_outcomes_balanced` 合并到现有 1 Hz `/api/webrtc/metrics` 上报，便于核对乱序
