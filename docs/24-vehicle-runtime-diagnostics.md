@@ -304,7 +304,6 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `control_apply_timeout` / `vcu_control_apply_timeout` | Ready 或保留控制状态下，成功上游控制 apply 超过 `control_timeout_ms` 未刷新 | `watchdog/control_apply_timeout` 锁存，本地全停；检查 DataChannel、vehicle-agent 控制循环和命令时序，完成安全退出后重新握手 |
 | `physical_emergency_latched`、`control_apply_rejected` / `vcu_physical_emergency_latched` | `WVCU_EmergencySwitch` 非零，或物理急停锁存期间仍收到普通控制 | `physical_estop/physical_emergency_switch` 本地全停；只能在现场释放开关、完成 N/零速/EPB/manual 反向握手后重新申请，物理来源可覆盖此前软件来源 |
 | `arming_motion_latched` / `vcu_arming_state_motion` | 要求静止的握手阶段实测速度超过 0.1 m/s | `software_fault/arming_motion` 本地全停；完成反向握手并检查速度/挡位反馈后重新申请 |
-| `opposite_direction_motion_latched` / `vcu_opposite_direction_motion` | Ready 且实际挡位匹配时，实测运动方向与所选 D/R 相反 | `software_fault/opposite_direction_motion` 本地全停；检查速度符号、挡位和传动状态，完成反向握手后重新申请 |
 | `hard_overspeed_latched` / `vcu_hard_overspeed` | 实测绝对速度超过本地硬速度上限与 margin | `software_fault/hard_overspeed` 本地全停并锁存；检查速度标定和 profile，完成 Disarmed 且 N/零速反馈新鲜后才允许新握手 |
 | `control_apply_rejected` / `vcu_hard_overspeed_latched` | 硬超速已经锁存后仍收到普通控制 | 保持既有全停，不允许普通控制清除；完成安全退出并从页面重新申请握手 |
 | `chassis_control_fault_latched` / `vcu_chassis_control_fault` | 本地 PID/转矩计算调用 ChassisControl 抛出标准或未知异常 | `software_fault/chassis_control_fault` 本地全停并锁存 I/O fault；检查 vendor ChassisControl 与输入标定，修复后重启，不能靠普通重连清除 |

@@ -334,7 +334,10 @@ VehicleState make_vehicle_state(
     const double* steering_values,
     int steering_count) {
   VehicleState state{};
-  state.cur_velocity = clamp_float(current_speed_mps, -20.0, 20.0);
+  // The field WVCU speed signal is a magnitude in both D and R. Keep that
+  // contract at the ChassisControl boundary as well as in the local PID.
+  state.cur_velocity = clamp_float(
+      mine_teleop_chassis_speed_magnitude_mps(current_speed_mps), 0.0, 20.0);
   state.target_velocity = {clamp_float(target_vx, 0.0, 20.0), 0.0F};
   // Positive traction is generated directly from the local speed PID below.
   // ChassisControl only receives the independent non-positive brake input.
@@ -2187,8 +2190,8 @@ class BridgeRuntime {
     const bool gear_fresh = gear_feedback_fresh_locked(now);
     const bool actual_gear_matches =
         gear_fresh && feedback.gear == intent.gear;
-    const double direction = intent.gear == 2 ? -1.0 : 1.0;
-    const double measured_along_gear_mps = direction * feedback.speed_mps;
+    const double measured_speed_magnitude_mps =
+        mine_teleop_chassis_speed_magnitude_mps(feedback.speed_mps);
     const auto controller_state = controller_.state();
 
     const bool physical_emergency_latched =
@@ -2240,38 +2243,15 @@ class BridgeRuntime {
               std::to_string(feedback.speed_mps));
     }
 
-    if (!physical_emergency_latched && !hard_overspeed_latched_ &&
-        speed_control_.enabled &&
-        controller_state == mine_teleop::vcu::State::Ready && driving_gear &&
-        speed_fresh && actual_gear_matches &&
-        mine_teleop_chassis_opposite_direction_motion(
-            intent.gear, feedback.speed_mps)) {
-      latch_stop_provenance_locked(
-          MINE_TELEOP_CHASSIS_STOP_SOURCE_SOFTWARE_FAULT,
-          MINE_TELEOP_CHASSIS_STOP_REASON_OPPOSITE_DIRECTION_MOTION);
-      hard_overspeed_latched_ = true;
-      controller_.emergency_stop();
-      software_estop_ = true;
-      reset_speed_pid_locked();
-      logger_.issue(
-          "opposite_direction_motion_latched",
-          "vcu_opposite_direction_motion",
-          "local_speed_controller",
-          "measured vehicle motion opposed the selected drive direction",
-          "Keep the vehicle stopped, inspect gear/speed sign and driveline state, complete disarm, then request a new handshake.",
-          "local_full_stop",
-          "\"target_gear\":" + std::to_string(intent.gear) +
-              ",\"measured_speed_mps\":" +
-              std::to_string(feedback.speed_mps));
-    }
-
+    // Field WVCU integrations may report vehicle-speed magnitude for both D and R.
+    // Keep absolute-speed safety below, but do not infer travel direction from sign.
     if (!physical_emergency_latched && !hard_overspeed_latched_ &&
         speed_control_.enabled &&
         speed_safety_active_state(controller_state) && speed_fresh &&
         mine_teleop_chassis_hard_overspeed_latch(
             hard_overspeed_latched_ ? 1 : 0,
             speed_control_.hard_speed_limit_mps,
-            std::abs(feedback.speed_mps),
+            feedback.speed_mps,
             speed_control_.hard_overspeed_margin_mps)) {
       latch_stop_provenance_locked(
           MINE_TELEOP_CHASSIS_STOP_SOURCE_SOFTWARE_FAULT,
@@ -2354,7 +2334,7 @@ class BridgeRuntime {
           &speed_control_.pid,
           &speed_pid_state_,
           intent.target_speed_mps,
-          measured_along_gear_mps,
+          measured_speed_magnitude_mps,
           reachable_normalized_output,
           dt_seconds);
     } else {
@@ -2381,7 +2361,8 @@ class BridgeRuntime {
     const bool direct_pressure_brake = physical_brake_input_ && brake_requested;
     const double chassis_control_longitudinal =
         !direct_pressure_brake && brake_requested ? normalized_output : 0.0;
-    const double measured_speed = speed_fresh ? feedback.speed_mps : 0.0;
+    const double measured_speed =
+        speed_fresh ? measured_speed_magnitude_mps : 0.0;
     Command command;
     try {
       const auto state = make_vehicle_state(

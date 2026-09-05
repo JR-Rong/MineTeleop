@@ -137,9 +137,11 @@ state-specific required feedback must remain fresh, so CAN silence cannot leave
 EPB release asserted indefinitely. After the session reaches Ready, all 29
 critical feedback IDs remain watched across later gear/mode waits. In Ready,
 including zero-traction or braking intents, speed beyond
-`max_speed_kph + hard_overspeed_margin_kph`, or signed motion opposite the
-selected D/R direction by more than 0.1 m/s, latches a local safe stop. Ordinary
-apply calls cannot clear it. Recovery requires the full disarm sequence, fresh
+`max_speed_kph + hard_overspeed_margin_kph` latches a local safe stop. Field WVCU
+vehicle speed is treated as a magnitude by both the PID and hard-speed fuse, and
+its sign is not used to infer D/R travel direction. Gear selection alone controls
+the requested motor-torque direction. Ordinary apply calls cannot clear a hard-speed latch. Recovery
+requires the full disarm sequence, fresh
 valid zero speed, N, all EPBs parked and manual VCU state, followed by an
 explicit new parallel-handshake request.
 

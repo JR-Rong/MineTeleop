@@ -726,6 +726,10 @@ int main() {
 
     const MineTeleopChassisSpeedPidConfig pid_config{
         1.0, 0.5, 0.1, 100.0, 100};
+    expect(
+        mine_teleop_chassis_speed_magnitude_mps(4.5) == 4.5 &&
+            mine_teleop_chassis_speed_magnitude_mps(-4.5) == 4.5,
+        "field vehicle-speed magnitude normalization retained a D/R sign");
     MineTeleopChassisSpeedPidState pid_state{};
     const double saturated_pid = mine_teleop_chassis_speed_pid_step(
         &pid_config, &pid_state, 5.0, 0.0, 1.0, 0.02);
@@ -833,13 +837,6 @@ int main() {
     expect(
         std::abs(d_output - r_output) < 1e-9,
         "D/R direction normalization produced materially different PID output");
-    expect(
-        mine_teleop_chassis_opposite_direction_motion(3, -0.11) == 1 &&
-            mine_teleop_chassis_opposite_direction_motion(2, 0.11) == 1 &&
-            mine_teleop_chassis_opposite_direction_motion(3, 0.11) == 0 &&
-            mine_teleop_chassis_opposite_direction_motion(2, -0.11) == 0,
-        "opposite-direction D/R motion was not rejected symmetrically");
-
     pid_state.integral = 0.5;
     pid_state.initialized = 1;
     expect(
@@ -870,6 +867,7 @@ int main() {
     expect(
         mine_teleop_chassis_hard_overspeed_latch(0, 10.0, 11.0, 1.0) == 0 &&
             mine_teleop_chassis_hard_overspeed_latch(0, 10.0, 11.01, 1.0) == 1 &&
+            mine_teleop_chassis_hard_overspeed_latch(0, 10.0, -11.01, 1.0) == 1 &&
             mine_teleop_chassis_hard_overspeed_latch(0, 0.0, 1.01, 1.0) == 1 &&
             mine_teleop_chassis_hard_overspeed_latch(1, 10.0, 0.0, 1.0) == 1,
         "hard overspeed boundary or latch persistence is incorrect");
@@ -940,8 +938,10 @@ int main() {
       expect(
           event.value("issue_code", "") == "socketcan_open_failed",
           "SocketCAN issue_code is missing");
+      const auto socket_stage = event.value("stage", "");
       expect(
-          event.value("stage", "") == "resolve_interface_index",
+          socket_stage == "socket" ||
+              socket_stage == "resolve_interface_index",
           "SocketCAN open stage is not specific");
       expect(
           event.value("errno", 0) != 0,
@@ -1620,88 +1620,37 @@ int main() {
     feedback = runtime_feedback(5, 3, 1, -0.2);
     expect(
         mine_teleop_chassis_update_feedback(&feedback) == 0,
-        "Ready-D opposite-direction feedback injection failed");
-    MineTeleopChassisTelemetry opposite_direction_telemetry{};
+        "Ready-D signed-speed feedback injection failed");
+    MineTeleopChassisTelemetry signed_speed_telemetry{};
     expect(
         wait_until(
             [&] {
               return mine_teleop_chassis_read_telemetry(
-                         &opposite_direction_telemetry) == 0 &&
-                  opposite_direction_telemetry.estop == 1 &&
-                  opposite_direction_telemetry.stop_source ==
-                      MINE_TELEOP_CHASSIS_STOP_SOURCE_SOFTWARE_FAULT &&
-                  opposite_direction_telemetry.stop_reason ==
-                      MINE_TELEOP_CHASSIS_STOP_REASON_OPPOSITE_DIRECTION_MOTION;
+                         &signed_speed_telemetry) == 0 &&
+                  signed_speed_telemetry.estop == 0 &&
+                  signed_speed_telemetry.stop_reason ==
+                      MINE_TELEOP_CHASSIS_STOP_REASON_NONE;
             },
             100),
-        "Ready-D reverse motion did not latch opposite-direction stop provenance");
+        "Ready driving inferred direction from the vehicle-speed sign");
     expect(
-        opposite_direction_telemetry.stop_sequence > 0,
-        "opposite-direction stop did not advance its provenance sequence");
-    const auto opposite_direction_stop_sequence =
-        opposite_direction_telemetry.stop_sequence;
-    const auto opposite_direction_frames = drain_can_frames(transport[1], 40);
-    expect_all_motor_torque_raw(
-        opposite_direction_frames,
-        8000,
-        "Ready-D opposite-direction stop");
+        wait_until(
+            [&] {
+              std::lock_guard<std::mutex> lock(g_vendor_mutex);
+              return std::any_of(
+                  g_vehicle_states.begin(),
+                  g_vehicle_states.end(),
+                  [](const auto& state) {
+                    return state.cur_velocity > 0.19F &&
+                        state.cur_velocity <= 0.2F;
+                  });
+            },
+            100),
+        "ChassisControl boundary retained a signed reverse speed");
+    feedback = runtime_feedback(5, 3, 1, 0.0);
     expect(
-        can_signal(
-            last_frame_with_id(opposite_direction_frames, 0x18FFD0F5U),
-            4,
-            12) > 0 &&
-            can_signal(
-                last_frame_with_id(opposite_direction_frames, 0x18FED0F5U),
-                8,
-                8) == 0,
-        "opposite-direction stop did not produce EHB safety braking and speed Q0");
-    MineTeleopChassisApplyResultV1 opposite_direction_apply_result{};
-    expect(
-        mine_teleop_chassis_apply_state_v2(
-            3,
-            5.0,
-            0.01,
-            steering.data(),
-            steering.size(),
-            &opposite_direction_apply_result) == -3 &&
-            opposite_direction_apply_result.result_code == -3 &&
-            opposite_direction_apply_result.issue_id ==
-                MINE_TELEOP_CHASSIS_APPLY_ISSUE_HARD_OVERSPEED_LATCHED,
-        "ordinary apply cleared the opposite-direction safety latch");
-    MineTeleopChassisTelemetry retained_opposite_direction_telemetry{};
-    expect(
-        mine_teleop_chassis_read_telemetry(
-            &retained_opposite_direction_telemetry) == 0 &&
-            retained_opposite_direction_telemetry.estop == 1 &&
-            retained_opposite_direction_telemetry.stop_source ==
-                MINE_TELEOP_CHASSIS_STOP_SOURCE_SOFTWARE_FAULT &&
-            retained_opposite_direction_telemetry.stop_reason ==
-                MINE_TELEOP_CHASSIS_STOP_REASON_OPPOSITE_DIRECTION_MOTION &&
-            retained_opposite_direction_telemetry.stop_sequence ==
-                opposite_direction_stop_sequence,
-        "rejected apply replaced the latched opposite-direction root cause");
-    expect(
-        mine_teleop_chassis_request_parallel_handshake() == -2,
-        "opposite-direction latch cleared without completed Disarmed recovery");
-    expect(
-        mine_teleop_chassis_disconnect_parallel_handshake() == 0,
-        "opposite-direction latch prevented explicit disarm");
-    expect(
-        wait_for_handshake_state(MINE_TELEOP_VCU_DISARM_TORQUE),
-        "explicit opposite-direction recovery did not start the reverse handshake");
-    complete_runtime_disarm(3, "opposite-direction recovery");
-
-    expect(
-        mine_teleop_chassis_request_parallel_handshake() == 0,
-        "post-opposite-direction handshake recovery failed");
-    expect(
-        mine_teleop_chassis_apply_state(
-            3, 0.0, 0.0, steering.data(), steering.size()) == 0,
-        "post-opposite-direction D intent was rejected");
-    expect(
-        wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
-        "post-opposite-direction runtime did not restart the handshake");
-    complete_runtime_arming_to_ready(3);
+        mine_teleop_chassis_update_feedback(&feedback) == 0,
+        "post-signed-speed feedback refresh failed");
 
     feedback = runtime_feedback(5, 3, 1, 0.0);
     expect(
@@ -1806,14 +1755,11 @@ int main() {
         }) == 1,
         "Ready hard overspeed did not latch/log exactly once");
     expect(
-        std::count_if(runtime_events.begin(), runtime_events.end(), [](const auto& event) {
+        std::none_of(runtime_events.begin(), runtime_events.end(), [](const auto& event) {
           return event.value("name", "") ==
-                  "opposite_direction_motion_latched" &&
-              event.value("issue_code", "") ==
-                  "vcu_opposite_direction_motion" &&
-              event.value("safety_action", "") == "local_full_stop";
-        }) == 1,
-        "Ready opposite-direction motion did not latch/log exactly once");
+              "opposite_direction_motion_latched";
+        }),
+        "Ready driving still emitted the retired opposite-direction latch");
     expect(
         std::count_if(runtime_events.begin(), runtime_events.end(), [](const auto& event) {
           return event.value("name", "") == "arming_motion_latched";
@@ -2038,6 +1984,33 @@ int main() {
         2,
         7000,
         "V4 R -100 Nm direct session cap");
+    feedback = runtime_feedback(5, 2, 1, 5.0);
+    expect(
+        mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+            mine_teleop_chassis_apply_state(
+                2, 5.0, 0.1, steering.data(), steering.size()) == 0,
+        "V4 reverse positive-magnitude speed feedback was rejected");
+    bool reverse_torque_withdrawn = false;
+    for (int attempt = 0; attempt < 20 && !reverse_torque_withdrawn; ++attempt) {
+      expect(
+          mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+              mine_teleop_chassis_apply_state(
+                  2, 5.0, 0.1, steering.data(), steering.size()) == 0,
+          "V4 reverse target-speed refresh failed");
+      const auto frames = drain_can_frames(pressure_transport[1], 45);
+      const auto latest_first_motor = std::find_if(
+          frames.rbegin(),
+          frames.rend(),
+          [](const auto& frame) {
+            return (frame.can_id & CAN_EFF_MASK) == 0x18F0D0F5U;
+          });
+      reverse_torque_withdrawn =
+          latest_first_motor != frames.rend() &&
+          can_signal(*latest_first_motor, 8, 14) >= 7900;
+    }
+    expect(
+        reverse_torque_withdrawn,
+        "V4 reverse positive-magnitude feedback retained near-full reverse torque");
     {
       std::lock_guard<std::mutex> lock(g_vendor_mutex);
       g_forced_vendor_motor_torque_nm = -1.0;

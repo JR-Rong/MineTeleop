@@ -219,7 +219,6 @@ for issue_code in \
   vcu_control_apply_timeout \
   vcu_physical_emergency_latched \
   vcu_arming_state_motion \
-  vcu_opposite_direction_motion \
   vcu_hard_overspeed \
   vcu_hard_overspeed_latched \
   vcu_chassis_control_fault \

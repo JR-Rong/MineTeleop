@@ -36,6 +36,13 @@ static inline int mine_teleop_chassis_finite(double value) {
     return value == value && value >= -DBL_MAX && value <= DBL_MAX;
 }
 
+/* Field WVCU integrations report vehicle-speed magnitude in both D and R.
+ * Keep the PID measurement unsigned; gear selection alone determines the
+ * requested motor-torque direction. */
+static inline double mine_teleop_chassis_speed_magnitude_mps(double speed_mps) {
+    return fabs(speed_mps);
+}
+
 static inline double mine_teleop_chassis_bounded_motor_torque_nm(
     double normalized_pid_output,
     double max_motor_torque_nm) {
@@ -227,7 +234,7 @@ static inline double mine_teleop_chassis_speed_pid_step(
     const struct MineTeleopChassisSpeedPidConfig* config,
     struct MineTeleopChassisSpeedPidState* state,
     double target_speed_mps,
-    double measured_speed_along_gear_mps,
+    double measured_speed_magnitude_mps,
     double traction_ceiling,
     double dt_seconds) {
     if (!mine_teleop_chassis_speed_pid_config_is_valid(config) || state == 0 ||
@@ -236,7 +243,7 @@ static inline double mine_teleop_chassis_speed_pid_step(
         !mine_teleop_chassis_finite(state->previous_measurement) ||
         (state->initialized != 0 && state->initialized != 1) ||
         !mine_teleop_chassis_finite(target_speed_mps) || target_speed_mps <= 0.0 ||
-        !mine_teleop_chassis_finite(measured_speed_along_gear_mps) ||
+        !mine_teleop_chassis_finite(measured_speed_magnitude_mps) ||
         !mine_teleop_chassis_finite(traction_ceiling) || traction_ceiling <= 0.0 ||
         !mine_teleop_chassis_finite(dt_seconds) || dt_seconds <= 0.0 ||
         dt_seconds * 1000.0 > (double)config->max_dt_ms) {
@@ -245,11 +252,11 @@ static inline double mine_teleop_chassis_speed_pid_step(
     }
 
     if (traction_ceiling > 1.0) traction_ceiling = 1.0;
-    const double error = target_speed_mps - measured_speed_along_gear_mps;
+    const double error = target_speed_mps - measured_speed_magnitude_mps;
     double derivative = 0.0;
     if (state->initialized) {
         const double raw_derivative =
-            (measured_speed_along_gear_mps - state->previous_measurement) /
+            (measured_speed_magnitude_mps - state->previous_measurement) /
             dt_seconds;
         const double tau_seconds = config->derivative_filter_tau_ms / 1000.0;
         const double alpha = tau_seconds <= 0.0
@@ -261,7 +268,7 @@ static inline double mine_teleop_chassis_speed_pid_step(
     } else {
         state->initialized = 1;
     }
-    state->previous_measurement = measured_speed_along_gear_mps;
+    state->previous_measurement = measured_speed_magnitude_mps;
     if (state->integral < 0.0) state->integral = 0.0;
     if (state->integral > traction_ceiling) state->integral = traction_ceiling;
 
@@ -286,13 +293,14 @@ static inline double mine_teleop_chassis_speed_pid_step(
 
 static inline int mine_teleop_chassis_hard_overspeed(
     double target_speed_mps,
-    double measured_speed_along_gear_mps,
+    double measured_speed_mps,
     double margin_mps) {
     return mine_teleop_chassis_finite(target_speed_mps) &&
-        mine_teleop_chassis_finite(measured_speed_along_gear_mps) &&
+        mine_teleop_chassis_finite(measured_speed_mps) &&
         mine_teleop_chassis_finite(margin_mps) && target_speed_mps >= 0.0 &&
         margin_mps > 0.0 &&
-        measured_speed_along_gear_mps > target_speed_mps + margin_mps;
+        mine_teleop_chassis_speed_magnitude_mps(measured_speed_mps) >
+            target_speed_mps + margin_mps;
 }
 
 static inline int mine_teleop_chassis_hard_overspeed_latch(
@@ -302,15 +310,6 @@ static inline int mine_teleop_chassis_hard_overspeed_latch(
     double margin_mps) {
     return already_latched || mine_teleop_chassis_hard_overspeed(
         target_speed_mps, measured_speed_mps, margin_mps);
-}
-
-static inline int mine_teleop_chassis_opposite_direction_motion(
-    int target_gear,
-    double signed_speed_mps) {
-    if (!mine_teleop_chassis_finite(signed_speed_mps)) return 1;
-    if (target_gear == 3) return signed_speed_mps < -0.1;
-    if (target_gear == 2) return signed_speed_mps > 0.1;
-    return 0;
 }
 
 static inline int mine_teleop_chassis_control_watchdog_expired(
@@ -367,6 +366,7 @@ enum MineTeleopChassisStopReason {
     MINE_TELEOP_CHASSIS_STOP_REASON_CAN_SEND_FAILED = 11,
     MINE_TELEOP_CHASSIS_STOP_REASON_IO_THREAD_EXCEPTION = 12,
     MINE_TELEOP_CHASSIS_STOP_REASON_HARD_OVERSPEED = 13,
+    /* Reserved for compatibility with runtimes that emitted this retired reason. */
     MINE_TELEOP_CHASSIS_STOP_REASON_OPPOSITE_DIRECTION_MOTION = 14,
     MINE_TELEOP_CHASSIS_STOP_REASON_ARMING_MOTION = 15,
     MINE_TELEOP_CHASSIS_STOP_REASON_CONTROL_COMMAND_INVALID = 16,
