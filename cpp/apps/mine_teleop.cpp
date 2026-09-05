@@ -163,6 +163,7 @@ void print_help() {
 Usage:
   mine-teleop version
   mine-teleop config-check [--config PATH] [--chassis-bridge-library PATH]
+                           [--verify-configured-ca-bundle]
   mine-teleop vehicle-agent [options]
   mine-teleop vehicle-media-agent [options]
   mine-teleop vehicle-runtime [options]
@@ -818,10 +819,18 @@ int run_vehicle_runtime(const Arguments& arguments) {
 
 int run_vehicle_uploader(const Arguments& arguments) {
   const auto config = mine_teleop::load_vehicle_config(arguments.value("--config", "configs/vehicle-agent.dev.yaml"));
+  if (!config.upload.enabled) {
+    mine_teleop::UploadProcessResult result;
+    result.action = "disabled";
+    std::cout << result.to_json().dump() << std::endl;
+    return 0;
+  }
   mine_teleop::LocalArchiveUploader uploader(
       arguments.value("--recording-root", config.recording.root_dir.string()),
       arguments.value("--archive-root", ".local/archive"),
-      config.upload.max_bandwidth_mbps);
+      config.upload.max_bandwidth_mbps,
+      config.upload.retry_initial_seconds,
+      config.upload.retry_max_seconds);
   const bool service = arguments.has("--service") || arguments.has("--service-mode");
   const int poll_interval_ms = arguments.integer("--poll-interval-ms", 5000);
   if (poll_interval_ms <= 0) throw std::invalid_argument("--poll-interval-ms must be positive");
@@ -831,7 +840,12 @@ int run_vehicle_uploader(const Arguments& arguments) {
     record["backlog"] = uploader.backlog();
     std::cout << record.dump() << std::endl;
     if (!service) return result.action == "failed" ? 2 : 0;
-    if (result.action == "idle") std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms));
+    if (result.action != "uploaded") {
+      const auto retry_delay = result.retry_after_ms > 0
+          ? std::min<std::int64_t>(poll_interval_ms, result.retry_after_ms)
+          : poll_interval_ms;
+      std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay));
+    }
   } while (true);
 }
 
@@ -945,6 +959,20 @@ int main(int argc, char** argv) {
       const auto config = mine_teleop::load_vehicle_config(
           arguments.value("--config", "configs/vehicle-agent.dev.yaml"));
       auto result = config.redacted_summary();
+      if (arguments.has("--verify-configured-ca-bundle")) {
+        result["ca_bundle_file_checked"] = !config.cloud.ca_bundle.empty();
+        if (!config.cloud.ca_bundle.empty()) {
+          std::error_code file_error;
+          const auto regular = std::filesystem::is_regular_file(config.cloud.ca_bundle, file_error);
+          const auto size = regular ? std::filesystem::file_size(config.cloud.ca_bundle, file_error) : 0;
+          std::ifstream input(config.cloud.ca_bundle);
+          if (!regular || file_error || size == 0 || !input) {
+            throw std::runtime_error(
+                "configured CA bundle is not a readable non-empty regular file: " +
+                config.cloud.ca_bundle.string());
+          }
+        }
+      }
       if (arguments.has("--chassis-bridge-library")) {
         const auto library_path = arguments.value("--chassis-bridge-library");
         if (library_path.empty()) {

@@ -268,20 +268,12 @@ recording:
 
 upload:
   enabled: true
-  backend: s3
+  backend: local_archive
   max_bandwidth_mbps: 5
-  trigger_segments: 20
-  trigger_network_idle: true
-  direct_file_upload: true
-  presigned_url_refresh_margin_seconds: 300
+  trigger_segments: 1
+  trigger_network_idle: false
   retry_initial_seconds: 10
   retry_max_seconds: 600
-  s3:
-    endpoint_url: https://s3.us-west-2.amazonaws.com
-    bucket: mine-teleop-recordings
-    region: us-west-2
-    access_key_id: AKIDEXAMPLE
-    secret_access_key_file: /etc/mine-teleop/secrets/s3-secret-access-key
 
 vehicle_adapter:
   type: mock
@@ -455,20 +447,18 @@ version 6 门禁明确拒绝，ABI 5 bridge 也不会被加载；runtime 与 bri
 `control.control_timeout_ms` 没有成功 apply，bridge 会撤销车速请求、将转矩置零并施加
 标定的安全制动；下一条有效 apply 才会清除该 watchdog 锁存。
 
-上传限速必须是有限正数；上传触发数量、URL 刷新安全余量和重试退避时间
-必须是正数；`retry_initial_seconds` 不能大于 `retry_max_seconds`。
-`upload.enabled`、`upload.direct_file_upload` 与 `upload.trigger_network_idle`
+上传限速必须是有限正数；上传触发数量和重试退避时间必须是正数；
+`retry_initial_seconds` 不能大于 `retry_max_seconds`。
+`upload.enabled` 与 `upload.trigger_network_idle`
 必须写成 YAML/TOML boolean `true`/`false`，不能用带引号字符串。
-当前本地参考实现只支持逐文件直接上传，因此 `upload.direct_file_upload`
-必须保持 `true`；打包上传模式未实现时不能用 `false` 静默表达。
+当前原生实现只支持 `upload.backend=local_archive` 和逐片段立即调度；启用上传时
+`trigger_segments` 必须为 `1`、`trigger_network_idle` 必须为 `false`。
 `upload.enabled=false` 只关闭上传侧效果；录像和 sidecar 仍会写入本地磁盘，
-但不会申请上传凭证、入队、扫描 pending sidecar 或执行上传。
+但上传入口不会扫描 pending sidecar 或执行本地归档。
 `delete_unuploaded_when_below_free_gb` 是破坏性开关，必须写成 YAML/TOML boolean
 `true`/`false`，不能用带引号字符串。
-`upload.backend=s3` 时必须配置 `upload.s3` 的 endpoint、bucket、region、
-access key 和 secret。Secret 可以直接配置，也可以用
-`secret_access_key_file` 指向只读凭据文件；运行时有效配置日志只记录
-`configured`，不输出 secret 值或 secret 文件路径。
+S3、预签名 URL、批量触发和网络空闲触发尚未由原生上传器实现；其它 backend
+会在配置加载阶段明确拒绝，不会静默降级。
 
 `vehicle_adapter.type=mock` 可直接无外部依赖运行。配置为 `can` 或
 `dynamic_library` 时，必须显式填写 `field_safety.max_speed_kph`、

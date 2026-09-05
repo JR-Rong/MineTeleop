@@ -1935,6 +1935,13 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
       optional<double>(recording, "delete_uploaded_when_below_free_gb", 2.0);
   config.recording.delete_unuploaded_when_below_free_gb =
       optional<bool>(recording, "delete_unuploaded_when_below_free_gb", false);
+  if (!std::isfinite(config.recording.min_free_gb) || config.recording.min_free_gb <= 0.0 ||
+      !std::isfinite(config.recording.delete_uploaded_when_below_free_gb) ||
+      config.recording.delete_uploaded_when_below_free_gb < 0.0 ||
+      config.recording.delete_uploaded_when_below_free_gb > config.recording.min_free_gb) {
+    throw std::runtime_error(
+        "recording free-space thresholds must be finite, min_free_gb must be positive, and cleanup threshold must not exceed it");
+  }
 
   const auto upload = root["upload"];
   config.upload.enabled = optional<bool>(upload, "enabled", false);
@@ -1944,6 +1951,20 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.upload.trigger_network_idle = optional<bool>(upload, "trigger_network_idle", true);
   config.upload.retry_initial_seconds = optional<int>(upload, "retry_initial_seconds", 10);
   config.upload.retry_max_seconds = optional<int>(upload, "retry_max_seconds", 600);
+  if (config.upload.backend != "local_archive") {
+    throw std::runtime_error("native vehicle uploader only supports upload.backend=local_archive");
+  }
+  if (!std::isfinite(config.upload.max_bandwidth_mbps) || config.upload.max_bandwidth_mbps <= 0.0 ||
+      config.upload.trigger_segments <= 0 || config.upload.retry_initial_seconds <= 0 ||
+      config.upload.retry_max_seconds < config.upload.retry_initial_seconds) {
+    throw std::runtime_error("upload bandwidth, trigger count, and retry bounds are invalid");
+  }
+  if (config.upload.enabled &&
+      (config.upload.trigger_segments != 1 || config.upload.trigger_network_idle)) {
+    throw std::runtime_error(
+        "native local archive uploader supports immediate per-segment scheduling only; "
+        "set trigger_segments=1 and trigger_network_idle=false");
+  }
 
   const auto adapter = root["vehicle_adapter"];
   config.vehicle_adapter.type = optional<std::string>(adapter, "type", "mock");

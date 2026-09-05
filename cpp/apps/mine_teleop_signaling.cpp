@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -86,6 +87,8 @@ class Arguments {
         "--login-failure-window-ms",
         "--login-lockout-ms",
         "--login-max-failures",
+        "--signaling-queue-max-bytes",
+        "--signaling-queue-max-messages",
         "--port",
         "--stun-urls",
         "--trusted-proxy-addresses",
@@ -96,6 +99,9 @@ class Arguments {
         "--validate-config",
         "--vehicle-heartbeat-ms",
         "--vehicle-id",
+        "--websocket-byte-rate-limit",
+        "--websocket-message-rate-limit",
+        "--websocket-rate-limit-window-ms",
         "--version",
     };
     if (!known.contains(std::string(key))) throw std::invalid_argument("unknown option: " + std::string(key));
@@ -127,6 +133,23 @@ std::int64_t configured_integer(
     std::int64_t fallback) {
   if (arguments.has(argument_name)) return arguments.integer(argument_name, fallback);
   return environment_integer(environment_name, fallback);
+}
+
+std::size_t configured_size(
+    const Arguments& arguments,
+    std::string_view argument_name,
+    std::string_view environment_name,
+    std::size_t fallback) {
+  if (fallback > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
+    throw std::invalid_argument(std::string(argument_name) + " default is too large");
+  }
+  const auto value = configured_integer(
+      arguments,
+      argument_name,
+      environment_name,
+      static_cast<std::int64_t>(fallback));
+  if (value <= 0) throw std::invalid_argument(std::string(argument_name) + " must be positive");
+  return static_cast<std::size_t>(value);
 }
 
 std::string read_secret(std::string_view path, std::string_view label) {
@@ -190,6 +213,11 @@ Abuse controls and proxy trust:
   --api-rate-limit-requests N
   --api-rate-limit-window-ms N
   --api-rate-limit-max-sources N
+  --signaling-queue-max-messages N        pending messages per recipient (default 256)
+  --signaling-queue-max-bytes N           pending bytes per recipient (default 8388608)
+  --websocket-message-rate-limit N        messages per participant/window (default 600)
+  --websocket-byte-rate-limit N           bytes per participant/window (default 16777216)
+  --websocket-rate-limit-window-ms N      participant rate window (default 60000)
   --trusted-proxy-addresses CSV
 
 ICE and audit:
@@ -295,6 +323,31 @@ int main(int argc, char** argv) {
         "--api-rate-limit-max-sources",
         "MINE_TELEOP_API_RATE_LIMIT_MAX_SOURCES",
         4096);
+    config.max_signaling_queue_messages = configured_size(
+        arguments,
+        "--signaling-queue-max-messages",
+        "MINE_TELEOP_SIGNALING_QUEUE_MAX_MESSAGES",
+        config.max_signaling_queue_messages);
+    config.max_signaling_queue_bytes = configured_size(
+        arguments,
+        "--signaling-queue-max-bytes",
+        "MINE_TELEOP_SIGNALING_QUEUE_MAX_BYTES",
+        config.max_signaling_queue_bytes);
+    config.websocket_rate_limit_messages = configured_integer(
+        arguments,
+        "--websocket-message-rate-limit",
+        "MINE_TELEOP_WEBSOCKET_MESSAGE_RATE_LIMIT",
+        config.websocket_rate_limit_messages);
+    config.websocket_rate_limit_bytes = configured_size(
+        arguments,
+        "--websocket-byte-rate-limit",
+        "MINE_TELEOP_WEBSOCKET_BYTE_RATE_LIMIT",
+        config.websocket_rate_limit_bytes);
+    config.websocket_rate_limit_window_ms = configured_integer(
+        arguments,
+        "--websocket-rate-limit-window-ms",
+        "MINE_TELEOP_WEBSOCKET_RATE_LIMIT_WINDOW_MS",
+        config.websocket_rate_limit_window_ms);
     config.trusted_proxy_addresses = comma_separated(arguments.value(
         "--trusted-proxy-addresses",
         environment("MINE_TELEOP_TRUSTED_PROXY_ADDRESSES").empty()
@@ -338,6 +391,11 @@ int main(int argc, char** argv) {
     const auto api_rate_limit_requests = config.api_rate_limit_requests;
     const auto api_rate_limit_window_ms = config.api_rate_limit_window_ms;
     const auto api_rate_limit_max_sources = config.api_rate_limit_max_sources;
+    const auto max_signaling_queue_messages = config.max_signaling_queue_messages;
+    const auto max_signaling_queue_bytes = config.max_signaling_queue_bytes;
+    const auto websocket_rate_limit_messages = config.websocket_rate_limit_messages;
+    const auto websocket_rate_limit_bytes = config.websocket_rate_limit_bytes;
+    const auto websocket_rate_limit_window_ms = config.websocket_rate_limit_window_ms;
     const auto trusted_proxy_count = config.trusted_proxy_addresses.size();
     const auto audit_log_max_bytes = config.audit_log_max_bytes;
     const auto audit_log_files = config.audit_log_files;
@@ -386,6 +444,11 @@ int main(int argc, char** argv) {
                      {"api_rate_limit_requests", api_rate_limit_requests},
                      {"api_rate_limit_window_ms", api_rate_limit_window_ms},
                      {"api_rate_limit_max_sources", api_rate_limit_max_sources},
+                     {"max_signaling_queue_messages", max_signaling_queue_messages},
+                     {"max_signaling_queue_bytes", max_signaling_queue_bytes},
+                     {"websocket_rate_limit_messages", websocket_rate_limit_messages},
+                     {"websocket_rate_limit_bytes", websocket_rate_limit_bytes},
+                     {"websocket_rate_limit_window_ms", websocket_rate_limit_window_ms},
                      {"trusted_proxy_count", trusted_proxy_count},
                      {"audit_log_max_bytes", audit_log_max_bytes},
                      {"audit_log_files", audit_log_files},

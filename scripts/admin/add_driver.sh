@@ -34,6 +34,9 @@
 #
 set -euo pipefail
 
+script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
+
 if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
   color_reset=$'\033[0m'
   color_red=$'\033[31m'
@@ -66,7 +69,8 @@ Required:
                             each one must already exist under auth.vehicles
 
 Options:
-  --secrets-dir DIR         credential directory (default: secrets/ next to the config)
+  --secrets-dir DIR         credential directory (default: .local for repo configs,
+                            otherwise secrets/ next to the config)
   --dry-run                 report the planned changes without writing anything
   --help                    show this help
 
@@ -480,11 +484,16 @@ if [[ $dry_run -eq 0 ]]; then
   [[ -w "$config_path" ]] || die "config file is not writable: $config_path"
 fi
 
-# The default credential directory is resolved against the config directory so
-# that the recorded password_file stays relative to the YAML, as the server
-# expects. An explicit --secrets-dir is resolved against the caller's CWD.
+# Keep credentials generated for repository development configs out of the
+# distributable configs tree. Installed /etc-style configs continue to use a
+# sibling secrets directory. An explicit --secrets-dir is resolved against the
+# caller's CWD.
 if [[ -z "$secrets_dir" ]]; then
-  secrets_dir="$config_dir/secrets"
+  if [[ "$config_dir" == "$repo_root/configs" ]]; then
+    secrets_dir="$repo_root/.local/secrets/$(basename -- "$config_path" .yaml)"
+  else
+    secrets_dir="$config_dir/secrets"
+  fi
 elif [[ "$secrets_dir" != /* ]]; then
   secrets_dir="$PWD/$secrets_dir"
 fi
@@ -508,8 +517,14 @@ drivers_raw="$(yaml_ids "$config_path" drivers)" ||
   die "cannot read auth.drivers from $config_path (is it valid YAML?)"
 vehicles_raw="$(yaml_ids "$config_path" vehicles)" ||
   die "cannot read auth.vehicles from $config_path (is it valid YAML?)"
-mapfile -t existing_drivers <<<"$drivers_raw"
-mapfile -t known_vehicles <<<"$vehicles_raw"
+existing_drivers=()
+while IFS= read -r line; do
+  [[ -z "$line" ]] || existing_drivers+=("$line")
+done <<<"$drivers_raw"
+known_vehicles=()
+while IFS= read -r line; do
+  [[ -z "$line" ]] || known_vehicles+=("$line")
+done <<<"$vehicles_raw"
 
 for existing in "${existing_drivers[@]}"; do
   [[ "$existing" == "$driver_id" ]] &&
@@ -547,7 +562,9 @@ fi
 # record a relative path whenever the secrets directory lives under it. -m keeps
 # this working before the credential (or its directory) exists.
 password_file_value="$password_path"
-if relative="$(realpath -m --relative-to="$config_dir" -- "$password_path" 2>/dev/null)" &&
+if [[ "$config_dir" == "$repo_root/configs" && "$password_path" == "$repo_root/.local/"* ]]; then
+  password_file_value="../${password_path#"$repo_root"/}"
+elif relative="$(realpath -m --relative-to="$config_dir" -- "$password_path" 2>/dev/null)" &&
   [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
   password_file_value="$relative"
 fi
@@ -621,7 +638,7 @@ fi
 if [[ ! -d "$secrets_dir" ]]; then
   (umask 077 && mkdir -p -- "$secrets_dir") || die "cannot create secrets directory: $secrets_dir"
   created_secrets_dir="yes"
-  chmod 0700 -- "$secrets_dir"
+  chmod 0700 "$secrets_dir"
   ok "created secrets directory $secrets_dir (mode 0700)"
 fi
 [[ -w "$secrets_dir" ]] || die "secrets directory is not writable: $secrets_dir"
@@ -631,7 +648,7 @@ if ! (umask 077 && openssl rand -base64 32 >"$password_path"); then
   die "openssl failed to generate a password for $driver_id"
 fi
 created_password="yes"
-chmod 0600 -- "$password_path"
+chmod 0600 "$password_path"
 [[ -n "$(tr -d '\r\n' <"$password_path")" ]] ||
   die "generated credential is empty after trimming: $password_path"
 ok "generated credential $password_path (mode 0600)"
@@ -665,7 +682,7 @@ fi
 
 # Publish the new config, preserving the original file mode.
 config_mode="$(stat -c '%a' -- "$config_path" 2>/dev/null || stat -f '%Lp' -- "$config_path")"
-chmod "$config_mode" -- "$work_path"
+chmod "$config_mode" "$work_path"
 mv -f -- "$work_path" "$config_path"
 trap - EXIT
 ok "updated $config_path"

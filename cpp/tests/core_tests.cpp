@@ -440,6 +440,25 @@ void test_config_loads_current_vehicle_yaml() {
       "safe default ordinary brake pressure changed");
 }
 
+void test_vehicle_config_rejects_unsupported_upload_semantics() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  const std::vector<std::pair<std::string, std::pair<std::string, std::string>>> invalid{
+      {"unsupported-backend", {"backend: local_archive", "backend: s3"}},
+      {"unsupported-batch-trigger", {"trigger_segments: 1", "trigger_segments: 2"}},
+      {"unsupported-idle-trigger", {"trigger_network_idle: false", "trigger_network_idle: true"}},
+  };
+  for (const auto& [suffix, replacement] : invalid) {
+    auto contents = base;
+    replace_once(contents, replacement.first, replacement.second);
+    const auto path = write_temp_vehicle_config(suffix, contents);
+    expect_throws(
+        [&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); },
+        "unsupported native upload behavior was accepted");
+    std::error_code error;
+    std::filesystem::remove(path, error);
+  }
+}
+
 void test_vehicle_config_rejects_unimplemented_control_safety_options() {
   const auto base = read_text("configs/vehicle-agent.dev.yaml");
   auto variable_rate = base;
@@ -3426,7 +3445,7 @@ void test_signaling_presence_generation_and_automatic_release() {
   static_cast<void>(http.post_json_response(
       base + "/auth/driver_heartbeat", {{"driver_id", "driver-1"}, {"token", driver_1_token}}));
 
-  const auto heartbeat_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(700);
+  const auto heartbeat_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   mine_teleop::Json after_heartbeat_timeout;
   do {
     after_heartbeat_timeout = http.get_json(base + "/health");
@@ -3750,7 +3769,8 @@ void test_driver_console_page_keeps_waiting_state_during_background_safety_ticks
       response.body.find("function enqueueControlHeartbeat()") != std::string::npos &&
           response.body.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
               std::string::npos &&
-          response.body.find("sendPendingControlProfile();enqueueControlHeartbeat()") !=
+          response.body.find(
+              "sendPendingControlProfile();const enqueued=enqueueControlHeartbeat()") !=
               std::string::npos,
       "background safety tick still announces a control fault while waiting for media");
   expect(
@@ -3777,6 +3797,7 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
         {"session_id", "session-001"},
         {"camera_id", "front"},
         {"segment_id", "segment-001"},
+        {"video_sha256", mine_teleop::sha256_file(video)},
         {"upload_state", "pending"},
     }).dump();
   }
@@ -3786,6 +3807,109 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
   expect(std::filesystem::is_regular_file(archive / result.object_path), "archived video is missing");
   expect(mine_teleop::sha256_file(video) == mine_teleop::sha256_file(archive / result.object_path), "archive hash mismatch");
   expect(uploader.process_once().action == "idle", "uploaded segment was processed twice");
+
+  const auto bad_metadata = segment_dir / "segment-000.json";
+  {
+    std::ofstream output(bad_metadata);
+    output << "{broken-json";
+  }
+  const auto healthy_video = segment_dir / "segment-002.mp4";
+  const auto healthy_metadata = segment_dir / "segment-002.json";
+  {
+    std::ofstream output(healthy_video, std::ios::binary);
+    output << "healthy-later-segment";
+  }
+  {
+    std::ofstream output(healthy_metadata);
+    output << mine_teleop::Json({
+        {"segment_id", "segment-002"},
+        {"video_file", healthy_video.filename().string()},
+        {"video_sha256", mine_teleop::sha256_file(healthy_video)},
+        {"upload_state", "pending"},
+    }).dump();
+  }
+  const auto healthy_result = uploader.process_once();
+  expect(
+      healthy_result.action == "uploaded" && healthy_result.segment_id == "segment-002" &&
+          healthy_result.deferred_failures == 1,
+      "bad earliest sidecar blocked a later healthy segment");
+  const auto retry_wait = uploader.process_once();
+  expect(
+      retry_wait.action == "retry_wait" && retry_wait.retry_after_ms > 0,
+      "bad sidecar retry did not enter bounded backoff");
+
+  const auto tampered_video = segment_dir / "segment-003.mp4";
+  const auto tampered_metadata = segment_dir / "segment-003.json";
+  {
+    std::ofstream output(tampered_video, std::ios::binary);
+    output << "recorded-content";
+  }
+  const auto recorded_hash = mine_teleop::sha256_file(tampered_video);
+  {
+    std::ofstream output(tampered_metadata);
+    output << mine_teleop::Json({
+        {"segment_id", "segment-003"},
+        {"video_sha256", recorded_hash},
+        {"upload_state", "pending"},
+    }).dump();
+  }
+  {
+    std::ofstream output(tampered_video, std::ios::binary | std::ios::trunc);
+    output << "tampered-content";
+  }
+  const auto tampered_result = uploader.process_once();
+  expect(
+      tampered_result.action == "failed" &&
+          tampered_result.error.find("no longer matches") != std::string::npos,
+      "uploader accepted video content that no longer matched the recorded SHA-256");
+  expect(
+      !std::filesystem::exists(archive / std::filesystem::relative(tampered_video, recordings)),
+      "checksum-mismatched video reached the archive");
+
+  const auto storage_root = root / "storage-policy";
+  std::filesystem::create_directories(storage_root);
+  const auto write_storage_segment = [&](std::string_view id, std::string_view state) {
+    const auto video_path = storage_root / (std::string(id) + ".mp4");
+    const auto metadata_path = storage_root / (std::string(id) + ".json");
+    {
+      std::ofstream output(video_path, std::ios::binary);
+      output << id;
+    }
+    {
+      std::ofstream output(metadata_path);
+      output << mine_teleop::Json({
+          {"segment_id", id},
+          {"video_file", video_path.filename().string()},
+          {"upload_state", state},
+      }).dump();
+    }
+    return std::pair{video_path, metadata_path};
+  };
+  const auto uploaded_storage = write_storage_segment("uploaded-old", "uploaded");
+  const auto pending_storage = write_storage_segment("pending-evidence", "pending");
+  const auto available_gb = static_cast<double>(std::filesystem::space(storage_root).available) / 1'000'000'000.0;
+  mine_teleop::RecordingConfig storage_config;
+  storage_config.min_free_gb = available_gb + 1.0;
+  storage_config.delete_uploaded_when_below_free_gb = available_gb + 0.5;
+  storage_config.delete_unuploaded_when_below_free_gb = false;
+  const auto uploaded_cleanup = mine_teleop::enforce_recording_storage_policy(storage_root, storage_config);
+  expect(
+      uploaded_cleanup.removed_uploaded_segments == 1 &&
+          !std::filesystem::exists(uploaded_storage.first) &&
+          !std::filesystem::exists(uploaded_storage.second),
+      "low-space policy did not remove an already archived segment first");
+  expect(
+      std::filesystem::exists(pending_storage.first) && std::filesystem::exists(pending_storage.second) &&
+          uploaded_cleanup.removed_unuploaded_segments == 0 && !uploaded_cleanup.recording_allowed,
+      "default low-space policy deleted pending recording evidence");
+  storage_config.delete_unuploaded_when_below_free_gb = true;
+  const auto explicit_unuploaded_cleanup =
+      mine_teleop::enforce_recording_storage_policy(storage_root, storage_config);
+  expect(
+      explicit_unuploaded_cleanup.removed_unuploaded_segments == 1 &&
+          !std::filesystem::exists(pending_storage.first) &&
+          !std::filesystem::exists(pending_storage.second),
+      "explicit unuploaded cleanup policy did not remove pending evidence");
   std::filesystem::remove_all(root);
 }
 
@@ -3794,6 +3918,7 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"config_loads_current_vehicle_yaml", test_config_loads_current_vehicle_yaml},
+      {"vehicle_config_rejects_unsupported_upload_semantics", test_vehicle_config_rejects_unsupported_upload_semantics},
       {"vehicle_config_rejects_unimplemented_control_safety_options", test_vehicle_config_rejects_unimplemented_control_safety_options},
       {"vehicle_config_validates_full_scale_motor_torque", test_vehicle_config_validates_full_scale_motor_torque},
       {"vehicle_config_requires_physical_brake_pressure_units", test_vehicle_config_requires_physical_brake_pressure_units},

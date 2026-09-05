@@ -802,11 +802,14 @@ int relay_runtime(
 int main(int argc, char** argv) {
   const auto executable = std::filesystem::read_symlink("/proc/self/exe");
   const auto root = executable.parent_path().parent_path();
+  const auto install_root = root.parent_path().filename() == ".releases"
+      ? root.parent_path().parent_path()
+      : root;
   const auto library_path =
       (root / "lib").string() + ":" + (root / "lib/vendor/chassis").string() + ":" +
       (root / "lib/vendor/mvs").string();
-  if (chdir(root.c_str()) != 0) {
-    std::perror("mine-teleop bundle directory");
+  if (chdir(install_root.c_str()) != 0) {
+    std::perror("mine-teleop installation directory");
     return 126;
   }
 
@@ -829,7 +832,7 @@ int main(int argc, char** argv) {
   if (argc == 1) {
     arguments.emplace_back("vehicle-runtime");
     arguments.emplace_back("--config");
-    arguments.push_back((root / "config/vehicle-agent.yaml").string());
+    arguments.push_back((install_root / "config/vehicle-agent.yaml").string());
   } else {
     for (int index = 1; index < argc; ++index) arguments.emplace_back(argv[index]);
   }

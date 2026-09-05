@@ -225,7 +225,7 @@ Telemetry 仍明确标记为非真实车辆反馈。
 
 ### Uploader
 
-负责低优先级上传。
+当前原生实现负责把完整录像片段低优先级归档到本地目录。
 
 能力：
 
@@ -234,22 +234,16 @@ Telemetry 仍明确标记为非真实车辆反馈。
 - 上传成功标记。
 - 上传失败退避重试。
 - 限速。
-- 可暂停。
-- 可恢复。
-- 使用预签名 URL 时，在每次上传前检查有效期，过期或即将过期时重新向云端申请凭证。
+- 按片段独立退避并继续扫描后续片段。
+- 进程内失败恢复；重启后从 pending sidecar 重新扫描。
 
-本地 `VehicleRecorderUploader.scan_pending_segments()` 会扫描录像根目录下
-`upload_state=pending` 且视频文件仍存在的 sidecar，重新向 Upload API 申请
-video/metadata 两类凭证后恢复上传队列；已在队列中的片段不会重复入队。
-`process_once()` 在队列无可执行项时会先触发一次扫描，再决定上传或返回
-`idle`。通过 `from_config()` 创建的 uploader 会把 `upload.trigger_segments`、
-`upload.trigger_bytes_mb` 和 `upload.trigger_interval_seconds` 接入实际调度；
-未达到触发条件时保持 `pending` 并返回 `wait`。
-当 `upload.enabled=false` 时，recorder 仍写入视频和 sidecar，但不会申请上传
-凭证、不会把片段加入上传队列，也不会扫描历史 pending sidecar；`process_once()`
-返回 `disabled`。
-上传目标写入或对象存储适配器抛出 IO 异常时，uploader 会登记失败并进入
-`retry_wait`，而不是把片段留在 `uploading` 状态。
+`LocalArchiveUploader::process_once()` 扫描录像根目录下
+`upload_state=pending` 的 sidecar；先按 sidecar 的 `video_sha256` 验证录像文件，
+再原子复制视频和元数据。损坏或不匹配的片段进入有上限的指数退避，不会阻塞
+后续健康片段。当前只实现 `local_archive`、`trigger_segments=1` 和
+`trigger_network_idle=false`；其它 backend/调度语义会在配置检查中拒绝。
+`upload.enabled=false` 时，recorder 仍写入视频和 sidecar，上传入口直接返回
+`disabled`，不会扫描历史 pending sidecar。
 
 ## 车端启动顺序
 
@@ -282,6 +276,8 @@ systemd `ExecStartPre` 或部署脚本阻止带缺失设备的真实车端启动
   有界丢旧 queue，禁止让实时控制画面被慢磁盘反压。
 - 采集源按该相机的 `reopen_attempts` / `reopen_backoff_ms` 只重开故障 lane。
 - 关键相机首个已确认故障立即安全停车、锁止控制并关闭当前控制 DataChannel。
+  DataChannel 命令准入还会直接检查关键相机最后编码帧时间，因此同步信令请求阻塞时
+  也不能绕过 `media_frame_timeout_ms` 的本地 freshness 门槛。
   相机重新出帧只恢复视频；控制锁存保存在媒体 service loop，因而同一云端 session
   内重建 `VehicleMediaRuntime` 也不会解除锁存。必须结束当前
   session，并在新 session 中建立新的控制 DataChannel、重新完成 VCU 握手后才能

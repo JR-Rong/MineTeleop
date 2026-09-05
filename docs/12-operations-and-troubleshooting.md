@@ -49,7 +49,8 @@ printf '%s\n' '<device-token-from-secret-store>' > config/device-token
 chmod 600 config/device-token
 sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /var/log/mine-teleop
 
-./bin/mine-teleop-run config-check --config config/vehicle-agent.yaml
+./bin/mine-teleop-run config-check --config config/vehicle-agent.yaml \
+  --verify-configured-ca-bundle
 ./bin/mine-teleop-run vehicle-agent \
   --config config/vehicle-agent.yaml \
   --preflight

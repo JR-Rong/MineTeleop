@@ -2056,6 +2056,22 @@ int main() {
     }
 
     expect(
+        mine_teleop_chassis_clear_runtime_control_v1(
+            &runtime_profile_result) == 0 &&
+            runtime_profile_result.applied_revision == 0,
+        "V4 service-brake profile clear failed");
+    const auto cleared_profile_brake_frames =
+        drain_can_frames(pressure_transport[1], 45);
+    expect_all_motor_torque_raw(
+        cleared_profile_brake_frames,
+        8000,
+        "V4 profile clear retained zero traction");
+    expect_all_brake_pressure_raw(
+        cleared_profile_brake_frames,
+        300,
+        "V4 profile clear retained service brake");
+
+    expect(
         mine_teleop_chassis_update_feedback(&feedback) == 0 &&
             mine_teleop_chassis_apply_state(
                 2, 0.0, -(100.0 / 327.6), steering.data(), steering.size()) == 0,

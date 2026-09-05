@@ -33,6 +33,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -170,6 +171,11 @@ class TooManyRequests final : public std::runtime_error {
 
  private:
   std::int64_t retry_after_ms_;
+};
+
+class ServiceUnavailable final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
 };
 
 class SignalingRejected final : public std::runtime_error {
@@ -830,8 +836,72 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
   return request;
 }
 
-std::string console_html(const DriverConfig& config) {
+struct LoopbackHttpAuthority {
+  std::string host;
+  std::uint16_t effective_port{80};
+};
+
+std::optional<LoopbackHttpAuthority> loopback_http_authority(std::string authority) {
+  authority = lower(trim(std::move(authority)));
+  std::string host;
+  std::string_view port;
+  for (const std::string_view candidate : {"127.0.0.1", "localhost", "[::1]"}) {
+    if (authority == candidate) {
+      return LoopbackHttpAuthority{std::string(candidate), 80};
+    }
+    if (authority.starts_with(std::string(candidate) + ":")) {
+      host = candidate;
+      port = std::string_view(authority).substr(candidate.size() + 1);
+      break;
+    }
+  }
+  if (host.empty()) return std::nullopt;
+  if (port.empty() || !std::all_of(port.begin(), port.end(), [](unsigned char value) {
+        return std::isdigit(value) != 0;
+      })) {
+    return std::nullopt;
+  }
+  try {
+    const auto parsed = std::stoul(std::string(port));
+    if (parsed == 0 || parsed > 65535) return std::nullopt;
+    return LoopbackHttpAuthority{std::move(host), static_cast<std::uint16_t>(parsed)};
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+bool application_json_content_type(const HttpRequest& request) {
+  const auto found = request.headers.find("content-type");
+  if (found == request.headers.end()) return false;
+  const auto value = lower(trim(found->second));
+  const auto separator = value.find(';');
+  return trim(value.substr(0, separator)) == "application/json";
+}
+
+bool trusted_local_mutation_request(const HttpRequest& request, std::string_view page_capability) {
+  const auto host = request.headers.find("host");
+  const auto origin = request.headers.find("origin");
+  const auto capability = request.headers.find("x-mine-teleop-page-capability");
+  if (host == request.headers.end() || origin == request.headers.end() || capability == request.headers.end()) {
+    return false;
+  }
+  const auto host_authority = loopback_http_authority(host->second);
+  auto normalized_origin = lower(trim(origin->second));
+  constexpr std::string_view http_scheme = "http://";
+  if (!host_authority || !normalized_origin.starts_with(http_scheme)) return false;
+  const auto origin_authority = loopback_http_authority(normalized_origin.substr(http_scheme.size()));
+  if (!origin_authority || host_authority->host != origin_authority->host ||
+      host_authority->effective_port != origin_authority->effective_port ||
+      capability->second != page_capability) {
+    return false;
+  }
+  const auto fetch_site = request.headers.find("sec-fetch-site");
+  return fetch_site == request.headers.end() || lower(trim(fetch_site->second)) == "same-origin";
+}
+
+std::string console_html(const DriverConfig& config, std::string_view page_capability) {
   const Json page_config = {
+      {"page_capability", page_capability},
       {"rate_hz", config.rate_hz},
       {"estop_hold_ms", config.estop_hold_ms},
       {"max_time_sync_uncertainty_ms", config.max_time_sync_uncertainty_ms},
@@ -899,6 +969,7 @@ body .app-shell{grid-template-rows:auto auto minmax(0,1fr)}
 <dialog id="control-limits-dialog"><h2>当前会话驾驶与 PID 参数</h2><p class="limit-warning">这些值仅用于当前控制会话，必须由车端精确确认后才生效；车端本地硬上限仍会再次截断。三个制动字段都是每路 EHB 压力请求，单位 bar、分辨率 0.1 bar，不是百分比或整车制动力。急停、物理急停、故障、断开停车和 bridge 本地 watchdog 使用独立安全制动，普通 profile 不能削弱这些安全路径。升扭斜率是会话标定值，不是车型级硬上限；0 表示取消升扭限制，下一次牵引可能在一个控制周期内达到当前会话的单电机最大转矩。修改时立即清零当前输入。</p><fieldset><legend>驾驶参数</legend><div class="limit-grid"><label for="target-speed-kph">目标车速上限（km/h）<input id="target-speed-kph" type="number" min="0" max="72" step="0.1" inputmode="decimal"></label><label for="max-motor-torque-nm">单电机最大驱动转矩（Nm）<input id="max-motor-torque-nm" type="number" min="0" max="640.0" step="0.1" inputmode="decimal"></label><label for="max-brake-pressure-bar">每路 EHB 最大普通压力（bar）<input id="max-brake-pressure-bar" type="number" min="0" max="327.6" step="0.1" inputmode="decimal"></label><label for="service-brake-pressure-bar">每路 EHB 缓刹压力（bar）<input id="service-brake-pressure-bar" type="number" min="0" max="327.6" step="0.1" inputmode="decimal"></label><label for="hard-brake-pressure-bar">每路 EHB 急刹压力（bar）<input id="hard-brake-pressure-bar" type="number" min="0" max="327.6" step="0.1" inputmode="decimal"></label><label for="max-steering-deg">最大四轴转向角（°）<input id="max-steering-deg" type="number" min="0" max="30" step="0.5" inputmode="decimal"></label></div></fieldset><fieldset><legend>速度 PID 与升扭标定</legend><p class="muted">PID 初始值与可调范围只使用当前车端上报；未收到完整默认值和范围时禁止提交与驾驶。升扭斜率数值越大，转矩建立越快；0 不是禁用驱动，而是直接跟随 PID 输出。</p><div class="limit-grid"><label for="speed-pid-kp">Kp<input id="speed-pid-kp" type="number" min="0" max="100" step="0.01" inputmode="decimal"></label><label for="speed-pid-ki">Ki<input id="speed-pid-ki" type="number" min="0" max="100" step="0.01" inputmode="decimal"></label><label for="speed-pid-kd">Kd<input id="speed-pid-kd" type="number" min="0" max="100" step="0.01" inputmode="decimal"></label><label for="speed-pid-derivative-filter-tau-ms">微分滤波 τ（ms）<input id="speed-pid-derivative-filter-tau-ms" type="number" min="0" max="2000" step="1" inputmode="numeric"></label><label for="speed-pid-max-dt-ms">最大采样周期（ms）<input id="speed-pid-max-dt-ms" type="number" min="20" max="200" step="1" inputmode="numeric"></label><label for="motor-torque-rise-rate">升扭斜率（Nm/s，0=直接跟随 PID 输出）<input id="motor-torque-rise-rate" type="number" min="0" max="32000" step="1" inputmode="decimal" required></label></div></fieldset><p id="vehicle-hard-limits" class="muted">等待车端硬上限与 PID 默认值</p><label><input id="control-limits-confirm" type="checkbox">我已确认车辆处于 N 挡、零速、电子驻车或隔离 mock 台架，并理解 0 表示取消升扭限制、可能单周期达到会话转矩上限</label><div><button id="control-limits-apply" disabled>发送并等待车端确认</button><button id="control-limits-cancel">取消</button></div></dialog></main><script>)HTML" + std::string(web::kControlLogicJavaScript) + R"HTML(</script><script>
 const controlLogic=MineTeleopControlLogic;
 const consoleConfig=)HTML" + page_config.dump() + R"HTML(;
+const pageCapability=consoleConfig.page_capability;
 const gamepadConfig=consoleConfig.gamepad;
 const limitConfig=consoleConfig.control_limits;
 const keys=controlLogic.KEY_BINDINGS;
@@ -920,9 +991,9 @@ const operatorControlReadouts={gear:document.getElementById('operator-control-ge
 let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,gearRejectionInhibited=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,lastVehicleSafetyState='',vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,pendingGearTransition=null,gearTransitionGeneration=0,lastControlStatusSeq=0,lastControlPrepareTimeoutLogAt=0,lastControlPrepareExpiredLogAt=0,activeControlPrepareAbort=null,activeControlPrepareIsEstop=false,activeControlPreparePreemptedByEstop=false;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
 let controlOutcomeSession={metrics:controlLogic.createControlOutcomeMetrics()};
 function responseError(response,body){const error=Error(body.error||response.status);error.status=response.status;return error}
-async function post(path,body={},signal=null){const options={method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)};if(signal)options.signal=signal;const r=await fetch(path,options);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
+async function post(path,body={},signal=null){const options={method:'POST',headers:{'content-type':'application/json','x-mine-teleop-page-capability':pageCapability},body:JSON.stringify(body)};if(signal)options.signal=signal;const r=await fetch(path,options);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 async function get(path){const r=await fetch(path);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
-function clientLog(event,details={}){const entry={event,sent_at_utc_ms:Date.now(),details};console.info(JSON.stringify(entry));fetch('/api/browser-event',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(entry),keepalive:true}).catch(()=>{})}
+function clientLog(event,details={}){const entry={event,sent_at_utc_ms:Date.now(),details};console.info(JSON.stringify(entry));fetch('/api/browser-event',{method:'POST',headers:{'content-type':'application/json','x-mine-teleop-page-capability':pageCapability},body:JSON.stringify(entry),keepalive:true}).catch(()=>{})}
 function createControlTraceSummary(){return{interval_started_at_utc_ms:Date.now(),heartbeat_tick_count:0,heartbeat_enqueued_count:0,heartbeat_coalesced_count:0,timer_lag_sample_count:0,timer_lag_total_ms:0,timer_lag_max_ms:0,explicit_send_count:0,backpressure_count:0,max_buffered_amount_bytes:0,prepare_timeout_count:0,prepare_expired_count:0,prepare_preempted_by_estop_count:0,queue_unhandled_error_count:0}}
 function noteControlHeartbeat(now){if(!controlTraceEnabled)return;controlTraceSummary.heartbeat_tick_count++;if(lastHeartbeatTraceAt!==null){const lag=Math.max(0,now-lastHeartbeatTraceAt-controlHeartbeatIntervalMs);controlTraceSummary.timer_lag_sample_count++;controlTraceSummary.timer_lag_total_ms+=lag;controlTraceSummary.timer_lag_max_ms=Math.max(controlTraceSummary.timer_lag_max_ms,lag)}lastHeartbeatTraceAt=now}
 function noteControlBackpressure(bufferedAmount){if(!controlTraceEnabled)return;const bytes=Math.max(0,Number(bufferedAmount)||0);controlTraceSummary.backpressure_count++;controlTraceSummary.max_buffered_amount_bytes=Math.max(controlTraceSummary.max_buffered_amount_bytes,bytes)}
@@ -1190,7 +1261,7 @@ async function heartbeat(){const now=performance.now();if(!polling){lastHeartbea
 function advertisedCodecs(){const caps=RTCRtpReceiver.getCapabilities&&RTCRtpReceiver.getCapabilities('video');const found=new Set(['h264']);for(const c of (caps&&caps.codecs)||[]){const m=(c.mimeType||'').toLowerCase();if(m.includes('h265')||m.includes('hevc'))found.add('h265');if(m.includes('h264')||m.includes('avc'))found.add('h264')}return [...found]}
 async function connect(){if(connecting)return;const target=vehicleSelect.value;if(!target)throw Error('没有可连接的在线车辆');const fromVehicle=latestRuntimeStatus.connected?latestRuntimeStatus.vehicle_id:'';if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}const changingVehicle=Boolean(fromVehicle)&&fromVehicle!==target;const reconnecting=Boolean(fromVehicle)&&fromVehicle===target;const hadRealtime=polling;let suspendedGeneration=signalingGeneration;if((changingVehicle||reconnecting)&&hadRealtime){suspendedGeneration=suspendSignalingPoll();clearControlInput()}connecting=true;connectButton.disabled=true;if(changingVehicle){webrtcLabel.textContent='正在安全切换车辆';statusPanel.textContent=`正在验证 ${target}，成功后释放 ${fromVehicle}`;clientLog('driver_vehicle_switch_started',{from_vehicle_id:fromVehicle,to_vehicle_id:target})}let session=null,generation=signalingGeneration;try{session=await post('/api/connect',{vehicle_id:target});generation=closeRealtimeSession();setControlTraceScope(session.session_id,session.vehicle_id);controlAuthorityLost=true;const ice=await post('/api/webrtc/ice-servers');iceServers=ice.ice_servers||[];await post('/api/webrtc/capabilities',{codecs:advertisedCodecs()});polling=true;controlAuthorityLost=false;latestRuntimeStatus=await get('/api/status');webrtcLabel.textContent='等待车端媒体';statusPanel.textContent=`会话 ${session.session_id} · ${session.vehicle_id}`;connectButton.textContent='切换所选车辆';document.querySelector('main').focus();renderMonitoring();clientLog(changingVehicle?'driver_vehicle_switched':(reconnecting?'driver_session_reconnected':'driver_session_connected'),{from_vehicle_id:fromVehicle||undefined,session_id:session.session_id,vehicle_id:session.vehicle_id});pollSignaling(generation)}catch(error){if(session){flushControlTrace('connect_setup_failed');controlTraceScope={session_id:'',vehicle_id:''};await post('/api/end-session',{reason:'driver_connect_setup_failed'}).catch(()=>{})}latestRuntimeStatus=await get('/api/status').catch(()=>({connected:false}));const retained=Boolean(!session&&latestRuntimeStatus.connected&&hadRealtime);if(retained){polling=true;controlAuthorityLost=false;webrtcLabel.textContent=controlChannel&&controlChannel.readyState==='open'?'控制链路已连接':'当前会话已保留';statusPanel.textContent=`切换失败，当前会话已保留: ${error.message}`;clientLog('driver_vehicle_switch_rejected',{from_vehicle_id:fromVehicle,to_vehicle_id:target,error:error.message});pollSignaling(suspendedGeneration)}else{controlAuthorityLost=Boolean(latestRuntimeStatus.connected)}connectButton.textContent=latestRuntimeStatus.connected?'切换所选车辆':'连接所选车辆';renderMonitoring();if(!retained)throw error}finally{connecting=false;connectButton.disabled=!vehicleSelect.value}}
 async function logout(){const estopConfirmed=vehicleTelemetry?.estop===true;closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='正在释放控制权';await post('/api/disconnect',{reason:'driver_safe_logout'});authenticated=false;controlAuthorityLost=false;connectButton.textContent='连接所选车辆';renderAuthExpiry(0);sessionPanel.hidden=true;vcuPanel.hidden=true;canFeedbackPanel.hidden=true;monitorPanel.hidden=true;loginPanel.hidden=false;webrtcLabel.textContent='未连接';statusPanel.textContent=estopLatched?(estopConfirmed?'已安全退出；车辆急停已确认，仍需本地确认复位':'已安全退出；急停请求未获车端确认，请在车辆本地核实'):'已安全退出';clientLog('driver_safe_logout',{estop_request_latched:estopLatched,estop_confirmed:estopConfirmed})}
-addEventListener('pagehide',()=>{flushControlTrace('pagehide');closeRealtimeSession();if(authenticated)fetch('/api/disconnect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({reason:'browser_page_closed'}),keepalive:true}).catch(()=>{})});
+addEventListener('pagehide',()=>{flushControlTrace('pagehide');closeRealtimeSession();if(authenticated)fetch('/api/disconnect',{method:'POST',headers:{'content-type':'application/json','x-mine-teleop-page-capability':pageCapability},body:JSON.stringify({reason:'browser_page_closed'}),keepalive:true}).catch(()=>{})});
 function neutralizeInput(){clearControlInput(false);send({},false).catch(console.error)}
 addEventListener('blur',neutralizeInput);document.addEventListener('visibilitychange',()=>{if(document.hidden)neutralizeInput()});
 document.querySelector('#login').onclick=()=>login().catch(e=>{statusPanel.textContent='登录失败: '+e.message});
@@ -1742,7 +1813,10 @@ SignalingService::SignalingService(
     throw std::invalid_argument("TURN credential TTL must be positive");
   }
   if (config_.max_signaling_payload_bytes == 0 || config_.max_sdp_bytes == 0 ||
-      config_.max_ice_candidate_bytes == 0 || config_.signaling_message_ttl_ms <= 0) {
+      config_.max_ice_candidate_bytes == 0 || config_.signaling_message_ttl_ms <= 0 ||
+      config_.max_signaling_queue_messages == 0 || config_.max_signaling_queue_bytes == 0 ||
+      config_.websocket_rate_limit_messages <= 0 || config_.websocket_rate_limit_bytes == 0 ||
+      config_.websocket_rate_limit_window_ms <= 0) {
     throw std::invalid_argument("signaling limits and message TTL must be positive");
   }
   if (config_.stun_urls.empty() && config_.turn_urls.empty()) {
@@ -1776,19 +1850,32 @@ SignalingService::SignalingService(
       }
     }
   }
-  audit(
-      "signaling_service_started",
-      {{"runtime", "cpp"},
-       {"audit_log_max_bytes", config_.audit_log_max_bytes},
-       {"audit_log_files", config_.audit_log_files},
-       {"audit_log_rotation_interval_ms", config_.audit_log_rotation_interval_ms},
-       {"audit_log_retention_days", config_.audit_log_retention_days}});
+  if (!audit(
+          "signaling_service_started",
+          {{"runtime", "cpp"},
+           {"audit_log_max_bytes", config_.audit_log_max_bytes},
+           {"audit_log_files", config_.audit_log_files},
+           {"audit_log_rotation_interval_ms", config_.audit_log_rotation_interval_ms},
+           {"audit_log_retention_days", config_.audit_log_retention_days}})) {
+    throw std::runtime_error("signaling audit log is unavailable at startup");
+  }
   connection_reaper_ = std::jthread([this](std::stop_token stop_token) {
     while (!stop_token.stop_requested()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(config_.connection_reaper_interval_ms));
       if (stop_token.stop_requested()) break;
-      std::lock_guard lock(mutex_);
-      cleanup_expired_connections(now_ms());
+      try {
+        std::lock_guard lock(mutex_);
+        cleanup_expired_connections(now_ms());
+        connection_reaper_healthy_.store(true);
+      } catch (const std::exception& error) {
+        connection_reaper_healthy_.store(false);
+        connection_reaper_failures_.fetch_add(1);
+        std::cerr << "mine-teleop-signaling: connection reaper recovered from error: " << error.what() << '\n';
+      } catch (...) {
+        connection_reaper_healthy_.store(false);
+        connection_reaper_failures_.fetch_add(1);
+        std::cerr << "mine-teleop-signaling: connection reaper recovered from unknown error\n";
+      }
     }
   });
 }
@@ -1805,6 +1892,8 @@ Json SignalingService::health() const {
     return item.second.state == SessionState::Active || item.second.state == SessionState::Degraded;
   });
   std::uint64_t turn_relay_bytes_total = 0;
+  std::size_t queued_signaling_messages = 0;
+  std::size_t queued_signaling_bytes = 0;
   std::size_t turn_usage_sessions = 0;
   for (const auto& [id, session] : sessions_) {
     static_cast<void>(id);
@@ -1814,6 +1903,15 @@ Json SignalingService::health() const {
     turn_relay_bytes_total = session_total > std::numeric_limits<std::uint64_t>::max() - turn_relay_bytes_total
         ? std::numeric_limits<std::uint64_t>::max()
         : turn_relay_bytes_total + session_total;
+  }
+  for (const auto& [key, queue] : messages_) {
+    static_cast<void>(key);
+    queued_signaling_messages += queue.size();
+    for (const auto& message : queue) {
+      queued_signaling_bytes = message.serialized_bytes > std::numeric_limits<std::size_t>::max() - queued_signaling_bytes
+          ? std::numeric_limits<std::size_t>::max()
+          : queued_signaling_bytes + message.serialized_bytes;
+    }
   }
   const auto login_locked_buckets = std::count_if(login_failures_.begin(), login_failures_.end(), [&](const auto& item) {
     return item.second.blocked_until_ms > timestamp_ms;
@@ -1836,6 +1934,20 @@ Json SignalingService::health() const {
         {"count", 1},
     });
   }
+  if (!audit_healthy_.load()) {
+    alerts.push_back({
+        {"code", "audit_log_unavailable"},
+        {"severity", "critical"},
+        {"count", audit_write_failures_.load()},
+    });
+  }
+  if (!connection_reaper_healthy_.load()) {
+    alerts.push_back({
+        {"code", "connection_reaper_unhealthy"},
+        {"severity", "critical"},
+        {"count", connection_reaper_failures_.load()},
+    });
+  }
   const auto alert_count = alerts.size();
   return {
       {"status", alerts.empty() ? "ok" : "degraded"},
@@ -1853,6 +1965,13 @@ Json SignalingService::health() const {
       {"api_rate_limit_tracked_sources", api_rate_limits_.size()},
       {"api_rate_limit_overflow_active", api_rate_limit_overflow_active},
       {"api_rate_limited_requests", api_rate_limited_requests_},
+      {"queued_signaling_messages", queued_signaling_messages},
+      {"queued_signaling_bytes", queued_signaling_bytes},
+      {"signaling_queue_rejections", signaling_queue_rejections_},
+      {"audit_healthy", audit_healthy_.load()},
+      {"audit_write_failures", audit_write_failures_.load()},
+      {"connection_reaper_healthy", connection_reaper_healthy_.load()},
+      {"connection_reaper_failures", connection_reaper_failures_.load()},
       {"turn_usage_sessions", turn_usage_sessions},
       {"turn_relay_bytes_total", turn_relay_bytes_total},
   };
@@ -1941,6 +2060,7 @@ void SignalingService::close_sessions_for_driver(std::string_view driver_id, std
 }
 
 void SignalingService::cleanup_expired_connections(std::int64_t timestamp_ms) {
+  prune_expired_signaling_messages(timestamp_ms);
   for (auto token = driver_tokens_.begin(); token != driver_tokens_.end();) {
     if (timestamp_ms < token->second.expires_at_ms) {
       ++token;
@@ -2006,6 +2126,20 @@ void SignalingService::cleanup_expired_connections(std::int64_t timestamp_ms) {
         {{"driver_id", driver_id},
          {"connection_generation", generation},
          {"reason", "heartbeat_timeout"}});
+  }
+}
+
+void SignalingService::prune_expired_signaling_messages(std::int64_t timestamp_ms) {
+  for (auto queue = messages_.begin(); queue != messages_.end();) {
+    std::erase_if(queue->second, [&](const auto& message) {
+      return timestamp_ms < message.queued_at_utc_ms ||
+          timestamp_ms - message.queued_at_utc_ms >= config_.signaling_message_ttl_ms;
+    });
+    if (queue->second.empty()) {
+      queue = messages_.erase(queue);
+    } else {
+      ++queue;
+    }
   }
 }
 
@@ -2178,53 +2312,67 @@ void SignalingService::enforce_api_rate_limit(const HttpRequest& request, std::i
   throw TooManyRequests("API request rate limit exceeded", retry_after_ms);
 }
 
-void SignalingService::audit(std::string_view event, const Json& details) const {
-  if (config_.audit_log_path.empty()) return;
-  const auto timestamp_ms = audit_clock_ ? audit_clock_() : now_ms();
-  const auto max_bytes = static_cast<std::uint64_t>(config_.audit_log_max_bytes);
-  Json record = {
-      {"event", event},
-      {"sent_at_utc_ms", timestamp_ms},
-      {"service_instance_id", service_instance_id_},
-      {"details", sanitize_log_value(details)}};
-  if (!active_request_id.empty()) record["request_id"] = active_request_id;
-  const auto line = record.dump();
-  if (static_cast<std::uint64_t>(line.size()) >= max_bytes) {
-    throw std::runtime_error("signaling audit record exceeds configured maximum size");
-  }
-  std::lock_guard log_lock(audit_log_mutex_);
-  const auto current_period =
-      log_period_start(timestamp_ms, config_.audit_log_rotation_interval_ms);
-  if (audit_log_period_start_ms_ < 0) {
-    audit_log_period_start_ms_ = existing_log_period(
+bool SignalingService::audit(std::string_view event, const Json& details) const noexcept {
+  if (config_.audit_log_path.empty()) return true;
+  try {
+    const auto timestamp_ms = audit_clock_ ? audit_clock_() : now_ms();
+    const auto max_bytes = static_cast<std::uint64_t>(config_.audit_log_max_bytes);
+    Json record = {
+        {"event", event},
+        {"sent_at_utc_ms", timestamp_ms},
+        {"service_instance_id", service_instance_id_},
+        {"details", sanitize_log_value(details)}};
+    if (!active_request_id.empty()) record["request_id"] = active_request_id;
+    const auto line = record.dump();
+    if (static_cast<std::uint64_t>(line.size()) >= max_bytes) {
+      throw std::runtime_error("signaling audit record exceeds configured maximum size");
+    }
+    std::lock_guard log_lock(audit_log_mutex_);
+    const auto current_period =
+        log_period_start(timestamp_ms, config_.audit_log_rotation_interval_ms);
+    if (audit_log_period_start_ms_ < 0) {
+      audit_log_period_start_ms_ = existing_log_period(
+          config_.audit_log_path,
+          config_.audit_log_rotation_interval_ms,
+          current_period);
+    }
+    if (audit_log_period_start_ms_ != current_period) {
+      archive_jsonl_period(
+          config_.audit_log_path,
+          audit_log_period_start_ms_,
+          static_cast<int>(config_.audit_log_files));
+      audit_log_period_start_ms_ = current_period;
+    }
+    if (audit_log_last_retention_period_ms_ != current_period) {
+      prune_jsonl_periods(
+          config_.audit_log_path,
+          current_period,
+          config_.audit_log_retention_days);
+      audit_log_last_retention_period_ms_ = current_period;
+    }
+    rotate_jsonl_log(
         config_.audit_log_path,
-        config_.audit_log_rotation_interval_ms,
-        current_period);
+        max_bytes,
+        static_cast<int>(config_.audit_log_files),
+        line.size() + 1);
+    std::ofstream output(config_.audit_log_path, std::ios::app);
+    if (!output) throw std::runtime_error("cannot append signaling audit log");
+    output << line << '\n';
+    output.flush();
+    if (!output) throw std::runtime_error("cannot append signaling audit log");
+    audit_healthy_.store(true);
+    return true;
+  } catch (...) {
+    audit_healthy_.store(false);
+    audit_write_failures_.fetch_add(1);
+    const auto timestamp_ms = now_ms();
+    auto last_report_ms = audit_last_fallback_report_ms_.load();
+    if ((last_report_ms == 0 || timestamp_ms - last_report_ms >= 60 * 1000) &&
+        audit_last_fallback_report_ms_.compare_exchange_strong(last_report_ms, timestamp_ms)) {
+      std::cerr << "mine-teleop-signaling: audit log unavailable; new control sessions are disabled\n";
+    }
+    return false;
   }
-  if (audit_log_period_start_ms_ != current_period) {
-    archive_jsonl_period(
-        config_.audit_log_path,
-        audit_log_period_start_ms_,
-        static_cast<int>(config_.audit_log_files));
-    audit_log_period_start_ms_ = current_period;
-  }
-  if (audit_log_last_retention_period_ms_ != current_period) {
-    prune_jsonl_periods(
-        config_.audit_log_path,
-        current_period,
-        config_.audit_log_retention_days);
-    audit_log_last_retention_period_ms_ = current_period;
-  }
-  rotate_jsonl_log(
-      config_.audit_log_path,
-      max_bytes,
-      static_cast<int>(config_.audit_log_files),
-      line.size() + 1);
-  std::ofstream output(config_.audit_log_path, std::ios::app);
-  if (!output) throw std::runtime_error("cannot append signaling audit log");
-  output << line << '\n';
-  output.flush();
-  if (!output) throw std::runtime_error("cannot append signaling audit log");
 }
 
 ServerResponse SignalingService::handle(const HttpRequest& request) {
@@ -2246,6 +2394,8 @@ ServerResponse SignalingService::handle(const HttpRequest& request) {
     response = ServerResponse::json(401, {{"error", error.what()}});
   } catch (const TooManyRequests& error) {
     response = too_many_requests_response(error);
+  } catch (const ServiceUnavailable& error) {
+    response = ServerResponse::json(503, {{"error", error.what()}, {"issue_code", "audit_log_unavailable"}});
   } catch (const NotFound& error) {
     response = ServerResponse::json(404, {{"error", error.what()}});
   } catch (const Conflict& error) {
@@ -2399,6 +2549,44 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       if (received.status == WebSocketReceiveStatus::Timeout) continue;
       if (received.status == WebSocketReceiveStatus::Closed) return true;
       try {
+        const auto serialized_bytes = received.message.dump().size();
+        const auto rate_now = std::chrono::steady_clock::now();
+        std::optional<std::int64_t> retry_after_ms;
+        {
+          std::lock_guard lock(mutex_);
+          cleanup_expired_connections(now_ms());
+          const auto& session = require_participant(parts[1], participant);
+          validate_actor_credential(session, participant, credentials);
+          auto& rate = sessions_.at(parts[1]).websocket_rate_by_participant[participant];
+          const auto rate_window = std::chrono::milliseconds(config_.websocket_rate_limit_window_ms);
+          if (rate.window_started_at == std::chrono::steady_clock::time_point{} ||
+              rate_now - rate.window_started_at >= rate_window) {
+            rate.window_started_at = rate_now;
+            rate.messages = 0;
+            rate.bytes = 0;
+          }
+          const bool message_limit = rate.messages >= config_.websocket_rate_limit_messages;
+          const bool byte_limit = serialized_bytes > config_.websocket_rate_limit_bytes -
+              std::min(rate.bytes, config_.websocket_rate_limit_bytes);
+          if (message_limit || byte_limit) {
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                rate_now - rate.window_started_at).count();
+            retry_after_ms = std::max<std::int64_t>(
+                1,
+                config_.websocket_rate_limit_window_ms - elapsed_ms);
+          } else {
+            ++rate.messages;
+            rate.bytes += serialized_bytes;
+          }
+        }
+        if (retry_after_ms) {
+          connection.send_json(
+              {{"event", "signaling_rate_limited"},
+               {"error", "websocket participant rate limit exceeded"},
+               {"retry_after_ms", retry_after_ms.value()}});
+          connection.send_close(1008, "signaling rate limit exceeded");
+          return true;
+        }
         if (received.message.value("event", "") == "signaling_delivery_ack") {
           const auto delivery_cursor = required_uint64(received.message, "delivery_cursor");
           if (delivery_cursor > last_delivery_cursor_sent) {
@@ -2427,6 +2615,11 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
           acknowledgement = enqueue_signaling_message(parts[1], received.message, participant);
         }
         connection.send_json(acknowledgement);
+      } catch (const TooManyRequests& error) {
+        connection.send_json(
+            {{"error", error.what()},
+             {"event", "signaling_backpressure"},
+             {"retry_after_ms", error.retry_after_ms()}});
       } catch (const std::exception& error) {
         connection.send_json({{"error", error.what()}, {"event", "signaling_message_rejected"}});
       }
@@ -2442,17 +2635,8 @@ Json SignalingService::take_signaling_messages(
     std::string_view requested_types,
     bool consume) {
   Json values = Json::array();
+  prune_expired_signaling_messages(now_ms());
   auto found = messages_.find(message_key(session_id, recipient));
-  if (found != messages_.end()) {
-    const auto timestamp_ms = now_ms();
-    std::erase_if(found->second, [&](const auto& message) {
-      return timestamp_ms - message.queued_at_utc_ms >= config_.signaling_message_ttl_ms;
-    });
-    if (found->second.empty()) {
-      messages_.erase(found);
-      found = messages_.end();
-    }
-  }
   if (found == messages_.end()) return values;
   if (requested_types.empty()) {
     for (const auto& message : found->second) values.push_back(message.to_json());
@@ -2543,7 +2727,8 @@ Json SignalingService::enqueue_signaling_message(
   }
   const auto payload = value.value("payload", Json::object());
   if (!payload.is_object()) throw std::invalid_argument("payload must be an object");
-  if (payload.dump().size() > config_.max_signaling_payload_bytes) {
+  const auto serialized_payload = payload.dump();
+  if (serialized_payload.size() > config_.max_signaling_payload_bytes) {
     throw std::invalid_argument("signaling payload exceeds configured limit");
   }
   if (type == "webrtc_offer" || type == "webrtc_answer") {
@@ -2561,7 +2746,7 @@ Json SignalingService::enqueue_signaling_message(
     }
   }
   const auto sequence_key = message_key(session_id, sender);
-  const auto fingerprint = recipient + "\n" + type + "\n" + metadata.to_json().dump() + "\n" + payload.dump();
+  const auto fingerprint = recipient + "\n" + type + "\n" + metadata.to_json().dump() + "\n" + serialized_payload;
   if (const auto accepted = last_accepted_messages_.find(sequence_key); accepted != last_accepted_messages_.end()) {
     if (metadata.seq < accepted->second.sequence) {
       throw Conflict(
@@ -2591,11 +2776,50 @@ Json SignalingService::enqueue_signaling_message(
     }
   }
   const auto recipient_key = message_key(session_id, recipient);
-  const auto delivery_cursor = ++next_delivery_cursors_[recipient_key];
+  const auto queued_at_utc_ms = now_ms();
+  prune_expired_signaling_messages(queued_at_utc_ms);
   auto& queue = messages_[recipient_key];
-  queue.push_back(Message{metadata, sender, recipient, type, payload, now_ms(), delivery_cursor});
+  std::size_t queue_bytes = 0;
+  for (const auto& message : queue) {
+    queue_bytes = message.serialized_bytes > std::numeric_limits<std::size_t>::max() - queue_bytes
+        ? std::numeric_limits<std::size_t>::max()
+        : queue_bytes + message.serialized_bytes;
+  }
+  const auto serialized_bytes = value.dump().size();
+  const bool message_capacity_reached = queue.size() >= config_.max_signaling_queue_messages;
+  const bool byte_capacity_reached = serialized_bytes > config_.max_signaling_queue_bytes -
+      std::min(queue_bytes, config_.max_signaling_queue_bytes);
+  if (message_capacity_reached || byte_capacity_reached) {
+    const auto queued_messages = queue.size();
+    if (signaling_queue_rejections_ < std::numeric_limits<std::uint64_t>::max()) {
+      ++signaling_queue_rejections_;
+    }
+    audit(
+        "signaling_queue_backpressure",
+        {{"session_id", session_id},
+         {"sender", sender},
+         {"recipient", recipient},
+         {"queued_messages", queued_messages},
+         {"queued_bytes", queue_bytes},
+         {"message_capacity_reached", message_capacity_reached},
+         {"byte_capacity_reached", byte_capacity_reached}});
+    if (queued_messages == 0) messages_.erase(recipient_key);
+    throw TooManyRequests("signaling recipient queue capacity exceeded", config_.signaling_message_ttl_ms);
+  }
+  const auto delivery_cursor = ++next_delivery_cursors_[recipient_key];
+  queue.push_back(Message{
+      metadata,
+      sender,
+      recipient,
+      type,
+      payload,
+      queued_at_utc_ms,
+      delivery_cursor,
+      serialized_bytes});
+  queue_bytes += serialized_bytes;
   Json acknowledgement = {
       {"queued", queue.size()},
+      {"queued_bytes", queue_bytes},
       {"event", "signaling_ack"},
       {"type", type},
       {"seq", metadata.seq},
@@ -2953,6 +3177,11 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
         throw Conflict("control authority already granted");
       }
     }
+    if (!audit(
+            "control_authority_grant_preflight",
+            {{"vehicle_id", vehicle_id}, {"driver_id", driver_id}})) {
+      throw ServiceUnavailable("audit log unavailable; new control authority is disabled");
+    }
     ++session_counter_;
     std::ostringstream id;
     id << "session-" << std::setw(6) << std::setfill('0') << session_counter_;
@@ -2962,7 +3191,9 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
         .driver_id = driver_id,
         .state = SessionState::Online,
         .control_token = "control-token-" + random_token(),
-        .control_token_expires_at_ms = now_ms() + config_.control_token_ttl_ms};
+        .control_token_expires_at_ms = now_ms() + config_.control_token_ttl_ms,
+        .last_relay_usage_by_actor = {},
+        .websocket_rate_by_participant = {}};
     sessions_[session.session_id] = session;
     auto& stored = sessions_.at(session.session_id);
     audit(
@@ -2971,9 +3202,14 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
     transition_session(stored, SessionState::Reserved, "control_requested");
     transition_session(stored, SessionState::Connecting, "participants_authenticated");
     transition_session(stored, SessionState::Active, "control_authority_granted");
-    audit(
-        "control_authority_granted",
-        {{"session_id", stored.session_id}, {"vehicle_id", stored.vehicle_id}, {"driver_id", stored.driver_id}});
+    if (!audit(
+            "control_authority_granted",
+            {{"session_id", stored.session_id},
+             {"vehicle_id", stored.vehicle_id},
+             {"driver_id", stored.driver_id}})) {
+      close_session(stored, "audit_log_unavailable");
+      throw ServiceUnavailable("audit log unavailable; control authority was not granted");
+    }
     return ServerResponse::json(200, stored.to_json(true));
   }
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "renew") {
@@ -4597,12 +4833,21 @@ Json DriverConsoleRuntime::record_browser_event(const Json& input) {
   return {{"recorded", true}, {"event", event}};
 }
 
-DriverConsoleHttpApp::DriverConsoleHttpApp(std::shared_ptr<DriverConsoleRuntime> runtime) : runtime_(std::move(runtime)) {
+DriverConsoleHttpApp::DriverConsoleHttpApp(std::shared_ptr<DriverConsoleRuntime> runtime)
+    : runtime_(std::move(runtime)), page_capability_(random_token(32)) {
   if (!runtime_) throw std::invalid_argument("driver console runtime is required");
 }
 
 ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
   try {
+    if (request.method == "POST") {
+      if (!application_json_content_type(request)) {
+        return ServerResponse::json(415, {{"error", "local mutation requests require application/json"}});
+      }
+      if (!trusted_local_mutation_request(request, page_capability_)) {
+        return ServerResponse::json(403, {{"error", "local mutation request origin or capability is invalid"}});
+      }
+    }
     if (request.method == "GET" && request.path == "/health") return ServerResponse::json(200, {{"status", "ok"}, {"runtime", "cpp"}});
     if (request.method == "GET" && request.path == "/api/time") return ServerResponse::json(200, {{"now_ms", now_ms()}});
     if (request.method == "GET" && request.path == "/api/status") return ServerResponse::json(200, runtime_->status());
@@ -4610,7 +4855,7 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
     if (request.method == "GET" && request.path == "/api/control-limits") return ServerResponse::json(200, runtime_->control_limits());
     if (request.method == "GET" && request.path == "/api/control-profile") return ServerResponse::json(200, runtime_->control_profile());
     if (request.method == "GET" && request.path == "/") {
-      return ServerResponse::text(200, console_html(runtime_->config()), "text/html; charset=utf-8");
+      return ServerResponse::text(200, console_html(runtime_->config(), page_capability_), "text/html; charset=utf-8");
     }
     if (request.method == "POST" && request.path == "/api/login") {
       return ServerResponse::json(200, runtime_->login(request.json_body().value("password", "")));

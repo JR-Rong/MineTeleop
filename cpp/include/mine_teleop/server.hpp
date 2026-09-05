@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -111,6 +112,11 @@ struct SignalingServerConfig {
   std::size_t max_sdp_bytes{256 * 1024};
   std::size_t max_ice_candidate_bytes{8 * 1024};
   std::int64_t signaling_message_ttl_ms{15 * 1000};
+  std::size_t max_signaling_queue_messages{256};
+  std::size_t max_signaling_queue_bytes{8 * 1024 * 1024};
+  std::int64_t websocket_rate_limit_messages{600};
+  std::size_t websocket_rate_limit_bytes{16 * 1024 * 1024};
+  std::int64_t websocket_rate_limit_window_ms{60 * 1000};
   std::string audit_log_path;
   std::int64_t audit_log_max_bytes{64 * 1024 * 1024};
   std::int64_t audit_log_files{5};
@@ -149,6 +155,11 @@ class SignalingService {
     std::uint64_t bytes_received{0};
     std::uint64_t duration_ms{0};
   };
+  struct WebSocketRateState {
+    std::int64_t messages{0};
+    std::size_t bytes{0};
+    std::chrono::steady_clock::time_point window_started_at{};
+  };
   struct Session {
     std::string session_id;
     std::string vehicle_id;
@@ -162,6 +173,7 @@ class SignalingService {
     std::uint64_t relay_usage_samples{0};
     double last_relay_bitrate_kbps{0.0};
     std::unordered_map<std::string, RelayUsageSample> last_relay_usage_by_actor;
+    std::unordered_map<std::string, WebSocketRateState> websocket_rate_by_participant;
 
     [[nodiscard]] Json to_json(bool include_control_token = false) const;
   };
@@ -173,6 +185,7 @@ class SignalingService {
     Json payload;
     std::int64_t queued_at_utc_ms{0};
     std::uint64_t delivery_cursor{0};
+    std::size_t serialized_bytes{0};
 
     [[nodiscard]] Json to_json() const;
   };
@@ -220,6 +233,7 @@ class SignalingService {
       const Session& session,
       const ProtocolMetadata& metadata);
   void cleanup_expired_connections(std::int64_t timestamp_ms);
+  void prune_expired_signaling_messages(std::int64_t timestamp_ms);
   void close_sessions_for_vehicle(std::string_view vehicle_id, std::string_view reason);
   void close_sessions_for_driver(std::string_view driver_id, std::string_view reason);
   void transition_session(Session& session, SessionState next, std::string_view reason);
@@ -230,7 +244,7 @@ class SignalingService {
   [[nodiscard]] std::string request_source(const HttpRequest& request) const;
   void cleanup_api_rate_limits(std::int64_t timestamp_ms);
   void enforce_api_rate_limit(const HttpRequest& request, std::int64_t timestamp_ms);
-  void audit(std::string_view event, const Json& details = Json::object()) const;
+  bool audit(std::string_view event, const Json& details = Json::object()) const noexcept;
 
   SignalingServerConfig config_;
   std::string service_instance_id_;
@@ -239,6 +253,11 @@ class SignalingService {
   mutable std::mutex audit_log_mutex_;
   mutable std::int64_t audit_log_period_start_ms_{-1};
   mutable std::int64_t audit_log_last_retention_period_ms_{-1};
+  mutable std::atomic<bool> audit_healthy_{true};
+  mutable std::atomic<std::uint64_t> audit_write_failures_{0};
+  mutable std::atomic<std::int64_t> audit_last_fallback_report_ms_{0};
+  std::atomic<bool> connection_reaper_healthy_{true};
+  std::atomic<std::uint64_t> connection_reaper_failures_{0};
   std::unordered_map<std::string, DriverToken> driver_tokens_;
   std::unordered_map<std::string, ConnectionPresence> online_vehicles_;
   std::unordered_map<std::string, ConnectionPresence> online_drivers_;
@@ -254,6 +273,7 @@ class SignalingService {
   ApiRateState api_rate_limit_overflow_;
   std::int64_t api_rate_limit_last_cleanup_ms_{0};
   std::uint64_t api_rate_limited_requests_{0};
+  std::uint64_t signaling_queue_rejections_{0};
   std::uint64_t session_counter_{0};
   std::uint64_t connection_generation_{0};
   std::jthread connection_reaper_;
@@ -403,9 +423,11 @@ class DriverConsoleHttpApp {
  public:
   explicit DriverConsoleHttpApp(std::shared_ptr<DriverConsoleRuntime> runtime);
   [[nodiscard]] ServerResponse handle(const HttpRequest& request) const;
+  [[nodiscard]] const std::string& page_capability() const { return page_capability_; }
 
  private:
   std::shared_ptr<DriverConsoleRuntime> runtime_;
+  std::string page_capability_;
 };
 
 std::string random_token(std::size_t bytes = 24);

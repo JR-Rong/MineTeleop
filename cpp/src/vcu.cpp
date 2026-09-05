@@ -785,6 +785,8 @@ std::vector<CanFrame> ParallelController::tick() {
     brake_pressure = emergency_.brake_pressure_bar;
   } else if (state_ == State::DisarmParkingBrake) {
     gear = kNeutralGear;
+    brake_mode.fill(kByWireMode);
+    brake_pressure = emergency_.brake_pressure_bar;
     parking_brake.fill(kParkingBrakePark);
   } else if (state_ == State::DisarmManual) {
     gear = kNeutralGear;

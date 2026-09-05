@@ -134,7 +134,8 @@ WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉
 1. 扭矩请求归零并等待八路扭矩反馈都在 ±2 Nm 内。
 2. 八路 EHB 请求 DBC 全量 `409.5 bar/路`，等待车速不高于 0.1 m/s。
 3. 请求 N 并等待 N 反馈。
-4. 请求四路 EPB 驻车值 2，并等待四路状态都为 2。
+4. 请求四路 EPB 驻车值 2，并等待四路状态都为 2；等待期间八路 EHB 继续保持
+   上一步的安全制动压力，不在 EPB 确认前切回 mode 0。
 5. 清除 `ShakeReq`，等待人工状态 3。
 
 控制端通过同一条双向 DataChannel 每 500 ms 接收
@@ -219,7 +220,7 @@ export MINE_TELEOP_VCU_LOG_ROTATIONS=10
 - `event/parallel_handshake_disconnect_requested`：控制端主动断开请求；
 - `event/emergency_stop`、`feedback_timeout`、`can_send_failed`、
   `can_receive_failed`、`tx_deadline_miss`、`disarm_complete`、
-  `disarm_timeout`：安全、调度与故障结果。
+  `disarm_transport_stopped`、`disarm_timeout`：安全、调度与故障结果。
 
 安全/状态事件立即 flush，普通帧至少每秒 flush。文件达到上限后轮转为 `.1` 到
 `.N`；排查时需要同时保存当前文件和全部轮转文件。
