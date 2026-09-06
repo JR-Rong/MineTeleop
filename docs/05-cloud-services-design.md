@@ -217,6 +217,14 @@ WebSocket push 不会在 socket 写出前删除队列消息。每条消息带服
 该 mailbox，不能顺带确认或删除 offer/answer/ICE。驾驶端专用控制 WSS 为 send-only，
 不能同时请求接收类型；这两条限制避免控制高频流量污染普通信令的可靠投递语义。
 
+现场诊断可给 signaling server 增加 `--native-control-trace`。它把控制命令的
+`ingress_queued`、mailbox 覆盖/过期、`delivery_send_completed`/失败和
+`delivery_ack_received` 以 `cloud_native_control_trace_batch` 异步批量写入现有
+signaling audit。记录包含 `trace_session_id`、`seq`、`intent_seq`、
+`delivery_cursor`、命令发送/云端接收/入队/投递/ACK 时间和各段耗时，不包含控制
+token。生产部署模板当前开启该诊断；写盘在独立有界队列中完成，队列竞争或饱和会增加
+`dropped_total`，不会阻塞控制 WSS 热路径。
+
 客户端到服务端的信令 ACK 包含原 `seq`、稳定 `message_id` 和目标队列的
 `delivery_cursor`。相同会话、发送方、序列号和内容的重试返回原确认并标记
 `duplicate=true`，不重复入队；同序列号改写内容仍返回 409。临时 HTTPS/WSS

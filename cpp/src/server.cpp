@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -41,6 +42,134 @@
 #include <yaml-cpp/yaml.h>
 
 namespace mine_teleop {
+
+class AsyncControlTrace {
+ public:
+  using Emitter = std::function<void(Json)>;
+
+  explicit AsyncControlTrace(Emitter emitter) : emitter_(std::move(emitter)) {
+    if (!emitter_) throw std::invalid_argument("control trace emitter is required");
+    accepting_.store(true, std::memory_order_release);
+    try {
+      worker_ = std::thread([this] { worker_loop(); });
+    } catch (...) {
+      accepting_.store(false, std::memory_order_release);
+      throw;
+    }
+  }
+
+  ~AsyncControlTrace() { stop(); }
+
+  AsyncControlTrace(const AsyncControlTrace&) = delete;
+  AsyncControlTrace& operator=(const AsyncControlTrace&) = delete;
+
+  void enqueue(Json record) noexcept {
+    if (!accepting_.load(std::memory_order_acquire)) {
+      dropped_total_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    try {
+      std::unique_lock lock(mutex_, std::try_to_lock);
+      if (!lock.owns_lock() || stop_requested_ || queue_.size() >= kQueueCapacity) {
+        dropped_total_.fetch_add(1, std::memory_order_relaxed);
+        cv_.notify_one();
+        return;
+      }
+      queue_.push_back(std::move(record));
+      enqueued_total_.fetch_add(1, std::memory_order_relaxed);
+      const bool full_batch = queue_.size() >= kBatchMaxRecords;
+      lock.unlock();
+      if (full_batch) cv_.notify_one();
+    } catch (...) {
+      dropped_total_.fetch_add(1, std::memory_order_relaxed);
+      cv_.notify_one();
+    }
+  }
+
+  void stop() noexcept {
+    accepting_.store(false, std::memory_order_release);
+    bool notify = false;
+    {
+      std::lock_guard lock(mutex_);
+      if (!stop_requested_) {
+        stop_requested_ = true;
+        notify = true;
+      }
+    }
+    if (notify) cv_.notify_all();
+    if (worker_.joinable()) worker_.join();
+  }
+
+ private:
+  static constexpr std::size_t kQueueCapacity = 512;
+  static constexpr std::size_t kBatchMaxRecords = 32;
+
+  void worker_loop() noexcept {
+    std::uint64_t batch_seq = 0;
+    std::uint64_t emitted_total = 0;
+    std::uint64_t reported_dropped_total = 0;
+    std::uint64_t output_error_total = 0;
+    try {
+      for (;;) {
+        Json commands = Json::array();
+        bool final = false;
+        {
+          std::unique_lock lock(mutex_);
+          cv_.wait_for(
+              lock,
+              std::chrono::seconds(1),
+              [this] {
+                return stop_requested_ || queue_.size() >= kBatchMaxRecords;
+              });
+          const auto count = std::min(queue_.size(), kBatchMaxRecords);
+          for (std::size_t index = 0; index < count; ++index) {
+            commands.push_back(std::move(queue_.front()));
+            queue_.pop_front();
+          }
+          final = stop_requested_ && queue_.empty();
+        }
+
+        const auto command_count = commands.size();
+        const auto dropped_total = dropped_total_.load(std::memory_order_relaxed);
+        if (command_count > 0 || dropped_total != reported_dropped_total || final) {
+          try {
+            const auto next_emitted_total = emitted_total + command_count;
+            emitter_({
+                {"batch_seq", ++batch_seq},
+                {"final", final},
+                {"queue_capacity", kQueueCapacity},
+                {"commands", std::move(commands)},
+                {"enqueued_total", enqueued_total_.load(std::memory_order_relaxed)},
+                {"emitted_total", next_emitted_total},
+                {"dropped_since_last", dropped_total - reported_dropped_total},
+                {"dropped_total", dropped_total},
+                {"output_error_total", output_error_total},
+            });
+            emitted_total = next_emitted_total;
+            reported_dropped_total = dropped_total;
+          } catch (...) {
+            ++output_error_total;
+            dropped_total_.fetch_add(command_count, std::memory_order_relaxed);
+          }
+        }
+        if (final) return;
+      }
+    } catch (...) {
+      // Diagnostic tracing must never terminate or alter control transport.
+    }
+  }
+
+  Emitter emitter_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<Json> queue_;
+  std::thread worker_;
+  bool stop_requested_{false};
+  std::atomic<bool> accepting_{false};
+  std::atomic<std::uint64_t> enqueued_total_{0};
+  std::atomic<std::uint64_t> dropped_total_{0};
+};
+
 namespace {
 
 #if defined(_WIN32)
@@ -1751,9 +1880,16 @@ SignalingService::SignalingService(
       }
     }
   }
+  if (config_.native_control_trace_commands && !config_.audit_log_path.empty()) {
+    native_control_trace_ = std::make_unique<AsyncControlTrace>(
+        [this](Json details) {
+          audit("cloud_native_control_trace_batch", std::move(details));
+        });
+  }
   audit(
       "signaling_service_started",
       {{"runtime", "cpp"},
+       {"native_control_trace_commands", config_.native_control_trace_commands},
        {"audit_log_max_bytes", config_.audit_log_max_bytes},
        {"audit_log_files", config_.audit_log_files},
        {"audit_log_rotation_interval_ms", config_.audit_log_rotation_interval_ms},
@@ -1771,6 +1907,7 @@ SignalingService::SignalingService(
 SignalingService::~SignalingService() {
   connection_reaper_.request_stop();
   if (connection_reaper_.joinable()) connection_reaper_.join();
+  if (native_control_trace_) native_control_trace_->stop();
 }
 
 Json SignalingService::health() const {
@@ -2382,10 +2519,68 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
         const auto timestamp = std::chrono::steady_clock::now();
         if (delivery_cursor > last_delivery_cursor_sent ||
             timestamp - last_delivery_sent_at >= std::chrono::milliseconds(500)) {
-          connection.send_json(
-              {{"event", "signaling_messages"},
-               {"delivery_cursor", delivery_cursor},
-               {"messages", std::move(pending)}});
+          Json delivery_trace;
+          const bool trace_delivery = control_receive_only && native_control_trace_;
+          if (trace_delivery) {
+            const auto& message = pending.back();
+            const auto& payload = message.value("payload", Json::object());
+            delivery_trace = {
+                {"stage", "delivery_send_completed"},
+                {"trace_session_id", message.value("session_id", std::string(parts[1]))},
+                {"vehicle_id", message.value("vehicle_id", "")},
+                {"driver_id", message.value("driver_id", "")},
+                {"seq", message.value("seq", std::uint64_t{0})},
+                {"intent_seq", payload.value("intent_seq", std::uint64_t{0})},
+                {"command_sent_at_utc_ms", message.value("sent_at_utc_ms", std::int64_t{0})},
+                {"cloud_queued_at_utc_ms", message.value("queued_at_utc_ms", std::int64_t{0})},
+                {"delivery_cursor", delivery_cursor},
+                {"redelivery", delivery_cursor <= last_delivery_cursor_sent},
+            };
+          }
+          const auto send_started_at_utc_ms = now_ms();
+          const auto send_started_monotonic_ms = monotonic_now_ms();
+          try {
+            connection.send_json(
+                {{"event", "signaling_messages"},
+                 {"delivery_cursor", delivery_cursor},
+                 {"messages", std::move(pending)}});
+          } catch (const std::exception& error) {
+            if (trace_delivery) {
+              delivery_trace["stage"] = "delivery_send_failed";
+              delivery_trace["cloud_delivery_send_started_at_utc_ms"] =
+                  send_started_at_utc_ms;
+              delivery_trace["cloud_delivery_send_started_monotonic_ms"] =
+                  send_started_monotonic_ms;
+              delivery_trace["cloud_delivery_send_failed_at_utc_ms"] = now_ms();
+              delivery_trace["cloud_delivery_send_failed_monotonic_ms"] =
+                  monotonic_now_ms();
+              delivery_trace["error"] = error.what();
+              native_control_trace_->enqueue(std::move(delivery_trace));
+            }
+            throw;
+          }
+          const auto send_completed_at_utc_ms = now_ms();
+          const auto send_completed_monotonic_ms = monotonic_now_ms();
+          if (trace_delivery) {
+            const auto queued_at_utc_ms =
+                delivery_trace.value("cloud_queued_at_utc_ms", std::int64_t{0});
+            delivery_trace["cloud_delivery_send_started_at_utc_ms"] =
+                send_started_at_utc_ms;
+            delivery_trace["cloud_delivery_send_started_monotonic_ms"] =
+                send_started_monotonic_ms;
+            delivery_trace["cloud_delivery_send_completed_at_utc_ms"] =
+                send_completed_at_utc_ms;
+            delivery_trace["cloud_delivery_send_completed_monotonic_ms"] =
+                send_completed_monotonic_ms;
+            delivery_trace["cloud_mailbox_to_send_ms"] = queued_at_utc_ms > 0
+                ? std::max<std::int64_t>(0, send_started_at_utc_ms - queued_at_utc_ms)
+                : 0;
+            delivery_trace["cloud_delivery_send_call_ms"] =
+                std::max<std::int64_t>(
+                    0,
+                    send_completed_monotonic_ms - send_started_monotonic_ms);
+            native_control_trace_->enqueue(std::move(delivery_trace));
+          }
           last_delivery_cursor_sent = std::max(last_delivery_cursor_sent, delivery_cursor);
           last_delivery_sent_at = timestamp;
         }
@@ -2408,17 +2603,51 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
           if (delivery_cursor > last_delivery_cursor_sent) {
             throw std::invalid_argument("delivery acknowledgement exceeds the last delivered cursor");
           }
+          const auto ack_received_at_utc_ms = now_ms();
+          const auto ack_received_monotonic_ms = monotonic_now_ms();
           std::size_t acknowledged = 0;
+          Json acknowledgement_trace;
           {
             std::lock_guard lock(mutex_);
             cleanup_expired_connections(now_ms());
             const auto& session = require_participant(parts[1], participant);
             validate_actor_credential(session, participant, credentials);
+            if (control_receive_only && native_control_trace_) {
+              acknowledgement_trace = {
+                  {"stage", "delivery_ack_received"},
+                  {"trace_session_id", std::string(parts[1])},
+                  {"vehicle_id", session.vehicle_id},
+                  {"driver_id", session.driver_id},
+                  {"delivery_cursor", delivery_cursor},
+                  {"cloud_delivery_ack_received_at_utc_ms", ack_received_at_utc_ms},
+                  {"cloud_delivery_ack_received_monotonic_ms", ack_received_monotonic_ms},
+              };
+              const auto queued = latest_control_messages_.find(
+                  message_key(parts[1], participant));
+              if (queued != latest_control_messages_.end() &&
+                  queued->second.delivery_cursor <= delivery_cursor) {
+                acknowledgement_trace["seq"] = queued->second.metadata.seq;
+                acknowledgement_trace["intent_seq"] =
+                    queued->second.payload.value("intent_seq", std::uint64_t{0});
+                acknowledgement_trace["command_sent_at_utc_ms"] =
+                    queued->second.metadata.sent_at_utc_ms;
+                acknowledgement_trace["cloud_queued_at_utc_ms"] =
+                    queued->second.queued_at_utc_ms;
+                acknowledgement_trace["cloud_queue_to_vehicle_ack_ms"] =
+                    std::max<std::int64_t>(
+                        0,
+                        ack_received_at_utc_ms - queued->second.queued_at_utc_ms);
+              }
+            }
             acknowledged = acknowledge_signaling_messages(
                 parts[1],
                 participant,
                 delivery_cursor,
                 control_receive_only);
+          }
+          if (control_receive_only && native_control_trace_) {
+            acknowledgement_trace["acknowledged"] = acknowledged;
+            native_control_trace_->enqueue(std::move(acknowledgement_trace));
           }
           connection.send_json(
               {{"event", "signaling_delivery_acknowledged"},
@@ -2480,6 +2709,27 @@ Json SignalingService::take_signaling_messages(
   if (latest_control != latest_control_messages_.end() &&
       timestamp_monotonic_ms - latest_control->second.queued_at_monotonic_ms >=
           config_.native_control_message_ttl_ms) {
+    if (native_control_trace_) {
+      const auto& expired = latest_control->second;
+      native_control_trace_->enqueue({
+          {"stage", "mailbox_expired"},
+          {"trace_session_id", expired.metadata.session_id},
+          {"vehicle_id", expired.metadata.vehicle_id},
+          {"driver_id", expired.metadata.driver_id},
+          {"seq", expired.metadata.seq},
+          {"intent_seq", expired.payload.value("intent_seq", std::uint64_t{0})},
+          {"command_sent_at_utc_ms", expired.metadata.sent_at_utc_ms},
+          {"cloud_queued_at_utc_ms", expired.queued_at_utc_ms},
+          {"cloud_queued_monotonic_ms", expired.queued_at_monotonic_ms},
+          {"cloud_expired_at_utc_ms", now_ms()},
+          {"cloud_expired_monotonic_ms", timestamp_monotonic_ms},
+          {"cloud_mailbox_age_ms", std::max<std::int64_t>(
+                                           0,
+                                           timestamp_monotonic_ms -
+                                               expired.queued_at_monotonic_ms)},
+          {"delivery_cursor", expired.delivery_cursor},
+      });
+    }
     latest_control_messages_.erase(latest_control);
     latest_control = latest_control_messages_.end();
   }
@@ -2554,6 +2804,8 @@ Json SignalingService::enqueue_signaling_message(
     std::string_view session_id,
     const Json& value,
     std::optional<std::string_view> authenticated_actor) {
+  const auto cloud_ingress_started_at_utc_ms = now_ms();
+  const auto cloud_ingress_started_monotonic_ms = monotonic_now_ms();
   const auto sender = required_string(value, "sender");
   const auto recipient = required_string(value, "recipient");
   const auto type = required_string(value, "type");
@@ -2609,10 +2861,11 @@ Json SignalingService::enqueue_signaling_message(
       throw std::invalid_argument("WebRTC ICE candidate exceeds configured limit");
     }
   }
+  std::uint64_t control_intent_seq = 0;
   if (type == "control_command") {
     const auto command = ControlCommand::from_json(payload);
-    const auto intent_seq = required_uint64(payload, "intent_seq");
-    if (intent_seq == 0) throw std::invalid_argument("intent_seq must be positive");
+    control_intent_seq = required_uint64(payload, "intent_seq");
+    if (control_intent_seq == 0) throw std::invalid_argument("intent_seq must be positive");
     if (!payload.contains("intent_fresh") || !payload.at("intent_fresh").is_boolean()) {
       throw std::invalid_argument("intent_fresh must be a boolean");
     }
@@ -2647,6 +2900,20 @@ Json SignalingService::enqueue_signaling_message(
       }
       auto acknowledgement = accepted->second.acknowledgement;
       acknowledgement["duplicate"] = true;
+      if (type == "control_command" && native_control_trace_) {
+        native_control_trace_->enqueue({
+            {"stage", "ingress_duplicate_acknowledged"},
+            {"trace_session_id", std::string(session_id)},
+            {"vehicle_id", metadata.vehicle_id},
+            {"driver_id", metadata.driver_id},
+            {"seq", metadata.seq},
+            {"intent_seq", control_intent_seq},
+            {"command_sent_at_utc_ms", metadata.sent_at_utc_ms},
+            {"cloud_received_at_utc_ms", cloud_ingress_started_at_utc_ms},
+            {"cloud_received_monotonic_ms", cloud_ingress_started_monotonic_ms},
+            {"delivery_cursor", acknowledgement.value("delivery_cursor", std::uint64_t{0})},
+        });
+      }
       audit(
           "signaling_retry_acknowledged",
           {{"session_id", session_id},
@@ -2660,15 +2927,28 @@ Json SignalingService::enqueue_signaling_message(
     }
   }
   const auto recipient_key = message_key(session_id, recipient);
+  std::uint64_t replaced_seq = 0;
+  std::uint64_t replaced_delivery_cursor = 0;
+  std::int64_t replaced_queued_at_utc_ms = 0;
+  if (type == "control_command") {
+    const auto previous = latest_control_messages_.find(recipient_key);
+    if (previous != latest_control_messages_.end()) {
+      replaced_seq = previous->second.metadata.seq;
+      replaced_delivery_cursor = previous->second.delivery_cursor;
+      replaced_queued_at_utc_ms = previous->second.queued_at_utc_ms;
+    }
+  }
   const auto delivery_cursor = ++next_delivery_cursors_[recipient_key];
+  const auto cloud_queued_at_utc_ms = now_ms();
+  const auto cloud_queued_monotonic_ms = monotonic_now_ms();
   const Message queued_message{
       metadata,
       sender,
       recipient,
       type,
       payload,
-      now_ms(),
-      monotonic_now_ms(),
+      cloud_queued_at_utc_ms,
+      cloud_queued_monotonic_ms,
       delivery_cursor};
   std::size_t queued = 1;
   if (type == "control_command") {
@@ -2686,7 +2966,43 @@ Json SignalingService::enqueue_signaling_message(
       {"message_id", std::string(session_id) + ":" + sender + ":" + std::to_string(metadata.seq)},
       {"delivery_cursor", delivery_cursor},
       {"duplicate", false}};
+  if (type == "control_command") {
+    acknowledgement["cloud_received_at_utc_ms"] = cloud_ingress_started_at_utc_ms;
+    acknowledgement["cloud_queued_at_utc_ms"] = cloud_queued_at_utc_ms;
+    acknowledgement["cloud_ingress_processing_ms"] = std::max<std::int64_t>(
+        0,
+        cloud_queued_monotonic_ms - cloud_ingress_started_monotonic_ms);
+  }
   last_accepted_messages_[sequence_key] = AcceptedMessage{metadata.seq, fingerprint, acknowledgement};
+  if (type == "control_command" && native_control_trace_) {
+    native_control_trace_->enqueue({
+        {"stage", "ingress_queued"},
+        {"trace_session_id", std::string(session_id)},
+        {"vehicle_id", metadata.vehicle_id},
+        {"driver_id", metadata.driver_id},
+        {"seq", metadata.seq},
+        {"intent_seq", control_intent_seq},
+        {"command_sent_at_utc_ms", metadata.sent_at_utc_ms},
+        {"cloud_received_at_utc_ms", cloud_ingress_started_at_utc_ms},
+        {"cloud_received_monotonic_ms", cloud_ingress_started_monotonic_ms},
+        {"cloud_queued_at_utc_ms", cloud_queued_at_utc_ms},
+        {"cloud_queued_monotonic_ms", cloud_queued_monotonic_ms},
+        {"driver_to_cloud_utc_delta_ms",
+         cloud_ingress_started_at_utc_ms - metadata.sent_at_utc_ms},
+        {"cloud_ingress_processing_ms", std::max<std::int64_t>(
+                                             0,
+                                             cloud_queued_monotonic_ms -
+                                                 cloud_ingress_started_monotonic_ms)},
+        {"delivery_cursor", delivery_cursor},
+        {"mailbox_replaced_seq", replaced_seq},
+        {"mailbox_replaced_delivery_cursor", replaced_delivery_cursor},
+        {"mailbox_replaced_age_ms",
+         replaced_queued_at_utc_ms > 0
+             ? std::max<std::int64_t>(0, cloud_queued_at_utc_ms - replaced_queued_at_utc_ms)
+             : 0},
+        {"transport", authenticated_actor.has_value() ? "websocket" : "http"},
+    });
+  }
   if (type != "control_command") {
     audit(
         type,
@@ -3488,6 +3804,26 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
   if (!signaling_url_is_secure_or_loopback(config_.signaling_url)) {
     throw std::invalid_argument("public signaling URL must use HTTPS or WSS; HTTP/WS is allowed only on loopback");
   }
+  if (config_.control_trace_commands && !config_.browser_event_log_path.empty()) {
+    native_control_trace_ = std::make_unique<AsyncControlTrace>(
+        [this](Json details) {
+          std::string trace_session_id;
+          const auto& commands = details["commands"];
+          if (commands.is_array() && !commands.empty()) {
+            trace_session_id = commands.front().value("trace_session_id", "");
+          }
+          const auto timestamp_ms = now_ms();
+          append_driver_log_record({
+              {"event", "driver_native_control_trace_batch"},
+              {"sent_at_utc_ms", timestamp_ms},
+              {"browser_sent_at_utc_ms", timestamp_ms},
+              {"driver_id", config_.driver_id},
+              {"vehicle_id", vehicle_id_},
+              {"session_id", trace_session_id},
+              {"details", std::move(details)},
+          });
+        });
+  }
   native_control_sender_ = std::jthread(
       [this](std::stop_token stop_token) { native_control_sender_loop(stop_token); });
   native_control_lease_ = std::jthread(
@@ -3502,6 +3838,7 @@ DriverConsoleRuntime::~DriverConsoleRuntime() {
   if (native_control_lease_.joinable()) native_control_lease_.join();
   close_control_signaling_websocket();
   close_signaling_websocket();
+  if (native_control_trace_) native_control_trace_->stop();
 }
 
 void DriverConsoleRuntime::connect_signaling_websocket(std::string_view session_id, std::string_view token) {
@@ -3602,6 +3939,9 @@ void DriverConsoleRuntime::reset_native_control_state() {
   std::lock_guard update_lock(native_control_update_mutex_);
   close_control_signaling_websocket();
   native_control_intent_.reset();
+  native_control_last_sent_monotonic_ms_.store(0, std::memory_order_relaxed);
+  native_control_last_ack_received_at_utc_ms_.store(0, std::memory_order_relaxed);
+  native_control_last_ack_cloud_received_at_utc_ms_.store(0, std::memory_order_relaxed);
   {
     std::lock_guard lock(mutex_);
     control_sequence_ = 0;
@@ -3642,6 +3982,10 @@ void DriverConsoleRuntime::note_native_control_failure(
 }
 
 bool DriverConsoleRuntime::send_native_control_sample() {
+  const auto sample_started_monotonic_ms = monotonic_now_ms();
+  const auto sample_started_at_utc_ms = clock_.now_ms();
+  const auto scheduled_at_monotonic_ms =
+      native_control_scheduled_at_monotonic_ms_.load(std::memory_order_relaxed);
   NativeControlIntentSample sample;
   std::string session;
   std::string control_token;
@@ -3650,6 +3994,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
   std::int64_t control_token_expires_at_ms = 0;
   std::uint64_t sequence = 0;
   std::uint64_t generation = 0;
+  Json trace_record;
   {
     std::lock_guard update_lock(native_control_update_mutex_);
     sample = native_control_intent_.sample(monotonic_now_ms());
@@ -3670,6 +4015,29 @@ bool DriverConsoleRuntime::send_native_control_sample() {
   }
 
   try {
+    if (native_control_trace_) {
+      trace_record = {
+          {"stage", "send_started"},
+          {"trace_session_id", session},
+          {"vehicle_id", vehicle},
+          {"driver_id", config_.driver_id},
+          {"session_generation", generation},
+          {"seq", sequence},
+          {"intent_seq", sample.intent.intent_seq},
+          {"intent_fresh", sample.fresh && !sample.requires_fresh_input},
+          {"intent_requires_fresh_input", sample.requires_fresh_input},
+          {"effective_gear", sample.intent.gear},
+          {"scheduled_at_monotonic_ms", scheduled_at_monotonic_ms},
+          {"sample_started_at_utc_ms", sample_started_at_utc_ms},
+          {"sample_started_monotonic_ms", sample_started_monotonic_ms},
+          {"sender_wakeup_lag_ms",
+           scheduled_at_monotonic_ms > 0
+               ? std::max<std::int64_t>(
+                     0,
+                     sample_started_monotonic_ms - scheduled_at_monotonic_ms)
+               : 0},
+      };
+    }
     if (clock_.now_ms() >= control_token_expires_at_ms) {
       throw std::runtime_error("control authority lease expired");
     }
@@ -3704,12 +4072,45 @@ bool DriverConsoleRuntime::send_native_control_sample() {
     envelope["type"] = "control_command";
     envelope["payload"] = payload;
 
+    const auto connect_started_at_utc_ms = clock_.now_ms();
+    const auto connect_started_monotonic_ms = monotonic_now_ms();
     if (!connect_control_signaling_websocket(
             session,
             driver_token,
             generation)) {
+      if (native_control_trace_) {
+        trace_record["stage"] = "send_skipped";
+        trace_record["reason"] = "session_changed_or_reconnect_backoff";
+        trace_record["command_sent_at_utc_ms"] = command.sent_at_utc_ms;
+        trace_record["connect_started_at_utc_ms"] = connect_started_at_utc_ms;
+        trace_record["connect_started_monotonic_ms"] = connect_started_monotonic_ms;
+        trace_record["trace_completed_at_utc_ms"] = clock_.now_ms();
+        trace_record["trace_completed_monotonic_ms"] = monotonic_now_ms();
+        native_control_trace_->enqueue(std::move(trace_record));
+      }
       return false;
     }
+    const auto connect_completed_at_utc_ms = clock_.now_ms();
+    const auto connect_completed_monotonic_ms = monotonic_now_ms();
+    if (native_control_trace_) {
+      trace_record["command_sent_at_utc_ms"] = command.sent_at_utc_ms;
+      trace_record["connect_started_at_utc_ms"] = connect_started_at_utc_ms;
+      trace_record["connect_started_monotonic_ms"] = connect_started_monotonic_ms;
+      trace_record["connect_completed_at_utc_ms"] = connect_completed_at_utc_ms;
+      trace_record["connect_completed_monotonic_ms"] = connect_completed_monotonic_ms;
+      trace_record["connect_processing_ms"] = std::max<std::int64_t>(
+          0,
+          connect_completed_monotonic_ms - connect_started_monotonic_ms);
+    }
+    Json drained_acknowledgements = Json::array();
+    std::int64_t acknowledgement_drain_started_monotonic_ms = 0;
+    std::int64_t acknowledgement_drain_completed_monotonic_ms = 0;
+    std::int64_t send_started_at_utc_ms = 0;
+    std::int64_t send_started_monotonic_ms = 0;
+    std::int64_t send_completed_at_utc_ms = 0;
+    std::int64_t send_completed_monotonic_ms = 0;
+    std::int64_t unacknowledged_age_ms = 0;
+    std::uint64_t last_ack_seq = 0;
     {
       std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
       {
@@ -3729,6 +4130,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       // schedule depend on a cloud round trip. TCP send backpressure plus this
       // bounded acknowledgement-age check still fails closed when the server
       // is no longer consuming messages.
+      acknowledgement_drain_started_monotonic_ms = monotonic_now_ms();
       for (int drained = 0; drained < 16; ++drained) {
         const auto received =
             control_signaling_websocket_->receive_json(std::chrono::milliseconds(0));
@@ -3753,30 +4155,91 @@ bool DriverConsoleRuntime::send_native_control_sample() {
         }
         control_signaling_last_ack_seq_ =
             std::max(control_signaling_last_ack_seq_, acknowledged_seq);
+        const auto acknowledgement_received_at_utc_ms = clock_.now_ms();
+        const auto acknowledgement_received_monotonic_ms = monotonic_now_ms();
+        native_control_last_ack_received_at_utc_ms_.store(
+            acknowledgement_received_at_utc_ms,
+            std::memory_order_relaxed);
+        const auto cloud_received_at_utc_ms = received.message.value(
+            "cloud_received_at_utc_ms",
+            std::int64_t{0});
+        if (cloud_received_at_utc_ms > 0) {
+          native_control_last_ack_cloud_received_at_utc_ms_.store(
+              cloud_received_at_utc_ms,
+              std::memory_order_relaxed);
+        }
+        if (native_control_trace_) {
+          drained_acknowledgements.push_back({
+              {"seq", acknowledged_seq},
+              {"ack_received_at_utc_ms", acknowledgement_received_at_utc_ms},
+              {"ack_received_monotonic_ms", acknowledgement_received_monotonic_ms},
+              {"cloud_received_at_utc_ms", cloud_received_at_utc_ms},
+              {"cloud_queued_at_utc_ms", received.message.value(
+                                                "cloud_queued_at_utc_ms",
+                                                std::int64_t{0})},
+              {"cloud_ingress_processing_ms", received.message.value(
+                                                   "cloud_ingress_processing_ms",
+                                                   std::int64_t{0})},
+              {"delivery_cursor", received.message.value(
+                                      "delivery_cursor",
+                                      std::uint64_t{0})},
+          });
+        }
         control_signaling_next_connect_monotonic_ms_ = 0;
         control_signaling_reconnect_delay_ms_ = 100;
+      }
+      acknowledgement_drain_completed_monotonic_ms = monotonic_now_ms();
+      if (native_control_trace_) {
+        trace_record["acknowledgement_drain_started_monotonic_ms"] =
+            acknowledgement_drain_started_monotonic_ms;
+        trace_record["acknowledgement_drain_completed_monotonic_ms"] =
+            acknowledgement_drain_completed_monotonic_ms;
+        trace_record["acknowledgement_drain_ms"] = std::max<std::int64_t>(
+            0,
+            acknowledgement_drain_completed_monotonic_ms -
+                acknowledgement_drain_started_monotonic_ms);
+        trace_record["acknowledgements"] = drained_acknowledgements;
       }
       const auto monotonic_ms = monotonic_now_ms();
       if (control_signaling_last_ack_seq_ + 1 < sequence) {
         if (control_signaling_first_unacked_monotonic_ms_ == 0) {
           control_signaling_first_unacked_monotonic_ms_ = monotonic_ms;
-        } else if (
-            monotonic_ms - control_signaling_first_unacked_monotonic_ms_ >= 500) {
+        }
+        unacknowledged_age_ms = std::max<std::int64_t>(
+            0,
+            monotonic_ms - control_signaling_first_unacked_monotonic_ms_);
+        if (native_control_trace_) {
+          trace_record["last_ack_seq"] = control_signaling_last_ack_seq_;
+          trace_record["unacknowledged_age_ms"] = unacknowledged_age_ms;
+        }
+        if (unacknowledged_age_ms >= 500) {
           throw std::runtime_error(
               "native control signaling acknowledgements stalled for 500ms");
         }
       } else {
         control_signaling_first_unacked_monotonic_ms_ = monotonic_ms;
       }
+      last_ack_seq = control_signaling_last_ack_seq_;
+      send_started_at_utc_ms = clock_.now_ms();
+      send_started_monotonic_ms = monotonic_now_ms();
       control_signaling_websocket_->send_json(
           envelope,
           std::chrono::milliseconds(20));
+      send_completed_at_utc_ms = clock_.now_ms();
+      send_completed_monotonic_ms = monotonic_now_ms();
     }
 
     const auto sent_at_ms = clock_.now_ms();
     const auto previous = native_control_last_sent_at_utc_ms_.exchange(sent_at_ms);
     const auto gap_ms =
         previous > 0 ? std::max<std::int64_t>(0, sent_at_ms - previous) : 0;
+    const auto previous_monotonic_ms =
+        native_control_last_sent_monotonic_ms_.exchange(send_completed_monotonic_ms);
+    const auto monotonic_gap_ms = previous_monotonic_ms > 0
+        ? std::max<std::int64_t>(
+              0,
+              send_completed_monotonic_ms - previous_monotonic_ms)
+        : 0;
     native_control_last_gap_ms_.store(gap_ms);
     auto maximum = native_control_max_gap_ms_.load();
     while (gap_ms > maximum &&
@@ -3788,8 +4251,45 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       std::lock_guard lock(native_control_status_mutex_);
       native_control_last_error_.clear();
     }
+    if (native_control_trace_) {
+      trace_record["stage"] = "send_completed";
+      trace_record["acknowledgement_drain_started_monotonic_ms"] =
+          acknowledgement_drain_started_monotonic_ms;
+      trace_record["acknowledgement_drain_completed_monotonic_ms"] =
+          acknowledgement_drain_completed_monotonic_ms;
+      trace_record["acknowledgement_drain_ms"] = std::max<std::int64_t>(
+          0,
+          acknowledgement_drain_completed_monotonic_ms -
+              acknowledgement_drain_started_monotonic_ms);
+      trace_record["acknowledgements"] = std::move(drained_acknowledgements);
+      trace_record["last_ack_seq"] = last_ack_seq;
+      trace_record["unacknowledged_age_ms"] = unacknowledged_age_ms;
+      trace_record["send_started_at_utc_ms"] = send_started_at_utc_ms;
+      trace_record["send_started_monotonic_ms"] = send_started_monotonic_ms;
+      trace_record["send_completed_at_utc_ms"] = send_completed_at_utc_ms;
+      trace_record["send_completed_monotonic_ms"] = send_completed_monotonic_ms;
+      trace_record["send_call_ms"] = std::max<std::int64_t>(
+          0,
+          send_completed_monotonic_ms - send_started_monotonic_ms);
+      trace_record["successful_send_gap_ms"] = gap_ms;
+      trace_record["successful_send_monotonic_gap_ms"] = monotonic_gap_ms;
+      trace_record["sample_processing_ms"] = std::max<std::int64_t>(
+          0,
+          send_completed_monotonic_ms - sample_started_monotonic_ms);
+      native_control_trace_->enqueue(std::move(trace_record));
+    }
     return true;
   } catch (const std::exception& error) {
+    if (native_control_trace_) {
+      trace_record["stage"] = "send_failed";
+      trace_record["error"] = error.what();
+      trace_record["failure_at_utc_ms"] = clock_.now_ms();
+      trace_record["failure_monotonic_ms"] = monotonic_now_ms();
+      trace_record["sample_processing_ms"] = std::max<std::int64_t>(
+          0,
+          monotonic_now_ms() - sample_started_monotonic_ms);
+      native_control_trace_->enqueue(std::move(trace_record));
+    }
     note_native_control_failure(error.what(), session, generation);
     return false;
   }
@@ -3808,6 +4308,11 @@ void DriverConsoleRuntime::native_control_sender_loop(std::stop_token stop_token
       });
     }
     if (stop_token.stop_requested()) break;
+    native_control_scheduled_at_monotonic_ms_.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            next_send.time_since_epoch())
+            .count(),
+        std::memory_order_relaxed);
     static_cast<void>(send_native_control_sample());
     // Never replay missed periods or emit a catch-up burst after a scheduler or
     // network stall. The next vehicle packet is always one fresh sample.
@@ -4953,6 +5458,7 @@ Json DriverConsoleRuntime::status() {
   bool native_control_websocket_connected = false;
   std::uint64_t native_control_last_ack_seq = 0;
   std::int64_t native_control_next_connect_monotonic_ms = 0;
+  std::int64_t native_control_unacknowledged_age_ms = 0;
   int native_control_reconnect_delay_ms = 0;
   {
     std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
@@ -4961,6 +5467,13 @@ Json DriverConsoleRuntime::status() {
     native_control_last_ack_seq = control_signaling_last_ack_seq_;
     native_control_next_connect_monotonic_ms =
         control_signaling_next_connect_monotonic_ms_;
+    native_control_unacknowledged_age_ms =
+        control_signaling_first_unacked_monotonic_ms_ > 0 &&
+            native_control_last_ack_seq + 1 < native_control_last_seq_.load()
+        ? std::max<std::int64_t>(
+              0,
+              monotonic_now_ms() - control_signaling_first_unacked_monotonic_ms_)
+        : 0;
     native_control_reconnect_delay_ms = control_signaling_reconnect_delay_ms_;
   }
   const auto native_sample = native_control_intent_.sample(monotonic_now_ms());
@@ -5015,16 +5528,46 @@ Json DriverConsoleRuntime::status() {
         {"commands_sent_total", native_control_commands_sent_.load()},
         {"send_failures_total", native_control_send_failures_.load()},
         {"last_sent_at_utc_ms", native_control_last_sent_at_utc_ms_.load()},
+        {"last_sent_monotonic_ms", native_control_last_sent_monotonic_ms_.load()},
         {"last_gap_ms", native_control_last_gap_ms_.load()},
         {"max_gap_ms", native_control_max_gap_ms_.load()},
         {"last_seq", native_control_last_seq_.load()},
         {"last_ack_seq", native_control_last_ack_seq},
+        {"unacknowledged_age_ms", native_control_unacknowledged_age_ms},
+        {"last_ack_received_at_utc_ms",
+         native_control_last_ack_received_at_utc_ms_.load()},
+        {"last_ack_cloud_received_at_utc_ms",
+         native_control_last_ack_cloud_received_at_utc_ms_.load()},
         {"last_error", native_control_last_error}}},
       {"time_sync", clock_.status().to_json()},
       {"webrtc_metrics", webrtc_metrics_},
       {"last_signaling_messages", signaling_messages_},
       {"authorized_vehicles", authorized_vehicles_},
   };
+}
+
+void DriverConsoleRuntime::append_driver_log_record(const Json& record) const {
+  if (config_.browser_event_log_path.empty()) return;
+  const auto line = record.dump() + "\n";
+  if (line.size() > config_.browser_event_log_max_bytes) {
+    throw std::invalid_argument("driver event exceeds configured log size");
+  }
+  std::lock_guard log_lock(browser_event_log_mutex_);
+  const auto parent = config_.browser_event_log_path.parent_path();
+  std::error_code error;
+  if (!parent.empty()) {
+    std::filesystem::create_directories(parent, error);
+    if (error) throw std::runtime_error("cannot create browser event log directory: " + error.message());
+  }
+  rotate_jsonl_log(
+      config_.browser_event_log_path,
+      config_.browser_event_log_max_bytes,
+      config_.browser_event_log_files,
+      line.size());
+  std::ofstream output(config_.browser_event_log_path, std::ios::app);
+  if (!output) throw std::runtime_error("cannot append browser event log");
+  output << line;
+  if (!output) throw std::runtime_error("cannot flush browser event log");
 }
 
 Json DriverConsoleRuntime::record_browser_event(const Json& input) {
@@ -5071,26 +5614,7 @@ Json DriverConsoleRuntime::record_browser_event(const Json& input) {
       {"details", details},
   };
   if (config_.browser_event_log_path.empty()) return {{"recorded", false}, {"event", event}};
-  const auto line = record.dump() + "\n";
-  if (line.size() > config_.browser_event_log_max_bytes) {
-    throw std::invalid_argument("browser event exceeds configured log size");
-  }
-  std::lock_guard log_lock(browser_event_log_mutex_);
-  const auto parent = config_.browser_event_log_path.parent_path();
-  std::error_code error;
-  if (!parent.empty()) {
-    std::filesystem::create_directories(parent, error);
-    if (error) throw std::runtime_error("cannot create browser event log directory: " + error.message());
-  }
-  rotate_jsonl_log(
-      config_.browser_event_log_path,
-      config_.browser_event_log_max_bytes,
-      config_.browser_event_log_files,
-      line.size());
-  std::ofstream output(config_.browser_event_log_path, std::ios::app);
-  if (!output) throw std::runtime_error("cannot append browser event log");
-  output << line;
-  if (!output) throw std::runtime_error("cannot flush browser event log");
+  append_driver_log_record(record);
   return {{"recorded", true}, {"event", event}};
 }
 

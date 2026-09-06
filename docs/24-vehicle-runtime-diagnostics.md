@@ -221,8 +221,11 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 普通控制命令不再走 DataChannel。车端最终 summary 的 `native_control_signaling`
 提供 control-only WSS 连接/重连、接收、latest-only 覆盖、ACK、独立 watchdog、
 stale 非零丢弃和严格零值 stale heartbeat 接受/拒绝计数；
-`vehicle_control_trace_batch.commands` 再用 `session_id + seq`、`intent_seq`、
-`intent_fresh` 与 `reason` 定位单次处理。profile、握手或状态 DataChannel 正常不能证明
+`vehicle_control_trace_batch.commands` 再用 `trace_session_id + seq`、`intent_seq`、
+`intent_fresh` 与 `reason` 定位单次处理，并带 `delivery_cursor`、云端入队时间、车端
+信封到达时间、信封到 callback、control mutex 等待及 receive/apply 起止耗时。
+跨机器 UTC delta 必须结合当时的 time-sync uncertainty 解读；同进程 monotonic delta
+才是不受校时影响的调度/处理证据。profile、握手或状态 DataChannel 正常不能证明
 普通控制 WSS 正常，反之亦然。
 
 ### HTTP 409 与 signaling sequence

@@ -21,6 +21,8 @@
 
 namespace mine_teleop {
 
+class AsyncControlTrace;
+
 struct HttpRequest {
   std::string method;
   std::string target;
@@ -112,6 +114,7 @@ struct SignalingServerConfig {
   std::size_t max_ice_candidate_bytes{8 * 1024};
   std::int64_t signaling_message_ttl_ms{15 * 1000};
   std::int64_t native_control_message_ttl_ms{150};
+  bool native_control_trace_commands{false};
   std::string audit_log_path;
   std::int64_t audit_log_max_bytes{64 * 1024 * 1024};
   std::int64_t audit_log_files{5};
@@ -256,6 +259,7 @@ class SignalingService {
   std::unordered_set<std::string> trusted_proxy_addresses_;
   std::unordered_map<std::string, ApiRateState> api_rate_limits_;
   ApiRateState api_rate_limit_overflow_;
+  std::unique_ptr<AsyncControlTrace> native_control_trace_;
   std::int64_t api_rate_limit_last_cleanup_ms_{0};
   std::uint64_t api_rate_limited_requests_{0};
   std::uint64_t session_counter_{0};
@@ -358,6 +362,7 @@ class DriverConsoleRuntime {
       std::string error,
       std::string_view session_id,
       std::uint64_t generation);
+  void append_driver_log_record(const Json& record) const;
   void append_websocket_messages(const Json& envelope);
   [[nodiscard]] bool remote_session_is_active(std::string_view session_id, std::string_view token) const;
   TimeSyncStatus refresh_time_sync();
@@ -437,10 +442,15 @@ class DriverConsoleRuntime {
   std::atomic<std::uint64_t> native_control_commands_sent_{0};
   std::atomic<std::uint64_t> native_control_send_failures_{0};
   std::atomic<std::int64_t> native_control_last_sent_at_utc_ms_{0};
+  std::atomic<std::int64_t> native_control_last_sent_monotonic_ms_{0};
   std::atomic<std::int64_t> native_control_last_gap_ms_{0};
   std::atomic<std::int64_t> native_control_max_gap_ms_{0};
   std::atomic<std::uint64_t> native_control_last_seq_{0};
+  std::atomic<std::int64_t> native_control_scheduled_at_monotonic_ms_{0};
+  std::atomic<std::int64_t> native_control_last_ack_received_at_utc_ms_{0};
+  std::atomic<std::int64_t> native_control_last_ack_cloud_received_at_utc_ms_{0};
   std::string native_control_last_error_;
+  std::unique_ptr<AsyncControlTrace> native_control_trace_;
   std::jthread native_control_sender_;
   std::jthread native_control_lease_;
 };

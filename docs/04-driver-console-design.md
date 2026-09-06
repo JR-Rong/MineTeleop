@@ -278,8 +278,11 @@ TURN 使用状态和时间同步可信度。逐路指标超过 200 ms 或低于 
 
 现场排查可显式开启 `logging.control_trace_commands`。页面约每秒批量记录
 `control_trace_batch`，其中 timer/queue 计数只描述浏览器刷新输入租约，不代表 20 Hz
-车辆发包。`/api/status.native_control` 才提供原生 WSS 的连接、重连、发送/失败总数、
-最近/最大命令间隔以及发送/ACK 序号。车端 `vehicle_control_trace_batch` 记录实际收到
-的原生命令、`intent_seq`/`intent_fresh`、处理耗时和拒绝原因。三者均按原始 session
-作用域关联且不记录 `control_token`；signaling latest-only mailbox 允许中间命令被
-覆盖，不能把每个浏览器意图或原生发送序号都当作车端必达确认。
+车辆发包。同一控制端 JSONL 还会写入 `driver_native_control_trace_batch`，逐条记录原生
+sender 的计划唤醒/实际唤醒、建连、ACK 排空、WSS send 起止、单次 send 耗时以及 UTC/
+monotonic 成功发送间隔。`/api/status.native_control` 同时提供连接、重连、发送/失败总数、
+最近/最大命令间隔、发送/ACK 序号、未确认持续时间和最近云端接收 ACK 时间。云端和车端
+分别使用 `cloud_native_control_trace_batch`、`vehicle_control_trace_batch` 补全入站、
+latest-only mailbox、投递、接收、锁等待、apply 和拒绝阶段。三端都用
+`trace_session_id + seq + intent_seq`（云端投递 ACK 另带 `delivery_cursor`）关联且不记录
+`control_token`；中间发送序号被 mailbox 覆盖是正常行为，不能当作丢包或必达确认。

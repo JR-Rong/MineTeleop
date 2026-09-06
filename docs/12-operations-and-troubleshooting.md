@@ -39,6 +39,12 @@ sudo journalctl -u caddy.service -n 200 --no-pager
 sudo journalctl -u haproxy.service -n 200 --no-pager
 ```
 
+控制逐段时序写入 `/var/log/mine-teleop/signaling-audit.jsonl*`，事件名为
+`cloud_native_control_trace_batch`。控制端的浏览器意图与原生 sender 时序共同写入包内
+`.local/logs/control-browser-events.jsonl*`；车端接收/apply 时序写入
+`/var/log/mine-teleop/vehicle-runtime.log*`。复现时三端文件必须覆盖同一
+`trace_session_id`，再按 `seq`、`intent_seq` 和 `delivery_cursor` 对齐。
+
 signaling 必须只绑定回环地址，由 Caddy 终止 TLS。公网不得直接开放 8765。
 
 ## Ubuntu 车端

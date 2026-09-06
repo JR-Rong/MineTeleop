@@ -1804,8 +1804,17 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
           lock_wait_started < lock_acquired,
       "vehicle control trace does not separate callback entry, parsing, and mutex wait");
   for (const auto field : {
+           "stage",
+           "trace_session_id",
            "callback_entered_at_utc_ms",
            "callback_entered_monotonic_ms",
+           "delivery_cursor",
+           "cloud_queued_at_utc_ms",
+           "vehicle_envelope_received_at_utc_ms",
+           "vehicle_envelope_received_monotonic_ms",
+           "driver_to_vehicle_callback_utc_delta_ms",
+           "cloud_queue_to_vehicle_callback_utc_delta_ms",
+           "vehicle_envelope_to_callback_ms",
            "received_at_utc_ms",
            "control_mutex_acquired_at_utc_ms",
            "control_mutex_acquired_monotonic_ms",
@@ -1827,6 +1836,11 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
         handler.find(std::string("{\"") + field + "\"") != std::string::npos,
         std::string("vehicle control trace omits diagnostic field ") + field);
   }
+  expect(
+      source.find("\"post_transport_error_discarded\"") != std::string::npos &&
+          source.find("\"delivery_ack_sent\"") != std::string::npos &&
+          source.find("\"vehicle_ack_send_call_ms\"") != std::string::npos,
+      "vehicle trace omits post-error disposition or delivery ACK timing");
   expect(
       source.find("callback_completed_at_utc_ms") == std::string::npos &&
           source.find("callback_completed_monotonic_ms") == std::string::npos &&
@@ -4235,6 +4249,221 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
   server.stop();
 }
 
+void test_native_control_three_hop_trace_correlation() {
+  const auto root = std::filesystem::temp_directory_path() /
+      ("mine-teleop-native-control-trace-" + mine_teleop::random_token(6));
+  std::filesystem::create_directories(root);
+  const auto audit_path = root / "signaling-audit.jsonl";
+  const auto driver_log_path = root / "control-browser-events.jsonl";
+  std::string trace_session_id;
+  std::uint64_t vehicle_received_seq = 0;
+  std::uint64_t vehicle_delivery_cursor = 0;
+
+  mine_teleop::SignalingServerConfig signaling_config;
+  signaling_config.driver_passwords = {{"driver-console-001", "trace-driver-password"}};
+  signaling_config.device_tokens = {{"vehicle-001", "trace-device-token"}};
+  signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
+  signaling_config.audit_log_path = audit_path.string();
+  signaling_config.native_control_trace_commands = true;
+  signaling_config.native_control_message_ttl_ms = 1000;
+  auto signaling = std::make_shared<mine_teleop::SignalingService>(signaling_config);
+
+  {
+    mine_teleop::SimpleHttpServer server(
+        "127.0.0.1",
+        0,
+        [signaling](const auto& request) { return signaling->handle(request); },
+        8 * 1024 * 1024,
+        [signaling](int socket, const auto& request) {
+          return signaling->handle_websocket(socket, request);
+        });
+    server.start();
+    const auto base = "http://127.0.0.1:" + std::to_string(server.port());
+    mine_teleop::HttpClient http;
+    const auto online = http.post_json_response(
+        base + "/vehicles/online",
+        {{"vehicle_id", "vehicle-001"},
+         {"device_token", "trace-device-token"},
+         {"connection_id", "trace-vehicle-connection"}});
+    const auto vehicle_generation =
+        online.at("connection_generation").get<std::uint64_t>();
+
+    {
+      mine_teleop::DriverConfig driver_config;
+      driver_config.driver_id = "driver-console-001";
+      driver_config.signaling_url = base;
+      driver_config.control_trace_commands = true;
+      driver_config.browser_event_log_path = driver_log_path;
+      driver_config.browser_event_log_max_bytes = 4 * 1024 * 1024;
+      driver_config.intent_lease_ms = 1000;
+      allow_qemu_test_scheduler_time_sync(driver_config);
+      mine_teleop::DriverConsoleRuntime driver(
+          driver_config,
+          "vehicle-001",
+          "trace-driver-password");
+      const auto connected = driver.connect("vehicle-001");
+      const auto session_id = connected.at("session_id").get<std::string>();
+      trace_session_id = session_id;
+      const auto session_generation =
+          connected.at("control_session_generation").get<std::uint64_t>();
+
+      auto receiver_url = mine_teleop::signaling_websocket_url(
+          base,
+          session_id,
+          "vehicle-001",
+          std::to_string(vehicle_generation));
+      receiver_url += "&types=control_command";
+      mine_teleop::WebSocketClient receiver;
+      receiver.connect(
+          receiver_url,
+          {{"X-Mine-Teleop-Device-Token", "trace-device-token"}});
+
+      static_cast<void>(driver.update_control_intent(
+          {{"session_id", session_id},
+           {"session_generation", session_generation},
+           {"ui_instance_id", "three-hop-trace-test"},
+           {"intent_seq", 1},
+           {"gear", "N"},
+           {"steering", 0.0},
+           {"throttle", 0.0},
+           {"brake", 0.0}}));
+      static_cast<void>(driver.update_control_intent(
+          {{"session_id", session_id},
+           {"session_generation", session_generation},
+           {"ui_instance_id", "three-hop-trace-test"},
+           {"intent_seq", 2},
+           {"gear", "D"},
+           {"steering", 0.1},
+           {"throttle", 0.2},
+           {"brake", 0.0}}));
+
+      bool correlated_delivery = false;
+      const auto deadline = std::chrono::steady_clock::now() +
+          std::chrono::seconds(3);
+      while (std::chrono::steady_clock::now() < deadline && !correlated_delivery) {
+        const auto received = receiver.receive_json(std::chrono::milliseconds(500));
+        if (received.status != mine_teleop::WebSocketReceiveStatus::Message ||
+            received.message.value("event", "") != "signaling_messages") {
+          continue;
+        }
+        const auto delivery_cursor =
+            received.message.value("delivery_cursor", std::uint64_t{0});
+        for (const auto& message : received.message.at("messages")) {
+          if (message.value("type", "") == "control_command" &&
+              message.at("payload").value("intent_seq", std::uint64_t{0}) == 2) {
+            correlated_delivery = true;
+            vehicle_received_seq = message.value("seq", std::uint64_t{0});
+            vehicle_delivery_cursor = delivery_cursor;
+          }
+        }
+        receiver.send_json(
+            {{"event", "signaling_delivery_ack"},
+             {"delivery_cursor", delivery_cursor}});
+      }
+      expect(correlated_delivery, "native control trace test did not receive the active intent");
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      receiver.close();
+      static_cast<void>(driver.disconnect("three_hop_trace_test_complete"));
+    }
+    server.stop();
+  }
+  signaling.reset();
+
+  const auto driver_log = read_text_file(driver_log_path);
+  const auto cloud_log = read_text_file(audit_path);
+  const auto load_trace_commands = [](const std::filesystem::path& path,
+                                      std::string_view event) {
+    mine_teleop::Json commands = mine_teleop::Json::array();
+    std::ifstream input(path);
+    expect(input.good(), "expected native control trace log is missing");
+    std::string line;
+    while (std::getline(input, line)) {
+      const auto record = mine_teleop::Json::parse(line);
+      if (record.value("event", "") != event) continue;
+      for (const auto& command : record.at("details").at("commands")) {
+        commands.push_back(command);
+      }
+    }
+    return commands;
+  };
+  const auto driver_commands = load_trace_commands(
+      driver_log_path,
+      "driver_native_control_trace_batch");
+  const auto cloud_commands = load_trace_commands(
+      audit_path,
+      "cloud_native_control_trace_batch");
+  const auto has_command = [&](const mine_teleop::Json& commands,
+                               std::string_view stage,
+                               std::uint64_t seq,
+                               std::uint64_t delivery_cursor) {
+    return std::any_of(commands.begin(), commands.end(), [&](const auto& command) {
+      return command.value("stage", "") == stage &&
+          command.value("trace_session_id", "") == trace_session_id &&
+          command.value("seq", std::uint64_t{0}) == seq &&
+          command.value("intent_seq", std::uint64_t{0}) == 2 &&
+          (delivery_cursor == 0 ||
+           command.value("delivery_cursor", std::uint64_t{0}) == delivery_cursor);
+    });
+  };
+  expect(
+      !trace_session_id.empty() && vehicle_received_seq > 0 &&
+          vehicle_delivery_cursor > 0,
+      "vehicle-side receiver did not retain the trace correlation keys");
+  expect(
+      has_command(driver_commands, "send_completed", vehicle_received_seq, 0),
+      "driver trace cannot be correlated to the command received by the vehicle");
+  expect(
+      has_command(
+          cloud_commands,
+          "ingress_queued",
+          vehicle_received_seq,
+          vehicle_delivery_cursor) &&
+          has_command(
+              cloud_commands,
+              "delivery_send_completed",
+              vehicle_received_seq,
+              vehicle_delivery_cursor) &&
+          has_command(
+              cloud_commands,
+              "delivery_ack_received",
+              vehicle_received_seq,
+              vehicle_delivery_cursor),
+      "cloud trace does not correlate ingress, vehicle delivery, and vehicle ACK");
+  for (const auto field : {
+           "driver_native_control_trace_batch",
+           "sender_wakeup_lag_ms",
+           "acknowledgement_drain_ms",
+           "send_started_at_utc_ms",
+           "send_completed_at_utc_ms",
+           "send_call_ms",
+           "successful_send_gap_ms",
+           "successful_send_monotonic_gap_ms"}) {
+    expect(
+        driver_log.find(field) != std::string::npos,
+        std::string("driver native control trace omitted ") + field);
+  }
+  for (const auto field : {
+           "cloud_native_control_trace_batch",
+           "ingress_queued",
+           "delivery_send_completed",
+           "delivery_ack_received",
+           "driver_to_cloud_utc_delta_ms",
+           "cloud_mailbox_to_send_ms",
+           "delivery_cursor",
+           "trace_session_id"}) {
+    expect(
+        cloud_log.find(field) != std::string::npos,
+        std::string("cloud native control trace omitted ") + field);
+  }
+  for (const auto secret : {
+           "trace-driver-password",
+           "trace-device-token"}) {
+    expect(driver_log.find(secret) == std::string::npos, "driver trace leaked a credential");
+    expect(cloud_log.find(secret) == std::string::npos, "cloud trace leaked a credential");
+  }
+  std::filesystem::remove_all(root);
+}
+
 void test_mac_runtime_retries_uncertain_websocket_send_without_duplication() {
   mine_teleop::SignalingServerConfig signaling_config;
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
@@ -5691,6 +5920,8 @@ int main() {
       {"websocket_handshake_and_participant_isolation", test_websocket_handshake_and_participant_isolation},
       {"websocket_delivery_replay_and_idempotent_acknowledgement",
        test_websocket_delivery_replay_and_idempotent_acknowledgement},
+      {"native_control_three_hop_trace_correlation",
+       test_native_control_three_hop_trace_correlation},
       {"mac_runtime_retries_uncertain_websocket_send_without_duplication",
        test_mac_runtime_retries_uncertain_websocket_send_without_duplication},
       {"expired_websocket_authority_clears_local_control", test_expired_websocket_authority_clears_local_control},

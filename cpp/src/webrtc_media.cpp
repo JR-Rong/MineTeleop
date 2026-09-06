@@ -150,6 +150,16 @@ constexpr auto kNativeControlReconnectInitialDelay = std::chrono::milliseconds(1
 constexpr auto kNativeControlReconnectMaximumDelay = std::chrono::milliseconds(1000);
 constexpr auto kNativeControlDiagnosticInterval = std::chrono::milliseconds(5000);
 
+struct NativeControlDeliveryTraceContext {
+  std::uint64_t delivery_cursor{0};
+  std::int64_t cloud_queued_at_utc_ms{0};
+  std::int64_t envelope_received_at_utc_ms{0};
+  std::int64_t envelope_received_monotonic_ms{0};
+  std::size_t envelope_message_count{0};
+  std::size_t valid_message_count{0};
+  std::size_t superseded_message_count{0};
+};
+
 std::int64_t steady_now_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -924,7 +934,8 @@ struct VehicleMediaRuntime::Impl {
     self->handle_control_message(
         channel,
         data == nullptr ? "" : data,
-        ControlMessageTransport::DataChannel);
+        ControlMessageTransport::DataChannel,
+        nullptr);
   }
 
   static void on_offer_created(GstPromise* promise, gpointer user_data) {
@@ -1164,10 +1175,28 @@ struct VehicleMediaRuntime::Impl {
   void handle_control_message(
       GstWebRTCDataChannel* channel,
       std::string_view data,
-      ControlMessageTransport transport) {
+      ControlMessageTransport transport,
+      const NativeControlDeliveryTraceContext* delivery_trace) {
     const auto callback_entered_monotonic_ms = steady_now_ms();
     const auto callback_entered_at_utc_ms = signaling.now_ms();
     const std::string transport_name(control_transport_name(transport));
+    const auto delivery_cursor =
+        delivery_trace == nullptr ? std::uint64_t{0} : delivery_trace->delivery_cursor;
+    const auto cloud_queued_at_utc_ms =
+        delivery_trace == nullptr ? std::int64_t{0} : delivery_trace->cloud_queued_at_utc_ms;
+    const auto envelope_received_at_utc_ms = delivery_trace == nullptr
+        ? std::int64_t{0}
+        : delivery_trace->envelope_received_at_utc_ms;
+    const auto envelope_received_monotonic_ms = delivery_trace == nullptr
+        ? std::int64_t{0}
+        : delivery_trace->envelope_received_monotonic_ms;
+    const auto envelope_message_count =
+        delivery_trace == nullptr ? std::size_t{0} : delivery_trace->envelope_message_count;
+    const auto valid_message_count =
+        delivery_trace == nullptr ? std::size_t{0} : delivery_trace->valid_message_count;
+    const auto superseded_message_count = delivery_trace == nullptr
+        ? std::size_t{0}
+        : delivery_trace->superseded_message_count;
     if (data.empty() || data.size() > 64 * 1024) {
       ++rejected_control_commands;
       return;
@@ -1310,7 +1339,14 @@ struct VehicleMediaRuntime::Impl {
                                         intent_fresh,
                                         stale_safe_heartbeat,
                                         wire_requested_gear,
-                                        transport_name](
+                                        transport_name,
+                                        delivery_cursor,
+                                        cloud_queued_at_utc_ms,
+                                        envelope_received_at_utc_ms,
+                                        envelope_received_monotonic_ms,
+                                        envelope_message_count,
+                                        valid_message_count,
+                                        superseded_message_count](
                                            const ReceiveResult* result,
                                            std::string_view reason,
                                            bool receive_apply_invoked,
@@ -1331,19 +1367,41 @@ struct VehicleMediaRuntime::Impl {
             }
           }
           Json record = {
+              {"stage", "receive_apply"},
               {"protocol_version", command.protocol_version},
               {"vehicle_id", bounded_control_trace_text(command.vehicle_id)},
               {"driver_id", bounded_control_trace_text(command.driver_id)},
               {"session_id", bounded_control_trace_text(command.session_id)},
+              {"trace_session_id", bounded_control_trace_text(command.session_id)},
               {"active_session_id", bounded_control_trace_text(active_session_id)},
               {"transport", transport_name},
               {"seq", command.seq},
               {"intent_seq", intent_seq},
               {"intent_fresh", intent_fresh},
               {"stale_safe_heartbeat", stale_safe_heartbeat},
+              {"delivery_cursor", delivery_cursor},
+              {"cloud_queued_at_utc_ms", cloud_queued_at_utc_ms},
+              {"vehicle_envelope_received_at_utc_ms", envelope_received_at_utc_ms},
+              {"vehicle_envelope_received_monotonic_ms", envelope_received_monotonic_ms},
+              {"envelope_message_count", envelope_message_count},
+              {"valid_message_count", valid_message_count},
+              {"superseded_message_count", superseded_message_count},
               {"sent_at_utc_ms", command.sent_at_utc_ms},
               {"callback_entered_at_utc_ms", callback_entered_at_utc_ms},
               {"callback_entered_monotonic_ms", callback_entered_monotonic_ms},
+              {"driver_to_vehicle_callback_utc_delta_ms",
+               callback_entered_at_utc_ms - command.sent_at_utc_ms},
+              {"cloud_queue_to_vehicle_callback_utc_delta_ms",
+               cloud_queued_at_utc_ms > 0
+                   ? callback_entered_at_utc_ms - cloud_queued_at_utc_ms
+                   : 0},
+              {"vehicle_envelope_to_callback_ms",
+               envelope_received_monotonic_ms > 0
+                   ? std::max<std::int64_t>(
+                         0,
+                         callback_entered_monotonic_ms -
+                             envelope_received_monotonic_ms)
+                   : 0},
               {"control_mutex_wait_started_monotonic_ms", control_mutex_wait_started_monotonic_ms},
               {"received_at_utc_ms", control_mutex_acquired_at_utc_ms},
               {"control_mutex_acquired_at_utc_ms", control_mutex_acquired_at_utc_ms},
@@ -1755,6 +1813,8 @@ struct VehicleMediaRuntime::Impl {
   void handle_native_control_websocket_envelope(
       WebSocketClient& websocket,
       const Json& envelope) {
+    const auto envelope_received_at_utc_ms = signaling.now_ms();
+    const auto envelope_received_monotonic_ms = steady_now_ms();
     if (!envelope.is_object()) {
       throw std::invalid_argument("native control WebSocket envelope must be an object");
     }
@@ -1863,20 +1923,107 @@ struct VehicleMediaRuntime::Impl {
       native_control_websocket_post_error_discards_total.fetch_add(
           1,
           std::memory_order_relaxed);
+      if (config.runtime.control_log_commands) {
+        try {
+          enqueue_control_trace({
+              {"stage", "post_transport_error_discarded"},
+              {"protocol_version", payload.value("protocol_version", "")},
+              {"vehicle_id", bounded_control_trace_text(payload.value("vehicle_id", ""))},
+              {"driver_id", bounded_control_trace_text(payload.value("driver_id", ""))},
+              {"session_id", bounded_control_trace_text(payload.value("session_id", ""))},
+              {"trace_session_id", bounded_control_trace_text(payload.value("session_id", ""))},
+              {"transport", "native_signaling_websocket"},
+              {"seq", payload.value("seq", std::uint64_t{0})},
+              {"intent_seq", payload.value("intent_seq", std::uint64_t{0})},
+              {"delivery_cursor", selected->value("delivery_cursor", std::uint64_t{0})},
+              {"sent_at_utc_ms", command_sent_at_ms},
+              {"cloud_queued_at_utc_ms", selected->value("queued_at_utc_ms", std::int64_t{0})},
+              {"vehicle_envelope_received_at_utc_ms", envelope_received_at_utc_ms},
+              {"vehicle_envelope_received_monotonic_ms", envelope_received_monotonic_ms},
+              {"accepted", false},
+              {"reason", "post_transport_error_freshness_cutoff"},
+          });
+        } catch (...) {
+          note_control_trace_drop();
+        }
+      }
     } else {
+      const NativeControlDeliveryTraceContext delivery_trace{
+          selected->value("delivery_cursor", std::uint64_t{0}),
+          selected->value("queued_at_utc_ms", std::int64_t{0}),
+          envelope_received_at_utc_ms,
+          envelope_received_monotonic_ms,
+          messages.size(),
+          valid_messages,
+          valid_messages > 0 ? valid_messages - 1 : 0,
+      };
       handle_control_message(
           nullptr,
           payload.dump(),
-          ControlMessageTransport::NativeSignaling);
+          ControlMessageTransport::NativeSignaling,
+          &delivery_trace);
     }
 
     // Acknowledge the delivered view even when its ordinary command was
     // intentionally discarded. This prevents reconnect from replaying an old
     // mailbox entry; a newer controller sample is required to resume control.
-    websocket.send_json(
-        {{"event", "signaling_delivery_ack"},
-         {"delivery_cursor", delivery_cursor}},
-        kNativeControlWebSocketSendTimeout);
+    const auto ack_send_started_at_utc_ms = signaling.now_ms();
+    const auto ack_send_started_monotonic_ms = steady_now_ms();
+    try {
+      websocket.send_json(
+          {{"event", "signaling_delivery_ack"},
+           {"delivery_cursor", delivery_cursor}},
+          kNativeControlWebSocketSendTimeout);
+    } catch (const std::exception& error) {
+      if (config.runtime.control_log_commands) {
+        try {
+          enqueue_control_trace({
+              {"stage", "delivery_ack_send_failed"},
+              {"vehicle_id", bounded_control_trace_text(config.vehicle_id)},
+              {"driver_id", bounded_control_trace_text(payload.value("driver_id", ""))},
+              {"session_id", bounded_control_trace_text(payload.value("session_id", ""))},
+              {"trace_session_id", bounded_control_trace_text(payload.value("session_id", ""))},
+              {"seq", payload.value("seq", std::uint64_t{0})},
+              {"intent_seq", payload.value("intent_seq", std::uint64_t{0})},
+              {"delivery_cursor", delivery_cursor},
+              {"vehicle_ack_send_started_at_utc_ms", ack_send_started_at_utc_ms},
+              {"vehicle_ack_send_started_monotonic_ms", ack_send_started_monotonic_ms},
+              {"vehicle_ack_send_failed_at_utc_ms", signaling.now_ms()},
+              {"vehicle_ack_send_failed_monotonic_ms", steady_now_ms()},
+              {"error", bounded_control_trace_text(error.what())},
+          });
+        } catch (...) {
+          note_control_trace_drop();
+        }
+      }
+      throw;
+    }
+    const auto ack_send_completed_at_utc_ms = signaling.now_ms();
+    const auto ack_send_completed_monotonic_ms = steady_now_ms();
+    if (config.runtime.control_log_commands) {
+      try {
+        enqueue_control_trace({
+            {"stage", "delivery_ack_sent"},
+            {"vehicle_id", bounded_control_trace_text(config.vehicle_id)},
+            {"driver_id", bounded_control_trace_text(payload.value("driver_id", ""))},
+            {"session_id", bounded_control_trace_text(payload.value("session_id", ""))},
+            {"trace_session_id", bounded_control_trace_text(payload.value("session_id", ""))},
+            {"seq", payload.value("seq", std::uint64_t{0})},
+            {"intent_seq", payload.value("intent_seq", std::uint64_t{0})},
+            {"delivery_cursor", delivery_cursor},
+            {"vehicle_ack_send_started_at_utc_ms", ack_send_started_at_utc_ms},
+            {"vehicle_ack_send_started_monotonic_ms", ack_send_started_monotonic_ms},
+            {"vehicle_ack_send_completed_at_utc_ms", ack_send_completed_at_utc_ms},
+            {"vehicle_ack_send_completed_monotonic_ms", ack_send_completed_monotonic_ms},
+            {"vehicle_ack_send_call_ms", std::max<std::int64_t>(
+                                                    0,
+                                                    ack_send_completed_monotonic_ms -
+                                                        ack_send_started_monotonic_ms)},
+        });
+      } catch (...) {
+        note_control_trace_drop();
+      }
+    }
     native_control_delivery_acks_sent_total.fetch_add(1, std::memory_order_relaxed);
     native_control_websocket_last_message_at_ms.store(
         signaling.now_ms(),

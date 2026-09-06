@@ -199,6 +199,7 @@ Signaling server options:
   --audit-log-max-bytes N       active-hour part size limit (default 67108864)
   --audit-log-files N           active-hour size part count (default 5)
   --audit-log-retention-days N  hourly archive retention (default 7)
+  --native-control-trace        batch per-command native control hop timings into audit log
   --driver-token-ttl-ms N       driver bearer token lifetime (default 1800000)
   --control-token-ttl-ms N      control authority token lifetime (default 300000)
   --vehicle-heartbeat-ms N      vehicle offline timeout (default 15000)
@@ -457,6 +458,7 @@ int run_signaling_server(const Arguments& arguments) {
   config.audit_log_max_bytes = arguments.integer("--audit-log-max-bytes", 64 * 1024 * 1024);
   config.audit_log_files = arguments.integer("--audit-log-files", 5);
   config.audit_log_retention_days = arguments.integer("--audit-log-retention-days", 7);
+  config.native_control_trace_commands = arguments.has("--native-control-trace");
   const auto stun_url_count = config.stun_urls.size();
   const auto turn_url_count = config.turn_urls.size();
   const auto login_max_failures = config.login_max_failures;
@@ -466,6 +468,7 @@ int run_signaling_server(const Arguments& arguments) {
   const auto api_rate_limit_window_ms = config.api_rate_limit_window_ms;
   const auto api_rate_limit_max_sources = config.api_rate_limit_max_sources;
   const auto trusted_proxy_count = config.trusted_proxy_addresses.size();
+  const auto native_control_trace_commands = config.native_control_trace_commands;
   auto service = std::make_shared<mine_teleop::SignalingService>(std::move(config));
   mine_teleop::SimpleHttpServer server(
       arguments.value("--host", "127.0.0.1"),
@@ -489,6 +492,7 @@ int run_signaling_server(const Arguments& arguments) {
                    {"api_rate_limit_window_ms", api_rate_limit_window_ms},
                    {"api_rate_limit_max_sources", api_rate_limit_max_sources},
                    {"trusted_proxy_count", trusted_proxy_count},
+                   {"native_control_trace_commands", native_control_trace_commands},
                }).dump()
             << std::endl;
   server.serve_forever();

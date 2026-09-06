@@ -720,10 +720,12 @@ ACK；若在新 profile 被拒绝时继续按本地预设生成制动标量，�
 `trace_session_id`、`trace_vehicle_id` 是浏览器采集时固定的会话归属；会话切换边界
 排查应使用这两个字段，而不是写盘时控制端进程的当前会话字段。
 
-控制端 `/api/status.native_control` 提供实际原生发包证据：`intent_fresh`、
+控制端同一 JSONL 中的 `driver_native_control_trace_batch` 提供实际原生发包证据：
+sender 调度延迟、建连耗时、ACK 排空、WSS send 起止/耗时以及 UTC 和 monotonic 的
+成功发送间隔。`/api/status.native_control` 另提供 `intent_fresh`、
 `requires_fresh_input`、`websocket_connected`、`commands_sent_total`、
-`send_failures_total`、`last_gap_ms`、`max_gap_ms`、`last_seq`、`last_ack_seq` 和
-`last_error`。车端 summary 的 `native_control_signaling` 与
+`send_failures_total`、`last_gap_ms`、`max_gap_ms`、`last_seq`、`last_ack_seq`、
+`unacknowledged_age_ms`、最近 ACK 时间和 `last_error`。车端 summary 的 `native_control_signaling` 与
 `vehicle_control_trace_batch` 再区分 WSS 接收、latest-only 覆盖、stale 零值接受/丢弃、
 profile/握手门禁和实际 apply。任何单侧“已提交”或“已发送”都不能作为车端已接受的
 ACK。现场三机配置启用此项，并使用 `16 MiB × 4` 轮转容量；复现完成后应按现场保留
@@ -774,6 +776,10 @@ ACK。现场三机配置启用此项，并使用 `16 MiB × 4` 轮转容量；�
   1024 bytes，分片数范围为 1 到 20。全部轮转、追加、flush 和过期清理由同一
   写入锁保护。每次服务构造会先写入 UTC `signaling_service_started`，审计目录
   不存在或不可写时启动失败。
+- `--native-control-trace` 在 signaling audit 中启用
+  `cloud_native_control_trace_batch`。批次用有界异步队列记录入站、mailbox 覆盖/过期、
+  车端 WSS 投递和 delivery ACK；`dropped_total` 非零表示诊断记录自身有缺口。该开关
+  只应与 `--audit-log` 配合使用，复现完成后可从 systemd override 移除以降低日志量。
 - 控制超时大于命令周期。
 - 已单独确认控制超时 0.3/0.6 分段的物理压力、最终 1.0 阶段以及故障/断链/急停的
   八路 `409.5 bar` 安全制动语义和 VCU 硬件响应；409.5 bar 路径不受普通会话压力
