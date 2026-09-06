@@ -7,7 +7,7 @@
   },
   "curl": {
     "port_version": "8.17.0",
-    "runtime_version": "8.17.0",
+    "runtime_version": "8.17.0-DEV",
     "tls_backend": "Schannel",
     "linkage": "static"
   }
