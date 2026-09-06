@@ -25,6 +25,7 @@ option(MINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES "Build camera bridges when bundle
 option(MINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE "Build the lightweight Aravis USB3 Vision camera bridge" ON)
 option(MINE_TELEOP_FETCH_MISSING_DEPS "Fetch pinned yaml-cpp and nlohmann-json sources when absent" OFF)
 set(MINE_TELEOP_MVS_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/mvs" CACHE PATH "Bundled Hikrobot MVS SDK root")
+set(MINE_TELEOP_CURL_LINKAGE "unknown" CACHE STRING "How libcurl is linked into the control client")
 
 find_package(Threads REQUIRED)
 if(WIN32)
@@ -173,6 +174,10 @@ endif()
 if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
   add_executable(mine-teleop-control cpp/apps/mine_teleop_control.cpp)
   target_link_libraries(mine-teleop-control PRIVATE mine_teleop_runtime)
+  target_compile_definitions(
+    mine-teleop-control
+    PRIVATE MINE_TELEOP_CURL_LINKAGE="${MINE_TELEOP_CURL_LINKAGE}"
+  )
   mine_teleop_enable_warnings(mine-teleop-control)
   set_target_properties(mine-teleop-control PROPERTIES
     BUILD_RPATH "$ORIGIN/../lib"

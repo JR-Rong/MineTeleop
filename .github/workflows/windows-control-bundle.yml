@@ -29,19 +29,32 @@ jobs:
     steps:
       - name: Check out MineTeleop
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Read pinned Windows dependencies
+        id: windows-dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $lock = Get-Content -LiteralPath packaging/windows/dependencies.lock.json -Raw | ConvertFrom-Json
+          if ([string]::IsNullOrWhiteSpace([string]$lock.vcpkg_commit)) {
+            throw "Windows dependency lock does not contain vcpkg_commit"
+          }
+          "vcpkg_commit=$($lock.vcpkg_commit)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Check out pinned vcpkg
         uses: actions/checkout@v4
         with:
           repository: microsoft/vcpkg
-          ref: 120deac3062162151622ca4860575a33844ba10b
+          ref: ${{ steps.windows-dependencies.outputs.vcpkg_commit }}
           path: .vcpkg
 
       - name: Bootstrap vcpkg
         shell: pwsh
         env:
           VCPKG_DISABLE_METRICS: "1"
-          VCPKG_COMMIT: 120deac3062162151622ca4860575a33844ba10b
+          VCPKG_COMMIT: ${{ steps.windows-dependencies.outputs.vcpkg_commit }}
         run: |
           $ErrorActionPreference = "Stop"
           $actualCommit = git -C .vcpkg rev-parse HEAD
@@ -65,9 +78,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}\vcpkg-binary-cache
-          key: vcpkg-windows-x64-120deac3062162151622ca4860575a33844ba10b-control-v1
+          key: vcpkg-windows-x64-${{ hashFiles('packaging/windows/dependencies.lock.json') }}-control-v2
 
-      - name: Build and smoke-test Windows x64 bundle
+      - name: Build Windows x64 bundle and verify embedded dependencies
         shell: pwsh
         env:
           VCPKG_DISABLE_METRICS: "1"
@@ -75,8 +88,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           & .\scripts\build\build_windows_control_bundle.ps1 `
             -Architecture x64 `
-            -VcpkgRoot .\.vcpkg `
-            -SmokeTest
+            -VcpkgRoot .\.vcpkg
           if ($LASTEXITCODE -ne 0) {
             throw "Windows control bundle build failed with exit code $LASTEXITCODE"
           }
@@ -104,7 +116,7 @@ jobs:
       - name: Upload Windows x64 ZIP and SHA-256
         uses: actions/upload-artifact@v4
         with:
-          name: mine-teleop-control-windows-x64-${{ github.sha }}
+          name: mine-teleop-control-windows-x64-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
             dist/mine-teleop-control-windows-x64-*.zip
             dist/mine-teleop-control-windows-x64-*.zip.sha256

@@ -2,6 +2,7 @@
 /build/
 /cpp-build/
 /dist/
+/.vcpkg/
 *.tar.gz
 .DS_Store
 .playwright-cli/

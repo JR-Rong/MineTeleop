@@ -37,11 +37,21 @@ MINE_TELEOP_DRIVER_PASSWORD process environment variable.
 
 Contents:
 
-  bin\            Windows executable and any app-local runtime DLLs
+  bin\            Windows executable; curl and third-party libraries are static
   config\         local baseline and field-tested three-machine driver YAML
   protocol\       protocol-v1 interoperability vectors
   run-control.ps1 one-command PowerShell launcher
-  BUILD-INFO.txt  target architecture, dependency triplet, and test status
+  BUILD-INFO.txt  source, architecture, curl/TLS versions, and build status
+  DEPENDENCIES.json exact linked curl provenance and runtime file hashes
+  DEPENDENCIES.lock.json reproducible vcpkg/curl build inputs
+  THIRD-PARTY-VERSIONS.txt complete vcpkg dependency version list
+  RUNTIME-SHA256.txt executable and app-local runtime hashes
+
+The package does not load libcurl from Windows or PATH. curl is statically
+linked into mine-teleop-control.exe at build time. Run this command to inspect
+the version and TLS backend actually compiled into the executable:
+
+  .\bin\mine-teleop-control.exe --dependency-info
 
 This package is a build artifact until it passes Windows-host acceptance. At a
 minimum, verify startup, loopback-only binding, browser opening, occupied-port

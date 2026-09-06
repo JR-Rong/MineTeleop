@@ -2,6 +2,10 @@
 
 #include <curl/curl.h>
 
+#if defined(_WIN32) && LIBCURL_VERSION_NUM < 0x081100
+#error "MineTeleop Windows WSS requires libcurl 8.17.0 or newer"
+#endif
+
 namespace mine_teleop {
 
 inline void configure_curl_custom_ca(CURL* curl, const char* ca_bundle) {
