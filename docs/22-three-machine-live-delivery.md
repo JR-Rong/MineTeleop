@@ -1,5 +1,10 @@
 # Ubuntu vehicle + cloud + Mac live delivery
 
+> Historical acceptance note: the ordinary-command DataChannel evidence in this
+> handoff belongs to the previous transport revision. Current control commands
+> use native 20 Hz WSS on both endpoints; DataChannel is profile/VCU/status only.
+> Keep the results below as historical evidence, not current transport acceptance.
+
 This is the live field handoff for the first three-machine path. Windows and
 Ubuntu control clients are intentionally deferred. Physical chassis actuation
 is not part of this gate: the vehicle configuration uses the mock adapter and

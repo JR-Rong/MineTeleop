@@ -4,10 +4,13 @@
 
 控制链路必须简单、稳定、可追溯。视频可以丢帧，控制不能积压旧命令。
 
-控制命令只通过 WebRTC DataChannel 传输，信令服务拒绝 `control_command`。通道固定为
-`label=control`、`protocol=mine-teleop-control-v1`、`ordered=false`、
-`maxRetransmits=0`。控制命令是 20 Hz 全量状态，车端依赖 `seq` 丢弃旧命令；
-可靠有序重传会造成队头阻塞，不适合作为控制模式。
+普通控制命令由原生控制端固定 20 Hz 生成，通过专用 send-only WSS 写入 signaling
+的容量 1、TTL 150 ms latest-only mailbox，再由车端独立 control-only WSS 接收。
+浏览器只经回环 `/api/control-intent` 更新最新输入意图，不生成 `ControlCommand`，也不
+通过 WebRTC DataChannel 发送普通控制。`label=control`、
+`protocol=mine-teleop-control-v1`、`ordered=false`、`maxRetransmits=0` 的 DataChannel
+只承载 session profile、VCU 握手和状态。控制命令仍是全量状态，车端依赖 `seq`
+丢弃旧命令；服务端不保留可积压、可重放的控制队列。
 
 ## ControlCommand
 
@@ -23,6 +26,8 @@
   "seq": 12345,
   "sent_at_utc_ms": 1780000000000,
   "control_token": "short-lived-session-token",
+  "intent_seq": 81,
+  "intent_fresh": true,
   "gear": "D",
   "steering": 0.12,
   "throttle": 0.20,
@@ -38,9 +43,12 @@
 - `driver_id`：当前获权驾驶员 ID，必须是 JSON string，并与会话记录一致。
 - `session_id`：当前控制会话 ID，必须是 JSON string。
 - `seq`：单调递增的非负 JSON integer，用于丢弃乱序旧命令。
-- `sent_at_utc_ms`：控制输入形成时的 UTC 毫秒时间，必须是 JSON integer；两端时间同步不确定度必须不超过 25 ms，否则时延数据标记为不可信。
+- `sent_at_utc_ms`：原生控制命令形成时的 UTC 毫秒时间，必须是 JSON integer；两端时间同步不确定度必须不超过 25 ms，否则时延数据标记为不可信。
 - `control_token`：当前会话的短期控制权令牌，必须是非空 JSON string；认证续租只延长
-  其服务端到期时间，不在活动 DataChannel 中轮换值；会话结束后立即失效，禁止写入日志。
+  其服务端到期时间，不在活动控制 WSS 或 profile DataChannel 中轮换值；会话结束后
+  立即失效，禁止写入日志。
+- `intent_seq`：浏览器输入意图的正整数序号；它与原生命令 `seq` 是两个独立序列。
+- `intent_fresh`：原生进程采样时输入租约是否新鲜，必须是 JSON boolean。
 - `gear`：档位，必须是 JSON string，具体枚举待车辆接口确认。
 - `steering`：归一化转向，必须是 JSON number，范围 `[-1.0, 1.0]`。
 - `throttle`：归一化油门，必须是 JSON number，范围 `[0.0, 1.0]`。
@@ -55,23 +63,36 @@
 
 ## 发送频率
 
-默认 20 Hz。
+活动会话内默认 20 Hz。安全退出、页面关闭导致会话结束，或原生进程退出后不继续
+发包；车端必须按权限撤销或真实命令间隔本地安全停车。
 
 原则：
 
-- 固定周期发送完整状态。
-- 没有输入变化也要发送心跳式命令。
-- 浏览器只允许一个 async writer 串行执行 `/api/control` 和 DataChannel `send`；键盘、Gamepad 和
-  心跳只更新 latest-wins 快照，不排队积压过时命令。
+- 原生发送线程固定周期发送完整状态；没有输入变化也发送心跳式命令，浏览器 timer
+  只刷新输入租约，不能调度车辆发包。
+- 浏览器的单一 async writer 只串行提交 `/api/control-intent`；键盘、Gamepad 和租约刷新
+  只更新 latest-only 意图，不排队积压旧输入。请求带当前 session/generation/UI 实例，
+  旧会话的延迟响应不能污染新会话。
+- 输入租约默认 200 ms，可配置范围 100--1000 ms。租约过期或原生 WSS 异常会使普通
+  非中立输入失效；必须先收到新鲜中立意图才能重新接受非中立输入。ESTOP 在会话内锁存，
+  抢占普通意图且不因请求中止解除。
+- 原生 WSS 的 500 ms ACK 门限按“最老的实际已发送且未确认包”计时；ACK 序号前进会
+  淘汰已经确认的旧包。持续存在一到两包在途时不会继承旧包年龄并误触发重连，真正最老
+  未确认包达到门限时仍会失败关闭。
 - 车端对 `vehicle_telemetry` 与 `vcu_handshake_status` 共用单调递增的 `control_status_seq`；浏览器在
   unordered DataChannel 上只接受严格递增状态，禁止旧 Ready 覆盖较新的 fault/disarm。只有同时通过 `control_status_seq` 门禁并且通过
   `command_seq` 关联到当前换挡事务的拒绝才能改变本地挡位。
-- D/R 选择与油门按键状态分离；松开前进/倒车键只归零牵引请求，普通制动也不自动切 N。
-  真实断链、控制权丢失和 VCU 故障/退出仍重置控制资格，并要求新的 keydown 才能恢复。
-- 浏览器失焦或页面隐藏时立即清空物理输入，保持已选 D/R，但发送零牵引、零转向、零普通制动的
-  安全快照；旧按键不能在窗口恢复焦点后自动恢复控制。
-- DataChannel 未打开、关闭或缓冲超过上限时不继续生成有效油门，界面显示控制链路中断/拥塞。
-- 车端以最后一条有效命令的本地接收时间判断链路健康。
+- D/R 选择与油门按键状态分离；每次新换挡至少要求 3 条严格递增、跨度不小于 200 ms 的
+  新鲜有效零速反馈，当前反馈也必须保持在 `0.1 m/s` 内。目标挡第一包及换挡反馈闭环期间
+  强制零牵引；实际挡位确认后才恢复仍被物理保持的方向输入。松开前进/倒车键只归零牵引
+  请求，普通制动也不自动切 N。真实断链、控制权丢失和 VCU 故障/退出仍重置控制资格，
+  并要求新的 keydown 才能恢复。
+- 浏览器失焦或页面隐藏时立即清空物理输入并提交零意图，保持已选 D/R；旧按键不能在
+  窗口恢复焦点后自动恢复控制。页面被冻结而无法提交时，由原生租约到期完成归零。
+- profile/VCU/status DataChannel 未打开或关闭时，普通输入保持禁用；这条权限门禁与
+  原生控制 WSS 的发包时钟相互独立。
+- 车端独立 50 ms watchdog 以最后一条被接受命令的本地单调时间判断原生链路健康，
+  不依赖 WSS receive、媒体或浏览器线程推进。
 
 ## 车端校验
 
@@ -81,12 +102,18 @@
 2. 校验 `protocol_version` 是否兼容。
 3. 校验 `vehicle_id`、`driver_id` 和 `session_id` 均与当前会话一致。
 4. 校验当前 `control_token`；空令牌、旧会话令牌和其他会话令牌均拒绝。
-5. 校验 seq 是否大于已处理序号。
-6. 使用本地接收时间检查命令到达间隔是否超过配置阈值。
-7. 校验驾驶端时间戳是否明显异常，并记录到日志；除非有可靠时间同步，不直接用跨机器时间差拒绝控制。
-8. 校验控制值范围。
-9. 如果 `estop=true`，立即锁存进入急停状态。
-10. 将命令交给安全状态机。
+5. 校验 `seq` 是否大于已处理序号，并校验正整数 `intent_seq` 与 boolean
+   `intent_fresh`。
+6. 从 signaling 的 latest-only mailbox 只取最新未过期命令；中间序号被覆盖是允许的，
+   但旧序号和传输错误后的滞留普通命令不得补发执行。
+7. 使用本地接收时间检查命令到达间隔是否超过配置阈值。
+8. 校验驾驶端时间戳是否明显异常，并记录到日志；除非有可靠时间同步，不直接用跨机器时间差拒绝控制。
+9. 校验控制值范围。
+10. 如果 `estop=true`，立即锁存进入急停状态并冻结其安全挡位选择。
+11. 非急停且 `intent_fresh=false` 时，只在执行量精确归零、挡位等于最后一条新鲜已接受
+    挡位、profile/握手有效、状态仍为 `CONTROL_ACTIVE`，且原生包间隔尚未达到
+    `degraded_timeout_ms` 时，允许该包仅维持看门狗；其它过期意图全部丢弃。
+12. 将命令交给安全状态机。
 
 ## 会话控制参数
 
@@ -193,7 +220,13 @@ Degraded 阶段会先把会话归一化制动换算成车端普通压力比例�
 
 默认策略：
 
-- 控制心跳短暂异常先进入降级控制：油门置 0、限制速度、提示驾驶端链路抖动。
+- 控制心跳短暂异常先进入降级控制：油门置 0、限制速度、提示驾驶端链路抖动。`DEGRADED`
+  保留已确认的会话 profile；首个新鲜命令只重整接收时序，车端随后只允许一条新鲜中立命令
+  （油门与转向为 0，制动仍可用）恢复 `CONTROL_ACTIVE`。驾驶端同时清空并锁住当前物理输入，
+  要求释放后重新按下，避免恢复旧的按住意图。
+- 浏览器输入租约过期不等同于原生链路中断。满足上一节严格条件的零值 stale heartbeat
+  只能维持尚未中断的 `CONTROL_ACTIVE`；它不能从 `DEGRADED`/`TIMEOUT_BRAKE` 建立或
+  恢复控制，也不能掩盖已达到 `degraded_timeout_ms` 的真实原生包间隔。
 - 超过 `control_timeout_ms` 后进入 `TIMEOUT_BRAKE`。
 - 普通驾驶的缓刹/急刹按会话中已确认的 bar 值直接施加；本 PR 不实现制动 PID 或
   ramp。控制心跳超时按配置的 0.3/0.6/1.0 分段执行，故障、断链、急停以及最终
@@ -228,6 +261,9 @@ control:
 - `max_command_gap_ms`：单次有效命令到达间隔上限。超过该值时，车端应丢弃过旧命令、记录链路异常，并可提示驾驶端网络抖动；它不是状态机进入降级态的持续时间。
 - `degraded_timeout_ms`：链路异常持续时间阈值。超过该持续时间后进入降级控制，例如油门置 0、限速或告警；本 PR 不在普通制动路径内生成压力 ramp。
 - `control_timeout_ms`：持续未收到有效控制心跳后进入 `TIMEOUT_BRAKE` 的阈值。该值必须小于按车辆制动距离、安全边界和场地速度上限反推得到的最大允许值。
+
+只有可恢复的 `DEGRADED` 保留 session profile；`TIMEOUT_BRAKE`、`ESTOP`、`FAULT`、显式断开和
+adapter 已接管的停车仍撤销 profile 与牵引上限，后续必须重新授权。
 
 `degraded_timeout_ms=300` 只能作为首版弱网告警/降级参考值，不应直接等同于急刹阈值。5G 抖动可能达到几十到上百毫秒，最终 `max_command_gap_ms`、`degraded_timeout_ms`、`control_timeout_ms` 和安全制动动作必须结合真实网络、车辆制动距离、坡道/松散路面和底层控制器心跳机制实测标定。
 三个毫秒参数都必须为正且不大于 60000，并满足

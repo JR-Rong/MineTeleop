@@ -37,13 +37,40 @@ MINE_TELEOP_DRIVER_PASSWORD process environment variable.
 
 Contents:
 
-  bin\            Windows executable and any app-local runtime DLLs
+  bin\            Windows executable; curl and third-party libraries are static
   config\         local baseline and field-tested three-machine driver YAML
   protocol\       protocol-v1 interoperability vectors
   run-control.ps1 one-command PowerShell launcher
-  BUILD-INFO.txt  target architecture, dependency triplet, and test status
+  BUILD-INFO.txt  source, architecture, curl/TLS versions, and build status
+  DEPENDENCIES.json exact linked curl provenance and runtime file hashes
+  DEPENDENCIES.lock.json reproducible vcpkg/curl build inputs
+  THIRD-PARTY-VERSIONS.txt complete vcpkg dependency version list
+  RUNTIME-SHA256.txt executable and app-local runtime hashes
 
-This package is a build artifact until it passes Windows-host acceptance. At a
-minimum, verify startup, loopback-only binding, browser opening, occupied-port
-failure, HTTPS/WSS certificate validation, login, vehicle selection, media and
-DataChannel behavior, emergency stop, safe release, and shutdown port cleanup.
+The package does not load libcurl from Windows or PATH. curl is statically
+linked into mine-teleop-control.exe at build time. Run this command to inspect
+the version and TLS backend actually compiled into the executable:
+
+  .\bin\mine-teleop-control.exe --dependency-info
+
+The Windows build runs a Release native-control safety test before packaging.
+It verifies lease-expiry neutralization with gear preservation, invalidation
+without stale-throttle replay, the fresh-neutral interlock, and sticky ESTOP.
+BUILD-INFO.txt records that test execution, but the package remains a build
+artifact until it passes Windows-host and end-to-end acceptance.
+
+At a minimum, verify startup, loopback-only binding, browser opening,
+occupied-port failure, HTTPS/WSS certificate validation, login, vehicle
+selection, and media. Verify that the browser submits only its latest input
+intent, while the native process sends commands at 20 Hz over its dedicated
+WSS connection, the signaling mailbox keeps only the latest command with a
+150 ms TTL, and the vehicle receives it over a separate control-only WSS while
+its watchdog ticks independently every 50 ms. After browser focus loss, hiding,
+or freezing, the intent lease must expire while native transport continues with
+neutral actuation marked stale. The vehicle accepts only exact-zero stale
+actuation as a safe native-link heartbeat, rejects every stale non-zero command,
+and returning to the page must not restore old throttle before a fresh neutral
+input. A real native-process or WSS packet gap still triggers the vehicle
+watchdog. The DataChannel remains the fail-closed session-profile
+and VCU-handshake gate and carries status only. Also verify emergency stop,
+safe release, and shutdown port cleanup.

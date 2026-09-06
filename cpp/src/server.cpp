@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -41,6 +42,134 @@
 #include <yaml-cpp/yaml.h>
 
 namespace mine_teleop {
+
+class AsyncControlTrace {
+ public:
+  using Emitter = std::function<void(Json)>;
+
+  explicit AsyncControlTrace(Emitter emitter) : emitter_(std::move(emitter)) {
+    if (!emitter_) throw std::invalid_argument("control trace emitter is required");
+    accepting_.store(true, std::memory_order_release);
+    try {
+      worker_ = std::thread([this] { worker_loop(); });
+    } catch (...) {
+      accepting_.store(false, std::memory_order_release);
+      throw;
+    }
+  }
+
+  ~AsyncControlTrace() { stop(); }
+
+  AsyncControlTrace(const AsyncControlTrace&) = delete;
+  AsyncControlTrace& operator=(const AsyncControlTrace&) = delete;
+
+  void enqueue(Json record) noexcept {
+    if (!accepting_.load(std::memory_order_acquire)) {
+      dropped_total_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    try {
+      std::unique_lock lock(mutex_, std::try_to_lock);
+      if (!lock.owns_lock() || stop_requested_ || queue_.size() >= kQueueCapacity) {
+        dropped_total_.fetch_add(1, std::memory_order_relaxed);
+        cv_.notify_one();
+        return;
+      }
+      queue_.push_back(std::move(record));
+      enqueued_total_.fetch_add(1, std::memory_order_relaxed);
+      const bool full_batch = queue_.size() >= kBatchMaxRecords;
+      lock.unlock();
+      if (full_batch) cv_.notify_one();
+    } catch (...) {
+      dropped_total_.fetch_add(1, std::memory_order_relaxed);
+      cv_.notify_one();
+    }
+  }
+
+  void stop() noexcept {
+    accepting_.store(false, std::memory_order_release);
+    bool notify = false;
+    {
+      std::lock_guard lock(mutex_);
+      if (!stop_requested_) {
+        stop_requested_ = true;
+        notify = true;
+      }
+    }
+    if (notify) cv_.notify_all();
+    if (worker_.joinable()) worker_.join();
+  }
+
+ private:
+  static constexpr std::size_t kQueueCapacity = 512;
+  static constexpr std::size_t kBatchMaxRecords = 32;
+
+  void worker_loop() noexcept {
+    std::uint64_t batch_seq = 0;
+    std::uint64_t emitted_total = 0;
+    std::uint64_t reported_dropped_total = 0;
+    std::uint64_t output_error_total = 0;
+    try {
+      for (;;) {
+        Json commands = Json::array();
+        bool final = false;
+        {
+          std::unique_lock lock(mutex_);
+          cv_.wait_for(
+              lock,
+              std::chrono::seconds(1),
+              [this] {
+                return stop_requested_ || queue_.size() >= kBatchMaxRecords;
+              });
+          const auto count = std::min(queue_.size(), kBatchMaxRecords);
+          for (std::size_t index = 0; index < count; ++index) {
+            commands.push_back(std::move(queue_.front()));
+            queue_.pop_front();
+          }
+          final = stop_requested_ && queue_.empty();
+        }
+
+        const auto command_count = commands.size();
+        const auto dropped_total = dropped_total_.load(std::memory_order_relaxed);
+        if (command_count > 0 || dropped_total != reported_dropped_total || final) {
+          try {
+            const auto next_emitted_total = emitted_total + command_count;
+            emitter_({
+                {"batch_seq", ++batch_seq},
+                {"final", final},
+                {"queue_capacity", kQueueCapacity},
+                {"commands", std::move(commands)},
+                {"enqueued_total", enqueued_total_.load(std::memory_order_relaxed)},
+                {"emitted_total", next_emitted_total},
+                {"dropped_since_last", dropped_total - reported_dropped_total},
+                {"dropped_total", dropped_total},
+                {"output_error_total", output_error_total},
+            });
+            emitted_total = next_emitted_total;
+            reported_dropped_total = dropped_total;
+          } catch (...) {
+            ++output_error_total;
+            dropped_total_.fetch_add(command_count, std::memory_order_relaxed);
+          }
+        }
+        if (final) return;
+      }
+    } catch (...) {
+      // Diagnostic tracing must never terminate or alter control transport.
+    }
+  }
+
+  Emitter emitter_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<Json> queue_;
+  std::thread worker_;
+  bool stop_requested_{false};
+  std::atomic<bool> accepting_{false};
+  std::atomic<std::uint64_t> enqueued_total_{0};
+  std::atomic<std::uint64_t> dropped_total_{0};
+};
+
 namespace {
 
 #if defined(_WIN32)
@@ -463,6 +592,12 @@ std::int64_t control_lease_renew_at(std::int64_t now_ms, std::int64_t expires_at
   return now_ms + (expires_at_ms - now_ms) / 3;
 }
 
+std::int64_t monotonic_now_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 std::string base64_encode(const unsigned char* data, std::size_t size) {
   static constexpr std::string_view alphabet =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -695,6 +830,7 @@ std::string status_reason(int status) {
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 409: return "Conflict";
+    case 410: return "Gone";
     case 413: return "Payload Too Large";
     case 429: return "Too Many Requests";
     case 500: return "Internal Server Error";
@@ -833,9 +969,11 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
 std::string console_html(const DriverConfig& config) {
   const Json page_config = {
       {"rate_hz", config.rate_hz},
+      {"intent_lease_ms", config.intent_lease_ms},
       {"estop_hold_ms", config.estop_hold_ms},
       {"max_time_sync_uncertainty_ms", config.max_time_sync_uncertainty_ms},
       {"ice_transport_policy", config.ice_transport_policy},
+      {"control_trace_commands", config.control_trace_commands},
       {"control_limits",
        {
            {"initial_target_speed_kph", config.control_limits.initial_target_speed_kph},
@@ -907,6 +1045,8 @@ const gamepadState={connected:false,steering:0,throttle:0,brake:0};
 const driverActuationDefaults={target_speed_kph:limitConfig.initial_target_speed_kph,max_motor_torque_nm:limitConfig.initial_max_motor_torque_nm,max_brake_pressure_bar:limitConfig.initial_max_brake_pressure_bar,service_brake_pressure_bar:limitConfig.initial_service_brake_pressure_bar,hard_brake_pressure_bar:limitConfig.initial_hard_brake_pressure_bar,max_steering_angle_deg:limitConfig.initial_max_steering_angle_deg};
 let controlProfileState={requestedProfile:null,pendingRequestSeq:0,effectiveProfile:null,effectiveRequestSeq:0,effectiveAppliedRevision:0,acknowledged:false,reason:''},pendingControlProfileEnvelope=null,lastControlProfileSendAt=0,controlProfilePrepareInFlight=false,controlProfileGeneration=0;
 let vehicleHardLimits={received:false};
+const controlTraceEnabled=Boolean(consoleConfig.control_trace_commands),intentRefreshIntervalMs=Math.max(50,Math.floor(Number(consoleConfig.intent_lease_ms||200)/3)),controlTraceBuffer=[],controlTraceErrorScopes=new WeakMap();
+let controlTraceSummary=createControlTraceSummary(),controlTraceScope={session_id:'',vehicle_id:''},lastHeartbeatTraceAt=null;
 const calibration={steeringCenter:gamepadConfig.steering_center,steeringRange:gamepadConfig.steering_range,throttleRest:gamepadConfig.throttle_rest,throttleRange:gamepadConfig.throttle_range,brakeRest:gamepadConfig.brake_rest,brakeRange:gamepadConfig.brake_range};
 const webrtcLabel=document.getElementById('webrtc'),cameraGrid=document.getElementById('cameras'),statusPanel=document.getElementById('status'),loginPanel=document.getElementById('login-panel'),sessionPanel=document.getElementById('session-panel'),passwordInput=document.getElementById('password'),vehicleSelect=document.getElementById('vehicle'),connectButton=document.getElementById('connect'),authExpiry=document.getElementById('auth-expiry'),vcuPanel=document.getElementById('vcu-panel'),vcuStatus=document.getElementById('vcu-status'),vcuGate=document.getElementById('vcu-gate'),vcuConnectButton=document.getElementById('vcu-connect'),vcuDisconnectButton=document.getElementById('vcu-disconnect'),controlLimitsOpen=document.getElementById('control-limits-open'),controlLimitsSummary=document.getElementById('control-limits-summary'),controlLimitsDialog=document.getElementById('control-limits-dialog'),targetSpeedKph=document.getElementById('target-speed-kph'),maxMotorTorqueNm=document.getElementById('max-motor-torque-nm'),maxBrakePressureBar=document.getElementById('max-brake-pressure-bar'),serviceBrakePressureBar=document.getElementById('service-brake-pressure-bar'),hardBrakePressureBar=document.getElementById('hard-brake-pressure-bar'),maxSteeringDeg=document.getElementById('max-steering-deg'),speedPidKp=document.getElementById('speed-pid-kp'),speedPidKi=document.getElementById('speed-pid-ki'),speedPidKd=document.getElementById('speed-pid-kd'),speedPidDerivativeFilterTauMs=document.getElementById('speed-pid-derivative-filter-tau-ms'),speedPidMaxDtMs=document.getElementById('speed-pid-max-dt-ms'),motorTorqueRiseRate=document.getElementById('motor-torque-rise-rate'),vehicleHardLimitsLabel=document.getElementById('vehicle-hard-limits'),controlLimitsConfirm=document.getElementById('control-limits-confirm'),controlLimitsApply=document.getElementById('control-limits-apply'),controlLimitsCancel=document.getElementById('control-limits-cancel'),estopStatus=document.getElementById('estop-status'),monitorPanel=document.getElementById('monitor-panel'),alertsPanel=document.getElementById('alerts'),streamMetrics=document.getElementById('stream-metrics'),inputReadiness=document.getElementById('input-readiness'),lastKeyboardEvent=document.getElementById('last-keyboard-event'),emptyStage=document.getElementById('empty-stage');
 const canFeedbackPanel=document.getElementById('can-feedback-panel'),canFeedbackStatus=document.getElementById('can-feedback-status'),canSpeed=document.getElementById('can-speed'),canGear=document.getElementById('can-gear'),canSelector=document.getElementById('can-selector'),canEpb=document.getElementById('can-epb'),canHandshake=document.getElementById('can-handshake'),canVmcFault=document.getElementById('can-vmc-fault'),canParkingSwitch=document.getElementById('can-parking-switch'),canBrakePedal=document.getElementById('can-brake-pedal'),canEmergency=document.getElementById('can-emergency'),canAge=document.getElementById('can-age'),wheelFeedbackGrid=document.getElementById('wheel-feedback-grid'),steeringFeedbackGrid=document.getElementById('steering-feedback-grid');
@@ -914,14 +1054,29 @@ const operatorSpeed=document.getElementById('operator-speed'),operatorActualGear
 const keyIndicators={left:document.getElementById('key-left'),right:document.getElementById('key-right'),up:document.getElementById('key-up'),down:document.getElementById('key-down'),service_brake:document.getElementById('key-service-brake'),hard_brake:document.getElementById('key-hard-brake')};
 const controlReadouts={gear:document.getElementById('control-gear'),steering:document.getElementById('control-steering'),throttle:document.getElementById('control-throttle'),brake:document.getElementById('control-brake')};
 const operatorControlReadouts={gear:document.getElementById('operator-control-gear'),steering:document.getElementById('operator-control-steering'),throttle:document.getElementById('operator-control-throttle'),brake:document.getElementById('operator-control-brake')};
-let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,heartbeatInFlight=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,gearRejectionInhibited=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,pendingGearTransition=null,gearTransitionGeneration=0,controlWriteActive=false,pendingControlWrite=null,lastControlStatusSeq=0;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
+let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,gearRejectionInhibited=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,lastVehicleSafetyState='',vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,pendingGearTransition=null,gearTransitionGeneration=0,lastControlStatusSeq=0,lastControlPrepareTimeoutLogAt=0,lastControlPrepareExpiredLogAt=0,activeControlPrepareAbort=null,activeControlPrepareIsEstop=false,activeControlPreparePreemptedByEstop=false;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
+let gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();
+const uiInstanceId=(globalThis.crypto?.randomUUID?.()||`ui-${Date.now()}-${Math.random().toString(16).slice(2)}`).replace(/[^A-Za-z0-9_-]/g,'_');
+let nativeIntentSeq=0,lastNativeIntentSnapshot='',nativeControlSessionId='',nativeControlSessionGeneration=0;
 let controlOutcomeSession={metrics:controlLogic.createControlOutcomeMetrics()};
 function responseError(response,body){const error=Error(body.error||response.status);error.status=response.status;return error}
 async function post(path,body={},signal=null){const options={method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)};if(signal)options.signal=signal;const r=await fetch(path,options);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 async function get(path){const r=await fetch(path);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 function clientLog(event,details={}){const entry={event,sent_at_utc_ms:Date.now(),details};console.info(JSON.stringify(entry));fetch('/api/browser-event',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(entry),keepalive:true}).catch(()=>{})}
+function createControlTraceSummary(){return{interval_started_at_utc_ms:Date.now(),heartbeat_tick_count:0,heartbeat_enqueued_count:0,heartbeat_coalesced_count:0,timer_lag_sample_count:0,timer_lag_total_ms:0,timer_lag_max_ms:0,explicit_send_count:0,backpressure_count:0,max_buffered_amount_bytes:0,prepare_timeout_count:0,prepare_expired_count:0,prepare_preempted_by_estop_count:0,queue_unhandled_error_count:0}}
+function noteIntentRefresh(now){if(!controlTraceEnabled)return;controlTraceSummary.heartbeat_tick_count++;if(lastHeartbeatTraceAt!==null){const lag=Math.max(0,now-lastHeartbeatTraceAt-intentRefreshIntervalMs);controlTraceSummary.timer_lag_sample_count++;controlTraceSummary.timer_lag_total_ms+=lag;controlTraceSummary.timer_lag_max_ms=Math.max(controlTraceSummary.timer_lag_max_ms,lag)}lastHeartbeatTraceAt=now}
+function noteControlBackpressure(bufferedAmount){if(!controlTraceEnabled)return;const bytes=Math.max(0,Number(bufferedAmount)||0);controlTraceSummary.backpressure_count++;controlTraceSummary.max_buffered_amount_bytes=Math.max(controlTraceSummary.max_buffered_amount_bytes,bytes)}
+function setControlTraceScope(sessionId='',vehicleId=''){if(!controlTraceEnabled)return;const next={session_id:String(sessionId||''),vehicle_id:String(vehicleId||'')};if(next.session_id===controlTraceScope.session_id&&next.vehicle_id===controlTraceScope.vehicle_id)return;if(controlTraceScope.session_id||controlTraceScope.vehicle_id)flushControlTrace('session_scope_change');controlTraceScope=next}
+function sameControlTraceScope(scope){return Boolean(scope)&&String(scope.session_id||'')===controlTraceScope.session_id&&String(scope.vehicle_id||'')===controlTraceScope.vehicle_id}
+function emitControlTraceBatch(reason,scope,commands,summary,sampleTransport=true){const samples=summary.timer_lag_sample_count;summary.interval_ended_at_utc_ms=Date.now();summary.timer_lag_average_ms=samples?summary.timer_lag_total_ms/samples:0;summary.peer_connection_state=sampleTransport?(peer?.connectionState||'none'):null;summary.data_channel_ready_state=sampleTransport?(controlChannel?.readyState||'none'):null;summary.data_channel_buffered_amount_bytes=sampleTransport?Math.max(0,Number(controlChannel?.bufferedAmount)||0):null;clientLog('control_trace_batch',{reason,trace_session_id:String(scope&&scope.session_id||''),trace_vehicle_id:String(scope&&scope.vehicle_id||''),commands,summary})}
+function noteScopedControlTraceCounter(field,scope){if(!controlTraceEnabled)return;if(sameControlTraceScope(scope)){controlTraceSummary[field]++;return}const summary=createControlTraceSummary();summary[field]=1;emitControlTraceBatch(`late_${field}`,scope,[],summary,false)}
+function queueTerminalControlTrace(outcome,command,trace){if(!controlTraceEnabled||!trace)return;const seq=Number(command&&command.seq);if(!Number.isSafeInteger(seq)||seq<=0)return;const scope={session_id:String(command&&command.session_id||trace.scope&&trace.scope.session_id||''),vehicle_id:String(command&&command.vehicle_id||trace.scope&&trace.scope.vehicle_id||'')},item={session_id:scope.session_id,seq,browser_prepare_started_at_utc_ms:trace.browserPrepareStartedAtUtcMs,native_command_sent_at_utc_ms:Number(command&&command.sent_at_utc_ms)||null,prepare_elapsed_ms:trace.prepareElapsedMs,data_channel_send_invoked_at_utc_ms:trace.dataChannelSendInvokedAtUtcMs,buffered_amount_bytes:trace.bufferedAmountBytes,outcome,browser_terminal_at_utc_ms:Date.now(),estop:Boolean(trace.estop)};if(!sameControlTraceScope(scope)){const summary=createControlTraceSummary();summary.interval_started_at_utc_ms=Number(trace.browserPrepareStartedAtUtcMs)||summary.interval_started_at_utc_ms;emitControlTraceBatch('late_terminal',scope,[item],summary,false);return}controlTraceBuffer.push(item);if(controlTraceBuffer.length>=48)flushControlTrace('capacity')}
+function flushControlTrace(reason='interval'){if(!controlTraceEnabled)return false;const summary=controlTraceSummary,scope=controlTraceScope,commands=controlTraceBuffer.splice(0,controlTraceBuffer.length),hasActivity=commands.length||summary.heartbeat_tick_count||summary.explicit_send_count||summary.backpressure_count||summary.prepare_timeout_count||summary.prepare_expired_count||summary.prepare_preempted_by_estop_count||summary.queue_unhandled_error_count;controlTraceSummary=createControlTraceSummary();if(!hasActivity)return false;emitControlTraceBatch(reason,scope,commands,summary);return true}
+function recordTerminalControlOutcome(outcome,command,session,trace,details={}){recordControlOutcome(outcome,command,session,details);queueTerminalControlTrace(outcome,command,trace)}
 function resetControlOutcomeSession(){controlOutcomeSession={metrics:controlLogic.createControlOutcomeMetrics()}}
-function recordControlOutcome(outcome,command,session=controlOutcomeSession){const sequence=Number(command&&command.seq);session.metrics=controlLogic.reduceControlOutcome(session.metrics,outcome,sequence);if(controlLogic.shouldLogControlOutcome(outcome))clientLog('control_command_browser_outcome',{session_id:String(command&&command.session_id||''),vehicle_id:String(command&&command.vehicle_id||''),outcome,control_seq:sequence,...session.metrics})}
+function recordControlOutcome(outcome,command,session=controlOutcomeSession,details={}){const sequence=Number(command&&command.seq);session.metrics=controlLogic.reduceControlOutcome(session.metrics,outcome,sequence);if(controlLogic.shouldLogControlOutcome(outcome))clientLog('control_command_browser_outcome',{session_id:String(command&&command.session_id||''),vehicle_id:String(command&&command.vehicle_id||''),outcome,control_seq:sequence,...session.metrics,...details})}
+function controlPrepareDeadlineMs(){return controlLogic.controlPrepareDeadlineMs(vehicleHardLimits?.read_only_control_safety?.max_command_gap_ms)}
+function logControlPrepareFailure(event,details){const now=Date.now(),last=event==='control_prepare_timeout'?lastControlPrepareTimeoutLogAt:lastControlPrepareExpiredLogAt;if(now-last<1000)return;if(event==='control_prepare_timeout')lastControlPrepareTimeoutLogAt=now;else lastControlPrepareExpiredLogAt=now;clientLog(event,details)}
 function hasTurnServer(){return iceServers.some(server=>String(server.urls||'').includes('turn:')||(Array.isArray(server.urls)&&server.urls.some(url=>String(url).startsWith('turn:'))))}
 function safeIceEndpoint(value){const match=String(value||'').match(/^([a-z]+):(?:\/\/)?(?:[^@]*@)?(\[[^\]]+\]|[^:?/]+)(?::(\d+))?/i);return match?`${match[1].toLowerCase()}:${match[2]}${match[3]?`:${match[3]}`:''}`:'unknown'}
 function setMetric(id,text,level=''){const element=document.getElementById(id);element.textContent=text;element.classList.remove('ok','warn','critical');if(level)element.classList.add(level)}
@@ -1030,22 +1185,23 @@ function buttonValue(pad,index){return Number.isInteger(index)&&index>=0&&index<
 function syncControlKeyState(){state=controlLogic.deriveKeyState(pressedControlKeys)}
 function vcuMockUnsupported(value=vcuHandshake){return controlLogic.mockUnsupported(value)}
 function vcuAllowsGearChange(requestedGear){return controlLogic.allowsGearChange(selectedGear,requestedGear,vcuHandshake)}
-function updateSelectedGearFromInput(inputState){const next=controlLogic.deriveGearSelection(selectedGear,inputState,vcuHandshake);if(next.changed&&pendingGearTransition){const requestedGear=next.selectedGear;clearControlInput(false);pendingGearRequest=requestedGear;statusPanel.textContent=`${pendingGearTransition.fromGear}→${pendingGearTransition.toGear} 换挡尚未获得车端反馈；已阻止新的 ${requestedGear} 挡请求，请释放后重新操作`;return{selectedGear,pendingGearRequest,changed:false}}if(next.changed)pendingGearTransition=controlLogic.createGearTransition(selectedGear,next.selectedGear,lastControlStatusSeq,++gearTransitionGeneration);selectedGear=next.selectedGear;pendingGearRequest=next.pendingGearRequest;if(pendingGearRequest)statusPanel.textContent=`${selectedGear}→${pendingGearRequest} 换挡已阻止：需有效零速反馈；请停车后释放并重新按下方向键`;return next}
+function updateSelectedGearFromInput(inputState){const next=controlLogic.deriveGearSelection(selectedGear,inputState,vcuHandshake);if(next.changed&&pendingGearTransition){const requestedGear=next.selectedGear;clearControlInput(false);pendingGearRequest=requestedGear;statusPanel.textContent=`${pendingGearTransition.fromGear}→${pendingGearTransition.toGear} 换挡尚未获得车端反馈；已阻止新的 ${requestedGear} 挡请求，请释放后重新操作`;return{selectedGear,pendingGearRequest,changed:false}}if(next.changed)pendingGearTransition=controlLogic.createGearTransition(selectedGear,next.selectedGear,lastControlStatusSeq,++gearTransitionGeneration);selectedGear=next.selectedGear;pendingGearRequest=next.pendingGearRequest;if(pendingGearRequest)statusPanel.textContent=`${selectedGear}→${pendingGearRequest} 换挡已阻止：需至少 3 帧且持续 200 ms 的新鲜零速反馈；请停车后释放并重新按下方向键`;return next}
 function updateSelectedGearFromHeldDirections(){return updateSelectedGearFromInput(state)}
 function clearControlInput(resetGear=true){controlLogic.blockAndClearKeys(pressedControlKeys,blockedControlKeys);syncControlKeyState();gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;if(resetGear){selectedGear='N';pendingGearRequest=null;pendingGearTransition=null}renderControlState()}
 function vcuStateRequiresFreshInput(value=vcuHandshake){return controlLogic.requiresFreshInput(value)}
 function vcuStateKeepsHeldInput(value=vcuHandshake){return controlLogic.keepsHeldInput(vcuEverReady,value)}
 function acceptControlStatusMessage(message){const decision=controlLogic.reduceStatusSequence(lastControlStatusSeq,message?.control_status_seq);if(!decision.accepted){const sequence=Number(message?.control_status_seq);clientLog('control_status_message_dropped',{event:message?.event||'unknown',control_status_seq:Number.isFinite(sequence)?sequence:null,last_control_status_seq:lastControlStatusSeq});return false}if(decision.gap>0)clientLog('control_status_sequence_gap',{event:message?.event||'unknown',control_status_seq:decision.lastSequence,last_control_status_seq:lastControlStatusSeq,missing_status_count:decision.gap});lastControlStatusSeq=decision.lastSequence;return true}
 function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}
-function updateVcuHandshakeState(value){const transition=controlLogic.transitionVcuState(vcuEverReady,value);vcuHandshake=value;vcuEverReady=transition.everReady;if(transition.resetInput)resetControlAuthorityInput()}
+function updateVcuHandshakeState(value){gearChangeStationaryEvidence=controlLogic.updateGearChangeStationaryEvidence(gearChangeStationaryEvidence,value,lastControlStatusSeq,performance.now());value={...value,gear_change_stationary_confirmed:gearChangeStationaryEvidence.confirmed};const transition=controlLogic.transitionVcuState(vcuEverReady,value);vcuHandshake=value;vcuEverReady=transition.everReady;if(transition.resetInput)resetControlAuthorityInput()}
+function applyVehicleSafetyState(value){const next=String(value||'');if(next==='DEGRADED'){clearControlInput(false);if(lastVehicleSafetyState!=='DEGRADED'){lastKeyboardEvent.textContent='控制命令短暂中断，输入已清除 · 请释放后重新按下';statusPanel.textContent='车端进入可恢复降级：牵引已清零；请释放控制键后重新按下';clientLog('driver_input_cleared_on_degraded',{previous_safety_state:lastVehicleSafetyState||null})}}lastVehicleSafetyState=next}
 function suspendSignalingPoll(){const generation=++signalingGeneration;polling=false;if(signalingPollAbort){signalingPollAbort.abort();signalingPollAbort=null}return generation}
-function closeRealtimeSession(){const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
+function closeRealtimeSession(){flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;lastVehicleSafetyState='';vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
 function renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason)){estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner}
-function latchEstop(source){if(estopLatched)return;estopLatched=true;clientLog('control_estop_request_latched',{source});renderEstopRequest();renderMonitoring()}
+function latchEstop(source){if(estopLatched)return false;estopLatched=true;clientLog('control_estop_request_latched',{source});renderEstopRequest();renderMonitoring();return true}
 function firstConnectedGamepad(){const pads=navigator.getGamepads?navigator.getGamepads():[];if(activeGamepadIndex!==null&&pads[activeGamepadIndex]?.connected)return pads[activeGamepadIndex];for(const pad of pads)if(pad?.connected){activeGamepadIndex=pad.index;return pad}activeGamepadIndex=null;return null}
 function applyGamepadNeutralInterlock(authorityReady,gearRequestPending=false){const next=controlLogic.reduceGamepadNeutralInterlock({requiresNeutral:gamepadRequiresNeutral,authorityReady,throttle:gamepadState.throttle,brake:gamepadState.brake,gearRequestPending});gamepadRequiresNeutral=next.requiresNeutral;gamepadState.throttle=next.throttle;gamepadState.brake=next.brake;return next}
-function sampleGamepad(){if(!gamepadConfig.enabled||document.hidden||!document.hasFocus()){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}const pad=firstConnectedGamepad();if(!pad){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}gamepadState.connected=true;const standard=pad.mapping==='standard';if(standard){const steering=axisValue(pad,0);let steeringValue=steering===null?0:(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);gamepadState.throttle=clamp(applyPedalDeadzone(buttonValue(pad,7)),0,1);gamepadState.brake=clamp(applyPedalDeadzone(buttonValue(pad,6)),0,1)}else{const steering=axisValue(pad,gamepadConfig.steering_axis),throttle=axisValue(pad,gamepadConfig.throttle_axis),brake=axisValue(pad,gamepadConfig.brake_axis);if(steering===null||throttle===null||brake===null){gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}let steeringValue=(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);const throttleDelta=gamepadConfig.throttle_inverted?calibration.throttleRest-throttle:throttle-calibration.throttleRest;const brakeDelta=gamepadConfig.brake_inverted?calibration.brakeRest-brake:brake-calibration.brakeRest;gamepadState.throttle=clamp(applyPedalDeadzone(throttleDelta/calibration.throttleRange),0,1);gamepadState.brake=clamp(applyPedalDeadzone(brakeDelta/calibration.brakeRange),0,1)}const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported();applyGamepadNeutralInterlock(gamepadAuthorityReady);if(gamepadState.throttle>0&&selectedGear==='N'){const nextGear=updateSelectedGearFromInput({up:true,down:false});if(nextGear.pendingGearRequest)applyGamepadNeutralInterlock(gamepadAuthorityReady,true)}const estopPressed=buttonValue(pad,gamepadConfig.estop_button)>=0.5;if(estopPressed){if(!gamepadEstopPressedAt)gamepadEstopPressedAt=performance.now();if(performance.now()-gamepadEstopPressedAt>=consoleConfig.estop_hold_ms)latchEstop('Gamepad')}else gamepadEstopPressedAt=0;renderControlState()}
-function currentControl(extra={}){return controlLogic.deriveControl({keyState:state,gamepad:gamepadState,selectedGear,limits:effectiveControlLimits(),steeringFullScaleDeg:limitConfig.steering_full_scale_deg,estop:estopLatched||Boolean(extra.estop)})}
+function sampleGamepad(){if(!gamepadConfig.enabled||document.hidden||!document.hasFocus()){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}const pad=firstConnectedGamepad();if(!pad){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}gamepadState.connected=true;const standard=pad.mapping==='standard';if(standard){const steering=axisValue(pad,0);let steeringValue=steering===null?0:(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);gamepadState.throttle=clamp(applyPedalDeadzone(buttonValue(pad,7)),0,1);gamepadState.brake=clamp(applyPedalDeadzone(buttonValue(pad,6)),0,1)}else{const steering=axisValue(pad,gamepadConfig.steering_axis),throttle=axisValue(pad,gamepadConfig.throttle_axis),brake=axisValue(pad,gamepadConfig.brake_axis);if(steering===null||throttle===null||brake===null){gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}let steeringValue=(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);const throttleDelta=gamepadConfig.throttle_inverted?calibration.throttleRest-throttle:throttle-calibration.throttleRest;const brakeDelta=gamepadConfig.brake_inverted?calibration.brakeRest-brake:brake-calibration.brakeRest;gamepadState.throttle=clamp(applyPedalDeadzone(throttleDelta/calibration.throttleRange),0,1);gamepadState.brake=clamp(applyPedalDeadzone(brakeDelta/calibration.brakeRange),0,1)}const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported();applyGamepadNeutralInterlock(gamepadAuthorityReady);if(gamepadState.throttle>0&&selectedGear==='N'){const nextGear=updateSelectedGearFromInput({up:true,down:false});if(nextGear.pendingGearRequest)applyGamepadNeutralInterlock(gamepadAuthorityReady,true)}const estopPressed=buttonValue(pad,gamepadConfig.estop_button)>=0.5;if(estopPressed){if(!gamepadEstopPressedAt)gamepadEstopPressedAt=performance.now();if(performance.now()-gamepadEstopPressedAt>=consoleConfig.estop_hold_ms&&latchEstop('Gamepad'))send({estop:true},false).catch(console.error)}else gamepadEstopPressedAt=0;renderControlState()}
+function currentControl(extra={}){const control=controlLogic.deriveControl({keyState:state,gamepad:gamepadState,selectedGear,limits:effectiveControlLimits(),steeringFullScaleDeg:limitConfig.steering_full_scale_deg,estop:estopLatched||Boolean(extra.estop)});if(pendingGearTransition&&!control.estop)control.throttle=0;return control}
 function setControlReadout(name,text,active=false){for(const element of [controlReadouts[name],operatorControlReadouts[name]]){element.textContent=text;element.parentElement?.classList.toggle('active',active)}}
 function renderControlState(){
   const control=currentControl();
@@ -1062,96 +1218,82 @@ function handleVehicleRefreshError(error){if(error.status===401){requireLogin('�
 async function login(){const password=passwordInput.value;if(!password)throw Error('请输入驾驶员密码');passwordInput.value='';const result=await post('/api/login',{password});authenticated=true;controlAuthorityLost=false;webrtcLabel.textContent='未连接';loginPanel.hidden=true;sessionPanel.hidden=false;vcuPanel.hidden=false;renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);sampleGamepad();latestRuntimeStatus=await get('/api/status');renderMonitoring();statusPanel.textContent=`已登录 ${result.driver_id}，请选择在线车辆`;clientLog('driver_login_succeeded',{driver_id:result.driver_id,authorized_vehicle_count:(result.vehicles||[]).length})}
 async function refreshVehicles(){if(!authenticated)return;const result=await get('/api/vehicles');renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);if(result.signaling_available===false){controlAuthorityLost=true;resetControlAuthorityInput();connectButton.disabled=true;statusPanel.textContent='信令服务暂时不可用；车辆列表为安全快照，禁止建立控制会话';renderMonitoring();return}if(result.signaling_restart_recovered){closeRealtimeSession();controlAuthorityLost=true;latestRuntimeStatus=await get('/api/status');connectButton.textContent='连接所选车辆';webrtcLabel.textContent='服务已恢复，需重新建立控制会话';statusPanel.textContent='信令服务已重启，驾驶员身份已自动恢复；旧控制权未恢复，请重新选择车辆';clientLog('signaling_restart_recovered',{previous_service_instance_id:result.previous_service_instance_id,service_instance_id:result.service_instance_id,control_authority_recovered:false});renderMonitoring()}}
 function sendVcuHandshakeCommand(action){if(!controlChannel||controlChannel.readyState!=='open')throw Error('控制 DataChannel 尚未连接');if(action==='connect'&&!controlProfileState.acknowledged)throw Error('会话控制参数尚未获得车端确认');if(vcuHandshake.adapter_ready!==true)throw Error('VCU 适配器尚未就绪');if(!['connect','disconnect'].includes(action))throw Error('VCU 握手命令非法');if(action==='disconnect'){resetControlAuthorityInput();vcuHandshake={...vcuHandshake,ready:false,disarming:true}}else{gearRejectionInhibited=false;vcuHandshake={...vcuHandshake,requested:true}}renderMonitoring();controlChannel.send(JSON.stringify({event:'vcu_handshake_command',action,sent_at_utc_ms:Date.now()}));clientLog('driver_vcu_handshake_command',{action});statusPanel.textContent=action==='connect'?'已请求开始 VCU 平行驾驶握手':'已请求安全断开 VCU 握手'}
-async function writeControl(extra,announceUnavailable){
-  const activePeer=peer,activeChannel=controlChannel,outcomeSession=controlOutcomeSession;
-  if(controlAuthorityLost||!activePeer||activePeer.connectionState!=='connected'||!activeChannel||activeChannel.readyState!=='open'){
-    resetControlAuthorityInput();
-    if(announceUnavailable)webrtcLabel.textContent=controlAuthorityLost?'控制权丢失':'控制链路中断';
-    return{sent:false,reason:controlAuthorityLost?'control_authority_lost':'control_link_unavailable'};
-  }
-  const estopRequested=estopLatched||Boolean(extra.estop);
-  if(gearRejectionInhibited&&!estopRequested){
-    return{sent:false,reason:'gear_rejection_unresolved'};
-  }
-  if(!estopRequested&&!controlProfileState.acknowledged){
-    resetControlAuthorityInput();
-    if(announceUnavailable)statusPanel.textContent='会话控制参数尚未获得车端确认，驾驶命令已阻止';
-    return{sent:false,reason:'control_profile_not_acknowledged'};
-  }
-  const retainedWait=vcuHandshake.adapter_ready===true&&vcuStateKeepsHeldInput(vcuHandshake);
-  if(estopRequested&&vcuHandshake.adapter_ready===false){
-    resetControlAuthorityInput();
-    if(announceUnavailable)statusPanel.textContent='VCU 适配器明确不可用，远程急停未发送；请使用车辆物理急停';
-    return{sent:false,reason:'vcu_adapter_unavailable'};
-  }
-  if(!vcuDrivingReady()&&!estopRequested){
-    if(!retainedWait){
-      if(vcuHandshake.adapter_ready!==true||vcuStateRequiresFreshInput(vcuHandshake))resetControlAuthorityInput();
-      if(announceUnavailable)statusPanel.textContent='VCU 平行驾驶握手未成功，驾驶命令已阻止';
-      return{sent:false,reason:'vcu_handshake_not_ready'};
-    }
-  }
-  if(activeChannel.bufferedAmount>4096&&!estopRequested){
-    // Backpressure is transient: clear live actuation, but retain the last
-    // confirmed gear and any in-flight transition so recovery cannot invent an
-    // unrelated N request whose rejection has no matching transaction.
-    clearControlInput(false);
-    webrtcLabel.textContent='控制链路拥塞，输入已清除';
-    return{sent:false,reason:'buffered_amount_limit'};
-  }
-  const outgoing=currentControl(extra);
-  if(retainedWait&&!estopRequested)outgoing.throttle=0;
-  const outgoingSnapshot=controlLogic.controlSnapshot(outgoing);
-  const outgoingGearTransitionGeneration=!estopRequested&&pendingGearTransition?pendingGearTransition.generation:0;
-  let prepared;
-  try{prepared=await post('/api/control',outgoing)}catch(error){
-    if([401,403,409].includes(error.status)){controlAuthorityLost=true;resetControlAuthorityInput();resetControlProfileSession()}
-    throw error;
-  }
-  recordControlOutcome('prepared',prepared.command,outcomeSession);
-  if(controlAuthorityLost||peer!==activePeer||controlChannel!==activeChannel||activePeer.connectionState!=='connected'||activeChannel.readyState!=='open'){
-    recordControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession);
-    resetControlAuthorityInput();
-    return{sent:false,reason:'control_link_changed'};
-  }
-  if(estopRequested&&vcuHandshake.adapter_ready===false){
-    recordControlOutcome('post_prepare_vcu_not_ready',prepared.command,outcomeSession);
-    resetControlAuthorityInput();
-    if(announceUnavailable)statusPanel.textContent='VCU 适配器明确不可用，远程急停未发送；请使用车辆物理急停';
-    return{sent:false,reason:'vcu_adapter_unavailable'};
-  }
-  const stillVcuReady=vcuDrivingReady(),stillRetainedWait=vcuHandshake.adapter_ready===true&&vcuStateKeepsHeldInput(vcuHandshake);
-  if(!stillVcuReady&&!estopRequested){
-    if(!stillRetainedWait||!retainedWait){
-      recordControlOutcome('post_prepare_vcu_not_ready',prepared.command,outcomeSession);
-      if(vcuHandshake.adapter_ready!==true||vcuStateRequiresFreshInput(vcuHandshake))resetControlAuthorityInput();
-      return{sent:false,reason:'vcu_handshake_not_ready'};
-    }
-  }
-  const latestOutgoing=currentControl(extra);
-  if(stillRetainedWait&&!estopRequested)latestOutgoing.throttle=0;
-  if(controlLogic.controlIntentSuperseded(outgoingSnapshot,latestOutgoing)){
-    recordControlOutcome('superseded',prepared.command,outcomeSession);
-    return{sent:false,reason:'control_intent_superseded'};
-  }
-  try{activeChannel.send(JSON.stringify(prepared.command))}catch(error){
-    recordControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession);
-    resetControlAuthorityInput();
-    throw error;
-  }
-  pendingGearTransition=controlLogic.recordForwardedGearCommand(pendingGearTransition,outgoingGearTransitionGeneration,prepared.command?.seq,outgoingSnapshot.gear);
-  recordControlOutcome('forwarded',prepared.command,outcomeSession);
-  if(webrtcLabel.textContent==='控制链路拥塞，输入已清除')webrtcLabel.textContent='控制链路已连接';
-  return{...prepared,delivery_state:'browser_data_channel_send_invoked'};
+function nativeIntentEnvelope(outgoing){
+  const normalized={gear:String(outgoing.gear||'N'),steering:Number(outgoing.steering||0),throttle:Number(outgoing.throttle||0),brake:Number(outgoing.brake||0),estop:Boolean(outgoing.estop)};
+  const snapshot=JSON.stringify(normalized);
+  if(!nativeIntentSeq||snapshot!==lastNativeIntentSnapshot){nativeIntentSeq++;lastNativeIntentSnapshot=snapshot}
+  return{session_id:nativeControlSessionId,session_generation:nativeControlSessionGeneration,ui_instance_id:uiInstanceId,intent_seq:nativeIntentSeq,...normalized}
 }
-function enqueueControlWrite(extra,announceUnavailable){return new Promise((resolve,reject)=>{if(pendingControlWrite){pendingControlWrite.extra={...pendingControlWrite.extra,...extra,estop:Boolean(pendingControlWrite.extra.estop||extra.estop)};pendingControlWrite.announceUnavailable=pendingControlWrite.announceUnavailable||announceUnavailable;pendingControlWrite.waiters.push({resolve,reject})}else pendingControlWrite={extra:{...extra},announceUnavailable,waiters:[{resolve,reject}]};drainControlWrites().catch(console.error)})}
-async function drainControlWrites(){if(controlWriteActive)return;controlWriteActive=true;try{while(pendingControlWrite){const request=pendingControlWrite;pendingControlWrite=null;try{const result=await writeControl(request.extra,request.announceUnavailable);for(const waiter of request.waiters)waiter.resolve(result)}catch(error){for(const waiter of request.waiters)waiter.reject(error)}}}finally{controlWriteActive=false;if(pendingControlWrite)drainControlWrites().catch(console.error)}}
-async function send(extra={},announceUnavailable=true){return enqueueControlWrite(extra,announceUnavailable)}
-async function heartbeat(){if(!polling||heartbeatInFlight)return;heartbeatInFlight=true;try{sampleGamepad();sendPendingControlProfile();await send({},false)}finally{heartbeatInFlight=false}}
+async function writeControlIntent(extra,announceUnavailable){
+  const activePeer=peer,activeChannel=controlChannel,estopRequested=estopLatched||Boolean(extra.estop);
+  if(controlAuthorityLost){
+    resetControlAuthorityInput();
+    if(announceUnavailable)webrtcLabel.textContent='控制权丢失';
+    return{sent:false,reason:'control_authority_lost'}
+  }
+  let blockReason='';
+  if(!activePeer||activePeer.connectionState!=='connected'||!activeChannel||activeChannel.readyState!=='open'){
+    blockReason='control_link_unavailable';
+    if(announceUnavailable)webrtcLabel.textContent='控制链路中断'
+  }else if(gearRejectionInhibited&&!estopRequested){
+    blockReason='gear_rejection_unresolved'
+  }else if(!estopRequested&&!controlProfileState.acknowledged){
+    blockReason='control_profile_not_acknowledged';
+    if(announceUnavailable)statusPanel.textContent='会话控制参数尚未获得车端确认，驾驶命令已阻止'
+  }
+  const retainedWait=vcuHandshake.adapter_ready===true&&vcuStateKeepsHeldInput(vcuHandshake),gearTransitionPending=Boolean(pendingGearTransition);
+  if(!blockReason&&estopRequested&&vcuHandshake.adapter_ready===false){
+    blockReason='vcu_adapter_unavailable';
+    if(announceUnavailable)statusPanel.textContent='VCU 适配器明确不可用，远程急停未发送；请使用车辆物理急停'
+  }else if(!blockReason&&!vcuDrivingReady()&&!estopRequested&&!retainedWait){
+    blockReason='vcu_handshake_not_ready';
+    if(announceUnavailable)statusPanel.textContent='VCU 平行驾驶握手未成功，驾驶命令已阻止'
+  }
+  if(blockReason)clearControlInput(false);
+  const outgoing=currentControl(blockReason?{}:extra);
+  if((retainedWait||gearTransitionPending)&&!estopRequested)outgoing.throttle=0;
+  const outgoingSnapshot=controlLogic.controlSnapshot(outgoing);
+  const transitionGeneration=!blockReason&&!estopRequested&&pendingGearTransition?pendingGearTransition.generation:0;
+  const intent=nativeIntentEnvelope(outgoing);
+  const controller=new AbortController(),deadlineMs=Math.max(75,Math.min(150,Math.floor(Number(consoleConfig.intent_lease_ms||200)*0.75))),timer=setTimeout(()=>controller.abort(),deadlineMs);
+  activeControlPrepareAbort=controller;activeControlPrepareIsEstop=estopRequested;
+  let accepted;
+  try{
+    accepted=await post('/api/control-intent',intent,controller.signal)
+  }catch(error){
+    if(intent.session_id!==nativeControlSessionId||intent.session_generation!==nativeControlSessionGeneration)return{sent:false,reason:'stale_control_intent_response'};
+    if(error.name==='AbortError'){
+      clearControlInput(false);
+      if(activeControlPreparePreemptedByEstop&&!estopRequested)return{sent:false,reason:'control_intent_preempted_by_estop'};
+      clientLog('control_intent_update_timeout',{intent_seq:intent.intent_seq,deadline_ms:deadlineMs});
+      return{sent:false,reason:'control_intent_update_timeout'}
+    }
+    if([401,403,409].includes(error.status)){controlAuthorityLost=true;resetControlAuthorityInput();resetControlProfileSession()}
+    throw error
+  }finally{clearTimeout(timer);if(activeControlPrepareAbort===controller){activeControlPrepareAbort=null;activeControlPrepareIsEstop=false;activeControlPreparePreemptedByEstop=false}}
+  if(intent.session_id!==nativeControlSessionId||intent.session_generation!==nativeControlSessionGeneration)return{sent:false,reason:'stale_control_intent_response'};
+  if(!accepted.accepted){
+    if(accepted.reason==='fresh_neutral_required'){
+      clearControlInput(false);
+      lastNativeIntentSnapshot='';
+    }
+    return{...accepted,sent:false,reason:accepted.reason||'control_intent_rejected'}
+  }
+  if(transitionGeneration){
+    pendingGearTransition=controlLogic.recordForwardedGearCommand(pendingGearTransition,transitionGeneration,accepted.intent_seq,outgoingSnapshot.gear)
+  }
+  if(!accepted.duplicate)clientLog('control_intent_accepted',{intent_seq:accepted.intent_seq,transport:accepted.transport,gear:outgoingSnapshot.gear,estop:estopRequested});
+  return{...accepted,sent:true,blocked_reason:blockReason||null}
+}
+function reportControlQueueError(error){if(controlTraceEnabled)noteScopedControlTraceCounter('queue_unhandled_error_count',error&&typeof error==='object'?(controlTraceErrorScopes.get(error)||controlTraceScope):controlTraceScope);console.error(error)}
+const controlWriteQueue=controlLogic.createLatestControlWriteQueue(writeControlIntent,reportControlQueueError,()=>{if(activeControlPrepareAbort&&!activeControlPrepareIsEstop){activeControlPreparePreemptedByEstop=true;activeControlPrepareAbort.abort()}});
+function enqueueIntentRefresh(){return controlWriteQueue.enqueueHeartbeat()}
+async function send(extra={},announceUnavailable=true){if(controlTraceEnabled)controlTraceSummary.explicit_send_count++;return controlWriteQueue.send(extra,announceUnavailable)}
+async function refreshControlIntent(){const now=performance.now();if(!polling){lastHeartbeatTraceAt=null;return}noteIntentRefresh(now);sampleGamepad();sendPendingControlProfile();const enqueued=enqueueIntentRefresh();if(controlTraceEnabled){if(enqueued)controlTraceSummary.heartbeat_enqueued_count++;else controlTraceSummary.heartbeat_coalesced_count++}}
 function advertisedCodecs(){const caps=RTCRtpReceiver.getCapabilities&&RTCRtpReceiver.getCapabilities('video');const found=new Set(['h264']);for(const c of (caps&&caps.codecs)||[]){const m=(c.mimeType||'').toLowerCase();if(m.includes('h265')||m.includes('hevc'))found.add('h265');if(m.includes('h264')||m.includes('avc'))found.add('h264')}return [...found]}
-async function connect(){if(connecting)return;const target=vehicleSelect.value;if(!target)throw Error('没有可连接的在线车辆');const fromVehicle=latestRuntimeStatus.connected?latestRuntimeStatus.vehicle_id:'';if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}const changingVehicle=Boolean(fromVehicle)&&fromVehicle!==target;const reconnecting=Boolean(fromVehicle)&&fromVehicle===target;const hadRealtime=polling;let suspendedGeneration=signalingGeneration;if((changingVehicle||reconnecting)&&hadRealtime){suspendedGeneration=suspendSignalingPoll();clearControlInput()}connecting=true;connectButton.disabled=true;if(changingVehicle){webrtcLabel.textContent='正在安全切换车辆';statusPanel.textContent=`正在验证 ${target}，成功后释放 ${fromVehicle}`;clientLog('driver_vehicle_switch_started',{from_vehicle_id:fromVehicle,to_vehicle_id:target})}let session=null,generation=signalingGeneration;try{session=await post('/api/connect',{vehicle_id:target});generation=closeRealtimeSession();controlAuthorityLost=true;const ice=await post('/api/webrtc/ice-servers');iceServers=ice.ice_servers||[];await post('/api/webrtc/capabilities',{codecs:advertisedCodecs()});polling=true;controlAuthorityLost=false;latestRuntimeStatus=await get('/api/status');webrtcLabel.textContent='等待车端媒体';statusPanel.textContent=`会话 ${session.session_id} · ${session.vehicle_id}`;connectButton.textContent='切换所选车辆';document.querySelector('main').focus();renderMonitoring();clientLog(changingVehicle?'driver_vehicle_switched':(reconnecting?'driver_session_reconnected':'driver_session_connected'),{from_vehicle_id:fromVehicle||undefined,session_id:session.session_id,vehicle_id:session.vehicle_id});pollSignaling(generation)}catch(error){if(session)await post('/api/end-session',{reason:'driver_connect_setup_failed'}).catch(()=>{});latestRuntimeStatus=await get('/api/status').catch(()=>({connected:false}));const retained=Boolean(!session&&latestRuntimeStatus.connected&&hadRealtime);if(retained){polling=true;controlAuthorityLost=false;webrtcLabel.textContent=controlChannel&&controlChannel.readyState==='open'?'控制链路已连接':'当前会话已保留';statusPanel.textContent=`切换失败，当前会话已保留: ${error.message}`;clientLog('driver_vehicle_switch_rejected',{from_vehicle_id:fromVehicle,to_vehicle_id:target,error:error.message});pollSignaling(suspendedGeneration)}else{controlAuthorityLost=Boolean(latestRuntimeStatus.connected)}connectButton.textContent=latestRuntimeStatus.connected?'切换所选车辆':'连接所选车辆';renderMonitoring();if(!retained)throw error}finally{connecting=false;connectButton.disabled=!vehicleSelect.value}}
+async function connect(){if(connecting)return;const target=vehicleSelect.value;if(!target)throw Error('没有可连接的在线车辆');const fromVehicle=latestRuntimeStatus.connected?latestRuntimeStatus.vehicle_id:'';if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}const changingVehicle=Boolean(fromVehicle)&&fromVehicle!==target;const reconnecting=Boolean(fromVehicle)&&fromVehicle===target;const hadRealtime=polling;let suspendedGeneration=signalingGeneration;if((changingVehicle||reconnecting)&&hadRealtime){suspendedGeneration=suspendSignalingPoll();clearControlInput()}connecting=true;connectButton.disabled=true;if(changingVehicle){webrtcLabel.textContent='正在安全切换车辆';statusPanel.textContent=`正在验证 ${target}，成功后释放 ${fromVehicle}`;clientLog('driver_vehicle_switch_started',{from_vehicle_id:fromVehicle,to_vehicle_id:target})}let session=null,generation=signalingGeneration;try{session=await post('/api/connect',{vehicle_id:target});generation=closeRealtimeSession();nativeControlSessionId=String(session.session_id||'');nativeControlSessionGeneration=Number(session.control_session_generation);if(!nativeControlSessionId||!Number.isSafeInteger(nativeControlSessionGeneration)||nativeControlSessionGeneration<=0)throw Error('原生控制会话代次无效');setControlTraceScope(session.session_id,session.vehicle_id);controlAuthorityLost=true;const ice=await post('/api/webrtc/ice-servers');iceServers=ice.ice_servers||[];await post('/api/webrtc/capabilities',{codecs:advertisedCodecs()});polling=true;controlAuthorityLost=false;latestRuntimeStatus=await get('/api/status');webrtcLabel.textContent='等待车端媒体';statusPanel.textContent=`会话 ${session.session_id} · ${session.vehicle_id}`;connectButton.textContent='切换所选车辆';document.querySelector('main').focus();renderMonitoring();clientLog(changingVehicle?'driver_vehicle_switched':(reconnecting?'driver_session_reconnected':'driver_session_connected'),{from_vehicle_id:fromVehicle||undefined,session_id:session.session_id,vehicle_id:session.vehicle_id});pollSignaling(generation)}catch(error){if(session){flushControlTrace('connect_setup_failed');controlTraceScope={session_id:'',vehicle_id:''};nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';await post('/api/end-session',{reason:'driver_connect_setup_failed'}).catch(()=>{})}latestRuntimeStatus=await get('/api/status').catch(()=>({connected:false}));const retained=Boolean(!session&&latestRuntimeStatus.connected&&hadRealtime);if(retained){polling=true;controlAuthorityLost=false;webrtcLabel.textContent=controlChannel&&controlChannel.readyState==='open'?'控制链路已连接':'当前会话已保留';statusPanel.textContent=`切换失败，当前会话已保留: ${error.message}`;clientLog('driver_vehicle_switch_rejected',{from_vehicle_id:fromVehicle,to_vehicle_id:target,error:error.message});pollSignaling(suspendedGeneration)}else{controlAuthorityLost=Boolean(latestRuntimeStatus.connected)}connectButton.textContent=latestRuntimeStatus.connected?'切换所选车辆':'连接所选车辆';renderMonitoring();if(!retained)throw error}finally{connecting=false;connectButton.disabled=!vehicleSelect.value}}
 async function logout(){const estopConfirmed=vehicleTelemetry?.estop===true;closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='正在释放控制权';await post('/api/disconnect',{reason:'driver_safe_logout'});authenticated=false;controlAuthorityLost=false;connectButton.textContent='连接所选车辆';renderAuthExpiry(0);sessionPanel.hidden=true;vcuPanel.hidden=true;canFeedbackPanel.hidden=true;monitorPanel.hidden=true;loginPanel.hidden=false;webrtcLabel.textContent='未连接';statusPanel.textContent=estopLatched?(estopConfirmed?'已安全退出；车辆急停已确认，仍需本地确认复位':'已安全退出；急停请求未获车端确认，请在车辆本地核实'):'已安全退出';clientLog('driver_safe_logout',{estop_request_latched:estopLatched,estop_confirmed:estopConfirmed})}
-addEventListener('pagehide',()=>{closeRealtimeSession();if(authenticated)fetch('/api/disconnect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({reason:'browser_page_closed'}),keepalive:true}).catch(()=>{})});
+addEventListener('pagehide',()=>{flushControlTrace('pagehide');closeRealtimeSession();if(authenticated)fetch('/api/disconnect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({reason:'browser_page_closed'}),keepalive:true}).catch(()=>{})});
 function neutralizeInput(){clearControlInput(false);send({},false).catch(console.error)}
 addEventListener('blur',neutralizeInput);document.addEventListener('visibilitychange',()=>{if(document.hidden)neutralizeInput()});
 document.querySelector('#login').onclick=()=>login().catch(e=>{statusPanel.textContent='登录失败: '+e.message});
@@ -1182,6 +1324,7 @@ async function startFromOffer(offer){
   resetControlProfileSession();
   lastControlStatusSeq=0;
   vehicleTelemetry=null;
+  lastVehicleSafetyState='';
   vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};
   resetControlAuthorityInput();
   cameraGrid.replaceChildren();
@@ -1201,12 +1344,17 @@ async function startFromOffer(offer){
     const connectionState=nextPeer.connectionState;
     webrtcLabel.textContent=connectionState;
     if(connectionState==='disconnected'){
+      lastVehicleSafetyState='';
       resetControlAuthorityInput();
       resetControlProfileSession();
       clientLog('webrtc_peer_disconnected');
     }
     if(['failed','closed'].includes(connectionState)){
-      controlChannel=null;
+      const terminalChannel=controlChannel;
+      flushControlTrace(`peer_${connectionState}`);
+      clientLog('webrtc_peer_terminal',{connection_state:connectionState,trace_session_id:controlTraceScope.session_id||null,trace_vehicle_id:controlTraceScope.vehicle_id||null,data_channel_ready_state:terminalChannel?.readyState||'none',buffered_amount_bytes:Math.max(0,Number(terminalChannel?.bufferedAmount)||0)});
+      if(controlChannel===terminalChannel)controlChannel=null;
+      lastVehicleSafetyState='';
       resetControlAuthorityInput();
       resetControlProfileSession();
     }
@@ -1232,6 +1380,8 @@ async function startFromOffer(offer){
       webrtcLabel.textContent='控制链路已连接';
       resetControlAuthorityInput();
       resetControlProfileSession();
+      lastVehicleSafetyState='';
+      gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();
       vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:true,adapter_ready:null};
       clientLog('control_datachannel_open');
       renderMonitoring();
@@ -1271,6 +1421,7 @@ async function startFromOffer(offer){
           renderEstopRequest();
           applyControlProfileStatus(message.session_control_profile);
           updateVehicleHardLimits(message.control_limits);
+          applyVehicleSafetyState(message.safety_state);
           renderMonitoring();
           return;
         }
@@ -1291,10 +1442,12 @@ async function startFromOffer(offer){
     };
     channel.onclose=()=>{
       if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
+      flushControlTrace('datachannel_close');
       controlChannel=null;
       resetControlAuthorityInput();
       resetControlProfileSession();
       vehicleTelemetry=null;
+      lastVehicleSafetyState='';
       vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};
       webrtcLabel.textContent='控制链路中断';
       clientLog('control_datachannel_closed');
@@ -1302,8 +1455,11 @@ async function startFromOffer(offer){
     };
     channel.onerror=()=>{
       if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
+      flushControlTrace('datachannel_error');
+      clientLog('control_datachannel_error',{ready_state:channel.readyState,buffered_amount_bytes:Math.max(0,Number(channel.bufferedAmount)||0),peer_connection_state:nextPeer.connectionState});
       resetControlAuthorityInput();
       resetControlProfileSession();
+      lastVehicleSafetyState='';
       webrtcLabel.textContent='控制链路错误';
       renderMonitoring();
     };
@@ -1344,7 +1500,8 @@ async function collectMetrics(){
 }
 setInterval(()=>collectMetrics().catch(console.error),1000);
 setInterval(()=>refreshRuntimeStatus().catch(console.error),1000);
-setInterval(()=>heartbeat().catch(console.error),50);
+setInterval(()=>flushControlTrace('interval'),1000);
+setInterval(()=>refreshControlIntent().catch(console.error),intentRefreshIntervalMs);
 setInterval(()=>{if(authenticated&&!connecting)refreshVehicles().catch(handleVehicleRefreshError)},5000);
 </script></body></html>)HTML";
 }
@@ -1689,7 +1846,9 @@ SignalingService::SignalingService(
     throw std::invalid_argument("TURN credential TTL must be positive");
   }
   if (config_.max_signaling_payload_bytes == 0 || config_.max_sdp_bytes == 0 ||
-      config_.max_ice_candidate_bytes == 0 || config_.signaling_message_ttl_ms <= 0) {
+      config_.max_ice_candidate_bytes == 0 || config_.signaling_message_ttl_ms <= 0 ||
+      config_.native_control_message_ttl_ms <= 0 ||
+      config_.native_control_message_ttl_ms > 1000) {
     throw std::invalid_argument("signaling limits and message TTL must be positive");
   }
   if (config_.stun_urls.empty() && config_.turn_urls.empty()) {
@@ -1723,9 +1882,16 @@ SignalingService::SignalingService(
       }
     }
   }
+  if (config_.native_control_trace_commands && !config_.audit_log_path.empty()) {
+    native_control_trace_ = std::make_unique<AsyncControlTrace>(
+        [this](Json details) {
+          audit("cloud_native_control_trace_batch", std::move(details));
+        });
+  }
   audit(
       "signaling_service_started",
       {{"runtime", "cpp"},
+       {"native_control_trace_commands", config_.native_control_trace_commands},
        {"audit_log_max_bytes", config_.audit_log_max_bytes},
        {"audit_log_files", config_.audit_log_files},
        {"audit_log_rotation_interval_ms", config_.audit_log_rotation_interval_ms},
@@ -1743,6 +1909,7 @@ SignalingService::SignalingService(
 SignalingService::~SignalingService() {
   connection_reaper_.request_stop();
   if (connection_reaper_.joinable()) connection_reaper_.join();
+  if (native_control_trace_) native_control_trace_->stop();
 }
 
 Json SignalingService::health() const {
@@ -2002,8 +2169,11 @@ void SignalingService::close_session(Session& session, std::string_view reason) 
   session.control_token_expires_at_ms = 0;
   messages_.erase(message_key(session.session_id, session.driver_id));
   messages_.erase(message_key(session.session_id, session.vehicle_id));
+  latest_control_messages_.erase(message_key(session.session_id, session.driver_id));
+  latest_control_messages_.erase(message_key(session.session_id, session.vehicle_id));
   last_accepted_messages_.erase(message_key(session.session_id, session.driver_id));
   last_accepted_messages_.erase(message_key(session.session_id, session.vehicle_id));
+  last_accepted_messages_.erase(message_key(session.session_id, session.driver_id) + ":native_control");
   next_delivery_cursors_.erase(message_key(session.session_id, session.driver_id));
   next_delivery_cursors_.erase(message_key(session.session_id, session.vehicle_id));
   if (session.state != SessionState::Stopping) transition_session(session, SessionState::Stopping, reason);
@@ -2242,6 +2412,19 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
   if (request.method != "GET") return reject(405, "WebSocket endpoint requires GET");
   const auto participant = query_value(request, "participant");
   if (participant.empty()) return reject(400, "participant is required");
+  const auto send_only_value = query_value(request, "send_only");
+  if (!send_only_value.empty() && send_only_value != "1") {
+    return reject(400, "send_only must be 1 when provided");
+  }
+  const bool send_only = send_only_value == "1";
+  const auto requested_types = query_value(request, "types");
+  const bool control_receive_only = !requested_types.empty();
+  if (control_receive_only && requested_types != "control_command") {
+    return reject(400, "WebSocket types must be control_command when provided");
+  }
+  if (control_receive_only && send_only) {
+    return reject(400, "control-command receive WebSocket cannot be send-only");
+  }
 
   Json credentials = {
       {"token", credential_value(request, "token", "x-mine-teleop-driver-token")},
@@ -2252,6 +2435,12 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
     cleanup_expired_connections(now_ms());
     const auto& session = require_participant(parts[1], participant);
     validate_actor_credential(session, participant, credentials);
+    if (send_only && participant != session.driver_id) {
+      throw Unauthorized("send-only signaling is restricted to the session driver");
+    }
+    if (control_receive_only && participant != session.vehicle_id) {
+      throw Unauthorized("control-command receive signaling is restricted to the session vehicle");
+    }
   };
   try {
     authenticate();
@@ -2315,21 +2504,85 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
         cleanup_expired_connections(now_ms());
         const auto& session = require_participant(parts[1], participant);
         validate_actor_credential(session, participant, credentials);
-        pending = take_signaling_messages(parts[1], participant, {}, false);
+        if (!send_only) {
+          pending = take_signaling_messages(
+              parts[1],
+              participant,
+              control_receive_only ? std::string_view("control_command") : std::string_view{},
+              false);
+        }
       } catch (const std::exception& error) {
         connection.send_json({{"error", error.what()}, {"event", "signaling_authority_lost"}});
         connection.send_close(1008, "signaling authority lost");
         return true;
       }
-      if (!pending.empty()) {
+      if (!send_only && !pending.empty()) {
         const auto delivery_cursor = pending.back().value("delivery_cursor", std::uint64_t{0});
         const auto timestamp = std::chrono::steady_clock::now();
         if (delivery_cursor > last_delivery_cursor_sent ||
             timestamp - last_delivery_sent_at >= std::chrono::milliseconds(500)) {
-          connection.send_json(
-              {{"event", "signaling_messages"},
-               {"delivery_cursor", delivery_cursor},
-               {"messages", std::move(pending)}});
+          Json delivery_trace;
+          const bool trace_delivery = control_receive_only && native_control_trace_;
+          if (trace_delivery) {
+            const auto& message = pending.back();
+            const auto& payload = message.value("payload", Json::object());
+            delivery_trace = {
+                {"stage", "delivery_send_completed"},
+                {"trace_session_id", message.value("session_id", std::string(parts[1]))},
+                {"vehicle_id", message.value("vehicle_id", "")},
+                {"driver_id", message.value("driver_id", "")},
+                {"seq", message.value("seq", std::uint64_t{0})},
+                {"intent_seq", payload.value("intent_seq", std::uint64_t{0})},
+                {"command_sent_at_utc_ms", message.value("sent_at_utc_ms", std::int64_t{0})},
+                {"cloud_queued_at_utc_ms", message.value("queued_at_utc_ms", std::int64_t{0})},
+                {"delivery_cursor", delivery_cursor},
+                {"redelivery", delivery_cursor <= last_delivery_cursor_sent},
+            };
+          }
+          const auto send_started_at_utc_ms = now_ms();
+          const auto send_started_monotonic_ms = monotonic_now_ms();
+          try {
+            connection.send_json(
+                {{"event", "signaling_messages"},
+                 {"delivery_cursor", delivery_cursor},
+                 {"messages", std::move(pending)}});
+          } catch (const std::exception& error) {
+            if (trace_delivery) {
+              delivery_trace["stage"] = "delivery_send_failed";
+              delivery_trace["cloud_delivery_send_started_at_utc_ms"] =
+                  send_started_at_utc_ms;
+              delivery_trace["cloud_delivery_send_started_monotonic_ms"] =
+                  send_started_monotonic_ms;
+              delivery_trace["cloud_delivery_send_failed_at_utc_ms"] = now_ms();
+              delivery_trace["cloud_delivery_send_failed_monotonic_ms"] =
+                  monotonic_now_ms();
+              delivery_trace["error"] = error.what();
+              native_control_trace_->enqueue(std::move(delivery_trace));
+            }
+            throw;
+          }
+          const auto send_completed_at_utc_ms = now_ms();
+          const auto send_completed_monotonic_ms = monotonic_now_ms();
+          if (trace_delivery) {
+            const auto queued_at_utc_ms =
+                delivery_trace.value("cloud_queued_at_utc_ms", std::int64_t{0});
+            delivery_trace["cloud_delivery_send_started_at_utc_ms"] =
+                send_started_at_utc_ms;
+            delivery_trace["cloud_delivery_send_started_monotonic_ms"] =
+                send_started_monotonic_ms;
+            delivery_trace["cloud_delivery_send_completed_at_utc_ms"] =
+                send_completed_at_utc_ms;
+            delivery_trace["cloud_delivery_send_completed_monotonic_ms"] =
+                send_completed_monotonic_ms;
+            delivery_trace["cloud_mailbox_to_send_ms"] = queued_at_utc_ms > 0
+                ? std::max<std::int64_t>(0, send_started_at_utc_ms - queued_at_utc_ms)
+                : 0;
+            delivery_trace["cloud_delivery_send_call_ms"] =
+                std::max<std::int64_t>(
+                    0,
+                    send_completed_monotonic_ms - send_started_monotonic_ms);
+            native_control_trace_->enqueue(std::move(delivery_trace));
+          }
           last_delivery_cursor_sent = std::max(last_delivery_cursor_sent, delivery_cursor);
           last_delivery_sent_at = timestamp;
         }
@@ -2337,7 +2590,8 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
 
       WebSocketReceiveResult received;
       try {
-        received = connection.receive_json(std::chrono::milliseconds(50));
+        received = connection.receive_json(
+            std::chrono::milliseconds(send_only ? 10 : 50));
       } catch (const std::exception& error) {
         connection.send_json({{"error", error.what()}, {"event", "websocket_protocol_error"}});
         connection.send_close(1002, "websocket protocol error");
@@ -2346,18 +2600,71 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       if (received.status == WebSocketReceiveStatus::Timeout) continue;
       if (received.status == WebSocketReceiveStatus::Closed) return true;
       try {
-        if (received.message.value("event", "") == "signaling_delivery_ack") {
+        if (!send_only && received.message.value("event", "") == "signaling_delivery_ack") {
           const auto delivery_cursor = required_uint64(received.message, "delivery_cursor");
+          const auto reported_trace_session_id =
+              received.message.value("trace_session_id", "");
+          if (!reported_trace_session_id.empty() &&
+              reported_trace_session_id != parts[1]) {
+            throw std::invalid_argument(
+                "delivery acknowledgement trace session does not match WebSocket session");
+          }
+          const auto reported_seq =
+              received.message.value("seq", std::uint64_t{0});
+          const auto reported_intent_seq =
+              received.message.value("intent_seq", std::uint64_t{0});
           if (delivery_cursor > last_delivery_cursor_sent) {
             throw std::invalid_argument("delivery acknowledgement exceeds the last delivered cursor");
           }
+          const auto ack_received_at_utc_ms = now_ms();
+          const auto ack_received_monotonic_ms = monotonic_now_ms();
           std::size_t acknowledged = 0;
+          Json acknowledgement_trace;
           {
             std::lock_guard lock(mutex_);
             cleanup_expired_connections(now_ms());
             const auto& session = require_participant(parts[1], participant);
             validate_actor_credential(session, participant, credentials);
-            acknowledged = acknowledge_signaling_messages(parts[1], participant, delivery_cursor);
+            if (control_receive_only && native_control_trace_) {
+              acknowledgement_trace = {
+                  {"stage", "delivery_ack_received"},
+                  {"trace_session_id", std::string(parts[1])},
+                  {"vehicle_id", session.vehicle_id},
+                  {"driver_id", session.driver_id},
+                  {"seq", reported_seq},
+                  {"intent_seq", reported_intent_seq},
+                  {"delivery_cursor", delivery_cursor},
+                  {"vehicle_reported_seq", reported_seq},
+                  {"vehicle_reported_intent_seq", reported_intent_seq},
+                  {"cloud_delivery_ack_received_at_utc_ms", ack_received_at_utc_ms},
+                  {"cloud_delivery_ack_received_monotonic_ms", ack_received_monotonic_ms},
+              };
+              const auto queued = latest_control_messages_.find(
+                  message_key(parts[1], participant));
+              if (queued != latest_control_messages_.end() &&
+                  queued->second.delivery_cursor <= delivery_cursor) {
+                acknowledgement_trace["seq"] = queued->second.metadata.seq;
+                acknowledgement_trace["intent_seq"] =
+                    queued->second.payload.value("intent_seq", std::uint64_t{0});
+                acknowledgement_trace["command_sent_at_utc_ms"] =
+                    queued->second.metadata.sent_at_utc_ms;
+                acknowledgement_trace["cloud_queued_at_utc_ms"] =
+                    queued->second.queued_at_utc_ms;
+                acknowledgement_trace["cloud_queue_to_vehicle_ack_ms"] =
+                    std::max<std::int64_t>(
+                        0,
+                        ack_received_at_utc_ms - queued->second.queued_at_utc_ms);
+              }
+            }
+            acknowledged = acknowledge_signaling_messages(
+                parts[1],
+                participant,
+                delivery_cursor,
+                control_receive_only);
+          }
+          if (control_receive_only && native_control_trace_) {
+            acknowledgement_trace["acknowledged"] = acknowledged;
+            native_control_trace_->enqueue(std::move(acknowledgement_trace));
           }
           connection.send_json(
               {{"event", "signaling_delivery_acknowledged"},
@@ -2365,12 +2672,20 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                {"acknowledged", acknowledged}});
           continue;
         }
+        if (control_receive_only) {
+          throw std::invalid_argument(
+              "control-command receive WebSocket accepts delivery acknowledgements only");
+        }
         Json acknowledgement;
         {
           std::lock_guard lock(mutex_);
           cleanup_expired_connections(now_ms());
           const auto& session = require_participant(parts[1], participant);
           validate_actor_credential(session, participant, credentials);
+          if (send_only && received.message.value("type", "") != "control_command") {
+            throw std::invalid_argument(
+                "send-only control WebSocket accepts control_command messages only");
+          }
           acknowledgement = enqueue_signaling_message(parts[1], received.message, participant);
         }
         connection.send_json(acknowledgement);
@@ -2389,24 +2704,6 @@ Json SignalingService::take_signaling_messages(
     std::string_view requested_types,
     bool consume) {
   Json values = Json::array();
-  auto found = messages_.find(message_key(session_id, recipient));
-  if (found != messages_.end()) {
-    const auto timestamp_ms = now_ms();
-    std::erase_if(found->second, [&](const auto& message) {
-      return timestamp_ms - message.queued_at_utc_ms >= config_.signaling_message_ttl_ms;
-    });
-    if (found->second.empty()) {
-      messages_.erase(found);
-      found = messages_.end();
-    }
-  }
-  if (found == messages_.end()) return values;
-  if (requested_types.empty()) {
-    for (const auto& message : found->second) values.push_back(message.to_json());
-    if (consume) messages_.erase(found);
-    return values;
-  }
-
   std::vector<std::string> types;
   std::size_t start = 0;
   while (start <= requested_types.size()) {
@@ -2418,36 +2715,105 @@ Json SignalingService::take_signaling_messages(
     if (end == std::string_view::npos) break;
     start = end + 1;
   }
-  std::vector<Message> remaining;
-  for (const auto& message : found->second) {
-    if (std::find(types.begin(), types.end(), message.type) != types.end()) {
-      values.push_back(message.to_json());
-    } else if (consume) {
-      remaining.push_back(message);
+  const auto requested = [&](std::string_view type) {
+    return requested_types.empty() ||
+        std::find(types.begin(), types.end(), type) != types.end();
+  };
+  const auto recipient_key = message_key(session_id, recipient);
+  const auto timestamp_monotonic_ms = monotonic_now_ms();
+
+  auto latest_control = latest_control_messages_.find(recipient_key);
+  if (latest_control != latest_control_messages_.end() &&
+      timestamp_monotonic_ms - latest_control->second.queued_at_monotonic_ms >=
+          config_.native_control_message_ttl_ms) {
+    if (native_control_trace_) {
+      const auto& expired = latest_control->second;
+      native_control_trace_->enqueue({
+          {"stage", "mailbox_expired"},
+          {"trace_session_id", expired.metadata.session_id},
+          {"vehicle_id", expired.metadata.vehicle_id},
+          {"driver_id", expired.metadata.driver_id},
+          {"seq", expired.metadata.seq},
+          {"intent_seq", expired.payload.value("intent_seq", std::uint64_t{0})},
+          {"command_sent_at_utc_ms", expired.metadata.sent_at_utc_ms},
+          {"cloud_queued_at_utc_ms", expired.queued_at_utc_ms},
+          {"cloud_queued_monotonic_ms", expired.queued_at_monotonic_ms},
+          {"cloud_expired_at_utc_ms", now_ms()},
+          {"cloud_expired_monotonic_ms", timestamp_monotonic_ms},
+          {"cloud_mailbox_age_ms", std::max<std::int64_t>(
+                                           0,
+                                           timestamp_monotonic_ms -
+                                               expired.queued_at_monotonic_ms)},
+          {"delivery_cursor", expired.delivery_cursor},
+      });
     }
+    latest_control_messages_.erase(latest_control);
+    latest_control = latest_control_messages_.end();
   }
-  if (consume) {
-    if (remaining.empty()) {
+  if (latest_control != latest_control_messages_.end() && requested("control_command")) {
+    values.push_back(latest_control->second.to_json());
+    if (consume) latest_control_messages_.erase(latest_control);
+  }
+
+  auto found = messages_.find(recipient_key);
+  if (found != messages_.end()) {
+    std::erase_if(found->second, [&](const auto& message) {
+      return timestamp_monotonic_ms - message.queued_at_monotonic_ms >=
+          config_.signaling_message_ttl_ms;
+    });
+    if (found->second.empty()) {
       messages_.erase(found);
-    } else {
-      found->second = std::move(remaining);
+      found = messages_.end();
     }
   }
+  if (found != messages_.end()) {
+    std::vector<Message> remaining;
+    for (const auto& message : found->second) {
+      if (requested(message.type)) {
+        values.push_back(message.to_json());
+      } else if (consume) {
+        remaining.push_back(message);
+      }
+    }
+    if (consume) {
+      if (remaining.empty()) {
+        messages_.erase(found);
+      } else {
+        found->second = std::move(remaining);
+      }
+    }
+  }
+  std::sort(values.begin(), values.end(), [](const Json& left, const Json& right) {
+    return left.value("delivery_cursor", std::uint64_t{0}) <
+        right.value("delivery_cursor", std::uint64_t{0});
+  });
   return values;
 }
 
 std::size_t SignalingService::acknowledge_signaling_messages(
     std::string_view session_id,
     std::string_view recipient,
-    std::uint64_t delivery_cursor) {
-  auto found = messages_.find(message_key(session_id, recipient));
-  if (found == messages_.end()) return 0;
-  const auto previous_size = found->second.size();
-  std::erase_if(found->second, [&](const auto& message) {
-    return message.delivery_cursor <= delivery_cursor;
-  });
-  const auto acknowledged = previous_size - found->second.size();
-  if (found->second.empty()) messages_.erase(found);
+    std::uint64_t delivery_cursor,
+    bool control_only) {
+  const auto recipient_key = message_key(session_id, recipient);
+  std::size_t acknowledged = 0;
+  if (!control_only) {
+    auto found = messages_.find(recipient_key);
+    if (found != messages_.end()) {
+      const auto previous_size = found->second.size();
+      std::erase_if(found->second, [&](const auto& message) {
+        return message.delivery_cursor <= delivery_cursor;
+      });
+      acknowledged += previous_size - found->second.size();
+      if (found->second.empty()) messages_.erase(found);
+    }
+  }
+  const auto latest_control = latest_control_messages_.find(recipient_key);
+  if (latest_control != latest_control_messages_.end() &&
+      latest_control->second.delivery_cursor <= delivery_cursor) {
+    latest_control_messages_.erase(latest_control);
+    ++acknowledged;
+  }
   return acknowledged;
 }
 
@@ -2455,12 +2821,14 @@ Json SignalingService::enqueue_signaling_message(
     std::string_view session_id,
     const Json& value,
     std::optional<std::string_view> authenticated_actor) {
+  const auto cloud_ingress_started_at_utc_ms = now_ms();
+  const auto cloud_ingress_started_monotonic_ms = monotonic_now_ms();
   const auto sender = required_string(value, "sender");
   const auto recipient = required_string(value, "recipient");
   const auto type = required_string(value, "type");
   static const std::vector<std::string> allowed{
       "webrtc_offer", "webrtc_answer", "ice_candidate", "media_capabilities", "media_fallback",
-      "connection_status", "telemetry", "media_status", "session_event"};
+      "connection_status", "telemetry", "media_status", "session_event", "control_command"};
   if (std::find(allowed.begin(), allowed.end(), type) == allowed.end()) {
     throw std::invalid_argument("unsupported signaling message type");
   }
@@ -2485,6 +2853,9 @@ Json SignalingService::enqueue_signaling_message(
     throw Unauthorized(type + " route is invalid");
   }
   if (type == "webrtc_offer" && !vehicle_to_driver) throw Unauthorized("webrtc_offer route is invalid");
+  if (type == "control_command" && !driver_to_vehicle) {
+    throw Unauthorized("control_command route is invalid");
+  }
   if (type == "ice_candidate" && !driver_to_vehicle && !vehicle_to_driver) {
     throw Unauthorized("ice_candidate route is invalid");
   }
@@ -2507,7 +2878,28 @@ Json SignalingService::enqueue_signaling_message(
       throw std::invalid_argument("WebRTC ICE candidate exceeds configured limit");
     }
   }
-  const auto sequence_key = message_key(session_id, sender);
+  std::uint64_t control_intent_seq = 0;
+  if (type == "control_command") {
+    const auto command = ControlCommand::from_json(payload);
+    control_intent_seq = required_uint64(payload, "intent_seq");
+    if (control_intent_seq == 0) throw std::invalid_argument("intent_seq must be positive");
+    if (!payload.contains("intent_fresh") || !payload.at("intent_fresh").is_boolean()) {
+      throw std::invalid_argument("intent_fresh must be a boolean");
+    }
+    if (command.protocol_version != metadata.protocol_version ||
+        command.vehicle_id != metadata.vehicle_id ||
+        command.driver_id != metadata.driver_id ||
+        command.session_id != metadata.session_id ||
+        command.seq != metadata.seq ||
+        command.sent_at_utc_ms != metadata.sent_at_utc_ms) {
+      throw std::invalid_argument("control command payload metadata does not match signaling wrapper");
+    }
+    if (command.control_token != session.control_token) {
+      throw Unauthorized("control command token does not match active session");
+    }
+  }
+  const auto sequence_key = message_key(session_id, sender) +
+      (type == "control_command" ? ":native_control" : "");
   const auto fingerprint = recipient + "\n" + type + "\n" + metadata.to_json().dump() + "\n" + payload.dump();
   if (const auto accepted = last_accepted_messages_.find(sequence_key); accepted != last_accepted_messages_.end()) {
     if (metadata.seq < accepted->second.sequence) {
@@ -2525,6 +2917,20 @@ Json SignalingService::enqueue_signaling_message(
       }
       auto acknowledgement = accepted->second.acknowledgement;
       acknowledgement["duplicate"] = true;
+      if (type == "control_command" && native_control_trace_) {
+        native_control_trace_->enqueue({
+            {"stage", "ingress_duplicate_acknowledged"},
+            {"trace_session_id", std::string(session_id)},
+            {"vehicle_id", metadata.vehicle_id},
+            {"driver_id", metadata.driver_id},
+            {"seq", metadata.seq},
+            {"intent_seq", control_intent_seq},
+            {"command_sent_at_utc_ms", metadata.sent_at_utc_ms},
+            {"cloud_received_at_utc_ms", cloud_ingress_started_at_utc_ms},
+            {"cloud_received_monotonic_ms", cloud_ingress_started_monotonic_ms},
+            {"delivery_cursor", acknowledgement.value("delivery_cursor", std::uint64_t{0})},
+        });
+      }
       audit(
           "signaling_retry_acknowledged",
           {{"session_id", session_id},
@@ -2538,27 +2944,93 @@ Json SignalingService::enqueue_signaling_message(
     }
   }
   const auto recipient_key = message_key(session_id, recipient);
+  std::uint64_t replaced_seq = 0;
+  std::uint64_t replaced_delivery_cursor = 0;
+  std::int64_t replaced_queued_at_utc_ms = 0;
+  if (type == "control_command") {
+    const auto previous = latest_control_messages_.find(recipient_key);
+    if (previous != latest_control_messages_.end()) {
+      replaced_seq = previous->second.metadata.seq;
+      replaced_delivery_cursor = previous->second.delivery_cursor;
+      replaced_queued_at_utc_ms = previous->second.queued_at_utc_ms;
+    }
+  }
   const auto delivery_cursor = ++next_delivery_cursors_[recipient_key];
-  auto& queue = messages_[recipient_key];
-  queue.push_back(Message{metadata, sender, recipient, type, payload, now_ms(), delivery_cursor});
+  const auto cloud_queued_at_utc_ms = now_ms();
+  const auto cloud_queued_monotonic_ms = monotonic_now_ms();
+  const Message queued_message{
+      metadata,
+      sender,
+      recipient,
+      type,
+      payload,
+      cloud_queued_at_utc_ms,
+      cloud_queued_monotonic_ms,
+      delivery_cursor};
+  std::size_t queued = 1;
+  if (type == "control_command") {
+    latest_control_messages_.insert_or_assign(recipient_key, queued_message);
+  } else {
+    auto& queue = messages_[recipient_key];
+    queue.push_back(queued_message);
+    queued = queue.size();
+  }
   Json acknowledgement = {
-      {"queued", queue.size()},
+      {"queued", queued},
       {"event", "signaling_ack"},
       {"type", type},
       {"seq", metadata.seq},
       {"message_id", std::string(session_id) + ":" + sender + ":" + std::to_string(metadata.seq)},
       {"delivery_cursor", delivery_cursor},
       {"duplicate", false}};
+  if (type == "control_command") {
+    acknowledgement["cloud_received_at_utc_ms"] = cloud_ingress_started_at_utc_ms;
+    acknowledgement["cloud_queued_at_utc_ms"] = cloud_queued_at_utc_ms;
+    acknowledgement["cloud_ingress_processing_ms"] = std::max<std::int64_t>(
+        0,
+        cloud_queued_monotonic_ms - cloud_ingress_started_monotonic_ms);
+  }
   last_accepted_messages_[sequence_key] = AcceptedMessage{metadata.seq, fingerprint, acknowledgement};
-  audit(
-      type,
-      {{"session_id", session_id},
-       {"vehicle_id", metadata.vehicle_id},
-       {"driver_id", metadata.driver_id},
-       {"seq", metadata.seq},
-       {"sender", sender},
-       {"recipient", recipient},
-       {"transport", authenticated_actor.has_value() ? "websocket" : "http"}});
+  if (type == "control_command" && native_control_trace_) {
+    native_control_trace_->enqueue({
+        {"stage", "ingress_queued"},
+        {"trace_session_id", std::string(session_id)},
+        {"vehicle_id", metadata.vehicle_id},
+        {"driver_id", metadata.driver_id},
+        {"seq", metadata.seq},
+        {"intent_seq", control_intent_seq},
+        {"command_sent_at_utc_ms", metadata.sent_at_utc_ms},
+        {"cloud_received_at_utc_ms", cloud_ingress_started_at_utc_ms},
+        {"cloud_received_monotonic_ms", cloud_ingress_started_monotonic_ms},
+        {"cloud_queued_at_utc_ms", cloud_queued_at_utc_ms},
+        {"cloud_queued_monotonic_ms", cloud_queued_monotonic_ms},
+        {"driver_to_cloud_utc_delta_ms",
+         cloud_ingress_started_at_utc_ms - metadata.sent_at_utc_ms},
+        {"cloud_ingress_processing_ms", std::max<std::int64_t>(
+                                             0,
+                                             cloud_queued_monotonic_ms -
+                                                 cloud_ingress_started_monotonic_ms)},
+        {"delivery_cursor", delivery_cursor},
+        {"mailbox_replaced_seq", replaced_seq},
+        {"mailbox_replaced_delivery_cursor", replaced_delivery_cursor},
+        {"mailbox_replaced_age_ms",
+         replaced_queued_at_utc_ms > 0
+             ? std::max<std::int64_t>(0, cloud_queued_at_utc_ms - replaced_queued_at_utc_ms)
+             : 0},
+        {"transport", authenticated_actor.has_value() ? "websocket" : "http"},
+    });
+  }
+  if (type != "control_command") {
+    audit(
+        type,
+        {{"session_id", session_id},
+         {"vehicle_id", metadata.vehicle_id},
+         {"driver_id", metadata.driver_id},
+         {"seq", metadata.seq},
+         {"sender", sender},
+         {"recipient", recipient},
+         {"transport", authenticated_actor.has_value() ? "websocket" : "http"}});
+  }
   return acknowledgement;
 }
 
@@ -3222,12 +3694,18 @@ DriverConfig load_driver_config(const std::string& path) {
   if (logging && logging["browser_event_log_files"]) {
     config.browser_event_log_files = logging["browser_event_log_files"].as<int>();
   }
+  if (logging && logging["control_trace_commands"]) {
+    config.control_trace_commands = logging["control_trace_commands"].as<bool>();
+  }
   if (root["control"] && root["control"].IsMap() && root["control"]["keyboard"].IsDefined()) {
     throw std::invalid_argument(
         "control.keyboard is no longer supported; keyboard bindings are fixed: "
         "Arrow/WASD directions, Space service brake, B hard brake, E ESTOP");
   }
   if (root["control"] && root["control"]["rate_hz"]) config.rate_hz = root["control"]["rate_hz"].as<int>();
+  if (root["control"] && root["control"]["intent_lease_ms"]) {
+    config.intent_lease_ms = root["control"]["intent_lease_ms"].as<int>();
+  }
   if (root["control"] && root["control"]["estop_hold_ms"]) config.estop_hold_ms = root["control"]["estop_hold_ms"].as<int>();
   const auto limits = root["control"] ? root["control"]["limits"] : YAML::Node{};
   if (limits) {
@@ -3293,7 +3771,8 @@ DriverConfig load_driver_config(const std::string& path) {
   }
   if (time_sync && time_sync["interval_ms"]) config.time_sync_interval_ms = time_sync["interval_ms"].as<int>();
   if (time_sync && time_sync["samples"]) config.time_sync_samples = time_sync["samples"].as<int>();
-  if (config.driver_id.empty() || config.signaling_url.empty() || config.rate_hz <= 0 || config.estop_hold_ms < 0 ||
+  if (config.driver_id.empty() || config.signaling_url.empty() || config.rate_hz <= 0 ||
+      config.intent_lease_ms < 100 || config.intent_lease_ms > 1000 || config.estop_hold_ms < 0 ||
       config.browser_event_log_max_bytes < 1024 || config.browser_event_log_files < 1 ||
       config.browser_event_log_files > 20 ||
       config.max_time_sync_uncertainty_ms < 0 || config.time_sync_interval_ms <= 0 ||
@@ -3335,15 +3814,49 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
       vehicle_id_(std::move(vehicle_id)),
       password_(std::move(password)),
       signaling_http_url_(normalize_signaling_http_url(config_.signaling_url)),
-      http_(std::chrono::seconds(5), config_.resolve_entries, config_.ca_bundle) {
+      http_(std::chrono::seconds(5), config_.resolve_entries, config_.ca_bundle),
+      native_control_intent_(config_.intent_lease_ms) {
   if (vehicle_id_.empty() || password_.empty()) throw std::invalid_argument("vehicle id and driver password are required");
   reset_control_profile_locked();
   if (!signaling_url_is_secure_or_loopback(config_.signaling_url)) {
     throw std::invalid_argument("public signaling URL must use HTTPS or WSS; HTTP/WS is allowed only on loopback");
   }
+  if (config_.control_trace_commands && !config_.browser_event_log_path.empty()) {
+    native_control_trace_ = std::make_unique<AsyncControlTrace>(
+        [this](Json details) {
+          std::string trace_session_id;
+          const auto& commands = details["commands"];
+          if (commands.is_array() && !commands.empty()) {
+            trace_session_id = commands.front().value("trace_session_id", "");
+          }
+          const auto timestamp_ms = now_ms();
+          append_driver_log_record({
+              {"event", "driver_native_control_trace_batch"},
+              {"sent_at_utc_ms", timestamp_ms},
+              {"browser_sent_at_utc_ms", timestamp_ms},
+              {"driver_id", config_.driver_id},
+              {"vehicle_id", vehicle_id_},
+              {"session_id", trace_session_id},
+              {"details", std::move(details)},
+          });
+        });
+  }
+  native_control_sender_ = std::jthread(
+      [this](std::stop_token stop_token) { native_control_sender_loop(stop_token); });
+  native_control_lease_ = std::jthread(
+      [this](std::stop_token stop_token) { native_control_lease_loop(stop_token); });
 }
 
-DriverConsoleRuntime::~DriverConsoleRuntime() { close_signaling_websocket(); }
+DriverConsoleRuntime::~DriverConsoleRuntime() {
+  native_control_sender_.request_stop();
+  native_control_lease_.request_stop();
+  native_control_cv_.notify_all();
+  if (native_control_sender_.joinable()) native_control_sender_.join();
+  if (native_control_lease_.joinable()) native_control_lease_.join();
+  close_control_signaling_websocket();
+  close_signaling_websocket();
+  if (native_control_trace_) native_control_trace_->stop();
+}
 
 void DriverConsoleRuntime::connect_signaling_websocket(std::string_view session_id, std::string_view token) {
   const auto url = signaling_websocket_url(
@@ -3387,6 +3900,472 @@ void DriverConsoleRuntime::close_signaling_websocket() {
   signaling_websocket_session_id_.clear();
   pending_websocket_messages_ = Json::array();
   signaling_delivery_cursor_ = 0;
+}
+
+bool DriverConsoleRuntime::connect_control_signaling_websocket(
+    std::string_view session_id,
+    std::string_view token,
+    std::uint64_t expected_generation) {
+  const auto url = signaling_websocket_url(
+                       config_.signaling_url,
+                       session_id,
+                       config_.driver_id) +
+      "&send_only=1";
+  std::lock_guard lock(control_signaling_websocket_mutex_);
+  if (expected_generation != 0) {
+    {
+      std::lock_guard state_lock(mutex_);
+      if (session_id_ != session_id || driver_token_ != token ||
+          control_session_generation_ != expected_generation) {
+        return false;
+      }
+    }
+    if (control_signaling_next_connect_monotonic_ms_ > monotonic_now_ms()) {
+      return false;
+    }
+  }
+  if (control_signaling_websocket_ && control_signaling_websocket_->connected() &&
+      control_signaling_websocket_->url() == url &&
+      control_signaling_websocket_session_id_ == session_id) {
+    return true;
+  }
+  auto next = std::make_unique<WebSocketClient>(
+      std::chrono::seconds(1), config_.resolve_entries, config_.ca_bundle);
+  next->connect(url, {{"X-Mine-Teleop-Driver-Token", std::string(token)}});
+  if (control_signaling_websocket_) control_signaling_websocket_->close();
+  control_signaling_websocket_ = std::move(next);
+  control_signaling_websocket_session_id_ = std::string(session_id);
+  control_signaling_last_ack_seq_ = 0;
+  control_signaling_ack_window_.reset();
+  control_signaling_next_connect_monotonic_ms_ = 0;
+  return true;
+}
+
+void DriverConsoleRuntime::close_control_signaling_websocket() {
+  std::lock_guard lock(control_signaling_websocket_mutex_);
+  if (control_signaling_websocket_) control_signaling_websocket_->close();
+  control_signaling_websocket_.reset();
+  control_signaling_websocket_session_id_.clear();
+  control_signaling_last_ack_seq_ = 0;
+  control_signaling_ack_window_.reset();
+  control_signaling_next_connect_monotonic_ms_ = 0;
+  control_signaling_reconnect_delay_ms_ = 100;
+}
+
+void DriverConsoleRuntime::reset_native_control_state() {
+  std::lock_guard update_lock(native_control_update_mutex_);
+  close_control_signaling_websocket();
+  native_control_intent_.reset();
+  native_control_last_sent_monotonic_ms_.store(0, std::memory_order_relaxed);
+  native_control_last_ack_received_at_utc_ms_.store(0, std::memory_order_relaxed);
+  native_control_last_ack_cloud_received_at_utc_ms_.store(0, std::memory_order_relaxed);
+  {
+    std::lock_guard lock(mutex_);
+    control_sequence_ = 0;
+    ++control_session_generation_;
+  }
+  native_control_estop_wakeup_.store(false);
+  native_control_cv_.notify_all();
+}
+
+void DriverConsoleRuntime::note_native_control_failure(
+    std::string error,
+    std::string_view session_id,
+    std::uint64_t generation) {
+  std::lock_guard update_lock(native_control_update_mutex_);
+  {
+    std::lock_guard lock(mutex_);
+    if (session_id_ != session_id || control_session_generation_ != generation) {
+      return;
+    }
+  }
+  ++native_control_send_failures_;
+  {
+    std::lock_guard lock(native_control_status_mutex_);
+    native_control_last_error_ = std::move(error);
+  }
+  native_control_intent_.invalidate();
+  std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
+  if (control_signaling_websocket_) control_signaling_websocket_->close();
+  control_signaling_websocket_.reset();
+  control_signaling_websocket_session_id_.clear();
+  control_signaling_last_ack_seq_ = 0;
+  control_signaling_ack_window_.reset();
+  const auto now_monotonic_ms = monotonic_now_ms();
+  control_signaling_next_connect_monotonic_ms_ =
+      now_monotonic_ms + control_signaling_reconnect_delay_ms_;
+  control_signaling_reconnect_delay_ms_ =
+      std::min(control_signaling_reconnect_delay_ms_ * 2, 1000);
+}
+
+bool DriverConsoleRuntime::send_native_control_sample() {
+  const auto sample_started_monotonic_ms = monotonic_now_ms();
+  const auto sample_started_at_utc_ms = clock_.now_ms();
+  const auto scheduled_at_monotonic_ms =
+      native_control_scheduled_at_monotonic_ms_.load(std::memory_order_relaxed);
+  NativeControlIntentSample sample;
+  std::string session;
+  std::string control_token;
+  std::string driver_token;
+  std::string vehicle;
+  std::int64_t control_token_expires_at_ms = 0;
+  std::uint64_t sequence = 0;
+  std::uint64_t generation = 0;
+  Json trace_record;
+  {
+    std::lock_guard update_lock(native_control_update_mutex_);
+    sample = native_control_intent_.sample(monotonic_now_ms());
+    if (!sample.active) return false;
+    {
+      std::lock_guard lock(mutex_);
+      if (session_id_.empty() || driver_token_.empty() || control_token_.empty()) {
+        return false;
+      }
+      session = session_id_;
+      control_token = control_token_;
+      driver_token = driver_token_;
+      vehicle = vehicle_id_;
+      control_token_expires_at_ms = control_token_expires_at_ms_;
+      generation = control_session_generation_;
+      sequence = ++control_sequence_;
+    }
+  }
+
+  try {
+    if (native_control_trace_) {
+      trace_record = {
+          {"stage", "send_started"},
+          {"trace_session_id", session},
+          {"vehicle_id", vehicle},
+          {"driver_id", config_.driver_id},
+          {"session_generation", generation},
+          {"seq", sequence},
+          {"intent_seq", sample.intent.intent_seq},
+          {"intent_fresh", sample.fresh && !sample.requires_fresh_input},
+          {"intent_requires_fresh_input", sample.requires_fresh_input},
+          {"effective_gear", sample.intent.gear},
+          {"scheduled_at_monotonic_ms", scheduled_at_monotonic_ms},
+          {"sample_started_at_utc_ms", sample_started_at_utc_ms},
+          {"sample_started_monotonic_ms", sample_started_monotonic_ms},
+          {"sender_wakeup_lag_ms",
+           scheduled_at_monotonic_ms > 0
+               ? std::max<std::int64_t>(
+                     0,
+                     sample_started_monotonic_ms - scheduled_at_monotonic_ms)
+               : 0},
+      };
+    }
+    if (clock_.now_ms() >= control_token_expires_at_ms) {
+      throw std::runtime_error("control authority lease expired");
+    }
+
+    ControlCommand command;
+    command.vehicle_id = vehicle;
+    command.driver_id = config_.driver_id;
+    command.session_id = session;
+    command.seq = sequence;
+    command.sent_at_utc_ms = clock_.now_ms();
+    command.gear = sample.intent.gear;
+    command.steering = sample.intent.steering;
+    command.throttle = sample.intent.throttle;
+    command.brake = sample.intent.brake;
+    command.estop = sample.intent.estop;
+    command.control_token = control_token;
+    command.validate();
+    auto payload = command.to_json();
+    payload["intent_seq"] = sample.intent.intent_seq;
+    payload["intent_fresh"] = sample.fresh && !sample.requires_fresh_input;
+    payload["intent_requires_fresh_input"] = sample.requires_fresh_input;
+    auto envelope = ProtocolMetadata{
+                        command.protocol_version,
+                        command.vehicle_id,
+                        command.driver_id,
+                        command.session_id,
+                        command.seq,
+                        command.sent_at_utc_ms}
+                        .to_json();
+    envelope["sender"] = config_.driver_id;
+    envelope["recipient"] = vehicle;
+    envelope["type"] = "control_command";
+    envelope["payload"] = payload;
+
+    const auto connect_started_at_utc_ms = clock_.now_ms();
+    const auto connect_started_monotonic_ms = monotonic_now_ms();
+    if (!connect_control_signaling_websocket(
+            session,
+            driver_token,
+            generation)) {
+      if (native_control_trace_) {
+        trace_record["stage"] = "send_skipped";
+        trace_record["reason"] = "session_changed_or_reconnect_backoff";
+        trace_record["command_sent_at_utc_ms"] = command.sent_at_utc_ms;
+        trace_record["connect_started_at_utc_ms"] = connect_started_at_utc_ms;
+        trace_record["connect_started_monotonic_ms"] = connect_started_monotonic_ms;
+        trace_record["trace_completed_at_utc_ms"] = clock_.now_ms();
+        trace_record["trace_completed_monotonic_ms"] = monotonic_now_ms();
+        native_control_trace_->enqueue(std::move(trace_record));
+      }
+      return false;
+    }
+    const auto connect_completed_at_utc_ms = clock_.now_ms();
+    const auto connect_completed_monotonic_ms = monotonic_now_ms();
+    if (native_control_trace_) {
+      trace_record["command_sent_at_utc_ms"] = command.sent_at_utc_ms;
+      trace_record["connect_started_at_utc_ms"] = connect_started_at_utc_ms;
+      trace_record["connect_started_monotonic_ms"] = connect_started_monotonic_ms;
+      trace_record["connect_completed_at_utc_ms"] = connect_completed_at_utc_ms;
+      trace_record["connect_completed_monotonic_ms"] = connect_completed_monotonic_ms;
+      trace_record["connect_processing_ms"] = std::max<std::int64_t>(
+          0,
+          connect_completed_monotonic_ms - connect_started_monotonic_ms);
+    }
+    Json drained_acknowledgements = Json::array();
+    std::int64_t acknowledgement_drain_started_monotonic_ms = 0;
+    std::int64_t acknowledgement_drain_completed_monotonic_ms = 0;
+    std::int64_t send_started_at_utc_ms = 0;
+    std::int64_t send_started_monotonic_ms = 0;
+    std::int64_t send_completed_at_utc_ms = 0;
+    std::int64_t send_completed_monotonic_ms = 0;
+    std::int64_t unacknowledged_age_ms = 0;
+    std::uint64_t last_ack_seq = 0;
+    {
+      std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
+      {
+        std::lock_guard lock(mutex_);
+        if (session_id_ != session || control_token_ != control_token ||
+            control_session_generation_ != generation) {
+          return false;
+        }
+      }
+      if (!control_signaling_websocket_ ||
+          !control_signaling_websocket_->connected() ||
+          control_signaling_websocket_session_id_ != session) {
+        throw std::runtime_error(
+            "native control signaling websocket is not connected");
+      }
+      // Drain acknowledgements from earlier packets without making the 20 Hz
+      // schedule depend on a cloud round trip. Track the oldest packet that is
+      // still pending, rather than accumulating time across an ACK pipeline
+      // whose sequence is continuously advancing.
+      acknowledgement_drain_started_monotonic_ms = monotonic_now_ms();
+      for (int drained = 0; drained < 16; ++drained) {
+        const auto received =
+            control_signaling_websocket_->receive_json(std::chrono::milliseconds(0));
+        if (received.status == WebSocketReceiveStatus::Timeout) break;
+        if (received.status == WebSocketReceiveStatus::Closed) {
+          throw std::runtime_error("native control signaling websocket closed");
+        }
+        if (received.message.contains("error")) {
+          throw std::runtime_error(received.message.value(
+              "error", "native control signaling message was rejected"));
+        }
+        if (received.message.value("event", "") != "signaling_ack" ||
+            received.message.value("type", "") != "control_command") {
+          throw std::runtime_error(
+              "native control signaling acknowledgement is invalid");
+        }
+        const auto acknowledged_seq =
+            received.message.value("seq", std::uint64_t{0});
+        if (acknowledged_seq == 0 || acknowledged_seq > sequence) {
+          throw std::runtime_error(
+              "native control signaling acknowledgement sequence is invalid");
+        }
+        control_signaling_last_ack_seq_ =
+            std::max(control_signaling_last_ack_seq_, acknowledged_seq);
+        control_signaling_ack_window_.acknowledge_through(
+            control_signaling_last_ack_seq_);
+        const auto acknowledgement_received_at_utc_ms = clock_.now_ms();
+        const auto acknowledgement_received_monotonic_ms = monotonic_now_ms();
+        native_control_last_ack_received_at_utc_ms_.store(
+            acknowledgement_received_at_utc_ms,
+            std::memory_order_relaxed);
+        const auto cloud_received_at_utc_ms = received.message.value(
+            "cloud_received_at_utc_ms",
+            std::int64_t{0});
+        if (cloud_received_at_utc_ms > 0) {
+          native_control_last_ack_cloud_received_at_utc_ms_.store(
+              cloud_received_at_utc_ms,
+              std::memory_order_relaxed);
+        }
+        if (native_control_trace_) {
+          drained_acknowledgements.push_back({
+              {"seq", acknowledged_seq},
+              {"ack_received_at_utc_ms", acknowledgement_received_at_utc_ms},
+              {"ack_received_monotonic_ms", acknowledgement_received_monotonic_ms},
+              {"cloud_received_at_utc_ms", cloud_received_at_utc_ms},
+              {"cloud_queued_at_utc_ms", received.message.value(
+                                                "cloud_queued_at_utc_ms",
+                                                std::int64_t{0})},
+              {"cloud_ingress_processing_ms", received.message.value(
+                                                   "cloud_ingress_processing_ms",
+                                                   std::int64_t{0})},
+              {"delivery_cursor", received.message.value(
+                                      "delivery_cursor",
+                                      std::uint64_t{0})},
+          });
+        }
+        control_signaling_next_connect_monotonic_ms_ = 0;
+        control_signaling_reconnect_delay_ms_ = 100;
+      }
+      acknowledgement_drain_completed_monotonic_ms = monotonic_now_ms();
+      if (native_control_trace_) {
+        trace_record["acknowledgement_drain_started_monotonic_ms"] =
+            acknowledgement_drain_started_monotonic_ms;
+        trace_record["acknowledgement_drain_completed_monotonic_ms"] =
+            acknowledgement_drain_completed_monotonic_ms;
+        trace_record["acknowledgement_drain_ms"] = std::max<std::int64_t>(
+            0,
+            acknowledgement_drain_completed_monotonic_ms -
+                acknowledgement_drain_started_monotonic_ms);
+        trace_record["acknowledgements"] = drained_acknowledgements;
+      }
+      const auto monotonic_ms = monotonic_now_ms();
+      if (control_signaling_ack_window_.pending_count() > 0) {
+        unacknowledged_age_ms =
+            control_signaling_ack_window_.oldest_age_ms(monotonic_ms);
+        if (native_control_trace_) {
+          trace_record["last_ack_seq"] = control_signaling_last_ack_seq_;
+          trace_record["oldest_unacknowledged_seq"] =
+              control_signaling_ack_window_.oldest_sequence();
+          trace_record["unacknowledged_count"] =
+              control_signaling_ack_window_.pending_count();
+          trace_record["unacknowledged_age_ms"] = unacknowledged_age_ms;
+        }
+        if (unacknowledged_age_ms >= 500) {
+          throw std::runtime_error(
+              "native control signaling acknowledgements stalled for 500ms");
+        }
+      }
+      last_ack_seq = control_signaling_last_ack_seq_;
+      send_started_at_utc_ms = clock_.now_ms();
+      send_started_monotonic_ms = monotonic_now_ms();
+      control_signaling_websocket_->send_json(
+          envelope,
+          std::chrono::milliseconds(20));
+      send_completed_at_utc_ms = clock_.now_ms();
+      send_completed_monotonic_ms = monotonic_now_ms();
+      control_signaling_ack_window_.note_sent(
+          sequence, send_completed_monotonic_ms);
+    }
+
+    const auto sent_at_ms = clock_.now_ms();
+    const auto previous = native_control_last_sent_at_utc_ms_.exchange(sent_at_ms);
+    const auto gap_ms =
+        previous > 0 ? std::max<std::int64_t>(0, sent_at_ms - previous) : 0;
+    const auto previous_monotonic_ms =
+        native_control_last_sent_monotonic_ms_.exchange(send_completed_monotonic_ms);
+    const auto monotonic_gap_ms = previous_monotonic_ms > 0
+        ? std::max<std::int64_t>(
+              0,
+              send_completed_monotonic_ms - previous_monotonic_ms)
+        : 0;
+    native_control_last_gap_ms_.store(gap_ms);
+    auto maximum = native_control_max_gap_ms_.load();
+    while (gap_ms > maximum &&
+           !native_control_max_gap_ms_.compare_exchange_weak(maximum, gap_ms)) {
+    }
+    ++native_control_commands_sent_;
+    native_control_last_seq_.store(sequence);
+    {
+      std::lock_guard lock(native_control_status_mutex_);
+      native_control_last_error_.clear();
+    }
+    if (native_control_trace_) {
+      trace_record["stage"] = "send_completed";
+      trace_record["acknowledgement_drain_started_monotonic_ms"] =
+          acknowledgement_drain_started_monotonic_ms;
+      trace_record["acknowledgement_drain_completed_monotonic_ms"] =
+          acknowledgement_drain_completed_monotonic_ms;
+      trace_record["acknowledgement_drain_ms"] = std::max<std::int64_t>(
+          0,
+          acknowledgement_drain_completed_monotonic_ms -
+              acknowledgement_drain_started_monotonic_ms);
+      trace_record["acknowledgements"] = std::move(drained_acknowledgements);
+      trace_record["last_ack_seq"] = last_ack_seq;
+      trace_record["unacknowledged_age_ms"] = unacknowledged_age_ms;
+      trace_record["send_started_at_utc_ms"] = send_started_at_utc_ms;
+      trace_record["send_started_monotonic_ms"] = send_started_monotonic_ms;
+      trace_record["send_completed_at_utc_ms"] = send_completed_at_utc_ms;
+      trace_record["send_completed_monotonic_ms"] = send_completed_monotonic_ms;
+      trace_record["send_call_ms"] = std::max<std::int64_t>(
+          0,
+          send_completed_monotonic_ms - send_started_monotonic_ms);
+      trace_record["successful_send_gap_ms"] = gap_ms;
+      trace_record["successful_send_monotonic_gap_ms"] = monotonic_gap_ms;
+      trace_record["sample_processing_ms"] = std::max<std::int64_t>(
+          0,
+          send_completed_monotonic_ms - sample_started_monotonic_ms);
+      native_control_trace_->enqueue(std::move(trace_record));
+    }
+    return true;
+  } catch (const std::exception& error) {
+    if (native_control_trace_) {
+      trace_record["stage"] = "send_failed";
+      trace_record["error"] = error.what();
+      trace_record["failure_at_utc_ms"] = clock_.now_ms();
+      trace_record["failure_monotonic_ms"] = monotonic_now_ms();
+      trace_record["sample_processing_ms"] = std::max<std::int64_t>(
+          0,
+          monotonic_now_ms() - sample_started_monotonic_ms);
+      native_control_trace_->enqueue(std::move(trace_record));
+    }
+    note_native_control_failure(error.what(), session, generation);
+    return false;
+  }
+}
+
+void DriverConsoleRuntime::native_control_sender_loop(std::stop_token stop_token) {
+  const auto period = std::chrono::milliseconds(
+      std::max(1, static_cast<int>(std::llround(1000.0 / config_.rate_hz))));
+  auto next_send = std::chrono::steady_clock::now();
+  while (!stop_token.stop_requested()) {
+    {
+      std::unique_lock lock(native_control_wait_mutex_);
+      native_control_cv_.wait_until(lock, next_send, [&] {
+        return stop_token.stop_requested() ||
+            native_control_estop_wakeup_.exchange(false);
+      });
+    }
+    if (stop_token.stop_requested()) break;
+    native_control_scheduled_at_monotonic_ms_.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            next_send.time_since_epoch())
+            .count(),
+        std::memory_order_relaxed);
+    static_cast<void>(send_native_control_sample());
+    // Never replay missed periods or emit a catch-up burst after a scheduler or
+    // network stall. The next vehicle packet is always one fresh sample.
+    next_send = std::chrono::steady_clock::now() + period;
+  }
+}
+
+void DriverConsoleRuntime::native_control_lease_loop(std::stop_token stop_token) {
+  while (!stop_token.stop_requested()) {
+    {
+      std::unique_lock lock(native_control_wait_mutex_);
+      native_control_cv_.wait_for(lock, std::chrono::milliseconds(250));
+    }
+    if (stop_token.stop_requested()) break;
+    bool renewal_due = false;
+    std::string renewal_session;
+    std::uint64_t renewal_generation = 0;
+    {
+      std::lock_guard lock(mutex_);
+      renewal_due = !session_id_.empty() && !control_token_.empty() &&
+          control_token_renew_at_ms_ <= clock_.now_ms();
+      renewal_session = session_id_;
+      renewal_generation = control_session_generation_;
+    }
+    if (!renewal_due) continue;
+    try {
+      static_cast<void>(renew_control_authority());
+    } catch (const std::exception& error) {
+      note_native_control_failure(
+          std::string("control authority renewal failed: ") + error.what(),
+          renewal_session,
+          renewal_generation);
+    }
+  }
 }
 
 void DriverConsoleRuntime::append_websocket_messages(const Json& envelope) {
@@ -3478,6 +4457,7 @@ Json DriverConsoleRuntime::renew_control_authority() {
   } catch (const HttpStatusError& error) {
     if (error.status() == 401 || error.status() == 403 || error.status() == 404 || error.status() == 409) {
       close_signaling_websocket();
+      reset_native_control_state();
       std::lock_guard lock(mutex_);
       if (session_id_ == session) {
         session_id_.clear();
@@ -3526,6 +4506,7 @@ Json DriverConsoleRuntime::login_locked(std::string_view password) {
       result["authenticated"] = true;
       return result;
     } catch (const std::exception&) {
+      reset_native_control_state();
       std::lock_guard lock(mutex_);
       driver_token_.clear();
       driver_token_expires_at_ms_ = 0;
@@ -3614,6 +4595,7 @@ Json DriverConsoleRuntime::vehicles() {
     }
 
     close_signaling_websocket();
+    reset_native_control_state();
     {
       std::lock_guard lock(mutex_);
       driver_token_.clear();
@@ -3709,6 +4691,8 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       }
       if (session_is_active) {
         connect_signaling_websocket(current_session, current_token);
+        static_cast<void>(
+            connect_control_signaling_websocket(current_session, current_token));
         std::lock_guard lock(mutex_);
         return {
             {"runtime", "cpp"},
@@ -3716,6 +4700,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
             {"vehicle_id", vehicle_id_},
             {"connected", true},
             {"session_id", session_id_},
+            {"control_session_generation", control_session_generation_},
             {"connected_at_ms", connected_at_ms_},
             {"time_sync", clock_.status().to_json()},
         };
@@ -3726,6 +4711,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       static_cast<void>(end_session("driver_vehicle_switch"));
     }
     if (current_vehicle == target) {
+      reset_native_control_state();
       std::lock_guard lock(mutex_);
       session_id_.clear();
       control_token_.clear();
@@ -3738,6 +4724,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
   }
 
   if (!target_validated) validate_target();
+  reset_native_control_state();
   const auto session = http_.post_json_response(
       signaling_http_url_ + "/sessions",
       {{"driver_id", config_.driver_id}, {"vehicle_id", target}, {"token", current_token}});
@@ -3748,24 +4735,41 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
   if (control_token_expires_at_ms <= connected_at_ms) {
     throw std::runtime_error("new control authority lease is already expired");
   }
+  std::uint64_t control_session_generation = 0;
   {
-    std::lock_guard lock(mutex_);
-    vehicle_id_ = target;
-    session_id_ = session_id;
-    control_token_ = control_token;
-    control_token_expires_at_ms_ = control_token_expires_at_ms;
-    control_token_renew_at_ms_ = control_lease_renew_at(connected_at_ms, control_token_expires_at_ms);
-    sequence_ = 0;
-    reset_control_profile_locked();
-    connected_at_ms_ = connected_at_ms;
+    std::lock_guard update_lock(native_control_update_mutex_);
+    {
+      std::lock_guard lock(mutex_);
+      vehicle_id_ = target;
+      session_id_ = session_id;
+      control_token_ = control_token;
+      control_token_expires_at_ms_ = control_token_expires_at_ms;
+      control_token_renew_at_ms_ = control_lease_renew_at(connected_at_ms, control_token_expires_at_ms);
+      sequence_ = 0;
+      control_sequence_ = 0;
+      control_session_generation = ++control_session_generation_;
+      reset_control_profile_locked();
+      connected_at_ms_ = connected_at_ms;
+    }
+    const auto bootstrap = native_control_intent_.update(
+        NativeControlIntent{
+            "native-session-bootstrap", 1, "N", 0.0, 0.0, 0.0, false},
+        monotonic_now_ms());
+    if (!bootstrap.accepted) {
+      throw std::runtime_error("native control bootstrap intent was rejected");
+    }
   }
+  native_control_cv_.notify_all();
   try {
     connect_signaling_websocket(session_id, current_token);
+    static_cast<void>(
+        connect_control_signaling_websocket(session_id, current_token));
   } catch (...) {
     const auto failure = std::current_exception();
     try {
       static_cast<void>(end_session("signaling_websocket_connect_failed"));
     } catch (const std::exception&) {
+      reset_native_control_state();
       std::lock_guard lock(mutex_);
       if (session_id_ == session_id) {
         session_id_.clear();
@@ -3790,6 +4794,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       {"vehicle_id", target},
       {"connected", true},
       {"session_id", session_id},
+      {"control_session_generation", control_session_generation},
       {"connected_at_ms", connected_at_ms},
       {"time_sync", clock_.status().to_json()},
   };
@@ -3804,6 +4809,7 @@ Json DriverConsoleRuntime::end_session(std::string_view reason) {
     session = session_id_;
   }
   if (session.empty()) {
+    reset_native_control_state();
     std::lock_guard lock(mutex_);
     reset_control_profile_locked();
     return {{"driver_id", config_.driver_id}, {"connected", false}, {"session_id", ""}};
@@ -3813,6 +4819,7 @@ Json DriverConsoleRuntime::end_session(std::string_view reason) {
       signaling_http_url_ + "/sessions/" + http_.url_encode(session) + "/end",
       {{"actor", config_.driver_id}, {"token", token}, {"reason", std::string(reason)}});
   close_signaling_websocket();
+  reset_native_control_state();
   {
     std::lock_guard lock(mutex_);
     if (session_id_ == session) {
@@ -3841,6 +4848,7 @@ Json DriverConsoleRuntime::disconnect(std::string_view reason) {
   }
   if (token.empty()) {
     close_signaling_websocket();
+    reset_native_control_state();
     std::lock_guard lock(mutex_);
     session_id_.clear();
     control_token_.clear();
@@ -3856,6 +4864,7 @@ Json DriverConsoleRuntime::disconnect(std::string_view reason) {
       signaling_http_url_ + "/auth/driver_logout",
       {{"driver_id", config_.driver_id}, {"token", token}, {"reason", std::string(reason)}});
   close_signaling_websocket();
+  reset_native_control_state();
   {
     std::lock_guard lock(mutex_);
     if (driver_token_ == token) {
@@ -3931,6 +4940,7 @@ Json DriverConsoleRuntime::poll_signaling() {
           error.what());
     }
     if (!session_is_active) {
+      reset_native_control_state();
       {
         std::lock_guard lock(mutex_);
         signaling_available_ = true;
@@ -4046,6 +5056,7 @@ Json DriverConsoleRuntime::send_signaling_message(std::string_view type, const J
             authority_error.what());
       }
       if (!session_is_active) {
+        reset_native_control_state();
         {
           std::lock_guard lock(mutex_);
           if (session_id_ == session) {
@@ -4373,41 +5384,59 @@ Json DriverConsoleRuntime::set_control_limits(const Json&) {
 }
 
 Json DriverConsoleRuntime::send_control(const Json& input) {
-  std::string session;
-  std::string control_token;
-  std::string vehicle;
-  std::uint64_t sequence = 0;
-  {
-    std::lock_guard lock(mutex_);
-    if (session_id_.empty() || driver_token_.empty() || control_token_.empty()) throw std::runtime_error("driver console is not connected");
-    session = session_id_;
-    control_token = control_token_;
-    vehicle = vehicle_id_;
-    sequence = ++sequence_;
+  static_cast<void>(input);
+  throw std::runtime_error(
+      "legacy browser control packet preparation is retired; use /api/control-intent");
+}
+
+Json DriverConsoleRuntime::update_control_intent(const Json& input) {
+  if (!input.is_object()) throw std::invalid_argument("control intent must be an object");
+  const auto expected_session_id = required_string(input, "session_id");
+  const auto expected_session_generation = required_uint64(input, "session_generation");
+  NativeControlIntent intent;
+  intent.ui_instance_id = required_string(input, "ui_instance_id");
+  intent.intent_seq = required_uint64(input, "intent_seq");
+  intent.gear = required_string(input, "gear");
+  try {
+    intent.steering = input.at("steering").get<double>();
+    intent.throttle = input.at("throttle").get<double>();
+    intent.brake = input.at("brake").get<double>();
+    intent.estop = input.value("estop", false);
+  } catch (const Json::exception& error) {
+    throw std::invalid_argument(std::string("invalid control intent: ") + error.what());
   }
-  ControlCommand command;
-  command.vehicle_id = vehicle;
-  command.driver_id = config_.driver_id;
-  command.session_id = session;
-  command.seq = sequence;
-  command.sent_at_utc_ms = clock_.now_ms();
-  command.gear = input.value("gear", "N");
-  command.steering = input.value("steering", 0.0);
-  command.throttle = input.value("throttle", 0.0);
-  command.brake = input.value("brake", 0.0);
-  command.estop = input.value("estop", false);
-  command.control_token = control_token;
-  command.validate();
+  intent.validate();
+  NativeControlIntentUpdate result;
   {
-    std::lock_guard lock(mutex_);
-    last_control_prepared_at_utc_ms_ = command.sent_at_utc_ms;
-    ++control_commands_prepared_total_;
+    std::lock_guard update_lock(native_control_update_mutex_);
+    {
+      std::lock_guard lock(mutex_);
+      if (session_id_.empty() || driver_token_.empty() || control_token_.empty()) {
+        throw std::runtime_error("driver console is not connected");
+      }
+      if (session_id_ != expected_session_id ||
+          control_session_generation_ != expected_session_generation) {
+        throw std::runtime_error(
+            "control intent belongs to a stale or different native control session");
+      }
+    }
+    result = native_control_intent_.update(intent, monotonic_now_ms());
+  }
+  if (result.accepted && intent.estop) {
+    native_control_estop_wakeup_.store(true);
+    native_control_cv_.notify_all();
   }
   return {
-      {"prepared", true},
-      {"transport", "webrtc_data_channel"},
-      {"delivery_state", "browser_data_channel_pending"},
-      {"command", command.to_json()},
+      {"accepted", result.accepted},
+      {"duplicate", result.duplicate},
+      {"requires_fresh_input", result.requires_fresh_input},
+      {"reason", result.reason},
+      {"intent_seq", intent.intent_seq},
+      {"session_id", expected_session_id},
+      {"session_generation", expected_session_generation},
+      {"lease_ms", native_control_intent_.lease_ms()},
+      {"transport", "native_signaling_websocket"},
+      {"delivery_state", "native_periodic_sender_owned"},
   };
 }
 
@@ -4445,6 +5474,28 @@ Json DriverConsoleRuntime::status() {
     delivery_cursor = signaling_delivery_cursor_;
     pending_deliveries = pending_websocket_messages_.size();
   }
+  bool native_control_websocket_connected = false;
+  std::uint64_t native_control_last_ack_seq = 0;
+  std::int64_t native_control_next_connect_monotonic_ms = 0;
+  std::int64_t native_control_unacknowledged_age_ms = 0;
+  int native_control_reconnect_delay_ms = 0;
+  {
+    std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
+    native_control_websocket_connected =
+        control_signaling_websocket_ && control_signaling_websocket_->connected();
+    native_control_last_ack_seq = control_signaling_last_ack_seq_;
+    native_control_next_connect_monotonic_ms =
+        control_signaling_next_connect_monotonic_ms_;
+    native_control_unacknowledged_age_ms =
+        control_signaling_ack_window_.oldest_age_ms(monotonic_now_ms());
+    native_control_reconnect_delay_ms = control_signaling_reconnect_delay_ms_;
+  }
+  const auto native_sample = native_control_intent_.sample(monotonic_now_ms());
+  std::string native_control_last_error;
+  {
+    std::lock_guard status_lock(native_control_status_mutex_);
+    native_control_last_error = native_control_last_error_;
+  }
   std::lock_guard lock(mutex_);
   return {
       {"runtime", "cpp"},
@@ -4457,6 +5508,7 @@ Json DriverConsoleRuntime::status() {
       {"signaling_available", signaling_available_},
       {"connected", !session_id_.empty()},
       {"session_id", session_id_},
+      {"control_session_generation", control_session_generation_},
       {"control_token_expires_at_utc_ms", control_token_expires_at_ms_},
       {"sequence", sequence_},
       {"connected_at_ms", connected_at_ms_},
@@ -4467,11 +5519,69 @@ Json DriverConsoleRuntime::status() {
       {"signaling_websocket_reconnects", websocket_reconnects},
       {"signaling_delivery_cursor", delivery_cursor},
       {"pending_signaling_deliveries", pending_deliveries},
+      {"native_control",
+       {{"transport", "native_signaling_websocket"},
+        {"session_generation", control_session_generation_},
+        {"rate_hz", config_.rate_hz},
+        {"intent_lease_ms", native_control_intent_.lease_ms()},
+        {"intent_active", native_sample.active},
+        {"intent_fresh", native_sample.fresh},
+        {"requires_fresh_input", native_sample.requires_fresh_input},
+        {"effective_intent_seq", native_sample.intent.intent_seq},
+        {"effective_gear", native_sample.intent.gear},
+        {"effective_steering", native_sample.intent.steering},
+        {"effective_throttle", native_sample.intent.throttle},
+        {"effective_brake", native_sample.intent.brake},
+        {"effective_estop", native_sample.intent.estop},
+        {"websocket_connected", native_control_websocket_connected},
+        {"next_connect_in_ms",
+         std::max<std::int64_t>(
+             0,
+             native_control_next_connect_monotonic_ms - monotonic_now_ms())},
+        {"reconnect_delay_ms", native_control_reconnect_delay_ms},
+        {"commands_sent_total", native_control_commands_sent_.load()},
+        {"send_failures_total", native_control_send_failures_.load()},
+        {"last_sent_at_utc_ms", native_control_last_sent_at_utc_ms_.load()},
+        {"last_sent_monotonic_ms", native_control_last_sent_monotonic_ms_.load()},
+        {"last_gap_ms", native_control_last_gap_ms_.load()},
+        {"max_gap_ms", native_control_max_gap_ms_.load()},
+        {"last_seq", native_control_last_seq_.load()},
+        {"last_ack_seq", native_control_last_ack_seq},
+        {"unacknowledged_age_ms", native_control_unacknowledged_age_ms},
+        {"last_ack_received_at_utc_ms",
+         native_control_last_ack_received_at_utc_ms_.load()},
+        {"last_ack_cloud_received_at_utc_ms",
+         native_control_last_ack_cloud_received_at_utc_ms_.load()},
+        {"last_error", native_control_last_error}}},
       {"time_sync", clock_.status().to_json()},
       {"webrtc_metrics", webrtc_metrics_},
       {"last_signaling_messages", signaling_messages_},
       {"authorized_vehicles", authorized_vehicles_},
   };
+}
+
+void DriverConsoleRuntime::append_driver_log_record(const Json& record) const {
+  if (config_.browser_event_log_path.empty()) return;
+  const auto line = record.dump() + "\n";
+  if (line.size() > config_.browser_event_log_max_bytes) {
+    throw std::invalid_argument("driver event exceeds configured log size");
+  }
+  std::lock_guard log_lock(browser_event_log_mutex_);
+  const auto parent = config_.browser_event_log_path.parent_path();
+  std::error_code error;
+  if (!parent.empty()) {
+    std::filesystem::create_directories(parent, error);
+    if (error) throw std::runtime_error("cannot create browser event log directory: " + error.message());
+  }
+  rotate_jsonl_log(
+      config_.browser_event_log_path,
+      config_.browser_event_log_max_bytes,
+      config_.browser_event_log_files,
+      line.size());
+  std::ofstream output(config_.browser_event_log_path, std::ios::app);
+  if (!output) throw std::runtime_error("cannot append browser event log");
+  output << line;
+  if (!output) throw std::runtime_error("cannot flush browser event log");
 }
 
 Json DriverConsoleRuntime::record_browser_event(const Json& input) {
@@ -4518,26 +5628,7 @@ Json DriverConsoleRuntime::record_browser_event(const Json& input) {
       {"details", details},
   };
   if (config_.browser_event_log_path.empty()) return {{"recorded", false}, {"event", event}};
-  const auto line = record.dump() + "\n";
-  if (line.size() > config_.browser_event_log_max_bytes) {
-    throw std::invalid_argument("browser event exceeds configured log size");
-  }
-  std::lock_guard log_lock(browser_event_log_mutex_);
-  const auto parent = config_.browser_event_log_path.parent_path();
-  std::error_code error;
-  if (!parent.empty()) {
-    std::filesystem::create_directories(parent, error);
-    if (error) throw std::runtime_error("cannot create browser event log directory: " + error.message());
-  }
-  rotate_jsonl_log(
-      config_.browser_event_log_path,
-      config_.browser_event_log_max_bytes,
-      config_.browser_event_log_files,
-      line.size());
-  std::ofstream output(config_.browser_event_log_path, std::ios::app);
-  if (!output) throw std::runtime_error("cannot append browser event log");
-  output << line;
-  if (!output) throw std::runtime_error("cannot flush browser event log");
+  append_driver_log_record(record);
   return {{"recorded", true}, {"event", event}};
 }
 
@@ -4586,14 +5677,19 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
           {{"error", "legacy control-limit mutation is retired; use /api/control-profile"}});
     }
     if (request.method == "POST" && request.path == "/api/control-profile") return ServerResponse::json(200, runtime_->prepare_control_profile(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/control") return ServerResponse::json(200, runtime_->send_control(request.json_body()));
+    if (request.method == "POST" && request.path == "/api/control-intent") return ServerResponse::json(200, runtime_->update_control_intent(request.json_body()));
+    if (request.method == "POST" && request.path == "/api/control") {
+      return ServerResponse::json(
+          410,
+          {{"error", "legacy browser control packet endpoint is retired; use /api/control-intent"}});
+    }
     if (request.method == "POST" &&
         (request.path == "/api/control/keyboard" ||
          request.path == "/api/control/gamepad")) {
       return ServerResponse::json(
           410,
           {{"error",
-            "legacy specialized control endpoint is retired; use /api/control with an acknowledged session profile"}});
+            "legacy specialized control endpoint is retired; use /api/control-intent"}});
     }
     return ServerResponse::json(404, {{"error", "not found"}});
   } catch (const HttpStatusError& error) {

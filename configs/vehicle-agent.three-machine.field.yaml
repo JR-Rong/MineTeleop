@@ -14,7 +14,7 @@ cloud:
 runtime:
   control_enabled: true
   media_enabled: true
-  control_log_commands: false
+  control_log_commands: true
   teleop_poll_interval_ms: 500
   media_frame_timeout_ms: 3000
   media_capture_interval_ms: 0

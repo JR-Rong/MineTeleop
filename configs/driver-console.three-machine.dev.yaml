@@ -10,8 +10,9 @@ cloud:
 
 logging:
   browser_event_log: ../.local/logs/control-browser-events.jsonl
-  browser_event_log_max_bytes: 2097152
-  browser_event_log_files: 3
+  browser_event_log_max_bytes: 16777216
+  browser_event_log_files: 4
+  control_trace_commands: true
 
 ui:
   default_layout: grid_4

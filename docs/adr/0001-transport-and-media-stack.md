@@ -21,8 +21,10 @@ Accepted and implemented for the media path.
 车端使用进程内 GStreamer `webrtcbin`，浏览器使用原生 WebRTC 连续解码；不再
 通过逐帧 JSON/Base64/HTTP 传输，也不启动 FFmpeg 录制进程。
 
-控制命令暂时继续使用独立的已认证信令队列，以 20 Hz 发送完整状态并通过 `seq`
-去重；本 ADR 本次落地范围不宣称控制 DataChannel 已实现。
+普通控制命令使用独立的已认证原生 WSS：控制端以 20 Hz 发送完整状态，signaling
+只保留容量 1、TTL 150 ms 的 latest-only mailbox，车端通过 control-only WSS 接收并
+按 `seq` 去重。WebRTC DataChannel 已用于 session profile、VCU 握手和状态，但不承载
+普通控制命令。
 
 ## Rationale
 

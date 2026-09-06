@@ -285,17 +285,35 @@ four-timestamp samples, select the lowest-RTT samples, report offset/RTT/
 uncertainty, and refresh every 30 seconds. With `require_time_sync: true`, the
 vehicle refuses remote operation when uncertainty exceeds
 `max_time_sync_uncertainty_ms`; no host NTP package is required for relative
-latency measurements. The browser sends the current control state at 20 Hz;
-non-emergency commands older than `max_command_gap_ms` (or too far in the
+latency measurements. The browser only submits its latest input intent to the
+loopback control process; it does not schedule vehicle commands or send them
+over the WebRTC DataChannel. A native sender samples that intent at 20 Hz and
+sends `ControlCommand` messages over a dedicated WSS connection. The signaling
+server keeps one latest command per active route with a 150 ms TTL, and the
+vehicle receives that mailbox through a separate native, control-only WSS. A
+dedicated 50 ms vehicle watchdog thread is independent of WSS and media waits.
+Non-emergency commands older than `max_command_gap_ms` (or too far in the
 future) are rejected in the shared time domain, while emergency stop remains
 available regardless of command age.
+
+Browser focus loss, page hiding, or renderer freezing lets the native input
+lease expire. The native sender then continues at 20 Hz with steering,
+throttle, and brake neutralized while preserving the selected gear, and marks
+the packet's intent as stale. The vehicle accepts only that exact-zero stale
+command as a safe native-link heartbeat and discards any stale non-zero
+actuation. This keeps a hidden or frozen browser from creating a false packet
+gap while the vehicle watchdog still detects a real native-process or WSS
+outage. Cached actuation cannot resume until a fresh neutral intent re-arms
+input. The WebRTC DataChannel remains the fail-closed session-profile and VCU
+handshake gate and carries status, but is not the ordinary control-command
+transport.
 
 An active driver session renews its short control-authority lease through the
 loopback runtime before one third of the remaining TTL elapses. Renewal is
 authenticated with the current driver token, preserves the existing session
 and DataChannel control token, and is audited without logging either token.
-If browser/runtime refreshes stop, the signaling server still expires and
-clears the authority at the last issued deadline.
+If native runtime renewal stops, the signaling server still expires and clears
+the authority at the last issued deadline.
 
 ## Development control plane
 

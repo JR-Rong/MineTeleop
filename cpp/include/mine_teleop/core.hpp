@@ -82,6 +82,60 @@ struct ControlCommand {
   static ControlCommand from_json(const Json& value);
 };
 
+struct NativeControlIntent {
+  std::string ui_instance_id;
+  std::uint64_t intent_seq{0};
+  std::string gear{"N"};
+  double steering{0.0};
+  double throttle{0.0};
+  double brake{0.0};
+  bool estop{false};
+
+  void validate() const;
+  [[nodiscard]] bool is_neutral() const;
+  bool operator==(const NativeControlIntent&) const = default;
+};
+
+struct NativeControlIntentUpdate {
+  bool accepted{false};
+  bool duplicate{false};
+  bool requires_fresh_input{true};
+  std::string reason;
+};
+
+struct NativeControlIntentSample {
+  bool active{false};
+  bool fresh{false};
+  bool requires_fresh_input{true};
+  NativeControlIntent intent;
+};
+
+// Holds only the latest browser input intent. The native sender samples this
+// state at its own fixed cadence; browser timing never schedules a vehicle
+// command. Expired or transport-invalidated non-neutral input is fail-closed
+// until a fresh neutral input is observed.
+class NativeControlIntentStore {
+ public:
+  explicit NativeControlIntentStore(int lease_ms);
+
+  NativeControlIntentUpdate update(
+      NativeControlIntent intent,
+      std::int64_t received_at_monotonic_ms);
+  [[nodiscard]] NativeControlIntentSample sample(std::int64_t now_monotonic_ms);
+  void invalidate();
+  void reset();
+
+  [[nodiscard]] int lease_ms() const { return lease_ms_; }
+
+ private:
+  int lease_ms_;
+  mutable std::mutex mutex_;
+  std::optional<NativeControlIntent> latest_;
+  std::int64_t received_at_monotonic_ms_{0};
+  bool requires_fresh_input_{true};
+  bool estop_latched_{false};
+};
+
 struct SessionControlProfile {
   int profile_version{kSessionControlProfileVersion};
   double target_speed_kph{0.0};
@@ -752,6 +806,7 @@ class VehicleControlService {
 
  private:
   [[nodiscard]] bool refresh_adapter_safe_stop_state() noexcept;
+  void evaluate_control_watchdog(std::int64_t now_ms);
   void clear_session_profile() noexcept;
   [[nodiscard]] SessionControlProfileResult profile_result(
       const SessionControlProfileRequest& request,

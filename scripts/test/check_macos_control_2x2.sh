@@ -197,6 +197,8 @@ post_json "$control_two_origin/api/connect" '{"vehicle_id":"vehicle-002"}' "$run
 
 session_one="$(jq -er '.session_id' "$runtime_dir/session-one.json")"
 session_two="$(jq -er '.session_id' "$runtime_dir/session-two.json")"
+session_generation_one="$(jq -er '.control_session_generation' "$runtime_dir/session-one.json")"
+session_generation_two="$(jq -er '.control_session_generation' "$runtime_dir/session-two.json")"
 [[ -n "$session_one" && -n "$session_two" && "$session_one" != "$session_two" ]] || \
   fail 'simultaneous sessions were not independent'
 
@@ -209,20 +211,38 @@ wait_for_status "$control_two_origin/api/status" "$runtime_dir/status-two.json" 
 wait_for_status "$server_origin/health" "$runtime_dir/health-active.json" \
   '.online_vehicles == 2 and .online_drivers == 2 and .active_sessions == 2'
 
-post_json "$control_one_origin/api/control" \
-  '{"gear":"N","steering":-0.25,"throttle":0.1,"brake":0.0}' \
+post_json "$control_one_origin/api/control-intent" \
+  "$(jq -nc --arg session "$session_one" --argjson generation "$session_generation_one" \
+    '{session_id:$session,session_generation:$generation,ui_instance_id:"mac-2x2-one",intent_seq:1,gear:"N",steering:0,throttle:0,brake:0,estop:false}')" \
+  "$runtime_dir/control-one-neutral.json"
+post_json "$control_two_origin/api/control-intent" \
+  "$(jq -nc --arg session "$session_two" --argjson generation "$session_generation_two" \
+    '{session_id:$session,session_generation:$generation,ui_instance_id:"mac-2x2-two",intent_seq:1,gear:"N",steering:0,throttle:0,brake:0,estop:false}')" \
+  "$runtime_dir/control-two-neutral.json"
+post_json "$control_one_origin/api/control-intent" \
+  "$(jq -nc --arg session "$session_one" --argjson generation "$session_generation_one" \
+    '{session_id:$session,session_generation:$generation,ui_instance_id:"mac-2x2-one",intent_seq:2,gear:"N",steering:-0.25,throttle:0.1,brake:0,estop:false}')" \
   "$runtime_dir/control-one.json"
-post_json "$control_two_origin/api/control" \
-  '{"gear":"N","steering":0.25,"throttle":0.2,"brake":0.0}' \
+post_json "$control_two_origin/api/control-intent" \
+  "$(jq -nc --arg session "$session_two" --argjson generation "$session_generation_two" \
+    '{session_id:$session,session_generation:$generation,ui_instance_id:"mac-2x2-two",intent_seq:2,gear:"N",steering:0.25,throttle:0.2,brake:0,estop:false}')" \
   "$runtime_dir/control-two.json"
-jq -e --arg session "$session_one" \
-  '.command.vehicle_id == "vehicle-001" and .command.driver_id == "driver-console-001" and .command.session_id == $session and .command.seq == 1' \
-  "$runtime_dir/control-one.json" >/dev/null || fail 'driver one control command crossed identities'
-jq -e --arg session "$session_two" \
-  '.command.vehicle_id == "vehicle-002" and .command.driver_id == "driver-console-002" and .command.session_id == $session and .command.seq == 1' \
-  "$runtime_dir/control-two.json" >/dev/null || fail 'driver two control command crossed identities'
-control_token_one="$(jq -er '.command.control_token' "$runtime_dir/control-one.json")"
-control_token_two="$(jq -er '.command.control_token' "$runtime_dir/control-two.json")"
+jq -e '.accepted and .transport == "native_signaling_websocket"' \
+  "$runtime_dir/control-one.json" >/dev/null || fail 'driver one native intent was not accepted'
+jq -e '.accepted and .transport == "native_signaling_websocket"' \
+  "$runtime_dir/control-two.json" >/dev/null || fail 'driver two native intent was not accepted'
+wait_for_status \
+  "$server_origin/signaling/$session_one/messages?recipient=vehicle-001&device_token=$vehicle_one_token&connection_generation=$vehicle_one_generation&types=control_command" \
+  "$runtime_dir/control-one-delivery.json" \
+  --arg session "$session_one" \
+  '.messages | length == 1 and .[0].type == "control_command" and .[0].payload.vehicle_id == "vehicle-001" and .[0].payload.driver_id == "driver-console-001" and .[0].payload.session_id == $session and .[0].payload.intent_seq == 2 and .[0].payload.intent_fresh'
+wait_for_status \
+  "$server_origin/signaling/$session_two/messages?recipient=vehicle-002&device_token=$vehicle_two_token&connection_generation=$vehicle_two_generation&types=control_command" \
+  "$runtime_dir/control-two-delivery.json" \
+  --arg session "$session_two" \
+  '.messages | length == 1 and .[0].type == "control_command" and .[0].payload.vehicle_id == "vehicle-002" and .[0].payload.driver_id == "driver-console-002" and .[0].payload.session_id == $session and .[0].payload.intent_seq == 2 and .[0].payload.intent_fresh'
+control_token_one="$(jq -er '.messages[0].payload.control_token' "$runtime_dir/control-one-delivery.json")"
+control_token_two="$(jq -er '.messages[0].payload.control_token' "$runtime_dir/control-two-delivery.json")"
 [[ "$control_token_one" != "$control_token_two" ]] || fail 'independent sessions shared a control token'
 
 rejection_one_status="$(curl -sS -o "$runtime_dir/rejection-one.json" -w '%{http_code}' \

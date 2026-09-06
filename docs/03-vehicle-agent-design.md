@@ -1,6 +1,8 @@
 # 车端 Agent 设计
 
-> 迁移说明：本文保留旧实现的设计背景；当前可执行入口与命令以根目录 `README.md` 中的 Ubuntu 22.04 原生 C++ 运行时为准。
+> 迁移说明：本文保留部分旧实现的设计背景；当前可执行入口与命令以根目录
+> `README.md` 中的 Ubuntu 22.04 原生 C++ 运行时为准，当前控制传输以
+> `02-system-architecture.md` 和 `07-control-and-safety.md` 为准。
 
 ## 职责
 
@@ -107,7 +109,8 @@ Camera Source
 
 ### Control Receiver
 
-负责接收驾驶端控制命令。
+通过独立 control-only WSS 接收驾驶端原生进程发送的控制命令。浏览器 WebRTC
+DataChannel 只提供 session profile、VCU 握手和状态门禁，不承载普通控制命令。
 
 处理步骤：
 
@@ -115,9 +118,13 @@ Camera Source
 2. 校验会话 ID。
 3. 校验控制权。
 4. 校验序号是否新于最近命令。
-5. 使用车端本地接收时间更新控制心跳，并基于到达间隔判断命令是否过旧。
-6. 将驾驶端时间戳保留用于审计和延迟估算，不直接用跨机器时钟差做安全判定。
-7. 将命令交给 Safety State Machine。
+5. 校验 `intent_seq` 和 `intent_fresh`；stale 非零输入严格丢弃。
+6. 使用车端本地接收时间更新控制心跳，并基于到达间隔判断命令是否过旧。
+7. 只有在 `CONTROL_ACTIVE`、profile/握手有效、原生包间隔未达到 degraded 门限且
+   挡位等于最后新鲜已接受挡位时，精确零执行量的 stale 包才可维持看门狗；它不能
+   建立或恢复控制。
+8. 将驾驶端时间戳保留用于审计和延迟估算，不直接用跨机器时钟差做安全判定。
+9. 将命令交给 Safety State Machine。
 
 ### Safety State Machine
 
@@ -259,10 +266,12 @@ video/metadata 两类凭证后恢复上传队列；已在队列中的片段不�
 4. 完成时间同步并注册到云端信令。
 5. 进入待命状态，等待有效驾驶会话。
 6. 会话建立后初始化相机和媒体 pipeline，先启动实时视频。
-7. 创建控制 DataChannel，但在关键相机尚无首个编码帧时不启动车辆适配器。
-8. 控制 DataChannel 已打开且所有关键相机均已实际编码出帧后，才初始化车辆适配器。
-9. 驾驶员随后显式完成 VCU 握手，控制才可进入 Ready。
-10. 根据配置启动录像和上传队列。
+7. 启动独立 control-only WSS 接收线程与 50 ms watchdog，并创建只承载
+   profile/VCU/status 的 DataChannel；关键相机尚无首个编码帧时不启动车辆适配器。
+8. DataChannel 已打开且所有关键相机均已实际编码出帧后，才初始化车辆适配器。
+9. 驾驶员随后显式完成 profile 确认和 VCU 握手，控制才可进入 Ready。
+10. 原生控制命令通过 control-only WSS 到达；普通 DataChannel 命令一律拒绝。
+11. 根据配置启动录像和上传队列。
 
 本地参考实现提供只读 `VehiclePreflightChecker`：启动前检查启用相机设备、
 录像目录写权限和指定硬编设备节点，输出每项 `ready`、`missing`、
@@ -281,10 +290,12 @@ systemd `ExecStartPre` 或部署脚本阻止带缺失设备的真实车端启动
 - 每路实时 `appsrc` 和下游 queue 均使用 2 帧有界丢旧，录像 tee 也使用约 2 秒的
   有界丢旧 queue，禁止让实时控制画面被慢磁盘反压。
 - 采集源按该相机的 `reopen_attempts` / `reopen_backoff_ms` 只重开故障 lane。
-- 关键相机首个已确认故障立即安全停车、锁止控制并关闭当前控制 DataChannel。
+- 关键相机首个已确认故障立即安全停车、锁止控制并关闭当前 profile/VCU/status
+  DataChannel；同一 session 的 control-only WSS 命令也继续被控制锁存拒绝。
   相机重新出帧只恢复视频；控制锁存保存在媒体 service loop，因而同一云端 session
   内重建 `VehicleMediaRuntime` 也不会解除锁存。必须结束当前
-  session，并在新 session 中建立新的控制 DataChannel、重新完成 VCU 握手后才能
+  session，并在新 session 中建立新的 DataChannel 和 control-only WSS、重新完成 VCU
+  握手后才能
   恢复驾驶权限。这样不会让故障前排队帧或多关键相机的交错恢复自动重新授权控制。
 - V4L2 设备节点暂时不存在（包括 USB 拔插或 udev 重建）仍属于有界重试范围；
   永久路径错误应由启动 preflight 报告，运行期不以一次 `exists()` 结果永久禁用 lane。
@@ -309,9 +320,11 @@ systemd `ExecStartPre` 或部署脚本阻止带缺失设备的真实车端启动
 - `session_not_active`：结束当前媒体会话并等待新的有效权限。
 - `signaling_sequence_older` / `signaling_sequence_reused` 或过期 connection
   generation：fail-closed，不得当作 session 已结束而循环重建。
-- 控制 DataChannel 关闭：立即安全停车；共享 WebRTC/GStreamer 故障结束当前
-  encoder candidate，再由候选/媒体 service loop 决定是否重建。
-- 控制心跳超时：立即安全停车。
+- profile/VCU/status DataChannel 关闭：立即撤销驾驶权限并安全停车；共享
+  WebRTC/GStreamer 故障结束当前 encoder candidate，再由候选/媒体 service loop
+  决定是否重建。
+- 原生 control-only WSS 断流或进程停发：由独立 watchdog 按 degraded/control timeout
+  执行本地安全停车；stale 零值输入不能掩盖已经发生的真实包间隔。
 
 媒体 service loop 把 signaling sequence cursor 和关键相机控制锁存都保存在
 `VehicleMediaRuntime` 生命周期之外；同一 `(connection_generation, session_id)` 内的

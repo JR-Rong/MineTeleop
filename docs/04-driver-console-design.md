@@ -16,9 +16,11 @@ Driver Console 运行在远端模拟驾驶器上，负责：
 ## 应用形态
 
 当前实现采用便携 C++20 本地进程与系统浏览器组合：C++ 进程只监听
-`127.0.0.1`，保存登录/会话/token、连接服务器并给控制命令补齐协议元数据；
-浏览器负责 WebRTC 解码、DataChannel、键盘和标准 Gamepad API。平台差异仅保留
-默认浏览器启动、动态库和文件路径适配。
+`127.0.0.1`，保存登录/会话/token、维护最新输入租约，并以固定 20 Hz 通过独立
+控制 WSS 生成和发送完整控制命令；浏览器负责 WebRTC 解码、键盘和标准 Gamepad
+API，并通过 DataChannel 交换 session profile、VCU 握手和状态。浏览器不生成或
+经 DataChannel 发送普通 `control_command`。平台差异仅保留默认浏览器启动、动态库
+和文件路径适配。
 
 这个形态让 macOS、Windows 和 Ubuntu 共享同一套核心与页面，同时不把长期设备
 凭证或 TURN 密钥放进浏览器。特殊方向盘、踏板和档位器如果不能通过标准 Gamepad
@@ -57,17 +59,20 @@ API 表达，应放到独立平台适配器中，不能侵入会话或协议核�
 注意：
 
 - 键盘控制必须有回中/回零策略。
-- 失去窗口焦点时应继续按固定周期发送安全控制心跳，但主动目标车速比例必须置 0，并按配置进入滑行、限速或渐进制动策略；不应主动停发来制造超时急刹。
+- 失去窗口焦点或页面隐藏时，浏览器应立即向本机进程提交零执行量意图；即使浏览器
+  随后被冻结，原生发送线程也继续固定周期的安全心跳，不应以网页停发制造超时急刹。
 - 急停取键盘、页面按钮和 Gamepad 的并集，始终最高优先级。
 - 键盘离散输入覆盖同一时刻的 Gamepad 连续量；相反方向同时按下时输出归零。
 - 急刹优先于缓刹；任一刹车输入存在时目标车速比例输出为 0，转向输入保持独立。
 - 前进/倒车键选择的 `D`/`R` 在当前控制会话内锁存；松开按键只将目标车速比例归零，普通刹车不得把挡位切回 `N`。
 - 任何新的 `D`/`R` 选择（包括 `N`/`P`→`D`/`R` 以及 `D`↔`R`）都必须有 VCU 有效且绝对值不大于 `0.1 m/s` 的零速反馈；唯一例外是明确不支持 VCU 握手的 mock。键盘和 Gamepad 必须调用同一挡位 reducer；门禁未满足时目标车速比例保持 0，并提示驾驶员停车后释放、重新操作。
 - 多个物理键映射到同一方向时必须按键码集合派生状态；例如同时按住 `ArrowUp` 和 `W`，释放其中一个不能清除前进状态。
-- 首次获得 VCU Ready 前不得记录运动按键；只有当前会话曾经 Ready 后的 `wait_gear` / `wait_actuator_modes` 闭环等待才保留按键集合，并继续按 20 Hz 发送目标车速比例强制为 0 的完整安全快照。
+- 首次获得 VCU Ready 前不得记录运动按键；只有当前会话曾经 Ready 后的 `wait_gear` /
+  `wait_actuator_modes` 闭环等待才保留按键集合。此时页面只刷新目标车速比例强制为 0
+  的输入意图，完整安全快照仍由原生线程按 20 Hz 生成。
 - 真实链路中断、控制权丢失、VCU fault 或 disarm 必须清空输入并重置 Ready 资格，要求释放后重新按键，禁止旧按键自动恢复。
 - Gamepad 在首次 Ready、链路/控制权重置或窗口失焦后进入踏板回零互锁；只有观测到油门与刹车都回零后，后续的新踏板动作才可生效。
-- 窗口失焦时主动目标车速比例和转向归零，但仍按固定频率发送安全心跳。
+- 窗口失焦时主动目标车速比例和转向归零；安全心跳的固定频率由原生进程维持。
 - 档位输出必须落在控制协议允许集合内；真实车辆额外档位由后续车辆适配器契约扩展。
 
 后续输入适配：
@@ -95,19 +100,32 @@ API 表达，应放到独立平台适配器中，不能侵入会话或协议核�
 
 ## 控制命令生成
 
-Console 不应只在按键变化时发送控制，而应按固定周期发送当前控制状态。
+浏览器只维护输入意图，不能承担车辆发包时钟。输入变化时以及输入租约有效期内，
+页面向回环接口 `POST /api/control-intent` 提交 latest-only 完整意图；原生 Console
+独立采样该意图并生成车辆控制命令。
 
 默认：
 
-- 频率：20 Hz。
+- 活动会话内的原生发包频率：20 Hz；不受浏览器 timer、渲染、焦点或可见性调度。
 - 每条命令包含协议版本、车辆、驾驶员、会话、单调递增 `seq`、
-  `sent_at_utc_ms` 和短期 `control_token`。
+  `sent_at_utc_ms`、短期 `control_token`、`intent_seq` 和 `intent_fresh`。
 - 每条命令包含完整控制状态，而不是增量。
+- 命令经专用 send-only 控制 WSS 进入 signaling 的容量 1、TTL 150 ms latest-only
+  mailbox，再由车端独立 control-only WSS 接收；普通命令不走 WebRTC DataChannel。
 - loopback C++ 运行时在控制权租约签发后约 1/3 处，用当前驾驶员 token
-  调用服务端续租；续租保持 session 和 DataChannel 中的 `control_token` 不变，
+  调用服务端续租；续租保持 session、控制 WSS 与 DataChannel profile 中的
+  `control_token` 不变，
   不把任一 token 暴露给浏览器 JavaScript。
 
-这样车端可以通过心跳判断驾驶端是否还活着。
+浏览器输入租约默认 200 ms，可配置范围为 100--1000 ms。失焦/隐藏时页面主动提交
+零执行量；页面冻结、更新超时或控制 WSS 异常时租约会过期/失效，原生进程保留已选
+挡位并把转向、油门和普通制动精确归零，同时标记 `intent_fresh=false`。车端只在
+`CONTROL_ACTIVE`、profile 与 VCU 握手仍有效、距上一条已接受命令尚未达到
+`degraded_timeout_ms`、且挡位等于最后一条新鲜非急停命令的挡位时，接受这种零值包
+维持看门狗；它不能建立或恢复控制。任何过期非零指令都丢弃，原生进程/WSS 真断流
+仍触发 `DEGRADED`/`TIMEOUT_BRAKE`，恢复前必须先提交新鲜中立意图。
+安全退出、关闭页面触发会话结束，或原生控制进程退出时不会继续发包；这时车端按
+权限撤销或真实包间隔进入本地安全停车。
 
 ### 会话控制参数确认
 
@@ -136,7 +154,8 @@ DataChannel envelope。V3 profile 在 envelope 顶层包含 `profile_version=3`�
 单电机最大转矩、三项普通制动压力、最大转向角，`speed_pid_kp/ki/kd`、
 `speed_pid_derivative_filter_tau_ms`、`speed_pid_max_dt_ms`，以及
 `motor_torque_rise_rate_nm_per_s`；它与普通控制命令复用车辆、
-驾驶员、session、`control_token` 和单调递增 `seq`。由于 control DataChannel
+驾驶员、session 和 `control_token`，但使用 DataChannel 自己的消息序号。由于该
+profile/status DataChannel
 是 unordered/unreliable，浏览器每隔至少 200 ms 重发同一 envelope 和同一 `seq`，直到
 收到共享 `control_status_seq` 排序后的 `session_control_profile_status`，或 telemetry
 中的同一 canonical `session_control_profile`。只有 `active=true`、`accepted=true`、
@@ -145,9 +164,9 @@ DataChannel envelope。V3 profile 在 envelope 顶层包含 `profile_version=3`�
 幂等重 ACK 可保持授权。
 旧 `GET /api/control-limits` 仅保留归一化制动比例的只读兼容；`POST` 固定返回
 `410 Gone`，不能绕过 profile 的停车、鉴权和 ACK 门禁修改会话制动参数。旧的
-`POST /api/control/keyboard` 与 `POST /api/control/gamepad` 同样固定返回 `410 Gone`：
-它们无法证明车端已经确认了与本地预设一致的物理压力 profile，继续发送会产生 ACK
-前后单位解释不一致。浏览器和新集成都只使用标准 `POST /api/control` 准备 v1 命令。
+`POST /api/control`、`POST /api/control/keyboard` 与 `POST /api/control/gamepad`
+同样固定返回 `410 Gone`：浏览器和新集成都必须改用 `/api/control-intent` 更新本机
+latest-only 意图，不能再准备或自行发送 v1 命令。
 
 未确认时页面清空输入并禁止 VCU connect 握手和所有普通驾驶命令；`estop=true` 不受
 profile ACK 门禁阻止。后续 telemetry 报告 profile inactive/rejected、请求序号或
@@ -163,16 +182,12 @@ limits；新会话必须重新等待车端 PID 默认值，不得跨会话自动
 latest-wins 判定由可在浏览器和 Node.js 共用的无 DOM 模块实现。生产页面
 实际调用该模块；Node.js 测试执行行为矩阵，C++ 页面测试只核对 wiring。
 
-`POST /api/control` 返回只表示本机 C++ 运行时已为命令补齐元数据（prepared），
-不表示 DataChannel 已发送、对端已接收或车端已接受。浏览器在每次 prepared 后
-记录且仅记录一个终态：`forwarded`、`superseded`、
-`post_prepare_link_changed` 或 `post_prepare_vcu_not_ready`。只有
-`RTCDataChannel.send()` 正常返回后才计入 `forwarded`；这仍不是 delivered/accepted 证据。
-`superseded`、链路变化和 VCU 未就绪会立即写入结构化浏览器日志；正常的
-`prepared` / `forwarded` 心跳不逐条写日志或发起额外 HTTP 请求。浏览器把上述会话内
-累计值、`last_prepared_seq` / `last_forwarded_seq` 和守恒标志
-`control_outcomes_balanced` 合并到现有 1 Hz `/api/webrtc/metrics` 上报，便于核对乱序
-拒绝和 latest-wins 产生的序号空洞，同时避免 20 Hz 控制心跳淹没日志或增加控制负载。
+`POST /api/control-intent` 返回只表示本机 C++ latest-only 意图存储已接受或刷新该
+`intent_seq`，不表示原生 WSS 已发送、signaling 已接收或车端已接受。请求必须携带
+当前 `session_id`、`session_generation` 和 `ui_instance_id`；旧会话的延迟成功或失败
+响应不能修改新会话状态。过期序号、同序号异内容、跨 UI 实例的非中立起步以及
+租约/传输失效后的非中立输入均 fail closed；ESTOP 在当前会话内锁存并可抢占普通
+意图。原生命令序号由 C++ 进程独立生成，和浏览器 `intent_seq` 不是同一个序列。
 
 车端若在实际 apply 阶段拒绝命令，会发送带共享 `control_status_seq` 和原命令
 `command_seq` 的 `control_command_rejected`。页面只解释本地 allowlist 中的
@@ -183,7 +198,7 @@ latest-wins 判定由可在浏览器和 Node.js 共用的无 DOM 模块实现。
 拒绝前挡位的零牵引（或制动）帧才能解除该次门禁。
 无法关联到当前事务的换挡拒绝不会猜测或重发挡位，而是冻结普通控制，保留急停和
 显式断开，并要求完成安全断开后重新握手。
-相同拒绝由车端限频重发，以覆盖 unordered/unreliable DataChannel 的单包丢失，
+相同拒绝由车端限频重发，以覆盖 unordered/unreliable 状态 DataChannel 的单包丢失，
 同时避免拒绝风暴。
 
 ## 视频显示
@@ -198,7 +213,8 @@ latest-wins 判定由可在浏览器和 Node.js 共用的无 DOM 模块实现。
 
 当前控制端会把车端 `webrtc_offer` 返回给浏览器页面，
 页面用 `RTCPeerConnection` 创建 answer，并通过 `ontrack` 把远端视频流挂到对应
-camera 的 `<video>` 元素；控制 DataChannel 按 unordered/unreliable 配置创建。
+camera 的 `<video>` 元素；profile/VCU/status DataChannel 按 unordered/unreliable
+配置创建，不承载普通控制命令。
 视频轨道不以 VCU 握手或 CAN adapter ready 为显示前提：浏览器收到 `ontrack`
 就立即挂载画面。车端只在控制 DataChannel 打开后启动 VCU adapter；adapter
 启动或运行失败时继续保留视频，把握手状态上报为 `fault`，随后只关闭控制
@@ -259,3 +275,14 @@ TURN 使用状态和时间同步可信度。逐路指标超过 200 ms 或低于 
 `password`、`token`、`secret` 或 `credential` 的值会在写盘前递归替换为
 `[redacted]`，单条超出文件上限的事件会被拒绝。日志用于本地排障，不能替代服务端
 会话审计或车辆安全记录。
+
+现场排查可显式开启 `logging.control_trace_commands`。页面约每秒批量记录
+`control_trace_batch`，其中 timer/queue 计数只描述浏览器刷新输入租约，不代表 20 Hz
+车辆发包。同一控制端 JSONL 还会写入 `driver_native_control_trace_batch`，逐条记录原生
+sender 的计划唤醒/实际唤醒、建连、ACK 排空、WSS send 起止、单次 send 耗时以及 UTC/
+monotonic 成功发送间隔。`/api/status.native_control` 同时提供连接、重连、发送/失败总数、
+最近/最大命令间隔、发送/ACK 序号、未确认持续时间和最近云端接收 ACK 时间。云端和车端
+分别使用 `cloud_native_control_trace_batch`、`vehicle_control_trace_batch` 补全入站、
+latest-only mailbox、投递、接收、锁等待、apply 和拒绝阶段。三端都用
+`trace_session_id + seq + intent_seq`（云端投递 ACK 另带 `delivery_cursor`）关联且不记录
+`control_token`；中间发送序号被 mailbox 覆盖是正常行为，不能当作丢包或必达确认。

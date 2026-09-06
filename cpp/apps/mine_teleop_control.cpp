@@ -1,6 +1,8 @@
 #include "mine_teleop/platform.hpp"
 #include "mine_teleop/server.hpp"
 
+#include <curl/curl.h>
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -68,6 +70,7 @@ class Arguments {
         "--signaling-url",
         "--ice-transport-policy",
         "--no-open-browser",
+        "--dependency-info",
         "--help",
         "--version",
     };
@@ -116,11 +119,28 @@ Options:
   --signaling-url URL        override cloud.signaling_url
   --ice-transport-policy P   all (default) or relay (forced TURN)
   --no-open-browser          do not open the default browser
+  --dependency-info          show linked dependency versions as JSON
   --help                     show this help
+  --version                  show the program and linked curl versions
 
 The control page always binds to a loopback address and is never published as
 a public driving page.
 )HELP";
+}
+
+Json dependency_info() {
+  const auto* curl = curl_version_info(CURLVERSION_NOW);
+  if (curl == nullptr) throw std::runtime_error("curl_version_info failed");
+  return Json({
+      {"curl_compile_version", LIBCURL_VERSION},
+      {"curl_compile_version_num", static_cast<std::uint64_t>(LIBCURL_VERSION_NUM)},
+      {"curl_linkage", MINE_TELEOP_CURL_LINKAGE},
+      {"curl_runtime_version", curl->version == nullptr ? "" : curl->version},
+      {"curl_runtime_version_num", static_cast<std::uint64_t>(curl->version_num)},
+      {"curl_tls_backend", curl->ssl_version == nullptr ? "" : curl->ssl_version},
+      {"mine_teleop_version", "0.2.0"},
+      {"platform", mine_teleop::platform_name()},
+  });
 }
 
 volatile std::sig_atomic_t termination_signal = 0;
@@ -219,8 +239,16 @@ int main(int argc, char** argv) {
       print_help();
       return 0;
     }
+    if (arguments.has("--dependency-info")) {
+      std::cout << dependency_info().dump() << '\n';
+      return 0;
+    }
     if (arguments.has("--version")) {
-      std::cout << "mine-teleop-control 0.2.0 " << mine_teleop::platform_name() << '\n';
+      const auto dependencies = dependency_info();
+      std::cout << "mine-teleop-control 0.2.0 " << mine_teleop::platform_name()
+                << " libcurl/" << dependencies.at("curl_runtime_version").get<std::string>()
+                << " " << dependencies.at("curl_tls_backend").get<std::string>()
+                << " curl-linkage/" << dependencies.at("curl_linkage").get<std::string>() << '\n';
       return 0;
     }
     return run(arguments, argc > 0 && argv[0] != nullptr ? argv[0] : "mine-teleop-control");

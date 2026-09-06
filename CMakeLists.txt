@@ -9,11 +9,20 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(WIN32)
   set(MINE_TELEOP_VEHICLE_DEFAULT OFF)
+  # winsock2.h/windows.h otherwise define min/max macros before several
+  # translation units reach <algorithm> and <limits>. Keep this directory-wide
+  # so every current and future Windows target shares the same header contract.
+  add_compile_definitions(NOMINMAX)
 else()
   set(MINE_TELEOP_VEHICLE_DEFAULT ON)
 endif()
 
 option(MINE_TELEOP_BUILD_TESTS "Build the native C++ test suites" OFF)
+option(
+  MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS
+  "Build portable native control safety tests"
+  OFF
+)
 option(MINE_TELEOP_BUILD_CONTROL_CLIENT "Build the portable control client" ON)
 option(MINE_TELEOP_BUILD_SIGNALING_SERVER "Build the standalone signaling server" ON)
 option(MINE_TELEOP_BUILD_VEHICLE_RUNTIME "Build Linux vehicle media and packaging targets" ${MINE_TELEOP_VEHICLE_DEFAULT})
@@ -21,6 +30,7 @@ option(MINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES "Build camera bridges when bundle
 option(MINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE "Build the lightweight Aravis USB3 Vision camera bridge" ON)
 option(MINE_TELEOP_FETCH_MISSING_DEPS "Fetch pinned yaml-cpp and nlohmann-json sources when absent" OFF)
 set(MINE_TELEOP_MVS_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/mvs" CACHE PATH "Bundled Hikrobot MVS SDK root")
+set(MINE_TELEOP_CURL_LINKAGE "unknown" CACHE STRING "How libcurl is linked into the control client")
 
 find_package(Threads REQUIRED)
 if(WIN32)
@@ -73,20 +83,38 @@ else()
   set(MINE_TELEOP_YAML_TARGET yaml-cpp)
 endif()
 include(GNUInstallDirs)
+include(cmake/SplitMsvcStringLiterals.cmake)
 
 set(MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_logic.js")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}")
 file(READ "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}" MINE_TELEOP_CONTROL_LOGIC_JS)
-string(FIND "${MINE_TELEOP_CONTROL_LOGIC_JS}" ")MT_CONTROL_JS\"" MINE_TELEOP_CONTROL_LOGIC_DELIMITER)
-if(NOT MINE_TELEOP_CONTROL_LOGIC_DELIMITER EQUAL -1)
-  message(FATAL_ERROR "cpp/web/control_logic.js contains the generated C++ raw-string delimiter")
-endif()
+string(REPLACE "\r\n" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
+string(REPLACE "\r" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
+mine_teleop_make_adjacent_raw_literals(
+  "${MINE_TELEOP_CONTROL_LOGIC_JS}"
+  "MT_CONTROL_JS"
+  MINE_TELEOP_CONTROL_LOGIC_JS_LITERALS
+  MINE_TELEOP_CONTROL_LOGIC_JS_CHUNK_COUNT
+  MINE_TELEOP_CONTROL_LOGIC_JS_MAX_CHUNK_BYTES
+)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop")
 configure_file(
   cmake/control_logic_js.hpp.in
   "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop/control_logic_js.hpp"
   @ONLY
 )
+
+set(MINE_TELEOP_SERVER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/server.cpp")
+set(MINE_TELEOP_GENERATED_SERVER_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/src/server.cpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_SERVER_SOURCE}")
+# Keep server.cpp as the canonical source while compiling a byte-equivalent
+# generated copy whose large HTML raw strings are safe for MSVC.
+mine_teleop_split_cpp_raw_literals(
+  "${MINE_TELEOP_SERVER_SOURCE}"
+  "${MINE_TELEOP_GENERATED_SERVER_SOURCE}"
+  "HTML"
+)
+set_source_files_properties("${MINE_TELEOP_GENERATED_SERVER_SOURCE}" PROPERTIES GENERATED TRUE)
 
 function(mine_teleop_enable_warnings target)
   if(MSVC)
@@ -110,7 +138,7 @@ add_library(mine_teleop_runtime
   cpp/src/core.cpp
   cpp/src/http.cpp
   cpp/src/platform.cpp
-  cpp/src/server.cpp
+  "${MINE_TELEOP_GENERATED_SERVER_SOURCE}"
   cpp/src/websocket.cpp
 )
 target_include_directories(mine_teleop_runtime
@@ -151,6 +179,10 @@ endif()
 if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
   add_executable(mine-teleop-control cpp/apps/mine_teleop_control.cpp)
   target_link_libraries(mine-teleop-control PRIVATE mine_teleop_runtime)
+  target_compile_definitions(
+    mine-teleop-control
+    PRIVATE MINE_TELEOP_CURL_LINKAGE="${MINE_TELEOP_CURL_LINKAGE}"
+  )
   mine_teleop_enable_warnings(mine-teleop-control)
   set_target_properties(mine-teleop-control PROPERTIES
     BUILD_RPATH "$ORIGIN/../lib"
@@ -262,6 +294,23 @@ install(TARGETS mine_teleop_runtime
 install(DIRECTORY cpp/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY configs/ DESTINATION share/mine-teleop/configs)
 install(DIRECTORY protocol/ DESTINATION share/mine-teleop/protocol)
+
+if(MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
+  enable_testing()
+  add_executable(
+    mine-teleop-native-control-intent-tests
+    cpp/tests/native_control_intent_tests.cpp
+  )
+  target_link_libraries(
+    mine-teleop-native-control-intent-tests
+    PRIVATE mine_teleop_runtime
+  )
+  mine_teleop_enable_warnings(mine-teleop-native-control-intent-tests)
+  add_test(
+    NAME mine-teleop-native-control-intent-tests
+    COMMAND mine-teleop-native-control-intent-tests
+  )
+endif()
 
 if(MINE_TELEOP_BUILD_TESTS)
   enable_testing()

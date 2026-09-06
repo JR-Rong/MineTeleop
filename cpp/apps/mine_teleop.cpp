@@ -199,6 +199,7 @@ Signaling server options:
   --audit-log-max-bytes N       active-hour part size limit (default 67108864)
   --audit-log-files N           active-hour size part count (default 5)
   --audit-log-retention-days N  hourly archive retention (default 7)
+  --native-control-trace        batch per-command native control hop timings into audit log
   --driver-token-ttl-ms N       driver bearer token lifetime (default 1800000)
   --control-token-ttl-ms N      control authority token lifetime (default 300000)
   --vehicle-heartbeat-ms N      vehicle offline timeout (default 15000)
@@ -457,6 +458,7 @@ int run_signaling_server(const Arguments& arguments) {
   config.audit_log_max_bytes = arguments.integer("--audit-log-max-bytes", 64 * 1024 * 1024);
   config.audit_log_files = arguments.integer("--audit-log-files", 5);
   config.audit_log_retention_days = arguments.integer("--audit-log-retention-days", 7);
+  config.native_control_trace_commands = arguments.has("--native-control-trace");
   const auto stun_url_count = config.stun_urls.size();
   const auto turn_url_count = config.turn_urls.size();
   const auto login_max_failures = config.login_max_failures;
@@ -466,6 +468,7 @@ int run_signaling_server(const Arguments& arguments) {
   const auto api_rate_limit_window_ms = config.api_rate_limit_window_ms;
   const auto api_rate_limit_max_sources = config.api_rate_limit_max_sources;
   const auto trusted_proxy_count = config.trusted_proxy_addresses.size();
+  const auto native_control_trace_commands = config.native_control_trace_commands;
   auto service = std::make_shared<mine_teleop::SignalingService>(std::move(config));
   mine_teleop::SimpleHttpServer server(
       arguments.value("--host", "127.0.0.1"),
@@ -489,6 +492,7 @@ int run_signaling_server(const Arguments& arguments) {
                    {"api_rate_limit_window_ms", api_rate_limit_window_ms},
                    {"api_rate_limit_max_sources", api_rate_limit_max_sources},
                    {"trusted_proxy_count", trusted_proxy_count},
+                   {"native_control_trace_commands", native_control_trace_commands},
                }).dump()
             << std::endl;
   server.serve_forever();
@@ -748,7 +752,7 @@ int run_vehicle_runtime(const Arguments& arguments) {
   try {
     if (config.runtime.control_enabled && !config.runtime.media_enabled) {
       throw std::invalid_argument(
-          "vehicle control requires the WebRTC media runtime because commands use its DataChannel");
+          "vehicle control requires the vehicle media runtime because it owns the native control WebSocket");
     }
     if (config.runtime.media_enabled) {
       const auto pid = spawn_service("media", [config, token, connection_id] {
@@ -783,7 +787,7 @@ int run_vehicle_runtime(const Arguments& arguments) {
                    {"vehicle_id", config.vehicle_id},
                    {"config", config_path},
                    {"control_enabled", config.runtime.control_enabled},
-                   {"control_transport", config.runtime.control_enabled ? "webrtc_data_channel" : "disabled"},
+                   {"control_transport", config.runtime.control_enabled ? "native_signaling_websocket" : "disabled"},
                    {"media_enabled", config.runtime.media_enabled},
                    {"recording_enabled", config.recording.enabled},
                    {"vehicle_adapter_type", config.vehicle_adapter.type},
@@ -892,18 +896,69 @@ int run_control_smoke(const Arguments& arguments) {
        {"connection_id", "control-smoke-" + mine_teleop::random_token(12)}});
   const auto connection_generation = online.at("connection_generation").get<std::uint64_t>();
   const auto connection = http.post_json_response(console + "/api/connect", Json::object());
-  const auto control = http.post_json_response(
-      console + "/api/control", {{"gear", "D"}, {"steering", 0.125}, {"throttle", 0.25}, {"brake", 0.0}, {"estop", false}});
   const auto session = http.get_json(
       signaling + "/vehicles/" + http.url_encode(vehicle_id) + "/session?connection_generation=" +
           std::to_string(connection_generation),
       {{"X-Mine-Teleop-Device-Token", device_token}});
-  const auto command = mine_teleop::ControlCommand::from_json(control.at("command"));
+  const auto session_id = connection.at("session_id").get<std::string>();
+  const auto control_session_generation =
+      connection.at("control_session_generation").get<std::uint64_t>();
+  const auto neutral = http.post_json_response(
+      console + "/api/control-intent",
+      {{"session_id", session_id},
+       {"session_generation", control_session_generation},
+       {"ui_instance_id", "control-smoke"},
+       {"intent_seq", 1},
+       {"gear", "N"},
+       {"steering", 0.0},
+       {"throttle", 0.0},
+       {"brake", 0.0},
+       {"estop", false}});
+  const auto control = http.post_json_response(
+      console + "/api/control-intent",
+      {{"session_id", session_id},
+       {"session_generation", control_session_generation},
+       {"ui_instance_id", "control-smoke"},
+       {"intent_seq", 2},
+       {"gear", "D"},
+       {"steering", 0.125},
+       {"throttle", 0.25},
+       {"brake", 0.0},
+       {"estop", false}});
+  Json delivered_command = Json::object();
+  const auto delivery_url =
+      signaling + "/signaling/" + http.url_encode(session_id) +
+      "/messages?recipient=" + http.url_encode(vehicle_id) +
+      "&device_token=" + http.url_encode(device_token) +
+      "&connection_generation=" + std::to_string(connection_generation) +
+      "&types=control_command";
+  const auto delivery_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < delivery_deadline) {
+    const auto delivery = http.get_json(delivery_url);
+    for (const auto& message : delivery.value("messages", Json::array())) {
+      if (message.value("type", "") != "control_command") continue;
+      const auto payload = message.value("payload", Json::object());
+      if (payload.value("intent_seq", std::uint64_t{0}) == 2) {
+        delivered_command = payload;
+        break;
+      }
+    }
+    if (!delivered_command.empty()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  const auto command = delivered_command.empty()
+      ? mine_teleop::ControlCommand{}
+      : mine_teleop::ControlCommand::from_json(delivered_command);
   const auto capabilities = http.post_json_response(
       console + "/api/webrtc/capabilities", {{"codecs", {"h264", "h265"}}});
   const auto console_status = http.get_json(console + "/api/status");
   const bool passed = online.value("state", "") == "online" && connection.value("connected", false) &&
-                      control.value("prepared", false) && control.value("transport", "") == "webrtc_data_channel" &&
+                      neutral.value("accepted", false) && control.value("accepted", false) &&
+                      control.value("transport", "") == "native_signaling_websocket" &&
+                      !delivered_command.empty() &&
+                      delivered_command.value("intent_seq", std::uint64_t{0}) == 2 &&
+                      delivered_command.value("intent_fresh", false) &&
                       command.vehicle_id == vehicle_id && command.session_id == session.value("session_id", "") &&
                       command.control_token == session.value("control_token", "") &&
                       capabilities.value("queued", 0) == 1 && console_status.value("connected", false);
@@ -913,7 +968,8 @@ int run_control_smoke(const Arguments& arguments) {
                    {"passed", passed},
                    {"session_id", session.value("session_id", "")},
                    {"control_transport", control.value("transport", "")},
-                   {"control_command_prepared", control.value("prepared", false)},
+                   {"control_intent_accepted", control.value("accepted", false)},
+                   {"control_command_delivered", !delivered_command.empty()},
                    {"media_capabilities", capabilities},
                }).dump()
             << '\n';

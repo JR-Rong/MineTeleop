@@ -86,6 +86,7 @@ class Arguments {
         "--login-failure-window-ms",
         "--login-lockout-ms",
         "--login-max-failures",
+        "--native-control-trace",
         "--port",
         "--stun-urls",
         "--trusted-proxy-addresses",
@@ -202,6 +203,7 @@ ICE and audit:
   --audit-log-max-bytes N
   --audit-log-files N                    size-limited parts within the active hour
   --audit-log-retention-days N           hourly archive retention (default 7)
+  --native-control-trace                 batch per-command native control hop timings into audit log
 
 Other:
   --validate-config                        load and validate configuration without listening
@@ -330,6 +332,7 @@ int main(int argc, char** argv) {
         "--audit-log-retention-days",
         "MINE_TELEOP_AUDIT_LOG_RETENTION_DAYS",
         7);
+    config.native_control_trace_commands = arguments.has("--native-control-trace");
     const auto stun_count = config.stun_urls.size();
     const auto turn_count = config.turn_urls.size();
     const auto login_max_failures = config.login_max_failures;
@@ -343,6 +346,7 @@ int main(int argc, char** argv) {
     const auto audit_log_files = config.audit_log_files;
     const auto audit_log_rotation_interval_ms = config.audit_log_rotation_interval_ms;
     const auto audit_log_retention_days = config.audit_log_retention_days;
+    const auto native_control_trace_commands = config.native_control_trace_commands;
     const auto driver_count = config.driver_passwords.size();
     const auto vehicle_count = config.device_tokens.size();
     std::size_t permission_count = 0;
@@ -391,6 +395,7 @@ int main(int argc, char** argv) {
                      {"audit_log_files", audit_log_files},
                      {"audit_log_rotation_interval_ms", audit_log_rotation_interval_ms},
                      {"audit_log_retention_days", audit_log_retention_days},
+                     {"native_control_trace_commands", native_control_trace_commands},
                      {"driver_count", driver_count},
                      {"vehicle_count", vehicle_count},
                      {"permission_count", permission_count},

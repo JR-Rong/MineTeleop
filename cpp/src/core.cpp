@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -1033,6 +1034,110 @@ ControlCommand ControlCommand::from_json(const Json& value) {
   }
   command.validate();
   return command;
+}
+
+void NativeControlIntent::validate() const {
+  if (ui_instance_id.empty() || ui_instance_id.size() > 128 ||
+      !std::all_of(ui_instance_id.begin(), ui_instance_id.end(), [](unsigned char value) {
+        return std::isalnum(value) || value == '-' || value == '_';
+      })) {
+    throw std::invalid_argument("ui_instance_id is invalid");
+  }
+  if (intent_seq == 0) throw std::invalid_argument("intent_seq must be positive");
+  static const std::unordered_set<std::string> allowed_gears{"P", "R", "N", "D"};
+  if (!allowed_gears.contains(gear)) {
+    throw std::invalid_argument("intent gear must be one of P/R/N/D");
+  }
+  require_finite_range(steering, -1.0, 1.0, "intent steering");
+  require_finite_range(throttle, 0.0, 1.0, "intent throttle");
+  require_finite_range(brake, 0.0, 1.0, "intent brake");
+}
+
+bool NativeControlIntent::is_neutral() const {
+  return !estop && std::abs(steering) <= 1e-9 && throttle <= 1e-9 && brake <= 1e-9;
+}
+
+NativeControlIntentStore::NativeControlIntentStore(int lease_ms)
+    : lease_ms_(lease_ms) {
+  if (lease_ms_ < 100 || lease_ms_ > 1000) {
+    throw std::invalid_argument("native control intent lease must be between 100ms and 1000ms");
+  }
+}
+
+NativeControlIntentUpdate NativeControlIntentStore::update(
+    NativeControlIntent intent,
+    std::int64_t received_at_monotonic_ms) {
+  intent.validate();
+  if (received_at_monotonic_ms < 0) {
+    throw std::invalid_argument("intent receive time must be non-negative");
+  }
+  std::lock_guard lock(mutex_);
+  const bool incoming_estop = intent.estop;
+  const bool incoming_neutral = intent.is_neutral();
+  // ESTOP is session-sticky. Normalize the incoming value before replay and
+  // fingerprint checks so a producer which refreshes the same sequence with
+  // estop=false cannot create a false conflict after the latch has already
+  // forced that stored intent to true. Actuation fields are irrelevant while
+  // ESTOP is active, so keep the wire command unambiguously fail-safe.
+  if (estop_latched_ || intent.estop) {
+    intent.estop = true;
+    intent.steering = 0.0;
+    intent.throttle = 0.0;
+    intent.brake = 0.0;
+  }
+  const bool same_ui = latest_ && latest_->ui_instance_id == intent.ui_instance_id;
+  if (latest_ && !same_ui) requires_fresh_input_ = true;
+  if (same_ui && intent.intent_seq < latest_->intent_seq) {
+    return {false, false, requires_fresh_input_, "old_intent_seq"};
+  }
+  if (same_ui && intent.intent_seq == latest_->intent_seq && intent != *latest_) {
+    return {false, false, requires_fresh_input_, "intent_seq_conflict"};
+  }
+  // A sticky ESTOP must not make an originally non-neutral command from a
+  // replacement UI look safe enough to bypass the fresh-neutral interlock.
+  // A newly requested ESTOP remains allowed to preempt that interlock.
+  if (requires_fresh_input_ && !incoming_neutral && !incoming_estop) {
+    return {false, same_ui && intent.intent_seq == latest_->intent_seq, true, "fresh_neutral_required"};
+  }
+
+  const bool duplicate = same_ui && intent.intent_seq == latest_->intent_seq;
+  if (requires_fresh_input_ && incoming_neutral) requires_fresh_input_ = false;
+  if (intent.estop) estop_latched_ = true;
+  latest_ = std::move(intent);
+  received_at_monotonic_ms_ = received_at_monotonic_ms;
+  return {true, duplicate, requires_fresh_input_, duplicate ? "refreshed" : "accepted"};
+}
+
+NativeControlIntentSample NativeControlIntentStore::sample(std::int64_t now_monotonic_ms) {
+  if (now_monotonic_ms < 0) {
+    throw std::invalid_argument("intent sample time must be non-negative");
+  }
+  std::lock_guard lock(mutex_);
+  if (!latest_) return {};
+  const auto age_ms = std::max<std::int64_t>(0, now_monotonic_ms - received_at_monotonic_ms_);
+  const bool fresh = age_ms < lease_ms_;
+  if (!fresh && !latest_->is_neutral() && !latest_->estop) requires_fresh_input_ = true;
+  auto effective = *latest_;
+  if (requires_fresh_input_ && !effective.estop) {
+    effective.steering = 0.0;
+    effective.throttle = 0.0;
+    effective.brake = 0.0;
+  }
+  effective.estop = estop_latched_;
+  return {true, fresh, requires_fresh_input_, std::move(effective)};
+}
+
+void NativeControlIntentStore::invalidate() {
+  std::lock_guard lock(mutex_);
+  requires_fresh_input_ = true;
+}
+
+void NativeControlIntentStore::reset() {
+  std::lock_guard lock(mutex_);
+  latest_.reset();
+  received_at_monotonic_ms_ = 0;
+  requires_fresh_input_ = true;
+  estop_latched_ = false;
 }
 
 void SessionControlProfile::validate() const {
@@ -3033,7 +3138,24 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
 
 ReceiveResult VehicleControlService::receive_command(const ControlCommand& command, std::int64_t timestamp_ms) {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
-  auto result = receiver_.accept(command, timestamp_ms);
+  ReceiveResult result;
+  if (command.estop) {
+    result = receiver_.accept(command, timestamp_ms);
+    if (result.accepted && result.command) {
+      // Latch a valid ESTOP and revoke traction authority before any adapter
+      // call. A failed physical stop must never lose the outer safety latch.
+      safety_.on_valid_command(*result.command, timestamp_ms);
+      clear_session_profile();
+    } else {
+      evaluate_control_watchdog(timestamp_ms);
+    }
+  } else {
+    // The receive path can keep running even if the periodic loop is delayed.
+    // Advance the same watchdog here so fresh packets cannot bypass a hard
+    // timeout merely because tick() has not been scheduled.
+    evaluate_control_watchdog(timestamp_ms);
+    result = receiver_.accept(command, timestamp_ms);
+  }
   if (!result.accepted || !result.command) return result;
   auto& effective = *result.command;
   if (!effective.estop && !active_session_profile_) {
@@ -3044,6 +3166,16 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
            VehicleStopReason::SessionProfileRequired});
     }
     return {false, "session_control_profile_required", std::nullopt, {}};
+  }
+  if (!effective.estop && safety_.state() == SafetyState::Degraded &&
+      (effective.throttle > 1e-9 || std::abs(effective.steering) > 1e-9)) {
+    // Recovery is intentionally explicit: a command gap withdraws traction,
+    // and a fresh neutral command must be applied before any prior held input
+    // can produce torque again. Brake remains allowed during this re-arm.
+    result.accepted = false;
+    result.reason = "degraded_neutral_required";
+    result.command.reset();
+    return result;
   }
   const auto vehicle_limited_throttle =
       std::min(effective.throttle, max_throttle_);
@@ -3207,9 +3339,29 @@ void VehicleControlService::tick(std::int64_t timestamp_ms) {
       safety_.state() != SafetyState::Fault) {
     safety_.mark_fault();
   }
+  evaluate_control_watchdog(timestamp_ms);
+  if (!last_telemetry_ms_ || timestamp_ms - *last_telemetry_ms_ >= telemetry_interval_ms_) {
+    try {
+      if (telemetry_history_.size() == kMaxVehicleTelemetryHistory) telemetry_history_.pop_front();
+      telemetry_history_.push_back(build_telemetry(timestamp_ms));
+      last_telemetry_ms_ = timestamp_ms;
+    } catch (...) {
+      // Control safety was already evaluated above from the same adapter. A
+      // failed observability snapshot must not tear down an adapter-owned stop
+      // or prevent the outer fault path from keeping the vehicle stopped.
+    }
+  }
+}
+
+void VehicleControlService::evaluate_control_watchdog(std::int64_t timestamp_ms) {
   safety_.tick(timestamp_ms);
   if (safety_.state() == SafetyState::Degraded || safety_.state() == SafetyState::TimeoutBrake ||
       safety_.state() == SafetyState::Estop || safety_.state() == SafetyState::Fault) {
+    // Revoke software traction authority before touching the adapter. This
+    // remains true even when the physical safe-stop call reports an error.
+    if (safety_.state() != SafetyState::Degraded) {
+      clear_session_profile();
+    }
     const bool adapter_owns_recoverable_stop =
         adapter_safe_stop_active_ &&
         (safety_.state() == SafetyState::Degraded ||
@@ -3232,18 +3384,12 @@ void VehicleControlService::tick(std::int64_t timestamp_ms) {
           safety_.current_output(timestamp_ms),
           stop_context);
     }
-    clear_session_profile();
-  }
-  if (!last_telemetry_ms_ || timestamp_ms - *last_telemetry_ms_ >= telemetry_interval_ms_) {
-    try {
-      if (telemetry_history_.size() == kMaxVehicleTelemetryHistory) telemetry_history_.pop_front();
-      telemetry_history_.push_back(build_telemetry(timestamp_ms));
-      last_telemetry_ms_ = timestamp_ms;
-    } catch (...) {
-      // Control safety was already evaluated above from the same adapter. A
-      // failed observability snapshot must not tear down an adapter-owned stop
-      // or prevent the outer fault path from keeping the vehicle stopped.
-    }
+    // DEGRADED is the recoverable 300 ms control-gap state: traction has
+    // already been withdrawn above, but the acknowledged session limits must
+    // remain installed so one fresh packet can re-arm receiver timing and a
+    // subsequent fresh neutral command can restore active control before the
+    // hard timeout. Hard-timeout/latching states still require a new parked
+    // handshake after the profile has been revoked above.
   }
 }
 

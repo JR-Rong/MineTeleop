@@ -1,9 +1,15 @@
 #pragma once
 
+#include <cstddef>
 #include <string_view>
 
 namespace mine_teleop::web {
 
-inline constexpr std::string_view kControlLogicJavaScript = R"MT_CONTROL_JS(@MINE_TELEOP_CONTROL_LOGIC_JS@)MT_CONTROL_JS";
+inline constexpr std::string_view kControlLogicJavaScript =
+@MINE_TELEOP_CONTROL_LOGIC_JS_LITERALS@;
+inline constexpr std::size_t kControlLogicJavaScriptLiteralChunks =
+    @MINE_TELEOP_CONTROL_LOGIC_JS_CHUNK_COUNT@;
+inline constexpr std::size_t kControlLogicJavaScriptMaxLiteralBytes =
+    @MINE_TELEOP_CONTROL_LOGIC_JS_MAX_CHUNK_BYTES@;
 
 }  // namespace mine_teleop::web

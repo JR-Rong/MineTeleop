@@ -33,6 +33,18 @@ ICE policy:
   WebRTC media/DataChannel transport; relay normally adds cloud bandwidth cost
   and latency.
 
+Control transport:
+
+  The browser submits only the latest input intent to the loopback process via
+  /api/control-intent. The native process owns the 20 Hz command clock and sends
+  complete control commands over a dedicated WSS connection; the vehicle uses a
+  separate control-only WSS and independent watchdog. The WebRTC DataChannel is
+  only the session-profile/VCU-handshake/status gate, not the ordinary command
+  transport. If browser input stops refreshing, the native lease expires and
+  actuation is forced to exact zero. The vehicle accepts a stale zero heartbeat
+  only while CONTROL_ACTIVE and only while the profile, handshake, native packet
+  gap, and last fresh gear remain valid; it never establishes or recovers control.
+
 Credential transport:
 
   Login remains an HTTPS POST. Subsequent driver bearer authentication is sent

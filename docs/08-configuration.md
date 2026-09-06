@@ -87,6 +87,23 @@ cloud:
 窗口；它不是浏览器显示的端到端时延预算，后者由
 `hardware.encoding.max_end_to_end_latency_ms` 单独约束。
 
+`runtime.control_log_commands=true` 会把通过车端 control-only WSS 收到并解析的控制命令约每秒汇总为一条
+`vehicle_control_trace_batch`；队列累计 32 条也会提前刷新。现场模板默认开启该追踪。每个
+`commands[]` 项用 `session_id + seq` 关联原生命令，同时记录 `intent_seq`、
+`intent_fresh`、接收处理入口 UTC/单调时钟、
+`control_mutex` 获取时刻与等待毫秒、`VehicleControlService::receive_command`（含 adapter
+apply）完成时刻与处理毫秒，以及 `accepted/reason`。调用控制服务前因 runtime 停止、控制
+被禁止、服务不可用、profile/握手未就绪、stale 条件不满足或链路未打开而丢弃时仍有明确 reason；控制服务抛错记为
+`receive_apply_exception`，早期丢弃的 receive/apply 时间与耗时为 `null`。
+
+`control_path_completed_before_trace_*` 只表示控制路径完成、即将构造追踪记录的时刻，不是
+callback 真正返回的时刻，也不包含追踪构造/入队耗时。单调时钟值只能在同一车端进程内比较。
+追踪仅复制限长白名单字段，不含 control token；原生 WSS 接收路径用容量 256 的有界队列
+非阻塞入队，日志序列化和 stdout 输出由专用 worker 完成。队列锁忙、队满、构造或输出失败时
+只丢追踪，不影响控制命令，批次用 `dropped_since_last/dropped_total` 暴露缺口。worker 会按
+40 KiB 命令预算拆批并拒绝超过 48 KiB 的 JSONL 行；退出时在安全停车、pipeline 停止后排空
+并写 `final=true`。stdout 永久阻塞不会卡住控制 callback，但可能延迟进程退出。
+
 相对的 `device_token_file` 按 YAML 所在目录解析。现场只需创建权限为 `0600` 的
 `config/device-token`，随后执行 `bin/mine-teleop-run`。`cloud.resolve` 的每一项使用
 libcurl 的 `host:port:address` 格式，只影响当前进程；连接仍以
@@ -94,7 +111,7 @@ libcurl 的 `host:port:address` 格式，只影响当前进程；连接仍以
 `cloud.ca_bundle` 可使用相对配置文件的路径，必须指向可信 CA 文件。当前三机现场
 路径依靠这两个字段直接连接云端，不需要 SSH、SOCKS 或 FRP。500 ms 的空闲会话
 轮询既可在无会话时保持车端在线，也避免把云端 API 限流预算消耗在高频空轮询上；
-已建立会话后的 WebSocket/DataChannel 不使用该轮询周期。
+已建立会话后的普通信令 WSS、control-only WSS 和 DataChannel 不使用该轮询周期。
 
 车辆和控制端的后续 GET/WSS 请求分别用
 `X-Mine-Teleop-Device-Token`、`X-Mine-Teleop-Driver-Token` header 携带凭据，
@@ -273,6 +290,10 @@ vehicle_adapter:
 
 `control.rate_hz` 当前固定为上游命令 `20 Hz`（50 ms），其他值在 loader 中直接拒绝；
 它与 bridge 固定 `20 ms/50 Hz` 的 SocketCAN 发送/PID 周期不是同一个频率。
+控制端可选 `control.intent_lease_ms` 表示浏览器输入意图在本机原生进程中的租期，默认
+`200 ms`、范围 `100..1000 ms`。浏览器在约租期 1/3 处刷新意图；该 timer 不负责
+20 Hz 车辆发包。租期届满或控制 WSS 失败后，原生进程将执行量精确归零并要求新的
+中立输入解锁，车端只按控制安全文档中的严格条件接受零值 stale heartbeat。
 `max_command_gap_ms`、`degraded_timeout_ms`、`control_timeout_ms` 都必须为正且不大于
 60000，并满足 `degraded_timeout_ms < control_timeout_ms`。
 `deceleration_profile.after_ms` 从进入 `TIMEOUT_BRAKE` 起算，继续要求非负、按声明顺序
@@ -296,7 +317,8 @@ pipeline。控制端按车端 offer 中实际声明的轨道逐路渲染，云�
 默认 `500 ms`，范围 `0..60000 ms`。关键相机的首个已确认故障会立即锁止控制并
 触发本地安全停车，同时只重开故障 lane。相机恢复只恢复视频；控制锁存跨同一云端
 session 内的 `VehicleMediaRuntime` 重建保持不变。必须结束当前 session，在新 session
-中建立新的控制 DataChannel 并重新完成 VCU 握手后才能恢复驾驶权限。V4L2 设备路径
+中重新建立 profile/VCU/status DataChannel 与 control-only WSS，并重新完成 VCU 握手后
+才能恢复驾驶权限。V4L2 设备路径
 在 USB 拔插或 udev 重建期间
 暂时不存在时，仍按 `reopen_attempts` 做有限重试；永久路径错误应由启动 preflight
 报告。非关键相机在重开额度耗尽后只禁用自身 lane，其他视频和当前控制不受影响。
@@ -590,6 +612,7 @@ logging:
   browser_event_log: ../.local/logs/control-browser-events.jsonl
   browser_event_log_max_bytes: 2097152
   browser_event_log_files: 3
+  control_trace_commands: false
 
 ui:
   default_layout: grid_4
@@ -597,6 +620,7 @@ ui:
 
 control:
   rate_hz: 20
+  intent_lease_ms: 200
   estop_hold_ms: 500
   limits:
     initial_target_speed_kph: 2.0
@@ -649,8 +673,8 @@ control:
 本 PR 中缓刹为直接 `service_brake_pressure_bar`，不运行制动 PID，也不做压力 ramp；
 急刹直接请求 `hard_brake_pressure_bar`。任何制动会把油门与目标车速置零、复位车速
 PID、清零八路电机扭矩，同时保留转向。页面修改参数会先清空输入并要求车端确认，
-标准 `/api/control` 只准备 0..1 的模拟制动标量；物理压力始终由车端当前已确认的
-会话 profile 还原。
+浏览器通过 `/api/control-intent` 提交包含 0..1 制动标量的 latest-only 输入意图；
+原生线程再生成完整控制命令，物理压力始终由车端当前已确认的会话 profile 还原。
 页面只把这些默认值填入“实车调试限幅”窗口，不会自动提交 profile。新直接转矩语义下
 `PID 输出 × 单电机最大转矩`，旧 Kp/Ki 与 `300 Nm` 默认组合可能产生明显转矩阶跃；
 驾驶员必须在驻车准入已满足（或车端明确报告 mock/无需握手且 adapter ready）后打开
@@ -665,10 +689,12 @@ PID、清零八路电机扭矩，同时保留转向。页面修改参数会先�
 `409.5 bar/路` 安全路径，不受这些普通驾驶压力上限削弱。控制心跳超时先按
 `timeout_action.deceleration_profile` 的普通压力分段执行，最终 1.0 阶段才切到
 409.5 bar。
-旧的 `POST /api/control/keyboard` 与 `POST /api/control/gamepad` 固定返回 `410 Gone`。
-这两个接口无法携带或验证车端 profile ACK；若在新 profile 被拒绝时继续按本地预设生成
-制动标量，车辆会按旧 active profile 还原成不同的 bar 值。旧调用方必须迁移到
-`/api/control-profile` 等待精确 ACK，再用标准 `/api/control` 发送明确的 v1 控制命令。
+旧的 `POST /api/control`、`POST /api/control/keyboard` 与
+`POST /api/control/gamepad` 固定返回 `410 Gone`。这些接口无法携带或验证车端 profile
+ACK；若在新 profile 被拒绝时继续按本地预设生成制动标量，车辆会按旧 active profile
+还原成不同的 bar 值。旧调用方必须先用 `/api/control-profile` 等待精确 ACK，再用
+`/api/control-intent` 更新当前 session/generation 的本机输入意图；普通命令只能由原生
+20 Hz 线程生成和发送。
 
 ### 升级迁移
 
@@ -687,6 +713,23 @@ PID、清零八路电机扭矩，同时保留转向。页面修改参数会先�
 写入控制端包根目录的 `.local/logs/`。`browser_event_log_files` 包含当前文件，
 因此值 `3` 表示当前文件加 `.1`、`.2` 两个备份。凭据类字段会被递归脱敏，但部署
 时仍应限制日志目录权限，并按现场保留策略采集或销毁日志。
+
+`logging.control_trace_commands` 默认关闭。启用后，浏览器约每秒写一条
+`control_trace_batch`；其中 heartbeat/timer/queue 指标只描述 `/api/control-intent`
+输入租约刷新，不是 20 Hz 原生命令时钟或 DataChannel 发送证明。批次的
+`trace_session_id`、`trace_vehicle_id` 是浏览器采集时固定的会话归属；会话切换边界
+排查应使用这两个字段，而不是写盘时控制端进程的当前会话字段。
+
+控制端同一 JSONL 中的 `driver_native_control_trace_batch` 提供实际原生发包证据：
+sender 调度延迟、建连耗时、ACK 排空、WSS send 起止/耗时以及 UTC 和 monotonic 的
+成功发送间隔。`/api/status.native_control` 另提供 `intent_fresh`、
+`requires_fresh_input`、`websocket_connected`、`commands_sent_total`、
+`send_failures_total`、`last_gap_ms`、`max_gap_ms`、`last_seq`、`last_ack_seq`、
+`unacknowledged_age_ms`、最近 ACK 时间和 `last_error`。车端 summary 的 `native_control_signaling` 与
+`vehicle_control_trace_batch` 再区分 WSS 接收、latest-only 覆盖、stale 零值接受/丢弃、
+profile/握手门禁和实际 apply。任何单侧“已提交”或“已发送”都不能作为车端已接受的
+ACK。现场三机配置启用此项，并使用 `16 MiB × 4` 轮转容量；复现完成后应按现场保留
+策略归档或删除。
 
 ## 配置校验
 
@@ -733,6 +776,10 @@ PID、清零八路电机扭矩，同时保留转向。页面修改参数会先�
   1024 bytes，分片数范围为 1 到 20。全部轮转、追加、flush 和过期清理由同一
   写入锁保护。每次服务构造会先写入 UTC `signaling_service_started`，审计目录
   不存在或不可写时启动失败。
+- `--native-control-trace` 在 signaling audit 中启用
+  `cloud_native_control_trace_batch`。批次用有界异步队列记录入站、mailbox 覆盖/过期、
+  车端 WSS 投递和 delivery ACK；`dropped_total` 非零表示诊断记录自身有缺口。该开关
+  只应与 `--audit-log` 配合使用，复现完成后可从 systemd override 移除以降低日志量。
 - 控制超时大于命令周期。
 - 已单独确认控制超时 0.3/0.6 分段的物理压力、最终 1.0 阶段以及故障/断链/急停的
   八路 `409.5 bar` 安全制动语义和 VCU 硬件响应；409.5 bar 路径不受普通会话压力

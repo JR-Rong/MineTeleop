@@ -52,7 +52,8 @@ DBC 全量 `409.5 bar/路`；上游控制超时在此之前仍按 0.3/0.6 普通
 车端启动 CAN bridge 后只进入 `standby`，继续发送 20 ms 的低请求报文，但不会
 自动声明平行驾驶控制权。开始握手同时要求：
 
-1. 驾驶员的 WebRTC `control` DataChannel 已连接；
+1. 驾驶员的 profile/VCU/status WebRTC `control` DataChannel 已连接，原生控制端和车端
+   的专用控制 WSS 属于当前有效会话；
 2. 驾驶员在控制端点击“开始平行驾驶握手”；
 3. `WVCU_GearCtrlReqSts=1`（物理选择器为 N）；
 4. VCU 车速反馈有效且绝对值不大于 0.1 m/s；
@@ -69,8 +70,9 @@ N/R/D 三个挡位；电子驻车通过四路 EPB 状态单独判断，不能用
 2. 复用智驾握手：发送 `ShakeReq=2`、保持 `CloudShakeReq=0`，等待
    `WVCU_ShakeHandSts=5`。
 3. 发送 EPB 释放请求 1，等待四路转发状态都为 1。
-4. 发送 N/R/D 挡位和 EPS/EHB 模式，等待挡位反馈；进入驱动挡或 D/R 互换都要求
-   新鲜有效车速不大于 0.1 m/s。
+4. 控制页先以至少 3 条严格递增、跨度不小于 200 ms 的新鲜零速反馈确认稳定停车，
+   再以零牵引发送 N/R/D 目标挡；bridge 继续独立要求新鲜有效车速不大于 0.1 m/s，
+   并等待实际挡位和 EPS/EHB 模式反馈。目标挡确认前不得恢复牵引。
 5. 发送八路 MCU 扭矩模式，等待 MCU/EPS/EHB 全部模式反馈为 1。
 6. 只有完成以上反馈闭环后才发送本地 PID 计算出的扭矩、ChassisControl 转角和
    会话中已确认的直接 EHB 压力。
@@ -137,11 +139,12 @@ WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉
 4. 请求四路 EPB 驻车值 2，并等待四路状态都为 2。
 5. 清除 `ShakeReq`，等待人工状态 3。
 
-控制端通过同一条双向 DataChannel 每 500 ms 接收
+控制端通过双向 profile/VCU/status DataChannel 每 500 ms 接收
 `vcu_handshake_status`，可见 N/R/D 选择器、车速、EPB、VCU 状态、当前状态机阶段
 和最终 `ready`。
-只有 `ready=true` 才放行普通驾驶命令。点击“断开 VCU 握手”、DataChannel
-断开或安全退出时，车端执行上述完整反向序列；不会只停发 CAN。
+只有 `ready=true` 才放行由原生控制 WSS 到达的普通驾驶命令。点击“断开 VCU 握手”、
+DataChannel 断开或安全退出时，车端执行上述完整反向序列；原生控制 WSS 真断流则由
+独立 watchdog 按超时策略安全停车，不会只停发 CAN。
 
 控制页面的“实车调试限幅”窗口可设置当前浏览器会话的目标车速、单电机最大转矩、
 普通制动最大压力、缓刹压力、急刹压力和最大四轴转向角。控制端默认分别为

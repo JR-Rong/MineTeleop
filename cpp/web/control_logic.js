@@ -25,6 +25,9 @@
     'service_brake',
     'hard_brake',
   ]);
+  const GEAR_CHANGE_STATIONARY_SPEED_MPS = 0.1;
+  const GEAR_CHANGE_STATIONARY_MIN_SAMPLES = 3;
+  const GEAR_CHANGE_STATIONARY_MIN_DURATION_MS = 200;
   const CONTROL_PROFILE_VERSION = 3;
   const CONTROL_PROFILE_FIELDS = Object.freeze([
     'profile_version',
@@ -695,11 +698,59 @@
     return {everReady: nextEverReady, resetInput: false, retainedWait};
   }
 
+  function createGearChangeStationaryEvidence() {
+    return {
+      firstObservedAtMs: 0,
+      lastObservedAtMs: 0,
+      lastStatusSeq: 0,
+      sampleCount: 0,
+      confirmed: false,
+    };
+  }
+
+  function updateGearChangeStationaryEvidence(
+      previousValue, vcuStatus, statusSequenceValue, observedAtMsValue) {
+    const previous = previousValue && typeof previousValue === 'object'
+      ? previousValue : createGearChangeStationaryEvidence();
+    const statusSequence = Number(statusSequenceValue);
+    const observedAtMs = Number(observedAtMsValue);
+    if (!Number.isSafeInteger(statusSequence) || statusSequence <= 0 ||
+        !Number.isFinite(observedAtMs) || observedAtMs < 0) {
+      return createGearChangeStationaryEvidence();
+    }
+    if (statusSequence <= Number(previous.lastStatusSeq || 0)) return previous;
+
+    const speed = Number(vcuStatus && vcuStatus.speed_mps);
+    if (!vcuStatus || vcuStatus.speed_valid !== true || !Number.isFinite(speed) ||
+        Math.abs(speed) > GEAR_CHANGE_STATIONARY_SPEED_MPS) {
+      return {
+        ...createGearChangeStationaryEvidence(),
+        lastStatusSeq: statusSequence,
+      };
+    }
+
+    const continuing = Number(previous.sampleCount || 0) > 0 &&
+        observedAtMs >= Number(previous.lastObservedAtMs || 0);
+    const firstObservedAtMs = continuing
+      ? Number(previous.firstObservedAtMs) : observedAtMs;
+    const sampleCount = continuing ? Number(previous.sampleCount) + 1 : 1;
+    return {
+      firstObservedAtMs,
+      lastObservedAtMs: observedAtMs,
+      lastStatusSeq: statusSequence,
+      sampleCount,
+      confirmed: sampleCount >= GEAR_CHANGE_STATIONARY_MIN_SAMPLES &&
+          observedAtMs - firstObservedAtMs >= GEAR_CHANGE_STATIONARY_MIN_DURATION_MS,
+    };
+  }
+
   function allowsGearChange(selectedGear, requestedGear, vcuStatus) {
     if (selectedGear === requestedGear || mockUnsupported(vcuStatus)) return true;
     const speed = Number(vcuStatus && vcuStatus.speed_mps);
     return Boolean(vcuStatus && vcuStatus.speed_valid) &&
-        Number.isFinite(speed) && Math.abs(speed) <= 0.1;
+        vcuStatus.gear_change_stationary_confirmed === true &&
+        Number.isFinite(speed) &&
+        Math.abs(speed) <= GEAR_CHANGE_STATIONARY_SPEED_MPS;
   }
 
   function deriveGearSelection(selectedGear, keyState, vcuStatus) {
@@ -755,7 +806,9 @@
         String(selectedGearValue || '') !== transition.toGear) {
       return false;
     }
-    const commandSequence = Number(message.command_seq);
+    const intentSequence = Number(message.intent_seq);
+    const commandSequence = Number.isSafeInteger(intentSequence) && intentSequence > 0
+      ? intentSequence : Number(message.command_seq);
     const statusSequence = Number(message.control_status_seq);
     return Number.isSafeInteger(commandSequence) && commandSequence > 0 &&
         Number.isSafeInteger(statusSequence) && statusSequence > transition.statusFloor &&
@@ -1023,15 +1076,93 @@
     return JSON.stringify(prepared) !== JSON.stringify(controlSnapshot(latestValue));
   }
 
+  function controlPrepareDeadlineMs(maxCommandGapMs) {
+    const gap = Number(maxCommandGapMs);
+    return Number.isFinite(gap) && gap > 0
+      ? Math.max(1, Math.min(100, Math.floor(gap / 2)))
+      : 100;
+  }
+
+  function createLatestControlWriteQueue(writeControl, onUnhandledError, onUrgentWrite) {
+    if (typeof writeControl !== 'function') throw new TypeError('writeControl must be a function');
+    const reportUnhandled = typeof onUnhandledError === 'function'
+      ? onUnhandledError
+      : function noop() {};
+    const notifyUrgent = typeof onUrgentWrite === 'function'
+      ? onUrgentWrite
+      : function noop() {};
+    let active = false;
+    let pending = null;
+
+    function mergeExtra(current, incoming) {
+      return Object.assign({}, current, incoming, {
+        estop: Boolean((current && current.estop) || (incoming && incoming.estop)),
+      });
+    }
+
+    async function drain() {
+      if (active) return;
+      active = true;
+      try {
+        while (pending) {
+          const request = pending;
+          pending = null;
+          try {
+            const result = await writeControl(request.extra, request.announceUnavailable);
+            for (const waiter of request.waiters) waiter.resolve(result);
+          } catch (error) {
+            if (!request.waiters.length) reportUnhandled(error);
+            for (const waiter of request.waiters) waiter.reject(error);
+          }
+        }
+      } finally {
+        active = false;
+        if (pending) drain().catch(reportUnhandled);
+      }
+    }
+
+    function send(extra, announceUnavailable) {
+      return new Promise(function enqueue(resolve, reject) {
+        const urgent = Boolean(extra && extra.estop);
+        if (pending) {
+          pending.extra = mergeExtra(pending.extra, extra);
+          pending.announceUnavailable = pending.announceUnavailable || announceUnavailable;
+          pending.waiters.push({resolve, reject});
+        } else {
+          pending = {
+            extra: Object.assign({}, extra),
+            announceUnavailable: Boolean(announceUnavailable),
+            waiters: [{resolve, reject}],
+          };
+        }
+        if (urgent && active) notifyUrgent();
+        drain().catch(reportUnhandled);
+      });
+    }
+
+    function enqueueHeartbeat() {
+      if (pending) return false;
+      pending = {extra: {}, announceUnavailable: false, waiters: []};
+      drain().catch(reportUnhandled);
+      return true;
+    }
+
+    return Object.freeze({send, enqueueHeartbeat});
+  }
+
   const CONTROL_OUTCOMES = Object.freeze([
     'forwarded',
     'superseded',
+    'expired_before_forward',
     'post_prepare_link_changed',
     'post_prepare_vcu_not_ready',
   ]);
 
   function shouldLogControlOutcome(outcome) {
-    if (outcome === 'prepared' || outcome === 'forwarded') return false;
+    // High-rate normal and expiry outcomes stay in the 1 Hz aggregate. The
+    // page emits a separately throttled diagnostic for preparation expiry.
+    if (outcome === 'prepared' || outcome === 'forwarded' ||
+        outcome === 'superseded' || outcome === 'expired_before_forward') return false;
     if (!CONTROL_OUTCOMES.includes(outcome)) throw new TypeError('unknown control outcome');
     return true;
   }
@@ -1041,6 +1172,7 @@
       prepared: 0,
       forwarded: 0,
       superseded: 0,
+      expired_before_forward: 0,
       post_prepare_link_changed: 0,
       post_prepare_vcu_not_ready: 0,
       last_prepared_seq: 0,
@@ -1102,6 +1234,11 @@
     requiresFreshInput,
     keepsHeldInput,
     transitionVcuState,
+    GEAR_CHANGE_STATIONARY_SPEED_MPS,
+    GEAR_CHANGE_STATIONARY_MIN_SAMPLES,
+    GEAR_CHANGE_STATIONARY_MIN_DURATION_MS,
+    createGearChangeStationaryEvidence,
+    updateGearChangeStationaryEvidence,
     allowsGearChange,
     deriveGearSelection,
     createGearTransition,
@@ -1124,6 +1261,8 @@
     isCurrentControlChannel,
     controlSnapshot,
     controlIntentSuperseded,
+    controlPrepareDeadlineMs,
+    createLatestControlWriteQueue,
     CONTROL_OUTCOMES,
     shouldLogControlOutcome,
     createControlOutcomeMetrics,

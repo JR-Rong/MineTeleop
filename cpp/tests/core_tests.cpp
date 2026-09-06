@@ -1417,6 +1417,9 @@ void test_field_config_pins_tls_route_without_system_dns() {
   expect(
       config.runtime.teleop_poll_interval_ms == 500,
       "field vehicle session discovery interval is not rate-limit safe");
+  expect(
+      config.runtime.control_log_commands,
+      "field vehicle per-command diagnostic tracing is disabled");
   expect(config.cloud.ice_transport_policy == "all", "field vehicle ICE policy is not the safe default");
   expect(mine_teleop::ice_transport_policy_is_valid("all"), "all ICE policy was rejected");
   expect(mine_teleop::ice_transport_policy_is_valid("relay"), "relay ICE policy was rejected");
@@ -1723,6 +1726,112 @@ void test_mailbox_keeps_only_latest_command() {
   expect(mailbox.pending_count() == 1, "mailbox should contain one command");
   expect(mailbox.dropped_count() == 1, "mailbox should count overwritten command");
   expect(mailbox.pop_latest()->seq == 2, "mailbox did not preserve latest command");
+}
+
+void test_native_control_intent_lease_neutralizes_without_replay() {
+  mine_teleop::NativeControlIntentStore store(150);
+  mine_teleop::NativeControlIntent neutral{
+      "ui-1", 1, "D", 0.0, 0.0, 0.0, false};
+  auto update = store.update(neutral, 1000);
+  expect(update.accepted && !update.requires_fresh_input, "initial neutral intent did not arm native control");
+
+  auto drive = neutral;
+  drive.intent_seq = 2;
+  drive.steering = 0.1;
+  drive.throttle = 0.2;
+  update = store.update(drive, 1010);
+  expect(update.accepted, "fresh drive intent was rejected after neutral arming");
+  auto sample = store.sample(1159);
+  expect(
+      sample.active && sample.fresh && !sample.requires_fresh_input &&
+          sample.intent.throttle == 0.2 && sample.intent.steering == 0.1,
+      "fresh native intent was not retained before the lease boundary");
+
+  sample = store.sample(1160);
+  expect(
+      sample.active && !sample.fresh && sample.requires_fresh_input &&
+          sample.intent.gear == "D" && sample.intent.throttle == 0.0 &&
+          sample.intent.steering == 0.0 && sample.intent.brake == 0.0,
+      "expired native intent did not preserve gear while zeroing all actuation");
+
+  update = store.update(drive, 1170);
+  expect(
+      !update.accepted && update.reason == "fresh_neutral_required",
+      "an expired non-neutral keepalive restored stale actuation");
+  auto newer_drive = drive;
+  newer_drive.intent_seq = 3;
+  update = store.update(newer_drive, 1180);
+  expect(
+      !update.accepted && update.reason == "fresh_neutral_required",
+      "a new sequence bypassed the post-expiry neutral interlock");
+
+  neutral.intent_seq = 4;
+  update = store.update(neutral, 1190);
+  expect(update.accepted && !update.requires_fresh_input, "fresh neutral did not re-arm native control");
+  newer_drive.intent_seq = 5;
+  update = store.update(newer_drive, 1200);
+  expect(update.accepted, "new drive input was rejected after a fresh neutral");
+
+  store.invalidate();
+  sample = store.sample(1201);
+  expect(
+      sample.requires_fresh_input && sample.intent.throttle == 0.0 &&
+          sample.intent.steering == 0.0,
+      "transport invalidation did not fail closed to neutral");
+}
+
+void test_native_control_intent_is_latest_only_and_estop_sticky() {
+  mine_teleop::NativeControlIntentStore store(150);
+  const mine_teleop::NativeControlIntent neutral{
+      "ui-1", 1, "R", 0.0, 0.0, 0.0, false};
+  expect(store.update(neutral, 10).accepted, "initial neutral intent was rejected");
+  auto drive = neutral;
+  drive.intent_seq = 2;
+  drive.throttle = 0.1;
+  expect(store.update(drive, 20).accepted, "drive intent was rejected");
+  auto latest = drive;
+  latest.intent_seq = 3;
+  latest.throttle = 0.3;
+  expect(store.update(latest, 21).accepted, "latest drive intent was rejected");
+  expect(store.sample(22).intent.throttle == 0.3, "native intent store replayed an overwritten value");
+
+  auto conflict = latest;
+  conflict.throttle = 0.4;
+  auto update = store.update(conflict, 23);
+  expect(!update.accepted && update.reason == "intent_seq_conflict", "intent sequence reuse was accepted");
+  auto old = drive;
+  update = store.update(old, 24);
+  expect(!update.accepted && update.reason == "old_intent_seq", "older intent sequence was accepted");
+
+  auto estop = latest;
+  estop.intent_seq = 4;
+  estop.estop = true;
+  expect(store.update(estop, 25).accepted, "ESTOP intent was rejected");
+  const auto estop_sample = store.sample(25);
+  expect(
+      estop_sample.intent.estop && estop_sample.intent.steering == 0.0 &&
+          estop_sample.intent.throttle == 0.0 && estop_sample.intent.brake == 0.0,
+      "ESTOP intent retained ordinary actuation");
+  auto cleared = neutral;
+  cleared.intent_seq = 5;
+  expect(store.update(cleared, 26).accepted, "post-ESTOP neutral update was rejected");
+  const auto duplicate_clear = store.update(cleared, 27);
+  expect(
+      duplicate_clear.accepted && duplicate_clear.duplicate,
+      "sticky ESTOP caused an identical intent refresh sequence conflict");
+  expect(store.sample(1000).intent.estop, "ESTOP did not remain sticky after lease expiry and neutral update");
+
+  auto replacement_ui = neutral;
+  replacement_ui.ui_instance_id = "ui-2";
+  replacement_ui.intent_seq = 1;
+  replacement_ui.throttle = 0.2;
+  update = store.update(replacement_ui, 1001);
+  expect(
+      !update.accepted && update.requires_fresh_input &&
+          update.reason == "fresh_neutral_required",
+      "a replacement page restored non-neutral input without a neutral handshake");
+  store.reset();
+  expect(!store.sample(1002).active, "session reset retained a prior native intent");
 }
 
 void test_safety_timeout_profile_and_estop_latch() {
@@ -2127,19 +2236,28 @@ void test_control_service_commits_only_successfully_applied_commands() {
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
     service.start(0);
+    activate_adapter_owned_session_profile(service, *adapter_view);
+    expect(
+        service.receive_command(command(1, 0), 0).accepted,
+        "control command before overdue ESTOP was rejected");
+    service.tick(300);
 
-    auto estop = command(1, 0);
+    auto estop = command(2, 810);
     estop.estop = true;
     adapter_view->safe_stop_throws = true;
     expect_throws(
-        [&] { static_cast<void>(service.receive_command(estop, 0)); },
-        "adapter ESTOP failure did not propagate");
+        [&] { static_cast<void>(service.receive_command(estop, 810)); },
+        "overdue adapter ESTOP failure did not propagate");
     expect(
         service.safety_state() == mine_teleop::SafetyState::Estop,
-        "adapter ESTOP failure rolled back the outer ESTOP latch");
+        "overdue adapter ESTOP failure rolled back the outer ESTOP latch");
+    expect(
+        !service.session_control_profile().at("active").get<bool>() &&
+            adapter_view->session_motor_torque_limit_nm() == 0.0,
+        "overdue adapter ESTOP failure retained session traction authority");
 
     adapter_view->safe_stop_throws = false;
-    const auto replay = service.receive_command(estop, 1);
+    const auto replay = service.receive_command(estop, 811);
     expect(
         !replay.accepted && replay.reason == "old_seq" &&
             service.safety_state() == mine_teleop::SafetyState::Estop,
@@ -2158,11 +2276,117 @@ void test_control_service_reports_safe_stop_output_after_timeout() {
   activate_session_profile(service);
   expect(service.receive_command(command(1, 0), 0).accepted, "control command was rejected");
   service.tick(800);
-  service.tick(1300);
   expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake, "service did not enter timeout");
+  expect(
+      !service.session_control_profile().at("active").get<bool>(),
+      "hard control timeout retained the session control profile");
+  expect_near(
+      adapter_view->session_motor_torque_limit_nm(),
+      0.0,
+      1e-9,
+      "hard control timeout retained session traction authority");
+  service.tick(1300);
   const auto telemetry = adapter_view->read_telemetry();
   expect_near(telemetry.throttle_feedback, 0.0, 1e-9, "timeout telemetry retained stale throttle");
   expect_near(telemetry.brake_feedback, 0.6, 1e-9, "timeout telemetry did not report safe brake");
+  const auto gap_rearm = service.receive_command(command(2, 1310), 1310);
+  expect(
+      !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
+      "hard-timeout receiver did not re-arm on the first fresh command");
+  const auto blocked = service.receive_command(command(3, 1320), 1320);
+  expect(
+      !blocked.accepted && blocked.reason == "session_control_profile_required",
+      "hard control timeout recovered without explicit profile re-authorization");
+  service.close();
+}
+
+void test_control_service_recovers_from_degraded_command_gap_without_profile_reapply() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+  auto* adapter_view = adapter.get();
+  mine_teleop::VehicleControlService service(
+      config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(0);
+  activate_session_profile(service);
+  expect(service.receive_command(command(1, 0), 0).accepted, "control command was rejected");
+
+  service.tick(300);
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::Degraded,
+      "service did not enter the recoverable degraded state");
+  expect(
+      service.session_control_profile().at("active").get<bool>(),
+      "recoverable command jitter revoked the session control profile");
+  expect_near(
+      adapter_view->session_motor_torque_limit_nm(),
+      100.0,
+      1e-9,
+      "recoverable command jitter withdrew the acknowledged torque ceiling");
+  const auto degraded_telemetry = adapter_view->read_telemetry();
+  expect_near(
+      degraded_telemetry.throttle_feedback,
+      0.0,
+      1e-9,
+      "degraded state retained stale traction while preserving the profile");
+
+  const auto gap_rearm = service.receive_command(command(2, 350), 350);
+  expect(
+      !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
+      "first fresh command after the gap did not re-arm receiver timing");
+  const auto held_input = service.receive_command(command(3, 360), 360);
+  expect(
+      !held_input.accepted && held_input.reason == "degraded_neutral_required",
+      "degraded control resumed stale held input before an explicit neutral command");
+  auto neutral = command(4, 370);
+  neutral.steering = 0.0;
+  neutral.throttle = 0.0;
+  const auto recovered = service.receive_command(neutral, 370);
+  expect(recovered.accepted, "fresh neutral command did not recover degraded control");
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::ControlActive,
+      "fresh neutral command did not restore active control");
+  expect(
+      service.receive_command(command(5, 380), 380).accepted,
+      "fresh input remained blocked after explicit neutral recovery");
+  expect(
+      service.session_control_profile().at("active").get<bool>() &&
+          adapter_view->session_motor_torque_limit_nm() == 100.0,
+      "degraded recovery required an unsafe profile re-application");
+  service.close();
+}
+
+void test_control_service_receive_path_cannot_bypass_hard_timeout() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+  auto* adapter_view = adapter.get();
+  mine_teleop::VehicleControlService service(
+      config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(0);
+  activate_session_profile(service);
+  expect(service.receive_command(command(1, 0), 0).accepted, "control command was rejected");
+  const auto controls_before_timeout = adapter_view->status().applied_command_count;
+
+  service.tick(300);
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::Degraded,
+      "service did not enter degraded before receive-path timeout test");
+
+  const auto gap_rearm = service.receive_command(command(2, 810), 810);
+  expect(
+      !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
+      "first packet after a hard timeout did not re-arm receiver timing");
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
+          !service.session_control_profile().at("active").get<bool>(),
+      "receive path failed to advance the hard timeout and revoke the profile");
+
+  const auto blocked = service.receive_command(command(3, 820), 820);
+  expect(
+      !blocked.accepted && blocked.reason == "session_control_profile_required",
+      "fresh packets bypassed profile re-authorization after the hard timeout");
+  expect(
+      adapter_view->status().applied_command_count == controls_before_timeout,
+      "a command reached the adapter after receive-path hard timeout");
   service.close();
 }
 
@@ -3471,11 +3695,11 @@ void test_basler_camera_uses_minimal_aravis_bridge() {
       "Aravis bridge did not receive the bounded JPEG quality setting");
 }
 
-void test_native_driver_to_vehicle_data_channel_payload() {
+void test_native_driver_to_vehicle_signaling_control_payload() {
   mine_teleop::SignalingServerConfig signaling_config;
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "dev-device-secret"}};
-  signaling_config.control_token_ttl_ms = 100;
+  signaling_config.control_token_ttl_ms = 5000;
   signaling_config.connection_reaper_interval_ms = 5;
   auto signaling = std::make_shared<mine_teleop::SignalingService>(std::move(signaling_config));
   mine_teleop::SimpleHttpServer server(
@@ -3497,6 +3721,7 @@ void test_native_driver_to_vehicle_data_channel_payload() {
   const auto vehicle_generation = online.at("connection_generation").get<std::uint64_t>();
   auto driver_config = mine_teleop::load_driver_config("configs/driver-console.dev.yaml");
   driver_config.signaling_url = base;
+  driver_config.intent_lease_ms = 1000;
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
   const auto connection = driver.connect();
   expect(connection.value("connected", false), "driver failed to connect");
@@ -3507,14 +3732,75 @@ void test_native_driver_to_vehicle_data_channel_payload() {
   const auto vehicle_session = http.get_json(
       base + "/vehicles/vehicle-001/session?device_token=dev-device-secret&connection_generation=" +
       std::to_string(vehicle_generation));
-  const auto prepared = driver.send_control({{"gear", "D"}, {"steering", 0.1}, {"throttle", 0.2}, {"brake", 0.0}});
-  expect(prepared.value("prepared", false), "driver did not prepare a DataChannel command");
-  expect(prepared.value("transport", "") == "webrtc_data_channel", "driver selected the wrong control transport");
-  const auto control = mine_teleop::ControlCommand::from_json(prepared.at("command"));
-  expect(control.session_id == connection.value("session_id", ""), "DataChannel command used the wrong session");
+  const auto session_id = connection.at("session_id").get<std::string>();
+  const auto session_generation =
+      connection.at("control_session_generation").get<std::uint64_t>();
+  const auto neutral = driver.update_control_intent(
+      {{"session_id", session_id},
+       {"session_generation", session_generation},
+       {"ui_instance_id", "native-control-integration-test"},
+       {"intent_seq", 1},
+       {"gear", "N"},
+       {"steering", 0.0},
+       {"throttle", 0.0},
+       {"brake", 0.0}});
+  expect(
+      neutral.value("accepted", false) &&
+          neutral.value("transport", "") == "native_signaling_websocket",
+      "fresh neutral intent did not arm the native control sender");
+  const auto active = driver.update_control_intent(
+      {{"session_id", session_id},
+       {"session_generation", session_generation},
+       {"ui_instance_id", "native-control-integration-test"},
+       {"intent_seq", 2},
+       {"gear", "D"},
+       {"steering", 0.1},
+       {"throttle", 0.2},
+       {"brake", 0.0}});
+  expect(active.value("accepted", false), "non-neutral native control intent was rejected");
+
+  const auto control_messages_url =
+      base + "/signaling/" + session_id +
+      "/messages?recipient=vehicle-001&device_token=dev-device-secret&connection_generation=" +
+      std::to_string(vehicle_generation) + "&types=control_command";
+  mine_teleop::Json native_message;
+  const auto delivery_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  do {
+    const auto messages = http.get_json(control_messages_url).at("messages");
+    if (!messages.empty()) {
+      const auto& candidate = messages.back();
+      if (candidate.value("type", "") == "control_command" &&
+          candidate.at("payload").value("intent_seq", std::uint64_t{0}) == 2 &&
+          candidate.at("payload").value("intent_fresh", false)) {
+        native_message = candidate;
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  } while (std::chrono::steady_clock::now() < delivery_deadline);
+  expect(
+      native_message.is_object() && !native_message.empty(),
+      "native sender did not publish the fresh non-neutral intent to the control mailbox");
+  expect(
+      native_message.value("sender", "") == "driver-console-001" &&
+          native_message.value("recipient", "") == "vehicle-001" &&
+          native_message.value("session_id", "") == session_id,
+      "native control signaling wrapper used the wrong route or session");
+  const auto& native_payload = native_message.at("payload");
+  expect(
+      native_payload.value("intent_seq", std::uint64_t{0}) == 2 &&
+          native_payload.value("intent_fresh", false),
+      "native control payload lost its fresh browser intent identity");
+  const auto control = mine_teleop::ControlCommand::from_json(native_payload);
+  expect(control.session_id == session_id, "native control command used the wrong session");
   expect(
       control.control_token == vehicle_session.value("control_token", ""),
-      "DataChannel command did not use the server-issued control token");
+      "native control command did not use the server-issued control token");
+  expect(
+      control.gear == "D" && control.steering == 0.1 &&
+          control.throttle == 0.2 && control.brake == 0.0,
+      "native control command did not preserve the latest intent values");
   mine_teleop::VehicleControlService receiver(
       vehicle_config,
       "driver-console-001",
@@ -3531,22 +3817,10 @@ void test_native_driver_to_vehicle_data_channel_payload() {
       receiver.receive_session_profile(profile, received_at_ms).accepted,
       "vehicle receiver did not ACK the session profile before control");
   const auto applied = receiver.receive_command(control, received_at_ms);
-  expect(applied.accepted, "vehicle receiver did not accept the DataChannel command payload");
+  expect(applied.accepted, "vehicle receiver did not accept the native signaling control payload");
   const auto duplicate = receiver.receive_command(control, received_at_ms + 1);
   expect(!duplicate.accepted && duplicate.reason == "old_seq", "vehicle receiver accepted a duplicate command");
   receiver.close();
-  const auto expiry_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-  mine_teleop::Json after_expiry;
-  do {
-    after_expiry = http.get_json(base + "/health");
-    if (after_expiry.value("active_sessions", 0) == 0) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  } while (std::chrono::steady_clock::now() < expiry_deadline);
-  expect(after_expiry.value("active_sessions", 0) == 0, "server did not expire the short-lived control session");
-  const auto renewed_connection = driver.connect();
-  expect(
-      renewed_connection.value("session_id", "") != connection.value("session_id", ""),
-      "driver console reused a server-expired local session");
   const auto disconnected = driver.disconnect("test_disconnect");
   expect(disconnected.value("state", "") == "offline", "driver console disconnect did not release authority");
   const auto released_session = http.get_json(
@@ -3614,7 +3888,7 @@ void test_driver_login_lists_only_authorized_vehicles() {
   server.stop();
 }
 
-void test_driver_console_page_keeps_waiting_state_during_background_safety_ticks() {
+void test_driver_console_page_keeps_waiting_state_during_background_intent_refresh() {
   mine_teleop::DriverConfig config;
   config.driver_id = "driver-console-001";
   config.signaling_url = "http://127.0.0.1:1";
@@ -3627,10 +3901,15 @@ void test_driver_console_page_keeps_waiting_state_during_background_safety_ticks
   expect(response.status == 200, "driver console page did not load");
   expect(
       response.body.find("async function send(extra={},announceUnavailable=true)") != std::string::npos,
-      "driver console page cannot distinguish background safety ticks from user control attempts");
+      "driver console page cannot distinguish background intent refresh from user control attempts");
   expect(
-      response.body.find("await send({},false)") != std::string::npos,
-      "background safety tick still announces a control fault while waiting for media");
+      response.body.find("function enqueueIntentRefresh()") != std::string::npos &&
+          response.body.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
+              std::string::npos &&
+          response.body.find(
+              "sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
+              std::string::npos,
+      "background intent refresh still announces a control fault while waiting for media");
   expect(
       response.body.find("webrtcLabel.textContent='等待车端媒体'") != std::string::npos,
       "driver console page does not expose the pending vehicle-media state");
@@ -3704,6 +3983,10 @@ int main() {
       {"shared_protocol_v1_vectors_and_session_states", test_shared_protocol_v1_vectors_and_session_states},
       {"control_receiver_enforces_token_sequence_and_gap", test_control_receiver_enforces_token_sequence_and_gap},
       {"mailbox_keeps_only_latest_command", test_mailbox_keeps_only_latest_command},
+      {"native_control_intent_lease_neutralizes_without_replay",
+       test_native_control_intent_lease_neutralizes_without_replay},
+      {"native_control_intent_is_latest_only_and_estop_sticky",
+       test_native_control_intent_is_latest_only_and_estop_sticky},
       {"safety_timeout_profile_and_estop_latch", test_safety_timeout_profile_and_estop_latch},
       {"session_control_profile_ack_sequence_limits_and_clear", test_session_control_profile_ack_sequence_limits_and_clear},
       {"session_control_profile_uses_independent_two_second_age_window", test_session_control_profile_uses_independent_two_second_age_window},
@@ -3711,6 +3994,10 @@ int main() {
       {"control_service_commits_only_successfully_applied_commands",
        test_control_service_commits_only_successfully_applied_commands},
       {"control_service_reports_safe_stop_output_after_timeout", test_control_service_reports_safe_stop_output_after_timeout},
+      {"control_service_recovers_from_degraded_command_gap_without_profile_reapply",
+       test_control_service_recovers_from_degraded_command_gap_without_profile_reapply},
+      {"control_service_receive_path_cannot_bypass_hard_timeout",
+       test_control_service_receive_path_cannot_bypass_hard_timeout},
       {"control_service_preserves_physical_brake_across_degraded_timeout", test_control_service_preserves_physical_brake_across_degraded_timeout},
       {"control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshake",
        test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshake},
@@ -3734,8 +4021,8 @@ int main() {
       {"nvenc_pipeline_stage_tracks_gstreamer_property_compatibility", test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility},
       {"native_testsrc_acquisition_does_not_spawn_ffmpeg", test_native_testsrc_acquisition_does_not_spawn_ffmpeg},
       {"basler_camera_uses_minimal_aravis_bridge", test_basler_camera_uses_minimal_aravis_bridge},
-      {"native_driver_to_vehicle_data_channel_payload", test_native_driver_to_vehicle_data_channel_payload},
-      {"driver_console_page_keeps_waiting_state_during_background_safety_ticks", test_driver_console_page_keeps_waiting_state_during_background_safety_ticks},
+      {"native_driver_to_vehicle_signaling_control_payload", test_native_driver_to_vehicle_signaling_control_payload},
+      {"driver_console_page_keeps_waiting_state_during_background_intent_refresh", test_driver_console_page_keeps_waiting_state_during_background_intent_refresh},
       {"driver_login_lists_only_authorized_vehicles", test_driver_login_lists_only_authorized_vehicles},
       {"local_archive_uploader_is_atomic_and_resumable", test_local_archive_uploader_is_atomic_and_resumable},
   };

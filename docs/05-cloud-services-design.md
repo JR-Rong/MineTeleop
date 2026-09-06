@@ -166,6 +166,7 @@ logout；异常关闭则由默认 15 秒驾驶端心跳超时回收控制权。
 - `webrtc_offer`
 - `webrtc_answer`
 - `ice_candidate`
+- `control_command`（仅驾驶端原生进程到车端的专用控制 WSS）
 - `session_end`
 
 控制权回收是 server-side 状态变更，应通过受控 API 触发并写审计，不允许普通
@@ -174,7 +175,10 @@ logout；异常关闭则由默认 15 秒驾驶端心跳超时回收控制权。
 `session_request` 由 HTTP API 处理；`session_accept`/`session_reject` 属于
 后续显式会话协商模型的 server-side 生命周期结果，不能通过普通信令消息伪造 `session_accept`、`session_reject` 或控制权状态变更。
 
-信令只负责建立连接和会话状态，不转发每条控制命令。
+普通 WebRTC 信令使用可确认的会话隔离队列；控制命令使用独立序列域和容量为 1、
+TTL 150 ms 的 latest-only mailbox，由控制端 send-only WSS 写入、车端
+`types=control_command` 的 control-only WSS 读取。服务端只做鉴权、限长、覆盖和
+转发，不执行车辆安全决策，也不把旧控制命令积压或重放。
 
 本地参考实现对信令消息发送方、收件人、消息拉取方和 WebSocket 升级参与者
 都执行会话参与者校验；驾驶员侧必须带短期登录 token，车端侧必须带设备
@@ -209,6 +213,19 @@ WebSocket push 不会在 socket 写出前删除队列消息。每条消息带服
 `signaling_delivery_ack`，服务端只清理不高于已确认游标的消息。连接在确认前
 中断时，同一有效会话重连会补发，客户端按游标去重；确认游标不得超过该连接
 实际发送过的最高值。
+车端 `types=control_command` 视图只投递控制 mailbox，且它的 delivery ACK 只能删除
+该 mailbox，不能顺带确认或删除 offer/answer/ICE。驾驶端专用控制 WSS 为 send-only，
+不能同时请求接收类型；这两条限制避免控制高频流量污染普通信令的可靠投递语义。
+
+现场诊断可给 signaling server 增加 `--native-control-trace`。它把控制命令的
+`ingress_queued`、mailbox 覆盖/过期、`delivery_send_completed`/失败和
+`delivery_ack_received` 以 `cloud_native_control_trace_batch` 异步批量写入现有
+signaling audit。记录包含 `trace_session_id`、`seq`、`intent_seq`、
+`delivery_cursor`、命令发送/云端接收/入队/投递/ACK 时间和各段耗时，不包含控制
+token。新车端在 delivery ACK 中回传同一组关联键，云端同时校验 ACK 的会话归属，
+避免 20 Hz mailbox 已被下一条命令覆盖时丢失 ACK 对应的命令序号。生产部署模板当前
+开启该诊断；写盘在独立有界队列中完成，队列竞争或饱和会增加
+`dropped_total`，不会阻塞控制 WSS 热路径。
 
 客户端到服务端的信令 ACK 包含原 `seq`、稳定 `message_id` 和目标队列的
 `delivery_cursor`。相同会话、发送方、序列号和内容的重试返回原确认并标记

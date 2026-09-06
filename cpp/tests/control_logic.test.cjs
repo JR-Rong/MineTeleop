@@ -1,7 +1,10 @@
 'use strict';
 
 const assert = require('assert').strict;
+const fs = require('fs');
+const path = require('path');
 const logic = require('../web/control_logic.js');
+const controlPageSource = fs.readFileSync(path.join(__dirname, '../src/server.cpp'), 'utf8');
 
 let passed = 0;
 let failed = 0;
@@ -24,7 +27,23 @@ const readyVcu = {
   adapter_ready: true,
   speed_valid: true,
   speed_mps: 0,
+  gear_change_stationary_confirmed: true,
 };
+
+test('browser native intent envelope is bound to the connected session generation', () => {
+  assert.equal(
+      controlPageSource.includes(
+          "return{session_id:nativeControlSessionId,session_generation:nativeControlSessionGeneration,ui_instance_id:uiInstanceId,intent_seq:nativeIntentSeq,...normalized}"),
+      true);
+  assert.equal(
+      controlPageSource.includes(
+          "nativeControlSessionId=String(session.session_id||'');nativeControlSessionGeneration=Number(session.control_session_generation)"),
+      true);
+  assert.equal(
+      controlPageSource.includes(
+          "nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot=''"),
+      true);
+});
 
 test('fixed keyboard bindings expose two brakes and paired direction keys', () => {
   assert.deepEqual(logic.KEY_BINDINGS, {
@@ -57,7 +76,38 @@ test('blocked keys require a physical release before a fresh press', () => {
   assert.equal(logic.pressKey(pressed, blocked, 'ArrowLeft').accepted, true);
 });
 
-test('gear selection latches on release and gates every new D/R selection on valid zero speed', () => {
+test('stationary evidence requires three fresh samples spanning at least 200 ms', () => {
+  let evidence = logic.createGearChangeStationaryEvidence();
+  evidence = logic.updateGearChangeStationaryEvidence(
+      evidence, {speed_valid: true, speed_mps: 0.1}, 10, 1000);
+  assert.equal(evidence.confirmed, false);
+  evidence = logic.updateGearChangeStationaryEvidence(
+      evidence, {speed_valid: true, speed_mps: -0.1}, 11, 1100);
+  assert.equal(evidence.confirmed, false);
+  evidence = logic.updateGearChangeStationaryEvidence(
+      evidence, {speed_valid: true, speed_mps: 0}, 12, 1200);
+  assert.deepEqual(evidence, {
+    firstObservedAtMs: 1000,
+    lastObservedAtMs: 1200,
+    lastStatusSeq: 12,
+    sampleCount: 3,
+    confirmed: true,
+  });
+
+  const duplicate = logic.updateGearChangeStationaryEvidence(
+      evidence, {speed_valid: true, speed_mps: 0}, 12, 1300);
+  assert.strictEqual(duplicate, evidence);
+  const moving = logic.updateGearChangeStationaryEvidence(
+      evidence, {speed_valid: true, speed_mps: 0.1001}, 13, 1300);
+  assert.equal(moving.confirmed, false);
+  assert.equal(moving.sampleCount, 0);
+  const stale = logic.updateGearChangeStationaryEvidence(
+      evidence, {speed_valid: false, speed_mps: 0}, 13, 1300);
+  assert.equal(stale.confirmed, false);
+  assert.equal(stale.sampleCount, 0);
+});
+
+test('gear selection latches on release and gates every new D/R selection on stable zero speed', () => {
   const forward = {up: true, down: false};
   const released = {up: false, down: false};
   const reverse = {up: false, down: true};
@@ -72,6 +122,9 @@ test('gear selection latches on release and gates every new D/R selection on val
   });
   assert.equal(logic.allowsGearChange('P', 'D', {...readyVcu, speed_valid: false}), false);
   assert.equal(logic.allowsGearChange('P', 'D', readyVcu), true);
+  assert.equal(
+      logic.allowsGearChange('D', 'R', {...readyVcu, gear_change_stationary_confirmed: false}),
+      false);
   assert.deepEqual(logic.deriveGearSelection('D', reverse, {...readyVcu, speed_valid: false}), {
     selectedGear: 'D', pendingGearRequest: 'R', changed: false,
   });
@@ -107,14 +160,27 @@ test('gear rejection matches only a forwarded command from the active transition
   assert.deepEqual(transition.forwardedSeqs, [101, 102]);
   assert.equal(logic.matchesGearChangeRejection(transition, {
     issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    intent_seq: 101,
+    command_seq: 999,
+    control_status_seq: 41,
+  }, 'R'), true);
+  assert.equal(logic.matchesGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    intent_seq: 103,
+    command_seq: 101,
+    control_status_seq: 41,
+  }, 'R'), false);
+  assert.equal(logic.matchesGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
     command_seq: 101,
     control_status_seq: 41,
   }, 'R'), true);
   assert.equal(logic.matchesGearChangeRejection(transition, {
     issue_code: 'vcu_drive_gear_change_moving_or_stale',
-    command_seq: 103,
+    intent_seq: 0,
+    command_seq: 102,
     control_status_seq: 41,
-  }, 'R'), false);
+  }, 'R'), true);
   assert.equal(logic.matchesGearChangeRejection(transition, {
     issue_code: 'vcu_drive_gear_change_moving_or_stale',
     command_seq: 101,
@@ -128,7 +194,7 @@ test('gear rejection matches only a forwarded command from the active transition
 
   assert.deepEqual(logic.reduceGearChangeRejection(transition, {
     issue_code: 'vcu_drive_gear_change_moving_or_stale',
-    command_seq: 101,
+    intent_seq: 101,
     control_status_seq: 41,
   }, 'R'), {
     matched: true,
@@ -819,10 +885,82 @@ test('latest intent supersedes ordinary prepared commands but never an ESTOP', (
   assert.equal(logic.controlIntentSuperseded(estop, {...ordinary, throttle: 0}), false);
 });
 
+test('control prepare deadline reserves at least half the command-gap budget', () => {
+  assert.equal(logic.controlPrepareDeadlineMs(200), 100);
+  assert.equal(logic.controlPrepareDeadlineMs(150), 75);
+  assert.equal(logic.controlPrepareDeadlineMs(500), 100);
+  assert.equal(logic.controlPrepareDeadlineMs(undefined), 100);
+});
+
+test('latest-write queue bounds heartbeat backlog and preserves a pending ESTOP', async () => {
+  const deferred = [];
+  const calls = [];
+  const writeControl = (extra, announceUnavailable) => {
+    calls.push({extra, announceUnavailable});
+    return new Promise((resolve, reject) => deferred.push({resolve, reject}));
+  };
+  const unhandled = [];
+  let urgentWrites = 0;
+  const queue = logic.createLatestControlWriteQueue(
+      writeControl,
+      error => unhandled.push(error),
+      () => {
+        urgentWrites += 1;
+        if (deferred[0]) {
+          deferred[0].resolve({sent: false, reason: 'control_prepare_preempted_by_estop'});
+        }
+      });
+
+  const first = queue.send({throttle: 0.4}, false);
+  assert.equal(calls.length, 1);
+  assert.equal(queue.enqueueHeartbeat(), true);
+  assert.equal(queue.enqueueHeartbeat(), false);
+  const estop = queue.send({estop: true}, true);
+  assert.equal(urgentWrites, 1);
+
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1], {extra: {estop: true}, announceUnavailable: true});
+  assert.equal(queue.enqueueHeartbeat(), true);
+  assert.equal(queue.enqueueHeartbeat(), false);
+
+  deferred[1].resolve({id: 2});
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(calls.length, 3);
+  deferred[2].resolve({id: 3});
+  assert.deepEqual(await first, {sent: false, reason: 'control_prepare_preempted_by_estop'});
+  assert.deepEqual(await estop, {id: 2});
+  await Promise.resolve();
+  assert.deepEqual(unhandled, []);
+});
+
+test('waiterless heartbeat rejection is consumed and the queue continues', async () => {
+  const failure = new Error('synthetic heartbeat failure');
+  const calls = [];
+  const unhandled = [];
+  const queue = logic.createLatestControlWriteQueue(
+      async extra => {
+        calls.push(extra);
+        if (calls.length === 1) throw failure;
+        return {sent: true};
+      },
+      error => unhandled.push(error));
+
+  assert.equal(queue.enqueueHeartbeat(), true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(unhandled, [failure]);
+  assert.equal(queue.enqueueHeartbeat(), true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.length, 2);
+});
+
 test('every prepared browser command has exactly one named terminal outcome', () => {
   assert.equal(logic.shouldLogControlOutcome('prepared'), false);
   assert.equal(logic.shouldLogControlOutcome('forwarded'), false);
-  assert.equal(logic.shouldLogControlOutcome('superseded'), true);
+  assert.equal(logic.shouldLogControlOutcome('superseded'), false);
+  assert.equal(logic.shouldLogControlOutcome('expired_before_forward'), false);
   assert.equal(logic.shouldLogControlOutcome('post_prepare_link_changed'), true);
   assert.equal(logic.shouldLogControlOutcome('post_prepare_vcu_not_ready'), true);
   assert.throws(() => logic.shouldLogControlOutcome('delivered'), /unknown control outcome/);
@@ -836,16 +974,17 @@ test('every prepared browser command has exactly one named terminal outcome', ()
     sequence += 1;
   }
   assert.deepEqual(metrics, {
-    prepared: 4,
+    prepared: 5,
     forwarded: 1,
     superseded: 1,
+    expired_before_forward: 1,
     post_prepare_link_changed: 1,
     post_prepare_vcu_not_ready: 1,
-    last_prepared_seq: 13,
+    last_prepared_seq: 14,
     last_forwarded_seq: 10,
   });
   assert.throws(
-      () => logic.reduceControlOutcome(metrics, 'forwarded', 13),
+      () => logic.reduceControlOutcome(metrics, 'forwarded', 14),
       /does not match/);
 });
 

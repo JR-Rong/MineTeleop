@@ -125,12 +125,14 @@ if ! grep -F --quiet 'VehicleStopReason::VcuStateFault' <<<"$control_tick_block"
 fi
 # Profile and handshake callbacks must reject a stale DataChannel before they
 # can publish a rejection/status to the replacement channel. Ordinary control
-# has no response, so it may keep the identity check in its combined gate. The
-# executable control contract test verifies the ordering inside both branches;
-# this package-level check makes sure neither form disappears from production.
+# is no longer accepted from any DataChannel: it must be rejected before the
+# native control validation/apply path. The executable control contract test
+# verifies the ordering; this package-level check keeps both boundaries in the
+# production source.
 if [[ "$(grep -F -c 'if (control_channel != channel) return;' <<<"$control_message_block")" -lt 2 ]] ||
-   [[ "$(grep -F -c 'stop_requested || control_inhibited || control_channel != channel' <<<"$control_message_block")" -lt 1 ]] ||
-   [[ "$(grep -F -c 'stop_requested || control_inhibited || !control_service_started' <<<"$control_message_block")" -lt 2 ]]; then
+   [[ "$(grep -F -c 'stop_requested || control_inhibited || !control_service_started' <<<"$control_message_block")" -lt 2 ]] ||
+   ! grep -F --quiet 'if (transport == ControlMessageTransport::DataChannel)' <<<"$control_message_block" ||
+   ! grep -F --quiet 'legacy_data_channel_control_disabled' <<<"$control_message_block"; then
   printf 'media/control isolation contract missing: stale or tearing-down DataChannel commands are rejected\n' >&2
   exit 1
 fi
@@ -157,8 +159,8 @@ done
 # may still drain from bounded queues after the source has failed, and another
 # critical lane may remain healthy, so no media callback may clear the latch
 # inside the same VehicleMediaRuntime or while the service reconstructs it for
-# the same cloud session. Recovery requires a new session, DataChannel, and VCU
-# handshake.
+# the same cloud session. Recovery requires a new session, a rebuilt
+# profile/VCU/status DataChannel and control-only WSS, and a fresh VCU handshake.
 if grep -F --quiet 'control_inhibited.exchange(false)' "$media_runtime" ||
    grep -F --quiet 'vehicle_control_inhibition_cleared' "$media_runtime" ||
    grep -F --quiet 'clear_control_inhibition_if_recovered' "$media_runtime"; then
@@ -166,7 +168,7 @@ if grep -F --quiet 'control_inhibited.exchange(false)' "$media_runtime" ||
   exit 1
 fi
 require_text "$media_runtime" 'Camera recovery restores video only; end this session and complete a fresh VCU handshake before driving again.'
-require_text "$catalog" '必须结束当前 session，在新 session 建立控制 DataChannel 并重新完成 VCU 握手'
+require_text "$catalog" '必须结束当前 session，在新 session 重建该 DataChannel、control-only WSS 并重新完成 VCU 握手'
 require_text "$media_runtime" 'critical_camera_control_latch->enter_session(signaling.session_id())'
 require_text "$media_runtime" 'critical_camera_control_latch->inhibit(signaling.session_id())'
 require_text "$vehicle_app" 'std::make_shared<mine_teleop::CriticalCameraControlLatch>()'
