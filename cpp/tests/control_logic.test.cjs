@@ -27,6 +27,7 @@ const readyVcu = {
   adapter_ready: true,
   speed_valid: true,
   speed_mps: 0,
+  gear_change_stationary_confirmed: true,
 };
 
 test('browser native intent envelope is bound to the connected session generation', () => {
@@ -75,7 +76,38 @@ test('blocked keys require a physical release before a fresh press', () => {
   assert.equal(logic.pressKey(pressed, blocked, 'ArrowLeft').accepted, true);
 });
 
-test('gear selection latches on release and gates every new D/R selection on valid zero speed', () => {
+test('stationary evidence requires three fresh samples spanning at least 200 ms', () => {
+  let evidence = logic.createGearChangeStationaryEvidence();
+  evidence = logic.updateGearChangeStationaryEvidence(
+      evidence, {speed_valid: true, speed_mps: 0.1}, 10, 1000);
+  assert.equal(evidence.confirmed, false);
+  evidence = logic.updateGearChangeStationaryEvidence(
+      evidence, {speed_valid: true, speed_mps: -0.1}, 11, 1100);
+  assert.equal(evidence.confirmed, false);
+  evidence = logic.updateGearChangeStationaryEvidence(
+      evidence, {speed_valid: true, speed_mps: 0}, 12, 1200);
+  assert.deepEqual(evidence, {
+    firstObservedAtMs: 1000,
+    lastObservedAtMs: 1200,
+    lastStatusSeq: 12,
+    sampleCount: 3,
+    confirmed: true,
+  });
+
+  const duplicate = logic.updateGearChangeStationaryEvidence(
+      evidence, {speed_valid: true, speed_mps: 0}, 12, 1300);
+  assert.strictEqual(duplicate, evidence);
+  const moving = logic.updateGearChangeStationaryEvidence(
+      evidence, {speed_valid: true, speed_mps: 0.1001}, 13, 1300);
+  assert.equal(moving.confirmed, false);
+  assert.equal(moving.sampleCount, 0);
+  const stale = logic.updateGearChangeStationaryEvidence(
+      evidence, {speed_valid: false, speed_mps: 0}, 13, 1300);
+  assert.equal(stale.confirmed, false);
+  assert.equal(stale.sampleCount, 0);
+});
+
+test('gear selection latches on release and gates every new D/R selection on stable zero speed', () => {
   const forward = {up: true, down: false};
   const released = {up: false, down: false};
   const reverse = {up: false, down: true};
@@ -90,6 +122,9 @@ test('gear selection latches on release and gates every new D/R selection on val
   });
   assert.equal(logic.allowsGearChange('P', 'D', {...readyVcu, speed_valid: false}), false);
   assert.equal(logic.allowsGearChange('P', 'D', readyVcu), true);
+  assert.equal(
+      logic.allowsGearChange('D', 'R', {...readyVcu, gear_change_stationary_confirmed: false}),
+      false);
   assert.deepEqual(logic.deriveGearSelection('D', reverse, {...readyVcu, speed_valid: false}), {
     selectedGear: 'D', pendingGearRequest: 'R', changed: false,
   });

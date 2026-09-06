@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "mine_teleop/core.hpp"
+#include "mine_teleop/detail/native_control_acknowledgement_window.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/websocket.hpp"
 
@@ -429,7 +430,7 @@ class DriverConsoleRuntime {
   std::unique_ptr<WebSocketClient> control_signaling_websocket_;
   std::string control_signaling_websocket_session_id_;
   std::uint64_t control_signaling_last_ack_seq_{0};
-  std::int64_t control_signaling_first_unacked_monotonic_ms_{0};
+  detail::NativeControlAcknowledgementWindow control_signaling_ack_window_;
   std::int64_t control_signaling_next_connect_monotonic_ms_{0};
   int control_signaling_reconnect_delay_ms_{100};
   std::uint64_t signaling_delivery_cursor_{0};

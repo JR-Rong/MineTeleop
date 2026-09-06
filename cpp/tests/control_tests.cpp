@@ -530,12 +530,15 @@ void test_control_page_contract() {
           response.body.find("updateSelectedGearFromHeldDirections") != std::string::npos &&
           response.body.find("updateSelectedGearFromInput({up:true,down:false})") !=
               std::string::npos &&
-          response.body.find("换挡已阻止：需有效零速反馈") != std::string::npos &&
+          response.body.find(
+              "换挡已阻止：需至少 3 帧且持续 200 ms 的新鲜零速反馈") !=
+              std::string::npos &&
           response.body.find("if(gear!=='R')gear='N'") == std::string::npos,
       "keyboard and Gamepad do not share the zero-speed-gated gear reducer");
   expect(
       response.body.find("function currentControl") != std::string::npos &&
-          response.body.find("return controlLogic.deriveControl") != std::string::npos &&
+          response.body.find("const control=controlLogic.deriveControl") !=
+              std::string::npos &&
           response.body.find("limits:effectiveControlLimits()") != std::string::npos,
       "the production page bypasses shared brake/control derivation");
   expect(
@@ -817,7 +820,13 @@ void test_control_page_contract() {
       response.body.find("function vcuStateKeepsHeldInput") != std::string::npos &&
           response.body.find("controlLogic.keepsHeldInput(vcuEverReady,value)") !=
               std::string::npos &&
-          response.body.find("if(retainedWait&&!estopRequested)outgoing.throttle=0") !=
+          response.body.find("gearTransitionPending=Boolean(pendingGearTransition)") !=
+              std::string::npos &&
+          response.body.find(
+              "if((retainedWait||gearTransitionPending)&&!estopRequested)outgoing.throttle=0") !=
+              std::string::npos &&
+          response.body.find(
+              "if(pendingGearTransition&&!control.estop)control.throttle=0") !=
               std::string::npos &&
           response.body.find(
               "!blockReason&&!vcuDrivingReady()&&!estopRequested&&!retainedWait") !=
@@ -826,6 +835,16 @@ void test_control_page_contract() {
           response.body.find("执行器闭环中（输入保持）") != std::string::npos &&
           response.body.find("输入已清除，等待新鲜 VCU Ready") != std::string::npos,
       "authorized VCU convergence waits do not retain inputs with zero-throttle heartbeats");
+  expect(
+      response.body.find(
+          "controlLogic.updateGearChangeStationaryEvidence(gearChangeStationaryEvidence,value,lastControlStatusSeq,performance.now())") !=
+              std::string::npos &&
+          response.body.find(
+              "gear_change_stationary_confirmed:gearChangeStationaryEvidence.confirmed") !=
+              std::string::npos &&
+          response.body.find("至少 3 帧且持续 200 ms 的新鲜零速反馈") !=
+              std::string::npos,
+      "browser gear changes are not gated on stable fresh zero-speed evidence");
   const auto telemetry_vcu_update = response.body.find(
       "adapter_ready:vcuAdapterReady(message.vcu_handshake,message.vehicle_adapter?.opened)};updateVcuHandshakeState(nextVcuStatus)");
   const auto telemetry_profile_update = response.body.find(
@@ -1727,6 +1746,26 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
           send_sample.find("return false;", send_revalidation) < websocket_send,
       "native sender can wrap an old intent sample in a replacement session before WSS send");
 
+  const auto acknowledgement_progress = send_sample.find(
+      "control_signaling_ack_window_.acknowledge_through(");
+  const auto oldest_pending_age = send_sample.find(
+      "control_signaling_ack_window_.oldest_age_ms(monotonic_ms)",
+      acknowledgement_progress);
+  const auto acknowledgement_stall = send_sample.find(
+      "native control signaling acknowledgements stalled for 500ms",
+      oldest_pending_age);
+  const auto record_transmitted_packet = send_sample.find(
+      "control_signaling_ack_window_.note_sent(", websocket_send);
+  expect(
+      acknowledgement_progress != std::string::npos &&
+          oldest_pending_age != std::string::npos &&
+          acknowledgement_stall != std::string::npos &&
+          record_transmitted_packet != std::string::npos &&
+          acknowledgement_progress < oldest_pending_age &&
+          oldest_pending_age < acknowledgement_stall &&
+          websocket_send < record_transmitted_packet,
+      "native ACK timeout is not tied to the oldest actually transmitted packet");
+
   const auto intent_update_lock = update_intent.find(
       "std::lock_guard update_lock(native_control_update_mutex_)");
   const auto intent_session_check = update_intent.find(
@@ -1783,6 +1822,43 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
           status.find("{\"send_failures_total\", native_control_send_failures_.load()}") !=
               std::string::npos,
       "native control WSS failures can retry at 20 Hz or omit bounded backoff state");
+}
+
+void test_native_control_acknowledgement_window_tracks_oldest_pending_packet() {
+  mine_teleop::detail::NativeControlAcknowledgementWindow window;
+
+  window.note_sent(1653, 0);
+  window.note_sent(1654, 62);
+  window.acknowledge_through(1653);
+  expect(
+      window.oldest_sequence() == 1654 &&
+          window.oldest_age_ms(126) == 64 &&
+          window.pending_count() == 1,
+      "ACK progress inherited the age of a packet that was already acknowledged");
+
+  window.note_sent(1655, 126);
+  window.acknowledge_through(1654);
+  expect(
+      window.oldest_sequence() == 1655 &&
+          window.oldest_age_ms(189) == 63 &&
+          window.pending_count() == 1,
+      "a continuously advancing ACK pipeline accumulated a false stall age");
+
+  window.note_sent(1656, 189);
+  expect(
+      window.oldest_age_ms(626) == 500,
+      "a genuinely stalled oldest packet did not retain its send timestamp");
+  window.acknowledge_through(1656);
+  expect(
+      window.oldest_sequence() == 0 && window.oldest_age_ms(1000) == 0 &&
+          window.pending_count() == 0,
+      "cumulative ACK did not clear every acknowledged packet");
+
+  window.note_sent(1663, 1000);
+  window.reset();
+  expect(
+      window.oldest_sequence() == 0 && window.pending_count() == 0,
+      "reconnect reset retained an old unacknowledged packet");
 }
 
 void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
@@ -5906,6 +5982,8 @@ int main() {
        test_vehicle_native_signaling_control_transport_is_single_path},
       {"driver_native_control_session_snapshot_and_backoff_contract",
        test_driver_native_control_session_snapshot_and_backoff_contract},
+      {"native_control_acknowledgement_window_tracks_oldest_pending_packet",
+       test_native_control_acknowledgement_window_tracks_oldest_pending_packet},
       {"vehicle_control_command_trace_is_bounded_async_and_timed",
        test_vehicle_control_command_trace_is_bounded_async_and_timed},
       {"structured_control_rejection_is_safe_and_rate_limited",

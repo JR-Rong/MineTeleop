@@ -25,6 +25,9 @@
     'service_brake',
     'hard_brake',
   ]);
+  const GEAR_CHANGE_STATIONARY_SPEED_MPS = 0.1;
+  const GEAR_CHANGE_STATIONARY_MIN_SAMPLES = 3;
+  const GEAR_CHANGE_STATIONARY_MIN_DURATION_MS = 200;
   const CONTROL_PROFILE_VERSION = 3;
   const CONTROL_PROFILE_FIELDS = Object.freeze([
     'profile_version',
@@ -695,11 +698,59 @@
     return {everReady: nextEverReady, resetInput: false, retainedWait};
   }
 
+  function createGearChangeStationaryEvidence() {
+    return {
+      firstObservedAtMs: 0,
+      lastObservedAtMs: 0,
+      lastStatusSeq: 0,
+      sampleCount: 0,
+      confirmed: false,
+    };
+  }
+
+  function updateGearChangeStationaryEvidence(
+      previousValue, vcuStatus, statusSequenceValue, observedAtMsValue) {
+    const previous = previousValue && typeof previousValue === 'object'
+      ? previousValue : createGearChangeStationaryEvidence();
+    const statusSequence = Number(statusSequenceValue);
+    const observedAtMs = Number(observedAtMsValue);
+    if (!Number.isSafeInteger(statusSequence) || statusSequence <= 0 ||
+        !Number.isFinite(observedAtMs) || observedAtMs < 0) {
+      return createGearChangeStationaryEvidence();
+    }
+    if (statusSequence <= Number(previous.lastStatusSeq || 0)) return previous;
+
+    const speed = Number(vcuStatus && vcuStatus.speed_mps);
+    if (!vcuStatus || vcuStatus.speed_valid !== true || !Number.isFinite(speed) ||
+        Math.abs(speed) > GEAR_CHANGE_STATIONARY_SPEED_MPS) {
+      return {
+        ...createGearChangeStationaryEvidence(),
+        lastStatusSeq: statusSequence,
+      };
+    }
+
+    const continuing = Number(previous.sampleCount || 0) > 0 &&
+        observedAtMs >= Number(previous.lastObservedAtMs || 0);
+    const firstObservedAtMs = continuing
+      ? Number(previous.firstObservedAtMs) : observedAtMs;
+    const sampleCount = continuing ? Number(previous.sampleCount) + 1 : 1;
+    return {
+      firstObservedAtMs,
+      lastObservedAtMs: observedAtMs,
+      lastStatusSeq: statusSequence,
+      sampleCount,
+      confirmed: sampleCount >= GEAR_CHANGE_STATIONARY_MIN_SAMPLES &&
+          observedAtMs - firstObservedAtMs >= GEAR_CHANGE_STATIONARY_MIN_DURATION_MS,
+    };
+  }
+
   function allowsGearChange(selectedGear, requestedGear, vcuStatus) {
     if (selectedGear === requestedGear || mockUnsupported(vcuStatus)) return true;
     const speed = Number(vcuStatus && vcuStatus.speed_mps);
     return Boolean(vcuStatus && vcuStatus.speed_valid) &&
-        Number.isFinite(speed) && Math.abs(speed) <= 0.1;
+        vcuStatus.gear_change_stationary_confirmed === true &&
+        Number.isFinite(speed) &&
+        Math.abs(speed) <= GEAR_CHANGE_STATIONARY_SPEED_MPS;
   }
 
   function deriveGearSelection(selectedGear, keyState, vcuStatus) {
@@ -1183,6 +1234,11 @@
     requiresFreshInput,
     keepsHeldInput,
     transitionVcuState,
+    GEAR_CHANGE_STATIONARY_SPEED_MPS,
+    GEAR_CHANGE_STATIONARY_MIN_SAMPLES,
+    GEAR_CHANGE_STATIONARY_MIN_DURATION_MS,
+    createGearChangeStationaryEvidence,
+    updateGearChangeStationaryEvidence,
     allowsGearChange,
     deriveGearSelection,
     createGearTransition,

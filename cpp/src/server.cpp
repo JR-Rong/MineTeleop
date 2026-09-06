@@ -1055,6 +1055,7 @@ const keyIndicators={left:document.getElementById('key-left'),right:document.get
 const controlReadouts={gear:document.getElementById('control-gear'),steering:document.getElementById('control-steering'),throttle:document.getElementById('control-throttle'),brake:document.getElementById('control-brake')};
 const operatorControlReadouts={gear:document.getElementById('operator-control-gear'),steering:document.getElementById('operator-control-steering'),throttle:document.getElementById('operator-control-throttle'),brake:document.getElementById('operator-control-brake')};
 let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,gearRejectionInhibited=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,lastVehicleSafetyState='',vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,pendingGearTransition=null,gearTransitionGeneration=0,lastControlStatusSeq=0,lastControlPrepareTimeoutLogAt=0,lastControlPrepareExpiredLogAt=0,activeControlPrepareAbort=null,activeControlPrepareIsEstop=false,activeControlPreparePreemptedByEstop=false;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
+let gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();
 const uiInstanceId=(globalThis.crypto?.randomUUID?.()||`ui-${Date.now()}-${Math.random().toString(16).slice(2)}`).replace(/[^A-Za-z0-9_-]/g,'_');
 let nativeIntentSeq=0,lastNativeIntentSnapshot='',nativeControlSessionId='',nativeControlSessionGeneration=0;
 let controlOutcomeSession={metrics:controlLogic.createControlOutcomeMetrics()};
@@ -1184,23 +1185,23 @@ function buttonValue(pad,index){return Number.isInteger(index)&&index>=0&&index<
 function syncControlKeyState(){state=controlLogic.deriveKeyState(pressedControlKeys)}
 function vcuMockUnsupported(value=vcuHandshake){return controlLogic.mockUnsupported(value)}
 function vcuAllowsGearChange(requestedGear){return controlLogic.allowsGearChange(selectedGear,requestedGear,vcuHandshake)}
-function updateSelectedGearFromInput(inputState){const next=controlLogic.deriveGearSelection(selectedGear,inputState,vcuHandshake);if(next.changed&&pendingGearTransition){const requestedGear=next.selectedGear;clearControlInput(false);pendingGearRequest=requestedGear;statusPanel.textContent=`${pendingGearTransition.fromGear}→${pendingGearTransition.toGear} 换挡尚未获得车端反馈；已阻止新的 ${requestedGear} 挡请求，请释放后重新操作`;return{selectedGear,pendingGearRequest,changed:false}}if(next.changed)pendingGearTransition=controlLogic.createGearTransition(selectedGear,next.selectedGear,lastControlStatusSeq,++gearTransitionGeneration);selectedGear=next.selectedGear;pendingGearRequest=next.pendingGearRequest;if(pendingGearRequest)statusPanel.textContent=`${selectedGear}→${pendingGearRequest} 换挡已阻止：需有效零速反馈；请停车后释放并重新按下方向键`;return next}
+function updateSelectedGearFromInput(inputState){const next=controlLogic.deriveGearSelection(selectedGear,inputState,vcuHandshake);if(next.changed&&pendingGearTransition){const requestedGear=next.selectedGear;clearControlInput(false);pendingGearRequest=requestedGear;statusPanel.textContent=`${pendingGearTransition.fromGear}→${pendingGearTransition.toGear} 换挡尚未获得车端反馈；已阻止新的 ${requestedGear} 挡请求，请释放后重新操作`;return{selectedGear,pendingGearRequest,changed:false}}if(next.changed)pendingGearTransition=controlLogic.createGearTransition(selectedGear,next.selectedGear,lastControlStatusSeq,++gearTransitionGeneration);selectedGear=next.selectedGear;pendingGearRequest=next.pendingGearRequest;if(pendingGearRequest)statusPanel.textContent=`${selectedGear}→${pendingGearRequest} 换挡已阻止：需至少 3 帧且持续 200 ms 的新鲜零速反馈；请停车后释放并重新按下方向键`;return next}
 function updateSelectedGearFromHeldDirections(){return updateSelectedGearFromInput(state)}
 function clearControlInput(resetGear=true){controlLogic.blockAndClearKeys(pressedControlKeys,blockedControlKeys);syncControlKeyState();gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;if(resetGear){selectedGear='N';pendingGearRequest=null;pendingGearTransition=null}renderControlState()}
 function vcuStateRequiresFreshInput(value=vcuHandshake){return controlLogic.requiresFreshInput(value)}
 function vcuStateKeepsHeldInput(value=vcuHandshake){return controlLogic.keepsHeldInput(vcuEverReady,value)}
 function acceptControlStatusMessage(message){const decision=controlLogic.reduceStatusSequence(lastControlStatusSeq,message?.control_status_seq);if(!decision.accepted){const sequence=Number(message?.control_status_seq);clientLog('control_status_message_dropped',{event:message?.event||'unknown',control_status_seq:Number.isFinite(sequence)?sequence:null,last_control_status_seq:lastControlStatusSeq});return false}if(decision.gap>0)clientLog('control_status_sequence_gap',{event:message?.event||'unknown',control_status_seq:decision.lastSequence,last_control_status_seq:lastControlStatusSeq,missing_status_count:decision.gap});lastControlStatusSeq=decision.lastSequence;return true}
 function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}
-function updateVcuHandshakeState(value){const transition=controlLogic.transitionVcuState(vcuEverReady,value);vcuHandshake=value;vcuEverReady=transition.everReady;if(transition.resetInput)resetControlAuthorityInput()}
+function updateVcuHandshakeState(value){gearChangeStationaryEvidence=controlLogic.updateGearChangeStationaryEvidence(gearChangeStationaryEvidence,value,lastControlStatusSeq,performance.now());value={...value,gear_change_stationary_confirmed:gearChangeStationaryEvidence.confirmed};const transition=controlLogic.transitionVcuState(vcuEverReady,value);vcuHandshake=value;vcuEverReady=transition.everReady;if(transition.resetInput)resetControlAuthorityInput()}
 function applyVehicleSafetyState(value){const next=String(value||'');if(next==='DEGRADED'){clearControlInput(false);if(lastVehicleSafetyState!=='DEGRADED'){lastKeyboardEvent.textContent='控制命令短暂中断，输入已清除 · 请释放后重新按下';statusPanel.textContent='车端进入可恢复降级：牵引已清零；请释放控制键后重新按下';clientLog('driver_input_cleared_on_degraded',{previous_safety_state:lastVehicleSafetyState||null})}}lastVehicleSafetyState=next}
 function suspendSignalingPoll(){const generation=++signalingGeneration;polling=false;if(signalingPollAbort){signalingPollAbort.abort();signalingPollAbort=null}return generation}
-function closeRealtimeSession(){flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;lastVehicleSafetyState='';vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
+function closeRealtimeSession(){flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;lastVehicleSafetyState='';vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
 function renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason)){estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner}
 function latchEstop(source){if(estopLatched)return false;estopLatched=true;clientLog('control_estop_request_latched',{source});renderEstopRequest();renderMonitoring();return true}
 function firstConnectedGamepad(){const pads=navigator.getGamepads?navigator.getGamepads():[];if(activeGamepadIndex!==null&&pads[activeGamepadIndex]?.connected)return pads[activeGamepadIndex];for(const pad of pads)if(pad?.connected){activeGamepadIndex=pad.index;return pad}activeGamepadIndex=null;return null}
 function applyGamepadNeutralInterlock(authorityReady,gearRequestPending=false){const next=controlLogic.reduceGamepadNeutralInterlock({requiresNeutral:gamepadRequiresNeutral,authorityReady,throttle:gamepadState.throttle,brake:gamepadState.brake,gearRequestPending});gamepadRequiresNeutral=next.requiresNeutral;gamepadState.throttle=next.throttle;gamepadState.brake=next.brake;return next}
 function sampleGamepad(){if(!gamepadConfig.enabled||document.hidden||!document.hasFocus()){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}const pad=firstConnectedGamepad();if(!pad){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}gamepadState.connected=true;const standard=pad.mapping==='standard';if(standard){const steering=axisValue(pad,0);let steeringValue=steering===null?0:(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);gamepadState.throttle=clamp(applyPedalDeadzone(buttonValue(pad,7)),0,1);gamepadState.brake=clamp(applyPedalDeadzone(buttonValue(pad,6)),0,1)}else{const steering=axisValue(pad,gamepadConfig.steering_axis),throttle=axisValue(pad,gamepadConfig.throttle_axis),brake=axisValue(pad,gamepadConfig.brake_axis);if(steering===null||throttle===null||brake===null){gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}let steeringValue=(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);const throttleDelta=gamepadConfig.throttle_inverted?calibration.throttleRest-throttle:throttle-calibration.throttleRest;const brakeDelta=gamepadConfig.brake_inverted?calibration.brakeRest-brake:brake-calibration.brakeRest;gamepadState.throttle=clamp(applyPedalDeadzone(throttleDelta/calibration.throttleRange),0,1);gamepadState.brake=clamp(applyPedalDeadzone(brakeDelta/calibration.brakeRange),0,1)}const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported();applyGamepadNeutralInterlock(gamepadAuthorityReady);if(gamepadState.throttle>0&&selectedGear==='N'){const nextGear=updateSelectedGearFromInput({up:true,down:false});if(nextGear.pendingGearRequest)applyGamepadNeutralInterlock(gamepadAuthorityReady,true)}const estopPressed=buttonValue(pad,gamepadConfig.estop_button)>=0.5;if(estopPressed){if(!gamepadEstopPressedAt)gamepadEstopPressedAt=performance.now();if(performance.now()-gamepadEstopPressedAt>=consoleConfig.estop_hold_ms&&latchEstop('Gamepad'))send({estop:true},false).catch(console.error)}else gamepadEstopPressedAt=0;renderControlState()}
-function currentControl(extra={}){return controlLogic.deriveControl({keyState:state,gamepad:gamepadState,selectedGear,limits:effectiveControlLimits(),steeringFullScaleDeg:limitConfig.steering_full_scale_deg,estop:estopLatched||Boolean(extra.estop)})}
+function currentControl(extra={}){const control=controlLogic.deriveControl({keyState:state,gamepad:gamepadState,selectedGear,limits:effectiveControlLimits(),steeringFullScaleDeg:limitConfig.steering_full_scale_deg,estop:estopLatched||Boolean(extra.estop)});if(pendingGearTransition&&!control.estop)control.throttle=0;return control}
 function setControlReadout(name,text,active=false){for(const element of [controlReadouts[name],operatorControlReadouts[name]]){element.textContent=text;element.parentElement?.classList.toggle('active',active)}}
 function renderControlState(){
   const control=currentControl();
@@ -1240,7 +1241,7 @@ async function writeControlIntent(extra,announceUnavailable){
     blockReason='control_profile_not_acknowledged';
     if(announceUnavailable)statusPanel.textContent='会话控制参数尚未获得车端确认，驾驶命令已阻止'
   }
-  const retainedWait=vcuHandshake.adapter_ready===true&&vcuStateKeepsHeldInput(vcuHandshake);
+  const retainedWait=vcuHandshake.adapter_ready===true&&vcuStateKeepsHeldInput(vcuHandshake),gearTransitionPending=Boolean(pendingGearTransition);
   if(!blockReason&&estopRequested&&vcuHandshake.adapter_ready===false){
     blockReason='vcu_adapter_unavailable';
     if(announceUnavailable)statusPanel.textContent='VCU 适配器明确不可用，远程急停未发送；请使用车辆物理急停'
@@ -1250,7 +1251,7 @@ async function writeControlIntent(extra,announceUnavailable){
   }
   if(blockReason)clearControlInput(false);
   const outgoing=currentControl(blockReason?{}:extra);
-  if(retainedWait&&!estopRequested)outgoing.throttle=0;
+  if((retainedWait||gearTransitionPending)&&!estopRequested)outgoing.throttle=0;
   const outgoingSnapshot=controlLogic.controlSnapshot(outgoing);
   const transitionGeneration=!blockReason&&!estopRequested&&pendingGearTransition?pendingGearTransition.generation:0;
   const intent=nativeIntentEnvelope(outgoing);
@@ -1380,6 +1381,7 @@ async function startFromOffer(offer){
       resetControlAuthorityInput();
       resetControlProfileSession();
       lastVehicleSafetyState='';
+      gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();
       vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:true,adapter_ready:null};
       clientLog('control_datachannel_open');
       renderMonitoring();
@@ -3934,7 +3936,7 @@ bool DriverConsoleRuntime::connect_control_signaling_websocket(
   control_signaling_websocket_ = std::move(next);
   control_signaling_websocket_session_id_ = std::string(session_id);
   control_signaling_last_ack_seq_ = 0;
-  control_signaling_first_unacked_monotonic_ms_ = 0;
+  control_signaling_ack_window_.reset();
   control_signaling_next_connect_monotonic_ms_ = 0;
   return true;
 }
@@ -3945,7 +3947,7 @@ void DriverConsoleRuntime::close_control_signaling_websocket() {
   control_signaling_websocket_.reset();
   control_signaling_websocket_session_id_.clear();
   control_signaling_last_ack_seq_ = 0;
-  control_signaling_first_unacked_monotonic_ms_ = 0;
+  control_signaling_ack_window_.reset();
   control_signaling_next_connect_monotonic_ms_ = 0;
   control_signaling_reconnect_delay_ms_ = 100;
 }
@@ -3988,7 +3990,7 @@ void DriverConsoleRuntime::note_native_control_failure(
   control_signaling_websocket_.reset();
   control_signaling_websocket_session_id_.clear();
   control_signaling_last_ack_seq_ = 0;
-  control_signaling_first_unacked_monotonic_ms_ = 0;
+  control_signaling_ack_window_.reset();
   const auto now_monotonic_ms = monotonic_now_ms();
   control_signaling_next_connect_monotonic_ms_ =
       now_monotonic_ms + control_signaling_reconnect_delay_ms_;
@@ -4142,9 +4144,9 @@ bool DriverConsoleRuntime::send_native_control_sample() {
             "native control signaling websocket is not connected");
       }
       // Drain acknowledgements from earlier packets without making the 20 Hz
-      // schedule depend on a cloud round trip. TCP send backpressure plus this
-      // bounded acknowledgement-age check still fails closed when the server
-      // is no longer consuming messages.
+      // schedule depend on a cloud round trip. Track the oldest packet that is
+      // still pending, rather than accumulating time across an ACK pipeline
+      // whose sequence is continuously advancing.
       acknowledgement_drain_started_monotonic_ms = monotonic_now_ms();
       for (int drained = 0; drained < 16; ++drained) {
         const auto received =
@@ -4170,6 +4172,8 @@ bool DriverConsoleRuntime::send_native_control_sample() {
         }
         control_signaling_last_ack_seq_ =
             std::max(control_signaling_last_ack_seq_, acknowledged_seq);
+        control_signaling_ack_window_.acknowledge_through(
+            control_signaling_last_ack_seq_);
         const auto acknowledgement_received_at_utc_ms = clock_.now_ms();
         const auto acknowledgement_received_monotonic_ms = monotonic_now_ms();
         native_control_last_ack_received_at_utc_ms_.store(
@@ -4216,23 +4220,21 @@ bool DriverConsoleRuntime::send_native_control_sample() {
         trace_record["acknowledgements"] = drained_acknowledgements;
       }
       const auto monotonic_ms = monotonic_now_ms();
-      if (control_signaling_last_ack_seq_ + 1 < sequence) {
-        if (control_signaling_first_unacked_monotonic_ms_ == 0) {
-          control_signaling_first_unacked_monotonic_ms_ = monotonic_ms;
-        }
-        unacknowledged_age_ms = std::max<std::int64_t>(
-            0,
-            monotonic_ms - control_signaling_first_unacked_monotonic_ms_);
+      if (control_signaling_ack_window_.pending_count() > 0) {
+        unacknowledged_age_ms =
+            control_signaling_ack_window_.oldest_age_ms(monotonic_ms);
         if (native_control_trace_) {
           trace_record["last_ack_seq"] = control_signaling_last_ack_seq_;
+          trace_record["oldest_unacknowledged_seq"] =
+              control_signaling_ack_window_.oldest_sequence();
+          trace_record["unacknowledged_count"] =
+              control_signaling_ack_window_.pending_count();
           trace_record["unacknowledged_age_ms"] = unacknowledged_age_ms;
         }
         if (unacknowledged_age_ms >= 500) {
           throw std::runtime_error(
               "native control signaling acknowledgements stalled for 500ms");
         }
-      } else {
-        control_signaling_first_unacked_monotonic_ms_ = monotonic_ms;
       }
       last_ack_seq = control_signaling_last_ack_seq_;
       send_started_at_utc_ms = clock_.now_ms();
@@ -4242,6 +4244,8 @@ bool DriverConsoleRuntime::send_native_control_sample() {
           std::chrono::milliseconds(20));
       send_completed_at_utc_ms = clock_.now_ms();
       send_completed_monotonic_ms = monotonic_now_ms();
+      control_signaling_ack_window_.note_sent(
+          sequence, send_completed_monotonic_ms);
     }
 
     const auto sent_at_ms = clock_.now_ms();
@@ -5483,12 +5487,7 @@ Json DriverConsoleRuntime::status() {
     native_control_next_connect_monotonic_ms =
         control_signaling_next_connect_monotonic_ms_;
     native_control_unacknowledged_age_ms =
-        control_signaling_first_unacked_monotonic_ms_ > 0 &&
-            native_control_last_ack_seq + 1 < native_control_last_seq_.load()
-        ? std::max<std::int64_t>(
-              0,
-              monotonic_now_ms() - control_signaling_first_unacked_monotonic_ms_)
-        : 0;
+        control_signaling_ack_window_.oldest_age_ms(monotonic_now_ms());
     native_control_reconnect_delay_ms = control_signaling_reconnect_delay_ms_;
   }
   const auto native_sample = native_control_intent_.sample(monotonic_now_ms());
