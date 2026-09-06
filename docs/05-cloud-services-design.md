@@ -222,7 +222,9 @@ WebSocket push 不会在 socket 写出前删除队列消息。每条消息带服
 `delivery_ack_received` 以 `cloud_native_control_trace_batch` 异步批量写入现有
 signaling audit。记录包含 `trace_session_id`、`seq`、`intent_seq`、
 `delivery_cursor`、命令发送/云端接收/入队/投递/ACK 时间和各段耗时，不包含控制
-token。生产部署模板当前开启该诊断；写盘在独立有界队列中完成，队列竞争或饱和会增加
+token。新车端在 delivery ACK 中回传同一组关联键，云端同时校验 ACK 的会话归属，
+避免 20 Hz mailbox 已被下一条命令覆盖时丢失 ACK 对应的命令序号。生产部署模板当前
+开启该诊断；写盘在独立有界队列中完成，队列竞争或饱和会增加
 `dropped_total`，不会阻塞控制 WSS 热路径。
 
 客户端到服务端的信令 ACK 包含原 `seq`、稳定 `message_id` 和目标队列的

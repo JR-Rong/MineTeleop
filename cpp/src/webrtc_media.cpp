@@ -1972,7 +1972,10 @@ struct VehicleMediaRuntime::Impl {
     try {
       websocket.send_json(
           {{"event", "signaling_delivery_ack"},
-           {"delivery_cursor", delivery_cursor}},
+           {"delivery_cursor", delivery_cursor},
+           {"trace_session_id", payload.value("session_id", "")},
+           {"seq", payload.value("seq", std::uint64_t{0})},
+           {"intent_seq", payload.value("intent_seq", std::uint64_t{0})}},
           kNativeControlWebSocketSendTimeout);
     } catch (const std::exception& error) {
       if (config.runtime.control_log_commands) {

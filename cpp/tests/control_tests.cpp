@@ -4348,17 +4348,25 @@ void test_native_control_three_hop_trace_correlation() {
         }
         const auto delivery_cursor =
             received.message.value("delivery_cursor", std::uint64_t{0});
+        std::uint64_t acknowledged_seq = 0;
+        std::uint64_t acknowledged_intent_seq = 0;
         for (const auto& message : received.message.at("messages")) {
-          if (message.value("type", "") == "control_command" &&
-              message.at("payload").value("intent_seq", std::uint64_t{0}) == 2) {
+          if (message.value("type", "") != "control_command") continue;
+          acknowledged_seq = message.value("seq", std::uint64_t{0});
+          acknowledged_intent_seq =
+              message.at("payload").value("intent_seq", std::uint64_t{0});
+          if (acknowledged_intent_seq == 2) {
             correlated_delivery = true;
-            vehicle_received_seq = message.value("seq", std::uint64_t{0});
+            vehicle_received_seq = acknowledged_seq;
             vehicle_delivery_cursor = delivery_cursor;
           }
         }
         receiver.send_json(
             {{"event", "signaling_delivery_ack"},
-             {"delivery_cursor", delivery_cursor}});
+             {"delivery_cursor", delivery_cursor},
+             {"trace_session_id", session_id},
+             {"seq", acknowledged_seq},
+             {"intent_seq", acknowledged_intent_seq}});
       }
       expect(correlated_delivery, "native control trace test did not receive the active intent");
       std::this_thread::sleep_for(std::chrono::milliseconds(150));

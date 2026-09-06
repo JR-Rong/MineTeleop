@@ -2600,6 +2600,17 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       try {
         if (!send_only && received.message.value("event", "") == "signaling_delivery_ack") {
           const auto delivery_cursor = required_uint64(received.message, "delivery_cursor");
+          const auto reported_trace_session_id =
+              received.message.value("trace_session_id", "");
+          if (!reported_trace_session_id.empty() &&
+              reported_trace_session_id != parts[1]) {
+            throw std::invalid_argument(
+                "delivery acknowledgement trace session does not match WebSocket session");
+          }
+          const auto reported_seq =
+              received.message.value("seq", std::uint64_t{0});
+          const auto reported_intent_seq =
+              received.message.value("intent_seq", std::uint64_t{0});
           if (delivery_cursor > last_delivery_cursor_sent) {
             throw std::invalid_argument("delivery acknowledgement exceeds the last delivered cursor");
           }
@@ -2618,7 +2629,11 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                   {"trace_session_id", std::string(parts[1])},
                   {"vehicle_id", session.vehicle_id},
                   {"driver_id", session.driver_id},
+                  {"seq", reported_seq},
+                  {"intent_seq", reported_intent_seq},
                   {"delivery_cursor", delivery_cursor},
+                  {"vehicle_reported_seq", reported_seq},
+                  {"vehicle_reported_intent_seq", reported_intent_seq},
                   {"cloud_delivery_ack_received_at_utc_ms", ack_received_at_utc_ms},
                   {"cloud_delivery_ack_received_monotonic_ms", ack_received_monotonic_ms},
               };
