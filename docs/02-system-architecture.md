@@ -48,8 +48,9 @@ flowchart LR
   WebRTCClient <--> Turn
   WebRTCClient <--> Decoder
   Input --> ControlClient
-  ControlClient <--> WebRTCClient
-  WebRTCClient --> ControlRx
+  ControlClient -->|"20 Hz control WSS"| Signaling
+  Signaling -->|"control-only WSS / latest-only"| ControlRx
+  ControlClient <-->|"profile / VCU / status DataChannel"| WebRTCClient
   ControlRx --> Safety
   Safety --> VehicleAdapter
   UI <--> Auth
@@ -78,20 +79,22 @@ flowchart LR
 
 ### 控制链路
 
-1. 驾驶端输入层产生控制状态。
-2. Control Client 以 20 Hz 发送包含 `protocol_version`、`seq` 和完整控制状态的 `ControlCommand`。
-3. 如果控制走 WebRTC DataChannel，通道必须配置为 unordered/unreliable，避免可靠有序重传造成队头阻塞和旧命令积压；本地配置对象通过 `to_webrtc_init()` 导出浏览器/WebRTC 初始化字段 `ordered=false`、`maxRetransmits=0` 和协议名。
-4. 车端接收后校验协议版本、序号、会话和控制权，并用本地到达间隔判断命令新鲜度。
-5. Safety State Machine 判断是否可执行。
+1. 浏览器输入层只向本机回环 Control Client 提交最新输入意图，不负责控制发送定时，也不通过 WebRTC DataChannel 发送普通控制命令。
+2. 原生 Control Client 管理输入租约，并由固定 20 Hz 线程生成包含 `protocol_version`、`seq` 和完整控制状态的 `ControlCommand`，通过独立控制 WSS 发送。
+3. Signaling Service 按会话和车辆维护容量为 1 的 latest-only 控制 mailbox；新命令原子覆盖旧命令，TTL 为 150 ms，不进入可积压、可重放的通用信令队列。
+4. 车端使用独立 control-only WSS 接收 mailbox，只处理最新且未过期的命令，并校验协议版本、序号、会话和控制权；另有独立 50 ms 看门狗线程，不受 WSS、媒体或网页等待影响。
+5. Safety State Machine 判断是否可执行；输入租约过期后，只有转向/油门/制动精确归零的原生安全心跳可刷新链路看门狗，任何过期非零指令都严格丢弃。
 6. Vehicle Adapter 下发给真实车辆接口或 Mock Adapter。
-7. Telemetry 回传当前状态。
+7. Telemetry 回传当前状态；WebRTC DataChannel 只保留 session profile、VCU handshake 和 status 交换。
+
+页面失焦、隐藏或渲染线程冻结时，浏览器不能继续刷新输入租约。租约到期后，原生 20 Hz 线程仍持续发送保留挡位、转向/油门/制动归零且带“不新鲜输入”标记的包。车端只允许这种执行量精确归零的过期包作为原生链路安全心跳，严格丢弃任何过期非零指令；因此切到后台不会制造假断包，而原生进程或 WSS 真正断流仍会触发车端看门狗。恢复页面后必须先收到新的中性输入才能解除 interlock，旧油门状态不能自动恢复。
 
 设计要求：
 
 - 控制命令轻量、固定频率、可追溯。
 - 安全停车由车端本地状态机执行。
 - 急停命令一旦到达车端即锁存，不依赖驾驶端持续发送。
-- 云端不在控制闭环中做逐帧/逐命令转发决策。
+- 云端只做鉴权和有界的 latest-only 命令暂存/转发，不执行车辆控制或安全决策，也不允许旧命令积压重放。
 
 ### 录像上传链路
 
@@ -112,10 +115,10 @@ flowchart LR
 
 首版可以先采用较少进程，但安全关键逻辑不能和媒体编码 pipeline 共故障域：
 
-- 当前 `vehicle-runtime` 由原生媒体进程建立 WebRTC 视频和 `control` DataChannel，并在车端运行 Control Receiver、Safety State Machine 与 Vehicle Adapter；DataChannel 关闭和进程正常退出都会本地全停。
+- 当前 `vehicle-runtime` 由原生媒体进程建立 WebRTC 视频以及用于 profile/VCU/status 的 DataChannel，并由独立 control-only WSS 接收控制命令、独立 50 ms 线程推进看门狗；车端仍运行 Control Receiver、Safety State Machine 与 Vehicle Adapter，控制 WSS 失联和进程正常退出都会本地全停。
 - 在接入真实 CAN 前，仍必须用进程强杀、媒体阻塞和底层控制器看门狗完成故障隔离验收；如果底层看门狗不能独立保证停车，再把安全执行拆为独立高优先级进程和有界本地 IPC。
 - `vehicle-uploader`：低优先级上传进程或独立服务，负责上传队列、限速和重试。
-- `mine-teleop-control`：跨平台 C++ 回环服务，使用系统浏览器呈现驾驶页面。
+- `mine-teleop-control`：跨平台 C++ 回环服务，使用系统浏览器呈现驾驶页面；浏览器提交最新输入意图，原生线程以 20 Hz 通过独立控制 WSS 发送命令。
 - `signaling-server`：云端信令和会话管理服务。
 - `turn-server`：coturn 或等价 TURN 服务。
 

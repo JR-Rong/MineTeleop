@@ -9,7 +9,8 @@
   `mine-teleop-cloud.target` 统一启停。
 - Ubuntu 车端：使用自包含压缩包和前台 `mine-teleop-run`，不安装车端
   systemd，不依赖 Docker、Python 或 FFmpeg。
-- 控制端：本地原生进程只监听 `127.0.0.1`，页面由系统浏览器打开。
+- 控制端：本地原生进程只监听 `127.0.0.1`，页面由系统浏览器打开；浏览器只提交
+  最新输入意图，原生进程独立以 20 Hz 经专用 WSS 发包。
 - 正常驾驶链路直接连接云端 HTTPS/WSS/STUN/TURN，不依赖 FRP、SSH 反向隧道
   或 SOCKS。
 
@@ -206,22 +207,31 @@ VCU/CAN 启动、日志落盘、收发、反馈超时、握手门禁和 disarm �
 ### `command_age_exceeded` / `command_gap_exceeded`
 
 三机驾驶端配置默认启用批量控制追踪。复现后同时收集控制端包根目录
-`.local/logs/control-browser-events.jsonl*` 和车端 runtime 日志，先用批次内的
-`trace_session_id`、`trace_vehicle_id` 确认控制端原始会话，再按命令的 `session_id`
-和 `seq` 对齐控制端 `control_trace_batch.commands` 与车端
-`vehicle_control_trace_batch.commands`；车端批次的 `dropped_total` 增长表示诊断记录自身有缺口：
+`.local/logs/control-browser-events.jsonl*`、控制端 `/api/status` 快照和车端 runtime
+日志。先用 `trace_session_id`、`trace_vehicle_id` 确认浏览器意图属于哪个原始会话，
+再用原生命令的 `session_id + seq` 对齐控制端 `native_control` 状态与车端
+`vehicle_control_trace_batch.commands`；车端批次的 `dropped_total` 增长只表示诊断记录
+自身有缺口。signaling 的控制 mailbox 容量为 1，中间序号被新命令覆盖是正常的，不能
+要求每个控制端 `seq` 都逐条出现在车端：
 
-- heartbeat tick 本身出现明显空窗、`timer_lag_max_ms` 同步升高：优先检查浏览器主线程
-  long task、页面失焦/冻结和驾驶端 CPU 调度；
-- heartbeat 持续但 `prepare_timeout_count` 或 `prepare_expired_count` 增长：检查本机
-  `/api/control` 请求耗时和控制端进程/回环 HTTP 调度；
-- terminal outcome 持续为 `forwarded`、`data_channel_send_invoked_at_utc_ms` 正常，但
-  车端缺少同一 `seq`：问题位于浏览器 `send()` 之后，需继续区分 SCTP/DataChannel、
-  车端 callback 调度和接收锁等待；
-- `backpressure_count` 或 `max_buffered_amount_bytes` 增长：检查 DataChannel 拥塞。
-
-`forwarded` 不是送达确认；浏览器 WebRTC candidate-pair RTT 和视频 RTP 丢包率也不是
-控制 DataChannel 的逐命令送达证据。
+- `control_trace_batch.summary.timer_lag_max_ms` 升高，但
+  `/api/status.native_control.last_gap_ms` 仍接近 50 ms：只是浏览器输入租约刷新变慢；
+  租约到期后应看到 `intent_fresh=false`、`requires_fresh_input=true` 和执行量归零，
+  不应据此判断原生发包中断；
+- `control_intent_update_timeout` 增长：检查浏览器到回环 `/api/control-intent` 的请求、
+  本机进程和 CPU 调度。恢复页面后必须先提交新鲜中立输入，旧油门不会自动恢复；
+- 控制端 `websocket_connected=false`、`send_failures_total` 增长、`last_ack_seq` 停滞，
+  或 `last_gap_ms/max_gap_ms` 增大：检查控制端到 signaling 的专用 WSS、代理 Upgrade、
+  ACK 停滞和重连退避；
+- 控制端发送/ACK 继续推进但车端 `messages_received_total` 不增长：检查 signaling
+  latest-only mailbox、车端 `vehicle_native_control_websocket_failed`、control-only WSS
+  与 `post_error_discards_total`；
+- 页面切走后 `stale_safe_heartbeats_accepted_total` 增长可以是预期安全心跳；
+  `stale_nonzero_intent_discards_total`、`stale_safe_native_gap_discards_total` 或
+  `stale_safe_untrusted_gear_discards_total` 增长则按对应门禁继续排查。零值 stale 包只能
+  维持尚未中断的 `CONTROL_ACTIVE`，不能恢复已经发生的 `DEGRADED` 或真实 WSS 断流；
+- profile/VCU/status DataChannel 关闭会撤销驾驶权限，但它不再是普通控制命令的传输
+  路径。浏览器 WebRTC RTT 和视频 RTP 丢包率也不是控制 WSS 的逐命令送达证据。
 
 ### 磁盘增长
 

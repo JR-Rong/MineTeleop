@@ -586,7 +586,7 @@ void test_control_page_contract() {
               std::string::npos &&
           response.body.find("gearRejectionState.inhibitOrdinaryControl") !=
               std::string::npos &&
-          response.body.find("reason:'gear_rejection_unresolved'") !=
+          response.body.find("blockReason='gear_rejection_unresolved'") !=
               std::string::npos &&
           response.body.find("send({},false).catch(console.error)") !=
               std::string::npos &&
@@ -723,81 +723,60 @@ void test_control_page_contract() {
           response.body.find("VCU 为 standby/disarmed") !=
               std::string::npos,
       "profile editing does not preflight parking rules for speed, torque, brake, steering, and PID changes");
-  const auto control_post = response.body.find(
-      "post('/api/control',outgoing,controlPrepareAbort.signal)");
+  const auto control_intent_post = response.body.find(
+      "accepted=await post('/api/control-intent',intent,controller.signal)");
   expect(
-      control_post != std::string::npos &&
-          response.body.find("post('/api/control'", control_post + 1) == std::string::npos &&
-          response.body.find("function createLatestControlWriteQueue(writeControl") !=
+      control_intent_post != std::string::npos &&
+          response.body.find("post('/api/control'") == std::string::npos &&
+          response.body.find("function nativeIntentEnvelope(outgoing)") !=
               std::string::npos &&
           response.body.find(
-              "const controlWriteQueue=controlLogic.createLatestControlWriteQueue(writeControl") !=
+              "return{session_id:nativeControlSessionId,session_generation:nativeControlSessionGeneration,ui_instance_id:uiInstanceId,intent_seq:nativeIntentSeq,...normalized}") !=
               std::string::npos &&
-          response.body.find("const outgoingSnapshot=controlLogic.controlSnapshot(outgoing)") !=
+          response.body.find(
+              "nativeControlSessionId=String(session.session_id||'');nativeControlSessionGeneration=Number(session.control_session_generation)") !=
               std::string::npos &&
-          response.body.find("const estopRequested=estopLatched||Boolean(extra.estop)") !=
+          response.body.find("async function writeControlIntent(extra,announceUnavailable)") !=
               std::string::npos &&
-          response.body.find("activeChannel.bufferedAmount>4096&&!estopRequested") !=
+          response.body.find("const intent=nativeIntentEnvelope(outgoing)") !=
               std::string::npos &&
-          response.body.find("controlLogic.controlIntentSuperseded(outgoingSnapshot,latestOutgoing)") !=
+          response.body.find(
+              "pendingGearTransition=controlLogic.recordForwardedGearCommand"
+              "(pendingGearTransition,transitionGeneration,accepted.intent_seq,outgoingSnapshot.gear)") !=
               std::string::npos &&
-          response.body.find("reason:'control_intent_superseded'") !=
+          response.body.find("transport:accepted.transport") !=
+              std::string::npos &&
+          response.body.find("delivery_state:'browser_data_channel_send_invoked'") ==
               std::string::npos,
-      "browser control writes are not merged through one ordered writer");
+      "browser ordinary control is not reduced to a native intent lease update");
   expect(
-      response.body.find("function enqueueControlHeartbeat()") != std::string::npos &&
+      response.body.find(
+              "const controlWriteQueue=controlLogic.createLatestControlWriteQueue"
+              "(writeControlIntent,reportControlQueueError") != std::string::npos &&
+          response.body.find("function enqueueIntentRefresh(){return controlWriteQueue.enqueueHeartbeat()}") !=
+              std::string::npos &&
           response.body.find("controlWriteQueue.enqueueHeartbeat()") != std::string::npos &&
-          response.body.find("enqueueControlHeartbeat()") != std::string::npos &&
-          response.body.find("heartbeatInFlight") == std::string::npos &&
-          response.body.find("controlPrepareAbort=new AbortController()") != std::string::npos &&
-          response.body.find("controlPrepareAbort.abort()") != std::string::npos &&
+          response.body.find("const enqueued=enqueueIntentRefresh()") != std::string::npos &&
+          response.body.find("const controller=new AbortController()") != std::string::npos &&
+          response.body.find("activeControlPrepareAbort=controller") != std::string::npos &&
           response.body.find("activeControlPrepareAbort&&!activeControlPrepareIsEstop") !=
               std::string::npos &&
-          response.body.find("reason:'control_prepare_preempted_by_estop'") !=
+          response.body.find("reason:'control_intent_preempted_by_estop'") !=
               std::string::npos &&
           response.body.find("latchEstop('Gamepad'))send({estop:true},false)") !=
               std::string::npos &&
-          response.body.find("estopRequested?'estop_prepare_timeout':'control_prepare_timeout'") !=
+          response.body.find("reason:'control_intent_update_timeout'") !=
               std::string::npos &&
-          response.body.find("performance.now()-prepareStartedAt") != std::string::npos &&
-          response.body.find("preparedAgeMs>=prepareDeadlineMs") != std::string::npos &&
-          response.body.find("reason:'control_command_expired_before_forward'") !=
-              std::string::npos,
-      "slow command preparation can starve heartbeats or forward stale commands");
-  const auto prepared_outcome = response.body.find(
-      "recordControlOutcome('prepared',prepared.command,outcomeSession)");
-  const auto data_channel_send = response.body.find(
-      "activeChannel.send(JSON.stringify(prepared.command))", prepared_outcome);
-  const auto forwarded_outcome = response.body.find(
-      "recordTerminalControlOutcome('forwarded',prepared.command,outcomeSession", prepared_outcome);
+          response.body.find("heartbeatInFlight") == std::string::npos,
+      "intent lease refreshes are not coalesced or ESTOP-preemptible");
   expect(
-      prepared_outcome != std::string::npos &&
-          response.body.find(
-              "recordTerminalControlOutcome('superseded',prepared.command,outcomeSession",
-              prepared_outcome) != std::string::npos &&
-          response.body.find(
-              "recordTerminalControlOutcome('expired_before_forward',prepared.command,outcomeSession",
-              prepared_outcome) != std::string::npos &&
-          response.body.find(
-              "recordTerminalControlOutcome('post_prepare_link_changed',prepared.command,outcomeSession",
-              prepared_outcome) != std::string::npos &&
-          response.body.find(
-              "recordTerminalControlOutcome('post_prepare_vcu_not_ready',prepared.command,outcomeSession",
-              prepared_outcome) != std::string::npos &&
-          data_channel_send != std::string::npos &&
-          forwarded_outcome != std::string::npos && data_channel_send < forwarded_outcome &&
-          response.body.find("controlLogic.shouldLogControlOutcome(outcome)") !=
+      response.body.find("async function heartbeat()") == std::string::npos &&
+          response.body.find("controlHeartbeatIntervalMs") == std::string::npos &&
+          response.body.find("setInterval(()=>heartbeat") == std::string::npos &&
+          response.body.find("activeChannel.send(JSON.stringify(prepared.command))") ==
               std::string::npos &&
-          response.body.find("control_command_browser_outcome") != std::string::npos &&
-          response.body.find("control_outcomes:controlOutcomes") != std::string::npos &&
-          response.body.find(
-              "control_outcomes_balanced:controlLogic.controlOutcomesBalanced(controlOutcomes)") !=
-              std::string::npos &&
-          response.body.find("last_prepared_seq") != std::string::npos &&
-          response.body.find("last_forwarded_seq") != std::string::npos &&
-          response.body.find("delivery_state:'browser_data_channel_send_invoked'") !=
-              std::string::npos,
-      "prepared browser commands do not have rate-bounded auditable terminal outcomes");
+          response.body.find("retiredBrowserPacketPath") == std::string::npos,
+      "a retired 50ms browser packet heartbeat or ordinary DataChannel send remains active");
   expect(
       response.body.find("function applyVehicleSafetyState(value)") !=
               std::string::npos &&
@@ -840,7 +819,8 @@ void test_control_page_contract() {
               std::string::npos &&
           response.body.find("if(retainedWait&&!estopRequested)outgoing.throttle=0") !=
               std::string::npos &&
-          response.body.find("if(!stillVcuReady&&!estopRequested)") !=
+          response.body.find(
+              "!blockReason&&!vcuDrivingReady()&&!estopRequested&&!retainedWait") !=
               std::string::npos &&
           response.body.find("换挡闭环中（输入保持）") != std::string::npos &&
           response.body.find("执行器闭环中（输入保持）") != std::string::npos &&
@@ -1009,9 +989,9 @@ void test_control_page_contract() {
           std::string::npos,
       "the controller can silently recreate a control DataChannel inside an inhibited media session");
   expect(
-      response.body.find("const estopRequested=estopLatched||Boolean(extra.estop)") !=
+      response.body.find("estopRequested=estopLatched||Boolean(extra.estop)") !=
               std::string::npos &&
-          response.body.find("estopRequested&&vcuHandshake.adapter_ready===false") !=
+          response.body.find("!blockReason&&estopRequested&&vcuHandshake.adapter_ready===false") !=
               std::string::npos &&
           response.body.find("vcu_adapter_unavailable") != std::string::npos &&
           response.body.find("请使用车辆物理急停") != std::string::npos &&
@@ -1020,10 +1000,12 @@ void test_control_page_contract() {
       "the controller can claim that remote ESTOP was sent while the VCU adapter is unavailable");
   expect(
       response.body.find("!vcuDrivingReady()&&!estopRequested") != std::string::npos &&
-          response.body.find("async function heartbeat()") != std::string::npos &&
-          response.body.find("sendPendingControlProfile();const enqueued=enqueueControlHeartbeat()") !=
+          response.body.find("async function refreshControlIntent()") != std::string::npos &&
+          response.body.find("sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
+              std::string::npos &&
+          response.body.find("estopRequested=estopLatched||Boolean(extra.estop)") !=
               std::string::npos,
-      "a latched ESTOP is not retransmitted by heartbeat while the VCU handshake is incomplete");
+      "a latched ESTOP is not retained by periodic native intent refresh while the VCU handshake is incomplete");
   expect(
       response.body.find("function vcuAdapterReady(status,explicit){return controlLogic.adapterReady(status,explicit)}") !=
               std::string::npos,
@@ -1051,24 +1033,18 @@ void test_control_page_contract() {
               "prepareControlProfile(controlProfileState.requestedProfile,false)") ==
               std::string::npos,
       "a completed VCU disconnect can silently reapply a legacy session profile");
-  const auto backpressure_gate = response.body.find(
-      "activeChannel.bufferedAmount>4096&&!estopRequested){");
-  const auto backpressure_return = response.body.find(
-      "return{sent:false,reason:'buffered_amount_limit'}", backpressure_gate);
-  const auto backpressure_trace = response.body.find(
-      "noteControlBackpressure(activeChannel.bufferedAmount)", backpressure_gate);
+  const auto neutralize_input = response.body.find(
+      "function neutralizeInput(){clearControlInput(false);send({},false).catch(console.error)}");
+  const auto blur_neutralize = response.body.find(
+      "addEventListener('blur',neutralizeInput)", neutralize_input);
+  const auto hidden_neutralize = response.body.find(
+      "document.addEventListener('visibilitychange',()=>{if(document.hidden)neutralizeInput()})",
+      blur_neutralize);
   expect(
-      backpressure_gate != std::string::npos &&
-          backpressure_trace != std::string::npos &&
-          backpressure_return != std::string::npos &&
-          response.body.find("clearControlInput(false)", backpressure_gate) <
-              backpressure_return &&
-          backpressure_trace < backpressure_return &&
-          response.body.find("resetControlAuthorityInput()", backpressure_gate) >
-              backpressure_return &&
-          response.body.find("webrtcLabel.textContent==='控制链路拥塞，输入已清除'") !=
-              std::string::npos,
-      "DataChannel backpressure does not clear actuation while preserving gear state and recover its operator label");
+      neutralize_input != std::string::npos && blur_neutralize != std::string::npos &&
+          hidden_neutralize != std::string::npos &&
+          response.body.find("activeChannel.bufferedAmount>4096") == std::string::npos,
+      "blur or page hiding does not publish a neutral native intent independent of DataChannel backpressure");
   expect(response.body.find("时延超过 200 ms") != std::string::npos, "latency threshold alarm is missing");
   expect(response.body.find("低于 20 FPS") != std::string::npos, "FPS threshold alarm is missing");
   expect(response.body.find("sent_at_utc_ms:Date.now()") != std::string::npos, "browser-local logs do not use UTC milliseconds");
@@ -1087,12 +1063,9 @@ void test_control_page_contract() {
           response.body.find("clientLog('control_trace_command'") == std::string::npos,
       "control command tracing is not enabled through a bounded one-second batch");
   for (const std::string_view field : {
-           "session_id", "browser_prepare_started_at_utc_ms", "native_command_sent_at_utc_ms",
-           "prepare_elapsed_ms", "data_channel_send_invoked_at_utc_ms", "buffered_amount_bytes",
-           "outcome", "trace_session_id", "trace_vehicle_id", "heartbeat_tick_count",
-           "heartbeat_enqueued_count",
-           "heartbeat_coalesced_count", "timer_lag_max_ms", "backpressure_count",
-           "prepare_timeout_count", "prepare_expired_count", "prepare_preempted_by_estop_count",
+           "session_id", "intent_seq", "trace_session_id", "trace_vehicle_id",
+           "heartbeat_tick_count", "heartbeat_enqueued_count", "heartbeat_coalesced_count",
+           "timer_lag_max_ms", "explicit_send_count", "prepare_preempted_by_estop_count",
            "queue_unhandled_error_count"}) {
     expect(
         response.body.find(field) != std::string::npos,
@@ -1101,32 +1074,22 @@ void test_control_page_contract() {
   const auto trace_flush = response.body.find("function flushControlTrace(");
   expect(
       trace_flush != std::string::npos &&
-          response.body.find("summary.prepare_timeout_count", trace_flush) != std::string::npos &&
-          response.body.find("summary.prepare_expired_count", trace_flush) != std::string::npos &&
-          response.body.find("summary.prepare_preempted_by_estop_count", trace_flush) !=
+          response.body.find("summary.heartbeat_tick_count", trace_flush) != std::string::npos &&
+          response.body.find("summary.explicit_send_count", trace_flush) != std::string::npos &&
+          response.body.find("summary.queue_unhandled_error_count", trace_flush) !=
               std::string::npos,
-      "summary-only control prepare failures can be discarded during trace flush");
-  const auto terminal_trace_queue = response.body.find("function queueTerminalControlTrace(");
-  const auto terminal_trace_flush = response.body.find("function flushControlTrace(", terminal_trace_queue);
-  const auto terminal_trace_contract =
-      terminal_trace_queue != std::string::npos && terminal_trace_flush != std::string::npos
-          ? response.body.substr(
-                terminal_trace_queue, terminal_trace_flush - terminal_trace_queue)
-          : std::string{};
+      "summary-only native intent refresh activity can be discarded during trace flush");
+  const auto intent_refresh = response.body.find("async function refreshControlIntent()");
+  const auto intent_refresh_timer = response.body.find(
+      "setInterval(()=>refreshControlIntent().catch(console.error),intentRefreshIntervalMs)",
+      intent_refresh);
   expect(
-      terminal_trace_queue != std::string::npos && terminal_trace_flush != std::string::npos &&
-          terminal_trace_contract.find("emitControlTraceBatch('late_terminal'") !=
+      intent_refresh != std::string::npos && intent_refresh_timer != std::string::npos &&
+          response.body.find(
+              "intentRefreshIntervalMs=Math.max(50,Math.floor(Number(consoleConfig.intent_lease_ms||200)/3))") !=
               std::string::npos &&
-          terminal_trace_contract.find("setControlTraceScope") == std::string::npos &&
-          response.body.find(
-              "commandTrace=controlTraceEnabled?{scope:writeTraceScope,") != std::string::npos &&
-          response.body.find(
-              "noteScopedControlTraceCounter('prepare_timeout_count',writeTraceScope)") !=
-              std::string::npos &&
-          response.body.find(
-              "noteScopedControlTraceCounter('prepare_expired_count',writeTraceScope)") !=
-              std::string::npos,
-      "a late command can mutate the active trace scope or attribute delayed prepare counters to the new session");
+          response.body.find("async function heartbeat()") == std::string::npos,
+      "browser intent renewal is not derived from the lease or still owns the retired packet heartbeat");
   const auto connect_handler = response.body.find("async function connect()");
   const auto connect_close = response.body.find("generation=closeRealtimeSession()", connect_handler);
   const auto connect_trace_scope =
@@ -1175,11 +1138,11 @@ void test_control_page_contract() {
       "DataChannel close does not flush the pending control trace");
   expect(response.body.find("dev-password") == std::string::npos, "driver credential leaked into the control page");
   expect(
-      response.body.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
+      response.body.find("async function refreshControlIntent(){const now=performance.now();if(!polling)") !=
               std::string::npos &&
-          response.body.find("sendPendingControlProfile();const enqueued=enqueueControlHeartbeat()") !=
+          response.body.find("sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
               std::string::npos,
-      "background safety ticks can override waiting state");
+      "background intent renewal can run without an active session or bypass latest-write coalescing");
   const auto pagehide = response.body.find("addEventListener('pagehide'");
   const auto pagehide_flush = response.body.find("flushControlTrace('pagehide')", pagehide);
   const auto pagehide_close = response.body.find("closeRealtimeSession()", pagehide);
@@ -1327,7 +1290,7 @@ void test_stale_control_data_channel_callbacks_are_fail_silent() {
       "if (message.value(\"type\", \"\") == \"session_control_profile\")");
   const auto handshake_begin = handler.find(
       "if (message.value(\"event\", \"\") == \"vcu_handshake_command\")");
-  const auto command_begin = handler.find("const auto command = ControlCommand::from_json(message)");
+  const auto command_begin = handler.find("auto command = ControlCommand::from_json(message)");
   expect(
       profile_begin != std::string::npos && handshake_begin != std::string::npos &&
           command_begin != std::string::npos && profile_begin < handshake_begin &&
@@ -1361,6 +1324,467 @@ void test_stale_control_data_channel_callbacks_are_fail_silent() {
       "a stale handshake callback can publish a rejection on the replacement control channel");
 }
 
+void test_vehicle_native_signaling_control_transport_is_single_path() {
+  const auto source = read_text_file("cpp/src/webrtc_media.cpp");
+  const auto server_source = read_text_file("cpp/src/server.cpp");
+  const auto handler = cpp_function_contract(source, "void handle_control_message(");
+  const auto process_signaling = cpp_function_contract(source, "void process_signaling()");
+  const auto native_control_websocket_url = cpp_function_contract(
+      source,
+      "[[nodiscard]] std::string native_control_websocket_url() const");
+  const auto native_control_websocket_headers = cpp_function_contract(
+      source,
+      "[[nodiscard]] HttpHeaders native_control_websocket_headers() const");
+  const auto native_control_websocket_handler = cpp_function_contract(
+      source,
+      "void handle_native_control_websocket_envelope(");
+  const auto native_control_websocket_loop = cpp_function_contract(
+      source,
+      "void native_control_websocket_loop(std::stop_token stop_token) noexcept");
+  const auto native_control_watchdog_loop = cpp_function_contract(
+      source,
+      "void native_control_watchdog_loop(std::stop_token stop_token) noexcept");
+  const auto start_native_control_transport = cpp_function_contract(
+      source,
+      "void start_native_control_transport()");
+  const auto signaling_websocket = cpp_function_contract(
+      server_source,
+      "bool SignalingService::handle_websocket(");
+  const auto acknowledge_signaling_messages = cpp_function_contract(
+      server_source,
+      "std::size_t SignalingService::acknowledge_signaling_messages(");
+  const auto profile_begin = handler.find(
+      "if (message.value(\"type\", \"\") == \"session_control_profile\")");
+  const auto handshake_begin = handler.find(
+      "if (message.value(\"event\", \"\") == \"vcu_handshake_command\")");
+  const auto legacy_reject = handler.find(
+      "if (transport == ControlMessageTransport::DataChannel)", handshake_begin);
+  const auto command_begin = handler.find(
+      "auto command = ControlCommand::from_json(message)", legacy_reject);
+  expect(
+      profile_begin != std::string::npos && handshake_begin != std::string::npos &&
+          legacy_reject != std::string::npos && command_begin != std::string::npos &&
+          profile_begin < handshake_begin && handshake_begin < legacy_reject &&
+          legacy_reject < command_begin,
+      "vehicle control transport branches are not ordered profile, handshake, legacy reject, native command");
+  expect(
+      handler.substr(profile_begin, handshake_begin - profile_begin)
+                  .find("transport != ControlMessageTransport::DataChannel") !=
+              std::string::npos &&
+          handler.substr(handshake_begin, legacy_reject - handshake_begin)
+                  .find("transport != ControlMessageTransport::DataChannel") !=
+              std::string::npos,
+      "session profile or VCU handshake escaped the browser DataChannel transport");
+  expect(
+      handler.substr(legacy_reject, command_begin - legacy_reject)
+                  .find("legacy_data_channel_control_disabled") != std::string::npos,
+      "legacy browser ControlCommand messages can still reach the vehicle apply path");
+
+  const auto native_command_path = handler.substr(command_begin);
+  expect(
+      native_command_path.find("control_channel != channel") == std::string::npos &&
+          native_command_path.find("!control_service_started || !control_service || !control_link_open") !=
+              std::string::npos &&
+          native_command_path.find("control_inhibited") != std::string::npos,
+      "native signaling control either depends on a browser channel pointer or bypasses readiness gates");
+  expect(
+      native_command_path.find("{\"transport\", transport_name}") != std::string::npos,
+      "native vehicle control trace does not identify its transport");
+
+  const auto stale_safe_definition = native_command_path.find(
+      "const bool stale_safe_heartbeat =");
+  const auto stale_nonzero_gate = native_command_path.find(
+      "if (!command.estop && !intent_fresh && !stale_safe_heartbeat)",
+      stale_safe_definition);
+  const auto estop_gear_gate = native_command_path.find(
+      "if (command.estop)", stale_nonzero_gate);
+  const auto profile_readiness_gate = native_command_path.find(
+      "const bool profile_active =", estop_gear_gate);
+  const auto handshake_readiness_gate = native_command_path.find(
+      "if (!profile_active || !handshake_ready)", profile_readiness_gate);
+  const auto stale_safe_gate = native_command_path.find(
+      "if (stale_safe_heartbeat)", handshake_readiness_gate);
+  const auto stale_safe_active_gate = native_command_path.find(
+      "control_service->safety_state() != SafetyState::ControlActive",
+      stale_safe_gate);
+  const auto stale_safe_gap_clock = native_command_path.find(
+      "const auto previous_accepted_monotonic_ms =",
+      stale_safe_active_gate);
+  const auto stale_safe_gap_gate = native_command_path.find(
+      "control_mutex_acquired_monotonic_ms - previous_accepted_monotonic_ms >=",
+      stale_safe_gap_clock);
+  const auto stale_safe_gap_reject = native_command_path.find(
+      "stale_safe_heartbeat_native_gap_elapsed",
+      stale_safe_gap_gate);
+  const auto stale_safe_gear_gate = native_command_path.find(
+      "!native_control_last_accepted_fresh_gear",
+      stale_safe_gap_reject);
+  const auto receive_command = native_command_path.find(
+      "control_service->receive_command(command, received_at_ms)",
+      stale_safe_gear_gate);
+  const auto accepted_result = native_command_path.find(
+      "if (result.accepted && result.command)", receive_command);
+  const auto estop_gear_freeze = native_command_path.find(
+      "if (command.estop && !native_control_estop_frozen_gear)",
+      accepted_result);
+  const auto fresh_gear_update = native_command_path.find(
+      "else if (!command.estop && intent_fresh)", estop_gear_freeze);
+  const auto accepted_monotonic_update = native_command_path.find(
+      "native_control_last_accepted_monotonic_ms =\n"
+      "            control_mutex_acquired_monotonic_ms",
+      fresh_gear_update);
+  expect(
+      stale_safe_definition != std::string::npos &&
+          native_command_path.find("command.steering == 0.0", stale_safe_definition) <
+              stale_nonzero_gate &&
+          native_command_path.find("command.throttle == 0.0", stale_safe_definition) <
+              stale_nonzero_gate &&
+          native_command_path.find("command.brake == 0.0", stale_safe_definition) <
+              stale_nonzero_gate &&
+          stale_nonzero_gate != std::string::npos &&
+          estop_gear_gate != std::string::npos &&
+          profile_readiness_gate != std::string::npos &&
+          handshake_readiness_gate != std::string::npos &&
+          stale_safe_gate != std::string::npos &&
+          stale_safe_active_gate != std::string::npos &&
+          stale_safe_gap_clock != std::string::npos &&
+          stale_safe_gap_gate != std::string::npos &&
+          stale_safe_gap_reject != std::string::npos &&
+          stale_safe_gear_gate != std::string::npos &&
+          receive_command != std::string::npos &&
+          accepted_result != std::string::npos &&
+          estop_gear_freeze != std::string::npos &&
+          fresh_gear_update != std::string::npos &&
+          accepted_monotonic_update != std::string::npos &&
+          stale_nonzero_gate < estop_gear_gate &&
+          estop_gear_gate < profile_readiness_gate &&
+          profile_readiness_gate < handshake_readiness_gate &&
+          handshake_readiness_gate < stale_safe_gate &&
+          stale_safe_gate < stale_safe_active_gate &&
+          stale_safe_active_gate < stale_safe_gap_clock &&
+          stale_safe_gap_clock < stale_safe_gap_gate &&
+          stale_safe_gap_gate < stale_safe_gap_reject &&
+          stale_safe_gap_reject < stale_safe_gear_gate &&
+          stale_safe_gear_gate < receive_command &&
+          handshake_readiness_gate < receive_command &&
+          native_command_path.find(
+              "native_control_stale_nonzero_intents_discarded_total",
+              stale_nonzero_gate) <
+              profile_readiness_gate &&
+          native_command_path.find("native_control_profile_not_ready_discards_total", handshake_readiness_gate) <
+              receive_command &&
+          native_command_path.find("native_control_handshake_not_ready_discards_total", handshake_readiness_gate) <
+              receive_command &&
+          native_command_path.find("session_profile_not_ready", handshake_readiness_gate) <
+              receive_command &&
+          native_command_path.find("vcu_handshake_not_ready", handshake_readiness_gate) <
+              receive_command &&
+          native_command_path.find(
+              "stale_safe_heartbeat_control_not_active", stale_safe_active_gate) <
+              receive_command &&
+          native_command_path.find(
+              "native_control_last_accepted_monotonic_ms.load()",
+              stale_safe_gap_clock) <
+              stale_safe_gap_gate &&
+          native_command_path.find(
+              "control_mutex_acquired_monotonic_ms < previous_accepted_monotonic_ms",
+              stale_safe_gap_clock) <
+              stale_safe_gap_gate &&
+          native_command_path.find(
+              "config.control.degraded_timeout_ms", stale_safe_gap_gate) <
+              stale_safe_gap_reject &&
+          native_command_path.find(
+              "native_control_stale_safe_native_gap_discards_total",
+              stale_safe_gap_gate) <
+              stale_safe_gap_reject &&
+          native_command_path
+                  .substr(
+                      stale_safe_gap_clock,
+                      stale_safe_gear_gate - stale_safe_gap_clock)
+                  .find("control_mutex_acquired_at_utc_ms") ==
+              std::string::npos &&
+          native_command_path.find(
+              "stale_safe_heartbeat_gear_untrusted", stale_safe_gear_gate) <
+              receive_command &&
+          native_command_path.find(
+              "native_control_estop_frozen_gear\n            ? *native_control_estop_frozen_gear",
+              estop_gear_gate) <
+              profile_readiness_gate &&
+          native_command_path.find(
+              "native_control_last_accepted_fresh_gear.value_or(command.gear)",
+              estop_gear_gate) <
+              profile_readiness_gate &&
+          native_command_path.find("command.gear = estop_gear", estop_gear_gate) <
+              profile_readiness_gate &&
+          native_command_path.find(
+              "native_control_estop_frozen_gear = command.gear", estop_gear_freeze) <
+              fresh_gear_update &&
+          native_command_path.find(
+              "native_control_last_accepted_fresh_gear = result.command->gear",
+              fresh_gear_update) <
+              accepted_monotonic_update,
+      "native control freshness, readiness, monotonic-gap, retained-gear, or ESTOP-gear gates regressed");
+
+  const auto stale_command_gate = native_control_websocket_handler.find(
+      "command_sent_at_ms <= replay_cutoff_ms");
+  const auto native_handler_call = native_control_websocket_handler.find(
+      "handle_control_message(", stale_command_gate);
+  const auto native_delivery_ack = native_control_websocket_handler.find(
+      "{\"event\", \"signaling_delivery_ack\"}", native_handler_call);
+  expect(
+      process_signaling.find("control_command") == std::string::npos &&
+          process_signaling.find(
+              "signaling.poll(\"webrtc_answer,ice_candidate,media_fallback\")") !=
+              std::string::npos &&
+          native_control_websocket_url.find("signaling_websocket_url(") !=
+              std::string::npos &&
+          native_control_websocket_url.find("std::to_string(connection_generation_)") !=
+              std::string::npos &&
+          native_control_websocket_url.find("&types=control_command") !=
+              std::string::npos &&
+          native_control_websocket_headers.find("X-Mine-Teleop-Device-Token") !=
+              std::string::npos &&
+          native_control_websocket_loop.find(
+              "signaling.native_control_websocket_url()") != std::string::npos &&
+          native_control_websocket_loop.find(
+              "signaling.native_control_websocket_headers()") != std::string::npos &&
+          native_control_websocket_loop.find("websocket.receive_json(") !=
+              std::string::npos &&
+          native_control_websocket_loop.find(
+              "handle_native_control_websocket_envelope(websocket, received.message)") !=
+              std::string::npos &&
+          native_control_websocket_handler.find(
+              "message.value(\"type\", \"\") != \"control_command\"") !=
+              std::string::npos &&
+          native_control_websocket_handler.find(
+              "const auto selected = newest_estop ? newest_estop : newest") !=
+              std::string::npos &&
+          stale_command_gate != std::string::npos &&
+          native_handler_call != std::string::npos &&
+          native_delivery_ack != std::string::npos &&
+          stale_command_gate < native_handler_call &&
+          native_handler_call < native_delivery_ack &&
+          native_control_websocket_handler.find(
+              "ControlMessageTransport::NativeSignaling", native_handler_call) !=
+              std::string::npos,
+      "native control is not isolated on its dedicated authenticated WSS or stale-safe ACK path");
+
+  expect(
+      native_control_watchdog_loop.find("tick_control_service()") !=
+              std::string::npos &&
+          native_control_watchdog_loop.find("websocket") == std::string::npos &&
+          start_native_control_transport.find(
+              "native_control_watchdog_thread = std::jthread(") !=
+              std::string::npos &&
+          start_native_control_transport.find(
+              "native_control_websocket_thread = std::jthread(") !=
+              std::string::npos &&
+          start_native_control_transport.find(
+              "native_control_last_accepted_fresh_gear.reset()") !=
+              std::string::npos &&
+          start_native_control_transport.find(
+              "native_control_estop_frozen_gear.reset()") !=
+              std::string::npos &&
+          start_native_control_transport.find(
+              "native_control_last_accepted_monotonic_ms = 0") !=
+              std::string::npos &&
+          start_native_control_transport.find(
+              "native_control_watchdog_loop(stop_token)") != std::string::npos &&
+          start_native_control_transport.find(
+              "native_control_websocket_loop(stop_token)") != std::string::npos,
+      "vehicle watchdog is not scheduled independently from the native control WebSocket");
+
+  const auto native_websocket_connect = native_control_websocket_loop.find(
+      "websocket.connect(");
+  const auto native_websocket_receive = native_control_websocket_loop.find(
+      "const auto received = websocket.receive_json(", native_websocket_connect);
+  const auto native_websocket_handle = native_control_websocket_loop.find(
+      "handle_native_control_websocket_envelope(websocket, received.message)",
+      native_websocket_receive);
+  const auto valid_delivery_gate = native_control_websocket_loop.find(
+      "received.message.value(\"event\", \"\") == \"signaling_messages\"",
+      native_websocket_handle);
+  const auto healthy_backoff_reset = native_control_websocket_loop.find(
+      "reconnect_delay = kNativeControlReconnectInitialDelay",
+      valid_delivery_gate);
+  const auto reconnect_wait = native_control_websocket_loop.find(
+      "wait_for_native_control_reconnect(stop_token, reconnect_delay)",
+      healthy_backoff_reset);
+  const auto reconnect_backoff_growth = native_control_websocket_loop.find(
+      "reconnect_delay * 2", reconnect_wait);
+  expect(
+      native_websocket_connect != std::string::npos &&
+          native_websocket_receive != std::string::npos &&
+          native_websocket_handle != std::string::npos &&
+          valid_delivery_gate != std::string::npos &&
+          healthy_backoff_reset != std::string::npos &&
+          reconnect_wait != std::string::npos &&
+          reconnect_backoff_growth != std::string::npos &&
+          native_websocket_connect < native_websocket_receive &&
+          native_websocket_receive < native_websocket_handle &&
+          native_websocket_handle < valid_delivery_gate &&
+          valid_delivery_gate < healthy_backoff_reset &&
+          healthy_backoff_reset < reconnect_wait &&
+          reconnect_wait < reconnect_backoff_growth &&
+          native_control_websocket_loop
+                  .substr(
+                      native_websocket_connect,
+                      native_websocket_handle - native_websocket_connect)
+                  .find("reconnect_delay = kNativeControlReconnectInitialDelay") ==
+              std::string::npos,
+      "vehicle control WSS short-lived connections can reset backoff before a valid delivery");
+
+  const auto ordinary_ack_guard = acknowledge_signaling_messages.find(
+      "if (!control_only)");
+  const auto ordinary_mailbox_ack = acknowledge_signaling_messages.find(
+      "auto found = messages_.find(recipient_key)", ordinary_ack_guard);
+  const auto control_mailbox_ack = acknowledge_signaling_messages.find(
+      "const auto latest_control = latest_control_messages_.find(recipient_key)",
+      ordinary_mailbox_ack);
+  expect(
+      signaling_websocket.find(
+              "requested_types != \"control_command\"") != std::string::npos &&
+          signaling_websocket.find(
+              "control-command receive signaling is restricted to the session vehicle") !=
+              std::string::npos &&
+          signaling_websocket.find(
+              "control-command receive WebSocket cannot be send-only") !=
+              std::string::npos &&
+          signaling_websocket.find(
+              "control_receive_only ? std::string_view(\"control_command\")") !=
+              std::string::npos &&
+          signaling_websocket.find(
+              "control-command receive WebSocket accepts delivery acknowledgements only") !=
+              std::string::npos &&
+          signaling_websocket.find(
+              "delivery_cursor,\n                control_receive_only") !=
+              std::string::npos &&
+          ordinary_ack_guard != std::string::npos &&
+          ordinary_mailbox_ack != std::string::npos &&
+          control_mailbox_ack != std::string::npos &&
+          ordinary_ack_guard < ordinary_mailbox_ack &&
+          ordinary_mailbox_ack < control_mailbox_ack,
+      "control-only WSS authentication or ACK isolation from ordinary signaling regressed");
+}
+
+void test_driver_native_control_session_snapshot_and_backoff_contract() {
+  const auto source = read_text_file("cpp/src/server.cpp");
+  const auto send_sample = cpp_function_contract(
+      source,
+      "bool DriverConsoleRuntime::send_native_control_sample()");
+  const auto update_intent = cpp_function_contract(
+      source,
+      "Json DriverConsoleRuntime::update_control_intent(");
+  const auto connect_control_websocket = cpp_function_contract(
+      source,
+      "bool DriverConsoleRuntime::connect_control_signaling_websocket(");
+  const auto note_failure = cpp_function_contract(
+      source,
+      "void DriverConsoleRuntime::note_native_control_failure(");
+  const auto close_control_websocket = cpp_function_contract(
+      source,
+      "void DriverConsoleRuntime::close_control_signaling_websocket()");
+  const auto sender_loop = cpp_function_contract(
+      source,
+      "void DriverConsoleRuntime::native_control_sender_loop(");
+  const auto status = cpp_function_contract(
+      source,
+      "Json DriverConsoleRuntime::status()");
+
+  const auto snapshot_lock = send_sample.find(
+      "std::lock_guard update_lock(native_control_update_mutex_)");
+  const auto sample = send_sample.find(
+      "sample = native_control_intent_.sample(monotonic_now_ms())",
+      snapshot_lock);
+  const auto session_snapshot = send_sample.find(
+      "session = session_id_", sample);
+  const auto generation_snapshot = send_sample.find(
+      "generation = control_session_generation_", session_snapshot);
+  const auto snapshot_scope_end = send_sample.find("\n\n  try {", generation_snapshot);
+  expect(
+      snapshot_lock != std::string::npos && sample != std::string::npos &&
+          session_snapshot != std::string::npos &&
+          generation_snapshot != std::string::npos &&
+          snapshot_scope_end != std::string::npos &&
+          snapshot_lock < sample && sample < session_snapshot &&
+          session_snapshot < generation_snapshot &&
+          generation_snapshot < snapshot_scope_end,
+      "native sender does not sample intent and snapshot its session generation under one update lock");
+
+  const auto connect = send_sample.find(
+      "connect_control_signaling_websocket(\n            session,\n            driver_token,\n            generation)",
+      snapshot_scope_end);
+  const auto send_revalidation = send_sample.find(
+      "if (session_id_ != session || control_token_ != control_token ||\n"
+      "            control_session_generation_ != generation)",
+      connect);
+  const auto websocket_send = send_sample.find(
+      "control_signaling_websocket_->send_json(", send_revalidation);
+  expect(
+      connect != std::string::npos && send_revalidation != std::string::npos &&
+          websocket_send != std::string::npos && connect < send_revalidation &&
+          send_revalidation < websocket_send &&
+          send_sample.find("return false;", send_revalidation) < websocket_send,
+      "native sender can wrap an old intent sample in a replacement session before WSS send");
+
+  const auto intent_update_lock = update_intent.find(
+      "std::lock_guard update_lock(native_control_update_mutex_)");
+  const auto intent_session_check = update_intent.find(
+      "if (session_id_ != expected_session_id ||\n"
+      "          control_session_generation_ != expected_session_generation)",
+      intent_update_lock);
+  const auto store_update = update_intent.find(
+      "native_control_intent_.update(intent, monotonic_now_ms())",
+      intent_session_check);
+  expect(
+      intent_update_lock != std::string::npos &&
+          intent_session_check != std::string::npos &&
+          store_update != std::string::npos &&
+          intent_update_lock < intent_session_check &&
+          intent_session_check < store_update,
+      "controller mutates native intent without an atomic current-session generation check");
+
+  const auto expected_generation_gate = connect_control_websocket.find(
+      "if (expected_generation != 0)");
+  const auto next_connect_gate = connect_control_websocket.find(
+      "control_signaling_next_connect_monotonic_ms_ > monotonic_now_ms()",
+      expected_generation_gate);
+  const auto websocket_connect_attempt = connect_control_websocket.find(
+      "auto next = std::make_unique<WebSocketClient>", next_connect_gate);
+  const auto next_backoff = note_failure.find(
+      "control_signaling_next_connect_monotonic_ms_ =");
+  const auto doubled_backoff = note_failure.find(
+      "std::min(control_signaling_reconnect_delay_ms_ * 2, 1000)",
+      next_backoff);
+  expect(
+      expected_generation_gate != std::string::npos &&
+          next_connect_gate != std::string::npos &&
+          websocket_connect_attempt != std::string::npos &&
+          expected_generation_gate < next_connect_gate &&
+          next_connect_gate < websocket_connect_attempt &&
+          connect_control_websocket.find("return false;", next_connect_gate) <
+              websocket_connect_attempt &&
+          next_backoff != std::string::npos &&
+          note_failure.find(
+              "now_monotonic_ms + control_signaling_reconnect_delay_ms_",
+              next_backoff) != std::string::npos &&
+          doubled_backoff != std::string::npos &&
+          close_control_websocket.find(
+              "control_signaling_reconnect_delay_ms_ = 100") !=
+              std::string::npos &&
+          send_sample.find(
+              "control_signaling_reconnect_delay_ms_ = 100") !=
+              std::string::npos &&
+          sender_loop.find("send_native_control_sample()") !=
+              std::string::npos &&
+          status.find("{\"next_connect_in_ms\",") != std::string::npos &&
+          status.find("{\"reconnect_delay_ms\", native_control_reconnect_delay_ms}") !=
+              std::string::npos &&
+          status.find("{\"send_failures_total\", native_control_send_failures_.load()}") !=
+              std::string::npos,
+      "native control WSS failures can retry at 20 Hz or omit bounded backoff state");
+}
+
 void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
   const auto source = read_text_file("cpp/src/webrtc_media.cpp");
   const auto handler = cpp_function_contract(source, "void handle_control_message(");
@@ -1370,7 +1794,7 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
   const auto stop_worker = cpp_function_contract(source, "void stop_control_trace_worker()");
   const auto run = cpp_function_contract(source, "Json run(int frame_count, int duration_ms, int capture_interval_ms)");
   const auto callback_timestamp = handler.find("callback_entered_at_utc_ms = signaling.now_ms()");
-  const auto command_parse = handler.find("const auto command = ControlCommand::from_json(message)");
+  const auto command_parse = handler.find("auto command = ControlCommand::from_json(message)");
   const auto lock_wait_started = handler.find("control_mutex_wait_started_monotonic_ms = steady_now_ms()");
   const auto lock_acquired = handler.find("control_mutex_acquired_monotonic_ms = steady_now_ms()");
   expect(
@@ -1396,6 +1820,7 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
            "control_path_completed_before_trace_at_utc_ms",
            "control_path_completed_before_trace_monotonic_ms",
            "control_path_processing_before_trace_ms",
+           "transport",
            "accepted",
            "reason"}) {
     expect(
@@ -1415,7 +1840,6 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
       early_reason != std::string::npos &&
           handler.find("\"runtime_stop_requested\"") != std::string::npos &&
           handler.find("\"control_inhibited\"") != std::string::npos &&
-          handler.find("\"stale_control_channel\"") != std::string::npos &&
           handler.find("\"control_service_unavailable\"") != std::string::npos &&
           handler.find("\"control_link_not_open\"") != std::string::npos &&
           handler.find("\"receive_apply_exception\"") != std::string::npos &&
@@ -1432,7 +1856,7 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
 
   const auto trace_lambda = handler.find("const auto queue_control_trace");
   const auto first_control_guard = handler.find(
-      "if (stop_requested || control_inhibited || control_channel != channel", trace_lambda);
+      "if (stop_requested || control_inhibited ||", trace_lambda);
   expect(
       trace_lambda != std::string::npos && first_control_guard != std::string::npos,
       "vehicle control trace producer could not be isolated");
@@ -1444,7 +1868,7 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
           producer.find("std::cout") == std::string::npos &&
           producer.find("write_control_trace_batch_line") == std::string::npos &&
           producer.find("control_token") == std::string::npos,
-      "DataChannel callback trace producer can write output, leak a token, or throw");
+      "control callback trace producer can write output, leak a token, or throw");
   expect(
       handler.find("lock.unlock();\n        queue_control_trace") != std::string::npos &&
           handler.find("queue_control_trace(\n          &result", early_return) != std::string::npos,
@@ -1497,9 +1921,23 @@ void test_structured_control_rejection_is_safe_and_rate_limited() {
       "void send_control_command_rejected_locked(");
   expect(
       handler.find(
-          "send_control_command_rejected_locked(command.seq, result.issue_code)") !=
+          "send_control_command_rejected_locked(command.seq, intent_seq, result.issue_code)") !=
           std::string::npos,
-      "an adapter control rejection is not returned to the active driver channel");
+      "a native signaling control rejection is not correlated to both command and browser intent sequences");
+  const auto legacy_data_channel_reject = handler.find(
+      "if (transport == ControlMessageTransport::DataChannel)");
+  const auto native_command_parse = handler.find(
+      "auto command = ControlCommand::from_json(message)", legacy_data_channel_reject);
+  expect(
+      legacy_data_channel_reject != std::string::npos &&
+          native_command_parse != std::string::npos &&
+          handler.find("legacy_data_channel_control_disabled", legacy_data_channel_reject) <
+              native_command_parse &&
+          handler.find("return;", legacy_data_channel_reject) < native_command_parse &&
+          handler.find(
+              "const auto intent_seq = message.value(\"intent_seq\", std::uint64_t{0})",
+              native_command_parse) != std::string::npos,
+      "ordinary DataChannel commands can reach apply or native signaling payloads can omit intent_seq");
   expect(
       sender.find("vcu_drive_gear_change_moving_or_stale") != std::string::npos &&
           sender.find("vcu_control_apply_rejected") != std::string::npos,
@@ -1510,13 +1948,348 @@ void test_structured_control_rejection_is_safe_and_rate_limited() {
           sender.find("{\"session_id\", signaling.session_id()}") != std::string::npos &&
           sender.find("{\"control_status_seq\", ++control_status_seq}") !=
               std::string::npos &&
-          sender.find("{\"command_seq\", command_seq}") != std::string::npos,
+          sender.find("{\"command_seq\", command_seq}") != std::string::npos &&
+          sender.find("{\"intent_seq\", intent_seq}") != std::string::npos,
       "control rejection status is not bound to authoritative identity and sequence state");
   expect(
       sender.find("< 500") != std::string::npos &&
           sender.find("\"error\"") == std::string::npos &&
           sender.find("error.what()") == std::string::npos,
       "control rejection status can flood the channel or leak raw exception text");
+}
+
+void test_signaling_latest_only_control_mailbox() {
+  constexpr std::string_view kDriverId = "driver-control-mailbox";
+  constexpr std::string_view kVehicleId = "vehicle-control-mailbox";
+  constexpr std::string_view kDriverPassword = "driver-control-mailbox-password";
+  constexpr std::string_view kDeviceToken = "vehicle-control-mailbox-device-token";
+
+  mine_teleop::SignalingServerConfig config;
+  config.driver_passwords = {{std::string(kDriverId), std::string(kDriverPassword)}};
+  config.device_tokens = {{std::string(kVehicleId), std::string(kDeviceToken)}};
+  config.driver_vehicle_permissions = {{std::string(kDriverId), {std::string(kVehicleId)}}};
+  config.native_control_message_ttl_ms = 150;
+  mine_teleop::SignalingService service(config);
+
+  const auto post = [&](std::string path, const mine_teleop::Json& body) {
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.target = path;
+    request.path = std::move(path);
+    request.peer_address = "127.0.0.1";
+    request.body = body.dump();
+    return service.handle(request);
+  };
+  const auto get = [&](std::string path,
+                       std::unordered_map<std::string, std::string> query) {
+    mine_teleop::HttpRequest request;
+    request.method = "GET";
+    request.target = path;
+    request.path = std::move(path);
+    request.peer_address = "127.0.0.1";
+    request.query = std::move(query);
+    return service.handle(request);
+  };
+
+  const auto online_response = post(
+      "/vehicles/online",
+      {{"vehicle_id", kVehicleId},
+       {"device_token", kDeviceToken},
+       {"connection_id", "control-mailbox-vehicle-runtime"}});
+  expect(online_response.status == 200, "control mailbox vehicle did not become online");
+  const auto vehicle_generation = mine_teleop::Json::parse(online_response.body)
+                                      .at("connection_generation")
+                                      .get<std::uint64_t>();
+  const auto login_response = post(
+      "/auth/driver_login",
+      {{"driver_id", kDriverId}, {"password", kDriverPassword}});
+  expect(login_response.status == 200, "control mailbox driver login failed");
+  const auto driver_token =
+      mine_teleop::Json::parse(login_response.body).at("token").get<std::string>();
+  const auto session_response = post(
+      "/sessions",
+      {{"driver_id", kDriverId}, {"vehicle_id", kVehicleId}, {"token", driver_token}});
+  expect(session_response.status == 200, "control mailbox session creation failed");
+  const auto session = mine_teleop::Json::parse(session_response.body);
+  const auto session_id = session.at("session_id").get<std::string>();
+  const auto control_token = session.at("control_token").get<std::string>();
+
+  const auto make_control_message = [&](std::uint64_t command_sequence,
+                                        std::uint64_t intent_sequence,
+                                        std::string_view inner_control_token) {
+    mine_teleop::ControlCommand command;
+    command.vehicle_id = kVehicleId;
+    command.driver_id = kDriverId;
+    command.session_id = session_id;
+    command.seq = command_sequence;
+    command.sent_at_utc_ms = mine_teleop::now_ms();
+    command.gear = "N";
+    command.steering = static_cast<double>(command_sequence) / 100.0;
+    command.control_token = inner_control_token;
+    auto payload = command.to_json();
+    payload["intent_seq"] = intent_sequence;
+    payload["intent_fresh"] = true;
+    auto message = mine_teleop::ProtocolMetadata{
+                       command.protocol_version,
+                       command.vehicle_id,
+                       command.driver_id,
+                       command.session_id,
+                       command.seq,
+                       command.sent_at_utc_ms}
+                       .to_json();
+    message["sender"] = kDriverId;
+    message["recipient"] = kVehicleId;
+    message["token"] = driver_token;
+    message["type"] = "control_command";
+    message["payload"] = std::move(payload);
+    return message;
+  };
+  const auto post_signaling = [&](const mine_teleop::Json& message) {
+    return post("/signaling/" + session_id + "/messages", message);
+  };
+  const auto vehicle_messages = [&](std::string_view types) {
+    return get(
+        "/signaling/" + session_id + "/messages",
+        {{"recipient", std::string(kVehicleId)},
+         {"device_token", std::string(kDeviceToken)},
+         {"connection_generation", std::to_string(vehicle_generation)},
+         {"types", std::string(types)}});
+  };
+
+  const auto media_answer = signaling_request_for(
+      session_id,
+      1,
+      kVehicleId,
+      kDriverId,
+      kDriverId,
+      kVehicleId,
+      "token",
+      driver_token,
+      "webrtc_answer",
+      {{"type", "answer"}, {"sdp", "v=0\r\n"}});
+  expect(
+      post_signaling(media_answer).status == 200,
+      "ordinary signaling sequence 1 was rejected before control sequence isolation testing");
+  const auto first_control = post_signaling(make_control_message(1, 101, control_token));
+  expect(
+      first_control.status == 200 &&
+          mine_teleop::Json::parse(first_control.body).value("queued", 0U) == 1,
+      "control sequence 1 did not use its own latest-only sequence domain");
+
+  auto wrong_driver_token = make_control_message(2, 102, control_token);
+  wrong_driver_token["token"] = "wrong-driver-token";
+  expect(
+      post_signaling(wrong_driver_token).status == 401,
+      "control mailbox accepted an invalid driver credential");
+  expect(
+      post_signaling(make_control_message(2, 102, "wrong-control-token")).status == 401,
+      "control mailbox accepted a command token outside the active session");
+
+  for (const auto& [field, replacement] :
+       std::vector<std::pair<std::string, mine_teleop::Json>>{
+           {"vehicle_id", "another-vehicle"},
+           {"driver_id", "another-driver"},
+           {"session_id", "another-session"},
+           {"seq", 999},
+           {"sent_at_utc_ms", std::numeric_limits<std::int64_t>::max()}}) {
+    auto mismatch = make_control_message(2, 102, control_token);
+    mismatch["payload"][field] = replacement;
+    expect(
+        post_signaling(mismatch).status == 400,
+        "control mailbox accepted mismatched inner/outer metadata field: " + field);
+  }
+
+  auto reversed_route = make_control_message(2, 102, control_token);
+  reversed_route["sender"] = kVehicleId;
+  reversed_route["recipient"] = kDriverId;
+  reversed_route.erase("token");
+  reversed_route["device_token"] = kDeviceToken;
+  reversed_route["connection_generation"] = vehicle_generation;
+  expect(
+      post_signaling(reversed_route).status == 401,
+      "vehicle-to-driver control_command route was accepted");
+
+  const auto second_control = post_signaling(make_control_message(2, 102, control_token));
+  expect(
+      second_control.status == 200 &&
+          mine_teleop::Json::parse(second_control.body).value("queued", 0U) == 1,
+      "second control command grew the latest-only mailbox beyond capacity one");
+  const auto latest_control_response = vehicle_messages("control_command");
+  expect(latest_control_response.status == 200, "vehicle control mailbox poll failed");
+  const auto latest_control = mine_teleop::Json::parse(latest_control_response.body).at("messages");
+  expect(
+      latest_control.size() == 1 &&
+          latest_control.at(0).value("seq", std::uint64_t{0}) == 2 &&
+          latest_control.at(0).at("payload").value("intent_seq", std::uint64_t{0}) == 102,
+      "latest-only control mailbox replayed an overwritten command");
+  const auto retained_media_response = vehicle_messages("webrtc_answer");
+  expect(retained_media_response.status == 200, "retained media message poll failed");
+  const auto retained_media = mine_teleop::Json::parse(retained_media_response.body).at("messages");
+  expect(
+      retained_media.size() == 1 && retained_media.at(0).value("type", "") == "webrtc_answer",
+      "control-only poll consumed an unrelated WebRTC message");
+
+  auto pending_offer = signaling_request_for(
+      session_id,
+      1,
+      kVehicleId,
+      kDriverId,
+      kVehicleId,
+      kDriverId,
+      "device_token",
+      kDeviceToken,
+      "webrtc_offer",
+      {{"type", "offer"}, {"sdp", "v=0\r\n"}});
+  pending_offer["connection_generation"] = vehicle_generation;
+  expect(post_signaling(pending_offer).status == 200, "pending WebRTC offer was rejected");
+
+  int websocket_pair[2]{-1, -1};
+  expect(
+      ::socketpair(AF_UNIX, SOCK_STREAM, 0, websocket_pair) == 0,
+      "send-only websocket socketpair creation failed");
+  timeval websocket_timeout{0, 200'000};
+  ::setsockopt(
+      websocket_pair[0],
+      SOL_SOCKET,
+      SO_RCVTIMEO,
+      &websocket_timeout,
+      sizeof(websocket_timeout));
+  mine_teleop::HttpRequest websocket_request;
+  websocket_request.method = "GET";
+  websocket_request.path = "/signaling/" + session_id + "/ws";
+  websocket_request.target = websocket_request.path +
+      "?participant=" + std::string(kDriverId) + "&send_only=1";
+  websocket_request.peer_address = "127.0.0.1";
+  websocket_request.query = {
+      {"participant", std::string(kDriverId)}, {"send_only", "1"}};
+  websocket_request.headers = {
+      {"upgrade", "websocket"},
+      {"connection", "Upgrade"},
+      {"sec-websocket-version", "13"},
+      {"sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="},
+      {"x-mine-teleop-driver-token", driver_token}};
+  bool websocket_handled = false;
+  std::thread websocket_thread([&] {
+    websocket_handled = service.handle_websocket(websocket_pair[1], websocket_request);
+    ::close(websocket_pair[1]);
+  });
+  try {
+    std::string upgrade_headers;
+    while (upgrade_headers.find("\r\n\r\n") == std::string::npos) {
+      upgrade_headers += raw_receive_exact(websocket_pair[0], 1);
+    }
+    expect(
+        upgrade_headers.starts_with("HTTP/1.1 101 "),
+        "send-only websocket upgrade failed");
+    std::array<char, 2> unexpected{};
+    expect(
+        ::recv(websocket_pair[0], unexpected.data(), unexpected.size(), 0) < 0,
+        "send-only websocket received a pending WebRTC delivery");
+
+    raw_send_all(
+        websocket_pair[0],
+        raw_masked_websocket_frame(
+            0x81U,
+            mine_teleop::Json{
+                {"event", "signaling_delivery_ack"}, {"delivery_cursor", 0}}
+                .dump()));
+    const auto rejected_delivery_ack_frame = raw_receive_websocket_frame(websocket_pair[0]);
+    const auto rejected_delivery_ack =
+        mine_teleop::Json::parse(rejected_delivery_ack_frame.payload);
+    expect(
+        rejected_delivery_ack_frame.final && rejected_delivery_ack_frame.opcode == 0x1U &&
+            rejected_delivery_ack.value("event", "") == "signaling_message_rejected" &&
+            rejected_delivery_ack.value("error", "") ==
+                "send-only control WebSocket accepts control_command messages only",
+        "send-only control websocket accepted a delivery acknowledgement");
+
+    raw_send_all(
+        websocket_pair[0],
+        raw_masked_websocket_frame(0x81U, media_answer.dump()));
+    const auto rejected_media_frame = raw_receive_websocket_frame(websocket_pair[0]);
+    const auto rejected_media = mine_teleop::Json::parse(rejected_media_frame.payload);
+    expect(
+        rejected_media_frame.final && rejected_media_frame.opcode == 0x1U &&
+            rejected_media.value("event", "") == "signaling_message_rejected" &&
+            rejected_media.value("error", "") ==
+                "send-only control WebSocket accepts control_command messages only",
+        "send-only control websocket accepted a non-control signaling message");
+
+    raw_send_all(
+        websocket_pair[0],
+        raw_masked_websocket_frame(
+            0x81U,
+            make_control_message(3, 103, control_token).dump()));
+    const auto valid_control_frame =
+        raw_receive_websocket_frame(websocket_pair[0]);
+    const auto valid_control =
+        mine_teleop::Json::parse(valid_control_frame.payload);
+    expect(
+        valid_control_frame.final && valid_control_frame.opcode == 0x1U &&
+            valid_control.value("event", "") == "signaling_ack" &&
+            valid_control.value("type", "") == "control_command" &&
+            valid_control.value("seq", std::uint64_t{0}) == 3 &&
+            !valid_control.value("duplicate", true),
+        "send-only control websocket changed valid control acknowledgement behavior");
+
+    const std::string close_payload("\x03\xe8", 2);
+    raw_send_all(
+        websocket_pair[0],
+        raw_masked_websocket_frame(0x88U, close_payload));
+    const auto close = raw_receive_websocket_frame(websocket_pair[0]);
+    expect(
+        close.final && close.opcode == 0x8U && close.payload == close_payload,
+        "send-only websocket close handshake failed");
+    ::close(websocket_pair[0]);
+    websocket_pair[0] = -1;
+    websocket_thread.join();
+  } catch (...) {
+    if (websocket_pair[0] >= 0) {
+      ::shutdown(websocket_pair[0], SHUT_RDWR);
+      ::close(websocket_pair[0]);
+    }
+    if (websocket_thread.joinable()) websocket_thread.join();
+    throw;
+  }
+  expect(websocket_handled, "send-only websocket request was not handled");
+  const auto pending_driver_response = get(
+      "/signaling/" + session_id + "/messages",
+      {{"recipient", std::string(kDriverId)}, {"token", driver_token}, {"types", "webrtc_offer"}});
+  expect(pending_driver_response.status == 200, "driver pending message poll failed");
+  const auto pending_driver = mine_teleop::Json::parse(pending_driver_response.body).at("messages");
+  expect(
+      pending_driver.size() == 1 && pending_driver.at(0).value("type", "") == "webrtc_offer",
+      "send-only websocket consumed the pending WebRTC message");
+
+  expect(
+      post_signaling(make_control_message(4, 104, control_token)).status == 200,
+      "control command for TTL testing was rejected");
+  const auto second_media_answer = signaling_request_for(
+      session_id,
+      2,
+      kVehicleId,
+      kDriverId,
+      kDriverId,
+      kVehicleId,
+      "token",
+      driver_token,
+      "webrtc_answer",
+      {{"type", "answer"}, {"sdp", "v=0\r\na=mid:second\r\n"}});
+  expect(post_signaling(second_media_answer).status == 200, "second media message was rejected");
+  std::this_thread::sleep_for(std::chrono::milliseconds(175));
+  const auto expired_control_response = vehicle_messages("control_command");
+  expect(expired_control_response.status == 200, "expired control mailbox poll failed");
+  expect(
+      mine_teleop::Json::parse(expired_control_response.body).at("messages").empty(),
+      "150ms native control mailbox TTL replayed a stale command");
+  const auto media_after_expiry_response = vehicle_messages("webrtc_answer");
+  expect(media_after_expiry_response.status == 200, "media poll after control expiry failed");
+  const auto media_after_expiry =
+      mine_teleop::Json::parse(media_after_expiry_response.body).at("messages");
+  expect(
+      media_after_expiry.size() == 1 &&
+          media_after_expiry.at(0).value("seq", std::uint64_t{0}) == 2,
+      "expiring a stale control command consumed an unrelated media message");
 }
 
 void write_text_file(const std::filesystem::path& path, std::string_view value) {
@@ -1961,6 +2734,9 @@ void test_driver_vehicle_switch_releases_old_session() {
   auto& driver = *driver_runtime;
   const auto first = driver.connect("vehicle-001");
   const auto second = driver.connect("vehicle-002");
+  const auto second_session_id = second.at("session_id").get<std::string>();
+  const auto second_control_session_generation =
+      second.at("control_session_generation").get<std::uint64_t>();
   expect(
       first.value("session_id", "") != second.value("session_id", ""),
       "vehicle switch reused the old session");
@@ -1976,8 +2752,87 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(
       new_session.value("session_id", "") == second.value("session_id", ""),
       "vehicle switch did not activate the new session");
+  expect_throws(
+      [&] {
+        static_cast<void>(driver.update_control_intent(
+            {{"session_id", first.at("session_id")},
+             {"session_generation", first.at("control_session_generation")},
+             {"ui_instance_id", "stale-switch-test-ui"},
+             {"intent_seq", 1},
+             {"gear", "N"},
+             {"steering", 0.0},
+             {"throttle", 0.0},
+             {"brake", 0.0}}));
+      },
+      "a browser intent from the released session generation survived the vehicle switch");
 
   mine_teleop::DriverConsoleHttpApp control_app(driver_runtime);
+  const auto post_control_intent = [&](const mine_teleop::Json& body) {
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.path = "/api/control-intent";
+    request.body = body.dump();
+    return control_app.handle(request);
+  };
+  const auto effective_native_intent = [&] {
+    const auto native = driver.status().at("native_control");
+    return mine_teleop::Json({
+        {"intent_seq", native.value("effective_intent_seq", std::uint64_t{0})},
+        {"gear", native.value("effective_gear", "")},
+        {"steering", native.value("effective_steering", -1.0)},
+        {"throttle", native.value("effective_throttle", -1.0)},
+        {"brake", native.value("effective_brake", -1.0)},
+        {"estop", native.value("effective_estop", false)},
+    });
+  };
+  mine_teleop::Json bound_intent = {
+      {"session_id", second_session_id},
+      {"session_generation", second_control_session_generation},
+      {"ui_instance_id", "api-session-binding-ui"},
+      {"intent_seq", 1},
+      {"gear", "D"},
+      {"steering", 0.0},
+      {"throttle", 0.0},
+      {"brake", 0.0},
+  };
+  const auto before_invalid_intents = effective_native_intent();
+  auto missing_session_id = bound_intent;
+  missing_session_id.erase("session_id");
+  expect(
+      post_control_intent(missing_session_id).status == 400,
+      "control intent without session_id did not fail schema validation");
+  auto wrong_session_id = bound_intent;
+  wrong_session_id["session_id"] = "session-from-released-browser";
+  expect(
+      post_control_intent(wrong_session_id).status == 409,
+      "control intent for another session did not fail the active-generation conflict check");
+  auto missing_session_generation = bound_intent;
+  missing_session_generation.erase("session_generation");
+  expect(
+      post_control_intent(missing_session_generation).status == 400,
+      "control intent without session_generation did not fail schema validation");
+  auto wrong_session_generation = bound_intent;
+  wrong_session_generation["session_generation"] =
+      second_control_session_generation + 1;
+  expect(
+      post_control_intent(wrong_session_generation).status == 409,
+      "control intent from an obsolete session generation was accepted");
+  expect(
+      effective_native_intent() == before_invalid_intents,
+      "rejected session-bound control intent changed the effective native intent");
+  const auto accepted_bound_intent = post_control_intent(bound_intent);
+  const auto accepted_bound_body = mine_teleop::Json::parse(accepted_bound_intent.body);
+  const auto after_bound_intent = effective_native_intent();
+  expect(
+      accepted_bound_intent.status == 200 &&
+          accepted_bound_body.value("accepted", false) &&
+          accepted_bound_body.value("session_id", "") == second_session_id &&
+          accepted_bound_body.value("session_generation", std::uint64_t{0}) ==
+              second_control_session_generation &&
+          after_bound_intent.value("intent_seq", std::uint64_t{0}) == 1 &&
+          after_bound_intent.value("gear", "") == "D",
+      "control intent with the current session generation was not accepted atomically");
+
   mine_teleop::HttpRequest profile_request;
   profile_request.method = "POST";
   profile_request.path = "/api/control-profile";
@@ -2096,11 +2951,34 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(
       control_app.handle(profile_request).status == 400,
       "session profile accepted a negative rise rate");
-  const auto profile_analog_brake = driver.send_control(
-      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
+  const auto neutral_intent = driver.update_control_intent(
+      {{"session_id", second_session_id},
+       {"session_generation", second_control_session_generation},
+       {"ui_instance_id", "switch-test-ui"},
+       {"intent_seq", 1},
+       {"gear", "N"},
+       {"steering", 0.0},
+       {"throttle", 0.0},
+       {"brake", 0.0}});
   expect(
-      profile_analog_brake.at("command").value("brake", -1.0) == 0.80,
-      "session hard-brake key pressure incorrectly capped the analog brake range");
+      neutral_intent.value("accepted", false) &&
+          neutral_intent.value("transport", "") == "native_signaling_websocket",
+      "fresh neutral intent did not arm native control after the vehicle switch");
+  const auto profile_analog_brake = driver.update_control_intent(
+      {{"session_id", second_session_id},
+       {"session_generation", second_control_session_generation},
+       {"ui_instance_id", "switch-test-ui"},
+       {"intent_seq", 2},
+       {"gear", "N"},
+       {"steering", 0.0},
+       {"throttle", 0.0},
+       {"brake", 0.80}});
+  const auto profile_analog_brake_status = driver.status().at("native_control");
+  expect(
+      profile_analog_brake.value("accepted", false) &&
+          profile_analog_brake_status.value("effective_intent_seq", std::uint64_t{0}) == 2 &&
+          profile_analog_brake_status.value("effective_brake", -1.0) == 0.80,
+      "session hard-brake key pressure incorrectly capped the native analog brake intent");
 
   for (const auto* path : {"/api/control/keyboard", "/api/control/gamepad"}) {
     mine_teleop::HttpRequest request;
@@ -2114,25 +2992,38 @@ void test_driver_vehicle_switch_releases_old_session() {
     }).dump();
     const auto response = control_app.handle(request);
     expect(
-        response.status == 410 &&
-            response.body.find("acknowledged session profile") != std::string::npos,
+      response.status == 410 &&
+            response.body.find("/api/control-intent") != std::string::npos,
         std::string("legacy specialized control endpoint did not fail closed: ") + path);
   }
   const auto prepared_status = driver.status();
+  const auto& prepared_native_status = prepared_status.at("native_control");
   expect(
-      prepared_status.value("control_commands_prepared_total", std::uint64_t{0}) == 1 &&
-          prepared_status.value("last_control_prepared_at_utc_ms", std::int64_t{0}) > 0 &&
+      prepared_status.value("control_commands_prepared_total", std::uint64_t{1}) == 0 &&
+          prepared_status.value("last_control_prepared_at_utc_ms", std::int64_t{-1}) == 0 &&
+          prepared_native_status.value("intent_active", false) &&
+          prepared_native_status.value("effective_brake", -1.0) == 0.80 &&
           !prepared_status.contains("last_control_sent_ms"),
-      "control preparation metrics still imply browser DataChannel delivery or count rejected input");
+      "retired packet-preparation metrics changed or native intent state was not exposed");
 
-  const auto prepared = driver.send_control(
-      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
+  const auto prepared = driver.update_control_intent(
+      {{"session_id", second_session_id},
+       {"session_generation", second_control_session_generation},
+       {"ui_instance_id", "switch-test-ui"},
+       {"intent_seq", 3},
+       {"gear", "N"},
+       {"steering", 0.0},
+       {"throttle", 0.0},
+       {"brake", 0.80}});
+  const auto refreshed_native_status = driver.status();
   expect(
-      prepared.at("command").value("vehicle_id", "") == "vehicle-002",
-      "post-switch control command targeted the old vehicle");
+      prepared.value("accepted", false) &&
+          refreshed_native_status.value("vehicle_id", "") == "vehicle-002" &&
+          refreshed_native_status.value("session_id", "") == second.value("session_id", ""),
+      "post-switch native control intent retained the old vehicle or session");
   expect(
-      prepared.at("command").value("brake", -1.0) == 0.80,
-      "driver runtime treated the hard-brake key preset as the analog-pedal ceiling");
+      refreshed_native_status.at("native_control").value("effective_brake", -1.0) == 0.80,
+      "driver runtime treated the hard-brake key preset as the native analog-pedal ceiling");
 
   mine_teleop::HttpRequest get_legacy_limits_request;
   get_legacy_limits_request.method = "GET";
@@ -2187,22 +3078,36 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(
       control_app.handle(profile_request).status == 200,
       "zero pending profile could not be prepared");
-  const auto pending_zero_profile_control = driver.send_control(
-      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.80}});
+  const auto pending_zero_profile_control = driver.update_control_intent(
+      {{"session_id", second_session_id},
+       {"session_generation", second_control_session_generation},
+       {"ui_instance_id", "switch-test-ui"},
+       {"intent_seq", 4},
+       {"gear", "N"},
+       {"steering", 0.0},
+       {"throttle", 0.0},
+       {"brake", 0.80}});
   expect(
-      pending_zero_profile_control.at("command").value("brake", -1.0) == 0.80,
-      "unacknowledged local profile state altered the generic control wire value");
+      pending_zero_profile_control.value("accepted", false) &&
+          driver.status().at("native_control").value("effective_brake", -1.0) == 0.80,
+      "unacknowledged local profile state altered the native control intent");
 
-  const auto estop = driver.send_control(
-      {{"gear", "N"},
+  const auto estop = driver.update_control_intent(
+      {{"session_id", second_session_id},
+       {"session_generation", second_control_session_generation},
+       {"ui_instance_id", "switch-test-ui"},
+       {"intent_seq", 5},
+       {"gear", "N"},
        {"steering", 0.0},
        {"throttle", 0.0},
        {"brake", 0.80},
        {"estop", true}});
+  const auto estop_status = driver.status().at("native_control");
   expect(
-      estop.at("command").value("brake", -1.0) == 0.80 &&
-          estop.at("command").value("estop", false),
-      "driver ordinary-brake limit weakened an emergency-stop command");
+      estop.value("accepted", false) &&
+          estop_status.value("effective_brake", -1.0) == 0.0 &&
+          estop_status.value("effective_estop", false),
+      "native emergency-stop intent was not latched with ordinary actuation normalized");
 
   const auto ended = driver.end_session("switch_test_complete");
   expect(!ended.value("connected", true), "explicit session end did not clear local authority");
@@ -2304,6 +3209,10 @@ void test_two_driver_two_vehicle_wss_isolation_and_safe_rejection() {
 
   const auto session_one = connected_one.at("session_id").get<std::string>();
   const auto session_two = connected_two.at("session_id").get<std::string>();
+  const auto control_session_generation_one =
+      connected_one.at("control_session_generation").get<std::uint64_t>();
+  const auto control_session_generation_two =
+      connected_two.at("control_session_generation").get<std::uint64_t>();
   expect(session_one != session_two, "simultaneous drivers shared a session id");
   const auto active_health = http.get_json(base + "/health");
   expect(active_health.value("online_vehicles", 0U) == 2, "two-vehicle presence was not retained");
@@ -2327,18 +3236,73 @@ void test_two_driver_two_vehicle_wss_isolation_and_safe_rejection() {
       status_two.value("signaling_websocket_connected", false),
       "unauthorized switch closed the second WSS session");
 
-  const auto control_one = driver_one.send_control(
-      {{"gear", "N"}, {"steering", -0.25}, {"throttle", 0.1}, {"brake", 0.0}});
-  const auto control_two = driver_two.send_control(
-      {{"gear", "N"}, {"steering", 0.25}, {"throttle", 0.2}, {"brake", 0.0}});
-  const auto& command_one = control_one.at("command");
-  const auto& command_two = control_two.at("command");
-  expect(command_one.value("vehicle_id", "") == "vehicle-001", "first control command crossed vehicles");
-  expect(command_one.value("session_id", "") == session_one, "first control command crossed sessions");
-  expect(command_two.value("vehicle_id", "") == "vehicle-002", "second control command crossed vehicles");
-  expect(command_two.value("session_id", "") == session_two, "second control command crossed sessions");
-  const auto control_token_one = command_one.value("control_token", "");
-  const auto control_token_two = command_two.value("control_token", "");
+  const auto neutral_one = driver_one.update_control_intent(
+      {{"session_id", session_one},
+       {"session_generation", control_session_generation_one},
+       {"ui_instance_id", "two-driver-ui-1"},
+       {"intent_seq", 1},
+       {"gear", "N"},
+       {"steering", 0.0},
+       {"throttle", 0.0},
+       {"brake", 0.0}});
+  const auto neutral_two = driver_two.update_control_intent(
+      {{"session_id", session_two},
+       {"session_generation", control_session_generation_two},
+       {"ui_instance_id", "two-driver-ui-2"},
+       {"intent_seq", 1},
+       {"gear", "N"},
+       {"steering", 0.0},
+       {"throttle", 0.0},
+       {"brake", 0.0}});
+  expect(
+      neutral_one.value("accepted", false) && neutral_two.value("accepted", false),
+      "independent native control intents were not armed by fresh neutral input");
+  const auto control_one = driver_one.update_control_intent(
+      {{"session_id", session_one},
+       {"session_generation", control_session_generation_one},
+       {"ui_instance_id", "two-driver-ui-1"},
+       {"intent_seq", 2},
+       {"gear", "N"},
+       {"steering", -0.25},
+       {"throttle", 0.1},
+       {"brake", 0.0}});
+  const auto control_two = driver_two.update_control_intent(
+      {{"session_id", session_two},
+       {"session_generation", control_session_generation_two},
+       {"ui_instance_id", "two-driver-ui-2"},
+       {"intent_seq", 2},
+       {"gear", "N"},
+       {"steering", 0.25},
+       {"throttle", 0.2},
+       {"brake", 0.0}});
+  const auto native_status_one = driver_one.status();
+  const auto native_status_two = driver_two.status();
+  expect(
+      control_one.value("accepted", false) &&
+          control_one.value("transport", "") == "native_signaling_websocket" &&
+          native_status_one.value("vehicle_id", "") == "vehicle-001" &&
+          native_status_one.value("session_id", "") == session_one &&
+          native_status_one.at("native_control").value("effective_intent_seq", std::uint64_t{0}) == 2 &&
+          native_status_one.at("native_control").value("effective_steering", 0.0) == -0.25 &&
+          native_status_one.at("native_control").value("effective_throttle", 0.0) == 0.1,
+      "first native control intent crossed vehicles or sessions");
+  expect(
+      control_two.value("accepted", false) &&
+          control_two.value("transport", "") == "native_signaling_websocket" &&
+          native_status_two.value("vehicle_id", "") == "vehicle-002" &&
+          native_status_two.value("session_id", "") == session_two &&
+          native_status_two.at("native_control").value("effective_intent_seq", std::uint64_t{0}) == 2 &&
+          native_status_two.at("native_control").value("effective_steering", 0.0) == 0.25 &&
+          native_status_two.at("native_control").value("effective_throttle", 0.0) == 0.2,
+      "second native control intent crossed vehicles or sessions");
+  const auto vehicle_session_one = http.get_json(
+      base + "/vehicles/vehicle-001/session?device_token=vehicle-secret-1&connection_generation=" +
+      std::to_string(generation_one));
+  const auto vehicle_session_two = http.get_json(
+      base + "/vehicles/vehicle-002/session?device_token=vehicle-secret-2&connection_generation=" +
+      std::to_string(generation_two));
+  const auto control_token_one = vehicle_session_one.value("control_token", "");
+  const auto control_token_two = vehicle_session_two.value("control_token", "");
   expect(!control_token_one.empty(), "first session omitted its control token");
   expect(!control_token_two.empty(), "second session omitted its control token");
   expect(
@@ -2388,11 +3352,11 @@ void test_two_driver_two_vehicle_wss_isolation_and_safe_rejection() {
   const auto answers_one = http.get_json(
       base + "/signaling/" + session_one +
       "/messages?recipient=vehicle-001&device_token=vehicle-secret-1&connection_generation=" +
-      std::to_string(generation_one));
+      std::to_string(generation_one) + "&types=webrtc_answer");
   const auto answers_two = http.get_json(
       base + "/signaling/" + session_two +
       "/messages?recipient=vehicle-002&device_token=vehicle-secret-2&connection_generation=" +
-      std::to_string(generation_two));
+      std::to_string(generation_two) + "&types=webrtc_answer");
   expect(answers_one.at("messages").size() == 1, "first vehicle did not receive exactly one answer");
   expect(answers_two.at("messages").size() == 1, "second vehicle did not receive exactly one answer");
   expect(
@@ -2560,12 +3524,31 @@ void test_control_authority_lease_renews_without_rotating_token() {
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
   const auto connected = driver.connect("vehicle-001");
   const auto session_id = connected.at("session_id").get<std::string>();
+  const auto control_session_generation =
+      connected.at("control_session_generation").get<std::uint64_t>();
   const auto initial_status = driver.status();
   const auto initial_expiry = initial_status.at("control_token_expires_at_utc_ms").get<std::int64_t>();
-  const auto first_control = driver.send_control(
-      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0}});
-  const auto original_control_token = first_control.at("command").value("control_token", "");
+  const auto initial_vehicle_session = http.get_json(
+      base + "/vehicles/vehicle-001/session?device_token=vehicle-secret-1&connection_generation=" +
+      std::to_string(vehicle_generation));
+  const auto original_control_token = initial_vehicle_session.value("control_token", "");
   expect(!original_control_token.empty(), "initial control lease omitted its token");
+  const auto first_intent = driver.update_control_intent(
+      {{"session_id", session_id},
+       {"session_generation", control_session_generation},
+       {"ui_instance_id", "control-renewal-ui"},
+       {"intent_seq", 1},
+       {"gear", "N"},
+       {"steering", 0.0},
+       {"throttle", 0.0},
+       {"brake", 0.0}});
+  const auto first_native_status = driver.status().at("native_control");
+  expect(
+      first_intent.value("accepted", false) &&
+          first_intent.value("transport", "") == "native_signaling_websocket" &&
+          first_native_status.value("effective_intent_seq", std::uint64_t{0}) == 1 &&
+          first_native_status.value("intent_active", false),
+      "initial native control intent was not accepted under the control lease");
 
   const auto vehicle_renewal = http.post_json(
       base + "/sessions/" + session_id + "/renew",
@@ -2597,15 +3580,26 @@ void test_control_authority_lease_renews_without_rotating_token() {
       std::to_string(vehicle_generation));
   expect(
       renewed_vehicle_session.value("control_token", "") == original_control_token,
-      "control authority renewal rotated the DataChannel token");
+      "control authority renewal rotated the native control token");
   expect(
       renewed_vehicle_session.value("control_token_expires_at_utc_ms", std::int64_t{0}) == latest_expiry,
       "vehicle did not observe the renewed control lease expiry");
-  const auto final_control = driver.send_control(
-      {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0}});
+  const auto final_control = driver.update_control_intent(
+      {{"session_id", session_id},
+       {"session_generation", control_session_generation},
+       {"ui_instance_id", "control-renewal-ui"},
+       {"intent_seq", 2},
+       {"gear", "N"},
+       {"steering", 0.0},
+       {"throttle", 0.0},
+       {"brake", 0.0}});
+  const auto final_native_status = driver.status().at("native_control");
   expect(
-      final_control.at("command").value("control_token", "") == original_control_token,
-      "renewed driver command changed the active control token");
+      final_control.value("accepted", false) &&
+          final_native_status.value("effective_intent_seq", std::uint64_t{0}) == 2 &&
+          final_native_status.value("intent_active", false) &&
+          renewed_vehicle_session.value("control_token", "") == original_control_token,
+      "renewed native intent lost or changed the active control authority");
 
   // Expiry/fail-closed behavior is covered by
   // test_expired_websocket_authority_clears_local_control. End this focused
@@ -2708,7 +3702,7 @@ void test_mac_runtime_uses_websocket_signaling() {
   expect(answer.value("transport", "") == "websocket", "Mac answer fell back to HTTP signaling");
   const auto vehicle_messages = http.get_json(
       base + "/signaling/" + session_id + "/messages?recipient=vehicle-001&device_token=vehicle-secret-1"
-      "&connection_generation=" + std::to_string(vehicle_generation));
+      "&connection_generation=" + std::to_string(vehicle_generation) + "&types=webrtc_answer");
   expect(vehicle_messages.at("messages").size() == 1, "websocket answer was not queued for the vehicle");
   expect(
       vehicle_messages.at("messages").at(0).value("type", "") == "webrtc_answer",
@@ -3025,6 +4019,7 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
+  signaling_config.native_control_message_ttl_ms = 1000;
   auto signaling = std::make_shared<mine_teleop::SignalingService>(std::move(signaling_config));
   mine_teleop::SimpleHttpServer server(
       "127.0.0.1",
@@ -3156,10 +4151,83 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
           retry_ack.message.value("message_id", "") == first_outbound_ack.message.value("message_id", ""),
       "identical websocket resend did not receive the stable idempotent acknowledgement");
   retry.close();
+
+  mine_teleop::ControlCommand native_command;
+  native_command.vehicle_id = "vehicle-001";
+  native_command.driver_id = "driver-console-001";
+  native_command.session_id = session_id;
+  native_command.seq = 1;
+  native_command.sent_at_utc_ms = mine_teleop::now_ms();
+  native_command.gear = "N";
+  native_command.control_token = session.at("control_token").get<std::string>();
+  auto native_payload = native_command.to_json();
+  native_payload["intent_seq"] = 1;
+  native_payload["intent_fresh"] = true;
+  const auto native_control_ack = http.post_json_response(
+      base + "/signaling/" + session_id + "/messages",
+      signaling_request_for(
+          session_id,
+          1,
+          "vehicle-001",
+          "driver-console-001",
+          "driver-console-001",
+          "vehicle-001",
+          "token",
+          token,
+          "control_command",
+          native_payload));
+  const auto native_control_cursor =
+      native_control_ack.at("delivery_cursor").get<std::uint64_t>();
+  const auto native_control_websocket_url =
+      mine_teleop::signaling_websocket_url(
+          base,
+          session_id,
+          "vehicle-001",
+          std::to_string(vehicle_generation)) +
+      "&types=control_command";
+  mine_teleop::WebSocketClient native_control_receiver;
+  native_control_receiver.connect(
+      native_control_websocket_url,
+      {{"X-Mine-Teleop-Device-Token", "vehicle-secret-1"}});
+  const auto native_control_delivery =
+      native_control_receiver.receive_json(std::chrono::seconds(1));
+  expect(
+      native_control_delivery.status == mine_teleop::WebSocketReceiveStatus::Message &&
+          native_control_delivery.message.value("event", "") == "signaling_messages" &&
+          native_control_delivery.message.value("delivery_cursor", std::uint64_t{0}) ==
+              native_control_cursor &&
+          native_control_delivery.message.at("messages").size() == 1 &&
+          native_control_delivery.message.at("messages").at(0).value("type", "") ==
+              "control_command",
+      "control-only vehicle WebSocket did not receive exactly its native command");
+  native_control_receiver.send_json(
+      {{"event", "signaling_delivery_ack"},
+       {"delivery_cursor", native_control_cursor}});
+  const auto native_control_confirmed = receive_event(
+      native_control_receiver,
+      "signaling_delivery_acknowledged",
+      std::chrono::seconds(1));
+  expect(
+      native_control_confirmed.status == mine_teleop::WebSocketReceiveStatus::Message &&
+          native_control_confirmed.message.value("acknowledged", 0) == 1,
+      "control-only vehicle WebSocket acknowledgement was not confirmed");
+  native_control_receiver.close();
+
   const auto vehicle_messages = http.get_json(
       base + "/signaling/" + session_id + "/messages?recipient=vehicle-001&device_token=vehicle-secret-1"
       "&connection_generation=" + std::to_string(vehicle_generation));
-  expect(vehicle_messages.at("messages").size() == 1, "idempotent websocket resend duplicated the queued message");
+  expect(
+      vehicle_messages.at("messages").size() == 1 &&
+          vehicle_messages.at("messages").at(0).value("type", "") ==
+              "media_capabilities",
+      "control-only acknowledgement consumed or duplicated an ordinary signaling message");
+  const auto acknowledged_control = http.get_json(
+      base + "/signaling/" + session_id + "/messages?recipient=vehicle-001&device_token=vehicle-secret-1"
+      "&connection_generation=" + std::to_string(vehicle_generation) +
+      "&types=control_command");
+  expect(
+      acknowledged_control.at("messages").empty(),
+      "control-only acknowledgement left the native command queued for replay");
 
   static_cast<void>(http.post_json_response(
       base + "/auth/driver_logout",
@@ -3261,7 +4329,7 @@ void test_expired_websocket_authority_clears_local_control() {
   driver_config.driver_id = "driver-console-001";
   driver_config.signaling_url = base;
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
-  static_cast<void>(driver.connect("vehicle-001"));
+  const auto connected = driver.connect("vehicle-001");
   std::this_thread::sleep_for(std::chrono::milliseconds(130));
   bool authority_loss_reported = false;
   try {
@@ -3275,12 +4343,19 @@ void test_expired_websocket_authority_clears_local_control() {
   expect(!status.value("signaling_websocket_connected", true), "expired WSS connection remained open locally");
   bool control_rejected = false;
   try {
-    static_cast<void>(driver.send_control(
-        {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 1.0}}));
+    static_cast<void>(driver.update_control_intent(
+        {{"session_id", connected.at("session_id")},
+         {"session_generation", connected.at("control_session_generation")},
+         {"ui_instance_id", "expired-authority-ui"},
+         {"intent_seq", 1},
+         {"gear", "N"},
+         {"steering", 0.0},
+         {"throttle", 0.0},
+         {"brake", 1.0}}));
   } catch (const std::runtime_error&) {
     control_rejected = true;
   }
-  expect(control_rejected, "expired WSS authority could still prepare control commands");
+  expect(control_rejected, "expired WSS authority could still accept a native control intent");
   static_cast<void>(driver.disconnect("expired_authority_test_complete"));
   server.stop();
 }
@@ -3494,10 +4569,17 @@ void test_signaling_process_restart_requires_fresh_authority() {
       "automatic restart recovery created control authority instead of authentication only");
   expect_throws(
       [&] {
-        static_cast<void>(driver.send_control(
-            {{"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 1.0}}));
+        static_cast<void>(driver.update_control_intent(
+            {{"session_id", first_connection.at("session_id")},
+             {"session_generation", first_connection.at("control_session_generation")},
+             {"ui_instance_id", "restart-recovery-ui"},
+             {"intent_seq", 1},
+             {"gear", "N"},
+             {"steering", 0.0},
+             {"throttle", 0.0},
+             {"brake", 1.0}}));
       },
-      "control runtime prepared a command with pre-restart authority");
+      "control runtime accepted a native intent with pre-restart authority");
 
   const auto replacement_connection = driver.connect("vehicle-001");
   const auto replacement_session_id = replacement_connection.at("session_id").get<std::string>();
@@ -4583,10 +5665,15 @@ int main() {
        test_vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start},
       {"stale_control_data_channel_callbacks_are_fail_silent",
        test_stale_control_data_channel_callbacks_are_fail_silent},
+      {"vehicle_native_signaling_control_transport_is_single_path",
+       test_vehicle_native_signaling_control_transport_is_single_path},
+      {"driver_native_control_session_snapshot_and_backoff_contract",
+       test_driver_native_control_session_snapshot_and_backoff_contract},
       {"vehicle_control_command_trace_is_bounded_async_and_timed",
        test_vehicle_control_command_trace_is_bounded_async_and_timed},
       {"structured_control_rejection_is_safe_and_rate_limited",
        test_structured_control_rejection_is_safe_and_rate_limited},
+      {"signaling_latest_only_control_mailbox", test_signaling_latest_only_control_mailbox},
       {"driver_brake_limit_config_validation", test_driver_brake_limit_config_validation},
       {"signaling_multi_identity_config", test_signaling_multi_identity_config},
       {"credential_purpose_separation_and_stale_control_replay",

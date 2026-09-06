@@ -1,5 +1,9 @@
 # macOS 控制端构建与验收
 
+> 历史证据说明：本文中“浏览器以 20 Hz 经 DataChannel 发送普通控制命令”的现场结果
+> 属于旧传输版本。当前版本由原生进程以 20 Hz 经专用 WSS 发包，DataChannel 只承载
+> profile/VCU/status；旧结果不能替代当前架构的 macOS 端到端复验。
+
 当前已实测平台为 macOS arm64；x64 支持交叉构建但仍需 Intel Mac 或 Rosetta
 运行验收。控制端使用 C++20 回环服务和系统浏览器，
 不编译车端的 GStreamer、JPEG、相机或录像模块。

@@ -18,6 +18,11 @@ else()
 endif()
 
 option(MINE_TELEOP_BUILD_TESTS "Build the native C++ test suites" OFF)
+option(
+  MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS
+  "Build portable native control safety tests"
+  OFF
+)
 option(MINE_TELEOP_BUILD_CONTROL_CLIENT "Build the portable control client" ON)
 option(MINE_TELEOP_BUILD_SIGNALING_SERVER "Build the standalone signaling server" ON)
 option(MINE_TELEOP_BUILD_VEHICLE_RUNTIME "Build Linux vehicle media and packaging targets" ${MINE_TELEOP_VEHICLE_DEFAULT})
@@ -289,6 +294,23 @@ install(TARGETS mine_teleop_runtime
 install(DIRECTORY cpp/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY configs/ DESTINATION share/mine-teleop/configs)
 install(DIRECTORY protocol/ DESTINATION share/mine-teleop/protocol)
+
+if(MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
+  enable_testing()
+  add_executable(
+    mine-teleop-native-control-intent-tests
+    cpp/tests/native_control_intent_tests.cpp
+  )
+  target_link_libraries(
+    mine-teleop-native-control-intent-tests
+    PRIVATE mine_teleop_runtime
+  )
+  mine_teleop_enable_warnings(mine-teleop-native-control-intent-tests)
+  add_test(
+    NAME mine-teleop-native-control-intent-tests
+    COMMAND mine-teleop-native-control-intent-tests
+  )
+endif()
 
 if(MINE_TELEOP_BUILD_TESTS)
   enable_testing()

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -1033,6 +1034,105 @@ ControlCommand ControlCommand::from_json(const Json& value) {
   }
   command.validate();
   return command;
+}
+
+void NativeControlIntent::validate() const {
+  if (ui_instance_id.empty() || ui_instance_id.size() > 128 ||
+      !std::all_of(ui_instance_id.begin(), ui_instance_id.end(), [](unsigned char value) {
+        return std::isalnum(value) || value == '-' || value == '_';
+      })) {
+    throw std::invalid_argument("ui_instance_id is invalid");
+  }
+  if (intent_seq == 0) throw std::invalid_argument("intent_seq must be positive");
+  static const std::unordered_set<std::string> allowed_gears{"P", "R", "N", "D"};
+  if (!allowed_gears.contains(gear)) {
+    throw std::invalid_argument("intent gear must be one of P/R/N/D");
+  }
+  require_finite_range(steering, -1.0, 1.0, "intent steering");
+  require_finite_range(throttle, 0.0, 1.0, "intent throttle");
+  require_finite_range(brake, 0.0, 1.0, "intent brake");
+}
+
+bool NativeControlIntent::is_neutral() const {
+  return !estop && std::abs(steering) <= 1e-9 && throttle <= 1e-9 && brake <= 1e-9;
+}
+
+NativeControlIntentStore::NativeControlIntentStore(int lease_ms)
+    : lease_ms_(lease_ms) {
+  if (lease_ms_ < 100 || lease_ms_ > 1000) {
+    throw std::invalid_argument("native control intent lease must be between 100ms and 1000ms");
+  }
+}
+
+NativeControlIntentUpdate NativeControlIntentStore::update(
+    NativeControlIntent intent,
+    std::int64_t received_at_monotonic_ms) {
+  intent.validate();
+  if (received_at_monotonic_ms < 0) {
+    throw std::invalid_argument("intent receive time must be non-negative");
+  }
+  std::lock_guard lock(mutex_);
+  // ESTOP is session-sticky. Normalize the incoming value before replay and
+  // fingerprint checks so a producer which refreshes the same sequence with
+  // estop=false cannot create a false conflict after the latch has already
+  // forced that stored intent to true. Actuation fields are irrelevant while
+  // ESTOP is active, so keep the wire command unambiguously fail-safe.
+  if (estop_latched_ || intent.estop) {
+    intent.estop = true;
+    intent.steering = 0.0;
+    intent.throttle = 0.0;
+    intent.brake = 0.0;
+  }
+  const bool same_ui = latest_ && latest_->ui_instance_id == intent.ui_instance_id;
+  if (latest_ && !same_ui) requires_fresh_input_ = true;
+  if (same_ui && intent.intent_seq < latest_->intent_seq) {
+    return {false, false, requires_fresh_input_, "old_intent_seq"};
+  }
+  if (same_ui && intent.intent_seq == latest_->intent_seq && intent != *latest_) {
+    return {false, false, requires_fresh_input_, "intent_seq_conflict"};
+  }
+  if (requires_fresh_input_ && !intent.is_neutral() && !intent.estop) {
+    return {false, same_ui && intent.intent_seq == latest_->intent_seq, true, "fresh_neutral_required"};
+  }
+
+  const bool duplicate = same_ui && intent.intent_seq == latest_->intent_seq;
+  if (requires_fresh_input_ && intent.is_neutral()) requires_fresh_input_ = false;
+  if (intent.estop) estop_latched_ = true;
+  latest_ = std::move(intent);
+  received_at_monotonic_ms_ = received_at_monotonic_ms;
+  return {true, duplicate, requires_fresh_input_, duplicate ? "refreshed" : "accepted"};
+}
+
+NativeControlIntentSample NativeControlIntentStore::sample(std::int64_t now_monotonic_ms) {
+  if (now_monotonic_ms < 0) {
+    throw std::invalid_argument("intent sample time must be non-negative");
+  }
+  std::lock_guard lock(mutex_);
+  if (!latest_) return {};
+  const auto age_ms = std::max<std::int64_t>(0, now_monotonic_ms - received_at_monotonic_ms_);
+  const bool fresh = age_ms < lease_ms_;
+  if (!fresh && !latest_->is_neutral() && !latest_->estop) requires_fresh_input_ = true;
+  auto effective = *latest_;
+  if (requires_fresh_input_ && !effective.estop) {
+    effective.steering = 0.0;
+    effective.throttle = 0.0;
+    effective.brake = 0.0;
+  }
+  effective.estop = estop_latched_;
+  return {true, fresh, requires_fresh_input_, std::move(effective)};
+}
+
+void NativeControlIntentStore::invalidate() {
+  std::lock_guard lock(mutex_);
+  requires_fresh_input_ = true;
+}
+
+void NativeControlIntentStore::reset() {
+  std::lock_guard lock(mutex_);
+  latest_.reset();
+  received_at_monotonic_ms_ = 0;
+  requires_fresh_input_ = true;
+  estop_latched_ = false;
 }
 
 void SessionControlProfile::validate() const {

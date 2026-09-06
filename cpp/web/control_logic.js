@@ -755,7 +755,9 @@
         String(selectedGearValue || '') !== transition.toGear) {
       return false;
     }
-    const commandSequence = Number(message.command_seq);
+    const intentSequence = Number(message.intent_seq);
+    const commandSequence = Number.isSafeInteger(intentSequence) && intentSequence > 0
+      ? intentSequence : Number(message.command_seq);
     const statusSequence = Number(message.control_status_seq);
     return Number.isSafeInteger(commandSequence) && commandSequence > 0 &&
         Number.isSafeInteger(statusSequence) && statusSequence > transition.statusFloor &&

@@ -151,11 +151,11 @@ CCG2 的 `vehicle_camera_first_frame`、`vehicle_camera_failed` 和 lane metrics
 
 | `event` / `issue_code` | 条件 | 控制与媒体结果 |
 | --- | --- | --- |
-| `vehicle_camera_failed` / 具体 camera issue | 单路采集首次或再次失败 | `critical_for_control=true` 时首个已确认故障立即本地安全停车、锁止控制并关闭控制 DataChannel；非关键 lane 不改变控制权限 |
+| `vehicle_camera_failed` / 具体 camera issue | 单路采集首次或再次失败 | `critical_for_control=true` 时首个已确认故障立即本地安全停车、锁止控制并关闭 profile/VCU/status DataChannel；原生 WSS 命令继续被锁存拒绝，非关键 lane 不改变控制权限 |
 | `vehicle_camera_reopen_scheduled` / `camera_lane_reopen_scheduled` | 故障可重试且累计失败次数未超过 `reopen_attempts` | 只销毁并重开故障采集源，其他 lane 不重建；关键相机的控制锁止保持不变 |
 | `vehicle_camera_recovered` / `camera_lane_recovered` | 重开后的第一帧到达 | 视频恢复；若为关键相机，同一云端 session 的控制锁止保持不变，不能把该事件当作恢复驾驶权限 |
 | `vehicle_camera_lane_disabled` / `camera_reopen_exhausted` | 不可重试或重开额度耗尽 | 关键 lane 禁用且继续保持停车；非关键 lane 只结束自身视频，其他 lane 与当前控制继续 |
-| `vehicle_control_inhibited_by_camera` / `critical_camera_control_inhibited` | 关键相机首次确认失败 | 保持车辆停止并关闭控制 DataChannel；必须结束当前 session，在新 session 建立控制 DataChannel 并重新完成 VCU 握手 |
+| `vehicle_control_inhibited_by_camera` / `critical_camera_control_inhibited` | 关键相机首次确认失败 | 保持车辆停止并关闭 profile/VCU/status DataChannel；必须结束当前 session，在新 session 重建该 DataChannel、control-only WSS 并重新完成 VCU 握手 |
 | `vehicle_control_inhibition_retained` / `critical_camera_control_inhibition_retained` | 媒体 service 在同一云端 session 内重建 runtime | 继续拒绝控制并保留视频能力；结束当前 session 后才能在新 session 重新握手 |
 | `vehicle_control_inhibition_latch_failed` / `critical_camera_control_latch_failed` | 内部 session 作用域不一致，无法更新共享锁存 | runtime-local 锁存仍立即安全停车；保持物理隔离并结束当前 session，禁止继续驾驶 |
 
@@ -166,7 +166,7 @@ CCG2 的 `vehicle_camera_first_frame`、`vehicle_camera_failed` 和 lane metrics
 session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧、多关键相机交错
 恢复、短暂画面恢复或媒体 transport 重试自行重新获得驾驶权限。
 
-## 编码、WebRTC、DataChannel 与信令故障全集
+## 编码、WebRTC、DataChannel 与原生控制 WSS 故障全集
 
 | `event` / `issue_code` | 触发条件 | 关键附加字段 | 频率 |
 | --- | --- | --- | --- |
@@ -183,7 +183,7 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `vehicle_media_pipeline_failed` / `gstreamer_webrtcbin_missing` | pipeline 中找不到 webrtcbin | backend/codec | 每个 candidate 一次 |
 | `vehicle_media_pipeline_failed` / `webrtc_ice_server_config_failed` | TURN 凭据/URI/add-turn-server 失败 | `error` | 每个 candidate 一次 |
 | `vehicle_media_pipeline_failed` / `gstreamer_ready_state_failed` | pipeline 不能进入 READY | backend/codec | 每个 candidate 一次 |
-| `vehicle_vcu_adapter_start_failed` / `vcu_adapter_start_failed` | 控制 DataChannel 打开后，动态库、符号、CAN、日志路径或 adapter open 失败；控制通道关闭、视频继续 | adapter/interface/bitrate/tx queue/library、`control_not_started_video_continues` | 每次 DataChannel 启动尝试一次 |
+| `vehicle_vcu_adapter_start_failed` / `vcu_adapter_start_failed` | profile/VCU/status DataChannel 打开后，动态库、符号、CAN、日志路径或 adapter open 失败；权限通道关闭、视频继续，原生 WSS 命令不执行 | adapter/interface/bitrate/tx queue/library、`control_not_started_video_continues` | 每次 DataChannel 启动尝试一次 |
 | `vehicle_vcu_runtime_failed` / `vcu_runtime_operation_failed` | adapter tick、反馈读取或遥测构建失败；尝试本地安全停车、关闭控制通道，视频继续 | error、`local_full_stop_control_disabled_video_continues` | 每次控制服务故障一次 |
 | `vehicle_media_pipeline_failed` / `control_data_channel_create_failed` | webrtcbin 未创建 SCTP DataChannel | `error` | 每个 candidate 一次 |
 | `vehicle_media_pipeline_failed` / `gstreamer_camera_lane_incomplete` | 某路 appsrc/encoder 元素缺失 | `camera_id`, `device` | 即时 |
@@ -198,6 +198,8 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `vehicle_control_data_channel_not_ready` / `control_data_channel_open_timeout` | answer 后 5 秒 DataChannel 未 open | local/remote ICE counts | 每个 candidate 一次 |
 | `vehicle_control_data_channel_error` | DataChannel 回调报错 | `error` | 每次错误 |
 | `vehicle_control_data_channel_closed` | 已打开的 channel 关闭 | 命令计数、最后接收时间 | 每次状态变化 |
+| `vehicle_native_control_websocket_failed` / `native_control_websocket_connection_failed` | 车端 control-only WSS 连接、读取、关闭或 ACK 失败 | `consecutive_errors`, `errors_total`, `safety_action=local_watchdog_safe_stop` | 最多每秒一次 |
+| `vehicle_native_control_websocket_failed` / `native_control_websocket_protocol_failed` | 控制 WSS envelope/type/cursor/`intent_seq`/`intent_fresh` 非法 | 同上及协议错误文本 | 最多每秒一次 |
 | `vehicle_media_pipeline_failed` / `media_runtime_time_sync_failed` | session 中刷新时间同步失败 | `error` | 每个 candidate 首错一次 |
 | `vehicle_media_pipeline_failed` / `media_runtime_time_sync_uncertainty_exceeded` | 刷新不确定度越界 | limit | 每个 candidate 首错一次 |
 | `vehicle_media_signaling_failed` / `session_signaling_exchange_failed` | offer/answer/ICE 消息收发失败 | `error` | 每次 session 失败 |
@@ -215,6 +217,13 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 `vehicle_webrtc_remote_ice_candidate_received` 和
 `vehicle_control_data_channel_open`。页面出现“等待视频轨道”或“DataChannel 尚未
 就绪”时，应从最后一个已出现的里程碑之后开始排查。
+
+普通控制命令不再走 DataChannel。车端最终 summary 的 `native_control_signaling`
+提供 control-only WSS 连接/重连、接收、latest-only 覆盖、ACK、独立 watchdog、
+stale 非零丢弃和严格零值 stale heartbeat 接受/拒绝计数；
+`vehicle_control_trace_batch.commands` 再用 `session_id + seq`、`intent_seq`、
+`intent_fresh` 与 `reason` 定位单次处理。profile、握手或状态 DataChannel 正常不能证明
+普通控制 WSS 正常，反之亦然。
 
 ### HTTP 409 与 signaling sequence
 
@@ -301,7 +310,7 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `control_apply_rejected` / `vcu_control_runtime_unavailable` | runtime/I/O fault 阻止控制 | 本地全停 |
 | `control_apply_rejected` / `vcu_runtime_control_profile_inactive` | 请求牵引时当前会话参数尚未原子应用或已被清除 | 仅撤销牵引并复位 PID，保留安全转向/挡位状态；页面重新确认并下发完整 profile 后重试，不得误判成已实施全制动 |
 | `control_apply_rejected` / `vcu_runtime_control_profile_limit_exceeded` | 目标速度、牵引比例或转向请求超过已确认的会话 profile | 以 `traction_withdrawn` 撤销牵引并复位 PID；按页面有效上限修正请求，不自动升级为急停 |
-| `control_apply_timeout` / `vcu_control_apply_timeout` | Ready 或保留控制状态下，成功上游控制 apply 超过 `control_timeout_ms` 未刷新 | `watchdog/control_apply_timeout` 锁存，本地全停；检查 DataChannel、vehicle-agent 控制循环和命令时序，完成安全退出后重新握手 |
+| `control_apply_timeout` / `vcu_control_apply_timeout` | Ready 或保留控制状态下，成功上游控制 apply 超过 `control_timeout_ms` 未刷新 | `watchdog/control_apply_timeout` 锁存，本地全停；检查原生控制 WSS、vehicle-agent 控制循环和命令时序，完成安全退出后重新握手 |
 | `physical_emergency_latched`、`control_apply_rejected` / `vcu_physical_emergency_latched` | `WVCU_EmergencySwitch` 非零，或物理急停锁存期间仍收到普通控制 | `physical_estop/physical_emergency_switch` 本地全停；只能在现场释放开关、完成 N/零速/EPB/manual 反向握手后重新申请，物理来源可覆盖此前软件来源 |
 | `arming_motion_latched` / `vcu_arming_state_motion` | 要求静止的握手阶段实测速度超过 0.1 m/s | `software_fault/arming_motion` 本地全停；完成反向握手并检查速度/挡位反馈后重新申请 |
 | `hard_overspeed_latched` / `vcu_hard_overspeed` | 实测绝对速度超过本地硬速度上限与 margin | `software_fault/hard_overspeed` 本地全停并锁存；检查速度标定和 profile，完成 Disarmed 且 N/零速反馈新鲜后才允许新握手 |
@@ -309,7 +318,7 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `chassis_control_fault_latched` / `vcu_chassis_control_fault` | 本地 PID/转矩计算调用 ChassisControl 抛出标准或未知异常 | `software_fault/chassis_control_fault` 本地全停并锁存 I/O fault；检查 vendor ChassisControl 与输入标定，修复后重启，不能靠普通重连清除 |
 | `control_apply_rejected` / `vcu_control_command_invalid` | command 越界或状态不允许 | 本地全停 |
 | `bridge_api_operation_failed` / `vcu_apply_arguments_invalid` | ABI gear/pointer/count 非法 | 本地全停 |
-| `vehicle_control_command_rejected` / `vcu_feedback_blocks_control` | feedback missing/poll failed 阻止 DataChannel 命令 | 本地全停；结合 VCU JSONL |
+| `vehicle_control_command_rejected` / `vcu_feedback_blocks_control` | feedback missing/poll failed 阻止原生 WSS 控制命令 | 本地全停；结合 VCU JSONL |
 | `control_apply_rejected`、`control_command_rejected` / `vcu_drive_gear_change_moving_or_stale` | 任何挡位切换（包括 N）时车辆仍在移动，或速度/挡位反馈无效、过期 | 以 `traction_withdrawn_retained_gear` 撤牵引并锁存上一有效挡位；旧目标不会在随后零速时自动生效。驾驶端能关联 `command_seq` 时回滚且发送旧挡零牵引；无法关联时冻结普通控制但保留急停/显式断开，需安全断开并重新握手 |
 | `control_command_rejected` / `vcu_control_apply_rejected` | bridge 拒绝控制但原因不属于浏览器 allowlist | 清空驾驶输入并保持安全状态；查 VCU JSONL 获取本地详细原因 |
 | `vehicle_vcu_handshake_command_failed` / `vcu_handshake_command_failed` | handshake ABI 调用抛错 | 本地全停 |

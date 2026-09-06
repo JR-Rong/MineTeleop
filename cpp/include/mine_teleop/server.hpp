@@ -111,6 +111,7 @@ struct SignalingServerConfig {
   std::size_t max_sdp_bytes{256 * 1024};
   std::size_t max_ice_candidate_bytes{8 * 1024};
   std::int64_t signaling_message_ttl_ms{15 * 1000};
+  std::int64_t native_control_message_ttl_ms{150};
   std::string audit_log_path;
   std::int64_t audit_log_max_bytes{64 * 1024 * 1024};
   std::int64_t audit_log_files{5};
@@ -172,6 +173,7 @@ class SignalingService {
     std::string type;
     Json payload;
     std::int64_t queued_at_utc_ms{0};
+    std::int64_t queued_at_monotonic_ms{0};
     std::uint64_t delivery_cursor{0};
 
     [[nodiscard]] Json to_json() const;
@@ -206,7 +208,8 @@ class SignalingService {
   [[nodiscard]] std::size_t acknowledge_signaling_messages(
       std::string_view session_id,
       std::string_view recipient,
-      std::uint64_t delivery_cursor);
+      std::uint64_t delivery_cursor,
+      bool control_only = false);
   [[nodiscard]] const Session& require_active_session(std::string_view session_id) const;
   [[nodiscard]] const Session& require_participant(std::string_view session_id, std::string_view participant) const;
   void validate_driver_token(std::string_view driver_id, std::string_view token);
@@ -246,6 +249,7 @@ class SignalingService {
   std::unordered_set<std::string> revoked_drivers_;
   std::unordered_map<std::string, Session> sessions_;
   std::unordered_map<std::string, std::vector<Message>> messages_;
+  std::unordered_map<std::string, Message> latest_control_messages_;
   std::unordered_map<std::string, AcceptedMessage> last_accepted_messages_;
   std::unordered_map<std::string, std::uint64_t> next_delivery_cursors_;
   std::unordered_map<std::string, LoginFailureState> login_failures_;
@@ -297,6 +301,7 @@ struct DriverConfig {
   int browser_event_log_files{3};
   bool control_trace_commands{false};
   int rate_hz{20};
+  int intent_lease_ms{200};
   int estop_hold_ms{500};
   int max_time_sync_uncertainty_ms{25};
   int time_sync_interval_ms{30000};
@@ -329,6 +334,7 @@ class DriverConsoleRuntime {
   [[nodiscard]] Json control_profile() const;
   [[nodiscard]] Json prepare_control_profile(const Json& input);
   [[nodiscard]] Json send_control(const Json& input);
+  [[nodiscard]] Json update_control_intent(const Json& input);
   [[nodiscard]] Json record_browser_event(const Json& input);
   [[nodiscard]] Json status();
   [[nodiscard]] const DriverConfig& config() const { return config_; }
@@ -339,6 +345,19 @@ class DriverConsoleRuntime {
   [[nodiscard]] Json send_signaling_message(std::string_view type, const Json& payload);
   void connect_signaling_websocket(std::string_view session_id, std::string_view token);
   void close_signaling_websocket();
+  [[nodiscard]] bool connect_control_signaling_websocket(
+      std::string_view session_id,
+      std::string_view token,
+      std::uint64_t expected_generation = 0);
+  void close_control_signaling_websocket();
+  void reset_native_control_state();
+  void native_control_sender_loop(std::stop_token stop_token);
+  void native_control_lease_loop(std::stop_token stop_token);
+  [[nodiscard]] bool send_native_control_sample();
+  void note_native_control_failure(
+      std::string error,
+      std::string_view session_id,
+      std::uint64_t generation);
   void append_websocket_messages(const Json& envelope);
   [[nodiscard]] bool remote_session_is_active(std::string_view session_id, std::string_view token) const;
   TimeSyncStatus refresh_time_sync();
@@ -359,6 +378,14 @@ class DriverConsoleRuntime {
   mutable std::mutex authentication_mutex_;
   mutable std::mutex signaling_send_mutex_;
   mutable std::mutex signaling_websocket_mutex_;
+  mutable std::mutex control_signaling_websocket_mutex_;
+  mutable std::mutex native_control_status_mutex_;
+  mutable std::mutex native_control_wait_mutex_;
+  // Serializes browser-intent acceptance with native session resets. This
+  // prevents a delayed request from a previous page/session being installed
+  // after the new session store has been initialized.
+  mutable std::mutex native_control_update_mutex_;
+  std::condition_variable_any native_control_cv_;
   std::string driver_token_;
   std::int64_t driver_token_expires_at_ms_{0};
   std::string signaling_service_instance_id_;
@@ -369,6 +396,8 @@ class DriverConsoleRuntime {
   std::int64_t control_token_expires_at_ms_{0};
   std::int64_t control_token_renew_at_ms_{0};
   std::uint64_t sequence_{0};
+  std::uint64_t control_sequence_{0};
+  std::uint64_t control_session_generation_{0};
   std::int64_t connected_at_ms_{0};
   std::int64_t last_control_prepared_at_utc_ms_{0};
   std::uint64_t control_commands_prepared_total_{0};
@@ -392,11 +421,28 @@ class DriverConsoleRuntime {
   Json pending_websocket_messages_ = Json::array();
   std::unique_ptr<WebSocketClient> signaling_websocket_;
   std::string signaling_websocket_session_id_;
+  std::unique_ptr<WebSocketClient> control_signaling_websocket_;
+  std::string control_signaling_websocket_session_id_;
+  std::uint64_t control_signaling_last_ack_seq_{0};
+  std::int64_t control_signaling_first_unacked_monotonic_ms_{0};
+  std::int64_t control_signaling_next_connect_monotonic_ms_{0};
+  int control_signaling_reconnect_delay_ms_{100};
   std::uint64_t signaling_delivery_cursor_{0};
   std::uint64_t signaling_websocket_reconnects_{0};
   Json webrtc_metrics_ = Json::object();
   std::string last_webrtc_audit_key_;
   Json authorized_vehicles_ = Json::array();
+  NativeControlIntentStore native_control_intent_;
+  std::atomic<bool> native_control_estop_wakeup_{false};
+  std::atomic<std::uint64_t> native_control_commands_sent_{0};
+  std::atomic<std::uint64_t> native_control_send_failures_{0};
+  std::atomic<std::int64_t> native_control_last_sent_at_utc_ms_{0};
+  std::atomic<std::int64_t> native_control_last_gap_ms_{0};
+  std::atomic<std::int64_t> native_control_max_gap_ms_{0};
+  std::atomic<std::uint64_t> native_control_last_seq_{0};
+  std::string native_control_last_error_;
+  std::jthread native_control_sender_;
+  std::jthread native_control_lease_;
 };
 
 class DriverConsoleHttpApp {

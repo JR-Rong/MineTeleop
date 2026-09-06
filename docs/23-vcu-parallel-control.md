@@ -52,7 +52,8 @@ DBC 全量 `409.5 bar/路`；上游控制超时在此之前仍按 0.3/0.6 普通
 车端启动 CAN bridge 后只进入 `standby`，继续发送 20 ms 的低请求报文，但不会
 自动声明平行驾驶控制权。开始握手同时要求：
 
-1. 驾驶员的 WebRTC `control` DataChannel 已连接；
+1. 驾驶员的 profile/VCU/status WebRTC `control` DataChannel 已连接，原生控制端和车端
+   的专用控制 WSS 属于当前有效会话；
 2. 驾驶员在控制端点击“开始平行驾驶握手”；
 3. `WVCU_GearCtrlReqSts=1`（物理选择器为 N）；
 4. VCU 车速反馈有效且绝对值不大于 0.1 m/s；
@@ -137,11 +138,12 @@ WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉
 4. 请求四路 EPB 驻车值 2，并等待四路状态都为 2。
 5. 清除 `ShakeReq`，等待人工状态 3。
 
-控制端通过同一条双向 DataChannel 每 500 ms 接收
+控制端通过双向 profile/VCU/status DataChannel 每 500 ms 接收
 `vcu_handshake_status`，可见 N/R/D 选择器、车速、EPB、VCU 状态、当前状态机阶段
 和最终 `ready`。
-只有 `ready=true` 才放行普通驾驶命令。点击“断开 VCU 握手”、DataChannel
-断开或安全退出时，车端执行上述完整反向序列；不会只停发 CAN。
+只有 `ready=true` 才放行由原生控制 WSS 到达的普通驾驶命令。点击“断开 VCU 握手”、
+DataChannel 断开或安全退出时，车端执行上述完整反向序列；原生控制 WSS 真断流则由
+独立 watchdog 按超时策略安全停车，不会只停发 CAN。
 
 控制页面的“实车调试限幅”窗口可设置当前浏览器会话的目标车速、单电机最大转矩、
 普通制动最大压力、缓刹压力、急刹压力和最大四轴转向角。控制端默认分别为

@@ -169,15 +169,25 @@ Invoke-CheckedCommand -Command "cmake" -CommandArguments @(
   "-DMINE_TELEOP_BUILD_SIGNALING_SERVER=OFF",
   "-DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=OFF",
   "-DMINE_TELEOP_BUILD_TESTS=OFF",
+  "-DMINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS=ON",
   "-DMINE_TELEOP_FETCH_MISSING_DEPS=OFF"
 )
 
-Write-Host "==> Building Windows control client (jobs=$BuildJobs)"
+Write-Host "==> Building Windows control client and portable safety test (jobs=$BuildJobs)"
 Invoke-CheckedCommand -Command "cmake" -CommandArguments @(
   "--build", $BuildDirectory,
   "--config", "Release",
-  "--target", "mine-teleop-control",
+  "--target", "mine-teleop-control", "mine-teleop-native-control-intent-tests",
   "--parallel", "$BuildJobs"
+)
+
+Write-Host "==> Running portable native control safety test (Release)"
+Invoke-CheckedCommand -Command "ctest" -CommandArguments @(
+  "--test-dir", $BuildDirectory,
+  "-C", "Release",
+  "--output-on-failure",
+  "--no-tests=error",
+  "-R", "^mine-teleop-native-control-intent-tests$"
 )
 
 $ConfigurationDirectory = Join-Path $BuildDirectory "Release"
@@ -300,7 +310,11 @@ $DependencyManifest |
   ConvertTo-Json -Depth 6 |
   Set-Content -LiteralPath (Join-Path $PackageRoot "DEPENDENCIES.json") -Encoding UTF8
 
-$TestsExecuted = if ($SmokeTest) { "help-smoke-only" } else { "no" }
+$TestsExecuted = if ($SmokeTest) {
+  "portable-native-control-intent,help-smoke"
+} else {
+  "portable-native-control-intent"
+}
 @(
   "target_platform=windows",
   "target_architecture=$Architecture",
@@ -312,7 +326,7 @@ $TestsExecuted = if ($SmokeTest) { "help-smoke-only" } else { "no" }
   "libcurl_runtime_version=$ActualCurlRuntimeVersion",
   "libcurl_tls_backend=$ActualCurlTlsBackend",
   "libcurl_linkage=$ActualCurlLinkage",
-  "native_tests_built=no",
+  "native_tests_built=yes",
   "runtime_tests_executed=$TestsExecuted",
   "dependency_manifest=DEPENDENCIES.json",
   "built_at_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"

@@ -9,7 +9,8 @@
 
 1. 云端：安装信令、Caddy、HAProxy 和 Coturn；
 2. 车端：解压安装包、放置 device token、检查配置并前台启动；
-3. 控制端：解压 macOS 包，启动本地 `127.0.0.1` 控制页面；
+3. 控制端：解压目标平台的 Windows、macOS 或 Ubuntu 包，启动只监听
+   `127.0.0.1` 的原生控制进程和系统浏览器页面；
 4. 联合验收：先直连/STUN，再强制 TURN，最后接入真实相机、编码器和底盘。
 
 部署不会在工控机上编译源码。
@@ -184,7 +185,13 @@ scripts/deploy/deploy_vehicle_bundle.sh \
 
 部署脚本只是 SSH 上传和验收辅助工具，不是车端运行依赖。
 
-## 5. 部署 macOS 控制端
+## 5. 部署控制端
+
+三个桌面平台使用相同架构：网页只向本机 `/api/control-intent` 提交 latest-only 输入
+意图；Windows、macOS 和 Ubuntu 的原生进程都独立以 20 Hz 经专用 WSS 生成并发送
+普通控制命令。WebRTC DataChannel 只保留 session profile、VCU 握手和状态。
+
+### 5.1 macOS
 
 解压：
 
@@ -219,6 +226,25 @@ http://127.0.0.1:28080
 
 不要把司机密码写入 YAML、命令行历史或安装包。
 
+### 5.2 Windows
+
+解压 Windows x64 ZIP 后，可双击 `bin\mine-teleop-control.exe`，或在 PowerShell 中运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run-control.ps1
+```
+
+### 5.3 Ubuntu 控制端
+
+解压 Ubuntu x64 控制包后运行：
+
+```bash
+./mine-teleop-control --config config/driver-console.three-machine.yaml
+```
+
+三个平台都不得把回环监听地址改成公网地址。平台包的构建成功只证明可启动产物，
+不能替代对应桌面系统上的浏览器、专用控制 WSS 和真实车端联合验收。
+
 ## 6. 联合启动与验收
 
 启动顺序：
@@ -226,7 +252,8 @@ http://127.0.0.1:28080
 1. `mine-teleop-cloud.target` 健康；
 2. 车端 `./bin/mine-teleop-run` 已注册并保持在线；
 3. 控制端登录并选择 `vehicle-001`；
-4. 确认控制权、视频轨道、时间同步和 DataChannel，并等待页面显示车端已确认 V3 会话控制参数及匹配的 `applied_revision`；
+4. 确认控制权、视频轨道、时间同步、profile/VCU/status DataChannel 和两端专用控制
+   WSS，并等待页面显示车端已确认 V3 会话控制参数及匹配的 `applied_revision`；
 5. 释放会话后确认车辆回到安全状态。
 
 推荐检查：
@@ -280,9 +307,14 @@ curl -fsS http://127.0.0.1:8080/health
   条件下提交。
 - 将所有写旧 `/api/control-limits` 的集成迁移到 `/api/control-profile`。旧 GET 仅保留
   归一化比例只读兼容，旧 POST 固定返回 `410 Gone`，不会再直接修改当前会话制动参数。
-- 将旧 `POST /api/control/keyboard`、`POST /api/control/gamepad` 调用迁移到标准
-  `/api/control`；两个 specialized endpoint 现在固定返回 `410 Gone`，避免在 profile
-  尚未被车端 ACK 或已被拒绝时按错误的物理压力比例发送命令。
+- 将旧 `POST /api/control`、`POST /api/control/keyboard` 和
+  `POST /api/control/gamepad` 调用迁移到 `/api/control-intent`；三个旧命令接口现在
+  固定返回 `410 Gone`。新接口必须携带当前 `session_id`、`session_generation`、
+  `ui_instance_id` 和递增 `intent_seq`，只更新本机输入意图；普通 v1 命令及其 20 Hz
+  时钟、协议序号和 token 都由原生进程拥有。
+- 云端 signaling、车端 runtime 与控制端必须作为同一协议版本成套升级：新车端拒绝
+  浏览器 DataChannel 普通命令，新控制端则只通过原生 WSS 发送。不得把新控制端与旧
+  车端/旧 signaling 混用，或把旧控制端与新车端混用。
 - 检查车端 `field_safety.max_speed_kph`：所有 adapter 的范围均为 `[0, 72] km/h`，
   `0` 明确禁用牵引。旧配置如果大于 `72` 会启动失败，必须根据本地 PID 车速上限和
   隔离台架结果显式修改，不得为通过校验而盲目压到 `72`。

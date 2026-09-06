@@ -1,7 +1,10 @@
 'use strict';
 
 const assert = require('assert').strict;
+const fs = require('fs');
+const path = require('path');
 const logic = require('../web/control_logic.js');
+const controlPageSource = fs.readFileSync(path.join(__dirname, '../src/server.cpp'), 'utf8');
 
 let passed = 0;
 let failed = 0;
@@ -25,6 +28,21 @@ const readyVcu = {
   speed_valid: true,
   speed_mps: 0,
 };
+
+test('browser native intent envelope is bound to the connected session generation', () => {
+  assert.equal(
+      controlPageSource.includes(
+          "return{session_id:nativeControlSessionId,session_generation:nativeControlSessionGeneration,ui_instance_id:uiInstanceId,intent_seq:nativeIntentSeq,...normalized}"),
+      true);
+  assert.equal(
+      controlPageSource.includes(
+          "nativeControlSessionId=String(session.session_id||'');nativeControlSessionGeneration=Number(session.control_session_generation)"),
+      true);
+  assert.equal(
+      controlPageSource.includes(
+          "nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot=''"),
+      true);
+});
 
 test('fixed keyboard bindings expose two brakes and paired direction keys', () => {
   assert.deepEqual(logic.KEY_BINDINGS, {
@@ -107,14 +125,27 @@ test('gear rejection matches only a forwarded command from the active transition
   assert.deepEqual(transition.forwardedSeqs, [101, 102]);
   assert.equal(logic.matchesGearChangeRejection(transition, {
     issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    intent_seq: 101,
+    command_seq: 999,
+    control_status_seq: 41,
+  }, 'R'), true);
+  assert.equal(logic.matchesGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
+    intent_seq: 103,
+    command_seq: 101,
+    control_status_seq: 41,
+  }, 'R'), false);
+  assert.equal(logic.matchesGearChangeRejection(transition, {
+    issue_code: 'vcu_drive_gear_change_moving_or_stale',
     command_seq: 101,
     control_status_seq: 41,
   }, 'R'), true);
   assert.equal(logic.matchesGearChangeRejection(transition, {
     issue_code: 'vcu_drive_gear_change_moving_or_stale',
-    command_seq: 103,
+    intent_seq: 0,
+    command_seq: 102,
     control_status_seq: 41,
-  }, 'R'), false);
+  }, 'R'), true);
   assert.equal(logic.matchesGearChangeRejection(transition, {
     issue_code: 'vcu_drive_gear_change_moving_or_stale',
     command_seq: 101,
@@ -128,7 +159,7 @@ test('gear rejection matches only a forwarded command from the active transition
 
   assert.deepEqual(logic.reduceGearChangeRejection(transition, {
     issue_code: 'vcu_drive_gear_change_moving_or_stale',
-    command_seq: 101,
+    intent_seq: 101,
     control_status_seq: 41,
   }, 'R'), {
     matched: true,

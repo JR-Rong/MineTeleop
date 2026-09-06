@@ -66,6 +66,7 @@ class WebSocketClient {
   [[nodiscard]] bool connected() const;
   [[nodiscard]] const std::string& url() const { return url_; }
   void send_json(const Json& value);
+  void send_json(const Json& value, std::chrono::milliseconds timeout);
   [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout);
 
  private:

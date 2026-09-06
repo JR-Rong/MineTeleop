@@ -5,7 +5,9 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #else
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -64,6 +66,20 @@ std::string socket_error_message(int error) { return std::strerror(error); }
 
 NativeSocket native_socket(SocketHandle socket) {
   return static_cast<NativeSocket>(socket);
+}
+
+void enable_tcp_nodelay_best_effort(NativeSocket socket) noexcept {
+  int enabled = 1;
+#if defined(_WIN32)
+  ::setsockopt(
+      socket,
+      IPPROTO_TCP,
+      TCP_NODELAY,
+      reinterpret_cast<const char*>(&enabled),
+      static_cast<int>(sizeof(enabled)));
+#else
+  ::setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+#endif
 }
 
 int socket_buffer_size(std::size_t size) {
@@ -698,6 +714,7 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
     close();
     throw std::runtime_error("websocket connection has no active socket");
   }
+  enable_tcp_nodelay_best_effort(impl_->socket);
 
   std::array<unsigned char, 16> nonce{};
   random_bytes(nonce.data(), nonce.size());
@@ -777,9 +794,14 @@ bool WebSocketClient::connected() const {
 }
 
 void WebSocketClient::send_json(const Json& value) {
+  send_json(value, timeout_);
+}
+
+void WebSocketClient::send_json(const Json& value, std::chrono::milliseconds timeout) {
   if (!connected()) throw std::runtime_error("websocket is not connected");
+  if (timeout.count() <= 0) throw std::invalid_argument("websocket send timeout must be positive");
   if (!value.is_object()) throw std::invalid_argument("websocket JSON message must be an object");
-  impl_->send_frame(0x1, value.dump(), timeout_);
+  impl_->send_frame(0x1, value.dump(), timeout);
 }
 
 WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds timeout) {
