@@ -1826,7 +1826,10 @@ void test_native_control_intent_is_latest_only_and_estop_sticky() {
   replacement_ui.intent_seq = 1;
   replacement_ui.throttle = 0.2;
   update = store.update(replacement_ui, 1001);
-  expect(!update.accepted, "a replacement page restored non-neutral input without a neutral handshake");
+  expect(
+      !update.accepted && update.requires_fresh_input &&
+          update.reason == "fresh_neutral_required",
+      "a replacement page restored non-neutral input without a neutral handshake");
   store.reset();
   expect(!store.sample(1002).active, "session reset retained a prior native intent");
 }
@@ -3885,7 +3888,7 @@ void test_driver_login_lists_only_authorized_vehicles() {
   server.stop();
 }
 
-void test_driver_console_page_keeps_waiting_state_during_background_safety_ticks() {
+void test_driver_console_page_keeps_waiting_state_during_background_intent_refresh() {
   mine_teleop::DriverConfig config;
   config.driver_id = "driver-console-001";
   config.signaling_url = "http://127.0.0.1:1";
@@ -3898,15 +3901,15 @@ void test_driver_console_page_keeps_waiting_state_during_background_safety_ticks
   expect(response.status == 200, "driver console page did not load");
   expect(
       response.body.find("async function send(extra={},announceUnavailable=true)") != std::string::npos,
-      "driver console page cannot distinguish background safety ticks from user control attempts");
+      "driver console page cannot distinguish background intent refresh from user control attempts");
   expect(
-      response.body.find("function enqueueControlHeartbeat()") != std::string::npos &&
+      response.body.find("function enqueueIntentRefresh()") != std::string::npos &&
           response.body.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
               std::string::npos &&
           response.body.find(
-              "sendPendingControlProfile();const enqueued=enqueueControlHeartbeat()") !=
+              "sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
               std::string::npos,
-      "background safety tick still announces a control fault while waiting for media");
+      "background intent refresh still announces a control fault while waiting for media");
   expect(
       response.body.find("webrtcLabel.textContent='等待车端媒体'") != std::string::npos,
       "driver console page does not expose the pending vehicle-media state");
@@ -4019,7 +4022,7 @@ int main() {
       {"native_testsrc_acquisition_does_not_spawn_ffmpeg", test_native_testsrc_acquisition_does_not_spawn_ffmpeg},
       {"basler_camera_uses_minimal_aravis_bridge", test_basler_camera_uses_minimal_aravis_bridge},
       {"native_driver_to_vehicle_signaling_control_payload", test_native_driver_to_vehicle_signaling_control_payload},
-      {"driver_console_page_keeps_waiting_state_during_background_safety_ticks", test_driver_console_page_keeps_waiting_state_during_background_safety_ticks},
+      {"driver_console_page_keeps_waiting_state_during_background_intent_refresh", test_driver_console_page_keeps_waiting_state_during_background_intent_refresh},
       {"driver_login_lists_only_authorized_vehicles", test_driver_login_lists_only_authorized_vehicles},
       {"local_archive_uploader_is_atomic_and_resumable", test_local_archive_uploader_is_atomic_and_resumable},
   };

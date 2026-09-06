@@ -1072,6 +1072,8 @@ NativeControlIntentUpdate NativeControlIntentStore::update(
     throw std::invalid_argument("intent receive time must be non-negative");
   }
   std::lock_guard lock(mutex_);
+  const bool incoming_estop = intent.estop;
+  const bool incoming_neutral = intent.is_neutral();
   // ESTOP is session-sticky. Normalize the incoming value before replay and
   // fingerprint checks so a producer which refreshes the same sequence with
   // estop=false cannot create a false conflict after the latch has already
@@ -1091,12 +1093,15 @@ NativeControlIntentUpdate NativeControlIntentStore::update(
   if (same_ui && intent.intent_seq == latest_->intent_seq && intent != *latest_) {
     return {false, false, requires_fresh_input_, "intent_seq_conflict"};
   }
-  if (requires_fresh_input_ && !intent.is_neutral() && !intent.estop) {
+  // A sticky ESTOP must not make an originally non-neutral command from a
+  // replacement UI look safe enough to bypass the fresh-neutral interlock.
+  // A newly requested ESTOP remains allowed to preempt that interlock.
+  if (requires_fresh_input_ && !incoming_neutral && !incoming_estop) {
     return {false, same_ui && intent.intent_seq == latest_->intent_seq, true, "fresh_neutral_required"};
   }
 
   const bool duplicate = same_ui && intent.intent_seq == latest_->intent_seq;
-  if (requires_fresh_input_ && intent.is_neutral()) requires_fresh_input_ = false;
+  if (requires_fresh_input_ && incoming_neutral) requires_fresh_input_ = false;
   if (intent.estop) estop_latched_ = true;
   latest_ = std::move(intent);
   received_at_monotonic_ms_ = received_at_monotonic_ms;

@@ -137,6 +137,18 @@ void test_estop_is_sticky() {
       duplicate_clear.accepted && duplicate_clear.duplicate,
       "sticky ESTOP turned an otherwise identical intent refresh into a sequence conflict");
 
+  auto replacement_drive = neutral_intent(1, "R");
+  replacement_drive.ui_instance_id = "replacement-test-ui";
+  replacement_drive.throttle = 0.2;
+  const auto replacement = store.update(replacement_drive, 23);
+  expect(
+      !replacement.accepted && replacement.requires_fresh_input &&
+          replacement.reason == "fresh_neutral_required",
+      "sticky ESTOP allowed a replacement UI to bypass the fresh-neutral interlock");
+  expect(
+      store.sample(24).intent.estop,
+      "rejected replacement UI input cleared the ESTOP latch");
+
   store.invalidate();
   const auto invalidated = store.sample(1000);
   expect(
