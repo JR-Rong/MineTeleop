@@ -3613,7 +3613,6 @@ ServerResponse SignalingService::handle_driver_login(Json value) {
         break;
       case LoginCredentialSnapshot::Kind::LegacyPlaintext:
         verified = constant_time_equal(credential.verifier, password.view());
-        cleanse_secret(credential.verifier);
         break;
       case LoginCredentialSnapshot::Kind::Unknown:
         static_cast<void>(verify_argon2id_password(

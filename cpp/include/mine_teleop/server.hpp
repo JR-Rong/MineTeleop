@@ -221,7 +221,10 @@ class SignalingService {
     };
 
     Kind kind{Kind::Unknown};
-    std::string verifier;
+    // SignalingService owns immutable credential configuration for its entire
+    // request lifetime, so a view avoids copying a legacy plaintext password
+    // into a second transient buffer before verification runs outside mutex_.
+    std::string_view verifier;
   };
   struct ApiRateState {
     std::int64_t requests{0};
