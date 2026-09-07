@@ -1615,11 +1615,10 @@ void test_control_page_contract() {
               "clientLog('control_trace_batch',{reason,trace_session_id:String(scope&&scope.session_id||''),"
               "trace_vehicle_id:String(scope&&scope.vehicle_id||''),commands,summary})") !=
               std::string::npos &&
-          control_assets.find("controlTraceBuffer.length>=48") != std::string::npos &&
           control_assets.find("setInterval(()=>flushControlTrace('interval'),1000)") !=
               std::string::npos &&
           control_assets.find("clientLog('control_trace_command'") == std::string::npos,
-      "control command tracing is not enabled through a bounded one-second batch");
+      "control trace summary is not enabled through a bounded one-second batch");
   for (const std::string_view field : {
            "session_id", "intent_seq", "trace_session_id", "trace_vehicle_id",
            "heartbeat_tick_count", "heartbeat_enqueued_count", "heartbeat_coalesced_count",

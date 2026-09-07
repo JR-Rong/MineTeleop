@@ -4748,19 +4748,23 @@ void test_driver_console_page_keeps_waiting_state_during_background_intent_refre
   asset_request.path = "/assets/control_console.js";
   const auto console_js_response = app.handle(asset_request);
   expect(console_js_response.status == 200, "driver console script did not load");
+  asset_request.path = "/assets/control_logic.js";
+  const auto control_logic_response = app.handle(asset_request);
+  expect(control_logic_response.status == 200, "driver control logic script did not load");
+  const auto control_assets = console_js_response.body + "\n" + control_logic_response.body;
   expect(
-      console_js_response.body.find("async function send(extra={},announceUnavailable=true)") != std::string::npos,
+      control_assets.find("async function send(extra={},announceUnavailable=true)") != std::string::npos,
       "driver console page cannot distinguish background intent refresh from user control attempts");
   expect(
-      console_js_response.body.find("function enqueueIntentRefresh()") != std::string::npos &&
-          console_js_response.body.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
+      control_assets.find("function enqueueIntentRefresh()") != std::string::npos &&
+          control_assets.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
               std::string::npos &&
-          console_js_response.body.find(
+          control_assets.find(
               "sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
               std::string::npos,
       "background intent refresh still announces a control fault while waiting for media");
   expect(
-      console_js_response.body.find("webrtcLabel.textContent='等待车端媒体'") != std::string::npos,
+      control_assets.find("webrtcLabel.textContent='等待车端媒体'") != std::string::npos,
       "driver console page does not expose the pending vehicle-media state");
 }
 
