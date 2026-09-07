@@ -41,17 +41,16 @@
 namespace mine_teleop {
 namespace {
 
-constexpr double kChassisControlMaxTargetSpeedMps = 20.0;
-constexpr double kChassisControlMaxTargetSpeedKph =
-    kChassisControlMaxTargetSpeedMps * 3.6;
-constexpr double kChassisControlMaxSteeringAngleDeg = 30.0;
-constexpr int kMinSpeedFeedbackTimeoutMs = 20;
-constexpr int kMaxSpeedFeedbackTimeoutMs = 500;
-constexpr int kMinSpeedPidMaxDtMs = 20;
-constexpr int kMaxSpeedPidMaxDtMs = 200;
-constexpr double kMaxSpeedPidGain = 100.0;
-constexpr double kMaxSpeedPidDerivativeFilterTauMs = 2000.0;
-constexpr double kMaxHardOverspeedMarginKph = 36.0;
+using control_limits::kChassisControlMaxTargetSpeedKph;
+using control_limits::kChassisControlMaxTargetSpeedMps;
+using control_limits::kMaxHardOverspeedMarginKph;
+using control_limits::kMaxSpeedPidDerivativeFilterTauMs;
+using control_limits::kMaxSpeedPidGain;
+using control_limits::kMaxSteeringAngleDeg;
+using control_limits::kMaxSpeedFeedbackTimeoutMs;
+using control_limits::kMaxSpeedPidMaxDtMs;
+using control_limits::kMinSpeedFeedbackTimeoutMs;
+using control_limits::kMinSpeedPidMaxDtMs;
 
 template <typename T>
 T required(const YAML::Node& node, const char* key, std::string_view context) {
@@ -80,7 +79,7 @@ T optional(const YAML::Node& node, const char* key, T fallback) {
 }
 
 void require_finite_range(double value, double minimum, double maximum, std::string_view label) {
-  if (!std::isfinite(value) || value < minimum || value > maximum) {
+  if (!control_limits::is_finite_inclusive(value, minimum, maximum)) {
     throw std::invalid_argument(std::string(label) + " must be a finite value in [" +
                                 std::to_string(minimum) + ", " + std::to_string(maximum) + "]");
   }
@@ -1269,7 +1268,7 @@ void SessionControlProfile::validate() const {
   require_finite_range(
       max_steering_angle_deg,
       0.0,
-      kChassisControlMaxSteeringAngleDeg,
+      kMaxSteeringAngleDeg,
       "max_steering_angle_deg");
   require_finite_range(speed_pid_kp, 0.0, kMaxSpeedPidGain, "speed_pid_kp");
   if (speed_pid_kp <= 0.0) {
@@ -2101,7 +2100,10 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
       "max_brake_pressure_bar",
       kDefaultMaxBrakePressureBar);
   config.field_safety.max_steering_angle_deg =
-      optional<double>(safety, "max_steering_angle_deg", 30.0);
+      optional<double>(
+          safety,
+          "max_steering_angle_deg",
+          control_limits::kMaxSteeringAngleDeg);
   config.field_safety.require_can_feedback_before_control =
       optional<bool>(safety, "require_can_feedback_before_control", true);
   config.field_safety.require_local_estop_reset = optional<bool>(safety, "require_local_estop_reset", true);
@@ -2144,7 +2146,8 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
           kMaxOrdinaryBrakePressureBar ||
       !std::isfinite(config.field_safety.max_steering_angle_deg) ||
       config.field_safety.max_steering_angle_deg < 0.0 ||
-      config.field_safety.max_steering_angle_deg > 30.0 ||
+      config.field_safety.max_steering_angle_deg >
+          control_limits::kMaxSteeringAngleDeg ||
       config.field_safety.max_time_sync_uncertainty_ms < 0 ||
       config.field_safety.time_sync_interval_ms <= 0 ||
       config.field_safety.time_sync_samples < 3 || config.field_safety.time_sync_samples > 15) {
@@ -2505,7 +2508,8 @@ DynamicLibraryVehicleAdapter::DynamicLibraryVehicleAdapter(
       speed_pid_max_dt_ms_ > kMaxSpeedPidMaxDtMs ||
       !std::isfinite(hard_overspeed_margin_mps_) ||
       hard_overspeed_margin_mps_ <= 0.0 ||
-      hard_overspeed_margin_mps_ > kMaxHardOverspeedMarginKph / 3.6) {
+      hard_overspeed_margin_mps_ >
+          control_limits::kMaxHardOverspeedMarginMps) {
     throw std::invalid_argument("dynamic adapter configuration is incomplete");
   }
 }
@@ -2608,19 +2612,28 @@ std::uint64_t DynamicLibraryVehicleAdapter::configure_runtime_control_profile(
   if (!opened_) throw std::runtime_error("dynamic vehicle adapter is not open");
   profile.validate();
   if (profile_revision == 0 ||
-      profile.target_speed_kph > max_speed_mps_ * 3.6 + 1e-9 ||
-      profile.max_motor_torque_nm > full_scale_motor_torque_nm_ + 1e-9 ||
-      profile.max_brake_pressure_bar > max_ordinary_brake_pressure_bar_ + 1e-9) {
+      control_limits::exceeds_hard_limit(
+          profile.target_speed_kph,
+          control_limits::meters_per_second_to_kilometers_per_hour(
+              max_speed_mps_)) ||
+      control_limits::exceeds_hard_limit(
+          profile.max_motor_torque_nm,
+          full_scale_motor_torque_nm_) ||
+      control_limits::exceeds_hard_limit(
+          profile.max_brake_pressure_bar,
+          max_ordinary_brake_pressure_bar_)) {
     throw std::invalid_argument("runtime control profile exceeds vehicle limits");
   }
   const BridgeRuntimeControlConfigV2 config{
       sizeof(BridgeRuntimeControlConfigV2),
       static_cast<std::uint32_t>(profile.profile_version),
       profile_revision,
-      profile.target_speed_kph / 3.6,
+      control_limits::kilometers_per_hour_to_meters_per_second(
+          profile.target_speed_kph),
       profile.max_motor_torque_nm,
       profile.max_brake_pressure_bar,
-      profile.max_steering_angle_deg / kChassisControlMaxSteeringAngleDeg,
+      control_limits::steering_degrees_to_normalized_request(
+          profile.max_steering_angle_deg),
       profile.speed_pid_kp,
       profile.speed_pid_ki,
       profile.speed_pid_kd,
@@ -2685,14 +2698,15 @@ void DynamicLibraryVehicleAdapter::apply_control(const ControlCommand& command) 
       traction_ceiling,
       session_brake_pressure_limit_bar_,
       max_ordinary_brake_pressure_bar_);
-  const double steering[4]{command.steering, command.steering, command.steering, command.steering};
+  const auto steering =
+      control_limits::broadcast_steering_request(command.steering);
   BridgeApplyResultV1 apply_result{};
   const int result = apply_v2_fn_(
       gear_to_bridge_value(command.gear),
       velocity,
       acceleration,
-      steering,
-      4,
+      steering.data(),
+      static_cast<int>(steering.size()),
       &apply_result);
   if (apply_result.struct_size != sizeof(BridgeApplyResultV1) ||
       apply_result.result_code != result || apply_result.reserved != 0U ||
@@ -2726,9 +2740,15 @@ void DynamicLibraryVehicleAdapter::apply_safe_stop(
         "mine_teleop_chassis_set_stop_context_v1");
     check_result(stop_fn_(), "mine_teleop_chassis_emergency_stop");
   } else {
-    const double steering[4]{output.steering, output.steering, output.steering, output.steering};
+    const auto steering =
+        control_limits::broadcast_steering_request(output.steering);
     check_result(
-        apply_fn_(gear_to_bridge_value(output.gear), 0.0, -output.brake, steering, 4),
+        apply_fn_(
+            gear_to_bridge_value(output.gear),
+            0.0,
+            -output.brake,
+            steering.data(),
+            static_cast<int>(steering.size())),
         "mine_teleop_chassis_apply_state");
   }
   ++safe_stop_count_;
@@ -2891,7 +2911,8 @@ std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& conf
         config.vehicle_adapter.can_interface,
         config.hardware.can_bitrate,
         config.hardware.can_tx_queue_length,
-        config.field_safety.max_speed_kph / 3.6,
+        control_limits::kilometers_per_hour_to_meters_per_second(
+            config.field_safety.max_speed_kph),
         config.field_safety.full_scale_motor_torque_nm,
         config.field_safety.motor_torque_rise_rate_nm_per_s,
         config.field_safety.max_brake_pressure_bar,
@@ -2902,7 +2923,8 @@ std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& conf
         config.field_safety.speed_pid_kd,
         config.field_safety.speed_pid_derivative_filter_tau_ms,
         config.field_safety.speed_pid_max_dt_ms,
-        config.field_safety.hard_overspeed_margin_kph / 3.6);
+        control_limits::kilometers_per_hour_to_meters_per_second(
+            config.field_safety.hard_overspeed_margin_kph));
   }
   throw std::runtime_error("unsupported vehicle adapter type: " + config.vehicle_adapter.type);
 }
@@ -3136,7 +3158,9 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
     return result;
   };
   const double target_speed_ceiling_kph = max_speed_kph_ * max_throttle_;
-  if (request.profile.target_speed_kph > target_speed_ceiling_kph + 1e-9) {
+  if (control_limits::exceeds_hard_limit(
+          request.profile.target_speed_kph,
+          target_speed_ceiling_kph)) {
     return cache_result(profile_result(
         request,
         now.utc,
@@ -3144,8 +3168,9 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
         false,
         "target_speed_exceeds_vehicle_limit"));
   }
-  if (request.profile.max_motor_torque_nm >
-      full_scale_motor_torque_nm_ + 1e-9) {
+  if (control_limits::exceeds_hard_limit(
+          request.profile.max_motor_torque_nm,
+          full_scale_motor_torque_nm_)) {
     return cache_result(profile_result(
         request,
         now.utc,
@@ -3153,8 +3178,9 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
         false,
         "motor_torque_exceeds_vehicle_limit"));
   }
-  if (request.profile.max_brake_pressure_bar >
-      max_brake_pressure_bar_ + 1e-9) {
+  if (control_limits::exceeds_hard_limit(
+          request.profile.max_brake_pressure_bar,
+          max_brake_pressure_bar_)) {
     return cache_result(profile_result(
         request,
         now.utc,
@@ -3162,8 +3188,9 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
         false,
         "brake_pressure_exceeds_vehicle_limit"));
   }
-  if (request.profile.max_steering_angle_deg >
-      max_steering_angle_deg_ + 1e-9) {
+  if (control_limits::exceeds_hard_limit(
+          request.profile.max_steering_angle_deg,
+          max_steering_angle_deg_)) {
     return cache_result(profile_result(
         request,
         now.utc,
@@ -3363,7 +3390,8 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
       ? active_session_profile_->max_steering_angle_deg
       : max_steering_angle_deg_;
   const auto steering_limit =
-      std::min(max_steering_angle_deg_, session_steering_angle_limit) / 30.0;
+      control_limits::steering_degrees_to_normalized_request(
+          std::min(max_steering_angle_deg_, session_steering_angle_limit));
   const auto limited_steering =
       std::clamp(effective.steering, -steering_limit, steering_limit);
   if (vehicle_limited_throttle != effective.throttle) {

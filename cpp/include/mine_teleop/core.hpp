@@ -16,6 +16,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "mine_teleop/control_limits.hpp"
 #include "mine_teleop/time.hpp"
 
 namespace mine_teleop {
@@ -24,13 +25,20 @@ using Json = nlohmann::json;
 
 inline constexpr int kProtocolVersion = 1;
 inline constexpr std::size_t kMaxVehicleTelemetryHistory = 1024;
-inline constexpr double kDefaultFullScaleMotorTorqueNm = 300.0;
-inline constexpr double kMaxFullScaleMotorTorqueNm = 640.0;
-inline constexpr double kDefaultMotorTorqueRiseRateNmPerSecond = 0.0;
-inline constexpr double kMaxMotorTorqueRiseRateNmPerSecond = 32000.0;
-inline constexpr double kDefaultMaxBrakePressureBar = 100.0;
-inline constexpr double kMaxOrdinaryBrakePressureBar = 327.6;
-inline constexpr double kMaxEmergencyBrakePressureBar = 409.5;
+inline constexpr double kDefaultFullScaleMotorTorqueNm =
+    control_limits::kDefaultFullScaleMotorTorqueNm;
+inline constexpr double kMaxFullScaleMotorTorqueNm =
+    control_limits::kMaxFullScaleMotorTorqueNm;
+inline constexpr double kDefaultMotorTorqueRiseRateNmPerSecond =
+    control_limits::kDefaultMotorTorqueRiseRateNmPerSecond;
+inline constexpr double kMaxMotorTorqueRiseRateNmPerSecond =
+    control_limits::kMaxMotorTorqueRiseRateNmPerSecond;
+inline constexpr double kDefaultMaxBrakePressureBar =
+    control_limits::kDefaultMaxBrakePressureBar;
+inline constexpr double kMaxOrdinaryBrakePressureBar =
+    control_limits::kMaxOrdinaryBrakePressureBar;
+inline constexpr double kMaxEmergencyBrakePressureBar =
+    control_limits::kMaxEmergencyBrakePressureBar;
 inline constexpr int kSessionControlProfileMaxAgeMs = 2000;
 inline constexpr int kSessionControlProfileVersion = 3;
 static_assert(kMaxFullScaleMotorTorqueNm <= 800.0 * 0.8);

@@ -516,6 +516,15 @@ if(MINE_TELEOP_BUILD_TESTS)
   add_test(NAME mine-teleop-control-tests COMMAND mine-teleop-control-tests)
   set_tests_properties(mine-teleop-control-tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+  add_executable(mine-teleop-control-limits-tests cpp/tests/control_limits_tests.cpp)
+  target_include_directories(
+    mine-teleop-control-limits-tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/deployments/chassis-control-bridge
+  )
+  target_link_libraries(mine-teleop-control-limits-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-control-limits-tests)
+  add_test(NAME mine-teleop-control-limits-tests COMMAND mine-teleop-control-limits-tests)
+
   add_executable(mine-teleop-vcu-tests cpp/tests/vcu_tests.cpp)
   target_link_libraries(mine-teleop-vcu-tests PRIVATE mine_teleop_vcu)
   mine_teleop_enable_warnings(mine-teleop-vcu-tests)

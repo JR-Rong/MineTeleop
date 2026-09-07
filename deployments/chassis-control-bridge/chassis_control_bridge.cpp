@@ -1,4 +1,5 @@
 #include "global_variables.h"
+#include "mine_teleop/control_limits.hpp"
 #include "mine_teleop/detail/json_escape.hpp"
 #include "mine_teleop/vcu.hpp"
 #include "mine_teleop_chassis_bridge.h"
@@ -33,6 +34,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unistd.h>
 #include <utility>
@@ -71,6 +73,64 @@ constexpr std::array<std::uint32_t, 29> kCriticalFeedbackIds{
     0x18C0F4D0U, 0x18C1F4D0U, 0x18C2F4D0U, 0x18C3F4D0U,
     0x18C8F4D0U, 0x18C9F4D0U, 0x18CAF4D0U, 0x18CBF4D0U,
 };
+
+static_assert(
+    mine_teleop::control_limits::kDefaultFullScaleMotorTorqueNm ==
+    MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM);
+static_assert(
+    mine_teleop::control_limits::kMaxFullScaleMotorTorqueNm ==
+    MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM);
+static_assert(
+    mine_teleop::control_limits::kDefaultMotorTorqueRiseRateNmPerSecond ==
+    MINE_TELEOP_CHASSIS_DEFAULT_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND);
+static_assert(
+    mine_teleop::control_limits::kMaxMotorTorqueRiseRateNmPerSecond ==
+    MINE_TELEOP_CHASSIS_MAX_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND);
+static_assert(
+    mine_teleop::control_limits::kDefaultMaxBrakePressureBar ==
+    MINE_TELEOP_CHASSIS_DEFAULT_MAX_BRAKE_PRESSURE_BAR);
+static_assert(
+    mine_teleop::control_limits::kMaxOrdinaryBrakePressureBar ==
+    MINE_TELEOP_CHASSIS_MAX_ORDINARY_BRAKE_PRESSURE_BAR);
+static_assert(
+    mine_teleop::control_limits::kMaxEmergencyBrakePressureBar ==
+    MINE_TELEOP_CHASSIS_MAX_EMERGENCY_BRAKE_PRESSURE_BAR);
+static_assert(
+    mine_teleop::control_limits::kBrakePressureResolutionBar ==
+    MINE_TELEOP_CHASSIS_BRAKE_PRESSURE_RESOLUTION_BAR);
+static_assert(
+    mine_teleop::control_limits::kMinSpeedFeedbackTimeoutMs ==
+    MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS);
+static_assert(
+    mine_teleop::control_limits::kMaxSpeedFeedbackTimeoutMs ==
+    MINE_TELEOP_CHASSIS_MAX_SPEED_FEEDBACK_TIMEOUT_MS);
+static_assert(
+    mine_teleop::control_limits::kMinSpeedPidMaxDtMs ==
+    MINE_TELEOP_CHASSIS_MIN_SPEED_PID_MAX_DT_MS);
+static_assert(
+    mine_teleop::control_limits::kMaxSpeedPidMaxDtMs ==
+    MINE_TELEOP_CHASSIS_MAX_SPEED_PID_MAX_DT_MS);
+static_assert(
+    mine_teleop::control_limits::kMaxSpeedPidGain ==
+    MINE_TELEOP_CHASSIS_MAX_SPEED_PID_GAIN);
+static_assert(
+    mine_teleop::control_limits::kMaxSpeedPidDerivativeFilterTauMs ==
+    MINE_TELEOP_CHASSIS_MAX_DERIVATIVE_FILTER_TAU_MS);
+static_assert(
+    mine_teleop::control_limits::kMaxHardOverspeedMarginMps ==
+    MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS);
+static_assert(
+    mine_teleop::control_limits::kMaxNormalizedSteeringRequest ==
+    MINE_TELEOP_CHASSIS_MAX_STEERING_REQUEST);
+static_assert(
+    mine_teleop::control_limits::kSteeringAxisCount ==
+    mine_teleop::vcu::kSteeringAxisCount);
+static_assert(
+    std::extent_v<decltype(MineTeleopChassisFeedback::eps_angle)> ==
+    mine_teleop::control_limits::kSteeringAxisCount);
+static_assert(
+    std::extent_v<decltype(MineTeleopChassisCanFeedbackV1::steering_angle_deg)> ==
+    mine_teleop::control_limits::kSteeringAxisCount);
 
 struct SpeedControlSettings {
   bool enabled{false};
@@ -480,8 +540,14 @@ VehicleState make_vehicle_state(
   // The field WVCU speed signal is a magnitude in both D and R. Keep that
   // contract at the ChassisControl boundary as well as in the local PID.
   state.cur_velocity = clamp_float(
-      mine_teleop_chassis_speed_magnitude_mps(current_speed_mps), 0.0, 20.0);
-  state.target_velocity = {clamp_float(target_vx, 0.0, 20.0), 0.0F};
+      mine_teleop_chassis_speed_magnitude_mps(current_speed_mps),
+      0.0,
+      mine_teleop::control_limits::kChassisControlMaxTargetSpeedMps);
+  state.target_velocity = {clamp_float(
+      target_vx,
+      0.0,
+      mine_teleop::control_limits::kChassisControlMaxTargetSpeedMps),
+      0.0F};
   // Positive traction is generated directly from the local speed PID below.
   // ChassisControl only receives the independent non-positive brake input.
   state.target_acceleration = {clamp_float(std::min(0.0, target_ax), -8.0, 0.0), 0.0F};
@@ -491,11 +557,14 @@ VehicleState make_vehicle_state(
   state.vehicle_position = {0.0F, 0.0F, 0.0F};
   state.target_steering_angle.assign(kWheelCount, 0.0F);
 
-  const int axis_count = std::max(
-      0,
-      std::min(steering_count, static_cast<int>(mine_teleop::vcu::kSteeringAxisCount)));
-  for (int axis = 0; axis < axis_count; ++axis) {
-    const auto angle_rad = clamp_value(steering_values[axis], -1.0, 1.0) * kMaxSteeringAngleRad;
+  const auto axis_count =
+      mine_teleop::control_limits::bounded_steering_axis_count(steering_count);
+  for (std::size_t axis = 0; axis < axis_count; ++axis) {
+    const auto angle_rad = clamp_value(
+                               steering_values[axis],
+                               -mine_teleop::control_limits::kMaxNormalizedSteeringRequest,
+                               mine_teleop::control_limits::kMaxNormalizedSteeringRequest) *
+        kMaxSteeringAngleRad;
     state.target_steering_angle[axis * 2] = static_cast<float>(angle_rad);
     state.target_steering_angle[axis * 2 + 1] = static_cast<float>(angle_rad);
   }
@@ -540,13 +609,16 @@ Command command_from_chassis_control(
     // is placed in the ignored speed request.
     command.motor_speed_rpm[index] = 0.0;
     command.brake_pressure_bar[index] =
-        mine_teleop_chassis_quantize_brake_pressure_bar(
+        mine_teleop::control_limits::quantize_ordinary_brake_pressure_bar_toward_zero(
             controls[index].ehb_brk_pres_req);
   }
   for (std::size_t axis = 0; axis < mine_teleop::vcu::kSteeringAxisCount; ++axis) {
     const auto& control = controls[axis * 2U];
     command.steering_angle_deg[axis] =
-        clamp_value(control.eps_ang_req, -30.0, 30.0);
+        clamp_value(
+            control.eps_ang_req,
+            -mine_teleop::control_limits::kMaxSteeringAngleDeg,
+            mine_teleop::control_limits::kMaxSteeringAngleDeg);
     command.steering_speed_degps[axis] =
         clamp_value(control.eps_ang_spd_req * kRadiansToDegrees, 0.0, 255.0);
   }
@@ -1247,21 +1319,23 @@ class BridgeRuntime {
           ? runtime_control_.max_motor_torque_nm /
               full_scale_motor_torque_nm_
           : 0.0;
-      const int checked_steering_count = std::max(
-          0,
-          std::min(
-              steering_count,
-              static_cast<int>(mine_teleop::vcu::kSteeringAxisCount)));
+      const auto checked_steering_count =
+          mine_teleop::control_limits::bounded_steering_axis_count(
+              steering_count);
       const bool steering_exceeds_limit = std::any_of(
           steering_values,
           steering_values + checked_steering_count,
           [&](double value) {
-            return std::abs(value) >
-                runtime_control_.max_steering_request + 1e-9;
+            return mine_teleop::control_limits::exceeds_hard_limit(
+                std::abs(value),
+                runtime_control_.max_steering_request);
           });
-      if (target_speed_mps >
-              runtime_control_.target_speed_limit_mps + 1e-9 ||
-          normalized_longitudinal > traction_limit + 1e-9 ||
+      if (mine_teleop::control_limits::exceeds_hard_limit(
+              target_speed_mps,
+              runtime_control_.target_speed_limit_mps) ||
+          mine_teleop::control_limits::exceeds_hard_limit(
+              normalized_longitudinal,
+              traction_limit) ||
           steering_exceeds_limit) {
         withdraw_latest_traction_locked();
         log_operation_rejected_locked(
@@ -1323,7 +1397,8 @@ class BridgeRuntime {
     intent.normalized_longitudinal = normalized_longitudinal;
     std::copy_n(
         steering_values,
-        std::min<int>(steering_count, intent.steering.size()),
+        mine_teleop::control_limits::bounded_steering_axis_count(
+            steering_count),
         intent.steering.begin());
     intent.generation = ++intent_generation_;
     latest_intent_ = intent;
@@ -1725,7 +1800,11 @@ class BridgeRuntime {
 
     if (feedback.vehicle_speed_valid != 0) {
       frame = CanFrame{mine_teleop::vcu::ids::kWvcuVehicleSpeed};
-      const auto speed_kph = clamp_value(feedback.vehicle_speed * 3.6, -500.0, 6053.5);
+      const auto speed_kph = clamp_value(
+          mine_teleop::control_limits::meters_per_second_to_kilometers_per_hour(
+              feedback.vehicle_speed),
+          -500.0,
+          6053.5);
       const auto raw = static_cast<std::uint16_t>(std::llround((speed_kph + 500.0) / 0.1));
       frame.data[0] = static_cast<std::uint8_t>(raw & 0xFFU);
       frame.data[1] = static_cast<std::uint8_t>((raw >> 8U) & 0xFFU);
@@ -2779,7 +2858,7 @@ class BridgeRuntime {
       command.motor_torque_nm.fill(directional_motor_torque_nm);
       if (physical_brake_input_) {
         const double requested_pressure_bar = direct_pressure_brake
-            ? mine_teleop_chassis_quantize_brake_pressure_bar(
+            ? mine_teleop::control_limits::quantize_ordinary_brake_pressure_bar_toward_zero(
                   -intent.normalized_longitudinal *
                   max_ordinary_brake_pressure_bar_)
             : 0.0;
@@ -3038,7 +3117,11 @@ class BridgeRuntime {
     telemetry_.speed_mps = feedback.speed_valid ? feedback.speed_mps : 0.0;
     telemetry_.gear = feedback.gear_valid ? feedback.gear : 1;
     telemetry_.steering_feedback = feedback.steering_valid[0]
-        ? clamp_value(feedback.steering_angle_deg[0] / 30.0, -1.0, 1.0)
+        ? clamp_value(
+              mine_teleop::control_limits::steering_degrees_to_normalized_request(
+                  feedback.steering_angle_deg[0]),
+              -mine_teleop::control_limits::kMaxNormalizedSteeringRequest,
+              mine_teleop::control_limits::kMaxNormalizedSteeringRequest)
         : 0.0;
     double max_positive_torque = 0.0;
     for (std::size_t index = 0; index < mine_teleop::vcu::kMotorCount; ++index) {
@@ -3725,7 +3808,8 @@ extern "C" int mine_teleop_chassis_open_v2(
           MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM ||
       !std::isfinite(config->hard_speed_limit_mps) ||
       config->hard_speed_limit_mps < 0.0 ||
-      config->hard_speed_limit_mps > 20.0 ||
+      config->hard_speed_limit_mps >
+          mine_teleop::control_limits::kChassisControlMaxTargetSpeedMps ||
       !mine_teleop_chassis_control_timeout_is_valid(config->control_timeout_ms) ||
       config->speed_feedback_timeout_ms <
           MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS ||
@@ -3784,7 +3868,8 @@ int open_configured_bridge(
           MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM ||
       !std::isfinite(config->hard_speed_limit_mps) ||
       config->hard_speed_limit_mps < 0.0 ||
-      config->hard_speed_limit_mps > 20.0 ||
+      config->hard_speed_limit_mps >
+          mine_teleop::control_limits::kChassisControlMaxTargetSpeedMps ||
       !mine_teleop_chassis_control_timeout_is_valid(config->control_timeout_ms) ||
       config->speed_feedback_timeout_ms <
           MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS ||
@@ -4005,11 +4090,9 @@ extern "C" int mine_teleop_chassis_apply_state_v2(
       MINE_TELEOP_CHASSIS_APPLY_ISSUE_GENERIC_REJECTED);
   try {
     std::lock_guard<std::mutex> lock(g_api_mutex);
-    const int checked_steering_count = std::max(
-        0,
-        std::min(
-            steering_count,
-            static_cast<int>(mine_teleop::vcu::kSteeringAxisCount)));
+    const auto checked_steering_count =
+        mine_teleop::control_limits::bounded_steering_axis_count(
+            steering_count);
     const bool steering_finite = steering_values != nullptr &&
         std::all_of(
             steering_values,
@@ -4023,7 +4106,9 @@ extern "C" int mine_teleop_chassis_apply_state_v2(
     }
     if (steering_values == nullptr || steering_count < 0 ||
         target_gear < 1 || target_gear > 4 || !std::isfinite(target_vx) ||
-        target_vx < 0.0 || target_vx > 20.0 || !std::isfinite(target_ax) ||
+        target_vx < 0.0 || target_vx >
+            mine_teleop::control_limits::kChassisControlMaxTargetSpeedMps ||
+        !std::isfinite(target_ax) ||
         target_ax < -1.0 || target_ax > 1.0 || !steering_finite) {
       g_runtime->fail_control_apply(
           "vcu_apply_arguments_invalid",
