@@ -655,6 +655,14 @@ if(MINE_TELEOP_BUILD_TESTS)
       PROPERTIES SKIP_REGULAR_EXPRESSION "admin_credentials_test=skipped"
     )
     add_test(
+      NAME mine-teleop-admin-yaml-editor
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_admin_yaml_editor.sh
+    )
+    set_tests_properties(
+      mine-teleop-admin-yaml-editor
+      PROPERTIES SKIP_REGULAR_EXPRESSION "admin_yaml_editor_test=skipped"
+    )
+    add_test(
       NAME mine-teleop-cloud-no-start-rollback
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_cloud_no_start_rollback.sh
     )
