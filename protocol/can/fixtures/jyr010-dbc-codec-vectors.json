@@ -1,0 +1,145 @@
+{
+  "format": "mine-teleop-jyr010-dbc-codec-vectors-v1",
+  "manifest": "../jyr010-dbc-codec-manifest.json",
+  "reference_method": "tools/dbc/check_jyr010_dbc_contract.mjs packs each declared signal from exact decimal strings without calling the production codec, then compares its result with this static golden payload.",
+  "vectors": [
+    {
+      "name": "ready-tx-mcu01-negative-limit",
+      "message": "ADU_Tx_MCU01",
+      "values": {"motor_control_command": "1", "motor_control_mode": "1", "motor_torque_nm": "-800", "motor_speed_rpm": "-8000"},
+      "expected_data_hex": "0900000000000000"
+    },
+    {
+      "name": "ready-tx-mcu02-negative-non-tie-rounding",
+      "message": "ADU_Tx_MCU02",
+      "values": {"motor_control_command": "1", "motor_control_mode": "1", "motor_torque_nm": "-0.06", "motor_speed_rpm": "-1"},
+      "expected_data_hex": "093f1f3f1f000000"
+    },
+    {
+      "name": "ready-tx-mcu03-zero",
+      "message": "ADU_Tx_MCU03",
+      "values": {"motor_control_command": "1", "motor_control_mode": "1", "motor_torque_nm": "0", "motor_speed_rpm": "0"},
+      "expected_data_hex": "09401f401f000000"
+    },
+    {
+      "name": "ready-tx-mcu04-positive-non-tie-rounding",
+      "message": "ADU_Tx_MCU04",
+      "values": {"motor_control_command": "1", "motor_control_mode": "1", "motor_torque_nm": "0.06", "motor_speed_rpm": "1"},
+      "expected_data_hex": "09411f411f000000"
+    },
+    {
+      "name": "ready-tx-mcu05-application-ceiling",
+      "message": "ADU_Tx_MCU05",
+      "values": {"motor_control_command": "1", "motor_control_mode": "1", "motor_torque_nm": "640", "motor_speed_rpm": "8000"},
+      "expected_data_hex": "094038803e000000"
+    },
+    {
+      "name": "ready-tx-mcu06-dbc-positive-limit",
+      "message": "ADU_Tx_MCU06",
+      "values": {"motor_control_command": "1", "motor_control_mode": "1", "motor_torque_nm": "838.3", "motor_speed_rpm": "8383"},
+      "expected_data_hex": "09ff3fff3f000000"
+    },
+    {
+      "name": "ready-tx-mcu07-negative-resolution",
+      "message": "ADU_Tx_MCU07",
+      "values": {"motor_control_command": "1", "motor_control_mode": "1", "motor_torque_nm": "-799.9", "motor_speed_rpm": "-7999"},
+      "expected_data_hex": "0901000100000000"
+    },
+    {
+      "name": "ready-tx-mcu08-positive-resolution",
+      "message": "ADU_Tx_MCU08",
+      "values": {"motor_control_command": "1", "motor_control_mode": "1", "motor_torque_nm": "1.2", "motor_speed_rpm": "37"},
+      "expected_data_hex": "094c1f651f000000"
+    },
+    {
+      "name": "ready-tx-eps01-axis1-axis2",
+      "message": "ADU_Tx_EPS01",
+      "values": {"first_axis_mode": "1", "first_axis_angle_deg": "-30", "first_axis_speed_degps": "0", "second_axis_mode": "1", "second_axis_angle_deg": "-0.1", "second_axis_speed_degps": "42"},
+      "expected_data_hex": "015a3c0001853d2a"
+    },
+    {
+      "name": "ready-tx-eps03-axis3-axis4",
+      "message": "ADU_Tx_EPS03",
+      "values": {"first_axis_mode": "1", "first_axis_angle_deg": "5", "first_axis_speed_degps": "1", "second_axis_mode": "1", "second_axis_angle_deg": "30", "second_axis_speed_degps": "255"},
+      "expected_data_hex": "01b83d0101b23eff"
+    },
+    {
+      "name": "dbc-eps-linear-boundaries",
+      "message": "ADU_Tx_EPS01",
+      "values": {"first_axis_mode": "1", "first_axis_angle_deg": "-1575", "first_axis_speed_degps": "0", "second_axis_mode": "1", "second_axis_angle_deg": "1575", "second_axis_speed_degps": "255"},
+      "expected_data_hex": "01000000010c7bff"
+    },
+    {
+      "name": "ready-tx-ehb01-brake1-to-brake4",
+      "message": "ADU_Tx_EHB01",
+      "values": {"brake1_mode": "1", "brake1_pressure_bar": "0", "brake2_mode": "1", "brake2_pressure_bar": "327.6", "brake3_mode": "1", "brake3_pressure_bar": "409.5", "brake4_mode": "1", "brake4_pressure_bar": "0.1"},
+      "expected_data_hex": "0100c1ccf1ff1100"
+    },
+    {
+      "name": "ready-tx-ehb02-brake5-to-brake8",
+      "message": "ADU_Tx_EHB02",
+      "values": {"brake1_mode": "1", "brake1_pressure_bar": "100", "brake2_mode": "1", "brake2_pressure_bar": "200", "brake3_mode": "1", "brake3_pressure_bar": "300", "brake4_mode": "1", "brake4_pressure_bar": "400"},
+      "expected_data_hex": "813e017d81bb01fa"
+    },
+    {
+      "name": "ready-tx-epb-release-and-steering-mode",
+      "message": "ADU_Tx_EPB",
+      "values": {"epb1_request": "1", "epb2_request": "1", "epb3_request": "1", "epb4_request": "1", "steering_mode_request": "1"},
+      "expected_data_hex": "0101010101000000"
+    },
+    {
+      "name": "ready-tx-shake-gear-fault-reset",
+      "message": "ADU_Tx_Shake",
+      "values": {"handshake_request": "2", "gear_request": "3", "cloud_handshake_request": "0", "fault_code_reset": "1"},
+      "expected_data_hex": "0203000100000000"
+    },
+    {
+      "name": "ready-tx-body-zeroed",
+      "message": "ADU_Tx_Body",
+      "values": {"job_action": "0", "turn_left_lamp": "0", "turn_right_lamp": "0", "low_beam_lamp": "0", "high_beam_lamp": "0", "brake_lamp": "0", "horn": "0"},
+      "expected_data_hex": "0000000000000000"
+    },
+    {
+      "name": "ready-tx-vehicle-speed-disabled",
+      "message": "ADU_Tx_VehSpd",
+      "values": {"vehicle_speed_kph": "0", "vehicle_speed_quality": "0"},
+      "expected_data_hex": "0000000000000000"
+    }
+  ],
+  "runtime_cases": [
+    {
+      "name": "ready-application-domain-boundaries",
+      "expected_state": "ready",
+      "command": {
+        "gear": "3",
+        "vehicle_speed_request_kph": "123.9",
+        "vehicle_speed_request_valid": true,
+        "motor_torque_nm": ["-800", "-0.06", "0", "0.06", "640", "838.3", "-799.9", "1.2"],
+        "motor_speed_rpm": ["-8000", "-1", "0", "1", "8000", "8383", "-7999", "37"],
+        "steering_angle_deg": ["-30", "-0.1", "5", "30"],
+        "steering_speed_degps": ["0", "42", "1", "255"],
+        "brake_pressure_bar": ["0", "327.6", "409.5", "0.1", "100", "200", "300", "400"],
+        "fault_reset": true
+      },
+      "expected_vector_names": [
+        "ready-tx-mcu01-negative-limit",
+        "ready-tx-mcu02-negative-non-tie-rounding",
+        "ready-tx-mcu03-zero",
+        "ready-tx-mcu04-positive-non-tie-rounding",
+        "ready-tx-mcu05-application-ceiling",
+        "ready-tx-mcu06-dbc-positive-limit",
+        "ready-tx-mcu07-negative-resolution",
+        "ready-tx-mcu08-positive-resolution",
+        "ready-tx-eps01-axis1-axis2",
+        "ready-tx-eps03-axis3-axis4",
+        "ready-tx-ehb01-brake1-to-brake4",
+        "ready-tx-ehb02-brake5-to-brake8",
+        "ready-tx-epb-release-and-steering-mode",
+        "ready-tx-shake-gear-fault-reset",
+        "ready-tx-body-zeroed",
+        "ready-tx-vehicle-speed-disabled"
+      ],
+      "application_contract": "The nonzero vehicle-speed request is deliberately ignored by the existing vehicle safety policy; the golden ADU_Tx_VehSpd frame remains physical zero with Q=0."
+    }
+  ]
+}

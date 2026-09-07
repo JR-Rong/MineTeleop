@@ -1,0 +1,282 @@
+{
+  "format": "mine-teleop-jyr010-dbc-codec-manifest-v1",
+  "title": "JYR010 20260714 transmit-codec verification manifest",
+  "scope": {
+    "covers": [
+      "all 16 ADU transmit frames emitted by mine_teleop::vcu::ParallelController::tick",
+      "DBC byte layout, unsignedness, scaling, offsets, DLC, 29-bit ID conversion, and deterministic zeroing of unassigned bits"
+    ],
+    "does_not_claim": [
+      "vendor confirmation of enum meanings, vehicle direction, actuator response, braking force, or bus-level timing",
+      "a generated codec replacement or full receive-frame coverage"
+    ]
+  },
+  "sources": [
+    {
+      "path": "JYR010_DBC_VCU_20260714.dbc",
+      "sha256": "ef0b58d5eb5abbaaddd4c188b3fd21514f283aff1b6e6e4defea955ea6a1ed77",
+      "role": "CAN bit-layout authority"
+    },
+    {
+      "path": "JYR010_通讯协议_VCU_20260714.xls",
+      "sha256": "31a28963a98dd48aabc4c63b9a0402ed3a08d6682b74b758bb877b929228d18b",
+      "role": "paired supplier artifact; hashed for version binding, not parsed by this offline check"
+    }
+  ],
+  "id_encoding": {
+    "dbc_bo_extended_marker": "0x80000000",
+    "arbitration_id_mask": "0x1FFFFFFF",
+    "socketcan_eff_flag": "0x80000000",
+    "runtime_can_frame_id": "canonical 29-bit arbitration ID without CAN_EFF_FLAG",
+    "socketcan_boundary": "deployments/chassis-control-bridge/chassis_control_bridge.cpp masks on receive and adds CAN_EFF_FLAG on transmit"
+  },
+  "quantization": {
+    "physical_to_raw": "nearest integer for non-tie reference values; reference inputs are decimal strings and are evaluated exactly",
+    "half_step_boundary": "The DBC does not state a physical-to-raw half-step rounding rule. The current codec uses std::llround after double arithmetic, so half-step inputs remain explicitly out of this foundation until a supplier rule is available.",
+    "invalid_input_policy": "NaN, infinity, and out-of-range values are application validation concerns; this layout contract never clamps a reference vector"
+  },
+  "layouts": {
+    "mcu_command": {
+      "dlc": 8,
+      "byte_order": "little_endian",
+      "signals": [
+        {"key": "motor_control_command", "start_bit": 0, "length": 3, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "7"},
+        {"key": "motor_control_mode", "start_bit": 3, "length": 3, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "7"},
+        {"key": "motor_torque_nm", "start_bit": 8, "length": 14, "signed": false, "factor": "0.1", "offset": "-800", "minimum": "-800", "maximum": "838.3"},
+        {"key": "motor_speed_rpm", "start_bit": 24, "length": 14, "signed": false, "factor": "1", "offset": "-8000", "minimum": "-8000", "maximum": "8383"}
+      ],
+      "zeroed_unassigned_bit_ranges": [[6, 7], [22, 23], [38, 63]],
+      "reserved_or_unassigned_bit_policy": "DBC has no named signal in these ranges; golden vectors require zero only, without asserting vendor reserve semantics."
+    },
+    "steering_pair": {
+      "dlc": 8,
+      "byte_order": "little_endian",
+      "signals": [
+        {"key": "first_axis_mode", "start_bit": 0, "length": 8, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "255"},
+        {"key": "first_axis_angle_deg", "start_bit": 8, "length": 16, "signed": false, "factor": "0.1", "offset": "-1575", "minimum": "-1575", "maximum": "1575"},
+        {"key": "first_axis_speed_degps", "start_bit": 24, "length": 8, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "255"},
+        {"key": "second_axis_mode", "start_bit": 32, "length": 8, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "255"},
+        {"key": "second_axis_angle_deg", "start_bit": 40, "length": 16, "signed": false, "factor": "0.1", "offset": "-1575", "minimum": "-1575", "maximum": "1575"},
+        {"key": "second_axis_speed_degps", "start_bit": 56, "length": 8, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "255"}
+      ],
+      "zeroed_unassigned_bit_ranges": []
+    },
+    "brake_quad": {
+      "dlc": 8,
+      "byte_order": "little_endian",
+      "signals": [
+        {"key": "brake1_mode", "start_bit": 0, "length": 4, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "15"},
+        {"key": "brake1_pressure_bar", "start_bit": 4, "length": 12, "signed": false, "factor": "0.1", "offset": "0", "minimum": "0", "maximum": "409.5"},
+        {"key": "brake2_mode", "start_bit": 16, "length": 4, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "15"},
+        {"key": "brake2_pressure_bar", "start_bit": 20, "length": 12, "signed": false, "factor": "0.1", "offset": "0", "minimum": "0", "maximum": "409.5"},
+        {"key": "brake3_mode", "start_bit": 32, "length": 4, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "15"},
+        {"key": "brake3_pressure_bar", "start_bit": 36, "length": 12, "signed": false, "factor": "0.1", "offset": "0", "minimum": "0", "maximum": "409.5"},
+        {"key": "brake4_mode", "start_bit": 48, "length": 4, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "15"},
+        {"key": "brake4_pressure_bar", "start_bit": 52, "length": 12, "signed": false, "factor": "0.1", "offset": "0", "minimum": "0", "maximum": "409.5"}
+      ],
+      "zeroed_unassigned_bit_ranges": []
+    },
+    "parking_brake": {
+      "dlc": 8,
+      "byte_order": "little_endian",
+      "signals": [
+        {"key": "epb1_request", "start_bit": 0, "length": 2, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "3"},
+        {"key": "epb2_request", "start_bit": 8, "length": 2, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "3"},
+        {"key": "epb3_request", "start_bit": 16, "length": 2, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "3"},
+        {"key": "epb4_request", "start_bit": 24, "length": 2, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "3"},
+        {"key": "steering_mode_request", "start_bit": 32, "length": 3, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "7"}
+      ],
+      "zeroed_unassigned_bit_ranges": [[2, 7], [10, 15], [18, 23], [26, 31], [35, 63]],
+      "reserved_or_unassigned_bit_policy": "DBC has no named signal in these ranges; golden vectors require zero only, without asserting vendor reserve semantics."
+    },
+    "handshake": {
+      "dlc": 8,
+      "byte_order": "little_endian",
+      "signals": [
+        {"key": "handshake_request", "start_bit": 0, "length": 8, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "255"},
+        {"key": "gear_request", "start_bit": 8, "length": 8, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "255"},
+        {"key": "cloud_handshake_request", "start_bit": 16, "length": 8, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "255"},
+        {"key": "fault_code_reset", "start_bit": 24, "length": 1, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "1"}
+      ],
+      "zeroed_unassigned_bit_ranges": [[25, 63]],
+      "reserved_or_unassigned_bit_policy": "DBC has no named signal in these ranges; golden vectors require zero only, without asserting vendor reserve semantics."
+    },
+    "body": {
+      "dlc": 8,
+      "byte_order": "little_endian",
+      "signals": [
+        {"key": "job_action", "start_bit": 0, "length": 2, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "3"},
+        {"key": "turn_left_lamp", "start_bit": 2, "length": 2, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "3"},
+        {"key": "turn_right_lamp", "start_bit": 4, "length": 2, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "3"},
+        {"key": "low_beam_lamp", "start_bit": 6, "length": 2, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "3"},
+        {"key": "high_beam_lamp", "start_bit": 8, "length": 2, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "3"},
+        {"key": "brake_lamp", "start_bit": 10, "length": 2, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "3"},
+        {"key": "horn", "start_bit": 12, "length": 2, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "3"}
+      ],
+      "zeroed_unassigned_bit_ranges": [[14, 63]],
+      "reserved_or_unassigned_bit_policy": "DBC has no named signal in these ranges; golden vectors require zero only, without asserting vendor reserve semantics."
+    },
+    "vehicle_speed": {
+      "dlc": 8,
+      "byte_order": "little_endian",
+      "signals": [
+        {"key": "vehicle_speed_kph", "start_bit": 0, "length": 8, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "255"},
+        {"key": "vehicle_speed_quality", "start_bit": 8, "length": 8, "signed": false, "factor": "1", "offset": "0", "minimum": "0", "maximum": "255"}
+      ],
+      "zeroed_unassigned_bit_ranges": [[16, 63]],
+      "reserved_or_unassigned_bit_policy": "DBC has no named signal in these ranges; golden vectors require zero only, without asserting vendor reserve semantics."
+    }
+  },
+  "families": [
+    {
+      "name": "ADU_Tx_MCU",
+      "direction": "tx",
+      "layout": "mcu_command",
+      "dbc_message_name_template": "ADU_Tx_MCU{index02}",
+      "dbc_signal_name_templates": {
+        "motor_control_command": "ADU_Tx_MCU{index02}MotCtrlCmd",
+        "motor_control_mode": "ADU_Tx_MCU{index02}MotCtrlMode",
+        "motor_torque_nm": "ADU_Tx_MCU{index02}MotTqReq",
+        "motor_speed_rpm": "ADU_Tx_MCU{index02}MotSpdReq"
+      },
+      "instances": [
+        {"index": 1, "dbc_raw_id": "2565918965", "arbitration_id": "0x18F0D0F5", "socketcan_can_id": "0x98F0D0F5"},
+        {"index": 2, "dbc_raw_id": "2565984501", "arbitration_id": "0x18F1D0F5", "socketcan_can_id": "0x98F1D0F5"},
+        {"index": 3, "dbc_raw_id": "2566050037", "arbitration_id": "0x18F2D0F5", "socketcan_can_id": "0x98F2D0F5"},
+        {"index": 4, "dbc_raw_id": "2566115573", "arbitration_id": "0x18F3D0F5", "socketcan_can_id": "0x98F3D0F5"},
+        {"index": 5, "dbc_raw_id": "2566181109", "arbitration_id": "0x18F4D0F5", "socketcan_can_id": "0x98F4D0F5"},
+        {"index": 6, "dbc_raw_id": "2566246645", "arbitration_id": "0x18F5D0F5", "socketcan_can_id": "0x98F5D0F5"},
+        {"index": 7, "dbc_raw_id": "2566312181", "arbitration_id": "0x18F6D0F5", "socketcan_can_id": "0x98F6D0F5"},
+        {"index": 8, "dbc_raw_id": "2566377717", "arbitration_id": "0x18F7D0F5", "socketcan_can_id": "0x98F7D0F5"}
+      ]
+    }
+  ],
+  "messages": [
+    {
+      "name": "ADU_Tx_EPS01",
+      "direction": "tx",
+      "layout": "steering_pair",
+      "dbc_raw_id": "2566443253",
+      "arbitration_id": "0x18F8D0F5",
+      "socketcan_can_id": "0x98F8D0F5",
+      "dbc_signal_names": {
+        "first_axis_mode": "ADU_Tx_EPS01Axis1ModeReq",
+        "first_axis_angle_deg": "ADU_Tx_EPS01Axis1AngReq",
+        "first_axis_speed_degps": "ADU_Tx_EPS01Axis1AngSpdReq",
+        "second_axis_mode": "ADU_Tx_EPS01Axis2ModeReq",
+        "second_axis_angle_deg": "ADU_Tx_EPS01Axis2AngReq",
+        "second_axis_speed_degps": "ADU_Tx_EPS01Axis2AngSpdReq"
+      }
+    },
+    {
+      "name": "ADU_Tx_EPS03",
+      "direction": "tx",
+      "layout": "steering_pair",
+      "dbc_raw_id": "2566508789",
+      "arbitration_id": "0x18F9D0F5",
+      "socketcan_can_id": "0x98F9D0F5",
+      "dbc_signal_names": {
+        "first_axis_mode": "ADU_Tx_EPS03Axis3ModeReq",
+        "first_axis_angle_deg": "ADU_Tx_EPS03Axis3AngReq",
+        "first_axis_speed_degps": "ADU_Tx_EPS03Axis3AngSpdReq",
+        "second_axis_mode": "ADU_Tx_EPS03Axis4ModeReq",
+        "second_axis_angle_deg": "ADU_Tx_EPS03Axis4AngReq",
+        "second_axis_speed_degps": "ADU_Tx_EPS03Axis4AngSpdReq"
+      }
+    },
+    {
+      "name": "ADU_Tx_EHB01",
+      "direction": "tx",
+      "layout": "brake_quad",
+      "dbc_raw_id": "2566902005",
+      "arbitration_id": "0x18FFD0F5",
+      "socketcan_can_id": "0x98FFD0F5",
+      "dbc_signal_names": {
+        "brake1_mode": "ADU_Tx_EHB01Brk1ModeReq",
+        "brake1_pressure_bar": "ADU_Tx_EHB01Brk1PresReq",
+        "brake2_mode": "ADU_Tx_EHB01Brk2ModeReq",
+        "brake2_pressure_bar": "ADU_Tx_EHB01Brk2PresReq",
+        "brake3_mode": "ADU_Tx_EHB01Brk3ModeReq",
+        "brake3_pressure_bar": "ADU_Tx_EHB01Brk3PresReq",
+        "brake4_mode": "ADU_Tx_EHB01Brk4ModeReq",
+        "brake4_pressure_bar": "ADU_Tx_EHB01Brk4PresReq"
+      }
+    },
+    {
+      "name": "ADU_Tx_EHB02",
+      "direction": "tx",
+      "layout": "brake_quad",
+      "dbc_raw_id": "2566574325",
+      "arbitration_id": "0x18FAD0F5",
+      "socketcan_can_id": "0x98FAD0F5",
+      "dbc_signal_names": {
+        "brake1_mode": "ADU_Tx_EHB02Brk5ModeReq",
+        "brake1_pressure_bar": "ADU_Tx_EHB02Brk5PresReq",
+        "brake2_mode": "ADU_Tx_EHB02Brk6ModeReq",
+        "brake2_pressure_bar": "ADU_Tx_EHB02Brk6PresReq",
+        "brake3_mode": "ADU_Tx_EHB02Brk7ModeReq",
+        "brake3_pressure_bar": "ADU_Tx_EHB02Brk7PresReq",
+        "brake4_mode": "ADU_Tx_EHB02Brk8ModeReq",
+        "brake4_pressure_bar": "ADU_Tx_EHB02Brk8PresReq"
+      }
+    },
+    {
+      "name": "ADU_Tx_EPB",
+      "direction": "tx",
+      "layout": "parking_brake",
+      "dbc_raw_id": "2566639861",
+      "arbitration_id": "0x18FBD0F5",
+      "socketcan_can_id": "0x98FBD0F5",
+      "dbc_signal_names": {
+        "epb1_request": "ADU_Tx_EPB1CtrlReq",
+        "epb2_request": "ADU_Tx_EPB2CtrlReq",
+        "epb3_request": "ADU_Tx_EPB3CtrlReq",
+        "epb4_request": "ADU_Tx_EPB4CtrlReq",
+        "steering_mode_request": "ADU_Tx_StrModReq"
+      }
+    },
+    {
+      "name": "ADU_Tx_Shake",
+      "direction": "tx",
+      "layout": "handshake",
+      "dbc_raw_id": "2566705397",
+      "arbitration_id": "0x18FCD0F5",
+      "socketcan_can_id": "0x98FCD0F5",
+      "dbc_signal_names": {
+        "handshake_request": "ADU_Tx_ShakeReq",
+        "gear_request": "ADU_Tx_GearReq",
+        "cloud_handshake_request": "ADU_Tx_CloudShakeReq",
+        "fault_code_reset": "ADU_Tx_FltCodeRst"
+      }
+    },
+    {
+      "name": "ADU_Tx_Body",
+      "direction": "tx",
+      "layout": "body",
+      "dbc_raw_id": "2566770933",
+      "arbitration_id": "0x18FDD0F5",
+      "socketcan_can_id": "0x98FDD0F5",
+      "dbc_signal_names": {
+        "job_action": "ADU_Tx_BodyJobAction",
+        "turn_left_lamp": "ADU_Tx_BodyTurnLLamp",
+        "turn_right_lamp": "ADU_Tx_BodyTurnRLamp",
+        "low_beam_lamp": "ADU_Tx_BodyLowBeamLamp",
+        "high_beam_lamp": "ADU_Tx_BodyHighBeamLamp",
+        "brake_lamp": "ADU_Tx_BodyBrkLamp",
+        "horn": "ADU_Tx_BodyHorn"
+      }
+    },
+    {
+      "name": "ADU_Tx_VehSpd",
+      "direction": "tx",
+      "layout": "vehicle_speed",
+      "dbc_raw_id": "2566836469",
+      "arbitration_id": "0x18FED0F5",
+      "socketcan_can_id": "0x98FED0F5",
+      "dbc_signal_names": {
+        "vehicle_speed_kph": "ADU_Tx_VehSpdReq",
+        "vehicle_speed_quality": "ADU_Tx_VehSpdReq_Q"
+      }
+    }
+  ]
+}

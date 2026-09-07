@@ -493,6 +493,32 @@ if(MINE_TELEOP_BUILD_TESTS)
   mine_teleop_enable_warnings(mine-teleop-vcu-tests)
   add_test(NAME mine-teleop-vcu-tests COMMAND mine-teleop-vcu-tests)
 
+  add_executable(mine-teleop-dbc-codec-contract-tests cpp/tests/dbc_codec_contract_tests.cpp)
+  target_link_libraries(
+    mine-teleop-dbc-codec-contract-tests
+    PRIVATE
+      mine_teleop_vcu
+      nlohmann_json::nlohmann_json
+  )
+  mine_teleop_enable_warnings(mine-teleop-dbc-codec-contract-tests)
+  add_test(
+    NAME mine-teleop-dbc-codec-contract-tests
+    COMMAND mine-teleop-dbc-codec-contract-tests
+  )
+  set_tests_properties(
+    mine-teleop-dbc-codec-contract-tests
+    PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  add_test(
+    NAME mine-teleop-dbc-codec-reference-tests
+    COMMAND ${MINE_TELEOP_NODE_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tools/dbc/check_jyr010_dbc_contract.cjs
+  )
+  set_tests_properties(
+    mine-teleop-dbc-codec-reference-tests
+    PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
   if(UNIX AND NOT APPLE)
     enable_language(C)
 
