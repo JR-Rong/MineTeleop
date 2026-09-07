@@ -95,9 +95,11 @@ declare -a changed_files=()
 append_unique_file() {
   local candidate="$1"
   local existing
-  for existing in "${changed_files[@]-}"; do
-    [[ "$existing" == "$candidate" ]] && return
-  done
+  if ((${#changed_files[@]} > 0)); then
+    for existing in "${changed_files[@]}"; do
+      [[ "$existing" == "$candidate" ]] && return
+    done
+  fi
   changed_files+=("$candidate")
 }
 read_paths() {
@@ -114,6 +116,7 @@ read_paths < <(git ls-files --others --exclude-standard -z)
 
 is_relevant_file() {
   case "$1" in
+    node_modules/*) return 1 ;;
     cpp/*|scripts/*|protocol/*|deployments/chassis-control-bridge/*|*.js|*.cjs|*.mjs) return 0 ;;
     *) return 1 ;;
   esac
@@ -124,21 +127,23 @@ declare -a cpp_files=()
 declare -a cpp_translation_units=()
 declare -a shell_files=()
 declare -a js_files=()
-for changed_file in "${changed_files[@]-}"; do
-  [[ -f "$changed_file" ]] || continue
-  is_relevant_file "$changed_file" || continue
-  relevant_files+=("$changed_file")
-  case "$changed_file" in
-    *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx)
-      cpp_files+=("$changed_file")
-      case "$changed_file" in
-        *.c|*.cc|*.cpp|*.cxx) cpp_translation_units+=("$changed_file") ;;
-      esac
-      ;;
-    *.sh|*.bash) shell_files+=("$changed_file") ;;
-    *.js|*.cjs|*.mjs) js_files+=("$changed_file") ;;
-  esac
-done
+if ((${#changed_files[@]} > 0)); then
+  for changed_file in "${changed_files[@]}"; do
+    [[ -f "$changed_file" ]] || continue
+    is_relevant_file "$changed_file" || continue
+    relevant_files+=("$changed_file")
+    case "$changed_file" in
+      *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx)
+        cpp_files+=("$changed_file")
+        case "$changed_file" in
+          *.c|*.cc|*.cpp|*.cxx) cpp_translation_units+=("$changed_file") ;;
+        esac
+        ;;
+      *.sh|*.bash) shell_files+=("$changed_file") ;;
+      *.js|*.cjs|*.mjs) js_files+=("$changed_file") ;;
+    esac
+  done
+fi
 
 printf 'incremental_quality_base=%s\n' "$quality_base_sha"
 printf 'incremental_quality_files=%s cpp=%s shell=%s js=%s\n' "${#relevant_files[@]}" "${#cpp_files[@]}" "${#shell_files[@]}" "${#js_files[@]}"
@@ -149,10 +154,10 @@ if ((${#relevant_files[@]} > 0)); then
   git diff --cached --check -- "${relevant_files[@]}"
 fi
 
-for shell_file in "${shell_files[@]-}"; do
-  bash -n "$shell_file"
-done
 if ((${#shell_files[@]} > 0)); then
+  for shell_file in "${shell_files[@]}"; do
+    bash -n "$shell_file"
+  done
   printf 'incremental_quality_bash=passed files=%s\n' "${#shell_files[@]}"
 fi
 
@@ -161,7 +166,7 @@ if ((${#js_files[@]} > 0)); then
     printf '%s\n' 'node is required for changed JavaScript files' >&2
     exit 2
   fi
-  for js_file in "${js_files[@]-}"; do
+  for js_file in "${js_files[@]}"; do
     node --check "$js_file"
   done
   printf 'incremental_quality_node_syntax=passed files=%s\n' "${#js_files[@]}"
