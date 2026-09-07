@@ -1,4 +1,5 @@
 #include "mine_teleop/core.hpp"
+#include "mine_teleop/detail/recording_fragment_state.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/server.hpp"
@@ -8,6 +9,7 @@
 #include <gst/gst.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <filesystem>
@@ -16,6 +18,8 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1045,6 +1049,271 @@ void test_ccg2_camera_input_pipeline_is_gstreamer_parseable() {
   expect(
       parsed,
       "GStreamer could not parse the CCG2 30-to-25 FPS input pipeline: " + error);
+}
+
+void test_recording_fragment_state_fails_closed_and_survives_detach() {
+  const auto root = std::filesystem::path("/tmp") /
+      ("mine-teleop-recording-state-test-" + mine_teleop::random_token(6));
+  std::filesystem::create_directories(root);
+  const auto valid_fragment = root / "valid.mp4";
+  const auto malformed_fragment = root / "malformed.mp4";
+  const auto write_u32 = [](std::ofstream& output, std::uint32_t value) {
+    output.put(static_cast<char>((value >> 24U) & 0xffU));
+    output.put(static_cast<char>((value >> 16U) & 0xffU));
+    output.put(static_cast<char>((value >> 8U) & 0xffU));
+    output.put(static_cast<char>(value & 0xffU));
+  };
+  const auto write_box = [&](std::ofstream& output, std::string_view type, std::string_view payload) {
+    write_u32(output, static_cast<std::uint32_t>(8U + payload.size()));
+    output.write(type.data(), static_cast<std::streamsize>(type.size()));
+    output.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+  };
+  {
+    std::ofstream output(valid_fragment, std::ios::binary);
+    write_box(output, "ftyp", "isom");
+    write_box(output, "mdat", "frame");
+    write_box(output, "moov", "");
+  }
+  {
+    std::ofstream output(malformed_fragment, std::ios::binary);
+    write_u32(output, 64U);
+    output.write("mdat", 4);
+    output.write("short", 5);
+  }
+  const auto valid = mine_teleop::detail::validate_finalized_mp4(valid_fragment);
+  expect(valid.valid, "minimal complete MP4 boxes were rejected: " + valid.reason);
+  expect(
+      !mine_teleop::detail::validate_finalized_mp4(malformed_fragment).valid,
+      "truncated MP4 box was accepted as finalized media");
+  expect(
+      !mine_teleop::detail::probe_finalized_mp4(malformed_fragment).valid,
+      "truncated MP4 box was accepted by the qtdemux probe");
+
+  auto owner = std::make_shared<mine_teleop::detail::RecordingFragmentOwner>(
+      17,
+      "session-state",
+      "front");
+  expect(owner->bind_path(valid_fragment), "recording fragment path could not be bound");
+  owner->set_started_at_ms(100);
+  expect(owner->mark_closed(200), "fragment closed event did not enter finalizing state");
+  expect(owner->claim_completed(), "finalizing fragment could not claim completed publication");
+  const auto completed_revision = owner->snapshot().revision;
+  expect(owner->mark_failed("late filesink error"), "late error did not dominate completed state");
+  const auto failed = owner->snapshot();
+  expect(
+      failed.state == mine_teleop::detail::RecordingFragmentState::Failed &&
+          failed.revision > completed_revision && failed.failure == "late filesink error",
+      "late fragment failure was not latched with a newer revision");
+  expect(!owner->mark_closed(300), "late close event overwrote the failed fragment state");
+
+  GError* init_error = nullptr;
+  if (!gst_init_check(nullptr, nullptr, &init_error)) {
+    const std::string message = init_error == nullptr ? "unknown error" : init_error->message;
+    if (init_error != nullptr) g_error_free(init_error);
+    throw TestFailure("GStreamer initialization failed: " + message);
+  }
+  GstElement* bin = gst_bin_new("recording-owner-detach-test");
+  GstElement* sink = gst_element_factory_make("fakesink", "recording-owner-detach-sink");
+  expect(bin != nullptr && sink != nullptr, "GStreamer fakesink fixture is unavailable");
+  gst_object_ref(sink);
+  expect(gst_bin_add(GST_BIN(bin), sink), "could not add test sink to bin");
+  mine_teleop::detail::tag_recording_fragment_owner(GST_OBJECT(sink), owner);
+  expect(
+      mine_teleop::detail::recording_fragment_owner(GST_OBJECT(sink)) == owner,
+      "recording owner tag was not readable before detach");
+  expect(gst_bin_remove(GST_BIN(bin), sink), "could not detach tagged sink from test bin");
+  expect(
+      mine_teleop::detail::recording_fragment_owner(GST_OBJECT(sink)) == owner,
+      "recording owner tag was lost after its sink detached from the pipeline");
+  gst_object_unref(sink);
+  gst_object_unref(bin);
+  std::filesystem::remove_all(root);
+}
+
+struct AsyncSplitmuxWitness {
+  std::atomic<std::uint64_t> live_handoffs{0};
+  std::shared_ptr<mine_teleop::detail::RecordingFragmentOwner> injected_fragment;
+  std::uint64_t live_handoffs_at_injected_error{0};
+  bool closed_event_seen{false};
+  bool old_sink_detached{false};
+  bool late_error_classified{false};
+};
+
+void on_async_splitmux_sink_added(GstElement*, GstElement* sink, gpointer user_data) {
+  auto* witness = static_cast<AsyncSplitmuxWitness*>(user_data);
+  if (witness == nullptr || sink == nullptr) return;
+  auto owner = std::make_shared<mine_teleop::detail::RecordingFragmentOwner>(
+      23,
+      "splitmux-test-session",
+      "front");
+  mine_teleop::detail::tag_recording_fragment_owner(GST_OBJECT(sink), std::move(owner));
+}
+
+void on_async_splitmux_live_handoff(GstElement*, GstBuffer*, GstPad*, gpointer user_data) {
+  auto* witness = static_cast<AsyncSplitmuxWitness*>(user_data);
+  if (witness != nullptr) witness->live_handoffs.fetch_add(1, std::memory_order_relaxed);
+}
+
+void test_async_splitmux_late_sink_error_keeps_live_branch_running() {
+  const auto root = std::filesystem::path("/tmp") /
+      ("mine-teleop-splitmux-test-" + mine_teleop::random_token(6));
+  std::filesystem::create_directories(root);
+  const auto location = root / "fragment-%05d.mp4";
+  GError* init_error = nullptr;
+  if (!gst_init_check(nullptr, nullptr, &init_error)) {
+    const std::string message = init_error == nullptr ? "unknown error" : init_error->message;
+    if (init_error != nullptr) g_error_free(init_error);
+    throw TestFailure("GStreamer initialization failed: " + message);
+  }
+
+  const std::string description =
+      "videotestsrc is-live=true num-buffers=90 ! "
+      "video/x-raw,framerate=30/1,width=160,height=120 ! tee name=fanout "
+      "fanout. ! queue ! fakesink name=live sync=false signal-handoffs=true "
+      "fanout. ! queue ! valve name=recording_valve drop=false ! videoconvert ! jpegenc ! queue ! "
+      "splitmuxsink name=recorder muxer-factory=qtmux sink-factory=filesink "
+      "async-finalize=true max-size-time=500000000 location=\"" + location.string() + "\"";
+  GError* parse_error = nullptr;
+  GstElement* pipeline = gst_parse_launch(description.c_str(), &parse_error);
+  if (pipeline == nullptr || parse_error != nullptr) {
+    const std::string message = parse_error == nullptr ? "unknown parse error" : parse_error->message;
+    if (parse_error != nullptr) g_error_free(parse_error);
+    if (pipeline != nullptr) gst_object_unref(pipeline);
+    std::filesystem::remove_all(root);
+    throw TestFailure("real splitmux test pipeline could not be created: " + message);
+  }
+
+  AsyncSplitmuxWitness witness;
+  GstElement* recorder = gst_bin_get_by_name(GST_BIN(pipeline), "recorder");
+  GstElement* live = gst_bin_get_by_name(GST_BIN(pipeline), "live");
+  if (recorder == nullptr || live == nullptr) {
+    if (recorder != nullptr) gst_object_unref(recorder);
+    if (live != nullptr) gst_object_unref(live);
+    gst_object_unref(pipeline);
+    std::filesystem::remove_all(root);
+    throw TestFailure("real splitmux test did not create recorder and live branches");
+  }
+  g_signal_connect(recorder, "sink-added", G_CALLBACK(on_async_splitmux_sink_added), &witness);
+  g_signal_connect(live, "handoff", G_CALLBACK(on_async_splitmux_live_handoff), &witness);
+  gst_object_unref(recorder);
+  gst_object_unref(live);
+
+  GstBus* bus = gst_element_get_bus(pipeline);
+  if (bus == nullptr) {
+    gst_object_unref(pipeline);
+    std::filesystem::remove_all(root);
+    throw TestFailure("real splitmux test pipeline has no bus");
+  }
+  if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+    gst_object_unref(bus);
+    gst_object_unref(pipeline);
+    std::filesystem::remove_all(root);
+    throw TestFailure("real splitmux test pipeline could not enter PLAYING");
+  }
+
+  // Deliberately leave the bus unread while async-finalize rolls at least one
+  // fragment.  The test then injects an error from the retired internal sink,
+  // matching the production race rather than a stand-alone filesink model.
+  std::this_thread::sleep_for(std::chrono::milliseconds(850));
+  const auto delayed_live_handoffs = witness.live_handoffs.load(std::memory_order_relaxed);
+  bool eos = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+  try {
+    while (!eos && std::chrono::steady_clock::now() < deadline) {
+      GstMessage* message = gst_bus_timed_pop(bus, 100 * GST_MSECOND);
+      if (message == nullptr) continue;
+      const auto type = GST_MESSAGE_TYPE(message);
+      if (type == GST_MESSAGE_ELEMENT) {
+        const GstStructure* structure = gst_message_get_structure(message);
+        if (structure != nullptr &&
+            gst_structure_has_name(structure, "splitmuxsink-fragment-closed") &&
+            !witness.injected_fragment) {
+          const gchar* location_text = gst_structure_get_string(structure, "location");
+          const GValue* sink_value = gst_structure_get_value(structure, "sink");
+          expect(location_text != nullptr, "real splitmux closed event omitted its fragment location");
+          expect(
+              sink_value != nullptr && G_VALUE_HOLDS(sink_value, GST_TYPE_ELEMENT),
+              "real splitmux closed event omitted its internal sink");
+          auto* sink = GST_ELEMENT(g_value_get_object(sink_value));
+          expect(sink != nullptr, "real splitmux closed event supplied a null sink");
+          auto owner = mine_teleop::detail::recording_fragment_owner(GST_OBJECT(sink));
+          expect(owner != nullptr, "retired splitmux sink lost its stable recording owner tag");
+          expect(owner->bind_path(location_text), "closed splitmux sink changed its recording fragment path");
+          expect(owner->mark_closed(200), "closed splitmux sink did not enter finalizing state");
+          witness.closed_event_seen = true;
+          gst_object_ref(sink);
+          const auto detach_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+          while (gst_object_has_as_ancestor(GST_OBJECT(sink), GST_OBJECT(pipeline)) &&
+                 std::chrono::steady_clock::now() < detach_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+          witness.old_sink_detached = !gst_object_has_as_ancestor(GST_OBJECT(sink), GST_OBJECT(pipeline));
+          GError* injected = g_error_new_literal(
+              GST_RESOURCE_ERROR,
+              GST_RESOURCE_ERROR_WRITE,
+              "injected late retired splitmux sink error");
+          GstMessage* injected_message = gst_message_new_error(
+              GST_OBJECT(sink),
+              injected,
+              "late async-finalize sink witness");
+          g_error_free(injected);
+          expect(gst_bus_post(bus, injected_message), "could not post late retired splitmux sink error");
+          witness.injected_fragment = std::move(owner);
+          witness.live_handoffs_at_injected_error = witness.live_handoffs.load(std::memory_order_relaxed);
+          gst_object_unref(sink);
+        }
+      } else if (type == GST_MESSAGE_ERROR) {
+        GError* error = nullptr;
+        gchar* debug = nullptr;
+        gst_message_parse_error(message, &error, &debug);
+        const std::string text = error == nullptr ? "unknown GStreamer error" : error->message;
+        if (error != nullptr) g_error_free(error);
+        g_free(debug);
+        if (text.find("injected late retired splitmux sink error") != std::string::npos) {
+          auto owner = mine_teleop::detail::recording_fragment_owner(GST_MESSAGE_SRC(message));
+          expect(owner == witness.injected_fragment, "late retired sink error was not classified by its stable owner tag");
+          static_cast<void>(owner->mark_failed(text));
+          witness.late_error_classified = true;
+        } else {
+          throw TestFailure("real splitmux topology emitted an unexpected error: " + text);
+        }
+      } else if (type == GST_MESSAGE_EOS) {
+        eos = true;
+      }
+      gst_message_unref(message);
+    }
+  } catch (...) {
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(bus);
+    gst_object_unref(pipeline);
+    std::filesystem::remove_all(root);
+    throw;
+  }
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_element_get_state(pipeline, nullptr, nullptr, 2 * GST_SECOND);
+  gst_object_unref(bus);
+  gst_object_unref(pipeline);
+  expect(delayed_live_handoffs > 0, "live branch produced no frames while bus consumption was delayed");
+  expect(witness.closed_event_seen, "real splitmux topology never closed a recording fragment");
+  expect(witness.old_sink_detached, "closed splitmux sink was still attached to the main pipeline before late error injection");
+  expect(witness.late_error_classified, "late retired splitmux sink error was not observed on the delayed bus");
+  expect(
+      witness.injected_fragment &&
+          witness.injected_fragment->snapshot().state == mine_teleop::detail::RecordingFragmentState::Failed,
+      "late retired splitmux sink error did not leave its fragment failed");
+  expect(
+      witness.live_handoffs.load(std::memory_order_relaxed) > witness.live_handoffs_at_injected_error,
+      "live branch stopped producing frames after the retired recording sink error");
+  expect(eos, "real splitmux topology did not reach EOS within its bounded test deadline");
+  bool probe_verified_fragment = false;
+  for (const auto& entry : std::filesystem::directory_iterator(root)) {
+    if (entry.path().extension() != ".mp4") continue;
+    const auto probe = mine_teleop::detail::probe_finalized_mp4(entry.path());
+    expect(probe.valid, "real splitmux output failed qtdemux probe: " + probe.reason);
+    probe_verified_fragment = true;
+  }
+  expect(probe_verified_fragment, "real splitmux topology produced no probeable MP4 fragment");
+  std::filesystem::remove_all(root);
 }
 
 void test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap() {
@@ -4022,6 +4291,73 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
       !std::filesystem::exists(archive / std::filesystem::relative(tampered_video, recordings)),
       "checksum-mismatched video reached the archive");
 
+  // A late splitmux/filesink error replaces the sidecar with quarantined
+  // metadata and leaves a durable revocation marker.  The uploader must not
+  // treat an older pending sidecar as successful work while that hand-off is
+  // in flight.
+  std::filesystem::remove(bad_metadata);
+  std::filesystem::remove(tampered_metadata);
+  const auto revoked_video = segment_dir / "segment-004.mp4";
+  const auto revoked_metadata = segment_dir / "segment-004.json";
+  {
+    std::ofstream output(revoked_video, std::ios::binary);
+    output << "late-error-fragment";
+  }
+  {
+    std::ofstream output(revoked_metadata);
+    output << mine_teleop::Json({
+        {"segment_id", "segment-004"},
+        {"video_file", revoked_video.filename().string()},
+        {"video_sha256", mine_teleop::sha256_file(revoked_video)},
+        {"recording_revision", 4},
+        {"recording_state", "completed"},
+        {"upload_state", "pending"},
+    }).dump();
+  }
+  {
+    std::ofstream output(revoked_metadata.string() + ".revoked");
+    output << R"({"failure":"late retired filesink error"})";
+  }
+  mine_teleop::LocalArchiveUploader revocation_uploader(recordings, archive);
+  expect(
+      revocation_uploader.process_once().action == "idle",
+      "revoked recording fragment was retried instead of being skipped");
+  expect(
+      !std::filesystem::exists(archive / std::filesystem::relative(revoked_video, recordings)),
+      "revoked recording fragment reached the successful archive");
+  expect(
+      revocation_uploader.backlog().value("pending_segments", std::uint64_t{1}) == 0,
+      "revoked recording fragment remained visible in the uploader backlog");
+
+  const auto claimed_video = segment_dir / "segment-005.mp4";
+  const auto claimed_metadata = segment_dir / "segment-005.json";
+  {
+    std::ofstream output(claimed_video, std::ios::binary);
+    output << "claimed-finalized-fragment";
+  }
+  {
+    std::ofstream output(claimed_metadata);
+    output << mine_teleop::Json({
+        {"segment_id", "segment-005"},
+        {"video_file", claimed_video.filename().string()},
+        {"video_sha256", mine_teleop::sha256_file(claimed_video)},
+        {"recording_revision", 5},
+        {"recording_state", "completed"},
+        {"upload_state", "pending"},
+    }).dump();
+  }
+  const auto claim_path = std::filesystem::path(claimed_metadata.string() + ".upload-claim");
+  expect(std::filesystem::create_directory(claim_path), "test could not create an uploader claim fixture");
+  const auto deferred_claim = revocation_uploader.process_once();
+  expect(
+      deferred_claim.action == "retry_wait" &&
+          !std::filesystem::exists(archive / std::filesystem::relative(claimed_video, recordings)),
+      "active uploader claim did not prevent a duplicate archive copy");
+  std::filesystem::remove_all(claim_path);
+  expect(
+      revocation_uploader.process_once().action == "uploaded",
+      "released uploader claim did not allow the completed fragment to archive");
+
   const auto storage_root = root / "storage-policy";
   std::filesystem::create_directories(storage_root);
   const auto write_storage_segment = [&](std::string_view id, std::string_view state) {
@@ -4090,6 +4426,7 @@ int main() {
       {"camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2", test_camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2},
       {"camera_input_pipeline_resamples_only_mismatched_ccg2_fps", test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps},
       {"ccg2_camera_input_pipeline_is_gstreamer_parseable", test_ccg2_camera_input_pipeline_is_gstreamer_parseable},
+      {"recording_fragment_state_fails_closed_and_survives_detach", test_recording_fragment_state_fails_closed_and_survives_detach},
       {"v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap", test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap},
       {"camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults", test_camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults},
       {"ccg2_example_config_defines_two_explicit_capture_lanes", test_ccg2_example_config_defines_two_explicit_capture_lanes},
@@ -4149,6 +4486,7 @@ int main() {
       {"driver_console_page_keeps_waiting_state_during_background_intent_refresh", test_driver_console_page_keeps_waiting_state_during_background_intent_refresh},
       {"driver_login_lists_only_authorized_vehicles", test_driver_login_lists_only_authorized_vehicles},
       {"local_archive_uploader_is_atomic_and_resumable", test_local_archive_uploader_is_atomic_and_resumable},
+      {"async_splitmux_late_sink_error_keeps_live_branch_running", test_async_splitmux_late_sink_error_keeps_live_branch_running},
   };
   int failures = 0;
   for (const auto& [name, test] : tests) {
