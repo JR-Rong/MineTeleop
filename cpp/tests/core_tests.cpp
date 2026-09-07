@@ -1,20 +1,24 @@
 #include "mine_teleop/core.hpp"
+#include "mine_teleop/detail/dynamic_adapter_apply.hpp"
 #include "mine_teleop/detail/recording_fragment_state.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/upload.hpp"
 #include "mine_teleop/video.hpp"
+#include "mine_teleop_chassis_bridge.h"
 
 #include <gst/gst.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -1681,6 +1685,221 @@ void test_dynamic_adapter_brake_overrides_throttle() {
       0.25,
       1e-9,
       "session torque ceiling was not encoded into the bridge intent");
+}
+
+struct DynamicAdapterSafeStopProbe {
+  int apply_result_code{0};
+  std::uint32_t apply_issue_id{MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE};
+  bool malformed_apply_result{false};
+  int set_stop_context_result{0};
+  int emergency_stop_result{0};
+  int apply_v2_calls{0};
+  int set_stop_context_calls{0};
+  int emergency_stop_calls{0};
+  int target_gear{0};
+  double target_vx{0.0};
+  double target_ax{0.0};
+  int steering_count{0};
+  std::array<double, 4> steering{};
+  MineTeleopChassisStopContextV1 stop_context{};
+};
+
+DynamicAdapterSafeStopProbe* g_dynamic_adapter_safe_stop_probe = nullptr;
+
+int dynamic_adapter_safe_stop_apply_v2(
+    int target_gear,
+    double target_vx,
+    double target_ax,
+    const double* steering_values,
+    int steering_count,
+    void* result) {
+  auto& probe = *g_dynamic_adapter_safe_stop_probe;
+  ++probe.apply_v2_calls;
+  probe.target_gear = target_gear;
+  probe.target_vx = target_vx;
+  probe.target_ax = target_ax;
+  probe.steering_count = steering_count;
+  if (steering_values != nullptr &&
+      steering_count == static_cast<int>(probe.steering.size())) {
+    for (std::size_t index = 0; index < probe.steering.size(); ++index) {
+      probe.steering[index] = steering_values[index];
+    }
+  }
+  if (result != nullptr) {
+    auto* raw = static_cast<MineTeleopChassisApplyResultV1*>(result);
+    raw->struct_size = probe.malformed_apply_result
+        ? static_cast<std::uint32_t>(sizeof(*raw) - 1U)
+        : static_cast<std::uint32_t>(sizeof(*raw));
+    raw->result_code = probe.apply_result_code;
+    raw->issue_id = probe.apply_issue_id;
+    raw->reserved = 0U;
+  }
+  return probe.apply_result_code;
+}
+
+int dynamic_adapter_safe_stop_set_context(const void* context) {
+  auto& probe = *g_dynamic_adapter_safe_stop_probe;
+  ++probe.set_stop_context_calls;
+  if (context != nullptr) {
+    probe.stop_context = *static_cast<const MineTeleopChassisStopContextV1*>(context);
+  }
+  return probe.set_stop_context_result;
+}
+
+int dynamic_adapter_safe_stop_emergency_stop() {
+  auto& probe = *g_dynamic_adapter_safe_stop_probe;
+  ++probe.emergency_stop_calls;
+  return probe.emergency_stop_result;
+}
+
+class ScopedDynamicAdapterSafeStopProbe {
+ public:
+  explicit ScopedDynamicAdapterSafeStopProbe(DynamicAdapterSafeStopProbe& probe) {
+    expect(
+        g_dynamic_adapter_safe_stop_probe == nullptr,
+        "dynamic adapter safe-stop probe was already active");
+    g_dynamic_adapter_safe_stop_probe = &probe;
+  }
+
+  ~ScopedDynamicAdapterSafeStopProbe() {
+    g_dynamic_adapter_safe_stop_probe = nullptr;
+  }
+
+  ScopedDynamicAdapterSafeStopProbe(const ScopedDynamicAdapterSafeStopProbe&) = delete;
+  ScopedDynamicAdapterSafeStopProbe& operator=(const ScopedDynamicAdapterSafeStopProbe&) = delete;
+};
+
+template <typename Function>
+void expect_error_contains(
+    Function&& function,
+    std::initializer_list<std::string_view> expected_fragments,
+    std::string_view message) {
+  try {
+    function();
+  } catch (const std::exception& error) {
+    const std::string_view text = error.what();
+    for (const auto expected : expected_fragments) {
+      expect(
+          text.find(expected) != std::string_view::npos,
+          std::string(message) + ": missing " + std::string(expected));
+    }
+    return;
+  }
+  throw TestFailure(std::string(message));
+}
+
+void test_dynamic_adapter_safe_stop_reads_v2_result_and_preserves_emergency_path() {
+  DynamicAdapterSafeStopProbe probe;
+  ScopedDynamicAdapterSafeStopProbe scoped_probe(probe);
+  constexpr std::string_view kOrdinaryStopContext =
+      "ordinary safe stop source=watchdog reason=outer_control_timeout";
+  const mine_teleop::VehicleStopContext context{
+      mine_teleop::VehicleStopSource::Watchdog,
+      mine_teleop::VehicleStopReason::OuterControlTimeout};
+  const mine_teleop::ControlOutput ordinary{
+      "D", 1.25, 0.8, 0.4, false, false};
+
+  const auto successful_stop =
+      mine_teleop::detail::invoke_dynamic_adapter_safe_stop(
+          dynamic_adapter_safe_stop_apply_v2,
+          dynamic_adapter_safe_stop_set_context,
+          dynamic_adapter_safe_stop_emergency_stop,
+          3,
+          ordinary,
+          context,
+          kOrdinaryStopContext);
+  expect(
+      !successful_stop.uses_emergency_stop && probe.apply_v2_calls == 1 &&
+          probe.set_stop_context_calls == 0 && probe.emergency_stop_calls == 0,
+      "ordinary safe stop did not use only apply_state_v2");
+  expect_near(probe.target_vx, 0.0, 1e-12, "ordinary safe stop changed target velocity");
+  expect_near(probe.target_ax, -0.4, 1e-12, "ordinary safe stop changed brake acceleration");
+  expect(
+      probe.target_gear == 3 && probe.steering_count == 4,
+      "ordinary safe stop changed the bridge gear or steering cardinality");
+  for (const double steering : probe.steering) {
+    expect_near(steering, 1.25, 1e-12, "ordinary safe stop did not broadcast steering");
+  }
+
+  probe = {};
+  probe.apply_result_code = -3;
+  probe.apply_issue_id =
+      MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE;
+  expect_error_contains(
+      [&] {
+        static_cast<void>(mine_teleop::detail::invoke_dynamic_adapter_safe_stop(
+            dynamic_adapter_safe_stop_apply_v2,
+            dynamic_adapter_safe_stop_set_context,
+            dynamic_adapter_safe_stop_emergency_stop,
+            3,
+            ordinary,
+            context,
+            kOrdinaryStopContext));
+      },
+      {"source=watchdog", "reason=outer_control_timeout", "code -3",
+       "issue vcu_drive_gear_change_moving_or_stale"},
+      "ordinary safe-stop rejection lost structured context");
+  expect(
+      probe.apply_v2_calls == 1 && probe.set_stop_context_calls == 0 &&
+          probe.emergency_stop_calls == 0,
+      "ordinary safe-stop rejection used the emergency path");
+
+  probe = {};
+  probe.malformed_apply_result = true;
+  expect_error_contains(
+      [&] {
+        static_cast<void>(mine_teleop::detail::invoke_dynamic_adapter_safe_stop(
+            dynamic_adapter_safe_stop_apply_v2,
+            dynamic_adapter_safe_stop_set_context,
+            dynamic_adapter_safe_stop_emergency_stop,
+            3,
+            ordinary,
+            context,
+            kOrdinaryStopContext));
+      },
+      {"source=watchdog", "reason=outer_control_timeout",
+       "returned an invalid result structure"},
+      "ordinary safe-stop accepted a malformed v2 result");
+
+  probe = {};
+  auto emergency = ordinary;
+  emergency.estop = true;
+  const auto emergency_stop =
+      mine_teleop::detail::invoke_dynamic_adapter_safe_stop(
+          dynamic_adapter_safe_stop_apply_v2,
+          dynamic_adapter_safe_stop_set_context,
+          dynamic_adapter_safe_stop_emergency_stop,
+          3,
+          emergency,
+          context,
+          kOrdinaryStopContext);
+  expect(
+      emergency_stop.uses_emergency_stop && probe.apply_v2_calls == 0 &&
+          probe.set_stop_context_calls == 1 && probe.emergency_stop_calls == 1,
+      "ESTOP did not stay on the independent emergency-stop path");
+  expect(
+      probe.stop_context.struct_size == sizeof(MineTeleopChassisStopContextV1) &&
+          probe.stop_context.stop_source == MINE_TELEOP_CHASSIS_STOP_SOURCE_WATCHDOG &&
+          probe.stop_context.stop_reason == MINE_TELEOP_CHASSIS_STOP_REASON_OUTER_CONTROL_TIMEOUT &&
+          probe.stop_context.reserved == 0U,
+      "ESTOP did not preserve its stop context before emergency stop");
+
+  probe = {};
+  auto full_emergency = ordinary;
+  full_emergency.full_emergency_brake = true;
+  const auto full_emergency_stop =
+      mine_teleop::detail::invoke_dynamic_adapter_safe_stop(
+          dynamic_adapter_safe_stop_apply_v2,
+          dynamic_adapter_safe_stop_set_context,
+          dynamic_adapter_safe_stop_emergency_stop,
+          3,
+          full_emergency,
+          context,
+          kOrdinaryStopContext);
+  expect(
+      full_emergency_stop.uses_emergency_stop && probe.apply_v2_calls == 0 &&
+          probe.set_stop_context_calls == 1 && probe.emergency_stop_calls == 1,
+      "full emergency brake incorrectly touched apply_state_v2");
 }
 
 void test_bench_config_drives_unified_vehicle_runtime() {
@@ -4675,6 +4894,8 @@ int main() {
       {"vehicle_config_validates_chassis_control_speed_range", test_vehicle_config_validates_chassis_control_speed_range},
       {"dynamic_adapter_target_speed_uses_configured_ceiling", test_dynamic_adapter_target_speed_uses_configured_ceiling},
       {"dynamic_adapter_brake_overrides_throttle", test_dynamic_adapter_brake_overrides_throttle},
+      {"dynamic_adapter_safe_stop_reads_v2_result_and_preserves_emergency_path",
+       test_dynamic_adapter_safe_stop_reads_v2_result_and_preserves_emergency_path},
       {"bench_config_drives_unified_vehicle_runtime", test_bench_config_drives_unified_vehicle_runtime},
       {"field_config_pins_tls_route_without_system_dns", test_field_config_pins_tls_route_without_system_dns},
       {"control_command_json_round_trip_and_validation", test_control_command_json_round_trip_and_validation},

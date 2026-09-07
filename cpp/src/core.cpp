@@ -1,5 +1,6 @@
 #include "mine_teleop/core.hpp"
 #include "mine_teleop/credentials.hpp"
+#include "mine_teleop/detail/dynamic_adapter_apply.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -39,7 +40,37 @@
 #include <yaml-cpp/yaml.h>
 
 namespace mine_teleop {
+namespace detail {
+
+struct DynamicAdapterBridgeStopContextV1 {
+  std::uint32_t struct_size;
+  std::uint32_t stop_source;
+  std::uint32_t stop_reason;
+  std::uint32_t reserved;
+};
+
+struct DynamicAdapterBridgeApplyResultV1 {
+  std::uint32_t struct_size;
+  std::int32_t result_code;
+  std::uint32_t issue_id;
+  std::uint32_t reserved;
+};
+
+constexpr std::uint32_t kDynamicAdapterApplyIssueNone = 0U;
+constexpr std::uint32_t kDynamicAdapterApplyIssueDriveGearChangeMovingOrStale = 5U;
+
+std::string dynamic_adapter_apply_issue_code(std::uint32_t issue_id) {
+  return issue_id == kDynamicAdapterApplyIssueDriveGearChangeMovingOrStale
+      ? "vcu_drive_gear_change_moving_or_stale"
+      : "vcu_control_apply_rejected";
+}
+
+}  // namespace detail
+
 namespace {
+
+using BridgeApplyResultV1 = detail::DynamicAdapterBridgeApplyResultV1;
+using BridgeStopContextV1 = detail::DynamicAdapterBridgeStopContextV1;
 
 using control_limits::kChassisControlMaxTargetSpeedKph;
 using control_limits::kChassisControlMaxTargetSpeedMps;
@@ -178,13 +209,6 @@ struct BridgeTelemetry {
   std::uint64_t stop_sequence;
 };
 
-struct BridgeStopContextV1 {
-  std::uint32_t struct_size;
-  std::uint32_t stop_source;
-  std::uint32_t stop_reason;
-  std::uint32_t reserved;
-};
-
 struct BridgeOpenConfigV1 {
   std::uint32_t struct_size;
   const char* can_interface;
@@ -239,13 +263,6 @@ struct BridgeOpenConfigV4 {
   double motor_torque_rise_rate_nm_per_s;
 };
 
-struct BridgeApplyResultV1 {
-  std::uint32_t struct_size;
-  std::int32_t result_code;
-  std::uint32_t issue_id;
-  std::uint32_t reserved;
-};
-
 struct BridgeRuntimeControlConfigV1 {
   std::uint32_t struct_size;
   std::uint32_t profile_version;
@@ -295,13 +312,8 @@ static_assert(
 static_assert(sizeof(BridgeRuntimeControlConfigV2) == 96U);
 static_assert(sizeof(BridgeRuntimeControlResultV1) == 24U);
 
-constexpr std::uint32_t kBridgeApplyIssueNone = 0U;
-constexpr std::uint32_t kBridgeApplyIssueDriveGearChangeMovingOrStale = 5U;
-
 std::string bridge_apply_issue_code(std::uint32_t issue_id) {
-  return issue_id == kBridgeApplyIssueDriveGearChangeMovingOrStale
-      ? "vcu_drive_gear_change_moving_or_stale"
-      : "vcu_control_apply_rejected";
+  return detail::dynamic_adapter_apply_issue_code(issue_id);
 }
 
 #define MINE_TELEOP_ASSERT_BRIDGE_V3_PREFIX_FIELD(field) \
@@ -962,6 +974,85 @@ void prepare_socketcan(
 #endif
 
 }  // namespace
+
+namespace detail {
+
+DynamicAdapterApplyV2Outcome invoke_dynamic_adapter_apply_v2(
+    DynamicAdapterApplyV2Fn apply_v2,
+    int target_gear,
+    double target_vx,
+    double target_ax,
+    const double* steering_values,
+    int steering_count) {
+  if (apply_v2 == nullptr) {
+    throw std::runtime_error("mine_teleop_chassis_apply_state_v2 is unavailable");
+  }
+  DynamicAdapterBridgeApplyResultV1 result{};
+  const int result_code = apply_v2(
+      target_gear,
+      target_vx,
+      target_ax,
+      steering_values,
+      steering_count,
+      &result);
+  if (result.struct_size != sizeof(DynamicAdapterBridgeApplyResultV1) ||
+      result.result_code != result_code || result.reserved != 0U ||
+      (result_code == 0 && result.issue_id != kDynamicAdapterApplyIssueNone)) {
+    throw std::runtime_error(
+        "mine_teleop_chassis_apply_state_v2 returned an invalid result structure");
+  }
+  return {result_code, result.issue_id};
+}
+
+DynamicAdapterSafeStopInvocation invoke_dynamic_adapter_safe_stop(
+    DynamicAdapterApplyV2Fn apply_v2,
+    DynamicAdapterSetStopContextV1Fn set_stop_context,
+    DynamicAdapterEmergencyStopFn emergency_stop,
+    int target_gear,
+    const ControlOutput& output,
+    VehicleStopContext context,
+    std::string_view ordinary_error_context) {
+  if (output.estop || output.full_emergency_brake) {
+    if (set_stop_context == nullptr || emergency_stop == nullptr) {
+      throw std::runtime_error("dynamic adapter emergency-stop capability is unavailable");
+    }
+    const DynamicAdapterBridgeStopContextV1 raw_context{
+        sizeof(DynamicAdapterBridgeStopContextV1),
+        static_cast<std::uint32_t>(context.source),
+        static_cast<std::uint32_t>(context.reason),
+        0U};
+    const int context_result = set_stop_context(&raw_context);
+    if (context_result != 0) {
+      return {true, context_result, 0};
+    }
+    return {true, 0, emergency_stop()};
+  }
+
+  const auto steering = control_limits::broadcast_steering_request(output.steering);
+  DynamicAdapterApplyV2Outcome outcome;
+  try {
+    outcome = invoke_dynamic_adapter_apply_v2(
+        apply_v2,
+        target_gear,
+        0.0,
+        -output.brake,
+        steering.data(),
+        static_cast<int>(steering.size()));
+  } catch (const std::exception& error) {
+    throw std::runtime_error(
+        std::string(ordinary_error_context) + ": " + error.what());
+  }
+  if (outcome.result_code != 0) {
+    throw std::runtime_error(
+        std::string(ordinary_error_context) +
+        " rejected by mine_teleop_chassis_apply_state_v2 with code " +
+        std::to_string(outcome.result_code) + " and issue " +
+        dynamic_adapter_apply_issue_code(outcome.issue_id));
+  }
+  return {};
+}
+
+}  // namespace detail
 
 VehicleAdapterControlRejected::VehicleAdapterControlRejected(
     std::string issue_code,
@@ -2700,26 +2791,25 @@ void DynamicLibraryVehicleAdapter::apply_control(const ControlCommand& command) 
       max_ordinary_brake_pressure_bar_);
   const auto steering =
       control_limits::broadcast_steering_request(command.steering);
-  BridgeApplyResultV1 apply_result{};
-  const int result = apply_v2_fn_(
-      gear_to_bridge_value(command.gear),
-      velocity,
-      acceleration,
-      steering.data(),
-      static_cast<int>(steering.size()),
-      &apply_result);
-  if (apply_result.struct_size != sizeof(BridgeApplyResultV1) ||
-      apply_result.result_code != result || apply_result.reserved != 0U ||
-      (result == 0 && apply_result.issue_id != kBridgeApplyIssueNone)) {
-    last_error_ = "mine_teleop_chassis_apply_state_v2 returned an invalid result structure";
-    throw std::runtime_error(last_error_);
+  detail::DynamicAdapterApplyV2Outcome outcome;
+  try {
+    outcome = detail::invoke_dynamic_adapter_apply_v2(
+        apply_v2_fn_,
+        gear_to_bridge_value(command.gear),
+        velocity,
+        acceleration,
+        steering.data(),
+        static_cast<int>(steering.size()));
+  } catch (const std::exception& error) {
+    last_error_ = error.what();
+    throw;
   }
-  if (result != 0) {
+  if (outcome.result_code != 0) {
     last_error_ = "mine_teleop_chassis_apply_state_v2 rejected control with code " +
-        std::to_string(result);
+        std::to_string(outcome.result_code);
     throw VehicleAdapterControlRejected(
-        bridge_apply_issue_code(apply_result.issue_id),
-        result);
+        bridge_apply_issue_code(outcome.issue_id),
+        outcome.result_code);
   }
   last_error_.clear();
   ++applied_command_count_;
@@ -2729,27 +2819,35 @@ void DynamicLibraryVehicleAdapter::apply_safe_stop(
     const ControlOutput& output,
     VehicleStopContext context) {
   if (!opened_) throw std::runtime_error("dynamic vehicle adapter is not open");
-  if (output.estop || output.full_emergency_brake) {
-    const BridgeStopContextV1 raw_context{
-        sizeof(BridgeStopContextV1),
-        static_cast<std::uint32_t>(context.source),
-        static_cast<std::uint32_t>(context.reason),
-        0U};
-    check_result(
-        set_stop_context_v1_fn_(&raw_context),
-        "mine_teleop_chassis_set_stop_context_v1");
-    check_result(stop_fn_(), "mine_teleop_chassis_emergency_stop");
-  } else {
-    const auto steering =
-        control_limits::broadcast_steering_request(output.steering);
-    check_result(
-        apply_fn_(
-            gear_to_bridge_value(output.gear),
-            0.0,
-            -output.brake,
-            steering.data(),
-            static_cast<int>(steering.size())),
-        "mine_teleop_chassis_apply_state");
+  const auto ordinary_error_context =
+      "ordinary safe stop source=" +
+      bridge_stop_source(
+          static_cast<std::uint32_t>(context.source),
+          static_cast<std::uint32_t>(context.reason)) +
+      " reason=" +
+      bridge_stop_reason(static_cast<std::uint32_t>(context.reason));
+  try {
+    const auto invocation = detail::invoke_dynamic_adapter_safe_stop(
+        apply_v2_fn_,
+        set_stop_context_v1_fn_,
+        stop_fn_,
+        gear_to_bridge_value(output.gear),
+        output,
+        context,
+        ordinary_error_context);
+    if (invocation.uses_emergency_stop) {
+      check_result(
+          invocation.set_stop_context_result,
+          "mine_teleop_chassis_set_stop_context_v1");
+      check_result(
+          invocation.emergency_stop_result,
+          "mine_teleop_chassis_emergency_stop");
+    } else {
+      last_error_.clear();
+    }
+  } catch (const std::exception& error) {
+    last_error_ = error.what();
+    throw;
   }
   ++safe_stop_count_;
 }

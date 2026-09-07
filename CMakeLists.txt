@@ -796,6 +796,9 @@ if(MINE_TELEOP_BUILD_TESTS)
       PROPERTIES TIMEOUT 30
     )
     add_executable(mine-teleop-cpp-tests cpp/tests/core_tests.cpp)
+    target_include_directories(mine-teleop-cpp-tests
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/deployments/chassis-control-bridge
+    )
     target_link_libraries(mine-teleop-cpp-tests PRIVATE mine_teleop_vehicle_runtime)
     mine_teleop_enable_warnings(mine-teleop-cpp-tests)
     add_test(NAME mine-teleop-cpp-tests COMMAND mine-teleop-cpp-tests)
