@@ -189,9 +189,12 @@ void validate_connection_limits(const SimpleHttpServer::ConnectionLimits& limits
 
 class SignalingService {
  public:
+  using ClockSampler = std::function<ClockSample()>;
+
   explicit SignalingService(
       SignalingServerConfig config,
-      std::function<std::int64_t()> audit_clock = {});
+      std::function<std::int64_t()> audit_clock = {},
+      ClockSampler clock_sampler = {});
   ~SignalingService();
 
   [[nodiscard]] ServerResponse handle(const HttpRequest& request);
@@ -201,14 +204,16 @@ class SignalingService {
  private:
   struct DriverToken {
     std::string driver_id;
-    std::int64_t expires_at_ms{0};
+    std::int64_t expires_at_utc_ms{0};
+    std::int64_t expires_at_monotonic_ms{0};
     std::uint64_t connection_generation{0};
   };
   struct ConnectionPresence {
     std::string connection_id;
     std::uint64_t generation{0};
-    std::int64_t connected_at_ms{0};
-    std::int64_t last_seen_at_ms{0};
+    std::int64_t connected_at_utc_ms{0};
+    std::int64_t last_seen_at_utc_ms{0};
+    std::int64_t last_seen_at_monotonic_ms{0};
   };
   struct RelayUsageSample {
     std::uint64_t sequence{0};
@@ -219,7 +224,7 @@ class SignalingService {
   struct WebSocketRateState {
     std::int64_t messages{0};
     std::size_t bytes{0};
-    std::chrono::steady_clock::time_point window_started_at{};
+    std::optional<std::int64_t> window_started_at_monotonic_ms;
   };
   struct Session {
     std::string session_id;
@@ -227,7 +232,8 @@ class SignalingService {
     std::string driver_id;
     SessionState state{SessionState::Online};
     std::string control_token;
-    std::int64_t control_token_expires_at_ms{0};
+    std::int64_t control_token_expires_at_utc_ms{0};
+    std::int64_t control_token_expires_at_monotonic_ms{0};
     std::uint64_t relay_bytes_sent{0};
     std::uint64_t relay_bytes_received{0};
     std::uint64_t relay_duration_ms{0};
@@ -259,12 +265,14 @@ class SignalingService {
   struct LoginFailureState {
     std::int64_t failures{0};
     std::int64_t pending_failures{0};
-    std::int64_t window_started_at_ms{0};
-    std::int64_t blocked_until_ms{0};
+    std::optional<std::int64_t> window_started_at_monotonic_ms;
+    std::optional<std::int64_t> blocked_until_utc_ms;
+    std::optional<std::int64_t> blocked_until_monotonic_ms;
   };
   struct LoginFailureReservation {
     std::string bucket;
-    std::int64_t admitted_at_ms{0};
+    std::int64_t admitted_at_utc_ms{0};
+    std::int64_t admitted_at_monotonic_ms{0};
   };
   struct LoginCredentialSnapshot {
     enum class Kind {
@@ -281,20 +289,23 @@ class SignalingService {
   };
   struct ApiRateState {
     std::int64_t requests{0};
-    std::int64_t window_started_at_ms{0};
+    std::optional<std::int64_t> window_started_at_monotonic_ms;
     bool limit_audited{false};
   };
 
-  [[nodiscard]] ServerResponse handle_get(const HttpRequest& request);
-  [[nodiscard]] ServerResponse handle_post(const HttpRequest& request);
-  [[nodiscard]] ServerResponse handle_driver_login(Json value);
+  [[nodiscard]] ClockSample clock_sample() const;
+  [[nodiscard]] ServerResponse handle_get(const HttpRequest& request, ClockSample now);
+  [[nodiscard]] ServerResponse handle_post(const HttpRequest& request, ClockSample now);
+  [[nodiscard]] ServerResponse handle_driver_login(Json value, ClockSample admitted_at);
   [[nodiscard]] Json enqueue_signaling_message(
       std::string_view session_id,
       const Json& value,
+      ClockSample received_at,
       std::optional<std::string_view> authenticated_actor = std::nullopt);
   [[nodiscard]] Json take_signaling_messages(
       std::string_view session_id,
       std::string_view recipient,
+      ClockSample now,
       std::string_view requested_types = {},
       bool consume = true);
   [[nodiscard]] std::size_t acknowledge_signaling_messages(
@@ -304,18 +315,23 @@ class SignalingService {
       bool control_only = false);
   [[nodiscard]] const Session& require_active_session(std::string_view session_id) const;
   [[nodiscard]] const Session& require_participant(std::string_view session_id, std::string_view participant) const;
-  void validate_driver_token(std::string_view driver_id, std::string_view token);
+  void validate_driver_token(std::string_view driver_id, std::string_view token, ClockSample now);
   void validate_device_token(std::string_view vehicle_id, std::string_view token) const;
   void validate_vehicle_connection(
       std::string_view vehicle_id,
       std::string_view token,
-      std::uint64_t connection_generation);
-  void validate_actor_credential(const Session& session, std::string_view actor, const Json& value);
+      std::uint64_t connection_generation,
+      ClockSample now);
+  void validate_actor_credential(
+      const Session& session,
+      std::string_view actor,
+      const Json& value,
+      ClockSample now);
   void validate_message_metadata(
       const Session& session,
       const ProtocolMetadata& metadata);
-  void cleanup_expired_connections(std::int64_t timestamp_ms);
-  void prune_expired_signaling_messages(std::int64_t timestamp_ms);
+  void cleanup_expired_connections(ClockSample now);
+  void prune_expired_signaling_messages(ClockSample now);
   void close_sessions_for_vehicle(std::string_view vehicle_id, std::string_view reason);
   void close_sessions_for_driver(std::string_view driver_id, std::string_view reason);
   void transition_session(Session& session, SessionState next, std::string_view reason);
@@ -325,29 +341,32 @@ class SignalingService {
   void release_password_verification_slot() noexcept;
   [[nodiscard]] LoginFailureReservation reserve_login_failure_locked(
       std::string_view driver_id,
-      std::int64_t admitted_at_ms);
+      ClockSample admitted_at);
   void release_login_failure_reservation_locked(const LoginFailureReservation& reservation);
   void record_login_failure_locked(
       std::string_view driver_id,
       const LoginFailureReservation& reservation,
-      std::int64_t settled_at_ms);
+      ClockSample settled_at);
   void clear_login_failures_locked(std::string_view driver_id);
   [[nodiscard]] std::string request_source(const HttpRequest& request) const;
-  void cleanup_api_rate_limits(std::int64_t timestamp_ms);
-  void enforce_api_rate_limit(const HttpRequest& request, std::int64_t timestamp_ms);
+  void cleanup_api_rate_limits(MonotonicMillis now);
+  void enforce_api_rate_limit(const HttpRequest& request, MonotonicMillis now);
   bool audit(std::string_view event, const Json& details = Json::object()) const noexcept;
 
   SignalingServerConfig config_;
   std::string service_instance_id_;
   std::function<std::int64_t()> audit_clock_;
+  ClockSampler clock_sampler_;
   mutable std::mutex mutex_;
   mutable std::mutex password_verification_mutex_;
   mutable std::mutex audit_log_mutex_;
+  mutable std::mutex audit_fallback_mutex_;
   mutable std::int64_t audit_log_period_start_ms_{-1};
   mutable std::int64_t audit_log_last_retention_period_ms_{-1};
   mutable std::atomic<bool> audit_healthy_{true};
   mutable std::atomic<std::uint64_t> audit_write_failures_{0};
-  mutable std::atomic<std::int64_t> audit_last_fallback_report_ms_{0};
+  mutable bool audit_last_fallback_report_has_monotonic_{false};
+  mutable std::int64_t audit_last_fallback_report_monotonic_ms_{0};
   std::atomic<bool> connection_reaper_healthy_{true};
   std::atomic<std::uint64_t> connection_reaper_failures_{0};
   std::unordered_map<std::string, DriverToken> driver_tokens_;
@@ -366,7 +385,7 @@ class SignalingService {
   std::unordered_map<std::string, ApiRateState> api_rate_limits_;
   ApiRateState api_rate_limit_overflow_;
   std::unique_ptr<AsyncControlTrace> native_control_trace_;
-  std::int64_t api_rate_limit_last_cleanup_ms_{0};
+  std::optional<std::int64_t> api_rate_limit_last_cleanup_monotonic_ms_;
   std::uint64_t api_rate_limited_requests_{0};
   std::uint64_t signaling_queue_rejections_{0};
   std::uint64_t session_counter_{0};
@@ -452,7 +471,9 @@ class DriverConsoleRuntime {
 
  private:
   [[nodiscard]] Json login_locked(std::string_view password);
-  [[nodiscard]] Json fetch_authorized_vehicles(std::string_view token, std::int64_t expires_at_ms);
+  [[nodiscard]] Json fetch_authorized_vehicles(
+      std::string_view token,
+      std::int64_t expires_at_utc_ms);
   [[nodiscard]] Json send_signaling_message(std::string_view type, const Json& payload);
   void connect_signaling_websocket(std::string_view session_id, std::string_view token);
   void close_signaling_websocket();
@@ -499,18 +520,20 @@ class DriverConsoleRuntime {
   mutable std::mutex native_control_update_mutex_;
   std::condition_variable_any native_control_cv_;
   std::string driver_token_;
-  std::int64_t driver_token_expires_at_ms_{0};
+  std::int64_t driver_token_expires_at_utc_ms_{0};
+  std::int64_t driver_token_expires_at_monotonic_ms_{0};
   std::string signaling_service_instance_id_;
   std::uint64_t signaling_restart_recoveries_{0};
   bool signaling_available_{false};
   std::string session_id_;
   std::string control_token_;
-  std::int64_t control_token_expires_at_ms_{0};
-  std::int64_t control_token_renew_at_ms_{0};
+  std::int64_t control_token_expires_at_utc_ms_{0};
+  std::int64_t control_token_expires_at_monotonic_ms_{0};
+  std::int64_t control_token_renew_at_monotonic_ms_{0};
   std::uint64_t sequence_{0};
   std::uint64_t control_sequence_{0};
   std::uint64_t control_session_generation_{0};
-  std::int64_t connected_at_ms_{0};
+  std::int64_t connected_at_utc_ms_{0};
   std::int64_t last_control_prepared_at_utc_ms_{0};
   std::uint64_t control_commands_prepared_total_{0};
   double target_speed_kph_{2.0};

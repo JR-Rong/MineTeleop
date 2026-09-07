@@ -1,5 +1,6 @@
 #include "mine_teleop/core.hpp"
 #include "mine_teleop/credentials.hpp"
+#include "mine_teleop/detail/clock_deadline.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/platform.hpp"
 #include "mine_teleop/server.hpp"
@@ -23,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -39,6 +41,25 @@ mine_teleop::SignalingServerConfig legacy_signaling_config() {
   config.legacy_passwords_remove_by = "2099-12-31";
   return config;
 }
+
+struct FakeDualClock {
+  std::atomic<std::int64_t> utc_ms{1'700'000'000'000};
+  std::atomic<std::int64_t> monotonic_ms{0};
+
+  [[nodiscard]] mine_teleop::ClockSample sample() const {
+    return {
+        mine_teleop::UtcMillis{utc_ms.load(std::memory_order_relaxed)},
+        mine_teleop::MonotonicMillis{monotonic_ms.load(std::memory_order_relaxed)}};
+  }
+
+  void jump_utc(std::int64_t delta_ms) {
+    utc_ms.fetch_add(delta_ms, std::memory_order_relaxed);
+  }
+
+  void advance_monotonic(std::int64_t delta_ms) {
+    monotonic_ms.fetch_add(delta_ms, std::memory_order_relaxed);
+  }
+};
 
 void authorize_local_post(
     const mine_teleop::DriverConsoleHttpApp& app,
@@ -747,6 +768,72 @@ void test_signaling_time_sync_applies_backward_utc_correction() {
       std::abs(corrected_lead_ms) <= 10,
       "backward UTC correction was permanently hidden by a monotonic clock clamp");
   server.stop();
+}
+
+void test_driver_runtime_utc_expiry_maps_to_monotonic_after_resync() {
+  std::atomic<std::int64_t> server_offset_ms{60'000};
+  std::atomic<int> login_requests{0};
+  mine_teleop::SimpleHttpServer server(
+      "127.0.0.1",
+      0,
+      [&](const mine_teleop::HttpRequest& request) {
+        if (request.path == "/time") {
+          const auto client_send = request.query.find("client_send_ms");
+          if (client_send == request.query.end()) {
+            return mine_teleop::ServerResponse::json(400, {{"error", "client_send_ms is required"}});
+          }
+          const auto server_time = mine_teleop::now_ms() + server_offset_ms.load();
+          return mine_teleop::ServerResponse::json(
+              200,
+              {{"time_domain", "signaling_server"},
+               {"client_send_ms", std::stoll(client_send->second)},
+               {"server_receive_ms", server_time},
+               {"server_send_ms", server_time}});
+        }
+        if (request.path == "/auth/driver_login") {
+          const auto login_number = login_requests.fetch_add(1) + 1;
+          return mine_teleop::ServerResponse::json(
+              200,
+              {{"token_type", "bearer"},
+               {"token", "driver-resync-token-" + std::to_string(login_number)},
+               {"expires_at_ms", mine_teleop::now_ms() + server_offset_ms.load() + 500},
+               {"connection_generation", login_number},
+               {"service_instance_id", "driver-resync-test"}});
+        }
+        if (request.path == "/drivers/driver-resync/vehicles") {
+          return mine_teleop::ServerResponse::json(
+              200,
+              {{"driver_id", "driver-resync"},
+               {"vehicles", mine_teleop::Json::array({{{"vehicle_id", "vehicle-001"},
+                                                           {"online", true}}})}});
+        }
+        return mine_teleop::ServerResponse::json(404, {{"error", "not found"}});
+      });
+  server.start();
+  mine_teleop::DriverConfig config;
+  config.driver_id = "driver-resync";
+  config.signaling_url = "http://127.0.0.1:" + std::to_string(server.port());
+  config.time_sync_samples = 3;
+  config.time_sync_interval_ms = 1;
+  config.max_time_sync_uncertainty_ms = 2'000;
+  mine_teleop::DriverConsoleRuntime runtime(config, "vehicle-001", "driver-resync-password");
+
+  const auto first_login = runtime.login();
+  const auto first_expiry_utc_ms = first_login.at("token_expires_at_utc_ms").get<std::int64_t>();
+  expect(login_requests.load() == 1, "driver runtime did not issue its initial login");
+
+  server_offset_ms = 0;
+  std::this_thread::sleep_for(std::chrono::milliseconds(650));
+  const auto second_login = runtime.login();
+  const auto second_expiry_utc_ms = second_login.at("token_expires_at_utc_ms").get<std::int64_t>();
+  server.stop();
+
+  expect(
+      login_requests.load() == 2,
+      "driver runtime extended a locally expired token after a backward time-sync reanchor");
+  expect(
+      second_expiry_utc_ms < first_expiry_utc_ms - 50'000,
+      "driver runtime did not retain the resynchronized UTC expiry for display");
 }
 
 void test_driver_time_sync_uncertainty_fails_closed_at_production_default() {
@@ -6600,6 +6687,375 @@ void test_driver_webrtc_connection_audit_transitions() {
   std::filesystem::remove(audit_path);
 }
 
+void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
+  constexpr std::string_view kDriverId = "driver-dual-clock";
+  constexpr std::string_view kVehicleId = "vehicle-dual-clock";
+  constexpr std::string_view kDriverPassword = "driver-dual-clock-password";
+  constexpr std::string_view kDeviceToken = "vehicle-dual-clock-device-token";
+
+  const auto local_deadline = mine_teleop::detail::local_monotonic_deadline_from_utc_expiry(
+      mine_teleop::UtcMillis{2'000},
+      mine_teleop::ClockSample{
+          mine_teleop::UtcMillis{1'000}, mine_teleop::MonotonicMillis{500}});
+  expect(
+      local_deadline.value == 1'500 &&
+          mine_teleop::detail::monotonic_deadline_reached(
+              mine_teleop::MonotonicMillis{1'500}, local_deadline.value),
+      "UTC expiry was not converted to the local response-receipt monotonic deadline");
+  expect(
+      !mine_teleop::detail::monotonic_deadline_reached(
+          mine_teleop::MonotonicMillis{-1},
+          0) &&
+          mine_teleop::detail::monotonic_deadline_reached(
+              mine_teleop::MonotonicMillis{0},
+              0),
+      "a zero monotonic deadline was treated as an unset sentinel");
+  expect(
+      mine_teleop::detail::saturating_deadline_ms(
+          std::numeric_limits<std::int64_t>::max() - 1,
+          2) == std::numeric_limits<std::int64_t>::max() &&
+          mine_teleop::detail::saturating_deadline_ms(
+              std::numeric_limits<std::int64_t>::min(),
+              std::numeric_limits<std::int64_t>::max()) == -1,
+      "saturating deadline arithmetic is not safe across its declared int64 domain");
+
+  FakeDualClock clock;
+  const auto initial = clock.sample();
+  const auto audit_path = std::filesystem::temp_directory_path() /
+      ("mine-teleop-dual-clock-" + mine_teleop::random_token(6) + ".jsonl");
+  auto config = legacy_signaling_config();
+  config.driver_passwords = {{std::string(kDriverId), std::string(kDriverPassword)}};
+  config.device_tokens = {{std::string(kVehicleId), std::string(kDeviceToken)}};
+  config.driver_vehicle_permissions = {{std::string(kDriverId), {std::string(kVehicleId)}}};
+  config.token_ttl_ms = 10'000;
+  config.control_token_ttl_ms = 3'000;
+  config.driver_heartbeat_timeout_ms = 5'000;
+  config.vehicle_heartbeat_timeout_ms = 5'000;
+  config.signaling_message_ttl_ms = 1'000;
+  config.native_control_message_ttl_ms = 1'000;
+  config.api_rate_limit_requests = 1'000;
+  config.audit_log_path = audit_path.string();
+  mine_teleop::SignalingService service(
+      config,
+      {},
+      [&clock] { return clock.sample(); });
+
+  const auto post = [&](std::string path, const mine_teleop::Json& body) {
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.target = path;
+    request.path = std::move(path);
+    request.peer_address = "198.51.100.90";
+    request.body = body.dump();
+    return service.handle(request);
+  };
+  const auto get = [&](std::string path, std::unordered_map<std::string, std::string> query) {
+    mine_teleop::HttpRequest request;
+    request.method = "GET";
+    request.target = path;
+    request.path = std::move(path);
+    request.peer_address = "198.51.100.90";
+    request.query = std::move(query);
+    return service.handle(request);
+  };
+
+  const auto online = post(
+      "/vehicles/online",
+      {{"vehicle_id", kVehicleId},
+       {"device_token", kDeviceToken},
+       {"connection_id", "dual-clock-vehicle-connection"}});
+  expect(online.status == 200, "dual-clock vehicle did not become online");
+  const auto vehicle_generation = mine_teleop::Json::parse(online.body)
+                                      .at("connection_generation")
+                                      .get<std::uint64_t>();
+  const auto login = post(
+      "/auth/driver_login",
+      {{"driver_id", kDriverId}, {"password", kDriverPassword}});
+  expect(login.status == 200, "dual-clock driver login failed");
+  const auto login_body = mine_teleop::Json::parse(login.body);
+  const auto driver_token = login_body.at("token").get<std::string>();
+  expect(
+      login_body.at("expires_at_ms").get<std::int64_t>() == initial.utc.value + config.token_ttl_ms,
+      "driver token wire expiry is not the injected UTC display value");
+  const auto session_response = post(
+      "/sessions",
+      {{"driver_id", kDriverId}, {"vehicle_id", kVehicleId}, {"token", driver_token}});
+  expect(session_response.status == 200, "dual-clock control session creation failed");
+  const auto session = mine_teleop::Json::parse(session_response.body);
+  const auto session_id = session.at("session_id").get<std::string>();
+  const auto control_token = session.at("control_token").get<std::string>();
+  expect(
+      session.at("control_token_expires_at_utc_ms").get<std::int64_t>() ==
+          initial.utc.value + config.control_token_ttl_ms,
+      "control lease wire expiry is not the injected UTC display value");
+
+  const auto ordinary_message = [&](std::uint64_t sequence) {
+    const auto sampled_at = clock.sample();
+    auto message = mine_teleop::ProtocolMetadata{
+                       mine_teleop::kProtocolVersion,
+                       std::string(kVehicleId),
+                       std::string(kDriverId),
+                       session_id,
+                       sequence,
+                       sampled_at.utc.value}
+                       .to_json();
+    message["sender"] = kVehicleId;
+    message["recipient"] = kDriverId;
+    message["device_token"] = kDeviceToken;
+    message["connection_generation"] = vehicle_generation;
+    message["type"] = "ice_candidate";
+    message["payload"] = {{"candidate", "candidate:dual-clock-" + std::to_string(sequence)}};
+    return message;
+  };
+  const auto control_message = [&](std::uint64_t sequence) {
+    const auto sampled_at = clock.sample();
+    mine_teleop::ControlCommand command;
+    command.vehicle_id = kVehicleId;
+    command.driver_id = kDriverId;
+    command.session_id = session_id;
+    command.seq = sequence;
+    command.sent_at_utc_ms = sampled_at.utc.value;
+    command.gear = "N";
+    command.control_token = control_token;
+    auto payload = command.to_json();
+    payload["intent_seq"] = sequence;
+    payload["intent_fresh"] = true;
+    auto message = mine_teleop::ProtocolMetadata{
+                       command.protocol_version,
+                       command.vehicle_id,
+                       command.driver_id,
+                       command.session_id,
+                       command.seq,
+                       command.sent_at_utc_ms}
+                       .to_json();
+    message["sender"] = kDriverId;
+    message["recipient"] = kVehicleId;
+    message["token"] = driver_token;
+    message["type"] = "control_command";
+    message["payload"] = std::move(payload);
+    return message;
+  };
+  const auto post_signaling = [&](const mine_teleop::Json& message) {
+    return post("/signaling/" + session_id + "/messages", message);
+  };
+  const auto driver_messages = [&] {
+    return get(
+        "/signaling/" + session_id + "/messages",
+        {{"recipient", std::string(kDriverId)}, {"token", driver_token}});
+  };
+  const auto vehicle_messages = [&] {
+    return get(
+        "/signaling/" + session_id + "/messages",
+        {{"recipient", std::string(kVehicleId)},
+         {"device_token", std::string(kDeviceToken)},
+         {"connection_generation", std::to_string(vehicle_generation)},
+         {"types", "control_command"}});
+  };
+
+  expect(post_signaling(ordinary_message(1)).status == 200, "ordinary message was not queued");
+  expect(post_signaling(control_message(1)).status == 200, "native control message was not queued");
+
+  clock.jump_utc(60'000);
+  expect(
+      get(
+          "/sessions/" + session_id,
+          {{"actor", std::string(kDriverId)}, {"token", driver_token}})
+              .status == 200,
+      "UTC forward jump prematurely expired the control lease");
+  const auto online_vehicles = get(
+      "/drivers/" + std::string(kDriverId) + "/vehicles",
+      {{"token", driver_token}});
+  expect(
+      online_vehicles.status == 200 &&
+          mine_teleop::Json::parse(online_vehicles.body).at("vehicles").at(0).value("online", false),
+      "UTC forward jump prematurely expired vehicle presence");
+  const auto heartbeat = post(
+      "/vehicles/heartbeat",
+      {{"vehicle_id", kVehicleId},
+       {"device_token", kDeviceToken},
+       {"connection_generation", vehicle_generation}});
+  expect(
+      heartbeat.status == 200 &&
+          mine_teleop::Json::parse(heartbeat.body).at("last_seen_at_utc_ms").get<std::int64_t>() ==
+              clock.sample().utc.value,
+      "heartbeat wire timestamp did not retain injected UTC semantics");
+  const auto queued_ordinary = driver_messages();
+  expect(
+      queued_ordinary.status == 200 &&
+          mine_teleop::Json::parse(queued_ordinary.body).at("messages").size() == 1,
+      "UTC forward jump prematurely expired an ordinary signaling message");
+  const auto queued_native = vehicle_messages();
+  expect(
+      queued_native.status == 200 &&
+          mine_teleop::Json::parse(queued_native.body).at("messages").size() == 1,
+      "UTC forward jump prematurely expired a native control mailbox message");
+
+  clock.jump_utc(-120'000);
+  const auto backward_utc_ms = clock.sample().utc.value;
+  expect(post_signaling(ordinary_message(2)).status == 200, "ordinary message after UTC rollback was rejected");
+  expect(post_signaling(control_message(2)).status == 200, "native message after UTC rollback was rejected");
+
+  std::ifstream audit_input(audit_path);
+  bool observed_backward_utc_audit = false;
+  std::string audit_line;
+  while (std::getline(audit_input, audit_line)) {
+    const auto record = mine_teleop::Json::parse(audit_line);
+    observed_backward_utc_audit = observed_backward_utc_audit ||
+        record.value("sent_at_utc_ms", std::int64_t{0}) == backward_utc_ms;
+  }
+  expect(observed_backward_utc_audit, "audit records did not retain injected UTC timestamps after rollback");
+
+  clock.advance_monotonic(config.signaling_message_ttl_ms);
+  const auto expired_ordinary = driver_messages();
+  const auto expired_native = vehicle_messages();
+  expect(
+      expired_ordinary.status == 200 &&
+          mine_teleop::Json::parse(expired_ordinary.body).at("messages").empty() &&
+          expired_native.status == 200 &&
+          mine_teleop::Json::parse(expired_native.body).at("messages").empty(),
+      "message TTL did not follow monotonic time after UTC discontinuities");
+
+  clock.advance_monotonic(config.control_token_ttl_ms - config.signaling_message_ttl_ms - 1);
+  expect(
+      get(
+          "/sessions/" + session_id,
+          {{"actor", std::string(kDriverId)}, {"token", driver_token}})
+              .status == 200,
+      "control lease expired before its monotonic deadline");
+  clock.advance_monotonic(1);
+  expect(
+      get(
+          "/sessions/" + session_id,
+          {{"actor", std::string(kDriverId)}, {"token", driver_token}})
+              .status == 409,
+      "control lease remained active beyond its monotonic deadline");
+
+  clock.advance_monotonic(
+      config.vehicle_heartbeat_timeout_ms - config.control_token_ttl_ms +
+      config.signaling_message_ttl_ms);
+  const auto expired_presence = get(
+      "/drivers/" + std::string(kDriverId) + "/vehicles",
+      {{"token", driver_token}});
+  expect(
+      expired_presence.status == 200 &&
+          !mine_teleop::Json::parse(expired_presence.body).at("vehicles").at(0).value("online", true),
+      "vehicle presence did not expire on its monotonic heartbeat deadline");
+  clock.advance_monotonic(
+      config.token_ttl_ms - config.vehicle_heartbeat_timeout_ms -
+      config.signaling_message_ttl_ms);
+  expect(
+      get(
+          "/drivers/" + std::string(kDriverId) + "/vehicles",
+          {{"token", driver_token}})
+              .status == 401,
+      "driver token did not expire on its monotonic deadline");
+  std::filesystem::remove(audit_path);
+
+  FakeDualClock api_clock;
+  auto api_config = legacy_signaling_config();
+  api_config.api_rate_limit_requests = 1;
+  api_config.api_rate_limit_window_ms = 1'000;
+  mine_teleop::SignalingService api_service(
+      api_config,
+      {},
+      [&api_clock] { return api_clock.sample(); });
+  const auto health_request = [&] {
+    mine_teleop::HttpRequest request;
+    request.method = "GET";
+    request.target = "/health";
+    request.path = request.target;
+    request.peer_address = "203.0.113.90";
+    return api_service.handle(request);
+  };
+  expect(health_request().status == 200 && health_request().status == 429, "API rate window was not enforced");
+  api_clock.jump_utc(60'000);
+  expect(health_request().status == 429, "UTC forward jump reset the API rate window");
+  api_clock.jump_utc(-120'000);
+  expect(health_request().status == 429, "UTC rollback reset the API rate window");
+  api_clock.advance_monotonic(api_config.api_rate_limit_window_ms);
+  expect(health_request().status == 200, "API rate window did not recover on monotonic expiry");
+
+  FakeDualClock login_clock;
+  auto login_config = legacy_signaling_config();
+  login_config.driver_passwords = {{std::string(kDriverId), std::string(kDriverPassword)}};
+  login_config.device_tokens = {{std::string(kVehicleId), std::string(kDeviceToken)}};
+  login_config.driver_vehicle_permissions = {{std::string(kDriverId), {std::string(kVehicleId)}}};
+  login_config.login_max_failures = 3;
+  login_config.login_failure_window_ms = 1'000;
+  login_config.login_lockout_ms = 1'000;
+  mine_teleop::SignalingService login_service(
+      login_config,
+      {},
+      [&login_clock] { return login_clock.sample(); });
+  const auto login_attempt = [&](std::string_view password) {
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.target = "/auth/driver_login";
+    request.path = request.target;
+    request.peer_address = "192.0.2.90";
+    request.body = mine_teleop::Json(
+        {{"driver_id", kDriverId}, {"password", std::string(password)}})
+                       .dump();
+    return login_service.handle(request);
+  };
+  expect(login_attempt("wrong-one").status == 401, "first fake-clock login failure was not recorded");
+  login_clock.jump_utc(60'000);
+  expect(login_attempt("wrong-two").status == 401, "UTC forward jump reset the pending login failure window");
+  login_clock.jump_utc(-120'000);
+  expect(login_attempt("wrong-three").status == 429, "UTC rollback reset the login failure window");
+  expect(login_attempt(kDriverPassword).status == 429, "UTC rollback shortened the login lockout");
+  login_clock.advance_monotonic(login_config.login_lockout_ms - 1);
+  expect(login_attempt(kDriverPassword).status == 429, "login lockout expired before its monotonic deadline");
+  login_clock.advance_monotonic(1);
+  expect(login_attempt(kDriverPassword).status == 200, "login lockout did not expire on its monotonic deadline");
+
+  const auto sampler_audit_path = std::filesystem::temp_directory_path() /
+      ("mine-teleop-throwing-sampler-audit-" + mine_teleop::random_token(6) + ".jsonl");
+  auto sampler_audit_config = legacy_signaling_config();
+  sampler_audit_config.driver_passwords = {{"driver-console-001", "dev-password"}};
+  sampler_audit_config.device_tokens = {{"vehicle-001", "dev-device-secret"}};
+  sampler_audit_config.driver_vehicle_permissions = {
+      {"driver-console-001", {"vehicle-001"}}};
+  sampler_audit_config.audit_log_path = sampler_audit_path.string();
+  sampler_audit_config.connection_reaper_interval_ms = 60 * 1000;
+  std::atomic<int> audit_clock_calls{0};
+  std::atomic<int> sampler_calls{0};
+  {
+    mine_teleop::SignalingService sampler_audit_service(
+        sampler_audit_config,
+        [&audit_clock_calls]() -> std::int64_t {
+          if (audit_clock_calls.fetch_add(1, std::memory_order_relaxed) == 0) {
+            return 1'700'000'000'000;
+          }
+          throw std::runtime_error("test audit clock failure");
+        },
+        [&sampler_calls]() -> mine_teleop::ClockSample {
+          if (sampler_calls.fetch_add(1, std::memory_order_relaxed) == 0) {
+            return {
+                mine_teleop::UtcMillis{1'700'000'000'000},
+                mine_teleop::MonotonicMillis{0}};
+          }
+          throw std::runtime_error("test clock sampler failure");
+        });
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.target = "/vehicles/online";
+    request.path = request.target;
+    request.peer_address = "192.0.2.91";
+    request.body = mine_teleop::Json(
+        {{"vehicle_id", "vehicle-001"},
+         {"device_token", "dev-device-secret"},
+         {"connection_id", "throwing-sampler-audit"}})
+                       .dump();
+    expect(
+        sampler_audit_service.handle(request).status == 200 &&
+            audit_clock_calls.load(std::memory_order_relaxed) >= 2 &&
+            sampler_calls.load(std::memory_order_relaxed) == 1,
+        "audit noexcept fallback invoked a throwing clock sampler or aborted the request");
+  }
+  std::filesystem::remove(sampler_audit_path);
+}
+
 void test_driver_login_failure_rate_limit_and_recovery() {
   auto config = legacy_signaling_config();
   config.driver_passwords = {{"driver-1", "correct-password"}};
@@ -7190,6 +7646,8 @@ int main() {
       {"websocket_connection_budget_transition", test_websocket_connection_budget_transition},
       {"signaling_time_sync_applies_backward_utc_correction",
        test_signaling_time_sync_applies_backward_utc_correction},
+      {"driver_runtime_utc_expiry_maps_to_monotonic_after_resync",
+       test_driver_runtime_utc_expiry_maps_to_monotonic_after_resync},
       {"driver_time_sync_uncertainty_fails_closed_at_production_default",
        test_driver_time_sync_uncertainty_fails_closed_at_production_default},
       {"control_page_contract", test_control_page_contract},
@@ -7245,6 +7703,8 @@ int main() {
       {"signaling_audit_redacts_authenticated_reports", test_signaling_audit_redacts_authenticated_reports},
       {"signaling_audit_failure_does_not_abort_reaper", test_signaling_audit_failure_does_not_abort_reaper},
       {"driver_webrtc_connection_audit_transitions", test_driver_webrtc_connection_audit_transitions},
+      {"signaling_dual_clock_deadlines_ignore_wall_clock_jumps",
+       test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps},
       {"driver_login_failure_rate_limit_and_recovery", test_driver_login_failure_rate_limit_and_recovery},
       {"request_correlation_ids", test_request_correlation_ids},
       {"source_aware_api_and_websocket_rate_limit", test_source_aware_api_and_websocket_rate_limit},

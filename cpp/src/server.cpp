@@ -1,6 +1,7 @@
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/credentials.hpp"
 #include "mine_teleop/control_logic_js.hpp"
+#include "mine_teleop/detail/clock_deadline.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -715,15 +716,17 @@ double required_nonnegative_number(const Json& value, std::string_view key) {
   return parsed;
 }
 
-std::int64_t control_lease_renew_at(std::int64_t now_ms, std::int64_t expires_at_ms) {
-  if (expires_at_ms <= now_ms) return now_ms;
-  return now_ms + (expires_at_ms - now_ms) / 3;
+std::int64_t control_lease_renew_at(
+    MonotonicMillis received_at,
+    MonotonicMillis expires_at) {
+  if (expires_at.value <= received_at.value) return received_at.value;
+  return detail::saturating_deadline_ms(
+      received_at.value,
+      (expires_at.value - received_at.value) / 3);
 }
 
 std::int64_t monotonic_now_ms() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
+  return process_monotonic_now_ms().value;
 }
 
 std::string base64_encode(const unsigned char* data, std::size_t size) {
@@ -2390,7 +2393,7 @@ Json SignalingService::Session::to_json(bool include_control_token) const {
   };
   if (include_control_token && !control_token.empty()) {
     value["control_token"] = control_token;
-    value["control_token_expires_at_utc_ms"] = control_token_expires_at_ms;
+    value["control_token_expires_at_utc_ms"] = control_token_expires_at_utc_ms;
   }
   return value;
 }
@@ -2408,10 +2411,12 @@ Json SignalingService::Message::to_json() const {
 
 SignalingService::SignalingService(
     SignalingServerConfig config,
-    std::function<std::int64_t()> audit_clock)
+    std::function<std::int64_t()> audit_clock,
+    ClockSampler clock_sampler)
     : config_(std::move(config)),
       service_instance_id_("service-" + random_token(12)),
-      audit_clock_(std::move(audit_clock)) {
+      audit_clock_(std::move(audit_clock)),
+      clock_sampler_(std::move(clock_sampler)) {
   if (config_.token_ttl_ms <= 0) throw std::invalid_argument("driver token TTL must be positive");
   if (config_.control_token_ttl_ms <= 0) throw std::invalid_argument("control token TTL must be positive");
   if (config_.vehicle_heartbeat_timeout_ms <= 0 || config_.driver_heartbeat_timeout_ms <= 0 ||
@@ -2544,8 +2549,9 @@ SignalingService::SignalingService(
       std::this_thread::sleep_for(std::chrono::milliseconds(config_.connection_reaper_interval_ms));
       if (stop_token.stop_requested()) break;
       try {
+        const auto now = clock_sample();
         std::lock_guard lock(mutex_);
-        cleanup_expired_connections(now_ms());
+        cleanup_expired_connections(now);
         connection_reaper_healthy_.store(true);
       } catch (const std::exception& error) {
         connection_reaper_healthy_.store(false);
@@ -2558,6 +2564,10 @@ SignalingService::SignalingService(
       }
     }
   });
+}
+
+ClockSample SignalingService::clock_sample() const {
+  return clock_sampler_ ? clock_sampler_() : ClockSample{utc_now_ms(), process_monotonic_now_ms()};
 }
 
 SignalingService::~SignalingService() {
@@ -2573,7 +2583,7 @@ Json SignalingService::health() const {
     active_password_verifications = active_password_verifications_;
   }
   std::lock_guard lock(mutex_);
-  const auto timestamp_ms = now_ms();
+  const auto now = clock_sample();
   const auto active_sessions = std::count_if(sessions_.begin(), sessions_.end(), [](const auto& item) {
     return item.second.state == SessionState::Active || item.second.state == SessionState::Degraded;
   });
@@ -2600,11 +2610,18 @@ Json SignalingService::health() const {
     }
   }
   const auto login_locked_buckets = std::count_if(login_failures_.begin(), login_failures_.end(), [&](const auto& item) {
-    return item.second.blocked_until_ms > timestamp_ms;
+    return item.second.blocked_until_monotonic_ms.has_value() &&
+        !detail::monotonic_deadline_reached(
+            now.monotonic,
+            *item.second.blocked_until_monotonic_ms);
   });
   const bool api_rate_limit_overflow_active =
-      api_rate_limit_overflow_.window_started_at_ms > 0 &&
-      timestamp_ms - api_rate_limit_overflow_.window_started_at_ms < config_.api_rate_limit_window_ms;
+      api_rate_limit_overflow_.window_started_at_monotonic_ms.has_value() &&
+      !detail::monotonic_deadline_reached(
+          now.monotonic,
+          detail::saturating_deadline_ms(
+              *api_rate_limit_overflow_.window_started_at_monotonic_ms,
+              config_.api_rate_limit_window_ms));
   Json alerts = Json::array();
   if (login_locked_buckets > 0) {
     alerts.push_back({
@@ -2683,18 +2700,24 @@ const SignalingService::Session& SignalingService::require_participant(
   return session;
 }
 
-void SignalingService::validate_driver_token(std::string_view driver_id, std::string_view token) {
+void SignalingService::validate_driver_token(
+    std::string_view driver_id,
+    std::string_view token,
+    ClockSample now) {
   if (revoked_drivers_.contains(std::string(driver_id))) throw Unauthorized("driver is revoked");
   const auto found = driver_tokens_.find(std::string(token));
   if (token.empty() || found == driver_tokens_.end() || found->second.driver_id != driver_id) {
     throw Unauthorized("invalid driver token");
   }
-  if (now_ms() >= found->second.expires_at_ms) throw Unauthorized("driver token expired");
+  if (detail::monotonic_deadline_reached(now.monotonic, found->second.expires_at_monotonic_ms)) {
+    throw Unauthorized("driver token expired");
+  }
   const auto presence = online_drivers_.find(std::string(driver_id));
   if (presence == online_drivers_.end() || presence->second.generation != found->second.connection_generation) {
     throw Unauthorized("driver connection is no longer current");
   }
-  presence->second.last_seen_at_ms = now_ms();
+  presence->second.last_seen_at_utc_ms = now.utc.value;
+  presence->second.last_seen_at_monotonic_ms = now.monotonic.value;
 }
 
 void SignalingService::validate_device_token(std::string_view vehicle_id, std::string_view token) const {
@@ -2709,7 +2732,8 @@ void SignalingService::validate_device_token(std::string_view vehicle_id, std::s
 void SignalingService::validate_vehicle_connection(
     std::string_view vehicle_id,
     std::string_view token,
-    std::uint64_t connection_generation) {
+    std::uint64_t connection_generation,
+    ClockSample now) {
   validate_device_token(vehicle_id, token);
   const auto found = online_vehicles_.find(std::string(vehicle_id));
   if (found == online_vehicles_.end()) throw Conflict("vehicle is offline", "vehicle_offline");
@@ -2718,17 +2742,23 @@ void SignalingService::validate_vehicle_connection(
         "vehicle connection generation is stale",
         "vehicle_connection_generation_stale");
   }
-  found->second.last_seen_at_ms = now_ms();
+  found->second.last_seen_at_utc_ms = now.utc.value;
+  found->second.last_seen_at_monotonic_ms = now.monotonic.value;
 }
 
-void SignalingService::validate_actor_credential(const Session& session, std::string_view actor, const Json& value) {
+void SignalingService::validate_actor_credential(
+    const Session& session,
+    std::string_view actor,
+    const Json& value,
+    ClockSample now) {
   if (actor == session.driver_id) {
-    validate_driver_token(actor, optional_string(value, "token"));
+    validate_driver_token(actor, optional_string(value, "token"), now);
   } else if (actor == session.vehicle_id) {
     validate_vehicle_connection(
         actor,
         optional_string(value, "device_token"),
-        required_uint64(value, "connection_generation"));
+        required_uint64(value, "connection_generation"),
+        now);
   } else {
     throw Unauthorized("actor is not current session participant");
   }
@@ -2748,10 +2778,10 @@ void SignalingService::close_sessions_for_driver(std::string_view driver_id, std
   }
 }
 
-void SignalingService::cleanup_expired_connections(std::int64_t timestamp_ms) {
-  prune_expired_signaling_messages(timestamp_ms);
+void SignalingService::cleanup_expired_connections(ClockSample now) {
+  prune_expired_signaling_messages(now);
   for (auto token = driver_tokens_.begin(); token != driver_tokens_.end();) {
-    if (timestamp_ms < token->second.expires_at_ms) {
+    if (!detail::monotonic_deadline_reached(now.monotonic, token->second.expires_at_monotonic_ms)) {
       ++token;
       continue;
     }
@@ -2771,15 +2801,21 @@ void SignalingService::cleanup_expired_connections(std::int64_t timestamp_ms) {
 
   for (auto& [id, session] : sessions_) {
     static_cast<void>(id);
-    if (session.state != SessionState::Closed && session.control_token_expires_at_ms > 0 &&
-        timestamp_ms >= session.control_token_expires_at_ms) {
+    if (session.state != SessionState::Closed &&
+        detail::monotonic_deadline_reached(
+            now.monotonic,
+            session.control_token_expires_at_monotonic_ms)) {
       close_session(session, "control_token_expired");
       audit("control_authority_expired", session.to_json());
     }
   }
 
   for (auto iterator = online_vehicles_.begin(); iterator != online_vehicles_.end();) {
-    if (timestamp_ms - iterator->second.last_seen_at_ms < config_.vehicle_heartbeat_timeout_ms) {
+    if (!detail::monotonic_deadline_reached(
+            now.monotonic,
+            detail::saturating_deadline_ms(
+                iterator->second.last_seen_at_monotonic_ms,
+                config_.vehicle_heartbeat_timeout_ms))) {
       ++iterator;
       continue;
     }
@@ -2795,7 +2831,11 @@ void SignalingService::cleanup_expired_connections(std::int64_t timestamp_ms) {
   }
 
   for (auto iterator = online_drivers_.begin(); iterator != online_drivers_.end();) {
-    if (timestamp_ms - iterator->second.last_seen_at_ms < config_.driver_heartbeat_timeout_ms) {
+    if (!detail::monotonic_deadline_reached(
+            now.monotonic,
+            detail::saturating_deadline_ms(
+                iterator->second.last_seen_at_monotonic_ms,
+                config_.driver_heartbeat_timeout_ms))) {
       ++iterator;
       continue;
     }
@@ -2818,17 +2858,51 @@ void SignalingService::cleanup_expired_connections(std::int64_t timestamp_ms) {
   }
 }
 
-void SignalingService::prune_expired_signaling_messages(std::int64_t timestamp_ms) {
+void SignalingService::prune_expired_signaling_messages(ClockSample now) {
   for (auto queue = messages_.begin(); queue != messages_.end();) {
     std::erase_if(queue->second, [&](const auto& message) {
-      return timestamp_ms < message.queued_at_utc_ms ||
-          timestamp_ms - message.queued_at_utc_ms >= config_.signaling_message_ttl_ms;
+      return detail::monotonic_deadline_reached(
+          now.monotonic,
+          detail::saturating_deadline_ms(
+              message.queued_at_monotonic_ms,
+              config_.signaling_message_ttl_ms));
     });
     if (queue->second.empty()) {
       queue = messages_.erase(queue);
     } else {
       ++queue;
     }
+  }
+  for (auto message = latest_control_messages_.begin(); message != latest_control_messages_.end();) {
+    if (!detail::monotonic_deadline_reached(
+            now.monotonic,
+            detail::saturating_deadline_ms(
+                message->second.queued_at_monotonic_ms,
+                config_.native_control_message_ttl_ms))) {
+      ++message;
+      continue;
+    }
+    if (native_control_trace_) {
+      const auto& expired = message->second;
+      native_control_trace_->enqueue({
+          {"stage", "mailbox_expired"},
+          {"trace_session_id", expired.metadata.session_id},
+          {"vehicle_id", expired.metadata.vehicle_id},
+          {"driver_id", expired.metadata.driver_id},
+          {"seq", expired.metadata.seq},
+          {"intent_seq", expired.payload.value("intent_seq", std::uint64_t{0})},
+          {"command_sent_at_utc_ms", expired.metadata.sent_at_utc_ms},
+          {"cloud_queued_at_utc_ms", expired.queued_at_utc_ms},
+          {"cloud_queued_monotonic_ms", expired.queued_at_monotonic_ms},
+          {"cloud_expired_at_utc_ms", now.utc.value},
+          {"cloud_expired_monotonic_ms", now.monotonic.value},
+          {"cloud_mailbox_age_ms", std::max<std::int64_t>(
+                                         0,
+                                         now.monotonic.value - expired.queued_at_monotonic_ms)},
+          {"delivery_cursor", expired.delivery_cursor},
+      });
+    }
+    message = latest_control_messages_.erase(message);
   }
 }
 
@@ -2875,7 +2949,8 @@ void SignalingService::transition_session(Session& session, SessionState next, s
 void SignalingService::close_session(Session& session, std::string_view reason) {
   if (session.state == SessionState::Closed) return;
   session.control_token.clear();
-  session.control_token_expires_at_ms = 0;
+  session.control_token_expires_at_utc_ms = 0;
+  session.control_token_expires_at_monotonic_ms = 0;
   messages_.erase(message_key(session.session_id, session.driver_id));
   messages_.erase(message_key(session.session_id, session.vehicle_id));
   latest_control_messages_.erase(message_key(session.session_id, session.driver_id));
@@ -2911,27 +2986,43 @@ void SignalingService::release_password_verification_slot() noexcept {
 
 SignalingService::LoginFailureReservation SignalingService::reserve_login_failure_locked(
     std::string_view driver_id,
-    std::int64_t admitted_at_ms) {
+    ClockSample admitted_at) {
   const bool known_driver = configured_driver(driver_id);
   const std::string bucket = known_driver ? "driver:" + std::string(driver_id) : "unknown";
   auto& state = login_failures_[bucket];
-  if (state.blocked_until_ms > admitted_at_ms) {
-    throw TooManyRequests("too many login attempts", state.blocked_until_ms - admitted_at_ms);
+  if (state.blocked_until_monotonic_ms.has_value() &&
+      !detail::monotonic_deadline_reached(
+          admitted_at.monotonic,
+          *state.blocked_until_monotonic_ms)) {
+    throw TooManyRequests(
+        "too many login attempts",
+        std::max<std::int64_t>(
+            1,
+            *state.blocked_until_monotonic_ms - admitted_at.monotonic.value));
   }
 
   const bool window_expired =
-      state.window_started_at_ms > 0 &&
-      admitted_at_ms - state.window_started_at_ms >= config_.login_failure_window_ms;
-  if (state.pending_failures == 0 && (state.blocked_until_ms > 0 || window_expired)) {
-    state = LoginFailureState{0, 0, admitted_at_ms, 0};
-  } else if (state.blocked_until_ms > 0) {
+      state.window_started_at_monotonic_ms.has_value() &&
+      detail::monotonic_deadline_reached(
+          admitted_at.monotonic,
+          detail::saturating_deadline_ms(
+              *state.window_started_at_monotonic_ms,
+              config_.login_failure_window_ms));
+  if (state.pending_failures == 0 &&
+      (state.blocked_until_monotonic_ms.has_value() || window_expired)) {
+    state = LoginFailureState{
+        .failures = 0,
+        .pending_failures = 0,
+        .window_started_at_monotonic_ms = admitted_at.monotonic.value};
+  } else if (state.blocked_until_monotonic_ms.has_value()) {
     // This can only occur when an already-expired lockout still has an
     // in-flight candidate. Keep that candidate in its admission window rather
     // than resetting its state based on a later KDF completion.
-    state.blocked_until_ms = 0;
+    state.blocked_until_utc_ms.reset();
+    state.blocked_until_monotonic_ms.reset();
   }
-  if (state.window_started_at_ms == 0) {
-    state.window_started_at_ms = admitted_at_ms;
+  if (!state.window_started_at_monotonic_ms.has_value()) {
+    state.window_started_at_monotonic_ms = admitted_at.monotonic.value;
   }
   if (state.failures >= config_.login_max_failures ||
       state.pending_failures >= config_.login_max_failures - state.failures) {
@@ -2939,7 +3030,10 @@ SignalingService::LoginFailureReservation SignalingService::reserve_login_failur
   }
 
   ++state.pending_failures;
-  return LoginFailureReservation{bucket, admitted_at_ms};
+  return LoginFailureReservation{
+      bucket,
+      admitted_at.utc.value,
+      admitted_at.monotonic.value};
 }
 
 void SignalingService::release_login_failure_reservation_locked(
@@ -2949,7 +3043,8 @@ void SignalingService::release_login_failure_reservation_locked(
   auto& state = found->second;
   if (state.pending_failures <= 0) return;
   --state.pending_failures;
-  if (state.pending_failures == 0 && state.failures == 0 && state.blocked_until_ms == 0) {
+  if (state.pending_failures == 0 && state.failures == 0 &&
+      !state.blocked_until_monotonic_ms.has_value()) {
     login_failures_.erase(found);
   }
 }
@@ -2957,31 +3052,37 @@ void SignalingService::release_login_failure_reservation_locked(
 void SignalingService::record_login_failure_locked(
     std::string_view driver_id,
     const LoginFailureReservation& reservation,
-    std::int64_t settled_at_ms) {
+    ClockSample settled_at) {
   const bool known_driver = configured_driver(driver_id);
   auto found = login_failures_.find(reservation.bucket);
   if (found == login_failures_.end()) {
     found = login_failures_
                 .emplace(
                     reservation.bucket,
-                    LoginFailureState{0, 1, reservation.admitted_at_ms, 0})
+                    LoginFailureState{
+                        .failures = 0,
+                        .pending_failures = 1,
+                        .window_started_at_monotonic_ms = reservation.admitted_at_monotonic_ms})
                 .first;
   }
   auto& state = found->second;
   if (state.pending_failures <= 0) {
     state.pending_failures = 1;
-    state.window_started_at_ms = reservation.admitted_at_ms;
+    state.window_started_at_monotonic_ms = reservation.admitted_at_monotonic_ms;
   }
   --state.pending_failures;
-  if (state.window_started_at_ms == 0) {
-    state.window_started_at_ms = reservation.admitted_at_ms;
+  if (!state.window_started_at_monotonic_ms.has_value()) {
+    state.window_started_at_monotonic_ms = reservation.admitted_at_monotonic_ms;
   }
   ++state.failures;
   const bool lock_login = state.failures >= config_.login_max_failures;
   if (lock_login) {
-    state.blocked_until_ms = config_.login_lockout_ms > std::numeric_limits<std::int64_t>::max() - settled_at_ms
-        ? std::numeric_limits<std::int64_t>::max()
-        : settled_at_ms + config_.login_lockout_ms;
+    state.blocked_until_utc_ms = detail::saturating_deadline_ms(
+        settled_at.utc.value,
+        config_.login_lockout_ms);
+    state.blocked_until_monotonic_ms = detail::saturating_deadline_ms(
+        settled_at.monotonic.value,
+        config_.login_lockout_ms);
   }
   const Json identity = known_driver
       ? Json{{"driver_id", std::string(driver_id)}, {"recognized_driver", true}}
@@ -2994,7 +3095,7 @@ void SignalingService::record_login_failure_locked(
 
   auto limited_details = identity;
   limited_details["failure_count"] = state.failures;
-  limited_details["blocked_until_utc_ms"] = state.blocked_until_ms;
+  limited_details["blocked_until_utc_ms"] = state.blocked_until_utc_ms.value_or(0);
   audit("driver_login_rate_limited", limited_details);
   throw TooManyRequests("too many login attempts", config_.login_lockout_ms);
 }
@@ -3007,7 +3108,8 @@ void SignalingService::clear_login_failures_locked(std::string_view driver_id) {
     return;
   }
   found->second.failures = 0;
-  found->second.blocked_until_ms = 0;
+  found->second.blocked_until_utc_ms.reset();
+  found->second.blocked_until_monotonic_ms.reset();
 }
 
 std::string SignalingService::request_source(const HttpRequest& request) const {
@@ -3024,20 +3126,28 @@ std::string SignalingService::request_source(const HttpRequest& request) const {
   return canonical_ip_address(candidate).value_or(peer);
 }
 
-void SignalingService::cleanup_api_rate_limits(std::int64_t timestamp_ms) {
+void SignalingService::cleanup_api_rate_limits(MonotonicMillis now) {
   const auto expired = [&](const ApiRateState& state) {
-    return state.window_started_at_ms == 0 || timestamp_ms < state.window_started_at_ms ||
-        timestamp_ms - state.window_started_at_ms >= config_.api_rate_limit_window_ms;
+    return !state.window_started_at_monotonic_ms.has_value() ||
+        detail::monotonic_deadline_reached(
+            now,
+            detail::saturating_deadline_ms(
+                *state.window_started_at_monotonic_ms,
+                config_.api_rate_limit_window_ms));
   };
   std::erase_if(api_rate_limits_, [&](const auto& item) { return expired(item.second); });
   if (expired(api_rate_limit_overflow_)) api_rate_limit_overflow_ = {};
-  api_rate_limit_last_cleanup_ms_ = timestamp_ms;
+  api_rate_limit_last_cleanup_monotonic_ms_ = now.value;
 }
 
-void SignalingService::enforce_api_rate_limit(const HttpRequest& request, std::int64_t timestamp_ms) {
-  if (api_rate_limit_last_cleanup_ms_ == 0 || timestamp_ms < api_rate_limit_last_cleanup_ms_ ||
-      timestamp_ms - api_rate_limit_last_cleanup_ms_ >= config_.api_rate_limit_window_ms) {
-    cleanup_api_rate_limits(timestamp_ms);
+void SignalingService::enforce_api_rate_limit(const HttpRequest& request, MonotonicMillis now) {
+  if (!api_rate_limit_last_cleanup_monotonic_ms_.has_value() ||
+      detail::monotonic_deadline_reached(
+          now,
+          detail::saturating_deadline_ms(
+              *api_rate_limit_last_cleanup_monotonic_ms_,
+              config_.api_rate_limit_window_ms))) {
+    cleanup_api_rate_limits(now);
   }
 
   const auto source = request_source(request);
@@ -3053,15 +3163,21 @@ void SignalingService::enforce_api_rate_limit(const HttpRequest& request, std::i
     state = &api_rate_limits_.try_emplace(source).first->second;
   }
 
-  if (state->window_started_at_ms == 0 || timestamp_ms < state->window_started_at_ms ||
-      timestamp_ms - state->window_started_at_ms >= config_.api_rate_limit_window_ms) {
-    *state = ApiRateState{0, timestamp_ms, false};
+  if (!state->window_started_at_monotonic_ms.has_value() ||
+      detail::monotonic_deadline_reached(
+          now,
+          detail::saturating_deadline_ms(
+              *state->window_started_at_monotonic_ms,
+              config_.api_rate_limit_window_ms))) {
+    *state = ApiRateState{0, now.value, false};
   }
   if (state->requests < std::numeric_limits<std::int64_t>::max()) ++state->requests;
   if (state->requests <= config_.api_rate_limit_requests) return;
 
   if (api_rate_limited_requests_ < std::numeric_limits<std::uint64_t>::max()) ++api_rate_limited_requests_;
-  const auto elapsed = std::max<std::int64_t>(0, timestamp_ms - state->window_started_at_ms);
+  const auto elapsed = std::max<std::int64_t>(
+      0,
+      now.value - *state->window_started_at_monotonic_ms);
   const auto retry_after_ms = std::max<std::int64_t>(1, config_.api_rate_limit_window_ms - elapsed);
   if (!state->limit_audited) {
     state->limit_audited = true;
@@ -3078,7 +3194,7 @@ void SignalingService::enforce_api_rate_limit(const HttpRequest& request, std::i
 bool SignalingService::audit(std::string_view event, const Json& details) const noexcept {
   if (config_.audit_log_path.empty()) return true;
   try {
-    const auto timestamp_ms = audit_clock_ ? audit_clock_() : now_ms();
+    const auto timestamp_ms = audit_clock_ ? audit_clock_() : clock_sample().utc.value;
     const auto max_bytes = static_cast<std::uint64_t>(config_.audit_log_max_bytes);
     Json record = {
         {"event", event},
@@ -3128,11 +3244,29 @@ bool SignalingService::audit(std::string_view event, const Json& details) const 
   } catch (...) {
     audit_healthy_.store(false);
     audit_write_failures_.fetch_add(1);
-    const auto timestamp_ms = now_ms();
-    auto last_report_ms = audit_last_fallback_report_ms_.load();
-    if ((last_report_ms == 0 || timestamp_ms - last_report_ms >= 60 * 1000) &&
-        audit_last_fallback_report_ms_.compare_exchange_strong(last_report_ms, timestamp_ms)) {
-      std::cerr << "mine-teleop-signaling: audit log unavailable; new control sessions are disabled\n";
+    try {
+      // Do not invoke the injected sampler again here: this noexcept recovery
+      // path must remain non-terminating when the sampler itself is faulty.
+      const auto now = process_monotonic_now_ms();
+      bool report = false;
+      {
+        std::lock_guard fallback_lock(audit_fallback_mutex_);
+        if (!audit_last_fallback_report_has_monotonic_ ||
+            detail::monotonic_deadline_reached(
+                now,
+                detail::saturating_deadline_ms(
+                    audit_last_fallback_report_monotonic_ms_,
+                    60 * 1000))) {
+          audit_last_fallback_report_monotonic_ms_ = now.value;
+          audit_last_fallback_report_has_monotonic_ = true;
+          report = true;
+        }
+      }
+      if (report) {
+        std::cerr << "mine-teleop-signaling: audit log unavailable; new control sessions are disabled\n";
+      }
+    } catch (...) {
+      // Keep the audit failure path noexcept even if a diagnostic sink fails.
     }
     return false;
   }
@@ -3142,14 +3276,15 @@ ServerResponse SignalingService::handle(const HttpRequest& request) {
   RequestIdScope request_id("request-" + random_token(12));
   ServerResponse response;
   try {
+    const auto now = clock_sample();
     {
       std::lock_guard lock(mutex_);
-      enforce_api_rate_limit(request, now_ms());
+      enforce_api_rate_limit(request, now.monotonic);
     }
     if (request.method == "GET") {
-      response = handle_get(request);
+      response = handle_get(request, now);
     } else if (request.method == "POST") {
-      response = handle_post(request);
+      response = handle_post(request, now);
     } else {
       response = ServerResponse::json(405, {{"error", "method not allowed"}});
     }
@@ -3194,8 +3329,9 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
     return true;
   };
   try {
+    const auto now = clock_sample();
     std::lock_guard lock(mutex_);
-    enforce_api_rate_limit(request, now_ms());
+    enforce_api_rate_limit(request, now.monotonic);
   } catch (const TooManyRequests& error) {
     try {
       auto response = too_many_requests_response(error);
@@ -3227,10 +3363,11 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       {"device_token", credential_value(request, "device_token", "x-mine-teleop-device-token")},
       {"connection_generation", query_value(request, "connection_generation")}};
   auto authenticate = [&] {
+    const auto now = clock_sample();
     std::lock_guard lock(mutex_);
-    cleanup_expired_connections(now_ms());
+    cleanup_expired_connections(now);
     const auto& session = require_participant(parts[1], participant);
-    validate_actor_credential(session, participant, credentials);
+    validate_actor_credential(session, participant, credentials, now);
     if (send_only && participant != session.driver_id) {
       throw Unauthorized("send-only signaling is restricted to the session driver");
     }
@@ -3292,20 +3429,31 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
             accept + "\r\nX-Request-ID: " + request_id.value() + "\r\n\r\n");
     ServerWebSocketConnection connection(socket, config_.max_signaling_payload_bytes);
     std::uint64_t last_delivery_cursor_sent = 0;
-    auto last_delivery_sent_at = std::chrono::steady_clock::time_point{};
+    std::int64_t last_delivery_sent_at_monotonic_ms = 0;
     while (true) {
       Json pending = Json::array();
+      std::int64_t pending_control_queued_at_monotonic_ms = 0;
       try {
+        const auto now = clock_sample();
         std::lock_guard lock(mutex_);
-        cleanup_expired_connections(now_ms());
+        cleanup_expired_connections(now);
         const auto& session = require_participant(parts[1], participant);
-        validate_actor_credential(session, participant, credentials);
+        validate_actor_credential(session, participant, credentials, now);
         if (!send_only) {
           pending = take_signaling_messages(
               parts[1],
               participant,
+              now,
               control_receive_only ? std::string_view("control_command") : std::string_view{},
               false);
+          if (control_receive_only && !pending.empty()) {
+            const auto queued = latest_control_messages_.find(message_key(parts[1], participant));
+            if (queued != latest_control_messages_.end() &&
+                queued->second.delivery_cursor ==
+                    pending.back().value("delivery_cursor", std::uint64_t{0})) {
+              pending_control_queued_at_monotonic_ms = queued->second.queued_at_monotonic_ms;
+            }
+          }
         }
       } catch (const std::exception& error) {
         connection.send_json({{"error", error.what()}, {"event", "signaling_authority_lost"}});
@@ -3314,9 +3462,11 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       }
       if (!send_only && !pending.empty()) {
         const auto delivery_cursor = pending.back().value("delivery_cursor", std::uint64_t{0});
-        const auto timestamp = std::chrono::steady_clock::now();
+        const auto send_clock = clock_sample();
         if (delivery_cursor > last_delivery_cursor_sent ||
-            timestamp - last_delivery_sent_at >= std::chrono::milliseconds(500)) {
+            detail::monotonic_deadline_reached(
+                send_clock.monotonic,
+                detail::saturating_deadline_ms(last_delivery_sent_at_monotonic_ms, 500))) {
           Json delivery_trace;
           const bool trace_delivery = control_receive_only && native_control_trace_;
           if (trace_delivery) {
@@ -3331,12 +3481,16 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                 {"intent_seq", payload.value("intent_seq", std::uint64_t{0})},
                 {"command_sent_at_utc_ms", message.value("sent_at_utc_ms", std::int64_t{0})},
                 {"cloud_queued_at_utc_ms", message.value("queued_at_utc_ms", std::int64_t{0})},
+                {"cloud_mailbox_to_send_ms", std::max<std::int64_t>(
+                                                   0,
+                                                   send_clock.monotonic.value -
+                                                       pending_control_queued_at_monotonic_ms)},
                 {"delivery_cursor", delivery_cursor},
                 {"redelivery", delivery_cursor <= last_delivery_cursor_sent},
             };
           }
-          const auto send_started_at_utc_ms = now_ms();
-          const auto send_started_monotonic_ms = monotonic_now_ms();
+          const auto send_started_at_utc_ms = send_clock.utc.value;
+          const auto send_started_monotonic_ms = send_clock.monotonic.value;
           try {
             connection.send_json(
                 {{"event", "signaling_messages"},
@@ -3349,19 +3503,19 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                   send_started_at_utc_ms;
               delivery_trace["cloud_delivery_send_started_monotonic_ms"] =
                   send_started_monotonic_ms;
-              delivery_trace["cloud_delivery_send_failed_at_utc_ms"] = now_ms();
+              const auto failed_at = clock_sample();
+              delivery_trace["cloud_delivery_send_failed_at_utc_ms"] = failed_at.utc.value;
               delivery_trace["cloud_delivery_send_failed_monotonic_ms"] =
-                  monotonic_now_ms();
+                  failed_at.monotonic.value;
               delivery_trace["error"] = error.what();
               native_control_trace_->enqueue(std::move(delivery_trace));
             }
             throw;
           }
-          const auto send_completed_at_utc_ms = now_ms();
-          const auto send_completed_monotonic_ms = monotonic_now_ms();
+          const auto send_completed_at = clock_sample();
+          const auto send_completed_at_utc_ms = send_completed_at.utc.value;
+          const auto send_completed_monotonic_ms = send_completed_at.monotonic.value;
           if (trace_delivery) {
-            const auto queued_at_utc_ms =
-                delivery_trace.value("cloud_queued_at_utc_ms", std::int64_t{0});
             delivery_trace["cloud_delivery_send_started_at_utc_ms"] =
                 send_started_at_utc_ms;
             delivery_trace["cloud_delivery_send_started_monotonic_ms"] =
@@ -3370,9 +3524,6 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                 send_completed_at_utc_ms;
             delivery_trace["cloud_delivery_send_completed_monotonic_ms"] =
                 send_completed_monotonic_ms;
-            delivery_trace["cloud_mailbox_to_send_ms"] = queued_at_utc_ms > 0
-                ? std::max<std::int64_t>(0, send_started_at_utc_ms - queued_at_utc_ms)
-                : 0;
             delivery_trace["cloud_delivery_send_call_ms"] =
                 std::max<std::int64_t>(
                     0,
@@ -3380,7 +3531,7 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
             native_control_trace_->enqueue(std::move(delivery_trace));
           }
           last_delivery_cursor_sent = std::max(last_delivery_cursor_sent, delivery_cursor);
-          last_delivery_sent_at = timestamp;
+          last_delivery_sent_at_monotonic_ms = send_clock.monotonic.value;
         }
       }
 
@@ -3397,18 +3548,21 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       if (received.status == WebSocketReceiveStatus::Closed) return true;
       try {
         const auto serialized_bytes = received.message.dump().size();
-        const auto rate_now = std::chrono::steady_clock::now();
+        const auto rate_now = clock_sample();
         std::optional<std::int64_t> retry_after_ms;
         {
           std::lock_guard lock(mutex_);
-          cleanup_expired_connections(now_ms());
+          cleanup_expired_connections(rate_now);
           const auto& session = require_participant(parts[1], participant);
-          validate_actor_credential(session, participant, credentials);
+          validate_actor_credential(session, participant, credentials, rate_now);
           auto& rate = sessions_.at(parts[1]).websocket_rate_by_participant[participant];
-          const auto rate_window = std::chrono::milliseconds(config_.websocket_rate_limit_window_ms);
-          if (rate.window_started_at == std::chrono::steady_clock::time_point{} ||
-              rate_now - rate.window_started_at >= rate_window) {
-            rate.window_started_at = rate_now;
+          if (!rate.window_started_at_monotonic_ms.has_value() ||
+              detail::monotonic_deadline_reached(
+                  rate_now.monotonic,
+                  detail::saturating_deadline_ms(
+                      *rate.window_started_at_monotonic_ms,
+                      config_.websocket_rate_limit_window_ms))) {
+            rate.window_started_at_monotonic_ms = rate_now.monotonic.value;
             rate.messages = 0;
             rate.bytes = 0;
           }
@@ -3416,8 +3570,9 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
           const bool byte_limit = serialized_bytes > config_.websocket_rate_limit_bytes -
               std::min(rate.bytes, config_.websocket_rate_limit_bytes);
           if (message_limit || byte_limit) {
-            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                rate_now - rate.window_started_at).count();
+            const auto elapsed_ms = std::max<std::int64_t>(
+                0,
+                rate_now.monotonic.value - *rate.window_started_at_monotonic_ms);
             retry_after_ms = std::max<std::int64_t>(
                 1,
                 config_.websocket_rate_limit_window_ms - elapsed_ms);
@@ -3450,15 +3605,16 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
           if (delivery_cursor > last_delivery_cursor_sent) {
             throw std::invalid_argument("delivery acknowledgement exceeds the last delivered cursor");
           }
-          const auto ack_received_at_utc_ms = now_ms();
-          const auto ack_received_monotonic_ms = monotonic_now_ms();
+          const auto ack_received_at = clock_sample();
+          const auto ack_received_at_utc_ms = ack_received_at.utc.value;
+          const auto ack_received_monotonic_ms = ack_received_at.monotonic.value;
           std::size_t acknowledged = 0;
           Json acknowledgement_trace;
           {
             std::lock_guard lock(mutex_);
-            cleanup_expired_connections(now_ms());
+            cleanup_expired_connections(ack_received_at);
             const auto& session = require_participant(parts[1], participant);
-            validate_actor_credential(session, participant, credentials);
+            validate_actor_credential(session, participant, credentials, ack_received_at);
             if (control_receive_only && native_control_trace_) {
               acknowledgement_trace = {
                   {"stage", "delivery_ack_received"},
@@ -3487,7 +3643,7 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                 acknowledgement_trace["cloud_queue_to_vehicle_ack_ms"] =
                     std::max<std::int64_t>(
                         0,
-                        ack_received_at_utc_ms - queued->second.queued_at_utc_ms);
+                        ack_received_monotonic_ms - queued->second.queued_at_monotonic_ms);
               }
             }
             acknowledged = acknowledge_signaling_messages(
@@ -3512,15 +3668,20 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
         }
         Json acknowledgement;
         {
+          const auto received_at = clock_sample();
           std::lock_guard lock(mutex_);
-          cleanup_expired_connections(now_ms());
+          cleanup_expired_connections(received_at);
           const auto& session = require_participant(parts[1], participant);
-          validate_actor_credential(session, participant, credentials);
+          validate_actor_credential(session, participant, credentials, received_at);
           if (send_only && received.message.value("type", "") != "control_command") {
             throw std::invalid_argument(
                 "send-only control WebSocket accepts control_command messages only");
           }
-          acknowledgement = enqueue_signaling_message(parts[1], received.message, participant);
+          acknowledgement = enqueue_signaling_message(
+              parts[1],
+              received.message,
+              received_at,
+              participant);
         }
         connection.send_json(acknowledgement);
       } catch (const TooManyRequests& error) {
@@ -3540,10 +3701,11 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
 Json SignalingService::take_signaling_messages(
     std::string_view session_id,
     std::string_view recipient,
+    ClockSample now,
     std::string_view requested_types,
     bool consume) {
   Json values = Json::array();
-  prune_expired_signaling_messages(now_ms());
+  prune_expired_signaling_messages(now);
   std::vector<std::string> types;
   std::size_t start = 0;
   while (start <= requested_types.size()) {
@@ -3560,52 +3722,13 @@ Json SignalingService::take_signaling_messages(
         std::find(types.begin(), types.end(), type) != types.end();
   };
   const auto recipient_key = message_key(session_id, recipient);
-  const auto timestamp_monotonic_ms = monotonic_now_ms();
-
   auto latest_control = latest_control_messages_.find(recipient_key);
-  if (latest_control != latest_control_messages_.end() &&
-      timestamp_monotonic_ms - latest_control->second.queued_at_monotonic_ms >=
-          config_.native_control_message_ttl_ms) {
-    if (native_control_trace_) {
-      const auto& expired = latest_control->second;
-      native_control_trace_->enqueue({
-          {"stage", "mailbox_expired"},
-          {"trace_session_id", expired.metadata.session_id},
-          {"vehicle_id", expired.metadata.vehicle_id},
-          {"driver_id", expired.metadata.driver_id},
-          {"seq", expired.metadata.seq},
-          {"intent_seq", expired.payload.value("intent_seq", std::uint64_t{0})},
-          {"command_sent_at_utc_ms", expired.metadata.sent_at_utc_ms},
-          {"cloud_queued_at_utc_ms", expired.queued_at_utc_ms},
-          {"cloud_queued_monotonic_ms", expired.queued_at_monotonic_ms},
-          {"cloud_expired_at_utc_ms", now_ms()},
-          {"cloud_expired_monotonic_ms", timestamp_monotonic_ms},
-          {"cloud_mailbox_age_ms", std::max<std::int64_t>(
-                                           0,
-                                           timestamp_monotonic_ms -
-                                               expired.queued_at_monotonic_ms)},
-          {"delivery_cursor", expired.delivery_cursor},
-      });
-    }
-    latest_control_messages_.erase(latest_control);
-    latest_control = latest_control_messages_.end();
-  }
   if (latest_control != latest_control_messages_.end() && requested("control_command")) {
     values.push_back(latest_control->second.to_json());
     if (consume) latest_control_messages_.erase(latest_control);
   }
 
   auto found = messages_.find(recipient_key);
-  if (found != messages_.end()) {
-    std::erase_if(found->second, [&](const auto& message) {
-      return timestamp_monotonic_ms - message.queued_at_monotonic_ms >=
-          config_.signaling_message_ttl_ms;
-    });
-    if (found->second.empty()) {
-      messages_.erase(found);
-      found = messages_.end();
-    }
-  }
   if (found != messages_.end()) {
     std::vector<Message> remaining;
     for (const auto& message : found->second) {
@@ -3660,9 +3783,10 @@ std::size_t SignalingService::acknowledge_signaling_messages(
 Json SignalingService::enqueue_signaling_message(
     std::string_view session_id,
     const Json& value,
+    ClockSample received_at,
     std::optional<std::string_view> authenticated_actor) {
-  const auto cloud_ingress_started_at_utc_ms = now_ms();
-  const auto cloud_ingress_started_monotonic_ms = monotonic_now_ms();
+  const auto cloud_ingress_started_at_utc_ms = received_at.utc.value;
+  const auto cloud_ingress_started_monotonic_ms = received_at.monotonic.value;
   const auto sender = required_string(value, "sender");
   const auto recipient = required_string(value, "recipient");
   const auto type = required_string(value, "type");
@@ -3678,7 +3802,7 @@ Json SignalingService::enqueue_signaling_message(
       throw Unauthorized("sender is not authenticated websocket participant");
     }
   } else {
-    validate_actor_credential(session, sender, value);
+    validate_actor_credential(session, sender, value, received_at);
   }
   const auto metadata = ProtocolMetadata::from_json(value);
   validate_message_metadata(session, metadata);
@@ -3796,9 +3920,10 @@ Json SignalingService::enqueue_signaling_message(
       replaced_queued_at_utc_ms = previous->second.queued_at_utc_ms;
     }
   }
-  const auto cloud_queued_at_utc_ms = now_ms();
-  const auto cloud_queued_monotonic_ms = monotonic_now_ms();
-  prune_expired_signaling_messages(cloud_queued_at_utc_ms);
+  const auto queued_at = clock_sample();
+  const auto cloud_queued_at_utc_ms = queued_at.utc.value;
+  const auto cloud_queued_monotonic_ms = queued_at.monotonic.value;
+  prune_expired_signaling_messages(queued_at);
   const auto serialized_bytes = value.dump().size();
   std::size_t queue_bytes = 0;
   if (type != "control_command") {
@@ -3912,10 +4037,10 @@ Json SignalingService::enqueue_signaling_message(
   return acknowledgement;
 }
 
-ServerResponse SignalingService::handle_get(const HttpRequest& request) {
+ServerResponse SignalingService::handle_get(const HttpRequest& request, ClockSample now) {
   if (request.path == "/health") return ServerResponse::json(200, health());
   if (request.path == "/time") {
-    const auto server_receive_ms = now_ms();
+    const auto server_receive_ms = now.utc.value;
     const auto encoded_client_send_ms = query_value(request, "client_send_ms");
     if (encoded_client_send_ms.empty()) throw std::invalid_argument("client_send_ms is required");
     std::size_t consumed = 0;
@@ -3930,19 +4055,20 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
     }
     return ServerResponse::json(
         200,
-        {{"time_domain", "signaling_server"},
+         {{"time_domain", "signaling_server"},
          {"client_send_ms", client_send_ms},
          {"server_receive_ms", server_receive_ms},
-         {"server_send_ms", now_ms()}});
+         {"server_send_ms", clock_sample().utc.value}});
   }
   const auto parts = path_parts(request.path);
   std::lock_guard lock(mutex_);
-  cleanup_expired_connections(now_ms());
+  cleanup_expired_connections(now);
   if (parts.size() == 3 && parts[0] == "drivers" && parts[2] == "vehicles") {
     const auto& driver_id = parts[1];
     validate_driver_token(
         driver_id,
-        credential_value(request, "token", "x-mine-teleop-driver-token"));
+        credential_value(request, "token", "x-mine-teleop-driver-token"),
+        now);
     const auto permission = config_.driver_vehicle_permissions.find(driver_id);
     Json vehicles = Json::array();
     if (permission != config_.driver_vehicle_permissions.end()) {
@@ -3978,23 +4104,26 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
     if (recipient == session.driver_id) {
       validate_driver_token(
           recipient,
-          credential_value(request, "token", "x-mine-teleop-driver-token"));
+          credential_value(request, "token", "x-mine-teleop-driver-token"),
+          now);
     } else {
       validate_vehicle_connection(
           recipient,
           credential_value(request, "device_token", "x-mine-teleop-device-token"),
-          required_uint64(Json{{"connection_generation", query_value(request, "connection_generation")}}, "connection_generation"));
+          required_uint64(Json{{"connection_generation", query_value(request, "connection_generation")}}, "connection_generation"),
+          now);
     }
     return ServerResponse::json(
         200,
-        {{"messages", take_signaling_messages(parts[1], recipient, query_value(request, "types"))}});
+        {{"messages", take_signaling_messages(parts[1], recipient, now, query_value(request, "types"))}});
   }
   if (parts.size() == 3 && parts[0] == "vehicles" && parts[2] == "session") {
     const auto& vehicle_id = parts[1];
     validate_vehicle_connection(
         vehicle_id,
         credential_value(request, "device_token", "x-mine-teleop-device-token"),
-        required_uint64(Json{{"connection_generation", query_value(request, "connection_generation")}}, "connection_generation"));
+        required_uint64(Json{{"connection_generation", query_value(request, "connection_generation")}}, "connection_generation"),
+        now);
     for (const auto& [id, session] : sessions_) {
       static_cast<void>(id);
       if (session.vehicle_id == vehicle_id && session.state == SessionState::Active) {
@@ -4005,7 +4134,7 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
              {"driver_id", session.driver_id},
              {"state", to_string(session.state)},
              {"control_token", session.control_token},
-             {"control_token_expires_at_utc_ms", session.control_token_expires_at_ms},
+             {"control_token_expires_at_utc_ms", session.control_token_expires_at_utc_ms},
              {"connection_generation", online_vehicles_.at(vehicle_id).generation}});
       }
     }
@@ -4023,7 +4152,7 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
         {"token", credential_value(request, "token", "x-mine-teleop-driver-token")},
         {"device_token", credential_value(request, "device_token", "x-mine-teleop-device-token")},
         {"connection_generation", query_value(request, "connection_generation")}};
-    validate_actor_credential(session, actor, credentials);
+    validate_actor_credential(session, actor, credentials, now);
     return ServerResponse::json(200, session.to_json());
   }
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "ice_servers") {
@@ -4033,12 +4162,12 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
         {"token", credential_value(request, "token", "x-mine-teleop-driver-token")},
         {"device_token", credential_value(request, "device_token", "x-mine-teleop-device-token")},
         {"connection_generation", query_value(request, "connection_generation")}};
-    validate_actor_credential(session, actor, credentials);
+    validate_actor_credential(session, actor, credentials, now);
     Json servers = Json::array();
     if (!config_.stun_urls.empty()) servers.push_back({{"urls", config_.stun_urls}});
     std::int64_t expires_at_utc_ms = 0;
     if (!config_.turn_urls.empty()) {
-      const auto expires_at_seconds = now_ms() / 1000 + config_.turn_credential_ttl_seconds;
+      const auto expires_at_seconds = now.utc.value / 1000 + config_.turn_credential_ttl_seconds;
       const auto username = std::to_string(expires_at_seconds) + ":" + config_.turn_realm + ":" +
           session.session_id + ":" + std::string(actor);
       servers.push_back(
@@ -4066,7 +4195,7 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
   return ServerResponse::json(404, {{"error", "not found"}});
 }
 
-ServerResponse SignalingService::handle_driver_login(Json value) {
+ServerResponse SignalingService::handle_driver_login(Json value, ClockSample admitted_at) {
   const auto driver_id = required_string(value, "driver_id");
   CleansedString password(optional_string(value, "password"));
   if (const auto field = value.find("password"); field != value.end() && field->is_string()) {
@@ -4078,8 +4207,7 @@ ServerResponse SignalingService::handle_driver_login(Json value) {
   std::optional<LoginFailureReservation> reservation;
   {
     std::lock_guard lock(mutex_);
-    const auto admitted_at_ms = now_ms();
-    cleanup_expired_connections(admitted_at_ms);
+    cleanup_expired_connections(admitted_at);
     if (const auto found = config_.driver_password_verifiers.find(driver_id);
         found != config_.driver_password_verifiers.end()) {
       credential.kind = LoginCredentialSnapshot::Kind::Argon2id;
@@ -4091,7 +4219,7 @@ ServerResponse SignalingService::handle_driver_login(Json value) {
         credential.verifier = found->second;
       }
     }
-    reservation.emplace(reserve_login_failure_locked(driver_id, admitted_at_ms));
+    reservation.emplace(reserve_login_failure_locked(driver_id, admitted_at));
   }
 
   const auto release_reservation = [&] {
@@ -4141,13 +4269,13 @@ ServerResponse SignalingService::handle_driver_login(Json value) {
   }
   release_password_verification_slot();
 
+  const auto settled_at = clock_sample();
   std::lock_guard lock(mutex_);
-  const auto timestamp_ms = now_ms();
-  cleanup_expired_connections(timestamp_ms);
+  cleanup_expired_connections(settled_at);
   if (!verified || credential.kind == LoginCredentialSnapshot::Kind::Unknown) {
     const auto failed_reservation = *reservation;
     reservation.reset();
-    record_login_failure_locked(driver_id, failed_reservation, timestamp_ms);
+    record_login_failure_locked(driver_id, failed_reservation, settled_at);
     throw Unauthorized("invalid driver credentials");
   }
   release_login_failure_reservation_locked(*reservation);
@@ -4163,24 +4291,33 @@ ServerResponse SignalingService::handle_driver_login(Json value) {
   }
   const auto generation = ++connection_generation_;
   const std::string token = "driver-token-" + random_token();
-  driver_tokens_[token] = DriverToken{driver_id, timestamp_ms + config_.token_ttl_ms, generation};
-  online_drivers_[driver_id] = ConnectionPresence{"", generation, timestamp_ms, timestamp_ms};
+  driver_tokens_[token] = DriverToken{
+      driver_id,
+      detail::saturating_deadline_ms(settled_at.utc.value, config_.token_ttl_ms),
+      detail::saturating_deadline_ms(settled_at.monotonic.value, config_.token_ttl_ms),
+      generation};
+  online_drivers_[driver_id] = ConnectionPresence{
+      "",
+      generation,
+      settled_at.utc.value,
+      settled_at.utc.value,
+      settled_at.monotonic.value};
   audit("driver_login", {{"driver_id", driver_id}, {"connection_generation", generation}});
   return ServerResponse::json(
       200,
       {{"token_type", "bearer"},
        {"token", token},
-       {"expires_at_ms", driver_tokens_.at(token).expires_at_ms},
+       {"expires_at_ms", driver_tokens_.at(token).expires_at_utc_ms},
        {"connection_generation", generation},
        {"service_instance_id", service_instance_id_}});
 }
 
-ServerResponse SignalingService::handle_post(const HttpRequest& request) {
+ServerResponse SignalingService::handle_post(const HttpRequest& request, ClockSample now) {
   auto value = request.json_body();
-  if (request.path == "/auth/driver_login") return handle_driver_login(std::move(value));
+  if (request.path == "/auth/driver_login") return handle_driver_login(std::move(value), now);
   const auto parts = path_parts(request.path);
   std::lock_guard lock(mutex_);
-  cleanup_expired_connections(now_ms());
+  cleanup_expired_connections(now);
   if (request.path.starts_with("/admin/")) {
     if (config_.admin_token.empty()) throw Unauthorized("admin API is disabled");
     if (!constant_time_equal(config_.admin_token, optional_string(value, "admin_token"))) {
@@ -4226,19 +4363,19 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   }
   if (request.path == "/auth/driver_heartbeat") {
     const auto driver_id = required_string(value, "driver_id");
-    validate_driver_token(driver_id, optional_string(value, "token"));
+    validate_driver_token(driver_id, optional_string(value, "token"), now);
     const auto& presence = online_drivers_.at(driver_id);
     return ServerResponse::json(
         200,
         {{"driver_id", driver_id},
          {"state", "online"},
          {"connection_generation", presence.generation},
-         {"last_seen_at_utc_ms", presence.last_seen_at_ms}});
+         {"last_seen_at_utc_ms", presence.last_seen_at_utc_ms}});
   }
   if (request.path == "/auth/driver_logout") {
     const auto driver_id = required_string(value, "driver_id");
     const auto token = optional_string(value, "token");
-    validate_driver_token(driver_id, token);
+    validate_driver_token(driver_id, token, now);
     const auto generation = online_drivers_.at(driver_id).generation;
     close_sessions_for_driver(driver_id, "driver_logout");
     driver_tokens_.erase(token);
@@ -4254,10 +4391,10 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
     const auto vehicle_id = required_string(value, "vehicle_id");
     validate_device_token(vehicle_id, optional_string(value, "device_token"));
     const auto connection_id = required_string(value, "connection_id");
-    const auto timestamp_ms = now_ms();
     const auto current = online_vehicles_.find(vehicle_id);
     if (current != online_vehicles_.end() && current->second.connection_id == connection_id) {
-      current->second.last_seen_at_ms = timestamp_ms;
+      current->second.last_seen_at_utc_ms = now.utc.value;
+      current->second.last_seen_at_monotonic_ms = now.monotonic.value;
       return ServerResponse::json(
           200,
           {{"vehicle_id", vehicle_id},
@@ -4273,7 +4410,12 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
           {{"vehicle_id", vehicle_id}, {"previous_connection_generation", current->second.generation}});
     }
     const auto generation = ++connection_generation_;
-    online_vehicles_[vehicle_id] = ConnectionPresence{connection_id, generation, timestamp_ms, timestamp_ms};
+    online_vehicles_[vehicle_id] = ConnectionPresence{
+        connection_id,
+        generation,
+        now.utc.value,
+        now.utc.value,
+        now.monotonic.value};
     audit("vehicle_online", {{"vehicle_id", vehicle_id}, {"connection_generation", generation}});
     return ServerResponse::json(
         200,
@@ -4285,18 +4427,18 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (request.path == "/vehicles/heartbeat") {
     const auto vehicle_id = required_string(value, "vehicle_id");
     const auto generation = required_uint64(value, "connection_generation");
-    validate_vehicle_connection(vehicle_id, optional_string(value, "device_token"), generation);
+    validate_vehicle_connection(vehicle_id, optional_string(value, "device_token"), generation, now);
     return ServerResponse::json(
         200,
         {{"vehicle_id", vehicle_id},
          {"state", "online"},
          {"connection_generation", generation},
-         {"last_seen_at_utc_ms", online_vehicles_.at(vehicle_id).last_seen_at_ms}});
+         {"last_seen_at_utc_ms", online_vehicles_.at(vehicle_id).last_seen_at_utc_ms}});
   }
   if (request.path == "/vehicles/offline") {
     const auto vehicle_id = required_string(value, "vehicle_id");
     const auto generation = required_uint64(value, "connection_generation");
-    validate_vehicle_connection(vehicle_id, optional_string(value, "device_token"), generation);
+    validate_vehicle_connection(vehicle_id, optional_string(value, "device_token"), generation, now);
     online_vehicles_.erase(vehicle_id);
     close_sessions_for_vehicle(vehicle_id, "vehicle_offline");
     audit(
@@ -4309,7 +4451,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (request.path == "/sessions") {
     const auto driver_id = required_string(value, "driver_id");
     const auto vehicle_id = required_string(value, "vehicle_id");
-    validate_driver_token(driver_id, optional_string(value, "token"));
+    validate_driver_token(driver_id, optional_string(value, "token"), now);
     const auto permissions = config_.driver_vehicle_permissions.find(driver_id);
     if (permissions == config_.driver_vehicle_permissions.end() || !permissions->second.contains(vehicle_id)) {
       audit(
@@ -4344,7 +4486,12 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
         .driver_id = driver_id,
         .state = SessionState::Online,
         .control_token = "control-token-" + random_token(),
-        .control_token_expires_at_ms = now_ms() + config_.control_token_ttl_ms,
+        .control_token_expires_at_utc_ms = detail::saturating_deadline_ms(
+            now.utc.value,
+            config_.control_token_ttl_ms),
+        .control_token_expires_at_monotonic_ms = detail::saturating_deadline_ms(
+            now.monotonic.value,
+            config_.control_token_ttl_ms),
         .last_relay_usage_by_actor = {},
         .websocket_rate_by_participant = {}};
     sessions_[session.session_id] = session;
@@ -4369,26 +4516,27 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
     const auto actor = required_string(value, "actor");
     auto& session = const_cast<Session&>(require_participant(parts[1], actor));
     if (actor != session.driver_id) throw Unauthorized("only the current driver can renew control authority");
-    validate_actor_credential(session, actor, value);
-    const auto renewed_at_ms = now_ms();
-    const auto previous_expiry_ms = session.control_token_expires_at_ms;
-    session.control_token_expires_at_ms =
-        config_.control_token_ttl_ms > std::numeric_limits<std::int64_t>::max() - renewed_at_ms
-        ? std::numeric_limits<std::int64_t>::max()
-        : renewed_at_ms + config_.control_token_ttl_ms;
+    validate_actor_credential(session, actor, value, now);
+    const auto previous_expiry_utc_ms = session.control_token_expires_at_utc_ms;
+    session.control_token_expires_at_utc_ms = detail::saturating_deadline_ms(
+        now.utc.value,
+        config_.control_token_ttl_ms);
+    session.control_token_expires_at_monotonic_ms = detail::saturating_deadline_ms(
+        now.monotonic.value,
+        config_.control_token_ttl_ms);
     audit(
         "control_authority_renewed",
         {{"session_id", session.session_id},
          {"vehicle_id", session.vehicle_id},
          {"driver_id", session.driver_id},
-         {"previous_expires_at_utc_ms", previous_expiry_ms},
-         {"expires_at_utc_ms", session.control_token_expires_at_ms}});
+         {"previous_expires_at_utc_ms", previous_expiry_utc_ms},
+         {"expires_at_utc_ms", session.control_token_expires_at_utc_ms}});
     return ServerResponse::json(200, session.to_json(true));
   }
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "end") {
     const auto actor = required_string(value, "actor");
     auto& session = const_cast<Session&>(require_participant(parts[1], actor));
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     close_session(session, optional_string(value, "reason").empty() ? "session_end" : optional_string(value, "reason"));
     audit("session_ended", session.to_json());
     return ServerResponse::json(200, session.to_json());
@@ -4396,7 +4544,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 4 && parts[0] == "sessions" && parts[2] == "control_authority" && parts[3] == "revoke") {
     const auto actor = required_string(value, "actor");
     auto& session = const_cast<Session&>(require_participant(parts[1], actor));
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     close_session(
         session,
         optional_string(value, "reason").empty() ? "control_authority_revoked" : optional_string(value, "reason"));
@@ -4406,7 +4554,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "webrtc_connection") {
     const auto actor = required_string(value, "actor");
     const auto& session = require_participant(parts[1], actor);
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     const auto connection_state = required_string(value, "connection_state");
     const auto connection_method = required_string(value, "connection_method");
     static const std::unordered_set<std::string> allowed_states{
@@ -4453,7 +4601,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "abnormal_disconnect") {
     const auto actor = required_string(value, "actor");
     const auto& session = require_participant(parts[1], actor);
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     const auto reason = required_string(value, "reason");
     const auto detected_by = required_string(value, "detected_by");
     audit(
@@ -4469,7 +4617,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "diagnostics") {
     const auto actor = required_string(value, "actor");
     const auto& session = require_participant(parts[1], actor);
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     const auto component = required_string(value, "component");
     const auto rtt_ms = required_nonnegative_uint64(value, "rtt_ms");
     const auto packet_loss_percent = required_nonnegative_number(value, "packet_loss_percent");
@@ -4494,7 +4642,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "control_timeout") {
     const auto actor = required_string(value, "actor");
     const auto& session = require_participant(parts[1], actor);
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     if (actor != session.vehicle_id) throw Unauthorized("only the vehicle may report a control timeout");
     const auto last_valid_control_at_utc_ms = required_nonnegative_uint64(value, "last_valid_control_at_utc_ms");
     const auto braking_at_utc_ms = required_nonnegative_uint64(value, "braking_at_utc_ms");
@@ -4517,7 +4665,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "estop") {
     const auto actor = required_string(value, "actor");
     const auto& session = require_participant(parts[1], actor);
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     const auto reason = required_string(value, "reason");
     const auto control_seq = required_nonnegative_uint64(value, "control_seq");
     audit(
@@ -4533,7 +4681,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "turn_relay") {
     const auto actor = required_string(value, "actor");
     const auto& session = require_participant(parts[1], actor);
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     const auto turn_url = required_string(value, "turn_url");
     const auto relay_candidate = required_string(value, "relay_candidate");
     const auto selected_pair = required_string(value, "selected_pair");
@@ -4551,7 +4699,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "turn_usage") {
     const auto actor = required_string(value, "actor");
     auto& session = const_cast<Session&>(require_participant(parts[1], actor));
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     const auto sample_sequence = required_nonnegative_uint64(value, "sample_seq");
     if (sample_sequence == 0) throw std::invalid_argument("sample_seq must be positive");
     const auto bytes_sent = required_nonnegative_uint64(value, "bytes_sent");
@@ -4619,7 +4767,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
          {"turn_usage", session.to_json().at("turn_usage")}});
   }
   if (parts.size() == 3 && parts[0] == "signaling" && parts[2] == "messages") {
-    return ServerResponse::json(200, enqueue_signaling_message(parts[1], value));
+    return ServerResponse::json(200, enqueue_signaling_message(parts[1], value, now));
   }
   return ServerResponse::json(404, {{"error", "not found"}});
 }
@@ -4969,8 +5117,9 @@ void DriverConsoleRuntime::note_native_control_failure(
 }
 
 bool DriverConsoleRuntime::send_native_control_sample() {
-  const auto sample_started_monotonic_ms = monotonic_now_ms();
-  const auto sample_started_at_utc_ms = clock_.now_ms();
+  const auto sample_started_at = clock_.sample();
+  const auto sample_started_monotonic_ms = sample_started_at.monotonic.value;
+  const auto sample_started_at_utc_ms = sample_started_at.utc.value;
   const auto scheduled_at_monotonic_ms =
       native_control_scheduled_at_monotonic_ms_.load(std::memory_order_relaxed);
   NativeControlIntentSample sample;
@@ -4978,7 +5127,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
   std::string control_token;
   std::string driver_token;
   std::string vehicle;
-  std::int64_t control_token_expires_at_ms = 0;
+  std::int64_t control_token_expires_at_monotonic_ms = 0;
   std::uint64_t sequence = 0;
   std::uint64_t generation = 0;
   Json trace_record;
@@ -4995,7 +5144,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       control_token = control_token_;
       driver_token = driver_token_;
       vehicle = vehicle_id_;
-      control_token_expires_at_ms = control_token_expires_at_ms_;
+      control_token_expires_at_monotonic_ms = control_token_expires_at_monotonic_ms_;
       generation = control_session_generation_;
       sequence = ++control_sequence_;
     }
@@ -5025,7 +5174,9 @@ bool DriverConsoleRuntime::send_native_control_sample() {
                : 0},
       };
     }
-    if (clock_.now_ms() >= control_token_expires_at_ms) {
+    if (detail::monotonic_deadline_reached(
+            clock_.sample().monotonic,
+            control_token_expires_at_monotonic_ms)) {
       throw std::runtime_error("control authority lease expired");
     }
 
@@ -5321,8 +5472,11 @@ void DriverConsoleRuntime::native_control_lease_loop(std::stop_token stop_token)
     std::uint64_t renewal_generation = 0;
     {
       std::lock_guard lock(mutex_);
+      const auto now = clock_.sample();
       renewal_due = !session_id_.empty() && !control_token_.empty() &&
-          control_token_renew_at_ms_ <= clock_.now_ms();
+          detail::monotonic_deadline_reached(
+              now.monotonic,
+              control_token_renew_at_monotonic_ms_);
       renewal_session = session_id_;
       renewal_generation = control_session_generation_;
     }
@@ -5404,19 +5558,21 @@ Json DriverConsoleRuntime::renew_control_authority() {
   std::string token;
   std::string session;
   std::string control_token;
-  std::int64_t renew_at_ms = 0;
+  std::int64_t renew_at_monotonic_ms = 0;
   {
     std::lock_guard lock(mutex_);
     token = driver_token_;
     session = session_id_;
     control_token = control_token_;
-    renew_at_ms = control_token_renew_at_ms_;
+    renew_at_monotonic_ms = control_token_renew_at_monotonic_ms_;
   }
   if (token.empty() || session.empty() || control_token.empty()) {
     return {{"renewed", false}, {"reason", "not_connected"}};
   }
-  const auto now = clock_.now_ms();
-  if (renew_at_ms > now) {
+  const auto request_started_at = clock_.sample();
+  if (!detail::monotonic_deadline_reached(
+          request_started_at.monotonic,
+          renew_at_monotonic_ms)) {
     return {{"renewed", false}, {"reason", "not_due"}};
   }
   Json response;
@@ -5432,11 +5588,12 @@ Json DriverConsoleRuntime::renew_control_authority() {
       if (session_id_ == session) {
         session_id_.clear();
         control_token_.clear();
-        control_token_expires_at_ms_ = 0;
-        control_token_renew_at_ms_ = 0;
+        control_token_expires_at_utc_ms_ = 0;
+        control_token_expires_at_monotonic_ms_ = 0;
+        control_token_renew_at_monotonic_ms_ = 0;
         sequence_ = 0;
         reset_control_profile_locked();
-        connected_at_ms_ = 0;
+        connected_at_utc_ms_ = 0;
       }
     }
     throw;
@@ -5444,49 +5601,64 @@ Json DriverConsoleRuntime::renew_control_authority() {
   if (response.value("session_id", "") != session || response.value("control_token", "") != control_token) {
     throw std::runtime_error("control authority renewal changed the active session or token");
   }
-  const auto expires_at_ms = required_int64(response, "control_token_expires_at_utc_ms");
-  if (expires_at_ms <= now) throw std::runtime_error("control authority renewal returned an expired lease");
+  const auto expires_at_utc_ms = required_int64(response, "control_token_expires_at_utc_ms");
+  const auto received_at = clock_.sample();
+  const auto expires_at_monotonic_ms = detail::local_monotonic_deadline_from_utc_expiry(
+      UtcMillis{expires_at_utc_ms},
+      received_at);
+  if (detail::monotonic_deadline_reached(received_at.monotonic, expires_at_monotonic_ms.value)) {
+    throw std::runtime_error("control authority renewal returned an expired lease");
+  }
   {
     std::lock_guard lock(mutex_);
     if (session_id_ != session || control_token_ != control_token) {
       return {{"renewed", false}, {"reason", "session_changed"}};
     }
-    control_token_expires_at_ms_ = expires_at_ms;
-    control_token_renew_at_ms_ = control_lease_renew_at(now, expires_at_ms);
+    control_token_expires_at_utc_ms_ = expires_at_utc_ms;
+    control_token_expires_at_monotonic_ms_ = expires_at_monotonic_ms.value;
+    control_token_renew_at_monotonic_ms_ = control_lease_renew_at(
+        received_at.monotonic,
+        expires_at_monotonic_ms);
   }
   return {
       {"renewed", true},
       {"session_id", session},
-      {"control_token_expires_at_utc_ms", expires_at_ms},
+      {"control_token_expires_at_utc_ms", expires_at_utc_ms},
   };
 }
 
 Json DriverConsoleRuntime::login_locked(std::string_view password) {
   if (clock_.refresh_due(config_.time_sync_interval_ms)) static_cast<void>(refresh_time_sync());
   std::string current_token;
-  std::int64_t current_expiry = 0;
+  std::int64_t current_expiry_utc_ms = 0;
+  std::int64_t current_expiry_monotonic_ms = 0;
   {
     std::lock_guard lock(mutex_);
     current_token = driver_token_;
-    current_expiry = driver_token_expires_at_ms_;
+    current_expiry_utc_ms = driver_token_expires_at_utc_ms_;
+    current_expiry_monotonic_ms = driver_token_expires_at_monotonic_ms_;
   }
-  if (!current_token.empty() && clock_.now_ms() < current_expiry) {
+  if (!current_token.empty() && !detail::monotonic_deadline_reached(
+                                    clock_.sample().monotonic,
+                                    current_expiry_monotonic_ms)) {
     try {
-      auto result = fetch_authorized_vehicles(current_token, current_expiry);
+      auto result = fetch_authorized_vehicles(current_token, current_expiry_utc_ms);
       result["authenticated"] = true;
       return result;
     } catch (const std::exception&) {
       reset_native_control_state();
       std::lock_guard lock(mutex_);
       driver_token_.clear();
-      driver_token_expires_at_ms_ = 0;
+      driver_token_expires_at_utc_ms_ = 0;
+      driver_token_expires_at_monotonic_ms_ = 0;
       session_id_.clear();
       control_token_.clear();
-      control_token_expires_at_ms_ = 0;
-      control_token_renew_at_ms_ = 0;
+      control_token_expires_at_utc_ms_ = 0;
+      control_token_expires_at_monotonic_ms_ = 0;
+      control_token_renew_at_monotonic_ms_ = 0;
       sequence_ = 0;
       reset_control_profile_locked();
-      connected_at_ms_ = 0;
+      connected_at_utc_ms_ = 0;
     }
   }
   const auto credential = password.empty() ? password_ : std::string(password);
@@ -5494,17 +5666,26 @@ Json DriverConsoleRuntime::login_locked(std::string_view password) {
   const auto response = http_.post_json_response(
       signaling_http_url_ + "/auth/driver_login",
       {{"driver_id", config_.driver_id}, {"password", credential}});
+  const auto expires_at_utc_ms = response.value("expires_at_ms", std::int64_t{0});
+  const auto received_at = clock_.sample();
+  const auto expires_at_monotonic_ms = detail::local_monotonic_deadline_from_utc_expiry(
+      UtcMillis{expires_at_utc_ms},
+      received_at);
+  if (detail::monotonic_deadline_reached(received_at.monotonic, expires_at_monotonic_ms.value)) {
+    throw std::runtime_error("driver login returned an expired token");
+  }
   {
     std::lock_guard lock(mutex_);
     password_ = credential;
     driver_token_ = required_string(response, "token");
-    driver_token_expires_at_ms_ = response.value("expires_at_ms", std::int64_t{0});
+    driver_token_expires_at_utc_ms_ = expires_at_utc_ms;
+    driver_token_expires_at_monotonic_ms_ = expires_at_monotonic_ms.value;
     signaling_service_instance_id_ = required_string(response, "service_instance_id");
     signaling_available_ = true;
   }
   auto result = fetch_authorized_vehicles(
       required_string(response, "token"),
-      response.value("expires_at_ms", std::int64_t{0}));
+      expires_at_utc_ms);
   result["authenticated"] = true;
   return result;
 }
@@ -5516,7 +5697,7 @@ Json DriverConsoleRuntime::login(std::string_view password) {
 
 Json DriverConsoleRuntime::fetch_authorized_vehicles(
     std::string_view token,
-    std::int64_t expires_at_ms) {
+    std::int64_t expires_at_utc_ms) {
   const auto response = http_.get_json(
       signaling_http_url_ + "/drivers/" + http_.url_encode(config_.driver_id) + "/vehicles",
       {{"X-Mine-Teleop-Driver-Token", std::string(token)}});
@@ -5532,7 +5713,7 @@ Json DriverConsoleRuntime::fetch_authorized_vehicles(
   return {
       {"authenticated", true},
       {"driver_id", config_.driver_id},
-      {"token_expires_at_utc_ms", expires_at_ms},
+      {"token_expires_at_utc_ms", expires_at_utc_ms},
       {"service_instance_id", service_instance_id},
       {"vehicles", listed},
   };
@@ -5541,17 +5722,17 @@ Json DriverConsoleRuntime::fetch_authorized_vehicles(
 Json DriverConsoleRuntime::vehicles() {
   std::lock_guard authentication_lock(authentication_mutex_);
   std::string token;
-  std::int64_t expires_at_ms = 0;
+  std::int64_t expires_at_utc_ms = 0;
   std::string service_instance_id;
   {
     std::lock_guard lock(mutex_);
     token = driver_token_;
-    expires_at_ms = driver_token_expires_at_ms_;
+    expires_at_utc_ms = driver_token_expires_at_utc_ms_;
     service_instance_id = signaling_service_instance_id_;
   }
   if (token.empty()) throw HttpStatusError(401, "driver login is required");
   try {
-    return fetch_authorized_vehicles(token, expires_at_ms);
+    return fetch_authorized_vehicles(token, expires_at_utc_ms);
   } catch (const HttpStatusError& error) {
     {
       std::lock_guard lock(mutex_);
@@ -5569,14 +5750,16 @@ Json DriverConsoleRuntime::vehicles() {
     {
       std::lock_guard lock(mutex_);
       driver_token_.clear();
-      driver_token_expires_at_ms_ = 0;
+      driver_token_expires_at_utc_ms_ = 0;
+      driver_token_expires_at_monotonic_ms_ = 0;
       session_id_.clear();
       control_token_.clear();
-      control_token_expires_at_ms_ = 0;
-      control_token_renew_at_ms_ = 0;
+      control_token_expires_at_utc_ms_ = 0;
+      control_token_expires_at_monotonic_ms_ = 0;
+      control_token_renew_at_monotonic_ms_ = 0;
       sequence_ = 0;
       reset_control_profile_locked();
-      connected_at_ms_ = 0;
+      connected_at_utc_ms_ = 0;
       authorized_vehicles_ = Json::array();
     }
     auto recovered = login_locked({});
@@ -5606,7 +5789,7 @@ Json DriverConsoleRuntime::vehicles() {
     return {
         {"authenticated", true},
         {"driver_id", config_.driver_id},
-        {"token_expires_at_utc_ms", expires_at_ms},
+        {"token_expires_at_utc_ms", expires_at_utc_ms},
         {"service_instance_id", service_instance_id},
         {"signaling_available", false},
         {"stale", true},
@@ -5671,7 +5854,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
             {"connected", true},
             {"session_id", session_id_},
             {"control_session_generation", control_session_generation_},
-            {"connected_at_ms", connected_at_ms_},
+            {"connected_at_ms", connected_at_utc_ms_},
             {"time_sync", clock_.status().to_json()},
         };
       }
@@ -5685,11 +5868,12 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       std::lock_guard lock(mutex_);
       session_id_.clear();
       control_token_.clear();
-      control_token_expires_at_ms_ = 0;
-      control_token_renew_at_ms_ = 0;
+      control_token_expires_at_utc_ms_ = 0;
+      control_token_expires_at_monotonic_ms_ = 0;
+      control_token_renew_at_monotonic_ms_ = 0;
       sequence_ = 0;
       reset_control_profile_locked();
-      connected_at_ms_ = 0;
+      connected_at_utc_ms_ = 0;
     }
   }
 
@@ -5700,9 +5884,16 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       {{"driver_id", config_.driver_id}, {"vehicle_id", target}, {"token", current_token}});
   const auto session_id = required_string(session, "session_id");
   const auto control_token = required_string(session, "control_token");
-  const auto connected_at_ms = clock_.now_ms();
-  const auto control_token_expires_at_ms = required_int64(session, "control_token_expires_at_utc_ms");
-  if (control_token_expires_at_ms <= connected_at_ms) {
+  const auto connected_at = clock_.sample();
+  const auto connected_at_utc_ms = connected_at.utc.value;
+  const auto control_token_expires_at_utc_ms = required_int64(session, "control_token_expires_at_utc_ms");
+  const auto control_token_expires_at_monotonic_ms =
+      detail::local_monotonic_deadline_from_utc_expiry(
+          UtcMillis{control_token_expires_at_utc_ms},
+          connected_at);
+  if (detail::monotonic_deadline_reached(
+          connected_at.monotonic,
+          control_token_expires_at_monotonic_ms.value)) {
     throw std::runtime_error("new control authority lease is already expired");
   }
   std::uint64_t control_session_generation = 0;
@@ -5713,13 +5904,16 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       vehicle_id_ = target;
       session_id_ = session_id;
       control_token_ = control_token;
-      control_token_expires_at_ms_ = control_token_expires_at_ms;
-      control_token_renew_at_ms_ = control_lease_renew_at(connected_at_ms, control_token_expires_at_ms);
+      control_token_expires_at_utc_ms_ = control_token_expires_at_utc_ms;
+      control_token_expires_at_monotonic_ms_ = control_token_expires_at_monotonic_ms.value;
+      control_token_renew_at_monotonic_ms_ = control_lease_renew_at(
+          connected_at.monotonic,
+          control_token_expires_at_monotonic_ms);
       sequence_ = 0;
       control_sequence_ = 0;
       control_session_generation = ++control_session_generation_;
       reset_control_profile_locked();
-      connected_at_ms_ = connected_at_ms;
+      connected_at_utc_ms_ = connected_at_utc_ms;
     }
     const auto bootstrap = native_control_intent_.update(
         NativeControlIntent{
@@ -5744,11 +5938,12 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       if (session_id_ == session_id) {
         session_id_.clear();
         control_token_.clear();
-        control_token_expires_at_ms_ = 0;
-        control_token_renew_at_ms_ = 0;
+        control_token_expires_at_utc_ms_ = 0;
+        control_token_expires_at_monotonic_ms_ = 0;
+        control_token_renew_at_monotonic_ms_ = 0;
         sequence_ = 0;
         reset_control_profile_locked();
-        connected_at_ms_ = 0;
+        connected_at_utc_ms_ = 0;
       }
     }
     std::rethrow_exception(failure);
@@ -5765,7 +5960,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       {"connected", true},
       {"session_id", session_id},
       {"control_session_generation", control_session_generation},
-      {"connected_at_ms", connected_at_ms},
+      {"connected_at_ms", connected_at_utc_ms},
       {"time_sync", clock_.status().to_json()},
   };
 }
@@ -5795,11 +5990,12 @@ Json DriverConsoleRuntime::end_session(std::string_view reason) {
     if (session_id_ == session) {
       session_id_.clear();
       control_token_.clear();
-      control_token_expires_at_ms_ = 0;
-      control_token_renew_at_ms_ = 0;
+      control_token_expires_at_utc_ms_ = 0;
+      control_token_expires_at_monotonic_ms_ = 0;
+      control_token_renew_at_monotonic_ms_ = 0;
       sequence_ = 0;
       reset_control_profile_locked();
-      connected_at_ms_ = 0;
+      connected_at_utc_ms_ = 0;
     }
   }
   response["driver_id"] = config_.driver_id;
@@ -5822,11 +6018,12 @@ Json DriverConsoleRuntime::disconnect(std::string_view reason) {
     std::lock_guard lock(mutex_);
     session_id_.clear();
     control_token_.clear();
-    control_token_expires_at_ms_ = 0;
-    control_token_renew_at_ms_ = 0;
+    control_token_expires_at_utc_ms_ = 0;
+    control_token_expires_at_monotonic_ms_ = 0;
+    control_token_renew_at_monotonic_ms_ = 0;
     sequence_ = 0;
     reset_control_profile_locked();
-    connected_at_ms_ = 0;
+    connected_at_utc_ms_ = 0;
     authorized_vehicles_ = Json::array();
     return {{"driver_id", config_.driver_id}, {"state", "offline"}, {"session_id", session}};
   }
@@ -5839,14 +6036,16 @@ Json DriverConsoleRuntime::disconnect(std::string_view reason) {
     std::lock_guard lock(mutex_);
     if (driver_token_ == token) {
       driver_token_.clear();
-      driver_token_expires_at_ms_ = 0;
+      driver_token_expires_at_utc_ms_ = 0;
+      driver_token_expires_at_monotonic_ms_ = 0;
       session_id_.clear();
       control_token_.clear();
-      control_token_expires_at_ms_ = 0;
-      control_token_renew_at_ms_ = 0;
+      control_token_expires_at_utc_ms_ = 0;
+      control_token_expires_at_monotonic_ms_ = 0;
+      control_token_renew_at_monotonic_ms_ = 0;
       sequence_ = 0;
       reset_control_profile_locked();
-      connected_at_ms_ = 0;
+      connected_at_utc_ms_ = 0;
       authorized_vehicles_ = Json::array();
     }
   }
@@ -5917,11 +6116,12 @@ Json DriverConsoleRuntime::poll_signaling() {
         if (session_id_ == session) {
           session_id_.clear();
           control_token_.clear();
-          control_token_expires_at_ms_ = 0;
-          control_token_renew_at_ms_ = 0;
+          control_token_expires_at_utc_ms_ = 0;
+          control_token_expires_at_monotonic_ms_ = 0;
+          control_token_renew_at_monotonic_ms_ = 0;
           sequence_ = 0;
           reset_control_profile_locked();
-          connected_at_ms_ = 0;
+          connected_at_utc_ms_ = 0;
         }
       }
       close_signaling_websocket();
@@ -6032,11 +6232,12 @@ Json DriverConsoleRuntime::send_signaling_message(std::string_view type, const J
           if (session_id_ == session) {
             session_id_.clear();
             control_token_.clear();
-            control_token_expires_at_ms_ = 0;
-            control_token_renew_at_ms_ = 0;
+            control_token_expires_at_utc_ms_ = 0;
+            control_token_expires_at_monotonic_ms_ = 0;
+            control_token_renew_at_monotonic_ms_ = 0;
             sequence_ = 0;
             reset_control_profile_locked();
-            connected_at_ms_ = 0;
+            connected_at_utc_ms_ = 0;
           }
         }
         close_signaling_websocket();
@@ -6413,11 +6614,13 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input) {
 Json DriverConsoleRuntime::status() {
   bool authenticated = false;
   bool control_lease_due = false;
-  const auto timestamp_ms = clock_.now_ms();
+  const auto timestamp = clock_.sample();
   {
     std::lock_guard lock(mutex_);
     authenticated = !driver_token_.empty();
-    control_lease_due = !session_id_.empty() && control_token_renew_at_ms_ <= timestamp_ms;
+    control_lease_due = !session_id_.empty() && detail::monotonic_deadline_reached(
+        timestamp.monotonic,
+        control_token_renew_at_monotonic_ms_);
   }
   if (control_lease_due) {
     try {
@@ -6472,16 +6675,16 @@ Json DriverConsoleRuntime::status() {
       {"driver_id", config_.driver_id},
       {"vehicle_id", vehicle_id_},
       {"authenticated", !driver_token_.empty()},
-      {"driver_token_expires_at_utc_ms", driver_token_expires_at_ms_},
+      {"driver_token_expires_at_utc_ms", driver_token_expires_at_utc_ms_},
       {"signaling_service_instance_id", signaling_service_instance_id_},
       {"signaling_restart_recoveries", signaling_restart_recoveries_},
       {"signaling_available", signaling_available_},
       {"connected", !session_id_.empty()},
       {"session_id", session_id_},
       {"control_session_generation", control_session_generation_},
-      {"control_token_expires_at_utc_ms", control_token_expires_at_ms_},
+      {"control_token_expires_at_utc_ms", control_token_expires_at_utc_ms_},
       {"sequence", sequence_},
-      {"connected_at_ms", connected_at_ms_},
+      {"connected_at_ms", connected_at_utc_ms_},
       {"last_control_prepared_at_utc_ms", last_control_prepared_at_utc_ms_},
       {"control_commands_prepared_total", control_commands_prepared_total_},
       {"signaling_transport", "websocket"},
