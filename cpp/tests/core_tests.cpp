@@ -4558,6 +4558,91 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
   std::filesystem::remove_all(root);
 }
 
+void test_local_archive_uploader_rejects_outside_links() {
+#if defined(_WIN32)
+  // Windows symlink creation can require a host policy or developer-mode
+  // privilege.  The production path check remains cross-platform; the
+  // deterministic symlink fixtures run on POSIX CI.
+  return;
+#else
+  const auto root = std::filesystem::path("/tmp") /
+      ("mine-teleop-upload-link-boundary-" + mine_teleop::random_token(6));
+  std::error_code error;
+  const auto cleanup = [&] {
+    error.clear();
+    std::filesystem::remove_all(root, error);
+  };
+  try {
+    const auto recordings = root / "recordings";
+    const auto archive = root / "archive";
+    const auto segment_dir = recordings / "vehicle-001" / "session-001" / "front";
+    // This sibling intentionally shares the recording root's text prefix.
+    // A lexical starts_with check would be unsafe here.
+    const auto outside_same_prefix = root / "recordings-outside";
+    std::filesystem::create_directories(segment_dir);
+    std::filesystem::create_directories(outside_same_prefix);
+    const auto outside_video = outside_same_prefix / "outside.mp4";
+    {
+      std::ofstream output(outside_video, std::ios::binary);
+      output << "outside-recording-content";
+    }
+    const auto escaping_video = segment_dir / "escape.mp4";
+    std::filesystem::create_symlink(outside_video, escaping_video, error);
+    expect(!error, "could not create static archive-escape symlink fixture");
+    const auto escaping_metadata = segment_dir / "escape.json";
+    {
+      std::ofstream output(escaping_metadata);
+      output << mine_teleop::Json({
+          {"segment_id", "escape"},
+          {"video_file", escaping_video.filename().string()},
+          {"video_sha256", mine_teleop::sha256_file(outside_video)},
+          {"upload_state", "pending"},
+      }).dump();
+    }
+    mine_teleop::LocalArchiveUploader escaping_uploader(recordings, archive);
+    const auto escaped_result = escaping_uploader.process_once();
+    expect(
+        escaped_result.action == "failed" &&
+            escaped_result.error.find("regular non-symlink file") != std::string::npos,
+        "outside static symlink was not rejected as a plain recording file");
+    expect(
+        !std::filesystem::exists(archive),
+        "outside static symlink created an archive object outside the configured root");
+
+    const auto broken_recordings = root / "broken-recordings";
+    const auto broken_archive = root / "broken-archive";
+    const auto broken_segment_dir = broken_recordings / "vehicle-001" / "session-001" / "front";
+    std::filesystem::create_directories(broken_segment_dir);
+    const auto broken_video = broken_segment_dir / "broken.mp4";
+    std::filesystem::create_symlink(root / "missing-recording.mp4", broken_video, error);
+    expect(!error, "could not create broken recording symlink fixture");
+    const auto broken_metadata = broken_segment_dir / "broken.json";
+    {
+      std::ofstream output(broken_metadata);
+      output << mine_teleop::Json({
+          {"segment_id", "broken"},
+          {"video_file", broken_video.filename().string()},
+          {"video_sha256", std::string(64, '0')},
+          {"upload_state", "pending"},
+      }).dump();
+    }
+    mine_teleop::LocalArchiveUploader broken_uploader(broken_recordings, broken_archive);
+    const auto broken_result = broken_uploader.process_once();
+    expect(
+        broken_result.action == "failed" &&
+            broken_result.error.find("regular non-symlink file") != std::string::npos,
+        "broken recording symlink was not rejected before archive copy");
+    expect(
+        !std::filesystem::exists(broken_archive),
+        "broken recording symlink created an archive object");
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+  cleanup();
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -4641,6 +4726,7 @@ int main() {
       {"driver_console_page_keeps_waiting_state_during_background_intent_refresh", test_driver_console_page_keeps_waiting_state_during_background_intent_refresh},
       {"driver_login_lists_only_authorized_vehicles", test_driver_login_lists_only_authorized_vehicles},
       {"local_archive_uploader_is_atomic_and_resumable", test_local_archive_uploader_is_atomic_and_resumable},
+      {"local_archive_uploader_rejects_outside_links", test_local_archive_uploader_rejects_outside_links},
       {"async_splitmux_late_sink_error_keeps_live_branch_running", test_async_splitmux_late_sink_error_keeps_live_branch_running},
   };
   int failures = 0;

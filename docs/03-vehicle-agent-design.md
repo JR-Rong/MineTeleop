@@ -180,6 +180,13 @@ VehicleAdapter
 - `dynamic_library` 通过原生 C++ `DynamicLibraryVehicleAdapter` 加载稳定 C shim
   ABI。仓库内的 `deployments/chassis-control-bridge/` 把 ChassisControl 和
   MinePilot CAN 接口封装为该 ABI。
+- 在调用 `dlopen`/`LoadLibrary` 前，配置的 bridge 候选必须是非链接的普通文件，
+  并解析为 canonical 绝对路径；这不是固定 `/opt` 前缀，开发目录和安装包目录都可用。
+  Linux 还要求该文件及其所有父目录由 root 或当前服务用户拥有，且非 sticky 父目录不对
+  group/other 开放写权限；受信子项位于 `/tmp` 这类 sticky 祖先下时可用于开发，但不能把
+  普通可写包目录视为受信。macOS/Windows 保留前述路径/文件类型检查，但没有假称实现了
+  Linux 的 POSIX owner/mode 策略；该预检也不防御检查后的替换竞态、可控依赖库、root 或
+  进程内存已失陷的情况。
 
 后续实现：
 
@@ -251,6 +258,9 @@ Telemetry 仍明确标记为非真实车辆反馈。
 `trigger_network_idle=false`；其它 backend/调度语义会在配置检查中拒绝。
 `upload.enabled=false` 时，recorder 仍写入视频和 sidecar，上传入口直接返回
 `disabled`，不会扫描历史 pending sidecar。
+上传器只接收录像根内的普通 sidecar 和视频文件；静态/断开的符号链接会在复制前拒绝，
+并且归档对象路径必须相对该录像根。并发修改目录、归档目标父目录链接和临时文件占位的
+FD 级竞态缓解属于另一个部署/文件系统边界，不能由该静态检查假称已经解决。
 
 ## 车端启动顺序
 

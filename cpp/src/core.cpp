@@ -8,9 +8,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <system_error>
 #include <unordered_set>
 #include <utility>
 
@@ -30,6 +32,7 @@
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -573,16 +576,96 @@ void unload_dynamic_library(void* handle) {
 #endif
 }
 
+[[nodiscard]] std::filesystem::path canonical_chassis_library_path(
+    const std::filesystem::path& configured_path) {
+  if (configured_path.empty()) {
+    throw std::invalid_argument("chassis bridge library path is empty");
+  }
+
+  std::error_code error;
+  const auto configured_status = std::filesystem::symlink_status(configured_path, error);
+  if (error || configured_status.type() == std::filesystem::file_type::not_found) {
+    throw std::runtime_error(
+        "chassis dynamic library does not exist: " + configured_path.string());
+  }
+  if (std::filesystem::is_symlink(configured_status)) {
+    throw std::runtime_error(
+        "chassis dynamic library must not be a symbolic link: " + configured_path.string());
+  }
+  if (!std::filesystem::is_regular_file(configured_status)) {
+    throw std::runtime_error(
+        "chassis dynamic library must be a regular file: " + configured_path.string());
+  }
+
+  const auto canonical_path = std::filesystem::canonical(configured_path, error);
+  if (error || !canonical_path.is_absolute()) {
+    throw std::runtime_error(
+        "cannot resolve chassis dynamic library to an absolute canonical path: " +
+        configured_path.string());
+  }
+  const auto canonical_status = std::filesystem::symlink_status(canonical_path, error);
+  if (error || !std::filesystem::is_regular_file(canonical_status)) {
+    throw std::runtime_error(
+        "chassis dynamic library is no longer a regular file after path resolution: " +
+        canonical_path.string());
+  }
+
+#if defined(__linux__)
+  // Linux field packages may be owned either by root or by the effective
+  // service user.  Every directory leading to the selected library must use
+  // the same trust model and must not be group- or world-writable, except for
+  // a sticky ancestor such as /tmp: that directory cannot replace a protected
+  // child owned by the trusted user.  This is a pre-load deployment boundary,
+  // not a claim to close replacement races or to defend a compromised
+  // privileged process.
+  const auto effective_uid = ::geteuid();
+  for (auto candidate = canonical_path;; candidate = candidate.parent_path()) {
+    struct stat metadata {};
+    if (::lstat(candidate.c_str(), &metadata) != 0) {
+      throw std::runtime_error(
+          "cannot inspect chassis dynamic library path component " + candidate.string() +
+          ": " + std::strerror(errno));
+    }
+    const bool is_library = candidate == canonical_path;
+    if ((is_library && !S_ISREG(metadata.st_mode)) ||
+        (!is_library && !S_ISDIR(metadata.st_mode))) {
+      throw std::runtime_error(
+          "chassis dynamic library path component has an unexpected type: " +
+          candidate.string());
+    }
+    if (metadata.st_uid != 0 && metadata.st_uid != effective_uid) {
+      throw std::runtime_error(
+          "chassis dynamic library " +
+          std::string(is_library ? "file" : "parent directory") +
+          " owner is neither root nor the effective service user: " + candidate.string());
+    }
+    const bool sticky_parent_directory =
+        !is_library && (metadata.st_mode & S_ISVTX) != 0;
+    if ((metadata.st_mode & (S_IWGRP | S_IWOTH)) != 0 &&
+        !sticky_parent_directory) {
+      throw std::runtime_error(
+          "chassis dynamic library " +
+          std::string(is_library ? "file" : "parent directory") +
+          " is writable by a non-trusted principal: " + candidate.string());
+    }
+    if (candidate == candidate.root_path()) break;
+  }
+#endif
+
+  return canonical_path;
+}
+
 void* open_dynamic_library(const std::filesystem::path& path) {
+  const auto canonical_path = canonical_chassis_library_path(path);
 #if defined(_WIN32)
-  void* handle = static_cast<void*>(LoadLibraryW(path.wstring().c_str()));
+  void* handle = static_cast<void*>(LoadLibraryW(canonical_path.wstring().c_str()));
   if (handle == nullptr) {
     throw std::runtime_error(
         "failed to load dynamic library (Windows error " +
         std::to_string(GetLastError()) + ")");
   }
 #else
-  void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+  void* handle = dlopen(canonical_path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (handle == nullptr) {
     throw std::runtime_error(
         std::string("failed to load dynamic library: ") + dlerror());
