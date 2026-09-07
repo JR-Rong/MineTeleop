@@ -21,7 +21,7 @@ fi
 
 docker run -d --name "$server_name" --security-opt "no-new-privileges:true" --cap-drop ALL \
   "$image" signaling-server --host 127.0.0.1 --port 8765 \
-    --allow-legacy-passwords --legacy-passwords-remove-by 2027-03-31 >/dev/null
+    --allow-legacy-passwords --legacy-passwords-remove-by 2099-12-31 >/dev/null
 
 for _ in $(seq 1 30); do
   if docker exec "$server_name" /opt/mine-teleop/bin/mine-teleop \

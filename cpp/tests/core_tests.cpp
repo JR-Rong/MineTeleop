@@ -43,7 +43,7 @@ void expect(bool condition, std::string_view message) {
 mine_teleop::SignalingServerConfig legacy_signaling_config() {
   auto config = mine_teleop::SignalingServerConfig{};
   config.allow_legacy_passwords = true;
-  config.legacy_passwords_remove_by = "2027-03-31";
+  config.legacy_passwords_remove_by = "2099-12-31";
   return config;
 }
 

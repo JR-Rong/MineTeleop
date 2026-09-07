@@ -35,7 +35,7 @@ void expect(bool condition, std::string_view message) {
 mine_teleop::SignalingServerConfig legacy_signaling_config() {
   auto config = mine_teleop::SignalingServerConfig{};
   config.allow_legacy_passwords = true;
-  config.legacy_passwords_remove_by = "2027-03-31";
+  config.legacy_passwords_remove_by = "2099-12-31";
   return config;
 }
 
@@ -2614,7 +2614,7 @@ void test_signaling_multi_identity_config() {
       duplicate_path,
       R"YAML(auth:
   allow_legacy_passwords: true
-  legacy_passwords_remove_by: "2027-03-31"
+  legacy_passwords_remove_by: "2099-12-31"
   drivers:
     - id: driver-console-001
       password_file: driver-1.password
@@ -2635,7 +2635,7 @@ void test_signaling_multi_identity_config() {
       empty_permissions_path,
       R"YAML(auth:
   allow_legacy_passwords: true
-  legacy_passwords_remove_by: "2027-03-31"
+  legacy_passwords_remove_by: "2099-12-31"
   drivers:
     - id: driver-console-001
       password_file: driver-1.password
@@ -2653,7 +2653,7 @@ void test_signaling_multi_identity_config() {
       unknown_vehicle_path,
       R"YAML(auth:
   allow_legacy_passwords: true
-  legacy_passwords_remove_by: "2027-03-31"
+  legacy_passwords_remove_by: "2099-12-31"
   drivers:
     - id: driver-console-001
       password_file: driver-1.password
@@ -2671,7 +2671,7 @@ void test_signaling_multi_identity_config() {
       ambiguous_secret_path,
       R"YAML(auth:
   allow_legacy_passwords: true
-  legacy_passwords_remove_by: "2027-03-31"
+  legacy_passwords_remove_by: "2099-12-31"
   drivers:
     - id: driver-console-001
       password_file: driver-1.password
