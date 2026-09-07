@@ -1,4 +1,5 @@
 #include "mine_teleop/core.hpp"
+#include "mine_teleop/curl_tls.hpp"
 #include "mine_teleop/detail/dynamic_adapter_apply.hpp"
 #include "mine_teleop/detail/recording_fragment_state.hpp"
 #include "mine_teleop/http.hpp"
@@ -64,6 +65,22 @@ void expect_throws(Function&& function, std::string_view message) {
     function();
   } catch (const std::exception&) {
     return;
+  }
+  throw TestFailure(std::string(message));
+}
+
+template <typename Function>
+void expect_throws_containing(
+    Function&& function,
+    std::string_view expected_detail,
+    std::string_view message) {
+  try {
+    function();
+  } catch (const std::exception& error) {
+    if (std::string_view(error.what()).find(expected_detail) != std::string_view::npos) return;
+    throw TestFailure(
+        std::string(message) + ": expected error containing '" + std::string(expected_detail) +
+        "', got '" + error.what() + "'");
   }
   throw TestFailure(std::string(message));
 }
@@ -2010,6 +2027,173 @@ void test_field_config_pins_tls_route_without_system_dns() {
   expect(
       config.hardware.can_tx_queue_length == 100,
       "field vehicle CAN tx queue length is not 100");
+}
+
+void test_curl_tls_trust_policy_is_explicit_and_protects_ca_bundles() {
+  const auto root = std::filesystem::path("/tmp") /
+      ("mine-teleop-curl-tls-policy-" + mine_teleop::random_token(6));
+  std::error_code error;
+  const auto cleanup = [&] {
+    error.clear();
+    std::filesystem::remove_all(root, error);
+  };
+  try {
+    std::filesystem::create_directories(root);
+    const auto bundle = root / "private-root.pem";
+    const auto fallback_bundle = root / "fallback-root.pem";
+    const auto field_root = std::filesystem::path("configs/mine-teleop-field-root.crt");
+    std::filesystem::copy_file(field_root, bundle, std::filesystem::copy_options::overwrite_existing, error);
+    expect(!error, "could not create valid protected TLS CA bundle fixture");
+    std::filesystem::copy_file(
+        field_root,
+        fallback_bundle,
+        std::filesystem::copy_options::overwrite_existing,
+        error);
+    expect(!error, "could not create valid legacy TLS CA bundle fixture");
+    const auto bundle_text = bundle.string();
+    const auto fallback_bundle_text = fallback_bundle.string();
+    const auto missing_text = (root / "missing.pem").string();
+
+    const auto protected_policy = mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(bundle);
+    const auto protected_configuration = mine_teleop::resolve_curl_tls_trust_policy(
+        protected_policy,
+        missing_text.c_str(),
+        missing_text.c_str());
+    expect(
+        protected_configuration.mode == mine_teleop::CurlTlsTrustMode::ProtectedCaBundle &&
+            protected_configuration.ca_bundle == std::filesystem::canonical(bundle),
+        "explicit TLS policy did not retain its canonical protected CA bundle");
+    expect(
+        protected_configuration.verify_peer && protected_configuration.verify_hostname,
+        "explicit TLS policy allowed peer or hostname verification to be disabled");
+
+    const auto system_configuration = mine_teleop::resolve_curl_tls_trust_policy(
+        mine_teleop::CurlTlsTrustPolicy::system(),
+        missing_text.c_str(),
+        missing_text.c_str());
+    expect(
+        system_configuration.mode == mine_teleop::CurlTlsTrustMode::SystemTrust &&
+            !system_configuration.ca_bundle.has_value() &&
+            system_configuration.verify_peer && system_configuration.verify_hostname,
+        "system TLS trust consulted a supplied legacy-environment CA bundle");
+
+    const auto legacy_policy = mine_teleop::CurlTlsTrustPolicy::legacy_environment();
+    const auto legacy_system_configuration = mine_teleop::resolve_curl_tls_trust_policy(
+        legacy_policy,
+        nullptr,
+        nullptr);
+    expect(
+        !legacy_system_configuration.ca_bundle.has_value() &&
+            legacy_system_configuration.verify_peer && legacy_system_configuration.verify_hostname,
+        "legacy TLS policy without environment bundles did not preserve system trust");
+    const auto legacy_configuration = mine_teleop::resolve_curl_tls_trust_policy(
+        legacy_policy,
+        bundle_text.c_str(),
+        fallback_bundle_text.c_str());
+    expect(
+        legacy_configuration.ca_bundle == std::filesystem::canonical(bundle),
+        "legacy TLS policy did not prefer CURL_CA_BUNDLE over SSL_CERT_FILE");
+    const auto legacy_fallback_configuration = mine_teleop::resolve_curl_tls_trust_policy(
+        legacy_policy,
+        nullptr,
+        fallback_bundle_text.c_str());
+    expect(
+        legacy_fallback_configuration.ca_bundle == std::filesystem::canonical(fallback_bundle),
+        "legacy TLS policy did not use SSL_CERT_FILE when CURL_CA_BUNDLE was absent");
+
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(root / "missing.pem"));
+        },
+        "does not exist",
+        "missing explicit CA bundle was accepted");
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::resolve_curl_tls_trust_policy(
+              legacy_policy,
+              missing_text.c_str(),
+              nullptr));
+        },
+        "does not exist",
+        "legacy environment selected a missing CA bundle");
+
+    const auto malformed_bundle = root / "malformed.pem";
+    {
+      std::ofstream output(malformed_bundle);
+      output << "-----BEGIN CERTIFICATE-----\nnot-valid-base64\n-----END CERTIFICATE-----\n";
+    }
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(malformed_bundle));
+        },
+        "invalid PEM certificate data",
+        "malformed explicit CA bundle was accepted");
+    const auto malformed_text = malformed_bundle.string();
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::resolve_curl_tls_trust_policy(
+              legacy_policy,
+              malformed_text.c_str(),
+              nullptr));
+        },
+        "invalid PEM certificate data",
+        "legacy environment selected malformed CA content");
+
+    const auto empty_bundle = root / "empty.pem";
+    {
+      std::ofstream output(empty_bundle);
+    }
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(empty_bundle));
+        },
+        "is empty",
+        "empty explicit CA bundle was accepted");
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(root));
+        },
+        "regular file",
+        "directory explicit CA bundle was accepted");
+
+#if !defined(_WIN32)
+    const auto symlink_bundle = root / "symlink.pem";
+    std::filesystem::create_symlink(bundle, symlink_bundle, error);
+    expect(!error, "could not create TLS CA bundle symlink fixture");
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(symlink_bundle));
+        },
+        "symbolic link",
+        "symlink explicit CA bundle was accepted");
+
+    const auto unreadable_bundle = root / "unreadable.pem";
+    std::filesystem::copy_file(bundle, unreadable_bundle, std::filesystem::copy_options::overwrite_existing, error);
+    expect(!error, "could not create unreadable TLS CA bundle fixture");
+    std::filesystem::permissions(
+        unreadable_bundle,
+        std::filesystem::perms::none,
+        std::filesystem::perm_options::replace,
+        error);
+    expect(!error, "could not remove TLS CA bundle read permissions");
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(unreadable_bundle));
+        },
+        "unreadable",
+        "unreadable explicit CA bundle was accepted");
+    std::filesystem::permissions(
+        unreadable_bundle,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace,
+        error);
+    expect(!error, "could not restore TLS CA bundle permissions");
+#endif
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+  cleanup();
 }
 
 void test_control_command_json_round_trip_and_validation() {
@@ -4898,6 +5082,8 @@ int main() {
        test_dynamic_adapter_safe_stop_reads_v2_result_and_preserves_emergency_path},
       {"bench_config_drives_unified_vehicle_runtime", test_bench_config_drives_unified_vehicle_runtime},
       {"field_config_pins_tls_route_without_system_dns", test_field_config_pins_tls_route_without_system_dns},
+      {"curl_tls_trust_policy_is_explicit_and_protects_ca_bundles",
+       test_curl_tls_trust_policy_is_explicit_and_protects_ca_bundles},
       {"control_command_json_round_trip_and_validation", test_control_command_json_round_trip_and_validation},
       {"session_control_profile_json_round_trip_and_physical_units", test_session_control_profile_json_round_trip_and_physical_units},
       {"shared_protocol_v1_vectors_and_session_states", test_shared_protocol_v1_vectors_and_session_states},

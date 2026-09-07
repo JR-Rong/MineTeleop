@@ -530,15 +530,13 @@ WebSocketReceiveResult ServerWebSocketConnection::receive_json(std::chrono::mill
 struct WebSocketClient::Impl {
   CURL* curl{nullptr};
   curl_slist* resolve_entries{nullptr};
-  std::filesystem::path ca_bundle;
   curl_socket_t socket{CURL_SOCKET_BAD};
   std::string buffered;
   std::size_t max_message_bytes{8 * 1024 * 1024};
   bool peer_closed{false};
   std::optional<std::chrono::steady_clock::time_point> frame_started_at;
 
-  Impl(const std::vector<std::string>& entries, std::filesystem::path next_ca_bundle)
-      : ca_bundle(std::move(next_ca_bundle)) {
+  explicit Impl(const std::vector<std::string>& entries) {
     try {
       for (const auto& entry : entries) {
         if (entry.empty() || entry.find_first_of("\r\n") != std::string::npos) {
@@ -672,19 +670,28 @@ struct WebSocketClient::Impl {
 };
 
 WebSocketClient::WebSocketClient(std::chrono::milliseconds timeout)
-    : WebSocketClient(timeout, {}, {}) {}
+    : WebSocketClient(timeout, {}, CurlTlsTrustPolicy::system()) {}
 
 WebSocketClient::WebSocketClient(
     std::chrono::milliseconds timeout,
     std::vector<std::string> resolve_entries,
     std::filesystem::path ca_bundle)
+    : WebSocketClient(
+          timeout,
+          std::move(resolve_entries),
+          CurlTlsTrustPolicy::from_optional_ca_bundle(std::move(ca_bundle))) {}
+
+WebSocketClient::WebSocketClient(
+    std::chrono::milliseconds timeout,
+    std::vector<std::string> resolve_entries,
+    CurlTlsTrustPolicy tls_trust_policy)
     : resolve_entries_(std::move(resolve_entries)),
-      ca_bundle_(std::move(ca_bundle)),
+      tls_trust_policy_(std::move(tls_trust_policy)),
       impl_(nullptr),
       timeout_(timeout) {
   if (timeout_.count() <= 0) throw std::invalid_argument("websocket timeout must be positive");
   ensure_curl_global();
-  impl_ = std::make_unique<Impl>(resolve_entries_, ca_bundle_);
+  impl_ = std::make_unique<Impl>(resolve_entries_);
 }
 
 WebSocketClient::~WebSocketClient() { close(); }
@@ -717,7 +724,7 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
   const auto authority_host = host.find(':') == std::string::npos ? host : "[" + host + "]";
   const auto authority = port.empty() ? authority_host : authority_host + ":" + port;
 
-  impl_ = std::make_unique<Impl>(resolve_entries_, ca_bundle_);
+  impl_ = std::make_unique<Impl>(resolve_entries_);
   impl_->curl = curl_easy_init();
   if (impl_->curl == nullptr) throw std::runtime_error("curl_easy_init failed");
   curl_easy_setopt(impl_->curl, CURLOPT_URL, transport_url.c_str());
@@ -730,14 +737,7 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
   curl_easy_setopt(impl_->curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_.count()));
   curl_easy_setopt(impl_->curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(impl_->curl, CURLOPT_USERAGENT, "mine-teleop-websocket/0.2");
-  const auto ca_bundle = impl_->ca_bundle.string();
-  if (!ca_bundle.empty()) {
-    configure_curl_custom_ca(impl_->curl, ca_bundle.c_str());
-  } else if (const auto* ca_bundle = std::getenv("CURL_CA_BUNDLE"); ca_bundle != nullptr && *ca_bundle != '\0') {
-    curl_easy_setopt(impl_->curl, CURLOPT_CAINFO, ca_bundle);
-  } else if (const auto* ca_file = std::getenv("SSL_CERT_FILE"); ca_file != nullptr && *ca_file != '\0') {
-    curl_easy_setopt(impl_->curl, CURLOPT_CAINFO, ca_file);
-  }
+  configure_curl_tls_trust_policy(impl_->curl, tls_trust_policy_);
   if (impl_->resolve_entries != nullptr) curl_easy_setopt(impl_->curl, CURLOPT_RESOLVE, impl_->resolve_entries);
   const auto result = curl_easy_perform(impl_->curl);
   if (result != CURLE_OK) {

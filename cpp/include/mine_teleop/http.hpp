@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "mine_teleop/curl_tls.hpp"
 #include "mine_teleop/core.hpp"
 
 namespace mine_teleop {
@@ -55,6 +56,10 @@ class HttpClient {
       std::chrono::milliseconds timeout,
       std::vector<std::string> resolve_entries,
       std::filesystem::path ca_bundle);
+  HttpClient(
+      std::chrono::milliseconds timeout,
+      std::vector<std::string> resolve_entries,
+      CurlTlsTrustPolicy tls_trust_policy);
 
   [[nodiscard]] HttpResponse get(std::string_view url) const;
   [[nodiscard]] HttpResponse get(std::string_view url, const HttpHeaders& headers) const;

@@ -42,6 +42,22 @@ VehicleAdapter、输出 `vehicle_adapter_status`，失败时返回非 0。
 
 危险配置如车辆控制适配器、设备证书路径、车辆 ID，不建议运行时热更新。
 
+### Native TLS trust policy
+
+车端原生 `HttpClient` 与 `WebSocketClient` 使用同一份显式 TLS 信任策略：默认
+`SystemTrust` 只使用 libcurl/TLS 后端的系统信任库，不读取
+`CURL_CA_BUNDLE` 或 `SSL_CERT_FILE`，也完全不设置 `CURLOPT_CAINFO`，从而保留
+libcurl 的编译期默认 bundle 或 Schannel 系统根；`ProtectedCaBundle` 只接受应用明确
+传入、非链接、非空、可读且可解析为 CA 证书的普通 PEM bundle。旧环境变量行为必须
+由调用方显式选择 `LegacyEnvironment`，且仅在该模式实际选择 bundle 时设置
+`CURLOPT_CAINFO`。三种模式都强制 libcurl 校验证书链和主机名，不能因 bundle 校验
+失败退回到不安全连接。
+
+Windows 的 `SystemTrust` 保留 Schannel 系统根证书行为；Windows 私有 CA bundle
+继续使用既有的 best-effort 吊销状态处理，但仍校验证书链与主机名。单元测试覆盖
+策略选择、路径检查和畸形 PEM 拒绝，不依赖外部 TLS 端点；TLS 后端实际系统根库、
+证书链/主机名握手和吊销服务仍须在目标平台的集成测试中验证。
+
 ### Camera Manager
 
 负责管理多个 Camera Source。
