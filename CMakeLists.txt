@@ -329,8 +329,31 @@ endif()
 
 if(MINE_TELEOP_BUILD_TESTS)
   enable_testing()
+  find_program(MINE_TELEOP_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
+  add_executable(
+    mine-teleop-protocol-v1-contract-tests
+    cpp/tests/protocol_contract_tests.cpp
+  )
+  target_link_libraries(mine-teleop-protocol-v1-contract-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-protocol-v1-contract-tests)
+  add_test(
+    NAME mine-teleop-protocol-v1-contract-tests
+    COMMAND mine-teleop-protocol-v1-contract-tests
+  )
+  set_tests_properties(
+    mine-teleop-protocol-v1-contract-tests
+    PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  add_test(
+    NAME mine-teleop-protocol-v1-schema-js-tests
+    COMMAND ${MINE_TELEOP_NODE_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_protocol_contract_vectors.cjs
+  )
+  set_tests_properties(
+    mine-teleop-protocol-v1-schema-js-tests
+    PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
   if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
-    find_program(MINE_TELEOP_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
     add_test(
       NAME mine-teleop-control-logic-js-tests
       COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/control_logic.test.cjs

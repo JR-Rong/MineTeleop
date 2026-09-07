@@ -1,0 +1,366 @@
+{
+  "format": "mine-teleop-control-command-contract-v1",
+  "schema": "../control-command.schema.json",
+  "scope": "structural-only",
+  "numeric_compatibility": {
+    "portable_json_integer_maximum": 9007199254740991,
+    "cpp_seq_storage": "uint64_t",
+    "javascript_seq_storage": "Number",
+    "rule": "All v1 cross-language producers and validators use JSON integers from 0 through 9007199254740991. A wider sequence representation requires a new protocol version; it must not silently change this field into a string."
+  },
+  "vectors": [
+    {
+      "name": "valid-existing-golden-with-unknown-field",
+      "file": "../control-command.valid.json",
+      "structural_valid": true
+    },
+    {
+      "name": "invalid-existing-missing-driver-id",
+      "file": "../control-command.invalid-missing-driver-id.json",
+      "structural_valid": false
+    },
+    {
+      "name": "valid-lower-boundaries",
+      "structural_valid": true,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "v",
+        "driver_id": "d",
+        "session_id": "s",
+        "seq": 1,
+        "sent_at_utc_ms": 0,
+        "control_token": "t",
+        "gear": "P",
+        "steering": -1.0,
+        "throttle": 0.0,
+        "brake": 0.0,
+        "estop": false
+      }
+    },
+    {
+      "name": "valid-upper-boundaries",
+      "structural_valid": true,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-max",
+        "driver_id": "driver-max",
+        "session_id": "session-max",
+        "seq": 9007199254740991,
+        "sent_at_utc_ms": 9007199254740991,
+        "control_token": "control-token-max",
+        "gear": "D",
+        "steering": 1.0,
+        "throttle": 1.0,
+        "brake": 1.0,
+        "estop": true
+      }
+    },
+    {
+      "name": "valid-omitted-optional-estop",
+      "structural_valid": true,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-optional",
+        "driver_id": "driver-optional",
+        "session_id": "session-optional",
+        "seq": 2,
+        "sent_at_utc_ms": 1,
+        "control_token": "control-token-optional",
+        "gear": "N",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-missing-type",
+      "structural_valid": false,
+      "value": {
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 1,
+        "sent_at_utc_ms": 1,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-seq-wrong-type",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": "1",
+        "sent_at_utc_ms": 1,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-empty-vehicle-id",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 1,
+        "sent_at_utc_ms": 1,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-zero-seq",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 0,
+        "sent_at_utc_ms": 1,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-negative-seq",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": -1,
+        "sent_at_utc_ms": 1,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-seq-above-portable-json-range",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 9007199254740992,
+        "sent_at_utc_ms": 1,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-negative-timestamp",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 1,
+        "sent_at_utc_ms": -1,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-timestamp-above-portable-json-range",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 1,
+        "sent_at_utc_ms": 9007199254740992,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-unsupported-protocol-version",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 2,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 1,
+        "sent_at_utc_ms": 1,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-missing-control-token",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 1,
+        "sent_at_utc_ms": 1,
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-empty-control-token",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 1,
+        "sent_at_utc_ms": 1,
+        "control_token": "",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-gear",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 1,
+        "sent_at_utc_ms": 1,
+        "control_token": "token",
+        "gear": "L",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-steering-above-range",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 1,
+        "sent_at_utc_ms": 1,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 1.000001,
+        "throttle": 0.0,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-throttle-below-range",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 1,
+        "sent_at_utc_ms": 1,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": -0.000001,
+        "brake": 0.0
+      }
+    },
+    {
+      "name": "invalid-brake-above-range",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 1,
+        "sent_at_utc_ms": 1,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 1.000001
+      }
+    },
+    {
+      "name": "invalid-estop-wrong-type",
+      "structural_valid": false,
+      "value": {
+        "type": "control_command",
+        "protocol_version": 1,
+        "vehicle_id": "vehicle-001",
+        "driver_id": "driver-001",
+        "session_id": "session-001",
+        "seq": 1,
+        "sent_at_utc_ms": 1,
+        "control_token": "token",
+        "gear": "D",
+        "steering": 0.0,
+        "throttle": 0.0,
+        "brake": 0.0,
+        "estop": "false"
+      }
+    }
+  ]
+}
