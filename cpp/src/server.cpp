@@ -3013,7 +3013,9 @@ SignalingService::LoginFailureReservation SignalingService::reserve_login_failur
     state = LoginFailureState{
         .failures = 0,
         .pending_failures = 0,
-        .window_started_at_monotonic_ms = admitted_at.monotonic.value};
+        .window_started_at_monotonic_ms = admitted_at.monotonic.value,
+        .blocked_until_utc_ms = std::nullopt,
+        .blocked_until_monotonic_ms = std::nullopt};
   } else if (state.blocked_until_monotonic_ms.has_value()) {
     // This can only occur when an already-expired lockout still has an
     // in-flight candidate. Keep that candidate in its admission window rather
@@ -3062,7 +3064,9 @@ void SignalingService::record_login_failure_locked(
                     LoginFailureState{
                         .failures = 0,
                         .pending_failures = 1,
-                        .window_started_at_monotonic_ms = reservation.admitted_at_monotonic_ms})
+                        .window_started_at_monotonic_ms = reservation.admitted_at_monotonic_ms,
+                        .blocked_until_utc_ms = std::nullopt,
+                        .blocked_until_monotonic_ms = std::nullopt})
                 .first;
   }
   auto& state = found->second;
