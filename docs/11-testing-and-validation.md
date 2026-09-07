@@ -39,6 +39,28 @@ scripts/test/check_incremental_quality.sh --base <pr-head-sha> --compile-command
 阻塞门禁时，添加 `--require-format`、`--require-eslint` 或 `--require-tidy`。当前
 质量层不引入全仓历史 baseline、自动修复或新的测试框架。
 
+GitHub Actions 中独立的 `Linux incremental quality` job 是目前的阻塞环境：它以
+完整 Git history checkout，PR 使用 `pull_request.base.sha` 作为基线；向 `main`
+的非 PR push 使用该 push 的 `before` SHA。两者都会先确认基线对象存在且是当前
+HEAD 的祖先，因此首个零 SHA push 或 force push 的非祖先基线会明确失败，而不会
+悄悄改用错误的比较范围。手动 dispatch 使用当前 HEAD 的第一父提交。
+
+该 job 固定 Node 20.19.5、锁文件中的 ESLint 9.39.5，以及 LLVM APT 的
+`clang-format-18` 18.1.8 精确包版本；通过 `npm ci` 安装 lint 依赖，且仅以
+`--dry-run --Werror` 的 formatter 检查运行新增/改动文件。它调用：
+
+```bash
+scripts/test/check_incremental_quality.sh \
+  --base <event-base-sha> \
+  --require-format \
+  --require-eslint
+```
+
+`clang-tidy` 尚未成为该轻量 job 的必需门禁：它仍只在调用方显式提供与目标、编译器和
+生成参数匹配的 `compile_commands.json` 时执行。不要为了让它在此 job 中运行而使用
+与实际构建不匹配的 compile database；待可重复地生成该数据库后，才能单独启用
+`--require-tidy`。
+
 轻量 C++ 测试可逐步包含 `cpp/tests/test_support.hpp`，并用
 `MINE_TELEOP_EXPECT` / `MINE_TELEOP_EXPECT_THROWS` 保留现有的异常式 runner，同时在
 失败消息中写入调用点文件和行号。该 header 保持 C++17 兼容；其独立验证为：

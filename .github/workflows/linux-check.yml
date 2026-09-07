@@ -6,6 +6,10 @@ on:
     paths:
       - ".github/workflows/linux-check.yml"
       - ".dockerignore"
+      - ".clang-format"
+      - ".clang-tidy"
+      - ".editorconfig"
+      - ".eslint.config.cjs"
       - "CMakeLists.txt"
       - "CMakePresets.json"
       - "cmake/**"
@@ -13,8 +17,11 @@ on:
       - "cpp/**"
       - "deployments/**"
       - "docs/BUILD.md"
+      - "package.json"
+      - "package-lock.json"
       - "protocol/**"
       - "scripts/**"
+      - "tools/**"
       - "vendor/**"
   push:
     branches:
@@ -22,6 +29,10 @@ on:
     paths:
       - ".github/workflows/linux-check.yml"
       - ".dockerignore"
+      - ".clang-format"
+      - ".clang-tidy"
+      - ".editorconfig"
+      - ".eslint.config.cjs"
       - "CMakeLists.txt"
       - "CMakePresets.json"
       - "cmake/**"
@@ -29,8 +40,11 @@ on:
       - "cpp/**"
       - "deployments/**"
       - "docs/BUILD.md"
+      - "package.json"
+      - "package-lock.json"
       - "protocol/**"
       - "scripts/**"
+      - "tools/**"
       - "vendor/**"
 
 permissions:
@@ -41,6 +55,103 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  incremental-quality:
+    name: Linux incremental quality
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out MineTeleop with its comparison base
+        # actions/checkout v4.4.0; update through Dependabot and verify the commit.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node for locked ESLint
+        # actions/setup-node v4.4.0; tag verified at 49933ea5288caeca8642d1e84afbd3f7d6820020.
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20.19.5"
+          check-latest: false
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install pinned clang-format 18
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly llvm_key_sha256='8b2a587ffd672c4687e7581dad4b2f6c1bb2ad6b480cd9771ba2ff48e0b8c75d'
+          readonly clang_format_package='clang-format-18=1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144'
+          llvm_key="$RUNNER_TEMP/llvm-snapshot.gpg.key"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            https://apt.llvm.org/llvm-snapshot.gpg.key \
+            --output "$llvm_key"
+          printf '%s  %s\n' "$llvm_key_sha256" "$llvm_key" | sha256sum --check --status
+          sudo install --directory --mode=0755 /etc/apt/keyrings
+          sudo install --mode=0644 "$llvm_key" /etc/apt/keyrings/llvm-snapshot.asc
+          printf '%s\n' \
+            'deb [signed-by=/etc/apt/keyrings/llvm-snapshot.asc] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main' \
+            | sudo tee /etc/apt/sources.list.d/llvm-toolchain-18.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends "$clang_format_package"
+          clang-format-18 --version | tee "$RUNNER_TEMP/clang-format-version.log"
+          grep -F 'clang-format version 18.1.8' "$RUNNER_TEMP/clang-format-version.log"
+
+      - name: Install locked ESLint 9
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --audit=false --fund=false
+          ./node_modules/.bin/eslint --version | tee "$RUNNER_TEMP/eslint-version.log"
+          grep -Fx 'v9.39.5' "$RUNNER_TEMP/eslint-version.log"
+
+      - name: Resolve incremental-quality baseline
+        id: quality-base
+        shell: bash
+        env:
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          PUSH_BEFORE_SHA: ${{ github.event.before || '' }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              quality_base="$PULL_REQUEST_BASE_SHA"
+              ;;
+            push)
+              quality_base="$PUSH_BEFORE_SHA"
+              ;;
+            workflow_dispatch)
+              quality_base="$(git rev-parse --verify HEAD^)"
+              ;;
+            *)
+              printf 'unsupported incremental-quality event: %s\n' "$GITHUB_EVENT_NAME" >&2
+              exit 2
+              ;;
+          esac
+          if [[ -z "$quality_base" || "$quality_base" =~ ^0+$ ]]; then
+            printf 'incremental-quality has no usable predecessor for %s\n' "$GITHUB_EVENT_NAME" >&2
+            exit 2
+          fi
+          quality_base="$(git rev-parse --verify "${quality_base}^{commit}")"
+          git merge-base --is-ancestor "$quality_base" HEAD
+          printf 'base_sha=%s\n' "$quality_base" >> "$GITHUB_OUTPUT"
+          printf 'Incremental-quality baseline: `%s` (%s)\n' \
+            "$quality_base" "$GITHUB_EVENT_NAME" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run required incremental quality checks
+        shell: bash
+        env:
+          MINE_TELEOP_CLANG_FORMAT: clang-format-18
+          MINE_TELEOP_ESLINT: ${{ github.workspace }}/node_modules/.bin/eslint
+        run: |
+          set -euo pipefail
+          bash scripts/test/check_incremental_quality.sh \
+            --base "${{ steps.quality-base.outputs.base_sha }}" \
+            --require-format \
+            --require-eslint
+
   docker-check:
     name: Linux amd64 Docker check
     runs-on: ubuntu-22.04

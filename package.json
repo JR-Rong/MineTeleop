@@ -1,0 +1,9 @@
+{
+  "name": "mine-teleop-quality-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Locked local tooling for Mine Teleop incremental-quality CI.",
+  "devDependencies": {
+    "eslint": "9.39.5"
+  }
+}
