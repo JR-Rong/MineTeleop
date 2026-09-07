@@ -6576,7 +6576,10 @@ void test_driver_login_failure_rate_limit_and_recovery() {
   config.device_tokens = {{"vehicle-1", "device-token"}};
   config.driver_vehicle_permissions = {{"driver-1", {"vehicle-1"}}};
   config.login_max_failures = 3;
-  config.login_failure_window_ms = 1000;
+  // Unknown identities deliberately run the dummy Argon2id verifier, so the
+  // ordinary sequential fixture needs a window wider than one serial KDF.
+  // The concurrent reservation regression below uses a one-millisecond window.
+  config.login_failure_window_ms = 10 * 1000;
   config.login_lockout_ms = 25;
   const auto audit_path = std::filesystem::path("/tmp") /
       ("mine-teleop-login-rate-limit-" + mine_teleop::random_token(6) + ".jsonl");
@@ -6659,11 +6662,11 @@ void test_driver_login_failure_rate_limit_and_recovery() {
   auto concurrent_config = config;
   concurrent_config.audit_log_path.clear();
   concurrent_config.login_max_failures = 4;
+  concurrent_config.login_failure_window_ms = 1;
   concurrent_config.login_lockout_ms = 1000;
   // Keep this test focused on the atomic login-failure counter. The KDF slot
-  // budget has separate coverage; its production default would otherwise
-  // return capacity 429s before all of these concurrent wrong passwords reach
-  // the lockout accounting path.
+  // budget has separate coverage. The one-millisecond window makes a
+  // completion-time reset visible without adding KDF-capacity rejections.
   concurrent_config.password_verification_max_concurrency = 12;
   mine_teleop::SignalingService concurrent_service(concurrent_config);
   std::vector<int> concurrent_statuses(12, 0);
@@ -6689,6 +6692,66 @@ void test_driver_login_failure_rate_limit_and_recovery() {
   expect(
       std::count(concurrent_statuses.begin(), concurrent_statuses.end(), 429) == 9,
       "concurrent failure counter did not consistently enforce lockout");
+
+  auto reservation_cleanup_config = config;
+  reservation_cleanup_config.login_max_failures = 3;
+  reservation_cleanup_config.login_lockout_ms = 1000;
+  reservation_cleanup_config.password_verification_max_concurrency = 1;
+  reservation_cleanup_config.password_verification_retry_after_ms = 17;
+  const auto reservation_cleanup_audit_path = std::filesystem::path("/tmp") /
+      ("mine-teleop-login-reservation-" + mine_teleop::random_token(6) + ".jsonl");
+  reservation_cleanup_config.audit_log_path = reservation_cleanup_audit_path.string();
+  mine_teleop::SignalingService reservation_cleanup_service(reservation_cleanup_config);
+  const auto reservation_cleanup_login = [&](std::string_view driver_id) {
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.target = "/auth/driver_login";
+    request.path = request.target;
+    request.body = mine_teleop::Json({
+        {"driver_id", std::string(driver_id)},
+        {"password", "wrong"},
+    }).dump();
+    return reservation_cleanup_service.handle(request);
+  };
+  std::atomic<int> slot_holding_status{0};
+  std::jthread slot_holding_attempt([&] {
+    slot_holding_status.store(reservation_cleanup_login("slot-holding-unknown").status);
+  });
+  const auto verification_active_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < verification_active_deadline &&
+         reservation_cleanup_service.health().value("password_verification_active", std::size_t{0}) != 1) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  expect(
+      reservation_cleanup_service.health().value("password_verification_active", std::size_t{0}) == 1,
+      "reservation cleanup fixture did not occupy the only password verification slot");
+  const auto slot_exhausted = reservation_cleanup_login("slot-exhausted-unknown");
+  expect(slot_exhausted.status == 429, "password verification slot exhaustion was not rejected");
+  expect(
+      mine_teleop::Json::parse(slot_exhausted.body).value("retry_after_ms", 0) ==
+          reservation_cleanup_config.password_verification_retry_after_ms,
+      "password verification slot exhaustion did not retain its own retry budget");
+  slot_holding_attempt.join();
+  expect(slot_holding_status.load() == 401, "slot-holding unknown login did not settle as a failure");
+  expect(
+      reservation_cleanup_login("after-slot-one").status == 401,
+      "slot exhaustion leaked a pending login failure reservation");
+  expect(
+      reservation_cleanup_login("after-slot-two").status == 429,
+      "threshold candidate did not establish lockout after reservation cleanup");
+  std::ifstream reservation_cleanup_audit_input(reservation_cleanup_audit_path);
+  std::size_t reservation_cleanup_failures = 0;
+  std::string reservation_cleanup_audit_line;
+  while (std::getline(reservation_cleanup_audit_input, reservation_cleanup_audit_line)) {
+    if (mine_teleop::Json::parse(reservation_cleanup_audit_line).value("event", "") ==
+        "driver_login_failed") {
+      ++reservation_cleanup_failures;
+    }
+  }
+  expect(
+      reservation_cleanup_failures == 3,
+      "slot exhaustion consumed a pending login failure reservation after rejection");
+  std::filesystem::remove(reservation_cleanup_audit_path);
 
   auto unavailable_audit_config = config;
   unavailable_audit_config.login_max_failures = 1;

@@ -258,8 +258,13 @@ class SignalingService {
   };
   struct LoginFailureState {
     std::int64_t failures{0};
+    std::int64_t pending_failures{0};
     std::int64_t window_started_at_ms{0};
     std::int64_t blocked_until_ms{0};
+  };
+  struct LoginFailureReservation {
+    std::string bucket;
+    std::int64_t admitted_at_ms{0};
   };
   struct LoginCredentialSnapshot {
     enum class Kind {
@@ -318,9 +323,15 @@ class SignalingService {
   [[nodiscard]] bool configured_driver(std::string_view driver_id) const;
   [[nodiscard]] bool try_acquire_password_verification_slot();
   void release_password_verification_slot() noexcept;
-  void enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms);
-  void record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms);
-  void clear_login_failures(std::string_view driver_id);
+  [[nodiscard]] LoginFailureReservation reserve_login_failure_locked(
+      std::string_view driver_id,
+      std::int64_t admitted_at_ms);
+  void release_login_failure_reservation_locked(const LoginFailureReservation& reservation);
+  void record_login_failure_locked(
+      std::string_view driver_id,
+      const LoginFailureReservation& reservation,
+      std::int64_t settled_at_ms);
+  void clear_login_failures_locked(std::string_view driver_id);
   [[nodiscard]] std::string request_source(const HttpRequest& request) const;
   void cleanup_api_rate_limits(std::int64_t timestamp_ms);
   void enforce_api_rate_limit(const HttpRequest& request, std::int64_t timestamp_ms);

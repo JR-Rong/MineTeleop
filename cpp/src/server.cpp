@@ -2909,35 +2909,79 @@ void SignalingService::release_password_verification_slot() noexcept {
   if (active_password_verifications_ > 0) --active_password_verifications_;
 }
 
-void SignalingService::enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms) {
+SignalingService::LoginFailureReservation SignalingService::reserve_login_failure_locked(
+    std::string_view driver_id,
+    std::int64_t admitted_at_ms) {
   const bool known_driver = configured_driver(driver_id);
   const std::string bucket = known_driver ? "driver:" + std::string(driver_id) : "unknown";
-  const auto found = login_failures_.find(bucket);
-  if (found == login_failures_.end()) return;
-
-  auto& state = found->second;
-  if (state.blocked_until_ms > timestamp_ms) {
-    throw TooManyRequests("too many login attempts", state.blocked_until_ms - timestamp_ms);
+  auto& state = login_failures_[bucket];
+  if (state.blocked_until_ms > admitted_at_ms) {
+    throw TooManyRequests("too many login attempts", state.blocked_until_ms - admitted_at_ms);
   }
-  if (state.blocked_until_ms > 0 || timestamp_ms - state.window_started_at_ms >= config_.login_failure_window_ms) {
+
+  const bool window_expired =
+      state.window_started_at_ms > 0 &&
+      admitted_at_ms - state.window_started_at_ms >= config_.login_failure_window_ms;
+  if (state.pending_failures == 0 && (state.blocked_until_ms > 0 || window_expired)) {
+    state = LoginFailureState{0, 0, admitted_at_ms, 0};
+  } else if (state.blocked_until_ms > 0) {
+    // This can only occur when an already-expired lockout still has an
+    // in-flight candidate. Keep that candidate in its admission window rather
+    // than resetting its state based on a later KDF completion.
+    state.blocked_until_ms = 0;
+  }
+  if (state.window_started_at_ms == 0) {
+    state.window_started_at_ms = admitted_at_ms;
+  }
+  if (state.failures >= config_.login_max_failures ||
+      state.pending_failures >= config_.login_max_failures - state.failures) {
+    throw TooManyRequests("too many login attempts", config_.login_lockout_ms);
+  }
+
+  ++state.pending_failures;
+  return LoginFailureReservation{bucket, admitted_at_ms};
+}
+
+void SignalingService::release_login_failure_reservation_locked(
+    const LoginFailureReservation& reservation) {
+  const auto found = login_failures_.find(reservation.bucket);
+  if (found == login_failures_.end()) return;
+  auto& state = found->second;
+  if (state.pending_failures <= 0) return;
+  --state.pending_failures;
+  if (state.pending_failures == 0 && state.failures == 0 && state.blocked_until_ms == 0) {
     login_failures_.erase(found);
   }
 }
 
-void SignalingService::record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms) {
+void SignalingService::record_login_failure_locked(
+    std::string_view driver_id,
+    const LoginFailureReservation& reservation,
+    std::int64_t settled_at_ms) {
   const bool known_driver = configured_driver(driver_id);
-  const std::string bucket = known_driver ? "driver:" + std::string(driver_id) : "unknown";
-  auto& state = login_failures_[bucket];
-  if (state.window_started_at_ms == 0 ||
-      timestamp_ms - state.window_started_at_ms >= config_.login_failure_window_ms) {
-    state = LoginFailureState{0, timestamp_ms, 0};
+  auto found = login_failures_.find(reservation.bucket);
+  if (found == login_failures_.end()) {
+    found = login_failures_
+                .emplace(
+                    reservation.bucket,
+                    LoginFailureState{0, 1, reservation.admitted_at_ms, 0})
+                .first;
+  }
+  auto& state = found->second;
+  if (state.pending_failures <= 0) {
+    state.pending_failures = 1;
+    state.window_started_at_ms = reservation.admitted_at_ms;
+  }
+  --state.pending_failures;
+  if (state.window_started_at_ms == 0) {
+    state.window_started_at_ms = reservation.admitted_at_ms;
   }
   ++state.failures;
   const bool lock_login = state.failures >= config_.login_max_failures;
   if (lock_login) {
-    state.blocked_until_ms = config_.login_lockout_ms > std::numeric_limits<std::int64_t>::max() - timestamp_ms
+    state.blocked_until_ms = config_.login_lockout_ms > std::numeric_limits<std::int64_t>::max() - settled_at_ms
         ? std::numeric_limits<std::int64_t>::max()
-        : timestamp_ms + config_.login_lockout_ms;
+        : settled_at_ms + config_.login_lockout_ms;
   }
   const Json identity = known_driver
       ? Json{{"driver_id", std::string(driver_id)}, {"recognized_driver", true}}
@@ -2955,8 +2999,15 @@ void SignalingService::record_login_failure(std::string_view driver_id, std::int
   throw TooManyRequests("too many login attempts", config_.login_lockout_ms);
 }
 
-void SignalingService::clear_login_failures(std::string_view driver_id) {
-  login_failures_.erase("driver:" + std::string(driver_id));
+void SignalingService::clear_login_failures_locked(std::string_view driver_id) {
+  const auto found = login_failures_.find("driver:" + std::string(driver_id));
+  if (found == login_failures_.end()) return;
+  if (found->second.pending_failures == 0) {
+    login_failures_.erase(found);
+    return;
+  }
+  found->second.failures = 0;
+  found->second.blocked_until_ms = 0;
 }
 
 std::string SignalingService::request_source(const HttpRequest& request) const {
@@ -4024,11 +4075,11 @@ ServerResponse SignalingService::handle_driver_login(Json value) {
   }
 
   LoginCredentialSnapshot credential;
+  std::optional<LoginFailureReservation> reservation;
   {
     std::lock_guard lock(mutex_);
-    const auto timestamp_ms = now_ms();
-    cleanup_expired_connections(timestamp_ms);
-    enforce_login_rate_limit(driver_id, timestamp_ms);
+    const auto admitted_at_ms = now_ms();
+    cleanup_expired_connections(admitted_at_ms);
     if (const auto found = config_.driver_password_verifiers.find(driver_id);
         found != config_.driver_password_verifiers.end()) {
       credential.kind = LoginCredentialSnapshot::Kind::Argon2id;
@@ -4040,9 +4091,25 @@ ServerResponse SignalingService::handle_driver_login(Json value) {
         credential.verifier = found->second;
       }
     }
+    reservation.emplace(reserve_login_failure_locked(driver_id, admitted_at_ms));
   }
 
-  if (!try_acquire_password_verification_slot()) {
+  const auto release_reservation = [&] {
+    if (!reservation) return;
+    std::lock_guard lock(mutex_);
+    release_login_failure_reservation_locked(*reservation);
+    reservation.reset();
+  };
+
+  bool verification_slot_acquired = false;
+  try {
+    verification_slot_acquired = try_acquire_password_verification_slot();
+  } catch (...) {
+    release_reservation();
+    throw;
+  }
+  if (!verification_slot_acquired) {
+    release_reservation();
     throw TooManyRequests(
         "password verification capacity is temporarily exhausted",
         config_.password_verification_retry_after_ms);
@@ -4069,6 +4136,7 @@ ServerResponse SignalingService::handle_driver_login(Json value) {
     }
   } catch (...) {
     release_password_verification_slot();
+    release_reservation();
     throw;
   }
   release_password_verification_slot();
@@ -4077,10 +4145,14 @@ ServerResponse SignalingService::handle_driver_login(Json value) {
   const auto timestamp_ms = now_ms();
   cleanup_expired_connections(timestamp_ms);
   if (!verified || credential.kind == LoginCredentialSnapshot::Kind::Unknown) {
-    record_login_failure(driver_id, timestamp_ms);
+    const auto failed_reservation = *reservation;
+    reservation.reset();
+    record_login_failure_locked(driver_id, failed_reservation, timestamp_ms);
     throw Unauthorized("invalid driver credentials");
   }
-  clear_login_failures(driver_id);
+  release_login_failure_reservation_locked(*reservation);
+  reservation.reset();
+  clear_login_failures_locked(driver_id);
   if (revoked_drivers_.contains(driver_id)) {
     audit("driver_login_rejected", {{"driver_id", driver_id}, {"reason", "driver_revoked"}});
     throw Unauthorized("driver is revoked");
