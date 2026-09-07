@@ -16,6 +16,37 @@ find scripts -type f -name '*.sh' -print0 \
 同时检查文档和脚本是否引用已删除的文件。静态检查只能证明仓库内部一致性，
 不能证明目标平台能够构建或运行。
 
+### 增量开发质量检查
+
+新增或改动 C++、Shell、浏览器 JavaScript、CommonJS 测试或协议工具时，先以当前
+PR 的起点作为明确基线运行只读检查：
+
+```bash
+scripts/test/check_incremental_quality.sh --base <pr-head-sha>
+```
+
+该脚本只检查基线之后，以及 staged、unstaged 和未跟踪的相关文件；不会执行
+`clang-format -i`、`clang-tidy --fix` 或全仓格式化。C++ 格式使用仓库根目录的
+`.clang-format`，固定为 clang-format 18；`.clang-tidy` 只启用一组小的
+bugprone/performance 检查，且仅在显式提供 build 目录时运行：
+
+```bash
+scripts/test/check_incremental_quality.sh --base <pr-head-sha> --compile-commands /path/to/cmake-build
+```
+
+浏览器脚本和 `.cjs` 测试共享 `.eslint.config.cjs`，但 ESLint 是可选的本地开发
+工具；未安装时脚本仍会运行 `node --check` 并明确报告 skip。需要把某一环境变成
+阻塞门禁时，添加 `--require-format`、`--require-eslint` 或 `--require-tidy`。当前
+质量层不引入全仓历史 baseline、自动修复或新的测试框架。
+
+轻量 C++ 测试可逐步包含 `cpp/tests/test_support.hpp`，并用
+`MINE_TELEOP_EXPECT` / `MINE_TELEOP_EXPECT_THROWS` 保留现有的异常式 runner，同时在
+失败消息中写入调用点文件和行号。该 header 保持 C++17 兼容；其独立验证为：
+
+```bash
+scripts/test/check_test_support_header.sh
+```
+
 ### 2. Ubuntu 22.04 原生构建
 
 ```bash

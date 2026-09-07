@@ -1,0 +1,16 @@
+# Check with clang-format 18. The incremental checker deliberately never runs
+# clang-format with -i, and only inspects files changed from its explicit base.
+BasedOnStyle: Google
+IndentWidth: 2
+ColumnLimit: 100
+PointerAlignment: Left
+ReferenceAlignment: Left
+SortIncludes: Never
+IncludeBlocks: Preserve
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+BreakBeforeBraces: Attach
+SpaceBeforeParens: ControlStatements
+SpacesInContainerLiterals: false
+Standard: c++20
