@@ -26,6 +26,13 @@ mkdir -p .local/deployment/identity-secrets
 
 openssl rand -base64 32 \
   > .local/deployment/identity-secrets/driver-console-001.password
+argon2_salt="$(openssl rand -hex 16)"
+tr -d '\r\n' < .local/deployment/identity-secrets/driver-console-001.password \
+  | argon2 "$argon2_salt" -id -t 3 -m 16 -p 1 -e \
+  > .local/deployment/identity-secrets/driver-console-001.password.argon2id
+unset argon2_salt
+chmod 600 .local/deployment/identity-secrets/driver-console-001.password \
+  .local/deployment/identity-secrets/driver-console-001.password.argon2id
 openssl rand -hex 32 \
   > .local/deployment/identity-secrets/vehicle-001.token
 openssl rand -hex 32 \
@@ -37,7 +44,8 @@ cp packaging/ubuntu-cloud/signaling-server.yaml.example \
 
 凭据对应关系：
 
-- `driver-console-001.password`：控制页面登录密码；
+- `driver-console-001.password`：仅在受限管理端保留并经安全通道交付给驾驶员；
+- `driver-console-001.password.argon2id`：上传到云端并由信令服务读取的 Argon2id verifier；
 - `vehicle-001.token`：云端和车端共享的车辆设备凭据；
 - `turn-static-auth.secret`：云端信令和 Coturn 共享的 TURN REST secret。
 
@@ -65,7 +73,7 @@ cd ~/mine-teleop-cloud
 
 ```text
 /secure/staging/signaling-server.yaml
-/secure/staging/identity-secrets/driver-console-001.password
+/secure/staging/identity-secrets/driver-console-001.password.argon2id
 /secure/staging/identity-secrets/vehicle-001.token
 /secure/staging/turn-static-auth.secret
 ```

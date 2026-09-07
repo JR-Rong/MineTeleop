@@ -6,7 +6,7 @@ repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 driver_script="$repo_root/scripts/admin/add_driver.sh"
 vehicle_script="$repo_root/scripts/admin/add_vehicle.sh"
 
-if ! command -v python3 >/dev/null 2>&1 ||
+if ! command -v python3 >/dev/null 2>&1 || ! command -v argon2 >/dev/null 2>&1 ||
   ! python3 -c 'import yaml' >/dev/null 2>&1; then
   printf 'admin_yaml_editor_test=skipped reason=python3_pyyaml_unavailable\n'
   exit 0
@@ -164,6 +164,14 @@ grep -Fq 'title: "巡检配置"' "$fixture_config" || {
 }
 [[ "$(file_mode "$secrets_dir/driver-fallback-applied.password")" == 600 ]] || {
   printf 'fallback created password with an unexpected mode\n' >&2
+  exit 2
+}
+[[ "$(file_mode "$secrets_dir/driver-fallback-applied.password.argon2id")" == 600 ]] || {
+  printf 'fallback created verifier with an unexpected mode\n' >&2
+  exit 2
+}
+grep -Fq 'password_hash_file:' "$fixture_config" || {
+  printf 'fallback did not add an Argon2id verifier reference\n' >&2
   exit 2
 }
 

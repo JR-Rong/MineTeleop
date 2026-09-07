@@ -89,7 +89,13 @@ class SimpleHttpServer {
 struct SignalingServerConfig {
   std::string host{"127.0.0.1"};
   std::uint16_t port{8765};
+  // Legacy plaintext credentials are retained only for an explicitly enabled
+  // migration window and in-process test fixtures. File-backed production
+  // configuration should use driver_password_verifiers exclusively.
+  bool allow_legacy_passwords{false};
+  std::string legacy_passwords_remove_by;
   std::unordered_map<std::string, std::string> driver_passwords{{"driver-console-001", "dev-password"}};
+  std::unordered_map<std::string, std::string> driver_password_verifiers;
   std::unordered_map<std::string, std::string> device_tokens{{"vehicle-001", "dev-device-secret"}};
   std::unordered_map<std::string, std::unordered_set<std::string>> driver_vehicle_permissions{
       {"driver-console-001", {"vehicle-001"}}};
@@ -102,6 +108,8 @@ struct SignalingServerConfig {
   std::int64_t login_max_failures{5};
   std::int64_t login_failure_window_ms{60 * 1000};
   std::int64_t login_lockout_ms{5 * 60 * 1000};
+  std::size_t password_verification_max_concurrency{2};
+  std::int64_t password_verification_retry_after_ms{250};
   std::int64_t api_rate_limit_requests{600};
   std::int64_t api_rate_limit_window_ms{60 * 1000};
   std::int64_t api_rate_limit_max_sources{4096};
@@ -205,6 +213,16 @@ class SignalingService {
     std::int64_t window_started_at_ms{0};
     std::int64_t blocked_until_ms{0};
   };
+  struct LoginCredentialSnapshot {
+    enum class Kind {
+      Argon2id,
+      LegacyPlaintext,
+      Unknown,
+    };
+
+    Kind kind{Kind::Unknown};
+    std::string verifier;
+  };
   struct ApiRateState {
     std::int64_t requests{0};
     std::int64_t window_started_at_ms{0};
@@ -213,6 +231,7 @@ class SignalingService {
 
   [[nodiscard]] ServerResponse handle_get(const HttpRequest& request);
   [[nodiscard]] ServerResponse handle_post(const HttpRequest& request);
+  [[nodiscard]] ServerResponse handle_driver_login(Json value);
   [[nodiscard]] Json enqueue_signaling_message(
       std::string_view session_id,
       const Json& value,
@@ -245,6 +264,9 @@ class SignalingService {
   void close_sessions_for_driver(std::string_view driver_id, std::string_view reason);
   void transition_session(Session& session, SessionState next, std::string_view reason);
   void close_session(Session& session, std::string_view reason);
+  [[nodiscard]] bool configured_driver(std::string_view driver_id) const;
+  [[nodiscard]] bool try_acquire_password_verification_slot();
+  void release_password_verification_slot() noexcept;
   void enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms);
   void record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms);
   void clear_login_failures(std::string_view driver_id);
@@ -257,6 +279,7 @@ class SignalingService {
   std::string service_instance_id_;
   std::function<std::int64_t()> audit_clock_;
   mutable std::mutex mutex_;
+  mutable std::mutex password_verification_mutex_;
   mutable std::mutex audit_log_mutex_;
   mutable std::int64_t audit_log_period_start_ms_{-1};
   mutable std::int64_t audit_log_last_retention_period_ms_{-1};
@@ -276,6 +299,7 @@ class SignalingService {
   std::unordered_map<std::string, AcceptedMessage> last_accepted_messages_;
   std::unordered_map<std::string, std::uint64_t> next_delivery_cursors_;
   std::unordered_map<std::string, LoginFailureState> login_failures_;
+  std::size_t active_password_verifications_{0};
   std::unordered_set<std::string> trusted_proxy_addresses_;
   std::unordered_map<std::string, ApiRateState> api_rate_limits_;
   ApiRateState api_rate_limit_overflow_;

@@ -2,9 +2,9 @@
 #
 # add_driver.sh - register a new driver identity in a signaling server config.
 #
-# Generates a random password file (0600) and appends a driver entry to the
-# `auth.drivers` sequence of the multi-identity YAML consumed by
-# `mine-teleop-signaling-server --config`.
+# Generates a random password file (0600), derives an Argon2id verifier file
+# (0600), and appends a hash-backed driver entry to the `auth.drivers`
+# sequence consumed by `mine-teleop-signaling-server --config`.
 #
 # Usage:
 #   add_driver.sh --id DRIVER_ID --config YAML_PATH --vehicles ID[,ID...]
@@ -71,11 +71,12 @@ Required:
 Options:
   --secrets-dir DIR         credential directory (default: .local for repo configs,
                             otherwise secrets/ next to the config)
+  --password-stdin          read a supplied password once from standard input
   --dry-run                 report the planned changes without writing anything
   --help                    show this help
 
-Requires: openssl, plus one YAML backend: yq (mikefarah/yq v4) or python3 with
-PyYAML (used automatically when yq is unavailable).
+Requires: openssl, argon2, plus one YAML backend: yq (mikefarah/yq v4) or
+python3 with PyYAML (used automatically when yq is unavailable).
 EOF
 }
 
@@ -93,6 +94,7 @@ config_path=''
 secrets_dir=''
 vehicles_csv=''
 dry_run=0
+password_stdin=0
 
 require_value() {
   [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
@@ -124,6 +126,10 @@ while [[ $# -gt 0 ]]; do
       dry_run=1
       shift
       ;;
+    --password-stdin)
+      password_stdin=1
+      shift
+      ;;
     --help | -h)
       usage
       exit 0
@@ -143,6 +149,7 @@ done
   die "driver id must start alphanumeric and contain only letters, digits, '.', '_' or '-': $driver_id"
 
 command -v openssl >/dev/null 2>&1 || die "openssl is required but was not found in PATH"
+command -v argon2 >/dev/null 2>&1 || die "argon2 is required but was not found in PATH"
 select_yaml_engine
 
 [[ -f "$config_path" ]] || die "config file does not exist: $config_path"
@@ -224,20 +231,23 @@ done
 [[ ${#requested_vehicles[@]} -gt 0 ]] || die "--vehicles must list at least one vehicle"
 
 password_path="$secrets_dir/$driver_id.password"
-if [[ -e "$password_path" ]]; then
-  die "credential file already exists: $password_path
-      refusing to overwrite an existing credential; remove or rename it first"
-fi
+password_hash_path="$secrets_dir/$driver_id.password.argon2id"
+for credential_path in "$password_path" "$password_hash_path"; do
+  if [[ -e "$credential_path" ]]; then
+    die "credential file already exists: $credential_path
+        refusing to overwrite an existing credential; remove or rename it first"
+  fi
+done
 
-# password_file is resolved relative to the config directory by the server, so
-# record a relative path whenever the secrets directory lives under it. -m keeps
-# this working before the credential (or its directory) exists.
-password_file_value="$password_path"
-if [[ "$config_dir" == "$repo_root/configs" && "$password_path" == "$repo_root/.local/"* ]]; then
-  password_file_value="../${password_path#"$repo_root"/}"
-elif relative="$(realpath -m --relative-to="$config_dir" -- "$password_path" 2>/dev/null)" &&
+# password_hash_file is resolved relative to the config directory by the
+# server, so record a relative path whenever the secrets directory lives under
+# it. -m keeps this working before the credential (or its directory) exists.
+password_hash_file_value="$password_hash_path"
+if [[ "$config_dir" == "$repo_root/configs" && "$password_hash_path" == "$repo_root/.local/"* ]]; then
+  password_hash_file_value="../${password_hash_path#"$repo_root"/}"
+elif relative="$(realpath -m --relative-to="$config_dir" -- "$password_hash_path" 2>/dev/null)" &&
   [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
-  password_file_value="$relative"
+  password_hash_file_value="$relative"
 fi
 
 vehicles_display="$(
@@ -263,14 +273,20 @@ elif command -v mine-teleop-signaling-server >/dev/null 2>&1; then
   signaling_binary="$(command -v mine-teleop-signaling-server)"
 fi
 
-# Render the modified document into a sibling temp file: relative password_file
+# Render the modified document into a sibling temp file: relative verifier
 # paths then resolve exactly as they will once the file is in place.
 created_secrets_dir="no"
 created_password="no"
+created_password_hash="no"
+password_stage=''
+password_hash_stage=''
 work_path="$(mktemp "$config_dir/.${config_name}.add-driver.XXXXXX")"
 cleanup() {
   rm -f -- "$work_path"
+  [[ -n "$password_stage" ]] && rm -f -- "$password_stage"
+  [[ -n "$password_hash_stage" ]] && rm -f -- "$password_hash_stage"
   [[ "$created_password" == "yes" ]] && rm -f -- "$password_path"
+  [[ "$created_password_hash" == "yes" ]] && rm -f -- "$password_hash_path"
   [[ "$created_secrets_dir" == "yes" ]] && rmdir -- "$secrets_dir" 2>/dev/null
   return 0
 }
@@ -278,7 +294,7 @@ trap cleanup EXIT
 cat -- "$config_path" >"$work_path"
 
 MINE_TELEOP_NEW_VEHICLES="$vehicles_display"
-yaml_add_driver "$work_path" "$driver_id" "$password_file_value" "$vehicles_display" ||
+yaml_add_driver "$work_path" "$driver_id" "$password_hash_file_value" "$vehicles_display" ||
   die "the $yaml_engine backend failed to append the driver entry; $config_name was not modified"
 
 [[ "$(yaml_ids "$work_path" drivers | grep -c -x -F -- "$driver_id")" == '1' ]] ||
@@ -289,6 +305,8 @@ if [[ $dry_run -eq 1 ]]; then
   printf '\n%splanned credential%s\n' "$color_bold" "$color_reset"
   printf '  openssl rand -base64 32 > %s\n' "$password_path"
   printf '  chmod 0600 %s\n' "$password_path"
+  printf '  argon2 <password-from-stdin> -id -t 3 -m 16 -p 1 -e > %s\n' "$password_hash_path"
+  printf '  chmod 0600 %s\n' "$password_hash_path"
   [[ -d "$secrets_dir" ]] || printf '  (creates directory %s with mode 0700)\n' "$secrets_dir"
   printf '\n%splanned %s change%s\n' "$color_bold" "$config_name" "$color_reset"
   if command -v diff >/dev/null 2>&1; then
@@ -304,7 +322,7 @@ if [[ $dry_run -eq 1 ]]; then
   exit 0
 fi
 
-# Credential first: the config must never reference a password file that does
+# Credentials first: the config must never reference a verifier file that does
 # not exist yet.
 if [[ ! -d "$secrets_dir" ]]; then
   (umask 077 && mkdir -p -- "$secrets_dir") || die "cannot create secrets directory: $secrets_dir"
@@ -314,15 +332,43 @@ if [[ ! -d "$secrets_dir" ]]; then
 fi
 [[ -w "$secrets_dir" ]] || die "secrets directory is not writable: $secrets_dir"
 
-if ! (umask 077 && openssl rand -base64 32 >"$password_path"); then
-  rm -f -- "$password_path"
+password_stage="$(mktemp "$secrets_dir/.${driver_id}.password.XXXXXX")"
+password_hash_stage="$(mktemp "$secrets_dir/.${driver_id}.password.argon2id.XXXXXX")"
+chmod 0600 "$password_stage" "$password_hash_stage"
+if [[ $password_stdin -eq 1 ]]; then
+  if ! IFS= read -r supplied_password; then
+    die "--password-stdin did not receive a password"
+  fi
+  if [[ -z "$supplied_password" ]]; then
+    unset supplied_password
+    die "--password-stdin received an empty password"
+  fi
+  printf '%s\n' "$supplied_password" >"$password_stage"
+  unset supplied_password
+elif ! (umask 077 && openssl rand -base64 32 >"$password_stage"); then
   die "openssl failed to generate a password for $driver_id"
 fi
+[[ -n "$(tr -d '\r\n' <"$password_stage")" ]] ||
+  die "generated credential is empty after trimming: $password_stage"
+if ! argon2_salt="$(openssl rand -hex 16)" || [[ -z "$argon2_salt" ]]; then
+  die "openssl failed to generate an Argon2id salt for $driver_id"
+fi
+if ! tr -d '\r\n' <"$password_stage" |
+  argon2 "$argon2_salt" -id -t 3 -m 16 -p 1 -e >"$password_hash_stage"; then
+  unset argon2_salt
+  die "argon2 failed to derive a verifier for $driver_id"
+fi
+unset argon2_salt
+grep -Eq '^\$argon2id\$v=19\$m=65536,t=3,p=1\$' "$password_hash_stage" ||
+  die "argon2 did not produce the required Argon2id verifier policy"
+mv -f -- "$password_stage" "$password_path"
+password_stage=''
 created_password="yes"
-chmod 0600 "$password_path"
-[[ -n "$(tr -d '\r\n' <"$password_path")" ]] ||
-  die "generated credential is empty after trimming: $password_path"
-ok "generated credential $password_path (mode 0600)"
+mv -f -- "$password_hash_stage" "$password_hash_path"
+password_hash_stage=''
+created_password_hash="yes"
+chmod 0600 "$password_path" "$password_hash_path"
+ok "generated password and Argon2id verifier for $driver_id (mode 0600)"
 
 validate_config() {
   local target="$1" label="$2" output status=0
@@ -366,7 +412,8 @@ fi
 printf '\n%sdriver added%s\n' "$color_bold$color_green" "$color_reset"
 printf '  driver id      %s\n' "$driver_id"
 printf '  config         %s\n' "$config_path"
-printf '  password file  %s (password_file: %s)\n' "$password_path" "$password_file_value"
+printf '  password file  %s (mode 0600; do not commit)\n' "$password_path"
+printf '  verifier file  %s (password_hash_file: %s)\n' "$password_hash_path" "$password_hash_file_value"
 printf '  vehicles       %s\n' "${requested_vehicles[*]}"
 printf '\n%snext steps%s\n' "$color_bold" "$color_reset"
 printf '  1. restart the signaling server so the new identity is loaded:\n'

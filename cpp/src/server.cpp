@@ -1,4 +1,5 @@
 #include "mine_teleop/server.hpp"
+#include "mine_teleop/credentials.hpp"
 #include "mine_teleop/control_logic_js.hpp"
 
 #if defined(_WIN32)
@@ -302,6 +303,20 @@ class TooManyRequests final : public std::runtime_error {
   std::int64_t retry_after_ms_;
 };
 
+class CleansedString final {
+ public:
+  explicit CleansedString(std::string value) : value_(std::move(value)) {}
+  ~CleansedString() { cleanse_secret(value_); }
+
+  CleansedString(const CleansedString&) = delete;
+  CleansedString& operator=(const CleansedString&) = delete;
+
+  [[nodiscard]] std::string_view view() const noexcept { return value_; }
+
+ private:
+  std::string value_;
+};
+
 class ServiceUnavailable final : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
@@ -541,6 +556,34 @@ std::string load_identity_secret(
         std::string(context) + " environment variable is unset or empty: " + *configured_environment);
   }
   return value;
+}
+
+bool valid_legacy_password_removal_date(std::string_view value) {
+  if (value.size() != 10 || value[4] != '-' || value[7] != '-') return false;
+  for (const auto index : std::array<std::size_t, 8>{0, 1, 2, 3, 5, 6, 8, 9}) {
+    if (value[index] < '0' || value[index] > '9') return false;
+  }
+  const int year = (value[0] - '0') * 1000 + (value[1] - '0') * 100 +
+      (value[2] - '0') * 10 + (value[3] - '0');
+  const unsigned month = static_cast<unsigned>((value[5] - '0') * 10 + (value[6] - '0'));
+  const unsigned day = static_cast<unsigned>((value[8] - '0') * 10 + (value[9] - '0'));
+  return std::chrono::year_month_day{
+      std::chrono::year{year}, std::chrono::month{month}, std::chrono::day{day}}
+      .ok();
+}
+
+bool legacy_password_migration_is_active(std::string_view value) {
+  if (!valid_legacy_password_removal_date(value)) return false;
+  const int year = (value[0] - '0') * 1000 + (value[1] - '0') * 100 +
+      (value[2] - '0') * 10 + (value[3] - '0');
+  const unsigned month = static_cast<unsigned>((value[5] - '0') * 10 + (value[6] - '0'));
+  const unsigned day = static_cast<unsigned>((value[8] - '0') * 10 + (value[9] - '0'));
+  const std::chrono::sys_days removal_day{
+      std::chrono::year_month_day{
+          std::chrono::year{year}, std::chrono::month{month}, std::chrono::day{day}}};
+  const std::chrono::sys_days today =
+      std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now());
+  return today <= removal_day;
 }
 
 std::uint64_t required_uint64(const Json& value, std::string_view key) {
@@ -1600,7 +1643,20 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
   }
 
   SignalingServerConfig config;
+  if (auth["allow_legacy_passwords"]) {
+    try {
+      config.allow_legacy_passwords = auth["allow_legacy_passwords"].as<bool>();
+    } catch (const YAML::Exception& error) {
+      throw std::invalid_argument(
+          "auth.allow_legacy_passwords must be a boolean: " + std::string(error.what()));
+    }
+  }
+  if (config.allow_legacy_passwords) {
+    config.legacy_passwords_remove_by = required_yaml_string(
+        auth, "legacy_passwords_remove_by", "auth");
+  }
   config.driver_passwords.clear();
+  config.driver_password_verifiers.clear();
   config.device_tokens.clear();
   config.driver_vehicle_permissions.clear();
   const auto base_path = std::filesystem::absolute(path).parent_path();
@@ -1608,9 +1664,39 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
     const auto entry = drivers[index];
     const auto context = "auth.drivers[" + std::to_string(index) + "]";
     const auto driver_id = required_yaml_string(entry, "id", context);
-    const auto password = load_identity_secret(
-        entry, "password_file", "password_env", base_path, context);
-    if (!config.driver_passwords.emplace(driver_id, password).second) {
+    const bool has_legacy_source = entry["password_file"] || entry["password_env"];
+    const bool has_verifier_source = entry["password_hash_file"] || entry["password_hash_env"];
+    if (has_legacy_source && has_verifier_source) {
+      throw std::invalid_argument(
+          context + " must configure either a legacy password source or an Argon2id verifier source, not both");
+    }
+    if (!has_legacy_source && !has_verifier_source) {
+      throw std::invalid_argument(
+          context + " must configure exactly one of password_hash_file or password_hash_env");
+    }
+    if (has_legacy_source) {
+      if (!config.allow_legacy_passwords) {
+        throw std::invalid_argument(
+            context + " uses a legacy plaintext password source but auth.allow_legacy_passwords is not true");
+      }
+      const auto password = load_identity_secret(
+          entry, "password_file", "password_env", base_path, context);
+      if (!config.driver_passwords.emplace(driver_id, password).second) {
+        throw std::invalid_argument("duplicate driver id: " + driver_id);
+      }
+    } else {
+      const auto verifier = load_identity_secret(
+          entry, "password_hash_file", "password_hash_env", base_path, context);
+      std::string reason;
+      if (!validate_argon2id_verifier(verifier, default_argon2id_policy(), &reason)) {
+        throw std::invalid_argument(context + " Argon2id verifier is invalid: " + reason);
+      }
+      if (!config.driver_password_verifiers.emplace(driver_id, verifier).second) {
+        throw std::invalid_argument("duplicate driver id: " + driver_id);
+      }
+    }
+    if (config.driver_passwords.contains(driver_id) &&
+        config.driver_password_verifiers.contains(driver_id)) {
       throw std::invalid_argument("duplicate driver id: " + driver_id);
     }
     const auto allowed = entry["vehicles"];
@@ -1890,6 +1976,13 @@ SignalingService::SignalingService(
       config_.login_lockout_ms <= 0) {
     throw std::invalid_argument("login failure limit, window, and lockout must be positive");
   }
+  if (config_.password_verification_max_concurrency == 0 ||
+      config_.password_verification_max_concurrency > 16 ||
+      config_.password_verification_retry_after_ms <= 0 ||
+      config_.password_verification_retry_after_ms > 60 * 1000) {
+    throw std::invalid_argument(
+        "password verification concurrency and retry budget are outside the supported range");
+  }
   if (config_.api_rate_limit_requests <= 0 || config_.api_rate_limit_window_ms <= 0 ||
       config_.api_rate_limit_max_sources <= 0) {
     throw std::invalid_argument("API rate limit, window, and source capacity must be positive");
@@ -1938,16 +2031,44 @@ SignalingService::SignalingService(
       (config_.turn_realm.empty() || config_.turn_static_auth_secret.empty())) {
     throw std::invalid_argument("TURN URLs require a realm and static auth secret");
   }
-  if (config_.driver_passwords.empty()) throw std::invalid_argument("at least one driver credential is required");
+  if (config_.driver_passwords.empty() && config_.driver_password_verifiers.empty()) {
+    throw std::invalid_argument("at least one driver credential is required");
+  }
+  if (!config_.allow_legacy_passwords && !config_.driver_passwords.empty()) {
+    throw std::invalid_argument(
+        "legacy plaintext driver passwords require allow_legacy_passwords=true");
+  }
+  if (config_.allow_legacy_passwords && !config_.driver_passwords.empty() &&
+      !valid_legacy_password_removal_date(config_.legacy_passwords_remove_by)) {
+    throw std::invalid_argument(
+        "legacy plaintext driver passwords require a valid YYYY-MM-DD legacy_passwords_remove_by deadline");
+  }
+  if (config_.allow_legacy_passwords && !config_.driver_passwords.empty() &&
+      !legacy_password_migration_is_active(config_.legacy_passwords_remove_by)) {
+    throw std::invalid_argument(
+        "legacy plaintext driver passwords are past their legacy_passwords_remove_by deadline");
+  }
   if (config_.device_tokens.empty()) throw std::invalid_argument("at least one device credential is required");
   for (const auto& [id, password] : config_.driver_passwords) {
     if (id.empty() || password.empty()) throw std::invalid_argument("driver credentials must not be empty");
+  }
+  for (const auto& [id, verifier] : config_.driver_password_verifiers) {
+    if (id.empty() || verifier.empty()) {
+      throw std::invalid_argument("driver password verifiers must not be empty");
+    }
+    if (config_.driver_passwords.contains(id)) {
+      throw std::invalid_argument("a driver cannot have both legacy and Argon2id credentials");
+    }
+    std::string reason;
+    if (!validate_argon2id_verifier(verifier, default_argon2id_policy(), &reason)) {
+      throw std::invalid_argument("driver Argon2id verifier is invalid: " + reason);
+    }
   }
   for (const auto& [id, token] : config_.device_tokens) {
     if (id.empty() || token.empty()) throw std::invalid_argument("device credentials must not be empty");
   }
   for (const auto& [driver_id, vehicles] : config_.driver_vehicle_permissions) {
-    if (!config_.driver_passwords.contains(driver_id)) {
+    if (!configured_driver(driver_id)) {
       throw std::invalid_argument("vehicle permission references an unknown driver");
     }
     for (const auto& vehicle_id : vehicles) {
@@ -2000,6 +2121,11 @@ SignalingService::~SignalingService() {
 }
 
 Json SignalingService::health() const {
+  std::size_t active_password_verifications = 0;
+  {
+    std::lock_guard verification_lock(password_verification_mutex_);
+    active_password_verifications = active_password_verifications_;
+  }
   std::lock_guard lock(mutex_);
   const auto timestamp_ms = now_ms();
   const auto active_sessions = std::count_if(sessions_.begin(), sessions_.end(), [](const auto& item) {
@@ -2076,6 +2202,8 @@ Json SignalingService::health() const {
       {"revoked_vehicles", revoked_vehicles_.size()},
       {"revoked_drivers", revoked_drivers_.size()},
       {"login_locked_buckets", login_locked_buckets},
+      {"password_verification_active", active_password_verifications},
+      {"password_verification_capacity", config_.password_verification_max_concurrency},
       {"api_rate_limit_tracked_sources", api_rate_limits_.size()},
       {"api_rate_limit_overflow_active", api_rate_limit_overflow_active},
       {"api_rate_limited_requests", api_rate_limited_requests_},
@@ -2126,7 +2254,8 @@ void SignalingService::validate_driver_token(std::string_view driver_id, std::st
 void SignalingService::validate_device_token(std::string_view vehicle_id, std::string_view token) const {
   if (revoked_vehicles_.contains(std::string(vehicle_id))) throw Unauthorized("vehicle is revoked");
   const auto found = config_.device_tokens.find(std::string(vehicle_id));
-  if (token.empty() || found == config_.device_tokens.end() || found->second != token) {
+  if (token.empty() || found == config_.device_tokens.end() ||
+      !constant_time_equal(found->second, token)) {
     throw Unauthorized("invalid device token");
   }
 }
@@ -2314,8 +2443,28 @@ void SignalingService::close_session(Session& session, std::string_view reason) 
   transition_session(session, SessionState::Closed, reason);
 }
 
+bool SignalingService::configured_driver(std::string_view driver_id) const {
+  const auto id = std::string(driver_id);
+  return config_.driver_passwords.contains(id) ||
+      config_.driver_password_verifiers.contains(id);
+}
+
+bool SignalingService::try_acquire_password_verification_slot() {
+  std::lock_guard lock(password_verification_mutex_);
+  if (active_password_verifications_ >= config_.password_verification_max_concurrency) {
+    return false;
+  }
+  ++active_password_verifications_;
+  return true;
+}
+
+void SignalingService::release_password_verification_slot() noexcept {
+  std::lock_guard lock(password_verification_mutex_);
+  if (active_password_verifications_ > 0) --active_password_verifications_;
+}
+
 void SignalingService::enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms) {
-  const bool known_driver = config_.driver_passwords.contains(std::string(driver_id));
+  const bool known_driver = configured_driver(driver_id);
   const std::string bucket = known_driver ? "driver:" + std::string(driver_id) : "unknown";
   const auto found = login_failures_.find(bucket);
   if (found == login_failures_.end()) return;
@@ -2330,7 +2479,7 @@ void SignalingService::enforce_login_rate_limit(std::string_view driver_id, std:
 }
 
 void SignalingService::record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms) {
-  const bool known_driver = config_.driver_passwords.contains(std::string(driver_id));
+  const bool known_driver = configured_driver(driver_id);
   const std::string bucket = known_driver ? "driver:" + std::string(driver_id) : "unknown";
   auto& state = login_failures_[bucket];
   if (state.window_started_at_ms == 0 ||
@@ -3089,7 +3238,7 @@ Json SignalingService::enqueue_signaling_message(
         command.sent_at_utc_ms != metadata.sent_at_utc_ms) {
       throw std::invalid_argument("control command payload metadata does not match signaling wrapper");
     }
-    if (command.control_token != session.control_token) {
+    if (!constant_time_equal(session.control_token, command.control_token)) {
       throw Unauthorized("control command token does not match active session");
     }
   }
@@ -3420,17 +3569,109 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
   return ServerResponse::json(404, {{"error", "not found"}});
 }
 
+ServerResponse SignalingService::handle_driver_login(Json value) {
+  const auto driver_id = required_string(value, "driver_id");
+  CleansedString password(optional_string(value, "password"));
+  if (const auto field = value.find("password"); field != value.end() && field->is_string()) {
+    cleanse_secret(field->get_ref<std::string&>());
+    value.erase(field);
+  }
+
+  LoginCredentialSnapshot credential;
+  {
+    std::lock_guard lock(mutex_);
+    const auto timestamp_ms = now_ms();
+    cleanup_expired_connections(timestamp_ms);
+    enforce_login_rate_limit(driver_id, timestamp_ms);
+    if (const auto found = config_.driver_password_verifiers.find(driver_id);
+        found != config_.driver_password_verifiers.end()) {
+      credential.kind = LoginCredentialSnapshot::Kind::Argon2id;
+      credential.verifier = found->second;
+    } else if (config_.allow_legacy_passwords) {
+      if (const auto found = config_.driver_passwords.find(driver_id);
+          found != config_.driver_passwords.end()) {
+        credential.kind = LoginCredentialSnapshot::Kind::LegacyPlaintext;
+        credential.verifier = found->second;
+      }
+    }
+  }
+
+  if (!try_acquire_password_verification_slot()) {
+    throw TooManyRequests(
+        "password verification capacity is temporarily exhausted",
+        config_.password_verification_retry_after_ms);
+  }
+
+  bool verified = false;
+  try {
+    switch (credential.kind) {
+      case LoginCredentialSnapshot::Kind::Argon2id:
+        verified = verify_argon2id_password(
+            credential.verifier,
+            password.view(),
+            default_argon2id_policy());
+        break;
+      case LoginCredentialSnapshot::Kind::LegacyPlaintext:
+        verified = constant_time_equal(credential.verifier, password.view());
+        cleanse_secret(credential.verifier);
+        break;
+      case LoginCredentialSnapshot::Kind::Unknown:
+        static_cast<void>(verify_argon2id_password(
+            dummy_argon2id_verifier(),
+            password.view(),
+            default_argon2id_policy()));
+        break;
+    }
+  } catch (...) {
+    release_password_verification_slot();
+    throw;
+  }
+  release_password_verification_slot();
+
+  std::lock_guard lock(mutex_);
+  const auto timestamp_ms = now_ms();
+  cleanup_expired_connections(timestamp_ms);
+  if (!verified || credential.kind == LoginCredentialSnapshot::Kind::Unknown) {
+    record_login_failure(driver_id, timestamp_ms);
+    throw Unauthorized("invalid driver credentials");
+  }
+  clear_login_failures(driver_id);
+  if (revoked_drivers_.contains(driver_id)) {
+    audit("driver_login_rejected", {{"driver_id", driver_id}, {"reason", "driver_revoked"}});
+    throw Unauthorized("driver is revoked");
+  }
+  if (online_drivers_.contains(driver_id)) {
+    audit("driver_login_rejected", {{"driver_id", driver_id}, {"reason", "driver_already_online"}});
+    throw Conflict("driver is already online");
+  }
+  const auto generation = ++connection_generation_;
+  const std::string token = "driver-token-" + random_token();
+  driver_tokens_[token] = DriverToken{driver_id, timestamp_ms + config_.token_ttl_ms, generation};
+  online_drivers_[driver_id] = ConnectionPresence{"", generation, timestamp_ms, timestamp_ms};
+  audit("driver_login", {{"driver_id", driver_id}, {"connection_generation", generation}});
+  return ServerResponse::json(
+      200,
+      {{"token_type", "bearer"},
+       {"token", token},
+       {"expires_at_ms", driver_tokens_.at(token).expires_at_ms},
+       {"connection_generation", generation},
+       {"service_instance_id", service_instance_id_}});
+}
+
 ServerResponse SignalingService::handle_post(const HttpRequest& request) {
-  const auto value = request.json_body();
+  auto value = request.json_body();
+  if (request.path == "/auth/driver_login") return handle_driver_login(std::move(value));
   const auto parts = path_parts(request.path);
   std::lock_guard lock(mutex_);
   cleanup_expired_connections(now_ms());
   if (request.path.starts_with("/admin/")) {
     if (config_.admin_token.empty()) throw Unauthorized("admin API is disabled");
-    if (optional_string(value, "admin_token") != config_.admin_token) throw Unauthorized("invalid admin token");
+    if (!constant_time_equal(config_.admin_token, optional_string(value, "admin_token"))) {
+      throw Unauthorized("invalid admin token");
+    }
     const auto object_id = required_string(value, "id");
     if (request.path == "/admin/revoke/driver") {
-      if (!config_.driver_passwords.contains(object_id)) throw NotFound("unknown driver");
+      if (!configured_driver(object_id)) throw NotFound("unknown driver");
       revoked_drivers_.insert(object_id);
       close_sessions_for_driver(object_id, "driver_revoked");
       online_drivers_.erase(object_id);
@@ -3445,7 +3686,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
       return ServerResponse::json(200, {{"driver_id", object_id}, {"state", "revoked"}});
     }
     if (request.path == "/admin/restore/driver") {
-      if (!config_.driver_passwords.contains(object_id)) throw NotFound("unknown driver");
+      if (!configured_driver(object_id)) throw NotFound("unknown driver");
       revoked_drivers_.erase(object_id);
       audit("driver_restored", {{"driver_id", object_id}});
       return ServerResponse::json(200, {{"driver_id", object_id}, {"state", "offline"}});
@@ -3465,38 +3706,6 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
       return ServerResponse::json(200, {{"vehicle_id", object_id}, {"state", "offline"}});
     }
     return ServerResponse::json(404, {{"error", "not found"}});
-  }
-  if (request.path == "/auth/driver_login") {
-    const auto driver_id = required_string(value, "driver_id");
-    const auto password = optional_string(value, "password");
-    const auto timestamp_ms = now_ms();
-    enforce_login_rate_limit(driver_id, timestamp_ms);
-    const auto found = config_.driver_passwords.find(driver_id);
-    if (found == config_.driver_passwords.end() || found->second != password) {
-      record_login_failure(driver_id, timestamp_ms);
-      throw Unauthorized("invalid driver credentials");
-    }
-    clear_login_failures(driver_id);
-    if (revoked_drivers_.contains(driver_id)) {
-      audit("driver_login_rejected", {{"driver_id", driver_id}, {"reason", "driver_revoked"}});
-      throw Unauthorized("driver is revoked");
-    }
-    if (online_drivers_.contains(driver_id)) {
-      audit("driver_login_rejected", {{"driver_id", driver_id}, {"reason", "driver_already_online"}});
-      throw Conflict("driver is already online");
-    }
-    const auto generation = ++connection_generation_;
-    const std::string token = "driver-token-" + random_token();
-    driver_tokens_[token] = DriverToken{driver_id, timestamp_ms + config_.token_ttl_ms, generation};
-    online_drivers_[driver_id] = ConnectionPresence{"", generation, timestamp_ms, timestamp_ms};
-    audit("driver_login", {{"driver_id", driver_id}, {"connection_generation", generation}});
-    return ServerResponse::json(
-        200,
-        {{"token_type", "bearer"},
-         {"token", token},
-         {"expires_at_ms", driver_tokens_.at(token).expires_at_ms},
-         {"connection_generation", generation},
-         {"service_instance_id", service_instance_id_}});
   }
   if (request.path == "/auth/driver_heartbeat") {
     const auto driver_id = required_string(value, "driver_id");

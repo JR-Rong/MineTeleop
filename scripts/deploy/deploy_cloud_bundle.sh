@@ -615,7 +615,7 @@ if [[ -f "$candidate_signaling_config" ]]; then
     )
   fi
   signaling_validation+=(--validate-config)
-  if grep -Eq '^[[:space:]]*(password_env|device_token_env):' "$candidate_signaling_config"; then
+  if grep -Eq '^[[:space:]]*(password_hash_env|password_env|device_token_env):' "$candidate_signaling_config"; then
     command -v systemd-run >/dev/null 2>&1 || {
       die "systemd-run is required to validate identity variables from the candidate environment file"
     }
@@ -759,7 +759,7 @@ if [[ -f "$signaling_config_path" ]]; then
     )
   fi
   installed_signaling_validation+=(--validate-config)
-  if grep -Eq '^[[:space:]]*(password_env|device_token_env):' "$signaling_config_path"; then
+  if grep -Eq '^[[:space:]]*(password_hash_env|password_env|device_token_env):' "$signaling_config_path"; then
     systemd-run \
       --quiet \
       --wait \

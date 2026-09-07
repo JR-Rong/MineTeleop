@@ -28,16 +28,17 @@ config/driver-console.dev.yaml
 ## 信令服务多身份配置
 
 独立信令进程的多驾驶员/多车辆身份使用单独的 YAML。仓库示例
-`configs/signaling-server.2x2.dev.yaml` 使用环境变量引用，不包含 secret 明文：
+`configs/signaling-server.2x2.dev.yaml` 仅为受限的明文迁移 fixture；生产
+配置使用 Argon2id PHC verifier，不包含 secret 明文：
 
 ```yaml
 auth:
   drivers:
     - id: driver-console-001
-      password_env: MINE_TELEOP_DRIVER_001_PASSWORD
+      password_hash_file: secrets/driver-console-001.password.argon2id
       vehicles: [vehicle-001]
     - id: driver-console-002
-      password_env: MINE_TELEOP_DRIVER_002_PASSWORD
+      password_hash_env: MINE_TELEOP_DRIVER_002_PASSWORD_ARGON2ID
       vehicles: [vehicle-002]
   vehicles:
     - id: vehicle-001
@@ -47,9 +48,30 @@ auth:
 ```
 
 每个驾驶员必须配置非空车辆白名单；白名单只能引用本文件中声明的车辆。驾驶员
-必须且只能二选一配置 `password_file`/`password_env`，车辆同样二选一配置
-`device_token_file`/`device_token_env`。相对 secret 文件按 YAML 所在目录解析，现场
-文件应设为 `0600`。先执行以下命令做无监听校验，再启动服务：
+必须且只能二选一配置 `password_hash_file`/`password_hash_env`，车辆同样二选一配置
+`device_token_file`/`device_token_env`。Argon2id verifier 必须是带 `v=19`、`m/t/p`、
+salt 与 digest 的 PHC 字符串，服务会限制编码长度及成本上限后才调用库验证。相对 secret
+文件按 YAML 所在目录解析，现场文件应设为 `0600`。
+
+旧 `password_file`/`password_env` 只可用于明确的迁移窗口，且需要同级开关和移除日期；
+没有两者之一，配置校验会失败。当前开发 fixture 的日期为 `2027-03-31`，生产迁移应使用
+自己的短期日期并在到期前完成口令轮换与删除明文字段：
+
+```yaml
+auth:
+  allow_legacy_passwords: true
+  legacy_passwords_remove_by: "2027-03-31"
+  drivers:
+    - id: temporary-legacy-driver
+      password_file: secrets/temporary-legacy-driver.password
+      vehicles: [vehicle-001]
+```
+
+使用 `scripts/admin/add_driver.sh` 创建新驾驶员时，脚本会生成 0600 的随机口令和
+Argon2id verifier，并仅把 `password_hash_file` 写入配置；口令不会进入 argv、日志或审计。
+`allow_legacy_passwords` 是临时迁移开关：服务仅在 `legacy_passwords_remove_by` 尚未到期时
+接受该模式；到期后必须改为 verifier 配置才能启动。
+先执行以下命令做无监听校验，再启动服务：
 
 ```bash
 mine-teleop-signaling-server \

@@ -1,4 +1,8 @@
 auth:
+  # Temporary developer migration fixture. New identities created by
+  # scripts/admin/add_driver.sh use password_hash_file instead.
+  allow_legacy_passwords: true
+  legacy_passwords_remove_by: "2027-03-31"
   # Browser switch acceptance: driver 001 may switch after driver 002 safely
   # releases vehicle 002. The strict isolation fixture remains the 2x2 default.
   drivers:

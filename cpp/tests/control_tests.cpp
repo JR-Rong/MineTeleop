@@ -1,4 +1,5 @@
 #include "mine_teleop/core.hpp"
+#include "mine_teleop/credentials.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/platform.hpp"
 #include "mine_teleop/server.hpp"
@@ -29,6 +30,13 @@ namespace {
 
 void expect(bool condition, std::string_view message) {
   if (!condition) throw std::runtime_error(std::string(message));
+}
+
+mine_teleop::SignalingServerConfig legacy_signaling_config() {
+  auto config = mine_teleop::SignalingServerConfig{};
+  config.allow_legacy_passwords = true;
+  config.legacy_passwords_remove_by = "2027-03-31";
+  return config;
 }
 
 void authorize_local_post(
@@ -2115,7 +2123,7 @@ void test_signaling_latest_only_control_mailbox() {
   constexpr std::string_view kDriverPassword = "driver-control-mailbox-password";
   constexpr std::string_view kDeviceToken = "vehicle-control-mailbox-device-token";
 
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.driver_passwords = {{std::string(kDriverId), std::string(kDriverPassword)}};
   config.device_tokens = {{std::string(kVehicleId), std::string(kDeviceToken)}};
   config.driver_vehicle_permissions = {{std::string(kDriverId), {std::string(kVehicleId)}}};
@@ -2529,6 +2537,18 @@ void test_signaling_multi_identity_config() {
   std::filesystem::create_directories(root);
   write_text_file(root / "driver-1.password", "driver-password-1\n");
   write_text_file(root / "driver-2.password", "driver-password-2\n");
+  constexpr std::array<std::uint8_t, 16> first_salt{
+      0x4d, 0x69, 0x6e, 0x65, 0x54, 0x65, 0x6c, 0x65,
+      0x6f, 0x70, 0x2d, 0x64, 0x72, 0x76, 0x30, 0x31};
+  constexpr std::array<std::uint8_t, 16> second_salt{
+      0x4d, 0x69, 0x6e, 0x65, 0x54, 0x65, 0x6c, 0x65,
+      0x6f, 0x70, 0x2d, 0x64, 0x72, 0x76, 0x30, 0x32};
+  write_text_file(
+      root / "driver-1.argon2id",
+      mine_teleop::hash_argon2id_password("driver-password-1", first_salt) + "\n");
+  write_text_file(
+      root / "driver-2.argon2id",
+      mine_teleop::hash_argon2id_password("driver-password-2", second_salt) + "\n");
   write_text_file(root / "vehicle-1.token", "vehicle-token-1\n");
   write_text_file(root / "vehicle-2.token", "vehicle-token-2\n");
   const auto valid_path = root / "valid.yaml";
@@ -2537,10 +2557,10 @@ void test_signaling_multi_identity_config() {
       R"YAML(auth:
   drivers:
     - id: driver-console-001
-      password_file: driver-1.password
+      password_hash_file: driver-1.argon2id
       vehicles: [vehicle-001]
     - id: driver-console-002
-      password_file: driver-2.password
+      password_hash_file: driver-2.argon2id
       vehicles: [vehicle-002]
   vehicles:
     - id: vehicle-001
@@ -2549,11 +2569,14 @@ void test_signaling_multi_identity_config() {
       device_token_file: vehicle-2.token
 )YAML");
   const auto config = mine_teleop::load_signaling_identity_config(valid_path);
-  expect(config.driver_passwords.size() == 2, "multi-identity config lost a driver");
+  expect(config.driver_password_verifiers.size() == 2, "multi-identity config lost an Argon2id driver");
   expect(config.device_tokens.size() == 2, "multi-identity config lost a vehicle");
   expect(
-      config.driver_passwords.at("driver-console-001") == "driver-password-1",
-      "relative driver secret file was not loaded");
+      mine_teleop::verify_argon2id_password(
+          config.driver_password_verifiers.at("driver-console-001"),
+          "driver-password-1",
+          mine_teleop::default_argon2id_policy()),
+      "relative driver verifier file was not loaded");
   expect(
       config.device_tokens.at("vehicle-002") == "vehicle-token-2",
       "relative vehicle secret file was not loaded");
@@ -2570,10 +2593,28 @@ void test_signaling_multi_identity_config() {
     expect(service.health().value("status", "") == "ok", "loaded multi-identity service did not initialize");
   }
 
+  const auto legacy_disabled_path = root / "legacy-disabled.yaml";
+  write_text_file(
+      legacy_disabled_path,
+      R"YAML(auth:
+  drivers:
+    - id: driver-console-001
+      password_file: driver-1.password
+      vehicles: [vehicle-001]
+  vehicles:
+    - id: vehicle-001
+      device_token_file: vehicle-1.token
+)YAML");
+  expect_throws(
+      [&] { static_cast<void>(mine_teleop::load_signaling_identity_config(legacy_disabled_path)); },
+      "legacy plaintext password config was accepted without an explicit migration switch");
+
   const auto duplicate_path = root / "duplicate.yaml";
   write_text_file(
       duplicate_path,
       R"YAML(auth:
+  allow_legacy_passwords: true
+  legacy_passwords_remove_by: "2027-03-31"
   drivers:
     - id: driver-console-001
       password_file: driver-1.password
@@ -2593,6 +2634,8 @@ void test_signaling_multi_identity_config() {
   write_text_file(
       empty_permissions_path,
       R"YAML(auth:
+  allow_legacy_passwords: true
+  legacy_passwords_remove_by: "2027-03-31"
   drivers:
     - id: driver-console-001
       password_file: driver-1.password
@@ -2609,6 +2652,8 @@ void test_signaling_multi_identity_config() {
   write_text_file(
       unknown_vehicle_path,
       R"YAML(auth:
+  allow_legacy_passwords: true
+  legacy_passwords_remove_by: "2027-03-31"
   drivers:
     - id: driver-console-001
       password_file: driver-1.password
@@ -2625,6 +2670,8 @@ void test_signaling_multi_identity_config() {
   write_text_file(
       ambiguous_secret_path,
       R"YAML(auth:
+  allow_legacy_passwords: true
+  legacy_passwords_remove_by: "2027-03-31"
   drivers:
     - id: driver-console-001
       password_file: driver-1.password
@@ -2640,8 +2687,154 @@ void test_signaling_multi_identity_config() {
   std::filesystem::remove_all(root);
 }
 
-void test_credential_purpose_separation_and_stale_control_replay() {
+void test_argon2id_credentials_and_login_concurrency() {
+  constexpr std::array<std::uint8_t, 16> salt{
+      0x52, 0x30, 0x34, 0x2d, 0x61, 0x72, 0x67, 0x6f,
+      0x6e, 0x32, 0x69, 0x64, 0x2d, 0x74, 0x65, 0x73};
+  const auto verifier = mine_teleop::hash_argon2id_password("correct-hash-password", salt);
+  std::string reason;
+  expect(
+      mine_teleop::validate_argon2id_verifier(
+          verifier, mine_teleop::default_argon2id_policy(), &reason),
+      "generated Argon2id verifier did not satisfy the configured policy");
+  expect(
+      mine_teleop::verify_argon2id_password(
+          verifier, "correct-hash-password", mine_teleop::default_argon2id_policy()),
+      "Argon2id verifier rejected its source password");
+  expect(
+      !mine_teleop::verify_argon2id_password(
+          verifier, "wrong-hash-password", mine_teleop::default_argon2id_policy()),
+      "Argon2id verifier accepted a wrong password");
+  auto excessive_cost = verifier;
+  const auto cost_begin = excessive_cost.find("m=65536");
+  expect(cost_begin != std::string::npos, "generated verifier did not use the expected default memory cost");
+  excessive_cost.replace(cost_begin, std::string("m=65536").size(), "m=262145");
+  expect(
+      !mine_teleop::validate_argon2id_verifier(
+          excessive_cost, mine_teleop::default_argon2id_policy(), &reason),
+      "out-of-policy Argon2id memory cost was accepted");
+  expect(
+      !mine_teleop::validate_argon2id_verifier(
+          "$argon2id$v=19$m=65536,t=3,p=1$not*base64$also-not-base64",
+          mine_teleop::default_argon2id_policy(),
+          &reason),
+      "malformed Argon2id PHC verifier was accepted");
+  expect(
+      mine_teleop::constant_time_equal("fixed-token", "fixed-token") &&
+          !mine_teleop::constant_time_equal("fixed-token", "other-token") &&
+          !mine_teleop::constant_time_equal("fixed-token", "short"),
+      "constant-time equal-length secret helper has an incorrect result contract");
+  std::string temporary_secret = "temporary-password";
+  mine_teleop::cleanse_secret(temporary_secret);
+  expect(temporary_secret.empty(), "secret cleansing did not release the owned string");
+
+  mine_teleop::SignalingServerConfig invalid_legacy;
+  invalid_legacy.driver_passwords = {{"legacy-driver", "legacy-password"}};
+  invalid_legacy.driver_password_verifiers.clear();
+  invalid_legacy.device_tokens = {{"vehicle-1", "device-token"}};
+  invalid_legacy.driver_vehicle_permissions = {{"legacy-driver", {"vehicle-1"}}};
+  expect_throws(
+      [&] { mine_teleop::SignalingService service(invalid_legacy); },
+      "legacy plaintext credentials were accepted without an explicit migration switch");
+  auto expired_legacy = invalid_legacy;
+  expired_legacy.allow_legacy_passwords = true;
+  expired_legacy.legacy_passwords_remove_by = "2000-01-01";
+  expect_throws(
+      [&] { mine_teleop::SignalingService service(expired_legacy); },
+      "legacy plaintext credentials were accepted after their removal deadline");
+
+  mine_teleop::SignalingServerConfig invalid_verifier;
+  invalid_verifier.driver_passwords.clear();
+  invalid_verifier.driver_password_verifiers = {{"hash-driver", excessive_cost}};
+  invalid_verifier.device_tokens = {{"vehicle-1", "device-token"}};
+  invalid_verifier.driver_vehicle_permissions = {{"hash-driver", {"vehicle-1"}}};
+  expect_throws(
+      [&] { mine_teleop::SignalingService service(invalid_verifier); },
+      "out-of-policy Argon2id verifier was accepted at service startup");
+
   mine_teleop::SignalingServerConfig config;
+  config.driver_passwords.clear();
+  config.driver_password_verifiers = {{"hash-driver", verifier}};
+  config.device_tokens = {{"vehicle-1", "device-token"}};
+  config.driver_vehicle_permissions = {{"hash-driver", {"vehicle-1"}}};
+  config.admin_token = "admin-token-with-a-fixed-test-length";
+  config.password_verification_max_concurrency = 1;
+  config.password_verification_retry_after_ms = 25;
+  mine_teleop::SignalingService service(config);
+
+  const auto post = [&](std::string_view path, const mine_teleop::Json& body) {
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.target = std::string(path);
+    request.path = request.target;
+    request.peer_address = "198.51.100.55";
+    request.body = body.dump();
+    return service.handle(request);
+  };
+  const auto online = post(
+      "/vehicles/online",
+      {{"vehicle_id", "vehicle-1"}, {"device_token", "device-token"}, {"connection_id", "hash-test"}});
+  expect(online.status == 200, "hash login fixture could not bring its vehicle online");
+  const auto generation = mine_teleop::Json::parse(online.body).at("connection_generation").get<std::uint64_t>();
+
+  std::atomic<int> first_login_status{-1};
+  std::jthread first_login([&] {
+    first_login_status.store(
+        post(
+            "/auth/driver_login",
+            {{"driver_id", "hash-driver"}, {"password", "correct-hash-password"}})
+            .status);
+  });
+  const auto active_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  bool verification_active = false;
+  while (std::chrono::steady_clock::now() < active_deadline) {
+    if (service.health().value("password_verification_active", std::size_t{0}) == 1) {
+      verification_active = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  expect(verification_active, "Argon2id verification slot never became observable");
+  const auto heartbeat = post(
+      "/vehicles/heartbeat",
+      {{"vehicle_id", "vehicle-1"},
+       {"device_token", "device-token"},
+       {"connection_generation", generation}});
+  expect(
+      heartbeat.status == 200,
+      "vehicle heartbeat could not progress while an Argon2id password verification was active");
+  const auto saturated = post(
+      "/auth/driver_login",
+      {{"driver_id", "hash-driver"}, {"password", "wrong-hash-password"}});
+  expect(saturated.status == 429, "bounded password verification capacity did not reject a concurrent login");
+  first_login.join();
+  expect(first_login_status.load() == 200, "correct Argon2id login failed");
+  const auto duplicate = post(
+      "/auth/driver_login",
+      {{"driver_id", "hash-driver"}, {"password", "correct-hash-password"}});
+  expect(
+      duplicate.status == 409,
+      "duplicate Argon2id login did not preserve the online-driver guard");
+  const auto wrong = post(
+      "/auth/driver_login",
+      {{"driver_id", "hash-driver"}, {"password", "wrong-hash-password"}});
+  expect(wrong.status == 401, "wrong Argon2id password was not rejected");
+  const auto unknown = post(
+      "/auth/driver_login",
+      {{"driver_id", "unknown-hash-driver"}, {"password", "wrong-hash-password"}});
+  expect(unknown.status == 401, "unknown driver did not use the generic credential rejection path");
+  const auto revoke = post(
+      "/admin/revoke/driver",
+      {{"id", "hash-driver"}, {"admin_token", "admin-token-with-a-fixed-test-length"}});
+  expect(revoke.status == 200, "admin revoke did not recognize a hash-backed driver");
+  const auto revoked = post(
+      "/auth/driver_login",
+      {{"driver_id", "hash-driver"}, {"password", "correct-hash-password"}});
+  expect(revoked.status == 401, "revoked hash-backed driver was allowed to log in");
+}
+
+void test_credential_purpose_separation_and_stale_control_replay() {
+  auto config = legacy_signaling_config();
   config.driver_passwords = {{"driver-purpose", "driver-purpose-password"}};
   config.device_tokens = {{"vehicle-purpose", "vehicle-purpose-device-token"}};
   config.driver_vehicle_permissions = {{"driver-purpose", {"vehicle-purpose"}}};
@@ -2845,7 +3038,7 @@ void test_browser_event_logging_rotation_and_redaction() {
 }
 
 void test_driver_vehicle_switch_releases_old_session() {
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {
       {"vehicle-001", "vehicle-secret-1"},
@@ -3292,7 +3485,7 @@ void test_two_driver_two_vehicle_wss_isolation_and_safe_rejection() {
   std::filesystem::create_directories(root);
   const auto audit_path = root / "signaling-audit.jsonl";
 
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {
       {"driver-console-001", "dev-password-1"},
       {"driver-console-002", "dev-password-2"},
@@ -3554,7 +3747,7 @@ void test_two_driver_two_vehicle_wss_isolation_and_safe_rejection() {
 }
 
 void test_failed_logout_keeps_retryable_local_authority() {
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
@@ -3593,7 +3786,7 @@ void test_failed_logout_keeps_retryable_local_authority() {
 }
 
 void test_local_proxy_preserves_upstream_auth_status() {
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
@@ -3639,7 +3832,7 @@ void test_local_proxy_preserves_upstream_auth_status() {
 void test_control_authority_lease_renews_without_rotating_token() {
   const auto audit_path = std::filesystem::path("/tmp") /
       ("mine-teleop-control-renewal-" + mine_teleop::random_token(6) + ".jsonl");
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
@@ -3806,7 +3999,7 @@ void test_control_transport_and_loopback_policy() {
 }
 
 void test_mac_runtime_uses_websocket_signaling() {
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
@@ -3913,7 +4106,7 @@ void test_websocket_handshake_and_participant_isolation() {
   }
   expect(invalid_key_rejected, "invalid websocket key was accepted");
 
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
@@ -4171,7 +4364,7 @@ void test_websocket_handshake_and_participant_isolation() {
 }
 
 void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
@@ -4401,7 +4594,7 @@ void test_native_control_three_hop_trace_correlation() {
   std::uint64_t vehicle_received_seq = 0;
   std::uint64_t vehicle_delivery_cursor = 0;
 
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "trace-driver-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "trace-device-token"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
@@ -4615,7 +4808,7 @@ void test_native_control_three_hop_trace_correlation() {
 }
 
 void test_websocket_participant_rate_limit_survives_reconnect_and_parallel_sockets() {
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.driver_passwords = {{"driver-console-001", "dev-password"}};
   config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
@@ -4697,7 +4890,7 @@ void test_websocket_participant_rate_limit_survives_reconnect_and_parallel_socke
 }
 
 void test_mac_runtime_retries_uncertain_websocket_send_without_duplication() {
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
@@ -4818,7 +5011,7 @@ void test_websocket_client_retains_split_server_frame() {
 }
 
 void test_signaling_queue_prunes_expired_messages_and_backpressures() {
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.signaling_message_ttl_ms = 200;
   config.max_signaling_queue_messages = 2;
   config.max_signaling_queue_bytes = 1024 * 1024;
@@ -4882,7 +5075,7 @@ void test_signaling_queue_prunes_expired_messages_and_backpressures() {
 }
 
 void test_expired_websocket_authority_clears_local_control() {
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
@@ -4940,7 +5133,7 @@ void test_expired_websocket_authority_clears_local_control() {
 }
 
 void test_websocket_reconnect_preserves_active_authority() {
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
@@ -5020,7 +5213,7 @@ void test_websocket_reconnect_preserves_active_authority() {
 void test_signaling_process_restart_requires_fresh_authority() {
   const auto audit_path = std::filesystem::temp_directory_path() /
       ("mine-teleop-signaling-restart-" + mine_teleop::random_token(6) + ".jsonl");
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.driver_passwords = {
       {"driver-console-001", "restart-driver-password"},
       {"restart-api-driver", "restart-api-password"}};
@@ -5263,7 +5456,7 @@ void test_signaling_audit_rotation_and_service_start() {
   std::filesystem::create_directories(root);
   const auto audit_path = root / "signaling-audit.jsonl";
 
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.audit_log_path = audit_path.string();
   config.audit_log_max_bytes = 1024;
   config.audit_log_files = 3;
@@ -5440,7 +5633,7 @@ void test_signaling_audit_rotation_and_service_start() {
 void test_signaling_audit_redacts_authenticated_reports() {
   const auto audit_path = std::filesystem::temp_directory_path() /
       ("mine-teleop-authenticated-report-audit-" + mine_teleop::random_token(6) + ".jsonl");
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.driver_passwords = {{"driver-audit", "driver-password-audit"}};
   config.device_tokens = {{"vehicle-audit", "device-token-audit-secret"}};
   config.driver_vehicle_permissions = {{"driver-audit", {"vehicle-audit"}}};
@@ -5689,7 +5882,7 @@ void test_signaling_audit_redacts_authenticated_reports() {
 void test_driver_webrtc_connection_audit_transitions() {
   const auto audit_path = std::filesystem::temp_directory_path() /
       ("mine-teleop-webrtc-connection-audit-" + mine_teleop::random_token(6) + ".jsonl");
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.driver_passwords = {{"driver-webrtc", "driver-webrtc-password"}};
   config.device_tokens = {{"vehicle-webrtc", "vehicle-webrtc-token"}};
   config.driver_vehicle_permissions = {{"driver-webrtc", {"vehicle-webrtc"}}};
@@ -5797,7 +5990,7 @@ void test_driver_webrtc_connection_audit_transitions() {
 }
 
 void test_driver_login_failure_rate_limit_and_recovery() {
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.driver_passwords = {{"driver-1", "correct-password"}};
   config.device_tokens = {{"vehicle-1", "device-token"}};
   config.driver_vehicle_permissions = {{"driver-1", {"vehicle-1"}}};
@@ -5962,7 +6155,7 @@ void test_signaling_audit_failure_does_not_abort_reaper() {
       ("mine-teleop-audit-reaper-test-" + mine_teleop::random_token(6));
   std::filesystem::create_directories(root);
   const auto audit_path = root / "audit.jsonl";
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.audit_log_path = audit_path.string();
   config.token_ttl_ms = 60;
   config.connection_reaper_interval_ms = 5;
@@ -6032,7 +6225,7 @@ void test_signaling_audit_failure_does_not_abort_reaper() {
 }
 
 void test_request_correlation_ids() {
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   const auto audit_path = std::filesystem::path("/tmp") /
       ("mine-teleop-request-correlation-" + mine_teleop::random_token(6) + ".jsonl");
   config.audit_log_path = audit_path.string();
@@ -6117,7 +6310,7 @@ void test_request_correlation_ids() {
 }
 
 void test_source_aware_api_and_websocket_rate_limit() {
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.api_rate_limit_requests = 2;
   config.api_rate_limit_window_ms = 25;
   config.api_rate_limit_max_sources = 8;
@@ -6337,6 +6530,7 @@ int main() {
       {"signaling_latest_only_control_mailbox", test_signaling_latest_only_control_mailbox},
       {"driver_brake_limit_config_validation", test_driver_brake_limit_config_validation},
       {"signaling_multi_identity_config", test_signaling_multi_identity_config},
+      {"argon2id_credentials_and_login_concurrency", test_argon2id_credentials_and_login_concurrency},
       {"credential_purpose_separation_and_stale_control_replay",
        test_credential_purpose_separation_and_stale_control_replay},
       {"browser_event_logging_rotation_and_redaction", test_browser_event_logging_rotation_and_redaction},

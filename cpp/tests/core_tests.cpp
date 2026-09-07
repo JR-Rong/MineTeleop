@@ -40,6 +40,13 @@ void expect(bool condition, std::string_view message) {
   if (!condition) throw TestFailure(std::string(message));
 }
 
+mine_teleop::SignalingServerConfig legacy_signaling_config() {
+  auto config = mine_teleop::SignalingServerConfig{};
+  config.allow_legacy_passwords = true;
+  config.legacy_passwords_remove_by = "2027-03-31";
+  return config;
+}
+
 void expect_near(double actual, double expected, double epsilon, std::string_view message) {
   if (std::abs(actual - expected) > epsilon) {
     throw TestFailure(std::string(message) + ": expected " + std::to_string(expected) + ", got " +
@@ -3419,7 +3426,7 @@ void test_fault_output_fails_safe() {
 }
 
 void test_native_signaling_webrtc_message_isolation() {
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.driver_passwords = {{"driver-1", "secret"}, {"driver-2", "secret-2"}};
   config.device_tokens = {{"vehicle-001", "device-secret"}};
   config.driver_vehicle_permissions = {
@@ -3742,7 +3749,7 @@ void test_native_signaling_webrtc_message_isolation() {
 }
 
 void test_signaling_presence_generation_and_automatic_release() {
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.driver_passwords = {{"driver-1", "secret-1"}, {"driver-2", "secret-2"}};
   config.device_tokens = {{"vehicle-1", "device-1"}, {"vehicle-2", "device-2"}};
   config.driver_vehicle_permissions = {
@@ -4008,7 +4015,7 @@ void test_signaling_presence_generation_and_automatic_release() {
 }
 
 void test_signaling_time_sync_common_domain() {
-  auto service = std::make_shared<mine_teleop::SignalingService>(mine_teleop::SignalingServerConfig{});
+  auto service = std::make_shared<mine_teleop::SignalingService>(legacy_signaling_config());
   mine_teleop::SimpleHttpServer server(
       "127.0.0.1",
       0,
@@ -4130,7 +4137,7 @@ void test_basler_camera_uses_minimal_aravis_bridge() {
 }
 
 void test_native_driver_to_vehicle_signaling_control_payload() {
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "dev-device-secret"}};
   signaling_config.control_token_ttl_ms = 5000;
@@ -4265,7 +4272,7 @@ void test_native_driver_to_vehicle_signaling_control_payload() {
 }
 
 void test_driver_login_lists_only_authorized_vehicles() {
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {
       {"driver-console-001", "dev-password"},
       {"driver-console-002", "other-password"},

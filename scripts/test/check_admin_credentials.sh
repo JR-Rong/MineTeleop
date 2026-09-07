@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 
-if ! command -v python3 >/dev/null 2>&1 ||
+if ! command -v python3 >/dev/null 2>&1 || ! command -v argon2 >/dev/null 2>&1 ||
   ! python3 -c 'import yaml' >/dev/null 2>&1; then
   printf 'admin_credentials_test=skipped reason=python3_pyyaml_unavailable\n'
   exit 0
@@ -37,13 +37,13 @@ driver_plan="$(
       --vehicles vehicle-001 \
       --dry-run
 )"
-expected_driver_secret="$repo_root/.local/secrets/signaling-server.2x2.dev/driver-credential-dry-run.password"
+expected_driver_secret="$repo_root/.local/secrets/signaling-server.2x2.dev/driver-credential-dry-run.password.argon2id"
 [[ "$driver_plan" == *"$expected_driver_secret"* ]] || {
   printf 'add_driver repo credential path escaped .local: %s\n' "$driver_plan" >&2
   exit 2
 }
-[[ "$driver_plan" == *'password_file: ../.local/secrets/signaling-server.2x2.dev/driver-credential-dry-run.password'* ]] || {
-  printf 'add_driver did not render the repository-relative .local reference\n' >&2
+[[ "$driver_plan" == *'password_hash_file: ../.local/secrets/signaling-server.2x2.dev/driver-credential-dry-run.password.argon2id'* ]] || {
+  printf 'add_driver did not render the repository-relative Argon2id reference\n' >&2
   exit 2
 }
 
@@ -94,8 +94,29 @@ MINE_TELEOP_SIGNALING_SERVER_BIN="$validator_ok" \
   printf 'add_driver did not create the requested password file\n' >&2
   exit 2
 }
+[[ -s "$secrets_dir/driver-credential-applied.password.argon2id" ]] || {
+  printf 'add_driver did not create the requested Argon2id verifier file\n' >&2
+  exit 2
+}
+grep -Eq '^\$argon2id\$v=19\$m=65536,t=3,p=1\$' \
+  "$secrets_dir/driver-credential-applied.password.argon2id" || {
+  printf 'add_driver did not create the required Argon2id verifier policy\n' >&2
+  exit 2
+}
+[[ "$(stat -c '%a' -- "$secrets_dir/driver-credential-applied.password" 2>/dev/null || stat -f '%Lp' -- "$secrets_dir/driver-credential-applied.password")" == 600 ]] || {
+  printf 'add_driver password file mode is not 0600\n' >&2
+  exit 2
+}
+[[ "$(stat -c '%a' -- "$secrets_dir/driver-credential-applied.password.argon2id" 2>/dev/null || stat -f '%Lp' -- "$secrets_dir/driver-credential-applied.password.argon2id")" == 600 ]] || {
+  printf 'add_driver verifier file mode is not 0600\n' >&2
+  exit 2
+}
 grep -q 'id: driver-credential-applied' "$fixture_config" || {
   printf 'add_driver did not publish the validated config\n' >&2
+  exit 2
+}
+grep -q 'password_hash_file: .*driver-credential-applied.password.argon2id' "$fixture_config" || {
+  printf 'add_driver did not publish a password_hash_file reference\n' >&2
   exit 2
 }
 

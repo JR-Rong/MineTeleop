@@ -108,19 +108,19 @@ yaml_driver_vehicles() {
 }
 
 yaml_add_driver() {
-  local file="$1" driver="$2" password_file="$3" vehicles="$4"
+  local file="$1" driver="$2" password_hash_file="$3" vehicles="$4"
   case "$yaml_engine" in
     yq)
       MINE_TELEOP_NEW_DRIVER_ID="$driver" \
-        MINE_TELEOP_NEW_PASSWORD_FILE="$password_file" \
+        MINE_TELEOP_NEW_PASSWORD_HASH_FILE="$password_hash_file" \
         MINE_TELEOP_NEW_VEHICLES="$vehicles" \
         yq -i '.auth.drivers += [{
           "id": strenv(MINE_TELEOP_NEW_DRIVER_ID),
-          "password_file": strenv(MINE_TELEOP_NEW_PASSWORD_FILE),
+          "password_hash_file": strenv(MINE_TELEOP_NEW_PASSWORD_HASH_FILE),
           "vehicles": (strenv(MINE_TELEOP_NEW_VEHICLES) | split(","))
         }]' -- "$file"
       ;;
-    python) python_yaml add-driver "$file" "$driver" "$password_file" "$vehicles" ;;
+    python) python_yaml add-driver "$file" "$driver" "$password_hash_file" "$vehicles" ;;
   esac
 }
 

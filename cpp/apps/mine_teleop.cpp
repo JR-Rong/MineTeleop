@@ -193,7 +193,10 @@ Signaling server options:
   --host ADDRESS                bind address (default 127.0.0.1)
   --port N                      bind port (default 8765)
   --driver-id ID                configured driver (default driver-console-001)
-  --driver-password PASSWORD    or set MINE_TELEOP_DRIVER_PASSWORD
+  --driver-password PASSWORD    legacy only; or set MINE_TELEOP_DRIVER_PASSWORD
+  --allow-legacy-passwords      explicitly enable temporary plaintext CLI credentials
+  --legacy-passwords-remove-by YYYY-MM-DD
+                                required migration removal deadline for that mode
   --vehicle-id ID               configured vehicle (default vehicle-001)
   --device-token TOKEN          or set MINE_TELEOP_DEVICE_TOKEN
   --audit-log PATH              append native JSONL audit records
@@ -391,6 +394,10 @@ std::uint16_t port_option(const Arguments& arguments, std::string_view key, int 
 }
 
 int run_signaling_server(const Arguments& arguments) {
+  if (!arguments.has("--allow-legacy-passwords")) {
+    throw std::invalid_argument(
+        "legacy --driver-password mode requires --allow-legacy-passwords; use mine-teleop-signaling-server --config with Argon2id verifiers instead");
+  }
   mine_teleop::SignalingServerConfig config;
   config.host = arguments.value("--host", "127.0.0.1");
   config.port = port_option(arguments, "--port", 8765);
@@ -401,6 +408,8 @@ int run_signaling_server(const Arguments& arguments) {
   const auto device_token = arguments.value(
       "--device-token", environment("MINE_TELEOP_DEVICE_TOKEN").empty() ? "dev-device-secret" : environment("MINE_TELEOP_DEVICE_TOKEN"));
   config.driver_passwords = {{driver_id, driver_password}};
+  config.allow_legacy_passwords = true;
+  config.legacy_passwords_remove_by = arguments.value("--legacy-passwords-remove-by");
   config.device_tokens = {{vehicle_id, device_token}};
   config.driver_vehicle_permissions = {{driver_id, {vehicle_id}}};
   config.admin_token = environment("MINE_TELEOP_ADMIN_TOKEN");

@@ -42,6 +42,7 @@ docker run -d \
   -p "127.0.0.1:${console_port}:8080" \
   "$image" signaling-server \
     --host 0.0.0.0 --port 8765 \
+    --allow-legacy-passwords --legacy-passwords-remove-by 2027-03-31 \
     --vehicle-id "$vehicle_id" \
     --audit-log /tmp/signaling-audit.jsonl >/dev/null
 

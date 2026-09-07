@@ -1,4 +1,5 @@
 #include "mine_teleop/core.hpp"
+#include "mine_teleop/credentials.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -1502,7 +1503,7 @@ ReceiveResult ControlReceiver::validate(
   if (command.driver_id != driver_id_) return {false, "wrong_driver", std::nullopt, {}};
   if (command.session_id != session_id_) return {false, "wrong_session", std::nullopt, {}};
   if (!control_authority_) return {false, "control_authority_missing", std::nullopt, {}};
-  if (command.control_token != control_token_) {
+  if (!constant_time_equal(control_token_, command.control_token)) {
     return {false, "control_token_invalid", std::nullopt, {}};
   }
   if (last_seq_ && command.seq <= *last_seq_) return {false, "old_seq", std::nullopt, {}};
@@ -2969,7 +2970,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
   if (request.session_id != session_id_) {
     return profile_result(request, now.utc, false, false, "wrong_session");
   }
-  if (request.control_token != control_token_) {
+  if (!constant_time_equal(control_token_, request.control_token)) {
     return profile_result(
         request,
         now.utc,

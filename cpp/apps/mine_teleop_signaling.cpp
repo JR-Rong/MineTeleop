@@ -67,6 +67,8 @@ class Arguments {
  private:
   static void require_known(std::string_view key) {
     static const std::unordered_set<std::string> known{
+        "--allow-legacy-passwords",
+        "--legacy-passwords-remove-by",
         "--allow-insecure-nonloopback-dev",
         "--api-rate-limit-max-sources",
         "--api-rate-limit-requests",
@@ -196,9 +198,11 @@ Identity and listener:
   --host ADDRESS                         loopback bind address (default 127.0.0.1)
   --port N                               HTTP/WSS port (default 8765; 0 selects a free port)
   --driver-id ID                         configured driver identity
-  --driver-password VALUE                development driver credential
+  --driver-password VALUE                development driver credential (legacy only)
   --vehicle-id ID                        configured vehicle identity
   --device-token VALUE                   development vehicle credential
+  --allow-legacy-passwords               explicitly enable the temporary plaintext CLI mode
+  --legacy-passwords-remove-by YYYY-MM-DD required migration removal deadline for that mode
   --allow-insecure-nonloopback-dev        permit an isolated non-loopback development bind
 
 Lease and presence:
@@ -263,6 +267,10 @@ int main(int argc, char** argv) {
         "--config", environment("MINE_TELEOP_SIGNALING_CONFIG"));
     mine_teleop::SignalingServerConfig config;
     if (!identity_config_path.empty()) {
+      if (arguments.has("--allow-legacy-passwords")) {
+        throw std::invalid_argument(
+            "--allow-legacy-passwords is configured only by auth.allow_legacy_passwords in the identity YAML");
+      }
       if (arguments.has("--driver-id") || arguments.has("--driver-password") ||
           arguments.has("--vehicle-id") || arguments.has("--device-token") ||
           !environment("MINE_TELEOP_DRIVER_PASSWORD").empty() ||
@@ -272,6 +280,10 @@ int main(int argc, char** argv) {
       }
       config = mine_teleop::load_signaling_identity_config(identity_config_path);
     } else {
+      if (!arguments.has("--allow-legacy-passwords")) {
+        throw std::invalid_argument(
+            "legacy --driver-password mode requires --allow-legacy-passwords; use --config with Argon2id verifiers instead");
+      }
       const auto driver_id = arguments.value("--driver-id", "driver-console-001");
       const auto vehicle_id = arguments.value("--vehicle-id", "vehicle-001");
       const auto driver_password = arguments.value(
@@ -285,6 +297,8 @@ int main(int argc, char** argv) {
               ? "dev-device-secret"
               : environment("MINE_TELEOP_DEVICE_TOKEN"));
       config.driver_passwords = {{driver_id, driver_password}};
+      config.allow_legacy_passwords = true;
+      config.legacy_passwords_remove_by = arguments.value("--legacy-passwords-remove-by");
       config.device_tokens = {{vehicle_id, device_token}};
       config.driver_vehicle_permissions = {{driver_id, {vehicle_id}}};
     }
@@ -405,7 +419,7 @@ int main(int argc, char** argv) {
     const auto audit_log_rotation_interval_ms = config.audit_log_rotation_interval_ms;
     const auto audit_log_retention_days = config.audit_log_retention_days;
     const auto native_control_trace_commands = config.native_control_trace_commands;
-    const auto driver_count = config.driver_passwords.size();
+    const auto driver_count = config.driver_passwords.size() + config.driver_password_verifiers.size();
     const auto vehicle_count = config.device_tokens.size();
     std::size_t permission_count = 0;
     for (const auto& entry : config.driver_vehicle_permissions) permission_count += entry.second.size();

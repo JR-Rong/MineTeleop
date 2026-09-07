@@ -23,8 +23,10 @@ ARG MINE_TELEOP_BUILD_JOBS=2
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
       bash \
+      argon2 \
       build-essential \
       cmake \
+      libargon2-dev \
       libcurl4-openssl-dev \
       libssl-dev \
       libyaml-cpp-dev \

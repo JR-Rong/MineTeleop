@@ -1,7 +1,9 @@
 auth:
   drivers:
     - id: driver-console-001
-      password_file: secrets/driver-console-001.password
+      # Argon2id PHC verifier, produced by scripts/admin/add_driver.sh. Keep
+      # the plaintext password outside this configuration tree.
+      password_hash_file: secrets/driver-console-001.password.argon2id
       vehicles:
         - vehicle-001
   vehicles:

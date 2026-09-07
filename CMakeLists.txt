@@ -32,6 +32,24 @@ option(MINE_TELEOP_FETCH_MISSING_DEPS "Fetch pinned yaml-cpp and nlohmann-json s
 set(MINE_TELEOP_MVS_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/mvs" CACHE PATH "Bundled Hikrobot MVS SDK root")
 set(MINE_TELEOP_CURL_LINKAGE "unknown" CACHE STRING "How libcurl is linked into the control client")
 
+# Password verification is deliberately an optional implementation dependency
+# for control-only packages, but it is mandatory whenever the signaling server
+# or its native tests are built. Do not silently replace Argon2id with a fast
+# digest when a packaging image is incomplete.
+set(MINE_TELEOP_NEEDS_ARGON2ID OFF)
+if(MINE_TELEOP_BUILD_SIGNALING_SERVER OR MINE_TELEOP_BUILD_TESTS)
+  set(MINE_TELEOP_NEEDS_ARGON2ID ON)
+endif()
+find_path(MINE_TELEOP_ARGON2_INCLUDE_DIR NAMES argon2.h)
+find_library(MINE_TELEOP_ARGON2_LIBRARY NAMES argon2 libargon2)
+set(MINE_TELEOP_HAS_ARGON2ID 0)
+if(MINE_TELEOP_ARGON2_INCLUDE_DIR AND MINE_TELEOP_ARGON2_LIBRARY)
+  set(MINE_TELEOP_HAS_ARGON2ID 1)
+elseif(MINE_TELEOP_NEEDS_ARGON2ID)
+  message(FATAL_ERROR
+    "Argon2id is required to build the signaling server or native tests. Install the packaged Argon2 development dependency.")
+endif()
+
 find_package(Threads REQUIRED)
 if(WIN32)
   find_package(ZLIB REQUIRED)
@@ -135,6 +153,7 @@ mine_teleop_enable_warnings(mine_teleop_vcu)
 # This library is the shared protocol/session/HTTP core used by all control
 # packages. It intentionally has no camera, JPEG, or GStreamer dependency.
 add_library(mine_teleop_runtime
+  cpp/src/credentials.cpp
   cpp/src/core.cpp
   cpp/src/http.cpp
   cpp/src/platform.cpp
@@ -156,6 +175,16 @@ target_link_libraries(mine_teleop_runtime
     nlohmann_json::nlohmann_json
     ${CMAKE_DL_LIBS}
 )
+target_compile_definitions(
+  mine_teleop_runtime
+  PRIVATE
+    MINE_TELEOP_HAS_ARGON2ID=${MINE_TELEOP_HAS_ARGON2ID}
+    MINE_TELEOP_HAS_OPENSSL_CRYPTO=$<NOT:$<BOOL:${APPLE}>>
+)
+if(MINE_TELEOP_HAS_ARGON2ID)
+  target_include_directories(mine_teleop_runtime PRIVATE "${MINE_TELEOP_ARGON2_INCLUDE_DIR}")
+  target_link_libraries(mine_teleop_runtime PRIVATE "${MINE_TELEOP_ARGON2_LIBRARY}")
+endif()
 if(APPLE)
   target_link_libraries(mine_teleop_runtime PUBLIC "${MINE_TELEOP_SECURITY_FRAMEWORK}")
 else()

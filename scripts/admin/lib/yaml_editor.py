@@ -220,7 +220,7 @@ if mode == "show-driver":
     raise SystemExit(0)
 
 if mode == "add-driver":
-    driver_id, password_file = arguments[0], arguments[1]
+    driver_id, password_hash_file = arguments[0], arguments[1]
     vehicles = [item for item in arguments[2].split(",") if item]
     if not vehicles:
         die("the new driver needs at least one vehicle")
@@ -246,7 +246,7 @@ if mode == "add-driver":
 
     payload.extend([
         " " * item + "- id: " + quote(driver_id),
-        " " * (item + 2) + "password_file: " + quote(password_file),
+        " " * (item + 2) + "password_hash_file: " + quote(password_hash_file),
         " " * (item + 2) + "vehicles:",
     ])
     payload.extend(" " * (item + 4) + "- " + quote(vehicle) for vehicle in vehicles)
