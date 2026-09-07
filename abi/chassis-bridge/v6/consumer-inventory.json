@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "inventory_id": "mine-teleop-chassis-bridge-abi-v6-consumers",
+  "evidence_commit": "2aca59dbf6218659041bf1ac3daaff24fd46003e",
+  "scope": "Repository evidence only. Absence from this file is not evidence that an external ABI consumer does not exist.",
+  "contract": "abi/chassis-bridge/v6/preflight-contract.json",
+  "repository_consumers": [
+    {
+      "id": "vehicle-control-runtime-loader",
+      "kind": "production_runtime_dynamic_loader",
+      "required_profile": "vehicle_agent_pre_can",
+      "evidence": [
+        "cpp/src/core.cpp:593-668",
+        "cpp/src/core.cpp:2439-2466",
+        "cpp/src/core.cpp:2504"
+      ],
+      "notes": "The adapter validates the ABI handle and loads the remaining runtime symbols before invoking open_v4."
+    },
+    {
+      "id": "mine-teleop-config-check",
+      "kind": "production_preflight_cli",
+      "required_profile": "config_check_pre_can",
+      "evidence": [
+        "cpp/apps/mine_teleop.cpp:1017-1044",
+        "cpp/include/mine_teleop/core.hpp:567"
+      ],
+      "notes": "The CLI calls validate_chassis_bridge_abi only; it is the package and deployment preflight entry point."
+    },
+    {
+      "id": "chassis-bridge-abi-loader-regression",
+      "kind": "fixture_and_loader_test",
+      "required_profile": "config_check_pre_can",
+      "evidence": [
+        "cpp/tests/chassis_bridge_abi_loader_tests.cpp:55-171",
+        "cpp/tests/fixtures/chassis-bridge-abi/chassis_bridge_abi_fixture.c:47-239",
+        "CMakeLists.txt:470-579"
+      ],
+      "notes": "Current CMake fixtures exercise ABI-version, missing-symbol, and POD-size rejection paths."
+    },
+    {
+      "id": "chassis-bridge-diagnostics-smoke",
+      "kind": "direct_bridge_smoke_test",
+      "required_profile": null,
+      "abi_exposure": "direct_public_header",
+      "evidence": [
+        "cpp/tests/chassis_bridge_diagnostics_smoke.cpp:1-2",
+        "cpp/tests/chassis_bridge_diagnostics_smoke.cpp:488"
+      ],
+      "notes": "This test includes the public bridge header and directly observes ABI version 6."
+    },
+    {
+      "id": "ubuntu-vehicle-bundle-check",
+      "kind": "package_preflight",
+      "required_profile": "config_check_pre_can",
+      "evidence": [
+        "scripts/test/check_cpp_ubuntu_bundle.sh:80-103",
+        "scripts/build/build_cpp_ubuntu_bundle.sh:187-200"
+      ],
+      "notes": "The bundle check requires the bridge artifact and runs config-check with its packaged path."
+    },
+    {
+      "id": "vehicle-deployment-staging-preflight",
+      "kind": "deployment_preflight",
+      "required_profile": "config_check_pre_can",
+      "evidence": [
+        "scripts/deploy/deploy_vehicle_bundle.sh:379-402",
+        "scripts/deploy/deploy_vehicle_bundle.sh:486-488"
+      ],
+      "notes": "The deployment transaction validates the staged bridge before release activation."
+    },
+    {
+      "id": "chassis-runtime-builder",
+      "kind": "runtime_package_builder",
+      "required_profile": null,
+      "abi_exposure": "artifact_provider",
+      "evidence": [
+        "scripts/build/prepare_chassis_runtime.sh:15-20",
+        "scripts/build/prepare_chassis_runtime.sh:54-73",
+        "deployments/chassis-control-bridge/Dockerfile.build:39-45"
+      ],
+      "notes": "The builder emits libmine_teleop_chassis_bridge.so and its vendor dependency for vehicle packages."
+    },
+    {
+      "id": "published-ubuntu-vehicle-package-contract",
+      "kind": "release_documentation_and_operator_contract",
+      "required_profile": "config_check_pre_can",
+      "evidence": [
+        "packaging/ubuntu-vehicle/README.txt:56",
+        "deployments/chassis-control-bridge/README.md:148-176"
+      ],
+      "notes": "Repository documentation names the packaged bridge location and requires an ABI-6 compatibility gate."
+    }
+  ],
+  "unverified_external_consumers": [
+    {
+      "id": "external-chassiscontrol-integrations",
+      "kind": "external_unknown",
+      "repository_evidence": "none",
+      "required_evidence_before_destructive_migration": [
+        "released vehicle package manifests with runtime and bridge hashes",
+        "deployment and rollback records for every active vehicle",
+        "confirmation from ChassisControl owners or other direct C-header consumers"
+      ],
+      "blocks": [
+        "removal of legacy exports",
+        "ABI-version bump that removes compatibility",
+        "signature changes under an existing symbol name",
+        "POD field reordering or layout changes",
+        "deletion of legacy ABI fixtures or compatibility tests"
+      ]
+    }
+  ]
+}

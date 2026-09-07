@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "contract_id": "mine-teleop-chassis-bridge-abi-v6",
+  "contract_status": "non_destructive_migration_foundation",
+  "evidence_commit": "2aca59dbf6218659041bf1ac3daaff24fd46003e",
+  "source_of_truth": {
+    "public_c_header": "deployments/chassis-control-bridge/mine_teleop_chassis_bridge.h:715-779",
+    "runtime_validator": "cpp/src/core.cpp:593-668",
+    "runtime_adapter_loader": "cpp/src/core.cpp:2439-2466",
+    "bridge_abi_version_export": "deployments/chassis-control-bridge/chassis_control_bridge.cpp:3155"
+  },
+  "supported_package": {
+    "target": "linux/amd64",
+    "bridge_relative_path": "lib/vendor/chassis/libmine_teleop_chassis_bridge.so",
+    "target_evidence": "scripts/build/prepare_chassis_runtime.sh:15-20"
+  },
+  "profiles": {
+    "config_check_pre_can": {
+      "description": "Mirrors the ABI validation that the config-check path and adapter loader perform before a versioned open call.",
+      "evidence": [
+        "cpp/src/core.cpp:593-668",
+        "cpp/apps/mine_teleop.cpp:1017-1044"
+      ],
+      "checks": [
+        {
+          "symbol": "mine_teleop_chassis_abi_version",
+          "kind": "u32_query",
+          "expected": 6
+        },
+        {
+          "symbol": "mine_teleop_chassis_open_config_v2_size",
+          "kind": "u32_query",
+          "expected": 88
+        },
+        {
+          "symbol": "mine_teleop_chassis_open_config_v3_size",
+          "kind": "u32_query",
+          "expected": 96
+        },
+        {
+          "symbol": "mine_teleop_chassis_open_config_v4_size",
+          "kind": "u32_query",
+          "expected": 104
+        },
+        {
+          "symbol": "mine_teleop_chassis_runtime_control_config_v1_size",
+          "kind": "u32_query",
+          "expected": 88
+        },
+        {
+          "symbol": "mine_teleop_chassis_runtime_control_config_v2_size",
+          "kind": "u32_query",
+          "expected": 96
+        },
+        {
+          "symbol": "mine_teleop_chassis_stop_context_v1_size",
+          "kind": "u32_query",
+          "expected": 16
+        },
+        {
+          "symbol": "mine_teleop_chassis_open_v1",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_open_v2",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_open_v3",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_open_v4",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_apply_state_v2",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_configure_runtime_control_v1",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_configure_runtime_control_v2",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_clear_runtime_control_v1",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_set_stop_context_v1",
+          "kind": "symbol"
+        }
+      ]
+    },
+    "vehicle_agent_pre_can": {
+      "description": "Adds every symbol loaded by ChassisControlAdapter::ensure_loaded before mine_teleop_chassis_open_v4 can be invoked.",
+      "extends": "config_check_pre_can",
+      "evidence": [
+        "cpp/src/core.cpp:2439-2466",
+        "cpp/src/core.cpp:2504"
+      ],
+      "checks": [
+        {
+          "symbol": "mine_teleop_chassis_apply_state",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_emergency_stop",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_request_parallel_handshake",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_disconnect_parallel_handshake",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_poll_feedback",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_read_handshake_status",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_read_telemetry",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_read_can_feedback_v1",
+          "kind": "symbol"
+        },
+        {
+          "symbol": "mine_teleop_chassis_close",
+          "kind": "symbol"
+        }
+      ]
+    }
+  },
+  "preflight_invariants": [
+    "Only u32_query checks are invoked; symbol checks use lookup only.",
+    "No mine_teleop_chassis_open, mine_teleop_chassis_open_v1, mine_teleop_chassis_open_v2, mine_teleop_chassis_open_v3, or mine_teleop_chassis_open_v4 function may be called by this preflight.",
+    "The preflight must complete before a candidate package is activated or a CAN-initialization-capable runtime command is invoked."
+  ]
+}
