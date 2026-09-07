@@ -64,6 +64,7 @@ case "$command_name" in
       esac
     done
     [[ -n "$config" && -s "$config" ]] || exit 9
+    grep -q '[^[:space:]]' "$config" || exit 9
     ! grep -q 'INVALID_CANDIDATE' "$config" || exit 10
     if [[ "$config" == */config/vehicle-agent.yaml ]] &&
       grep -q 'FAIL_FINAL_CHECK' "$config"; then
@@ -150,7 +151,12 @@ while (($# > 2)); do shift; done
 source_path="$1"
 destination="${2#*:}"
 mkdir -p "$(dirname -- "$destination")"
-cp "$source_path" "$destination"
+if [[ "${MINE_TELEOP_TEST_TRUNCATE_CONFIG_UPLOAD:-false}" == "true" &&
+      "$destination" == *.vehicle-agent.yaml ]]; then
+  : >"$destination"
+else
+  cp "$source_path" "$destination"
+fi
 EOF
 cat >"$stub_dir/ssh" <<'EOF'
 #!/usr/bin/env bash
@@ -202,6 +208,67 @@ grep -q 'site-custom-ca' "$remote_dir/config/mine-teleop-field-root.crt" ||
   fail "successful deployment did not migrate the stable lib entry"
 first_release="$(readlink "$remote_dir/current")"
 [[ -d "$first_release" ]] || fail "current release symlink target is missing"
+
+assert_primary_deployment_unchanged() {
+  [[ "$(readlink "$remote_dir/current")" == "$first_release" ]] ||
+    fail "failed override changed the active release"
+  grep -q 'site_calibration: preserve-me' "$remote_dir/config/vehicle-agent.yaml" ||
+    fail "failed override changed the persistent site configuration"
+  grep -q 'site-token-preserve-me' "$remote_dir/config/device-token" ||
+    fail "failed override changed the persistent device token"
+  [[ ! -e "$remote_archive" && ! -e "$remote_archive.vehicle-agent.yaml" &&
+      ! -e "$remote_archive.device-token" ]] ||
+    fail "failed override left uploaded candidate files behind"
+  [[ "$(find "$remote_dir/.releases" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" == "1" ]] ||
+    fail "failed override left a partial release directory"
+}
+
+empty_config="$fixture_root/empty-vehicle.yaml"
+: >"$empty_config"
+if PATH="$stub_dir:$PATH" bash "$repository_root/scripts/deploy/deploy_vehicle_bundle.sh" \
+  --bundle "$bundle" \
+  --config "$empty_config" \
+  --host fixture \
+  --user fixture \
+  --remote-dir "$remote_dir" \
+  --remote-archive "$remote_archive" \
+  --media-frames 0 >/dev/null 2>&1; then
+  fail "zero-byte --config unexpectedly fell back to the site configuration"
+fi
+assert_primary_deployment_unchanged
+
+whitespace_config="$fixture_root/whitespace-vehicle.yaml"
+printf ' \t\n' >"$whitespace_config"
+if PATH="$stub_dir:$PATH" bash "$repository_root/scripts/deploy/deploy_vehicle_bundle.sh" \
+  --bundle "$bundle" \
+  --config "$whitespace_config" \
+  --host fixture \
+  --user fixture \
+  --remote-dir "$remote_dir" \
+  --remote-archive "$remote_archive" \
+  --media-frames 0 >/dev/null 2>&1; then
+  fail "whitespace-only --config unexpectedly activated"
+fi
+assert_primary_deployment_unchanged
+
+truncated_config="$fixture_root/truncated-vehicle.yaml"
+cat >"$truncated_config" <<'EOF'
+site_calibration: remote-transfer-must-not-fallback
+cloud:
+  ca_bundle: mine-teleop-field-root.crt
+EOF
+if MINE_TELEOP_TEST_TRUNCATE_CONFIG_UPLOAD=true PATH="$stub_dir:$PATH" \
+  bash "$repository_root/scripts/deploy/deploy_vehicle_bundle.sh" \
+    --bundle "$bundle" \
+    --config "$truncated_config" \
+    --host fixture \
+    --user fixture \
+    --remote-dir "$remote_dir" \
+    --remote-archive "$remote_archive" \
+    --media-frames 0 >/dev/null 2>&1; then
+  fail "truncated remote --config unexpectedly fell back to the site configuration"
+fi
+assert_primary_deployment_unchanged
 
 if [[ -n "$launcher_under_test" ]]; then
   launcher_capture="$fixture_root/launcher-result.log"
@@ -309,16 +376,23 @@ if PATH="$stub_dir:$PATH" bash "$repository_root/scripts/deploy/deploy_vehicle_b
   fail "invalid candidate config unexpectedly activated"
 fi
 
-[[ "$(readlink "$remote_dir/current")" == "$first_release" ]] ||
-  fail "failed preflight changed the active release"
-grep -q 'site_calibration: preserve-me' "$remote_dir/config/vehicle-agent.yaml" ||
-  fail "failed preflight changed the persistent site configuration"
-grep -q 'site-token-preserve-me' "$remote_dir/config/device-token" ||
-  fail "failed preflight changed the persistent device token"
-[[ ! -e "$remote_archive" && ! -e "$remote_archive.vehicle-agent.yaml" &&
-    ! -e "$remote_archive.device-token" ]] ||
-  fail "failed preflight left uploaded candidate files behind"
-[[ "$(find "$remote_dir/.releases" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" == "1" ]] ||
-  fail "failed deployment left a partial release directory"
+assert_primary_deployment_unchanged
+
+valid_override="$fixture_root/valid-vehicle.yaml"
+cat >"$valid_override" <<'EOF'
+site_calibration: explicit-override-applied
+cloud:
+  ca_bundle: mine-teleop-field-root.crt
+EOF
+PATH="$stub_dir:$PATH" bash "$repository_root/scripts/deploy/deploy_vehicle_bundle.sh" \
+  --bundle "$bundle" \
+  --config "$valid_override" \
+  --host fixture \
+  --user fixture \
+  --remote-dir "$remote_dir" \
+  --remote-archive "$remote_archive" \
+  --media-frames 0 >/dev/null
+grep -q 'site_calibration: explicit-override-applied' "$remote_dir/config/vehicle-agent.yaml" ||
+  fail "valid --config override was not applied"
 
 printf 'vehicle_deploy_transaction=passed\n'

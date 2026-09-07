@@ -315,6 +315,7 @@ deployment_committed="false"
 prefix_replacement_started="false"
 prefix_had_existing="false"
 changed_paths=()
+changed_path_states=()
 managed_units=(
   mine-teleop-signaling-server.service
   mine-teleop-turn-server.service
@@ -328,22 +329,58 @@ distribution_coturn_was_active="false"
 distribution_coturn_was_enabled="false"
 service_state_mutated="false"
 
-record_changed_path() {
+normalized_managed_path() {
   local path="$1"
-  local recorded
-  for recorded in "${changed_paths[@]:-}"; do
-    [[ "$recorded" != "$path" ]] || return
-  done
-  changed_paths+=("$path")
+  realpath -m -s -- "$path"
 }
 
-backup_existing() {
+snapshot_before_first_mutation() {
   local path="$1"
-  local destination
-  if [[ -e "$path" || -L "$path" ]]; then
-    destination="$backup_root$path"
-    mkdir -p "$(dirname -- "$destination")"
-    cp -a "$path" "$destination"
+  local normalized_path
+  local snapshot_path
+  local snapshot_state="missing"
+  local index
+
+  normalized_path="$(normalized_managed_path "$path")" || {
+    printf 'error: unable to normalize managed path before snapshot: %s\n' "$path" >&2
+    return 1
+  }
+  for ((index = 0; index < ${#changed_paths[@]}; ++index)); do
+    [[ "${changed_paths[$index]}" != "$normalized_path" ]] || return 0
+  done
+
+  snapshot_path="$backup_root$normalized_path"
+  if [[ -e "$normalized_path" || -L "$normalized_path" ]]; then
+    mkdir -p "$(dirname -- "$snapshot_path")" || {
+      printf 'error: rollback snapshot failed for %s during directory creation\n' "$normalized_path" >&2
+      return 1
+    }
+    cp -a -- "$normalized_path" "$snapshot_path" || {
+      printf 'error: rollback snapshot failed for %s during copy\n' "$normalized_path" >&2
+      return 1
+    }
+    snapshot_state="present"
+  fi
+
+  changed_paths+=("$normalized_path")
+  changed_path_states+=("$snapshot_state")
+}
+
+snapshot_chmod_mutation() {
+  local source="$1"
+  local destination="$2"
+  local chmod_target
+
+  snapshot_before_first_mutation "$destination" || return 1
+  # chmod follows a symlink and changes its referent. Keep the managed-link
+  # snapshot lexical, then explicitly snapshot the object chmod will mutate.
+  snapshot_before_first_mutation "$source" || return 1
+  if [[ -L "$destination" ]]; then
+    chmod_target="$(realpath -m -- "$destination")" || {
+      printf 'error: unable to resolve chmod target for rollback: %s\n' "$destination" >&2
+      return 1
+    }
+    snapshot_before_first_mutation "$chmod_target" || return 1
   fi
 }
 
@@ -352,11 +389,11 @@ install_config_file() {
   local destination="$2"
   local mode="$3"
   if [[ -e "$destination" && "$source" -ef "$destination" ]]; then
-    chmod "$mode" "$destination"
+    snapshot_chmod_mutation "$source" "$destination" || return 1
+    chmod "$mode" "$destination" || return 1
     return
   fi
-  backup_existing "$destination"
-  record_changed_path "$destination"
+  snapshot_before_first_mutation "$destination" || return 1
   local staged_destination="${destination}.candidate.$$"
   rm -f -- "$staged_destination"
   install -D -m "$mode" "$source" "$staged_destination" || {
@@ -382,6 +419,7 @@ rollback_deployment() {
   local index
   local path
   local saved
+  local snapshot_state
 
   set +e
   printf '==> deployment failed; restoring the previous cloud installation\n' >&2
@@ -392,11 +430,27 @@ rollback_deployment() {
   for ((index = ${#changed_paths[@]} - 1; index >= 0; --index)); do
     path="${changed_paths[$index]}"
     saved="$backup_root$path"
-    rm -rf -- "$path"
-    if [[ -e "$saved" || -L "$saved" ]]; then
-      mkdir -p "$(dirname -- "$path")"
-      cp -a "$saved" "$path"
+    snapshot_state="${changed_path_states[$index]:-unknown}"
+    if ! rm -rf -- "$path"; then
+      printf 'rollback_error target=%s phase=remove\n' "$path" >&2
+      continue
     fi
+    case "$snapshot_state" in
+      present)
+        if ! mkdir -p "$(dirname -- "$path")"; then
+          printf 'rollback_error target=%s phase=restore-parent\n' "$path" >&2
+          continue
+        fi
+        if ! cp -a -- "$saved" "$path"; then
+          printf 'rollback_error target=%s phase=restore\n' "$path" >&2
+        fi
+        ;;
+      missing)
+        ;;
+      *)
+        printf 'rollback_error target=%s phase=unknown-snapshot-state\n' "$path" >&2
+        ;;
+    esac
   done
 
   if [[ "$prefix_replacement_started" == "true" ]]; then

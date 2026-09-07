@@ -25,8 +25,14 @@ stub_dir="$fixture_root/bin"
 systemctl_log="$fixture_root/systemctl.log"
 deployment_log="$fixture_root/deployment.log"
 installed_caddy="$test_root/etc/caddy/Caddyfile"
+installed_turn_secret="$test_root/etc/mine-teleop/secrets/turn-static-auth.secret"
+installed_cloud_target="$test_root/etc/systemd/system/mine-teleop-cloud.target"
+original_cloud_target="$fixture_root/original-cloud.target"
+identity_secrets_dir="$fixture_root/identity-secrets"
+replacement_turn_secret="$fixture_root/replacement-turn-secret"
 mkdir -p \
   "$stub_dir" \
+  "$identity_secrets_dir" \
   "$package_root/bin" \
   "$package_root/lib" \
   "$package_root/deployments/systemd/caddy.service.d" \
@@ -35,6 +41,8 @@ mkdir -p \
   "$package_root/scripts" \
   "$test_root/opt/mine-teleop" \
   "$test_root/etc/caddy" \
+  "$test_root/etc/mine-teleop/secrets" \
+  "$test_root/etc/systemd/system" \
   "$test_root/var/tmp" \
   "$test_root/var/backups/mine-teleop"
 
@@ -126,6 +134,12 @@ chmod 0755 "$stub_dir"/*
 
 printf 'old-application\n' >"$test_root/opt/mine-teleop/old-marker"
 printf 'old-caddy\n' >"$installed_caddy"
+printf 'ORIGINAL_TURN_SENTINEL\n' >"$installed_turn_secret"
+chmod 0640 "$installed_turn_secret"
+printf 'IDENTITY_TURN_SENTINEL\n' >"$identity_secrets_dir/turn-static-auth.secret"
+printf 'REPLACEMENT_TURN_SENTINEL\n' >"$replacement_turn_secret"
+printf '[Unit]\nDescription=original cloud target\n' >"$original_cloud_target"
+ln -s "$original_cloud_target" "$installed_cloud_target"
 candidate_caddy="$fixture_root/candidate.Caddyfile"
 printf 'candidate-caddy\n' >"$candidate_caddy"
 : >"$systemctl_log"
@@ -136,6 +150,8 @@ if PATH="$stub_dir:$PATH" \
   bash "$package_root/deploy-cloud.sh" \
     --skip-package-install \
     --no-start \
+    --identity-secrets-dir "$identity_secrets_dir" \
+    --turn-secret-file "$replacement_turn_secret" \
     --caddy-config "$candidate_caddy" >"$deployment_log" 2>&1; then
   fail "installed Caddy validation failure unexpectedly committed"
 fi
@@ -143,6 +159,37 @@ fi
 grep -q '^old-application$' "$test_root/opt/mine-teleop/old-marker" ||
   fail "application bundle was not restored"
 grep -q '^old-caddy$' "$installed_caddy" || fail "Caddy configuration was not restored"
+grep -Fxq 'ORIGINAL_TURN_SENTINEL' "$installed_turn_secret" ||
+  fail "repeated TURN-secret install overwrote the first rollback snapshot"
+[[ "$(stat -c '%a' "$installed_turn_secret")" == "640" ]] ||
+  fail "TURN-secret rollback did not restore its original mode"
+[[ -L "$installed_cloud_target" &&
+    "$(readlink "$installed_cloud_target")" == "$original_cloud_target" ]] ||
+  fail "rollback did not restore the original managed symlink"
+[[ ! -e "$test_root/etc/systemd/system/mine-teleop-turn-server.service" &&
+    ! -L "$test_root/etc/systemd/system/mine-teleop-turn-server.service" ]] ||
+  fail "rollback did not remove an originally missing managed target"
+
+rm -rf -- "$test_root/etc/systemd"
+mkdir -p "$test_root/etc/systemd/system"
+cp -a "$package_root/." "$test_root/opt/mine-teleop/"
+chmod_source="$test_root/opt/mine-teleop/deployments/systemd/mine-teleop-signaling-server.service"
+chmod_destination="$test_root/etc/systemd/system/mine-teleop-signaling-server.service"
+chmod 0600 "$chmod_source"
+ln -s "$chmod_source" "$chmod_destination"
+if PATH="$stub_dir:$PATH" \
+  MINE_TELEOP_TEST_SYSTEMCTL_LOG="$systemctl_log" \
+  MINE_TELEOP_TEST_INSTALLED_CADDY="$installed_caddy" \
+  bash "$test_root/opt/mine-teleop/deploy-cloud.sh" \
+    --skip-package-install \
+    --no-start \
+    --caddy-config "$candidate_caddy" >"$deployment_log" 2>&1; then
+  fail "same-file chmod validation failure unexpectedly committed"
+fi
+[[ -L "$chmod_destination" && "$(readlink "$chmod_destination")" == "$chmod_source" ]] ||
+  fail "same-file chmod rollback did not restore the managed symlink"
+[[ "$(stat -c '%a' "$chmod_source")" == "600" ]] ||
+  fail "same-file chmod rollback did not restore the original mode"
 if grep -Eq '^(stop|start|restart|enable|disable)( |$)' "$systemctl_log"; then
   fail "--no-start rollback changed service state: $(tr '\n' ';' <"$systemctl_log")"
 fi

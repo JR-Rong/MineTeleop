@@ -92,6 +92,7 @@ while [[ $# -gt 0 ]]; do
     --config)
       require_value "$1" "${2:-}"
       CONFIG="$2"
+      CONFIG_OVERRIDE_REQUESTED="true"
       shift 2
       ;;
     --user)
@@ -181,6 +182,9 @@ done
 [[ "$MEDIA_FRAMES" =~ ^[0-9]+$ ]] || die "--media-frames must be an integer"
 [[ "$FRAME_INTERVAL_MS" =~ ^[0-9]+$ ]] || die "--frame-interval-ms must be an integer"
 [[ "$LIVE_TELEOP_DURATION_MS" =~ ^[0-9]+$ ]] || die "--live-teleop-duration-ms must be an integer"
+if [[ -n "$CONFIG" ]]; then
+  CONFIG_OVERRIDE_REQUESTED="true"
+fi
 
 if [[ "$DRY_RUN" != "true" ]]; then
   [[ -n "$SSH_HOST" ]] || die "--host (or MINE_TELEOP_VEHICLE_SSH_HOST) is required"
@@ -199,8 +203,9 @@ fi
 if [[ "$DRY_RUN" != "true" && ! -f "$BUNDLE" ]]; then
   die "bundle archive not found: $BUNDLE"
 fi
-if [[ "$DRY_RUN" != "true" && -n "$CONFIG" && ! -f "$CONFIG" ]]; then
-  die "vehicle config not found: $CONFIG"
+if [[ "$DRY_RUN" != "true" && "$CONFIG_OVERRIDE_REQUESTED" == "true" &&
+      ( ! -f "$CONFIG" || ! -r "$CONFIG" || ! -s "$CONFIG" ) ]]; then
+  die "vehicle config override must be a readable, non-empty regular file: $CONFIG"
 fi
 if [[ "$DRY_RUN" != "true" && -n "$DEVICE_TOKEN_FILE" && ! -f "$DEVICE_TOKEN_FILE" ]]; then
   die "vehicle device-token file not found: $DEVICE_TOKEN_FILE"
@@ -219,9 +224,6 @@ fi
 SSH_TARGET="$SSH_USER@$SSH_HOST"
 REMOTE_CONFIG_OVERRIDE="$REMOTE_ARCHIVE.vehicle-agent.yaml"
 REMOTE_DEVICE_TOKEN_OVERRIDE="$REMOTE_ARCHIVE.device-token"
-if [[ -n "$CONFIG" ]]; then
-  CONFIG_OVERRIDE_REQUESTED="true"
-fi
 if [[ -n "$DEVICE_TOKEN_FILE" ]]; then
   DEVICE_TOKEN_OVERRIDE_REQUESTED="true"
 fi
@@ -276,7 +278,7 @@ EOF
 printf '==> uploading bundle archive\n'
 run_cmd "${SCP_BASE[@]}" "$BUNDLE" "$SSH_TARGET:$REMOTE_ARCHIVE"
 
-if [[ -n "$CONFIG" ]]; then
+if [[ "$CONFIG_OVERRIDE_REQUESTED" == "true" ]]; then
   printf '==> uploading vehicle configuration override for preflight\n'
   run_cmd "${SCP_BASE[@]}" "$CONFIG" "$SSH_TARGET:$REMOTE_CONFIG_OVERRIDE"
 fi
@@ -379,7 +381,11 @@ test -x "\$staging_release/bin/mine-teleop-run"
 test -s "\$staging_release/lib/vendor/chassis/libmine_teleop_chassis_bridge.so"
 
 candidate_config="\$staging_release/config/vehicle-agent.yaml"
-if [[ "$CONFIG_OVERRIDE_REQUESTED" == "true" && -s "$REMOTE_CONFIG_OVERRIDE" ]]; then
+if [[ "$CONFIG_OVERRIDE_REQUESTED" == "true" ]]; then
+  if [[ ! -f "$REMOTE_CONFIG_OVERRIDE" || ! -r "$REMOTE_CONFIG_OVERRIDE" || ! -s "$REMOTE_CONFIG_OVERRIDE" ]]; then
+    printf 'vehicle config override transfer is missing, unreadable, or empty: %s\n' "$REMOTE_CONFIG_OVERRIDE" >&2
+    exit 2
+  fi
   candidate_config="$REMOTE_CONFIG_OVERRIDE"
 elif [[ -s "\$final_config" ]]; then
   candidate_config="\$final_config"
