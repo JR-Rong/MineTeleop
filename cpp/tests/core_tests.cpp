@@ -4743,19 +4743,24 @@ void test_driver_console_page_keeps_waiting_state_during_background_intent_refre
   request.path = "/";
   const auto response = app.handle(request);
   expect(response.status == 200, "driver console page did not load");
+  mine_teleop::HttpRequest asset_request;
+  asset_request.method = "GET";
+  asset_request.path = "/assets/control_console.js";
+  const auto console_js_response = app.handle(asset_request);
+  expect(console_js_response.status == 200, "driver console script did not load");
   expect(
-      response.body.find("async function send(extra={},announceUnavailable=true)") != std::string::npos,
+      console_js_response.body.find("async function send(extra={},announceUnavailable=true)") != std::string::npos,
       "driver console page cannot distinguish background intent refresh from user control attempts");
   expect(
-      response.body.find("function enqueueIntentRefresh()") != std::string::npos &&
-          response.body.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
+      console_js_response.body.find("function enqueueIntentRefresh()") != std::string::npos &&
+          console_js_response.body.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
               std::string::npos &&
-          response.body.find(
+          console_js_response.body.find(
               "sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
               std::string::npos,
       "background intent refresh still announces a control fault while waiting for media");
   expect(
-      response.body.find("webrtcLabel.textContent='等待车端媒体'") != std::string::npos,
+      console_js_response.body.find("webrtcLabel.textContent='等待车端媒体'") != std::string::npos,
       "driver console page does not expose the pending vehicle-media state");
 }
 

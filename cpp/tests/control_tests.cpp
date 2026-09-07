@@ -1064,7 +1064,7 @@ void test_control_page_contract() {
   expect(
       control_assets.find("selectedGear='N'") != std::string::npos &&
           control_assets.find("controlLogic.deriveGearSelection") != std::string::npos &&
-          control_assets.find("controlLogic.allowsGearChange") != std::string::npos &&
+          control_logic_response.body.find("function allowsGearChange") != std::string::npos &&
           control_assets.find("updateSelectedGearFromHeldDirections") != std::string::npos &&
           control_assets.find("updateSelectedGearFromInput({up:true,down:false})") !=
               std::string::npos &&
