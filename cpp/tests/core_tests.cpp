@@ -1991,7 +1991,16 @@ void test_control_receiver_enforces_token_sequence_and_gap() {
   expect(recovery_receiver.accept(recovery_gap, 500).reason == "command_gap_exceeded", "recovery gap was not detected");
   auto recovery_next = command(3, 550);
   recovery_next.control_token = "token";
-  expect(recovery_receiver.accept(recovery_next, 550).accepted, "receiver did not recover after command gap");
+  recovery_next.throttle = 0.0;
+  recovery_next.steering = 0.0;
+  const auto recovery_sample = mine_teleop::legacy_clock_sample(550);
+  expect(
+      recovery_receiver.validate(recovery_next, recovery_sample, true).accepted,
+      "receiver did not admit an explicit neutral recovery after command gap");
+  recovery_receiver.commit_accepted(recovery_next, recovery_sample);
+  auto post_recovery = command(4, 600);
+  post_recovery.control_token = "token";
+  expect(recovery_receiver.accept(post_recovery, 600).accepted, "receiver did not recover after committed neutral input");
 
   mine_teleop::ControlReceiver synchronized_receiver("vehicle-001", "driver-001", "session-001", 200, 1, true, "token");
   auto stale = command(1, 0);
@@ -2182,6 +2191,110 @@ void test_safety_timeout_profile_and_estop_latch() {
   expect(safety.state() == mine_teleop::SafetyState::Estop, "drive command cleared estop latch");
   expect(!safety.reset_estop(false, "operator", 2500), "estop reset without local confirmation");
   expect(safety.reset_estop(true, "operator", 2500), "confirmed estop reset failed");
+}
+
+void test_control_clock_domains_and_explicit_recovery() {
+  using mine_teleop::ClockSample;
+  using mine_teleop::MonotonicMillis;
+  using mine_teleop::RecoveryCause;
+  using mine_teleop::UtcMillis;
+
+  mine_teleop::ControlReceiver receiver(
+      "vehicle-001", "driver-001", "session-001", 200, 1, true, "token");
+  auto first = command(1, 10'000);
+  first.control_token = "token";
+  expect(
+      receiver.accept(first, ClockSample{UtcMillis{10'000}, MonotonicMillis{100}}).accepted,
+      "first command was rejected under an explicit clock sample");
+
+  auto held = command(2, 70'000);
+  held.control_token = "token";
+  held.throttle = 0.5;
+  expect(
+      receiver.validate(held, ClockSample{UtcMillis{70'000}, MonotonicMillis{350}}, false).reason ==
+          "command_gap_exceeded",
+      "monotonic control gap was hidden by a forward UTC jump");
+  auto neutral = held;
+  neutral.throttle = 0.0;
+  neutral.steering = 0.0;
+  neutral.brake = 0.6;
+  const ClockSample neutral_sample{UtcMillis{70'001}, MonotonicMillis{351}};
+  expect(
+      receiver.validate(neutral, neutral_sample, true).accepted,
+      "fresh neutral recovery was rejected after a monotonic command gap");
+  auto still_held = held;
+  still_held.seq = 3;
+  still_held.sent_at_utc_ms = 10'001;
+  expect(
+      receiver.validate(still_held, ClockSample{UtcMillis{10'001}, MonotonicMillis{352}}, false).reason ==
+          "command_gap_exceeded",
+      "uncommitted recovery attempt advanced the watchdog receiver state");
+  receiver.commit_accepted(neutral, neutral_sample);
+  auto post_recovery = neutral;
+  post_recovery.seq = 3;
+  post_recovery.sent_at_utc_ms = 10'002;
+  expect(
+      receiver.validate(post_recovery, ClockSample{UtcMillis{10'002}, MonotonicMillis{353}}, false).accepted,
+      "committed fresh neutral did not re-arm the monotonic receiver clock");
+
+  mine_teleop::SafetyStateMachine safety(
+      300,
+      800,
+      {{0, 0.3}, {500, 0.6}, {1500, 1.0}});
+  safety.mark_ready(MonotonicMillis{100});
+  safety.on_valid_command(first, MonotonicMillis{100});
+  // A 60-second UTC jump is intentionally absent from this API: only steady
+  // time advances the watchdog.
+  safety.tick(MonotonicMillis{400});
+  expect(safety.state() == mine_teleop::SafetyState::Degraded, "monotonic degraded timeout did not trigger");
+  safety.on_valid_command(neutral, MonotonicMillis{401});
+  expect(
+      safety.state() == mine_teleop::SafetyState::Degraded,
+      "ordinary state-machine command implicitly recovered a degraded watchdog");
+  expect(
+      !safety.can_recover(RecoveryCause::FreshTractionNeutral, held),
+      "non-neutral input was accepted as an explicit degraded recovery");
+  expect(
+      safety.recover(RecoveryCause::FreshTractionNeutral, neutral, MonotonicMillis{403}),
+      "fresh neutral input did not enter the explicit recovery transition");
+  expect(safety.state() == mine_teleop::SafetyState::ControlActive, "explicit neutral recovery did not restore active state");
+  safety.tick(MonotonicMillis{1'300});
+  expect(safety.state() == mine_teleop::SafetyState::TimeoutBrake, "hard watchdog timeout did not use monotonic time");
+  expect(
+      !safety.recover(RecoveryCause::FreshTractionNeutral, neutral, MonotonicMillis{1'301}),
+      "fresh neutral bypassed the authorized-handshake hard-timeout gate");
+  expect(
+      safety.recover(RecoveryCause::AuthorizedHandshake, std::nullopt, MonotonicMillis{1'302}),
+      "authorized handshake transition did not restore standby");
+  expect(safety.state() == mine_teleop::SafetyState::Standby, "authorized handshake did not return to standby");
+
+  auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+  mine_teleop::VehicleControlService service(
+      mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml"),
+      "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(ClockSample{UtcMillis{10'000}, MonotonicMillis{100}});
+  expect(
+      service.receive_session_profile(
+                 session_profile_request(1, 10'000),
+                 ClockSample{UtcMillis{10'000}, MonotonicMillis{100}})
+          .accepted,
+      "clock-domain service profile was rejected");
+  auto service_command = command(1, 10'000);
+  expect(
+      service.receive_command(
+                 service_command,
+                 ClockSample{UtcMillis{10'000}, MonotonicMillis{100}})
+          .accepted,
+      "clock-domain service command was rejected");
+  service.tick(ClockSample{UtcMillis{70'000}, MonotonicMillis{399}});
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::ControlActive,
+      "UTC forward jump advanced the vehicle watchdog");
+  service.tick(ClockSample{UtcMillis{1}, MonotonicMillis{400}});
+  expect(
+      service.safety_state() == mine_teleop::SafetyState::Degraded,
+      "UTC backward jump hid the monotonic vehicle watchdog deadline");
+  service.close();
 }
 
 void test_session_control_profile_ack_sequence_limits_and_clear() {
@@ -2505,16 +2618,49 @@ void test_control_service_commits_only_successfully_applied_commands() {
     adapter_view->rejected_control_gear.reset();
     const auto replay = service.receive_command(rejected_reverse, 110);
     expect(
-        !replay.accepted && replay.reason == "old_seq",
-        "failed adapter application did not consume its command sequence");
+        replay.accepted,
+        "failed adapter application incorrectly consumed its command sequence");
 
+    service.tick(410);
+    expect(
+        service.safety_state() == mine_teleop::SafetyState::Degraded,
+        "successful replay did not establish the new outer safety watchdog");
+    expect(
+        adapter_view->last_safe_output.gear == "R",
+        "only a successfully applied replay may replace the safe-stop gear");
+    service.close();
+  }
+
+  {
+    auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
+    auto* adapter_view = adapter.get();
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 10000);
+    service.start(0);
+    activate_adapter_owned_session_profile(service, *adapter_view);
+    expect(
+        service.receive_command(command(1, 0), 0).accepted,
+        "initial command before rejected recovery was rejected");
     service.tick(300);
     expect(
         service.safety_state() == mine_teleop::SafetyState::Degraded,
-        "failed adapter application refreshed the outer safety watchdog");
+        "recovery rejection test did not enter degraded state");
+    auto neutral = command(2, 350);
+    neutral.throttle = 0.0;
+    neutral.steering = 0.0;
+    neutral.brake = 0.6;
+    adapter_view->structured_rejection_issue_code =
+        "vcu_drive_gear_change_moving_or_stale";
+    const auto rejected = service.receive_command(neutral, 350);
     expect(
-        adapter_view->last_safe_output.gear == "D",
-        "failed reverse application replaced the last successfully applied gear");
+        !rejected.accepted && rejected.reason == "adapter_control_rejected" &&
+            service.safety_state() == mine_teleop::SafetyState::Degraded,
+        "adapter-rejected neutral recovery changed the degraded state");
+    service.tick(800);
+    expect(
+        service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
+            !service.session_control_profile().at("active").get<bool>(),
+        "rejected recovery moved the hard-timeout origin or retained traction authority");
     service.close();
   }
 
@@ -2583,8 +2729,8 @@ void test_control_service_reports_safe_stop_output_after_timeout() {
       "hard-timeout receiver did not re-arm on the first fresh command");
   const auto blocked = service.receive_command(command(3, 1320), 1320);
   expect(
-      !blocked.accepted && blocked.reason == "session_control_profile_required",
-      "hard control timeout recovered without explicit profile re-authorization");
+      !blocked.accepted && blocked.reason == "command_gap_exceeded",
+      "rejected hard-timeout command advanced the watchdog receiver state");
   service.close();
 }
 
@@ -2623,8 +2769,8 @@ void test_control_service_recovers_from_degraded_command_gap_without_profile_rea
       "first fresh command after the gap did not re-arm receiver timing");
   const auto held_input = service.receive_command(command(3, 360), 360);
   expect(
-      !held_input.accepted && held_input.reason == "degraded_neutral_required",
-      "degraded control resumed stale held input before an explicit neutral command");
+      !held_input.accepted && held_input.reason == "command_gap_exceeded",
+      "degraded held input advanced receiver timing before an explicit neutral command");
   auto neutral = command(4, 370);
   neutral.steering = 0.0;
   neutral.throttle = 0.0;
@@ -2670,8 +2816,8 @@ void test_control_service_receive_path_cannot_bypass_hard_timeout() {
 
   const auto blocked = service.receive_command(command(3, 820), 820);
   expect(
-      !blocked.accepted && blocked.reason == "session_control_profile_required",
-      "fresh packets bypassed profile re-authorization after the hard timeout");
+      !blocked.accepted && blocked.reason == "command_gap_exceeded",
+      "rejected hard-timeout packet advanced the receiver watchdog state");
   expect(
       adapter_view->status().applied_command_count == controls_before_timeout,
       "a command reached the adapter after receive-path hard timeout");
@@ -2818,7 +2964,7 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
 
   adapter_view->handshake_succeeds = true;
   expect(
-      service.request_vcu_handshake(),
+      service.request_vcu_handshake(mine_teleop::legacy_clock_sample(1'900)),
       "explicit adapter handshake recovery was rejected");
   expect(
       service.safety_state() == mine_teleop::SafetyState::Standby,
@@ -2834,20 +2980,20 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
       !adapter_view->feedback_ready(),
       "fake adapter incorrectly reported Ready while the handshake was Initial");
   adapter_view->set_safe_stop(false, true, false);
-  const auto gap_rearm = service.receive_command(command(3, 2010), 2010);
+  const auto old_replay = service.receive_command(command(1, 2010), 2010);
   expect(
-      !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
-      "first heartbeat after the intentional handshake gap did not re-arm timing");
+      !old_replay.accepted && old_replay.reason == "old_seq",
+      "successful handshake forgot the pre-handshake sequence boundary");
   expect(
       service.safety_state() == mine_teleop::SafetyState::Standby &&
           adapter_view->control_attempts == 1,
-      "gap re-arm heartbeat replayed control after the handshake");
-  const auto fresh = service.receive_command(command(4, 2020), 2020);
+      "a replayed command restored control after the handshake");
+  const auto fresh = service.receive_command(command(3, 2020), 2020);
   expect(fresh.accepted, "fresh post-handshake control command was rejected");
   expect(
       service.safety_state() == mine_teleop::SafetyState::ControlActive &&
           adapter_view->applied_commands == 2 &&
-          adapter_view->last_control && adapter_view->last_control->seq == 4,
+          adapter_view->last_control && adapter_view->last_control->seq == 3,
       "fresh post-handshake command did not exclusively restore control");
   service.close();
 }
@@ -4449,6 +4595,8 @@ int main() {
       {"native_control_intent_is_latest_only_and_estop_sticky",
        test_native_control_intent_is_latest_only_and_estop_sticky},
       {"safety_timeout_profile_and_estop_latch", test_safety_timeout_profile_and_estop_latch},
+      {"control_clock_domains_and_explicit_recovery",
+       test_control_clock_domains_and_explicit_recovery},
       {"session_control_profile_ack_sequence_limits_and_clear", test_session_control_profile_ack_sequence_limits_and_clear},
       {"session_control_profile_uses_independent_two_second_age_window", test_session_control_profile_uses_independent_two_second_age_window},
       {"real_adapter_profile_changes_require_parking_and_apply_before_ack", test_real_adapter_profile_changes_require_parking_and_apply_before_ack},

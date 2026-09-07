@@ -373,6 +373,7 @@ class MediaSignalingClient {
   [[nodiscard]] TimeSyncStatus time_sync_status() const { return clock_.status(); }
   [[nodiscard]] bool time_sync_refresh_due(int interval_ms) const { return clock_.refresh_due(interval_ms); }
   [[nodiscard]] std::int64_t now_ms() const { return clock_.now_ms(); }
+  [[nodiscard]] ClockSample clock_sample() const { return clock_.sample(); }
   [[nodiscard]] std::int64_t from_local_system_ms(std::int64_t value) const {
     return clock_.from_local_system_ms(value);
   }
@@ -1263,7 +1264,7 @@ struct VehicleMediaRuntime::Impl {
         } else {
           result = control_service->receive_session_profile(
               request,
-              signaling.now_ms());
+              signaling.clock_sample());
           if (result.accepted) invalidate_native_control_trusted_gear_locked();
         }
         send_session_control_profile_status_locked(result);
@@ -1297,7 +1298,7 @@ struct VehicleMediaRuntime::Impl {
         bool accepted = false;
         try {
           if (action == "connect") {
-            accepted = control_service->request_vcu_handshake();
+            accepted = control_service->request_vcu_handshake(signaling.clock_sample());
           } else if (action == "disconnect") {
             accepted = control_service->disconnect_vcu_handshake();
           }
@@ -1363,8 +1364,9 @@ struct VehicleMediaRuntime::Impl {
       enforce_critical_camera_freshness();
       const auto control_mutex_wait_started_monotonic_ms = steady_now_ms();
       std::unique_lock lock(control_mutex);
-      const auto control_mutex_acquired_monotonic_ms = steady_now_ms();
-      const auto control_mutex_acquired_at_utc_ms = signaling.now_ms();
+      const auto control_clock_sample = signaling.clock_sample();
+      const auto control_mutex_acquired_monotonic_ms = control_clock_sample.monotonic.value;
+      const auto control_mutex_acquired_at_utc_ms = control_clock_sample.utc.value;
       const auto active_session_id = signaling.session_id();
       const bool control_log_commands = config.runtime.control_log_commands;
       const auto queue_control_trace = [this,
@@ -1665,14 +1667,16 @@ struct VehicleMediaRuntime::Impl {
             1,
             std::memory_order_relaxed);
       }
-      const auto received_at_ms = control_mutex_acquired_at_utc_ms;
+      const auto received_at_utc_ms = control_mutex_acquired_at_utc_ms;
       const auto receive_apply_started_at_utc_ms = signaling.now_ms();
       const auto receive_apply_started_monotonic_ms = steady_now_ms();
       ReceiveResult result;
       std::int64_t receive_apply_completed_at_utc_ms = 0;
       std::int64_t receive_apply_completed_monotonic_ms = 0;
       try {
-        result = control_service->receive_command(command, received_at_ms);
+        result = control_service->receive_command(
+            command,
+            control_clock_sample);
         receive_apply_completed_at_utc_ms = signaling.now_ms();
         receive_apply_completed_monotonic_ms = steady_now_ms();
       } catch (...) {
@@ -1723,13 +1727,13 @@ struct VehicleMediaRuntime::Impl {
               1,
               std::memory_order_relaxed);
         }
-        last_control_received_at_ms = received_at_ms;
+        last_control_received_at_ms = received_at_utc_ms;
         native_control_last_accepted_monotonic_ms =
             control_mutex_acquired_monotonic_ms;
         if (accepted_count == 1 || accepted_count % 100 == 0) {
           std::cout << Json({
                            {"event", "vehicle_native_control_progress"},
-                           {"event_at_utc_ms", received_at_ms},
+                           {"event_at_utc_ms", received_at_utc_ms},
                            {"vehicle_id", config.vehicle_id},
                            {"driver_id", signaling.driver_id()},
                            {"session_id", signaling.session_id()},
@@ -2626,7 +2630,7 @@ struct VehicleMediaRuntime::Impl {
             signaling.session_id(),
             signaling.control_token(),
             create_vehicle_adapter(config));
-        control_service->start(signaling.now_ms());
+        control_service->start(signaling.clock_sample());
         // A critical camera can fail while a vendor adapter is synchronously
         // opening.  The latch is set before it waits for this mutex, so check
         // again before publishing the adapter as ready or accepting commands.
@@ -2754,9 +2758,9 @@ struct VehicleMediaRuntime::Impl {
   void tick_control_service() {
     std::unique_lock lock(control_mutex);
     if (stop_requested || control_inhibited || !control_service_started || !control_service) return;
-    const auto timestamp_ms = signaling.now_ms();
+    const ClockSample now = signaling.clock_sample();
     try {
-      control_service->tick(timestamp_ms);
+      control_service->tick(now);
     } catch (const std::exception& error) {
       emit_diagnostic(
           "vehicle_vcu_runtime_failed",
@@ -2797,9 +2801,10 @@ struct VehicleMediaRuntime::Impl {
       return;
     }
     if (control_link_open &&
-        (!last_vcu_status_ms || timestamp_ms - *last_vcu_status_ms >= 500)) {
+        (!last_vcu_status_monotonic_ms ||
+         now.monotonic.value - last_vcu_status_monotonic_ms->value >= 500)) {
       send_vcu_handshake_status_locked("status_update");
-      last_vcu_status_ms = timestamp_ms;
+      last_vcu_status_monotonic_ms = now.monotonic;
     }
     if (control_link_open) send_latest_vehicle_telemetry_locked();
   }
@@ -4871,7 +4876,7 @@ struct VehicleMediaRuntime::Impl {
   std::atomic<std::int64_t> native_control_transport_last_error_at_ms{0};
   std::atomic<std::int64_t> native_control_command_freshness_cutoff_at_ms{0};
   std::atomic<std::int64_t> native_control_transport_last_error_log_monotonic_ms{0};
-  std::optional<std::int64_t> last_vcu_status_ms;
+  std::optional<MonotonicMillis> last_vcu_status_monotonic_ms;
   std::uint64_t last_vehicle_telemetry_seq{0};
   std::uint64_t control_status_seq{0};
   std::string last_vcu_handshake_state;

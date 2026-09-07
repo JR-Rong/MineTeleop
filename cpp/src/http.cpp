@@ -244,15 +244,26 @@ TimeSyncStatus SynchronizedClock::synchronize(
   std::vector<Sample> samples;
   samples.reserve(static_cast<std::size_t>(sample_count));
   for (int index = 0; index < sample_count; ++index) {
-    const auto client_send_ms = mine_teleop::now_ms();
+    const auto client_send_ms = mine_teleop::utc_now_ms().value;
+    const auto client_send_monotonic_ms = mine_teleop::process_monotonic_now_ms().value;
     const auto response = http.get_json(
         origin + "/time?client_send_ms=" + std::to_string(client_send_ms));
-    const auto client_receive_ms = mine_teleop::now_ms();
+    const auto client_receive_ms = mine_teleop::utc_now_ms().value;
+    const auto client_receive_monotonic_ms = mine_teleop::process_monotonic_now_ms().value;
     const auto echoed_client_send_ms = response.at("client_send_ms").get<std::int64_t>();
     const auto server_receive_ms = response.at("server_receive_ms").get<std::int64_t>();
     const auto server_send_ms = response.at("server_send_ms").get<std::int64_t>();
     if (echoed_client_send_ms != client_send_ms || server_send_ms < server_receive_ms) {
       throw std::runtime_error("signaling time endpoint returned an invalid four-timestamp sample");
+    }
+    const auto wall_elapsed_ms = client_receive_ms - client_send_ms;
+    const auto monotonic_elapsed_ms =
+        client_receive_monotonic_ms - client_send_monotonic_ms;
+    // A system-clock step while measuring the request would corrupt both RTT
+    // and offset.  Reject that sample rather than treating it as an ordinary
+    // long network request; the caller will retain/retry its prior sync state.
+    if (std::llabs(wall_elapsed_ms - monotonic_elapsed_ms) > 1000) {
+      throw std::runtime_error("local wall clock changed during signaling time synchronization");
     }
     const auto server_processing_ms = server_send_ms - server_receive_ms;
     const auto round_trip_ms = std::max<std::int64_t>(0, client_receive_ms - client_send_ms - server_processing_ms);
@@ -295,6 +306,19 @@ std::int64_t SynchronizedClock::now_ms() const {
   if (!status_.synchronized) return mine_teleop::now_ms();
   return synchronized_anchor_ms_ +
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - steady_anchor_).count();
+}
+
+ClockSample SynchronizedClock::sample() const {
+  const auto monotonic = mine_teleop::process_monotonic_now_ms();
+  std::lock_guard lock(mutex_);
+  if (!status_.synchronized) {
+    return {mine_teleop::utc_now_ms(), monotonic};
+  }
+  return {
+      UtcMillis{synchronized_anchor_ms_ +
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - steady_anchor_).count()},
+      monotonic};
 }
 
 std::int64_t SynchronizedClock::from_local_system_ms(std::int64_t local_time_ms) const {

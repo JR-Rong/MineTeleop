@@ -1489,7 +1489,9 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
       "!native_control_last_accepted_fresh_gear",
       stale_safe_gap_reject);
   const auto receive_command = native_command_path.find(
-      "control_service->receive_command(command, received_at_ms)",
+      "control_service->receive_command(\n"
+      "            command,\n"
+      "            control_clock_sample)",
       stale_safe_gear_gate);
   const auto accepted_result = native_command_path.find(
       "if (result.accepted && result.command)", receive_command);
@@ -1521,6 +1523,9 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
           stale_safe_gap_reject != std::string::npos &&
           stale_safe_gear_gate != std::string::npos &&
           receive_command != std::string::npos &&
+          native_command_path.find(
+              "const auto control_clock_sample = signaling.clock_sample()") <
+              receive_command &&
           accepted_result != std::string::npos &&
           estop_gear_freeze != std::string::npos &&
           fresh_gear_update != std::string::npos &&
@@ -1922,12 +1927,18 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
   const auto callback_timestamp = handler.find("callback_entered_at_utc_ms = signaling.now_ms()");
   const auto command_parse = handler.find("auto command = ControlCommand::from_json(message)");
   const auto lock_wait_started = handler.find("control_mutex_wait_started_monotonic_ms = steady_now_ms()");
-  const auto lock_acquired = handler.find("control_mutex_acquired_monotonic_ms = steady_now_ms()");
+  const auto clock_sample = handler.find("const auto control_clock_sample = signaling.clock_sample()");
+  const auto lock_acquired = handler.find(
+      "control_mutex_acquired_monotonic_ms = control_clock_sample.monotonic.value");
+  const auto lock_acquired_utc = handler.find(
+      "control_mutex_acquired_at_utc_ms = control_clock_sample.utc.value");
   expect(
       callback_timestamp != std::string::npos && command_parse != std::string::npos &&
-          lock_wait_started != std::string::npos && lock_acquired != std::string::npos &&
+          lock_wait_started != std::string::npos && clock_sample != std::string::npos &&
+          lock_acquired != std::string::npos && lock_acquired_utc != std::string::npos &&
           callback_timestamp < command_parse && command_parse < lock_wait_started &&
-          lock_wait_started < lock_acquired,
+          lock_wait_started < clock_sample && clock_sample < lock_acquired &&
+          clock_sample < lock_acquired_utc,
       "vehicle control trace does not separate callback entry, parsing, and mutex wait");
   for (const auto field : {
            "stage",

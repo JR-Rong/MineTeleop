@@ -904,10 +904,20 @@ void validate_chassis_bridge_abi(const std::filesystem::path& library_path) {
   unload_dynamic_library(handle);
 }
 
+UtcMillis utc_now_ms() {
+  return UtcMillis{std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count()};
+}
+
+MonotonicMillis process_monotonic_now_ms() {
+  return MonotonicMillis{std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count()};
+}
+
 std::int64_t now_ms() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::system_clock::now().time_since_epoch())
-      .count();
+  return utc_now_ms().value;
 }
 
 std::string_view to_string(SessionState state) {
@@ -1475,9 +1485,12 @@ ControlReceiver::ControlReceiver(
   }
 }
 
-ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_t receive_time_ms) {
-  if (receive_time_ms < 0) {
-    throw std::invalid_argument("receive_time_ms must be non-negative");
+ReceiveResult ControlReceiver::validate(
+    const ControlCommand& command,
+    ClockSample receive_time,
+    bool allow_gap_recovery) const {
+  if (receive_time.utc.value < 0 || receive_time.monotonic.value < 0) {
+    throw std::invalid_argument("receive clock sample must be non-negative");
   }
   try {
     command.validate();
@@ -1493,29 +1506,42 @@ ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_
     return {false, "control_token_invalid", std::nullopt, {}};
   }
   if (last_seq_ && command.seq <= *last_seq_) return {false, "old_seq", std::nullopt, {}};
-  const auto timestamp_delta_ms = receive_time_ms - command.sent_at_utc_ms;
+  const auto timestamp_delta_ms = receive_time.utc.value - command.sent_at_utc_ms;
   if (!command.estop && timestamp_delta_ms > max_command_gap_ms_) {
     return {false, "command_age_exceeded", std::nullopt, {}};
   }
   if (!command.estop && timestamp_delta_ms < -max_command_gap_ms_) {
     return {false, "command_timestamp_in_future", std::nullopt, {}};
   }
-  if (last_valid_receive_ms_ && receive_time_ms < *last_valid_receive_ms_) {
+  if (last_valid_receive_monotonic_ms_ &&
+      receive_time.monotonic.value < last_valid_receive_monotonic_ms_->value) {
     return {false, "receive_time_reversed", std::nullopt, {}};
   }
-  if (last_valid_receive_ms_ && receive_time_ms - *last_valid_receive_ms_ > max_command_gap_ms_ && !command.estop) {
-    // Drop the first command after a gap, but re-arm timing so the next fresh
-    // heartbeat can recover instead of permanently locking out control.
-    last_valid_receive_ms_ = receive_time_ms;
+  if (last_valid_receive_monotonic_ms_ &&
+      receive_time.monotonic.value - last_valid_receive_monotonic_ms_->value > max_command_gap_ms_ &&
+      !command.estop && !allow_gap_recovery) {
     return {false, "command_gap_exceeded", std::nullopt, {}};
   }
-  last_seq_ = command.seq;
-  last_valid_receive_ms_ = receive_time_ms;
   std::vector<std::string> warnings;
-  if (std::llabs(receive_time_ms - command.sent_at_utc_ms) > timestamp_warning_skew_ms_) {
+  if (std::llabs(receive_time.utc.value - command.sent_at_utc_ms) > timestamp_warning_skew_ms_) {
     warnings.emplace_back("driver_timestamp_skew");
   }
   return {true, "accepted", command, std::move(warnings)};
+}
+
+void ControlReceiver::commit_accepted(const ControlCommand& command, ClockSample receive_time) {
+  last_seq_ = command.seq;
+  last_valid_receive_monotonic_ms_ = receive_time.monotonic;
+}
+
+void ControlReceiver::reset_watchdog_after_authorized_handshake() {
+  last_valid_receive_monotonic_ms_.reset();
+}
+
+ReceiveResult ControlReceiver::accept(const ControlCommand& command, ClockSample receive_time) {
+  auto result = validate(command, receive_time, false);
+  if (result.accepted && result.command) commit_accepted(*result.command, receive_time);
+  return result;
 }
 
 std::string_view to_string(SafetyState state) {
@@ -1551,39 +1577,77 @@ SafetyStateMachine::SafetyStateMachine(
   normalize_and_validate_deceleration_profile(profile_);
 }
 
-void SafetyStateMachine::mark_ready(std::int64_t /*now_ms*/) {
+void SafetyStateMachine::mark_ready(MonotonicMillis /*now*/) {
   if (state_ == SafetyState::Init) state_ = SafetyState::Standby;
 }
 
-void SafetyStateMachine::on_valid_command(const ControlCommand& command, std::int64_t timestamp_ms) {
+void SafetyStateMachine::on_valid_command(const ControlCommand& command, MonotonicMillis now) {
   if (command.estop) {
     last_valid_command_ = command;
-    last_valid_receive_ms_ = timestamp_ms;
+    last_valid_receive_monotonic_ms_ = now;
     state_ = SafetyState::Estop;
     return;
   }
-  if (state_ == SafetyState::Estop || state_ == SafetyState::Fault) return;
+  // Recoverable and hard timeout states have dedicated recovery entrances.
+  // A generic valid command must never erase their timeout origin.
+  if (state_ == SafetyState::Estop || state_ == SafetyState::Fault ||
+      state_ == SafetyState::Degraded || state_ == SafetyState::TimeoutBrake) {
+    return;
+  }
   last_valid_command_ = command;
-  last_valid_receive_ms_ = timestamp_ms;
-  timeout_entered_ms_.reset();
+  last_valid_receive_monotonic_ms_ = now;
+  timeout_entered_monotonic_ms_.reset();
   state_ = SafetyState::ControlActive;
 }
 
-void SafetyStateMachine::tick(std::int64_t timestamp_ms) {
+bool SafetyStateMachine::can_recover(
+    RecoveryCause cause,
+    const std::optional<ControlCommand>& command) const {
+  if (cause == RecoveryCause::FreshTractionNeutral) {
+    return state_ == SafetyState::Degraded && command && !command->estop &&
+        std::abs(command->throttle) <= 1e-9 &&
+        std::abs(command->steering) <= 1e-9;
+  }
+  if (cause == RecoveryCause::AuthorizedHandshake) {
+    return state_ != SafetyState::Estop && state_ != SafetyState::Fault;
+  }
+  return false;
+}
+
+bool SafetyStateMachine::recover(
+    RecoveryCause cause,
+    const std::optional<ControlCommand>& command,
+    MonotonicMillis now) {
+  if (!can_recover(cause, command)) return false;
+  if (cause == RecoveryCause::FreshTractionNeutral) {
+    last_valid_command_ = *command;
+    last_valid_receive_monotonic_ms_ = now;
+    timeout_entered_monotonic_ms_.reset();
+    state_ = SafetyState::ControlActive;
+    return true;
+  }
+  if (cause == RecoveryCause::AuthorizedHandshake) {
+    enter_standby();
+    return true;
+  }
+  return false;
+}
+
+void SafetyStateMachine::tick(MonotonicMillis now) {
   if (state_ == SafetyState::Init || state_ == SafetyState::Standby || state_ == SafetyState::Estop ||
-      state_ == SafetyState::Fault || !last_valid_receive_ms_) {
+      state_ == SafetyState::Fault || !last_valid_receive_monotonic_ms_) {
     return;
   }
-  const auto elapsed = timestamp_ms - *last_valid_receive_ms_;
+  const auto elapsed = now.value - last_valid_receive_monotonic_ms_->value;
   if (elapsed >= control_timeout_ms_) {
-    if (state_ != SafetyState::TimeoutBrake) timeout_entered_ms_ = timestamp_ms;
+    if (state_ != SafetyState::TimeoutBrake) timeout_entered_monotonic_ms_ = now;
     state_ = SafetyState::TimeoutBrake;
   } else if (elapsed >= degraded_timeout_ms_) {
     state_ = SafetyState::Degraded;
   }
 }
 
-ControlOutput SafetyStateMachine::current_output(std::int64_t timestamp_ms) const {
+ControlOutput SafetyStateMachine::current_output(MonotonicMillis now) const {
   const auto gear = last_valid_command_ ? last_valid_command_->gear : "N";
   const auto steering = last_valid_command_ ? last_valid_command_->steering : 0.0;
   switch (state_) {
@@ -1596,7 +1660,7 @@ ControlOutput SafetyStateMachine::current_output(std::int64_t timestamp_ms) cons
       return {gear, steering, 0.0, last_valid_command_ ? last_valid_command_->brake : 0.0, false};
     case SafetyState::TimeoutBrake:
       {
-        const double brake = brake_for_timeout(timestamp_ms);
+        const double brake = brake_for_timeout(now);
         return {gear, 0.0, 0.0, brake, false, brake >= 1.0};
       }
     case SafetyState::Estop:
@@ -1613,30 +1677,24 @@ ControlOutput SafetyStateMachine::current_output(std::int64_t timestamp_ms) cons
 bool SafetyStateMachine::reset_estop(
     bool local_confirmed,
     std::string_view authorized_by,
-    std::int64_t /*now_ms*/) {
+    MonotonicMillis /*now*/) {
   if (state_ != SafetyState::Estop || !local_confirmed || authorized_by.empty()) return false;
-  enter_standby();
-  return true;
-}
-
-bool SafetyStateMachine::reset_to_standby() {
-  if (state_ == SafetyState::Estop || state_ == SafetyState::Fault) return false;
   enter_standby();
   return true;
 }
 
 void SafetyStateMachine::enter_standby() {
   last_valid_command_.reset();
-  last_valid_receive_ms_.reset();
-  timeout_entered_ms_.reset();
+  last_valid_receive_monotonic_ms_.reset();
+  timeout_entered_monotonic_ms_.reset();
   state_ = SafetyState::Standby;
 }
 
 void SafetyStateMachine::mark_fault() { state_ = SafetyState::Fault; }
 
-double SafetyStateMachine::brake_for_timeout(std::int64_t timestamp_ms) const {
-  const auto entered = timeout_entered_ms_.value_or(timestamp_ms);
-  const auto elapsed = timestamp_ms - entered;
+double SafetyStateMachine::brake_for_timeout(MonotonicMillis now) const {
+  const auto entered = timeout_entered_monotonic_ms_.value_or(now);
+  const auto elapsed = now.value - entered.value;
   double chosen = 0.0;
   for (const auto& stage : profile_) {
     if (elapsed >= stage.after_ms) chosen = stage.brake;
@@ -2842,7 +2900,7 @@ VehicleControlService::~VehicleControlService() {
   }
 }
 
-void VehicleControlService::start(std::int64_t timestamp_ms) {
+void VehicleControlService::start(ClockSample now) {
   if (started_) return;
   adapter_->open();
   try {
@@ -2851,13 +2909,13 @@ void VehicleControlService::start(std::int64_t timestamp_ms) {
     adapter_->close();
     throw;
   }
-  safety_.mark_ready(timestamp_ms);
+  safety_.mark_ready(now.monotonic);
   started_ = true;
 }
 
 SessionControlProfileResult VehicleControlService::profile_result(
     const SessionControlProfileRequest& request,
-    std::int64_t timestamp_ms,
+    UtcMillis now,
     bool accepted,
     bool idempotent,
     std::string reason) const {
@@ -2866,7 +2924,7 @@ SessionControlProfileResult VehicleControlService::profile_result(
   result.driver_id = driver_id_;
   result.session_id = session_id_;
   result.seq = request.seq == 0 ? 1 : request.seq;
-  result.sent_at_utc_ms = std::max<std::int64_t>(timestamp_ms, 0);
+  result.sent_at_utc_ms = std::max<std::int64_t>(now.value, 0);
   result.accepted = accepted;
   result.idempotent = idempotent;
   result.applied_revision = accepted ? result.seq : 0;
@@ -2877,10 +2935,10 @@ SessionControlProfileResult VehicleControlService::profile_result(
 
 SessionControlProfileResult VehicleControlService::receive_session_profile(
     const SessionControlProfileRequest& request,
-    std::int64_t timestamp_ms) {
+    ClockSample now) {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
-  if (timestamp_ms < 0) {
-    throw std::invalid_argument("receive_time_ms must be non-negative");
+  if (now.utc.value < 0 || now.monotonic.value < 0) {
+    throw std::invalid_argument("receive clock sample must be non-negative");
   }
   try {
     ProtocolMetadata{
@@ -2897,31 +2955,31 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
   } catch (const std::exception& error) {
     return profile_result(
         request,
-        timestamp_ms,
+        now.utc,
         false,
         false,
         std::string("invalid_profile:") + error.what());
   }
   if (request.vehicle_id != vehicle_id_) {
-    return profile_result(request, timestamp_ms, false, false, "wrong_vehicle");
+    return profile_result(request, now.utc, false, false, "wrong_vehicle");
   }
   if (request.driver_id != driver_id_) {
-    return profile_result(request, timestamp_ms, false, false, "wrong_driver");
+    return profile_result(request, now.utc, false, false, "wrong_driver");
   }
   if (request.session_id != session_id_) {
-    return profile_result(request, timestamp_ms, false, false, "wrong_session");
+    return profile_result(request, now.utc, false, false, "wrong_session");
   }
   if (request.control_token != control_token_) {
     return profile_result(
         request,
-        timestamp_ms,
+        now.utc,
         false,
         false,
         "control_token_invalid");
   }
   if (last_session_profile_request_) {
     if (request.seq < last_session_profile_request_->seq) {
-      return profile_result(request, timestamp_ms, false, false, "old_seq");
+      return profile_result(request, now.utc, false, false, "old_seq");
     }
     if (request.seq == last_session_profile_request_->seq) {
       const auto& previous = *last_session_profile_request_;
@@ -2936,7 +2994,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
       if (!is_identical_request) {
         return profile_result(
             request,
-            timestamp_ms,
+            now.utc,
             false,
             false,
             "profile_seq_conflict");
@@ -2945,13 +3003,13 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
           last_session_profile_result_->accepted) {
         return profile_result(
             request,
-            timestamp_ms,
+            now.utc,
             false,
             true,
             "session_profile_cleared");
       }
       auto replay = *last_session_profile_result_;
-      replay.sent_at_utc_ms = timestamp_ms;
+      replay.sent_at_utc_ms = now.utc.value;
       replay.idempotent = true;
       replay.effective_profile = active_session_profile_;
       last_session_profile_result_ = replay;
@@ -2963,16 +3021,16 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
   } catch (const std::exception& error) {
     return profile_result(
         request,
-        timestamp_ms,
+        now.utc,
         false,
         false,
         std::string("invalid_profile:") + error.what());
   }
-  const auto timestamp_delta_ms = timestamp_ms - request.sent_at_utc_ms;
+  const auto timestamp_delta_ms = now.utc.value - request.sent_at_utc_ms;
   if (timestamp_delta_ms > kSessionControlProfileMaxAgeMs) {
     return profile_result(
         request,
-        timestamp_ms,
+        now.utc,
         false,
         false,
         "profile_age_exceeded");
@@ -2980,7 +3038,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
   if (timestamp_delta_ms < -kSessionControlProfileMaxAgeMs) {
     return profile_result(
         request,
-        timestamp_ms,
+        now.utc,
         false,
         false,
         "profile_timestamp_in_future");
@@ -2995,7 +3053,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
   if (request.profile.target_speed_kph > target_speed_ceiling_kph + 1e-9) {
     return cache_result(profile_result(
         request,
-        timestamp_ms,
+        now.utc,
         false,
         false,
         "target_speed_exceeds_vehicle_limit"));
@@ -3004,7 +3062,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
       full_scale_motor_torque_nm_ + 1e-9) {
     return cache_result(profile_result(
         request,
-        timestamp_ms,
+        now.utc,
         false,
         false,
         "motor_torque_exceeds_vehicle_limit"));
@@ -3013,7 +3071,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
       max_brake_pressure_bar_ + 1e-9) {
     return cache_result(profile_result(
         request,
-        timestamp_ms,
+        now.utc,
         false,
         false,
         "brake_pressure_exceeds_vehicle_limit"));
@@ -3022,7 +3080,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
       max_steering_angle_deg_ + 1e-9) {
     return cache_result(profile_result(
         request,
-        timestamp_ms,
+        now.utc,
         false,
         false,
         "steering_exceeds_vehicle_limit"));
@@ -3091,7 +3149,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
     if (!handshake_status_available || !handshake_status.parking_ready) {
       return cache_result(profile_result(
           request,
-          timestamp_ms,
+          now.utc,
           false,
           false,
           "parking_ready_required_for_profile_increase"));
@@ -3100,7 +3158,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
         handshake_status.state != "disarmed") {
       return cache_result(profile_result(
           request,
-          timestamp_ms,
+          now.utc,
           false,
           false,
           "standby_or_disarmed_required_for_profile_change"));
@@ -3142,7 +3200,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
     clear_session_profile();
     return cache_result(profile_result(
         request,
-        timestamp_ms,
+        now.utc,
         false,
         false,
         "adapter_session_profile_apply_failed"));
@@ -3151,31 +3209,39 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
   active_session_profile_ = request.profile;
   return cache_result(profile_result(
       request,
-      timestamp_ms,
+      now.utc,
       true,
       false,
       "accepted"));
 }
 
-ReceiveResult VehicleControlService::receive_command(const ControlCommand& command, std::int64_t timestamp_ms) {
+bool VehicleControlService::is_traction_neutral(const ControlCommand& command) {
+  return !command.estop && std::abs(command.throttle) <= 1e-9 &&
+      std::abs(command.steering) <= 1e-9;
+}
+
+ReceiveResult VehicleControlService::receive_command(const ControlCommand& command, ClockSample now) {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
   ReceiveResult result;
   if (command.estop) {
-    result = receiver_.accept(command, timestamp_ms);
+    result = receiver_.validate(command, now, true);
     if (result.accepted && result.command) {
       // Latch a valid ESTOP and revoke traction authority before any adapter
       // call. A failed physical stop must never lose the outer safety latch.
-      safety_.on_valid_command(*result.command, timestamp_ms);
+      receiver_.commit_accepted(*result.command, now);
+      safety_.on_valid_command(*result.command, now.monotonic);
       clear_session_profile();
     } else {
-      evaluate_control_watchdog(timestamp_ms);
+      evaluate_control_watchdog(now.monotonic);
     }
   } else {
     // The receive path can keep running even if the periodic loop is delayed.
-    // Advance the same watchdog here so fresh packets cannot bypass a hard
-    // timeout merely because tick() has not been scheduled.
-    evaluate_control_watchdog(timestamp_ms);
-    result = receiver_.accept(command, timestamp_ms);
+    // Advance the same monotonic watchdog here so a fresh UTC packet cannot
+    // bypass a hard timeout merely because tick() has not been scheduled.
+    evaluate_control_watchdog(now.monotonic);
+    const bool recovery_candidate =
+        safety_.state() == SafetyState::Degraded && is_traction_neutral(command);
+    result = receiver_.validate(command, now, recovery_candidate);
   }
   if (!result.accepted || !result.command) return result;
   auto& effective = *result.command;
@@ -3189,10 +3255,9 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     return {false, "session_control_profile_required", std::nullopt, {}};
   }
   if (!effective.estop && safety_.state() == SafetyState::Degraded &&
-      (effective.throttle > 1e-9 || std::abs(effective.steering) > 1e-9)) {
-    // Recovery is intentionally explicit: a command gap withdraws traction,
-    // and a fresh neutral command must be applied before any prior held input
-    // can produce torque again. Brake remains allowed during this re-arm.
+      !is_traction_neutral(effective)) {
+    // A held throttle/steering input cannot advance receiver timing or reset
+    // the brake profile.  Brake may remain held during the neutral re-arm.
     result.accepted = false;
     result.reason = "degraded_neutral_required";
     result.command.reset();
@@ -3248,7 +3313,7 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     if (!adapter_safety_observed) {
       safety_.mark_fault();
       adapter_->apply_safe_stop(
-          safety_.current_output(timestamp_ms),
+          safety_.current_output(now.monotonic),
           {VehicleStopSource::SoftwareFault,
            VehicleStopReason::AdapterSafetyStatusUnavailable});
       clear_session_profile();
@@ -3257,7 +3322,7 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     if (feedback_poll_failed && require_feedback_before_control_) {
       safety_.mark_fault();
       adapter_->apply_safe_stop(
-          safety_.current_output(timestamp_ms),
+          safety_.current_output(now.monotonic),
           {VehicleStopSource::SoftwareFault,
            VehicleStopReason::CanFeedbackMissing});
       clear_session_profile();
@@ -3282,6 +3347,15 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
   if (!safety_command.estop &&
       safety_.state() != SafetyState::Estop &&
       safety_.state() != SafetyState::Fault) {
+    const bool recovering_degraded = safety_.state() == SafetyState::Degraded;
+    if (recovering_degraded && !safety_.can_recover(
+            RecoveryCause::FreshTractionNeutral,
+            safety_command)) {
+      result.accepted = false;
+      result.reason = "degraded_recovery_not_admitted";
+      result.command.reset();
+      return result;
+    }
     try {
       adapter_->apply_control(*result.command);
     } catch (const VehicleAdapterControlRejected& error) {
@@ -3291,7 +3365,20 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
       result.issue_code = error.issue_code();
       return result;
     }
-    safety_.on_valid_command(safety_command, timestamp_ms);
+    if (recovering_degraded) {
+      if (!safety_.recover(
+              RecoveryCause::FreshTractionNeutral,
+              safety_command,
+              now.monotonic)) {
+        result.accepted = false;
+        result.reason = "degraded_recovery_not_admitted";
+        result.command.reset();
+        return result;
+      }
+    } else {
+      safety_.on_valid_command(safety_command, now.monotonic);
+    }
+    receiver_.commit_accepted(*result.command, now);
     last_effective_command_ = *result.command;
     return result;
   }
@@ -3299,7 +3386,10 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
   // ESTOP is a safety latch, not an ordinary actuator transaction: preserve
   // it even when the adapter cannot apply the physical stop. Ordinary commands
   // received while ESTOP/Fault is already latched must not reach apply_control.
-  safety_.on_valid_command(safety_command, timestamp_ms);
+  if (!safety_command.estop) {
+    safety_.on_valid_command(safety_command, now.monotonic);
+    receiver_.commit_accepted(*result.command, now);
+  }
   if (!adapter_safe_stop_active_ ||
       safety_.state() == SafetyState::Estop ||
       safety_.state() == SafetyState::Fault) {
@@ -3315,13 +3405,13 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
               VehicleStopSource::SoftwareFault,
               VehicleStopReason::VcuStateFault};
     adapter_->apply_safe_stop(
-        safety_.current_output(timestamp_ms),
+        safety_.current_output(now.monotonic),
         stop_context);
   }
   return result;
 }
 
-bool VehicleControlService::request_vcu_handshake() {
+bool VehicleControlService::request_vcu_handshake(ClockSample now) {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
   if (!active_session_profile_) return false;
   if (safety_.state() == SafetyState::Estop ||
@@ -3329,7 +3419,13 @@ bool VehicleControlService::request_vcu_handshake() {
     return false;
   }
   if (!adapter_->request_vcu_handshake()) return false;
-  if (!safety_.reset_to_standby()) return false;
+  if (!safety_.recover(
+          RecoveryCause::AuthorizedHandshake,
+          std::nullopt,
+          now.monotonic)) {
+    return false;
+  }
+  receiver_.reset_watchdog_after_authorized_handshake();
   adapter_safe_stop_active_ = false;
   return true;
 }
@@ -3344,7 +3440,7 @@ bool VehicleControlService::disconnect_vcu_handshake() {
   return disconnected;
 }
 
-void VehicleControlService::tick(std::int64_t timestamp_ms) {
+void VehicleControlService::tick(ClockSample now) {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
   bool feedback_poll_failed = false;
   try {
@@ -3360,12 +3456,13 @@ void VehicleControlService::tick(std::int64_t timestamp_ms) {
       safety_.state() != SafetyState::Fault) {
     safety_.mark_fault();
   }
-  evaluate_control_watchdog(timestamp_ms);
-  if (!last_telemetry_ms_ || timestamp_ms - *last_telemetry_ms_ >= telemetry_interval_ms_) {
+  evaluate_control_watchdog(now.monotonic);
+  if (!last_telemetry_monotonic_ms_ ||
+      now.monotonic.value - last_telemetry_monotonic_ms_->value >= telemetry_interval_ms_) {
     try {
       if (telemetry_history_.size() == kMaxVehicleTelemetryHistory) telemetry_history_.pop_front();
-      telemetry_history_.push_back(build_telemetry(timestamp_ms));
-      last_telemetry_ms_ = timestamp_ms;
+      telemetry_history_.push_back(build_telemetry(now));
+      last_telemetry_monotonic_ms_ = now.monotonic;
     } catch (...) {
       // Control safety was already evaluated above from the same adapter. A
       // failed observability snapshot must not tear down an adapter-owned stop
@@ -3374,8 +3471,8 @@ void VehicleControlService::tick(std::int64_t timestamp_ms) {
   }
 }
 
-void VehicleControlService::evaluate_control_watchdog(std::int64_t timestamp_ms) {
-  safety_.tick(timestamp_ms);
+void VehicleControlService::evaluate_control_watchdog(MonotonicMillis now) {
+  safety_.tick(now);
   if (safety_.state() == SafetyState::Degraded || safety_.state() == SafetyState::TimeoutBrake ||
       safety_.state() == SafetyState::Estop || safety_.state() == SafetyState::Fault) {
     // Revoke software traction authority before touching the adapter. This
@@ -3402,7 +3499,7 @@ void VehicleControlService::evaluate_control_watchdog(std::int64_t timestamp_ms)
             VehicleStopReason::OperatorEstop};
       }
       adapter_->apply_safe_stop(
-          safety_.current_output(timestamp_ms),
+          safety_.current_output(now),
           stop_context);
     }
     // DEGRADED is the recoverable 300 ms control-gap state: traction has
@@ -3417,7 +3514,7 @@ void VehicleControlService::evaluate_control_watchdog(std::int64_t timestamp_ms)
 bool VehicleControlService::reset_estop(
     bool local_confirmed,
     std::string_view authorized_by,
-    std::int64_t timestamp_ms) {
+    ClockSample now) {
   if (safety_.state() != SafetyState::Estop || !local_confirmed || authorized_by.empty()) {
     return false;
   }
@@ -3446,7 +3543,7 @@ bool VehicleControlService::reset_estop(
     return false;
   }
 
-  const bool reset = safety_.reset_estop(local_confirmed, authorized_by, timestamp_ms);
+  const bool reset = safety_.reset_estop(local_confirmed, authorized_by, now.monotonic);
   if (!reset) return false;
   adapter_safe_stop_active_ = false;
   static_cast<void>(refresh_adapter_safe_stop_state());
@@ -3463,7 +3560,7 @@ void VehicleControlService::close(VehicleStopContext context) {
   started_ = false;
 }
 
-Json VehicleControlService::build_telemetry(std::int64_t timestamp_ms) {
+Json VehicleControlService::build_telemetry(ClockSample now) {
   const auto telemetry = adapter_->read_telemetry();
   return {
       {"event", "vehicle_telemetry"},
@@ -3472,7 +3569,7 @@ Json VehicleControlService::build_telemetry(std::int64_t timestamp_ms) {
       {"driver_id", driver_id_},
       {"session_id", session_id_},
       {"seq", ++telemetry_sequence_},
-      {"sent_at_utc_ms", timestamp_ms},
+      {"sent_at_utc_ms", now.utc.value},
       {"safety_state", to_string(safety_.state())},
       {"speed_mps", telemetry.speed_mps},
       {"gear", telemetry.gear},

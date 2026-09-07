@@ -345,8 +345,11 @@ int run_loop(const VehicleConfig& config, const Arguments& arguments) {
       std::string(control_token),
       mine_teleop::create_vehicle_adapter(config),
       100);
-  service.start(0);
+  service.start({mine_teleop::UtcMillis{0}, mine_teleop::MonotonicMillis{0}});
   for (int timestamp_ms = 0; timestamp_ms <= duration_ms; timestamp_ms += 50) {
+    const auto sample = mine_teleop::ClockSample{
+        mine_teleop::UtcMillis{timestamp_ms},
+        mine_teleop::MonotonicMillis{timestamp_ms}};
     if (timestamp_ms < disconnect_at_ms) {
       ControlCommand command;
       command.vehicle_id = config.vehicle_id;
@@ -357,9 +360,9 @@ int run_loop(const VehicleConfig& config, const Arguments& arguments) {
       command.control_token = control_token;
       command.gear = "D";
       command.throttle = 0.25;
-      service.receive_command(command, timestamp_ms);
+      service.receive_command(command, sample);
     }
-    service.tick(timestamp_ms);
+    service.tick(sample);
   }
   std::cout << service.summary().dump() << '\n';
   service.close();

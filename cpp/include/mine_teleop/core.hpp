@@ -16,6 +16,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "mine_teleop/time.hpp"
+
 namespace mine_teleop {
 
 using Json = nlohmann::json;
@@ -34,6 +36,8 @@ inline constexpr int kSessionControlProfileVersion = 3;
 static_assert(kMaxFullScaleMotorTorqueNm <= 800.0 * 0.8);
 static_assert(kMaxFullScaleMotorTorqueNm <= 838.3 * 0.8);
 
+// Compatibility UTC wall-clock accessor for external protocol/audit callers.
+// Safety/watchdog code must use ClockSample::monotonic instead.
 std::int64_t now_ms();
 
 enum class SessionState {
@@ -262,7 +266,20 @@ class ControlReceiver {
       std::string control_token,
       int timestamp_warning_skew_ms = 5000);
 
-  ReceiveResult accept(const ControlCommand& command, std::int64_t receive_time_ms);
+  ReceiveResult accept(const ControlCommand& command, ClockSample receive_time);
+  // Validation deliberately does not mutate receiver timing/sequence state.
+  // VehicleControlService calls commit_accepted only after an ordinary command
+  // reaches the adapter, so rejected recovery/apply attempts cannot postpone a
+  // watchdog deadline.
+  [[nodiscard]] ReceiveResult validate(
+      const ControlCommand& command,
+      ClockSample receive_time,
+      bool allow_gap_recovery) const;
+  void commit_accepted(const ControlCommand& command, ClockSample receive_time);
+  void reset_watchdog_after_authorized_handshake();
+  ReceiveResult accept(const ControlCommand& command, std::int64_t legacy_receive_time_ms) {
+    return accept(command, legacy_clock_sample(legacy_receive_time_ms));
+  }
 
  private:
   std::string vehicle_id_;
@@ -274,7 +291,7 @@ class ControlReceiver {
   std::string control_token_;
   int timestamp_warning_skew_ms_;
   std::optional<std::uint64_t> last_seq_;
-  std::optional<std::int64_t> last_valid_receive_ms_;
+  std::optional<MonotonicMillis> last_valid_receive_monotonic_ms_;
 };
 
 enum class SafetyState {
@@ -288,6 +305,13 @@ enum class SafetyState {
 };
 
 std::string_view to_string(SafetyState state);
+
+// The service decides when the external prerequisites for one of these causes
+// hold.  The state machine only verifies the state/input transition itself.
+enum class RecoveryCause {
+  FreshTractionNeutral,
+  AuthorizedHandshake,
+};
 
 struct DecelerationStage {
   int after_ms{0};
@@ -351,28 +375,53 @@ class SafetyStateMachine {
  public:
   SafetyStateMachine(int degraded_timeout_ms, int control_timeout_ms, std::vector<DecelerationStage> profile);
 
-  void mark_ready(std::int64_t now_ms);
-  void on_valid_command(const ControlCommand& command, std::int64_t now_ms);
-  void tick(std::int64_t now_ms);
-  [[nodiscard]] ControlOutput current_output(std::int64_t now_ms) const;
-  bool reset_estop(bool local_confirmed, std::string_view authorized_by, std::int64_t now_ms);
-  bool reset_to_standby();
+  void mark_ready(MonotonicMillis now);
+  void on_valid_command(const ControlCommand& command, MonotonicMillis now);
+  [[nodiscard]] bool can_recover(
+      RecoveryCause cause,
+      const std::optional<ControlCommand>& command) const;
+  [[nodiscard]] bool recover(
+      RecoveryCause cause,
+      const std::optional<ControlCommand>& command,
+      MonotonicMillis now);
+  void tick(MonotonicMillis now);
+  [[nodiscard]] ControlOutput current_output(MonotonicMillis now) const;
+  bool reset_estop(bool local_confirmed, std::string_view authorized_by, MonotonicMillis now);
+  void mark_ready(std::int64_t legacy_now_ms) { mark_ready(MonotonicMillis{legacy_now_ms}); }
+  void on_valid_command(const ControlCommand& command, std::int64_t legacy_now_ms) {
+    on_valid_command(command, MonotonicMillis{legacy_now_ms});
+  }
+  [[nodiscard]] bool recover(
+      RecoveryCause cause,
+      const std::optional<ControlCommand>& command,
+      std::int64_t legacy_now_ms) {
+    return recover(cause, command, MonotonicMillis{legacy_now_ms});
+  }
+  void tick(std::int64_t legacy_now_ms) { tick(MonotonicMillis{legacy_now_ms}); }
+  [[nodiscard]] ControlOutput current_output(std::int64_t legacy_now_ms) const {
+    return current_output(MonotonicMillis{legacy_now_ms});
+  }
+  bool reset_estop(bool local_confirmed, std::string_view authorized_by, std::int64_t legacy_now_ms) {
+    return reset_estop(local_confirmed, authorized_by, MonotonicMillis{legacy_now_ms});
+  }
   void mark_fault();
 
   [[nodiscard]] SafetyState state() const { return state_; }
-  [[nodiscard]] std::optional<std::int64_t> last_valid_receive_ms() const { return last_valid_receive_ms_; }
+  [[nodiscard]] std::optional<MonotonicMillis> last_valid_receive_monotonic_ms() const {
+    return last_valid_receive_monotonic_ms_;
+  }
 
  private:
   void enter_standby();
-  [[nodiscard]] double brake_for_timeout(std::int64_t now_ms) const;
+  [[nodiscard]] double brake_for_timeout(MonotonicMillis now) const;
 
   int degraded_timeout_ms_;
   int control_timeout_ms_;
   std::vector<DecelerationStage> profile_;
   SafetyState state_{SafetyState::Init};
   std::optional<ControlCommand> last_valid_command_;
-  std::optional<std::int64_t> last_valid_receive_ms_;
-  std::optional<std::int64_t> timeout_entered_ms_;
+  std::optional<MonotonicMillis> last_valid_receive_monotonic_ms_;
+  std::optional<MonotonicMillis> timeout_entered_monotonic_ms_;
 };
 
 struct ControlConfig {
@@ -781,15 +830,34 @@ class VehicleControlService {
       int telemetry_interval_ms = 100);
   ~VehicleControlService();
 
-  void start(std::int64_t now_ms);
-  ReceiveResult receive_command(const ControlCommand& command, std::int64_t now_ms);
+  void start(ClockSample now);
+  ReceiveResult receive_command(const ControlCommand& command, ClockSample now);
   SessionControlProfileResult receive_session_profile(
       const SessionControlProfileRequest& request,
-      std::int64_t now_ms);
-  void tick(std::int64_t now_ms);
-  bool request_vcu_handshake();
+      ClockSample now);
+  void tick(ClockSample now);
+  bool request_vcu_handshake(ClockSample now);
+  bool request_vcu_handshake() {
+    return request_vcu_handshake({utc_now_ms(), process_monotonic_now_ms()});
+  }
   bool disconnect_vcu_handshake();
-  bool reset_estop(bool local_confirmed, std::string_view authorized_by, std::int64_t now_ms);
+  bool reset_estop(bool local_confirmed, std::string_view authorized_by, ClockSample now);
+  void start(std::int64_t legacy_now_ms) { start(legacy_clock_sample(legacy_now_ms)); }
+  ReceiveResult receive_command(const ControlCommand& command, std::int64_t legacy_now_ms) {
+    return receive_command(command, legacy_clock_sample(legacy_now_ms));
+  }
+  SessionControlProfileResult receive_session_profile(
+      const SessionControlProfileRequest& request,
+      std::int64_t legacy_now_ms) {
+    return receive_session_profile(request, legacy_clock_sample(legacy_now_ms));
+  }
+  void tick(std::int64_t legacy_now_ms) { tick(legacy_clock_sample(legacy_now_ms)); }
+  bool reset_estop(
+      bool local_confirmed,
+      std::string_view authorized_by,
+      std::int64_t legacy_now_ms) {
+    return reset_estop(local_confirmed, authorized_by, legacy_clock_sample(legacy_now_ms));
+  }
   void close(VehicleStopContext context = {
       VehicleStopSource::Session,
       VehicleStopReason::SessionLost});
@@ -806,15 +874,16 @@ class VehicleControlService {
 
  private:
   [[nodiscard]] bool refresh_adapter_safe_stop_state() noexcept;
-  void evaluate_control_watchdog(std::int64_t now_ms);
+  void evaluate_control_watchdog(MonotonicMillis now);
   void clear_session_profile() noexcept;
   [[nodiscard]] SessionControlProfileResult profile_result(
       const SessionControlProfileRequest& request,
-      std::int64_t now_ms,
+      UtcMillis now,
       bool accepted,
       bool idempotent,
       std::string reason) const;
-  [[nodiscard]] Json build_telemetry(std::int64_t now_ms);
+  [[nodiscard]] Json build_telemetry(ClockSample now);
+  [[nodiscard]] static bool is_traction_neutral(const ControlCommand& command);
 
   std::string vehicle_id_;
   std::string driver_id_;
@@ -841,7 +910,7 @@ class VehicleControlService {
   double hard_overspeed_margin_kph_{3.6};
   Json read_only_control_safety_;
   int telemetry_interval_ms_;
-  std::optional<std::int64_t> last_telemetry_ms_;
+  std::optional<MonotonicMillis> last_telemetry_monotonic_ms_;
   std::uint64_t telemetry_sequence_{0};
   std::deque<Json> telemetry_history_;
   std::optional<SessionControlProfile> active_session_profile_;

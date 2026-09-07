@@ -92,6 +92,7 @@ class SynchronizedClock {
  public:
   TimeSyncStatus synchronize(const HttpClient& http, std::string_view signaling_origin, int sample_count = 7);
   [[nodiscard]] std::int64_t now_ms() const;
+  [[nodiscard]] ClockSample sample() const;
   [[nodiscard]] std::int64_t from_local_system_ms(std::int64_t local_time_ms) const;
   [[nodiscard]] TimeSyncStatus status() const;
   [[nodiscard]] bool refresh_due(int interval_ms) const;
