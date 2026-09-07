@@ -82,6 +82,47 @@ mine-teleop-signaling-server \
 多身份配置不能与旧的 `--driver-id`、`--driver-password`、`--vehicle-id`、
 `--device-token` 或对应的单身份 secret 环境变量混用；混用会启动失败。
 
+### 信令连接预算与 HTTP 阶段时限
+
+身份 YAML 可携带顶层 `connection_limits` 映射，用于设置监听器的连接预算与 HTTP
+阶段时限。每个已配置数值均为单位显式、必须为正；零、负值或超限组合都会在启动监听与
+激活服务之前失败，错误会点名具体字段。省略整个映射或其中任意字段时，均保留运行时
+`SimpleHttpServer::ConnectionLimits` 默认值：
+
+```yaml
+connection_limits:
+  max_active_connections: 64        # 总并发 socket 预算
+  max_pending_http_connections: 16  # 升级前 HTTP 请求槽位
+  max_websocket_connections: 48     # 升级后 WSS 通道
+  max_connections_per_source: 48    # 每来源 IP 预算
+  listen_backlog: 64                # TCP accept backlog
+  header_read_timeout_ms: 5000      # HTTP 头阶段时限
+  body_read_timeout_ms: 10000       # HTTP body 阶段时限
+  response_write_timeout_ms: 5000   # 正常响应写时限
+  overload_write_timeout_ms: 100    # 过载拒绝写时限
+```
+
+校验规则：所有数值为正；`max_pending_http_connections` 与 `max_websocket_connections`
+不得大于 `max_active_connections`；由于信令服务始终安装 WSS handler，必须为升级后的
+WSS 通道保留容量（`max_websocket_connections > 0` 且 `max_pending_http_connections <
+max_active_connections`）；各类时限拒绝零、负值与人可写的溢出值。映射允许**部分覆盖**：
+任何未显式给出的字段都继承运行时默认值，因此 `connection_limits` 可以只列出需要定制的
+字段。
+
+CLI 也提供单位显式等价参数（`--max-active-connections`、`--max-pending-http-connections`、
+`--max-websocket-connections`、`--max-connections-per-source`、`--listen-backlog`、
+`--header-read-timeout-ms`、`--body-read-timeout-ms`、`--response-write-timeout-ms`、
+`--overload-write-timeout-ms`），并有对应的 `MINE_TELEOP_*` 环境变量；显式 CLI 参数优先。
+
+> **来源聚合容量**：`max_connections_per_source` 是每个 TCP 对端 IP 的预算。当可信反向
+> 代理（例如 Caddy）落在回环信令后端之前时，所有上游浏览器与车辆 WSS 通道都来自同一个
+> 代理 IP，因此必须按整个部署的聚合容量（而非单个控制会话）调整
+> `max_connections_per_source` 与 `max_active_connections`。
+>
+> **fixture 非验收**：仓库内 `configs/signaling-server.*.dev.yaml` 只是开发冒烟 fixture，
+> 不是 Caddy（TLS 反向代理）或真实车辆现场验收配置。现场部署必须自行提供反向代理、
+> TLS 与认证身份 YAML。
+
 ## 车端配置示例
 
 当前安装包携带 `config/vehicle-agent.yaml`。其中 `runtime` 决定统一前台入口启动哪些服务，

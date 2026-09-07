@@ -166,6 +166,9 @@ struct SignalingServerConfig {
   std::int64_t websocket_rate_limit_messages{600};
   std::size_t websocket_rate_limit_bytes{16 * 1024 * 1024};
   std::int64_t websocket_rate_limit_window_ms{60 * 1000};
+  // Connection-budget and HTTP phase deadlines applied to the standalone
+  // signaling listener. Defaults mirror SimpleHttpServer::ConnectionLimits.
+  SimpleHttpServer::ConnectionLimits connection_limits;
   std::string audit_log_path;
   std::int64_t audit_log_max_bytes{64 * 1024 * 1024};
   std::int64_t audit_log_files{5};
@@ -174,6 +177,15 @@ struct SignalingServerConfig {
 };
 
 SignalingServerConfig load_signaling_identity_config(const std::filesystem::path& path);
+
+// Validates a connection budget before a listener is activated. Mirrors the
+// SimpleHttpServer constructor invariants but names the exact offending field
+// so configuration failures are actionable. Enforces the WebSocket-capacity
+// reservation whenever a WSS handler will be installed (always true for the
+// standalone signaling server). Throws std::invalid_argument on the first
+// invalid field; call sites must invoke this before listening or service
+// activation.
+void validate_connection_limits(const SimpleHttpServer::ConnectionLimits& limits);
 
 class SignalingService {
  public:

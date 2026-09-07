@@ -77,6 +77,7 @@ class Arguments {
         "--audit-log-files",
         "--audit-log-max-bytes",
         "--audit-log-retention-days",
+        "--body-read-timeout-ms",
         "--config",
         "--control-token-ttl-ms",
         "--device-token",
@@ -84,15 +85,23 @@ class Arguments {
         "--driver-id",
         "--driver-password",
         "--driver-token-ttl-ms",
+        "--header-read-timeout-ms",
         "--help",
         "--host",
+        "--listen-backlog",
         "--login-failure-window-ms",
         "--login-lockout-ms",
         "--login-max-failures",
+        "--max-active-connections",
+        "--max-connections-per-source",
+        "--max-pending-http-connections",
+        "--max-websocket-connections",
         "--native-control-trace",
+        "--overload-write-timeout-ms",
+        "--port",
+        "--response-write-timeout-ms",
         "--signaling-queue-max-bytes",
         "--signaling-queue-max-messages",
-        "--port",
         "--stun-urls",
         "--trusted-proxy-addresses",
         "--turn-credential-ttl-seconds",
@@ -153,6 +162,16 @@ std::size_t configured_size(
       static_cast<std::int64_t>(fallback));
   if (value <= 0) throw std::invalid_argument(std::string(argument_name) + " must be positive");
   return static_cast<std::size_t>(value);
+}
+
+std::int64_t configured_duration_ms(
+    const Arguments& arguments,
+    std::string_view argument_name,
+    std::string_view environment_name,
+    std::int64_t fallback) {
+  const auto value = configured_integer(arguments, argument_name, environment_name, fallback);
+  if (value <= 0) throw std::invalid_argument(std::string(argument_name) + " must be positive");
+  return value;
 }
 
 std::string read_secret(std::string_view path, std::string_view label) {
@@ -224,6 +243,17 @@ Abuse controls and proxy trust:
   --websocket-byte-rate-limit N           bytes per participant/window (default 16777216)
   --websocket-rate-limit-window-ms N      participant rate window (default 60000)
   --trusted-proxy-addresses CSV
+
+Connection budget and HTTP deadlines (override the connection_limits mapping):
+  --max-active-connections N              total concurrent socket budget (default 64)
+  --max-pending-http-connections N        pre-upgrade HTTP request slots (default 16)
+  --max-websocket-connections N           post-upgrade WSS channels (default 48)
+  --max-connections-per-source N          budget per peer source IP (default 48)
+  --listen-backlog N                      TCP accept backlog (default 64)
+  --header-read-timeout-ms N              HTTP header phase deadline (default 5000)
+  --body-read-timeout-ms N                HTTP body phase deadline (default 10000)
+  --response-write-timeout-ms N           normal response write deadline (default 5000)
+  --overload-write-timeout-ms N           overload reject write deadline (default 100)
 
 ICE and audit:
   --stun-urls CSV
@@ -364,6 +394,61 @@ int main(int argc, char** argv) {
         "--websocket-rate-limit-window-ms",
         "MINE_TELEOP_WEBSOCKET_RATE_LIMIT_WINDOW_MS",
         config.websocket_rate_limit_window_ms);
+    config.connection_limits.max_active_connections = configured_size(
+        arguments,
+        "--max-active-connections",
+        "MINE_TELEOP_MAX_ACTIVE_CONNECTIONS",
+        config.connection_limits.max_active_connections);
+    config.connection_limits.max_pending_http_connections = configured_size(
+        arguments,
+        "--max-pending-http-connections",
+        "MINE_TELEOP_MAX_PENDING_HTTP_CONNECTIONS",
+        config.connection_limits.max_pending_http_connections);
+    config.connection_limits.max_websocket_connections = configured_size(
+        arguments,
+        "--max-websocket-connections",
+        "MINE_TELEOP_MAX_WEBSOCKET_CONNECTIONS",
+        config.connection_limits.max_websocket_connections);
+    config.connection_limits.max_connections_per_source = configured_size(
+        arguments,
+        "--max-connections-per-source",
+        "MINE_TELEOP_MAX_CONNECTIONS_PER_SOURCE",
+        config.connection_limits.max_connections_per_source);
+    const auto listen_backlog_value = configured_integer(
+        arguments,
+        "--listen-backlog",
+        "MINE_TELEOP_LISTEN_BACKLOG",
+        config.connection_limits.listen_backlog);
+    if (listen_backlog_value > std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("--listen-backlog is too large");
+    }
+    if (listen_backlog_value <= 0) {
+      throw std::invalid_argument("--listen-backlog must be positive");
+    }
+    config.connection_limits.listen_backlog = static_cast<int>(listen_backlog_value);
+    config.connection_limits.header_read_timeout = std::chrono::milliseconds(configured_duration_ms(
+        arguments,
+        "--header-read-timeout-ms",
+        "MINE_TELEOP_HEADER_READ_TIMEOUT_MS",
+        config.connection_limits.header_read_timeout.count()));
+    config.connection_limits.body_read_timeout = std::chrono::milliseconds(configured_duration_ms(
+        arguments,
+        "--body-read-timeout-ms",
+        "MINE_TELEOP_BODY_READ_TIMEOUT_MS",
+        config.connection_limits.body_read_timeout.count()));
+    config.connection_limits.response_write_timeout = std::chrono::milliseconds(configured_duration_ms(
+        arguments,
+        "--response-write-timeout-ms",
+        "MINE_TELEOP_RESPONSE_WRITE_TIMEOUT_MS",
+        config.connection_limits.response_write_timeout.count()));
+    config.connection_limits.overload_write_timeout = std::chrono::milliseconds(configured_duration_ms(
+        arguments,
+        "--overload-write-timeout-ms",
+        "MINE_TELEOP_OVERLOAD_WRITE_TIMEOUT_MS",
+        config.connection_limits.overload_write_timeout.count()));
+    // Reject an invalid connection budget before service construction or
+    // listener activation so misconfiguration names the offending field.
+    mine_teleop::validate_connection_limits(config.connection_limits);
     config.trusted_proxy_addresses = comma_separated(arguments.value(
         "--trusted-proxy-addresses",
         environment("MINE_TELEOP_TRUSTED_PROXY_ADDRESSES").empty()
@@ -423,6 +508,16 @@ int main(int argc, char** argv) {
     const auto vehicle_count = config.device_tokens.size();
     std::size_t permission_count = 0;
     for (const auto& entry : config.driver_vehicle_permissions) permission_count += entry.second.size();
+    const auto max_active_connections = config.connection_limits.max_active_connections;
+    const auto max_pending_http_connections = config.connection_limits.max_pending_http_connections;
+    const auto max_websocket_connections = config.connection_limits.max_websocket_connections;
+    const auto max_connections_per_source = config.connection_limits.max_connections_per_source;
+    const auto listen_backlog = config.connection_limits.listen_backlog;
+    const auto header_read_timeout_ms = config.connection_limits.header_read_timeout.count();
+    const auto body_read_timeout_ms = config.connection_limits.body_read_timeout.count();
+    const auto response_write_timeout_ms = config.connection_limits.response_write_timeout.count();
+    const auto overload_write_timeout_ms = config.connection_limits.overload_write_timeout.count();
+    const auto connection_limits = config.connection_limits;
 
     if (arguments.has("--validate-config")) {
       config.audit_log_path.clear();
@@ -443,7 +538,8 @@ int main(int argc, char** argv) {
         port(arguments),
         [service](const auto& request) { return service->handle(request); },
         8 * 1024 * 1024,
-        [service](int socket, const auto& request) { return service->handle_websocket(socket, request); });
+        [service](int socket, const auto& request) { return service->handle_websocket(socket, request); },
+        connection_limits);
     server.start();
     std::signal(SIGINT, stop_handler);
     std::signal(SIGTERM, stop_handler);
@@ -468,6 +564,15 @@ int main(int argc, char** argv) {
                      {"websocket_rate_limit_bytes", websocket_rate_limit_bytes},
                      {"websocket_rate_limit_window_ms", websocket_rate_limit_window_ms},
                      {"trusted_proxy_count", trusted_proxy_count},
+                     {"max_active_connections", max_active_connections},
+                     {"max_pending_http_connections", max_pending_http_connections},
+                     {"max_websocket_connections", max_websocket_connections},
+                     {"max_connections_per_source", max_connections_per_source},
+                     {"listen_backlog", listen_backlog},
+                     {"header_read_timeout_ms", header_read_timeout_ms},
+                     {"body_read_timeout_ms", body_read_timeout_ms},
+                     {"response_write_timeout_ms", response_write_timeout_ms},
+                     {"overload_write_timeout_ms", overload_write_timeout_ms},
                      {"audit_log_max_bytes", audit_log_max_bytes},
                      {"audit_log_files", audit_log_files},
                      {"audit_log_rotation_interval_ms", audit_log_rotation_interval_ms},

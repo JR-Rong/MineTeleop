@@ -585,6 +585,23 @@ std::optional<std::string> optional_yaml_string(
   }
 }
 
+std::int64_t required_positive_integer_node(
+    const YAML::Node& node,
+    std::string_view field,
+    std::string_view field_display,
+    std::int64_t fallback) {
+  const std::string name(field);
+  if (!node || !node.IsMap() || !node[name]) return fallback;
+  std::int64_t value = 0;
+  try {
+    value = node[name].as<std::int64_t>();
+  } catch (const YAML::Exception& error) {
+    throw std::invalid_argument(std::string(field_display) + " must be an integer: " + error.what());
+  }
+  if (value <= 0) throw std::invalid_argument(std::string(field_display) + " must be positive");
+  return value;
+}
+
 std::string read_identity_secret_file(const std::filesystem::path& path, std::string_view context) {
   std::ifstream input(path, std::ios::binary);
   if (!input) throw std::runtime_error("cannot read " + std::string(context) + " secret file: " + path.string());
@@ -1896,7 +1913,118 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
       }
     }
   }
+  const auto limits = root["connection_limits"];
+  if (limits) {
+    if (!limits.IsMap()) throw std::invalid_argument("connection_limits must be a mapping");
+    // Partial mappings inherit every omitted field from the R05
+    // default-constructed ConnectionLimits (SignalingServerConfig already
+    // carries those defaults), so only explicitly-present keys are validated.
+    config.connection_limits.max_active_connections = static_cast<std::size_t>(
+        required_positive_integer_node(
+            limits,
+            "max_active_connections",
+            "connection_limits.max_active_connections",
+            static_cast<std::int64_t>(config.connection_limits.max_active_connections)));
+    config.connection_limits.max_pending_http_connections = static_cast<std::size_t>(
+        required_positive_integer_node(
+            limits,
+            "max_pending_http_connections",
+            "connection_limits.max_pending_http_connections",
+            static_cast<std::int64_t>(config.connection_limits.max_pending_http_connections)));
+    config.connection_limits.max_websocket_connections = static_cast<std::size_t>(
+        required_positive_integer_node(
+            limits,
+            "max_websocket_connections",
+            "connection_limits.max_websocket_connections",
+            static_cast<std::int64_t>(config.connection_limits.max_websocket_connections)));
+    config.connection_limits.max_connections_per_source = static_cast<std::size_t>(
+        required_positive_integer_node(
+            limits,
+            "max_connections_per_source",
+            "connection_limits.max_connections_per_source",
+            static_cast<std::int64_t>(config.connection_limits.max_connections_per_source)));
+    const auto listen_backlog = required_positive_integer_node(
+        limits,
+        "listen_backlog",
+        "connection_limits.listen_backlog",
+        config.connection_limits.listen_backlog);
+    if (listen_backlog > std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("connection_limits.listen_backlog is too large");
+    }
+    config.connection_limits.listen_backlog = static_cast<int>(listen_backlog);
+    config.connection_limits.header_read_timeout = std::chrono::milliseconds(
+        required_positive_integer_node(
+            limits,
+            "header_read_timeout_ms",
+            "connection_limits.header_read_timeout_ms",
+            config.connection_limits.header_read_timeout.count()));
+    config.connection_limits.body_read_timeout = std::chrono::milliseconds(
+        required_positive_integer_node(
+            limits,
+            "body_read_timeout_ms",
+            "connection_limits.body_read_timeout_ms",
+            config.connection_limits.body_read_timeout.count()));
+    config.connection_limits.response_write_timeout = std::chrono::milliseconds(
+        required_positive_integer_node(
+            limits,
+            "response_write_timeout_ms",
+            "connection_limits.response_write_timeout_ms",
+            config.connection_limits.response_write_timeout.count()));
+    config.connection_limits.overload_write_timeout = std::chrono::milliseconds(
+        required_positive_integer_node(
+            limits,
+            "overload_write_timeout_ms",
+            "connection_limits.overload_write_timeout_ms",
+            config.connection_limits.overload_write_timeout.count()));
+    validate_connection_limits(config.connection_limits);
+  }
   return config;
+}
+
+void validate_connection_limits(const SimpleHttpServer::ConnectionLimits& limits) {
+  if (limits.max_active_connections == 0) {
+    throw std::invalid_argument("connection_limits.max_active_connections must be positive");
+  }
+  if (limits.max_pending_http_connections == 0) {
+    throw std::invalid_argument("connection_limits.max_pending_http_connections must be positive");
+  }
+  if (limits.max_connections_per_source == 0) {
+    throw std::invalid_argument("connection_limits.max_connections_per_source must be positive");
+  }
+  if (limits.listen_backlog <= 0) {
+    throw std::invalid_argument("connection_limits.listen_backlog must be positive");
+  }
+  if (limits.header_read_timeout <= std::chrono::milliseconds::zero()) {
+    throw std::invalid_argument("connection_limits.header_read_timeout_ms must be positive");
+  }
+  if (limits.body_read_timeout <= std::chrono::milliseconds::zero()) {
+    throw std::invalid_argument("connection_limits.body_read_timeout_ms must be positive");
+  }
+  if (limits.response_write_timeout <= std::chrono::milliseconds::zero()) {
+    throw std::invalid_argument("connection_limits.response_write_timeout_ms must be positive");
+  }
+  if (limits.overload_write_timeout <= std::chrono::milliseconds::zero()) {
+    throw std::invalid_argument("connection_limits.overload_write_timeout_ms must be positive");
+  }
+  if (limits.max_pending_http_connections > limits.max_active_connections) {
+    throw std::invalid_argument(
+        "connection_limits.max_pending_http_connections must not exceed "
+        "connection_limits.max_active_connections");
+  }
+  if (limits.max_websocket_connections > limits.max_active_connections) {
+    throw std::invalid_argument(
+        "connection_limits.max_websocket_connections must not exceed "
+        "connection_limits.max_active_connections");
+  }
+  // The standalone signaling server always installs a WSS handler, so a valid
+  // budget must always reserve post-upgrade capacity for WebSocket channels.
+  if (limits.max_websocket_connections == 0 ||
+      limits.max_pending_http_connections >= limits.max_active_connections) {
+    throw std::invalid_argument(
+        "connection_limits must reserve active capacity for WebSocket connections "
+        "(max_websocket_connections must be positive and max_pending_http_connections "
+        "must be less than max_active_connections)");
+  }
 }
 
 Json HttpRequest::json_body() const {

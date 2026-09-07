@@ -3060,6 +3060,214 @@ void test_signaling_multi_identity_config() {
   std::filesystem::remove_all(root);
 }
 
+void test_signaling_connection_limits_config() {
+  const auto root = std::filesystem::temp_directory_path() /
+      ("mine-teleop-connection-limits-" + mine_teleop::random_token(6));
+  std::filesystem::create_directories(root);
+  write_text_file(root / "driver-1.password", "driver-password-1\n");
+  write_text_file(root / "vehicle-1.token", "vehicle-token-1\n");
+
+  const auto write_identity = [&](std::string_view name, std::string_view limits_block) {
+    std::string yaml = R"YAML(auth:
+  allow_legacy_passwords: true
+  legacy_passwords_remove_by: "2099-12-31"
+  drivers:
+    - id: driver-console-001
+      password_file: driver-1.password
+      vehicles: [vehicle-001]
+  vehicles:
+    - id: vehicle-001
+      device_token_file: vehicle-1.token
+)YAML";
+    if (!limits_block.empty()) {
+      yaml += "\nconnection_limits:\n";
+      yaml += std::string(limits_block);
+    }
+    const auto path = root / std::string(name);
+    write_text_file(path, yaml);
+    return path;
+  };
+
+  try {
+    mine_teleop::SimpleHttpServer::ConnectionLimits reference;
+    auto defaults = mine_teleop::SignalingServerConfig{};
+    const auto has_runtime_defaults = [&](const mine_teleop::SimpleHttpServer::ConnectionLimits& limits) {
+      return limits.max_active_connections == reference.max_active_connections &&
+          limits.max_pending_http_connections == reference.max_pending_http_connections &&
+          limits.max_websocket_connections == reference.max_websocket_connections &&
+          limits.max_connections_per_source == reference.max_connections_per_source &&
+          limits.listen_backlog == reference.listen_backlog &&
+          limits.header_read_timeout == reference.header_read_timeout &&
+          limits.body_read_timeout == reference.body_read_timeout &&
+          limits.response_write_timeout == reference.response_write_timeout &&
+          limits.overload_write_timeout == reference.overload_write_timeout;
+    };
+    expect(
+        has_runtime_defaults(defaults.connection_limits),
+        "SignalingServerConfig connection_limits defaults do not mirror SimpleHttpServer::ConnectionLimits");
+    const auto yaml_defaults = mine_teleop::load_signaling_identity_config(
+        write_identity("defaults.yaml", ""));
+    expect(
+        has_runtime_defaults(yaml_defaults.connection_limits),
+        "identity YAML without connection_limits did not retain runtime defaults");
+
+    const auto valid_path = write_identity(
+        "valid.yaml",
+        "  max_active_connections: 4\n"
+        "  max_pending_http_connections: 2\n"
+        "  max_websocket_connections: 2\n"
+        "  max_connections_per_source: 1\n"
+        "  listen_backlog: 4\n"
+        "  header_read_timeout_ms: 700\n"
+        "  body_read_timeout_ms: 800\n"
+        "  response_write_timeout_ms: 900\n"
+        "  overload_write_timeout_ms: 120\n");
+    const auto parsed = mine_teleop::load_signaling_identity_config(valid_path);
+    expect(
+        parsed.connection_limits.max_active_connections == 4,
+        "max_active_connections override was not parsed into the config");
+    expect(
+        parsed.connection_limits.max_pending_http_connections == 2,
+        "max_pending_http_connections override was not parsed into the config");
+    expect(
+        parsed.connection_limits.max_websocket_connections == 2,
+        "max_websocket_connections override was not parsed into the config");
+    expect(
+        parsed.connection_limits.max_connections_per_source == 1,
+        "max_connections_per_source override was not parsed into the config");
+    expect(
+        parsed.connection_limits.listen_backlog == 4,
+        "listen_backlog override was not parsed into the config");
+    expect(
+        parsed.connection_limits.header_read_timeout == std::chrono::milliseconds(700),
+        "header_read_timeout_ms override was not parsed into the config");
+    expect(
+        parsed.connection_limits.body_read_timeout == std::chrono::milliseconds(800),
+        "body_read_timeout_ms override was not parsed into the config");
+    expect(
+        parsed.connection_limits.response_write_timeout == std::chrono::milliseconds(900),
+        "response_write_timeout_ms override was not parsed into the config");
+    expect(
+        parsed.connection_limits.overload_write_timeout == std::chrono::milliseconds(120),
+        "overload_write_timeout_ms override was not parsed into the config");
+
+    // Partial mappings inherit every omitted field from the default-constructed
+    // ConnectionLimits; only the fields actually present in YAML are overridden.
+    const auto partial_path = write_identity(
+        "partial.yaml",
+        "  max_connections_per_source: 1\n"
+        "  overload_write_timeout_ms: 120\n");
+    const auto partial = mine_teleop::load_signaling_identity_config(partial_path);
+    expect(
+        partial.connection_limits.max_active_connections ==
+            defaults.connection_limits.max_active_connections,
+        "omitted max_active_connections did not inherit the R05 default");
+    expect(
+        partial.connection_limits.max_pending_http_connections ==
+            defaults.connection_limits.max_pending_http_connections,
+        "omitted max_pending_http_connections did not inherit the R05 default");
+    expect(
+        partial.connection_limits.max_websocket_connections ==
+            defaults.connection_limits.max_websocket_connections,
+        "omitted max_websocket_connections did not inherit the R05 default");
+    expect(
+        partial.connection_limits.listen_backlog == defaults.connection_limits.listen_backlog,
+        "omitted listen_backlog did not inherit the R05 default");
+    expect(
+        partial.connection_limits.header_read_timeout ==
+            defaults.connection_limits.header_read_timeout,
+        "omitted header_read_timeout_ms did not inherit the R05 default");
+    expect(
+        partial.connection_limits.body_read_timeout == defaults.connection_limits.body_read_timeout,
+        "omitted body_read_timeout_ms did not inherit the R05 default");
+    expect(
+        partial.connection_limits.response_write_timeout ==
+            defaults.connection_limits.response_write_timeout,
+        "omitted response_write_timeout_ms did not inherit the R05 default");
+    expect(
+        partial.connection_limits.max_connections_per_source == 1,
+        "present max_connections_per_source override was not applied in a partial mapping");
+    expect(
+        partial.connection_limits.overload_write_timeout == std::chrono::milliseconds(120),
+        "present overload_write_timeout_ms override was not applied in a partial mapping");
+
+    // Behavioral proof: the per_source=1 override actually configures the
+    // server. A second loopback connection is rejected with 503 even though the
+    // default per-source budget (48) would accept it.
+    {
+      mine_teleop::SimpleHttpServer server(
+          "127.0.0.1",
+          0,
+          [](const mine_teleop::HttpRequest&) { return mine_teleop::ServerResponse::text(200, "ok"); },
+          1024,
+          {},
+          parsed.connection_limits);
+      server.start();
+      const int first = raw_http_connect(server.port());
+      const int second = raw_http_connect(server.port());
+      const auto second_response = raw_receive_until_close(second);
+      ::close(second);
+      expect(
+          second_response.starts_with("HTTP/1.1 503 "),
+          "parsed per-source=1 override did not reach and constrain the server");
+      ::close(first);
+      server.stop();
+    }
+
+    const auto expect_invalid = [&](std::string_view name,
+                                    std::string_view limits_block,
+                                    std::string_view expected_field) {
+      const auto path = write_identity(name, limits_block);
+      std::string message;
+      try {
+        static_cast<void>(mine_teleop::load_signaling_identity_config(path));
+      } catch (const std::exception& error) {
+        message = error.what();
+      }
+      expect(
+          message.find(expected_field) != std::string::npos,
+          std::string("invalid connection_limits did not reject naming the field; expected '") +
+              std::string(expected_field) + "' in: " + message);
+    };
+
+    expect_invalid("active-zero.yaml", "  max_active_connections: 0\n", "max_active_connections");
+    expect_invalid("pending-zero.yaml", "  max_pending_http_connections: 0\n", "max_pending_http_connections");
+    expect_invalid("wss-zero.yaml", "  max_websocket_connections: 0\n", "max_websocket_connections");
+    expect_invalid("per-source-zero.yaml", "  max_connections_per_source: 0\n", "max_connections_per_source");
+    expect_invalid("backlog-zero.yaml", "  listen_backlog: 0\n", "listen_backlog");
+    expect_invalid("header-zero.yaml", "  header_read_timeout_ms: 0\n", "header_read_timeout_ms");
+    expect_invalid("header-negative.yaml", "  header_read_timeout_ms: -1\n", "header_read_timeout_ms");
+    expect_invalid("body-zero.yaml", "  body_read_timeout_ms: 0\n", "body_read_timeout_ms");
+    expect_invalid("response-zero.yaml", "  response_write_timeout_ms: 0\n", "response_write_timeout_ms");
+    expect_invalid("overload-zero.yaml", "  overload_write_timeout_ms: 0\n", "overload_write_timeout_ms");
+    expect_invalid(
+        "header-overflow.yaml",
+        "  header_read_timeout_ms: 9223372036854775808\n",
+        "header_read_timeout_ms");
+    expect_invalid(
+        "pending-gt-active.yaml",
+        "  max_active_connections: 2\n"
+        "  max_pending_http_connections: 3\n",
+        "max_pending_http_connections");
+    expect_invalid(
+        "wss-gt-active.yaml",
+        "  max_active_connections: 2\n"
+        "  max_pending_http_connections: 2\n"
+        "  max_websocket_connections: 3\n",
+        "max_websocket_connections");
+    expect_invalid(
+        "no-wss-capacity.yaml",
+        "  max_active_connections: 2\n"
+        "  max_pending_http_connections: 2\n"
+        "  max_websocket_connections: 1\n",
+        "WebSocket");
+  } catch (...) {
+    std::filesystem::remove_all(root);
+    throw;
+  }
+  std::filesystem::remove_all(root);
+}
+
 void test_argon2id_credentials_and_login_concurrency() {
   constexpr std::array<std::uint8_t, 16> salt{
       0x52, 0x30, 0x34, 0x2d, 0x61, 0x72, 0x67, 0x6f,
@@ -6910,6 +7118,7 @@ int main() {
       {"signaling_latest_only_control_mailbox", test_signaling_latest_only_control_mailbox},
       {"driver_brake_limit_config_validation", test_driver_brake_limit_config_validation},
       {"signaling_multi_identity_config", test_signaling_multi_identity_config},
+      {"signaling_connection_limits_config", test_signaling_connection_limits_config},
       {"argon2id_credentials_and_login_concurrency", test_argon2id_credentials_and_login_concurrency},
       {"credential_purpose_separation_and_stale_control_replay",
        test_credential_purpose_separation_and_stale_control_replay},

@@ -509,6 +509,70 @@ if(MINE_TELEOP_BUILD_TESTS)
       COMMAND mine-teleop-signaling-server --host 0.0.0.0 --port 0
     )
     set_tests_properties(mine-teleop-signaling-rejects-public-bind PROPERTIES WILL_FAIL TRUE)
+    add_test(
+      NAME mine-teleop-signaling-rejects-zero-connection-limit
+      COMMAND ${CMAKE_COMMAND} -E env
+        --unset=MINE_TELEOP_DRIVER_PASSWORD
+        --unset=MINE_TELEOP_DEVICE_TOKEN
+        MINE_TELEOP_DRIVER_001_PASSWORD=test-driver-1
+        MINE_TELEOP_DRIVER_002_PASSWORD=test-driver-2
+        MINE_TELEOP_VEHICLE_001_TOKEN=test-vehicle-1
+        MINE_TELEOP_VEHICLE_002_TOKEN=test-vehicle-2
+        $<TARGET_FILE:mine-teleop-signaling-server>
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/configs/signaling-server.2x2.dev.yaml
+        --max-pending-http-connections 0
+        --validate-config
+    )
+    set_tests_properties(mine-teleop-signaling-rejects-zero-connection-limit PROPERTIES WILL_FAIL TRUE)
+    add_test(
+      NAME mine-teleop-signaling-rejects-connection-sublimit-over-total
+      COMMAND ${CMAKE_COMMAND} -E env
+        --unset=MINE_TELEOP_DRIVER_PASSWORD
+        --unset=MINE_TELEOP_DEVICE_TOKEN
+        MINE_TELEOP_DRIVER_001_PASSWORD=test-driver-1
+        MINE_TELEOP_DRIVER_002_PASSWORD=test-driver-2
+        MINE_TELEOP_VEHICLE_001_TOKEN=test-vehicle-1
+        MINE_TELEOP_VEHICLE_002_TOKEN=test-vehicle-2
+        $<TARGET_FILE:mine-teleop-signaling-server>
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/configs/signaling-server.2x2.dev.yaml
+        --max-active-connections 4
+        --max-pending-http-connections 8
+        --validate-config
+    )
+    set_tests_properties(
+      mine-teleop-signaling-rejects-connection-sublimit-over-total
+      PROPERTIES WILL_FAIL TRUE
+    )
+    add_test(
+      NAME mine-teleop-signaling-rejects-listen-backlog-overflow
+      COMMAND ${CMAKE_COMMAND} -E env
+        --unset=MINE_TELEOP_DRIVER_PASSWORD
+        --unset=MINE_TELEOP_DEVICE_TOKEN
+        MINE_TELEOP_DRIVER_001_PASSWORD=test-driver-1
+        MINE_TELEOP_DRIVER_002_PASSWORD=test-driver-2
+        MINE_TELEOP_VEHICLE_001_TOKEN=test-vehicle-1
+        MINE_TELEOP_VEHICLE_002_TOKEN=test-vehicle-2
+        $<TARGET_FILE:mine-teleop-signaling-server>
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/configs/signaling-server.2x2.dev.yaml
+        --listen-backlog 2147483648
+        --validate-config
+    )
+    set_tests_properties(mine-teleop-signaling-rejects-listen-backlog-overflow PROPERTIES WILL_FAIL TRUE)
+    add_test(
+      NAME mine-teleop-signaling-rejects-zero-timeout
+      COMMAND ${CMAKE_COMMAND} -E env
+        --unset=MINE_TELEOP_DRIVER_PASSWORD
+        --unset=MINE_TELEOP_DEVICE_TOKEN
+        MINE_TELEOP_DRIVER_001_PASSWORD=test-driver-1
+        MINE_TELEOP_DRIVER_002_PASSWORD=test-driver-2
+        MINE_TELEOP_VEHICLE_001_TOKEN=test-vehicle-1
+        MINE_TELEOP_VEHICLE_002_TOKEN=test-vehicle-2
+        $<TARGET_FILE:mine-teleop-signaling-server>
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/configs/signaling-server.2x2.dev.yaml
+        --header-read-timeout-ms 0
+        --validate-config
+    )
+    set_tests_properties(mine-teleop-signaling-rejects-zero-timeout PROPERTIES WILL_FAIL TRUE)
   endif()
   add_executable(mine-teleop-control-tests cpp/tests/control_tests.cpp)
   target_link_libraries(mine-teleop-control-tests PRIVATE mine_teleop_runtime)
