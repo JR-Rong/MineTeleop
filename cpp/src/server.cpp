@@ -8,8 +8,10 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -179,9 +181,12 @@ using NativeSocket = SOCKET;
 using SocketLength = int;
 constexpr int kSendFlags = 0;
 constexpr int kShutdownBoth = SD_BOTH;
+constexpr short kPollRead = POLLRDNORM;
+constexpr short kPollWrite = POLLWRNORM;
 
 int last_socket_error() { return WSAGetLastError(); }
 bool socket_error_interrupted(int error) { return error == WSAEINTR; }
+bool socket_error_would_block(int error) { return error == WSAEWOULDBLOCK; }
 bool socket_error_closed(int error) {
   return error == WSAENOTSOCK || error == WSAEINVAL;
 }
@@ -196,9 +201,12 @@ using NativeSocket = int;
 using SocketLength = socklen_t;
 constexpr int kSendFlags = MSG_NOSIGNAL;
 constexpr int kShutdownBoth = SHUT_RDWR;
+constexpr short kPollRead = POLLIN;
+constexpr short kPollWrite = POLLOUT;
 
 int last_socket_error() { return errno; }
 bool socket_error_interrupted(int error) { return error == EINTR; }
+bool socket_error_would_block(int error) { return error == EAGAIN || error == EWOULDBLOCK; }
 bool socket_error_closed(int error) { return error == EBADF || error == EINVAL; }
 std::string socket_error_message(int error) { return std::strerror(error); }
 std::string address_error_message(int error) { return ::gai_strerror(error); }
@@ -265,6 +273,60 @@ void configure_listener_socket(SocketHandle socket) {
 #else
   ::setsockopt(native_socket(socket), SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
 #endif
+}
+
+void set_socket_nonblocking(SocketHandle socket, bool enabled) {
+#if defined(_WIN32)
+  u_long mode = enabled ? 1UL : 0UL;
+  if (::ioctlsocket(native_socket(socket), FIONBIO, &mode) != 0) {
+    throw std::runtime_error("cannot configure HTTP client socket: " + socket_error_message(last_socket_error()));
+  }
+#else
+  const int flags = ::fcntl(native_socket(socket), F_GETFL, 0);
+  if (flags < 0 || ::fcntl(
+                       native_socket(socket),
+                       F_SETFL,
+                       enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK) != 0) {
+    throw std::runtime_error("cannot configure HTTP client socket: " + socket_error_message(last_socket_error()));
+  }
+#endif
+}
+
+std::chrono::milliseconds remaining_until(std::chrono::steady_clock::time_point deadline) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) return std::chrono::milliseconds::zero();
+  const auto remaining = deadline - now;
+  auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+  if (milliseconds < remaining) ++milliseconds;
+  return std::max(milliseconds, std::chrono::milliseconds(1));
+}
+
+bool wait_socket_until(
+    SocketHandle socket,
+    short events,
+    std::chrono::steady_clock::time_point deadline) {
+#if defined(_WIN32)
+  WSAPOLLFD descriptor{native_socket(socket), events, 0};
+#else
+  pollfd descriptor{native_socket(socket), events, 0};
+#endif
+  while (true) {
+    const auto remaining = remaining_until(deadline);
+    if (remaining <= std::chrono::milliseconds::zero()) return false;
+    const auto timeout = static_cast<int>(std::min<std::int64_t>(
+        remaining.count(), static_cast<std::int64_t>(std::numeric_limits<int>::max())));
+#if defined(_WIN32)
+    const int result = ::WSAPoll(&descriptor, 1, timeout);
+#else
+    const int result = ::poll(&descriptor, 1, timeout);
+#endif
+    if (result > 0) return (descriptor.revents & (events | POLLERR | POLLHUP | POLLNVAL)) != 0;
+    if (result == 0) return false;
+    const int error = last_socket_error();
+    if (!socket_error_interrupted(error)) {
+      throw std::runtime_error("HTTP socket poll failed: " + socket_error_message(error));
+    }
+  }
 }
 
 class Unauthorized final : public std::runtime_error {
@@ -878,12 +940,64 @@ std::string status_reason(int status) {
     case 401: return "Unauthorized";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 408: return "Request Timeout";
     case 409: return "Conflict";
     case 410: return "Gone";
     case 413: return "Payload Too Large";
     case 429: return "Too Many Requests";
     case 500: return "Internal Server Error";
+    case 503: return "Service Unavailable";
     default: return "Response";
+  }
+}
+
+class HttpDeadlineExceeded final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+std::size_t receive_until(
+    SocketHandle socket,
+    char* output,
+    std::size_t output_size,
+    std::chrono::steady_clock::time_point deadline,
+    std::string_view phase) {
+  while (true) {
+    if (!wait_socket_until(socket, kPollRead, deadline)) {
+      throw HttpDeadlineExceeded("HTTP " + std::string(phase) + " timed out");
+    }
+    const auto result = ::recv(
+        native_socket(socket), output, socket_buffer_size(output_size), 0);
+    if (result < 0) {
+      const int error = last_socket_error();
+      if (socket_error_interrupted(error) || socket_error_would_block(error)) continue;
+      throw std::runtime_error("recv failed: " + socket_error_message(error));
+    }
+    return static_cast<std::size_t>(result);
+  }
+}
+
+void send_all_until(
+    SocketHandle socket,
+    std::string_view value,
+    std::chrono::steady_clock::time_point deadline) {
+  std::size_t sent = 0;
+  while (sent < value.size()) {
+    if (!wait_socket_until(socket, kPollWrite, deadline)) {
+      throw HttpDeadlineExceeded("HTTP response write timed out");
+    }
+    const auto result = ::send(
+        native_socket(socket),
+        value.data() + sent,
+        socket_buffer_size(value.size() - sent),
+        kSendFlags);
+    if (result < 0) {
+      const int error = last_socket_error();
+      if (socket_error_interrupted(error) || socket_error_would_block(error)) continue;
+      throw std::runtime_error("send failed: " + socket_error_message(error));
+    }
+    if (result == 0) throw std::runtime_error("connection closed while sending response");
+    sent += static_cast<std::size_t>(result);
   }
 }
 
@@ -905,7 +1019,7 @@ void send_all(SocketHandle socket, std::string_view value) {
   }
 }
 
-void send_http_response(SocketHandle socket, const ServerResponse& response) {
+std::string http_response_header(const ServerResponse& response) {
   std::ostringstream header;
   header << "HTTP/1.1 " << response.status << ' ' << status_reason(response.status) << "\r\n"
          << "Content-Type: " << response.content_type << "\r\n"
@@ -913,7 +1027,21 @@ void send_http_response(SocketHandle socket, const ServerResponse& response) {
          << "Connection: close\r\n";
   for (const auto& [name, value] : response.headers) header << name << ": " << value << "\r\n";
   header << "\r\n";
-  send_all(socket, header.str());
+  return header.str();
+}
+
+void send_http_response_until(
+    SocketHandle socket,
+    const ServerResponse& response,
+    std::chrono::steady_clock::time_point deadline) {
+  const auto header = http_response_header(response);
+  send_all_until(socket, header, deadline);
+  send_all_until(socket, response.body, deadline);
+}
+
+void send_http_response(SocketHandle socket, const ServerResponse& response) {
+  const auto header = http_response_header(response);
+  send_all(socket, header);
   send_all(socket, response.body);
 }
 
@@ -934,21 +1062,37 @@ void add_request_id_header(ServerResponse& response, std::string_view request_id
   response.headers.emplace_back("X-Request-ID", request_id);
 }
 
-HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
+std::size_t parse_content_length(std::string_view value) {
+  if (value.empty()) throw std::invalid_argument("invalid Content-Length header");
+  std::size_t result = 0;
+  for (const unsigned char character : value) {
+    if (character < '0' || character > '9') {
+      throw std::invalid_argument("invalid Content-Length header");
+    }
+    const auto digit = static_cast<std::size_t>(character - '0');
+    if (result > (std::numeric_limits<std::size_t>::max() - digit) / 10U) {
+      throw std::invalid_argument("invalid Content-Length header");
+    }
+    result = result * 10U + digit;
+  }
+  return result;
+}
+
+HttpRequest parse_request(
+    SocketHandle socket,
+    std::size_t max_body_bytes,
+    std::chrono::milliseconds header_read_timeout,
+    std::chrono::milliseconds body_read_timeout) {
   constexpr std::size_t max_headers = 64 * 1024;
   std::string wire;
   std::array<char, 16 * 1024> buffer{};
   std::size_t header_end = std::string::npos;
+  const auto header_deadline = std::chrono::steady_clock::now() + header_read_timeout;
   while ((header_end = wire.find("\r\n\r\n")) == std::string::npos) {
-    const auto received = ::recv(
-        native_socket(socket), buffer.data(), socket_buffer_size(buffer.size()), 0);
-    if (received < 0) {
-      const int error = last_socket_error();
-      if (socket_error_interrupted(error)) continue;
-      throw std::runtime_error("recv failed: " + socket_error_message(error));
-    }
+    const auto received = receive_until(
+        socket, buffer.data(), buffer.size(), header_deadline, "header read");
     if (received == 0) throw std::invalid_argument("client closed before sending HTTP headers");
-    wire.append(buffer.data(), static_cast<std::size_t>(received));
+    wire.append(buffer.data(), received);
     if (wire.size() > max_headers) throw std::invalid_argument("HTTP headers too large");
   }
 
@@ -959,7 +1103,8 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
   request_line = trim(std::move(request_line));
   std::istringstream line(request_line);
   std::string version;
-  if (!(line >> request.method >> request.target >> version) || !version.starts_with("HTTP/1.")) {
+  if (!(line >> request.method >> request.target >> version) ||
+      (version != "HTTP/1.0" && version != "HTTP/1.1")) {
     throw std::invalid_argument("invalid HTTP request line");
   }
   std::string header;
@@ -968,31 +1113,29 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
     if (header.empty()) continue;
     const auto separator = header.find(':');
     if (separator == std::string::npos) throw std::invalid_argument("invalid HTTP header");
-    request.headers[lower(trim(header.substr(0, separator)))] = trim(header.substr(separator + 1));
+    const auto name = lower(trim(header.substr(0, separator)));
+    if (name.empty()) throw std::invalid_argument("invalid HTTP header");
+    if (name == "transfer-encoding") {
+      throw std::invalid_argument("Transfer-Encoding is not supported");
+    }
+    if (name == "content-length" && request.headers.contains(name)) {
+      throw std::invalid_argument("duplicate Content-Length header");
+    }
+    request.headers[name] = trim(header.substr(separator + 1));
   }
 
   std::size_t content_length = 0;
   if (const auto found = request.headers.find("content-length"); found != request.headers.end()) {
-    std::size_t consumed = 0;
-    try {
-      content_length = std::stoull(found->second, &consumed);
-    } catch (const std::exception&) {
-      throw std::invalid_argument("invalid Content-Length header");
-    }
-    if (consumed != found->second.size()) throw std::invalid_argument("invalid Content-Length header");
+    content_length = parse_content_length(found->second);
   }
   if (content_length > max_body_bytes) throw std::length_error("request body too large");
   const auto body_start = header_end + 4;
+  const auto body_deadline = std::chrono::steady_clock::now() + body_read_timeout;
   while (wire.size() - body_start < content_length) {
-    const auto received = ::recv(
-        native_socket(socket), buffer.data(), socket_buffer_size(buffer.size()), 0);
-    if (received < 0) {
-      const int error = last_socket_error();
-      if (socket_error_interrupted(error)) continue;
-      throw std::runtime_error("recv failed: " + socket_error_message(error));
-    }
+    const auto received = receive_until(
+        socket, buffer.data(), buffer.size(), body_deadline, "body read");
     if (received == 0) throw std::invalid_argument("client closed before sending HTTP body");
-    wire.append(buffer.data(), static_cast<std::size_t>(received));
+    wire.append(buffer.data(), received);
   }
   request.body = wire.substr(body_start, content_length);
 
@@ -1013,6 +1156,24 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
     }
   }
   return request;
+}
+
+bool websocket_upgrade_requested(const HttpRequest& request) {
+  const auto upgrade = request.headers.find("upgrade");
+  if (upgrade == request.headers.end() || lower(trim(upgrade->second)) != "websocket") return false;
+  const auto connection = request.headers.find("connection");
+  if (connection == request.headers.end()) return false;
+  std::size_t start = 0;
+  while (start <= connection->second.size()) {
+    const auto end = connection->second.find(',', start);
+    const auto token = lower(trim(connection->second.substr(
+        start,
+        end == std::string::npos ? std::string::npos : end - start)));
+    if (token == "upgrade") return true;
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  return false;
 }
 
 struct LoopbackHttpAuthority {
@@ -1763,14 +1924,49 @@ SimpleHttpServer::SimpleHttpServer(
     Handler handler,
     std::size_t max_body_bytes,
     WebSocketHandler websocket_handler)
+    : SimpleHttpServer(
+          std::move(host),
+          port,
+          std::move(handler),
+          max_body_bytes,
+          std::move(websocket_handler),
+          ConnectionLimits{}) {}
+
+SimpleHttpServer::SimpleHttpServer(
+    std::string host,
+    std::uint16_t port,
+    Handler handler,
+    std::size_t max_body_bytes,
+    WebSocketHandler websocket_handler,
+    ConnectionLimits connection_limits)
     : host_(std::move(host)),
       requested_port_(port),
       handler_(std::move(handler)),
       max_body_bytes_(max_body_bytes),
-      websocket_handler_(std::move(websocket_handler)) {
+      websocket_handler_(std::move(websocket_handler)),
+      connection_limits_(std::move(connection_limits)) {
   if (host_.empty()) throw std::invalid_argument("HTTP host must not be empty");
   if (!handler_) throw std::invalid_argument("HTTP handler is required");
   if (max_body_bytes_ == 0) throw std::invalid_argument("HTTP max body size must be positive");
+  if (connection_limits_.max_active_connections == 0 ||
+      connection_limits_.max_pending_http_connections == 0 ||
+      connection_limits_.max_connections_per_source == 0 ||
+      connection_limits_.listen_backlog <= 0 ||
+      connection_limits_.header_read_timeout <= std::chrono::milliseconds::zero() ||
+      connection_limits_.body_read_timeout <= std::chrono::milliseconds::zero() ||
+      connection_limits_.response_write_timeout <= std::chrono::milliseconds::zero() ||
+      connection_limits_.overload_write_timeout <= std::chrono::milliseconds::zero()) {
+    throw std::invalid_argument("HTTP connection limits and deadlines must be positive");
+  }
+  if (connection_limits_.max_pending_http_connections > connection_limits_.max_active_connections ||
+      connection_limits_.max_websocket_connections > connection_limits_.max_active_connections) {
+    throw std::invalid_argument("HTTP connection sub-limits must not exceed the active connection limit");
+  }
+  if (websocket_handler_ &&
+      (connection_limits_.max_websocket_connections == 0 ||
+       connection_limits_.max_pending_http_connections >= connection_limits_.max_active_connections)) {
+    throw std::invalid_argument("HTTP limits must reserve active capacity for WebSocket connections");
+  }
 }
 
 SimpleHttpServer::~SimpleHttpServer() { stop(); }
@@ -1802,7 +1998,7 @@ void SimpleHttpServer::open_listener() {
     listener_fd_ = static_cast<SocketHandle>(candidate);
     configure_listener_socket(listener_fd_);
     if (::bind(native_socket(listener_fd_), address->ai_addr, address->ai_addrlen) == 0 &&
-        ::listen(native_socket(listener_fd_), 64) == 0) {
+        ::listen(native_socket(listener_fd_), connection_limits_.listen_backlog) == 0) {
       break;
     }
     saved_error = last_socket_error();
@@ -1825,13 +2021,110 @@ void SimpleHttpServer::open_listener() {
   if (bound.ss_family == AF_INET6) bound_port_ = ntohs(reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port);
 }
 
-void SimpleHttpServer::serve_client(SocketHandle client_fd) const {
-  ServerResponse response;
+bool SimpleHttpServer::try_register_client(SocketHandle client_fd, std::string source) {
+  std::lock_guard lock(clients_mutex_);
+  const auto source_count = connections_by_source_.find(source);
+  if (stopping_ || client_sockets_.size() >= connection_limits_.max_active_connections ||
+      pending_http_connections_ >= connection_limits_.max_pending_http_connections ||
+      (source_count != connections_by_source_.end() &&
+       source_count->second >= connection_limits_.max_connections_per_source)) {
+    return false;
+  }
+  const auto [socket, inserted] = client_sockets_.insert(client_fd);
+  if (!inserted) return false;
   try {
-    auto request = parse_request(client_fd, max_body_bytes_);
+    const auto [stored_source, source_inserted] = client_sources_.emplace(client_fd, std::move(source));
+    if (!source_inserted) {
+      client_sockets_.erase(socket);
+      return false;
+    }
+    ++connections_by_source_[stored_source->second];
+    ++pending_http_connections_;
+    return true;
+  } catch (...) {
+    client_sources_.erase(client_fd);
+    client_sockets_.erase(socket);
+    throw;
+  }
+}
+
+bool SimpleHttpServer::try_promote_client_to_websocket(SocketHandle client_fd) {
+  std::lock_guard lock(clients_mutex_);
+  if (!client_sockets_.contains(client_fd) || websocket_sockets_.contains(client_fd) ||
+      websocket_sockets_.size() >= connection_limits_.max_websocket_connections) {
+    return false;
+  }
+  websocket_sockets_.insert(client_fd);
+  if (pending_http_connections_ > 0) --pending_http_connections_;
+  return true;
+}
+
+bool SimpleHttpServer::try_demote_client_from_websocket(SocketHandle client_fd) {
+  std::lock_guard lock(clients_mutex_);
+  if (!websocket_sockets_.contains(client_fd) ||
+      pending_http_connections_ >= connection_limits_.max_pending_http_connections) {
+    return false;
+  }
+  websocket_sockets_.erase(client_fd);
+  ++pending_http_connections_;
+  return true;
+}
+
+void SimpleHttpServer::unregister_client(SocketHandle client_fd) {
+  {
+    std::lock_guard lock(clients_mutex_);
+    const auto client = client_sockets_.find(client_fd);
+    if (client == client_sockets_.end()) return;
+    if (websocket_sockets_.erase(client_fd) == 0 && pending_http_connections_ > 0) {
+      --pending_http_connections_;
+    }
+    if (const auto source = client_sources_.find(client_fd); source != client_sources_.end()) {
+      if (const auto count = connections_by_source_.find(source->second); count != connections_by_source_.end()) {
+        if (count->second > 1) {
+          --count->second;
+        } else {
+          connections_by_source_.erase(count);
+        }
+      }
+      client_sources_.erase(source);
+    }
+    client_sockets_.erase(client);
+  }
+  clients_stopped_.notify_all();
+}
+
+void SimpleHttpServer::serve_client(SocketHandle client_fd) {
+  ServerResponse response;
+  bool socket_is_nonblocking = true;
+  try {
+    auto request = parse_request(
+        client_fd,
+        max_body_bytes_,
+        connection_limits_.header_read_timeout,
+        connection_limits_.body_read_timeout);
     request.peer_address = socket_peer_address(client_fd);
-    if (websocket_handler_ && websocket_handler_(client_fd, request)) return;
-    response = handler_(request);
+    if (websocket_handler_) {
+      const bool websocket_upgrade = websocket_upgrade_requested(request);
+      if (websocket_upgrade && !try_promote_client_to_websocket(client_fd)) {
+        response = ServerResponse::json(503, {{"error", "WebSocket connection budget exhausted"}});
+      } else {
+        // The established WebSocket implementation expects the blocking socket
+        // contract it had before HTTP parsing became deadline-driven.
+        set_socket_nonblocking(client_fd, false);
+        socket_is_nonblocking = false;
+        if (websocket_handler_(client_fd, request)) return;
+        if (websocket_upgrade) {
+          static_cast<void>(try_demote_client_from_websocket(client_fd));
+        }
+        set_socket_nonblocking(client_fd, true);
+        socket_is_nonblocking = true;
+        response = handler_(request);
+      }
+    } else {
+      response = handler_(request);
+    }
+  } catch (const HttpDeadlineExceeded& error) {
+    response = ServerResponse::json(408, {{"error", error.what()}});
   } catch (const std::length_error& error) {
     response = ServerResponse::json(413, {{"error", error.what()}});
   } catch (const std::invalid_argument& error) {
@@ -1839,8 +2132,18 @@ void SimpleHttpServer::serve_client(SocketHandle client_fd) const {
   } catch (const std::exception& error) {
     response = ServerResponse::json(500, {{"error", error.what()}});
   }
+  if (!socket_is_nonblocking) {
+    try {
+      set_socket_nonblocking(client_fd, true);
+    } catch (const std::exception&) {
+      return;
+    }
+  }
   try {
-    send_http_response(client_fd, response);
+    send_http_response_until(
+        client_fd,
+        response,
+        std::chrono::steady_clock::now() + connection_limits_.response_write_timeout);
   } catch (const std::exception&) {
   }
 }
@@ -1860,29 +2163,39 @@ void SimpleHttpServer::serve_forever() {
       continue;
     }
     const auto client = static_cast<SocketHandle>(accepted);
-    {
-      std::lock_guard lock(clients_mutex_);
-      client_sockets_.insert(client);
-    }
     try {
-      std::thread([this, client] {
-        serve_client(client);
-        shutdown_socket(client);
-        close_socket(client);
-        {
-          std::lock_guard lock(clients_mutex_);
-          client_sockets_.erase(client);
-        }
-        clients_stopped_.notify_all();
-      }).detach();
-    } catch (...) {
-      {
-        std::lock_guard lock(clients_mutex_);
-        client_sockets_.erase(client);
+      set_socket_nonblocking(client, true);
+    } catch (const std::exception&) {
+      shutdown_socket(client);
+      close_socket(client);
+      continue;
+    }
+    if (!try_register_client(client, socket_peer_address(client))) {
+      try {
+        send_http_response_until(
+            client,
+            ServerResponse::json(503, {{"error", "HTTP connection budget exhausted"}}),
+            std::chrono::steady_clock::now() + connection_limits_.overload_write_timeout);
+      } catch (const std::exception&) {
       }
       shutdown_socket(client);
       close_socket(client);
-      throw;
+      continue;
+    }
+    try {
+      std::thread([this, client] {
+        try {
+          serve_client(client);
+        } catch (const std::exception&) {
+        }
+        shutdown_socket(client);
+        close_socket(client);
+        unregister_client(client);
+      }).detach();
+    } catch (...) {
+      shutdown_socket(client);
+      close_socket(client);
+      unregister_client(client);
     }
   }
 }

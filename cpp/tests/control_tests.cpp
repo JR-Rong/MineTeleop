@@ -5,6 +5,7 @@
 #include "mine_teleop/server.hpp"
 
 #include <arpa/inet.h>
+#include <cerrno>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -162,6 +163,49 @@ std::string raw_http_exchange(std::uint16_t port, std::string_view request) {
     ::close(socket);
     throw;
   }
+}
+
+int raw_http_connect(std::uint16_t port) {
+  const int socket = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (socket < 0) throw std::runtime_error("raw HTTP test socket failed");
+  try {
+    timeval timeout{2, 0};
+    ::setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::connect(socket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
+      throw std::runtime_error("raw HTTP test connect failed");
+    }
+    return socket;
+  } catch (...) {
+    ::close(socket);
+    throw;
+  }
+}
+
+std::string raw_receive_until_close(int socket) {
+  std::string response;
+  std::array<char, 4096> buffer{};
+  while (true) {
+    const auto received = ::recv(socket, buffer.data(), buffer.size(), 0);
+    if (received == 0) return response;
+    if (received < 0) {
+      if (errno == EINTR) continue;
+      throw std::runtime_error("raw HTTP test receive failed");
+    }
+    response.append(buffer.data(), static_cast<std::size_t>(received));
+  }
+}
+
+std::string raw_receive_http_headers(int socket) {
+  std::string headers;
+  while (headers.find("\r\n\r\n") == std::string::npos) {
+    headers += raw_receive_exact(socket, 1);
+    if (headers.size() > 64 * 1024) throw std::runtime_error("raw HTTP response headers are too large");
+  }
+  return headers;
 }
 
 struct RawWebSocketFrame {
@@ -339,6 +383,274 @@ void test_loopback_http_server_and_port_conflict() {
   }
   first.stop();
   expect(conflict_reported, "occupied control port did not produce a clear bind error");
+}
+
+void test_http_connection_budget_deadlines_and_framing() {
+  mine_teleop::SimpleHttpServer::ConnectionLimits limits;
+  limits.max_active_connections = 4;
+  limits.max_pending_http_connections = 2;
+  limits.max_websocket_connections = 2;
+  limits.max_connections_per_source = 2;
+  limits.listen_backlog = 4;
+  limits.header_read_timeout = std::chrono::milliseconds(300);
+  limits.body_read_timeout = std::chrono::milliseconds(300);
+  limits.response_write_timeout = std::chrono::milliseconds(150);
+  limits.overload_write_timeout = std::chrono::milliseconds(50);
+  const auto handler = [](const mine_teleop::HttpRequest& request) {
+    return mine_teleop::ServerResponse::text(request.path == "/health" ? 200 : 404, "ok");
+  };
+  mine_teleop::SimpleHttpServer server("127.0.0.1", 0, handler, 1024, {}, limits);
+  server.start();
+
+  const auto request = [&](std::string_view wire) { return raw_http_exchange(server.port(), wire); };
+  expect(
+      request("GET /health HTTP/1.1\r\nHost: test\r\n\r\n").starts_with("HTTP/1.1 200 "),
+      "normal short HTTP request was rejected");
+  for (const auto& malformed : std::array<std::string, 7>{
+           "POST /health HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n",
+           "POST /health HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
+           "POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\ncontent-length: 0\r\n\r\n",
+           "POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: 1, 1\r\n\r\n",
+           "POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: +1\r\n\r\n",
+           "POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: 184467440737095516160\r\n\r\n",
+           "GET /health HTTP/1.2\r\nHost: test\r\n\r\n"}) {
+    expect(
+        request(malformed).starts_with("HTTP/1.1 400 "),
+        "malformed HTTP framing or version was not rejected");
+  }
+  expect(
+      request("POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: 1025\r\n\r\n").starts_with("HTTP/1.1 413 "),
+      "oversized Content-Length was not rejected before body allocation");
+
+  const int held_one = raw_http_connect(server.port());
+  const int held_two = raw_http_connect(server.port());
+  const int rejected = raw_http_connect(server.port());
+  const auto overload = raw_receive_until_close(rejected);
+  ::close(rejected);
+  expect(overload.starts_with("HTTP/1.1 503 "), "connection budget did not reject excess pre-auth HTTP clients");
+  ::close(held_one);
+  ::close(held_two);
+
+  bool capacity_released = false;
+  const auto release_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < release_deadline) {
+    const auto response = request("GET /health HTTP/1.1\r\nHost: test\r\n\r\n");
+    if (response.starts_with("HTTP/1.1 200 ")) {
+      capacity_released = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  expect(capacity_released, "closed clients did not release their connection budget");
+
+  const int slow_header = raw_http_connect(server.port());
+  raw_send_all(slow_header, "GET /health HTTP/1.1\r\nHost: test\r\nX-Slow: ");
+  std::this_thread::sleep_for(std::chrono::milliseconds(70));
+  raw_send_all(slow_header, "a");
+  std::this_thread::sleep_for(std::chrono::milliseconds(70));
+  raw_send_all(slow_header, "b");
+  std::this_thread::sleep_for(std::chrono::milliseconds(280));
+  const auto slow_header_response = raw_receive_until_close(slow_header);
+  ::close(slow_header);
+  expect(
+      slow_header_response.starts_with("HTTP/1.1 408 "),
+      "slow-drip HTTP headers exceeded an idle interval but not the absolute deadline");
+
+  const int slow_body = raw_http_connect(server.port());
+  raw_send_all(
+      slow_body,
+      "POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\na");
+  std::this_thread::sleep_for(std::chrono::milliseconds(70));
+  raw_send_all(slow_body, "b");
+  std::this_thread::sleep_for(std::chrono::milliseconds(70));
+  raw_send_all(slow_body, "c");
+  std::this_thread::sleep_for(std::chrono::milliseconds(280));
+  const auto slow_body_response = raw_receive_until_close(slow_body);
+  ::close(slow_body);
+  expect(slow_body_response.starts_with("HTTP/1.1 408 "), "slow-drip HTTP body ignored its absolute deadline");
+
+  const int held_for_stop = raw_http_connect(server.port());
+  const auto stop_started_at = std::chrono::steady_clock::now();
+  server.stop();
+  const auto stop_elapsed = std::chrono::steady_clock::now() - stop_started_at;
+  ::close(held_for_stop);
+  expect(stop_elapsed < std::chrono::seconds(1), "HTTP stop did not wake a pending client read promptly");
+
+  auto write_limits = limits;
+  write_limits.max_active_connections = 2;
+  write_limits.max_pending_http_connections = 1;
+  write_limits.max_websocket_connections = 0;
+  write_limits.max_connections_per_source = 2;
+  write_limits.response_write_timeout = std::chrono::milliseconds(150);
+  mine_teleop::SimpleHttpServer write_server(
+      "127.0.0.1",
+      0,
+      [](const mine_teleop::HttpRequest& request) {
+        if (request.path == "/large") {
+          return mine_teleop::ServerResponse::text(200, std::string(4 * 1024 * 1024, 'x'));
+        }
+        return mine_teleop::ServerResponse::text(200, "ok");
+      },
+      1024,
+      {},
+      write_limits);
+  write_server.start();
+  const int stalled_reader = raw_http_connect(write_server.port());
+  int receive_buffer = 1024;
+  static_cast<void>(::setsockopt(
+      stalled_reader, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer)));
+  raw_send_all(stalled_reader, "GET /large HTTP/1.1\r\nHost: test\r\n\r\n");
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  const auto after_stalled_write = raw_http_exchange(
+      write_server.port(), "GET /health HTTP/1.1\r\nHost: test\r\n\r\n");
+  ::close(stalled_reader);
+  write_server.stop();
+  expect(
+      after_stalled_write.starts_with("HTTP/1.1 200 "),
+      "a non-reading HTTP peer retained the only pending request slot past the write deadline");
+}
+
+void test_websocket_connection_budget_transition() {
+  mine_teleop::SimpleHttpServer::ConnectionLimits limits;
+  limits.max_active_connections = 4;
+  limits.max_pending_http_connections = 1;
+  limits.max_websocket_connections = 1;
+  limits.max_connections_per_source = 3;
+  limits.header_read_timeout = std::chrono::milliseconds(500);
+  limits.body_read_timeout = std::chrono::milliseconds(500);
+  std::atomic<int> normal_handler_calls{0};
+  std::atomic<int> websocket_handler_calls{0};
+  std::atomic<bool> release_websocket{false};
+  const auto websocket_handler_for = [](std::atomic<bool>& release, std::atomic<int>* calls) {
+    return [&release, calls](mine_teleop::SocketHandle socket, const mine_teleop::HttpRequest& request) {
+      if (request.path != "/ws") return false;
+      if (calls != nullptr) ++*calls;
+      raw_send_all(
+          static_cast<int>(socket),
+          "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+      while (!release.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      return true;
+    };
+  };
+  mine_teleop::SimpleHttpServer server(
+      "127.0.0.1",
+      0,
+      [&](const mine_teleop::HttpRequest&) {
+        ++normal_handler_calls;
+        return mine_teleop::ServerResponse::text(200, "normal");
+      },
+      1024,
+      websocket_handler_for(release_websocket, &websocket_handler_calls),
+      limits);
+  struct ReleaseWebSocketOnExit final {
+    std::atomic<bool>& value;
+    ~ReleaseWebSocketOnExit() { value.store(true, std::memory_order_release); }
+  } release_on_exit{release_websocket};
+  server.start();
+
+  const auto open_upgrade = [&](std::uint16_t port) {
+    const int socket = raw_http_connect(port);
+    raw_send_all(
+        socket,
+        "GET /ws HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+    return socket;
+  };
+
+  const int upgraded = open_upgrade(server.port());
+  expect(
+      raw_receive_http_headers(upgraded).starts_with("HTTP/1.1 101 "),
+      "test WebSocket upgrade was not accepted");
+  expect(normal_handler_calls == 0, "successful WebSocket upgrade invoked the normal HTTP handler");
+  expect(
+      raw_http_exchange(server.port(), "GET /health HTTP/1.1\r\nHost: test\r\n\r\n")
+          .starts_with("HTTP/1.1 200 "),
+      "upgraded WebSocket did not release the pending HTTP budget for a short request");
+  expect(normal_handler_calls == 1, "ordinary HTTP request was not routed exactly once");
+
+  const int websocket_overflow = open_upgrade(server.port());
+  const auto websocket_overflow_response = raw_receive_until_close(websocket_overflow);
+  ::close(websocket_overflow);
+  expect(
+      websocket_overflow_response.starts_with("HTTP/1.1 503 "),
+      "WebSocket-specific connection budget was not enforced");
+  expect(
+      websocket_handler_calls == 1 && normal_handler_calls == 1,
+      "WebSocket budget exhaustion reached an upgrade or normal handler unexpectedly");
+
+  // The rejected upgrade closes in its worker before the next admission check;
+  // allow its bounded teardown to release its pre-upgrade accounting slot.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  release_websocket.store(true, std::memory_order_release);
+  ::close(upgraded);
+  server.stop();
+
+  auto source_limits = limits;
+  source_limits.max_active_connections = 3;
+  source_limits.max_pending_http_connections = 2;
+  source_limits.max_connections_per_source = 2;
+  std::atomic<bool> release_source_websocket{false};
+  mine_teleop::SimpleHttpServer source_server(
+      "127.0.0.1",
+      0,
+      [](const mine_teleop::HttpRequest&) { return mine_teleop::ServerResponse::text(200, "normal"); },
+      1024,
+      websocket_handler_for(release_source_websocket, nullptr),
+      source_limits);
+  ReleaseWebSocketOnExit release_source_on_exit{release_source_websocket};
+  source_server.start();
+  const int source_upgraded = open_upgrade(source_server.port());
+  expect(
+      raw_receive_http_headers(source_upgraded).starts_with("HTTP/1.1 101 "),
+      "source-budget test WebSocket upgrade was not accepted");
+  const int source_held = raw_http_connect(source_server.port());
+  const int source_overflow = raw_http_connect(source_server.port());
+  const auto source_overflow_response = raw_receive_until_close(source_overflow);
+  ::close(source_overflow);
+  expect(
+      source_overflow_response.starts_with("HTTP/1.1 503 "),
+      "upgraded WebSocket was not included in the per-source connection budget");
+  ::close(source_held);
+  release_source_websocket.store(true, std::memory_order_release);
+  ::close(source_upgraded);
+  source_server.stop();
+
+  auto total_limits = limits;
+  total_limits.max_active_connections = 3;
+  total_limits.max_pending_http_connections = 2;
+  total_limits.max_connections_per_source = 4;
+  std::atomic<bool> release_total_websocket{false};
+  mine_teleop::SimpleHttpServer total_server(
+      "127.0.0.1",
+      0,
+      [](const mine_teleop::HttpRequest&) { return mine_teleop::ServerResponse::text(200, "normal"); },
+      1024,
+      websocket_handler_for(release_total_websocket, nullptr),
+      total_limits);
+  struct ReleaseTotalWebSocketOnExit final {
+    std::atomic<bool>& value;
+    ~ReleaseTotalWebSocketOnExit() { value.store(true, std::memory_order_release); }
+  } release_total_on_exit{release_total_websocket};
+  total_server.start();
+  const int total_upgraded = open_upgrade(total_server.port());
+  expect(
+      raw_receive_http_headers(total_upgraded).starts_with("HTTP/1.1 101 "),
+      "total-budget test WebSocket upgrade was not accepted");
+  const int total_held_one = raw_http_connect(total_server.port());
+  const int total_held_two = raw_http_connect(total_server.port());
+  const int total_overflow = raw_http_connect(total_server.port());
+  const auto total_overflow_response = raw_receive_until_close(total_overflow);
+  ::close(total_overflow);
+  expect(
+      total_overflow_response.starts_with("HTTP/1.1 503 "),
+      "upgraded WebSocket was not included in the total connection budget");
+  ::close(total_held_one);
+  ::close(total_held_two);
+  release_total_websocket.store(true, std::memory_order_release);
+  ::close(total_upgraded);
+  total_server.stop();
 }
 
 void test_signaling_time_sync_applies_backward_utc_correction() {
@@ -6507,6 +6819,8 @@ int main() {
   std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"shared_control_protocol_vector", test_shared_control_protocol_vector},
       {"loopback_http_server_and_port_conflict", test_loopback_http_server_and_port_conflict},
+      {"http_connection_budget_deadlines_and_framing", test_http_connection_budget_deadlines_and_framing},
+      {"websocket_connection_budget_transition", test_websocket_connection_budget_transition},
       {"signaling_time_sync_applies_backward_utc_correction",
        test_signaling_time_sync_applies_backward_utc_correction},
       {"driver_time_sync_uncertainty_fails_closed_at_production_default",

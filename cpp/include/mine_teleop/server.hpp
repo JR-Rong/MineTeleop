@@ -52,12 +52,39 @@ class SimpleHttpServer {
   using Handler = std::function<ServerResponse(const HttpRequest&)>;
   using WebSocketHandler = std::function<bool(SocketHandle, const HttpRequest&)>;
 
+  // The HTTP listener has no application-side wait queue: accepted sockets
+  // either reserve one of these bounded slots or are rejected immediately.
+  // A WSS connection moves out of the short-lived HTTP budget after its
+  // upgrade request is parsed, while remaining within the total connection
+  // budget for its whole lifetime.
+  struct ConnectionLimits {
+    std::size_t max_active_connections{64};
+    std::size_t max_pending_http_connections{16};
+    std::size_t max_websocket_connections{48};
+    // A trusted reverse proxy can legitimately concentrate several browser and
+    // vehicle WSS channels on one peer address, so the default stays well
+    // above a single control session while remaining below the global cap.
+    std::size_t max_connections_per_source{48};
+    int listen_backlog{64};
+    std::chrono::milliseconds header_read_timeout{std::chrono::seconds(5)};
+    std::chrono::milliseconds body_read_timeout{std::chrono::seconds(10)};
+    std::chrono::milliseconds response_write_timeout{std::chrono::seconds(5)};
+    std::chrono::milliseconds overload_write_timeout{std::chrono::milliseconds(100)};
+  };
+
   SimpleHttpServer(
       std::string host,
       std::uint16_t port,
       Handler handler,
       std::size_t max_body_bytes = 8 * 1024 * 1024,
       WebSocketHandler websocket_handler = {});
+  SimpleHttpServer(
+      std::string host,
+      std::uint16_t port,
+      Handler handler,
+      std::size_t max_body_bytes,
+      WebSocketHandler websocket_handler,
+      ConnectionLimits connection_limits);
   ~SimpleHttpServer();
 
   SimpleHttpServer(const SimpleHttpServer&) = delete;
@@ -70,17 +97,26 @@ class SimpleHttpServer {
 
  private:
   void open_listener();
-  void serve_client(SocketHandle client_fd) const;
+  void serve_client(SocketHandle client_fd);
+  [[nodiscard]] bool try_register_client(SocketHandle client_fd, std::string source);
+  [[nodiscard]] bool try_promote_client_to_websocket(SocketHandle client_fd);
+  [[nodiscard]] bool try_demote_client_from_websocket(SocketHandle client_fd);
+  void unregister_client(SocketHandle client_fd);
 
   std::string host_;
   std::uint16_t requested_port_;
   Handler handler_;
   std::size_t max_body_bytes_;
   WebSocketHandler websocket_handler_;
+  ConnectionLimits connection_limits_;
   std::atomic<bool> stopping_{false};
   mutable std::mutex clients_mutex_;
   mutable std::condition_variable clients_stopped_;
   std::unordered_set<SocketHandle> client_sockets_;
+  std::unordered_set<SocketHandle> websocket_sockets_;
+  std::unordered_map<SocketHandle, std::string> client_sources_;
+  std::unordered_map<std::string, std::size_t> connections_by_source_;
+  std::size_t pending_http_connections_{0};
   std::atomic<SocketHandle> listener_fd_{kInvalidSocket};
   std::uint16_t bound_port_{0};
   std::thread thread_;
