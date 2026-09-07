@@ -1,4 +1,5 @@
 #include "global_variables.h"
+#include "mine_teleop/vcu.hpp"
 #include "mine_teleop_chassis_bridge.h"
 
 #include <nlohmann/json.hpp>
@@ -479,6 +480,8 @@ std::size_t count_logged_events(
   }
   return count;
 }
+
+#include "chassis_bridge_transition_deadline_tests.hpp"
 
 }  // namespace
 
@@ -2507,6 +2510,9 @@ int main() {
             revoked_event->value("stop_reason", "") == "handshake_revoked",
         "handshake revoke diagnostic was missing, duplicated, or incomplete");
     std::filesystem::remove(physical_log_path, error);
+
+    test_transition_deadline_supervisor_boundaries();
+    test_wait_gear_transition_timeout_preserves_staged_disarm();
 
     std::cout << "chassis_bridge_diagnostics_smoke=passed\n";
     return 0;

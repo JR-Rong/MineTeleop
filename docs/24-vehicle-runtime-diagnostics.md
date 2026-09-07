@@ -295,6 +295,7 @@ stale 非零丢弃和严格零值 stale heartbeat 接受/拒绝计数；
 | `vmc_fault_code_changed` / `vcu_vmc_fault_code_changed` | `0x18F2F5D0` 中 `WVCU_VMCFltCode` 首次可用或发生变化 | `previous_valid`、`previous_vmc_fault_code`、`vmc_fault_code`；非零时按整车厂故障码表排查，本事件本身不自动触发停车 |
 | `feedback_timeout` / `vcu_critical_feedback_timeout` | Ready 后 29 个关键 ID 任一超过 500 ms | `stale_ids` 与逐 ID `age_ms`；锁存故障并全停 |
 | `arming_feedback_timeout` / `vcu_arming_feedback_timeout` | 握手某阶段必需反馈未在 500 ms 入口宽限内保持新鲜 | 全停并记录当前 `state`、`stale_ids` 和逐 ID `age_ms`；先断开完成 `Disarmed`，再从页面重新连接 |
+| `transition_timeout` / `vcu_transition_timeout` | 某个握手或分步退出阶段的反馈持续新鲜、但在该状态 transition epoch 的单调 deadline 内始终未达到目标 | 记录 `state`、`state_transition_epoch`、`state_entry_generation`、`elapsed_ms`/`limit_ms`、`expected`、`observed`、`missing_or_mismatched` 和停车来源；撤销牵引/profile 后复用零扭矩、停稳、N、EPB 驻车、人工状态的分步退出，绝不因未知车速跳过停稳换挡 |
 | `can_send_failed` / `socketcan_send_failed` | 连续 3 个 TX 周期有发送失败 | errno、失败 ID；锁存故障并全停 |
 | `tx_deadline_miss` / `vcu_tx_deadline_missed` | 20 ms 调度 deadline 落后 | 每秒至多一次，含 `lag_ms` |
 | `io_thread_exception` / `vcu_io_thread_exception` | I/O 线程标准异常 | 原始 exception；本地全停 |
@@ -315,6 +316,7 @@ stale 非零丢弃和严格零值 stale heartbeat 接受/拒绝计数；
 | `parallel_handshake_rejected` / `vcu_handshake_gate_rejected` | N/零速/电子驻车/manual state/新鲜度任一不满足 | 日志记录全部 gate 值 |
 | `parallel_handshake_requested` / `vcu_handshake_requested` | 请求被接受 | 仍停车直至 Ready |
 | `arming_feedback_timeout_recovered` / `vcu_arming_feedback_timeout_recovered` | 上一次握手阶段反馈超时，用户完成断开且车辆回到 `Disarmed` 后，新鲜驻车 gate 通过并接受新页面握手请求 | 清除仅属于该握手超时的 I/O 锁存，继续停车直至新握手 Ready；其他 I/O 故障不借此清除 |
+| `transition_timeout_recovered` / `vcu_transition_timeout_recovered` | 阶段 deadline 后完成 `Disarmed`、新鲜 N/零速/EPB 驻车/manual gate 通过，并由用户显式重新下发当前 runtime profile | 只清除该阶段超时锁存，仍保持停车；必须继续由页面显式请求新握手，旧输入或随后重复反馈不能自动恢复牵引 |
 | `handshake_revoked` / `vcu_handshake_revoked` | 握手状态 5 已被接受，但在驻车释放/挡位/执行器准备或 Ready 阶段收到新的状态 3；同批后续状态 5 不清除锁存 | 立即撤销握手请求并安全退出；记录 `revoked_handshake_status`、`vmc_fault_code`、四路 EPB、`parking_brake_switch`、`brake_pedal_switch` 及停车来源，必须在页面重新申请握手 |
 | `vehicle_vcu_handshake_state_changed` / `vcu_handshake_state_changed` | browser 可见握手状态变化 | stdout 只在状态变化时输出 |
 | `control_apply_rejected` / `vcu_control_runtime_unavailable` | runtime/I/O fault 阻止控制 | 本地全停 |
