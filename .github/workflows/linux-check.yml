@@ -1,0 +1,185 @@
+name: Linux Docker check
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/linux-check.yml"
+      - ".dockerignore"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "configs/**"
+      - "cpp/**"
+      - "deployments/**"
+      - "protocol/**"
+      - "scripts/**"
+      - "vendor/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/linux-check.yml"
+      - ".dockerignore"
+      - "CMakeLists.txt"
+      - "cmake/**"
+      - "configs/**"
+      - "cpp/**"
+      - "deployments/**"
+      - "protocol/**"
+      - "scripts/**"
+      - "vendor/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-docker-check-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-check:
+    name: Linux amd64 Docker check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      MINE_TELEOP_CHECK_PLATFORM: linux/amd64
+      MINE_TELEOP_BUILD_JOBS: "2"
+      DOCKER_BUILDKIT: "1"
+      BUILDKIT_PROGRESS: plain
+
+    steps:
+      - name: Check out MineTeleop
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Go for the pinned yq v4 fixture
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.12"
+          check-latest: false
+
+      - name: Record Linux check inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          CI_LOG_DIR="$RUNNER_TEMP/mine-teleop-linux-check"
+          CI_TOOL_DIR="$RUNNER_TEMP/mine-teleop-linux-tools"
+          printf 'CI_LOG_DIR=%s\n' "$CI_LOG_DIR" >> "$GITHUB_ENV"
+          printf 'CI_TOOL_DIR=%s\n' "$CI_TOOL_DIR" >> "$GITHUB_ENV"
+          mkdir -p "$CI_LOG_DIR"
+          case "$(docker info --format '{{.Architecture}}')" in
+            amd64|x86_64) ;;
+            *)
+              printf 'The Linux Docker check requires an amd64 runner, got: %s\n' \
+                "$(docker info --format '{{.Architecture}}')" >&2
+              exit 1
+              ;;
+          esac
+          {
+            printf 'commit='; git rev-parse HEAD
+            printf 'requested_platform=%s\n' "$MINE_TELEOP_CHECK_PLATFORM"
+            printf 'build_jobs=%s\n' "$MINE_TELEOP_BUILD_JOBS"
+            printf 'runner_architecture=%s\n' "$(uname -m)"
+            printf 'docker_architecture=%s\n' "$(docker info --format '{{.Architecture}}')"
+            docker version --format 'docker_client={{.Client.Version}} docker_server={{.Server.Version}}'
+            printf 'bash='; bash --version | sed -n '1p'
+            printf 'go='; go version
+            printf 'node='; node --version
+            printf 'python='; python3 --version
+          } | tee "$CI_LOG_DIR/environment.log"
+
+      - name: Install admin YAML test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends python3-yaml
+          python3 -c 'import yaml; print(f"PyYAML={yaml.__version__}")'
+          mkdir -p "$CI_TOOL_DIR"
+          GOBIN="$CI_TOOL_DIR" go install github.com/mikefarah/yq/v4@v4.44.3
+          "$CI_TOOL_DIR/yq" --version | tee "$CI_LOG_DIR/yq-version.log"
+          "$CI_TOOL_DIR/yq" --version | grep -Eq 'version v4\.'
+
+      - name: Run the admin yq v4 fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATH="$CI_TOOL_DIR:$PATH" bash scripts/test/check_admin_credentials.sh 2>&1 | \
+            tee "$CI_LOG_DIR/admin-credentials-yq.log"
+          grep -Fx 'admin_credentials_test=passed' "$CI_LOG_DIR/admin-credentials-yq.log"
+
+      - name: Run the required admin PyYAML fallback fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$CI_TOOL_DIR/without-yq"
+          printf '#!/usr/bin/env bash\nexit 1\n' > "$CI_TOOL_DIR/without-yq/yq"
+          chmod 0755 "$CI_TOOL_DIR/without-yq/yq"
+          PATH="$CI_TOOL_DIR/without-yq:$PATH" bash scripts/test/check_admin_credentials.sh 2>&1 | \
+            tee "$CI_LOG_DIR/admin-credentials.log"
+          grep -Fx 'admin_credentials_test=passed' "$CI_LOG_DIR/admin-credentials.log"
+
+      - name: Run the canonical Linux Docker check
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test/check.sh 2>&1 | tee "$CI_LOG_DIR/docker-check.log"
+
+      - name: Record registered Docker CTest tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --platform "$MINE_TELEOP_CHECK_PLATFORM" \
+            --entrypoint /bin/sh mine-teleop-cpp-check:local-build -ec '
+              printf "node="; node --version
+              printf "compiler="; c++ --version | sed -n "1p"
+              ctest --version | sed -n "1p"
+              ctest --test-dir /tmp/mine-teleop-build -N
+            ' 2>&1 | tee "$CI_LOG_DIR/ctest-registration.log"
+
+      - name: Summarize Docker CTest output
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf '### Linux Docker check\n\n'
+            printf 'Commit: %s\n' "$(git rev-parse HEAD)"
+            printf 'Requested platform: %s; build jobs: %s\n' \
+              "$MINE_TELEOP_CHECK_PLATFORM" "$MINE_TELEOP_BUILD_JOBS"
+            if [[ -f "$CI_LOG_DIR/docker-check.log" ]]; then
+              printf '%s\n' '- Canonical scripts/test/check.sh CTest lines:'
+              printf '\n```text\n'
+              grep -E '([0-9]+% tests passed|[0-9]+ tests passed out of|\*\*\*(Failed|Skipped|Timeout))' \
+                "$CI_LOG_DIR/docker-check.log" || true
+              printf '```\n'
+            else
+              printf '%s\n' '- The canonical Docker check did not start; see the failure artifact.'
+            fi
+            if [[ -f "$CI_LOG_DIR/admin-credentials.log" ]]; then
+              printf '%s\n' '- The yq v4 and PyYAML fallback fixtures run separately from Docker and must pass.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect failed Docker diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$CI_LOG_DIR"
+          {
+            printf 'commit='; git rev-parse HEAD
+            docker version
+            docker image ls --digests --no-trunc
+          } >"$CI_LOG_DIR/docker-diagnostics.log" 2>&1 || true
+
+      - name: Upload failed Linux Docker and CTest logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mine-teleop-linux-check-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mine-teleop-linux-check
+          if-no-files-found: error
+          retention-days: 14
