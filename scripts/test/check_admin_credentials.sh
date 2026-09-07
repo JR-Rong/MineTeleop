@@ -83,6 +83,26 @@ expected_external_secret="$external_secret_dir/vehicle-external-yaml-dry-run.tok
   exit 2
 }
 
+ln -s /definitely-not-a-mine-teleop-secret "$secrets_dir/driver-dangling-link.password"
+if MINE_TELEOP_SIGNALING_SERVER_BIN="$validator_ok" \
+  "$repo_root/scripts/admin/add_driver.sh" \
+    --id driver-dangling-link \
+    --config "$fixture_config" \
+    --vehicles vehicle-001 \
+    --secrets-dir "$secrets_dir" \
+    >/dev/null 2>&1; then
+  printf 'add_driver replaced a dangling credential symlink\n' >&2
+  exit 2
+fi
+[[ -L "$secrets_dir/driver-dangling-link.password" ]] || {
+  printf 'add_driver changed a dangling credential symlink after rejection\n' >&2
+  exit 2
+}
+cmp -s "$fixture_config" "$original_config" || {
+  printf 'add_driver changed the config while rejecting a dangling credential symlink\n' >&2
+  exit 2
+}
+
 MINE_TELEOP_SIGNALING_SERVER_BIN="$validator_ok" \
   "$repo_root/scripts/admin/add_driver.sh" \
     --id driver-credential-applied \

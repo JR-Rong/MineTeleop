@@ -233,7 +233,10 @@ done
 password_path="$secrets_dir/$driver_id.password"
 password_hash_path="$secrets_dir/$driver_id.password.argon2id"
 for credential_path in "$password_path" "$password_hash_path"; do
-  if [[ -e "$credential_path" ]]; then
+  # -e does not detect a dangling symlink. Treat every link as an existing
+  # credential target so an explicit secrets directory cannot redirect a
+  # generated password or verifier during publication.
+  if [[ -e "$credential_path" || -L "$credential_path" ]]; then
     die "credential file already exists: $credential_path
         refusing to overwrite an existing credential; remove or rename it first"
   fi
