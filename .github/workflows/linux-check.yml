@@ -7,10 +7,12 @@ on:
       - ".github/workflows/linux-check.yml"
       - ".dockerignore"
       - "CMakeLists.txt"
+      - "CMakePresets.json"
       - "cmake/**"
       - "configs/**"
       - "cpp/**"
       - "deployments/**"
+      - "docs/BUILD.md"
       - "protocol/**"
       - "scripts/**"
       - "vendor/**"
@@ -21,10 +23,12 @@ on:
       - ".github/workflows/linux-check.yml"
       - ".dockerignore"
       - "CMakeLists.txt"
+      - "CMakePresets.json"
       - "cmake/**"
       - "configs/**"
       - "cpp/**"
       - "deployments/**"
+      - "docs/BUILD.md"
       - "protocol/**"
       - "scripts/**"
       - "vendor/**"
@@ -49,13 +53,15 @@ jobs:
 
     steps:
       - name: Check out MineTeleop
-        uses: actions/checkout@v4
+        # actions/checkout v4.4.0; update through Dependabot and verify the commit.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Set up Go for the pinned yq v4 fixture
-        uses: actions/setup-go@v5
+        # actions/setup-go v5.6.0; update through Dependabot and verify the commit.
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: "1.22.12"
           check-latest: false
@@ -127,6 +133,40 @@ jobs:
           set -euo pipefail
           bash scripts/test/check.sh 2>&1 | tee "$CI_LOG_DIR/docker-check.log"
 
+      - name: Verify target hardening and record build provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_id=""
+          cleanup() {
+            if [[ -n "$container_id" ]]; then
+              docker rm -f "$container_id" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+          container_id="$(docker create --platform "$MINE_TELEOP_CHECK_PLATFORM" \
+            -e "MINE_TELEOP_SOURCE_REVISION=$(git rev-parse HEAD)" \
+            --entrypoint /bin/bash mine-teleop-cpp-check:local-build -lc '
+              /src/scripts/build/verify_build_provenance.sh \
+                --source-dir /src \
+                --source-revision "$MINE_TELEOP_SOURCE_REVISION" \
+                --build-dir /tmp/mine-teleop-build \
+                --output-dir /tmp/mine-teleop-build-provenance \
+                --dynamic-elf /opt/mine-teleop/bin/mine-teleop \
+                --dynamic-elf /opt/mine-teleop/bin/mine-teleop-control \
+                --dynamic-elf /opt/mine-teleop/bin/mine-teleop-signaling-server \
+                --dynamic-elf /opt/mine-teleop/bin/mine-teleop-aravis-camera \
+                --static-elf /opt/mine-teleop/bin/mine-teleop-run \
+                --artifact /opt/mine-teleop/bin/mine-teleop \
+                --artifact /opt/mine-teleop/bin/mine-teleop-run
+            ')"
+          docker start --attach "$container_id" 2>&1 | tee "$CI_LOG_DIR/hardening-provenance.log"
+          docker cp "$container_id:/tmp/mine-teleop-build-provenance/." \
+            "$CI_LOG_DIR/hardening-provenance"
+          docker rm "$container_id" >/dev/null
+          container_id=""
+          trap - EXIT
+
       - name: Record registered Docker CTest tests
         shell: bash
         run: |
@@ -177,9 +217,20 @@ jobs:
 
       - name: Upload failed Linux Docker and CTest logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        # actions/upload-artifact v4.6.2; update through Dependabot and verify the commit.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: mine-teleop-linux-check-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/mine-teleop-linux-check
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build hardening evidence
+        if: always()
+        # actions/upload-artifact v4.6.2; update through Dependabot and verify the commit.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mine-teleop-build-provenance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mine-teleop-linux-check/hardening-provenance
+          if-no-files-found: warn
           retention-days: 14

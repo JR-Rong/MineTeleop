@@ -15,6 +15,68 @@
 所有构建脚本都会同时生成 `.sha256` 文件。安装包不包含司机密码、车辆
 device token 或 TURN shared secret。
 
+## 构建强化与可追溯证据
+
+Release、车端 static launcher 和 sanitizer 是三种不同的构建角色，不能把它们
+混为一个“更安全”的配置：
+
+- `linux-release` 构建可移植的控制端和信令服务，动态 ELF 需要验证 PIE、GNU
+  RELRO、BIND_NOW 与非可执行栈；
+- `linux-vehicle-release` 额外构建 Linux static `mine-teleop-run`。它仍接受
+  编译期 stack protector/FORTIFY，但没有动态加载器，因此不能要求 PIE/RELRO
+  这些动态 ELF 属性；
+- `linux-asan-ubsan` 仅用于带符号的测试构建，开启 ASan+UBSan 并禁止 sanitizer
+  error 后继续执行。它强制关闭 static launcher，绝不能作为车辆正式发布包。
+
+Linux 示例（需要可用的 CMake、C++ 编译器与联网的 pinned 依赖下载）：
+
+```bash
+cmake --preset linux-release
+cmake --build --preset linux-release
+ctest --preset linux-release
+
+scripts/build/verify_build_provenance.sh \
+  --build-dir build/linux-release \
+  --output-dir build/evidence/linux-release \
+  --dynamic-elf build/linux-release/mine-teleop-control \
+  --dynamic-elf build/linux-release/mine-teleop-signaling-server \
+  --artifact build/linux-release/mine-teleop-control
+```
+
+诊断构建使用独立 preset：
+
+```bash
+cmake --preset linux-asan-ubsan
+cmake --build --preset linux-asan-ubsan
+ctest --preset linux-asan-ubsan
+```
+
+车端 release 在具备 GStreamer/相机依赖的 Linux 构建环境中使用
+`linux-vehicle-release`。验收 static launcher 时把它明确传为 `--static-elf`，
+而不是把动态 ELF 规则套上去。TSan 没有提供 preset：第三方媒体、CURL、OpenSSL
+与 vendor bridge 尚未完成 TSan 兼容性验证，不能与 ASan 混开或冒充已覆盖。
+
+`scripts/build/verify_build_provenance.sh` 会固定顺序记录 source revision、dirty
+状态、CMake cache、编译器版本、Docker 内实际 `dpkg-query` 包版本、根依赖锁、Docker
+base-image lock、compile command 中的 hardening flags 和每个提交产物的 SHA-256。
+动态 PIE 与共享库会分别识别；`--check-lock` 不需要构建，可先
+验证所有 Dockerfile 是否仍与 `deployments/base-images.lock.env` 一致：
+
+```bash
+scripts/build/verify_build_provenance.sh --check-lock
+```
+
+该 lock 记录的是通过 `docker buildx imagetools inspect ubuntu:22.04` 核验过的
+OCI **index** digest，以及 amd64/arm64 manifest 证据；它不是凭空猜测的单架构
+digest。镜像更新时，重新核验 index、更新 lock 和 Dockerfile 默认值，并运行
+`--check-lock`、Linux Docker check 与目标平台构建。GitHub Actions 和 Docker
+更新由 `.github/dependabot.yml` 定期提出；安全修复仍应在常规周期之外优先处理。
+
+当前可声称的级别是“依赖可追踪”：证据包含源 SHA、依赖 lock、镜像 digest、
+编译器和产物 SHA-256。它**不**等于离线可重建（APT package index 和外部 source
+仍需归档/可用性验证），也不等于二进制逐字节可复现（时间戳、APT 解算和工具链
+环境尚未完全固定）。
+
 ## 2. Mac 构建机准备
 
 支持 Intel Mac 和 Apple Silicon Mac。需要：

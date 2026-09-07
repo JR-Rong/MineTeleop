@@ -40,6 +40,16 @@ package_name="mine-teleop-control-macos-${package_arch}-$(date -u +%Y%m%d-%H%M%S
 package_root="$build_root/$package_name"
 mkdir -p "$output_dir" "$package_root/bin" "$package_root/lib" "$package_root/config" \
   "$package_root/certs" "$package_root/protocol/v1"
+source_commit="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || printf unknown)"
+if git -C "$repo_root" status --porcelain >/dev/null 2>&1; then
+  if [[ -n "$(git -C "$repo_root" status --porcelain)" ]]; then
+    source_tree_state=dirty
+  else
+    source_tree_state=clean
+  fi
+else
+  source_tree_state=unavailable
+fi
 
 cmake_args=(
   -S "$repo_root"
@@ -85,10 +95,16 @@ install -m 0644 /etc/ssl/cert.pem "$package_root/certs/cacert.pem"
 cp -R "$repo_root/protocol/v1/." "$package_root/protocol/v1/"
 
 printf '%s\n' \
+  "source_commit=$source_commit" \
+  "source_tree_state=$source_tree_state" \
   "target_arch=$package_arch" \
   "host_arch=$host_machine_arch" \
   "runtime_tests_executed=$tests_executed" \
   "reused_build_dir=$reused_build_dir" \
+  'build_hardening=target-scoped' \
+  'reproducibility_level=dependency-traceable' \
+  'offline_rebuild=not-established' \
+  'bit_for_bit_reproducible=not-established' \
   "built_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   "code_signing=ad-hoc" \
   >"$package_root/BUILD-INFO.txt"

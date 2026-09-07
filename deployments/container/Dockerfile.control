@@ -1,4 +1,5 @@
-FROM ubuntu:22.04 AS build
+ARG MINE_TELEOP_UBUNTU_BASE=docker.io/library/ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
+FROM ${MINE_TELEOP_UBUNTU_BASE} AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -17,7 +18,7 @@ RUN cmake -S . -B /tmp/build \
     && cmake --build /tmp/build --parallel "$(nproc)" \
     && cmake --install /tmp/build
 
-FROM ubuntu:22.04
+FROM ${MINE_TELEOP_UBUNTU_BASE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \

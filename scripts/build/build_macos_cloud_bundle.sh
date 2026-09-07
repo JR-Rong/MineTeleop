@@ -3,6 +3,8 @@ set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
+# shellcheck disable=SC1090
+source "$repo_root/deployments/base-images.lock.env"
 run_tests="OFF"
 positional_args=()
 for argument in "$@"; do
@@ -47,8 +49,15 @@ docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
 
 mkdir -p "$(dirname "$output_root")"
 source_commit="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || printf unknown)"
-if [[ -n "$(git -C "$repo_root" status --porcelain 2>/dev/null || true)" ]]; then
-  source_commit="$source_commit-dirty"
+if git -C "$repo_root" status --porcelain >/dev/null 2>&1; then
+  if [[ -n "$(git -C "$repo_root" status --porcelain)" ]]; then
+    source_tree_state=dirty
+    source_commit="$source_commit-dirty"
+  else
+    source_tree_state=clean
+  fi
+else
+  source_tree_state=unavailable
 fi
 built_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -70,7 +79,7 @@ if [[ "$run_tests" == "ON" ]]; then
   COPYFILE_DISABLE=1 tar --no-xattrs -C "$temporary/artifact" -cf - . \
     | docker run --rm -i \
         --platform "$platform" \
-        ubuntu:22.04 \
+        "$MINE_TELEOP_UBUNTU_2204_REFERENCE" \
         bash -c '
           mkdir -p /opt/mine-teleop
           tar -C /opt/mine-teleop -xf -
@@ -79,6 +88,15 @@ if [[ "$run_tests" == "ON" ]]; then
 fi
 
 mv "$temporary/artifact" "$output_root"
+printf '%s\n' \
+  "source_tree_state=$source_tree_state" \
+  'build_hardening=target-scoped' \
+  "base_image_reference=$MINE_TELEOP_UBUNTU_2204_REFERENCE" \
+  "base_image_index_digest=$MINE_TELEOP_UBUNTU_2204_INDEX_DIGEST" \
+  'reproducibility_level=dependency-traceable' \
+  'offline_rebuild=not-established' \
+  'bit_for_bit_reproducible=not-established' \
+  >> "$output_root/BUILD-INFO.txt"
 
 archive="$output_root.tar.gz"
 COPYFILE_DISABLE=1 tar --no-xattrs \

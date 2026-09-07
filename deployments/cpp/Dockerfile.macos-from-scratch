@@ -2,8 +2,9 @@
 
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
+ARG MINE_TELEOP_UBUNTU_BASE=docker.io/library/ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
 
-FROM --platform=$TARGETPLATFORM ubuntu:22.04 AS target-deps
+FROM ${MINE_TELEOP_UBUNTU_BASE} AS target-deps
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -45,7 +46,7 @@ RUN printf '%s\n' \
 
 RUN pkg-config --print-errors --cflags --libs aravis-0.8
 
-FROM --platform=$BUILDPLATFORM ubuntu:22.04 AS cross-deps
+FROM --platform=$BUILDPLATFORM ${MINE_TELEOP_UBUNTU_BASE} AS cross-deps
 
 ARG DEBIAN_FRONTEND=noninteractive
 

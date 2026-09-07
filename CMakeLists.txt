@@ -5,7 +5,6 @@ project(mine_teleop VERSION 0.2.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(WIN32)
   set(MINE_TELEOP_VEHICLE_DEFAULT OFF)
@@ -29,6 +28,16 @@ option(MINE_TELEOP_BUILD_VEHICLE_RUNTIME "Build Linux vehicle media and packagin
 option(MINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES "Build camera bridges when bundled vendor SDKs are present" ON)
 option(MINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE "Build the lightweight Aravis USB3 Vision camera bridge" ON)
 option(MINE_TELEOP_FETCH_MISSING_DEPS "Fetch pinned yaml-cpp and nlohmann-json sources when absent" OFF)
+if(UNIX AND NOT APPLE)
+  set(MINE_TELEOP_STATIC_LAUNCHER_DEFAULT ON)
+else()
+  set(MINE_TELEOP_STATIC_LAUNCHER_DEFAULT OFF)
+endif()
+option(
+  MINE_TELEOP_STATIC_LAUNCHER
+  "Build mine-teleop-run as a Linux static executable"
+  ${MINE_TELEOP_STATIC_LAUNCHER_DEFAULT}
+)
 set(MINE_TELEOP_MVS_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/mvs" CACHE PATH "Bundled Hikrobot MVS SDK root")
 set(MINE_TELEOP_CURL_LINKAGE "unknown" CACHE STRING "How libcurl is linked into the control client")
 
@@ -50,6 +59,9 @@ elseif(MINE_TELEOP_NEEDS_ARGON2ID)
     "Argon2id is required to build the signaling server or native tests. Install the packaged Argon2 development dependency.")
 endif()
 
+if(MINE_TELEOP_STATIC_LAUNCHER AND NOT (UNIX AND NOT APPLE))
+  message(FATAL_ERROR "MINE_TELEOP_STATIC_LAUNCHER is supported only for Linux builds")
+endif()
 find_package(Threads REQUIRED)
 if(WIN32)
   find_package(ZLIB REQUIRED)
@@ -102,6 +114,13 @@ else()
 endif()
 include(GNUInstallDirs)
 include(cmake/SplitMsvcStringLiterals.cmake)
+include(cmake/Hardening.cmake)
+if(MINE_TELEOP_ENABLE_SANITIZERS AND MINE_TELEOP_STATIC_LAUNCHER AND
+   MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
+  message(FATAL_ERROR
+    "ASan/UBSan builds must set -DMINE_TELEOP_STATIC_LAUNCHER=OFF; "
+    "the static launcher cannot carry the sanitizer runtime.")
+endif()
 
 set(MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_logic.js")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}")
@@ -140,9 +159,11 @@ function(mine_teleop_enable_warnings target)
   else()
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror=return-type)
   endif()
+  mine_teleop_enable_target_hardening(${target} ${ARGN})
 endfunction()
 
 add_library(mine_teleop_vcu cpp/src/vcu.cpp)
+set_target_properties(mine_teleop_vcu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(mine_teleop_vcu
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>
@@ -160,6 +181,7 @@ add_library(mine_teleop_runtime
   "${MINE_TELEOP_GENERATED_SERVER_SOURCE}"
   cpp/src/websocket.cpp
 )
+set_target_properties(mine_teleop_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(mine_teleop_runtime
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>
@@ -239,6 +261,7 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
     cpp/src/video.cpp
     cpp/src/webrtc_media.cpp
   )
+  set_target_properties(mine_teleop_vehicle_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(mine_teleop_vehicle_runtime
     PUBLIC
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>
@@ -262,8 +285,12 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
 
   add_executable(mine-teleop-run cpp/apps/mine_teleop_launcher.cpp)
   target_include_directories(mine-teleop-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
-  mine_teleop_enable_warnings(mine-teleop-run)
-  target_link_options(mine-teleop-run PRIVATE -static)
+  if(MINE_TELEOP_STATIC_LAUNCHER)
+    target_link_options(mine-teleop-run PRIVATE -static)
+    mine_teleop_enable_warnings(mine-teleop-run STATIC_EXECUTABLE)
+  else()
+    mine_teleop_enable_warnings(mine-teleop-run)
+  endif()
 
   if(MINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE)
     pkg_check_modules(ARAVIS QUIET IMPORTED_TARGET aravis-0.8)
@@ -309,6 +336,7 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
           "${MINE_TELEOP_MVS_INCLUDE_DIR}"
       )
       target_link_libraries(mine-teleop-mvs-camera PRIVATE "${MINE_TELEOP_MVS_LIBRARY}")
+      mine_teleop_enable_warnings(mine-teleop-mvs-camera)
       set_target_properties(mine-teleop-mvs-camera PROPERTIES INSTALL_RPATH "$ORIGIN/../lib/vendor/mvs")
       install(TARGETS mine-teleop-mvs-camera RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
       install(DIRECTORY "${MINE_TELEOP_MVS_SDK_ROOT}/lib/" DESTINATION ${CMAKE_INSTALL_LIBDIR}/vendor/mvs
