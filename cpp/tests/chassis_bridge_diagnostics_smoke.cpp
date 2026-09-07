@@ -489,6 +489,10 @@ int main() {
   try {
     expect(
         mine_teleop_chassis_abi_version() == 6U &&
+            MINE_TELEOP_CHASSIS_STOP_REASON_ADAPTER_SAFETY_STATUS_UNAVAILABLE ==
+                24U &&
+            MINE_TELEOP_CHASSIS_STOP_REASON_VCU_TRANSITION_TIMEOUT == 25U &&
+            MINE_TELEOP_CHASSIS_STOP_REASON_LEGACY_UNSPECIFIED == 255U &&
             mine_teleop_chassis_open_config_v2_size() ==
                 sizeof(MineTeleopChassisOpenConfigV2) &&
             mine_teleop_chassis_open_config_v3_size() ==
@@ -1732,6 +1736,15 @@ int main() {
     expect(
         wait_for_handshake_state(MINE_TELEOP_VCU_FAULT),
         "post-Ready WaitActuatorModes did not retain the critical-feedback watchdog");
+    MineTeleopChassisTelemetry feedback_timeout_telemetry{};
+    expect(
+        mine_teleop_chassis_read_telemetry(&feedback_timeout_telemetry) == 0 &&
+            feedback_timeout_telemetry.estop == 1 &&
+            feedback_timeout_telemetry.stop_source ==
+                MINE_TELEOP_CHASSIS_STOP_SOURCE_WATCHDOG &&
+            feedback_timeout_telemetry.stop_reason ==
+                MINE_TELEOP_CHASSIS_STOP_REASON_FEEDBACK_TIMEOUT,
+        "actual stale critical feedback no longer exposes FEEDBACK_TIMEOUT provenance");
     const auto critical_frames = drain_can_frames(transport[1], 40);
     expect(
         can_signal(last_frame_with_id(critical_frames, 0x18F0D0F5U), 8, 14) ==

@@ -222,6 +222,15 @@ void test_wait_gear_transition_timeout_preserves_staged_disarm() {
     expect(
         entered_disarm_torque,
         "fresh-but-wrong gear feedback did not enter the torque-zero disarm phase");
+    MineTeleopChassisTelemetry transition_timeout_telemetry{};
+    expect(
+        mine_teleop_chassis_read_telemetry(&transition_timeout_telemetry) == 0 &&
+            transition_timeout_telemetry.estop == 1 &&
+            transition_timeout_telemetry.stop_source ==
+                MINE_TELEOP_CHASSIS_STOP_SOURCE_WATCHDOG &&
+            transition_timeout_telemetry.stop_reason ==
+                MINE_TELEOP_CHASSIS_STOP_REASON_VCU_TRANSITION_TIMEOUT,
+        "transition deadline expiry did not expose distinct watchdog provenance");
 
     const auto stop_frames = drain_can_frames(transport[1], 50);
     expect_all_motor_torque_raw(
@@ -296,6 +305,10 @@ void test_wait_gear_transition_timeout_preserves_staged_disarm() {
           timed_out->value("elapsed_ms", 0) >= timed_out->value("limit_ms", 1) &&
           timed_out->value("state_transition_epoch", 0ULL) > 0ULL &&
           timed_out->value("state_entry_generation", 0ULL) > 0ULL &&
+          timed_out->value("stop_source", "") == "watchdog" &&
+          timed_out->value("stop_reason", "") == "vcu_transition_timeout" &&
+          timed_out->value("stop_reason_id", 0U) ==
+              MINE_TELEOP_CHASSIS_STOP_REASON_VCU_TRANSITION_TIMEOUT &&
           timed_out->at("expected").value("gear", 0) == 3 &&
           timed_out->at("observed").value("gear", 0) == 1 &&
           std::find(

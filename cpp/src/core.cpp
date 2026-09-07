@@ -503,6 +503,8 @@ std::string bridge_stop_reason(std::uint32_t value) {
       return "can_feedback_missing";
     case VehicleStopReason::AdapterSafetyStatusUnavailable:
       return "adapter_safety_status_unavailable";
+    case VehicleStopReason::VcuTransitionTimeout:
+      return "vcu_transition_timeout";
     case VehicleStopReason::LegacyUnspecified:
       return "legacy_unspecified";
   }

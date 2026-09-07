@@ -148,6 +148,7 @@ bool valid_stop_reason(std::uint32_t value) {
     case MINE_TELEOP_CHASSIS_STOP_REASON_SESSION_PROFILE_REQUIRED:
     case MINE_TELEOP_CHASSIS_STOP_REASON_CAN_FEEDBACK_MISSING:
     case MINE_TELEOP_CHASSIS_STOP_REASON_ADAPTER_SAFETY_STATUS_UNAVAILABLE:
+    case MINE_TELEOP_CHASSIS_STOP_REASON_VCU_TRANSITION_TIMEOUT:
     case MINE_TELEOP_CHASSIS_STOP_REASON_LEGACY_UNSPECIFIED:
       return true;
     default:
@@ -226,6 +227,8 @@ std::string_view stop_reason_name(std::uint32_t value) {
       return "can_feedback_missing";
     case MINE_TELEOP_CHASSIS_STOP_REASON_ADAPTER_SAFETY_STATUS_UNAVAILABLE:
       return "adapter_safety_status_unavailable";
+    case MINE_TELEOP_CHASSIS_STOP_REASON_VCU_TRANSITION_TIMEOUT:
+      return "vcu_transition_timeout";
     default:
       return "legacy_unspecified";
   }
@@ -2250,7 +2253,7 @@ class BridgeRuntime {
     if (first_transition_timeout) {
       latch_stop_provenance_locked(
           MINE_TELEOP_CHASSIS_STOP_SOURCE_WATCHDOG,
-          MINE_TELEOP_CHASSIS_STOP_REASON_FEEDBACK_TIMEOUT);
+          MINE_TELEOP_CHASSIS_STOP_REASON_VCU_TRANSITION_TIMEOUT);
       clear_runtime_control_locked("vcu_transition_timeout");
     }
     controller_.request_disarm();

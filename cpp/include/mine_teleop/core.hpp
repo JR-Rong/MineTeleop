@@ -363,6 +363,7 @@ enum class VehicleStopReason : std::uint32_t {
   SessionProfileRequired = 22,
   CanFeedbackMissing = 23,
   AdapterSafetyStatusUnavailable = 24,
+  VcuTransitionTimeout = 25,
   LegacyUnspecified = 255,
 };
 

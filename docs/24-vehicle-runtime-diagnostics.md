@@ -20,8 +20,8 @@
 `stop_sequence`。控制服务对页面暴露的 `stop_source` 为 `page_disconnect`、
 `page_request`、`session_loss`、`watchdog`、`software_fault`、
 `physical_estop` 或 `unknown`；`stop_reason` 给出更精确的原因，例如
-`vcu_handshake_disconnect`、`feedback_timeout`、`handshake_revoked` 或
-`physical_emergency_switch`。关键摄像头和媒体管线故障分别使用
+`vcu_handshake_disconnect`、`feedback_timeout`、`vcu_transition_timeout`、
+`handshake_revoked` 或 `physical_emergency_switch`。关键摄像头和媒体管线故障分别使用
 `software_fault/critical_camera_failed` 与
 `software_fault/media_pipeline_failed`，不会再被普通会话关闭覆盖成
 `session_loss/session_lost`。`stop_sequence` 在新的根因被锁存时递增。VCU
@@ -293,9 +293,9 @@ stale 非零丢弃和严格零值 stale heartbeat 接受/拒绝计数；
 | `can_error_or_rtr_frame_ignored` / `can_error_or_rtr_frame_received` | 收到 CAN error/RTR frame | 每秒聚合；查 bus-off/error counter |
 | `can_rx_ignored_summary` / `can_rx_unrecognized_or_invalid` | JYR010 decoder 不识别或 DLC 不合法 | 每秒聚合 count/last ID |
 | `vmc_fault_code_changed` / `vcu_vmc_fault_code_changed` | `0x18F2F5D0` 中 `WVCU_VMCFltCode` 首次可用或发生变化 | `previous_valid`、`previous_vmc_fault_code`、`vmc_fault_code`；非零时按整车厂故障码表排查，本事件本身不自动触发停车 |
-| `feedback_timeout` / `vcu_critical_feedback_timeout` | Ready 后 29 个关键 ID 任一超过 500 ms | `stale_ids` 与逐 ID `age_ms`；锁存故障并全停 |
+| `feedback_timeout` / `vcu_critical_feedback_timeout` | Ready 后 29 个关键 ID 任一超过 500 ms | `stale_ids` 与逐 ID `age_ms`；以 `watchdog/feedback_timeout` 锁存故障并全停 |
 | `arming_feedback_timeout` / `vcu_arming_feedback_timeout` | 握手某阶段必需反馈未在 500 ms 入口宽限内保持新鲜 | 全停并记录当前 `state`、`stale_ids` 和逐 ID `age_ms`；先断开完成 `Disarmed`，再从页面重新连接 |
-| `transition_timeout` / `vcu_transition_timeout` | 某个握手或分步退出阶段的反馈持续新鲜、但在该状态 transition epoch 的单调 deadline 内始终未达到目标 | 记录 `state`、`state_transition_epoch`、`state_entry_generation`、`elapsed_ms`/`limit_ms`、`expected`、`observed`、`missing_or_mismatched` 和停车来源；撤销牵引/profile 后复用零扭矩、停稳、N、EPB 驻车、人工状态的分步退出，绝不因未知车速跳过停稳换挡 |
+| `transition_timeout` / `vcu_transition_timeout` | 某个握手或分步退出阶段的反馈持续新鲜、但在该状态 transition epoch 的单调 deadline 内始终未达到目标 | 以 `watchdog/vcu_transition_timeout`（而非 freshness 的 `watchdog/feedback_timeout`）锁存，记录 `state`、`state_transition_epoch`、`state_entry_generation`、`elapsed_ms`/`limit_ms`、`expected`、`observed`、`missing_or_mismatched` 和停车来源；撤销牵引/profile 后复用零扭矩、停稳、N、EPB 驻车、人工状态的分步退出，绝不因未知车速跳过停稳换挡 |
 | `can_send_failed` / `socketcan_send_failed` | 连续 3 个 TX 周期有发送失败 | errno、失败 ID；锁存故障并全停 |
 | `tx_deadline_miss` / `vcu_tx_deadline_missed` | 20 ms 调度 deadline 落后 | 每秒至多一次，含 `lag_ms` |
 | `io_thread_exception` / `vcu_io_thread_exception` | I/O 线程标准异常 | 原始 exception；本地全停 |
