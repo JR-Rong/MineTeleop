@@ -1,3 +1,5 @@
+#include "mine_teleop/detail/json_escape.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -23,6 +25,8 @@
 #include <unistd.h>
 
 namespace {
+
+using mine_teleop::detail::json_escape;
 
 constexpr std::uintmax_t kDefaultRuntimeLogMaxBytes = 64U * 1024U * 1024U;
 constexpr int kDefaultRuntimeLogRotations = 5;
@@ -69,32 +73,6 @@ bool write_all(
     return false;
   }
   return true;
-}
-
-std::string json_escape(std::string_view value) {
-  std::string escaped;
-  escaped.reserve(value.size());
-  for (const unsigned char character : value) {
-    switch (character) {
-      case '\"': escaped += "\\\""; break;
-      case '\\': escaped += "\\\\"; break;
-      case '\b': escaped += "\\b"; break;
-      case '\f': escaped += "\\f"; break;
-      case '\n': escaped += "\\n"; break;
-      case '\r': escaped += "\\r"; break;
-      case '\t': escaped += "\\t"; break;
-      default:
-        if (character < 0x20U) {
-          constexpr char hex[] = "0123456789abcdef";
-          escaped += "\\u00";
-          escaped += hex[(character >> 4U) & 0x0fU];
-          escaped += hex[character & 0x0fU];
-        } else {
-          escaped += static_cast<char>(character);
-        }
-    }
-  }
-  return escaped;
 }
 
 std::string runtime_log_event(

@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <jpeglib.h>
 
+#include "mine_teleop/detail/json_escape.hpp"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -18,6 +20,8 @@
 #include <vector>
 
 namespace {
+
+using mine_teleop::detail::json_escape;
 
 struct Arguments {
   bool list{false};
@@ -92,24 +96,6 @@ Arguments parse_arguments(int argc, char** argv) {
 
 std::string text(const char* value) {
   return value == nullptr ? std::string() : std::string(value);
-}
-
-std::string json_escape(std::string_view value) {
-  std::string result;
-  result.reserve(value.size());
-  for (const unsigned char character : value) {
-    switch (character) {
-      case '\\': result += "\\\\"; break;
-      case '"': result += "\\\""; break;
-      case '\n': result += "\\n"; break;
-      case '\r': result += "\\r"; break;
-      case '\t': result += "\\t"; break;
-      default:
-        if (character >= 0x20) result.push_back(static_cast<char>(character));
-        break;
-    }
-  }
-  return result;
 }
 
 [[noreturn]] void throw_aravis(std::string_view operation, GError* error) {

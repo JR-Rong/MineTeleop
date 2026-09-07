@@ -1,4 +1,5 @@
 #include "global_variables.h"
+#include "mine_teleop/detail/json_escape.hpp"
 #include "mine_teleop/vcu.hpp"
 #include "mine_teleop_chassis_bridge.h"
 
@@ -44,6 +45,7 @@ bool Initialize(const VehicleParam& vehicle, const std::string& can_channel);
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using mine_teleop::detail::json_escape;
 using mine_teleop::vcu::CanFrame;
 using mine_teleop::vcu::Command;
 using mine_teleop::vcu::ParallelController;
@@ -421,43 +423,6 @@ std::string utc_timestamp() {
   std::ostringstream output;
   output << std::put_time(&utc, "%Y-%m-%dT%H:%M:%S") << '.'
          << std::setfill('0') << std::setw(3) << milliseconds.count() << 'Z';
-  return output.str();
-}
-
-std::string json_escape(std::string_view value) {
-  std::ostringstream output;
-  for (const unsigned char character : value) {
-    switch (character) {
-      case '"':
-        output << "\\\"";
-        break;
-      case '\\':
-        output << "\\\\";
-        break;
-      case '\b':
-        output << "\\b";
-        break;
-      case '\f':
-        output << "\\f";
-        break;
-      case '\n':
-        output << "\\n";
-        break;
-      case '\r':
-        output << "\\r";
-        break;
-      case '\t':
-        output << "\\t";
-        break;
-      default:
-        if (character < 0x20U) {
-          output << "\\u" << std::hex << std::setw(4) << std::setfill('0')
-                 << static_cast<int>(character) << std::dec;
-        } else {
-          output << static_cast<char>(character);
-        }
-    }
-  }
   return output.str();
 }
 

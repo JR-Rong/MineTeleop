@@ -232,6 +232,7 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
   )
 
   add_executable(mine-teleop-run cpp/apps/mine_teleop_launcher.cpp)
+  target_include_directories(mine-teleop-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
   mine_teleop_enable_warnings(mine-teleop-run)
   target_link_options(mine-teleop-run PRIVATE -static)
 
@@ -239,6 +240,10 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
     pkg_check_modules(ARAVIS QUIET IMPORTED_TARGET aravis-0.8)
     if(ARAVIS_FOUND)
       add_executable(mine-teleop-aravis-camera cpp/bridges/aravis_camera_bridge.cpp)
+      target_include_directories(
+        mine-teleop-aravis-camera
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
+      )
       target_link_libraries(mine-teleop-aravis-camera PRIVATE PkgConfig::ARAVIS JPEG::JPEG)
       mine_teleop_enable_warnings(mine-teleop-aravis-camera)
       set_target_properties(mine-teleop-aravis-camera PROPERTIES
@@ -268,7 +273,12 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
     )
     if(MINE_TELEOP_MVS_INCLUDE_DIR AND MINE_TELEOP_MVS_LIBRARY)
       add_executable(mine-teleop-mvs-camera cpp/bridges/mvs_camera_bridge.cpp)
-      target_include_directories(mine-teleop-mvs-camera PRIVATE "${MINE_TELEOP_MVS_INCLUDE_DIR}")
+      target_include_directories(
+        mine-teleop-mvs-camera
+        PRIVATE
+          ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
+          "${MINE_TELEOP_MVS_INCLUDE_DIR}"
+      )
       target_link_libraries(mine-teleop-mvs-camera PRIVATE "${MINE_TELEOP_MVS_LIBRARY}")
       set_target_properties(mine-teleop-mvs-camera PROPERTIES INSTALL_RPATH "$ORIGIN/../lib/vendor/mvs")
       install(TARGETS mine-teleop-mvs-camera RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -353,6 +363,24 @@ if(MINE_TELEOP_BUILD_TESTS)
     mine-teleop-protocol-v1-schema-js-tests
     PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
+
+  add_executable(mine-teleop-json-escape-tests cpp/tests/json_escape_tests.cpp)
+  target_include_directories(
+    mine-teleop-json-escape-tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
+  )
+  target_link_libraries(
+    mine-teleop-json-escape-tests
+    PRIVATE nlohmann_json::nlohmann_json
+  )
+  set_target_properties(mine-teleop-json-escape-tests PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+  )
+  mine_teleop_enable_warnings(mine-teleop-json-escape-tests)
+  add_test(NAME mine-teleop-json-escape-tests COMMAND mine-teleop-json-escape-tests)
+
   if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
     add_test(
       NAME mine-teleop-control-logic-js-tests
