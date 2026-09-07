@@ -171,6 +171,19 @@ target_include_directories(mine_teleop_vcu
 )
 mine_teleop_enable_warnings(mine_teleop_vcu)
 
+# Vehicle diagnostics use a private bounded sink so a stalled launcher pipe
+# cannot block media/control callbacks. Keep it separate from the portable
+# runtime library: no control-only package should gain a media logging dependency.
+add_library(mine_teleop_diagnostic_emitter cpp/src/diagnostic_emitter.cpp)
+set_target_properties(mine_teleop_diagnostic_emitter PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(mine_teleop_diagnostic_emitter
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>
+    $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(mine_teleop_diagnostic_emitter PUBLIC Threads::Threads)
+mine_teleop_enable_warnings(mine_teleop_diagnostic_emitter)
+
 # This library is the shared protocol/session/HTTP core used by all control
 # packages. It intentionally has no camera, JPEG, or GStreamer dependency.
 add_library(mine_teleop_runtime
@@ -270,6 +283,7 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
   target_link_libraries(mine_teleop_vehicle_runtime
     PUBLIC
       mine_teleop_runtime
+      mine_teleop_diagnostic_emitter
       JPEG::JPEG
       PkgConfig::GSTREAMER
   )
@@ -437,6 +451,16 @@ if(MINE_TELEOP_BUILD_TESTS)
   )
   mine_teleop_enable_warnings(mine-teleop-json-escape-tests)
   add_test(NAME mine-teleop-json-escape-tests COMMAND mine-teleop-json-escape-tests)
+
+  add_executable(mine-teleop-diagnostic-emitter-tests cpp/tests/diagnostic_emitter_tests.cpp)
+  target_link_libraries(
+    mine-teleop-diagnostic-emitter-tests
+    PRIVATE
+      mine_teleop_diagnostic_emitter
+      nlohmann_json::nlohmann_json
+  )
+  mine_teleop_enable_warnings(mine-teleop-diagnostic-emitter-tests)
+  add_test(NAME mine-teleop-diagnostic-emitter-tests COMMAND mine-teleop-diagnostic-emitter-tests)
 
   if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
     add_test(

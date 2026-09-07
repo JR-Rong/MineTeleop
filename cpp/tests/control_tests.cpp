@@ -2302,8 +2302,14 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
   const auto handler = cpp_function_contract(source, "void handle_control_message(");
   const auto enqueue = cpp_function_contract(source, "void enqueue_control_trace(");
   const auto worker = cpp_function_contract(source, "void control_trace_worker_loop_impl()");
-  const auto trace_output = cpp_function_contract(source, "void write_control_trace_batch_line(");
+  const auto trace_output = cpp_function_contract(
+      source,
+      "[[nodiscard]] bool write_control_trace_batch_line(");
   const auto stop_worker = cpp_function_contract(source, "void stop_control_trace_worker()");
+  const auto stop_pipeline = cpp_function_contract(
+      source,
+      "void stop_pipeline(bool final_runtime_shutdown = false)");
+  const auto destructor = cpp_function_contract(source, "~Impl()");
   const auto run = cpp_function_contract(source, "Json run(int frame_count, int duration_ms, int capture_interval_ms)");
   const auto callback_timestamp = handler.find("callback_entered_at_utc_ms = signaling.now_ms()");
   const auto command_parse = handler.find("auto command = ControlCommand::from_json(message)");
@@ -2429,20 +2435,44 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
       "trace worker does not batch by time/size or expose loss accounting");
   expect(
       trace_output.find("kControlTraceBatchLineMaxBytes") != std::string::npos &&
-          trace_output.find("std::osyncstream output(std::cout)") != std::string::npos &&
-          trace_output.find("diagnostic_mutex") == std::string::npos,
-      "trace output can exceed the launcher line limit or block callbacks on a shared log mutex");
+          trace_output.find("diagnostic_emitter.submit(line)") != std::string::npos &&
+          source.find("detail::DiagnosticEmitter diagnostic_emitter") != std::string::npos &&
+          source.find("std::cout") == std::string::npos &&
+          source.find("std::osyncstream") == std::string::npos,
+      "media diagnostics bypass the bounded JSONL emitter or can still block stdout directly");
   expect(
       stop_worker.find("control_trace_accepting.store(false") != std::string::npos &&
           stop_worker.find("control_trace_worker.joinable()") != std::string::npos &&
           stop_worker.find("control_mutex") == std::string::npos,
       "trace shutdown joins while holding the control mutex");
   const auto run_stop_trace = run.rfind("stop_control_trace_worker()");
+  const auto run_stop_emitter = run.rfind("diagnostic_emitter.stop()");
   const auto run_return = run.rfind("return summary;");
   expect(
       run_stop_trace != std::string::npos && run_return != std::string::npos &&
-          run_stop_trace < run_return,
-      "media summary can be written before the final trace batch is drained");
+          run_stop_emitter != std::string::npos && run_stop_trace < run_stop_emitter &&
+          run_stop_emitter < run_return,
+      "media summary can return before the diagnostic emitter is stopped and joined");
+
+  const auto callback_disconnect = stop_pipeline.find("g_signal_handlers_disconnect_by_data(webrtc, this)");
+  const auto pipeline_unref = stop_pipeline.find("gst_object_unref(pipeline);");
+  const auto orphan_quarantine = stop_pipeline.find("quarantine_orphan_recordings(");
+  expect(
+      callback_disconnect != std::string::npos && pipeline_unref != std::string::npos &&
+          callback_disconnect < pipeline_unref && orphan_quarantine != std::string::npos &&
+          pipeline_unref < orphan_quarantine,
+      "diagnostic shutdown changed callback teardown or R17 orphan quarantine ordering");
+  const auto destructor_stop_pipeline = destructor.find("stop_pipeline(true)");
+  const auto destructor_stop_recording = destructor.find("stop_recording_finalization_worker()");
+  const auto destructor_stop_trace = destructor.find("stop_control_trace_worker()");
+  const auto destructor_stop_emitter = destructor.find("diagnostic_emitter.stop()");
+  expect(
+      destructor_stop_pipeline != std::string::npos && destructor_stop_recording != std::string::npos &&
+          destructor_stop_trace != std::string::npos && destructor_stop_emitter != std::string::npos &&
+          destructor_stop_pipeline < destructor_stop_recording &&
+          destructor_stop_recording < destructor_stop_trace &&
+          destructor_stop_trace < destructor_stop_emitter,
+      "Impl destruction can leave a diagnostic producer alive past emitter shutdown");
 }
 
 void test_structured_control_rejection_is_safe_and_rate_limited() {

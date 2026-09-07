@@ -37,6 +37,19 @@ JSONL 中的原始 bridge 来源名为 `driver_page`、`session`、`watchdog`、
 因此是 `.log` 而不是严格 JSONL；默认单文件 64 MiB、保留 5 份，可分别通过
 `MINE_TELEOP_VEHICLE_RUNTIME_LOG_MAX_BYTES` 和
 `MINE_TELEOP_VEHICLE_RUNTIME_LOG_ROTATIONS` 覆盖。
+
+媒体 runtime 自己产生的结构化诊断统一经私有 `DiagnosticEmitter` 写 stdout：队列最多
+256 条、单条最多 3072 bytes，生产者用 try-lock，满载或序列化失败会丢弃而不会等待
+stdout。stdout sink 不改变进程级 `O_NONBLOCK`；在打包 launcher 的 stdout pipe 上，每条
+在一个不超过 `PIPE_BUF` 的 write 中写入，并以 100 ms poll deadline 失败/丢弃，避免半条
+JSONL。`vehicle_media_webrtc_summary`
+的 `diagnostic_output` 给出 enqueue/emitted/dropped、oversized、sink timeout/failure 和
+shutdown timeout 计数。这个 sink 是媒体 runtime 内部唯一的结构化 stdout writer；启动器
+父进程的有限生命周期事件仍是独立进程，pipe 的 `PIPE_BUF` 原子边界保持两者不交错。
+关闭时先停止接收和 trace 生产者，等待配置的 drain window，随后请求取消并 join emitter；
+没有 detach。该有界承诺只适用于会及时响应 `stop_token` 的内部 sink；非协作自定义 sink
+不受支持，不能作为可恢复的生产路径。R17 的 splitmux async-finalize、bus drain 与孤立
+fragment quarantine 仍在原有的 GStreamer teardown 之后执行，未改变录像完成/隔离时序。
 例外：可识别的 vendor ChassisControl 输出只保留在终端，**不写入该落盘日志**：包括
 `UpdateVehicleState` wrapper 每个控制周期打印的完整裸行，以及 vendor `log_printf` 的
 `[YYYY-MM-DD HH:MM:SS.mmm] [级别] [pid] [tag]` 格式行（可带 ANSI 颜色）。过滤按完整
