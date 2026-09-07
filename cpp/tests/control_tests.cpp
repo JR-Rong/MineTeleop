@@ -651,6 +651,67 @@ void test_websocket_connection_budget_transition() {
   release_total_websocket.store(true, std::memory_order_release);
   ::close(total_upgraded);
   total_server.stop();
+
+  auto fallback_limits = limits;
+  fallback_limits.max_active_connections = 3;
+  fallback_limits.max_pending_http_connections = 1;
+  fallback_limits.max_websocket_connections = 1;
+  fallback_limits.max_connections_per_source = 3;
+  std::atomic<bool> fallback_handler_entered{false};
+  std::atomic<bool> release_fallback_handler{false};
+  std::atomic<int> fallback_normal_handler_calls{0};
+  mine_teleop::SimpleHttpServer fallback_server(
+      "127.0.0.1",
+      0,
+      [&](const mine_teleop::HttpRequest&) {
+        ++fallback_normal_handler_calls;
+        return mine_teleop::ServerResponse::text(200, "normal");
+      },
+      1024,
+      [&](mine_teleop::SocketHandle, const mine_teleop::HttpRequest& request) {
+        if (request.path != "/fallback") return false;
+        fallback_handler_entered.store(true, std::memory_order_release);
+        while (!release_fallback_handler.load(std::memory_order_acquire)) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+      },
+      fallback_limits);
+  struct ReleaseFallbackHandlerOnExit final {
+    std::atomic<bool>& value;
+    ~ReleaseFallbackHandlerOnExit() { value.store(true, std::memory_order_release); }
+  } release_fallback_on_exit{release_fallback_handler};
+  fallback_server.start();
+  const int fallback_upgrade = raw_http_connect(fallback_server.port());
+  raw_send_all(
+      fallback_upgrade,
+      "GET /fallback HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+  const auto fallback_entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!fallback_handler_entered.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < fallback_entered_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  expect(
+      fallback_handler_entered.load(std::memory_order_acquire),
+      "upgrade-shaped fallback request did not reach the WebSocket handler");
+  const int fallback_pending = raw_http_connect(fallback_server.port());
+  const int fallback_overflow = raw_http_connect(fallback_server.port());
+  const auto fallback_overflow_response = raw_receive_until_close(fallback_overflow);
+  ::close(fallback_overflow);
+  expect(
+      fallback_overflow_response.starts_with("HTTP/1.1 503 "),
+      "fallback test did not fill the pending HTTP connection budget");
+  release_fallback_handler.store(true, std::memory_order_release);
+  const auto fallback_response = raw_receive_until_close(fallback_upgrade);
+  ::close(fallback_upgrade);
+  ::close(fallback_pending);
+  fallback_server.stop();
+  expect(
+      fallback_response.starts_with("HTTP/1.1 503 "),
+      "upgrade-shaped fallback request bypassed the pending HTTP connection budget");
+  expect(
+      fallback_normal_handler_calls == 0,
+      "upgrade-shaped fallback request reached the ordinary HTTP handler after budget rejection");
 }
 
 void test_signaling_time_sync_applies_backward_utc_correction() {
@@ -6391,6 +6452,11 @@ void test_driver_login_failure_rate_limit_and_recovery() {
   concurrent_config.audit_log_path.clear();
   concurrent_config.login_max_failures = 4;
   concurrent_config.login_lockout_ms = 1000;
+  // Keep this test focused on the atomic login-failure counter. The KDF slot
+  // budget has separate coverage; its production default would otherwise
+  // return capacity 429s before all of these concurrent wrong passwords reach
+  // the lockout accounting path.
+  concurrent_config.password_verification_max_concurrency = 12;
   mine_teleop::SignalingService concurrent_service(concurrent_config);
   std::vector<int> concurrent_statuses(12, 0);
   std::vector<std::thread> attempts;

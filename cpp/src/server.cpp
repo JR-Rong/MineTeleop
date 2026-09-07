@@ -2113,12 +2113,17 @@ void SimpleHttpServer::serve_client(SocketHandle client_fd) {
         set_socket_nonblocking(client_fd, false);
         socket_is_nonblocking = false;
         if (websocket_handler_(client_fd, request)) return;
-        if (websocket_upgrade) {
-          static_cast<void>(try_demote_client_from_websocket(client_fd));
-        }
         set_socket_nonblocking(client_fd, true);
         socket_is_nonblocking = true;
-        response = handler_(request);
+        if (websocket_upgrade && !try_demote_client_from_websocket(client_fd)) {
+          // A request that advertised an upgrade consumed the WebSocket slot
+          // before the handler decided it was ordinary HTTP.  It must regain
+          // the pending-HTTP slot before reaching the normal handler; otherwise
+          // an upgrade-shaped request could bypass that bounded pre-auth pool.
+          response = ServerResponse::json(503, {{"error", "HTTP connection budget exhausted"}});
+        } else {
+          response = handler_(request);
+        }
       }
     } else {
       response = handler_(request);
