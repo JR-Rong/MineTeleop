@@ -1,0 +1,29 @@
+#pragma once
+
+#include <cstddef>
+#include <string_view>
+
+namespace mine_teleop::web {
+
+inline constexpr std::string_view kControlConsoleHtml =
+@MINE_TELEOP_CONTROL_CONSOLE_HTML_LITERALS@;
+inline constexpr std::size_t kControlConsoleHtmlLiteralChunks =
+    @MINE_TELEOP_CONTROL_CONSOLE_HTML_CHUNK_COUNT@;
+inline constexpr std::size_t kControlConsoleHtmlMaxLiteralBytes =
+    @MINE_TELEOP_CONTROL_CONSOLE_HTML_MAX_CHUNK_BYTES@;
+
+inline constexpr std::string_view kControlConsoleCss =
+@MINE_TELEOP_CONTROL_CONSOLE_CSS_LITERALS@;
+inline constexpr std::size_t kControlConsoleCssLiteralChunks =
+    @MINE_TELEOP_CONTROL_CONSOLE_CSS_CHUNK_COUNT@;
+inline constexpr std::size_t kControlConsoleCssMaxLiteralBytes =
+    @MINE_TELEOP_CONTROL_CONSOLE_CSS_MAX_CHUNK_BYTES@;
+
+inline constexpr std::string_view kControlConsoleJavaScript =
+@MINE_TELEOP_CONTROL_CONSOLE_JS_LITERALS@;
+inline constexpr std::size_t kControlConsoleJavaScriptLiteralChunks =
+    @MINE_TELEOP_CONTROL_CONSOLE_JS_CHUNK_COUNT@;
+inline constexpr std::size_t kControlConsoleJavaScriptMaxLiteralBytes =
+    @MINE_TELEOP_CONTROL_CONSOLE_JS_MAX_CHUNK_BYTES@;
+
+}  // namespace mine_teleop::web

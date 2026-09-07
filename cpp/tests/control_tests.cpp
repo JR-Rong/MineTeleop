@@ -90,6 +90,11 @@ std::string response_header(const mine_teleop::ServerResponse& response, std::st
   return found == response.headers.end() ? "" : found->second;
 }
 
+std::size_t response_header_count(const mine_teleop::ServerResponse& response, std::string_view name) {
+  return static_cast<std::size_t>(std::count_if(
+      response.headers.begin(), response.headers.end(), [&](const auto& header) { return header.first == name; }));
+}
+
 template <typename Function>
 void expect_throws(Function&& function, std::string_view message) {
   try {
@@ -914,23 +919,38 @@ void test_control_page_contract() {
   request.method = "GET";
   request.path = "/";
   const auto response = app.handle(request);
+  mine_teleop::HttpRequest asset_request;
+  asset_request.method = "GET";
+  asset_request.path = "/assets/control_console.js";
+  const auto console_js_response = app.handle(asset_request);
+  asset_request.path = "/assets/control_console.css";
+  const auto console_css_response = app.handle(asset_request);
+  asset_request.path = "/assets/control_logic.js";
+  const auto control_logic_response = app.handle(asset_request);
+  asset_request.path = "/api/console-config";
+  const auto console_config_response = app.handle(asset_request);
+  const auto control_assets =
+      response.body + "\n" + console_css_response.body + "\n" +
+      control_logic_response.body + "\n" + console_js_response.body;
   expect(response.status == 200, "control page did not load");
   expect(response.body.find("Mine Teleop 控制台") != std::string::npos, "control page identity is missing");
   expect(response.body.find("rel=\"icon\" href=\"data:,\"") != std::string::npos, "control page triggers a favicon 404");
   expect(response.body.find("登录并加载车辆") != std::string::npos, "driver login UI is missing");
   expect(response.body.find("授权车辆") != std::string::npos, "authorized vehicle selector is missing");
-  expect(response.body.find("认证有效至") != std::string::npos, "driver token expiry is not visible");
-  expect(response.body.find("登录已失效，请重新认证") != std::string::npos, "driver re-authentication UX is missing");
-  expect(response.body.find("post('/api/login'") != std::string::npos, "driver credential is not handled by the local runtime");
+  expect(response.body.find("认证有效至") == std::string::npos, "driver token expiry was embedded in static HTML");
+  expect(control_assets.find("认证有效至") != std::string::npos, "driver token expiry is not visible");
+  expect(control_assets.find("登录已失效，请重新认证") != std::string::npos, "driver re-authentication UX is missing");
+  expect(control_assets.find("post('/api/login'") != std::string::npos, "driver credential is not handled by the local runtime");
   expect(
-      response.body.find("'x-mine-teleop-page-capability':pageCapability") != std::string::npos &&
-          response.body.find(app.page_capability()) != std::string::npos,
-      "local control page does not bind mutations to its random page capability");
+      control_assets.find("'x-mine-teleop-page-capability':pageCapability") != std::string::npos &&
+          response.body.find(app.page_capability()) == std::string::npos &&
+          console_config_response.body.find(app.page_capability()) != std::string::npos,
+      "local control page binds mutations to the /api/console-config page capability, not static HTML");
   expect(
-      response.body.find("passwordInput.value='';const result=await post('/api/login'") != std::string::npos,
+      control_assets.find("passwordInput.value='';const result=await post('/api/login'") != std::string::npos,
       "driver credential is not cleared before the login request can fail");
   expect(
-      response.body.find("controlAuthorityLost=false;webrtcLabel.textContent='未连接'") != std::string::npos,
+      control_assets.find("controlAuthorityLost=false;webrtcLabel.textContent='未连接'") != std::string::npos,
       "successful reauthentication leaves a stale lost-authority label visible");
 
   mine_teleop::HttpRequest mutation;
@@ -967,69 +987,69 @@ void test_control_page_contract() {
   authorize_local_post(app, mutation);
   mutation.headers["x-mine-teleop-page-capability"] = "wrong-capability";
   expect(app.handle(mutation).status == 403, "invalid local page capability was accepted");
-  expect(response.body.find("navigator.getGamepads") != std::string::npos, "Gamepad discovery is missing");
+  expect(control_assets.find("navigator.getGamepads") != std::string::npos, "Gamepad discovery is missing");
   expect(
-      response.body.find("id=\"gamepad-panel\"") == std::string::npos &&
-          response.body.find("未检测到 Gamepad") == std::string::npos &&
-          response.body.find("id=\"keyboard-panel\"") != std::string::npos,
+      control_assets.find("id=\"gamepad-panel\"") == std::string::npos &&
+          control_assets.find("未检测到 Gamepad") == std::string::npos &&
+          control_assets.find("id=\"keyboard-panel\"") != std::string::npos,
       "the obsolete Gamepad status panel was not replaced by keyboard control feedback");
   expect(
-      response.body.find("class=\"workspace\"") != std::string::npos &&
-          response.body.find("class=\"sidebar\"") != std::string::npos &&
-          response.body.find("html,body{height:100%;overflow:hidden}") != std::string::npos,
+      control_assets.find("class=\"workspace\"") != std::string::npos &&
+          control_assets.find("class=\"sidebar\"") != std::string::npos &&
+          control_assets.find("html,body{height:100%;overflow:hidden}") != std::string::npos,
       "the control page is not organized as a single-screen workspace with a monitoring sidebar");
   expect(
-      response.body.find("id=\"control-steering\"") != std::string::npos &&
-          response.body.find("id=\"control-throttle\"") != std::string::npos &&
-          response.body.find("id=\"control-brake\"") != std::string::npos &&
-          response.body.find("function renderControlState()") != std::string::npos,
+      control_assets.find("id=\"control-steering\"") != std::string::npos &&
+          control_assets.find("id=\"control-throttle\"") != std::string::npos &&
+          control_assets.find("id=\"control-brake\"") != std::string::npos &&
+          control_assets.find("function renderControlState()") != std::string::npos,
       "live steering, throttle, and brake feedback is missing");
   expect(
-      response.body.find("id=\"operator-status-strip\"") != std::string::npos &&
-          response.body.find("id=\"operator-speed\"") != std::string::npos &&
-          response.body.find("id=\"operator-actual-gear\"") != std::string::npos &&
-          response.body.find("id=\"operator-control-brake\"") != std::string::npos &&
-          response.body.find("position:sticky;top:0;z-index:20") != std::string::npos &&
-          response.body.find("grid-auto-rows:clamp(190px,56vw,300px)") != std::string::npos &&
-          response.body.find(
+      control_assets.find("id=\"operator-status-strip\"") != std::string::npos &&
+          control_assets.find("id=\"operator-speed\"") != std::string::npos &&
+          control_assets.find("id=\"operator-actual-gear\"") != std::string::npos &&
+          control_assets.find("id=\"operator-control-brake\"") != std::string::npos &&
+          control_assets.find("position:sticky;top:0;z-index:20") != std::string::npos &&
+          control_assets.find("grid-auto-rows:clamp(190px,56vw,300px)") != std::string::npos &&
+          control_assets.find(
               ".can-feedback-panel .can-summary{grid-template-columns:repeat(2,minmax(0,1fr))") !=
               std::string::npos &&
-          response.body.find(".visual-stage .camera>video{position:absolute;inset:0") !=
+          control_assets.find(".visual-stage .camera>video{position:absolute;inset:0") !=
               std::string::npos,
       "camera-first responsive layout can still hide critical vehicle state");
   expect(
-      response.body.find("id=\"can-feedback-panel\"") != std::string::npos &&
-          response.body.find("id=\"wheel-feedback-grid\"") != std::string::npos &&
-          response.body.find("id=\"steering-feedback-grid\"") != std::string::npos &&
-          response.body.find("message.event==='vehicle_telemetry'") != std::string::npos &&
-          response.body.find("motor_torque_nm") != std::string::npos &&
-          response.body.find("motor_speed_rpm") != std::string::npos &&
-          response.body.find("steering_angle_deg") != std::string::npos &&
-          response.body.find("brake_pressure_bar") != std::string::npos,
+      control_assets.find("id=\"can-feedback-panel\"") != std::string::npos &&
+          control_assets.find("id=\"wheel-feedback-grid\"") != std::string::npos &&
+          control_assets.find("id=\"steering-feedback-grid\"") != std::string::npos &&
+          control_assets.find("message.event==='vehicle_telemetry'") != std::string::npos &&
+          control_assets.find("motor_torque_nm") != std::string::npos &&
+          control_assets.find("motor_speed_rpm") != std::string::npos &&
+          control_assets.find("steering_angle_deg") != std::string::npos &&
+          control_assets.find("brake_pressure_bar") != std::string::npos,
       "complete measured CAN feedback is not rendered from vehicle telemetry");
   expect(
-      response.body.find("function createControlLogic()") != std::string::npos &&
-          response.body.find("const controlLogic=MineTeleopControlLogic") != std::string::npos &&
-          response.body.find("const keys=controlLogic.KEY_BINDINGS") != std::string::npos &&
-          response.body.find("ArrowLeft: 'left'") != std::string::npos &&
-          response.body.find("ArrowUp: 'up'") != std::string::npos &&
-          response.body.find("Space: 'service_brake'") != std::string::npos &&
-          response.body.find("KeyB: 'hard_brake'") != std::string::npos &&
-          response.body.find("e.code==='KeyE'") != std::string::npos,
+      control_assets.find("function createControlLogic()") != std::string::npos &&
+          control_assets.find("const controlLogic=MineTeleopControlLogic") != std::string::npos &&
+          control_assets.find("const keys=controlLogic.KEY_BINDINGS") != std::string::npos &&
+          control_assets.find("ArrowLeft: 'left'") != std::string::npos &&
+          control_assets.find("ArrowUp: 'up'") != std::string::npos &&
+          control_assets.find("Space: 'service_brake'") != std::string::npos &&
+          control_assets.find("KeyB: 'hard_brake'") != std::string::npos &&
+          control_assets.find("e.code==='KeyE'") != std::string::npos,
       "the production page is not wired to the shared fixed-key control module");
   expect(
-      response.body.find("pressedControlKeys=controlLogic.createKeySet()") != std::string::npos &&
-          response.body.find("blockedControlKeys=controlLogic.createKeySet()") != std::string::npos &&
-          response.body.find("controlLogic.pressKey(pressedControlKeys,blockedControlKeys,e.code)") !=
+      control_assets.find("pressedControlKeys=controlLogic.createKeySet()") != std::string::npos &&
+          control_assets.find("blockedControlKeys=controlLogic.createKeySet()") != std::string::npos &&
+          control_assets.find("controlLogic.pressKey(pressedControlKeys,blockedControlKeys,e.code)") !=
               std::string::npos &&
-          response.body.find("controlLogic.releaseKey(pressedControlKeys,blockedControlKeys,e.code)") !=
+          control_assets.find("controlLogic.releaseKey(pressedControlKeys,blockedControlKeys,e.code)") !=
               std::string::npos &&
-          response.body.find("state=controlLogic.deriveKeyState(pressedControlKeys)") !=
+          control_assets.find("state=controlLogic.deriveKeyState(pressedControlKeys)") !=
               std::string::npos,
       "physical key codes are not reduced into held control actions");
-  const auto keyboard_handler = response.body.find("addEventListener('keydown'");
-  const auto keyboard_prevent_default = response.body.find("e.preventDefault()", keyboard_handler);
-  const auto keyboard_connection_gate = response.body.find("if(!polling)", keyboard_handler);
+  const auto keyboard_handler = control_assets.find("addEventListener('keydown'");
+  const auto keyboard_prevent_default = control_assets.find("e.preventDefault()", keyboard_handler);
+  const auto keyboard_connection_gate = control_assets.find("if(!polling)", keyboard_handler);
   expect(
       keyboard_handler != std::string::npos &&
           keyboard_prevent_default != std::string::npos &&
@@ -1037,45 +1057,45 @@ void test_control_page_contract() {
           keyboard_prevent_default < keyboard_connection_gate,
       "control keys can still scroll the page before the connection gate runs");
   expect(
-      response.body.find("lastKeyboardEvent.textContent") != std::string::npos &&
-          response.body.find("已截获 · 等待连接") != std::string::npos &&
-          response.body.find("需释放后重新按下") != std::string::npos,
+      control_assets.find("lastKeyboardEvent.textContent") != std::string::npos &&
+          control_assets.find("已截获 · 等待连接") != std::string::npos &&
+          control_assets.find("需释放后重新按下") != std::string::npos,
       "keyboard capture and fresh-keydown interlock do not provide visible operator feedback");
   expect(
-      response.body.find("selectedGear='N'") != std::string::npos &&
-          response.body.find("controlLogic.deriveGearSelection") != std::string::npos &&
-          response.body.find("controlLogic.allowsGearChange") != std::string::npos &&
-          response.body.find("updateSelectedGearFromHeldDirections") != std::string::npos &&
-          response.body.find("updateSelectedGearFromInput({up:true,down:false})") !=
+      control_assets.find("selectedGear='N'") != std::string::npos &&
+          control_assets.find("controlLogic.deriveGearSelection") != std::string::npos &&
+          control_assets.find("controlLogic.allowsGearChange") != std::string::npos &&
+          control_assets.find("updateSelectedGearFromHeldDirections") != std::string::npos &&
+          control_assets.find("updateSelectedGearFromInput({up:true,down:false})") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "换挡已阻止：需至少 3 帧且持续 200 ms 的新鲜零速反馈") !=
               std::string::npos &&
-          response.body.find("if(gear!=='R')gear='N'") == std::string::npos,
+          control_assets.find("if(gear!=='R')gear='N'") == std::string::npos,
       "keyboard and Gamepad do not share the zero-speed-gated gear reducer");
   expect(
-      response.body.find("function currentControl") != std::string::npos &&
-          response.body.find("const control=controlLogic.deriveControl") !=
+      control_assets.find("function currentControl") != std::string::npos &&
+          control_assets.find("const control=controlLogic.deriveControl") !=
               std::string::npos &&
-          response.body.find("limits:effectiveControlLimits()") != std::string::npos,
+          control_assets.find("limits:effectiveControlLimits()") != std::string::npos,
       "the production page bypasses shared brake/control derivation");
   expect(
-      response.body.find("开始平行驾驶握手") != std::string::npos &&
-          response.body.find("断开 VCU 握手") != std::string::npos &&
-          response.body.find("can-vmc-fault") != std::string::npos &&
-          response.body.find("can-parking-switch") != std::string::npos &&
-          response.body.find("can-brake-pedal") != std::string::npos &&
-          response.body.find("vcuHandshake.handshake_revoked") !=
+      control_assets.find("开始平行驾驶握手") != std::string::npos &&
+          control_assets.find("断开 VCU 握手") != std::string::npos &&
+          control_assets.find("can-vmc-fault") != std::string::npos &&
+          control_assets.find("can-parking-switch") != std::string::npos &&
+          control_assets.find("can-brake-pedal") != std::string::npos &&
+          control_assets.find("vcuHandshake.handshake_revoked") !=
               std::string::npos &&
-          response.body.find("握手已被 VCU 撤销") != std::string::npos &&
-          response.body.find("完成后请从页面重新申请 VCU 握手") !=
+          control_assets.find("握手已被 VCU 撤销") != std::string::npos &&
+          control_assets.find("完成后请从页面重新申请 VCU 握手") !=
               std::string::npos,
       "explicit VCU handshake controls are missing");
   const auto diagnose_handshake =
-      response.body.find("function diagnoseVcuHandshake");
-  const auto handshake_revoked_gate = response.body.find(
+      control_assets.find("function diagnoseVcuHandshake");
+  const auto handshake_revoked_gate = control_assets.find(
       "if(vcuHandshake.handshake_revoked)", diagnose_handshake);
-  const auto profile_ack_gate = response.body.find(
+  const auto profile_ack_gate = control_assets.find(
       "if(!controlProfileState.acknowledged)", diagnose_handshake);
   expect(
       diagnose_handshake != std::string::npos &&
@@ -1084,294 +1104,294 @@ void test_control_page_contract() {
           handshake_revoked_gate < profile_ack_gate,
       "handshake revocation can be hidden by the cleared session profile gate");
   expect(
-      response.body.find("event:'vcu_handshake_command'") != std::string::npos &&
-          response.body.find("'vcu_handshake_status','session_control_profile_status'") !=
+      control_assets.find("event:'vcu_handshake_command'") != std::string::npos &&
+          control_assets.find("'vcu_handshake_status','session_control_profile_status'") !=
               std::string::npos,
       "VCU handshake command/status DataChannel contract is missing");
   expect(
-      response.body.find("'control_command_rejected'") != std::string::npos &&
-      response.body.find(
+      control_assets.find("'control_command_rejected'") != std::string::npos &&
+      control_assets.find(
               "controlLogic.deriveControlCommandRejection(message.issue_code)") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "pendingGearTransition=controlLogic.createGearTransition") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "pendingGearTransition=controlLogic.recordForwardedGearCommand") !=
               std::string::npos &&
-          response.body.find("controlLogic.reduceGearChangeRejection") !=
+          control_assets.find("controlLogic.reduceGearChangeRejection") !=
               std::string::npos &&
-          response.body.find("selectedGear=gearRejectionState.selectedGear") !=
+          control_assets.find("selectedGear=gearRejectionState.selectedGear") !=
               std::string::npos &&
-          response.body.find("clearControlInput(false)") !=
+          control_assets.find("clearControlInput(false)") !=
               std::string::npos &&
-          response.body.find("gearRejectionState.inhibitOrdinaryControl") !=
+          control_assets.find("gearRejectionState.inhibitOrdinaryControl") !=
               std::string::npos &&
-          response.body.find("blockReason='gear_rejection_unresolved'") !=
+          control_assets.find("blockReason='gear_rejection_unresolved'") !=
               std::string::npos &&
-          response.body.find("send({},false).catch(console.error)") !=
+          control_assets.find("send({},false).catch(console.error)") !=
               std::string::npos &&
-          response.body.find("driver_control_command_rejected") !=
+          control_assets.find("driver_control_command_rejected") !=
               std::string::npos,
       "structured gear rejection does not restore the retained gear with zero input");
   expect(
-      response.body.find("vcu_handshake_not_ready") != std::string::npos &&
-          response.body.find("vcuHandshake.parking_ready") != std::string::npos,
+      control_assets.find("vcu_handshake_not_ready") != std::string::npos &&
+          control_assets.find("vcuHandshake.parking_ready") != std::string::npos,
       "driving commands are not gated by explicit N/EPB-ready VCU handshake state");
   expect(
-      response.body.find("只有 N 挡允许进入平行驾驶") != std::string::npos &&
-          response.body.find("电子驻车未全部拉起") != std::string::npos &&
-          response.body.find("反馈已过期") != std::string::npos &&
-          response.body.find("握手请求已发送") != std::string::npos &&
-          response.body.find("启动第 2/5 步未完成") != std::string::npos &&
-          response.body.find("复用智驾握手，等待 VCU 状态 5") != std::string::npos &&
-          response.body.find("退出第 4/5 步未完成") != std::string::npos,
+      control_assets.find("只有 N 挡允许进入平行驾驶") != std::string::npos &&
+          control_assets.find("电子驻车未全部拉起") != std::string::npos &&
+          control_assets.find("反馈已过期") != std::string::npos &&
+          control_assets.find("握手请求已发送") != std::string::npos &&
+          control_assets.find("启动第 2/5 步未完成") != std::string::npos &&
+          control_assets.find("复用智驾握手，等待 VCU 状态 5") != std::string::npos &&
+          control_assets.find("退出第 4/5 步未完成") != std::string::npos,
       "the control page does not explain the failed VCU gate or handshake step");
   expect(
-      response.body.find("实车调试限幅") != std::string::npos &&
-          response.body.find("驾驶参数") != std::string::npos &&
-          response.body.find("速度 PID 与升扭标定") != std::string::npos &&
-          response.body.find("目标车速上限（km/h）") != std::string::npos &&
-          response.body.find("max-motor-torque-nm") != std::string::npos &&
-          response.body.find("max=\"640.0\"") != std::string::npos &&
-          response.body.find("max-brake-pressure-bar") != std::string::npos &&
-          response.body.find("service-brake-pressure-bar") != std::string::npos &&
-          response.body.find("hard-brake-pressure-bar") != std::string::npos &&
-          response.body.find("max-steering-deg") != std::string::npos &&
-          response.body.find("speed-pid-kp") != std::string::npos &&
-          response.body.find("speed-pid-ki") != std::string::npos &&
-          response.body.find("speed-pid-kd") != std::string::npos &&
-          response.body.find("speed-pid-derivative-filter-tau-ms") != std::string::npos &&
-          response.body.find("speed-pid-max-dt-ms") != std::string::npos &&
-          response.body.find("motor-torque-rise-rate") != std::string::npos &&
-          response.body.find("inputmode=\"decimal\" required") !=
+      control_assets.find("实车调试限幅") != std::string::npos &&
+          control_assets.find("驾驶参数") != std::string::npos &&
+          control_assets.find("速度 PID 与升扭标定") != std::string::npos &&
+          control_assets.find("目标车速上限（km/h）") != std::string::npos &&
+          control_assets.find("max-motor-torque-nm") != std::string::npos &&
+          control_assets.find("max=\"640.0\"") != std::string::npos &&
+          control_assets.find("max-brake-pressure-bar") != std::string::npos &&
+          control_assets.find("service-brake-pressure-bar") != std::string::npos &&
+          control_assets.find("hard-brake-pressure-bar") != std::string::npos &&
+          control_assets.find("max-steering-deg") != std::string::npos &&
+          control_assets.find("speed-pid-kp") != std::string::npos &&
+          control_assets.find("speed-pid-ki") != std::string::npos &&
+          control_assets.find("speed-pid-kd") != std::string::npos &&
+          control_assets.find("speed-pid-derivative-filter-tau-ms") != std::string::npos &&
+          control_assets.find("speed-pid-max-dt-ms") != std::string::npos &&
+          control_assets.find("motor-torque-rise-rate") != std::string::npos &&
+          control_assets.find("inputmode=\"decimal\" required") !=
               std::string::npos &&
-          response.body.find("0 不是禁用驱动，而是直接跟随 PID 输出") !=
+          control_assets.find("0 不是禁用驱动，而是直接跟随 PID 输出") !=
               std::string::npos,
       "field commissioning control limit dialog is missing");
   expect(
-      response.body.find("effectiveControlLimits") != std::string::npos &&
-          response.body.find("updateVehicleHardLimits(message.hard_limits)") != std::string::npos &&
-          response.body.find("controlLogic.normalizeControlProfile(value)") !=
+      control_assets.find("effectiveControlLimits") != std::string::npos &&
+          control_assets.find("updateVehicleHardLimits(message.hard_limits)") != std::string::npos &&
+          control_assets.find("controlLogic.normalizeControlProfile(value)") !=
               std::string::npos &&
-          response.body.find("controlLogic.mergeControlProfileWithHardLimits") !=
+          control_assets.find("controlLogic.mergeControlProfileWithHardLimits") !=
               std::string::npos &&
-          response.body.find("controlLogic.deriveControl") != std::string::npos &&
-          response.body.find("post('/api/control-profile',requested)") != std::string::npos &&
-          response.body.find("get('/api/control-limits').then") == std::string::npos &&
-          response.body.find("sendPendingControlProfile()") != std::string::npos &&
-          response.body.find("now-lastControlProfileSendAt<200") != std::string::npos &&
-          response.body.find("每路 EHB 压力请求，单位 bar、分辨率 0.1 bar") !=
+          control_assets.find("controlLogic.deriveControl") != std::string::npos &&
+          control_assets.find("post('/api/control-profile',requested)") != std::string::npos &&
+          control_assets.find("get('/api/control-limits').then") == std::string::npos &&
+          control_assets.find("sendPendingControlProfile()") != std::string::npos &&
+          control_assets.find("now-lastControlProfileSendAt<200") != std::string::npos &&
+          control_assets.find("每路 EHB 压力请求，单位 bar、分辨率 0.1 bar") !=
               std::string::npos &&
-          response.body.find("我已确认车辆处于 N 挡、零速、电子驻车或隔离 mock 台架") !=
+          control_assets.find("我已确认车辆处于 N 挡、零速、电子驻车或隔离 mock 台架") !=
               std::string::npos &&
-          response.body.find("motorTorqueRiseRate.valueAsNumber") !=
+          control_assets.find("motorTorqueRiseRate.valueAsNumber") !=
               std::string::npos &&
-          response.body.find("if(!motorTorqueRiseRate.checkValidity())") !=
+          control_assets.find("if(!motorTorqueRiseRate.checkValidity())") !=
               std::string::npos &&
-          response.body.find("硬安全制动与 watchdog 参数不可编辑") != std::string::npos &&
-          response.body.find("vehicleHardLimits.max_speed_kph.toFixed(1)") !=
+          control_assets.find("硬安全制动与 watchdog 参数不可编辑") != std::string::npos &&
+          control_assets.find("vehicleHardLimits.max_speed_kph.toFixed(1)") !=
               std::string::npos &&
-          response.body.find("vehicleHardLimits.max_throttle.toFixed(3)") !=
+          control_assets.find("vehicleHardLimits.max_throttle.toFixed(3)") !=
               std::string::npos &&
-          response.body.find("vehicleHardLimits.speed_feedback_timeout_ms") !=
+          control_assets.find("vehicleHardLimits.speed_feedback_timeout_ms") !=
               std::string::npos &&
-          response.body.find("vehicleHardLimits.hard_overspeed_margin_kph") !=
+          control_assets.find("vehicleHardLimits.hard_overspeed_margin_kph") !=
               std::string::npos &&
-          response.body.find("readOnlyControlSafetyText(") != std::string::npos &&
-          response.body.find("safety.control_rate_hz") != std::string::npos &&
-          response.body.find("safety.deceleration_profile.map") != std::string::npos &&
-          response.body.find(
+          control_assets.find("readOnlyControlSafetyText(") != std::string::npos &&
+          control_assets.find("safety.control_rate_hz") != std::string::npos &&
+          control_assets.find("safety.deceleration_profile.map") != std::string::npos &&
+          control_assets.find(
               "read_only_control_safety must contain exactly the fixed fields") !=
               std::string::npos &&
-          response.body.find("value.control_rate_hz, 20, 20") != std::string::npos &&
-          response.body.find(
+          control_assets.find("value.control_rate_hz, 20, 20") != std::string::npos &&
+          control_assets.find(
               "flat and read_only_control_safety speed values must match") !=
               std::string::npos &&
-          response.body.find("等待车端完整硬上限、PID 默认值与固定安全参数") !=
+          control_assets.find("等待车端完整硬上限、PID 默认值与固定安全参数") !=
               std::string::npos,
       "controller limits are not combined with vehicle hard limits and operator confirmation");
   expect(
-      response.body.find("control_profile_not_acknowledged") != std::string::npos &&
-          response.body.find("action==='connect'&&!controlProfileState.acknowledged") !=
+      control_assets.find("control_profile_not_acknowledged") != std::string::npos &&
+          control_assets.find("action==='connect'&&!controlProfileState.acknowledged") !=
               std::string::npos &&
-          response.body.find("applyControlProfileStatus(message.session_control_profile)") !=
+          control_assets.find("applyControlProfileStatus(message.session_control_profile)") !=
               std::string::npos &&
-          response.body.find("applyControlProfileStatus(message);", response.body.find(
+          control_assets.find("applyControlProfileStatus(message);", control_assets.find(
               "message.event==='session_control_profile_status'")) != std::string::npos &&
-          response.body.find("resetControlProfileSession()") != std::string::npos &&
-          response.body.find("effectiveAppliedRevision") != std::string::npos &&
-          response.body.find("applied_revision:controlProfileState.effectiveAppliedRevision") !=
+          control_assets.find("resetControlProfileSession()") != std::string::npos &&
+          control_assets.find("effectiveAppliedRevision") != std::string::npos &&
+          control_assets.find("applied_revision:controlProfileState.effectiveAppliedRevision") !=
               std::string::npos,
       "ordinary driving is not fail-closed on session control profile acknowledgement");
   expect(
-      response.body.find(
+      control_assets.find(
               "controlLogic.controlProfileFromVehicleDefaults(driverActuationDefaults,hard)") !=
               std::string::npos &&
-          response.body.find("function controlProfileParkingReady()") !=
+          control_assets.find("function controlProfileParkingReady()") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "parkedStandby=vcuHandshake.parking_ready===true&&"
               "(vcuHandshake.state==='standby'||vcuHandshake.state==='disarmed')") !=
               std::string::npos &&
-          response.body.find("return mockBench||parkedStandby") != std::string::npos &&
-          response.body.find("需人工打开并发送") != std::string::npos &&
-          response.body.find("defaultProfileAutoAttempted") == std::string::npos &&
-          response.body.find(
+          control_assets.find("return mockBench||parkedStandby") != std::string::npos &&
+          control_assets.find("需人工打开并发送") != std::string::npos &&
+          control_assets.find("defaultProfileAutoAttempted") == std::string::npos &&
+          control_assets.find(
               "prepareControlProfile(controlProfileState.requestedProfile,false)") ==
               std::string::npos,
       "legacy PID defaults can still auto-submit without explicit operator confirmation");
   expect(
-      response.body.find("pidChanged=!prior||requested.speed_pid_kp!==prior.speed_pid_kp") !=
+      control_assets.find("pidChanged=!prior||requested.speed_pid_kp!==prior.speed_pid_kp") !=
               std::string::npos &&
-      response.body.find(
+      control_assets.find(
               "requested.motor_torque_rise_rate_nm_per_s!==prior.motor_torque_rise_rate_nm_per_s") !=
               std::string::npos &&
-      response.body.find(
+      control_assets.find(
               "requested.target_speed_kph>prior.target_speed_kph||"
               "requested.max_motor_torque_nm>prior.max_motor_torque_nm") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "requested.max_brake_pressure_bar!==prior.max_brake_pressure_bar||"
               "requested.service_brake_pressure_bar!==prior.service_brake_pressure_bar||"
               "requested.hard_brake_pressure_bar!==prior.hard_brake_pressure_bar") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "requested.max_steering_angle_deg!==prior.max_steering_angle_deg") !=
               std::string::npos &&
-          response.body.find("if(requiresParking&&!controlProfileParkingReady())") !=
+          control_assets.find("if(requiresParking&&!controlProfileParkingReady())") !=
               std::string::npos &&
-          response.body.find("VCU 为 standby/disarmed") !=
+          control_assets.find("VCU 为 standby/disarmed") !=
               std::string::npos,
       "profile editing does not preflight parking rules for speed, torque, brake, steering, and PID changes");
-  const auto control_intent_post = response.body.find(
+  const auto control_intent_post = control_assets.find(
       "accepted=await post('/api/control-intent',intent,controller.signal)");
   expect(
       control_intent_post != std::string::npos &&
-          response.body.find("post('/api/control'") == std::string::npos &&
-          response.body.find("function nativeIntentEnvelope(outgoing)") !=
+          control_assets.find("post('/api/control'") == std::string::npos &&
+          control_assets.find("function nativeIntentEnvelope(outgoing)") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "return{session_id:nativeControlSessionId,session_generation:nativeControlSessionGeneration,ui_instance_id:uiInstanceId,intent_seq:nativeIntentSeq,...normalized}") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "nativeControlSessionId=String(session.session_id||'');nativeControlSessionGeneration=Number(session.control_session_generation)") !=
               std::string::npos &&
-          response.body.find("async function writeControlIntent(extra,announceUnavailable)") !=
+          control_assets.find("async function writeControlIntent(extra,announceUnavailable)") !=
               std::string::npos &&
-          response.body.find("const intent=nativeIntentEnvelope(outgoing)") !=
+          control_assets.find("const intent=nativeIntentEnvelope(outgoing)") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "pendingGearTransition=controlLogic.recordForwardedGearCommand"
               "(pendingGearTransition,transitionGeneration,accepted.intent_seq,outgoingSnapshot.gear)") !=
               std::string::npos &&
-          response.body.find("transport:accepted.transport") !=
+          control_assets.find("transport:accepted.transport") !=
               std::string::npos &&
-          response.body.find("delivery_state:'browser_data_channel_send_invoked'") ==
+          control_assets.find("delivery_state:'browser_data_channel_send_invoked'") ==
               std::string::npos,
       "browser ordinary control is not reduced to a native intent lease update");
   expect(
-      response.body.find(
+      control_assets.find(
               "const controlWriteQueue=controlLogic.createLatestControlWriteQueue"
               "(writeControlIntent,reportControlQueueError") != std::string::npos &&
-          response.body.find("function enqueueIntentRefresh(){return controlWriteQueue.enqueueHeartbeat()}") !=
+          control_assets.find("function enqueueIntentRefresh(){return controlWriteQueue.enqueueHeartbeat()}") !=
               std::string::npos &&
-          response.body.find("controlWriteQueue.enqueueHeartbeat()") != std::string::npos &&
-          response.body.find("const enqueued=enqueueIntentRefresh()") != std::string::npos &&
-          response.body.find("const controller=new AbortController()") != std::string::npos &&
-          response.body.find("activeControlPrepareAbort=controller") != std::string::npos &&
-          response.body.find("activeControlPrepareAbort&&!activeControlPrepareIsEstop") !=
+          control_assets.find("controlWriteQueue.enqueueHeartbeat()") != std::string::npos &&
+          control_assets.find("const enqueued=enqueueIntentRefresh()") != std::string::npos &&
+          control_assets.find("const controller=new AbortController()") != std::string::npos &&
+          control_assets.find("activeControlPrepareAbort=controller") != std::string::npos &&
+          control_assets.find("activeControlPrepareAbort&&!activeControlPrepareIsEstop") !=
               std::string::npos &&
-          response.body.find("reason:'control_intent_preempted_by_estop'") !=
+          control_assets.find("reason:'control_intent_preempted_by_estop'") !=
               std::string::npos &&
-          response.body.find("latchEstop('Gamepad'))send({estop:true},false)") !=
+          control_assets.find("latchEstop('Gamepad'))send({estop:true},false)") !=
               std::string::npos &&
-          response.body.find("reason:'control_intent_update_timeout'") !=
+          control_assets.find("reason:'control_intent_update_timeout'") !=
               std::string::npos &&
-          response.body.find("heartbeatInFlight") == std::string::npos,
+          control_assets.find("heartbeatInFlight") == std::string::npos,
       "intent lease refreshes are not coalesced or ESTOP-preemptible");
   expect(
-      response.body.find("async function heartbeat()") == std::string::npos &&
-          response.body.find("controlHeartbeatIntervalMs") == std::string::npos &&
-          response.body.find("setInterval(()=>heartbeat") == std::string::npos &&
-          response.body.find("activeChannel.send(JSON.stringify(prepared.command))") ==
+      control_assets.find("async function heartbeat()") == std::string::npos &&
+          control_assets.find("controlHeartbeatIntervalMs") == std::string::npos &&
+          control_assets.find("setInterval(()=>heartbeat") == std::string::npos &&
+          control_assets.find("activeChannel.send(JSON.stringify(prepared.command))") ==
               std::string::npos &&
-          response.body.find("retiredBrowserPacketPath") == std::string::npos,
+          control_assets.find("retiredBrowserPacketPath") == std::string::npos,
       "a retired 50ms browser packet heartbeat or ordinary DataChannel send remains active");
   expect(
-      response.body.find("function applyVehicleSafetyState(value)") !=
+      control_assets.find("function applyVehicleSafetyState(value)") !=
               std::string::npos &&
-          response.body.find("next==='DEGRADED'){clearControlInput(false)") !=
+          control_assets.find("next==='DEGRADED'){clearControlInput(false)") !=
               std::string::npos &&
-          response.body.find("next==='DEGRADED'&&lastVehicleSafetyState") ==
+          control_assets.find("next==='DEGRADED'&&lastVehicleSafetyState") ==
               std::string::npos &&
-          response.body.find("clearControlInput(false)") != std::string::npos &&
-          response.body.find("driver_input_cleared_on_degraded") !=
+          control_assets.find("clearControlInput(false)") != std::string::npos &&
+          control_assets.find("driver_input_cleared_on_degraded") !=
               std::string::npos &&
-          response.body.find("applyVehicleSafetyState(message.safety_state)") !=
+          control_assets.find("applyVehicleSafetyState(message.safety_state)") !=
               std::string::npos,
       "recoverable vehicle degradation can replay held driver input");
   expect(
-      response.body.find("function vcuStateRequiresFreshInput") != std::string::npos &&
-          response.body.find("controlLogic.requiresFreshInput(value)") != std::string::npos &&
-          response.body.find("controlLogic.transitionVcuState(vcuEverReady,value)") !=
+      control_assets.find("function vcuStateRequiresFreshInput") != std::string::npos &&
+          control_assets.find("controlLogic.requiresFreshInput(value)") != std::string::npos &&
+          control_assets.find("controlLogic.transitionVcuState(vcuEverReady,value)") !=
               std::string::npos &&
-          response.body.find("function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}") !=
+          control_assets.find("function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}") !=
               std::string::npos &&
-          response.body.find("if(!vcuEverReady&&!vcuMockUnsupported())") != std::string::npos &&
-          response.body.find("首次握手完成后请重新按下") != std::string::npos,
+          control_assets.find("if(!vcuEverReady&&!vcuMockUnsupported())") != std::string::npos &&
+          control_assets.find("首次握手完成后请重新按下") != std::string::npos,
       "initial authority, fault, or disarm does not require fresh control input");
   expect(
-      response.body.find("lastControlStatusSeq=0") != std::string::npos &&
-          response.body.find("function acceptControlStatusMessage(message)") !=
+      control_assets.find("lastControlStatusSeq=0") != std::string::npos &&
+          control_assets.find("function acceptControlStatusMessage(message)") !=
               std::string::npos &&
-          response.body.find("controlLogic.reduceStatusSequence(lastControlStatusSeq") !=
+          control_assets.find("controlLogic.reduceStatusSequence(lastControlStatusSeq") !=
               std::string::npos &&
-          response.body.find("if(!acceptControlStatusMessage(message))return") !=
+          control_assets.find("if(!acceptControlStatusMessage(message))return") !=
               std::string::npos &&
-          response.body.find("control_status_message_dropped") != std::string::npos &&
-          response.body.find("if(!acceptControlStatusMessage(message))return;") <
-              response.body.find("const gearRejectionMatched=") &&
-          response.body.find("control_status_sequence_gap") != std::string::npos,
+          control_assets.find("control_status_message_dropped") != std::string::npos &&
+          control_assets.find("if(!acceptControlStatusMessage(message))return;") <
+              control_assets.find("const gearRejectionMatched=") &&
+          control_assets.find("control_status_sequence_gap") != std::string::npos,
       "unordered vehicle status messages can replay stale VCU authority");
   expect(
-      response.body.find("function vcuStateKeepsHeldInput") != std::string::npos &&
-          response.body.find("controlLogic.keepsHeldInput(vcuEverReady,value)") !=
+      control_assets.find("function vcuStateKeepsHeldInput") != std::string::npos &&
+          control_assets.find("controlLogic.keepsHeldInput(vcuEverReady,value)") !=
               std::string::npos &&
-          response.body.find("gearTransitionPending=Boolean(pendingGearTransition)") !=
+          control_assets.find("gearTransitionPending=Boolean(pendingGearTransition)") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "if((retainedWait||gearTransitionPending)&&!estopRequested)outgoing.throttle=0") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "if(pendingGearTransition&&!control.estop)control.throttle=0") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "!blockReason&&!vcuDrivingReady()&&!estopRequested&&!retainedWait") !=
               std::string::npos &&
-          response.body.find("换挡闭环中（输入保持）") != std::string::npos &&
-          response.body.find("执行器闭环中（输入保持）") != std::string::npos &&
-          response.body.find("输入已清除，等待新鲜 VCU Ready") != std::string::npos,
+          control_assets.find("换挡闭环中（输入保持）") != std::string::npos &&
+          control_assets.find("执行器闭环中（输入保持）") != std::string::npos &&
+          control_assets.find("输入已清除，等待新鲜 VCU Ready") != std::string::npos,
       "authorized VCU convergence waits do not retain inputs with zero-throttle heartbeats");
   expect(
-      response.body.find(
+      control_assets.find(
           "controlLogic.updateGearChangeStationaryEvidence(gearChangeStationaryEvidence,value,lastControlStatusSeq,performance.now())") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "gear_change_stationary_confirmed:gearChangeStationaryEvidence.confirmed") !=
               std::string::npos &&
-          response.body.find("至少 3 帧且持续 200 ms 的新鲜零速反馈") !=
+          control_assets.find("至少 3 帧且持续 200 ms 的新鲜零速反馈") !=
               std::string::npos,
       "browser gear changes are not gated on stable fresh zero-speed evidence");
-  const auto telemetry_vcu_update = response.body.find(
+  const auto telemetry_vcu_update = control_assets.find(
       "adapter_ready:vcuAdapterReady(message.vcu_handshake,message.vehicle_adapter?.opened)};updateVcuHandshakeState(nextVcuStatus)");
-  const auto telemetry_profile_update = response.body.find(
+  const auto telemetry_profile_update = control_assets.find(
       "applyControlProfileStatus(message.session_control_profile)", telemetry_vcu_update);
-  const auto telemetry_limits_update = response.body.find(
+  const auto telemetry_limits_update = control_assets.find(
       "updateVehicleHardLimits(message.control_limits)", telemetry_profile_update);
-  const auto handshake_vcu_update = response.body.find(
+  const auto handshake_vcu_update = control_assets.find(
       "updateVcuHandshakeState({...nextVcuStatus,driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)})");
-  const auto handshake_limits_update = response.body.find(
+  const auto handshake_limits_update = control_assets.find(
       "updateVehicleHardLimits(message.hard_limits)", handshake_vcu_update);
   expect(
       telemetry_vcu_update != std::string::npos &&
@@ -1384,122 +1404,122 @@ void test_control_page_contract() {
           handshake_vcu_update < handshake_limits_update,
       "vehicle status does not update VCU, profile, and hard-limit state in a deterministic order");
   expect(
-      response.body.find("gamepadRequiresNeutral=true") != std::string::npos &&
-          response.body.find("const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported()") !=
+      control_assets.find("gamepadRequiresNeutral=true") != std::string::npos &&
+          control_assets.find("const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported()") !=
               std::string::npos &&
-          response.body.find("controlLogic.reduceGamepadNeutralInterlock") !=
+          control_assets.find("controlLogic.reduceGamepadNeutralInterlock") !=
               std::string::npos &&
-          response.body.find("applyGamepadNeutralInterlock(gamepadAuthorityReady,true)") !=
+          control_assets.find("applyGamepadNeutralInterlock(gamepadAuthorityReady,true)") !=
               std::string::npos,
       "Gamepad pedals can resume without a physical neutral after an authority or gear-gate reset");
-  expect(response.body.find("driver_vehicle_switch_started") != std::string::npos, "safe vehicle switching UI is missing");
-  const auto switch_request = response.body.find("session=await post('/api/connect'");
-  const auto realtime_close = response.body.find("generation=closeRealtimeSession()", switch_request);
+  expect(control_assets.find("driver_vehicle_switch_started") != std::string::npos, "safe vehicle switching UI is missing");
+  const auto switch_request = control_assets.find("session=await post('/api/connect'");
+  const auto realtime_close = control_assets.find("generation=closeRealtimeSession()", switch_request);
   expect(
       switch_request != std::string::npos && realtime_close != std::string::npos && switch_request < realtime_close,
       "vehicle switch closes the current realtime path before the target is accepted");
   expect(
-      response.body.find("driver_vehicle_switch_rejected") != std::string::npos &&
-          response.body.find("pollSignaling(suspendedGeneration)") != std::string::npos,
+      control_assets.find("driver_vehicle_switch_rejected") != std::string::npos &&
+          control_assets.find("pollSignaling(suspendedGeneration)") != std::string::npos,
       "rejected vehicle switch cannot resume the retained realtime session");
   expect(
-      response.body.find("suspendSignalingPoll()") != std::string::npos &&
-          response.body.find("post('/api/poll-signaling',{},controller.signal)") != std::string::npos,
+      control_assets.find("suspendSignalingPoll()") != std::string::npos &&
+          control_assets.find("post('/api/poll-signaling',{},controller.signal)") != std::string::npos,
       "vehicle switching cannot cancel a stale browser signaling request without closing realtime media");
   expect(
-      response.body.find("current=vehicle.vehicle_id===currentVehicle,selectable=vehicle.controllable||current") !=
+      control_assets.find("current=vehicle.vehicle_id===currentVehicle,selectable=vehicle.controllable||current") !=
           std::string::npos,
       "the active vehicle cannot remain selected while other switch targets refresh");
   expect(
-      response.body.find("if(authenticated&&!connecting)refreshVehicles()") != std::string::npos,
+      control_assets.find("if(authenticated&&!connecting)refreshVehicles()") != std::string::npos,
       "vehicle availability does not refresh during an active session");
   expect(
-      response.body.find("if(result.signaling_restart_recovered)") != std::string::npos &&
-          response.body.find("旧控制权未恢复，请重新选择车辆") != std::string::npos &&
-          response.body.find("control_authority_recovered:false") != std::string::npos,
+      control_assets.find("if(result.signaling_restart_recovered)") != std::string::npos &&
+          control_assets.find("旧控制权未恢复，请重新选择车辆") != std::string::npos &&
+          control_assets.find("control_authority_recovered:false") != std::string::npos,
       "signaling restart recovery does not preserve the no-authority operator state");
   expect(
-      response.body.find("if(result.signaling_available===false)") != std::string::npos &&
-          response.body.find("车辆列表为安全快照，禁止建立控制会话") != std::string::npos &&
-          response.body.find("connectButton.disabled=true") != std::string::npos,
+      control_assets.find("if(result.signaling_available===false)") != std::string::npos &&
+          control_assets.find("车辆列表为安全快照，禁止建立控制会话") != std::string::npos &&
+          control_assets.find("connectButton.disabled=true") != std::string::npos,
       "signaling outage vehicle refresh is not fail-safe and locally readable");
   expect(
-      response.body.find("if(error.status===401){requireLogin") != std::string::npos &&
-          response.body.find("车辆状态刷新失败，当前会话已保留") != std::string::npos,
+      control_assets.find("if(error.status===401){requireLogin") != std::string::npos &&
+          control_assets.find("车辆状态刷新失败，当前会话已保留") != std::string::npos,
       "a transient vehicle-list refresh failure can discard current authority");
-  expect(response.body.find("post('/api/end-session'") != std::string::npos, "failed connection setup cannot release only its session");
-  expect(response.body.find("pollSignaling(generation)") != std::string::npos, "stale signaling pollers are not isolated across vehicle switches");
+  expect(control_assets.find("post('/api/end-session'") != std::string::npos, "failed connection setup cannot release only its session");
+  expect(control_assets.find("pollSignaling(generation)") != std::string::npos, "stale signaling pollers are not isolated across vehicle switches");
   expect(
-      response.body.find("gamepaddisconnected") != std::string::npos &&
-          response.body.find("gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;renderControlState();clientLog('gamepad_disconnected'") !=
+      control_assets.find("gamepaddisconnected") != std::string::npos &&
+          control_assets.find("gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;renderControlState();clientLog('gamepad_disconnected'") !=
               std::string::npos,
       "Gamepad disconnect does not zero its own axes without clearing keyboard input");
-  expect(response.body.find("车辆必须本地确认后才能复位") != std::string::npos, "ESTOP latch feedback is missing");
-  expect(response.body.find("运行监控") != std::string::npos, "operator monitoring panel is missing");
-  expect(response.body.find("控制 RTT") != std::string::npos, "control RTT display is missing");
-  expect(response.body.find("packet_loss_percent") != std::string::npos, "per-stream packet-loss metric is missing");
-  expect(response.body.find("connection_method") != std::string::npos, "ICE path classification is missing");
+  expect(control_assets.find("车辆必须本地确认后才能复位") != std::string::npos, "ESTOP latch feedback is missing");
+  expect(control_assets.find("运行监控") != std::string::npos, "operator monitoring panel is missing");
+  expect(control_assets.find("控制 RTT") != std::string::npos, "control RTT display is missing");
+  expect(control_assets.find("packet_loss_percent") != std::string::npos, "per-stream packet-loss metric is missing");
+  expect(control_assets.find("connection_method") != std::string::npos, "ICE path classification is missing");
   expect(
-      response.body.find("iceTransportPolicy:consoleConfig.ice_transport_policy") != std::string::npos,
+      control_assets.find("iceTransportPolicy:consoleConfig.ice_transport_policy") != std::string::npos,
       "browser RTCPeerConnection does not apply the configured ICE transport policy");
   expect(
-      response.body.find("webrtc_ice_candidate_error") != std::string::npos,
+      control_assets.find("webrtc_ice_candidate_error") != std::string::npos,
       "browser does not record credential-free ICE candidate errors");
   expect(
-      response.body.find("offeredVideoCameraIds(offer.sdp,offer.media_tracks||[])") != std::string::npos &&
-          response.body.find("offeredCameraByMid.get(mid)") != std::string::npos,
+      control_assets.find("offeredVideoCameraIds(offer.sdp,offer.media_tracks||[])") != std::string::npos &&
+          control_assets.find("offeredCameraByMid.get(mid)") != std::string::npos,
       "browser camera IDs are not mapped from the SDP video mids");
   expect(
-      response.body.find("srcObject=new MediaStream([track])") != std::string::npos &&
-          response.body.find("attach(id,e.track)") != std::string::npos,
+      control_assets.find("srcObject=new MediaStream([track])") != std::string::npos &&
+          control_assets.find("attach(id,e.track)") != std::string::npos,
       "browser video elements are not isolated to their individual WebRTC tracks");
-  const auto ontrack_handler = response.body.find("nextPeer.ontrack=e=>");
-  const auto remote_description = response.body.find("await nextPeer.setRemoteDescription", ontrack_handler);
+  const auto ontrack_handler = control_assets.find("nextPeer.ontrack=e=>");
+  const auto remote_description = control_assets.find("await nextPeer.setRemoteDescription", ontrack_handler);
   expect(
       ontrack_handler != std::string::npos &&
           remote_description != std::string::npos &&
-          response.body.substr(ontrack_handler, remote_description - ontrack_handler).find("vcuHandshake") ==
+          control_assets.substr(ontrack_handler, remote_description - ontrack_handler).find("vcuHandshake") ==
               std::string::npos &&
-          response.body.substr(ontrack_handler, remote_description - ontrack_handler).find("controlChannel") ==
+          control_assets.substr(ontrack_handler, remote_description - ontrack_handler).find("controlChannel") ==
               std::string::npos,
       "browser camera attachment is gated on the VCU handshake or control DataChannel");
   expect(
-      response.body.find("e.streams[0]") == std::string::npos,
+      control_assets.find("e.streams[0]") == std::string::npos,
       "browser can bind the same multi-track MediaStream to multiple camera elements");
   expect(
-      response.body.find("if(connectionState==='disconnected')") != std::string::npos &&
-          response.body.find("if(['failed','closed'].includes(connectionState))") != std::string::npos &&
-          response.body.find("peer!==nextPeer") != std::string::npos,
+      control_assets.find("if(connectionState==='disconnected')") != std::string::npos &&
+          control_assets.find("if(['failed','closed'].includes(connectionState))") != std::string::npos &&
+          control_assets.find("peer!==nextPeer") != std::string::npos,
       "a transient or stale peer state change can discard a recoverable control DataChannel");
-  const auto offer_start = response.body.find("async function startFromOffer");
-  const auto offer_authority_reset = response.body.find("resetControlAuthorityInput()", offer_start);
-  const auto offer_peer_create = response.body.find("new RTCPeerConnection", offer_start);
+  const auto offer_start = control_assets.find("async function startFromOffer");
+  const auto offer_authority_reset = control_assets.find("resetControlAuthorityInput()", offer_start);
+  const auto offer_peer_create = control_assets.find("new RTCPeerConnection", offer_start);
   expect(
       offer_start != std::string::npos && offer_authority_reset != std::string::npos &&
           offer_peer_create != std::string::npos && offer_authority_reset < offer_peer_create &&
-          response.body.find("channel.onclose=()=>{") != std::string::npos,
+          control_assets.find("channel.onclose=()=>{") != std::string::npos,
       "a new peer or closed DataChannel can inherit stale VCU authority/input state");
-  const auto data_channel_handler = response.body.find("nextPeer.ondatachannel=e=>{");
-  const auto data_channel_peer_gate = response.body.find(
+  const auto data_channel_handler = control_assets.find("nextPeer.ondatachannel=e=>{");
+  const auto data_channel_peer_gate = control_assets.find(
       "if(!controlLogic.isCurrentPeer(peer,nextPeer)){channel.close();return}",
       data_channel_handler);
-  const auto data_channel_status_reset = response.body.find(
+  const auto data_channel_status_reset = control_assets.find(
       "lastControlStatusSeq=0;",
       data_channel_peer_gate);
-  const auto data_channel_publish = response.body.find(
+  const auto data_channel_publish = control_assets.find(
       "controlChannel=channel;",
       data_channel_status_reset);
-  const auto channel_open_handler = response.body.find("channel.onopen=()=>{", data_channel_publish);
-  const auto channel_message_handler = response.body.find("channel.onmessage=async event=>{", channel_open_handler);
-  const auto channel_close_handler = response.body.find("channel.onclose=()=>{", channel_message_handler);
-  const auto channel_error_handler = response.body.find("channel.onerror=()=>{", channel_close_handler);
+  const auto channel_open_handler = control_assets.find("channel.onopen=()=>{", data_channel_publish);
+  const auto channel_message_handler = control_assets.find("channel.onmessage=async event=>{", channel_open_handler);
+  const auto channel_close_handler = control_assets.find("channel.onclose=()=>{", channel_message_handler);
+  const auto channel_error_handler = control_assets.find("channel.onerror=()=>{", channel_close_handler);
   const std::string channel_identity_gate =
       "if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;";
-  const auto channel_open_gate = response.body.find(channel_identity_gate, channel_open_handler);
-  const auto channel_message_gate = response.body.find(channel_identity_gate, channel_message_handler);
-  const auto channel_close_gate = response.body.find(channel_identity_gate, channel_close_handler);
-  const auto channel_error_gate = response.body.find(channel_identity_gate, channel_error_handler);
-  const auto channel_error_end = response.body.find("};", channel_error_gate);
+  const auto channel_open_gate = control_assets.find(channel_identity_gate, channel_open_handler);
+  const auto channel_message_gate = control_assets.find(channel_identity_gate, channel_message_handler);
+  const auto channel_close_gate = control_assets.find(channel_identity_gate, channel_close_handler);
+  const auto channel_error_gate = control_assets.find(channel_identity_gate, channel_error_handler);
+  const auto channel_error_end = control_assets.find("};", channel_error_gate);
   expect(
       data_channel_handler != std::string::npos && data_channel_peer_gate != std::string::npos &&
           data_channel_status_reset != std::string::npos && data_channel_publish != std::string::npos &&
@@ -1513,91 +1533,92 @@ void test_control_page_contract() {
           channel_error_gate != std::string::npos,
       "control DataChannel lifecycle callbacks do not reject stale peer or channel identities");
   expect(
-      response.body.find("controlChannel=null;", channel_close_gate) < channel_error_handler &&
-          response.body.find("resetControlAuthorityInput()", channel_close_gate) < channel_error_handler &&
+      control_assets.find("controlChannel=null;", channel_close_gate) < channel_error_handler &&
+          control_assets.find("resetControlAuthorityInput()", channel_close_gate) < channel_error_handler &&
           channel_error_end != std::string::npos &&
-          response.body.find("resetControlAuthorityInput()", channel_error_gate) < channel_error_end,
+          control_assets.find("resetControlAuthorityInput()", channel_error_gate) < channel_error_end,
       "current control DataChannel close or error is not fail-closed");
   expect(
-      response.body.find("activePeer.connectionState!=='connected'") != std::string::npos,
+      control_assets.find("activePeer.connectionState!=='connected'") != std::string::npos,
       "control commands can be sent while the current WebRTC peer is disconnected");
   expect(
-      response.body.find("if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}") !=
+      control_assets.find("if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}") !=
           std::string::npos,
       "the controller can silently recreate a control DataChannel inside an inhibited media session");
   expect(
-      response.body.find("estopRequested=estopLatched||Boolean(extra.estop)") !=
+      control_assets.find("estopRequested=estopLatched||Boolean(extra.estop)") !=
               std::string::npos &&
-          response.body.find("!blockReason&&estopRequested&&vcuHandshake.adapter_ready===false") !=
+          control_assets.find("!blockReason&&estopRequested&&vcuHandshake.adapter_ready===false") !=
               std::string::npos &&
-          response.body.find("vcu_adapter_unavailable") != std::string::npos &&
-          response.body.find("请使用车辆物理急停") != std::string::npos &&
-          response.body.find("function vcuDrivingReady(){return controlProfileState.acknowledged&&controlLogic.drivingReady(vcuHandshake)}") !=
+          control_assets.find("vcu_adapter_unavailable") != std::string::npos &&
+          control_assets.find("请使用车辆物理急停") != std::string::npos &&
+          control_assets.find("function vcuDrivingReady(){return controlProfileState.acknowledged&&controlLogic.drivingReady(vcuHandshake)}") !=
               std::string::npos,
       "the controller can claim that remote ESTOP was sent while the VCU adapter is unavailable");
   expect(
-      response.body.find("!vcuDrivingReady()&&!estopRequested") != std::string::npos &&
-          response.body.find("async function refreshControlIntent()") != std::string::npos &&
-          response.body.find("sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
+      control_assets.find("!vcuDrivingReady()&&!estopRequested") != std::string::npos &&
+          control_assets.find("async function refreshControlIntent()") != std::string::npos &&
+          control_assets.find("sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
               std::string::npos &&
-          response.body.find("estopRequested=estopLatched||Boolean(extra.estop)") !=
+          control_assets.find("estopRequested=estopLatched||Boolean(extra.estop)") !=
               std::string::npos,
       "a latched ESTOP is not retained by periodic native intent refresh while the VCU handshake is incomplete");
   expect(
-      response.body.find("function vcuAdapterReady(status,explicit){return controlLogic.adapterReady(status,explicit)}") !=
+      control_assets.find("function vcuAdapterReady(status,explicit){return controlLogic.adapterReady(status,explicit)}") !=
               std::string::npos,
       "an older vehicle without adapter_ready cannot use the compatibility-safe unknown state");
-  const auto estop_monitor = response.body.find(
+  const auto estop_monitor = control_assets.find(
       "const estopPresentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason)");
-  const auto estop_banner = response.body.find(
+  const auto estop_banner = control_assets.find(
       "function renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason))");
   expect(
       estop_monitor != std::string::npos && estop_banner != std::string::npos &&
-          response.body.find("renderEstopRequest(estopPresentation)", estop_monitor) !=
+          control_assets.find("renderEstopRequest(estopPresentation)", estop_monitor) !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "if(estopPresentation.visible){alerts.push(estopPresentation.alert);severity=estopPresentation.severity}",
               estop_monitor) != std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner",
               estop_banner) != std::string::npos,
       "vehicle-only ESTOP telemetry does not drive the critical banner and alert presentation");
   expect(
-      response.body.find("function controlProfileParkingReady()") !=
+      control_assets.find("function controlProfileParkingReady()") !=
               std::string::npos &&
-          response.body.find("defaultProfileAutoAttempted") == std::string::npos &&
-          response.body.find(
+          control_assets.find("defaultProfileAutoAttempted") == std::string::npos &&
+          control_assets.find(
               "prepareControlProfile(controlProfileState.requestedProfile,false)") ==
               std::string::npos,
       "a completed VCU disconnect can silently reapply a legacy session profile");
-  const auto neutralize_input = response.body.find(
+  const auto neutralize_input = control_assets.find(
       "function neutralizeInput(){clearControlInput(false);send({},false).catch(console.error)}");
-  const auto blur_neutralize = response.body.find(
+  const auto blur_neutralize = control_assets.find(
       "addEventListener('blur',neutralizeInput)", neutralize_input);
-  const auto hidden_neutralize = response.body.find(
+  const auto hidden_neutralize = control_assets.find(
       "document.addEventListener('visibilitychange',()=>{if(document.hidden)neutralizeInput()})",
       blur_neutralize);
   expect(
       neutralize_input != std::string::npos && blur_neutralize != std::string::npos &&
           hidden_neutralize != std::string::npos &&
-          response.body.find("activeChannel.bufferedAmount>4096") == std::string::npos,
+          control_assets.find("activeChannel.bufferedAmount>4096") == std::string::npos,
       "blur or page hiding does not publish a neutral native intent independent of DataChannel backpressure");
-  expect(response.body.find("时延超过 200 ms") != std::string::npos, "latency threshold alarm is missing");
-  expect(response.body.find("低于 20 FPS") != std::string::npos, "FPS threshold alarm is missing");
-  expect(response.body.find("sent_at_utc_ms:Date.now()") != std::string::npos, "browser-local logs do not use UTC milliseconds");
-  expect(response.body.find("fetch('/api/browser-event'") != std::string::npos, "browser events are not persisted by the local runtime");
+  expect(control_assets.find("时延超过 200 ms") != std::string::npos, "latency threshold alarm is missing");
+  expect(control_assets.find("低于 20 FPS") != std::string::npos, "FPS threshold alarm is missing");
+  expect(control_assets.find("sent_at_utc_ms:Date.now()") != std::string::npos, "browser-local logs do not use UTC milliseconds");
+  expect(control_assets.find("fetch('/api/browser-event'") != std::string::npos, "browser events are not persisted by the local runtime");
   expect(
-      response.body.find("\"control_trace_commands\":true") != std::string::npos &&
-          response.body.find("const controlTraceEnabled=Boolean(consoleConfig.control_trace_commands)") !=
+      console_config_response.body.find("\"control_trace_commands\":true") != std::string::npos &&
+          control_assets.find("\"control_trace_commands\":true") == std::string::npos &&
+          control_assets.find("const controlTraceEnabled=Boolean(consoleConfig.control_trace_commands)") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "clientLog('control_trace_batch',{reason,trace_session_id:String(scope&&scope.session_id||''),"
               "trace_vehicle_id:String(scope&&scope.vehicle_id||''),commands,summary})") !=
               std::string::npos &&
-          response.body.find("controlTraceBuffer.length>=48") != std::string::npos &&
-          response.body.find("setInterval(()=>flushControlTrace('interval'),1000)") !=
+          control_assets.find("controlTraceBuffer.length>=48") != std::string::npos &&
+          control_assets.find("setInterval(()=>flushControlTrace('interval'),1000)") !=
               std::string::npos &&
-          response.body.find("clientLog('control_trace_command'") == std::string::npos,
+          control_assets.find("clientLog('control_trace_command'") == std::string::npos,
       "control command tracing is not enabled through a bounded one-second batch");
   for (const std::string_view field : {
            "session_id", "intent_seq", "trace_session_id", "trace_vehicle_id",
@@ -1605,55 +1626,55 @@ void test_control_page_contract() {
            "timer_lag_max_ms", "explicit_send_count", "prepare_preempted_by_estop_count",
            "queue_unhandled_error_count"}) {
     expect(
-        response.body.find(field) != std::string::npos,
+        control_assets.find(field) != std::string::npos,
         "control trace field is missing from the page: " + std::string(field));
   }
-  const auto trace_flush = response.body.find("function flushControlTrace(");
+  const auto trace_flush = control_assets.find("function flushControlTrace(");
   expect(
       trace_flush != std::string::npos &&
-          response.body.find("summary.heartbeat_tick_count", trace_flush) != std::string::npos &&
-          response.body.find("summary.explicit_send_count", trace_flush) != std::string::npos &&
-          response.body.find("summary.queue_unhandled_error_count", trace_flush) !=
+          control_assets.find("summary.heartbeat_tick_count", trace_flush) != std::string::npos &&
+          control_assets.find("summary.explicit_send_count", trace_flush) != std::string::npos &&
+          control_assets.find("summary.queue_unhandled_error_count", trace_flush) !=
               std::string::npos,
       "summary-only native intent refresh activity can be discarded during trace flush");
-  const auto intent_refresh = response.body.find("async function refreshControlIntent()");
-  const auto intent_refresh_timer = response.body.find(
+  const auto intent_refresh = control_assets.find("async function refreshControlIntent()");
+  const auto intent_refresh_timer = control_assets.find(
       "setInterval(()=>refreshControlIntent().catch(console.error),intentRefreshIntervalMs)",
       intent_refresh);
   expect(
       intent_refresh != std::string::npos && intent_refresh_timer != std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "intentRefreshIntervalMs=Math.max(50,Math.floor(Number(consoleConfig.intent_lease_ms||200)/3))") !=
               std::string::npos &&
-          response.body.find("async function heartbeat()") == std::string::npos,
+          control_assets.find("async function heartbeat()") == std::string::npos,
       "browser intent renewal is not derived from the lease or still owns the retired packet heartbeat");
-  const auto connect_handler = response.body.find("async function connect()");
-  const auto connect_close = response.body.find("generation=closeRealtimeSession()", connect_handler);
+  const auto connect_handler = control_assets.find("async function connect()");
+  const auto connect_close = control_assets.find("generation=closeRealtimeSession()", connect_handler);
   const auto connect_trace_scope =
-      response.body.find("setControlTraceScope(session.session_id,session.vehicle_id)", connect_close);
+      control_assets.find("setControlTraceScope(session.session_id,session.vehicle_id)", connect_close);
   expect(
       connect_handler != std::string::npos && connect_close != std::string::npos &&
           connect_trace_scope != std::string::npos && connect_close < connect_trace_scope,
       "new browser control traces are not scoped after the previous realtime session is flushed");
-  const auto peer_state_handler = response.body.find("nextPeer.onconnectionstatechange=()=>{");
+  const auto peer_state_handler = control_assets.find("nextPeer.onconnectionstatechange=()=>{");
   const auto peer_terminal_flush =
-      response.body.find("flushControlTrace(`peer_${connectionState}`)", peer_state_handler);
+      control_assets.find("flushControlTrace(`peer_${connectionState}`)", peer_state_handler);
   const auto peer_terminal_log =
-      response.body.find("clientLog('webrtc_peer_terminal'", peer_state_handler);
-  const auto peer_terminal_clear = response.body.find(
+      control_assets.find("clientLog('webrtc_peer_terminal'", peer_state_handler);
+  const auto peer_terminal_clear = control_assets.find(
       "if(controlChannel===terminalChannel)controlChannel=null", peer_state_handler);
   expect(
       peer_state_handler != std::string::npos && peer_terminal_flush != std::string::npos &&
           peer_terminal_log != std::string::npos && peer_terminal_clear != std::string::npos &&
           peer_terminal_flush < peer_terminal_log && peer_terminal_log < peer_terminal_clear,
       "terminal peer state can clear the DataChannel before its trace and failure context are persisted");
-  const auto data_channel_error_handler = response.body.find("channel.onerror=()=>{");
+  const auto data_channel_error_handler = control_assets.find("channel.onerror=()=>{");
   const auto data_channel_error_log =
-      response.body.find("clientLog('control_datachannel_error'", data_channel_error_handler);
+      control_assets.find("clientLog('control_datachannel_error'", data_channel_error_handler);
   const auto data_channel_error_flush =
-      response.body.find("flushControlTrace('datachannel_error')", data_channel_error_handler);
+      control_assets.find("flushControlTrace('datachannel_error')", data_channel_error_handler);
   const auto data_channel_error_reset =
-      response.body.find("resetControlAuthorityInput()", data_channel_error_handler);
+      control_assets.find("resetControlAuthorityInput()", data_channel_error_handler);
   expect(
       data_channel_error_handler != std::string::npos &&
           data_channel_error_flush != std::string::npos &&
@@ -1662,28 +1683,28 @@ void test_control_page_contract() {
           data_channel_error_flush < data_channel_error_log &&
           data_channel_error_log < data_channel_error_reset,
       "DataChannel errors are not persisted before control input is cleared");
-  const auto data_channel_close_handler = response.body.find("channel.onclose=()=>{");
+  const auto data_channel_close_handler = control_assets.find("channel.onclose=()=>{");
   const auto data_channel_close_flush =
-      response.body.find("flushControlTrace('datachannel_close')", data_channel_close_handler);
+      control_assets.find("flushControlTrace('datachannel_close')", data_channel_close_handler);
   const auto data_channel_close_clear =
-      response.body.find("controlChannel=null", data_channel_close_handler);
+      control_assets.find("controlChannel=null", data_channel_close_handler);
   expect(
       data_channel_close_handler != std::string::npos &&
           data_channel_close_flush != std::string::npos &&
           data_channel_close_clear != std::string::npos &&
           data_channel_close_flush < data_channel_close_clear,
       "DataChannel close does not flush the pending control trace");
-  expect(response.body.find("dev-password") == std::string::npos, "driver credential leaked into the control page");
+  expect(control_assets.find("dev-password") == std::string::npos, "driver credential leaked into the control page");
   expect(
-      response.body.find("async function refreshControlIntent(){const now=performance.now();if(!polling)") !=
+      control_assets.find("async function refreshControlIntent(){const now=performance.now();if(!polling)") !=
               std::string::npos &&
-          response.body.find("sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
+          control_assets.find("sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
               std::string::npos,
       "background intent renewal can run without an active session or bypass latest-write coalescing");
-  const auto pagehide = response.body.find("addEventListener('pagehide'");
-  const auto pagehide_flush = response.body.find("flushControlTrace('pagehide')", pagehide);
-  const auto pagehide_close = response.body.find("closeRealtimeSession()", pagehide);
-  const auto pagehide_disconnect = response.body.find("fetch('/api/disconnect'", pagehide);
+  const auto pagehide = control_assets.find("addEventListener('pagehide'");
+  const auto pagehide_flush = control_assets.find("flushControlTrace('pagehide')", pagehide);
+  const auto pagehide_close = control_assets.find("closeRealtimeSession()", pagehide);
+  const auto pagehide_disconnect = control_assets.find("fetch('/api/disconnect'", pagehide);
   expect(
       pagehide != std::string::npos && pagehide_flush != std::string::npos &&
           pagehide_close != std::string::npos && pagehide_disconnect != std::string::npos &&
@@ -1705,6 +1726,192 @@ void test_control_page_contract() {
   expect(
       initial_status.at("authorized_vehicles").is_array() && initial_status.at("authorized_vehicles").empty(),
       "initial authorized vehicles are not an empty array");
+}
+
+void test_console_assets_routes_config_and_security_headers() {
+  mine_teleop::DriverConfig config;
+  config.driver_id = "driver-console-assets-r06";
+  config.signaling_url = "https://signal.example.test";
+  config.control_trace_commands = true;
+  auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(config, "vehicle-001", "dev-password");
+  mine_teleop::DriverConsoleHttpApp app(runtime);
+  const auto get_console_response = [&app](std::string path) {
+    mine_teleop::HttpRequest request;
+    request.method = "GET";
+    request.path = std::move(path);
+    return app.handle(request);
+  };
+
+  const auto page = [&] {
+    mine_teleop::HttpRequest request;
+    request.method = "GET";
+    request.path = "/";
+    return app.handle(request);
+  }();
+  expect(page.status == 200, "console page did not load");
+  expect(page.content_type == "text/html; charset=utf-8", "console page has the wrong content type");
+
+  const auto page_html = [&] {
+    mine_teleop::HttpRequest request;
+    request.method = "GET";
+    request.path = "/assets/control_console.html";
+    return app.handle(request);
+  }();
+  expect(page_html.status == 200, "embedded console HTML asset did not load");
+  expect(page_html.content_type == "text/html; charset=utf-8", "embedded console HTML asset has the wrong content type");
+  expect(page_html.body == page.body, "console HTML asset bytes differ from the root console route");
+
+  const auto page_css = [&] {
+    mine_teleop::HttpRequest request;
+    request.method = "GET";
+    request.path = "/assets/control_console.css";
+    return app.handle(request);
+  }();
+  expect(page_css.status == 200, "console stylesheet did not load");
+  expect(page_css.content_type == "text/css; charset=utf-8", "console stylesheet has the wrong content type");
+  expect(page_css.body.find(":root{color-scheme:dark") != std::string::npos, "console stylesheet content is missing");
+
+  const auto page_logic = [&] {
+    mine_teleop::HttpRequest request;
+    request.method = "GET";
+    request.path = "/assets/control_logic.js";
+    return app.handle(request);
+  }();
+  expect(page_logic.status == 200, "shared control logic script did not load");
+  expect(page_logic.content_type == "application/javascript; charset=utf-8", "control logic script has the wrong content type");
+  expect(page_logic.body.find("MineTeleopControlLogic") != std::string::npos, "control logic script content is missing");
+
+  const auto page_js = [&] {
+    mine_teleop::HttpRequest request;
+    request.method = "GET";
+    request.path = "/assets/control_console.js";
+    return app.handle(request);
+  }();
+  expect(page_js.status == 200, "console page script did not load");
+  expect(page_js.content_type == "application/javascript; charset=utf-8", "console page script has the wrong content type");
+  expect(page_js.body.find("fetch('/api/console-config',{cache:'no-store'})") != std::string::npos,
+         "console page script does not fetch no-store runtime configuration");
+  expect(page_js.body.find("await consoleConfigResponse.json()") != std::string::npos,
+         "console page script does not await the runtime configuration");
+  expect(page_js.body.find("pageCapability") != std::string::npos, "console page script does not use the runtime page capability");
+  expect(page_js.body.find("'x-mine-teleop-page-capability':pageCapability") != std::string::npos,
+         "console page script does not bind mutations to the runtime page capability");
+  expect(page_js.body.find("addEventListener('keydown'") != std::string::npos || page_js.body.find("addEventListener(\"keydown\"") != std::string::npos,
+         "console page script lost keyboard capture");
+  expect(page_js.body.find("addEventListener('pagehide'") != std::string::npos || page_js.body.find("addEventListener(\"pagehide\"") != std::string::npos,
+         "console page script lost pagehide cleanup");
+
+  const auto config_response = [&] {
+    mine_teleop::HttpRequest request;
+    request.method = "GET";
+    request.path = "/api/console-config";
+    return app.handle(request);
+  }();
+  expect(config_response.status == 200, "console configuration endpoint did not load");
+  expect(config_response.content_type == "application/json; charset=utf-8", "console configuration is not JSON");
+  expect(config_response.body.find(app.page_capability()) != std::string::npos,
+         "console configuration does not carry the runtime page capability");
+  expect(config_response.body.find("\"initial_target_speed_kph\"") != std::string::npos,
+         "console configuration does not carry control limit defaults");
+  expect(config_response.body.find("\"axis_deadzone\"") != std::string::npos,
+         "console configuration does not carry gamepad calibration");
+  const auto parsed_config = mine_teleop::Json::parse(config_response.body);
+  expect(parsed_config.is_object(), "console configuration is not a JSON object");
+  expect(parsed_config.value("page_capability", "") == app.page_capability(),
+         "console configuration page capability differs from the app token");
+
+  expect(page.body.find("<link rel=\"stylesheet\" href=\"/assets/control_console.css\">") != std::string::npos,
+         "console page does not reference its external stylesheet");
+  expect(page.body.find("<script src=\"/assets/control_logic.js\">") != std::string::npos,
+         "console page does not load the shared control logic script");
+  expect(page.body.find("<script type=\"module\" src=\"/assets/control_console.js\">") != std::string::npos,
+         "console page does not load its module page script");
+  expect(page.body.find("<style>") == std::string::npos, "console page still embeds inline styles");
+  expect(page.body.find("const controlLogic=") == std::string::npos, "console page still embeds inline page script");
+  expect(page.body.find("addEventListener") == std::string::npos, "console page still embeds inline event wiring");
+  expect(page.body.find(" onclick=") == std::string::npos &&
+             page.body.find(" onload=") == std::string::npos &&
+             page.body.find(" onerror=") == std::string::npos,
+         "console page still embeds inline event attributes");
+  expect(page.body.find(app.page_capability()) == std::string::npos,
+         "console page embeds the runtime page capability in static HTML");
+  expect(page.body.find("\"initial_target_speed_kph\"") == std::string::npos,
+         "console page embeds dynamic configuration in static HTML");
+  expect(page.body.find("id=\"estop\"") != std::string::npos && page.body.find("id=\"control-steering\"") != std::string::npos &&
+             page.body.find("id=\"control-limits-dialog\"") != std::string::npos && page.body.find("id=\"keyboard-panel\"") != std::string::npos &&
+             page.body.find("id=\"vcu-panel\"") != std::string::npos && page.body.find("id=\"monitor-panel\"") != std::string::npos,
+         "console page dropped required control DOM IDs");
+
+  std::vector<std::pair<std::string, std::string>> required_headers{
+      {"X-Frame-Options", "DENY"},
+      {"X-Content-Type-Options", "nosniff"},
+      {"Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'none'"},
+      {"Referrer-Policy", "no-referrer"},
+      {"Cache-Control", "no-store"},
+  };
+  for (const auto& [name, expected] : required_headers) {
+    for (const auto& response : {page, page_html, page_css, page_logic, page_js, config_response}) {
+      expect(response_header(response, name) == expected, "console route missing or wrong security header " + name);
+      expect(response_header_count(response, name) == 1, "console route duplicated security header " + name);
+    }
+  }
+  expect(response_header(config_response, "Cache-Control") == "no-store",
+         "console configuration endpoint is cacheable");
+  expect(response_header(page, "Content-Security-Policy").find("unsafe-inline") == std::string::npos,
+         "console CSP weakened external asset enforcement with unsafe-inline");
+  expect(response_header(page, "Strict-Transport-Security").empty(),
+         "loopback console response must not set HSTS");
+
+  mine_teleop::HttpRequest mutation;
+  mutation.method = "POST";
+  mutation.path = "/api/browser-event";
+  mutation.body = R"({"event":"console_security_headers_contract","details":{}})";
+  authorize_local_post(app, mutation);
+  const auto sensitive_post = app.handle(mutation);
+  expect(sensitive_post.status == 200, "authorized sensitive console mutation was rejected");
+  expect(response_header(sensitive_post, "X-Frame-Options") == "DENY" &&
+             response_header(sensitive_post, "X-Content-Type-Options") == "nosniff" &&
+             response_header(sensitive_post, "Content-Security-Policy") == required_headers[2].second &&
+             response_header(sensitive_post, "Cache-Control") == "no-store",
+         "sensitive console mutation response lacks security headers");
+  for (const auto& [name, _] : required_headers) {
+    expect(response_header_count(sensitive_post, name) == 1,
+           "sensitive console mutation duplicated security header " + name);
+  }
+
+  expect(get_console_response("/assets/not-an-asset.js").status == 404,
+         "unknown console asset path was not rejected");
+  expect(get_console_response("/assets/../server.cpp").status == 404,
+         "traversal asset path was not rejected");
+  expect(get_console_response("/etc/passwd").status == 404,
+         "non-console filesystem path was served");
+  expect(get_console_response("/assets").status == 404,
+         "console asset directory listing is exposed");
+
+  const std::string script_terminator_fixture =
+      "</script><script>window.mine_teleop_r06_injected=true</script>";
+  auto script_terminator_config = config;
+  script_terminator_config.ice_transport_policy = script_terminator_fixture;
+  auto script_terminator_runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(
+      script_terminator_config, "vehicle-001", "dev-password");
+  mine_teleop::DriverConsoleHttpApp script_terminator_app(script_terminator_runtime);
+  const auto script_terminator_get = [&script_terminator_app](std::string path) {
+    mine_teleop::HttpRequest request;
+    request.method = "GET";
+    request.path = std::move(path);
+    return script_terminator_app.handle(request);
+  };
+  const auto script_terminator_page = script_terminator_get("/");
+  const auto script_terminator_config_response = script_terminator_get("/api/console-config");
+  const auto script_terminator_json = mine_teleop::Json::parse(script_terminator_config_response.body);
+  expect(script_terminator_page.body == page.body,
+         "runtime configuration changed the static console HTML document");
+  expect(script_terminator_page.body.find(script_terminator_fixture) == std::string::npos,
+         "script terminator fixture was embedded in executable console HTML");
+  expect(script_terminator_config_response.content_type == "application/json; charset=utf-8" &&
+             response_header(script_terminator_config_response, "Cache-Control") == "no-store" &&
+             script_terminator_json.value("ice_transport_policy", "") == script_terminator_fixture,
+         "script terminator fixture was not retained as inert no-store JSON configuration data");
 }
 
 void test_driver_gamepad_config() {
@@ -7651,6 +7858,8 @@ int main() {
       {"driver_time_sync_uncertainty_fails_closed_at_production_default",
        test_driver_time_sync_uncertainty_fails_closed_at_production_default},
       {"control_page_contract", test_control_page_contract},
+      {"console_assets_routes_config_and_security_headers",
+       test_console_assets_routes_config_and_security_headers},
       {"driver_gamepad_config", test_driver_gamepad_config},
       {"vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start",
        test_vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start},
