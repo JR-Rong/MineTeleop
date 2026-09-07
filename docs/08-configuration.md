@@ -588,7 +588,7 @@ vehicle_adapter:
 `mine_teleop_chassis_open`、`mine_teleop_chassis_open_v1`、
 `mine_teleop_chassis_open_v2`、`mine_teleop_chassis_open_v3`、
 `mine_teleop_chassis_open_v4`、
-`mine_teleop_chassis_apply_state`、
+`mine_teleop_chassis_apply_state_v2`、
 `mine_teleop_chassis_emergency_stop`、`mine_teleop_chassis_update_feedback`、
 `mine_teleop_chassis_poll_feedback`、`mine_teleop_chassis_read_telemetry` 和
 `mine_teleop_chassis_close`。该 bridge 会链接
@@ -597,6 +597,9 @@ ChassisControl `chassis_control` 动态库；MinePilot `include/can/can_common.h
 `can_sender.h` 作为发送侧依赖一并记录和校验；bridge 前置检查还会确认
 `src/can_db.cpp`、`src/can_receiver.cpp` 和 `src/can_sender.cpp` 存在，
 避免目标主机发送/接收探针缺少源码。
+`mine_teleop_chassis_apply_state` 仍作为直接 C ABI 调用方的兼容导出；原生
+adapter 仅动态加载带结构化结果的 `mine_teleop_chassis_apply_state_v2`，不会把
+legacy wrapper 当作启动前置条件。
 运行时的 CAN 接收线程应把 MinePilot `DecodedCanData` 形态的最新数据交给
 `ChassisControlFeedbackPump`；该泵会抽取握手、驻车、挡位、MCU/EPS/EHB 模式和车速快照，并调用 adapter `update_feedback`，最终进入
 `mine_teleop_chassis_update_feedback`，供 ChassisControl arming 状态机和 telemetry

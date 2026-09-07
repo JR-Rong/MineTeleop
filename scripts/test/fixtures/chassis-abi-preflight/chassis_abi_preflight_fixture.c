@@ -11,6 +11,10 @@
 #define MINE_TELEOP_ABI_FIXTURE_HAS_APPLY_STATE_V2 1
 #endif
 
+#ifndef MINE_TELEOP_ABI_FIXTURE_HAS_LEGACY_APPLY_STATE
+#define MINE_TELEOP_ABI_FIXTURE_HAS_LEGACY_APPLY_STATE 1
+#endif
+
 #ifndef MINE_TELEOP_ABI_FIXTURE_HAS_READ_TELEMETRY
 #define MINE_TELEOP_ABI_FIXTURE_HAS_READ_TELEMETRY 1
 #endif
@@ -94,6 +98,7 @@ int mine_teleop_chassis_open_v4(
     return 0;
 }
 
+#if MINE_TELEOP_ABI_FIXTURE_HAS_LEGACY_APPLY_STATE
 int mine_teleop_chassis_apply_state(
     int target_gear,
     double target_vx,
@@ -107,6 +112,7 @@ int mine_teleop_chassis_apply_state(
     (void)steering_count;
     return 0;
 }
+#endif
 
 #if MINE_TELEOP_ABI_FIXTURE_HAS_APPLY_STATE_V2
 int mine_teleop_chassis_apply_state_v2(

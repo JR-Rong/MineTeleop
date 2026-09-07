@@ -5,8 +5,8 @@
   "evidence_commit": "2aca59dbf6218659041bf1ac3daaff24fd46003e",
   "source_of_truth": {
     "public_c_header": "deployments/chassis-control-bridge/mine_teleop_chassis_bridge.h:715-779",
-    "runtime_validator": "cpp/src/core.cpp:593-668",
-    "runtime_adapter_loader": "cpp/src/core.cpp:2439-2466",
+    "runtime_validator": "cpp/src/core.cpp:690-769",
+    "runtime_adapter_loader": "cpp/src/core.cpp:2616-2652",
     "bridge_abi_version_export": "deployments/chassis-control-bridge/chassis_control_bridge.cpp:3155"
   },
   "supported_package": {
@@ -18,7 +18,7 @@
     "config_check_pre_can": {
       "description": "Mirrors the ABI validation that the config-check path and adapter loader perform before a versioned open call.",
       "evidence": [
-        "cpp/src/core.cpp:593-668",
+        "cpp/src/core.cpp:690-769",
         "cpp/apps/mine_teleop.cpp:1017-1044"
       ],
       "checks": [
@@ -96,17 +96,12 @@
       ]
     },
     "vehicle_agent_pre_can": {
-      "description": "Adds every symbol loaded by ChassisControlAdapter::ensure_loaded before mine_teleop_chassis_open_v4 can be invoked.",
+      "description": "Adds every symbol DynamicLibraryVehicleAdapter::ensure_loaded resolves before mine_teleop_chassis_open_v4 can be invoked. The legacy apply_state wrapper remains an exported compatibility symbol, not a runtime dependency.",
       "extends": "config_check_pre_can",
       "evidence": [
-        "cpp/src/core.cpp:2439-2466",
-        "cpp/src/core.cpp:2504"
+        "cpp/src/core.cpp:2616-2652"
       ],
       "checks": [
-        {
-          "symbol": "mine_teleop_chassis_apply_state",
-          "kind": "symbol"
-        },
         {
           "symbol": "mine_teleop_chassis_emergency_stop",
           "kind": "symbol"

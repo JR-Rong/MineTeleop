@@ -49,12 +49,14 @@ valid_bridge="$temporary/libmine_teleop_chassis_bridge-valid.so"
 wrong_version_bridge="$temporary/libmine_teleop_chassis_bridge-v5.so"
 wrong_size_bridge="$temporary/libmine_teleop_chassis_bridge-wrong-v4-size.so"
 missing_apply_v2_bridge="$temporary/libmine_teleop_chassis_bridge-missing-apply-v2.so"
+missing_legacy_apply_bridge="$temporary/libmine_teleop_chassis_bridge-missing-legacy-apply.so"
 missing_telemetry_bridge="$temporary/libmine_teleop_chassis_bridge-missing-telemetry.so"
 
 build_fixture "$valid_bridge"
 build_fixture "$wrong_version_bridge" -DMINE_TELEOP_ABI_FIXTURE_VERSION=5U
 build_fixture "$wrong_size_bridge" -DMINE_TELEOP_ABI_FIXTURE_WRONG_V4_SIZE=1
 build_fixture "$missing_apply_v2_bridge" -DMINE_TELEOP_ABI_FIXTURE_HAS_APPLY_STATE_V2=0
+build_fixture "$missing_legacy_apply_bridge" -DMINE_TELEOP_ABI_FIXTURE_HAS_LEGACY_APPLY_STATE=0
 build_fixture "$missing_telemetry_bridge" -DMINE_TELEOP_ABI_FIXTURE_HAS_READ_TELEMETRY=0
 
 package_root="$temporary/package"
@@ -97,6 +99,18 @@ grep -F '"code":"abi_value_mismatch"' "$wrong_size_output" >/dev/null || \
   fail "wrong V4 POD size did not report abi_value_mismatch"
 grep -F '"symbol":"mine_teleop_chassis_open_config_v4_size"' "$wrong_size_output" >/dev/null || \
   fail "wrong V4 POD size reported the wrong query"
+assert_no_can_initialization
+
+missing_legacy_apply_output="$temporary/missing-legacy-apply.json"
+if ! env MINE_TELEOP_ABI_PRECHECK_MARKER="$marker" \
+  "$python" "$preflight" --contract "$contract" \
+  --bridge-library "$missing_legacy_apply_bridge" --profile vehicle_agent_pre_can \
+  >"$missing_legacy_apply_output"; then
+  sed -n '1p' "$missing_legacy_apply_output" >&2
+  fail "vehicle-agent preflight still required the legacy apply_state wrapper"
+fi
+grep -F '"passed":true' "$missing_legacy_apply_output" >/dev/null || \
+  fail "bridge without legacy apply_state was not accepted"
 assert_no_can_initialization
 
 missing_apply_v2_output="$temporary/missing-apply-v2.json"

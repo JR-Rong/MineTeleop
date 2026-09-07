@@ -164,7 +164,9 @@ ABI 5 is rejected, so the runtime and bridge must be deployed together.
 `apply_state_v2` returns a fixed-size POD result in the same locked call. It
 distinguishes the D/R moving-or-stale gate from other rejected applies without
 exporting bridge log strings or requiring a racy last-error getter. The legacy
-`apply_state` symbol remains a fail-closed integer wrapper.
+`apply_state` symbol remains a fail-closed integer wrapper for direct ABI
+callers; the vehicle-agent runtime resolves only `apply_state_v2` and no
+longer dynamically requires that legacy export.
 The bridge continues to export `mine_teleop_chassis_open_v1`,
 `mine_teleop_chassis_open_v2`, and `mine_teleop_chassis_open_v3` for direct ABI
 callers and unit fixtures. V3 has no rise-rate field, so direct PID torque

@@ -10,11 +10,10 @@
       "kind": "production_runtime_dynamic_loader",
       "required_profile": "vehicle_agent_pre_can",
       "evidence": [
-        "cpp/src/core.cpp:593-668",
-        "cpp/src/core.cpp:2439-2466",
-        "cpp/src/core.cpp:2504"
+        "cpp/src/core.cpp:690-769",
+        "cpp/src/core.cpp:2616-2652"
       ],
-      "notes": "The adapter validates the ABI handle and loads the remaining runtime symbols before invoking open_v4."
+      "notes": "The adapter validates the ABI handle and loads the remaining runtime symbols before invoking open_v4. It resolves apply_state_v2 for normal and ordinary safe-stop control; legacy apply_state remains an external direct-ABI compatibility export."
     },
     {
       "id": "mine-teleop-config-check",

@@ -175,8 +175,8 @@ void test_dynamic_library_preload_boundaries(
 int main(int argc, char** argv) {
   try {
     expect(
-        argc == 13,
-        "expected one V5 and eleven capability/size V6 fixture paths");
+        argc == 14,
+        "expected one V5 and twelve capability/size V6 fixture paths");
     expect_rejected(
         argv[1],
         5U,
@@ -250,6 +250,10 @@ int main(int argc, char** argv) {
             sizeof(MineTeleopChassisStopContextV1) - 1U));
     expect_missing_symbol_rejected(
         argv[12], "mine_teleop_chassis_set_stop_context_v1");
+    // The runtime has migrated every adapter call to apply_state_v2.  ABI 6
+    // still requires that structured capability, but it must not preflight a
+    // legacy wrapper that it no longer resolves.
+    expect_accepted(argv[13]);
     std::cout << "chassis_bridge_abi_loader_tests=passed\n";
     return 0;
   } catch (const std::exception& error) {

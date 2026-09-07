@@ -2619,7 +2619,6 @@ void DynamicLibraryVehicleAdapter::ensure_loaded() {
   try {
     validate_chassis_bridge_abi_handle(handle_);
     open_v4_fn_ = load_symbol<OpenV4Fn>(handle_, "mine_teleop_chassis_open_v4");
-    apply_fn_ = load_symbol<ApplyFn>(handle_, "mine_teleop_chassis_apply_state");
     apply_v2_fn_ = load_symbol<ApplyV2Fn>(
         handle_, "mine_teleop_chassis_apply_state_v2");
     configure_runtime_control_v2_fn_ = load_symbol<ConfigureRuntimeControlV2Fn>(
