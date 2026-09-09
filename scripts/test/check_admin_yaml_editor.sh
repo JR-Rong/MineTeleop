@@ -6,11 +6,40 @@ repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 driver_script="$repo_root/scripts/admin/add_driver.sh"
 vehicle_script="$repo_root/scripts/admin/add_vehicle.sh"
 
-if ! command -v python3 >/dev/null 2>&1 || ! command -v argon2 >/dev/null 2>&1 ||
-  ! python3 -c 'import yaml' >/dev/null 2>&1; then
-  printf 'admin_yaml_editor_test=skipped reason=python3_pyyaml_unavailable\n'
+required=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --require)
+      required=1
+      shift
+      ;;
+    --help | -h)
+      printf 'Usage: %s [--require]\n' "$(basename -- "$0")"
+      exit 0
+      ;;
+    *)
+      printf 'admin_yaml_editor_test=failed reason=unknown_argument argument=%s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+finish_prerequisite_unavailable() {
+  local reason="$1"
+  if [[ $required -eq 1 ]]; then
+    printf 'admin_yaml_editor_test=failed reason=%s\n' "$reason"
+    exit 2
+  fi
+  printf 'admin_yaml_editor_test=skipped reason=%s\n' "$reason"
   exit 0
-fi
+}
+
+command -v python3 >/dev/null 2>&1 ||
+  finish_prerequisite_unavailable "python3_unavailable"
+command -v argon2 >/dev/null 2>&1 ||
+  finish_prerequisite_unavailable "argon2_cli_unavailable"
+python3 -c 'import yaml' >/dev/null 2>&1 ||
+  finish_prerequisite_unavailable "pyyaml_unavailable"
 
 temporary_root="$(mktemp -d /tmp/mine-teleop-admin-yaml-test.XXXXXX)"
 cleanup() {
@@ -91,6 +120,21 @@ expect_failure() {
 file_mode() {
   stat -c '%a' -- "$1" 2>/dev/null || stat -f '%Lp' -- "$1"
 }
+
+if command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -qi 'mikefarah\|version v4'; then
+  write_empty_vehicle_fixture
+  NO_COLOR=1 env MINE_TELEOP_SIGNALING_BIN="$validator_ok" "$vehicle_script" \
+    --id vehicle-yq-applied --config "$fixture_config" --secrets-dir "$secrets_dir" \
+    --assign-to-driver driver-empty >/dev/null
+  grep -Fq 'id: vehicle-yq-applied' "$fixture_config" || {
+    printf 'yq v4 did not add the vehicle\n' >&2
+    exit 2
+  }
+  grep -Fqx '        - vehicle-yq-applied' "$fixture_config" || {
+    printf 'yq v4 did not assign the vehicle to the driver\n' >&2
+    exit 2
+  }
+fi
 
 write_quoted_fixture
 cp "$fixture_config" "$original_config"

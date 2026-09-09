@@ -4,11 +4,40 @@ set -euo pipefail
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 
-if ! command -v python3 >/dev/null 2>&1 || ! command -v argon2 >/dev/null 2>&1 ||
-  ! python3 -c 'import yaml' >/dev/null 2>&1; then
-  printf 'admin_credentials_test=skipped reason=python3_pyyaml_unavailable\n'
+required=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --require)
+      required=1
+      shift
+      ;;
+    --help | -h)
+      printf 'Usage: %s [--require]\n' "$(basename -- "$0")"
+      exit 0
+      ;;
+    *)
+      printf 'admin_credentials_test=failed reason=unknown_argument argument=%s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+finish_prerequisite_unavailable() {
+  local reason="$1"
+  if [[ $required -eq 1 ]]; then
+    printf 'admin_credentials_test=failed reason=%s\n' "$reason"
+    exit 2
+  fi
+  printf 'admin_credentials_test=skipped reason=%s\n' "$reason"
   exit 0
-fi
+}
+
+command -v python3 >/dev/null 2>&1 ||
+  finish_prerequisite_unavailable "python3_unavailable"
+command -v argon2 >/dev/null 2>&1 ||
+  finish_prerequisite_unavailable "argon2_cli_unavailable"
+python3 -c 'import yaml' >/dev/null 2>&1 ||
+  finish_prerequisite_unavailable "pyyaml_unavailable"
 
 temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/mine-teleop-admin-test.XXXXXX")"
 cleanup() {
