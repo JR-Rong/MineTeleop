@@ -2196,6 +2196,26 @@ void test_curl_tls_trust_policy_is_explicit_and_protects_ca_bundles() {
   cleanup();
 }
 
+void test_curl_ca_info_path_owns_narrow_utf8_storage() {
+  const std::u8string utf8_path = u8"C:\\mine-teleop\\ca-\u8BC1\u4E66\\root.pem";
+  const mine_teleop::detail::CurlCaInfoPath ca_info{std::u8string_view(utf8_path)};
+  const std::string expected(
+      reinterpret_cast<const char*>(utf8_path.data()),
+      utf8_path.size());
+
+  expect(ca_info.string() == expected, "curl CAINFO path did not retain UTF-8 bytes");
+  expect(ca_info.c_str() == ca_info.string().c_str(), "curl CAINFO path did not expose owned storage");
+  expect(std::string(ca_info.c_str()) == expected, "curl CAINFO path exposed an unstable C string");
+
+#if !defined(_WIN32)
+  const std::filesystem::path native_path("configs/mine-teleop-field-root.crt");
+  const mine_teleop::detail::CurlCaInfoPath native_ca_info(native_path);
+  expect(
+      native_ca_info.string() == native_path.string(),
+      "curl CAINFO path changed non-Windows native path encoding");
+#endif
+}
+
 void test_control_command_json_round_trip_and_validation() {
   const auto original = command(7, 1234);
   const auto parsed = ControlCommand::from_json(original.to_json());
@@ -5093,6 +5113,8 @@ int main() {
       {"field_config_pins_tls_route_without_system_dns", test_field_config_pins_tls_route_without_system_dns},
       {"curl_tls_trust_policy_is_explicit_and_protects_ca_bundles",
        test_curl_tls_trust_policy_is_explicit_and_protects_ca_bundles},
+      {"curl_ca_info_path_owns_narrow_utf8_storage",
+       test_curl_ca_info_path_owns_narrow_utf8_storage},
       {"control_command_json_round_trip_and_validation", test_control_command_json_round_trip_and_validation},
       {"session_control_profile_json_round_trip_and_physical_units", test_session_control_profile_json_round_trip_and_physical_units},
       {"shared_protocol_v1_vectors_and_session_states", test_shared_protocol_v1_vectors_and_session_states},
