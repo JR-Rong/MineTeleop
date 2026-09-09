@@ -4,6 +4,7 @@
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/platform.hpp"
 #include "mine_teleop/server.hpp"
+#include "test_support.hpp"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -30,6 +31,8 @@
 #include <vector>
 
 namespace {
+
+namespace test = mine_teleop::test;
 
 void expect(bool condition, std::string_view message) {
   if (!condition) throw std::runtime_error(std::string(message));
@@ -374,12 +377,26 @@ void test_shared_control_protocol_vector() {
   auto first = command;
   first.seq = 1;
   first.sent_at_utc_ms = mine_teleop::now_ms();
-  expect(receiver.accept(first, first.sent_at_utc_ms).accepted, "first control sequence was rejected");
+  expect(
+      receiver
+          .accept(
+              first,
+              test::clock_sample(
+                  mine_teleop::UtcMillis{first.sent_at_utc_ms},
+                  mine_teleop::MonotonicMillis{first.sent_at_utc_ms}))
+          .accepted,
+      "first control sequence was rejected");
   auto after_prepared_gap = first;
   after_prepared_gap.seq = 3;
   ++after_prepared_gap.sent_at_utc_ms;
   expect(
-      receiver.accept(after_prepared_gap, after_prepared_gap.sent_at_utc_ms).accepted,
+      receiver
+          .accept(
+              after_prepared_gap,
+              test::clock_sample(
+                  mine_teleop::UtcMillis{after_prepared_gap.sent_at_utc_ms},
+                  mine_teleop::MonotonicMillis{after_prepared_gap.sent_at_utc_ms}))
+          .accepted,
       "receiver rejected a monotonic sequence gap from a prepared but superseded browser command");
 }
 
@@ -3855,12 +3872,26 @@ void test_credential_purpose_separation_and_stale_control_replay() {
       mine_teleop::kProtocolVersion,
       true,
       replacement_control_token);
-  const auto stale = receiver.accept(replay, mine_teleop::now_ms());
+  const auto stale_received_at_ms = mine_teleop::now_ms();
+  const auto stale = receiver.accept(
+      replay,
+      test::clock_sample(
+          mine_teleop::UtcMillis{stale_received_at_ms},
+          mine_teleop::MonotonicMillis{stale_received_at_ms}));
   expect(
       !stale.accepted && stale.reason == "control_token_invalid",
       "replacement session accepted the stale control token");
   replay.control_token = replacement_control_token;
-  expect(receiver.accept(replay, mine_teleop::now_ms()).accepted, "replacement control token was rejected");
+  const auto fresh_received_at_ms = mine_teleop::now_ms();
+  expect(
+      receiver
+          .accept(
+              replay,
+              test::clock_sample(
+                  mine_teleop::UtcMillis{fresh_received_at_ms},
+                  mine_teleop::MonotonicMillis{fresh_received_at_ms}))
+          .accepted,
+      "replacement control token was rejected");
 
   static_cast<void>(http.post_json_response(
       base + "/sessions/" + replacement_session_id + "/end",
@@ -6282,12 +6313,26 @@ void test_signaling_process_restart_requires_fresh_authority() {
       mine_teleop::kProtocolVersion,
       true,
       replacement_control_token);
-  const auto old_replay = receiver.accept(replay, mine_teleop::now_ms());
+  const auto old_replay_received_at_ms = mine_teleop::now_ms();
+  const auto old_replay = receiver.accept(
+      replay,
+      test::clock_sample(
+          mine_teleop::UtcMillis{old_replay_received_at_ms},
+          mine_teleop::MonotonicMillis{old_replay_received_at_ms}));
   expect(
       !old_replay.accepted && old_replay.reason == "control_token_invalid",
       "post-restart session accepted the pre-restart control token");
   replay.control_token = replacement_control_token;
-  expect(receiver.accept(replay, mine_teleop::now_ms()).accepted, "post-restart control token was rejected");
+  const auto restart_replay_received_at_ms = mine_teleop::now_ms();
+  expect(
+      receiver
+          .accept(
+              replay,
+              test::clock_sample(
+                  mine_teleop::UtcMillis{restart_replay_received_at_ms},
+                  mine_teleop::MonotonicMillis{restart_replay_received_at_ms}))
+          .accepted,
+      "post-restart control token was rejected");
 
   static_cast<void>(driver.disconnect("signaling_restart_test_complete"));
   server->stop();

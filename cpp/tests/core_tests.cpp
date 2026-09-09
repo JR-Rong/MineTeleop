@@ -8,6 +8,7 @@
 #include "mine_teleop/upload.hpp"
 #include "mine_teleop/video.hpp"
 #include "mine_teleop_chassis_bridge.h"
+#include "test_support.hpp"
 
 #include <gst/gst.h>
 
@@ -35,7 +36,12 @@
 
 namespace {
 
+namespace test = mine_teleop::test;
+
+using mine_teleop::ClockSample;
 using mine_teleop::ControlCommand;
+using mine_teleop::MonotonicMillis;
+using mine_teleop::UtcMillis;
 
 class TestFailure : public std::runtime_error {
  public:
@@ -172,10 +178,10 @@ mine_teleop::SessionControlProfileRequest session_profile_request(
 void activate_session_profile(
     mine_teleop::VehicleControlService& service,
     std::uint64_t seq = 1,
-    std::int64_t timestamp_ms = 0) {
+    ClockSample now = test::clock_sample(UtcMillis{0}, MonotonicMillis{0})) {
   const auto result = service.receive_session_profile(
-      session_profile_request(seq, timestamp_ms),
-      timestamp_ms);
+      session_profile_request(seq, now.utc.value),
+      now);
   expect(result.accepted, "session control profile was rejected: " + result.reason);
 }
 
@@ -438,12 +444,12 @@ void activate_adapter_owned_session_profile(
     mine_teleop::VehicleControlService& service,
     AdapterOwnedSafeStopAdapter& adapter,
     std::uint64_t seq = 1,
-    std::int64_t timestamp_ms = 0) {
+    ClockSample now = test::clock_sample(UtcMillis{0}, MonotonicMillis{0})) {
   adapter.handshake.state = "standby";
   adapter.handshake.ready = false;
   adapter.handshake.disarming = false;
   adapter.handshake.parking_ready = true;
-  activate_session_profile(service, seq, timestamp_ms);
+  activate_session_profile(service, seq, now);
   adapter.set_safe_stop(false, true, false);
 }
 
@@ -2410,51 +2416,92 @@ void test_control_receiver_enforces_token_sequence_and_gap() {
   mine_teleop::ControlReceiver receiver("vehicle-001", "driver-001", "session-001", 200, 1, true, "token");
   auto first = command(1, 0);
   first.control_token = "wrong";
-  expect(receiver.accept(first, 0).reason == "control_token_invalid", "wrong token was accepted");
+  expect(
+      receiver.accept(first, test::clock_sample(UtcMillis{0}, MonotonicMillis{0})).reason ==
+          "control_token_invalid",
+      "wrong token was accepted");
   first.control_token = "token";
   first.driver_id = "driver-other";
-  expect(receiver.accept(first, 0).reason == "wrong_driver", "wrong driver was accepted");
+  expect(
+      receiver.accept(first, test::clock_sample(UtcMillis{0}, MonotonicMillis{0})).reason ==
+          "wrong_driver",
+      "wrong driver was accepted");
   first.driver_id = "driver-001";
-  expect(receiver.accept(first, 0).accepted, "first command was rejected");
-  expect(receiver.accept(first, 50).reason == "old_seq", "old sequence was accepted");
+  expect(
+      receiver.accept(first, test::clock_sample(UtcMillis{0}, MonotonicMillis{0})).accepted,
+      "first command was rejected");
+  expect(
+      receiver.accept(first, test::clock_sample(UtcMillis{50}, MonotonicMillis{50})).reason ==
+          "old_seq",
+      "old sequence was accepted");
   auto late = command(2, 500);
   late.control_token = "token";
-  expect(receiver.accept(late, 500).reason == "command_gap_exceeded", "large command gap was accepted");
+  expect(
+      receiver.accept(late, test::clock_sample(UtcMillis{500}, MonotonicMillis{500})).reason ==
+          "command_gap_exceeded",
+      "large command gap was accepted");
   late.estop = true;
-  expect(receiver.accept(late, 500).accepted, "estop should bypass command gap rejection");
+  expect(
+      receiver.accept(late, test::clock_sample(UtcMillis{500}, MonotonicMillis{500})).accepted,
+      "estop should bypass command gap rejection");
 
   mine_teleop::ControlReceiver recovery_receiver("vehicle-001", "driver-001", "session-001", 200, 1, true, "token");
   auto recovery_first = command(1, 0);
   recovery_first.control_token = "token";
-  expect(recovery_receiver.accept(recovery_first, 0).accepted, "recovery first command was rejected");
+  expect(
+      recovery_receiver
+          .accept(recovery_first, test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+          .accepted,
+      "recovery first command was rejected");
   auto recovery_gap = command(2, 500);
   recovery_gap.control_token = "token";
-  expect(recovery_receiver.accept(recovery_gap, 500).reason == "command_gap_exceeded", "recovery gap was not detected");
+  expect(
+      recovery_receiver
+              .accept(recovery_gap, test::clock_sample(UtcMillis{500}, MonotonicMillis{500}))
+              .reason ==
+          "command_gap_exceeded",
+      "recovery gap was not detected");
   auto recovery_next = command(3, 550);
   recovery_next.control_token = "token";
   recovery_next.throttle = 0.0;
   recovery_next.steering = 0.0;
-  const auto recovery_sample = mine_teleop::legacy_clock_sample(550);
+  const auto recovery_sample = test::clock_sample(UtcMillis{550}, MonotonicMillis{550});
   expect(
       recovery_receiver.validate(recovery_next, recovery_sample, true).accepted,
       "receiver did not admit an explicit neutral recovery after command gap");
   recovery_receiver.commit_accepted(recovery_next, recovery_sample);
   auto post_recovery = command(4, 600);
   post_recovery.control_token = "token";
-  expect(recovery_receiver.accept(post_recovery, 600).accepted, "receiver did not recover after committed neutral input");
+  expect(
+      recovery_receiver
+          .accept(post_recovery, test::clock_sample(UtcMillis{600}, MonotonicMillis{600}))
+          .accepted,
+      "receiver did not recover after committed neutral input");
 
   mine_teleop::ControlReceiver synchronized_receiver("vehicle-001", "driver-001", "session-001", 200, 1, true, "token");
   auto stale = command(1, 0);
   stale.control_token = "token";
-  expect(synchronized_receiver.accept(stale, 201).reason == "command_age_exceeded", "stale command was accepted");
+  expect(
+      synchronized_receiver
+              .accept(stale, test::clock_sample(UtcMillis{201}, MonotonicMillis{201}))
+              .reason ==
+          "command_age_exceeded",
+      "stale command was accepted");
   stale.sent_at_utc_ms = 201;
   stale.estop = true;
-  expect(synchronized_receiver.accept(stale, 500).accepted, "stale estop should remain acceptable");
+  expect(
+      synchronized_receiver
+          .accept(stale, test::clock_sample(UtcMillis{500}, MonotonicMillis{500}))
+          .accepted,
+      "stale estop should remain acceptable");
 
   mine_teleop::ControlReceiver future_receiver("vehicle-001", "driver-001", "session-001", 200, 1, true, "token");
   auto future = command(1, 201);
   future.control_token = "token";
-  expect(future_receiver.accept(future, 0).reason == "command_timestamp_in_future", "future command was accepted");
+  expect(
+      future_receiver.accept(future, test::clock_sample(UtcMillis{0}, MonotonicMillis{0})).reason ==
+          "command_timestamp_in_future",
+      "future command was accepted");
 }
 
 void test_mailbox_keeps_only_latest_command() {
@@ -2607,31 +2654,47 @@ void test_safety_timeout_profile_and_estop_latch() {
       300,
       800,
       {{0, 0.3}, {500, 0.6}, {1500, 1.0}});
-  safety.mark_ready(0);
+  safety.mark_ready(MonotonicMillis{0});
   auto value = command(1, 0);
-  safety.on_valid_command(value, 0);
-  safety.tick(300);
+  safety.on_valid_command(value, MonotonicMillis{0});
+  safety.tick(MonotonicMillis{300});
   expect(safety.state() == mine_teleop::SafetyState::Degraded, "degraded state not entered");
-  safety.tick(800);
+  safety.tick(MonotonicMillis{800});
   expect(safety.state() == mine_teleop::SafetyState::TimeoutBrake, "timeout state not entered");
-  expect_near(safety.current_output(800).brake, 0.3, 1e-9, "initial timeout brake mismatch");
-  expect_near(safety.current_output(1300).brake, 0.6, 1e-9, "second timeout brake mismatch");
-  expect_near(safety.current_output(2300).brake, 1.0, 1e-9, "maximum timeout brake mismatch");
+  expect_near(
+      safety.current_output(MonotonicMillis{800}).brake,
+      0.3,
+      1e-9,
+      "initial timeout brake mismatch");
+  expect_near(
+      safety.current_output(MonotonicMillis{1300}).brake,
+      0.6,
+      1e-9,
+      "second timeout brake mismatch");
+  expect_near(
+      safety.current_output(MonotonicMillis{2300}).brake,
+      1.0,
+      1e-9,
+      "maximum timeout brake mismatch");
   expect(
-      !safety.current_output(1300).full_emergency_brake &&
-          safety.current_output(2300).full_emergency_brake,
+      !safety.current_output(MonotonicMillis{1300}).full_emergency_brake &&
+          safety.current_output(MonotonicMillis{2300}).full_emergency_brake,
       "timeout stages did not distinguish ordinary pressure from final full-DBC braking");
 
   value.seq = 2;
   value.estop = true;
-  safety.on_valid_command(value, 2400);
+  safety.on_valid_command(value, MonotonicMillis{2400});
   expect(safety.state() == mine_teleop::SafetyState::Estop, "estop did not latch");
   value.seq = 3;
   value.estop = false;
-  safety.on_valid_command(value, 2450);
+  safety.on_valid_command(value, MonotonicMillis{2450});
   expect(safety.state() == mine_teleop::SafetyState::Estop, "drive command cleared estop latch");
-  expect(!safety.reset_estop(false, "operator", 2500), "estop reset without local confirmation");
-  expect(safety.reset_estop(true, "operator", 2500), "confirmed estop reset failed");
+  expect(
+      !safety.reset_estop(false, "operator", MonotonicMillis{2500}),
+      "estop reset without local confirmation");
+  expect(
+      safety.reset_estop(true, "operator", MonotonicMillis{2500}),
+      "confirmed estop reset failed");
 }
 
 void test_control_clock_domains_and_explicit_recovery() {
@@ -2744,19 +2807,24 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect_near(
       adapter_view->session_motor_torque_limit_nm(),
       0.0,
       1e-9,
       "service start exposed traction before profile ACK");
   expect(
-      service.receive_command(command(1, 0), 0).reason ==
+      service.receive_command(
+                 command(1, 0),
+                 test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+              .reason ==
           "session_control_profile_required",
       "ordinary control was accepted before a session profile ACK");
 
   const auto first_request = session_profile_request(1, 0, 20.0, 100.0, 100.0, 30.0, 80.0);
-  const auto first = service.receive_session_profile(first_request, 0);
+  const auto first = service.receive_session_profile(
+      first_request,
+      test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(
       first.accepted && !first.idempotent && first.applied_revision == 1,
       "first session profile was rejected or ACKed with the wrong revision");
@@ -2781,20 +2849,26 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
       1e-9,
       "ACK preceded the adapter brake-pressure update");
 
-  const auto delayed_retry = service.receive_session_profile(first_request, 1000);
+  const auto delayed_retry = service.receive_session_profile(
+      first_request,
+      test::clock_sample(UtcMillis{1000}, MonotonicMillis{1000}));
   expect(
       delayed_retry.accepted && delayed_retry.idempotent,
       "lost ACK retry was rejected after the original timestamp aged out");
   auto conflict = first_request;
   conflict.sent_at_utc_ms = 1000;
   conflict.profile.max_motor_torque_nm = 90.0;
-  const auto conflict_result = service.receive_session_profile(conflict, 1000);
+  const auto conflict_result = service.receive_session_profile(
+      conflict,
+      test::clock_sample(UtcMillis{1000}, MonotonicMillis{1000}));
   expect(
       !conflict_result.accepted &&
           conflict_result.reason == "profile_seq_conflict",
       "same profile sequence with a different payload was not rejected");
 
-  const auto active_command = service.receive_command(command(2, 100), 100);
+  const auto active_command = service.receive_command(
+      command(2, 100),
+      test::clock_sample(UtcMillis{100}, MonotonicMillis{100}));
   expect(
       active_command.accepted,
       "profile-authorized command was rejected: " + active_command.reason);
@@ -2806,7 +2880,7 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
 
   const auto lower = service.receive_session_profile(
       session_profile_request(2, 1020, 10.0, 50.0, 100.0, 30.0, 80.0),
-      1020);
+      test::clock_sample(UtcMillis{1020}, MonotonicMillis{1020}));
   expect(lower.accepted, "live target/torque decrease was rejected");
   expect(
       adapter_view->status().applied_command_count == 2,
@@ -2817,19 +2891,27 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
       1e-9,
       "lower torque ACK did not reflect the adapter state");
   expect(
-      service.receive_session_profile(first_request, 1030).reason == "old_seq",
+      service.receive_session_profile(
+                 first_request,
+                 test::clock_sample(UtcMillis{1030}, MonotonicMillis{1030}))
+              .reason == "old_seq",
       "older profile sequence was not rejected");
 
   const auto raised = service.receive_session_profile(
       session_profile_request(3, 1040, 12.0, 60.0, 100.0, 30.0, 80.0),
-      1040);
+      test::clock_sample(UtcMillis{1040}, MonotonicMillis{1040}));
   expect(raised.accepted, "mock bench profile increase bypass was rejected");
   expect(
       adapter_view->status().applied_command_count == 2,
       "profile increase replayed a stale command with newly raised authority");
   auto estop = command(3, 1050);
   estop.estop = true;
-  expect(service.receive_command(estop, 1050).accepted, "ESTOP was rejected");
+  expect(
+      service.receive_command(
+                 estop,
+                 test::clock_sample(UtcMillis{1050}, MonotonicMillis{1050}))
+          .accepted,
+      "ESTOP was rejected");
   const auto cleared_status = service.session_control_profile();
   expect(
       !cleared_status.at("active").get<bool>() &&
@@ -2844,7 +2926,7 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
       "ESTOP did not withdraw session traction authority");
   const auto cleared_retry = service.receive_session_profile(
       session_profile_request(3, 1040, 12.0, 60.0, 100.0, 30.0, 80.0),
-      2000);
+      test::clock_sample(UtcMillis{2000}, MonotonicMillis{2000}));
   expect(
       !cleared_retry.accepted && cleared_retry.idempotent &&
           cleared_retry.reason == "session_profile_cleared",
@@ -2857,49 +2939,64 @@ void test_session_control_profile_uses_independent_two_second_age_window() {
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
 
   auto wrong_identity = session_profile_request(1, 0);
   wrong_identity.vehicle_id = "vehicle-002";
   expect(
-      service.receive_session_profile(wrong_identity, 0).reason == "wrong_vehicle",
+      service.receive_session_profile(
+                 wrong_identity,
+                 test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+              .reason == "wrong_vehicle",
       "session profile for a different vehicle was accepted");
   wrong_identity = session_profile_request(1, 0);
   wrong_identity.driver_id = "driver-002";
   expect(
-      service.receive_session_profile(wrong_identity, 0).reason == "wrong_driver",
+      service.receive_session_profile(
+                 wrong_identity,
+                 test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+              .reason == "wrong_driver",
       "session profile for a different driver was accepted");
   wrong_identity = session_profile_request(1, 0);
   wrong_identity.session_id = "session-002";
   expect(
-      service.receive_session_profile(wrong_identity, 0).reason == "wrong_session",
+      service.receive_session_profile(
+                 wrong_identity,
+                 test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+              .reason == "wrong_session",
       "session profile for a different session was accepted");
 
   const auto future = service.receive_session_profile(
       session_profile_request(
           1,
           mine_teleop::kSessionControlProfileMaxAgeMs + 1),
-      0);
+      test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(
       !future.accepted && future.reason == "profile_timestamp_in_future",
       "new profile beyond the independent future-skew window was accepted");
 
   const auto delayed_first = session_profile_request(1, 0);
-  const auto accepted = service.receive_session_profile(delayed_first, 500);
+  const auto accepted = service.receive_session_profile(
+      delayed_first,
+      test::clock_sample(UtcMillis{500}, MonotonicMillis{500}));
   expect(
       accepted.accepted && !accepted.idempotent,
       "new profile older than the ordinary 200-ms control window was rejected");
 
   const auto too_old = service.receive_session_profile(
       session_profile_request(2, 0),
-      mine_teleop::kSessionControlProfileMaxAgeMs + 1);
+      test::clock_sample(
+          UtcMillis{mine_teleop::kSessionControlProfileMaxAgeMs + 1},
+          MonotonicMillis{mine_teleop::kSessionControlProfileMaxAgeMs + 1}));
   expect(
       !too_old.accepted && too_old.reason == "profile_age_exceeded",
       "new profile older than the independent two-second window was accepted");
 
   const auto very_late_retry = service.receive_session_profile(
       delayed_first,
-      mine_teleop::kSessionControlProfileMaxAgeMs * 3);
+      test::clock_sample(
+          UtcMillis{mine_teleop::kSessionControlProfileMaxAgeMs * 3},
+          MonotonicMillis{mine_teleop::kSessionControlProfileMaxAgeMs * 3}));
   expect(
       very_late_retry.accepted && very_late_retry.idempotent,
       "known same-sequence retry was rejected by the profile age window");
@@ -2913,11 +3010,11 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   adapter_view->handshake.parking_ready = false;
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
 
   const auto blocked = service.receive_session_profile(
       session_profile_request(1, 0, 10.0, 100.0, 100.0, 30.0, 80.0),
-      0);
+      test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(
       !blocked.accepted &&
           blocked.reason == "parking_ready_required_for_profile_increase",
@@ -2931,7 +3028,7 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   adapter_view->handshake.parking_ready = true;
   const auto ready_blocked = service.receive_session_profile(
       session_profile_request(2, 10, 10.0, 100.0, 100.0, 30.0, 80.0),
-      10);
+      test::clock_sample(UtcMillis{10}, MonotonicMillis{10}));
   expect(
       !ready_blocked.accepted &&
           ready_blocked.reason ==
@@ -2940,24 +3037,24 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   adapter_view->handshake.state = "standby";
   const auto accepted = service.receive_session_profile(
       session_profile_request(3, 20, 10.0, 100.0, 100.0, 30.0, 80.0),
-      20);
+      test::clock_sample(UtcMillis{20}, MonotonicMillis{20}));
   expect(accepted.accepted, "parking-ready real-adapter profile was rejected");
   adapter_view->handshake.state = "ready";
   adapter_view->handshake.parking_ready = false;
   const auto decreased = service.receive_session_profile(
       session_profile_request(4, 30, 8.0, 80.0, 100.0, 30.0, 80.0),
-      30);
+      test::clock_sample(UtcMillis{30}, MonotonicMillis{30}));
   expect(decreased.accepted, "target/torque decrease required parking_ready");
   const auto brake_change = service.receive_session_profile(
       session_profile_request(5, 40, 8.0, 80.0, 90.0, 20.0, 70.0),
-      40);
+      test::clock_sample(UtcMillis{40}, MonotonicMillis{40}));
   expect(
       !brake_change.accepted &&
           brake_change.reason == "parking_ready_required_for_profile_increase",
       "brake pressure change bypassed parking_ready");
   const auto target_raise = service.receive_session_profile(
       session_profile_request(6, 50, 9.0, 80.0, 100.0, 30.0, 80.0),
-      50);
+      test::clock_sample(UtcMillis{50}, MonotonicMillis{50}));
   expect(
       !target_raise.accepted &&
           target_raise.reason == "parking_ready_required_for_profile_increase",
@@ -2968,7 +3065,7 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   adapter_view->control_limit_update_throws = true;
   const auto apply_failed = service.receive_session_profile(
       session_profile_request(7, 60, 8.0, 70.0, 90.0, 20.0, 70.0),
-      60);
+      test::clock_sample(UtcMillis{60}, MonotonicMillis{60}));
   expect(
       !apply_failed.accepted &&
           apply_failed.reason == "adapter_session_profile_apply_failed" &&
@@ -2978,7 +3075,7 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
 
   const auto restored = service.receive_session_profile(
       session_profile_request(8, 70, 8.0, 80.0, 100.0, 30.0, 80.0),
-      70);
+      test::clock_sample(UtcMillis{70}, MonotonicMillis{70}));
   expect(
       restored.accepted,
       "parking-ready baseline profile was not restored after apply failure");
@@ -2989,7 +3086,9 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   adapter_view->handshake.parking_ready = false;
   auto rise_rate_change = session_profile_request(9, 80, 8.0, 80.0, 100.0, 30.0, 80.0);
   rise_rate_change.profile.motor_torque_rise_rate_nm_per_s = 50.0;
-  const auto rise_rate_blocked = service.receive_session_profile(rise_rate_change, 80);
+  const auto rise_rate_blocked = service.receive_session_profile(
+      rise_rate_change,
+      test::clock_sample(UtcMillis{80}, MonotonicMillis{80}));
   expect(
       !rise_rate_blocked.accepted &&
           rise_rate_blocked.reason == "parking_ready_required_for_profile_increase",
@@ -2997,7 +3096,9 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   adapter_view->handshake.parking_ready = true;
   auto rise_rate_apply = session_profile_request(10, 90, 8.0, 80.0, 100.0, 30.0, 80.0);
   rise_rate_apply.profile.motor_torque_rise_rate_nm_per_s = 50.0;
-  const auto rise_rate_accepted = service.receive_session_profile(rise_rate_apply, 90);
+  const auto rise_rate_accepted = service.receive_session_profile(
+      rise_rate_apply,
+      test::clock_sample(UtcMillis{90}, MonotonicMillis{90}));
   expect(
       rise_rate_accepted.accepted,
       "parked rise-rate change was rejected");
@@ -3019,12 +3120,14 @@ void test_control_service_commits_only_successfully_applied_commands() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     activate_adapter_owned_session_profile(service, *adapter_view);
 
     adapter_view->structured_rejection_issue_code =
         "vcu_drive_gear_change_moving_or_stale";
-    const auto rejected = service.receive_command(command(1, 0), 0);
+    const auto rejected = service.receive_command(
+        command(1, 0),
+        test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     expect(
         !rejected.accepted && !rejected.command &&
             rejected.reason == "adapter_control_rejected" &&
@@ -3033,7 +3136,10 @@ void test_control_service_commits_only_successfully_applied_commands() {
         "structured adapter rejection was not returned without committing safety state");
     adapter_view->structured_rejection_issue_code.reset();
     expect(
-        service.receive_command(command(2, 1), 1).accepted,
+        service.receive_command(
+                   command(2, 1),
+                   test::clock_sample(UtcMillis{1}, MonotonicMillis{1}))
+            .accepted,
         "fresh command did not recover after a structured adapter rejection");
     service.close();
   }
@@ -3043,26 +3149,35 @@ void test_control_service_commits_only_successfully_applied_commands() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     activate_adapter_owned_session_profile(service, *adapter_view);
 
     expect(
-        service.receive_command(command(1, 0), 0).accepted,
+        service.receive_command(
+                   command(1, 0),
+                   test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+            .accepted,
         "initial D command was rejected");
     adapter_view->rejected_control_gear = "R";
     auto rejected_reverse = command(2, 100);
     rejected_reverse.gear = "R";
     expect_throws(
-        [&] { static_cast<void>(service.receive_command(rejected_reverse, 100)); },
+        [&] {
+          static_cast<void>(service.receive_command(
+              rejected_reverse,
+              test::clock_sample(UtcMillis{100}, MonotonicMillis{100})));
+        },
         "adapter control rejection did not propagate");
 
     adapter_view->rejected_control_gear.reset();
-    const auto replay = service.receive_command(rejected_reverse, 110);
+    const auto replay = service.receive_command(
+        rejected_reverse,
+        test::clock_sample(UtcMillis{110}, MonotonicMillis{110}));
     expect(
         replay.accepted,
         "failed adapter application incorrectly consumed its command sequence");
 
-    service.tick(410);
+    service.tick(test::clock_sample(UtcMillis{410}, MonotonicMillis{410}));
     expect(
         service.safety_state() == mine_teleop::SafetyState::Degraded,
         "successful replay did not establish the new outer safety watchdog");
@@ -3077,12 +3192,15 @@ void test_control_service_commits_only_successfully_applied_commands() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     activate_adapter_owned_session_profile(service, *adapter_view);
     expect(
-        service.receive_command(command(1, 0), 0).accepted,
+        service.receive_command(
+                   command(1, 0),
+                   test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+            .accepted,
         "initial command before rejected recovery was rejected");
-    service.tick(300);
+    service.tick(test::clock_sample(UtcMillis{300}, MonotonicMillis{300}));
     expect(
         service.safety_state() == mine_teleop::SafetyState::Degraded,
         "recovery rejection test did not enter degraded state");
@@ -3092,12 +3210,14 @@ void test_control_service_commits_only_successfully_applied_commands() {
     neutral.brake = 0.6;
     adapter_view->structured_rejection_issue_code =
         "vcu_drive_gear_change_moving_or_stale";
-    const auto rejected = service.receive_command(neutral, 350);
+    const auto rejected = service.receive_command(
+        neutral,
+        test::clock_sample(UtcMillis{350}, MonotonicMillis{350}));
     expect(
         !rejected.accepted && rejected.reason == "adapter_control_rejected" &&
             service.safety_state() == mine_teleop::SafetyState::Degraded,
         "adapter-rejected neutral recovery changed the degraded state");
-    service.tick(800);
+    service.tick(test::clock_sample(UtcMillis{800}, MonotonicMillis{800}));
     expect(
         service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
             !service.session_control_profile().at("active").get<bool>(),
@@ -3110,18 +3230,25 @@ void test_control_service_commits_only_successfully_applied_commands() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     activate_adapter_owned_session_profile(service, *adapter_view);
     expect(
-        service.receive_command(command(1, 0), 0).accepted,
+        service.receive_command(
+                   command(1, 0),
+                   test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+            .accepted,
         "control command before overdue ESTOP was rejected");
-    service.tick(300);
+    service.tick(test::clock_sample(UtcMillis{300}, MonotonicMillis{300}));
 
     auto estop = command(2, 810);
     estop.estop = true;
     adapter_view->safe_stop_throws = true;
     expect_throws(
-        [&] { static_cast<void>(service.receive_command(estop, 810)); },
+        [&] {
+          static_cast<void>(service.receive_command(
+              estop,
+              test::clock_sample(UtcMillis{810}, MonotonicMillis{810})));
+        },
         "overdue adapter ESTOP failure did not propagate");
     expect(
         service.safety_state() == mine_teleop::SafetyState::Estop,
@@ -3132,7 +3259,9 @@ void test_control_service_commits_only_successfully_applied_commands() {
         "overdue adapter ESTOP failure retained session traction authority");
 
     adapter_view->safe_stop_throws = false;
-    const auto replay = service.receive_command(estop, 811);
+    const auto replay = service.receive_command(
+        estop,
+        test::clock_sample(UtcMillis{811}, MonotonicMillis{811}));
     expect(
         !replay.accepted && replay.reason == "old_seq" &&
             service.safety_state() == mine_teleop::SafetyState::Estop,
@@ -3147,10 +3276,15 @@ void test_control_service_reports_safe_stop_output_after_timeout() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   activate_session_profile(service);
-  expect(service.receive_command(command(1, 0), 0).accepted, "control command was rejected");
-  service.tick(800);
+  expect(
+      service.receive_command(
+                 command(1, 0),
+                 test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+          .accepted,
+      "control command was rejected");
+  service.tick(test::clock_sample(UtcMillis{800}, MonotonicMillis{800}));
   expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake, "service did not enter timeout");
   expect(
       !service.session_control_profile().at("active").get<bool>(),
@@ -3160,15 +3294,19 @@ void test_control_service_reports_safe_stop_output_after_timeout() {
       0.0,
       1e-9,
       "hard control timeout retained session traction authority");
-  service.tick(1300);
+  service.tick(test::clock_sample(UtcMillis{1300}, MonotonicMillis{1300}));
   const auto telemetry = adapter_view->read_telemetry();
   expect_near(telemetry.throttle_feedback, 0.0, 1e-9, "timeout telemetry retained stale throttle");
   expect_near(telemetry.brake_feedback, 0.6, 1e-9, "timeout telemetry did not report safe brake");
-  const auto gap_rearm = service.receive_command(command(2, 1310), 1310);
+  const auto gap_rearm = service.receive_command(
+      command(2, 1310),
+      test::clock_sample(UtcMillis{1310}, MonotonicMillis{1310}));
   expect(
       !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
       "hard-timeout receiver did not re-arm on the first fresh command");
-  const auto blocked = service.receive_command(command(3, 1320), 1320);
+  const auto blocked = service.receive_command(
+      command(3, 1320),
+      test::clock_sample(UtcMillis{1320}, MonotonicMillis{1320}));
   expect(
       !blocked.accepted && blocked.reason == "command_gap_exceeded",
       "rejected hard-timeout command advanced the watchdog receiver state");
@@ -3181,11 +3319,16 @@ void test_control_service_recovers_from_degraded_command_gap_without_profile_rea
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   activate_session_profile(service);
-  expect(service.receive_command(command(1, 0), 0).accepted, "control command was rejected");
+  expect(
+      service.receive_command(
+                 command(1, 0),
+                 test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+          .accepted,
+      "control command was rejected");
 
-  service.tick(300);
+  service.tick(test::clock_sample(UtcMillis{300}, MonotonicMillis{300}));
   expect(
       service.safety_state() == mine_teleop::SafetyState::Degraded,
       "service did not enter the recoverable degraded state");
@@ -3204,24 +3347,33 @@ void test_control_service_recovers_from_degraded_command_gap_without_profile_rea
       1e-9,
       "degraded state retained stale traction while preserving the profile");
 
-  const auto gap_rearm = service.receive_command(command(2, 350), 350);
+  const auto gap_rearm = service.receive_command(
+      command(2, 350),
+      test::clock_sample(UtcMillis{350}, MonotonicMillis{350}));
   expect(
       !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
       "first fresh command after the gap did not re-arm receiver timing");
-  const auto held_input = service.receive_command(command(3, 360), 360);
+  const auto held_input = service.receive_command(
+      command(3, 360),
+      test::clock_sample(UtcMillis{360}, MonotonicMillis{360}));
   expect(
       !held_input.accepted && held_input.reason == "command_gap_exceeded",
       "degraded held input advanced receiver timing before an explicit neutral command");
   auto neutral = command(4, 370);
   neutral.steering = 0.0;
   neutral.throttle = 0.0;
-  const auto recovered = service.receive_command(neutral, 370);
+  const auto recovered = service.receive_command(
+      neutral,
+      test::clock_sample(UtcMillis{370}, MonotonicMillis{370}));
   expect(recovered.accepted, "fresh neutral command did not recover degraded control");
   expect(
       service.safety_state() == mine_teleop::SafetyState::ControlActive,
       "fresh neutral command did not restore active control");
   expect(
-      service.receive_command(command(5, 380), 380).accepted,
+      service.receive_command(
+                 command(5, 380),
+                 test::clock_sample(UtcMillis{380}, MonotonicMillis{380}))
+          .accepted,
       "fresh input remained blocked after explicit neutral recovery");
   expect(
       service.session_control_profile().at("active").get<bool>() &&
@@ -3236,17 +3388,24 @@ void test_control_service_receive_path_cannot_bypass_hard_timeout() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   activate_session_profile(service);
-  expect(service.receive_command(command(1, 0), 0).accepted, "control command was rejected");
+  expect(
+      service.receive_command(
+                 command(1, 0),
+                 test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+          .accepted,
+      "control command was rejected");
   const auto controls_before_timeout = adapter_view->status().applied_command_count;
 
-  service.tick(300);
+  service.tick(test::clock_sample(UtcMillis{300}, MonotonicMillis{300}));
   expect(
       service.safety_state() == mine_teleop::SafetyState::Degraded,
       "service did not enter degraded before receive-path timeout test");
 
-  const auto gap_rearm = service.receive_command(command(2, 810), 810);
+  const auto gap_rearm = service.receive_command(
+      command(2, 810),
+      test::clock_sample(UtcMillis{810}, MonotonicMillis{810}));
   expect(
       !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
       "first packet after a hard timeout did not re-arm receiver timing");
@@ -3255,7 +3414,9 @@ void test_control_service_receive_path_cannot_bypass_hard_timeout() {
           !service.session_control_profile().at("active").get<bool>(),
       "receive path failed to advance the hard timeout and revoke the profile");
 
-  const auto blocked = service.receive_command(command(3, 820), 820);
+  const auto blocked = service.receive_command(
+      command(3, 820),
+      test::clock_sample(UtcMillis{820}, MonotonicMillis{820}));
   expect(
       !blocked.accepted && blocked.reason == "command_gap_exceeded",
       "rejected hard-timeout packet advanced the receiver watchdog state");
@@ -3272,22 +3433,25 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     adapter_view->handshake.state = "standby";
     adapter_view->handshake.ready = false;
     const auto profile = service.receive_session_profile(
         session_profile_request(1, 0, 20.0, 100.0, 20.0, 10.0, 20.0),
-        0);
+        test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     expect(profile.accepted, "20 bar session profile was rejected");
     adapter_view->set_safe_stop(false, true, false);
     auto braking = command(1, 0);
     braking.throttle = 0.8;
     braking.brake = 0.5;
     expect(
-        service.receive_command(braking, 0).accepted,
+        service.receive_command(
+                   braking,
+                   test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+            .accepted,
         "session-scaled braking command was rejected");
 
-    service.tick(300);
+    service.tick(test::clock_sample(UtcMillis{300}, MonotonicMillis{300}));
     expect(
         service.safety_state() == mine_teleop::SafetyState::Degraded,
         "service did not enter Degraded for brake-unit preservation test");
@@ -3300,7 +3464,7 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
         !adapter_view->last_safe_output.full_emergency_brake,
         "Degraded session braking was mislabeled as full-DBC emergency braking");
 
-    service.tick(800);
+    service.tick(test::clock_sample(UtcMillis{800}, MonotonicMillis{800}));
     expect_near(
         adapter_view->last_safe_output.brake,
         0.3,
@@ -3309,7 +3473,7 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
     expect(
         !adapter_view->last_safe_output.full_emergency_brake,
         "first timeout stage incorrectly requested full-DBC emergency braking");
-    service.tick(1300);
+    service.tick(test::clock_sample(UtcMillis{1300}, MonotonicMillis{1300}));
     expect_near(
         adapter_view->last_safe_output.brake,
         0.6,
@@ -3318,7 +3482,7 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
     expect(
         !adapter_view->last_safe_output.full_emergency_brake,
         "second timeout stage incorrectly requested full-DBC emergency braking");
-    service.tick(2300);
+    service.tick(test::clock_sample(UtcMillis{2300}, MonotonicMillis{2300}));
     expect(
         adapter_view->last_safe_output.full_emergency_brake &&
             adapter_view->last_safe_output.brake == 1.0,
@@ -3331,15 +3495,18 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     activate_adapter_owned_session_profile(service, *adapter_view);
     auto full_ordinary_brake = command(1, 0);
     full_ordinary_brake.throttle = 0.0;
     full_ordinary_brake.brake = 1.0;
     expect(
-        service.receive_command(full_ordinary_brake, 0).accepted,
+        service.receive_command(
+                   full_ordinary_brake,
+                   test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+            .accepted,
         "100 bar ordinary braking command was rejected");
-    service.tick(300);
+    service.tick(test::clock_sample(UtcMillis{300}, MonotonicMillis{300}));
     expect(
         adapter_view->last_safe_output.brake == 1.0 &&
             !adapter_view->last_safe_output.full_emergency_brake,
@@ -3354,19 +3521,24 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   activate_adapter_owned_session_profile(service, *adapter_view);
 
   expect(
-      service.receive_command(command(1, 0), 0).accepted,
+      service.receive_command(
+                 command(1, 0),
+                 test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+          .accepted,
       "initial control command was rejected");
   expect(
       adapter_view->applied_commands == 1 && adapter_view->control_attempts == 1,
       "initial control command did not reach the adapter exactly once");
 
   adapter_view->set_safe_stop(true, true, false);
-  service.tick(100);
-  const auto blocked = service.receive_command(command(2, 110), 110);
+  service.tick(test::clock_sample(UtcMillis{100}, MonotonicMillis{100}));
+  const auto blocked = service.receive_command(
+      command(2, 110),
+      test::clock_sample(UtcMillis{110}, MonotonicMillis{110}));
   expect(
       !blocked.accepted && blocked.reason == "session_control_profile_required",
       "adapter-owned safe stop did not withdraw ordinary profile authority");
@@ -3376,13 +3548,13 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
       "blocked control refreshed outer safety state or reached the adapter");
 
   adapter_view->handshake_status_throws = true;
-  service.tick(350);
+  service.tick(test::clock_sample(UtcMillis{350}, MonotonicMillis{350}));
   adapter_view->handshake_status_throws = false;
   expect(
       service.safety_state() == mine_teleop::SafetyState::Degraded,
       "outer safety state did not survive an unreadable adapter interlock");
   adapter_view->set_safe_stop(false, false, true);
-  service.tick(900);
+  service.tick(test::clock_sample(UtcMillis{900}, MonotonicMillis{900}));
   expect(
       service.safety_state() == mine_teleop::SafetyState::TimeoutBrake,
       "outer safety state did not reach timeout while the adapter disarmed");
@@ -3392,7 +3564,10 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
       "outer timeout repeated an ordinary safe stop owned by the adapter");
 
   adapter_view->set_safe_stop(false, false, false);
-  activate_session_profile(service, 2, 900);
+  activate_session_profile(
+      service,
+      2,
+      test::clock_sample(UtcMillis{900}, MonotonicMillis{900}));
 
   adapter_view->handshake_succeeds = false;
   expect(
@@ -3405,12 +3580,13 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
 
   adapter_view->handshake_succeeds = true;
   expect(
-      service.request_vcu_handshake(mine_teleop::legacy_clock_sample(1'900)),
+      service.request_vcu_handshake(
+          test::clock_sample(UtcMillis{1'900}, MonotonicMillis{1'900})),
       "explicit adapter handshake recovery was rejected");
   expect(
       service.safety_state() == mine_teleop::SafetyState::Standby,
       "successful adapter handshake did not reset the recoverable outer state to Standby");
-  service.tick(2000);
+  service.tick(test::clock_sample(UtcMillis{2000}, MonotonicMillis{2000}));
   expect(
       service.safety_state() == mine_teleop::SafetyState::Standby &&
           adapter_view->applied_commands == 1 &&
@@ -3421,7 +3597,9 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
       !adapter_view->feedback_ready(),
       "fake adapter incorrectly reported Ready while the handshake was Initial");
   adapter_view->set_safe_stop(false, true, false);
-  const auto old_replay = service.receive_command(command(1, 2010), 2010);
+  const auto old_replay = service.receive_command(
+      command(1, 2010),
+      test::clock_sample(UtcMillis{2010}, MonotonicMillis{2010}));
   expect(
       !old_replay.accepted && old_replay.reason == "old_seq",
       "successful handshake forgot the pre-handshake sequence boundary");
@@ -3429,7 +3607,9 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
       service.safety_state() == mine_teleop::SafetyState::Standby &&
           adapter_view->control_attempts == 1,
       "a replayed command restored control after the handshake");
-  const auto fresh = service.receive_command(command(3, 2020), 2020);
+  const auto fresh = service.receive_command(
+      command(3, 2020),
+      test::clock_sample(UtcMillis{2020}, MonotonicMillis{2020}));
   expect(fresh.accepted, "fresh post-handshake control command was rejected");
   expect(
       service.safety_state() == mine_teleop::SafetyState::ControlActive &&
@@ -3446,12 +3626,15 @@ void test_adapter_handshake_does_not_clear_outer_estop_or_fault() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     adapter_view->set_safe_stop(true, true, false);
     auto estop = command(1, 0);
     estop.estop = true;
     expect(
-        service.receive_command(estop, 0).accepted &&
+        service.receive_command(
+                   estop,
+                   test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+                .accepted &&
             service.safety_state() == mine_teleop::SafetyState::Estop,
         "outer ESTOP command did not latch while the adapter owned the stop");
     expect(
@@ -3474,9 +3657,11 @@ void test_adapter_handshake_does_not_clear_outer_estop_or_fault() {
     adapter_view->telemetry_throws = true;
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     activate_adapter_owned_session_profile(service, *adapter_view);
-    const auto failed = service.receive_command(command(1, 0), 0);
+    const auto failed = service.receive_command(
+        command(1, 0),
+        test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     expect(
         !failed.accepted && failed.reason == "adapter_safety_status_unavailable" &&
             service.safety_state() == mine_teleop::SafetyState::Fault,
@@ -3498,16 +3683,21 @@ void test_reset_estop_rejects_unreadable_disarming_and_hard_adapter_stops() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
 
   auto estop = command(1, 0);
   estop.estop = true;
-  expect(service.receive_command(estop, 0).accepted, "outer ESTOP command was rejected");
+  expect(
+      service.receive_command(
+                 estop,
+                 test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+          .accepted,
+      "outer ESTOP command was rejected");
   expect(adapter_view->safe_stop_attempts == 1, "outer ESTOP was not applied");
 
   adapter_view->set_safe_stop(false, false, true);
   expect(
-      !service.reset_estop(true, "operator", 5) &&
+      !service.reset_estop(true, "operator", test::clock_sample(UtcMillis{5}, MonotonicMillis{5})) &&
           service.safety_state() == mine_teleop::SafetyState::Estop &&
           adapter_view->safe_stop_attempts == 1,
       "adapter disarming allowed an outer ESTOP reset or ordinary apply");
@@ -3515,12 +3705,12 @@ void test_reset_estop_rejects_unreadable_disarming_and_hard_adapter_stops() {
   adapter_view->set_safe_stop(true, true, false);
   adapter_view->telemetry_throws = true;
   expect(
-      !service.reset_estop(true, "operator", 10) &&
+      !service.reset_estop(true, "operator", test::clock_sample(UtcMillis{10}, MonotonicMillis{10})) &&
           service.safety_state() == mine_teleop::SafetyState::Estop,
       "unreadable adapter interlock allowed the outer ESTOP reset");
   adapter_view->telemetry_throws = false;
   expect(
-      !service.reset_estop(true, "operator", 20) &&
+      !service.reset_estop(true, "operator", test::clock_sample(UtcMillis{20}, MonotonicMillis{20})) &&
           service.safety_state() == mine_teleop::SafetyState::Estop,
       "physical or hard adapter stop incorrectly cleared the outer ESTOP");
   expect(
@@ -3536,25 +3726,33 @@ void test_reset_estop_clears_soft_stop_before_fresh_control() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
 
   auto estop = command(1, 0);
   estop.estop = true;
   expect(
-      service.receive_command(estop, 0).accepted &&
+      service.receive_command(
+                 estop,
+                 test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+              .accepted &&
           service.safety_state() == mine_teleop::SafetyState::Estop &&
           adapter_view->read_telemetry().estop,
       "soft outer ESTOP did not reach the mock adapter");
   expect(
-      service.reset_estop(true, "operator", 10) &&
+      service.reset_estop(true, "operator", test::clock_sample(UtcMillis{10}, MonotonicMillis{10})) &&
           service.safety_state() == mine_teleop::SafetyState::Standby &&
           !adapter_view->read_telemetry().estop &&
           adapter_view->read_telemetry().gear == "D",
       "authorized reset did not clear the adapter soft stop while preserving actual D");
 
-  activate_session_profile(service, 1, 15);
+  activate_session_profile(
+      service,
+      1,
+      test::clock_sample(UtcMillis{15}, MonotonicMillis{15}));
 
-  const auto fresh = service.receive_command(command(2, 20), 20);
+  const auto fresh = service.receive_command(
+      command(2, 20),
+      test::clock_sample(UtcMillis{20}, MonotonicMillis{20}));
   expect(
       fresh.accepted &&
           service.safety_state() == mine_teleop::SafetyState::ControlActive &&
@@ -3572,15 +3770,17 @@ void test_control_service_applies_vehicle_hard_limits() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   const auto profile = service.receive_session_profile(
       session_profile_request(1, 0, 4.0, 100.0, 100.0, 30.0, 80.0),
-      0);
+      test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(profile.accepted, "hard-limit test profile was rejected");
 
   auto requested = command(1, 0);
   requested.brake = 0.80;
-  const auto result = service.receive_command(requested, 0);
+  const auto result = service.receive_command(
+      requested,
+      test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(result.accepted && result.command.has_value(), "limited control command was rejected");
   expect_near(result.command->throttle, 0.10, 1e-9, "vehicle throttle hard limit was not applied");
   expect_near(result.command->brake, 0.80, 1e-9, "normalized brake intent was rewritten before physical mapping");
@@ -3681,15 +3881,19 @@ void test_control_service_applies_session_steering_limit() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   auto profile = session_profile_request(1, 0);
   profile.profile.max_steering_angle_deg = 3.0;
-  const auto profile_result = service.receive_session_profile(profile, 0);
+  const auto profile_result = service.receive_session_profile(
+      profile,
+      test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(profile_result.accepted, "session steering profile was rejected");
 
   auto requested = command(1, 0);
   requested.steering = 0.25;
-  const auto result = service.receive_command(requested, 0);
+  const auto result = service.receive_command(
+      requested,
+      test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(
       result.accepted && result.command.has_value(),
       "session steering-limited command was rejected");
@@ -3721,10 +3925,11 @@ void test_control_service_bounds_telemetry_history() {
       "token",
       std::make_unique<mine_teleop::MockVehicleAdapter>(),
       1);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   constexpr std::size_t total_samples = mine_teleop::kMaxVehicleTelemetryHistory * 2 + 1;
   for (std::size_t sample = 0; sample < total_samples; ++sample) {
-    service.tick(static_cast<std::int64_t>(sample));
+    const auto sample_ms = static_cast<std::int64_t>(sample);
+    service.tick(test::clock_sample(UtcMillis{sample_ms}, MonotonicMillis{sample_ms}));
   }
   const auto& history = service.telemetry_history();
   expect(
@@ -3757,9 +3962,14 @@ void test_control_service_bounds_telemetry_history() {
   expect(
       service.receive_command(
           estop,
-          static_cast<std::int64_t>(total_samples + 1)).accepted,
+          test::clock_sample(
+              UtcMillis{static_cast<std::int64_t>(total_samples + 1)},
+              MonotonicMillis{static_cast<std::int64_t>(total_samples + 1)}))
+          .accepted,
       "page ESTOP was rejected while checking telemetry provenance");
-  service.tick(static_cast<std::int64_t>(total_samples + 2));
+  service.tick(test::clock_sample(
+      UtcMillis{static_cast<std::int64_t>(total_samples + 2)},
+      MonotonicMillis{static_cast<std::int64_t>(total_samples + 2)}));
   const auto& stopped = service.telemetry_history().back();
   expect(
       stopped.at("stop_source").get<std::string>() == "page_request" &&
@@ -3776,7 +3986,7 @@ void test_control_service_close_preserves_stop_provenance() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     service.close({
         mine_teleop::VehicleStopSource::SoftwareFault,
         mine_teleop::VehicleStopReason::CriticalCameraFailed});
@@ -3792,7 +4002,7 @@ void test_control_service_close_preserves_stop_provenance() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     service.close({
         mine_teleop::VehicleStopSource::SoftwareFault,
         mine_teleop::VehicleStopReason::MediaPipelineFailed});
@@ -3808,7 +4018,7 @@ void test_control_service_close_preserves_stop_provenance() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     service.close();
     const auto telemetry = adapter_view->read_telemetry();
     expect(
@@ -3826,10 +4036,12 @@ void test_control_service_requires_feedback_before_actuation_but_allows_estop() 
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   activate_session_profile(service);
 
-  const auto rejected = service.receive_command(command(1, 0), 0);
+  const auto rejected = service.receive_command(
+      command(1, 0),
+      test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(!rejected.accepted && rejected.reason == "can_feedback_missing", "control was not gated on CAN feedback");
   expect(adapter_view->applied_commands == 0, "control reached chassis without CAN feedback");
   expect(adapter_view->safe_stops == 1, "missing feedback did not issue a safe stop");
@@ -3837,7 +4049,9 @@ void test_control_service_requires_feedback_before_actuation_but_allows_estop() 
 
   auto estop = command(2, 10);
   estop.estop = true;
-  const auto accepted_estop = service.receive_command(estop, 10);
+  const auto accepted_estop = service.receive_command(
+      estop,
+      test::clock_sample(UtcMillis{10}, MonotonicMillis{10}));
   expect(accepted_estop.accepted, "estop must bypass the feedback gate");
   expect(service.safety_state() == mine_teleop::SafetyState::Estop, "estop did not latch without feedback");
   expect_near(
@@ -3851,9 +4065,9 @@ void test_control_service_requires_feedback_before_actuation_but_allows_estop() 
 void test_fault_output_fails_safe() {
   mine_teleop::SafetyStateMachine safety(
       300, 800, {{0, 0.3}, {1500, 1.0}});
-  safety.mark_ready(0);
+  safety.mark_ready(MonotonicMillis{0});
   safety.mark_fault();
-  const auto output = safety.current_output(0);
+  const auto output = safety.current_output(MonotonicMillis{0});
   expect_near(output.brake, 1.0, 1e-9, "fault output must command full brake");
   expect_near(output.throttle, 0.0, 1e-9, "fault output must clear throttle");
   expect(output.full_emergency_brake, "fault output did not request full-DBC braking");
@@ -4152,7 +4366,9 @@ void test_native_signaling_webrtc_message_isolation() {
   expect(
       replacement.value("control_token", "") != control.control_token,
       "replacement session reused the previous control token");
-  auto old_token_command = command(1, mine_teleop::now_ms());
+  const ClockSample old_token_replay_time{
+      mine_teleop::utc_now_ms(), mine_teleop::process_monotonic_now_ms()};
+  auto old_token_command = command(1, old_token_replay_time.utc.value);
   old_token_command.session_id = replacement.at("session_id").get<std::string>();
   old_token_command.driver_id = "driver-2";
   old_token_command.control_token = control.control_token;
@@ -4164,7 +4380,7 @@ void test_native_signaling_webrtc_message_isolation() {
       mine_teleop::kProtocolVersion,
       true,
       replacement.at("control_token").get<std::string>());
-  const auto old_token_replay = replacement_receiver.accept(old_token_command, mine_teleop::now_ms());
+  const auto old_token_replay = replacement_receiver.accept(old_token_command, old_token_replay_time);
   expect(
       !old_token_replay.accepted && old_token_replay.reason == "control_token_invalid",
       "replacement vehicle receiver accepted the previous control token");
@@ -4683,17 +4899,24 @@ void test_native_driver_to_vehicle_signaling_control_payload() {
       vehicle_session.at("control_token").get<std::string>(),
       std::make_unique<mine_teleop::MockVehicleAdapter>());
   const auto received_at_ms = mine_teleop::now_ms();
-  receiver.start(received_at_ms);
+  const auto received_at = test::clock_sample(
+      UtcMillis{received_at_ms},
+      MonotonicMillis{received_at_ms});
+  receiver.start(received_at);
   auto profile = session_profile_request(1, received_at_ms);
   profile.driver_id = "driver-console-001";
   profile.session_id = control.session_id;
   profile.control_token = vehicle_session.at("control_token").get<std::string>();
   expect(
-      receiver.receive_session_profile(profile, received_at_ms).accepted,
+      receiver.receive_session_profile(profile, received_at).accepted,
       "vehicle receiver did not ACK the session profile before control");
-  const auto applied = receiver.receive_command(control, received_at_ms);
+  const auto applied = receiver.receive_command(control, received_at);
   expect(applied.accepted, "vehicle receiver did not accept the native signaling control payload");
-  const auto duplicate = receiver.receive_command(control, received_at_ms + 1);
+  const auto duplicate = receiver.receive_command(
+      control,
+      test::clock_sample(
+          UtcMillis{received_at_ms + 1},
+          MonotonicMillis{received_at_ms + 1}));
   expect(!duplicate.accepted && duplicate.reason == "old_seq", "vehicle receiver accepted a duplicate command");
   receiver.close();
   const auto disconnected = driver.disconnect("test_disconnect");

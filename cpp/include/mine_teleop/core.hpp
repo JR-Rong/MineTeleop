@@ -285,9 +285,6 @@ class ControlReceiver {
       bool allow_gap_recovery) const;
   void commit_accepted(const ControlCommand& command, ClockSample receive_time);
   void reset_watchdog_after_authorized_handshake();
-  ReceiveResult accept(const ControlCommand& command, std::int64_t legacy_receive_time_ms) {
-    return accept(command, legacy_clock_sample(legacy_receive_time_ms));
-  }
 
  private:
   std::string vehicle_id_;
@@ -396,23 +393,6 @@ class SafetyStateMachine {
   void tick(MonotonicMillis now);
   [[nodiscard]] ControlOutput current_output(MonotonicMillis now) const;
   bool reset_estop(bool local_confirmed, std::string_view authorized_by, MonotonicMillis now);
-  void mark_ready(std::int64_t legacy_now_ms) { mark_ready(MonotonicMillis{legacy_now_ms}); }
-  void on_valid_command(const ControlCommand& command, std::int64_t legacy_now_ms) {
-    on_valid_command(command, MonotonicMillis{legacy_now_ms});
-  }
-  [[nodiscard]] bool recover(
-      RecoveryCause cause,
-      const std::optional<ControlCommand>& command,
-      std::int64_t legacy_now_ms) {
-    return recover(cause, command, MonotonicMillis{legacy_now_ms});
-  }
-  void tick(std::int64_t legacy_now_ms) { tick(MonotonicMillis{legacy_now_ms}); }
-  [[nodiscard]] ControlOutput current_output(std::int64_t legacy_now_ms) const {
-    return current_output(MonotonicMillis{legacy_now_ms});
-  }
-  bool reset_estop(bool local_confirmed, std::string_view authorized_by, std::int64_t legacy_now_ms) {
-    return reset_estop(local_confirmed, authorized_by, MonotonicMillis{legacy_now_ms});
-  }
   void mark_fault();
 
   [[nodiscard]] SafetyState state() const { return state_; }
@@ -849,22 +829,6 @@ class VehicleControlService {
   }
   bool disconnect_vcu_handshake();
   bool reset_estop(bool local_confirmed, std::string_view authorized_by, ClockSample now);
-  void start(std::int64_t legacy_now_ms) { start(legacy_clock_sample(legacy_now_ms)); }
-  ReceiveResult receive_command(const ControlCommand& command, std::int64_t legacy_now_ms) {
-    return receive_command(command, legacy_clock_sample(legacy_now_ms));
-  }
-  SessionControlProfileResult receive_session_profile(
-      const SessionControlProfileRequest& request,
-      std::int64_t legacy_now_ms) {
-    return receive_session_profile(request, legacy_clock_sample(legacy_now_ms));
-  }
-  void tick(std::int64_t legacy_now_ms) { tick(legacy_clock_sample(legacy_now_ms)); }
-  bool reset_estop(
-      bool local_confirmed,
-      std::string_view authorized_by,
-      std::int64_t legacy_now_ms) {
-    return reset_estop(local_confirmed, authorized_by, legacy_clock_sample(legacy_now_ms));
-  }
   void close(VehicleStopContext context = {
       VehicleStopSource::Session,
       VehicleStopReason::SessionLost});

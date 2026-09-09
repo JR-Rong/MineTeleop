@@ -30,11 +30,4 @@ struct ClockSample {
 [[nodiscard]] UtcMillis utc_now_ms();
 [[nodiscard]] MonotonicMillis process_monotonic_now_ms();
 
-// Test-only compatibility for the former single integer clock API.  Runtime
-// call sites must construct a sample from their independent UTC and steady
-// clocks instead of relying on this convenience conversion.
-[[nodiscard]] constexpr ClockSample legacy_clock_sample(std::int64_t value) {
-  return {UtcMillis{value}, MonotonicMillis{value}};
-}
-
 }  // namespace mine_teleop

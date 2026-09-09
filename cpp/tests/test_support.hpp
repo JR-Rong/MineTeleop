@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mine_teleop/time.hpp"
+
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -23,6 +25,10 @@ class TestFailure : public std::runtime_error {
 
 inline void expect(bool condition, std::string_view message, SourceLocation location) {
   if (!condition) throw TestFailure(location, message);
+}
+
+[[nodiscard]] constexpr ClockSample clock_sample(UtcMillis utc, MonotonicMillis monotonic) {
+  return {utc, monotonic};
 }
 
 template <typename Function>

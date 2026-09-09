@@ -1,6 +1,7 @@
 #include "mine_teleop/control_limits.hpp"
 #include "mine_teleop/core.hpp"
 #include "mine_teleop_chassis_bridge.h"
+#include "test_support.hpp"
 
 #include <array>
 #include <cmath>
@@ -14,6 +15,7 @@
 namespace {
 
 namespace limits = mine_teleop::control_limits;
+namespace test = mine_teleop::test;
 
 static_assert(
     limits::kMaxFullScaleMotorTorqueNm ==
@@ -250,10 +252,13 @@ void test_protocol_and_vehicle_limits_are_independent() {
       "session-r10",
       "r10-control-token",
       std::make_unique<mine_teleop::MockVehicleAdapter>());
-  service.start(1'000);
+  const auto now = test::clock_sample(
+      mine_teleop::UtcMillis{1'000},
+      mine_teleop::MonotonicMillis{1'000});
+  service.start(now);
 
   auto exact = profile_request(1, valid_profile());
-  const auto exact_result = service.receive_session_profile(exact, 1'000);
+  const auto exact_result = service.receive_session_profile(exact, now);
   expect(exact_result.accepted, "vehicle ceiling rejected an exact profile limit");
 
   struct VehicleLimitCase {
@@ -285,7 +290,7 @@ void test_protocol_and_vehicle_limits_are_independent() {
     profile.validate();
     const auto result = service.receive_session_profile(
         profile_request(sequence++, std::move(profile)),
-        1'000);
+        now);
     expect(
         !result.accepted && result.reason == item.expected_reason,
         std::string("vehicle layer did not independently reject ") +

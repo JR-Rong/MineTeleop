@@ -640,6 +640,14 @@ if(MINE_TELEOP_BUILD_TESTS)
   add_test(NAME mine-teleop-control-tests COMMAND mine-teleop-control-tests)
   set_tests_properties(mine-teleop-control-tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+  add_executable(mine-teleop-clock-type-contract-tests cpp/tests/clock_type_contract_tests.cpp)
+  target_link_libraries(mine-teleop-clock-type-contract-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-clock-type-contract-tests)
+  add_test(
+    NAME mine-teleop-clock-type-contract-tests
+    COMMAND mine-teleop-clock-type-contract-tests
+  )
+
   add_executable(mine-teleop-control-limits-tests cpp/tests/control_limits_tests.cpp)
   target_include_directories(
     mine-teleop-control-limits-tests
