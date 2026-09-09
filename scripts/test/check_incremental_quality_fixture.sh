@@ -49,8 +49,8 @@ TOOL
 cat > "$tool_dir/git-clang-format" <<'TOOL'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == "--version" ]]; then
-  printf '%s\n' 'git-clang-format version 18.1.8'
+if [[ "${1:-}" == "--help" ]]; then
+  printf '%s\n' 'usage: git clang-format [OPTIONS] [<commit>] [<commit>|--staged] [--] [<file>...]'
   exit 0
 fi
 {
@@ -67,13 +67,6 @@ if [[ "${MINE_TELEOP_FAKE_GIT_CLANG_FORMAT_STATUS:-0}" != 0 ]]; then
 fi
 TOOL
 chmod 0755 "$tool_dir/clang-format" "$tool_dir/git-clang-format"
-
-cat > "$tool_dir/git-clang-format-bad" <<'TOOL'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' 'git-clang-format version 17.0.6'
-TOOL
-chmod 0755 "$tool_dir/git-clang-format-bad"
 
 cd "$fixture_repo"
 git init -q
@@ -146,6 +139,7 @@ before_status="$(git status --porcelain=v1 -z | od -An -tx1 | tr -d ' \n')"
 output="$(
   MINE_TELEOP_CLANG_FORMAT="$tool_dir/clang-format" \
   MINE_TELEOP_GIT_CLANG_FORMAT="$tool_dir/git-clang-format" \
+  MINE_TELEOP_GIT_CLANG_FORMAT_VERSION=18.1.8 \
   MINE_TELEOP_FAKE_TOOL_LOG="$tool_log" \
   bash scripts/test/check_incremental_quality.sh --base "$main_sha" 2>&1
 )"
@@ -173,6 +167,7 @@ grep -F 'cpp/untracked\ new.cpp' "$tool_log" >/dev/null
 format_failure_log="$tmp_dir/format-failure.log"
 if MINE_TELEOP_CLANG_FORMAT="$tool_dir/clang-format" \
   MINE_TELEOP_GIT_CLANG_FORMAT="$tool_dir/git-clang-format" \
+  MINE_TELEOP_GIT_CLANG_FORMAT_VERSION=18.1.8 \
   MINE_TELEOP_FAKE_TOOL_LOG="$tool_log" \
   MINE_TELEOP_FAKE_GIT_CLANG_FORMAT_STATUS=1 \
   bash scripts/test/check_incremental_quality.sh --base "$main_sha" >"$format_failure_log" 2>&1; then
@@ -188,6 +183,7 @@ printf '%s\n' 'int newline_path() { return 7; }' > "$newline_cpp"
 newline_failure_log="$tmp_dir/newline-failure.log"
 if MINE_TELEOP_CLANG_FORMAT="$tool_dir/clang-format" \
   MINE_TELEOP_GIT_CLANG_FORMAT="$tool_dir/git-clang-format" \
+  MINE_TELEOP_GIT_CLANG_FORMAT_VERSION=18.1.8 \
   MINE_TELEOP_FAKE_TOOL_LOG="$tool_log" \
   bash scripts/test/check_incremental_quality.sh --base "$main_sha" >"$newline_failure_log" 2>&1; then
   printf '%s\n' 'incremental quality fixture accepted a newline C++ path' >&2
@@ -201,6 +197,7 @@ unrelated_tree="$(git mktree </dev/null)"
 unrelated_sha="$(printf '%s\n' unrelated | git commit-tree "$unrelated_tree")"
 if MINE_TELEOP_CLANG_FORMAT="$tool_dir/clang-format" \
   MINE_TELEOP_GIT_CLANG_FORMAT="$tool_dir/git-clang-format" \
+  MINE_TELEOP_GIT_CLANG_FORMAT_VERSION=18.1.8 \
   MINE_TELEOP_FAKE_TOOL_LOG="$tool_log" \
   bash scripts/test/check_incremental_quality.sh --base "$unrelated_sha" >/dev/null 2>&1; then
   printf '%s\n' 'incremental quality fixture accepted unrelated baseline' >&2
@@ -208,10 +205,20 @@ if MINE_TELEOP_CLANG_FORMAT="$tool_dir/clang-format" \
 fi
 
 if MINE_TELEOP_CLANG_FORMAT="$tool_dir/clang-format" \
-  MINE_TELEOP_GIT_CLANG_FORMAT="$tool_dir/git-clang-format-bad" \
+  MINE_TELEOP_GIT_CLANG_FORMAT="$tool_dir/git-clang-format" \
+  MINE_TELEOP_GIT_CLANG_FORMAT_VERSION=17.0.6 \
   MINE_TELEOP_FAKE_TOOL_LOG="$tool_log" \
   bash scripts/test/check_incremental_quality.sh --base "$main_sha" >/dev/null 2>&1; then
   printf '%s\n' 'incremental quality fixture accepted wrong git-clang-format version' >&2
+  exit 1
+fi
+
+if MINE_TELEOP_CLANG_FORMAT="$tool_dir/clang-format" \
+  MINE_TELEOP_GIT_CLANG_FORMAT=/definitely-not-a-mine-teleop-git-clang-format \
+  MINE_TELEOP_GIT_CLANG_FORMAT_VERSION=18.1.8 \
+  MINE_TELEOP_FAKE_TOOL_LOG="$tool_log" \
+  bash scripts/test/check_incremental_quality.sh --base "$main_sha" >/dev/null 2>&1; then
+  printf '%s\n' 'incremental quality fixture accepted a missing git-clang-format wrapper' >&2
   exit 1
 fi
 

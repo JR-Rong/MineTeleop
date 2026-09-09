@@ -96,10 +96,16 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/llvm-toolchain-18.list >/dev/null
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends "$clang_format_package"
+          clang_format_version="${clang_format_package#*=}"
+          dpkg-query -W -f='${Version}\n' clang-format-18 | \
+            grep -Fx "$clang_format_version"
           clang-format-18 --version | tee "$RUNNER_TEMP/clang-format-version.log"
           grep -F 'clang-format version 18.1.8' "$RUNNER_TEMP/clang-format-version.log"
-          git-clang-format-18 --version | tee "$RUNNER_TEMP/git-clang-format-version.log"
-          grep -F 'git-clang-format version 18.1.8' "$RUNNER_TEMP/git-clang-format-version.log"
+          git_clang_format_path="$(command -v git-clang-format-18)"
+          dpkg-query -S "$git_clang_format_path" | \
+            grep -Fx "clang-format-18: $git_clang_format_path"
+          git-clang-format-18 --help | tee "$RUNNER_TEMP/git-clang-format-help.log"
+          grep -F 'usage: git clang-format' "$RUNNER_TEMP/git-clang-format-help.log"
 
       - name: Exercise incremental-quality fixture
         shell: bash
@@ -161,6 +167,7 @@ jobs:
         env:
           MINE_TELEOP_CLANG_FORMAT: clang-format-18
           MINE_TELEOP_GIT_CLANG_FORMAT: git-clang-format-18
+          MINE_TELEOP_GIT_CLANG_FORMAT_VERSION: "18.1.8"
           MINE_TELEOP_ESLINT: ${{ github.workspace }}/node_modules/.bin/eslint
         run: |
           set -euo pipefail

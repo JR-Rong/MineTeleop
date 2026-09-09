@@ -13,15 +13,16 @@ Options:
                               MINE_TELEOP_QUALITY_BASE, origin/main, or main.
   --compile-commands <path>   Directory containing compile_commands.json for
                               bounded clang-tidy checks of changed C++ TUs.
-  --require-format            Fail when clang-format/git-clang-format 18.1.8
-                              are unavailable.
+  --require-format            Fail when clang-format 18.1.8 or its paired
+                              git-clang-format wrapper is unavailable.
   --require-eslint            Fail when ESLint 9 is unavailable for changed JS.
   --require-tidy              Fail unless --compile-commands and clang-tidy 18
                               are available for changed C++ translation units.
   --help                      Show this help.
 
 Tool paths can be overridden with MINE_TELEOP_CLANG_FORMAT,
-MINE_TELEOP_GIT_CLANG_FORMAT, MINE_TELEOP_CLANG_TIDY, and MINE_TELEOP_ESLINT.
+MINE_TELEOP_GIT_CLANG_FORMAT, MINE_TELEOP_GIT_CLANG_FORMAT_VERSION,
+MINE_TELEOP_CLANG_TIDY, and MINE_TELEOP_ESLINT.
 Pass the target branch tip, push predecessor, or explicit predecessor as --base;
 the script uses its merge-base with HEAD as the comparison baseline.
 USAGE
@@ -225,11 +226,39 @@ require_tool_version() {
   fi
 }
 
+require_git_clang_format_wrapper() {
+  local tool_bin="$1"
+  local tool_help
+  if ! command -v "$tool_bin" >/dev/null 2>&1; then
+    printf 'git-clang-format %s is required\n' "$required_clang_tool_version" >&2
+    exit 2
+  fi
+  tool_help="$("$tool_bin" --help 2>&1)" || {
+    printf 'git-clang-format help check failed: %s\n' "$tool_bin" >&2
+    exit 2
+  }
+  if [[ "$tool_help" != *'usage: git clang-format'* ]]; then
+    printf 'git-clang-format wrapper is not recognized: %s\n' "$tool_bin" >&2
+    exit 2
+  fi
+  if [[ -n "${MINE_TELEOP_GIT_CLANG_FORMAT_VERSION:-}" ]]; then
+    if [[ "$MINE_TELEOP_GIT_CLANG_FORMAT_VERSION" != "$required_clang_tool_version" ]]; then
+      printf 'git-clang-format %s is required, found verified version: %s\n' \
+        "$required_clang_tool_version" "$MINE_TELEOP_GIT_CLANG_FORMAT_VERSION" >&2
+      exit 2
+    fi
+  elif [[ -n "${MINE_TELEOP_GIT_CLANG_FORMAT:-}" ]]; then
+    printf '%s\n' \
+      'MINE_TELEOP_GIT_CLANG_FORMAT_VERSION is required when overriding git-clang-format' >&2
+    exit 2
+  fi
+}
+
 clang_format_bin="$(choose_tool "${MINE_TELEOP_CLANG_FORMAT:-}" clang-format-18 clang-format)"
 git_clang_format_bin="$(choose_tool "${MINE_TELEOP_GIT_CLANG_FORMAT:-}" git-clang-format-18 git-clang-format)"
 if ((require_format || ${#cpp_files[@]} > 0)); then
   require_tool_version "clang-format" "$clang_format_bin" "clang-format version $required_clang_tool_version"
-  require_tool_version "git-clang-format" "$git_clang_format_bin" "git-clang-format version $required_clang_tool_version"
+  require_git_clang_format_wrapper "$git_clang_format_bin"
 fi
 
 # LLVM's fixed git-clang-format wrapper parses unified diffs line-by-line.
