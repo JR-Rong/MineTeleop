@@ -425,6 +425,17 @@ std::string trim(std::string value) {
   return value.substr(first, last - first + 1);
 }
 
+bool http_header_field_name_valid(std::string_view name) {
+  if (name.empty()) return false;
+  return std::all_of(name.begin(), name.end(), [](unsigned char value) {
+    return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+        (value >= '0' && value <= '9') || value == '!' || value == '#' || value == '$' ||
+        value == '%' || value == '&' || value == '\'' || value == '*' || value == '+' ||
+        value == '-' || value == '.' || value == '^' || value == '_' || value == '`' ||
+        value == '|' || value == '~';
+  });
+}
+
 std::optional<std::string> canonical_ip_address(std::string value) {
   value = trim(std::move(value));
   if (value.empty()) return std::nullopt;
@@ -1129,20 +1140,36 @@ HttpRequest parse_request(
     throw std::invalid_argument("invalid HTTP request line");
   }
   std::string header;
+  std::size_t host_count = 0;
+  std::size_t origin_count = 0;
   while (std::getline(headers, header)) {
-    header = trim(std::move(header));
+    if (!header.empty() && header.back() == '\r') header.pop_back();
     if (header.empty()) continue;
     const auto separator = header.find(':');
     if (separator == std::string::npos) throw std::invalid_argument("invalid HTTP header");
-    const auto name = lower(trim(header.substr(0, separator)));
-    if (name.empty()) throw std::invalid_argument("invalid HTTP header");
+    const auto raw_name = std::string_view(header).substr(0, separator);
+    if (!http_header_field_name_valid(raw_name)) throw std::invalid_argument("invalid HTTP header");
+    const auto name = lower(std::string(raw_name));
+    const auto value = trim(header.substr(separator + 1));
     if (name == "transfer-encoding") {
       throw std::invalid_argument("Transfer-Encoding is not supported");
+    }
+    if (name == "host") {
+      ++host_count;
+      if (host_count > 1) throw std::invalid_argument("duplicate Host header");
+      if (value.empty()) throw std::invalid_argument("invalid Host header");
+    }
+    if (name == "origin") {
+      ++origin_count;
+      if (origin_count > 1) throw std::invalid_argument("duplicate Origin header");
     }
     if (name == "content-length" && request.headers.contains(name)) {
       throw std::invalid_argument("duplicate Content-Length header");
     }
-    request.headers[name] = trim(header.substr(separator + 1));
+    request.headers[name] = value;
+  }
+  if (version == "HTTP/1.1" && host_count != 1) {
+    throw std::invalid_argument("HTTP/1.1 request requires exactly one Host header");
   }
 
   std::size_t content_length = 0;

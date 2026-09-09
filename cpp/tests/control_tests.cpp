@@ -553,6 +553,92 @@ void test_http_connection_budget_deadlines_and_framing() {
       "a non-reading HTTP peer retained the only pending request slot past the write deadline");
 }
 
+void test_raw_http_header_parse_rejects_before_map_overwrite() {
+  mine_teleop::SimpleHttpServer::ConnectionLimits limits;
+  limits.max_active_connections = 8;
+  limits.max_pending_http_connections = 4;
+  limits.max_websocket_connections = 2;
+  limits.max_connections_per_source = 8;
+  limits.listen_backlog = 4;
+  limits.header_read_timeout = std::chrono::milliseconds(500);
+  limits.body_read_timeout = std::chrono::milliseconds(500);
+  limits.response_write_timeout = std::chrono::milliseconds(500);
+
+  std::atomic<int> normal_handler_calls{0};
+  std::atomic<int> websocket_handler_calls{0};
+  mine_teleop::SimpleHttpServer server(
+      "127.0.0.1",
+      0,
+      [&](const mine_teleop::HttpRequest& request) {
+        ++normal_handler_calls;
+        if (request.path == "/list") {
+          const auto accepted = request.headers.find("accept");
+          const bool preserved_optional_origin = request.headers.find("origin") == request.headers.end();
+          const bool preserved_list_overwrite =
+              accepted != request.headers.end() && accepted->second == "application/json";
+          return mine_teleop::ServerResponse::text(
+              preserved_optional_origin && preserved_list_overwrite ? 200 : 500,
+              "list");
+        }
+        return mine_teleop::ServerResponse::text(200, "ok");
+      },
+      1024,
+      [&](mine_teleop::SocketHandle socket, const mine_teleop::HttpRequest& request) {
+        if (request.path != "/ws") return false;
+        ++websocket_handler_calls;
+        raw_send_all(
+            static_cast<int>(socket),
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+        return true;
+      },
+      limits);
+  server.start();
+
+  std::string control_character_field_name = "GET /bad HTTP/1.1\r\nHost: test\r\nBad";
+  control_character_field_name.push_back('\x01');
+  control_character_field_name += "Name: x\r\n\r\n";
+
+  const std::vector<std::string> invalid_requests{
+      control_character_field_name,
+      "GET /bad HTTP/1.1\r\nHost : test\r\n\r\n",
+      "GET /bad HTTP/1.1\r\nhost: test\r\nHOST: test\r\n\r\n",
+      "GET /bad HTTP/1.1\r\nHost: test\r\nOrigin: http://localhost\r\norigin: http://localhost\r\n\r\n",
+      "GET /bad HTTP/1.1\r\nOrigin: http://localhost\r\n\r\n",
+      "GET /ws HTTP/1.1\r\nHost: test\r\nHOST: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"};
+  for (const auto& request : invalid_requests) {
+    const auto response = raw_http_exchange(server.port(), request);
+    expect(response.starts_with("HTTP/1.1 400 "), "raw invalid HTTP header was not rejected with 400");
+    expect(normal_handler_calls == 0, "raw invalid HTTP header reached the normal handler");
+    expect(websocket_handler_calls == 0, "raw invalid HTTP header reached the WebSocket handler");
+  }
+
+  expect(
+      raw_http_exchange(
+          server.port(),
+          "GET /list HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain\r\nACCEPT: application/json\r\n\r\n")
+          .starts_with("HTTP/1.1 200 "),
+      "ordinary duplicate list-style header or optional Origin semantics regressed");
+  expect(normal_handler_calls == 1, "valid duplicate-list HTTP request was not handled exactly once");
+
+  expect(
+      raw_http_exchange(server.port(), "GET /legacy HTTP/1.0\r\nAccept: text/plain\r\n\r\n")
+          .starts_with("HTTP/1.1 200 "),
+      "HTTP/1.0 request without Host was rejected");
+  expect(normal_handler_calls == 2, "valid HTTP/1.0 request was not handled exactly once");
+
+  const int websocket = raw_http_connect(server.port());
+  raw_send_all(
+      websocket,
+      "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(server.port()) +
+          "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+  expect(
+      raw_receive_http_headers(websocket).starts_with("HTTP/1.1 101 "),
+      "valid raw WebSocket upgrade regressed");
+  ::close(websocket);
+  expect(websocket_handler_calls == 1, "valid raw WebSocket upgrade was not handled exactly once");
+  server.stop();
+}
+
 void test_websocket_connection_budget_transition() {
   mine_teleop::SimpleHttpServer::ConnectionLimits limits;
   limits.max_active_connections = 4;
@@ -7894,6 +7980,8 @@ int main() {
       {"shared_control_protocol_vector", test_shared_control_protocol_vector},
       {"loopback_http_server_and_port_conflict", test_loopback_http_server_and_port_conflict},
       {"http_connection_budget_deadlines_and_framing", test_http_connection_budget_deadlines_and_framing},
+      {"raw_http_header_parse_rejects_before_map_overwrite",
+       test_raw_http_header_parse_rejects_before_map_overwrite},
       {"websocket_connection_budget_transition", test_websocket_connection_budget_transition},
       {"signaling_time_sync_applies_backward_utc_correction",
        test_signaling_time_sync_applies_backward_utc_correction},
