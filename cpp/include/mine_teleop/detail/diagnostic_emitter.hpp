@@ -28,9 +28,8 @@ class DiagnosticSink {
  public:
   virtual ~DiagnosticSink() = default;
 
-  [[nodiscard]] virtual DiagnosticWriteResult write(
-      std::string_view jsonl_line,
-      std::stop_token stop_token) noexcept = 0;
+  [[nodiscard]] virtual DiagnosticWriteResult write(std::string_view jsonl_line,
+                                                    std::stop_token stop_token) noexcept = 0;
 };
 
 [[nodiscard]] std::shared_ptr<DiagnosticSink> make_stdout_diagnostic_sink();

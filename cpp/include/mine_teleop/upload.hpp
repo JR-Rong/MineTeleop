@@ -25,12 +25,9 @@ struct UploadProcessResult {
 
 class LocalArchiveUploader {
  public:
-  LocalArchiveUploader(
-      std::filesystem::path recording_root,
-      std::filesystem::path archive_root,
-      double max_bandwidth_mbps = 0.0,
-      int retry_initial_seconds = 10,
-      int retry_max_seconds = 600);
+  LocalArchiveUploader(std::filesystem::path recording_root, std::filesystem::path archive_root,
+                       double max_bandwidth_mbps = 0.0, int retry_initial_seconds = 10,
+                       int retry_max_seconds = 600);
 
   [[nodiscard]] UploadProcessResult process_once();
   [[nodiscard]] Json backlog() const;
@@ -62,8 +59,7 @@ struct RecordingStorageResult {
 };
 
 [[nodiscard]] RecordingStorageResult enforce_recording_storage_policy(
-    const std::filesystem::path& recording_root,
-    const RecordingConfig& config);
+    const std::filesystem::path& recording_root, const RecordingConfig& config);
 
 std::string sha256_file(const std::filesystem::path& path);
 

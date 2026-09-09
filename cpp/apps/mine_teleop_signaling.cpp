@@ -147,30 +147,23 @@ std::int64_t configured_integer(
   return environment_integer(environment_name, fallback);
 }
 
-std::size_t configured_size(
-    const Arguments& arguments,
-    std::string_view argument_name,
-    std::string_view environment_name,
-    std::size_t fallback) {
+std::size_t configured_size(const Arguments& arguments, std::string_view argument_name,
+                            std::string_view environment_name, std::size_t fallback) {
   if (fallback > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
     throw std::invalid_argument(std::string(argument_name) + " default is too large");
   }
-  const auto value = configured_integer(
-      arguments,
-      argument_name,
-      environment_name,
-      static_cast<std::int64_t>(fallback));
-  if (value <= 0) throw std::invalid_argument(std::string(argument_name) + " must be positive");
+  const auto value = configured_integer(arguments, argument_name, environment_name,
+                                        static_cast<std::int64_t>(fallback));
+  if (value <= 0)
+    throw std::invalid_argument(std::string(argument_name) + " must be positive");
   return static_cast<std::size_t>(value);
 }
 
-std::int64_t configured_duration_ms(
-    const Arguments& arguments,
-    std::string_view argument_name,
-    std::string_view environment_name,
-    std::int64_t fallback) {
+std::int64_t configured_duration_ms(const Arguments& arguments, std::string_view argument_name,
+                                    std::string_view environment_name, std::int64_t fallback) {
   const auto value = configured_integer(arguments, argument_name, environment_name, fallback);
-  if (value <= 0) throw std::invalid_argument(std::string(argument_name) + " must be positive");
+  if (value <= 0)
+    throw std::invalid_argument(std::string(argument_name) + " must be positive");
   return value;
 }
 
@@ -299,7 +292,8 @@ int main(int argc, char** argv) {
     if (!identity_config_path.empty()) {
       if (arguments.has("--allow-legacy-passwords")) {
         throw std::invalid_argument(
-            "--allow-legacy-passwords is configured only by auth.allow_legacy_passwords in the identity YAML");
+            "--allow-legacy-passwords is configured only by auth.allow_legacy_passwords in the "
+            "identity YAML");
       }
       if (arguments.has("--driver-id") || arguments.has("--driver-password") ||
           arguments.has("--vehicle-id") || arguments.has("--device-token") ||
@@ -312,7 +306,8 @@ int main(int argc, char** argv) {
     } else {
       if (!arguments.has("--allow-legacy-passwords")) {
         throw std::invalid_argument(
-            "legacy --driver-password mode requires --allow-legacy-passwords; use --config with Argon2id verifiers instead");
+            "legacy --driver-password mode requires --allow-legacy-passwords; use --config with "
+            "Argon2id verifiers instead");
       }
       const auto driver_id = arguments.value("--driver-id", "driver-console-001");
       const auto vehicle_id = arguments.value("--vehicle-id", "vehicle-001");
@@ -370,55 +365,35 @@ int main(int argc, char** argv) {
         "MINE_TELEOP_API_RATE_LIMIT_MAX_SOURCES",
         4096);
     config.max_signaling_queue_messages = configured_size(
-        arguments,
-        "--signaling-queue-max-messages",
-        "MINE_TELEOP_SIGNALING_QUEUE_MAX_MESSAGES",
+        arguments, "--signaling-queue-max-messages", "MINE_TELEOP_SIGNALING_QUEUE_MAX_MESSAGES",
         config.max_signaling_queue_messages);
-    config.max_signaling_queue_bytes = configured_size(
-        arguments,
-        "--signaling-queue-max-bytes",
-        "MINE_TELEOP_SIGNALING_QUEUE_MAX_BYTES",
-        config.max_signaling_queue_bytes);
+    config.max_signaling_queue_bytes =
+        configured_size(arguments, "--signaling-queue-max-bytes",
+                        "MINE_TELEOP_SIGNALING_QUEUE_MAX_BYTES", config.max_signaling_queue_bytes);
     config.websocket_rate_limit_messages = configured_integer(
-        arguments,
-        "--websocket-message-rate-limit",
-        "MINE_TELEOP_WEBSOCKET_MESSAGE_RATE_LIMIT",
+        arguments, "--websocket-message-rate-limit", "MINE_TELEOP_WEBSOCKET_MESSAGE_RATE_LIMIT",
         config.websocket_rate_limit_messages);
-    config.websocket_rate_limit_bytes = configured_size(
-        arguments,
-        "--websocket-byte-rate-limit",
-        "MINE_TELEOP_WEBSOCKET_BYTE_RATE_LIMIT",
-        config.websocket_rate_limit_bytes);
+    config.websocket_rate_limit_bytes =
+        configured_size(arguments, "--websocket-byte-rate-limit",
+                        "MINE_TELEOP_WEBSOCKET_BYTE_RATE_LIMIT", config.websocket_rate_limit_bytes);
     config.websocket_rate_limit_window_ms = configured_integer(
-        arguments,
-        "--websocket-rate-limit-window-ms",
-        "MINE_TELEOP_WEBSOCKET_RATE_LIMIT_WINDOW_MS",
+        arguments, "--websocket-rate-limit-window-ms", "MINE_TELEOP_WEBSOCKET_RATE_LIMIT_WINDOW_MS",
         config.websocket_rate_limit_window_ms);
-    config.connection_limits.max_active_connections = configured_size(
-        arguments,
-        "--max-active-connections",
-        "MINE_TELEOP_MAX_ACTIVE_CONNECTIONS",
-        config.connection_limits.max_active_connections);
+    config.connection_limits.max_active_connections =
+        configured_size(arguments, "--max-active-connections", "MINE_TELEOP_MAX_ACTIVE_CONNECTIONS",
+                        config.connection_limits.max_active_connections);
     config.connection_limits.max_pending_http_connections = configured_size(
-        arguments,
-        "--max-pending-http-connections",
-        "MINE_TELEOP_MAX_PENDING_HTTP_CONNECTIONS",
+        arguments, "--max-pending-http-connections", "MINE_TELEOP_MAX_PENDING_HTTP_CONNECTIONS",
         config.connection_limits.max_pending_http_connections);
     config.connection_limits.max_websocket_connections = configured_size(
-        arguments,
-        "--max-websocket-connections",
-        "MINE_TELEOP_MAX_WEBSOCKET_CONNECTIONS",
+        arguments, "--max-websocket-connections", "MINE_TELEOP_MAX_WEBSOCKET_CONNECTIONS",
         config.connection_limits.max_websocket_connections);
     config.connection_limits.max_connections_per_source = configured_size(
-        arguments,
-        "--max-connections-per-source",
-        "MINE_TELEOP_MAX_CONNECTIONS_PER_SOURCE",
+        arguments, "--max-connections-per-source", "MINE_TELEOP_MAX_CONNECTIONS_PER_SOURCE",
         config.connection_limits.max_connections_per_source);
-    const auto listen_backlog_value = configured_integer(
-        arguments,
-        "--listen-backlog",
-        "MINE_TELEOP_LISTEN_BACKLOG",
-        config.connection_limits.listen_backlog);
+    const auto listen_backlog_value =
+        configured_integer(arguments, "--listen-backlog", "MINE_TELEOP_LISTEN_BACKLOG",
+                           config.connection_limits.listen_backlog);
     if (listen_backlog_value > std::numeric_limits<int>::max()) {
       throw std::invalid_argument("--listen-backlog is too large");
     }
@@ -427,25 +402,19 @@ int main(int argc, char** argv) {
     }
     config.connection_limits.listen_backlog = static_cast<int>(listen_backlog_value);
     config.connection_limits.header_read_timeout = std::chrono::milliseconds(configured_duration_ms(
-        arguments,
-        "--header-read-timeout-ms",
-        "MINE_TELEOP_HEADER_READ_TIMEOUT_MS",
+        arguments, "--header-read-timeout-ms", "MINE_TELEOP_HEADER_READ_TIMEOUT_MS",
         config.connection_limits.header_read_timeout.count()));
     config.connection_limits.body_read_timeout = std::chrono::milliseconds(configured_duration_ms(
-        arguments,
-        "--body-read-timeout-ms",
-        "MINE_TELEOP_BODY_READ_TIMEOUT_MS",
+        arguments, "--body-read-timeout-ms", "MINE_TELEOP_BODY_READ_TIMEOUT_MS",
         config.connection_limits.body_read_timeout.count()));
-    config.connection_limits.response_write_timeout = std::chrono::milliseconds(configured_duration_ms(
-        arguments,
-        "--response-write-timeout-ms",
-        "MINE_TELEOP_RESPONSE_WRITE_TIMEOUT_MS",
-        config.connection_limits.response_write_timeout.count()));
-    config.connection_limits.overload_write_timeout = std::chrono::milliseconds(configured_duration_ms(
-        arguments,
-        "--overload-write-timeout-ms",
-        "MINE_TELEOP_OVERLOAD_WRITE_TIMEOUT_MS",
-        config.connection_limits.overload_write_timeout.count()));
+    config.connection_limits.response_write_timeout =
+        std::chrono::milliseconds(configured_duration_ms(
+            arguments, "--response-write-timeout-ms", "MINE_TELEOP_RESPONSE_WRITE_TIMEOUT_MS",
+            config.connection_limits.response_write_timeout.count()));
+    config.connection_limits.overload_write_timeout =
+        std::chrono::milliseconds(configured_duration_ms(
+            arguments, "--overload-write-timeout-ms", "MINE_TELEOP_OVERLOAD_WRITE_TIMEOUT_MS",
+            config.connection_limits.overload_write_timeout.count()));
     // Reject an invalid connection budget before service construction or
     // listener activation so misconfiguration names the offending field.
     mine_teleop::validate_connection_limits(config.connection_limits);
@@ -504,7 +473,8 @@ int main(int argc, char** argv) {
     const auto audit_log_rotation_interval_ms = config.audit_log_rotation_interval_ms;
     const auto audit_log_retention_days = config.audit_log_retention_days;
     const auto native_control_trace_commands = config.native_control_trace_commands;
-    const auto driver_count = config.driver_passwords.size() + config.driver_password_verifiers.size();
+    const auto driver_count =
+        config.driver_passwords.size() + config.driver_password_verifiers.size();
     const auto vehicle_count = config.device_tokens.size();
     std::size_t permission_count = 0;
     for (const auto& entry : config.driver_vehicle_permissions) permission_count += entry.second.size();
@@ -534,54 +504,56 @@ int main(int argc, char** argv) {
 
     auto service = std::make_shared<mine_teleop::SignalingService>(std::move(config));
     mine_teleop::SimpleHttpServer server(
-        host,
-        port(arguments),
-        [service](const auto& request) { return service->handle(request); },
+        host, port(arguments), [service](const auto& request) { return service->handle(request); },
         8 * 1024 * 1024,
-        [service](int socket, const auto& request) { return service->handle_websocket(socket, request); },
+        [service](int socket, const auto& request) {
+          return service->handle_websocket(socket, request);
+        },
         connection_limits);
     server.start();
     std::signal(SIGINT, stop_handler);
     std::signal(SIGTERM, stop_handler);
-    std::cout << mine_teleop::Json({
-                     {"event", "signaling_server_started"},
-                     {"runtime", "cpp"},
-                     {"host", host},
-                     {"port", server.port()},
-                     {"tls_termination", "external"},
-                     {"websocket", true},
-                     {"stun_url_count", stun_count},
-                     {"turn_url_count", turn_count},
-                     {"login_max_failures", login_max_failures},
-                     {"login_failure_window_ms", login_failure_window_ms},
-                     {"login_lockout_ms", login_lockout_ms},
-                     {"api_rate_limit_requests", api_rate_limit_requests},
-                     {"api_rate_limit_window_ms", api_rate_limit_window_ms},
-                     {"api_rate_limit_max_sources", api_rate_limit_max_sources},
-                     {"max_signaling_queue_messages", max_signaling_queue_messages},
-                     {"max_signaling_queue_bytes", max_signaling_queue_bytes},
-                     {"websocket_rate_limit_messages", websocket_rate_limit_messages},
-                     {"websocket_rate_limit_bytes", websocket_rate_limit_bytes},
-                     {"websocket_rate_limit_window_ms", websocket_rate_limit_window_ms},
-                     {"trusted_proxy_count", trusted_proxy_count},
-                     {"max_active_connections", max_active_connections},
-                     {"max_pending_http_connections", max_pending_http_connections},
-                     {"max_websocket_connections", max_websocket_connections},
-                     {"max_connections_per_source", max_connections_per_source},
-                     {"listen_backlog", listen_backlog},
-                     {"header_read_timeout_ms", header_read_timeout_ms},
-                     {"body_read_timeout_ms", body_read_timeout_ms},
-                     {"response_write_timeout_ms", response_write_timeout_ms},
-                     {"overload_write_timeout_ms", overload_write_timeout_ms},
-                     {"audit_log_max_bytes", audit_log_max_bytes},
-                     {"audit_log_files", audit_log_files},
-                     {"audit_log_rotation_interval_ms", audit_log_rotation_interval_ms},
-                     {"audit_log_retention_days", audit_log_retention_days},
-                     {"native_control_trace_commands", native_control_trace_commands},
-                     {"driver_count", driver_count},
-                     {"vehicle_count", vehicle_count},
-                     {"permission_count", permission_count},
-                 }).dump()
+    std::cout << mine_teleop::Json(
+                     {
+                         {"event", "signaling_server_started"},
+                         {"runtime", "cpp"},
+                         {"host", host},
+                         {"port", server.port()},
+                         {"tls_termination", "external"},
+                         {"websocket", true},
+                         {"stun_url_count", stun_count},
+                         {"turn_url_count", turn_count},
+                         {"login_max_failures", login_max_failures},
+                         {"login_failure_window_ms", login_failure_window_ms},
+                         {"login_lockout_ms", login_lockout_ms},
+                         {"api_rate_limit_requests", api_rate_limit_requests},
+                         {"api_rate_limit_window_ms", api_rate_limit_window_ms},
+                         {"api_rate_limit_max_sources", api_rate_limit_max_sources},
+                         {"max_signaling_queue_messages", max_signaling_queue_messages},
+                         {"max_signaling_queue_bytes", max_signaling_queue_bytes},
+                         {"websocket_rate_limit_messages", websocket_rate_limit_messages},
+                         {"websocket_rate_limit_bytes", websocket_rate_limit_bytes},
+                         {"websocket_rate_limit_window_ms", websocket_rate_limit_window_ms},
+                         {"trusted_proxy_count", trusted_proxy_count},
+                         {"max_active_connections", max_active_connections},
+                         {"max_pending_http_connections", max_pending_http_connections},
+                         {"max_websocket_connections", max_websocket_connections},
+                         {"max_connections_per_source", max_connections_per_source},
+                         {"listen_backlog", listen_backlog},
+                         {"header_read_timeout_ms", header_read_timeout_ms},
+                         {"body_read_timeout_ms", body_read_timeout_ms},
+                         {"response_write_timeout_ms", response_write_timeout_ms},
+                         {"overload_write_timeout_ms", overload_write_timeout_ms},
+                         {"audit_log_max_bytes", audit_log_max_bytes},
+                         {"audit_log_files", audit_log_files},
+                         {"audit_log_rotation_interval_ms", audit_log_rotation_interval_ms},
+                         {"audit_log_retention_days", audit_log_retention_days},
+                         {"native_control_trace_commands", native_control_trace_commands},
+                         {"driver_count", driver_count},
+                         {"vehicle_count", vehicle_count},
+                         {"permission_count", permission_count},
+                     })
+                     .dump()
               << std::endl;
     while (!stopping) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     server.stop();

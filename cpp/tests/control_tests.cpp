@@ -50,9 +50,8 @@ struct FakeDualClock {
   std::atomic<std::int64_t> monotonic_ms{0};
 
   [[nodiscard]] mine_teleop::ClockSample sample() const {
-    return {
-        mine_teleop::UtcMillis{utc_ms.load(std::memory_order_relaxed)},
-        mine_teleop::MonotonicMillis{monotonic_ms.load(std::memory_order_relaxed)}};
+    return {mine_teleop::UtcMillis{utc_ms.load(std::memory_order_relaxed)},
+            mine_teleop::MonotonicMillis{monotonic_ms.load(std::memory_order_relaxed)}};
   }
 
   void jump_utc(std::int64_t delta_ms) {
@@ -64,10 +63,9 @@ struct FakeDualClock {
   }
 };
 
-void authorize_local_post(
-    const mine_teleop::DriverConsoleHttpApp& app,
-    mine_teleop::HttpRequest& request,
-    std::string_view authority = "127.0.0.1:8080") {
+void authorize_local_post(const mine_teleop::DriverConsoleHttpApp& app,
+                          mine_teleop::HttpRequest& request,
+                          std::string_view authority = "127.0.0.1:8080") {
   request.headers["host"] = std::string(authority);
   request.headers["origin"] = "http://" + std::string(authority);
   request.headers["content-type"] = "application/json";
@@ -93,9 +91,11 @@ std::string response_header(const mine_teleop::ServerResponse& response, std::st
   return found == response.headers.end() ? "" : found->second;
 }
 
-std::size_t response_header_count(const mine_teleop::ServerResponse& response, std::string_view name) {
-  return static_cast<std::size_t>(std::count_if(
-      response.headers.begin(), response.headers.end(), [&](const auto& header) { return header.first == name; }));
+std::size_t response_header_count(const mine_teleop::ServerResponse& response,
+                                  std::string_view name) {
+  return static_cast<std::size_t>(
+      std::count_if(response.headers.begin(), response.headers.end(),
+                    [&](const auto& header) { return header.first == name; }));
 }
 
 template <typename Function>
@@ -196,7 +196,8 @@ std::string raw_http_exchange(std::uint16_t port, std::string_view request) {
 
 int raw_http_connect(std::uint16_t port) {
   const int socket = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (socket < 0) throw std::runtime_error("raw HTTP test socket failed");
+  if (socket < 0)
+    throw std::runtime_error("raw HTTP test socket failed");
   try {
     timeval timeout{2, 0};
     ::setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -219,9 +220,11 @@ std::string raw_receive_until_close(int socket) {
   std::array<char, 4096> buffer{};
   while (true) {
     const auto received = ::recv(socket, buffer.data(), buffer.size(), 0);
-    if (received == 0) return response;
+    if (received == 0)
+      return response;
     if (received < 0) {
-      if (errno == EINTR) continue;
+      if (errno == EINTR)
+        continue;
       throw std::runtime_error("raw HTTP test receive failed");
     }
     response.append(buffer.data(), static_cast<std::size_t>(received));
@@ -232,7 +235,8 @@ std::string raw_receive_http_headers(int socket) {
   std::string headers;
   while (headers.find("\r\n\r\n") == std::string::npos) {
     headers += raw_receive_exact(socket, 1);
-    if (headers.size() > 64 * 1024) throw std::runtime_error("raw HTTP response headers are too large");
+    if (headers.size() > 64 * 1024)
+      throw std::runtime_error("raw HTTP response headers are too large");
   }
   return headers;
 }
@@ -377,15 +381,11 @@ void test_shared_control_protocol_vector() {
   auto first = command;
   first.seq = 1;
   first.sent_at_utc_ms = mine_teleop::now_ms();
-  expect(
-      receiver
-          .accept(
-              first,
-              test::clock_sample(
-                  mine_teleop::UtcMillis{first.sent_at_utc_ms},
-                  mine_teleop::MonotonicMillis{first.sent_at_utc_ms}))
-          .accepted,
-      "first control sequence was rejected");
+  expect(receiver
+             .accept(first, test::clock_sample(mine_teleop::UtcMillis{first.sent_at_utc_ms},
+                                               mine_teleop::MonotonicMillis{first.sent_at_utc_ms}))
+             .accepted,
+         "first control sequence was rejected");
   auto after_prepared_gap = first;
   after_prepared_gap.seq = 3;
   ++after_prepared_gap.sent_at_utc_ms;
@@ -393,9 +393,8 @@ void test_shared_control_protocol_vector() {
       receiver
           .accept(
               after_prepared_gap,
-              test::clock_sample(
-                  mine_teleop::UtcMillis{after_prepared_gap.sent_at_utc_ms},
-                  mine_teleop::MonotonicMillis{after_prepared_gap.sent_at_utc_ms}))
+              test::clock_sample(mine_teleop::UtcMillis{after_prepared_gap.sent_at_utc_ms},
+                                 mine_teleop::MonotonicMillis{after_prepared_gap.sent_at_utc_ms}))
           .accepted,
       "receiver rejected a monotonic sequence gap from a prepared but superseded browser command");
 }
@@ -445,32 +444,34 @@ void test_http_connection_budget_deadlines_and_framing() {
   mine_teleop::SimpleHttpServer server("127.0.0.1", 0, handler, 1024, {}, limits);
   server.start();
 
-  const auto request = [&](std::string_view wire) { return raw_http_exchange(server.port(), wire); };
-  expect(
-      request("GET /health HTTP/1.1\r\nHost: test\r\n\r\n").starts_with("HTTP/1.1 200 "),
-      "normal short HTTP request was rejected");
+  const auto request = [&](std::string_view wire) {
+    return raw_http_exchange(server.port(), wire);
+  };
+  expect(request("GET /health HTTP/1.1\r\nHost: test\r\n\r\n").starts_with("HTTP/1.1 200 "),
+         "normal short HTTP request was rejected");
   for (const auto& malformed : std::array<std::string, 7>{
            "POST /health HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n",
-           "POST /health HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
+           "POST /health HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\nContent-Length: "
+           "0\r\n\r\n",
            "POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\ncontent-length: 0\r\n\r\n",
            "POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: 1, 1\r\n\r\n",
            "POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: +1\r\n\r\n",
            "POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: 184467440737095516160\r\n\r\n",
            "GET /health HTTP/1.2\r\nHost: test\r\n\r\n"}) {
-    expect(
-        request(malformed).starts_with("HTTP/1.1 400 "),
-        "malformed HTTP framing or version was not rejected");
+    expect(request(malformed).starts_with("HTTP/1.1 400 "),
+           "malformed HTTP framing or version was not rejected");
   }
-  expect(
-      request("POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: 1025\r\n\r\n").starts_with("HTTP/1.1 413 "),
-      "oversized Content-Length was not rejected before body allocation");
+  expect(request("POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: 1025\r\n\r\n")
+             .starts_with("HTTP/1.1 413 "),
+         "oversized Content-Length was not rejected before body allocation");
 
   const int held_one = raw_http_connect(server.port());
   const int held_two = raw_http_connect(server.port());
   const int rejected = raw_http_connect(server.port());
   const auto overload = raw_receive_until_close(rejected);
   ::close(rejected);
-  expect(overload.starts_with("HTTP/1.1 503 "), "connection budget did not reject excess pre-auth HTTP clients");
+  expect(overload.starts_with("HTTP/1.1 503 "),
+         "connection budget did not reject excess pre-auth HTTP clients");
   ::close(held_one);
   ::close(held_two);
 
@@ -495,14 +496,11 @@ void test_http_connection_budget_deadlines_and_framing() {
   std::this_thread::sleep_for(std::chrono::milliseconds(280));
   const auto slow_header_response = raw_receive_until_close(slow_header);
   ::close(slow_header);
-  expect(
-      slow_header_response.starts_with("HTTP/1.1 408 "),
-      "slow-drip HTTP headers exceeded an idle interval but not the absolute deadline");
+  expect(slow_header_response.starts_with("HTTP/1.1 408 "),
+         "slow-drip HTTP headers exceeded an idle interval but not the absolute deadline");
 
   const int slow_body = raw_http_connect(server.port());
-  raw_send_all(
-      slow_body,
-      "POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\na");
+  raw_send_all(slow_body, "POST /health HTTP/1.1\r\nHost: test\r\nContent-Length: 5\r\n\r\na");
   std::this_thread::sleep_for(std::chrono::milliseconds(70));
   raw_send_all(slow_body, "b");
   std::this_thread::sleep_for(std::chrono::milliseconds(70));
@@ -510,14 +508,16 @@ void test_http_connection_budget_deadlines_and_framing() {
   std::this_thread::sleep_for(std::chrono::milliseconds(280));
   const auto slow_body_response = raw_receive_until_close(slow_body);
   ::close(slow_body);
-  expect(slow_body_response.starts_with("HTTP/1.1 408 "), "slow-drip HTTP body ignored its absolute deadline");
+  expect(slow_body_response.starts_with("HTTP/1.1 408 "),
+         "slow-drip HTTP body ignored its absolute deadline");
 
   const int held_for_stop = raw_http_connect(server.port());
   const auto stop_started_at = std::chrono::steady_clock::now();
   server.stop();
   const auto stop_elapsed = std::chrono::steady_clock::now() - stop_started_at;
   ::close(held_for_stop);
-  expect(stop_elapsed < std::chrono::seconds(1), "HTTP stop did not wake a pending client read promptly");
+  expect(stop_elapsed < std::chrono::seconds(1),
+         "HTTP stop did not wake a pending client read promptly");
 
   auto write_limits = limits;
   write_limits.max_active_connections = 2;
@@ -526,31 +526,27 @@ void test_http_connection_budget_deadlines_and_framing() {
   write_limits.max_connections_per_source = 2;
   write_limits.response_write_timeout = std::chrono::milliseconds(150);
   mine_teleop::SimpleHttpServer write_server(
-      "127.0.0.1",
-      0,
+      "127.0.0.1", 0,
       [](const mine_teleop::HttpRequest& request) {
         if (request.path == "/large") {
           return mine_teleop::ServerResponse::text(200, std::string(4 * 1024 * 1024, 'x'));
         }
         return mine_teleop::ServerResponse::text(200, "ok");
       },
-      1024,
-      {},
-      write_limits);
+      1024, {}, write_limits);
   write_server.start();
   const int stalled_reader = raw_http_connect(write_server.port());
   int receive_buffer = 1024;
-  static_cast<void>(::setsockopt(
-      stalled_reader, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer)));
+  static_cast<void>(
+      ::setsockopt(stalled_reader, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer)));
   raw_send_all(stalled_reader, "GET /large HTTP/1.1\r\nHost: test\r\n\r\n");
   std::this_thread::sleep_for(std::chrono::milliseconds(400));
-  const auto after_stalled_write = raw_http_exchange(
-      write_server.port(), "GET /health HTTP/1.1\r\nHost: test\r\n\r\n");
+  const auto after_stalled_write =
+      raw_http_exchange(write_server.port(), "GET /health HTTP/1.1\r\nHost: test\r\n\r\n");
   ::close(stalled_reader);
   write_server.stop();
-  expect(
-      after_stalled_write.starts_with("HTTP/1.1 200 "),
-      "a non-reading HTTP peer retained the only pending request slot past the write deadline");
+  expect(after_stalled_write.starts_with("HTTP/1.1 200 "),
+         "a non-reading HTTP peer retained the only pending request slot past the write deadline");
 }
 
 void test_raw_http_header_parse_rejects_before_map_overwrite() {
@@ -567,28 +563,28 @@ void test_raw_http_header_parse_rejects_before_map_overwrite() {
   std::atomic<int> normal_handler_calls{0};
   std::atomic<int> websocket_handler_calls{0};
   mine_teleop::SimpleHttpServer server(
-      "127.0.0.1",
-      0,
+      "127.0.0.1", 0,
       [&](const mine_teleop::HttpRequest& request) {
         ++normal_handler_calls;
         if (request.path == "/list") {
           const auto accepted = request.headers.find("accept");
-          const bool preserved_optional_origin = request.headers.find("origin") == request.headers.end();
+          const bool preserved_optional_origin =
+              request.headers.find("origin") == request.headers.end();
           const bool preserved_list_overwrite =
               accepted != request.headers.end() && accepted->second == "application/json";
           return mine_teleop::ServerResponse::text(
-              preserved_optional_origin && preserved_list_overwrite ? 200 : 500,
-              "list");
+              preserved_optional_origin && preserved_list_overwrite ? 200 : 500, "list");
         }
         return mine_teleop::ServerResponse::text(200, "ok");
       },
       1024,
       [&](mine_teleop::SocketHandle socket, const mine_teleop::HttpRequest& request) {
-        if (request.path != "/ws") return false;
+        if (request.path != "/ws")
+          return false;
         ++websocket_handler_calls;
-        raw_send_all(
-            static_cast<int>(socket),
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+        raw_send_all(static_cast<int>(socket),
+                     "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: "
+                     "Upgrade\r\n\r\n");
         return true;
       },
       limits);
@@ -604,38 +600,37 @@ void test_raw_http_header_parse_rejects_before_map_overwrite() {
       "GET /bad HTTP/1.1\r\nHost: invalid host\r\n\r\n",
       "GET /bad HTTP/1.1\r\nHost: test\rInjected: value\r\n\r\n",
       "GET /bad HTTP/1.1\r\nhost: test\r\nHOST: test\r\n\r\n",
-      "GET /bad HTTP/1.1\r\nHost: test\r\nOrigin: http://localhost\r\norigin: http://localhost\r\n\r\n",
+      "GET /bad HTTP/1.1\r\nHost: test\r\nOrigin: http://localhost\r\norigin: "
+      "http://localhost\r\n\r\n",
       "GET /bad HTTP/1.1\r\nOrigin: http://localhost\r\n\r\n",
-      "GET /ws HTTP/1.1\r\nHost: test\r\nHOST: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"};
+      "GET /ws HTTP/1.1\r\nHost: test\r\nHOST: test\r\nUpgrade: websocket\r\nConnection: "
+      "Upgrade\r\n\r\n"};
   for (const auto& request : invalid_requests) {
     const auto response = raw_http_exchange(server.port(), request);
-    expect(response.starts_with("HTTP/1.1 400 "), "raw invalid HTTP header was not rejected with 400");
+    expect(response.starts_with("HTTP/1.1 400 "),
+           "raw invalid HTTP header was not rejected with 400");
     expect(normal_handler_calls == 0, "raw invalid HTTP header reached the normal handler");
     expect(websocket_handler_calls == 0, "raw invalid HTTP header reached the WebSocket handler");
   }
 
-  expect(
-      raw_http_exchange(
-          server.port(),
-          "GET /list HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain\r\nACCEPT: application/json\r\n\r\n")
-          .starts_with("HTTP/1.1 200 "),
-      "ordinary duplicate list-style header or optional Origin semantics regressed");
-  expect(normal_handler_calls == 1, "valid duplicate-list HTTP request was not handled exactly once");
+  expect(raw_http_exchange(server.port(),
+                           "GET /list HTTP/1.1\r\nHost: localhost\r\nAccept: text/plain\r\nACCEPT: "
+                           "application/json\r\n\r\n")
+             .starts_with("HTTP/1.1 200 "),
+         "ordinary duplicate list-style header or optional Origin semantics regressed");
+  expect(normal_handler_calls == 1,
+         "valid duplicate-list HTTP request was not handled exactly once");
 
-  expect(
-      raw_http_exchange(server.port(), "GET /legacy HTTP/1.0\r\nAccept: text/plain\r\n\r\n")
-          .starts_with("HTTP/1.1 200 "),
-      "HTTP/1.0 request without Host was rejected");
+  expect(raw_http_exchange(server.port(), "GET /legacy HTTP/1.0\r\nAccept: text/plain\r\n\r\n")
+             .starts_with("HTTP/1.1 200 "),
+         "HTTP/1.0 request without Host was rejected");
   expect(normal_handler_calls == 2, "valid HTTP/1.0 request was not handled exactly once");
 
   const int websocket = raw_http_connect(server.port());
-  raw_send_all(
-      websocket,
-      "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(server.port()) +
-          "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
-  expect(
-      raw_receive_http_headers(websocket).starts_with("HTTP/1.1 101 "),
-      "valid raw WebSocket upgrade regressed");
+  raw_send_all(websocket, "GET /ws HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(server.port()) +
+                              "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+  expect(raw_receive_http_headers(websocket).starts_with("HTTP/1.1 101 "),
+         "valid raw WebSocket upgrade regressed");
   ::close(websocket);
   expect(websocket_handler_calls == 1, "valid raw WebSocket upgrade was not handled exactly once");
   server.stop();
@@ -653,9 +648,12 @@ void test_websocket_connection_budget_transition() {
   std::atomic<int> websocket_handler_calls{0};
   std::atomic<bool> release_websocket{false};
   const auto websocket_handler_for = [](std::atomic<bool>& release, std::atomic<int>* calls) {
-    return [&release, calls](mine_teleop::SocketHandle socket, const mine_teleop::HttpRequest& request) {
-      if (request.path != "/ws") return false;
-      if (calls != nullptr) ++*calls;
+    return [&release, calls](mine_teleop::SocketHandle socket,
+                             const mine_teleop::HttpRequest& request) {
+      if (request.path != "/ws")
+        return false;
+      if (calls != nullptr)
+        ++*calls;
       raw_send_all(
           static_cast<int>(socket),
           "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
@@ -666,18 +664,17 @@ void test_websocket_connection_budget_transition() {
     };
   };
   mine_teleop::SimpleHttpServer server(
-      "127.0.0.1",
-      0,
+      "127.0.0.1", 0,
       [&](const mine_teleop::HttpRequest&) {
         ++normal_handler_calls;
         return mine_teleop::ServerResponse::text(200, "normal");
       },
-      1024,
-      websocket_handler_for(release_websocket, &websocket_handler_calls),
-      limits);
+      1024, websocket_handler_for(release_websocket, &websocket_handler_calls), limits);
   struct ReleaseWebSocketOnExit final {
     std::atomic<bool>& value;
-    ~ReleaseWebSocketOnExit() { value.store(true, std::memory_order_release); }
+    ~ReleaseWebSocketOnExit() {
+      value.store(true, std::memory_order_release);
+    }
   } release_on_exit{release_websocket};
   server.start();
 
@@ -690,25 +687,21 @@ void test_websocket_connection_budget_transition() {
   };
 
   const int upgraded = open_upgrade(server.port());
-  expect(
-      raw_receive_http_headers(upgraded).starts_with("HTTP/1.1 101 "),
-      "test WebSocket upgrade was not accepted");
+  expect(raw_receive_http_headers(upgraded).starts_with("HTTP/1.1 101 "),
+         "test WebSocket upgrade was not accepted");
   expect(normal_handler_calls == 0, "successful WebSocket upgrade invoked the normal HTTP handler");
-  expect(
-      raw_http_exchange(server.port(), "GET /health HTTP/1.1\r\nHost: test\r\n\r\n")
-          .starts_with("HTTP/1.1 200 "),
-      "upgraded WebSocket did not release the pending HTTP budget for a short request");
+  expect(raw_http_exchange(server.port(), "GET /health HTTP/1.1\r\nHost: test\r\n\r\n")
+             .starts_with("HTTP/1.1 200 "),
+         "upgraded WebSocket did not release the pending HTTP budget for a short request");
   expect(normal_handler_calls == 1, "ordinary HTTP request was not routed exactly once");
 
   const int websocket_overflow = open_upgrade(server.port());
   const auto websocket_overflow_response = raw_receive_until_close(websocket_overflow);
   ::close(websocket_overflow);
-  expect(
-      websocket_overflow_response.starts_with("HTTP/1.1 503 "),
-      "WebSocket-specific connection budget was not enforced");
-  expect(
-      websocket_handler_calls == 1 && normal_handler_calls == 1,
-      "WebSocket budget exhaustion reached an upgrade or normal handler unexpectedly");
+  expect(websocket_overflow_response.starts_with("HTTP/1.1 503 "),
+         "WebSocket-specific connection budget was not enforced");
+  expect(websocket_handler_calls == 1 && normal_handler_calls == 1,
+         "WebSocket budget exhaustion reached an upgrade or normal handler unexpectedly");
 
   // The rejected upgrade closes in its worker before the next admission check;
   // allow its bounded teardown to release its pre-upgrade accounting slot.
@@ -724,25 +717,22 @@ void test_websocket_connection_budget_transition() {
   source_limits.max_connections_per_source = 2;
   std::atomic<bool> release_source_websocket{false};
   mine_teleop::SimpleHttpServer source_server(
-      "127.0.0.1",
-      0,
-      [](const mine_teleop::HttpRequest&) { return mine_teleop::ServerResponse::text(200, "normal"); },
-      1024,
-      websocket_handler_for(release_source_websocket, nullptr),
-      source_limits);
+      "127.0.0.1", 0,
+      [](const mine_teleop::HttpRequest&) {
+        return mine_teleop::ServerResponse::text(200, "normal");
+      },
+      1024, websocket_handler_for(release_source_websocket, nullptr), source_limits);
   ReleaseWebSocketOnExit release_source_on_exit{release_source_websocket};
   source_server.start();
   const int source_upgraded = open_upgrade(source_server.port());
-  expect(
-      raw_receive_http_headers(source_upgraded).starts_with("HTTP/1.1 101 "),
-      "source-budget test WebSocket upgrade was not accepted");
+  expect(raw_receive_http_headers(source_upgraded).starts_with("HTTP/1.1 101 "),
+         "source-budget test WebSocket upgrade was not accepted");
   const int source_held = raw_http_connect(source_server.port());
   const int source_overflow = raw_http_connect(source_server.port());
   const auto source_overflow_response = raw_receive_until_close(source_overflow);
   ::close(source_overflow);
-  expect(
-      source_overflow_response.starts_with("HTTP/1.1 503 "),
-      "upgraded WebSocket was not included in the per-source connection budget");
+  expect(source_overflow_response.starts_with("HTTP/1.1 503 "),
+         "upgraded WebSocket was not included in the per-source connection budget");
   ::close(source_held);
   release_source_websocket.store(true, std::memory_order_release);
   ::close(source_upgraded);
@@ -754,29 +744,28 @@ void test_websocket_connection_budget_transition() {
   total_limits.max_connections_per_source = 4;
   std::atomic<bool> release_total_websocket{false};
   mine_teleop::SimpleHttpServer total_server(
-      "127.0.0.1",
-      0,
-      [](const mine_teleop::HttpRequest&) { return mine_teleop::ServerResponse::text(200, "normal"); },
-      1024,
-      websocket_handler_for(release_total_websocket, nullptr),
-      total_limits);
+      "127.0.0.1", 0,
+      [](const mine_teleop::HttpRequest&) {
+        return mine_teleop::ServerResponse::text(200, "normal");
+      },
+      1024, websocket_handler_for(release_total_websocket, nullptr), total_limits);
   struct ReleaseTotalWebSocketOnExit final {
     std::atomic<bool>& value;
-    ~ReleaseTotalWebSocketOnExit() { value.store(true, std::memory_order_release); }
+    ~ReleaseTotalWebSocketOnExit() {
+      value.store(true, std::memory_order_release);
+    }
   } release_total_on_exit{release_total_websocket};
   total_server.start();
   const int total_upgraded = open_upgrade(total_server.port());
-  expect(
-      raw_receive_http_headers(total_upgraded).starts_with("HTTP/1.1 101 "),
-      "total-budget test WebSocket upgrade was not accepted");
+  expect(raw_receive_http_headers(total_upgraded).starts_with("HTTP/1.1 101 "),
+         "total-budget test WebSocket upgrade was not accepted");
   const int total_held_one = raw_http_connect(total_server.port());
   const int total_held_two = raw_http_connect(total_server.port());
   const int total_overflow = raw_http_connect(total_server.port());
   const auto total_overflow_response = raw_receive_until_close(total_overflow);
   ::close(total_overflow);
-  expect(
-      total_overflow_response.starts_with("HTTP/1.1 503 "),
-      "upgraded WebSocket was not included in the total connection budget");
+  expect(total_overflow_response.starts_with("HTTP/1.1 503 "),
+         "upgraded WebSocket was not included in the total connection budget");
   ::close(total_held_one);
   ::close(total_held_two);
   release_total_websocket.store(true, std::memory_order_release);
@@ -792,15 +781,15 @@ void test_websocket_connection_budget_transition() {
   std::atomic<bool> release_fallback_handler{false};
   std::atomic<int> fallback_normal_handler_calls{0};
   mine_teleop::SimpleHttpServer fallback_server(
-      "127.0.0.1",
-      0,
+      "127.0.0.1", 0,
       [&](const mine_teleop::HttpRequest&) {
         ++fallback_normal_handler_calls;
         return mine_teleop::ServerResponse::text(200, "normal");
       },
       1024,
       [&](mine_teleop::SocketHandle, const mine_teleop::HttpRequest& request) {
-        if (request.path != "/fallback") return false;
+        if (request.path != "/fallback")
+          return false;
         fallback_handler_entered.store(true, std::memory_order_release);
         while (!release_fallback_handler.load(std::memory_order_acquire)) {
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -810,7 +799,9 @@ void test_websocket_connection_budget_transition() {
       fallback_limits);
   struct ReleaseFallbackHandlerOnExit final {
     std::atomic<bool>& value;
-    ~ReleaseFallbackHandlerOnExit() { value.store(true, std::memory_order_release); }
+    ~ReleaseFallbackHandlerOnExit() {
+      value.store(true, std::memory_order_release);
+    }
   } release_fallback_on_exit{release_fallback_handler};
   fallback_server.start();
   const int fallback_upgrade = raw_http_connect(fallback_server.port());
@@ -822,24 +813,21 @@ void test_websocket_connection_budget_transition() {
          std::chrono::steady_clock::now() < fallback_entered_deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  expect(
-      fallback_handler_entered.load(std::memory_order_acquire),
-      "upgrade-shaped fallback request did not reach the WebSocket handler");
+  expect(fallback_handler_entered.load(std::memory_order_acquire),
+         "upgrade-shaped fallback request did not reach the WebSocket handler");
   const int fallback_pending = raw_http_connect(fallback_server.port());
   const int fallback_overflow = raw_http_connect(fallback_server.port());
   const auto fallback_overflow_response = raw_receive_until_close(fallback_overflow);
   ::close(fallback_overflow);
-  expect(
-      fallback_overflow_response.starts_with("HTTP/1.1 503 "),
-      "fallback test did not fill the pending HTTP connection budget");
+  expect(fallback_overflow_response.starts_with("HTTP/1.1 503 "),
+         "fallback test did not fill the pending HTTP connection budget");
   release_fallback_handler.store(true, std::memory_order_release);
   const auto fallback_response = raw_receive_until_close(fallback_upgrade);
   ::close(fallback_upgrade);
   ::close(fallback_pending);
   fallback_server.stop();
-  expect(
-      fallback_response.starts_with("HTTP/1.1 503 "),
-      "upgrade-shaped fallback request bypassed the pending HTTP connection budget");
+  expect(fallback_response.starts_with("HTTP/1.1 503 "),
+         "upgrade-shaped fallback request bypassed the pending HTTP connection budget");
   expect(
       fallback_normal_handler_calls == 0,
       "upgrade-shaped fallback request reached the ordinary HTTP handler after budget rejection");
@@ -884,38 +872,34 @@ void test_driver_runtime_utc_expiry_maps_to_monotonic_after_resync() {
   std::atomic<std::int64_t> server_offset_ms{60'000};
   std::atomic<int> login_requests{0};
   mine_teleop::SimpleHttpServer server(
-      "127.0.0.1",
-      0,
-      [&](const mine_teleop::HttpRequest& request) {
+      "127.0.0.1", 0, [&](const mine_teleop::HttpRequest& request) {
         if (request.path == "/time") {
           const auto client_send = request.query.find("client_send_ms");
           if (client_send == request.query.end()) {
-            return mine_teleop::ServerResponse::json(400, {{"error", "client_send_ms is required"}});
+            return mine_teleop::ServerResponse::json(400,
+                                                     {{"error", "client_send_ms is required"}});
           }
           const auto server_time = mine_teleop::now_ms() + server_offset_ms.load();
           return mine_teleop::ServerResponse::json(
-              200,
-              {{"time_domain", "signaling_server"},
-               {"client_send_ms", std::stoll(client_send->second)},
-               {"server_receive_ms", server_time},
-               {"server_send_ms", server_time}});
+              200, {{"time_domain", "signaling_server"},
+                    {"client_send_ms", std::stoll(client_send->second)},
+                    {"server_receive_ms", server_time},
+                    {"server_send_ms", server_time}});
         }
         if (request.path == "/auth/driver_login") {
           const auto login_number = login_requests.fetch_add(1) + 1;
           return mine_teleop::ServerResponse::json(
-              200,
-              {{"token_type", "bearer"},
-               {"token", "driver-resync-token-" + std::to_string(login_number)},
-               {"expires_at_ms", mine_teleop::now_ms() + server_offset_ms.load() + 500},
-               {"connection_generation", login_number},
-               {"service_instance_id", "driver-resync-test"}});
+              200, {{"token_type", "bearer"},
+                    {"token", "driver-resync-token-" + std::to_string(login_number)},
+                    {"expires_at_ms", mine_teleop::now_ms() + server_offset_ms.load() + 500},
+                    {"connection_generation", login_number},
+                    {"service_instance_id", "driver-resync-test"}});
         }
         if (request.path == "/drivers/driver-resync/vehicles") {
           return mine_teleop::ServerResponse::json(
-              200,
-              {{"driver_id", "driver-resync"},
-               {"vehicles", mine_teleop::Json::array({{{"vehicle_id", "vehicle-001"},
-                                                           {"online", true}}})}});
+              200, {{"driver_id", "driver-resync"},
+                    {"vehicles", mine_teleop::Json::array(
+                                     {{{"vehicle_id", "vehicle-001"}, {"online", true}}})}});
         }
         return mine_teleop::ServerResponse::json(404, {{"error", "not found"}});
       });
@@ -938,12 +922,10 @@ void test_driver_runtime_utc_expiry_maps_to_monotonic_after_resync() {
   const auto second_expiry_utc_ms = second_login.at("token_expires_at_utc_ms").get<std::int64_t>();
   server.stop();
 
-  expect(
-      login_requests.load() == 2,
-      "driver runtime extended a locally expired token after a backward time-sync reanchor");
-  expect(
-      second_expiry_utc_ms < first_expiry_utc_ms - 50'000,
-      "driver runtime did not retain the resynchronized UTC expiry for display");
+  expect(login_requests.load() == 2,
+         "driver runtime extended a locally expired token after a backward time-sync reanchor");
+  expect(second_expiry_utc_ms < first_expiry_utc_ms - 50'000,
+         "driver runtime did not retain the resynchronized UTC expiry for display");
 }
 
 void test_driver_time_sync_uncertainty_fails_closed_at_production_default() {
@@ -1034,29 +1016,33 @@ void test_control_page_contract() {
   const auto control_logic_response = app.handle(asset_request);
   asset_request.path = "/api/console-config";
   const auto console_config_response = app.handle(asset_request);
-  const auto control_assets =
-      response.body + "\n" + console_css_response.body + "\n" +
-      control_logic_response.body + "\n" + console_js_response.body;
+  const auto control_assets = response.body + "\n" + console_css_response.body + "\n" +
+                              control_logic_response.body + "\n" + console_js_response.body;
   expect(response.status == 200, "control page did not load");
   expect(response.body.find("Mine Teleop 控制台") != std::string::npos, "control page identity is missing");
   expect(response.body.find("rel=\"icon\" href=\"data:,\"") != std::string::npos, "control page triggers a favicon 404");
   expect(response.body.find("登录并加载车辆") != std::string::npos, "driver login UI is missing");
   expect(response.body.find("授权车辆") != std::string::npos, "authorized vehicle selector is missing");
-  expect(response.body.find("认证有效至") == std::string::npos, "driver token expiry was embedded in static HTML");
-  expect(control_assets.find("认证有效至") != std::string::npos, "driver token expiry is not visible");
-  expect(control_assets.find("登录已失效，请重新认证") != std::string::npos, "driver re-authentication UX is missing");
-  expect(control_assets.find("post('/api/login'") != std::string::npos, "driver credential is not handled by the local runtime");
+  expect(response.body.find("认证有效至") == std::string::npos,
+         "driver token expiry was embedded in static HTML");
+  expect(control_assets.find("认证有效至") != std::string::npos,
+         "driver token expiry is not visible");
+  expect(control_assets.find("登录已失效，请重新认证") != std::string::npos,
+         "driver re-authentication UX is missing");
+  expect(control_assets.find("post('/api/login'") != std::string::npos,
+         "driver credential is not handled by the local runtime");
   expect(
       control_assets.find("'x-mine-teleop-page-capability':pageCapability") != std::string::npos &&
           response.body.find(app.page_capability()) == std::string::npos &&
           console_config_response.body.find(app.page_capability()) != std::string::npos,
-      "local control page binds mutations to the /api/console-config page capability, not static HTML");
-  expect(
-      control_assets.find("passwordInput.value='';const result=await post('/api/login'") != std::string::npos,
-      "driver credential is not cleared before the login request can fail");
-  expect(
-      control_assets.find("controlAuthorityLost=false;webrtcLabel.textContent='未连接'") != std::string::npos,
-      "successful reauthentication leaves a stale lost-authority label visible");
+      "local control page binds mutations to the /api/console-config page capability, not static "
+      "HTML");
+  expect(control_assets.find("passwordInput.value='';const result=await post('/api/login'") !=
+             std::string::npos,
+         "driver credential is not cleared before the login request can fail");
+  expect(control_assets.find("controlAuthorityLost=false;webrtcLabel.textContent='未连接'") !=
+             std::string::npos,
+         "successful reauthentication leaves a stale lost-authority label visible");
 
   mine_teleop::HttpRequest mutation;
   mutation.method = "POST";
@@ -1072,10 +1058,12 @@ void test_control_page_contract() {
   expect(app.handle(mutation).status == 200, "default-port IPv6 local mutation was rejected");
   authorize_local_post(app, mutation, "127.0.0.1:80");
   mutation.headers["origin"] = "http://127.0.0.1";
-  expect(app.handle(mutation).status == 200, "equivalent explicit/default port origins did not match");
+  expect(app.handle(mutation).status == 200,
+         "equivalent explicit/default port origins did not match");
   authorize_local_post(app, mutation, "localhost");
   mutation.headers["origin"] = "http://127.0.0.1";
-  expect(app.handle(mutation).status == 403, "different loopback host origins were treated as same-origin");
+  expect(app.handle(mutation).status == 403,
+         "different loopback host origins were treated as same-origin");
   mutation.headers["origin"] = "http://untrusted.example";
   mutation.headers["sec-fetch-site"] = "cross-site";
   expect(app.handle(mutation).status == 403, "foreign-origin local mutation was accepted");
@@ -1092,23 +1080,22 @@ void test_control_page_contract() {
   authorize_local_post(app, mutation);
   mutation.headers["x-mine-teleop-page-capability"] = "wrong-capability";
   expect(app.handle(mutation).status == 403, "invalid local page capability was accepted");
-  expect(control_assets.find("navigator.getGamepads") != std::string::npos, "Gamepad discovery is missing");
-  expect(
-      control_assets.find("id=\"gamepad-panel\"") == std::string::npos &&
-          control_assets.find("未检测到 Gamepad") == std::string::npos &&
-          control_assets.find("id=\"keyboard-panel\"") != std::string::npos,
-      "the obsolete Gamepad status panel was not replaced by keyboard control feedback");
+  expect(control_assets.find("navigator.getGamepads") != std::string::npos,
+         "Gamepad discovery is missing");
+  expect(control_assets.find("id=\"gamepad-panel\"") == std::string::npos &&
+             control_assets.find("未检测到 Gamepad") == std::string::npos &&
+             control_assets.find("id=\"keyboard-panel\"") != std::string::npos,
+         "the obsolete Gamepad status panel was not replaced by keyboard control feedback");
   expect(
       control_assets.find("class=\"workspace\"") != std::string::npos &&
           control_assets.find("class=\"sidebar\"") != std::string::npos &&
           control_assets.find("html,body{height:100%;overflow:hidden}") != std::string::npos,
       "the control page is not organized as a single-screen workspace with a monitoring sidebar");
-  expect(
-      control_assets.find("id=\"control-steering\"") != std::string::npos &&
-          control_assets.find("id=\"control-throttle\"") != std::string::npos &&
-          control_assets.find("id=\"control-brake\"") != std::string::npos &&
-          control_assets.find("function renderControlState()") != std::string::npos,
-      "live steering, throttle, and brake feedback is missing");
+  expect(control_assets.find("id=\"control-steering\"") != std::string::npos &&
+             control_assets.find("id=\"control-throttle\"") != std::string::npos &&
+             control_assets.find("id=\"control-brake\"") != std::string::npos &&
+             control_assets.find("function renderControlState()") != std::string::npos,
+         "live steering, throttle, and brake feedback is missing");
   expect(
       control_assets.find("id=\"operator-status-strip\"") != std::string::npos &&
           control_assets.find("id=\"operator-speed\"") != std::string::npos &&
@@ -1122,16 +1109,15 @@ void test_control_page_contract() {
           control_assets.find(".visual-stage .camera>video{position:absolute;inset:0") !=
               std::string::npos,
       "camera-first responsive layout can still hide critical vehicle state");
-  expect(
-      control_assets.find("id=\"can-feedback-panel\"") != std::string::npos &&
-          control_assets.find("id=\"wheel-feedback-grid\"") != std::string::npos &&
-          control_assets.find("id=\"steering-feedback-grid\"") != std::string::npos &&
-          control_assets.find("message.event==='vehicle_telemetry'") != std::string::npos &&
-          control_assets.find("motor_torque_nm") != std::string::npos &&
-          control_assets.find("motor_speed_rpm") != std::string::npos &&
-          control_assets.find("steering_angle_deg") != std::string::npos &&
-          control_assets.find("brake_pressure_bar") != std::string::npos,
-      "complete measured CAN feedback is not rendered from vehicle telemetry");
+  expect(control_assets.find("id=\"can-feedback-panel\"") != std::string::npos &&
+             control_assets.find("id=\"wheel-feedback-grid\"") != std::string::npos &&
+             control_assets.find("id=\"steering-feedback-grid\"") != std::string::npos &&
+             control_assets.find("message.event==='vehicle_telemetry'") != std::string::npos &&
+             control_assets.find("motor_torque_nm") != std::string::npos &&
+             control_assets.find("motor_speed_rpm") != std::string::npos &&
+             control_assets.find("steering_angle_deg") != std::string::npos &&
+             control_assets.find("brake_pressure_bar") != std::string::npos,
+         "complete measured CAN feedback is not rendered from vehicle telemetry");
   expect(
       control_assets.find("function createControlLogic()") != std::string::npos &&
           control_assets.find("const controlLogic=MineTeleopControlLogic") != std::string::npos &&
@@ -1144,10 +1130,13 @@ void test_control_page_contract() {
       "the production page is not wired to the shared fixed-key control module");
   expect(
       control_assets.find("pressedControlKeys=controlLogic.createKeySet()") != std::string::npos &&
-          control_assets.find("blockedControlKeys=controlLogic.createKeySet()") != std::string::npos &&
-          control_assets.find("controlLogic.pressKey(pressedControlKeys,blockedControlKeys,e.code)") !=
+          control_assets.find("blockedControlKeys=controlLogic.createKeySet()") !=
               std::string::npos &&
-          control_assets.find("controlLogic.releaseKey(pressedControlKeys,blockedControlKeys,e.code)") !=
+          control_assets.find(
+              "controlLogic.pressKey(pressedControlKeys,blockedControlKeys,e.code)") !=
+              std::string::npos &&
+          control_assets.find(
+              "controlLogic.releaseKey(pressedControlKeys,blockedControlKeys,e.code)") !=
               std::string::npos &&
           control_assets.find("state=controlLogic.deriveKeyState(pressedControlKeys)") !=
               std::string::npos,
@@ -1161,124 +1150,100 @@ void test_control_page_contract() {
           keyboard_connection_gate != std::string::npos &&
           keyboard_prevent_default < keyboard_connection_gate,
       "control keys can still scroll the page before the connection gate runs");
-  expect(
-      control_assets.find("lastKeyboardEvent.textContent") != std::string::npos &&
-          control_assets.find("已截获 · 等待连接") != std::string::npos &&
-          control_assets.find("需释放后重新按下") != std::string::npos,
-      "keyboard capture and fresh-keydown interlock do not provide visible operator feedback");
-  expect(
-      control_assets.find("selectedGear='N'") != std::string::npos &&
-          control_assets.find("controlLogic.deriveGearSelection") != std::string::npos &&
-          control_logic_response.body.find("function allowsGearChange") != std::string::npos &&
-          control_assets.find("updateSelectedGearFromHeldDirections") != std::string::npos &&
-          control_assets.find("updateSelectedGearFromInput({up:true,down:false})") !=
-              std::string::npos &&
-          control_assets.find(
-              "换挡已阻止：需至少 3 帧且持续 200 ms 的新鲜零速反馈") !=
-              std::string::npos &&
-          control_assets.find("if(gear!=='R')gear='N'") == std::string::npos,
-      "keyboard and Gamepad do not share the zero-speed-gated gear reducer");
-  expect(
-      control_assets.find("function currentControl") != std::string::npos &&
-          control_assets.find("const control=controlLogic.deriveControl") !=
-              std::string::npos &&
-          control_assets.find("limits:effectiveControlLimits()") != std::string::npos,
-      "the production page bypasses shared brake/control derivation");
-  expect(
-      control_assets.find("开始平行驾驶握手") != std::string::npos &&
-          control_assets.find("断开 VCU 握手") != std::string::npos &&
-          control_assets.find("can-vmc-fault") != std::string::npos &&
-          control_assets.find("can-parking-switch") != std::string::npos &&
-          control_assets.find("can-brake-pedal") != std::string::npos &&
-          control_assets.find("vcuHandshake.handshake_revoked") !=
-              std::string::npos &&
-          control_assets.find("握手已被 VCU 撤销") != std::string::npos &&
-          control_assets.find("完成后请从页面重新申请 VCU 握手") !=
-              std::string::npos,
-      "explicit VCU handshake controls are missing");
-  const auto diagnose_handshake =
-      control_assets.find("function diagnoseVcuHandshake");
-  const auto handshake_revoked_gate = control_assets.find(
-      "if(vcuHandshake.handshake_revoked)", diagnose_handshake);
-  const auto profile_ack_gate = control_assets.find(
-      "if(!controlProfileState.acknowledged)", diagnose_handshake);
+  expect(control_assets.find("lastKeyboardEvent.textContent") != std::string::npos &&
+             control_assets.find("已截获 · 等待连接") != std::string::npos &&
+             control_assets.find("需释放后重新按下") != std::string::npos,
+         "keyboard capture and fresh-keydown interlock do not provide visible operator feedback");
+  expect(control_assets.find("selectedGear='N'") != std::string::npos &&
+             control_assets.find("controlLogic.deriveGearSelection") != std::string::npos &&
+             control_logic_response.body.find("function allowsGearChange") != std::string::npos &&
+             control_assets.find("updateSelectedGearFromHeldDirections") != std::string::npos &&
+             control_assets.find("updateSelectedGearFromInput({up:true,down:false})") !=
+                 std::string::npos &&
+             control_assets.find("换挡已阻止：需至少 3 帧且持续 200 ms 的新鲜零速反馈") !=
+                 std::string::npos &&
+             control_assets.find("if(gear!=='R')gear='N'") == std::string::npos,
+         "keyboard and Gamepad do not share the zero-speed-gated gear reducer");
+  expect(control_assets.find("function currentControl") != std::string::npos &&
+             control_assets.find("const control=controlLogic.deriveControl") != std::string::npos &&
+             control_assets.find("limits:effectiveControlLimits()") != std::string::npos,
+         "the production page bypasses shared brake/control derivation");
+  expect(control_assets.find("开始平行驾驶握手") != std::string::npos &&
+             control_assets.find("断开 VCU 握手") != std::string::npos &&
+             control_assets.find("can-vmc-fault") != std::string::npos &&
+             control_assets.find("can-parking-switch") != std::string::npos &&
+             control_assets.find("can-brake-pedal") != std::string::npos &&
+             control_assets.find("vcuHandshake.handshake_revoked") != std::string::npos &&
+             control_assets.find("握手已被 VCU 撤销") != std::string::npos &&
+             control_assets.find("完成后请从页面重新申请 VCU 握手") != std::string::npos,
+         "explicit VCU handshake controls are missing");
+  const auto diagnose_handshake = control_assets.find("function diagnoseVcuHandshake");
+  const auto handshake_revoked_gate =
+      control_assets.find("if(vcuHandshake.handshake_revoked)", diagnose_handshake);
+  const auto profile_ack_gate =
+      control_assets.find("if(!controlProfileState.acknowledged)", diagnose_handshake);
   expect(
       diagnose_handshake != std::string::npos &&
           handshake_revoked_gate != std::string::npos &&
           profile_ack_gate != std::string::npos &&
           handshake_revoked_gate < profile_ack_gate,
       "handshake revocation can be hidden by the cleared session profile gate");
-  expect(
-      control_assets.find("event:'vcu_handshake_command'") != std::string::npos &&
-          control_assets.find("'vcu_handshake_status','session_control_profile_status'") !=
-              std::string::npos,
-      "VCU handshake command/status DataChannel contract is missing");
+  expect(control_assets.find("event:'vcu_handshake_command'") != std::string::npos &&
+             control_assets.find("'vcu_handshake_status','session_control_profile_status'") !=
+                 std::string::npos,
+         "VCU handshake command/status DataChannel contract is missing");
   expect(
       control_assets.find("'control_command_rejected'") != std::string::npos &&
-      control_assets.find(
-              "controlLogic.deriveControlCommandRejection(message.issue_code)") !=
+          control_assets.find("controlLogic.deriveControlCommandRejection(message.issue_code)") !=
               std::string::npos &&
-          control_assets.find(
-              "pendingGearTransition=controlLogic.createGearTransition") !=
+          control_assets.find("pendingGearTransition=controlLogic.createGearTransition") !=
               std::string::npos &&
-          control_assets.find(
-              "pendingGearTransition=controlLogic.recordForwardedGearCommand") !=
+          control_assets.find("pendingGearTransition=controlLogic.recordForwardedGearCommand") !=
               std::string::npos &&
-          control_assets.find("controlLogic.reduceGearChangeRejection") !=
-              std::string::npos &&
+          control_assets.find("controlLogic.reduceGearChangeRejection") != std::string::npos &&
           control_assets.find("selectedGear=gearRejectionState.selectedGear") !=
               std::string::npos &&
-          control_assets.find("clearControlInput(false)") !=
-              std::string::npos &&
-          control_assets.find("gearRejectionState.inhibitOrdinaryControl") !=
-              std::string::npos &&
-          control_assets.find("blockReason='gear_rejection_unresolved'") !=
-              std::string::npos &&
-          control_assets.find("send({},false).catch(console.error)") !=
-              std::string::npos &&
-          control_assets.find("driver_control_command_rejected") !=
-              std::string::npos,
+          control_assets.find("clearControlInput(false)") != std::string::npos &&
+          control_assets.find("gearRejectionState.inhibitOrdinaryControl") != std::string::npos &&
+          control_assets.find("blockReason='gear_rejection_unresolved'") != std::string::npos &&
+          control_assets.find("send({},false).catch(console.error)") != std::string::npos &&
+          control_assets.find("driver_control_command_rejected") != std::string::npos,
       "structured gear rejection does not restore the retained gear with zero input");
-  expect(
-      control_assets.find("vcu_handshake_not_ready") != std::string::npos &&
-          control_assets.find("vcuHandshake.parking_ready") != std::string::npos,
-      "driving commands are not gated by explicit N/EPB-ready VCU handshake state");
-  expect(
-      control_assets.find("只有 N 挡允许进入平行驾驶") != std::string::npos &&
-          control_assets.find("电子驻车未全部拉起") != std::string::npos &&
-          control_assets.find("反馈已过期") != std::string::npos &&
-          control_assets.find("握手请求已发送") != std::string::npos &&
-          control_assets.find("启动第 2/5 步未完成") != std::string::npos &&
-          control_assets.find("复用智驾握手，等待 VCU 状态 5") != std::string::npos &&
-          control_assets.find("退出第 4/5 步未完成") != std::string::npos,
-      "the control page does not explain the failed VCU gate or handshake step");
-  expect(
-      control_assets.find("实车调试限幅") != std::string::npos &&
-          control_assets.find("驾驶参数") != std::string::npos &&
-          control_assets.find("速度 PID 与升扭标定") != std::string::npos &&
-          control_assets.find("目标车速上限（km/h）") != std::string::npos &&
-          control_assets.find("max-motor-torque-nm") != std::string::npos &&
-          control_assets.find("max=\"640.0\"") != std::string::npos &&
-          control_assets.find("max-brake-pressure-bar") != std::string::npos &&
-          control_assets.find("service-brake-pressure-bar") != std::string::npos &&
-          control_assets.find("hard-brake-pressure-bar") != std::string::npos &&
-          control_assets.find("max-steering-deg") != std::string::npos &&
-          control_assets.find("speed-pid-kp") != std::string::npos &&
-          control_assets.find("speed-pid-ki") != std::string::npos &&
-          control_assets.find("speed-pid-kd") != std::string::npos &&
-          control_assets.find("speed-pid-derivative-filter-tau-ms") != std::string::npos &&
-          control_assets.find("speed-pid-max-dt-ms") != std::string::npos &&
-          control_assets.find("motor-torque-rise-rate") != std::string::npos &&
-          control_assets.find("inputmode=\"decimal\" required") !=
-              std::string::npos &&
-          control_assets.find("0 不是禁用驱动，而是直接跟随 PID 输出") !=
-              std::string::npos,
-      "field commissioning control limit dialog is missing");
+  expect(control_assets.find("vcu_handshake_not_ready") != std::string::npos &&
+             control_assets.find("vcuHandshake.parking_ready") != std::string::npos,
+         "driving commands are not gated by explicit N/EPB-ready VCU handshake state");
+  expect(control_assets.find("只有 N 挡允许进入平行驾驶") != std::string::npos &&
+             control_assets.find("电子驻车未全部拉起") != std::string::npos &&
+             control_assets.find("反馈已过期") != std::string::npos &&
+             control_assets.find("握手请求已发送") != std::string::npos &&
+             control_assets.find("启动第 2/5 步未完成") != std::string::npos &&
+             control_assets.find("复用智驾握手，等待 VCU 状态 5") != std::string::npos &&
+             control_assets.find("退出第 4/5 步未完成") != std::string::npos,
+         "the control page does not explain the failed VCU gate or handshake step");
+  expect(control_assets.find("实车调试限幅") != std::string::npos &&
+             control_assets.find("驾驶参数") != std::string::npos &&
+             control_assets.find("速度 PID 与升扭标定") != std::string::npos &&
+             control_assets.find("目标车速上限（km/h）") != std::string::npos &&
+             control_assets.find("max-motor-torque-nm") != std::string::npos &&
+             control_assets.find("max=\"640.0\"") != std::string::npos &&
+             control_assets.find("max-brake-pressure-bar") != std::string::npos &&
+             control_assets.find("service-brake-pressure-bar") != std::string::npos &&
+             control_assets.find("hard-brake-pressure-bar") != std::string::npos &&
+             control_assets.find("max-steering-deg") != std::string::npos &&
+             control_assets.find("speed-pid-kp") != std::string::npos &&
+             control_assets.find("speed-pid-ki") != std::string::npos &&
+             control_assets.find("speed-pid-kd") != std::string::npos &&
+             control_assets.find("speed-pid-derivative-filter-tau-ms") != std::string::npos &&
+             control_assets.find("speed-pid-max-dt-ms") != std::string::npos &&
+             control_assets.find("motor-torque-rise-rate") != std::string::npos &&
+             control_assets.find("inputmode=\"decimal\" required") != std::string::npos &&
+             control_assets.find("0 不是禁用驱动，而是直接跟随 PID 输出") != std::string::npos,
+         "field commissioning control limit dialog is missing");
   expect(
       control_assets.find("effectiveControlLimits") != std::string::npos &&
-          control_assets.find("updateVehicleHardLimits(message.hard_limits)") != std::string::npos &&
-          control_assets.find("controlLogic.normalizeControlProfile(value)") !=
+          control_assets.find("updateVehicleHardLimits(message.hard_limits)") !=
               std::string::npos &&
+          control_assets.find("controlLogic.normalizeControlProfile(value)") != std::string::npos &&
           control_assets.find("controlLogic.mergeControlProfileWithHardLimits") !=
               std::string::npos &&
           control_assets.find("controlLogic.deriveControl") != std::string::npos &&
@@ -1286,120 +1251,103 @@ void test_control_page_contract() {
           control_assets.find("get('/api/control-limits').then") == std::string::npos &&
           control_assets.find("sendPendingControlProfile()") != std::string::npos &&
           control_assets.find("now-lastControlProfileSendAt<200") != std::string::npos &&
-          control_assets.find("每路 EHB 压力请求，单位 bar、分辨率 0.1 bar") !=
-              std::string::npos &&
+          control_assets.find("每路 EHB 压力请求，单位 bar、分辨率 0.1 bar") != std::string::npos &&
           control_assets.find("我已确认车辆处于 N 挡、零速、电子驻车或隔离 mock 台架") !=
               std::string::npos &&
-          control_assets.find("motorTorqueRiseRate.valueAsNumber") !=
-              std::string::npos &&
-          control_assets.find("if(!motorTorqueRiseRate.checkValidity())") !=
-              std::string::npos &&
+          control_assets.find("motorTorqueRiseRate.valueAsNumber") != std::string::npos &&
+          control_assets.find("if(!motorTorqueRiseRate.checkValidity())") != std::string::npos &&
           control_assets.find("硬安全制动与 watchdog 参数不可编辑") != std::string::npos &&
-          control_assets.find("vehicleHardLimits.max_speed_kph.toFixed(1)") !=
-              std::string::npos &&
-          control_assets.find("vehicleHardLimits.max_throttle.toFixed(3)") !=
-              std::string::npos &&
-          control_assets.find("vehicleHardLimits.speed_feedback_timeout_ms") !=
-              std::string::npos &&
-          control_assets.find("vehicleHardLimits.hard_overspeed_margin_kph") !=
-              std::string::npos &&
+          control_assets.find("vehicleHardLimits.max_speed_kph.toFixed(1)") != std::string::npos &&
+          control_assets.find("vehicleHardLimits.max_throttle.toFixed(3)") != std::string::npos &&
+          control_assets.find("vehicleHardLimits.speed_feedback_timeout_ms") != std::string::npos &&
+          control_assets.find("vehicleHardLimits.hard_overspeed_margin_kph") != std::string::npos &&
           control_assets.find("readOnlyControlSafetyText(") != std::string::npos &&
           control_assets.find("safety.control_rate_hz") != std::string::npos &&
           control_assets.find("safety.deceleration_profile.map") != std::string::npos &&
-          control_assets.find(
-              "read_only_control_safety must contain exactly the fixed fields") !=
+          control_assets.find("read_only_control_safety must contain exactly the fixed fields") !=
               std::string::npos &&
           control_assets.find("value.control_rate_hz, 20, 20") != std::string::npos &&
-          control_assets.find(
-              "flat and read_only_control_safety speed values must match") !=
+          control_assets.find("flat and read_only_control_safety speed values must match") !=
               std::string::npos &&
-          control_assets.find("等待车端完整硬上限、PID 默认值与固定安全参数") !=
-              std::string::npos,
+          control_assets.find("等待车端完整硬上限、PID 默认值与固定安全参数") != std::string::npos,
       "controller limits are not combined with vehicle hard limits and operator confirmation");
-  expect(
-      control_assets.find("control_profile_not_acknowledged") != std::string::npos &&
-          control_assets.find("action==='connect'&&!controlProfileState.acknowledged") !=
-              std::string::npos &&
-          control_assets.find("applyControlProfileStatus(message.session_control_profile)") !=
-              std::string::npos &&
-          control_assets.find("applyControlProfileStatus(message);", control_assets.find(
-              "message.event==='session_control_profile_status'")) != std::string::npos &&
-          control_assets.find("resetControlProfileSession()") != std::string::npos &&
-          control_assets.find("effectiveAppliedRevision") != std::string::npos &&
-          control_assets.find("applied_revision:controlProfileState.effectiveAppliedRevision") !=
-              std::string::npos,
-      "ordinary driving is not fail-closed on session control profile acknowledgement");
-  expect(
-      control_assets.find(
-              "controlLogic.controlProfileFromVehicleDefaults(driverActuationDefaults,hard)") !=
-              std::string::npos &&
-          control_assets.find("function controlProfileParkingReady()") !=
-              std::string::npos &&
-          control_assets.find(
-              "parkedStandby=vcuHandshake.parking_ready===true&&"
-              "(vcuHandshake.state==='standby'||vcuHandshake.state==='disarmed')") !=
-              std::string::npos &&
-          control_assets.find("return mockBench||parkedStandby") != std::string::npos &&
-          control_assets.find("需人工打开并发送") != std::string::npos &&
-          control_assets.find("defaultProfileAutoAttempted") == std::string::npos &&
-          control_assets.find(
-              "prepareControlProfile(controlProfileState.requestedProfile,false)") ==
-              std::string::npos,
-      "legacy PID defaults can still auto-submit without explicit operator confirmation");
+  expect(control_assets.find("control_profile_not_acknowledged") != std::string::npos &&
+             control_assets.find("action==='connect'&&!controlProfileState.acknowledged") !=
+                 std::string::npos &&
+             control_assets.find("applyControlProfileStatus(message.session_control_profile)") !=
+                 std::string::npos &&
+             control_assets.find(
+                 "applyControlProfileStatus(message);",
+                 control_assets.find("message.event==='session_control_profile_status'")) !=
+                 std::string::npos &&
+             control_assets.find("resetControlProfileSession()") != std::string::npos &&
+             control_assets.find("effectiveAppliedRevision") != std::string::npos &&
+             control_assets.find("applied_revision:controlProfileState.effectiveAppliedRevision") !=
+                 std::string::npos,
+         "ordinary driving is not fail-closed on session control profile acknowledgement");
+  expect(control_assets.find(
+             "controlLogic.controlProfileFromVehicleDefaults(driverActuationDefaults,hard)") !=
+                 std::string::npos &&
+             control_assets.find("function controlProfileParkingReady()") != std::string::npos &&
+             control_assets.find(
+                 "parkedStandby=vcuHandshake.parking_ready===true&&"
+                 "(vcuHandshake.state==='standby'||vcuHandshake.state==='disarmed')") !=
+                 std::string::npos &&
+             control_assets.find("return mockBench||parkedStandby") != std::string::npos &&
+             control_assets.find("需人工打开并发送") != std::string::npos &&
+             control_assets.find("defaultProfileAutoAttempted") == std::string::npos &&
+             control_assets.find(
+                 "prepareControlProfile(controlProfileState.requestedProfile,false)") ==
+                 std::string::npos,
+         "legacy PID defaults can still auto-submit without explicit operator confirmation");
   expect(
       control_assets.find("pidChanged=!prior||requested.speed_pid_kp!==prior.speed_pid_kp") !=
               std::string::npos &&
-      control_assets.find(
-              "requested.motor_torque_rise_rate_nm_per_s!==prior.motor_torque_rise_rate_nm_per_s") !=
-              std::string::npos &&
-      control_assets.find(
-              "requested.target_speed_kph>prior.target_speed_kph||"
-              "requested.max_motor_torque_nm>prior.max_motor_torque_nm") !=
+          control_assets.find("requested.motor_torque_rise_rate_nm_per_s!==prior.motor_torque_rise_"
+                              "rate_nm_per_s") != std::string::npos &&
+          control_assets.find("requested.target_speed_kph>prior.target_speed_kph||"
+                              "requested.max_motor_torque_nm>prior.max_motor_torque_nm") !=
               std::string::npos &&
           control_assets.find(
               "requested.max_brake_pressure_bar!==prior.max_brake_pressure_bar||"
               "requested.service_brake_pressure_bar!==prior.service_brake_pressure_bar||"
               "requested.hard_brake_pressure_bar!==prior.hard_brake_pressure_bar") !=
               std::string::npos &&
-          control_assets.find(
-              "requested.max_steering_angle_deg!==prior.max_steering_angle_deg") !=
+          control_assets.find("requested.max_steering_angle_deg!==prior.max_steering_angle_deg") !=
               std::string::npos &&
           control_assets.find("if(requiresParking&&!controlProfileParkingReady())") !=
               std::string::npos &&
-          control_assets.find("VCU 为 standby/disarmed") !=
-              std::string::npos,
-      "profile editing does not preflight parking rules for speed, torque, brake, steering, and PID changes");
-  const auto control_intent_post = control_assets.find(
-      "accepted=await post('/api/control-intent',intent,controller.signal)");
+          control_assets.find("VCU 为 standby/disarmed") != std::string::npos,
+      "profile editing does not preflight parking rules for speed, torque, brake, steering, and "
+      "PID changes");
+  const auto control_intent_post =
+      control_assets.find("accepted=await post('/api/control-intent',intent,controller.signal)");
   expect(
       control_intent_post != std::string::npos &&
           control_assets.find("post('/api/control'") == std::string::npos &&
-          control_assets.find("function nativeIntentEnvelope(outgoing)") !=
-              std::string::npos &&
+          control_assets.find("function nativeIntentEnvelope(outgoing)") != std::string::npos &&
+          control_assets.find("return{session_id:nativeControlSessionId,session_generation:"
+                              "nativeControlSessionGeneration,ui_instance_id:uiInstanceId,intent_"
+                              "seq:nativeIntentSeq,...normalized}") != std::string::npos &&
           control_assets.find(
-              "return{session_id:nativeControlSessionId,session_generation:nativeControlSessionGeneration,ui_instance_id:uiInstanceId,intent_seq:nativeIntentSeq,...normalized}") !=
-              std::string::npos &&
-          control_assets.find(
-              "nativeControlSessionId=String(session.session_id||'');nativeControlSessionGeneration=Number(session.control_session_generation)") !=
+              "nativeControlSessionId=String(session.session_id||'');"
+              "nativeControlSessionGeneration=Number(session.control_session_generation)") !=
               std::string::npos &&
           control_assets.find("async function writeControlIntent(extra,announceUnavailable)") !=
               std::string::npos &&
-          control_assets.find("const intent=nativeIntentEnvelope(outgoing)") !=
-              std::string::npos &&
-          control_assets.find(
-              "pendingGearTransition=controlLogic.recordForwardedGearCommand"
-              "(pendingGearTransition,transitionGeneration,accepted.intent_seq,outgoingSnapshot.gear)") !=
-              std::string::npos &&
-          control_assets.find("transport:accepted.transport") !=
-              std::string::npos &&
+          control_assets.find("const intent=nativeIntentEnvelope(outgoing)") != std::string::npos &&
+          control_assets.find("pendingGearTransition=controlLogic.recordForwardedGearCommand"
+                              "(pendingGearTransition,transitionGeneration,accepted.intent_seq,"
+                              "outgoingSnapshot.gear)") != std::string::npos &&
+          control_assets.find("transport:accepted.transport") != std::string::npos &&
           control_assets.find("delivery_state:'browser_data_channel_send_invoked'") ==
               std::string::npos,
       "browser ordinary control is not reduced to a native intent lease update");
   expect(
-      control_assets.find(
-              "const controlWriteQueue=controlLogic.createLatestControlWriteQueue"
-              "(writeControlIntent,reportControlQueueError") != std::string::npos &&
-          control_assets.find("function enqueueIntentRefresh(){return controlWriteQueue.enqueueHeartbeat()}") !=
+      control_assets.find("const controlWriteQueue=controlLogic.createLatestControlWriteQueue"
+                          "(writeControlIntent,reportControlQueueError") != std::string::npos &&
+          control_assets.find(
+              "function enqueueIntentRefresh(){return controlWriteQueue.enqueueHeartbeat()}") !=
               std::string::npos &&
           control_assets.find("controlWriteQueue.enqueueHeartbeat()") != std::string::npos &&
           control_assets.find("const enqueued=enqueueIntentRefresh()") != std::string::npos &&
@@ -1407,58 +1355,49 @@ void test_control_page_contract() {
           control_assets.find("activeControlPrepareAbort=controller") != std::string::npos &&
           control_assets.find("activeControlPrepareAbort&&!activeControlPrepareIsEstop") !=
               std::string::npos &&
-          control_assets.find("reason:'control_intent_preempted_by_estop'") !=
-              std::string::npos &&
+          control_assets.find("reason:'control_intent_preempted_by_estop'") != std::string::npos &&
           control_assets.find("latchEstop('Gamepad'))send({estop:true},false)") !=
               std::string::npos &&
-          control_assets.find("reason:'control_intent_update_timeout'") !=
-              std::string::npos &&
+          control_assets.find("reason:'control_intent_update_timeout'") != std::string::npos &&
           control_assets.find("heartbeatInFlight") == std::string::npos,
       "intent lease refreshes are not coalesced or ESTOP-preemptible");
+  expect(control_assets.find("async function heartbeat()") == std::string::npos &&
+             control_assets.find("controlHeartbeatIntervalMs") == std::string::npos &&
+             control_assets.find("setInterval(()=>heartbeat") == std::string::npos &&
+             control_assets.find("activeChannel.send(JSON.stringify(prepared.command))") ==
+                 std::string::npos &&
+             control_assets.find("retiredBrowserPacketPath") == std::string::npos,
+         "a retired 50ms browser packet heartbeat or ordinary DataChannel send remains active");
   expect(
-      control_assets.find("async function heartbeat()") == std::string::npos &&
-          control_assets.find("controlHeartbeatIntervalMs") == std::string::npos &&
-          control_assets.find("setInterval(()=>heartbeat") == std::string::npos &&
-          control_assets.find("activeChannel.send(JSON.stringify(prepared.command))") ==
-              std::string::npos &&
-          control_assets.find("retiredBrowserPacketPath") == std::string::npos,
-      "a retired 50ms browser packet heartbeat or ordinary DataChannel send remains active");
-  expect(
-      control_assets.find("function applyVehicleSafetyState(value)") !=
-              std::string::npos &&
-          control_assets.find("next==='DEGRADED'){clearControlInput(false)") !=
-              std::string::npos &&
-          control_assets.find("next==='DEGRADED'&&lastVehicleSafetyState") ==
-              std::string::npos &&
+      control_assets.find("function applyVehicleSafetyState(value)") != std::string::npos &&
+          control_assets.find("next==='DEGRADED'){clearControlInput(false)") != std::string::npos &&
+          control_assets.find("next==='DEGRADED'&&lastVehicleSafetyState") == std::string::npos &&
           control_assets.find("clearControlInput(false)") != std::string::npos &&
-          control_assets.find("driver_input_cleared_on_degraded") !=
-              std::string::npos &&
-          control_assets.find("applyVehicleSafetyState(message.safety_state)") !=
-              std::string::npos,
+          control_assets.find("driver_input_cleared_on_degraded") != std::string::npos &&
+          control_assets.find("applyVehicleSafetyState(message.safety_state)") != std::string::npos,
       "recoverable vehicle degradation can replay held driver input");
-  expect(
-      control_assets.find("function vcuStateRequiresFreshInput") != std::string::npos &&
-          control_assets.find("controlLogic.requiresFreshInput(value)") != std::string::npos &&
-          control_assets.find("controlLogic.transitionVcuState(vcuEverReady,value)") !=
-              std::string::npos &&
-          control_assets.find("function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}") !=
-              std::string::npos &&
-          control_assets.find("if(!vcuEverReady&&!vcuMockUnsupported())") != std::string::npos &&
-          control_assets.find("首次握手完成后请重新按下") != std::string::npos,
-      "initial authority, fault, or disarm does not require fresh control input");
-  expect(
-      control_assets.find("lastControlStatusSeq=0") != std::string::npos &&
-          control_assets.find("function acceptControlStatusMessage(message)") !=
-              std::string::npos &&
-          control_assets.find("controlLogic.reduceStatusSequence(lastControlStatusSeq") !=
-              std::string::npos &&
-          control_assets.find("if(!acceptControlStatusMessage(message))return") !=
-              std::string::npos &&
-          control_assets.find("control_status_message_dropped") != std::string::npos &&
-          control_assets.find("if(!acceptControlStatusMessage(message))return;") <
-              control_assets.find("const gearRejectionMatched=") &&
-          control_assets.find("control_status_sequence_gap") != std::string::npos,
-      "unordered vehicle status messages can replay stale VCU authority");
+  expect(control_assets.find("function vcuStateRequiresFreshInput") != std::string::npos &&
+             control_assets.find("controlLogic.requiresFreshInput(value)") != std::string::npos &&
+             control_assets.find("controlLogic.transitionVcuState(vcuEverReady,value)") !=
+                 std::string::npos &&
+             control_assets.find(
+                 "function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}") !=
+                 std::string::npos &&
+             control_assets.find("if(!vcuEverReady&&!vcuMockUnsupported())") != std::string::npos &&
+             control_assets.find("首次握手完成后请重新按下") != std::string::npos,
+         "initial authority, fault, or disarm does not require fresh control input");
+  expect(control_assets.find("lastControlStatusSeq=0") != std::string::npos &&
+             control_assets.find("function acceptControlStatusMessage(message)") !=
+                 std::string::npos &&
+             control_assets.find("controlLogic.reduceStatusSequence(lastControlStatusSeq") !=
+                 std::string::npos &&
+             control_assets.find("if(!acceptControlStatusMessage(message))return") !=
+                 std::string::npos &&
+             control_assets.find("control_status_message_dropped") != std::string::npos &&
+             control_assets.find("if(!acceptControlStatusMessage(message))return;") <
+                 control_assets.find("const gearRejectionMatched=") &&
+             control_assets.find("control_status_sequence_gap") != std::string::npos,
+         "unordered vehicle status messages can replay stale VCU authority");
   expect(
       control_assets.find("function vcuStateKeepsHeldInput") != std::string::npos &&
           control_assets.find("controlLogic.keepsHeldInput(vcuEverReady,value)") !=
@@ -1468,36 +1407,34 @@ void test_control_page_contract() {
           control_assets.find(
               "if((retainedWait||gearTransitionPending)&&!estopRequested)outgoing.throttle=0") !=
               std::string::npos &&
-          control_assets.find(
-              "if(pendingGearTransition&&!control.estop)control.throttle=0") !=
+          control_assets.find("if(pendingGearTransition&&!control.estop)control.throttle=0") !=
               std::string::npos &&
-          control_assets.find(
-              "!blockReason&&!vcuDrivingReady()&&!estopRequested&&!retainedWait") !=
+          control_assets.find("!blockReason&&!vcuDrivingReady()&&!estopRequested&&!retainedWait") !=
               std::string::npos &&
           control_assets.find("换挡闭环中（输入保持）") != std::string::npos &&
           control_assets.find("执行器闭环中（输入保持）") != std::string::npos &&
           control_assets.find("输入已清除，等待新鲜 VCU Ready") != std::string::npos,
       "authorized VCU convergence waits do not retain inputs with zero-throttle heartbeats");
-  expect(
-      control_assets.find(
-          "controlLogic.updateGearChangeStationaryEvidence(gearChangeStationaryEvidence,value,lastControlStatusSeq,performance.now())") !=
-              std::string::npos &&
-          control_assets.find(
-              "gear_change_stationary_confirmed:gearChangeStationaryEvidence.confirmed") !=
-              std::string::npos &&
-          control_assets.find("至少 3 帧且持续 200 ms 的新鲜零速反馈") !=
-              std::string::npos,
-      "browser gear changes are not gated on stable fresh zero-speed evidence");
+  expect(control_assets.find(
+             "controlLogic.updateGearChangeStationaryEvidence(gearChangeStationaryEvidence,value,"
+             "lastControlStatusSeq,performance.now())") != std::string::npos &&
+             control_assets.find(
+                 "gear_change_stationary_confirmed:gearChangeStationaryEvidence.confirmed") !=
+                 std::string::npos &&
+             control_assets.find("至少 3 帧且持续 200 ms 的新鲜零速反馈") != std::string::npos,
+         "browser gear changes are not gated on stable fresh zero-speed evidence");
   const auto telemetry_vcu_update = control_assets.find(
-      "adapter_ready:vcuAdapterReady(message.vcu_handshake,message.vehicle_adapter?.opened)};updateVcuHandshakeState(nextVcuStatus)");
+      "adapter_ready:vcuAdapterReady(message.vcu_handshake,message.vehicle_adapter?.opened)};"
+      "updateVcuHandshakeState(nextVcuStatus)");
   const auto telemetry_profile_update = control_assets.find(
       "applyControlProfileStatus(message.session_control_profile)", telemetry_vcu_update);
   const auto telemetry_limits_update = control_assets.find(
       "updateVehicleHardLimits(message.control_limits)", telemetry_profile_update);
   const auto handshake_vcu_update = control_assets.find(
-      "updateVcuHandshakeState({...nextVcuStatus,driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)})");
-  const auto handshake_limits_update = control_assets.find(
-      "updateVehicleHardLimits(message.hard_limits)", handshake_vcu_update);
+      "updateVcuHandshakeState({...nextVcuStatus,driver_connected:Boolean(message.driver_connected)"
+      ",adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)})");
+  const auto handshake_limits_update =
+      control_assets.find("updateVehicleHardLimits(message.hard_limits)", handshake_vcu_update);
   expect(
       telemetry_vcu_update != std::string::npos &&
           telemetry_profile_update != std::string::npos &&
@@ -1512,116 +1449,120 @@ void test_control_page_contract() {
       control_assets.find("gamepadRequiresNeutral=true") != std::string::npos &&
           control_assets.find("const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported()") !=
               std::string::npos &&
-          control_assets.find("controlLogic.reduceGamepadNeutralInterlock") !=
-              std::string::npos &&
+          control_assets.find("controlLogic.reduceGamepadNeutralInterlock") != std::string::npos &&
           control_assets.find("applyGamepadNeutralInterlock(gamepadAuthorityReady,true)") !=
               std::string::npos,
       "Gamepad pedals can resume without a physical neutral after an authority or gear-gate reset");
-  expect(control_assets.find("driver_vehicle_switch_started") != std::string::npos, "safe vehicle switching UI is missing");
+  expect(control_assets.find("driver_vehicle_switch_started") != std::string::npos,
+         "safe vehicle switching UI is missing");
   const auto switch_request = control_assets.find("session=await post('/api/connect'");
-  const auto realtime_close = control_assets.find("generation=closeRealtimeSession()", switch_request);
+  const auto realtime_close =
+      control_assets.find("generation=closeRealtimeSession()", switch_request);
   expect(
       switch_request != std::string::npos && realtime_close != std::string::npos && switch_request < realtime_close,
       "vehicle switch closes the current realtime path before the target is accepted");
+  expect(control_assets.find("driver_vehicle_switch_rejected") != std::string::npos &&
+             control_assets.find("pollSignaling(suspendedGeneration)") != std::string::npos,
+         "rejected vehicle switch cannot resume the retained realtime session");
+  expect(control_assets.find("suspendSignalingPoll()") != std::string::npos &&
+             control_assets.find("post('/api/poll-signaling',{},controller.signal)") !=
+                 std::string::npos,
+         "vehicle switching cannot cancel a stale browser signaling request without closing "
+         "realtime media");
   expect(
-      control_assets.find("driver_vehicle_switch_rejected") != std::string::npos &&
-          control_assets.find("pollSignaling(suspendedGeneration)") != std::string::npos,
-      "rejected vehicle switch cannot resume the retained realtime session");
-  expect(
-      control_assets.find("suspendSignalingPoll()") != std::string::npos &&
-          control_assets.find("post('/api/poll-signaling',{},controller.signal)") != std::string::npos,
-      "vehicle switching cannot cancel a stale browser signaling request without closing realtime media");
-  expect(
-      control_assets.find("current=vehicle.vehicle_id===currentVehicle,selectable=vehicle.controllable||current") !=
+      control_assets.find(
+          "current=vehicle.vehicle_id===currentVehicle,selectable=vehicle.controllable||current") !=
           std::string::npos,
       "the active vehicle cannot remain selected while other switch targets refresh");
   expect(
       control_assets.find("if(authenticated&&!connecting)refreshVehicles()") != std::string::npos,
       "vehicle availability does not refresh during an active session");
-  expect(
-      control_assets.find("if(result.signaling_restart_recovered)") != std::string::npos &&
-          control_assets.find("旧控制权未恢复，请重新选择车辆") != std::string::npos &&
-          control_assets.find("control_authority_recovered:false") != std::string::npos,
-      "signaling restart recovery does not preserve the no-authority operator state");
-  expect(
-      control_assets.find("if(result.signaling_available===false)") != std::string::npos &&
-          control_assets.find("车辆列表为安全快照，禁止建立控制会话") != std::string::npos &&
-          control_assets.find("connectButton.disabled=true") != std::string::npos,
-      "signaling outage vehicle refresh is not fail-safe and locally readable");
-  expect(
-      control_assets.find("if(error.status===401){requireLogin") != std::string::npos &&
-          control_assets.find("车辆状态刷新失败，当前会话已保留") != std::string::npos,
-      "a transient vehicle-list refresh failure can discard current authority");
-  expect(control_assets.find("post('/api/end-session'") != std::string::npos, "failed connection setup cannot release only its session");
-  expect(control_assets.find("pollSignaling(generation)") != std::string::npos, "stale signaling pollers are not isolated across vehicle switches");
-  expect(
-      control_assets.find("gamepaddisconnected") != std::string::npos &&
-          control_assets.find("gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;renderControlState();clientLog('gamepad_disconnected'") !=
-              std::string::npos,
-      "Gamepad disconnect does not zero its own axes without clearing keyboard input");
-  expect(control_assets.find("车辆必须本地确认后才能复位") != std::string::npos, "ESTOP latch feedback is missing");
-  expect(control_assets.find("运行监控") != std::string::npos, "operator monitoring panel is missing");
+  expect(control_assets.find("if(result.signaling_restart_recovered)") != std::string::npos &&
+             control_assets.find("旧控制权未恢复，请重新选择车辆") != std::string::npos &&
+             control_assets.find("control_authority_recovered:false") != std::string::npos,
+         "signaling restart recovery does not preserve the no-authority operator state");
+  expect(control_assets.find("if(result.signaling_available===false)") != std::string::npos &&
+             control_assets.find("车辆列表为安全快照，禁止建立控制会话") != std::string::npos &&
+             control_assets.find("connectButton.disabled=true") != std::string::npos,
+         "signaling outage vehicle refresh is not fail-safe and locally readable");
+  expect(control_assets.find("if(error.status===401){requireLogin") != std::string::npos &&
+             control_assets.find("车辆状态刷新失败，当前会话已保留") != std::string::npos,
+         "a transient vehicle-list refresh failure can discard current authority");
+  expect(control_assets.find("post('/api/end-session'") != std::string::npos,
+         "failed connection setup cannot release only its session");
+  expect(control_assets.find("pollSignaling(generation)") != std::string::npos,
+         "stale signaling pollers are not isolated across vehicle switches");
+  expect(control_assets.find("gamepaddisconnected") != std::string::npos &&
+             control_assets.find(
+                 "gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;"
+                 "renderControlState();clientLog('gamepad_disconnected'") != std::string::npos,
+         "Gamepad disconnect does not zero its own axes without clearing keyboard input");
+  expect(control_assets.find("车辆必须本地确认后才能复位") != std::string::npos,
+         "ESTOP latch feedback is missing");
+  expect(control_assets.find("运行监控") != std::string::npos,
+         "operator monitoring panel is missing");
   expect(control_assets.find("控制 RTT") != std::string::npos, "control RTT display is missing");
-  expect(control_assets.find("packet_loss_percent") != std::string::npos, "per-stream packet-loss metric is missing");
-  expect(control_assets.find("connection_method") != std::string::npos, "ICE path classification is missing");
-  expect(
-      control_assets.find("iceTransportPolicy:consoleConfig.ice_transport_policy") != std::string::npos,
-      "browser RTCPeerConnection does not apply the configured ICE transport policy");
-  expect(
-      control_assets.find("webrtc_ice_candidate_error") != std::string::npos,
-      "browser does not record credential-free ICE candidate errors");
-  expect(
-      control_assets.find("offeredVideoCameraIds(offer.sdp,offer.media_tracks||[])") != std::string::npos &&
-          control_assets.find("offeredCameraByMid.get(mid)") != std::string::npos,
-      "browser camera IDs are not mapped from the SDP video mids");
-  expect(
-      control_assets.find("srcObject=new MediaStream([track])") != std::string::npos &&
-          control_assets.find("attach(id,e.track)") != std::string::npos,
-      "browser video elements are not isolated to their individual WebRTC tracks");
+  expect(control_assets.find("packet_loss_percent") != std::string::npos,
+         "per-stream packet-loss metric is missing");
+  expect(control_assets.find("connection_method") != std::string::npos,
+         "ICE path classification is missing");
+  expect(control_assets.find("iceTransportPolicy:consoleConfig.ice_transport_policy") !=
+             std::string::npos,
+         "browser RTCPeerConnection does not apply the configured ICE transport policy");
+  expect(control_assets.find("webrtc_ice_candidate_error") != std::string::npos,
+         "browser does not record credential-free ICE candidate errors");
+  expect(control_assets.find("offeredVideoCameraIds(offer.sdp,offer.media_tracks||[])") !=
+                 std::string::npos &&
+             control_assets.find("offeredCameraByMid.get(mid)") != std::string::npos,
+         "browser camera IDs are not mapped from the SDP video mids");
+  expect(control_assets.find("srcObject=new MediaStream([track])") != std::string::npos &&
+             control_assets.find("attach(id,e.track)") != std::string::npos,
+         "browser video elements are not isolated to their individual WebRTC tracks");
   const auto ontrack_handler = control_assets.find("nextPeer.ontrack=e=>");
-  const auto remote_description = control_assets.find("await nextPeer.setRemoteDescription", ontrack_handler);
-  expect(
-      ontrack_handler != std::string::npos &&
-          remote_description != std::string::npos &&
-          control_assets.substr(ontrack_handler, remote_description - ontrack_handler).find("vcuHandshake") ==
-              std::string::npos &&
-          control_assets.substr(ontrack_handler, remote_description - ontrack_handler).find("controlChannel") ==
-              std::string::npos,
-      "browser camera attachment is gated on the VCU handshake or control DataChannel");
-  expect(
-      control_assets.find("e.streams[0]") == std::string::npos,
-      "browser can bind the same multi-track MediaStream to multiple camera elements");
-  expect(
-      control_assets.find("if(connectionState==='disconnected')") != std::string::npos &&
-          control_assets.find("if(['failed','closed'].includes(connectionState))") != std::string::npos &&
-          control_assets.find("peer!==nextPeer") != std::string::npos,
-      "a transient or stale peer state change can discard a recoverable control DataChannel");
+  const auto remote_description =
+      control_assets.find("await nextPeer.setRemoteDescription", ontrack_handler);
+  expect(ontrack_handler != std::string::npos && remote_description != std::string::npos &&
+             control_assets.substr(ontrack_handler, remote_description - ontrack_handler)
+                     .find("vcuHandshake") == std::string::npos &&
+             control_assets.substr(ontrack_handler, remote_description - ontrack_handler)
+                     .find("controlChannel") == std::string::npos,
+         "browser camera attachment is gated on the VCU handshake or control DataChannel");
+  expect(control_assets.find("e.streams[0]") == std::string::npos,
+         "browser can bind the same multi-track MediaStream to multiple camera elements");
+  expect(control_assets.find("if(connectionState==='disconnected')") != std::string::npos &&
+             control_assets.find("if(['failed','closed'].includes(connectionState))") !=
+                 std::string::npos &&
+             control_assets.find("peer!==nextPeer") != std::string::npos,
+         "a transient or stale peer state change can discard a recoverable control DataChannel");
   const auto offer_start = control_assets.find("async function startFromOffer");
-  const auto offer_authority_reset = control_assets.find("resetControlAuthorityInput()", offer_start);
+  const auto offer_authority_reset =
+      control_assets.find("resetControlAuthorityInput()", offer_start);
   const auto offer_peer_create = control_assets.find("new RTCPeerConnection", offer_start);
-  expect(
-      offer_start != std::string::npos && offer_authority_reset != std::string::npos &&
-          offer_peer_create != std::string::npos && offer_authority_reset < offer_peer_create &&
-          control_assets.find("channel.onclose=()=>{") != std::string::npos,
-      "a new peer or closed DataChannel can inherit stale VCU authority/input state");
+  expect(offer_start != std::string::npos && offer_authority_reset != std::string::npos &&
+             offer_peer_create != std::string::npos && offer_authority_reset < offer_peer_create &&
+             control_assets.find("channel.onclose=()=>{") != std::string::npos,
+         "a new peer or closed DataChannel can inherit stale VCU authority/input state");
   const auto data_channel_handler = control_assets.find("nextPeer.ondatachannel=e=>{");
-  const auto data_channel_peer_gate = control_assets.find(
-      "if(!controlLogic.isCurrentPeer(peer,nextPeer)){channel.close();return}",
-      data_channel_handler);
-  const auto data_channel_status_reset = control_assets.find(
-      "lastControlStatusSeq=0;",
-      data_channel_peer_gate);
-  const auto data_channel_publish = control_assets.find(
-      "controlChannel=channel;",
-      data_channel_status_reset);
-  const auto channel_open_handler = control_assets.find("channel.onopen=()=>{", data_channel_publish);
-  const auto channel_message_handler = control_assets.find("channel.onmessage=async event=>{", channel_open_handler);
-  const auto channel_close_handler = control_assets.find("channel.onclose=()=>{", channel_message_handler);
-  const auto channel_error_handler = control_assets.find("channel.onerror=()=>{", channel_close_handler);
+  const auto data_channel_peer_gate =
+      control_assets.find("if(!controlLogic.isCurrentPeer(peer,nextPeer)){channel.close();return}",
+                          data_channel_handler);
+  const auto data_channel_status_reset =
+      control_assets.find("lastControlStatusSeq=0;", data_channel_peer_gate);
+  const auto data_channel_publish =
+      control_assets.find("controlChannel=channel;", data_channel_status_reset);
+  const auto channel_open_handler =
+      control_assets.find("channel.onopen=()=>{", data_channel_publish);
+  const auto channel_message_handler =
+      control_assets.find("channel.onmessage=async event=>{", channel_open_handler);
+  const auto channel_close_handler =
+      control_assets.find("channel.onclose=()=>{", channel_message_handler);
+  const auto channel_error_handler =
+      control_assets.find("channel.onerror=()=>{", channel_close_handler);
   const std::string channel_identity_gate =
       "if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;";
   const auto channel_open_gate = control_assets.find(channel_identity_gate, channel_open_handler);
-  const auto channel_message_gate = control_assets.find(channel_identity_gate, channel_message_handler);
+  const auto channel_message_gate =
+      control_assets.find(channel_identity_gate, channel_message_handler);
   const auto channel_close_gate = control_assets.find(channel_identity_gate, channel_close_handler);
   const auto channel_error_gate = control_assets.find(channel_identity_gate, channel_error_handler);
   const auto channel_error_end = control_assets.find("};", channel_error_gate);
@@ -1637,19 +1578,19 @@ void test_control_page_contract() {
           channel_close_gate != std::string::npos && channel_close_gate < channel_error_handler &&
           channel_error_gate != std::string::npos,
       "control DataChannel lifecycle callbacks do not reject stale peer or channel identities");
-  expect(
-      control_assets.find("controlChannel=null;", channel_close_gate) < channel_error_handler &&
-          control_assets.find("resetControlAuthorityInput()", channel_close_gate) < channel_error_handler &&
-          channel_error_end != std::string::npos &&
-          control_assets.find("resetControlAuthorityInput()", channel_error_gate) < channel_error_end,
-      "current control DataChannel close or error is not fail-closed");
-  expect(
-      control_assets.find("activePeer.connectionState!=='connected'") != std::string::npos,
-      "control commands can be sent while the current WebRTC peer is disconnected");
-  expect(
-      control_assets.find("if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}") !=
-          std::string::npos,
-      "the controller can silently recreate a control DataChannel inside an inhibited media session");
+  expect(control_assets.find("controlChannel=null;", channel_close_gate) < channel_error_handler &&
+             control_assets.find("resetControlAuthorityInput()", channel_close_gate) <
+                 channel_error_handler &&
+             channel_error_end != std::string::npos &&
+             control_assets.find("resetControlAuthorityInput()", channel_error_gate) <
+                 channel_error_end,
+         "current control DataChannel close or error is not fail-closed");
+  expect(control_assets.find("activePeer.connectionState!=='connected'") != std::string::npos,
+         "control commands can be sent while the current WebRTC peer is disconnected");
+  expect(control_assets.find("if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 "
+                             "${target} 已处于当前会话`;return}") != std::string::npos,
+         "the controller can silently recreate a control DataChannel inside an inhibited media "
+         "session");
   expect(
       control_assets.find("estopRequested=estopLatched||Boolean(extra.estop)") !=
               std::string::npos &&
@@ -1657,67 +1598,76 @@ void test_control_page_contract() {
               std::string::npos &&
           control_assets.find("vcu_adapter_unavailable") != std::string::npos &&
           control_assets.find("请使用车辆物理急停") != std::string::npos &&
-          control_assets.find("function vcuDrivingReady(){return controlProfileState.acknowledged&&controlLogic.drivingReady(vcuHandshake)}") !=
+          control_assets.find(
+              "function vcuDrivingReady(){return "
+              "controlProfileState.acknowledged&&controlLogic.drivingReady(vcuHandshake)}") !=
               std::string::npos,
       "the controller can claim that remote ESTOP was sent while the VCU adapter is unavailable");
-  expect(
-      control_assets.find("!vcuDrivingReady()&&!estopRequested") != std::string::npos &&
-          control_assets.find("async function refreshControlIntent()") != std::string::npos &&
-          control_assets.find("sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
-              std::string::npos &&
-          control_assets.find("estopRequested=estopLatched||Boolean(extra.estop)") !=
-              std::string::npos,
-      "a latched ESTOP is not retained by periodic native intent refresh while the VCU handshake is incomplete");
-  expect(
-      control_assets.find("function vcuAdapterReady(status,explicit){return controlLogic.adapterReady(status,explicit)}") !=
-              std::string::npos,
-      "an older vehicle without adapter_ready cannot use the compatibility-safe unknown state");
+  expect(control_assets.find("!vcuDrivingReady()&&!estopRequested") != std::string::npos &&
+             control_assets.find("async function refreshControlIntent()") != std::string::npos &&
+             control_assets.find(
+                 "sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
+                 std::string::npos &&
+             control_assets.find("estopRequested=estopLatched||Boolean(extra.estop)") !=
+                 std::string::npos,
+         "a latched ESTOP is not retained by periodic native intent refresh while the VCU "
+         "handshake is incomplete");
+  expect(control_assets.find("function vcuAdapterReady(status,explicit){return "
+                             "controlLogic.adapterReady(status,explicit)}") != std::string::npos,
+         "an older vehicle without adapter_ready cannot use the compatibility-safe unknown state");
   const auto estop_monitor = control_assets.find(
-      "const estopPresentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason)");
+      "const "
+      "estopPresentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop="
+      "==true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason)");
   const auto estop_banner = control_assets.find(
-      "function renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason))");
-  expect(
-      estop_monitor != std::string::npos && estop_banner != std::string::npos &&
-          control_assets.find("renderEstopRequest(estopPresentation)", estop_monitor) !=
-              std::string::npos &&
-          control_assets.find(
-              "if(estopPresentation.visible){alerts.push(estopPresentation.alert);severity=estopPresentation.severity}",
-              estop_monitor) != std::string::npos &&
-          control_assets.find(
-              "estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner",
-              estop_banner) != std::string::npos,
-      "vehicle-only ESTOP telemetry does not drive the critical banner and alert presentation");
-  expect(
-      control_assets.find("function controlProfileParkingReady()") !=
-              std::string::npos &&
-          control_assets.find("defaultProfileAutoAttempted") == std::string::npos &&
-          control_assets.find(
-              "prepareControlProfile(controlProfileState.requestedProfile,false)") ==
-              std::string::npos,
-      "a completed VCU disconnect can silently reapply a legacy session profile");
+      "function "
+      "renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,"
+      "vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason)"
+      ")");
+  expect(estop_monitor != std::string::npos && estop_banner != std::string::npos &&
+             control_assets.find("renderEstopRequest(estopPresentation)", estop_monitor) !=
+                 std::string::npos &&
+             control_assets.find("if(estopPresentation.visible){alerts.push(estopPresentation."
+                                 "alert);severity=estopPresentation.severity}",
+                                 estop_monitor) != std::string::npos &&
+             control_assets.find("estopStatus.hidden=!presentation.visible;estopStatus.textContent="
+                                 "presentation.banner",
+                                 estop_banner) != std::string::npos,
+         "vehicle-only ESTOP telemetry does not drive the critical banner and alert presentation");
+  expect(control_assets.find("function controlProfileParkingReady()") != std::string::npos &&
+             control_assets.find("defaultProfileAutoAttempted") == std::string::npos &&
+             control_assets.find(
+                 "prepareControlProfile(controlProfileState.requestedProfile,false)") ==
+                 std::string::npos,
+         "a completed VCU disconnect can silently reapply a legacy session profile");
   const auto neutralize_input = control_assets.find(
       "function neutralizeInput(){clearControlInput(false);send({},false).catch(console.error)}");
-  const auto blur_neutralize = control_assets.find(
-      "addEventListener('blur',neutralizeInput)", neutralize_input);
+  const auto blur_neutralize =
+      control_assets.find("addEventListener('blur',neutralizeInput)", neutralize_input);
   const auto hidden_neutralize = control_assets.find(
       "document.addEventListener('visibilitychange',()=>{if(document.hidden)neutralizeInput()})",
       blur_neutralize);
-  expect(
-      neutralize_input != std::string::npos && blur_neutralize != std::string::npos &&
-          hidden_neutralize != std::string::npos &&
-          control_assets.find("activeChannel.bufferedAmount>4096") == std::string::npos,
-      "blur or page hiding does not publish a neutral native intent independent of DataChannel backpressure");
-  expect(control_assets.find("时延超过 200 ms") != std::string::npos, "latency threshold alarm is missing");
+  expect(neutralize_input != std::string::npos && blur_neutralize != std::string::npos &&
+             hidden_neutralize != std::string::npos &&
+             control_assets.find("activeChannel.bufferedAmount>4096") == std::string::npos,
+         "blur or page hiding does not publish a neutral native intent independent of DataChannel "
+         "backpressure");
+  expect(control_assets.find("时延超过 200 ms") != std::string::npos,
+         "latency threshold alarm is missing");
   expect(control_assets.find("低于 20 FPS") != std::string::npos, "FPS threshold alarm is missing");
-  expect(control_assets.find("sent_at_utc_ms:Date.now()") != std::string::npos, "browser-local logs do not use UTC milliseconds");
-  expect(control_assets.find("fetch('/api/browser-event'") != std::string::npos, "browser events are not persisted by the local runtime");
+  expect(control_assets.find("sent_at_utc_ms:Date.now()") != std::string::npos,
+         "browser-local logs do not use UTC milliseconds");
+  expect(control_assets.find("fetch('/api/browser-event'") != std::string::npos,
+         "browser events are not persisted by the local runtime");
   expect(
       console_config_response.body.find("\"control_trace_commands\":true") != std::string::npos &&
           control_assets.find("\"control_trace_commands\":true") == std::string::npos &&
-          control_assets.find("const controlTraceEnabled=Boolean(consoleConfig.control_trace_commands)") !=
+          control_assets.find(
+              "const controlTraceEnabled=Boolean(consoleConfig.control_trace_commands)") !=
               std::string::npos &&
           control_assets.find(
-              "clientLog('control_trace_batch',{reason,trace_session_id:String(scope&&scope.session_id||''),"
+              "clientLog('control_trace_batch',{reason,trace_session_id:String(scope&&scope."
+              "session_id||''),"
               "trace_vehicle_id:String(scope&&scope.vehicle_id||''),commands,summary})") !=
               std::string::npos &&
           control_assets.find("setInterval(()=>flushControlTrace('interval'),1000)") !=
@@ -1729,9 +1679,8 @@ void test_control_page_contract() {
            "heartbeat_tick_count", "heartbeat_enqueued_count", "heartbeat_coalesced_count",
            "timer_lag_max_ms", "explicit_send_count", "prepare_preempted_by_estop_count",
            "queue_unhandled_error_count"}) {
-    expect(
-        control_assets.find(field) != std::string::npos,
-        "control trace field is missing from the page: " + std::string(field));
+    expect(control_assets.find(field) != std::string::npos,
+           "control trace field is missing from the page: " + std::string(field));
   }
   const auto trace_flush = control_assets.find("function flushControlTrace(");
   expect(
@@ -1745,17 +1694,17 @@ void test_control_page_contract() {
   const auto intent_refresh_timer = control_assets.find(
       "setInterval(()=>refreshControlIntent().catch(console.error),intentRefreshIntervalMs)",
       intent_refresh);
-  expect(
-      intent_refresh != std::string::npos && intent_refresh_timer != std::string::npos &&
-          control_assets.find(
-              "intentRefreshIntervalMs=Math.max(50,Math.floor(Number(consoleConfig.intent_lease_ms||200)/3))") !=
-              std::string::npos &&
-          control_assets.find("async function heartbeat()") == std::string::npos,
-      "browser intent renewal is not derived from the lease or still owns the retired packet heartbeat");
+  expect(intent_refresh != std::string::npos && intent_refresh_timer != std::string::npos &&
+             control_assets.find("intentRefreshIntervalMs=Math.max(50,Math.floor(Number("
+                                 "consoleConfig.intent_lease_ms||200)/3))") != std::string::npos &&
+             control_assets.find("async function heartbeat()") == std::string::npos,
+         "browser intent renewal is not derived from the lease or still owns the retired packet "
+         "heartbeat");
   const auto connect_handler = control_assets.find("async function connect()");
-  const auto connect_close = control_assets.find("generation=closeRealtimeSession()", connect_handler);
-  const auto connect_trace_scope =
-      control_assets.find("setControlTraceScope(session.session_id,session.vehicle_id)", connect_close);
+  const auto connect_close =
+      control_assets.find("generation=closeRealtimeSession()", connect_handler);
+  const auto connect_trace_scope = control_assets.find(
+      "setControlTraceScope(session.session_id,session.vehicle_id)", connect_close);
   expect(
       connect_handler != std::string::npos && connect_close != std::string::npos &&
           connect_trace_scope != std::string::npos && connect_close < connect_trace_scope,
@@ -1798,13 +1747,16 @@ void test_control_page_contract() {
           data_channel_close_clear != std::string::npos &&
           data_channel_close_flush < data_channel_close_clear,
       "DataChannel close does not flush the pending control trace");
-  expect(control_assets.find("dev-password") == std::string::npos, "driver credential leaked into the control page");
-  expect(
-      control_assets.find("async function refreshControlIntent(){const now=performance.now();if(!polling)") !=
-              std::string::npos &&
-          control_assets.find("sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
-              std::string::npos,
-      "background intent renewal can run without an active session or bypass latest-write coalescing");
+  expect(control_assets.find("dev-password") == std::string::npos,
+         "driver credential leaked into the control page");
+  expect(control_assets.find(
+             "async function refreshControlIntent(){const now=performance.now();if(!polling)") !=
+                 std::string::npos &&
+             control_assets.find(
+                 "sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
+                 std::string::npos,
+         "background intent renewal can run without an active session or bypass latest-write "
+         "coalescing");
   const auto pagehide = control_assets.find("addEventListener('pagehide'");
   const auto pagehide_flush = control_assets.find("flushControlTrace('pagehide')", pagehide);
   const auto pagehide_close = control_assets.find("closeRealtimeSession()", pagehide);
@@ -1837,7 +1789,8 @@ void test_console_assets_routes_config_and_security_headers() {
   config.driver_id = "driver-console-assets-r06";
   config.signaling_url = "https://signal.example.test";
   config.control_trace_commands = true;
-  auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(config, "vehicle-001", "dev-password");
+  auto runtime =
+      std::make_shared<mine_teleop::DriverConsoleRuntime>(config, "vehicle-001", "dev-password");
   mine_teleop::DriverConsoleHttpApp app(runtime);
   const auto get_console_response = [&app](std::string path) {
     mine_teleop::HttpRequest request;
@@ -1853,7 +1806,8 @@ void test_console_assets_routes_config_and_security_headers() {
     return app.handle(request);
   }();
   expect(page.status == 200, "console page did not load");
-  expect(page.content_type == "text/html; charset=utf-8", "console page has the wrong content type");
+  expect(page.content_type == "text/html; charset=utf-8",
+         "console page has the wrong content type");
 
   const auto page_html = [&] {
     mine_teleop::HttpRequest request;
@@ -1862,8 +1816,10 @@ void test_console_assets_routes_config_and_security_headers() {
     return app.handle(request);
   }();
   expect(page_html.status == 200, "embedded console HTML asset did not load");
-  expect(page_html.content_type == "text/html; charset=utf-8", "embedded console HTML asset has the wrong content type");
-  expect(page_html.body == page.body, "console HTML asset bytes differ from the root console route");
+  expect(page_html.content_type == "text/html; charset=utf-8",
+         "embedded console HTML asset has the wrong content type");
+  expect(page_html.body == page.body,
+         "console HTML asset bytes differ from the root console route");
 
   const auto page_css = [&] {
     mine_teleop::HttpRequest request;
@@ -1872,8 +1828,10 @@ void test_console_assets_routes_config_and_security_headers() {
     return app.handle(request);
   }();
   expect(page_css.status == 200, "console stylesheet did not load");
-  expect(page_css.content_type == "text/css; charset=utf-8", "console stylesheet has the wrong content type");
-  expect(page_css.body.find(":root{color-scheme:dark") != std::string::npos, "console stylesheet content is missing");
+  expect(page_css.content_type == "text/css; charset=utf-8",
+         "console stylesheet has the wrong content type");
+  expect(page_css.body.find(":root{color-scheme:dark") != std::string::npos,
+         "console stylesheet content is missing");
 
   const auto page_logic = [&] {
     mine_teleop::HttpRequest request;
@@ -1882,8 +1840,10 @@ void test_console_assets_routes_config_and_security_headers() {
     return app.handle(request);
   }();
   expect(page_logic.status == 200, "shared control logic script did not load");
-  expect(page_logic.content_type == "application/javascript; charset=utf-8", "control logic script has the wrong content type");
-  expect(page_logic.body.find("MineTeleopControlLogic") != std::string::npos, "control logic script content is missing");
+  expect(page_logic.content_type == "application/javascript; charset=utf-8",
+         "control logic script has the wrong content type");
+  expect(page_logic.body.find("MineTeleopControlLogic") != std::string::npos,
+         "control logic script content is missing");
 
   const auto page_js = [&] {
     mine_teleop::HttpRequest request;
@@ -1892,17 +1852,21 @@ void test_console_assets_routes_config_and_security_headers() {
     return app.handle(request);
   }();
   expect(page_js.status == 200, "console page script did not load");
-  expect(page_js.content_type == "application/javascript; charset=utf-8", "console page script has the wrong content type");
+  expect(page_js.content_type == "application/javascript; charset=utf-8",
+         "console page script has the wrong content type");
   expect(page_js.body.find("fetch('/api/console-config',{cache:'no-store'})") != std::string::npos,
          "console page script does not fetch no-store runtime configuration");
   expect(page_js.body.find("await consoleConfigResponse.json()") != std::string::npos,
          "console page script does not await the runtime configuration");
-  expect(page_js.body.find("pageCapability") != std::string::npos, "console page script does not use the runtime page capability");
+  expect(page_js.body.find("pageCapability") != std::string::npos,
+         "console page script does not use the runtime page capability");
   expect(page_js.body.find("'x-mine-teleop-page-capability':pageCapability") != std::string::npos,
          "console page script does not bind mutations to the runtime page capability");
-  expect(page_js.body.find("addEventListener('keydown'") != std::string::npos || page_js.body.find("addEventListener(\"keydown\"") != std::string::npos,
+  expect(page_js.body.find("addEventListener('keydown'") != std::string::npos ||
+             page_js.body.find("addEventListener(\"keydown\"") != std::string::npos,
          "console page script lost keyboard capture");
-  expect(page_js.body.find("addEventListener('pagehide'") != std::string::npos || page_js.body.find("addEventListener(\"pagehide\"") != std::string::npos,
+  expect(page_js.body.find("addEventListener('pagehide'") != std::string::npos ||
+             page_js.body.find("addEventListener(\"pagehide\"") != std::string::npos,
          "console page script lost pagehide cleanup");
 
   const auto config_response = [&] {
@@ -1912,7 +1876,8 @@ void test_console_assets_routes_config_and_security_headers() {
     return app.handle(request);
   }();
   expect(config_response.status == 200, "console configuration endpoint did not load");
-  expect(config_response.content_type == "application/json; charset=utf-8", "console configuration is not JSON");
+  expect(config_response.content_type == "application/json; charset=utf-8",
+         "console configuration is not JSON");
   expect(config_response.body.find(app.page_capability()) != std::string::npos,
          "console configuration does not carry the runtime page capability");
   expect(config_response.body.find("\"initial_target_speed_kph\"") != std::string::npos,
@@ -1924,15 +1889,19 @@ void test_console_assets_routes_config_and_security_headers() {
   expect(parsed_config.value("page_capability", "") == app.page_capability(),
          "console configuration page capability differs from the app token");
 
-  expect(page.body.find("<link rel=\"stylesheet\" href=\"/assets/control_console.css\">") != std::string::npos,
+  expect(page.body.find("<link rel=\"stylesheet\" href=\"/assets/control_console.css\">") !=
+             std::string::npos,
          "console page does not reference its external stylesheet");
   expect(page.body.find("<script src=\"/assets/control_logic.js\">") != std::string::npos,
          "console page does not load the shared control logic script");
-  expect(page.body.find("<script type=\"module\" src=\"/assets/control_console.js\">") != std::string::npos,
+  expect(page.body.find("<script type=\"module\" src=\"/assets/control_console.js\">") !=
+             std::string::npos,
          "console page does not load its module page script");
   expect(page.body.find("<style>") == std::string::npos, "console page still embeds inline styles");
-  expect(page.body.find("const controlLogic=") == std::string::npos, "console page still embeds inline page script");
-  expect(page.body.find("addEventListener") == std::string::npos, "console page still embeds inline event wiring");
+  expect(page.body.find("const controlLogic=") == std::string::npos,
+         "console page still embeds inline page script");
+  expect(page.body.find("addEventListener") == std::string::npos,
+         "console page still embeds inline event wiring");
   expect(page.body.find(" onclick=") == std::string::npos &&
              page.body.find(" onload=") == std::string::npos &&
              page.body.find(" onerror=") == std::string::npos,
@@ -1941,28 +1910,37 @@ void test_console_assets_routes_config_and_security_headers() {
          "console page embeds the runtime page capability in static HTML");
   expect(page.body.find("\"initial_target_speed_kph\"") == std::string::npos,
          "console page embeds dynamic configuration in static HTML");
-  expect(page.body.find("id=\"estop\"") != std::string::npos && page.body.find("id=\"control-steering\"") != std::string::npos &&
-             page.body.find("id=\"control-limits-dialog\"") != std::string::npos && page.body.find("id=\"keyboard-panel\"") != std::string::npos &&
-             page.body.find("id=\"vcu-panel\"") != std::string::npos && page.body.find("id=\"monitor-panel\"") != std::string::npos,
+  expect(page.body.find("id=\"estop\"") != std::string::npos &&
+             page.body.find("id=\"control-steering\"") != std::string::npos &&
+             page.body.find("id=\"control-limits-dialog\"") != std::string::npos &&
+             page.body.find("id=\"keyboard-panel\"") != std::string::npos &&
+             page.body.find("id=\"vcu-panel\"") != std::string::npos &&
+             page.body.find("id=\"monitor-panel\"") != std::string::npos,
          "console page dropped required control DOM IDs");
 
   std::vector<std::pair<std::string, std::string>> required_headers{
       {"X-Frame-Options", "DENY"},
       {"X-Content-Type-Options", "nosniff"},
-      {"Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'none'"},
+      {"Content-Security-Policy",
+       "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src "
+       "'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src "
+       "'none'; form-action 'none'"},
       {"Referrer-Policy", "no-referrer"},
       {"Cache-Control", "no-store"},
   };
   for (const auto& [name, expected] : required_headers) {
     for (const auto& response : {page, page_html, page_css, page_logic, page_js, config_response}) {
-      expect(response_header(response, name) == expected, "console route missing or wrong security header " + name);
-      expect(response_header_count(response, name) == 1, "console route duplicated security header " + name);
+      expect(response_header(response, name) == expected,
+             "console route missing or wrong security header " + name);
+      expect(response_header_count(response, name) == 1,
+             "console route duplicated security header " + name);
     }
   }
   expect(response_header(config_response, "Cache-Control") == "no-store",
          "console configuration endpoint is cacheable");
-  expect(response_header(page, "Content-Security-Policy").find("unsafe-inline") == std::string::npos,
-         "console CSP weakened external asset enforcement with unsafe-inline");
+  expect(
+      response_header(page, "Content-Security-Policy").find("unsafe-inline") == std::string::npos,
+      "console CSP weakened external asset enforcement with unsafe-inline");
   expect(response_header(page, "Strict-Transport-Security").empty(),
          "loopback console response must not set HSTS");
 
@@ -1975,7 +1953,8 @@ void test_console_assets_routes_config_and_security_headers() {
   expect(sensitive_post.status == 200, "authorized sensitive console mutation was rejected");
   expect(response_header(sensitive_post, "X-Frame-Options") == "DENY" &&
              response_header(sensitive_post, "X-Content-Type-Options") == "nosniff" &&
-             response_header(sensitive_post, "Content-Security-Policy") == required_headers[2].second &&
+             response_header(sensitive_post, "Content-Security-Policy") ==
+                 required_headers[2].second &&
              response_header(sensitive_post, "Cache-Control") == "no-store",
          "sensitive console mutation response lacks security headers");
   for (const auto& [name, _] : required_headers) {
@@ -2007,7 +1986,8 @@ void test_console_assets_routes_config_and_security_headers() {
   };
   const auto script_terminator_page = script_terminator_get("/");
   const auto script_terminator_config_response = script_terminator_get("/api/console-config");
-  const auto script_terminator_json = mine_teleop::Json::parse(script_terminator_config_response.body);
+  const auto script_terminator_json =
+      mine_teleop::Json::parse(script_terminator_config_response.body);
   expect(script_terminator_page.body == page.body,
          "runtime configuration changed the static console HTML document");
   expect(script_terminator_page.body.find(script_terminator_fixture) == std::string::npos,
@@ -2093,6 +2073,49 @@ std::string cpp_function_contract(
     }
   }
   throw std::runtime_error("unterminated C++ function body: " + std::string(signature));
+}
+
+constexpr bool is_cpp_contract_whitespace(char character) noexcept {
+  return character == ' ' || character == '\t' || character == '\r' || character == '\n' ||
+         character == '\f' || character == '\v';
+}
+
+std::size_t find_cpp_contract_ignoring_whitespace(std::string_view source,
+                                                  std::string_view contract,
+                                                  std::size_t start = 0) {
+  std::size_t first_contract_character = 0;
+  while (first_contract_character < contract.size() &&
+         is_cpp_contract_whitespace(contract[first_contract_character])) {
+    ++first_contract_character;
+  }
+  if (first_contract_character == contract.size())
+    return start <= source.size() ? start : std::string::npos;
+
+  for (std::size_t candidate = start; candidate < source.size(); ++candidate) {
+    if (source[candidate] != contract[first_contract_character])
+      continue;
+
+    std::size_t source_position = candidate;
+    std::size_t contract_position = 0;
+    while (true) {
+      while (contract_position < contract.size() &&
+             is_cpp_contract_whitespace(contract[contract_position])) {
+        ++contract_position;
+      }
+      while (source_position < source.size() &&
+             is_cpp_contract_whitespace(source[source_position])) {
+        ++source_position;
+      }
+      if (contract_position == contract.size())
+        return candidate;
+      if (source_position == source.size() ||
+          source[source_position] != contract[contract_position])
+        break;
+      ++source_position;
+      ++contract_position;
+    }
+  }
+  return std::string::npos;
 }
 
 void test_vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start() {
@@ -2267,10 +2290,8 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
   const auto stale_safe_gear_gate = native_command_path.find(
       "!native_control_last_accepted_fresh_gear",
       stale_safe_gap_reject);
-  const auto receive_command = native_command_path.find(
-      "control_service->receive_command(\n"
-      "            command,\n"
-      "            control_clock_sample)",
+  const auto receive_command = find_cpp_contract_ignoring_whitespace(
+      native_command_path, "control_service->receive_command(command, control_clock_sample)",
       stale_safe_gear_gate);
   const auto accepted_result = native_command_path.find(
       "if (result.accepted && result.command)", receive_command);
@@ -2279,9 +2300,9 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
       accepted_result);
   const auto fresh_gear_update = native_command_path.find(
       "else if (!command.estop && intent_fresh)", estop_gear_freeze);
-  const auto accepted_monotonic_update = native_command_path.find(
-      "native_control_last_accepted_monotonic_ms =\n"
-      "            control_mutex_acquired_monotonic_ms",
+  const auto accepted_monotonic_update = find_cpp_contract_ignoring_whitespace(
+      native_command_path,
+      "native_control_last_accepted_monotonic_ms = control_mutex_acquired_monotonic_ms",
       fresh_gear_update);
   expect(
       stale_safe_definition != std::string::npos &&
@@ -2291,92 +2312,66 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
               stale_nonzero_gate &&
           native_command_path.find("command.brake == 0.0", stale_safe_definition) <
               stale_nonzero_gate &&
-          stale_nonzero_gate != std::string::npos &&
-          estop_gear_gate != std::string::npos &&
+          stale_nonzero_gate != std::string::npos && estop_gear_gate != std::string::npos &&
           profile_readiness_gate != std::string::npos &&
-          handshake_readiness_gate != std::string::npos &&
-          stale_safe_gate != std::string::npos &&
+          handshake_readiness_gate != std::string::npos && stale_safe_gate != std::string::npos &&
           stale_safe_active_gate != std::string::npos &&
-          stale_safe_gap_clock != std::string::npos &&
-          stale_safe_gap_gate != std::string::npos &&
-          stale_safe_gap_reject != std::string::npos &&
-          stale_safe_gear_gate != std::string::npos &&
+          stale_safe_gap_clock != std::string::npos && stale_safe_gap_gate != std::string::npos &&
+          stale_safe_gap_reject != std::string::npos && stale_safe_gear_gate != std::string::npos &&
           receive_command != std::string::npos &&
-          native_command_path.find(
-              "const auto control_clock_sample = signaling.clock_sample()") <
+          native_command_path.find("const auto control_clock_sample = signaling.clock_sample()") <
               receive_command &&
-          accepted_result != std::string::npos &&
-          estop_gear_freeze != std::string::npos &&
+          accepted_result != std::string::npos && estop_gear_freeze != std::string::npos &&
           fresh_gear_update != std::string::npos &&
-          accepted_monotonic_update != std::string::npos &&
-          stale_nonzero_gate < estop_gear_gate &&
+          accepted_monotonic_update != std::string::npos && stale_nonzero_gate < estop_gear_gate &&
           estop_gear_gate < profile_readiness_gate &&
           profile_readiness_gate < handshake_readiness_gate &&
-          handshake_readiness_gate < stale_safe_gate &&
-          stale_safe_gate < stale_safe_active_gate &&
+          handshake_readiness_gate < stale_safe_gate && stale_safe_gate < stale_safe_active_gate &&
           stale_safe_active_gate < stale_safe_gap_clock &&
           stale_safe_gap_clock < stale_safe_gap_gate &&
           stale_safe_gap_gate < stale_safe_gap_reject &&
-          stale_safe_gap_reject < stale_safe_gear_gate &&
-          stale_safe_gear_gate < receive_command &&
+          stale_safe_gap_reject < stale_safe_gear_gate && stale_safe_gear_gate < receive_command &&
           handshake_readiness_gate < receive_command &&
-          native_command_path.find(
-              "native_control_stale_nonzero_intents_discarded_total",
-              stale_nonzero_gate) <
-              profile_readiness_gate &&
-          native_command_path.find("native_control_profile_not_ready_discards_total", handshake_readiness_gate) <
-              receive_command &&
-          native_command_path.find("native_control_handshake_not_ready_discards_total", handshake_readiness_gate) <
-              receive_command &&
+          native_command_path.find("native_control_stale_nonzero_intents_discarded_total",
+                                   stale_nonzero_gate) < profile_readiness_gate &&
+          native_command_path.find("native_control_profile_not_ready_discards_total",
+                                   handshake_readiness_gate) < receive_command &&
+          native_command_path.find("native_control_handshake_not_ready_discards_total",
+                                   handshake_readiness_gate) < receive_command &&
           native_command_path.find("session_profile_not_ready", handshake_readiness_gate) <
               receive_command &&
           native_command_path.find("vcu_handshake_not_ready", handshake_readiness_gate) <
               receive_command &&
-          native_command_path.find(
-              "stale_safe_heartbeat_control_not_active", stale_safe_active_gate) <
-              receive_command &&
-          native_command_path.find(
-              "native_control_last_accepted_monotonic_ms.load()",
-              stale_safe_gap_clock) <
-              stale_safe_gap_gate &&
+          native_command_path.find("stale_safe_heartbeat_control_not_active",
+                                   stale_safe_active_gate) < receive_command &&
+          native_command_path.find("native_control_last_accepted_monotonic_ms.load()",
+                                   stale_safe_gap_clock) < stale_safe_gap_gate &&
           native_command_path.find(
               "control_mutex_acquired_monotonic_ms < previous_accepted_monotonic_ms",
-              stale_safe_gap_clock) <
-              stale_safe_gap_gate &&
-          native_command_path.find(
-              "config.control.degraded_timeout_ms", stale_safe_gap_gate) <
+              stale_safe_gap_clock) < stale_safe_gap_gate &&
+          native_command_path.find("config.control.degraded_timeout_ms", stale_safe_gap_gate) <
               stale_safe_gap_reject &&
-          native_command_path.find(
-              "native_control_stale_safe_native_gap_discards_total",
-              stale_safe_gap_gate) <
-              stale_safe_gap_reject &&
+          native_command_path.find("native_control_stale_safe_native_gap_discards_total",
+                                   stale_safe_gap_gate) < stale_safe_gap_reject &&
           native_command_path
-                  .substr(
-                      stale_safe_gap_clock,
-                      stale_safe_gear_gate - stale_safe_gap_clock)
-                  .find("control_mutex_acquired_at_utc_ms") ==
-              std::string::npos &&
-          native_command_path.find(
-              "stale_safe_heartbeat_gear_untrusted", stale_safe_gear_gate) <
+                  .substr(stale_safe_gap_clock, stale_safe_gear_gate - stale_safe_gap_clock)
+                  .find("control_mutex_acquired_at_utc_ms") == std::string::npos &&
+          native_command_path.find("stale_safe_heartbeat_gear_untrusted", stale_safe_gear_gate) <
               receive_command &&
-          native_command_path.find(
-              "native_control_estop_frozen_gear\n            ? *native_control_estop_frozen_gear",
-              estop_gear_gate) <
-              profile_readiness_gate &&
-          native_command_path.find(
-              "native_control_last_accepted_fresh_gear.value_or(command.gear)",
-              estop_gear_gate) <
-              profile_readiness_gate &&
+          find_cpp_contract_ignoring_whitespace(
+              native_command_path,
+              "native_control_estop_frozen_gear ? *native_control_estop_frozen_gear",
+              estop_gear_gate) < profile_readiness_gate &&
+          native_command_path.find("native_control_last_accepted_fresh_gear.value_or(command.gear)",
+                                   estop_gear_gate) < profile_readiness_gate &&
           native_command_path.find("command.gear = estop_gear", estop_gear_gate) <
               profile_readiness_gate &&
-          native_command_path.find(
-              "native_control_estop_frozen_gear = command.gear", estop_gear_freeze) <
-              fresh_gear_update &&
-          native_command_path.find(
-              "native_control_last_accepted_fresh_gear = result.command->gear",
-              fresh_gear_update) <
-              accepted_monotonic_update,
-      "native control freshness, readiness, monotonic-gap, retained-gear, or ESTOP-gear gates regressed");
+          native_command_path.find("native_control_estop_frozen_gear = command.gear",
+                                   estop_gear_freeze) < fresh_gear_update &&
+          native_command_path.find("native_control_last_accepted_fresh_gear = result.command->gear",
+                                   fresh_gear_update) < accepted_monotonic_update,
+      "native control freshness, readiness, monotonic-gap, retained-gear, or ESTOP-gear gates "
+      "regressed");
 
   const auto stale_command_gate = native_control_websocket_handler.find(
       "command_sent_at_ms <= replay_cutoff_ms");
@@ -2700,31 +2695,29 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
   const auto handler = cpp_function_contract(source, "void handle_control_message(");
   const auto enqueue = cpp_function_contract(source, "void enqueue_control_trace(");
   const auto worker = cpp_function_contract(source, "void control_trace_worker_loop_impl()");
-  const auto trace_output = cpp_function_contract(
-      source,
-      "[[nodiscard]] bool write_control_trace_batch_line(");
+  const auto trace_output =
+      cpp_function_contract(source, "[[nodiscard]] bool write_control_trace_batch_line(");
   const auto stop_worker = cpp_function_contract(source, "void stop_control_trace_worker()");
-  const auto stop_pipeline = cpp_function_contract(
-      source,
-      "void stop_pipeline(bool final_runtime_shutdown = false)");
+  const auto stop_pipeline =
+      cpp_function_contract(source, "void stop_pipeline(bool final_runtime_shutdown = false)");
   const auto destructor = cpp_function_contract(source, "~Impl()");
   const auto run = cpp_function_contract(source, "Json run(int frame_count, int duration_ms, int capture_interval_ms)");
   const auto callback_timestamp = handler.find("callback_entered_at_utc_ms = signaling.now_ms()");
   const auto command_parse = handler.find("auto command = ControlCommand::from_json(message)");
   const auto lock_wait_started = handler.find("control_mutex_wait_started_monotonic_ms = steady_now_ms()");
-  const auto clock_sample = handler.find("const auto control_clock_sample = signaling.clock_sample()");
-  const auto lock_acquired = handler.find(
-      "control_mutex_acquired_monotonic_ms = control_clock_sample.monotonic.value");
-  const auto lock_acquired_utc = handler.find(
-      "control_mutex_acquired_at_utc_ms = control_clock_sample.utc.value");
-  expect(
-      callback_timestamp != std::string::npos && command_parse != std::string::npos &&
-          lock_wait_started != std::string::npos && clock_sample != std::string::npos &&
-          lock_acquired != std::string::npos && lock_acquired_utc != std::string::npos &&
-          callback_timestamp < command_parse && command_parse < lock_wait_started &&
-          lock_wait_started < clock_sample && clock_sample < lock_acquired &&
-          clock_sample < lock_acquired_utc,
-      "vehicle control trace does not separate callback entry, parsing, and mutex wait");
+  const auto clock_sample =
+      handler.find("const auto control_clock_sample = signaling.clock_sample()");
+  const auto lock_acquired =
+      handler.find("control_mutex_acquired_monotonic_ms = control_clock_sample.monotonic.value");
+  const auto lock_acquired_utc =
+      handler.find("control_mutex_acquired_at_utc_ms = control_clock_sample.utc.value");
+  expect(callback_timestamp != std::string::npos && command_parse != std::string::npos &&
+             lock_wait_started != std::string::npos && clock_sample != std::string::npos &&
+             lock_acquired != std::string::npos && lock_acquired_utc != std::string::npos &&
+             callback_timestamp < command_parse && command_parse < lock_wait_started &&
+             lock_wait_started < clock_sample && clock_sample < lock_acquired &&
+             clock_sample < lock_acquired_utc,
+         "vehicle control trace does not separate callback entry, parsing, and mutex wait");
   for (const auto field : {
            "stage",
            "trace_session_id",
@@ -2831,13 +2824,12 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
           worker.find("\"dropped_total\"") != std::string::npos &&
           worker.find("\"final\"") != std::string::npos,
       "trace worker does not batch by time/size or expose loss accounting");
-  expect(
-      trace_output.find("kControlTraceBatchLineMaxBytes") != std::string::npos &&
-          trace_output.find("diagnostic_emitter.submit(line)") != std::string::npos &&
-          source.find("detail::DiagnosticEmitter diagnostic_emitter") != std::string::npos &&
-          source.find("std::cout") == std::string::npos &&
-          source.find("std::osyncstream") == std::string::npos,
-      "media diagnostics bypass the bounded JSONL emitter or can still block stdout directly");
+  expect(trace_output.find("kControlTraceBatchLineMaxBytes") != std::string::npos &&
+             trace_output.find("diagnostic_emitter.submit(line)") != std::string::npos &&
+             source.find("detail::DiagnosticEmitter diagnostic_emitter") != std::string::npos &&
+             source.find("std::cout") == std::string::npos &&
+             source.find("std::osyncstream") == std::string::npos,
+         "media diagnostics bypass the bounded JSONL emitter or can still block stdout directly");
   expect(
       stop_worker.find("control_trace_accepting.store(false") != std::string::npos &&
           stop_worker.find("control_trace_worker.joinable()") != std::string::npos &&
@@ -2846,31 +2838,31 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
   const auto run_stop_trace = run.rfind("stop_control_trace_worker()");
   const auto run_stop_emitter = run.rfind("diagnostic_emitter.stop()");
   const auto run_return = run.rfind("return summary;");
-  expect(
-      run_stop_trace != std::string::npos && run_return != std::string::npos &&
-          run_stop_emitter != std::string::npos && run_stop_trace < run_stop_emitter &&
-          run_stop_emitter < run_return,
-      "media summary can return before the diagnostic emitter is stopped and joined");
+  expect(run_stop_trace != std::string::npos && run_return != std::string::npos &&
+             run_stop_emitter != std::string::npos && run_stop_trace < run_stop_emitter &&
+             run_stop_emitter < run_return,
+         "media summary can return before the diagnostic emitter is stopped and joined");
 
-  const auto callback_disconnect = stop_pipeline.find("g_signal_handlers_disconnect_by_data(webrtc, this)");
+  const auto callback_disconnect =
+      stop_pipeline.find("g_signal_handlers_disconnect_by_data(webrtc, this)");
   const auto pipeline_unref = stop_pipeline.find("gst_object_unref(pipeline);");
   const auto orphan_quarantine = stop_pipeline.find("quarantine_orphan_recordings(");
-  expect(
-      callback_disconnect != std::string::npos && pipeline_unref != std::string::npos &&
-          callback_disconnect < pipeline_unref && orphan_quarantine != std::string::npos &&
-          pipeline_unref < orphan_quarantine,
-      "diagnostic shutdown changed callback teardown or R17 orphan quarantine ordering");
+  expect(callback_disconnect != std::string::npos && pipeline_unref != std::string::npos &&
+             callback_disconnect < pipeline_unref && orphan_quarantine != std::string::npos &&
+             pipeline_unref < orphan_quarantine,
+         "diagnostic shutdown changed callback teardown or R17 orphan quarantine ordering");
   const auto destructor_stop_pipeline = destructor.find("stop_pipeline(true)");
   const auto destructor_stop_recording = destructor.find("stop_recording_finalization_worker()");
   const auto destructor_stop_trace = destructor.find("stop_control_trace_worker()");
   const auto destructor_stop_emitter = destructor.find("diagnostic_emitter.stop()");
-  expect(
-      destructor_stop_pipeline != std::string::npos && destructor_stop_recording != std::string::npos &&
-          destructor_stop_trace != std::string::npos && destructor_stop_emitter != std::string::npos &&
-          destructor_stop_pipeline < destructor_stop_recording &&
-          destructor_stop_recording < destructor_stop_trace &&
-          destructor_stop_trace < destructor_stop_emitter,
-      "Impl destruction can leave a diagnostic producer alive past emitter shutdown");
+  expect(destructor_stop_pipeline != std::string::npos &&
+             destructor_stop_recording != std::string::npos &&
+             destructor_stop_trace != std::string::npos &&
+             destructor_stop_emitter != std::string::npos &&
+             destructor_stop_pipeline < destructor_stop_recording &&
+             destructor_stop_recording < destructor_stop_trace &&
+             destructor_stop_trace < destructor_stop_emitter,
+         "Impl destruction can leave a diagnostic producer alive past emitter shutdown");
 }
 
 void test_structured_control_rejection_is_safe_and_rate_limited() {
@@ -3338,24 +3330,20 @@ void test_signaling_multi_identity_config() {
   std::filesystem::create_directories(root);
   write_text_file(root / "driver-1.password", "driver-password-1\n");
   write_text_file(root / "driver-2.password", "driver-password-2\n");
-  constexpr std::array<std::uint8_t, 16> first_salt{
-      0x4d, 0x69, 0x6e, 0x65, 0x54, 0x65, 0x6c, 0x65,
-      0x6f, 0x70, 0x2d, 0x64, 0x72, 0x76, 0x30, 0x31};
-  constexpr std::array<std::uint8_t, 16> second_salt{
-      0x4d, 0x69, 0x6e, 0x65, 0x54, 0x65, 0x6c, 0x65,
-      0x6f, 0x70, 0x2d, 0x64, 0x72, 0x76, 0x30, 0x32};
-  write_text_file(
-      root / "driver-1.argon2id",
-      mine_teleop::hash_argon2id_password("driver-password-1", first_salt) + "\n");
-  write_text_file(
-      root / "driver-2.argon2id",
-      mine_teleop::hash_argon2id_password("driver-password-2", second_salt) + "\n");
+  constexpr std::array<std::uint8_t, 16> first_salt{0x4d, 0x69, 0x6e, 0x65, 0x54, 0x65, 0x6c, 0x65,
+                                                    0x6f, 0x70, 0x2d, 0x64, 0x72, 0x76, 0x30, 0x31};
+  constexpr std::array<std::uint8_t, 16> second_salt{0x4d, 0x69, 0x6e, 0x65, 0x54, 0x65,
+                                                     0x6c, 0x65, 0x6f, 0x70, 0x2d, 0x64,
+                                                     0x72, 0x76, 0x30, 0x32};
+  write_text_file(root / "driver-1.argon2id",
+                  mine_teleop::hash_argon2id_password("driver-password-1", first_salt) + "\n");
+  write_text_file(root / "driver-2.argon2id",
+                  mine_teleop::hash_argon2id_password("driver-password-2", second_salt) + "\n");
   write_text_file(root / "vehicle-1.token", "vehicle-token-1\n");
   write_text_file(root / "vehicle-2.token", "vehicle-token-2\n");
   const auto valid_path = root / "valid.yaml";
-  write_text_file(
-      valid_path,
-      R"YAML(auth:
+  write_text_file(valid_path,
+                  R"YAML(auth:
   drivers:
     - id: driver-console-001
       password_hash_file: driver-1.argon2id
@@ -3370,14 +3358,13 @@ void test_signaling_multi_identity_config() {
       device_token_file: vehicle-2.token
 )YAML");
   const auto config = mine_teleop::load_signaling_identity_config(valid_path);
-  expect(config.driver_password_verifiers.size() == 2, "multi-identity config lost an Argon2id driver");
+  expect(config.driver_password_verifiers.size() == 2,
+         "multi-identity config lost an Argon2id driver");
   expect(config.device_tokens.size() == 2, "multi-identity config lost a vehicle");
-  expect(
-      mine_teleop::verify_argon2id_password(
-          config.driver_password_verifiers.at("driver-console-001"),
-          "driver-password-1",
-          mine_teleop::default_authentication_cost_policy()),
-      "relative driver verifier file was not loaded");
+  expect(mine_teleop::verify_argon2id_password(
+             config.driver_password_verifiers.at("driver-console-001"), "driver-password-1",
+             mine_teleop::default_authentication_cost_policy()),
+         "relative driver verifier file was not loaded");
   expect(
       config.device_tokens.at("vehicle-002") == "vehicle-token-2",
       "relative vehicle secret file was not loaded");
@@ -3395,9 +3382,8 @@ void test_signaling_multi_identity_config() {
   }
 
   const auto legacy_disabled_path = root / "legacy-disabled.yaml";
-  write_text_file(
-      legacy_disabled_path,
-      R"YAML(auth:
+  write_text_file(legacy_disabled_path,
+                  R"YAML(auth:
   drivers:
     - id: driver-console-001
       password_file: driver-1.password
@@ -3411,9 +3397,8 @@ void test_signaling_multi_identity_config() {
       "legacy plaintext password config was accepted without an explicit migration switch");
 
   const auto duplicate_path = root / "duplicate.yaml";
-  write_text_file(
-      duplicate_path,
-      R"YAML(auth:
+  write_text_file(duplicate_path,
+                  R"YAML(auth:
   allow_legacy_passwords: true
   legacy_passwords_remove_by: "2099-12-31"
   drivers:
@@ -3432,9 +3417,8 @@ void test_signaling_multi_identity_config() {
       "duplicate driver identity was accepted");
 
   const auto empty_permissions_path = root / "empty-permissions.yaml";
-  write_text_file(
-      empty_permissions_path,
-      R"YAML(auth:
+  write_text_file(empty_permissions_path,
+                  R"YAML(auth:
   allow_legacy_passwords: true
   legacy_passwords_remove_by: "2099-12-31"
   drivers:
@@ -3450,9 +3434,8 @@ void test_signaling_multi_identity_config() {
       "driver with no vehicle permissions was accepted");
 
   const auto unknown_vehicle_path = root / "unknown-vehicle.yaml";
-  write_text_file(
-      unknown_vehicle_path,
-      R"YAML(auth:
+  write_text_file(unknown_vehicle_path,
+                  R"YAML(auth:
   allow_legacy_passwords: true
   legacy_passwords_remove_by: "2099-12-31"
   drivers:
@@ -3468,9 +3451,8 @@ void test_signaling_multi_identity_config() {
       "permission for an unknown vehicle was accepted");
 
   const auto ambiguous_secret_path = root / "ambiguous-secret.yaml";
-  write_text_file(
-      ambiguous_secret_path,
-      R"YAML(auth:
+  write_text_file(ambiguous_secret_path,
+                  R"YAML(auth:
   allow_legacy_passwords: true
   legacy_passwords_remove_by: "2099-12-31"
   drivers:
@@ -3490,7 +3472,7 @@ void test_signaling_multi_identity_config() {
 
 void test_signaling_connection_limits_config() {
   const auto root = std::filesystem::temp_directory_path() /
-      ("mine-teleop-connection-limits-" + mine_teleop::random_token(6));
+                    ("mine-teleop-connection-limits-" + mine_teleop::random_token(6));
   std::filesystem::create_directories(root);
   write_text_file(root / "driver-1.password", "driver-password-1\n");
   write_text_file(root / "vehicle-1.token", "vehicle-token-1\n");
@@ -3519,131 +3501,109 @@ void test_signaling_connection_limits_config() {
   try {
     mine_teleop::SimpleHttpServer::ConnectionLimits reference;
     auto defaults = mine_teleop::SignalingServerConfig{};
-    const auto has_runtime_defaults = [&](const mine_teleop::SimpleHttpServer::ConnectionLimits& limits) {
-      return limits.max_active_connections == reference.max_active_connections &&
-          limits.max_pending_http_connections == reference.max_pending_http_connections &&
-          limits.max_websocket_connections == reference.max_websocket_connections &&
-          limits.max_connections_per_source == reference.max_connections_per_source &&
-          limits.listen_backlog == reference.listen_backlog &&
-          limits.header_read_timeout == reference.header_read_timeout &&
-          limits.body_read_timeout == reference.body_read_timeout &&
-          limits.response_write_timeout == reference.response_write_timeout &&
-          limits.overload_write_timeout == reference.overload_write_timeout;
-    };
-    expect(
-        has_runtime_defaults(defaults.connection_limits),
-        "SignalingServerConfig connection_limits defaults do not mirror SimpleHttpServer::ConnectionLimits");
-    const auto yaml_defaults = mine_teleop::load_signaling_identity_config(
-        write_identity("defaults.yaml", ""));
-    expect(
-        has_runtime_defaults(yaml_defaults.connection_limits),
-        "identity YAML without connection_limits did not retain runtime defaults");
+    const auto has_runtime_defaults =
+        [&](const mine_teleop::SimpleHttpServer::ConnectionLimits& limits) {
+          return limits.max_active_connections == reference.max_active_connections &&
+                 limits.max_pending_http_connections == reference.max_pending_http_connections &&
+                 limits.max_websocket_connections == reference.max_websocket_connections &&
+                 limits.max_connections_per_source == reference.max_connections_per_source &&
+                 limits.listen_backlog == reference.listen_backlog &&
+                 limits.header_read_timeout == reference.header_read_timeout &&
+                 limits.body_read_timeout == reference.body_read_timeout &&
+                 limits.response_write_timeout == reference.response_write_timeout &&
+                 limits.overload_write_timeout == reference.overload_write_timeout;
+        };
+    expect(has_runtime_defaults(defaults.connection_limits),
+           "SignalingServerConfig connection_limits defaults do not mirror "
+           "SimpleHttpServer::ConnectionLimits");
+    const auto yaml_defaults =
+        mine_teleop::load_signaling_identity_config(write_identity("defaults.yaml", ""));
+    expect(has_runtime_defaults(yaml_defaults.connection_limits),
+           "identity YAML without connection_limits did not retain runtime defaults");
 
-    const auto valid_path = write_identity(
-        "valid.yaml",
-        "  max_active_connections: 4\n"
-        "  max_pending_http_connections: 2\n"
-        "  max_websocket_connections: 2\n"
-        "  max_connections_per_source: 1\n"
-        "  listen_backlog: 4\n"
-        "  header_read_timeout_ms: 700\n"
-        "  body_read_timeout_ms: 800\n"
-        "  response_write_timeout_ms: 900\n"
-        "  overload_write_timeout_ms: 120\n");
+    const auto valid_path = write_identity("valid.yaml",
+                                           "  max_active_connections: 4\n"
+                                           "  max_pending_http_connections: 2\n"
+                                           "  max_websocket_connections: 2\n"
+                                           "  max_connections_per_source: 1\n"
+                                           "  listen_backlog: 4\n"
+                                           "  header_read_timeout_ms: 700\n"
+                                           "  body_read_timeout_ms: 800\n"
+                                           "  response_write_timeout_ms: 900\n"
+                                           "  overload_write_timeout_ms: 120\n");
     const auto parsed = mine_teleop::load_signaling_identity_config(valid_path);
-    expect(
-        parsed.connection_limits.max_active_connections == 4,
-        "max_active_connections override was not parsed into the config");
-    expect(
-        parsed.connection_limits.max_pending_http_connections == 2,
-        "max_pending_http_connections override was not parsed into the config");
-    expect(
-        parsed.connection_limits.max_websocket_connections == 2,
-        "max_websocket_connections override was not parsed into the config");
-    expect(
-        parsed.connection_limits.max_connections_per_source == 1,
-        "max_connections_per_source override was not parsed into the config");
-    expect(
-        parsed.connection_limits.listen_backlog == 4,
-        "listen_backlog override was not parsed into the config");
-    expect(
-        parsed.connection_limits.header_read_timeout == std::chrono::milliseconds(700),
-        "header_read_timeout_ms override was not parsed into the config");
-    expect(
-        parsed.connection_limits.body_read_timeout == std::chrono::milliseconds(800),
-        "body_read_timeout_ms override was not parsed into the config");
-    expect(
-        parsed.connection_limits.response_write_timeout == std::chrono::milliseconds(900),
-        "response_write_timeout_ms override was not parsed into the config");
-    expect(
-        parsed.connection_limits.overload_write_timeout == std::chrono::milliseconds(120),
-        "overload_write_timeout_ms override was not parsed into the config");
+    expect(parsed.connection_limits.max_active_connections == 4,
+           "max_active_connections override was not parsed into the config");
+    expect(parsed.connection_limits.max_pending_http_connections == 2,
+           "max_pending_http_connections override was not parsed into the config");
+    expect(parsed.connection_limits.max_websocket_connections == 2,
+           "max_websocket_connections override was not parsed into the config");
+    expect(parsed.connection_limits.max_connections_per_source == 1,
+           "max_connections_per_source override was not parsed into the config");
+    expect(parsed.connection_limits.listen_backlog == 4,
+           "listen_backlog override was not parsed into the config");
+    expect(parsed.connection_limits.header_read_timeout == std::chrono::milliseconds(700),
+           "header_read_timeout_ms override was not parsed into the config");
+    expect(parsed.connection_limits.body_read_timeout == std::chrono::milliseconds(800),
+           "body_read_timeout_ms override was not parsed into the config");
+    expect(parsed.connection_limits.response_write_timeout == std::chrono::milliseconds(900),
+           "response_write_timeout_ms override was not parsed into the config");
+    expect(parsed.connection_limits.overload_write_timeout == std::chrono::milliseconds(120),
+           "overload_write_timeout_ms override was not parsed into the config");
 
     // Partial mappings inherit every omitted field from the default-constructed
     // ConnectionLimits; only the fields actually present in YAML are overridden.
-    const auto partial_path = write_identity(
-        "partial.yaml",
-        "  max_connections_per_source: 1\n"
-        "  overload_write_timeout_ms: 120\n");
+    const auto partial_path = write_identity("partial.yaml",
+                                             "  max_connections_per_source: 1\n"
+                                             "  overload_write_timeout_ms: 120\n");
     const auto partial = mine_teleop::load_signaling_identity_config(partial_path);
-    expect(
-        partial.connection_limits.max_active_connections ==
-            defaults.connection_limits.max_active_connections,
-        "omitted max_active_connections did not inherit the R05 default");
-    expect(
-        partial.connection_limits.max_pending_http_connections ==
-            defaults.connection_limits.max_pending_http_connections,
-        "omitted max_pending_http_connections did not inherit the R05 default");
-    expect(
-        partial.connection_limits.max_websocket_connections ==
-            defaults.connection_limits.max_websocket_connections,
-        "omitted max_websocket_connections did not inherit the R05 default");
-    expect(
-        partial.connection_limits.listen_backlog == defaults.connection_limits.listen_backlog,
-        "omitted listen_backlog did not inherit the R05 default");
-    expect(
-        partial.connection_limits.header_read_timeout ==
-            defaults.connection_limits.header_read_timeout,
-        "omitted header_read_timeout_ms did not inherit the R05 default");
+    expect(partial.connection_limits.max_active_connections ==
+               defaults.connection_limits.max_active_connections,
+           "omitted max_active_connections did not inherit the R05 default");
+    expect(partial.connection_limits.max_pending_http_connections ==
+               defaults.connection_limits.max_pending_http_connections,
+           "omitted max_pending_http_connections did not inherit the R05 default");
+    expect(partial.connection_limits.max_websocket_connections ==
+               defaults.connection_limits.max_websocket_connections,
+           "omitted max_websocket_connections did not inherit the R05 default");
+    expect(partial.connection_limits.listen_backlog == defaults.connection_limits.listen_backlog,
+           "omitted listen_backlog did not inherit the R05 default");
+    expect(partial.connection_limits.header_read_timeout ==
+               defaults.connection_limits.header_read_timeout,
+           "omitted header_read_timeout_ms did not inherit the R05 default");
     expect(
         partial.connection_limits.body_read_timeout == defaults.connection_limits.body_read_timeout,
         "omitted body_read_timeout_ms did not inherit the R05 default");
-    expect(
-        partial.connection_limits.response_write_timeout ==
-            defaults.connection_limits.response_write_timeout,
-        "omitted response_write_timeout_ms did not inherit the R05 default");
-    expect(
-        partial.connection_limits.max_connections_per_source == 1,
-        "present max_connections_per_source override was not applied in a partial mapping");
-    expect(
-        partial.connection_limits.overload_write_timeout == std::chrono::milliseconds(120),
-        "present overload_write_timeout_ms override was not applied in a partial mapping");
+    expect(partial.connection_limits.response_write_timeout ==
+               defaults.connection_limits.response_write_timeout,
+           "omitted response_write_timeout_ms did not inherit the R05 default");
+    expect(partial.connection_limits.max_connections_per_source == 1,
+           "present max_connections_per_source override was not applied in a partial mapping");
+    expect(partial.connection_limits.overload_write_timeout == std::chrono::milliseconds(120),
+           "present overload_write_timeout_ms override was not applied in a partial mapping");
 
     // Behavioral proof: the per_source=1 override actually configures the
     // server. A second loopback connection is rejected with 503 even though the
     // default per-source budget (48) would accept it.
     {
       mine_teleop::SimpleHttpServer server(
-          "127.0.0.1",
-          0,
-          [](const mine_teleop::HttpRequest&) { return mine_teleop::ServerResponse::text(200, "ok"); },
-          1024,
-          {},
-          parsed.connection_limits);
+          "127.0.0.1", 0,
+          [](const mine_teleop::HttpRequest&) {
+            return mine_teleop::ServerResponse::text(200, "ok");
+          },
+          1024, {}, parsed.connection_limits);
       server.start();
       const int first = raw_http_connect(server.port());
       const int second = raw_http_connect(server.port());
       const auto second_response = raw_receive_until_close(second);
       ::close(second);
-      expect(
-          second_response.starts_with("HTTP/1.1 503 "),
-          "parsed per-source=1 override did not reach and constrain the server");
+      expect(second_response.starts_with("HTTP/1.1 503 "),
+             "parsed per-source=1 override did not reach and constrain the server");
       ::close(first);
       server.stop();
     }
 
-    const auto expect_invalid = [&](std::string_view name,
-                                    std::string_view limits_block,
+    const auto expect_invalid = [&](std::string_view name, std::string_view limits_block,
                                     std::string_view expected_field) {
       const auto path = write_identity(name, limits_block);
       std::string message;
@@ -3652,43 +3612,43 @@ void test_signaling_connection_limits_config() {
       } catch (const std::exception& error) {
         message = error.what();
       }
-      expect(
-          message.find(expected_field) != std::string::npos,
-          std::string("invalid connection_limits did not reject naming the field; expected '") +
-              std::string(expected_field) + "' in: " + message);
+      expect(message.find(expected_field) != std::string::npos,
+             std::string("invalid connection_limits did not reject naming the field; expected '") +
+                 std::string(expected_field) + "' in: " + message);
     };
 
     expect_invalid("active-zero.yaml", "  max_active_connections: 0\n", "max_active_connections");
-    expect_invalid("pending-zero.yaml", "  max_pending_http_connections: 0\n", "max_pending_http_connections");
-    expect_invalid("wss-zero.yaml", "  max_websocket_connections: 0\n", "max_websocket_connections");
-    expect_invalid("per-source-zero.yaml", "  max_connections_per_source: 0\n", "max_connections_per_source");
+    expect_invalid("pending-zero.yaml", "  max_pending_http_connections: 0\n",
+                   "max_pending_http_connections");
+    expect_invalid("wss-zero.yaml", "  max_websocket_connections: 0\n",
+                   "max_websocket_connections");
+    expect_invalid("per-source-zero.yaml", "  max_connections_per_source: 0\n",
+                   "max_connections_per_source");
     expect_invalid("backlog-zero.yaml", "  listen_backlog: 0\n", "listen_backlog");
     expect_invalid("header-zero.yaml", "  header_read_timeout_ms: 0\n", "header_read_timeout_ms");
-    expect_invalid("header-negative.yaml", "  header_read_timeout_ms: -1\n", "header_read_timeout_ms");
+    expect_invalid("header-negative.yaml", "  header_read_timeout_ms: -1\n",
+                   "header_read_timeout_ms");
     expect_invalid("body-zero.yaml", "  body_read_timeout_ms: 0\n", "body_read_timeout_ms");
-    expect_invalid("response-zero.yaml", "  response_write_timeout_ms: 0\n", "response_write_timeout_ms");
-    expect_invalid("overload-zero.yaml", "  overload_write_timeout_ms: 0\n", "overload_write_timeout_ms");
-    expect_invalid(
-        "header-overflow.yaml",
-        "  header_read_timeout_ms: 9223372036854775808\n",
-        "header_read_timeout_ms");
-    expect_invalid(
-        "pending-gt-active.yaml",
-        "  max_active_connections: 2\n"
-        "  max_pending_http_connections: 3\n",
-        "max_pending_http_connections");
-    expect_invalid(
-        "wss-gt-active.yaml",
-        "  max_active_connections: 2\n"
-        "  max_pending_http_connections: 2\n"
-        "  max_websocket_connections: 3\n",
-        "max_websocket_connections");
-    expect_invalid(
-        "no-wss-capacity.yaml",
-        "  max_active_connections: 2\n"
-        "  max_pending_http_connections: 2\n"
-        "  max_websocket_connections: 1\n",
-        "WebSocket");
+    expect_invalid("response-zero.yaml", "  response_write_timeout_ms: 0\n",
+                   "response_write_timeout_ms");
+    expect_invalid("overload-zero.yaml", "  overload_write_timeout_ms: 0\n",
+                   "overload_write_timeout_ms");
+    expect_invalid("header-overflow.yaml", "  header_read_timeout_ms: 9223372036854775808\n",
+                   "header_read_timeout_ms");
+    expect_invalid("pending-gt-active.yaml",
+                   "  max_active_connections: 2\n"
+                   "  max_pending_http_connections: 3\n",
+                   "max_pending_http_connections");
+    expect_invalid("wss-gt-active.yaml",
+                   "  max_active_connections: 2\n"
+                   "  max_pending_http_connections: 2\n"
+                   "  max_websocket_connections: 3\n",
+                   "max_websocket_connections");
+    expect_invalid("no-wss-capacity.yaml",
+                   "  max_active_connections: 2\n"
+                   "  max_pending_http_connections: 2\n"
+                   "  max_websocket_connections: 1\n",
+                   "WebSocket");
   } catch (...) {
     std::filesystem::remove_all(root);
     throw;
@@ -3697,120 +3657,91 @@ void test_signaling_connection_limits_config() {
 }
 
 void test_argon2id_credentials_and_login_concurrency() {
-  constexpr std::array<std::uint8_t, 16> salt{
-      0x52, 0x30, 0x34, 0x2d, 0x61, 0x72, 0x67, 0x6f,
-      0x6e, 0x32, 0x69, 0x64, 0x2d, 0x74, 0x65, 0x73};
+  constexpr std::array<std::uint8_t, 16> salt{0x52, 0x30, 0x34, 0x2d, 0x61, 0x72, 0x67, 0x6f,
+                                              0x6e, 0x32, 0x69, 0x64, 0x2d, 0x74, 0x65, 0x73};
   const auto verifier = mine_teleop::hash_argon2id_password("correct-hash-password", salt);
   std::string reason;
-  expect(
-      mine_teleop::validate_argon2id_verifier(
-          verifier, mine_teleop::default_authentication_cost_policy(), &reason),
-      "generated Argon2id verifier did not satisfy the configured policy");
-  expect(
-      mine_teleop::verify_argon2id_password(
-          verifier, "correct-hash-password", mine_teleop::default_authentication_cost_policy()),
-      "Argon2id verifier rejected its source password");
-  expect(
-      !mine_teleop::verify_argon2id_password(
-          verifier, "wrong-hash-password", mine_teleop::default_authentication_cost_policy()),
-      "Argon2id verifier accepted a wrong password");
+  expect(mine_teleop::validate_argon2id_verifier(
+             verifier, mine_teleop::default_authentication_cost_policy(), &reason),
+         "generated Argon2id verifier did not satisfy the configured policy");
+  expect(mine_teleop::verify_argon2id_password(verifier, "correct-hash-password",
+                                               mine_teleop::default_authentication_cost_policy()),
+         "Argon2id verifier rejected its source password");
+  expect(!mine_teleop::verify_argon2id_password(verifier, "wrong-hash-password",
+                                                mine_teleop::default_authentication_cost_policy()),
+         "Argon2id verifier accepted a wrong password");
   const auto& default_policy = mine_teleop::default_authentication_cost_policy();
-  expect(
-      default_policy.memory_kib == 64U * 1024U && default_policy.time_cost == 3 &&
-          default_policy.parallelism == 1,
-      "default authentication cost policy no longer accepts add_driver.sh Argon2id parameters");
+  expect(default_policy.memory_kib == 64U * 1024U && default_policy.time_cost == 3 &&
+             default_policy.parallelism == 1,
+         "default authentication cost policy no longer accepts add_driver.sh Argon2id parameters");
   auto excessive_cost = verifier;
   const auto cost_begin = excessive_cost.find("m=65536");
-  expect(cost_begin != std::string::npos, "generated verifier did not use the expected default memory cost");
+  expect(cost_begin != std::string::npos,
+         "generated verifier did not use the expected default memory cost");
   excessive_cost.replace(cost_begin, std::string("m=65536").size(), "m=262145");
-  expect(
-      !mine_teleop::validate_argon2id_verifier(
-          excessive_cost, default_policy, &reason),
-      "out-of-policy Argon2id memory cost was accepted");
+  expect(!mine_teleop::validate_argon2id_verifier(excessive_cost, default_policy, &reason),
+         "out-of-policy Argon2id memory cost was accepted");
   auto excessive_time = verifier;
   const auto time_begin = excessive_time.find("t=3");
-  expect(time_begin != std::string::npos, "generated verifier did not use the expected default time cost");
+  expect(time_begin != std::string::npos,
+         "generated verifier did not use the expected default time cost");
   excessive_time.replace(time_begin, std::string("t=3").size(), "t=11");
-  expect(
-      !mine_teleop::validate_argon2id_verifier(excessive_time, default_policy, &reason),
-      "out-of-policy Argon2id time cost was accepted");
+  expect(!mine_teleop::validate_argon2id_verifier(excessive_time, default_policy, &reason),
+         "out-of-policy Argon2id time cost was accepted");
   auto excessive_parallelism = verifier;
   const auto parallelism_begin = excessive_parallelism.find("p=1");
-  expect(
-      parallelism_begin != std::string::npos,
-      "generated verifier did not use the expected default parallelism");
+  expect(parallelism_begin != std::string::npos,
+         "generated verifier did not use the expected default parallelism");
   excessive_parallelism.replace(parallelism_begin, std::string("p=1").size(), "p=5");
-  expect(
-      !mine_teleop::validate_argon2id_verifier(excessive_parallelism, default_policy, &reason),
-      "out-of-policy Argon2id parallelism was accepted");
+  expect(!mine_teleop::validate_argon2id_verifier(excessive_parallelism, default_policy, &reason),
+         "out-of-policy Argon2id parallelism was accepted");
   auto excessive_encoded = verifier;
   excessive_encoded.append(default_policy.maximum_encoded_bytes, 'A');
-  expect(
-      !mine_teleop::validate_argon2id_verifier(excessive_encoded, default_policy, &reason),
-      "over-budget Argon2id PHC verifier length was accepted");
-  expect(
-      !mine_teleop::validate_argon2id_verifier(
-          "$argon2id$v=19$m=65536,t=3,p=1$not*base64$also-not-base64",
-          default_policy,
-          &reason),
-      "malformed Argon2id PHC verifier was accepted");
+  expect(!mine_teleop::validate_argon2id_verifier(excessive_encoded, default_policy, &reason),
+         "over-budget Argon2id PHC verifier length was accepted");
+  expect(!mine_teleop::validate_argon2id_verifier(
+             "$argon2id$v=19$m=65536,t=3,p=1$not*base64$also-not-base64", default_policy, &reason),
+         "malformed Argon2id PHC verifier was accepted");
 
   auto tuned_policy = default_policy;
   tuned_policy.memory_kib = tuned_policy.minimum_memory_kib;
   tuned_policy.time_cost = 1;
   tuned_policy.maximum_time_cost = 2;
-  expect(
-      mine_teleop::validate_authentication_cost_policy(tuned_policy, &reason),
-      "valid tuned authentication cost policy was rejected");
-  const auto tuned_verifier = mine_teleop::hash_argon2id_password(
-      "tuned-hash-password",
-      salt,
-      tuned_policy);
-  expect(
-      tuned_verifier.find(
-          "m=" + std::to_string(tuned_policy.memory_kib) + ",t=1,p=1") != std::string::npos,
-      "tuned verifier did not use the selected authentication cost policy");
-  expect(
-      !mine_teleop::validate_argon2id_verifier(tuned_verifier, default_policy, &reason),
-      "a verifier with an otherwise legal but different authentication cost was accepted");
+  expect(mine_teleop::validate_authentication_cost_policy(tuned_policy, &reason),
+         "valid tuned authentication cost policy was rejected");
+  const auto tuned_verifier =
+      mine_teleop::hash_argon2id_password("tuned-hash-password", salt, tuned_policy);
+  expect(tuned_verifier.find("m=" + std::to_string(tuned_policy.memory_kib) + ",t=1,p=1") !=
+             std::string::npos,
+         "tuned verifier did not use the selected authentication cost policy");
+  expect(!mine_teleop::validate_argon2id_verifier(tuned_verifier, default_policy, &reason),
+         "a verifier with an otherwise legal but different authentication cost was accepted");
   const auto& tuned_dummy = mine_teleop::dummy_argon2id_verifier(tuned_policy);
   const auto& tuned_dummy_again = mine_teleop::dummy_argon2id_verifier(tuned_policy);
-  expect(
-      &tuned_dummy == &tuned_dummy_again &&
-          tuned_dummy.find(
-              "m=" + std::to_string(tuned_policy.memory_kib) + ",t=1,p=1") !=
-              std::string::npos &&
-          mine_teleop::validate_argon2id_verifier(tuned_dummy, tuned_policy, &reason),
-      "dummy Argon2id verifier was not cached from the selected authentication cost policy");
+  expect(&tuned_dummy == &tuned_dummy_again &&
+             tuned_dummy.find("m=" + std::to_string(tuned_policy.memory_kib) + ",t=1,p=1") !=
+                 std::string::npos &&
+             mine_teleop::validate_argon2id_verifier(tuned_dummy, tuned_policy, &reason),
+         "dummy Argon2id verifier was not cached from the selected authentication cost policy");
   auto short_digest_policy = default_policy;
   short_digest_policy.hash_length = 16;
+  expect(mine_teleop::validate_authentication_cost_policy(short_digest_policy, &reason),
+         "valid short-digest authentication cost policy was rejected");
+  const auto short_digest_verifier =
+      mine_teleop::hash_argon2id_password("short-digest-password", salt, short_digest_policy);
   expect(
-      mine_teleop::validate_authentication_cost_policy(short_digest_policy, &reason),
-      "valid short-digest authentication cost policy was rejected");
-  const auto short_digest_verifier = mine_teleop::hash_argon2id_password(
-      "short-digest-password",
-      salt,
-      short_digest_policy);
-  expect(
-      mine_teleop::validate_argon2id_verifier(
-          short_digest_verifier,
-          short_digest_policy,
-          &reason) &&
-          !mine_teleop::validate_argon2id_verifier(
-              short_digest_verifier,
-              default_policy,
-              &reason),
+      mine_teleop::validate_argon2id_verifier(short_digest_verifier, short_digest_policy,
+                                              &reason) &&
+          !mine_teleop::validate_argon2id_verifier(short_digest_verifier, default_policy, &reason),
       "a verifier with a different digest length was accepted by the selected policy");
   auto invalid_policy = tuned_policy;
   invalid_policy.maximum_memory_kib = invalid_policy.minimum_memory_kib - 1;
-  expect(
-      !mine_teleop::validate_authentication_cost_policy(invalid_policy, &reason),
-      "invalid authentication cost policy bounds were accepted");
-  expect(
-      mine_teleop::constant_time_equal("fixed-token", "fixed-token") &&
-          !mine_teleop::constant_time_equal("fixed-token", "other-token") &&
-          !mine_teleop::constant_time_equal("fixed-token", "short"),
-      "constant-time equal-length secret helper has an incorrect result contract");
+  expect(!mine_teleop::validate_authentication_cost_policy(invalid_policy, &reason),
+         "invalid authentication cost policy bounds were accepted");
+  expect(mine_teleop::constant_time_equal("fixed-token", "fixed-token") &&
+             !mine_teleop::constant_time_equal("fixed-token", "other-token") &&
+             !mine_teleop::constant_time_equal("fixed-token", "short"),
+         "constant-time equal-length secret helper has an incorrect result contract");
   std::string temporary_secret = "temporary-password";
   mine_teleop::cleanse_secret(temporary_secret);
   expect(temporary_secret.empty(), "secret cleansing did not release the owned string");
@@ -3820,15 +3751,13 @@ void test_argon2id_credentials_and_login_concurrency() {
   invalid_legacy.driver_password_verifiers.clear();
   invalid_legacy.device_tokens = {{"vehicle-1", "device-token"}};
   invalid_legacy.driver_vehicle_permissions = {{"legacy-driver", {"vehicle-1"}}};
-  expect_throws(
-      [&] { mine_teleop::SignalingService service(invalid_legacy); },
-      "legacy plaintext credentials were accepted without an explicit migration switch");
+  expect_throws([&] { mine_teleop::SignalingService service(invalid_legacy); },
+                "legacy plaintext credentials were accepted without an explicit migration switch");
   auto expired_legacy = invalid_legacy;
   expired_legacy.allow_legacy_passwords = true;
   expired_legacy.legacy_passwords_remove_by = "2000-01-01";
-  expect_throws(
-      [&] { mine_teleop::SignalingService service(expired_legacy); },
-      "legacy plaintext credentials were accepted after their removal deadline");
+  expect_throws([&] { mine_teleop::SignalingService service(expired_legacy); },
+                "legacy plaintext credentials were accepted after their removal deadline");
 
   mine_teleop::SignalingServerConfig invalid_verifier;
   invalid_verifier.driver_passwords.clear();
@@ -3836,9 +3765,8 @@ void test_argon2id_credentials_and_login_concurrency() {
   invalid_verifier.authentication_cost_policy = default_policy;
   invalid_verifier.device_tokens = {{"vehicle-1", "device-token"}};
   invalid_verifier.driver_vehicle_permissions = {{"hash-driver", {"vehicle-1"}}};
-  expect_throws(
-      [&] { mine_teleop::SignalingService service(invalid_verifier); },
-      "out-of-policy Argon2id verifier was accepted at service startup");
+  expect_throws([&] { mine_teleop::SignalingService service(invalid_verifier); },
+                "out-of-policy Argon2id verifier was accepted at service startup");
 
   mine_teleop::SignalingServerConfig incompatible_config;
   incompatible_config.driver_passwords.clear();
@@ -3846,9 +3774,8 @@ void test_argon2id_credentials_and_login_concurrency() {
   incompatible_config.driver_password_verifiers = {{"hash-driver", tuned_verifier}};
   incompatible_config.device_tokens = {{"vehicle-1", "device-token"}};
   incompatible_config.driver_vehicle_permissions = {{"hash-driver", {"vehicle-1"}}};
-  expect_throws(
-      [&] { mine_teleop::SignalingService service(incompatible_config); },
-      "service accepted a real verifier outside its selected authentication cost policy");
+  expect_throws([&] { mine_teleop::SignalingService service(incompatible_config); },
+                "service accepted a real verifier outside its selected authentication cost policy");
 
   mine_teleop::SignalingServerConfig config;
   config.driver_passwords.clear();
@@ -3874,19 +3801,18 @@ void test_argon2id_credentials_and_login_concurrency() {
     request.body = body.dump();
     return service.handle(request);
   };
-  const auto online = post(
-      "/vehicles/online",
-      {{"vehicle_id", "vehicle-1"}, {"device_token", "device-token"}, {"connection_id", "hash-test"}});
+  const auto online = post("/vehicles/online", {{"vehicle_id", "vehicle-1"},
+                                                {"device_token", "device-token"},
+                                                {"connection_id", "hash-test"}});
   expect(online.status == 200, "hash login fixture could not bring its vehicle online");
-  const auto generation = mine_teleop::Json::parse(online.body).at("connection_generation").get<std::uint64_t>();
+  const auto generation =
+      mine_teleop::Json::parse(online.body).at("connection_generation").get<std::uint64_t>();
 
   std::atomic<int> first_login_status{-1};
   std::jthread first_login([&] {
-    first_login_status.store(
-        post(
-            "/auth/driver_login",
-            {{"driver_id", "hash-driver"}, {"password", "correct-hash-password"}})
-            .status);
+    first_login_status.store(post("/auth/driver_login", {{"driver_id", "hash-driver"},
+                                                         {"password", "correct-hash-password"}})
+                                 .status);
   });
   const auto active_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   bool verification_active = false;
@@ -3898,41 +3824,33 @@ void test_argon2id_credentials_and_login_concurrency() {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   expect(verification_active, "Argon2id verification slot never became observable");
-  const auto heartbeat = post(
-      "/vehicles/heartbeat",
-      {{"vehicle_id", "vehicle-1"},
-       {"device_token", "device-token"},
-       {"connection_generation", generation}});
-  expect(
-      heartbeat.status == 200,
-      "vehicle heartbeat could not progress while an Argon2id password verification was active");
-  const auto saturated = post(
-      "/auth/driver_login",
-      {{"driver_id", "hash-driver"}, {"password", "wrong-hash-password"}});
-  expect(saturated.status == 429, "bounded password verification capacity did not reject a concurrent login");
+  const auto heartbeat = post("/vehicles/heartbeat", {{"vehicle_id", "vehicle-1"},
+                                                      {"device_token", "device-token"},
+                                                      {"connection_generation", generation}});
+  expect(heartbeat.status == 200,
+         "vehicle heartbeat could not progress while an Argon2id password verification was active");
+  const auto saturated = post("/auth/driver_login",
+                              {{"driver_id", "hash-driver"}, {"password", "wrong-hash-password"}});
+  expect(saturated.status == 429,
+         "bounded password verification capacity did not reject a concurrent login");
   first_login.join();
   expect(first_login_status.load() == 200, "correct Argon2id login failed");
   const auto duplicate = post(
-      "/auth/driver_login",
-      {{"driver_id", "hash-driver"}, {"password", "correct-hash-password"}});
-  expect(
-      duplicate.status == 409,
-      "duplicate Argon2id login did not preserve the online-driver guard");
-  const auto wrong = post(
-      "/auth/driver_login",
-      {{"driver_id", "hash-driver"}, {"password", "wrong-hash-password"}});
+      "/auth/driver_login", {{"driver_id", "hash-driver"}, {"password", "correct-hash-password"}});
+  expect(duplicate.status == 409,
+         "duplicate Argon2id login did not preserve the online-driver guard");
+  const auto wrong = post("/auth/driver_login",
+                          {{"driver_id", "hash-driver"}, {"password", "wrong-hash-password"}});
   expect(wrong.status == 401, "wrong Argon2id password was not rejected");
-  const auto unknown = post(
-      "/auth/driver_login",
-      {{"driver_id", "unknown-hash-driver"}, {"password", "wrong-hash-password"}});
+  const auto unknown = post("/auth/driver_login", {{"driver_id", "unknown-hash-driver"},
+                                                   {"password", "wrong-hash-password"}});
   expect(unknown.status == 401, "unknown driver did not use the generic credential rejection path");
-  const auto revoke = post(
-      "/admin/revoke/driver",
-      {{"id", "hash-driver"}, {"admin_token", "admin-token-with-a-fixed-test-length"}});
+  const auto revoke =
+      post("/admin/revoke/driver",
+           {{"id", "hash-driver"}, {"admin_token", "admin-token-with-a-fixed-test-length"}});
   expect(revoke.status == 200, "admin revoke did not recognize a hash-backed driver");
-  const auto revoked = post(
-      "/auth/driver_login",
-      {{"driver_id", "hash-driver"}, {"password", "correct-hash-password"}});
+  const auto revoked = post("/auth/driver_login",
+                            {{"driver_id", "hash-driver"}, {"password", "correct-hash-password"}});
   expect(revoked.status == 401, "revoked hash-backed driver was allowed to log in");
 }
 
@@ -3946,35 +3864,29 @@ void test_credential_purpose_separation_and_stale_control_replay() {
   config.turn_static_auth_secret = "turn-purpose-static-secret";
   auto service = std::make_shared<mine_teleop::SignalingService>(std::move(config));
   mine_teleop::SimpleHttpServer server(
-      "127.0.0.1",
-      0,
-      [service](const auto& request) { return service->handle(request); },
+      "127.0.0.1", 0, [service](const auto& request) { return service->handle(request); },
       8 * 1024 * 1024,
-      [service](int socket, const auto& request) { return service->handle_websocket(socket, request); });
+      [service](int socket, const auto& request) {
+        return service->handle_websocket(socket, request);
+      });
   server.start();
   const auto base = "http://127.0.0.1:" + std::to_string(server.port());
   mine_teleop::HttpClient http;
 
-  expect(
-      http.post_json(
-              base + "/auth/driver_login",
-              {{"driver_id", "driver-purpose"}, {"password", "vehicle-purpose-device-token"}})
-              .status == 401,
-      "device credential was accepted as a driver password");
-  expect(
-      http.post_json(
-              base + "/vehicles/online",
-              {{"vehicle_id", "vehicle-purpose"},
-               {"device_token", "driver-purpose-password"},
-               {"connection_id", "purpose-invalid-device"}})
-              .status == 401,
-      "driver credential was accepted as a device credential");
+  expect(http.post_json(base + "/auth/driver_login", {{"driver_id", "driver-purpose"},
+                                                      {"password", "vehicle-purpose-device-token"}})
+                 .status == 401,
+         "device credential was accepted as a driver password");
+  expect(http.post_json(base + "/vehicles/online", {{"vehicle_id", "vehicle-purpose"},
+                                                    {"device_token", "driver-purpose-password"},
+                                                    {"connection_id", "purpose-invalid-device"}})
+                 .status == 401,
+         "driver credential was accepted as a device credential");
 
-  const auto online = http.post_json_response(
-      base + "/vehicles/online",
-      {{"vehicle_id", "vehicle-purpose"},
-       {"device_token", "vehicle-purpose-device-token"},
-       {"connection_id", "purpose-device-runtime"}});
+  const auto online = http.post_json_response(base + "/vehicles/online",
+                                              {{"vehicle_id", "vehicle-purpose"},
+                                               {"device_token", "vehicle-purpose-device-token"},
+                                               {"connection_id", "purpose-device-runtime"}});
   const auto generation = online.at("connection_generation").get<std::uint64_t>();
   const auto login = http.post_json_response(
       base + "/auth/driver_login",
@@ -4056,24 +3968,18 @@ void test_credential_purpose_separation_and_stale_control_replay() {
       replacement_control_token);
   const auto stale_received_at_ms = mine_teleop::now_ms();
   const auto stale = receiver.accept(
-      replay,
-      test::clock_sample(
-          mine_teleop::UtcMillis{stale_received_at_ms},
-          mine_teleop::MonotonicMillis{stale_received_at_ms}));
+      replay, test::clock_sample(mine_teleop::UtcMillis{stale_received_at_ms},
+                                 mine_teleop::MonotonicMillis{stale_received_at_ms}));
   expect(
       !stale.accepted && stale.reason == "control_token_invalid",
       "replacement session accepted the stale control token");
   replay.control_token = replacement_control_token;
   const auto fresh_received_at_ms = mine_teleop::now_ms();
-  expect(
-      receiver
-          .accept(
-              replay,
-              test::clock_sample(
-                  mine_teleop::UtcMillis{fresh_received_at_ms},
-                  mine_teleop::MonotonicMillis{fresh_received_at_ms}))
-          .accepted,
-      "replacement control token was rejected");
+  expect(receiver
+             .accept(replay, test::clock_sample(mine_teleop::UtcMillis{fresh_received_at_ms},
+                                                mine_teleop::MonotonicMillis{fresh_received_at_ms}))
+             .accepted,
+         "replacement control token was rejected");
 
   static_cast<void>(http.post_json_response(
       base + "/sessions/" + replacement_session_id + "/end",
@@ -5934,42 +5840,38 @@ void test_websocket_participant_rate_limit_survives_reconnect_and_parallel_socke
   config.websocket_rate_limit_window_ms = 5000;
   auto signaling = std::make_shared<mine_teleop::SignalingService>(std::move(config));
   mine_teleop::SimpleHttpServer server(
-      "127.0.0.1",
-      0,
-      [signaling](const auto& request) { return signaling->handle(request); },
+      "127.0.0.1", 0, [signaling](const auto& request) { return signaling->handle(request); },
       8 * 1024 * 1024,
-      [signaling](int socket, const auto& request) { return signaling->handle_websocket(socket, request); });
+      [signaling](int socket, const auto& request) {
+        return signaling->handle_websocket(socket, request);
+      });
   server.start();
   const auto base = "http://127.0.0.1:" + std::to_string(server.port());
   mine_teleop::HttpClient http;
-  static_cast<void>(http.post_json_response(
-      base + "/vehicles/online",
-      {{"vehicle_id", "vehicle-001"},
-       {"device_token", "vehicle-secret-1"},
-       {"connection_id", "wss-rate-vehicle"}}));
-  const auto login = http.post_json_response(
-      base + "/auth/driver_login",
-      {{"driver_id", "driver-console-001"}, {"password", "dev-password"}});
+  static_cast<void>(
+      http.post_json_response(base + "/vehicles/online", {{"vehicle_id", "vehicle-001"},
+                                                          {"device_token", "vehicle-secret-1"},
+                                                          {"connection_id", "wss-rate-vehicle"}}));
+  const auto login =
+      http.post_json_response(base + "/auth/driver_login",
+                              {{"driver_id", "driver-console-001"}, {"password", "dev-password"}});
   const auto token = login.at("token").get<std::string>();
   const auto session = http.post_json_response(
       base + "/sessions",
       {{"driver_id", "driver-console-001"}, {"vehicle_id", "vehicle-001"}, {"token", token}});
   const auto websocket_url = mine_teleop::signaling_websocket_url(
-      base,
-      session.at("session_id").get<std::string>(),
-      "driver-console-001");
+      base, session.at("session_id").get<std::string>(), "driver-console-001");
   const mine_teleop::HttpHeaders websocket_headers{{"X-Mine-Teleop-Driver-Token", token}};
-  const mine_teleop::Json quota_message = {
-      {"event", "signaling_delivery_ack"}, {"delivery_cursor", std::uint64_t{0}}};
+  const mine_teleop::Json quota_message = {{"event", "signaling_delivery_ack"},
+                                           {"delivery_cursor", std::uint64_t{0}}};
 
   mine_teleop::WebSocketClient first;
   first.connect(websocket_url, websocket_headers);
   first.send_json(quota_message);
   const auto first_result = first.receive_json(std::chrono::seconds(1));
-  expect(
-      first_result.status == mine_teleop::WebSocketReceiveStatus::Message &&
-          first_result.message.value("event", "") == "signaling_delivery_acknowledged",
-      "first websocket quota message was not accepted");
+  expect(first_result.status == mine_teleop::WebSocketReceiveStatus::Message &&
+             first_result.message.value("event", "") == "signaling_delivery_acknowledged",
+         "first websocket quota message was not accepted");
   first.close();
 
   mine_teleop::WebSocketClient second;
@@ -5980,7 +5882,8 @@ void test_websocket_participant_rate_limit_survives_reconnect_and_parallel_socke
   std::array<std::string, 2> events;
   std::array<std::thread, 2> senders{
       std::thread([&] {
-        while (!send_parallel.load()) std::this_thread::yield();
+        while (!send_parallel.load())
+          std::this_thread::yield();
         second.send_json(quota_message);
         const auto result = second.receive_json(std::chrono::seconds(1));
         if (result.status == mine_teleop::WebSocketReceiveStatus::Message) {
@@ -5988,7 +5891,8 @@ void test_websocket_participant_rate_limit_survives_reconnect_and_parallel_socke
         }
       }),
       std::thread([&] {
-        while (!send_parallel.load()) std::this_thread::yield();
+        while (!send_parallel.load())
+          std::this_thread::yield();
         third.send_json(quota_message);
         const auto result = third.receive_json(std::chrono::seconds(1));
         if (result.status == mine_teleop::WebSocketReceiveStatus::Message) {
@@ -5996,13 +5900,15 @@ void test_websocket_participant_rate_limit_survives_reconnect_and_parallel_socke
         }
       })};
   send_parallel.store(true);
-  for (auto& sender : senders) sender.join();
-  expect(
-      std::count(events.begin(), events.end(), "signaling_delivery_acknowledged") == 1 &&
-          std::count(events.begin(), events.end(), "signaling_rate_limited") == 1,
-      "reconnect or parallel websocket sockets received independent participant quotas");
-  if (events[0] == "signaling_delivery_acknowledged") second.close();
-  if (events[1] == "signaling_delivery_acknowledged") third.close();
+  for (auto& sender : senders)
+    sender.join();
+  expect(std::count(events.begin(), events.end(), "signaling_delivery_acknowledged") == 1 &&
+             std::count(events.begin(), events.end(), "signaling_rate_limited") == 1,
+         "reconnect or parallel websocket sockets received independent participant quotas");
+  if (events[0] == "signaling_delivery_acknowledged")
+    second.close();
+  if (events[1] == "signaling_delivery_acknowledged")
+    third.close();
   server.stop();
 }
 
@@ -6077,15 +5983,13 @@ void test_websocket_client_retains_split_server_frame() {
   auto frame_header_sent = std::make_shared<std::atomic<bool>>(false);
   auto release_payload = std::make_shared<std::atomic<bool>>(false);
   mine_teleop::SimpleHttpServer server(
-      "127.0.0.1",
-      0,
-      [](const auto&) {
-        return mine_teleop::ServerResponse::json(404, {{"error", "not found"}});
-      },
+      "127.0.0.1", 0,
+      [](const auto&) { return mine_teleop::ServerResponse::json(404, {{"error", "not found"}}); },
       8 * 1024 * 1024,
       [frame_header_sent, release_payload](int socket, const auto& request) {
         const auto key = request.headers.find("sec-websocket-key");
-        if (request.path != "/split-frame" || key == request.headers.end()) return false;
+        if (request.path != "/split-frame" || key == request.headers.end())
+          return false;
         raw_send_all(
             socket,
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -6101,7 +6005,8 @@ void test_websocket_client_retains_split_server_frame() {
         while (!release_payload->load() && std::chrono::steady_clock::now() < deadline) {
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        if (release_payload->load()) raw_send_all(socket, payload);
+        if (release_payload->load())
+          raw_send_all(socket, payload);
         return true;
       });
   server.start();
@@ -6114,15 +6019,13 @@ void test_websocket_client_retains_split_server_frame() {
   }
   expect(frame_header_sent->load(), "split-frame fixture did not send the frame header");
   const auto partial = client.receive_json(std::chrono::milliseconds(20));
-  expect(
-      partial.status == mine_teleop::WebSocketReceiveStatus::Timeout,
-      "partial server websocket frame was treated as a corrupt message");
+  expect(partial.status == mine_teleop::WebSocketReceiveStatus::Timeout,
+         "partial server websocket frame was treated as a corrupt message");
   release_payload->store(true);
   const auto completed = client.receive_json(std::chrono::seconds(1));
-  expect(
-      completed.status == mine_teleop::WebSocketReceiveStatus::Message &&
-          completed.message.value("event", "") == "split-frame-complete",
-      "split server websocket frame was not retained across receive calls");
+  expect(completed.status == mine_teleop::WebSocketReceiveStatus::Message &&
+             completed.message.value("event", "") == "split-frame-complete",
+         "split server websocket frame was not retained across receive calls");
   client.close();
   server.stop();
 }
@@ -6134,60 +6037,47 @@ void test_signaling_queue_prunes_expired_messages_and_backpressures() {
   config.max_signaling_queue_bytes = 1024 * 1024;
   auto signaling = std::make_shared<mine_teleop::SignalingService>(config);
   mine_teleop::SimpleHttpServer server(
-      "127.0.0.1",
-      0,
-      [signaling](const auto& request) { return signaling->handle(request); });
+      "127.0.0.1", 0, [signaling](const auto& request) { return signaling->handle(request); });
   server.start();
   const auto base = "http://127.0.0.1:" + std::to_string(server.port());
   mine_teleop::HttpClient http;
-  const auto online = http.post_json_response(
-      base + "/vehicles/online",
-      {{"vehicle_id", "vehicle-001"},
-       {"device_token", "dev-device-secret"},
-       {"connection_id", "queue-capacity-vehicle"}});
+  const auto online = http.post_json_response(base + "/vehicles/online",
+                                              {{"vehicle_id", "vehicle-001"},
+                                               {"device_token", "dev-device-secret"},
+                                               {"connection_id", "queue-capacity-vehicle"}});
   const auto generation = online.at("connection_generation").get<std::uint64_t>();
-  const auto login = http.post_json_response(
-      base + "/auth/driver_login",
-      {{"driver_id", "driver-console-001"}, {"password", "dev-password"}});
+  const auto login =
+      http.post_json_response(base + "/auth/driver_login",
+                              {{"driver_id", "driver-console-001"}, {"password", "dev-password"}});
   const auto token = login.at("token").get<std::string>();
   const auto session = http.post_json_response(
       base + "/sessions",
       {{"driver_id", "driver-console-001"}, {"vehicle_id", "vehicle-001"}, {"token", token}});
   const auto session_id = session.at("session_id").get<std::string>();
   const auto message = [&](std::uint64_t sequence) {
-    auto value = signaling_request(
-        session_id,
-        sequence,
-        "vehicle-001",
-        "driver-console-001",
-        "device_token",
-        "dev-device-secret",
-        "ice_candidate",
-        {{"candidate", "candidate:queue-" + std::to_string(sequence)}});
+    auto value = signaling_request(session_id, sequence, "vehicle-001", "driver-console-001",
+                                   "device_token", "dev-device-secret", "ice_candidate",
+                                   {{"candidate", "candidate:queue-" + std::to_string(sequence)}});
     value["connection_generation"] = generation;
     return value;
   };
   const auto endpoint = base + "/signaling/" + session_id + "/messages";
-  expect(
-      http.post_json_response(endpoint, message(1)).value("queued", std::size_t{0}) == 1,
-      "first signaling queue item was not accepted");
+  expect(http.post_json_response(endpoint, message(1)).value("queued", std::size_t{0}) == 1,
+         "first signaling queue item was not accepted");
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
-  expect(
-      http.post_json_response(endpoint, message(2)).value("queued", std::size_t{0}) == 1,
-      "expired signaling queue item was not pruned at enqueue");
-  expect(
-      http.post_json_response(endpoint, message(3)).value("queued", std::size_t{0}) == 2,
-      "signaling queue did not reach its configured capacity");
+  expect(http.post_json_response(endpoint, message(2)).value("queued", std::size_t{0}) == 1,
+         "expired signaling queue item was not pruned at enqueue");
+  expect(http.post_json_response(endpoint, message(3)).value("queued", std::size_t{0}) == 2,
+         "signaling queue did not reach its configured capacity");
   const auto rejected = http.post_json(endpoint, message(4));
   expect(rejected.status == 429, "full signaling queue did not return explicit backpressure");
-  expect(
-      mine_teleop::Json::parse(rejected.body).value("error", "").find("capacity") != std::string::npos,
-      "signaling queue backpressure response did not explain the capacity limit");
+  expect(mine_teleop::Json::parse(rejected.body).value("error", "").find("capacity") !=
+             std::string::npos,
+         "signaling queue backpressure response did not explain the capacity limit");
   const auto health = signaling->health();
-  expect(
-      health.value("queued_signaling_messages", std::size_t{0}) == 2 &&
-          health.value("signaling_queue_rejections", std::uint64_t{0}) == 1,
-      "signaling queue health counters do not reflect capacity backpressure");
+  expect(health.value("queued_signaling_messages", std::size_t{0}) == 2 &&
+             health.value("signaling_queue_rejections", std::uint64_t{0}) == 1,
+         "signaling queue health counters do not reflect capacity backpressure");
   server.stop();
 }
 
@@ -6497,24 +6387,19 @@ void test_signaling_process_restart_requires_fresh_authority() {
       replacement_control_token);
   const auto old_replay_received_at_ms = mine_teleop::now_ms();
   const auto old_replay = receiver.accept(
-      replay,
-      test::clock_sample(
-          mine_teleop::UtcMillis{old_replay_received_at_ms},
-          mine_teleop::MonotonicMillis{old_replay_received_at_ms}));
+      replay, test::clock_sample(mine_teleop::UtcMillis{old_replay_received_at_ms},
+                                 mine_teleop::MonotonicMillis{old_replay_received_at_ms}));
   expect(
       !old_replay.accepted && old_replay.reason == "control_token_invalid",
       "post-restart session accepted the pre-restart control token");
   replay.control_token = replacement_control_token;
   const auto restart_replay_received_at_ms = mine_teleop::now_ms();
-  expect(
-      receiver
-          .accept(
-              replay,
-              test::clock_sample(
-                  mine_teleop::UtcMillis{restart_replay_received_at_ms},
-                  mine_teleop::MonotonicMillis{restart_replay_received_at_ms}))
-          .accepted,
-      "post-restart control token was rejected");
+  expect(receiver
+             .accept(replay, test::clock_sample(
+                                 mine_teleop::UtcMillis{restart_replay_received_at_ms},
+                                 mine_teleop::MonotonicMillis{restart_replay_received_at_ms}))
+             .accepted,
+         "post-restart control token was rejected");
 
   static_cast<void>(driver.disconnect("signaling_restart_test_complete"));
   server->stop();
@@ -7128,34 +7013,26 @@ void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
 
   const auto local_deadline = mine_teleop::detail::local_monotonic_deadline_from_utc_expiry(
       mine_teleop::UtcMillis{2'000},
-      mine_teleop::ClockSample{
-          mine_teleop::UtcMillis{1'000}, mine_teleop::MonotonicMillis{500}});
+      mine_teleop::ClockSample{mine_teleop::UtcMillis{1'000}, mine_teleop::MonotonicMillis{500}});
+  expect(local_deadline.value == 1'500 &&
+             mine_teleop::detail::monotonic_deadline_reached(mine_teleop::MonotonicMillis{1'500},
+                                                             local_deadline.value),
+         "UTC expiry was not converted to the local response-receipt monotonic deadline");
+  expect(!mine_teleop::detail::monotonic_deadline_reached(mine_teleop::MonotonicMillis{-1}, 0) &&
+             mine_teleop::detail::monotonic_deadline_reached(mine_teleop::MonotonicMillis{0}, 0),
+         "a zero monotonic deadline was treated as an unset sentinel");
   expect(
-      local_deadline.value == 1'500 &&
-          mine_teleop::detail::monotonic_deadline_reached(
-              mine_teleop::MonotonicMillis{1'500}, local_deadline.value),
-      "UTC expiry was not converted to the local response-receipt monotonic deadline");
-  expect(
-      !mine_teleop::detail::monotonic_deadline_reached(
-          mine_teleop::MonotonicMillis{-1},
-          0) &&
-          mine_teleop::detail::monotonic_deadline_reached(
-              mine_teleop::MonotonicMillis{0},
-              0),
-      "a zero monotonic deadline was treated as an unset sentinel");
-  expect(
-      mine_teleop::detail::saturating_deadline_ms(
-          std::numeric_limits<std::int64_t>::max() - 1,
-          2) == std::numeric_limits<std::int64_t>::max() &&
-          mine_teleop::detail::saturating_deadline_ms(
-              std::numeric_limits<std::int64_t>::min(),
-              std::numeric_limits<std::int64_t>::max()) == -1,
+      mine_teleop::detail::saturating_deadline_ms(std::numeric_limits<std::int64_t>::max() - 1,
+                                                  2) == std::numeric_limits<std::int64_t>::max() &&
+          mine_teleop::detail::saturating_deadline_ms(std::numeric_limits<std::int64_t>::min(),
+                                                      std::numeric_limits<std::int64_t>::max()) ==
+              -1,
       "saturating deadline arithmetic is not safe across its declared int64 domain");
 
   FakeDualClock clock;
   const auto initial = clock.sample();
   const auto audit_path = std::filesystem::temp_directory_path() /
-      ("mine-teleop-dual-clock-" + mine_teleop::random_token(6) + ".jsonl");
+                          ("mine-teleop-dual-clock-" + mine_teleop::random_token(6) + ".jsonl");
   auto config = legacy_signaling_config();
   config.driver_passwords = {{std::string(kDriverId), std::string(kDriverPassword)}};
   config.device_tokens = {{std::string(kVehicleId), std::string(kDeviceToken)}};
@@ -7168,10 +7045,7 @@ void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
   config.native_control_message_ttl_ms = 1'000;
   config.api_rate_limit_requests = 1'000;
   config.audit_log_path = audit_path.string();
-  mine_teleop::SignalingService service(
-      config,
-      {},
-      [&clock] { return clock.sample(); });
+  mine_teleop::SignalingService service(config, {}, [&clock] { return clock.sample(); });
 
   const auto post = [&](std::string path, const mine_teleop::Json& body) {
     mine_teleop::HttpRequest request;
@@ -7192,18 +7066,15 @@ void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
     return service.handle(request);
   };
 
-  const auto online = post(
-      "/vehicles/online",
-      {{"vehicle_id", kVehicleId},
-       {"device_token", kDeviceToken},
-       {"connection_id", "dual-clock-vehicle-connection"}});
+  const auto online =
+      post("/vehicles/online", {{"vehicle_id", kVehicleId},
+                                {"device_token", kDeviceToken},
+                                {"connection_id", "dual-clock-vehicle-connection"}});
   expect(online.status == 200, "dual-clock vehicle did not become online");
-  const auto vehicle_generation = mine_teleop::Json::parse(online.body)
-                                      .at("connection_generation")
-                                      .get<std::uint64_t>();
-  const auto login = post(
-      "/auth/driver_login",
-      {{"driver_id", kDriverId}, {"password", kDriverPassword}});
+  const auto vehicle_generation =
+      mine_teleop::Json::parse(online.body).at("connection_generation").get<std::uint64_t>();
+  const auto login =
+      post("/auth/driver_login", {{"driver_id", kDriverId}, {"password", kDriverPassword}});
   expect(login.status == 200, "dual-clock driver login failed");
   const auto login_body = mine_teleop::Json::parse(login.body);
   const auto driver_token = login_body.at("token").get<std::string>();
@@ -7211,26 +7082,23 @@ void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
       login_body.at("expires_at_ms").get<std::int64_t>() == initial.utc.value + config.token_ttl_ms,
       "driver token wire expiry is not the injected UTC display value");
   const auto session_response = post(
-      "/sessions",
-      {{"driver_id", kDriverId}, {"vehicle_id", kVehicleId}, {"token", driver_token}});
+      "/sessions", {{"driver_id", kDriverId}, {"vehicle_id", kVehicleId}, {"token", driver_token}});
   expect(session_response.status == 200, "dual-clock control session creation failed");
   const auto session = mine_teleop::Json::parse(session_response.body);
   const auto session_id = session.at("session_id").get<std::string>();
   const auto control_token = session.at("control_token").get<std::string>();
-  expect(
-      session.at("control_token_expires_at_utc_ms").get<std::int64_t>() ==
-          initial.utc.value + config.control_token_ttl_ms,
-      "control lease wire expiry is not the injected UTC display value");
+  expect(session.at("control_token_expires_at_utc_ms").get<std::int64_t>() ==
+             initial.utc.value + config.control_token_ttl_ms,
+         "control lease wire expiry is not the injected UTC display value");
 
   const auto ordinary_message = [&](std::uint64_t sequence) {
     const auto sampled_at = clock.sample();
-    auto message = mine_teleop::ProtocolMetadata{
-                       mine_teleop::kProtocolVersion,
-                       std::string(kVehicleId),
-                       std::string(kDriverId),
-                       session_id,
-                       sequence,
-                       sampled_at.utc.value}
+    auto message = mine_teleop::ProtocolMetadata{mine_teleop::kProtocolVersion,
+                                                 std::string(kVehicleId),
+                                                 std::string(kDriverId),
+                                                 session_id,
+                                                 sequence,
+                                                 sampled_at.utc.value}
                        .to_json();
     message["sender"] = kVehicleId;
     message["recipient"] = kDriverId;
@@ -7253,14 +7121,11 @@ void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
     auto payload = command.to_json();
     payload["intent_seq"] = sequence;
     payload["intent_fresh"] = true;
-    auto message = mine_teleop::ProtocolMetadata{
-                       command.protocol_version,
-                       command.vehicle_id,
-                       command.driver_id,
-                       command.session_id,
-                       command.seq,
-                       command.sent_at_utc_ms}
-                       .to_json();
+    auto message =
+        mine_teleop::ProtocolMetadata{
+            command.protocol_version, command.vehicle_id, command.driver_id,
+            command.session_id,       command.seq,        command.sent_at_utc_ms}
+            .to_json();
     message["sender"] = kDriverId;
     message["recipient"] = kVehicleId;
     message["token"] = driver_token;
@@ -7272,17 +7137,15 @@ void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
     return post("/signaling/" + session_id + "/messages", message);
   };
   const auto driver_messages = [&] {
-    return get(
-        "/signaling/" + session_id + "/messages",
-        {{"recipient", std::string(kDriverId)}, {"token", driver_token}});
+    return get("/signaling/" + session_id + "/messages",
+               {{"recipient", std::string(kDriverId)}, {"token", driver_token}});
   };
   const auto vehicle_messages = [&] {
-    return get(
-        "/signaling/" + session_id + "/messages",
-        {{"recipient", std::string(kVehicleId)},
-         {"device_token", std::string(kDeviceToken)},
-         {"connection_generation", std::to_string(vehicle_generation)},
-         {"types", "control_command"}});
+    return get("/signaling/" + session_id + "/messages",
+               {{"recipient", std::string(kVehicleId)},
+                {"device_token", std::string(kDeviceToken)},
+                {"connection_generation", std::to_string(vehicle_generation)},
+                {"types", "control_command"}});
   };
 
   expect(post_signaling(ordinary_message(1)).status == 200, "ordinary message was not queued");
@@ -7290,97 +7153,87 @@ void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
 
   clock.jump_utc(60'000);
   expect(
-      get(
-          "/sessions/" + session_id,
-          {{"actor", std::string(kDriverId)}, {"token", driver_token}})
+      get("/sessions/" + session_id, {{"actor", std::string(kDriverId)}, {"token", driver_token}})
               .status == 200,
       "UTC forward jump prematurely expired the control lease");
-  const auto online_vehicles = get(
-      "/drivers/" + std::string(kDriverId) + "/vehicles",
-      {{"token", driver_token}});
-  expect(
-      online_vehicles.status == 200 &&
-          mine_teleop::Json::parse(online_vehicles.body).at("vehicles").at(0).value("online", false),
-      "UTC forward jump prematurely expired vehicle presence");
-  const auto heartbeat = post(
-      "/vehicles/heartbeat",
-      {{"vehicle_id", kVehicleId},
-       {"device_token", kDeviceToken},
-       {"connection_generation", vehicle_generation}});
+  const auto online_vehicles =
+      get("/drivers/" + std::string(kDriverId) + "/vehicles", {{"token", driver_token}});
+  expect(online_vehicles.status == 200 && mine_teleop::Json::parse(online_vehicles.body)
+                                              .at("vehicles")
+                                              .at(0)
+                                              .value("online", false),
+         "UTC forward jump prematurely expired vehicle presence");
+  const auto heartbeat =
+      post("/vehicles/heartbeat", {{"vehicle_id", kVehicleId},
+                                   {"device_token", kDeviceToken},
+                                   {"connection_generation", vehicle_generation}});
   expect(
       heartbeat.status == 200 &&
           mine_teleop::Json::parse(heartbeat.body).at("last_seen_at_utc_ms").get<std::int64_t>() ==
               clock.sample().utc.value,
       "heartbeat wire timestamp did not retain injected UTC semantics");
   const auto queued_ordinary = driver_messages();
-  expect(
-      queued_ordinary.status == 200 &&
-          mine_teleop::Json::parse(queued_ordinary.body).at("messages").size() == 1,
-      "UTC forward jump prematurely expired an ordinary signaling message");
+  expect(queued_ordinary.status == 200 &&
+             mine_teleop::Json::parse(queued_ordinary.body).at("messages").size() == 1,
+         "UTC forward jump prematurely expired an ordinary signaling message");
   const auto queued_native = vehicle_messages();
-  expect(
-      queued_native.status == 200 &&
-          mine_teleop::Json::parse(queued_native.body).at("messages").size() == 1,
-      "UTC forward jump prematurely expired a native control mailbox message");
+  expect(queued_native.status == 200 &&
+             mine_teleop::Json::parse(queued_native.body).at("messages").size() == 1,
+         "UTC forward jump prematurely expired a native control mailbox message");
 
   clock.jump_utc(-120'000);
   const auto backward_utc_ms = clock.sample().utc.value;
-  expect(post_signaling(ordinary_message(2)).status == 200, "ordinary message after UTC rollback was rejected");
-  expect(post_signaling(control_message(2)).status == 200, "native message after UTC rollback was rejected");
+  expect(post_signaling(ordinary_message(2)).status == 200,
+         "ordinary message after UTC rollback was rejected");
+  expect(post_signaling(control_message(2)).status == 200,
+         "native message after UTC rollback was rejected");
 
   std::ifstream audit_input(audit_path);
   bool observed_backward_utc_audit = false;
   std::string audit_line;
   while (std::getline(audit_input, audit_line)) {
     const auto record = mine_teleop::Json::parse(audit_line);
-    observed_backward_utc_audit = observed_backward_utc_audit ||
+    observed_backward_utc_audit =
+        observed_backward_utc_audit ||
         record.value("sent_at_utc_ms", std::int64_t{0}) == backward_utc_ms;
   }
-  expect(observed_backward_utc_audit, "audit records did not retain injected UTC timestamps after rollback");
+  expect(observed_backward_utc_audit,
+         "audit records did not retain injected UTC timestamps after rollback");
 
   clock.advance_monotonic(config.signaling_message_ttl_ms);
   const auto expired_ordinary = driver_messages();
   const auto expired_native = vehicle_messages();
-  expect(
-      expired_ordinary.status == 200 &&
-          mine_teleop::Json::parse(expired_ordinary.body).at("messages").empty() &&
-          expired_native.status == 200 &&
-          mine_teleop::Json::parse(expired_native.body).at("messages").empty(),
-      "message TTL did not follow monotonic time after UTC discontinuities");
+  expect(expired_ordinary.status == 200 &&
+             mine_teleop::Json::parse(expired_ordinary.body).at("messages").empty() &&
+             expired_native.status == 200 &&
+             mine_teleop::Json::parse(expired_native.body).at("messages").empty(),
+         "message TTL did not follow monotonic time after UTC discontinuities");
 
   clock.advance_monotonic(config.control_token_ttl_ms - config.signaling_message_ttl_ms - 1);
   expect(
-      get(
-          "/sessions/" + session_id,
-          {{"actor", std::string(kDriverId)}, {"token", driver_token}})
+      get("/sessions/" + session_id, {{"actor", std::string(kDriverId)}, {"token", driver_token}})
               .status == 200,
       "control lease expired before its monotonic deadline");
   clock.advance_monotonic(1);
   expect(
-      get(
-          "/sessions/" + session_id,
-          {{"actor", std::string(kDriverId)}, {"token", driver_token}})
+      get("/sessions/" + session_id, {{"actor", std::string(kDriverId)}, {"token", driver_token}})
               .status == 409,
       "control lease remained active beyond its monotonic deadline");
 
-  clock.advance_monotonic(
-      config.vehicle_heartbeat_timeout_ms - config.control_token_ttl_ms +
-      config.signaling_message_ttl_ms);
-  const auto expired_presence = get(
-      "/drivers/" + std::string(kDriverId) + "/vehicles",
-      {{"token", driver_token}});
+  clock.advance_monotonic(config.vehicle_heartbeat_timeout_ms - config.control_token_ttl_ms +
+                          config.signaling_message_ttl_ms);
+  const auto expired_presence =
+      get("/drivers/" + std::string(kDriverId) + "/vehicles", {{"token", driver_token}});
+  expect(expired_presence.status == 200 && !mine_teleop::Json::parse(expired_presence.body)
+                                                .at("vehicles")
+                                                .at(0)
+                                                .value("online", true),
+         "vehicle presence did not expire on its monotonic heartbeat deadline");
+  clock.advance_monotonic(config.token_ttl_ms - config.vehicle_heartbeat_timeout_ms -
+                          config.signaling_message_ttl_ms);
   expect(
-      expired_presence.status == 200 &&
-          !mine_teleop::Json::parse(expired_presence.body).at("vehicles").at(0).value("online", true),
-      "vehicle presence did not expire on its monotonic heartbeat deadline");
-  clock.advance_monotonic(
-      config.token_ttl_ms - config.vehicle_heartbeat_timeout_ms -
-      config.signaling_message_ttl_ms);
-  expect(
-      get(
-          "/drivers/" + std::string(kDriverId) + "/vehicles",
-          {{"token", driver_token}})
-              .status == 401,
+      get("/drivers/" + std::string(kDriverId) + "/vehicles", {{"token", driver_token}}).status ==
+          401,
       "driver token did not expire on its monotonic deadline");
   std::filesystem::remove(audit_path);
 
@@ -7388,10 +7241,8 @@ void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
   auto api_config = legacy_signaling_config();
   api_config.api_rate_limit_requests = 1;
   api_config.api_rate_limit_window_ms = 1'000;
-  mine_teleop::SignalingService api_service(
-      api_config,
-      {},
-      [&api_clock] { return api_clock.sample(); });
+  mine_teleop::SignalingService api_service(api_config, {},
+                                            [&api_clock] { return api_clock.sample(); });
   const auto health_request = [&] {
     mine_teleop::HttpRequest request;
     request.method = "GET";
@@ -7400,7 +7251,8 @@ void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
     request.peer_address = "203.0.113.90";
     return api_service.handle(request);
   };
-  expect(health_request().status == 200 && health_request().status == 429, "API rate window was not enforced");
+  expect(health_request().status == 200 && health_request().status == 429,
+         "API rate window was not enforced");
   api_clock.jump_utc(60'000);
   expect(health_request().status == 429, "UTC forward jump reset the API rate window");
   api_clock.jump_utc(-120'000);
@@ -7416,39 +7268,40 @@ void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
   login_config.login_max_failures = 3;
   login_config.login_failure_window_ms = 1'000;
   login_config.login_lockout_ms = 1'000;
-  mine_teleop::SignalingService login_service(
-      login_config,
-      {},
-      [&login_clock] { return login_clock.sample(); });
+  mine_teleop::SignalingService login_service(login_config, {},
+                                              [&login_clock] { return login_clock.sample(); });
   const auto login_attempt = [&](std::string_view password) {
     mine_teleop::HttpRequest request;
     request.method = "POST";
     request.target = "/auth/driver_login";
     request.path = request.target;
     request.peer_address = "192.0.2.90";
-    request.body = mine_teleop::Json(
-        {{"driver_id", kDriverId}, {"password", std::string(password)}})
-                       .dump();
+    request.body =
+        mine_teleop::Json({{"driver_id", kDriverId}, {"password", std::string(password)}}).dump();
     return login_service.handle(request);
   };
-  expect(login_attempt("wrong-one").status == 401, "first fake-clock login failure was not recorded");
+  expect(login_attempt("wrong-one").status == 401,
+         "first fake-clock login failure was not recorded");
   login_clock.jump_utc(60'000);
-  expect(login_attempt("wrong-two").status == 401, "UTC forward jump reset the pending login failure window");
+  expect(login_attempt("wrong-two").status == 401,
+         "UTC forward jump reset the pending login failure window");
   login_clock.jump_utc(-120'000);
   expect(login_attempt("wrong-three").status == 429, "UTC rollback reset the login failure window");
   expect(login_attempt(kDriverPassword).status == 429, "UTC rollback shortened the login lockout");
   login_clock.advance_monotonic(login_config.login_lockout_ms - 1);
-  expect(login_attempt(kDriverPassword).status == 429, "login lockout expired before its monotonic deadline");
+  expect(login_attempt(kDriverPassword).status == 429,
+         "login lockout expired before its monotonic deadline");
   login_clock.advance_monotonic(1);
-  expect(login_attempt(kDriverPassword).status == 200, "login lockout did not expire on its monotonic deadline");
+  expect(login_attempt(kDriverPassword).status == 200,
+         "login lockout did not expire on its monotonic deadline");
 
-  const auto sampler_audit_path = std::filesystem::temp_directory_path() /
+  const auto sampler_audit_path =
+      std::filesystem::temp_directory_path() /
       ("mine-teleop-throwing-sampler-audit-" + mine_teleop::random_token(6) + ".jsonl");
   auto sampler_audit_config = legacy_signaling_config();
   sampler_audit_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   sampler_audit_config.device_tokens = {{"vehicle-001", "dev-device-secret"}};
-  sampler_audit_config.driver_vehicle_permissions = {
-      {"driver-console-001", {"vehicle-001"}}};
+  sampler_audit_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
   sampler_audit_config.audit_log_path = sampler_audit_path.string();
   sampler_audit_config.connection_reaper_interval_ms = 60 * 1000;
   std::atomic<int> audit_clock_calls{0};
@@ -7464,9 +7317,7 @@ void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
         },
         [&sampler_calls]() -> mine_teleop::ClockSample {
           if (sampler_calls.fetch_add(1, std::memory_order_relaxed) == 0) {
-            return {
-                mine_teleop::UtcMillis{1'700'000'000'000},
-                mine_teleop::MonotonicMillis{0}};
+            return {mine_teleop::UtcMillis{1'700'000'000'000}, mine_teleop::MonotonicMillis{0}};
           }
           throw std::runtime_error("test clock sampler failure");
         });
@@ -7475,16 +7326,14 @@ void test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps() {
     request.target = "/vehicles/online";
     request.path = request.target;
     request.peer_address = "192.0.2.91";
-    request.body = mine_teleop::Json(
-        {{"vehicle_id", "vehicle-001"},
-         {"device_token", "dev-device-secret"},
-         {"connection_id", "throwing-sampler-audit"}})
+    request.body = mine_teleop::Json({{"vehicle_id", "vehicle-001"},
+                                      {"device_token", "dev-device-secret"},
+                                      {"connection_id", "throwing-sampler-audit"}})
                        .dump();
-    expect(
-        sampler_audit_service.handle(request).status == 200 &&
-            audit_clock_calls.load(std::memory_order_relaxed) >= 2 &&
-            sampler_calls.load(std::memory_order_relaxed) == 1,
-        "audit noexcept fallback invoked a throwing clock sampler or aborted the request");
+    expect(sampler_audit_service.handle(request).status == 200 &&
+               audit_clock_calls.load(std::memory_order_relaxed) >= 2 &&
+               sampler_calls.load(std::memory_order_relaxed) == 1,
+           "audit noexcept fallback invoked a throwing clock sampler or aborted the request");
   }
   std::filesystem::remove(sampler_audit_path);
 }
@@ -7617,7 +7466,8 @@ void test_driver_login_failure_rate_limit_and_recovery() {
   reservation_cleanup_config.login_lockout_ms = 1000;
   reservation_cleanup_config.password_verification_max_concurrency = 1;
   reservation_cleanup_config.password_verification_retry_after_ms = 17;
-  const auto reservation_cleanup_audit_path = std::filesystem::path("/tmp") /
+  const auto reservation_cleanup_audit_path =
+      std::filesystem::path("/tmp") /
       ("mine-teleop-login-reservation-" + mine_teleop::random_token(6) + ".jsonl");
   reservation_cleanup_config.audit_log_path = reservation_cleanup_audit_path.string();
   mine_teleop::SignalingService reservation_cleanup_service(reservation_cleanup_config);
@@ -7627,37 +7477,37 @@ void test_driver_login_failure_rate_limit_and_recovery() {
     request.target = "/auth/driver_login";
     request.path = request.target;
     request.body = mine_teleop::Json({
-        {"driver_id", std::string(driver_id)},
-        {"password", "wrong"},
-    }).dump();
+                                         {"driver_id", std::string(driver_id)},
+                                         {"password", "wrong"},
+                                     })
+                       .dump();
     return reservation_cleanup_service.handle(request);
   };
   std::atomic<int> slot_holding_status{0};
-  std::jthread slot_holding_attempt([&] {
-    slot_holding_status.store(reservation_cleanup_login("slot-holding-unknown").status);
-  });
-  const auto verification_active_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  std::jthread slot_holding_attempt(
+      [&] { slot_holding_status.store(reservation_cleanup_login("slot-holding-unknown").status); });
+  const auto verification_active_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (std::chrono::steady_clock::now() < verification_active_deadline &&
-         reservation_cleanup_service.health().value("password_verification_active", std::size_t{0}) != 1) {
+         reservation_cleanup_service.health().value("password_verification_active",
+                                                    std::size_t{0}) != 1) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  expect(
-      reservation_cleanup_service.health().value("password_verification_active", std::size_t{0}) == 1,
-      "reservation cleanup fixture did not occupy the only password verification slot");
+  expect(reservation_cleanup_service.health().value("password_verification_active",
+                                                    std::size_t{0}) == 1,
+         "reservation cleanup fixture did not occupy the only password verification slot");
   const auto slot_exhausted = reservation_cleanup_login("slot-exhausted-unknown");
   expect(slot_exhausted.status == 429, "password verification slot exhaustion was not rejected");
-  expect(
-      mine_teleop::Json::parse(slot_exhausted.body).value("retry_after_ms", 0) ==
-          reservation_cleanup_config.password_verification_retry_after_ms,
-      "password verification slot exhaustion did not retain its own retry budget");
+  expect(mine_teleop::Json::parse(slot_exhausted.body).value("retry_after_ms", 0) ==
+             reservation_cleanup_config.password_verification_retry_after_ms,
+         "password verification slot exhaustion did not retain its own retry budget");
   slot_holding_attempt.join();
-  expect(slot_holding_status.load() == 401, "slot-holding unknown login did not settle as a failure");
-  expect(
-      reservation_cleanup_login("after-slot-one").status == 401,
-      "slot exhaustion leaked a pending login failure reservation");
-  expect(
-      reservation_cleanup_login("after-slot-two").status == 429,
-      "threshold candidate did not establish lockout after reservation cleanup");
+  expect(slot_holding_status.load() == 401,
+         "slot-holding unknown login did not settle as a failure");
+  expect(reservation_cleanup_login("after-slot-one").status == 401,
+         "slot exhaustion leaked a pending login failure reservation");
+  expect(reservation_cleanup_login("after-slot-two").status == 429,
+         "threshold candidate did not establish lockout after reservation cleanup");
   std::ifstream reservation_cleanup_audit_input(reservation_cleanup_audit_path);
   std::size_t reservation_cleanup_failures = 0;
   std::string reservation_cleanup_audit_line;
@@ -7667,9 +7517,8 @@ void test_driver_login_failure_rate_limit_and_recovery() {
       ++reservation_cleanup_failures;
     }
   }
-  expect(
-      reservation_cleanup_failures == 3,
-      "slot exhaustion consumed a pending login failure reservation after rejection");
+  expect(reservation_cleanup_failures == 3,
+         "slot exhaustion consumed a pending login failure reservation after rejection");
   std::filesystem::remove(reservation_cleanup_audit_path);
 
   auto unavailable_audit_config = config;
@@ -7693,15 +7542,13 @@ void test_driver_login_failure_rate_limit_and_recovery() {
     }).dump();
     return unavailable_audit_service.handle(request);
   };
-  expect(
-      unavailable_audit_login("wrong").status == 429,
-      "unavailable audit sink bypassed the configured first-failure lockout");
+  expect(unavailable_audit_login("wrong").status == 429,
+         "unavailable audit sink bypassed the configured first-failure lockout");
   const auto unavailable_health = unavailable_audit_service.health();
-  expect(
-      unavailable_health.value("status", "") == "degraded" &&
-          !unavailable_health.value("audit_healthy", true) &&
-          unavailable_health.value("audit_write_failures", std::uint64_t{0}) > 0,
-      "unavailable audit sink was not reported as degraded");
+  expect(unavailable_health.value("status", "") == "degraded" &&
+             !unavailable_health.value("audit_healthy", true) &&
+             unavailable_health.value("audit_write_failures", std::uint64_t{0}) > 0,
+         "unavailable audit sink was not reported as degraded");
   expect(
       unavailable_audit_login("correct-password").status == 429,
       "audit sink failure bypassed the established login lockout");
@@ -7720,7 +7567,7 @@ void test_driver_login_failure_rate_limit_and_recovery() {
 
 void test_signaling_audit_failure_does_not_abort_reaper() {
   const auto root = std::filesystem::temp_directory_path() /
-      ("mine-teleop-audit-reaper-test-" + mine_teleop::random_token(6));
+                    ("mine-teleop-audit-reaper-test-" + mine_teleop::random_token(6));
   std::filesystem::create_directories(root);
   const auto audit_path = root / "audit.jsonl";
   auto config = legacy_signaling_config();
@@ -7739,12 +7586,10 @@ void test_signaling_audit_failure_does_not_abort_reaper() {
     request.body = body.dump();
     return service.handle(request);
   };
-  expect(
-      post(
-          "/auth/driver_login",
-          {{"driver_id", "driver-console-001"}, {"password", "dev-password"}})
-              .status == 200,
-      "audit-reaper fixture could not log in the driver");
+  expect(post("/auth/driver_login",
+              {{"driver_id", "driver-console-001"}, {"password", "dev-password"}})
+                 .status == 200,
+         "audit-reaper fixture could not log in the driver");
 
   std::filesystem::remove(audit_path);
   std::filesystem::create_directory(audit_path);
@@ -7758,37 +7603,29 @@ void test_signaling_audit_failure_does_not_abort_reaper() {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   } while (std::chrono::steady_clock::now() < reaper_deadline);
-  expect(
-      expired_health.value("online_drivers", std::size_t{1}) == 0,
-      "audit failure interrupted expired-driver revocation in the reaper");
-  expect(
-      expired_health.value("status", "") == "degraded" &&
-          !expired_health.value("audit_healthy", true) &&
-          expired_health.value("connection_reaper_healthy", false),
-      "audit failure did not leave the service alive with explicit degraded health");
+  expect(expired_health.value("online_drivers", std::size_t{1}) == 0,
+         "audit failure interrupted expired-driver revocation in the reaper");
+  expect(expired_health.value("status", "") == "degraded" &&
+             !expired_health.value("audit_healthy", true) &&
+             expired_health.value("connection_reaper_healthy", false),
+         "audit failure did not leave the service alive with explicit degraded health");
 
-  expect(
-      post(
-          "/vehicles/online",
-          {{"vehicle_id", "vehicle-001"},
-           {"device_token", "dev-device-secret"},
-           {"connection_id", "audit-failure-vehicle"}})
-              .status == 200,
-      "audit failure prevented non-authority vehicle recovery");
-  const auto login = post(
-      "/auth/driver_login",
-      {{"driver_id", "driver-console-001"}, {"password", "dev-password"}});
+  expect(post("/vehicles/online", {{"vehicle_id", "vehicle-001"},
+                                   {"device_token", "dev-device-secret"},
+                                   {"connection_id", "audit-failure-vehicle"}})
+                 .status == 200,
+         "audit failure prevented non-authority vehicle recovery");
+  const auto login = post("/auth/driver_login",
+                          {{"driver_id", "driver-console-001"}, {"password", "dev-password"}});
   expect(login.status == 200, "audit failure prevented driver authentication recovery");
   const auto token = mine_teleop::Json::parse(login.body).at("token").get<std::string>();
-  const auto session = post(
-      "/sessions",
-      {{"driver_id", "driver-console-001"}, {"vehicle_id", "vehicle-001"}, {"token", token}});
-  expect(
-      session.status == 503 && session.body.find("audit_log_unavailable") != std::string::npos,
-      "new control authority was granted while the audit sink was unavailable");
-  expect(
-      service.health().value("active_sessions", std::size_t{1}) == 0,
-      "failed audit admission left an active control session");
+  const auto session =
+      post("/sessions",
+           {{"driver_id", "driver-console-001"}, {"vehicle_id", "vehicle-001"}, {"token", token}});
+  expect(session.status == 503 && session.body.find("audit_log_unavailable") != std::string::npos,
+         "new control authority was granted while the audit sink was unavailable");
+  expect(service.health().value("active_sessions", std::size_t{1}) == 0,
+         "failed audit admission left an active control session");
   std::filesystem::remove_all(root);
 }
 
@@ -8075,7 +7912,8 @@ int main() {
   std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"shared_control_protocol_vector", test_shared_control_protocol_vector},
       {"loopback_http_server_and_port_conflict", test_loopback_http_server_and_port_conflict},
-      {"http_connection_budget_deadlines_and_framing", test_http_connection_budget_deadlines_and_framing},
+      {"http_connection_budget_deadlines_and_framing",
+       test_http_connection_budget_deadlines_and_framing},
       {"raw_http_header_parse_rejects_before_map_overwrite",
        test_raw_http_header_parse_rejects_before_map_overwrite},
       {"websocket_connection_budget_transition", test_websocket_connection_budget_transition},
@@ -8107,20 +7945,26 @@ int main() {
       {"driver_brake_limit_config_validation", test_driver_brake_limit_config_validation},
       {"signaling_multi_identity_config", test_signaling_multi_identity_config},
       {"signaling_connection_limits_config", test_signaling_connection_limits_config},
-      {"argon2id_credentials_and_login_concurrency", test_argon2id_credentials_and_login_concurrency},
+      {"argon2id_credentials_and_login_concurrency",
+       test_argon2id_credentials_and_login_concurrency},
       {"credential_purpose_separation_and_stale_control_replay",
        test_credential_purpose_separation_and_stale_control_replay},
-      {"browser_event_logging_rotation_and_redaction", test_browser_event_logging_rotation_and_redaction},
-      {"driver_vehicle_switch_releases_old_session", test_driver_vehicle_switch_releases_old_session},
+      {"browser_event_logging_rotation_and_redaction",
+       test_browser_event_logging_rotation_and_redaction},
+      {"driver_vehicle_switch_releases_old_session",
+       test_driver_vehicle_switch_releases_old_session},
       {"two_driver_two_vehicle_wss_isolation_and_safe_rejection",
        test_two_driver_two_vehicle_wss_isolation_and_safe_rejection},
-      {"failed_logout_keeps_retryable_local_authority", test_failed_logout_keeps_retryable_local_authority},
-      {"local_proxy_preserves_upstream_auth_status", test_local_proxy_preserves_upstream_auth_status},
+      {"failed_logout_keeps_retryable_local_authority",
+       test_failed_logout_keeps_retryable_local_authority},
+      {"local_proxy_preserves_upstream_auth_status",
+       test_local_proxy_preserves_upstream_auth_status},
       {"control_authority_lease_renews_without_rotating_token",
        test_control_authority_lease_renews_without_rotating_token},
       {"control_transport_and_loopback_policy", test_control_transport_and_loopback_policy},
       {"mac_runtime_uses_websocket_signaling", test_mac_runtime_uses_websocket_signaling},
-      {"websocket_handshake_and_participant_isolation", test_websocket_handshake_and_participant_isolation},
+      {"websocket_handshake_and_participant_isolation",
+       test_websocket_handshake_and_participant_isolation},
       {"websocket_delivery_replay_and_idempotent_acknowledgement",
        test_websocket_delivery_replay_and_idempotent_acknowledgement},
       {"native_control_three_hop_trace_correlation",
@@ -8129,20 +7973,28 @@ int main() {
        test_websocket_participant_rate_limit_survives_reconnect_and_parallel_sockets},
       {"mac_runtime_retries_uncertain_websocket_send_without_duplication",
        test_mac_runtime_retries_uncertain_websocket_send_without_duplication},
-      {"websocket_client_retains_split_server_frame", test_websocket_client_retains_split_server_frame},
+      {"websocket_client_retains_split_server_frame",
+       test_websocket_client_retains_split_server_frame},
       {"signaling_queue_prunes_expired_messages_and_backpressures",
        test_signaling_queue_prunes_expired_messages_and_backpressures},
-      {"expired_websocket_authority_clears_local_control", test_expired_websocket_authority_clears_local_control},
-      {"websocket_reconnect_preserves_active_authority", test_websocket_reconnect_preserves_active_authority},
+      {"expired_websocket_authority_clears_local_control",
+       test_expired_websocket_authority_clears_local_control},
+      {"websocket_reconnect_preserves_active_authority",
+       test_websocket_reconnect_preserves_active_authority},
       {"signaling_process_restart_requires_fresh_authority",
        test_signaling_process_restart_requires_fresh_authority},
-      {"signaling_audit_rotation_and_service_start", test_signaling_audit_rotation_and_service_start},
-      {"signaling_audit_redacts_authenticated_reports", test_signaling_audit_redacts_authenticated_reports},
-      {"signaling_audit_failure_does_not_abort_reaper", test_signaling_audit_failure_does_not_abort_reaper},
-      {"driver_webrtc_connection_audit_transitions", test_driver_webrtc_connection_audit_transitions},
+      {"signaling_audit_rotation_and_service_start",
+       test_signaling_audit_rotation_and_service_start},
+      {"signaling_audit_redacts_authenticated_reports",
+       test_signaling_audit_redacts_authenticated_reports},
+      {"signaling_audit_failure_does_not_abort_reaper",
+       test_signaling_audit_failure_does_not_abort_reaper},
+      {"driver_webrtc_connection_audit_transitions",
+       test_driver_webrtc_connection_audit_transitions},
       {"signaling_dual_clock_deadlines_ignore_wall_clock_jumps",
        test_signaling_dual_clock_deadlines_ignore_wall_clock_jumps},
-      {"driver_login_failure_rate_limit_and_recovery", test_driver_login_failure_rate_limit_and_recovery},
+      {"driver_login_failure_rate_limit_and_recovery",
+       test_driver_login_failure_rate_limit_and_recovery},
       {"request_correlation_ids", test_request_correlation_ids},
       {"source_aware_api_and_websocket_rate_limit", test_source_aware_api_and_websocket_rate_limit},
   };

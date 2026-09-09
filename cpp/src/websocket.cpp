@@ -618,8 +618,8 @@ struct WebSocketClient::Impl {
     while (buffered.size() < size) {
       const auto now = std::chrono::steady_clock::now();
       const auto assembly_deadline = frame_started_at.has_value()
-          ? *frame_started_at + kWebSocketFrameAssemblyTimeout
-          : poll_deadline;
+                                         ? *frame_started_at + kWebSocketFrameAssemblyTimeout
+                                         : poll_deadline;
       if (frame_started_at.has_value() && now >= assembly_deadline) {
         throw std::runtime_error("incomplete websocket frame");
       }
@@ -632,16 +632,17 @@ struct WebSocketClient::Impl {
         }
         return false;
       }
-      if (!frame_started_at.has_value()) frame_started_at = std::chrono::steady_clock::now();
+      if (!frame_started_at.has_value())
+        frame_started_at = std::chrono::steady_clock::now();
     }
     return true;
   }
 
   void consume_frame(std::size_t size) {
     buffered.erase(0, size);
-    frame_started_at = buffered.empty()
-        ? std::optional<std::chrono::steady_clock::time_point>{}
-        : std::optional<std::chrono::steady_clock::time_point>{std::chrono::steady_clock::now()};
+    frame_started_at = buffered.empty() ? std::optional<std::chrono::steady_clock::time_point>{}
+                                        : std::optional<std::chrono::steady_clock::time_point>{
+                                              std::chrono::steady_clock::now()};
   }
 
   void send_frame(std::uint8_t opcode, std::string_view payload, std::chrono::milliseconds timeout) {
@@ -672,19 +673,15 @@ struct WebSocketClient::Impl {
 WebSocketClient::WebSocketClient(std::chrono::milliseconds timeout)
     : WebSocketClient(timeout, {}, CurlTlsTrustPolicy::system()) {}
 
-WebSocketClient::WebSocketClient(
-    std::chrono::milliseconds timeout,
-    std::vector<std::string> resolve_entries,
-    std::filesystem::path ca_bundle)
-    : WebSocketClient(
-          timeout,
-          std::move(resolve_entries),
-          CurlTlsTrustPolicy::from_optional_ca_bundle(std::move(ca_bundle))) {}
+WebSocketClient::WebSocketClient(std::chrono::milliseconds timeout,
+                                 std::vector<std::string> resolve_entries,
+                                 std::filesystem::path ca_bundle)
+    : WebSocketClient(timeout, std::move(resolve_entries),
+                      CurlTlsTrustPolicy::from_optional_ca_bundle(std::move(ca_bundle))) {}
 
-WebSocketClient::WebSocketClient(
-    std::chrono::milliseconds timeout,
-    std::vector<std::string> resolve_entries,
-    CurlTlsTrustPolicy tls_trust_policy)
+WebSocketClient::WebSocketClient(std::chrono::milliseconds timeout,
+                                 std::vector<std::string> resolve_entries,
+                                 CurlTlsTrustPolicy tls_trust_policy)
     : resolve_entries_(std::move(resolve_entries)),
       tls_trust_policy_(std::move(tls_trust_policy)),
       impl_(nullptr),
@@ -795,7 +792,8 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
   const auto end = impl_->buffered.find("\r\n\r\n") + 4;
   const auto response = impl_->buffered.substr(0, end);
   impl_->buffered.erase(0, end);
-  if (!impl_->buffered.empty()) impl_->frame_started_at = std::chrono::steady_clock::now();
+  if (!impl_->buffered.empty())
+    impl_->frame_started_at = std::chrono::steady_clock::now();
   const auto line_end = response.find("\r\n");
   if (line_end == std::string::npos || response.substr(0, line_end).find(" 101 ") == std::string::npos) {
     const auto status_line = response.substr(0, line_end);

@@ -57,34 +57,30 @@ inline constexpr double kMaxHardOverspeedMarginKph =
   return normalized_request * kMaxSteeringAngleDeg;
 }
 
-[[nodiscard]] inline bool is_finite_inclusive(
-    double value,
-    double minimum,
-    double maximum) noexcept {
-  return std::isfinite(value) && std::isfinite(minimum) &&
-      std::isfinite(maximum) && minimum <= maximum && value >= minimum &&
-      value <= maximum;
+[[nodiscard]] inline bool is_finite_inclusive(double value, double minimum,
+                                              double maximum) noexcept {
+  return std::isfinite(value) && std::isfinite(minimum) && std::isfinite(maximum) &&
+         minimum <= maximum && value >= minimum && value <= maximum;
 }
 
 // Hard caps are exact. Callers must not add an epsilon to a physical or
 // protocol limit before using this predicate.
-[[nodiscard]] inline bool exceeds_hard_limit(
-    double value,
-    double maximum) noexcept {
+[[nodiscard]] inline bool exceeds_hard_limit(double value, double maximum) noexcept {
   return !std::isfinite(value) || !std::isfinite(maximum) || value > maximum;
 }
 
-[[nodiscard]] constexpr std::size_t bounded_steering_axis_count(
-    int requested_axis_count) noexcept {
-  if (requested_axis_count <= 0) return 0U;
+[[nodiscard]] constexpr std::size_t bounded_steering_axis_count(int requested_axis_count) noexcept {
+  if (requested_axis_count <= 0)
+    return 0U;
   const auto requested = static_cast<std::size_t>(requested_axis_count);
   return std::min(requested, kSteeringAxisCount);
 }
 
-[[nodiscard]] constexpr std::array<double, kSteeringAxisCount>
-broadcast_steering_request(double normalized_request) noexcept {
+[[nodiscard]] constexpr std::array<double, kSteeringAxisCount> broadcast_steering_request(
+    double normalized_request) noexcept {
   std::array<double, kSteeringAxisCount> values{};
-  for (auto& value : values) value = normalized_request;
+  for (auto& value : values)
+    value = normalized_request;
   return values;
 }
 
@@ -92,14 +88,12 @@ broadcast_steering_request(double normalized_request) noexcept {
 // emitted ordinary brake pressure must never exceed its accepted input.
 [[nodiscard]] inline double quantize_ordinary_brake_pressure_bar_toward_zero(
     double brake_pressure_bar) noexcept {
-  if (!(brake_pressure_bar > 0.0)) return 0.0;
-  const double bounded = std::min(
-      brake_pressure_bar,
-      kMaxOrdinaryBrakePressureBar);
-  return std::floor(std::nextafter(
-                        bounded / kBrakePressureResolutionBar,
-                        std::numeric_limits<double>::max())) *
-      kBrakePressureResolutionBar;
+  if (!(brake_pressure_bar > 0.0))
+    return 0.0;
+  const double bounded = std::min(brake_pressure_bar, kMaxOrdinaryBrakePressureBar);
+  return std::floor(std::nextafter(bounded / kBrakePressureResolutionBar,
+                                   std::numeric_limits<double>::max())) *
+         kBrakePressureResolutionBar;
 }
 
 }  // namespace mine_teleop::control_limits

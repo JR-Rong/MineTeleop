@@ -33,38 +33,31 @@ using Argon2idPolicy = AuthenticationCostPolicy;
 [[nodiscard]] const AuthenticationCostPolicy& default_authentication_cost_policy();
 [[nodiscard]] const AuthenticationCostPolicy& default_argon2id_policy();
 
-[[nodiscard]] bool validate_authentication_cost_policy(
-    const AuthenticationCostPolicy& policy,
-    std::string* reason = nullptr);
+[[nodiscard]] bool validate_authentication_cost_policy(const AuthenticationCostPolicy& policy,
+                                                       std::string* reason = nullptr);
 
 // Compares equal-length high-entropy secrets with the platform crypto primitive
 // (CRYPTO_memcmp on OpenSSL targets). This does not claim that the surrounding
 // HTTP/request handling has constant timing; callers must validate expected
 // length/format before calling it.
-[[nodiscard]] bool constant_time_equal(
-    std::string_view expected,
-    std::string_view actual) noexcept;
+[[nodiscard]] bool constant_time_equal(std::string_view expected, std::string_view actual) noexcept;
 
 // Parses only the supported Argon2id PHC form and applies the bounded policy
 // before the password KDF runs. `reason` is suitable for configuration
 // diagnostics and must never be returned to an unauthenticated client.
-[[nodiscard]] bool validate_argon2id_verifier(
-    std::string_view encoded,
-    const AuthenticationCostPolicy& policy,
-    std::string* reason = nullptr);
+[[nodiscard]] bool validate_argon2id_verifier(std::string_view encoded,
+                                              const AuthenticationCostPolicy& policy,
+                                              std::string* reason = nullptr);
 
 // Returns false for a password mismatch. Invalid configured verifier data is
 // a startup error and should have been rejected by validate_argon2id_verifier.
-[[nodiscard]] bool verify_argon2id_password(
-    std::string_view encoded,
-    std::string_view password,
-    const AuthenticationCostPolicy& policy);
+[[nodiscard]] bool verify_argon2id_password(std::string_view encoded, std::string_view password,
+                                            const AuthenticationCostPolicy& policy);
 
 // Intended for provisioning and deterministic tests. The caller owns the
 // plaintext and must clear it after use; this function never logs it.
 [[nodiscard]] std::string hash_argon2id_password(
-    std::string_view password,
-    std::span<const std::uint8_t> salt,
+    std::string_view password, std::span<const std::uint8_t> salt,
     const AuthenticationCostPolicy& policy = default_authentication_cost_policy());
 
 // A valid fixed verifier used for unknown-account work so that a missing ID

@@ -20,7 +20,8 @@ class TestFailure final : public std::runtime_error {
 };
 
 void expect(bool condition, std::string_view message) {
-  if (!condition) throw TestFailure(std::string(message));
+  if (!condition)
+    throw TestFailure(std::string(message));
 }
 
 std::string parse_json_string_contents(std::string_view escaped) {
@@ -42,9 +43,8 @@ void test_all_control_characters_are_lossless() {
       "\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f";
   const auto escaped = mine_teleop::detail::json_escape(controls);
   expect(escaped == expected, "control characters did not use the intended JSON escapes");
-  expect(
-      parse_json_string_contents(escaped) == controls,
-      "control character values changed after JSON parse");
+  expect(parse_json_string_contents(escaped) == controls,
+         "control character values changed after JSON parse");
 }
 
 void test_quotes_and_backslashes_are_not_double_escaped() {
@@ -65,7 +65,8 @@ void test_empty_and_valid_utf8_values_are_preserved() {
 
 void test_long_field_is_lossless() {
   std::string field;
-  for (int index = 0; index < 4096; ++index) field += u8"矿";
+  for (int index = 0; index < 4096; ++index)
+    field += u8"矿";
   field += "\nend";
 
   const auto escaped = mine_teleop::detail::json_escape(field);
@@ -74,12 +75,9 @@ void test_long_field_is_lossless() {
 
 void test_utf8_boundaries_are_preserved() {
   const std::array<std::string, 6> valid_utf8_values{
-      std::string("\xc2\x80", 2),
-      std::string("\xe0\xa0\x80", 3),
-      std::string("\xed\x9f\xbf", 3),
-      std::string("\xee\x80\x80", 3),
-      std::string("\xf0\x90\x80\x80", 4),
-      std::string("\xf4\x8f\xbf\xbf", 4),
+      std::string("\xc2\x80", 2),         std::string("\xe0\xa0\x80", 3),
+      std::string("\xed\x9f\xbf", 3),     std::string("\xee\x80\x80", 3),
+      std::string("\xf0\x90\x80\x80", 4), std::string("\xf4\x8f\xbf\xbf", 4),
   };
 
   for (const auto& value : valid_utf8_values) {
@@ -97,34 +95,24 @@ void test_invalid_utf8_is_explicitly_replaced() {
   };
   const std::array<InvalidUtf8Case, 6> invalid_utf8_values{
       InvalidUtf8Case{std::string("\x80", 1), "\\ufffd", std::string("\xef\xbf\xbd", 3)},
-      InvalidUtf8Case{
-          std::string("\xc0\xaf", 2), "\\ufffd\\ufffd", std::string("\xef\xbf\xbd\xef\xbf\xbd", 6)},
-      InvalidUtf8Case{
-          std::string("\xe0\x80\x80", 3),
-          "\\ufffd\\ufffd\\ufffd",
-          std::string("\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd", 9)},
-      InvalidUtf8Case{
-          std::string("\xed\xa0\x80", 3),
-          "\\ufffd\\ufffd\\ufffd",
-          std::string("\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd", 9)},
-      InvalidUtf8Case{
-          std::string("\xf4\x90\x80\x80", 4),
-          "\\ufffd\\ufffd\\ufffd\\ufffd",
-          std::string("\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd", 12)},
-      InvalidUtf8Case{
-          std::string("\xf0\x28\x8c\xbc", 4),
-          "\\ufffd(\\ufffd\\ufffd",
-          std::string("\xef\xbf\xbd(\xef\xbf\xbd\xef\xbf\xbd", 10)},
+      InvalidUtf8Case{std::string("\xc0\xaf", 2), "\\ufffd\\ufffd",
+                      std::string("\xef\xbf\xbd\xef\xbf\xbd", 6)},
+      InvalidUtf8Case{std::string("\xe0\x80\x80", 3), "\\ufffd\\ufffd\\ufffd",
+                      std::string("\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd", 9)},
+      InvalidUtf8Case{std::string("\xed\xa0\x80", 3), "\\ufffd\\ufffd\\ufffd",
+                      std::string("\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd", 9)},
+      InvalidUtf8Case{std::string("\xf4\x90\x80\x80", 4), "\\ufffd\\ufffd\\ufffd\\ufffd",
+                      std::string("\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd", 12)},
+      InvalidUtf8Case{std::string("\xf0\x28\x8c\xbc", 4), "\\ufffd(\\ufffd\\ufffd",
+                      std::string("\xef\xbf\xbd(\xef\xbf\xbd\xef\xbf\xbd", 10)},
   };
 
   for (const auto& invalid : invalid_utf8_values) {
     const auto escaped = mine_teleop::detail::json_escape(invalid.value);
-    expect(
-        escaped == invalid.escaped,
-        "invalid UTF-8 was not represented by explicit replacement escapes");
-    expect(
-        parse_json_string_contents(escaped) == invalid.parsed,
-        "invalid UTF-8 replacement output did not parse to replacement characters");
+    expect(escaped == invalid.escaped,
+           "invalid UTF-8 was not represented by explicit replacement escapes");
+    expect(parse_json_string_contents(escaped) == invalid.parsed,
+           "invalid UTF-8 replacement output did not parse to replacement characters");
   }
 }
 
@@ -138,7 +126,8 @@ struct TestCase {
 int main() {
   const TestCase tests[] = {
       {"all_control_characters_are_lossless", test_all_control_characters_are_lossless},
-      {"quotes_and_backslashes_are_not_double_escaped", test_quotes_and_backslashes_are_not_double_escaped},
+      {"quotes_and_backslashes_are_not_double_escaped",
+       test_quotes_and_backslashes_are_not_double_escaped},
       {"empty_and_valid_utf8_values_are_preserved", test_empty_and_valid_utf8_values_are_preserved},
       {"long_field_is_lossless", test_long_field_is_lossless},
       {"utf8_boundaries_are_preserved", test_utf8_boundaries_are_preserved},
@@ -146,7 +135,8 @@ int main() {
   };
 
   try {
-    for (const auto& test : tests) test.function();
+    for (const auto& test : tests)
+      test.function();
     std::cout << "json_escape_tests=passed count=" << std::size(tests) << '\n';
     return 0;
   } catch (const std::exception& error) {

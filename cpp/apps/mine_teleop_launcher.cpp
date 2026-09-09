@@ -780,9 +780,8 @@ int relay_runtime(
 int main(int argc, char** argv) {
   const auto executable = std::filesystem::read_symlink("/proc/self/exe");
   const auto root = executable.parent_path().parent_path();
-  const auto install_root = root.parent_path().filename() == ".releases"
-      ? root.parent_path().parent_path()
-      : root;
+  const auto install_root =
+      root.parent_path().filename() == ".releases" ? root.parent_path().parent_path() : root;
   const auto library_path =
       (root / "lib").string() + ":" + (root / "lib/vendor/chassis").string() + ":" +
       (root / "lib/vendor/mvs").string();

@@ -532,7 +532,8 @@ bool ParallelController::ingest(const CanFrame& frame) {
 }
 
 void ParallelController::enter(State state) {
-  if (state_ != state) ++transition_epoch_;
+  if (state_ != state)
+    ++transition_epoch_;
   state_ = state;
   state_entry_generation_ = receive_generation_;
 }

@@ -18,13 +18,13 @@ struct SourceLocation {
 class TestFailure : public std::runtime_error {
  public:
   TestFailure(SourceLocation location, std::string_view message)
-      : std::runtime_error(
-            std::string(location.file) + ":" + std::to_string(location.line) + ": " +
-            std::string(message)) {}
+      : std::runtime_error(std::string(location.file) + ":" + std::to_string(location.line) + ": " +
+                           std::string(message)) {}
 };
 
 inline void expect(bool condition, std::string_view message, SourceLocation location) {
-  if (!condition) throw TestFailure(location, message);
+  if (!condition)
+    throw TestFailure(location, message);
 }
 
 [[nodiscard]] constexpr ClockSample clock_sample(UtcMillis utc, MonotonicMillis monotonic) {
@@ -46,9 +46,7 @@ void expect_throws(Function&& function, std::string_view message, SourceLocation
 // C++17 has no std::source_location. These macros preserve the current
 // expect/expect_throws style while attaching the call site to a failure.
 #define MINE_TELEOP_EXPECT(condition, message) \
-  ::mine_teleop::test::expect( \
-      static_cast<bool>(condition), (message), {__FILE__, __LINE__})
+  ::mine_teleop::test::expect(static_cast<bool>(condition), (message), {__FILE__, __LINE__})
 
 #define MINE_TELEOP_EXPECT_THROWS(function, message) \
-  ::mine_teleop::test::expect_throws( \
-      (function), (message), {__FILE__, __LINE__})
+  ::mine_teleop::test::expect_throws((function), (message), {__FILE__, __LINE__})

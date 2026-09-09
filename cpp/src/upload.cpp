@@ -39,7 +39,7 @@ Json read_json_file(const std::filesystem::path& path) {
 void write_json_atomic(const std::filesystem::path& path, const Json& value) {
   static std::atomic<std::uint64_t> temporary_sequence{0};
   const auto temporary = path.string() + ".tmp." +
-      std::to_string(temporary_sequence.fetch_add(1, std::memory_order_relaxed));
+                         std::to_string(temporary_sequence.fetch_add(1, std::memory_order_relaxed));
   {
     std::ofstream output(temporary, std::ios::trunc);
     if (!output) throw std::runtime_error("cannot write temporary metadata: " + temporary);
@@ -75,37 +75,44 @@ class RecordingUploadDeferred final : public std::runtime_error {
 }
 
 [[nodiscard]] std::optional<std::uint64_t> recording_revision(const Json& metadata) {
-  if (!metadata.contains("recording_revision")) return std::nullopt;
+  if (!metadata.contains("recording_revision"))
+    return std::nullopt;
   const auto& value = metadata.at("recording_revision");
-  if (value.is_number_unsigned()) return value.get<std::uint64_t>();
+  if (value.is_number_unsigned())
+    return value.get<std::uint64_t>();
   if (value.is_number_integer()) {
     const auto signed_value = value.get<std::int64_t>();
-    if (signed_value >= 0) return static_cast<std::uint64_t>(signed_value);
+    if (signed_value >= 0)
+      return static_cast<std::uint64_t>(signed_value);
   }
   throw std::runtime_error("recording_revision must be a non-negative integer");
 }
 
 [[nodiscard]] bool recording_metadata_is_uploadable(const Json& metadata) {
-  if (metadata.value("upload_state", "pending") != "pending") return false;
-  if (!metadata.contains("recording_state")) return true;
+  if (metadata.value("upload_state", "pending") != "pending")
+    return false;
+  if (!metadata.contains("recording_state"))
+    return true;
   if (!metadata["recording_state"].is_string()) {
     throw std::runtime_error("recording_state must be a string when present");
   }
   return metadata["recording_state"].get<std::string>() == "completed";
 }
 
-void ensure_recording_upload_is_current(
-    const std::filesystem::path& metadata_path,
-    std::optional<std::uint64_t> expected_revision) {
+void ensure_recording_upload_is_current(const std::filesystem::path& metadata_path,
+                                        std::optional<std::uint64_t> expected_revision) {
   if (std::filesystem::exists(recording_revocation_path(metadata_path))) {
-    throw RecordingUploadRevoked("recording fragment was revoked before archive commit: " + metadata_path.string());
+    throw RecordingUploadRevoked("recording fragment was revoked before archive commit: " +
+                                 metadata_path.string());
   }
   const auto current = read_json_file(metadata_path);
   if (!recording_metadata_is_uploadable(current)) {
-    throw RecordingUploadRevoked("recording sidecar is no longer pending and completed: " + metadata_path.string());
+    throw RecordingUploadRevoked("recording sidecar is no longer pending and completed: " +
+                                 metadata_path.string());
   }
   if (expected_revision != recording_revision(current)) {
-    throw RecordingUploadRevoked("recording sidecar revision changed during archive claim: " + metadata_path.string());
+    throw RecordingUploadRevoked("recording sidecar revision changed during archive claim: " +
+                                 metadata_path.string());
   }
 }
 
@@ -118,13 +125,16 @@ class RecordingUploadClaim {
       : path_(std::exchange(other.path_, {})) {}
 
   RecordingUploadClaim& operator=(RecordingUploadClaim&& other) noexcept {
-    if (this == &other) return *this;
+    if (this == &other)
+      return *this;
     release();
     path_ = std::exchange(other.path_, {});
     return *this;
   }
 
-  ~RecordingUploadClaim() { release(); }
+  ~RecordingUploadClaim() {
+    release();
+  }
 
   [[nodiscard]] static std::optional<RecordingUploadClaim> try_acquire(
       const std::filesystem::path& metadata_path) {
@@ -132,7 +142,8 @@ class RecordingUploadClaim {
     std::error_code error;
     if (!std::filesystem::create_directory(claim_path, error)) {
       if (error) {
-        throw std::runtime_error("cannot create recording upload claim: " + claim_path.string() + ": " + error.message());
+        throw std::runtime_error("cannot create recording upload claim: " + claim_path.string() +
+                                 ": " + error.message());
       }
       return std::nullopt;
     }
@@ -143,7 +154,8 @@ class RecordingUploadClaim {
   explicit RecordingUploadClaim(std::filesystem::path path) : path_(std::move(path)) {}
 
   void release() noexcept {
-    if (path_.empty()) return;
+    if (path_.empty())
+      return;
     std::error_code ignored;
     std::filesystem::remove_all(path_, ignored);
     path_.clear();
@@ -152,22 +164,24 @@ class RecordingUploadClaim {
   std::filesystem::path path_;
 };
 
-void copy_verified_atomic(
-    const std::filesystem::path& source,
-    const std::filesystem::path& destination,
-    std::string_view expected_sha256,
-    const std::function<void()>& before_commit = {}) {
+void copy_verified_atomic(const std::filesystem::path& source,
+                          const std::filesystem::path& destination,
+                          std::string_view expected_sha256,
+                          const std::function<void()>& before_commit = {}) {
   std::filesystem::create_directories(destination.parent_path());
   const auto temporary = destination.string() + ".tmp";
   std::error_code ignored;
   std::filesystem::remove(temporary, ignored);
   try {
-    std::filesystem::copy_file(source, temporary, std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(source, temporary,
+                               std::filesystem::copy_options::overwrite_existing);
     if (sha256_file(temporary) != expected_sha256) {
       throw std::runtime_error("archive checksum mismatch: " + source.string());
     }
-    if (before_commit) before_commit();
-    if (std::filesystem::exists(destination)) std::filesystem::remove(destination);
+    if (before_commit)
+      before_commit();
+    if (std::filesystem::exists(destination))
+      std::filesystem::remove(destination);
     std::filesystem::rename(temporary, destination);
   } catch (...) {
     ignored.clear();
@@ -190,7 +204,8 @@ std::uint64_t gigabytes_to_bytes(double gigabytes) {
     throw std::invalid_argument("recording free-space threshold must be finite and non-negative");
   }
   constexpr double kBytesPerGigabyte = 1'000'000'000.0;
-  if (gigabytes >= static_cast<double>(std::numeric_limits<std::uint64_t>::max()) / kBytesPerGigabyte) {
+  if (gigabytes >=
+      static_cast<double>(std::numeric_limits<std::uint64_t>::max()) / kBytesPerGigabyte) {
     return std::numeric_limits<std::uint64_t>::max();
   }
   return static_cast<std::uint64_t>(gigabytes * kBytesPerGigabyte);
@@ -208,9 +223,8 @@ bool plain_regular_file(const std::filesystem::path& path) {
   return std::filesystem::is_regular_file(std::filesystem::symlink_status(path, error)) && !error;
 }
 
-std::filesystem::path sidecar_video_path(
-    const std::filesystem::path& metadata_path,
-    const Json& metadata) {
+std::filesystem::path sidecar_video_path(const std::filesystem::path& metadata_path,
+                                         const Json& metadata) {
   if (!metadata.contains("video_file")) {
     auto video_path = metadata_path;
     video_path.replace_extension(".mp4");
@@ -231,13 +245,15 @@ std::uint64_t remove_recording_candidate(const RecordingCleanupCandidate& candid
   std::error_code error;
   if (plain_regular_file(candidate.video_path)) {
     const auto size = std::filesystem::file_size(candidate.video_path, error);
-    if (error || !std::filesystem::remove(candidate.video_path, error) || error) return 0;
+    if (error || !std::filesystem::remove(candidate.video_path, error) || error)
+      return 0;
     removed_bytes += size;
   }
   error.clear();
   if (plain_regular_file(candidate.metadata_path)) {
     const auto size = std::filesystem::file_size(candidate.metadata_path, error);
-    if (!error && std::filesystem::remove(candidate.metadata_path, error) && !error) removed_bytes += size;
+    if (!error && std::filesystem::remove(candidate.metadata_path, error) && !error)
+      removed_bytes += size;
   }
   return removed_bytes;
 }
@@ -256,8 +272,10 @@ Json UploadProcessResult::to_json() const {
   if (!object_path.empty()) value["object_path"] = object_path;
   if (!metadata_object_path.empty()) value["metadata_object_path"] = metadata_object_path;
   if (!error.empty()) value["error"] = error;
-  if (retry_after_ms > 0) value["retry_after_ms"] = retry_after_ms;
-  if (deferred_failures > 0) value["deferred_failures"] = deferred_failures;
+  if (retry_after_ms > 0)
+    value["retry_after_ms"] = retry_after_ms;
+  if (deferred_failures > 0)
+    value["deferred_failures"] = deferred_failures;
   return value;
 }
 
@@ -272,23 +290,24 @@ Json RecordingStorageResult::to_json() const {
   };
 }
 
-RecordingStorageResult enforce_recording_storage_policy(
-    const std::filesystem::path& recording_root,
-    const RecordingConfig& config) {
-  if (recording_root.empty()) throw std::invalid_argument("recording root is required");
+RecordingStorageResult enforce_recording_storage_policy(const std::filesystem::path& recording_root,
+                                                        const RecordingConfig& config) {
+  if (recording_root.empty())
+    throw std::invalid_argument("recording root is required");
   std::filesystem::create_directories(recording_root);
   RecordingStorageResult result;
   result.required_free_bytes = gigabytes_to_bytes(config.min_free_gb);
-  const auto uploaded_cleanup_threshold = gigabytes_to_bytes(config.delete_uploaded_when_below_free_gb);
+  const auto uploaded_cleanup_threshold =
+      gigabytes_to_bytes(config.delete_uploaded_when_below_free_gb);
   auto space = std::filesystem::space(recording_root);
   result.available_bytes = space.available;
-  if (result.available_bytes >= result.required_free_bytes) return result;
+  if (result.available_bytes >= result.required_free_bytes)
+    return result;
 
   std::vector<RecordingCleanupCandidate> uploaded;
   std::vector<RecordingCleanupCandidate> unuploaded;
   for (const auto& entry : std::filesystem::recursive_directory_iterator(
-           recording_root,
-           std::filesystem::directory_options::skip_permission_denied)) {
+           recording_root, std::filesystem::directory_options::skip_permission_denied)) {
     if (!plain_regular_file(entry.path()) || entry.path().extension() != ".json" ||
         entry.path().filename().string().ends_with(".tmp")) {
       continue;
@@ -298,12 +317,10 @@ RecordingStorageResult enforce_recording_storage_policy(
       auto video_path = sidecar_video_path(entry.path(), metadata);
       std::error_code modified_error;
       const auto modified_at = std::filesystem::last_write_time(entry.path(), modified_error);
-      if (modified_error) continue;
-      RecordingCleanupCandidate candidate{
-          entry.path(),
-          std::move(video_path),
-          modified_at,
-          metadata.value("upload_state", "pending") == "uploaded"};
+      if (modified_error)
+        continue;
+      RecordingCleanupCandidate candidate{entry.path(), std::move(video_path), modified_at,
+                                          metadata.value("upload_state", "pending") == "uploaded"};
       (candidate.uploaded ? uploaded : unuploaded).push_back(std::move(candidate));
     } catch (const std::exception&) {
     }
@@ -315,9 +332,11 @@ RecordingStorageResult enforce_recording_storage_policy(
   std::sort(unuploaded.begin(), unuploaded.end(), oldest_first);
   const auto remove_until_safe = [&](const auto& candidates, bool uploaded_state) {
     for (const auto& candidate : candidates) {
-      if (result.available_bytes >= result.required_free_bytes) break;
+      if (result.available_bytes >= result.required_free_bytes)
+        break;
       const auto removed = remove_recording_candidate(candidate);
-      if (removed == 0) continue;
+      if (removed == 0)
+        continue;
       result.removed_bytes += removed;
       if (uploaded_state) {
         ++result.removed_uploaded_segments;
@@ -331,7 +350,8 @@ RecordingStorageResult enforce_recording_storage_policy(
   if (uploaded_cleanup_threshold > 0 && result.available_bytes < uploaded_cleanup_threshold) {
     remove_until_safe(uploaded, true);
   }
-  if (config.delete_unuploaded_when_below_free_gb && result.available_bytes < result.required_free_bytes) {
+  if (config.delete_unuploaded_when_below_free_gb &&
+      result.available_bytes < result.required_free_bytes) {
     remove_until_safe(unuploaded, false);
   }
   result.recording_allowed = result.available_bytes >= result.required_free_bytes;
@@ -368,12 +388,10 @@ std::string sha256_file(const std::filesystem::path& path) {
   return output.str();
 }
 
-LocalArchiveUploader::LocalArchiveUploader(
-    std::filesystem::path recording_root,
-    std::filesystem::path archive_root,
-    double max_bandwidth_mbps,
-    int retry_initial_seconds,
-    int retry_max_seconds)
+LocalArchiveUploader::LocalArchiveUploader(std::filesystem::path recording_root,
+                                           std::filesystem::path archive_root,
+                                           double max_bandwidth_mbps, int retry_initial_seconds,
+                                           int retry_max_seconds)
     : recording_root_(std::move(recording_root)),
       archive_root_(std::move(archive_root)),
       max_bandwidth_mbps_(max_bandwidth_mbps),
@@ -392,8 +410,7 @@ UploadProcessResult LocalArchiveUploader::process_once() {
   if (!std::filesystem::exists(recording_root_)) return {};
   std::vector<std::filesystem::path> metadata_files;
   for (const auto& entry : std::filesystem::recursive_directory_iterator(
-           recording_root_,
-           std::filesystem::directory_options::skip_permission_denied)) {
+           recording_root_, std::filesystem::directory_options::skip_permission_denied)) {
     if (plain_regular_file(entry.path()) && entry.path().extension() == ".json" &&
         !entry.path().filename().string().ends_with(".tmp")) {
       metadata_files.push_back(entry.path());
@@ -420,12 +437,12 @@ UploadProcessResult LocalArchiveUploader::process_once() {
     if (const auto retry = retries_.find(retry_key); retry != retries_.end()) {
       const auto now = std::chrono::steady_clock::now();
       if (now < retry->second.next_attempt_at) {
-        const auto remaining = std::max<std::int64_t>(
-            1,
-            std::chrono::duration_cast<std::chrono::milliseconds>(retry->second.next_attempt_at - now).count());
-        shortest_retry_after_ms = shortest_retry_after_ms == 0
-            ? remaining
-            : std::min(shortest_retry_after_ms, remaining);
+        const auto remaining =
+            std::max<std::int64_t>(1, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          retry->second.next_attempt_at - now)
+                                          .count());
+        shortest_retry_after_ms =
+            shortest_retry_after_ms == 0 ? remaining : std::min(shortest_retry_after_ms, remaining);
         ++deferred_failures;
         continue;
       }
@@ -451,34 +468,33 @@ UploadProcessResult LocalArchiveUploader::process_once() {
       // Another uploader owns the per-sidecar claim.  Avoid a duplicate copy
       // and let the next periodic invocation observe its result.
       ++deferred_failures;
-      shortest_retry_after_ms = shortest_retry_after_ms == 0
-          ? 100
-          : std::min<std::int64_t>(shortest_retry_after_ms, 100);
+      shortest_retry_after_ms =
+          shortest_retry_after_ms == 0 ? 100 : std::min<std::int64_t>(shortest_retry_after_ms, 100);
       continue;
     } catch (const std::exception& error) {
       auto& retry = retries_[retry_key];
       retry.attempts = std::min<std::uint32_t>(retry.attempts + 1, 31);
       const auto exponent = std::min<std::uint32_t>(retry.attempts - 1, 30);
       const auto multiplier = std::uint64_t{1} << exponent;
-      const auto delay_seconds = std::min<std::uint64_t>(
-          static_cast<std::uint64_t>(retry_max_seconds_),
-          static_cast<std::uint64_t>(retry_initial_seconds_) * multiplier);
-      retry.next_attempt_at = std::chrono::steady_clock::now() + std::chrono::seconds(delay_seconds);
+      const auto delay_seconds =
+          std::min<std::uint64_t>(static_cast<std::uint64_t>(retry_max_seconds_),
+                                  static_cast<std::uint64_t>(retry_initial_seconds_) * multiplier);
+      retry.next_attempt_at =
+          std::chrono::steady_clock::now() + std::chrono::seconds(delay_seconds);
       const auto retry_after_ms = static_cast<std::int64_t>(delay_seconds * 1000);
       shortest_retry_after_ms = shortest_retry_after_ms == 0
-          ? retry_after_ms
-          : std::min(shortest_retry_after_ms, retry_after_ms);
+                                    ? retry_after_ms
+                                    : std::min(shortest_retry_after_ms, retry_after_ms);
       ++deferred_failures;
       if (!first_failure.has_value()) {
-        first_failure = UploadProcessResult{
-            "failed",
-            metadata_path.stem().string(),
-            "",
-            "",
-            error.what(),
-            0,
-            retry_after_ms,
-            deferred_failures};
+        first_failure = UploadProcessResult{"failed",
+                                            metadata_path.stem().string(),
+                                            "",
+                                            "",
+                                            error.what(),
+                                            0,
+                                            retry_after_ms,
+                                            deferred_failures};
       }
     }
   }
@@ -498,19 +514,23 @@ UploadProcessResult LocalArchiveUploader::process_once() {
 
 UploadProcessResult LocalArchiveUploader::upload_metadata(const std::filesystem::path& metadata_path) {
   if (!plain_regular_file(metadata_path)) {
-    throw std::runtime_error("segment metadata must be a regular non-symlink file: " + metadata_path.string());
+    throw std::runtime_error("segment metadata must be a regular non-symlink file: " +
+                             metadata_path.string());
   }
   auto metadata = read_json_file(metadata_path);
   if (!recording_metadata_is_uploadable(metadata)) {
-    throw RecordingUploadRevoked("recording sidecar is not an uploadable completed fragment: " + metadata_path.string());
+    throw RecordingUploadRevoked("recording sidecar is not an uploadable completed fragment: " +
+                                 metadata_path.string());
   }
   const auto expected_revision = recording_revision(metadata);
   if (std::filesystem::exists(recording_revocation_path(metadata_path))) {
-    throw RecordingUploadRevoked("recording fragment was revoked before uploader claim: " + metadata_path.string());
+    throw RecordingUploadRevoked("recording fragment was revoked before uploader claim: " +
+                                 metadata_path.string());
   }
   auto claim = RecordingUploadClaim::try_acquire(metadata_path);
   if (!claim.has_value()) {
-    throw RecordingUploadDeferred("recording fragment is already claimed by another uploader: " + metadata_path.string());
+    throw RecordingUploadDeferred("recording fragment is already claimed by another uploader: " +
+                                  metadata_path.string());
   }
   ensure_recording_upload_is_current(metadata_path, expected_revision);
   // Re-read under the claim so all values used below have the same revision
@@ -522,21 +542,22 @@ UploadProcessResult LocalArchiveUploader::upload_metadata(const std::filesystem:
   if (segment_id.empty()) throw std::runtime_error("segment_id is missing from metadata");
   const auto video_path = sidecar_video_path(metadata_path, metadata);
   if (!plain_regular_file(video_path)) {
-    throw std::runtime_error("segment video must be a regular non-symlink file: " + video_path.string());
+    throw std::runtime_error("segment video must be a regular non-symlink file: " +
+                             video_path.string());
   }
   if (!metadata.contains("video_sha256") || !metadata["video_sha256"].is_string()) {
     throw std::runtime_error("video_sha256 is required; legacy sidecar lacks an integrity proof");
   }
   const auto expected_sha256 = metadata["video_sha256"].get<std::string>();
   if (expected_sha256.size() != 64 ||
-      !std::all_of(expected_sha256.begin(), expected_sha256.end(), [](unsigned char value) {
-        return std::isxdigit(value) != 0;
-      })) {
+      !std::all_of(expected_sha256.begin(), expected_sha256.end(),
+                   [](unsigned char value) { return std::isxdigit(value) != 0; })) {
     throw std::runtime_error("video_sha256 is invalid in segment metadata");
   }
   const auto source_sha256 = sha256_file(video_path);
   if (source_sha256 != expected_sha256) {
-    throw std::runtime_error("recorded video checksum no longer matches its sidecar: " + video_path.string());
+    throw std::runtime_error("recorded video checksum no longer matches its sidecar: " +
+                             video_path.string());
   }
   const auto video_relative = safe_relative(recording_root_, video_path);
   const auto metadata_relative = safe_relative(recording_root_, metadata_path);
@@ -555,9 +576,12 @@ UploadProcessResult LocalArchiveUploader::upload_metadata(const std::filesystem:
     std::filesystem::create_directories(metadata_destination.parent_path());
     write_json_atomic(metadata_destination, archived_metadata);
     if (max_bandwidth_mbps_ > 0.0) {
-      const auto required_seconds = static_cast<double>(bytes) * 8.0 / (max_bandwidth_mbps_ * 1'000'000.0);
-      const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-      if (required_seconds > elapsed) std::this_thread::sleep_for(std::chrono::duration<double>(required_seconds - elapsed));
+      const auto required_seconds =
+          static_cast<double>(bytes) * 8.0 / (max_bandwidth_mbps_ * 1'000'000.0);
+      const auto elapsed =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+      if (required_seconds > elapsed)
+        std::this_thread::sleep_for(std::chrono::duration<double>(required_seconds - elapsed));
     }
     ensure_recording_upload_is_current(metadata_path, expected_revision);
     metadata["upload_state"] = "uploaded";
@@ -584,9 +608,9 @@ Json LocalArchiveUploader::backlog() const {
   std::uint64_t pending_bytes = 0;
   if (std::filesystem::exists(recording_root_)) {
     for (const auto& entry : std::filesystem::recursive_directory_iterator(
-             recording_root_,
-             std::filesystem::directory_options::skip_permission_denied)) {
-      if (!plain_regular_file(entry.path()) || entry.path().extension() != ".json") continue;
+             recording_root_, std::filesystem::directory_options::skip_permission_denied)) {
+      if (!plain_regular_file(entry.path()) || entry.path().extension() != ".json")
+        continue;
       try {
         const auto metadata = read_json_file(entry.path());
         if (!recording_metadata_is_uploadable(metadata) ||
@@ -596,7 +620,8 @@ Json LocalArchiveUploader::backlog() const {
         ++pending_segments;
         const auto video = sidecar_video_path(entry.path(), metadata);
         pending_bytes += std::filesystem::file_size(entry.path());
-        if (plain_regular_file(video)) pending_bytes += std::filesystem::file_size(video);
+        if (plain_regular_file(video))
+          pending_bytes += std::filesystem::file_size(video);
       } catch (const std::exception&) {
       }
     }

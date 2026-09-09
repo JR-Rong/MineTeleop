@@ -27,16 +27,13 @@ inline constexpr int kProtocolVersion = 1;
 inline constexpr std::size_t kMaxVehicleTelemetryHistory = 1024;
 inline constexpr double kDefaultFullScaleMotorTorqueNm =
     control_limits::kDefaultFullScaleMotorTorqueNm;
-inline constexpr double kMaxFullScaleMotorTorqueNm =
-    control_limits::kMaxFullScaleMotorTorqueNm;
+inline constexpr double kMaxFullScaleMotorTorqueNm = control_limits::kMaxFullScaleMotorTorqueNm;
 inline constexpr double kDefaultMotorTorqueRiseRateNmPerSecond =
     control_limits::kDefaultMotorTorqueRiseRateNmPerSecond;
 inline constexpr double kMaxMotorTorqueRiseRateNmPerSecond =
     control_limits::kMaxMotorTorqueRiseRateNmPerSecond;
-inline constexpr double kDefaultMaxBrakePressureBar =
-    control_limits::kDefaultMaxBrakePressureBar;
-inline constexpr double kMaxOrdinaryBrakePressureBar =
-    control_limits::kMaxOrdinaryBrakePressureBar;
+inline constexpr double kDefaultMaxBrakePressureBar = control_limits::kDefaultMaxBrakePressureBar;
+inline constexpr double kMaxOrdinaryBrakePressureBar = control_limits::kMaxOrdinaryBrakePressureBar;
 inline constexpr double kMaxEmergencyBrakePressureBar =
     control_limits::kMaxEmergencyBrakePressureBar;
 inline constexpr int kSessionControlProfileMaxAgeMs = 2000;
@@ -279,10 +276,8 @@ class ControlReceiver {
   // VehicleControlService calls commit_accepted only after an ordinary command
   // reaches the adapter, so rejected recovery/apply attempts cannot postpone a
   // watchdog deadline.
-  [[nodiscard]] ReceiveResult validate(
-      const ControlCommand& command,
-      ClockSample receive_time,
-      bool allow_gap_recovery) const;
+  [[nodiscard]] ReceiveResult validate(const ControlCommand& command, ClockSample receive_time,
+                                       bool allow_gap_recovery) const;
   void commit_accepted(const ControlCommand& command, ClockSample receive_time);
   void reset_watchdog_after_authorized_handshake();
 
@@ -383,13 +378,10 @@ class SafetyStateMachine {
 
   void mark_ready(MonotonicMillis now);
   void on_valid_command(const ControlCommand& command, MonotonicMillis now);
-  [[nodiscard]] bool can_recover(
-      RecoveryCause cause,
-      const std::optional<ControlCommand>& command) const;
-  [[nodiscard]] bool recover(
-      RecoveryCause cause,
-      const std::optional<ControlCommand>& command,
-      MonotonicMillis now);
+  [[nodiscard]] bool can_recover(RecoveryCause cause,
+                                 const std::optional<ControlCommand>& command) const;
+  [[nodiscard]] bool recover(RecoveryCause cause, const std::optional<ControlCommand>& command,
+                             MonotonicMillis now);
   void tick(MonotonicMillis now);
   [[nodiscard]] ControlOutput current_output(MonotonicMillis now) const;
   bool reset_estop(bool local_confirmed, std::string_view authorized_by, MonotonicMillis now);
@@ -819,9 +811,8 @@ class VehicleControlService {
 
   void start(ClockSample now);
   ReceiveResult receive_command(const ControlCommand& command, ClockSample now);
-  SessionControlProfileResult receive_session_profile(
-      const SessionControlProfileRequest& request,
-      ClockSample now);
+  SessionControlProfileResult receive_session_profile(const SessionControlProfileRequest& request,
+                                                      ClockSample now);
   void tick(ClockSample now);
   bool request_vcu_handshake(ClockSample now);
   bool request_vcu_handshake() {
@@ -848,10 +839,7 @@ class VehicleControlService {
   void evaluate_control_watchdog(MonotonicMillis now);
   void clear_session_profile() noexcept;
   [[nodiscard]] SessionControlProfileResult profile_result(
-      const SessionControlProfileRequest& request,
-      UtcMillis now,
-      bool accepted,
-      bool idempotent,
+      const SessionControlProfileRequest& request, UtcMillis now, bool accepted, bool idempotent,
       std::string reason) const;
   [[nodiscard]] Json build_telemetry(ClockSample now);
   [[nodiscard]] static bool is_traction_neutral(const ControlCommand& command);

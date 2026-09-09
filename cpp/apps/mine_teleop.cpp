@@ -350,9 +350,8 @@ int run_loop(const VehicleConfig& config, const Arguments& arguments) {
       100);
   service.start({mine_teleop::UtcMillis{0}, mine_teleop::MonotonicMillis{0}});
   for (int timestamp_ms = 0; timestamp_ms <= duration_ms; timestamp_ms += 50) {
-    const auto sample = mine_teleop::ClockSample{
-        mine_teleop::UtcMillis{timestamp_ms},
-        mine_teleop::MonotonicMillis{timestamp_ms}};
+    const auto sample = mine_teleop::ClockSample{mine_teleop::UtcMillis{timestamp_ms},
+                                                 mine_teleop::MonotonicMillis{timestamp_ms}};
     if (timestamp_ms < disconnect_at_ms) {
       ControlCommand command;
       command.vehicle_id = config.vehicle_id;
@@ -396,7 +395,8 @@ std::uint16_t port_option(const Arguments& arguments, std::string_view key, int 
 int run_signaling_server(const Arguments& arguments) {
   if (!arguments.has("--allow-legacy-passwords")) {
     throw std::invalid_argument(
-        "legacy --driver-password mode requires --allow-legacy-passwords; use mine-teleop-signaling-server --config with Argon2id verifiers instead");
+        "legacy --driver-password mode requires --allow-legacy-passwords; use "
+        "mine-teleop-signaling-server --config with Argon2id verifiers instead");
   }
   mine_teleop::SignalingServerConfig config;
   config.host = arguments.value("--host", "127.0.0.1");
@@ -843,10 +843,8 @@ int run_vehicle_uploader(const Arguments& arguments) {
   }
   mine_teleop::LocalArchiveUploader uploader(
       arguments.value("--recording-root", config.recording.root_dir.string()),
-      arguments.value("--archive-root", ".local/archive"),
-      config.upload.max_bandwidth_mbps,
-      config.upload.retry_initial_seconds,
-      config.upload.retry_max_seconds);
+      arguments.value("--archive-root", ".local/archive"), config.upload.max_bandwidth_mbps,
+      config.upload.retry_initial_seconds, config.upload.retry_max_seconds);
   const bool service = arguments.has("--service") || arguments.has("--service-mode");
   const int poll_interval_ms = arguments.integer("--poll-interval-ms", 5000);
   if (poll_interval_ms <= 0) throw std::invalid_argument("--poll-interval-ms must be positive");
@@ -858,8 +856,8 @@ int run_vehicle_uploader(const Arguments& arguments) {
     if (!service) return result.action == "failed" ? 2 : 0;
     if (result.action != "uploaded") {
       const auto retry_delay = result.retry_after_ms > 0
-          ? std::min<std::int64_t>(poll_interval_ms, result.retry_after_ms)
-          : poll_interval_ms;
+                                   ? std::min<std::int64_t>(poll_interval_ms, result.retry_after_ms)
+                                   : poll_interval_ms;
       std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay));
     }
   } while (true);
@@ -1032,7 +1030,8 @@ int main(int argc, char** argv) {
         if (!config.cloud.ca_bundle.empty()) {
           std::error_code file_error;
           const auto regular = std::filesystem::is_regular_file(config.cloud.ca_bundle, file_error);
-          const auto size = regular ? std::filesystem::file_size(config.cloud.ca_bundle, file_error) : 0;
+          const auto size =
+              regular ? std::filesystem::file_size(config.cloud.ca_bundle, file_error) : 0;
           std::ifstream input(config.cloud.ca_bundle);
           if (!regular || file_error || size == 0 || !input) {
             throw std::runtime_error(

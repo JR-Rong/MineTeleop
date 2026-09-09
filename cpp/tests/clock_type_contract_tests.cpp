@@ -21,38 +21,29 @@ using mine_teleop::UtcMillis;
 using mine_teleop::VehicleControlService;
 
 template <typename Time>
-concept ControlReceiverAccepts = requires(
-    ControlReceiver& receiver,
-    const ControlCommand& command,
-    Time time) {
-  { receiver.accept(command, time) } -> std::same_as<ReceiveResult>;
-};
+concept ControlReceiverAccepts =
+    requires(ControlReceiver& receiver, const ControlCommand& command, Time time) {
+      { receiver.accept(command, time) } -> std::same_as<ReceiveResult>;
+    };
 
 template <typename Time>
-concept SafetyMarkReadyAccepts = requires(SafetyStateMachine& safety, Time time) {
-  safety.mark_ready(time);
-};
+concept SafetyMarkReadyAccepts =
+    requires(SafetyStateMachine& safety, Time time) { safety.mark_ready(time); };
 
 template <typename Time>
-concept SafetyOnValidCommandAccepts = requires(
-    SafetyStateMachine& safety,
-    const ControlCommand& command,
-    Time time) {
-  safety.on_valid_command(command, time);
-};
+concept SafetyOnValidCommandAccepts =
+    requires(SafetyStateMachine& safety, const ControlCommand& command, Time time) {
+      safety.on_valid_command(command, time);
+    };
 
 template <typename Time>
-concept SafetyRecoverAccepts = requires(
-    SafetyStateMachine& safety,
-    const std::optional<ControlCommand>& command,
-    Time time) {
-  { safety.recover(RecoveryCause::AuthorizedHandshake, command, time) } -> std::same_as<bool>;
-};
+concept SafetyRecoverAccepts =
+    requires(SafetyStateMachine& safety, const std::optional<ControlCommand>& command, Time time) {
+      { safety.recover(RecoveryCause::AuthorizedHandshake, command, time) } -> std::same_as<bool>;
+    };
 
 template <typename Time>
-concept SafetyTickAccepts = requires(SafetyStateMachine& safety, Time time) {
-  safety.tick(time);
-};
+concept SafetyTickAccepts = requires(SafetyStateMachine& safety, Time time) { safety.tick(time); };
 
 template <typename Time>
 concept SafetyCurrentOutputAccepts = requires(const SafetyStateMachine& safety, Time time) {
@@ -65,30 +56,24 @@ concept SafetyResetEstopAccepts = requires(SafetyStateMachine& safety, Time time
 };
 
 template <typename Time>
-concept ServiceStartAccepts = requires(VehicleControlService& service, Time time) {
-  service.start(time);
-};
+concept ServiceStartAccepts =
+    requires(VehicleControlService& service, Time time) { service.start(time); };
 
 template <typename Time>
-concept ServiceReceiveCommandAccepts = requires(
-    VehicleControlService& service,
-    const ControlCommand& command,
-    Time time) {
-  { service.receive_command(command, time) } -> std::same_as<ReceiveResult>;
-};
+concept ServiceReceiveCommandAccepts =
+    requires(VehicleControlService& service, const ControlCommand& command, Time time) {
+      { service.receive_command(command, time) } -> std::same_as<ReceiveResult>;
+    };
 
 template <typename Time>
 concept ServiceReceiveSessionProfileAccepts = requires(
-    VehicleControlService& service,
-    const SessionControlProfileRequest& request,
-    Time time) {
+    VehicleControlService& service, const SessionControlProfileRequest& request, Time time) {
   { service.receive_session_profile(request, time) } -> std::same_as<SessionControlProfileResult>;
 };
 
 template <typename Time>
-concept ServiceTickAccepts = requires(VehicleControlService& service, Time time) {
-  service.tick(time);
-};
+concept ServiceTickAccepts =
+    requires(VehicleControlService& service, Time time) { service.tick(time); };
 
 template <typename Time>
 concept ServiceResetEstopAccepts = requires(VehicleControlService& service, Time time) {

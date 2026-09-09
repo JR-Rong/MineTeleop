@@ -39,9 +39,8 @@ class CurlTlsTrustPolicy {
   }
 
   [[nodiscard]] static CurlTlsTrustPolicy protected_ca_bundle(std::filesystem::path ca_bundle) {
-    return CurlTlsTrustPolicy(
-        CurlTlsTrustMode::ProtectedCaBundle,
-        validate_protected_ca_bundle(std::move(ca_bundle)));
+    return CurlTlsTrustPolicy(CurlTlsTrustMode::ProtectedCaBundle,
+                              validate_protected_ca_bundle(std::move(ca_bundle)));
   }
 
   // This preserves the historical CURL_CA_BUNDLE/SSL_CERT_FILE behavior only
@@ -54,12 +53,17 @@ class CurlTlsTrustPolicy {
   // constructors: an empty path used system trust, while a non-empty path was
   // an app-supplied CA bundle.
   [[nodiscard]] static CurlTlsTrustPolicy from_optional_ca_bundle(std::filesystem::path ca_bundle) {
-    if (ca_bundle.empty()) return system();
+    if (ca_bundle.empty())
+      return system();
     return protected_ca_bundle(std::move(ca_bundle));
   }
 
-  [[nodiscard]] CurlTlsTrustMode mode() const noexcept { return mode_; }
-  [[nodiscard]] const std::filesystem::path& ca_bundle() const noexcept { return ca_bundle_; }
+  [[nodiscard]] CurlTlsTrustMode mode() const noexcept {
+    return mode_;
+  }
+  [[nodiscard]] const std::filesystem::path& ca_bundle() const noexcept {
+    return ca_bundle_;
+  }
 
  private:
   CurlTlsTrustPolicy(CurlTlsTrustMode mode, std::filesystem::path ca_bundle)
@@ -82,15 +86,22 @@ class CurlCaInfoPath {
  public:
   explicit CurlCaInfoPath(const std::filesystem::path& ca_bundle)
 #if defined(_WIN32)
-      : storage_(copy_utf8_bytes(ca_bundle.u8string())) {}
+      : storage_(copy_utf8_bytes(ca_bundle.u8string())){}
 #else
-      : storage_(ca_bundle.string()) {}
+      : storage_(ca_bundle.string()) {
+  }
 #endif
 
-  explicit CurlCaInfoPath(std::u8string_view utf8_path) : storage_(copy_utf8_bytes(utf8_path)) {}
+        explicit CurlCaInfoPath(std::u8string_view utf8_path)
+      : storage_(copy_utf8_bytes(utf8_path)) {
+  }
 
-  [[nodiscard]] const char* c_str() const noexcept { return storage_.c_str(); }
-  [[nodiscard]] const std::string& string() const noexcept { return storage_; }
+  [[nodiscard]] const char* c_str() const noexcept {
+    return storage_.c_str();
+  }
+  [[nodiscard]] const std::string& string() const noexcept {
+    return storage_;
+  }
 
  private:
   [[nodiscard]] static std::string copy_utf8_bytes(std::u8string_view utf8_path) {
@@ -105,16 +116,16 @@ class CurlCaInfoPath {
 };
 
 inline void throw_if_curl_option_failed(CURLcode result, std::string_view option) {
-  if (result == CURLE_OK) return;
-  throw std::runtime_error(
-      "curl TLS option " + std::string(option) + " failed: " + curl_easy_strerror(result));
+  if (result == CURLE_OK)
+    return;
+  throw std::runtime_error("curl TLS option " + std::string(option) +
+                           " failed: " + curl_easy_strerror(result));
 }
 
 }  // namespace detail
 
 [[nodiscard]] inline CurlTlsTrustConfiguration resolve_curl_tls_trust_policy(
-    const CurlTlsTrustPolicy& policy,
-    const char* legacy_curl_ca_bundle = nullptr,
+    const CurlTlsTrustPolicy& policy, const char* legacy_curl_ca_bundle = nullptr,
     const char* legacy_ssl_cert_file = nullptr) {
   CurlTlsTrustConfiguration configuration;
   configuration.mode = policy.mode();
@@ -137,29 +148,25 @@ inline void throw_if_curl_option_failed(CURLcode result, std::string_view option
 }
 
 inline void configure_curl_custom_ca(CURL* curl, const detail::CurlCaInfoPath& ca_bundle) {
-  detail::throw_if_curl_option_failed(
-      curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle.c_str()),
-      "CURLOPT_CAINFO");
+  detail::throw_if_curl_option_failed(curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle.c_str()),
+                                      "CURLOPT_CAINFO");
 #if defined(_WIN32) && LIBCURL_VERSION_NUM >= 0x074600
   // Private PKI certificates may intentionally omit public CRL/OCSP endpoints.
   // Schannel still validates the CA chain and hostname, but accepts an unknown
   // revocation status when no distribution point is available.
   detail::throw_if_curl_option_failed(
-      curl_easy_setopt(
-          curl,
-          CURLOPT_SSL_OPTIONS,
-          static_cast<long>(CURLSSLOPT_REVOKE_BEST_EFFORT)),
+      curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, static_cast<long>(CURLSSLOPT_REVOKE_BEST_EFFORT)),
       "CURLOPT_SSL_OPTIONS");
 #endif
 }
 
 inline void configure_curl_tls_trust_policy(CURL* curl, const CurlTlsTrustPolicy& policy) {
-  if (curl == nullptr) throw std::invalid_argument("curl TLS policy requires a handle");
+  if (curl == nullptr)
+    throw std::invalid_argument("curl TLS policy requires a handle");
 
   const bool allow_legacy_environment = policy.mode() == CurlTlsTrustMode::LegacyEnvironment;
   const auto configuration = resolve_curl_tls_trust_policy(
-      policy,
-      allow_legacy_environment ? std::getenv("CURL_CA_BUNDLE") : nullptr,
+      policy, allow_legacy_environment ? std::getenv("CURL_CA_BUNDLE") : nullptr,
       allow_legacy_environment ? std::getenv("SSL_CERT_FILE") : nullptr);
   if (!configuration.verify_peer || !configuration.verify_hostname) {
     throw std::logic_error("TLS policy cannot disable peer or hostname verification");
@@ -167,12 +174,10 @@ inline void configure_curl_tls_trust_policy(CURL* curl, const CurlTlsTrustPolicy
 
   // These are deliberate every-request settings, rather than backend defaults:
   // HTTPS/WSS must never continue after a certificate or hostname failure.
-  detail::throw_if_curl_option_failed(
-      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L),
-      "CURLOPT_SSL_VERIFYPEER");
-  detail::throw_if_curl_option_failed(
-      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L),
-      "CURLOPT_SSL_VERIFYHOST");
+  detail::throw_if_curl_option_failed(curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L),
+                                      "CURLOPT_SSL_VERIFYPEER");
+  detail::throw_if_curl_option_failed(curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L),
+                                      "CURLOPT_SSL_VERIFYHOST");
   if (configuration.ca_bundle.has_value()) {
     const detail::CurlCaInfoPath ca_bundle(*configuration.ca_bundle);
     configure_curl_custom_ca(curl, ca_bundle);

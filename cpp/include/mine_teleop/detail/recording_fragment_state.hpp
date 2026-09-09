@@ -41,10 +41,8 @@ struct RecordingFragmentSnapshot {
 
 class RecordingFragmentOwner {
  public:
-  RecordingFragmentOwner(
-      std::uint64_t pipeline_generation,
-      std::string session_id,
-      std::string camera_id)
+  RecordingFragmentOwner(std::uint64_t pipeline_generation, std::string session_id,
+                         std::string camera_id)
       : pipeline_generation_(pipeline_generation),
         session_id_(std::move(session_id)),
         camera_id_(std::move(camera_id)) {}
@@ -53,7 +51,8 @@ class RecordingFragmentOwner {
   // filesink has received its final path.  Binding is idempotent only for the
   // same fragment, so a delayed message cannot retarget an existing owner.
   [[nodiscard]] bool bind_path(const std::filesystem::path& path) {
-    if (path.empty()) return false;
+    if (path.empty())
+      return false;
     const auto normalized = path.lexically_normal();
     std::lock_guard lock(mutex_);
     if (path_.empty()) {
@@ -66,7 +65,8 @@ class RecordingFragmentOwner {
 
   void set_started_at_ms(std::int64_t started_at_ms) {
     std::lock_guard lock(mutex_);
-    if (!started_at_ms_.has_value()) started_at_ms_ = started_at_ms;
+    if (!started_at_ms_.has_value())
+      started_at_ms_ = started_at_ms;
   }
 
   // A close message is a necessary but not sufficient completion signal.  A
@@ -74,8 +74,10 @@ class RecordingFragmentOwner {
   // duplicate/later closed message.
   [[nodiscard]] bool mark_closed(std::int64_t ended_at_ms) {
     std::lock_guard lock(mutex_);
-    if (path_.empty() || state_ == RecordingFragmentState::Failed) return false;
-    if (!ended_at_ms_.has_value()) ended_at_ms_ = ended_at_ms;
+    if (path_.empty() || state_ == RecordingFragmentState::Failed)
+      return false;
+    if (!ended_at_ms_.has_value())
+      ended_at_ms_ = ended_at_ms;
     if (state_ == RecordingFragmentState::Started) {
       state_ = RecordingFragmentState::Finalizing;
       ++revision_;
@@ -103,7 +105,8 @@ class RecordingFragmentOwner {
   // may arrive while validation is in progress.
   [[nodiscard]] bool claim_completed() {
     std::lock_guard lock(mutex_);
-    if (state_ != RecordingFragmentState::Finalizing) return false;
+    if (state_ != RecordingFragmentState::Finalizing)
+      return false;
     state_ = RecordingFragmentState::Completed;
     ++revision_;
     return true;
@@ -112,15 +115,8 @@ class RecordingFragmentOwner {
   [[nodiscard]] RecordingFragmentSnapshot snapshot() const {
     std::lock_guard lock(mutex_);
     return {
-        pipeline_generation_,
-        revision_,
-        session_id_,
-        camera_id_,
-        path_,
-        started_at_ms_,
-        ended_at_ms_,
-        state_,
-        failure_,
+        pipeline_generation_, revision_,    session_id_, camera_id_, path_,
+        started_at_ms_,       ended_at_ms_, state_,      failure_,
     };
   }
 
@@ -151,16 +147,13 @@ inline void destroy_recording_fragment_owner(gpointer value) {
   delete static_cast<std::shared_ptr<RecordingFragmentOwner>*>(value);
 }
 
-inline void tag_recording_fragment_owner(
-    GstObject* object,
-    std::shared_ptr<RecordingFragmentOwner> owner) {
-  if (object == nullptr || !owner) return;
+inline void tag_recording_fragment_owner(GstObject* object,
+                                         std::shared_ptr<RecordingFragmentOwner> owner) {
+  if (object == nullptr || !owner)
+    return;
   auto* holder = new std::shared_ptr<RecordingFragmentOwner>(std::move(owner));
-  g_object_set_qdata_full(
-      G_OBJECT(object),
-      recording_fragment_owner_quark(),
-      holder,
-      destroy_recording_fragment_owner);
+  g_object_set_qdata_full(G_OBJECT(object), recording_fragment_owner_quark(), holder,
+                          destroy_recording_fragment_owner);
 }
 
 [[nodiscard]] inline std::shared_ptr<RecordingFragmentOwner> recording_fragment_owner(
@@ -171,11 +164,13 @@ inline void tag_recording_fragment_owner(
         g_object_get_qdata(G_OBJECT(current), recording_fragment_owner_quark()));
     if (holder != nullptr) {
       const auto result = *holder;
-      if (current != source) gst_object_unref(current);
+      if (current != source)
+        gst_object_unref(current);
       return result;
     }
     GstObject* parent = gst_object_get_parent(current);
-    if (current != source) gst_object_unref(current);
+    if (current != source)
+      gst_object_unref(current);
     current = parent;
   }
   return {};
@@ -194,7 +189,8 @@ struct Mp4ProbePadLink {
 
 inline void on_mp4_probe_pad_added(GstElement*, GstPad* source_pad, gpointer user_data) {
   auto* link = static_cast<Mp4ProbePadLink*>(user_data);
-  if (link == nullptr || link->sink == nullptr || link->linked) return;
+  if (link == nullptr || link->sink == nullptr || link->linked)
+    return;
   GstPad* sink_pad = gst_element_get_static_pad(link->sink, "sink");
   if (sink_pad == nullptr) {
     link->failed = true;
@@ -216,12 +212,14 @@ inline void on_mp4_probe_pad_added(GstElement*, GstPad* source_pad, gpointer use
 inline FinalizedMp4Validation validate_finalized_mp4(const std::filesystem::path& path) {
   std::error_code size_error;
   const auto size = std::filesystem::file_size(path, size_error);
-  if (size_error || size < 16) return {false, "MP4 fragment is missing or too small"};
+  if (size_error || size < 16)
+    return {false, "MP4 fragment is missing or too small"};
   if (size > static_cast<std::uintmax_t>(std::numeric_limits<std::streamoff>::max())) {
     return {false, "MP4 fragment is too large for bounded validation"};
   }
   std::ifstream input(path, std::ios::binary);
-  if (!input) return {false, "cannot open MP4 fragment for validation"};
+  if (!input)
+    return {false, "cannot open MP4 fragment for validation"};
 
   bool saw_ftyp = false;
   bool saw_moov = false;
@@ -232,18 +230,20 @@ inline FinalizedMp4Validation validate_finalized_mp4(const std::filesystem::path
     std::array<unsigned char, 16> header{};
     input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     input.read(reinterpret_cast<char*>(header.data()), 8);
-    if (input.gcount() != 8) return {false, "truncated MP4 box header"};
+    if (input.gcount() != 8)
+      return {false, "truncated MP4 box header"};
     const auto read_u32 = [&](std::size_t start) {
       return (static_cast<std::uint64_t>(header[start]) << 24U) |
-          (static_cast<std::uint64_t>(header[start + 1]) << 16U) |
-          (static_cast<std::uint64_t>(header[start + 2]) << 8U) |
-          static_cast<std::uint64_t>(header[start + 3]);
+             (static_cast<std::uint64_t>(header[start + 1]) << 16U) |
+             (static_cast<std::uint64_t>(header[start + 2]) << 8U) |
+             static_cast<std::uint64_t>(header[start + 3]);
     };
     std::uintmax_t box_size = read_u32(0);
     std::size_t header_size = 8;
     if (box_size == 1) {
       input.read(reinterpret_cast<char*>(header.data() + 8), 8);
-      if (input.gcount() != 8) return {false, "truncated extended MP4 box header"};
+      if (input.gcount() != 8)
+        return {false, "truncated extended MP4 box header"};
       box_size = (read_u32(8) << 32U) | read_u32(12);
       header_size = 16;
     } else if (box_size == 0) {
@@ -252,17 +252,15 @@ inline FinalizedMp4Validation validate_finalized_mp4(const std::filesystem::path
     if (box_size < header_size || box_size > size - offset) {
       return {false, "MP4 box extends beyond fragment boundary"};
     }
-    const std::string type{
-        static_cast<char>(header[4]),
-        static_cast<char>(header[5]),
-        static_cast<char>(header[6]),
-        static_cast<char>(header[7])};
+    const std::string type{static_cast<char>(header[4]), static_cast<char>(header[5]),
+                           static_cast<char>(header[6]), static_cast<char>(header[7])};
     saw_ftyp = saw_ftyp || type == "ftyp";
     saw_moov = saw_moov || type == "moov";
     saw_mdat = saw_mdat || type == "mdat";
     offset += box_size;
   }
-  if (offset != size) return {false, "MP4 top-level box count exceeded validation bound"};
+  if (offset != size)
+    return {false, "MP4 top-level box count exceeded validation bound"};
   if (!saw_ftyp || !saw_moov || !saw_mdat) {
     return {false, "MP4 fragment lacks ftyp, moov, or mdat"};
   }
@@ -274,18 +272,21 @@ inline FinalizedMp4Validation validate_finalized_mp4(const std::filesystem::path
 // unplayable MP4 cannot become a pending upload.  It intentionally links the
 // demuxed elementary stream to fakesink rather than requiring a hardware
 // decoder on every vehicle build.
-inline FinalizedMp4Validation probe_finalized_mp4(
-    const std::filesystem::path& path,
-    GstClockTime timeout = 5 * GST_SECOND) {
+inline FinalizedMp4Validation probe_finalized_mp4(const std::filesystem::path& path,
+                                                  GstClockTime timeout = 5 * GST_SECOND) {
   GstElement* pipeline = gst_pipeline_new(nullptr);
   GstElement* source = gst_element_factory_make("filesrc", nullptr);
   GstElement* demux = gst_element_factory_make("qtdemux", nullptr);
   GstElement* sink = gst_element_factory_make("fakesink", nullptr);
   if (pipeline == nullptr || source == nullptr || demux == nullptr || sink == nullptr) {
-    if (pipeline != nullptr) gst_object_unref(pipeline);
-    if (source != nullptr) gst_object_unref(source);
-    if (demux != nullptr) gst_object_unref(demux);
-    if (sink != nullptr) gst_object_unref(sink);
+    if (pipeline != nullptr)
+      gst_object_unref(pipeline);
+    if (source != nullptr)
+      gst_object_unref(source);
+    if (demux != nullptr)
+      gst_object_unref(demux);
+    if (sink != nullptr)
+      gst_object_unref(sink);
     return {false, "MP4 probe requires filesrc, qtdemux, and fakesink"};
   }
   g_object_set(source, "location", path.string().c_str(), nullptr);
@@ -310,9 +311,7 @@ inline FinalizedMp4Validation probe_finalized_mp4(
     return {false, "MP4 probe has no bus"};
   }
   GstMessage* message = gst_bus_timed_pop_filtered(
-      bus,
-      timeout,
-      static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+      bus, timeout, static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
   FinalizedMp4Validation result;
   if (message == nullptr) {
     result = {false, "MP4 probe timed out before EOS"};
@@ -323,13 +322,15 @@ inline FinalizedMp4Validation probe_finalized_mp4(
     gchar* debug = nullptr;
     gst_message_parse_error(message, &error, &debug);
     const std::string reason = error == nullptr ? "unknown qtdemux error" : error->message;
-    if (error != nullptr) g_error_free(error);
+    if (error != nullptr)
+      g_error_free(error);
     g_free(debug);
     result = {false, "MP4 qtdemux probe failed: " + reason};
   } else {
     result = {false, "MP4 probe reached EOS without a demuxed elementary stream"};
   }
-  if (message != nullptr) gst_message_unref(message);
+  if (message != nullptr)
+    gst_message_unref(message);
   gst_object_unref(bus);
   gst_element_set_state(pipeline, GST_STATE_NULL);
   gst_object_unref(pipeline);

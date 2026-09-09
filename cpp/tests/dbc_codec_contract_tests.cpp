@@ -31,16 +31,19 @@ class TestFailure : public std::runtime_error {
 };
 
 void expect(bool condition, std::string_view message) {
-  if (!condition) throw TestFailure(std::string(message));
+  if (!condition)
+    throw TestFailure(std::string(message));
 }
 
 Json read_json(const std::filesystem::path& path) {
   std::ifstream input(path);
-  if (!input) throw TestFailure("cannot open DBC codec contract input: " + path.string());
+  if (!input)
+    throw TestFailure("cannot open DBC codec contract input: " + path.string());
   try {
     return Json::parse(input);
   } catch (const Json::exception& error) {
-    throw TestFailure("cannot parse DBC codec contract input " + path.string() + ": " + error.what());
+    throw TestFailure("cannot parse DBC codec contract input " + path.string() + ": " +
+                      error.what());
   }
 }
 
@@ -55,14 +58,16 @@ std::string replace_index_template(std::string value, int index) {
 
 Json find_manifest_message(const Json& manifest, std::string_view name) {
   for (const auto& message : manifest.at("messages")) {
-    if (message.at("name").get<std::string>() == name) return message;
+    if (message.at("name").get<std::string>() == name)
+      return message;
   }
   for (const auto& family : manifest.at("families")) {
     for (const auto& instance : family.at("instances")) {
-      const auto message_name = replace_index_template(
-          family.at("dbc_message_name_template").get<std::string>(),
-          instance.at("index").get<int>());
-      if (message_name != name) continue;
+      const auto message_name =
+          replace_index_template(family.at("dbc_message_name_template").get<std::string>(),
+                                 instance.at("index").get<int>());
+      if (message_name != name)
+        continue;
       return Json{
           {"name", message_name},
           {"layout", family.at("layout")},
@@ -139,25 +144,13 @@ Command command_from_vector(const Json& value) {
 }
 
 constexpr std::array<std::uint32_t, mine_teleop::vcu::kMotorCount> kMotorStatus01Ids{
-    0x18A0F4D0U,
-    0x18A3F4D0U,
-    0x18A6F4D0U,
-    0x18A9F4D0U,
-    0x18ACF4D0U,
-    0x18AFF4D0U,
-    0x18B2F4D0U,
-    0x18B5F4D0U,
+    0x18A0F4D0U, 0x18A3F4D0U, 0x18A6F4D0U, 0x18A9F4D0U,
+    0x18ACF4D0U, 0x18AFF4D0U, 0x18B2F4D0U, 0x18B5F4D0U,
 };
 
 constexpr std::array<std::uint32_t, mine_teleop::vcu::kMotorCount> kMotorStatus02Ids{
-    0x18A1F4D0U,
-    0x18A4F4D0U,
-    0x18A7F4D0U,
-    0x18AAF4D0U,
-    0x18ADF4D0U,
-    0x18B0F4D0U,
-    0x18B3F4D0U,
-    0x18B6F4D0U,
+    0x18A1F4D0U, 0x18A4F4D0U, 0x18A7F4D0U, 0x18AAF4D0U,
+    0x18ADF4D0U, 0x18B0F4D0U, 0x18B3F4D0U, 0x18B6F4D0U,
 };
 
 constexpr std::array<std::uint32_t, mine_teleop::vcu::kSteeringAxisCount> kSteeringStatusIds{
@@ -253,15 +246,19 @@ void advance_to_ready(ParallelController& controller, const Command& command) {
   expect(controller.ingest(parking_brake_feedback(2)), "parked EPB feedback was rejected");
   expect(controller.ingest(speed_feedback_zero()), "zero-speed feedback was rejected");
   expect(controller.ingest(gear_feedback(1)), "neutral actual-gear feedback was rejected");
-  expect(controller.ingest(driver_gear_request_feedback(1)), "driver neutral request feedback was rejected");
+  expect(controller.ingest(driver_gear_request_feedback(1)),
+         "driver neutral request feedback was rejected");
   expect(controller.request_parallel_handshake(), "N/park/manual handshake setup was rejected");
   expect(controller.set_command(command), "runtime vector command was rejected");
-  for (int index = 0; index < 6; ++index) static_cast<void>(controller.tick());
-  expect(controller.state() == State::WaitParallelHandshake, "initial handshake low period was not emitted");
+  for (int index = 0; index < 6; ++index)
+    static_cast<void>(controller.tick());
+  expect(controller.state() == State::WaitParallelHandshake,
+         "initial handshake low period was not emitted");
 
   expect(controller.ingest(handshake_feedback(5)), "intelligent handshake feedback was rejected");
   static_cast<void>(controller.tick());
-  expect(controller.state() == State::WaitParkingBrakeReleased, "handshake did not advance to EPB release");
+  expect(controller.state() == State::WaitParkingBrakeReleased,
+         "handshake did not advance to EPB release");
 
   expect(controller.ingest(parking_brake_feedback(1)), "EPB release feedback was rejected");
   static_cast<void>(controller.tick());
@@ -269,7 +266,8 @@ void advance_to_ready(ParallelController& controller, const Command& command) {
 
   expect(controller.ingest(gear_feedback(command.gear)), "target gear feedback was rejected");
   static_cast<void>(controller.tick());
-  expect(controller.state() == State::WaitActuatorModes, "gear feedback did not advance to actuator gate");
+  expect(controller.state() == State::WaitActuatorModes,
+         "gear feedback did not advance to actuator gate");
 
   send_mode_feedback(controller);
   static_cast<void>(controller.tick());
@@ -277,13 +275,15 @@ void advance_to_ready(ParallelController& controller, const Command& command) {
 }
 
 void test_ready_frames_match_independent_golden_vectors() {
-  const auto vectors_path = std::filesystem::path("protocol/can/fixtures/jyr010-dbc-codec-vectors.json");
+  const auto vectors_path =
+      std::filesystem::path("protocol/can/fixtures/jyr010-dbc-codec-vectors.json");
   const auto vectors = read_json(vectors_path);
-  const auto manifest = read_json(vectors_path.parent_path() / vectors.at("manifest").get<std::string>());
+  const auto manifest =
+      read_json(vectors_path.parent_path() / vectors.at("manifest").get<std::string>());
   expect(vectors.at("format").get<std::string>() == "mine-teleop-jyr010-dbc-codec-vectors-v1",
-      "unexpected DBC codec vector format");
+         "unexpected DBC codec vector format");
   expect(manifest.at("format").get<std::string>() == "mine-teleop-jyr010-dbc-codec-manifest-v1",
-      "unexpected DBC codec manifest format");
+         "unexpected DBC codec manifest format");
 
   std::map<std::string, Json> vectors_by_name;
   for (const auto& vector : vectors.at("vectors")) {
@@ -296,10 +296,9 @@ void test_ready_frames_match_independent_golden_vectors() {
 
   ParallelController controller;
   advance_to_ready(controller, command);
-  expect(
-      std::string(mine_teleop::vcu::state_name(controller.state())) ==
-          runtime_case.at("expected_state").get<std::string>(),
-      "runtime vector did not reach its declared state");
+  expect(std::string(mine_teleop::vcu::state_name(controller.state())) ==
+             runtime_case.at("expected_state").get<std::string>(),
+         "runtime vector did not reach its declared state");
 
   const auto frames = controller.tick();
   const auto& expected_names = runtime_case.at("expected_vector_names");
@@ -308,13 +307,17 @@ void test_ready_frames_match_independent_golden_vectors() {
     const auto vector_name = expected_names.at(index).get<std::string>();
     const auto vector = vectors_by_name.find(vector_name);
     expect(vector != vectors_by_name.end(), "runtime case references an unknown golden vector");
-    const auto message = find_manifest_message(manifest, vector->second.at("message").get<std::string>());
+    const auto message =
+        find_manifest_message(manifest, vector->second.at("message").get<std::string>());
     const auto expected_id = parse_hex_id(message.at("arbitration_id").get<std::string>());
-    const auto expected_data = parse_hex_payload(vector->second.at("expected_data_hex").get<std::string>());
-    expect(frames[index].id == expected_id, "production codec emitted the wrong 29-bit arbitration ID");
+    const auto expected_data =
+        parse_hex_payload(vector->second.at("expected_data_hex").get<std::string>());
+    expect(frames[index].id == expected_id,
+           "production codec emitted the wrong 29-bit arbitration ID");
     expect(frames[index].extended, "production codec emitted a non-extended CAN frame");
     expect(frames[index].dlc == 8U, "production codec emitted a non-eight-byte CAN frame");
-    expect(frames[index].data == expected_data, "production codec payload differs from independent golden vector");
+    expect(frames[index].data == expected_data,
+           "production codec payload differs from independent golden vector");
   }
 }
 
@@ -342,7 +345,8 @@ void test_application_rejects_nonfinite_and_out_of_range_codec_inputs() {
 
 int main() {
   const std::vector<std::pair<std::string, void (*)()>> tests{
-      {"ready_frames_match_independent_golden_vectors", test_ready_frames_match_independent_golden_vectors},
+      {"ready_frames_match_independent_golden_vectors",
+       test_ready_frames_match_independent_golden_vectors},
       {"application_rejects_nonfinite_and_out_of_range_codec_inputs",
        test_application_rejects_nonfinite_and_out_of_range_codec_inputs},
   };

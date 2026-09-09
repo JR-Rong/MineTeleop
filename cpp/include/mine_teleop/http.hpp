@@ -56,10 +56,8 @@ class HttpClient {
       std::chrono::milliseconds timeout,
       std::vector<std::string> resolve_entries,
       std::filesystem::path ca_bundle);
-  HttpClient(
-      std::chrono::milliseconds timeout,
-      std::vector<std::string> resolve_entries,
-      CurlTlsTrustPolicy tls_trust_policy);
+  HttpClient(std::chrono::milliseconds timeout, std::vector<std::string> resolve_entries,
+             CurlTlsTrustPolicy tls_trust_policy);
 
   [[nodiscard]] HttpResponse get(std::string_view url) const;
   [[nodiscard]] HttpResponse get(std::string_view url, const HttpHeaders& headers) const;

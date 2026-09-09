@@ -33,35 +33,33 @@ namespace {
 #if defined(__APPLE__)
 [[nodiscard]] bool apple_ca_property_is_yes(CFTypeRef value) {
   return value != nullptr && CFGetTypeID(value) == CFStringGetTypeID() &&
-      CFStringCompare(
-          static_cast<CFStringRef>(value),
-          CFSTR("Yes"),
-          kCFCompareCaseInsensitive) == kCFCompareEqualTo;
+         CFStringCompare(static_cast<CFStringRef>(value), CFSTR("Yes"),
+                         kCFCompareCaseInsensitive) == kCFCompareEqualTo;
 }
 
 [[nodiscard]] bool is_apple_ca_certificate(SecCertificateRef certificate) {
   const void* keys[] = {kSecOIDBasicConstraints};
   CFArrayRef requested_keys = CFArrayCreate(
-      kCFAllocatorDefault,
-      keys,
-      static_cast<CFIndex>(std::size(keys)),
-      &kCFTypeArrayCallBacks);
-  if (requested_keys == nullptr) return false;
+      kCFAllocatorDefault, keys, static_cast<CFIndex>(std::size(keys)), &kCFTypeArrayCallBacks);
+  if (requested_keys == nullptr)
+    return false;
 
   CFErrorRef error = nullptr;
   CFDictionaryRef values = SecCertificateCopyValues(certificate, requested_keys, &error);
   CFRelease(requested_keys);
-  if (error != nullptr) CFRelease(error);
-  if (values == nullptr) return false;
+  if (error != nullptr)
+    CFRelease(error);
+  if (values == nullptr)
+    return false;
 
-  const auto* basic_constraints = static_cast<CFDictionaryRef>(
-      CFDictionaryGetValue(values, kSecOIDBasicConstraints));
+  const auto* basic_constraints =
+      static_cast<CFDictionaryRef>(CFDictionaryGetValue(values, kSecOIDBasicConstraints));
   if (basic_constraints == nullptr) {
     CFRelease(values);
     return false;
   }
-  const auto* properties = static_cast<CFArrayRef>(
-      CFDictionaryGetValue(basic_constraints, kSecPropertyKeyValue));
+  const auto* properties =
+      static_cast<CFArrayRef>(CFDictionaryGetValue(basic_constraints, kSecPropertyKeyValue));
   if (properties == nullptr) {
     CFRelease(values);
     return false;
@@ -70,9 +68,10 @@ namespace {
   bool is_ca = false;
   for (CFIndex index = 0; index < CFArrayGetCount(properties); ++index) {
     const auto* property = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(properties, index));
-    if (property == nullptr) continue;
-    const auto* label = static_cast<CFStringRef>(
-        CFDictionaryGetValue(property, kSecPropertyKeyLabel));
+    if (property == nullptr)
+      continue;
+    const auto* label =
+        static_cast<CFStringRef>(CFDictionaryGetValue(property, kSecPropertyKeyLabel));
     if (label == nullptr ||
         CFStringCompare(label, CFSTR("Certificate Authority"), 0) != kCFCompareEqualTo) {
       continue;
@@ -86,33 +85,25 @@ namespace {
 
 void validate_pem_ca_bundle_contents(const std::filesystem::path& ca_bundle) {
   std::ifstream input(ca_bundle, std::ios::binary);
-  const std::string contents{
-      std::istreambuf_iterator<char>(input),
-      std::istreambuf_iterator<char>()};
-  CFDataRef data = CFDataCreate(
-      kCFAllocatorDefault,
-      reinterpret_cast<const UInt8*>(contents.data()),
-      static_cast<CFIndex>(contents.size()));
+  const std::string contents{std::istreambuf_iterator<char>(input),
+                             std::istreambuf_iterator<char>()};
+  CFDataRef data =
+      CFDataCreate(kCFAllocatorDefault, reinterpret_cast<const UInt8*>(contents.data()),
+                   static_cast<CFIndex>(contents.size()));
   if (data == nullptr) {
-    throw std::invalid_argument(
-        "TLS CA bundle cannot allocate PEM validation data: " + ca_bundle.string());
+    throw std::invalid_argument("TLS CA bundle cannot allocate PEM validation data: " +
+                                ca_bundle.string());
   }
 
   SecExternalFormat input_format = kSecFormatPEMSequence;
   SecExternalItemType item_type = kSecItemTypeAggregate;
   CFArrayRef items = nullptr;
-  const OSStatus status = SecItemImport(
-      data,
-      nullptr,
-      &input_format,
-      &item_type,
-      0,
-      nullptr,
-      nullptr,
-      &items);
+  const OSStatus status =
+      SecItemImport(data, nullptr, &input_format, &item_type, 0, nullptr, nullptr, &items);
   CFRelease(data);
   if (status != errSecSuccess || items == nullptr || CFArrayGetCount(items) == 0) {
-    if (items != nullptr) CFRelease(items);
+    if (items != nullptr)
+      CFRelease(items);
     throw std::invalid_argument(
         "TLS CA bundle contains invalid PEM certificate data: " + ca_bundle.string() +
         " (Security status " + std::to_string(status) + ")");
@@ -133,14 +124,15 @@ void validate_pem_ca_bundle_contents(const std::filesystem::path& ca_bundle) {
   }
   CFRelease(items);
   if (!contains_only_ca_certificates) {
-    throw std::invalid_argument(
-        "TLS CA bundle must contain only PEM CA certificates: " + ca_bundle.string());
+    throw std::invalid_argument("TLS CA bundle must contain only PEM CA certificates: " +
+                                ca_bundle.string());
   }
 }
 #else
 [[nodiscard]] std::string openssl_pem_error() {
   const auto error = ERR_peek_last_error();
-  if (error == 0) return {};
+  if (error == 0)
+    return {};
   std::array<char, 256> detail{};
   ERR_error_string_n(error, detail.data(), detail.size());
   return detail.data();
@@ -156,7 +148,8 @@ void validate_pem_ca_bundle_contents(const std::filesystem::path& ca_bundle) {
   BIO_free(input);
   const auto parse_error = openssl_pem_error();
   if (entries == nullptr || !parse_error.empty()) {
-    if (entries != nullptr) sk_X509_INFO_pop_free(entries, X509_INFO_free);
+    if (entries != nullptr)
+      sk_X509_INFO_pop_free(entries, X509_INFO_free);
     throw std::invalid_argument(
         "TLS CA bundle contains invalid PEM certificate data: " + ca_bundle.string() +
         (parse_error.empty() ? std::string{} : ": " + parse_error));
@@ -174,12 +167,12 @@ void validate_pem_ca_bundle_contents(const std::filesystem::path& ca_bundle) {
   }
   sk_X509_INFO_pop_free(entries, X509_INFO_free);
   if (!contains_ca_certificate) {
-    throw std::invalid_argument(
-        "TLS CA bundle must contain one or more PEM CA certificates: " + ca_bundle.string());
+    throw std::invalid_argument("TLS CA bundle must contain one or more PEM CA certificates: " +
+                                ca_bundle.string());
   }
   if (contains_non_ca_entry) {
-    throw std::invalid_argument(
-        "TLS CA bundle must contain only PEM CA certificates: " + ca_bundle.string());
+    throw std::invalid_argument("TLS CA bundle must contain only PEM CA certificates: " +
+                                ca_bundle.string());
   }
 }
 #endif
@@ -187,7 +180,8 @@ void validate_pem_ca_bundle_contents(const std::filesystem::path& ca_bundle) {
 }  // namespace
 
 std::filesystem::path validate_protected_ca_bundle(std::filesystem::path ca_bundle) {
-  if (ca_bundle.empty()) throw std::invalid_argument("TLS CA bundle path is empty");
+  if (ca_bundle.empty())
+    throw std::invalid_argument("TLS CA bundle path is empty");
 
   std::error_code error;
   const auto link_status = std::filesystem::symlink_status(ca_bundle, error);
@@ -198,8 +192,8 @@ std::filesystem::path validate_protected_ca_bundle(std::filesystem::path ca_bund
     if (error == std::errc::permission_denied) {
       throw std::invalid_argument("TLS CA bundle is unreadable: " + ca_bundle.string());
     }
-    throw std::invalid_argument(
-        "TLS CA bundle cannot be inspected: " + ca_bundle.string() + ": " + error.message());
+    throw std::invalid_argument("TLS CA bundle cannot be inspected: " + ca_bundle.string() + ": " +
+                                error.message());
   }
   if (!std::filesystem::exists(link_status)) {
     throw std::invalid_argument("TLS CA bundle does not exist: " + ca_bundle.string());
@@ -211,26 +205,28 @@ std::filesystem::path validate_protected_ca_bundle(std::filesystem::path ca_bund
     throw std::invalid_argument("TLS CA bundle must be a regular file: " + ca_bundle.string());
   }
 
-  constexpr auto kReadPermissions =
-      std::filesystem::perms::owner_read |
-      std::filesystem::perms::group_read |
-      std::filesystem::perms::others_read;
+  constexpr auto kReadPermissions = std::filesystem::perms::owner_read |
+                                    std::filesystem::perms::group_read |
+                                    std::filesystem::perms::others_read;
   if (link_status.permissions() != std::filesystem::perms::unknown &&
       (link_status.permissions() & kReadPermissions) == std::filesystem::perms::none) {
     throw std::invalid_argument("TLS CA bundle is unreadable: " + ca_bundle.string());
   }
 
   const auto size = std::filesystem::file_size(ca_bundle, error);
-  if (error) throw std::invalid_argument("TLS CA bundle is unreadable: " + ca_bundle.string());
-  if (size == 0) throw std::invalid_argument("TLS CA bundle is empty: " + ca_bundle.string());
+  if (error)
+    throw std::invalid_argument("TLS CA bundle is unreadable: " + ca_bundle.string());
+  if (size == 0)
+    throw std::invalid_argument("TLS CA bundle is empty: " + ca_bundle.string());
 
   std::ifstream input(ca_bundle, std::ios::binary);
-  if (!input) throw std::invalid_argument("TLS CA bundle is unreadable: " + ca_bundle.string());
+  if (!input)
+    throw std::invalid_argument("TLS CA bundle is unreadable: " + ca_bundle.string());
 
   const auto canonical = std::filesystem::canonical(ca_bundle, error);
   if (error) {
-    throw std::invalid_argument(
-        "TLS CA bundle cannot be canonicalized: " + ca_bundle.string() + ": " + error.message());
+    throw std::invalid_argument("TLS CA bundle cannot be canonicalized: " + ca_bundle.string() +
+                                ": " + error.message());
   }
   validate_pem_ca_bundle_contents(canonical);
   return canonical;
@@ -325,19 +321,13 @@ struct HttpClient::Impl {
 HttpClient::HttpClient(std::chrono::milliseconds timeout)
     : HttpClient(timeout, {}, CurlTlsTrustPolicy::system()) {}
 
-HttpClient::HttpClient(
-    std::chrono::milliseconds timeout,
-    std::vector<std::string> resolve_entries,
-    std::filesystem::path ca_bundle)
-    : HttpClient(
-          timeout,
-          std::move(resolve_entries),
-          CurlTlsTrustPolicy::from_optional_ca_bundle(std::move(ca_bundle))) {}
+HttpClient::HttpClient(std::chrono::milliseconds timeout, std::vector<std::string> resolve_entries,
+                       std::filesystem::path ca_bundle)
+    : HttpClient(timeout, std::move(resolve_entries),
+                 CurlTlsTrustPolicy::from_optional_ca_bundle(std::move(ca_bundle))) {}
 
-HttpClient::HttpClient(
-    std::chrono::milliseconds timeout,
-    std::vector<std::string> resolve_entries,
-    CurlTlsTrustPolicy tls_trust_policy)
+HttpClient::HttpClient(std::chrono::milliseconds timeout, std::vector<std::string> resolve_entries,
+                       CurlTlsTrustPolicy tls_trust_policy)
     : timeout_(timeout) {
   if (timeout_.count() <= 0) throw std::invalid_argument("HTTP timeout must be positive");
   ensure_curl_global();
@@ -481,8 +471,7 @@ TimeSyncStatus SynchronizedClock::synchronize(
       throw std::runtime_error("signaling time endpoint returned an invalid four-timestamp sample");
     }
     const auto wall_elapsed_ms = client_receive_ms - client_send_ms;
-    const auto monotonic_elapsed_ms =
-        client_receive_monotonic_ms - client_send_monotonic_ms;
+    const auto monotonic_elapsed_ms = client_receive_monotonic_ms - client_send_monotonic_ms;
     // A system-clock step while measuring the request would corrupt both RTT
     // and offset.  Reject that sample rather than treating it as an ordinary
     // long network request; the caller will retain/retry its prior sync state.
@@ -538,11 +527,10 @@ ClockSample SynchronizedClock::sample() const {
   if (!status_.synchronized) {
     return {mine_teleop::utc_now_ms(), monotonic};
   }
-  return {
-      UtcMillis{synchronized_anchor_ms_ +
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              std::chrono::steady_clock::now() - steady_anchor_).count()},
-      monotonic};
+  return {UtcMillis{synchronized_anchor_ms_ + std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                  std::chrono::steady_clock::now() - steady_anchor_)
+                                                  .count()},
+          monotonic};
 }
 
 std::int64_t SynchronizedClock::from_local_system_ms(std::int64_t local_time_ms) const {

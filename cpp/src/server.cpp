@@ -188,7 +188,9 @@ constexpr short kPollWrite = POLLWRNORM;
 
 int last_socket_error() { return WSAGetLastError(); }
 bool socket_error_interrupted(int error) { return error == WSAEINTR; }
-bool socket_error_would_block(int error) { return error == WSAEWOULDBLOCK; }
+bool socket_error_would_block(int error) {
+  return error == WSAEWOULDBLOCK;
+}
 bool socket_error_closed(int error) {
   return error == WSAENOTSOCK || error == WSAEINVAL;
 }
@@ -208,7 +210,9 @@ constexpr short kPollWrite = POLLOUT;
 
 int last_socket_error() { return errno; }
 bool socket_error_interrupted(int error) { return error == EINTR; }
-bool socket_error_would_block(int error) { return error == EAGAIN || error == EWOULDBLOCK; }
+bool socket_error_would_block(int error) {
+  return error == EAGAIN || error == EWOULDBLOCK;
+}
 bool socket_error_closed(int error) { return error == EBADF || error == EINVAL; }
 std::string socket_error_message(int error) { return std::strerror(error); }
 std::string address_error_message(int error) { return ::gai_strerror(error); }
@@ -281,32 +285,32 @@ void set_socket_nonblocking(SocketHandle socket, bool enabled) {
 #if defined(_WIN32)
   u_long mode = enabled ? 1UL : 0UL;
   if (::ioctlsocket(native_socket(socket), FIONBIO, &mode) != 0) {
-    throw std::runtime_error("cannot configure HTTP client socket: " + socket_error_message(last_socket_error()));
+    throw std::runtime_error("cannot configure HTTP client socket: " +
+                             socket_error_message(last_socket_error()));
   }
 #else
   const int flags = ::fcntl(native_socket(socket), F_GETFL, 0);
-  if (flags < 0 || ::fcntl(
-                       native_socket(socket),
-                       F_SETFL,
-                       enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK) != 0) {
-    throw std::runtime_error("cannot configure HTTP client socket: " + socket_error_message(last_socket_error()));
+  if (flags < 0 || ::fcntl(native_socket(socket), F_SETFL,
+                           enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK) != 0) {
+    throw std::runtime_error("cannot configure HTTP client socket: " +
+                             socket_error_message(last_socket_error()));
   }
 #endif
 }
 
 std::chrono::milliseconds remaining_until(std::chrono::steady_clock::time_point deadline) {
   const auto now = std::chrono::steady_clock::now();
-  if (now >= deadline) return std::chrono::milliseconds::zero();
+  if (now >= deadline)
+    return std::chrono::milliseconds::zero();
   const auto remaining = deadline - now;
   auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
-  if (milliseconds < remaining) ++milliseconds;
+  if (milliseconds < remaining)
+    ++milliseconds;
   return std::max(milliseconds, std::chrono::milliseconds(1));
 }
 
-bool wait_socket_until(
-    SocketHandle socket,
-    short events,
-    std::chrono::steady_clock::time_point deadline) {
+bool wait_socket_until(SocketHandle socket, short events,
+                       std::chrono::steady_clock::time_point deadline) {
 #if defined(_WIN32)
   WSAPOLLFD descriptor{native_socket(socket), events, 0};
 #else
@@ -314,7 +318,8 @@ bool wait_socket_until(
 #endif
   while (true) {
     const auto remaining = remaining_until(deadline);
-    if (remaining <= std::chrono::milliseconds::zero()) return false;
+    if (remaining <= std::chrono::milliseconds::zero())
+      return false;
     const auto timeout = static_cast<int>(std::min<std::int64_t>(
         remaining.count(), static_cast<std::int64_t>(std::numeric_limits<int>::max())));
 #if defined(_WIN32)
@@ -322,8 +327,10 @@ bool wait_socket_until(
 #else
     const int result = ::poll(&descriptor, 1, timeout);
 #endif
-    if (result > 0) return (descriptor.revents & (events | POLLERR | POLLHUP | POLLNVAL)) != 0;
-    if (result == 0) return false;
+    if (result > 0)
+      return (descriptor.revents & (events | POLLERR | POLLHUP | POLLNVAL)) != 0;
+    if (result == 0)
+      return false;
     const int error = last_socket_error();
     if (!socket_error_interrupted(error)) {
       throw std::runtime_error("HTTP socket poll failed: " + socket_error_message(error));
@@ -370,12 +377,16 @@ class TooManyRequests final : public std::runtime_error {
 class CleansedString final {
  public:
   explicit CleansedString(std::string value) : value_(std::move(value)) {}
-  ~CleansedString() { cleanse_secret(value_); }
+  ~CleansedString() {
+    cleanse_secret(value_);
+  }
 
   CleansedString(const CleansedString&) = delete;
   CleansedString& operator=(const CleansedString&) = delete;
 
-  [[nodiscard]] std::string_view view() const noexcept { return value_; }
+  [[nodiscard]] std::string_view view() const noexcept {
+    return value_;
+  }
 
  private:
   std::string value_;
@@ -426,24 +437,26 @@ std::string trim(std::string value) {
 }
 
 bool http_header_field_name_valid(std::string_view name) {
-  if (name.empty()) return false;
+  if (name.empty())
+    return false;
   return std::all_of(name.begin(), name.end(), [](unsigned char value) {
     return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
-        (value >= '0' && value <= '9') || value == '!' || value == '#' || value == '$' ||
-        value == '%' || value == '&' || value == '\'' || value == '*' || value == '+' ||
-        value == '-' || value == '.' || value == '^' || value == '_' || value == '`' ||
-        value == '|' || value == '~';
+           (value >= '0' && value <= '9') || value == '!' || value == '#' || value == '$' ||
+           value == '%' || value == '&' || value == '\'' || value == '*' || value == '+' ||
+           value == '-' || value == '.' || value == '^' || value == '_' || value == '`' ||
+           value == '|' || value == '~';
   });
 }
 
 bool http_host_value_valid(std::string_view value) {
-  if (value.empty()) return false;
+  if (value.empty())
+    return false;
   return std::all_of(value.begin(), value.end(), [](unsigned char character) {
     // Leading/trailing OWS is removed before this check. A Host authority may
     // contain ':' and IPv6 brackets, but cannot contain whitespace, controls,
     // a URI path/query/fragment, userinfo, or a backslash path separator.
-    return character >= 0x21 && character <= 0x7e && character != '/' &&
-        character != '?' && character != '#' && character != '@' && character != '\\';
+    return character >= 0x21 && character <= 0x7e && character != '/' && character != '?' &&
+           character != '#' && character != '@' && character != '\\';
   });
 }
 
@@ -609,20 +622,20 @@ std::optional<std::string> optional_yaml_string(
   }
 }
 
-std::int64_t required_positive_integer_node(
-    const YAML::Node& node,
-    std::string_view field,
-    std::string_view field_display,
-    std::int64_t fallback) {
+std::int64_t required_positive_integer_node(const YAML::Node& node, std::string_view field,
+                                            std::string_view field_display, std::int64_t fallback) {
   const std::string name(field);
-  if (!node || !node.IsMap() || !node[name]) return fallback;
+  if (!node || !node.IsMap() || !node[name])
+    return fallback;
   std::int64_t value = 0;
   try {
     value = node[name].as<std::int64_t>();
   } catch (const YAML::Exception& error) {
-    throw std::invalid_argument(std::string(field_display) + " must be an integer: " + error.what());
+    throw std::invalid_argument(std::string(field_display) +
+                                " must be an integer: " + error.what());
   }
-  if (value <= 0) throw std::invalid_argument(std::string(field_display) + " must be positive");
+  if (value <= 0)
+    throw std::invalid_argument(std::string(field_display) + " must be positive");
   return value;
 }
 
@@ -662,28 +675,30 @@ std::string load_identity_secret(
 }
 
 bool valid_legacy_password_removal_date(std::string_view value) {
-  if (value.size() != 10 || value[4] != '-' || value[7] != '-') return false;
+  if (value.size() != 10 || value[4] != '-' || value[7] != '-')
+    return false;
   for (const auto index : std::array<std::size_t, 8>{0, 1, 2, 3, 5, 6, 8, 9}) {
-    if (value[index] < '0' || value[index] > '9') return false;
+    if (value[index] < '0' || value[index] > '9')
+      return false;
   }
-  const int year = (value[0] - '0') * 1000 + (value[1] - '0') * 100 +
-      (value[2] - '0') * 10 + (value[3] - '0');
+  const int year =
+      (value[0] - '0') * 1000 + (value[1] - '0') * 100 + (value[2] - '0') * 10 + (value[3] - '0');
   const unsigned month = static_cast<unsigned>((value[5] - '0') * 10 + (value[6] - '0'));
   const unsigned day = static_cast<unsigned>((value[8] - '0') * 10 + (value[9] - '0'));
-  return std::chrono::year_month_day{
-      std::chrono::year{year}, std::chrono::month{month}, std::chrono::day{day}}
+  return std::chrono::year_month_day{std::chrono::year{year}, std::chrono::month{month},
+                                     std::chrono::day{day}}
       .ok();
 }
 
 bool legacy_password_migration_is_active(std::string_view value) {
-  if (!valid_legacy_password_removal_date(value)) return false;
-  const int year = (value[0] - '0') * 1000 + (value[1] - '0') * 100 +
-      (value[2] - '0') * 10 + (value[3] - '0');
+  if (!valid_legacy_password_removal_date(value))
+    return false;
+  const int year =
+      (value[0] - '0') * 1000 + (value[1] - '0') * 100 + (value[2] - '0') * 10 + (value[3] - '0');
   const unsigned month = static_cast<unsigned>((value[5] - '0') * 10 + (value[6] - '0'));
   const unsigned day = static_cast<unsigned>((value[8] - '0') * 10 + (value[9] - '0'));
-  const std::chrono::sys_days removal_day{
-      std::chrono::year_month_day{
-          std::chrono::year{year}, std::chrono::month{month}, std::chrono::day{day}}};
+  const std::chrono::sys_days removal_day{std::chrono::year_month_day{
+      std::chrono::year{year}, std::chrono::month{month}, std::chrono::day{day}}};
   const std::chrono::sys_days today =
       std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now());
   return today <= removal_day;
@@ -739,13 +754,11 @@ double required_nonnegative_number(const Json& value, std::string_view key) {
   return parsed;
 }
 
-std::int64_t control_lease_renew_at(
-    MonotonicMillis received_at,
-    MonotonicMillis expires_at) {
-  if (expires_at.value <= received_at.value) return received_at.value;
-  return detail::saturating_deadline_ms(
-      received_at.value,
-      (expires_at.value - received_at.value) / 3);
+std::int64_t control_lease_renew_at(MonotonicMillis received_at, MonotonicMillis expires_at) {
+  if (expires_at.value <= received_at.value)
+    return received_at.value;
+  return detail::saturating_deadline_ms(received_at.value,
+                                        (expires_at.value - received_at.value) / 3);
 }
 
 std::int64_t monotonic_now_ms() {
@@ -983,13 +996,15 @@ std::string status_reason(int status) {
     case 401: return "Unauthorized";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
-    case 408: return "Request Timeout";
+    case 408:
+      return "Request Timeout";
     case 409: return "Conflict";
     case 410: return "Gone";
     case 413: return "Payload Too Large";
     case 429: return "Too Many Requests";
     case 500: return "Internal Server Error";
-    case 503: return "Service Unavailable";
+    case 503:
+      return "Service Unavailable";
     default: return "Response";
   }
 }
@@ -999,47 +1014,40 @@ class HttpDeadlineExceeded final : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
-std::size_t receive_until(
-    SocketHandle socket,
-    char* output,
-    std::size_t output_size,
-    std::chrono::steady_clock::time_point deadline,
-    std::string_view phase) {
+std::size_t receive_until(SocketHandle socket, char* output, std::size_t output_size,
+                          std::chrono::steady_clock::time_point deadline, std::string_view phase) {
   while (true) {
     if (!wait_socket_until(socket, kPollRead, deadline)) {
       throw HttpDeadlineExceeded("HTTP " + std::string(phase) + " timed out");
     }
-    const auto result = ::recv(
-        native_socket(socket), output, socket_buffer_size(output_size), 0);
+    const auto result = ::recv(native_socket(socket), output, socket_buffer_size(output_size), 0);
     if (result < 0) {
       const int error = last_socket_error();
-      if (socket_error_interrupted(error) || socket_error_would_block(error)) continue;
+      if (socket_error_interrupted(error) || socket_error_would_block(error))
+        continue;
       throw std::runtime_error("recv failed: " + socket_error_message(error));
     }
     return static_cast<std::size_t>(result);
   }
 }
 
-void send_all_until(
-    SocketHandle socket,
-    std::string_view value,
-    std::chrono::steady_clock::time_point deadline) {
+void send_all_until(SocketHandle socket, std::string_view value,
+                    std::chrono::steady_clock::time_point deadline) {
   std::size_t sent = 0;
   while (sent < value.size()) {
     if (!wait_socket_until(socket, kPollWrite, deadline)) {
       throw HttpDeadlineExceeded("HTTP response write timed out");
     }
-    const auto result = ::send(
-        native_socket(socket),
-        value.data() + sent,
-        socket_buffer_size(value.size() - sent),
-        kSendFlags);
+    const auto result = ::send(native_socket(socket), value.data() + sent,
+                               socket_buffer_size(value.size() - sent), kSendFlags);
     if (result < 0) {
       const int error = last_socket_error();
-      if (socket_error_interrupted(error) || socket_error_would_block(error)) continue;
+      if (socket_error_interrupted(error) || socket_error_would_block(error))
+        continue;
       throw std::runtime_error("send failed: " + socket_error_message(error));
     }
-    if (result == 0) throw std::runtime_error("connection closed while sending response");
+    if (result == 0)
+      throw std::runtime_error("connection closed while sending response");
     sent += static_cast<std::size_t>(result);
   }
 }
@@ -1073,10 +1081,8 @@ std::string http_response_header(const ServerResponse& response) {
   return header.str();
 }
 
-void send_http_response_until(
-    SocketHandle socket,
-    const ServerResponse& response,
-    std::chrono::steady_clock::time_point deadline) {
+void send_http_response_until(SocketHandle socket, const ServerResponse& response,
+                              std::chrono::steady_clock::time_point deadline) {
   const auto header = http_response_header(response);
   send_all_until(socket, header, deadline);
   send_all_until(socket, response.body, deadline);
@@ -1106,7 +1112,8 @@ void add_request_id_header(ServerResponse& response, std::string_view request_id
 }
 
 std::size_t parse_content_length(std::string_view value) {
-  if (value.empty()) throw std::invalid_argument("invalid Content-Length header");
+  if (value.empty())
+    throw std::invalid_argument("invalid Content-Length header");
   std::size_t result = 0;
   for (const unsigned char character : value) {
     if (character < '0' || character > '9') {
@@ -1121,19 +1128,17 @@ std::size_t parse_content_length(std::string_view value) {
   return result;
 }
 
-HttpRequest parse_request(
-    SocketHandle socket,
-    std::size_t max_body_bytes,
-    std::chrono::milliseconds header_read_timeout,
-    std::chrono::milliseconds body_read_timeout) {
+HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes,
+                          std::chrono::milliseconds header_read_timeout,
+                          std::chrono::milliseconds body_read_timeout) {
   constexpr std::size_t max_headers = 64 * 1024;
   std::string wire;
   std::array<char, 16 * 1024> buffer{};
   std::size_t header_end = std::string::npos;
   const auto header_deadline = std::chrono::steady_clock::now() + header_read_timeout;
   while ((header_end = wire.find("\r\n\r\n")) == std::string::npos) {
-    const auto received = receive_until(
-        socket, buffer.data(), buffer.size(), header_deadline, "header read");
+    const auto received =
+        receive_until(socket, buffer.data(), buffer.size(), header_deadline, "header read");
     if (received == 0) throw std::invalid_argument("client closed before sending HTTP headers");
     wire.append(buffer.data(), received);
     if (wire.size() > max_headers) throw std::invalid_argument("HTTP headers too large");
@@ -1154,7 +1159,8 @@ HttpRequest parse_request(
   std::size_t host_count = 0;
   std::size_t origin_count = 0;
   while (std::getline(headers, header)) {
-    if (!header.empty() && header.back() == '\r') header.pop_back();
+    if (!header.empty() && header.back() == '\r')
+      header.pop_back();
     if (header.empty()) continue;
     if (header.find('\r') != std::string::npos) {
       throw std::invalid_argument("invalid HTTP header");
@@ -1162,7 +1168,8 @@ HttpRequest parse_request(
     const auto separator = header.find(':');
     if (separator == std::string::npos) throw std::invalid_argument("invalid HTTP header");
     const auto raw_name = std::string_view(header).substr(0, separator);
-    if (!http_header_field_name_valid(raw_name)) throw std::invalid_argument("invalid HTTP header");
+    if (!http_header_field_name_valid(raw_name))
+      throw std::invalid_argument("invalid HTTP header");
     const auto name = lower(std::string(raw_name));
     const auto value = trim(header.substr(separator + 1));
     if (name == "transfer-encoding") {
@@ -1170,12 +1177,15 @@ HttpRequest parse_request(
     }
     if (name == "host") {
       ++host_count;
-      if (host_count > 1) throw std::invalid_argument("duplicate Host header");
-      if (!http_host_value_valid(value)) throw std::invalid_argument("invalid Host header");
+      if (host_count > 1)
+        throw std::invalid_argument("duplicate Host header");
+      if (!http_host_value_valid(value))
+        throw std::invalid_argument("invalid Host header");
     }
     if (name == "origin") {
       ++origin_count;
-      if (origin_count > 1) throw std::invalid_argument("duplicate Origin header");
+      if (origin_count > 1)
+        throw std::invalid_argument("duplicate Origin header");
     }
     if (name == "content-length" && request.headers.contains(name)) {
       throw std::invalid_argument("duplicate Content-Length header");
@@ -1194,8 +1204,8 @@ HttpRequest parse_request(
   const auto body_start = header_end + 4;
   const auto body_deadline = std::chrono::steady_clock::now() + body_read_timeout;
   while (wire.size() - body_start < content_length) {
-    const auto received = receive_until(
-        socket, buffer.data(), buffer.size(), body_deadline, "body read");
+    const auto received =
+        receive_until(socket, buffer.data(), buffer.size(), body_deadline, "body read");
     if (received == 0) throw std::invalid_argument("client closed before sending HTTP body");
     wire.append(buffer.data(), received);
   }
@@ -1222,17 +1232,20 @@ HttpRequest parse_request(
 
 bool websocket_upgrade_requested(const HttpRequest& request) {
   const auto upgrade = request.headers.find("upgrade");
-  if (upgrade == request.headers.end() || lower(trim(upgrade->second)) != "websocket") return false;
+  if (upgrade == request.headers.end() || lower(trim(upgrade->second)) != "websocket")
+    return false;
   const auto connection = request.headers.find("connection");
-  if (connection == request.headers.end()) return false;
+  if (connection == request.headers.end())
+    return false;
   std::size_t start = 0;
   while (start <= connection->second.size()) {
     const auto end = connection->second.find(',', start);
     const auto token = lower(trim(connection->second.substr(
-        start,
-        end == std::string::npos ? std::string::npos : end - start)));
-    if (token == "upgrade") return true;
-    if (end == std::string::npos) break;
+        start, end == std::string::npos ? std::string::npos : end - start)));
+    if (token == "upgrade")
+      return true;
+    if (end == std::string::npos)
+      break;
     start = end + 1;
   }
   return false;
@@ -1257,15 +1270,16 @@ std::optional<LoopbackHttpAuthority> loopback_http_authority(std::string authori
       break;
     }
   }
-  if (host.empty()) return std::nullopt;
-  if (port.empty() || !std::all_of(port.begin(), port.end(), [](unsigned char value) {
-        return std::isdigit(value) != 0;
-      })) {
+  if (host.empty())
+    return std::nullopt;
+  if (port.empty() || !std::all_of(port.begin(), port.end(),
+                                   [](unsigned char value) { return std::isdigit(value) != 0; })) {
     return std::nullopt;
   }
   try {
     const auto parsed = std::stoul(std::string(port));
-    if (parsed == 0 || parsed > 65535) return std::nullopt;
+    if (parsed == 0 || parsed > 65535)
+      return std::nullopt;
     return LoopbackHttpAuthority{std::move(host), static_cast<std::uint16_t>(parsed)};
   } catch (const std::exception&) {
     return std::nullopt;
@@ -1274,7 +1288,8 @@ std::optional<LoopbackHttpAuthority> loopback_http_authority(std::string authori
 
 bool application_json_content_type(const HttpRequest& request) {
   const auto found = request.headers.find("content-type");
-  if (found == request.headers.end()) return false;
+  if (found == request.headers.end())
+    return false;
   const auto value = lower(trim(found->second));
   const auto separator = value.find(';');
   return trim(value.substr(0, separator)) == "application/json";
@@ -1284,14 +1299,17 @@ bool trusted_local_mutation_request(const HttpRequest& request, std::string_view
   const auto host = request.headers.find("host");
   const auto origin = request.headers.find("origin");
   const auto capability = request.headers.find("x-mine-teleop-page-capability");
-  if (host == request.headers.end() || origin == request.headers.end() || capability == request.headers.end()) {
+  if (host == request.headers.end() || origin == request.headers.end() ||
+      capability == request.headers.end()) {
     return false;
   }
   const auto host_authority = loopback_http_authority(host->second);
   auto normalized_origin = lower(trim(origin->second));
   constexpr std::string_view http_scheme = "http://";
-  if (!host_authority || !normalized_origin.starts_with(http_scheme)) return false;
-  const auto origin_authority = loopback_http_authority(normalized_origin.substr(http_scheme.size()));
+  if (!host_authority || !normalized_origin.starts_with(http_scheme))
+    return false;
+  const auto origin_authority =
+      loopback_http_authority(normalized_origin.substr(http_scheme.size()));
   if (!origin_authority || host_authority->host != origin_authority->host ||
       host_authority->effective_port != origin_authority->effective_port ||
       capability->second != page_capability) {
@@ -1315,10 +1333,11 @@ Json console_config_json(const DriverConfig& config, std::string_view page_capab
            {"initial_target_speed_kph", config.control_limits.initial_target_speed_kph},
            {"initial_max_motor_torque_nm", config.control_limits.initial_max_motor_torque_nm},
            {"initial_max_brake_pressure_bar", config.control_limits.initial_max_brake_pressure_bar},
-           {"initial_service_brake_pressure_bar", config.control_limits.initial_service_brake_pressure_bar},
-           {"initial_hard_brake_pressure_bar", config.control_limits.initial_hard_brake_pressure_bar},
-           {"initial_max_steering_angle_deg",
-            config.control_limits.initial_max_steering_angle_deg},
+           {"initial_service_brake_pressure_bar",
+            config.control_limits.initial_service_brake_pressure_bar},
+           {"initial_hard_brake_pressure_bar",
+            config.control_limits.initial_hard_brake_pressure_bar},
+           {"initial_max_steering_angle_deg", config.control_limits.initial_max_steering_angle_deg},
            {"steering_full_scale_deg", 30.0},
        }},
       {"gamepad",
@@ -1386,13 +1405,13 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
     try {
       config.allow_legacy_passwords = auth["allow_legacy_passwords"].as<bool>();
     } catch (const YAML::Exception& error) {
-      throw std::invalid_argument(
-          "auth.allow_legacy_passwords must be a boolean: " + std::string(error.what()));
+      throw std::invalid_argument("auth.allow_legacy_passwords must be a boolean: " +
+                                  std::string(error.what()));
     }
   }
   if (config.allow_legacy_passwords) {
-    config.legacy_passwords_remove_by = required_yaml_string(
-        auth, "legacy_passwords_remove_by", "auth");
+    config.legacy_passwords_remove_by =
+        required_yaml_string(auth, "legacy_passwords_remove_by", "auth");
   }
   config.driver_passwords.clear();
   config.driver_password_verifiers.clear();
@@ -1406,8 +1425,9 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
     const bool has_legacy_source = entry["password_file"] || entry["password_env"];
     const bool has_verifier_source = entry["password_hash_file"] || entry["password_hash_env"];
     if (has_legacy_source && has_verifier_source) {
-      throw std::invalid_argument(
-          context + " must configure either a legacy password source or an Argon2id verifier source, not both");
+      throw std::invalid_argument(context +
+                                  " must configure either a legacy password source or an Argon2id "
+                                  "verifier source, not both");
     }
     if (!has_legacy_source && !has_verifier_source) {
       throw std::invalid_argument(
@@ -1416,16 +1436,17 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
     if (has_legacy_source) {
       if (!config.allow_legacy_passwords) {
         throw std::invalid_argument(
-            context + " uses a legacy plaintext password source but auth.allow_legacy_passwords is not true");
+            context +
+            " uses a legacy plaintext password source but auth.allow_legacy_passwords is not true");
       }
-      const auto password = load_identity_secret(
-          entry, "password_file", "password_env", base_path, context);
+      const auto password =
+          load_identity_secret(entry, "password_file", "password_env", base_path, context);
       if (!config.driver_passwords.emplace(driver_id, password).second) {
         throw std::invalid_argument("duplicate driver id: " + driver_id);
       }
     } else {
-      const auto verifier = load_identity_secret(
-          entry, "password_hash_file", "password_hash_env", base_path, context);
+      const auto verifier = load_identity_secret(entry, "password_hash_file", "password_hash_env",
+                                                 base_path, context);
       std::string reason;
       if (!validate_argon2id_verifier(verifier, config.authentication_cost_policy, &reason)) {
         throw std::invalid_argument(context + " Argon2id verifier is invalid: " + reason);
@@ -1476,66 +1497,50 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
   }
   const auto limits = root["connection_limits"];
   if (limits) {
-    if (!limits.IsMap()) throw std::invalid_argument("connection_limits must be a mapping");
+    if (!limits.IsMap())
+      throw std::invalid_argument("connection_limits must be a mapping");
     // Partial mappings inherit every omitted field from the R05
     // default-constructed ConnectionLimits (SignalingServerConfig already
     // carries those defaults), so only explicitly-present keys are validated.
-    config.connection_limits.max_active_connections = static_cast<std::size_t>(
-        required_positive_integer_node(
-            limits,
-            "max_active_connections",
-            "connection_limits.max_active_connections",
+    config.connection_limits.max_active_connections =
+        static_cast<std::size_t>(required_positive_integer_node(
+            limits, "max_active_connections", "connection_limits.max_active_connections",
             static_cast<std::int64_t>(config.connection_limits.max_active_connections)));
-    config.connection_limits.max_pending_http_connections = static_cast<std::size_t>(
-        required_positive_integer_node(
-            limits,
-            "max_pending_http_connections",
+    config.connection_limits.max_pending_http_connections =
+        static_cast<std::size_t>(required_positive_integer_node(
+            limits, "max_pending_http_connections",
             "connection_limits.max_pending_http_connections",
             static_cast<std::int64_t>(config.connection_limits.max_pending_http_connections)));
-    config.connection_limits.max_websocket_connections = static_cast<std::size_t>(
-        required_positive_integer_node(
-            limits,
-            "max_websocket_connections",
-            "connection_limits.max_websocket_connections",
+    config.connection_limits.max_websocket_connections =
+        static_cast<std::size_t>(required_positive_integer_node(
+            limits, "max_websocket_connections", "connection_limits.max_websocket_connections",
             static_cast<std::int64_t>(config.connection_limits.max_websocket_connections)));
-    config.connection_limits.max_connections_per_source = static_cast<std::size_t>(
-        required_positive_integer_node(
-            limits,
-            "max_connections_per_source",
-            "connection_limits.max_connections_per_source",
+    config.connection_limits.max_connections_per_source =
+        static_cast<std::size_t>(required_positive_integer_node(
+            limits, "max_connections_per_source", "connection_limits.max_connections_per_source",
             static_cast<std::int64_t>(config.connection_limits.max_connections_per_source)));
-    const auto listen_backlog = required_positive_integer_node(
-        limits,
-        "listen_backlog",
-        "connection_limits.listen_backlog",
-        config.connection_limits.listen_backlog);
+    const auto listen_backlog =
+        required_positive_integer_node(limits, "listen_backlog", "connection_limits.listen_backlog",
+                                       config.connection_limits.listen_backlog);
     if (listen_backlog > std::numeric_limits<int>::max()) {
       throw std::invalid_argument("connection_limits.listen_backlog is too large");
     }
     config.connection_limits.listen_backlog = static_cast<int>(listen_backlog);
-    config.connection_limits.header_read_timeout = std::chrono::milliseconds(
-        required_positive_integer_node(
-            limits,
-            "header_read_timeout_ms",
-            "connection_limits.header_read_timeout_ms",
+    config.connection_limits.header_read_timeout =
+        std::chrono::milliseconds(required_positive_integer_node(
+            limits, "header_read_timeout_ms", "connection_limits.header_read_timeout_ms",
             config.connection_limits.header_read_timeout.count()));
-    config.connection_limits.body_read_timeout = std::chrono::milliseconds(
-        required_positive_integer_node(
-            limits,
-            "body_read_timeout_ms",
-            "connection_limits.body_read_timeout_ms",
+    config.connection_limits.body_read_timeout =
+        std::chrono::milliseconds(required_positive_integer_node(
+            limits, "body_read_timeout_ms", "connection_limits.body_read_timeout_ms",
             config.connection_limits.body_read_timeout.count()));
-    config.connection_limits.response_write_timeout = std::chrono::milliseconds(
-        required_positive_integer_node(
-            limits,
-            "response_write_timeout_ms",
-            "connection_limits.response_write_timeout_ms",
+    config.connection_limits.response_write_timeout =
+        std::chrono::milliseconds(required_positive_integer_node(
+            limits, "response_write_timeout_ms", "connection_limits.response_write_timeout_ms",
             config.connection_limits.response_write_timeout.count()));
-    config.connection_limits.overload_write_timeout = std::chrono::milliseconds(
-        required_positive_integer_node(
-            limits,
-            "overload_write_timeout_ms",
-            "connection_limits.overload_write_timeout_ms",
+    config.connection_limits.overload_write_timeout =
+        std::chrono::milliseconds(required_positive_integer_node(
+            limits, "overload_write_timeout_ms", "connection_limits.overload_write_timeout_ms",
             config.connection_limits.overload_write_timeout.count()));
     validate_connection_limits(config.connection_limits);
   }
@@ -1607,27 +1612,14 @@ ServerResponse ServerResponse::text(int status, std::string body, std::string co
   return ServerResponse{status, std::move(content_type), std::move(body), {}};
 }
 
-SimpleHttpServer::SimpleHttpServer(
-    std::string host,
-    std::uint16_t port,
-    Handler handler,
-    std::size_t max_body_bytes,
-    WebSocketHandler websocket_handler)
-    : SimpleHttpServer(
-          std::move(host),
-          port,
-          std::move(handler),
-          max_body_bytes,
-          std::move(websocket_handler),
-          ConnectionLimits{}) {}
+SimpleHttpServer::SimpleHttpServer(std::string host, std::uint16_t port, Handler handler,
+                                   std::size_t max_body_bytes, WebSocketHandler websocket_handler)
+    : SimpleHttpServer(std::move(host), port, std::move(handler), max_body_bytes,
+                       std::move(websocket_handler), ConnectionLimits{}) {}
 
-SimpleHttpServer::SimpleHttpServer(
-    std::string host,
-    std::uint16_t port,
-    Handler handler,
-    std::size_t max_body_bytes,
-    WebSocketHandler websocket_handler,
-    ConnectionLimits connection_limits)
+SimpleHttpServer::SimpleHttpServer(std::string host, std::uint16_t port, Handler handler,
+                                   std::size_t max_body_bytes, WebSocketHandler websocket_handler,
+                                   ConnectionLimits connection_limits)
     : host_(std::move(host)),
       requested_port_(port),
       handler_(std::move(handler)),
@@ -1649,12 +1641,14 @@ SimpleHttpServer::SimpleHttpServer(
   }
   if (connection_limits_.max_pending_http_connections > connection_limits_.max_active_connections ||
       connection_limits_.max_websocket_connections > connection_limits_.max_active_connections) {
-    throw std::invalid_argument("HTTP connection sub-limits must not exceed the active connection limit");
+    throw std::invalid_argument(
+        "HTTP connection sub-limits must not exceed the active connection limit");
   }
-  if (websocket_handler_ &&
-      (connection_limits_.max_websocket_connections == 0 ||
-       connection_limits_.max_pending_http_connections >= connection_limits_.max_active_connections)) {
-    throw std::invalid_argument("HTTP limits must reserve active capacity for WebSocket connections");
+  if (websocket_handler_ && (connection_limits_.max_websocket_connections == 0 ||
+                             connection_limits_.max_pending_http_connections >=
+                                 connection_limits_.max_active_connections)) {
+    throw std::invalid_argument(
+        "HTTP limits must reserve active capacity for WebSocket connections");
   }
 }
 
@@ -1720,9 +1714,11 @@ bool SimpleHttpServer::try_register_client(SocketHandle client_fd, std::string s
     return false;
   }
   const auto [socket, inserted] = client_sockets_.insert(client_fd);
-  if (!inserted) return false;
+  if (!inserted)
+    return false;
   try {
-    const auto [stored_source, source_inserted] = client_sources_.emplace(client_fd, std::move(source));
+    const auto [stored_source, source_inserted] =
+        client_sources_.emplace(client_fd, std::move(source));
     if (!source_inserted) {
       client_sockets_.erase(socket);
       return false;
@@ -1744,7 +1740,8 @@ bool SimpleHttpServer::try_promote_client_to_websocket(SocketHandle client_fd) {
     return false;
   }
   websocket_sockets_.insert(client_fd);
-  if (pending_http_connections_ > 0) --pending_http_connections_;
+  if (pending_http_connections_ > 0)
+    --pending_http_connections_;
   return true;
 }
 
@@ -1763,12 +1760,14 @@ void SimpleHttpServer::unregister_client(SocketHandle client_fd) {
   {
     std::lock_guard lock(clients_mutex_);
     const auto client = client_sockets_.find(client_fd);
-    if (client == client_sockets_.end()) return;
+    if (client == client_sockets_.end())
+      return;
     if (websocket_sockets_.erase(client_fd) == 0 && pending_http_connections_ > 0) {
       --pending_http_connections_;
     }
     if (const auto source = client_sources_.find(client_fd); source != client_sources_.end()) {
-      if (const auto count = connections_by_source_.find(source->second); count != connections_by_source_.end()) {
+      if (const auto count = connections_by_source_.find(source->second);
+          count != connections_by_source_.end()) {
         if (count->second > 1) {
           --count->second;
         } else {
@@ -1786,11 +1785,8 @@ void SimpleHttpServer::serve_client(SocketHandle client_fd) {
   ServerResponse response;
   bool socket_is_nonblocking = true;
   try {
-    auto request = parse_request(
-        client_fd,
-        max_body_bytes_,
-        connection_limits_.header_read_timeout,
-        connection_limits_.body_read_timeout);
+    auto request = parse_request(client_fd, max_body_bytes_, connection_limits_.header_read_timeout,
+                                 connection_limits_.body_read_timeout);
     request.peer_address = socket_peer_address(client_fd);
     if (websocket_handler_) {
       const bool websocket_upgrade = websocket_upgrade_requested(request);
@@ -1801,7 +1797,8 @@ void SimpleHttpServer::serve_client(SocketHandle client_fd) {
         // contract it had before HTTP parsing became deadline-driven.
         set_socket_nonblocking(client_fd, false);
         socket_is_nonblocking = false;
-        if (websocket_handler_(client_fd, request)) return;
+        if (websocket_handler_(client_fd, request))
+          return;
         set_socket_nonblocking(client_fd, true);
         socket_is_nonblocking = true;
         if (websocket_upgrade && !try_demote_client_from_websocket(client_fd)) {
@@ -1835,8 +1832,7 @@ void SimpleHttpServer::serve_client(SocketHandle client_fd) {
   }
   try {
     send_http_response_until(
-        client_fd,
-        response,
+        client_fd, response,
         std::chrono::steady_clock::now() + connection_limits_.response_write_timeout);
   } catch (const std::exception&) {
   }
@@ -1867,8 +1863,7 @@ void SimpleHttpServer::serve_forever() {
     if (!try_register_client(client, socket_peer_address(client))) {
       try {
         send_http_response_until(
-            client,
-            ServerResponse::json(503, {{"error", "HTTP connection budget exhausted"}}),
+            client, ServerResponse::json(503, {{"error", "HTTP connection budget exhausted"}}),
             std::chrono::steady_clock::now() + connection_limits_.overload_write_timeout);
       } catch (const std::exception&) {
       }
@@ -1967,10 +1962,9 @@ Json SignalingService::Message::to_json() const {
   return value;
 }
 
-SignalingService::SignalingService(
-    SignalingServerConfig config,
-    std::function<std::int64_t()> audit_clock,
-    ClockSampler clock_sampler)
+SignalingService::SignalingService(SignalingServerConfig config,
+                                   std::function<std::int64_t()> audit_clock,
+                                   ClockSampler clock_sampler)
     : config_(std::move(config)),
       service_instance_id_("service-" + random_token(12)),
       audit_clock_(std::move(audit_clock)),
@@ -1986,11 +1980,10 @@ SignalingService::SignalingService(
     throw std::invalid_argument("login failure limit, window, and lockout must be positive");
   }
   std::string authentication_policy_reason;
-  if (!validate_authentication_cost_policy(
-          config_.authentication_cost_policy,
-          &authentication_policy_reason)) {
-    throw std::invalid_argument(
-        "authentication cost policy is invalid: " + authentication_policy_reason);
+  if (!validate_authentication_cost_policy(config_.authentication_cost_policy,
+                                           &authentication_policy_reason)) {
+    throw std::invalid_argument("authentication cost policy is invalid: " +
+                                authentication_policy_reason);
   }
   if (config_.password_verification_max_concurrency == 0 ||
       config_.password_verification_max_concurrency > 16 ||
@@ -2027,8 +2020,7 @@ SignalingService::SignalingService(
   }
   if (config_.max_signaling_payload_bytes == 0 || config_.max_sdp_bytes == 0 ||
       config_.max_ice_candidate_bytes == 0 || config_.signaling_message_ttl_ms <= 0 ||
-      config_.native_control_message_ttl_ms <= 0 ||
-      config_.native_control_message_ttl_ms > 1000 ||
+      config_.native_control_message_ttl_ms <= 0 || config_.native_control_message_ttl_ms > 1000 ||
       config_.max_signaling_queue_messages == 0 || config_.max_signaling_queue_bytes == 0 ||
       config_.websocket_rate_limit_messages <= 0 || config_.websocket_rate_limit_bytes == 0 ||
       config_.websocket_rate_limit_window_ms <= 0) {
@@ -2057,7 +2049,8 @@ SignalingService::SignalingService(
   if (config_.allow_legacy_passwords && !config_.driver_passwords.empty() &&
       !valid_legacy_password_removal_date(config_.legacy_passwords_remove_by)) {
     throw std::invalid_argument(
-        "legacy plaintext driver passwords require a valid YYYY-MM-DD legacy_passwords_remove_by deadline");
+        "legacy plaintext driver passwords require a valid YYYY-MM-DD legacy_passwords_remove_by "
+        "deadline");
   }
   if (config_.allow_legacy_passwords && !config_.driver_passwords.empty() &&
       !legacy_password_migration_is_active(config_.legacy_passwords_remove_by)) {
@@ -2100,14 +2093,13 @@ SignalingService::SignalingService(
           audit("cloud_native_control_trace_batch", std::move(details));
         });
   }
-  if (!audit(
-          "signaling_service_started",
-          {{"runtime", "cpp"},
-           {"native_control_trace_commands", config_.native_control_trace_commands},
-           {"audit_log_max_bytes", config_.audit_log_max_bytes},
-           {"audit_log_files", config_.audit_log_files},
-           {"audit_log_rotation_interval_ms", config_.audit_log_rotation_interval_ms},
-           {"audit_log_retention_days", config_.audit_log_retention_days}})) {
+  if (!audit("signaling_service_started",
+             {{"runtime", "cpp"},
+              {"native_control_trace_commands", config_.native_control_trace_commands},
+              {"audit_log_max_bytes", config_.audit_log_max_bytes},
+              {"audit_log_files", config_.audit_log_files},
+              {"audit_log_rotation_interval_ms", config_.audit_log_rotation_interval_ms},
+              {"audit_log_retention_days", config_.audit_log_retention_days}})) {
     throw std::runtime_error("signaling audit log is unavailable at startup");
   }
   connection_reaper_ = std::jthread([this](std::stop_token stop_token) {
@@ -2122,7 +2114,8 @@ SignalingService::SignalingService(
       } catch (const std::exception& error) {
         connection_reaper_healthy_.store(false);
         connection_reaper_failures_.fetch_add(1);
-        std::cerr << "mine-teleop-signaling: connection reaper recovered from error: " << error.what() << '\n';
+        std::cerr << "mine-teleop-signaling: connection reaper recovered from error: "
+                  << error.what() << '\n';
       } catch (...) {
         connection_reaper_healthy_.store(false);
         connection_reaper_failures_.fetch_add(1);
@@ -2170,24 +2163,24 @@ Json SignalingService::health() const {
     static_cast<void>(key);
     queued_signaling_messages += queue.size();
     for (const auto& message : queue) {
-      queued_signaling_bytes = message.serialized_bytes > std::numeric_limits<std::size_t>::max() - queued_signaling_bytes
-          ? std::numeric_limits<std::size_t>::max()
-          : queued_signaling_bytes + message.serialized_bytes;
+      queued_signaling_bytes = message.serialized_bytes > std::numeric_limits<std::size_t>::max() -
+                                                              queued_signaling_bytes
+                                   ? std::numeric_limits<std::size_t>::max()
+                                   : queued_signaling_bytes + message.serialized_bytes;
     }
   }
-  const auto login_locked_buckets = std::count_if(login_failures_.begin(), login_failures_.end(), [&](const auto& item) {
-    return item.second.blocked_until_monotonic_ms.has_value() &&
-        !detail::monotonic_deadline_reached(
-            now.monotonic,
-            *item.second.blocked_until_monotonic_ms);
-  });
+  const auto login_locked_buckets =
+      std::count_if(login_failures_.begin(), login_failures_.end(), [&](const auto& item) {
+        return item.second.blocked_until_monotonic_ms.has_value() &&
+               !detail::monotonic_deadline_reached(now.monotonic,
+                                                   *item.second.blocked_until_monotonic_ms);
+      });
   const bool api_rate_limit_overflow_active =
       api_rate_limit_overflow_.window_started_at_monotonic_ms.has_value() &&
       !detail::monotonic_deadline_reached(
           now.monotonic,
-          detail::saturating_deadline_ms(
-              *api_rate_limit_overflow_.window_started_at_monotonic_ms,
-              config_.api_rate_limit_window_ms));
+          detail::saturating_deadline_ms(*api_rate_limit_overflow_.window_started_at_monotonic_ms,
+                                         config_.api_rate_limit_window_ms));
   Json alerts = Json::array();
   if (login_locked_buckets > 0) {
     alerts.push_back({
@@ -2234,10 +2227,14 @@ Json SignalingService::health() const {
       {"authentication_cost_memory_kib", config_.authentication_cost_policy.memory_kib},
       {"authentication_cost_time_cost", config_.authentication_cost_policy.time_cost},
       {"authentication_cost_parallelism", config_.authentication_cost_policy.parallelism},
-      {"authentication_cost_maximum_memory_kib", config_.authentication_cost_policy.maximum_memory_kib},
-      {"authentication_cost_maximum_time_cost", config_.authentication_cost_policy.maximum_time_cost},
-      {"authentication_cost_maximum_parallelism", config_.authentication_cost_policy.maximum_parallelism},
-      {"authentication_cost_maximum_encoded_bytes", config_.authentication_cost_policy.maximum_encoded_bytes},
+      {"authentication_cost_maximum_memory_kib",
+       config_.authentication_cost_policy.maximum_memory_kib},
+      {"authentication_cost_maximum_time_cost",
+       config_.authentication_cost_policy.maximum_time_cost},
+      {"authentication_cost_maximum_parallelism",
+       config_.authentication_cost_policy.maximum_parallelism},
+      {"authentication_cost_maximum_encoded_bytes",
+       config_.authentication_cost_policy.maximum_encoded_bytes},
       {"password_verification_active", active_password_verifications},
       {"password_verification_capacity", config_.password_verification_max_concurrency},
       {"api_rate_limit_tracked_sources", api_rate_limits_.size()},
@@ -2273,10 +2270,8 @@ const SignalingService::Session& SignalingService::require_participant(
   return session;
 }
 
-void SignalingService::validate_driver_token(
-    std::string_view driver_id,
-    std::string_view token,
-    ClockSample now) {
+void SignalingService::validate_driver_token(std::string_view driver_id, std::string_view token,
+                                             ClockSample now) {
   if (revoked_drivers_.contains(std::string(driver_id))) throw Unauthorized("driver is revoked");
   const auto found = driver_tokens_.find(std::string(token));
   if (token.empty() || found == driver_tokens_.end() || found->second.driver_id != driver_id) {
@@ -2302,11 +2297,10 @@ void SignalingService::validate_device_token(std::string_view vehicle_id, std::s
   }
 }
 
-void SignalingService::validate_vehicle_connection(
-    std::string_view vehicle_id,
-    std::string_view token,
-    std::uint64_t connection_generation,
-    ClockSample now) {
+void SignalingService::validate_vehicle_connection(std::string_view vehicle_id,
+                                                   std::string_view token,
+                                                   std::uint64_t connection_generation,
+                                                   ClockSample now) {
   validate_device_token(vehicle_id, token);
   const auto found = online_vehicles_.find(std::string(vehicle_id));
   if (found == online_vehicles_.end()) throw Conflict("vehicle is offline", "vehicle_offline");
@@ -2319,19 +2313,13 @@ void SignalingService::validate_vehicle_connection(
   found->second.last_seen_at_monotonic_ms = now.monotonic.value;
 }
 
-void SignalingService::validate_actor_credential(
-    const Session& session,
-    std::string_view actor,
-    const Json& value,
-    ClockSample now) {
+void SignalingService::validate_actor_credential(const Session& session, std::string_view actor,
+                                                 const Json& value, ClockSample now) {
   if (actor == session.driver_id) {
     validate_driver_token(actor, optional_string(value, "token"), now);
   } else if (actor == session.vehicle_id) {
-    validate_vehicle_connection(
-        actor,
-        optional_string(value, "device_token"),
-        required_uint64(value, "connection_generation"),
-        now);
+    validate_vehicle_connection(actor, optional_string(value, "device_token"),
+                                required_uint64(value, "connection_generation"), now);
   } else {
     throw Unauthorized("actor is not current session participant");
   }
@@ -2375,9 +2363,8 @@ void SignalingService::cleanup_expired_connections(ClockSample now) {
   for (auto& [id, session] : sessions_) {
     static_cast<void>(id);
     if (session.state != SessionState::Closed &&
-        detail::monotonic_deadline_reached(
-            now.monotonic,
-            session.control_token_expires_at_monotonic_ms)) {
+        detail::monotonic_deadline_reached(now.monotonic,
+                                           session.control_token_expires_at_monotonic_ms)) {
       close_session(session, "control_token_expired");
       audit("control_authority_expired", session.to_json());
     }
@@ -2386,9 +2373,8 @@ void SignalingService::cleanup_expired_connections(ClockSample now) {
   for (auto iterator = online_vehicles_.begin(); iterator != online_vehicles_.end();) {
     if (!detail::monotonic_deadline_reached(
             now.monotonic,
-            detail::saturating_deadline_ms(
-                iterator->second.last_seen_at_monotonic_ms,
-                config_.vehicle_heartbeat_timeout_ms))) {
+            detail::saturating_deadline_ms(iterator->second.last_seen_at_monotonic_ms,
+                                           config_.vehicle_heartbeat_timeout_ms))) {
       ++iterator;
       continue;
     }
@@ -2406,9 +2392,8 @@ void SignalingService::cleanup_expired_connections(ClockSample now) {
   for (auto iterator = online_drivers_.begin(); iterator != online_drivers_.end();) {
     if (!detail::monotonic_deadline_reached(
             now.monotonic,
-            detail::saturating_deadline_ms(
-                iterator->second.last_seen_at_monotonic_ms,
-                config_.driver_heartbeat_timeout_ms))) {
+            detail::saturating_deadline_ms(iterator->second.last_seen_at_monotonic_ms,
+                                           config_.driver_heartbeat_timeout_ms))) {
       ++iterator;
       continue;
     }
@@ -2435,10 +2420,8 @@ void SignalingService::prune_expired_signaling_messages(ClockSample now) {
   for (auto queue = messages_.begin(); queue != messages_.end();) {
     std::erase_if(queue->second, [&](const auto& message) {
       return detail::monotonic_deadline_reached(
-          now.monotonic,
-          detail::saturating_deadline_ms(
-              message.queued_at_monotonic_ms,
-              config_.signaling_message_ttl_ms));
+          now.monotonic, detail::saturating_deadline_ms(message.queued_at_monotonic_ms,
+                                                        config_.signaling_message_ttl_ms));
     });
     if (queue->second.empty()) {
       queue = messages_.erase(queue);
@@ -2446,12 +2429,11 @@ void SignalingService::prune_expired_signaling_messages(ClockSample now) {
       ++queue;
     }
   }
-  for (auto message = latest_control_messages_.begin(); message != latest_control_messages_.end();) {
+  for (auto message = latest_control_messages_.begin();
+       message != latest_control_messages_.end();) {
     if (!detail::monotonic_deadline_reached(
-            now.monotonic,
-            detail::saturating_deadline_ms(
-                message->second.queued_at_monotonic_ms,
-                config_.native_control_message_ttl_ms))) {
+            now.monotonic, detail::saturating_deadline_ms(message->second.queued_at_monotonic_ms,
+                                                          config_.native_control_message_ttl_ms))) {
       ++message;
       continue;
     }
@@ -2469,9 +2451,8 @@ void SignalingService::prune_expired_signaling_messages(ClockSample now) {
           {"cloud_queued_monotonic_ms", expired.queued_at_monotonic_ms},
           {"cloud_expired_at_utc_ms", now.utc.value},
           {"cloud_expired_monotonic_ms", now.monotonic.value},
-          {"cloud_mailbox_age_ms", std::max<std::int64_t>(
-                                         0,
-                                         now.monotonic.value - expired.queued_at_monotonic_ms)},
+          {"cloud_mailbox_age_ms",
+           std::max<std::int64_t>(0, now.monotonic.value - expired.queued_at_monotonic_ms)},
           {"delivery_cursor", expired.delivery_cursor},
       });
     }
@@ -2539,8 +2520,7 @@ void SignalingService::close_session(Session& session, std::string_view reason) 
 
 bool SignalingService::configured_driver(std::string_view driver_id) const {
   const auto id = std::string(driver_id);
-  return config_.driver_passwords.contains(id) ||
-      config_.driver_password_verifiers.contains(id);
+  return config_.driver_passwords.contains(id) || config_.driver_password_verifiers.contains(id);
 }
 
 bool SignalingService::try_acquire_password_verification_slot() {
@@ -2554,41 +2534,35 @@ bool SignalingService::try_acquire_password_verification_slot() {
 
 void SignalingService::release_password_verification_slot() noexcept {
   std::lock_guard lock(password_verification_mutex_);
-  if (active_password_verifications_ > 0) --active_password_verifications_;
+  if (active_password_verifications_ > 0)
+    --active_password_verifications_;
 }
 
 SignalingService::LoginFailureReservation SignalingService::reserve_login_failure_locked(
-    std::string_view driver_id,
-    ClockSample admitted_at) {
+    std::string_view driver_id, ClockSample admitted_at) {
   const bool known_driver = configured_driver(driver_id);
   const std::string bucket = known_driver ? "driver:" + std::string(driver_id) : "unknown";
   auto& state = login_failures_[bucket];
   if (state.blocked_until_monotonic_ms.has_value() &&
-      !detail::monotonic_deadline_reached(
-          admitted_at.monotonic,
-          *state.blocked_until_monotonic_ms)) {
+      !detail::monotonic_deadline_reached(admitted_at.monotonic,
+                                          *state.blocked_until_monotonic_ms)) {
     throw TooManyRequests(
         "too many login attempts",
-        std::max<std::int64_t>(
-            1,
-            *state.blocked_until_monotonic_ms - admitted_at.monotonic.value));
+        std::max<std::int64_t>(1, *state.blocked_until_monotonic_ms - admitted_at.monotonic.value));
   }
 
-  const bool window_expired =
-      state.window_started_at_monotonic_ms.has_value() &&
-      detail::monotonic_deadline_reached(
-          admitted_at.monotonic,
-          detail::saturating_deadline_ms(
-              *state.window_started_at_monotonic_ms,
-              config_.login_failure_window_ms));
+  const bool window_expired = state.window_started_at_monotonic_ms.has_value() &&
+                              detail::monotonic_deadline_reached(
+                                  admitted_at.monotonic, detail::saturating_deadline_ms(
+                                                             *state.window_started_at_monotonic_ms,
+                                                             config_.login_failure_window_ms));
   if (state.pending_failures == 0 &&
       (state.blocked_until_monotonic_ms.has_value() || window_expired)) {
-    state = LoginFailureState{
-        .failures = 0,
-        .pending_failures = 0,
-        .window_started_at_monotonic_ms = admitted_at.monotonic.value,
-        .blocked_until_utc_ms = std::nullopt,
-        .blocked_until_monotonic_ms = std::nullopt};
+    state = LoginFailureState{.failures = 0,
+                              .pending_failures = 0,
+                              .window_started_at_monotonic_ms = admitted_at.monotonic.value,
+                              .blocked_until_utc_ms = std::nullopt,
+                              .blocked_until_monotonic_ms = std::nullopt};
   } else if (state.blocked_until_monotonic_ms.has_value()) {
     // This can only occur when an already-expired lockout still has an
     // in-flight candidate. Keep that candidate in its admission window rather
@@ -2605,18 +2579,17 @@ SignalingService::LoginFailureReservation SignalingService::reserve_login_failur
   }
 
   ++state.pending_failures;
-  return LoginFailureReservation{
-      bucket,
-      admitted_at.utc.value,
-      admitted_at.monotonic.value};
+  return LoginFailureReservation{bucket, admitted_at.utc.value, admitted_at.monotonic.value};
 }
 
 void SignalingService::release_login_failure_reservation_locked(
     const LoginFailureReservation& reservation) {
   const auto found = login_failures_.find(reservation.bucket);
-  if (found == login_failures_.end()) return;
+  if (found == login_failures_.end())
+    return;
   auto& state = found->second;
-  if (state.pending_failures <= 0) return;
+  if (state.pending_failures <= 0)
+    return;
   --state.pending_failures;
   if (state.pending_failures == 0 && state.failures == 0 &&
       !state.blocked_until_monotonic_ms.has_value()) {
@@ -2624,22 +2597,20 @@ void SignalingService::release_login_failure_reservation_locked(
   }
 }
 
-void SignalingService::record_login_failure_locked(
-    std::string_view driver_id,
-    const LoginFailureReservation& reservation,
-    ClockSample settled_at) {
+void SignalingService::record_login_failure_locked(std::string_view driver_id,
+                                                   const LoginFailureReservation& reservation,
+                                                   ClockSample settled_at) {
   const bool known_driver = configured_driver(driver_id);
   auto found = login_failures_.find(reservation.bucket);
   if (found == login_failures_.end()) {
     found = login_failures_
-                .emplace(
-                    reservation.bucket,
-                    LoginFailureState{
-                        .failures = 0,
-                        .pending_failures = 1,
-                        .window_started_at_monotonic_ms = reservation.admitted_at_monotonic_ms,
-                        .blocked_until_utc_ms = std::nullopt,
-                        .blocked_until_monotonic_ms = std::nullopt})
+                .emplace(reservation.bucket,
+                         LoginFailureState{
+                             .failures = 0,
+                             .pending_failures = 1,
+                             .window_started_at_monotonic_ms = reservation.admitted_at_monotonic_ms,
+                             .blocked_until_utc_ms = std::nullopt,
+                             .blocked_until_monotonic_ms = std::nullopt})
                 .first;
   }
   auto& state = found->second;
@@ -2654,12 +2625,10 @@ void SignalingService::record_login_failure_locked(
   ++state.failures;
   const bool lock_login = state.failures >= config_.login_max_failures;
   if (lock_login) {
-    state.blocked_until_utc_ms = detail::saturating_deadline_ms(
-        settled_at.utc.value,
-        config_.login_lockout_ms);
-    state.blocked_until_monotonic_ms = detail::saturating_deadline_ms(
-        settled_at.monotonic.value,
-        config_.login_lockout_ms);
+    state.blocked_until_utc_ms =
+        detail::saturating_deadline_ms(settled_at.utc.value, config_.login_lockout_ms);
+    state.blocked_until_monotonic_ms =
+        detail::saturating_deadline_ms(settled_at.monotonic.value, config_.login_lockout_ms);
   }
   const Json identity = known_driver
       ? Json{{"driver_id", std::string(driver_id)}, {"recognized_driver", true}}
@@ -2679,7 +2648,8 @@ void SignalingService::record_login_failure_locked(
 
 void SignalingService::clear_login_failures_locked(std::string_view driver_id) {
   const auto found = login_failures_.find("driver:" + std::string(driver_id));
-  if (found == login_failures_.end()) return;
+  if (found == login_failures_.end())
+    return;
   if (found->second.pending_failures == 0) {
     login_failures_.erase(found);
     return;
@@ -2706,11 +2676,9 @@ std::string SignalingService::request_source(const HttpRequest& request) const {
 void SignalingService::cleanup_api_rate_limits(MonotonicMillis now) {
   const auto expired = [&](const ApiRateState& state) {
     return !state.window_started_at_monotonic_ms.has_value() ||
-        detail::monotonic_deadline_reached(
-            now,
-            detail::saturating_deadline_ms(
-                *state.window_started_at_monotonic_ms,
-                config_.api_rate_limit_window_ms));
+           detail::monotonic_deadline_reached(
+               now, detail::saturating_deadline_ms(*state.window_started_at_monotonic_ms,
+                                                   config_.api_rate_limit_window_ms));
   };
   std::erase_if(api_rate_limits_, [&](const auto& item) { return expired(item.second); });
   if (expired(api_rate_limit_overflow_)) api_rate_limit_overflow_ = {};
@@ -2720,10 +2688,8 @@ void SignalingService::cleanup_api_rate_limits(MonotonicMillis now) {
 void SignalingService::enforce_api_rate_limit(const HttpRequest& request, MonotonicMillis now) {
   if (!api_rate_limit_last_cleanup_monotonic_ms_.has_value() ||
       detail::monotonic_deadline_reached(
-          now,
-          detail::saturating_deadline_ms(
-              *api_rate_limit_last_cleanup_monotonic_ms_,
-              config_.api_rate_limit_window_ms))) {
+          now, detail::saturating_deadline_ms(*api_rate_limit_last_cleanup_monotonic_ms_,
+                                              config_.api_rate_limit_window_ms))) {
     cleanup_api_rate_limits(now);
   }
 
@@ -2742,19 +2708,16 @@ void SignalingService::enforce_api_rate_limit(const HttpRequest& request, Monoto
 
   if (!state->window_started_at_monotonic_ms.has_value() ||
       detail::monotonic_deadline_reached(
-          now,
-          detail::saturating_deadline_ms(
-              *state->window_started_at_monotonic_ms,
-              config_.api_rate_limit_window_ms))) {
+          now, detail::saturating_deadline_ms(*state->window_started_at_monotonic_ms,
+                                              config_.api_rate_limit_window_ms))) {
     *state = ApiRateState{0, now.value, false};
   }
   if (state->requests < std::numeric_limits<std::int64_t>::max()) ++state->requests;
   if (state->requests <= config_.api_rate_limit_requests) return;
 
   if (api_rate_limited_requests_ < std::numeric_limits<std::uint64_t>::max()) ++api_rate_limited_requests_;
-  const auto elapsed = std::max<std::int64_t>(
-      0,
-      now.value - *state->window_started_at_monotonic_ms);
+  const auto elapsed =
+      std::max<std::int64_t>(0, now.value - *state->window_started_at_monotonic_ms);
   const auto retry_after_ms = std::max<std::int64_t>(1, config_.api_rate_limit_window_ms - elapsed);
   if (!state->limit_audited) {
     state->limit_audited = true;
@@ -2769,16 +2732,17 @@ void SignalingService::enforce_api_rate_limit(const HttpRequest& request, Monoto
 }
 
 bool SignalingService::audit(std::string_view event, const Json& details) const noexcept {
-  if (config_.audit_log_path.empty()) return true;
+  if (config_.audit_log_path.empty())
+    return true;
   try {
     const auto timestamp_ms = audit_clock_ ? audit_clock_() : clock_sample().utc.value;
     const auto max_bytes = static_cast<std::uint64_t>(config_.audit_log_max_bytes);
-    Json record = {
-        {"event", event},
-        {"sent_at_utc_ms", timestamp_ms},
-        {"service_instance_id", service_instance_id_},
-        {"details", sanitize_log_value(details)}};
-    if (!active_request_id.empty()) record["request_id"] = active_request_id;
+    Json record = {{"event", event},
+                   {"sent_at_utc_ms", timestamp_ms},
+                   {"service_instance_id", service_instance_id_},
+                   {"details", sanitize_log_value(details)}};
+    if (!active_request_id.empty())
+      record["request_id"] = active_request_id;
     const auto line = record.dump();
     if (static_cast<std::uint64_t>(line.size()) >= max_bytes) {
       throw std::runtime_error("signaling audit record exceeds configured maximum size");
@@ -2788,34 +2752,26 @@ bool SignalingService::audit(std::string_view event, const Json& details) const 
         log_period_start(timestamp_ms, config_.audit_log_rotation_interval_ms);
     if (audit_log_period_start_ms_ < 0) {
       audit_log_period_start_ms_ = existing_log_period(
-          config_.audit_log_path,
-          config_.audit_log_rotation_interval_ms,
-          current_period);
+          config_.audit_log_path, config_.audit_log_rotation_interval_ms, current_period);
     }
     if (audit_log_period_start_ms_ != current_period) {
-      archive_jsonl_period(
-          config_.audit_log_path,
-          audit_log_period_start_ms_,
-          static_cast<int>(config_.audit_log_files));
+      archive_jsonl_period(config_.audit_log_path, audit_log_period_start_ms_,
+                           static_cast<int>(config_.audit_log_files));
       audit_log_period_start_ms_ = current_period;
     }
     if (audit_log_last_retention_period_ms_ != current_period) {
-      prune_jsonl_periods(
-          config_.audit_log_path,
-          current_period,
-          config_.audit_log_retention_days);
+      prune_jsonl_periods(config_.audit_log_path, current_period, config_.audit_log_retention_days);
       audit_log_last_retention_period_ms_ = current_period;
     }
-    rotate_jsonl_log(
-        config_.audit_log_path,
-        max_bytes,
-        static_cast<int>(config_.audit_log_files),
-        line.size() + 1);
+    rotate_jsonl_log(config_.audit_log_path, max_bytes, static_cast<int>(config_.audit_log_files),
+                     line.size() + 1);
     std::ofstream output(config_.audit_log_path, std::ios::app);
-    if (!output) throw std::runtime_error("cannot append signaling audit log");
+    if (!output)
+      throw std::runtime_error("cannot append signaling audit log");
     output << line << '\n';
     output.flush();
-    if (!output) throw std::runtime_error("cannot append signaling audit log");
+    if (!output)
+      throw std::runtime_error("cannot append signaling audit log");
     audit_healthy_.store(true);
     return true;
   } catch (...) {
@@ -2830,17 +2786,16 @@ bool SignalingService::audit(std::string_view event, const Json& details) const 
         std::lock_guard fallback_lock(audit_fallback_mutex_);
         if (!audit_last_fallback_report_has_monotonic_ ||
             detail::monotonic_deadline_reached(
-                now,
-                detail::saturating_deadline_ms(
-                    audit_last_fallback_report_monotonic_ms_,
-                    60 * 1000))) {
+                now, detail::saturating_deadline_ms(audit_last_fallback_report_monotonic_ms_,
+                                                    60 * 1000))) {
           audit_last_fallback_report_monotonic_ms_ = now.value;
           audit_last_fallback_report_has_monotonic_ = true;
           report = true;
         }
       }
       if (report) {
-        std::cerr << "mine-teleop-signaling: audit log unavailable; new control sessions are disabled\n";
+        std::cerr
+            << "mine-teleop-signaling: audit log unavailable; new control sessions are disabled\n";
       }
     } catch (...) {
       // Keep the audit failure path noexcept even if a diagnostic sink fails.
@@ -2870,7 +2825,8 @@ ServerResponse SignalingService::handle(const HttpRequest& request) {
   } catch (const TooManyRequests& error) {
     response = too_many_requests_response(error);
   } catch (const ServiceUnavailable& error) {
-    response = ServerResponse::json(503, {{"error", error.what()}, {"issue_code", "audit_log_unavailable"}});
+    response = ServerResponse::json(
+        503, {{"error", error.what()}, {"issue_code", "audit_log_unavailable"}});
   } catch (const NotFound& error) {
     response = ServerResponse::json(404, {{"error", error.what()}});
   } catch (const Conflict& error) {
@@ -3018,9 +2974,7 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
         validate_actor_credential(session, participant, credentials, now);
         if (!send_only) {
           pending = take_signaling_messages(
-              parts[1],
-              participant,
-              now,
+              parts[1], participant, now,
               control_receive_only ? std::string_view("control_command") : std::string_view{},
               false);
           if (control_receive_only && !pending.empty()) {
@@ -3058,10 +3012,9 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                 {"intent_seq", payload.value("intent_seq", std::uint64_t{0})},
                 {"command_sent_at_utc_ms", message.value("sent_at_utc_ms", std::int64_t{0})},
                 {"cloud_queued_at_utc_ms", message.value("queued_at_utc_ms", std::int64_t{0})},
-                {"cloud_mailbox_to_send_ms", std::max<std::int64_t>(
-                                                   0,
-                                                   send_clock.monotonic.value -
-                                                       pending_control_queued_at_monotonic_ms)},
+                {"cloud_mailbox_to_send_ms",
+                 std::max<std::int64_t>(
+                     0, send_clock.monotonic.value - pending_control_queued_at_monotonic_ms)},
                 {"delivery_cursor", delivery_cursor},
                 {"redelivery", delivery_cursor <= last_delivery_cursor_sent},
             };
@@ -3082,8 +3035,7 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                   send_started_monotonic_ms;
               const auto failed_at = clock_sample();
               delivery_trace["cloud_delivery_send_failed_at_utc_ms"] = failed_at.utc.value;
-              delivery_trace["cloud_delivery_send_failed_monotonic_ms"] =
-                  failed_at.monotonic.value;
+              delivery_trace["cloud_delivery_send_failed_monotonic_ms"] = failed_at.monotonic.value;
               delivery_trace["error"] = error.what();
               native_control_trace_->enqueue(std::move(delivery_trace));
             }
@@ -3136,33 +3088,30 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
           if (!rate.window_started_at_monotonic_ms.has_value() ||
               detail::monotonic_deadline_reached(
                   rate_now.monotonic,
-                  detail::saturating_deadline_ms(
-                      *rate.window_started_at_monotonic_ms,
-                      config_.websocket_rate_limit_window_ms))) {
+                  detail::saturating_deadline_ms(*rate.window_started_at_monotonic_ms,
+                                                 config_.websocket_rate_limit_window_ms))) {
             rate.window_started_at_monotonic_ms = rate_now.monotonic.value;
             rate.messages = 0;
             rate.bytes = 0;
           }
           const bool message_limit = rate.messages >= config_.websocket_rate_limit_messages;
-          const bool byte_limit = serialized_bytes > config_.websocket_rate_limit_bytes -
-              std::min(rate.bytes, config_.websocket_rate_limit_bytes);
+          const bool byte_limit =
+              serialized_bytes > config_.websocket_rate_limit_bytes -
+                                     std::min(rate.bytes, config_.websocket_rate_limit_bytes);
           if (message_limit || byte_limit) {
             const auto elapsed_ms = std::max<std::int64_t>(
-                0,
-                rate_now.monotonic.value - *rate.window_started_at_monotonic_ms);
-            retry_after_ms = std::max<std::int64_t>(
-                1,
-                config_.websocket_rate_limit_window_ms - elapsed_ms);
+                0, rate_now.monotonic.value - *rate.window_started_at_monotonic_ms);
+            retry_after_ms =
+                std::max<std::int64_t>(1, config_.websocket_rate_limit_window_ms - elapsed_ms);
           } else {
             ++rate.messages;
             rate.bytes += serialized_bytes;
           }
         }
         if (retry_after_ms) {
-          connection.send_json(
-              {{"event", "signaling_rate_limited"},
-               {"error", "websocket participant rate limit exceeded"},
-               {"retry_after_ms", retry_after_ms.value()}});
+          connection.send_json({{"event", "signaling_rate_limited"},
+                                {"error", "websocket participant rate limit exceeded"},
+                                {"retry_after_ms", retry_after_ms.value()}});
           connection.send_close(1008, "signaling rate limit exceeded");
           return true;
         }
@@ -3217,10 +3166,8 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                     queued->second.metadata.sent_at_utc_ms;
                 acknowledgement_trace["cloud_queued_at_utc_ms"] =
                     queued->second.queued_at_utc_ms;
-                acknowledgement_trace["cloud_queue_to_vehicle_ack_ms"] =
-                    std::max<std::int64_t>(
-                        0,
-                        ack_received_monotonic_ms - queued->second.queued_at_monotonic_ms);
+                acknowledgement_trace["cloud_queue_to_vehicle_ack_ms"] = std::max<std::int64_t>(
+                    0, ack_received_monotonic_ms - queued->second.queued_at_monotonic_ms);
               }
             }
             acknowledged = acknowledge_signaling_messages(
@@ -3254,18 +3201,14 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
             throw std::invalid_argument(
                 "send-only control WebSocket accepts control_command messages only");
           }
-          acknowledgement = enqueue_signaling_message(
-              parts[1],
-              received.message,
-              received_at,
-              participant);
+          acknowledgement =
+              enqueue_signaling_message(parts[1], received.message, received_at, participant);
         }
         connection.send_json(acknowledgement);
       } catch (const TooManyRequests& error) {
-        connection.send_json(
-            {{"error", error.what()},
-             {"event", "signaling_backpressure"},
-             {"retry_after_ms", error.retry_after_ms()}});
+        connection.send_json({{"error", error.what()},
+                              {"event", "signaling_backpressure"},
+                              {"retry_after_ms", error.retry_after_ms()}});
       } catch (const std::exception& error) {
         connection.send_json({{"error", error.what()}, {"event", "signaling_message_rejected"}});
       }
@@ -3275,12 +3218,9 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
   }
 }
 
-Json SignalingService::take_signaling_messages(
-    std::string_view session_id,
-    std::string_view recipient,
-    ClockSample now,
-    std::string_view requested_types,
-    bool consume) {
+Json SignalingService::take_signaling_messages(std::string_view session_id,
+                                               std::string_view recipient, ClockSample now,
+                                               std::string_view requested_types, bool consume) {
   Json values = Json::array();
   prune_expired_signaling_messages(now);
   std::vector<std::string> types;
@@ -3358,9 +3298,7 @@ std::size_t SignalingService::acknowledge_signaling_messages(
 }
 
 Json SignalingService::enqueue_signaling_message(
-    std::string_view session_id,
-    const Json& value,
-    ClockSample received_at,
+    std::string_view session_id, const Json& value, ClockSample received_at,
     std::optional<std::string_view> authenticated_actor) {
   const auto cloud_ingress_started_at_utc_ms = received_at.utc.value;
   const auto cloud_ingress_started_monotonic_ms = received_at.monotonic.value;
@@ -3442,7 +3380,8 @@ Json SignalingService::enqueue_signaling_message(
   }
   const auto sequence_key = message_key(session_id, sender) +
       (type == "control_command" ? ":native_control" : "");
-  const auto fingerprint = recipient + "\n" + type + "\n" + metadata.to_json().dump() + "\n" + serialized_payload;
+  const auto fingerprint =
+      recipient + "\n" + type + "\n" + metadata.to_json().dump() + "\n" + serialized_payload;
   if (const auto accepted = last_accepted_messages_.find(sequence_key); accepted != last_accepted_messages_.end()) {
     if (metadata.seq < accepted->second.sequence) {
       throw Conflict(
@@ -3507,43 +3446,41 @@ Json SignalingService::enqueue_signaling_message(
     auto& queue = messages_[recipient_key];
     for (const auto& message : queue) {
       queue_bytes = message.serialized_bytes > std::numeric_limits<std::size_t>::max() - queue_bytes
-          ? std::numeric_limits<std::size_t>::max()
-          : queue_bytes + message.serialized_bytes;
+                        ? std::numeric_limits<std::size_t>::max()
+                        : queue_bytes + message.serialized_bytes;
     }
     const bool message_capacity_reached = queue.size() >= config_.max_signaling_queue_messages;
-    const bool byte_capacity_reached = serialized_bytes > config_.max_signaling_queue_bytes -
-        std::min(queue_bytes, config_.max_signaling_queue_bytes);
+    const bool byte_capacity_reached =
+        serialized_bytes > config_.max_signaling_queue_bytes -
+                               std::min(queue_bytes, config_.max_signaling_queue_bytes);
     if (message_capacity_reached || byte_capacity_reached) {
       const auto queued_messages = queue.size();
       if (signaling_queue_rejections_ < std::numeric_limits<std::uint64_t>::max()) {
         ++signaling_queue_rejections_;
       }
-      audit(
-          "signaling_queue_backpressure",
-          {{"session_id", session_id},
-           {"sender", sender},
-           {"recipient", recipient},
-           {"queued_messages", queued_messages},
-           {"queued_bytes", queue_bytes},
-           {"message_capacity_reached", message_capacity_reached},
-           {"byte_capacity_reached", byte_capacity_reached}});
-      if (queued_messages == 0) messages_.erase(recipient_key);
-      throw TooManyRequests(
-          "signaling recipient queue capacity exceeded",
-          config_.signaling_message_ttl_ms);
+      audit("signaling_queue_backpressure", {{"session_id", session_id},
+                                             {"sender", sender},
+                                             {"recipient", recipient},
+                                             {"queued_messages", queued_messages},
+                                             {"queued_bytes", queue_bytes},
+                                             {"message_capacity_reached", message_capacity_reached},
+                                             {"byte_capacity_reached", byte_capacity_reached}});
+      if (queued_messages == 0)
+        messages_.erase(recipient_key);
+      throw TooManyRequests("signaling recipient queue capacity exceeded",
+                            config_.signaling_message_ttl_ms);
     }
   }
   const auto delivery_cursor = ++next_delivery_cursors_[recipient_key];
-  const Message queued_message{
-      metadata,
-      sender,
-      recipient,
-      type,
-      payload,
-      cloud_queued_at_utc_ms,
-      cloud_queued_monotonic_ms,
-      delivery_cursor,
-      serialized_bytes};
+  const Message queued_message{metadata,
+                               sender,
+                               recipient,
+                               type,
+                               payload,
+                               cloud_queued_at_utc_ms,
+                               cloud_queued_monotonic_ms,
+                               delivery_cursor,
+                               serialized_bytes};
   std::size_t queued = 1;
   std::size_t queued_bytes = serialized_bytes;
   if (type == "control_command") {
@@ -3630,22 +3567,18 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request, ClockSam
     if (consumed != encoded_client_send_ms.size()) {
       throw std::invalid_argument("client_send_ms must be an integer");
     }
-    return ServerResponse::json(
-        200,
-         {{"time_domain", "signaling_server"},
-         {"client_send_ms", client_send_ms},
-         {"server_receive_ms", server_receive_ms},
-         {"server_send_ms", clock_sample().utc.value}});
+    return ServerResponse::json(200, {{"time_domain", "signaling_server"},
+                                      {"client_send_ms", client_send_ms},
+                                      {"server_receive_ms", server_receive_ms},
+                                      {"server_send_ms", clock_sample().utc.value}});
   }
   const auto parts = path_parts(request.path);
   std::lock_guard lock(mutex_);
   cleanup_expired_connections(now);
   if (parts.size() == 3 && parts[0] == "drivers" && parts[2] == "vehicles") {
     const auto& driver_id = parts[1];
-    validate_driver_token(
-        driver_id,
-        credential_value(request, "token", "x-mine-teleop-driver-token"),
-        now);
+    validate_driver_token(driver_id,
+                          credential_value(request, "token", "x-mine-teleop-driver-token"), now);
     const auto permission = config_.driver_vehicle_permissions.find(driver_id);
     Json vehicles = Json::array();
     if (permission != config_.driver_vehicle_permissions.end()) {
@@ -3679,40 +3612,39 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request, ClockSam
     if (recipient.empty()) throw std::invalid_argument("recipient is required");
     const auto& session = require_participant(parts[1], recipient);
     if (recipient == session.driver_id) {
-      validate_driver_token(
-          recipient,
-          credential_value(request, "token", "x-mine-teleop-driver-token"),
-          now);
+      validate_driver_token(recipient,
+                            credential_value(request, "token", "x-mine-teleop-driver-token"), now);
     } else {
       validate_vehicle_connection(
-          recipient,
-          credential_value(request, "device_token", "x-mine-teleop-device-token"),
-          required_uint64(Json{{"connection_generation", query_value(request, "connection_generation")}}, "connection_generation"),
+          recipient, credential_value(request, "device_token", "x-mine-teleop-device-token"),
+          required_uint64(
+              Json{{"connection_generation", query_value(request, "connection_generation")}},
+              "connection_generation"),
           now);
     }
     return ServerResponse::json(
-        200,
-        {{"messages", take_signaling_messages(parts[1], recipient, now, query_value(request, "types"))}});
+        200, {{"messages",
+               take_signaling_messages(parts[1], recipient, now, query_value(request, "types"))}});
   }
   if (parts.size() == 3 && parts[0] == "vehicles" && parts[2] == "session") {
     const auto& vehicle_id = parts[1];
     validate_vehicle_connection(
-        vehicle_id,
-        credential_value(request, "device_token", "x-mine-teleop-device-token"),
-        required_uint64(Json{{"connection_generation", query_value(request, "connection_generation")}}, "connection_generation"),
+        vehicle_id, credential_value(request, "device_token", "x-mine-teleop-device-token"),
+        required_uint64(
+            Json{{"connection_generation", query_value(request, "connection_generation")}},
+            "connection_generation"),
         now);
     for (const auto& [id, session] : sessions_) {
       static_cast<void>(id);
       if (session.vehicle_id == vehicle_id && session.state == SessionState::Active) {
         return ServerResponse::json(
-            200,
-            {{"vehicle_id", vehicle_id},
-             {"session_id", session.session_id},
-             {"driver_id", session.driver_id},
-             {"state", to_string(session.state)},
-             {"control_token", session.control_token},
-             {"control_token_expires_at_utc_ms", session.control_token_expires_at_utc_ms},
-             {"connection_generation", online_vehicles_.at(vehicle_id).generation}});
+            200, {{"vehicle_id", vehicle_id},
+                  {"session_id", session.session_id},
+                  {"driver_id", session.driver_id},
+                  {"state", to_string(session.state)},
+                  {"control_token", session.control_token},
+                  {"control_token_expires_at_utc_ms", session.control_token_expires_at_utc_ms},
+                  {"connection_generation", online_vehicles_.at(vehicle_id).generation}});
       }
     }
     return ServerResponse::json(
@@ -3800,7 +3732,8 @@ ServerResponse SignalingService::handle_driver_login(Json value, ClockSample adm
   }
 
   const auto release_reservation = [&] {
-    if (!reservation) return;
+    if (!reservation)
+      return;
     std::lock_guard lock(mutex_);
     release_login_failure_reservation_locked(*reservation);
     reservation.reset();
@@ -3815,28 +3748,23 @@ ServerResponse SignalingService::handle_driver_login(Json value, ClockSample adm
   }
   if (!verification_slot_acquired) {
     release_reservation();
-    throw TooManyRequests(
-        "password verification capacity is temporarily exhausted",
-        config_.password_verification_retry_after_ms);
+    throw TooManyRequests("password verification capacity is temporarily exhausted",
+                          config_.password_verification_retry_after_ms);
   }
 
   bool verified = false;
   try {
     switch (credential.kind) {
       case LoginCredentialSnapshot::Kind::Argon2id:
-        verified = verify_argon2id_password(
-            credential.verifier,
-            password.view(),
-            config_.authentication_cost_policy);
+        verified = verify_argon2id_password(credential.verifier, password.view(),
+                                            config_.authentication_cost_policy);
         break;
       case LoginCredentialSnapshot::Kind::LegacyPlaintext:
         verified = constant_time_equal(credential.verifier, password.view());
         break;
       case LoginCredentialSnapshot::Kind::Unknown:
-        static_cast<void>(verify_argon2id_password(
-            dummy_password_verifier_,
-            password.view(),
-            config_.authentication_cost_policy));
+        static_cast<void>(verify_argon2id_password(dummy_password_verifier_, password.view(),
+                                                   config_.authentication_cost_policy));
         break;
     }
   } catch (...) {
@@ -3869,29 +3797,22 @@ ServerResponse SignalingService::handle_driver_login(Json value, ClockSample adm
   const auto generation = ++connection_generation_;
   const std::string token = "driver-token-" + random_token();
   driver_tokens_[token] = DriverToken{
-      driver_id,
-      detail::saturating_deadline_ms(settled_at.utc.value, config_.token_ttl_ms),
-      detail::saturating_deadline_ms(settled_at.monotonic.value, config_.token_ttl_ms),
-      generation};
-  online_drivers_[driver_id] = ConnectionPresence{
-      "",
-      generation,
-      settled_at.utc.value,
-      settled_at.utc.value,
-      settled_at.monotonic.value};
+      driver_id, detail::saturating_deadline_ms(settled_at.utc.value, config_.token_ttl_ms),
+      detail::saturating_deadline_ms(settled_at.monotonic.value, config_.token_ttl_ms), generation};
+  online_drivers_[driver_id] = ConnectionPresence{"", generation, settled_at.utc.value,
+                                                  settled_at.utc.value, settled_at.monotonic.value};
   audit("driver_login", {{"driver_id", driver_id}, {"connection_generation", generation}});
-  return ServerResponse::json(
-      200,
-      {{"token_type", "bearer"},
-       {"token", token},
-       {"expires_at_ms", driver_tokens_.at(token).expires_at_utc_ms},
-       {"connection_generation", generation},
-       {"service_instance_id", service_instance_id_}});
+  return ServerResponse::json(200, {{"token_type", "bearer"},
+                                    {"token", token},
+                                    {"expires_at_ms", driver_tokens_.at(token).expires_at_utc_ms},
+                                    {"connection_generation", generation},
+                                    {"service_instance_id", service_instance_id_}});
 }
 
 ServerResponse SignalingService::handle_post(const HttpRequest& request, ClockSample now) {
   auto value = request.json_body();
-  if (request.path == "/auth/driver_login") return handle_driver_login(std::move(value), now);
+  if (request.path == "/auth/driver_login")
+    return handle_driver_login(std::move(value), now);
   const auto parts = path_parts(request.path);
   std::lock_guard lock(mutex_);
   cleanup_expired_connections(now);
@@ -3902,7 +3823,8 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request, ClockSa
     }
     const auto object_id = required_string(value, "id");
     if (request.path == "/admin/revoke/driver") {
-      if (!configured_driver(object_id)) throw NotFound("unknown driver");
+      if (!configured_driver(object_id))
+        throw NotFound("unknown driver");
       revoked_drivers_.insert(object_id);
       close_sessions_for_driver(object_id, "driver_revoked");
       online_drivers_.erase(object_id);
@@ -3917,7 +3839,8 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request, ClockSa
       return ServerResponse::json(200, {{"driver_id", object_id}, {"state", "revoked"}});
     }
     if (request.path == "/admin/restore/driver") {
-      if (!configured_driver(object_id)) throw NotFound("unknown driver");
+      if (!configured_driver(object_id))
+        throw NotFound("unknown driver");
       revoked_drivers_.erase(object_id);
       audit("driver_restored", {{"driver_id", object_id}});
       return ServerResponse::json(200, {{"driver_id", object_id}, {"state", "offline"}});
@@ -3942,12 +3865,10 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request, ClockSa
     const auto driver_id = required_string(value, "driver_id");
     validate_driver_token(driver_id, optional_string(value, "token"), now);
     const auto& presence = online_drivers_.at(driver_id);
-    return ServerResponse::json(
-        200,
-        {{"driver_id", driver_id},
-         {"state", "online"},
-         {"connection_generation", presence.generation},
-         {"last_seen_at_utc_ms", presence.last_seen_at_utc_ms}});
+    return ServerResponse::json(200, {{"driver_id", driver_id},
+                                      {"state", "online"},
+                                      {"connection_generation", presence.generation},
+                                      {"last_seen_at_utc_ms", presence.last_seen_at_utc_ms}});
   }
   if (request.path == "/auth/driver_logout") {
     const auto driver_id = required_string(value, "driver_id");
@@ -3987,12 +3908,8 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request, ClockSa
           {{"vehicle_id", vehicle_id}, {"previous_connection_generation", current->second.generation}});
     }
     const auto generation = ++connection_generation_;
-    online_vehicles_[vehicle_id] = ConnectionPresence{
-        connection_id,
-        generation,
-        now.utc.value,
-        now.utc.value,
-        now.monotonic.value};
+    online_vehicles_[vehicle_id] = ConnectionPresence{connection_id, generation, now.utc.value,
+                                                      now.utc.value, now.monotonic.value};
     audit("vehicle_online", {{"vehicle_id", vehicle_id}, {"connection_generation", generation}});
     return ServerResponse::json(
         200,
@@ -4004,18 +3921,19 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request, ClockSa
   if (request.path == "/vehicles/heartbeat") {
     const auto vehicle_id = required_string(value, "vehicle_id");
     const auto generation = required_uint64(value, "connection_generation");
-    validate_vehicle_connection(vehicle_id, optional_string(value, "device_token"), generation, now);
+    validate_vehicle_connection(vehicle_id, optional_string(value, "device_token"), generation,
+                                now);
     return ServerResponse::json(
-        200,
-        {{"vehicle_id", vehicle_id},
-         {"state", "online"},
-         {"connection_generation", generation},
-         {"last_seen_at_utc_ms", online_vehicles_.at(vehicle_id).last_seen_at_utc_ms}});
+        200, {{"vehicle_id", vehicle_id},
+              {"state", "online"},
+              {"connection_generation", generation},
+              {"last_seen_at_utc_ms", online_vehicles_.at(vehicle_id).last_seen_at_utc_ms}});
   }
   if (request.path == "/vehicles/offline") {
     const auto vehicle_id = required_string(value, "vehicle_id");
     const auto generation = required_uint64(value, "connection_generation");
-    validate_vehicle_connection(vehicle_id, optional_string(value, "device_token"), generation, now);
+    validate_vehicle_connection(vehicle_id, optional_string(value, "device_token"), generation,
+                                now);
     online_vehicles_.erase(vehicle_id);
     close_sessions_for_vehicle(vehicle_id, "vehicle_offline");
     audit(
@@ -4049,28 +3967,24 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request, ClockSa
         throw Conflict("control authority already granted");
       }
     }
-    if (!audit(
-            "control_authority_grant_preflight",
-            {{"vehicle_id", vehicle_id}, {"driver_id", driver_id}})) {
+    if (!audit("control_authority_grant_preflight",
+               {{"vehicle_id", vehicle_id}, {"driver_id", driver_id}})) {
       throw ServiceUnavailable("audit log unavailable; new control authority is disabled");
     }
     ++session_counter_;
     std::ostringstream id;
     id << "session-" << std::setw(6) << std::setfill('0') << session_counter_;
-    Session session{
-        .session_id = id.str(),
-        .vehicle_id = vehicle_id,
-        .driver_id = driver_id,
-        .state = SessionState::Online,
-        .control_token = "control-token-" + random_token(),
-        .control_token_expires_at_utc_ms = detail::saturating_deadline_ms(
-            now.utc.value,
-            config_.control_token_ttl_ms),
-        .control_token_expires_at_monotonic_ms = detail::saturating_deadline_ms(
-            now.monotonic.value,
-            config_.control_token_ttl_ms),
-        .last_relay_usage_by_actor = {},
-        .websocket_rate_by_participant = {}};
+    Session session{.session_id = id.str(),
+                    .vehicle_id = vehicle_id,
+                    .driver_id = driver_id,
+                    .state = SessionState::Online,
+                    .control_token = "control-token-" + random_token(),
+                    .control_token_expires_at_utc_ms =
+                        detail::saturating_deadline_ms(now.utc.value, config_.control_token_ttl_ms),
+                    .control_token_expires_at_monotonic_ms = detail::saturating_deadline_ms(
+                        now.monotonic.value, config_.control_token_ttl_ms),
+                    .last_relay_usage_by_actor = {},
+                    .websocket_rate_by_participant = {}};
     sessions_[session.session_id] = session;
     auto& stored = sessions_.at(session.session_id);
     audit(
@@ -4079,11 +3993,9 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request, ClockSa
     transition_session(stored, SessionState::Reserved, "control_requested");
     transition_session(stored, SessionState::Connecting, "participants_authenticated");
     transition_session(stored, SessionState::Active, "control_authority_granted");
-    if (!audit(
-            "control_authority_granted",
-            {{"session_id", stored.session_id},
-             {"vehicle_id", stored.vehicle_id},
-             {"driver_id", stored.driver_id}})) {
+    if (!audit("control_authority_granted", {{"session_id", stored.session_id},
+                                             {"vehicle_id", stored.vehicle_id},
+                                             {"driver_id", stored.driver_id}})) {
       close_session(stored, "audit_log_unavailable");
       throw ServiceUnavailable("audit log unavailable; control authority was not granted");
     }
@@ -4095,19 +4007,16 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request, ClockSa
     if (actor != session.driver_id) throw Unauthorized("only the current driver can renew control authority");
     validate_actor_credential(session, actor, value, now);
     const auto previous_expiry_utc_ms = session.control_token_expires_at_utc_ms;
-    session.control_token_expires_at_utc_ms = detail::saturating_deadline_ms(
-        now.utc.value,
-        config_.control_token_ttl_ms);
-    session.control_token_expires_at_monotonic_ms = detail::saturating_deadline_ms(
-        now.monotonic.value,
-        config_.control_token_ttl_ms);
-    audit(
-        "control_authority_renewed",
-        {{"session_id", session.session_id},
-         {"vehicle_id", session.vehicle_id},
-         {"driver_id", session.driver_id},
-         {"previous_expires_at_utc_ms", previous_expiry_utc_ms},
-         {"expires_at_utc_ms", session.control_token_expires_at_utc_ms}});
+    session.control_token_expires_at_utc_ms =
+        detail::saturating_deadline_ms(now.utc.value, config_.control_token_ttl_ms);
+    session.control_token_expires_at_monotonic_ms =
+        detail::saturating_deadline_ms(now.monotonic.value, config_.control_token_ttl_ms);
+    audit("control_authority_renewed",
+          {{"session_id", session.session_id},
+           {"vehicle_id", session.vehicle_id},
+           {"driver_id", session.driver_id},
+           {"previous_expires_at_utc_ms", previous_expiry_utc_ms},
+           {"expires_at_utc_ms", session.control_token_expires_at_utc_ms}});
     return ServerResponse::json(200, session.to_json(true));
   }
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "end") {
@@ -4751,9 +4660,8 @@ bool DriverConsoleRuntime::send_native_control_sample() {
                : 0},
       };
     }
-    if (detail::monotonic_deadline_reached(
-            clock_.sample().monotonic,
-            control_token_expires_at_monotonic_ms)) {
+    if (detail::monotonic_deadline_reached(clock_.sample().monotonic,
+                                           control_token_expires_at_monotonic_ms)) {
       throw std::runtime_error("control authority lease expired");
     }
 
@@ -5050,10 +4958,9 @@ void DriverConsoleRuntime::native_control_lease_loop(std::stop_token stop_token)
     {
       std::lock_guard lock(mutex_);
       const auto now = clock_.sample();
-      renewal_due = !session_id_.empty() && !control_token_.empty() &&
-          detail::monotonic_deadline_reached(
-              now.monotonic,
-              control_token_renew_at_monotonic_ms_);
+      renewal_due =
+          !session_id_.empty() && !control_token_.empty() &&
+          detail::monotonic_deadline_reached(now.monotonic, control_token_renew_at_monotonic_ms_);
       renewal_session = session_id_;
       renewal_generation = control_session_generation_;
     }
@@ -5147,9 +5054,7 @@ Json DriverConsoleRuntime::renew_control_authority() {
     return {{"renewed", false}, {"reason", "not_connected"}};
   }
   const auto request_started_at = clock_.sample();
-  if (!detail::monotonic_deadline_reached(
-          request_started_at.monotonic,
-          renew_at_monotonic_ms)) {
+  if (!detail::monotonic_deadline_reached(request_started_at.monotonic, renew_at_monotonic_ms)) {
     return {{"renewed", false}, {"reason", "not_due"}};
   }
   Json response;
@@ -5180,9 +5085,8 @@ Json DriverConsoleRuntime::renew_control_authority() {
   }
   const auto expires_at_utc_ms = required_int64(response, "control_token_expires_at_utc_ms");
   const auto received_at = clock_.sample();
-  const auto expires_at_monotonic_ms = detail::local_monotonic_deadline_from_utc_expiry(
-      UtcMillis{expires_at_utc_ms},
-      received_at);
+  const auto expires_at_monotonic_ms =
+      detail::local_monotonic_deadline_from_utc_expiry(UtcMillis{expires_at_utc_ms}, received_at);
   if (detail::monotonic_deadline_reached(received_at.monotonic, expires_at_monotonic_ms.value)) {
     throw std::runtime_error("control authority renewal returned an expired lease");
   }
@@ -5193,9 +5097,8 @@ Json DriverConsoleRuntime::renew_control_authority() {
     }
     control_token_expires_at_utc_ms_ = expires_at_utc_ms;
     control_token_expires_at_monotonic_ms_ = expires_at_monotonic_ms.value;
-    control_token_renew_at_monotonic_ms_ = control_lease_renew_at(
-        received_at.monotonic,
-        expires_at_monotonic_ms);
+    control_token_renew_at_monotonic_ms_ =
+        control_lease_renew_at(received_at.monotonic, expires_at_monotonic_ms);
   }
   return {
       {"renewed", true},
@@ -5215,9 +5118,8 @@ Json DriverConsoleRuntime::login_locked(std::string_view password) {
     current_expiry_utc_ms = driver_token_expires_at_utc_ms_;
     current_expiry_monotonic_ms = driver_token_expires_at_monotonic_ms_;
   }
-  if (!current_token.empty() && !detail::monotonic_deadline_reached(
-                                    clock_.sample().monotonic,
-                                    current_expiry_monotonic_ms)) {
+  if (!current_token.empty() &&
+      !detail::monotonic_deadline_reached(clock_.sample().monotonic, current_expiry_monotonic_ms)) {
     try {
       auto result = fetch_authorized_vehicles(current_token, current_expiry_utc_ms);
       result["authenticated"] = true;
@@ -5245,9 +5147,8 @@ Json DriverConsoleRuntime::login_locked(std::string_view password) {
       {{"driver_id", config_.driver_id}, {"password", credential}});
   const auto expires_at_utc_ms = response.value("expires_at_ms", std::int64_t{0});
   const auto received_at = clock_.sample();
-  const auto expires_at_monotonic_ms = detail::local_monotonic_deadline_from_utc_expiry(
-      UtcMillis{expires_at_utc_ms},
-      received_at);
+  const auto expires_at_monotonic_ms =
+      detail::local_monotonic_deadline_from_utc_expiry(UtcMillis{expires_at_utc_ms}, received_at);
   if (detail::monotonic_deadline_reached(received_at.monotonic, expires_at_monotonic_ms.value)) {
     throw std::runtime_error("driver login returned an expired token");
   }
@@ -5260,9 +5161,7 @@ Json DriverConsoleRuntime::login_locked(std::string_view password) {
     signaling_service_instance_id_ = required_string(response, "service_instance_id");
     signaling_available_ = true;
   }
-  auto result = fetch_authorized_vehicles(
-      required_string(response, "token"),
-      expires_at_utc_ms);
+  auto result = fetch_authorized_vehicles(required_string(response, "token"), expires_at_utc_ms);
   result["authenticated"] = true;
   return result;
 }
@@ -5272,9 +5171,8 @@ Json DriverConsoleRuntime::login(std::string_view password) {
   return login_locked(password);
 }
 
-Json DriverConsoleRuntime::fetch_authorized_vehicles(
-    std::string_view token,
-    std::int64_t expires_at_utc_ms) {
+Json DriverConsoleRuntime::fetch_authorized_vehicles(std::string_view token,
+                                                     std::int64_t expires_at_utc_ms) {
   const auto response = http_.get_json(
       signaling_http_url_ + "/drivers/" + http_.url_encode(config_.driver_id) + "/vehicles",
       {{"X-Mine-Teleop-Driver-Token", std::string(token)}});
@@ -5463,14 +5361,13 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
   const auto control_token = required_string(session, "control_token");
   const auto connected_at = clock_.sample();
   const auto connected_at_utc_ms = connected_at.utc.value;
-  const auto control_token_expires_at_utc_ms = required_int64(session, "control_token_expires_at_utc_ms");
+  const auto control_token_expires_at_utc_ms =
+      required_int64(session, "control_token_expires_at_utc_ms");
   const auto control_token_expires_at_monotonic_ms =
-      detail::local_monotonic_deadline_from_utc_expiry(
-          UtcMillis{control_token_expires_at_utc_ms},
-          connected_at);
-  if (detail::monotonic_deadline_reached(
-          connected_at.monotonic,
-          control_token_expires_at_monotonic_ms.value)) {
+      detail::local_monotonic_deadline_from_utc_expiry(UtcMillis{control_token_expires_at_utc_ms},
+                                                       connected_at);
+  if (detail::monotonic_deadline_reached(connected_at.monotonic,
+                                         control_token_expires_at_monotonic_ms.value)) {
     throw std::runtime_error("new control authority lease is already expired");
   }
   std::uint64_t control_session_generation = 0;
@@ -5483,9 +5380,8 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       control_token_ = control_token;
       control_token_expires_at_utc_ms_ = control_token_expires_at_utc_ms;
       control_token_expires_at_monotonic_ms_ = control_token_expires_at_monotonic_ms.value;
-      control_token_renew_at_monotonic_ms_ = control_lease_renew_at(
-          connected_at.monotonic,
-          control_token_expires_at_monotonic_ms);
+      control_token_renew_at_monotonic_ms_ =
+          control_lease_renew_at(connected_at.monotonic, control_token_expires_at_monotonic_ms);
       sequence_ = 0;
       control_sequence_ = 0;
       control_session_generation = ++control_session_generation_;
@@ -6195,9 +6091,9 @@ Json DriverConsoleRuntime::status() {
   {
     std::lock_guard lock(mutex_);
     authenticated = !driver_token_.empty();
-    control_lease_due = !session_id_.empty() && detail::monotonic_deadline_reached(
-        timestamp.monotonic,
-        control_token_renew_at_monotonic_ms_);
+    control_lease_due =
+        !session_id_.empty() && detail::monotonic_deadline_reached(
+                                    timestamp.monotonic, control_token_renew_at_monotonic_ms_);
   }
   if (control_lease_due) {
     try {
@@ -6285,9 +6181,7 @@ Json DriverConsoleRuntime::status() {
         {"effective_estop", native_sample.intent.estop},
         {"websocket_connected", native_control_websocket_connected},
         {"next_connect_in_ms",
-         std::max<std::int64_t>(
-             0,
-             native_control_next_connect_monotonic_ms - monotonic_now_ms())},
+         std::max<std::int64_t>(0, native_control_next_connect_monotonic_ms - monotonic_now_ms())},
         {"reconnect_delay_ms", native_control_reconnect_delay_ms},
         {"commands_sent_total", native_control_commands_sent_.load()},
         {"send_failures_total", native_control_send_failures_.load()},
@@ -6298,8 +6192,7 @@ Json DriverConsoleRuntime::status() {
         {"last_seq", native_control_last_seq_.load()},
         {"last_ack_seq", native_control_last_ack_seq},
         {"unacknowledged_age_ms", native_control_unacknowledged_age_ms},
-        {"last_ack_received_at_utc_ms",
-         native_control_last_ack_received_at_utc_ms_.load()},
+        {"last_ack_received_at_utc_ms", native_control_last_ack_received_at_utc_ms_.load()},
         {"last_ack_cloud_received_at_utc_ms",
          native_control_last_ack_cloud_received_at_utc_ms_.load()},
         {"last_error", native_control_last_error}}},
@@ -6392,38 +6285,33 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
   try {
     if (request.method == "POST") {
       if (!application_json_content_type(request)) {
-        response = ServerResponse::json(415, {{"error", "local mutation requests require application/json"}});
+        response = ServerResponse::json(
+            415, {{"error", "local mutation requests require application/json"}});
       } else if (!trusted_local_mutation_request(request, page_capability_)) {
-        response = ServerResponse::json(403, {{"error", "local mutation request origin or capability is invalid"}});
+        response = ServerResponse::json(
+            403, {{"error", "local mutation request origin or capability is invalid"}});
       }
     }
     if (response.status == 200) {
       if (request.method == "GET" && request.path == "/assets/control_logic.js") {
-        response = ServerResponse::text(
-            200,
-            std::string(web::kControlLogicJavaScript),
-            "application/javascript; charset=utf-8");
+        response = ServerResponse::text(200, std::string(web::kControlLogicJavaScript),
+                                        "application/javascript; charset=utf-8");
       } else if (request.method == "GET" && request.path == "/assets/control_console.js") {
-        response = ServerResponse::text(
-            200,
-            std::string(web::kControlConsoleJavaScript),
-            "application/javascript; charset=utf-8");
+        response = ServerResponse::text(200, std::string(web::kControlConsoleJavaScript),
+                                        "application/javascript; charset=utf-8");
       } else if (request.method == "GET" && request.path == "/assets/control_console.css") {
-        response = ServerResponse::text(
-            200,
-            std::string(web::kControlConsoleCss),
-            "text/css; charset=utf-8");
+        response = ServerResponse::text(200, std::string(web::kControlConsoleCss),
+                                        "text/css; charset=utf-8");
       } else if (request.method == "GET" && request.path == "/assets/control_console.html") {
-        response = ServerResponse::text(
-            200,
-            std::string(web::kControlConsoleHtml),
-            "text/html; charset=utf-8");
+        response = ServerResponse::text(200, std::string(web::kControlConsoleHtml),
+                                        "text/html; charset=utf-8");
       } else if (request.method == "GET" && request.path == "/health") {
         response = ServerResponse::json(200, {{"status", "ok"}, {"runtime", "cpp"}});
       } else if (request.method == "GET" && request.path == "/api/time") {
         response = ServerResponse::json(200, {{"now_ms", now_ms()}});
       } else if (request.method == "GET" && request.path == "/api/console-config") {
-        response = ServerResponse::json(200, console_config_json(runtime_->config(), page_capability_));
+        response =
+            ServerResponse::json(200, console_config_json(runtime_->config(), page_capability_));
       } else if (request.method == "GET" && request.path == "/api/status") {
         response = ServerResponse::json(200, runtime_->status());
       } else if (request.method == "GET" && request.path == "/api/vehicles") {
@@ -6433,57 +6321,55 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
       } else if (request.method == "GET" && request.path == "/api/control-profile") {
         response = ServerResponse::json(200, runtime_->control_profile());
       } else if (request.method == "GET" && request.path == "/") {
-        response = ServerResponse::text(
-            200,
-            std::string(web::kControlConsoleHtml),
-            "text/html; charset=utf-8");
+        response = ServerResponse::text(200, std::string(web::kControlConsoleHtml),
+                                        "text/html; charset=utf-8");
       } else if (request.method == "POST" && request.path == "/api/login") {
-        response = ServerResponse::json(200, runtime_->login(request.json_body().value("password", "")));
+        response =
+            ServerResponse::json(200, runtime_->login(request.json_body().value("password", "")));
       } else if (request.method == "POST" && request.path == "/api/connect") {
-        response = ServerResponse::json(200, runtime_->connect(request.json_body().value("vehicle_id", "")));
+        response = ServerResponse::json(
+            200, runtime_->connect(request.json_body().value("vehicle_id", "")));
       } else if (request.method == "POST" && request.path == "/api/end-session") {
         response = ServerResponse::json(
-            200,
-            runtime_->end_session(request.json_body().value("reason", "driver_session_end")));
+            200, runtime_->end_session(request.json_body().value("reason", "driver_session_end")));
       } else if (request.method == "POST" && request.path == "/api/disconnect") {
-        response = ServerResponse::json(
-            200,
-            runtime_->disconnect(request.json_body().value("reason", "driver_console_disconnect")));
+        response = ServerResponse::json(200, runtime_->disconnect(request.json_body().value(
+                                                 "reason", "driver_console_disconnect")));
       } else if (request.method == "POST" && request.path == "/api/poll-signaling") {
         response = ServerResponse::json(200, runtime_->poll_signaling());
       } else if (request.method == "POST" && request.path == "/api/webrtc/ice-servers") {
         response = ServerResponse::json(200, runtime_->ice_servers());
       } else if (request.method == "POST" && request.path == "/api/webrtc/capabilities") {
-        response = ServerResponse::json(200, runtime_->send_media_capabilities(request.json_body()));
+        response =
+            ServerResponse::json(200, runtime_->send_media_capabilities(request.json_body()));
       } else if (request.method == "POST" && request.path == "/api/webrtc/fallback") {
         response = ServerResponse::json(200, runtime_->send_media_fallback(request.json_body()));
       } else if (request.method == "POST" && request.path == "/api/webrtc/answer") {
         response = ServerResponse::json(200, runtime_->send_webrtc_answer(request.json_body()));
       } else if (request.method == "POST" && request.path == "/api/webrtc/ice-candidate") {
-        response = ServerResponse::json(200, runtime_->send_webrtc_ice_candidate(request.json_body()));
+        response =
+            ServerResponse::json(200, runtime_->send_webrtc_ice_candidate(request.json_body()));
       } else if (request.method == "POST" && request.path == "/api/webrtc/metrics") {
         response = ServerResponse::json(200, runtime_->ingest_webrtc_metrics(request.json_body()));
       } else if (request.method == "POST" && request.path == "/api/browser-event") {
         response = ServerResponse::json(200, runtime_->record_browser_event(request.json_body()));
       } else if (request.method == "POST" && request.path == "/api/control-limits") {
         response = ServerResponse::json(
-            410,
-            {{"error", "legacy control-limit mutation is retired; use /api/control-profile"}});
+            410, {{"error", "legacy control-limit mutation is retired; use /api/control-profile"}});
       } else if (request.method == "POST" && request.path == "/api/control-profile") {
-        response = ServerResponse::json(200, runtime_->prepare_control_profile(request.json_body()));
+        response =
+            ServerResponse::json(200, runtime_->prepare_control_profile(request.json_body()));
       } else if (request.method == "POST" && request.path == "/api/control-intent") {
         response = ServerResponse::json(200, runtime_->update_control_intent(request.json_body()));
       } else if (request.method == "POST" && request.path == "/api/control") {
         response = ServerResponse::json(
-            410,
-            {{"error", "legacy browser control packet endpoint is retired; use /api/control-intent"}});
-      } else if (request.method == "POST" &&
-                 (request.path == "/api/control/keyboard" ||
-                  request.path == "/api/control/gamepad")) {
+            410, {{"error",
+                   "legacy browser control packet endpoint is retired; use /api/control-intent"}});
+      } else if (request.method == "POST" && (request.path == "/api/control/keyboard" ||
+                                              request.path == "/api/control/gamepad")) {
         response = ServerResponse::json(
             410,
-            {{"error",
-              "legacy specialized control endpoint is retired; use /api/control-intent"}});
+            {{"error", "legacy specialized control endpoint is retired; use /api/control-intent"}});
       } else {
         response = ServerResponse::json(404, {{"error", "not found"}});
       }

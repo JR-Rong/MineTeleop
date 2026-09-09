@@ -79,13 +79,9 @@ class SimpleHttpServer {
       Handler handler,
       std::size_t max_body_bytes = 8 * 1024 * 1024,
       WebSocketHandler websocket_handler = {});
-  SimpleHttpServer(
-      std::string host,
-      std::uint16_t port,
-      Handler handler,
-      std::size_t max_body_bytes,
-      WebSocketHandler websocket_handler,
-      ConnectionLimits connection_limits);
+  SimpleHttpServer(std::string host, std::uint16_t port, Handler handler,
+                   std::size_t max_body_bytes, WebSocketHandler websocket_handler,
+                   ConnectionLimits connection_limits);
   ~SimpleHttpServer();
 
   SimpleHttpServer(const SimpleHttpServer&) = delete;
@@ -193,10 +189,9 @@ class SignalingService {
  public:
   using ClockSampler = std::function<ClockSample()>;
 
-  explicit SignalingService(
-      SignalingServerConfig config,
-      std::function<std::int64_t()> audit_clock = {},
-      ClockSampler clock_sampler = {});
+  explicit SignalingService(SignalingServerConfig config,
+                            std::function<std::int64_t()> audit_clock = {},
+                            ClockSampler clock_sampler = {});
   ~SignalingService();
 
   [[nodiscard]] ServerResponse handle(const HttpRequest& request);
@@ -300,16 +295,12 @@ class SignalingService {
   [[nodiscard]] ServerResponse handle_post(const HttpRequest& request, ClockSample now);
   [[nodiscard]] ServerResponse handle_driver_login(Json value, ClockSample admitted_at);
   [[nodiscard]] Json enqueue_signaling_message(
-      std::string_view session_id,
-      const Json& value,
-      ClockSample received_at,
+      std::string_view session_id, const Json& value, ClockSample received_at,
       std::optional<std::string_view> authenticated_actor = std::nullopt);
-  [[nodiscard]] Json take_signaling_messages(
-      std::string_view session_id,
-      std::string_view recipient,
-      ClockSample now,
-      std::string_view requested_types = {},
-      bool consume = true);
+  [[nodiscard]] Json take_signaling_messages(std::string_view session_id,
+                                             std::string_view recipient, ClockSample now,
+                                             std::string_view requested_types = {},
+                                             bool consume = true);
   [[nodiscard]] std::size_t acknowledge_signaling_messages(
       std::string_view session_id,
       std::string_view recipient,
@@ -319,16 +310,10 @@ class SignalingService {
   [[nodiscard]] const Session& require_participant(std::string_view session_id, std::string_view participant) const;
   void validate_driver_token(std::string_view driver_id, std::string_view token, ClockSample now);
   void validate_device_token(std::string_view vehicle_id, std::string_view token) const;
-  void validate_vehicle_connection(
-      std::string_view vehicle_id,
-      std::string_view token,
-      std::uint64_t connection_generation,
-      ClockSample now);
-  void validate_actor_credential(
-      const Session& session,
-      std::string_view actor,
-      const Json& value,
-      ClockSample now);
+  void validate_vehicle_connection(std::string_view vehicle_id, std::string_view token,
+                                   std::uint64_t connection_generation, ClockSample now);
+  void validate_actor_credential(const Session& session, std::string_view actor, const Json& value,
+                                 ClockSample now);
   void validate_message_metadata(
       const Session& session,
       const ProtocolMetadata& metadata);
@@ -341,14 +326,12 @@ class SignalingService {
   [[nodiscard]] bool configured_driver(std::string_view driver_id) const;
   [[nodiscard]] bool try_acquire_password_verification_slot();
   void release_password_verification_slot() noexcept;
-  [[nodiscard]] LoginFailureReservation reserve_login_failure_locked(
-      std::string_view driver_id,
-      ClockSample admitted_at);
+  [[nodiscard]] LoginFailureReservation reserve_login_failure_locked(std::string_view driver_id,
+                                                                     ClockSample admitted_at);
   void release_login_failure_reservation_locked(const LoginFailureReservation& reservation);
-  void record_login_failure_locked(
-      std::string_view driver_id,
-      const LoginFailureReservation& reservation,
-      ClockSample settled_at);
+  void record_login_failure_locked(std::string_view driver_id,
+                                   const LoginFailureReservation& reservation,
+                                   ClockSample settled_at);
   void clear_login_failures_locked(std::string_view driver_id);
   [[nodiscard]] std::string request_source(const HttpRequest& request) const;
   void cleanup_api_rate_limits(MonotonicMillis now);
@@ -474,9 +457,8 @@ class DriverConsoleRuntime {
 
  private:
   [[nodiscard]] Json login_locked(std::string_view password);
-  [[nodiscard]] Json fetch_authorized_vehicles(
-      std::string_view token,
-      std::int64_t expires_at_utc_ms);
+  [[nodiscard]] Json fetch_authorized_vehicles(std::string_view token,
+                                               std::int64_t expires_at_utc_ms);
   [[nodiscard]] Json send_signaling_message(std::string_view type, const Json& payload);
   void connect_signaling_websocket(std::string_view session_id, std::string_view token);
   void close_signaling_websocket();
@@ -592,7 +574,9 @@ class DriverConsoleHttpApp {
  public:
   explicit DriverConsoleHttpApp(std::shared_ptr<DriverConsoleRuntime> runtime);
   [[nodiscard]] ServerResponse handle(const HttpRequest& request) const;
-  [[nodiscard]] const std::string& page_capability() const { return page_capability_; }
+  [[nodiscard]] const std::string& page_capability() const {
+    return page_capability_;
+  }
 
  private:
   std::shared_ptr<DriverConsoleRuntime> runtime_;

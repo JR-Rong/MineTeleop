@@ -36,14 +36,16 @@ class TestFailure final : public std::runtime_error {
 };
 
 void expect(bool condition, std::string_view message) {
-  if (!condition) throw TestFailure(std::string(message));
+  if (!condition)
+    throw TestFailure(std::string(message));
 }
 
 template <typename Predicate>
 bool wait_until(Predicate&& predicate, std::chrono::milliseconds timeout) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
-    if (predicate()) return true;
+    if (predicate())
+      return true;
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   return predicate();
@@ -51,10 +53,10 @@ bool wait_until(Predicate&& predicate, std::chrono::milliseconds timeout) {
 
 class CollectingSink final : public DiagnosticSink {
  public:
-  [[nodiscard]] DiagnosticWriteResult write(
-      std::string_view jsonl_line,
-      std::stop_token stop_token) noexcept override {
-    if (stop_token.stop_requested()) return DiagnosticWriteResult::Cancelled;
+  [[nodiscard]] DiagnosticWriteResult write(std::string_view jsonl_line,
+                                            std::stop_token stop_token) noexcept override {
+    if (stop_token.stop_requested())
+      return DiagnosticWriteResult::Cancelled;
     try {
       std::lock_guard lock(mutex_);
       lines_.emplace_back(jsonl_line);
@@ -76,9 +78,7 @@ class CollectingSink final : public DiagnosticSink {
 
 class FailingSink final : public DiagnosticSink {
  public:
-  [[nodiscard]] DiagnosticWriteResult write(
-      std::string_view,
-      std::stop_token) noexcept override {
+  [[nodiscard]] DiagnosticWriteResult write(std::string_view, std::stop_token) noexcept override {
     return DiagnosticWriteResult::Failed;
   }
 };
@@ -88,9 +88,8 @@ class FailingSink final : public DiagnosticSink {
 // is not a valid bounded-shutdown test double.
 class CooperativeBlockingSink final : public DiagnosticSink {
  public:
-  [[nodiscard]] DiagnosticWriteResult write(
-      std::string_view,
-      std::stop_token stop_token) noexcept override {
+  [[nodiscard]] DiagnosticWriteResult write(std::string_view,
+                                            std::stop_token stop_token) noexcept override {
     {
       std::lock_guard lock(mutex_);
       entered_ = true;
@@ -147,15 +146,14 @@ void test_failing_sink_is_observable_and_does_not_kill_worker() {
     expect(emitter.submit("{\"event\":\"sink_failure\",\"index\":" + std::to_string(index) + "}"),
            "failing sink unexpectedly rejected a bounded record");
   }
-  expect(
-      wait_until(
-          [&] { return emitter.stats().sink_failures_total >= kRecords; },
-          std::chrono::milliseconds(500)),
-      "failing sink did not report every failed write");
+  expect(wait_until([&] { return emitter.stats().sink_failures_total >= kRecords; },
+                    std::chrono::milliseconds(500)),
+         "failing sink did not report every failed write");
   emitter.stop();
 
   const auto stats = emitter.stats();
-  expect(stats.sink_failures_total == kRecords, "failed writes were lost after the first sink failure");
+  expect(stats.sink_failures_total == kRecords,
+         "failed writes were lost after the first sink failure");
   expect(stats.emitted_total == 0, "failing sink reported an emitted line");
   expect(stats.dropped_total == kRecords, "failed writes were not counted as dropped");
 }
@@ -170,8 +168,8 @@ void test_full_cooperative_blocking_sink_drops_and_shutdown_is_bounded() {
 
   constexpr int kQueuedAttempts = 10;
   for (int index = 0; index < kQueuedAttempts; ++index) {
-    static_cast<void>(emitter.submit(
-        "{\"event\":\"blocked\",\"index\":" + std::to_string(index + 1) + "}"));
+    static_cast<void>(
+        emitter.submit("{\"event\":\"blocked\",\"index\":" + std::to_string(index + 1) + "}"));
   }
   const auto started = std::chrono::steady_clock::now();
   emitter.stop();
@@ -201,7 +199,8 @@ class ScopedStdoutPipe final {
 
   ~ScopedStdoutPipe() {
     restore();
-    if (pipe_fds_[0] >= 0) ::close(pipe_fds_[0]);
+    if (pipe_fds_[0] >= 0)
+      ::close(pipe_fds_[0]);
   }
 
   ScopedStdoutPipe(const ScopedStdoutPipe&) = delete;
@@ -213,7 +212,8 @@ class ScopedStdoutPipe final {
     std::array<char, 4096> buffer{};
     while (true) {
       const auto received = ::read(pipe_fds_[0], buffer.data(), buffer.size());
-      if (received == 0) break;
+      if (received == 0)
+        break;
       expect(received > 0, "cannot read stdout test pipe");
       result.append(buffer.data(), static_cast<std::size_t>(received));
     }
@@ -224,7 +224,8 @@ class ScopedStdoutPipe final {
 
  private:
   void restore() noexcept {
-    if (saved_stdout_ < 0) return;
+    if (saved_stdout_ < 0)
+      return;
     static_cast<void>(::dup2(saved_stdout_, STDOUT_FILENO));
     ::close(saved_stdout_);
     saved_stdout_ = -1;
@@ -251,40 +252,35 @@ void test_real_stdout_pipe_concurrent_producers_have_bounded_loss_and_complete_j
       for (int index = 0; index < kRecordsPerProducer; ++index) {
         static_cast<void>(emitter.submit(
             "{\"event\":\"stdout_pipe\",\"producer\":" + std::to_string(producer) +
-            ",\"index\":" + std::to_string(index) + ",\"payload\":\"" + payload +
-            "\"}"));
+            ",\"index\":" + std::to_string(index) + ",\"payload\":\"" + payload + "\"}"));
       }
     });
   }
-  for (auto& producer : producers) producer.join();
-  expect(
-      wait_until(
-          [&] { return emitter.stats().sink_timeouts_total > 0; },
-          std::chrono::milliseconds(600)),
-      "real stdout pipe did not expose its bounded write deadline when full");
+  for (auto& producer : producers)
+    producer.join();
+  expect(wait_until([&] { return emitter.stats().sink_timeouts_total > 0; },
+                    std::chrono::milliseconds(600)),
+         "real stdout pipe did not expose its bounded write deadline when full");
   emitter.stop();
   const auto stats = emitter.stats();
   const int stdout_flags_after = ::fcntl(STDOUT_FILENO, F_GETFL);
   expect(stdout_flags_after >= 0, "cannot read stdout flags after diagnostic sink test");
-  expect(
-      (stdout_flags_after & O_NONBLOCK) == (stdout_flags_before & O_NONBLOCK),
-      "diagnostic sink changed the process stdout O_NONBLOCK flag");
+  expect((stdout_flags_after & O_NONBLOCK) == (stdout_flags_before & O_NONBLOCK),
+         "diagnostic sink changed the process stdout O_NONBLOCK flag");
   const auto bytes = stdout_pipe.restore_and_read_all();
   expect(stats.sink_timeouts_total > 0, "full stdout pipe loss was not observable");
-  expect(
-      stats.emitted_total + stats.dropped_total ==
-          static_cast<std::uint64_t>(kProducerCount * kRecordsPerProducer),
-      "stdout pipe producer records were neither emitted nor counted as dropped");
+  expect(stats.emitted_total + stats.dropped_total ==
+             static_cast<std::uint64_t>(kProducerCount * kRecordsPerProducer),
+         "stdout pipe producer records were neither emitted nor counted as dropped");
   std::size_t line_start = 0;
   std::uint64_t parsed_lines = 0;
   while (line_start < bytes.size()) {
     const auto newline = bytes.find('\n', line_start);
     expect(newline != std::string::npos, "stdout pipe ended with a partial JSONL record");
     const auto parsed = Json::parse(bytes.substr(line_start, newline - line_start));
-    expect(
-        parsed.value("event", "") == "stdout_pipe" && parsed.contains("producer") &&
-            parsed.contains("index"),
-        "stdout pipe emitted a corrupted JSON record");
+    expect(parsed.value("event", "") == "stdout_pipe" && parsed.contains("producer") &&
+               parsed.contains("index"),
+           "stdout pipe emitted a corrupted JSON record");
     ++parsed_lines;
     line_start = newline + 1;
   }
@@ -303,29 +299,29 @@ void test_concurrent_producers_preserve_jsonl_record_boundaries() {
   for (int producer = 0; producer < kProducerCount; ++producer) {
     producers.emplace_back([&emitter, producer] {
       for (int index = 0; index < kRecordsPerProducer; ++index) {
-        static_cast<void>(emitter.submit(
-            "{\"event\":\"concurrent\",\"producer\":" + std::to_string(producer) +
-            ",\"index\":" + std::to_string(index) + "}"));
+        static_cast<void>(
+            emitter.submit("{\"event\":\"concurrent\",\"producer\":" + std::to_string(producer) +
+                           ",\"index\":" + std::to_string(index) + "}"));
       }
     });
   }
-  for (auto& producer : producers) producer.join();
+  for (auto& producer : producers)
+    producer.join();
   emitter.stop();
 
   const auto stats = emitter.stats();
   const auto lines = sink->lines();
   const auto submitted = static_cast<std::uint64_t>(kProducerCount * kRecordsPerProducer);
-  expect(
-      stats.emitted_total + stats.dropped_total == submitted,
-      "concurrent producer records were neither emitted nor counted as dropped");
-  expect(lines.size() == stats.emitted_total, "sink line count differs from emitter emission count");
+  expect(stats.emitted_total + stats.dropped_total == submitted,
+         "concurrent producer records were neither emitted nor counted as dropped");
+  expect(lines.size() == stats.emitted_total,
+         "sink line count differs from emitter emission count");
   for (const auto& line : lines) {
     expect(!line.empty() && line.back() == '\n', "emitted diagnostic is not a complete JSONL line");
     const auto parsed = Json::parse(line);
-    expect(
-        parsed.value("event", "") == "concurrent" && parsed.contains("producer") &&
-            parsed.contains("index"),
-        "concurrent output lost a diagnostic record boundary");
+    expect(parsed.value("event", "") == "concurrent" && parsed.contains("producer") &&
+               parsed.contains("index"),
+           "concurrent output lost a diagnostic record boundary");
   }
 }
 

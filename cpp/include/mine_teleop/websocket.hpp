@@ -55,10 +55,8 @@ class WebSocketClient {
       std::chrono::milliseconds timeout,
       std::vector<std::string> resolve_entries,
       std::filesystem::path ca_bundle);
-  WebSocketClient(
-      std::chrono::milliseconds timeout,
-      std::vector<std::string> resolve_entries,
-      CurlTlsTrustPolicy tls_trust_policy);
+  WebSocketClient(std::chrono::milliseconds timeout, std::vector<std::string> resolve_entries,
+                  CurlTlsTrustPolicy tls_trust_policy);
   ~WebSocketClient();
 
   WebSocketClient(const WebSocketClient&) = delete;

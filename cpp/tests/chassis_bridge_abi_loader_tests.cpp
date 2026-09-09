@@ -98,26 +98,22 @@ void expect_missing_symbol_rejected(
       "bridge with a missing capability was accepted");
 }
 
-void expect_preload_path_rejected(
-    const std::filesystem::path& library_path,
-    std::string_view expected_reason) {
+void expect_preload_path_rejected(const std::filesystem::path& library_path,
+                                  std::string_view expected_reason) {
   try {
     mine_teleop::validate_chassis_bridge_abi(library_path);
   } catch (const std::runtime_error& error) {
-    expect(
-        std::string_view(error.what()).find(expected_reason) != std::string_view::npos,
-        "dynamic-library path was rejected for an unexpected reason");
+    expect(std::string_view(error.what()).find(expected_reason) != std::string_view::npos,
+           "dynamic-library path was rejected for an unexpected reason");
     return;
   }
-  throw std::runtime_error(
-      "untrusted dynamic-library path reached ABI validation");
+  throw std::runtime_error("untrusted dynamic-library path reached ABI validation");
 }
 
-void test_dynamic_library_preload_boundaries(
-    const std::filesystem::path& compatible_library) {
+void test_dynamic_library_preload_boundaries(const std::filesystem::path& compatible_library) {
   const auto root = std::filesystem::temp_directory_path() /
-      ("mine-teleop-chassis-loader-path-test-" +
-       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+                    ("mine-teleop-chassis-loader-path-test-" +
+                     std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   std::error_code error;
   std::filesystem::create_directories(root, error);
   expect(!error, "could not create dynamic-library path test root");
@@ -137,15 +133,10 @@ void test_dynamic_library_preload_boundaries(
     const auto file_writable = root / "file-writable.so";
     std::filesystem::copy_file(compatible_library, file_writable, error);
     expect(!error, "could not create writable dynamic-library fixture");
-    std::filesystem::permissions(
-        file_writable,
-        std::filesystem::perms::group_write,
-        std::filesystem::perm_options::add,
-        error);
+    std::filesystem::permissions(file_writable, std::filesystem::perms::group_write,
+                                 std::filesystem::perm_options::add, error);
     expect(!error, "could not mark dynamic-library fixture group-writable");
-    expect_preload_path_rejected(
-        file_writable,
-        "file is writable by a non-trusted principal");
+    expect_preload_path_rejected(file_writable, "file is writable by a non-trusted principal");
 
     const auto writable_parent = root / "writable-parent";
     std::filesystem::create_directories(writable_parent, error);
@@ -153,15 +144,11 @@ void test_dynamic_library_preload_boundaries(
     const auto parent_writable = writable_parent / "parent-writable.so";
     std::filesystem::copy_file(compatible_library, parent_writable, error);
     expect(!error, "could not create parent-writable dynamic-library fixture");
-    std::filesystem::permissions(
-        writable_parent,
-        std::filesystem::perms::others_write,
-        std::filesystem::perm_options::add,
-        error);
+    std::filesystem::permissions(writable_parent, std::filesystem::perms::others_write,
+                                 std::filesystem::perm_options::add, error);
     expect(!error, "could not mark dynamic-library parent world-writable");
-    expect_preload_path_rejected(
-        parent_writable,
-        "parent directory is writable by a non-trusted principal");
+    expect_preload_path_rejected(parent_writable,
+                                 "parent directory is writable by a non-trusted principal");
 #endif
   } catch (...) {
     cleanup();
@@ -174,9 +161,7 @@ void test_dynamic_library_preload_boundaries(
 
 int main(int argc, char** argv) {
   try {
-    expect(
-        argc == 14,
-        "expected one V5 and twelve capability/size V6 fixture paths");
+    expect(argc == 14, "expected one V5 and twelve capability/size V6 fixture paths");
     expect_rejected(
         argv[1],
         5U,
@@ -189,12 +174,11 @@ int main(int argc, char** argv) {
             sizeof(MineTeleopChassisStopContextV1)));
     expect_accepted(argv[2]);
     std::error_code relative_error;
-    const auto relative_compatible_path = std::filesystem::relative(
-        argv[2], std::filesystem::current_path(), relative_error);
-    expect(
-        !relative_error && !relative_compatible_path.empty() &&
-            !relative_compatible_path.is_absolute(),
-        "could not derive a relative compatible dynamic-library path");
+    const auto relative_compatible_path =
+        std::filesystem::relative(argv[2], std::filesystem::current_path(), relative_error);
+    expect(!relative_error && !relative_compatible_path.empty() &&
+               !relative_compatible_path.is_absolute(),
+           "could not derive a relative compatible dynamic-library path");
     expect_accepted(relative_compatible_path);
     test_dynamic_library_preload_boundaries(argv[2]);
     expect_rejected(

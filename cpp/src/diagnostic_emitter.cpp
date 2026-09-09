@@ -24,9 +24,7 @@ constexpr auto kStdoutWriteTimeout = std::chrono::milliseconds(100);
 
 class UnavailableDiagnosticSink final : public DiagnosticSink {
  public:
-  [[nodiscard]] DiagnosticWriteResult write(
-      std::string_view,
-      std::stop_token) noexcept override {
+  [[nodiscard]] DiagnosticWriteResult write(std::string_view, std::stop_token) noexcept override {
     return DiagnosticWriteResult::Failed;
   }
 };
@@ -34,17 +32,16 @@ class UnavailableDiagnosticSink final : public DiagnosticSink {
 #if defined(__unix__) || defined(__APPLE__)
 class StdoutDiagnosticSink final : public DiagnosticSink {
  public:
-  [[nodiscard]] DiagnosticWriteResult write(
-      std::string_view jsonl_line,
-      std::stop_token stop_token) noexcept override {
+  [[nodiscard]] DiagnosticWriteResult write(std::string_view jsonl_line,
+                                            std::stop_token stop_token) noexcept override {
     if (jsonl_line.empty() || jsonl_line.back() != '\n') {
       return DiagnosticWriteResult::Failed;
     }
 
     const long configured_pipe_buf = ::fpathconf(STDOUT_FILENO, _PC_PIPE_BUF);
     const auto atomic_write_limit = configured_pipe_buf > 0
-        ? static_cast<std::size_t>(configured_pipe_buf)
-        : static_cast<std::size_t>(PIPE_BUF);
+                                        ? static_cast<std::size_t>(configured_pipe_buf)
+                                        : static_cast<std::size_t>(PIPE_BUF);
     if (jsonl_line.size() > atomic_write_limit) {
       return DiagnosticWriteResult::Failed;
     }
@@ -54,7 +51,8 @@ class StdoutDiagnosticSink final : public DiagnosticSink {
     // it also preserves one atomic JSONL writer without changing stdout's
     // process-wide O_NONBLOCK state.
     std::unique_lock output_lock(output_mutex_, std::try_to_lock);
-    if (!output_lock.owns_lock()) return DiagnosticWriteResult::TimedOut;
+    if (!output_lock.owns_lock())
+      return DiagnosticWriteResult::TimedOut;
 
     // A closed launcher pipe must be a diagnostic failure, not a SIGPIPE that
     // takes the media runtime down. The mask belongs only to this worker and
@@ -66,26 +64,31 @@ class StdoutDiagnosticSink final : public DiagnosticSink {
 
     const auto deadline = std::chrono::steady_clock::now() + kStdoutWriteTimeout;
     for (;;) {
-      if (stop_token.stop_requested()) return DiagnosticWriteResult::Cancelled;
+      if (stop_token.stop_requested())
+        return DiagnosticWriteResult::Cancelled;
       const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline) return DiagnosticWriteResult::TimedOut;
+      if (now >= deadline)
+        return DiagnosticWriteResult::TimedOut;
       const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-      const auto wait = std::max(
-          std::chrono::milliseconds(1),
-          std::min(remaining, kStdoutPollSlice));
+      const auto wait =
+          std::max(std::chrono::milliseconds(1), std::min(remaining, kStdoutPollSlice));
       pollfd poll_fd{STDOUT_FILENO, POLLOUT, 0};
       const int ready = ::poll(&poll_fd, 1, static_cast<int>(wait.count()));
-      if (ready == 0) continue;
+      if (ready == 0)
+        continue;
       if (ready < 0) {
-        if (errno == EINTR) continue;
+        if (errno == EINTR)
+          continue;
         return DiagnosticWriteResult::Failed;
       }
-      if ((poll_fd.revents & POLLOUT) == 0) return DiagnosticWriteResult::Failed;
+      if ((poll_fd.revents & POLLOUT) == 0)
+        return DiagnosticWriteResult::Failed;
       const auto written = ::write(STDOUT_FILENO, jsonl_line.data(), jsonl_line.size());
       if (written == static_cast<ssize_t>(jsonl_line.size())) {
         return DiagnosticWriteResult::Written;
       }
-      if (written < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+      if (written < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+        continue;
 
       // A <= PIPE_BUF pipe write is all-or-nothing. Do not retry a suffix:
       // that could turn a JSONL stream into an unparsable partial record.
@@ -135,7 +138,8 @@ std::shared_ptr<DiagnosticSink> make_stdout_diagnostic_sink() {
 }
 
 DiagnosticEmitter::DiagnosticEmitter(std::shared_ptr<DiagnosticSink> sink, Limits limits) {
-  if (!sink) throw std::invalid_argument("diagnostic emitter requires a sink");
+  if (!sink)
+    throw std::invalid_argument("diagnostic emitter requires a sink");
   if (limits.queue_capacity == 0 || limits.max_line_bytes < 2 ||
       limits.shutdown_timeout <= std::chrono::milliseconds::zero()) {
     throw std::invalid_argument("diagnostic emitter limits are invalid");
@@ -150,7 +154,8 @@ DiagnosticEmitter::~DiagnosticEmitter() {
 
 bool DiagnosticEmitter::submit(std::string json_record) noexcept {
   const auto state = state_;
-  if (!state) return false;
+  if (!state)
+    return false;
   const auto drop = [&] { state->dropped_total.fetch_add(1, std::memory_order_relaxed); };
   if (!state->accepting.load(std::memory_order_acquire)) {
     drop();
@@ -186,7 +191,8 @@ bool DiagnosticEmitter::submit(std::string json_record) noexcept {
 }
 
 void DiagnosticEmitter::note_producer_drop() noexcept {
-  if (state_) state_->dropped_total.fetch_add(1, std::memory_order_relaxed);
+  if (state_)
+    state_->dropped_total.fetch_add(1, std::memory_order_relaxed);
 }
 
 void DiagnosticEmitter::worker_loop(std::shared_ptr<State> state) noexcept {
@@ -204,7 +210,8 @@ void DiagnosticEmitter::worker_loop(std::shared_ptr<State> state) noexcept {
           break;
         }
         if (state->queue.empty()) {
-          if (state->stopping) break;
+          if (state->stopping)
+            break;
           continue;
         }
         line = std::move(state->queue.front());
@@ -244,10 +251,12 @@ void DiagnosticEmitter::worker_loop(std::shared_ptr<State> state) noexcept {
 
 void DiagnosticEmitter::stop() noexcept {
   const auto state = state_;
-  if (!state) return;
+  if (!state)
+    return;
   {
     std::lock_guard lifecycle_lock(lifecycle_mutex_);
-    if (!worker_.joinable()) return;
+    if (!worker_.joinable())
+      return;
     if (!stop_started_) {
       stop_started_ = true;
       state->accepting.store(false, std::memory_order_release);
@@ -260,10 +269,8 @@ void DiagnosticEmitter::stop() noexcept {
   }
 
   std::unique_lock state_lock(state->mutex);
-  bool finished = state->finished.wait_for(
-      state_lock,
-      state->limits.shutdown_timeout,
-      [&] { return state->worker_finished; });
+  bool finished = state->finished.wait_for(state_lock, state->limits.shutdown_timeout,
+                                           [&] { return state->worker_finished; });
   state_lock.unlock();
   if (!finished) {
     state->shutdown_timeouts_total.fetch_add(1, std::memory_order_relaxed);
@@ -277,7 +284,8 @@ void DiagnosticEmitter::stop() noexcept {
   }
 
   std::lock_guard lifecycle_lock(lifecycle_mutex_);
-  if (!worker_.joinable()) return;
+  if (!worker_.joinable())
+    return;
   // The production stdout sink has a fixed poll deadline and checks the stop
   // token between polls. Test sinks use the same cooperative contract, so this
   // joins rather than orphaning a worker that could outlive shutdown.
@@ -287,7 +295,8 @@ void DiagnosticEmitter::stop() noexcept {
 DiagnosticEmitterStats DiagnosticEmitter::stats() const noexcept {
   DiagnosticEmitterStats result;
   const auto state = state_;
-  if (!state) return result;
+  if (!state)
+    return result;
   result.enqueued_total = state->enqueued_total.load(std::memory_order_relaxed);
   result.emitted_total = state->emitted_total.load(std::memory_order_relaxed);
   result.dropped_total = state->dropped_total.load(std::memory_order_relaxed);
