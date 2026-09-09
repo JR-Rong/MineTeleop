@@ -72,6 +72,7 @@ cd "$fixture_repo"
 git init -q
 git config user.email "fixture@example.invalid"
 git config user.name "Incremental Quality Fixture"
+git config core.whitespace cr-at-eol
 
 mkdir -p cpp
 printf '%s\n' \
