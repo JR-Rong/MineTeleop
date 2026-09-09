@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cmath>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -2199,9 +2200,8 @@ void test_curl_tls_trust_policy_is_explicit_and_protects_ca_bundles() {
 void test_curl_ca_info_path_owns_narrow_utf8_storage() {
   const std::u8string utf8_path = u8"C:\\mine-teleop\\ca-\u8BC1\u4E66\\root.pem";
   const mine_teleop::detail::CurlCaInfoPath ca_info{std::u8string_view(utf8_path)};
-  const std::string expected(
-      reinterpret_cast<const char*>(utf8_path.data()),
-      utf8_path.size());
+  std::string expected(utf8_path.size(), '\0');
+  std::memcpy(expected.data(), utf8_path.data(), utf8_path.size());
 
   expect(ca_info.string() == expected, "curl CAINFO path did not retain UTF-8 bytes");
   expect(ca_info.c_str() == ca_info.string().c_str(), "curl CAINFO path did not expose owned storage");
@@ -2214,6 +2214,17 @@ void test_curl_ca_info_path_owns_narrow_utf8_storage() {
       native_ca_info.string() == native_path.string(),
       "curl CAINFO path changed non-Windows native path encoding");
 #endif
+}
+
+void test_curl_tls_option_failures_are_reported() {
+  expect_throws_containing(
+      [] {
+        mine_teleop::detail::throw_if_curl_option_failed(
+            CURLE_FAILED_INIT,
+            "CURLOPT_CAINFO");
+      },
+      "CURLOPT_CAINFO",
+      "curl TLS option failures did not identify the rejected option");
 }
 
 void test_control_command_json_round_trip_and_validation() {
@@ -5115,6 +5126,7 @@ int main() {
        test_curl_tls_trust_policy_is_explicit_and_protects_ca_bundles},
       {"curl_ca_info_path_owns_narrow_utf8_storage",
        test_curl_ca_info_path_owns_narrow_utf8_storage},
+      {"curl_tls_option_failures_are_reported", test_curl_tls_option_failures_are_reported},
       {"control_command_json_round_trip_and_validation", test_control_command_json_round_trip_and_validation},
       {"session_control_profile_json_round_trip_and_physical_units", test_session_control_profile_json_round_trip_and_physical_units},
       {"shared_protocol_v1_vectors_and_session_states", test_shared_protocol_v1_vectors_and_session_states},

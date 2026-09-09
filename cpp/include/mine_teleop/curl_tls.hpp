@@ -104,6 +104,12 @@ class CurlCaInfoPath {
   std::string storage_;
 };
 
+inline void throw_if_curl_option_failed(CURLcode result, std::string_view option) {
+  if (result == CURLE_OK) return;
+  throw std::runtime_error(
+      "curl TLS option " + std::string(option) + " failed: " + curl_easy_strerror(result));
+}
+
 }  // namespace detail
 
 [[nodiscard]] inline CurlTlsTrustConfiguration resolve_curl_tls_trust_policy(
@@ -131,15 +137,19 @@ class CurlCaInfoPath {
 }
 
 inline void configure_curl_custom_ca(CURL* curl, const detail::CurlCaInfoPath& ca_bundle) {
-  curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle.c_str());
+  detail::throw_if_curl_option_failed(
+      curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle.c_str()),
+      "CURLOPT_CAINFO");
 #if defined(_WIN32) && LIBCURL_VERSION_NUM >= 0x074600
   // Private PKI certificates may intentionally omit public CRL/OCSP endpoints.
   // Schannel still validates the CA chain and hostname, but accepts an unknown
   // revocation status when no distribution point is available.
-  curl_easy_setopt(
-      curl,
-      CURLOPT_SSL_OPTIONS,
-      static_cast<long>(CURLSSLOPT_REVOKE_BEST_EFFORT));
+  detail::throw_if_curl_option_failed(
+      curl_easy_setopt(
+          curl,
+          CURLOPT_SSL_OPTIONS,
+          static_cast<long>(CURLSSLOPT_REVOKE_BEST_EFFORT)),
+      "CURLOPT_SSL_OPTIONS");
 #endif
 }
 
@@ -157,8 +167,12 @@ inline void configure_curl_tls_trust_policy(CURL* curl, const CurlTlsTrustPolicy
 
   // These are deliberate every-request settings, rather than backend defaults:
   // HTTPS/WSS must never continue after a certificate or hostname failure.
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+  detail::throw_if_curl_option_failed(
+      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L),
+      "CURLOPT_SSL_VERIFYPEER");
+  detail::throw_if_curl_option_failed(
+      curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L),
+      "CURLOPT_SSL_VERIFYHOST");
   if (configuration.ca_bundle.has_value()) {
     const detail::CurlCaInfoPath ca_bundle(*configuration.ca_bundle);
     configure_curl_custom_ca(curl, ca_bundle);
