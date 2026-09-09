@@ -277,16 +277,13 @@ ensure_git_clang_format_paths_are_supported() {
 run_git_clang_format_diff() {
   local scope="$1"
   shift
-  local output status existing_config_count
+  local output rename_config status
   output="$(mktemp "${TMPDIR:-/tmp}/mine-teleop-git-clang-format.XXXXXX")"
-  existing_config_count="${GIT_CONFIG_COUNT:-0}"
-  if env \
-    "GIT_CONFIG_COUNT=$((existing_config_count + 1))" \
-    "GIT_CONFIG_KEY_${existing_config_count}=diff.renames" \
-    "GIT_CONFIG_VALUE_${existing_config_count}=true" \
-    "$git_clang_format_bin" --diff --binary "$clang_format_bin" \
+  rename_config="$(mktemp "${TMPDIR:-/tmp}/mine-teleop-git-clang-format-config.XXXXXX")"
+  printf '[diff]\n\trenames = true\n' >"$rename_config"
+  if GIT_CONFIG_GLOBAL="$rename_config" "$git_clang_format_bin" --diff --binary "$clang_format_bin" \
       --extensions c,cc,cpp,cxx,h,hh,hpp,hxx --style=file "$@" >"$output" 2>&1; then
-    rm -f -- "$output"
+    rm -f -- "$output" "$rename_config"
     printf 'incremental_quality_git_clang_format=passed scope=%s\n' "$scope"
     return 0
   else
@@ -294,7 +291,7 @@ run_git_clang_format_diff() {
   fi
   printf 'incremental_quality_git_clang_format=failed scope=%s status=%s\n' "$scope" "$status" >&2
   cat -- "$output" >&2
-  rm -f -- "$output"
+  rm -f -- "$output" "$rename_config"
   if ((status == 1)); then
     return 1
   fi

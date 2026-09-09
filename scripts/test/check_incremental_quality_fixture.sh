@@ -136,13 +136,16 @@ printf '%s\n' \
   '}' > "cpp/untracked new.cpp"
 
 before_status="$(git status --porcelain=v1 -z | od -An -tx1 | tr -d ' \n')"
-output="$(
-  MINE_TELEOP_CLANG_FORMAT="$tool_dir/clang-format" \
+initial_quality_log="$tmp_dir/initial-quality.log"
+if ! MINE_TELEOP_CLANG_FORMAT="$tool_dir/clang-format" \
   MINE_TELEOP_GIT_CLANG_FORMAT="$tool_dir/git-clang-format" \
   MINE_TELEOP_GIT_CLANG_FORMAT_VERSION=18.1.8 \
   MINE_TELEOP_FAKE_TOOL_LOG="$tool_log" \
-  bash scripts/test/check_incremental_quality.sh --base "$main_sha" 2>&1
-)"
+  bash scripts/test/check_incremental_quality.sh --base "$main_sha" >"$initial_quality_log" 2>&1; then
+  cat -- "$initial_quality_log" >&2
+  exit 1
+fi
+output="$(<"$initial_quality_log")"
 after_status="$(git status --porcelain=v1 -z | od -An -tx1 | tr -d ' \n')"
 
 if [[ "$before_status" != "$after_status" ]]; then
