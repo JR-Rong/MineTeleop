@@ -6,6 +6,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -57,6 +58,21 @@ void set_reason(std::string* reason, std::string value) {
                    (character >= '0' && character <= '9') || character == '+' ||
                    character == '/';
              });
+}
+
+[[nodiscard]] std::optional<std::size_t> phc_base64_decoded_bytes(std::string_view value) {
+  if (!phc_base64_component(value)) return std::nullopt;
+  const auto complete_groups = value.size() / 4;
+  switch (value.size() % 4) {
+    case 0:
+      return complete_groups * 3;
+    case 2:
+      return complete_groups * 3 + 1;
+    case 3:
+      return complete_groups * 3 + 2;
+    default:
+      return std::nullopt;
+  }
 }
 
 [[nodiscard]] bool supports_argon2id() {
@@ -217,14 +233,15 @@ bool validate_argon2id_verifier(
     set_reason(reason, "Argon2id verifier parameters are malformed");
     return false;
   }
-  if (memory_kib < policy.minimum_memory_kib || memory_kib > policy.maximum_memory_kib ||
-      time_cost < policy.minimum_time_cost || time_cost > policy.maximum_time_cost ||
-      parallelism < policy.minimum_parallelism || parallelism > policy.maximum_parallelism) {
-    set_reason(reason, "Argon2id verifier cost is outside configured policy");
+  if (memory_kib != policy.memory_kib || time_cost != policy.time_cost ||
+      parallelism != policy.parallelism) {
+    set_reason(reason, "Argon2id verifier cost does not match the selected authentication policy");
     return false;
   }
-  if (fields[4].size() < 11 || fields[5].size() < 22 ||
-      !phc_base64_component(fields[4]) || !phc_base64_component(fields[5])) {
+  const auto salt_bytes = phc_base64_decoded_bytes(fields[4]);
+  const auto digest_bytes = phc_base64_decoded_bytes(fields[5]);
+  if (!salt_bytes.has_value() || *salt_bytes < 8 || !digest_bytes.has_value() ||
+      *digest_bytes != policy.hash_length) {
     set_reason(reason, "Argon2id verifier salt or digest is malformed");
     return false;
   }

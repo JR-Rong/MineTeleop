@@ -26,6 +26,10 @@ struct AuthenticationCostPolicy {
   std::size_t maximum_encoded_bytes{1024};
 };
 
+// Preserve the public provisioning type name while all verification paths use
+// one selected authentication-cost policy.
+using Argon2idPolicy = AuthenticationCostPolicy;
+
 [[nodiscard]] const AuthenticationCostPolicy& default_authentication_cost_policy();
 [[nodiscard]] const AuthenticationCostPolicy& default_argon2id_policy();
 

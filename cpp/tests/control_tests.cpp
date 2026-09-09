@@ -3770,6 +3770,9 @@ void test_argon2id_credentials_and_login_concurrency() {
       tuned_verifier.find(
           "m=" + std::to_string(tuned_policy.memory_kib) + ",t=1,p=1") != std::string::npos,
       "tuned verifier did not use the selected authentication cost policy");
+  expect(
+      !mine_teleop::validate_argon2id_verifier(tuned_verifier, default_policy, &reason),
+      "a verifier with an otherwise legal but different authentication cost was accepted");
   const auto& tuned_dummy = mine_teleop::dummy_argon2id_verifier(tuned_policy);
   const auto& tuned_dummy_again = mine_teleop::dummy_argon2id_verifier(tuned_policy);
   expect(
@@ -3779,6 +3782,25 @@ void test_argon2id_credentials_and_login_concurrency() {
               std::string::npos &&
           mine_teleop::validate_argon2id_verifier(tuned_dummy, tuned_policy, &reason),
       "dummy Argon2id verifier was not cached from the selected authentication cost policy");
+  auto short_digest_policy = default_policy;
+  short_digest_policy.hash_length = 16;
+  expect(
+      mine_teleop::validate_authentication_cost_policy(short_digest_policy, &reason),
+      "valid short-digest authentication cost policy was rejected");
+  const auto short_digest_verifier = mine_teleop::hash_argon2id_password(
+      "short-digest-password",
+      salt,
+      short_digest_policy);
+  expect(
+      mine_teleop::validate_argon2id_verifier(
+          short_digest_verifier,
+          short_digest_policy,
+          &reason) &&
+          !mine_teleop::validate_argon2id_verifier(
+              short_digest_verifier,
+              default_policy,
+              &reason),
+      "a verifier with a different digest length was accepted by the selected policy");
   auto invalid_policy = tuned_policy;
   invalid_policy.maximum_memory_kib = invalid_policy.minimum_memory_kib - 1;
   expect(
@@ -3818,16 +3840,10 @@ void test_argon2id_credentials_and_login_concurrency() {
       [&] { mine_teleop::SignalingService service(invalid_verifier); },
       "out-of-policy Argon2id verifier was accepted at service startup");
 
-  auto incompatible_policy = tuned_policy;
-  incompatible_policy.maximum_time_cost = 1;
-  auto incompatible_verifier = tuned_verifier;
-  const auto tuned_time_begin = incompatible_verifier.find("t=1");
-  expect(tuned_time_begin != std::string::npos, "tuned verifier did not contain its selected time cost");
-  incompatible_verifier.replace(tuned_time_begin, std::string("t=1").size(), "t=2");
   mine_teleop::SignalingServerConfig incompatible_config;
   incompatible_config.driver_passwords.clear();
-  incompatible_config.authentication_cost_policy = incompatible_policy;
-  incompatible_config.driver_password_verifiers = {{"hash-driver", incompatible_verifier}};
+  incompatible_config.authentication_cost_policy = default_policy;
+  incompatible_config.driver_password_verifiers = {{"hash-driver", tuned_verifier}};
   incompatible_config.device_tokens = {{"vehicle-1", "device-token"}};
   incompatible_config.driver_vehicle_permissions = {{"hash-driver", {"vehicle-1"}}};
   expect_throws(
