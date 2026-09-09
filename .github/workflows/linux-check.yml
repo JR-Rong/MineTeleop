@@ -98,6 +98,8 @@ jobs:
           sudo apt-get install --yes --no-install-recommends "$clang_format_package"
           clang-format-18 --version | tee "$RUNNER_TEMP/clang-format-version.log"
           grep -F 'clang-format version 18.1.8' "$RUNNER_TEMP/clang-format-version.log"
+          git-clang-format-18 --version | tee "$RUNNER_TEMP/git-clang-format-version.log"
+          grep -F 'git-clang-format version 18.1.8' "$RUNNER_TEMP/git-clang-format-version.log"
 
       - name: Install locked ESLint 9
         shell: bash
@@ -134,16 +136,22 @@ jobs:
             printf 'incremental-quality has no usable predecessor for %s\n' "$GITHUB_EVENT_NAME" >&2
             exit 2
           fi
+          quality_base_input="$(git rev-parse --verify "${quality_base}^{commit}")"
+          quality_base="$(git merge-base "$quality_base_input" HEAD)" || {
+            printf 'incremental-quality baseline has no common ancestor with HEAD: %s\n' \
+              "$quality_base_input" >&2
+            exit 2
+          }
           quality_base="$(git rev-parse --verify "${quality_base}^{commit}")"
-          git merge-base --is-ancestor "$quality_base" HEAD
           printf 'base_sha=%s\n' "$quality_base" >> "$GITHUB_OUTPUT"
-          printf 'Incremental-quality baseline: `%s` (%s)\n' \
-            "$quality_base" "$GITHUB_EVENT_NAME" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Incremental-quality baseline: `%s` merge-base of `%s` and HEAD (%s)\n' \
+            "$quality_base" "$quality_base_input" "$GITHUB_EVENT_NAME" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run required incremental quality checks
         shell: bash
         env:
           MINE_TELEOP_CLANG_FORMAT: clang-format-18
+          MINE_TELEOP_GIT_CLANG_FORMAT: git-clang-format-18
           MINE_TELEOP_ESLINT: ${{ github.workspace }}/node_modules/.bin/eslint
         run: |
           set -euo pipefail

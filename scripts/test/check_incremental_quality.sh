@@ -5,23 +5,25 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/test/check_incremental_quality.sh [options]
 
-Checks only changed or new relevant files after --base, plus staged, unstaged,
-and untracked changes. It never rewrites files.
+Checks only changed or new relevant files after the common ancestor of --base
+and HEAD, plus staged, unstaged, and untracked changes. It never rewrites files.
 
 Options:
   --base <git-revision>       Compare against this revision. Defaults to
                               MINE_TELEOP_QUALITY_BASE, origin/main, or main.
   --compile-commands <path>   Directory containing compile_commands.json for
                               bounded clang-tidy checks of changed C++ TUs.
-  --require-format            Fail when clang-format 18 is unavailable.
+  --require-format            Fail when clang-format/git-clang-format 18.1.8
+                              are unavailable.
   --require-eslint            Fail when ESLint 9 is unavailable for changed JS.
   --require-tidy              Fail unless --compile-commands and clang-tidy 18
                               are available for changed C++ translation units.
   --help                      Show this help.
 
 Tool paths can be overridden with MINE_TELEOP_CLANG_FORMAT,
-MINE_TELEOP_CLANG_TIDY, and MINE_TELEOP_ESLINT. Run with --base set to the
-current PR head to keep an incremental PR check focused on new work.
+MINE_TELEOP_GIT_CLANG_FORMAT, MINE_TELEOP_CLANG_TIDY, and MINE_TELEOP_ESLINT.
+Pass the target branch tip, push predecessor, or explicit predecessor as --base;
+the script uses its merge-base with HEAD as the comparison baseline.
 USAGE
 }
 
@@ -82,14 +84,18 @@ if [[ -z "$quality_base" ]]; then
   fi
 fi
 
-quality_base_sha="$(git rev-parse --verify "${quality_base}^{commit}")" || {
+quality_base_input_sha="$(git rev-parse --verify "${quality_base}^{commit}")" || {
   printf 'invalid quality baseline: %s\n' "$quality_base" >&2
   exit 2
 }
-if ! git merge-base --is-ancestor "$quality_base_sha" HEAD; then
-  printf 'quality baseline is not an ancestor of HEAD: %s\n' "$quality_base" >&2
+quality_base_sha="$(git merge-base "$quality_base_input_sha" HEAD)" || {
+  printf 'quality baseline has no common ancestor with HEAD: %s\n' "$quality_base" >&2
   exit 2
-fi
+}
+quality_base_sha="$(git rev-parse --verify "${quality_base_sha}^{commit}")" || {
+  printf 'invalid quality merge-base for: %s\n' "$quality_base" >&2
+  exit 2
+}
 
 declare -a changed_files=()
 append_unique_file() {
@@ -109,9 +115,9 @@ read_paths() {
   done
 }
 
-read_paths < <(git diff --name-only --diff-filter=ACMR -z "$quality_base_sha...HEAD")
-read_paths < <(git diff --name-only --diff-filter=ACMR -z)
-read_paths < <(git diff --cached --name-only --diff-filter=ACMR -z)
+read_paths < <(git diff --name-only --diff-filter=ACMR --find-renames -z "$quality_base_sha" HEAD)
+read_paths < <(git diff --name-only --diff-filter=ACMR --find-renames -z)
+read_paths < <(git diff --cached --name-only --diff-filter=ACMR --find-renames -z)
 read_paths < <(git ls-files --others --exclude-standard -z)
 
 is_relevant_file() {
@@ -124,9 +130,46 @@ is_relevant_file() {
 
 declare -a relevant_files=()
 declare -a cpp_files=()
+declare -a existing_cpp_files=()
+declare -a new_cpp_files=()
 declare -a cpp_translation_units=()
 declare -a shell_files=()
 declare -a js_files=()
+
+path_exists_at_base() {
+  git cat-file -e "$quality_base_sha:$1" 2>/dev/null
+}
+
+renamed_from_base_in_diff() {
+  local target="$1"
+  shift
+  local status old_path new_path path
+  while IFS= read -r -d '' status; do
+    case "$status" in
+      R*)
+        IFS= read -r -d '' old_path || return 1
+        IFS= read -r -d '' new_path || return 1
+        if [[ "$new_path" == "$target" ]] && path_exists_at_base "$old_path"; then
+          return 0
+        fi
+        ;;
+      *)
+        IFS= read -r -d '' path || return 1
+        ;;
+    esac
+  done < <(git diff --name-status --find-renames -z "$@")
+  return 1
+}
+
+is_existing_at_base_or_rename() {
+  local path="$1"
+  path_exists_at_base "$path" && return 0
+  renamed_from_base_in_diff "$path" "$quality_base_sha" HEAD && return 0
+  renamed_from_base_in_diff "$path" --cached && return 0
+  renamed_from_base_in_diff "$path" && return 0
+  return 1
+}
+
 if ((${#changed_files[@]} > 0)); then
   for changed_file in "${changed_files[@]}"; do
     [[ -f "$changed_file" ]] || continue
@@ -135,6 +178,11 @@ if ((${#changed_files[@]} > 0)); then
     case "$changed_file" in
       *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx)
         cpp_files+=("$changed_file")
+        if is_existing_at_base_or_rename "$changed_file"; then
+          existing_cpp_files+=("$changed_file")
+        else
+          new_cpp_files+=("$changed_file")
+        fi
         case "$changed_file" in
           *.c|*.cc|*.cpp|*.cxx) cpp_translation_units+=("$changed_file") ;;
         esac
@@ -145,11 +193,13 @@ if ((${#changed_files[@]} > 0)); then
   done
 fi
 
+printf 'incremental_quality_requested_base=%s\n' "$quality_base_input_sha"
 printf 'incremental_quality_base=%s\n' "$quality_base_sha"
-printf 'incremental_quality_files=%s cpp=%s shell=%s js=%s\n' "${#relevant_files[@]}" "${#cpp_files[@]}" "${#shell_files[@]}" "${#js_files[@]}"
+printf 'incremental_quality_files=%s cpp=%s existing_cpp=%s new_cpp=%s shell=%s js=%s\n' \
+  "${#relevant_files[@]}" "${#cpp_files[@]}" "${#existing_cpp_files[@]}" "${#new_cpp_files[@]}" "${#shell_files[@]}" "${#js_files[@]}"
 
 if ((${#relevant_files[@]} > 0)); then
-  git diff --check "$quality_base_sha...HEAD" -- "${relevant_files[@]}"
+  git diff --check "$quality_base_sha" HEAD -- "${relevant_files[@]}"
   git diff --check -- "${relevant_files[@]}"
   git diff --cached --check -- "${relevant_files[@]}"
 fi
@@ -172,22 +222,111 @@ if ((${#js_files[@]} > 0)); then
   printf 'incremental_quality_node_syntax=passed files=%s\n' "${#js_files[@]}"
 fi
 
-clang_format_bin="${MINE_TELEOP_CLANG_FORMAT:-clang-format}"
-if ((${#cpp_files[@]} > 0)); then
-  if command -v "$clang_format_bin" >/dev/null 2>&1; then
-    clang_format_version="$($clang_format_bin --version)"
-    if [[ "$clang_format_version" != *"version 18"* ]]; then
-      printf 'clang-format 18 is required, found: %s\n' "$clang_format_version" >&2
-      exit 2
-    fi
-    "$clang_format_bin" --dry-run --Werror --style=file "${cpp_files[@]}"
-    printf 'incremental_quality_clang_format=passed files=%s\n' "${#cpp_files[@]}"
-  elif ((require_format)); then
-    printf '%s\n' 'clang-format 18 is required for changed C++ files' >&2
-    exit 2
+required_clang_tool_version="18.1.8"
+
+choose_tool() {
+  local override="$1"
+  local versioned_name="$2"
+  local fallback_name="$3"
+  if [[ -n "$override" ]]; then
+    printf '%s\n' "$override"
+  elif command -v "$versioned_name" >/dev/null 2>&1; then
+    printf '%s\n' "$versioned_name"
   else
-    printf '%s\n' 'incremental_quality_clang_format=skipped reason=clang-format-18-unavailable'
+    printf '%s\n' "$fallback_name"
   fi
+}
+
+require_tool_version() {
+  local tool_label="$1"
+  local tool_bin="$2"
+  local expected_fragment="$3"
+  local tool_version
+  if ! command -v "$tool_bin" >/dev/null 2>&1; then
+    printf '%s %s is required\n' "$tool_label" "$required_clang_tool_version" >&2
+    exit 2
+  fi
+  tool_version="$("$tool_bin" --version)" || {
+    printf '%s version detection failed: %s\n' "$tool_label" "$tool_bin" >&2
+    exit 2
+  }
+  if [[ "$tool_version" != *"$expected_fragment"* ]]; then
+    printf '%s %s is required, found: %s\n' "$tool_label" "$required_clang_tool_version" "$tool_version" >&2
+    exit 2
+  fi
+}
+
+emit_line_args_from_diff() {
+  local target="$1"
+  shift
+  declare -a diff_args=()
+  while (($# > 0)); do
+    [[ "$1" == "--" ]] && { shift; break; }
+    diff_args+=("$1")
+    shift
+  done
+  local hunk start count end
+  while IFS= read -r hunk; do
+    [[ "$hunk" =~ ^@@[[:space:]]-[0-9]+(,[0-9]+)?[[:space:]]\+([0-9]+)(,([0-9]+))?[[:space:]]@@ ]] || continue
+    start="${BASH_REMATCH[2]}"
+    count="${BASH_REMATCH[4]:-1}"
+    [[ "$count" == "0" ]] && continue
+    end=$((start + count - 1))
+    printf '%s\0' "--lines=$start:$end"
+  done < <(git diff --unified=0 --no-ext-diff --find-renames "${diff_args[@]}" -- "$@")
+}
+
+collect_changed_line_args_from_diff() {
+  local target="$1"
+  shift
+  local status old_path new_path path rename_seen
+  rename_seen=0
+  while IFS= read -r -d '' status; do
+    case "$status" in
+      R*)
+        IFS= read -r -d '' old_path || return 1
+        IFS= read -r -d '' new_path || return 1
+        if [[ "$new_path" == "$target" ]]; then
+          emit_line_args_from_diff "$target" "$@" -- "$old_path" "$target"
+          rename_seen=1
+        fi
+        ;;
+      *)
+        IFS= read -r -d '' path || return 1
+        ;;
+    esac
+  done < <(git diff --name-status --find-renames -z "$@")
+  if ((rename_seen == 0)); then
+    emit_line_args_from_diff "$target" "$@" -- "$target"
+  fi
+}
+
+clang_format_bin="$(choose_tool "${MINE_TELEOP_CLANG_FORMAT:-}" clang-format-18 clang-format)"
+git_clang_format_bin="$(choose_tool "${MINE_TELEOP_GIT_CLANG_FORMAT:-}" git-clang-format-18 git-clang-format)"
+if ((require_format || ${#cpp_files[@]} > 0)); then
+  require_tool_version "clang-format" "$clang_format_bin" "clang-format version $required_clang_tool_version"
+  require_tool_version "git-clang-format" "$git_clang_format_bin" "git-clang-format version $required_clang_tool_version"
+fi
+if ((${#new_cpp_files[@]} > 0)); then
+  "$clang_format_bin" --dry-run --Werror --style=file "${new_cpp_files[@]}"
+  printf 'incremental_quality_clang_format_full=passed files=%s\n' "${#new_cpp_files[@]}"
+fi
+if ((${#existing_cpp_files[@]} > 0)); then
+  for cpp_file in "${existing_cpp_files[@]}"; do
+    declare -a line_args=()
+    while IFS= read -r -d '' line_arg; do
+      line_args+=("$line_arg")
+    done < <({
+      collect_changed_line_args_from_diff "$cpp_file" "$quality_base_sha" HEAD
+      collect_changed_line_args_from_diff "$cpp_file" "$quality_base_sha"
+      collect_changed_line_args_from_diff "$cpp_file"
+      collect_changed_line_args_from_diff "$cpp_file" --cached
+    })
+    if ((${#line_args[@]} > 0)); then
+      "$clang_format_bin" --dry-run --Werror --style=file "${line_args[@]}" "$cpp_file"
+    fi
+  done
+  printf 'incremental_quality_clang_format_hunks=passed files=%s\n' "${#existing_cpp_files[@]}"
 fi
 
 eslint_bin="${MINE_TELEOP_ESLINT:-}"
