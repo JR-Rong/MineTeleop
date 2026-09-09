@@ -1,21 +1,32 @@
 #include "mine_teleop/core.hpp"
+#include "mine_teleop/curl_tls.hpp"
+#include "mine_teleop/detail/dynamic_adapter_apply.hpp"
+#include "mine_teleop/detail/recording_fragment_state.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/upload.hpp"
 #include "mine_teleop/video.hpp"
+#include "mine_teleop_chassis_bridge.h"
+#include "test_support.hpp"
 
 #include <gst/gst.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -25,7 +36,12 @@
 
 namespace {
 
+namespace test = mine_teleop::test;
+
+using mine_teleop::ClockSample;
 using mine_teleop::ControlCommand;
+using mine_teleop::MonotonicMillis;
+using mine_teleop::UtcMillis;
 
 class TestFailure : public std::runtime_error {
  public:
@@ -34,6 +50,13 @@ class TestFailure : public std::runtime_error {
 
 void expect(bool condition, std::string_view message) {
   if (!condition) throw TestFailure(std::string(message));
+}
+
+mine_teleop::SignalingServerConfig legacy_signaling_config() {
+  auto config = mine_teleop::SignalingServerConfig{};
+  config.allow_legacy_passwords = true;
+  config.legacy_passwords_remove_by = "2099-12-31";
+  return config;
 }
 
 void expect_near(double actual, double expected, double epsilon, std::string_view message) {
@@ -49,6 +72,20 @@ void expect_throws(Function&& function, std::string_view message) {
     function();
   } catch (const std::exception&) {
     return;
+  }
+  throw TestFailure(std::string(message));
+}
+
+template <typename Function>
+void expect_throws_containing(Function&& function, std::string_view expected_detail,
+                              std::string_view message) {
+  try {
+    function();
+  } catch (const std::exception& error) {
+    if (std::string_view(error.what()).find(expected_detail) != std::string_view::npos)
+      return;
+    throw TestFailure(std::string(message) + ": expected error containing '" +
+                      std::string(expected_detail) + "', got '" + error.what() + "'");
   }
   throw TestFailure(std::string(message));
 }
@@ -136,13 +173,11 @@ mine_teleop::SessionControlProfileRequest session_profile_request(
   return request;
 }
 
-void activate_session_profile(
-    mine_teleop::VehicleControlService& service,
-    std::uint64_t seq = 1,
-    std::int64_t timestamp_ms = 0) {
-  const auto result = service.receive_session_profile(
-      session_profile_request(seq, timestamp_ms),
-      timestamp_ms);
+void activate_session_profile(mine_teleop::VehicleControlService& service, std::uint64_t seq = 1,
+                              ClockSample now = test::clock_sample(UtcMillis{0},
+                                                                   MonotonicMillis{0})) {
+  const auto result =
+      service.receive_session_profile(session_profile_request(seq, now.utc.value), now);
   expect(result.accepted, "session control profile was rejected: " + result.reason);
 }
 
@@ -402,15 +437,13 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
 };
 
 void activate_adapter_owned_session_profile(
-    mine_teleop::VehicleControlService& service,
-    AdapterOwnedSafeStopAdapter& adapter,
-    std::uint64_t seq = 1,
-    std::int64_t timestamp_ms = 0) {
+    mine_teleop::VehicleControlService& service, AdapterOwnedSafeStopAdapter& adapter,
+    std::uint64_t seq = 1, ClockSample now = test::clock_sample(UtcMillis{0}, MonotonicMillis{0})) {
   adapter.handshake.state = "standby";
   adapter.handshake.ready = false;
   adapter.handshake.disarming = false;
   adapter.handshake.parking_ready = true;
-  activate_session_profile(service, seq, timestamp_ms);
+  activate_session_profile(service, seq, now);
   adapter.set_safe_stop(false, true, false);
 }
 
@@ -438,6 +471,24 @@ void test_config_loads_current_vehicle_yaml() {
       100.0,
       1e-9,
       "safe default ordinary brake pressure changed");
+}
+
+void test_vehicle_config_rejects_unsupported_upload_semantics() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  const std::vector<std::pair<std::string, std::pair<std::string, std::string>>> invalid{
+      {"unsupported-backend", {"backend: local_archive", "backend: s3"}},
+      {"unsupported-batch-trigger", {"trigger_segments: 1", "trigger_segments: 2"}},
+      {"unsupported-idle-trigger", {"trigger_network_idle: false", "trigger_network_idle: true"}},
+  };
+  for (const auto& [suffix, replacement] : invalid) {
+    auto contents = base;
+    replace_once(contents, replacement.first, replacement.second);
+    const auto path = write_temp_vehicle_config(suffix, contents);
+    expect_throws([&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); },
+                  "unsupported native upload behavior was accepted");
+    std::error_code error;
+    std::filesystem::remove(path, error);
+  }
 }
 
 void test_vehicle_config_rejects_unimplemented_control_safety_options() {
@@ -1028,6 +1079,281 @@ void test_ccg2_camera_input_pipeline_is_gstreamer_parseable() {
       "GStreamer could not parse the CCG2 30-to-25 FPS input pipeline: " + error);
 }
 
+void test_recording_fragment_state_fails_closed_and_survives_detach() {
+  const auto root = std::filesystem::path("/tmp") /
+                    ("mine-teleop-recording-state-test-" + mine_teleop::random_token(6));
+  std::filesystem::create_directories(root);
+  const auto valid_fragment = root / "valid.mp4";
+  const auto malformed_fragment = root / "malformed.mp4";
+  const auto write_u32 = [](std::ofstream& output, std::uint32_t value) {
+    output.put(static_cast<char>((value >> 24U) & 0xffU));
+    output.put(static_cast<char>((value >> 16U) & 0xffU));
+    output.put(static_cast<char>((value >> 8U) & 0xffU));
+    output.put(static_cast<char>(value & 0xffU));
+  };
+  const auto write_box = [&](std::ofstream& output, std::string_view type,
+                             std::string_view payload) {
+    write_u32(output, static_cast<std::uint32_t>(8U + payload.size()));
+    output.write(type.data(), static_cast<std::streamsize>(type.size()));
+    output.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+  };
+  {
+    std::ofstream output(valid_fragment, std::ios::binary);
+    write_box(output, "ftyp", "isom");
+    write_box(output, "mdat", "frame");
+    write_box(output, "moov", "");
+  }
+  {
+    std::ofstream output(malformed_fragment, std::ios::binary);
+    write_u32(output, 64U);
+    output.write("mdat", 4);
+    output.write("short", 5);
+  }
+  const auto valid = mine_teleop::detail::validate_finalized_mp4(valid_fragment);
+  expect(valid.valid, "minimal complete MP4 boxes were rejected: " + valid.reason);
+  expect(!mine_teleop::detail::validate_finalized_mp4(malformed_fragment).valid,
+         "truncated MP4 box was accepted as finalized media");
+  expect(!mine_teleop::detail::probe_finalized_mp4(malformed_fragment).valid,
+         "truncated MP4 box was accepted by the qtdemux probe");
+
+  auto owner =
+      std::make_shared<mine_teleop::detail::RecordingFragmentOwner>(17, "session-state", "front");
+  expect(owner->bind_path(valid_fragment), "recording fragment path could not be bound");
+  owner->set_started_at_ms(100);
+  expect(owner->mark_closed(200), "fragment closed event did not enter finalizing state");
+  expect(owner->claim_completed(), "finalizing fragment could not claim completed publication");
+  const auto completed_revision = owner->snapshot().revision;
+  expect(owner->mark_failed("late filesink error"), "late error did not dominate completed state");
+  const auto failed = owner->snapshot();
+  expect(failed.state == mine_teleop::detail::RecordingFragmentState::Failed &&
+             failed.revision > completed_revision && failed.failure == "late filesink error",
+         "late fragment failure was not latched with a newer revision");
+  expect(!owner->mark_closed(300), "late close event overwrote the failed fragment state");
+
+  GError* init_error = nullptr;
+  if (!gst_init_check(nullptr, nullptr, &init_error)) {
+    const std::string message = init_error == nullptr ? "unknown error" : init_error->message;
+    if (init_error != nullptr)
+      g_error_free(init_error);
+    throw TestFailure("GStreamer initialization failed: " + message);
+  }
+  GstElement* bin = gst_bin_new("recording-owner-detach-test");
+  GstElement* sink = gst_element_factory_make("fakesink", "recording-owner-detach-sink");
+  expect(bin != nullptr && sink != nullptr, "GStreamer fakesink fixture is unavailable");
+  gst_object_ref(sink);
+  expect(gst_bin_add(GST_BIN(bin), sink), "could not add test sink to bin");
+  mine_teleop::detail::tag_recording_fragment_owner(GST_OBJECT(sink), owner);
+  expect(mine_teleop::detail::recording_fragment_owner(GST_OBJECT(sink)) == owner,
+         "recording owner tag was not readable before detach");
+  expect(gst_bin_remove(GST_BIN(bin), sink), "could not detach tagged sink from test bin");
+  expect(mine_teleop::detail::recording_fragment_owner(GST_OBJECT(sink)) == owner,
+         "recording owner tag was lost after its sink detached from the pipeline");
+  gst_object_unref(sink);
+  gst_object_unref(bin);
+  std::filesystem::remove_all(root);
+}
+
+struct AsyncSplitmuxWitness {
+  std::atomic<std::uint64_t> live_handoffs{0};
+  std::shared_ptr<mine_teleop::detail::RecordingFragmentOwner> injected_fragment;
+  std::uint64_t live_handoffs_at_injected_error{0};
+  bool closed_event_seen{false};
+  bool old_sink_detached{false};
+  bool late_error_classified{false};
+};
+
+void on_async_splitmux_sink_added(GstElement*, GstElement* sink, gpointer user_data) {
+  auto* witness = static_cast<AsyncSplitmuxWitness*>(user_data);
+  if (witness == nullptr || sink == nullptr)
+    return;
+  auto owner = std::make_shared<mine_teleop::detail::RecordingFragmentOwner>(
+      23, "splitmux-test-session", "front");
+  mine_teleop::detail::tag_recording_fragment_owner(GST_OBJECT(sink), std::move(owner));
+}
+
+void on_async_splitmux_live_handoff(GstElement*, GstBuffer*, GstPad*, gpointer user_data) {
+  auto* witness = static_cast<AsyncSplitmuxWitness*>(user_data);
+  if (witness != nullptr)
+    witness->live_handoffs.fetch_add(1, std::memory_order_relaxed);
+}
+
+void test_async_splitmux_late_sink_error_keeps_live_branch_running() {
+  const auto root =
+      std::filesystem::path("/tmp") / ("mine-teleop-splitmux-test-" + mine_teleop::random_token(6));
+  std::filesystem::create_directories(root);
+  const auto location = root / "fragment-%05d.mp4";
+  GError* init_error = nullptr;
+  if (!gst_init_check(nullptr, nullptr, &init_error)) {
+    const std::string message = init_error == nullptr ? "unknown error" : init_error->message;
+    if (init_error != nullptr)
+      g_error_free(init_error);
+    throw TestFailure("GStreamer initialization failed: " + message);
+  }
+
+  const std::string description =
+      "videotestsrc is-live=true num-buffers=90 ! "
+      "video/x-raw,framerate=30/1,width=160,height=120 ! tee name=fanout "
+      "fanout. ! queue ! fakesink name=live sync=false signal-handoffs=true "
+      "fanout. ! queue ! valve name=recording_valve drop=false ! videoconvert ! jpegenc ! queue ! "
+      "splitmuxsink name=recorder muxer-factory=qtmux sink-factory=filesink "
+      "async-finalize=true max-size-time=500000000 location=\"" +
+      location.string() + "\"";
+  GError* parse_error = nullptr;
+  GstElement* pipeline = gst_parse_launch(description.c_str(), &parse_error);
+  if (pipeline == nullptr || parse_error != nullptr) {
+    const std::string message =
+        parse_error == nullptr ? "unknown parse error" : parse_error->message;
+    if (parse_error != nullptr)
+      g_error_free(parse_error);
+    if (pipeline != nullptr)
+      gst_object_unref(pipeline);
+    std::filesystem::remove_all(root);
+    throw TestFailure("real splitmux test pipeline could not be created: " + message);
+  }
+
+  AsyncSplitmuxWitness witness;
+  GstElement* recorder = gst_bin_get_by_name(GST_BIN(pipeline), "recorder");
+  GstElement* live = gst_bin_get_by_name(GST_BIN(pipeline), "live");
+  if (recorder == nullptr || live == nullptr) {
+    if (recorder != nullptr)
+      gst_object_unref(recorder);
+    if (live != nullptr)
+      gst_object_unref(live);
+    gst_object_unref(pipeline);
+    std::filesystem::remove_all(root);
+    throw TestFailure("real splitmux test did not create recorder and live branches");
+  }
+  g_signal_connect(recorder, "sink-added", G_CALLBACK(on_async_splitmux_sink_added), &witness);
+  g_signal_connect(live, "handoff", G_CALLBACK(on_async_splitmux_live_handoff), &witness);
+  gst_object_unref(recorder);
+  gst_object_unref(live);
+
+  GstBus* bus = gst_element_get_bus(pipeline);
+  if (bus == nullptr) {
+    gst_object_unref(pipeline);
+    std::filesystem::remove_all(root);
+    throw TestFailure("real splitmux test pipeline has no bus");
+  }
+  if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+    gst_object_unref(bus);
+    gst_object_unref(pipeline);
+    std::filesystem::remove_all(root);
+    throw TestFailure("real splitmux test pipeline could not enter PLAYING");
+  }
+
+  // Deliberately leave the bus unread while async-finalize rolls at least one
+  // fragment.  The test then injects an error from the retired internal sink,
+  // matching the production race rather than a stand-alone filesink model.
+  std::this_thread::sleep_for(std::chrono::milliseconds(850));
+  const auto delayed_live_handoffs = witness.live_handoffs.load(std::memory_order_relaxed);
+  bool eos = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+  try {
+    while (!eos && std::chrono::steady_clock::now() < deadline) {
+      GstMessage* message = gst_bus_timed_pop(bus, 100 * GST_MSECOND);
+      if (message == nullptr)
+        continue;
+      const auto type = GST_MESSAGE_TYPE(message);
+      if (type == GST_MESSAGE_ELEMENT) {
+        const GstStructure* structure = gst_message_get_structure(message);
+        if (structure != nullptr &&
+            gst_structure_has_name(structure, "splitmuxsink-fragment-closed") &&
+            !witness.injected_fragment) {
+          const gchar* location_text = gst_structure_get_string(structure, "location");
+          const GValue* sink_value = gst_structure_get_value(structure, "sink");
+          expect(location_text != nullptr,
+                 "real splitmux closed event omitted its fragment location");
+          expect(sink_value != nullptr && G_VALUE_HOLDS(sink_value, GST_TYPE_ELEMENT),
+                 "real splitmux closed event omitted its internal sink");
+          auto* sink = GST_ELEMENT(g_value_get_object(sink_value));
+          expect(sink != nullptr, "real splitmux closed event supplied a null sink");
+          auto owner = mine_teleop::detail::recording_fragment_owner(GST_OBJECT(sink));
+          expect(owner != nullptr, "retired splitmux sink lost its stable recording owner tag");
+          expect(owner->bind_path(location_text),
+                 "closed splitmux sink changed its recording fragment path");
+          expect(owner->mark_closed(200), "closed splitmux sink did not enter finalizing state");
+          witness.closed_event_seen = true;
+          gst_object_ref(sink);
+          const auto detach_deadline =
+              std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+          while (gst_object_has_as_ancestor(GST_OBJECT(sink), GST_OBJECT(pipeline)) &&
+                 std::chrono::steady_clock::now() < detach_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+          witness.old_sink_detached =
+              !gst_object_has_as_ancestor(GST_OBJECT(sink), GST_OBJECT(pipeline));
+          GError* injected = g_error_new_literal(GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_WRITE,
+                                                 "injected late retired splitmux sink error");
+          GstMessage* injected_message =
+              gst_message_new_error(GST_OBJECT(sink), injected, "late async-finalize sink witness");
+          g_error_free(injected);
+          expect(gst_bus_post(bus, injected_message),
+                 "could not post late retired splitmux sink error");
+          witness.injected_fragment = std::move(owner);
+          witness.live_handoffs_at_injected_error =
+              witness.live_handoffs.load(std::memory_order_relaxed);
+          gst_object_unref(sink);
+        }
+      } else if (type == GST_MESSAGE_ERROR) {
+        GError* error = nullptr;
+        gchar* debug = nullptr;
+        gst_message_parse_error(message, &error, &debug);
+        const std::string text = error == nullptr ? "unknown GStreamer error" : error->message;
+        if (error != nullptr)
+          g_error_free(error);
+        g_free(debug);
+        if (text.find("injected late retired splitmux sink error") != std::string::npos) {
+          auto owner = mine_teleop::detail::recording_fragment_owner(GST_MESSAGE_SRC(message));
+          expect(owner == witness.injected_fragment,
+                 "late retired sink error was not classified by its stable owner tag");
+          static_cast<void>(owner->mark_failed(text));
+          witness.late_error_classified = true;
+        } else {
+          throw TestFailure("real splitmux topology emitted an unexpected error: " + text);
+        }
+      } else if (type == GST_MESSAGE_EOS) {
+        eos = true;
+      }
+      gst_message_unref(message);
+    }
+  } catch (...) {
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(bus);
+    gst_object_unref(pipeline);
+    std::filesystem::remove_all(root);
+    throw;
+  }
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_element_get_state(pipeline, nullptr, nullptr, 2 * GST_SECOND);
+  gst_object_unref(bus);
+  gst_object_unref(pipeline);
+  expect(delayed_live_handoffs > 0,
+         "live branch produced no frames while bus consumption was delayed");
+  expect(witness.closed_event_seen, "real splitmux topology never closed a recording fragment");
+  expect(
+      witness.old_sink_detached,
+      "closed splitmux sink was still attached to the main pipeline before late error injection");
+  expect(witness.late_error_classified,
+         "late retired splitmux sink error was not observed on the delayed bus");
+  expect(witness.injected_fragment && witness.injected_fragment->snapshot().state ==
+                                          mine_teleop::detail::RecordingFragmentState::Failed,
+         "late retired splitmux sink error did not leave its fragment failed");
+  expect(witness.live_handoffs.load(std::memory_order_relaxed) >
+             witness.live_handoffs_at_injected_error,
+         "live branch stopped producing frames after the retired recording sink error");
+  expect(eos, "real splitmux topology did not reach EOS within its bounded test deadline");
+  bool probe_verified_fragment = false;
+  for (const auto& entry : std::filesystem::directory_iterator(root)) {
+    if (entry.path().extension() != ".mp4")
+      continue;
+    const auto probe = mine_teleop::detail::probe_finalized_mp4(entry.path());
+    expect(probe.valid, "real splitmux output failed qtdemux probe: " + probe.reason);
+    probe_verified_fragment = true;
+  }
+  expect(probe_verified_fragment, "real splitmux topology produced no probeable MP4 fragment");
+  std::filesystem::remove_all(root);
+}
+
 void test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap() {
   expect(
       mine_teleop::v4l2_sequence_gap(std::nullopt, 42U) == 0,
@@ -1388,6 +1714,176 @@ void test_dynamic_adapter_brake_overrides_throttle() {
       "session torque ceiling was not encoded into the bridge intent");
 }
 
+struct DynamicAdapterSafeStopProbe {
+  int apply_result_code{0};
+  std::uint32_t apply_issue_id{MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE};
+  bool malformed_apply_result{false};
+  int set_stop_context_result{0};
+  int emergency_stop_result{0};
+  int apply_v2_calls{0};
+  int set_stop_context_calls{0};
+  int emergency_stop_calls{0};
+  int target_gear{0};
+  double target_vx{0.0};
+  double target_ax{0.0};
+  int steering_count{0};
+  std::array<double, 4> steering{};
+  MineTeleopChassisStopContextV1 stop_context{};
+};
+
+DynamicAdapterSafeStopProbe* g_dynamic_adapter_safe_stop_probe = nullptr;
+
+int dynamic_adapter_safe_stop_apply_v2(int target_gear, double target_vx, double target_ax,
+                                       const double* steering_values, int steering_count,
+                                       void* result) {
+  auto& probe = *g_dynamic_adapter_safe_stop_probe;
+  ++probe.apply_v2_calls;
+  probe.target_gear = target_gear;
+  probe.target_vx = target_vx;
+  probe.target_ax = target_ax;
+  probe.steering_count = steering_count;
+  if (steering_values != nullptr && steering_count == static_cast<int>(probe.steering.size())) {
+    for (std::size_t index = 0; index < probe.steering.size(); ++index) {
+      probe.steering[index] = steering_values[index];
+    }
+  }
+  if (result != nullptr) {
+    auto* raw = static_cast<MineTeleopChassisApplyResultV1*>(result);
+    raw->struct_size = probe.malformed_apply_result ? static_cast<std::uint32_t>(sizeof(*raw) - 1U)
+                                                    : static_cast<std::uint32_t>(sizeof(*raw));
+    raw->result_code = probe.apply_result_code;
+    raw->issue_id = probe.apply_issue_id;
+    raw->reserved = 0U;
+  }
+  return probe.apply_result_code;
+}
+
+int dynamic_adapter_safe_stop_set_context(const void* context) {
+  auto& probe = *g_dynamic_adapter_safe_stop_probe;
+  ++probe.set_stop_context_calls;
+  if (context != nullptr) {
+    probe.stop_context = *static_cast<const MineTeleopChassisStopContextV1*>(context);
+  }
+  return probe.set_stop_context_result;
+}
+
+int dynamic_adapter_safe_stop_emergency_stop() {
+  auto& probe = *g_dynamic_adapter_safe_stop_probe;
+  ++probe.emergency_stop_calls;
+  return probe.emergency_stop_result;
+}
+
+class ScopedDynamicAdapterSafeStopProbe {
+ public:
+  explicit ScopedDynamicAdapterSafeStopProbe(DynamicAdapterSafeStopProbe& probe) {
+    expect(g_dynamic_adapter_safe_stop_probe == nullptr,
+           "dynamic adapter safe-stop probe was already active");
+    g_dynamic_adapter_safe_stop_probe = &probe;
+  }
+
+  ~ScopedDynamicAdapterSafeStopProbe() {
+    g_dynamic_adapter_safe_stop_probe = nullptr;
+  }
+
+  ScopedDynamicAdapterSafeStopProbe(const ScopedDynamicAdapterSafeStopProbe&) = delete;
+  ScopedDynamicAdapterSafeStopProbe& operator=(const ScopedDynamicAdapterSafeStopProbe&) = delete;
+};
+
+template <typename Function>
+void expect_error_contains(Function&& function,
+                           std::initializer_list<std::string_view> expected_fragments,
+                           std::string_view message) {
+  try {
+    function();
+  } catch (const std::exception& error) {
+    const std::string_view text = error.what();
+    for (const auto expected : expected_fragments) {
+      expect(text.find(expected) != std::string_view::npos,
+             std::string(message) + ": missing " + std::string(expected));
+    }
+    return;
+  }
+  throw TestFailure(std::string(message));
+}
+
+void test_dynamic_adapter_safe_stop_reads_v2_result_and_preserves_emergency_path() {
+  DynamicAdapterSafeStopProbe probe;
+  ScopedDynamicAdapterSafeStopProbe scoped_probe(probe);
+  constexpr std::string_view kOrdinaryStopContext =
+      "ordinary safe stop source=watchdog reason=outer_control_timeout";
+  const mine_teleop::VehicleStopContext context{
+      mine_teleop::VehicleStopSource::Watchdog,
+      mine_teleop::VehicleStopReason::OuterControlTimeout};
+  const mine_teleop::ControlOutput ordinary{"D", 1.25, 0.8, 0.4, false, false};
+
+  const auto successful_stop = mine_teleop::detail::invoke_dynamic_adapter_safe_stop(
+      dynamic_adapter_safe_stop_apply_v2, dynamic_adapter_safe_stop_set_context,
+      dynamic_adapter_safe_stop_emergency_stop, 3, ordinary, context, kOrdinaryStopContext);
+  expect(!successful_stop.uses_emergency_stop && probe.apply_v2_calls == 1 &&
+             probe.set_stop_context_calls == 0 && probe.emergency_stop_calls == 0,
+         "ordinary safe stop did not use only apply_state_v2");
+  expect_near(probe.target_vx, 0.0, 1e-12, "ordinary safe stop changed target velocity");
+  expect_near(probe.target_ax, -0.4, 1e-12, "ordinary safe stop changed brake acceleration");
+  expect(probe.target_gear == 3 && probe.steering_count == 4,
+         "ordinary safe stop changed the bridge gear or steering cardinality");
+  for (const double steering : probe.steering) {
+    expect_near(steering, 1.25, 1e-12, "ordinary safe stop did not broadcast steering");
+  }
+
+  probe = {};
+  probe.apply_result_code = -3;
+  probe.apply_issue_id = MINE_TELEOP_CHASSIS_APPLY_ISSUE_DRIVE_GEAR_CHANGE_MOVING_OR_STALE;
+  expect_error_contains(
+      [&] {
+        static_cast<void>(mine_teleop::detail::invoke_dynamic_adapter_safe_stop(
+            dynamic_adapter_safe_stop_apply_v2, dynamic_adapter_safe_stop_set_context,
+            dynamic_adapter_safe_stop_emergency_stop, 3, ordinary, context, kOrdinaryStopContext));
+      },
+      {"source=watchdog", "reason=outer_control_timeout", "code -3",
+       "issue vcu_drive_gear_change_moving_or_stale"},
+      "ordinary safe-stop rejection lost structured context");
+  expect(probe.apply_v2_calls == 1 && probe.set_stop_context_calls == 0 &&
+             probe.emergency_stop_calls == 0,
+         "ordinary safe-stop rejection used the emergency path");
+
+  probe = {};
+  probe.malformed_apply_result = true;
+  expect_error_contains(
+      [&] {
+        static_cast<void>(mine_teleop::detail::invoke_dynamic_adapter_safe_stop(
+            dynamic_adapter_safe_stop_apply_v2, dynamic_adapter_safe_stop_set_context,
+            dynamic_adapter_safe_stop_emergency_stop, 3, ordinary, context, kOrdinaryStopContext));
+      },
+      {"source=watchdog", "reason=outer_control_timeout", "returned an invalid result structure"},
+      "ordinary safe-stop accepted a malformed v2 result");
+
+  probe = {};
+  auto emergency = ordinary;
+  emergency.estop = true;
+  const auto emergency_stop = mine_teleop::detail::invoke_dynamic_adapter_safe_stop(
+      dynamic_adapter_safe_stop_apply_v2, dynamic_adapter_safe_stop_set_context,
+      dynamic_adapter_safe_stop_emergency_stop, 3, emergency, context, kOrdinaryStopContext);
+  expect(emergency_stop.uses_emergency_stop && probe.apply_v2_calls == 0 &&
+             probe.set_stop_context_calls == 1 && probe.emergency_stop_calls == 1,
+         "ESTOP did not stay on the independent emergency-stop path");
+  expect(
+      probe.stop_context.struct_size == sizeof(MineTeleopChassisStopContextV1) &&
+          probe.stop_context.stop_source == MINE_TELEOP_CHASSIS_STOP_SOURCE_WATCHDOG &&
+          probe.stop_context.stop_reason == MINE_TELEOP_CHASSIS_STOP_REASON_OUTER_CONTROL_TIMEOUT &&
+          probe.stop_context.reserved == 0U,
+      "ESTOP did not preserve its stop context before emergency stop");
+
+  probe = {};
+  auto full_emergency = ordinary;
+  full_emergency.full_emergency_brake = true;
+  const auto full_emergency_stop = mine_teleop::detail::invoke_dynamic_adapter_safe_stop(
+      dynamic_adapter_safe_stop_apply_v2, dynamic_adapter_safe_stop_set_context,
+      dynamic_adapter_safe_stop_emergency_stop, 3, full_emergency, context, kOrdinaryStopContext);
+  expect(full_emergency_stop.uses_emergency_stop && probe.apply_v2_calls == 0 &&
+             probe.set_stop_context_calls == 1 && probe.emergency_stop_calls == 1,
+         "full emergency brake incorrectly touched apply_state_v2");
+}
+
 void test_bench_config_drives_unified_vehicle_runtime() {
   const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.bench.yaml");
   expect(config.runtime.control_enabled, "bench runtime control is disabled");
@@ -1496,6 +1992,163 @@ void test_field_config_pins_tls_route_without_system_dns() {
   expect(
       config.hardware.can_tx_queue_length == 100,
       "field vehicle CAN tx queue length is not 100");
+}
+
+void test_curl_tls_trust_policy_is_explicit_and_protects_ca_bundles() {
+  const auto root = std::filesystem::path("/tmp") /
+                    ("mine-teleop-curl-tls-policy-" + mine_teleop::random_token(6));
+  std::error_code error;
+  const auto cleanup = [&] {
+    error.clear();
+    std::filesystem::remove_all(root, error);
+  };
+  try {
+    std::filesystem::create_directories(root);
+    const auto bundle = root / "private-root.pem";
+    const auto fallback_bundle = root / "fallback-root.pem";
+    const auto field_root = std::filesystem::path("configs/mine-teleop-field-root.crt");
+    std::filesystem::copy_file(field_root, bundle,
+                               std::filesystem::copy_options::overwrite_existing, error);
+    expect(!error, "could not create valid protected TLS CA bundle fixture");
+    std::filesystem::copy_file(field_root, fallback_bundle,
+                               std::filesystem::copy_options::overwrite_existing, error);
+    expect(!error, "could not create valid legacy TLS CA bundle fixture");
+    const auto bundle_text = bundle.string();
+    const auto fallback_bundle_text = fallback_bundle.string();
+    const auto missing_text = (root / "missing.pem").string();
+
+    const auto protected_policy = mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(bundle);
+    const auto protected_configuration = mine_teleop::resolve_curl_tls_trust_policy(
+        protected_policy, missing_text.c_str(), missing_text.c_str());
+    expect(protected_configuration.mode == mine_teleop::CurlTlsTrustMode::ProtectedCaBundle &&
+               protected_configuration.ca_bundle == std::filesystem::canonical(bundle),
+           "explicit TLS policy did not retain its canonical protected CA bundle");
+    expect(protected_configuration.verify_peer && protected_configuration.verify_hostname,
+           "explicit TLS policy allowed peer or hostname verification to be disabled");
+
+    const auto system_configuration = mine_teleop::resolve_curl_tls_trust_policy(
+        mine_teleop::CurlTlsTrustPolicy::system(), missing_text.c_str(), missing_text.c_str());
+    expect(system_configuration.mode == mine_teleop::CurlTlsTrustMode::SystemTrust &&
+               !system_configuration.ca_bundle.has_value() && system_configuration.verify_peer &&
+               system_configuration.verify_hostname,
+           "system TLS trust consulted a supplied legacy-environment CA bundle");
+
+    const auto legacy_policy = mine_teleop::CurlTlsTrustPolicy::legacy_environment();
+    const auto legacy_system_configuration =
+        mine_teleop::resolve_curl_tls_trust_policy(legacy_policy, nullptr, nullptr);
+    expect(!legacy_system_configuration.ca_bundle.has_value() &&
+               legacy_system_configuration.verify_peer &&
+               legacy_system_configuration.verify_hostname,
+           "legacy TLS policy without environment bundles did not preserve system trust");
+    const auto legacy_configuration = mine_teleop::resolve_curl_tls_trust_policy(
+        legacy_policy, bundle_text.c_str(), fallback_bundle_text.c_str());
+    expect(legacy_configuration.ca_bundle == std::filesystem::canonical(bundle),
+           "legacy TLS policy did not prefer CURL_CA_BUNDLE over SSL_CERT_FILE");
+    const auto legacy_fallback_configuration = mine_teleop::resolve_curl_tls_trust_policy(
+        legacy_policy, nullptr, fallback_bundle_text.c_str());
+    expect(legacy_fallback_configuration.ca_bundle == std::filesystem::canonical(fallback_bundle),
+           "legacy TLS policy did not use SSL_CERT_FILE when CURL_CA_BUNDLE was absent");
+
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(
+              mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(root / "missing.pem"));
+        },
+        "does not exist", "missing explicit CA bundle was accepted");
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::resolve_curl_tls_trust_policy(
+              legacy_policy, missing_text.c_str(), nullptr));
+        },
+        "does not exist", "legacy environment selected a missing CA bundle");
+
+    const auto malformed_bundle = root / "malformed.pem";
+    {
+      std::ofstream output(malformed_bundle);
+      output << "-----BEGIN CERTIFICATE-----\nnot-valid-base64\n-----END CERTIFICATE-----\n";
+    }
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(malformed_bundle));
+        },
+        "invalid PEM certificate data", "malformed explicit CA bundle was accepted");
+    const auto malformed_text = malformed_bundle.string();
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::resolve_curl_tls_trust_policy(
+              legacy_policy, malformed_text.c_str(), nullptr));
+        },
+        "invalid PEM certificate data", "legacy environment selected malformed CA content");
+
+    const auto empty_bundle = root / "empty.pem";
+    { std::ofstream output(empty_bundle); }
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(empty_bundle));
+        },
+        "is empty", "empty explicit CA bundle was accepted");
+    expect_throws_containing(
+        [&] { static_cast<void>(mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(root)); },
+        "regular file", "directory explicit CA bundle was accepted");
+
+#if !defined(_WIN32)
+    const auto symlink_bundle = root / "symlink.pem";
+    std::filesystem::create_symlink(bundle, symlink_bundle, error);
+    expect(!error, "could not create TLS CA bundle symlink fixture");
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(symlink_bundle));
+        },
+        "symbolic link", "symlink explicit CA bundle was accepted");
+
+    const auto unreadable_bundle = root / "unreadable.pem";
+    std::filesystem::copy_file(bundle, unreadable_bundle,
+                               std::filesystem::copy_options::overwrite_existing, error);
+    expect(!error, "could not create unreadable TLS CA bundle fixture");
+    std::filesystem::permissions(unreadable_bundle, std::filesystem::perms::none,
+                                 std::filesystem::perm_options::replace, error);
+    expect(!error, "could not remove TLS CA bundle read permissions");
+    expect_throws_containing(
+        [&] {
+          static_cast<void>(
+              mine_teleop::CurlTlsTrustPolicy::protected_ca_bundle(unreadable_bundle));
+        },
+        "unreadable", "unreadable explicit CA bundle was accepted");
+    std::filesystem::permissions(
+        unreadable_bundle, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace, error);
+    expect(!error, "could not restore TLS CA bundle permissions");
+#endif
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+  cleanup();
+}
+
+void test_curl_ca_info_path_owns_narrow_utf8_storage() {
+  const std::u8string utf8_path = u8"C:\\mine-teleop\\ca-\u8BC1\u4E66\\root.pem";
+  const mine_teleop::detail::CurlCaInfoPath ca_info{std::u8string_view(utf8_path)};
+  std::string expected(utf8_path.size(), '\0');
+  std::memcpy(expected.data(), utf8_path.data(), utf8_path.size());
+
+  expect(ca_info.string() == expected, "curl CAINFO path did not retain UTF-8 bytes");
+  expect(ca_info.c_str() == ca_info.string().c_str(),
+         "curl CAINFO path did not expose owned storage");
+  expect(std::string(ca_info.c_str()) == expected, "curl CAINFO path exposed an unstable C string");
+
+#if !defined(_WIN32)
+  const std::filesystem::path native_path("configs/mine-teleop-field-root.crt");
+  const mine_teleop::detail::CurlCaInfoPath native_ca_info(native_path);
+  expect(native_ca_info.string() == native_path.string(),
+         "curl CAINFO path changed non-Windows native path encoding");
+#endif
+}
+
+void test_curl_tls_option_failures_are_reported() {
+  expect_throws_containing(
+      [] { mine_teleop::detail::throw_if_curl_option_failed(CURLE_FAILED_INIT, "CURLOPT_CAINFO"); },
+      "CURLOPT_CAINFO", "curl TLS option failures did not identify the rejected option");
 }
 
 void test_control_command_json_round_trip_and_validation() {
@@ -1681,42 +2334,78 @@ void test_control_receiver_enforces_token_sequence_and_gap() {
   mine_teleop::ControlReceiver receiver("vehicle-001", "driver-001", "session-001", 200, 1, true, "token");
   auto first = command(1, 0);
   first.control_token = "wrong";
-  expect(receiver.accept(first, 0).reason == "control_token_invalid", "wrong token was accepted");
+  expect(receiver.accept(first, test::clock_sample(UtcMillis{0}, MonotonicMillis{0})).reason ==
+             "control_token_invalid",
+         "wrong token was accepted");
   first.control_token = "token";
   first.driver_id = "driver-other";
-  expect(receiver.accept(first, 0).reason == "wrong_driver", "wrong driver was accepted");
+  expect(receiver.accept(first, test::clock_sample(UtcMillis{0}, MonotonicMillis{0})).reason ==
+             "wrong_driver",
+         "wrong driver was accepted");
   first.driver_id = "driver-001";
-  expect(receiver.accept(first, 0).accepted, "first command was rejected");
-  expect(receiver.accept(first, 50).reason == "old_seq", "old sequence was accepted");
+  expect(receiver.accept(first, test::clock_sample(UtcMillis{0}, MonotonicMillis{0})).accepted,
+         "first command was rejected");
+  expect(receiver.accept(first, test::clock_sample(UtcMillis{50}, MonotonicMillis{50})).reason ==
+             "old_seq",
+         "old sequence was accepted");
   auto late = command(2, 500);
   late.control_token = "token";
-  expect(receiver.accept(late, 500).reason == "command_gap_exceeded", "large command gap was accepted");
+  expect(receiver.accept(late, test::clock_sample(UtcMillis{500}, MonotonicMillis{500})).reason ==
+             "command_gap_exceeded",
+         "large command gap was accepted");
   late.estop = true;
-  expect(receiver.accept(late, 500).accepted, "estop should bypass command gap rejection");
+  expect(receiver.accept(late, test::clock_sample(UtcMillis{500}, MonotonicMillis{500})).accepted,
+         "estop should bypass command gap rejection");
 
   mine_teleop::ControlReceiver recovery_receiver("vehicle-001", "driver-001", "session-001", 200, 1, true, "token");
   auto recovery_first = command(1, 0);
   recovery_first.control_token = "token";
-  expect(recovery_receiver.accept(recovery_first, 0).accepted, "recovery first command was rejected");
+  expect(
+      recovery_receiver.accept(recovery_first, test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+          .accepted,
+      "recovery first command was rejected");
   auto recovery_gap = command(2, 500);
   recovery_gap.control_token = "token";
-  expect(recovery_receiver.accept(recovery_gap, 500).reason == "command_gap_exceeded", "recovery gap was not detected");
+  expect(recovery_receiver
+                 .accept(recovery_gap, test::clock_sample(UtcMillis{500}, MonotonicMillis{500}))
+                 .reason == "command_gap_exceeded",
+         "recovery gap was not detected");
   auto recovery_next = command(3, 550);
   recovery_next.control_token = "token";
-  expect(recovery_receiver.accept(recovery_next, 550).accepted, "receiver did not recover after command gap");
+  recovery_next.throttle = 0.0;
+  recovery_next.steering = 0.0;
+  const auto recovery_sample = test::clock_sample(UtcMillis{550}, MonotonicMillis{550});
+  expect(recovery_receiver.validate(recovery_next, recovery_sample, true).accepted,
+         "receiver did not admit an explicit neutral recovery after command gap");
+  recovery_receiver.commit_accepted(recovery_next, recovery_sample);
+  auto post_recovery = command(4, 600);
+  post_recovery.control_token = "token";
+  expect(recovery_receiver
+             .accept(post_recovery, test::clock_sample(UtcMillis{600}, MonotonicMillis{600}))
+             .accepted,
+         "receiver did not recover after committed neutral input");
 
   mine_teleop::ControlReceiver synchronized_receiver("vehicle-001", "driver-001", "session-001", 200, 1, true, "token");
   auto stale = command(1, 0);
   stale.control_token = "token";
-  expect(synchronized_receiver.accept(stale, 201).reason == "command_age_exceeded", "stale command was accepted");
+  expect(
+      synchronized_receiver.accept(stale, test::clock_sample(UtcMillis{201}, MonotonicMillis{201}))
+              .reason == "command_age_exceeded",
+      "stale command was accepted");
   stale.sent_at_utc_ms = 201;
   stale.estop = true;
-  expect(synchronized_receiver.accept(stale, 500).accepted, "stale estop should remain acceptable");
+  expect(
+      synchronized_receiver.accept(stale, test::clock_sample(UtcMillis{500}, MonotonicMillis{500}))
+          .accepted,
+      "stale estop should remain acceptable");
 
   mine_teleop::ControlReceiver future_receiver("vehicle-001", "driver-001", "session-001", 200, 1, true, "token");
   auto future = command(1, 201);
   future.control_token = "token";
-  expect(future_receiver.accept(future, 0).reason == "command_timestamp_in_future", "future command was accepted");
+  expect(
+      future_receiver.accept(future, test::clock_sample(UtcMillis{0}, MonotonicMillis{0})).reason ==
+          "command_timestamp_in_future",
+      "future command was accepted");
 }
 
 void test_mailbox_keeps_only_latest_command() {
@@ -1869,31 +2558,128 @@ void test_safety_timeout_profile_and_estop_latch() {
       300,
       800,
       {{0, 0.3}, {500, 0.6}, {1500, 1.0}});
-  safety.mark_ready(0);
+  safety.mark_ready(MonotonicMillis{0});
   auto value = command(1, 0);
-  safety.on_valid_command(value, 0);
-  safety.tick(300);
+  safety.on_valid_command(value, MonotonicMillis{0});
+  safety.tick(MonotonicMillis{300});
   expect(safety.state() == mine_teleop::SafetyState::Degraded, "degraded state not entered");
-  safety.tick(800);
+  safety.tick(MonotonicMillis{800});
   expect(safety.state() == mine_teleop::SafetyState::TimeoutBrake, "timeout state not entered");
-  expect_near(safety.current_output(800).brake, 0.3, 1e-9, "initial timeout brake mismatch");
-  expect_near(safety.current_output(1300).brake, 0.6, 1e-9, "second timeout brake mismatch");
-  expect_near(safety.current_output(2300).brake, 1.0, 1e-9, "maximum timeout brake mismatch");
-  expect(
-      !safety.current_output(1300).full_emergency_brake &&
-          safety.current_output(2300).full_emergency_brake,
-      "timeout stages did not distinguish ordinary pressure from final full-DBC braking");
+  expect_near(safety.current_output(MonotonicMillis{800}).brake, 0.3, 1e-9,
+              "initial timeout brake mismatch");
+  expect_near(safety.current_output(MonotonicMillis{1300}).brake, 0.6, 1e-9,
+              "second timeout brake mismatch");
+  expect_near(safety.current_output(MonotonicMillis{2300}).brake, 1.0, 1e-9,
+              "maximum timeout brake mismatch");
+  expect(!safety.current_output(MonotonicMillis{1300}).full_emergency_brake &&
+             safety.current_output(MonotonicMillis{2300}).full_emergency_brake,
+         "timeout stages did not distinguish ordinary pressure from final full-DBC braking");
 
   value.seq = 2;
   value.estop = true;
-  safety.on_valid_command(value, 2400);
+  safety.on_valid_command(value, MonotonicMillis{2400});
   expect(safety.state() == mine_teleop::SafetyState::Estop, "estop did not latch");
   value.seq = 3;
   value.estop = false;
-  safety.on_valid_command(value, 2450);
+  safety.on_valid_command(value, MonotonicMillis{2450});
   expect(safety.state() == mine_teleop::SafetyState::Estop, "drive command cleared estop latch");
-  expect(!safety.reset_estop(false, "operator", 2500), "estop reset without local confirmation");
-  expect(safety.reset_estop(true, "operator", 2500), "confirmed estop reset failed");
+  expect(!safety.reset_estop(false, "operator", MonotonicMillis{2500}),
+         "estop reset without local confirmation");
+  expect(safety.reset_estop(true, "operator", MonotonicMillis{2500}),
+         "confirmed estop reset failed");
+}
+
+void test_control_clock_domains_and_explicit_recovery() {
+  using mine_teleop::ClockSample;
+  using mine_teleop::MonotonicMillis;
+  using mine_teleop::RecoveryCause;
+  using mine_teleop::UtcMillis;
+
+  mine_teleop::ControlReceiver receiver("vehicle-001", "driver-001", "session-001", 200, 1, true,
+                                        "token");
+  auto first = command(1, 10'000);
+  first.control_token = "token";
+  expect(receiver.accept(first, ClockSample{UtcMillis{10'000}, MonotonicMillis{100}}).accepted,
+         "first command was rejected under an explicit clock sample");
+
+  auto held = command(2, 70'000);
+  held.control_token = "token";
+  held.throttle = 0.5;
+  expect(
+      receiver.validate(held, ClockSample{UtcMillis{70'000}, MonotonicMillis{350}}, false).reason ==
+          "command_gap_exceeded",
+      "monotonic control gap was hidden by a forward UTC jump");
+  auto neutral = held;
+  neutral.throttle = 0.0;
+  neutral.steering = 0.0;
+  neutral.brake = 0.6;
+  const ClockSample neutral_sample{UtcMillis{70'001}, MonotonicMillis{351}};
+  expect(receiver.validate(neutral, neutral_sample, true).accepted,
+         "fresh neutral recovery was rejected after a monotonic command gap");
+  auto still_held = held;
+  still_held.seq = 3;
+  still_held.sent_at_utc_ms = 10'001;
+  expect(receiver.validate(still_held, ClockSample{UtcMillis{10'001}, MonotonicMillis{352}}, false)
+                 .reason == "command_gap_exceeded",
+         "uncommitted recovery attempt advanced the watchdog receiver state");
+  receiver.commit_accepted(neutral, neutral_sample);
+  auto post_recovery = neutral;
+  post_recovery.seq = 3;
+  post_recovery.sent_at_utc_ms = 10'002;
+  expect(
+      receiver.validate(post_recovery, ClockSample{UtcMillis{10'002}, MonotonicMillis{353}}, false)
+          .accepted,
+      "committed fresh neutral did not re-arm the monotonic receiver clock");
+
+  mine_teleop::SafetyStateMachine safety(300, 800, {{0, 0.3}, {500, 0.6}, {1500, 1.0}});
+  safety.mark_ready(MonotonicMillis{100});
+  safety.on_valid_command(first, MonotonicMillis{100});
+  // A 60-second UTC jump is intentionally absent from this API: only steady
+  // time advances the watchdog.
+  safety.tick(MonotonicMillis{400});
+  expect(safety.state() == mine_teleop::SafetyState::Degraded,
+         "monotonic degraded timeout did not trigger");
+  safety.on_valid_command(neutral, MonotonicMillis{401});
+  expect(safety.state() == mine_teleop::SafetyState::Degraded,
+         "ordinary state-machine command implicitly recovered a degraded watchdog");
+  expect(!safety.can_recover(RecoveryCause::FreshTractionNeutral, held),
+         "non-neutral input was accepted as an explicit degraded recovery");
+  expect(safety.recover(RecoveryCause::FreshTractionNeutral, neutral, MonotonicMillis{403}),
+         "fresh neutral input did not enter the explicit recovery transition");
+  expect(safety.state() == mine_teleop::SafetyState::ControlActive,
+         "explicit neutral recovery did not restore active state");
+  safety.tick(MonotonicMillis{1'300});
+  expect(safety.state() == mine_teleop::SafetyState::TimeoutBrake,
+         "hard watchdog timeout did not use monotonic time");
+  expect(!safety.recover(RecoveryCause::FreshTractionNeutral, neutral, MonotonicMillis{1'301}),
+         "fresh neutral bypassed the authorized-handshake hard-timeout gate");
+  expect(safety.recover(RecoveryCause::AuthorizedHandshake, std::nullopt, MonotonicMillis{1'302}),
+         "authorized handshake transition did not restore standby");
+  expect(safety.state() == mine_teleop::SafetyState::Standby,
+         "authorized handshake did not return to standby");
+
+  auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+  mine_teleop::VehicleControlService service(
+      mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml"), "driver-001",
+      "session-001", "token", std::move(adapter), 100);
+  service.start(ClockSample{UtcMillis{10'000}, MonotonicMillis{100}});
+  expect(service
+             .receive_session_profile(session_profile_request(1, 10'000),
+                                      ClockSample{UtcMillis{10'000}, MonotonicMillis{100}})
+             .accepted,
+         "clock-domain service profile was rejected");
+  auto service_command = command(1, 10'000);
+  expect(
+      service.receive_command(service_command, ClockSample{UtcMillis{10'000}, MonotonicMillis{100}})
+          .accepted,
+      "clock-domain service command was rejected");
+  service.tick(ClockSample{UtcMillis{70'000}, MonotonicMillis{399}});
+  expect(service.safety_state() == mine_teleop::SafetyState::ControlActive,
+         "UTC forward jump advanced the vehicle watchdog");
+  service.tick(ClockSample{UtcMillis{1}, MonotonicMillis{400}});
+  expect(service.safety_state() == mine_teleop::SafetyState::Degraded,
+         "UTC backward jump hid the monotonic vehicle watchdog deadline");
+  service.close();
 }
 
 void test_session_control_profile_ack_sequence_limits_and_clear() {
@@ -1902,19 +2688,20 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect_near(
       adapter_view->session_motor_torque_limit_nm(),
       0.0,
       1e-9,
       "service start exposed traction before profile ACK");
   expect(
-      service.receive_command(command(1, 0), 0).reason ==
-          "session_control_profile_required",
+      service.receive_command(command(1, 0), test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+              .reason == "session_control_profile_required",
       "ordinary control was accepted before a session profile ACK");
 
   const auto first_request = session_profile_request(1, 0, 20.0, 100.0, 100.0, 30.0, 80.0);
-  const auto first = service.receive_session_profile(first_request, 0);
+  const auto first = service.receive_session_profile(
+      first_request, test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(
       first.accepted && !first.idempotent && first.applied_revision == 1,
       "first session profile was rejected or ACKed with the wrong revision");
@@ -1939,20 +2726,23 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
       1e-9,
       "ACK preceded the adapter brake-pressure update");
 
-  const auto delayed_retry = service.receive_session_profile(first_request, 1000);
+  const auto delayed_retry = service.receive_session_profile(
+      first_request, test::clock_sample(UtcMillis{1000}, MonotonicMillis{1000}));
   expect(
       delayed_retry.accepted && delayed_retry.idempotent,
       "lost ACK retry was rejected after the original timestamp aged out");
   auto conflict = first_request;
   conflict.sent_at_utc_ms = 1000;
   conflict.profile.max_motor_torque_nm = 90.0;
-  const auto conflict_result = service.receive_session_profile(conflict, 1000);
+  const auto conflict_result = service.receive_session_profile(
+      conflict, test::clock_sample(UtcMillis{1000}, MonotonicMillis{1000}));
   expect(
       !conflict_result.accepted &&
           conflict_result.reason == "profile_seq_conflict",
       "same profile sequence with a different payload was not rejected");
 
-  const auto active_command = service.receive_command(command(2, 100), 100);
+  const auto active_command = service.receive_command(
+      command(2, 100), test::clock_sample(UtcMillis{100}, MonotonicMillis{100}));
   expect(
       active_command.accepted,
       "profile-authorized command was rejected: " + active_command.reason);
@@ -1964,7 +2754,7 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
 
   const auto lower = service.receive_session_profile(
       session_profile_request(2, 1020, 10.0, 50.0, 100.0, 30.0, 80.0),
-      1020);
+      test::clock_sample(UtcMillis{1020}, MonotonicMillis{1020}));
   expect(lower.accepted, "live target/torque decrease was rejected");
   expect(
       adapter_view->status().applied_command_count == 2,
@@ -1974,20 +2764,23 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
       50.0,
       1e-9,
       "lower torque ACK did not reflect the adapter state");
-  expect(
-      service.receive_session_profile(first_request, 1030).reason == "old_seq",
-      "older profile sequence was not rejected");
+  expect(service.receive_session_profile(first_request,
+                                         test::clock_sample(UtcMillis{1030}, MonotonicMillis{1030}))
+                 .reason == "old_seq",
+         "older profile sequence was not rejected");
 
   const auto raised = service.receive_session_profile(
       session_profile_request(3, 1040, 12.0, 60.0, 100.0, 30.0, 80.0),
-      1040);
+      test::clock_sample(UtcMillis{1040}, MonotonicMillis{1040}));
   expect(raised.accepted, "mock bench profile increase bypass was rejected");
   expect(
       adapter_view->status().applied_command_count == 2,
       "profile increase replayed a stale command with newly raised authority");
   auto estop = command(3, 1050);
   estop.estop = true;
-  expect(service.receive_command(estop, 1050).accepted, "ESTOP was rejected");
+  expect(service.receive_command(estop, test::clock_sample(UtcMillis{1050}, MonotonicMillis{1050}))
+             .accepted,
+         "ESTOP was rejected");
   const auto cleared_status = service.session_control_profile();
   expect(
       !cleared_status.at("active").get<bool>() &&
@@ -2002,7 +2795,7 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
       "ESTOP did not withdraw session traction authority");
   const auto cleared_retry = service.receive_session_profile(
       session_profile_request(3, 1040, 12.0, 60.0, 100.0, 30.0, 80.0),
-      2000);
+      test::clock_sample(UtcMillis{2000}, MonotonicMillis{2000}));
   expect(
       !cleared_retry.accepted && cleared_retry.idempotent &&
           cleared_retry.reason == "session_profile_cleared",
@@ -2015,49 +2808,53 @@ void test_session_control_profile_uses_independent_two_second_age_window() {
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
 
   auto wrong_identity = session_profile_request(1, 0);
   wrong_identity.vehicle_id = "vehicle-002";
-  expect(
-      service.receive_session_profile(wrong_identity, 0).reason == "wrong_vehicle",
-      "session profile for a different vehicle was accepted");
+  expect(service.receive_session_profile(wrong_identity,
+                                         test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+                 .reason == "wrong_vehicle",
+         "session profile for a different vehicle was accepted");
   wrong_identity = session_profile_request(1, 0);
   wrong_identity.driver_id = "driver-002";
-  expect(
-      service.receive_session_profile(wrong_identity, 0).reason == "wrong_driver",
-      "session profile for a different driver was accepted");
+  expect(service.receive_session_profile(wrong_identity,
+                                         test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+                 .reason == "wrong_driver",
+         "session profile for a different driver was accepted");
   wrong_identity = session_profile_request(1, 0);
   wrong_identity.session_id = "session-002";
-  expect(
-      service.receive_session_profile(wrong_identity, 0).reason == "wrong_session",
-      "session profile for a different session was accepted");
+  expect(service.receive_session_profile(wrong_identity,
+                                         test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+                 .reason == "wrong_session",
+         "session profile for a different session was accepted");
 
   const auto future = service.receive_session_profile(
-      session_profile_request(
-          1,
-          mine_teleop::kSessionControlProfileMaxAgeMs + 1),
-      0);
+      session_profile_request(1, mine_teleop::kSessionControlProfileMaxAgeMs + 1),
+      test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(
       !future.accepted && future.reason == "profile_timestamp_in_future",
       "new profile beyond the independent future-skew window was accepted");
 
   const auto delayed_first = session_profile_request(1, 0);
-  const auto accepted = service.receive_session_profile(delayed_first, 500);
+  const auto accepted = service.receive_session_profile(
+      delayed_first, test::clock_sample(UtcMillis{500}, MonotonicMillis{500}));
   expect(
       accepted.accepted && !accepted.idempotent,
       "new profile older than the ordinary 200-ms control window was rejected");
 
   const auto too_old = service.receive_session_profile(
       session_profile_request(2, 0),
-      mine_teleop::kSessionControlProfileMaxAgeMs + 1);
+      test::clock_sample(UtcMillis{mine_teleop::kSessionControlProfileMaxAgeMs + 1},
+                         MonotonicMillis{mine_teleop::kSessionControlProfileMaxAgeMs + 1}));
   expect(
       !too_old.accepted && too_old.reason == "profile_age_exceeded",
       "new profile older than the independent two-second window was accepted");
 
   const auto very_late_retry = service.receive_session_profile(
       delayed_first,
-      mine_teleop::kSessionControlProfileMaxAgeMs * 3);
+      test::clock_sample(UtcMillis{mine_teleop::kSessionControlProfileMaxAgeMs * 3},
+                         MonotonicMillis{mine_teleop::kSessionControlProfileMaxAgeMs * 3}));
   expect(
       very_late_retry.accepted && very_late_retry.idempotent,
       "known same-sequence retry was rejected by the profile age window");
@@ -2071,11 +2868,11 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   adapter_view->handshake.parking_ready = false;
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
 
-  const auto blocked = service.receive_session_profile(
-      session_profile_request(1, 0, 10.0, 100.0, 100.0, 30.0, 80.0),
-      0);
+  const auto blocked =
+      service.receive_session_profile(session_profile_request(1, 0, 10.0, 100.0, 100.0, 30.0, 80.0),
+                                      test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(
       !blocked.accepted &&
           blocked.reason == "parking_ready_required_for_profile_increase",
@@ -2089,7 +2886,7 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   adapter_view->handshake.parking_ready = true;
   const auto ready_blocked = service.receive_session_profile(
       session_profile_request(2, 10, 10.0, 100.0, 100.0, 30.0, 80.0),
-      10);
+      test::clock_sample(UtcMillis{10}, MonotonicMillis{10}));
   expect(
       !ready_blocked.accepted &&
           ready_blocked.reason ==
@@ -2098,24 +2895,24 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   adapter_view->handshake.state = "standby";
   const auto accepted = service.receive_session_profile(
       session_profile_request(3, 20, 10.0, 100.0, 100.0, 30.0, 80.0),
-      20);
+      test::clock_sample(UtcMillis{20}, MonotonicMillis{20}));
   expect(accepted.accepted, "parking-ready real-adapter profile was rejected");
   adapter_view->handshake.state = "ready";
   adapter_view->handshake.parking_ready = false;
-  const auto decreased = service.receive_session_profile(
-      session_profile_request(4, 30, 8.0, 80.0, 100.0, 30.0, 80.0),
-      30);
+  const auto decreased =
+      service.receive_session_profile(session_profile_request(4, 30, 8.0, 80.0, 100.0, 30.0, 80.0),
+                                      test::clock_sample(UtcMillis{30}, MonotonicMillis{30}));
   expect(decreased.accepted, "target/torque decrease required parking_ready");
-  const auto brake_change = service.receive_session_profile(
-      session_profile_request(5, 40, 8.0, 80.0, 90.0, 20.0, 70.0),
-      40);
+  const auto brake_change =
+      service.receive_session_profile(session_profile_request(5, 40, 8.0, 80.0, 90.0, 20.0, 70.0),
+                                      test::clock_sample(UtcMillis{40}, MonotonicMillis{40}));
   expect(
       !brake_change.accepted &&
           brake_change.reason == "parking_ready_required_for_profile_increase",
       "brake pressure change bypassed parking_ready");
-  const auto target_raise = service.receive_session_profile(
-      session_profile_request(6, 50, 9.0, 80.0, 100.0, 30.0, 80.0),
-      50);
+  const auto target_raise =
+      service.receive_session_profile(session_profile_request(6, 50, 9.0, 80.0, 100.0, 30.0, 80.0),
+                                      test::clock_sample(UtcMillis{50}, MonotonicMillis{50}));
   expect(
       !target_raise.accepted &&
           target_raise.reason == "parking_ready_required_for_profile_increase",
@@ -2124,9 +2921,9 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   adapter_view->handshake.parking_ready = true;
   adapter_view->handshake.state = "disarmed";
   adapter_view->control_limit_update_throws = true;
-  const auto apply_failed = service.receive_session_profile(
-      session_profile_request(7, 60, 8.0, 70.0, 90.0, 20.0, 70.0),
-      60);
+  const auto apply_failed =
+      service.receive_session_profile(session_profile_request(7, 60, 8.0, 70.0, 90.0, 20.0, 70.0),
+                                      test::clock_sample(UtcMillis{60}, MonotonicMillis{60}));
   expect(
       !apply_failed.accepted &&
           apply_failed.reason == "adapter_session_profile_apply_failed" &&
@@ -2134,9 +2931,9 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
       "profile was ACKed before adapter application completed");
   adapter_view->control_limit_update_throws = false;
 
-  const auto restored = service.receive_session_profile(
-      session_profile_request(8, 70, 8.0, 80.0, 100.0, 30.0, 80.0),
-      70);
+  const auto restored =
+      service.receive_session_profile(session_profile_request(8, 70, 8.0, 80.0, 100.0, 30.0, 80.0),
+                                      test::clock_sample(UtcMillis{70}, MonotonicMillis{70}));
   expect(
       restored.accepted,
       "parking-ready baseline profile was not restored after apply failure");
@@ -2147,7 +2944,8 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   adapter_view->handshake.parking_ready = false;
   auto rise_rate_change = session_profile_request(9, 80, 8.0, 80.0, 100.0, 30.0, 80.0);
   rise_rate_change.profile.motor_torque_rise_rate_nm_per_s = 50.0;
-  const auto rise_rate_blocked = service.receive_session_profile(rise_rate_change, 80);
+  const auto rise_rate_blocked = service.receive_session_profile(
+      rise_rate_change, test::clock_sample(UtcMillis{80}, MonotonicMillis{80}));
   expect(
       !rise_rate_blocked.accepted &&
           rise_rate_blocked.reason == "parking_ready_required_for_profile_increase",
@@ -2155,7 +2953,8 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   adapter_view->handshake.parking_ready = true;
   auto rise_rate_apply = session_profile_request(10, 90, 8.0, 80.0, 100.0, 30.0, 80.0);
   rise_rate_apply.profile.motor_torque_rise_rate_nm_per_s = 50.0;
-  const auto rise_rate_accepted = service.receive_session_profile(rise_rate_apply, 90);
+  const auto rise_rate_accepted = service.receive_session_profile(
+      rise_rate_apply, test::clock_sample(UtcMillis{90}, MonotonicMillis{90}));
   expect(
       rise_rate_accepted.accepted,
       "parked rise-rate change was rejected");
@@ -2177,12 +2976,13 @@ void test_control_service_commits_only_successfully_applied_commands() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     activate_adapter_owned_session_profile(service, *adapter_view);
 
     adapter_view->structured_rejection_issue_code =
         "vcu_drive_gear_change_moving_or_stale";
-    const auto rejected = service.receive_command(command(1, 0), 0);
+    const auto rejected = service.receive_command(
+        command(1, 0), test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     expect(
         !rejected.accepted && !rejected.command &&
             rejected.reason == "adapter_control_rejected" &&
@@ -2191,7 +2991,8 @@ void test_control_service_commits_only_successfully_applied_commands() {
         "structured adapter rejection was not returned without committing safety state");
     adapter_view->structured_rejection_issue_code.reset();
     expect(
-        service.receive_command(command(2, 1), 1).accepted,
+        service.receive_command(command(2, 1), test::clock_sample(UtcMillis{1}, MonotonicMillis{1}))
+            .accepted,
         "fresh command did not recover after a structured adapter rejection");
     service.close();
   }
@@ -2201,32 +3002,33 @@ void test_control_service_commits_only_successfully_applied_commands() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     activate_adapter_owned_session_profile(service, *adapter_view);
 
     expect(
-        service.receive_command(command(1, 0), 0).accepted,
+        service.receive_command(command(1, 0), test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+            .accepted,
         "initial D command was rejected");
     adapter_view->rejected_control_gear = "R";
     auto rejected_reverse = command(2, 100);
     rejected_reverse.gear = "R";
     expect_throws(
-        [&] { static_cast<void>(service.receive_command(rejected_reverse, 100)); },
+        [&] {
+          static_cast<void>(service.receive_command(
+              rejected_reverse, test::clock_sample(UtcMillis{100}, MonotonicMillis{100})));
+        },
         "adapter control rejection did not propagate");
 
     adapter_view->rejected_control_gear.reset();
-    const auto replay = service.receive_command(rejected_reverse, 110);
-    expect(
-        !replay.accepted && replay.reason == "old_seq",
-        "failed adapter application did not consume its command sequence");
+    const auto replay = service.receive_command(
+        rejected_reverse, test::clock_sample(UtcMillis{110}, MonotonicMillis{110}));
+    expect(replay.accepted, "failed adapter application incorrectly consumed its command sequence");
 
-    service.tick(300);
-    expect(
-        service.safety_state() == mine_teleop::SafetyState::Degraded,
-        "failed adapter application refreshed the outer safety watchdog");
-    expect(
-        adapter_view->last_safe_output.gear == "D",
-        "failed reverse application replaced the last successfully applied gear");
+    service.tick(test::clock_sample(UtcMillis{410}, MonotonicMillis{410}));
+    expect(service.safety_state() == mine_teleop::SafetyState::Degraded,
+           "successful replay did not establish the new outer safety watchdog");
+    expect(adapter_view->last_safe_output.gear == "R",
+           "only a successfully applied replay may replace the safe-stop gear");
     service.close();
   }
 
@@ -2235,18 +3037,53 @@ void test_control_service_commits_only_successfully_applied_commands() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     activate_adapter_owned_session_profile(service, *adapter_view);
     expect(
-        service.receive_command(command(1, 0), 0).accepted,
+        service.receive_command(command(1, 0), test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+            .accepted,
+        "initial command before rejected recovery was rejected");
+    service.tick(test::clock_sample(UtcMillis{300}, MonotonicMillis{300}));
+    expect(service.safety_state() == mine_teleop::SafetyState::Degraded,
+           "recovery rejection test did not enter degraded state");
+    auto neutral = command(2, 350);
+    neutral.throttle = 0.0;
+    neutral.steering = 0.0;
+    neutral.brake = 0.6;
+    adapter_view->structured_rejection_issue_code = "vcu_drive_gear_change_moving_or_stale";
+    const auto rejected =
+        service.receive_command(neutral, test::clock_sample(UtcMillis{350}, MonotonicMillis{350}));
+    expect(!rejected.accepted && rejected.reason == "adapter_control_rejected" &&
+               service.safety_state() == mine_teleop::SafetyState::Degraded,
+           "adapter-rejected neutral recovery changed the degraded state");
+    service.tick(test::clock_sample(UtcMillis{800}, MonotonicMillis{800}));
+    expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
+               !service.session_control_profile().at("active").get<bool>(),
+           "rejected recovery moved the hard-timeout origin or retained traction authority");
+    service.close();
+  }
+
+  {
+    auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
+    auto* adapter_view = adapter.get();
+    mine_teleop::VehicleControlService service(config, "driver-001", "session-001", "token",
+                                               std::move(adapter), 10000);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
+    activate_adapter_owned_session_profile(service, *adapter_view);
+    expect(
+        service.receive_command(command(1, 0), test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+            .accepted,
         "control command before overdue ESTOP was rejected");
-    service.tick(300);
+    service.tick(test::clock_sample(UtcMillis{300}, MonotonicMillis{300}));
 
     auto estop = command(2, 810);
     estop.estop = true;
     adapter_view->safe_stop_throws = true;
     expect_throws(
-        [&] { static_cast<void>(service.receive_command(estop, 810)); },
+        [&] {
+          static_cast<void>(service.receive_command(
+              estop, test::clock_sample(UtcMillis{810}, MonotonicMillis{810})));
+        },
         "overdue adapter ESTOP failure did not propagate");
     expect(
         service.safety_state() == mine_teleop::SafetyState::Estop,
@@ -2257,7 +3094,8 @@ void test_control_service_commits_only_successfully_applied_commands() {
         "overdue adapter ESTOP failure retained session traction authority");
 
     adapter_view->safe_stop_throws = false;
-    const auto replay = service.receive_command(estop, 811);
+    const auto replay =
+        service.receive_command(estop, test::clock_sample(UtcMillis{811}, MonotonicMillis{811}));
     expect(
         !replay.accepted && replay.reason == "old_seq" &&
             service.safety_state() == mine_teleop::SafetyState::Estop,
@@ -2272,10 +3110,13 @@ void test_control_service_reports_safe_stop_output_after_timeout() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   activate_session_profile(service);
-  expect(service.receive_command(command(1, 0), 0).accepted, "control command was rejected");
-  service.tick(800);
+  expect(
+      service.receive_command(command(1, 0), test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+          .accepted,
+      "control command was rejected");
+  service.tick(test::clock_sample(UtcMillis{800}, MonotonicMillis{800}));
   expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake, "service did not enter timeout");
   expect(
       !service.session_control_profile().at("active").get<bool>(),
@@ -2285,18 +3126,19 @@ void test_control_service_reports_safe_stop_output_after_timeout() {
       0.0,
       1e-9,
       "hard control timeout retained session traction authority");
-  service.tick(1300);
+  service.tick(test::clock_sample(UtcMillis{1300}, MonotonicMillis{1300}));
   const auto telemetry = adapter_view->read_telemetry();
   expect_near(telemetry.throttle_feedback, 0.0, 1e-9, "timeout telemetry retained stale throttle");
   expect_near(telemetry.brake_feedback, 0.6, 1e-9, "timeout telemetry did not report safe brake");
-  const auto gap_rearm = service.receive_command(command(2, 1310), 1310);
+  const auto gap_rearm = service.receive_command(
+      command(2, 1310), test::clock_sample(UtcMillis{1310}, MonotonicMillis{1310}));
   expect(
       !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
       "hard-timeout receiver did not re-arm on the first fresh command");
-  const auto blocked = service.receive_command(command(3, 1320), 1320);
-  expect(
-      !blocked.accepted && blocked.reason == "session_control_profile_required",
-      "hard control timeout recovered without explicit profile re-authorization");
+  const auto blocked = service.receive_command(
+      command(3, 1320), test::clock_sample(UtcMillis{1320}, MonotonicMillis{1320}));
+  expect(!blocked.accepted && blocked.reason == "command_gap_exceeded",
+         "rejected hard-timeout command advanced the watchdog receiver state");
   service.close();
 }
 
@@ -2306,11 +3148,14 @@ void test_control_service_recovers_from_degraded_command_gap_without_profile_rea
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   activate_session_profile(service);
-  expect(service.receive_command(command(1, 0), 0).accepted, "control command was rejected");
+  expect(
+      service.receive_command(command(1, 0), test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+          .accepted,
+      "control command was rejected");
 
-  service.tick(300);
+  service.tick(test::clock_sample(UtcMillis{300}, MonotonicMillis{300}));
   expect(
       service.safety_state() == mine_teleop::SafetyState::Degraded,
       "service did not enter the recoverable degraded state");
@@ -2329,25 +3174,29 @@ void test_control_service_recovers_from_degraded_command_gap_without_profile_rea
       1e-9,
       "degraded state retained stale traction while preserving the profile");
 
-  const auto gap_rearm = service.receive_command(command(2, 350), 350);
+  const auto gap_rearm = service.receive_command(
+      command(2, 350), test::clock_sample(UtcMillis{350}, MonotonicMillis{350}));
   expect(
       !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
       "first fresh command after the gap did not re-arm receiver timing");
-  const auto held_input = service.receive_command(command(3, 360), 360);
-  expect(
-      !held_input.accepted && held_input.reason == "degraded_neutral_required",
-      "degraded control resumed stale held input before an explicit neutral command");
+  const auto held_input = service.receive_command(
+      command(3, 360), test::clock_sample(UtcMillis{360}, MonotonicMillis{360}));
+  expect(!held_input.accepted && held_input.reason == "command_gap_exceeded",
+         "degraded held input advanced receiver timing before an explicit neutral command");
   auto neutral = command(4, 370);
   neutral.steering = 0.0;
   neutral.throttle = 0.0;
-  const auto recovered = service.receive_command(neutral, 370);
+  const auto recovered =
+      service.receive_command(neutral, test::clock_sample(UtcMillis{370}, MonotonicMillis{370}));
   expect(recovered.accepted, "fresh neutral command did not recover degraded control");
   expect(
       service.safety_state() == mine_teleop::SafetyState::ControlActive,
       "fresh neutral command did not restore active control");
-  expect(
-      service.receive_command(command(5, 380), 380).accepted,
-      "fresh input remained blocked after explicit neutral recovery");
+  expect(service
+             .receive_command(command(5, 380),
+                              test::clock_sample(UtcMillis{380}, MonotonicMillis{380}))
+             .accepted,
+         "fresh input remained blocked after explicit neutral recovery");
   expect(
       service.session_control_profile().at("active").get<bool>() &&
           adapter_view->session_motor_torque_limit_nm() == 100.0,
@@ -2361,17 +3210,21 @@ void test_control_service_receive_path_cannot_bypass_hard_timeout() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   activate_session_profile(service);
-  expect(service.receive_command(command(1, 0), 0).accepted, "control command was rejected");
+  expect(
+      service.receive_command(command(1, 0), test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+          .accepted,
+      "control command was rejected");
   const auto controls_before_timeout = adapter_view->status().applied_command_count;
 
-  service.tick(300);
+  service.tick(test::clock_sample(UtcMillis{300}, MonotonicMillis{300}));
   expect(
       service.safety_state() == mine_teleop::SafetyState::Degraded,
       "service did not enter degraded before receive-path timeout test");
 
-  const auto gap_rearm = service.receive_command(command(2, 810), 810);
+  const auto gap_rearm = service.receive_command(
+      command(2, 810), test::clock_sample(UtcMillis{810}, MonotonicMillis{810}));
   expect(
       !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
       "first packet after a hard timeout did not re-arm receiver timing");
@@ -2380,10 +3233,10 @@ void test_control_service_receive_path_cannot_bypass_hard_timeout() {
           !service.session_control_profile().at("active").get<bool>(),
       "receive path failed to advance the hard timeout and revoke the profile");
 
-  const auto blocked = service.receive_command(command(3, 820), 820);
-  expect(
-      !blocked.accepted && blocked.reason == "session_control_profile_required",
-      "fresh packets bypassed profile re-authorization after the hard timeout");
+  const auto blocked = service.receive_command(
+      command(3, 820), test::clock_sample(UtcMillis{820}, MonotonicMillis{820}));
+  expect(!blocked.accepted && blocked.reason == "command_gap_exceeded",
+         "rejected hard-timeout packet advanced the receiver watchdog state");
   expect(
       adapter_view->status().applied_command_count == controls_before_timeout,
       "a command reached the adapter after receive-path hard timeout");
@@ -2397,22 +3250,22 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     adapter_view->handshake.state = "standby";
     adapter_view->handshake.ready = false;
     const auto profile = service.receive_session_profile(
         session_profile_request(1, 0, 20.0, 100.0, 20.0, 10.0, 20.0),
-        0);
+        test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     expect(profile.accepted, "20 bar session profile was rejected");
     adapter_view->set_safe_stop(false, true, false);
     auto braking = command(1, 0);
     braking.throttle = 0.8;
     braking.brake = 0.5;
-    expect(
-        service.receive_command(braking, 0).accepted,
-        "session-scaled braking command was rejected");
+    expect(service.receive_command(braking, test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+               .accepted,
+           "session-scaled braking command was rejected");
 
-    service.tick(300);
+    service.tick(test::clock_sample(UtcMillis{300}, MonotonicMillis{300}));
     expect(
         service.safety_state() == mine_teleop::SafetyState::Degraded,
         "service did not enter Degraded for brake-unit preservation test");
@@ -2425,7 +3278,7 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
         !adapter_view->last_safe_output.full_emergency_brake,
         "Degraded session braking was mislabeled as full-DBC emergency braking");
 
-    service.tick(800);
+    service.tick(test::clock_sample(UtcMillis{800}, MonotonicMillis{800}));
     expect_near(
         adapter_view->last_safe_output.brake,
         0.3,
@@ -2434,7 +3287,7 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
     expect(
         !adapter_view->last_safe_output.full_emergency_brake,
         "first timeout stage incorrectly requested full-DBC emergency braking");
-    service.tick(1300);
+    service.tick(test::clock_sample(UtcMillis{1300}, MonotonicMillis{1300}));
     expect_near(
         adapter_view->last_safe_output.brake,
         0.6,
@@ -2443,7 +3296,7 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
     expect(
         !adapter_view->last_safe_output.full_emergency_brake,
         "second timeout stage incorrectly requested full-DBC emergency braking");
-    service.tick(2300);
+    service.tick(test::clock_sample(UtcMillis{2300}, MonotonicMillis{2300}));
     expect(
         adapter_view->last_safe_output.full_emergency_brake &&
             adapter_view->last_safe_output.brake == 1.0,
@@ -2456,15 +3309,17 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     activate_adapter_owned_session_profile(service, *adapter_view);
     auto full_ordinary_brake = command(1, 0);
     full_ordinary_brake.throttle = 0.0;
     full_ordinary_brake.brake = 1.0;
-    expect(
-        service.receive_command(full_ordinary_brake, 0).accepted,
-        "100 bar ordinary braking command was rejected");
-    service.tick(300);
+    expect(service
+               .receive_command(full_ordinary_brake,
+                                test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+               .accepted,
+           "100 bar ordinary braking command was rejected");
+    service.tick(test::clock_sample(UtcMillis{300}, MonotonicMillis{300}));
     expect(
         adapter_view->last_safe_output.brake == 1.0 &&
             !adapter_view->last_safe_output.full_emergency_brake,
@@ -2479,19 +3334,21 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 10000);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   activate_adapter_owned_session_profile(service, *adapter_view);
 
   expect(
-      service.receive_command(command(1, 0), 0).accepted,
+      service.receive_command(command(1, 0), test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+          .accepted,
       "initial control command was rejected");
   expect(
       adapter_view->applied_commands == 1 && adapter_view->control_attempts == 1,
       "initial control command did not reach the adapter exactly once");
 
   adapter_view->set_safe_stop(true, true, false);
-  service.tick(100);
-  const auto blocked = service.receive_command(command(2, 110), 110);
+  service.tick(test::clock_sample(UtcMillis{100}, MonotonicMillis{100}));
+  const auto blocked = service.receive_command(
+      command(2, 110), test::clock_sample(UtcMillis{110}, MonotonicMillis{110}));
   expect(
       !blocked.accepted && blocked.reason == "session_control_profile_required",
       "adapter-owned safe stop did not withdraw ordinary profile authority");
@@ -2501,13 +3358,13 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
       "blocked control refreshed outer safety state or reached the adapter");
 
   adapter_view->handshake_status_throws = true;
-  service.tick(350);
+  service.tick(test::clock_sample(UtcMillis{350}, MonotonicMillis{350}));
   adapter_view->handshake_status_throws = false;
   expect(
       service.safety_state() == mine_teleop::SafetyState::Degraded,
       "outer safety state did not survive an unreadable adapter interlock");
   adapter_view->set_safe_stop(false, false, true);
-  service.tick(900);
+  service.tick(test::clock_sample(UtcMillis{900}, MonotonicMillis{900}));
   expect(
       service.safety_state() == mine_teleop::SafetyState::TimeoutBrake,
       "outer safety state did not reach timeout while the adapter disarmed");
@@ -2517,7 +3374,7 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
       "outer timeout repeated an ordinary safe stop owned by the adapter");
 
   adapter_view->set_safe_stop(false, false, false);
-  activate_session_profile(service, 2, 900);
+  activate_session_profile(service, 2, test::clock_sample(UtcMillis{900}, MonotonicMillis{900}));
 
   adapter_view->handshake_succeeds = false;
   expect(
@@ -2530,12 +3387,12 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
 
   adapter_view->handshake_succeeds = true;
   expect(
-      service.request_vcu_handshake(),
+      service.request_vcu_handshake(test::clock_sample(UtcMillis{1'900}, MonotonicMillis{1'900})),
       "explicit adapter handshake recovery was rejected");
   expect(
       service.safety_state() == mine_teleop::SafetyState::Standby,
       "successful adapter handshake did not reset the recoverable outer state to Standby");
-  service.tick(2000);
+  service.tick(test::clock_sample(UtcMillis{2000}, MonotonicMillis{2000}));
   expect(
       service.safety_state() == mine_teleop::SafetyState::Standby &&
           adapter_view->applied_commands == 1 &&
@@ -2546,21 +3403,20 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
       !adapter_view->feedback_ready(),
       "fake adapter incorrectly reported Ready while the handshake was Initial");
   adapter_view->set_safe_stop(false, true, false);
-  const auto gap_rearm = service.receive_command(command(3, 2010), 2010);
-  expect(
-      !gap_rearm.accepted && gap_rearm.reason == "command_gap_exceeded",
-      "first heartbeat after the intentional handshake gap did not re-arm timing");
-  expect(
-      service.safety_state() == mine_teleop::SafetyState::Standby &&
-          adapter_view->control_attempts == 1,
-      "gap re-arm heartbeat replayed control after the handshake");
-  const auto fresh = service.receive_command(command(4, 2020), 2020);
+  const auto old_replay = service.receive_command(
+      command(1, 2010), test::clock_sample(UtcMillis{2010}, MonotonicMillis{2010}));
+  expect(!old_replay.accepted && old_replay.reason == "old_seq",
+         "successful handshake forgot the pre-handshake sequence boundary");
+  expect(service.safety_state() == mine_teleop::SafetyState::Standby &&
+             adapter_view->control_attempts == 1,
+         "a replayed command restored control after the handshake");
+  const auto fresh = service.receive_command(
+      command(3, 2020), test::clock_sample(UtcMillis{2020}, MonotonicMillis{2020}));
   expect(fresh.accepted, "fresh post-handshake control command was rejected");
-  expect(
-      service.safety_state() == mine_teleop::SafetyState::ControlActive &&
-          adapter_view->applied_commands == 2 &&
-          adapter_view->last_control && adapter_view->last_control->seq == 4,
-      "fresh post-handshake command did not exclusively restore control");
+  expect(service.safety_state() == mine_teleop::SafetyState::ControlActive &&
+             adapter_view->applied_commands == 2 && adapter_view->last_control &&
+             adapter_view->last_control->seq == 3,
+         "fresh post-handshake command did not exclusively restore control");
   service.close();
 }
 
@@ -2571,14 +3427,14 @@ void test_adapter_handshake_does_not_clear_outer_estop_or_fault() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     adapter_view->set_safe_stop(true, true, false);
     auto estop = command(1, 0);
     estop.estop = true;
-    expect(
-        service.receive_command(estop, 0).accepted &&
-            service.safety_state() == mine_teleop::SafetyState::Estop,
-        "outer ESTOP command did not latch while the adapter owned the stop");
+    expect(service.receive_command(estop, test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+                   .accepted &&
+               service.safety_state() == mine_teleop::SafetyState::Estop,
+           "outer ESTOP command did not latch while the adapter owned the stop");
     expect(
         adapter_view->safe_stop_attempts == 1 &&
             adapter_view->last_safe_output.estop &&
@@ -2599,9 +3455,10 @@ void test_adapter_handshake_does_not_clear_outer_estop_or_fault() {
     adapter_view->telemetry_throws = true;
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     activate_adapter_owned_session_profile(service, *adapter_view);
-    const auto failed = service.receive_command(command(1, 0), 0);
+    const auto failed = service.receive_command(
+        command(1, 0), test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     expect(
         !failed.accepted && failed.reason == "adapter_safety_status_unavailable" &&
             service.safety_state() == mine_teleop::SafetyState::Fault,
@@ -2623,31 +3480,33 @@ void test_reset_estop_rejects_unreadable_disarming_and_hard_adapter_stops() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
 
   auto estop = command(1, 0);
   estop.estop = true;
-  expect(service.receive_command(estop, 0).accepted, "outer ESTOP command was rejected");
+  expect(
+      service.receive_command(estop, test::clock_sample(UtcMillis{0}, MonotonicMillis{0})).accepted,
+      "outer ESTOP command was rejected");
   expect(adapter_view->safe_stop_attempts == 1, "outer ESTOP was not applied");
 
   adapter_view->set_safe_stop(false, false, true);
-  expect(
-      !service.reset_estop(true, "operator", 5) &&
-          service.safety_state() == mine_teleop::SafetyState::Estop &&
-          adapter_view->safe_stop_attempts == 1,
-      "adapter disarming allowed an outer ESTOP reset or ordinary apply");
+  expect(!service.reset_estop(true, "operator",
+                              test::clock_sample(UtcMillis{5}, MonotonicMillis{5})) &&
+             service.safety_state() == mine_teleop::SafetyState::Estop &&
+             adapter_view->safe_stop_attempts == 1,
+         "adapter disarming allowed an outer ESTOP reset or ordinary apply");
 
   adapter_view->set_safe_stop(true, true, false);
   adapter_view->telemetry_throws = true;
-  expect(
-      !service.reset_estop(true, "operator", 10) &&
-          service.safety_state() == mine_teleop::SafetyState::Estop,
-      "unreadable adapter interlock allowed the outer ESTOP reset");
+  expect(!service.reset_estop(true, "operator",
+                              test::clock_sample(UtcMillis{10}, MonotonicMillis{10})) &&
+             service.safety_state() == mine_teleop::SafetyState::Estop,
+         "unreadable adapter interlock allowed the outer ESTOP reset");
   adapter_view->telemetry_throws = false;
-  expect(
-      !service.reset_estop(true, "operator", 20) &&
-          service.safety_state() == mine_teleop::SafetyState::Estop,
-      "physical or hard adapter stop incorrectly cleared the outer ESTOP");
+  expect(!service.reset_estop(true, "operator",
+                              test::clock_sample(UtcMillis{20}, MonotonicMillis{20})) &&
+             service.safety_state() == mine_teleop::SafetyState::Estop,
+         "physical or hard adapter stop incorrectly cleared the outer ESTOP");
   expect(
       adapter_view->safe_stop_attempts == 2 &&
           adapter_view->rejected_ordinary_safe_stops == 1,
@@ -2661,25 +3520,25 @@ void test_reset_estop_clears_soft_stop_before_fresh_control() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
 
   auto estop = command(1, 0);
   estop.estop = true;
-  expect(
-      service.receive_command(estop, 0).accepted &&
-          service.safety_state() == mine_teleop::SafetyState::Estop &&
-          adapter_view->read_telemetry().estop,
-      "soft outer ESTOP did not reach the mock adapter");
-  expect(
-      service.reset_estop(true, "operator", 10) &&
-          service.safety_state() == mine_teleop::SafetyState::Standby &&
-          !adapter_view->read_telemetry().estop &&
-          adapter_view->read_telemetry().gear == "D",
-      "authorized reset did not clear the adapter soft stop while preserving actual D");
+  expect(service.receive_command(estop, test::clock_sample(UtcMillis{0}, MonotonicMillis{0}))
+                 .accepted &&
+             service.safety_state() == mine_teleop::SafetyState::Estop &&
+             adapter_view->read_telemetry().estop,
+         "soft outer ESTOP did not reach the mock adapter");
+  expect(service.reset_estop(true, "operator",
+                             test::clock_sample(UtcMillis{10}, MonotonicMillis{10})) &&
+             service.safety_state() == mine_teleop::SafetyState::Standby &&
+             !adapter_view->read_telemetry().estop && adapter_view->read_telemetry().gear == "D",
+         "authorized reset did not clear the adapter soft stop while preserving actual D");
 
-  activate_session_profile(service, 1, 15);
+  activate_session_profile(service, 1, test::clock_sample(UtcMillis{15}, MonotonicMillis{15}));
 
-  const auto fresh = service.receive_command(command(2, 20), 20);
+  const auto fresh = service.receive_command(
+      command(2, 20), test::clock_sample(UtcMillis{20}, MonotonicMillis{20}));
   expect(
       fresh.accepted &&
           service.safety_state() == mine_teleop::SafetyState::ControlActive &&
@@ -2697,15 +3556,16 @@ void test_control_service_applies_vehicle_hard_limits() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
-  const auto profile = service.receive_session_profile(
-      session_profile_request(1, 0, 4.0, 100.0, 100.0, 30.0, 80.0),
-      0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
+  const auto profile =
+      service.receive_session_profile(session_profile_request(1, 0, 4.0, 100.0, 100.0, 30.0, 80.0),
+                                      test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(profile.accepted, "hard-limit test profile was rejected");
 
   auto requested = command(1, 0);
   requested.brake = 0.80;
-  const auto result = service.receive_command(requested, 0);
+  const auto result =
+      service.receive_command(requested, test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(result.accepted && result.command.has_value(), "limited control command was rejected");
   expect_near(result.command->throttle, 0.10, 1e-9, "vehicle throttle hard limit was not applied");
   expect_near(result.command->brake, 0.80, 1e-9, "normalized brake intent was rewritten before physical mapping");
@@ -2806,15 +3666,17 @@ void test_control_service_applies_session_steering_limit() {
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   auto profile = session_profile_request(1, 0);
   profile.profile.max_steering_angle_deg = 3.0;
-  const auto profile_result = service.receive_session_profile(profile, 0);
+  const auto profile_result = service.receive_session_profile(
+      profile, test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(profile_result.accepted, "session steering profile was rejected");
 
   auto requested = command(1, 0);
   requested.steering = 0.25;
-  const auto result = service.receive_command(requested, 0);
+  const auto result =
+      service.receive_command(requested, test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(
       result.accepted && result.command.has_value(),
       "session steering-limited command was rejected");
@@ -2846,10 +3708,11 @@ void test_control_service_bounds_telemetry_history() {
       "token",
       std::make_unique<mine_teleop::MockVehicleAdapter>(),
       1);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   constexpr std::size_t total_samples = mine_teleop::kMaxVehicleTelemetryHistory * 2 + 1;
   for (std::size_t sample = 0; sample < total_samples; ++sample) {
-    service.tick(static_cast<std::int64_t>(sample));
+    const auto sample_ms = static_cast<std::int64_t>(sample);
+    service.tick(test::clock_sample(UtcMillis{sample_ms}, MonotonicMillis{sample_ms}));
   }
   const auto& history = service.telemetry_history();
   expect(
@@ -2879,12 +3742,15 @@ void test_control_service_bounds_telemetry_history() {
       static_cast<std::uint64_t>(total_samples + 1),
       static_cast<std::int64_t>(total_samples + 1));
   estop.estop = true;
-  expect(
-      service.receive_command(
-          estop,
-          static_cast<std::int64_t>(total_samples + 1)).accepted,
-      "page ESTOP was rejected while checking telemetry provenance");
-  service.tick(static_cast<std::int64_t>(total_samples + 2));
+  expect(service
+             .receive_command(
+                 estop,
+                 test::clock_sample(UtcMillis{static_cast<std::int64_t>(total_samples + 1)},
+                                    MonotonicMillis{static_cast<std::int64_t>(total_samples + 1)}))
+             .accepted,
+         "page ESTOP was rejected while checking telemetry provenance");
+  service.tick(test::clock_sample(UtcMillis{static_cast<std::int64_t>(total_samples + 2)},
+                                  MonotonicMillis{static_cast<std::int64_t>(total_samples + 2)}));
   const auto& stopped = service.telemetry_history().back();
   expect(
       stopped.at("stop_source").get<std::string>() == "page_request" &&
@@ -2901,7 +3767,7 @@ void test_control_service_close_preserves_stop_provenance() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     service.close({
         mine_teleop::VehicleStopSource::SoftwareFault,
         mine_teleop::VehicleStopReason::CriticalCameraFailed});
@@ -2917,7 +3783,7 @@ void test_control_service_close_preserves_stop_provenance() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     service.close({
         mine_teleop::VehicleStopSource::SoftwareFault,
         mine_teleop::VehicleStopReason::MediaPipelineFailed});
@@ -2933,7 +3799,7 @@ void test_control_service_close_preserves_stop_provenance() {
     auto* adapter_view = adapter.get();
     mine_teleop::VehicleControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
-    service.start(0);
+    service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
     service.close();
     const auto telemetry = adapter_view->read_telemetry();
     expect(
@@ -2951,10 +3817,11 @@ void test_control_service_requires_feedback_before_actuation_but_allows_estop() 
   auto* adapter_view = adapter.get();
   mine_teleop::VehicleControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
-  service.start(0);
+  service.start(test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   activate_session_profile(service);
 
-  const auto rejected = service.receive_command(command(1, 0), 0);
+  const auto rejected =
+      service.receive_command(command(1, 0), test::clock_sample(UtcMillis{0}, MonotonicMillis{0}));
   expect(!rejected.accepted && rejected.reason == "can_feedback_missing", "control was not gated on CAN feedback");
   expect(adapter_view->applied_commands == 0, "control reached chassis without CAN feedback");
   expect(adapter_view->safe_stops == 1, "missing feedback did not issue a safe stop");
@@ -2962,7 +3829,8 @@ void test_control_service_requires_feedback_before_actuation_but_allows_estop() 
 
   auto estop = command(2, 10);
   estop.estop = true;
-  const auto accepted_estop = service.receive_command(estop, 10);
+  const auto accepted_estop =
+      service.receive_command(estop, test::clock_sample(UtcMillis{10}, MonotonicMillis{10}));
   expect(accepted_estop.accepted, "estop must bypass the feedback gate");
   expect(service.safety_state() == mine_teleop::SafetyState::Estop, "estop did not latch without feedback");
   expect_near(
@@ -2976,16 +3844,16 @@ void test_control_service_requires_feedback_before_actuation_but_allows_estop() 
 void test_fault_output_fails_safe() {
   mine_teleop::SafetyStateMachine safety(
       300, 800, {{0, 0.3}, {1500, 1.0}});
-  safety.mark_ready(0);
+  safety.mark_ready(MonotonicMillis{0});
   safety.mark_fault();
-  const auto output = safety.current_output(0);
+  const auto output = safety.current_output(MonotonicMillis{0});
   expect_near(output.brake, 1.0, 1e-9, "fault output must command full brake");
   expect_near(output.throttle, 0.0, 1e-9, "fault output must clear throttle");
   expect(output.full_emergency_brake, "fault output did not request full-DBC braking");
 }
 
 void test_native_signaling_webrtc_message_isolation() {
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.driver_passwords = {{"driver-1", "secret"}, {"driver-2", "secret-2"}};
   config.device_tokens = {{"vehicle-001", "device-secret"}};
   config.driver_vehicle_permissions = {
@@ -3277,7 +4145,9 @@ void test_native_signaling_webrtc_message_isolation() {
   expect(
       replacement.value("control_token", "") != control.control_token,
       "replacement session reused the previous control token");
-  auto old_token_command = command(1, mine_teleop::now_ms());
+  const ClockSample old_token_replay_time{mine_teleop::utc_now_ms(),
+                                          mine_teleop::process_monotonic_now_ms()};
+  auto old_token_command = command(1, old_token_replay_time.utc.value);
   old_token_command.session_id = replacement.at("session_id").get<std::string>();
   old_token_command.driver_id = "driver-2";
   old_token_command.control_token = control.control_token;
@@ -3289,7 +4159,8 @@ void test_native_signaling_webrtc_message_isolation() {
       mine_teleop::kProtocolVersion,
       true,
       replacement.at("control_token").get<std::string>());
-  const auto old_token_replay = replacement_receiver.accept(old_token_command, mine_teleop::now_ms());
+  const auto old_token_replay =
+      replacement_receiver.accept(old_token_command, old_token_replay_time);
   expect(
       !old_token_replay.accepted && old_token_replay.reason == "control_token_invalid",
       "replacement vehicle receiver accepted the previous control token");
@@ -3308,7 +4179,7 @@ void test_native_signaling_webrtc_message_isolation() {
 }
 
 void test_signaling_presence_generation_and_automatic_release() {
-  mine_teleop::SignalingServerConfig config;
+  auto config = legacy_signaling_config();
   config.driver_passwords = {{"driver-1", "secret-1"}, {"driver-2", "secret-2"}};
   config.device_tokens = {{"vehicle-1", "device-1"}, {"vehicle-2", "device-2"}};
   config.driver_vehicle_permissions = {
@@ -3532,7 +4403,7 @@ void test_signaling_presence_generation_and_automatic_release() {
   static_cast<void>(http.post_json_response(
       base + "/auth/driver_heartbeat", {{"driver_id", "driver-1"}, {"token", driver_1_token}}));
 
-  const auto heartbeat_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(700);
+  const auto heartbeat_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   mine_teleop::Json after_heartbeat_timeout;
   do {
     after_heartbeat_timeout = http.get_json(base + "/health");
@@ -3574,7 +4445,7 @@ void test_signaling_presence_generation_and_automatic_release() {
 }
 
 void test_signaling_time_sync_common_domain() {
-  auto service = std::make_shared<mine_teleop::SignalingService>(mine_teleop::SignalingServerConfig{});
+  auto service = std::make_shared<mine_teleop::SignalingService>(legacy_signaling_config());
   mine_teleop::SimpleHttpServer server(
       "127.0.0.1",
       0,
@@ -3696,7 +4567,7 @@ void test_basler_camera_uses_minimal_aravis_bridge() {
 }
 
 void test_native_driver_to_vehicle_signaling_control_payload() {
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "dev-device-secret"}};
   signaling_config.control_token_ttl_ms = 5000;
@@ -3808,17 +4679,20 @@ void test_native_driver_to_vehicle_signaling_control_payload() {
       vehicle_session.at("control_token").get<std::string>(),
       std::make_unique<mine_teleop::MockVehicleAdapter>());
   const auto received_at_ms = mine_teleop::now_ms();
-  receiver.start(received_at_ms);
+  const auto received_at =
+      test::clock_sample(UtcMillis{received_at_ms}, MonotonicMillis{received_at_ms});
+  receiver.start(received_at);
   auto profile = session_profile_request(1, received_at_ms);
   profile.driver_id = "driver-console-001";
   profile.session_id = control.session_id;
   profile.control_token = vehicle_session.at("control_token").get<std::string>();
-  expect(
-      receiver.receive_session_profile(profile, received_at_ms).accepted,
-      "vehicle receiver did not ACK the session profile before control");
-  const auto applied = receiver.receive_command(control, received_at_ms);
+  expect(receiver.receive_session_profile(profile, received_at).accepted,
+         "vehicle receiver did not ACK the session profile before control");
+  const auto applied = receiver.receive_command(control, received_at);
   expect(applied.accepted, "vehicle receiver did not accept the native signaling control payload");
-  const auto duplicate = receiver.receive_command(control, received_at_ms + 1);
+  const auto duplicate = receiver.receive_command(
+      control,
+      test::clock_sample(UtcMillis{received_at_ms + 1}, MonotonicMillis{received_at_ms + 1}));
   expect(!duplicate.accepted && duplicate.reason == "old_seq", "vehicle receiver accepted a duplicate command");
   receiver.close();
   const auto disconnected = driver.disconnect("test_disconnect");
@@ -3831,7 +4705,7 @@ void test_native_driver_to_vehicle_signaling_control_payload() {
 }
 
 void test_driver_login_lists_only_authorized_vehicles() {
-  mine_teleop::SignalingServerConfig signaling_config;
+  auto signaling_config = legacy_signaling_config();
   signaling_config.driver_passwords = {
       {"driver-console-001", "dev-password"},
       {"driver-console-002", "other-password"},
@@ -3899,20 +4773,29 @@ void test_driver_console_page_keeps_waiting_state_during_background_intent_refre
   request.path = "/";
   const auto response = app.handle(request);
   expect(response.status == 200, "driver console page did not load");
+  mine_teleop::HttpRequest asset_request;
+  asset_request.method = "GET";
+  asset_request.path = "/assets/control_console.js";
+  const auto console_js_response = app.handle(asset_request);
+  expect(console_js_response.status == 200, "driver console script did not load");
+  asset_request.path = "/assets/control_logic.js";
+  const auto control_logic_response = app.handle(asset_request);
+  expect(control_logic_response.status == 200, "driver control logic script did not load");
+  const auto control_assets = console_js_response.body + "\n" + control_logic_response.body;
+  expect(control_assets.find("async function send(extra={},announceUnavailable=true)") !=
+             std::string::npos,
+         "driver console page cannot distinguish background intent refresh from user control "
+         "attempts");
   expect(
-      response.body.find("async function send(extra={},announceUnavailable=true)") != std::string::npos,
-      "driver console page cannot distinguish background intent refresh from user control attempts");
-  expect(
-      response.body.find("function enqueueIntentRefresh()") != std::string::npos &&
-          response.body.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
+      control_assets.find("function enqueueIntentRefresh()") != std::string::npos &&
+          control_assets.find("pending = {extra: {}, announceUnavailable: false, waiters: []}") !=
               std::string::npos &&
-          response.body.find(
+          control_assets.find(
               "sendPendingControlProfile();const enqueued=enqueueIntentRefresh()") !=
               std::string::npos,
       "background intent refresh still announces a control fault while waiting for media");
-  expect(
-      response.body.find("webrtcLabel.textContent='等待车端媒体'") != std::string::npos,
-      "driver console page does not expose the pending vehicle-media state");
+  expect(control_assets.find("webrtcLabel.textContent='等待车端媒体'") != std::string::npos,
+         "driver console page does not expose the pending vehicle-media state");
 }
 
 void test_local_archive_uploader_is_atomic_and_resumable() {
@@ -3930,12 +4813,14 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
   {
     std::ofstream output(metadata);
     output << mine_teleop::Json({
-        {"vehicle_id", "vehicle-001"},
-        {"session_id", "session-001"},
-        {"camera_id", "front"},
-        {"segment_id", "segment-001"},
-        {"upload_state", "pending"},
-    }).dump();
+                                    {"vehicle_id", "vehicle-001"},
+                                    {"session_id", "session-001"},
+                                    {"camera_id", "front"},
+                                    {"segment_id", "segment-001"},
+                                    {"video_sha256", mine_teleop::sha256_file(video)},
+                                    {"upload_state", "pending"},
+                                })
+                  .dump();
   }
   mine_teleop::LocalArchiveUploader uploader(recordings, archive);
   const auto result = uploader.process_once();
@@ -3943,7 +4828,259 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
   expect(std::filesystem::is_regular_file(archive / result.object_path), "archived video is missing");
   expect(mine_teleop::sha256_file(video) == mine_teleop::sha256_file(archive / result.object_path), "archive hash mismatch");
   expect(uploader.process_once().action == "idle", "uploaded segment was processed twice");
+
+  const auto bad_metadata = segment_dir / "segment-000.json";
+  {
+    std::ofstream output(bad_metadata);
+    output << "{broken-json";
+  }
+  const auto healthy_video = segment_dir / "segment-002.mp4";
+  const auto healthy_metadata = segment_dir / "segment-002.json";
+  {
+    std::ofstream output(healthy_video, std::ios::binary);
+    output << "healthy-later-segment";
+  }
+  {
+    std::ofstream output(healthy_metadata);
+    output << mine_teleop::Json({
+                                    {"segment_id", "segment-002"},
+                                    {"video_file", healthy_video.filename().string()},
+                                    {"video_sha256", mine_teleop::sha256_file(healthy_video)},
+                                    {"upload_state", "pending"},
+                                })
+                  .dump();
+  }
+  const auto healthy_result = uploader.process_once();
+  expect(healthy_result.action == "uploaded" && healthy_result.segment_id == "segment-002" &&
+             healthy_result.deferred_failures == 1,
+         "bad earliest sidecar blocked a later healthy segment");
+  const auto retry_wait = uploader.process_once();
+  expect(retry_wait.action == "retry_wait" && retry_wait.retry_after_ms > 0,
+         "bad sidecar retry did not enter bounded backoff");
+
+  const auto tampered_video = segment_dir / "segment-003.mp4";
+  const auto tampered_metadata = segment_dir / "segment-003.json";
+  {
+    std::ofstream output(tampered_video, std::ios::binary);
+    output << "recorded-content";
+  }
+  const auto recorded_hash = mine_teleop::sha256_file(tampered_video);
+  {
+    std::ofstream output(tampered_metadata);
+    output << mine_teleop::Json({
+                                    {"segment_id", "segment-003"},
+                                    {"video_sha256", recorded_hash},
+                                    {"upload_state", "pending"},
+                                })
+                  .dump();
+  }
+  {
+    std::ofstream output(tampered_video, std::ios::binary | std::ios::trunc);
+    output << "tampered-content";
+  }
+  const auto tampered_result = uploader.process_once();
+  expect(tampered_result.action == "failed" &&
+             tampered_result.error.find("no longer matches") != std::string::npos,
+         "uploader accepted video content that no longer matched the recorded SHA-256");
+  expect(!std::filesystem::exists(archive / std::filesystem::relative(tampered_video, recordings)),
+         "checksum-mismatched video reached the archive");
+
+  // A late splitmux/filesink error replaces the sidecar with quarantined
+  // metadata and leaves a durable revocation marker.  The uploader must not
+  // treat an older pending sidecar as successful work while that hand-off is
+  // in flight.
+  std::filesystem::remove(bad_metadata);
+  std::filesystem::remove(tampered_metadata);
+  const auto revoked_video = segment_dir / "segment-004.mp4";
+  const auto revoked_metadata = segment_dir / "segment-004.json";
+  {
+    std::ofstream output(revoked_video, std::ios::binary);
+    output << "late-error-fragment";
+  }
+  {
+    std::ofstream output(revoked_metadata);
+    output << mine_teleop::Json({
+                                    {"segment_id", "segment-004"},
+                                    {"video_file", revoked_video.filename().string()},
+                                    {"video_sha256", mine_teleop::sha256_file(revoked_video)},
+                                    {"recording_revision", 4},
+                                    {"recording_state", "completed"},
+                                    {"upload_state", "pending"},
+                                })
+                  .dump();
+  }
+  {
+    std::ofstream output(revoked_metadata.string() + ".revoked");
+    output << R"({"failure":"late retired filesink error"})";
+  }
+  mine_teleop::LocalArchiveUploader revocation_uploader(recordings, archive);
+  expect(revocation_uploader.process_once().action == "idle",
+         "revoked recording fragment was retried instead of being skipped");
+  expect(!std::filesystem::exists(archive / std::filesystem::relative(revoked_video, recordings)),
+         "revoked recording fragment reached the successful archive");
+  expect(revocation_uploader.backlog().value("pending_segments", std::uint64_t{1}) == 0,
+         "revoked recording fragment remained visible in the uploader backlog");
+
+  const auto claimed_video = segment_dir / "segment-005.mp4";
+  const auto claimed_metadata = segment_dir / "segment-005.json";
+  {
+    std::ofstream output(claimed_video, std::ios::binary);
+    output << "claimed-finalized-fragment";
+  }
+  {
+    std::ofstream output(claimed_metadata);
+    output << mine_teleop::Json({
+                                    {"segment_id", "segment-005"},
+                                    {"video_file", claimed_video.filename().string()},
+                                    {"video_sha256", mine_teleop::sha256_file(claimed_video)},
+                                    {"recording_revision", 5},
+                                    {"recording_state", "completed"},
+                                    {"upload_state", "pending"},
+                                })
+                  .dump();
+  }
+  const auto claim_path = std::filesystem::path(claimed_metadata.string() + ".upload-claim");
+  expect(std::filesystem::create_directory(claim_path),
+         "test could not create an uploader claim fixture");
+  const auto deferred_claim = revocation_uploader.process_once();
+  expect(
+      deferred_claim.action == "retry_wait" &&
+          !std::filesystem::exists(archive / std::filesystem::relative(claimed_video, recordings)),
+      "active uploader claim did not prevent a duplicate archive copy");
+  std::filesystem::remove_all(claim_path);
+  expect(revocation_uploader.process_once().action == "uploaded",
+         "released uploader claim did not allow the completed fragment to archive");
+
+  const auto storage_root = root / "storage-policy";
+  std::filesystem::create_directories(storage_root);
+  const auto write_storage_segment = [&](std::string_view id, std::string_view state) {
+    const auto video_path = storage_root / (std::string(id) + ".mp4");
+    const auto metadata_path = storage_root / (std::string(id) + ".json");
+    {
+      std::ofstream output(video_path, std::ios::binary);
+      output << id;
+    }
+    {
+      std::ofstream output(metadata_path);
+      output << mine_teleop::Json({
+                                      {"segment_id", id},
+                                      {"video_file", video_path.filename().string()},
+                                      {"upload_state", state},
+                                  })
+                    .dump();
+    }
+    return std::pair{video_path, metadata_path};
+  };
+  const auto uploaded_storage = write_storage_segment("uploaded-old", "uploaded");
+  const auto pending_storage = write_storage_segment("pending-evidence", "pending");
+  const auto available_gb =
+      static_cast<double>(std::filesystem::space(storage_root).available) / 1'000'000'000.0;
+  mine_teleop::RecordingConfig storage_config;
+  storage_config.min_free_gb = available_gb + 1.0;
+  storage_config.delete_uploaded_when_below_free_gb = available_gb + 0.5;
+  storage_config.delete_unuploaded_when_below_free_gb = false;
+  const auto uploaded_cleanup =
+      mine_teleop::enforce_recording_storage_policy(storage_root, storage_config);
+  expect(uploaded_cleanup.removed_uploaded_segments == 1 &&
+             !std::filesystem::exists(uploaded_storage.first) &&
+             !std::filesystem::exists(uploaded_storage.second),
+         "low-space policy did not remove an already archived segment first");
+  expect(std::filesystem::exists(pending_storage.first) &&
+             std::filesystem::exists(pending_storage.second) &&
+             uploaded_cleanup.removed_unuploaded_segments == 0 &&
+             !uploaded_cleanup.recording_allowed,
+         "default low-space policy deleted pending recording evidence");
+  storage_config.delete_unuploaded_when_below_free_gb = true;
+  const auto explicit_unuploaded_cleanup =
+      mine_teleop::enforce_recording_storage_policy(storage_root, storage_config);
+  expect(explicit_unuploaded_cleanup.removed_unuploaded_segments == 1 &&
+             !std::filesystem::exists(pending_storage.first) &&
+             !std::filesystem::exists(pending_storage.second),
+         "explicit unuploaded cleanup policy did not remove pending evidence");
   std::filesystem::remove_all(root);
+}
+
+void test_local_archive_uploader_rejects_outside_links() {
+#if defined(_WIN32)
+  // Windows symlink creation can require a host policy or developer-mode
+  // privilege.  The production path check remains cross-platform; the
+  // deterministic symlink fixtures run on POSIX CI.
+  return;
+#else
+  const auto root = std::filesystem::path("/tmp") /
+                    ("mine-teleop-upload-link-boundary-" + mine_teleop::random_token(6));
+  std::error_code error;
+  const auto cleanup = [&] {
+    error.clear();
+    std::filesystem::remove_all(root, error);
+  };
+  try {
+    const auto recordings = root / "recordings";
+    const auto archive = root / "archive";
+    const auto segment_dir = recordings / "vehicle-001" / "session-001" / "front";
+    // This sibling intentionally shares the recording root's text prefix.
+    // A lexical starts_with check would be unsafe here.
+    const auto outside_same_prefix = root / "recordings-outside";
+    std::filesystem::create_directories(segment_dir);
+    std::filesystem::create_directories(outside_same_prefix);
+    const auto outside_video = outside_same_prefix / "outside.mp4";
+    {
+      std::ofstream output(outside_video, std::ios::binary);
+      output << "outside-recording-content";
+    }
+    const auto escaping_video = segment_dir / "escape.mp4";
+    std::filesystem::create_symlink(outside_video, escaping_video, error);
+    expect(!error, "could not create static archive-escape symlink fixture");
+    const auto escaping_metadata = segment_dir / "escape.json";
+    {
+      std::ofstream output(escaping_metadata);
+      output << mine_teleop::Json({
+                                      {"segment_id", "escape"},
+                                      {"video_file", escaping_video.filename().string()},
+                                      {"video_sha256", mine_teleop::sha256_file(outside_video)},
+                                      {"upload_state", "pending"},
+                                  })
+                    .dump();
+    }
+    mine_teleop::LocalArchiveUploader escaping_uploader(recordings, archive);
+    const auto escaped_result = escaping_uploader.process_once();
+    expect(escaped_result.action == "failed" &&
+               escaped_result.error.find("regular non-symlink file") != std::string::npos,
+           "outside static symlink was not rejected as a plain recording file");
+    expect(!std::filesystem::exists(archive),
+           "outside static symlink created an archive object outside the configured root");
+
+    const auto broken_recordings = root / "broken-recordings";
+    const auto broken_archive = root / "broken-archive";
+    const auto broken_segment_dir = broken_recordings / "vehicle-001" / "session-001" / "front";
+    std::filesystem::create_directories(broken_segment_dir);
+    const auto broken_video = broken_segment_dir / "broken.mp4";
+    std::filesystem::create_symlink(root / "missing-recording.mp4", broken_video, error);
+    expect(!error, "could not create broken recording symlink fixture");
+    const auto broken_metadata = broken_segment_dir / "broken.json";
+    {
+      std::ofstream output(broken_metadata);
+      output << mine_teleop::Json({
+                                      {"segment_id", "broken"},
+                                      {"video_file", broken_video.filename().string()},
+                                      {"video_sha256", std::string(64, '0')},
+                                      {"upload_state", "pending"},
+                                  })
+                    .dump();
+    }
+    mine_teleop::LocalArchiveUploader broken_uploader(broken_recordings, broken_archive);
+    const auto broken_result = broken_uploader.process_once();
+    expect(broken_result.action == "failed" &&
+               broken_result.error.find("regular non-symlink file") != std::string::npos,
+           "broken recording symlink was not rejected before archive copy");
+    expect(!std::filesystem::exists(broken_archive),
+           "broken recording symlink created an archive object");
+  } catch (...) {
+    cleanup();
+    throw;
+  }
+  cleanup();
+#endif
 }
 
 }  // namespace
@@ -3951,54 +5088,100 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"config_loads_current_vehicle_yaml", test_config_loads_current_vehicle_yaml},
-      {"vehicle_config_rejects_unimplemented_control_safety_options", test_vehicle_config_rejects_unimplemented_control_safety_options},
-      {"vehicle_config_validates_full_scale_motor_torque", test_vehicle_config_validates_full_scale_motor_torque},
-      {"vehicle_config_requires_physical_brake_pressure_units", test_vehicle_config_requires_physical_brake_pressure_units},
-      {"vehicle_config_requires_monotonic_final_full_safety_brake", test_vehicle_config_requires_monotonic_final_full_safety_brake},
-      {"vehicle_config_validates_local_speed_pid_safety_fields", test_vehicle_config_validates_local_speed_pid_safety_fields},
-      {"vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries", test_vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries},
-      {"control_enabled_vehicle_requires_an_enabled_critical_camera", test_control_enabled_vehicle_requires_an_enabled_critical_camera},
-      {"camera_failure_decision_is_bounded_and_fail_closed", test_camera_failure_decision_is_bounded_and_fail_closed},
+      {"vehicle_config_rejects_unsupported_upload_semantics",
+       test_vehicle_config_rejects_unsupported_upload_semantics},
+      {"vehicle_config_rejects_unimplemented_control_safety_options",
+       test_vehicle_config_rejects_unimplemented_control_safety_options},
+      {"vehicle_config_validates_full_scale_motor_torque",
+       test_vehicle_config_validates_full_scale_motor_torque},
+      {"vehicle_config_requires_physical_brake_pressure_units",
+       test_vehicle_config_requires_physical_brake_pressure_units},
+      {"vehicle_config_requires_monotonic_final_full_safety_brake",
+       test_vehicle_config_requires_monotonic_final_full_safety_brake},
+      {"vehicle_config_validates_local_speed_pid_safety_fields",
+       test_vehicle_config_validates_local_speed_pid_safety_fields},
+      {"vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries",
+       test_vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries},
+      {"control_enabled_vehicle_requires_an_enabled_critical_camera",
+       test_control_enabled_vehicle_requires_an_enabled_critical_camera},
+      {"camera_failure_decision_is_bounded_and_fail_closed",
+       test_camera_failure_decision_is_bounded_and_fail_closed},
       {"camera_source_classification_is_canonical", test_camera_source_classification_is_canonical},
-      {"camera_input_spec_is_explicit_for_ccg2_and_legacy_safe", test_camera_input_spec_is_explicit_for_ccg2_and_legacy_safe},
-      {"camera_backend_config_rejects_unknown_and_invalid_ccg2_modes", test_camera_backend_config_rejects_unknown_and_invalid_ccg2_modes},
-      {"ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames", test_ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames},
-      {"camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2", test_camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2},
-      {"camera_input_pipeline_resamples_only_mismatched_ccg2_fps", test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps},
-      {"ccg2_camera_input_pipeline_is_gstreamer_parseable", test_ccg2_camera_input_pipeline_is_gstreamer_parseable},
-      {"v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap", test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap},
-      {"camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults", test_camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults},
-      {"ccg2_example_config_defines_two_explicit_capture_lanes", test_ccg2_example_config_defines_two_explicit_capture_lanes},
+      {"camera_input_spec_is_explicit_for_ccg2_and_legacy_safe",
+       test_camera_input_spec_is_explicit_for_ccg2_and_legacy_safe},
+      {"camera_backend_config_rejects_unknown_and_invalid_ccg2_modes",
+       test_camera_backend_config_rejects_unknown_and_invalid_ccg2_modes},
+      {"ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames",
+       test_ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames},
+      {"camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2",
+       test_camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2},
+      {"camera_input_pipeline_resamples_only_mismatched_ccg2_fps",
+       test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps},
+      {"ccg2_camera_input_pipeline_is_gstreamer_parseable",
+       test_ccg2_camera_input_pipeline_is_gstreamer_parseable},
+      {"recording_fragment_state_fails_closed_and_survives_detach",
+       test_recording_fragment_state_fails_closed_and_survives_detach},
+      {"v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap",
+       test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap},
+      {"camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults",
+       test_camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults},
+      {"ccg2_example_config_defines_two_explicit_capture_lanes",
+       test_ccg2_example_config_defines_two_explicit_capture_lanes},
       {"missing_v4l2_path_remains_retryable", test_missing_v4l2_path_remains_retryable},
-      {"media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes", test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes},
-      {"critical_camera_control_latch_persists_until_a_new_session", test_critical_camera_control_latch_persists_until_a_new_session},
-      {"media_signaling_error_classification_supports_structured_and_legacy_conflicts", test_media_signaling_error_classification_supports_structured_and_legacy_conflicts},
-      {"vehicle_config_validates_chassis_control_speed_range", test_vehicle_config_validates_chassis_control_speed_range},
-      {"dynamic_adapter_target_speed_uses_configured_ceiling", test_dynamic_adapter_target_speed_uses_configured_ceiling},
+      {"media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes",
+       test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes},
+      {"critical_camera_control_latch_persists_until_a_new_session",
+       test_critical_camera_control_latch_persists_until_a_new_session},
+      {"media_signaling_error_classification_supports_structured_and_legacy_conflicts",
+       test_media_signaling_error_classification_supports_structured_and_legacy_conflicts},
+      {"vehicle_config_validates_chassis_control_speed_range",
+       test_vehicle_config_validates_chassis_control_speed_range},
+      {"dynamic_adapter_target_speed_uses_configured_ceiling",
+       test_dynamic_adapter_target_speed_uses_configured_ceiling},
       {"dynamic_adapter_brake_overrides_throttle", test_dynamic_adapter_brake_overrides_throttle},
-      {"bench_config_drives_unified_vehicle_runtime", test_bench_config_drives_unified_vehicle_runtime},
-      {"field_config_pins_tls_route_without_system_dns", test_field_config_pins_tls_route_without_system_dns},
-      {"control_command_json_round_trip_and_validation", test_control_command_json_round_trip_and_validation},
-      {"session_control_profile_json_round_trip_and_physical_units", test_session_control_profile_json_round_trip_and_physical_units},
-      {"shared_protocol_v1_vectors_and_session_states", test_shared_protocol_v1_vectors_and_session_states},
-      {"control_receiver_enforces_token_sequence_and_gap", test_control_receiver_enforces_token_sequence_and_gap},
+      {"dynamic_adapter_safe_stop_reads_v2_result_and_preserves_emergency_path",
+       test_dynamic_adapter_safe_stop_reads_v2_result_and_preserves_emergency_path},
+      {"bench_config_drives_unified_vehicle_runtime",
+       test_bench_config_drives_unified_vehicle_runtime},
+      {"field_config_pins_tls_route_without_system_dns",
+       test_field_config_pins_tls_route_without_system_dns},
+      {"curl_tls_trust_policy_is_explicit_and_protects_ca_bundles",
+       test_curl_tls_trust_policy_is_explicit_and_protects_ca_bundles},
+      {"curl_ca_info_path_owns_narrow_utf8_storage",
+       test_curl_ca_info_path_owns_narrow_utf8_storage},
+      {"curl_tls_option_failures_are_reported", test_curl_tls_option_failures_are_reported},
+      {"control_command_json_round_trip_and_validation",
+       test_control_command_json_round_trip_and_validation},
+      {"session_control_profile_json_round_trip_and_physical_units",
+       test_session_control_profile_json_round_trip_and_physical_units},
+      {"shared_protocol_v1_vectors_and_session_states",
+       test_shared_protocol_v1_vectors_and_session_states},
+      {"control_receiver_enforces_token_sequence_and_gap",
+       test_control_receiver_enforces_token_sequence_and_gap},
       {"mailbox_keeps_only_latest_command", test_mailbox_keeps_only_latest_command},
       {"native_control_intent_lease_neutralizes_without_replay",
        test_native_control_intent_lease_neutralizes_without_replay},
       {"native_control_intent_is_latest_only_and_estop_sticky",
        test_native_control_intent_is_latest_only_and_estop_sticky},
       {"safety_timeout_profile_and_estop_latch", test_safety_timeout_profile_and_estop_latch},
-      {"session_control_profile_ack_sequence_limits_and_clear", test_session_control_profile_ack_sequence_limits_and_clear},
-      {"session_control_profile_uses_independent_two_second_age_window", test_session_control_profile_uses_independent_two_second_age_window},
-      {"real_adapter_profile_changes_require_parking_and_apply_before_ack", test_real_adapter_profile_changes_require_parking_and_apply_before_ack},
+      {"control_clock_domains_and_explicit_recovery",
+       test_control_clock_domains_and_explicit_recovery},
+      {"session_control_profile_ack_sequence_limits_and_clear",
+       test_session_control_profile_ack_sequence_limits_and_clear},
+      {"session_control_profile_uses_independent_two_second_age_window",
+       test_session_control_profile_uses_independent_two_second_age_window},
+      {"real_adapter_profile_changes_require_parking_and_apply_before_ack",
+       test_real_adapter_profile_changes_require_parking_and_apply_before_ack},
       {"control_service_commits_only_successfully_applied_commands",
        test_control_service_commits_only_successfully_applied_commands},
-      {"control_service_reports_safe_stop_output_after_timeout", test_control_service_reports_safe_stop_output_after_timeout},
+      {"control_service_reports_safe_stop_output_after_timeout",
+       test_control_service_reports_safe_stop_output_after_timeout},
       {"control_service_recovers_from_degraded_command_gap_without_profile_reapply",
        test_control_service_recovers_from_degraded_command_gap_without_profile_reapply},
       {"control_service_receive_path_cannot_bypass_hard_timeout",
        test_control_service_receive_path_cannot_bypass_hard_timeout},
-      {"control_service_preserves_physical_brake_across_degraded_timeout", test_control_service_preserves_physical_brake_across_degraded_timeout},
+      {"control_service_preserves_physical_brake_across_degraded_timeout",
+       test_control_service_preserves_physical_brake_across_degraded_timeout},
       {"control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshake",
        test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshake},
       {"adapter_handshake_does_not_clear_outer_estop_or_fault",
@@ -4007,24 +5190,39 @@ int main() {
        test_reset_estop_rejects_unreadable_disarming_and_hard_adapter_stops},
       {"reset_estop_clears_soft_stop_before_fresh_control",
        test_reset_estop_clears_soft_stop_before_fresh_control},
-      {"control_service_applies_vehicle_hard_limits", test_control_service_applies_vehicle_hard_limits},
-      {"control_service_applies_session_steering_limit", test_control_service_applies_session_steering_limit},
+      {"control_service_applies_vehicle_hard_limits",
+       test_control_service_applies_vehicle_hard_limits},
+      {"control_service_applies_session_steering_limit",
+       test_control_service_applies_session_steering_limit},
       {"control_service_bounds_telemetry_history", test_control_service_bounds_telemetry_history},
       {"control_service_close_preserves_stop_provenance",
        test_control_service_close_preserves_stop_provenance},
-      {"control_service_requires_feedback_before_actuation_but_allows_estop", test_control_service_requires_feedback_before_actuation_but_allows_estop},
+      {"control_service_requires_feedback_before_actuation_but_allows_estop",
+       test_control_service_requires_feedback_before_actuation_but_allows_estop},
       {"fault_output_fails_safe", test_fault_output_fails_safe},
       {"native_signaling_webrtc_message_isolation", test_native_signaling_webrtc_message_isolation},
-      {"signaling_presence_generation_and_automatic_release", test_signaling_presence_generation_and_automatic_release},
+      {"signaling_presence_generation_and_automatic_release",
+       test_signaling_presence_generation_and_automatic_release},
       {"signaling_time_sync_common_domain", test_signaling_time_sync_common_domain},
-      {"driver_config_and_hardware_encoder_priority", test_driver_config_and_hardware_encoder_priority},
-      {"nvenc_pipeline_stage_tracks_gstreamer_property_compatibility", test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility},
-      {"native_testsrc_acquisition_does_not_spawn_ffmpeg", test_native_testsrc_acquisition_does_not_spawn_ffmpeg},
+      {"driver_config_and_hardware_encoder_priority",
+       test_driver_config_and_hardware_encoder_priority},
+      {"nvenc_pipeline_stage_tracks_gstreamer_property_compatibility",
+       test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility},
+      {"native_testsrc_acquisition_does_not_spawn_ffmpeg",
+       test_native_testsrc_acquisition_does_not_spawn_ffmpeg},
       {"basler_camera_uses_minimal_aravis_bridge", test_basler_camera_uses_minimal_aravis_bridge},
-      {"native_driver_to_vehicle_signaling_control_payload", test_native_driver_to_vehicle_signaling_control_payload},
-      {"driver_console_page_keeps_waiting_state_during_background_intent_refresh", test_driver_console_page_keeps_waiting_state_during_background_intent_refresh},
-      {"driver_login_lists_only_authorized_vehicles", test_driver_login_lists_only_authorized_vehicles},
-      {"local_archive_uploader_is_atomic_and_resumable", test_local_archive_uploader_is_atomic_and_resumable},
+      {"native_driver_to_vehicle_signaling_control_payload",
+       test_native_driver_to_vehicle_signaling_control_payload},
+      {"driver_console_page_keeps_waiting_state_during_background_intent_refresh",
+       test_driver_console_page_keeps_waiting_state_during_background_intent_refresh},
+      {"driver_login_lists_only_authorized_vehicles",
+       test_driver_login_lists_only_authorized_vehicles},
+      {"local_archive_uploader_is_atomic_and_resumable",
+       test_local_archive_uploader_is_atomic_and_resumable},
+      {"local_archive_uploader_rejects_outside_links",
+       test_local_archive_uploader_rejects_outside_links},
+      {"async_splitmux_late_sink_error_keeps_live_branch_running",
+       test_async_splitmux_late_sink_error_keeps_live_branch_running},
   };
   int failures = 0;
   for (const auto& [name, test] : tests) {

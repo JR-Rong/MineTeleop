@@ -20,8 +20,8 @@
 `stop_sequence`。控制服务对页面暴露的 `stop_source` 为 `page_disconnect`、
 `page_request`、`session_loss`、`watchdog`、`software_fault`、
 `physical_estop` 或 `unknown`；`stop_reason` 给出更精确的原因，例如
-`vcu_handshake_disconnect`、`feedback_timeout`、`handshake_revoked` 或
-`physical_emergency_switch`。关键摄像头和媒体管线故障分别使用
+`vcu_handshake_disconnect`、`feedback_timeout`、`vcu_transition_timeout`、
+`handshake_revoked` 或 `physical_emergency_switch`。关键摄像头和媒体管线故障分别使用
 `software_fault/critical_camera_failed` 与
 `software_fault/media_pipeline_failed`，不会再被普通会话关闭覆盖成
 `session_loss/session_lost`。`stop_sequence` 在新的根因被锁存时递增。VCU
@@ -37,6 +37,19 @@ JSONL 中的原始 bridge 来源名为 `driver_page`、`session`、`watchdog`、
 因此是 `.log` 而不是严格 JSONL；默认单文件 64 MiB、保留 5 份，可分别通过
 `MINE_TELEOP_VEHICLE_RUNTIME_LOG_MAX_BYTES` 和
 `MINE_TELEOP_VEHICLE_RUNTIME_LOG_ROTATIONS` 覆盖。
+
+媒体 runtime 自己产生的结构化诊断统一经私有 `DiagnosticEmitter` 写 stdout：队列最多
+256 条、单条最多 3072 bytes，生产者用 try-lock，满载或序列化失败会丢弃而不会等待
+stdout。stdout sink 不改变进程级 `O_NONBLOCK`；在打包 launcher 的 stdout pipe 上，每条
+在一个不超过 `PIPE_BUF` 的 write 中写入，并以 100 ms poll deadline 失败/丢弃，避免半条
+JSONL。`vehicle_media_webrtc_summary`
+的 `diagnostic_output` 给出 enqueue/emitted/dropped、oversized、sink timeout/failure 和
+shutdown timeout 计数。这个 sink 是媒体 runtime 内部唯一的结构化 stdout writer；启动器
+父进程的有限生命周期事件仍是独立进程，pipe 的 `PIPE_BUF` 原子边界保持两者不交错。
+关闭时先停止接收和 trace 生产者，等待配置的 drain window，随后请求取消并 join emitter；
+没有 detach。该有界承诺只适用于会及时响应 `stop_token` 的内部 sink；非协作自定义 sink
+不受支持，不能作为可恢复的生产路径。R17 的 splitmux async-finalize、bus drain 与孤立
+fragment quarantine 仍在原有的 GStreamer teardown 之后执行，未改变录像完成/隔离时序。
 例外：可识别的 vendor ChassisControl 输出只保留在终端，**不写入该落盘日志**：包括
 `UpdateVehicleState` wrapper 每个控制周期打印的完整裸行，以及 vendor `log_printf` 的
 `[YYYY-MM-DD HH:MM:SS.mmm] [级别] [pid] [tag]` 格式行（可带 ANSI 颜色）。过滤按完整
@@ -155,7 +168,7 @@ CCG2 的 `vehicle_camera_first_frame`、`vehicle_camera_failed` 和 lane metrics
 | `vehicle_camera_reopen_scheduled` / `camera_lane_reopen_scheduled` | 故障可重试且累计失败次数未超过 `reopen_attempts` | 只销毁并重开故障采集源，其他 lane 不重建；关键相机的控制锁止保持不变 |
 | `vehicle_camera_recovered` / `camera_lane_recovered` | 重开后的第一帧到达 | 视频恢复；若为关键相机，同一云端 session 的控制锁止保持不变，不能把该事件当作恢复驾驶权限 |
 | `vehicle_camera_lane_disabled` / `camera_reopen_exhausted` | 不可重试或重开额度耗尽 | 关键 lane 禁用且继续保持停车；非关键 lane 只结束自身视频，其他 lane 与当前控制继续 |
-| `vehicle_control_inhibited_by_camera` / `critical_camera_control_inhibited` | 关键相机首次确认失败 | 保持车辆停止并关闭 profile/VCU/status DataChannel；必须结束当前 session，在新 session 重建该 DataChannel、control-only WSS 并重新完成 VCU 握手 |
+| `vehicle_control_inhibited_by_camera` / `critical_camera_control_inhibited` | 关键相机首次确认失败，或最后编码帧超过 `media_frame_timeout_ms` | 每条原生控制命令在本地准入前独立检查编码 freshness，不依赖可能阻塞的主信令循环；超时即保持车辆停止并关闭 profile/VCU/status DataChannel，同一 session 的 control-only WSS 命令继续被锁存拒绝；必须结束当前 session，在新 session 重建该 DataChannel、control-only WSS 并重新完成 VCU 握手 |
 | `vehicle_control_inhibition_retained` / `critical_camera_control_inhibition_retained` | 媒体 service 在同一云端 session 内重建 runtime | 继续拒绝控制并保留视频能力；结束当前 session 后才能在新 session 重新握手 |
 | `vehicle_control_inhibition_latch_failed` / `critical_camera_control_latch_failed` | 内部 session 作用域不一致，无法更新共享锁存 | runtime-local 锁存仍立即安全停车；保持物理隔离并结束当前 session，禁止继续驾驶 |
 
@@ -208,7 +221,14 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `vehicle_media_connection_stale` / `vehicle_connection_generation_stale` | HTTP 409 `vehicle_connection_generation_stale` | `server_issue_code`, `safety_action=local_full_stop` | 非自动重试，进程 fail-closed |
 | `vehicle_media_signaling_sequence_conflict` / `signaling_sequence_conflict` | HTTP 409 `signaling_sequence_older` 或 `signaling_sequence_reused` | `server_issue_code`, `safety_action=local_full_stop` | 非自动重试，进程 fail-closed |
 | `vehicle_media_signaling_conflict` / `unclassified_signaling_conflict` | 其他无法安全分类的 HTTP 409 | `server_issue_code`, `safety_action=local_full_stop` | 非自动重试，进程 fail-closed |
-| `vehicle_recording_sidecar_failed` / `recording_sidecar_write_failed` | 录像 sidecar 创建/rename 失败 | `error` | 每次 finalize 失败 |
+| `vehicle_recording_retention_cleanup` / `recording_low_space_cleanup` | 录像盘低水位并按策略删除旧片段 | available/required bytes、已上传/未上传删除数 | 每次实际清理 |
+| `vehicle_recording_suspended` / `recording_low_space` | 允许的清理后仍低于 `min_free_gb`，录像 valve 暂停；实时视频与控制继续 | storage、`recording_paused_live_media_and_control_continue` | 状态转为暂停时一次 |
+| `vehicle_recording_resumed` / `recording_space_recovered` | 可用空间恢复，录像 valve 恢复 | storage | 状态转为恢复时一次 |
+| `vehicle_recording_suspended` / `recording_space_check_failed` | 空间查询/目录扫描失败，录像保守暂停 | `error`、`recording_paused_live_media_and_control_continue` | 首次变化或强制检查 |
+| `vehicle_recording_suspended` / `recording_pipeline_error` | splitmux/muxer/filesink 分支报错，禁用录像但不升级成全媒体故障 | `error`、`recording_disabled_live_media_and_control_continue` | 每个 recorder bus error |
+| `vehicle_recording_sidecar_failed` / `recording_fragment_sidecar_write_failed` | 已完成片段的 sidecar 哈希或原子写入失败 | `error`、`recording_degraded_live_media_and_control_continue` | 每次 fragment-closed 失败 |
+| `vehicle_recording_sidecar_failed` / `recording_sidecar_write_failed` | 停流时孤立片段隔离 sidecar 创建失败 | `error` | 每次 finalize 失败 |
+| `vehicle_recording_recovery_failed` / `recording_orphan_recovery_failed` | 启动扫描孤立 MP4 失败；无 sidecar 的文件不进入上传 | `error`、`recording_degraded_live_media_and_control_continue` | 每次 session 恢复扫描失败 |
 | `vehicle_camera_performance_failed` / `camera_encoded_fps_below_minimum` | 任一路编码 FPS 低于阈值 | camera/FPS/frame counts | 每次 summary |
 | `vehicle_camera_performance_warning` / `camera_capture_to_encode_latency_high` | capture→encode 峰值超过预算 | camera/latency/budget | 每次 summary |
 
@@ -286,8 +306,9 @@ stale 非零丢弃和严格零值 stale heartbeat 接受/拒绝计数；
 | `can_error_or_rtr_frame_ignored` / `can_error_or_rtr_frame_received` | 收到 CAN error/RTR frame | 每秒聚合；查 bus-off/error counter |
 | `can_rx_ignored_summary` / `can_rx_unrecognized_or_invalid` | JYR010 decoder 不识别或 DLC 不合法 | 每秒聚合 count/last ID |
 | `vmc_fault_code_changed` / `vcu_vmc_fault_code_changed` | `0x18F2F5D0` 中 `WVCU_VMCFltCode` 首次可用或发生变化 | `previous_valid`、`previous_vmc_fault_code`、`vmc_fault_code`；非零时按整车厂故障码表排查，本事件本身不自动触发停车 |
-| `feedback_timeout` / `vcu_critical_feedback_timeout` | Ready 后 29 个关键 ID 任一超过 500 ms | `stale_ids` 与逐 ID `age_ms`；锁存故障并全停 |
+| `feedback_timeout` / `vcu_critical_feedback_timeout` | Ready 后 29 个关键 ID 任一超过 500 ms | `stale_ids` 与逐 ID `age_ms`；以 `watchdog/feedback_timeout` 锁存故障并全停 |
 | `arming_feedback_timeout` / `vcu_arming_feedback_timeout` | 握手某阶段必需反馈未在 500 ms 入口宽限内保持新鲜 | 全停并记录当前 `state`、`stale_ids` 和逐 ID `age_ms`；先断开完成 `Disarmed`，再从页面重新连接 |
+| `transition_timeout` / `vcu_transition_timeout` | 某个握手或分步退出阶段的反馈持续新鲜、但在该状态 transition epoch 的单调 deadline 内始终未达到目标 | 以 `watchdog/vcu_transition_timeout`（而非 freshness 的 `watchdog/feedback_timeout`）锁存，记录 `state`、`state_transition_epoch`、`state_entry_generation`、`elapsed_ms`/`limit_ms`、`expected`、`observed`、`missing_or_mismatched` 和停车来源；撤销牵引/profile 后复用零扭矩、停稳、N、EPB 驻车、人工状态的分步退出，绝不因未知车速跳过停稳换挡 |
 | `can_send_failed` / `socketcan_send_failed` | 连续 3 个 TX 周期有发送失败 | errno、失败 ID；锁存故障并全停 |
 | `tx_deadline_miss` / `vcu_tx_deadline_missed` | 20 ms 调度 deadline 落后 | 每秒至多一次，含 `lag_ms` |
 | `io_thread_exception` / `vcu_io_thread_exception` | I/O 线程标准异常 | 原始 exception；本地全停 |
@@ -308,6 +329,7 @@ stale 非零丢弃和严格零值 stale heartbeat 接受/拒绝计数；
 | `parallel_handshake_rejected` / `vcu_handshake_gate_rejected` | N/零速/电子驻车/manual state/新鲜度任一不满足 | 日志记录全部 gate 值 |
 | `parallel_handshake_requested` / `vcu_handshake_requested` | 请求被接受 | 仍停车直至 Ready |
 | `arming_feedback_timeout_recovered` / `vcu_arming_feedback_timeout_recovered` | 上一次握手阶段反馈超时，用户完成断开且车辆回到 `Disarmed` 后，新鲜驻车 gate 通过并接受新页面握手请求 | 清除仅属于该握手超时的 I/O 锁存，继续停车直至新握手 Ready；其他 I/O 故障不借此清除 |
+| `transition_timeout_recovered` / `vcu_transition_timeout_recovered` | 阶段 deadline 后完成 `Disarmed`、新鲜 N/零速/EPB 驻车/manual gate 通过，并由用户显式重新下发当前 runtime profile | 只清除该阶段超时锁存，仍保持停车；必须继续由页面显式请求新握手，旧输入或随后重复反馈不能自动恢复牵引 |
 | `handshake_revoked` / `vcu_handshake_revoked` | 握手状态 5 已被接受，但在驻车释放/挡位/执行器准备或 Ready 阶段收到新的状态 3；同批后续状态 5 不清除锁存 | 立即撤销握手请求并安全退出；记录 `revoked_handshake_status`、`vmc_fault_code`、四路 EPB、`parking_brake_switch`、`brake_pedal_switch` 及停车来源，必须在页面重新申请握手 |
 | `vehicle_vcu_handshake_state_changed` / `vcu_handshake_state_changed` | browser 可见握手状态变化 | stdout 只在状态变化时输出 |
 | `control_apply_rejected` / `vcu_control_runtime_unavailable` | runtime/I/O fault 阻止控制 | 本地全停 |
@@ -332,6 +354,7 @@ stale 非零丢弃和严格零值 stale heartbeat 接受/拒绝计数；
 | `emergency_stop_rejected` / `vcu_emergency_stop_runtime_unavailable` | bridge 已停止，软件急停无法下发 | 必须使用独立硬件安全路径 |
 | `parallel_handshake_disconnect_requested` / `vcu_disarm_requested` | 主动断开 | 零扭矩、N、EPB、清握手 |
 | `disarm_complete` / `vcu_disarm_complete` | 反向握手完成 | 全停已确认 |
+| `disarm_transport_stopped` / `vcu_disarm_transport_stopped` | 等待反向握手时 bridge I/O 已停止，未获得 controller disarmed 确认 | 不得记录为安全停车完成；保持隔离、检查 CAN/I/O 日志并使用独立硬件安全路径 |
 | `disarm_timeout` / `vcu_disarm_timeout` | 15 秒内未完成反向握手 | 保持隔离并使用硬件安全路径 |
 | `vehicle_vcu_safe_stop_failed` / `vcu_safe_stop_or_close_failed` | adapter close/safe stop 抛错 | 保持隔离，禁止仅凭软件判断安全 |
 

@@ -1,0 +1,18 @@
+# This is intentionally a small, actionable starter set. The incremental
+# checker runs it only on changed translation units with an explicit
+# compile_commands.json and never supplies --fix.
+Checks: >
+  -*,
+  bugprone-assert-side-effect,
+  bugprone-branch-clone,
+  bugprone-copy-constructor-init,
+  bugprone-infinite-loop,
+  bugprone-macro-parentheses,
+  bugprone-suspicious-memory-comparison,
+  performance-inefficient-string-concatenation,
+  performance-unnecessary-copy-initialization,
+  performance-unnecessary-value-param,
+  readability-container-size-empty
+WarningsAsErrors: ''
+HeaderFilterRegex: '(^|.*/)(cpp/(apps|include|src|tests)|deployments/chassis-control-bridge)/'
+FormatStyle: file

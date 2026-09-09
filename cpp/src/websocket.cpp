@@ -530,14 +530,13 @@ WebSocketReceiveResult ServerWebSocketConnection::receive_json(std::chrono::mill
 struct WebSocketClient::Impl {
   CURL* curl{nullptr};
   curl_slist* resolve_entries{nullptr};
-  std::filesystem::path ca_bundle;
   curl_socket_t socket{CURL_SOCKET_BAD};
   std::string buffered;
   std::size_t max_message_bytes{8 * 1024 * 1024};
   bool peer_closed{false};
+  std::optional<std::chrono::steady_clock::time_point> frame_started_at;
 
-  Impl(const std::vector<std::string>& entries, std::filesystem::path next_ca_bundle)
-      : ca_bundle(std::move(next_ca_bundle)) {
+  explicit Impl(const std::vector<std::string>& entries) {
     try {
       for (const auto& entry : entries) {
         if (entry.empty() || entry.find_first_of("\r\n") != std::string::npos) {
@@ -612,6 +611,40 @@ struct WebSocketClient::Impl {
     return true;
   }
 
+  bool ensure_frame_bytes(std::size_t size, std::chrono::steady_clock::time_point poll_deadline) {
+    if (!buffered.empty() && !frame_started_at.has_value()) {
+      frame_started_at = std::chrono::steady_clock::now();
+    }
+    while (buffered.size() < size) {
+      const auto now = std::chrono::steady_clock::now();
+      const auto assembly_deadline = frame_started_at.has_value()
+                                         ? *frame_started_at + kWebSocketFrameAssemblyTimeout
+                                         : poll_deadline;
+      if (frame_started_at.has_value() && now >= assembly_deadline) {
+        throw std::runtime_error("incomplete websocket frame");
+      }
+      if (!read_more(std::min(poll_deadline, assembly_deadline))) {
+        if (peer_closed && !buffered.empty()) {
+          throw std::runtime_error("incomplete websocket frame");
+        }
+        if (frame_started_at.has_value() && std::chrono::steady_clock::now() >= assembly_deadline) {
+          throw std::runtime_error("incomplete websocket frame");
+        }
+        return false;
+      }
+      if (!frame_started_at.has_value())
+        frame_started_at = std::chrono::steady_clock::now();
+    }
+    return true;
+  }
+
+  void consume_frame(std::size_t size) {
+    buffered.erase(0, size);
+    frame_started_at = buffered.empty() ? std::optional<std::chrono::steady_clock::time_point>{}
+                                        : std::optional<std::chrono::steady_clock::time_point>{
+                                              std::chrono::steady_clock::now()};
+  }
+
   void send_frame(std::uint8_t opcode, std::string_view payload, std::chrono::milliseconds timeout) {
     std::array<unsigned char, 4> mask{};
     random_bytes(mask.data(), mask.size());
@@ -638,19 +671,24 @@ struct WebSocketClient::Impl {
 };
 
 WebSocketClient::WebSocketClient(std::chrono::milliseconds timeout)
-    : WebSocketClient(timeout, {}, {}) {}
+    : WebSocketClient(timeout, {}, CurlTlsTrustPolicy::system()) {}
 
-WebSocketClient::WebSocketClient(
-    std::chrono::milliseconds timeout,
-    std::vector<std::string> resolve_entries,
-    std::filesystem::path ca_bundle)
+WebSocketClient::WebSocketClient(std::chrono::milliseconds timeout,
+                                 std::vector<std::string> resolve_entries,
+                                 std::filesystem::path ca_bundle)
+    : WebSocketClient(timeout, std::move(resolve_entries),
+                      CurlTlsTrustPolicy::from_optional_ca_bundle(std::move(ca_bundle))) {}
+
+WebSocketClient::WebSocketClient(std::chrono::milliseconds timeout,
+                                 std::vector<std::string> resolve_entries,
+                                 CurlTlsTrustPolicy tls_trust_policy)
     : resolve_entries_(std::move(resolve_entries)),
-      ca_bundle_(std::move(ca_bundle)),
+      tls_trust_policy_(std::move(tls_trust_policy)),
       impl_(nullptr),
       timeout_(timeout) {
   if (timeout_.count() <= 0) throw std::invalid_argument("websocket timeout must be positive");
   ensure_curl_global();
-  impl_ = std::make_unique<Impl>(resolve_entries_, ca_bundle_);
+  impl_ = std::make_unique<Impl>(resolve_entries_);
 }
 
 WebSocketClient::~WebSocketClient() { close(); }
@@ -683,7 +721,7 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
   const auto authority_host = host.find(':') == std::string::npos ? host : "[" + host + "]";
   const auto authority = port.empty() ? authority_host : authority_host + ":" + port;
 
-  impl_ = std::make_unique<Impl>(resolve_entries_, ca_bundle_);
+  impl_ = std::make_unique<Impl>(resolve_entries_);
   impl_->curl = curl_easy_init();
   if (impl_->curl == nullptr) throw std::runtime_error("curl_easy_init failed");
   curl_easy_setopt(impl_->curl, CURLOPT_URL, transport_url.c_str());
@@ -696,14 +734,7 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
   curl_easy_setopt(impl_->curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_.count()));
   curl_easy_setopt(impl_->curl, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(impl_->curl, CURLOPT_USERAGENT, "mine-teleop-websocket/0.2");
-  const auto ca_bundle = impl_->ca_bundle.string();
-  if (!ca_bundle.empty()) {
-    configure_curl_custom_ca(impl_->curl, ca_bundle.c_str());
-  } else if (const auto* ca_bundle = std::getenv("CURL_CA_BUNDLE"); ca_bundle != nullptr && *ca_bundle != '\0') {
-    curl_easy_setopt(impl_->curl, CURLOPT_CAINFO, ca_bundle);
-  } else if (const auto* ca_file = std::getenv("SSL_CERT_FILE"); ca_file != nullptr && *ca_file != '\0') {
-    curl_easy_setopt(impl_->curl, CURLOPT_CAINFO, ca_file);
-  }
+  configure_curl_tls_trust_policy(impl_->curl, tls_trust_policy_);
   if (impl_->resolve_entries != nullptr) curl_easy_setopt(impl_->curl, CURLOPT_RESOLVE, impl_->resolve_entries);
   const auto result = curl_easy_perform(impl_->curl);
   if (result != CURLE_OK) {
@@ -761,6 +792,8 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
   const auto end = impl_->buffered.find("\r\n\r\n") + 4;
   const auto response = impl_->buffered.substr(0, end);
   impl_->buffered.erase(0, end);
+  if (!impl_->buffered.empty())
+    impl_->frame_started_at = std::chrono::steady_clock::now();
   const auto line_end = response.find("\r\n");
   if (line_end == std::string::npos || response.substr(0, line_end).find(" 101 ") == std::string::npos) {
     const auto status_line = response.substr(0, line_end);
@@ -809,7 +842,7 @@ WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds t
   if (!connected()) throw std::runtime_error("websocket is not connected");
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (true) {
-    if (!impl_->ensure_bytes(2, deadline)) {
+    if (!impl_->ensure_frame_bytes(2, deadline)) {
       if (impl_->peer_closed) {
         close();
         return {WebSocketReceiveStatus::Closed, Json::object()};
@@ -826,13 +859,17 @@ WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds t
     std::uint64_t length = second & 0x7fU;
     std::size_t header_size = 2;
     if (length == 126) {
-      if (!impl_->ensure_bytes(4, deadline)) throw std::runtime_error("incomplete websocket frame");
+      if (!impl_->ensure_frame_bytes(4, deadline)) {
+        return {WebSocketReceiveStatus::Timeout, Json::object()};
+      }
       length = (static_cast<std::uint64_t>(static_cast<unsigned char>(impl_->buffered[2])) << 8U) |
           static_cast<unsigned char>(impl_->buffered[3]);
       if (length < 126U) throw std::runtime_error("websocket frame length is not minimally encoded");
       header_size = 4;
     } else if (length == 127) {
-      if (!impl_->ensure_bytes(10, deadline)) throw std::runtime_error("incomplete websocket frame");
+      if (!impl_->ensure_frame_bytes(10, deadline)) {
+        return {WebSocketReceiveStatus::Timeout, Json::object()};
+      }
       if ((static_cast<unsigned char>(impl_->buffered[2]) & 0x80U) != 0) {
         throw std::runtime_error("invalid websocket frame length");
       }
@@ -849,11 +886,11 @@ WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds t
     if (length > std::numeric_limits<std::size_t>::max() - header_size) {
       throw std::runtime_error("websocket frame length is unsupported");
     }
-    if (!impl_->ensure_bytes(header_size + static_cast<std::size_t>(length), deadline)) {
-      throw std::runtime_error("incomplete websocket frame");
+    if (!impl_->ensure_frame_bytes(header_size + static_cast<std::size_t>(length), deadline)) {
+      return {WebSocketReceiveStatus::Timeout, Json::object()};
     }
     const auto payload = impl_->buffered.substr(header_size, static_cast<std::size_t>(length));
-    impl_->buffered.erase(0, header_size + static_cast<std::size_t>(length));
+    impl_->consume_frame(header_size + static_cast<std::size_t>(length));
     if (opcode == 0x8) {
       try {
         validate_websocket_close_payload(payload);

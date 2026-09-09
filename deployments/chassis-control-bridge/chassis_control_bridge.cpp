@@ -1,4 +1,6 @@
 #include "global_variables.h"
+#include "mine_teleop/control_limits.hpp"
+#include "mine_teleop/detail/json_escape.hpp"
 #include "mine_teleop/vcu.hpp"
 #include "mine_teleop_chassis_bridge.h"
 
@@ -25,14 +27,17 @@
 #include <memory>
 #include <mutex>
 #include <net/if.h>
+#include <optional>
 #include <stdexcept>
 #include <sstream>
 #include <string>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 // Initialize is implemented by ChassisControl but only declared by its
@@ -44,6 +49,7 @@ bool Initialize(const VehicleParam& vehicle, const std::string& can_channel);
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using mine_teleop::detail::json_escape;
 using mine_teleop::vcu::CanFrame;
 using mine_teleop::vcu::Command;
 using mine_teleop::vcu::ParallelController;
@@ -67,6 +73,45 @@ constexpr std::array<std::uint32_t, 29> kCriticalFeedbackIds{
     0x18C0F4D0U, 0x18C1F4D0U, 0x18C2F4D0U, 0x18C3F4D0U,
     0x18C8F4D0U, 0x18C9F4D0U, 0x18CAF4D0U, 0x18CBF4D0U,
 };
+
+static_assert(mine_teleop::control_limits::kDefaultFullScaleMotorTorqueNm ==
+              MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM);
+static_assert(mine_teleop::control_limits::kMaxFullScaleMotorTorqueNm ==
+              MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM);
+static_assert(mine_teleop::control_limits::kDefaultMotorTorqueRiseRateNmPerSecond ==
+              MINE_TELEOP_CHASSIS_DEFAULT_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND);
+static_assert(mine_teleop::control_limits::kMaxMotorTorqueRiseRateNmPerSecond ==
+              MINE_TELEOP_CHASSIS_MAX_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND);
+static_assert(mine_teleop::control_limits::kDefaultMaxBrakePressureBar ==
+              MINE_TELEOP_CHASSIS_DEFAULT_MAX_BRAKE_PRESSURE_BAR);
+static_assert(mine_teleop::control_limits::kMaxOrdinaryBrakePressureBar ==
+              MINE_TELEOP_CHASSIS_MAX_ORDINARY_BRAKE_PRESSURE_BAR);
+static_assert(mine_teleop::control_limits::kMaxEmergencyBrakePressureBar ==
+              MINE_TELEOP_CHASSIS_MAX_EMERGENCY_BRAKE_PRESSURE_BAR);
+static_assert(mine_teleop::control_limits::kBrakePressureResolutionBar ==
+              MINE_TELEOP_CHASSIS_BRAKE_PRESSURE_RESOLUTION_BAR);
+static_assert(mine_teleop::control_limits::kMinSpeedFeedbackTimeoutMs ==
+              MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS);
+static_assert(mine_teleop::control_limits::kMaxSpeedFeedbackTimeoutMs ==
+              MINE_TELEOP_CHASSIS_MAX_SPEED_FEEDBACK_TIMEOUT_MS);
+static_assert(mine_teleop::control_limits::kMinSpeedPidMaxDtMs ==
+              MINE_TELEOP_CHASSIS_MIN_SPEED_PID_MAX_DT_MS);
+static_assert(mine_teleop::control_limits::kMaxSpeedPidMaxDtMs ==
+              MINE_TELEOP_CHASSIS_MAX_SPEED_PID_MAX_DT_MS);
+static_assert(mine_teleop::control_limits::kMaxSpeedPidGain ==
+              MINE_TELEOP_CHASSIS_MAX_SPEED_PID_GAIN);
+static_assert(mine_teleop::control_limits::kMaxSpeedPidDerivativeFilterTauMs ==
+              MINE_TELEOP_CHASSIS_MAX_DERIVATIVE_FILTER_TAU_MS);
+static_assert(mine_teleop::control_limits::kMaxHardOverspeedMarginMps ==
+              MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS);
+static_assert(mine_teleop::control_limits::kMaxNormalizedSteeringRequest ==
+              MINE_TELEOP_CHASSIS_MAX_STEERING_REQUEST);
+static_assert(mine_teleop::control_limits::kSteeringAxisCount ==
+              mine_teleop::vcu::kSteeringAxisCount);
+static_assert(std::extent_v<decltype(MineTeleopChassisFeedback::eps_angle)> ==
+              mine_teleop::control_limits::kSteeringAxisCount);
+static_assert(std::extent_v<decltype(MineTeleopChassisCanFeedbackV1::steering_angle_deg)> ==
+              mine_teleop::control_limits::kSteeringAxisCount);
 
 struct SpeedControlSettings {
   bool enabled{false};
@@ -144,6 +189,7 @@ bool valid_stop_reason(std::uint32_t value) {
     case MINE_TELEOP_CHASSIS_STOP_REASON_SESSION_PROFILE_REQUIRED:
     case MINE_TELEOP_CHASSIS_STOP_REASON_CAN_FEEDBACK_MISSING:
     case MINE_TELEOP_CHASSIS_STOP_REASON_ADAPTER_SAFETY_STATUS_UNAVAILABLE:
+    case MINE_TELEOP_CHASSIS_STOP_REASON_VCU_TRANSITION_TIMEOUT:
     case MINE_TELEOP_CHASSIS_STOP_REASON_LEGACY_UNSPECIFIED:
       return true;
     default:
@@ -222,6 +268,8 @@ std::string_view stop_reason_name(std::uint32_t value) {
       return "can_feedback_missing";
     case MINE_TELEOP_CHASSIS_STOP_REASON_ADAPTER_SAFETY_STATUS_UNAVAILABLE:
       return "adapter_safety_status_unavailable";
+    case MINE_TELEOP_CHASSIS_STOP_REASON_VCU_TRANSITION_TIMEOUT:
+      return "vcu_transition_timeout";
     default:
       return "legacy_unspecified";
   }
@@ -287,6 +335,139 @@ bool stationary_arming_state(mine_teleop::vcu::State state) {
          state == State::WaitActuatorModes;
 }
 
+// Feedback freshness proves that the VCU is still talking; it does not prove
+// that a requested state transition is converging.  Keep the two concerns
+// separate so a stream of fresh-but-unmatched feedback cannot hold an arming
+// or staged-disarm phase forever.
+struct VcuTransitionDeadlinePolicy {
+  std::chrono::milliseconds wait_parallel_handshake{4000};
+  std::chrono::milliseconds wait_parking_brake_released{5000};
+  std::chrono::milliseconds wait_gear{3000};
+  std::chrono::milliseconds wait_actuator_modes{4000};
+  std::chrono::milliseconds disarm_torque{3000};
+  std::chrono::milliseconds disarm_stop{10000};
+  std::chrono::milliseconds disarm_neutral{3000};
+  std::chrono::milliseconds disarm_parking_brake{5000};
+  std::chrono::milliseconds disarm_manual{4000};
+
+  [[nodiscard]] std::optional<std::chrono::milliseconds> deadline_for(
+      mine_teleop::vcu::State state) const {
+    using State = mine_teleop::vcu::State;
+    switch (state) {
+      case State::WaitParallelHandshake:
+        return wait_parallel_handshake;
+      case State::WaitParkingBrakeReleased:
+        return wait_parking_brake_released;
+      case State::WaitGear:
+        return wait_gear;
+      case State::WaitActuatorModes:
+        return wait_actuator_modes;
+      case State::DisarmTorque:
+        return disarm_torque;
+      case State::DisarmStop:
+        return disarm_stop;
+      case State::DisarmNeutral:
+        return disarm_neutral;
+      case State::DisarmParkingBrake:
+        return disarm_parking_brake;
+      case State::DisarmManual:
+        return disarm_manual;
+      case State::Standby:
+      case State::Initial:
+      case State::Ready:
+      case State::Disarmed:
+      case State::Fault:
+        return std::nullopt;
+    }
+    return std::nullopt;
+  }
+};
+
+struct VcuTransitionTimeout {
+  mine_teleop::vcu::State state;
+  std::uint64_t transition_epoch;
+  std::chrono::milliseconds elapsed;
+  std::chrono::milliseconds limit;
+};
+
+class VcuTransitionSupervisor {
+ public:
+  explicit VcuTransitionSupervisor(
+      VcuTransitionDeadlinePolicy policy = VcuTransitionDeadlinePolicy{})
+      : policy_(std::move(policy)) {}
+
+  void reset() {
+    tracked_ = false;
+    expired_ = false;
+    last_now_valid_ = false;
+  }
+
+  [[nodiscard]] std::optional<VcuTransitionTimeout> observe(mine_teleop::vcu::State state,
+                                                            std::uint64_t transition_epoch,
+                                                            Clock::time_point now) {
+    const auto deadline = policy_.deadline_for(state);
+    if (!deadline.has_value()) {
+      tracked_ = false;
+      expired_ = false;
+      return std::nullopt;
+    }
+
+    // steady_clock must not run backwards in production.  Saturating test or
+    // platform anomalies here prevents an older sample from extending a live
+    // safety deadline.
+    if (!last_now_valid_ || now > last_now_) {
+      last_now_ = now;
+      last_now_valid_ = true;
+    }
+    const auto effective_now = last_now_;
+    if (!tracked_ || state != state_ || transition_epoch != transition_epoch_) {
+      tracked_ = true;
+      expired_ = false;
+      state_ = state;
+      transition_epoch_ = transition_epoch;
+      entered_at_ = effective_now;
+      return std::nullopt;
+    }
+
+    auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(effective_now - entered_at_);
+    if (elapsed.count() < 0)
+      elapsed = std::chrono::milliseconds{0};
+    if (!expired_ && elapsed >= *deadline) {
+      expired_ = true;
+      return VcuTransitionTimeout{state, transition_epoch, elapsed, *deadline};
+    }
+    return std::nullopt;
+  }
+
+ private:
+  VcuTransitionDeadlinePolicy policy_;
+  bool tracked_{false};
+  bool expired_{false};
+  bool last_now_valid_{false};
+  mine_teleop::vcu::State state_{mine_teleop::vcu::State::Standby};
+  std::uint64_t transition_epoch_{0};
+  Clock::time_point entered_at_{};
+  Clock::time_point last_now_{};
+};
+
+VcuTransitionDeadlinePolicy transition_deadline_policy_for_runtime() {
+#if defined(MINE_TELEOP_CHASSIS_TESTING)
+  const char* raw_timeout = std::getenv("MINE_TELEOP_CHASSIS_TEST_TRANSITION_DEADLINE_MS");
+  if (raw_timeout != nullptr && raw_timeout[0] != '\0') {
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(raw_timeout, &end, 10);
+    if (errno == 0 && end != raw_timeout && *end == '\0' && parsed >= 10 && parsed <= 1000) {
+      const auto timeout = std::chrono::milliseconds{parsed};
+      return VcuTransitionDeadlinePolicy{timeout, timeout, timeout, timeout, timeout,
+                                         timeout, timeout, timeout, timeout};
+    }
+  }
+#endif
+  return VcuTransitionDeadlinePolicy{};
+}
+
 double clamp_value(double value, double minimum, double maximum) {
   return std::max(minimum, std::min(maximum, value));
 }
@@ -336,9 +517,11 @@ VehicleState make_vehicle_state(
   VehicleState state{};
   // The field WVCU speed signal is a magnitude in both D and R. Keep that
   // contract at the ChassisControl boundary as well as in the local PID.
-  state.cur_velocity = clamp_float(
-      mine_teleop_chassis_speed_magnitude_mps(current_speed_mps), 0.0, 20.0);
-  state.target_velocity = {clamp_float(target_vx, 0.0, 20.0), 0.0F};
+  state.cur_velocity = clamp_float(mine_teleop_chassis_speed_magnitude_mps(current_speed_mps), 0.0,
+                                   mine_teleop::control_limits::kChassisControlMaxTargetSpeedMps);
+  state.target_velocity = {
+      clamp_float(target_vx, 0.0, mine_teleop::control_limits::kChassisControlMaxTargetSpeedMps),
+      0.0F};
   // Positive traction is generated directly from the local speed PID below.
   // ChassisControl only receives the independent non-positive brake input.
   state.target_acceleration = {clamp_float(std::min(0.0, target_ax), -8.0, 0.0), 0.0F};
@@ -348,11 +531,12 @@ VehicleState make_vehicle_state(
   state.vehicle_position = {0.0F, 0.0F, 0.0F};
   state.target_steering_angle.assign(kWheelCount, 0.0F);
 
-  const int axis_count = std::max(
-      0,
-      std::min(steering_count, static_cast<int>(mine_teleop::vcu::kSteeringAxisCount)));
-  for (int axis = 0; axis < axis_count; ++axis) {
-    const auto angle_rad = clamp_value(steering_values[axis], -1.0, 1.0) * kMaxSteeringAngleRad;
+  const auto axis_count = mine_teleop::control_limits::bounded_steering_axis_count(steering_count);
+  for (std::size_t axis = 0; axis < axis_count; ++axis) {
+    const auto angle_rad = clamp_value(steering_values[axis],
+                                       -mine_teleop::control_limits::kMaxNormalizedSteeringRequest,
+                                       mine_teleop::control_limits::kMaxNormalizedSteeringRequest) *
+                           kMaxSteeringAngleRad;
     state.target_steering_angle[axis * 2] = static_cast<float>(angle_rad);
     state.target_steering_angle[axis * 2 + 1] = static_cast<float>(angle_rad);
   }
@@ -397,13 +581,14 @@ Command command_from_chassis_control(
     // is placed in the ignored speed request.
     command.motor_speed_rpm[index] = 0.0;
     command.brake_pressure_bar[index] =
-        mine_teleop_chassis_quantize_brake_pressure_bar(
+        mine_teleop::control_limits::quantize_ordinary_brake_pressure_bar_toward_zero(
             controls[index].ehb_brk_pres_req);
   }
   for (std::size_t axis = 0; axis < mine_teleop::vcu::kSteeringAxisCount; ++axis) {
     const auto& control = controls[axis * 2U];
     command.steering_angle_deg[axis] =
-        clamp_value(control.eps_ang_req, -30.0, 30.0);
+        clamp_value(control.eps_ang_req, -mine_teleop::control_limits::kMaxSteeringAngleDeg,
+                    mine_teleop::control_limits::kMaxSteeringAngleDeg);
     command.steering_speed_degps[axis] =
         clamp_value(control.eps_ang_spd_req * kRadiansToDegrees, 0.0, 255.0);
   }
@@ -421,43 +606,6 @@ std::string utc_timestamp() {
   std::ostringstream output;
   output << std::put_time(&utc, "%Y-%m-%dT%H:%M:%S") << '.'
          << std::setfill('0') << std::setw(3) << milliseconds.count() << 'Z';
-  return output.str();
-}
-
-std::string json_escape(std::string_view value) {
-  std::ostringstream output;
-  for (const unsigned char character : value) {
-    switch (character) {
-      case '"':
-        output << "\\\"";
-        break;
-      case '\\':
-        output << "\\\\";
-        break;
-      case '\b':
-        output << "\\b";
-        break;
-      case '\f':
-        output << "\\f";
-        break;
-      case '\n':
-        output << "\\n";
-        break;
-      case '\r':
-        output << "\\r";
-        break;
-      case '\t':
-        output << "\\t";
-        break;
-      default:
-        if (character < 0x20U) {
-          output << "\\u" << std::hex << std::setw(4) << std::setfill('0')
-                 << static_cast<int>(character) << std::dec;
-        } else {
-          output << static_cast<char>(character);
-        }
-    }
-  }
   return output.str();
 }
 
@@ -993,20 +1141,17 @@ class SocketCan {
 
 class BridgeRuntime {
  public:
-  BridgeRuntime(
-      std::string can_interface,
-      double full_scale_motor_torque_nm,
-      int control_timeout_ms,
-      SpeedControlSettings speed_control,
-      bool physical_brake_input,
-      double max_ordinary_brake_pressure_bar)
+  BridgeRuntime(std::string can_interface, double full_scale_motor_torque_nm,
+                int control_timeout_ms, SpeedControlSettings speed_control,
+                bool physical_brake_input, double max_ordinary_brake_pressure_bar)
       : can_interface_(std::move(can_interface)),
         full_scale_motor_torque_nm_(full_scale_motor_torque_nm),
         control_timeout_ms_(control_timeout_ms),
         open_speed_control_(speed_control),
         speed_control_(speed_control),
         physical_brake_input_(physical_brake_input),
-        max_ordinary_brake_pressure_bar_(max_ordinary_brake_pressure_bar) {
+        max_ordinary_brake_pressure_bar_(max_ordinary_brake_pressure_bar),
+        transition_supervisor_(transition_deadline_policy_for_runtime()) {
     last_feedback_.vehicle_speed_valid = 0;
     for (double& angle : last_feedback_.eps_angle) {
       angle = std::numeric_limits<double>::quiet_NaN();
@@ -1140,21 +1285,17 @@ class BridgeRuntime {
           ? runtime_control_.max_motor_torque_nm /
               full_scale_motor_torque_nm_
           : 0.0;
-      const int checked_steering_count = std::max(
-          0,
-          std::min(
-              steering_count,
-              static_cast<int>(mine_teleop::vcu::kSteeringAxisCount)));
-      const bool steering_exceeds_limit = std::any_of(
-          steering_values,
-          steering_values + checked_steering_count,
-          [&](double value) {
-            return std::abs(value) >
-                runtime_control_.max_steering_request + 1e-9;
+      const auto checked_steering_count =
+          mine_teleop::control_limits::bounded_steering_axis_count(steering_count);
+      const bool steering_exceeds_limit =
+          std::any_of(steering_values, steering_values + checked_steering_count, [&](double value) {
+            return mine_teleop::control_limits::exceeds_hard_limit(
+                std::abs(value), runtime_control_.max_steering_request);
           });
-      if (target_speed_mps >
-              runtime_control_.target_speed_limit_mps + 1e-9 ||
-          normalized_longitudinal > traction_limit + 1e-9 ||
+      if (mine_teleop::control_limits::exceeds_hard_limit(
+              target_speed_mps, runtime_control_.target_speed_limit_mps) ||
+          mine_teleop::control_limits::exceeds_hard_limit(normalized_longitudinal,
+                                                          traction_limit) ||
           steering_exceeds_limit) {
         withdraw_latest_traction_locked();
         log_operation_rejected_locked(
@@ -1214,10 +1355,9 @@ class BridgeRuntime {
     intent.gear = gear;
     intent.target_speed_mps = target_speed_mps;
     intent.normalized_longitudinal = normalized_longitudinal;
-    std::copy_n(
-        steering_values,
-        std::min<int>(steering_count, intent.steering.size()),
-        intent.steering.begin());
+    std::copy_n(steering_values,
+                mine_teleop::control_limits::bounded_steering_axis_count(steering_count),
+                intent.steering.begin());
     intent.generation = ++intent_generation_;
     latest_intent_ = intent;
     latest_intent_valid_ = true;
@@ -1268,10 +1408,8 @@ class BridgeRuntime {
         config.speed_pid_derivative_filter_tau_ms,
         config.speed_pid_max_dt_ms};
     const auto now = Clock::now();
-    const bool recoverable_arming_timeout_ready =
-        arming_timeout_recovery_ready_locked(now);
-    if (!running_.load() ||
-        (io_error_ != 0 && !recoverable_arming_timeout_ready)) {
+    const bool recoverable_timeout_ready = timeout_recovery_ready_for_configuration_locked(now);
+    if (!running_.load() || (io_error_ != 0 && !recoverable_timeout_ready)) {
       return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_RUNTIME_UNAVAILABLE;
     }
     if (config.struct_size != sizeof(Config) ||
@@ -1333,8 +1471,8 @@ class BridgeRuntime {
          !controller_.parking_ready())) {
       return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_PARKING_REQUIRED;
     }
-    if (recoverable_arming_timeout_ready) {
-      recover_arming_timeout_locked("runtime_control_config");
+    if (recoverable_timeout_ready) {
+      recover_timeout_locked("runtime_control_config");
     }
 
     RuntimeControlSettings next;
@@ -1372,21 +1510,7 @@ class BridgeRuntime {
   std::uint32_t clear_runtime_control(std::uint64_t& applied_revision) {
     std::lock_guard<std::mutex> lock(mutex_);
     applied_revision = 0;
-    withdraw_latest_traction_locked();
-    latest_intent_.target_speed_mps = 0.0;
-    speed_control_.pid = open_speed_control_.pid;
-    speed_control_.motor_torque_rise_rate_nm_per_s =
-        open_speed_control_.motor_torque_rise_rate_nm_per_s;
-    runtime_control_ = RuntimeControlSettings{};
-    try {
-      logger_.event(
-          "runtime_control_profile_cleared",
-          "\"issue_code\":\"vcu_runtime_control_profile_cleared\","
-          "\"stage\":\"runtime_control_config\","
-          "\"safety_action\":\"traction_withdrawn\"",
-          true);
-    } catch (...) {
-    }
+    clear_runtime_control_locked("runtime_control_config");
     return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_NONE;
   }
 
@@ -1457,9 +1581,8 @@ class BridgeRuntime {
     const auto now = Clock::now();
     const auto state_before = controller_.state();
     const auto& feedback = controller_.feedback();
-    const bool recoverable_arming_timeout_ready =
-        arming_timeout_recovery_ready_locked(now);
-    if (io_error_ != 0 && !recoverable_arming_timeout_ready) {
+    const bool recoverable_timeout_ready = timeout_recovery_ready_for_handshake_locked(now);
+    if (io_error_ != 0 && !recoverable_timeout_ready) {
       log_operation_rejected_locked(
           "parallel_handshake_rejected",
           "vcu_handshake_runtime_unavailable",
@@ -1494,8 +1617,8 @@ class BridgeRuntime {
         true);
       return false;
     }
-    if (recoverable_arming_timeout_ready) {
-      recover_arming_timeout_locked("vcu_handshake_request");
+    if (recoverable_timeout_ready) {
+      recover_timeout_locked("vcu_handshake_request");
     }
     clear_stop_provenance_locked();
     last_successful_apply_valid_ = false;
@@ -1503,6 +1626,7 @@ class BridgeRuntime {
     session_ready_latched_ = false;
     feedback_watchdog_armed_ = false;
     arming_feedback_deadline_valid_ = false;
+    transition_supervisor_.reset();
     control_watchdog_latched_ = false;
     hard_overspeed_latched_ = false;
     physical_emergency_reported_ = false;
@@ -1631,7 +1755,10 @@ class BridgeRuntime {
 
     if (feedback.vehicle_speed_valid != 0) {
       frame = CanFrame{mine_teleop::vcu::ids::kWvcuVehicleSpeed};
-      const auto speed_kph = clamp_value(feedback.vehicle_speed * 3.6, -500.0, 6053.5);
+      const auto speed_kph =
+          clamp_value(mine_teleop::control_limits::meters_per_second_to_kilometers_per_hour(
+                          feedback.vehicle_speed),
+                      -500.0, 6053.5);
       const auto raw = static_cast<std::uint16_t>(std::llround((speed_kph + 500.0) / 0.1));
       frame.data[0] = static_cast<std::uint8_t>(raw & 0xFFU);
       frame.data[1] = static_cast<std::uint8_t>((raw >> 8U) & 0xFFU);
@@ -1834,27 +1961,29 @@ class BridgeRuntime {
               "\"," + stop_provenance_json_locked(),
           true);
     }
+    bool disarm_wait_completed = false;
     bool disarmed = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      disarmed = condition_.wait_for(
-          lock,
-          std::chrono::duration<double>(kDisarmTimeoutSeconds),
-          [&] { return controller_.disarmed() || !running_.load(); });
+      disarm_wait_completed =
+          condition_.wait_for(lock, std::chrono::duration<double>(kDisarmTimeoutSeconds),
+                              [&] { return controller_.disarmed() || !running_.load(); });
+      disarmed = controller_.disarmed();
     }
     if (!disarmed) {
       std::lock_guard<std::mutex> lock(mutex_);
+      const bool transport_stopped = disarm_wait_completed && !running_.load();
       logger_.issue(
-          "disarm_timeout",
-          "vcu_disarm_timeout",
-          "vcu_close",
-          "VCU did not complete the reverse handshake within the timeout",
-          "Keep the vehicle isolated; inspect feedback/state and use the independent hardware safety path.",
+          transport_stopped ? "disarm_transport_stopped" : "disarm_timeout",
+          transport_stopped ? "vcu_disarm_transport_stopped" : "vcu_disarm_timeout", "vcu_close",
+          transport_stopped ? "VCU bridge I/O stopped before the reverse handshake was confirmed"
+                            : "VCU did not complete the reverse handshake within the timeout",
+          "Keep the vehicle isolated; inspect feedback/state and use the independent hardware "
+          "safety path.",
           "local_full_stop",
-          "\"timeout_ms\":" +
-              std::to_string(static_cast<int>(kDisarmTimeoutSeconds * 1000.0)) +
-              ",\"state\":\"" +
-              std::string(mine_teleop::vcu::state_name(controller_.state())) + "\"");
+          "\"timeout_ms\":" + std::to_string(static_cast<int>(kDisarmTimeoutSeconds * 1000.0)) +
+              ",\"state\":\"" + std::string(mine_teleop::vcu::state_name(controller_.state())) +
+              "\"");
       logger_.feedback(controller_.feedback(), controller_.state());
     } else {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1874,22 +2003,292 @@ class BridgeRuntime {
   }
 
  private:
-  bool arming_timeout_recovery_ready_locked(Clock::time_point now) const {
-    return recoverable_arming_timeout_ && io_error_ == -ETIMEDOUT &&
-        controller_.state() == mine_teleop::vcu::State::Disarmed &&
-        parking_gate_fresh_locked(now) && controller_.parking_ready();
+  bool timeout_recovery_base_ready_locked(Clock::time_point now) const {
+    return io_error_ == -ETIMEDOUT && controller_.state() == mine_teleop::vcu::State::Disarmed &&
+           parking_gate_fresh_locked(now) && controller_.parking_ready();
   }
 
-  void recover_arming_timeout_locked(std::string_view stage) {
+  bool timeout_recovery_ready_for_configuration_locked(Clock::time_point now) const {
+    return timeout_recovery_base_ready_locked(now) &&
+           (recoverable_arming_timeout_ || recoverable_transition_timeout_);
+  }
+
+  bool timeout_recovery_ready_for_handshake_locked(Clock::time_point now) const {
+    if (!timeout_recovery_base_ready_locked(now))
+      return false;
+    // A transition deadline revokes the profile.  Reconfiguration must happen
+    // explicitly before another handshake can clear that latch.
+    return recoverable_arming_timeout_ ||
+           (recoverable_transition_timeout_ && runtime_control_.active);
+  }
+
+  void recover_timeout_locked(std::string_view stage) {
+    const bool recover_arming_feedback = recoverable_arming_timeout_;
+    const bool recover_transition = recoverable_transition_timeout_;
     io_error_ = 0;
     recoverable_arming_timeout_ = false;
-    logger_.event(
-        "arming_feedback_timeout_recovered",
-        "\"issue_code\":\"vcu_arming_feedback_timeout_recovered\","
-        "\"stage\":\"" + json_escape(stage) + "\","
-        "\"operator_action\":\"Wait for the new VCU handshake to complete.\","
-        "\"safety_action\":\"remain_stopped_until_ready\"",
-        true);
+    recoverable_transition_timeout_ = false;
+    if (recover_arming_feedback) {
+      logger_.event("arming_feedback_timeout_recovered",
+                    "\"issue_code\":\"vcu_arming_feedback_timeout_recovered\","
+                    "\"stage\":\"" +
+                        json_escape(stage) +
+                        "\","
+                        "\"operator_action\":\"Wait for the new VCU handshake to complete.\","
+                        "\"safety_action\":\"remain_stopped_until_ready\"",
+                    true);
+    }
+    if (recover_transition) {
+      logger_.event("transition_timeout_recovered",
+                    "\"issue_code\":\"vcu_transition_timeout_recovered\","
+                    "\"stage\":\"" +
+                        json_escape(stage) +
+                        "\","
+                        "\"operator_action\":\"Apply a current control profile, then request a new "
+                        "VCU handshake.\","
+                        "\"safety_action\":\"remain_stopped_until_ready\"",
+                    true);
+    }
+  }
+
+  void clear_runtime_control_locked(std::string_view stage) {
+    withdraw_latest_traction_locked();
+    latest_intent_.target_speed_mps = 0.0;
+    speed_control_.pid = open_speed_control_.pid;
+    speed_control_.motor_torque_rise_rate_nm_per_s =
+        open_speed_control_.motor_torque_rise_rate_nm_per_s;
+    runtime_control_ = RuntimeControlSettings{};
+    try {
+      logger_.event("runtime_control_profile_cleared",
+                    "\"issue_code\":\"vcu_runtime_control_profile_cleared\","
+                    "\"stage\":\"" +
+                        json_escape(stage) +
+                        "\","
+                        "\"safety_action\":\"traction_withdrawn\"",
+                    true);
+    } catch (...) {
+    }
+  }
+
+  std::string transition_expectation_json_locked(mine_teleop::vcu::State state) const {
+    const auto& feedback = controller_.feedback();
+    std::ostringstream output;
+    std::vector<std::string> unmet;
+    auto add_unmet = [&](std::string_view signal) { unmet.emplace_back(signal); };
+    auto append_ints = [&](const auto& values) {
+      output << '[';
+      for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index != 0)
+          output << ',';
+        output << values[index];
+      }
+      output << ']';
+    };
+    auto append_valid = [&](const auto& values) {
+      output << '[';
+      for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index != 0)
+          output << ',';
+        output << (values[index] ? "true" : "false");
+      }
+      output << ']';
+    };
+    auto all_equal = [](const auto& values, const auto& valid, int expected) {
+      for (std::size_t index = 0; index < values.size(); ++index) {
+        if (!valid[index] || values[index] != expected)
+          return false;
+      }
+      return true;
+    };
+    auto all_valid = [](const auto& valid) {
+      return std::all_of(valid.begin(), valid.end(), [](bool value) { return value; });
+    };
+
+    output << "\"expected\":{";
+    using State = mine_teleop::vcu::State;
+    switch (state) {
+      case State::WaitParallelHandshake:
+        output << "\"handshake_status\":5";
+        break;
+      case State::WaitParkingBrakeReleased:
+        output << "\"parking_brake_status\":1";
+        break;
+      case State::WaitGear:
+        output << "\"gear\":" << latest_intent_.gear;
+        break;
+      case State::WaitActuatorModes:
+        output << "\"motor_mode\":1,\"steering_mode\":1,\"brake_mode\":1,"
+                  "\"motor_torque_feedback\":\"valid\"";
+        break;
+      case State::DisarmTorque:
+        output << "\"max_abs_motor_torque_nm\":2";
+        break;
+      case State::DisarmStop:
+        output << "\"max_abs_speed_mps\":0.1";
+        break;
+      case State::DisarmNeutral:
+        output << "\"gear\":1";
+        break;
+      case State::DisarmParkingBrake:
+        output << "\"parking_brake_status\":2";
+        break;
+      case State::DisarmManual:
+        output << "\"handshake_status\":3,\"gear\":1,"
+                  "\"max_abs_speed_mps\":0.1,\"parking_brake_status\":2";
+        break;
+      case State::Standby:
+      case State::Initial:
+      case State::Ready:
+      case State::Disarmed:
+      case State::Fault:
+        output << "\"state\":\"unmonitored\"";
+        break;
+    }
+    output << "},\"observed\":{";
+    switch (state) {
+      case State::WaitParallelHandshake:
+        output << "\"handshake_status\":" << feedback.handshake_status
+               << ",\"handshake_valid\":" << (feedback.handshake_valid ? "true" : "false");
+        if (!feedback.handshake_valid || feedback.handshake_status != 5) {
+          add_unmet("handshake_status");
+        }
+        break;
+      case State::WaitParkingBrakeReleased:
+      case State::DisarmParkingBrake:
+        output << "\"parking_brake_status\":";
+        append_ints(feedback.parking_brake_status);
+        output << ",\"parking_brake_valid\":";
+        append_valid(feedback.parking_brake_valid);
+        if (!all_equal(feedback.parking_brake_status, feedback.parking_brake_valid,
+                       state == State::WaitParkingBrakeReleased ? 1 : 2)) {
+          add_unmet("parking_brake_status");
+        }
+        break;
+      case State::WaitGear:
+      case State::DisarmNeutral:
+        output << "\"gear\":" << feedback.gear
+               << ",\"gear_valid\":" << (feedback.gear_valid ? "true" : "false");
+        if (!feedback.gear_valid ||
+            feedback.gear != (state == State::WaitGear ? latest_intent_.gear : 1)) {
+          add_unmet("gear");
+        }
+        break;
+      case State::WaitActuatorModes:
+        output << "\"motor_mode\":";
+        append_ints(feedback.motor_mode);
+        output << ",\"motor_mode_valid\":";
+        append_valid(feedback.motor_mode_valid);
+        output << ",\"steering_mode\":";
+        append_ints(feedback.steering_mode);
+        output << ",\"steering_mode_valid\":";
+        append_valid(feedback.steering_valid);
+        output << ",\"brake_mode\":";
+        append_ints(feedback.brake_mode);
+        output << ",\"brake_mode_valid\":";
+        append_valid(feedback.brake_valid);
+        output << ",\"motor_torque_valid\":";
+        append_valid(feedback.motor_torque_valid);
+        if (!all_equal(feedback.motor_mode, feedback.motor_mode_valid, 1)) {
+          add_unmet("motor_mode");
+        }
+        if (!all_equal(feedback.steering_mode, feedback.steering_valid, 1)) {
+          add_unmet("steering_mode");
+        }
+        if (!all_equal(feedback.brake_mode, feedback.brake_valid, 1)) {
+          add_unmet("brake_mode");
+        }
+        if (!all_valid(feedback.motor_torque_valid)) {
+          add_unmet("motor_torque_feedback");
+        }
+        break;
+      case State::DisarmTorque: {
+        double max_abs_torque = 0.0;
+        for (const auto torque : feedback.motor_torque_nm) {
+          max_abs_torque = std::max(max_abs_torque, std::abs(torque));
+        }
+        output << "\"max_abs_motor_torque_nm\":" << max_abs_torque << ",\"motor_torque_valid\":";
+        append_valid(feedback.motor_torque_valid);
+        if (!all_valid(feedback.motor_torque_valid) || max_abs_torque > 2.0) {
+          add_unmet("motor_torque");
+        }
+        break;
+      }
+      case State::DisarmStop:
+        output << "\"speed_mps\":" << feedback.speed_mps
+               << ",\"speed_valid\":" << (feedback.speed_valid ? "true" : "false");
+        if (!feedback.speed_valid || std::abs(feedback.speed_mps) > 0.1) {
+          add_unmet("speed");
+        }
+        break;
+      case State::DisarmManual:
+        output << "\"handshake_status\":" << feedback.handshake_status
+               << ",\"handshake_valid\":" << (feedback.handshake_valid ? "true" : "false")
+               << ",\"gear\":" << feedback.gear
+               << ",\"gear_valid\":" << (feedback.gear_valid ? "true" : "false")
+               << ",\"speed_mps\":" << feedback.speed_mps
+               << ",\"speed_valid\":" << (feedback.speed_valid ? "true" : "false")
+               << ",\"parking_brake_status\":";
+        append_ints(feedback.parking_brake_status);
+        output << ",\"parking_brake_valid\":";
+        append_valid(feedback.parking_brake_valid);
+        if (!feedback.handshake_valid || feedback.handshake_status != 3) {
+          add_unmet("handshake_status");
+        }
+        if (!feedback.gear_valid || feedback.gear != 1)
+          add_unmet("gear");
+        if (!feedback.speed_valid || std::abs(feedback.speed_mps) > 0.1) {
+          add_unmet("speed");
+        }
+        if (!all_equal(feedback.parking_brake_status, feedback.parking_brake_valid, 2)) {
+          add_unmet("parking_brake_status");
+        }
+        break;
+      case State::Standby:
+      case State::Initial:
+      case State::Ready:
+      case State::Disarmed:
+      case State::Fault:
+        output << "\"state\":\"unmonitored\"";
+        break;
+    }
+    output << "},\"missing_or_mismatched\":[";
+    for (std::size_t index = 0; index < unmet.size(); ++index) {
+      if (index != 0)
+        output << ',';
+      output << '"' << json_escape(unmet[index]) << '"';
+    }
+    output << ']';
+    return output.str();
+  }
+
+  void handle_transition_timeout_locked(const VcuTransitionTimeout& timeout) {
+    const bool first_transition_timeout = !recoverable_transition_timeout_;
+    const auto state_entry_generation = controller_.state_entry_generation();
+    io_error_ = -ETIMEDOUT;
+    recoverable_transition_timeout_ = true;
+    clear_soft_stop_requested_ = false;
+    software_estop_ = true;
+    if (first_transition_timeout) {
+      latch_stop_provenance_locked(MINE_TELEOP_CHASSIS_STOP_SOURCE_WATCHDOG,
+                                   MINE_TELEOP_CHASSIS_STOP_REASON_VCU_TRANSITION_TIMEOUT);
+      clear_runtime_control_locked("vcu_transition_timeout");
+    }
+    controller_.request_disarm();
+
+    std::ostringstream details;
+    details << "\"state\":\"" << mine_teleop::vcu::state_name(timeout.state)
+            << "\",\"state_transition_epoch\":" << timeout.transition_epoch
+            << ",\"state_entry_generation\":" << state_entry_generation
+            << ",\"elapsed_ms\":" << timeout.elapsed.count()
+            << ",\"limit_ms\":" << timeout.limit.count() << ','
+            << transition_expectation_json_locked(timeout.state) << ','
+            << stop_provenance_json_locked();
+    logger_.issue("transition_timeout", "vcu_transition_timeout",
+                  "vcu_transition_" + std::string(mine_teleop::vcu::state_name(timeout.state)),
+                  "the VCU phase did not converge before its monotonic progress deadline",
+                  "Complete the staged disarm, apply a current control profile, then explicitly "
+                  "request a new VCU handshake.",
+                  "local_full_stop_new_page_handshake_required", details.str());
   }
 
   StopContext consume_stop_context_locked(
@@ -2018,7 +2417,10 @@ class BridgeRuntime {
       latest_intent_.target_speed_mps = 0.0;
       latest_intent_valid_ = true;
     }
-    latest_intent_.normalized_longitudinal = 0.0;
+    // Runtime-profile invalidation must remove traction without undoing an
+    // already requested ordinary brake. Positive values are traction; negative
+    // values are direct/service braking and remain valid without a profile.
+    latest_intent_.normalized_longitudinal = std::min(0.0, latest_intent_.normalized_longitudinal);
     latest_intent_.generation = ++intent_generation_;
     reset_speed_pid_locked();
     reset_direct_traction_locked();
@@ -2386,11 +2788,11 @@ class BridgeRuntime {
               last_traction_torque_magnitude_nm_);
       command.motor_torque_nm.fill(directional_motor_torque_nm);
       if (physical_brake_input_) {
-        const double requested_pressure_bar = direct_pressure_brake
-            ? mine_teleop_chassis_quantize_brake_pressure_bar(
-                  -intent.normalized_longitudinal *
-                  max_ordinary_brake_pressure_bar_)
-            : 0.0;
+        const double requested_pressure_bar =
+            direct_pressure_brake
+                ? mine_teleop::control_limits::quantize_ordinary_brake_pressure_bar_toward_zero(
+                      -intent.normalized_longitudinal * max_ordinary_brake_pressure_bar_)
+                : 0.0;
         if (direct_pressure_brake) {
           command.motor_torque_nm.fill(0.0);
         }
@@ -2645,9 +3047,13 @@ class BridgeRuntime {
 
     telemetry_.speed_mps = feedback.speed_valid ? feedback.speed_mps : 0.0;
     telemetry_.gear = feedback.gear_valid ? feedback.gear : 1;
-    telemetry_.steering_feedback = feedback.steering_valid[0]
-        ? clamp_value(feedback.steering_angle_deg[0] / 30.0, -1.0, 1.0)
-        : 0.0;
+    telemetry_.steering_feedback =
+        feedback.steering_valid[0]
+            ? clamp_value(mine_teleop::control_limits::steering_degrees_to_normalized_request(
+                              feedback.steering_angle_deg[0]),
+                          -mine_teleop::control_limits::kMaxNormalizedSteeringRequest,
+                          mine_teleop::control_limits::kMaxNormalizedSteeringRequest)
+            : 0.0;
     double max_positive_torque = 0.0;
     for (std::size_t index = 0; index < mine_teleop::vcu::kMotorCount; ++index) {
       if (feedback.motor_torque_valid[index]) {
@@ -2780,52 +3186,54 @@ class BridgeRuntime {
         last_control_tick_valid = true;
         log_ignored_rx_locked(now);
         const auto current_state = controller_.state();
-        const bool retained_feedback_timeout =
-            feedback_watchdog_armed_ &&
-            speed_safety_active_state(current_state) &&
-            !feedback_fresh_locked(now);
-        const bool first_arming_feedback_timeout =
-            !feedback_watchdog_armed_ &&
-            arming_feedback_deadline_valid_ &&
-            current_state == arming_feedback_state_ &&
-            now - arming_feedback_state_entry_ >=
-                std::chrono::duration_cast<Clock::duration>(
-                    std::chrono::duration<double>(kFeedbackTimeoutSeconds)) &&
-            !arming_feedback_fresh_locked(current_state, now);
-        if (retained_feedback_timeout || first_arming_feedback_timeout) {
-          io_error_ = -ETIMEDOUT;
-          recoverable_arming_timeout_ = first_arming_feedback_timeout;
-          latch_stop_provenance_locked(
-              MINE_TELEOP_CHASSIS_STOP_SOURCE_WATCHDOG,
-              MINE_TELEOP_CHASSIS_STOP_REASON_FEEDBACK_TIMEOUT);
-          controller_.transport_fault();
-          software_estop_ = true;
-          withdraw_latest_traction_locked();
-          logger_.issue(
-              first_arming_feedback_timeout
-                  ? "arming_feedback_timeout"
-                  : "feedback_timeout",
-              first_arming_feedback_timeout
-                  ? "vcu_arming_feedback_timeout"
-                  : "vcu_critical_feedback_timeout",
-              "vcu_feedback_watchdog",
-              first_arming_feedback_timeout
-                  ? "feedback required by the current arming phase did not remain fresh through its 500 ms entry grace"
-                  : "one or more critical VCU feedback IDs exceeded the freshness deadline",
-              "Inspect stale_feedback ages, CAN wiring/load, VCU power/state, and protocol ID mapping.",
-              "local_full_stop",
-              "\"timeout_ms\":" +
-                  std::to_string(static_cast<int>(kFeedbackTimeoutSeconds * 1000.0)) +
-                  ",\"state\":\"" +
-                  std::string(mine_teleop::vcu::state_name(current_state)) +
-                  "\"" +
-                  "," + stale_feedback_ids_locked(now) +
-                  "," + stale_feedback_ages_locked(now));
+        const auto transition_timeout =
+            transition_supervisor_.observe(current_state, controller_.transition_epoch(), now);
+        if (transition_timeout.has_value()) {
+          handle_transition_timeout_locked(*transition_timeout);
+        } else {
+          const bool retained_feedback_timeout = feedback_watchdog_armed_ &&
+                                                 speed_safety_active_state(current_state) &&
+                                                 !feedback_fresh_locked(now);
+          const bool first_arming_feedback_timeout =
+              !feedback_watchdog_armed_ && arming_feedback_deadline_valid_ &&
+              current_state == arming_feedback_state_ &&
+              now - arming_feedback_state_entry_ >=
+                  std::chrono::duration_cast<Clock::duration>(
+                      std::chrono::duration<double>(kFeedbackTimeoutSeconds)) &&
+              !arming_feedback_fresh_locked(current_state, now);
+          if (retained_feedback_timeout || first_arming_feedback_timeout) {
+            io_error_ = -ETIMEDOUT;
+            recoverable_arming_timeout_ = first_arming_feedback_timeout;
+            latch_stop_provenance_locked(MINE_TELEOP_CHASSIS_STOP_SOURCE_WATCHDOG,
+                                         MINE_TELEOP_CHASSIS_STOP_REASON_FEEDBACK_TIMEOUT);
+            controller_.transport_fault();
+            software_estop_ = true;
+            withdraw_latest_traction_locked();
+            logger_.issue(
+                first_arming_feedback_timeout ? "arming_feedback_timeout" : "feedback_timeout",
+                first_arming_feedback_timeout ? "vcu_arming_feedback_timeout"
+                                              : "vcu_critical_feedback_timeout",
+                "vcu_feedback_watchdog",
+                first_arming_feedback_timeout
+                    ? "feedback required by the current arming phase did not remain fresh through "
+                      "its 500 ms entry grace"
+                    : "one or more critical VCU feedback IDs exceeded the freshness deadline",
+                "Inspect stale_feedback ages, CAN wiring/load, VCU power/state, and protocol ID "
+                "mapping.",
+                "local_full_stop",
+                "\"timeout_ms\":" +
+                    std::to_string(static_cast<int>(kFeedbackTimeoutSeconds * 1000.0)) +
+                    ",\"state\":\"" + std::string(mine_teleop::vcu::state_name(current_state)) +
+                    "\"" + "," + stale_feedback_ids_locked(now) + "," +
+                    stale_feedback_ages_locked(now));
+          }
+          check_control_watchdog_locked(now);
+          update_command_from_intent_locked(now, control_dt_seconds);
         }
-        check_control_watchdog_locked(now);
-        update_command_from_intent_locked(now, control_dt_seconds);
         frames = controller_.tick();
         transmit_state = controller_.state();
+        static_cast<void>(
+            transition_supervisor_.observe(transmit_state, controller_.transition_epoch(), now));
         if (controller_.handshake_revoked() &&
             !handshake_revoked_reported_) {
           handshake_revoked_reported_ = true;
@@ -2994,6 +3402,7 @@ class BridgeRuntime {
   SocketCan socket_;
   ProtocolLogger logger_;
   ParallelController controller_;
+  VcuTransitionSupervisor transition_supervisor_;
   std::atomic<bool> running_{false};
   std::thread io_thread_;
   std::unordered_map<std::uint32_t, Clock::time_point> last_seen_;
@@ -3016,6 +3425,7 @@ class BridgeRuntime {
   bool physical_emergency_reported_{false};
   bool handshake_revoked_reported_{false};
   bool recoverable_arming_timeout_{false};
+  bool recoverable_transition_timeout_{false};
   bool vmc_fault_code_observed_{false};
   int last_vmc_fault_code_{0};
   bool chassis_control_fault_latched_{false};
@@ -3176,6 +3586,70 @@ int open_bridge(
 
 }  // namespace
 
+#if defined(MINE_TELEOP_CHASSIS_TESTING)
+namespace {
+
+VcuTransitionSupervisor& test_transition_supervisor() {
+  static VcuTransitionSupervisor supervisor;
+  return supervisor;
+}
+
+std::optional<mine_teleop::vcu::State> test_transition_state(int value) {
+  using State = mine_teleop::vcu::State;
+  if (value < static_cast<int>(State::Standby) || value > static_cast<int>(State::Fault)) {
+    return std::nullopt;
+  }
+  return static_cast<State>(value);
+}
+
+Clock::time_point test_transition_time(std::int64_t milliseconds) {
+  return Clock::time_point{
+      std::chrono::duration_cast<Clock::duration>(std::chrono::milliseconds{milliseconds})};
+}
+
+}  // namespace
+
+extern "C" int mine_teleop_chassis_test_transition_deadline_reset(void) {
+  test_transition_supervisor().reset();
+  return 0;
+}
+
+extern "C" int mine_teleop_chassis_test_transition_deadline_ms(int state_value,
+                                                               std::int64_t* deadline_ms) {
+  if (deadline_ms == nullptr)
+    return -2;
+  const auto state = test_transition_state(state_value);
+  if (!state.has_value())
+    return -1;
+  const auto deadline = VcuTransitionDeadlinePolicy{}.deadline_for(*state);
+  if (!deadline.has_value())
+    return 0;
+  *deadline_ms = deadline->count();
+  return 1;
+}
+
+extern "C" int mine_teleop_chassis_test_transition_deadline_observe(int state_value,
+                                                                    std::uint64_t transition_epoch,
+                                                                    std::int64_t monotonic_ms,
+                                                                    std::int64_t* elapsed_ms,
+                                                                    std::int64_t* limit_ms) {
+  if (elapsed_ms == nullptr || limit_ms == nullptr)
+    return -2;
+  *elapsed_ms = -1;
+  *limit_ms = -1;
+  const auto state = test_transition_state(state_value);
+  if (!state.has_value())
+    return -1;
+  const auto timeout = test_transition_supervisor().observe(*state, transition_epoch,
+                                                            test_transition_time(monotonic_ms));
+  if (!timeout.has_value())
+    return 0;
+  *elapsed_ms = timeout->elapsed.count();
+  *limit_ms = timeout->limit.count();
+  return 1;
+}
+#endif
+
 extern "C" std::uint32_t mine_teleop_chassis_abi_version() { return 6U; }
 
 extern "C" std::uint32_t mine_teleop_chassis_open_config_v2_size() {
@@ -3253,26 +3727,21 @@ extern "C" int mine_teleop_chassis_open_v2(
             config->speed_pid_kd,
             config->speed_pid_derivative_filter_tau_ms,
             config->speed_pid_max_dt_ms};
-  if (config == nullptr ||
-      config->struct_size != sizeof(MineTeleopChassisOpenConfigV2) ||
+  if (config == nullptr || config->struct_size != sizeof(MineTeleopChassisOpenConfigV2) ||
       !std::isfinite(config->full_scale_motor_torque_nm) ||
       config->full_scale_motor_torque_nm < 0.0 ||
-      config->full_scale_motor_torque_nm >
-          MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM ||
-      !std::isfinite(config->hard_speed_limit_mps) ||
-      config->hard_speed_limit_mps < 0.0 ||
-      config->hard_speed_limit_mps > 20.0 ||
+      config->full_scale_motor_torque_nm > MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM ||
+      !std::isfinite(config->hard_speed_limit_mps) || config->hard_speed_limit_mps < 0.0 ||
+      config->hard_speed_limit_mps >
+          mine_teleop::control_limits::kChassisControlMaxTargetSpeedMps ||
       !mine_teleop_chassis_control_timeout_is_valid(config->control_timeout_ms) ||
-      config->speed_feedback_timeout_ms <
-          MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS ||
-      config->speed_feedback_timeout_ms >
-          MINE_TELEOP_CHASSIS_MAX_SPEED_FEEDBACK_TIMEOUT_MS ||
+      config->speed_feedback_timeout_ms < MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS ||
+      config->speed_feedback_timeout_ms > MINE_TELEOP_CHASSIS_MAX_SPEED_FEEDBACK_TIMEOUT_MS ||
       config->speed_feedback_timeout_ms > config->control_timeout_ms ||
       !mine_teleop_chassis_speed_pid_config_is_valid(&pid) ||
       !std::isfinite(config->hard_overspeed_margin_mps) ||
       config->hard_overspeed_margin_mps <= 0.0 ||
-      config->hard_overspeed_margin_mps >
-          MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS) {
+      config->hard_overspeed_margin_mps > MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS) {
     emit_bridge_diagnostic(
         "vehicle_vcu_start_failed",
         "vcu_open_config_invalid",
@@ -3312,32 +3781,26 @@ int open_configured_bridge(
             config->speed_pid_kd,
             config->speed_pid_derivative_filter_tau_ms,
             config->speed_pid_max_dt_ms};
-  if (config == nullptr ||
-      config->struct_size != sizeof(Config) ||
+  if (config == nullptr || config->struct_size != sizeof(Config) ||
       !std::isfinite(config->full_scale_motor_torque_nm) ||
       config->full_scale_motor_torque_nm < 0.0 ||
-      config->full_scale_motor_torque_nm >
-          MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM ||
-      !std::isfinite(config->hard_speed_limit_mps) ||
-      config->hard_speed_limit_mps < 0.0 ||
-      config->hard_speed_limit_mps > 20.0 ||
+      config->full_scale_motor_torque_nm > MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM ||
+      !std::isfinite(config->hard_speed_limit_mps) || config->hard_speed_limit_mps < 0.0 ||
+      config->hard_speed_limit_mps >
+          mine_teleop::control_limits::kChassisControlMaxTargetSpeedMps ||
       !mine_teleop_chassis_control_timeout_is_valid(config->control_timeout_ms) ||
-      config->speed_feedback_timeout_ms <
-          MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS ||
-      config->speed_feedback_timeout_ms >
-          MINE_TELEOP_CHASSIS_MAX_SPEED_FEEDBACK_TIMEOUT_MS ||
+      config->speed_feedback_timeout_ms < MINE_TELEOP_CHASSIS_MIN_SPEED_FEEDBACK_TIMEOUT_MS ||
+      config->speed_feedback_timeout_ms > MINE_TELEOP_CHASSIS_MAX_SPEED_FEEDBACK_TIMEOUT_MS ||
       config->speed_feedback_timeout_ms > config->control_timeout_ms ||
       !mine_teleop_chassis_speed_pid_config_is_valid(&pid) ||
       !std::isfinite(config->hard_overspeed_margin_mps) ||
       config->hard_overspeed_margin_mps <= 0.0 ||
-      config->hard_overspeed_margin_mps >
-          MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS ||
+      config->hard_overspeed_margin_mps > MINE_TELEOP_CHASSIS_MAX_HARD_OVERSPEED_MARGIN_MPS ||
       !std::isfinite(config->max_ordinary_brake_pressure_bar) ||
       config->max_ordinary_brake_pressure_bar < 0.0 ||
       config->max_ordinary_brake_pressure_bar >
           MINE_TELEOP_CHASSIS_MAX_ORDINARY_BRAKE_PRESSURE_BAR ||
-      !std::isfinite(motor_torque_rise_rate_nm_per_s) ||
-      motor_torque_rise_rate_nm_per_s < 0.0 ||
+      !std::isfinite(motor_torque_rise_rate_nm_per_s) || motor_torque_rise_rate_nm_per_s < 0.0 ||
       motor_torque_rise_rate_nm_per_s >
           MINE_TELEOP_CHASSIS_MAX_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND) {
     emit_bridge_diagnostic(
@@ -3541,11 +4004,8 @@ extern "C" int mine_teleop_chassis_apply_state_v2(
       MINE_TELEOP_CHASSIS_APPLY_ISSUE_GENERIC_REJECTED);
   try {
     std::lock_guard<std::mutex> lock(g_api_mutex);
-    const int checked_steering_count = std::max(
-        0,
-        std::min(
-            steering_count,
-            static_cast<int>(mine_teleop::vcu::kSteeringAxisCount)));
+    const auto checked_steering_count =
+        mine_teleop::control_limits::bounded_steering_axis_count(steering_count);
     const bool steering_finite = steering_values != nullptr &&
         std::all_of(
             steering_values,
@@ -3557,10 +4017,10 @@ extern "C" int mine_teleop_chassis_apply_state_v2(
           -1,
           MINE_TELEOP_CHASSIS_APPLY_ISSUE_RUNTIME_UNAVAILABLE);
     }
-    if (steering_values == nullptr || steering_count < 0 ||
-        target_gear < 1 || target_gear > 4 || !std::isfinite(target_vx) ||
-        target_vx < 0.0 || target_vx > 20.0 || !std::isfinite(target_ax) ||
-        target_ax < -1.0 || target_ax > 1.0 || !steering_finite) {
+    if (steering_values == nullptr || steering_count < 0 || target_gear < 1 || target_gear > 4 ||
+        !std::isfinite(target_vx) || target_vx < 0.0 ||
+        target_vx > mine_teleop::control_limits::kChassisControlMaxTargetSpeedMps ||
+        !std::isfinite(target_ax) || target_ax < -1.0 || target_ax > 1.0 || !steering_finite) {
       g_runtime->fail_control_apply(
           "vcu_apply_arguments_invalid",
           "invalid gear, target speed/acceleration, steering pointer, or steering values",

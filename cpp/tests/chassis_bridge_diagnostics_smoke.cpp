@@ -1,4 +1,5 @@
 #include "global_variables.h"
+#include "mine_teleop/vcu.hpp"
 #include "mine_teleop_chassis_bridge.h"
 
 #include <nlohmann/json.hpp>
@@ -480,24 +481,25 @@ std::size_t count_logged_events(
   return count;
 }
 
+#include "chassis_bridge_transition_deadline_tests.hpp"
+
 }  // namespace
 
 int main() {
   try {
     expect(
         mine_teleop_chassis_abi_version() == 6U &&
-            mine_teleop_chassis_open_config_v2_size() ==
-                sizeof(MineTeleopChassisOpenConfigV2) &&
-            mine_teleop_chassis_open_config_v3_size() ==
-                sizeof(MineTeleopChassisOpenConfigV3) &&
-            mine_teleop_chassis_open_config_v4_size() ==
-                sizeof(MineTeleopChassisOpenConfigV4) &&
+            MINE_TELEOP_CHASSIS_STOP_REASON_ADAPTER_SAFETY_STATUS_UNAVAILABLE == 24U &&
+            MINE_TELEOP_CHASSIS_STOP_REASON_VCU_TRANSITION_TIMEOUT == 25U &&
+            MINE_TELEOP_CHASSIS_STOP_REASON_LEGACY_UNSPECIFIED == 255U &&
+            mine_teleop_chassis_open_config_v2_size() == sizeof(MineTeleopChassisOpenConfigV2) &&
+            mine_teleop_chassis_open_config_v3_size() == sizeof(MineTeleopChassisOpenConfigV3) &&
+            mine_teleop_chassis_open_config_v4_size() == sizeof(MineTeleopChassisOpenConfigV4) &&
             mine_teleop_chassis_runtime_control_config_v1_size() ==
                 sizeof(MineTeleopChassisRuntimeControlConfigV1) &&
             mine_teleop_chassis_runtime_control_config_v2_size() ==
                 sizeof(MineTeleopChassisRuntimeControlConfigV2) &&
-            mine_teleop_chassis_stop_context_v1_size() ==
-                sizeof(MineTeleopChassisStopContextV1) &&
+            mine_teleop_chassis_stop_context_v1_size() == sizeof(MineTeleopChassisStopContextV1) &&
             sizeof(MineTeleopChassisRuntimeControlConfigV1) == 88U &&
             sizeof(MineTeleopChassisRuntimeControlConfigV2) == 96U &&
             sizeof(MineTeleopChassisStopContextV1) == 16U &&
@@ -1729,6 +1731,13 @@ int main() {
     expect(
         wait_for_handshake_state(MINE_TELEOP_VCU_FAULT),
         "post-Ready WaitActuatorModes did not retain the critical-feedback watchdog");
+    MineTeleopChassisTelemetry feedback_timeout_telemetry{};
+    expect(mine_teleop_chassis_read_telemetry(&feedback_timeout_telemetry) == 0 &&
+               feedback_timeout_telemetry.estop == 1 &&
+               feedback_timeout_telemetry.stop_source == MINE_TELEOP_CHASSIS_STOP_SOURCE_WATCHDOG &&
+               feedback_timeout_telemetry.stop_reason ==
+                   MINE_TELEOP_CHASSIS_STOP_REASON_FEEDBACK_TIMEOUT,
+           "actual stale critical feedback no longer exposes FEEDBACK_TIMEOUT provenance");
     const auto critical_frames = drain_can_frames(transport[1], 40);
     expect(
         can_signal(last_frame_with_id(critical_frames, 0x18F0D0F5U), 8, 14) ==
@@ -2054,6 +2063,15 @@ int main() {
               std::abs(g_vehicle_states.back().target_steering_angle[0]) > 1e-6,
           "V4 service brake retained traction input or discarded steering");
     }
+
+    expect(mine_teleop_chassis_clear_runtime_control_v1(&runtime_profile_result) == 0 &&
+               runtime_profile_result.applied_revision == 0,
+           "V4 service-brake profile clear failed");
+    const auto cleared_profile_brake_frames = drain_can_frames(pressure_transport[1], 45);
+    expect_all_motor_torque_raw(cleared_profile_brake_frames, 8000,
+                                "V4 profile clear retained zero traction");
+    expect_all_brake_pressure_raw(cleared_profile_brake_frames, 300,
+                                  "V4 profile clear retained service brake");
 
     expect(
         mine_teleop_chassis_update_feedback(&feedback) == 0 &&
@@ -2491,6 +2509,9 @@ int main() {
             revoked_event->value("stop_reason", "") == "handshake_revoked",
         "handshake revoke diagnostic was missing, duplicated, or incomplete");
     std::filesystem::remove(physical_log_path, error);
+
+    test_transition_deadline_supervisor_boundaries();
+    test_wait_gear_transition_timeout_preserves_staged_disarm();
 
     std::cout << "chassis_bridge_diagnostics_smoke=passed\n";
     return 0;

@@ -134,6 +134,11 @@ class ParallelController {
   [[nodiscard]] bool physical_emergency_latched() const;
   [[nodiscard]] bool handshake_revoked() const;
   [[nodiscard]] int revoked_handshake_status() const;
+  // Changes only when the controller enters a different state.  The bridge
+  // uses this to bind phase-progress deadlines to one concrete transition,
+  // rather than renewing them for each fresh-but-unmatched CAN frame.
+  [[nodiscard]] std::uint64_t transition_epoch() const;
+  [[nodiscard]] std::uint64_t state_entry_generation() const;
   [[nodiscard]] bool feedback_complete() const;
   [[nodiscard]] const Feedback& feedback() const;
 
@@ -152,6 +157,7 @@ class ParallelController {
   bool handshake_revoked_{false};
   int revoked_handshake_status_{0};
   std::uint64_t receive_generation_{0};
+  std::uint64_t transition_epoch_{0};
   std::uint64_t state_entry_generation_{0};
   std::uint64_t handshake_generation_{0};
   std::uint64_t gear_generation_{0};

@@ -1,5 +1,7 @@
 #include <MvCameraControl.h>
 
+#include "mine_teleop/detail/json_escape.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -10,6 +12,8 @@
 #include <vector>
 
 namespace {
+
+using mine_teleop::detail::json_escape;
 
 struct Arguments {
   bool list{false};
@@ -112,16 +116,6 @@ DeviceDescription describe(const MV_CC_DEVICE_INFO& info) {
     };
   }
   return {"", "", "unknown"};
-}
-
-std::string json_escape(std::string_view value) {
-  std::string result;
-  for (const char character : value) {
-    if (character == '\\' || character == '"') result.push_back('\\');
-    if (character == '\n') result += "\\n";
-    else if (character != '\r') result.push_back(character);
-  }
-  return result;
 }
 
 MV_CC_DEVICE_INFO_LIST enumerate() {

@@ -3,6 +3,8 @@ set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
+# shellcheck disable=SC1090
+source "$repo_root/deployments/base-images.lock.env"
 run_tests="OFF"
 positional_args=()
 for argument in "$@"; do
@@ -58,6 +60,16 @@ if [[ -e "$output_root" ]]; then
   exit 2
 fi
 mkdir -p "$(dirname "$output_root")"
+source_commit="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || printf unknown)"
+if git -C "$repo_root" status --porcelain >/dev/null 2>&1; then
+  if [[ -n "$(git -C "$repo_root" status --porcelain)" ]]; then
+    source_tree_state=dirty
+  else
+    source_tree_state=clean
+  fi
+else
+  source_tree_state=unavailable
+fi
 
 third_party_runtime_source="from-source"
 third_party_runtime_sha256="none"
@@ -213,12 +225,20 @@ install -m 0755 "$repo_root/scripts/deploy/setup_basler_usb_access.sh" \
   "$output_root/scripts/setup_basler_usb_access.sh"
 install -m 0644 "$repo_root/packaging/ubuntu-vehicle/README.txt" "$output_root/README.txt"
 printf '%s\n' \
+  "source_commit=$source_commit" \
+  "source_tree_state=$source_tree_state" \
   "target_platform=$platform" \
   "target_architecture=$architecture" \
   "vehicle_config=$(basename "$vehicle_config")" \
   "third_party_runtime_source=$third_party_runtime_source" \
   "third_party_runtime_sha256=$third_party_runtime_sha256" \
   "runtime_tests_executed=$([[ "$run_tests" == "ON" ]] && printf yes || printf no)" \
+  'build_hardening=target-scoped' \
+  "base_image_reference=$MINE_TELEOP_UBUNTU_2204_REFERENCE" \
+  "base_image_index_digest=$MINE_TELEOP_UBUNTU_2204_INDEX_DIGEST" \
+  'reproducibility_level=dependency-traceable' \
+  'offline_rebuild=not-established' \
+  'bit_for_bit_reproducible=not-established' \
   "built_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   >"$output_root/BUILD-INFO.txt"
 archive="$output_root.tar.gz"

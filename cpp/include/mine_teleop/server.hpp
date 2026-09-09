@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "mine_teleop/credentials.hpp"
 #include "mine_teleop/core.hpp"
 #include "mine_teleop/detail/native_control_acknowledgement_window.hpp"
 #include "mine_teleop/http.hpp"
@@ -51,12 +53,35 @@ class SimpleHttpServer {
   using Handler = std::function<ServerResponse(const HttpRequest&)>;
   using WebSocketHandler = std::function<bool(SocketHandle, const HttpRequest&)>;
 
+  // The HTTP listener has no application-side wait queue: accepted sockets
+  // either reserve one of these bounded slots or are rejected immediately.
+  // A WSS connection moves out of the short-lived HTTP budget after its
+  // upgrade request is parsed, while remaining within the total connection
+  // budget for its whole lifetime.
+  struct ConnectionLimits {
+    std::size_t max_active_connections{64};
+    std::size_t max_pending_http_connections{16};
+    std::size_t max_websocket_connections{48};
+    // A trusted reverse proxy can legitimately concentrate several browser and
+    // vehicle WSS channels on one peer address, so the default stays well
+    // above a single control session while remaining below the global cap.
+    std::size_t max_connections_per_source{48};
+    int listen_backlog{64};
+    std::chrono::milliseconds header_read_timeout{std::chrono::seconds(5)};
+    std::chrono::milliseconds body_read_timeout{std::chrono::seconds(10)};
+    std::chrono::milliseconds response_write_timeout{std::chrono::seconds(5)};
+    std::chrono::milliseconds overload_write_timeout{std::chrono::milliseconds(100)};
+  };
+
   SimpleHttpServer(
       std::string host,
       std::uint16_t port,
       Handler handler,
       std::size_t max_body_bytes = 8 * 1024 * 1024,
       WebSocketHandler websocket_handler = {});
+  SimpleHttpServer(std::string host, std::uint16_t port, Handler handler,
+                   std::size_t max_body_bytes, WebSocketHandler websocket_handler,
+                   ConnectionLimits connection_limits);
   ~SimpleHttpServer();
 
   SimpleHttpServer(const SimpleHttpServer&) = delete;
@@ -69,17 +94,26 @@ class SimpleHttpServer {
 
  private:
   void open_listener();
-  void serve_client(SocketHandle client_fd) const;
+  void serve_client(SocketHandle client_fd);
+  [[nodiscard]] bool try_register_client(SocketHandle client_fd, std::string source);
+  [[nodiscard]] bool try_promote_client_to_websocket(SocketHandle client_fd);
+  [[nodiscard]] bool try_demote_client_from_websocket(SocketHandle client_fd);
+  void unregister_client(SocketHandle client_fd);
 
   std::string host_;
   std::uint16_t requested_port_;
   Handler handler_;
   std::size_t max_body_bytes_;
   WebSocketHandler websocket_handler_;
+  ConnectionLimits connection_limits_;
   std::atomic<bool> stopping_{false};
   mutable std::mutex clients_mutex_;
   mutable std::condition_variable clients_stopped_;
   std::unordered_set<SocketHandle> client_sockets_;
+  std::unordered_set<SocketHandle> websocket_sockets_;
+  std::unordered_map<SocketHandle, std::string> client_sources_;
+  std::unordered_map<std::string, std::size_t> connections_by_source_;
+  std::size_t pending_http_connections_{0};
   std::atomic<SocketHandle> listener_fd_{kInvalidSocket};
   std::uint16_t bound_port_{0};
   std::thread thread_;
@@ -88,7 +122,13 @@ class SimpleHttpServer {
 struct SignalingServerConfig {
   std::string host{"127.0.0.1"};
   std::uint16_t port{8765};
+  // Legacy plaintext credentials are retained only for an explicitly enabled
+  // migration window and in-process test fixtures. File-backed production
+  // configuration should use driver_password_verifiers exclusively.
+  bool allow_legacy_passwords{false};
+  std::string legacy_passwords_remove_by;
   std::unordered_map<std::string, std::string> driver_passwords{{"driver-console-001", "dev-password"}};
+  std::unordered_map<std::string, std::string> driver_password_verifiers;
   std::unordered_map<std::string, std::string> device_tokens{{"vehicle-001", "dev-device-secret"}};
   std::unordered_map<std::string, std::unordered_set<std::string>> driver_vehicle_permissions{
       {"driver-console-001", {"vehicle-001"}}};
@@ -101,6 +141,9 @@ struct SignalingServerConfig {
   std::int64_t login_max_failures{5};
   std::int64_t login_failure_window_ms{60 * 1000};
   std::int64_t login_lockout_ms{5 * 60 * 1000};
+  AuthenticationCostPolicy authentication_cost_policy;
+  std::size_t password_verification_max_concurrency{2};
+  std::int64_t password_verification_retry_after_ms{250};
   std::int64_t api_rate_limit_requests{600};
   std::int64_t api_rate_limit_window_ms{60 * 1000};
   std::int64_t api_rate_limit_max_sources{4096};
@@ -116,6 +159,14 @@ struct SignalingServerConfig {
   std::int64_t signaling_message_ttl_ms{15 * 1000};
   std::int64_t native_control_message_ttl_ms{150};
   bool native_control_trace_commands{false};
+  std::size_t max_signaling_queue_messages{256};
+  std::size_t max_signaling_queue_bytes{8 * 1024 * 1024};
+  std::int64_t websocket_rate_limit_messages{600};
+  std::size_t websocket_rate_limit_bytes{16 * 1024 * 1024};
+  std::int64_t websocket_rate_limit_window_ms{60 * 1000};
+  // Connection-budget and HTTP phase deadlines applied to the standalone
+  // signaling listener. Defaults mirror SimpleHttpServer::ConnectionLimits.
+  SimpleHttpServer::ConnectionLimits connection_limits;
   std::string audit_log_path;
   std::int64_t audit_log_max_bytes{64 * 1024 * 1024};
   std::int64_t audit_log_files{5};
@@ -125,11 +176,22 @@ struct SignalingServerConfig {
 
 SignalingServerConfig load_signaling_identity_config(const std::filesystem::path& path);
 
+// Validates a connection budget before a listener is activated. Mirrors the
+// SimpleHttpServer constructor invariants but names the exact offending field
+// so configuration failures are actionable. Enforces the WebSocket-capacity
+// reservation whenever a WSS handler will be installed (always true for the
+// standalone signaling server). Throws std::invalid_argument on the first
+// invalid field; call sites must invoke this before listening or service
+// activation.
+void validate_connection_limits(const SimpleHttpServer::ConnectionLimits& limits);
+
 class SignalingService {
  public:
-  explicit SignalingService(
-      SignalingServerConfig config,
-      std::function<std::int64_t()> audit_clock = {});
+  using ClockSampler = std::function<ClockSample()>;
+
+  explicit SignalingService(SignalingServerConfig config,
+                            std::function<std::int64_t()> audit_clock = {},
+                            ClockSampler clock_sampler = {});
   ~SignalingService();
 
   [[nodiscard]] ServerResponse handle(const HttpRequest& request);
@@ -139,14 +201,16 @@ class SignalingService {
  private:
   struct DriverToken {
     std::string driver_id;
-    std::int64_t expires_at_ms{0};
+    std::int64_t expires_at_utc_ms{0};
+    std::int64_t expires_at_monotonic_ms{0};
     std::uint64_t connection_generation{0};
   };
   struct ConnectionPresence {
     std::string connection_id;
     std::uint64_t generation{0};
-    std::int64_t connected_at_ms{0};
-    std::int64_t last_seen_at_ms{0};
+    std::int64_t connected_at_utc_ms{0};
+    std::int64_t last_seen_at_utc_ms{0};
+    std::int64_t last_seen_at_monotonic_ms{0};
   };
   struct RelayUsageSample {
     std::uint64_t sequence{0};
@@ -154,19 +218,26 @@ class SignalingService {
     std::uint64_t bytes_received{0};
     std::uint64_t duration_ms{0};
   };
+  struct WebSocketRateState {
+    std::int64_t messages{0};
+    std::size_t bytes{0};
+    std::optional<std::int64_t> window_started_at_monotonic_ms;
+  };
   struct Session {
     std::string session_id;
     std::string vehicle_id;
     std::string driver_id;
     SessionState state{SessionState::Online};
     std::string control_token;
-    std::int64_t control_token_expires_at_ms{0};
+    std::int64_t control_token_expires_at_utc_ms{0};
+    std::int64_t control_token_expires_at_monotonic_ms{0};
     std::uint64_t relay_bytes_sent{0};
     std::uint64_t relay_bytes_received{0};
     std::uint64_t relay_duration_ms{0};
     std::uint64_t relay_usage_samples{0};
     double last_relay_bitrate_kbps{0.0};
     std::unordered_map<std::string, RelayUsageSample> last_relay_usage_by_actor;
+    std::unordered_map<std::string, WebSocketRateState> websocket_rate_by_participant;
 
     [[nodiscard]] Json to_json(bool include_control_token = false) const;
   };
@@ -179,6 +250,7 @@ class SignalingService {
     std::int64_t queued_at_utc_ms{0};
     std::int64_t queued_at_monotonic_ms{0};
     std::uint64_t delivery_cursor{0};
+    std::size_t serialized_bytes{0};
 
     [[nodiscard]] Json to_json() const;
   };
@@ -189,26 +261,46 @@ class SignalingService {
   };
   struct LoginFailureState {
     std::int64_t failures{0};
-    std::int64_t window_started_at_ms{0};
-    std::int64_t blocked_until_ms{0};
+    std::int64_t pending_failures{0};
+    std::optional<std::int64_t> window_started_at_monotonic_ms;
+    std::optional<std::int64_t> blocked_until_utc_ms;
+    std::optional<std::int64_t> blocked_until_monotonic_ms;
+  };
+  struct LoginFailureReservation {
+    std::string bucket;
+    std::int64_t admitted_at_utc_ms{0};
+    std::int64_t admitted_at_monotonic_ms{0};
+  };
+  struct LoginCredentialSnapshot {
+    enum class Kind {
+      Argon2id,
+      LegacyPlaintext,
+      Unknown,
+    };
+
+    Kind kind{Kind::Unknown};
+    // SignalingService owns immutable credential configuration for its entire
+    // request lifetime, so a view avoids copying a legacy plaintext password
+    // into a second transient buffer before verification runs outside mutex_.
+    std::string_view verifier;
   };
   struct ApiRateState {
     std::int64_t requests{0};
-    std::int64_t window_started_at_ms{0};
+    std::optional<std::int64_t> window_started_at_monotonic_ms;
     bool limit_audited{false};
   };
 
-  [[nodiscard]] ServerResponse handle_get(const HttpRequest& request);
-  [[nodiscard]] ServerResponse handle_post(const HttpRequest& request);
+  [[nodiscard]] ClockSample clock_sample() const;
+  [[nodiscard]] ServerResponse handle_get(const HttpRequest& request, ClockSample now);
+  [[nodiscard]] ServerResponse handle_post(const HttpRequest& request, ClockSample now);
+  [[nodiscard]] ServerResponse handle_driver_login(Json value, ClockSample admitted_at);
   [[nodiscard]] Json enqueue_signaling_message(
-      std::string_view session_id,
-      const Json& value,
+      std::string_view session_id, const Json& value, ClockSample received_at,
       std::optional<std::string_view> authenticated_actor = std::nullopt);
-  [[nodiscard]] Json take_signaling_messages(
-      std::string_view session_id,
-      std::string_view recipient,
-      std::string_view requested_types = {},
-      bool consume = true);
+  [[nodiscard]] Json take_signaling_messages(std::string_view session_id,
+                                             std::string_view recipient, ClockSample now,
+                                             std::string_view requested_types = {},
+                                             bool consume = true);
   [[nodiscard]] std::size_t acknowledge_signaling_messages(
       std::string_view session_id,
       std::string_view recipient,
@@ -216,36 +308,53 @@ class SignalingService {
       bool control_only = false);
   [[nodiscard]] const Session& require_active_session(std::string_view session_id) const;
   [[nodiscard]] const Session& require_participant(std::string_view session_id, std::string_view participant) const;
-  void validate_driver_token(std::string_view driver_id, std::string_view token);
+  void validate_driver_token(std::string_view driver_id, std::string_view token, ClockSample now);
   void validate_device_token(std::string_view vehicle_id, std::string_view token) const;
-  void validate_vehicle_connection(
-      std::string_view vehicle_id,
-      std::string_view token,
-      std::uint64_t connection_generation);
-  void validate_actor_credential(const Session& session, std::string_view actor, const Json& value);
+  void validate_vehicle_connection(std::string_view vehicle_id, std::string_view token,
+                                   std::uint64_t connection_generation, ClockSample now);
+  void validate_actor_credential(const Session& session, std::string_view actor, const Json& value,
+                                 ClockSample now);
   void validate_message_metadata(
       const Session& session,
       const ProtocolMetadata& metadata);
-  void cleanup_expired_connections(std::int64_t timestamp_ms);
+  void cleanup_expired_connections(ClockSample now);
+  void prune_expired_signaling_messages(ClockSample now);
   void close_sessions_for_vehicle(std::string_view vehicle_id, std::string_view reason);
   void close_sessions_for_driver(std::string_view driver_id, std::string_view reason);
   void transition_session(Session& session, SessionState next, std::string_view reason);
   void close_session(Session& session, std::string_view reason);
-  void enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms);
-  void record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms);
-  void clear_login_failures(std::string_view driver_id);
+  [[nodiscard]] bool configured_driver(std::string_view driver_id) const;
+  [[nodiscard]] bool try_acquire_password_verification_slot();
+  void release_password_verification_slot() noexcept;
+  [[nodiscard]] LoginFailureReservation reserve_login_failure_locked(std::string_view driver_id,
+                                                                     ClockSample admitted_at);
+  void release_login_failure_reservation_locked(const LoginFailureReservation& reservation);
+  void record_login_failure_locked(std::string_view driver_id,
+                                   const LoginFailureReservation& reservation,
+                                   ClockSample settled_at);
+  void clear_login_failures_locked(std::string_view driver_id);
   [[nodiscard]] std::string request_source(const HttpRequest& request) const;
-  void cleanup_api_rate_limits(std::int64_t timestamp_ms);
-  void enforce_api_rate_limit(const HttpRequest& request, std::int64_t timestamp_ms);
-  void audit(std::string_view event, const Json& details = Json::object()) const;
+  void cleanup_api_rate_limits(MonotonicMillis now);
+  void enforce_api_rate_limit(const HttpRequest& request, MonotonicMillis now);
+  bool audit(std::string_view event, const Json& details = Json::object()) const noexcept;
 
   SignalingServerConfig config_;
+  std::string dummy_password_verifier_;
   std::string service_instance_id_;
   std::function<std::int64_t()> audit_clock_;
+  ClockSampler clock_sampler_;
   mutable std::mutex mutex_;
+  mutable std::mutex password_verification_mutex_;
   mutable std::mutex audit_log_mutex_;
+  mutable std::mutex audit_fallback_mutex_;
   mutable std::int64_t audit_log_period_start_ms_{-1};
   mutable std::int64_t audit_log_last_retention_period_ms_{-1};
+  mutable std::atomic<bool> audit_healthy_{true};
+  mutable std::atomic<std::uint64_t> audit_write_failures_{0};
+  mutable bool audit_last_fallback_report_has_monotonic_{false};
+  mutable std::int64_t audit_last_fallback_report_monotonic_ms_{0};
+  std::atomic<bool> connection_reaper_healthy_{true};
+  std::atomic<std::uint64_t> connection_reaper_failures_{0};
   std::unordered_map<std::string, DriverToken> driver_tokens_;
   std::unordered_map<std::string, ConnectionPresence> online_vehicles_;
   std::unordered_map<std::string, ConnectionPresence> online_drivers_;
@@ -257,12 +366,14 @@ class SignalingService {
   std::unordered_map<std::string, AcceptedMessage> last_accepted_messages_;
   std::unordered_map<std::string, std::uint64_t> next_delivery_cursors_;
   std::unordered_map<std::string, LoginFailureState> login_failures_;
+  std::size_t active_password_verifications_{0};
   std::unordered_set<std::string> trusted_proxy_addresses_;
   std::unordered_map<std::string, ApiRateState> api_rate_limits_;
   ApiRateState api_rate_limit_overflow_;
   std::unique_ptr<AsyncControlTrace> native_control_trace_;
-  std::int64_t api_rate_limit_last_cleanup_ms_{0};
+  std::optional<std::int64_t> api_rate_limit_last_cleanup_monotonic_ms_;
   std::uint64_t api_rate_limited_requests_{0};
+  std::uint64_t signaling_queue_rejections_{0};
   std::uint64_t session_counter_{0};
   std::uint64_t connection_generation_{0};
   std::jthread connection_reaper_;
@@ -346,7 +457,8 @@ class DriverConsoleRuntime {
 
  private:
   [[nodiscard]] Json login_locked(std::string_view password);
-  [[nodiscard]] Json fetch_authorized_vehicles(std::string_view token, std::int64_t expires_at_ms);
+  [[nodiscard]] Json fetch_authorized_vehicles(std::string_view token,
+                                               std::int64_t expires_at_utc_ms);
   [[nodiscard]] Json send_signaling_message(std::string_view type, const Json& payload);
   void connect_signaling_websocket(std::string_view session_id, std::string_view token);
   void close_signaling_websocket();
@@ -393,18 +505,20 @@ class DriverConsoleRuntime {
   mutable std::mutex native_control_update_mutex_;
   std::condition_variable_any native_control_cv_;
   std::string driver_token_;
-  std::int64_t driver_token_expires_at_ms_{0};
+  std::int64_t driver_token_expires_at_utc_ms_{0};
+  std::int64_t driver_token_expires_at_monotonic_ms_{0};
   std::string signaling_service_instance_id_;
   std::uint64_t signaling_restart_recoveries_{0};
   bool signaling_available_{false};
   std::string session_id_;
   std::string control_token_;
-  std::int64_t control_token_expires_at_ms_{0};
-  std::int64_t control_token_renew_at_ms_{0};
+  std::int64_t control_token_expires_at_utc_ms_{0};
+  std::int64_t control_token_expires_at_monotonic_ms_{0};
+  std::int64_t control_token_renew_at_monotonic_ms_{0};
   std::uint64_t sequence_{0};
   std::uint64_t control_sequence_{0};
   std::uint64_t control_session_generation_{0};
-  std::int64_t connected_at_ms_{0};
+  std::int64_t connected_at_utc_ms_{0};
   std::int64_t last_control_prepared_at_utc_ms_{0};
   std::uint64_t control_commands_prepared_total_{0};
   double target_speed_kph_{2.0};
@@ -460,9 +574,13 @@ class DriverConsoleHttpApp {
  public:
   explicit DriverConsoleHttpApp(std::shared_ptr<DriverConsoleRuntime> runtime);
   [[nodiscard]] ServerResponse handle(const HttpRequest& request) const;
+  [[nodiscard]] const std::string& page_capability() const {
+    return page_capability_;
+  }
 
  private:
   std::shared_ptr<DriverConsoleRuntime> runtime_;
+  std::string page_capability_;
 };
 
 std::string random_token(std::size_t bytes = 24);

@@ -329,6 +329,10 @@ $TestsExecuted = if ($SmokeTest) {
   "native_tests_built=yes",
   "runtime_tests_executed=$TestsExecuted",
   "dependency_manifest=DEPENDENCIES.json",
+  "build_hardening=target-scoped",
+  "reproducibility_level=dependency-traceable",
+  "offline_rebuild=not-established",
+  "bit_for_bit_reproducible=not-established",
   "built_at_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
 ) | Set-Content -LiteralPath (Join-Path $PackageRoot "BUILD-INFO.txt") -Encoding UTF8
 

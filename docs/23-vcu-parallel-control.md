@@ -111,6 +111,18 @@ ChassisControl 保持转向计算，但随后把八路电机扭矩强制置零�
 车速和 EPB，WaitGear 另加实际挡位，WaitActuatorModes 检查全部关键反馈。这样最后
 一帧 EPB 释放反馈后 CAN 静默不会无限保持释放请求。
 
+这套 500 ms 检查只验证反馈**新鲜度**。另有独立的、基于 `steady_clock` 的阶段推进
+deadline：`WaitParallelHandshake` 4 s、`WaitParkingBrakeReleased` 5 s、`WaitGear` 3 s、
+`WaitActuatorModes` 4 s，反向退出的 `DisarmTorque`/`DisarmStop`/`DisarmNeutral`/
+`DisarmParkingBrake`/`DisarmManual` 分别为 3/10/3/5/4 s。计时只在实际状态迁移的
+transition epoch 改变时开始；重复页面请求、重复日志或“持续新鲜但值不匹配”的 CAN
+帧不能续期。任一阶段到期会撤销牵引和当前 runtime profile，并复用既有的零扭矩、
+停稳、N、EPB 驻车、人工状态的分步退出，未知车速时不会跳过停稳检查直接换挡。
+它不会把状态机简化为 Fault，也不会自动恢复：完成 Disarmed、重新取得新鲜驻车反馈、
+显式下发当前 profile 后，仍须由页面再次显式请求握手。上述时间只是在软件中设定的
+有界默认值，必须在隔离 VCU/CAN 台架和低风险实车中按实际反馈节拍与 EPB/执行器响应
+重新标定。
+
 Ready 阶段的速度 PID 与独立硬超速门限都使用车速绝对值，D/R 档只决定电机
 扭矩方向。硬超速门限使用 `max_speed_kph + hard_overspeed_margin_kph`，在零牵引
 或制动时也持续监测，不随瞬时油门目标降低，不再根据车速正负推断 D/R 实际
@@ -136,7 +148,8 @@ WVCU 物理急停开关在 VehicleStatus 接收时立即锁存，即使开关脉
 1. 扭矩请求归零并等待八路扭矩反馈都在 ±2 Nm 内。
 2. 八路 EHB 请求 DBC 全量 `409.5 bar/路`，等待车速不高于 0.1 m/s。
 3. 请求 N 并等待 N 反馈。
-4. 请求四路 EPB 驻车值 2，并等待四路状态都为 2。
+4. 请求四路 EPB 驻车值 2，并等待四路状态都为 2；等待期间八路 EHB 继续保持
+   上一步的安全制动压力，不在 EPB 确认前切回 mode 0。
 5. 清除 `ShakeReq`，等待人工状态 3。
 
 控制端通过双向 profile/VCU/status DataChannel 每 500 ms 接收
@@ -220,9 +233,9 @@ export MINE_TELEOP_VCU_LOG_ROTATIONS=10
 - `event/parallel_handshake_requested`、`parallel_handshake_rejected`：
   开始请求及 N/零速/EPB/人工状态/反馈新鲜度门槛；
 - `event/parallel_handshake_disconnect_requested`：控制端主动断开请求；
-- `event/emergency_stop`、`feedback_timeout`、`can_send_failed`、
+- `event/emergency_stop`、`feedback_timeout`、`transition_timeout`、`can_send_failed`、
   `can_receive_failed`、`tx_deadline_miss`、`disarm_complete`、
-  `disarm_timeout`：安全、调度与故障结果。
+  `disarm_transport_stopped`、`disarm_timeout`：安全、调度与故障结果。
 
 安全/状态事件立即 flush，普通帧至少每秒 flush。文件达到上限后轮转为 `.1` 到
 `.N`；排查时需要同时保存当前文件和全部轮转文件。

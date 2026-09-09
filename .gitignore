@@ -3,10 +3,14 @@
 /cpp-build/
 /dist/
 /.vcpkg/
+node_modules/
 *.tar.gz
 .DS_Store
 .playwright-cli/
 output/
+/configs/secrets/
+/configs/*.password
+/configs/*.token
 
 # Compiled shared objects / binaries
 *.so

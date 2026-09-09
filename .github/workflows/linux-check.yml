@@ -1,0 +1,389 @@
+name: Linux Docker check
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/linux-check.yml"
+      - ".dockerignore"
+      - ".clang-format"
+      - ".clang-tidy"
+      - ".editorconfig"
+      - ".eslint.config.cjs"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "cmake/**"
+      - "configs/**"
+      - "cpp/**"
+      - "deployments/**"
+      - "docs/BUILD.md"
+      - "package.json"
+      - "package-lock.json"
+      - "protocol/**"
+      - "scripts/**"
+      - "tools/**"
+      - "vendor/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/linux-check.yml"
+      - ".dockerignore"
+      - ".clang-format"
+      - ".clang-tidy"
+      - ".editorconfig"
+      - ".eslint.config.cjs"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "cmake/**"
+      - "configs/**"
+      - "cpp/**"
+      - "deployments/**"
+      - "docs/BUILD.md"
+      - "package.json"
+      - "package-lock.json"
+      - "protocol/**"
+      - "scripts/**"
+      - "tools/**"
+      - "vendor/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-docker-check-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  incremental-quality:
+    name: Linux incremental quality
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out MineTeleop with its comparison base
+        # actions/checkout v4.4.0; update through Dependabot and verify the commit.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node for locked ESLint
+        # actions/setup-node v4.4.0; tag verified at 49933ea5288caeca8642d1e84afbd3f7d6820020.
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "20.19.5"
+          check-latest: false
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install pinned clang-format 18
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly llvm_key_sha256='8b2a587ffd672c4687e7581dad4b2f6c1bb2ad6b480cd9771ba2ff48e0b8c75d'
+          readonly clang_format_package='clang-format-18=1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144'
+          llvm_key="$RUNNER_TEMP/llvm-snapshot.gpg.key"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            https://apt.llvm.org/llvm-snapshot.gpg.key \
+            --output "$llvm_key"
+          printf '%s  %s\n' "$llvm_key_sha256" "$llvm_key" | sha256sum --check --status
+          sudo install --directory --mode=0755 /etc/apt/keyrings
+          sudo install --mode=0644 "$llvm_key" /etc/apt/keyrings/llvm-snapshot.asc
+          printf '%s\n' \
+            'deb [signed-by=/etc/apt/keyrings/llvm-snapshot.asc] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main' \
+            | sudo tee /etc/apt/sources.list.d/llvm-toolchain-18.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends "$clang_format_package"
+          clang_format_version="${clang_format_package#*=}"
+          dpkg-query -W -f='${Version}\n' clang-format-18 | \
+            grep -Fx "$clang_format_version"
+          clang-format-18 --version | tee "$RUNNER_TEMP/clang-format-version.log"
+          grep -F 'clang-format version 18.1.8' "$RUNNER_TEMP/clang-format-version.log"
+          git_clang_format_path="$(command -v git-clang-format-18)"
+          dpkg-query -S "$git_clang_format_path" | \
+            grep -Fx "clang-format-18: $git_clang_format_path"
+          git-clang-format-18 --help | tee "$RUNNER_TEMP/git-clang-format-help.log"
+          grep -F 'usage: git clang-format' "$RUNNER_TEMP/git-clang-format-help.log"
+
+      - name: Exercise incremental-quality fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test/check_incremental_quality_fixture.sh | \
+            tee "$RUNNER_TEMP/incremental-quality-fixture.log"
+          grep -Fx 'incremental_quality_fixture=passed' \
+            "$RUNNER_TEMP/incremental-quality-fixture.log"
+
+      - name: Install locked ESLint 9
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --audit=false --fund=false
+          ./node_modules/.bin/eslint --version | tee "$RUNNER_TEMP/eslint-version.log"
+          grep -Fx 'v9.39.5' "$RUNNER_TEMP/eslint-version.log"
+
+      - name: Resolve incremental-quality baseline
+        id: quality-base
+        shell: bash
+        env:
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          PUSH_BEFORE_SHA: ${{ github.event.before || '' }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              quality_base="$PULL_REQUEST_BASE_SHA"
+              ;;
+            push)
+              quality_base="$PUSH_BEFORE_SHA"
+              ;;
+            workflow_dispatch)
+              quality_base="$(git rev-parse --verify HEAD^)"
+              ;;
+            *)
+              printf 'unsupported incremental-quality event: %s\n' "$GITHUB_EVENT_NAME" >&2
+              exit 2
+              ;;
+          esac
+          if [[ -z "$quality_base" || "$quality_base" =~ ^0+$ ]]; then
+            printf 'incremental-quality has no usable predecessor for %s\n' "$GITHUB_EVENT_NAME" >&2
+            exit 2
+          fi
+          quality_base_input="$(git rev-parse --verify "${quality_base}^{commit}")"
+          quality_base="$(git merge-base "$quality_base_input" HEAD)" || {
+            printf 'incremental-quality baseline has no common ancestor with HEAD: %s\n' \
+              "$quality_base_input" >&2
+            exit 2
+          }
+          quality_base="$(git rev-parse --verify "${quality_base}^{commit}")"
+          printf 'base_sha=%s\n' "$quality_base" >> "$GITHUB_OUTPUT"
+          printf 'Incremental-quality baseline: `%s` merge-base of `%s` and HEAD (%s)\n' \
+            "$quality_base" "$quality_base_input" "$GITHUB_EVENT_NAME" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run required incremental quality checks
+        shell: bash
+        env:
+          MINE_TELEOP_CLANG_FORMAT: clang-format-18
+          MINE_TELEOP_GIT_CLANG_FORMAT: git-clang-format-18
+          MINE_TELEOP_GIT_CLANG_FORMAT_VERSION: "18.1.8"
+          MINE_TELEOP_ESLINT: ${{ github.workspace }}/node_modules/.bin/eslint
+        run: |
+          set -euo pipefail
+          bash scripts/test/check_incremental_quality.sh \
+            --base "${{ steps.quality-base.outputs.base_sha }}" \
+            --require-format \
+            --require-eslint
+
+  docker-check:
+    name: Linux amd64 Docker check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      MINE_TELEOP_CHECK_PLATFORM: linux/amd64
+      MINE_TELEOP_BUILD_JOBS: "2"
+      DOCKER_BUILDKIT: "1"
+      BUILDKIT_PROGRESS: plain
+
+    steps:
+      - name: Check out MineTeleop
+        # actions/checkout v4.4.0; update through Dependabot and verify the commit.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Go for the pinned yq v4 fixture
+        # actions/setup-go v5.6.0; update through Dependabot and verify the commit.
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: "1.22.12"
+          check-latest: false
+
+      - name: Record Linux check inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          CI_LOG_DIR="$RUNNER_TEMP/mine-teleop-linux-check"
+          CI_TOOL_DIR="$RUNNER_TEMP/mine-teleop-linux-tools"
+          printf 'CI_LOG_DIR=%s\n' "$CI_LOG_DIR" >> "$GITHUB_ENV"
+          printf 'CI_TOOL_DIR=%s\n' "$CI_TOOL_DIR" >> "$GITHUB_ENV"
+          mkdir -p "$CI_LOG_DIR"
+          case "$(docker info --format '{{.Architecture}}')" in
+            amd64|x86_64) ;;
+            *)
+              printf 'The Linux Docker check requires an amd64 runner, got: %s\n' \
+                "$(docker info --format '{{.Architecture}}')" >&2
+              exit 1
+              ;;
+          esac
+          {
+            printf 'commit='; git rev-parse HEAD
+            printf 'requested_platform=%s\n' "$MINE_TELEOP_CHECK_PLATFORM"
+            printf 'build_jobs=%s\n' "$MINE_TELEOP_BUILD_JOBS"
+            printf 'runner_architecture=%s\n' "$(uname -m)"
+            printf 'docker_architecture=%s\n' "$(docker info --format '{{.Architecture}}')"
+            docker version --format 'docker_client={{.Client.Version}} docker_server={{.Server.Version}}'
+            printf 'bash='; bash --version | sed -n '1p'
+            printf 'go='; go version
+            printf 'node='; node --version
+            printf 'python='; python3 --version
+          } | tee "$CI_LOG_DIR/environment.log"
+
+      - name: Install admin YAML test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends argon2 python3-yaml
+          mkdir -p "$CI_TOOL_DIR"
+          {
+            printf 'python='; python3 --version
+            python3 -c 'import yaml; print(f"PyYAML={yaml.__version__}")'
+            printf 'openssl_path=%s\n' "$(command -v openssl)"
+            printf 'openssl='; openssl version
+            printf 'argon2_path=%s\n' "$(command -v argon2)"
+            dpkg-query -W -f='package=${binary:Package} version=${Version}\n' \
+              argon2 openssl python3-yaml
+          } | tee "$CI_LOG_DIR/admin-tool-versions.log"
+          GOBIN="$CI_TOOL_DIR" go install github.com/mikefarah/yq/v4@v4.44.3
+          "$CI_TOOL_DIR/yq" --version | tee "$CI_LOG_DIR/yq-version.log"
+          "$CI_TOOL_DIR/yq" --version | grep -Eq 'version v4\.'
+
+      - name: Run the required admin yq v4 fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATH="$CI_TOOL_DIR:$PATH" bash scripts/test/check_admin_credentials.sh --require 2>&1 | \
+            tee "$CI_LOG_DIR/admin-credentials-yq.log"
+          grep -Fx 'admin_credentials_test=passed' "$CI_LOG_DIR/admin-credentials-yq.log"
+          PATH="$CI_TOOL_DIR:$PATH" bash scripts/test/check_admin_yaml_editor.sh --require 2>&1 | \
+            tee "$CI_LOG_DIR/admin-yaml-editor-yq.log"
+          grep -Fx 'admin_yaml_editor_test=passed' "$CI_LOG_DIR/admin-yaml-editor-yq.log"
+
+      - name: Run the required admin PyYAML fallback fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$CI_TOOL_DIR/without-yq"
+          printf '#!/usr/bin/env bash\nexit 1\n' > "$CI_TOOL_DIR/without-yq/yq"
+          chmod 0755 "$CI_TOOL_DIR/without-yq/yq"
+          PATH="$CI_TOOL_DIR/without-yq:$PATH" bash scripts/test/check_admin_credentials.sh --require 2>&1 | \
+            tee "$CI_LOG_DIR/admin-credentials.log"
+          grep -Fx 'admin_credentials_test=passed' "$CI_LOG_DIR/admin-credentials.log"
+          PATH="$CI_TOOL_DIR/without-yq:$PATH" bash scripts/test/check_admin_yaml_editor.sh --require 2>&1 | \
+            tee "$CI_LOG_DIR/admin-yaml-editor.log"
+          grep -Fx 'admin_yaml_editor_test=passed' "$CI_LOG_DIR/admin-yaml-editor.log"
+
+      - name: Run the canonical Linux Docker check
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test/check.sh 2>&1 | tee "$CI_LOG_DIR/docker-check.log"
+
+      - name: Verify target hardening and record build provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_id=""
+          cleanup() {
+            if [[ -n "$container_id" ]]; then
+              docker rm -f "$container_id" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+          container_id="$(docker create --platform "$MINE_TELEOP_CHECK_PLATFORM" \
+            -e "MINE_TELEOP_SOURCE_REVISION=$(git rev-parse HEAD)" \
+            --entrypoint /bin/bash mine-teleop-cpp-check:local-build -lc '
+              /src/scripts/build/verify_build_provenance.sh \
+                --source-dir /src \
+                --source-revision "$MINE_TELEOP_SOURCE_REVISION" \
+                --build-dir /tmp/mine-teleop-build \
+                --output-dir /tmp/mine-teleop-build-provenance \
+                --dynamic-elf /opt/mine-teleop/bin/mine-teleop \
+                --dynamic-elf /opt/mine-teleop/bin/mine-teleop-control \
+                --dynamic-elf /opt/mine-teleop/bin/mine-teleop-signaling-server \
+                --dynamic-elf /opt/mine-teleop/bin/mine-teleop-aravis-camera \
+                --static-elf /opt/mine-teleop/bin/mine-teleop-run \
+                --artifact /opt/mine-teleop/bin/mine-teleop \
+                --artifact /opt/mine-teleop/bin/mine-teleop-run
+            ')"
+          docker start --attach "$container_id" 2>&1 | tee "$CI_LOG_DIR/hardening-provenance.log"
+          docker cp "$container_id:/tmp/mine-teleop-build-provenance/." \
+            "$CI_LOG_DIR/hardening-provenance"
+          docker rm "$container_id" >/dev/null
+          container_id=""
+          trap - EXIT
+
+      - name: Record registered Docker CTest tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --platform "$MINE_TELEOP_CHECK_PLATFORM" \
+            --entrypoint /bin/sh mine-teleop-cpp-check:local-build -ec '
+              printf "node="; node --version
+              printf "compiler="; c++ --version | sed -n "1p"
+              ctest --version | sed -n "1p"
+              ctest --test-dir /tmp/mine-teleop-build -N
+            ' 2>&1 | tee "$CI_LOG_DIR/ctest-registration.log"
+
+      - name: Summarize Docker CTest output
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf '### Linux Docker check\n\n'
+            printf 'Commit: %s\n' "$(git rev-parse HEAD)"
+            printf 'Requested platform: %s; build jobs: %s\n' \
+              "$MINE_TELEOP_CHECK_PLATFORM" "$MINE_TELEOP_BUILD_JOBS"
+            if [[ -f "$CI_LOG_DIR/docker-check.log" ]]; then
+              printf '%s\n' '- Canonical scripts/test/check.sh CTest lines:'
+              printf '\n```text\n'
+              grep -E '([0-9]+% tests passed|[0-9]+ tests passed out of|\*\*\*(Failed|Skipped|Timeout))' \
+                "$CI_LOG_DIR/docker-check.log" || true
+              printf '```\n'
+            else
+              printf '%s\n' '- The canonical Docker check did not start; see the failure artifact.'
+            fi
+            if [[ -f "$CI_LOG_DIR/admin-credentials.log" ]]; then
+              printf '%s\n' '- The yq v4 and PyYAML fallback fixtures run separately from Docker and must pass.'
+              printf '%s\n' '- Admin host fixture outcomes:'
+              printf '\n```text\n'
+              grep -hE '^admin_.*_test=(passed|skipped|failed)' "$CI_LOG_DIR"/admin-*.log || true
+              printf '```\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect failed Docker diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$CI_LOG_DIR"
+          {
+            printf 'commit='; git rev-parse HEAD
+            docker version
+            docker image ls --digests --no-trunc
+          } >"$CI_LOG_DIR/docker-diagnostics.log" 2>&1 || true
+
+      - name: Upload failed Linux Docker and CTest logs
+        if: failure()
+        # actions/upload-artifact v4.6.2; update through Dependabot and verify the commit.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mine-teleop-linux-check-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mine-teleop-linux-check
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build hardening evidence
+        if: always()
+        # actions/upload-artifact v4.6.2; update through Dependabot and verify the commit.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mine-teleop-build-provenance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mine-teleop-linux-check/hardening-provenance
+          if-no-files-found: warn
+          retention-days: 14

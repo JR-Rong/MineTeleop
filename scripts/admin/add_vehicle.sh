@@ -70,7 +70,8 @@ Required:
   --config YAML_PATH           signaling server multi-identity YAML
 
 Options:
-  --secrets-dir DIR            token directory (default: <yaml dir>/secrets)
+  --secrets-dir DIR            token directory (default: .local for repo configs,
+                               otherwise <yaml dir>/secrets)
   --assign-to-driver DRIVER_ID append the vehicle to this driver's permission
                                list; may be repeated
   --force                      overwrite an existing token file
@@ -88,318 +89,10 @@ EOF
 # YAML backend
 # ---------------------------------------------------------------------------
 
-yaml_engine=""
-
-select_yaml_engine() {
-  if command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -qi 'mikefarah\|version v4'; then
-    yaml_engine="yq"
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
-    yaml_engine="python"
-    if command -v yq >/dev/null 2>&1; then
-      warn "the yq on PATH is not mikefarah/yq v4; using the python3 fallback editor"
-    else
-      warn "yq (https://github.com/mikefarah/yq) not found; using the python3 fallback editor"
-    fi
-    return 0
-  fi
-  fail "no YAML backend available: install mikefarah/yq v4, or python3 with PyYAML"
-}
-
-# Embedded fallback editor. Reads/edits the YAML as text so comments, key order
-# and indentation survive; PyYAML is only used for the read-only queries.
-python_yaml() {
-  python3 - "$@" <<'PYTHON'
-import re
-import sys
-
-mode, path = sys.argv[1], sys.argv[2]
-arguments = sys.argv[3:]
-
-
-def die(message):
-    sys.stderr.write("yaml edit failed: %s\n" % message)
-    raise SystemExit(2)
-
-
-def load_text():
-    with open(path, "r", encoding="utf-8") as handle:
-        text = handle.read()
-    trailing_newline = text.endswith("\n")
-    lines = text.split("\n")
-    if trailing_newline:
-        lines.pop()
-    return lines, trailing_newline
-
-
-def store_text(lines, trailing_newline):
-    text = "\n".join(lines)
-    if trailing_newline:
-        text += "\n"
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(text)
-
-
-def indent_of(line):
-    return len(line) - len(line.lstrip(" "))
-
-
-def is_filler(line):
-    stripped = line.strip()
-    return stripped == "" or stripped.startswith("#")
-
-
-def block_end(lines, key_index, limit=None):
-    """Index just past the last content line owned by the key at key_index."""
-    base = indent_of(lines[key_index])
-    limit = len(lines) if limit is None else limit
-    end = key_index + 1
-    index = key_index + 1
-    while index < limit:
-        line = lines[index]
-        if is_filler(line):
-            index += 1
-            continue
-        current = indent_of(line)
-        if current > base or (current == base and line.lstrip().startswith("- ")):
-            end = index + 1
-            index += 1
-            continue
-        break
-    return end
-
-
-def find_key(lines, start, limit, key, indent=None):
-    pattern = re.compile(r"^( *)" + re.escape(key) + r":( *)(.*)$")
-    for index in range(start, limit):
-        match = pattern.match(lines[index])
-        if match is None:
-            continue
-        if indent is not None and len(match.group(1)) != indent:
-            continue
-        return index, match.group(3).strip()
-    return -1, ""
-
-
-def child_indent(lines, key_index, limit, default):
-    for index in range(key_index + 1, limit):
-        if is_filler(lines[index]):
-            continue
-        return indent_of(lines[index])
-    return default
-
-
-def sequence_indent(lines, start, limit, default):
-    for index in range(start, limit):
-        line = lines[index]
-        if is_filler(line):
-            continue
-        if line.lstrip().startswith("- "):
-            return indent_of(line)
-    return default
-
-
-def auth_section(lines, section):
-    auth_index, auth_inline = find_key(lines, 0, len(lines), "auth", indent=0)
-    if auth_index < 0:
-        die("top level `auth` mapping not found")
-    if auth_inline:
-        die("`auth` must be a block mapping, found an inline value")
-    auth_limit = block_end(lines, auth_index)
-    auth_child = child_indent(lines, auth_index, auth_limit, 2)
-    section_index, section_inline = find_key(
-        lines, auth_index + 1, auth_limit, section, indent=auth_child)
-    return auth_index, auth_limit, auth_child, section_index, section_inline
-
-
-def quote(value):
-    if re.match(r"^[A-Za-z0-9._/-]+$", value):
-        return value
-    return '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def parsed_document():
-    try:
-        import yaml
-    except ImportError:
-        die("PyYAML is required for the python fallback backend")
-    with open(path, "r", encoding="utf-8") as handle:
-        document = yaml.safe_load(handle)
-    if document is None:
-        document = {}
-    if not isinstance(document, dict):
-        die("config root must be a mapping")
-    return document
-
-
-def entries(section):
-    document = parsed_document()
-    auth = document.get("auth") or {}
-    if not isinstance(auth, dict):
-        die("`auth` must be a mapping")
-    items = auth.get(section) or []
-    if not isinstance(items, list):
-        die("`auth.%s` must be a sequence" % section)
-    return items
-
-
-if mode == "ids":
-    for entry in entries(arguments[0]):
-        if isinstance(entry, dict) and entry.get("id") is not None:
-            print(entry["id"])
-    raise SystemExit(0)
-
-if mode == "driver-vehicles":
-    driver_id = arguments[0]
-    for entry in entries("drivers"):
-        if not isinstance(entry, dict) or entry.get("id") != driver_id:
-            continue
-        for vehicle in entry.get("vehicles") or []:
-            print(vehicle)
-    raise SystemExit(0)
-
-if mode == "add-vehicle":
-    vehicle_id, token_path = arguments[0], arguments[1]
-    lines, trailing_newline = load_text()
-    auth_index, auth_limit, auth_child, index, inline = auth_section(lines, "vehicles")
-
-    if index < 0:
-        item = auth_child + 2
-        insert_at = block_end(lines, auth_index)
-        payload = [
-            " " * auth_child + "vehicles:",
-            " " * item + "- id: " + quote(vehicle_id),
-            " " * (item + 2) + "device_token_file: " + quote(token_path),
-        ]
-    else:
-        if inline and inline != "[]":
-            die("`auth.vehicles` uses an inline sequence; install mikefarah/yq v4 to edit it")
-        if inline == "[]":
-            lines[index] = " " * auth_child + "vehicles:"
-            item = auth_child + 2
-            insert_at = index + 1
-        else:
-            limit = block_end(lines, index, auth_limit)
-            item = sequence_indent(lines, index + 1, limit, auth_child + 2)
-            insert_at = limit
-        payload = [
-            " " * item + "- id: " + quote(vehicle_id),
-            " " * (item + 2) + "device_token_file: " + quote(token_path),
-        ]
-
-    lines[insert_at:insert_at] = payload
-    store_text(lines, trailing_newline)
-    raise SystemExit(0)
-
-if mode == "assign":
-    driver_id, vehicle_id = arguments[0], arguments[1]
-    lines, trailing_newline = load_text()
-    _, _, auth_child, drivers_index, drivers_inline = auth_section(lines, "drivers")
-    if drivers_index < 0:
-        die("`auth.drivers` not found, cannot assign the vehicle")
-    if drivers_inline:
-        die("`auth.drivers` uses an inline sequence; install mikefarah/yq v4 to edit it")
-
-    drivers_limit = block_end(lines, drivers_index, None)
-    item = sequence_indent(lines, drivers_index + 1, drivers_limit, auth_child + 2)
-
-    starts = [index for index in range(drivers_index + 1, drivers_limit)
-              if indent_of(lines[index]) == item and lines[index].lstrip().startswith("- ")]
-    span = None
-    for position, start in enumerate(starts):
-        stop = starts[position + 1] if position + 1 < len(starts) else drivers_limit
-        head = re.match(r"^ *- +id: *(.*)$", lines[start])
-        matched = head is not None and head.group(1).strip().strip("\"'") == driver_id
-        if not matched:
-            body, _ = find_key(lines, start + 1, stop, "id", indent=item + 2)
-            if body >= 0:
-                matched = lines[body].split(":", 1)[1].strip().strip("\"'") == driver_id
-        if matched:
-            span = (start, stop)
-            break
-    if span is None:
-        die("driver `%s` not found under auth.drivers" % driver_id)
-
-    start, stop = span
-    key_index, inline = find_key(lines, start, stop, "vehicles", indent=item + 2)
-    if key_index < 0:
-        insert_at = block_end(lines, start, stop)
-        payload = [
-            " " * (item + 2) + "vehicles:",
-            " " * (item + 4) + "- " + quote(vehicle_id),
-        ]
-    elif inline:
-        if not (inline.startswith("[") and inline.endswith("]")):
-            die("driver `%s` has an unsupported `vehicles` value" % driver_id)
-        existing = inline[1:-1].strip()
-        merged = "[%s]" % (quote(vehicle_id) if not existing
-                           else "%s, %s" % (existing, quote(vehicle_id)))
-        lines[key_index] = " " * (item + 2) + "vehicles: " + merged
-        store_text(lines, trailing_newline)
-        raise SystemExit(0)
-    else:
-        limit = block_end(lines, key_index, stop)
-        entry_indent = sequence_indent(lines, key_index + 1, limit, item + 4)
-        insert_at = limit
-        payload = [" " * entry_indent + "- " + quote(vehicle_id)]
-
-    lines[insert_at:insert_at] = payload
-    store_text(lines, trailing_newline)
-    raise SystemExit(0)
-
-die("unknown mode: %s" % mode)
-PYTHON
-}
-
-yaml_ids() {
-  local file="$1" section="$2"
-  case "$yaml_engine" in
-    yq)
-      # Literal paths rather than a dynamic key: `.auth[strenv(...)]` support
-      # varies across yq v4 releases.
-      if [[ "$section" == "vehicles" ]]; then
-        yq eval '(.auth.vehicles // [])[].id // ""' -- "$file"
-      else
-        yq eval '(.auth.drivers // [])[].id // ""' -- "$file"
-      fi
-      ;;
-    python) python_yaml ids "$file" "$section" ;;
-  esac
-}
-
-yaml_driver_vehicles() {
-  local file="$1" driver="$2"
-  case "$yaml_engine" in
-    yq)
-      DRIVER="$driver" yq eval \
-        '(.auth.drivers // [])[] | select(.id == strenv(DRIVER)) | (.vehicles // [])[]' -- "$file"
-      ;;
-    python) python_yaml driver-vehicles "$file" "$driver" ;;
-  esac
-}
-
-yaml_add_vehicle() {
-  local file="$1" vehicle="$2" token="$3"
-  case "$yaml_engine" in
-    yq)
-      VEHICLE="$vehicle" TOKEN="$token" yq eval -i \
-        '.auth.vehicles += [{"id": strenv(VEHICLE), "device_token_file": strenv(TOKEN)}]' -- "$file"
-      ;;
-    python) python_yaml add-vehicle "$file" "$vehicle" "$token" ;;
-  esac
-}
-
-yaml_assign_vehicle() {
-  local file="$1" driver="$2" vehicle="$3"
-  case "$yaml_engine" in
-    yq)
-      DRIVER="$driver" VEHICLE="$vehicle" yq eval -i \
-        '(.auth.drivers[] | select(.id == strenv(DRIVER)) | .vehicles) += [strenv(VEHICLE)]' -- "$file"
-      ;;
-    python) python_yaml assign "$file" "$driver" "$vehicle" ;;
-  esac
-}
+# Keep this user-facing entrypoint and its credential transaction local; the
+# shared library owns only engine dispatch and YAML edits.
+# shellcheck source=lib/yaml_editor.sh
+source "$script_dir/lib/yaml_editor.sh"
 
 # ---------------------------------------------------------------------------
 # Arguments
@@ -482,31 +175,38 @@ select_yaml_engine
 
 config_path="$(CDPATH= cd -- "$(dirname -- "$config_path")" && pwd)/$(basename -- "$config_path")"
 config_dir="$(dirname -- "$config_path")"
-# The default credential directory is resolved against the config directory so
-# the recorded device_token_file stays relative to the YAML. An explicit
-# --secrets-dir is resolved against the caller's CWD (matching add_driver.sh).
+# Keep credentials generated for repository development configs out of the
+# distributable configs tree. Installed /etc-style configs continue to use a
+# sibling secrets directory. An explicit --secrets-dir is resolved against the
+# caller's CWD (matching add_driver.sh).
 if [[ -z "$secrets_dir" ]]; then
-  secrets_dir="$config_dir/secrets"
+  if [[ "$config_dir" == "$repo_root/configs" ]]; then
+    secrets_dir="$repo_root/.local/secrets/$(basename -- "$config_path" .yaml)"
+  else
+    secrets_dir="$config_dir/secrets"
+  fi
 elif [[ "$secrets_dir" != /* ]]; then
   secrets_dir="$PWD/$secrets_dir"
 fi
 secrets_dir="${secrets_dir%/}"
 token_path="$secrets_dir/${vehicle_id}.token"
 
-# `device_token_file` is resolved relative to the config directory by the server,
-# so prefer a relative reference. The plain prefix strip keeps the common case
-# working without GNU realpath (BSD/macOS lacks --relative-to).
-case "$token_path" in
-  "$config_dir"/*)
-    token_reference="${token_path#"$config_dir"/}"
-    ;;
-  *)
-    token_reference="$(realpath --relative-to="$config_dir" -m -- "$token_path" 2>/dev/null || true)"
-    if [[ -z "$token_reference" || "$token_reference" == ..* ]]; then
-      token_reference="$(realpath -m -- "$token_path" 2>/dev/null || printf '%s' "$token_path")"
-    fi
-    ;;
-esac
+# `device_token_file` is resolved relative to the config directory by the server.
+# The repository's `configs/` and `.local/` directories are siblings, but that
+# relationship must not be assumed for an arbitrary YAML supplied by the caller.
+token_reference="$token_path"
+if [[ "$config_dir" == "$repo_root/configs" && "$token_path" == "$repo_root/.local/"* ]]; then
+  token_reference="../${token_path#"$repo_root"/}"
+elif [[ "$token_path" == "$config_dir/"* ]]; then
+  token_reference="${token_path#"$config_dir"/}"
+else
+  relative="$(realpath --relative-to="$config_dir" -m -- "$token_path" 2>/dev/null || true)"
+  if [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
+    token_reference="$relative"
+  else
+    token_reference="$(realpath -m -- "$token_path" 2>/dev/null || printf '%s' "$token_path")"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Validation against the current config
@@ -651,14 +351,24 @@ fi
 created_token="no"
 created_secrets_dir="no"
 temporary_config=""
+temporary_token=""
+token_backup=""
 committed="no"
 
 cleanup() {
   [[ -z "$temporary_config" ]] || rm -f -- "$temporary_config"
+  [[ -z "$temporary_token" ]] || rm -f -- "$temporary_token"
   if [[ "$committed" != "yes" && "$created_token" == "yes" ]]; then
-    rm -f -- "$token_path"
-    warn "removed the freshly generated token $token_path because the config was not updated"
+    if [[ -n "$token_backup" && -f "$token_backup" ]]; then
+      mv -f -- "$token_backup" "$token_path"
+      token_backup=""
+      warn "restored the previous token because the config was not updated"
+    else
+      rm -f -- "$token_path"
+      warn "removed the freshly generated token $token_path because the config was not updated"
+    fi
   fi
+  [[ -z "$token_backup" ]] || rm -f -- "$token_backup"
   if [[ "$committed" != "yes" && "$created_secrets_dir" == "yes" ]]; then
     rmdir -- "$secrets_dir" 2>/dev/null || true
   fi
@@ -670,21 +380,34 @@ step "generating device token"
 if [[ ! -d "$secrets_dir" ]]; then
   mkdir -p -- "$secrets_dir"
   created_secrets_dir="yes"
-  chmod 0700 -- "$secrets_dir"
+  chmod 0700 "$secrets_dir"
   note "created $secrets_dir (mode 0700)"
 fi
 [[ -d "$secrets_dir" && -w "$secrets_dir" ]] || fail "secrets directory is not writable: $secrets_dir"
 
+temporary_token="$(mktemp "$secrets_dir/.${vehicle_id}.token.XXXXXX")"
 if ! (
   umask 077
-  openssl rand -hex 32 >"$token_path"
+  openssl rand -hex 32 >"$temporary_token"
 ); then
-  rm -f -- "$token_path"
+  rm -f -- "$temporary_token"
+  temporary_token=""
   fail "openssl failed to generate a device token for $vehicle_id"
 fi
+chmod 0600 "$temporary_token"
+[[ -n "$(tr -d '[:space:]' <"$temporary_token")" ]] || fail "generated token file is empty"
+if [[ -e "$token_path" ]]; then
+  backup_candidate="$(mktemp "$secrets_dir/.${vehicle_id}.token.backup.XXXXXX")"
+  if ! cp -p "$token_path" "$backup_candidate"; then
+    rm -f -- "$backup_candidate"
+    fail "cannot back up the existing token: $token_path"
+  fi
+  chmod 0600 "$backup_candidate"
+  token_backup="$backup_candidate"
+fi
 created_token="yes"
-chmod 0600 -- "$token_path"
-[[ -n "$(tr -d '[:space:]' <"$token_path")" ]] || fail "generated token file is empty: $token_path"
+mv -f -- "$temporary_token" "$token_path"
+temporary_token=""
 ok "wrote $token_path (mode 0600)"
 
 step "updating $config_path"
@@ -721,10 +444,12 @@ if [[ -n "$validator" ]]; then
   fi
 fi
 
-chmod "$config_mode" -- "$temporary_config"
+chmod "$config_mode" "$temporary_config"
 mv -f -- "$temporary_config" "$config_path"
 temporary_config=""
 committed="yes"
+[[ -z "$token_backup" ]] || rm -f -- "$token_backup"
+token_backup=""
 ok "updated $config_path"
 
 # ---------------------------------------------------------------------------

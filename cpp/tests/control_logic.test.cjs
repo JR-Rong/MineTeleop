@@ -1,10 +1,13 @@
 'use strict';
 
 const assert = require('assert').strict;
+const childProcess = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const {pathToFileURL} = require('url');
 const logic = require('../web/control_logic.js');
-const controlPageSource = fs.readFileSync(path.join(__dirname, '../src/server.cpp'), 'utf8');
+const controlPageSource = fs.readFileSync(path.join(__dirname, '../web/control_console.js'), 'utf8');
 
 let passed = 0;
 let failed = 0;
@@ -43,6 +46,60 @@ test('browser native intent envelope is bound to the connected session generatio
       controlPageSource.includes(
           "nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot=''"),
       true);
+});
+
+test('console bootstrap fails closed before it wires controls', () => {
+  const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'mine-teleop-console-bootstrap-'));
+  const fixtureModule = path.join(fixtureDirectory, 'control_console.mjs');
+  const bootstrapStart = controlPageSource.indexOf('let consoleConfig;');
+  const bootstrapEnd = controlPageSource.indexOf('const pageCapability=', bootstrapStart);
+  const firstControlWiring = Math.min(
+      controlPageSource.indexOf("addEventListener('pagehide'"),
+      controlPageSource.indexOf("document.querySelector('#login').onclick"),
+      controlPageSource.indexOf("addEventListener('keydown'"));
+  assert.ok(bootstrapStart >= 0 && bootstrapEnd > bootstrapStart);
+  assert.ok(firstControlWiring > bootstrapEnd,
+      'console control wiring must stay after runtime configuration bootstrap');
+  const bootstrapFixture = [
+    'const controlLogic=MineTeleopControlLogic;',
+    'async function bootstrapConsole(){',
+    controlPageSource.slice(bootstrapStart, bootstrapEnd),
+    '}',
+    'void bootstrapConsole().catch(console.error);',
+  ].join('\n');
+  fs.writeFileSync(fixtureModule, bootstrapFixture, 'utf8');
+  try {
+    const fixtureUrl = pathToFileURL(fixtureModule).href;
+    const harness = `
+      const events=[];
+      const status={textContent:''};
+      globalThis.MineTeleopControlLogic={};
+      globalThis.fetch=async (url,options)=>{
+        events.push({kind:'fetch',url,cache:options&&options.cache});
+        throw new Error('fixture config outage');
+      };
+      globalThis.document={getElementById:id=>id==='status'?status:null};
+      globalThis.addEventListener=name=>events.push({kind:'listener',name});
+      import(${JSON.stringify(fixtureUrl)}).then(
+        ()=>new Promise(resolve=>setImmediate(resolve))
+      ).then(
+        ()=>process.stdout.write(JSON.stringify({events,status,result:{resolved:true}})),
+        error=>{process.stderr.write(String(error&&error.stack||error));process.exitCode=1;});
+    `;
+    const child = childProcess.spawnSync(
+        process.execPath,
+        ['--input-type=module', '--eval', harness],
+        {encoding: 'utf8', timeout: 5000});
+    if (child.error) throw child.error;
+    assert.equal(child.status, 0, child.stderr || 'console bootstrap fixture failed');
+    const result = JSON.parse(child.stdout);
+    assert.deepEqual(result.events, [{kind: 'fetch', url: '/api/console-config', cache: 'no-store'}]);
+    assert.equal(result.status.textContent, '控制台配置加载失败；驾驶控制未启用');
+    assert.equal(result.result.resolved, true);
+  } finally {
+    if (fs.existsSync(fixtureModule)) fs.unlinkSync(fixtureModule);
+    fs.rmdirSync(fixtureDirectory);
+  }
 });
 
 test('fixed keyboard bindings expose two brakes and paired direction keys', () => {

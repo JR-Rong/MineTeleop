@@ -1,4 +1,5 @@
-FROM ubuntu:22.04 AS ubuntu-build-base
+ARG MINE_TELEOP_UBUNTU_BASE=docker.io/library/ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
+FROM ${MINE_TELEOP_UBUNTU_BASE} AS ubuntu-build-base
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get -o Acquire::Retries=10 -o Acquire::http::Timeout=30 update \
@@ -114,13 +115,14 @@ RUN git init /tmp/libsrtp \
     && git -C /tmp/libsrtp checkout --detach FETCH_HEAD \
     && test "$(git -C /tmp/libsrtp rev-parse HEAD)" = "$LIBSRTP_COMMIT"
 ARG MINE_TELEOP_BUILD_TESTS=OFF
+ARG MINE_TELEOP_BUILD_JOBS=2
 RUN cmake -S /tmp/libsrtp -B /tmp/libsrtp-build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX=/opt/libsrtp \
       -DBUILD_SHARED_LIBS=ON \
       -DENABLE_OPENSSL=ON \
       -DTEST_APPS="$MINE_TELEOP_BUILD_TESTS" \
-    && cmake --build /tmp/libsrtp-build --parallel 2 \
+    && cmake --build /tmp/libsrtp-build --parallel "$MINE_TELEOP_BUILD_JOBS" \
     && if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \
          ctest --test-dir /tmp/libsrtp-build --output-on-failure; \
        fi \
@@ -172,14 +174,17 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
 RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
     && apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
+        argon2 \
         build-essential \
         ca-certificates \
         cmake \
         libcurl4-openssl-dev \
+        libargon2-dev \
         libgstreamer1.0-dev \
         libgstreamer-plugins-base1.0-dev \
         libgstreamer-plugins-bad1.0-dev \
         gstreamer1.0-plugins-base \
+        gstreamer1.0-plugins-good \
         libglib2.0-dev \
         libjpeg-dev \
         libusb-1.0-0-dev \
@@ -209,6 +214,7 @@ WORKDIR /src
 COPY . .
 RUN cmake -S . -B /tmp/mine-teleop-build \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
       -DCMAKE_INSTALL_PREFIX=/opt/mine-teleop \
       -DMINE_TELEOP_BUILD_TESTS="$MINE_TELEOP_BUILD_TESTS" \
     && cmake --build /tmp/mine-teleop-build --parallel "$MINE_TELEOP_BUILD_JOBS" \
@@ -321,13 +327,24 @@ RUN set -e; \
         /bundle/bin/gst-launch-1.0 -q fakesrc num-buffers=1 sizetype=fixed sizemax=100 filltype=zero \
         '!' 'application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96,ssrc=(uint)1' \
         '!' srtpenc random-key=true '!' fakesink; \
-      for plugin in webrtcbin sctpenc sctpdec dtlsenc dtlsdec v4l2src va h264parse rtph264pay; do \
+      recording_probe_dir="$(mktemp -d)"; \
+      GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib \
+        /bundle/bin/gst-launch-1.0 -q -e \
+        videotestsrc num-buffers=90 '!' 'video/x-raw,framerate=30/1,width=160,height=120' '!' tee name=fanout \
+        fanout. '!' queue '!' fakesink sync=false \
+        fanout. '!' queue '!' jpegenc '!' splitmuxsink async-finalize=true muxer-factory=qtmux max-size-time=500000000 \
+        location="$recording_probe_dir/fragment-%05d.mp4"; \
+      test -s "$recording_probe_dir/fragment-00000.mp4"; \
+      GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib \
+        /bundle/bin/gst-launch-1.0 -q filesrc location="$recording_probe_dir/fragment-00000.mp4" '!' qtdemux '!' fakesink; \
+      rm -rf "$recording_probe_dir"; \
+      for plugin in webrtcbin sctpenc sctpdec dtlsenc dtlsdec v4l2src va h264parse rtph264pay splitmuxsink qtmux jpegenc qtdemux; do \
         GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib \
           /bundle/bin/gst-inspect-1.0 "$plugin" >/dev/null; \
       done; \
     fi
 
-FROM ubuntu:22.04 AS runtime
+FROM ${MINE_TELEOP_UBUNTU_BASE} AS runtime
 
 COPY --from=bundle /bundle /opt/mine-teleop
 ENV PATH="/opt/mine-teleop/bin:${PATH}"

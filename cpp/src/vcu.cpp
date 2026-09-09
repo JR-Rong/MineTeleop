@@ -298,6 +298,7 @@ void ParallelController::reset() {
   handshake_revoked_ = false;
   revoked_handshake_status_ = 0;
   receive_generation_ = 0;
+  transition_epoch_ = 0;
   state_entry_generation_ = 0;
   handshake_generation_ = 0;
   gear_generation_ = 0;
@@ -531,6 +532,8 @@ bool ParallelController::ingest(const CanFrame& frame) {
 }
 
 void ParallelController::enter(State state) {
+  if (state_ != state)
+    ++transition_epoch_;
   state_ = state;
   state_entry_generation_ = receive_generation_;
 }
@@ -785,6 +788,8 @@ std::vector<CanFrame> ParallelController::tick() {
     brake_pressure = emergency_.brake_pressure_bar;
   } else if (state_ == State::DisarmParkingBrake) {
     gear = kNeutralGear;
+    brake_mode.fill(kByWireMode);
+    brake_pressure = emergency_.brake_pressure_bar;
     parking_brake.fill(kParkingBrakePark);
   } else if (state_ == State::DisarmManual) {
     gear = kNeutralGear;
@@ -857,6 +862,14 @@ bool ParallelController::handshake_revoked() const {
 
 int ParallelController::revoked_handshake_status() const {
   return revoked_handshake_status_;
+}
+
+std::uint64_t ParallelController::transition_epoch() const {
+  return transition_epoch_;
+}
+
+std::uint64_t ParallelController::state_entry_generation() const {
+  return state_entry_generation_;
 }
 
 bool ParallelController::feedback_complete() const {

@@ -5,7 +5,6 @@ project(mine_teleop VERSION 0.2.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(WIN32)
   set(MINE_TELEOP_VEHICLE_DEFAULT OFF)
@@ -29,9 +28,40 @@ option(MINE_TELEOP_BUILD_VEHICLE_RUNTIME "Build Linux vehicle media and packagin
 option(MINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES "Build camera bridges when bundled vendor SDKs are present" ON)
 option(MINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE "Build the lightweight Aravis USB3 Vision camera bridge" ON)
 option(MINE_TELEOP_FETCH_MISSING_DEPS "Fetch pinned yaml-cpp and nlohmann-json sources when absent" OFF)
+if(UNIX AND NOT APPLE)
+  set(MINE_TELEOP_STATIC_LAUNCHER_DEFAULT ON)
+else()
+  set(MINE_TELEOP_STATIC_LAUNCHER_DEFAULT OFF)
+endif()
+option(
+  MINE_TELEOP_STATIC_LAUNCHER
+  "Build mine-teleop-run as a Linux static executable"
+  ${MINE_TELEOP_STATIC_LAUNCHER_DEFAULT}
+)
 set(MINE_TELEOP_MVS_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/mvs" CACHE PATH "Bundled Hikrobot MVS SDK root")
 set(MINE_TELEOP_CURL_LINKAGE "unknown" CACHE STRING "How libcurl is linked into the control client")
 
+# Password verification is deliberately an optional implementation dependency
+# for control-only packages, but it is mandatory whenever the signaling server
+# or its native tests are built. Do not silently replace Argon2id with a fast
+# digest when a packaging image is incomplete.
+set(MINE_TELEOP_NEEDS_ARGON2ID OFF)
+if(MINE_TELEOP_BUILD_SIGNALING_SERVER OR MINE_TELEOP_BUILD_TESTS)
+  set(MINE_TELEOP_NEEDS_ARGON2ID ON)
+endif()
+find_path(MINE_TELEOP_ARGON2_INCLUDE_DIR NAMES argon2.h)
+find_library(MINE_TELEOP_ARGON2_LIBRARY NAMES argon2 libargon2)
+set(MINE_TELEOP_HAS_ARGON2ID 0)
+if(MINE_TELEOP_ARGON2_INCLUDE_DIR AND MINE_TELEOP_ARGON2_LIBRARY)
+  set(MINE_TELEOP_HAS_ARGON2ID 1)
+elseif(MINE_TELEOP_NEEDS_ARGON2ID)
+  message(FATAL_ERROR
+    "Argon2id is required to build the signaling server or native tests. Install the packaged Argon2 development dependency.")
+endif()
+
+if(MINE_TELEOP_STATIC_LAUNCHER AND NOT (UNIX AND NOT APPLE))
+  message(FATAL_ERROR "MINE_TELEOP_STATIC_LAUNCHER is supported only for Linux builds")
+endif()
 find_package(Threads REQUIRED)
 if(WIN32)
   find_package(ZLIB REQUIRED)
@@ -84,6 +114,13 @@ else()
 endif()
 include(GNUInstallDirs)
 include(cmake/SplitMsvcStringLiterals.cmake)
+include(cmake/Hardening.cmake)
+if(MINE_TELEOP_ENABLE_SANITIZERS AND MINE_TELEOP_STATIC_LAUNCHER AND
+   MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
+  message(FATAL_ERROR
+    "ASan/UBSan builds must set -DMINE_TELEOP_STATIC_LAUNCHER=OFF; "
+    "the static launcher cannot carry the sanitizer runtime.")
+endif()
 
 set(MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_logic.js")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}")
@@ -97,24 +134,60 @@ mine_teleop_make_adjacent_raw_literals(
   MINE_TELEOP_CONTROL_LOGIC_JS_CHUNK_COUNT
   MINE_TELEOP_CONTROL_LOGIC_JS_MAX_CHUNK_BYTES
 )
+
+set(MINE_TELEOP_CONTROL_CONSOLE_HTML_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_console.html")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_CONSOLE_HTML_SOURCE}")
+file(READ "${MINE_TELEOP_CONTROL_CONSOLE_HTML_SOURCE}" MINE_TELEOP_CONTROL_CONSOLE_HTML)
+string(REPLACE "\r\n" "\n" MINE_TELEOP_CONTROL_CONSOLE_HTML "${MINE_TELEOP_CONTROL_CONSOLE_HTML}")
+string(REPLACE "\r" "\n" MINE_TELEOP_CONTROL_CONSOLE_HTML "${MINE_TELEOP_CONTROL_CONSOLE_HTML}")
+mine_teleop_make_adjacent_raw_literals(
+  "${MINE_TELEOP_CONTROL_CONSOLE_HTML}"
+  "MT_CONSOLE_HTML"
+  MINE_TELEOP_CONTROL_CONSOLE_HTML_LITERALS
+  MINE_TELEOP_CONTROL_CONSOLE_HTML_CHUNK_COUNT
+  MINE_TELEOP_CONTROL_CONSOLE_HTML_MAX_CHUNK_BYTES
+)
+
+set(MINE_TELEOP_CONTROL_CONSOLE_CSS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_console.css")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_CONSOLE_CSS_SOURCE}")
+file(READ "${MINE_TELEOP_CONTROL_CONSOLE_CSS_SOURCE}" MINE_TELEOP_CONTROL_CONSOLE_CSS)
+string(REPLACE "\r\n" "\n" MINE_TELEOP_CONTROL_CONSOLE_CSS "${MINE_TELEOP_CONTROL_CONSOLE_CSS}")
+string(REPLACE "\r" "\n" MINE_TELEOP_CONTROL_CONSOLE_CSS "${MINE_TELEOP_CONTROL_CONSOLE_CSS}")
+mine_teleop_make_adjacent_raw_literals(
+  "${MINE_TELEOP_CONTROL_CONSOLE_CSS}"
+  "MT_CONSOLE_CSS"
+  MINE_TELEOP_CONTROL_CONSOLE_CSS_LITERALS
+  MINE_TELEOP_CONTROL_CONSOLE_CSS_CHUNK_COUNT
+  MINE_TELEOP_CONTROL_CONSOLE_CSS_MAX_CHUNK_BYTES
+)
+
+set(MINE_TELEOP_CONTROL_CONSOLE_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_console.js")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_CONSOLE_JS_SOURCE}")
+file(READ "${MINE_TELEOP_CONTROL_CONSOLE_JS_SOURCE}" MINE_TELEOP_CONTROL_CONSOLE_JS)
+string(REPLACE "\r\n" "\n" MINE_TELEOP_CONTROL_CONSOLE_JS "${MINE_TELEOP_CONTROL_CONSOLE_JS}")
+string(REPLACE "\r" "\n" MINE_TELEOP_CONTROL_CONSOLE_JS "${MINE_TELEOP_CONTROL_CONSOLE_JS}")
+mine_teleop_make_adjacent_raw_literals(
+  "${MINE_TELEOP_CONTROL_CONSOLE_JS}"
+  "MT_CONSOLE_JS"
+  MINE_TELEOP_CONTROL_CONSOLE_JS_LITERALS
+  MINE_TELEOP_CONTROL_CONSOLE_JS_CHUNK_COUNT
+  MINE_TELEOP_CONTROL_CONSOLE_JS_MAX_CHUNK_BYTES
+)
+
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop")
 configure_file(
   cmake/control_logic_js.hpp.in
   "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop/control_logic_js.hpp"
   @ONLY
 )
+configure_file(
+  cmake/console_assets.hpp.in
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop/console_assets.hpp"
+  @ONLY
+)
 
 set(MINE_TELEOP_SERVER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/server.cpp")
-set(MINE_TELEOP_GENERATED_SERVER_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/src/server.cpp")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_SERVER_SOURCE}")
-# Keep server.cpp as the canonical source while compiling a byte-equivalent
-# generated copy whose large HTML raw strings are safe for MSVC.
-mine_teleop_split_cpp_raw_literals(
-  "${MINE_TELEOP_SERVER_SOURCE}"
-  "${MINE_TELEOP_GENERATED_SERVER_SOURCE}"
-  "HTML"
-)
-set_source_files_properties("${MINE_TELEOP_GENERATED_SERVER_SOURCE}" PROPERTIES GENERATED TRUE)
 
 function(mine_teleop_enable_warnings target)
   if(MSVC)
@@ -122,9 +195,11 @@ function(mine_teleop_enable_warnings target)
   else()
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror=return-type)
   endif()
+  mine_teleop_enable_target_hardening(${target} ${ARGN})
 endfunction()
 
 add_library(mine_teleop_vcu cpp/src/vcu.cpp)
+set_target_properties(mine_teleop_vcu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(mine_teleop_vcu
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>
@@ -132,15 +207,30 @@ target_include_directories(mine_teleop_vcu
 )
 mine_teleop_enable_warnings(mine_teleop_vcu)
 
+# Vehicle diagnostics use a private bounded sink so a stalled launcher pipe
+# cannot block media/control callbacks. Keep it separate from the portable
+# runtime library: no control-only package should gain a media logging dependency.
+add_library(mine_teleop_diagnostic_emitter cpp/src/diagnostic_emitter.cpp)
+set_target_properties(mine_teleop_diagnostic_emitter PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(mine_teleop_diagnostic_emitter
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>
+    $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(mine_teleop_diagnostic_emitter PUBLIC Threads::Threads)
+mine_teleop_enable_warnings(mine_teleop_diagnostic_emitter)
+
 # This library is the shared protocol/session/HTTP core used by all control
 # packages. It intentionally has no camera, JPEG, or GStreamer dependency.
 add_library(mine_teleop_runtime
+  cpp/src/credentials.cpp
   cpp/src/core.cpp
   cpp/src/http.cpp
   cpp/src/platform.cpp
-  "${MINE_TELEOP_GENERATED_SERVER_SOURCE}"
+  "${MINE_TELEOP_SERVER_SOURCE}"
   cpp/src/websocket.cpp
 )
+set_target_properties(mine_teleop_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(mine_teleop_runtime
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>
@@ -156,6 +246,16 @@ target_link_libraries(mine_teleop_runtime
     nlohmann_json::nlohmann_json
     ${CMAKE_DL_LIBS}
 )
+target_compile_definitions(
+  mine_teleop_runtime
+  PRIVATE
+    MINE_TELEOP_HAS_ARGON2ID=${MINE_TELEOP_HAS_ARGON2ID}
+    MINE_TELEOP_HAS_OPENSSL_CRYPTO=$<NOT:$<BOOL:${APPLE}>>
+)
+if(MINE_TELEOP_HAS_ARGON2ID)
+  target_include_directories(mine_teleop_runtime PRIVATE "${MINE_TELEOP_ARGON2_INCLUDE_DIR}")
+  target_link_libraries(mine_teleop_runtime PRIVATE "${MINE_TELEOP_ARGON2_LIBRARY}")
+endif()
 if(APPLE)
   target_link_libraries(mine_teleop_runtime PUBLIC "${MINE_TELEOP_SECURITY_FRAMEWORK}")
 else()
@@ -210,6 +310,7 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
     cpp/src/video.cpp
     cpp/src/webrtc_media.cpp
   )
+  set_target_properties(mine_teleop_vehicle_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(mine_teleop_vehicle_runtime
     PUBLIC
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>
@@ -218,6 +319,7 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
   target_link_libraries(mine_teleop_vehicle_runtime
     PUBLIC
       mine_teleop_runtime
+      mine_teleop_diagnostic_emitter
       JPEG::JPEG
       PkgConfig::GSTREAMER
   )
@@ -232,13 +334,22 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
   )
 
   add_executable(mine-teleop-run cpp/apps/mine_teleop_launcher.cpp)
-  mine_teleop_enable_warnings(mine-teleop-run)
-  target_link_options(mine-teleop-run PRIVATE -static)
+  target_include_directories(mine-teleop-run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include)
+  if(MINE_TELEOP_STATIC_LAUNCHER)
+    target_link_options(mine-teleop-run PRIVATE -static)
+    mine_teleop_enable_warnings(mine-teleop-run STATIC_EXECUTABLE)
+  else()
+    mine_teleop_enable_warnings(mine-teleop-run)
+  endif()
 
   if(MINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE)
     pkg_check_modules(ARAVIS QUIET IMPORTED_TARGET aravis-0.8)
     if(ARAVIS_FOUND)
       add_executable(mine-teleop-aravis-camera cpp/bridges/aravis_camera_bridge.cpp)
+      target_include_directories(
+        mine-teleop-aravis-camera
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
+      )
       target_link_libraries(mine-teleop-aravis-camera PRIVATE PkgConfig::ARAVIS JPEG::JPEG)
       mine_teleop_enable_warnings(mine-teleop-aravis-camera)
       set_target_properties(mine-teleop-aravis-camera PROPERTIES
@@ -268,8 +379,14 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
     )
     if(MINE_TELEOP_MVS_INCLUDE_DIR AND MINE_TELEOP_MVS_LIBRARY)
       add_executable(mine-teleop-mvs-camera cpp/bridges/mvs_camera_bridge.cpp)
-      target_include_directories(mine-teleop-mvs-camera PRIVATE "${MINE_TELEOP_MVS_INCLUDE_DIR}")
+      target_include_directories(
+        mine-teleop-mvs-camera
+        PRIVATE
+          ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
+          "${MINE_TELEOP_MVS_INCLUDE_DIR}"
+      )
       target_link_libraries(mine-teleop-mvs-camera PRIVATE "${MINE_TELEOP_MVS_LIBRARY}")
+      mine_teleop_enable_warnings(mine-teleop-mvs-camera)
       set_target_properties(mine-teleop-mvs-camera PROPERTIES INSTALL_RPATH "$ORIGIN/../lib/vendor/mvs")
       install(TARGETS mine-teleop-mvs-camera RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
       install(DIRECTORY "${MINE_TELEOP_MVS_SDK_ROOT}/lib/" DESTINATION ${CMAKE_INSTALL_LIBDIR}/vendor/mvs
@@ -292,7 +409,22 @@ install(TARGETS mine_teleop_runtime
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(DIRECTORY cpp/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(DIRECTORY configs/ DESTINATION share/mine-teleop/configs)
+set(MINE_TELEOP_DISTRIBUTABLE_CONFIGS
+  configs/driver-console-002.dev.yaml
+  configs/driver-console.dev.yaml
+  configs/driver-console.three-machine.dev.yaml
+  configs/mine-teleop-field-root.crt
+  configs/signaling-server.2x2.dev.yaml
+  configs/signaling-server.browser-switch.dev.yaml
+  configs/vehicle-agent.bench.yaml
+  configs/vehicle-agent.ccg2-8m.yaml
+  configs/vehicle-agent.dev.yaml
+  configs/vehicle-agent.three-machine.field.yaml
+)
+install(
+  FILES ${MINE_TELEOP_DISTRIBUTABLE_CONFIGS}
+  DESTINATION share/mine-teleop/configs
+)
 install(DIRECTORY protocol/ DESTINATION share/mine-teleop/protocol)
 
 if(MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
@@ -314,8 +446,59 @@ endif()
 
 if(MINE_TELEOP_BUILD_TESTS)
   enable_testing()
+  find_program(MINE_TELEOP_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
+  add_executable(
+    mine-teleop-protocol-v1-contract-tests
+    cpp/tests/protocol_contract_tests.cpp
+  )
+  target_link_libraries(mine-teleop-protocol-v1-contract-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-protocol-v1-contract-tests)
+  add_test(
+    NAME mine-teleop-protocol-v1-contract-tests
+    COMMAND mine-teleop-protocol-v1-contract-tests
+  )
+  set_tests_properties(
+    mine-teleop-protocol-v1-contract-tests
+    PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  add_test(
+    NAME mine-teleop-protocol-v1-schema-js-tests
+    COMMAND ${MINE_TELEOP_NODE_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_protocol_contract_vectors.cjs
+  )
+  set_tests_properties(
+    mine-teleop-protocol-v1-schema-js-tests
+    PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  add_executable(mine-teleop-json-escape-tests cpp/tests/json_escape_tests.cpp)
+  target_include_directories(
+    mine-teleop-json-escape-tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
+  )
+  target_link_libraries(
+    mine-teleop-json-escape-tests
+    PRIVATE nlohmann_json::nlohmann_json
+  )
+  set_target_properties(mine-teleop-json-escape-tests PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+  )
+  mine_teleop_enable_warnings(mine-teleop-json-escape-tests)
+  add_test(NAME mine-teleop-json-escape-tests COMMAND mine-teleop-json-escape-tests)
+
+  add_executable(mine-teleop-diagnostic-emitter-tests cpp/tests/diagnostic_emitter_tests.cpp)
+  target_link_libraries(
+    mine-teleop-diagnostic-emitter-tests
+    PRIVATE
+      mine_teleop_diagnostic_emitter
+      nlohmann_json::nlohmann_json
+  )
+  mine_teleop_enable_warnings(mine-teleop-diagnostic-emitter-tests)
+  add_test(NAME mine-teleop-diagnostic-emitter-tests COMMAND mine-teleop-diagnostic-emitter-tests)
+
   if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
-    find_program(MINE_TELEOP_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
     add_test(
       NAME mine-teleop-control-logic-js-tests
       COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/control_logic.test.cjs
@@ -386,6 +569,70 @@ if(MINE_TELEOP_BUILD_TESTS)
       COMMAND mine-teleop-signaling-server --host 0.0.0.0 --port 0
     )
     set_tests_properties(mine-teleop-signaling-rejects-public-bind PROPERTIES WILL_FAIL TRUE)
+    add_test(
+      NAME mine-teleop-signaling-rejects-zero-connection-limit
+      COMMAND ${CMAKE_COMMAND} -E env
+        --unset=MINE_TELEOP_DRIVER_PASSWORD
+        --unset=MINE_TELEOP_DEVICE_TOKEN
+        MINE_TELEOP_DRIVER_001_PASSWORD=test-driver-1
+        MINE_TELEOP_DRIVER_002_PASSWORD=test-driver-2
+        MINE_TELEOP_VEHICLE_001_TOKEN=test-vehicle-1
+        MINE_TELEOP_VEHICLE_002_TOKEN=test-vehicle-2
+        $<TARGET_FILE:mine-teleop-signaling-server>
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/configs/signaling-server.2x2.dev.yaml
+        --max-pending-http-connections 0
+        --validate-config
+    )
+    set_tests_properties(mine-teleop-signaling-rejects-zero-connection-limit PROPERTIES WILL_FAIL TRUE)
+    add_test(
+      NAME mine-teleop-signaling-rejects-connection-sublimit-over-total
+      COMMAND ${CMAKE_COMMAND} -E env
+        --unset=MINE_TELEOP_DRIVER_PASSWORD
+        --unset=MINE_TELEOP_DEVICE_TOKEN
+        MINE_TELEOP_DRIVER_001_PASSWORD=test-driver-1
+        MINE_TELEOP_DRIVER_002_PASSWORD=test-driver-2
+        MINE_TELEOP_VEHICLE_001_TOKEN=test-vehicle-1
+        MINE_TELEOP_VEHICLE_002_TOKEN=test-vehicle-2
+        $<TARGET_FILE:mine-teleop-signaling-server>
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/configs/signaling-server.2x2.dev.yaml
+        --max-active-connections 4
+        --max-pending-http-connections 8
+        --validate-config
+    )
+    set_tests_properties(
+      mine-teleop-signaling-rejects-connection-sublimit-over-total
+      PROPERTIES WILL_FAIL TRUE
+    )
+    add_test(
+      NAME mine-teleop-signaling-rejects-listen-backlog-overflow
+      COMMAND ${CMAKE_COMMAND} -E env
+        --unset=MINE_TELEOP_DRIVER_PASSWORD
+        --unset=MINE_TELEOP_DEVICE_TOKEN
+        MINE_TELEOP_DRIVER_001_PASSWORD=test-driver-1
+        MINE_TELEOP_DRIVER_002_PASSWORD=test-driver-2
+        MINE_TELEOP_VEHICLE_001_TOKEN=test-vehicle-1
+        MINE_TELEOP_VEHICLE_002_TOKEN=test-vehicle-2
+        $<TARGET_FILE:mine-teleop-signaling-server>
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/configs/signaling-server.2x2.dev.yaml
+        --listen-backlog 2147483648
+        --validate-config
+    )
+    set_tests_properties(mine-teleop-signaling-rejects-listen-backlog-overflow PROPERTIES WILL_FAIL TRUE)
+    add_test(
+      NAME mine-teleop-signaling-rejects-zero-timeout
+      COMMAND ${CMAKE_COMMAND} -E env
+        --unset=MINE_TELEOP_DRIVER_PASSWORD
+        --unset=MINE_TELEOP_DEVICE_TOKEN
+        MINE_TELEOP_DRIVER_001_PASSWORD=test-driver-1
+        MINE_TELEOP_DRIVER_002_PASSWORD=test-driver-2
+        MINE_TELEOP_VEHICLE_001_TOKEN=test-vehicle-1
+        MINE_TELEOP_VEHICLE_002_TOKEN=test-vehicle-2
+        $<TARGET_FILE:mine-teleop-signaling-server>
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/configs/signaling-server.2x2.dev.yaml
+        --header-read-timeout-ms 0
+        --validate-config
+    )
+    set_tests_properties(mine-teleop-signaling-rejects-zero-timeout PROPERTIES WILL_FAIL TRUE)
   endif()
   add_executable(mine-teleop-control-tests cpp/tests/control_tests.cpp)
   target_link_libraries(mine-teleop-control-tests PRIVATE mine_teleop_runtime)
@@ -393,10 +640,53 @@ if(MINE_TELEOP_BUILD_TESTS)
   add_test(NAME mine-teleop-control-tests COMMAND mine-teleop-control-tests)
   set_tests_properties(mine-teleop-control-tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+  add_executable(mine-teleop-clock-type-contract-tests cpp/tests/clock_type_contract_tests.cpp)
+  target_link_libraries(mine-teleop-clock-type-contract-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-clock-type-contract-tests)
+  add_test(
+    NAME mine-teleop-clock-type-contract-tests
+    COMMAND mine-teleop-clock-type-contract-tests
+  )
+
+  add_executable(mine-teleop-control-limits-tests cpp/tests/control_limits_tests.cpp)
+  target_include_directories(
+    mine-teleop-control-limits-tests
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/deployments/chassis-control-bridge
+  )
+  target_link_libraries(mine-teleop-control-limits-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-control-limits-tests)
+  add_test(NAME mine-teleop-control-limits-tests COMMAND mine-teleop-control-limits-tests)
+
   add_executable(mine-teleop-vcu-tests cpp/tests/vcu_tests.cpp)
   target_link_libraries(mine-teleop-vcu-tests PRIVATE mine_teleop_vcu)
   mine_teleop_enable_warnings(mine-teleop-vcu-tests)
   add_test(NAME mine-teleop-vcu-tests COMMAND mine-teleop-vcu-tests)
+
+  add_executable(mine-teleop-dbc-codec-contract-tests cpp/tests/dbc_codec_contract_tests.cpp)
+  target_link_libraries(
+    mine-teleop-dbc-codec-contract-tests
+    PRIVATE
+      mine_teleop_vcu
+      nlohmann_json::nlohmann_json
+  )
+  mine_teleop_enable_warnings(mine-teleop-dbc-codec-contract-tests)
+  add_test(
+    NAME mine-teleop-dbc-codec-contract-tests
+    COMMAND mine-teleop-dbc-codec-contract-tests
+  )
+  set_tests_properties(
+    mine-teleop-dbc-codec-contract-tests
+    PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  add_test(
+    NAME mine-teleop-dbc-codec-reference-tests
+    COMMAND ${MINE_TELEOP_NODE_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tools/dbc/check_jyr010_dbc_contract.cjs
+  )
+  set_tests_properties(
+    mine-teleop-dbc-codec-reference-tests
+    PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  )
 
   if(UNIX AND NOT APPLE)
     enable_language(C)
@@ -441,6 +731,13 @@ if(MINE_TELEOP_BUILD_TESTS)
       mine-teleop-chassis-abi-v6-complete-fixture
       6U 0 1 1 1 1 0 0 1 0 1)
     mine_teleop_add_chassis_abi_fixture(
+      mine-teleop-chassis-abi-v6-missing-legacy-apply-fixture
+      6U 0 1 1 1 1 0 0 1 0 1)
+    target_compile_definitions(
+      mine-teleop-chassis-abi-v6-missing-legacy-apply-fixture
+      PRIVATE MINE_TELEOP_TEST_CHASSIS_HAS_LEGACY_APPLY=0
+    )
+    mine_teleop_add_chassis_abi_fixture(
       mine-teleop-chassis-abi-v6-wrong-size-fixture
       6U 1 1 1 1 1 0 0 1 0 1)
     mine_teleop_add_chassis_abi_fixture(
@@ -483,6 +780,7 @@ if(MINE_TELEOP_BUILD_TESTS)
     add_dependencies(mine-teleop-chassis-bridge-abi-loader-tests
       mine-teleop-chassis-abi-v5-complete-fixture
       mine-teleop-chassis-abi-v6-complete-fixture
+      mine-teleop-chassis-abi-v6-missing-legacy-apply-fixture
       mine-teleop-chassis-abi-v6-wrong-size-fixture
       mine-teleop-chassis-abi-v6-missing-apply-v2-fixture
       mine-teleop-chassis-abi-v6-missing-runtime-control-v1-fixture
@@ -510,6 +808,7 @@ if(MINE_TELEOP_BUILD_TESTS)
         $<TARGET_FILE:mine-teleop-chassis-abi-v6-missing-stop-context-size-fixture>
         $<TARGET_FILE:mine-teleop-chassis-abi-v6-wrong-stop-context-size-fixture>
         $<TARGET_FILE:mine-teleop-chassis-abi-v6-missing-set-stop-context-fixture>
+        $<TARGET_FILE:mine-teleop-chassis-abi-v6-missing-legacy-apply-fixture>
     )
 
     # The production bridge links against the field-only ChassisControl
@@ -557,6 +856,53 @@ if(MINE_TELEOP_BUILD_TESTS)
       NAME mine-teleop-runtime-diagnostics-contract
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_runtime_diagnostics.sh
     )
+    if(TARGET mine-teleop-run)
+      add_test(
+        NAME mine-teleop-vehicle-deploy-transaction
+        COMMAND bash
+          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_vehicle_deploy_transaction.sh
+          $<TARGET_FILE:mine-teleop-run>
+      )
+    else()
+      add_test(
+        NAME mine-teleop-vehicle-deploy-transaction
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_vehicle_deploy_transaction.sh
+      )
+    endif()
+    if(TARGET mine-teleop)
+      add_test(
+        NAME mine-teleop-configured-ca-bundle
+        COMMAND bash
+          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_configured_ca_bundle.sh
+          $<TARGET_FILE:mine-teleop>
+          ${CMAKE_CURRENT_SOURCE_DIR}/configs/vehicle-agent.three-machine.field.yaml
+          ${CMAKE_CURRENT_SOURCE_DIR}/configs/mine-teleop-field-root.crt
+      )
+    endif()
+    add_test(
+      NAME mine-teleop-admin-credential-transaction
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_admin_credentials.sh
+    )
+    set_tests_properties(
+      mine-teleop-admin-credential-transaction
+      PROPERTIES SKIP_REGULAR_EXPRESSION "admin_credentials_test=skipped"
+    )
+    add_test(
+      NAME mine-teleop-admin-yaml-editor
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_admin_yaml_editor.sh
+    )
+    set_tests_properties(
+      mine-teleop-admin-yaml-editor
+      PROPERTIES SKIP_REGULAR_EXPRESSION "admin_yaml_editor_test=skipped"
+    )
+    add_test(
+      NAME mine-teleop-cloud-no-start-rollback
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_cloud_no_start_rollback.sh
+    )
+    set_tests_properties(
+      mine-teleop-cloud-no-start-rollback
+      PROPERTIES SKIP_REGULAR_EXPRESSION "cloud_no_start_rollback=skipped"
+    )
     add_test(
       NAME mine-teleop-coturn-usage-report-self-test
       COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/coturn_usage_report.sh --self-test
@@ -569,6 +915,18 @@ if(MINE_TELEOP_BUILD_TESTS)
 
   if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
     add_test(
+      NAME mine-teleop-uploader-disabled-does-not-scan
+      COMMAND $<TARGET_FILE:mine-teleop>
+        vehicle-uploader
+        --config ${CMAKE_CURRENT_SOURCE_DIR}/configs/vehicle-agent.bench.yaml
+        --recording-root /mine-teleop-test/disabled-uploader-must-not-scan
+        --archive-root /mine-teleop-test/disabled-uploader-must-not-write
+    )
+    set_tests_properties(
+      mine-teleop-uploader-disabled-does-not-scan
+      PROPERTIES PASS_REGULAR_EXPRESSION "\"action\":\"disabled\""
+    )
+    add_test(
       NAME mine-teleop-vehicle-runtime-log-relay
       COMMAND bash
         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/check_vehicle_runtime_log_relay.sh
@@ -579,6 +937,9 @@ if(MINE_TELEOP_BUILD_TESTS)
       PROPERTIES TIMEOUT 30
     )
     add_executable(mine-teleop-cpp-tests cpp/tests/core_tests.cpp)
+    target_include_directories(mine-teleop-cpp-tests
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/deployments/chassis-control-bridge
+    )
     target_link_libraries(mine-teleop-cpp-tests PRIVATE mine_teleop_vehicle_runtime)
     mine_teleop_enable_warnings(mine-teleop-cpp-tests)
     add_test(NAME mine-teleop-cpp-tests COMMAND mine-teleop-cpp-tests)

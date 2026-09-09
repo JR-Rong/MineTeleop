@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /deployments/chassis-control-bridge
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /deployments/cloud
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /deployments/container
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /deployments/cpp
+    schedule:
+      interval: weekly

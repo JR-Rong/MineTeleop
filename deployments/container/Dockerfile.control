@@ -1,9 +1,10 @@
-FROM ubuntu:22.04 AS build
+ARG MINE_TELEOP_UBUNTU_BASE=docker.io/library/ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
+FROM ${MINE_TELEOP_UBUNTU_BASE} AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential ca-certificates cmake libcurl4-openssl-dev libjpeg-dev libssl-dev \
+        build-essential ca-certificates cmake libargon2-dev libcurl4-openssl-dev libjpeg-dev libssl-dev \
         libyaml-cpp-dev nlohmann-json3-dev pkg-config libgstreamer1.0-dev \
         libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -17,11 +18,11 @@ RUN cmake -S . -B /tmp/build \
     && cmake --build /tmp/build --parallel "$(nproc)" \
     && cmake --install /tmp/build
 
-FROM ubuntu:22.04
+FROM ${MINE_TELEOP_UBUNTU_BASE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libcurl4 libjpeg-turbo8 libssl3 libyaml-cpp0.7 \
+    && apt-get install -y --no-install-recommends ca-certificates libargon2-1 libcurl4 libjpeg-turbo8 libssl3 libyaml-cpp0.7 \
         gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system mineteleop \

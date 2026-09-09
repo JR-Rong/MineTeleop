@@ -1,0 +1,119 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 22,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "linux-common",
+      "hidden": true,
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "MINE_TELEOP_ENABLE_HARDENING": "ON",
+        "MINE_TELEOP_FETCH_MISSING_DEPS": "ON",
+        "MINE_TELEOP_BUILD_CONTROL_CLIENT": "ON",
+        "MINE_TELEOP_BUILD_SIGNALING_SERVER": "ON"
+      }
+    },
+    {
+      "name": "linux-release",
+      "inherits": "linux-common",
+      "displayName": "Linux release (portable control and signaling)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MINE_TELEOP_BUILD_TESTS": "ON",
+        "MINE_TELEOP_BUILD_VEHICLE_RUNTIME": "OFF",
+        "MINE_TELEOP_STATIC_LAUNCHER": "OFF",
+        "MINE_TELEOP_ENABLE_SANITIZERS": "OFF"
+      }
+    },
+    {
+      "name": "linux-vehicle-release",
+      "inherits": "linux-common",
+      "displayName": "Linux vehicle release (includes static launcher)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "MINE_TELEOP_BUILD_TESTS": "OFF",
+        "MINE_TELEOP_BUILD_VEHICLE_RUNTIME": "ON",
+        "MINE_TELEOP_STATIC_LAUNCHER": "ON",
+        "MINE_TELEOP_ENABLE_SANITIZERS": "OFF"
+      }
+    },
+    {
+      "name": "linux-asan-ubsan",
+      "inherits": "linux-common",
+      "displayName": "Linux ASan and UBSan test build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MINE_TELEOP_BUILD_TESTS": "ON",
+        "MINE_TELEOP_BUILD_VEHICLE_RUNTIME": "OFF",
+        "MINE_TELEOP_STATIC_LAUNCHER": "OFF",
+        "MINE_TELEOP_ENABLE_SANITIZERS": "ON",
+        "MINE_TELEOP_SANITIZERS": "address,undefined"
+      }
+    },
+    {
+      "name": "macos-release",
+      "displayName": "macOS release control build",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "MINE_TELEOP_ENABLE_HARDENING": "ON",
+        "MINE_TELEOP_FETCH_MISSING_DEPS": "ON",
+        "MINE_TELEOP_BUILD_CONTROL_CLIENT": "ON",
+        "MINE_TELEOP_BUILD_SIGNALING_SERVER": "OFF",
+        "MINE_TELEOP_BUILD_VEHICLE_RUNTIME": "OFF",
+        "MINE_TELEOP_BUILD_TESTS": "ON",
+        "MINE_TELEOP_STATIC_LAUNCHER": "OFF",
+        "MINE_TELEOP_ENABLE_SANITIZERS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "linux-release",
+      "configurePreset": "linux-release"
+    },
+    {
+      "name": "linux-vehicle-release",
+      "configurePreset": "linux-vehicle-release"
+    },
+    {
+      "name": "linux-asan-ubsan",
+      "configurePreset": "linux-asan-ubsan"
+    },
+    {
+      "name": "macos-release",
+      "configurePreset": "macos-release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "linux-release",
+      "configurePreset": "linux-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-asan-ubsan",
+      "configurePreset": "linux-asan-ubsan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "macos-release",
+      "configurePreset": "macos-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

@@ -12,6 +12,10 @@
 #define MINE_TELEOP_TEST_CHASSIS_HAS_APPLY_V2 1
 #endif
 
+#ifndef MINE_TELEOP_TEST_CHASSIS_HAS_LEGACY_APPLY
+#define MINE_TELEOP_TEST_CHASSIS_HAS_LEGACY_APPLY 1
+#endif
+
 #ifndef MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V1
 #define MINE_TELEOP_TEST_CHASSIS_HAS_RUNTIME_CONTROL_V1 1
 #endif
@@ -121,6 +125,7 @@ int mine_teleop_chassis_open_v4(
     return 0;
 }
 
+#if MINE_TELEOP_TEST_CHASSIS_HAS_LEGACY_APPLY
 int mine_teleop_chassis_apply_state(
     int target_gear,
     double target_vx,
@@ -134,6 +139,7 @@ int mine_teleop_chassis_apply_state(
     (void)steering_count;
     return 0;
 }
+#endif
 
 #if MINE_TELEOP_TEST_CHASSIS_HAS_APPLY_V2
 int mine_teleop_chassis_apply_state_v2(

@@ -1,5 +1,8 @@
 #include "mine_teleop/server.hpp"
+#include "mine_teleop/credentials.hpp"
 #include "mine_teleop/control_logic_js.hpp"
+#include "mine_teleop/detail/clock_deadline.hpp"
+#include "mine_teleop/console_assets.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -7,8 +10,10 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -34,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -177,9 +183,14 @@ using NativeSocket = SOCKET;
 using SocketLength = int;
 constexpr int kSendFlags = 0;
 constexpr int kShutdownBoth = SD_BOTH;
+constexpr short kPollRead = POLLRDNORM;
+constexpr short kPollWrite = POLLWRNORM;
 
 int last_socket_error() { return WSAGetLastError(); }
 bool socket_error_interrupted(int error) { return error == WSAEINTR; }
+bool socket_error_would_block(int error) {
+  return error == WSAEWOULDBLOCK;
+}
 bool socket_error_closed(int error) {
   return error == WSAENOTSOCK || error == WSAEINVAL;
 }
@@ -194,9 +205,14 @@ using NativeSocket = int;
 using SocketLength = socklen_t;
 constexpr int kSendFlags = MSG_NOSIGNAL;
 constexpr int kShutdownBoth = SHUT_RDWR;
+constexpr short kPollRead = POLLIN;
+constexpr short kPollWrite = POLLOUT;
 
 int last_socket_error() { return errno; }
 bool socket_error_interrupted(int error) { return error == EINTR; }
+bool socket_error_would_block(int error) {
+  return error == EAGAIN || error == EWOULDBLOCK;
+}
 bool socket_error_closed(int error) { return error == EBADF || error == EINVAL; }
 std::string socket_error_message(int error) { return std::strerror(error); }
 std::string address_error_message(int error) { return ::gai_strerror(error); }
@@ -265,6 +281,63 @@ void configure_listener_socket(SocketHandle socket) {
 #endif
 }
 
+void set_socket_nonblocking(SocketHandle socket, bool enabled) {
+#if defined(_WIN32)
+  u_long mode = enabled ? 1UL : 0UL;
+  if (::ioctlsocket(native_socket(socket), FIONBIO, &mode) != 0) {
+    throw std::runtime_error("cannot configure HTTP client socket: " +
+                             socket_error_message(last_socket_error()));
+  }
+#else
+  const int flags = ::fcntl(native_socket(socket), F_GETFL, 0);
+  if (flags < 0 || ::fcntl(native_socket(socket), F_SETFL,
+                           enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK) != 0) {
+    throw std::runtime_error("cannot configure HTTP client socket: " +
+                             socket_error_message(last_socket_error()));
+  }
+#endif
+}
+
+std::chrono::milliseconds remaining_until(std::chrono::steady_clock::time_point deadline) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline)
+    return std::chrono::milliseconds::zero();
+  const auto remaining = deadline - now;
+  auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+  if (milliseconds < remaining)
+    ++milliseconds;
+  return std::max(milliseconds, std::chrono::milliseconds(1));
+}
+
+bool wait_socket_until(SocketHandle socket, short events,
+                       std::chrono::steady_clock::time_point deadline) {
+#if defined(_WIN32)
+  WSAPOLLFD descriptor{native_socket(socket), events, 0};
+#else
+  pollfd descriptor{native_socket(socket), events, 0};
+#endif
+  while (true) {
+    const auto remaining = remaining_until(deadline);
+    if (remaining <= std::chrono::milliseconds::zero())
+      return false;
+    const auto timeout = static_cast<int>(std::min<std::int64_t>(
+        remaining.count(), static_cast<std::int64_t>(std::numeric_limits<int>::max())));
+#if defined(_WIN32)
+    const int result = ::WSAPoll(&descriptor, 1, timeout);
+#else
+    const int result = ::poll(&descriptor, 1, timeout);
+#endif
+    if (result > 0)
+      return (descriptor.revents & (events | POLLERR | POLLHUP | POLLNVAL)) != 0;
+    if (result == 0)
+      return false;
+    const int error = last_socket_error();
+    if (!socket_error_interrupted(error)) {
+      throw std::runtime_error("HTTP socket poll failed: " + socket_error_message(error));
+    }
+  }
+}
+
 class Unauthorized final : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
@@ -299,6 +372,29 @@ class TooManyRequests final : public std::runtime_error {
 
  private:
   std::int64_t retry_after_ms_;
+};
+
+class CleansedString final {
+ public:
+  explicit CleansedString(std::string value) : value_(std::move(value)) {}
+  ~CleansedString() {
+    cleanse_secret(value_);
+  }
+
+  CleansedString(const CleansedString&) = delete;
+  CleansedString& operator=(const CleansedString&) = delete;
+
+  [[nodiscard]] std::string_view view() const noexcept {
+    return value_;
+  }
+
+ private:
+  std::string value_;
+};
+
+class ServiceUnavailable final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
 };
 
 class SignalingRejected final : public std::runtime_error {
@@ -338,6 +434,30 @@ std::string trim(std::string value) {
   if (first == std::string::npos) return {};
   const auto last = value.find_last_not_of(" \t\r\n");
   return value.substr(first, last - first + 1);
+}
+
+bool http_header_field_name_valid(std::string_view name) {
+  if (name.empty())
+    return false;
+  return std::all_of(name.begin(), name.end(), [](unsigned char value) {
+    return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+           (value >= '0' && value <= '9') || value == '!' || value == '#' || value == '$' ||
+           value == '%' || value == '&' || value == '\'' || value == '*' || value == '+' ||
+           value == '-' || value == '.' || value == '^' || value == '_' || value == '`' ||
+           value == '|' || value == '~';
+  });
+}
+
+bool http_host_value_valid(std::string_view value) {
+  if (value.empty())
+    return false;
+  return std::all_of(value.begin(), value.end(), [](unsigned char character) {
+    // Leading/trailing OWS is removed before this check. A Host authority may
+    // contain ':' and IPv6 brackets, but cannot contain whitespace, controls,
+    // a URI path/query/fragment, userinfo, or a backslash path separator.
+    return character >= 0x21 && character <= 0x7e && character != '/' && character != '?' &&
+           character != '#' && character != '@' && character != '\\';
+  });
 }
 
 std::optional<std::string> canonical_ip_address(std::string value) {
@@ -502,6 +622,23 @@ std::optional<std::string> optional_yaml_string(
   }
 }
 
+std::int64_t required_positive_integer_node(const YAML::Node& node, std::string_view field,
+                                            std::string_view field_display, std::int64_t fallback) {
+  const std::string name(field);
+  if (!node || !node.IsMap() || !node[name])
+    return fallback;
+  std::int64_t value = 0;
+  try {
+    value = node[name].as<std::int64_t>();
+  } catch (const YAML::Exception& error) {
+    throw std::invalid_argument(std::string(field_display) +
+                                " must be an integer: " + error.what());
+  }
+  if (value <= 0)
+    throw std::invalid_argument(std::string(field_display) + " must be positive");
+  return value;
+}
+
 std::string read_identity_secret_file(const std::filesystem::path& path, std::string_view context) {
   std::ifstream input(path, std::ios::binary);
   if (!input) throw std::runtime_error("cannot read " + std::string(context) + " secret file: " + path.string());
@@ -535,6 +672,36 @@ std::string load_identity_secret(
         std::string(context) + " environment variable is unset or empty: " + *configured_environment);
   }
   return value;
+}
+
+bool valid_legacy_password_removal_date(std::string_view value) {
+  if (value.size() != 10 || value[4] != '-' || value[7] != '-')
+    return false;
+  for (const auto index : std::array<std::size_t, 8>{0, 1, 2, 3, 5, 6, 8, 9}) {
+    if (value[index] < '0' || value[index] > '9')
+      return false;
+  }
+  const int year =
+      (value[0] - '0') * 1000 + (value[1] - '0') * 100 + (value[2] - '0') * 10 + (value[3] - '0');
+  const unsigned month = static_cast<unsigned>((value[5] - '0') * 10 + (value[6] - '0'));
+  const unsigned day = static_cast<unsigned>((value[8] - '0') * 10 + (value[9] - '0'));
+  return std::chrono::year_month_day{std::chrono::year{year}, std::chrono::month{month},
+                                     std::chrono::day{day}}
+      .ok();
+}
+
+bool legacy_password_migration_is_active(std::string_view value) {
+  if (!valid_legacy_password_removal_date(value))
+    return false;
+  const int year =
+      (value[0] - '0') * 1000 + (value[1] - '0') * 100 + (value[2] - '0') * 10 + (value[3] - '0');
+  const unsigned month = static_cast<unsigned>((value[5] - '0') * 10 + (value[6] - '0'));
+  const unsigned day = static_cast<unsigned>((value[8] - '0') * 10 + (value[9] - '0'));
+  const std::chrono::sys_days removal_day{std::chrono::year_month_day{
+      std::chrono::year{year}, std::chrono::month{month}, std::chrono::day{day}}};
+  const std::chrono::sys_days today =
+      std::chrono::floor<std::chrono::days>(std::chrono::system_clock::now());
+  return today <= removal_day;
 }
 
 std::uint64_t required_uint64(const Json& value, std::string_view key) {
@@ -587,15 +754,15 @@ double required_nonnegative_number(const Json& value, std::string_view key) {
   return parsed;
 }
 
-std::int64_t control_lease_renew_at(std::int64_t now_ms, std::int64_t expires_at_ms) {
-  if (expires_at_ms <= now_ms) return now_ms;
-  return now_ms + (expires_at_ms - now_ms) / 3;
+std::int64_t control_lease_renew_at(MonotonicMillis received_at, MonotonicMillis expires_at) {
+  if (expires_at.value <= received_at.value)
+    return received_at.value;
+  return detail::saturating_deadline_ms(received_at.value,
+                                        (expires_at.value - received_at.value) / 3);
 }
 
 std::int64_t monotonic_now_ms() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
+  return process_monotonic_now_ms().value;
 }
 
 std::string base64_encode(const unsigned char* data, std::size_t size) {
@@ -829,12 +996,59 @@ std::string status_reason(int status) {
     case 401: return "Unauthorized";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 408:
+      return "Request Timeout";
     case 409: return "Conflict";
     case 410: return "Gone";
     case 413: return "Payload Too Large";
     case 429: return "Too Many Requests";
     case 500: return "Internal Server Error";
+    case 503:
+      return "Service Unavailable";
     default: return "Response";
+  }
+}
+
+class HttpDeadlineExceeded final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+std::size_t receive_until(SocketHandle socket, char* output, std::size_t output_size,
+                          std::chrono::steady_clock::time_point deadline, std::string_view phase) {
+  while (true) {
+    if (!wait_socket_until(socket, kPollRead, deadline)) {
+      throw HttpDeadlineExceeded("HTTP " + std::string(phase) + " timed out");
+    }
+    const auto result = ::recv(native_socket(socket), output, socket_buffer_size(output_size), 0);
+    if (result < 0) {
+      const int error = last_socket_error();
+      if (socket_error_interrupted(error) || socket_error_would_block(error))
+        continue;
+      throw std::runtime_error("recv failed: " + socket_error_message(error));
+    }
+    return static_cast<std::size_t>(result);
+  }
+}
+
+void send_all_until(SocketHandle socket, std::string_view value,
+                    std::chrono::steady_clock::time_point deadline) {
+  std::size_t sent = 0;
+  while (sent < value.size()) {
+    if (!wait_socket_until(socket, kPollWrite, deadline)) {
+      throw HttpDeadlineExceeded("HTTP response write timed out");
+    }
+    const auto result = ::send(native_socket(socket), value.data() + sent,
+                               socket_buffer_size(value.size() - sent), kSendFlags);
+    if (result < 0) {
+      const int error = last_socket_error();
+      if (socket_error_interrupted(error) || socket_error_would_block(error))
+        continue;
+      throw std::runtime_error("send failed: " + socket_error_message(error));
+    }
+    if (result == 0)
+      throw std::runtime_error("connection closed while sending response");
+    sent += static_cast<std::size_t>(result);
   }
 }
 
@@ -856,7 +1070,7 @@ void send_all(SocketHandle socket, std::string_view value) {
   }
 }
 
-void send_http_response(SocketHandle socket, const ServerResponse& response) {
+std::string http_response_header(const ServerResponse& response) {
   std::ostringstream header;
   header << "HTTP/1.1 " << response.status << ' ' << status_reason(response.status) << "\r\n"
          << "Content-Type: " << response.content_type << "\r\n"
@@ -864,7 +1078,19 @@ void send_http_response(SocketHandle socket, const ServerResponse& response) {
          << "Connection: close\r\n";
   for (const auto& [name, value] : response.headers) header << name << ": " << value << "\r\n";
   header << "\r\n";
-  send_all(socket, header.str());
+  return header.str();
+}
+
+void send_http_response_until(SocketHandle socket, const ServerResponse& response,
+                              std::chrono::steady_clock::time_point deadline) {
+  const auto header = http_response_header(response);
+  send_all_until(socket, header, deadline);
+  send_all_until(socket, response.body, deadline);
+}
+
+void send_http_response(SocketHandle socket, const ServerResponse& response) {
+  const auto header = http_response_header(response);
+  send_all(socket, header);
   send_all(socket, response.body);
 }
 
@@ -885,21 +1111,36 @@ void add_request_id_header(ServerResponse& response, std::string_view request_id
   response.headers.emplace_back("X-Request-ID", request_id);
 }
 
-HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
+std::size_t parse_content_length(std::string_view value) {
+  if (value.empty())
+    throw std::invalid_argument("invalid Content-Length header");
+  std::size_t result = 0;
+  for (const unsigned char character : value) {
+    if (character < '0' || character > '9') {
+      throw std::invalid_argument("invalid Content-Length header");
+    }
+    const auto digit = static_cast<std::size_t>(character - '0');
+    if (result > (std::numeric_limits<std::size_t>::max() - digit) / 10U) {
+      throw std::invalid_argument("invalid Content-Length header");
+    }
+    result = result * 10U + digit;
+  }
+  return result;
+}
+
+HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes,
+                          std::chrono::milliseconds header_read_timeout,
+                          std::chrono::milliseconds body_read_timeout) {
   constexpr std::size_t max_headers = 64 * 1024;
   std::string wire;
   std::array<char, 16 * 1024> buffer{};
   std::size_t header_end = std::string::npos;
+  const auto header_deadline = std::chrono::steady_clock::now() + header_read_timeout;
   while ((header_end = wire.find("\r\n\r\n")) == std::string::npos) {
-    const auto received = ::recv(
-        native_socket(socket), buffer.data(), socket_buffer_size(buffer.size()), 0);
-    if (received < 0) {
-      const int error = last_socket_error();
-      if (socket_error_interrupted(error)) continue;
-      throw std::runtime_error("recv failed: " + socket_error_message(error));
-    }
+    const auto received =
+        receive_until(socket, buffer.data(), buffer.size(), header_deadline, "header read");
     if (received == 0) throw std::invalid_argument("client closed before sending HTTP headers");
-    wire.append(buffer.data(), static_cast<std::size_t>(received));
+    wire.append(buffer.data(), received);
     if (wire.size() > max_headers) throw std::invalid_argument("HTTP headers too large");
   }
 
@@ -910,40 +1151,63 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
   request_line = trim(std::move(request_line));
   std::istringstream line(request_line);
   std::string version;
-  if (!(line >> request.method >> request.target >> version) || !version.starts_with("HTTP/1.")) {
+  if (!(line >> request.method >> request.target >> version) ||
+      (version != "HTTP/1.0" && version != "HTTP/1.1")) {
     throw std::invalid_argument("invalid HTTP request line");
   }
   std::string header;
+  std::size_t host_count = 0;
+  std::size_t origin_count = 0;
   while (std::getline(headers, header)) {
-    header = trim(std::move(header));
+    if (!header.empty() && header.back() == '\r')
+      header.pop_back();
     if (header.empty()) continue;
+    if (header.find('\r') != std::string::npos) {
+      throw std::invalid_argument("invalid HTTP header");
+    }
     const auto separator = header.find(':');
     if (separator == std::string::npos) throw std::invalid_argument("invalid HTTP header");
-    request.headers[lower(trim(header.substr(0, separator)))] = trim(header.substr(separator + 1));
+    const auto raw_name = std::string_view(header).substr(0, separator);
+    if (!http_header_field_name_valid(raw_name))
+      throw std::invalid_argument("invalid HTTP header");
+    const auto name = lower(std::string(raw_name));
+    const auto value = trim(header.substr(separator + 1));
+    if (name == "transfer-encoding") {
+      throw std::invalid_argument("Transfer-Encoding is not supported");
+    }
+    if (name == "host") {
+      ++host_count;
+      if (host_count > 1)
+        throw std::invalid_argument("duplicate Host header");
+      if (!http_host_value_valid(value))
+        throw std::invalid_argument("invalid Host header");
+    }
+    if (name == "origin") {
+      ++origin_count;
+      if (origin_count > 1)
+        throw std::invalid_argument("duplicate Origin header");
+    }
+    if (name == "content-length" && request.headers.contains(name)) {
+      throw std::invalid_argument("duplicate Content-Length header");
+    }
+    request.headers[name] = value;
+  }
+  if (version == "HTTP/1.1" && host_count != 1) {
+    throw std::invalid_argument("HTTP/1.1 request requires exactly one Host header");
   }
 
   std::size_t content_length = 0;
   if (const auto found = request.headers.find("content-length"); found != request.headers.end()) {
-    std::size_t consumed = 0;
-    try {
-      content_length = std::stoull(found->second, &consumed);
-    } catch (const std::exception&) {
-      throw std::invalid_argument("invalid Content-Length header");
-    }
-    if (consumed != found->second.size()) throw std::invalid_argument("invalid Content-Length header");
+    content_length = parse_content_length(found->second);
   }
   if (content_length > max_body_bytes) throw std::length_error("request body too large");
   const auto body_start = header_end + 4;
+  const auto body_deadline = std::chrono::steady_clock::now() + body_read_timeout;
   while (wire.size() - body_start < content_length) {
-    const auto received = ::recv(
-        native_socket(socket), buffer.data(), socket_buffer_size(buffer.size()), 0);
-    if (received < 0) {
-      const int error = last_socket_error();
-      if (socket_error_interrupted(error)) continue;
-      throw std::runtime_error("recv failed: " + socket_error_message(error));
-    }
+    const auto received =
+        receive_until(socket, buffer.data(), buffer.size(), body_deadline, "body read");
     if (received == 0) throw std::invalid_argument("client closed before sending HTTP body");
-    wire.append(buffer.data(), static_cast<std::size_t>(received));
+    wire.append(buffer.data(), received);
   }
   request.body = wire.substr(body_start, content_length);
 
@@ -966,8 +1230,98 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
   return request;
 }
 
-std::string console_html(const DriverConfig& config) {
-  const Json page_config = {
+bool websocket_upgrade_requested(const HttpRequest& request) {
+  const auto upgrade = request.headers.find("upgrade");
+  if (upgrade == request.headers.end() || lower(trim(upgrade->second)) != "websocket")
+    return false;
+  const auto connection = request.headers.find("connection");
+  if (connection == request.headers.end())
+    return false;
+  std::size_t start = 0;
+  while (start <= connection->second.size()) {
+    const auto end = connection->second.find(',', start);
+    const auto token = lower(trim(connection->second.substr(
+        start, end == std::string::npos ? std::string::npos : end - start)));
+    if (token == "upgrade")
+      return true;
+    if (end == std::string::npos)
+      break;
+    start = end + 1;
+  }
+  return false;
+}
+
+struct LoopbackHttpAuthority {
+  std::string host;
+  std::uint16_t effective_port{80};
+};
+
+std::optional<LoopbackHttpAuthority> loopback_http_authority(std::string authority) {
+  authority = lower(trim(std::move(authority)));
+  std::string host;
+  std::string_view port;
+  for (const std::string_view candidate : {"127.0.0.1", "localhost", "[::1]"}) {
+    if (authority == candidate) {
+      return LoopbackHttpAuthority{std::string(candidate), 80};
+    }
+    if (authority.starts_with(std::string(candidate) + ":")) {
+      host = candidate;
+      port = std::string_view(authority).substr(candidate.size() + 1);
+      break;
+    }
+  }
+  if (host.empty())
+    return std::nullopt;
+  if (port.empty() || !std::all_of(port.begin(), port.end(),
+                                   [](unsigned char value) { return std::isdigit(value) != 0; })) {
+    return std::nullopt;
+  }
+  try {
+    const auto parsed = std::stoul(std::string(port));
+    if (parsed == 0 || parsed > 65535)
+      return std::nullopt;
+    return LoopbackHttpAuthority{std::move(host), static_cast<std::uint16_t>(parsed)};
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+bool application_json_content_type(const HttpRequest& request) {
+  const auto found = request.headers.find("content-type");
+  if (found == request.headers.end())
+    return false;
+  const auto value = lower(trim(found->second));
+  const auto separator = value.find(';');
+  return trim(value.substr(0, separator)) == "application/json";
+}
+
+bool trusted_local_mutation_request(const HttpRequest& request, std::string_view page_capability) {
+  const auto host = request.headers.find("host");
+  const auto origin = request.headers.find("origin");
+  const auto capability = request.headers.find("x-mine-teleop-page-capability");
+  if (host == request.headers.end() || origin == request.headers.end() ||
+      capability == request.headers.end()) {
+    return false;
+  }
+  const auto host_authority = loopback_http_authority(host->second);
+  auto normalized_origin = lower(trim(origin->second));
+  constexpr std::string_view http_scheme = "http://";
+  if (!host_authority || !normalized_origin.starts_with(http_scheme))
+    return false;
+  const auto origin_authority =
+      loopback_http_authority(normalized_origin.substr(http_scheme.size()));
+  if (!origin_authority || host_authority->host != origin_authority->host ||
+      host_authority->effective_port != origin_authority->effective_port ||
+      capability->second != page_capability) {
+    return false;
+  }
+  const auto fetch_site = request.headers.find("sec-fetch-site");
+  return fetch_site == request.headers.end() || lower(trim(fetch_site->second)) == "same-origin";
+}
+
+Json console_config_json(const DriverConfig& config, std::string_view page_capability) {
+  return {
+      {"page_capability", page_capability},
       {"rate_hz", config.rate_hz},
       {"intent_lease_ms", config.intent_lease_ms},
       {"estop_hold_ms", config.estop_hold_ms},
@@ -979,10 +1333,11 @@ std::string console_html(const DriverConfig& config) {
            {"initial_target_speed_kph", config.control_limits.initial_target_speed_kph},
            {"initial_max_motor_torque_nm", config.control_limits.initial_max_motor_torque_nm},
            {"initial_max_brake_pressure_bar", config.control_limits.initial_max_brake_pressure_bar},
-           {"initial_service_brake_pressure_bar", config.control_limits.initial_service_brake_pressure_bar},
-           {"initial_hard_brake_pressure_bar", config.control_limits.initial_hard_brake_pressure_bar},
-           {"initial_max_steering_angle_deg",
-            config.control_limits.initial_max_steering_angle_deg},
+           {"initial_service_brake_pressure_bar",
+            config.control_limits.initial_service_brake_pressure_bar},
+           {"initial_hard_brake_pressure_bar",
+            config.control_limits.initial_hard_brake_pressure_bar},
+           {"initial_max_steering_angle_deg", config.control_limits.initial_max_steering_angle_deg},
            {"steering_full_scale_deg", 30.0},
        }},
       {"gamepad",
@@ -1004,508 +1359,25 @@ std::string console_html(const DriverConfig& config) {
            {"estop_button", config.gamepad.estop_button},
        }},
   };
-  return R"HTML(<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Mine Teleop WebRTC Console</title><link rel="icon" href="data:," type="image/x-icon"><style>
-:root{color-scheme:dark;--bg:#08101d;--surface:#0f1929;--surface-2:#111f32;--line:#26364d;--text:#e7edf6;--muted:#8ea0b8;--accent:#38bdf8;--ok:#34d399;--warn:#fbbf24;--critical:#fb7185}
-body .app-shell{grid-template-rows:auto auto minmax(0,1fr)}
-.operator-status-strip{display:grid;grid-template-columns:minmax(170px,1.6fr) repeat(5,minmax(72px,1fr));gap:1px;overflow:hidden;border:1px solid var(--line);border-radius:8px;background:var(--line);position:relative;z-index:3}
-.operator-status-item{background:var(--surface-2);min-width:0;padding:6px 8px}
-.operator-status-item span{display:block;color:var(--muted);font-size:9px;margin-bottom:2px}
-.operator-status-item strong{display:block;font:700 16px/1.15 ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.operator-status-item.active strong{color:var(--accent)}
-.visual-stage>#estop-status{grid-row:1}.visual-stage>#cameras{grid-row:2}.visual-stage>#can-feedback-panel{grid-row:3}.visual-stage>#status{grid-row:4}
-.visual-stage>.grid{overflow:hidden}
-.visual-stage .camera>video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
-.can-feedback-panel .can-summary{grid-template-columns:repeat(5,minmax(0,1fr))}
-@media(max-height:760px){.operator-status-item{padding:4px 6px}.operator-status-item span{font-size:8px}.operator-status-item strong{font-size:14px}}
-@media(max-width:900px){body .operator-status-strip{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:720px){body .operator-status-strip{position:sticky;top:0;z-index:20;grid-template-columns:repeat(3,minmax(0,1fr))}.workspace>.visual-stage{min-height:0}.visual-stage>.grid{grid-template-columns:1fr;grid-template-rows:none;grid-auto-rows:clamp(190px,56vw,300px);overflow:visible}.can-feedback-panel .can-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
-*{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;padding:12px}button,input,select{font:inherit}button,input,select{border:1px solid var(--line);border-radius:7px;background:#0b1422;color:var(--text);padding:8px 10px}button{cursor:pointer}button:hover{border-color:#58708e}button:focus-visible,input:focus-visible,select:focus-visible,main:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.danger{background:#be123c;border-color:#fb7185;color:#fff}.app-shell{height:calc(100svh - 24px);min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr);gap:10px;max-width:1920px;margin:auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;min-width:0}.brand{display:flex;align-items:baseline;gap:12px;min-width:max-content}.brand h1{font-size:21px;line-height:1.1;margin:0;letter-spacing:-.02em}.brand p{font-size:12px;color:var(--muted);margin:0}.auth{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap;margin:0;min-width:0}.auth label{font-size:12px;color:var(--muted)}.auth input{width:170px}.auth select{max-width:220px}.auth strong{font-size:12px;color:var(--ok)}.workspace{display:grid;grid-template-columns:minmax(0,1fr) clamp(300px,25vw,390px);gap:10px;min-height:0}.visual-stage{display:grid;grid-template-rows:auto minmax(0,1fr) auto auto;gap:8px;min-width:0;min-height:0}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:8px;min-height:0}.camera{background:#020617;border:1px solid #162338;border-radius:8px;overflow:hidden;position:relative;min-width:0;min-height:0}.camera video{display:block;width:100%;height:100%;object-fit:contain}.label{position:absolute;left:7px;top:7px;background:#020617cc;padding:3px 7px;border-radius:5px;font-size:11px;z-index:2}.empty-stage{grid-column:1/-1;grid-row:1/-1;display:grid;place-items:center;border:1px dashed var(--line);border-radius:8px;color:var(--muted);font-size:13px}.can-feedback-panel{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:7px;min-width:0}.can-feedback-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px}.can-feedback-heading h2{font-size:11px;letter-spacing:.05em;text-transform:uppercase;margin:0}.can-summary{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:5px;overflow:hidden;margin-bottom:5px}.can-summary-item{background:var(--surface-2);padding:3px 5px;min-width:0}.can-summary-item span{display:block;color:var(--muted);font-size:8px}.can-summary-item strong{display:block;font:700 10px/1.25 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.can-feedback-body{display:grid;grid-template-columns:minmax(0,4fr) minmax(150px,1fr);gap:5px}.wheel-feedback-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:3px}.wheel-feedback,.steering-feedback{background:#0b1422;border:1px solid #1f3047;border-radius:5px;padding:3px 5px;min-width:0}.feedback-title{display:flex;justify-content:space-between;gap:4px;color:#cbd5e1;font-size:8px}.feedback-values{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-top:2px}.feedback-value{min-width:0}.feedback-value span{display:block;color:var(--muted);font-size:7px}.feedback-value strong{display:block;font:700 9px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.steering-feedback-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px}.steering-feedback .feedback-values{grid-template-columns:minmax(0,1fr) auto}.sidebar{min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding-right:2px}.side-section{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:10px}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.section-heading h2{font-size:13px;letter-spacing:.04em;text-transform:uppercase;margin:0}.status-chip{font-size:11px;color:var(--muted)}.key-help,.gate-copy{font-size:11px;color:var(--muted);margin:0 0 8px;line-height:1.35}.keyboard-grid{display:grid;grid-template-columns:repeat(3,46px);grid-template-rows:repeat(2,40px);justify-content:center;gap:5px;margin:8px 0}.keycap{display:flex;align-items:center;justify-content:center;gap:4px;border:1px solid #41536d;border-radius:7px;background:#0a1321;color:#aebdd0;font:700 15px/1 ui-monospace,SFMono-Regular,Menlo,monospace;transition:background .08s ease,border-color .08s ease,color .08s ease,transform .08s ease}.keycap small{font-size:9px;color:#71839b}.keycap.active{background:#075985;border-color:var(--accent);color:#fff;transform:translateY(1px);box-shadow:0 0 0 2px #38bdf826}.keycap.active small{color:#bae6fd}.key-up{grid-column:2}.key-left{grid-column:1;grid-row:2}.key-down{grid-column:2;grid-row:2}.key-right{grid-column:3;grid-row:2}.brake-keys{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin:7px 0 10px}.brake-key{height:30px;font-size:11px}.last-input{display:block;text-align:center;min-height:17px;font-size:11px;color:var(--accent)}.control-readouts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:7px;overflow:hidden}.control-readout{background:var(--surface-2);padding:8px}.control-readout span{display:block;font-size:10px;color:var(--muted);margin-bottom:3px}.control-readout strong{display:block;font:700 18px/1.1 ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}.control-readout.active strong{color:var(--accent)}.side-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px}.side-actions button{font-size:11px;padding:7px 6px}.limit-inline{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 7px;color:var(--muted);font-size:10px}.side-section .limit-inline strong{font-size:11px}.metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:7px;overflow:hidden}.metric{background:var(--surface-2);padding:7px}.metric span{display:block;color:var(--muted);font-size:9px;margin-bottom:3px}.metric strong{display:block;font-size:12px;line-height:1.25;overflow-wrap:anywhere}.ok{color:var(--ok)}.warn{color:var(--warn)}.critical{color:var(--critical)}.alerts{border-left:3px solid #475569;background:#0b1422;padding:7px 8px;margin:8px 0;font-size:11px;line-height:1.35}.alerts.warn{border-color:#f59e0b}.alerts.critical{border-color:#e11d48}table{width:100%;border-collapse:collapse;background:#0b1422;font-size:9px;table-layout:fixed}th,td{text-align:left;padding:5px 3px;border-bottom:1px solid #26364d;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}th:first-child,td:first-child{width:30%}.estop-banner{border:1px solid #fb7185;background:#881337;color:#fff;border-radius:7px;padding:7px 10px;margin:0;font-size:12px}.status-line{background:#020617;border:1px solid #162338;border-radius:7px;color:#9fb0c6;font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;padding:7px 9px;min-height:31px;max-height:48px;overflow:auto;white-space:pre-wrap}.muted{color:var(--muted)}[hidden]{display:none!important}dialog{color:var(--text);background:var(--surface);border:1px solid #4b5563;border-radius:10px;max-width:520px;width:calc(100% - 40px);padding:18px}dialog::backdrop{background:#000a}dialog h2{margin:0 0 12px;font-size:18px}.limit-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.limit-grid label{display:flex;flex-direction:column;gap:5px;font-size:12px}.limit-warning{border-left:4px solid #f59e0b;padding:8px 10px;background:#1f2937;font-size:12px;line-height:1.45}
-@media(max-height:760px){body{padding:8px}.app-shell{height:calc(100svh - 16px);gap:7px}.brand p{display:none}.sidebar{gap:7px}.side-section{padding:7px}.section-heading{margin-bottom:5px}.key-help,.gate-copy{margin-bottom:4px;line-height:1.25}.keyboard-grid{grid-template-columns:repeat(3,40px);grid-template-rows:repeat(2,30px);margin:3px 0}.brake-keys{margin:3px 0}.brake-key{height:26px}.last-input{min-height:14px;font-size:10px}.control-readout{padding:4px 6px}.control-readout span{font-size:9px;margin-bottom:2px}.control-readout strong{font-size:16px}.side-actions button{padding:5px 4px}.limit-inline{margin-bottom:4px}.metric{padding:3px 5px}.metric span{margin-bottom:2px}.metric strong{font-size:11px}.alerts{margin:4px 0;padding:4px 6px;font-size:10px;line-height:1.25}th,td{padding:3px 2px}}
-@media(max-width:900px){.workspace{grid-template-columns:minmax(0,1fr) 290px}.brand p{display:none}.auth label,.auth-expiry{display:none}}
-@media(max-width:720px){html,body{overflow:auto}.app-shell{height:auto;min-height:100svh}.topbar{align-items:flex-start;flex-direction:column}.auth{justify-content:flex-start}.workspace{grid-template-columns:1fr}.visual-stage{min-height:58svh}.sidebar{overflow:visible}.grid{grid-template-columns:1fr}.can-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.can-feedback-body{grid-template-columns:1fr}.wheel-feedback-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.steering-feedback-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.limit-grid{grid-template-columns:1fr}}</style></head><body><main class="app-shell" tabindex="-1">
-<header class="topbar"><div class="brand"><h1>Mine Teleop 控制台</h1><p>方向键 / WASD 控制 · Space 缓刹 · B 急刹 · E 急停</p></div>
-<section id="login-panel" class="auth"><label for="password">驾驶员密码</label><input id="password" type="password" autocomplete="current-password"><button id="login">登录并加载车辆</button></section>
-<section id="session-panel" class="auth" hidden><label for="vehicle">授权车辆</label><select id="vehicle"></select><button id="connect">连接所选车辆</button><button id="control-limits-open">实车调试限幅</button><button id="logout">安全退出</button><button id="estop" class="danger">急停</button><strong id="webrtc">未连接</strong><span id="auth-expiry" class="muted auth-expiry"></span></section></header>
-<section id="operator-status-strip" class="operator-status-strip" aria-label="关键车辆状态"><article class="operator-status-item"><span>实测车速</span><strong id="operator-speed">—</strong></article><article class="operator-status-item"><span>实际挡位</span><strong id="operator-actual-gear">—</strong></article><article id="operator-readout-gear" class="operator-status-item"><span>指令挡位</span><strong id="operator-control-gear">N</strong></article><article id="operator-readout-steering" class="operator-status-item"><span>转向</span><strong id="operator-control-steering">0.00</strong></article><article id="operator-readout-throttle" class="operator-status-item"><span>目标车速比例</span><strong id="operator-control-throttle">0.00</strong></article><article id="operator-readout-brake" class="operator-status-item"><span>刹车</span><strong id="operator-control-brake">0.00</strong></article></section>
-<div class="workspace"><section class="visual-stage"><p id="estop-status" class="estop-banner" hidden>急停请求已锁定；等待车端遥测确认，未确认时请使用车辆物理急停。</p><section id="cameras" class="grid"><div id="empty-stage" class="empty-stage">登录并连接车辆后显示实时视频</div></section><section id="can-feedback-panel" class="can-feedback-panel" hidden aria-label="CAN 实时反馈"><div class="can-feedback-heading"><h2>CAN 实时反馈 · 测量值</h2><strong id="can-feedback-status" class="status-chip warn">等待车端遥测</strong></div><div class="can-summary"><div class="can-summary-item"><span>车速</span><strong id="can-speed">—</strong></div><div class="can-summary-item"><span>实际挡位</span><strong id="can-gear">—</strong></div><div class="can-summary-item"><span>物理选择器</span><strong id="can-selector">—</strong></div><div class="can-summary-item"><span>电子驻车 1-4</span><strong id="can-epb">—</strong></div><div class="can-summary-item"><span>VCU 状态</span><strong id="can-handshake">—</strong></div><div class="can-summary-item"><span>VMC 故障码</span><strong id="can-vmc-fault">—</strong></div><div class="can-summary-item"><span>物理手刹</span><strong id="can-parking-switch">—</strong></div><div class="can-summary-item"><span>制动踏板</span><strong id="can-brake-pedal">—</strong></div><div class="can-summary-item"><span>紧急开关</span><strong id="can-emergency">—</strong></div><div class="can-summary-item"><span>反馈时效</span><strong id="can-age">—</strong></div></div><div class="can-feedback-body"><div id="wheel-feedback-grid" class="wheel-feedback-grid" aria-label="八路轮端反馈"></div><div id="steering-feedback-grid" class="steering-feedback-grid" aria-label="四路转向反馈"></div></div></section><pre id="status" class="status-line">请先登录</pre></section>
-<aside class="sidebar"><section id="keyboard-panel" class="side-section" aria-label="键盘控制状态"><div class="section-heading"><h2>键盘控制</h2><span id="input-readiness" class="status-chip">等待连接</span></div><p class="key-help">方向键与 WASD 等效；D/R 在会话内锁存，松开前进/倒车只将目标车速比例归零。</p><div class="keyboard-grid" aria-label="方向键状态"><span id="key-up" class="keycap key-up" aria-pressed="false">↑<small>W</small></span><span id="key-left" class="keycap key-left" aria-pressed="false">←<small>A</small></span><span id="key-down" class="keycap key-down" aria-pressed="false">↓<small>S</small></span><span id="key-right" class="keycap key-right" aria-pressed="false">→<small>D</small></span></div><div class="brake-keys"><span id="key-service-brake" class="keycap brake-key" aria-pressed="false">SPACE · 缓刹</span><span id="key-hard-brake" class="keycap brake-key" aria-pressed="false">B · 急刹</span></div><span id="last-keyboard-event" class="last-input">等待键盘输入</span><div class="control-readouts"><div id="readout-gear" class="control-readout"><span>挡位</span><strong id="control-gear">N</strong></div><div id="readout-steering" class="control-readout"><span>转向</span><strong id="control-steering">0.00</strong></div><div id="readout-throttle" class="control-readout"><span>目标车速比例</span><strong id="control-throttle">0.00</strong></div><div id="readout-brake" class="control-readout"><span>刹车</span><strong id="control-brake">0.00</strong></div></div></section>
-<section id="vcu-panel" class="side-section" hidden><div class="section-heading"><h2>VCU 平行驾驶</h2><strong id="vcu-status" class="status-chip warn">等待车端 VCU 状态</strong></div><p class="limit-inline"><span>当前会话限幅</span><strong id="control-limits-summary" class="warn">等待车端确认会话控制参数</strong></p><p id="vcu-gate" class="gate-copy warn" role="status" aria-live="polite">准入检查：需要车端确认会话控制参数、N 挡、电子驻车、零速及 VCU 人工状态</p><div class="side-actions"><button id="vcu-connect" disabled>开始平行驾驶握手</button><button id="vcu-disconnect" disabled>断开 VCU 握手</button></div></section>
-<section id="monitor-panel" class="side-section" hidden><div class="section-heading"><h2>运行监控</h2><span class="status-chip">实时</span></div><div class="metrics"><article class="metric"><span>车辆在线</span><strong id="metric-vehicle">未知</strong></article><article class="metric"><span>当前会话</span><strong id="metric-session">未连接</strong></article><article class="metric"><span>当前控制权</span><strong id="metric-authority">无</strong></article><article class="metric"><span>视频编码 / 后端</span><strong id="metric-video">等待媒体</strong></article><article class="metric"><span>控制 RTT</span><strong id="metric-rtt">未知</strong></article><article class="metric"><span>网络连接</span><strong id="metric-network">未知</strong></article><article class="metric"><span>TURN</span><strong id="metric-turn">未配置</strong></article><article class="metric"><span>时间同步</span><strong id="metric-time">未知</strong></article></div><div id="alerts" class="alerts">尚无媒体指标；控制命令不会在链路未就绪时发送。</div><table><thead><tr><th>camera</th><th>FPS</th><th>kbps</th><th>loss</th><th>latency</th></tr></thead><tbody id="stream-metrics"><tr><td colspan="5" class="muted">等待视频轨道</td></tr></tbody></table></section></aside></div>
-<dialog id="control-limits-dialog"><h2>当前会话驾驶与 PID 参数</h2><p class="limit-warning">这些值仅用于当前控制会话，必须由车端精确确认后才生效；车端本地硬上限仍会再次截断。三个制动字段都是每路 EHB 压力请求，单位 bar、分辨率 0.1 bar，不是百分比或整车制动力。急停、物理急停、故障、断开停车和 bridge 本地 watchdog 使用独立安全制动，普通 profile 不能削弱这些安全路径。升扭斜率是会话标定值，不是车型级硬上限；0 表示取消升扭限制，下一次牵引可能在一个控制周期内达到当前会话的单电机最大转矩。修改时立即清零当前输入。</p><fieldset><legend>驾驶参数</legend><div class="limit-grid"><label for="target-speed-kph">目标车速上限（km/h）<input id="target-speed-kph" type="number" min="0" max="72" step="0.1" inputmode="decimal"></label><label for="max-motor-torque-nm">单电机最大驱动转矩（Nm）<input id="max-motor-torque-nm" type="number" min="0" max="640.0" step="0.1" inputmode="decimal"></label><label for="max-brake-pressure-bar">每路 EHB 最大普通压力（bar）<input id="max-brake-pressure-bar" type="number" min="0" max="327.6" step="0.1" inputmode="decimal"></label><label for="service-brake-pressure-bar">每路 EHB 缓刹压力（bar）<input id="service-brake-pressure-bar" type="number" min="0" max="327.6" step="0.1" inputmode="decimal"></label><label for="hard-brake-pressure-bar">每路 EHB 急刹压力（bar）<input id="hard-brake-pressure-bar" type="number" min="0" max="327.6" step="0.1" inputmode="decimal"></label><label for="max-steering-deg">最大四轴转向角（°）<input id="max-steering-deg" type="number" min="0" max="30" step="0.5" inputmode="decimal"></label></div></fieldset><fieldset><legend>速度 PID 与升扭标定</legend><p class="muted">PID 初始值与可调范围只使用当前车端上报；未收到完整默认值和范围时禁止提交与驾驶。升扭斜率数值越大，转矩建立越快；0 不是禁用驱动，而是直接跟随 PID 输出。</p><div class="limit-grid"><label for="speed-pid-kp">Kp<input id="speed-pid-kp" type="number" min="0" max="100" step="0.01" inputmode="decimal"></label><label for="speed-pid-ki">Ki<input id="speed-pid-ki" type="number" min="0" max="100" step="0.01" inputmode="decimal"></label><label for="speed-pid-kd">Kd<input id="speed-pid-kd" type="number" min="0" max="100" step="0.01" inputmode="decimal"></label><label for="speed-pid-derivative-filter-tau-ms">微分滤波 τ（ms）<input id="speed-pid-derivative-filter-tau-ms" type="number" min="0" max="2000" step="1" inputmode="numeric"></label><label for="speed-pid-max-dt-ms">最大采样周期（ms）<input id="speed-pid-max-dt-ms" type="number" min="20" max="200" step="1" inputmode="numeric"></label><label for="motor-torque-rise-rate">升扭斜率（Nm/s，0=直接跟随 PID 输出）<input id="motor-torque-rise-rate" type="number" min="0" max="32000" step="1" inputmode="decimal" required></label></div></fieldset><p id="vehicle-hard-limits" class="muted">等待车端硬上限与 PID 默认值</p><label><input id="control-limits-confirm" type="checkbox">我已确认车辆处于 N 挡、零速、电子驻车或隔离 mock 台架，并理解 0 表示取消升扭限制、可能单周期达到会话转矩上限</label><div><button id="control-limits-apply" disabled>发送并等待车端确认</button><button id="control-limits-cancel">取消</button></div></dialog></main><script>)HTML" + std::string(web::kControlLogicJavaScript) + R"HTML(</script><script>
-const controlLogic=MineTeleopControlLogic;
-const consoleConfig=)HTML" + page_config.dump() + R"HTML(;
-const gamepadConfig=consoleConfig.gamepad;
-const limitConfig=consoleConfig.control_limits;
-const keys=controlLogic.KEY_BINDINGS;
-let state=controlLogic.deriveKeyState(controlLogic.createKeySet());
-const pressedControlKeys=controlLogic.createKeySet(),blockedControlKeys=controlLogic.createKeySet();
-const gamepadState={connected:false,steering:0,throttle:0,brake:0};
-const driverActuationDefaults={target_speed_kph:limitConfig.initial_target_speed_kph,max_motor_torque_nm:limitConfig.initial_max_motor_torque_nm,max_brake_pressure_bar:limitConfig.initial_max_brake_pressure_bar,service_brake_pressure_bar:limitConfig.initial_service_brake_pressure_bar,hard_brake_pressure_bar:limitConfig.initial_hard_brake_pressure_bar,max_steering_angle_deg:limitConfig.initial_max_steering_angle_deg};
-let controlProfileState={requestedProfile:null,pendingRequestSeq:0,effectiveProfile:null,effectiveRequestSeq:0,effectiveAppliedRevision:0,acknowledged:false,reason:''},pendingControlProfileEnvelope=null,lastControlProfileSendAt=0,controlProfilePrepareInFlight=false,controlProfileGeneration=0;
-let vehicleHardLimits={received:false};
-const controlTraceEnabled=Boolean(consoleConfig.control_trace_commands),intentRefreshIntervalMs=Math.max(50,Math.floor(Number(consoleConfig.intent_lease_ms||200)/3)),controlTraceBuffer=[],controlTraceErrorScopes=new WeakMap();
-let controlTraceSummary=createControlTraceSummary(),controlTraceScope={session_id:'',vehicle_id:''},lastHeartbeatTraceAt=null;
-const calibration={steeringCenter:gamepadConfig.steering_center,steeringRange:gamepadConfig.steering_range,throttleRest:gamepadConfig.throttle_rest,throttleRange:gamepadConfig.throttle_range,brakeRest:gamepadConfig.brake_rest,brakeRange:gamepadConfig.brake_range};
-const webrtcLabel=document.getElementById('webrtc'),cameraGrid=document.getElementById('cameras'),statusPanel=document.getElementById('status'),loginPanel=document.getElementById('login-panel'),sessionPanel=document.getElementById('session-panel'),passwordInput=document.getElementById('password'),vehicleSelect=document.getElementById('vehicle'),connectButton=document.getElementById('connect'),authExpiry=document.getElementById('auth-expiry'),vcuPanel=document.getElementById('vcu-panel'),vcuStatus=document.getElementById('vcu-status'),vcuGate=document.getElementById('vcu-gate'),vcuConnectButton=document.getElementById('vcu-connect'),vcuDisconnectButton=document.getElementById('vcu-disconnect'),controlLimitsOpen=document.getElementById('control-limits-open'),controlLimitsSummary=document.getElementById('control-limits-summary'),controlLimitsDialog=document.getElementById('control-limits-dialog'),targetSpeedKph=document.getElementById('target-speed-kph'),maxMotorTorqueNm=document.getElementById('max-motor-torque-nm'),maxBrakePressureBar=document.getElementById('max-brake-pressure-bar'),serviceBrakePressureBar=document.getElementById('service-brake-pressure-bar'),hardBrakePressureBar=document.getElementById('hard-brake-pressure-bar'),maxSteeringDeg=document.getElementById('max-steering-deg'),speedPidKp=document.getElementById('speed-pid-kp'),speedPidKi=document.getElementById('speed-pid-ki'),speedPidKd=document.getElementById('speed-pid-kd'),speedPidDerivativeFilterTauMs=document.getElementById('speed-pid-derivative-filter-tau-ms'),speedPidMaxDtMs=document.getElementById('speed-pid-max-dt-ms'),motorTorqueRiseRate=document.getElementById('motor-torque-rise-rate'),vehicleHardLimitsLabel=document.getElementById('vehicle-hard-limits'),controlLimitsConfirm=document.getElementById('control-limits-confirm'),controlLimitsApply=document.getElementById('control-limits-apply'),controlLimitsCancel=document.getElementById('control-limits-cancel'),estopStatus=document.getElementById('estop-status'),monitorPanel=document.getElementById('monitor-panel'),alertsPanel=document.getElementById('alerts'),streamMetrics=document.getElementById('stream-metrics'),inputReadiness=document.getElementById('input-readiness'),lastKeyboardEvent=document.getElementById('last-keyboard-event'),emptyStage=document.getElementById('empty-stage');
-const canFeedbackPanel=document.getElementById('can-feedback-panel'),canFeedbackStatus=document.getElementById('can-feedback-status'),canSpeed=document.getElementById('can-speed'),canGear=document.getElementById('can-gear'),canSelector=document.getElementById('can-selector'),canEpb=document.getElementById('can-epb'),canHandshake=document.getElementById('can-handshake'),canVmcFault=document.getElementById('can-vmc-fault'),canParkingSwitch=document.getElementById('can-parking-switch'),canBrakePedal=document.getElementById('can-brake-pedal'),canEmergency=document.getElementById('can-emergency'),canAge=document.getElementById('can-age'),wheelFeedbackGrid=document.getElementById('wheel-feedback-grid'),steeringFeedbackGrid=document.getElementById('steering-feedback-grid');
-const operatorSpeed=document.getElementById('operator-speed'),operatorActualGear=document.getElementById('operator-actual-gear');
-const keyIndicators={left:document.getElementById('key-left'),right:document.getElementById('key-right'),up:document.getElementById('key-up'),down:document.getElementById('key-down'),service_brake:document.getElementById('key-service-brake'),hard_brake:document.getElementById('key-hard-brake')};
-const controlReadouts={gear:document.getElementById('control-gear'),steering:document.getElementById('control-steering'),throttle:document.getElementById('control-throttle'),brake:document.getElementById('control-brake')};
-const operatorControlReadouts={gear:document.getElementById('operator-control-gear'),steering:document.getElementById('operator-control-steering'),throttle:document.getElementById('operator-control-throttle'),brake:document.getElementById('operator-control-brake')};
-let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,gearRejectionInhibited=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,lastVehicleSafetyState='',vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,pendingGearTransition=null,gearTransitionGeneration=0,lastControlStatusSeq=0,lastControlPrepareTimeoutLogAt=0,lastControlPrepareExpiredLogAt=0,activeControlPrepareAbort=null,activeControlPrepareIsEstop=false,activeControlPreparePreemptedByEstop=false;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
-let gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();
-const uiInstanceId=(globalThis.crypto?.randomUUID?.()||`ui-${Date.now()}-${Math.random().toString(16).slice(2)}`).replace(/[^A-Za-z0-9_-]/g,'_');
-let nativeIntentSeq=0,lastNativeIntentSnapshot='',nativeControlSessionId='',nativeControlSessionGeneration=0;
-let controlOutcomeSession={metrics:controlLogic.createControlOutcomeMetrics()};
-function responseError(response,body){const error=Error(body.error||response.status);error.status=response.status;return error}
-async function post(path,body={},signal=null){const options={method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)};if(signal)options.signal=signal;const r=await fetch(path,options);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
-async function get(path){const r=await fetch(path);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
-function clientLog(event,details={}){const entry={event,sent_at_utc_ms:Date.now(),details};console.info(JSON.stringify(entry));fetch('/api/browser-event',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(entry),keepalive:true}).catch(()=>{})}
-function createControlTraceSummary(){return{interval_started_at_utc_ms:Date.now(),heartbeat_tick_count:0,heartbeat_enqueued_count:0,heartbeat_coalesced_count:0,timer_lag_sample_count:0,timer_lag_total_ms:0,timer_lag_max_ms:0,explicit_send_count:0,backpressure_count:0,max_buffered_amount_bytes:0,prepare_timeout_count:0,prepare_expired_count:0,prepare_preempted_by_estop_count:0,queue_unhandled_error_count:0}}
-function noteIntentRefresh(now){if(!controlTraceEnabled)return;controlTraceSummary.heartbeat_tick_count++;if(lastHeartbeatTraceAt!==null){const lag=Math.max(0,now-lastHeartbeatTraceAt-intentRefreshIntervalMs);controlTraceSummary.timer_lag_sample_count++;controlTraceSummary.timer_lag_total_ms+=lag;controlTraceSummary.timer_lag_max_ms=Math.max(controlTraceSummary.timer_lag_max_ms,lag)}lastHeartbeatTraceAt=now}
-function noteControlBackpressure(bufferedAmount){if(!controlTraceEnabled)return;const bytes=Math.max(0,Number(bufferedAmount)||0);controlTraceSummary.backpressure_count++;controlTraceSummary.max_buffered_amount_bytes=Math.max(controlTraceSummary.max_buffered_amount_bytes,bytes)}
-function setControlTraceScope(sessionId='',vehicleId=''){if(!controlTraceEnabled)return;const next={session_id:String(sessionId||''),vehicle_id:String(vehicleId||'')};if(next.session_id===controlTraceScope.session_id&&next.vehicle_id===controlTraceScope.vehicle_id)return;if(controlTraceScope.session_id||controlTraceScope.vehicle_id)flushControlTrace('session_scope_change');controlTraceScope=next}
-function sameControlTraceScope(scope){return Boolean(scope)&&String(scope.session_id||'')===controlTraceScope.session_id&&String(scope.vehicle_id||'')===controlTraceScope.vehicle_id}
-function emitControlTraceBatch(reason,scope,commands,summary,sampleTransport=true){const samples=summary.timer_lag_sample_count;summary.interval_ended_at_utc_ms=Date.now();summary.timer_lag_average_ms=samples?summary.timer_lag_total_ms/samples:0;summary.peer_connection_state=sampleTransport?(peer?.connectionState||'none'):null;summary.data_channel_ready_state=sampleTransport?(controlChannel?.readyState||'none'):null;summary.data_channel_buffered_amount_bytes=sampleTransport?Math.max(0,Number(controlChannel?.bufferedAmount)||0):null;clientLog('control_trace_batch',{reason,trace_session_id:String(scope&&scope.session_id||''),trace_vehicle_id:String(scope&&scope.vehicle_id||''),commands,summary})}
-function noteScopedControlTraceCounter(field,scope){if(!controlTraceEnabled)return;if(sameControlTraceScope(scope)){controlTraceSummary[field]++;return}const summary=createControlTraceSummary();summary[field]=1;emitControlTraceBatch(`late_${field}`,scope,[],summary,false)}
-function queueTerminalControlTrace(outcome,command,trace){if(!controlTraceEnabled||!trace)return;const seq=Number(command&&command.seq);if(!Number.isSafeInteger(seq)||seq<=0)return;const scope={session_id:String(command&&command.session_id||trace.scope&&trace.scope.session_id||''),vehicle_id:String(command&&command.vehicle_id||trace.scope&&trace.scope.vehicle_id||'')},item={session_id:scope.session_id,seq,browser_prepare_started_at_utc_ms:trace.browserPrepareStartedAtUtcMs,native_command_sent_at_utc_ms:Number(command&&command.sent_at_utc_ms)||null,prepare_elapsed_ms:trace.prepareElapsedMs,data_channel_send_invoked_at_utc_ms:trace.dataChannelSendInvokedAtUtcMs,buffered_amount_bytes:trace.bufferedAmountBytes,outcome,browser_terminal_at_utc_ms:Date.now(),estop:Boolean(trace.estop)};if(!sameControlTraceScope(scope)){const summary=createControlTraceSummary();summary.interval_started_at_utc_ms=Number(trace.browserPrepareStartedAtUtcMs)||summary.interval_started_at_utc_ms;emitControlTraceBatch('late_terminal',scope,[item],summary,false);return}controlTraceBuffer.push(item);if(controlTraceBuffer.length>=48)flushControlTrace('capacity')}
-function flushControlTrace(reason='interval'){if(!controlTraceEnabled)return false;const summary=controlTraceSummary,scope=controlTraceScope,commands=controlTraceBuffer.splice(0,controlTraceBuffer.length),hasActivity=commands.length||summary.heartbeat_tick_count||summary.explicit_send_count||summary.backpressure_count||summary.prepare_timeout_count||summary.prepare_expired_count||summary.prepare_preempted_by_estop_count||summary.queue_unhandled_error_count;controlTraceSummary=createControlTraceSummary();if(!hasActivity)return false;emitControlTraceBatch(reason,scope,commands,summary);return true}
-function recordTerminalControlOutcome(outcome,command,session,trace,details={}){recordControlOutcome(outcome,command,session,details);queueTerminalControlTrace(outcome,command,trace)}
-function resetControlOutcomeSession(){controlOutcomeSession={metrics:controlLogic.createControlOutcomeMetrics()}}
-function recordControlOutcome(outcome,command,session=controlOutcomeSession,details={}){const sequence=Number(command&&command.seq);session.metrics=controlLogic.reduceControlOutcome(session.metrics,outcome,sequence);if(controlLogic.shouldLogControlOutcome(outcome))clientLog('control_command_browser_outcome',{session_id:String(command&&command.session_id||''),vehicle_id:String(command&&command.vehicle_id||''),outcome,control_seq:sequence,...session.metrics,...details})}
-function controlPrepareDeadlineMs(){return controlLogic.controlPrepareDeadlineMs(vehicleHardLimits?.read_only_control_safety?.max_command_gap_ms)}
-function logControlPrepareFailure(event,details){const now=Date.now(),last=event==='control_prepare_timeout'?lastControlPrepareTimeoutLogAt:lastControlPrepareExpiredLogAt;if(now-last<1000)return;if(event==='control_prepare_timeout')lastControlPrepareTimeoutLogAt=now;else lastControlPrepareExpiredLogAt=now;clientLog(event,details)}
-function hasTurnServer(){return iceServers.some(server=>String(server.urls||'').includes('turn:')||(Array.isArray(server.urls)&&server.urls.some(url=>String(url).startsWith('turn:'))))}
-function safeIceEndpoint(value){const match=String(value||'').match(/^([a-z]+):(?:\/\/)?(?:[^@]*@)?(\[[^\]]+\]|[^:?/]+)(?::(\d+))?/i);return match?`${match[1].toLowerCase()}:${match[2]}${match[3]?`:${match[3]}`:''}`:'unknown'}
-function setMetric(id,text,level=''){const element=document.getElementById(id);element.textContent=text;element.classList.remove('ok','warn','critical');if(level)element.classList.add(level)}
-function formatMetric(value,digits=1,suffix=''){return Number.isFinite(Number(value))?`${Number(value).toFixed(digits)}${suffix}`:'未知'}
-function setCanValue(id,text){const element=document.getElementById(id);if(element)element.textContent=text}
-function validCanValue(values,valid,index,digits,unit=''){return Array.isArray(values)&&Array.isArray(valid)&&valid[index]&&Number.isFinite(Number(values[index]))?`${Number(values[index]).toFixed(digits)}${unit}`:'—'}
-function ensureCanFeedbackCards(){
-  if(!wheelFeedbackGrid.childElementCount)for(let index=0;index<8;index++){const card=document.createElement('article');card.className='wheel-feedback';const title=document.createElement('div');title.className='feedback-title';const name=document.createElement('strong');name.textContent=`轮端 ${index+1}`;const mode=document.createElement('span');mode.id=`can-wheel-mode-${index}`;mode.textContent='M— / B—';title.append(name,mode);const values=document.createElement('div');values.className='feedback-values';for(const [label,key] of [['扭矩','torque'],['转速','speed'],['制动压力','brake']]){const item=document.createElement('div');item.className='feedback-value';const caption=document.createElement('span');caption.textContent=label;const value=document.createElement('strong');value.id=`can-wheel-${key}-${index}`;value.textContent='—';item.append(caption,value);values.appendChild(item)}card.append(title,values);wheelFeedbackGrid.appendChild(card)}
-  if(!steeringFeedbackGrid.childElementCount)for(let index=0;index<4;index++){const card=document.createElement('article');card.className='steering-feedback';const title=document.createElement('div');title.className='feedback-title';const name=document.createElement('strong');name.textContent=`转向轴 ${index+1}`;title.appendChild(name);const values=document.createElement('div');values.className='feedback-values';for(const [label,key] of [['转角','angle'],['模式','mode']]){const item=document.createElement('div');item.className='feedback-value';const caption=document.createElement('span');caption.textContent=label;const value=document.createElement('strong');value.id=`can-steering-${key}-${index}`;value.textContent='—';item.append(caption,value);values.appendChild(item)}card.append(title,values);steeringFeedbackGrid.appendChild(card)}
-}
-function renderCanFeedback(){
-  canFeedbackPanel.hidden=!authenticated;
-  if(!authenticated)return;
-  ensureCanFeedbackCards();
-  const feedback=vehicleTelemetry?.can_feedback;
-  const supported=Boolean(feedback?.supported);
-  const transportAge=vehicleTelemetry&&Number.isFinite(Number(vehicleTelemetry.sent_at_utc_ms))?Math.max(0,Date.now()-Number(vehicleTelemetry.sent_at_utc_ms)):null,canFeedbackAge=supported&&Number(feedback.max_feedback_age_ms)>=0?Number(feedback.max_feedback_age_ms):null;
-  canFeedbackStatus.textContent=!vehicleTelemetry?'等待车端遥测':(supported?`序号 ${vehicleTelemetry.seq??'—'}`:'车端桥接包无完整反馈');
-  canFeedbackStatus.className=supported&&Boolean(feedback.feedback_fresh)&&transportAge!==null&&transportAge<=500?'status-chip ok':'status-chip warn';
-  const telemetrySpeed=vehicleTelemetry?.speed_mps,measuredSpeed=supported&&feedback.speed_valid?Number(feedback.speed_mps):(telemetrySpeed!==null&&Number.isFinite(Number(telemetrySpeed))?Number(telemetrySpeed):null),speedText=measuredSpeed===null?'—':`${measuredSpeed.toFixed(2)} m/s · ${(measuredSpeed*3.6).toFixed(1)} km/h`;
-  const gearText=supported&&feedback.gear_valid?vcuGearLabel(feedback.gear):(typeof vehicleTelemetry?.gear==='string'&&vehicleTelemetry.gear?vehicleTelemetry.gear:'—');
-  canSpeed.textContent=speedText;operatorSpeed.textContent=speedText;
-  canGear.textContent=gearText;operatorActualGear.textContent=gearText;
-  canSelector.textContent=supported&&feedback.driver_gear_request_valid?vcuGearLabel(feedback.driver_gear_request):'—';
-  canEpb.textContent=supported&&Array.isArray(feedback.parking_brake_status)?feedback.parking_brake_status.map((value,index)=>feedback.parking_brake_valid?.[index]?vcuEpbLabel(value):'—').join('/'):'—';
-  canHandshake.textContent=supported&&feedback.handshake_valid?String(feedback.handshake_status):'—';
-  canVmcFault.textContent=supported&&feedback.vmc_fault_code_valid?String(feedback.vmc_fault_code):'—';
-  canVmcFault.className=supported&&feedback.vmc_fault_code_valid&&Number(feedback.vmc_fault_code)!==0?'critical':'';
-  canParkingSwitch.textContent=supported&&feedback.parking_brake_switch_valid?vcuSwitchLabel(feedback.parking_brake_switch,'已拉起','已松开'):'—';
-  canBrakePedal.textContent=supported&&feedback.brake_pedal_switch_valid?vcuSwitchLabel(feedback.brake_pedal_switch,'已踩下','已松开'):'—';
-  canEmergency.textContent=supported&&feedback.gear_valid?String(feedback.emergency_switch??'—'):'—';
-  canAge.textContent=!supported?'—':(canFeedbackAge===null?'CAN 未完整':`${canFeedbackAge} ms CAN · ${transportAge??'—'} ms 链路`);
-  canAge.className=supported&&Boolean(feedback.feedback_fresh)&&transportAge!==null&&transportAge<=500?'ok':'warn';
-  for(let index=0;index<8;index++){setCanValue(`can-wheel-torque-${index}`,validCanValue(feedback?.motor_torque_nm,feedback?.motor_torque_valid,index,1,' Nm'));setCanValue(`can-wheel-speed-${index}`,validCanValue(feedback?.motor_speed_rpm,feedback?.motor_speed_valid,index,0,' rpm'));setCanValue(`can-wheel-brake-${index}`,validCanValue(feedback?.brake_pressure_bar,feedback?.brake_valid,index,1,' bar'));const motorMode=feedback?.motor_mode_valid?.[index]?feedback.motor_mode[index]:'—',brakeMode=feedback?.brake_valid?.[index]?feedback.brake_mode[index]:'—';setCanValue(`can-wheel-mode-${index}`,`M${motorMode} / B${brakeMode}`)}
-  for(let index=0;index<4;index++){setCanValue(`can-steering-angle-${index}`,validCanValue(feedback?.steering_angle_deg,feedback?.steering_valid,index,1,'°'));setCanValue(`can-steering-mode-${index}`,feedback?.steering_valid?.[index]?String(feedback.steering_mode[index]):'—')}
-}
-function vcuGearLabel(value){const labels={1:'N',2:'R',3:'D'};return labels[Number(value)]||`不支持(${String(value)})`}
-function vcuEpbLabel(value){const labels={0:'保持',1:'释放',2:'已拉起'};return labels[Number(value)]||`异常(${String(value)})`}
-function vcuSwitchLabel(value,activeLabel,inactiveLabel){const number=Number(value);if(number===1)return activeLabel;if(number===0)return inactiveLabel;return`异常(${String(value)})`}
-function vcuAdapterReady(status,explicit){return controlLogic.adapterReady(status,explicit)}
-function vcuDrivingReady(){return controlProfileState.acknowledged&&controlLogic.drivingReady(vcuHandshake)}
-function diagnoseVcuHandshake(channelOpen){
-  if(!channelOpen)return{level:'warn',text:'连接步骤未完成：控制 DataChannel 尚未连接。'};
-  if(vcuHandshake.handshake_revoked){const vmc=vcuHandshake.vmc_fault_code_valid?String(vcuHandshake.vmc_fault_code):'未知',epb=Array.isArray(vcuHandshake.epb_status)?vcuHandshake.epb_status.map((value,index)=>vcuHandshake.epb_valid?.[index]?vcuEpbLabel(value):'—').join('/'):'未知';return{level:'critical',text:`握手已被 VCU 撤销（状态 5→${String(vcuHandshake.revoked_handshake_status??vcuHandshake.handshake_status??3)}）；VMC 故障码 ${vmc}，电子驻车 ${epb}。车端正在安全退出，完成后请从页面重新申请 VCU 握手。`};}
-  if(!controlProfileState.acknowledged)return{level:'warn',text:controlProfileState.pendingRequestSeq?`连接步骤未完成：等待车端确认会话控制参数序号 ${controlProfileState.pendingRequestSeq}。`:'连接步骤未完成：尚未发送或确认会话控制参数。'};
-  if(!vcuHandshake.supported){
-    if(vcuHandshake.state==='unsupported')return{level:'ok',text:'当前适配器不需要 VCU 平行驾驶握手。'};
-    return{level:'warn',text:'连接步骤未完成：尚未收到车端 VCU 状态。'};
-  }
-  const stateName=vcuHandshake.state||'unavailable';
-  if(stateName==='closed')return{level:'critical',text:'连接步骤失败：车端 VCU 适配器已关闭，请检查 CAN bridge。'};
-  if(stateName==='fault')return{level:'critical',text:'运行阶段失败：VCU 握手状态丢失或 CAN/I/O 故障，驾驶命令已阻止；请查看车端 VCU 日志 issue_code。'};
-  if((stateName==='standby'||stateName==='disarmed')&&!vcuHandshake.requested&&!vcuHandshake.disarming&&!vcuHandshake.ready){
-    if(!vcuHandshake.driver_gear_request_valid)return{level:'warn',text:'准入第 1 步失败：未收到物理挡位反馈；必须确认在 N 挡。'};
-    const selector=vcuGearLabel(vcuHandshake.driver_gear_request);
-    if(Number(vcuHandshake.driver_gear_request)!==1)return{level:'critical',text:`准入第 1 步失败：当前为 ${selector} 挡；只有 N 挡允许进入平行驾驶。`};
-    const epbStatus=Array.isArray(vcuHandshake.epb_status)?vcuHandshake.epb_status:[];
-    const epbValid=Array.isArray(vcuHandshake.epb_valid)?vcuHandshake.epb_valid:[];
-    if(epbValid.length!==4||epbValid.some(value=>!value))return{level:'warn',text:'准入第 2 步失败：电子驻车反馈不完整；需确认四路电子驻车均已拉起。'};
-    if(epbStatus.length!==4||epbStatus.some(value=>Number(value)!==2))return{level:'critical',text:`准入第 2 步失败：电子驻车未全部拉起；当前 ${epbStatus.map(vcuEpbLabel).join('/')}。`};
-    if(!vcuHandshake.speed_valid)return{level:'warn',text:'准入第 3 步失败：未收到有效车速反馈；必须确认车辆静止。'};
-    if(Math.abs(Number(vcuHandshake.speed_mps))>0.1)return{level:'critical',text:`准入第 3 步失败：当前车速 ${Number(vcuHandshake.speed_mps).toFixed(2)} m/s，高于 0.10 m/s。`};
-    if(!vcuHandshake.handshake_valid)return{level:'warn',text:'准入第 4 步失败：未收到 VCU 握手状态；需 VCU 处于人工状态 3。'};
-    if(Number(vcuHandshake.handshake_status)!==3)return{level:'critical',text:`准入第 4 步失败：VCU 当前状态 ${String(vcuHandshake.handshake_status)}，需要人工状态 3。`};
-    if(!vcuHandshake.parking_ready)return{level:'warn',text:'准入第 5 步失败：N 挡、电子驻车、零速和人工状态值已满足，但反馈已过期；请检查最近 500 ms 的 CAN 更新。'};
-    return{level:'ok',text:'准入检查通过：N 挡、电子驻车已拉起、车辆零速、VCU 人工状态及反馈新鲜度均满足。'};
-  }
-  if(stateName==='standby'&&vcuHandshake.requested){
-    return{level:'warn',text:'握手请求已发送：等待车端确认并进入启动第 1/5 步。'};
-  }
-  const stages={
-    initial:'启动第 1/5 步：正在发送 5 个周期低握手帧。',
-    wait_parallel_handshake:`启动第 2/5 步未完成：复用智驾握手，等待 VCU 状态 5；当前 ${vcuHandshake.handshake_valid?String(vcuHandshake.handshake_status):'无有效反馈'}。`,
-    wait_parking_brake_released:`启动第 3/5 步未完成：等待四路电子驻车释放反馈为 1；当前 ${Array.isArray(vcuHandshake.epb_status)?vcuHandshake.epb_status.map(vcuEpbLabel).join('/'):'无有效反馈'}。`,
-    wait_gear:'启动第 4/5 步未完成：等待 N/R/D 目标挡位闭环反馈。',
-    wait_actuator_modes:'启动第 5/5 步未完成：等待 MCU/EPS/EHB 全部进入线控模式。',
-    ready:'启动完成：平行驾驶已就绪，可以发送驾驶命令。',
-    disarm_torque:'退出第 1/5 步未完成：等待八路驱动扭矩归零。',
-    disarm_stop:'退出第 2/5 步未完成：正在制动并等待车辆零速。',
-    disarm_neutral:'退出第 3/5 步未完成：等待挡位回到 N。',
-    disarm_parking_brake:'退出第 4/5 步未完成：等待四路电子驻车全部拉起。',
-    disarm_manual:'退出第 5/5 步未完成：等待 VCU 回到人工状态 3。'
-  };
-  return{level:stateName==='ready'?'ok':'warn',text:stages[stateName]||`VCU 状态无法识别：${stateName}。`};
-}
-function renderVcuHandshake(){const labels={unavailable:'等待车端状态',unsupported:'当前适配器不支持 VCU 握手',closed:'车端适配器已关闭',standby:'待机（未请求）',initial:'启动 1/5 · 低握手帧',wait_parallel_handshake:'启动 2/5 · 智驾状态 5',wait_parking_brake_released:'启动 3/5 · 电子驻车释放',wait_gear:'启动 4/5 · 挡位闭环',wait_actuator_modes:'启动 5/5 · 执行器模式',ready:'握手成功（平行驾驶）',disarm_torque:'退出 1/5 · 扭矩归零',disarm_stop:'退出 2/5 · 车辆零速',disarm_neutral:'退出 3/5 · N 挡',disarm_parking_brake:'退出 4/5 · 电子驻车',disarm_manual:'退出 5/5 · 人工状态 3',disarmed:'已安全断开',fault:'VCU 通讯故障'};const channelOpen=Boolean(controlChannel&&controlChannel.readyState==='open'),supported=Boolean(vcuHandshake.supported),ready=Boolean(vcuHandshake.ready),disarming=Boolean(vcuHandshake.disarming),requested=Boolean(vcuHandshake.requested),adapterReady=vcuHandshake.adapter_ready===true,diagnostic=diagnoseVcuHandshake(channelOpen),vmcSuffix=vcuHandshake.vmc_fault_code_valid&&Number(vcuHandshake.vmc_fault_code)!==0?` · VMC ${vcuHandshake.vmc_fault_code}`:'';vcuStatus.textContent=(labels[vcuHandshake.state]||vcuHandshake.state||'未知')+vmcSuffix;vcuStatus.className=ready&&adapterReady&&controlProfileState.acknowledged?'ok':(diagnostic.level==='critical'?'critical':'warn');vcuGate.textContent=diagnostic.text;vcuGate.className=`gate-copy ${diagnostic.level}`;const selector=vcuHandshake.driver_gear_request_valid?vcuGearLabel(vcuHandshake.driver_gear_request):'未知',speed=vcuHandshake.speed_valid?`${Number(vcuHandshake.speed_mps).toFixed(2)} m/s`:'未知',manual=vcuHandshake.handshake_valid?String(vcuHandshake.handshake_status):'未知',epb=Array.isArray(vcuHandshake.epb_status)?vcuHandshake.epb_status.map(vcuEpbLabel).join('/'):'未知',vmc=vcuHandshake.vmc_fault_code_valid?String(vcuHandshake.vmc_fault_code):'未知',parkingSwitch=vcuHandshake.parking_brake_switch_valid?vcuSwitchLabel(vcuHandshake.parking_brake_switch,'已拉起','已松开'):'未知',brakePedal=vcuHandshake.brake_pedal_switch_valid?vcuSwitchLabel(vcuHandshake.brake_pedal_switch,'已踩下','已松开'):'未知';vcuGate.title=`控制链路 ${channelOpen?'已连接':'未连接'} · 参数 ${controlProfileState.acknowledged?'已确认':'未确认'} · 选择器 ${selector} · 车速 ${speed} · 电子驻车 ${epb} · VCU状态 ${manual} · VMC故障码 ${vmc} · 物理手刹 ${parkingSwitch} · 制动踏板 ${brakePedal}`;vcuConnectButton.disabled=!channelOpen||!controlProfileState.acknowledged||!adapterReady||!supported||!vcuHandshake.parking_ready||requested||ready||disarming;vcuDisconnectButton.disabled=!channelOpen||!adapterReady||!supported||(!requested&&!ready&&!disarming)}
-function renderMonitoring(){const estopPresentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason);renderEstopRequest(estopPresentation);renderVcuHandshake();renderCanFeedback();renderControlState();if(!authenticated){monitorPanel.hidden=true;return}monitorPanel.hidden=false;const runtime=latestRuntimeStatus||{},metrics=latestMetrics||{streams:[]},vehicles=runtime.authorized_vehicles||[],selected=vehicles.find(v=>v.vehicle_id===(runtime.vehicle_id||vehicleSelect.value));setMetric('metric-vehicle',selected?(selected.online?`${selected.vehicle_id} 在线`:`${selected.vehicle_id} 离线`):'未知',selected?.online?'ok':'warn');setMetric('metric-session',runtime.connected?`${runtime.session_id||'活动'} · ${metrics.connection_state||'等待媒体'}`:'未连接',runtime.connected?'ok':'warn');const authority=runtime.connected&&!controlAuthorityLost;setMetric('metric-authority',authority?'已获得':'无',authority?'ok':(controlAuthorityLost?'critical':'warn'));const codec=metrics.codec||mediaStatus.codec||'',backend=metrics.backend||mediaStatus.backend||'';setMetric('metric-video',codec||backend?`${codec||'未知'} / ${backend||'未知'}`:'等待媒体',codec?'ok':'warn');setMetric('metric-rtt',formatMetric(metrics.control_rtt_ms,1,' ms'),Number(metrics.control_rtt_ms)>200?'critical':(Number.isFinite(Number(metrics.control_rtt_ms))?'ok':'warn'));setMetric('metric-network',metrics.connection_method||'未知',metrics.connection_method==='TURN'?'warn':(metrics.connection_method&&metrics.connection_method!=='unknown'?'ok':'warn'));const turnConfigured=Boolean(metrics.turn_configured??hasTurnServer());setMetric('metric-turn',metrics.turn_in_use?'正在中继':(turnConfigured?'已配置，未使用':'未配置'),metrics.turn_in_use?'warn':(turnConfigured?'ok':'warn'));const sync=runtime.time_sync||metrics.time_sync||{},timeTrusted=runtime.signaling_available!==false&&Boolean(sync.synchronized)&&Number(sync.uncertainty_ms)<=consoleConfig.max_time_sync_uncertainty_ms;setMetric('metric-time',timeTrusted?`可信 ±${sync.uncertainty_ms} ms`:`不可信${Number.isFinite(Number(sync.uncertainty_ms))?` ±${sync.uncertainty_ms} ms`:''}`,timeTrusted?'ok':'critical');streamMetrics.replaceChildren();const streams=metrics.streams||[];if(!streams.length){const row=document.createElement('tr');const cell=document.createElement('td');cell.colSpan=5;cell.className='muted';cell.textContent='等待视频轨道';row.appendChild(cell);streamMetrics.appendChild(row)}for(const stream of streams){const row=document.createElement('tr');const loss=Number(stream.packet_loss_percent||0),fps=Number(stream.fps||0),latency=Number(stream.estimated_end_to_end_latency_ms||0);for(const [text,level] of [[stream.camera_id||stream.mid||'unknown',''],[formatMetric(fps,1),fps<20?'critical':'ok'],[formatMetric(stream.bitrate_kbps,0,' kbps'),''],[formatMetric(loss,2,'%'),loss>2?'warn':''],[formatMetric(latency,1,' ms'),latency>200?'critical':'ok']]){const cell=document.createElement('td');cell.textContent=text;if(level)cell.className=level;row.appendChild(cell)}streamMetrics.appendChild(row)}const alerts=[];let severity='';if(estopPresentation.visible){alerts.push(estopPresentation.alert);severity=estopPresentation.severity}if(controlAuthorityLost){alerts.push('控制权或信令已丢失，当前页面不会继续发送驾驶命令');severity='critical'}else if(runtime.connected&&(!controlChannel||controlChannel.readyState!=='open')){alerts.push('控制 DataChannel 尚未就绪');if(!severity)severity='warn'}if(vcuHandshake.supported&&!vcuHandshake.ready){const diagnostic=diagnoseVcuHandshake(Boolean(controlChannel&&controlChannel.readyState==='open'));alerts.push(diagnostic.text);if(diagnostic.level==='critical')severity='critical';else if(!severity)severity='warn'}if(!timeTrusted){alerts.push('时间同步不可信，端到端时延只作参考');severity='critical'}for(const stream of streams){if(Number(stream.estimated_end_to_end_latency_ms)>200){alerts.push(`${stream.camera_id||'视频'} 时延超过 200 ms`);severity='critical'}if(Number(stream.fps)<20){alerts.push(`${stream.camera_id||'视频'} 低于 20 FPS`);severity='critical'}}if(!alerts.length)alerts.push(streams.length?'当前指标在目标范围内':'尚无媒体指标；控制命令不会在链路未就绪时发送');alertsPanel.textContent=alerts.join('；');alertsPanel.className=`alerts ${severity}`.trim();const alertKey=`${severity}:${alerts.join('|')}`;if(alertKey!==lastAlertKey){clientLog('control_monitor_state',{severity:severity||'ok',alerts});lastAlertKey=alertKey}}
-async function refreshRuntimeStatus(){if(!authenticated)return;try{latestRuntimeStatus=await get('/api/status');if(polling&&!latestRuntimeStatus.connected){closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='控制权丢失'}renderMonitoring()}catch(error){controlAuthorityLost=true;resetControlAuthorityInput();webrtcLabel.textContent='本地状态读取失败';alertsPanel.textContent='无法读取本地运行状态: '+error.message;alertsPanel.className='alerts critical'}}
-function clamp(value,min,max){return Math.min(max,Math.max(min,value))}
-function resetControlProfileSession(){controlProfileGeneration+=1;controlProfileState={requestedProfile:null,pendingRequestSeq:0,effectiveProfile:null,effectiveRequestSeq:0,effectiveAppliedRevision:0,acknowledged:false,reason:''};pendingControlProfileEnvelope=null;lastControlProfileSendAt=0;controlProfilePrepareInFlight=false;vehicleHardLimits={received:false}}
-function effectiveControlLimits(){const profile=controlProfileState.acknowledged?controlProfileState.effectiveProfile:null;if(!profile||!vehicleHardLimits.received)return{maxThrottle:0,maxBrakePressureBar:0,serviceBrakePressureBar:0,hardBrakePressureBar:0,maxSteeringDeg:0};return{maxThrottle:controlLogic.controlProfileThrottleLimit(profile,vehicleHardLimits),maxBrakePressureBar:profile.max_brake_pressure_bar,serviceBrakePressureBar:profile.service_brake_pressure_bar,hardBrakePressureBar:profile.hard_brake_pressure_bar,maxSteeringDeg:Math.min(profile.max_steering_angle_deg,vehicleHardLimits.max_steering_angle_deg)}}
-function readOnlyControlSafetyText(safety){const stages=safety.deceleration_profile.map(stage=>`${stage.after_ms}ms:${stage.brake}`).join('/');return`固定安全：upstream rate ${safety.control_rate_hz} Hz · command gap ${safety.max_command_gap_ms} ms · watchdog ${safety.degraded_timeout_ms}/${safety.control_timeout_ms} ms · decel ${stages} · speed feedback ${safety.speed_feedback_timeout_ms} ms · overspeed margin ${safety.hard_overspeed_margin_kph} km/h · gates CAN=${safety.require_can_feedback_before_control}, ESTOP reset=${safety.require_local_estop_reset}, time sync=${safety.require_time_sync} (±${safety.max_time_sync_uncertainty_ms} ms / ${safety.time_sync_interval_ms} ms / ${safety.time_sync_samples} samples) · mode ${safety.commissioning_mode}`}
-function renderControlLimits(){const profile=controlProfileState.effectiveProfile;if(controlProfileState.pendingRequestSeq)controlLimitsSummary.textContent=`等待车端确认参数序号 ${controlProfileState.pendingRequestSeq}`;else if(!controlProfileState.acknowledged||!profile)controlLimitsSummary.textContent='未获得车端会话参数确认（需人工打开并发送）';else controlLimitsSummary.textContent=`目标 ${profile.target_speed_kph.toFixed(1)} km/h · 单电机 ${profile.max_motor_torque_nm.toFixed(1)} Nm · EHB ${profile.service_brake_pressure_bar.toFixed(1)}/${profile.hard_brake_pressure_bar.toFixed(1)}/${profile.max_brake_pressure_bar.toFixed(1)} bar · 转向 ≤${profile.max_steering_angle_deg.toFixed(1)}° · PID ${profile.speed_pid_kp.toFixed(2)}/${profile.speed_pid_ki.toFixed(2)}/${profile.speed_pid_kd.toFixed(2)} · 升扭 ${profile.motor_torque_rise_rate_nm_per_s.toFixed(0)} Nm/s · rev ${controlProfileState.effectiveAppliedRevision}`;controlLimitsSummary.className=controlProfileState.acknowledged&&!controlProfileState.pendingRequestSeq?'ok':'warn';controlLimitsOpen.disabled=!vehicleHardLimits.received||!controlProfileState.requestedProfile;if(vehicleHardLimits.received){const pid=vehicleHardLimits.speed_pid_limits;targetSpeedKph.max=String(vehicleHardLimits.max_target_speed_kph);maxMotorTorqueNm.max=String(vehicleHardLimits.full_scale_motor_torque_nm);maxBrakePressureBar.max=String(vehicleHardLimits.max_brake_pressure_bar);serviceBrakePressureBar.max=String(vehicleHardLimits.max_brake_pressure_bar);hardBrakePressureBar.max=String(vehicleHardLimits.max_brake_pressure_bar);maxSteeringDeg.max=String(vehicleHardLimits.max_steering_angle_deg);speedPidKp.min=String(pid.kp.min);speedPidKp.max=String(pid.kp.max);speedPidKi.min=String(pid.ki.min);speedPidKi.max=String(pid.ki.max);speedPidKd.min=String(pid.kd.min);speedPidKd.max=String(pid.kd.max);speedPidDerivativeFilterTauMs.min=String(pid.derivative_filter_tau_ms.min);speedPidDerivativeFilterTauMs.max=String(pid.derivative_filter_tau_ms.max);speedPidMaxDtMs.min=String(pid.max_dt_ms.min);speedPidMaxDtMs.max=String(pid.max_dt_ms.max);motorTorqueRiseRate.min=String(vehicleHardLimits.motor_torque_rise_rate_limits_nm_per_s.min);motorTorqueRiseRate.max=String(vehicleHardLimits.motor_torque_rise_rate_limits_nm_per_s.max)}vehicleHardLimitsLabel.textContent=vehicleHardLimits.received?`车端只读硬上限：max speed ${vehicleHardLimits.max_speed_kph.toFixed(1)} km/h × max throttle ${vehicleHardLimits.max_throttle.toFixed(3)} = 目标 ${vehicleHardLimits.max_target_speed_kph.toFixed(1)} km/h · 单电机 ${vehicleHardLimits.full_scale_motor_torque_nm.toFixed(1)} Nm · 每路 EHB 普通压力 ${vehicleHardLimits.max_brake_pressure_bar.toFixed(1)} bar · 转向 ${vehicleHardLimits.max_steering_angle_deg.toFixed(1)}° · 速度反馈超时 ${vehicleHardLimits.speed_feedback_timeout_ms} ms · 硬超速余量 ${vehicleHardLimits.hard_overspeed_margin_kph} km/h。车端 PID 默认 Kp/Ki/Kd=${vehicleHardLimits.default_speed_pid_kp}/${vehicleHardLimits.default_speed_pid_ki}/${vehicleHardLimits.default_speed_pid_kd}，τ=${vehicleHardLimits.default_speed_pid_derivative_filter_tau_ms} ms，max dt=${vehicleHardLimits.default_speed_pid_max_dt_ms} ms，升扭斜率默认 ${vehicleHardLimits.default_motor_torque_rise_rate_nm_per_s} Nm/s。${readOnlyControlSafetyText(vehicleHardLimits.read_only_control_safety)}。以上硬安全制动与 watchdog 参数不可编辑。`:'等待车端完整硬上限、PID 默认值与固定安全参数；普通驾驶保持禁用'}
-function sendPendingControlProfile(force=false){if(controlAuthorityLost||!pendingControlProfileEnvelope||!controlProfileState.pendingRequestSeq||controlProfileState.acknowledged||Number(pendingControlProfileEnvelope.seq)!==Number(controlProfileState.pendingRequestSeq)||!peer||peer.connectionState!=='connected'||!controlChannel||controlChannel.readyState!=='open')return false;const now=Date.now();if(!force&&now-lastControlProfileSendAt<200)return false;controlChannel.send(JSON.stringify(pendingControlProfileEnvelope));lastControlProfileSendAt=now;return true}
-async function prepareControlProfile(value,announce=true){if(controlProfilePrepareInFlight)throw Error('已有会话控制参数正在准备');if(!vehicleHardLimits.received)throw Error('尚未收到车端完整硬上限与 PID 默认值');const requested=controlLogic.normalizeControlProfile(value),bounded=controlLogic.mergeControlProfileWithHardLimits(requested,vehicleHardLimits);if(JSON.stringify(requested)!==JSON.stringify(bounded))throw Error('请求超出当前车辆硬上限');const activePeer=peer,activeChannel=controlChannel,activeProfileGeneration=controlProfileGeneration;if(!activePeer||activePeer.connectionState!=='connected'||!activeChannel||activeChannel.readyState!=='open')throw Error('控制 DataChannel 尚未连接');clearControlInput(false);controlProfilePrepareInFlight=true;try{const prepared=await post('/api/control-profile',requested),requestSeq=Number(prepared?.request?.seq);if(!Number.isSafeInteger(requestSeq)||requestSeq<=0)throw Error('控制端未生成有效参数序号');if(controlProfileGeneration!==activeProfileGeneration||controlAuthorityLost||peer!==activePeer||controlChannel!==activeChannel||activePeer.connectionState!=='connected'||activeChannel.readyState!=='open')throw Error('准备参数期间控制链路已变化');controlProfileState={...controlProfileState,requestedProfile:requested,pendingRequestSeq:requestSeq,effectiveProfile:null,effectiveRequestSeq:0,effectiveAppliedRevision:0,acknowledged:false,reason:'pending'};pendingControlProfileEnvelope=prepared.request;lastControlProfileSendAt=0;sendPendingControlProfile(true);renderControlLimits();renderMonitoring();if(announce)statusPanel.textContent=`会话控制参数序号 ${requestSeq} 已发送，等待车端确认`;return prepared}finally{if(controlProfileGeneration===activeProfileGeneration)controlProfilePrepareInFlight=false}}
-function applyControlProfileStatus(value){const wasAcknowledged=controlProfileState.acknowledged,next=controlLogic.reduceControlProfileStatus(controlProfileState,value);if(!next.matched)return false;controlProfileState=next;if(!controlProfileState.pendingRequestSeq)pendingControlProfileEnvelope=null;if(!controlProfileState.acknowledged&&(wasAcknowledged||next.invalidated))resetControlAuthorityInput();if(controlProfileState.acknowledged){statusPanel.textContent=`车端已确认会话控制参数序号 ${controlProfileState.effectiveRequestSeq} / revision ${controlProfileState.effectiveAppliedRevision}`;clientLog('session_control_profile_accepted',{request_seq:controlProfileState.effectiveRequestSeq,applied_revision:controlProfileState.effectiveAppliedRevision,effective_profile:controlProfileState.effectiveProfile,reason:controlProfileState.reason})}else{statusPanel.textContent=`车端会话控制参数无效：${controlProfileState.reason}`;clientLog('session_control_profile_invalidated',{reason:controlProfileState.reason})}renderControlLimits();renderMonitoring();return true}
-function controlProfileParkingReady(){const mockBench=vcuMockUnsupported()&&vcuHandshake.adapter_ready===true,parkedStandby=vcuHandshake.parking_ready===true&&(vcuHandshake.state==='standby'||vcuHandshake.state==='disarmed');return mockBench||parkedStandby}
-function updateVehicleHardLimits(value){if(!value||typeof value!=='object')return;try{const hard=controlLogic.normalizeVehicleHardLimits(value);vehicleHardLimits={...hard,received:true};if(!controlProfileState.requestedProfile)controlProfileState={...controlProfileState,requestedProfile:controlLogic.controlProfileFromVehicleDefaults(driverActuationDefaults,hard)};renderControlLimits()}catch(error){resetControlProfileSession();resetControlAuthorityInput();renderControlLimits();renderMonitoring();statusPanel.textContent='车端控制参数不完整，驾驶权限已撤销';clientLog('vehicle_hard_limits_invalid',{error:error.message})}}
-function openControlLimits(){const requested=controlProfileState.requestedProfile;if(!vehicleHardLimits.received||!requested)throw Error('尚未收到车端完整硬上限与 PID 默认值');targetSpeedKph.value=requested.target_speed_kph.toFixed(1);maxMotorTorqueNm.value=requested.max_motor_torque_nm.toFixed(1);maxBrakePressureBar.value=requested.max_brake_pressure_bar.toFixed(1);serviceBrakePressureBar.value=requested.service_brake_pressure_bar.toFixed(1);hardBrakePressureBar.value=requested.hard_brake_pressure_bar.toFixed(1);maxSteeringDeg.value=requested.max_steering_angle_deg.toFixed(1);speedPidKp.value=requested.speed_pid_kp;speedPidKi.value=requested.speed_pid_ki;speedPidKd.value=requested.speed_pid_kd;speedPidDerivativeFilterTauMs.value=requested.speed_pid_derivative_filter_tau_ms;speedPidMaxDtMs.value=requested.speed_pid_max_dt_ms;motorTorqueRiseRate.value=requested.motor_torque_rise_rate_nm_per_s;controlLimitsConfirm.checked=false;controlLimitsApply.disabled=true;renderControlLimits();controlLimitsDialog.showModal()}
-async function applyControlLimits(){if(!controlLimitsConfirm.checked)throw Error('请先确认停车或隔离台架条件');if(!vehicleHardLimits.received)throw Error('尚未收到车端完整硬上限与 PID 默认值');if(!motorTorqueRiseRate.checkValidity())throw Error('请填写车端允许范围内的升扭斜率；0 表示取消升扭限制');const requested=controlLogic.normalizeControlProfile({profile_version:3,target_speed_kph:Number(targetSpeedKph.value),max_motor_torque_nm:Number(maxMotorTorqueNm.value),max_brake_pressure_bar:Number(maxBrakePressureBar.value),service_brake_pressure_bar:Number(serviceBrakePressureBar.value),hard_brake_pressure_bar:Number(hardBrakePressureBar.value),max_steering_angle_deg:Number(maxSteeringDeg.value),speed_pid_kp:Number(speedPidKp.value),speed_pid_ki:Number(speedPidKi.value),speed_pid_kd:Number(speedPidKd.value),speed_pid_derivative_filter_tau_ms:Number(speedPidDerivativeFilterTauMs.value),speed_pid_max_dt_ms:Number(speedPidMaxDtMs.value),motor_torque_rise_rate_nm_per_s:motorTorqueRiseRate.valueAsNumber}),prior=controlProfileState.effectiveProfile||controlProfileState.requestedProfile,pidChanged=!prior||requested.speed_pid_kp!==prior.speed_pid_kp||requested.speed_pid_ki!==prior.speed_pid_ki||requested.speed_pid_kd!==prior.speed_pid_kd||requested.speed_pid_derivative_filter_tau_ms!==prior.speed_pid_derivative_filter_tau_ms||requested.speed_pid_max_dt_ms!==prior.speed_pid_max_dt_ms||requested.motor_torque_rise_rate_nm_per_s!==prior.motor_torque_rise_rate_nm_per_s,requiresParking=!controlProfileState.effectiveProfile||pidChanged||requested.target_speed_kph>prior.target_speed_kph||requested.max_motor_torque_nm>prior.max_motor_torque_nm||requested.max_brake_pressure_bar!==prior.max_brake_pressure_bar||requested.service_brake_pressure_bar!==prior.service_brake_pressure_bar||requested.hard_brake_pressure_bar!==prior.hard_brake_pressure_bar||requested.max_steering_angle_deg!==prior.max_steering_angle_deg;if(requiresParking&&!controlProfileParkingReady())throw Error('首次应用、任一 PID 或升扭斜率修改、提高目标车速/转矩、修改转向上限或制动压力，都需要 N 挡、零速、电子驻车且 VCU 为 standby/disarmed，或隔离 mock 台架');await prepareControlProfile(requested);controlLimitsDialog.close();clientLog('driver_control_profile_requested',{requested_profile:requested,vehicle_hard_limits:vehicleHardLimits})}
-function applyDeadzone(value){const magnitude=Math.abs(value),deadzone=gamepadConfig.axis_deadzone;if(magnitude<=deadzone)return 0;return Math.sign(value)*(magnitude-deadzone)/(1-deadzone)}
-)HTML" + R"HTML(
-function applyPedalDeadzone(value){const deadzone=gamepadConfig.axis_deadzone;return value<=deadzone?0:(value-deadzone)/(1-deadzone)}
-function axisValue(pad,index){return Number.isInteger(index)&&index>=0&&index<pad.axes.length&&Number.isFinite(pad.axes[index])?pad.axes[index]:null}
-function buttonValue(pad,index){return Number.isInteger(index)&&index>=0&&index<pad.buttons.length?Number(pad.buttons[index].value||0):0}
-function syncControlKeyState(){state=controlLogic.deriveKeyState(pressedControlKeys)}
-function vcuMockUnsupported(value=vcuHandshake){return controlLogic.mockUnsupported(value)}
-function vcuAllowsGearChange(requestedGear){return controlLogic.allowsGearChange(selectedGear,requestedGear,vcuHandshake)}
-function updateSelectedGearFromInput(inputState){const next=controlLogic.deriveGearSelection(selectedGear,inputState,vcuHandshake);if(next.changed&&pendingGearTransition){const requestedGear=next.selectedGear;clearControlInput(false);pendingGearRequest=requestedGear;statusPanel.textContent=`${pendingGearTransition.fromGear}→${pendingGearTransition.toGear} 换挡尚未获得车端反馈；已阻止新的 ${requestedGear} 挡请求，请释放后重新操作`;return{selectedGear,pendingGearRequest,changed:false}}if(next.changed)pendingGearTransition=controlLogic.createGearTransition(selectedGear,next.selectedGear,lastControlStatusSeq,++gearTransitionGeneration);selectedGear=next.selectedGear;pendingGearRequest=next.pendingGearRequest;if(pendingGearRequest)statusPanel.textContent=`${selectedGear}→${pendingGearRequest} 换挡已阻止：需至少 3 帧且持续 200 ms 的新鲜零速反馈；请停车后释放并重新按下方向键`;return next}
-function updateSelectedGearFromHeldDirections(){return updateSelectedGearFromInput(state)}
-function clearControlInput(resetGear=true){controlLogic.blockAndClearKeys(pressedControlKeys,blockedControlKeys);syncControlKeyState();gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;if(resetGear){selectedGear='N';pendingGearRequest=null;pendingGearTransition=null}renderControlState()}
-function vcuStateRequiresFreshInput(value=vcuHandshake){return controlLogic.requiresFreshInput(value)}
-function vcuStateKeepsHeldInput(value=vcuHandshake){return controlLogic.keepsHeldInput(vcuEverReady,value)}
-function acceptControlStatusMessage(message){const decision=controlLogic.reduceStatusSequence(lastControlStatusSeq,message?.control_status_seq);if(!decision.accepted){const sequence=Number(message?.control_status_seq);clientLog('control_status_message_dropped',{event:message?.event||'unknown',control_status_seq:Number.isFinite(sequence)?sequence:null,last_control_status_seq:lastControlStatusSeq});return false}if(decision.gap>0)clientLog('control_status_sequence_gap',{event:message?.event||'unknown',control_status_seq:decision.lastSequence,last_control_status_seq:lastControlStatusSeq,missing_status_count:decision.gap});lastControlStatusSeq=decision.lastSequence;return true}
-function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}
-function updateVcuHandshakeState(value){gearChangeStationaryEvidence=controlLogic.updateGearChangeStationaryEvidence(gearChangeStationaryEvidence,value,lastControlStatusSeq,performance.now());value={...value,gear_change_stationary_confirmed:gearChangeStationaryEvidence.confirmed};const transition=controlLogic.transitionVcuState(vcuEverReady,value);vcuHandshake=value;vcuEverReady=transition.everReady;if(transition.resetInput)resetControlAuthorityInput()}
-function applyVehicleSafetyState(value){const next=String(value||'');if(next==='DEGRADED'){clearControlInput(false);if(lastVehicleSafetyState!=='DEGRADED'){lastKeyboardEvent.textContent='控制命令短暂中断，输入已清除 · 请释放后重新按下';statusPanel.textContent='车端进入可恢复降级：牵引已清零；请释放控制键后重新按下';clientLog('driver_input_cleared_on_degraded',{previous_safety_state:lastVehicleSafetyState||null})}}lastVehicleSafetyState=next}
-function suspendSignalingPoll(){const generation=++signalingGeneration;polling=false;if(signalingPollAbort){signalingPollAbort.abort();signalingPollAbort=null}return generation}
-function closeRealtimeSession(){flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;lastVehicleSafetyState='';vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
-function renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason)){estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner}
-function latchEstop(source){if(estopLatched)return false;estopLatched=true;clientLog('control_estop_request_latched',{source});renderEstopRequest();renderMonitoring();return true}
-function firstConnectedGamepad(){const pads=navigator.getGamepads?navigator.getGamepads():[];if(activeGamepadIndex!==null&&pads[activeGamepadIndex]?.connected)return pads[activeGamepadIndex];for(const pad of pads)if(pad?.connected){activeGamepadIndex=pad.index;return pad}activeGamepadIndex=null;return null}
-function applyGamepadNeutralInterlock(authorityReady,gearRequestPending=false){const next=controlLogic.reduceGamepadNeutralInterlock({requiresNeutral:gamepadRequiresNeutral,authorityReady,throttle:gamepadState.throttle,brake:gamepadState.brake,gearRequestPending});gamepadRequiresNeutral=next.requiresNeutral;gamepadState.throttle=next.throttle;gamepadState.brake=next.brake;return next}
-function sampleGamepad(){if(!gamepadConfig.enabled||document.hidden||!document.hasFocus()){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}const pad=firstConnectedGamepad();if(!pad){gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}gamepadState.connected=true;const standard=pad.mapping==='standard';if(standard){const steering=axisValue(pad,0);let steeringValue=steering===null?0:(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);gamepadState.throttle=clamp(applyPedalDeadzone(buttonValue(pad,7)),0,1);gamepadState.brake=clamp(applyPedalDeadzone(buttonValue(pad,6)),0,1)}else{const steering=axisValue(pad,gamepadConfig.steering_axis),throttle=axisValue(pad,gamepadConfig.throttle_axis),brake=axisValue(pad,gamepadConfig.brake_axis);if(steering===null||throttle===null||brake===null){gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;renderControlState();return}let steeringValue=(steering-calibration.steeringCenter)/calibration.steeringRange;if(gamepadConfig.steering_inverted)steeringValue=-steeringValue;gamepadState.steering=clamp(applyDeadzone(steeringValue),-1,1);const throttleDelta=gamepadConfig.throttle_inverted?calibration.throttleRest-throttle:throttle-calibration.throttleRest;const brakeDelta=gamepadConfig.brake_inverted?calibration.brakeRest-brake:brake-calibration.brakeRest;gamepadState.throttle=clamp(applyPedalDeadzone(throttleDelta/calibration.throttleRange),0,1);gamepadState.brake=clamp(applyPedalDeadzone(brakeDelta/calibration.brakeRange),0,1)}const gamepadAuthorityReady=vcuEverReady||vcuMockUnsupported();applyGamepadNeutralInterlock(gamepadAuthorityReady);if(gamepadState.throttle>0&&selectedGear==='N'){const nextGear=updateSelectedGearFromInput({up:true,down:false});if(nextGear.pendingGearRequest)applyGamepadNeutralInterlock(gamepadAuthorityReady,true)}const estopPressed=buttonValue(pad,gamepadConfig.estop_button)>=0.5;if(estopPressed){if(!gamepadEstopPressedAt)gamepadEstopPressedAt=performance.now();if(performance.now()-gamepadEstopPressedAt>=consoleConfig.estop_hold_ms&&latchEstop('Gamepad'))send({estop:true},false).catch(console.error)}else gamepadEstopPressedAt=0;renderControlState()}
-function currentControl(extra={}){const control=controlLogic.deriveControl({keyState:state,gamepad:gamepadState,selectedGear,limits:effectiveControlLimits(),steeringFullScaleDeg:limitConfig.steering_full_scale_deg,estop:estopLatched||Boolean(extra.estop)});if(pendingGearTransition&&!control.estop)control.throttle=0;return control}
-function setControlReadout(name,text,active=false){for(const element of [controlReadouts[name],operatorControlReadouts[name]]){element.textContent=text;element.parentElement?.classList.toggle('active',active)}}
-function renderControlState(){
-  const control=currentControl();
-  for(const [name,element] of Object.entries(keyIndicators)){const active=Boolean(state[name]);element.classList.toggle('active',active);element.setAttribute('aria-pressed',String(active))}
-  setControlReadout('gear',control.gear);setControlReadout('steering',control.steering.toFixed(2),Math.abs(control.steering)>0.001);setControlReadout('throttle',control.throttle.toFixed(2),control.throttle>0.001);setControlReadout('brake',control.brake.toFixed(2),control.brake>0.001);
-  const linkReady=polling&&peer?.connectionState==='connected'&&controlChannel?.readyState==='open',vcuReady=vcuDrivingReady(),ready=linkReady&&vcuReady,retainedWait=vcuHandshake.adapter_ready===true&&vcuEverReady&&vcuHandshake.state==='wait_gear'?'换挡闭环中（输入保持）':(vcuHandshake.adapter_ready===true&&vcuEverReady&&vcuHandshake.state==='wait_actuator_modes'?'执行器闭环中（输入保持）':''),terminalState=vcuStateRequiresFreshInput(vcuHandshake),freshReadyRequired=linkReady&&vcuHandshake.ready&&!vcuEverReady;
-  inputReadiness.textContent=estopLatched?'急停请求锁定':(gearRejectionInhibited?'换挡拒绝状态不确定，普通控制已冻结':(pendingGearRequest?`等待有效零速后重新选择 ${pendingGearRequest}`:(ready?'控制已就绪':(retainedWait||(terminalState?'VCU 故障/退出，输入已清除':(freshReadyRequired?'输入已清除，等待新鲜 VCU Ready':(linkReady?'等待 VCU 握手':(polling?'等待控制链路':'等待连接'))))))));
-  inputReadiness.className=`status-chip ${estopLatched||gearRejectionInhibited||terminalState?'critical':(ready?'ok':'warn')}`;
-}
-function renderVehicles(vehicles=[]){const previous=vehicleSelect.value,currentVehicle=latestRuntimeStatus.connected?latestRuntimeStatus.vehicle_id:'';vehicleSelect.replaceChildren();let firstSelectable='',previousAvailable=false;const labels={online:'在线可控',offline:'离线',active:'控制中',reserved:'已预留',connecting:'连接中',revoked:'已撤销'};for(const vehicle of vehicles){const option=document.createElement('option'),current=vehicle.vehicle_id===currentVehicle,selectable=vehicle.controllable||current;option.value=vehicle.vehicle_id;option.textContent=`${vehicle.vehicle_id} · ${current?'当前会话':(labels[vehicle.state]||vehicle.state)}`;option.disabled=!selectable;if(selectable&&!firstSelectable)firstSelectable=vehicle.vehicle_id;if(selectable&&vehicle.vehicle_id===previous)previousAvailable=true;vehicleSelect.appendChild(option)}vehicleSelect.value=previousAvailable?previous:firstSelectable;connectButton.disabled=connecting||!vehicleSelect.value}
-function renderAuthExpiry(expiresAt){authExpiry.textContent=expiresAt?`认证有效至 ${new Date(expiresAt).toLocaleString()}`:''}
-function requireLogin(message){closeRealtimeSession();authenticated=false;controlAuthorityLost=false;connectButton.textContent='连接所选车辆';renderAuthExpiry(0);sessionPanel.hidden=true;vcuPanel.hidden=true;monitorPanel.hidden=true;loginPanel.hidden=false;statusPanel.textContent=message;clientLog('driver_reauthentication_required',{reason:message})}
-function handleVehicleRefreshError(error){if(error.status===401){requireLogin('登录已失效，请重新认证: '+error.message);return}statusPanel.textContent='车辆状态刷新失败，当前会话已保留: '+error.message;clientLog('vehicle_list_refresh_failed',{error:error.message})}
-async function login(){const password=passwordInput.value;if(!password)throw Error('请输入驾驶员密码');passwordInput.value='';const result=await post('/api/login',{password});authenticated=true;controlAuthorityLost=false;webrtcLabel.textContent='未连接';loginPanel.hidden=true;sessionPanel.hidden=false;vcuPanel.hidden=false;renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);sampleGamepad();latestRuntimeStatus=await get('/api/status');renderMonitoring();statusPanel.textContent=`已登录 ${result.driver_id}，请选择在线车辆`;clientLog('driver_login_succeeded',{driver_id:result.driver_id,authorized_vehicle_count:(result.vehicles||[]).length})}
-async function refreshVehicles(){if(!authenticated)return;const result=await get('/api/vehicles');renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);if(result.signaling_available===false){controlAuthorityLost=true;resetControlAuthorityInput();connectButton.disabled=true;statusPanel.textContent='信令服务暂时不可用；车辆列表为安全快照，禁止建立控制会话';renderMonitoring();return}if(result.signaling_restart_recovered){closeRealtimeSession();controlAuthorityLost=true;latestRuntimeStatus=await get('/api/status');connectButton.textContent='连接所选车辆';webrtcLabel.textContent='服务已恢复，需重新建立控制会话';statusPanel.textContent='信令服务已重启，驾驶员身份已自动恢复；旧控制权未恢复，请重新选择车辆';clientLog('signaling_restart_recovered',{previous_service_instance_id:result.previous_service_instance_id,service_instance_id:result.service_instance_id,control_authority_recovered:false});renderMonitoring()}}
-function sendVcuHandshakeCommand(action){if(!controlChannel||controlChannel.readyState!=='open')throw Error('控制 DataChannel 尚未连接');if(action==='connect'&&!controlProfileState.acknowledged)throw Error('会话控制参数尚未获得车端确认');if(vcuHandshake.adapter_ready!==true)throw Error('VCU 适配器尚未就绪');if(!['connect','disconnect'].includes(action))throw Error('VCU 握手命令非法');if(action==='disconnect'){resetControlAuthorityInput();vcuHandshake={...vcuHandshake,ready:false,disarming:true}}else{gearRejectionInhibited=false;vcuHandshake={...vcuHandshake,requested:true}}renderMonitoring();controlChannel.send(JSON.stringify({event:'vcu_handshake_command',action,sent_at_utc_ms:Date.now()}));clientLog('driver_vcu_handshake_command',{action});statusPanel.textContent=action==='connect'?'已请求开始 VCU 平行驾驶握手':'已请求安全断开 VCU 握手'}
-function nativeIntentEnvelope(outgoing){
-  const normalized={gear:String(outgoing.gear||'N'),steering:Number(outgoing.steering||0),throttle:Number(outgoing.throttle||0),brake:Number(outgoing.brake||0),estop:Boolean(outgoing.estop)};
-  const snapshot=JSON.stringify(normalized);
-  if(!nativeIntentSeq||snapshot!==lastNativeIntentSnapshot){nativeIntentSeq++;lastNativeIntentSnapshot=snapshot}
-  return{session_id:nativeControlSessionId,session_generation:nativeControlSessionGeneration,ui_instance_id:uiInstanceId,intent_seq:nativeIntentSeq,...normalized}
-}
-async function writeControlIntent(extra,announceUnavailable){
-  const activePeer=peer,activeChannel=controlChannel,estopRequested=estopLatched||Boolean(extra.estop);
-  if(controlAuthorityLost){
-    resetControlAuthorityInput();
-    if(announceUnavailable)webrtcLabel.textContent='控制权丢失';
-    return{sent:false,reason:'control_authority_lost'}
-  }
-  let blockReason='';
-  if(!activePeer||activePeer.connectionState!=='connected'||!activeChannel||activeChannel.readyState!=='open'){
-    blockReason='control_link_unavailable';
-    if(announceUnavailable)webrtcLabel.textContent='控制链路中断'
-  }else if(gearRejectionInhibited&&!estopRequested){
-    blockReason='gear_rejection_unresolved'
-  }else if(!estopRequested&&!controlProfileState.acknowledged){
-    blockReason='control_profile_not_acknowledged';
-    if(announceUnavailable)statusPanel.textContent='会话控制参数尚未获得车端确认，驾驶命令已阻止'
-  }
-  const retainedWait=vcuHandshake.adapter_ready===true&&vcuStateKeepsHeldInput(vcuHandshake),gearTransitionPending=Boolean(pendingGearTransition);
-  if(!blockReason&&estopRequested&&vcuHandshake.adapter_ready===false){
-    blockReason='vcu_adapter_unavailable';
-    if(announceUnavailable)statusPanel.textContent='VCU 适配器明确不可用，远程急停未发送；请使用车辆物理急停'
-  }else if(!blockReason&&!vcuDrivingReady()&&!estopRequested&&!retainedWait){
-    blockReason='vcu_handshake_not_ready';
-    if(announceUnavailable)statusPanel.textContent='VCU 平行驾驶握手未成功，驾驶命令已阻止'
-  }
-  if(blockReason)clearControlInput(false);
-  const outgoing=currentControl(blockReason?{}:extra);
-  if((retainedWait||gearTransitionPending)&&!estopRequested)outgoing.throttle=0;
-  const outgoingSnapshot=controlLogic.controlSnapshot(outgoing);
-  const transitionGeneration=!blockReason&&!estopRequested&&pendingGearTransition?pendingGearTransition.generation:0;
-  const intent=nativeIntentEnvelope(outgoing);
-  const controller=new AbortController(),deadlineMs=Math.max(75,Math.min(150,Math.floor(Number(consoleConfig.intent_lease_ms||200)*0.75))),timer=setTimeout(()=>controller.abort(),deadlineMs);
-  activeControlPrepareAbort=controller;activeControlPrepareIsEstop=estopRequested;
-  let accepted;
-  try{
-    accepted=await post('/api/control-intent',intent,controller.signal)
-  }catch(error){
-    if(intent.session_id!==nativeControlSessionId||intent.session_generation!==nativeControlSessionGeneration)return{sent:false,reason:'stale_control_intent_response'};
-    if(error.name==='AbortError'){
-      clearControlInput(false);
-      if(activeControlPreparePreemptedByEstop&&!estopRequested)return{sent:false,reason:'control_intent_preempted_by_estop'};
-      clientLog('control_intent_update_timeout',{intent_seq:intent.intent_seq,deadline_ms:deadlineMs});
-      return{sent:false,reason:'control_intent_update_timeout'}
-    }
-    if([401,403,409].includes(error.status)){controlAuthorityLost=true;resetControlAuthorityInput();resetControlProfileSession()}
-    throw error
-  }finally{clearTimeout(timer);if(activeControlPrepareAbort===controller){activeControlPrepareAbort=null;activeControlPrepareIsEstop=false;activeControlPreparePreemptedByEstop=false}}
-  if(intent.session_id!==nativeControlSessionId||intent.session_generation!==nativeControlSessionGeneration)return{sent:false,reason:'stale_control_intent_response'};
-  if(!accepted.accepted){
-    if(accepted.reason==='fresh_neutral_required'){
-      clearControlInput(false);
-      lastNativeIntentSnapshot='';
-    }
-    return{...accepted,sent:false,reason:accepted.reason||'control_intent_rejected'}
-  }
-  if(transitionGeneration){
-    pendingGearTransition=controlLogic.recordForwardedGearCommand(pendingGearTransition,transitionGeneration,accepted.intent_seq,outgoingSnapshot.gear)
-  }
-  if(!accepted.duplicate)clientLog('control_intent_accepted',{intent_seq:accepted.intent_seq,transport:accepted.transport,gear:outgoingSnapshot.gear,estop:estopRequested});
-  return{...accepted,sent:true,blocked_reason:blockReason||null}
-}
-function reportControlQueueError(error){if(controlTraceEnabled)noteScopedControlTraceCounter('queue_unhandled_error_count',error&&typeof error==='object'?(controlTraceErrorScopes.get(error)||controlTraceScope):controlTraceScope);console.error(error)}
-const controlWriteQueue=controlLogic.createLatestControlWriteQueue(writeControlIntent,reportControlQueueError,()=>{if(activeControlPrepareAbort&&!activeControlPrepareIsEstop){activeControlPreparePreemptedByEstop=true;activeControlPrepareAbort.abort()}});
-function enqueueIntentRefresh(){return controlWriteQueue.enqueueHeartbeat()}
-async function send(extra={},announceUnavailable=true){if(controlTraceEnabled)controlTraceSummary.explicit_send_count++;return controlWriteQueue.send(extra,announceUnavailable)}
-async function refreshControlIntent(){const now=performance.now();if(!polling){lastHeartbeatTraceAt=null;return}noteIntentRefresh(now);sampleGamepad();sendPendingControlProfile();const enqueued=enqueueIntentRefresh();if(controlTraceEnabled){if(enqueued)controlTraceSummary.heartbeat_enqueued_count++;else controlTraceSummary.heartbeat_coalesced_count++}}
-function advertisedCodecs(){const caps=RTCRtpReceiver.getCapabilities&&RTCRtpReceiver.getCapabilities('video');const found=new Set(['h264']);for(const c of (caps&&caps.codecs)||[]){const m=(c.mimeType||'').toLowerCase();if(m.includes('h265')||m.includes('hevc'))found.add('h265');if(m.includes('h264')||m.includes('avc'))found.add('h264')}return [...found]}
-async function connect(){if(connecting)return;const target=vehicleSelect.value;if(!target)throw Error('没有可连接的在线车辆');const fromVehicle=latestRuntimeStatus.connected?latestRuntimeStatus.vehicle_id:'';if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}const changingVehicle=Boolean(fromVehicle)&&fromVehicle!==target;const reconnecting=Boolean(fromVehicle)&&fromVehicle===target;const hadRealtime=polling;let suspendedGeneration=signalingGeneration;if((changingVehicle||reconnecting)&&hadRealtime){suspendedGeneration=suspendSignalingPoll();clearControlInput()}connecting=true;connectButton.disabled=true;if(changingVehicle){webrtcLabel.textContent='正在安全切换车辆';statusPanel.textContent=`正在验证 ${target}，成功后释放 ${fromVehicle}`;clientLog('driver_vehicle_switch_started',{from_vehicle_id:fromVehicle,to_vehicle_id:target})}let session=null,generation=signalingGeneration;try{session=await post('/api/connect',{vehicle_id:target});generation=closeRealtimeSession();nativeControlSessionId=String(session.session_id||'');nativeControlSessionGeneration=Number(session.control_session_generation);if(!nativeControlSessionId||!Number.isSafeInteger(nativeControlSessionGeneration)||nativeControlSessionGeneration<=0)throw Error('原生控制会话代次无效');setControlTraceScope(session.session_id,session.vehicle_id);controlAuthorityLost=true;const ice=await post('/api/webrtc/ice-servers');iceServers=ice.ice_servers||[];await post('/api/webrtc/capabilities',{codecs:advertisedCodecs()});polling=true;controlAuthorityLost=false;latestRuntimeStatus=await get('/api/status');webrtcLabel.textContent='等待车端媒体';statusPanel.textContent=`会话 ${session.session_id} · ${session.vehicle_id}`;connectButton.textContent='切换所选车辆';document.querySelector('main').focus();renderMonitoring();clientLog(changingVehicle?'driver_vehicle_switched':(reconnecting?'driver_session_reconnected':'driver_session_connected'),{from_vehicle_id:fromVehicle||undefined,session_id:session.session_id,vehicle_id:session.vehicle_id});pollSignaling(generation)}catch(error){if(session){flushControlTrace('connect_setup_failed');controlTraceScope={session_id:'',vehicle_id:''};nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';await post('/api/end-session',{reason:'driver_connect_setup_failed'}).catch(()=>{})}latestRuntimeStatus=await get('/api/status').catch(()=>({connected:false}));const retained=Boolean(!session&&latestRuntimeStatus.connected&&hadRealtime);if(retained){polling=true;controlAuthorityLost=false;webrtcLabel.textContent=controlChannel&&controlChannel.readyState==='open'?'控制链路已连接':'当前会话已保留';statusPanel.textContent=`切换失败，当前会话已保留: ${error.message}`;clientLog('driver_vehicle_switch_rejected',{from_vehicle_id:fromVehicle,to_vehicle_id:target,error:error.message});pollSignaling(suspendedGeneration)}else{controlAuthorityLost=Boolean(latestRuntimeStatus.connected)}connectButton.textContent=latestRuntimeStatus.connected?'切换所选车辆':'连接所选车辆';renderMonitoring();if(!retained)throw error}finally{connecting=false;connectButton.disabled=!vehicleSelect.value}}
-async function logout(){const estopConfirmed=vehicleTelemetry?.estop===true;closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='正在释放控制权';await post('/api/disconnect',{reason:'driver_safe_logout'});authenticated=false;controlAuthorityLost=false;connectButton.textContent='连接所选车辆';renderAuthExpiry(0);sessionPanel.hidden=true;vcuPanel.hidden=true;canFeedbackPanel.hidden=true;monitorPanel.hidden=true;loginPanel.hidden=false;webrtcLabel.textContent='未连接';statusPanel.textContent=estopLatched?(estopConfirmed?'已安全退出；车辆急停已确认，仍需本地确认复位':'已安全退出；急停请求未获车端确认，请在车辆本地核实'):'已安全退出';clientLog('driver_safe_logout',{estop_request_latched:estopLatched,estop_confirmed:estopConfirmed})}
-addEventListener('pagehide',()=>{flushControlTrace('pagehide');closeRealtimeSession();if(authenticated)fetch('/api/disconnect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({reason:'browser_page_closed'}),keepalive:true}).catch(()=>{})});
-function neutralizeInput(){clearControlInput(false);send({},false).catch(console.error)}
-addEventListener('blur',neutralizeInput);document.addEventListener('visibilitychange',()=>{if(document.hidden)neutralizeInput()});
-document.querySelector('#login').onclick=()=>login().catch(e=>{statusPanel.textContent='登录失败: '+e.message});
-passwordInput.addEventListener('keydown',e=>{if(e.key==='Enter')login().catch(error=>{statusPanel.textContent='登录失败: '+error.message})});
-document.querySelector('#connect').onclick=()=>connect().catch(e=>{webrtcLabel.textContent='连接失败';statusPanel.textContent=e.message});
-document.querySelector('#logout').onclick=()=>logout().catch(e=>{statusPanel.textContent='退出失败: '+e.message});
-document.querySelector('#estop').onclick=()=>{latchEstop('页面按钮');send({estop:true}).catch(alert)};
-controlLimitsOpen.onclick=openControlLimits;
-controlLimitsConfirm.onchange=()=>{controlLimitsApply.disabled=!controlLimitsConfirm.checked};
-controlLimitsApply.onclick=()=>applyControlLimits().catch(error=>{statusPanel.textContent='限幅设置失败: '+error.message});
-controlLimitsCancel.onclick=()=>controlLimitsDialog.close();
-vcuConnectButton.onclick=()=>{try{sendVcuHandshakeCommand('connect')}catch(error){statusPanel.textContent='开始握手失败: '+error.message}};
-vcuDisconnectButton.onclick=()=>{try{sendVcuHandshakeCommand('disconnect')}catch(error){statusPanel.textContent='断开握手失败: '+error.message}};
-const keyNames={left:'左转',right:'右转',up:'前进',down:'倒车',service_brake:'缓刹',hard_brake:'急刹'};
-renderControlLimits();
-renderControlState();
-addEventListener('gamepadconnected',e=>{activeGamepadIndex=e.gamepad.index;sampleGamepad();clientLog('gamepad_connected',{id:e.gamepad.id,mapping:e.gamepad.mapping,axes:e.gamepad.axes.length,buttons:e.gamepad.buttons.length})});addEventListener('gamepaddisconnected',e=>{if(activeGamepadIndex===e.gamepad.index)activeGamepadIndex=null;gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;renderControlState();clientLog('gamepad_disconnected',{id:e.gamepad.id})});
-function editingTarget(target){return ['INPUT','SELECT','TEXTAREA','BUTTON'].includes(target?.tagName)||Boolean(target?.isContentEditable)}
-addEventListener('keydown',e=>{const binding=keys[e.code],estopKey=e.code==='KeyE';if(!binding&&!estopKey)return;if(editingTarget(e.target))return;e.preventDefault();if(!polling){if(binding)controlLogic.blockKey(blockedControlKeys,e.code);lastKeyboardEvent.textContent=`${estopKey?'急停':keyNames[binding]}已截获 · 等待连接`;return}if(estopKey){if(!e.repeat){lastKeyboardEvent.textContent='急停请求已锁定 · E';latchEstop('键盘 E');send({estop:true}).catch(console.error)}return}if(blockedControlKeys.has(e.code)){lastKeyboardEvent.textContent=`${keyNames[binding]}需释放后重新按下 · ${e.code}`;return}if(vcuStateRequiresFreshInput(vcuHandshake)){controlLogic.blockKey(blockedControlKeys,e.code);lastKeyboardEvent.textContent=`${keyNames[binding]}已阻止 · 等待 VCU 恢复后重新按下`;return}if(!vcuEverReady&&!vcuMockUnsupported()){controlLogic.blockKey(blockedControlKeys,e.code);lastKeyboardEvent.textContent=`${keyNames[binding]}已阻止 · 首次握手完成后请重新按下`;return}const pressed=controlLogic.pressKey(pressedControlKeys,blockedControlKeys,e.code);if(pressed.changed){syncControlKeyState();updateSelectedGearFromHeldDirections();lastKeyboardEvent.textContent=`${keyNames[binding]}按下 · ${e.code}`;renderControlState();send().catch(console.error)}});
-addEventListener('keyup',e=>{const binding=keys[e.code];if(!binding)return;if(!editingTarget(e.target))e.preventDefault();const released=controlLogic.releaseKey(pressedControlKeys,blockedControlKeys,e.code);syncControlKeyState();updateSelectedGearFromHeldDirections();lastKeyboardEvent.textContent=`${keyNames[binding]}释放 · ${e.code}`;renderControlState();if(released.changed&&polling)send().catch(console.error)});
-async function pollSignaling(generation){const controller=new AbortController();signalingPollAbort=controller;while(polling&&generation===signalingGeneration){try{const data=await post('/api/poll-signaling',{},controller.signal);if(generation!==signalingGeneration)break;for(const message of data.messages||[]){if(message.type==='webrtc_offer')await startFromOffer(message.payload||{});if(message.type==='ice_candidate')await addIce(message.payload||{});if(message.type==='media_status'){mediaStatus=message.payload||{lanes:[]};renderMonitoring()}}}catch(e){if(generation!==signalingGeneration||e.name==='AbortError')break;closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='控制权或信令中断';statusPanel.textContent='信令轮询失败，已停止驾驶命令: '+e.message;post('/api/end-session',{reason:'signaling_poll_failed'}).catch(()=>{});clientLog('signaling_poll_failed',{error:e.message});renderMonitoring();break}await new Promise(r=>setTimeout(r,100))}if(signalingPollAbort===controller)signalingPollAbort=null}
-async function addIce(candidate){if(!candidate.candidate)return;if(!peer||!peer.remoteDescription){pendingIce.push(candidate);return}await peer.addIceCandidate(candidate)}
-function offeredVideoCameraIds(sdp,tracks){const mapping=new Map(),cameraIds=(tracks||[]).map(track=>track.camera_id).filter(Boolean);let cameraIndex=0;for(const section of String(sdp||'').split(/\r?\nm=/).slice(1)){if(!section.startsWith('video '))continue;const match=section.match(/(?:^|\r?\n)a=mid:([^\r\n]+)/),cameraId=cameraIds[cameraIndex++];if(match&&cameraId)mapping.set(match[1],cameraId)}return mapping}
-function attach(cameraId,track){if(emptyStage.isConnected)emptyStage.remove();let box=document.getElementById('camera-'+cameraId);if(!box){box=document.createElement('article');box.id='camera-'+cameraId;box.className='camera';box.innerHTML='<span class="label"></span><video autoplay playsinline muted></video>';box.querySelector('.label').textContent=cameraId;cameraGrid.appendChild(box)}box.querySelector('video').srcObject=new MediaStream([track])}
-async function startFromOffer(offer){
-  if(peer)peer.close();
-  controlChannel=null;
-  resetControlProfileSession();
-  lastControlStatusSeq=0;
-  vehicleTelemetry=null;
-  lastVehicleSafetyState='';
-  vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};
-  resetControlAuthorityInput();
-  cameraGrid.replaceChildren();
-  pendingIce=[];
-  cameraByMid.clear();
-  assignedCameraIds.clear();
-  previousStats.clear();
-  h265FailureSamples=0;
-  h265FallbackSent=false;
-  remoteCameraIds=(offer.media_tracks||[]).map(t=>t.camera_id);
-  offeredCameraByMid=offeredVideoCameraIds(offer.sdp,offer.media_tracks||[]);
-  const nextPeer=new RTCPeerConnection({bundlePolicy:'max-bundle',iceServers,iceTransportPolicy:consoleConfig.ice_transport_policy});
-  peer=nextPeer;
-  webrtcLabel.textContent=`协商 ${offer.codec||''}/${offer.backend||''}`;
-  nextPeer.onconnectionstatechange=()=>{
-    if(peer!==nextPeer)return;
-    const connectionState=nextPeer.connectionState;
-    webrtcLabel.textContent=connectionState;
-    if(connectionState==='disconnected'){
-      lastVehicleSafetyState='';
-      resetControlAuthorityInput();
-      resetControlProfileSession();
-      clientLog('webrtc_peer_disconnected');
-    }
-    if(['failed','closed'].includes(connectionState)){
-      const terminalChannel=controlChannel;
-      flushControlTrace(`peer_${connectionState}`);
-      clientLog('webrtc_peer_terminal',{connection_state:connectionState,trace_session_id:controlTraceScope.session_id||null,trace_vehicle_id:controlTraceScope.vehicle_id||null,data_channel_ready_state:terminalChannel?.readyState||'none',buffered_amount_bytes:Math.max(0,Number(terminalChannel?.bufferedAmount)||0)});
-      if(controlChannel===terminalChannel)controlChannel=null;
-      lastVehicleSafetyState='';
-      resetControlAuthorityInput();
-      resetControlProfileSession();
-    }
-    if(connectionState==='connected'&&controlChannel?.readyState==='open')webrtcLabel.textContent='控制链路已连接';
-    renderMonitoring();
-  };
-  nextPeer.onicecandidateerror=e=>clientLog('webrtc_ice_candidate_error',{endpoint:safeIceEndpoint(e.url),error_code:Number(e.errorCode||0)});
-  nextPeer.ondatachannel=e=>{
-    const channel=e.channel;
-    if(!controlLogic.isCurrentPeer(peer,nextPeer)){channel.close();return}
-    if(channel.label!=='control'||channel.protocol!=='mine-teleop-control-v1'||channel.ordered||channel.maxRetransmits!==0){
-      channel.close();
-      webrtcLabel.textContent='控制通道参数非法';
-      clientLog('control_datachannel_rejected',{label:channel.label,protocol:channel.protocol,ordered:channel.ordered,max_retransmits:channel.maxRetransmits});
-      return;
-    }
-    lastControlStatusSeq=0;
-    controlChannel=channel;
-    channel.bufferedAmountLowThreshold=1024;
-    channel.onopen=()=>{
-      if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
-      gearRejectionInhibited=false;
-      webrtcLabel.textContent='控制链路已连接';
-      resetControlAuthorityInput();
-      resetControlProfileSession();
-      lastVehicleSafetyState='';
-      gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();
-      vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:true,adapter_ready:null};
-      clientLog('control_datachannel_open');
-      renderMonitoring();
-    };
-    channel.onmessage=async event=>{
-      if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
-      try{
-        const message=JSON.parse(event.data);
-        if(!['vehicle_telemetry','vcu_handshake_status','session_control_profile_status','control_command_rejected'].includes(message.event))return;
-        if(!acceptControlStatusMessage(message))return;
-        const gearRejectionState=message.event==='control_command_rejected'&&message.issue_code==='vcu_drive_gear_change_moving_or_stale'?controlLogic.reduceGearChangeRejection(pendingGearTransition,message,selectedGear):null;
-        const gearRejectionMatched=Boolean(gearRejectionState?.matched);
-        if(message.event==='control_command_rejected'){
-          const rejection=controlLogic.deriveControlCommandRejection(message.issue_code);
-          let rollbackFrom=null,rollbackTo=null;
-          if(rejection.action==='rollback_gear_change'){
-            if(gearRejectionMatched){rollbackFrom=pendingGearTransition.toGear;rollbackTo=pendingGearTransition.fromGear}
-            selectedGear=gearRejectionState.selectedGear;pendingGearRequest=gearRejectionState.pendingGearRequest;pendingGearTransition=gearRejectionState.pendingGearTransition;gearRejectionInhibited=gearRejectionState.inhibitOrdinaryControl;clearControlInput(false);
-            if(gearRejectionState.sendRollback)send({},false).catch(console.error);
-          }else if(rejection.clearInput)clearControlInput();
-          statusPanel.textContent=gearRejectionMatched?rejection.text:(rejection.action==='rollback_gear_change'?'换挡拒绝无法关联，普通控制已冻结；请安全断开并重新握手。':rejection.text);
-          const commandSeq=Number(message.command_seq);
-          clientLog('driver_control_command_rejected',{issue_code:rejection.issueCode,command_seq:Number.isSafeInteger(commandSeq)&&commandSeq>0?commandSeq:null,gear_rejection_matched:gearRejectionMatched,rollback_from:rollbackFrom,rollback_to:rollbackTo});
-          renderMonitoring();
-          return;
-        }
-        if(message.event==='session_control_profile_status'){
-          applyControlProfileStatus(message);
-          updateVehicleHardLimits(message.hard_limits);
-          renderMonitoring();
-          return;
-        }
-        if(message.event==='vehicle_telemetry'){
-          vehicleTelemetry=message;
-          if(controlLogic.telemetryConfirmsGearTransition(pendingGearTransition,message)){const completedTransition=pendingGearTransition;pendingGearTransition=null;pendingGearRequest=null;clientLog('driver_gear_transition_confirmed',{from_gear:completedTransition.fromGear,to_gear:completedTransition.toGear,control_status_seq:Number(message.control_status_seq)})}
-          if(message.vcu_handshake){const nextVcuStatus={...message.vcu_handshake,driver_connected:true,adapter_ready:vcuAdapterReady(message.vcu_handshake,message.vehicle_adapter?.opened)};updateVcuHandshakeState(nextVcuStatus)}
-          renderEstopRequest();
-          applyControlProfileStatus(message.session_control_profile);
-          updateVehicleHardLimits(message.control_limits);
-          applyVehicleSafetyState(message.safety_state);
-          renderMonitoring();
-          return;
-        }
-        if(message.event!=='vcu_handshake_status')return;
-        const nextVcuStatus=message.status||{};
-        updateVcuHandshakeState({...nextVcuStatus,driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)});
-        updateVehicleHardLimits(message.hard_limits);
-        if(message.session_control_profile)applyControlProfileStatus(message.session_control_profile);
-        if(vcuHandshake.adapter_ready===false)statusPanel.textContent='VCU 适配器明确不可用；视频保持在线，驾驶命令已阻止';
-        else if(vcuHandshake.adapter_ready===null)statusPanel.textContent='VCU 适配器状态未确认；视频保持在线，驾驶命令已阻止';
-        else if(message.result==='command_rejected')statusPanel.textContent='开始握手失败：'+diagnoseVcuHandshake(true).text;
-        else if(vcuHandshake.handshake_revoked)statusPanel.textContent=diagnoseVcuHandshake(true).text;
-        else if(vcuDrivingReady())statusPanel.textContent='VCU 平行驾驶握手成功，可以发送驾驶命令';
-        else if(vcuHandshake.state==='disarmed')statusPanel.textContent='VCU 握手已安全断开';
-        clientLog('driver_vcu_handshake_status',{result:message.result,state:vcuHandshake.state,ready:Boolean(vcuHandshake.ready),parking_ready:Boolean(vcuHandshake.parking_ready),handshake_revoked:Boolean(vcuHandshake.handshake_revoked),vmc_fault_code:vcuHandshake.vmc_fault_code_valid?Number(vcuHandshake.vmc_fault_code):null});
-        renderMonitoring();
-      }catch(error){clientLog('control_datachannel_message_invalid',{error:error.message})}
-    };
-    channel.onclose=()=>{
-      if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
-      flushControlTrace('datachannel_close');
-      controlChannel=null;
-      resetControlAuthorityInput();
-      resetControlProfileSession();
-      vehicleTelemetry=null;
-      lastVehicleSafetyState='';
-      vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};
-      webrtcLabel.textContent='控制链路中断';
-      clientLog('control_datachannel_closed');
-      renderMonitoring();
-    };
-    channel.onerror=()=>{
-      if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
-      flushControlTrace('datachannel_error');
-      clientLog('control_datachannel_error',{ready_state:channel.readyState,buffered_amount_bytes:Math.max(0,Number(channel.bufferedAmount)||0),peer_connection_state:nextPeer.connectionState});
-      resetControlAuthorityInput();
-      resetControlProfileSession();
-      lastVehicleSafetyState='';
-      webrtcLabel.textContent='控制链路错误';
-      renderMonitoring();
-    };
-  };
-  nextPeer.onicecandidate=e=>{if(e.candidate)post('/api/webrtc/ice-candidate',{candidate:e.candidate.toJSON()}).catch(console.error)};
-  nextPeer.ontrack=e=>{const mid=e.transceiver.mid||'',id=offeredCameraByMid.get(mid)||remoteCameraIds.find(cameraId=>!assignedCameraIds.has(cameraId))||mid||e.track.id;assignedCameraIds.add(id);cameraByMid.set(mid,id);attach(id,e.track)};
-  await nextPeer.setRemoteDescription({type:'offer',sdp:offer.sdp});
-  while(pendingIce.length)await addIce(pendingIce.shift());
-  const answer=await nextPeer.createAnswer();
-  await nextPeer.setLocalDescription(answer);
-  await post('/api/webrtc/answer',{type:'answer',sdp:nextPeer.localDescription.sdp});
-}
-async function collectMetrics(){
-  if(!peer)return;
-  const report=await peer.getStats(),sampledAt=Date.now();
-  let rtt=0,connectionMethod='unknown',turnInUse=false,selectedPair=null;
-  for(const s of report.values())if(s.type==='candidate-pair'&&s.state==='succeeded'&&(s.nominated||!selectedPair))selectedPair=s;
-  if(selectedPair){rtt=Number(selectedPair.currentRoundTripTime||0);const local=report.get(selectedPair.localCandidateId),remote=report.get(selectedPair.remoteCandidateId),types=[local?.candidateType,remote?.candidateType];turnInUse=types.includes('relay');connectionMethod=turnInUse?'TURN':(types.some(type=>type==='srflx'||type==='prflx')?'STUN':'direct')}
-  const streams=[];
-  for(const s of report.values()){
-    if(s.type!=='inbound-rtp'||(s.kind||s.mediaType)!=='video')continue;
-    const statsKey=s.mid||String(s.ssrc||s.id),prior=previousStats.get(statsKey),decoded=Number(s.framesDecoded||0),bytesReceived=Number(s.bytesReceived||0),packetsLost=Number(s.packetsLost||0),packetsReceived=Number(s.packetsReceived||0);
-    let fps=Number(s.framesPerSecond||0),bitrateKbps=0;
-    if(prior){const seconds=(sampledAt-prior.sampledAt)/1000;if(seconds>0){if(!fps)fps=(decoded-prior.framesDecoded)/seconds;bitrateKbps=Math.max(0,(bytesReceived-prior.bytesReceived)*8/seconds/1000)}}
-    previousStats.set(statsKey,{sampledAt,framesDecoded:decoded,bytesReceived});
-    const jitterMs=Number(s.jitterBufferEmittedCount||0)>0?Number(s.jitterBufferDelay||0)*1000/Number(s.jitterBufferEmittedCount):0;
-    const processingMs=decoded>0?Number(s.totalProcessingDelay||0)*1000/decoded:0;
-    const cameraId=cameraByMid.get(s.mid||'')||'',lane=(mediaStatus.lanes||[]).find(l=>l.camera_id===cameraId)||{};
-    const captureEncodeMs=Number(lane.capture_to_encoded_ms||0),latencyMs=captureEncodeMs+rtt*500+jitterMs+processingMs;
-    streams.push({camera_id:cameraId,mid:s.mid||'',codec_id:s.codecId||'',fps,bitrate_kbps:bitrateKbps,frames_decoded:decoded,frames_dropped:Number(s.framesDropped||0),packets_lost:packetsLost,packets_received:packetsReceived,packet_loss_percent:(packetsLost+packetsReceived)>0?100*packetsLost/(packetsLost+packetsReceived):0,jitter_ms:Number(s.jitter||0)*1000,capture_to_encoded_ms:captureEncodeMs,jitter_buffer_ms:jitterMs,processing_ms:processingMs,round_trip_ms:rtt*1000,estimated_end_to_end_latency_ms:latencyMs,passed:fps>=20&&latencyMs<=200})
-  }
-  const timeSync=latestRuntimeStatus.time_sync||mediaStatus.time_sync||{},turnConfigured=hasTurnServer();
-  const controlOutcomes={...controlOutcomeSession.metrics};
-  const metrics={sampled_at_ms:sampledAt,connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',control_rtt_ms:rtt*1000,connection_method:connectionMethod,turn_configured:turnConfigured,turn_in_use:turnInUse,time_sync:timeSync,clock_uncertainty_ms:Number(timeSync.uncertainty_ms||0),latency_method:'capture-to-encoded + rtt/2 + jitter-buffer + browser-processing',control_outcomes:controlOutcomes,control_outcomes_balanced:controlLogic.controlOutcomesBalanced(controlOutcomes),streams,passed:streams.length>0&&streams.every(s=>s.passed)};
-  await post('/api/webrtc/metrics',metrics);
-  if(metrics.codec==='h265'&&metrics.connection_state==='connected'&&streams.length){h265FailureSamples=streams.some(s=>s.fps<20)?h265FailureSamples+1:0;if(h265FailureSamples>=3&&!h265FallbackSent){h265FallbackSent=true;await post('/api/webrtc/fallback',{codec:'h264',reason:'h265_decode_fps_below_20'})}}else h265FailureSamples=0;
-  latestMetrics=metrics;renderMonitoring();statusPanel.textContent=`${metrics.connection_state||'等待连接'} · ${streams.length} 路视频 · RTT ${formatMetric(metrics.control_rtt_ms,1,' ms')} · ${metrics.connection_method||'unknown'}`
-}
-setInterval(()=>collectMetrics().catch(console.error),1000);
-setInterval(()=>refreshRuntimeStatus().catch(console.error),1000);
-setInterval(()=>flushControlTrace('interval'),1000);
-setInterval(()=>refreshControlIntent().catch(console.error),intentRefreshIntervalMs);
-setInterval(()=>{if(authenticated&&!connecting)refreshVehicles().catch(handleVehicleRefreshError)},5000);
-</script></body></html>)HTML";
 }
 
+// Every DriverConsoleHttpApp response is same-origin console material and is
+// served from this process only. The strict CSP leaves no inline script or
+// style path, and the console/config bodies carry no-store so that refresh and
+// navigation never reuse stale capability-bound state from cache. Apply these
+// once at the dispatch boundary so an asset route cannot accidentally emit
+// duplicate CSP/XFO fields.
+void add_console_security_headers(ServerResponse& response) {
+  response.headers.emplace_back("X-Frame-Options", "DENY");
+  response.headers.emplace_back("X-Content-Type-Options", "nosniff");
+  response.headers.emplace_back("Content-Security-Policy",
+                                "default-src 'none'; script-src 'self'; style-src 'self'; "
+                                "img-src 'self' data:; media-src 'self' blob:; "
+                                "connect-src 'self'; frame-ancestors 'none'; "
+                                "base-uri 'none'; object-src 'none'; form-action 'none'");
+  response.headers.emplace_back("Referrer-Policy", "no-referrer");
+  response.headers.emplace_back("Cache-Control", "no-store");
+}
 }  // namespace
 
 SignalingServerConfig load_signaling_identity_config(const std::filesystem::path& path) {
@@ -1529,7 +1401,20 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
   }
 
   SignalingServerConfig config;
+  if (auth["allow_legacy_passwords"]) {
+    try {
+      config.allow_legacy_passwords = auth["allow_legacy_passwords"].as<bool>();
+    } catch (const YAML::Exception& error) {
+      throw std::invalid_argument("auth.allow_legacy_passwords must be a boolean: " +
+                                  std::string(error.what()));
+    }
+  }
+  if (config.allow_legacy_passwords) {
+    config.legacy_passwords_remove_by =
+        required_yaml_string(auth, "legacy_passwords_remove_by", "auth");
+  }
   config.driver_passwords.clear();
+  config.driver_password_verifiers.clear();
   config.device_tokens.clear();
   config.driver_vehicle_permissions.clear();
   const auto base_path = std::filesystem::absolute(path).parent_path();
@@ -1537,9 +1422,41 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
     const auto entry = drivers[index];
     const auto context = "auth.drivers[" + std::to_string(index) + "]";
     const auto driver_id = required_yaml_string(entry, "id", context);
-    const auto password = load_identity_secret(
-        entry, "password_file", "password_env", base_path, context);
-    if (!config.driver_passwords.emplace(driver_id, password).second) {
+    const bool has_legacy_source = entry["password_file"] || entry["password_env"];
+    const bool has_verifier_source = entry["password_hash_file"] || entry["password_hash_env"];
+    if (has_legacy_source && has_verifier_source) {
+      throw std::invalid_argument(context +
+                                  " must configure either a legacy password source or an Argon2id "
+                                  "verifier source, not both");
+    }
+    if (!has_legacy_source && !has_verifier_source) {
+      throw std::invalid_argument(
+          context + " must configure exactly one of password_hash_file or password_hash_env");
+    }
+    if (has_legacy_source) {
+      if (!config.allow_legacy_passwords) {
+        throw std::invalid_argument(
+            context +
+            " uses a legacy plaintext password source but auth.allow_legacy_passwords is not true");
+      }
+      const auto password =
+          load_identity_secret(entry, "password_file", "password_env", base_path, context);
+      if (!config.driver_passwords.emplace(driver_id, password).second) {
+        throw std::invalid_argument("duplicate driver id: " + driver_id);
+      }
+    } else {
+      const auto verifier = load_identity_secret(entry, "password_hash_file", "password_hash_env",
+                                                 base_path, context);
+      std::string reason;
+      if (!validate_argon2id_verifier(verifier, config.authentication_cost_policy, &reason)) {
+        throw std::invalid_argument(context + " Argon2id verifier is invalid: " + reason);
+      }
+      if (!config.driver_password_verifiers.emplace(driver_id, verifier).second) {
+        throw std::invalid_argument("duplicate driver id: " + driver_id);
+      }
+    }
+    if (config.driver_passwords.contains(driver_id) &&
+        config.driver_password_verifiers.contains(driver_id)) {
       throw std::invalid_argument("duplicate driver id: " + driver_id);
     }
     const auto allowed = entry["vehicles"];
@@ -1578,7 +1495,102 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
       }
     }
   }
+  const auto limits = root["connection_limits"];
+  if (limits) {
+    if (!limits.IsMap())
+      throw std::invalid_argument("connection_limits must be a mapping");
+    // Partial mappings inherit every omitted field from the R05
+    // default-constructed ConnectionLimits (SignalingServerConfig already
+    // carries those defaults), so only explicitly-present keys are validated.
+    config.connection_limits.max_active_connections =
+        static_cast<std::size_t>(required_positive_integer_node(
+            limits, "max_active_connections", "connection_limits.max_active_connections",
+            static_cast<std::int64_t>(config.connection_limits.max_active_connections)));
+    config.connection_limits.max_pending_http_connections =
+        static_cast<std::size_t>(required_positive_integer_node(
+            limits, "max_pending_http_connections",
+            "connection_limits.max_pending_http_connections",
+            static_cast<std::int64_t>(config.connection_limits.max_pending_http_connections)));
+    config.connection_limits.max_websocket_connections =
+        static_cast<std::size_t>(required_positive_integer_node(
+            limits, "max_websocket_connections", "connection_limits.max_websocket_connections",
+            static_cast<std::int64_t>(config.connection_limits.max_websocket_connections)));
+    config.connection_limits.max_connections_per_source =
+        static_cast<std::size_t>(required_positive_integer_node(
+            limits, "max_connections_per_source", "connection_limits.max_connections_per_source",
+            static_cast<std::int64_t>(config.connection_limits.max_connections_per_source)));
+    const auto listen_backlog =
+        required_positive_integer_node(limits, "listen_backlog", "connection_limits.listen_backlog",
+                                       config.connection_limits.listen_backlog);
+    if (listen_backlog > std::numeric_limits<int>::max()) {
+      throw std::invalid_argument("connection_limits.listen_backlog is too large");
+    }
+    config.connection_limits.listen_backlog = static_cast<int>(listen_backlog);
+    config.connection_limits.header_read_timeout =
+        std::chrono::milliseconds(required_positive_integer_node(
+            limits, "header_read_timeout_ms", "connection_limits.header_read_timeout_ms",
+            config.connection_limits.header_read_timeout.count()));
+    config.connection_limits.body_read_timeout =
+        std::chrono::milliseconds(required_positive_integer_node(
+            limits, "body_read_timeout_ms", "connection_limits.body_read_timeout_ms",
+            config.connection_limits.body_read_timeout.count()));
+    config.connection_limits.response_write_timeout =
+        std::chrono::milliseconds(required_positive_integer_node(
+            limits, "response_write_timeout_ms", "connection_limits.response_write_timeout_ms",
+            config.connection_limits.response_write_timeout.count()));
+    config.connection_limits.overload_write_timeout =
+        std::chrono::milliseconds(required_positive_integer_node(
+            limits, "overload_write_timeout_ms", "connection_limits.overload_write_timeout_ms",
+            config.connection_limits.overload_write_timeout.count()));
+    validate_connection_limits(config.connection_limits);
+  }
   return config;
+}
+
+void validate_connection_limits(const SimpleHttpServer::ConnectionLimits& limits) {
+  if (limits.max_active_connections == 0) {
+    throw std::invalid_argument("connection_limits.max_active_connections must be positive");
+  }
+  if (limits.max_pending_http_connections == 0) {
+    throw std::invalid_argument("connection_limits.max_pending_http_connections must be positive");
+  }
+  if (limits.max_connections_per_source == 0) {
+    throw std::invalid_argument("connection_limits.max_connections_per_source must be positive");
+  }
+  if (limits.listen_backlog <= 0) {
+    throw std::invalid_argument("connection_limits.listen_backlog must be positive");
+  }
+  if (limits.header_read_timeout <= std::chrono::milliseconds::zero()) {
+    throw std::invalid_argument("connection_limits.header_read_timeout_ms must be positive");
+  }
+  if (limits.body_read_timeout <= std::chrono::milliseconds::zero()) {
+    throw std::invalid_argument("connection_limits.body_read_timeout_ms must be positive");
+  }
+  if (limits.response_write_timeout <= std::chrono::milliseconds::zero()) {
+    throw std::invalid_argument("connection_limits.response_write_timeout_ms must be positive");
+  }
+  if (limits.overload_write_timeout <= std::chrono::milliseconds::zero()) {
+    throw std::invalid_argument("connection_limits.overload_write_timeout_ms must be positive");
+  }
+  if (limits.max_pending_http_connections > limits.max_active_connections) {
+    throw std::invalid_argument(
+        "connection_limits.max_pending_http_connections must not exceed "
+        "connection_limits.max_active_connections");
+  }
+  if (limits.max_websocket_connections > limits.max_active_connections) {
+    throw std::invalid_argument(
+        "connection_limits.max_websocket_connections must not exceed "
+        "connection_limits.max_active_connections");
+  }
+  // The standalone signaling server always installs a WSS handler, so a valid
+  // budget must always reserve post-upgrade capacity for WebSocket channels.
+  if (limits.max_websocket_connections == 0 ||
+      limits.max_pending_http_connections >= limits.max_active_connections) {
+    throw std::invalid_argument(
+        "connection_limits must reserve active capacity for WebSocket connections "
+        "(max_websocket_connections must be positive and max_pending_http_connections "
+        "must be less than max_active_connections)");
+  }
 }
 
 Json HttpRequest::json_body() const {
@@ -1600,20 +1612,44 @@ ServerResponse ServerResponse::text(int status, std::string body, std::string co
   return ServerResponse{status, std::move(content_type), std::move(body), {}};
 }
 
-SimpleHttpServer::SimpleHttpServer(
-    std::string host,
-    std::uint16_t port,
-    Handler handler,
-    std::size_t max_body_bytes,
-    WebSocketHandler websocket_handler)
+SimpleHttpServer::SimpleHttpServer(std::string host, std::uint16_t port, Handler handler,
+                                   std::size_t max_body_bytes, WebSocketHandler websocket_handler)
+    : SimpleHttpServer(std::move(host), port, std::move(handler), max_body_bytes,
+                       std::move(websocket_handler), ConnectionLimits{}) {}
+
+SimpleHttpServer::SimpleHttpServer(std::string host, std::uint16_t port, Handler handler,
+                                   std::size_t max_body_bytes, WebSocketHandler websocket_handler,
+                                   ConnectionLimits connection_limits)
     : host_(std::move(host)),
       requested_port_(port),
       handler_(std::move(handler)),
       max_body_bytes_(max_body_bytes),
-      websocket_handler_(std::move(websocket_handler)) {
+      websocket_handler_(std::move(websocket_handler)),
+      connection_limits_(std::move(connection_limits)) {
   if (host_.empty()) throw std::invalid_argument("HTTP host must not be empty");
   if (!handler_) throw std::invalid_argument("HTTP handler is required");
   if (max_body_bytes_ == 0) throw std::invalid_argument("HTTP max body size must be positive");
+  if (connection_limits_.max_active_connections == 0 ||
+      connection_limits_.max_pending_http_connections == 0 ||
+      connection_limits_.max_connections_per_source == 0 ||
+      connection_limits_.listen_backlog <= 0 ||
+      connection_limits_.header_read_timeout <= std::chrono::milliseconds::zero() ||
+      connection_limits_.body_read_timeout <= std::chrono::milliseconds::zero() ||
+      connection_limits_.response_write_timeout <= std::chrono::milliseconds::zero() ||
+      connection_limits_.overload_write_timeout <= std::chrono::milliseconds::zero()) {
+    throw std::invalid_argument("HTTP connection limits and deadlines must be positive");
+  }
+  if (connection_limits_.max_pending_http_connections > connection_limits_.max_active_connections ||
+      connection_limits_.max_websocket_connections > connection_limits_.max_active_connections) {
+    throw std::invalid_argument(
+        "HTTP connection sub-limits must not exceed the active connection limit");
+  }
+  if (websocket_handler_ && (connection_limits_.max_websocket_connections == 0 ||
+                             connection_limits_.max_pending_http_connections >=
+                                 connection_limits_.max_active_connections)) {
+    throw std::invalid_argument(
+        "HTTP limits must reserve active capacity for WebSocket connections");
+  }
 }
 
 SimpleHttpServer::~SimpleHttpServer() { stop(); }
@@ -1645,7 +1681,7 @@ void SimpleHttpServer::open_listener() {
     listener_fd_ = static_cast<SocketHandle>(candidate);
     configure_listener_socket(listener_fd_);
     if (::bind(native_socket(listener_fd_), address->ai_addr, address->ai_addrlen) == 0 &&
-        ::listen(native_socket(listener_fd_), 64) == 0) {
+        ::listen(native_socket(listener_fd_), connection_limits_.listen_backlog) == 0) {
       break;
     }
     saved_error = last_socket_error();
@@ -1668,13 +1704,118 @@ void SimpleHttpServer::open_listener() {
   if (bound.ss_family == AF_INET6) bound_port_ = ntohs(reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port);
 }
 
-void SimpleHttpServer::serve_client(SocketHandle client_fd) const {
-  ServerResponse response;
+bool SimpleHttpServer::try_register_client(SocketHandle client_fd, std::string source) {
+  std::lock_guard lock(clients_mutex_);
+  const auto source_count = connections_by_source_.find(source);
+  if (stopping_ || client_sockets_.size() >= connection_limits_.max_active_connections ||
+      pending_http_connections_ >= connection_limits_.max_pending_http_connections ||
+      (source_count != connections_by_source_.end() &&
+       source_count->second >= connection_limits_.max_connections_per_source)) {
+    return false;
+  }
+  const auto [socket, inserted] = client_sockets_.insert(client_fd);
+  if (!inserted)
+    return false;
   try {
-    auto request = parse_request(client_fd, max_body_bytes_);
+    const auto [stored_source, source_inserted] =
+        client_sources_.emplace(client_fd, std::move(source));
+    if (!source_inserted) {
+      client_sockets_.erase(socket);
+      return false;
+    }
+    ++connections_by_source_[stored_source->second];
+    ++pending_http_connections_;
+    return true;
+  } catch (...) {
+    client_sources_.erase(client_fd);
+    client_sockets_.erase(socket);
+    throw;
+  }
+}
+
+bool SimpleHttpServer::try_promote_client_to_websocket(SocketHandle client_fd) {
+  std::lock_guard lock(clients_mutex_);
+  if (!client_sockets_.contains(client_fd) || websocket_sockets_.contains(client_fd) ||
+      websocket_sockets_.size() >= connection_limits_.max_websocket_connections) {
+    return false;
+  }
+  websocket_sockets_.insert(client_fd);
+  if (pending_http_connections_ > 0)
+    --pending_http_connections_;
+  return true;
+}
+
+bool SimpleHttpServer::try_demote_client_from_websocket(SocketHandle client_fd) {
+  std::lock_guard lock(clients_mutex_);
+  if (!websocket_sockets_.contains(client_fd) ||
+      pending_http_connections_ >= connection_limits_.max_pending_http_connections) {
+    return false;
+  }
+  websocket_sockets_.erase(client_fd);
+  ++pending_http_connections_;
+  return true;
+}
+
+void SimpleHttpServer::unregister_client(SocketHandle client_fd) {
+  {
+    std::lock_guard lock(clients_mutex_);
+    const auto client = client_sockets_.find(client_fd);
+    if (client == client_sockets_.end())
+      return;
+    if (websocket_sockets_.erase(client_fd) == 0 && pending_http_connections_ > 0) {
+      --pending_http_connections_;
+    }
+    if (const auto source = client_sources_.find(client_fd); source != client_sources_.end()) {
+      if (const auto count = connections_by_source_.find(source->second);
+          count != connections_by_source_.end()) {
+        if (count->second > 1) {
+          --count->second;
+        } else {
+          connections_by_source_.erase(count);
+        }
+      }
+      client_sources_.erase(source);
+    }
+    client_sockets_.erase(client);
+  }
+  clients_stopped_.notify_all();
+}
+
+void SimpleHttpServer::serve_client(SocketHandle client_fd) {
+  ServerResponse response;
+  bool socket_is_nonblocking = true;
+  try {
+    auto request = parse_request(client_fd, max_body_bytes_, connection_limits_.header_read_timeout,
+                                 connection_limits_.body_read_timeout);
     request.peer_address = socket_peer_address(client_fd);
-    if (websocket_handler_ && websocket_handler_(client_fd, request)) return;
-    response = handler_(request);
+    if (websocket_handler_) {
+      const bool websocket_upgrade = websocket_upgrade_requested(request);
+      if (websocket_upgrade && !try_promote_client_to_websocket(client_fd)) {
+        response = ServerResponse::json(503, {{"error", "WebSocket connection budget exhausted"}});
+      } else {
+        // The established WebSocket implementation expects the blocking socket
+        // contract it had before HTTP parsing became deadline-driven.
+        set_socket_nonblocking(client_fd, false);
+        socket_is_nonblocking = false;
+        if (websocket_handler_(client_fd, request))
+          return;
+        set_socket_nonblocking(client_fd, true);
+        socket_is_nonblocking = true;
+        if (websocket_upgrade && !try_demote_client_from_websocket(client_fd)) {
+          // A request that advertised an upgrade consumed the WebSocket slot
+          // before the handler decided it was ordinary HTTP.  It must regain
+          // the pending-HTTP slot before reaching the normal handler; otherwise
+          // an upgrade-shaped request could bypass that bounded pre-auth pool.
+          response = ServerResponse::json(503, {{"error", "HTTP connection budget exhausted"}});
+        } else {
+          response = handler_(request);
+        }
+      }
+    } else {
+      response = handler_(request);
+    }
+  } catch (const HttpDeadlineExceeded& error) {
+    response = ServerResponse::json(408, {{"error", error.what()}});
   } catch (const std::length_error& error) {
     response = ServerResponse::json(413, {{"error", error.what()}});
   } catch (const std::invalid_argument& error) {
@@ -1682,8 +1823,17 @@ void SimpleHttpServer::serve_client(SocketHandle client_fd) const {
   } catch (const std::exception& error) {
     response = ServerResponse::json(500, {{"error", error.what()}});
   }
+  if (!socket_is_nonblocking) {
+    try {
+      set_socket_nonblocking(client_fd, true);
+    } catch (const std::exception&) {
+      return;
+    }
+  }
   try {
-    send_http_response(client_fd, response);
+    send_http_response_until(
+        client_fd, response,
+        std::chrono::steady_clock::now() + connection_limits_.response_write_timeout);
   } catch (const std::exception&) {
   }
 }
@@ -1703,29 +1853,38 @@ void SimpleHttpServer::serve_forever() {
       continue;
     }
     const auto client = static_cast<SocketHandle>(accepted);
-    {
-      std::lock_guard lock(clients_mutex_);
-      client_sockets_.insert(client);
-    }
     try {
-      std::thread([this, client] {
-        serve_client(client);
-        shutdown_socket(client);
-        close_socket(client);
-        {
-          std::lock_guard lock(clients_mutex_);
-          client_sockets_.erase(client);
-        }
-        clients_stopped_.notify_all();
-      }).detach();
-    } catch (...) {
-      {
-        std::lock_guard lock(clients_mutex_);
-        client_sockets_.erase(client);
+      set_socket_nonblocking(client, true);
+    } catch (const std::exception&) {
+      shutdown_socket(client);
+      close_socket(client);
+      continue;
+    }
+    if (!try_register_client(client, socket_peer_address(client))) {
+      try {
+        send_http_response_until(
+            client, ServerResponse::json(503, {{"error", "HTTP connection budget exhausted"}}),
+            std::chrono::steady_clock::now() + connection_limits_.overload_write_timeout);
+      } catch (const std::exception&) {
       }
       shutdown_socket(client);
       close_socket(client);
-      throw;
+      continue;
+    }
+    try {
+      std::thread([this, client] {
+        try {
+          serve_client(client);
+        } catch (const std::exception&) {
+        }
+        shutdown_socket(client);
+        close_socket(client);
+        unregister_client(client);
+      }).detach();
+    } catch (...) {
+      shutdown_socket(client);
+      close_socket(client);
+      unregister_client(client);
     }
   }
 }
@@ -1787,7 +1946,7 @@ Json SignalingService::Session::to_json(bool include_control_token) const {
   };
   if (include_control_token && !control_token.empty()) {
     value["control_token"] = control_token;
-    value["control_token_expires_at_utc_ms"] = control_token_expires_at_ms;
+    value["control_token_expires_at_utc_ms"] = control_token_expires_at_utc_ms;
   }
   return value;
 }
@@ -1803,12 +1962,13 @@ Json SignalingService::Message::to_json() const {
   return value;
 }
 
-SignalingService::SignalingService(
-    SignalingServerConfig config,
-    std::function<std::int64_t()> audit_clock)
+SignalingService::SignalingService(SignalingServerConfig config,
+                                   std::function<std::int64_t()> audit_clock,
+                                   ClockSampler clock_sampler)
     : config_(std::move(config)),
       service_instance_id_("service-" + random_token(12)),
-      audit_clock_(std::move(audit_clock)) {
+      audit_clock_(std::move(audit_clock)),
+      clock_sampler_(std::move(clock_sampler)) {
   if (config_.token_ttl_ms <= 0) throw std::invalid_argument("driver token TTL must be positive");
   if (config_.control_token_ttl_ms <= 0) throw std::invalid_argument("control token TTL must be positive");
   if (config_.vehicle_heartbeat_timeout_ms <= 0 || config_.driver_heartbeat_timeout_ms <= 0 ||
@@ -1818,6 +1978,19 @@ SignalingService::SignalingService(
   if (config_.login_max_failures <= 0 || config_.login_failure_window_ms <= 0 ||
       config_.login_lockout_ms <= 0) {
     throw std::invalid_argument("login failure limit, window, and lockout must be positive");
+  }
+  std::string authentication_policy_reason;
+  if (!validate_authentication_cost_policy(config_.authentication_cost_policy,
+                                           &authentication_policy_reason)) {
+    throw std::invalid_argument("authentication cost policy is invalid: " +
+                                authentication_policy_reason);
+  }
+  if (config_.password_verification_max_concurrency == 0 ||
+      config_.password_verification_max_concurrency > 16 ||
+      config_.password_verification_retry_after_ms <= 0 ||
+      config_.password_verification_retry_after_ms > 60 * 1000) {
+    throw std::invalid_argument(
+        "password verification concurrency and retry budget are outside the supported range");
   }
   if (config_.api_rate_limit_requests <= 0 || config_.api_rate_limit_window_ms <= 0 ||
       config_.api_rate_limit_max_sources <= 0) {
@@ -1847,8 +2020,10 @@ SignalingService::SignalingService(
   }
   if (config_.max_signaling_payload_bytes == 0 || config_.max_sdp_bytes == 0 ||
       config_.max_ice_candidate_bytes == 0 || config_.signaling_message_ttl_ms <= 0 ||
-      config_.native_control_message_ttl_ms <= 0 ||
-      config_.native_control_message_ttl_ms > 1000) {
+      config_.native_control_message_ttl_ms <= 0 || config_.native_control_message_ttl_ms > 1000 ||
+      config_.max_signaling_queue_messages == 0 || config_.max_signaling_queue_bytes == 0 ||
+      config_.websocket_rate_limit_messages <= 0 || config_.websocket_rate_limit_bytes == 0 ||
+      config_.websocket_rate_limit_window_ms <= 0) {
     throw std::invalid_argument("signaling limits and message TTL must be positive");
   }
   if (config_.stun_urls.empty() && config_.turn_urls.empty()) {
@@ -1864,16 +2039,45 @@ SignalingService::SignalingService(
       (config_.turn_realm.empty() || config_.turn_static_auth_secret.empty())) {
     throw std::invalid_argument("TURN URLs require a realm and static auth secret");
   }
-  if (config_.driver_passwords.empty()) throw std::invalid_argument("at least one driver credential is required");
+  if (config_.driver_passwords.empty() && config_.driver_password_verifiers.empty()) {
+    throw std::invalid_argument("at least one driver credential is required");
+  }
+  if (!config_.allow_legacy_passwords && !config_.driver_passwords.empty()) {
+    throw std::invalid_argument(
+        "legacy plaintext driver passwords require allow_legacy_passwords=true");
+  }
+  if (config_.allow_legacy_passwords && !config_.driver_passwords.empty() &&
+      !valid_legacy_password_removal_date(config_.legacy_passwords_remove_by)) {
+    throw std::invalid_argument(
+        "legacy plaintext driver passwords require a valid YYYY-MM-DD legacy_passwords_remove_by "
+        "deadline");
+  }
+  if (config_.allow_legacy_passwords && !config_.driver_passwords.empty() &&
+      !legacy_password_migration_is_active(config_.legacy_passwords_remove_by)) {
+    throw std::invalid_argument(
+        "legacy plaintext driver passwords are past their legacy_passwords_remove_by deadline");
+  }
   if (config_.device_tokens.empty()) throw std::invalid_argument("at least one device credential is required");
   for (const auto& [id, password] : config_.driver_passwords) {
     if (id.empty() || password.empty()) throw std::invalid_argument("driver credentials must not be empty");
+  }
+  for (const auto& [id, verifier] : config_.driver_password_verifiers) {
+    if (id.empty() || verifier.empty()) {
+      throw std::invalid_argument("driver password verifiers must not be empty");
+    }
+    if (config_.driver_passwords.contains(id)) {
+      throw std::invalid_argument("a driver cannot have both legacy and Argon2id credentials");
+    }
+    std::string reason;
+    if (!validate_argon2id_verifier(verifier, config_.authentication_cost_policy, &reason)) {
+      throw std::invalid_argument("driver Argon2id verifier is invalid: " + reason);
+    }
   }
   for (const auto& [id, token] : config_.device_tokens) {
     if (id.empty() || token.empty()) throw std::invalid_argument("device credentials must not be empty");
   }
   for (const auto& [driver_id, vehicles] : config_.driver_vehicle_permissions) {
-    if (!config_.driver_passwords.contains(driver_id)) {
+    if (!configured_driver(driver_id)) {
       throw std::invalid_argument("vehicle permission references an unknown driver");
     }
     for (const auto& vehicle_id : vehicles) {
@@ -1882,28 +2086,47 @@ SignalingService::SignalingService(
       }
     }
   }
+  dummy_password_verifier_ = dummy_argon2id_verifier(config_.authentication_cost_policy);
   if (config_.native_control_trace_commands && !config_.audit_log_path.empty()) {
     native_control_trace_ = std::make_unique<AsyncControlTrace>(
         [this](Json details) {
           audit("cloud_native_control_trace_batch", std::move(details));
         });
   }
-  audit(
-      "signaling_service_started",
-      {{"runtime", "cpp"},
-       {"native_control_trace_commands", config_.native_control_trace_commands},
-       {"audit_log_max_bytes", config_.audit_log_max_bytes},
-       {"audit_log_files", config_.audit_log_files},
-       {"audit_log_rotation_interval_ms", config_.audit_log_rotation_interval_ms},
-       {"audit_log_retention_days", config_.audit_log_retention_days}});
+  if (!audit("signaling_service_started",
+             {{"runtime", "cpp"},
+              {"native_control_trace_commands", config_.native_control_trace_commands},
+              {"audit_log_max_bytes", config_.audit_log_max_bytes},
+              {"audit_log_files", config_.audit_log_files},
+              {"audit_log_rotation_interval_ms", config_.audit_log_rotation_interval_ms},
+              {"audit_log_retention_days", config_.audit_log_retention_days}})) {
+    throw std::runtime_error("signaling audit log is unavailable at startup");
+  }
   connection_reaper_ = std::jthread([this](std::stop_token stop_token) {
     while (!stop_token.stop_requested()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(config_.connection_reaper_interval_ms));
       if (stop_token.stop_requested()) break;
-      std::lock_guard lock(mutex_);
-      cleanup_expired_connections(now_ms());
+      try {
+        const auto now = clock_sample();
+        std::lock_guard lock(mutex_);
+        cleanup_expired_connections(now);
+        connection_reaper_healthy_.store(true);
+      } catch (const std::exception& error) {
+        connection_reaper_healthy_.store(false);
+        connection_reaper_failures_.fetch_add(1);
+        std::cerr << "mine-teleop-signaling: connection reaper recovered from error: "
+                  << error.what() << '\n';
+      } catch (...) {
+        connection_reaper_healthy_.store(false);
+        connection_reaper_failures_.fetch_add(1);
+        std::cerr << "mine-teleop-signaling: connection reaper recovered from unknown error\n";
+      }
     }
   });
+}
+
+ClockSample SignalingService::clock_sample() const {
+  return clock_sampler_ ? clock_sampler_() : ClockSample{utc_now_ms(), process_monotonic_now_ms()};
 }
 
 SignalingService::~SignalingService() {
@@ -1913,12 +2136,19 @@ SignalingService::~SignalingService() {
 }
 
 Json SignalingService::health() const {
+  std::size_t active_password_verifications = 0;
+  {
+    std::lock_guard verification_lock(password_verification_mutex_);
+    active_password_verifications = active_password_verifications_;
+  }
   std::lock_guard lock(mutex_);
-  const auto timestamp_ms = now_ms();
+  const auto now = clock_sample();
   const auto active_sessions = std::count_if(sessions_.begin(), sessions_.end(), [](const auto& item) {
     return item.second.state == SessionState::Active || item.second.state == SessionState::Degraded;
   });
   std::uint64_t turn_relay_bytes_total = 0;
+  std::size_t queued_signaling_messages = 0;
+  std::size_t queued_signaling_bytes = 0;
   std::size_t turn_usage_sessions = 0;
   for (const auto& [id, session] : sessions_) {
     static_cast<void>(id);
@@ -1929,12 +2159,28 @@ Json SignalingService::health() const {
         ? std::numeric_limits<std::uint64_t>::max()
         : turn_relay_bytes_total + session_total;
   }
-  const auto login_locked_buckets = std::count_if(login_failures_.begin(), login_failures_.end(), [&](const auto& item) {
-    return item.second.blocked_until_ms > timestamp_ms;
-  });
+  for (const auto& [key, queue] : messages_) {
+    static_cast<void>(key);
+    queued_signaling_messages += queue.size();
+    for (const auto& message : queue) {
+      queued_signaling_bytes = message.serialized_bytes > std::numeric_limits<std::size_t>::max() -
+                                                              queued_signaling_bytes
+                                   ? std::numeric_limits<std::size_t>::max()
+                                   : queued_signaling_bytes + message.serialized_bytes;
+    }
+  }
+  const auto login_locked_buckets =
+      std::count_if(login_failures_.begin(), login_failures_.end(), [&](const auto& item) {
+        return item.second.blocked_until_monotonic_ms.has_value() &&
+               !detail::monotonic_deadline_reached(now.monotonic,
+                                                   *item.second.blocked_until_monotonic_ms);
+      });
   const bool api_rate_limit_overflow_active =
-      api_rate_limit_overflow_.window_started_at_ms > 0 &&
-      timestamp_ms - api_rate_limit_overflow_.window_started_at_ms < config_.api_rate_limit_window_ms;
+      api_rate_limit_overflow_.window_started_at_monotonic_ms.has_value() &&
+      !detail::monotonic_deadline_reached(
+          now.monotonic,
+          detail::saturating_deadline_ms(*api_rate_limit_overflow_.window_started_at_monotonic_ms,
+                                         config_.api_rate_limit_window_ms));
   Json alerts = Json::array();
   if (login_locked_buckets > 0) {
     alerts.push_back({
@@ -1948,6 +2194,20 @@ Json SignalingService::health() const {
         {"code", "api_rate_limit_source_capacity"},
         {"severity", "warning"},
         {"count", 1},
+    });
+  }
+  if (!audit_healthy_.load()) {
+    alerts.push_back({
+        {"code", "audit_log_unavailable"},
+        {"severity", "critical"},
+        {"count", audit_write_failures_.load()},
+    });
+  }
+  if (!connection_reaper_healthy_.load()) {
+    alerts.push_back({
+        {"code", "connection_reaper_unhealthy"},
+        {"severity", "critical"},
+        {"count", connection_reaper_failures_.load()},
     });
   }
   const auto alert_count = alerts.size();
@@ -1964,9 +2224,29 @@ Json SignalingService::health() const {
       {"revoked_vehicles", revoked_vehicles_.size()},
       {"revoked_drivers", revoked_drivers_.size()},
       {"login_locked_buckets", login_locked_buckets},
+      {"authentication_cost_memory_kib", config_.authentication_cost_policy.memory_kib},
+      {"authentication_cost_time_cost", config_.authentication_cost_policy.time_cost},
+      {"authentication_cost_parallelism", config_.authentication_cost_policy.parallelism},
+      {"authentication_cost_maximum_memory_kib",
+       config_.authentication_cost_policy.maximum_memory_kib},
+      {"authentication_cost_maximum_time_cost",
+       config_.authentication_cost_policy.maximum_time_cost},
+      {"authentication_cost_maximum_parallelism",
+       config_.authentication_cost_policy.maximum_parallelism},
+      {"authentication_cost_maximum_encoded_bytes",
+       config_.authentication_cost_policy.maximum_encoded_bytes},
+      {"password_verification_active", active_password_verifications},
+      {"password_verification_capacity", config_.password_verification_max_concurrency},
       {"api_rate_limit_tracked_sources", api_rate_limits_.size()},
       {"api_rate_limit_overflow_active", api_rate_limit_overflow_active},
       {"api_rate_limited_requests", api_rate_limited_requests_},
+      {"queued_signaling_messages", queued_signaling_messages},
+      {"queued_signaling_bytes", queued_signaling_bytes},
+      {"signaling_queue_rejections", signaling_queue_rejections_},
+      {"audit_healthy", audit_healthy_.load()},
+      {"audit_write_failures", audit_write_failures_.load()},
+      {"connection_reaper_healthy", connection_reaper_healthy_.load()},
+      {"connection_reaper_failures", connection_reaper_failures_.load()},
       {"turn_usage_sessions", turn_usage_sessions},
       {"turn_relay_bytes_total", turn_relay_bytes_total},
   };
@@ -1990,32 +2270,37 @@ const SignalingService::Session& SignalingService::require_participant(
   return session;
 }
 
-void SignalingService::validate_driver_token(std::string_view driver_id, std::string_view token) {
+void SignalingService::validate_driver_token(std::string_view driver_id, std::string_view token,
+                                             ClockSample now) {
   if (revoked_drivers_.contains(std::string(driver_id))) throw Unauthorized("driver is revoked");
   const auto found = driver_tokens_.find(std::string(token));
   if (token.empty() || found == driver_tokens_.end() || found->second.driver_id != driver_id) {
     throw Unauthorized("invalid driver token");
   }
-  if (now_ms() >= found->second.expires_at_ms) throw Unauthorized("driver token expired");
+  if (detail::monotonic_deadline_reached(now.monotonic, found->second.expires_at_monotonic_ms)) {
+    throw Unauthorized("driver token expired");
+  }
   const auto presence = online_drivers_.find(std::string(driver_id));
   if (presence == online_drivers_.end() || presence->second.generation != found->second.connection_generation) {
     throw Unauthorized("driver connection is no longer current");
   }
-  presence->second.last_seen_at_ms = now_ms();
+  presence->second.last_seen_at_utc_ms = now.utc.value;
+  presence->second.last_seen_at_monotonic_ms = now.monotonic.value;
 }
 
 void SignalingService::validate_device_token(std::string_view vehicle_id, std::string_view token) const {
   if (revoked_vehicles_.contains(std::string(vehicle_id))) throw Unauthorized("vehicle is revoked");
   const auto found = config_.device_tokens.find(std::string(vehicle_id));
-  if (token.empty() || found == config_.device_tokens.end() || found->second != token) {
+  if (token.empty() || found == config_.device_tokens.end() ||
+      !constant_time_equal(found->second, token)) {
     throw Unauthorized("invalid device token");
   }
 }
 
-void SignalingService::validate_vehicle_connection(
-    std::string_view vehicle_id,
-    std::string_view token,
-    std::uint64_t connection_generation) {
+void SignalingService::validate_vehicle_connection(std::string_view vehicle_id,
+                                                   std::string_view token,
+                                                   std::uint64_t connection_generation,
+                                                   ClockSample now) {
   validate_device_token(vehicle_id, token);
   const auto found = online_vehicles_.find(std::string(vehicle_id));
   if (found == online_vehicles_.end()) throw Conflict("vehicle is offline", "vehicle_offline");
@@ -2024,17 +2309,17 @@ void SignalingService::validate_vehicle_connection(
         "vehicle connection generation is stale",
         "vehicle_connection_generation_stale");
   }
-  found->second.last_seen_at_ms = now_ms();
+  found->second.last_seen_at_utc_ms = now.utc.value;
+  found->second.last_seen_at_monotonic_ms = now.monotonic.value;
 }
 
-void SignalingService::validate_actor_credential(const Session& session, std::string_view actor, const Json& value) {
+void SignalingService::validate_actor_credential(const Session& session, std::string_view actor,
+                                                 const Json& value, ClockSample now) {
   if (actor == session.driver_id) {
-    validate_driver_token(actor, optional_string(value, "token"));
+    validate_driver_token(actor, optional_string(value, "token"), now);
   } else if (actor == session.vehicle_id) {
-    validate_vehicle_connection(
-        actor,
-        optional_string(value, "device_token"),
-        required_uint64(value, "connection_generation"));
+    validate_vehicle_connection(actor, optional_string(value, "device_token"),
+                                required_uint64(value, "connection_generation"), now);
   } else {
     throw Unauthorized("actor is not current session participant");
   }
@@ -2054,9 +2339,10 @@ void SignalingService::close_sessions_for_driver(std::string_view driver_id, std
   }
 }
 
-void SignalingService::cleanup_expired_connections(std::int64_t timestamp_ms) {
+void SignalingService::cleanup_expired_connections(ClockSample now) {
+  prune_expired_signaling_messages(now);
   for (auto token = driver_tokens_.begin(); token != driver_tokens_.end();) {
-    if (timestamp_ms < token->second.expires_at_ms) {
+    if (!detail::monotonic_deadline_reached(now.monotonic, token->second.expires_at_monotonic_ms)) {
       ++token;
       continue;
     }
@@ -2076,15 +2362,19 @@ void SignalingService::cleanup_expired_connections(std::int64_t timestamp_ms) {
 
   for (auto& [id, session] : sessions_) {
     static_cast<void>(id);
-    if (session.state != SessionState::Closed && session.control_token_expires_at_ms > 0 &&
-        timestamp_ms >= session.control_token_expires_at_ms) {
+    if (session.state != SessionState::Closed &&
+        detail::monotonic_deadline_reached(now.monotonic,
+                                           session.control_token_expires_at_monotonic_ms)) {
       close_session(session, "control_token_expired");
       audit("control_authority_expired", session.to_json());
     }
   }
 
   for (auto iterator = online_vehicles_.begin(); iterator != online_vehicles_.end();) {
-    if (timestamp_ms - iterator->second.last_seen_at_ms < config_.vehicle_heartbeat_timeout_ms) {
+    if (!detail::monotonic_deadline_reached(
+            now.monotonic,
+            detail::saturating_deadline_ms(iterator->second.last_seen_at_monotonic_ms,
+                                           config_.vehicle_heartbeat_timeout_ms))) {
       ++iterator;
       continue;
     }
@@ -2100,7 +2390,10 @@ void SignalingService::cleanup_expired_connections(std::int64_t timestamp_ms) {
   }
 
   for (auto iterator = online_drivers_.begin(); iterator != online_drivers_.end();) {
-    if (timestamp_ms - iterator->second.last_seen_at_ms < config_.driver_heartbeat_timeout_ms) {
+    if (!detail::monotonic_deadline_reached(
+            now.monotonic,
+            detail::saturating_deadline_ms(iterator->second.last_seen_at_monotonic_ms,
+                                           config_.driver_heartbeat_timeout_ms))) {
       ++iterator;
       continue;
     }
@@ -2120,6 +2413,50 @@ void SignalingService::cleanup_expired_connections(std::int64_t timestamp_ms) {
         {{"driver_id", driver_id},
          {"connection_generation", generation},
          {"reason", "heartbeat_timeout"}});
+  }
+}
+
+void SignalingService::prune_expired_signaling_messages(ClockSample now) {
+  for (auto queue = messages_.begin(); queue != messages_.end();) {
+    std::erase_if(queue->second, [&](const auto& message) {
+      return detail::monotonic_deadline_reached(
+          now.monotonic, detail::saturating_deadline_ms(message.queued_at_monotonic_ms,
+                                                        config_.signaling_message_ttl_ms));
+    });
+    if (queue->second.empty()) {
+      queue = messages_.erase(queue);
+    } else {
+      ++queue;
+    }
+  }
+  for (auto message = latest_control_messages_.begin();
+       message != latest_control_messages_.end();) {
+    if (!detail::monotonic_deadline_reached(
+            now.monotonic, detail::saturating_deadline_ms(message->second.queued_at_monotonic_ms,
+                                                          config_.native_control_message_ttl_ms))) {
+      ++message;
+      continue;
+    }
+    if (native_control_trace_) {
+      const auto& expired = message->second;
+      native_control_trace_->enqueue({
+          {"stage", "mailbox_expired"},
+          {"trace_session_id", expired.metadata.session_id},
+          {"vehicle_id", expired.metadata.vehicle_id},
+          {"driver_id", expired.metadata.driver_id},
+          {"seq", expired.metadata.seq},
+          {"intent_seq", expired.payload.value("intent_seq", std::uint64_t{0})},
+          {"command_sent_at_utc_ms", expired.metadata.sent_at_utc_ms},
+          {"cloud_queued_at_utc_ms", expired.queued_at_utc_ms},
+          {"cloud_queued_monotonic_ms", expired.queued_at_monotonic_ms},
+          {"cloud_expired_at_utc_ms", now.utc.value},
+          {"cloud_expired_monotonic_ms", now.monotonic.value},
+          {"cloud_mailbox_age_ms",
+           std::max<std::int64_t>(0, now.monotonic.value - expired.queued_at_monotonic_ms)},
+          {"delivery_cursor", expired.delivery_cursor},
+      });
+    }
+    message = latest_control_messages_.erase(message);
   }
 }
 
@@ -2166,7 +2503,8 @@ void SignalingService::transition_session(Session& session, SessionState next, s
 void SignalingService::close_session(Session& session, std::string_view reason) {
   if (session.state == SessionState::Closed) return;
   session.control_token.clear();
-  session.control_token_expires_at_ms = 0;
+  session.control_token_expires_at_utc_ms = 0;
+  session.control_token_expires_at_monotonic_ms = 0;
   messages_.erase(message_key(session.session_id, session.driver_id));
   messages_.erase(message_key(session.session_id, session.vehicle_id));
   latest_control_messages_.erase(message_key(session.session_id, session.driver_id));
@@ -2180,35 +2518,117 @@ void SignalingService::close_session(Session& session, std::string_view reason) 
   transition_session(session, SessionState::Closed, reason);
 }
 
-void SignalingService::enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms) {
-  const bool known_driver = config_.driver_passwords.contains(std::string(driver_id));
-  const std::string bucket = known_driver ? "driver:" + std::string(driver_id) : "unknown";
-  const auto found = login_failures_.find(bucket);
-  if (found == login_failures_.end()) return;
+bool SignalingService::configured_driver(std::string_view driver_id) const {
+  const auto id = std::string(driver_id);
+  return config_.driver_passwords.contains(id) || config_.driver_password_verifiers.contains(id);
+}
 
-  auto& state = found->second;
-  if (state.blocked_until_ms > timestamp_ms) {
-    throw TooManyRequests("too many login attempts", state.blocked_until_ms - timestamp_ms);
+bool SignalingService::try_acquire_password_verification_slot() {
+  std::lock_guard lock(password_verification_mutex_);
+  if (active_password_verifications_ >= config_.password_verification_max_concurrency) {
+    return false;
   }
-  if (state.blocked_until_ms > 0 || timestamp_ms - state.window_started_at_ms >= config_.login_failure_window_ms) {
+  ++active_password_verifications_;
+  return true;
+}
+
+void SignalingService::release_password_verification_slot() noexcept {
+  std::lock_guard lock(password_verification_mutex_);
+  if (active_password_verifications_ > 0)
+    --active_password_verifications_;
+}
+
+SignalingService::LoginFailureReservation SignalingService::reserve_login_failure_locked(
+    std::string_view driver_id, ClockSample admitted_at) {
+  const bool known_driver = configured_driver(driver_id);
+  const std::string bucket = known_driver ? "driver:" + std::string(driver_id) : "unknown";
+  auto& state = login_failures_[bucket];
+  if (state.blocked_until_monotonic_ms.has_value() &&
+      !detail::monotonic_deadline_reached(admitted_at.monotonic,
+                                          *state.blocked_until_monotonic_ms)) {
+    throw TooManyRequests(
+        "too many login attempts",
+        std::max<std::int64_t>(1, *state.blocked_until_monotonic_ms - admitted_at.monotonic.value));
+  }
+
+  const bool window_expired = state.window_started_at_monotonic_ms.has_value() &&
+                              detail::monotonic_deadline_reached(
+                                  admitted_at.monotonic, detail::saturating_deadline_ms(
+                                                             *state.window_started_at_monotonic_ms,
+                                                             config_.login_failure_window_ms));
+  if (state.pending_failures == 0 &&
+      (state.blocked_until_monotonic_ms.has_value() || window_expired)) {
+    state = LoginFailureState{.failures = 0,
+                              .pending_failures = 0,
+                              .window_started_at_monotonic_ms = admitted_at.monotonic.value,
+                              .blocked_until_utc_ms = std::nullopt,
+                              .blocked_until_monotonic_ms = std::nullopt};
+  } else if (state.blocked_until_monotonic_ms.has_value()) {
+    // This can only occur when an already-expired lockout still has an
+    // in-flight candidate. Keep that candidate in its admission window rather
+    // than resetting its state based on a later KDF completion.
+    state.blocked_until_utc_ms.reset();
+    state.blocked_until_monotonic_ms.reset();
+  }
+  if (!state.window_started_at_monotonic_ms.has_value()) {
+    state.window_started_at_monotonic_ms = admitted_at.monotonic.value;
+  }
+  if (state.failures >= config_.login_max_failures ||
+      state.pending_failures >= config_.login_max_failures - state.failures) {
+    throw TooManyRequests("too many login attempts", config_.login_lockout_ms);
+  }
+
+  ++state.pending_failures;
+  return LoginFailureReservation{bucket, admitted_at.utc.value, admitted_at.monotonic.value};
+}
+
+void SignalingService::release_login_failure_reservation_locked(
+    const LoginFailureReservation& reservation) {
+  const auto found = login_failures_.find(reservation.bucket);
+  if (found == login_failures_.end())
+    return;
+  auto& state = found->second;
+  if (state.pending_failures <= 0)
+    return;
+  --state.pending_failures;
+  if (state.pending_failures == 0 && state.failures == 0 &&
+      !state.blocked_until_monotonic_ms.has_value()) {
     login_failures_.erase(found);
   }
 }
 
-void SignalingService::record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms) {
-  const bool known_driver = config_.driver_passwords.contains(std::string(driver_id));
-  const std::string bucket = known_driver ? "driver:" + std::string(driver_id) : "unknown";
-  auto& state = login_failures_[bucket];
-  if (state.window_started_at_ms == 0 ||
-      timestamp_ms - state.window_started_at_ms >= config_.login_failure_window_ms) {
-    state = LoginFailureState{0, timestamp_ms, 0};
+void SignalingService::record_login_failure_locked(std::string_view driver_id,
+                                                   const LoginFailureReservation& reservation,
+                                                   ClockSample settled_at) {
+  const bool known_driver = configured_driver(driver_id);
+  auto found = login_failures_.find(reservation.bucket);
+  if (found == login_failures_.end()) {
+    found = login_failures_
+                .emplace(reservation.bucket,
+                         LoginFailureState{
+                             .failures = 0,
+                             .pending_failures = 1,
+                             .window_started_at_monotonic_ms = reservation.admitted_at_monotonic_ms,
+                             .blocked_until_utc_ms = std::nullopt,
+                             .blocked_until_monotonic_ms = std::nullopt})
+                .first;
+  }
+  auto& state = found->second;
+  if (state.pending_failures <= 0) {
+    state.pending_failures = 1;
+    state.window_started_at_monotonic_ms = reservation.admitted_at_monotonic_ms;
+  }
+  --state.pending_failures;
+  if (!state.window_started_at_monotonic_ms.has_value()) {
+    state.window_started_at_monotonic_ms = reservation.admitted_at_monotonic_ms;
   }
   ++state.failures;
   const bool lock_login = state.failures >= config_.login_max_failures;
   if (lock_login) {
-    state.blocked_until_ms = config_.login_lockout_ms > std::numeric_limits<std::int64_t>::max() - timestamp_ms
-        ? std::numeric_limits<std::int64_t>::max()
-        : timestamp_ms + config_.login_lockout_ms;
+    state.blocked_until_utc_ms =
+        detail::saturating_deadline_ms(settled_at.utc.value, config_.login_lockout_ms);
+    state.blocked_until_monotonic_ms =
+        detail::saturating_deadline_ms(settled_at.monotonic.value, config_.login_lockout_ms);
   }
   const Json identity = known_driver
       ? Json{{"driver_id", std::string(driver_id)}, {"recognized_driver", true}}
@@ -2221,13 +2641,22 @@ void SignalingService::record_login_failure(std::string_view driver_id, std::int
 
   auto limited_details = identity;
   limited_details["failure_count"] = state.failures;
-  limited_details["blocked_until_utc_ms"] = state.blocked_until_ms;
+  limited_details["blocked_until_utc_ms"] = state.blocked_until_utc_ms.value_or(0);
   audit("driver_login_rate_limited", limited_details);
   throw TooManyRequests("too many login attempts", config_.login_lockout_ms);
 }
 
-void SignalingService::clear_login_failures(std::string_view driver_id) {
-  login_failures_.erase("driver:" + std::string(driver_id));
+void SignalingService::clear_login_failures_locked(std::string_view driver_id) {
+  const auto found = login_failures_.find("driver:" + std::string(driver_id));
+  if (found == login_failures_.end())
+    return;
+  if (found->second.pending_failures == 0) {
+    login_failures_.erase(found);
+    return;
+  }
+  found->second.failures = 0;
+  found->second.blocked_until_utc_ms.reset();
+  found->second.blocked_until_monotonic_ms.reset();
 }
 
 std::string SignalingService::request_source(const HttpRequest& request) const {
@@ -2244,20 +2673,24 @@ std::string SignalingService::request_source(const HttpRequest& request) const {
   return canonical_ip_address(candidate).value_or(peer);
 }
 
-void SignalingService::cleanup_api_rate_limits(std::int64_t timestamp_ms) {
+void SignalingService::cleanup_api_rate_limits(MonotonicMillis now) {
   const auto expired = [&](const ApiRateState& state) {
-    return state.window_started_at_ms == 0 || timestamp_ms < state.window_started_at_ms ||
-        timestamp_ms - state.window_started_at_ms >= config_.api_rate_limit_window_ms;
+    return !state.window_started_at_monotonic_ms.has_value() ||
+           detail::monotonic_deadline_reached(
+               now, detail::saturating_deadline_ms(*state.window_started_at_monotonic_ms,
+                                                   config_.api_rate_limit_window_ms));
   };
   std::erase_if(api_rate_limits_, [&](const auto& item) { return expired(item.second); });
   if (expired(api_rate_limit_overflow_)) api_rate_limit_overflow_ = {};
-  api_rate_limit_last_cleanup_ms_ = timestamp_ms;
+  api_rate_limit_last_cleanup_monotonic_ms_ = now.value;
 }
 
-void SignalingService::enforce_api_rate_limit(const HttpRequest& request, std::int64_t timestamp_ms) {
-  if (api_rate_limit_last_cleanup_ms_ == 0 || timestamp_ms < api_rate_limit_last_cleanup_ms_ ||
-      timestamp_ms - api_rate_limit_last_cleanup_ms_ >= config_.api_rate_limit_window_ms) {
-    cleanup_api_rate_limits(timestamp_ms);
+void SignalingService::enforce_api_rate_limit(const HttpRequest& request, MonotonicMillis now) {
+  if (!api_rate_limit_last_cleanup_monotonic_ms_.has_value() ||
+      detail::monotonic_deadline_reached(
+          now, detail::saturating_deadline_ms(*api_rate_limit_last_cleanup_monotonic_ms_,
+                                              config_.api_rate_limit_window_ms))) {
+    cleanup_api_rate_limits(now);
   }
 
   const auto source = request_source(request);
@@ -2273,15 +2706,18 @@ void SignalingService::enforce_api_rate_limit(const HttpRequest& request, std::i
     state = &api_rate_limits_.try_emplace(source).first->second;
   }
 
-  if (state->window_started_at_ms == 0 || timestamp_ms < state->window_started_at_ms ||
-      timestamp_ms - state->window_started_at_ms >= config_.api_rate_limit_window_ms) {
-    *state = ApiRateState{0, timestamp_ms, false};
+  if (!state->window_started_at_monotonic_ms.has_value() ||
+      detail::monotonic_deadline_reached(
+          now, detail::saturating_deadline_ms(*state->window_started_at_monotonic_ms,
+                                              config_.api_rate_limit_window_ms))) {
+    *state = ApiRateState{0, now.value, false};
   }
   if (state->requests < std::numeric_limits<std::int64_t>::max()) ++state->requests;
   if (state->requests <= config_.api_rate_limit_requests) return;
 
   if (api_rate_limited_requests_ < std::numeric_limits<std::uint64_t>::max()) ++api_rate_limited_requests_;
-  const auto elapsed = std::max<std::int64_t>(0, timestamp_ms - state->window_started_at_ms);
+  const auto elapsed =
+      std::max<std::int64_t>(0, now.value - *state->window_started_at_monotonic_ms);
   const auto retry_after_ms = std::max<std::int64_t>(1, config_.api_rate_limit_window_ms - elapsed);
   if (!state->limit_audited) {
     state->limit_audited = true;
@@ -2295,67 +2731,92 @@ void SignalingService::enforce_api_rate_limit(const HttpRequest& request, std::i
   throw TooManyRequests("API request rate limit exceeded", retry_after_ms);
 }
 
-void SignalingService::audit(std::string_view event, const Json& details) const {
-  if (config_.audit_log_path.empty()) return;
-  const auto timestamp_ms = audit_clock_ ? audit_clock_() : now_ms();
-  const auto max_bytes = static_cast<std::uint64_t>(config_.audit_log_max_bytes);
-  Json record = {
-      {"event", event},
-      {"sent_at_utc_ms", timestamp_ms},
-      {"service_instance_id", service_instance_id_},
-      {"details", sanitize_log_value(details)}};
-  if (!active_request_id.empty()) record["request_id"] = active_request_id;
-  const auto line = record.dump();
-  if (static_cast<std::uint64_t>(line.size()) >= max_bytes) {
-    throw std::runtime_error("signaling audit record exceeds configured maximum size");
+bool SignalingService::audit(std::string_view event, const Json& details) const noexcept {
+  if (config_.audit_log_path.empty())
+    return true;
+  try {
+    const auto timestamp_ms = audit_clock_ ? audit_clock_() : clock_sample().utc.value;
+    const auto max_bytes = static_cast<std::uint64_t>(config_.audit_log_max_bytes);
+    Json record = {{"event", event},
+                   {"sent_at_utc_ms", timestamp_ms},
+                   {"service_instance_id", service_instance_id_},
+                   {"details", sanitize_log_value(details)}};
+    if (!active_request_id.empty())
+      record["request_id"] = active_request_id;
+    const auto line = record.dump();
+    if (static_cast<std::uint64_t>(line.size()) >= max_bytes) {
+      throw std::runtime_error("signaling audit record exceeds configured maximum size");
+    }
+    std::lock_guard log_lock(audit_log_mutex_);
+    const auto current_period =
+        log_period_start(timestamp_ms, config_.audit_log_rotation_interval_ms);
+    if (audit_log_period_start_ms_ < 0) {
+      audit_log_period_start_ms_ = existing_log_period(
+          config_.audit_log_path, config_.audit_log_rotation_interval_ms, current_period);
+    }
+    if (audit_log_period_start_ms_ != current_period) {
+      archive_jsonl_period(config_.audit_log_path, audit_log_period_start_ms_,
+                           static_cast<int>(config_.audit_log_files));
+      audit_log_period_start_ms_ = current_period;
+    }
+    if (audit_log_last_retention_period_ms_ != current_period) {
+      prune_jsonl_periods(config_.audit_log_path, current_period, config_.audit_log_retention_days);
+      audit_log_last_retention_period_ms_ = current_period;
+    }
+    rotate_jsonl_log(config_.audit_log_path, max_bytes, static_cast<int>(config_.audit_log_files),
+                     line.size() + 1);
+    std::ofstream output(config_.audit_log_path, std::ios::app);
+    if (!output)
+      throw std::runtime_error("cannot append signaling audit log");
+    output << line << '\n';
+    output.flush();
+    if (!output)
+      throw std::runtime_error("cannot append signaling audit log");
+    audit_healthy_.store(true);
+    return true;
+  } catch (...) {
+    audit_healthy_.store(false);
+    audit_write_failures_.fetch_add(1);
+    try {
+      // Do not invoke the injected sampler again here: this noexcept recovery
+      // path must remain non-terminating when the sampler itself is faulty.
+      const auto now = process_monotonic_now_ms();
+      bool report = false;
+      {
+        std::lock_guard fallback_lock(audit_fallback_mutex_);
+        if (!audit_last_fallback_report_has_monotonic_ ||
+            detail::monotonic_deadline_reached(
+                now, detail::saturating_deadline_ms(audit_last_fallback_report_monotonic_ms_,
+                                                    60 * 1000))) {
+          audit_last_fallback_report_monotonic_ms_ = now.value;
+          audit_last_fallback_report_has_monotonic_ = true;
+          report = true;
+        }
+      }
+      if (report) {
+        std::cerr
+            << "mine-teleop-signaling: audit log unavailable; new control sessions are disabled\n";
+      }
+    } catch (...) {
+      // Keep the audit failure path noexcept even if a diagnostic sink fails.
+    }
+    return false;
   }
-  std::lock_guard log_lock(audit_log_mutex_);
-  const auto current_period =
-      log_period_start(timestamp_ms, config_.audit_log_rotation_interval_ms);
-  if (audit_log_period_start_ms_ < 0) {
-    audit_log_period_start_ms_ = existing_log_period(
-        config_.audit_log_path,
-        config_.audit_log_rotation_interval_ms,
-        current_period);
-  }
-  if (audit_log_period_start_ms_ != current_period) {
-    archive_jsonl_period(
-        config_.audit_log_path,
-        audit_log_period_start_ms_,
-        static_cast<int>(config_.audit_log_files));
-    audit_log_period_start_ms_ = current_period;
-  }
-  if (audit_log_last_retention_period_ms_ != current_period) {
-    prune_jsonl_periods(
-        config_.audit_log_path,
-        current_period,
-        config_.audit_log_retention_days);
-    audit_log_last_retention_period_ms_ = current_period;
-  }
-  rotate_jsonl_log(
-      config_.audit_log_path,
-      max_bytes,
-      static_cast<int>(config_.audit_log_files),
-      line.size() + 1);
-  std::ofstream output(config_.audit_log_path, std::ios::app);
-  if (!output) throw std::runtime_error("cannot append signaling audit log");
-  output << line << '\n';
-  output.flush();
-  if (!output) throw std::runtime_error("cannot append signaling audit log");
 }
 
 ServerResponse SignalingService::handle(const HttpRequest& request) {
   RequestIdScope request_id("request-" + random_token(12));
   ServerResponse response;
   try {
+    const auto now = clock_sample();
     {
       std::lock_guard lock(mutex_);
-      enforce_api_rate_limit(request, now_ms());
+      enforce_api_rate_limit(request, now.monotonic);
     }
     if (request.method == "GET") {
-      response = handle_get(request);
+      response = handle_get(request, now);
     } else if (request.method == "POST") {
-      response = handle_post(request);
+      response = handle_post(request, now);
     } else {
       response = ServerResponse::json(405, {{"error", "method not allowed"}});
     }
@@ -2363,6 +2824,9 @@ ServerResponse SignalingService::handle(const HttpRequest& request) {
     response = ServerResponse::json(401, {{"error", error.what()}});
   } catch (const TooManyRequests& error) {
     response = too_many_requests_response(error);
+  } catch (const ServiceUnavailable& error) {
+    response = ServerResponse::json(
+        503, {{"error", error.what()}, {"issue_code", "audit_log_unavailable"}});
   } catch (const NotFound& error) {
     response = ServerResponse::json(404, {{"error", error.what()}});
   } catch (const Conflict& error) {
@@ -2398,8 +2862,9 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
     return true;
   };
   try {
+    const auto now = clock_sample();
     std::lock_guard lock(mutex_);
-    enforce_api_rate_limit(request, now_ms());
+    enforce_api_rate_limit(request, now.monotonic);
   } catch (const TooManyRequests& error) {
     try {
       auto response = too_many_requests_response(error);
@@ -2431,10 +2896,11 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       {"device_token", credential_value(request, "device_token", "x-mine-teleop-device-token")},
       {"connection_generation", query_value(request, "connection_generation")}};
   auto authenticate = [&] {
+    const auto now = clock_sample();
     std::lock_guard lock(mutex_);
-    cleanup_expired_connections(now_ms());
+    cleanup_expired_connections(now);
     const auto& session = require_participant(parts[1], participant);
-    validate_actor_credential(session, participant, credentials);
+    validate_actor_credential(session, participant, credentials, now);
     if (send_only && participant != session.driver_id) {
       throw Unauthorized("send-only signaling is restricted to the session driver");
     }
@@ -2496,20 +2962,29 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
             accept + "\r\nX-Request-ID: " + request_id.value() + "\r\n\r\n");
     ServerWebSocketConnection connection(socket, config_.max_signaling_payload_bytes);
     std::uint64_t last_delivery_cursor_sent = 0;
-    auto last_delivery_sent_at = std::chrono::steady_clock::time_point{};
+    std::int64_t last_delivery_sent_at_monotonic_ms = 0;
     while (true) {
       Json pending = Json::array();
+      std::int64_t pending_control_queued_at_monotonic_ms = 0;
       try {
+        const auto now = clock_sample();
         std::lock_guard lock(mutex_);
-        cleanup_expired_connections(now_ms());
+        cleanup_expired_connections(now);
         const auto& session = require_participant(parts[1], participant);
-        validate_actor_credential(session, participant, credentials);
+        validate_actor_credential(session, participant, credentials, now);
         if (!send_only) {
           pending = take_signaling_messages(
-              parts[1],
-              participant,
+              parts[1], participant, now,
               control_receive_only ? std::string_view("control_command") : std::string_view{},
               false);
+          if (control_receive_only && !pending.empty()) {
+            const auto queued = latest_control_messages_.find(message_key(parts[1], participant));
+            if (queued != latest_control_messages_.end() &&
+                queued->second.delivery_cursor ==
+                    pending.back().value("delivery_cursor", std::uint64_t{0})) {
+              pending_control_queued_at_monotonic_ms = queued->second.queued_at_monotonic_ms;
+            }
+          }
         }
       } catch (const std::exception& error) {
         connection.send_json({{"error", error.what()}, {"event", "signaling_authority_lost"}});
@@ -2518,9 +2993,11 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       }
       if (!send_only && !pending.empty()) {
         const auto delivery_cursor = pending.back().value("delivery_cursor", std::uint64_t{0});
-        const auto timestamp = std::chrono::steady_clock::now();
+        const auto send_clock = clock_sample();
         if (delivery_cursor > last_delivery_cursor_sent ||
-            timestamp - last_delivery_sent_at >= std::chrono::milliseconds(500)) {
+            detail::monotonic_deadline_reached(
+                send_clock.monotonic,
+                detail::saturating_deadline_ms(last_delivery_sent_at_monotonic_ms, 500))) {
           Json delivery_trace;
           const bool trace_delivery = control_receive_only && native_control_trace_;
           if (trace_delivery) {
@@ -2535,12 +3012,15 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                 {"intent_seq", payload.value("intent_seq", std::uint64_t{0})},
                 {"command_sent_at_utc_ms", message.value("sent_at_utc_ms", std::int64_t{0})},
                 {"cloud_queued_at_utc_ms", message.value("queued_at_utc_ms", std::int64_t{0})},
+                {"cloud_mailbox_to_send_ms",
+                 std::max<std::int64_t>(
+                     0, send_clock.monotonic.value - pending_control_queued_at_monotonic_ms)},
                 {"delivery_cursor", delivery_cursor},
                 {"redelivery", delivery_cursor <= last_delivery_cursor_sent},
             };
           }
-          const auto send_started_at_utc_ms = now_ms();
-          const auto send_started_monotonic_ms = monotonic_now_ms();
+          const auto send_started_at_utc_ms = send_clock.utc.value;
+          const auto send_started_monotonic_ms = send_clock.monotonic.value;
           try {
             connection.send_json(
                 {{"event", "signaling_messages"},
@@ -2553,19 +3033,18 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                   send_started_at_utc_ms;
               delivery_trace["cloud_delivery_send_started_monotonic_ms"] =
                   send_started_monotonic_ms;
-              delivery_trace["cloud_delivery_send_failed_at_utc_ms"] = now_ms();
-              delivery_trace["cloud_delivery_send_failed_monotonic_ms"] =
-                  monotonic_now_ms();
+              const auto failed_at = clock_sample();
+              delivery_trace["cloud_delivery_send_failed_at_utc_ms"] = failed_at.utc.value;
+              delivery_trace["cloud_delivery_send_failed_monotonic_ms"] = failed_at.monotonic.value;
               delivery_trace["error"] = error.what();
               native_control_trace_->enqueue(std::move(delivery_trace));
             }
             throw;
           }
-          const auto send_completed_at_utc_ms = now_ms();
-          const auto send_completed_monotonic_ms = monotonic_now_ms();
+          const auto send_completed_at = clock_sample();
+          const auto send_completed_at_utc_ms = send_completed_at.utc.value;
+          const auto send_completed_monotonic_ms = send_completed_at.monotonic.value;
           if (trace_delivery) {
-            const auto queued_at_utc_ms =
-                delivery_trace.value("cloud_queued_at_utc_ms", std::int64_t{0});
             delivery_trace["cloud_delivery_send_started_at_utc_ms"] =
                 send_started_at_utc_ms;
             delivery_trace["cloud_delivery_send_started_monotonic_ms"] =
@@ -2574,9 +3053,6 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                 send_completed_at_utc_ms;
             delivery_trace["cloud_delivery_send_completed_monotonic_ms"] =
                 send_completed_monotonic_ms;
-            delivery_trace["cloud_mailbox_to_send_ms"] = queued_at_utc_ms > 0
-                ? std::max<std::int64_t>(0, send_started_at_utc_ms - queued_at_utc_ms)
-                : 0;
             delivery_trace["cloud_delivery_send_call_ms"] =
                 std::max<std::int64_t>(
                     0,
@@ -2584,7 +3060,7 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
             native_control_trace_->enqueue(std::move(delivery_trace));
           }
           last_delivery_cursor_sent = std::max(last_delivery_cursor_sent, delivery_cursor);
-          last_delivery_sent_at = timestamp;
+          last_delivery_sent_at_monotonic_ms = send_clock.monotonic.value;
         }
       }
 
@@ -2600,6 +3076,45 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       if (received.status == WebSocketReceiveStatus::Timeout) continue;
       if (received.status == WebSocketReceiveStatus::Closed) return true;
       try {
+        const auto serialized_bytes = received.message.dump().size();
+        const auto rate_now = clock_sample();
+        std::optional<std::int64_t> retry_after_ms;
+        {
+          std::lock_guard lock(mutex_);
+          cleanup_expired_connections(rate_now);
+          const auto& session = require_participant(parts[1], participant);
+          validate_actor_credential(session, participant, credentials, rate_now);
+          auto& rate = sessions_.at(parts[1]).websocket_rate_by_participant[participant];
+          if (!rate.window_started_at_monotonic_ms.has_value() ||
+              detail::monotonic_deadline_reached(
+                  rate_now.monotonic,
+                  detail::saturating_deadline_ms(*rate.window_started_at_monotonic_ms,
+                                                 config_.websocket_rate_limit_window_ms))) {
+            rate.window_started_at_monotonic_ms = rate_now.monotonic.value;
+            rate.messages = 0;
+            rate.bytes = 0;
+          }
+          const bool message_limit = rate.messages >= config_.websocket_rate_limit_messages;
+          const bool byte_limit =
+              serialized_bytes > config_.websocket_rate_limit_bytes -
+                                     std::min(rate.bytes, config_.websocket_rate_limit_bytes);
+          if (message_limit || byte_limit) {
+            const auto elapsed_ms = std::max<std::int64_t>(
+                0, rate_now.monotonic.value - *rate.window_started_at_monotonic_ms);
+            retry_after_ms =
+                std::max<std::int64_t>(1, config_.websocket_rate_limit_window_ms - elapsed_ms);
+          } else {
+            ++rate.messages;
+            rate.bytes += serialized_bytes;
+          }
+        }
+        if (retry_after_ms) {
+          connection.send_json({{"event", "signaling_rate_limited"},
+                                {"error", "websocket participant rate limit exceeded"},
+                                {"retry_after_ms", retry_after_ms.value()}});
+          connection.send_close(1008, "signaling rate limit exceeded");
+          return true;
+        }
         if (!send_only && received.message.value("event", "") == "signaling_delivery_ack") {
           const auto delivery_cursor = required_uint64(received.message, "delivery_cursor");
           const auto reported_trace_session_id =
@@ -2616,15 +3131,16 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
           if (delivery_cursor > last_delivery_cursor_sent) {
             throw std::invalid_argument("delivery acknowledgement exceeds the last delivered cursor");
           }
-          const auto ack_received_at_utc_ms = now_ms();
-          const auto ack_received_monotonic_ms = monotonic_now_ms();
+          const auto ack_received_at = clock_sample();
+          const auto ack_received_at_utc_ms = ack_received_at.utc.value;
+          const auto ack_received_monotonic_ms = ack_received_at.monotonic.value;
           std::size_t acknowledged = 0;
           Json acknowledgement_trace;
           {
             std::lock_guard lock(mutex_);
-            cleanup_expired_connections(now_ms());
+            cleanup_expired_connections(ack_received_at);
             const auto& session = require_participant(parts[1], participant);
-            validate_actor_credential(session, participant, credentials);
+            validate_actor_credential(session, participant, credentials, ack_received_at);
             if (control_receive_only && native_control_trace_) {
               acknowledgement_trace = {
                   {"stage", "delivery_ack_received"},
@@ -2650,10 +3166,8 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                     queued->second.metadata.sent_at_utc_ms;
                 acknowledgement_trace["cloud_queued_at_utc_ms"] =
                     queued->second.queued_at_utc_ms;
-                acknowledgement_trace["cloud_queue_to_vehicle_ack_ms"] =
-                    std::max<std::int64_t>(
-                        0,
-                        ack_received_at_utc_ms - queued->second.queued_at_utc_ms);
+                acknowledgement_trace["cloud_queue_to_vehicle_ack_ms"] = std::max<std::int64_t>(
+                    0, ack_received_monotonic_ms - queued->second.queued_at_monotonic_ms);
               }
             }
             acknowledged = acknowledge_signaling_messages(
@@ -2678,17 +3192,23 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
         }
         Json acknowledgement;
         {
+          const auto received_at = clock_sample();
           std::lock_guard lock(mutex_);
-          cleanup_expired_connections(now_ms());
+          cleanup_expired_connections(received_at);
           const auto& session = require_participant(parts[1], participant);
-          validate_actor_credential(session, participant, credentials);
+          validate_actor_credential(session, participant, credentials, received_at);
           if (send_only && received.message.value("type", "") != "control_command") {
             throw std::invalid_argument(
                 "send-only control WebSocket accepts control_command messages only");
           }
-          acknowledgement = enqueue_signaling_message(parts[1], received.message, participant);
+          acknowledgement =
+              enqueue_signaling_message(parts[1], received.message, received_at, participant);
         }
         connection.send_json(acknowledgement);
+      } catch (const TooManyRequests& error) {
+        connection.send_json({{"error", error.what()},
+                              {"event", "signaling_backpressure"},
+                              {"retry_after_ms", error.retry_after_ms()}});
       } catch (const std::exception& error) {
         connection.send_json({{"error", error.what()}, {"event", "signaling_message_rejected"}});
       }
@@ -2698,12 +3218,11 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
   }
 }
 
-Json SignalingService::take_signaling_messages(
-    std::string_view session_id,
-    std::string_view recipient,
-    std::string_view requested_types,
-    bool consume) {
+Json SignalingService::take_signaling_messages(std::string_view session_id,
+                                               std::string_view recipient, ClockSample now,
+                                               std::string_view requested_types, bool consume) {
   Json values = Json::array();
+  prune_expired_signaling_messages(now);
   std::vector<std::string> types;
   std::size_t start = 0;
   while (start <= requested_types.size()) {
@@ -2720,52 +3239,13 @@ Json SignalingService::take_signaling_messages(
         std::find(types.begin(), types.end(), type) != types.end();
   };
   const auto recipient_key = message_key(session_id, recipient);
-  const auto timestamp_monotonic_ms = monotonic_now_ms();
-
   auto latest_control = latest_control_messages_.find(recipient_key);
-  if (latest_control != latest_control_messages_.end() &&
-      timestamp_monotonic_ms - latest_control->second.queued_at_monotonic_ms >=
-          config_.native_control_message_ttl_ms) {
-    if (native_control_trace_) {
-      const auto& expired = latest_control->second;
-      native_control_trace_->enqueue({
-          {"stage", "mailbox_expired"},
-          {"trace_session_id", expired.metadata.session_id},
-          {"vehicle_id", expired.metadata.vehicle_id},
-          {"driver_id", expired.metadata.driver_id},
-          {"seq", expired.metadata.seq},
-          {"intent_seq", expired.payload.value("intent_seq", std::uint64_t{0})},
-          {"command_sent_at_utc_ms", expired.metadata.sent_at_utc_ms},
-          {"cloud_queued_at_utc_ms", expired.queued_at_utc_ms},
-          {"cloud_queued_monotonic_ms", expired.queued_at_monotonic_ms},
-          {"cloud_expired_at_utc_ms", now_ms()},
-          {"cloud_expired_monotonic_ms", timestamp_monotonic_ms},
-          {"cloud_mailbox_age_ms", std::max<std::int64_t>(
-                                           0,
-                                           timestamp_monotonic_ms -
-                                               expired.queued_at_monotonic_ms)},
-          {"delivery_cursor", expired.delivery_cursor},
-      });
-    }
-    latest_control_messages_.erase(latest_control);
-    latest_control = latest_control_messages_.end();
-  }
   if (latest_control != latest_control_messages_.end() && requested("control_command")) {
     values.push_back(latest_control->second.to_json());
     if (consume) latest_control_messages_.erase(latest_control);
   }
 
   auto found = messages_.find(recipient_key);
-  if (found != messages_.end()) {
-    std::erase_if(found->second, [&](const auto& message) {
-      return timestamp_monotonic_ms - message.queued_at_monotonic_ms >=
-          config_.signaling_message_ttl_ms;
-    });
-    if (found->second.empty()) {
-      messages_.erase(found);
-      found = messages_.end();
-    }
-  }
   if (found != messages_.end()) {
     std::vector<Message> remaining;
     for (const auto& message : found->second) {
@@ -2818,11 +3298,10 @@ std::size_t SignalingService::acknowledge_signaling_messages(
 }
 
 Json SignalingService::enqueue_signaling_message(
-    std::string_view session_id,
-    const Json& value,
+    std::string_view session_id, const Json& value, ClockSample received_at,
     std::optional<std::string_view> authenticated_actor) {
-  const auto cloud_ingress_started_at_utc_ms = now_ms();
-  const auto cloud_ingress_started_monotonic_ms = monotonic_now_ms();
+  const auto cloud_ingress_started_at_utc_ms = received_at.utc.value;
+  const auto cloud_ingress_started_monotonic_ms = received_at.monotonic.value;
   const auto sender = required_string(value, "sender");
   const auto recipient = required_string(value, "recipient");
   const auto type = required_string(value, "type");
@@ -2838,7 +3317,7 @@ Json SignalingService::enqueue_signaling_message(
       throw Unauthorized("sender is not authenticated websocket participant");
     }
   } else {
-    validate_actor_credential(session, sender, value);
+    validate_actor_credential(session, sender, value, received_at);
   }
   const auto metadata = ProtocolMetadata::from_json(value);
   validate_message_metadata(session, metadata);
@@ -2861,7 +3340,8 @@ Json SignalingService::enqueue_signaling_message(
   }
   const auto payload = value.value("payload", Json::object());
   if (!payload.is_object()) throw std::invalid_argument("payload must be an object");
-  if (payload.dump().size() > config_.max_signaling_payload_bytes) {
+  const auto serialized_payload = payload.dump();
+  if (serialized_payload.size() > config_.max_signaling_payload_bytes) {
     throw std::invalid_argument("signaling payload exceeds configured limit");
   }
   if (type == "webrtc_offer" || type == "webrtc_answer") {
@@ -2894,13 +3374,14 @@ Json SignalingService::enqueue_signaling_message(
         command.sent_at_utc_ms != metadata.sent_at_utc_ms) {
       throw std::invalid_argument("control command payload metadata does not match signaling wrapper");
     }
-    if (command.control_token != session.control_token) {
+    if (!constant_time_equal(session.control_token, command.control_token)) {
       throw Unauthorized("control command token does not match active session");
     }
   }
   const auto sequence_key = message_key(session_id, sender) +
       (type == "control_command" ? ":native_control" : "");
-  const auto fingerprint = recipient + "\n" + type + "\n" + metadata.to_json().dump() + "\n" + payload.dump();
+  const auto fingerprint =
+      recipient + "\n" + type + "\n" + metadata.to_json().dump() + "\n" + serialized_payload;
   if (const auto accepted = last_accepted_messages_.find(sequence_key); accepted != last_accepted_messages_.end()) {
     if (metadata.seq < accepted->second.sequence) {
       throw Conflict(
@@ -2955,28 +3436,64 @@ Json SignalingService::enqueue_signaling_message(
       replaced_queued_at_utc_ms = previous->second.queued_at_utc_ms;
     }
   }
+  const auto queued_at = clock_sample();
+  const auto cloud_queued_at_utc_ms = queued_at.utc.value;
+  const auto cloud_queued_monotonic_ms = queued_at.monotonic.value;
+  prune_expired_signaling_messages(queued_at);
+  const auto serialized_bytes = value.dump().size();
+  std::size_t queue_bytes = 0;
+  if (type != "control_command") {
+    auto& queue = messages_[recipient_key];
+    for (const auto& message : queue) {
+      queue_bytes = message.serialized_bytes > std::numeric_limits<std::size_t>::max() - queue_bytes
+                        ? std::numeric_limits<std::size_t>::max()
+                        : queue_bytes + message.serialized_bytes;
+    }
+    const bool message_capacity_reached = queue.size() >= config_.max_signaling_queue_messages;
+    const bool byte_capacity_reached =
+        serialized_bytes > config_.max_signaling_queue_bytes -
+                               std::min(queue_bytes, config_.max_signaling_queue_bytes);
+    if (message_capacity_reached || byte_capacity_reached) {
+      const auto queued_messages = queue.size();
+      if (signaling_queue_rejections_ < std::numeric_limits<std::uint64_t>::max()) {
+        ++signaling_queue_rejections_;
+      }
+      audit("signaling_queue_backpressure", {{"session_id", session_id},
+                                             {"sender", sender},
+                                             {"recipient", recipient},
+                                             {"queued_messages", queued_messages},
+                                             {"queued_bytes", queue_bytes},
+                                             {"message_capacity_reached", message_capacity_reached},
+                                             {"byte_capacity_reached", byte_capacity_reached}});
+      if (queued_messages == 0)
+        messages_.erase(recipient_key);
+      throw TooManyRequests("signaling recipient queue capacity exceeded",
+                            config_.signaling_message_ttl_ms);
+    }
+  }
   const auto delivery_cursor = ++next_delivery_cursors_[recipient_key];
-  const auto cloud_queued_at_utc_ms = now_ms();
-  const auto cloud_queued_monotonic_ms = monotonic_now_ms();
-  const Message queued_message{
-      metadata,
-      sender,
-      recipient,
-      type,
-      payload,
-      cloud_queued_at_utc_ms,
-      cloud_queued_monotonic_ms,
-      delivery_cursor};
+  const Message queued_message{metadata,
+                               sender,
+                               recipient,
+                               type,
+                               payload,
+                               cloud_queued_at_utc_ms,
+                               cloud_queued_monotonic_ms,
+                               delivery_cursor,
+                               serialized_bytes};
   std::size_t queued = 1;
+  std::size_t queued_bytes = serialized_bytes;
   if (type == "control_command") {
     latest_control_messages_.insert_or_assign(recipient_key, queued_message);
   } else {
     auto& queue = messages_[recipient_key];
     queue.push_back(queued_message);
     queued = queue.size();
+    queued_bytes = queue_bytes + serialized_bytes;
   }
   Json acknowledgement = {
       {"queued", queued},
+      {"queued_bytes", queued_bytes},
       {"event", "signaling_ack"},
       {"type", type},
       {"seq", metadata.seq},
@@ -3034,10 +3551,10 @@ Json SignalingService::enqueue_signaling_message(
   return acknowledgement;
 }
 
-ServerResponse SignalingService::handle_get(const HttpRequest& request) {
+ServerResponse SignalingService::handle_get(const HttpRequest& request, ClockSample now) {
   if (request.path == "/health") return ServerResponse::json(200, health());
   if (request.path == "/time") {
-    const auto server_receive_ms = now_ms();
+    const auto server_receive_ms = now.utc.value;
     const auto encoded_client_send_ms = query_value(request, "client_send_ms");
     if (encoded_client_send_ms.empty()) throw std::invalid_argument("client_send_ms is required");
     std::size_t consumed = 0;
@@ -3050,21 +3567,18 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
     if (consumed != encoded_client_send_ms.size()) {
       throw std::invalid_argument("client_send_ms must be an integer");
     }
-    return ServerResponse::json(
-        200,
-        {{"time_domain", "signaling_server"},
-         {"client_send_ms", client_send_ms},
-         {"server_receive_ms", server_receive_ms},
-         {"server_send_ms", now_ms()}});
+    return ServerResponse::json(200, {{"time_domain", "signaling_server"},
+                                      {"client_send_ms", client_send_ms},
+                                      {"server_receive_ms", server_receive_ms},
+                                      {"server_send_ms", clock_sample().utc.value}});
   }
   const auto parts = path_parts(request.path);
   std::lock_guard lock(mutex_);
-  cleanup_expired_connections(now_ms());
+  cleanup_expired_connections(now);
   if (parts.size() == 3 && parts[0] == "drivers" && parts[2] == "vehicles") {
     const auto& driver_id = parts[1];
-    validate_driver_token(
-        driver_id,
-        credential_value(request, "token", "x-mine-teleop-driver-token"));
+    validate_driver_token(driver_id,
+                          credential_value(request, "token", "x-mine-teleop-driver-token"), now);
     const auto permission = config_.driver_vehicle_permissions.find(driver_id);
     Json vehicles = Json::array();
     if (permission != config_.driver_vehicle_permissions.end()) {
@@ -3098,37 +3612,39 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
     if (recipient.empty()) throw std::invalid_argument("recipient is required");
     const auto& session = require_participant(parts[1], recipient);
     if (recipient == session.driver_id) {
-      validate_driver_token(
-          recipient,
-          credential_value(request, "token", "x-mine-teleop-driver-token"));
+      validate_driver_token(recipient,
+                            credential_value(request, "token", "x-mine-teleop-driver-token"), now);
     } else {
       validate_vehicle_connection(
-          recipient,
-          credential_value(request, "device_token", "x-mine-teleop-device-token"),
-          required_uint64(Json{{"connection_generation", query_value(request, "connection_generation")}}, "connection_generation"));
+          recipient, credential_value(request, "device_token", "x-mine-teleop-device-token"),
+          required_uint64(
+              Json{{"connection_generation", query_value(request, "connection_generation")}},
+              "connection_generation"),
+          now);
     }
     return ServerResponse::json(
-        200,
-        {{"messages", take_signaling_messages(parts[1], recipient, query_value(request, "types"))}});
+        200, {{"messages",
+               take_signaling_messages(parts[1], recipient, now, query_value(request, "types"))}});
   }
   if (parts.size() == 3 && parts[0] == "vehicles" && parts[2] == "session") {
     const auto& vehicle_id = parts[1];
     validate_vehicle_connection(
-        vehicle_id,
-        credential_value(request, "device_token", "x-mine-teleop-device-token"),
-        required_uint64(Json{{"connection_generation", query_value(request, "connection_generation")}}, "connection_generation"));
+        vehicle_id, credential_value(request, "device_token", "x-mine-teleop-device-token"),
+        required_uint64(
+            Json{{"connection_generation", query_value(request, "connection_generation")}},
+            "connection_generation"),
+        now);
     for (const auto& [id, session] : sessions_) {
       static_cast<void>(id);
       if (session.vehicle_id == vehicle_id && session.state == SessionState::Active) {
         return ServerResponse::json(
-            200,
-            {{"vehicle_id", vehicle_id},
-             {"session_id", session.session_id},
-             {"driver_id", session.driver_id},
-             {"state", to_string(session.state)},
-             {"control_token", session.control_token},
-             {"control_token_expires_at_utc_ms", session.control_token_expires_at_ms},
-             {"connection_generation", online_vehicles_.at(vehicle_id).generation}});
+            200, {{"vehicle_id", vehicle_id},
+                  {"session_id", session.session_id},
+                  {"driver_id", session.driver_id},
+                  {"state", to_string(session.state)},
+                  {"control_token", session.control_token},
+                  {"control_token_expires_at_utc_ms", session.control_token_expires_at_utc_ms},
+                  {"connection_generation", online_vehicles_.at(vehicle_id).generation}});
       }
     }
     return ServerResponse::json(
@@ -3145,7 +3661,7 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
         {"token", credential_value(request, "token", "x-mine-teleop-driver-token")},
         {"device_token", credential_value(request, "device_token", "x-mine-teleop-device-token")},
         {"connection_generation", query_value(request, "connection_generation")}};
-    validate_actor_credential(session, actor, credentials);
+    validate_actor_credential(session, actor, credentials, now);
     return ServerResponse::json(200, session.to_json());
   }
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "ice_servers") {
@@ -3155,12 +3671,12 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
         {"token", credential_value(request, "token", "x-mine-teleop-driver-token")},
         {"device_token", credential_value(request, "device_token", "x-mine-teleop-device-token")},
         {"connection_generation", query_value(request, "connection_generation")}};
-    validate_actor_credential(session, actor, credentials);
+    validate_actor_credential(session, actor, credentials, now);
     Json servers = Json::array();
     if (!config_.stun_urls.empty()) servers.push_back({{"urls", config_.stun_urls}});
     std::int64_t expires_at_utc_ms = 0;
     if (!config_.turn_urls.empty()) {
-      const auto expires_at_seconds = now_ms() / 1000 + config_.turn_credential_ttl_seconds;
+      const auto expires_at_seconds = now.utc.value / 1000 + config_.turn_credential_ttl_seconds;
       const auto username = std::to_string(expires_at_seconds) + ":" + config_.turn_realm + ":" +
           session.session_id + ":" + std::string(actor);
       servers.push_back(
@@ -3188,17 +3704,127 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
   return ServerResponse::json(404, {{"error", "not found"}});
 }
 
-ServerResponse SignalingService::handle_post(const HttpRequest& request) {
-  const auto value = request.json_body();
+ServerResponse SignalingService::handle_driver_login(Json value, ClockSample admitted_at) {
+  const auto driver_id = required_string(value, "driver_id");
+  CleansedString password(optional_string(value, "password"));
+  if (const auto field = value.find("password"); field != value.end() && field->is_string()) {
+    cleanse_secret(field->get_ref<std::string&>());
+    value.erase(field);
+  }
+
+  LoginCredentialSnapshot credential;
+  std::optional<LoginFailureReservation> reservation;
+  {
+    std::lock_guard lock(mutex_);
+    cleanup_expired_connections(admitted_at);
+    if (const auto found = config_.driver_password_verifiers.find(driver_id);
+        found != config_.driver_password_verifiers.end()) {
+      credential.kind = LoginCredentialSnapshot::Kind::Argon2id;
+      credential.verifier = found->second;
+    } else if (config_.allow_legacy_passwords) {
+      if (const auto found = config_.driver_passwords.find(driver_id);
+          found != config_.driver_passwords.end()) {
+        credential.kind = LoginCredentialSnapshot::Kind::LegacyPlaintext;
+        credential.verifier = found->second;
+      }
+    }
+    reservation.emplace(reserve_login_failure_locked(driver_id, admitted_at));
+  }
+
+  const auto release_reservation = [&] {
+    if (!reservation)
+      return;
+    std::lock_guard lock(mutex_);
+    release_login_failure_reservation_locked(*reservation);
+    reservation.reset();
+  };
+
+  bool verification_slot_acquired = false;
+  try {
+    verification_slot_acquired = try_acquire_password_verification_slot();
+  } catch (...) {
+    release_reservation();
+    throw;
+  }
+  if (!verification_slot_acquired) {
+    release_reservation();
+    throw TooManyRequests("password verification capacity is temporarily exhausted",
+                          config_.password_verification_retry_after_ms);
+  }
+
+  bool verified = false;
+  try {
+    switch (credential.kind) {
+      case LoginCredentialSnapshot::Kind::Argon2id:
+        verified = verify_argon2id_password(credential.verifier, password.view(),
+                                            config_.authentication_cost_policy);
+        break;
+      case LoginCredentialSnapshot::Kind::LegacyPlaintext:
+        verified = constant_time_equal(credential.verifier, password.view());
+        break;
+      case LoginCredentialSnapshot::Kind::Unknown:
+        static_cast<void>(verify_argon2id_password(dummy_password_verifier_, password.view(),
+                                                   config_.authentication_cost_policy));
+        break;
+    }
+  } catch (...) {
+    release_password_verification_slot();
+    release_reservation();
+    throw;
+  }
+  release_password_verification_slot();
+
+  const auto settled_at = clock_sample();
+  std::lock_guard lock(mutex_);
+  cleanup_expired_connections(settled_at);
+  if (!verified || credential.kind == LoginCredentialSnapshot::Kind::Unknown) {
+    const auto failed_reservation = *reservation;
+    reservation.reset();
+    record_login_failure_locked(driver_id, failed_reservation, settled_at);
+    throw Unauthorized("invalid driver credentials");
+  }
+  release_login_failure_reservation_locked(*reservation);
+  reservation.reset();
+  clear_login_failures_locked(driver_id);
+  if (revoked_drivers_.contains(driver_id)) {
+    audit("driver_login_rejected", {{"driver_id", driver_id}, {"reason", "driver_revoked"}});
+    throw Unauthorized("driver is revoked");
+  }
+  if (online_drivers_.contains(driver_id)) {
+    audit("driver_login_rejected", {{"driver_id", driver_id}, {"reason", "driver_already_online"}});
+    throw Conflict("driver is already online");
+  }
+  const auto generation = ++connection_generation_;
+  const std::string token = "driver-token-" + random_token();
+  driver_tokens_[token] = DriverToken{
+      driver_id, detail::saturating_deadline_ms(settled_at.utc.value, config_.token_ttl_ms),
+      detail::saturating_deadline_ms(settled_at.monotonic.value, config_.token_ttl_ms), generation};
+  online_drivers_[driver_id] = ConnectionPresence{"", generation, settled_at.utc.value,
+                                                  settled_at.utc.value, settled_at.monotonic.value};
+  audit("driver_login", {{"driver_id", driver_id}, {"connection_generation", generation}});
+  return ServerResponse::json(200, {{"token_type", "bearer"},
+                                    {"token", token},
+                                    {"expires_at_ms", driver_tokens_.at(token).expires_at_utc_ms},
+                                    {"connection_generation", generation},
+                                    {"service_instance_id", service_instance_id_}});
+}
+
+ServerResponse SignalingService::handle_post(const HttpRequest& request, ClockSample now) {
+  auto value = request.json_body();
+  if (request.path == "/auth/driver_login")
+    return handle_driver_login(std::move(value), now);
   const auto parts = path_parts(request.path);
   std::lock_guard lock(mutex_);
-  cleanup_expired_connections(now_ms());
+  cleanup_expired_connections(now);
   if (request.path.starts_with("/admin/")) {
     if (config_.admin_token.empty()) throw Unauthorized("admin API is disabled");
-    if (optional_string(value, "admin_token") != config_.admin_token) throw Unauthorized("invalid admin token");
+    if (!constant_time_equal(config_.admin_token, optional_string(value, "admin_token"))) {
+      throw Unauthorized("invalid admin token");
+    }
     const auto object_id = required_string(value, "id");
     if (request.path == "/admin/revoke/driver") {
-      if (!config_.driver_passwords.contains(object_id)) throw NotFound("unknown driver");
+      if (!configured_driver(object_id))
+        throw NotFound("unknown driver");
       revoked_drivers_.insert(object_id);
       close_sessions_for_driver(object_id, "driver_revoked");
       online_drivers_.erase(object_id);
@@ -3213,7 +3839,8 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
       return ServerResponse::json(200, {{"driver_id", object_id}, {"state", "revoked"}});
     }
     if (request.path == "/admin/restore/driver") {
-      if (!config_.driver_passwords.contains(object_id)) throw NotFound("unknown driver");
+      if (!configured_driver(object_id))
+        throw NotFound("unknown driver");
       revoked_drivers_.erase(object_id);
       audit("driver_restored", {{"driver_id", object_id}});
       return ServerResponse::json(200, {{"driver_id", object_id}, {"state", "offline"}});
@@ -3234,53 +3861,19 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
     }
     return ServerResponse::json(404, {{"error", "not found"}});
   }
-  if (request.path == "/auth/driver_login") {
-    const auto driver_id = required_string(value, "driver_id");
-    const auto password = optional_string(value, "password");
-    const auto timestamp_ms = now_ms();
-    enforce_login_rate_limit(driver_id, timestamp_ms);
-    const auto found = config_.driver_passwords.find(driver_id);
-    if (found == config_.driver_passwords.end() || found->second != password) {
-      record_login_failure(driver_id, timestamp_ms);
-      throw Unauthorized("invalid driver credentials");
-    }
-    clear_login_failures(driver_id);
-    if (revoked_drivers_.contains(driver_id)) {
-      audit("driver_login_rejected", {{"driver_id", driver_id}, {"reason", "driver_revoked"}});
-      throw Unauthorized("driver is revoked");
-    }
-    if (online_drivers_.contains(driver_id)) {
-      audit("driver_login_rejected", {{"driver_id", driver_id}, {"reason", "driver_already_online"}});
-      throw Conflict("driver is already online");
-    }
-    const auto generation = ++connection_generation_;
-    const std::string token = "driver-token-" + random_token();
-    driver_tokens_[token] = DriverToken{driver_id, timestamp_ms + config_.token_ttl_ms, generation};
-    online_drivers_[driver_id] = ConnectionPresence{"", generation, timestamp_ms, timestamp_ms};
-    audit("driver_login", {{"driver_id", driver_id}, {"connection_generation", generation}});
-    return ServerResponse::json(
-        200,
-        {{"token_type", "bearer"},
-         {"token", token},
-         {"expires_at_ms", driver_tokens_.at(token).expires_at_ms},
-         {"connection_generation", generation},
-         {"service_instance_id", service_instance_id_}});
-  }
   if (request.path == "/auth/driver_heartbeat") {
     const auto driver_id = required_string(value, "driver_id");
-    validate_driver_token(driver_id, optional_string(value, "token"));
+    validate_driver_token(driver_id, optional_string(value, "token"), now);
     const auto& presence = online_drivers_.at(driver_id);
-    return ServerResponse::json(
-        200,
-        {{"driver_id", driver_id},
-         {"state", "online"},
-         {"connection_generation", presence.generation},
-         {"last_seen_at_utc_ms", presence.last_seen_at_ms}});
+    return ServerResponse::json(200, {{"driver_id", driver_id},
+                                      {"state", "online"},
+                                      {"connection_generation", presence.generation},
+                                      {"last_seen_at_utc_ms", presence.last_seen_at_utc_ms}});
   }
   if (request.path == "/auth/driver_logout") {
     const auto driver_id = required_string(value, "driver_id");
     const auto token = optional_string(value, "token");
-    validate_driver_token(driver_id, token);
+    validate_driver_token(driver_id, token, now);
     const auto generation = online_drivers_.at(driver_id).generation;
     close_sessions_for_driver(driver_id, "driver_logout");
     driver_tokens_.erase(token);
@@ -3296,10 +3889,10 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
     const auto vehicle_id = required_string(value, "vehicle_id");
     validate_device_token(vehicle_id, optional_string(value, "device_token"));
     const auto connection_id = required_string(value, "connection_id");
-    const auto timestamp_ms = now_ms();
     const auto current = online_vehicles_.find(vehicle_id);
     if (current != online_vehicles_.end() && current->second.connection_id == connection_id) {
-      current->second.last_seen_at_ms = timestamp_ms;
+      current->second.last_seen_at_utc_ms = now.utc.value;
+      current->second.last_seen_at_monotonic_ms = now.monotonic.value;
       return ServerResponse::json(
           200,
           {{"vehicle_id", vehicle_id},
@@ -3315,7 +3908,8 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
           {{"vehicle_id", vehicle_id}, {"previous_connection_generation", current->second.generation}});
     }
     const auto generation = ++connection_generation_;
-    online_vehicles_[vehicle_id] = ConnectionPresence{connection_id, generation, timestamp_ms, timestamp_ms};
+    online_vehicles_[vehicle_id] = ConnectionPresence{connection_id, generation, now.utc.value,
+                                                      now.utc.value, now.monotonic.value};
     audit("vehicle_online", {{"vehicle_id", vehicle_id}, {"connection_generation", generation}});
     return ServerResponse::json(
         200,
@@ -3327,18 +3921,19 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (request.path == "/vehicles/heartbeat") {
     const auto vehicle_id = required_string(value, "vehicle_id");
     const auto generation = required_uint64(value, "connection_generation");
-    validate_vehicle_connection(vehicle_id, optional_string(value, "device_token"), generation);
+    validate_vehicle_connection(vehicle_id, optional_string(value, "device_token"), generation,
+                                now);
     return ServerResponse::json(
-        200,
-        {{"vehicle_id", vehicle_id},
-         {"state", "online"},
-         {"connection_generation", generation},
-         {"last_seen_at_utc_ms", online_vehicles_.at(vehicle_id).last_seen_at_ms}});
+        200, {{"vehicle_id", vehicle_id},
+              {"state", "online"},
+              {"connection_generation", generation},
+              {"last_seen_at_utc_ms", online_vehicles_.at(vehicle_id).last_seen_at_utc_ms}});
   }
   if (request.path == "/vehicles/offline") {
     const auto vehicle_id = required_string(value, "vehicle_id");
     const auto generation = required_uint64(value, "connection_generation");
-    validate_vehicle_connection(vehicle_id, optional_string(value, "device_token"), generation);
+    validate_vehicle_connection(vehicle_id, optional_string(value, "device_token"), generation,
+                                now);
     online_vehicles_.erase(vehicle_id);
     close_sessions_for_vehicle(vehicle_id, "vehicle_offline");
     audit(
@@ -3351,7 +3946,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (request.path == "/sessions") {
     const auto driver_id = required_string(value, "driver_id");
     const auto vehicle_id = required_string(value, "vehicle_id");
-    validate_driver_token(driver_id, optional_string(value, "token"));
+    validate_driver_token(driver_id, optional_string(value, "token"), now);
     const auto permissions = config_.driver_vehicle_permissions.find(driver_id);
     if (permissions == config_.driver_vehicle_permissions.end() || !permissions->second.contains(vehicle_id)) {
       audit(
@@ -3372,16 +3967,24 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
         throw Conflict("control authority already granted");
       }
     }
+    if (!audit("control_authority_grant_preflight",
+               {{"vehicle_id", vehicle_id}, {"driver_id", driver_id}})) {
+      throw ServiceUnavailable("audit log unavailable; new control authority is disabled");
+    }
     ++session_counter_;
     std::ostringstream id;
     id << "session-" << std::setw(6) << std::setfill('0') << session_counter_;
-    Session session{
-        .session_id = id.str(),
-        .vehicle_id = vehicle_id,
-        .driver_id = driver_id,
-        .state = SessionState::Online,
-        .control_token = "control-token-" + random_token(),
-        .control_token_expires_at_ms = now_ms() + config_.control_token_ttl_ms};
+    Session session{.session_id = id.str(),
+                    .vehicle_id = vehicle_id,
+                    .driver_id = driver_id,
+                    .state = SessionState::Online,
+                    .control_token = "control-token-" + random_token(),
+                    .control_token_expires_at_utc_ms =
+                        detail::saturating_deadline_ms(now.utc.value, config_.control_token_ttl_ms),
+                    .control_token_expires_at_monotonic_ms = detail::saturating_deadline_ms(
+                        now.monotonic.value, config_.control_token_ttl_ms),
+                    .last_relay_usage_by_actor = {},
+                    .websocket_rate_by_participant = {}};
     sessions_[session.session_id] = session;
     auto& stored = sessions_.at(session.session_id);
     audit(
@@ -3390,35 +3993,36 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
     transition_session(stored, SessionState::Reserved, "control_requested");
     transition_session(stored, SessionState::Connecting, "participants_authenticated");
     transition_session(stored, SessionState::Active, "control_authority_granted");
-    audit(
-        "control_authority_granted",
-        {{"session_id", stored.session_id}, {"vehicle_id", stored.vehicle_id}, {"driver_id", stored.driver_id}});
+    if (!audit("control_authority_granted", {{"session_id", stored.session_id},
+                                             {"vehicle_id", stored.vehicle_id},
+                                             {"driver_id", stored.driver_id}})) {
+      close_session(stored, "audit_log_unavailable");
+      throw ServiceUnavailable("audit log unavailable; control authority was not granted");
+    }
     return ServerResponse::json(200, stored.to_json(true));
   }
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "renew") {
     const auto actor = required_string(value, "actor");
     auto& session = const_cast<Session&>(require_participant(parts[1], actor));
     if (actor != session.driver_id) throw Unauthorized("only the current driver can renew control authority");
-    validate_actor_credential(session, actor, value);
-    const auto renewed_at_ms = now_ms();
-    const auto previous_expiry_ms = session.control_token_expires_at_ms;
-    session.control_token_expires_at_ms =
-        config_.control_token_ttl_ms > std::numeric_limits<std::int64_t>::max() - renewed_at_ms
-        ? std::numeric_limits<std::int64_t>::max()
-        : renewed_at_ms + config_.control_token_ttl_ms;
-    audit(
-        "control_authority_renewed",
-        {{"session_id", session.session_id},
-         {"vehicle_id", session.vehicle_id},
-         {"driver_id", session.driver_id},
-         {"previous_expires_at_utc_ms", previous_expiry_ms},
-         {"expires_at_utc_ms", session.control_token_expires_at_ms}});
+    validate_actor_credential(session, actor, value, now);
+    const auto previous_expiry_utc_ms = session.control_token_expires_at_utc_ms;
+    session.control_token_expires_at_utc_ms =
+        detail::saturating_deadline_ms(now.utc.value, config_.control_token_ttl_ms);
+    session.control_token_expires_at_monotonic_ms =
+        detail::saturating_deadline_ms(now.monotonic.value, config_.control_token_ttl_ms);
+    audit("control_authority_renewed",
+          {{"session_id", session.session_id},
+           {"vehicle_id", session.vehicle_id},
+           {"driver_id", session.driver_id},
+           {"previous_expires_at_utc_ms", previous_expiry_utc_ms},
+           {"expires_at_utc_ms", session.control_token_expires_at_utc_ms}});
     return ServerResponse::json(200, session.to_json(true));
   }
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "end") {
     const auto actor = required_string(value, "actor");
     auto& session = const_cast<Session&>(require_participant(parts[1], actor));
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     close_session(session, optional_string(value, "reason").empty() ? "session_end" : optional_string(value, "reason"));
     audit("session_ended", session.to_json());
     return ServerResponse::json(200, session.to_json());
@@ -3426,7 +4030,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 4 && parts[0] == "sessions" && parts[2] == "control_authority" && parts[3] == "revoke") {
     const auto actor = required_string(value, "actor");
     auto& session = const_cast<Session&>(require_participant(parts[1], actor));
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     close_session(
         session,
         optional_string(value, "reason").empty() ? "control_authority_revoked" : optional_string(value, "reason"));
@@ -3436,7 +4040,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "webrtc_connection") {
     const auto actor = required_string(value, "actor");
     const auto& session = require_participant(parts[1], actor);
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     const auto connection_state = required_string(value, "connection_state");
     const auto connection_method = required_string(value, "connection_method");
     static const std::unordered_set<std::string> allowed_states{
@@ -3483,7 +4087,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "abnormal_disconnect") {
     const auto actor = required_string(value, "actor");
     const auto& session = require_participant(parts[1], actor);
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     const auto reason = required_string(value, "reason");
     const auto detected_by = required_string(value, "detected_by");
     audit(
@@ -3499,7 +4103,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "diagnostics") {
     const auto actor = required_string(value, "actor");
     const auto& session = require_participant(parts[1], actor);
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     const auto component = required_string(value, "component");
     const auto rtt_ms = required_nonnegative_uint64(value, "rtt_ms");
     const auto packet_loss_percent = required_nonnegative_number(value, "packet_loss_percent");
@@ -3524,7 +4128,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "control_timeout") {
     const auto actor = required_string(value, "actor");
     const auto& session = require_participant(parts[1], actor);
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     if (actor != session.vehicle_id) throw Unauthorized("only the vehicle may report a control timeout");
     const auto last_valid_control_at_utc_ms = required_nonnegative_uint64(value, "last_valid_control_at_utc_ms");
     const auto braking_at_utc_ms = required_nonnegative_uint64(value, "braking_at_utc_ms");
@@ -3547,7 +4151,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "estop") {
     const auto actor = required_string(value, "actor");
     const auto& session = require_participant(parts[1], actor);
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     const auto reason = required_string(value, "reason");
     const auto control_seq = required_nonnegative_uint64(value, "control_seq");
     audit(
@@ -3563,7 +4167,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "turn_relay") {
     const auto actor = required_string(value, "actor");
     const auto& session = require_participant(parts[1], actor);
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     const auto turn_url = required_string(value, "turn_url");
     const auto relay_candidate = required_string(value, "relay_candidate");
     const auto selected_pair = required_string(value, "selected_pair");
@@ -3581,7 +4185,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
   if (parts.size() == 3 && parts[0] == "sessions" && parts[2] == "turn_usage") {
     const auto actor = required_string(value, "actor");
     auto& session = const_cast<Session&>(require_participant(parts[1], actor));
-    validate_actor_credential(session, actor, value);
+    validate_actor_credential(session, actor, value, now);
     const auto sample_sequence = required_nonnegative_uint64(value, "sample_seq");
     if (sample_sequence == 0) throw std::invalid_argument("sample_seq must be positive");
     const auto bytes_sent = required_nonnegative_uint64(value, "bytes_sent");
@@ -3649,7 +4253,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
          {"turn_usage", session.to_json().at("turn_usage")}});
   }
   if (parts.size() == 3 && parts[0] == "signaling" && parts[2] == "messages") {
-    return ServerResponse::json(200, enqueue_signaling_message(parts[1], value));
+    return ServerResponse::json(200, enqueue_signaling_message(parts[1], value, now));
   }
   return ServerResponse::json(404, {{"error", "not found"}});
 }
@@ -3999,8 +4603,9 @@ void DriverConsoleRuntime::note_native_control_failure(
 }
 
 bool DriverConsoleRuntime::send_native_control_sample() {
-  const auto sample_started_monotonic_ms = monotonic_now_ms();
-  const auto sample_started_at_utc_ms = clock_.now_ms();
+  const auto sample_started_at = clock_.sample();
+  const auto sample_started_monotonic_ms = sample_started_at.monotonic.value;
+  const auto sample_started_at_utc_ms = sample_started_at.utc.value;
   const auto scheduled_at_monotonic_ms =
       native_control_scheduled_at_monotonic_ms_.load(std::memory_order_relaxed);
   NativeControlIntentSample sample;
@@ -4008,7 +4613,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
   std::string control_token;
   std::string driver_token;
   std::string vehicle;
-  std::int64_t control_token_expires_at_ms = 0;
+  std::int64_t control_token_expires_at_monotonic_ms = 0;
   std::uint64_t sequence = 0;
   std::uint64_t generation = 0;
   Json trace_record;
@@ -4025,7 +4630,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       control_token = control_token_;
       driver_token = driver_token_;
       vehicle = vehicle_id_;
-      control_token_expires_at_ms = control_token_expires_at_ms_;
+      control_token_expires_at_monotonic_ms = control_token_expires_at_monotonic_ms_;
       generation = control_session_generation_;
       sequence = ++control_sequence_;
     }
@@ -4055,7 +4660,8 @@ bool DriverConsoleRuntime::send_native_control_sample() {
                : 0},
       };
     }
-    if (clock_.now_ms() >= control_token_expires_at_ms) {
+    if (detail::monotonic_deadline_reached(clock_.sample().monotonic,
+                                           control_token_expires_at_monotonic_ms)) {
       throw std::runtime_error("control authority lease expired");
     }
 
@@ -4351,8 +4957,10 @@ void DriverConsoleRuntime::native_control_lease_loop(std::stop_token stop_token)
     std::uint64_t renewal_generation = 0;
     {
       std::lock_guard lock(mutex_);
-      renewal_due = !session_id_.empty() && !control_token_.empty() &&
-          control_token_renew_at_ms_ <= clock_.now_ms();
+      const auto now = clock_.sample();
+      renewal_due =
+          !session_id_.empty() && !control_token_.empty() &&
+          detail::monotonic_deadline_reached(now.monotonic, control_token_renew_at_monotonic_ms_);
       renewal_session = session_id_;
       renewal_generation = control_session_generation_;
     }
@@ -4434,19 +5042,19 @@ Json DriverConsoleRuntime::renew_control_authority() {
   std::string token;
   std::string session;
   std::string control_token;
-  std::int64_t renew_at_ms = 0;
+  std::int64_t renew_at_monotonic_ms = 0;
   {
     std::lock_guard lock(mutex_);
     token = driver_token_;
     session = session_id_;
     control_token = control_token_;
-    renew_at_ms = control_token_renew_at_ms_;
+    renew_at_monotonic_ms = control_token_renew_at_monotonic_ms_;
   }
   if (token.empty() || session.empty() || control_token.empty()) {
     return {{"renewed", false}, {"reason", "not_connected"}};
   }
-  const auto now = clock_.now_ms();
-  if (renew_at_ms > now) {
+  const auto request_started_at = clock_.sample();
+  if (!detail::monotonic_deadline_reached(request_started_at.monotonic, renew_at_monotonic_ms)) {
     return {{"renewed", false}, {"reason", "not_due"}};
   }
   Json response;
@@ -4462,11 +5070,12 @@ Json DriverConsoleRuntime::renew_control_authority() {
       if (session_id_ == session) {
         session_id_.clear();
         control_token_.clear();
-        control_token_expires_at_ms_ = 0;
-        control_token_renew_at_ms_ = 0;
+        control_token_expires_at_utc_ms_ = 0;
+        control_token_expires_at_monotonic_ms_ = 0;
+        control_token_renew_at_monotonic_ms_ = 0;
         sequence_ = 0;
         reset_control_profile_locked();
-        connected_at_ms_ = 0;
+        connected_at_utc_ms_ = 0;
       }
     }
     throw;
@@ -4474,49 +5083,61 @@ Json DriverConsoleRuntime::renew_control_authority() {
   if (response.value("session_id", "") != session || response.value("control_token", "") != control_token) {
     throw std::runtime_error("control authority renewal changed the active session or token");
   }
-  const auto expires_at_ms = required_int64(response, "control_token_expires_at_utc_ms");
-  if (expires_at_ms <= now) throw std::runtime_error("control authority renewal returned an expired lease");
+  const auto expires_at_utc_ms = required_int64(response, "control_token_expires_at_utc_ms");
+  const auto received_at = clock_.sample();
+  const auto expires_at_monotonic_ms =
+      detail::local_monotonic_deadline_from_utc_expiry(UtcMillis{expires_at_utc_ms}, received_at);
+  if (detail::monotonic_deadline_reached(received_at.monotonic, expires_at_monotonic_ms.value)) {
+    throw std::runtime_error("control authority renewal returned an expired lease");
+  }
   {
     std::lock_guard lock(mutex_);
     if (session_id_ != session || control_token_ != control_token) {
       return {{"renewed", false}, {"reason", "session_changed"}};
     }
-    control_token_expires_at_ms_ = expires_at_ms;
-    control_token_renew_at_ms_ = control_lease_renew_at(now, expires_at_ms);
+    control_token_expires_at_utc_ms_ = expires_at_utc_ms;
+    control_token_expires_at_monotonic_ms_ = expires_at_monotonic_ms.value;
+    control_token_renew_at_monotonic_ms_ =
+        control_lease_renew_at(received_at.monotonic, expires_at_monotonic_ms);
   }
   return {
       {"renewed", true},
       {"session_id", session},
-      {"control_token_expires_at_utc_ms", expires_at_ms},
+      {"control_token_expires_at_utc_ms", expires_at_utc_ms},
   };
 }
 
 Json DriverConsoleRuntime::login_locked(std::string_view password) {
   if (clock_.refresh_due(config_.time_sync_interval_ms)) static_cast<void>(refresh_time_sync());
   std::string current_token;
-  std::int64_t current_expiry = 0;
+  std::int64_t current_expiry_utc_ms = 0;
+  std::int64_t current_expiry_monotonic_ms = 0;
   {
     std::lock_guard lock(mutex_);
     current_token = driver_token_;
-    current_expiry = driver_token_expires_at_ms_;
+    current_expiry_utc_ms = driver_token_expires_at_utc_ms_;
+    current_expiry_monotonic_ms = driver_token_expires_at_monotonic_ms_;
   }
-  if (!current_token.empty() && clock_.now_ms() < current_expiry) {
+  if (!current_token.empty() &&
+      !detail::monotonic_deadline_reached(clock_.sample().monotonic, current_expiry_monotonic_ms)) {
     try {
-      auto result = fetch_authorized_vehicles(current_token, current_expiry);
+      auto result = fetch_authorized_vehicles(current_token, current_expiry_utc_ms);
       result["authenticated"] = true;
       return result;
     } catch (const std::exception&) {
       reset_native_control_state();
       std::lock_guard lock(mutex_);
       driver_token_.clear();
-      driver_token_expires_at_ms_ = 0;
+      driver_token_expires_at_utc_ms_ = 0;
+      driver_token_expires_at_monotonic_ms_ = 0;
       session_id_.clear();
       control_token_.clear();
-      control_token_expires_at_ms_ = 0;
-      control_token_renew_at_ms_ = 0;
+      control_token_expires_at_utc_ms_ = 0;
+      control_token_expires_at_monotonic_ms_ = 0;
+      control_token_renew_at_monotonic_ms_ = 0;
       sequence_ = 0;
       reset_control_profile_locked();
-      connected_at_ms_ = 0;
+      connected_at_utc_ms_ = 0;
     }
   }
   const auto credential = password.empty() ? password_ : std::string(password);
@@ -4524,17 +5145,23 @@ Json DriverConsoleRuntime::login_locked(std::string_view password) {
   const auto response = http_.post_json_response(
       signaling_http_url_ + "/auth/driver_login",
       {{"driver_id", config_.driver_id}, {"password", credential}});
+  const auto expires_at_utc_ms = response.value("expires_at_ms", std::int64_t{0});
+  const auto received_at = clock_.sample();
+  const auto expires_at_monotonic_ms =
+      detail::local_monotonic_deadline_from_utc_expiry(UtcMillis{expires_at_utc_ms}, received_at);
+  if (detail::monotonic_deadline_reached(received_at.monotonic, expires_at_monotonic_ms.value)) {
+    throw std::runtime_error("driver login returned an expired token");
+  }
   {
     std::lock_guard lock(mutex_);
     password_ = credential;
     driver_token_ = required_string(response, "token");
-    driver_token_expires_at_ms_ = response.value("expires_at_ms", std::int64_t{0});
+    driver_token_expires_at_utc_ms_ = expires_at_utc_ms;
+    driver_token_expires_at_monotonic_ms_ = expires_at_monotonic_ms.value;
     signaling_service_instance_id_ = required_string(response, "service_instance_id");
     signaling_available_ = true;
   }
-  auto result = fetch_authorized_vehicles(
-      required_string(response, "token"),
-      response.value("expires_at_ms", std::int64_t{0}));
+  auto result = fetch_authorized_vehicles(required_string(response, "token"), expires_at_utc_ms);
   result["authenticated"] = true;
   return result;
 }
@@ -4544,9 +5171,8 @@ Json DriverConsoleRuntime::login(std::string_view password) {
   return login_locked(password);
 }
 
-Json DriverConsoleRuntime::fetch_authorized_vehicles(
-    std::string_view token,
-    std::int64_t expires_at_ms) {
+Json DriverConsoleRuntime::fetch_authorized_vehicles(std::string_view token,
+                                                     std::int64_t expires_at_utc_ms) {
   const auto response = http_.get_json(
       signaling_http_url_ + "/drivers/" + http_.url_encode(config_.driver_id) + "/vehicles",
       {{"X-Mine-Teleop-Driver-Token", std::string(token)}});
@@ -4562,7 +5188,7 @@ Json DriverConsoleRuntime::fetch_authorized_vehicles(
   return {
       {"authenticated", true},
       {"driver_id", config_.driver_id},
-      {"token_expires_at_utc_ms", expires_at_ms},
+      {"token_expires_at_utc_ms", expires_at_utc_ms},
       {"service_instance_id", service_instance_id},
       {"vehicles", listed},
   };
@@ -4571,17 +5197,17 @@ Json DriverConsoleRuntime::fetch_authorized_vehicles(
 Json DriverConsoleRuntime::vehicles() {
   std::lock_guard authentication_lock(authentication_mutex_);
   std::string token;
-  std::int64_t expires_at_ms = 0;
+  std::int64_t expires_at_utc_ms = 0;
   std::string service_instance_id;
   {
     std::lock_guard lock(mutex_);
     token = driver_token_;
-    expires_at_ms = driver_token_expires_at_ms_;
+    expires_at_utc_ms = driver_token_expires_at_utc_ms_;
     service_instance_id = signaling_service_instance_id_;
   }
   if (token.empty()) throw HttpStatusError(401, "driver login is required");
   try {
-    return fetch_authorized_vehicles(token, expires_at_ms);
+    return fetch_authorized_vehicles(token, expires_at_utc_ms);
   } catch (const HttpStatusError& error) {
     {
       std::lock_guard lock(mutex_);
@@ -4599,14 +5225,16 @@ Json DriverConsoleRuntime::vehicles() {
     {
       std::lock_guard lock(mutex_);
       driver_token_.clear();
-      driver_token_expires_at_ms_ = 0;
+      driver_token_expires_at_utc_ms_ = 0;
+      driver_token_expires_at_monotonic_ms_ = 0;
       session_id_.clear();
       control_token_.clear();
-      control_token_expires_at_ms_ = 0;
-      control_token_renew_at_ms_ = 0;
+      control_token_expires_at_utc_ms_ = 0;
+      control_token_expires_at_monotonic_ms_ = 0;
+      control_token_renew_at_monotonic_ms_ = 0;
       sequence_ = 0;
       reset_control_profile_locked();
-      connected_at_ms_ = 0;
+      connected_at_utc_ms_ = 0;
       authorized_vehicles_ = Json::array();
     }
     auto recovered = login_locked({});
@@ -4636,7 +5264,7 @@ Json DriverConsoleRuntime::vehicles() {
     return {
         {"authenticated", true},
         {"driver_id", config_.driver_id},
-        {"token_expires_at_utc_ms", expires_at_ms},
+        {"token_expires_at_utc_ms", expires_at_utc_ms},
         {"service_instance_id", service_instance_id},
         {"signaling_available", false},
         {"stale", true},
@@ -4701,7 +5329,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
             {"connected", true},
             {"session_id", session_id_},
             {"control_session_generation", control_session_generation_},
-            {"connected_at_ms", connected_at_ms_},
+            {"connected_at_ms", connected_at_utc_ms_},
             {"time_sync", clock_.status().to_json()},
         };
       }
@@ -4715,11 +5343,12 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       std::lock_guard lock(mutex_);
       session_id_.clear();
       control_token_.clear();
-      control_token_expires_at_ms_ = 0;
-      control_token_renew_at_ms_ = 0;
+      control_token_expires_at_utc_ms_ = 0;
+      control_token_expires_at_monotonic_ms_ = 0;
+      control_token_renew_at_monotonic_ms_ = 0;
       sequence_ = 0;
       reset_control_profile_locked();
-      connected_at_ms_ = 0;
+      connected_at_utc_ms_ = 0;
     }
   }
 
@@ -4730,9 +5359,15 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       {{"driver_id", config_.driver_id}, {"vehicle_id", target}, {"token", current_token}});
   const auto session_id = required_string(session, "session_id");
   const auto control_token = required_string(session, "control_token");
-  const auto connected_at_ms = clock_.now_ms();
-  const auto control_token_expires_at_ms = required_int64(session, "control_token_expires_at_utc_ms");
-  if (control_token_expires_at_ms <= connected_at_ms) {
+  const auto connected_at = clock_.sample();
+  const auto connected_at_utc_ms = connected_at.utc.value;
+  const auto control_token_expires_at_utc_ms =
+      required_int64(session, "control_token_expires_at_utc_ms");
+  const auto control_token_expires_at_monotonic_ms =
+      detail::local_monotonic_deadline_from_utc_expiry(UtcMillis{control_token_expires_at_utc_ms},
+                                                       connected_at);
+  if (detail::monotonic_deadline_reached(connected_at.monotonic,
+                                         control_token_expires_at_monotonic_ms.value)) {
     throw std::runtime_error("new control authority lease is already expired");
   }
   std::uint64_t control_session_generation = 0;
@@ -4743,13 +5378,15 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       vehicle_id_ = target;
       session_id_ = session_id;
       control_token_ = control_token;
-      control_token_expires_at_ms_ = control_token_expires_at_ms;
-      control_token_renew_at_ms_ = control_lease_renew_at(connected_at_ms, control_token_expires_at_ms);
+      control_token_expires_at_utc_ms_ = control_token_expires_at_utc_ms;
+      control_token_expires_at_monotonic_ms_ = control_token_expires_at_monotonic_ms.value;
+      control_token_renew_at_monotonic_ms_ =
+          control_lease_renew_at(connected_at.monotonic, control_token_expires_at_monotonic_ms);
       sequence_ = 0;
       control_sequence_ = 0;
       control_session_generation = ++control_session_generation_;
       reset_control_profile_locked();
-      connected_at_ms_ = connected_at_ms;
+      connected_at_utc_ms_ = connected_at_utc_ms;
     }
     const auto bootstrap = native_control_intent_.update(
         NativeControlIntent{
@@ -4774,11 +5411,12 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       if (session_id_ == session_id) {
         session_id_.clear();
         control_token_.clear();
-        control_token_expires_at_ms_ = 0;
-        control_token_renew_at_ms_ = 0;
+        control_token_expires_at_utc_ms_ = 0;
+        control_token_expires_at_monotonic_ms_ = 0;
+        control_token_renew_at_monotonic_ms_ = 0;
         sequence_ = 0;
         reset_control_profile_locked();
-        connected_at_ms_ = 0;
+        connected_at_utc_ms_ = 0;
       }
     }
     std::rethrow_exception(failure);
@@ -4795,7 +5433,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
       {"connected", true},
       {"session_id", session_id},
       {"control_session_generation", control_session_generation},
-      {"connected_at_ms", connected_at_ms},
+      {"connected_at_ms", connected_at_utc_ms},
       {"time_sync", clock_.status().to_json()},
   };
 }
@@ -4825,11 +5463,12 @@ Json DriverConsoleRuntime::end_session(std::string_view reason) {
     if (session_id_ == session) {
       session_id_.clear();
       control_token_.clear();
-      control_token_expires_at_ms_ = 0;
-      control_token_renew_at_ms_ = 0;
+      control_token_expires_at_utc_ms_ = 0;
+      control_token_expires_at_monotonic_ms_ = 0;
+      control_token_renew_at_monotonic_ms_ = 0;
       sequence_ = 0;
       reset_control_profile_locked();
-      connected_at_ms_ = 0;
+      connected_at_utc_ms_ = 0;
     }
   }
   response["driver_id"] = config_.driver_id;
@@ -4852,11 +5491,12 @@ Json DriverConsoleRuntime::disconnect(std::string_view reason) {
     std::lock_guard lock(mutex_);
     session_id_.clear();
     control_token_.clear();
-    control_token_expires_at_ms_ = 0;
-    control_token_renew_at_ms_ = 0;
+    control_token_expires_at_utc_ms_ = 0;
+    control_token_expires_at_monotonic_ms_ = 0;
+    control_token_renew_at_monotonic_ms_ = 0;
     sequence_ = 0;
     reset_control_profile_locked();
-    connected_at_ms_ = 0;
+    connected_at_utc_ms_ = 0;
     authorized_vehicles_ = Json::array();
     return {{"driver_id", config_.driver_id}, {"state", "offline"}, {"session_id", session}};
   }
@@ -4869,14 +5509,16 @@ Json DriverConsoleRuntime::disconnect(std::string_view reason) {
     std::lock_guard lock(mutex_);
     if (driver_token_ == token) {
       driver_token_.clear();
-      driver_token_expires_at_ms_ = 0;
+      driver_token_expires_at_utc_ms_ = 0;
+      driver_token_expires_at_monotonic_ms_ = 0;
       session_id_.clear();
       control_token_.clear();
-      control_token_expires_at_ms_ = 0;
-      control_token_renew_at_ms_ = 0;
+      control_token_expires_at_utc_ms_ = 0;
+      control_token_expires_at_monotonic_ms_ = 0;
+      control_token_renew_at_monotonic_ms_ = 0;
       sequence_ = 0;
       reset_control_profile_locked();
-      connected_at_ms_ = 0;
+      connected_at_utc_ms_ = 0;
       authorized_vehicles_ = Json::array();
     }
   }
@@ -4947,11 +5589,12 @@ Json DriverConsoleRuntime::poll_signaling() {
         if (session_id_ == session) {
           session_id_.clear();
           control_token_.clear();
-          control_token_expires_at_ms_ = 0;
-          control_token_renew_at_ms_ = 0;
+          control_token_expires_at_utc_ms_ = 0;
+          control_token_expires_at_monotonic_ms_ = 0;
+          control_token_renew_at_monotonic_ms_ = 0;
           sequence_ = 0;
           reset_control_profile_locked();
-          connected_at_ms_ = 0;
+          connected_at_utc_ms_ = 0;
         }
       }
       close_signaling_websocket();
@@ -5062,11 +5705,12 @@ Json DriverConsoleRuntime::send_signaling_message(std::string_view type, const J
           if (session_id_ == session) {
             session_id_.clear();
             control_token_.clear();
-            control_token_expires_at_ms_ = 0;
-            control_token_renew_at_ms_ = 0;
+            control_token_expires_at_utc_ms_ = 0;
+            control_token_expires_at_monotonic_ms_ = 0;
+            control_token_renew_at_monotonic_ms_ = 0;
             sequence_ = 0;
             reset_control_profile_locked();
-            connected_at_ms_ = 0;
+            connected_at_utc_ms_ = 0;
           }
         }
         close_signaling_websocket();
@@ -5443,11 +6087,13 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input) {
 Json DriverConsoleRuntime::status() {
   bool authenticated = false;
   bool control_lease_due = false;
-  const auto timestamp_ms = clock_.now_ms();
+  const auto timestamp = clock_.sample();
   {
     std::lock_guard lock(mutex_);
     authenticated = !driver_token_.empty();
-    control_lease_due = !session_id_.empty() && control_token_renew_at_ms_ <= timestamp_ms;
+    control_lease_due =
+        !session_id_.empty() && detail::monotonic_deadline_reached(
+                                    timestamp.monotonic, control_token_renew_at_monotonic_ms_);
   }
   if (control_lease_due) {
     try {
@@ -5502,16 +6148,16 @@ Json DriverConsoleRuntime::status() {
       {"driver_id", config_.driver_id},
       {"vehicle_id", vehicle_id_},
       {"authenticated", !driver_token_.empty()},
-      {"driver_token_expires_at_utc_ms", driver_token_expires_at_ms_},
+      {"driver_token_expires_at_utc_ms", driver_token_expires_at_utc_ms_},
       {"signaling_service_instance_id", signaling_service_instance_id_},
       {"signaling_restart_recoveries", signaling_restart_recoveries_},
       {"signaling_available", signaling_available_},
       {"connected", !session_id_.empty()},
       {"session_id", session_id_},
       {"control_session_generation", control_session_generation_},
-      {"control_token_expires_at_utc_ms", control_token_expires_at_ms_},
+      {"control_token_expires_at_utc_ms", control_token_expires_at_utc_ms_},
       {"sequence", sequence_},
-      {"connected_at_ms", connected_at_ms_},
+      {"connected_at_ms", connected_at_utc_ms_},
       {"last_control_prepared_at_utc_ms", last_control_prepared_at_utc_ms_},
       {"control_commands_prepared_total", control_commands_prepared_total_},
       {"signaling_transport", "websocket"},
@@ -5535,9 +6181,7 @@ Json DriverConsoleRuntime::status() {
         {"effective_estop", native_sample.intent.estop},
         {"websocket_connected", native_control_websocket_connected},
         {"next_connect_in_ms",
-         std::max<std::int64_t>(
-             0,
-             native_control_next_connect_monotonic_ms - monotonic_now_ms())},
+         std::max<std::int64_t>(0, native_control_next_connect_monotonic_ms - monotonic_now_ms())},
         {"reconnect_delay_ms", native_control_reconnect_delay_ms},
         {"commands_sent_total", native_control_commands_sent_.load()},
         {"send_failures_total", native_control_send_failures_.load()},
@@ -5548,8 +6192,7 @@ Json DriverConsoleRuntime::status() {
         {"last_seq", native_control_last_seq_.load()},
         {"last_ack_seq", native_control_last_ack_seq},
         {"unacknowledged_age_ms", native_control_unacknowledged_age_ms},
-        {"last_ack_received_at_utc_ms",
-         native_control_last_ack_received_at_utc_ms_.load()},
+        {"last_ack_received_at_utc_ms", native_control_last_ack_received_at_utc_ms_.load()},
         {"last_ack_cloud_received_at_utc_ms",
          native_control_last_ack_cloud_received_at_utc_ms_.load()},
         {"last_error", native_control_last_error}}},
@@ -5632,76 +6275,120 @@ Json DriverConsoleRuntime::record_browser_event(const Json& input) {
   return {{"recorded", true}, {"event", event}};
 }
 
-DriverConsoleHttpApp::DriverConsoleHttpApp(std::shared_ptr<DriverConsoleRuntime> runtime) : runtime_(std::move(runtime)) {
+DriverConsoleHttpApp::DriverConsoleHttpApp(std::shared_ptr<DriverConsoleRuntime> runtime)
+    : runtime_(std::move(runtime)), page_capability_(random_token(32)) {
   if (!runtime_) throw std::invalid_argument("driver console runtime is required");
 }
 
 ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
+  ServerResponse response;
   try {
-    if (request.method == "GET" && request.path == "/health") return ServerResponse::json(200, {{"status", "ok"}, {"runtime", "cpp"}});
-    if (request.method == "GET" && request.path == "/api/time") return ServerResponse::json(200, {{"now_ms", now_ms()}});
-    if (request.method == "GET" && request.path == "/api/status") return ServerResponse::json(200, runtime_->status());
-    if (request.method == "GET" && request.path == "/api/vehicles") return ServerResponse::json(200, runtime_->vehicles());
-    if (request.method == "GET" && request.path == "/api/control-limits") return ServerResponse::json(200, runtime_->control_limits());
-    if (request.method == "GET" && request.path == "/api/control-profile") return ServerResponse::json(200, runtime_->control_profile());
-    if (request.method == "GET" && request.path == "/") {
-      return ServerResponse::text(200, console_html(runtime_->config()), "text/html; charset=utf-8");
+    if (request.method == "POST") {
+      if (!application_json_content_type(request)) {
+        response = ServerResponse::json(
+            415, {{"error", "local mutation requests require application/json"}});
+      } else if (!trusted_local_mutation_request(request, page_capability_)) {
+        response = ServerResponse::json(
+            403, {{"error", "local mutation request origin or capability is invalid"}});
+      }
     }
-    if (request.method == "POST" && request.path == "/api/login") {
-      return ServerResponse::json(200, runtime_->login(request.json_body().value("password", "")));
+    if (response.status == 200) {
+      if (request.method == "GET" && request.path == "/assets/control_logic.js") {
+        response = ServerResponse::text(200, std::string(web::kControlLogicJavaScript),
+                                        "application/javascript; charset=utf-8");
+      } else if (request.method == "GET" && request.path == "/assets/control_console.js") {
+        response = ServerResponse::text(200, std::string(web::kControlConsoleJavaScript),
+                                        "application/javascript; charset=utf-8");
+      } else if (request.method == "GET" && request.path == "/assets/control_console.css") {
+        response = ServerResponse::text(200, std::string(web::kControlConsoleCss),
+                                        "text/css; charset=utf-8");
+      } else if (request.method == "GET" && request.path == "/assets/control_console.html") {
+        response = ServerResponse::text(200, std::string(web::kControlConsoleHtml),
+                                        "text/html; charset=utf-8");
+      } else if (request.method == "GET" && request.path == "/health") {
+        response = ServerResponse::json(200, {{"status", "ok"}, {"runtime", "cpp"}});
+      } else if (request.method == "GET" && request.path == "/api/time") {
+        response = ServerResponse::json(200, {{"now_ms", now_ms()}});
+      } else if (request.method == "GET" && request.path == "/api/console-config") {
+        response =
+            ServerResponse::json(200, console_config_json(runtime_->config(), page_capability_));
+      } else if (request.method == "GET" && request.path == "/api/status") {
+        response = ServerResponse::json(200, runtime_->status());
+      } else if (request.method == "GET" && request.path == "/api/vehicles") {
+        response = ServerResponse::json(200, runtime_->vehicles());
+      } else if (request.method == "GET" && request.path == "/api/control-limits") {
+        response = ServerResponse::json(200, runtime_->control_limits());
+      } else if (request.method == "GET" && request.path == "/api/control-profile") {
+        response = ServerResponse::json(200, runtime_->control_profile());
+      } else if (request.method == "GET" && request.path == "/") {
+        response = ServerResponse::text(200, std::string(web::kControlConsoleHtml),
+                                        "text/html; charset=utf-8");
+      } else if (request.method == "POST" && request.path == "/api/login") {
+        response =
+            ServerResponse::json(200, runtime_->login(request.json_body().value("password", "")));
+      } else if (request.method == "POST" && request.path == "/api/connect") {
+        response = ServerResponse::json(
+            200, runtime_->connect(request.json_body().value("vehicle_id", "")));
+      } else if (request.method == "POST" && request.path == "/api/end-session") {
+        response = ServerResponse::json(
+            200, runtime_->end_session(request.json_body().value("reason", "driver_session_end")));
+      } else if (request.method == "POST" && request.path == "/api/disconnect") {
+        response = ServerResponse::json(200, runtime_->disconnect(request.json_body().value(
+                                                 "reason", "driver_console_disconnect")));
+      } else if (request.method == "POST" && request.path == "/api/poll-signaling") {
+        response = ServerResponse::json(200, runtime_->poll_signaling());
+      } else if (request.method == "POST" && request.path == "/api/webrtc/ice-servers") {
+        response = ServerResponse::json(200, runtime_->ice_servers());
+      } else if (request.method == "POST" && request.path == "/api/webrtc/capabilities") {
+        response =
+            ServerResponse::json(200, runtime_->send_media_capabilities(request.json_body()));
+      } else if (request.method == "POST" && request.path == "/api/webrtc/fallback") {
+        response = ServerResponse::json(200, runtime_->send_media_fallback(request.json_body()));
+      } else if (request.method == "POST" && request.path == "/api/webrtc/answer") {
+        response = ServerResponse::json(200, runtime_->send_webrtc_answer(request.json_body()));
+      } else if (request.method == "POST" && request.path == "/api/webrtc/ice-candidate") {
+        response =
+            ServerResponse::json(200, runtime_->send_webrtc_ice_candidate(request.json_body()));
+      } else if (request.method == "POST" && request.path == "/api/webrtc/metrics") {
+        response = ServerResponse::json(200, runtime_->ingest_webrtc_metrics(request.json_body()));
+      } else if (request.method == "POST" && request.path == "/api/browser-event") {
+        response = ServerResponse::json(200, runtime_->record_browser_event(request.json_body()));
+      } else if (request.method == "POST" && request.path == "/api/control-limits") {
+        response = ServerResponse::json(
+            410, {{"error", "legacy control-limit mutation is retired; use /api/control-profile"}});
+      } else if (request.method == "POST" && request.path == "/api/control-profile") {
+        response =
+            ServerResponse::json(200, runtime_->prepare_control_profile(request.json_body()));
+      } else if (request.method == "POST" && request.path == "/api/control-intent") {
+        response = ServerResponse::json(200, runtime_->update_control_intent(request.json_body()));
+      } else if (request.method == "POST" && request.path == "/api/control") {
+        response = ServerResponse::json(
+            410, {{"error",
+                   "legacy browser control packet endpoint is retired; use /api/control-intent"}});
+      } else if (request.method == "POST" && (request.path == "/api/control/keyboard" ||
+                                              request.path == "/api/control/gamepad")) {
+        response = ServerResponse::json(
+            410,
+            {{"error", "legacy specialized control endpoint is retired; use /api/control-intent"}});
+      } else {
+        response = ServerResponse::json(404, {{"error", "not found"}});
+      }
     }
-    if (request.method == "POST" && request.path == "/api/connect") {
-      return ServerResponse::json(200, runtime_->connect(request.json_body().value("vehicle_id", "")));
-    }
-    if (request.method == "POST" && request.path == "/api/end-session") {
-      return ServerResponse::json(
-          200,
-          runtime_->end_session(request.json_body().value("reason", "driver_session_end")));
-    }
-    if (request.method == "POST" && request.path == "/api/disconnect") {
-      return ServerResponse::json(
-          200,
-          runtime_->disconnect(request.json_body().value("reason", "driver_console_disconnect")));
-    }
-    if (request.method == "POST" && request.path == "/api/poll-signaling") return ServerResponse::json(200, runtime_->poll_signaling());
-    if (request.method == "POST" && request.path == "/api/webrtc/ice-servers") return ServerResponse::json(200, runtime_->ice_servers());
-    if (request.method == "POST" && request.path == "/api/webrtc/capabilities") return ServerResponse::json(200, runtime_->send_media_capabilities(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/webrtc/fallback") return ServerResponse::json(200, runtime_->send_media_fallback(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/webrtc/answer") return ServerResponse::json(200, runtime_->send_webrtc_answer(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/webrtc/ice-candidate") return ServerResponse::json(200, runtime_->send_webrtc_ice_candidate(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/webrtc/metrics") return ServerResponse::json(200, runtime_->ingest_webrtc_metrics(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/browser-event") return ServerResponse::json(200, runtime_->record_browser_event(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/control-limits") {
-      return ServerResponse::json(
-          410,
-          {{"error", "legacy control-limit mutation is retired; use /api/control-profile"}});
-    }
-    if (request.method == "POST" && request.path == "/api/control-profile") return ServerResponse::json(200, runtime_->prepare_control_profile(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/control-intent") return ServerResponse::json(200, runtime_->update_control_intent(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/control") {
-      return ServerResponse::json(
-          410,
-          {{"error", "legacy browser control packet endpoint is retired; use /api/control-intent"}});
-    }
-    if (request.method == "POST" &&
-        (request.path == "/api/control/keyboard" ||
-         request.path == "/api/control/gamepad")) {
-      return ServerResponse::json(
-          410,
-          {{"error",
-            "legacy specialized control endpoint is retired; use /api/control-intent"}});
-    }
-    return ServerResponse::json(404, {{"error", "not found"}});
+    add_console_security_headers(response);
   } catch (const HttpStatusError& error) {
     const auto status = error.status() >= 400 && error.status() <= 599
         ? static_cast<int>(error.status())
         : 502;
-    return ServerResponse::json(status, {{"error", error.what()}});
+    response = ServerResponse::json(status, {{"error", error.what()}});
+    add_console_security_headers(response);
   } catch (const std::invalid_argument& error) {
-    return ServerResponse::json(400, {{"error", error.what()}});
+    response = ServerResponse::json(400, {{"error", error.what()}});
+    add_console_security_headers(response);
   } catch (const std::exception& error) {
-    return ServerResponse::json(409, {{"error", error.what()}});
+    response = ServerResponse::json(409, {{"error", error.what()}});
+    add_console_security_headers(response);
   }
+  return response;
 }
 
 }  // namespace mine_teleop

@@ -26,6 +26,13 @@ mkdir -p .local/deployment/identity-secrets
 
 openssl rand -base64 32 \
   > .local/deployment/identity-secrets/driver-console-001.password
+argon2_salt="$(openssl rand -hex 16)"
+tr -d '\r\n' < .local/deployment/identity-secrets/driver-console-001.password \
+  | argon2 "$argon2_salt" -id -t 3 -m 16 -p 1 -e \
+  > .local/deployment/identity-secrets/driver-console-001.password.argon2id
+unset argon2_salt
+chmod 600 .local/deployment/identity-secrets/driver-console-001.password \
+  .local/deployment/identity-secrets/driver-console-001.password.argon2id
 openssl rand -hex 32 \
   > .local/deployment/identity-secrets/vehicle-001.token
 openssl rand -hex 32 \
@@ -37,7 +44,8 @@ cp packaging/ubuntu-cloud/signaling-server.yaml.example \
 
 凭据对应关系：
 
-- `driver-console-001.password`：控制页面登录密码；
+- `driver-console-001.password`：仅在受限管理端保留并经安全通道交付给驾驶员；
+- `driver-console-001.password.argon2id`：上传到云端并由信令服务读取的 Argon2id verifier；
 - `vehicle-001.token`：云端和车端共享的车辆设备凭据；
 - `turn-static-auth.secret`：云端信令和 Coturn 共享的 TURN REST secret。
 
@@ -65,7 +73,7 @@ cd ~/mine-teleop-cloud
 
 ```text
 /secure/staging/signaling-server.yaml
-/secure/staging/identity-secrets/driver-console-001.password
+/secure/staging/identity-secrets/driver-console-001.password.argon2id
 /secure/staging/identity-secrets/vehicle-001.token
 /secure/staging/turn-static-auth.secret
 ```
@@ -94,6 +102,12 @@ sudo ./deploy-cloud.sh --no-start
 ```bash
 sudo ./deploy-cloud.sh
 ```
+
+部署器先在候选 bundle 与候选 `/etc` 副本上验证信令、Caddy 和 HAProxy 配置；
+只有候选通过后才短暂停止现有 target 并切换。切换、已安装配置复检、启动或健康
+检查任一步失败时，会从 `/var/backups/mine-teleop/<timestamp>-<pid>` 恢复旧 bundle、
+配置、systemd unit 及原服务启停状态。`--no-start` 不停止当前运行栈，仅安装已通过
+候选检查的文件，并在安装失败时恢复文件。
 
 云端验收：
 
@@ -138,7 +152,8 @@ rm -f /tmp/vehicle-001.token
 
 ```bash
 ./bin/mine-teleop-run version
-./bin/mine-teleop-run config-check --config config/vehicle-agent.yaml
+./bin/mine-teleop-run config-check --config config/vehicle-agent.yaml \
+  --verify-configured-ca-bundle
 ./bin/mine-teleop-run vehicle-agent \
   --config config/vehicle-agent.yaml \
   --preflight
@@ -184,6 +199,17 @@ scripts/deploy/deploy_vehicle_bundle.sh \
 ```
 
 部署脚本只是 SSH 上传和验收辅助工具，不是车端运行依赖。
+它把不可变 bundle 解压到 `<remote-dir>/.releases/`，最终通过原子替换
+`<remote-dir>/current` 符号链接激活。`<remote-dir>/config/vehicle-agent.yaml` 是
+独立持久配置：未传 `--config` 时保留现场文件，显式传入时才替换；候选配置会用
+候选 bridge ABI 先检查，失败不会改变当前 release 或现场配置。脚本后续命令均从
+`current/bin` 和 `current/lib` 运行，并把根目录 `bin`/`lib` 维护为指向 `current` 的
+稳定入口，因此升级后的既有 `./bin/mine-teleop-run` 命令也会进入新 release；无参
+launcher 仍从根目录持久 `config/vehicle-agent.yaml` 读取现场配置。显式传入的
+`--device-token-file` 也先暂存并随 release/config 事务发布；候选失败时保留原 token，
+未传该参数时不会改现场 token。bundle 内的 `.crt`/`.pem` CA 附件仅在持久目录缺失时
+补齐，不覆盖现场同名证书；切换后的最终 `config-check` 会验证 YAML 所引用的 CA
+确实是可读非空文件，失败时连同 release、稳定入口、配置、token 和新增 CA 一起回滚。
 
 ## 5. 部署控制端
 
@@ -263,7 +289,8 @@ powershell -ExecutionPolicy Bypass -File .\run-control.ps1
 curl -fsS http://127.0.0.1:8765/health
 
 # 车端
-./bin/mine-teleop-run config-check --config config/vehicle-agent.yaml
+./bin/mine-teleop-run config-check --config config/vehicle-agent.yaml \
+  --verify-configured-ca-bundle
 
 # 控制端
 curl -fsS http://127.0.0.1:8080/health

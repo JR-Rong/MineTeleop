@@ -1,5 +1,7 @@
 #include "mine_teleop/media.hpp"
 
+#include "mine_teleop/detail/diagnostic_emitter.hpp"
+#include "mine_teleop/detail/recording_fragment_state.hpp"
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/upload.hpp"
 #include "mine_teleop/video.hpp"
@@ -20,14 +22,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <iostream>
 #include <memory>
 #include <mutex>
 #include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
-#include <syncstream>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -195,6 +195,11 @@ std::string quote_pipeline(std::string_view value) {
   }
   result.push_back('"');
   return result;
+}
+
+bool regular_file_without_symlink(const std::filesystem::path& path) {
+  std::error_code error;
+  return std::filesystem::is_regular_file(std::filesystem::symlink_status(path, error)) && !error;
 }
 
 std::string iso_time(std::int64_t timestamp_ms) {
@@ -367,6 +372,9 @@ class MediaSignalingClient {
   [[nodiscard]] TimeSyncStatus time_sync_status() const { return clock_.status(); }
   [[nodiscard]] bool time_sync_refresh_due(int interval_ms) const { return clock_.refresh_due(interval_ms); }
   [[nodiscard]] std::int64_t now_ms() const { return clock_.now_ms(); }
+  [[nodiscard]] ClockSample clock_sample() const {
+    return clock_.sample();
+  }
   [[nodiscard]] std::int64_t from_local_system_ms(std::int64_t value) const {
     return clock_.from_local_system_ms(value);
   }
@@ -481,8 +489,9 @@ CameraIssue classify_camera_issue(std::string_view error) {
 struct VehicleMediaRuntime::Impl {
   static constexpr std::size_t kControlTraceQueueCapacity = 256;
   static constexpr std::size_t kControlTraceBatchMaxRecords = 32;
-  static constexpr std::size_t kControlTraceBatchCommandsMaxBytes = 40U * 1024U;
-  static constexpr std::size_t kControlTraceBatchLineMaxBytes = 48U * 1024U;
+  static constexpr std::size_t kControlTraceBatchCommandsMaxBytes = 2U * 1024U;
+  static constexpr std::size_t kControlTraceBatchLineMaxBytes =
+      detail::DiagnosticEmitter::kDefaultMaxLineBytes;
   static constexpr std::size_t kControlTraceTextMaxBytes = 128;
   static constexpr std::size_t kControlTraceMaxWarnings = 8;
 
@@ -506,6 +515,17 @@ struct VehicleMediaRuntime::Impl {
     std::unique_ptr<CameraFrameSource> source;
     GstElement* appsrc{nullptr};
     GstElement* encoder{nullptr};
+    GstElement* recording_queue{nullptr};
+    GstElement* recording_valve{nullptr};
+    GstElement* recording_parser{nullptr};
+    GstElement* recorder{nullptr};
+    std::uint64_t recording_generation{0};
+    std::atomic<bool> recording_failed{false};
+    std::mutex recording_mutex;
+    std::shared_ptr<detail::RecordingFragmentOwner> unpaired_recording_fragment;
+    bool unpaired_recording_sink{false};
+    bool unpaired_recording_muxer{false};
+    std::shared_ptr<detail::RecordingFragmentOwner> active_recording_fragment;
     std::thread thread;
     std::atomic<std::uint64_t> captured{0};
     std::atomic<std::uint64_t> pushed{0};
@@ -532,30 +552,39 @@ struct VehicleMediaRuntime::Impl {
     std::string error;
   };
 
-  Impl(
-      VehicleConfig next_config,
-      std::string signaling_url,
-      std::string device_token,
-      int next_frame_timeout_ms,
-      std::filesystem::path next_recording_root,
-      std::optional<std::string> next_forced_codec,
-      int next_simulate_primary_failure_after_frames,
-      std::string connection_id,
-      std::shared_ptr<MediaSignalingSequence> signaling_sequence,
-      std::shared_ptr<CriticalCameraControlLatch> next_critical_camera_control_latch)
+  struct RecordingFinalizationJob {
+    std::shared_ptr<detail::RecordingFragmentOwner> fragment;
+    // Each pipeline generation owns its cancellation flag.  A shutdown that
+    // times out must not accidentally re-enable an old job when a later
+    // reconnect starts a new pipeline.
+    std::shared_ptr<std::atomic<bool>> cancellation;
+    std::chrono::steady_clock::time_point not_before;
+    bool quarantine{false};
+  };
+
+  // A closed splitmux fragment is not immediately uploadable: an ERROR from a
+  // retired async-finalize child can still be waiting on the bus.  Keep the
+  // media loop to bounded queue insertion and let this worker observe that
+  // quiet period before it validates or publishes anything.
+  static constexpr auto kRecordingFinalizeQuietPeriod = std::chrono::milliseconds(500);
+  static constexpr auto kRecordingBusDrainTimeout = std::chrono::seconds(2);
+  static constexpr auto kRecordingFinalizationDrainTimeout = std::chrono::seconds(5);
+  static constexpr std::size_t kMaxRecordingFinalizationJobs = 64;
+
+  Impl(VehicleConfig next_config, std::string signaling_url, std::string device_token,
+       int next_frame_timeout_ms, std::filesystem::path next_recording_root,
+       std::optional<std::string> next_forced_codec, int next_simulate_primary_failure_after_frames,
+       std::string connection_id, std::shared_ptr<MediaSignalingSequence> signaling_sequence,
+       std::shared_ptr<CriticalCameraControlLatch> next_critical_camera_control_latch)
       : config(std::move(next_config)),
-        signaling(
-            std::move(signaling_url),
-            config.vehicle_id,
-            std::move(device_token),
-            std::move(connection_id),
-            std::move(signaling_sequence),
-            config.cloud.resolve_entries,
-            config.cloud.ca_bundle),
-        critical_camera_control_latch(
-            next_critical_camera_control_latch
-                ? std::move(next_critical_camera_control_latch)
-                : std::make_shared<CriticalCameraControlLatch>()),
+        signaling(std::move(signaling_url), config.vehicle_id, std::move(device_token),
+                  std::move(connection_id), std::move(signaling_sequence),
+                  config.cloud.resolve_entries, config.cloud.ca_bundle),
+        diagnostic_emitter(detail::make_stdout_diagnostic_sink(),
+                           detail::DiagnosticEmitter::Limits{}),
+        critical_camera_control_latch(next_critical_camera_control_latch
+                                          ? std::move(next_critical_camera_control_latch)
+                                          : std::make_shared<CriticalCameraControlLatch>()),
         frame_timeout_ms(next_frame_timeout_ms),
         recording_root(std::move(next_recording_root)),
         forced_codec(std::move(next_forced_codec)),
@@ -565,16 +594,19 @@ struct VehicleMediaRuntime::Impl {
       throw std::invalid_argument("simulated primary failure frame count must be non-negative");
     }
     start_control_trace_worker();
+    start_recording_finalization_worker();
   }
 
   ~Impl() {
     try {
       // stop_pipeline closes control_service before joining either native
       // control thread, so no late delivery can postpone the final safe stop.
-      stop_pipeline();
+      stop_pipeline(true);
     } catch (...) {
     }
+    stop_recording_finalization_worker();
     stop_control_trace_worker();
+    diagnostic_emitter.stop();
   }
 
   // control_mutex must be held. A fresh gear is scoped to one active
@@ -592,15 +624,45 @@ struct VehicleMediaRuntime::Impl {
     return std::string(value.substr(0, kControlTraceTextMaxBytes)) + "...[truncated]";
   }
 
-  void write_control_trace_batch_line(const Json& entry) const {
-    const auto line = entry.dump();
-    if (line.size() > kControlTraceBatchLineMaxBytes) {
-      throw std::length_error("vehicle control trace batch exceeds the JSONL line limit");
+  [[nodiscard]] bool emit_json_line(Json entry) const noexcept {
+    try {
+      return diagnostic_emitter.submit(entry.dump());
+    } catch (...) {
+      diagnostic_emitter.note_producer_drop();
+      return false;
     }
-    std::osyncstream output(std::cout);
-    output << line << '\n' << std::flush;
-    output.emit();
-    if (!output) throw std::runtime_error("cannot write vehicle control trace batch");
+  }
+
+  [[nodiscard]] Json diagnostic_output_status() const {
+    const auto stats = diagnostic_emitter.stats();
+    return {
+        {"queue_capacity", detail::DiagnosticEmitter::kDefaultQueueCapacity},
+        {"max_line_bytes", detail::DiagnosticEmitter::kDefaultMaxLineBytes},
+        {"enqueued_total", stats.enqueued_total},
+        {"emitted_total", stats.emitted_total},
+        {"dropped_total", stats.dropped_total},
+        {"oversized_total", stats.oversized_total},
+        {"malformed_total", stats.malformed_total},
+        {"sink_failures_total", stats.sink_failures_total},
+        {"sink_timeouts_total", stats.sink_timeouts_total},
+        {"shutdown_timeouts_total", stats.shutdown_timeouts_total},
+        {"queued", stats.queued},
+        {"accepting", stats.accepting},
+    };
+  }
+
+  [[nodiscard]] bool write_control_trace_batch_line(const Json& entry) noexcept {
+    try {
+      const auto line = entry.dump();
+      if (line.size() + 1 > kControlTraceBatchLineMaxBytes) {
+        diagnostic_emitter.note_producer_drop();
+        return false;
+      }
+      return diagnostic_emitter.submit(line);
+    } catch (...) {
+      diagnostic_emitter.note_producer_drop();
+      return false;
+    }
   }
 
   void note_control_trace_drop() noexcept {
@@ -675,30 +737,28 @@ struct VehicleMediaRuntime::Impl {
                                            bool final) noexcept {
         const auto dropped_total = control_trace_dropped_total.load(std::memory_order_relaxed);
         const auto dropped_since_last = dropped_total - reported_dropped_total;
-        try {
-          const auto next_emitted_total = emitted_total + command_count;
-          write_control_trace_batch_line({
-              {"event", "vehicle_control_trace_batch"},
-              {"event_at_utc_ms", signaling.now_ms()},
-              {"vehicle_id", bounded_control_trace_text(config.vehicle_id)},
-              {"batch_seq", ++batch_seq},
-              {"final", final},
-              {"queue_capacity", kControlTraceQueueCapacity},
-              {"commands", std::move(commands)},
-              {"enqueued_total", control_trace_enqueued_total.load(std::memory_order_relaxed)},
-              {"emitted_total", next_emitted_total},
-              {"dropped_since_last", dropped_since_last},
-              {"dropped_total", dropped_total},
-              {"output_error_total", output_error_total},
-          });
+        const auto next_emitted_total = emitted_total + command_count;
+        if (write_control_trace_batch_line({
+                {"event", "vehicle_control_trace_batch"},
+                {"event_at_utc_ms", signaling.now_ms()},
+                {"vehicle_id", bounded_control_trace_text(config.vehicle_id)},
+                {"batch_seq", ++batch_seq},
+                {"final", final},
+                {"queue_capacity", kControlTraceQueueCapacity},
+                {"commands", std::move(commands)},
+                {"enqueued_total", control_trace_enqueued_total.load(std::memory_order_relaxed)},
+                {"emitted_total", next_emitted_total},
+                {"dropped_since_last", dropped_since_last},
+                {"dropped_total", dropped_total},
+                {"output_error_total", output_error_total},
+            })) {
           emitted_total = next_emitted_total;
           reported_dropped_total = dropped_total;
           return true;
-        } catch (...) {
-          ++output_error_total;
-          control_trace_dropped_total.fetch_add(command_count, std::memory_order_relaxed);
-          return false;
         }
+        ++output_error_total;
+        control_trace_dropped_total.fetch_add(command_count, std::memory_order_relaxed);
+        return false;
       };
 
       std::size_t record_index = 0;
@@ -853,19 +913,18 @@ struct VehicleMediaRuntime::Impl {
       self->control_service_issue_code = "critical_camera_not_ready";
     }
     self->send_vcu_handshake_status("driver_connected");
-    std::cout << Json({
-                     {"event", "vehicle_control_data_channel_open"},
-                     {"event_at_utc_ms", self->signaling.now_ms()},
-                     {"vehicle_id", self->config.vehicle_id},
-                     {"driver_id", self->signaling.driver_id()},
-                     {"session_id", self->signaling.session_id()},
-                     {"ordered", false},
-                     {"max_retransmits", 0},
-                     {"adapter_ready", adapter_ready},
-                     {"critical_cameras_ready", cameras_ready},
-                     {"control_inhibited", control_inhibited},
-                 }).dump()
-              << '\n';
+    static_cast<void>(self->emit_json_line({
+        {"event", "vehicle_control_data_channel_open"},
+        {"event_at_utc_ms", self->signaling.now_ms()},
+        {"vehicle_id", self->config.vehicle_id},
+        {"driver_id", self->signaling.driver_id()},
+        {"session_id", self->signaling.session_id()},
+        {"ordered", false},
+        {"max_retransmits", 0},
+        {"adapter_ready", adapter_ready},
+        {"critical_cameras_ready", cameras_ready},
+        {"control_inhibited", control_inhibited},
+    }));
     if (control_inhibited || (cameras_ready && !adapter_ready)) {
       // Closing only the control DataChannel protects older controller builds
       // from treating an unacknowledged ESTOP as delivered.  RTP/video stays
@@ -902,30 +961,28 @@ struct VehicleMediaRuntime::Impl {
       self->control_service_started = false;
       self->control_service.reset();
     }
-    std::cout << Json({
-                     {"event", "vehicle_control_data_channel_closed"},
-                     {"event_at_utc_ms", self->signaling.now_ms()},
-                     {"vehicle_id", self->config.vehicle_id},
-                     {"driver_id", self->signaling.driver_id()},
-                     {"session_id", self->signaling.session_id()},
-                     {"accepted_commands", self->accepted_control_commands.load()},
-                     {"rejected_commands", self->rejected_control_commands.load()},
-                     {"last_received_at_utc_ms", self->last_control_received_at_ms.load()},
-                     {"safety_action", "local_full_stop"},
-                 }).dump()
-              << '\n';
+    static_cast<void>(self->emit_json_line({
+        {"event", "vehicle_control_data_channel_closed"},
+        {"event_at_utc_ms", self->signaling.now_ms()},
+        {"vehicle_id", self->config.vehicle_id},
+        {"driver_id", self->signaling.driver_id()},
+        {"session_id", self->signaling.session_id()},
+        {"accepted_commands", self->accepted_control_commands.load()},
+        {"rejected_commands", self->rejected_control_commands.load()},
+        {"last_received_at_utc_ms", self->last_control_received_at_ms.load()},
+        {"safety_action", "local_full_stop"},
+    }));
   }
 
   static void on_control_channel_error(GstWebRTCDataChannel* channel, GError* error, gpointer user_data) {
     auto* self = static_cast<Impl*>(user_data);
-    std::cout << Json({
-                     {"event", "vehicle_control_data_channel_error"},
-                     {"event_at_utc_ms", self->signaling.now_ms()},
-                     {"vehicle_id", self->config.vehicle_id},
-                     {"session_id", self->signaling.session_id()},
-                     {"error", error == nullptr ? "unknown data channel error" : error->message},
-                 }).dump()
-              << '\n';
+    static_cast<void>(self->emit_json_line({
+        {"event", "vehicle_control_data_channel_error"},
+        {"event_at_utc_ms", self->signaling.now_ms()},
+        {"vehicle_id", self->config.vehicle_id},
+        {"session_id", self->signaling.session_id()},
+        {"error", error == nullptr ? "unknown data channel error" : error->message},
+    }));
     on_control_channel_close(channel, user_data);
   }
 
@@ -1034,8 +1091,7 @@ struct VehicleMediaRuntime::Impl {
     details["session_id"] = signaling.session_id();
     details["operator_action"] = operator_action;
     if (!error.empty()) details["error"] = error;
-    std::lock_guard lock(diagnostic_mutex);
-    std::cout << details.dump() << std::endl;
+    static_cast<void>(emit_json_line(std::move(details)));
   }
 
   void stop_control_for_pipeline_fault(std::string_view issue_code) {
@@ -1223,24 +1279,21 @@ struct VehicleMediaRuntime::Impl {
           result.accepted = false;
           result.reason = "driver_not_connected";
         } else {
-          result = control_service->receive_session_profile(
-              request,
-              signaling.now_ms());
+          result = control_service->receive_session_profile(request, signaling.clock_sample());
           if (result.accepted) invalidate_native_control_trusted_gear_locked();
         }
         send_session_control_profile_status_locked(result);
-        std::cout << Json({
-                         {"event", "vehicle_session_control_profile_received"},
-                         {"event_at_utc_ms", signaling.now_ms()},
-                         {"vehicle_id", config.vehicle_id},
-                         {"driver_id", signaling.driver_id()},
-                         {"session_id", signaling.session_id()},
-                         {"request_seq", request.seq},
-                         {"accepted", result.accepted},
-                         {"idempotent", result.idempotent},
-                         {"reason", result.reason},
-                     }).dump()
-                  << '\n';
+        static_cast<void>(emit_json_line({
+            {"event", "vehicle_session_control_profile_received"},
+            {"event_at_utc_ms", signaling.now_ms()},
+            {"vehicle_id", config.vehicle_id},
+            {"driver_id", signaling.driver_id()},
+            {"session_id", signaling.session_id()},
+            {"request_seq", request.seq},
+            {"accepted", result.accepted},
+            {"idempotent", result.idempotent},
+            {"reason", result.reason},
+        }));
         return;
       }
       if (message.value("event", "") == "vcu_handshake_command") {
@@ -1259,7 +1312,7 @@ struct VehicleMediaRuntime::Impl {
         bool accepted = false;
         try {
           if (action == "connect") {
-            accepted = control_service->request_vcu_handshake();
+            accepted = control_service->request_vcu_handshake(signaling.clock_sample());
           } else if (action == "disconnect") {
             accepted = control_service->disconnect_vcu_handshake();
           }
@@ -1275,17 +1328,16 @@ struct VehicleMediaRuntime::Impl {
           return;
         }
         if (accepted) invalidate_native_control_trusted_gear_locked();
-        std::cout << Json({
-                         {"event", "vehicle_vcu_handshake_command"},
-                         {"event_at_utc_ms", signaling.now_ms()},
-                         {"vehicle_id", config.vehicle_id},
-                         {"driver_id", signaling.driver_id()},
-                         {"session_id", signaling.session_id()},
-                         {"action", action},
-                         {"accepted", accepted},
-                         {"vcu_handshake", control_service->vcu_handshake_status().to_json()},
-                     }).dump()
-                  << '\n';
+        static_cast<void>(emit_json_line({
+            {"event", "vehicle_vcu_handshake_command"},
+            {"event_at_utc_ms", signaling.now_ms()},
+            {"vehicle_id", config.vehicle_id},
+            {"driver_id", signaling.driver_id()},
+            {"session_id", signaling.session_id()},
+            {"action", action},
+            {"accepted", accepted},
+            {"vcu_handshake", control_service->vcu_handshake_status().to_json()},
+        }));
         send_vcu_handshake_status_locked(
             accepted ? "command_accepted" : "command_rejected");
         return;
@@ -1297,17 +1349,16 @@ struct VehicleMediaRuntime::Impl {
         // cannot be applied once through each transport.
         const auto rejected_count = ++rejected_control_commands;
         if (rejected_count == 1 || rejected_count % 100 == 0) {
-          std::cout << Json({
-                           {"event", "vehicle_control_transport_rejected"},
-                           {"event_at_utc_ms", signaling.now_ms()},
-                           {"vehicle_id", config.vehicle_id},
-                           {"driver_id", signaling.driver_id()},
-                           {"session_id", signaling.session_id()},
-                           {"transport", transport_name},
-                           {"reason", "legacy_data_channel_control_disabled"},
-                           {"rejected_commands", rejected_count},
-                       }).dump()
-                    << '\n';
+          static_cast<void>(emit_json_line({
+              {"event", "vehicle_control_transport_rejected"},
+              {"event_at_utc_ms", signaling.now_ms()},
+              {"vehicle_id", config.vehicle_id},
+              {"driver_id", signaling.driver_id()},
+              {"session_id", signaling.session_id()},
+              {"transport", transport_name},
+              {"reason", "legacy_data_channel_control_disabled"},
+              {"rejected_commands", rejected_count},
+          }));
         }
         return;
       }
@@ -1320,10 +1371,14 @@ struct VehicleMediaRuntime::Impl {
           !command.estop && !intent_fresh &&
           command.steering == 0.0 && command.throttle == 0.0 &&
           command.brake == 0.0;
+      // Native control callbacks must enforce encoded-frame freshness even if
+      // the main media loop is blocked in signaling I/O.
+      enforce_critical_camera_freshness();
       const auto control_mutex_wait_started_monotonic_ms = steady_now_ms();
       std::unique_lock lock(control_mutex);
-      const auto control_mutex_acquired_monotonic_ms = steady_now_ms();
-      const auto control_mutex_acquired_at_utc_ms = signaling.now_ms();
+      const auto control_clock_sample = signaling.clock_sample();
+      const auto control_mutex_acquired_monotonic_ms = control_clock_sample.monotonic.value;
+      const auto control_mutex_acquired_at_utc_ms = control_clock_sample.utc.value;
       const auto active_session_id = signaling.session_id();
       const bool control_log_commands = config.runtime.control_log_commands;
       const auto queue_control_trace = [this,
@@ -1624,14 +1679,14 @@ struct VehicleMediaRuntime::Impl {
             1,
             std::memory_order_relaxed);
       }
-      const auto received_at_ms = control_mutex_acquired_at_utc_ms;
+      const auto received_at_utc_ms = control_mutex_acquired_at_utc_ms;
       const auto receive_apply_started_at_utc_ms = signaling.now_ms();
       const auto receive_apply_started_monotonic_ms = steady_now_ms();
       ReceiveResult result;
       std::int64_t receive_apply_completed_at_utc_ms = 0;
       std::int64_t receive_apply_completed_monotonic_ms = 0;
       try {
-        result = control_service->receive_command(command, received_at_ms);
+        result = control_service->receive_command(command, control_clock_sample);
         receive_apply_completed_at_utc_ms = signaling.now_ms();
         receive_apply_completed_monotonic_ms = steady_now_ms();
       } catch (...) {
@@ -1682,21 +1737,20 @@ struct VehicleMediaRuntime::Impl {
               1,
               std::memory_order_relaxed);
         }
-        last_control_received_at_ms = received_at_ms;
+        last_control_received_at_ms = received_at_utc_ms;
         native_control_last_accepted_monotonic_ms =
             control_mutex_acquired_monotonic_ms;
         if (accepted_count == 1 || accepted_count % 100 == 0) {
-          std::cout << Json({
-                           {"event", "vehicle_native_control_progress"},
-                           {"event_at_utc_ms", received_at_ms},
-                           {"vehicle_id", config.vehicle_id},
-                           {"driver_id", signaling.driver_id()},
-                           {"session_id", signaling.session_id()},
-                           {"transport", transport_name},
-                           {"accepted_commands", accepted_count},
-                           {"rejected_commands", rejected_control_commands.load()},
-                       }).dump()
-                    << '\n';
+          static_cast<void>(emit_json_line({
+              {"event", "vehicle_native_control_progress"},
+              {"event_at_utc_ms", received_at_utc_ms},
+              {"vehicle_id", config.vehicle_id},
+              {"driver_id", signaling.driver_id()},
+              {"session_id", signaling.session_id()},
+              {"transport", transport_name},
+              {"accepted_commands", accepted_count},
+              {"rejected_commands", rejected_control_commands.load()},
+          }));
         }
       } else {
         ++rejected_control_commands;
@@ -1747,16 +1801,15 @@ struct VehicleMediaRuntime::Impl {
           receive_apply_completed_monotonic_ms);
     } catch (const std::exception& error) {
       ++rejected_control_commands;
-      std::cout << Json({
-                       {"event", "vehicle_control_message_rejected"},
-                       {"event_at_utc_ms", signaling.now_ms()},
-                       {"vehicle_id", config.vehicle_id},
-                       {"session_id", signaling.session_id()},
-                       {"transport", transport_name},
-                       {"reason", "invalid_control_message"},
-                       {"error", error.what()},
-                   }).dump()
-                << '\n';
+      static_cast<void>(emit_json_line({
+          {"event", "vehicle_control_message_rejected"},
+          {"event_at_utc_ms", signaling.now_ms()},
+          {"vehicle_id", config.vehicle_id},
+          {"session_id", signaling.session_id()},
+          {"transport", transport_name},
+          {"reason", "invalid_control_message"},
+          {"error", error.what()},
+      }));
     }
   }
 
@@ -2345,14 +2398,13 @@ struct VehicleMediaRuntime::Impl {
       }
     } catch (const std::exception& error) {
       invalidate_native_control_trusted_gear_locked();
-      std::cout << Json({
-                       {"event", "vehicle_vcu_handshake_status_failed"},
-                       {"event_at_utc_ms", signaling.now_ms()},
-                       {"vehicle_id", config.vehicle_id},
-                       {"session_id", signaling.session_id()},
-                       {"error", error.what()},
-                   }).dump()
-                << '\n';
+      static_cast<void>(emit_json_line({
+          {"event", "vehicle_vcu_handshake_status_failed"},
+          {"event_at_utc_ms", signaling.now_ms()},
+          {"vehicle_id", config.vehicle_id},
+          {"session_id", signaling.session_id()},
+          {"error", error.what()},
+      }));
     }
   }
 
@@ -2456,6 +2508,72 @@ struct VehicleMediaRuntime::Impl {
     }
   }
 
+  void set_recording_valve(const Lane& lane, bool storage_drop) const {
+    if (lane.recording_valve != nullptr) {
+      g_object_set(lane.recording_valve, "drop",
+                   storage_drop || lane.recording_failed.load() ? TRUE : FALSE, nullptr);
+    }
+  }
+
+  void set_recording_valves(bool storage_drop) const {
+    for (const auto& lane : lanes) {
+      set_recording_valve(*lane, storage_drop);
+    }
+  }
+
+  [[nodiscard]] bool disable_recording_lane(Lane& lane) {
+    const bool changed = !lane.recording_failed.exchange(true);
+    set_recording_valve(lane, recording_suspended.load());
+    return changed;
+  }
+
+  void enforce_recording_storage(bool force = false) {
+    if (recording_root.empty())
+      return;
+    const auto steady_ms = steady_now_ms();
+    if (!force && steady_ms < next_recording_space_check_ms)
+      return;
+    next_recording_space_check_ms = steady_ms + 1000;
+    try {
+      const auto storage = enforce_recording_storage_policy(recording_root, config.recording);
+      const bool suspend = !storage.recording_allowed;
+      const bool changed = recording_suspended.exchange(suspend) != suspend;
+      set_recording_valves(suspend);
+      if (storage.removed_uploaded_segments > 0 || storage.removed_unuploaded_segments > 0) {
+        emit_diagnostic("vehicle_recording_retention_cleanup", "recording_low_space_cleanup",
+                        "recording_storage", "recording storage cleanup removed retained segments",
+                        "Review recording retention and archive health; pending evidence is "
+                        "deleted only when explicitly enabled.",
+                        true, storage.to_json());
+      }
+      if (changed && suspend) {
+        emit_diagnostic("vehicle_recording_suspended", "recording_low_space", "recording_storage",
+                        "recording filesystem is below min_free_gb after permitted cleanup",
+                        "Restore recording disk capacity. Live media and the independent control "
+                        "safety path remain active.",
+                        true,
+                        {{"storage", storage.to_json()},
+                         {"safety_action", "recording_paused_live_media_and_control_continue"}});
+      } else if (changed) {
+        emit_diagnostic("vehicle_recording_resumed", "recording_space_recovered",
+                        "recording_storage", "recording filesystem recovered above min_free_gb",
+                        "No action is required; recording input has resumed.", true,
+                        storage.to_json());
+      }
+    } catch (const std::exception& error) {
+      const bool changed = !recording_suspended.exchange(true);
+      set_recording_valves(true);
+      if (changed || force) {
+        emit_diagnostic("vehicle_recording_suspended", "recording_space_check_failed",
+                        "recording_storage", error.what(),
+                        "Check recording directory permissions and filesystem health. Live media "
+                        "and control remain active.",
+                        true,
+                        {{"safety_action", "recording_paused_live_media_and_control_continue"}});
+      }
+    }
+  }
+
   void start_control_when_cameras_ready() {
     if (!config.runtime.control_enabled || control_inhibited || !critical_cameras_ready()) return;
     {
@@ -2507,7 +2625,7 @@ struct VehicleMediaRuntime::Impl {
             signaling.session_id(),
             signaling.control_token(),
             create_vehicle_adapter(config));
-        control_service->start(signaling.now_ms());
+        control_service->start(signaling.clock_sample());
         // A critical camera can fail while a vendor adapter is synchronously
         // opening.  The latch is set before it waits for this mutex, so check
         // again before publishing the adapter as ready or accepting commands.
@@ -2635,9 +2753,9 @@ struct VehicleMediaRuntime::Impl {
   void tick_control_service() {
     std::unique_lock lock(control_mutex);
     if (stop_requested || control_inhibited || !control_service_started || !control_service) return;
-    const auto timestamp_ms = signaling.now_ms();
+    const ClockSample now = signaling.clock_sample();
     try {
-      control_service->tick(timestamp_ms);
+      control_service->tick(now);
     } catch (const std::exception& error) {
       emit_diagnostic(
           "vehicle_vcu_runtime_failed",
@@ -2677,10 +2795,10 @@ struct VehicleMediaRuntime::Impl {
       }
       return;
     }
-    if (control_link_open &&
-        (!last_vcu_status_ms || timestamp_ms - *last_vcu_status_ms >= 500)) {
+    if (control_link_open && (!last_vcu_status_monotonic_ms ||
+                              now.monotonic.value - last_vcu_status_monotonic_ms->value >= 500)) {
       send_vcu_handshake_status_locked("status_update");
-      last_vcu_status_ms = timestamp_ms;
+      last_vcu_status_monotonic_ms = now.monotonic;
     }
     if (control_link_open) send_latest_vehicle_telemetry_locked();
   }
@@ -2770,16 +2888,18 @@ struct VehicleMediaRuntime::Impl {
         const auto directory = recording_root / config.vehicle_id / signaling.session_id() / lane->camera.id;
         std::filesystem::create_directories(directory);
         const auto pattern = directory / (std::to_string(signaling.now_ms()) + "_" + lane->camera.id + "_%05d.mp4");
-        pipeline_text
-            << "encoded_" << id << ". ! queue max-size-buffers="
-            << std::max(2, lane->profile.fps * 2)
-            << " max-size-bytes=0 max-size-time=0 leaky=downstream "
-            << "! " << parser << " config-interval=-1 "
-            << "! " << elementary_caps << ",stream-format=" << recording_stream_format << ",alignment=au "
-            << "! splitmuxsink name=recorder_" << id
-            << " muxer-factory=mp4mux async-finalize=true max-size-time="
-            << static_cast<std::int64_t>(record_profile.segment_seconds) * GST_SECOND
-            << " location=" << quote_pipeline(pattern.string()) << ' ';
+        pipeline_text << "encoded_" << id << ". ! queue name=recording_queue_" << id
+                      << " max-size-buffers=" << std::max(2, lane->profile.fps * 2)
+                      << " max-size-bytes=0 max-size-time=0 leaky=downstream "
+                      << "! valve name=recording_valve_" << id
+                      << " drop=" << (recording_suspended.load() ? "true" : "false") << ' ' << "! "
+                      << parser << " name=recording_parser_" << id << " config-interval=-1 "
+                      << "! " << elementary_caps << ",stream-format=" << recording_stream_format
+                      << ",alignment=au "
+                      << "! splitmuxsink name=recorder_" << id
+                      << " muxer-factory=mp4mux async-finalize=true max-size-time="
+                      << static_cast<std::int64_t>(record_profile.segment_seconds) * GST_SECOND
+                      << " location=" << quote_pipeline(pattern.string()) << ' ';
       }
       ++payload_type;
     }
@@ -2888,7 +3008,17 @@ struct VehicleMediaRuntime::Impl {
     answer_received_at_ms.reset();
     control_not_open_warning_fired = false;
     control_link_opened_this_attempt = false;
+    recording_finalization_cancellation = std::make_shared<std::atomic<bool>>(false);
+    if (recording_pipeline_generation == std::numeric_limits<std::uint64_t>::max()) {
+      throw std::overflow_error("recording pipeline generation is exhausted");
+    }
+    ++recording_pipeline_generation;
     prepare_lanes();
+    for (const auto& lane : lanes) {
+      lane->recording_generation = recording_pipeline_generation;
+      lane->recording_failed = false;
+    }
+    enforce_recording_storage(true);
     auto encoder_choice = create_video_encoder(candidate);
     if (encoder_choice->factory_name().empty()) {
       set_pipeline_error(
@@ -2943,27 +3073,27 @@ struct VehicleMediaRuntime::Impl {
       throw;
     }
 
-    // Supported GStreamer versions keep webrtcbin closed while it is in NULL.
-    // Creating a DataChannel in that state returns nullptr, so transition the complete
-    // pipeline to READY before asking webrtcbin to create the control channel.
-    const auto ready_state = gst_element_set_state(pipeline, GST_STATE_READY);
-    if (ready_state == GST_STATE_CHANGE_FAILURE) {
-      set_pipeline_error(
-          "GStreamer WebRTC pipeline failed to enter READY state",
-          "gstreamer_ready_state_failed",
-          "pipeline_ready",
-          "Inspect GStreamer plugin, device, and encoder initialization errors.",
-          true);
-      stop_pipeline();
-      return false;
-    }
-    configure_control_data_channel();
-
+    // Attach before NULL -> READY: splitmuxsink creates its first internal
+    // muxer/sink during READY, and async-finalize replaces those children
+    // later.  The callback tags each real child, rather than trying to infer
+    // ownership from its ancestry after it has been detached.
     for (const auto& lane : lanes) {
       const auto id = pipeline_identifier(lane->camera.id);
       lane->appsrc = gst_bin_get_by_name(GST_BIN(pipeline), ("source_" + id).c_str());
       lane->encoder = gst_bin_get_by_name(GST_BIN(pipeline), ("encoder_" + id).c_str());
-      if (lane->appsrc == nullptr || lane->encoder == nullptr) {
+      lane->recording_queue =
+          gst_bin_get_by_name(GST_BIN(pipeline), ("recording_queue_" + id).c_str());
+      lane->recording_valve =
+          gst_bin_get_by_name(GST_BIN(pipeline), ("recording_valve_" + id).c_str());
+      lane->recording_parser =
+          gst_bin_get_by_name(GST_BIN(pipeline), ("recording_parser_" + id).c_str());
+      lane->recorder = gst_bin_get_by_name(GST_BIN(pipeline), ("recorder_" + id).c_str());
+      const bool recording_expected =
+          !recording_root.empty() && !lane->camera.record_profile.empty();
+      if (lane->appsrc == nullptr || lane->encoder == nullptr ||
+          (recording_expected &&
+           (lane->recording_queue == nullptr || lane->recording_valve == nullptr ||
+            lane->recording_parser == nullptr || lane->recorder == nullptr))) {
         set_pipeline_error(
             "media pipeline lane is incomplete: " + lane->camera.id,
             "gstreamer_camera_lane_incomplete",
@@ -2974,12 +3104,32 @@ struct VehicleMediaRuntime::Impl {
         stop_pipeline();
         return false;
       }
+      if (lane->recorder != nullptr) {
+        g_signal_connect(lane->recorder, "muxer-added", G_CALLBACK(on_recording_muxer_added),
+                         lane.get());
+        g_signal_connect(lane->recorder, "sink-added", G_CALLBACK(on_recording_sink_added),
+                         lane.get());
+      }
       GstPad* encoder_src = gst_element_get_static_pad(lane->encoder, "src");
       if (encoder_src != nullptr) {
         gst_pad_add_probe(encoder_src, GST_PAD_PROBE_TYPE_BUFFER, count_encoded, lane.get(), nullptr);
         gst_object_unref(encoder_src);
       }
     }
+
+    // Supported GStreamer versions keep webrtcbin closed while it is in NULL.
+    // Creating a DataChannel in that state returns nullptr, so transition the complete
+    // pipeline to READY before asking webrtcbin to create the control channel.
+    const auto ready_state = gst_element_set_state(pipeline, GST_STATE_READY);
+    if (ready_state == GST_STATE_CHANGE_FAILURE) {
+      set_pipeline_error("GStreamer WebRTC pipeline failed to enter READY state",
+                         "gstreamer_ready_state_failed", "pipeline_ready",
+                         "Inspect GStreamer plugin, device, and encoder initialization errors.",
+                         true);
+      stop_pipeline();
+      return false;
+    }
+    configure_control_data_channel();
 
     const auto state = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (state == GST_STATE_CHANGE_FAILURE) {
@@ -3221,7 +3371,33 @@ struct VehicleMediaRuntime::Impl {
     return true;
   }
 
-  void stop_pipeline() {
+  void drain_pipeline_bus_for(std::chrono::milliseconds timeout) {
+    if (pipeline == nullptr || timeout <= std::chrono::milliseconds::zero())
+      return;
+    GstBus* bus = gst_element_get_bus(pipeline);
+    if (bus == nullptr)
+      return;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now());
+      const auto wait = std::max(std::chrono::milliseconds(1),
+                                 std::min(remaining, std::chrono::milliseconds(50)));
+      GstMessage* message =
+          gst_bus_timed_pop(bus, static_cast<GstClockTime>(wait.count()) * GST_MSECOND);
+      if (message == nullptr)
+        continue;
+      handle_bus_message(message);
+      gst_message_unref(message);
+    }
+    while (GstMessage* message = gst_bus_pop(bus)) {
+      handle_bus_message(message);
+      gst_message_unref(message);
+    }
+    gst_object_unref(bus);
+  }
+
+  void stop_pipeline(bool final_runtime_shutdown = false) {
     stop_requested = true;
     GstWebRTCDataChannel* channel_to_close = nullptr;
     {
@@ -3268,12 +3444,57 @@ struct VehicleMediaRuntime::Impl {
       }
       GstBus* bus = gst_element_get_bus(pipeline);
       if (bus != nullptr) {
-        GstMessage* message = gst_bus_timed_pop_filtered(
-            bus, 3 * GST_SECOND, static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
-        if (message != nullptr) gst_message_unref(message);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        bool eos_received = false;
+        while (!eos_received && std::chrono::steady_clock::now() < deadline) {
+          GstMessage* message = gst_bus_timed_pop(bus, 50 * GST_MSECOND);
+          if (message == nullptr)
+            continue;
+          eos_received = GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS;
+          handle_bus_message(message);
+          gst_message_unref(message);
+        }
+        while (GstMessage* message = gst_bus_pop(bus)) {
+          handle_bus_message(message);
+          gst_message_unref(message);
+        }
         gst_object_unref(bus);
       }
       gst_element_set_state(pipeline, GST_STATE_NULL);
+      // async-finalize children can report an ERROR only after the pipeline
+      // has gone NULL.  Keep their qdata-backed ownership alive while we
+      // drain that bounded post-stop window, before releasing recorder refs.
+      gst_element_get_state(
+          pipeline, nullptr, nullptr,
+          static_cast<GstClockTime>(kRecordingBusDrainTimeout.count()) * GST_SECOND);
+      drain_pipeline_bus_for(kRecordingBusDrainTimeout);
+    }
+    // fragment-closed only queues bounded work; wait here, outside the 50 ms
+    // media loop, so orphan recovery cannot race a healthy pending sidecar.
+    if (!drain_recording_finalization_worker()) {
+      if (recording_finalization_cancellation)
+        recording_finalization_cancellation->store(true);
+      emit_diagnostic("vehicle_recording_finalization_timeout", "recording_finalization_timeout",
+                      "recording_finalize",
+                      "recording finalization did not drain before the bounded shutdown deadline",
+                      "Recording is quarantined; inspect storage and restart the media session "
+                      "before relying on new clips.",
+                      true,
+                      {{"pipeline_generation", recording_pipeline_generation},
+                       {"timeout_ms", kRecordingFinalizationDrainTimeout.count()},
+                       {"safety_action", "recording_degraded_live_media_and_control_continue"}});
+    }
+    if (final_runtime_shutdown) {
+      // Every callback that can reach Impl is disconnected before the bounded
+      // diagnostic shutdown. Keep R17 fragment finalization and orphan
+      // quarantine after Gst teardown, exactly as before this R11 change.
+      if (webrtc != nullptr)
+        g_signal_handlers_disconnect_by_data(webrtc, this);
+      for (const auto& lane : lanes) {
+        if (lane->recorder != nullptr) {
+          g_signal_handlers_disconnect_by_data(lane->recorder, lane.get());
+        }
+      }
     }
     for (const auto& lane : lanes) {
       if (lane->appsrc != nullptr) {
@@ -3284,6 +3505,28 @@ struct VehicleMediaRuntime::Impl {
         gst_object_unref(lane->encoder);
         lane->encoder = nullptr;
       }
+      if (lane->recording_queue != nullptr) {
+        gst_object_unref(lane->recording_queue);
+        lane->recording_queue = nullptr;
+      }
+      if (lane->recording_valve != nullptr) {
+        gst_object_unref(lane->recording_valve);
+        lane->recording_valve = nullptr;
+      }
+      if (lane->recording_parser != nullptr) {
+        gst_object_unref(lane->recording_parser);
+        lane->recording_parser = nullptr;
+      }
+      if (lane->recorder != nullptr) {
+        g_signal_handlers_disconnect_by_data(lane->recorder, lane.get());
+        gst_object_unref(lane->recorder);
+        lane->recorder = nullptr;
+      }
+      std::lock_guard lock(lane->recording_mutex);
+      lane->unpaired_recording_fragment.reset();
+      lane->unpaired_recording_sink = false;
+      lane->unpaired_recording_muxer = false;
+      lane->active_recording_fragment.reset();
     }
     if (webrtc != nullptr) {
       gst_object_unref(webrtc);
@@ -3294,51 +3537,393 @@ struct VehicleMediaRuntime::Impl {
       pipeline = nullptr;
     }
     try {
-      write_recording_sidecars();
+      quarantine_orphan_recordings(recording_root / config.vehicle_id / signaling.session_id(),
+                                   "clean_stop_without_fragment_closed_event");
     } catch (const std::exception& error) {
-      emit_diagnostic(
-          "vehicle_recording_sidecar_failed",
-          "recording_sidecar_write_failed",
-          "recording_finalize",
-          error.what(),
-          "Check recording directory permissions, free space, and filesystem health.",
-          true);
-      throw;
+      emit_diagnostic("vehicle_recording_sidecar_failed", "recording_sidecar_write_failed",
+                      "recording_finalize", error.what(),
+                      "Check recording directory permissions, free space, and filesystem health.",
+                      true);
     }
   }
 
-  void write_recording_sidecars() const {
-    const auto session_root = recording_root / config.vehicle_id / signaling.session_id();
-    if (recording_root.empty() || !std::filesystem::exists(session_root)) return;
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(session_root)) {
-      if (!entry.is_regular_file() || entry.path().extension() != ".mp4") continue;
+  [[nodiscard]] static std::filesystem::path recording_metadata_path(
+      const std::filesystem::path& video_path) {
+    auto metadata_path = video_path;
+    metadata_path.replace_extension(".json");
+    return metadata_path;
+  }
+
+  [[nodiscard]] static std::filesystem::path recording_revocation_path(
+      const std::filesystem::path& video_path) {
+    auto result = recording_metadata_path(video_path);
+    result += ".revoked";
+    return result;
+  }
+
+  void write_recording_revocation_marker(const detail::RecordingFragmentSnapshot& snapshot,
+                                         std::string_view failure) const {
+    if (snapshot.path.empty())
+      return;
+    const auto marker = recording_revocation_path(snapshot.path);
+    const auto temporary = marker.string() + ".tmp." + random_token(12);
+    {
+      std::ofstream output(temporary, std::ios::trunc);
+      if (!output)
+        throw std::runtime_error("cannot write recording revocation marker: " + marker.string());
+      output << Json({
+                         {"pipeline_generation", snapshot.pipeline_generation},
+                         {"recording_revision", snapshot.revision},
+                         {"failure", failure},
+                     })
+                    .dump()
+             << '\n';
+      output.flush();
+      if (!output)
+        throw std::runtime_error("cannot flush recording revocation marker: " + marker.string());
+    }
+    std::filesystem::rename(temporary, marker);
+  }
+
+  void write_recording_sidecar(const std::filesystem::path& video_path, std::string_view session_id,
+                               std::string_view camera_id,
+                               std::optional<std::int64_t> started_at_ms,
+                               std::optional<std::int64_t> ended_at_ms,
+                               std::uint64_t pipeline_generation, std::uint64_t recording_revision,
+                               std::string_view upload_state, std::string_view recording_state,
+                               std::string_view timing_source, std::string_view recovery_state = {},
+                               bool media_identity_verified = true,
+                               bool replace_existing = false) const {
+    if (!regular_file_without_symlink(video_path)) {
+      throw std::runtime_error("recording fragment must be a regular non-symlink file: " +
+                               video_path.string());
+    }
+    const auto metadata_path = recording_metadata_path(video_path);
+    if (std::filesystem::exists(metadata_path) && !replace_existing) {
+      throw std::runtime_error("recording sidecar already exists before publication: " +
+                               metadata_path.string());
+    }
+    Json metadata = {
+        {"vehicle_id", config.vehicle_id},
+        {"session_id", session_id},
+        {"camera_id", camera_id},
+        {"segment_id", video_path.stem().string()},
+        {"pipeline_generation", pipeline_generation},
+        {"recording_revision", recording_revision},
+        {"started_at", started_at_ms.has_value() ? Json(iso_time(*started_at_ms)) : Json(nullptr)},
+        {"ended_at", ended_at_ms.has_value() ? Json(iso_time(*ended_at_ms)) : Json(nullptr)},
+        {"timing_source", timing_source},
+        {"codec",
+         media_identity_verified ? Json(to_string(active_candidate.codec)) : Json(nullptr)},
+        {"encoder",
+         media_identity_verified ? Json(to_string(active_candidate.backend)) : Json(nullptr)},
+        {"upload_state", upload_state},
+        {"recording_state", recording_state},
+        {"video_file", video_path.filename().string()},
+        {"file_size_bytes", std::filesystem::file_size(video_path)},
+        {"video_sha256", sha256_file(video_path)},
+    };
+    if (!recovery_state.empty()) {
+      metadata["recovery_state"] = recovery_state;
+      if (upload_state == "quarantined")
+        metadata["recording_failure"] = recovery_state;
+    }
+    // A revocation marker is intentionally never cleared by a later normal
+    // publication.  Segment paths must be unique within a session; keeping a
+    // stale marker fail-closes a pathological path reuse instead of allowing
+    // a known-bad fragment back into the uploader.
+    const auto temporary = metadata_path.string() + ".tmp." + random_token(12);
+    {
+      std::ofstream output(temporary, std::ios::trunc);
+      if (!output)
+        throw std::runtime_error("cannot write recording sidecar: " + metadata_path.string());
+      output << std::setw(2) << metadata << '\n';
+      output.flush();
+      if (!output)
+        throw std::runtime_error("cannot flush recording sidecar: " + metadata_path.string());
+    }
+    std::filesystem::rename(temporary, metadata_path);
+  }
+
+  void write_quarantined_recording_sidecar(
+      const std::shared_ptr<detail::RecordingFragmentOwner>& fragment,
+      std::string_view fallback_failure = {}) const {
+    if (!fragment)
+      return;
+    const auto snapshot = fragment->snapshot();
+    if (snapshot.path.empty())
+      return;
+    const auto failure =
+        snapshot.failure.empty() ? std::string(fallback_failure) : snapshot.failure;
+    write_recording_revocation_marker(
+        snapshot, failure.empty() ? "recording finalization was not confirmed" : failure);
+    write_recording_sidecar(
+        snapshot.path, snapshot.session_id, snapshot.camera_id, snapshot.started_at_ms,
+        snapshot.ended_at_ms, snapshot.pipeline_generation, snapshot.revision, "quarantined",
+        "failed", "recording_fragment_error",
+        failure.empty() ? "recording finalization was not confirmed" : failure, true, true);
+  }
+
+  void process_recording_finalization_job(const RecordingFinalizationJob& job) {
+    if (!job.fragment)
+      return;
+    auto snapshot = job.fragment->snapshot();
+    if (snapshot.path.empty())
+      return;
+    const auto quarantine = [&](std::string_view fallback_failure) {
+      try {
+        write_quarantined_recording_sidecar(job.fragment, fallback_failure);
+      } catch (const std::exception& error) {
+        emit_diagnostic(
+            "vehicle_recording_sidecar_failed", "recording_fragment_quarantine_failed",
+            "recording_finalization", error.what(),
+            "Keep the fragment out of upload and inspect recording storage permissions.", true,
+            {{"camera_id", snapshot.camera_id},
+             {"pipeline_generation", snapshot.pipeline_generation},
+             {"fragment", snapshot.path.string()},
+             {"safety_action", "recording_degraded_live_media_and_control_continue"}});
+      }
+    };
+    if (job.cancellation && job.cancellation->load()) {
+      static_cast<void>(
+          job.fragment->mark_failed("recording finalization was cancelled during shutdown"));
+      quarantine("recording finalization was cancelled during shutdown");
+      return;
+    }
+    if (job.quarantine || snapshot.state == detail::RecordingFragmentState::Failed) {
+      quarantine("recording error arrived before finalization");
+      return;
+    }
+    if (snapshot.state != detail::RecordingFragmentState::Finalizing)
+      return;
+
+    const auto validation = detail::validate_finalized_mp4(snapshot.path);
+    if (!validation.valid) {
+      static_cast<void>(
+          job.fragment->mark_failed("recording fragment validation failed: " + validation.reason));
+      quarantine("recording fragment validation failed");
+      emit_diagnostic(
+          "vehicle_recording_suspended", "recording_fragment_validation_failed",
+          "recording_finalization", validation.reason,
+          "Inspect the quarantined MP4 fragment and the muxer/filesink before resuming recording.",
+          true,
+          {{"camera_id", snapshot.camera_id},
+           {"pipeline_generation", snapshot.pipeline_generation},
+           {"fragment", snapshot.path.string()},
+           {"safety_action", "recording_degraded_live_media_and_control_continue"}});
+      return;
+    }
+    const auto probe = detail::probe_finalized_mp4(snapshot.path);
+    if (!probe.valid) {
+      static_cast<void>(
+          job.fragment->mark_failed("recording fragment probe failed: " + probe.reason));
+      quarantine("recording fragment probe failed");
+      emit_diagnostic(
+          "vehicle_recording_suspended", "recording_fragment_probe_failed",
+          "recording_finalization", probe.reason,
+          "Inspect the quarantined MP4 fragment and qtdemux/filesink before resuming recording.",
+          true,
+          {{"camera_id", snapshot.camera_id},
+           {"pipeline_generation", snapshot.pipeline_generation},
+           {"fragment", snapshot.path.string()},
+           {"safety_action", "recording_degraded_live_media_and_control_continue"}});
+      return;
+    }
+    if (job.cancellation && job.cancellation->load()) {
+      static_cast<void>(
+          job.fragment->mark_failed("recording finalization was cancelled during shutdown"));
+      quarantine("recording finalization was cancelled during shutdown");
+      return;
+    }
+    if (!job.fragment->claim_completed()) {
+      if (job.fragment->snapshot().state == detail::RecordingFragmentState::Failed) {
+        quarantine("recording error arrived during finalization");
+      }
+      return;
+    }
+
+    snapshot = job.fragment->snapshot();
+    try {
+      const auto publication = job.fragment->snapshot();
+      if (publication.state != detail::RecordingFragmentState::Completed ||
+          publication.revision != snapshot.revision) {
+        if (publication.state == detail::RecordingFragmentState::Failed) {
+          quarantine("recording error arrived before pending publication");
+        }
+        return;
+      }
+      if (job.cancellation && job.cancellation->load()) {
+        static_cast<void>(
+            job.fragment->mark_failed("recording finalization was cancelled during shutdown"));
+        quarantine("recording finalization was cancelled during shutdown");
+        return;
+      }
+      write_recording_sidecar(snapshot.path, snapshot.session_id, snapshot.camera_id,
+                              snapshot.started_at_ms, snapshot.ended_at_ms,
+                              snapshot.pipeline_generation, snapshot.revision, "pending",
+                              "completed",
+                              snapshot.ended_at_ms.has_value() ? "splitmux_running_time"
+                                                               : "fragment_closed_wall_clock");
+    } catch (const std::exception& error) {
+      static_cast<void>(job.fragment->mark_failed("recording pending publication failed: " +
+                                                  std::string(error.what())));
+      quarantine("recording pending publication failed");
+      emit_diagnostic("vehicle_recording_sidecar_failed", "recording_fragment_sidecar_write_failed",
+                      "recording_finalization", error.what(),
+                      "Quarantine the fragment and inspect recording storage before upload.", true,
+                      {{"camera_id", snapshot.camera_id},
+                       {"pipeline_generation", snapshot.pipeline_generation},
+                       {"fragment", snapshot.path.string()},
+                       {"safety_action", "recording_degraded_live_media_and_control_continue"}});
+      return;
+    }
+    if (job.fragment->snapshot().state == detail::RecordingFragmentState::Failed) {
+      quarantine("recording error arrived after pending publication");
+    }
+  }
+
+  void enqueue_recording_finalization(
+      const std::shared_ptr<detail::RecordingFragmentOwner>& fragment, bool quarantine) {
+    if (!fragment || fragment->snapshot().path.empty())
+      return;
+    RecordingFinalizationJob job{
+        fragment, recording_finalization_cancellation,
+        std::chrono::steady_clock::now() +
+            (quarantine ? std::chrono::milliseconds::zero() : kRecordingFinalizeQuietPeriod),
+        quarantine};
+    bool saturated = false;
+    {
+      std::lock_guard lock(recording_finalization_mutex);
+      const auto existing =
+          std::find_if(recording_finalization_jobs.begin(), recording_finalization_jobs.end(),
+                       [&](const auto& queued) { return queued.fragment == fragment; });
+      if (existing != recording_finalization_jobs.end()) {
+        // A late error upgrades the existing delayed completion job instead
+        // of adding unbounded duplicate work for the same fragment.
+        job.cancellation = existing->cancellation;
+        job.quarantine = quarantine || existing->quarantine;
+        if (!job.quarantine)
+          job.not_before = existing->not_before;
+        recording_finalization_jobs.erase(existing);
+      } else if (recording_finalization_jobs.size() >= kMaxRecordingFinalizationJobs) {
+        saturated = true;
+      }
+      if (!saturated) {
+        const auto position =
+            std::upper_bound(recording_finalization_jobs.begin(), recording_finalization_jobs.end(),
+                             job.not_before, [](const auto& not_before, const auto& queued) {
+                               return not_before < queued.not_before;
+                             });
+        recording_finalization_jobs.insert(position, std::move(job));
+      }
+    }
+    if (saturated) {
+      // This is an overload-only escape hatch.  It does not hash or scan the
+      // fragment on the media loop; the durable revocation marker makes an
+      // already-published sidecar ineligible for the uploader.
+      static_cast<void>(fragment->mark_failed("recording finalization queue capacity exceeded"));
+      const auto snapshot = fragment->snapshot();
+      try {
+        write_recording_revocation_marker(snapshot, snapshot.failure);
+      } catch (const std::exception& error) {
+        emit_diagnostic("vehicle_recording_sidecar_failed",
+                        "recording_finalization_queue_overflow_marker_failed",
+                        "recording_finalization", error.what(),
+                        "Keep recording disabled and inspect recording storage before restart.",
+                        true,
+                        {{"pipeline_generation", snapshot.pipeline_generation},
+                         {"fragment", snapshot.path.string()},
+                         {"queue_capacity", kMaxRecordingFinalizationJobs}});
+      }
+      return;
+    }
+    recording_finalization_ready.notify_one();
+  }
+
+  void recording_finalization_loop() {
+    while (true) {
+      RecordingFinalizationJob job;
+      {
+        std::unique_lock lock(recording_finalization_mutex);
+        while (true) {
+          if (recording_finalization_stopping && recording_finalization_jobs.empty())
+            return;
+          if (recording_finalization_jobs.empty()) {
+            recording_finalization_ready.wait(lock);
+            continue;
+          }
+          const auto now = std::chrono::steady_clock::now();
+          const auto& next = recording_finalization_jobs.front();
+          if (next.not_before > now) {
+            recording_finalization_ready.wait_until(lock, next.not_before);
+            continue;
+          }
+          job = std::move(recording_finalization_jobs.front());
+          recording_finalization_jobs.pop_front();
+          ++recording_finalization_active;
+          break;
+        }
+      }
+      process_recording_finalization_job(job);
+      {
+        std::lock_guard lock(recording_finalization_mutex);
+        --recording_finalization_active;
+        if (recording_finalization_jobs.empty() && recording_finalization_active == 0) {
+          recording_finalization_drained.notify_all();
+        }
+      }
+    }
+  }
+
+  void start_recording_finalization_worker() {
+    recording_finalization_thread = std::thread([this] { recording_finalization_loop(); });
+  }
+
+  [[nodiscard]] bool drain_recording_finalization_worker() {
+    std::unique_lock lock(recording_finalization_mutex);
+    return recording_finalization_drained.wait_for(lock, kRecordingFinalizationDrainTimeout, [&] {
+      return recording_finalization_jobs.empty() && recording_finalization_active == 0;
+    });
+  }
+
+  void stop_recording_finalization_worker() {
+    {
+      std::lock_guard lock(recording_finalization_mutex);
+      recording_finalization_stopping = true;
+      for (const auto& job : recording_finalization_jobs) {
+        if (job.cancellation)
+          job.cancellation->store(true);
+      }
+    }
+    recording_finalization_ready.notify_all();
+    if (recording_finalization_thread.joinable())
+      recording_finalization_thread.join();
+  }
+
+  void quarantine_orphan_recordings(const std::filesystem::path& scan_root,
+                                    std::string_view recovery_state) const {
+    if (recording_root.empty() || !std::filesystem::exists(scan_root))
+      return;
+    const auto vehicle_root = recording_root / config.vehicle_id;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(
+             scan_root, std::filesystem::directory_options::skip_permission_denied)) {
+      if (!regular_file_without_symlink(entry.path()) || entry.path().extension() != ".mp4")
+        continue;
       auto metadata_path = entry.path();
       metadata_path.replace_extension(".json");
       if (std::filesystem::exists(metadata_path)) continue;
-      const auto camera_id = entry.path().parent_path().filename().string();
-      const auto segment_id = entry.path().stem().string();
-      const auto timestamp = signaling.now_ms();
-      const Json metadata = {
-          {"vehicle_id", config.vehicle_id},
-          {"session_id", signaling.session_id()},
-          {"camera_id", camera_id},
-          {"segment_id", segment_id},
-          {"started_at", iso_time(timestamp)},
-          {"ended_at", iso_time(timestamp)},
-          {"codec", to_string(active_candidate.codec)},
-          {"encoder", to_string(active_candidate.backend)},
-          {"upload_state", "pending"},
-          {"video_file", entry.path().filename().string()},
-          {"file_size_bytes", entry.file_size()},
-          {"video_sha256", sha256_file(entry.path())},
-      };
-      const auto temporary = metadata_path.string() + ".tmp";
-      {
-        std::ofstream output(temporary, std::ios::trunc);
-        if (!output) throw std::runtime_error("cannot write recording sidecar: " + metadata_path.string());
-        output << std::setw(2) << metadata << '\n';
-      }
-      std::filesystem::rename(temporary, metadata_path);
+      const auto relative = std::filesystem::relative(entry.path(), vehicle_root);
+      auto part = relative.begin();
+      if (part == relative.end())
+        continue;
+      const auto session_id = part->string();
+      ++part;
+      if (part == relative.end())
+        continue;
+      const auto camera_id = part->string();
+      write_recording_sidecar(entry.path(), session_id, camera_id, std::nullopt, std::nullopt, 0, 0,
+                              "quarantined", "failed", "unavailable_after_recovery", recovery_state,
+                              false);
     }
   }
 
@@ -3417,19 +4002,215 @@ struct VehicleMediaRuntime::Impl {
     }
   }
 
-  void poll_bus() {
-    if (pipeline == nullptr) return;
-    GstBus* bus = gst_element_get_bus(pipeline);
-    if (bus == nullptr) return;
-    while (GstMessage* message = gst_bus_pop(bus)) {
-      if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
-        GError* error = nullptr;
-        gchar* debug = nullptr;
-        gst_message_parse_error(message, &error, &debug);
-        std::string value = error != nullptr ? error->message : "unknown GStreamer error";
-        if (debug != nullptr && *debug != '\0') value += ": " + std::string(debug);
-        if (error != nullptr) g_error_free(error);
-        g_free(debug);
+  void tag_recording_child(Lane& lane, GstElement* child, bool sink) {
+    if (child == nullptr)
+      return;
+    std::shared_ptr<detail::RecordingFragmentOwner> fragment;
+    {
+      std::lock_guard lock(lane.recording_mutex);
+      const bool already_tagged =
+          sink ? lane.unpaired_recording_sink : lane.unpaired_recording_muxer;
+      if (!lane.unpaired_recording_fragment || already_tagged) {
+        if (lane.unpaired_recording_fragment) {
+          static_cast<void>(lane.unpaired_recording_fragment->mark_failed(
+              "splitmux internal muxer/sink ownership pair was incomplete"));
+        }
+        lane.unpaired_recording_fragment = std::make_shared<detail::RecordingFragmentOwner>(
+            lane.recording_generation, signaling.session_id(), lane.camera.id);
+        lane.unpaired_recording_sink = false;
+        lane.unpaired_recording_muxer = false;
+      }
+      fragment = lane.unpaired_recording_fragment;
+      if (sink) {
+        lane.unpaired_recording_sink = true;
+      } else {
+        lane.unpaired_recording_muxer = true;
+      }
+      if (lane.unpaired_recording_sink && lane.unpaired_recording_muxer) {
+        lane.unpaired_recording_fragment.reset();
+        lane.unpaired_recording_sink = false;
+        lane.unpaired_recording_muxer = false;
+      }
+    }
+    detail::tag_recording_fragment_owner(GST_OBJECT(child), std::move(fragment));
+  }
+
+  static void on_recording_muxer_added(GstElement*, GstElement* muxer, gpointer user_data) {
+    auto* lane = static_cast<Lane*>(user_data);
+    if (lane != nullptr && lane->owner != nullptr)
+      lane->owner->tag_recording_child(*lane, muxer, false);
+  }
+
+  static void on_recording_sink_added(GstElement*, GstElement* sink, gpointer user_data) {
+    auto* lane = static_cast<Lane*>(user_data);
+    if (lane != nullptr && lane->owner != nullptr)
+      lane->owner->tag_recording_child(*lane, sink, true);
+  }
+
+  [[nodiscard]] Lane* recording_lane(const detail::RecordingFragmentSnapshot& fragment) const {
+    if (fragment.pipeline_generation != recording_pipeline_generation)
+      return nullptr;
+    const auto lane = std::find_if(lanes.begin(), lanes.end(), [&](const auto& value) {
+      return value->recording_generation == fragment.pipeline_generation &&
+             value->camera.id == fragment.camera_id;
+    });
+    return lane == lanes.end() ? nullptr : lane->get();
+  }
+
+  [[nodiscard]] static GstElement* recording_fragment_sink(const GstStructure* structure) {
+    if (structure == nullptr)
+      return nullptr;
+    const auto* value = gst_structure_get_value(structure, "sink");
+    if (value == nullptr || !G_VALUE_HOLDS(value, GST_TYPE_ELEMENT))
+      return nullptr;
+    return GST_ELEMENT(g_value_get_object(value));
+  }
+
+  [[nodiscard]] std::int64_t recording_fragment_time(
+      const std::shared_ptr<detail::RecordingFragmentOwner>& fragment,
+      std::optional<std::uint64_t> running_time_ns) const {
+    if (running_time_ns.has_value()) {
+      if (const auto* lane = recording_lane(fragment->snapshot()); lane != nullptr) {
+        return lane->pipeline_started_ms +
+               static_cast<std::int64_t>(*running_time_ns / GST_MSECOND);
+      }
+    }
+    return signaling.now_ms();
+  }
+
+  void bind_recording_fragment(const std::shared_ptr<detail::RecordingFragmentOwner>& fragment,
+                               const std::filesystem::path& path, std::int64_t started_at_ms) {
+    if (!fragment || !fragment->bind_path(path)) {
+      throw std::runtime_error("splitmux fragment path changed after ownership binding");
+    }
+    fragment->set_started_at_ms(started_at_ms);
+    const auto snapshot = fragment->snapshot();
+    if (snapshot.camera_id != path.parent_path().filename().string()) {
+      throw std::runtime_error("splitmux fragment path does not match its recording camera owner");
+    }
+    if (auto* lane = recording_lane(snapshot); lane != nullptr) {
+      std::lock_guard lock(lane->recording_mutex);
+      lane->active_recording_fragment = fragment;
+    }
+    if (snapshot.state == detail::RecordingFragmentState::Failed) {
+      enqueue_recording_finalization(fragment, true);
+    }
+  }
+
+  void handle_recording_fragment_event(const GstStructure* structure, bool opened,
+                                       std::optional<std::uint64_t> running_time_ns) {
+    const auto* location = gst_structure_get_string(structure, "location");
+    if (location == nullptr || *location == '\0') {
+      throw std::runtime_error("splitmux fragment event omitted location");
+    }
+    auto* sink = recording_fragment_sink(structure);
+    if (sink == nullptr) {
+      throw std::runtime_error("splitmux fragment event omitted its internal sink");
+    }
+    auto fragment = detail::recording_fragment_owner(GST_OBJECT(sink));
+    if (!fragment) {
+      throw std::runtime_error("splitmux fragment event has no stable internal sink ownership");
+    }
+    const auto event_at_ms = recording_fragment_time(fragment, running_time_ns);
+    bind_recording_fragment(fragment, location, event_at_ms);
+    if (!opened && fragment->mark_closed(event_at_ms)) {
+      enqueue_recording_finalization(fragment, false);
+    } else if (!opened && fragment->snapshot().state == detail::RecordingFragmentState::Failed) {
+      enqueue_recording_finalization(fragment, true);
+    }
+  }
+
+  struct RecordingMessageOwner {
+    Lane* lane{nullptr};
+    std::shared_ptr<detail::RecordingFragmentOwner> fragment;
+
+    [[nodiscard]] explicit operator bool() const {
+      return lane != nullptr || static_cast<bool>(fragment);
+    }
+  };
+
+  [[nodiscard]] RecordingMessageOwner recording_message_owner(GstMessage* message) const {
+    auto* source = GST_MESSAGE_SRC(message);
+    if (source == nullptr)
+      return {};
+    if (auto fragment = detail::recording_fragment_owner(source)) {
+      return {recording_lane(fragment->snapshot()), std::move(fragment)};
+    }
+    for (const auto& lane : lanes) {
+      const auto belongs_to = [&](GstElement* element) {
+        return element != nullptr && (source == GST_OBJECT(element) ||
+                                      gst_object_has_as_ancestor(source, GST_OBJECT(element)));
+      };
+      if (!belongs_to(lane->recording_queue) && !belongs_to(lane->recording_valve) &&
+          !belongs_to(lane->recording_parser) && !belongs_to(lane->recorder)) {
+        continue;
+      }
+      std::lock_guard lock(lane->recording_mutex);
+      return {lane.get(), lane->active_recording_fragment};
+    }
+    return {};
+  }
+
+  void handle_recording_error(RecordingMessageOwner owner, std::string_view error) {
+    if (owner.fragment) {
+      static_cast<void>(owner.fragment->mark_failed(std::string(error)));
+      enqueue_recording_finalization(owner.fragment, true);
+      if (owner.lane == nullptr)
+        owner.lane = recording_lane(owner.fragment->snapshot());
+    }
+    const bool changed = owner.lane != nullptr && disable_recording_lane(*owner.lane);
+    const auto snapshot =
+        owner.fragment ? owner.fragment->snapshot() : detail::RecordingFragmentSnapshot{};
+    if (changed || owner.fragment) {
+      emit_diagnostic(
+          "vehicle_recording_suspended", "recording_pipeline_error", "recording_pipeline", error,
+          "Inspect the affected muxer/filesink fragment. Live video and independent control safety "
+          "continue.",
+          true,
+          {{"camera_id", snapshot.camera_id.empty() && owner.lane != nullptr ? owner.lane->camera.id
+                                                                             : snapshot.camera_id},
+           {"pipeline_generation", snapshot.pipeline_generation},
+           {"fragment", snapshot.path.string()},
+           {"safety_action", "recording_lane_disabled_live_media_and_control_continue"}});
+    }
+  }
+
+  void handle_bus_message(GstMessage* message) {
+    if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ELEMENT) {
+      const auto* structure = gst_message_get_structure(message);
+      if (structure != nullptr &&
+          (gst_structure_has_name(structure, "splitmuxsink-fragment-opened") ||
+           gst_structure_has_name(structure, "splitmuxsink-fragment-closed"))) {
+        guint64 running_time_ns = GST_CLOCK_TIME_NONE;
+        const bool has_running_time =
+            gst_structure_get_uint64(structure, "running-time", &running_time_ns);
+        try {
+          handle_recording_fragment_event(
+              structure, gst_structure_has_name(structure, "splitmuxsink-fragment-opened"),
+              has_running_time && GST_CLOCK_TIME_IS_VALID(running_time_ns)
+                  ? std::optional<std::uint64_t>{running_time_ns}
+                  : std::nullopt);
+        } catch (const std::exception& error) {
+          emit_diagnostic(
+              "vehicle_recording_sidecar_failed", "recording_fragment_event_unowned",
+              "recording_fragment_event", error.what(),
+              "Quarantine the affected fragment and inspect recording storage before upload.", true,
+              {{"safety_action", "recording_degraded_live_media_and_control_continue"}});
+        }
+      }
+    } else if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
+      GError* error = nullptr;
+      gchar* debug = nullptr;
+      gst_message_parse_error(message, &error, &debug);
+      std::string value = error != nullptr ? error->message : "unknown GStreamer error";
+      if (debug != nullptr && *debug != '\0')
+        value += ": " + std::string(debug);
+      if (error != nullptr)
+        g_error_free(error);
+      g_free(debug);
+      if (auto owner = recording_message_owner(message)) {
+        handle_recording_error(std::move(owner), value);
+      } else {
         set_pipeline_error(
             std::move(value),
             "gstreamer_bus_error",
@@ -3437,6 +4218,17 @@ struct VehicleMediaRuntime::Impl {
             "Inspect the GStreamer error/debug text and the affected camera or encoder.",
             true);
       }
+    }
+  }
+
+  void poll_bus() {
+    if (pipeline == nullptr)
+      return;
+    GstBus* bus = gst_element_get_bus(pipeline);
+    if (bus == nullptr)
+      return;
+    while (GstMessage* message = gst_bus_pop(bus)) {
+      handle_bus_message(message);
       gst_message_unref(message);
     }
     gst_object_unref(bus);
@@ -3555,12 +4347,11 @@ struct VehicleMediaRuntime::Impl {
           true);
       throw;
     }
-    std::cout << Json({
-                     {"event", "vehicle_media_waiting_for_session"},
-                     {"vehicle_id", config.vehicle_id},
-                     {"poll_interval_ms", config.runtime.teleop_poll_interval_ms},
-                 }).dump()
-              << std::endl;
+    static_cast<void>(emit_json_line({
+        {"event", "vehicle_media_waiting_for_session"},
+        {"vehicle_id", config.vehicle_id},
+        {"poll_interval_ms", config.runtime.teleop_poll_interval_ms},
+    }));
     const auto session_deadline = signaling.now_ms() + 5000;
     while (true) {
       bool discovered = false;
@@ -3602,6 +4393,19 @@ struct VehicleMediaRuntime::Impl {
           "Keep the vehicle stopped. End this session, start a new session, and complete a fresh VCU handshake before driving again.",
           false,
           {{"safety_action", "control_disabled_video_may_continue"}});
+    }
+    if (!recording_root.empty()) {
+      try {
+        quarantine_orphan_recordings(recording_root / config.vehicle_id,
+                                     "startup_fragment_completion_unconfirmed");
+      } catch (const std::exception& error) {
+        emit_diagnostic("vehicle_recording_recovery_failed", "recording_orphan_recovery_failed",
+                        "recording_recovery", error.what(),
+                        "Inspect orphan MP4 files manually; they are not eligible for upload "
+                        "without a pending sidecar.",
+                        true,
+                        {{"safety_action", "recording_degraded_live_media_and_control_continue"}});
+      }
     }
     try {
       ice_configuration = signaling.ice_servers();
@@ -3673,6 +4477,7 @@ struct VehicleMediaRuntime::Impl {
       while (!frame_target_reached(frame_count) && (continuous || signaling.now_ms() < deadline)) {
         while (g_main_context_iteration(nullptr, false)) {
         }
+        enforce_recording_storage();
         try {
           flush_outgoing_signals();
           process_signaling();
@@ -3836,6 +4641,10 @@ struct VehicleMediaRuntime::Impl {
     }
     const bool passed = !attempts.empty() && attempts.back().value("passed", false) &&
         fps_passed && !control_inhibited;
+    // Stop trace producers first, then let the single diagnostic sink either
+    // drain or cancel within its fixed deadline before run() returns.
+    stop_control_trace_worker();
+    diagnostic_emitter.stop();
     Json summary = {
         {"event", "vehicle_media_webrtc_summary"},
         {"runtime", "cpp"},
@@ -3858,7 +4667,9 @@ struct VehicleMediaRuntime::Impl {
         {"attempts", std::move(attempts)},
         {"errors", std::move(errors)},
         {"negotiation_warning", last_negotiation_warning},
-        {"control_data_channel", {
+        {"diagnostic_output", diagnostic_output_status()},
+        {"control_data_channel",
+         {
              {"configured", config.runtime.control_enabled},
              {"ordered", false},
              {"max_retransmits", 0},
@@ -3867,32 +4678,24 @@ struct VehicleMediaRuntime::Impl {
              {"rejected_commands", rejected_control_commands.load()},
              {"link_loss_count", control_link_loss_count.load()},
              {"last_received_at_utc_ms", last_control_received_at_ms.load()},
-        }},
-        {"native_control_signaling", {
+         }},
+        {"native_control_signaling",
+         {
              {"configured", config.runtime.control_enabled},
              {"transport", "native_signaling_websocket"},
              {"websocket_connected", native_control_websocket_connected.load()},
-             {"websocket_connect_timeout_ms",
-              kNativeControlWebSocketConnectTimeout.count()},
-             {"websocket_receive_timeout_ms",
-              kNativeControlWebSocketReceiveTimeout.count()},
+             {"websocket_connect_timeout_ms", kNativeControlWebSocketConnectTimeout.count()},
+             {"websocket_receive_timeout_ms", kNativeControlWebSocketReceiveTimeout.count()},
              {"watchdog_interval_ms", kNativeControlWatchdogInterval.count()},
              {"connection_attempts_total",
               native_control_websocket_connection_attempts_total.load()},
-             {"connections_total",
-              native_control_websocket_connections_total.load()},
-             {"reconnects_total",
-              native_control_websocket_reconnects_total.load()},
-             {"transport_errors_total",
-              native_control_transport_errors_total.load()},
-             {"protocol_errors_total",
-              native_control_protocol_errors_total.load()},
-             {"consecutive_errors",
-              native_control_transport_consecutive_errors.load()},
-             {"envelopes_received_total",
-              native_control_websocket_envelopes_total.load()},
-             {"messages_received_total",
-              native_control_websocket_messages_total.load()},
+             {"connections_total", native_control_websocket_connections_total.load()},
+             {"reconnects_total", native_control_websocket_reconnects_total.load()},
+             {"transport_errors_total", native_control_transport_errors_total.load()},
+             {"protocol_errors_total", native_control_protocol_errors_total.load()},
+             {"consecutive_errors", native_control_transport_consecutive_errors.load()},
+             {"envelopes_received_total", native_control_websocket_envelopes_total.load()},
+             {"messages_received_total", native_control_websocket_messages_total.load()},
              {"messages_superseded_total",
               native_control_websocket_superseded_messages_total.load()},
              {"post_error_discards_total",
@@ -3909,58 +4712,58 @@ struct VehicleMediaRuntime::Impl {
               native_control_stale_safe_native_gap_discards_total.load()},
              {"stale_safe_untrusted_gear_discards_total",
               native_control_stale_safe_untrusted_gear_discards_total.load()},
-             {"fresh_gear_updates_total",
-              native_control_fresh_gear_updates_total.load()},
+             {"fresh_gear_updates_total", native_control_fresh_gear_updates_total.load()},
              {"trusted_gear_invalidations_total",
               native_control_trusted_gear_invalidations_total.load()},
-             {"estop_gear_freezes_total",
-              native_control_estop_gear_freezes_total.load()},
+             {"estop_gear_freezes_total", native_control_estop_gear_freezes_total.load()},
              {"estop_gear_freezes_after_apply_error_total",
               native_control_estop_gear_freezes_after_apply_error_total.load()},
-             {"estop_gear_overrides_total",
-              native_control_estop_gear_overrides_total.load()},
+             {"estop_gear_overrides_total", native_control_estop_gear_overrides_total.load()},
              {"profile_not_ready_discards_total",
               native_control_profile_not_ready_discards_total.load()},
              {"handshake_not_ready_discards_total",
               native_control_handshake_not_ready_discards_total.load()},
-             {"delivery_acks_sent_total",
-              native_control_delivery_acks_sent_total.load()},
+             {"delivery_acks_sent_total", native_control_delivery_acks_sent_total.load()},
              {"delivery_acknowledgements_total",
               native_control_delivery_acknowledgements_total.load()},
              {"accepted_commands", accepted_control_commands.load()},
              {"rejected_commands", rejected_control_commands.load()},
              {"last_received_at_utc_ms", last_control_received_at_ms.load()},
-             {"watchdog_ticks_total",
-              native_control_watchdog_ticks_total.load()},
+             {"watchdog_ticks_total", native_control_watchdog_ticks_total.load()},
              {"watchdog_skipped_intervals_total",
               native_control_watchdog_skipped_intervals_total.load()},
-             {"last_connected_at_utc_ms",
-              native_control_websocket_last_connected_at_ms.load()},
-             {"last_message_at_utc_ms",
-              native_control_websocket_last_message_at_ms.load()},
-             {"last_error_at_utc_ms",
-              native_control_transport_last_error_at_ms.load()},
-             {"freshness_cutoff_at_utc_ms",
-              native_control_command_freshness_cutoff_at_ms.load()},
+             {"last_connected_at_utc_ms", native_control_websocket_last_connected_at_ms.load()},
+             {"last_message_at_utc_ms", native_control_websocket_last_message_at_ms.load()},
+             {"last_error_at_utc_ms", native_control_transport_last_error_at_ms.load()},
+             {"freshness_cutoff_at_utc_ms", native_control_command_freshness_cutoff_at_ms.load()},
          }},
     };
-    // The caller writes the summary after run() returns.  Drain and join the
-    // trace worker first so a late final trace line cannot interleave with it.
-    stop_control_trace_worker();
     return summary;
   }
 
   VehicleConfig config;
   MediaSignalingClient signaling;
+  mutable detail::DiagnosticEmitter diagnostic_emitter;
   std::shared_ptr<CriticalCameraControlLatch> critical_camera_control_latch;
   int frame_timeout_ms;
   std::filesystem::path recording_root;
+  std::atomic<bool> recording_suspended{false};
+  std::uint64_t recording_pipeline_generation{0};
+  std::int64_t next_recording_space_check_ms{0};
   std::optional<std::string> forced_codec;
   int simulate_primary_failure_after_frames;
   GstElement* pipeline{nullptr};
   GstElement* webrtc{nullptr};
   GstWebRTCDataChannel* control_channel{nullptr};
   std::vector<std::unique_ptr<Lane>> lanes;
+  std::mutex recording_finalization_mutex;
+  std::condition_variable recording_finalization_ready;
+  std::condition_variable recording_finalization_drained;
+  std::deque<RecordingFinalizationJob> recording_finalization_jobs;
+  std::thread recording_finalization_thread;
+  bool recording_finalization_stopping{false};
+  std::size_t recording_finalization_active{0};
+  std::shared_ptr<std::atomic<bool>> recording_finalization_cancellation;
   std::atomic<bool> stop_requested{false};
   std::mutex signal_mutex;
   std::deque<std::pair<std::string, Json>> pending_signals;
@@ -3970,7 +4773,6 @@ struct VehicleMediaRuntime::Impl {
   std::string pipeline_error_stage;
   std::string pipeline_operator_action;
   bool pipeline_error_retryable{false};
-  mutable std::mutex diagnostic_mutex;
   EncoderCandidate active_candidate{EncoderBackend::Nvenc, VideoCodec::H265};
   std::int64_t started_ms{0};
   bool answer_received{false};
@@ -4049,7 +4851,7 @@ struct VehicleMediaRuntime::Impl {
   std::atomic<std::int64_t> native_control_transport_last_error_at_ms{0};
   std::atomic<std::int64_t> native_control_command_freshness_cutoff_at_ms{0};
   std::atomic<std::int64_t> native_control_transport_last_error_log_monotonic_ms{0};
-  std::optional<std::int64_t> last_vcu_status_ms;
+  std::optional<MonotonicMillis> last_vcu_status_monotonic_ms;
   std::uint64_t last_vehicle_telemetry_seq{0};
   std::uint64_t control_status_seq{0};
   std::string last_vcu_handshake_state;

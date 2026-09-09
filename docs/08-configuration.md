@@ -28,16 +28,17 @@ config/driver-console.dev.yaml
 ## 信令服务多身份配置
 
 独立信令进程的多驾驶员/多车辆身份使用单独的 YAML。仓库示例
-`configs/signaling-server.2x2.dev.yaml` 使用环境变量引用，不包含 secret 明文：
+`configs/signaling-server.2x2.dev.yaml` 仅为受限的明文迁移 fixture；生产
+配置使用 Argon2id PHC verifier，不包含 secret 明文：
 
 ```yaml
 auth:
   drivers:
     - id: driver-console-001
-      password_env: MINE_TELEOP_DRIVER_001_PASSWORD
+      password_hash_file: secrets/driver-console-001.password.argon2id
       vehicles: [vehicle-001]
     - id: driver-console-002
-      password_env: MINE_TELEOP_DRIVER_002_PASSWORD
+      password_hash_env: MINE_TELEOP_DRIVER_002_PASSWORD_ARGON2ID
       vehicles: [vehicle-002]
   vehicles:
     - id: vehicle-001
@@ -47,9 +48,30 @@ auth:
 ```
 
 每个驾驶员必须配置非空车辆白名单；白名单只能引用本文件中声明的车辆。驾驶员
-必须且只能二选一配置 `password_file`/`password_env`，车辆同样二选一配置
-`device_token_file`/`device_token_env`。相对 secret 文件按 YAML 所在目录解析，现场
-文件应设为 `0600`。先执行以下命令做无监听校验，再启动服务：
+必须且只能二选一配置 `password_hash_file`/`password_hash_env`，车辆同样二选一配置
+`device_token_file`/`device_token_env`。Argon2id verifier 必须是带 `v=19`、`m/t/p`、
+salt 与 digest 的 PHC 字符串，服务会限制编码长度及成本上限后才调用库验证。相对 secret
+文件按 YAML 所在目录解析，现场文件应设为 `0600`。
+
+旧 `password_file`/`password_env` 只可用于明确的迁移窗口，且需要同级开关和移除日期；
+没有两者之一，配置校验会失败。当前开发 fixture 的日期为 `2027-03-31`，生产迁移应使用
+自己的短期日期并在到期前完成口令轮换与删除明文字段：
+
+```yaml
+auth:
+  allow_legacy_passwords: true
+  legacy_passwords_remove_by: "2027-03-31"
+  drivers:
+    - id: temporary-legacy-driver
+      password_file: secrets/temporary-legacy-driver.password
+      vehicles: [vehicle-001]
+```
+
+使用 `scripts/admin/add_driver.sh` 创建新驾驶员时，脚本会生成 0600 的随机口令和
+Argon2id verifier，并仅把 `password_hash_file` 写入配置；口令不会进入 argv、日志或审计。
+`allow_legacy_passwords` 是临时迁移开关：服务仅在 `legacy_passwords_remove_by` 尚未到期时
+接受该模式；到期后必须改为 verifier 配置才能启动。
+先执行以下命令做无监听校验，再启动服务：
 
 ```bash
 mine-teleop-signaling-server \
@@ -59,6 +81,47 @@ mine-teleop-signaling-server \
 
 多身份配置不能与旧的 `--driver-id`、`--driver-password`、`--vehicle-id`、
 `--device-token` 或对应的单身份 secret 环境变量混用；混用会启动失败。
+
+### 信令连接预算与 HTTP 阶段时限
+
+身份 YAML 可携带顶层 `connection_limits` 映射，用于设置监听器的连接预算与 HTTP
+阶段时限。每个已配置数值均为单位显式、必须为正；零、负值或超限组合都会在启动监听与
+激活服务之前失败，错误会点名具体字段。省略整个映射或其中任意字段时，均保留运行时
+`SimpleHttpServer::ConnectionLimits` 默认值：
+
+```yaml
+connection_limits:
+  max_active_connections: 64        # 总并发 socket 预算
+  max_pending_http_connections: 16  # 升级前 HTTP 请求槽位
+  max_websocket_connections: 48     # 升级后 WSS 通道
+  max_connections_per_source: 48    # 每来源 IP 预算
+  listen_backlog: 64                # TCP accept backlog
+  header_read_timeout_ms: 5000      # HTTP 头阶段时限
+  body_read_timeout_ms: 10000       # HTTP body 阶段时限
+  response_write_timeout_ms: 5000   # 正常响应写时限
+  overload_write_timeout_ms: 100    # 过载拒绝写时限
+```
+
+校验规则：所有数值为正；`max_pending_http_connections` 与 `max_websocket_connections`
+不得大于 `max_active_connections`；由于信令服务始终安装 WSS handler，必须为升级后的
+WSS 通道保留容量（`max_websocket_connections > 0` 且 `max_pending_http_connections <
+max_active_connections`）；各类时限拒绝零、负值与人可写的溢出值。映射允许**部分覆盖**：
+任何未显式给出的字段都继承运行时默认值，因此 `connection_limits` 可以只列出需要定制的
+字段。
+
+CLI 也提供单位显式等价参数（`--max-active-connections`、`--max-pending-http-connections`、
+`--max-websocket-connections`、`--max-connections-per-source`、`--listen-backlog`、
+`--header-read-timeout-ms`、`--body-read-timeout-ms`、`--response-write-timeout-ms`、
+`--overload-write-timeout-ms`），并有对应的 `MINE_TELEOP_*` 环境变量；显式 CLI 参数优先。
+
+> **来源聚合容量**：`max_connections_per_source` 是每个 TCP 对端 IP 的预算。当可信反向
+> 代理（例如 Caddy）落在回环信令后端之前时，所有上游浏览器与车辆 WSS 通道都来自同一个
+> 代理 IP，因此必须按整个部署的聚合容量（而非单个控制会话）调整
+> `max_connections_per_source` 与 `max_active_connections`。
+>
+> **fixture 非验收**：仓库内 `configs/signaling-server.*.dev.yaml` 只是开发冒烟 fixture，
+> 不是 Caddy（TLS 反向代理）或真实车辆现场验收配置。现场部署必须自行提供反向代理、
+> TLS 与认证身份 YAML。
 
 ## 车端配置示例
 
@@ -269,20 +332,12 @@ recording:
 
 upload:
   enabled: true
-  backend: s3
+  backend: local_archive
   max_bandwidth_mbps: 5
-  trigger_segments: 20
-  trigger_network_idle: true
-  direct_file_upload: true
-  presigned_url_refresh_margin_seconds: 300
+  trigger_segments: 1
+  trigger_network_idle: false
   retry_initial_seconds: 10
   retry_max_seconds: 600
-  s3:
-    endpoint_url: https://s3.us-west-2.amazonaws.com
-    bucket: mine-teleop-recordings
-    region: us-west-2
-    access_key_id: AKIDEXAMPLE
-    secret_access_key_file: /etc/mine-teleop/secrets/s3-secret-access-key
 
 vehicle_adapter:
   type: mock
@@ -461,20 +516,18 @@ version 6 门禁明确拒绝，ABI 5 bridge 也不会被加载；runtime 与 bri
 `control.control_timeout_ms` 没有成功 apply，bridge 会撤销车速请求、将转矩置零并施加
 标定的安全制动；下一条有效 apply 才会清除该 watchdog 锁存。
 
-上传限速必须是有限正数；上传触发数量、URL 刷新安全余量和重试退避时间
-必须是正数；`retry_initial_seconds` 不能大于 `retry_max_seconds`。
-`upload.enabled`、`upload.direct_file_upload` 与 `upload.trigger_network_idle`
+上传限速必须是有限正数；上传触发数量和重试退避时间必须是正数；
+`retry_initial_seconds` 不能大于 `retry_max_seconds`。
+`upload.enabled` 与 `upload.trigger_network_idle`
 必须写成 YAML/TOML boolean `true`/`false`，不能用带引号字符串。
-当前本地参考实现只支持逐文件直接上传，因此 `upload.direct_file_upload`
-必须保持 `true`；打包上传模式未实现时不能用 `false` 静默表达。
+当前原生实现只支持 `upload.backend=local_archive` 和逐片段立即调度；启用上传时
+`trigger_segments` 必须为 `1`、`trigger_network_idle` 必须为 `false`。
 `upload.enabled=false` 只关闭上传侧效果；录像和 sidecar 仍会写入本地磁盘，
-但不会申请上传凭证、入队、扫描 pending sidecar 或执行上传。
+但上传入口不会扫描 pending sidecar 或执行本地归档。
 `delete_unuploaded_when_below_free_gb` 是破坏性开关，必须写成 YAML/TOML boolean
 `true`/`false`，不能用带引号字符串。
-`upload.backend=s3` 时必须配置 `upload.s3` 的 endpoint、bucket、region、
-access key 和 secret。Secret 可以直接配置，也可以用
-`secret_access_key_file` 指向只读凭据文件；运行时有效配置日志只记录
-`configured`，不输出 secret 值或 secret 文件路径。
+S3、预签名 URL、批量触发和网络空闲触发尚未由原生上传器实现；其它 backend
+会在配置加载阶段明确拒绝，不会静默降级。
 
 `vehicle_adapter.type=mock` 可直接无外部依赖运行。配置为 `can` 或
 `dynamic_library` 时，必须显式填写 `field_safety.max_speed_kph`、
@@ -576,7 +629,7 @@ vehicle_adapter:
 `mine_teleop_chassis_open`、`mine_teleop_chassis_open_v1`、
 `mine_teleop_chassis_open_v2`、`mine_teleop_chassis_open_v3`、
 `mine_teleop_chassis_open_v4`、
-`mine_teleop_chassis_apply_state`、
+`mine_teleop_chassis_apply_state_v2`、
 `mine_teleop_chassis_emergency_stop`、`mine_teleop_chassis_update_feedback`、
 `mine_teleop_chassis_poll_feedback`、`mine_teleop_chassis_read_telemetry` 和
 `mine_teleop_chassis_close`。该 bridge 会链接
@@ -585,6 +638,9 @@ ChassisControl `chassis_control` 动态库；MinePilot `include/can/can_common.h
 `can_sender.h` 作为发送侧依赖一并记录和校验；bridge 前置检查还会确认
 `src/can_db.cpp`、`src/can_receiver.cpp` 和 `src/can_sender.cpp` 存在，
 避免目标主机发送/接收探针缺少源码。
+`mine_teleop_chassis_apply_state` 仍作为直接 C ABI 调用方的兼容导出；原生
+adapter 仅动态加载带结构化结果的 `mine_teleop_chassis_apply_state_v2`，不会把
+legacy wrapper 当作启动前置条件。
 运行时的 CAN 接收线程应把 MinePilot `DecodedCanData` 形态的最新数据交给
 `ChassisControlFeedbackPump`；该泵会抽取握手、驻车、挡位、MCU/EPS/EHB 模式和车速快照，并调用 adapter `update_feedback`，最终进入
 `mine_teleop_chassis_update_feedback`，供 ChassisControl arming 状态机和 telemetry

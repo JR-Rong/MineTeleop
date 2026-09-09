@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.22)
 project(mine_teleop_chassis_bridge LANGUAGES CXX)
 
 get_filename_component(MINE_TELEOP_REPOSITORY_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
@@ -25,6 +25,7 @@ if(NOT EXISTS "${CHASSIS_CONTROL_ROOT}/include/global_variables.h")
 endif()
 
 find_package(Threads REQUIRED)
+include("${MINE_TELEOP_REPOSITORY_ROOT}/cmake/Hardening.cmake")
 
 add_library(mine_teleop_chassis_bridge SHARED
   chassis_control_bridge.cpp
@@ -40,6 +41,7 @@ target_compile_options(
     -Wpedantic
     -Werror=return-type
 )
+mine_teleop_enable_target_hardening(mine_teleop_chassis_bridge)
 target_include_directories(mine_teleop_chassis_bridge
   PRIVATE
     "${MINE_TELEOP_REPOSITORY_ROOT}/cpp/include"

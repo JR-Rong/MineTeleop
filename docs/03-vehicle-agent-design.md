@@ -42,6 +42,22 @@ VehicleAdapter、输出 `vehicle_adapter_status`，失败时返回非 0。
 
 危险配置如车辆控制适配器、设备证书路径、车辆 ID，不建议运行时热更新。
 
+### Native TLS trust policy
+
+车端原生 `HttpClient` 与 `WebSocketClient` 使用同一份显式 TLS 信任策略：默认
+`SystemTrust` 只使用 libcurl/TLS 后端的系统信任库，不读取
+`CURL_CA_BUNDLE` 或 `SSL_CERT_FILE`，也完全不设置 `CURLOPT_CAINFO`，从而保留
+libcurl 的编译期默认 bundle 或 Schannel 系统根；`ProtectedCaBundle` 只接受应用明确
+传入、非链接、非空、可读且可解析为 CA 证书的普通 PEM bundle。旧环境变量行为必须
+由调用方显式选择 `LegacyEnvironment`，且仅在该模式实际选择 bundle 时设置
+`CURLOPT_CAINFO`。三种模式都强制 libcurl 校验证书链和主机名，不能因 bundle 校验
+失败退回到不安全连接。
+
+Windows 的 `SystemTrust` 保留 Schannel 系统根证书行为；Windows 私有 CA bundle
+继续使用既有的 best-effort 吊销状态处理，但仍校验证书链与主机名。单元测试覆盖
+策略选择、路径检查和畸形 PEM 拒绝，不依赖外部 TLS 端点；TLS 后端实际系统根库、
+证书链/主机名握手和吊销服务仍须在目标平台的集成测试中验证。
+
 ### Camera Manager
 
 负责管理多个 Camera Source。
@@ -180,6 +196,13 @@ VehicleAdapter
 - `dynamic_library` 通过原生 C++ `DynamicLibraryVehicleAdapter` 加载稳定 C shim
   ABI。仓库内的 `deployments/chassis-control-bridge/` 把 ChassisControl 和
   MinePilot CAN 接口封装为该 ABI。
+- 在调用 `dlopen`/`LoadLibrary` 前，配置的 bridge 候选必须是非链接的普通文件，
+  并解析为 canonical 绝对路径；这不是固定 `/opt` 前缀，开发目录和安装包目录都可用。
+  Linux 还要求该文件及其所有父目录由 root 或当前服务用户拥有，且非 sticky 父目录不对
+  group/other 开放写权限；受信子项位于 `/tmp` 这类 sticky 祖先下时可用于开发，但不能把
+  普通可写包目录视为受信。macOS/Windows 保留前述路径/文件类型检查，但没有假称实现了
+  Linux 的 POSIX owner/mode 策略；该预检也不防御检查后的替换竞态、可控依赖库、root 或
+  进程内存已失陷的情况。
 
 后续实现：
 
@@ -232,7 +255,7 @@ Telemetry 仍明确标记为非真实车辆反馈。
 
 ### Uploader
 
-负责低优先级上传。
+当前原生实现负责把完整录像片段低优先级归档到本地目录。
 
 能力：
 
@@ -241,22 +264,19 @@ Telemetry 仍明确标记为非真实车辆反馈。
 - 上传成功标记。
 - 上传失败退避重试。
 - 限速。
-- 可暂停。
-- 可恢复。
-- 使用预签名 URL 时，在每次上传前检查有效期，过期或即将过期时重新向云端申请凭证。
+- 按片段独立退避并继续扫描后续片段。
+- 进程内失败恢复；重启后从 pending sidecar 重新扫描。
 
-本地 `VehicleRecorderUploader.scan_pending_segments()` 会扫描录像根目录下
-`upload_state=pending` 且视频文件仍存在的 sidecar，重新向 Upload API 申请
-video/metadata 两类凭证后恢复上传队列；已在队列中的片段不会重复入队。
-`process_once()` 在队列无可执行项时会先触发一次扫描，再决定上传或返回
-`idle`。通过 `from_config()` 创建的 uploader 会把 `upload.trigger_segments`、
-`upload.trigger_bytes_mb` 和 `upload.trigger_interval_seconds` 接入实际调度；
-未达到触发条件时保持 `pending` 并返回 `wait`。
-当 `upload.enabled=false` 时，recorder 仍写入视频和 sidecar，但不会申请上传
-凭证、不会把片段加入上传队列，也不会扫描历史 pending sidecar；`process_once()`
-返回 `disabled`。
-上传目标写入或对象存储适配器抛出 IO 异常时，uploader 会登记失败并进入
-`retry_wait`，而不是把片段留在 `uploading` 状态。
+`LocalArchiveUploader::process_once()` 扫描录像根目录下
+`upload_state=pending` 的 sidecar；先按 sidecar 的 `video_sha256` 验证录像文件，
+再原子复制视频和元数据。损坏或不匹配的片段进入有上限的指数退避，不会阻塞
+后续健康片段。当前只实现 `local_archive`、`trigger_segments=1` 和
+`trigger_network_idle=false`；其它 backend/调度语义会在配置检查中拒绝。
+`upload.enabled=false` 时，recorder 仍写入视频和 sidecar，上传入口直接返回
+`disabled`，不会扫描历史 pending sidecar。
+上传器只接收录像根内的普通 sidecar 和视频文件；静态/断开的符号链接会在复制前拒绝，
+并且归档对象路径必须相对该录像根。并发修改目录、归档目标父目录链接和临时文件占位的
+FD 级竞态缓解属于另一个部署/文件系统边界，不能由该静态检查假称已经解决。
 
 ## 车端启动顺序
 
@@ -292,6 +312,8 @@ systemd `ExecStartPre` 或部署脚本阻止带缺失设备的真实车端启动
 - 采集源按该相机的 `reopen_attempts` / `reopen_backoff_ms` 只重开故障 lane。
 - 关键相机首个已确认故障立即安全停车、锁止控制并关闭当前 profile/VCU/status
   DataChannel；同一 session 的 control-only WSS 命令也继续被控制锁存拒绝。
+  原生控制回调还会在每条命令准入前直接检查关键相机最后编码帧时间，因此同步信令
+  请求阻塞时也不能绕过 `media_frame_timeout_ms` 的本地 freshness 门槛。
   相机重新出帧只恢复视频；控制锁存保存在媒体 service loop，因而同一云端 session
   内重建 `VehicleMediaRuntime` 也不会解除锁存。必须结束当前
   session，并在新 session 中建立新的 DataChannel 和 control-only WSS、重新完成 VCU

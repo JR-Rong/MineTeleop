@@ -1,3 +1,5 @@
+#include "mine_teleop/detail/json_escape.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -23,6 +25,8 @@
 #include <unistd.h>
 
 namespace {
+
+using mine_teleop::detail::json_escape;
 
 constexpr std::uintmax_t kDefaultRuntimeLogMaxBytes = 64U * 1024U * 1024U;
 constexpr int kDefaultRuntimeLogRotations = 5;
@@ -69,32 +73,6 @@ bool write_all(
     return false;
   }
   return true;
-}
-
-std::string json_escape(std::string_view value) {
-  std::string escaped;
-  escaped.reserve(value.size());
-  for (const unsigned char character : value) {
-    switch (character) {
-      case '\"': escaped += "\\\""; break;
-      case '\\': escaped += "\\\\"; break;
-      case '\b': escaped += "\\b"; break;
-      case '\f': escaped += "\\f"; break;
-      case '\n': escaped += "\\n"; break;
-      case '\r': escaped += "\\r"; break;
-      case '\t': escaped += "\\t"; break;
-      default:
-        if (character < 0x20U) {
-          constexpr char hex[] = "0123456789abcdef";
-          escaped += "\\u00";
-          escaped += hex[(character >> 4U) & 0x0fU];
-          escaped += hex[character & 0x0fU];
-        } else {
-          escaped += static_cast<char>(character);
-        }
-    }
-  }
-  return escaped;
 }
 
 std::string runtime_log_event(
@@ -802,11 +780,13 @@ int relay_runtime(
 int main(int argc, char** argv) {
   const auto executable = std::filesystem::read_symlink("/proc/self/exe");
   const auto root = executable.parent_path().parent_path();
+  const auto install_root =
+      root.parent_path().filename() == ".releases" ? root.parent_path().parent_path() : root;
   const auto library_path =
       (root / "lib").string() + ":" + (root / "lib/vendor/chassis").string() + ":" +
       (root / "lib/vendor/mvs").string();
-  if (chdir(root.c_str()) != 0) {
-    std::perror("mine-teleop bundle directory");
+  if (chdir(install_root.c_str()) != 0) {
+    std::perror("mine-teleop installation directory");
     return 126;
   }
 
@@ -829,7 +809,7 @@ int main(int argc, char** argv) {
   if (argc == 1) {
     arguments.emplace_back("vehicle-runtime");
     arguments.emplace_back("--config");
-    arguments.push_back((root / "config/vehicle-agent.yaml").string());
+    arguments.push_back((install_root / "config/vehicle-agent.yaml").string());
   } else {
     for (int index = 1; index < argc; ++index) arguments.emplace_back(argv[index]);
   }

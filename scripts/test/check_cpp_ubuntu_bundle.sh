@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
+# shellcheck disable=SC1090
+source "$repo_root/deployments/base-images.lock.env"
+
 archive="${1:-}"
 if [[ -z "$archive" || ! -f "$archive" ]]; then
   printf 'usage: %s /path/to/mine-teleop-vehicle-ubuntu22.04-ARCH-*.tar.gz\n' "$0" >&2
@@ -51,7 +56,17 @@ for required_path in \
     exit 2
   fi
 done
-if printf '%s\n' "$entries" | awk 'tolower($0) ~ /(^|\/)(device-token|driver-password|turn-static-auth\.secret)$/ {found=1} END {exit !found}'; then
+if printf '%s\n' "$entries" | awk '
+  {
+    path = tolower($0)
+    if (path ~ /(^|\/)secrets(\/|$)/ ||
+        path ~ /(^|\/)(device-token|driver-password|turn-static-auth\.secret)$/ ||
+        path ~ /\.(password|token)$/) {
+      found = 1
+    }
+  }
+  END {exit !found}
+'; then
   printf 'bundle contains a credential file\n' >&2
   exit 2
 fi
@@ -66,7 +81,7 @@ trap cleanup EXIT
 
 container_id="$(docker create --platform linux/amd64 \
   --entrypoint /bin/sh \
-  ubuntu:22.04 \
+  "$MINE_TELEOP_UBUNTU_2204_REFERENCE" \
   -euc '
     mkdir -p /tmp/check
     tar -xzf /tmp/mine-teleop-bundle.tar.gz -C /tmp/check

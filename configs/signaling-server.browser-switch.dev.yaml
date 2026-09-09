@@ -1,4 +1,8 @@
 auth:
+  # Temporary developer migration fixture. New identities created by
+  # scripts/admin/add_driver.sh use password_hash_file instead.
+  allow_legacy_passwords: true
+  legacy_passwords_remove_by: "2027-03-31"
   # Browser switch acceptance: driver 001 may switch after driver 002 safely
   # releases vehicle 002. The strict isolation fixture remains the 2x2 default.
   drivers:
@@ -16,3 +20,21 @@ auth:
       device_token_env: MINE_TELEOP_VEHICLE_001_TOKEN
     - id: vehicle-002
       device_token_env: MINE_TELEOP_VEHICLE_002_TOKEN
+
+# Connection budget and HTTP phase deadlines. Defaults mirror the runtime
+# SimpleHttpServer::ConnectionLimits semantics; each configured value must be
+# positive and omitted fields inherit those defaults. In a reverse-proxy
+# deployment every upstream browser/vehicle WSS channel shares the proxy peer
+# IP, so max_connections_per_source (and max_active_connections) must be
+# tuned for aggregate deployment capacity, not a single control session. As a .dev.yaml fixture
+# this is not a Caddy (TLS reverse proxy) or real-vehicle acceptance config.
+connection_limits:
+  max_active_connections: 64
+  max_pending_http_connections: 16
+  max_websocket_connections: 48
+  max_connections_per_source: 48
+  listen_backlog: 64
+  header_read_timeout_ms: 5000
+  body_read_timeout_ms: 10000
+  response_write_timeout_ms: 5000
+  overload_write_timeout_ms: 100

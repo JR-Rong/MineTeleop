@@ -163,6 +163,7 @@ void print_help() {
 Usage:
   mine-teleop version
   mine-teleop config-check [--config PATH] [--chassis-bridge-library PATH]
+                           [--verify-configured-ca-bundle]
   mine-teleop vehicle-agent [options]
   mine-teleop vehicle-media-agent [options]
   mine-teleop vehicle-runtime [options]
@@ -192,7 +193,10 @@ Signaling server options:
   --host ADDRESS                bind address (default 127.0.0.1)
   --port N                      bind port (default 8765)
   --driver-id ID                configured driver (default driver-console-001)
-  --driver-password PASSWORD    or set MINE_TELEOP_DRIVER_PASSWORD
+  --driver-password PASSWORD    legacy only; or set MINE_TELEOP_DRIVER_PASSWORD
+  --allow-legacy-passwords      explicitly enable temporary plaintext CLI credentials
+  --legacy-passwords-remove-by YYYY-MM-DD
+                                required migration removal deadline for that mode
   --vehicle-id ID               configured vehicle (default vehicle-001)
   --device-token TOKEN          or set MINE_TELEOP_DEVICE_TOKEN
   --audit-log PATH              append native JSONL audit records
@@ -344,8 +348,10 @@ int run_loop(const VehicleConfig& config, const Arguments& arguments) {
       std::string(control_token),
       mine_teleop::create_vehicle_adapter(config),
       100);
-  service.start(0);
+  service.start({mine_teleop::UtcMillis{0}, mine_teleop::MonotonicMillis{0}});
   for (int timestamp_ms = 0; timestamp_ms <= duration_ms; timestamp_ms += 50) {
+    const auto sample = mine_teleop::ClockSample{mine_teleop::UtcMillis{timestamp_ms},
+                                                 mine_teleop::MonotonicMillis{timestamp_ms}};
     if (timestamp_ms < disconnect_at_ms) {
       ControlCommand command;
       command.vehicle_id = config.vehicle_id;
@@ -356,9 +362,9 @@ int run_loop(const VehicleConfig& config, const Arguments& arguments) {
       command.control_token = control_token;
       command.gear = "D";
       command.throttle = 0.25;
-      service.receive_command(command, timestamp_ms);
+      service.receive_command(command, sample);
     }
-    service.tick(timestamp_ms);
+    service.tick(sample);
   }
   std::cout << service.summary().dump() << '\n';
   service.close();
@@ -387,6 +393,11 @@ std::uint16_t port_option(const Arguments& arguments, std::string_view key, int 
 }
 
 int run_signaling_server(const Arguments& arguments) {
+  if (!arguments.has("--allow-legacy-passwords")) {
+    throw std::invalid_argument(
+        "legacy --driver-password mode requires --allow-legacy-passwords; use "
+        "mine-teleop-signaling-server --config with Argon2id verifiers instead");
+  }
   mine_teleop::SignalingServerConfig config;
   config.host = arguments.value("--host", "127.0.0.1");
   config.port = port_option(arguments, "--port", 8765);
@@ -397,6 +408,8 @@ int run_signaling_server(const Arguments& arguments) {
   const auto device_token = arguments.value(
       "--device-token", environment("MINE_TELEOP_DEVICE_TOKEN").empty() ? "dev-device-secret" : environment("MINE_TELEOP_DEVICE_TOKEN"));
   config.driver_passwords = {{driver_id, driver_password}};
+  config.allow_legacy_passwords = true;
+  config.legacy_passwords_remove_by = arguments.value("--legacy-passwords-remove-by");
   config.device_tokens = {{vehicle_id, device_token}};
   config.driver_vehicle_permissions = {{driver_id, {vehicle_id}}};
   config.admin_token = environment("MINE_TELEOP_ADMIN_TOKEN");
@@ -822,10 +835,16 @@ int run_vehicle_runtime(const Arguments& arguments) {
 
 int run_vehicle_uploader(const Arguments& arguments) {
   const auto config = mine_teleop::load_vehicle_config(arguments.value("--config", "configs/vehicle-agent.dev.yaml"));
+  if (!config.upload.enabled) {
+    mine_teleop::UploadProcessResult result;
+    result.action = "disabled";
+    std::cout << result.to_json().dump() << std::endl;
+    return 0;
+  }
   mine_teleop::LocalArchiveUploader uploader(
       arguments.value("--recording-root", config.recording.root_dir.string()),
-      arguments.value("--archive-root", ".local/archive"),
-      config.upload.max_bandwidth_mbps);
+      arguments.value("--archive-root", ".local/archive"), config.upload.max_bandwidth_mbps,
+      config.upload.retry_initial_seconds, config.upload.retry_max_seconds);
   const bool service = arguments.has("--service") || arguments.has("--service-mode");
   const int poll_interval_ms = arguments.integer("--poll-interval-ms", 5000);
   if (poll_interval_ms <= 0) throw std::invalid_argument("--poll-interval-ms must be positive");
@@ -835,7 +854,12 @@ int run_vehicle_uploader(const Arguments& arguments) {
     record["backlog"] = uploader.backlog();
     std::cout << record.dump() << std::endl;
     if (!service) return result.action == "failed" ? 2 : 0;
-    if (result.action == "idle") std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms));
+    if (result.action != "uploaded") {
+      const auto retry_delay = result.retry_after_ms > 0
+                                   ? std::min<std::int64_t>(poll_interval_ms, result.retry_after_ms)
+                                   : poll_interval_ms;
+      std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay));
+    }
   } while (true);
 }
 
@@ -1001,6 +1025,21 @@ int main(int argc, char** argv) {
       const auto config = mine_teleop::load_vehicle_config(
           arguments.value("--config", "configs/vehicle-agent.dev.yaml"));
       auto result = config.redacted_summary();
+      if (arguments.has("--verify-configured-ca-bundle")) {
+        result["ca_bundle_file_checked"] = !config.cloud.ca_bundle.empty();
+        if (!config.cloud.ca_bundle.empty()) {
+          std::error_code file_error;
+          const auto regular = std::filesystem::is_regular_file(config.cloud.ca_bundle, file_error);
+          const auto size =
+              regular ? std::filesystem::file_size(config.cloud.ca_bundle, file_error) : 0;
+          std::ifstream input(config.cloud.ca_bundle);
+          if (!regular || file_error || size == 0 || !input) {
+            throw std::runtime_error(
+                "configured CA bundle is not a readable non-empty regular file: " +
+                config.cloud.ca_bundle.string());
+          }
+        }
+      }
       if (arguments.has("--chassis-bridge-library")) {
         const auto library_path = arguments.value("--chassis-bridge-library");
         if (library_path.empty()) {

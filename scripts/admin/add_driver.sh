@@ -2,9 +2,9 @@
 #
 # add_driver.sh - register a new driver identity in a signaling server config.
 #
-# Generates a random password file (0600) and appends a driver entry to the
-# `auth.drivers` sequence of the multi-identity YAML consumed by
-# `mine-teleop-signaling-server --config`.
+# Generates a random password file (0600), derives an Argon2id verifier file
+# (0600), and appends a hash-backed driver entry to the `auth.drivers`
+# sequence consumed by `mine-teleop-signaling-server --config`.
 #
 # Usage:
 #   add_driver.sh --id DRIVER_ID --config YAML_PATH --vehicles ID[,ID...]
@@ -33,6 +33,9 @@
 #   NO_COLOR                          disable colored output
 #
 set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 
 if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
   color_reset=$'\033[0m'
@@ -66,12 +69,14 @@ Required:
                             each one must already exist under auth.vehicles
 
 Options:
-  --secrets-dir DIR         credential directory (default: secrets/ next to the config)
+  --secrets-dir DIR         credential directory (default: .local for repo configs,
+                            otherwise secrets/ next to the config)
+  --password-stdin          read a supplied password once from standard input
   --dry-run                 report the planned changes without writing anything
   --help                    show this help
 
-Requires: openssl, plus one YAML backend: yq (mikefarah/yq v4) or python3 with
-PyYAML (used automatically when yq is unavailable).
+Requires: openssl, argon2, plus one YAML backend: yq (mikefarah/yq v4) or
+python3 with PyYAML (used automatically when yq is unavailable).
 EOF
 }
 
@@ -79,345 +84,17 @@ EOF
 # YAML backend
 # ---------------------------------------------------------------------------
 
-yaml_engine=""
-
-select_yaml_engine() {
-  if command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -qi 'mikefarah\|version v4'; then
-    yaml_engine="yq"
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
-    yaml_engine="python"
-    if command -v yq >/dev/null 2>&1; then
-      warn "the yq on PATH is not mikefarah/yq v4; using the python3 fallback editor"
-    else
-      warn "yq (https://github.com/mikefarah/yq) not found; using the python3 fallback editor"
-    fi
-    return 0
-  fi
-  die "no YAML backend available: install mikefarah/yq v4, or python3 with PyYAML"
-}
-
-# Embedded fallback editor. Reads/edits the YAML as text so comments, key order
-# and indentation survive; PyYAML is only used for the read-only queries.
-python_yaml() {
-  python3 - "$@" <<'PYTHON'
-import re
-import sys
-
-mode, path = sys.argv[1], sys.argv[2]
-arguments = sys.argv[3:]
-
-
-def die(message):
-    sys.stderr.write("yaml edit failed: %s\n" % message)
-    raise SystemExit(2)
-
-
-def load_text():
-    with open(path, "r", encoding="utf-8") as handle:
-        text = handle.read()
-    trailing_newline = text.endswith("\n")
-    lines = text.split("\n")
-    if trailing_newline:
-        lines.pop()
-    return lines, trailing_newline
-
-
-def store_text(lines, trailing_newline):
-    text = "\n".join(lines)
-    if trailing_newline:
-        text += "\n"
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(text)
-
-
-def indent_of(line):
-    return len(line) - len(line.lstrip(" "))
-
-
-def is_filler(line):
-    stripped = line.strip()
-    return stripped == "" or stripped.startswith("#")
-
-
-def block_end(lines, key_index, limit=None):
-    """Index just past the last content line owned by the key at key_index."""
-    base = indent_of(lines[key_index])
-    limit = len(lines) if limit is None else limit
-    end = key_index + 1
-    index = key_index + 1
-    while index < limit:
-        line = lines[index]
-        if is_filler(line):
-            index += 1
-            continue
-        current = indent_of(line)
-        if current > base or (current == base and line.lstrip().startswith("- ")):
-            end = index + 1
-            index += 1
-            continue
-        break
-    return end
-
-
-def find_key(lines, start, limit, key, indent=None):
-    pattern = re.compile(r"^( *)" + re.escape(key) + r":( *)(.*)$")
-    for index in range(start, limit):
-        match = pattern.match(lines[index])
-        if match is None:
-            continue
-        if indent is not None and len(match.group(1)) != indent:
-            continue
-        return index, match.group(3).strip()
-    return -1, ""
-
-
-def child_indent(lines, key_index, limit, default):
-    for index in range(key_index + 1, limit):
-        if is_filler(lines[index]):
-            continue
-        return indent_of(lines[index])
-    return default
-
-
-def sequence_indent(lines, start, limit, default):
-    for index in range(start, limit):
-        line = lines[index]
-        if is_filler(line):
-            continue
-        if line.lstrip().startswith("- "):
-            return indent_of(line)
-    return default
-
-
-def auth_section(lines, section):
-    auth_index, auth_inline = find_key(lines, 0, len(lines), "auth", indent=0)
-    if auth_index < 0:
-        die("top level `auth` mapping not found")
-    if auth_inline:
-        die("`auth` must be a block mapping, found an inline value")
-    auth_limit = block_end(lines, auth_index)
-    auth_child = child_indent(lines, auth_index, auth_limit, 2)
-    section_index, section_inline = find_key(
-        lines, auth_index + 1, auth_limit, section, indent=auth_child)
-    return auth_index, auth_limit, auth_child, section_index, section_inline
-
-
-def quote(value):
-    if re.match(r"^[A-Za-z0-9._/-]+$", value):
-        return value
-    return '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def parsed_document():
-    try:
-        import yaml
-    except ImportError:
-        die("PyYAML is required for the python fallback backend")
-    with open(path, "r", encoding="utf-8") as handle:
-        document = yaml.safe_load(handle)
-    if document is None:
-        document = {}
-    if not isinstance(document, dict):
-        die("config root must be a mapping")
-    return document
-
-
-def entries(section):
-    document = parsed_document()
-    auth = document.get("auth") or {}
-    if not isinstance(auth, dict):
-        die("`auth` must be a mapping")
-    items = auth.get(section) or []
-    if not isinstance(items, list):
-        die("`auth.%s` must be a sequence" % section)
-    return items
-
-
-def driver_span(lines, driver_id):
-    """(start, stop, item_indent) of the `auth.drivers` entry with this id."""
-    _, auth_limit, auth_child, drivers_index, drivers_inline = auth_section(lines, "drivers")
-    if drivers_index < 0:
-        die("`auth.drivers` not found")
-    if drivers_inline:
-        die("`auth.drivers` uses an inline sequence; install mikefarah/yq v4 to edit it")
-    drivers_limit = block_end(lines, drivers_index, auth_limit)
-    item = sequence_indent(lines, drivers_index + 1, drivers_limit, auth_child + 2)
-    starts = [index for index in range(drivers_index + 1, drivers_limit)
-              if indent_of(lines[index]) == item and lines[index].lstrip().startswith("- ")]
-    for position, start in enumerate(starts):
-        stop = starts[position + 1] if position + 1 < len(starts) else drivers_limit
-        head = re.match(r"^ *- +id: *(.*)$", lines[start])
-        matched = head is not None and head.group(1).strip().strip("\"'") == driver_id
-        if not matched:
-            body, _ = find_key(lines, start + 1, stop, "id", indent=item + 2)
-            if body >= 0:
-                matched = lines[body].split(":", 1)[1].strip().strip("\"'") == driver_id
-        if matched:
-            return start, stop, item
-    return -1, -1, item
-
-
-if mode == "tag":
-    node = parsed_document()
-    for key in arguments[0].split("."):
-        if not isinstance(node, dict):
-            node = None
-            break
-        node = node.get(key)
-    kinds = ((bool, "!!bool"), (dict, "!!map"), (list, "!!seq"),
-             (str, "!!str"), (int, "!!int"), (float, "!!float"))
-    printed = "!!null"
-    if node is not None:
-        printed = "!!unknown"
-        for kind, name in kinds:
-            if isinstance(node, kind):
-                printed = name
-                break
-    print(printed)
-    raise SystemExit(0)
-
-if mode == "length":
-    print(len(entries(arguments[0])))
-    raise SystemExit(0)
-
-if mode == "ids":
-    for entry in entries(arguments[0]):
-        if isinstance(entry, dict) and entry.get("id") is not None:
-            print(entry["id"])
-    raise SystemExit(0)
-
-if mode == "show-driver":
-    lines, _ = load_text()
-    start, stop, _ = driver_span(lines, arguments[0])
-    if start < 0:
-        die("driver `%s` not found under auth.drivers" % arguments[0])
-    while stop > start and is_filler(lines[stop - 1]):
-        stop -= 1
-    for line in lines[start:stop]:
-        print(line)
-    raise SystemExit(0)
-
-if mode == "add-driver":
-    driver_id, password_file = arguments[0], arguments[1]
-    vehicles = [item for item in arguments[2].split(",") if item]
-    if not vehicles:
-        die("the new driver needs at least one vehicle")
-    lines, trailing_newline = load_text()
-    auth_index, auth_limit, auth_child, index, inline = auth_section(lines, "drivers")
-
-    payload = []
-    if index < 0:
-        item = auth_child + 2
-        insert_at = block_end(lines, auth_index)
-        payload.append(" " * auth_child + "drivers:")
-    else:
-        if inline and inline != "[]":
-            die("`auth.drivers` uses an inline sequence; install mikefarah/yq v4 to edit it")
-        if inline == "[]":
-            lines[index] = " " * auth_child + "drivers:"
-            item = auth_child + 2
-            insert_at = index + 1
-        else:
-            limit = block_end(lines, index, auth_limit)
-            item = sequence_indent(lines, index + 1, limit, auth_child + 2)
-            insert_at = limit
-
-    payload.extend([
-        " " * item + "- id: " + quote(driver_id),
-        " " * (item + 2) + "password_file: " + quote(password_file),
-        " " * (item + 2) + "vehicles:",
-    ])
-    payload.extend(" " * (item + 4) + "- " + quote(vehicle) for vehicle in vehicles)
-
-    lines[insert_at:insert_at] = payload
-    store_text(lines, trailing_newline)
-    raise SystemExit(0)
-
-die("unknown mode: %s" % mode)
-PYTHON
-}
-
-# Tag of a node, in yq's `!!map` / `!!seq` / `!!null` notation.
-yaml_tag() {
-  local file="$1" path="$2"
-  case "$yaml_engine" in
-    yq)
-      # Literal paths rather than a dynamic key: `.auth[strenv(...)]` support
-      # varies across yq v4 releases.
-      case "$path" in
-        auth) yq '.auth | tag' -- "$file" ;;
-        auth.drivers) yq '.auth.drivers | tag' -- "$file" ;;
-        auth.vehicles) yq '.auth.vehicles | tag' -- "$file" ;;
-        *) die "internal error: unsupported yaml path $path" ;;
-      esac
-      ;;
-    python) python_yaml tag "$file" "$path" ;;
-  esac
-}
-
-yaml_length() {
-  local file="$1" section="$2"
-  case "$yaml_engine" in
-    yq)
-      if [[ "$section" == "vehicles" ]]; then
-        yq '(.auth.vehicles // []) | length' -- "$file"
-      else
-        yq '(.auth.drivers // []) | length' -- "$file"
-      fi
-      ;;
-    python) python_yaml length "$file" "$section" ;;
-  esac
-}
-
-yaml_ids() {
-  local file="$1" section="$2"
-  case "$yaml_engine" in
-    yq)
-      if [[ "$section" == "vehicles" ]]; then
-        yq '(.auth.vehicles // [])[].id // ""' -- "$file"
-      else
-        yq '(.auth.drivers // [])[].id // ""' -- "$file"
-      fi
-      ;;
-    python) python_yaml ids "$file" "$section" ;;
-  esac
-}
-
-yaml_add_driver() {
-  local file="$1" driver="$2" password_file="$3" vehicles="$4"
-  case "$yaml_engine" in
-    yq)
-      MINE_TELEOP_NEW_DRIVER_ID="$driver" \
-        MINE_TELEOP_NEW_PASSWORD_FILE="$password_file" \
-        MINE_TELEOP_NEW_VEHICLES="$vehicles" \
-        yq -i '.auth.drivers += [{
-          "id": strenv(MINE_TELEOP_NEW_DRIVER_ID),
-          "password_file": strenv(MINE_TELEOP_NEW_PASSWORD_FILE),
-          "vehicles": (strenv(MINE_TELEOP_NEW_VEHICLES) | split(","))
-        }]' -- "$file"
-      ;;
-    python) python_yaml add-driver "$file" "$driver" "$password_file" "$vehicles" ;;
-  esac
-}
-
-yaml_show_driver() {
-  local file="$1" driver="$2"
-  case "$yaml_engine" in
-    yq)
-      MINE_TELEOP_NEW_DRIVER_ID="$driver" yq \
-        '(.auth.drivers // [])[] | select(.id == strenv(MINE_TELEOP_NEW_DRIVER_ID))' -- "$file"
-      ;;
-    python) python_yaml show-driver "$file" "$driver" ;;
-  esac
-}
+# Keep this user-facing entrypoint and its credential transaction local; the
+# shared library owns only engine dispatch and YAML edits.
+# shellcheck source=lib/yaml_editor.sh
+source "$script_dir/lib/yaml_editor.sh"
 
 driver_id=''
 config_path=''
 secrets_dir=''
 vehicles_csv=''
 dry_run=0
+password_stdin=0
 
 require_value() {
   [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
@@ -449,6 +126,10 @@ while [[ $# -gt 0 ]]; do
       dry_run=1
       shift
       ;;
+    --password-stdin)
+      password_stdin=1
+      shift
+      ;;
     --help | -h)
       usage
       exit 0
@@ -468,6 +149,7 @@ done
   die "driver id must start alphanumeric and contain only letters, digits, '.', '_' or '-': $driver_id"
 
 command -v openssl >/dev/null 2>&1 || die "openssl is required but was not found in PATH"
+command -v argon2 >/dev/null 2>&1 || die "argon2 is required but was not found in PATH"
 select_yaml_engine
 
 [[ -f "$config_path" ]] || die "config file does not exist: $config_path"
@@ -480,11 +162,16 @@ if [[ $dry_run -eq 0 ]]; then
   [[ -w "$config_path" ]] || die "config file is not writable: $config_path"
 fi
 
-# The default credential directory is resolved against the config directory so
-# that the recorded password_file stays relative to the YAML, as the server
-# expects. An explicit --secrets-dir is resolved against the caller's CWD.
+# Keep credentials generated for repository development configs out of the
+# distributable configs tree. Installed /etc-style configs continue to use a
+# sibling secrets directory. An explicit --secrets-dir is resolved against the
+# caller's CWD.
 if [[ -z "$secrets_dir" ]]; then
-  secrets_dir="$config_dir/secrets"
+  if [[ "$config_dir" == "$repo_root/configs" ]]; then
+    secrets_dir="$repo_root/.local/secrets/$(basename -- "$config_path" .yaml)"
+  else
+    secrets_dir="$config_dir/secrets"
+  fi
 elif [[ "$secrets_dir" != /* ]]; then
   secrets_dir="$PWD/$secrets_dir"
 fi
@@ -508,10 +195,16 @@ drivers_raw="$(yaml_ids "$config_path" drivers)" ||
   die "cannot read auth.drivers from $config_path (is it valid YAML?)"
 vehicles_raw="$(yaml_ids "$config_path" vehicles)" ||
   die "cannot read auth.vehicles from $config_path (is it valid YAML?)"
-mapfile -t existing_drivers <<<"$drivers_raw"
-mapfile -t known_vehicles <<<"$vehicles_raw"
+existing_drivers=()
+while IFS= read -r line; do
+  [[ -z "$line" ]] || existing_drivers+=("$line")
+done <<<"$drivers_raw"
+known_vehicles=()
+while IFS= read -r line; do
+  [[ -z "$line" ]] || known_vehicles+=("$line")
+done <<<"$vehicles_raw"
 
-for existing in "${existing_drivers[@]}"; do
+for existing in "${existing_drivers[@]+"${existing_drivers[@]}"}"; do
   [[ "$existing" == "$driver_id" ]] &&
     die "driver id already exists in $config_name: $driver_id (the server rejects duplicate driver ids)"
 done
@@ -538,18 +231,26 @@ done
 [[ ${#requested_vehicles[@]} -gt 0 ]] || die "--vehicles must list at least one vehicle"
 
 password_path="$secrets_dir/$driver_id.password"
-if [[ -e "$password_path" ]]; then
-  die "credential file already exists: $password_path
-      refusing to overwrite an existing credential; remove or rename it first"
-fi
+password_hash_path="$secrets_dir/$driver_id.password.argon2id"
+for credential_path in "$password_path" "$password_hash_path"; do
+  # -e does not detect a dangling symlink. Treat every link as an existing
+  # credential target so an explicit secrets directory cannot redirect a
+  # generated password or verifier during publication.
+  if [[ -e "$credential_path" || -L "$credential_path" ]]; then
+    die "credential file already exists: $credential_path
+        refusing to overwrite an existing credential; remove or rename it first"
+  fi
+done
 
-# password_file is resolved relative to the config directory by the server, so
-# record a relative path whenever the secrets directory lives under it. -m keeps
-# this working before the credential (or its directory) exists.
-password_file_value="$password_path"
-if relative="$(realpath -m --relative-to="$config_dir" -- "$password_path" 2>/dev/null)" &&
+# password_hash_file is resolved relative to the config directory by the
+# server, so record a relative path whenever the secrets directory lives under
+# it. -m keeps this working before the credential (or its directory) exists.
+password_hash_file_value="$password_hash_path"
+if [[ "$config_dir" == "$repo_root/configs" && "$password_hash_path" == "$repo_root/.local/"* ]]; then
+  password_hash_file_value="../${password_hash_path#"$repo_root"/}"
+elif relative="$(realpath -m --relative-to="$config_dir" -- "$password_hash_path" 2>/dev/null)" &&
   [[ -n "$relative" && "$relative" != /* && "$relative" != ../* ]]; then
-  password_file_value="$relative"
+  password_hash_file_value="$relative"
 fi
 
 vehicles_display="$(
@@ -575,14 +276,20 @@ elif command -v mine-teleop-signaling-server >/dev/null 2>&1; then
   signaling_binary="$(command -v mine-teleop-signaling-server)"
 fi
 
-# Render the modified document into a sibling temp file: relative password_file
+# Render the modified document into a sibling temp file: relative verifier
 # paths then resolve exactly as they will once the file is in place.
 created_secrets_dir="no"
 created_password="no"
+created_password_hash="no"
+password_stage=''
+password_hash_stage=''
 work_path="$(mktemp "$config_dir/.${config_name}.add-driver.XXXXXX")"
 cleanup() {
   rm -f -- "$work_path"
+  [[ -n "$password_stage" ]] && rm -f -- "$password_stage"
+  [[ -n "$password_hash_stage" ]] && rm -f -- "$password_hash_stage"
   [[ "$created_password" == "yes" ]] && rm -f -- "$password_path"
+  [[ "$created_password_hash" == "yes" ]] && rm -f -- "$password_hash_path"
   [[ "$created_secrets_dir" == "yes" ]] && rmdir -- "$secrets_dir" 2>/dev/null
   return 0
 }
@@ -590,7 +297,7 @@ trap cleanup EXIT
 cat -- "$config_path" >"$work_path"
 
 MINE_TELEOP_NEW_VEHICLES="$vehicles_display"
-yaml_add_driver "$work_path" "$driver_id" "$password_file_value" "$vehicles_display" ||
+yaml_add_driver "$work_path" "$driver_id" "$password_hash_file_value" "$vehicles_display" ||
   die "the $yaml_engine backend failed to append the driver entry; $config_name was not modified"
 
 [[ "$(yaml_ids "$work_path" drivers | grep -c -x -F -- "$driver_id")" == '1' ]] ||
@@ -601,6 +308,8 @@ if [[ $dry_run -eq 1 ]]; then
   printf '\n%splanned credential%s\n' "$color_bold" "$color_reset"
   printf '  openssl rand -base64 32 > %s\n' "$password_path"
   printf '  chmod 0600 %s\n' "$password_path"
+  printf '  argon2 <password-from-stdin> -id -t 3 -m 16 -p 1 -e > %s\n' "$password_hash_path"
+  printf '  chmod 0600 %s\n' "$password_hash_path"
   [[ -d "$secrets_dir" ]] || printf '  (creates directory %s with mode 0700)\n' "$secrets_dir"
   printf '\n%splanned %s change%s\n' "$color_bold" "$config_name" "$color_reset"
   if command -v diff >/dev/null 2>&1; then
@@ -616,25 +325,53 @@ if [[ $dry_run -eq 1 ]]; then
   exit 0
 fi
 
-# Credential first: the config must never reference a password file that does
+# Credentials first: the config must never reference a verifier file that does
 # not exist yet.
 if [[ ! -d "$secrets_dir" ]]; then
   (umask 077 && mkdir -p -- "$secrets_dir") || die "cannot create secrets directory: $secrets_dir"
   created_secrets_dir="yes"
-  chmod 0700 -- "$secrets_dir"
+  chmod 0700 "$secrets_dir"
   ok "created secrets directory $secrets_dir (mode 0700)"
 fi
 [[ -w "$secrets_dir" ]] || die "secrets directory is not writable: $secrets_dir"
 
-if ! (umask 077 && openssl rand -base64 32 >"$password_path"); then
-  rm -f -- "$password_path"
+password_stage="$(mktemp "$secrets_dir/.${driver_id}.password.XXXXXX")"
+password_hash_stage="$(mktemp "$secrets_dir/.${driver_id}.password.argon2id.XXXXXX")"
+chmod 0600 "$password_stage" "$password_hash_stage"
+if [[ $password_stdin -eq 1 ]]; then
+  if ! IFS= read -r supplied_password; then
+    die "--password-stdin did not receive a password"
+  fi
+  if [[ -z "$supplied_password" ]]; then
+    unset supplied_password
+    die "--password-stdin received an empty password"
+  fi
+  printf '%s\n' "$supplied_password" >"$password_stage"
+  unset supplied_password
+elif ! (umask 077 && openssl rand -base64 32 >"$password_stage"); then
   die "openssl failed to generate a password for $driver_id"
 fi
+[[ -n "$(tr -d '\r\n' <"$password_stage")" ]] ||
+  die "generated credential is empty after trimming: $password_stage"
+if ! argon2_salt="$(openssl rand -hex 16)" || [[ -z "$argon2_salt" ]]; then
+  die "openssl failed to generate an Argon2id salt for $driver_id"
+fi
+if ! tr -d '\r\n' <"$password_stage" |
+  argon2 "$argon2_salt" -id -t 3 -m 16 -p 1 -e >"$password_hash_stage"; then
+  unset argon2_salt
+  die "argon2 failed to derive a verifier for $driver_id"
+fi
+unset argon2_salt
+grep -Eq '^\$argon2id\$v=19\$m=65536,t=3,p=1\$' "$password_hash_stage" ||
+  die "argon2 did not produce the required Argon2id verifier policy"
+mv -f -- "$password_stage" "$password_path"
+password_stage=''
 created_password="yes"
-chmod 0600 -- "$password_path"
-[[ -n "$(tr -d '\r\n' <"$password_path")" ]] ||
-  die "generated credential is empty after trimming: $password_path"
-ok "generated credential $password_path (mode 0600)"
+mv -f -- "$password_hash_stage" "$password_hash_path"
+password_hash_stage=''
+created_password_hash="yes"
+chmod 0600 "$password_path" "$password_hash_path"
+ok "generated password and Argon2id verifier for $driver_id (mode 0600)"
 
 validate_config() {
   local target="$1" label="$2" output status=0
@@ -665,7 +402,7 @@ fi
 
 # Publish the new config, preserving the original file mode.
 config_mode="$(stat -c '%a' -- "$config_path" 2>/dev/null || stat -f '%Lp' -- "$config_path")"
-chmod "$config_mode" -- "$work_path"
+chmod "$config_mode" "$work_path"
 mv -f -- "$work_path" "$config_path"
 trap - EXIT
 ok "updated $config_path"
@@ -678,7 +415,8 @@ fi
 printf '\n%sdriver added%s\n' "$color_bold$color_green" "$color_reset"
 printf '  driver id      %s\n' "$driver_id"
 printf '  config         %s\n' "$config_path"
-printf '  password file  %s (password_file: %s)\n' "$password_path" "$password_file_value"
+printf '  password file  %s (mode 0600; do not commit)\n' "$password_path"
+printf '  verifier file  %s (password_hash_file: %s)\n' "$password_hash_path" "$password_hash_file_value"
 printf '  vehicles       %s\n' "${requested_vehicles[*]}"
 printf '\n%snext steps%s\n' "$color_bold" "$color_reset"
 printf '  1. restart the signaling server so the new identity is loaded:\n'

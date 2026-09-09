@@ -1,4 +1,8 @@
 auth:
+  # Temporary developer migration fixture. New identities created by
+  # scripts/admin/add_driver.sh use password_hash_file instead.
+  allow_legacy_passwords: true
+  legacy_passwords_remove_by: "2027-03-31"
   drivers:
     - id: driver-console-001
       password_env: MINE_TELEOP_DRIVER_001_PASSWORD
@@ -13,3 +17,29 @@ auth:
       device_token_env: MINE_TELEOP_VEHICLE_001_TOKEN
     - id: vehicle-002
       device_token_env: MINE_TELEOP_VEHICLE_002_TOKEN
+
+# Connection budget and HTTP phase deadlines for the standalone signaling
+# listener. Every configured value is mandatory-positive and unit-explicit; a
+# violation fails service startup before listening. Omitted fields inherit the
+# runtime SimpleHttpServer::ConnectionLimits defaults.
+#
+# NOTE: max_connections_per_source is a per-TCP peer-IP budget. When a trusted
+# reverse proxy (e.g. Caddy) fronts the loopback signaling backend, every
+# upstream browser and vehicle WSS channel arrives from the single proxy IP,
+# so tune max_connections_per_source (and max_active_connections) for the
+# aggregate deployment capacity, not a single control session.
+#
+# These .dev.yaml fixtures are development smoke fixtures: they are not Caddy
+# (TLS reverse proxy) acceptance configs, nor real-vehicle field acceptance
+# configs. Deployments must supply their own reverse proxy, TLS, and authen-
+# ticated identity YAML.
+connection_limits:
+  max_active_connections: 64
+  max_pending_http_connections: 16
+  max_websocket_connections: 48
+  max_connections_per_source: 48
+  listen_backlog: 64
+  header_read_timeout_ms: 5000
+  body_read_timeout_ms: 10000
+  response_write_timeout_ms: 5000
+  overload_write_timeout_ms: 100

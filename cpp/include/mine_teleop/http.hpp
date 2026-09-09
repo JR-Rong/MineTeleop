@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "mine_teleop/curl_tls.hpp"
 #include "mine_teleop/core.hpp"
 
 namespace mine_teleop {
@@ -55,6 +56,8 @@ class HttpClient {
       std::chrono::milliseconds timeout,
       std::vector<std::string> resolve_entries,
       std::filesystem::path ca_bundle);
+  HttpClient(std::chrono::milliseconds timeout, std::vector<std::string> resolve_entries,
+             CurlTlsTrustPolicy tls_trust_policy);
 
   [[nodiscard]] HttpResponse get(std::string_view url) const;
   [[nodiscard]] HttpResponse get(std::string_view url, const HttpHeaders& headers) const;
@@ -92,6 +95,7 @@ class SynchronizedClock {
  public:
   TimeSyncStatus synchronize(const HttpClient& http, std::string_view signaling_origin, int sample_count = 7);
   [[nodiscard]] std::int64_t now_ms() const;
+  [[nodiscard]] ClockSample sample() const;
   [[nodiscard]] std::int64_t from_local_system_ms(std::int64_t local_time_ms) const;
   [[nodiscard]] TimeSyncStatus status() const;
   [[nodiscard]] bool refresh_due(int interval_ms) const;
