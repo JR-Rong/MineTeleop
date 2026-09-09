@@ -101,6 +101,15 @@ jobs:
           git-clang-format-18 --version | tee "$RUNNER_TEMP/git-clang-format-version.log"
           grep -F 'git-clang-format version 18.1.8' "$RUNNER_TEMP/git-clang-format-version.log"
 
+      - name: Exercise incremental-quality fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/test/check_incremental_quality_fixture.sh | \
+            tee "$RUNNER_TEMP/incremental-quality-fixture.log"
+          grep -Fx 'incremental_quality_fixture=passed' \
+            "$RUNNER_TEMP/incremental-quality-fixture.log"
+
       - name: Install locked ESLint 9
         shell: bash
         run: |

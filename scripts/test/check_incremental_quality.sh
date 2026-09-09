@@ -130,43 +130,16 @@ is_relevant_file() {
 
 declare -a relevant_files=()
 declare -a cpp_files=()
-declare -a existing_cpp_files=()
-declare -a new_cpp_files=()
+declare -a untracked_cpp_files=()
 declare -a cpp_translation_units=()
 declare -a shell_files=()
 declare -a js_files=()
 
-path_exists_at_base() {
-  git cat-file -e "$quality_base_sha:$1" 2>/dev/null
-}
-
-renamed_from_base_in_diff() {
-  local target="$1"
-  shift
-  local status old_path new_path path
-  while IFS= read -r -d '' status; do
-    case "$status" in
-      R*)
-        IFS= read -r -d '' old_path || return 1
-        IFS= read -r -d '' new_path || return 1
-        if [[ "$new_path" == "$target" ]] && path_exists_at_base "$old_path"; then
-          return 0
-        fi
-        ;;
-      *)
-        IFS= read -r -d '' path || return 1
-        ;;
-    esac
-  done < <(git diff --name-status --find-renames -z "$@")
-  return 1
-}
-
-is_existing_at_base_or_rename() {
-  local path="$1"
-  path_exists_at_base "$path" && return 0
-  renamed_from_base_in_diff "$path" "$quality_base_sha" HEAD && return 0
-  renamed_from_base_in_diff "$path" --cached && return 0
-  renamed_from_base_in_diff "$path" && return 0
+is_untracked_file() {
+  local candidate
+  while IFS= read -r -d '' candidate; do
+    [[ "$candidate" == "$1" ]] && return 0
+  done < <(git ls-files --others --exclude-standard -z -- "$1")
   return 1
 }
 
@@ -178,11 +151,7 @@ if ((${#changed_files[@]} > 0)); then
     case "$changed_file" in
       *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx)
         cpp_files+=("$changed_file")
-        if is_existing_at_base_or_rename "$changed_file"; then
-          existing_cpp_files+=("$changed_file")
-        else
-          new_cpp_files+=("$changed_file")
-        fi
+        is_untracked_file "$changed_file" && untracked_cpp_files+=("$changed_file")
         case "$changed_file" in
           *.c|*.cc|*.cpp|*.cxx) cpp_translation_units+=("$changed_file") ;;
         esac
@@ -195,8 +164,8 @@ fi
 
 printf 'incremental_quality_requested_base=%s\n' "$quality_base_input_sha"
 printf 'incremental_quality_base=%s\n' "$quality_base_sha"
-printf 'incremental_quality_files=%s cpp=%s existing_cpp=%s new_cpp=%s shell=%s js=%s\n' \
-  "${#relevant_files[@]}" "${#cpp_files[@]}" "${#existing_cpp_files[@]}" "${#new_cpp_files[@]}" "${#shell_files[@]}" "${#js_files[@]}"
+printf 'incremental_quality_files=%s cpp=%s untracked_cpp=%s shell=%s js=%s\n' \
+  "${#relevant_files[@]}" "${#cpp_files[@]}" "${#untracked_cpp_files[@]}" "${#shell_files[@]}" "${#js_files[@]}"
 
 if ((${#relevant_files[@]} > 0)); then
   git diff --check "$quality_base_sha" HEAD -- "${relevant_files[@]}"
@@ -256,77 +225,69 @@ require_tool_version() {
   fi
 }
 
-emit_line_args_from_diff() {
-  local target="$1"
-  shift
-  declare -a diff_args=()
-  while (($# > 0)); do
-    [[ "$1" == "--" ]] && { shift; break; }
-    diff_args+=("$1")
-    shift
-  done
-  local hunk start count end
-  while IFS= read -r hunk; do
-    [[ "$hunk" =~ ^@@[[:space:]]-[0-9]+(,[0-9]+)?[[:space:]]\+([0-9]+)(,([0-9]+))?[[:space:]]@@ ]] || continue
-    start="${BASH_REMATCH[2]}"
-    count="${BASH_REMATCH[4]:-1}"
-    [[ "$count" == "0" ]] && continue
-    end=$((start + count - 1))
-    printf '%s\0' "--lines=$start:$end"
-  done < <(git diff --unified=0 --no-ext-diff --find-renames "${diff_args[@]}" -- "$@")
-}
-
-collect_changed_line_args_from_diff() {
-  local target="$1"
-  shift
-  local status old_path new_path path rename_seen
-  rename_seen=0
-  while IFS= read -r -d '' status; do
-    case "$status" in
-      R*)
-        IFS= read -r -d '' old_path || return 1
-        IFS= read -r -d '' new_path || return 1
-        if [[ "$new_path" == "$target" ]]; then
-          emit_line_args_from_diff "$target" "$@" -- "$old_path" "$target"
-          rename_seen=1
-        fi
-        ;;
-      *)
-        IFS= read -r -d '' path || return 1
-        ;;
-    esac
-  done < <(git diff --name-status --find-renames -z "$@")
-  if ((rename_seen == 0)); then
-    emit_line_args_from_diff "$target" "$@" -- "$target"
-  fi
-}
-
 clang_format_bin="$(choose_tool "${MINE_TELEOP_CLANG_FORMAT:-}" clang-format-18 clang-format)"
 git_clang_format_bin="$(choose_tool "${MINE_TELEOP_GIT_CLANG_FORMAT:-}" git-clang-format-18 git-clang-format)"
 if ((require_format || ${#cpp_files[@]} > 0)); then
   require_tool_version "clang-format" "$clang_format_bin" "clang-format version $required_clang_tool_version"
   require_tool_version "git-clang-format" "$git_clang_format_bin" "git-clang-format version $required_clang_tool_version"
 fi
-if ((${#new_cpp_files[@]} > 0)); then
-  "$clang_format_bin" --dry-run --Werror --style=file "${new_cpp_files[@]}"
-  printf 'incremental_quality_clang_format_full=passed files=%s\n' "${#new_cpp_files[@]}"
-fi
-if ((${#existing_cpp_files[@]} > 0)); then
-  for cpp_file in "${existing_cpp_files[@]}"; do
-    declare -a line_args=()
-    while IFS= read -r -d '' line_arg; do
-      line_args+=("$line_arg")
-    done < <({
-      collect_changed_line_args_from_diff "$cpp_file" "$quality_base_sha" HEAD
-      collect_changed_line_args_from_diff "$cpp_file" "$quality_base_sha"
-      collect_changed_line_args_from_diff "$cpp_file"
-      collect_changed_line_args_from_diff "$cpp_file" --cached
-    })
-    if ((${#line_args[@]} > 0)); then
-      "$clang_format_bin" --dry-run --Werror --style=file "${line_args[@]}" "$cpp_file"
+
+# LLVM's fixed git-clang-format wrapper parses unified diffs line-by-line.
+# A C/C++ pathname with a line break therefore cannot be represented safely by
+# that wrapper; fail explicitly instead of silently dropping it from a gate.
+ensure_git_clang_format_paths_are_supported() {
+  local cpp_file
+  for cpp_file in "${cpp_files[@]}"; do
+    if [[ "$cpp_file" == *$'\n'* || "$cpp_file" == *$'\r'* ]]; then
+      printf 'git-clang-format cannot safely check C/C++ path with a newline: %q\n' "$cpp_file" >&2
+      return 2
     fi
   done
-  printf 'incremental_quality_clang_format_hunks=passed files=%s\n' "${#existing_cpp_files[@]}"
+}
+
+run_git_clang_format_diff() {
+  local scope="$1"
+  shift
+  local output status existing_config_count
+  output="$(mktemp "${TMPDIR:-/tmp}/mine-teleop-git-clang-format.XXXXXX")"
+  existing_config_count="${GIT_CONFIG_COUNT:-0}"
+  if env \
+    "GIT_CONFIG_COUNT=$((existing_config_count + 1))" \
+    "GIT_CONFIG_KEY_${existing_config_count}=diff.renames" \
+    "GIT_CONFIG_VALUE_${existing_config_count}=true" \
+    "$git_clang_format_bin" --diff --binary "$clang_format_bin" \
+      --extensions c,cc,cpp,cxx,h,hh,hpp,hxx --style=file "$@" >"$output" 2>&1; then
+    rm -f -- "$output"
+    printf 'incremental_quality_git_clang_format=passed scope=%s\n' "$scope"
+    return 0
+  else
+    status=$?
+  fi
+  printf 'incremental_quality_git_clang_format=failed scope=%s status=%s\n' "$scope" "$status" >&2
+  cat -- "$output" >&2
+  rm -f -- "$output"
+  if ((status == 1)); then
+    return 1
+  fi
+  return 2
+}
+
+if ((${#cpp_files[@]} > 0)); then
+  ensure_git_clang_format_paths_are_supported
+  if ! git diff --quiet "$quality_base_sha" HEAD -- "${cpp_files[@]}"; then
+    run_git_clang_format_diff committed "$quality_base_sha" HEAD -- "${cpp_files[@]}"
+  fi
+  if ! git diff --cached --quiet HEAD -- "${cpp_files[@]}"; then
+    run_git_clang_format_diff staged --staged -- "${cpp_files[@]}"
+  fi
+  if ! git diff --quiet -- "${cpp_files[@]}"; then
+    run_git_clang_format_diff worktree HEAD -- "${cpp_files[@]}"
+  fi
+fi
+if ((${#untracked_cpp_files[@]} > 0)); then
+  "$clang_format_bin" --dry-run --Werror --style=file "${untracked_cpp_files[@]}"
+  printf 'incremental_quality_clang_format_untracked_full=passed files=%s\n' \
+    "${#untracked_cpp_files[@]}"
 fi
 
 eslint_bin="${MINE_TELEOP_ESLINT:-}"
