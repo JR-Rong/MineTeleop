@@ -601,6 +601,8 @@ void test_raw_http_header_parse_rejects_before_map_overwrite() {
   const std::vector<std::string> invalid_requests{
       control_character_field_name,
       "GET /bad HTTP/1.1\r\nHost : test\r\n\r\n",
+      "GET /bad HTTP/1.1\r\nHost: invalid host\r\n\r\n",
+      "GET /bad HTTP/1.1\r\nHost: test\rInjected: value\r\n\r\n",
       "GET /bad HTTP/1.1\r\nhost: test\r\nHOST: test\r\n\r\n",
       "GET /bad HTTP/1.1\r\nHost: test\r\nOrigin: http://localhost\r\norigin: http://localhost\r\n\r\n",
       "GET /bad HTTP/1.1\r\nOrigin: http://localhost\r\n\r\n",

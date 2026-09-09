@@ -436,6 +436,17 @@ bool http_header_field_name_valid(std::string_view name) {
   });
 }
 
+bool http_host_value_valid(std::string_view value) {
+  if (value.empty()) return false;
+  return std::all_of(value.begin(), value.end(), [](unsigned char character) {
+    // Leading/trailing OWS is removed before this check. A Host authority may
+    // contain ':' and IPv6 brackets, but cannot contain whitespace, controls,
+    // a URI path/query/fragment, userinfo, or a backslash path separator.
+    return character >= 0x21 && character <= 0x7e && character != '/' &&
+        character != '?' && character != '#' && character != '@' && character != '\\';
+  });
+}
+
 std::optional<std::string> canonical_ip_address(std::string value) {
   value = trim(std::move(value));
   if (value.empty()) return std::nullopt;
@@ -1145,6 +1156,9 @@ HttpRequest parse_request(
   while (std::getline(headers, header)) {
     if (!header.empty() && header.back() == '\r') header.pop_back();
     if (header.empty()) continue;
+    if (header.find('\r') != std::string::npos) {
+      throw std::invalid_argument("invalid HTTP header");
+    }
     const auto separator = header.find(':');
     if (separator == std::string::npos) throw std::invalid_argument("invalid HTTP header");
     const auto raw_name = std::string_view(header).substr(0, separator);
@@ -1157,7 +1171,7 @@ HttpRequest parse_request(
     if (name == "host") {
       ++host_count;
       if (host_count > 1) throw std::invalid_argument("duplicate Host header");
-      if (value.empty()) throw std::invalid_argument("invalid Host header");
+      if (!http_host_value_valid(value)) throw std::invalid_argument("invalid Host header");
     }
     if (name == "origin") {
       ++origin_count;
