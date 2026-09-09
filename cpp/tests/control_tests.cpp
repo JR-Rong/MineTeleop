@@ -3376,7 +3376,7 @@ void test_signaling_multi_identity_config() {
       mine_teleop::verify_argon2id_password(
           config.driver_password_verifiers.at("driver-console-001"),
           "driver-password-1",
-          mine_teleop::default_argon2id_policy()),
+          mine_teleop::default_authentication_cost_policy()),
       "relative driver verifier file was not loaded");
   expect(
       config.device_tokens.at("vehicle-002") == "vehicle-token-2",
@@ -3704,30 +3704,86 @@ void test_argon2id_credentials_and_login_concurrency() {
   std::string reason;
   expect(
       mine_teleop::validate_argon2id_verifier(
-          verifier, mine_teleop::default_argon2id_policy(), &reason),
+          verifier, mine_teleop::default_authentication_cost_policy(), &reason),
       "generated Argon2id verifier did not satisfy the configured policy");
   expect(
       mine_teleop::verify_argon2id_password(
-          verifier, "correct-hash-password", mine_teleop::default_argon2id_policy()),
+          verifier, "correct-hash-password", mine_teleop::default_authentication_cost_policy()),
       "Argon2id verifier rejected its source password");
   expect(
       !mine_teleop::verify_argon2id_password(
-          verifier, "wrong-hash-password", mine_teleop::default_argon2id_policy()),
+          verifier, "wrong-hash-password", mine_teleop::default_authentication_cost_policy()),
       "Argon2id verifier accepted a wrong password");
+  const auto& default_policy = mine_teleop::default_authentication_cost_policy();
+  expect(
+      default_policy.memory_kib == 64U * 1024U && default_policy.time_cost == 3 &&
+          default_policy.parallelism == 1,
+      "default authentication cost policy no longer accepts add_driver.sh Argon2id parameters");
   auto excessive_cost = verifier;
   const auto cost_begin = excessive_cost.find("m=65536");
   expect(cost_begin != std::string::npos, "generated verifier did not use the expected default memory cost");
   excessive_cost.replace(cost_begin, std::string("m=65536").size(), "m=262145");
   expect(
       !mine_teleop::validate_argon2id_verifier(
-          excessive_cost, mine_teleop::default_argon2id_policy(), &reason),
+          excessive_cost, default_policy, &reason),
       "out-of-policy Argon2id memory cost was accepted");
+  auto excessive_time = verifier;
+  const auto time_begin = excessive_time.find("t=3");
+  expect(time_begin != std::string::npos, "generated verifier did not use the expected default time cost");
+  excessive_time.replace(time_begin, std::string("t=3").size(), "t=11");
+  expect(
+      !mine_teleop::validate_argon2id_verifier(excessive_time, default_policy, &reason),
+      "out-of-policy Argon2id time cost was accepted");
+  auto excessive_parallelism = verifier;
+  const auto parallelism_begin = excessive_parallelism.find("p=1");
+  expect(
+      parallelism_begin != std::string::npos,
+      "generated verifier did not use the expected default parallelism");
+  excessive_parallelism.replace(parallelism_begin, std::string("p=1").size(), "p=5");
+  expect(
+      !mine_teleop::validate_argon2id_verifier(excessive_parallelism, default_policy, &reason),
+      "out-of-policy Argon2id parallelism was accepted");
+  auto excessive_encoded = verifier;
+  excessive_encoded.append(default_policy.maximum_encoded_bytes, 'A');
+  expect(
+      !mine_teleop::validate_argon2id_verifier(excessive_encoded, default_policy, &reason),
+      "over-budget Argon2id PHC verifier length was accepted");
   expect(
       !mine_teleop::validate_argon2id_verifier(
           "$argon2id$v=19$m=65536,t=3,p=1$not*base64$also-not-base64",
-          mine_teleop::default_argon2id_policy(),
+          default_policy,
           &reason),
       "malformed Argon2id PHC verifier was accepted");
+
+  auto tuned_policy = default_policy;
+  tuned_policy.memory_kib = tuned_policy.minimum_memory_kib;
+  tuned_policy.time_cost = 1;
+  tuned_policy.maximum_time_cost = 2;
+  expect(
+      mine_teleop::validate_authentication_cost_policy(tuned_policy, &reason),
+      "valid tuned authentication cost policy was rejected");
+  const auto tuned_verifier = mine_teleop::hash_argon2id_password(
+      "tuned-hash-password",
+      salt,
+      tuned_policy);
+  expect(
+      tuned_verifier.find(
+          "m=" + std::to_string(tuned_policy.memory_kib) + ",t=1,p=1") != std::string::npos,
+      "tuned verifier did not use the selected authentication cost policy");
+  const auto& tuned_dummy = mine_teleop::dummy_argon2id_verifier(tuned_policy);
+  const auto& tuned_dummy_again = mine_teleop::dummy_argon2id_verifier(tuned_policy);
+  expect(
+      &tuned_dummy == &tuned_dummy_again &&
+          tuned_dummy.find(
+              "m=" + std::to_string(tuned_policy.memory_kib) + ",t=1,p=1") !=
+              std::string::npos &&
+          mine_teleop::validate_argon2id_verifier(tuned_dummy, tuned_policy, &reason),
+      "dummy Argon2id verifier was not cached from the selected authentication cost policy");
+  auto invalid_policy = tuned_policy;
+  invalid_policy.maximum_memory_kib = invalid_policy.minimum_memory_kib - 1;
+  expect(
+      !mine_teleop::validate_authentication_cost_policy(invalid_policy, &reason),
+      "invalid authentication cost policy bounds were accepted");
   expect(
       mine_teleop::constant_time_equal("fixed-token", "fixed-token") &&
           !mine_teleop::constant_time_equal("fixed-token", "other-token") &&
@@ -3755,11 +3811,28 @@ void test_argon2id_credentials_and_login_concurrency() {
   mine_teleop::SignalingServerConfig invalid_verifier;
   invalid_verifier.driver_passwords.clear();
   invalid_verifier.driver_password_verifiers = {{"hash-driver", excessive_cost}};
+  invalid_verifier.authentication_cost_policy = default_policy;
   invalid_verifier.device_tokens = {{"vehicle-1", "device-token"}};
   invalid_verifier.driver_vehicle_permissions = {{"hash-driver", {"vehicle-1"}}};
   expect_throws(
       [&] { mine_teleop::SignalingService service(invalid_verifier); },
       "out-of-policy Argon2id verifier was accepted at service startup");
+
+  auto incompatible_policy = tuned_policy;
+  incompatible_policy.maximum_time_cost = 1;
+  auto incompatible_verifier = tuned_verifier;
+  const auto tuned_time_begin = incompatible_verifier.find("t=1");
+  expect(tuned_time_begin != std::string::npos, "tuned verifier did not contain its selected time cost");
+  incompatible_verifier.replace(tuned_time_begin, std::string("t=1").size(), "t=2");
+  mine_teleop::SignalingServerConfig incompatible_config;
+  incompatible_config.driver_passwords.clear();
+  incompatible_config.authentication_cost_policy = incompatible_policy;
+  incompatible_config.driver_password_verifiers = {{"hash-driver", incompatible_verifier}};
+  incompatible_config.device_tokens = {{"vehicle-1", "device-token"}};
+  incompatible_config.driver_vehicle_permissions = {{"hash-driver", {"vehicle-1"}}};
+  expect_throws(
+      [&] { mine_teleop::SignalingService service(incompatible_config); },
+      "service accepted a real verifier outside its selected authentication cost policy");
 
   mine_teleop::SignalingServerConfig config;
   config.driver_passwords.clear();
@@ -3770,6 +3843,11 @@ void test_argon2id_credentials_and_login_concurrency() {
   config.password_verification_max_concurrency = 1;
   config.password_verification_retry_after_ms = 25;
   mine_teleop::SignalingService service(config);
+  expect(
+      service.health().value("authentication_cost_memory_kib", 0U) == default_policy.memory_kib &&
+          service.health().value("authentication_cost_maximum_encoded_bytes", std::size_t{0}) ==
+              default_policy.maximum_encoded_bytes,
+      "service health does not expose the selected authentication cost budget");
 
   const auto post = [&](std::string_view path, const mine_teleop::Json& body) {
     mine_teleop::HttpRequest request;

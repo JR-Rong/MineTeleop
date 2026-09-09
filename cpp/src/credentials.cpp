@@ -4,9 +4,12 @@
 #include <array>
 #include <charconv>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <vector>
 
 #if MINE_TELEOP_HAS_OPENSSL_CRYPTO
@@ -71,11 +74,86 @@ void require_argon2id() {
   }
 }
 
+[[nodiscard]] auto policy_key(const AuthenticationCostPolicy& policy) {
+  return std::tie(
+      policy.memory_kib,
+      policy.time_cost,
+      policy.parallelism,
+      policy.hash_length,
+      policy.minimum_memory_kib,
+      policy.maximum_memory_kib,
+      policy.minimum_time_cost,
+      policy.maximum_time_cost,
+      policy.minimum_parallelism,
+      policy.maximum_parallelism,
+      policy.maximum_encoded_bytes);
+}
+
+struct AuthenticationCostPolicyLess {
+  [[nodiscard]] bool operator()(
+      const AuthenticationCostPolicy& left,
+      const AuthenticationCostPolicy& right) const {
+    return policy_key(left) < policy_key(right);
+  }
+};
+
 }  // namespace
 
-const Argon2idPolicy& default_argon2id_policy() {
-  static constexpr Argon2idPolicy policy{};
+const AuthenticationCostPolicy& default_authentication_cost_policy() {
+  static constexpr AuthenticationCostPolicy policy{};
   return policy;
+}
+
+const AuthenticationCostPolicy& default_argon2id_policy() {
+  return default_authentication_cost_policy();
+}
+
+bool validate_authentication_cost_policy(
+    const AuthenticationCostPolicy& policy,
+    std::string* reason) {
+  if (policy.minimum_memory_kib == 0 || policy.maximum_memory_kib == 0 ||
+      policy.minimum_time_cost == 0 || policy.maximum_time_cost == 0 ||
+      policy.minimum_parallelism == 0 || policy.maximum_parallelism == 0) {
+    set_reason(reason, "authentication cost policy bounds must be positive");
+    return false;
+  }
+  if (policy.minimum_memory_kib > policy.maximum_memory_kib ||
+      policy.minimum_time_cost > policy.maximum_time_cost ||
+      policy.minimum_parallelism > policy.maximum_parallelism) {
+    set_reason(reason, "authentication cost policy minimum exceeds maximum");
+    return false;
+  }
+  if (policy.memory_kib < policy.minimum_memory_kib ||
+      policy.memory_kib > policy.maximum_memory_kib ||
+      policy.time_cost < policy.minimum_time_cost ||
+      policy.time_cost > policy.maximum_time_cost ||
+      policy.parallelism < policy.minimum_parallelism ||
+      policy.parallelism > policy.maximum_parallelism) {
+    set_reason(reason, "authentication cost policy selected cost is outside its bounds");
+    return false;
+  }
+  if (policy.hash_length < 16 || policy.hash_length > 128) {
+    set_reason(reason, "authentication cost policy hash length must be between 16 and 128 bytes");
+    return false;
+  }
+  if (policy.maximum_encoded_bytes < 96 || policy.maximum_encoded_bytes > 4096) {
+    set_reason(reason, "authentication cost policy encoded PHC budget must be between 96 and 4096 bytes");
+    return false;
+  }
+#if MINE_TELEOP_HAS_ARGON2ID
+  const auto encoded_length = argon2_encodedlen(
+      policy.time_cost,
+      policy.memory_kib,
+      policy.parallelism,
+      16,
+      policy.hash_length,
+      Argon2_id);
+  if (encoded_length == 0 || encoded_length > policy.maximum_encoded_bytes + 1) {
+    set_reason(reason, "authentication cost policy cannot encode its selected Argon2id verifier");
+    return false;
+  }
+#endif
+  return true;
 }
 
 bool constant_time_equal(std::string_view expected, std::string_view actual) noexcept {
@@ -98,8 +176,9 @@ bool constant_time_equal(std::string_view expected, std::string_view actual) noe
 
 bool validate_argon2id_verifier(
     std::string_view encoded,
-    const Argon2idPolicy& policy,
+    const AuthenticationCostPolicy& policy,
     std::string* reason) {
+  if (!validate_authentication_cost_policy(policy, reason)) return false;
   if (encoded.empty() || encoded.size() > policy.maximum_encoded_bytes) {
     set_reason(reason, "encoded verifier length is outside policy");
     return false;
@@ -155,7 +234,7 @@ bool validate_argon2id_verifier(
 std::string hash_argon2id_password(
     std::string_view password,
     std::span<const std::uint8_t> salt,
-    const Argon2idPolicy& policy) {
+    const AuthenticationCostPolicy& policy) {
   require_argon2id();
   if (salt.size() < 8 || salt.size() > std::numeric_limits<std::uint32_t>::max()) {
     throw std::invalid_argument("Argon2id salt length is invalid");
@@ -163,13 +242,9 @@ std::string hash_argon2id_password(
   if (password.size() > std::numeric_limits<std::uint32_t>::max()) {
     throw std::invalid_argument("Argon2id password length is invalid");
   }
-  if (policy.memory_kib < policy.minimum_memory_kib ||
-      policy.memory_kib > policy.maximum_memory_kib ||
-      policy.time_cost < policy.minimum_time_cost ||
-      policy.time_cost > policy.maximum_time_cost ||
-      policy.parallelism < policy.minimum_parallelism ||
-      policy.parallelism > policy.maximum_parallelism || policy.hash_length < 16) {
-    throw std::invalid_argument("Argon2id hash policy is outside the allowed bounds");
+  std::string policy_reason;
+  if (!validate_authentication_cost_policy(policy, &policy_reason)) {
+    throw std::invalid_argument("Argon2id hash policy is invalid: " + policy_reason);
   }
 #if MINE_TELEOP_HAS_ARGON2ID
   const auto encoded_length = argon2_encodedlen(
@@ -215,7 +290,7 @@ std::string hash_argon2id_password(
 bool verify_argon2id_password(
     std::string_view encoded,
     std::string_view password,
-    const Argon2idPolicy& policy) {
+    const AuthenticationCostPolicy& policy) {
   require_argon2id();
   std::string reason;
   if (!validate_argon2id_verifier(encoded, policy, &reason)) {
@@ -239,17 +314,28 @@ bool verify_argon2id_password(
 #endif
 }
 
-const std::string& dummy_argon2id_verifier() {
-  static const std::string verifier = [] {
-    constexpr std::array<std::uint8_t, 16> salt{
-        0x6d, 0x69, 0x6e, 0x65, 0x2d, 0x74, 0x65, 0x6c,
-        0x65, 0x6f, 0x70, 0x2d, 0x64, 0x75, 0x6d, 0x6d};
-    return hash_argon2id_password(
-        "mine-teleop-unknown-driver-verifier",
-        salt,
-        default_argon2id_policy());
-  }();
-  return verifier;
+const std::string& dummy_argon2id_verifier(const AuthenticationCostPolicy& policy) {
+  std::string reason;
+  if (!validate_authentication_cost_policy(policy, &reason)) {
+    throw std::invalid_argument("dummy Argon2id verifier policy is invalid: " + reason);
+  }
+  static std::mutex mutex;
+  static std::map<AuthenticationCostPolicy, std::string, AuthenticationCostPolicyLess> cache;
+  {
+    std::lock_guard lock(mutex);
+    if (const auto found = cache.find(policy); found != cache.end()) return found->second;
+  }
+  constexpr std::array<std::uint8_t, 16> salt{
+      0x6d, 0x69, 0x6e, 0x65, 0x2d, 0x74, 0x65, 0x6c,
+      0x65, 0x6f, 0x70, 0x2d, 0x64, 0x75, 0x6d, 0x6d};
+  auto verifier = hash_argon2id_password(
+      "mine-teleop-unknown-driver-verifier",
+      salt,
+      policy);
+  std::lock_guard lock(mutex);
+  const auto [inserted, unused] = cache.emplace(policy, std::move(verifier));
+  static_cast<void>(unused);
+  return inserted->second;
 }
 
 void cleanse_secret(std::string& value) noexcept {

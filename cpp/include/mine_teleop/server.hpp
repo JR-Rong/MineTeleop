@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "mine_teleop/credentials.hpp"
 #include "mine_teleop/core.hpp"
 #include "mine_teleop/detail/native_control_acknowledgement_window.hpp"
 #include "mine_teleop/http.hpp"
@@ -144,6 +145,7 @@ struct SignalingServerConfig {
   std::int64_t login_max_failures{5};
   std::int64_t login_failure_window_ms{60 * 1000};
   std::int64_t login_lockout_ms{5 * 60 * 1000};
+  AuthenticationCostPolicy authentication_cost_policy;
   std::size_t password_verification_max_concurrency{2};
   std::int64_t password_verification_retry_after_ms{250};
   std::int64_t api_rate_limit_requests{600};
@@ -354,6 +356,7 @@ class SignalingService {
   bool audit(std::string_view event, const Json& details = Json::object()) const noexcept;
 
   SignalingServerConfig config_;
+  std::string dummy_password_verifier_;
   std::string service_instance_id_;
   std::function<std::int64_t()> audit_clock_;
   ClockSampler clock_sampler_;

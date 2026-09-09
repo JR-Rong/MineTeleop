@@ -1427,7 +1427,7 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
       const auto verifier = load_identity_secret(
           entry, "password_hash_file", "password_hash_env", base_path, context);
       std::string reason;
-      if (!validate_argon2id_verifier(verifier, default_argon2id_policy(), &reason)) {
+      if (!validate_argon2id_verifier(verifier, config.authentication_cost_policy, &reason)) {
         throw std::invalid_argument(context + " Argon2id verifier is invalid: " + reason);
       }
       if (!config.driver_password_verifiers.emplace(driver_id, verifier).second) {
@@ -1985,6 +1985,13 @@ SignalingService::SignalingService(
       config_.login_lockout_ms <= 0) {
     throw std::invalid_argument("login failure limit, window, and lockout must be positive");
   }
+  std::string authentication_policy_reason;
+  if (!validate_authentication_cost_policy(
+          config_.authentication_cost_policy,
+          &authentication_policy_reason)) {
+    throw std::invalid_argument(
+        "authentication cost policy is invalid: " + authentication_policy_reason);
+  }
   if (config_.password_verification_max_concurrency == 0 ||
       config_.password_verification_max_concurrency > 16 ||
       config_.password_verification_retry_after_ms <= 0 ||
@@ -2069,7 +2076,7 @@ SignalingService::SignalingService(
       throw std::invalid_argument("a driver cannot have both legacy and Argon2id credentials");
     }
     std::string reason;
-    if (!validate_argon2id_verifier(verifier, default_argon2id_policy(), &reason)) {
+    if (!validate_argon2id_verifier(verifier, config_.authentication_cost_policy, &reason)) {
       throw std::invalid_argument("driver Argon2id verifier is invalid: " + reason);
     }
   }
@@ -2086,6 +2093,7 @@ SignalingService::SignalingService(
       }
     }
   }
+  dummy_password_verifier_ = dummy_argon2id_verifier(config_.authentication_cost_policy);
   if (config_.native_control_trace_commands && !config_.audit_log_path.empty()) {
     native_control_trace_ = std::make_unique<AsyncControlTrace>(
         [this](Json details) {
@@ -2223,6 +2231,13 @@ Json SignalingService::health() const {
       {"revoked_vehicles", revoked_vehicles_.size()},
       {"revoked_drivers", revoked_drivers_.size()},
       {"login_locked_buckets", login_locked_buckets},
+      {"authentication_cost_memory_kib", config_.authentication_cost_policy.memory_kib},
+      {"authentication_cost_time_cost", config_.authentication_cost_policy.time_cost},
+      {"authentication_cost_parallelism", config_.authentication_cost_policy.parallelism},
+      {"authentication_cost_maximum_memory_kib", config_.authentication_cost_policy.maximum_memory_kib},
+      {"authentication_cost_maximum_time_cost", config_.authentication_cost_policy.maximum_time_cost},
+      {"authentication_cost_maximum_parallelism", config_.authentication_cost_policy.maximum_parallelism},
+      {"authentication_cost_maximum_encoded_bytes", config_.authentication_cost_policy.maximum_encoded_bytes},
       {"password_verification_active", active_password_verifications},
       {"password_verification_capacity", config_.password_verification_max_concurrency},
       {"api_rate_limit_tracked_sources", api_rate_limits_.size()},
@@ -3812,16 +3827,16 @@ ServerResponse SignalingService::handle_driver_login(Json value, ClockSample adm
         verified = verify_argon2id_password(
             credential.verifier,
             password.view(),
-            default_argon2id_policy());
+            config_.authentication_cost_policy);
         break;
       case LoginCredentialSnapshot::Kind::LegacyPlaintext:
         verified = constant_time_equal(credential.verifier, password.view());
         break;
       case LoginCredentialSnapshot::Kind::Unknown:
         static_cast<void>(verify_argon2id_password(
-            dummy_argon2id_verifier(),
+            dummy_password_verifier_,
             password.view(),
-            default_argon2id_policy()));
+            config_.authentication_cost_policy));
         break;
     }
   } catch (...) {
