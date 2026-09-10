@@ -17,6 +17,16 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <poll.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 using mine_teleop::Json;
@@ -70,6 +80,8 @@ class Arguments {
         "--signaling-url",
         "--ice-transport-policy",
         "--no-open-browser",
+        "--desktop-managed",
+        "--browser-event-log",
         "--dependency-info",
         "--help",
         "--version",
@@ -119,6 +131,8 @@ Options:
   --signaling-url URL        override cloud.signaling_url
   --ice-transport-policy P   all (default) or relay (forced TURN)
   --no-open-browser          do not open the default browser
+  --desktop-managed          exit when the owning desktop pipe closes
+  --browser-event-log PATH   write browser events outside the application bundle
   --dependency-info          show linked dependency versions as JSON
   --help                     show this help
   --version                  show the program and linked curl versions
@@ -145,6 +159,36 @@ Json dependency_info() {
 
 volatile std::sig_atomic_t termination_signal = 0;
 
+bool desktop_owner_requested_shutdown() {
+  static std::string pending;
+  char bytes[256];
+  std::size_t count = 0;
+#if defined(_WIN32)
+  const auto pipe = GetStdHandle(STD_INPUT_HANDLE);
+  DWORD available = 0;
+  if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) return true;
+  if (available == 0) return false;
+  DWORD received = 0;
+  if (!ReadFile(pipe, bytes, sizeof(bytes), &received, nullptr) || received == 0) return true;
+  count = received;
+#else
+  pollfd input{STDIN_FILENO, POLLIN, 0};
+  if (::poll(&input, 1, 0) <= 0) return false;
+  if ((input.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) == 0) return false;
+  const auto received = ::read(STDIN_FILENO, bytes, sizeof(bytes));
+  if (received <= 0) return true;
+  count = static_cast<std::size_t>(received);
+#endif
+  pending.append(bytes, count);
+  if (pending.size() > 4096) return true;
+  for (auto end = pending.find('\n'); end != std::string::npos; end = pending.find('\n')) {
+    const auto command = pending.substr(0, end);
+    pending.erase(0, end + 1);
+    if (command == "shutdown" || command == "shutdown\r") return true;
+  }
+  return false;
+}
+
 void handle_signal(int signal) { termination_signal = signal; }
 
 int run(const Arguments& arguments, const char* executable) {
@@ -152,6 +196,9 @@ int run(const Arguments& arguments, const char* executable) {
   if (!mine_teleop::is_loopback_bind_address(host)) throw std::logic_error("control client loopback policy failed");
   const auto config_path = arguments.value("--config", default_config_path(executable).string());
   auto config = mine_teleop::load_driver_config(config_path);
+  if (arguments.has("--browser-event-log")) {
+    config.browser_event_log_path = arguments.value("--browser-event-log");
+  }
   const auto signaling_override = arguments.value("--signaling-url");
   if (!signaling_override.empty()) config.signaling_url = signaling_override;
   const auto ice_transport_policy = arguments.value("--ice-transport-policy");
@@ -163,7 +210,7 @@ int run(const Arguments& arguments, const char* executable) {
   }
   const auto configured_password = environment("MINE_TELEOP_DRIVER_PASSWORD");
   const auto password = arguments.value(
-      "--driver-password", configured_password.empty() ? "dev-password" : configured_password);
+      "--driver-password", configured_password);
   auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(
       std::move(config), arguments.value("--vehicle-id", "vehicle-001"), password);
   auto app = std::make_shared<mine_teleop::DriverConsoleHttpApp>(runtime);
@@ -181,7 +228,8 @@ int run(const Arguments& arguments, const char* executable) {
   }
   const auto url = "http://127.0.0.1:" + std::to_string(server.port()) + "/";
   std::string browser_error;
-  const bool browser_opened = arguments.has("--no-open-browser") ? false : mine_teleop::open_default_browser(url, browser_error);
+  const bool open_browser = !arguments.has("--no-open-browser") && !arguments.has("--desktop-managed");
+  const bool browser_opened = open_browser ? mine_teleop::open_default_browser(url, browser_error) : false;
   std::cout << Json({
                    {"event", "control_client_started"},
                    {"sent_at_utc_ms", mine_teleop::now_ms()},
@@ -194,7 +242,7 @@ int run(const Arguments& arguments, const char* executable) {
                    {"config", config_path},
                }).dump()
             << std::endl;
-  if (!arguments.has("--no-open-browser") && !browser_opened) {
+  if (open_browser && !browser_opened) {
     std::cerr << Json({
                      {"event", "control_browser_open_failed"},
                      {"sent_at_utc_ms", mine_teleop::now_ms()},
@@ -207,7 +255,13 @@ int run(const Arguments& arguments, const char* executable) {
   termination_signal = 0;
   const auto previous_int = std::signal(SIGINT, handle_signal);
   const auto previous_term = std::signal(SIGTERM, handle_signal);
-  while (termination_signal == 0) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  // The owner is the only writer. EOF also covers an owner crash. Polling avoids
+  // a blocked stdin reader during signal shutdown and needs no public HTTP API.
+  while (termination_signal == 0) {
+    if (arguments.has("--desktop-managed") && desktop_owner_requested_shutdown()) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  runtime->prepare_shutdown();
   server.stop();
   try {
     static_cast<void>(runtime->disconnect("control_client_shutdown"));

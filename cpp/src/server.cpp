@@ -1,5 +1,6 @@
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/control_logic_js.hpp"
+#include "mine_teleop/detail/console_assets.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -1024,9 +1025,9 @@ body .app-shell{grid-template-rows:auto auto minmax(0,1fr)}
 *{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;padding:12px}button,input,select{font:inherit}button,input,select{border:1px solid var(--line);border-radius:7px;background:#0b1422;color:var(--text);padding:8px 10px}button{cursor:pointer}button:hover{border-color:#58708e}button:focus-visible,input:focus-visible,select:focus-visible,main:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.danger{background:#be123c;border-color:#fb7185;color:#fff}.app-shell{height:calc(100svh - 24px);min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr);gap:10px;max-width:1920px;margin:auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;min-width:0}.brand{display:flex;align-items:baseline;gap:12px;min-width:max-content}.brand h1{font-size:21px;line-height:1.1;margin:0;letter-spacing:-.02em}.brand p{font-size:12px;color:var(--muted);margin:0}.auth{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap;margin:0;min-width:0}.auth label{font-size:12px;color:var(--muted)}.auth input{width:170px}.auth select{max-width:220px}.auth strong{font-size:12px;color:var(--ok)}.workspace{display:grid;grid-template-columns:minmax(0,1fr) clamp(300px,25vw,390px);gap:10px;min-height:0}.visual-stage{display:grid;grid-template-rows:auto minmax(0,1fr) auto auto;gap:8px;min-width:0;min-height:0}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:8px;min-height:0}.camera{background:#020617;border:1px solid #162338;border-radius:8px;overflow:hidden;position:relative;min-width:0;min-height:0}.camera video{display:block;width:100%;height:100%;object-fit:contain}.label{position:absolute;left:7px;top:7px;background:#020617cc;padding:3px 7px;border-radius:5px;font-size:11px;z-index:2}.empty-stage{grid-column:1/-1;grid-row:1/-1;display:grid;place-items:center;border:1px dashed var(--line);border-radius:8px;color:var(--muted);font-size:13px}.can-feedback-panel{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:7px;min-width:0}.can-feedback-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px}.can-feedback-heading h2{font-size:11px;letter-spacing:.05em;text-transform:uppercase;margin:0}.can-summary{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:5px;overflow:hidden;margin-bottom:5px}.can-summary-item{background:var(--surface-2);padding:3px 5px;min-width:0}.can-summary-item span{display:block;color:var(--muted);font-size:8px}.can-summary-item strong{display:block;font:700 10px/1.25 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.can-feedback-body{display:grid;grid-template-columns:minmax(0,4fr) minmax(150px,1fr);gap:5px}.wheel-feedback-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:3px}.wheel-feedback,.steering-feedback{background:#0b1422;border:1px solid #1f3047;border-radius:5px;padding:3px 5px;min-width:0}.feedback-title{display:flex;justify-content:space-between;gap:4px;color:#cbd5e1;font-size:8px}.feedback-values{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-top:2px}.feedback-value{min-width:0}.feedback-value span{display:block;color:var(--muted);font-size:7px}.feedback-value strong{display:block;font:700 9px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.steering-feedback-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px}.steering-feedback .feedback-values{grid-template-columns:minmax(0,1fr) auto}.sidebar{min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding-right:2px}.side-section{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:10px}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.section-heading h2{font-size:13px;letter-spacing:.04em;text-transform:uppercase;margin:0}.status-chip{font-size:11px;color:var(--muted)}.key-help,.gate-copy{font-size:11px;color:var(--muted);margin:0 0 8px;line-height:1.35}.keyboard-grid{display:grid;grid-template-columns:repeat(3,46px);grid-template-rows:repeat(2,40px);justify-content:center;gap:5px;margin:8px 0}.keycap{display:flex;align-items:center;justify-content:center;gap:4px;border:1px solid #41536d;border-radius:7px;background:#0a1321;color:#aebdd0;font:700 15px/1 ui-monospace,SFMono-Regular,Menlo,monospace;transition:background .08s ease,border-color .08s ease,color .08s ease,transform .08s ease}.keycap small{font-size:9px;color:#71839b}.keycap.active{background:#075985;border-color:var(--accent);color:#fff;transform:translateY(1px);box-shadow:0 0 0 2px #38bdf826}.keycap.active small{color:#bae6fd}.key-up{grid-column:2}.key-left{grid-column:1;grid-row:2}.key-down{grid-column:2;grid-row:2}.key-right{grid-column:3;grid-row:2}.brake-keys{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin:7px 0 10px}.brake-key{height:30px;font-size:11px}.last-input{display:block;text-align:center;min-height:17px;font-size:11px;color:var(--accent)}.control-readouts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:7px;overflow:hidden}.control-readout{background:var(--surface-2);padding:8px}.control-readout span{display:block;font-size:10px;color:var(--muted);margin-bottom:3px}.control-readout strong{display:block;font:700 18px/1.1 ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}.control-readout.active strong{color:var(--accent)}.side-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px}.side-actions button{font-size:11px;padding:7px 6px}.limit-inline{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 0 7px;color:var(--muted);font-size:10px}.side-section .limit-inline strong{font-size:11px}.metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:7px;overflow:hidden}.metric{background:var(--surface-2);padding:7px}.metric span{display:block;color:var(--muted);font-size:9px;margin-bottom:3px}.metric strong{display:block;font-size:12px;line-height:1.25;overflow-wrap:anywhere}.ok{color:var(--ok)}.warn{color:var(--warn)}.critical{color:var(--critical)}.alerts{border-left:3px solid #475569;background:#0b1422;padding:7px 8px;margin:8px 0;font-size:11px;line-height:1.35}.alerts.warn{border-color:#f59e0b}.alerts.critical{border-color:#e11d48}table{width:100%;border-collapse:collapse;background:#0b1422;font-size:9px;table-layout:fixed}th,td{text-align:left;padding:5px 3px;border-bottom:1px solid #26364d;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}th:first-child,td:first-child{width:30%}.estop-banner{border:1px solid #fb7185;background:#881337;color:#fff;border-radius:7px;padding:7px 10px;margin:0;font-size:12px}.status-line{background:#020617;border:1px solid #162338;border-radius:7px;color:#9fb0c6;font:11px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;padding:7px 9px;min-height:31px;max-height:48px;overflow:auto;white-space:pre-wrap}.muted{color:var(--muted)}[hidden]{display:none!important}dialog{color:var(--text);background:var(--surface);border:1px solid #4b5563;border-radius:10px;max-width:520px;width:calc(100% - 40px);padding:18px}dialog::backdrop{background:#000a}dialog h2{margin:0 0 12px;font-size:18px}.limit-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.limit-grid label{display:flex;flex-direction:column;gap:5px;font-size:12px}.limit-warning{border-left:4px solid #f59e0b;padding:8px 10px;background:#1f2937;font-size:12px;line-height:1.45}
 @media(max-height:760px){body{padding:8px}.app-shell{height:calc(100svh - 16px);gap:7px}.brand p{display:none}.sidebar{gap:7px}.side-section{padding:7px}.section-heading{margin-bottom:5px}.key-help,.gate-copy{margin-bottom:4px;line-height:1.25}.keyboard-grid{grid-template-columns:repeat(3,40px);grid-template-rows:repeat(2,30px);margin:3px 0}.brake-keys{margin:3px 0}.brake-key{height:26px}.last-input{min-height:14px;font-size:10px}.control-readout{padding:4px 6px}.control-readout span{font-size:9px;margin-bottom:2px}.control-readout strong{font-size:16px}.side-actions button{padding:5px 4px}.limit-inline{margin-bottom:4px}.metric{padding:3px 5px}.metric span{margin-bottom:2px}.metric strong{font-size:11px}.alerts{margin:4px 0;padding:4px 6px;font-size:10px;line-height:1.25}th,td{padding:3px 2px}}
 @media(max-width:900px){.workspace{grid-template-columns:minmax(0,1fr) 290px}.brand p{display:none}.auth label,.auth-expiry{display:none}}
-@media(max-width:720px){html,body{overflow:auto}.app-shell{height:auto;min-height:100svh}.topbar{align-items:flex-start;flex-direction:column}.auth{justify-content:flex-start}.workspace{grid-template-columns:1fr}.visual-stage{min-height:58svh}.sidebar{overflow:visible}.grid{grid-template-columns:1fr}.can-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.can-feedback-body{grid-template-columns:1fr}.wheel-feedback-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.steering-feedback-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.limit-grid{grid-template-columns:1fr}}</style></head><body><main class="app-shell" tabindex="-1">
+@media(max-width:720px){html,body{overflow:auto}.app-shell{height:auto;min-height:100svh}.topbar{align-items:flex-start;flex-direction:column}.auth{justify-content:flex-start}.workspace{grid-template-columns:1fr}.visual-stage{min-height:58svh}.sidebar{overflow:visible}.grid{grid-template-columns:1fr}.can-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.can-feedback-body{grid-template-columns:1fr}.wheel-feedback-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.steering-feedback-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.limit-grid{grid-template-columns:1fr}}</style><link rel="stylesheet" href="/assets/console-layout.css"></head><body><main class="app-shell" tabindex="-1">
 <header class="topbar"><div class="brand"><h1>Mine Teleop 控制台</h1><p>方向键 / WASD 控制 · Space 缓刹 · B 急刹 · E 急停</p></div>
-<section id="login-panel" class="auth"><label for="password">驾驶员密码</label><input id="password" type="password" autocomplete="current-password"><button id="login">登录并加载车辆</button></section>
+<section id="login-panel" class="auth"><label for="driver-id">驾驶员 ID</label><input id="driver-id" type="text" autocomplete="username" maxlength="128" spellcheck="false" placeholder="请输入驾驶员 ID"><label for="password">驾驶员密码</label><input id="password" type="password" autocomplete="current-password"><button id="login">登录并加载车辆</button></section>
 <section id="session-panel" class="auth" hidden><label for="vehicle">授权车辆</label><select id="vehicle"></select><button id="connect">连接所选车辆</button><button id="control-limits-open">实车调试限幅</button><button id="logout">安全退出</button><button id="estop" class="danger">急停</button><strong id="webrtc">未连接</strong><span id="auth-expiry" class="muted auth-expiry"></span></section></header>
 <section id="operator-status-strip" class="operator-status-strip" aria-label="关键车辆状态"><article class="operator-status-item"><span>实测车速</span><strong id="operator-speed">—</strong></article><article class="operator-status-item"><span>实际挡位</span><strong id="operator-actual-gear">—</strong></article><article id="operator-readout-gear" class="operator-status-item"><span>指令挡位</span><strong id="operator-control-gear">N</strong></article><article id="operator-readout-steering" class="operator-status-item"><span>转向</span><strong id="operator-control-steering">0.00</strong></article><article id="operator-readout-throttle" class="operator-status-item"><span>目标车速比例</span><strong id="operator-control-throttle">0.00</strong></article><article id="operator-readout-brake" class="operator-status-item"><span>刹车</span><strong id="operator-control-brake">0.00</strong></article></section>
 <div class="workspace"><section class="visual-stage"><p id="estop-status" class="estop-banner" hidden>急停请求已锁定；等待车端遥测确认，未确认时请使用车辆物理急停。</p><section id="cameras" class="grid"><div id="empty-stage" class="empty-stage">登录并连接车辆后显示实时视频</div></section><section id="can-feedback-panel" class="can-feedback-panel" hidden aria-label="CAN 实时反馈"><div class="can-feedback-heading"><h2>CAN 实时反馈 · 测量值</h2><strong id="can-feedback-status" class="status-chip warn">等待车端遥测</strong></div><div class="can-summary"><div class="can-summary-item"><span>车速</span><strong id="can-speed">—</strong></div><div class="can-summary-item"><span>实际挡位</span><strong id="can-gear">—</strong></div><div class="can-summary-item"><span>物理选择器</span><strong id="can-selector">—</strong></div><div class="can-summary-item"><span>电子驻车 1-4</span><strong id="can-epb">—</strong></div><div class="can-summary-item"><span>VCU 状态</span><strong id="can-handshake">—</strong></div><div class="can-summary-item"><span>VMC 故障码</span><strong id="can-vmc-fault">—</strong></div><div class="can-summary-item"><span>物理手刹</span><strong id="can-parking-switch">—</strong></div><div class="can-summary-item"><span>制动踏板</span><strong id="can-brake-pedal">—</strong></div><div class="can-summary-item"><span>紧急开关</span><strong id="can-emergency">—</strong></div><div class="can-summary-item"><span>反馈时效</span><strong id="can-age">—</strong></div></div><div class="can-feedback-body"><div id="wheel-feedback-grid" class="wheel-feedback-grid" aria-label="八路轮端反馈"></div><div id="steering-feedback-grid" class="steering-feedback-grid" aria-label="四路转向反馈"></div></div></section><pre id="status" class="status-line">请先登录</pre></section>
@@ -1048,7 +1049,7 @@ let vehicleHardLimits={received:false};
 const controlTraceEnabled=Boolean(consoleConfig.control_trace_commands),intentRefreshIntervalMs=Math.max(50,Math.floor(Number(consoleConfig.intent_lease_ms||200)/3)),controlTraceBuffer=[],controlTraceErrorScopes=new WeakMap();
 let controlTraceSummary=createControlTraceSummary(),controlTraceScope={session_id:'',vehicle_id:''},lastHeartbeatTraceAt=null;
 const calibration={steeringCenter:gamepadConfig.steering_center,steeringRange:gamepadConfig.steering_range,throttleRest:gamepadConfig.throttle_rest,throttleRange:gamepadConfig.throttle_range,brakeRest:gamepadConfig.brake_rest,brakeRange:gamepadConfig.brake_range};
-const webrtcLabel=document.getElementById('webrtc'),cameraGrid=document.getElementById('cameras'),statusPanel=document.getElementById('status'),loginPanel=document.getElementById('login-panel'),sessionPanel=document.getElementById('session-panel'),passwordInput=document.getElementById('password'),vehicleSelect=document.getElementById('vehicle'),connectButton=document.getElementById('connect'),authExpiry=document.getElementById('auth-expiry'),vcuPanel=document.getElementById('vcu-panel'),vcuStatus=document.getElementById('vcu-status'),vcuGate=document.getElementById('vcu-gate'),vcuConnectButton=document.getElementById('vcu-connect'),vcuDisconnectButton=document.getElementById('vcu-disconnect'),controlLimitsOpen=document.getElementById('control-limits-open'),controlLimitsSummary=document.getElementById('control-limits-summary'),controlLimitsDialog=document.getElementById('control-limits-dialog'),targetSpeedKph=document.getElementById('target-speed-kph'),maxMotorTorqueNm=document.getElementById('max-motor-torque-nm'),maxBrakePressureBar=document.getElementById('max-brake-pressure-bar'),serviceBrakePressureBar=document.getElementById('service-brake-pressure-bar'),hardBrakePressureBar=document.getElementById('hard-brake-pressure-bar'),maxSteeringDeg=document.getElementById('max-steering-deg'),speedPidKp=document.getElementById('speed-pid-kp'),speedPidKi=document.getElementById('speed-pid-ki'),speedPidKd=document.getElementById('speed-pid-kd'),speedPidDerivativeFilterTauMs=document.getElementById('speed-pid-derivative-filter-tau-ms'),speedPidMaxDtMs=document.getElementById('speed-pid-max-dt-ms'),motorTorqueRiseRate=document.getElementById('motor-torque-rise-rate'),vehicleHardLimitsLabel=document.getElementById('vehicle-hard-limits'),controlLimitsConfirm=document.getElementById('control-limits-confirm'),controlLimitsApply=document.getElementById('control-limits-apply'),controlLimitsCancel=document.getElementById('control-limits-cancel'),estopStatus=document.getElementById('estop-status'),monitorPanel=document.getElementById('monitor-panel'),alertsPanel=document.getElementById('alerts'),streamMetrics=document.getElementById('stream-metrics'),inputReadiness=document.getElementById('input-readiness'),lastKeyboardEvent=document.getElementById('last-keyboard-event'),emptyStage=document.getElementById('empty-stage');
+const webrtcLabel=document.getElementById('webrtc'),cameraGrid=document.getElementById('cameras'),statusPanel=document.getElementById('status'),loginPanel=document.getElementById('login-panel'),sessionPanel=document.getElementById('session-panel'),driverIdInput=document.getElementById('driver-id'),passwordInput=document.getElementById('password'),vehicleSelect=document.getElementById('vehicle'),connectButton=document.getElementById('connect'),authExpiry=document.getElementById('auth-expiry'),vcuPanel=document.getElementById('vcu-panel'),vcuStatus=document.getElementById('vcu-status'),vcuGate=document.getElementById('vcu-gate'),vcuConnectButton=document.getElementById('vcu-connect'),vcuDisconnectButton=document.getElementById('vcu-disconnect'),controlLimitsOpen=document.getElementById('control-limits-open'),controlLimitsSummary=document.getElementById('control-limits-summary'),controlLimitsDialog=document.getElementById('control-limits-dialog'),targetSpeedKph=document.getElementById('target-speed-kph'),maxMotorTorqueNm=document.getElementById('max-motor-torque-nm'),maxBrakePressureBar=document.getElementById('max-brake-pressure-bar'),serviceBrakePressureBar=document.getElementById('service-brake-pressure-bar'),hardBrakePressureBar=document.getElementById('hard-brake-pressure-bar'),maxSteeringDeg=document.getElementById('max-steering-deg'),speedPidKp=document.getElementById('speed-pid-kp'),speedPidKi=document.getElementById('speed-pid-ki'),speedPidKd=document.getElementById('speed-pid-kd'),speedPidDerivativeFilterTauMs=document.getElementById('speed-pid-derivative-filter-tau-ms'),speedPidMaxDtMs=document.getElementById('speed-pid-max-dt-ms'),motorTorqueRiseRate=document.getElementById('motor-torque-rise-rate'),vehicleHardLimitsLabel=document.getElementById('vehicle-hard-limits'),controlLimitsConfirm=document.getElementById('control-limits-confirm'),controlLimitsApply=document.getElementById('control-limits-apply'),controlLimitsCancel=document.getElementById('control-limits-cancel'),estopStatus=document.getElementById('estop-status'),monitorPanel=document.getElementById('monitor-panel'),alertsPanel=document.getElementById('alerts'),streamMetrics=document.getElementById('stream-metrics'),inputReadiness=document.getElementById('input-readiness'),lastKeyboardEvent=document.getElementById('last-keyboard-event'),emptyStage=document.getElementById('empty-stage');
 const canFeedbackPanel=document.getElementById('can-feedback-panel'),canFeedbackStatus=document.getElementById('can-feedback-status'),canSpeed=document.getElementById('can-speed'),canGear=document.getElementById('can-gear'),canSelector=document.getElementById('can-selector'),canEpb=document.getElementById('can-epb'),canHandshake=document.getElementById('can-handshake'),canVmcFault=document.getElementById('can-vmc-fault'),canParkingSwitch=document.getElementById('can-parking-switch'),canBrakePedal=document.getElementById('can-brake-pedal'),canEmergency=document.getElementById('can-emergency'),canAge=document.getElementById('can-age'),wheelFeedbackGrid=document.getElementById('wheel-feedback-grid'),steeringFeedbackGrid=document.getElementById('steering-feedback-grid');
 const operatorSpeed=document.getElementById('operator-speed'),operatorActualGear=document.getElementById('operator-actual-gear');
 const keyIndicators={left:document.getElementById('key-left'),right:document.getElementById('key-right'),up:document.getElementById('key-up'),down:document.getElementById('key-down'),service_brake:document.getElementById('key-service-brake'),hard_brake:document.getElementById('key-hard-brake')};
@@ -1088,9 +1089,17 @@ function ensureCanFeedbackCards(){
   if(!steeringFeedbackGrid.childElementCount)for(let index=0;index<4;index++){const card=document.createElement('article');card.className='steering-feedback';const title=document.createElement('div');title.className='feedback-title';const name=document.createElement('strong');name.textContent=`转向轴 ${index+1}`;title.appendChild(name);const values=document.createElement('div');values.className='feedback-values';for(const [label,key] of [['转角','angle'],['模式','mode']]){const item=document.createElement('div');item.className='feedback-value';const caption=document.createElement('span');caption.textContent=label;const value=document.createElement('strong');value.id=`can-steering-${key}-${index}`;value.textContent='—';item.append(caption,value);values.appendChild(item)}card.append(title,values);steeringFeedbackGrid.appendChild(card)}
 }
 function renderCanFeedback(){
-  canFeedbackPanel.hidden=!authenticated;
-  if(!authenticated)return;
+  document.dispatchEvent(new CustomEvent('mine-teleop-telemetry',{detail:authenticated?vehicleTelemetry:null}));
+  canFeedbackPanel.hidden=false;
   ensureCanFeedbackCards();
+  if(!authenticated){
+    canFeedbackStatus.textContent='等待车端遥测';
+    canFeedbackStatus.className='status-chip warn';
+    for(const element of document.querySelectorAll('.can-summary strong,.feedback-value strong'))element.textContent='—';
+    for(let index=0;index<8;index++)setCanValue(`can-wheel-mode-${index}`,'M— / B—');
+    operatorSpeed.textContent='—';operatorActualGear.textContent='—';
+    return;
+  }
   const feedback=vehicleTelemetry?.can_feedback;
   const supported=Boolean(feedback?.supported);
   const transportAge=vehicleTelemetry&&Number.isFinite(Number(vehicleTelemetry.sent_at_utc_ms))?Math.max(0,Date.now()-Number(vehicleTelemetry.sent_at_utc_ms)):null,canFeedbackAge=supported&&Number(feedback.max_feedback_age_ms)>=0?Number(feedback.max_feedback_age_ms):null;
@@ -1215,7 +1224,7 @@ function renderVehicles(vehicles=[]){const previous=vehicleSelect.value,currentV
 function renderAuthExpiry(expiresAt){authExpiry.textContent=expiresAt?`认证有效至 ${new Date(expiresAt).toLocaleString()}`:''}
 function requireLogin(message){closeRealtimeSession();authenticated=false;controlAuthorityLost=false;connectButton.textContent='连接所选车辆';renderAuthExpiry(0);sessionPanel.hidden=true;vcuPanel.hidden=true;monitorPanel.hidden=true;loginPanel.hidden=false;statusPanel.textContent=message;clientLog('driver_reauthentication_required',{reason:message})}
 function handleVehicleRefreshError(error){if(error.status===401){requireLogin('登录已失效，请重新认证: '+error.message);return}statusPanel.textContent='车辆状态刷新失败，当前会话已保留: '+error.message;clientLog('vehicle_list_refresh_failed',{error:error.message})}
-async function login(){const password=passwordInput.value;if(!password)throw Error('请输入驾驶员密码');passwordInput.value='';const result=await post('/api/login',{password});authenticated=true;controlAuthorityLost=false;webrtcLabel.textContent='未连接';loginPanel.hidden=true;sessionPanel.hidden=false;vcuPanel.hidden=false;renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);sampleGamepad();latestRuntimeStatus=await get('/api/status');renderMonitoring();statusPanel.textContent=`已登录 ${result.driver_id}，请选择在线车辆`;clientLog('driver_login_succeeded',{driver_id:result.driver_id,authorized_vehicle_count:(result.vehicles||[]).length})}
+async function login(){const driver_id=driverIdInput.value.trim();if(!driver_id)throw Error('请输入驾驶员 ID');const password=passwordInput.value;if(!password)throw Error('请输入驾驶员密码');passwordInput.value='';const result=await post('/api/login',{driver_id,password});authenticated=true;controlAuthorityLost=false;webrtcLabel.textContent='未连接';loginPanel.hidden=true;sessionPanel.hidden=false;vcuPanel.hidden=false;renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);sampleGamepad();latestRuntimeStatus=await get('/api/status');renderMonitoring();statusPanel.textContent=`已登录 ${result.driver_id}，请选择在线车辆`;clientLog('driver_login_succeeded',{driver_id:result.driver_id,authorized_vehicle_count:(result.vehicles||[]).length})}
 async function refreshVehicles(){if(!authenticated)return;const result=await get('/api/vehicles');renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);if(result.signaling_available===false){controlAuthorityLost=true;resetControlAuthorityInput();connectButton.disabled=true;statusPanel.textContent='信令服务暂时不可用；车辆列表为安全快照，禁止建立控制会话';renderMonitoring();return}if(result.signaling_restart_recovered){closeRealtimeSession();controlAuthorityLost=true;latestRuntimeStatus=await get('/api/status');connectButton.textContent='连接所选车辆';webrtcLabel.textContent='服务已恢复，需重新建立控制会话';statusPanel.textContent='信令服务已重启，驾驶员身份已自动恢复；旧控制权未恢复，请重新选择车辆';clientLog('signaling_restart_recovered',{previous_service_instance_id:result.previous_service_instance_id,service_instance_id:result.service_instance_id,control_authority_recovered:false});renderMonitoring()}}
 function sendVcuHandshakeCommand(action){if(!controlChannel||controlChannel.readyState!=='open')throw Error('控制 DataChannel 尚未连接');if(action==='connect'&&!controlProfileState.acknowledged)throw Error('会话控制参数尚未获得车端确认');if(vcuHandshake.adapter_ready!==true)throw Error('VCU 适配器尚未就绪');if(!['connect','disconnect'].includes(action))throw Error('VCU 握手命令非法');if(action==='disconnect'){resetControlAuthorityInput();vcuHandshake={...vcuHandshake,ready:false,disarming:true}}else{gearRejectionInhibited=false;vcuHandshake={...vcuHandshake,requested:true}}renderMonitoring();controlChannel.send(JSON.stringify({event:'vcu_handshake_command',action,sent_at_utc_ms:Date.now()}));clientLog('driver_vcu_handshake_command',{action});statusPanel.textContent=action==='connect'?'已请求开始 VCU 平行驾驶握手':'已请求安全断开 VCU 握手'}
 function nativeIntentEnvelope(outgoing){
@@ -1292,11 +1301,12 @@ async function send(extra={},announceUnavailable=true){if(controlTraceEnabled)co
 async function refreshControlIntent(){const now=performance.now();if(!polling){lastHeartbeatTraceAt=null;return}noteIntentRefresh(now);sampleGamepad();sendPendingControlProfile();const enqueued=enqueueIntentRefresh();if(controlTraceEnabled){if(enqueued)controlTraceSummary.heartbeat_enqueued_count++;else controlTraceSummary.heartbeat_coalesced_count++}}
 function advertisedCodecs(){const caps=RTCRtpReceiver.getCapabilities&&RTCRtpReceiver.getCapabilities('video');const found=new Set(['h264']);for(const c of (caps&&caps.codecs)||[]){const m=(c.mimeType||'').toLowerCase();if(m.includes('h265')||m.includes('hevc'))found.add('h265');if(m.includes('h264')||m.includes('avc'))found.add('h264')}return [...found]}
 async function connect(){if(connecting)return;const target=vehicleSelect.value;if(!target)throw Error('没有可连接的在线车辆');const fromVehicle=latestRuntimeStatus.connected?latestRuntimeStatus.vehicle_id:'';if(polling&&fromVehicle===target){statusPanel.textContent=`车辆 ${target} 已处于当前会话`;return}const changingVehicle=Boolean(fromVehicle)&&fromVehicle!==target;const reconnecting=Boolean(fromVehicle)&&fromVehicle===target;const hadRealtime=polling;let suspendedGeneration=signalingGeneration;if((changingVehicle||reconnecting)&&hadRealtime){suspendedGeneration=suspendSignalingPoll();clearControlInput()}connecting=true;connectButton.disabled=true;if(changingVehicle){webrtcLabel.textContent='正在安全切换车辆';statusPanel.textContent=`正在验证 ${target}，成功后释放 ${fromVehicle}`;clientLog('driver_vehicle_switch_started',{from_vehicle_id:fromVehicle,to_vehicle_id:target})}let session=null,generation=signalingGeneration;try{session=await post('/api/connect',{vehicle_id:target});generation=closeRealtimeSession();nativeControlSessionId=String(session.session_id||'');nativeControlSessionGeneration=Number(session.control_session_generation);if(!nativeControlSessionId||!Number.isSafeInteger(nativeControlSessionGeneration)||nativeControlSessionGeneration<=0)throw Error('原生控制会话代次无效');setControlTraceScope(session.session_id,session.vehicle_id);controlAuthorityLost=true;const ice=await post('/api/webrtc/ice-servers');iceServers=ice.ice_servers||[];await post('/api/webrtc/capabilities',{codecs:advertisedCodecs()});polling=true;controlAuthorityLost=false;latestRuntimeStatus=await get('/api/status');webrtcLabel.textContent='等待车端媒体';statusPanel.textContent=`会话 ${session.session_id} · ${session.vehicle_id}`;connectButton.textContent='切换所选车辆';document.querySelector('main').focus();renderMonitoring();clientLog(changingVehicle?'driver_vehicle_switched':(reconnecting?'driver_session_reconnected':'driver_session_connected'),{from_vehicle_id:fromVehicle||undefined,session_id:session.session_id,vehicle_id:session.vehicle_id});pollSignaling(generation)}catch(error){if(session){flushControlTrace('connect_setup_failed');controlTraceScope={session_id:'',vehicle_id:''};nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';await post('/api/end-session',{reason:'driver_connect_setup_failed'}).catch(()=>{})}latestRuntimeStatus=await get('/api/status').catch(()=>({connected:false}));const retained=Boolean(!session&&latestRuntimeStatus.connected&&hadRealtime);if(retained){polling=true;controlAuthorityLost=false;webrtcLabel.textContent=controlChannel&&controlChannel.readyState==='open'?'控制链路已连接':'当前会话已保留';statusPanel.textContent=`切换失败，当前会话已保留: ${error.message}`;clientLog('driver_vehicle_switch_rejected',{from_vehicle_id:fromVehicle,to_vehicle_id:target,error:error.message});pollSignaling(suspendedGeneration)}else{controlAuthorityLost=Boolean(latestRuntimeStatus.connected)}connectButton.textContent=latestRuntimeStatus.connected?'切换所选车辆':'连接所选车辆';renderMonitoring();if(!retained)throw error}finally{connecting=false;connectButton.disabled=!vehicleSelect.value}}
-async function logout(){const estopConfirmed=vehicleTelemetry?.estop===true;closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='正在释放控制权';await post('/api/disconnect',{reason:'driver_safe_logout'});authenticated=false;controlAuthorityLost=false;connectButton.textContent='连接所选车辆';renderAuthExpiry(0);sessionPanel.hidden=true;vcuPanel.hidden=true;canFeedbackPanel.hidden=true;monitorPanel.hidden=true;loginPanel.hidden=false;webrtcLabel.textContent='未连接';statusPanel.textContent=estopLatched?(estopConfirmed?'已安全退出；车辆急停已确认，仍需本地确认复位':'已安全退出；急停请求未获车端确认，请在车辆本地核实'):'已安全退出';clientLog('driver_safe_logout',{estop_request_latched:estopLatched,estop_confirmed:estopConfirmed})}
+async function logout(){const estopConfirmed=vehicleTelemetry?.estop===true;closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='正在释放控制权';await post('/api/disconnect',{reason:'driver_safe_logout'});authenticated=false;controlAuthorityLost=false;connectButton.textContent='连接所选车辆';renderAuthExpiry(0);sessionPanel.hidden=true;vcuPanel.hidden=true;renderCanFeedback();monitorPanel.hidden=true;loginPanel.hidden=false;webrtcLabel.textContent='未连接';statusPanel.textContent=estopLatched?(estopConfirmed?'已安全退出；车辆急停已确认，仍需本地确认复位':'已安全退出；急停请求未获车端确认，请在车辆本地核实'):'已安全退出';clientLog('driver_safe_logout',{estop_request_latched:estopLatched,estop_confirmed:estopConfirmed})}
 addEventListener('pagehide',()=>{flushControlTrace('pagehide');closeRealtimeSession();if(authenticated)fetch('/api/disconnect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({reason:'browser_page_closed'}),keepalive:true}).catch(()=>{})});
 function neutralizeInput(){clearControlInput(false);send({},false).catch(console.error)}
 addEventListener('blur',neutralizeInput);document.addEventListener('visibilitychange',()=>{if(document.hidden)neutralizeInput()});
 document.querySelector('#login').onclick=()=>login().catch(e=>{statusPanel.textContent='登录失败: '+e.message});
+driverIdInput.addEventListener('keydown',e=>{if(e.key==='Enter')passwordInput.focus()});
 passwordInput.addEventListener('keydown',e=>{if(e.key==='Enter')login().catch(error=>{statusPanel.textContent='登录失败: '+error.message})});
 document.querySelector('#connect').onclick=()=>connect().catch(e=>{webrtcLabel.textContent='连接失败';statusPanel.textContent=e.message});
 document.querySelector('#logout').onclick=()=>logout().catch(e=>{statusPanel.textContent='退出失败: '+e.message});
@@ -1310,6 +1320,7 @@ vcuDisconnectButton.onclick=()=>{try{sendVcuHandshakeCommand('disconnect')}catch
 const keyNames={left:'左转',right:'右转',up:'前进',down:'倒车',service_brake:'缓刹',hard_brake:'急刹'};
 renderControlLimits();
 renderControlState();
+renderCanFeedback();
 addEventListener('gamepadconnected',e=>{activeGamepadIndex=e.gamepad.index;sampleGamepad();clientLog('gamepad_connected',{id:e.gamepad.id,mapping:e.gamepad.mapping,axes:e.gamepad.axes.length,buttons:e.gamepad.buttons.length})});addEventListener('gamepaddisconnected',e=>{if(activeGamepadIndex===e.gamepad.index)activeGamepadIndex=null;gamepadState.connected=false;gamepadState.steering=0;gamepadState.throttle=0;gamepadState.brake=0;gamepadRequiresNeutral=true;renderControlState();clientLog('gamepad_disconnected',{id:e.gamepad.id})});
 function editingTarget(target){return ['INPUT','SELECT','TEXTAREA','BUTTON'].includes(target?.tagName)||Boolean(target?.isContentEditable)}
 addEventListener('keydown',e=>{const binding=keys[e.code],estopKey=e.code==='KeyE';if(!binding&&!estopKey)return;if(editingTarget(e.target))return;e.preventDefault();if(!polling){if(binding)controlLogic.blockKey(blockedControlKeys,e.code);lastKeyboardEvent.textContent=`${estopKey?'急停':keyNames[binding]}已截获 · 等待连接`;return}if(estopKey){if(!e.repeat){lastKeyboardEvent.textContent='急停请求已锁定 · E';latchEstop('键盘 E');send({estop:true}).catch(console.error)}return}if(blockedControlKeys.has(e.code)){lastKeyboardEvent.textContent=`${keyNames[binding]}需释放后重新按下 · ${e.code}`;return}if(vcuStateRequiresFreshInput(vcuHandshake)){controlLogic.blockKey(blockedControlKeys,e.code);lastKeyboardEvent.textContent=`${keyNames[binding]}已阻止 · 等待 VCU 恢复后重新按下`;return}if(!vcuEverReady&&!vcuMockUnsupported()){controlLogic.blockKey(blockedControlKeys,e.code);lastKeyboardEvent.textContent=`${keyNames[binding]}已阻止 · 首次握手完成后请重新按下`;return}const pressed=controlLogic.pressKey(pressedControlKeys,blockedControlKeys,e.code);if(pressed.changed){syncControlKeyState();updateSelectedGearFromHeldDirections();lastKeyboardEvent.textContent=`${keyNames[binding]}按下 · ${e.code}`;renderControlState();send().catch(console.error)}});
@@ -1503,7 +1514,7 @@ setInterval(()=>refreshRuntimeStatus().catch(console.error),1000);
 setInterval(()=>flushControlTrace('interval'),1000);
 setInterval(()=>refreshControlIntent().catch(console.error),intentRefreshIntervalMs);
 setInterval(()=>{if(authenticated&&!connecting)refreshVehicles().catch(handleVehicleRefreshError)},5000);
-</script></body></html>)HTML";
+</script><script src="/assets/console-layout.js" defer></script></body></html>)HTML";
 }
 
 }  // namespace
@@ -3657,9 +3668,30 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
 DriverConfig load_driver_config(const std::string& path) {
   const auto root = YAML::LoadFile(path);
   DriverConfig config;
-  if (!root["driver"] || !root["driver"]["id"]) throw std::invalid_argument("driver.id is required");
+  const auto base = std::filesystem::absolute(path).parent_path();
+  const auto ui = root["ui"];
+  config.visual_assets_root = base / "../assets";
+  if (!std::filesystem::is_directory(config.visual_assets_root) &&
+      std::filesystem::is_directory(base / "../cpp/web/assets")) {
+    config.visual_assets_root = base / "../cpp/web/assets";
+  }
+  if (ui && ui["assets_root"]) {
+    config.visual_assets_root = ui["assets_root"].as<std::string>();
+    if (config.visual_assets_root.is_relative()) config.visual_assets_root = base / config.visual_assets_root;
+  }
+  config.visual_assets_root = config.visual_assets_root.lexically_normal();
+  if (ui && ui["scene_enabled"]) config.scene_enabled = ui["scene_enabled"].as<bool>();
+  if (ui && ui["scene_manifest"]) config.scene_manifest = ui["scene_manifest"].as<std::string>();
+  const std::filesystem::path manifest(config.scene_manifest);
+  if (manifest.empty() || manifest.is_absolute() || manifest.extension() != ".json" ||
+      config.scene_manifest.find_first_of("\\:\r\n?#") != std::string::npos) {
+    throw std::invalid_argument("ui.scene_manifest must be an asset-relative JSON path");
+  }
+  for (const auto& part : manifest) {
+    if (part == ".." || part == ".") throw std::invalid_argument("ui.scene_manifest must stay inside assets");
+  }
   if (!root["cloud"] || !root["cloud"]["signaling_url"]) throw std::invalid_argument("cloud.signaling_url is required");
-  config.driver_id = root["driver"]["id"].as<std::string>();
+  if (root["driver"] && root["driver"]["id"]) config.driver_id = root["driver"]["id"].as<std::string>();
   config.signaling_url = root["cloud"]["signaling_url"].as<std::string>();
   const auto cloud = root["cloud"];
   if (cloud["resolve"]) config.resolve_entries = cloud["resolve"].as<std::vector<std::string>>();
@@ -3771,7 +3803,7 @@ DriverConfig load_driver_config(const std::string& path) {
   }
   if (time_sync && time_sync["interval_ms"]) config.time_sync_interval_ms = time_sync["interval_ms"].as<int>();
   if (time_sync && time_sync["samples"]) config.time_sync_samples = time_sync["samples"].as<int>();
-  if (config.driver_id.empty() || config.signaling_url.empty() || config.rate_hz <= 0 ||
+  if (config.signaling_url.empty() || config.rate_hz <= 0 ||
       config.intent_lease_ms < 100 || config.intent_lease_ms > 1000 || config.estop_hold_ms < 0 ||
       config.browser_event_log_max_bytes < 1024 || config.browser_event_log_files < 1 ||
       config.browser_event_log_files > 20 ||
@@ -3811,12 +3843,13 @@ DriverConfig load_driver_config(const std::string& path) {
 
 DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehicle_id, std::string password)
     : config_(std::move(config)),
+      driver_id_(config_.driver_id),
       vehicle_id_(std::move(vehicle_id)),
       password_(std::move(password)),
       signaling_http_url_(normalize_signaling_http_url(config_.signaling_url)),
       http_(std::chrono::seconds(5), config_.resolve_entries, config_.ca_bundle),
       native_control_intent_(config_.intent_lease_ms) {
-  if (vehicle_id_.empty() || password_.empty()) throw std::invalid_argument("vehicle id and driver password are required");
+  if (vehicle_id_.empty()) throw std::invalid_argument("vehicle id is required");
   reset_control_profile_locked();
   if (!signaling_url_is_secure_or_loopback(config_.signaling_url)) {
     throw std::invalid_argument("public signaling URL must use HTTPS or WSS; HTTP/WS is allowed only on loopback");
@@ -3834,7 +3867,7 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
               {"event", "driver_native_control_trace_batch"},
               {"sent_at_utc_ms", timestamp_ms},
               {"browser_sent_at_utc_ms", timestamp_ms},
-              {"driver_id", config_.driver_id},
+              {"driver_id", driver_id()},
               {"vehicle_id", vehicle_id_},
               {"session_id", trace_session_id},
               {"details", std::move(details)},
@@ -3862,7 +3895,7 @@ void DriverConsoleRuntime::connect_signaling_websocket(std::string_view session_
   const auto url = signaling_websocket_url(
       config_.signaling_url,
       session_id,
-      config_.driver_id);
+      driver_id());
   std::lock_guard lock(signaling_websocket_mutex_);
   const bool same_session = signaling_websocket_session_id_ == session_id;
   if (signaling_websocket_ && signaling_websocket_->connected() && signaling_websocket_->url() == url) {
@@ -3909,7 +3942,7 @@ bool DriverConsoleRuntime::connect_control_signaling_websocket(
   const auto url = signaling_websocket_url(
                        config_.signaling_url,
                        session_id,
-                       config_.driver_id) +
+                       driver_id()) +
       "&send_only=1";
   std::lock_guard lock(control_signaling_websocket_mutex_);
   if (expected_generation != 0) {
@@ -4005,6 +4038,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       native_control_scheduled_at_monotonic_ms_.load(std::memory_order_relaxed);
   NativeControlIntentSample sample;
   std::string session;
+  std::string identity;
   std::string control_token;
   std::string driver_token;
   std::string vehicle;
@@ -4022,6 +4056,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
         return false;
       }
       session = session_id_;
+      identity = driver_id();
       control_token = control_token_;
       driver_token = driver_token_;
       vehicle = vehicle_id_;
@@ -4037,7 +4072,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
           {"stage", "send_started"},
           {"trace_session_id", session},
           {"vehicle_id", vehicle},
-          {"driver_id", config_.driver_id},
+          {"driver_id", identity},
           {"session_generation", generation},
           {"seq", sequence},
           {"intent_seq", sample.intent.intent_seq},
@@ -4061,7 +4096,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
 
     ControlCommand command;
     command.vehicle_id = vehicle;
-    command.driver_id = config_.driver_id;
+    command.driver_id = identity;
     command.session_id = session;
     command.seq = sequence;
     command.sent_at_utc_ms = clock_.now_ms();
@@ -4084,7 +4119,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
                         command.seq,
                         command.sent_at_utc_ms}
                         .to_json();
-    envelope["sender"] = config_.driver_id;
+    envelope["sender"] = identity;
     envelope["recipient"] = vehicle;
     envelope["type"] = "control_command";
     envelope["payload"] = payload;
@@ -4404,7 +4439,7 @@ bool DriverConsoleRuntime::remote_session_is_active(
     std::string_view token) const {
   const auto response = http_.get(
       signaling_http_url_ + "/sessions/" + http_.url_encode(session_id) + "?actor=" +
-          http_.url_encode(config_.driver_id),
+          http_.url_encode(driver_id()),
       {{"X-Mine-Teleop-Driver-Token", std::string(token)}});
   if (response.status == 401 || response.status == 403 || response.status == 404 || response.status == 409) {
     return false;
@@ -4433,12 +4468,14 @@ Json DriverConsoleRuntime::renew_control_authority() {
   std::lock_guard renewal_lock(control_lease_mutex_);
   std::string token;
   std::string session;
+  std::string identity;
   std::string control_token;
   std::int64_t renew_at_ms = 0;
   {
     std::lock_guard lock(mutex_);
     token = driver_token_;
     session = session_id_;
+    identity = driver_id();
     control_token = control_token_;
     renew_at_ms = control_token_renew_at_ms_;
   }
@@ -4453,7 +4490,7 @@ Json DriverConsoleRuntime::renew_control_authority() {
   try {
     response = http_.post_json_response(
         signaling_http_url_ + "/sessions/" + http_.url_encode(session) + "/renew",
-        {{"actor", config_.driver_id}, {"token", token}});
+        {{"actor", identity}, {"token", token}});
   } catch (const HttpStatusError& error) {
     if (error.status() == 401 || error.status() == 403 || error.status() == 404 || error.status() == 409) {
       close_signaling_websocket();
@@ -4523,7 +4560,7 @@ Json DriverConsoleRuntime::login_locked(std::string_view password) {
   if (credential.empty()) throw std::invalid_argument("driver password is required");
   const auto response = http_.post_json_response(
       signaling_http_url_ + "/auth/driver_login",
-      {{"driver_id", config_.driver_id}, {"password", credential}});
+      {{"driver_id", driver_id()}, {"password", credential}});
   {
     std::lock_guard lock(mutex_);
     password_ = credential;
@@ -4539,8 +4576,30 @@ Json DriverConsoleRuntime::login_locked(std::string_view password) {
   return result;
 }
 
-Json DriverConsoleRuntime::login(std::string_view password) {
+std::string DriverConsoleRuntime::driver_id() const {
+  std::lock_guard lock(identity_mutex_);
+  return driver_id_;
+}
+
+Json DriverConsoleRuntime::login(std::string_view password, std::string_view requested_driver_id) {
   std::lock_guard authentication_lock(authentication_mutex_);
+  const auto identity = requested_driver_id.empty() ? driver_id() : std::string(requested_driver_id);
+  if (identity.empty() || identity.size() > 128 ||
+      std::any_of(identity.begin(), identity.end(), [](unsigned char ch) { return std::isspace(ch) || std::iscntrl(ch); })) {
+    throw std::invalid_argument("driver ID is required and must not contain whitespace");
+  }
+  if (identity != driver_id()) {
+    // Login, logout and session changes share the authentication lock. A failed
+    // logout retains its token for retry and must not allow an identity switch.
+    std::lock_guard lock(mutex_);
+    if (!driver_token_.empty() || !session_id_.empty()) {
+      throw HttpStatusError(409, "log out before switching driver ID");
+    }
+    if (password.empty()) throw std::invalid_argument("driver password is required");
+    std::lock_guard identity_lock(identity_mutex_);
+    driver_id_ = identity;
+    password_.clear();
+  }
   return login_locked(password);
 }
 
@@ -4548,7 +4607,7 @@ Json DriverConsoleRuntime::fetch_authorized_vehicles(
     std::string_view token,
     std::int64_t expires_at_ms) {
   const auto response = http_.get_json(
-      signaling_http_url_ + "/drivers/" + http_.url_encode(config_.driver_id) + "/vehicles",
+      signaling_http_url_ + "/drivers/" + http_.url_encode(driver_id()) + "/vehicles",
       {{"X-Mine-Teleop-Driver-Token", std::string(token)}});
   const auto listed = response.value("vehicles", Json::array());
   if (!listed.is_array()) throw std::runtime_error("authorized vehicle response is invalid");
@@ -4561,7 +4620,7 @@ Json DriverConsoleRuntime::fetch_authorized_vehicles(
   }
   return {
       {"authenticated", true},
-      {"driver_id", config_.driver_id},
+      {"driver_id", driver_id()},
       {"token_expires_at_utc_ms", expires_at_ms},
       {"service_instance_id", service_instance_id},
       {"vehicles", listed},
@@ -4635,7 +4694,7 @@ Json DriverConsoleRuntime::vehicles() {
     }
     return {
         {"authenticated", true},
-        {"driver_id", config_.driver_id},
+        {"driver_id", driver_id()},
         {"token_expires_at_utc_ms", expires_at_ms},
         {"service_instance_id", service_instance_id},
         {"signaling_available", false},
@@ -4650,6 +4709,7 @@ Json DriverConsoleRuntime::vehicles() {
 }
 
 Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
+  std::lock_guard authentication_lock(authentication_mutex_);
   if (clock_.refresh_due(config_.time_sync_interval_ms)) static_cast<void>(refresh_time_sync());
   std::string current_token;
   std::string current_session;
@@ -4696,7 +4756,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
         std::lock_guard lock(mutex_);
         return {
             {"runtime", "cpp"},
-            {"driver_id", config_.driver_id},
+            {"driver_id", driver_id()},
             {"vehicle_id", vehicle_id_},
             {"connected", true},
             {"session_id", session_id_},
@@ -4727,7 +4787,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
   reset_native_control_state();
   const auto session = http_.post_json_response(
       signaling_http_url_ + "/sessions",
-      {{"driver_id", config_.driver_id}, {"vehicle_id", target}, {"token", current_token}});
+      {{"driver_id", driver_id()}, {"vehicle_id", target}, {"token", current_token}});
   const auto session_id = required_string(session, "session_id");
   const auto control_token = required_string(session, "control_token");
   const auto connected_at_ms = clock_.now_ms();
@@ -4790,7 +4850,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
   }
   return {
       {"runtime", "cpp"},
-      {"driver_id", config_.driver_id},
+      {"driver_id", driver_id()},
       {"vehicle_id", target},
       {"connected", true},
       {"session_id", session_id},
@@ -4801,6 +4861,7 @@ Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
 }
 
 Json DriverConsoleRuntime::end_session(std::string_view reason) {
+  std::lock_guard authentication_lock(authentication_mutex_);
   std::string token;
   std::string session;
   {
@@ -4812,12 +4873,12 @@ Json DriverConsoleRuntime::end_session(std::string_view reason) {
     reset_native_control_state();
     std::lock_guard lock(mutex_);
     reset_control_profile_locked();
-    return {{"driver_id", config_.driver_id}, {"connected", false}, {"session_id", ""}};
+    return {{"driver_id", driver_id()}, {"connected", false}, {"session_id", ""}};
   }
   if (token.empty()) throw std::runtime_error("driver login is required to end the session");
   auto response = http_.post_json_response(
       signaling_http_url_ + "/sessions/" + http_.url_encode(session) + "/end",
-      {{"actor", config_.driver_id}, {"token", token}, {"reason", std::string(reason)}});
+      {{"actor", driver_id()}, {"token", token}, {"reason", std::string(reason)}});
   close_signaling_websocket();
   reset_native_control_state();
   {
@@ -4832,13 +4893,19 @@ Json DriverConsoleRuntime::end_session(std::string_view reason) {
       connected_at_ms_ = 0;
     }
   }
-  response["driver_id"] = config_.driver_id;
+  response["driver_id"] = driver_id();
   response["connected"] = false;
   response["session_id"] = session;
   return response;
 }
 
+void DriverConsoleRuntime::prepare_shutdown() {
+  // Drop the local control generation before any potentially slow logout I/O.
+  reset_native_control_state();
+}
+
 Json DriverConsoleRuntime::disconnect(std::string_view reason) {
+  std::lock_guard authentication_lock(authentication_mutex_);
   std::string token;
   std::string session;
   {
@@ -4858,11 +4925,12 @@ Json DriverConsoleRuntime::disconnect(std::string_view reason) {
     reset_control_profile_locked();
     connected_at_ms_ = 0;
     authorized_vehicles_ = Json::array();
-    return {{"driver_id", config_.driver_id}, {"state", "offline"}, {"session_id", session}};
+    password_.clear();
+    return {{"driver_id", driver_id()}, {"state", "offline"}, {"session_id", session}};
   }
   auto response = http_.post_json_response(
       signaling_http_url_ + "/auth/driver_logout",
-      {{"driver_id", config_.driver_id}, {"token", token}, {"reason", std::string(reason)}});
+      {{"driver_id", driver_id()}, {"token", token}, {"reason", std::string(reason)}});
   close_signaling_websocket();
   reset_native_control_state();
   {
@@ -4878,6 +4946,7 @@ Json DriverConsoleRuntime::disconnect(std::string_view reason) {
       reset_control_profile_locked();
       connected_at_ms_ = 0;
       authorized_vehicles_ = Json::array();
+      password_.clear();
     }
   }
   response["session_id"] = session;
@@ -4973,6 +5042,7 @@ Json DriverConsoleRuntime::send_signaling_message(std::string_view type, const J
   std::lock_guard send_lock(signaling_send_mutex_);
   std::string token;
   std::string session;
+  std::string identity;
   std::string vehicle;
   std::uint64_t sequence = 0;
   {
@@ -4980,13 +5050,14 @@ Json DriverConsoleRuntime::send_signaling_message(std::string_view type, const J
     if (session_id_.empty() || driver_token_.empty()) throw std::runtime_error("driver console is not connected");
     token = driver_token_;
     session = session_id_;
+    identity = driver_id();
     vehicle = vehicle_id_;
     sequence = ++sequence_;
   }
   const ProtocolMetadata metadata{
-      kProtocolVersion, vehicle, config_.driver_id, session, sequence, clock_.now_ms()};
+      kProtocolVersion, vehicle, identity, session, sequence, clock_.now_ms()};
   auto request = metadata.to_json();
-  request["sender"] = config_.driver_id;
+  request["sender"] = identity;
   request["recipient"] = vehicle;
   request["token"] = token;
   request["type"] = type;
@@ -5095,15 +5166,17 @@ Json DriverConsoleRuntime::send_media_capabilities(const Json& input) {
 Json DriverConsoleRuntime::ice_servers() {
   std::string token;
   std::string session;
+  std::string identity;
   {
     std::lock_guard lock(mutex_);
     if (session_id_.empty() || driver_token_.empty()) throw std::runtime_error("driver console is not connected");
     token = driver_token_;
     session = session_id_;
+    identity = driver_id();
   }
   return http_.get_json(
       signaling_http_url_ + "/sessions/" + http_.url_encode(session) + "/ice_servers?actor=" +
-          http_.url_encode(config_.driver_id),
+          http_.url_encode(identity),
       {{"X-Mine-Teleop-Driver-Token", token}});
 }
 
@@ -5176,7 +5249,7 @@ Json DriverConsoleRuntime::ingest_webrtc_metrics(const Json& input) {
   try {
     const auto reported = http_.post_json_response(
         signaling_http_url_ + "/sessions/" + http_.url_encode(session) + "/webrtc_connection",
-        {{"actor", config_.driver_id},
+        {{"actor", driver_id()},
          {"token", token},
          {"connection_state", connection_state},
          {"connection_method", connection_method},
@@ -5349,7 +5422,7 @@ Json DriverConsoleRuntime::prepare_control_profile(const Json& input) {
   auto request = ProtocolMetadata{
       kProtocolVersion,
       vehicle_id_,
-      config_.driver_id,
+      driver_id(),
       session_id_,
       sequence,
       clock_.now_ms()}.to_json();
@@ -5499,7 +5572,7 @@ Json DriverConsoleRuntime::status() {
   std::lock_guard lock(mutex_);
   return {
       {"runtime", "cpp"},
-      {"driver_id", config_.driver_id},
+      {"driver_id", driver_id()},
       {"vehicle_id", vehicle_id_},
       {"authenticated", !driver_token_.empty()},
       {"driver_token_expires_at_utc_ms", driver_token_expires_at_ms_},
@@ -5622,7 +5695,7 @@ Json DriverConsoleRuntime::record_browser_event(const Json& input) {
       {"event", event},
       {"sent_at_utc_ms", received_at},
       {"browser_sent_at_utc_ms", browser_sent_at},
-      {"driver_id", config_.driver_id},
+      {"driver_id", driver_id()},
       {"vehicle_id", vehicle},
       {"session_id", session},
       {"details", details},
@@ -5638,6 +5711,13 @@ DriverConsoleHttpApp::DriverConsoleHttpApp(std::shared_ptr<DriverConsoleRuntime>
 
 ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
   try {
+    if (request.method == "GET" && request.path.starts_with("/assets/")) {
+      return serve_console_asset(runtime_->config(), request.path);
+    }
+    if (request.method == "GET" && request.path == "/api/scene-config") {
+      return ServerResponse::json(200, {{"enabled", runtime_->config().scene_enabled},
+          {"manifest", "/assets/" + runtime_->config().scene_manifest}});
+    }
     if (request.method == "GET" && request.path == "/health") return ServerResponse::json(200, {{"status", "ok"}, {"runtime", "cpp"}});
     if (request.method == "GET" && request.path == "/api/time") return ServerResponse::json(200, {{"now_ms", now_ms()}});
     if (request.method == "GET" && request.path == "/api/status") return ServerResponse::json(200, runtime_->status());
@@ -5648,7 +5728,8 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
       return ServerResponse::text(200, console_html(runtime_->config()), "text/html; charset=utf-8");
     }
     if (request.method == "POST" && request.path == "/api/login") {
-      return ServerResponse::json(200, runtime_->login(request.json_body().value("password", "")));
+      const auto body = request.json_body();
+      return ServerResponse::json(200, runtime_->login(required_string(body, "password"), required_string(body, "driver_id")));
     }
     if (request.method == "POST" && request.path == "/api/connect") {
       return ServerResponse::json(200, runtime_->connect(request.json_body().value("vehicle_id", "")));

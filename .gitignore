@@ -1,8 +1,11 @@
 # Build artifacts and generated output must not be tracked in git.
 /build/
+/build-native/
 /cpp-build/
 /dist/
 /.vcpkg/
+/cpp/web/node_modules/
+/desktop/node_modules/
 *.tar.gz
 .DS_Store
 .playwright-cli/

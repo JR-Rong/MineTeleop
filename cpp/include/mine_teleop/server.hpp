@@ -296,6 +296,9 @@ struct DriverControlLimitsConfig {
 };
 
 struct DriverConfig {
+  std::filesystem::path visual_assets_root;
+  std::string scene_manifest{"models/haul-truck/model.json"};
+  bool scene_enabled{true};
   std::string driver_id;
   std::string signaling_url;
   std::vector<std::string> resolve_entries;
@@ -322,11 +325,12 @@ class DriverConsoleRuntime {
   DriverConsoleRuntime(DriverConfig config, std::string vehicle_id, std::string password);
   ~DriverConsoleRuntime();
 
-  [[nodiscard]] Json login(std::string_view password = {});
+  [[nodiscard]] Json login(std::string_view password = {}, std::string_view driver_id = {});
   [[nodiscard]] Json vehicles();
   [[nodiscard]] Json connect(std::string_view vehicle_id = {});
   [[nodiscard]] Json end_session(std::string_view reason = "driver_session_end");
   [[nodiscard]] Json disconnect(std::string_view reason = "driver_console_disconnect");
+  void prepare_shutdown();
   [[nodiscard]] Json poll_signaling();
   [[nodiscard]] Json send_media_capabilities(const Json& input);
   [[nodiscard]] Json ice_servers();
@@ -346,6 +350,7 @@ class DriverConsoleRuntime {
 
  private:
   [[nodiscard]] Json login_locked(std::string_view password);
+  [[nodiscard]] std::string driver_id() const;
   [[nodiscard]] Json fetch_authorized_vehicles(std::string_view token, std::int64_t expires_at_ms);
   [[nodiscard]] Json send_signaling_message(std::string_view type, const Json& payload);
   void connect_signaling_websocket(std::string_view session_id, std::string_view token);
@@ -372,6 +377,9 @@ class DriverConsoleRuntime {
   [[nodiscard]] Json control_profile_locked() const;
 
   DriverConfig config_;
+  // Runtime identity is independent of the optional legacy configuration default.
+  mutable std::mutex identity_mutex_;
+  std::string driver_id_;
   std::string vehicle_id_;
   std::string password_;
   std::string signaling_http_url_;
@@ -381,7 +389,7 @@ class DriverConsoleRuntime {
   mutable std::mutex browser_event_log_mutex_;
   mutable std::mutex time_sync_mutex_;
   mutable std::mutex control_lease_mutex_;
-  mutable std::mutex authentication_mutex_;
+  mutable std::recursive_mutex authentication_mutex_;
   mutable std::mutex signaling_send_mutex_;
   mutable std::mutex signaling_websocket_mutex_;
   mutable std::mutex control_signaling_websocket_mutex_;

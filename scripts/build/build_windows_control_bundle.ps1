@@ -246,9 +246,16 @@ New-Item -ItemType Directory -Path (Join-Path $PackageRoot "bin") -Force | Out-N
 New-Item -ItemType Directory -Path (Join-Path $PackageRoot "config") -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $PackageRoot "protocol\v1") -Force | Out-Null
 
+Copy-Item -LiteralPath (Join-Path $RepoRoot "cpp\web\assets") -Destination (Join-Path $PackageRoot "assets") -Recurse
 Copy-Item -LiteralPath $Executable -Destination (Join-Path $PackageRoot "bin")
 Get-ChildItem -LiteralPath $ConfigurationDirectory -Filter "*.dll" -File | ForEach-Object {
   Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $PackageRoot "bin")
+}
+# CMake collects these from the selected MSVC toolchain, not the host System32.
+foreach ($RuntimeName in @("vcruntime140.dll", "msvcp140.dll")) {
+  if (-not (Test-Path -LiteralPath (Join-Path $PackageRoot "bin\$RuntimeName") -PathType Leaf)) {
+    throw "Missing app-local compiler runtime: $RuntimeName"
+  }
 }
 Copy-Item -LiteralPath (Join-Path $RepoRoot "configs\driver-console.three-machine.dev.yaml") `
   -Destination (Join-Path $PackageRoot "config\driver-console.yaml")

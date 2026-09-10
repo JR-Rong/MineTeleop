@@ -66,6 +66,7 @@ install -m 0644 \
   "$output_root/config/mine-teleop-field-root.crt"
 install -m 0644 /etc/ssl/certs/ca-certificates.crt "$output_root/certs/cacert.pem"
 cp -R "$repo_root/protocol/v1/." "$output_root/protocol/v1/"
+cp -R "$repo_root/cpp/web/assets" "$output_root/assets"
 
 # Launcher script
 cat > "$output_root/mine-teleop-control" <<'LAUNCHER'

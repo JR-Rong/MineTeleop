@@ -140,6 +140,7 @@ add_library(mine_teleop_runtime
   cpp/src/platform.cpp
   "${MINE_TELEOP_GENERATED_SERVER_SOURCE}"
   cpp/src/websocket.cpp
+  cpp/src/console_assets.cpp
 )
 target_include_directories(mine_teleop_runtime
   PUBLIC
@@ -184,6 +185,21 @@ if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
     PRIVATE MINE_TELEOP_CURL_LINKAGE="${MINE_TELEOP_CURL_LINKAGE}"
   )
   mine_teleop_enable_warnings(mine-teleop-control)
+  if(MSVC)
+    # Put the compiler's redistributable CRT next to the executable. Operators
+    # do not need a separate Visual C++ Redistributable installation.
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
+    include(InstallRequiredSystemLibraries)
+    if(NOT CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+      message(FATAL_ERROR "MSVC redistributable libraries are required for the portable controller")
+    endif()
+    foreach(runtime_library IN LISTS CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+      add_custom_command(TARGET mine-teleop-control POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${runtime_library}" "$<TARGET_FILE_DIR:mine-teleop-control>"
+        VERBATIM)
+    endforeach()
+  endif()
   set_target_properties(mine-teleop-control PROPERTIES
     BUILD_RPATH "$ORIGIN/../lib"
     INSTALL_RPATH "$ORIGIN/../lib"
@@ -293,6 +309,7 @@ install(TARGETS mine_teleop_runtime
 )
 install(DIRECTORY cpp/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY configs/ DESTINATION share/mine-teleop/configs)
+install(DIRECTORY cpp/web/assets/ DESTINATION share/mine-teleop/assets)
 install(DIRECTORY protocol/ DESTINATION share/mine-teleop/protocol)
 
 if(MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
@@ -314,8 +331,14 @@ endif()
 
 if(MINE_TELEOP_BUILD_TESTS)
   enable_testing()
+  add_executable(mine-teleop-console-assets-tests cpp/tests/console_assets_tests.cpp)
+  target_link_libraries(mine-teleop-console-assets-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-console-assets-tests)
+  add_test(NAME mine-teleop-console-assets-tests COMMAND mine-teleop-console-assets-tests)
   if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
     find_program(MINE_TELEOP_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
+    add_test(NAME mine-teleop-scene-state-tests
+      COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/scene_state.test.mjs)
     add_test(
       NAME mine-teleop-control-logic-js-tests
       COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/control_logic.test.cjs

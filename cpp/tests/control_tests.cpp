@@ -3526,6 +3526,54 @@ void test_failed_logout_keeps_retryable_local_authority() {
   expect(status.value("connected", false), "failed logout falsely reported the server session as released");
 }
 
+void test_web_login_selects_identity_and_requires_logout_to_switch() {
+  mine_teleop::SignalingServerConfig signaling_config;
+  signaling_config.driver_passwords = {{"driver-a", "secret-a"}, {"driver-b", "secret-b"}};
+  signaling_config.device_tokens = {{"vehicle-a", "device-a"}, {"vehicle-b", "device-b"}};
+  signaling_config.driver_vehicle_permissions = {{"driver-a", {"vehicle-a"}}, {"driver-b", {"vehicle-b"}}};
+  auto signaling = std::make_shared<mine_teleop::SignalingService>(std::move(signaling_config));
+  mine_teleop::SimpleHttpServer server("127.0.0.1", 0,
+      [signaling](const auto& request) { return signaling->handle(request); });
+  server.start();
+  mine_teleop::DriverConfig config;
+  config.signaling_url = "http://127.0.0.1:" + std::to_string(server.port());
+  allow_qemu_test_scheduler_time_sync(config);
+  auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(config, "vehicle-a", "");
+  mine_teleop::DriverConsoleHttpApp app(runtime);
+  auto login = [&](const mine_teleop::Json& body) {
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.path = "/api/login";
+    request.body = body.dump();
+    return app.handle(request);
+  };
+  expect(!runtime->status().value("authenticated", true), "fresh console auto-authenticated");
+  expect(login({{"password", "secret-a"}}).status == 400, "web login accepted missing driver ID");
+  expect(login({{"driver_id", "driver-a"}}).status == 400, "web login accepted missing password");
+  expect(login({{"driver_id", "driver-a"}, {"password", "wrong"}}).status == 401, "wrong password was accepted");
+  expect(!runtime->status().value("authenticated", true), "failed login installed authority");
+  const auto first = login({{"driver_id", "driver-a"}, {"password", "secret-a"}});
+  expect(first.status == 200, "page credentials could not log in without configured identity");
+  const auto a = mine_teleop::Json::parse(first.body);
+  expect(a.at("driver_id") == "driver-a" && a.at("vehicles").size() == 1 &&
+      a.at("vehicles")[0].at("vehicle_id") == "vehicle-a", "first identity received wrong permissions");
+  expect(login({{"driver_id", "driver-b"}, {"password", "secret-b"}}).status == 409,
+      "authenticated console allowed an identity switch without logout");
+  expect(runtime->status().at("driver_id") == "driver-a", "rejected switch mutated active identity");
+  static_cast<void>(runtime->disconnect());
+  bool cached_login_rejected = false;
+  try { static_cast<void>(runtime->login()); } catch (const std::invalid_argument&) { cached_login_rejected = true; }
+  expect(cached_login_rejected, "logout retained the previous password for automatic login");
+  const auto second = login({{"driver_id", "driver-b"}, {"password", "secret-b"}});
+  expect(second.status == 200, "logout did not allow a new driver ID");
+  const auto b = mine_teleop::Json::parse(second.body);
+  expect(b.at("driver_id") == "driver-b" && b.at("vehicles").size() == 1 &&
+      b.at("vehicles")[0].at("vehicle_id") == "vehicle-b", "new identity inherited previous permissions");
+  expect(runtime->config().driver_id.empty(), "page login mutated persistent configuration");
+  static_cast<void>(runtime->disconnect());
+  server.stop();
+}
+
 void test_local_proxy_preserves_upstream_auth_status() {
   mine_teleop::SignalingServerConfig signaling_config;
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
@@ -5998,6 +6046,7 @@ int main() {
       {"two_driver_two_vehicle_wss_isolation_and_safe_rejection",
        test_two_driver_two_vehicle_wss_isolation_and_safe_rejection},
       {"failed_logout_keeps_retryable_local_authority", test_failed_logout_keeps_retryable_local_authority},
+      {"web_login_selects_identity_and_requires_logout_to_switch", test_web_login_selects_identity_and_requires_logout_to_switch},
       {"local_proxy_preserves_upstream_auth_status", test_local_proxy_preserves_upstream_auth_status},
       {"control_authority_lease_renews_without_rotating_token",
        test_control_authority_lease_renews_without_rotating_token},

@@ -12,6 +12,8 @@ on:
       - "packaging/windows/**"
       - "protocol/**"
       - "scripts/build/build_windows_control_bundle.ps1"
+      - "scripts/build/build_desktop_control_bundle.mjs"
+      - "desktop/**"
 
 permissions:
   contents: read
@@ -93,6 +95,27 @@ jobs:
             throw "Windows control bundle build failed with exit code $LASTEXITCODE"
           }
 
+      - name: Set up desktop build tools
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Build independent Chromium desktop window
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm ci --prefix desktop
+          if ($LASTEXITCODE -ne 0) { throw "Desktop dependency install failed" }
+          $nativeRoots = @(Get-ChildItem -LiteralPath dist -Directory -Filter "mine-teleop-control-windows-x64-*")
+          if ($nativeRoots.Count -ne 1) { throw "Expected exactly one native bundle" }
+          $env:MINE_TELEOP_TEST_NATIVE_ROOT = $nativeRoots[0].FullName
+          node --test desktop/test/native-controller.test.cjs desktop/test/native-process.test.cjs
+          if ($LASTEXITCODE -ne 0) { throw "Desktop lifecycle tests failed" }
+          node scripts/build/build_desktop_control_bundle.mjs --platform win32 --arch x64 --native-root $nativeRoots[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw "Desktop packaging failed" }
+
       - name: Verify packaged checksum
         shell: pwsh
         run: |
@@ -120,6 +143,8 @@ jobs:
           path: |
             dist/mine-teleop-control-windows-x64-*.zip
             dist/mine-teleop-control-windows-x64-*.zip.sha256
+            dist/desktop/MineTeleop-win32-x64.zip
+            dist/desktop/MineTeleop-win32-x64.zip.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 14

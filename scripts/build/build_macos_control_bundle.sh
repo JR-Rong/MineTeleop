@@ -46,6 +46,7 @@ cmake_args=(
   -B "$build_dir"
   -DCMAKE_BUILD_TYPE=Release
   "-DCMAKE_OSX_ARCHITECTURES=$cmake_arch"
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
   -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=OFF
   -DMINE_TELEOP_BUILD_CONTROL_CLIENT=ON
   -DMINE_TELEOP_BUILD_SIGNALING_SERVER=OFF
@@ -83,6 +84,7 @@ install -m 0644 \
   "$package_root/config/mine-teleop-field-root.crt"
 install -m 0644 /etc/ssl/cert.pem "$package_root/certs/cacert.pem"
 cp -R "$repo_root/protocol/v1/." "$package_root/protocol/v1/"
+cp -R "$repo_root/cpp/web/assets" "$package_root/assets"
 
 printf '%s\n' \
   "target_arch=$package_arch" \

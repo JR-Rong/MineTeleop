@@ -4,7 +4,7 @@
 
 Driver Console 运行在远端模拟驾驶器上，负责：
 
-- 用户登录。
+- 用户在网页填写驾驶员 ID 和密码登录；退出后可更换账号，运行中不切换身份。
 - 选择车辆或会话。
 - 建立实时连接。
 - 显示多路视频。
@@ -286,3 +286,9 @@ monotonic 成功发送间隔。`/api/status.native_control` 同时提供连接�
 latest-only mailbox、投递、接收、锁等待、apply 和拒绝阶段。三端都用
 `trace_session_id + seq + intent_seq`（云端投递 ACK 另带 `delivery_cursor`）关联且不记录
 `control_token`；中间发送序号被 mailbox 覆盖是正常行为，不能当作丢包或必达确认。
+
+## 三列布局与自车 3D
+
+三列布局、八轮 CAN 汇总、可替换自车模型、鼠标交互和按实测速度自动切换视角，见 [控制端三列布局与可替换自车模型](console-3d-layout.md)。本阶段环视拼接与相机绑定暂缓。
+
+独立桌面分发与窗口生命周期见 [独立桌面控制端](desktop-control.md)。
