@@ -4295,25 +4295,27 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
   native_command.driver_id = "driver-console-001";
   native_command.session_id = session_id;
   native_command.seq = 1;
-  native_command.sent_at_utc_ms = mine_teleop::now_ms();
+  // Simulate a command prepared before its signaling envelope is constructed.
+  native_command.sent_at_utc_ms = mine_teleop::now_ms() - 10;
   native_command.gear = "N";
   native_command.control_token = session.at("control_token").get<std::string>();
   auto native_payload = native_command.to_json();
   native_payload["intent_seq"] = 1;
   native_payload["intent_fresh"] = true;
+  auto native_request = signaling_request_for(
+      session_id,
+      1,
+      "vehicle-001",
+      "driver-console-001",
+      "driver-console-001",
+      "vehicle-001",
+      "token",
+      token,
+      "control_command",
+      native_payload);
+  native_request["sent_at_utc_ms"] = native_command.sent_at_utc_ms;
   const auto native_control_ack = http.post_json_response(
-      base + "/signaling/" + session_id + "/messages",
-      signaling_request_for(
-          session_id,
-          1,
-          "vehicle-001",
-          "driver-console-001",
-          "driver-console-001",
-          "vehicle-001",
-          "token",
-          token,
-          "control_command",
-          native_payload));
+      base + "/signaling/" + session_id + "/messages", native_request);
   const auto native_control_cursor =
       native_control_ack.at("delivery_cursor").get<std::uint64_t>();
   const auto native_control_websocket_url =

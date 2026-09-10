@@ -40,7 +40,7 @@
 
 当前 MineTeleop 为公开仓库，而 ChassisControl 和 MinePilot 为私有仓库。完整车端包必须包含真实 `libchassis_control.so`，并从本次提交重新构建 `libmine_teleop_chassis_bridge.so`。不能把无底盘库的编译测试产物当作完整车端发布包。
 
-**待配置：私有仓库的专用只读访问凭据，以及该二进制是否允许公开发布的明确决定。** 完整打包步骤已经接入，但默认不启用。 在这两项落实前，PR 仍执行车端源码编译/测试；正式发布的全量包检查会因缺少完整车端包而失败，不发布不完整版本。不要将个人 GitHub token 写入工作流、聊天或仓库。
+**本仓库已获底盘运行库公开发布授权，并配置专用只读部署密钥和 `VEHICLE_RUNTIME_PUBLIC=true`。** 本仓库 PR 和 main 构建完整车端包，通过后上传 `bundle-vehicle-linux-x64`，并将它纳入 `validated-release`。fork PR 不读取私有依赖，仍只执行车端源码编译/测试。其他仓库复用此工作流时需自行完成以下配置；正式发布始终要求完整车端包通过校验。不要将个人 GitHub token 写入工作流、聊天或仓库。
 
 启用方式（仅在允许公开该运行库后）：
 
