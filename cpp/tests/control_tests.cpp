@@ -932,9 +932,14 @@ void test_control_page_contract() {
           response.body.find("offeredCameraByMid.get(mid)") != std::string::npos,
       "browser camera IDs are not mapped from the SDP video mids");
   expect(
-      response.body.find("srcObject=new MediaStream([track])") != std::string::npos &&
+      response.body.find("srcObject = new MediaStream([track])") != std::string::npos &&
           response.body.find("attach(id,e.track)") != std::string::npos,
       "browser video elements are not isolated to their individual WebRTC tracks");
+  expect(
+      response.body.find("cameraView.configure(remoteCameraIds)") != std::string::npos &&
+          response.body.find("if(peer!==nextPeer||e.track.kind!=='video')return") != std::string::npos &&
+          response.body.find("MineTeleopCameraView.mount(cameraGrid)") != std::string::npos,
+      "camera slots must be declared before tracks and reject callbacks from old peers");
   const auto ontrack_handler = response.body.find("nextPeer.ontrack=e=>");
   const auto remote_description = response.body.find("await nextPeer.setRemoteDescription", ontrack_handler);
   expect(

@@ -96,3 +96,11 @@ body .limit-inline strong{min-width:0;overflow-wrap:anywhere}
  body .camera-toolbar{flex-wrap:wrap}
  body .operator-status-item strong{font-size:13px;white-space:normal;overflow:visible}
 }
+
+/* Keep configured camera slots stable while their streams connect or recover. */
+body .visual-stage>#cameras{grid-template-columns:repeat(var(--camera-columns,2),minmax(0,1fr))}
+body #cameras[data-camera-count="3"]>.camera:first-child{grid-column:1/-1}
+body .camera-placeholder{position:absolute;inset:0;display:grid;place-items:center;padding:32px 12px 12px;background:#020617;color:var(--muted);font-size:13px;text-align:center}
+body .camera-placeholder[hidden]{display:none}
+body .camera[data-state="stale"],body .camera[data-state="offline"]{border-color:#b7791f}
+body .camera[data-state="stale"] .camera-placeholder,body .camera[data-state="offline"] .camera-placeholder{color:#fbbf24}

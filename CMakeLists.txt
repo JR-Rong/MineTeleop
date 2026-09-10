@@ -88,6 +88,11 @@ include(cmake/SplitMsvcStringLiterals.cmake)
 set(MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_logic.js")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}")
 file(READ "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}" MINE_TELEOP_CONTROL_LOGIC_JS)
+# Embed camera presentation alongside control logic so native packages need no extra script fetch.
+set(MINE_TELEOP_CAMERA_VIEW_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/camera_view.js")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CAMERA_VIEW_JS_SOURCE}")
+file(READ "${MINE_TELEOP_CAMERA_VIEW_JS_SOURCE}" MINE_TELEOP_CAMERA_VIEW_JS)
+string(APPEND MINE_TELEOP_CONTROL_LOGIC_JS "\n${MINE_TELEOP_CAMERA_VIEW_JS}")
 string(REPLACE "\r\n" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
 string(REPLACE "\r" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
 mine_teleop_make_adjacent_raw_literals(
@@ -337,6 +342,8 @@ if(MINE_TELEOP_BUILD_TESTS)
   add_test(NAME mine-teleop-console-assets-tests COMMAND mine-teleop-console-assets-tests)
   if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
     find_program(MINE_TELEOP_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
+    add_test(NAME mine-teleop-camera-view-tests
+      COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/camera_view.test.cjs)
     add_test(NAME mine-teleop-scene-state-tests
       COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/scene_state.test.mjs)
     add_test(

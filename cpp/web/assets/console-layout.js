@@ -20,8 +20,15 @@
   sidebar.before(scene);
   scene.querySelector('.scene-resume').addEventListener('click',event=>event.currentTarget.blur());
   const videos=document.getElementById('cameras');
-  const resizeGrid=()=>{const count=videos.querySelectorAll('.camera').length;videos.style.setProperty('--camera-rows',String(Math.max(1,Math.ceil(count/2))));};
-  new MutationObserver(resizeGrid).observe(videos,{childList:true});resizeGrid();
+  const resizeGrid=()=>{
+    const count=videos.querySelectorAll('.camera').length;
+    const columns=count===1||(count===2&&videos.clientWidth/videos.clientHeight<16/9)?1:2;
+    videos.dataset.cameraCount=String(count);
+    videos.style.setProperty('--camera-columns',String(columns));
+    videos.style.setProperty('--camera-rows',String(count===3?2:Math.max(1,Math.ceil(count/columns))));
+  };
+  new MutationObserver(resizeGrid).observe(videos,{childList:true});
+  new ResizeObserver(resizeGrid).observe(videos);resizeGrid();
   fetch('/api/scene-config').then(response=>{if(!response.ok)throw Error('无法读取 3D 配置');return response.json();}).then(async config=>{
     if(!config.enabled){scene.querySelector('.scene-status').textContent='3D 已在配置中关闭';return;}
     const {mountScene}=await import('./scene.js');await mountScene(scene,config.manifest);
