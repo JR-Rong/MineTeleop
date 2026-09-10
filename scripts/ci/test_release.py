@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
-from prepare_release import DESKTOPS, prepare
+from prepare_release import DESKTOPS, digest, prepare
 from publish_release import publish
 
 SHA = 'a' * 40
@@ -89,6 +89,20 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'requires all packages'):
                 publish(self.output)
             gh.assert_not_called()
+
+    def test_verified_assets_are_published_only_after_upload(self):
+        self.prepare()
+        env = {'GITHUB_SHA': SHA, 'GITHUB_REPOSITORY': 'owner/repo'}
+        tag = type('Result', (), {'returncode': 0, 'stdout': json.dumps({
+            'object': {'type': 'commit', 'sha': SHA}})})()
+        draft = type('Result', (), {'returncode': 0, 'stdout': json.dumps({
+            'draft': True, 'target_commitish': SHA})})()
+        assets = [{'name': p.name, 'size': p.stat().st_size, 'digest': 'sha256:' + digest(p)}
+                  for p in self.output.iterdir()]
+        with patch.dict('os.environ', env), patch('publish_release.subprocess.run', side_effect=[tag, draft]), \
+                patch('publish_release.gh', side_effect=['', json.dumps({'assets': assets}), '']) as gh:
+            publish(self.output)
+            self.assertEqual(gh.call_args_list[-1].args, ('release', 'edit', 'v1.2.3', '--draft=false', '--latest'))
 
     def test_existing_tag_cannot_be_moved_to_another_commit(self):
         self.prepare()

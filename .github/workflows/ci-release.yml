@@ -291,14 +291,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: docker/setup-buildx-action@v4
-      - name: Compile vehicle and run CTest without proprietary runtime
-        run: |
-          docker buildx build --platform linux/amd64 \
-            --build-arg MINE_TELEOP_BUILD_TESTS=ON \
-            --build-arg MINE_TELEOP_BUILD_JOBS=3 \
-            --target build --output type=cacheonly \
-            -f deployments/cpp/Dockerfile.build .
-
       - name: Enable approved complete vehicle packaging
         id: vehicle-inputs
         if: vars.VEHICLE_RUNTIME_PUBLIC == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
@@ -321,6 +313,14 @@ jobs:
                   output.write(f'{key}={value}\n')
               output.write('enabled=true\n')
           PYTHON
+      - name: Compile vehicle and run CTest without proprietary runtime
+        if: steps.vehicle-inputs.outputs.enabled != 'true'
+        run: |
+          docker buildx build --platform linux/amd64 \
+            --build-arg MINE_TELEOP_BUILD_TESTS=ON \
+            --build-arg MINE_TELEOP_BUILD_JOBS=3 \
+            --target build --output type=cacheonly \
+            -f deployments/cpp/Dockerfile.build .
       - name: Check out pinned chassis headers
         if: steps.vehicle-inputs.outputs.enabled == 'true'
         uses: actions/checkout@v7
