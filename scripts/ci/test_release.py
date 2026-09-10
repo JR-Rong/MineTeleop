@@ -90,11 +90,23 @@ class ReleaseTests(unittest.TestCase):
                 publish(self.output)
             gh.assert_not_called()
 
+    def test_existing_tag_cannot_be_moved_to_another_commit(self):
+        self.prepare()
+        env = {'GITHUB_SHA': SHA, 'GITHUB_REPOSITORY': 'owner/repo'}
+        result = type('Result', (), {'returncode': 0, 'stdout': json.dumps({
+            'object': {'type': 'commit', 'sha': 'b' * 40}})})()
+        with patch.dict('os.environ', env), patch('publish_release.subprocess.run', return_value=result), \
+                patch('publish_release.gh') as gh:
+            with self.assertRaisesRegex(ValueError, 'tag points to another'):
+                publish(self.output)
+            gh.assert_not_called()
+
     def test_failed_upload_verification_keeps_draft(self):
         self.prepare()
         env = {'GITHUB_SHA': SHA, 'GITHUB_REPOSITORY': 'owner/repo', 'GITHUB_RUN_NUMBER': '10'}
+        tag = type('Result', (), {'returncode': 0, 'stdout': json.dumps({'object': {'type': 'commit', 'sha': SHA}})})()
         result = type('Result', (), {'returncode': 0, 'stdout': json.dumps({'draft': True, 'target_commitish': SHA})})()
-        with patch.dict('os.environ', env), patch('publish_release.subprocess.run', return_value=result), \
+        with patch.dict('os.environ', env), patch('publish_release.subprocess.run', side_effect=[tag, result]), \
                 patch('publish_release.gh', side_effect=['', json.dumps({'assets': []})]) as gh:
             with self.assertRaisesRegex(ValueError, 'inventory differs'):
                 publish(self.output)

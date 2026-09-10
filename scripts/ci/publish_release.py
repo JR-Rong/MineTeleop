@@ -22,6 +22,15 @@ def publish(directory):
     repository = os.environ['GITHUB_REPOSITORY']
     parts(manifest['version'])
     tag = 'v' + manifest['version']
+    tag_result = subprocess.run(['gh', 'api', f'repos/{repository}/git/ref/tags/{tag}'], capture_output=True, text=True)
+    if tag_result.returncode == 0:
+        target = json.loads(tag_result.stdout)['object']
+        while target['type'] == 'tag':
+            target = json.loads(gh('api', f'repos/{repository}/git/tags/{target["sha"]}'))['object']
+        if target['type'] != 'commit' or target['sha'] != commit:
+            raise ValueError('Existing tag points to another source commit')
+    elif 'HTTP 404' not in tag_result.stderr:
+        raise RuntimeError(tag_result.stderr)
     endpoint = f'repos/{repository}/releases/tags/{tag}'
     result = subprocess.run(['gh', 'api', endpoint], capture_output=True, text=True)
     if result.returncode == 0:
@@ -34,7 +43,7 @@ def publish(directory):
     elif 'HTTP 404' in result.stderr:
         notes = (f'Source commit: {commit}\n\n'
                  f'Build and validation: https://github.com/{repository}/actions/runs/{os.environ["GITHUB_RUN_ID"]}\n\n'
-                 'Includes Windows x64, macOS arm64/x64 and Ubuntu x64 desktop controllers, '
+                 'Includes Windows arm64/x64, macOS arm64 and Ubuntu x64 desktop controllers, '
                  'Ubuntu 22.04 x64 cloud and vehicle bundles. SHA-256 files and RELEASE-MANIFEST.json '
                  'identify all packages. CI validation does not replace target hardware acceptance.\n')
         gh('release', 'create', tag, '--target', commit, '--draft', '--title', f'MineTeleop {tag}', '--notes', notes)

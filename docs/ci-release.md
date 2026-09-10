@@ -11,8 +11,8 @@
 
 | 组件 | 系统/架构 | 验证与产物 |
 | --- | --- | --- |
-| 控制端 | Windows x64 | MSVC 原生编译、进程生命周期测试、包含 Chromium 的 ZIP |
-| 控制端 | macOS arm64 / x64 | Xcode 26.3、CTest、进程生命周期测试、ad-hoc 签名的独立 App ZIP |
+| 控制端 | Windows arm64 / x64 | MSVC 原生编译、进程生命周期测试、包含 Chromium 的 ZIP |
+| 控制端 | macOS arm64 | Xcode 26.3、CTest、进程生命周期测试、ad-hoc 签名的独立 App ZIP |
 | 控制端 | Ubuntu 22.04 x64 | Docker 原生编译、CTest、进程生命周期测试、运行库闭包检查、桌面 tar.gz |
 | 云端 | Ubuntu 22.04 x64 | Docker 编译、CTest、干净容器自检、独立部署 tar.gz |
 | 车端 | Ubuntu 22.04 x64 | Docker 全量编译和 CTest；完整部署包还需下述私有运行库 |
@@ -40,7 +40,14 @@
 
 当前 MineTeleop 为公开仓库，而 ChassisControl 和 MinePilot 为私有仓库。完整车端包必须包含真实 `libchassis_control.so`，并从本次提交重新构建 `libmine_teleop_chassis_bridge.so`。不能把无底盘库的编译测试产物当作完整车端发布包。
 
-**待配置：私有仓库的专用只读访问凭据，以及该二进制是否允许公开发布的明确决定。** 在这两项落实前，PR 仍执行车端源码编译/测试；正式发布的全量包检查会因缺少完整车端包而失败，不发布不完整版本。不要将个人 GitHub token 写入工作流、聊天或仓库。
+**待配置：私有仓库的专用只读访问凭据，以及该二进制是否允许公开发布的明确决定。** 完整打包步骤已经接入，但默认不启用。 在这两项落实前，PR 仍执行车端源码编译/测试；正式发布的全量包检查会因缺少完整车端包而失败，不发布不完整版本。不要将个人 GitHub token 写入工作流、聊天或仓库。
+
+启用方式（仅在允许公开该运行库后）：
+
+1. 分别为 ChassisControl、MinePilot 配置只读 SSH deploy key，把私钥保存为 MineTeleop Actions secrets `CHASSIS_CONTROL_READ_KEY` 和 `MINEPILOT_READ_KEY`。不要使用个人全权限 token。
+2. 设置仓库变量 `VEHICLE_RUNTIME_PUBLIC=true`。仅 main/手动运行和本仓库 PR 可以读取私有依赖；fork PR 始终只执行源码编译/测试。
+3. 构建输入固定在 `packaging/vehicle/dependencies.lock.json`。初始值沿用本次开发的已知本地底盘头文件/运行库提交，不追随私有仓库的浮动分支。修改底盘实现时应配套更新这两个 SHA 并重新验收。
+4. 私有检出目录 `.ci-deps/` 同时排除在 Git 和默认 Docker context 外，头文件和库通过显式构建输入使用；不上传源码或 CI 镜像。
 
 车端现有严格入口是 `scripts/build/build_cpp_ubuntu_bundle.sh test linux/amd64`，内部调用 `prepare_chassis_runtime.sh` 并验证底盘 ABI、动态依赖及部署包。该入口需要：
 

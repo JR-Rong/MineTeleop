@@ -20,3 +20,6 @@ __pycache__/
 
 # Local runtime/working directories
 .local/
+
+# Private CI inputs are supplied only through explicit build contexts.
+.ci-deps/

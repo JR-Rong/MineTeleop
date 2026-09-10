@@ -14,7 +14,7 @@ from release_version import parts
 DESKTOPS = {
     'MineTeleop-win32-x64.zip': ('win32', 'x64'),
     'MineTeleop-darwin-arm64.zip': ('darwin', 'arm64'),
-    'MineTeleop-darwin-x64.zip': ('darwin', 'x64'),
+    'MineTeleop-win32-arm64.zip': ('win32', 'arm64'),
     'MineTeleop-linux-x64.tar.gz': ('linux', 'x64'),
 }
 
