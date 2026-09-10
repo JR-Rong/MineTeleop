@@ -40,6 +40,7 @@ async function start(){
   });
   const menu=Menu.buildFromTemplate([
     ...(process.platform==='darwin'?[{label:'MineTeleop',submenu:[{label:'退出 MineTeleop',accelerator:'Cmd+Q',click:()=>void shutdown()}]}]:[]),
+    {label:'编辑',role:'editMenu'},
     {label:'窗口',submenu:[{role:'togglefullscreen'},{role:'minimize'},{label:'退出控制台',click:()=>void shutdown()}]}
   ]);
   Menu.setApplicationMenu(menu);
