@@ -153,6 +153,12 @@ if (($CurlPortVersion -split "#")[0] -ne $ExpectedCurlPortVersion) {
 }
 
 $CmakeArchitecture = if ($Architecture -eq "arm64") { "ARM64" } else { "x64" }
+# Match the dependency triplet's CRT linkage (ARM64 uses the static CRT).
+$MsvcRuntime = if ($Triplet.EndsWith("-static")) {
+  'MultiThreaded$<$<CONFIG:Debug>:Debug>'
+} else {
+  'MultiThreaded$<$<CONFIG:Debug>:Debug>DLL'
+}
 New-Item -ItemType Directory -Path $BuildDirectory -Force | Out-Null
 
 Write-Host "==> Configuring Windows control client (architecture=$Architecture, triplet=$Triplet)"
@@ -163,6 +169,7 @@ Invoke-CheckedCommand -Command "cmake" -CommandArguments @(
   "-A", $CmakeArchitecture,
   "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain",
   "-DVCPKG_TARGET_TRIPLET=$Triplet",
+  "-DCMAKE_MSVC_RUNTIME_LIBRARY=$MsvcRuntime",
   "-DVCPKG_APPLOCAL_DEPS=ON",
   "-DMINE_TELEOP_CURL_LINKAGE=$ExpectedCurlLinkage",
   "-DMINE_TELEOP_BUILD_CONTROL_CLIENT=ON",
