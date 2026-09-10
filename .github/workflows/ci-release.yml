@@ -1,26 +1,21 @@
-name: Windows control bundle
+name: Build and release
 
 on:
-  workflow_dispatch:
   pull_request:
-    paths:
-      - ".github/workflows/windows-control-bundle.yml"
-      - "CMakeLists.txt"
-      - "cmake/**"
-      - "configs/**"
-      - "cpp/**"
-      - "packaging/windows/**"
-      - "protocol/**"
-      - "scripts/build/build_windows_control_bundle.ps1"
-      - "scripts/build/build_desktop_control_bundle.mjs"
-      - "desktop/**"
+  push:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-control-bundle-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: build-release-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build-windows-x64:
@@ -30,7 +25,7 @@ jobs:
 
     steps:
       - name: Check out MineTeleop
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -46,7 +41,7 @@ jobs:
           "vcpkg_commit=$($lock.vcpkg_commit)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Check out pinned vcpkg
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: microsoft/vcpkg
           ref: ${{ steps.windows-dependencies.outputs.vcpkg_commit }}
@@ -77,7 +72,7 @@ jobs:
           "VCPKG_DEFAULT_BINARY_CACHE=$cacheDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Restore vcpkg binary cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}\vcpkg-binary-cache
           key: vcpkg-windows-x64-${{ hashFiles('packaging/windows/dependencies.lock.json') }}-control-v2
@@ -96,7 +91,7 @@ jobs:
           }
 
       - name: Set up desktop build tools
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -137,14 +132,124 @@ jobs:
           }
 
       - name: Upload Windows x64 ZIP and SHA-256
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: mine-teleop-control-windows-x64-${{ github.event.pull_request.head.sha || github.sha }}
+          name: bundle-control-windows-x64
           path: |
-            dist/mine-teleop-control-windows-x64-*.zip
-            dist/mine-teleop-control-windows-x64-*.zip.sha256
             dist/desktop/MineTeleop-win32-x64.zip
             dist/desktop/MineTeleop-win32-x64.zip.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+  build-unix-control:
+    name: Control ${{ matrix.platform }} ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: darwin
+            arch: arm64
+          - runner: macos-15-intel
+            platform: darwin
+            arch: x64
+          - runner: ubuntu-22.04
+            platform: linux
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: docker/setup-buildx-action@v4
+        if: matrix.platform == 'linux'
+      - name: Install Linux packaging dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            patchelf libgtk-3-0 libnss3 libnspr4 libasound2 libgbm1 libcurl4 libssl3
+      - name: Build and test native control client
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          MINE_TELEOP_MACOS_ARCH: ${{ matrix.arch }}
+          MINE_TELEOP_BUILD_JOBS: '3'
+        run: |
+          if [[ "$TARGET_PLATFORM" == darwin ]]; then
+            scripts/build/build_macos_control_bundle.sh test | tee "$RUNNER_TEMP/native-build.log"
+            native_root=$(sed -n 's/^macos_control_bundle_root=//p' "$RUNNER_TEMP/native-build.log")
+          else
+            scripts/build/build_ubuntu_control_bundle.sh test linux/amd64 | tee "$RUNNER_TEMP/native-build.log"
+            native_root=$(sed -n 's/^BUNDLE_DIR=//p' "$RUNNER_TEMP/native-build.log")
+          fi
+          test -x "$native_root/bin/mine-teleop-control"
+          echo "MINE_TELEOP_TEST_NATIVE_ROOT=$native_root" >> "$GITHUB_ENV"
+      - name: Test lifecycle and package Chromium desktop
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          npm ci --prefix desktop
+          node --test desktop/test/native-controller.test.cjs desktop/test/native-process.test.cjs
+          node scripts/build/build_desktop_control_bundle.mjs \
+            --platform "$TARGET_PLATFORM" --arch "$TARGET_ARCH" \
+            --native-root "$MINE_TELEOP_TEST_NATIVE_ROOT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bundle-control-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            dist/desktop/*.zip
+            dist/desktop/*.zip.sha256
+            dist/desktop/*.tar.gz
+            dist/desktop/*.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  build-cloud:
+    name: Cloud Ubuntu 22.04 x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Build, test and verify standalone cloud package
+        run: scripts/build/build_macos_cloud_bundle.sh test linux/amd64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bundle-cloud-linux-x64
+          path: |
+            dist/mine-teleop-cloud-*.tar.gz
+            dist/mine-teleop-cloud-*.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  build-vehicle:
+    name: Vehicle Ubuntu 22.04 x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Compile vehicle and run CTest without proprietary runtime
+        run: |
+          docker buildx build --platform linux/amd64 \
+            --build-arg MINE_TELEOP_BUILD_TESTS=ON \
+            --build-arg MINE_TELEOP_BUILD_JOBS=3 \
+            --target build --output type=cacheonly \
+            -f deployments/cpp/Dockerfile.build .
