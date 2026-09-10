@@ -1,5 +1,6 @@
 const test=require('node:test');
 const assert=require('node:assert/strict');
+const path=require('node:path');
 const {EventEmitter}=require('node:events');
 const {PassThrough}=require('node:stream');
 const {NativeController,controllerEnvironment}=require('../native-controller.cjs');
@@ -30,7 +31,7 @@ test('unexpected native exit is observable and a later stop resolves',async()=>{
 });
 test('native launch ignores ambient controller overrides and loader injection',()=>{
   const env=controllerEnvironment('/bundle',{PATH:'/usr/bin',MINE_TELEOP_DRIVER_PASSWORD:'secret',MINE_TELEOP_CONFIG:'/wrong',LD_PRELOAD:'/injected',NODE_OPTIONS:'--inspect'},'linux');
-  assert.equal(env.MINE_TELEOP_DRIVER_PASSWORD,undefined);assert.equal(env.MINE_TELEOP_CONFIG,undefined);assert.equal(env.LD_PRELOAD,undefined);assert.equal(env.NODE_OPTIONS,undefined);assert.equal(env.LD_LIBRARY_PATH,'/bundle/lib');
+  assert.equal(env.MINE_TELEOP_DRIVER_PASSWORD,undefined);assert.equal(env.MINE_TELEOP_CONFIG,undefined);assert.equal(env.LD_PRELOAD,undefined);assert.equal(env.NODE_OPTIONS,undefined);assert.equal(env.LD_LIBRARY_PATH,path.join('/bundle','lib'));
 });
 test('spawn failure does not leave shutdown waiting for an exit event that never arrives',async()=>{
   const child=fake();const controller=new NativeController({root:'/missing',logPath:'/log',spawnProcess:()=>child});
