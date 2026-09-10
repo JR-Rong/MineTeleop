@@ -1,0 +1,5 @@
+# Preserve whitespace inside generated third-party shader strings.
+cpp/web/assets/chunks/*.js linguist-generated=true -whitespace
+cpp/web/assets/scene.js linguist-generated=true
+cpp/web/assets/console-layout.js linguist-generated=true
+cpp/web/assets/console-layout.css linguist-generated=true

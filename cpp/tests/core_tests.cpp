@@ -440,6 +440,24 @@ void test_config_loads_current_vehicle_yaml() {
       "safe default ordinary brake pressure changed");
 }
 
+void test_camera_identity_contract() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  for (const auto& id : {"fish_front", "fish_rear", "fish_left", "fish_right",
+                         "drive_front", "drive_rear", "drive_left", "drive_right", "legacy_camera"}) {
+    auto source = base;
+    replace_once(source, "id: front", std::string("id: ") + id);
+    const auto config = mine_teleop::load_vehicle_config(write_temp_vehicle_config(id, source));
+    expect(config.enabled_cameras().front().id == id, "camera ID was not preserved");
+  }
+  for (const auto& replacement : {"id: rear", "id: \"\""}) {
+    auto source = base;
+    replace_once(source, "id: front", replacement);
+    expect_throws([&] {
+      static_cast<void>(mine_teleop::load_vehicle_config(write_temp_vehicle_config("invalid-camera-id", source)));
+    }, "ambiguous camera identity was accepted");
+  }
+}
+
 void test_vehicle_config_rejects_unimplemented_control_safety_options() {
   const auto base = read_text("configs/vehicle-agent.dev.yaml");
   auto variable_rate = base;
@@ -3601,7 +3619,7 @@ void test_signaling_time_sync_common_domain() {
 
 void test_driver_config_and_hardware_encoder_priority() {
   const auto config = mine_teleop::load_driver_config("configs/driver-console.dev.yaml");
-  expect(config.driver_id == "driver-console-001", "driver config id mismatch");
+  expect(config.driver_id.empty(), "driver config must leave identity to the login form");
   const auto vehicle = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   expect(vehicle.hardware.preferred_encoder == "nvenc", "NVIDIA is not the preferred encoder");
   expect(vehicle.hardware.fallback_encoder == "vaapi", "Intel VAAPI is not the fallback encoder");
@@ -3720,6 +3738,7 @@ void test_native_driver_to_vehicle_signaling_control_payload() {
        {"connection_id", "data-channel-test-vehicle"}});
   const auto vehicle_generation = online.at("connection_generation").get<std::uint64_t>();
   auto driver_config = mine_teleop::load_driver_config("configs/driver-console.dev.yaml");
+  driver_config.driver_id = "driver-console-001";
   driver_config.signaling_url = base;
   driver_config.intent_lease_ms = 1000;
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
@@ -3951,6 +3970,7 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"config_loads_current_vehicle_yaml", test_config_loads_current_vehicle_yaml},
+      {"camera_identity_contract", test_camera_identity_contract},
       {"vehicle_config_rejects_unimplemented_control_safety_options", test_vehicle_config_rejects_unimplemented_control_safety_options},
       {"vehicle_config_validates_full_scale_motor_torque", test_vehicle_config_validates_full_scale_motor_torque},
       {"vehicle_config_requires_physical_brake_pressure_units", test_vehicle_config_requires_physical_brake_pressure_units},

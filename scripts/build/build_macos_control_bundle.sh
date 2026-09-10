@@ -41,16 +41,23 @@ package_root="$build_root/$package_name"
 mkdir -p "$output_dir" "$package_root/bin" "$package_root/lib" "$package_root/config" \
   "$package_root/certs" "$package_root/protocol/v1"
 
+macos_sdk="$(xcrun --sdk macosx --show-sdk-path)"
 cmake_args=(
   -S "$repo_root"
   -B "$build_dir"
   -DCMAKE_BUILD_TYPE=Release
   "-DCMAKE_OSX_ARCHITECTURES=$cmake_arch"
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
   -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=OFF
   -DMINE_TELEOP_BUILD_CONTROL_CLIENT=ON
   -DMINE_TELEOP_BUILD_SIGNALING_SERVER=OFF
   "-DMINE_TELEOP_BUILD_TESTS=$run_tests"
   -DMINE_TELEOP_FETCH_MISSING_DEPS=ON
+  # A portable app must not link a runner's Homebrew curl/yaml-cpp.
+  -DCMAKE_DISABLE_FIND_PACKAGE_yaml-cpp=ON
+  -DYAML_BUILD_SHARED_LIBS=OFF
+  "-DCURL_INCLUDE_DIR=$macos_sdk/usr/include"
+  "-DCURL_LIBRARY=$macos_sdk/usr/lib/libcurl.tbd"
 )
 if [[ -n "${FETCHCONTENT_SOURCE_DIR_YAML_CPP:-}" ]]; then
   cmake_args+=("-DFETCHCONTENT_SOURCE_DIR_YAML_CPP=$FETCHCONTENT_SOURCE_DIR_YAML_CPP")
@@ -83,6 +90,7 @@ install -m 0644 \
   "$package_root/config/mine-teleop-field-root.crt"
 install -m 0644 /etc/ssl/cert.pem "$package_root/certs/cacert.pem"
 cp -R "$repo_root/protocol/v1/." "$package_root/protocol/v1/"
+cp -R "$repo_root/cpp/web/assets" "$package_root/assets"
 
 printf '%s\n' \
   "target_arch=$package_arch" \

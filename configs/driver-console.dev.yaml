@@ -1,5 +1,4 @@
-driver:
-  id: driver-console-001
+# Driver ID and password are entered on the login page.
 
 cloud:
   auth_url: http://127.0.0.1:8765/auth
@@ -11,7 +10,9 @@ logging:
   browser_event_log_files: 3
 
 ui:
-  default_layout: grid_4
+  default_layout: grid_6
+  scene_enabled: true
+  scene_manifest: models/haul-truck/model.json
   show_debug_overlay: true
 
 control:

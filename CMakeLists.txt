@@ -88,6 +88,11 @@ include(cmake/SplitMsvcStringLiterals.cmake)
 set(MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_logic.js")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}")
 file(READ "${MINE_TELEOP_CONTROL_LOGIC_JS_SOURCE}" MINE_TELEOP_CONTROL_LOGIC_JS)
+# Embed camera presentation alongside control logic so native packages need no extra script fetch.
+set(MINE_TELEOP_CAMERA_VIEW_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/camera_view.js")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CAMERA_VIEW_JS_SOURCE}")
+file(READ "${MINE_TELEOP_CAMERA_VIEW_JS_SOURCE}" MINE_TELEOP_CAMERA_VIEW_JS)
+string(APPEND MINE_TELEOP_CONTROL_LOGIC_JS "\n${MINE_TELEOP_CAMERA_VIEW_JS}")
 string(REPLACE "\r\n" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
 string(REPLACE "\r" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
 mine_teleop_make_adjacent_raw_literals(
@@ -140,6 +145,7 @@ add_library(mine_teleop_runtime
   cpp/src/platform.cpp
   "${MINE_TELEOP_GENERATED_SERVER_SOURCE}"
   cpp/src/websocket.cpp
+  cpp/src/console_assets.cpp
 )
 target_include_directories(mine_teleop_runtime
   PUBLIC
@@ -184,6 +190,21 @@ if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
     PRIVATE MINE_TELEOP_CURL_LINKAGE="${MINE_TELEOP_CURL_LINKAGE}"
   )
   mine_teleop_enable_warnings(mine-teleop-control)
+  if(MSVC)
+    # Put the compiler's redistributable CRT next to the executable. Operators
+    # do not need a separate Visual C++ Redistributable installation.
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
+    include(InstallRequiredSystemLibraries)
+    if(NOT CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+      message(FATAL_ERROR "MSVC redistributable libraries are required for the portable controller")
+    endif()
+    foreach(runtime_library IN LISTS CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS)
+      add_custom_command(TARGET mine-teleop-control POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${runtime_library}" "$<TARGET_FILE_DIR:mine-teleop-control>"
+        VERBATIM)
+    endforeach()
+  endif()
   set_target_properties(mine-teleop-control PROPERTIES
     BUILD_RPATH "$ORIGIN/../lib"
     INSTALL_RPATH "$ORIGIN/../lib"
@@ -293,6 +314,7 @@ install(TARGETS mine_teleop_runtime
 )
 install(DIRECTORY cpp/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY configs/ DESTINATION share/mine-teleop/configs)
+install(DIRECTORY cpp/web/assets/ DESTINATION share/mine-teleop/assets)
 install(DIRECTORY protocol/ DESTINATION share/mine-teleop/protocol)
 
 if(MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
@@ -314,8 +336,16 @@ endif()
 
 if(MINE_TELEOP_BUILD_TESTS)
   enable_testing()
+  add_executable(mine-teleop-console-assets-tests cpp/tests/console_assets_tests.cpp)
+  target_link_libraries(mine-teleop-console-assets-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-console-assets-tests)
+  add_test(NAME mine-teleop-console-assets-tests COMMAND mine-teleop-console-assets-tests)
   if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
     find_program(MINE_TELEOP_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
+    add_test(NAME mine-teleop-camera-view-tests
+      COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/camera_view.test.cjs)
+    add_test(NAME mine-teleop-scene-state-tests
+      COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/scene_state.test.mjs)
     add_test(
       NAME mine-teleop-control-logic-js-tests
       COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/control_logic.test.cjs

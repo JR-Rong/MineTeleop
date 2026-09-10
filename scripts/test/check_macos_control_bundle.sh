@@ -51,6 +51,10 @@ for required_file in \
   "$package_root/certs/cacert.pem" \
   "$package_root/protocol/v1/control-command.valid.json" \
   "$package_root/BUILD-INFO.txt" \
+  "$package_root/assets/console-layout.js" \
+  "$package_root/assets/scene.js" \
+  "$package_root/assets/models/haul-truck/model.json" \
+  "$package_root/assets/models/haul-truck/haul-truck.glb" \
   "$package_root/README.txt"; do
   if [[ ! -s "$required_file" ]]; then
     printf 'required bundle file is missing or empty: %s\n' "$required_file" >&2
