@@ -35,6 +35,9 @@ try{
   await mkdir(appSource);
   for(const file of ['main.cjs','native-controller.cjs','package.json'])await cp(path.join(repo,'desktop',file),path.join(appSource,file));
   const packageJSON=JSON.parse(await readFile(path.join(appSource,'package.json'),'utf8'));
+  const releaseVersion=args.version||process.env.MINE_TELEOP_RELEASE_VERSION||packageJSON.version;
+  if(!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(releaseVersion))throw Error('Release version must be A.B.C');
+  packageJSON.version=releaseVersion;
   const electronVersion=packageJSON.devDependencies.electron;delete packageJSON.devDependencies;delete packageJSON.scripts;
   await writeFile(path.join(appSource,'package.json'),JSON.stringify(packageJSON,null,2));
   await mkdir(controller);
@@ -54,7 +57,7 @@ try{
     const manifest=[];
     async function collect(directory){for(const entry of await readdir(directory,{withFileTypes:true})){const file=path.join(directory,entry.name);if(entry.isDirectory())await collect(file);else if(entry.isFile())manifest.push({path:path.relative(folder,file),bytes:(await stat(file)).size,sha256:createHash('sha256').update(await readFile(file)).digest('hex')});}}
     await collect(folder);
-    await writeFile(path.join(folder,'DESKTOP-BUILD.json'),JSON.stringify({platform,arch,electron:electronVersion,source_commit:sourceCommit,source_dirty:sourceDirty,built_at:new Date().toISOString(),files:manifest},null,2));
+    await writeFile(path.join(folder,'DESKTOP-BUILD.json'),JSON.stringify({platform,arch,version:releaseVersion,electron:electronVersion,source_commit:sourceCommit,source_dirty:sourceDirty,built_at:new Date().toISOString(),files:manifest},null,2));
     const archive=folder+(platform==='linux'?'.tar.gz':'.zip');
     if(platform==='linux')execFileSync('tar',['-czf',archive,'-C',path.dirname(folder),path.basename(folder)]);
     else if(process.platform==='darwin')execFileSync('ditto',['-c','-k','--sequesterRsrc','--keepParent',folder,archive]);

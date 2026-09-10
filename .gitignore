@@ -10,6 +10,8 @@
 .DS_Store
 .playwright-cli/
 output/
+__pycache__/
+*.pyc
 
 # Compiled shared objects / binaries
 *.so

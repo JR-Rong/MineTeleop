@@ -2,6 +2,7 @@ name: Build and release
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled, ready_for_review]
   push:
     branches: [main]
   workflow_dispatch:
@@ -18,7 +19,31 @@ defaults:
     shell: bash
 
 jobs:
+  version:
+    name: Plan A.B.C version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/release_version.py
+
   build-windows-x64:
+    needs: version
+    env:
+      MINE_TELEOP_RELEASE_VERSION: ${{ needs.version.outputs.version }}
     name: Build Windows x64 control bundle
     runs-on: windows-2022
     timeout-minutes: 90
@@ -143,6 +168,9 @@ jobs:
           retention-days: 14
 
   build-unix-control:
+    needs: version
+    env:
+      MINE_TELEOP_RELEASE_VERSION: ${{ needs.version.outputs.version }}
     name: Control ${{ matrix.platform }} ${{ matrix.arch }}
     strategy:
       fail-fast: false
@@ -171,6 +199,9 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
       - uses: docker/setup-buildx-action@v4
         if: matrix.platform == 'linux'
+      - name: Select Xcode with C++20 stop-token support
+        if: matrix.platform == 'darwin'
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
       - name: Install Linux packaging dependencies
         if: matrix.platform == 'linux'
         run: |
@@ -215,6 +246,9 @@ jobs:
           retention-days: 14
 
   build-cloud:
+    needs: version
+    env:
+      MINE_TELEOP_RELEASE_VERSION: ${{ needs.version.outputs.version }}
     name: Cloud Ubuntu 22.04 x64
     runs-on: ubuntu-22.04
     timeout-minutes: 60
@@ -237,6 +271,9 @@ jobs:
           retention-days: 14
 
   build-vehicle:
+    needs: version
+    env:
+      MINE_TELEOP_RELEASE_VERSION: ${{ needs.version.outputs.version }}
     name: Vehicle Ubuntu 22.04 x64
     runs-on: ubuntu-22.04
     timeout-minutes: 120
@@ -253,3 +290,60 @@ jobs:
             --build-arg MINE_TELEOP_BUILD_JOBS=3 \
             --target build --output type=cacheonly \
             -f deployments/cpp/Dockerfile.build .
+
+  validate-release:
+    name: Validate release inventory
+    needs: [version, build-windows-x64, build-unix-control, build-cloud, build-vehicle]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Test publication guards
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bundle-*
+          path: downloaded
+      - name: Validate hashes, architectures and source commits
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          FORMAL_RELEASE: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+        run: |
+          arguments=()
+          if [[ "$FORMAL_RELEASE" == true ]]; then
+            arguments+=(--require-vehicle)
+          fi
+          python3 scripts/ci/prepare_release.py downloaded release \
+            --commit "$SOURCE_COMMIT" --version "$RELEASE_VERSION" --run-id "$GITHUB_RUN_ID" "${arguments[@]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: validated-release
+          path: release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    name: Publish main release and tag
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: validate-release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: validated-release
+          path: release
+      - name: Upload draft, verify remote assets, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/publish_release.py release
