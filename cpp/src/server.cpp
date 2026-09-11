@@ -1,6 +1,5 @@
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/control_logic_js.hpp"
-#include "mine_teleop/mobile_app.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -2575,18 +2574,14 @@ ServerResponse SignalingService::handle(const HttpRequest& request) {
   } catch (const Json::exception& error) {
     response = ServerResponse::json(400, {{"error", error.what()}});
   }
-  if ((request.path == "/auth/driver_login" || request.path.starts_with("/mobile/")) &&
+  if ((request.path == "/auth/driver_login" || request.path.starts_with("/mobile/api/")) &&
       std::none_of(response.headers.begin(), response.headers.end(), [](const auto& header) {
         return lower(header.first) == "cache-control";
       })) {
     response.headers.emplace_back("Cache-Control", "no-store");
   }
-  if (request.path.starts_with("/mobile")) {
+  if (request.path.starts_with("/mobile/api/")) {
     response.headers.emplace_back("X-Content-Type-Options", "nosniff");
-    response.headers.emplace_back("Referrer-Policy", "no-referrer");
-    response.headers.emplace_back("Content-Security-Policy",
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "
-        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
   }
   add_request_id_header(response, request_id.value());
   return response;
@@ -3243,7 +3238,6 @@ Json SignalingService::enqueue_signaling_message(
 }
 
 ServerResponse SignalingService::handle_get(const HttpRequest& request) {
-  if (auto asset = mobile_app_asset(request.path)) return *asset;
   if (request.path == "/health") return ServerResponse::json(200, health());
   if (request.path == "/time") {
     const auto server_receive_ms = now_ms();

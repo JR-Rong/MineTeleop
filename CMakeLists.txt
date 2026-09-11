@@ -104,44 +104,6 @@ configure_file(
   @ONLY
 )
 
-# Embed the phone application with the same raw-literal portability rules as the control UI.
-set(MINE_TELEOP_MOBILE_ROUTES "")
-foreach(asset IN ITEMS index.html app.css app.js manifest.webmanifest sw.js icon.svg)
-  set(asset_path "${CMAKE_CURRENT_SOURCE_DIR}/mobile-app/${asset}")
-  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${asset_path}")
-  file(READ "${asset_path}" asset_content)
-  mine_teleop_make_adjacent_raw_literals("${asset_content}" "MT_MOBILE"
-    asset_literals asset_chunks asset_max_bytes)
-  if(asset STREQUAL "index.html")
-    set(route "/mobile/")
-    set(mime "text/html; charset=utf-8")
-  elseif(asset MATCHES "\\.js$")
-    set(route "/mobile/${asset}")
-    set(mime "application/javascript; charset=utf-8")
-  elseif(asset STREQUAL "app.css")
-    set(route "/mobile/${asset}")
-    set(mime "text/css; charset=utf-8")
-  elseif(asset STREQUAL "icon.svg")
-    set(route "/mobile/${asset}")
-    set(mime "image/svg+xml")
-  else()
-    set(route "/mobile/${asset}")
-    set(mime "application/manifest+json")
-  endif()
-  string(APPEND MINE_TELEOP_MOBILE_ROUTES
-    "  if (path == \"${route}\") return ServerResponse::text(200, ${asset_literals}, \"${mime}\");\n")
-endforeach()
-foreach(size IN ITEMS 192 512)
-  set(icon_path "${CMAKE_CURRENT_SOURCE_DIR}/mobile-app/icon-${size}.png")
-  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${icon_path}")
-  file(READ "${icon_path}" icon_hex HEX)
-  string(REGEX REPLACE "(..)" "0x\\1," icon_bytes "${icon_hex}")
-  string(APPEND MINE_TELEOP_MOBILE_ROUTES
-    "  if (path == \"/mobile/icon-${size}.png\") { static constexpr unsigned char bytes[] = {${icon_bytes}}; return ServerResponse::text(200, std::string(reinterpret_cast<const char*>(bytes), sizeof(bytes)), \"image/png\"); }\n")
-endforeach()
-configure_file(cmake/mobile_app.hpp.in
-  "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop/mobile_app.hpp" @ONLY)
-
 set(MINE_TELEOP_SERVER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/server.cpp")
 set(MINE_TELEOP_GENERATED_SERVER_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/src/server.cpp")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_SERVER_SOURCE}")

@@ -130,7 +130,7 @@ void connection_generation_and_revocation() {
   f.online("v1", "after-revoke");
   check(f.pending() != id && f.decide(id).status == 404, "revocation retained old approval");
 }
-void authentication_and_assets() {
+void authentication_and_api_routes() {
   Fixture f;
   check(f.call("GET", "/mobile/api/requests").status == 401, "anonymous inbox accepted");
   HttpRequest query; query.method = "GET"; query.path = "/mobile/api/requests";
@@ -142,8 +142,8 @@ void authentication_and_assets() {
   check(std::find(response.headers.begin(), response.headers.end(), std::pair<std::string,std::string>{"Cache-Control","no-store"}) != response.headers.end(), "private responses cacheable");
   check(f.call("POST", "/mobile/api/logout", Json::object(), f.approver).status == 200, "logout failed");
   check(f.call("GET", "/mobile/api/requests", Json::object(), f.approver).status == 401, "logout token still works");
-  for (const auto* path : {"/mobile/", "/mobile/app.js", "/mobile/app.css", "/mobile/sw.js", "/mobile/manifest.webmanifest", "/mobile/icon-192.png", "/mobile/icon-512.png"}) {
-    const auto asset = f.call("GET", path); check(asset.status == 200 && asset.body.size() > 100, std::string("missing asset: ") + path);
+  for (const auto* path : {"/mobile", "/mobile/", "/mobile/index.html", "/mobile/icon.svg", "/mobile/app.js", "/mobile/app.css", "/mobile/sw.js", "/mobile/manifest.webmanifest", "/mobile/icon-192.png", "/mobile/icon-512.png"}) {
+    check(f.call("GET", path).status == 404, std::string("removed approval page still served: ") + path);
   }
   for (int n = 0; n < 5; ++n) f.call("POST", "/mobile/api/login", {{"password", "bad"}});
   check(f.call("POST", "/mobile/api/login", {{"password", "approval-secret"}}).status == 429, "mobile login is not throttled");
@@ -369,7 +369,7 @@ int main() {
   for (const auto& [name, test] : std::vector<std::pair<std::string,std::function<void()>>>{
       {"gate_and_single_use",gate_and_single_use},{"permissions_and_race",permissions_and_race},
       {"rejection_and_expiry",rejection_and_expiry},{"connection_generation_and_revocation",connection_generation_and_revocation},
-      {"authentication_and_assets",authentication_and_assets},{"audit_fail_closed",audit_fail_closed},
+      {"authentication_and_api_routes",authentication_and_api_routes},{"audit_fail_closed",audit_fail_closed},
       {"invalid_config_and_restart",invalid_config_and_restart},{"heartbeat_and_login_expiry",heartbeat_and_login_expiry},
       {"expiry_during_audit",expiry_during_audit},{"yaml_policy",yaml_policy},{"automatic_driver_runtime",automatic_driver_runtime},
       {"scoped_retry_and_cancellation",scoped_retry_and_cancellation},{"cancel_during_grant_response",cancel_during_grant_response}}) {

@@ -12,5 +12,5 @@ configs/secrets
 configs/*.password
 configs/*.token
 config/app-token
-android-app
+apps
 output
