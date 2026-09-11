@@ -1,0 +1,15 @@
+# Example only: provision driver/vehicle secrets and config/app-token before starting.
+# config/app-token is relative to the cloud process working directory.
+auth:
+  mobile_approval_timeout_ms: 120000
+  drivers:
+    - id: driver-console-001
+      password_env: MINE_TELEOP_DRIVER_001_PASSWORD
+      vehicles: [vehicle-001, vehicle-002]
+  vehicles:
+    - id: vehicle-001
+      device_token_env: MINE_TELEOP_VEHICLE_001_TOKEN
+      mobile_approval_required: true
+    - id: vehicle-002
+      device_token_env: MINE_TELEOP_VEHICLE_002_TOKEN
+      mobile_approval_required: false

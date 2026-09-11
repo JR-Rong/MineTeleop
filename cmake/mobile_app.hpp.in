@@ -1,0 +1,9 @@
+#pragma once
+// Public mobile application resources are embedded so existing cloud bundles remain self-contained.
+namespace mine_teleop {
+inline std::optional<ServerResponse> mobile_app_asset(std::string_view path) {
+  if (path == "/mobile") return ServerResponse{302, "text/plain", "", {{"Location", "/mobile/"}}};
+@MINE_TELEOP_MOBILE_ROUTES@
+  return std::nullopt;
+}
+}
