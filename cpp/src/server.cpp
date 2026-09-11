@@ -1590,6 +1590,13 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
       throw std::invalid_argument("auth.mobile_approval_timeout_ms must be an integer");
     }
   }
+  if (auth["approver_token_ttl_ms"]) {
+    try {
+      config.approver_token_ttl_ms = auth["approver_token_ttl_ms"].as<std::int64_t>();
+    } catch (const YAML::Exception&) {
+      throw std::invalid_argument("auth.approver_token_ttl_ms must be an integer");
+    }
+  }
   if (!config.mobile_approval_vehicles.empty() || std::filesystem::exists("config/app-token")) {
     YAML::Node app_secret;
     app_secret["password_file"] = "config/app-token";
@@ -1843,6 +1850,9 @@ SignalingService::SignalingService(
   }
   for (const auto& vehicle : config_.mobile_approval_vehicles) {
     if (!config_.device_tokens.contains(vehicle)) throw std::invalid_argument("unknown mobile approval vehicle");
+  }
+  if (config_.approver_token_ttl_ms <= 0 || config_.approver_token_ttl_ms > 7LL * 24 * 60 * 60 * 1000) {
+    throw std::invalid_argument("approver token TTL must be between 1ms and 7 days");
   }
   if (config_.token_ttl_ms <= 0) throw std::invalid_argument("driver token TTL must be positive");
   if (config_.control_token_ttl_ms <= 0) throw std::invalid_argument("control token TTL must be positive");
@@ -2216,9 +2226,29 @@ void SignalingService::close_session(Session& session, std::string_view reason) 
   transition_session(session, SessionState::Closed, reason);
 }
 
+std::string SignalingService::approver_login_bucket(const HttpRequest& request, std::int64_t timestamp_ms) {
+  if (approver_login_last_cleanup_ms_ == 0 || timestamp_ms < approver_login_last_cleanup_ms_ ||
+      timestamp_ms - approver_login_last_cleanup_ms_ >= config_.login_failure_window_ms) {
+    std::erase_if(login_failures_, [&](const auto& entry) {
+      if (!entry.first.starts_with("approver:")) return false;
+      const auto& state = entry.second;
+      return state.blocked_until_ms > 0 ? timestamp_ms >= state.blocked_until_ms
+          : timestamp_ms - state.window_started_at_ms >= config_.login_failure_window_ms;
+    });
+    approver_login_last_cleanup_ms_ = timestamp_ms;
+  }
+  const auto source = request_source(request);
+  if (login_failures_.contains("approver:" + source)) return source;
+  const auto count = std::count_if(login_failures_.begin(), login_failures_.end(), [](const auto& entry) {
+    return entry.first.starts_with("approver:") && entry.first != "approver:<overflow>";
+  });
+  // Same bounded overflow policy as API rate limiting; existing sources retain their own buckets.
+  return count < config_.api_rate_limit_max_sources ? source : "<overflow>";
+}
+
 void SignalingService::enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms, bool approver) {
   const bool known_driver = !approver && config_.driver_passwords.contains(std::string(driver_id));
-  const std::string bucket = approver ? "approver:password" : (known_driver ? "driver:" + std::string(driver_id) : "unknown");
+  const std::string bucket = approver ? "approver:" + std::string(driver_id) : (known_driver ? "driver:" + std::string(driver_id) : "unknown");
   const auto found = login_failures_.find(bucket);
   if (found == login_failures_.end()) return;
 
@@ -2233,7 +2263,7 @@ void SignalingService::enforce_login_rate_limit(std::string_view driver_id, std:
 
 void SignalingService::record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms, bool approver) {
   const bool known_driver = !approver && config_.driver_passwords.contains(std::string(driver_id));
-  const std::string bucket = approver ? "approver:password" : (known_driver ? "driver:" + std::string(driver_id) : "unknown");
+  const std::string bucket = approver ? "approver:" + std::string(driver_id) : (known_driver ? "driver:" + std::string(driver_id) : "unknown");
   auto& state = login_failures_[bucket];
   if (state.window_started_at_ms == 0 ||
       timestamp_ms - state.window_started_at_ms >= config_.login_failure_window_ms) {
@@ -2250,12 +2280,14 @@ void SignalingService::record_login_failure(std::string_view driver_id, std::int
       {approver ? "approver_id" : "driver_id", known_driver ? std::string(driver_id) : "<unknown>"},
       {approver ? "recognized_approver" : "recognized_driver", known_driver}};
   auto failed_details = identity;
+  if (approver) failed_details["source_address"] = std::string(driver_id);
   failed_details["failure_count"] = state.failures;
   failed_details["failure_limit"] = config_.login_max_failures;
   audit(approver ? "approver_login_failed" : "driver_login_failed", failed_details);
   if (!lock_login) return;
 
   auto limited_details = identity;
+  if (approver) limited_details["source_address"] = std::string(driver_id);
   limited_details["failure_count"] = state.failures;
   limited_details["blocked_until_utc_ms"] = state.blocked_until_ms;
   audit(approver ? "approver_login_rate_limited" : "driver_login_rate_limited", limited_details);
@@ -2263,7 +2295,7 @@ void SignalingService::record_login_failure(std::string_view driver_id, std::int
 }
 
 void SignalingService::clear_login_failures(std::string_view driver_id, bool approver) {
-  login_failures_.erase(approver ? "approver:password" : "driver:" + std::string(driver_id));
+  login_failures_.erase((approver ? "approver:" : "driver:") + std::string(driver_id));
 }
 
 std::string SignalingService::request_source(const HttpRequest& request) const {
@@ -2473,20 +2505,21 @@ ServerResponse SignalingService::handle_mobile_api(const HttpRequest& request) {
   cleanup_mobile_approvals();
   if (request.path == "/mobile/api/login" && request.method == "POST") {
     const auto value = request.json_body();
-    // One shared App password; a separate bounded failure bucket cannot affect driver login.
-    enforce_login_rate_limit("", now_ms(), true);
+    const auto timestamp_ms = now_ms();
+    const auto source = approver_login_bucket(request, timestamp_ms);
+    enforce_login_rate_limit(source, timestamp_ms, true);
     if (config_.mobile_app_password.empty() || config_.mobile_app_password != optional_string(value, "password")) {
-      record_login_failure("", now_ms(), true);
+      record_login_failure(source, timestamp_ms, true);
       throw Unauthorized("App 密码错误");
     }
-    clear_login_failures("", true);
+    clear_login_failures(source, true);
     // A random login-session label distinguishes concurrent phones in audit, without usernames.
     const auto id = "app-" + random_token(12);
     const auto token = "approver-token-" + random_token();
-    const auto expiry = now_ms() + config_.token_ttl_ms;
+    const auto expiry = now_ms() + config_.approver_token_ttl_ms;
     approver_tokens_[token] = DriverToken{id, expiry, 0};
     audit("approver_login", {{"approver_id", id}});
-    return ServerResponse::json(200, {{"token", token}, {"expires_at_utc_ms", expiry}});
+    return ServerResponse::json(200, {{"token", token}, {"expires_at_utc_ms", expiry}, {"remaining_ms", std::max<std::int64_t>(0, expiry - now_ms())}});
   }
   // Mobile credentials are header-only, never URL parameters or driver/device tokens.
   const auto header = request.headers.find("x-mine-teleop-approver-token");

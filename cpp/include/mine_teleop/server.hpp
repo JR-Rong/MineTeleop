@@ -96,6 +96,7 @@ struct SignalingServerConfig {
   std::string mobile_app_password;  // Loaded from config/app-token by the cloud identity loader.
   std::unordered_set<std::string> mobile_approval_vehicles;
   std::int64_t mobile_approval_timeout_ms{120 * 1000};
+  std::int64_t approver_token_ttl_ms{12 * 60 * 60 * 1000};
   std::int64_t token_ttl_ms{30 * 60 * 1000};
   std::int64_t control_token_ttl_ms{5 * 60 * 1000};
   std::int64_t vehicle_heartbeat_timeout_ms{15 * 1000};
@@ -252,6 +253,7 @@ class SignalingService {
   void close_sessions_for_driver(std::string_view driver_id, std::string_view reason);
   void transition_session(Session& session, SessionState next, std::string_view reason);
   void close_session(Session& session, std::string_view reason);
+  std::string approver_login_bucket(const HttpRequest& request, std::int64_t timestamp_ms);
   void enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms, bool approver = false);
   void record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms, bool approver = false);
   void clear_login_failures(std::string_view driver_id, bool approver = false);
@@ -282,6 +284,7 @@ class SignalingService {
   std::unordered_map<std::string, AcceptedMessage> last_accepted_messages_;
   std::unordered_map<std::string, std::uint64_t> next_delivery_cursors_;
   std::unordered_map<std::string, LoginFailureState> login_failures_;
+  std::int64_t approver_login_last_cleanup_ms_{0};
   std::unordered_set<std::string> trusted_proxy_addresses_;
   std::unordered_map<std::string, ApiRateState> api_rate_limits_;
   ApiRateState api_rate_limit_overflow_;

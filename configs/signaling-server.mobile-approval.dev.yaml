@@ -2,6 +2,7 @@
 # config/app-token is relative to the cloud process working directory.
 auth:
   mobile_approval_timeout_ms: 120000
+  approver_token_ttl_ms: 43200000 # 12 hours; independent of driver login
   drivers:
     - id: driver-console-001
       password_env: MINE_TELEOP_DRIVER_001_PASSWORD

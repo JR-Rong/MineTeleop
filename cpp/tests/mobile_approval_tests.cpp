@@ -66,6 +66,49 @@ struct Fixture {
     return body(call("GET", "/mobile/api/requests", Json::object(), credential.empty() ? approver : credential)).at("requests");
   }
 };
+ServerResponse app_login(Fixture& f, std::string peer, std::string password = "approval-secret", std::string forwarded = "") {
+  HttpRequest request;
+  request.method = "POST"; request.path = "/mobile/api/login"; request.peer_address = peer;
+  request.body = Json{{"password", password}}.dump();
+  if (!forwarded.empty()) request.headers["x-forwarded-for"] = forwarded;
+  return f.service.handle(request);
+}
+void login_source_isolation() {
+  Fixture f;
+  for (int i = 0; i < 5; ++i) app_login(f, "127.0.0.1", "bad", "198.51.100.1");
+  check(app_login(f, "127.0.0.1", "approval-secret", "198.51.100.1").status == 429, "blocked source bypassed lockout");
+  check(app_login(f, "127.0.0.1", "approval-secret", "198.51.100.2").status == 200, "one source locked every phone");
+  check(f.call("GET", "/mobile/api/requests", Json::object(), f.approver).status == 200, "lockout invalidated existing phone");
+  for (int i = 0; i < 5; ++i) app_login(f, "198.51.100.3", "bad", "203.0.113." + std::to_string(i + 1));
+  check(app_login(f, "198.51.100.3", "approval-secret", "203.0.113.99").status == 429,
+        "untrusted forwarded header bypassed source lockout");
+  check(f.connect("v2").status == 200, "App lockout affected driver");
+}
+void login_source_capacity_and_expiry() {
+  auto c = configuration(); c.api_rate_limit_max_sources = 2;
+  c.login_failure_window_ms = 150; c.login_lockout_ms = 250;
+  Fixture f(c);
+  app_login(f, "198.51.100.1", "bad"); app_login(f, "198.51.100.2", "bad");
+  for (int i = 0; i < 5; ++i) app_login(f, "198.51.100.3", "bad");
+  check(app_login(f, "198.51.100.4").status == 429, "overflow sources were not bounded by shared lockout");
+  check(app_login(f, "198.51.100.1").status == 200, "overflow lockout affected tracked source");
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  check(app_login(f, "198.51.100.4").status == 200, "expired source lockout did not recover");
+}
+void independent_app_token_expiry() {
+  for (bool short_app : {true, false}) {
+    auto c = configuration(); c.approver_token_ttl_ms = short_app ? 150 : 5000;
+    c.token_ttl_ms = short_app ? 5000 : 150;
+    Fixture f(c);
+    const auto login = body(app_login(f, "198.51.100.1"));
+    check(login.at("remaining_ms").get<std::int64_t>() > 0 &&
+          login.at("remaining_ms").get<std::int64_t>() <= c.approver_token_ttl_ms, "invalid App remaining TTL");
+    std::this_thread::sleep_for(std::chrono::milliseconds(180));
+    check(f.call("GET", "/mobile/api/requests", Json::object(), f.approver).status == (short_app ? 401 : 200),
+          "App token expiry is not independent");
+    check(f.connect("v2").status == (short_app ? 200 : 401), "App TTL changed driver expiry");
+  }
+}
 void gate_and_single_use() {
   Fixture f;
   check(f.connect("v2").status == 200, "default-off vehicle regressed");
@@ -182,11 +225,13 @@ void audit_fail_closed() {
   std::filesystem::remove_all(root);
 }
 void invalid_config_and_restart() {
-  for (int scenario = 0; scenario < 3; ++scenario) {
+  for (int scenario = 0; scenario < 5; ++scenario) {
     auto c = configuration();
     if (scenario == 0) c.mobile_app_password.clear();
     if (scenario == 1) c.mobile_approval_timeout_ms = 0;
     if (scenario == 2) c.mobile_approval_vehicles.insert("unknown");
+    if (scenario == 3) c.approver_token_ttl_ms = 0;
+    if (scenario == 4) c.approver_token_ttl_ms = 7LL * 24 * 60 * 60 * 1000 + 1;
     bool threw = false; try { SignalingService service(c); } catch (const std::invalid_argument&) { threw = true; }
     check(threw, "invalid approval configuration accepted");
   }
@@ -205,7 +250,7 @@ void heartbeat_and_login_expiry() {
     check(f.decide(id).status == 409, "heartbeat expiry retained approval");
     check(f.connect().status != 200 && f.service.health().at("active_sessions") == 0, "offline participant granted authority");
   }
-  auto c = configuration(); c.token_ttl_ms = 150;
+  auto c = configuration(); c.approver_token_ttl_ms = 150;
   Fixture f(c); const auto id = f.pending();
   std::this_thread::sleep_for(std::chrono::milliseconds(180));
   check(f.decide(id).status == 401, "expired phone login can approve");
@@ -226,7 +271,7 @@ void yaml_policy() {
   const auto root = std::filesystem::temp_directory_path() / ("mobile-config-" + random_token(6));
   std::filesystem::create_directories(root);
   std::ofstream(root / "secret") << "test-only-secret\n";
-  const std::string prefix = "auth:\n  mobile_approval_timeout_ms: 75000\n  drivers:\n    - id: d\n      password_file: secret\n      vehicles: [v]\n  vehicles:\n    - id: v\n      device_token_file: secret\n      mobile_approval_required: true\n";
+  const std::string prefix = "auth:\n  mobile_approval_timeout_ms: 75000\n  approver_token_ttl_ms: 600001\n  drivers:\n    - id: d\n      password_file: secret\n      vehicles: [v]\n  vehicles:\n    - id: v\n      device_token_file: secret\n      mobile_approval_required: true\n";
   const auto path = root / "config.yaml";
   std::ofstream(path) << prefix;
   const auto previous = std::filesystem::current_path();
@@ -242,7 +287,7 @@ void yaml_policy() {
     std::ofstream(root / "config/app-token") << "app-file-secret\n";
     const auto loaded = load_signaling_identity_config(path);
     check(loaded.mobile_approval_vehicles.contains("v") && loaded.mobile_approval_timeout_ms == 75000 &&
-        loaded.mobile_app_password == "app-file-secret", "config/app-token was not loaded");
+        loaded.approver_token_ttl_ms == 600001 && loaded.mobile_app_password == "app-file-secret", "config/app-token was not loaded");
     SignalingService validated(loaded);
   } catch (...) {
     std::filesystem::current_path(previous); std::filesystem::remove_all(root); throw;
@@ -367,7 +412,8 @@ void cancel_during_grant_response() {
 int main() {
   int failures = 0;
   for (const auto& [name, test] : std::vector<std::pair<std::string,std::function<void()>>>{
-      {"gate_and_single_use",gate_and_single_use},{"permissions_and_race",permissions_and_race},
+      {"login_source_isolation",login_source_isolation},{"login_source_capacity_and_expiry",login_source_capacity_and_expiry},
+      {"independent_app_token_expiry",independent_app_token_expiry},{"gate_and_single_use",gate_and_single_use},{"permissions_and_race",permissions_and_race},
       {"rejection_and_expiry",rejection_and_expiry},{"connection_generation_and_revocation",connection_generation_and_revocation},
       {"authentication_and_api_routes",authentication_and_api_routes},{"audit_fail_closed",audit_fail_closed},
       {"invalid_config_and_restart",invalid_config_and_restart},{"heartbeat_and_login_expiry",heartbeat_and_login_expiry},

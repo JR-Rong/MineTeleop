@@ -21,7 +21,7 @@ public final class MainActivity extends Activity implements ApprovalService.List
     private LinearLayout content, cards;
     private TextView status, originLabel, loginOriginLabel;
     private EditText passwordInput;
-    private Button loginButton, logoutButton, settingsButton;
+    private Button loginButton, logoutButton, settingsButton, notificationButton;
     private String lastCards = "";
     private final java.util.Map<TextView, ApprovalRequest> countdowns = new java.util.HashMap<>();
     private final ServiceConnection connection = new ServiceConnection() {
@@ -31,7 +31,7 @@ public final class MainActivity extends Activity implements ApprovalService.List
         @Override public void onServiceDisconnected(ComponentName name) { service = null; showLogin(); status.setText("值守已停止，请重新登录"); }
     };
     private final Runnable tick = new Runnable() {
-        @Override public void run() { if (showingInbox && service != null) renderCards(); handler.postDelayed(this, 1000); }
+        @Override public void run() { if (service != null) changed(); handler.postDelayed(this, 1000); }
     };
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -50,7 +50,13 @@ public final class MainActivity extends Activity implements ApprovalService.List
         if (service == null) return;
         ApprovalService.Snapshot state = service.snapshot();
         if (state.authenticated != showingInbox) { if (state.authenticated) showInbox(); else showLogin(); }
-        status.setText(state.message);
+        String message = state.message;
+        if (state.authenticated && service.lastSuccessfulSyncMs() >= 0)
+            message += "\n上次成功同步：" + Math.max(0, (SystemClock.elapsedRealtime() - service.lastSuccessfulSyncMs()) / 1000) + " 秒前";
+        boolean notificationsEnabled = service.notificationsEnabled();
+        if (state.authenticated && !notificationsEnabled) message += "\n通知未开启，无法后台提醒；请保持 App 打开";
+        status.setText(message);
+        if (notificationButton != null) notificationButton.setVisibility(notificationsEnabled ? View.GONE : View.VISIBLE);
         if (showingInbox) {
             originLabel.setText(getString(R.string.duty_origin, state.origin));
             logoutButton.setEnabled(!state.busy); renderCards();
@@ -95,15 +101,13 @@ public final class MainActivity extends Activity implements ApprovalService.List
                 String password = passwordInput.getText().toString();
                 if (password.isEmpty()) { status.setText("请填写云端配置的审批密码"); return; }
                 preferences.edit().putString("origin", origin).remove("account").apply();
-                if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
-                        !preferences.getBoolean("notification_asked", false)) {
-                    preferences.edit().putBoolean("notification_asked", true).apply();
+                if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
                     requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
-                }
                 passwordInput.setText(""); service.login(origin, password);
             } catch (IllegalArgumentException error) { status.setText(error.getMessage()); }
         });
         content.addView(settingsButton, fullWidth(16));
+        addNotificationSettings();
         addText(content, "开启值守后，App 会持续检查申请并显示通知。请允许通知；结束值守请在 App 内退出。", 13, MUTED, false, 0);
     }
     private String configuredOrigin() {
@@ -130,15 +134,32 @@ public final class MainActivity extends Activity implements ApprovalService.List
             });
         }); dialog.show();
     }
+    private void addNotificationSettings() {
+        notificationButton = button("通知未开启 · 开启提醒", false);
+        content.addView(notificationButton, fullWidth(16));
+        notificationButton.setOnClickListener(v -> {
+            if (Build.VERSION.SDK_INT >= 33 && shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS)) {
+                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
+            } else {
+                boolean appEnabled = getSystemService(NotificationManager.class).areNotificationsEnabled();
+                Intent intent = new Intent(appEnabled ? android.provider.Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS
+                        : android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName());
+                if (appEnabled) intent.putExtra(android.provider.Settings.EXTRA_CHANNEL_ID, ApprovalService.REQUESTS);
+                startActivity(intent);
+            }
+        });
+        if (service != null) notificationButton.setVisibility(service.notificationsEnabled() ? View.GONE : View.VISIBLE);
+    }
+    @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (service != null) changed();
+    }
     private void showInbox() {
         showingInbox = true; lastCards = "";
         shell("MINE TELEOP  /  审批台", "车辆控制申请", "同意仅对当前申请有效；拒绝或超时不会建立连接。");
         originLabel = addText(content, "", 13, MUTED, false, 18);
-        if (!getSystemService(NotificationManager.class).areNotificationsEnabled()) {
-            Button settings = button("通知未开启 · 前往设置", false); content.addView(settings, fullWidth(16));
-            settings.setOnClickListener(v -> startActivity(new Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
-                    .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName())));
-        }
+        addNotificationSettings();
         cards = new LinearLayout(this); cards.setOrientation(LinearLayout.VERTICAL); content.addView(cards);
         logoutButton = button("退出值守", false); content.addView(logoutButton, fullWidth(12));
         logoutButton.setOnClickListener(v -> { if (service != null) service.logout(); });
