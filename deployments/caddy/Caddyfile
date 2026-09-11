@@ -6,7 +6,7 @@
 	handle_path /api/* {
 		reverse_proxy {$MINE_TELEOP_SIGNALING_UPSTREAM:127.0.0.1:8765}
 	}
-	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/*
+	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/* /mobile /mobile/*
 	handle @signaling_api {
 		reverse_proxy {$MINE_TELEOP_SIGNALING_UPSTREAM:127.0.0.1:8765}
 	}

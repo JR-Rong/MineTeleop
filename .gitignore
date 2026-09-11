@@ -7,6 +7,10 @@
 .DS_Store
 .playwright-cli/
 output/
+/configs/secrets/
+/configs/*.password
+/configs/*.token
+/config/app-token
 
 # Compiled shared objects / binaries
 *.so

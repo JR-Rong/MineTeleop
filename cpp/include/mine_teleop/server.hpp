@@ -93,6 +93,9 @@ struct SignalingServerConfig {
   std::unordered_map<std::string, std::unordered_set<std::string>> driver_vehicle_permissions{
       {"driver-console-001", {"vehicle-001"}}};
   std::string admin_token;
+  std::string mobile_app_password;  // Loaded from config/app-token by the cloud identity loader.
+  std::unordered_set<std::string> mobile_approval_vehicles;
+  std::int64_t mobile_approval_timeout_ms{120 * 1000};
   std::int64_t token_ttl_ms{30 * 60 * 1000};
   std::int64_t control_token_ttl_ms{5 * 60 * 1000};
   std::int64_t vehicle_heartbeat_timeout_ms{15 * 1000};
@@ -137,6 +140,24 @@ class SignalingService {
   [[nodiscard]] Json health() const;
 
  private:
+  struct MobileApproval {
+    std::string request_id;
+    std::string vehicle_id;
+    std::string driver_id;
+    std::string state{"pending"};
+    std::string decided_by;
+    std::string session_id;
+    std::uint64_t driver_generation{0};
+    std::uint64_t vehicle_generation{0};
+    std::int64_t expires_at_ms{0};
+    std::chrono::steady_clock::time_point deadline;
+    [[nodiscard]] Json to_json() const;
+  };
+  void cleanup_mobile_approvals();
+  void require_mobile_approval(
+      const std::string& driver_id, const std::string& vehicle_id,
+      std::string_view request_id = {});
+  [[nodiscard]] ServerResponse handle_mobile_api(const HttpRequest& request);
   struct DriverToken {
     std::string driver_id;
     std::int64_t expires_at_ms{0};
@@ -231,13 +252,14 @@ class SignalingService {
   void close_sessions_for_driver(std::string_view driver_id, std::string_view reason);
   void transition_session(Session& session, SessionState next, std::string_view reason);
   void close_session(Session& session, std::string_view reason);
-  void enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms);
-  void record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms);
-  void clear_login_failures(std::string_view driver_id);
+  void enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms, bool approver = false);
+  void record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms, bool approver = false);
+  void clear_login_failures(std::string_view driver_id, bool approver = false);
   [[nodiscard]] std::string request_source(const HttpRequest& request) const;
   void cleanup_api_rate_limits(std::int64_t timestamp_ms);
   void enforce_api_rate_limit(const HttpRequest& request, std::int64_t timestamp_ms);
   void audit(std::string_view event, const Json& details = Json::object()) const;
+  bool try_audit(std::string_view event, const Json& details) const noexcept;
 
   SignalingServerConfig config_;
   std::string service_instance_id_;
@@ -247,6 +269,9 @@ class SignalingService {
   mutable std::int64_t audit_log_period_start_ms_{-1};
   mutable std::int64_t audit_log_last_retention_period_ms_{-1};
   std::unordered_map<std::string, DriverToken> driver_tokens_;
+  // One approval record per vehicle; phone login sessions expire independently.
+  std::unordered_map<std::string, MobileApproval> mobile_approvals_;
+  std::unordered_map<std::string, DriverToken> approver_tokens_;
   std::unordered_map<std::string, ConnectionPresence> online_vehicles_;
   std::unordered_map<std::string, ConnectionPresence> online_drivers_;
   std::unordered_set<std::string> revoked_vehicles_;
@@ -346,6 +371,11 @@ class DriverConsoleRuntime {
 
  private:
   [[nodiscard]] Json login_locked(std::string_view password);
+  [[nodiscard]] Json connect_locked(std::string_view requested_vehicle_id, std::uint64_t generation);
+  [[nodiscard]] Json await_control_session(const std::string& vehicle_id, const std::string& token,
+                                           std::uint64_t generation);
+  [[nodiscard]] Json end_session_locked(std::string_view reason);
+  void cancel_pending_connect();
   [[nodiscard]] Json fetch_authorized_vehicles(std::string_view token, std::int64_t expires_at_ms);
   [[nodiscard]] Json send_signaling_message(std::string_view type, const Json& payload);
   void connect_signaling_websocket(std::string_view session_id, std::string_view token);
@@ -378,6 +408,12 @@ class DriverConsoleRuntime {
   HttpClient http_;
   SynchronizedClock clock_;
   mutable std::mutex mutex_;
+  // A waiting connect is interrupted before disconnect/end-session acquires this lock.
+  std::mutex connection_operation_mutex_;
+  std::mutex approval_wait_mutex_;
+  std::condition_variable approval_wait_cv_;
+  std::atomic<std::uint64_t> connect_cancellation_generation_{0};
+  Json pending_mobile_approval_ = Json::object();
   mutable std::mutex browser_event_log_mutex_;
   mutable std::mutex time_sync_mutex_;
   mutable std::mutex control_lease_mutex_;
