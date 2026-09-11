@@ -1,0 +1,5 @@
+<resources>
+    <string name="duty_origin">值守云端  %1$s</string>
+    <string name="remaining">等待确认 · 剩余 %1$d 秒</string>
+    <string name="configured_origin">连接云端\n%1$s</string>
+</resources>

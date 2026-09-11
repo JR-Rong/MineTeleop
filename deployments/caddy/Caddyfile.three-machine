@@ -12,7 +12,7 @@ https://60-205-213-254.sslip.io:14443, https://60-205-213-254.sslip.io:16000, ht
 		reverse_proxy 127.0.0.1:8765
 	}
 
-	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/*
+	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/* /mobile/api/*
 	handle @signaling_api {
 		reverse_proxy 127.0.0.1:8765
 	}
@@ -32,7 +32,7 @@ https://60.205.213.254:14443, https://60.205.213.254:16000 {
 		reverse_proxy 127.0.0.1:8765
 	}
 
-	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/*
+	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/* /mobile/api/*
 	handle @signaling_api {
 		reverse_proxy 127.0.0.1:8765
 	}
@@ -52,7 +52,7 @@ https://teleop-field.internal:16000 {
 		reverse_proxy 127.0.0.1:8765
 	}
 
-	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/*
+	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/* /mobile/api/*
 	handle @signaling_api {
 		reverse_proxy 127.0.0.1:8765
 	}

@@ -8,3 +8,9 @@ dist
 cpp-build
 __pycache__
 *.pyc
+configs/secrets
+configs/*.password
+configs/*.token
+config/app-token
+apps
+output
