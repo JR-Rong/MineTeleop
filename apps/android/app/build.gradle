@@ -7,8 +7,8 @@ android {
         applicationId 'com.mineteleop.approval'
         minSdk 26
         targetSdk 35
-        versionCode 2
-        versionName '0.1.1'
+        versionCode 3
+        versionName '0.1.2'
     }
     buildFeatures { buildConfig true }
     compileOptions {
@@ -18,6 +18,10 @@ android {
     buildTypes {
         release { minifyEnabled false }
     }
+    testOptions.unitTests.includeAndroidResources = true
     lint { abortOnError true }
 }
-dependencies { testImplementation 'junit:junit:4.13.2' }
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+}
