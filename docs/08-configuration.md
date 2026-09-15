@@ -617,7 +617,7 @@ cloud:
   signaling_url: wss://teleop.example.com/signaling
 
 logging:
-  browser_event_log: ../.local/logs/control-browser-events.jsonl
+  browser_event_log: ../log/control-browser-events.jsonl
   browser_event_log_max_bytes: 2097152
   browser_event_log_files: 3
   control_trace_commands: false
@@ -631,12 +631,12 @@ control:
   intent_lease_ms: 200
   estop_hold_ms: 500
   limits:
-    initial_target_speed_kph: 2.0
-    initial_max_motor_torque_nm: 300.0
-    initial_max_brake_pressure_bar: 100.0
-    initial_service_brake_pressure_bar: 30.0
-    initial_hard_brake_pressure_bar: 100.0
-    initial_max_steering_angle_deg: 3.0
+    initial_target_speed_kph: 5.0
+    initial_max_motor_torque_nm: 320.0
+    initial_max_brake_pressure_bar: 163.8
+    initial_service_brake_pressure_bar: 163.8
+    initial_hard_brake_pressure_bar: 163.8
+    initial_max_steering_angle_deg: 30.0
   gamepad:
     enabled: true
     steering_axis: 0
@@ -713,12 +713,12 @@ ACK；若在新 profile 被拒绝时继续按本地预设生成制动标量，�
 - 检查所有仓库外车端的 `field_safety.max_speed_kph`。加载器通用范围已收紧为
   `[0, 72] km/h`，`0` 明确禁用牵引；大于 `72` 的旧值会启动失败，不会静默截断。
   必须根据本地 PID 车速上限和隔离台架结果显式选择新值。
-- 不得把默认 `300 Nm/路` 或普通最大 `100 bar/路` 当作已标定实车值。旧语义下有效
+- 不得把默认 `640 Nm/路` 或普通最大 `327.6 bar/路` 当作已标定实车值。旧语义下有效
   转矩上限可能约为 `full_scale_motor_torque_nm × max_throttle`；升级时应从旧有效上限
   或更小值开始，经隔离台架逐级标定。非 mock 配置缺少上述任一必填车速、比例、转矩、PID/反馈、
   超速、制动或转向门禁时继续 fail closed，不会补默认值启动真实 adapter。
 `logging.browser_event_log` 的相对路径以 YAML 文件所在目录为基准；默认值把日志
-写入控制端包根目录的 `.local/logs/`。`browser_event_log_files` 包含当前文件，
+写入控制端包根目录的 `log/`。`browser_event_log_files` 包含当前文件，
 因此值 `3` 表示当前文件加 `.1`、`.2` 两个备份。凭据类字段会被递归脱敏，但部署
 时仍应限制日志目录权限，并按现场保留策略采集或销毁日志。
 
@@ -834,3 +834,27 @@ fps/低分辨率 profile，pipeline hook 成功后才更新活动状态。
 ### 控制端 3D 资源
 
 `ui.scene_enabled` 默认 `true`；`ui.scene_manifest` 默认 `models/haul-truck/model.json`；可选 `ui.assets_root` 相对控制端 YAML 目录解析。资源随离线包交付，模型替换和坐标约定见 [控制端三列布局与可替换自车模型](console-3d-layout.md)。
+
+### 默认限值与无操作自动驻车（会话参数 V4）
+
+现场车端模板和车端类型缺省值使用 `can`；显式 `mock` 的开发/测试模板保持模拟。
+现场模板硬上限为 10 km/h、油门 1.0、转向 30°、单电机 640 Nm、普通制动 327.6 bar。
+相对 `bridge_library_path` 以车端 YAML 所在目录解析。CAN 接口默认为现场模板的 `can1`。
+
+控制页收到车辆硬上限后，首次会话默认取目标速度、转矩、普通制动压力的一半；
+转向使用车辆允许上限（不超过 30°），PID 和升扭标定沿用车端默认值。
+默认现场车辆对应 5 km/h、油门比例 0.5、转向 30°、320 Nm、163.8 bar。
+
+页面“无操作自动驻车”取值 0–1 秒，默认 0.5 秒；线协议为整数
+`parking_idle_timeout_ms`（0–1000），属于 `profile_version=4` 的完整会话快照。
+修改延时必须在 N 挡、零速、EPB 驻车、VCU standby/disarmed 时重新确认参数。
+
+握手完成仍保持驻车。前后、转向或刹车的有效操作发送 `operator_active=true`，
+车端收到后才请求松驻车，且新鲜的四路 EPB 释放反馈齐全后才允许驱动力。
+无输入时后台控制心跳继续发送，但不刷新驻车计时。到期先撤掉驱动力并按车端
+普通制动硬上限制动，收到新鲜零速和零扭矩反馈后请求 EPB 驻车；VCU 握手继续保留。
+0 秒表示松开操作键即开始停车，持续按住不会反复驻车；操作消息丢失后，
+车端仍会让活动输入租约失效。原有控制超时、急停及反馈超时安全链路独立生效。
+
+车端运行程序、CAN bridge 和控制端须一起升级；旧 bridge 缺少新能力时会在初始化
+CAN 前拒绝启动，旧会话参数不会被默默按新行为解释。本地软件/模拟 CAN 测试不替代实车验收。

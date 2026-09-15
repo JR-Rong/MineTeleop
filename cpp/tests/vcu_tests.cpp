@@ -286,6 +286,92 @@ void complete_emergency_disarm(ParallelController& controller) {
   expect(controller.state() == State::Disarmed, "emergency disarm did not complete");
 }
 
+void test_operator_idle_parking_deadlines() {
+  mine_teleop::vcu::OperatorIdleParking timer;
+  expect(timer.expired(0, 500), "handshake without input must stay parked");
+  timer.observe(true, 1000);
+  expect(!timer.expired(1000, 0), "held input cannot expire at zero delay");
+  timer.observe(false, 1050);
+  expect(timer.expired(1050, 0), "zero delay must park on key release");
+  for (int now = 1100; now < 1500; now += 50) {
+    timer.observe(false, now);
+    expect(!timer.expired(now, 500), "neutral heartbeat shortened the deadline");
+  }
+  expect(timer.expired(1500, 500), "neutral heartbeat renewed the deadline");
+  expect(!timer.expired(1999, 1000) && timer.expired(2000, 1000),
+      "one-second boundary is incorrect");
+  timer.observe(true, 3000);
+  expect(!timer.expired(3199, 0) && timer.expired(3200, 0),
+      "lost sender did not expire its held-input lease");
+  expect(timer.expired(3500, 500), "lost sender did not park locally");
+  for (int now = 4000; now <= 5000; now += 50) {
+    timer.observe(true, now);
+    expect(!timer.expired(now + 25, 0), "held key pulsed parking at zero delay");
+  }
+  timer.reset();
+  expect(timer.expired(5001, 500), "previous handshake leaked operator activity");
+}
+
+void test_automatic_parking_preserves_handshake_and_release_feedback_gate() {
+  ParallelController controller;
+  prepare_parking_gate(controller);
+  controller.set_automatic_parking(true, true, true, 50.0);
+  expect(controller.request_parallel_handshake(), "parked handshake rejected");
+  for (int i = 0; i < 6; ++i) static_cast<void>(controller.tick());
+  controller.ingest(handshake_feedback(5));
+  auto frames = controller.tick();
+  expect(controller.state() == State::WaitGear, "automatic handshake waited for EPB release");
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) != 1,
+      "handshake released EPB without an operator input");
+  controller.ingest(gear_feedback(1));
+  static_cast<void>(controller.tick());
+  send_mode_feedback(controller);
+  frames = controller.tick();
+  expect(controller.ready(), "parked controller did not become ready");
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 2,
+      "Ready released EPB without input");
+
+  // Even an earlier released status cannot satisfy a new release request.
+  controller.ingest(parking_brake_feedback(1));
+  controller.set_automatic_parking(true, false, true, 50.0);
+  Command command;
+  command.gear = 1;
+  command.motor_torque_nm.fill(100.0);
+  expect(controller.set_command(command), "automatic command rejected");
+  frames = controller.tick();
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 1,
+      "operator input did not request EPB release");
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) == 8000,
+      "torque escaped before fresh EPB release feedback");
+  controller.ingest(parking_brake_feedback(1));
+  frames = controller.tick();
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) == 9000,
+      "fresh release feedback did not unlock the requested torque");
+
+  controller.set_automatic_parking(true, true, false, 50.0);
+  frames = controller.tick();
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 0,
+      "idle parking changed EPB without fresh zero-speed confirmation");
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) == 8000 &&
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduEhb01), 4, 12) == 500,
+      "idle parking did not remove torque and apply service braking");
+  controller.set_automatic_parking(true, true, true, 50.0);
+  controller.ingest(motor_torque_feedback(0, 10.0));
+  frames = controller.tick();
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 0,
+      "parking engaged before actual torque reached zero");
+  controller.ingest(motor_torque_feedback(0, 0.0));
+  frames = controller.tick();
+  expect(controller.ready() &&
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 2,
+      "stopped idle parking lost authority or did not park");
+  controller.emergency_stop();
+  frames = controller.tick();
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) == 8000 &&
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduEhb01), 4, 12) == 4095,
+      "automatic parking weakened emergency braking");
+}
+
 void test_protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding() {
   ParallelController controller;
   const auto initial = controller.tick();
@@ -1199,6 +1285,9 @@ void test_arming_physical_emergency_is_latched_and_recoverable_only_after_disarm
 
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
+      {"operator_idle_parking_deadlines", test_operator_idle_parking_deadlines},
+      {"automatic_parking_handshake_and_feedback",
+       test_automatic_parking_preserves_handshake_and_release_feedback_gate},
       {"protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding",
        test_protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding},
       {"arming_uses_current_epb_semantics_and_gates_control",

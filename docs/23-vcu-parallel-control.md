@@ -229,8 +229,8 @@ export MINE_TELEOP_VCU_LOG_ROTATIONS=10
 
 ## 从 mock 切换到真实 CAN bridge
 
-仓库现场模板和安装包默认使用 `vehicle_adapter.type: mock`，这是为了避免安装后
-意外给底盘上电。实车调试时修改车端实际使用的
+仓库现场模板和安装包默认使用 `vehicle_adapter.type: can`，10 km/h、油门 1.0、
+转向 30°；开发模板仍可显式使用 `mock`。实车调试时修改车端实际使用的
 `/opt/mine-teleop/config/vehicle-agent.yaml`（源码模板是
 `configs/vehicle-agent.three-machine.field.yaml`），不要修改控制端配置来切换
 adapter。至少需要：
@@ -342,3 +342,7 @@ adapter 启动或运行失败会短暂上报握手 `fault`、关闭控制 DataCh
 
 任何一步反馈值、方向或执行结果不一致，都应停止后续阶段，保留日志并按具体 CAN
 ID、cycle 和状态迁移定位，不能通过放宽门禁继续测试。
+
+当前会话参数 V4 在握手期间保持 EPB 驻车，收到有效驾驶输入才请求释放，
+无操作自动停车但保留握手。0–1 秒的会话延时、默认限值及升级要求见
+[默认限值与无操作自动驻车](08-configuration.md#默认限值与无操作自动驻车会话参数-v4)。

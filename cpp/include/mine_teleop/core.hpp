@@ -22,15 +22,15 @@ using Json = nlohmann::json;
 
 inline constexpr int kProtocolVersion = 1;
 inline constexpr std::size_t kMaxVehicleTelemetryHistory = 1024;
-inline constexpr double kDefaultFullScaleMotorTorqueNm = 300.0;
+inline constexpr double kDefaultFullScaleMotorTorqueNm = 640.0;
 inline constexpr double kMaxFullScaleMotorTorqueNm = 640.0;
 inline constexpr double kDefaultMotorTorqueRiseRateNmPerSecond = 0.0;
 inline constexpr double kMaxMotorTorqueRiseRateNmPerSecond = 32000.0;
-inline constexpr double kDefaultMaxBrakePressureBar = 100.0;
+inline constexpr double kDefaultMaxBrakePressureBar = 327.6;
 inline constexpr double kMaxOrdinaryBrakePressureBar = 327.6;
 inline constexpr double kMaxEmergencyBrakePressureBar = 409.5;
 inline constexpr int kSessionControlProfileMaxAgeMs = 2000;
-inline constexpr int kSessionControlProfileVersion = 3;
+inline constexpr int kSessionControlProfileVersion = 4;
 static_assert(kMaxFullScaleMotorTorqueNm <= 800.0 * 0.8);
 static_assert(kMaxFullScaleMotorTorqueNm <= 838.3 * 0.8);
 
@@ -76,6 +76,7 @@ struct ControlCommand {
   double brake{0.0};
   bool estop{false};
   std::string control_token;
+  bool operator_active{false};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -150,6 +151,7 @@ struct SessionControlProfile {
   double speed_pid_derivative_filter_tau_ms{100.0};
   int speed_pid_max_dt_ms{100};
   double motor_torque_rise_rate_nm_per_s{kDefaultMotorTorqueRiseRateNmPerSecond};
+  int parking_idle_timeout_ms{500};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -448,7 +450,7 @@ struct UploadConfig {
 };
 
 struct VehicleAdapterConfig {
-  std::string type{"mock"};
+  std::string type{"can"};
   std::string can_interface{"can0"};
   std::filesystem::path bridge_library_path;
 };
@@ -471,7 +473,7 @@ struct HardwareConfig {
 
 struct FieldSafetyConfig {
   std::string commissioning_mode{"bench"};
-  double max_speed_kph{40.0};
+  double max_speed_kph{10.0};
   double max_throttle{1.0};
   double full_scale_motor_torque_nm{kDefaultFullScaleMotorTorqueNm};
   double motor_torque_rise_rate_nm_per_s{
@@ -741,8 +743,8 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
 
   using OpenV4Fn = int (*)(const void*);
   using ApplyFn = int (*)(int, double, double, const double*, int);
-  using ApplyV2Fn = int (*)(int, double, double, const double*, int, void*);
-  using ConfigureRuntimeControlV2Fn = int (*)(const void*, void*);
+  using ApplyV3Fn = int (*)(int, double, double, const double*, int, int, void*);
+  using ConfigureRuntimeControlV3Fn = int (*)(const void*, void*);
   using ClearRuntimeControlFn = int (*)(void*);
   using StopFn = int (*)();
   using HandshakeFn = int (*)();
@@ -754,8 +756,8 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
   using CloseFn = int (*)();
   OpenV4Fn open_v4_fn_{nullptr};
   ApplyFn apply_fn_{nullptr};
-  ApplyV2Fn apply_v2_fn_{nullptr};
-  ConfigureRuntimeControlV2Fn configure_runtime_control_v2_fn_{nullptr};
+  ApplyV3Fn apply_v3_fn_{nullptr};
+  ConfigureRuntimeControlV3Fn configure_runtime_control_v3_fn_{nullptr};
   ClearRuntimeControlFn clear_runtime_control_fn_{nullptr};
   StopFn stop_fn_{nullptr};
   HandshakeFn request_handshake_fn_{nullptr};

@@ -704,7 +704,7 @@ void test_control_page_contract() {
               std::string::npos,
       "legacy PID defaults can still auto-submit without explicit operator confirmation");
   expect(
-      response.body.find("pidChanged=!prior||requested.speed_pid_kp!==prior.speed_pid_kp") !=
+      response.body.find("pidChanged=!prior||requested.parking_idle_timeout_ms!==prior.parking_idle_timeout_ms||requested.speed_pid_kp!==prior.speed_pid_kp") !=
               std::string::npos &&
       response.body.find(
               "requested.motor_torque_rise_rate_nm_per_s!==prior.motor_torque_rise_rate_nm_per_s") !=
@@ -1232,18 +1232,18 @@ void test_driver_gamepad_config() {
       "field driver log rotation capacity is too small for batched command traces");
   expect(field.max_time_sync_uncertainty_ms == 25, "field driver time synchronization limit is not 25ms");
   expect(
-      field.control_limits.initial_target_speed_kph == 2.0,
+      field.control_limits.initial_target_speed_kph == 5.0,
       "field driver initial target speed changed");
   expect(
-      field.control_limits.initial_max_motor_torque_nm == 300.0,
+      field.control_limits.initial_max_motor_torque_nm == 320.0,
       "field driver initial per-motor torque request changed");
   expect(
-      field.control_limits.initial_max_brake_pressure_bar == 100.0 &&
-          field.control_limits.initial_service_brake_pressure_bar == 30.0 &&
-          field.control_limits.initial_hard_brake_pressure_bar == 100.0,
+      field.control_limits.initial_max_brake_pressure_bar == 163.8 &&
+          field.control_limits.initial_service_brake_pressure_bar == 163.8 &&
+          field.control_limits.initial_hard_brake_pressure_bar == 163.8,
       "field driver initial per-EHB pressure requests changed");
   expect(
-      field.control_limits.initial_max_steering_angle_deg == 3.0,
+      field.control_limits.initial_max_steering_angle_deg == 30.0,
       "field driver initial steering limit changed");
 }
 
@@ -2932,7 +2932,8 @@ void test_driver_vehicle_switch_releases_old_session() {
   profile_request.method = "POST";
   profile_request.path = "/api/control-profile";
   const mine_teleop::Json valid_profile = {
-      {"profile_version", 3},
+      {"profile_version", 4},
+      {"parking_idle_timeout_ms", 500},
       {"target_speed_kph", 3.0},
       {"max_motor_torque_nm", 250.0},
       {"max_brake_pressure_bar", 80.0},
@@ -2964,7 +2965,7 @@ void test_driver_vehicle_switch_releases_old_session() {
       "prepared session profile lost authenticated envelope identity");
   expect(
       !profile_envelope.contains("profile") &&
-          profile_envelope.value("profile_version", 0) == 3 &&
+          profile_envelope.value("profile_version", 0) == 4 &&
           profile_envelope.value("target_speed_kph", -1.0) == 3.0 &&
           profile_envelope.value("max_motor_torque_nm", -1.0) == 250.0 &&
           profile_envelope.value("max_brake_pressure_bar", -1.0) == 80.0 &&
@@ -2988,7 +2989,7 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(
       prepared_profile.value("target_speed_kph", -1.0) == 3.0 &&
           prepared_profile.value("max_motor_torque_nm", -1.0) == 250.0 &&
-          prepared_profile.value("profile_version", 0) == 3 &&
+          prepared_profile.value("profile_version", 0) == 4 &&
           prepared_profile.value("initialized", false) &&
           prepared_profile.value("max_steering_angle_deg", -1.0) == 3.0 &&
           prepared_profile.value("speed_pid_kp", -1.0) == 1.5 &&
@@ -3156,7 +3157,8 @@ void test_driver_vehicle_switch_releases_old_session() {
       "rejected legacy control-limit mutation changed the active profile");
 
   profile_request.body = mine_teleop::Json({
-      {"profile_version", 3},
+      {"profile_version", 4},
+      {"parking_idle_timeout_ms", 500},
       {"target_speed_kph", 0.0},
       {"max_motor_torque_nm", 0.0},
       {"max_brake_pressure_bar", 0.0},
@@ -3208,12 +3210,13 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(!ended.value("connected", true), "explicit session end did not clear local authority");
   const auto reset_profile = driver.control_profile();
   expect(
-      reset_profile.value("target_speed_kph", -1.0) == 2.0 &&
-          reset_profile.value("max_motor_torque_nm", -1.0) == 300.0 &&
+      reset_profile.value("target_speed_kph", -1.0) == 5.0 &&
+          reset_profile.value("max_motor_torque_nm", -1.0) == 320.0 &&
           reset_profile.value("max_brake_pressure_bar", -1.0) == 100.0 &&
           reset_profile.value("service_brake_pressure_bar", -1.0) == 10.0 &&
           reset_profile.value("hard_brake_pressure_bar", -1.0) == 25.0 &&
-          reset_profile.value("profile_version", 0) == 3 &&
+          reset_profile.value("profile_version", 0) == 4 &&
+          reset_profile.value("parking_idle_timeout_ms", -1) == 500 &&
           !reset_profile.value("initialized", true) &&
           reset_profile.value("speed_pid_kp", -1.0) == 0.0 &&
           reset_profile.value("speed_pid_max_dt_ms", -1) == 0 &&

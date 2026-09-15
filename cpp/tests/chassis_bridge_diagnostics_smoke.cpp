@@ -480,6 +480,75 @@ std::size_t count_logged_events(
   return count;
 }
 
+void test_runtime_operator_parking() {
+  int sockets[2];
+  expect(::socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) == 0, "parking test transport failed");
+  const auto fd = std::to_string(sockets[0]);
+  ::setenv("MINE_TELEOP_CHASSIS_TEST_FD", fd.c_str(), 1);
+  auto config = valid_v4_config("mt-test", 800);
+  expect(mine_teleop_chassis_open_v4(&config) == 0, "parking runtime open failed");
+  ::unsetenv("MINE_TELEOP_CHASSIS_TEST_FD");
+  auto feedback = runtime_feedback(3, 1, 2, 0.0);
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "parking feedback failed");
+  MineTeleopChassisRuntimeControlConfigV3 profile{
+      sizeof(MineTeleopChassisRuntimeControlConfigV3), 4U, 1U,
+      1.0, 40.0, 50.0, 1.0, 1.0, 0.2, 0.0, 100.0, 100, 0U, 0.0, 500, 0U};
+  MineTeleopChassisRuntimeControlResultV1 result{};
+  for (const int timeout : {-1, 1001}) {
+    profile.parking_idle_timeout_ms = timeout;
+    expect(mine_teleop_chassis_configure_runtime_control_v3(&profile, &result) == -1,
+        "bridge accepted an invalid parking timeout");
+  }
+  for (const int timeout : {0, 1000, 500}) {
+    profile.parking_idle_timeout_ms = timeout;
+    expect(mine_teleop_chassis_configure_runtime_control_v3(&profile, &result) == 0,
+        "bridge rejected a valid parking timeout");
+    ++profile.profile_revision;
+  }
+  expect(mine_teleop_chassis_request_parallel_handshake() == 0, "parked arming request failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE), "parking handshake wait failed");
+  feedback = runtime_feedback(5, 1, 2, 0.0);
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "handshake feedback failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR), "automatic handshake released parking");
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "gear feedback failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_ACTUATOR_MODES), "automatic gear wait failed");
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "mode feedback failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_READY), "automatic handshake never reached Ready");
+  const std::array<double, 4> steering{};
+  MineTeleopChassisApplyResultV1 applied{};
+  auto apply = [&](bool active) {
+    expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "parking refresh failed");
+    expect(mine_teleop_chassis_apply_state_v3(1, 0.0, active ? -0.1 : 0.0,
+        steering.data(), 4, active ? 1 : 0, &applied) == 0, "parking command rejected");
+  };
+  apply(false);
+  auto frames = drain_can_frames(sockets[1], 40);
+  expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), 0, 2) == 2,
+      "neutral heartbeat released parking after handshake");
+  apply(true);  // A brake key is a valid operator action even without traction.
+  frames = drain_can_frames(sockets[1], 40);
+  expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), 0, 2) == 1,
+      "brake input did not release parking");
+  feedback = runtime_feedback(5, 1, 1, 0.0);
+  const auto released_at = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - released_at < std::chrono::milliseconds(600)) {
+    apply(false);
+    frames = drain_can_frames(sockets[1], 40);
+  }
+  expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), 0, 2) == 2,
+      "neutral heartbeats prevented the 500 ms local parking deadline");
+  MineTeleopChassisHandshakeStatus status{};
+  expect(mine_teleop_chassis_read_handshake_status(&status) == 0 && status.ready == 1,
+      "automatic idle parking revoked the handshake");
+  expect(mine_teleop_chassis_clear_runtime_control_v1(&result) == 0, "profile clear failed");
+  frames = drain_can_frames(sockets[1], 40);
+  expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), 0, 2) == 2,
+      "clearing a profile released automatic parking");
+  expect(mine_teleop_chassis_close() == 0, "parking runtime close failed");
+  ::close(sockets[0]);
+  ::close(sockets[1]);
+}
+
 }  // namespace
 
 int main() {
@@ -2492,6 +2561,7 @@ int main() {
         "handshake revoke diagnostic was missing, duplicated, or incomplete");
     std::filesystem::remove(physical_log_path, error);
 
+    test_runtime_operator_parking();
     std::cout << "chassis_bridge_diagnostics_smoke=passed\n";
     return 0;
   } catch (const std::exception& error) {

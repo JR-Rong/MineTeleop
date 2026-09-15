@@ -43,10 +43,10 @@ speed-feedback deadline, hard-overspeed margin, `max_throttle`,
 `full_scale_motor_torque_nm`, `motor_torque_rise_rate_nm_per_s`,
 `max_brake_pressure_bar`, and steering limits.
 
-Before ordinary driving, the controller submits a complete `profile_version=3`
+Before ordinary driving, the controller submits a complete `profile_version=4`
 snapshot containing target speed, maximum per-motor torque, maximum ordinary
 EHB pressure, service and hard-brake pressure, maximum steering, the five
-speed-PID settings, and the motor torque rise rate. The vehicle applies and
+speed-PID settings, the motor torque rise rate, and `parking_idle_timeout_ms` (0–1000, default 500). The vehicle applies and
 acknowledges
 that profile before it permits the VCU handshake. Speed, torque, brake, and
 steering values can only reduce the immutable vehicle-side YAML limits; PID and
@@ -251,3 +251,16 @@ log path is unavailable; it never falls back to the mock adapter. Real
 CAN/VCU acceptance remains a separate bench/vehicle task. Successful builds,
 unit tests, bundle checks, and virtual-CAN tests do not establish real vehicle
 speed-control or braking acceptance.
+
+### Automatic parking capabilities
+
+Current runtimes additionally require the 104-byte runtime-control V3 size query,
+`mine_teleop_chassis_configure_runtime_control_v3` (profile version 4), and
+`mine_teleop_chassis_apply_state_v3` with explicit operator activity. Legacy V1/V2
+POD layouts and symbols remain unchanged. Missing V3 capabilities fail before CAN opens.
+The V4 profile keeps EPBs parked through arming. Fresh operator input requests release;
+traction waits for EPB feedback newer than that release request. The local monotonic
+idle timer ignores neutral heartbeats. Expiry removes torque, applies the vehicle's
+ordinary braking ceiling, then parks only with fresh zero-speed and zero-torque feedback. Clearing a
+profile does not switch a parked controller back to the legacy release behavior.
+The control watchdog, physical emergency and staged disarm retain priority.

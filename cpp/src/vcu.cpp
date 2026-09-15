@@ -292,6 +292,11 @@ void ParallelController::reset() {
   emergency_.brake_pressure_bar.fill(409.5);
   feedback_ = Feedback{};
   state_ = State::Standby;
+  automatic_parking_ = false;
+  automatic_park_requested_ = true;
+  parking_stopped_fresh_ = false;
+  parking_release_generation_ = 0;
+  parking_brake_bar_ = 0.0;
   initial_frame_count_ = 0;
   emergency_stop_ = false;
   physical_emergency_latched_ = false;
@@ -307,6 +312,45 @@ void ParallelController::reset() {
   motor_torque_generation_.fill(0);
   steering_generation_.fill(0);
   brake_generation_.fill(0);
+}
+
+void OperatorIdleParking::reset() {
+  seen_ = false;
+  active_ = false;
+  last_active_ms_ = 0;
+}
+
+void OperatorIdleParking::observe(bool active, std::int64_t now_ms) {
+  if (active) {
+    seen_ = true;
+    last_active_ms_ = now_ms;
+  }
+  active_ = active;
+}
+
+bool OperatorIdleParking::expired(std::int64_t now_ms, int timeout_ms) const {
+  if (!seen_) return true;
+  const auto elapsed = std::max<std::int64_t>(0, now_ms - last_active_ms_);
+  // At timeout=0, a held key must survive the interval between 20 Hz samples.
+  // Explicit release expires immediately; a vanished sender loses this lease.
+  return !(active_ && elapsed < 200) && elapsed >= timeout_ms;
+}
+
+void ParallelController::set_automatic_parking(
+    bool enabled, bool requested, bool stopped_fresh, double brake_bar) {
+  if (enabled && !requested && (!automatic_parking_ || automatic_park_requested_))
+    parking_release_generation_ = receive_generation_;
+  automatic_parking_ = enabled;
+  automatic_park_requested_ = requested;
+  parking_stopped_fresh_ = stopped_fresh;
+  parking_brake_bar_ = brake_bar;
+}
+
+bool ParallelController::parking_released() const {
+  return (!automatic_parking_ || (!automatic_park_requested_ &&
+      parking_brake_generation_ > parking_release_generation_)) &&
+      all_equal_valid(feedback_.parking_brake_status,
+      feedback_.parking_brake_valid, kParkingBrakeRelease);
 }
 
 bool ParallelController::set_command(const Command& command) {
@@ -589,7 +633,7 @@ void ParallelController::advance_state() {
       if (feedback_.handshake_valid &&
           handshake_generation_ > state_entry_generation_ &&
           feedback_.handshake_status == kIntelligentHandshakeStatus) {
-        enter(State::WaitParkingBrakeReleased);
+        enter(automatic_parking_ ? State::WaitGear : State::WaitParkingBrakeReleased);
       }
       break;
     case State::WaitParkingBrakeReleased:
@@ -752,6 +796,25 @@ std::vector<CanFrame> ParallelController::tick() {
     vehicle_speed_request_kph = 0.0;
     vehicle_speed_request_valid = false;
     fault_reset = desired_.fault_reset;
+  }
+
+  // Automatic parking retains by-wire authority. Never apply the EPB while
+  // moving, and never restore traction before all EPBs report released.
+  if (automatic_parking_ && (state_ == State::WaitGear ||
+      state_ == State::WaitActuatorModes || state_ == State::Ready)) {
+    const bool park = automatic_park_requested_ || state_ != State::Ready;
+    const bool torque_zero = all_valid(feedback_.motor_torque_valid) &&
+        std::all_of(feedback_.motor_torque_nm.begin(), feedback_.motor_torque_nm.end(),
+            [](double torque) { return std::abs(torque) <= kTorqueZeroToleranceNm; });
+    parking_brake.fill(park
+        ? (parking_stopped_fresh_ && torque_zero ? kParkingBrakePark : kParkingBrakeHold)
+        : kParkingBrakeRelease);
+    if (park || !parking_released()) {
+      motor_torque.fill(0.0);
+      motor_speed.fill(0.0);
+      steering_angle.fill(0.0);
+      brake_pressure.fill(parking_brake_bar_);
+    }
   }
 
   const bool safety_brake =

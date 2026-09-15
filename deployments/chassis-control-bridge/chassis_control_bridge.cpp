@@ -79,6 +79,7 @@ struct SpeedControlSettings {
 };
 
 struct RuntimeControlSettings {
+  int parking_idle_timeout_ms{-1};
   bool active{false};
   std::uint64_t revision{0};
   double target_speed_limit_mps{0.0};
@@ -1090,7 +1091,8 @@ class BridgeRuntime {
       double target_speed_mps,
       double normalized_longitudinal,
       const double* steering_values,
-      int steering_count) {
+      int steering_count,
+      bool operator_active = false) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!running_.load() || io_error_ != 0) {
       log_operation_rejected_locked(
@@ -1219,6 +1221,8 @@ class BridgeRuntime {
         std::min<int>(steering_count, intent.steering.size()),
         intent.steering.begin());
     intent.generation = ++intent_generation_;
+    operator_idle_.observe(operator_active && controller_.ready(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
     latest_intent_ = intent;
     latest_intent_valid_ = true;
     last_successful_apply_ = now;
@@ -1249,13 +1253,28 @@ class BridgeRuntime {
         applied_revision);
   }
 
+  std::uint32_t configure_runtime_control_v3(
+      const MineTeleopChassisRuntimeControlConfigV3& config,
+      std::uint64_t& applied_revision) {
+    if (config.struct_size != sizeof(config) || config.parking_reserved != 0U ||
+        config.parking_idle_timeout_ms < 0 ||
+        config.parking_idle_timeout_ms > 1000) {
+      applied_revision = 0;
+      return MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_ARGUMENTS_INVALID;
+    }
+    return configure_runtime_control(config, 4U, true,
+        config.motor_torque_rise_rate_nm_per_s, applied_revision,
+        config.parking_idle_timeout_ms);
+  }
+
   template <typename Config>
   std::uint32_t configure_runtime_control(
       const Config& config,
       std::uint32_t expected_profile_version,
       bool has_session_rise_rate,
       double session_rise_rate_nm_per_s,
-      std::uint64_t& applied_revision) {
+      std::uint64_t& applied_revision,
+      int parking_idle_timeout_ms = -1) {
     std::lock_guard<std::mutex> lock(mutex_);
     applied_revision = 0;
     const double motor_torque_rise_rate_nm_per_s = has_session_rise_rate
@@ -1316,6 +1335,7 @@ class BridgeRuntime {
         speed_control_.motor_torque_rise_rate_nm_per_s;
     const bool requires_parking =
         !runtime_control_.active || pid_changed || torque_shaping_changed ||
+        parking_idle_timeout_ms != runtime_control_.parking_idle_timeout_ms ||
         config.target_speed_limit_mps >
             runtime_control_.target_speed_limit_mps + 1e-9 ||
         config.max_motor_torque_nm >
@@ -1339,6 +1359,7 @@ class BridgeRuntime {
 
     RuntimeControlSettings next;
     next.active = true;
+    next.parking_idle_timeout_ms = parking_idle_timeout_ms;
     next.revision = config.profile_revision;
     next.target_speed_limit_mps = config.target_speed_limit_mps;
     next.max_motor_torque_nm = config.max_motor_torque_nm;
@@ -1355,6 +1376,11 @@ class BridgeRuntime {
     latest_intent_.target_speed_mps = 0.0;
     speed_control_ = next_speed_control;
     runtime_control_ = next;
+    operator_idle_.reset();
+    controller_.set_automatic_parking(parking_idle_timeout_ms >= 0, true,
+        speed_feedback_fresh_locked(now) && feedback_fresh_locked(now) &&
+            std::abs(controller_.feedback().speed_mps) <= 0.1,
+        max_ordinary_brake_pressure_bar_);
     applied_revision = runtime_control_.revision;
     try {
       logger_.event(
@@ -1377,7 +1403,10 @@ class BridgeRuntime {
     speed_control_.pid = open_speed_control_.pid;
     speed_control_.motor_torque_rise_rate_nm_per_s =
         open_speed_control_.motor_torque_rise_rate_nm_per_s;
+    const int parking_timeout = runtime_control_.parking_idle_timeout_ms;
     runtime_control_ = RuntimeControlSettings{};
+    runtime_control_.parking_idle_timeout_ms = parking_timeout;
+    operator_idle_.reset();
     try {
       logger_.event(
           "runtime_control_profile_cleared",
@@ -1499,6 +1528,7 @@ class BridgeRuntime {
     }
     clear_stop_provenance_locked();
     last_successful_apply_valid_ = false;
+    operator_idle_.reset();
     ready_since_valid_ = false;
     session_ready_latched_ = false;
     feedback_watchdog_armed_ = false;
@@ -2285,11 +2315,21 @@ class BridgeRuntime {
       clear_stop_provenance_locked();
     }
 
+    const bool idle_park = !runtime_control_.active || operator_idle_.expired(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count(),
+        runtime_control_.parking_idle_timeout_ms);
+    const bool automatic_parking = runtime_control_.parking_idle_timeout_ms >= 0;
+    controller_.set_automatic_parking(automatic_parking, idle_park,
+        speed_fresh && feedback_fresh_locked(now) && measured_speed_magnitude_mps <= 0.1,
+        max_ordinary_brake_pressure_bar_);
+    const bool parking_allows_traction = !automatic_parking ||
+        (!idle_park && feedback_fresh_locked(now) && controller_.parking_released());
+
     const bool traction_pid_active =
         speed_control_.enabled && runtime_control_.active &&
         !physical_emergency_latched && !hard_overspeed_latched_ &&
         !control_watchdog_latched_ && !software_estop_ &&
-        traction_requested && driving_gear && controller_.ready() &&
+        parking_allows_traction && traction_requested && driving_gear && controller_.ready() &&
         speed_fresh && actual_gear_matches && intent.target_speed_mps > 0.0;
     double normalized_output = 0.0;
     if (brake_requested && !physical_emergency_latched &&
@@ -3001,6 +3041,7 @@ class BridgeRuntime {
   std::uint64_t last_polled_generation_{0};
   int io_error_{0};
   bool software_estop_{false};
+  mine_teleop::vcu::OperatorIdleParking operator_idle_;
   Clock::time_point last_successful_apply_{};
   Clock::time_point ready_since_{};
   bool last_successful_apply_valid_{false};
@@ -3497,6 +3538,17 @@ extern "C" int mine_teleop_chassis_configure_runtime_control_v2(
       &BridgeRuntime::configure_runtime_control_v2);
 }
 
+extern "C" uint32_t mine_teleop_chassis_runtime_control_config_v3_size() {
+  return sizeof(MineTeleopChassisRuntimeControlConfigV3);
+}
+
+extern "C" int mine_teleop_chassis_configure_runtime_control_v3(
+    const MineTeleopChassisRuntimeControlConfigV3* config,
+    MineTeleopChassisRuntimeControlResultV1* result) {
+  return configure_runtime_control_entrypoint(
+      config, result, &BridgeRuntime::configure_runtime_control_v3);
+}
+
 extern "C" int mine_teleop_chassis_clear_runtime_control_v1(
     MineTeleopChassisRuntimeControlResultV1* result) {
   if (result == nullptr) return -1;
@@ -3527,12 +3579,13 @@ extern "C" int mine_teleop_chassis_clear_runtime_control_v1(
   }
 }
 
-extern "C" int mine_teleop_chassis_apply_state_v2(
+extern "C" int mine_teleop_chassis_apply_state_v3(
     int target_gear,
     double target_vx,
     double target_ax,
     const double* steering_values,
     int steering_count,
+    int operator_active,
     MineTeleopChassisApplyResultV1* result) {
   if (result == nullptr) return -1;
   finish_apply(
@@ -3557,7 +3610,8 @@ extern "C" int mine_teleop_chassis_apply_state_v2(
           -1,
           MINE_TELEOP_CHASSIS_APPLY_ISSUE_RUNTIME_UNAVAILABLE);
     }
-    if (steering_values == nullptr || steering_count < 0 ||
+    if ((operator_active != 0 && operator_active != 1) ||
+        steering_values == nullptr || steering_count < 0 ||
         target_gear < 1 || target_gear > 4 || !std::isfinite(target_vx) ||
         target_vx < 0.0 || target_vx > 20.0 || !std::isfinite(target_ax) ||
         target_ax < -1.0 || target_ax > 1.0 || !steering_finite) {
@@ -3584,7 +3638,8 @@ extern "C" int mine_teleop_chassis_apply_state_v2(
         target_vx,
         target_ax,
         steering_values,
-        steering_count);
+        steering_count,
+        operator_active != 0);
     return finish_apply(
         result,
         issue_id == MINE_TELEOP_CHASSIS_APPLY_ISSUE_NONE ? 0 : -3,
@@ -3634,6 +3689,12 @@ extern "C" int mine_teleop_chassis_apply_state_v2(
         -5,
         MINE_TELEOP_CHASSIS_APPLY_ISSUE_INTERNAL_ERROR);
   }
+}
+
+extern "C" int mine_teleop_chassis_apply_state_v2(
+    int gear, double vx, double ax, const double* steering, int count,
+    MineTeleopChassisApplyResultV1* result) {
+  return mine_teleop_chassis_apply_state_v3(gear, vx, ax, steering, count, 0, result);
 }
 
 extern "C" int mine_teleop_chassis_apply_state(

@@ -585,6 +585,26 @@ struct MineTeleopChassisRuntimeControlConfigV2 {
     double motor_torque_rise_rate_nm_per_s;
 };
 
+/* Profile-version-4 snapshot: immutable V2 prefix plus idle parking delay. */
+struct MineTeleopChassisRuntimeControlConfigV3 {
+    uint32_t struct_size;
+    uint32_t profile_version;
+    uint64_t profile_revision;
+    double target_speed_limit_mps;
+    double max_motor_torque_nm;
+    double max_brake_pressure_bar;
+    double max_steering_request;
+    double speed_pid_kp;
+    double speed_pid_ki;
+    double speed_pid_kd;
+    double speed_pid_derivative_filter_tau_ms;
+    int32_t speed_pid_max_dt_ms;
+    uint32_t reserved;
+    double motor_torque_rise_rate_nm_per_s;
+    int32_t parking_idle_timeout_ms;
+    uint32_t parking_reserved;
+};
+
 enum MineTeleopChassisRuntimeControlIssueV1 {
     MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_NONE = 0,
     MINE_TELEOP_CHASSIS_RUNTIME_CONTROL_ISSUE_GENERIC_REJECTED = 1,
@@ -706,6 +726,8 @@ static_assert(
         motor_torque_rise_rate_nm_per_s) ==
     sizeof(MineTeleopChassisRuntimeControlConfigV1));
 static_assert(sizeof(MineTeleopChassisRuntimeControlConfigV2) == 96U);
+static_assert(sizeof(MineTeleopChassisRuntimeControlConfigV3) == 104U);
+static_assert(offsetof(MineTeleopChassisRuntimeControlConfigV3, parking_idle_timeout_ms) == 96U);
 static_assert(sizeof(MineTeleopChassisRuntimeControlResultV1) == 24U);
 #endif
 
@@ -739,6 +761,14 @@ int mine_teleop_chassis_apply_state(
 /* Additive structured-result capability. The legacy apply_state entry point remains
  * available and preserves the same integer result codes. A non-null result is
  * required; it is filled in the same call while the bridge API lock is held. */
+uint32_t mine_teleop_chassis_runtime_control_config_v3_size(void);
+int mine_teleop_chassis_apply_state_v3(
+    int target_gear, double target_vx, double target_ax,
+    const double* steering_values, int steering_count, int operator_active,
+    struct MineTeleopChassisApplyResultV1* result);
+int mine_teleop_chassis_configure_runtime_control_v3(
+    const struct MineTeleopChassisRuntimeControlConfigV3* config,
+    struct MineTeleopChassisRuntimeControlResultV1* result);
 int mine_teleop_chassis_apply_state_v2(
     int target_gear,
     double target_vx,

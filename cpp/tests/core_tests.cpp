@@ -425,7 +425,7 @@ void test_config_loads_current_vehicle_yaml() {
   expect(config.hardware.can_tx_queue_length == 100, "CAN tx queue length mismatch");
   expect_near(
       config.field_safety.full_scale_motor_torque_nm,
-      300.0,
+      640.0,
       1e-9,
       "safe default full-scale motor torque changed");
   expect_near(
@@ -435,7 +435,7 @@ void test_config_loads_current_vehicle_yaml() {
       "safe default motor torque rise shaping changed");
   expect_near(
       config.field_safety.max_brake_pressure_bar,
-      100.0,
+      327.6,
       1e-9,
       "safe default ordinary brake pressure changed");
 }
@@ -1447,12 +1447,16 @@ void test_field_config_pins_tls_route_without_system_dns() {
       "field vehicle time synchronization limit is not 25ms");
   expect_near(
       config.field_safety.max_throttle,
-      0.10,
+      1.0,
       1e-9,
       "field vehicle throttle hard limit changed");
+  expect(config.vehicle_adapter.type == "can" && config.field_safety.max_speed_kph == 10.0,
+      "field defaults must use CAN at 10 km/h");
+  expect(config.vehicle_adapter.bridge_library_path.is_absolute(),
+      "relative bundled bridge path was not resolved against config directory");
   expect_near(
       config.field_safety.full_scale_motor_torque_nm,
-      300.0,
+      640.0,
       1e-9,
       "field vehicle full-scale motor torque changed");
   expect_near(
@@ -1481,7 +1485,7 @@ void test_field_config_pins_tls_route_without_system_dns() {
       "field vehicle hard overspeed margin changed");
   expect_near(
       config.redacted_summary().at("full_scale_motor_torque_nm").get<double>(),
-      300.0,
+      640.0,
       1e-9,
       "effective vehicle config omitted full-scale motor torque");
   expect_near(
@@ -1493,17 +1497,17 @@ void test_field_config_pins_tls_route_without_system_dns() {
       "effective vehicle config omitted motor torque rise shaping");
   expect_near(
       config.field_safety.max_brake_pressure_bar,
-      100.0,
+      327.6,
       1e-9,
       "field vehicle ordinary-brake pressure hard limit changed");
   expect_near(
       config.redacted_summary().at("max_brake_pressure_bar").get<double>(),
-      100.0,
+      327.6,
       1e-9,
       "effective vehicle config omitted ordinary-brake pressure hard limit");
   expect_near(
       config.field_safety.max_steering_angle_deg,
-      5.0,
+      30.0,
       1e-9,
       "field vehicle steering hard limit changed");
   expect(
@@ -2410,6 +2414,7 @@ void test_control_service_receive_path_cannot_bypass_hard_timeout() {
 
 void test_control_service_preserves_physical_brake_across_degraded_timeout() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  config.field_safety.max_brake_pressure_bar = 100.0;
   {
     auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
     auto* adapter_view = adapter.get();
@@ -2744,7 +2749,7 @@ void test_control_service_applies_vehicle_hard_limits() {
   expect_near(limits.at("max_throttle").get<double>(), 0.10, 1e-9, "reported throttle limit mismatch");
   expect_near(
       limits.at("full_scale_motor_torque_nm").get<double>(),
-      300.0,
+      640.0,
       1e-9,
       "reported full-scale motor torque mismatch");
   expect_near(

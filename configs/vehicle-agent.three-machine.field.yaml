@@ -96,13 +96,12 @@ hardware:
 
 field_safety:
   commissioning_mode: bench
-  max_speed_kph: 0
+  max_speed_kph: 10
   # Analog target-speed proportion gate. Session target speed must remain at
   # or below max_speed_kph * max_throttle.
-  max_throttle: 0.10
-  # Vehicle-side per-motor hard request ceiling. 300 Nm is a software default,
-  # not measured vehicle capability; ordinary code is capped at 640.0 Nm.
-  full_scale_motor_torque_nm: 300.0
+  max_throttle: 1.0
+  # Vehicle-side per-motor hard request ceiling, at the software maximum.
+  full_scale_motor_torque_nm: 640.0
   # Optional per-motor rising-torque shaping in Nm/s. Zero disables the extra
   # ramp and applies PID output x the acknowledged session torque limit directly.
   # This is the startup default; since session profile V3 the driver console may
@@ -114,7 +113,6 @@ field_safety:
   # acknowledged per-motor session torque limit. These are schema-valid, bounded
   # placeholders only and have NOT passed isolated CAN bench or vehicle calibration;
   # reduce the session torque limit before re-tuning any previously used gains.
-  # max_speed_kph: 0 plus the mock adapter is the current traction-enable gate.
   speed_feedback_timeout_ms: 200
   speed_pid_kp: 1.0
   speed_pid_ki: 0.2
@@ -122,11 +120,10 @@ field_safety:
   speed_pid_derivative_filter_tau_ms: 100.0
   speed_pid_max_dt_ms: 100
   hard_overspeed_margin_kph: 3.6
-  # Vehicle-side ordinary EHB hard ceiling in physical bar. 100 bar is a
-  # software default, not a calibrated vehicle value. Ordinary code is capped
-  # at 327.6 bar; ESTOP/physical emergency/fault uses 409.5 bar independently.
-  max_brake_pressure_bar: 100.0
-  max_steering_angle_deg: 5.0
+  # Vehicle-side ordinary EHB hard ceiling at the 327.6 bar software maximum.
+  # ESTOP/physical emergency/fault uses 409.5 bar independently.
+  max_brake_pressure_bar: 327.6
+  max_steering_angle_deg: 30.0
   require_can_feedback_before_control: true
   require_local_estop_reset: true
   require_time_sync: true
@@ -145,17 +142,10 @@ upload:
   enabled: false
   backend: local_archive
 
-# This proves network delivery without energizing a chassis. Replace only after
-# a separate CAN/braking safety acceptance has supplied the required evidence.
+# Native CAN adapter; packaged launcher resolves the bundled bridge library.
 vehicle_adapter:
-  type: mock
-
-# For an isolated JYR010 CAN bench, also set max_speed_kph to a positive
-# commissioning value, then replace the vehicle_adapter block above with:
-#
-# vehicle_adapter:
-#   type: can
-#   integration:
-#     chassis_control:
-#       can_interface: can1
-#       bridge_library_path: /opt/mine-teleop/lib/vendor/chassis/libmine_teleop_chassis_bridge.so
+  type: can
+  integration:
+    chassis_control:
+      can_interface: can1
+      bridge_library_path: ../lib/vendor/chassis/libmine_teleop_chassis_bridge.so

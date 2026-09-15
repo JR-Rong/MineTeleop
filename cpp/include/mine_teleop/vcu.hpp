@@ -110,6 +110,18 @@ enum class State {
   Fault,
 };
 
+// Monotonic operator-input timer. Neutral transport heartbeats do not renew it.
+class OperatorIdleParking {
+ public:
+  void reset();
+  void observe(bool active, std::int64_t now_ms);
+  [[nodiscard]] bool expired(std::int64_t now_ms, int timeout_ms) const;
+ private:
+  bool seen_{false};
+  bool active_{false};
+  std::int64_t last_active_ms_{0};
+};
+
 class ParallelController {
  public:
   ParallelController();
@@ -117,6 +129,8 @@ class ParallelController {
   void reset();
   bool set_command(const Command& command);
   bool set_emergency_command(const Command& command);
+  void set_automatic_parking(bool enabled, bool requested, bool stopped_fresh, double brake_bar);
+  [[nodiscard]] bool parking_released() const;
   void emergency_stop();
   void clear_emergency_stop();
   bool request_parallel_handshake();
@@ -142,6 +156,11 @@ class ParallelController {
   bool begin_arming_emergency_disarm();
   void enter(State state);
 
+  std::uint64_t parking_release_generation_{0};
+  bool automatic_parking_{false};
+  bool automatic_park_requested_{true};
+  bool parking_stopped_fresh_{false};
+  double parking_brake_bar_{0.0};
   Command desired_{};
   Command emergency_{};
   Feedback feedback_{};
