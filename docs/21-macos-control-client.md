@@ -81,7 +81,7 @@ cd mine-teleop-control-macos-arm64-*
 - 三机配置通过应用内 `cloud.resolve` 把 `teleop-field.internal:6000` 指向云服务器，
   并用同目录现场根 CA 完整校验 TLS；不会修改系统 hosts，也不依赖代理；
 - 从 `certs/cacert.pem` 提供 CA bundle；
-- 把页面 UTC 事件写入包根目录 `.local/logs/control-browser-events.jsonl`，默认
+- 把页面 UTC 事件写入包根目录 `log/control-browser-events.jsonl`，默认
   单文件 2 MiB、保留当前文件及两个编号备份，凭据类字段写盘前脱敏；
 - `Ctrl-C` 后关闭回环端口并尝试释放活动控制会话。
 
