@@ -1,0 +1,14 @@
+{
+  "name": "矿车 · 模型尺寸待实车标定",
+  "file": "haul-truck.glb",
+  "scale": 0.01,
+  "rotation_deg": [0, 0, 0],
+  "offset_m": [0, 0, 0],
+  "camera": {
+    "stopSpeed": 0.05,
+    "moveSpeed": 0.08,
+    "settleMs": 300,
+    "resumeMs": 5000,
+    "staleMs": 500
+  }
+}

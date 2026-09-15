@@ -153,6 +153,12 @@ if (($CurlPortVersion -split "#")[0] -ne $ExpectedCurlPortVersion) {
 }
 
 $CmakeArchitecture = if ($Architecture -eq "arm64") { "ARM64" } else { "x64" }
+# Match the dependency triplet's CRT linkage (ARM64 uses the static CRT).
+$MsvcRuntime = if ($Triplet.EndsWith("-static")) {
+  'MultiThreaded$<$<CONFIG:Debug>:Debug>'
+} else {
+  'MultiThreaded$<$<CONFIG:Debug>:Debug>DLL'
+}
 New-Item -ItemType Directory -Path $BuildDirectory -Force | Out-Null
 
 Write-Host "==> Configuring Windows control client (architecture=$Architecture, triplet=$Triplet)"
@@ -163,6 +169,7 @@ Invoke-CheckedCommand -Command "cmake" -CommandArguments @(
   "-A", $CmakeArchitecture,
   "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain",
   "-DVCPKG_TARGET_TRIPLET=$Triplet",
+  "-DCMAKE_MSVC_RUNTIME_LIBRARY=$MsvcRuntime",
   "-DVCPKG_APPLOCAL_DEPS=ON",
   "-DMINE_TELEOP_CURL_LINKAGE=$ExpectedCurlLinkage",
   "-DMINE_TELEOP_BUILD_CONTROL_CLIENT=ON",
@@ -246,9 +253,16 @@ New-Item -ItemType Directory -Path (Join-Path $PackageRoot "bin") -Force | Out-N
 New-Item -ItemType Directory -Path (Join-Path $PackageRoot "config") -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $PackageRoot "protocol\v1") -Force | Out-Null
 
+Copy-Item -LiteralPath (Join-Path $RepoRoot "cpp\web\assets") -Destination (Join-Path $PackageRoot "assets") -Recurse
 Copy-Item -LiteralPath $Executable -Destination (Join-Path $PackageRoot "bin")
 Get-ChildItem -LiteralPath $ConfigurationDirectory -Filter "*.dll" -File | ForEach-Object {
   Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $PackageRoot "bin")
+}
+# CMake collects these from the selected MSVC toolchain, not the host System32.
+foreach ($RuntimeName in @("vcruntime140.dll", "msvcp140.dll")) {
+  if (-not (Test-Path -LiteralPath (Join-Path $PackageRoot "bin\$RuntimeName") -PathType Leaf)) {
+    throw "Missing app-local compiler runtime: $RuntimeName"
+  }
 }
 Copy-Item -LiteralPath (Join-Path $RepoRoot "configs\driver-console.three-machine.dev.yaml") `
   -Destination (Join-Path $PackageRoot "config\driver-console.yaml")

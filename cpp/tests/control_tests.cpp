@@ -932,9 +932,14 @@ void test_control_page_contract() {
           response.body.find("offeredCameraByMid.get(mid)") != std::string::npos,
       "browser camera IDs are not mapped from the SDP video mids");
   expect(
-      response.body.find("srcObject=new MediaStream([track])") != std::string::npos &&
+      response.body.find("srcObject = new MediaStream([track])") != std::string::npos &&
           response.body.find("attach(id,e.track)") != std::string::npos,
       "browser video elements are not isolated to their individual WebRTC tracks");
+  expect(
+      response.body.find("cameraView.configure(remoteCameraIds)") != std::string::npos &&
+          response.body.find("if(peer!==nextPeer||e.track.kind!=='video')return") != std::string::npos &&
+          response.body.find("MineTeleopCameraView.mount(cameraGrid)") != std::string::npos,
+      "camera slots must be declared before tracks and reject callbacks from old peers");
   const auto ontrack_handler = response.body.find("nextPeer.ontrack=e=>");
   const auto remote_description = response.body.find("await nextPeer.setRemoteDescription", ontrack_handler);
   expect(
@@ -3526,6 +3531,54 @@ void test_failed_logout_keeps_retryable_local_authority() {
   expect(status.value("connected", false), "failed logout falsely reported the server session as released");
 }
 
+void test_web_login_selects_identity_and_requires_logout_to_switch() {
+  mine_teleop::SignalingServerConfig signaling_config;
+  signaling_config.driver_passwords = {{"driver-a", "secret-a"}, {"driver-b", "secret-b"}};
+  signaling_config.device_tokens = {{"vehicle-a", "device-a"}, {"vehicle-b", "device-b"}};
+  signaling_config.driver_vehicle_permissions = {{"driver-a", {"vehicle-a"}}, {"driver-b", {"vehicle-b"}}};
+  auto signaling = std::make_shared<mine_teleop::SignalingService>(std::move(signaling_config));
+  mine_teleop::SimpleHttpServer server("127.0.0.1", 0,
+      [signaling](const auto& request) { return signaling->handle(request); });
+  server.start();
+  mine_teleop::DriverConfig config;
+  config.signaling_url = "http://127.0.0.1:" + std::to_string(server.port());
+  allow_qemu_test_scheduler_time_sync(config);
+  auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(config, "vehicle-a", "");
+  mine_teleop::DriverConsoleHttpApp app(runtime);
+  auto login = [&](const mine_teleop::Json& body) {
+    mine_teleop::HttpRequest request;
+    request.method = "POST";
+    request.path = "/api/login";
+    request.body = body.dump();
+    return app.handle(request);
+  };
+  expect(!runtime->status().value("authenticated", true), "fresh console auto-authenticated");
+  expect(login({{"password", "secret-a"}}).status == 400, "web login accepted missing driver ID");
+  expect(login({{"driver_id", "driver-a"}}).status == 400, "web login accepted missing password");
+  expect(login({{"driver_id", "driver-a"}, {"password", "wrong"}}).status == 401, "wrong password was accepted");
+  expect(!runtime->status().value("authenticated", true), "failed login installed authority");
+  const auto first = login({{"driver_id", "driver-a"}, {"password", "secret-a"}});
+  expect(first.status == 200, "page credentials could not log in without configured identity");
+  const auto a = mine_teleop::Json::parse(first.body);
+  expect(a.at("driver_id") == "driver-a" && a.at("vehicles").size() == 1 &&
+      a.at("vehicles")[0].at("vehicle_id") == "vehicle-a", "first identity received wrong permissions");
+  expect(login({{"driver_id", "driver-b"}, {"password", "secret-b"}}).status == 409,
+      "authenticated console allowed an identity switch without logout");
+  expect(runtime->status().at("driver_id") == "driver-a", "rejected switch mutated active identity");
+  static_cast<void>(runtime->disconnect());
+  bool cached_login_rejected = false;
+  try { static_cast<void>(runtime->login()); } catch (const std::invalid_argument&) { cached_login_rejected = true; }
+  expect(cached_login_rejected, "logout retained the previous password for automatic login");
+  const auto second = login({{"driver_id", "driver-b"}, {"password", "secret-b"}});
+  expect(second.status == 200, "logout did not allow a new driver ID");
+  const auto b = mine_teleop::Json::parse(second.body);
+  expect(b.at("driver_id") == "driver-b" && b.at("vehicles").size() == 1 &&
+      b.at("vehicles")[0].at("vehicle_id") == "vehicle-b", "new identity inherited previous permissions");
+  expect(runtime->config().driver_id.empty(), "page login mutated persistent configuration");
+  static_cast<void>(runtime->disconnect());
+  server.stop();
+}
+
 void test_local_proxy_preserves_upstream_auth_status() {
   mine_teleop::SignalingServerConfig signaling_config;
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
@@ -4247,25 +4300,27 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
   native_command.driver_id = "driver-console-001";
   native_command.session_id = session_id;
   native_command.seq = 1;
-  native_command.sent_at_utc_ms = mine_teleop::now_ms();
+  // Simulate a command prepared before its signaling envelope is constructed.
+  native_command.sent_at_utc_ms = mine_teleop::now_ms() - 10;
   native_command.gear = "N";
   native_command.control_token = session.at("control_token").get<std::string>();
   auto native_payload = native_command.to_json();
   native_payload["intent_seq"] = 1;
   native_payload["intent_fresh"] = true;
+  auto native_request = signaling_request_for(
+      session_id,
+      1,
+      "vehicle-001",
+      "driver-console-001",
+      "driver-console-001",
+      "vehicle-001",
+      "token",
+      token,
+      "control_command",
+      native_payload);
+  native_request["sent_at_utc_ms"] = native_command.sent_at_utc_ms;
   const auto native_control_ack = http.post_json_response(
-      base + "/signaling/" + session_id + "/messages",
-      signaling_request_for(
-          session_id,
-          1,
-          "vehicle-001",
-          "driver-console-001",
-          "driver-console-001",
-          "vehicle-001",
-          "token",
-          token,
-          "control_command",
-          native_payload));
+      base + "/signaling/" + session_id + "/messages", native_request);
   const auto native_control_cursor =
       native_control_ack.at("delivery_cursor").get<std::uint64_t>();
   const auto native_control_websocket_url =
@@ -5998,6 +6053,7 @@ int main() {
       {"two_driver_two_vehicle_wss_isolation_and_safe_rejection",
        test_two_driver_two_vehicle_wss_isolation_and_safe_rejection},
       {"failed_logout_keeps_retryable_local_authority", test_failed_logout_keeps_retryable_local_authority},
+      {"web_login_selects_identity_and_requires_logout_to_switch", test_web_login_selects_identity_and_requires_logout_to_switch},
       {"local_proxy_preserves_upstream_auth_status", test_local_proxy_preserves_upstream_auth_status},
       {"control_authority_lease_renews_without_rotating_token",
        test_control_authority_lease_renews_without_rotating_token},

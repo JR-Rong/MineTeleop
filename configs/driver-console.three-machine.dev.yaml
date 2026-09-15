@@ -1,5 +1,4 @@
-driver:
-  id: driver-console-001
+# Driver ID and password are entered on the login page.
 
 cloud:
   signaling_url: wss://teleop-field.internal:6000/signaling
@@ -15,7 +14,9 @@ logging:
   control_trace_commands: true
 
 ui:
-  default_layout: grid_4
+  default_layout: grid_6
+  scene_enabled: true
+  scene_manifest: models/haul-truck/model.json
   show_debug_overlay: true
 
 control:

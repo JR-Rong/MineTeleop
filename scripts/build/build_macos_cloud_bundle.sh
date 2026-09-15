@@ -58,6 +58,7 @@ docker buildx build \
   --build-arg "MINE_TELEOP_BUILD_JOBS=$build_jobs" \
   --build-arg "MINE_TELEOP_BUILD_TESTS=$run_tests" \
   --build-arg "MINE_TELEOP_SOURCE_COMMIT=$source_commit" \
+  --build-arg "MINE_TELEOP_RELEASE_VERSION=${MINE_TELEOP_RELEASE_VERSION:-0.2.0}" \
   --build-arg "MINE_TELEOP_BUILT_AT_UTC=$built_at_utc" \
   --build-arg "MINE_TELEOP_TARGET_PLATFORM=$platform" \
   --target artifact \

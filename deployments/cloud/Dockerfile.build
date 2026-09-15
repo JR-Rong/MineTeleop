@@ -52,6 +52,7 @@ RUN cmake -S . -B /tmp/mine-teleop-cloud-build \
 
 FROM build AS bundle
 
+ARG MINE_TELEOP_RELEASE_VERSION=0.2.0
 ARG MINE_TELEOP_SOURCE_COMMIT=unknown
 ARG MINE_TELEOP_BUILT_AT_UTC=unknown
 ARG MINE_TELEOP_TARGET_PLATFORM=linux/amd64
@@ -106,6 +107,7 @@ RUN set -eu; \
     if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then tests_executed=yes; fi; \
     printf '%s\n' \
       "source_commit=$MINE_TELEOP_SOURCE_COMMIT" \
+      "release_version=$MINE_TELEOP_RELEASE_VERSION" \
       "target_platform=$MINE_TELEOP_TARGET_PLATFORM" \
       "build_type=Release" \
       "runtime=ubuntu22.04-self-contained" \

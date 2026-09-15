@@ -305,6 +305,13 @@ pipeline。控制端按车端 offer 中实际声明的轨道逐路渲染，云�
 信令，不决定路数。当前没有“控制端临时勾选部分轨道”的运行时协商；增减路数需要
 修改车端配置并重启车端媒体会话。
 
+相机 ID 采用 `fish_front`、`fish_rear`、`fish_left`、`fish_right` 与
+`drive_front`、`drive_rear`、`drive_left`、`drive_right`。最后两路驾驶视角可按需添加；
+不要求凑齐六路。ID 非空且在车辆配置中唯一（包括禁用条目）；旧的自定义 ID 仍兼容。
+控制端使用中文名称与固定排序，详见 [相机身份与布局](console-3d-layout.md#相机身份排序与缺帧显示)。
+只需修改对应相机的 `id`，保留现场确认的 `device`、采集参数、`enabled` 和
+`critical_for_control`；不要因为重命名而交换设备方向或降低安全要求。
+
 `cameras[].enabled` 和 `cameras[].critical_for_control` 必须写成 YAML/TOML boolean
 `true`/`false`，不能用带引号字符串。`critical_for_control` 默认 `true`，所以已有
 配置在升级后继续采用保守的安全语义；只有确实允许缺失且不影响驾驶视野的辅助相机
@@ -600,9 +607,10 @@ ChassisControl `chassis_control` 动态库；MinePilot `include/can/can_common.h
 
 ## 驾驶端配置示例
 
+控制台启动后，在网页填写驾驶员 ID 和密码。旧配置的 `driver.id` 仅保留为原生开发接口兼容项；网页 `/api/login` 必须同时提交两个字段，不使用默认密码。退出成功后清除内存密码；切换账号必须先退出，网络故障导致退出失败时保留原身份供重试。
+
 ```yaml
-driver:
-  id: driver-console-001
+# 驾驶员 ID 和密码在登录页输入，不需要写入配置。
 
 cloud:
   auth_url: https://teleop.example.com/auth
@@ -822,3 +830,7 @@ fps/低分辨率 profile，pipeline hook 成功后才更新活动状态。
 断链/故障/会话替换时立即清除并恢复车端默认 PID。
 目标媒体主循环仍需在 Ubuntu 工控机端到端验证。
 - 安全停车策略。
+
+### 控制端 3D 资源
+
+`ui.scene_enabled` 默认 `true`；`ui.scene_manifest` 默认 `models/haul-truck/model.json`；可选 `ui.assets_root` 相对控制端 YAML 目录解析。资源随离线包交付，模型替换和坐标约定见 [控制端三列布局与可替换自车模型](console-3d-layout.md)。

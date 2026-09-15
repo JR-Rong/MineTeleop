@@ -1,0 +1,16 @@
+{
+  "name": "mine-teleop-console-visuals",
+  "private": true,
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node ../tests/scene_state.test.mjs"
+  },
+  "dependencies": { "three": "0.186.0" },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "@gltf-transform/core": "4.5.0",
+    "@gltf-transform/functions": "4.5.0",
+    "meshoptimizer": "1.2.0",
+    "sharp": "0.35.4"
+  }
+}

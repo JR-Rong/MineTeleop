@@ -1,0 +1,23 @@
+{
+  "source": "carcz(1).fbx",
+  "source_sha256": "afeb6fe8f74c70062ba6a5135dce157845c3c63ad958f05f5aa763c541124fae",
+  "source_bytes": 90938620,
+  "output_bytes": 14551632,
+  "input_triangles": 989234,
+  "output_triangles": 178062,
+  "source_bounds": {
+    "min": [
+      -22.653500735759735,
+      -0.000004193009990509363,
+      -55.5381034935127
+    ],
+    "max": [
+      23.238399624824524,
+      46.21740404480595,
+      55.752801895141445
+    ]
+  },
+  "base_color_max_pixels": 2048,
+  "normal_max_pixels": 1024,
+  "simplification_error": 0.002
+}

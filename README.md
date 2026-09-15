@@ -7,6 +7,8 @@ and camera bridge entry points do not require Python.
 
 ## Guides
 
+- [CI 与自动发布](docs/ci-release.md)：平台矩阵、A.B.C 版本规则、测试包与正式 Release；
+
 - [编译教程](docs/BUILD.md)：从源码生成云端、控制端和车端安装包；
 - [部署教程](docs/DEPLOY.md)：凭据准备、三端安装、启动、验收和回滚；
 - [测试与验收](docs/11-testing-and-validation.md)：自动化测试和硬件验收边界。

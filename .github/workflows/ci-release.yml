@@ -1,0 +1,424 @@
+name: Build and release
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    name: Plan A.B.C version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/release_version.py
+
+  build-windows:
+    needs: version
+    env:
+      MINE_TELEOP_RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      TARGET_ARCH: ${{ matrix.arch }}
+    name: Control Windows ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            arch: x64
+          - runner: windows-11-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out MineTeleop
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Read pinned Windows dependencies
+        id: windows-dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $lock = Get-Content -LiteralPath packaging/windows/dependencies.lock.json -Raw | ConvertFrom-Json
+          if ([string]::IsNullOrWhiteSpace([string]$lock.vcpkg_commit)) {
+            throw "Windows dependency lock does not contain vcpkg_commit"
+          }
+          "vcpkg_commit=$($lock.vcpkg_commit)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Check out pinned vcpkg
+        uses: actions/checkout@v7
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ steps.windows-dependencies.outputs.vcpkg_commit }}
+          path: .vcpkg
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        env:
+          VCPKG_DISABLE_METRICS: "1"
+          VCPKG_COMMIT: ${{ steps.windows-dependencies.outputs.vcpkg_commit }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $actualCommit = git -C .vcpkg rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $actualCommit -ne $env:VCPKG_COMMIT) {
+            throw "Expected vcpkg $env:VCPKG_COMMIT, got $actualCommit"
+          }
+
+          & .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg bootstrap failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Prepare vcpkg binary cache
+        shell: pwsh
+        run: |
+          $cacheDirectory = Join-Path $env:RUNNER_TEMP "vcpkg-binary-cache"
+          New-Item -ItemType Directory -Path $cacheDirectory -Force | Out-Null
+          "VCPKG_DEFAULT_BINARY_CACHE=$cacheDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}\vcpkg-binary-cache
+          key: vcpkg-windows-${{ matrix.arch }}-${{ hashFiles('packaging/windows/dependencies.lock.json') }}-control-v2
+
+      - name: Build Windows bundle and verify embedded dependencies
+        shell: pwsh
+        env:
+          VCPKG_DISABLE_METRICS: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\scripts\build\build_windows_control_bundle.ps1 `
+            -Architecture $env:TARGET_ARCH `
+            -VcpkgRoot .\.vcpkg
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows control bundle build failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Set up desktop build tools
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Build independent Chromium desktop window
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm ci --prefix desktop
+          if ($LASTEXITCODE -ne 0) { throw "Desktop dependency install failed" }
+          $nativeRoots = @(Get-ChildItem -LiteralPath dist -Directory -Filter "mine-teleop-control-windows-$env:TARGET_ARCH-*")
+          if ($nativeRoots.Count -ne 1) { throw "Expected exactly one native bundle" }
+          $env:MINE_TELEOP_TEST_NATIVE_ROOT = $nativeRoots[0].FullName
+          node --test desktop/test/native-controller.test.cjs desktop/test/native-process.test.cjs
+          if ($LASTEXITCODE -ne 0) { throw "Desktop lifecycle tests failed" }
+          node scripts/build/build_desktop_control_bundle.mjs --platform win32 --arch $env:TARGET_ARCH --native-root $nativeRoots[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw "Desktop packaging failed" }
+
+      - name: Verify packaged checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archives = @(Get-ChildItem -LiteralPath dist -Filter "mine-teleop-control-windows-$env:TARGET_ARCH-*.zip" -File)
+          if ($archives.Count -ne 1) {
+            throw "Expected one Windows ZIP, found $($archives.Count)"
+          }
+
+          $checksumPath = "$($archives[0].FullName).sha256"
+          if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) {
+            throw "Missing checksum file: $checksumPath"
+          }
+
+          $expectedHash = ((Get-Content -LiteralPath $checksumPath -Raw).Trim() -split "\s+")[0].ToLowerInvariant()
+          $actualHash = (Get-FileHash -LiteralPath $archives[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expectedHash -ne $actualHash) {
+            throw "SHA-256 mismatch for $($archives[0].Name)"
+          }
+
+      - name: Upload Windows ZIP and SHA-256
+        uses: actions/upload-artifact@v7
+        with:
+          name: bundle-control-windows-${{ matrix.arch }}
+          path: |
+            dist/desktop/MineTeleop-win32-${{ matrix.arch }}.zip
+            dist/desktop/MineTeleop-win32-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  build-unix-control:
+    needs: version
+    env:
+      MINE_TELEOP_RELEASE_VERSION: ${{ needs.version.outputs.version }}
+    name: Control ${{ matrix.platform }} ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: darwin
+            arch: arm64
+          - runner: ubuntu-22.04
+            platform: linux
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: docker/setup-buildx-action@v4
+        if: matrix.platform == 'linux'
+      - name: Select Xcode with C++20 stop-token support
+        if: matrix.platform == 'darwin'
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+      - name: Install Linux packaging dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            patchelf libgtk-3-0 libnss3 libnspr4 libasound2 libgbm1 libcurl4 libssl3
+      - name: Build and test native control client
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          MINE_TELEOP_MACOS_ARCH: ${{ matrix.arch }}
+          MINE_TELEOP_BUILD_JOBS: '3'
+        run: |
+          if [[ "$TARGET_PLATFORM" == darwin ]]; then
+            scripts/build/build_macos_control_bundle.sh test | tee "$RUNNER_TEMP/native-build.log"
+            native_root=$(sed -n 's/^macos_control_bundle_root=//p' "$RUNNER_TEMP/native-build.log")
+          else
+            scripts/build/build_ubuntu_control_bundle.sh test linux/amd64 | tee "$RUNNER_TEMP/native-build.log"
+            native_root=$(sed -n 's/^BUNDLE_DIR=//p' "$RUNNER_TEMP/native-build.log")
+          fi
+          test -x "$native_root/bin/mine-teleop-control"
+          echo "MINE_TELEOP_TEST_NATIVE_ROOT=$native_root" >> "$GITHUB_ENV"
+      - name: Test lifecycle and package Chromium desktop
+        env:
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          npm ci --prefix desktop
+          node --test desktop/test/native-controller.test.cjs desktop/test/native-process.test.cjs
+          node scripts/build/build_desktop_control_bundle.mjs \
+            --platform "$TARGET_PLATFORM" --arch "$TARGET_ARCH" \
+            --native-root "$MINE_TELEOP_TEST_NATIVE_ROOT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bundle-control-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            dist/desktop/*.zip
+            dist/desktop/*.zip.sha256
+            dist/desktop/*.tar.gz
+            dist/desktop/*.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  build-cloud:
+    needs: version
+    env:
+      MINE_TELEOP_RELEASE_VERSION: ${{ needs.version.outputs.version }}
+    name: Cloud Ubuntu 22.04 x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Build, test and verify standalone cloud package
+        run: scripts/build/build_macos_cloud_bundle.sh test linux/amd64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bundle-cloud-linux-x64
+          path: |
+            dist/mine-teleop-cloud-*.tar.gz
+            dist/mine-teleop-cloud-*.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  build-vehicle:
+    needs: version
+    env:
+      MINE_TELEOP_RELEASE_VERSION: ${{ needs.version.outputs.version }}
+    outputs:
+      complete_bundle: ${{ steps.vehicle-package.outputs.complete }}
+    name: Vehicle Ubuntu 22.04 x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Enable approved complete vehicle packaging
+        id: vehicle-inputs
+        if: vars.VEHICLE_RUNTIME_PUBLIC == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          CHASSIS_KEY: ${{ secrets.CHASSIS_CONTROL_READ_KEY }}
+          MINEPILOT_KEY: ${{ secrets.MINEPILOT_READ_KEY }}
+        run: |
+          if [[ -z "$CHASSIS_KEY" || -z "$MINEPILOT_KEY" ]]; then
+            echo "::error::Complete vehicle packaging needs CHASSIS_CONTROL_READ_KEY and MINEPILOT_READ_KEY read-only deploy keys."
+            exit 1
+          fi
+          python3 - <<'PYTHON'
+          import json, os, re
+          lock = json.load(open('packaging/vehicle/dependencies.lock.json'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key in ('chassis_control_commit', 'minepilot_commit'):
+                  value = lock[key]
+                  if not re.fullmatch('[0-9a-f]{40}', value):
+                      raise ValueError('Vehicle dependencies must be pinned to full commit SHAs')
+                  output.write(f'{key}={value}\n')
+              output.write('enabled=true\n')
+          PYTHON
+      - name: Compile vehicle and run CTest without proprietary runtime
+        if: steps.vehicle-inputs.outputs.enabled != 'true'
+        run: |
+          docker buildx build --platform linux/amd64 \
+            --build-arg MINE_TELEOP_BUILD_TESTS=ON \
+            --build-arg MINE_TELEOP_BUILD_JOBS=3 \
+            --target build --output type=cacheonly \
+            -f deployments/cpp/Dockerfile.build .
+      - name: Check out pinned chassis headers
+        if: steps.vehicle-inputs.outputs.enabled == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: JR-Rong/ChassisControl
+          ref: ${{ steps.vehicle-inputs.outputs.chassis_control_commit }}
+          ssh-key: ${{ secrets.CHASSIS_CONTROL_READ_KEY }}
+          persist-credentials: false
+          path: .ci-deps/ChassisControl
+          sparse-checkout: include
+      - name: Check out pinned chassis runtime
+        if: steps.vehicle-inputs.outputs.enabled == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: JR-Rong/MinePilot
+          ref: ${{ steps.vehicle-inputs.outputs.minepilot_commit }}
+          ssh-key: ${{ secrets.MINEPILOT_READ_KEY }}
+          persist-credentials: false
+          path: .ci-deps/MinePilot
+          sparse-checkout: libchassis_control.so
+          sparse-checkout-cone-mode: false
+      - name: Build and strictly verify complete vehicle package
+        id: vehicle-package
+        if: steps.vehicle-inputs.outputs.enabled == 'true'
+        env:
+          MINE_TELEOP_CHASSIS_CONTROL_ROOT: ${{ github.workspace }}/.ci-deps/ChassisControl
+          MINE_TELEOP_CHASSIS_CONTROL_LIBRARY: ${{ github.workspace }}/.ci-deps/MinePilot/libchassis_control.so
+        run: |
+          scripts/build/build_cpp_ubuntu_bundle.sh test linux/amd64
+          echo 'complete=true' >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        if: steps.vehicle-package.outputs.complete == 'true'
+        with:
+          name: bundle-vehicle-linux-x64
+          path: |
+            dist/mine-teleop-vehicle-*.tar.gz
+            dist/mine-teleop-vehicle-*.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Report missing private runtime setup
+        if: steps.vehicle-inputs.outputs.enabled != 'true'
+        run: echo '::notice::Vehicle source/tests were built. Complete vehicle packaging and formal releases await approved private runtime access/publication setup.'
+
+  validate-release:
+    name: Validate release inventory
+    needs: [version, build-windows, build-unix-control, build-cloud, build-vehicle]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Test publication guards
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py' -v
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bundle-*
+          path: downloaded
+      - name: Validate hashes, architectures and source commits
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          COMPLETE_VEHICLE: ${{ needs.build-vehicle.outputs.complete_bundle }}
+          FORMAL_RELEASE: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+        run: |
+          arguments=()
+          if [[ "$FORMAL_RELEASE" == true || "$COMPLETE_VEHICLE" == true ]]; then
+            arguments+=(--require-vehicle)
+          fi
+          python3 scripts/ci/prepare_release.py downloaded release \
+            --commit "$SOURCE_COMMIT" --version "$RELEASE_VERSION" --run-id "$GITHUB_RUN_ID" "${arguments[@]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: validated-release
+          path: release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    name: Publish main release and tag
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: validate-release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: validated-release
+          path: release
+      - name: Upload draft, verify remote assets, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/publish_release.py release

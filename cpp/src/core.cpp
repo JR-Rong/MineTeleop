@@ -1838,9 +1838,13 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
 
   const auto cameras = root["cameras"];
   if (!cameras || !cameras.IsSequence()) throw std::runtime_error("cameras must be a list");
+  std::unordered_set<std::string> camera_ids;
   for (const auto& node : cameras) {
     CameraConfig camera;
     camera.id = required<std::string>(node, "id", "camera");
+    if (camera.id.empty() || !camera_ids.insert(camera.id).second) {
+      throw std::runtime_error("camera id must be non-empty and unique: " + camera.id);
+    }
     camera.enabled = optional<bool>(node, "enabled", true);
     camera.critical_for_control = optional<bool>(node, "critical_for_control", true);
     camera.reopen_attempts = optional<int>(node, "reopen_attempts", 3);
