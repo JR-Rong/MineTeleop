@@ -94,15 +94,24 @@ channels with the direct pressure quantized to 0.1 bar. No
 traction, stale/invalid speed, non-Ready state, a gear mismatch, or an abnormal
 PID interval likewise resets the PID and commands zero traction.
 
-The DBC defines every MCU torque request at 0.1 Nm resolution over
-`[-800, 838.3] Nm`. The ordinary-driving symmetric code ceiling is
-`min(800 * 0.8, 838.3 * 0.8)`, quantized toward zero to `640.0 Nm` per motor.
-The vehicle and controller defaults are `300 Nm` per motor. The symmetric cap
-is exactly 80% of the reverse bound and about 76.34% of the forward bound.
-Recalculate migrated limits and repeat isolated bench calibration before using
-a real adapter; these are CAN request limits, not measured motor or wheel
-torque. The field template's PID gains are schema-bounded placeholders, not
-vehicle calibration.
+The bridge uses `JYR010_DBC_VCU_20260916.dbc`: all eight MCU torque
+requests and actual-torque feedback use 16 bits, 0.1 Nm resolution and a
+-3200 Nm offset (wire range `[-3200, 3353.5] Nm`). Physical zero is raw
+`32000` (`00 7D` little-endian), including standby, braking and disarm.
+The ordinary-driving symmetric ceiling remains **640.0 Nm per motor** and
+the bridge fallback remains **300 Nm**. The field vehicle template retains
+**640 Nm**, with the controller initially using half the reported vehicle
+limit. This protocol change does not raise any configured request limits.
+These are CAN request limits, not measured motor or wheel torque. The field template's PID gains are
+schema-bounded placeholders, not vehicle calibration.
+
+The new DBC's MCU02 request still declares the old min/max metadata, despite
+its updated 16-bit width and -3200 offset. The accompanying 20260916 Excel
+also retains old torque definitions. Encoding follows the DBC width/factor/
+offset; the retained 640 Nm cap stays within even that old declared range.
+Resolve those document discrepancies before increasing the driving limits.
+This bridge requires the matching 20260916 VCU protocol; it does not
+auto-detect or support the old torque encoding.
 
 The DBC defines each EHB01/EHB02 pressure request as a 12-bit value at 0.1 bar
 resolution over `0..409.5 bar`. The ordinary-driving code ceiling is 80%, or
@@ -191,7 +200,7 @@ Validate before service startup:
   --adapter-status
 ```
 
-The bridge uses SocketCAN on Linux and the repository-owned JYR010 20260714
+The bridge uses SocketCAN on Linux and the repository-owned JYR010 20260916
 codec. ChassisControl supplies steering and braking calculations; the bridge
 owns direct traction torque and CAN encoding. It does not use MinePilot's
 older generated CAN codec at runtime.

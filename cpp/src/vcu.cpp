@@ -157,7 +157,7 @@ bool command_valid(const Command& command) {
          std::isfinite(command.vehicle_speed_request_kph) &&
          command.vehicle_speed_request_kph >= 0.0 &&
          command.vehicle_speed_request_kph <= 255.0 &&
-         all_finite_in_range(command.motor_torque_nm, -800.0, 838.3) &&
+         all_finite_in_range(command.motor_torque_nm, kMotorTorqueMinimumNm, kMotorTorqueMaximumNm) &&
          all_finite_in_range(command.motor_speed_rpm, -8000.0, 8383.0) &&
          all_finite_in_range(command.steering_angle_deg, -30.0, 30.0) &&
          all_finite_in_range(command.steering_speed_degps, 0.0, 255.0) &&
@@ -173,7 +173,9 @@ CanFrame make_motor_frame(
   CanFrame frame{kMotorCommandIds[index]};
   insert_signal(frame, 0, 3, static_cast<std::uint64_t>(command));
   insert_signal(frame, 3, 3, static_cast<std::uint64_t>(mode));
-  insert_signal(frame, 8, 14, encode_physical(torque_nm, 0.1, -800.0, 14, -800.0, 838.3));
+  insert_signal(frame, 8, kMotorTorqueBits, encode_physical(
+      torque_nm, kMotorTorqueResolutionNm, kMotorTorqueMinimumNm,
+      kMotorTorqueBits, kMotorTorqueMinimumNm, kMotorTorqueMaximumNm));
   insert_signal(frame, 24, 14, encode_physical(speed_rpm, 1.0, -8000.0, 14, -8000.0, 8383.0));
   return frame;
 }
@@ -532,7 +534,8 @@ bool ParallelController::ingest(const CanFrame& frame) {
     feedback_.motor_speed_valid[motor_status01_index] =
         extract_signal(frame, 15, 1) == 1U;
     feedback_.motor_torque_nm[motor_status01_index] =
-        decode_physical(extract_signal(frame, 16, 14), 0.1, -800.0);
+        decode_physical(extract_signal(frame, 16, kMotorTorqueBits),
+                        kMotorTorqueResolutionNm, kMotorTorqueMinimumNm);
     feedback_.motor_torque_valid[motor_status01_index] = true;
     return true;
   }

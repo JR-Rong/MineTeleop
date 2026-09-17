@@ -8,8 +8,8 @@
 
 #define MINE_TELEOP_CHASSIS_DEFAULT_FULL_SCALE_MOTOR_TORQUE_NM 300.0
 #define MINE_TELEOP_CHASSIS_MAX_FULL_SCALE_MOTOR_TORQUE_NM 640.0
-#define MINE_TELEOP_CHASSIS_MIN_DBC_MOTOR_TORQUE_NM -800.0
-#define MINE_TELEOP_CHASSIS_MAX_DBC_MOTOR_TORQUE_NM 838.3
+#define MINE_TELEOP_CHASSIS_MIN_DBC_MOTOR_TORQUE_NM -3200.0
+#define MINE_TELEOP_CHASSIS_MAX_DBC_MOTOR_TORQUE_NM 3353.5
 #define MINE_TELEOP_CHASSIS_MOTOR_TORQUE_RESOLUTION_NM 0.1
 #define MINE_TELEOP_CHASSIS_DEFAULT_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND 0.0
 #define MINE_TELEOP_CHASSIS_MAX_MOTOR_TORQUE_RISE_RATE_NM_PER_SECOND 32000.0
@@ -390,7 +390,7 @@ struct MineTeleopChassisStopContextV1 {
 
 struct MineTeleopChassisFeedback {
     int shake_hand_status;
-    /* 20260714 forwarded EPB values: 0=hold, 1=release, 2=park. */
+    /* 20260916 forwarded EPB values: 0=hold, 1=release, 2=park. */
     int epb_status[4];
     int gear_status;
     int mcu_mode[8];

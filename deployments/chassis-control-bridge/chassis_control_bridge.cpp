@@ -43,6 +43,11 @@ bool Initialize(const VehicleParam& vehicle, const std::string& can_channel);
 
 namespace {
 
+static_assert(MINE_TELEOP_CHASSIS_MIN_DBC_MOTOR_TORQUE_NM ==
+              mine_teleop::vcu::kMotorTorqueMinimumNm);
+static_assert(MINE_TELEOP_CHASSIS_MAX_DBC_MOTOR_TORQUE_NM ==
+              mine_teleop::vcu::kMotorTorqueMaximumNm);
+
 using Clock = std::chrono::steady_clock;
 using mine_teleop::vcu::CanFrame;
 using mine_teleop::vcu::Command;
@@ -580,7 +585,7 @@ class ProtocolLogger {
 
     std::ostringstream details;
     details << "\"can_interface\":\"" << can_interface
-            << "\",\"protocol\":\"JYR010_VCU_20260714\""
+            << "\",\"protocol\":\"JYR010_VCU_20260916\""
             << ",\"tx_period_ms\":" << mine_teleop::vcu::kTransmitPeriodMs
             << ",\"feedback_timeout_ms\":"
             << static_cast<int>(kFeedbackTimeoutSeconds * 1000.0)
@@ -1631,8 +1636,8 @@ class BridgeRuntime {
       frame = CanFrame{motor_torque_ids[index]};
       // The compatibility ABI has no torque field. Inject a physical zero
       // rather than reusing an unobservable commanded value.
-      frame.data[2] = 0x40;
-      frame.data[3] = 0x1F;
+      frame.data[2] = 0x00;
+      frame.data[3] = 0x7D;
       ingest_locked(frame);
     }
 
@@ -2694,7 +2699,8 @@ class BridgeRuntime {
         max_positive_torque = std::max(max_positive_torque, feedback.motor_torque_nm[index]);
       }
     }
-    telemetry_.throttle_feedback = clamp_value(max_positive_torque / 838.3, 0.0, 1.0);
+    telemetry_.throttle_feedback = clamp_value(
+        max_positive_torque / mine_teleop::vcu::kMotorTorqueMaximumNm, 0.0, 1.0);
     double max_brake_pressure = 0.0;
     for (std::size_t index = 0; index < mine_teleop::vcu::kBrakeCount; ++index) {
       if (feedback.brake_valid[index]) {

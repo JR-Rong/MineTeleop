@@ -14,6 +14,12 @@ constexpr std::size_t kParkingBrakeCount = 4;
 constexpr std::size_t kTransmitFrameCount = 16;
 constexpr int kTransmitPeriodMs = 20;
 
+// JYR010_DBC_VCU_20260916: unsigned 16-bit torque, 0.1 Nm/bit, -3200 Nm.
+constexpr unsigned kMotorTorqueBits = 16;
+constexpr double kMotorTorqueResolutionNm = 0.1;
+constexpr double kMotorTorqueMinimumNm = -3200.0;
+constexpr double kMotorTorqueMaximumNm = 3353.5;
+
 namespace ids {
 
 constexpr std::uint32_t kAduMcu01 = 0x18F0D0F5U;
