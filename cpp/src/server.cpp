@@ -5807,6 +5807,7 @@ Json DriverConsoleRuntime::prepare_control_profile(const Json& input) {
   request["type"] = "session_control_profile";
   request["control_token"] = control_token_;
   request["profile_version"] = kSessionControlProfileVersion;
+  request["parking_idle_timeout_ms"] = parking_idle_timeout_ms;
   request["target_speed_kph"] = target_speed_kph;
   request["max_motor_torque_nm"] = max_motor_torque_nm;
   request["max_brake_pressure_bar"] = max_brake_pressure_bar;

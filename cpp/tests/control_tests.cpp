@@ -2952,6 +2952,11 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(profile_response.status == 200, "session control profile could not be prepared");
   const auto profile_result = mine_teleop::Json::parse(profile_response.body);
   const auto& profile_envelope = profile_result.at("request");
+  const auto vehicle_profile_request =
+      mine_teleop::SessionControlProfileRequest::from_json(profile_envelope);
+  expect(
+      vehicle_profile_request.profile.to_json() == valid_profile,
+      "vehicle parser did not receive the complete requested control profile");
   expect(
       profile_result.value("prepared", false) &&
           profile_result.value("transport", "") == "webrtc_data_channel" &&
@@ -2998,6 +3003,22 @@ void test_driver_vehicle_switch_releases_old_session() {
           prepared_profile.value("last_prepared_seq", std::uint64_t{0}) ==
               profile_envelope.value("seq", std::uint64_t{0}),
       "prepared session profile state does not match its DataChannel envelope");
+
+  for (const int parking_timeout_ms : {0, 750, 1000}) {
+    auto requested_profile = valid_profile;
+    requested_profile["parking_idle_timeout_ms"] = parking_timeout_ms;
+    profile_request.body = requested_profile.dump();
+    const auto response = control_app.handle(profile_request);
+    expect(response.status == 200, "valid parking timeout could not be prepared");
+    const auto result = mine_teleop::Json::parse(response.body);
+    const auto vehicle_request =
+        mine_teleop::SessionControlProfileRequest::from_json(result.at("request"));
+    expect(
+        vehicle_request.profile.to_json() == requested_profile &&
+            result.at("control_profile").at("parking_idle_timeout_ms") ==
+                parking_timeout_ms,
+        "parking timeout changed between controller state and vehicle wire profile");
+  }
 
   auto invalid_profile = valid_profile;
   invalid_profile["max_motor_torque_nm"] = 640.1;
