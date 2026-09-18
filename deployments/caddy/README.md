@@ -2,7 +2,7 @@
 
 `Caddyfile` is the public TLS/WSS entry for the C++ signaling backend. Keep
 `mine-teleop-signaling-server` on `127.0.0.1:8765`; expose only Caddy port 443.
-The template routes `/api/*`, the native API paths, and `/signaling/*`. Every
+The template routes `/api/*`, the native API paths, `/signaling/*`, and the native App approval API at `/mobile/api/*`. Every
 other path returns 404, so this endpoint does not publish the driving page.
 
 Set the public origin and upstream before starting the pinned container:

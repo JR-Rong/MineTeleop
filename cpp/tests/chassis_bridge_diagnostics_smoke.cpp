@@ -436,7 +436,7 @@ void expect_all_motor_torque_raw(
         can_signal(
             last_frame_with_id(frames, 0x18F0D0F5U + (index << 16U)),
             8,
-            14) == expected_raw,
+            16) == expected_raw,
         context + " motor channel " + std::to_string(index) + " mismatch");
   }
 }
@@ -478,6 +478,75 @@ std::size_t count_logged_events(
     if (line.find(needle) != std::string::npos) ++count;
   }
   return count;
+}
+
+void test_runtime_operator_parking() {
+  int sockets[2];
+  expect(::socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) == 0, "parking test transport failed");
+  const auto fd = std::to_string(sockets[0]);
+  ::setenv("MINE_TELEOP_CHASSIS_TEST_FD", fd.c_str(), 1);
+  auto config = valid_v4_config("mt-test", 800);
+  expect(mine_teleop_chassis_open_v4(&config) == 0, "parking runtime open failed");
+  ::unsetenv("MINE_TELEOP_CHASSIS_TEST_FD");
+  auto feedback = runtime_feedback(3, 1, 2, 0.0);
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "parking feedback failed");
+  MineTeleopChassisRuntimeControlConfigV3 profile{
+      sizeof(MineTeleopChassisRuntimeControlConfigV3), 4U, 1U,
+      1.0, 40.0, 50.0, 1.0, 1.0, 0.2, 0.0, 100.0, 100, 0U, 0.0, 500, 0U};
+  MineTeleopChassisRuntimeControlResultV1 result{};
+  for (const int timeout : {-1, 1001}) {
+    profile.parking_idle_timeout_ms = timeout;
+    expect(mine_teleop_chassis_configure_runtime_control_v3(&profile, &result) == -1,
+        "bridge accepted an invalid parking timeout");
+  }
+  for (const int timeout : {0, 1000, 500}) {
+    profile.parking_idle_timeout_ms = timeout;
+    expect(mine_teleop_chassis_configure_runtime_control_v3(&profile, &result) == 0,
+        "bridge rejected a valid parking timeout");
+    ++profile.profile_revision;
+  }
+  expect(mine_teleop_chassis_request_parallel_handshake() == 0, "parked arming request failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE), "parking handshake wait failed");
+  feedback = runtime_feedback(5, 1, 2, 0.0);
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "handshake feedback failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR), "automatic handshake released parking");
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "gear feedback failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_ACTUATOR_MODES), "automatic gear wait failed");
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "mode feedback failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_READY), "automatic handshake never reached Ready");
+  const std::array<double, 4> steering{};
+  MineTeleopChassisApplyResultV1 applied{};
+  auto apply = [&](bool active) {
+    expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "parking refresh failed");
+    expect(mine_teleop_chassis_apply_state_v3(1, 0.0, active ? -0.1 : 0.0,
+        steering.data(), 4, active ? 1 : 0, &applied) == 0, "parking command rejected");
+  };
+  apply(false);
+  auto frames = drain_can_frames(sockets[1], 40);
+  expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), 0, 2) == 2,
+      "neutral heartbeat released parking after handshake");
+  apply(true);  // A brake key is a valid operator action even without traction.
+  frames = drain_can_frames(sockets[1], 40);
+  expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), 0, 2) == 1,
+      "brake input did not release parking");
+  feedback = runtime_feedback(5, 1, 1, 0.0);
+  const auto released_at = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - released_at < std::chrono::milliseconds(600)) {
+    apply(false);
+    frames = drain_can_frames(sockets[1], 40);
+  }
+  expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), 0, 2) == 2,
+      "neutral heartbeats prevented the 500 ms local parking deadline");
+  MineTeleopChassisHandshakeStatus status{};
+  expect(mine_teleop_chassis_read_handshake_status(&status) == 0 && status.ready == 1,
+      "automatic idle parking revoked the handshake");
+  expect(mine_teleop_chassis_clear_runtime_control_v1(&result) == 0, "profile clear failed");
+  frames = drain_can_frames(sockets[1], 40);
+  expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), 0, 2) == 2,
+      "clearing a profile released automatic parking");
+  expect(mine_teleop_chassis_close() == 0, "parking runtime close failed");
+  ::close(sockets[0]);
+  ::close(sockets[1]);
 }
 
 }  // namespace
@@ -1127,7 +1196,7 @@ int main() {
     const auto& pid_motor = last_frame_with_id(pid_frames, 0x18F0D0F5U);
     const auto& pid_speed = last_frame_with_id(pid_frames, 0x18FED0F5U);
     expect(
-        can_signal(pid_motor, 8, 14) == 8412,
+        can_signal(pid_motor, 8, 16) == 32412,
         "normalized speed PID did not directly reach the 41.2 Nm per-motor session limit");
     expect(
         can_signal(pid_speed, 0, 8) == 0 && can_signal(pid_speed, 8, 8) == 0,
@@ -1168,8 +1237,8 @@ int main() {
     const auto software_stop_frames = drain_can_frames(transport[1], 40);
     expect(
         can_signal(
-            last_frame_with_id(software_stop_frames, 0x18F0D0F5U), 8, 14) ==
-                8000 &&
+            last_frame_with_id(software_stop_frames, 0x18F0D0F5U), 8, 16) ==
+                32000 &&
             can_signal(
                 last_frame_with_id(software_stop_frames, 0x18FFD0F5U), 4, 12) >
                 0 &&
@@ -1219,8 +1288,8 @@ int main() {
     const auto software_reset_frames = drain_can_frames(transport[1], 30);
     expect(
         can_signal(
-            last_frame_with_id(software_reset_frames, 0x18F0D0F5U), 8, 14) ==
-                8000 &&
+            last_frame_with_id(software_reset_frames, 0x18F0D0F5U), 8, 16) ==
+                32000 &&
             can_signal(
                 last_frame_with_id(software_reset_frames, 0x18FFD0F5U), 4, 12) ==
                 0,
@@ -1234,8 +1303,8 @@ int main() {
     const auto software_recovery_frames = drain_can_frames(transport[1], 40);
     expect(
         can_signal(
-            last_frame_with_id(software_recovery_frames, 0x18F0D0F5U), 8, 14) >
-            8000,
+            last_frame_with_id(software_recovery_frames, 0x18F0D0F5U), 8, 16) >
+            32000,
         "fresh D intent did not restore traction after software ESTOP reset");
     expect(
         mine_teleop_chassis_read_telemetry(&software_stop_telemetry) == 0 &&
@@ -1254,7 +1323,7 @@ int main() {
     const auto& brake_ehb = last_frame_with_id(brake_frames, 0x18FFD0F5U);
     const auto& brake_speed = last_frame_with_id(brake_frames, 0x18FED0F5U);
     expect(
-        can_signal(brake_motor, 8, 14) == 8000,
+        can_signal(brake_motor, 8, 16) == 32000,
         "brake intent retained traction torque");
     expect(
         can_signal(brake_ehb, 4, 12) == 30,
@@ -1275,7 +1344,7 @@ int main() {
     const auto vendor_pressure_cap_frames = drain_can_frames(transport[1], 45);
     expect_all_motor_torque_raw(
         vendor_pressure_cap_frames,
-        8000,
+        32000,
         "legacy vendor pressure cap");
     expect_all_brake_pressure_raw(
         vendor_pressure_cap_frames,
@@ -1302,7 +1371,7 @@ int main() {
     const auto& watchdog_ehb = last_frame_with_id(watchdog_frames, 0x18FFD0F5U);
     const auto& watchdog_speed = last_frame_with_id(watchdog_frames, 0x18FED0F5U);
     expect(
-        can_signal(watchdog_motor, 8, 14) == 8000 &&
+        can_signal(watchdog_motor, 8, 16) == 32000 &&
             can_signal(watchdog_ehb, 4, 12) > 0 &&
             can_signal(watchdog_speed, 0, 8) == 0 &&
             can_signal(watchdog_speed, 8, 8) == 0,
@@ -1326,7 +1395,7 @@ int main() {
         can_signal(
             last_frame_with_id(post_timeout_recovery_frames, 0x18F0D0F5U),
             8,
-            14) > 8000,
+            16) > 32000,
         "post-timeout apply did not restart direct torque from zero");
     {
       std::lock_guard<std::mutex> lock(g_vendor_mutex);
@@ -1354,7 +1423,7 @@ int main() {
     const auto initial_moving_neutral_frames = drain_can_frames(transport[1], 35);
     expect_all_motor_torque_raw(
         initial_moving_neutral_frames,
-        8000,
+        32000,
         "initial moving D-to-N rejection");
     expect(
         can_signal(
@@ -1403,7 +1472,7 @@ int main() {
     const auto moving_neutral_frames = drain_can_frames(transport[1], 35);
     expect_all_motor_torque_raw(
         moving_neutral_frames,
-        8000,
+        32000,
         "moving D-to-N rejection");
     expect(
         can_signal(
@@ -1465,7 +1534,7 @@ int main() {
     const auto rejected_shift_brake_frames = drain_can_frames(transport[1], 35);
     expect_all_motor_torque_raw(
         rejected_shift_brake_frames,
-        8000,
+        32000,
         "braking during rejected gear change");
     expect_all_brake_pressure_raw(
         rejected_shift_brake_frames,
@@ -1534,7 +1603,7 @@ int main() {
         can_signal(
             last_frame_with_id(retained_watchdog_frames, 0x18F0D0F5U),
             8,
-            14) == 8000 &&
+            16) == 32000 &&
             can_signal(
                 last_frame_with_id(retained_watchdog_frames, 0x18FFD0F5U),
                 4,
@@ -1570,8 +1639,8 @@ int main() {
         "Ready zero-traction overspeed did not latch the local ESTOP");
     const auto hard_speed_frames = drain_can_frames(transport[1], 40);
     expect(
-        can_signal(last_frame_with_id(hard_speed_frames, 0x18F0D0F5U), 8, 14) ==
-                8000 &&
+        can_signal(last_frame_with_id(hard_speed_frames, 0x18F0D0F5U), 8, 16) ==
+                32000 &&
             can_signal(last_frame_with_id(hard_speed_frames, 0x18FFD0F5U), 4, 12) >
                 0,
         "Ready hard-speed fuse did not produce zero torque and EHB safety braking");
@@ -1673,8 +1742,8 @@ int main() {
     const auto arming_motion_frames = drain_can_frames(transport[1], 40);
     expect(
         can_signal(
-            last_frame_with_id(arming_motion_frames, 0x18F0D0F5U), 8, 14) ==
-                8000 &&
+            last_frame_with_id(arming_motion_frames, 0x18F0D0F5U), 8, 16) ==
+                32000 &&
             can_signal(
                 last_frame_with_id(arming_motion_frames, 0x18FFD0F5U), 4, 12) >
                 0,
@@ -1731,8 +1800,8 @@ int main() {
         "post-Ready WaitActuatorModes did not retain the critical-feedback watchdog");
     const auto critical_frames = drain_can_frames(transport[1], 40);
     expect(
-        can_signal(last_frame_with_id(critical_frames, 0x18F0D0F5U), 8, 14) ==
-                8000 &&
+        can_signal(last_frame_with_id(critical_frames, 0x18F0D0F5U), 8, 16) ==
+                32000 &&
             can_signal(last_frame_with_id(critical_frames, 0x18FFD0F5U), 4, 12) >
                 0,
         "retained critical-feedback timeout did not produce zero torque and EHB safety braking");
@@ -1873,8 +1942,8 @@ int main() {
               if ((frame.can_id & CAN_EFF_MASK) != 0x18F0D0F5U) {
                 return false;
               }
-              const auto raw = can_signal(frame, 8, 14);
-              return raw > 8000 && raw < 9000;
+              const auto raw = can_signal(frame, 8, 16);
+              return raw > 32000 && raw < 33000;
             }),
         "V4 configured rise rate did not bound the initial forward torque below the session cap");
 
@@ -1898,7 +1967,7 @@ int main() {
         drain_can_frames(pressure_transport[1], 80);
     expect_all_motor_torque_raw(
         no_hidden_integral_frames,
-        8000,
+        32000,
         "V4 actuator-aware anti-windup at target speed");
 
     auto wait_for_direct_torque_raw = [&](int gear,
@@ -1918,7 +1987,7 @@ int main() {
               return (frame.can_id & CAN_EFF_MASK) == 0x18F0D0F5U;
             });
         if (latest_first_motor != frames.rend() &&
-            can_signal(*latest_first_motor, 8, 14) == expected_raw) {
+            can_signal(*latest_first_motor, 8, 16) == expected_raw) {
           // The datagram drain may stop midway through a 16-frame transmit
           // batch, leaving later channels from the preceding cycle. Hold the
           // cap for one more complete cycle before comparing all eight.
@@ -1947,7 +2016,7 @@ int main() {
     feedback = runtime_feedback(5, 3, 1, 0.0);
     wait_for_direct_torque_raw(
         3,
-        9000,
+        33000,
         "V4 D +100 Nm direct session cap");
 
     expect(
@@ -1976,13 +2045,13 @@ int main() {
     const auto first_reverse_ramp_raw = can_signal(
         last_frame_with_id(first_reverse_ramp_frames, 0x18F0D0F5U),
         8,
-        14);
+        16);
     expect(
-        first_reverse_ramp_raw > 7000 && first_reverse_ramp_raw < 8000,
+        first_reverse_ramp_raw > 31000 && first_reverse_ramp_raw < 32000,
         "V4 D-to-R transition retained old torque or bypassed the configured reverse ramp");
     wait_for_direct_torque_raw(
         2,
-        7000,
+        31000,
         "V4 R -100 Nm direct session cap");
     // Move the target beyond the PID reference deadband so this assertion
     // isolates positive-magnitude R feedback instead of scheduler-dependent
@@ -2009,7 +2078,7 @@ int main() {
           });
       reverse_torque_withdrawn =
           latest_first_motor != frames.rend() &&
-          can_signal(*latest_first_motor, 8, 14) == 8000;
+          can_signal(*latest_first_motor, 8, 16) == 32000;
       if (reverse_torque_withdrawn) {
         expect(
             mine_teleop_chassis_update_feedback(&feedback) == 0 &&
@@ -2020,7 +2089,7 @@ int main() {
             drain_can_frames(pressure_transport[1], 80);
         expect_all_motor_torque_raw(
             stable_frames,
-            8000,
+            32000,
             "V4 reverse positive-magnitude speed feedback");
       }
     }
@@ -2040,7 +2109,7 @@ int main() {
     const auto service_brake_frames = drain_can_frames(pressure_transport[1], 45);
     expect_all_motor_torque_raw(
         service_brake_frames,
-        8000,
+        32000,
         "V4 service brake");
     expect_all_brake_pressure_raw(
         service_brake_frames,
@@ -2061,7 +2130,7 @@ int main() {
                 2, 0.0, -(100.0 / 327.6), steering.data(), steering.size()) == 0,
         "V4 100 bar hard-brake intent was rejected");
     const auto hard_brake_frames = drain_can_frames(pressure_transport[1], 45);
-    expect_all_motor_torque_raw(hard_brake_frames, 8000, "V4 hard brake");
+    expect_all_motor_torque_raw(hard_brake_frames, 32000, "V4 hard brake");
     expect_all_brake_pressure_raw(hard_brake_frames, 1000, "V4 hard brake");
     MineTeleopChassisTelemetry ordinary_brake_telemetry{};
     expect(
@@ -2078,7 +2147,7 @@ int main() {
         drain_can_frames(pressure_transport[1], 45);
     expect_all_motor_torque_raw(
         max_ordinary_brake_frames,
-        8000,
+        32000,
         "V4 maximum ordinary brake");
     expect_all_brake_pressure_raw(
         max_ordinary_brake_frames,
@@ -2095,7 +2164,7 @@ int main() {
                 2, 0.0, 0.0, steering.data(), steering.size()) == 0,
         "V4 ordinary brake release was rejected");
     const auto release_frames = drain_can_frames(pressure_transport[1], 45);
-    expect_all_motor_torque_raw(release_frames, 8000, "V4 brake release");
+    expect_all_motor_torque_raw(release_frames, 32000, "V4 brake release");
     expect_all_brake_pressure_raw(release_frames, 0, "V4 brake release");
 
     {
@@ -2113,7 +2182,7 @@ int main() {
         drain_can_frames(pressure_transport[1], 45);
     expect_all_motor_torque_raw(
         v4_runtime_fault_frames,
-        8000,
+        32000,
         "V4 runtime UpdateVehicleState fault");
     expect_all_brake_pressure_raw(
         v4_runtime_fault_frames,
@@ -2194,8 +2263,8 @@ int main() {
     const auto arming_timeout_frames = drain_can_frames(arming_transport[1], 40);
     expect(
         can_signal(
-            last_frame_with_id(arming_timeout_frames, 0x18F0D0F5U), 8, 14) ==
-                8000 &&
+            last_frame_with_id(arming_timeout_frames, 0x18F0D0F5U), 8, 16) ==
+                32000 &&
             can_signal(
                 last_frame_with_id(arming_timeout_frames, 0x18FFD0F5U), 4, 12) >
                 0,
@@ -2311,8 +2380,8 @@ int main() {
     const auto physical_stop_frames = drain_can_frames(physical_transport[1], 40);
     expect(
         can_signal(
-            last_frame_with_id(physical_stop_frames, 0x18F0D0F5U), 8, 14) ==
-                8000 &&
+            last_frame_with_id(physical_stop_frames, 0x18F0D0F5U), 8, 16) ==
+                32000 &&
             can_signal(
                 last_frame_with_id(physical_stop_frames, 0x18FFD0F5U), 4, 12) >
                 0 &&
@@ -2379,7 +2448,7 @@ int main() {
     const auto recovered_frames = drain_can_frames(physical_transport[1], 40);
     expect(
         can_signal(
-            last_frame_with_id(recovered_frames, 0x18F0D0F5U), 8, 14) > 8000,
+            last_frame_with_id(recovered_frames, 0x18F0D0F5U), 8, 16) > 32000,
         "explicit post-disarm handshake did not restore PID traction authority");
     expect(
         mine_teleop_chassis_disconnect_parallel_handshake() == 0,
@@ -2492,6 +2561,7 @@ int main() {
         "handshake revoke diagnostic was missing, duplicated, or incomplete");
     std::filesystem::remove(physical_log_path, error);
 
+    test_runtime_operator_parking();
     std::cout << "chassis_bridge_diagnostics_smoke=passed\n";
     return 0;
   } catch (const std::exception& error) {

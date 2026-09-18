@@ -1,11 +1,14 @@
 'use strict';
-const {app,BrowserWindow,Menu,dialog,session}=require('electron');
+const {app,BrowserWindow,Menu,dialog,session,shell}=require('electron');
 const path=require('node:path');
 const fs=require('node:fs');
 const {NativeController}=require('./native-controller.cjs');
+const {prepareLogDirectory}=require('./log-directory.cjs');
 
 app.setName('MineTeleop');
 const root=app.isPackaged?path.join(process.resourcesPath,'controller'):process.env.MINE_TELEOP_DESKTOP_ROOT;
+const projectRoot=app.isPackaged?(process.platform==='darwin'?path.resolve(path.dirname(process.execPath),'../../..'):path.dirname(process.execPath)):root;
+let logDirectory=null;
 let window=null,controller=null,quitting=false,finished=false;
 if(!app.requestSingleInstanceLock())app.quit();
 else{
@@ -21,15 +24,15 @@ async function shutdown(){
   if(window&&!window.isDestroyed())window.destroy();
   try{if(controller){
     const result=await controller.stop();
-    if(result.forced)fs.appendFileSync(path.join(app.getPath('userData'),'desktop-events.jsonl'),JSON.stringify({event:'native_shutdown_timeout',at:new Date().toISOString()})+'\n');
+    if(result.forced)fs.appendFileSync(path.join(logDirectory,'desktop-events.jsonl'),JSON.stringify({event:'native_shutdown_timeout',at:new Date().toISOString()})+'\n');
   }}catch(error){console.error('Desktop shutdown:',error.message);}
   finally{finished=true;app.quit();}
 }
 
 async function start(){
   if(!root)throw Error('开发模式需指定 MINE_TELEOP_DESKTOP_ROOT；正式包自动使用随包控制服务。');
-  const data=app.getPath('userData');fs.mkdirSync(data,{recursive:true});
-  controller=new NativeController({root:path.resolve(root),logPath:path.join(data,'control-browser-events.jsonl')});
+  logDirectory=prepareLogDirectory({projectRoot:path.resolve(projectRoot),getFallbackDirectory:()=>app.getPath('logs')});
+  controller=new NativeController({root:path.resolve(root),logPath:path.join(logDirectory,'control-browser-events.jsonl')});
   controller.on('exit',({expected})=>{if(!expected&&!quitting){dialog.showErrorBox('控制服务已停止','本地控制服务异常退出，窗口将关闭。请查看日志后重新启动。');void shutdown();}});
   const url=await controller.start();if(quitting)return;
   const origin=new URL(url).origin;
@@ -41,7 +44,7 @@ async function start(){
   const menu=Menu.buildFromTemplate([
     ...(process.platform==='darwin'?[{label:'MineTeleop',submenu:[{label:'退出 MineTeleop',accelerator:'Cmd+Q',click:()=>void shutdown()}]}]:[]),
     {label:'编辑',role:'editMenu'},
-    {label:'窗口',submenu:[{role:'togglefullscreen'},{role:'minimize'},{label:'退出控制台',click:()=>void shutdown()}]}
+    {label:'窗口',submenu:[{role:'togglefullscreen'},{role:'minimize'},{label:'打开日志目录',click:()=>{void shell.openPath(logDirectory).then(error=>{if(error)dialog.showErrorBox('无法打开日志目录',error);});}},{label:'退出控制台',click:()=>void shutdown()}]}
   ]);
   Menu.setApplicationMenu(menu);
   window.on('close',event=>{event.preventDefault();void shutdown();});

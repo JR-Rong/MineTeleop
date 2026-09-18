@@ -7,7 +7,7 @@ https://localhost {
 	handle_path /api/* {
 		reverse_proxy host.docker.internal:18765
 	}
-	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/*
+	@signaling_api path /health /time /auth/* /drivers/* /vehicles/* /sessions /sessions/* /signaling/* /mobile/api/*
 	handle @signaling_api {
 		reverse_proxy host.docker.internal:18765
 	}

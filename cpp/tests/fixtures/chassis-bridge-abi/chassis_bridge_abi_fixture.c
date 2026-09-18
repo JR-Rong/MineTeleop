@@ -254,3 +254,29 @@ int mine_teleop_chassis_read_can_feedback_v1(
 int mine_teleop_chassis_close(void) {
     return 0;
 }
+
+uint32_t mine_teleop_chassis_runtime_control_config_v3_size(void) {
+    return sizeof(struct MineTeleopChassisRuntimeControlConfigV3);
+}
+int mine_teleop_chassis_apply_state_v3(
+    int gear, double vx, double ax, const double* steering, int count, int active,
+    struct MineTeleopChassisApplyResultV1* result) {
+    (void)gear; (void)vx; (void)ax; (void)steering; (void)count; (void)active;
+    if (!result) return -1;
+    result->struct_size = sizeof(*result);
+    result->result_code = 0;
+    result->issue_id = 0;
+    result->reserved = 0;
+    return 0;
+}
+int mine_teleop_chassis_configure_runtime_control_v3(
+    const struct MineTeleopChassisRuntimeControlConfigV3* config,
+    struct MineTeleopChassisRuntimeControlResultV1* result) {
+    if (!config || !result) return -1;
+    result->struct_size = sizeof(*result);
+    result->result_code = 0;
+    result->issue_id = 0;
+    result->reserved = 0;
+    result->applied_revision = config->profile_revision;
+    return 0;
+}

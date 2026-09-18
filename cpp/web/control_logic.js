@@ -28,9 +28,10 @@
   const GEAR_CHANGE_STATIONARY_SPEED_MPS = 0.1;
   const GEAR_CHANGE_STATIONARY_MIN_SAMPLES = 3;
   const GEAR_CHANGE_STATIONARY_MIN_DURATION_MS = 200;
-  const CONTROL_PROFILE_VERSION = 3;
+  const CONTROL_PROFILE_VERSION = 4;
   const CONTROL_PROFILE_FIELDS = Object.freeze([
     'profile_version',
+    'parking_idle_timeout_ms',
     'target_speed_kph',
     'max_motor_torque_nm',
     'max_brake_pressure_bar',
@@ -226,13 +227,14 @@
     if (keys.length !== CONTROL_PROFILE_FIELDS.length ||
         !CONTROL_PROFILE_FIELDS.every(
             field => Object.prototype.hasOwnProperty.call(value, field))) {
-      throw new TypeError('control profile must contain exactly the V3 fields');
+      throw new TypeError('control profile must contain exactly the V4 fields');
     }
     if (value.profile_version !== CONTROL_PROFILE_VERSION) {
       throw new TypeError(`profile_version must be ${CONTROL_PROFILE_VERSION}`);
     }
     const profile = {
       profile_version: CONTROL_PROFILE_VERSION,
+      parking_idle_timeout_ms: requireIntegerRange(value.parking_idle_timeout_ms, 0, 1000, 'parking_idle_timeout_ms'),
       target_speed_kph: requireFiniteRange(value.target_speed_kph, 0, 72, 'target_speed_kph'),
       max_motor_torque_nm: requireFiniteRange(
           value.max_motor_torque_nm, 0, 640.0, 'max_motor_torque_nm'),
@@ -365,6 +367,7 @@
         requested.max_brake_pressure_bar, hard.max_brake_pressure_bar);
     return {
       profile_version: CONTROL_PROFILE_VERSION,
+      parking_idle_timeout_ms: requested.parking_idle_timeout_ms,
       target_speed_kph: Math.min(requested.target_speed_kph, hard.max_target_speed_kph),
       max_motor_torque_nm: Math.min(
           requested.max_motor_torque_nm, hard.full_scale_motor_torque_nm),
@@ -403,12 +406,13 @@
     const hard = normalizeVehicleHardLimits(hardLimitValue);
     return mergeControlProfileWithHardLimits({
       profile_version: CONTROL_PROFILE_VERSION,
-      target_speed_kph: actuationValue.target_speed_kph,
-      max_motor_torque_nm: actuationValue.max_motor_torque_nm,
-      max_brake_pressure_bar: actuationValue.max_brake_pressure_bar,
-      service_brake_pressure_bar: actuationValue.service_brake_pressure_bar,
-      hard_brake_pressure_bar: actuationValue.hard_brake_pressure_bar,
-      max_steering_angle_deg: actuationValue.max_steering_angle_deg,
+      parking_idle_timeout_ms: 500,
+      target_speed_kph: hard.max_target_speed_kph / 2,
+      max_motor_torque_nm: hard.full_scale_motor_torque_nm / 2,
+      max_brake_pressure_bar: hard.max_brake_pressure_bar / 2,
+      service_brake_pressure_bar: hard.max_brake_pressure_bar / 2,
+      hard_brake_pressure_bar: hard.max_brake_pressure_bar / 2,
+      max_steering_angle_deg: hard.max_steering_angle_deg,
       speed_pid_kp: hard.default_speed_pid_kp,
       speed_pid_ki: hard.default_speed_pid_ki,
       speed_pid_kd: hard.default_speed_pid_kd,

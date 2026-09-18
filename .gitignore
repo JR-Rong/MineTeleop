@@ -10,6 +10,10 @@
 .DS_Store
 .playwright-cli/
 output/
+/configs/secrets/
+/configs/*.password
+/configs/*.token
+/config/app-token
 __pycache__/
 *.pyc
 
@@ -20,6 +24,7 @@ __pycache__/
 
 # Local runtime/working directories
 .local/
+/log/
 
 # Private CI inputs are supplied only through explicit build contexts.
 .ci-deps/

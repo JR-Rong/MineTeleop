@@ -384,7 +384,8 @@ test('control rejection presentation exposes only stable issue-code guidance', (
 
 function controlProfile(overrides = {}) {
   return {
-    profile_version: 3,
+    profile_version: 4,
+    parking_idle_timeout_ms: 500,
     target_speed_kph: 12,
     max_motor_torque_nm: 300,
     max_brake_pressure_bar: 90,
@@ -455,11 +456,12 @@ function vehicleHardLimits(overrides = {}) {
   };
 }
 
-test('session control profile V3 validation and hard-limit merge preserve ordering', () => {
+test('session control profile V4 validation and hard-limit merge preserve ordering', () => {
   const requested = controlProfile();
   const hard = vehicleHardLimits();
   assert.deepEqual(logic.mergeControlProfileWithHardLimits(requested, hard), {
-    profile_version: 3,
+    profile_version: 4,
+    parking_idle_timeout_ms: 500,
     target_speed_kph: 4,
     max_motor_torque_nm: 165,
     max_brake_pressure_bar: 50,
@@ -502,13 +504,13 @@ test('session control profile V3 validation and hard-limit merge preserve orderi
       /speed_pid_max_dt_ms must be an integer/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, profile_version: 1}),
-      /profile_version must be 3/);
+      /profile_version must be 4/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, profile_version: 2}),
-      /profile_version must be 3/);
+      /profile_version must be 4/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, unexpected_field: 1}),
-      /exactly the V3 fields/);
+      /exactly the V4 fields/);
   assert.throws(
       () => logic.normalizeControlProfile(
           {...requested, motor_torque_rise_rate_nm_per_s: -1}),
@@ -521,7 +523,7 @@ test('session control profile V3 validation and hard-limit merge preserve orderi
   delete v2Profile.motor_torque_rise_rate_nm_per_s;
   assert.throws(
       () => logic.normalizeControlProfile(v2Profile),
-      /exactly the V3 fields/);
+      /exactly the V4 fields/);
 });
 
 test('PID defaults come only from complete vehicle limits and accept kp hard min zero', () => {
@@ -540,6 +542,15 @@ test('PID defaults come only from complete vehicle limits and accept kp hard min
     hard_brake_pressure_bar: 50,
     max_steering_angle_deg: 3,
   }, hard);
+  assert.equal(profile.target_speed_kph, hard.max_speed_kph * hard.max_throttle / 2);
+  assert.equal(profile.max_motor_torque_nm, hard.full_scale_motor_torque_nm / 2);
+  assert.equal(profile.max_brake_pressure_bar, hard.max_brake_pressure_bar / 2);
+  assert.equal(profile.max_steering_angle_deg, hard.max_steering_angle_deg);
+  assert.equal(profile.parking_idle_timeout_ms, 500);
+  for (const timeout of [0, 1000])
+    assert.equal(logic.normalizeControlProfile({...profile, parking_idle_timeout_ms: timeout}).parking_idle_timeout_ms, timeout);
+  for (const timeout of [-1, 1001, 0.5, NaN])
+    assert.throws(() => logic.normalizeControlProfile({...profile, parking_idle_timeout_ms: timeout}), /parking_idle_timeout_ms/);
   assert.equal(profile.speed_pid_kp, 3.25);
   assert.equal(profile.speed_pid_ki, 0.75);
   assert.equal(profile.speed_pid_kd, 0.5);

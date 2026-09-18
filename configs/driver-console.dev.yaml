@@ -5,7 +5,7 @@ cloud:
   signaling_url: ws://127.0.0.1:8765/signaling
 
 logging:
-  browser_event_log: ../.local/logs/control-browser-events.jsonl
+  browser_event_log: ../log/control-browser-events.jsonl
   browser_event_log_max_bytes: 2097152
   browser_event_log_files: 3
 

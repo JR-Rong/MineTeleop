@@ -269,6 +269,11 @@ TURN 使用状态和时间同步可信度。逐路指标超过 200 ms 或低于 
 - 配置版本。
 
 当前 C++ 控制端把页面 UTC 事件通过回环接口 `/api/browser-event` 写入 JSONL，
+默认写入项目（安装包）根目录的 `log/control-browser-events.jsonl`。桌面版 Windows/Linux
+以可执行文件所在目录为根，macOS 以 `.app` 所在目录为根；开发模式使用
+`MINE_TELEOP_DESKTOP_ROOT`。macOS AppTranslocation 隔离运行或安装位置不可写时，
+桌面版回退至 Electron 用户日志目录（macOS 为 `~/Library/Logs/MineTeleop/`）；
+可通过“窗口 → 打开日志目录”查看实际路径。桌面退出诊断使用同一目录。
 路径、单文件上限和保留文件数分别由 `logging.browser_event_log`、
 `logging.browser_event_log_max_bytes` 和 `logging.browser_event_log_files` 配置。
 达到上限后生成 `.1`、`.2` 等编号备份；文件数包含当前文件。键名包含

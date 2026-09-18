@@ -276,6 +276,25 @@ struct BridgeRuntimeControlConfigV2 {
   double motor_torque_rise_rate_nm_per_s;
 };
 
+struct BridgeRuntimeControlConfigV3 {
+  std::uint32_t struct_size;
+  std::uint32_t profile_version;
+  std::uint64_t profile_revision;
+  double target_speed_limit_mps;
+  double max_motor_torque_nm;
+  double max_brake_pressure_bar;
+  double max_steering_request;
+  double speed_pid_kp;
+  double speed_pid_ki;
+  double speed_pid_kd;
+  double speed_pid_derivative_filter_tau_ms;
+  std::int32_t speed_pid_max_dt_ms;
+  std::uint32_t reserved;
+  double motor_torque_rise_rate_nm_per_s;
+  std::int32_t parking_idle_timeout_ms;
+  std::uint32_t parking_reserved;
+};
+
 struct BridgeRuntimeControlResultV1 {
   std::uint32_t struct_size;
   std::int32_t result_code;
@@ -290,6 +309,8 @@ static_assert(
     offsetof(BridgeRuntimeControlConfigV2, motor_torque_rise_rate_nm_per_s) ==
     sizeof(BridgeRuntimeControlConfigV1));
 static_assert(sizeof(BridgeRuntimeControlConfigV2) == 96U);
+static_assert(sizeof(BridgeRuntimeControlConfigV3) == 104U);
+static_assert(offsetof(BridgeRuntimeControlConfigV3, parking_idle_timeout_ms) == 96U);
 static_assert(sizeof(BridgeRuntimeControlResultV1) == 24U);
 
 constexpr std::uint32_t kBridgeApplyIssueNone = 0U;
@@ -643,6 +664,13 @@ void validate_chassis_bridge_abi_handle(void* handle) {
       handle, "mine_teleop_chassis_clear_runtime_control_v1"));
   static_cast<void>(load_symbol<SetStopContextV1Fn>(
       handle, "mine_teleop_chassis_set_stop_context_v1"));
+  static_cast<void>(load_symbol<int (*)(int, double, double, const double*, int, int, BridgeApplyResultV1*)>(
+      handle, "mine_teleop_chassis_apply_state_v3"));
+  static_cast<void>(load_symbol<int (*)(const BridgeRuntimeControlConfigV3*, BridgeRuntimeControlResultV1*)>(
+      handle, "mine_teleop_chassis_configure_runtime_control_v3"));
+  if (load_symbol<QueryFn>(handle, "mine_teleop_chassis_runtime_control_config_v3_size")() !=
+      sizeof(BridgeRuntimeControlConfigV3))
+    throw std::runtime_error("chassis runtime control V3 ABI size mismatch");
   if (version != 6U || config_size != sizeof(BridgeOpenConfigV4) ||
       legacy_v3_config_size != sizeof(BridgeOpenConfigV3) ||
       legacy_v2_config_size != sizeof(BridgeOpenConfigV2) ||
@@ -1003,6 +1031,7 @@ Json ControlCommand::to_json() const {
   value["throttle"] = throttle;
   value["brake"] = brake;
   value["estop"] = estop;
+  value["operator_active"] = operator_active;
   value["control_token"] = control_token;
   return value;
 }
@@ -1028,6 +1057,7 @@ ControlCommand ControlCommand::from_json(const Json& value) {
     command.throttle = value.at("throttle").get<double>();
     command.brake = value.at("brake").get<double>();
     command.estop = value.value("estop", false);
+    command.operator_active = value.value("operator_active", false);
     command.control_token = value.at("control_token").get<std::string>();
   } catch (const Json::exception& error) {
     throw std::invalid_argument(std::string("invalid control command: ") + error.what());
@@ -1141,8 +1171,10 @@ void NativeControlIntentStore::reset() {
 }
 
 void SessionControlProfile::validate() const {
+  if (parking_idle_timeout_ms < 0 || parking_idle_timeout_ms > 1000)
+    throw std::invalid_argument("parking_idle_timeout_ms must be in [0, 1000]");
   if (profile_version != kSessionControlProfileVersion) {
-    throw std::invalid_argument("session control profile version must be 3");
+    throw std::invalid_argument("session control profile version must be 4");
   }
   require_finite_range(target_speed_kph, 0.0, kChassisControlMaxTargetSpeedKph, "target_speed_kph");
   require_finite_range(
@@ -1201,6 +1233,7 @@ Json SessionControlProfile::to_json() const {
   validate();
   return {
       {"profile_version", profile_version},
+      {"parking_idle_timeout_ms", parking_idle_timeout_ms},
       {"target_speed_kph", target_speed_kph},
       {"max_motor_torque_nm", max_motor_torque_nm},
       {"max_brake_pressure_bar", max_brake_pressure_bar},
@@ -1222,6 +1255,10 @@ SessionControlProfile SessionControlProfile::from_json(const Json& value) {
   }
   SessionControlProfile profile;
   try {
+    if (!value.at("parking_idle_timeout_ms").is_number_integer() ||
+        value.at("parking_idle_timeout_ms") < 0 || value.at("parking_idle_timeout_ms") > 1000)
+      throw std::invalid_argument("parking_idle_timeout_ms must be an integer");
+    profile.parking_idle_timeout_ms = value.at("parking_idle_timeout_ms").get<int>();
     profile.profile_version = value.at("profile_version").get<int>();
     profile.target_speed_kph = value.at("target_speed_kph").get<double>();
     profile.max_motor_torque_nm = value.at("max_motor_torque_nm").get<double>();
@@ -1930,7 +1967,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
 
   const auto safety = root["field_safety"];
   config.field_safety.commissioning_mode = optional<std::string>(safety, "commissioning_mode", "bench");
-  config.field_safety.max_speed_kph = optional<double>(safety, "max_speed_kph", 40.0);
+  config.field_safety.max_speed_kph = optional<double>(safety, "max_speed_kph", 10.0);
   config.field_safety.max_throttle = optional<double>(safety, "max_throttle", 1.0);
   config.field_safety.full_scale_motor_torque_nm =
       optional<double>(
@@ -2055,7 +2092,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.upload.retry_max_seconds = optional<int>(upload, "retry_max_seconds", 600);
 
   const auto adapter = root["vehicle_adapter"];
-  config.vehicle_adapter.type = optional<std::string>(adapter, "type", "mock");
+  config.vehicle_adapter.type = optional<std::string>(adapter, "type", "can");
   config.vehicle_adapter.can_interface = config.hardware.can_interface;
   YAML::Node chassis;
   const auto integration = adapter["integration"];
@@ -2063,6 +2100,11 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   if (chassis) {
     config.vehicle_adapter.can_interface = optional<std::string>(chassis, "can_interface", config.hardware.can_interface);
     config.vehicle_adapter.bridge_library_path = optional<std::string>(chassis, "bridge_library_path", "");
+  }
+  if (!config.vehicle_adapter.bridge_library_path.empty() &&
+      config.vehicle_adapter.bridge_library_path.is_relative()) {
+    config.vehicle_adapter.bridge_library_path = std::filesystem::absolute(
+        std::filesystem::path(path).parent_path() / config.vehicle_adapter.bridge_library_path).lexically_normal();
   }
   if (config.vehicle_adapter.can_interface != config.hardware.can_interface) {
     throw std::runtime_error("hardware.can.interface and vehicle adapter can_interface must match");
@@ -2364,10 +2406,10 @@ void DynamicLibraryVehicleAdapter::ensure_loaded() {
     validate_chassis_bridge_abi_handle(handle_);
     open_v4_fn_ = load_symbol<OpenV4Fn>(handle_, "mine_teleop_chassis_open_v4");
     apply_fn_ = load_symbol<ApplyFn>(handle_, "mine_teleop_chassis_apply_state");
-    apply_v2_fn_ = load_symbol<ApplyV2Fn>(
-        handle_, "mine_teleop_chassis_apply_state_v2");
-    configure_runtime_control_v2_fn_ = load_symbol<ConfigureRuntimeControlV2Fn>(
-        handle_, "mine_teleop_chassis_configure_runtime_control_v2");
+    apply_v3_fn_ = load_symbol<ApplyV3Fn>(
+        handle_, "mine_teleop_chassis_apply_state_v3");
+    configure_runtime_control_v3_fn_ = load_symbol<ConfigureRuntimeControlV3Fn>(
+        handle_, "mine_teleop_chassis_configure_runtime_control_v3");
     clear_runtime_control_fn_ = load_symbol<ClearRuntimeControlFn>(
         handle_, "mine_teleop_chassis_clear_runtime_control_v1");
     stop_fn_ = load_symbol<StopFn>(handle_, "mine_teleop_chassis_emergency_stop");
@@ -2452,8 +2494,8 @@ std::uint64_t DynamicLibraryVehicleAdapter::configure_runtime_control_profile(
       profile.max_brake_pressure_bar > max_ordinary_brake_pressure_bar_ + 1e-9) {
     throw std::invalid_argument("runtime control profile exceeds vehicle limits");
   }
-  const BridgeRuntimeControlConfigV2 config{
-      sizeof(BridgeRuntimeControlConfigV2),
+  const BridgeRuntimeControlConfigV3 config{
+      sizeof(BridgeRuntimeControlConfigV3),
       static_cast<std::uint32_t>(profile.profile_version),
       profile_revision,
       profile.target_speed_kph / 3.6,
@@ -2466,19 +2508,21 @@ std::uint64_t DynamicLibraryVehicleAdapter::configure_runtime_control_profile(
       profile.speed_pid_derivative_filter_tau_ms,
       profile.speed_pid_max_dt_ms,
       0U,
-      profile.motor_torque_rise_rate_nm_per_s};
+      profile.motor_torque_rise_rate_nm_per_s,
+      profile.parking_idle_timeout_ms,
+      0U};
   BridgeRuntimeControlResultV1 result{};
-  const int result_code = configure_runtime_control_v2_fn_(&config, &result);
+  const int result_code = configure_runtime_control_v3_fn_(&config, &result);
   if (result.struct_size != sizeof(BridgeRuntimeControlResultV1) ||
       result.result_code != result_code || result.reserved != 0U ||
       (result_code == 0 &&
        (result.issue_id != 0U || result.applied_revision != profile_revision))) {
     throw std::runtime_error(
-        "mine_teleop_chassis_configure_runtime_control_v2 returned an invalid result structure");
+        "mine_teleop_chassis_configure_runtime_control_v3 returned an invalid result structure");
   }
   if (result_code != 0) {
     throw std::runtime_error(
-        "mine_teleop_chassis_configure_runtime_control_v2 rejected profile with code " +
+        "mine_teleop_chassis_configure_runtime_control_v3 rejected profile with code " +
         std::to_string(result_code) + " and issue " +
         std::to_string(result.issue_id));
   }
@@ -2526,21 +2570,22 @@ void DynamicLibraryVehicleAdapter::apply_control(const ControlCommand& command) 
       max_ordinary_brake_pressure_bar_);
   const double steering[4]{command.steering, command.steering, command.steering, command.steering};
   BridgeApplyResultV1 apply_result{};
-  const int result = apply_v2_fn_(
+  const int result = apply_v3_fn_(
       gear_to_bridge_value(command.gear),
       velocity,
       acceleration,
       steering,
       4,
+      command.operator_active && !command.estop ? 1 : 0,
       &apply_result);
   if (apply_result.struct_size != sizeof(BridgeApplyResultV1) ||
       apply_result.result_code != result || apply_result.reserved != 0U ||
       (result == 0 && apply_result.issue_id != kBridgeApplyIssueNone)) {
-    last_error_ = "mine_teleop_chassis_apply_state_v2 returned an invalid result structure";
+    last_error_ = "mine_teleop_chassis_apply_state_v3 returned an invalid result structure";
     throw std::runtime_error(last_error_);
   }
   if (result != 0) {
-    last_error_ = "mine_teleop_chassis_apply_state_v2 rejected control with code " +
+    last_error_ = "mine_teleop_chassis_apply_state_v3 rejected control with code " +
         std::to_string(result);
     throw VehicleAdapterControlRejected(
         bridge_apply_issue_code(apply_result.issue_id),
@@ -3062,7 +3107,8 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
       commissioning_mode_ == "bench" && adapter_status.adapter_type == "mock";
   const bool first_profile = !active_session_profile_;
   if ((first_profile || target_speed_increase || torque_increase ||
-       brake_parameters_changed || steering_changed || pid_parameters_changed) &&
+       brake_parameters_changed || steering_changed || pid_parameters_changed ||
+       request.profile.parking_idle_timeout_ms != current_profile.parking_idle_timeout_ms) &&
       !mock_bench_bypass) {
     VcuHandshakeStatus handshake_status;
     bool handshake_status_available = false;

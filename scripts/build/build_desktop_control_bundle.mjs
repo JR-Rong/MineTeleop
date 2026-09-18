@@ -33,7 +33,7 @@ const temporary=await mkdtemp(path.join(os.tmpdir(),'mine-desktop-'));
 try{
   const appSource=path.join(temporary,'app'),controller=path.join(temporary,'controller');
   await mkdir(appSource);
-  for(const file of ['main.cjs','native-controller.cjs','package.json'])await cp(path.join(repo,'desktop',file),path.join(appSource,file));
+  for(const file of ['main.cjs','native-controller.cjs','log-directory.cjs','package.json'])await cp(path.join(repo,'desktop',file),path.join(appSource,file));
   const packageJSON=JSON.parse(await readFile(path.join(appSource,'package.json'),'utf8'));
   const releaseVersion=args.version||process.env.MINE_TELEOP_RELEASE_VERSION||packageJSON.version;
   if(!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(releaseVersion))throw Error('Release version must be A.B.C');
