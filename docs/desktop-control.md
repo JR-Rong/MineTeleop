@@ -10,7 +10,7 @@
 - 关闭唯一窗口、菜单“退出控制台”或 macOS Cmd+Q 会退出整个应用。重复启动只聚焦已有窗口。
 - 桌面主进程通过私有 stdin 管道拥有原生服务。服务绑定随机的 127.0.0.1 端口，准备就绪后才打开窗口。关闭时先销毁页面，再通知服务清除本地控制输入代次、停止 HTTP 服务并注销；超过 8 秒只终止本应用创建的子进程。主进程异常终止导致管道 EOF 时，原生服务也会退出。
 - 本地退出不代表已经收到车辆制动反馈。车端原有输入租约、控制超时和物理急停机制仍独立生效。网络断开时远端注销可能失败，车辆验收需覆盖这种情况。
-- 日志保存在操作系统用户数据目录下的 `MineTeleop`：Windows `%APPDATA%`、macOS `~/Library/Application Support`、Linux `~/.config`。不向安装目录写运行日志。
+- 日志优先保存在安装目录的 `log/`（macOS 为 `.app` 所在目录）。若 macOS 从 AppTranslocation 隔离目录运行，或安装位置不可写，则使用 Electron 用户日志目录：macOS 为 `~/Library/Logs/MineTeleop/`，Windows/Linux 为应用用户数据目录下的 `logs/`。可从“窗口 → 打开日志目录”查看实际位置。日志目录和现有日志文件均会在启动控制服务前检查写入权限；用户日志目录也不可写时明确报错。
 
 网页无 Node 权限、无 preload/IPC 权限桥，启用 sandbox、contextIsolation、webSecurity；禁止新窗口、任意导航和 webview。应用不调用默认浏览器，不在启动时下载依赖。实现参照 [Electron 安全建议](https://www.electronjs.org/docs/latest/tutorial/security)。
 

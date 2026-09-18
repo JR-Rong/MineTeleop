@@ -140,7 +140,7 @@ jobs:
           $nativeRoots = @(Get-ChildItem -LiteralPath dist -Directory -Filter "mine-teleop-control-windows-$env:TARGET_ARCH-*")
           if ($nativeRoots.Count -ne 1) { throw "Expected exactly one native bundle" }
           $env:MINE_TELEOP_TEST_NATIVE_ROOT = $nativeRoots[0].FullName
-          node --test desktop/test/native-controller.test.cjs desktop/test/native-process.test.cjs
+          node --test desktop/test/log-directory.test.cjs desktop/test/native-controller.test.cjs desktop/test/native-process.test.cjs
           if ($LASTEXITCODE -ne 0) { throw "Desktop lifecycle tests failed" }
           node scripts/build/build_desktop_control_bundle.mjs --platform win32 --arch $env:TARGET_ARCH --native-root $nativeRoots[0].FullName
           if ($LASTEXITCODE -ne 0) { throw "Desktop packaging failed" }
@@ -235,7 +235,7 @@ jobs:
           TARGET_ARCH: ${{ matrix.arch }}
         run: |
           npm ci --prefix desktop
-          node --test desktop/test/native-controller.test.cjs desktop/test/native-process.test.cjs
+          node --test desktop/test/log-directory.test.cjs desktop/test/native-controller.test.cjs desktop/test/native-process.test.cjs
           node scripts/build/build_desktop_control_bundle.mjs \
             --platform "$TARGET_PLATFORM" --arch "$TARGET_ARCH" \
             --native-root "$MINE_TELEOP_TEST_NATIVE_ROOT"
