@@ -46,8 +46,11 @@ node desktop/node_modules/electron/install.js
 MINE_TELEOP_DESKTOP_ROOT=/absolute/unpacked/native-bundle \
   node desktop/node_modules/electron/cli.js "$PWD/desktop"
 MINE_TELEOP_TEST_NATIVE_ROOT=/absolute/unpacked/native-bundle \
+MINE_TELEOP_TEST_SIGNALING_BINARY=/absolute/build/mine-teleop-signaling-server \
   node --test desktop/test/*.test.cjs
 ```
+
+第二个变量启用真实信令服务夹具：在等待手机审批时，分别触发 shutdown、父管道 EOF 和 SIGTERM，断言进程正常退出、端口释放、云端申请撤销且迟到批准被拒绝。缺少原生包或信令二进制时这些用例会明确跳过。
 
 ## 本次验证与限制
 
@@ -66,3 +69,9 @@ MINE_TELEOP_TEST_NATIVE_ROOT=/absolute/unpacked/native-bundle \
 | Ubuntu 22.04 arm64 | 168.9 MiB | 398.6 MiB |
 
 压缩包位于 `dist/desktop`。以上不包含用户运行后的缓存和日志，后续 MSVC Windows 正式构建大小可能不同。记录与签名校验通过，工作区未提交，因此 manifest 标注 `source_dirty: true`。
+
+## 会话日志 ZIP
+
+登录后使用顶部“导出会话日志”选择已结束会话，收集并保存三端应用日志。
+车端需保持在线；缺失、轮转和大小限制会显示在 ZIP 清单中。
+详见 [会话日志导出](29-session-log-export.md)。

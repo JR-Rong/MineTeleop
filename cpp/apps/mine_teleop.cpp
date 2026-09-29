@@ -2,6 +2,7 @@
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/server.hpp"
+#include "mine_teleop/session_logs.hpp"
 #include "mine_teleop/upload.hpp"
 #include "mine_teleop/video.hpp"
 
@@ -797,6 +798,9 @@ int run_vehicle_runtime(const Arguments& arguments) {
                }).dump()
             << std::endl;
 
+  // Start after all forks: the supervisor owns a separate, cancellable log
+  // transfer thread; media and control never wait for diagnostic file I/O.
+  auto log_worker = mine_teleop::start_vehicle_log_worker(config, token);
   int first_status = 0;
   bool child_exited = false;
   while (termination_signal == 0) {
@@ -811,6 +815,7 @@ int run_vehicle_runtime(const Arguments& arguments) {
     if (pid < 0 && errno != EINTR) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
+  log_worker.request_stop();
   stop_children();
   std::signal(SIGINT, previous_int);
   std::signal(SIGTERM, previous_term);

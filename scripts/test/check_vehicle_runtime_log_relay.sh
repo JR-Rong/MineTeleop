@@ -204,10 +204,14 @@ sleep 0.2
 touch "$log_failure_trigger"
 for _ in $(seq 1 100); do
   [[ -f "$log_failure_log" ]] &&
-    [[ "$(stat -c '%s' "$log_failure_log")" -eq 4096 ]] && break
+    [[ "$(stat -c '%s' "$log_failure_log")" -ge 3840 ]] && break
   sleep 0.02
 done
-[[ "$(stat -c '%s' "$log_failure_log")" -eq 4096 ]]
+# Whole-record rotation leaves less than one record of unused space. The next
+# append still reaches the deliberately blocked rotation/error path.
+[[ "$(stat -c '%s' "$log_failure_log")" -ge 3840 ]]
+[[ "$(stat -c '%s' "$log_failure_log")" -le 4096 ]]
+sleep 0.1
 kill -TERM "$log_failure_launcher_pid"
 for _ in $(seq 1 100); do
   if ! kill -0 "$log_failure_launcher_pid" >/dev/null 2>&1; then break; fi
@@ -327,11 +331,11 @@ fi
 # Similar diagnostics and structured runtime output remain recorded.
 grep -F 'UpdateVehicleState diagnostic detail' "$filter_log" >/dev/null
 grep -F '"event":"runtime-kept"' "$filter_log" >/dev/null
-grep -Fx '{"event":"runtime-interleaved-after"}' "$filter_log" >/dev/null
-grep -Fx '{"event":"runtime-interleaved-before"}' "$filter_log" >/dev/null
+grep -E '^\{"logged_at_utc_ms":[0-9]+,"event":"runtime-interleaved-after"\}$' "$filter_log" >/dev/null
+grep -E '^\{"logged_at_utc_ms":[0-9]+,"event":"runtime-interleaved-before"\}$' "$filter_log" >/dev/null
 # A line split across reads is reassembled, and an unterminated tail is
 # flushed when the stream closes.
-grep -F '{"event":"json-split-line"}' "$filter_log" >/dev/null
+grep -F '"event":"json-split-line"' "$filter_log" >/dev/null
 grep -F 'unterminated-tail' "$filter_log" >/dev/null
 
 forced_tail_log="$temporary/forced-tail/vehicle-runtime.log"

@@ -1,4 +1,5 @@
 #include "mine_teleop/server.hpp"
+#include "mine_teleop/session_logs.hpp"
 #include "mine_teleop/control_logic_js.hpp"
 #include "mine_teleop/detail/console_assets.hpp"
 
@@ -1033,13 +1034,14 @@ body .app-shell{grid-template-rows:auto auto minmax(0,1fr)}
 @media(max-width:720px){html,body{overflow:auto}.app-shell{height:auto;min-height:100svh}.topbar{align-items:flex-start;flex-direction:column}.auth{justify-content:flex-start}.workspace{grid-template-columns:1fr}.visual-stage{min-height:58svh}.sidebar{overflow:visible}.grid{grid-template-columns:1fr}.can-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.can-feedback-body{grid-template-columns:1fr}.wheel-feedback-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.steering-feedback-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.limit-grid{grid-template-columns:1fr}}</style><link rel="stylesheet" href="/assets/console-layout.css"></head><body><main class="app-shell" tabindex="-1">
 <header class="topbar"><div class="brand"><h1>Mine Teleop 控制台</h1><p>方向键 / WASD 控制 · Space 缓刹 · B 急刹 · E 急停</p></div>
 <section id="login-panel" class="auth"><label for="driver-id">驾驶员 ID</label><input id="driver-id" type="text" autocomplete="username" maxlength="128" spellcheck="false" placeholder="请输入驾驶员 ID"><label for="password">驾驶员密码</label><input id="password" type="password" autocomplete="current-password"><button id="login">登录并加载车辆</button></section>
-<section id="session-panel" class="auth" hidden><label for="vehicle">授权车辆</label><select id="vehicle"></select><button id="connect">连接所选车辆</button><button id="control-limits-open">实车调试限幅</button><button id="logout">安全退出</button><button id="estop" class="danger">急停</button><strong id="webrtc">未连接</strong><span id="auth-expiry" class="muted auth-expiry"></span></section></header>
+<section id="session-panel" class="auth" hidden><label for="vehicle">授权车辆</label><select id="vehicle"></select><button id="connect">连接所选车辆</button><button id="control-limits-open">实车调试限幅</button><button id="export-session-logs">导出会话日志</button><button id="logout">安全退出</button><button id="estop" class="danger">急停</button><strong id="webrtc">未连接</strong><span id="auth-expiry" class="muted auth-expiry"></span></section></header>
 <section id="operator-status-strip" class="operator-status-strip" aria-label="关键车辆状态"><article class="operator-status-item"><span>实测车速</span><strong id="operator-speed">—</strong></article><article class="operator-status-item"><span>实际挡位</span><strong id="operator-actual-gear">—</strong></article><article id="operator-readout-gear" class="operator-status-item"><span>指令挡位</span><strong id="operator-control-gear">N</strong></article><article id="operator-readout-steering" class="operator-status-item"><span>转向</span><strong id="operator-control-steering">0.00</strong></article><article id="operator-readout-throttle" class="operator-status-item"><span>目标车速比例</span><strong id="operator-control-throttle">0.00</strong></article><article id="operator-readout-brake" class="operator-status-item"><span>刹车</span><strong id="operator-control-brake">0.00</strong></article></section>
 <div class="workspace"><section class="visual-stage"><p id="estop-status" class="estop-banner" hidden>急停请求已锁定；等待车端遥测确认，未确认时请使用车辆物理急停。</p><section id="cameras" class="grid"><div id="empty-stage" class="empty-stage">登录并连接车辆后显示实时视频</div></section><section id="can-feedback-panel" class="can-feedback-panel" hidden aria-label="CAN 实时反馈"><div class="can-feedback-heading"><h2>CAN 实时反馈 · 测量值</h2><strong id="can-feedback-status" class="status-chip warn">等待车端遥测</strong></div><div class="can-summary"><div class="can-summary-item"><span>车速</span><strong id="can-speed">—</strong></div><div class="can-summary-item"><span>实际挡位</span><strong id="can-gear">—</strong></div><div class="can-summary-item"><span>物理选择器</span><strong id="can-selector">—</strong></div><div class="can-summary-item"><span>电子驻车 1-4</span><strong id="can-epb">—</strong></div><div class="can-summary-item"><span>VCU 状态</span><strong id="can-handshake">—</strong></div><div class="can-summary-item"><span>VMC 故障码</span><strong id="can-vmc-fault">—</strong></div><div class="can-summary-item"><span>物理手刹</span><strong id="can-parking-switch">—</strong></div><div class="can-summary-item"><span>制动踏板</span><strong id="can-brake-pedal">—</strong></div><div class="can-summary-item"><span>紧急开关</span><strong id="can-emergency">—</strong></div><div class="can-summary-item"><span>反馈时效</span><strong id="can-age">—</strong></div></div><div class="can-feedback-body"><div id="wheel-feedback-grid" class="wheel-feedback-grid" aria-label="八路轮端反馈"></div><div id="steering-feedback-grid" class="steering-feedback-grid" aria-label="四路转向反馈"></div></div></section><pre id="status" class="status-line">请先登录</pre></section>
 <aside class="sidebar"><section id="keyboard-panel" class="side-section" aria-label="键盘控制状态"><div class="section-heading"><h2>键盘控制</h2><span id="input-readiness" class="status-chip">等待连接</span></div><p class="key-help">方向键与 WASD 等效；D/R 在会话内锁存，松开前进/倒车只将目标车速比例归零。</p><div class="keyboard-grid" aria-label="方向键状态"><span id="key-up" class="keycap key-up" aria-pressed="false">↑<small>W</small></span><span id="key-left" class="keycap key-left" aria-pressed="false">←<small>A</small></span><span id="key-down" class="keycap key-down" aria-pressed="false">↓<small>S</small></span><span id="key-right" class="keycap key-right" aria-pressed="false">→<small>D</small></span></div><div class="brake-keys"><span id="key-service-brake" class="keycap brake-key" aria-pressed="false">SPACE · 缓刹</span><span id="key-hard-brake" class="keycap brake-key" aria-pressed="false">B · 急刹</span></div><span id="last-keyboard-event" class="last-input">等待键盘输入</span><div class="control-readouts"><div id="readout-gear" class="control-readout"><span>挡位</span><strong id="control-gear">N</strong></div><div id="readout-steering" class="control-readout"><span>转向</span><strong id="control-steering">0.00</strong></div><div id="readout-throttle" class="control-readout"><span>目标车速比例</span><strong id="control-throttle">0.00</strong></div><div id="readout-brake" class="control-readout"><span>刹车</span><strong id="control-brake">0.00</strong></div></div></section>
 <section id="vcu-panel" class="side-section" hidden><div class="section-heading"><h2>VCU 平行驾驶</h2><strong id="vcu-status" class="status-chip warn">等待车端 VCU 状态</strong></div><p class="limit-inline"><span>当前会话限幅</span><strong id="control-limits-summary" class="warn">等待车端确认会话控制参数</strong></p><p id="vcu-gate" class="gate-copy warn" role="status" aria-live="polite">准入检查：需要车端确认会话控制参数、N 挡、电子驻车、零速及 VCU 人工状态</p><div class="side-actions"><button id="vcu-connect" disabled>开始平行驾驶握手</button><button id="vcu-disconnect" disabled>断开 VCU 握手</button></div></section>
 <section id="monitor-panel" class="side-section" hidden><div class="section-heading"><h2>运行监控</h2><span class="status-chip">实时</span></div><div class="metrics"><article class="metric"><span>车辆在线</span><strong id="metric-vehicle">未知</strong></article><article class="metric"><span>当前会话</span><strong id="metric-session">未连接</strong></article><article class="metric"><span>当前控制权</span><strong id="metric-authority">无</strong></article><article class="metric"><span>视频编码 / 后端</span><strong id="metric-video">等待媒体</strong></article><article class="metric"><span>控制 RTT</span><strong id="metric-rtt">未知</strong></article><article class="metric"><span>网络连接</span><strong id="metric-network">未知</strong></article><article class="metric"><span>TURN</span><strong id="metric-turn">未配置</strong></article><article class="metric"><span>时间同步</span><strong id="metric-time">未知</strong></article></div><div id="alerts" class="alerts">尚无媒体指标；控制命令不会在链路未就绪时发送。</div><table><thead><tr><th>camera</th><th>FPS</th><th>kbps</th><th>loss</th><th>latency</th></tr></thead><tbody id="stream-metrics"><tr><td colspan="5" class="muted">等待视频轨道</td></tr></tbody></table></section></aside></div>
 <dialog id="control-limits-dialog"><h2>当前会话驾驶与 PID 参数</h2><p class="limit-warning">这些值仅用于当前控制会话，必须由车端精确确认后才生效；车端本地硬上限仍会再次截断。三个制动字段都是每路 EHB 压力请求，单位 bar、分辨率 0.1 bar，不是百分比或整车制动力。急停、物理急停、故障、断开停车和 bridge 本地 watchdog 使用独立安全制动，普通 profile 不能削弱这些安全路径。升扭斜率是会话标定值，不是车型级硬上限；0 表示取消升扭限制，下一次牵引可能在一个控制周期内达到当前会话的单电机最大转矩。修改时立即清零当前输入。</p><fieldset><legend>驾驶参数</legend><div class="limit-grid"><label for="target-speed-kph">目标车速上限（km/h）<input id="target-speed-kph" type="number" min="0" max="72" step="0.1" inputmode="decimal"></label><label for="max-motor-torque-nm">单电机最大驱动转矩（Nm）<input id="max-motor-torque-nm" type="number" min="0" max="640.0" step="0.1" inputmode="decimal"></label><label for="max-brake-pressure-bar">每路 EHB 最大普通压力（bar）<input id="max-brake-pressure-bar" type="number" min="0" max="327.6" step="0.1" inputmode="decimal"></label><label for="service-brake-pressure-bar">每路 EHB 缓刹压力（bar）<input id="service-brake-pressure-bar" type="number" min="0" max="327.6" step="0.1" inputmode="decimal"></label><label for="hard-brake-pressure-bar">每路 EHB 急刹压力（bar）<input id="hard-brake-pressure-bar" type="number" min="0" max="327.6" step="0.1" inputmode="decimal"></label><label for="parking-idle-timeout">无操作自动驻车（秒，0=松键即制动停车）<input id="parking-idle-timeout" type="number" min="0" max="1" step="0.001" value="0.5" required></label><label for="max-steering-deg">最大四轴转向角（°）<input id="max-steering-deg" type="number" min="0" max="30" step="0.5" inputmode="decimal"></label></div></fieldset><fieldset><legend>速度 PID 与升扭标定</legend><p class="muted">PID 初始值与可调范围只使用当前车端上报；未收到完整默认值和范围时禁止提交与驾驶。升扭斜率数值越大，转矩建立越快；0 不是禁用驱动，而是直接跟随 PID 输出。</p><div class="limit-grid"><label for="speed-pid-kp">Kp<input id="speed-pid-kp" type="number" min="0" max="100" step="0.01" inputmode="decimal"></label><label for="speed-pid-ki">Ki<input id="speed-pid-ki" type="number" min="0" max="100" step="0.01" inputmode="decimal"></label><label for="speed-pid-kd">Kd<input id="speed-pid-kd" type="number" min="0" max="100" step="0.01" inputmode="decimal"></label><label for="speed-pid-derivative-filter-tau-ms">微分滤波 τ（ms）<input id="speed-pid-derivative-filter-tau-ms" type="number" min="0" max="2000" step="1" inputmode="numeric"></label><label for="speed-pid-max-dt-ms">最大采样周期（ms）<input id="speed-pid-max-dt-ms" type="number" min="20" max="200" step="1" inputmode="numeric"></label><label for="motor-torque-rise-rate">升扭斜率（Nm/s，0=直接跟随 PID 输出）<input id="motor-torque-rise-rate" type="number" min="0" max="32000" step="1" inputmode="decimal" required></label></div></fieldset><p id="vehicle-hard-limits" class="muted">等待车端硬上限与 PID 默认值</p><label><input id="control-limits-confirm" type="checkbox">我已确认车辆处于 N 挡、零速、电子驻车或隔离 mock 台架，并理解 0 表示取消升扭限制、可能单周期达到会话转矩上限</label><div><button id="control-limits-apply" disabled>发送并等待车端确认</button><button id="control-limits-cancel">取消</button></div></dialog></main><script>)HTML" + std::string(web::kControlLogicJavaScript) + R"HTML(</script><script>
+MineTeleopSessionLogs.install();
 const controlLogic=MineTeleopControlLogic;
 const consoleConfig=)HTML" + page_config.dump() + R"HTML(;
 const gamepadConfig=consoleConfig.gamepad;
@@ -1611,11 +1613,14 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
       throw std::invalid_argument("auth.approver_token_ttl_ms must be an integer");
     }
   }
-  if (!config.mobile_approval_vehicles.empty() || std::filesystem::exists("config/app-token")) {
+  const auto app_password_file = optional_yaml_string(auth, "mobile_app_password_file", "auth");
+  const auto default_app_password_file = base_path / "secrets/app-token";
+  if (!config.mobile_approval_vehicles.empty() || app_password_file.has_value() ||
+      std::filesystem::exists(default_app_password_file)) {
     YAML::Node app_secret;
-    app_secret["password_file"] = "config/app-token";
+    app_secret["password_file"] = app_password_file.value_or("secrets/app-token");
     config.mobile_app_password = load_identity_secret(
-        app_secret, "password_file", "password_env", std::filesystem::current_path(), "mobile app");
+        app_secret, "password_file", "password_env", base_path, "mobile app");
   }
   for (const auto& [driver_id, permissions] : config.driver_vehicle_permissions) {
     for (const auto& vehicle_id : permissions) {
@@ -1860,7 +1865,7 @@ SignalingService::SignalingService(
     throw std::invalid_argument("mobile approval timeout must be between 1 and 600000 ms");
   }
   if (!config_.mobile_approval_vehicles.empty() && config_.mobile_app_password.empty()) {
-    throw std::invalid_argument("mobile approval requires a non-empty config/app-token");
+    throw std::invalid_argument("mobile approval requires a non-empty mobile app password");
   }
   for (const auto& vehicle : config_.mobile_approval_vehicles) {
     if (!config_.device_tokens.contains(vehicle)) throw std::invalid_argument("unknown mobile approval vehicle");
@@ -1955,6 +1960,7 @@ SignalingService::SignalingService(
        {"audit_log_files", config_.audit_log_files},
        {"audit_log_rotation_interval_ms", config_.audit_log_rotation_interval_ms},
        {"audit_log_retention_days", config_.audit_log_retention_days}});
+  session_logs_ = std::make_unique<SessionLogBroker>(config_.audit_log_path);
   connection_reaper_ = std::jthread([this](std::stop_token stop_token) {
     while (!stop_token.stop_requested()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(config_.connection_reaper_interval_ms));
@@ -2238,6 +2244,78 @@ void SignalingService::close_session(Session& session, std::string_view reason) 
   next_delivery_cursors_.erase(message_key(session.session_id, session.vehicle_id));
   if (session.state != SessionState::Stopping) transition_session(session, SessionState::Stopping, reason);
   transition_session(session, SessionState::Closed, reason);
+  remember_log_session(session, now_ms());
+}
+
+void SignalingService::remember_log_session(const Session& session, std::int64_t ended_at) {
+  session_logs_->remember({{"key", service_instance_id_ + "_" + session.session_id},
+      {"service_instance_id", service_instance_id_}, {"session_id", session.session_id},
+      {"driver_id", session.driver_id}, {"vehicle_id", session.vehicle_id},
+      {"started_at_utc_ms", session.started_at_utc_ms}, {"ended_at_utc_ms", ended_at}});
+}
+
+ServerResponse SignalingService::handle_diagnostics(const HttpRequest& request) {
+  if (request.method != "POST") return ServerResponse::json(405, {{"error", "POST required"}});
+  const auto value = request.json_body();
+  const auto operation = required_string(value, "operation");
+  if (request.path == "/diagnostics/vehicle") {
+    const auto vehicle = required_string(value, "vehicle_id");
+    bool idle = true;
+    {
+      std::lock_guard lock(mutex_);
+      validate_device_token(vehicle, optional_string(value, "device_token"));
+      for (const auto& [id, session] : sessions_) {
+        (void)id;
+        if (session.vehicle_id == vehicle && session.state != SessionState::Closed) idle = false;
+      }
+    }
+    return ServerResponse::json(200, session_logs_->vehicle(vehicle, value, idle));
+  }
+  if (request.path != "/diagnostics/driver") return ServerResponse::json(404, {{"error", "not found"}});
+  const auto driver = required_string(value, "driver_id");
+  std::unordered_set<std::string> allowed;
+  {
+    std::lock_guard lock(mutex_);
+    validate_driver_token(driver, optional_string(value, "token"));
+    const auto permissions = config_.driver_vehicle_permissions.find(driver);
+    if (permissions != config_.driver_vehicle_permissions.end()) allowed = permissions->second;
+  }
+  if (operation == "list") {
+    auto records = session_logs_->sessions(driver);
+    std::erase_if(records.get_ref<Json::array_t&>(), [&](const Json& r) {
+      return !allowed.contains(r.at("vehicle_id").get<std::string>());
+    });
+    return ServerResponse::json(200, {{"sessions", records}});
+  }
+  if (operation == "start") {
+    const auto record = session_logs_->session(required_string(value, "key"), driver);
+    const auto vehicle = record.at("vehicle_id").get<std::string>();
+    if (!allowed.contains(vehicle)) throw Unauthorized("vehicle permission was revoked");
+    bool online;
+    {
+      std::lock_guard lock(mutex_);
+      cleanup_expired_connections(now_ms());
+      online = online_vehicles_.contains(vehicle);
+      for (const auto& [id, session] : sessions_) {
+        (void)id;
+        if ((session.vehicle_id == vehicle || session.driver_id == driver) && session.state != SessionState::Closed)
+          throw Conflict("end the active control session before collecting logs");
+      }
+    }
+    return ServerResponse::json(200, session_logs_->start(record, online));
+  }
+  const auto id = required_string(value, "export_id");
+  // Check ownership and current permissions on every download, not only at creation.
+  const auto state = session_logs_->status(id, driver);
+  if (!allowed.contains(state.at("session").at("vehicle_id").get<std::string>()))
+    throw Unauthorized("vehicle permission was revoked");
+  if (operation == "status") return ServerResponse::json(200, session_logs_->status(id, driver, value.value("finish_partial", false)));
+  if (operation == "chunk") return ServerResponse::json(200, session_logs_->chunk(id, driver, value));
+  if (operation == "release") {
+    session_logs_->release(id, driver);
+    return ServerResponse::json(200, {{"released", true}});
+  }
+  throw std::invalid_argument("unknown log export operation");
 }
 
 std::string SignalingService::approver_login_bucket(const HttpRequest& request, std::int64_t timestamp_ms) {
@@ -2593,7 +2671,10 @@ ServerResponse SignalingService::handle(const HttpRequest& request) {
       std::lock_guard lock(mutex_);
       enforce_api_rate_limit(request, now_ms());
     }
-    if (request.path.starts_with("/mobile/api/")) {
+    if (request.path.starts_with("/diagnostics/")) {
+      response = handle_diagnostics(request);
+      response.headers.emplace_back("Cache-Control", "no-store");
+    } else if (request.path.starts_with("/mobile/api/")) {
       std::lock_guard lock(mutex_);
       cleanup_expired_connections(now_ms());
       response = handle_mobile_api(request);
@@ -3668,11 +3749,13 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
         .session_id = id.str(),
         .vehicle_id = vehicle_id,
         .driver_id = driver_id,
+        .started_at_utc_ms = now_ms(),
         .state = SessionState::Online,
         .control_token = "control-token-" + random_token(),
         .control_token_expires_at_ms = now_ms() + config_.control_token_ttl_ms};
     sessions_[session.session_id] = session;
     auto& stored = sessions_.at(session.session_id);
+    remember_log_session(stored);
     if (config_.mobile_approval_vehicles.contains(vehicle_id)) {
       mobile_approvals_.at(vehicle_id).session_id = stored.session_id;
     }
@@ -4176,6 +4259,7 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
 }
 
 DriverConsoleRuntime::~DriverConsoleRuntime() {
+  if (log_export_) log_export_->cancel();
   native_control_sender_.request_stop();
   native_control_lease_.request_stop();
   native_control_cv_.notify_all();
@@ -5059,8 +5143,12 @@ Json DriverConsoleRuntime::await_control_session(
 Json DriverConsoleRuntime::connect(std::string_view requested_vehicle_id) {
   std::unique_lock operation(authentication_mutex_, std::try_to_lock);
   if (!operation.owns_lock()) throw std::runtime_error("已有连接或退出操作正在进行");
+  // Capture cancellation before checking shutdown so a concurrent shutdown cannot
+  // leave this request waiting on a newer, uncancelled generation.
+  const auto generation = connect_cancellation_generation_.load();
+  if (shutting_down_.load()) throw std::runtime_error("控制端正在退出");
   try {
-    auto result = connect_locked(requested_vehicle_id, connect_cancellation_generation_.load());
+    auto result = connect_locked(requested_vehicle_id, generation);
     std::lock_guard lock(mutex_);
     pending_mobile_approval_ = Json::object();
     return result;
@@ -5267,6 +5355,13 @@ Json DriverConsoleRuntime::end_session_locked(std::string_view reason) {
 }
 
 void DriverConsoleRuntime::prepare_shutdown() {
+  shutting_down_.store(true);
+  {
+    std::lock_guard lock(log_export_mutex_);
+    if (log_export_) log_export_->cancel();
+  }
+  // The HTTP server joins active connect handlers before disconnect() runs.
+  cancel_pending_connect();
   // Drop the local control generation before any potentially slow logout I/O.
   reset_native_control_state();
 }
@@ -6013,6 +6108,51 @@ Json DriverConsoleRuntime::status() {
   };
 }
 
+Json DriverConsoleRuntime::log_sessions() {
+  std::string token;
+  { std::lock_guard lock(mutex_); token = driver_token_; }
+  if (token.empty()) throw std::invalid_argument("请先登录后查看会话日志");
+  HttpClient http(std::chrono::seconds(2), config_.resolve_entries, config_.ca_bundle);
+  return http.post_json_response(signaling_http_url_ + "/diagnostics/driver",
+      {{"operation", "list"}, {"driver_id", driver_id()}, {"token", token}});
+}
+
+Json DriverConsoleRuntime::start_log_export(std::string_view key) {
+  std::lock_guard operation(authentication_mutex_);
+  if (shutting_down_.load()) throw std::invalid_argument("控制端正在退出");
+  std::string token;
+  {
+    std::lock_guard lock(mutex_);
+    if (!session_id_.empty()) throw std::invalid_argument("请先结束控制会话再导出日志");
+    token = driver_token_;
+  }
+  if (token.empty()) throw std::invalid_argument("请先登录后导出日志");
+  std::lock_guard lock(log_export_mutex_);
+  if (log_export_ && log_export_->status().at("state") == "collecting")
+    throw std::invalid_argument("已有日志导出任务正在进行");
+  log_export_ = std::make_unique<ControllerLogExport>(signaling_http_url_, config_.resolve_entries,
+      config_.ca_bundle, driver_id(), token, std::string(key), config_.browser_event_log_path);
+  log_export_owner_token_ = token;
+  return log_export_->status();
+}
+
+Json DriverConsoleRuntime::log_export_status() const {
+  std::string token;
+  { std::lock_guard lock(mutex_); token = driver_token_; }
+  std::lock_guard lock(log_export_mutex_);
+  if (!log_export_ || token.empty() || token != log_export_owner_token_) return {{"state", "idle"}};
+  return log_export_->status();
+}
+
+std::string DriverConsoleRuntime::log_export_zip() const {
+  std::string token;
+  { std::lock_guard lock(mutex_); token = driver_token_; }
+  std::lock_guard lock(log_export_mutex_);
+  if (!log_export_ || token.empty() || token != log_export_owner_token_)
+    throw std::invalid_argument("当前登录无可下载的会话日志");
+  return log_export_->zip();
+}
+
 void DriverConsoleRuntime::append_driver_log_record(const Json& record) const {
   if (config_.browser_event_log_path.empty()) return;
   const auto line = record.dump() + "\n";
@@ -6102,6 +6242,17 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
     if (request.method == "GET" && request.path == "/api/time") return ServerResponse::json(200, {{"now_ms", now_ms()}});
     if (request.method == "GET" && request.path == "/api/status") return ServerResponse::json(200, runtime_->status());
     if (request.method == "GET" && request.path == "/api/vehicles") return ServerResponse::json(200, runtime_->vehicles());
+    if (request.method == "GET" && request.path == "/api/log-sessions") return ServerResponse::json(200, runtime_->log_sessions());
+    if (request.method == "POST" && request.path == "/api/log-export")
+      return ServerResponse::json(202, runtime_->start_log_export(required_string(request.json_body(), "key")));
+    if (request.method == "GET" && request.path == "/api/log-export")
+      return ServerResponse::json(200, runtime_->log_export_status());
+    if (request.method == "GET" && request.path == "/api/log-export/download") {
+      auto response = ServerResponse::text(200, runtime_->log_export_zip(), "application/zip");
+      response.headers.emplace_back("Content-Disposition", "attachment; filename=mine-teleop-session.zip");
+      response.headers.emplace_back("Cache-Control", "no-store");
+      return response;
+    }
     if (request.method == "GET" && request.path == "/api/control-limits") return ServerResponse::json(200, runtime_->control_limits());
     if (request.method == "GET" && request.path == "/api/control-profile") return ServerResponse::json(200, runtime_->control_profile());
     if (request.method == "GET" && request.path == "/") {

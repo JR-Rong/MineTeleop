@@ -52,7 +52,9 @@ Behavior options:
   -h, --help                   Show this help.
 
 Existing /etc/mine-teleop and proxy configuration is reused unless a replacement
-is explicitly supplied. The package never creates credentials.
+is explicitly supplied. Legacy config/app-token is migrated to
+/etc/mine-teleop/secrets/app-token if that persistent file does not exist.
+The package never creates credentials.
 EOF
 }
 
@@ -264,6 +266,7 @@ if [[ "$dry_run" == "true" ]]; then
     "start_services=$start_services" \
     "signaling_config=${signaling_config:-preserve-existing}" \
     "identity_secrets_dir=${identity_secrets_dir:-preserve-existing}" \
+    "mobile_app_password=migrate-legacy-if-persistent-file-missing" \
     "turn_realm=${turn_realm:-not-configured}" \
     "turn_host=${turn_host:-not-configured}" \
     "caddy_config=${caddy_config:-preserve-existing}" \
@@ -333,6 +336,16 @@ install_config_file() {
   install -D -m "$mode" "$source" "$destination"
 }
 
+install -d -m 0750 "$config_dir" "$config_dir/secrets" "$config_dir/tls"
+# Preserve the existing approval password before replacing the application tree.
+# An already provisioned persistent secret wins; explicit secret inputs below may
+# still rotate it, just like other identity credentials.
+if [[ ! -e "$config_dir/secrets/app-token" && ! -L "$config_dir/secrets/app-token" &&
+      -f "$prefix/config/app-token" ]]; then
+  printf '==> migrating the mobile approval password to the persistent secrets directory\n'
+  install_config_file "$prefix/config/app-token" "$config_dir/secrets/app-token" 0600
+fi
+
 package_real="$(CDPATH= cd -- "$package_root" && pwd -P)"
 prefix_real=""
 if [[ -d "$prefix" ]]; then
@@ -354,7 +367,6 @@ else
   printf '==> application bundle is already installed under %s\n' "$prefix"
 fi
 
-install -d -m 0750 "$config_dir" "$config_dir/secrets" "$config_dir/tls"
 if [[ -n "$environment_file" ]]; then
   install_config_file "$environment_file" "$config_dir/mine-teleop.env" 0600
 elif [[ ! -f "$config_dir/mine-teleop.env" ]]; then

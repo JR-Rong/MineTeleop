@@ -23,6 +23,8 @@
 namespace mine_teleop {
 
 class AsyncControlTrace;
+class SessionLogBroker;
+class ControllerLogExport;
 
 struct HttpRequest {
   std::string method;
@@ -93,7 +95,7 @@ struct SignalingServerConfig {
   std::unordered_map<std::string, std::unordered_set<std::string>> driver_vehicle_permissions{
       {"driver-console-001", {"vehicle-001"}}};
   std::string admin_token;
-  std::string mobile_app_password;  // Loaded from config/app-token by the cloud identity loader.
+  std::string mobile_app_password;  // Relative to the identity YAML (default: secrets/app-token).
   std::unordered_set<std::string> mobile_approval_vehicles;
   std::int64_t mobile_approval_timeout_ms{120 * 1000};
   std::int64_t approver_token_ttl_ms{12 * 60 * 60 * 1000};
@@ -180,6 +182,7 @@ class SignalingService {
     std::string session_id;
     std::string vehicle_id;
     std::string driver_id;
+    std::int64_t started_at_utc_ms{0};
     SessionState state{SessionState::Online};
     std::string control_token;
     std::int64_t control_token_expires_at_ms{0};
@@ -222,6 +225,8 @@ class SignalingService {
 
   [[nodiscard]] ServerResponse handle_get(const HttpRequest& request);
   [[nodiscard]] ServerResponse handle_post(const HttpRequest& request);
+  [[nodiscard]] ServerResponse handle_diagnostics(const HttpRequest& request);
+  void remember_log_session(const Session& session, std::int64_t ended_at = 0);
   [[nodiscard]] Json enqueue_signaling_message(
       std::string_view session_id,
       const Json& value,
@@ -289,6 +294,7 @@ class SignalingService {
   std::unordered_map<std::string, ApiRateState> api_rate_limits_;
   ApiRateState api_rate_limit_overflow_;
   std::unique_ptr<AsyncControlTrace> native_control_trace_;
+  std::unique_ptr<SessionLogBroker> session_logs_;
   std::int64_t api_rate_limit_last_cleanup_ms_{0};
   std::uint64_t api_rate_limited_requests_{0};
   std::uint64_t session_counter_{0};
@@ -374,6 +380,10 @@ class DriverConsoleRuntime {
   [[nodiscard]] Json update_control_intent(const Json& input);
   [[nodiscard]] Json record_browser_event(const Json& input);
   [[nodiscard]] Json status();
+  [[nodiscard]] Json log_sessions();
+  [[nodiscard]] Json start_log_export(std::string_view key);
+  [[nodiscard]] Json log_export_status() const;
+  [[nodiscard]] std::string log_export_zip() const;
   [[nodiscard]] const DriverConfig& config() const { return config_; }
 
  private:
@@ -410,6 +420,9 @@ class DriverConsoleRuntime {
   [[nodiscard]] Json control_profile_locked() const;
 
   DriverConfig config_;
+  mutable std::mutex log_export_mutex_;
+  std::unique_ptr<ControllerLogExport> log_export_;
+  std::string log_export_owner_token_;
   // Runtime identity is independent of the optional legacy configuration default.
   mutable std::mutex identity_mutex_;
   std::string driver_id_;
@@ -422,6 +435,7 @@ class DriverConsoleRuntime {
   std::mutex approval_wait_mutex_;
   std::condition_variable approval_wait_cv_;
   std::atomic<std::uint64_t> connect_cancellation_generation_{0};
+  std::atomic<bool> shutting_down_{false};
   Json pending_mobile_approval_ = Json::object();
   mutable std::mutex browser_event_log_mutex_;
   mutable std::mutex time_sync_mutex_;

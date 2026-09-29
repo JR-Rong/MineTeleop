@@ -2103,8 +2103,10 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   }
   if (!config.vehicle_adapter.bridge_library_path.empty() &&
       config.vehicle_adapter.bridge_library_path.is_relative()) {
+    // The vehicle launcher sets cwd to the installation root before loading
+    // any configuration, including overrides outside the package directory.
     config.vehicle_adapter.bridge_library_path = std::filesystem::absolute(
-        std::filesystem::path(path).parent_path() / config.vehicle_adapter.bridge_library_path).lexically_normal();
+        config.vehicle_adapter.bridge_library_path).lexically_normal();
   }
   if (config.vehicle_adapter.can_interface != config.hardware.can_interface) {
     throw std::runtime_error("hardware.can.interface and vehicle adapter can_interface must match");

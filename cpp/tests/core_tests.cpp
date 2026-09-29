@@ -1453,7 +1453,22 @@ void test_field_config_pins_tls_route_without_system_dns() {
   expect(config.vehicle_adapter.type == "can" && config.field_safety.max_speed_kph == 10.0,
       "field defaults must use CAN at 10 km/h");
   expect(config.vehicle_adapter.bridge_library_path.is_absolute(),
-      "relative bundled bridge path was not resolved against config directory");
+      "relative bundled bridge path was not resolved against package root");
+  expect(config.vehicle_adapter.bridge_library_path == std::filesystem::absolute(
+      "lib/vendor/chassis/libmine_teleop_chassis_bridge.so").lexically_normal(),
+      "bridge path incorrectly includes the config directory");
+  const auto external_config = write_temp_vehicle_config("external-field-config",
+      read_text("configs/vehicle-agent.three-machine.field.yaml"));
+  expect(mine_teleop::load_vehicle_config(external_config).vehicle_adapter.bridge_library_path ==
+      config.vehicle_adapter.bridge_library_path, "external YAML changed package-relative bridge root");
+  const auto cameras = config.enabled_cameras();
+  expect(cameras.size() == 2, "default capture-card channel count changed");
+  for (std::size_t index = 0; index < cameras.size(); ++index) {
+    const auto& camera = cameras[index];
+    expect(camera.backend == "ccg2" && camera.device == "/dev/ccg2-channel-" + std::to_string(index) &&
+        camera.capture_width == 1920 && camera.capture_height == 1080 && camera.capture_fps == 30 &&
+        camera.critical_for_control, "field capture-card configuration is inconsistent");
+  }
   expect_near(
       config.field_safety.full_scale_motor_torque_nm,
       640.0,

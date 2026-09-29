@@ -4,11 +4,13 @@ const path=require('node:path');
 const fs=require('node:fs');
 const {NativeController}=require('./native-controller.cjs');
 const {prepareLogDirectory}=require('./log-directory.cjs');
+const {createDiagnosticLog}=require('./diagnostic-log.cjs');
 
 app.setName('MineTeleop');
 const root=app.isPackaged?path.join(process.resourcesPath,'controller'):process.env.MINE_TELEOP_DESKTOP_ROOT;
 const projectRoot=app.isPackaged?(process.platform==='darwin'?path.resolve(path.dirname(process.execPath),'../../..'):path.dirname(process.execPath)):root;
 let logDirectory=null;
+let diagnosticLog=null;
 let window=null,controller=null,quitting=false,finished=false;
 if(!app.requestSingleInstanceLock())app.quit();
 else{
@@ -26,16 +28,23 @@ async function shutdown(){
     const result=await controller.stop();
     if(result.forced)fs.appendFileSync(path.join(logDirectory,'desktop-events.jsonl'),JSON.stringify({event:'native_shutdown_timeout',at:new Date().toISOString()})+'\n');
   }}catch(error){console.error('Desktop shutdown:',error.message);}
-  finally{finished=true;app.quit();}
+  finally{if(diagnosticLog){diagnosticLog.write('desktop_stopped');await diagnosticLog.flush();}finished=true;app.quit();}
 }
 
 async function start(){
   if(!root)throw Error('开发模式需指定 MINE_TELEOP_DESKTOP_ROOT；正式包自动使用随包控制服务。');
   logDirectory=prepareLogDirectory({projectRoot:path.resolve(projectRoot),getFallbackDirectory:()=>app.getPath('logs')});
-  controller=new NativeController({root:path.resolve(root),logPath:path.join(logDirectory,'control-browser-events.jsonl')});
+  diagnosticLog=createDiagnosticLog(path.join(logDirectory,'desktop-events.jsonl'));
+  diagnosticLog.write('desktop_started');
+  controller=new NativeController({root:path.resolve(root),logPath:path.join(logDirectory,'control-browser-events.jsonl'),onDiagnostic:diagnosticLog.write});
   controller.on('exit',({expected})=>{if(!expected&&!quitting){dialog.showErrorBox('控制服务已停止','本地控制服务异常退出，窗口将关闭。请查看日志后重新启动。');void shutdown();}});
   const url=await controller.start();if(quitting)return;
   const origin=new URL(url).origin;
+  session.defaultSession.on('will-download',(event,item,contents)=>{
+    if(!window||contents!==window.webContents){event.preventDefault();return;}
+    if(!item.getFilename().endsWith('.zip')){event.preventDefault();return;}
+    item.setSaveDialogOptions({title:'保存会话日志 ZIP',defaultPath:path.join(app.getPath('downloads'),path.basename(item.getFilename())),filters:[{name:'ZIP 日志归档',extensions:['zip']}]});
+  });
   session.defaultSession.setPermissionRequestHandler((contents,permission,callback)=>callback(permission==='fullscreen'&&contents.getURL().startsWith(origin+'/')));
   session.defaultSession.setPermissionCheckHandler((contents,permission,requestingOrigin)=>permission==='fullscreen'&&requestingOrigin===origin);
   window=new BrowserWindow({title:'MineTeleop 控制台',width:1600,height:1000,minWidth:800,minHeight:600,show:false,backgroundColor:'#08111d',autoHideMenuBar:true,

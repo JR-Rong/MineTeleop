@@ -14,6 +14,7 @@ output/
 /configs/*.password
 /configs/*.token
 /config/app-token
+/configs/secrets/app-token
 __pycache__/
 *.pyc
 

@@ -80,6 +80,9 @@ if [[ "$run_tests" == "ON" ]]; then
 fi
 
 mv "$temporary/artifact" "$output_root"
+if [[ "$run_tests" == "ON" ]]; then
+  bash "$repo_root/scripts/test/check_cloud_approval_secret_upgrade.sh" "$output_root"
+fi
 
 archive="$output_root.tar.gz"
 COPYFILE_DISABLE=1 tar --no-xattrs \

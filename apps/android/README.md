@@ -1,6 +1,6 @@
 # 手机授权 · Android
 
-原生 Java / Android Views App，支持 Android 8.0+。只输入统一 App 密码登录；云端从工作目录的 `config/app-token` 读取该密码。没有用户名，也没有内嵌网页。
+原生 Java / Android Views App，支持 Android 8.0+。只输入统一 App 密码登录；云端通过 `auth.mobile_app_password_file` 读取密码，默认是 identity YAML 所在目录的 `secrets/app-token`（生产路径 `/etc/mine-teleop/secrets/app-token`）。没有用户名，也没有内嵌网页。
 
 ## 构建与安装
 
@@ -14,7 +14,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 `app-debug.apk` 是可直接安装的调试签名包。正式发行需要使用团队持有的签名密钥配置 release 签名；仓库不包含生产签名密钥。
 
-默认连接服务器 `60.205.213.254` 的 HTTPS 入口 `https://60-205-213-254.nip.io:6000`，登录页直接显示当前地址。只需输入 `config/app-token` 中的密码并开始值守。已有安装会保留手动保存的地址；可在“连接设置”点击“恢复默认”再保存。自定义地址不包含 `/mobile/` 路径。云端配置参考 `../../docs/28-mobile-control-approval.md`。
+默认连接服务器 `60.205.213.254` 的 HTTPS 入口 `https://60-205-213-254.nip.io:6000`，登录页直接显示当前地址。只需输入云端审批密码文件中的密码并开始值守。已有安装会保留手动保存的地址；可在“连接设置”点击“恢复默认”再保存。自定义地址不包含 `/mobile/` 路径。云端配置参考 `../../docs/28-mobile-control-approval.md`。
 
 默认校验证书且禁止明文 HTTP。仅 debug 版本允许 `localhost`、`127.0.0.1` 和 Android 模拟器宿主 `10.0.2.2` 的 HTTP，便于本地联调。例如模拟器设置 `http://10.0.2.2:18779`。release 始终要求 HTTPS；不包含跳过证书验证的开关。
 

@@ -53,25 +53,27 @@ media:
       segment_seconds: 2
 
 cameras:
-  - id: front_uvc
+  - id: ccg2_channel_0
     enabled: true
     critical_for_control: true
     reopen_attempts: 3
     reopen_backoff_ms: 500
-    device: /dev/v4l/by-id/usb-Generic_USB_Camera_200901010001-video-index0
-    capture_width: 1280
-    capture_height: 720
+    backend: ccg2
+    device: /dev/ccg2-channel-0
+    capture_width: 1920
+    capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p30
     record_profile: reuse_realtime
-  - id: basler_25192546
+  - id: ccg2_channel_1
     enabled: true
     critical_for_control: true
     reopen_attempts: 3
     reopen_backoff_ms: 500
-    device: basler:serial=25192546
-    capture_width: 1280
-    capture_height: 720
+    backend: ccg2
+    device: /dev/ccg2-channel-1
+    capture_width: 1920
+    capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p30
     record_profile: reuse_realtime
@@ -148,4 +150,4 @@ vehicle_adapter:
   integration:
     chassis_control:
       can_interface: can1
-      bridge_library_path: ../lib/vendor/chassis/libmine_teleop_chassis_bridge.so
+      bridge_library_path: ./lib/vendor/chassis/libmine_teleop_chassis_bridge.so

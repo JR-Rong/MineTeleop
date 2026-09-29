@@ -839,7 +839,11 @@ fps/低分辨率 profile，pipeline hook 成功后才更新活动状态。
 
 现场车端模板和车端类型缺省值使用 `can`；显式 `mock` 的开发/测试模板保持模拟。
 现场模板硬上限为 10 km/h、油门 1.0、转向 30°、单电机 640 Nm、普通制动 327.6 bar。
-相对 `bridge_library_path` 以车端 YAML 所在目录解析。CAN 接口默认为现场模板的 `can1`。
+相对 `bridge_library_path` 以车端进程工作目录（安装包根目录）解析，例如
+`./lib/vendor/chassis/libmine_teleop_chassis_bridge.so`。`mine-teleop-run` 会先切换到
+自身所在安装包根目录，所以从任意目录调用启动器、或使用包外 YAML 时结果一致。
+直接运行原生二进制时应先进入安装包根目录，或使用绝对 bridge 路径。
+设备令牌和 CA 的相对路径仍以 YAML 所在目录解析。CAN 接口默认为现场模板的 `can1`。
 
 控制页收到车辆硬上限后，首次会话默认取目标速度、转矩、普通制动压力的一半；
 转向使用车辆允许上限（不超过 30°），PID 和升扭标定沿用车端默认值。
@@ -858,3 +862,11 @@ fps/低分辨率 profile，pipeline hook 成功后才更新活动状态。
 
 车端运行程序、CAN bridge 和控制端须一起升级；旧 bridge 缺少新能力时会在初始化
 CAN 前拒绝启动，旧会话参数不会被默默按新行为解释。本地软件/模拟 CAN 测试不替代实车验收。
+
+### 默认采集卡输入
+
+发布车端包默认使用 `vehicle-agent.three-machine.field.yaml` 中 CCG2-8M 的 CH0/CH1，
+采集 `1920x1080@30`，经 `realtime_720p30` 输出 `1280x720@30`。
+两路均为控制关键相机，使用 `/dev/ccg2-channel-0` 和 `-1` 稳定节点。
+内核驱动、稳定链接及板卡初始化须由目标主机提供；这些前提不由 YAML 自动安装。
+开发用 mock/testsrc 配置仍用于无硬件测试，不作为发布默认值。

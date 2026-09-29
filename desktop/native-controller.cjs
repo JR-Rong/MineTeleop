@@ -16,8 +16,8 @@ function controllerEnvironment(root,source=process.env,platform=process.platform
 }
 
 class NativeController extends EventEmitter {
-  constructor({root,logPath,startupMs=20000,shutdownMs=8000,spawnProcess=spawn,platform=process.platform}){
-    super();Object.assign(this,{root,logPath,startupMs,shutdownMs,spawnProcess,platform});
+  constructor({root,logPath,startupMs=20000,shutdownMs=8000,spawnProcess=spawn,platform=process.platform,onDiagnostic=()=>{}}){
+    super();Object.assign(this,{root,logPath,startupMs,shutdownMs,spawnProcess,platform,onDiagnostic});
     this.child=null;this.exited=false;this.stopping=false;this.stopPromise=null;
   }
   start(){
@@ -33,8 +33,9 @@ class NativeController extends EventEmitter {
         });
       }catch(error){this.exited=true;fail(error);return;}
       this.child.stdin.on('error',()=>{}); // The child may exit before the shutdown write.
-      this.child.stderr.on('data',()=>{}); // Always drain; never block the native control loop on a full pipe.
+      this.child.stderr.on('data',chunk=>this.onDiagnostic('native_stderr',{message:chunk.toString()}));
       this.child.stdout.on('data',chunk=>{
+        this.onDiagnostic('native_stdout',{message:chunk.toString()});
         buffer+=chunk.toString();
         if(buffer.length>65536){buffer='';return;}
         let newline;

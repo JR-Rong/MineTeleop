@@ -1,6 +1,7 @@
-# Example only: provision driver/vehicle secrets and config/app-token before starting.
-# config/app-token is relative to the cloud process working directory.
+# Example only: provision driver/vehicle secrets and secrets/app-token before starting.
+# Relative secret paths are resolved against this YAML's directory, not the working directory.
 auth:
+  mobile_app_password_file: secrets/app-token
   mobile_approval_timeout_ms: 120000
   approver_token_ttl_ms: 43200000 # 12 hours; independent of driver login
   drivers:

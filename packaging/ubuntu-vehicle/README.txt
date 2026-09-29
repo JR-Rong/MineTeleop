@@ -22,16 +22,22 @@ separately rotated vcu-can.jsonl. Recognizable vendor ChassisControl output,
 including the per-cycle bare line "UpdateVehicleState" and its formatted
 "[timestamp] [level] [pid] [tag]" logs, stays on the terminal only and is not
 persisted; Mine Teleop structured diagnostics are still recorded. The default field
-configuration uses the mock adapter and
-max_speed_kph=0; do not enable a physical chassis before the separate CAN,
-braking, and local emergency-stop acceptance is complete.
+configuration uses CAN1 at 500 kbit/s, max_speed_kph=10 and a 640 Nm per-motor
+hard request ceiling. commissioning_mode=bench does not disable CAN output.
+Review and calibrate session parameters before enabling a physical chassis.
+The relative bridge path ./lib/vendor/chassis/libmine_teleop_chassis_bridge.so
+is resolved from the package root; mine-teleop-run sets that working directory.
 
 Camera count:
 
   Each cameras entry with enabled: true in config/vehicle-agent.yaml creates
-  one WebRTC video track. The packaged field configuration enables the stable
-  UVC path front_uvc and Basler serial 25192546. Changing the enabled set
-  requires a media-session restart.
+  one WebRTC video track. The packaged field configuration enables CCG2-8M
+  channels 0 and 1 using backend=ccg2 and /dev/ccg2-channel-0 and -1.
+  Capture is 1920x1080 at 30 fps; encoded output is 1280x720 at 30 fps.
+  Install and initialize the board's kernel driver and ccg2-support stable
+  device links on the target host first. STREAMON alone does not prove frames
+  are arriving: verify nonempty buffers and vehicle_camera_first_frame.
+  Changing the enabled set requires a media-session restart.
 
 ICE policy:
 

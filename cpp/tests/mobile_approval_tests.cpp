@@ -275,20 +275,37 @@ void yaml_policy() {
   const auto path = root / "config.yaml";
   std::ofstream(path) << prefix;
   const auto previous = std::filesystem::current_path();
-  std::filesystem::create_directory(root / "config");
-  std::filesystem::current_path(root);
+  std::filesystem::create_directory(root / "secrets");
+  std::filesystem::create_directories(root / "application/config");
+  std::ofstream(root / "application/config/app-token") << "wrong-cwd-secret\n";
+  std::filesystem::current_path(root / "application");
   try {
     for (int mode = 0; mode < 2; ++mode) {
-      if (mode == 1) std::ofstream(root / "config/app-token") << "\n";
+      if (mode == 1) std::ofstream(root / "secrets/app-token") << "\n";
       bool rejected = false;
       try { load_signaling_identity_config(path); } catch (const std::exception&) { rejected = true; }
-      check(rejected, "missing or empty config/app-token accepted");
+      check(rejected, "missing or empty persistent app password accepted (or cwd password used)");
     }
-    std::ofstream(root / "config/app-token") << "app-file-secret\n";
-    const auto loaded = load_signaling_identity_config(path);
-    check(loaded.mobile_approval_vehicles.contains("v") && loaded.mobile_approval_timeout_ms == 75000 &&
-        loaded.approver_token_ttl_ms == 600001 && loaded.mobile_app_password == "app-file-secret", "config/app-token was not loaded");
-    SignalingService validated(loaded);
+    std::ofstream(root / "secrets/app-token") << "app-file-secret\n";
+    for (const auto& cwd : {root, root / "application"}) {
+      std::filesystem::current_path(cwd);
+      const auto loaded = load_signaling_identity_config(path);
+      check(loaded.mobile_approval_vehicles.contains("v") && loaded.mobile_approval_timeout_ms == 75000 &&
+          loaded.approver_token_ttl_ms == 600001 && loaded.mobile_app_password == "app-file-secret",
+          "default app password depends on working directory");
+      SignalingService validated(loaded);
+      for (const auto& secret_path : {std::filesystem::path("secret"), root / "secret"}) {
+        std::ofstream(path) << prefix << "  mobile_app_password_file: " << secret_path.generic_string() << '\n';
+        check(load_signaling_identity_config(path).mobile_app_password == "test-only-secret",
+            "explicit app password path was not resolved against identity YAML");
+      }
+      std::ofstream(path) << prefix;
+    }
+    std::filesystem::remove(root / "secrets/app-token");
+    auto no_approval = prefix;
+    no_approval.replace(no_approval.find("required: true"), std::string("required: true").size(), "required: false");
+    std::ofstream(path) << no_approval;
+    check(load_signaling_identity_config(path).mobile_app_password.empty(), "disabled approval requires a password");
   } catch (...) {
     std::filesystem::current_path(previous); std::filesystem::remove_all(root); throw;
   }
@@ -296,7 +313,7 @@ void yaml_policy() {
   std::filesystem::remove_all(root);
 }
 void automatic_driver_runtime() {
-  for (const auto& outcome : {"approve", "reject", "timeout", "logout", "end", "replace"}) {
+  for (const auto& outcome : {"approve", "reject", "timeout", "logout", "end", "replace", "shutdown"}) {
     auto c = configuration(); c.mobile_approval_timeout_ms = 1800;
     SignalingService service(c);
     SimpleHttpServer server("127.0.0.1", 0, [&](const auto& r) { return service.handle(r); }, 8 * 1024 * 1024,
@@ -337,6 +354,10 @@ void automatic_driver_runtime() {
       static_cast<void>(driver.disconnect("test-cancel"));
     } else if (scenario == "end") {
       static_cast<void>(driver.end_session("test-cancel"));
+    } else if (scenario == "shutdown") {
+      driver.prepare_shutdown();
+      check(connecting.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
+          "prepare_shutdown did not wake pending approval before HTTP stop");
     } else if (scenario == "replace") {
       check(post("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","replacement"}}).status == 200, "replacement failed");
     }
@@ -351,6 +372,13 @@ void automatic_driver_runtime() {
     if (scenario != "approve") {
       check(post("/mobile/api/requests/" + id + "/decision", {{"decision","approve"}}, token).status == 409,
           "terminated request can be approved later: " + scenario);
+    }
+    if (scenario == "shutdown") {
+      bool rejected = false;
+      try { static_cast<void>(driver.connect("v1")); } catch (const std::exception&) { rejected = true; }
+      check(rejected, "shutdown allowed a new approval wait");
+      check(http.get_json(base + "/mobile/api/requests", {{"X-Mine-Teleop-Approver-Token", token}})
+          .at("requests").at(0).at("request_id") == id, "shutdown created a replacement approval");
     }
     // Cloud waiting is still on the original ID, even after a terminal state.
     const auto login = post("/auth/driver_heartbeat", {{"driver_id","d1"},{"token","wrong"}});
