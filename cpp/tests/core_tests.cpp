@@ -1190,6 +1190,36 @@ void test_critical_camera_control_latch_persists_until_a_new_session() {
       "latch state was exposed for a non-active session");
 }
 
+void test_camera_startup_grace_and_running_freshness() {
+  using mine_teleop::camera_encoded_frame_fresh;
+  mine_teleop::CriticalCameraControlLatch latch;
+  expect(!latch.enter_session("startup"), "new session inhibited");
+  expect(latch.startup_grace_active("startup", 1000), "startup grace missing");
+  expect(!camera_encoded_frame_fresh(1000, 5000, 3000), "stale startup frame accepted");
+  expect(latch.startup_grace_active("startup", 5000), "startup used running 3s deadline");
+  expect(!latch.enter_session("startup"), "startup reentry inhibited");
+  expect(latch.startup_grace_active("startup", 15999), "grace expired early");
+  expect(!latch.startup_grace_active("startup", 16000), "same-session rebuild extended startup deadline");
+  expect(!camera_encoded_frame_fresh(0, 16000, 3000), "missing encoded frame accepted");
+  expect(!camera_encoded_frame_fresh(16001, 16000, 3000), "future encoded frame accepted");
+  expect(camera_encoded_frame_fresh(8000, 8000, 3000), "recovered startup frame rejected");
+  expect(!latch.enter_session("recovered"), "new session retained old startup deadline");
+  expect(latch.startup_grace_active("recovered", 1000), "second startup missing grace");
+  expect(latch.arm_for_control("recovered"), "fresh admission could not arm");
+  expect(!latch.startup_grace_active("recovered", 1001), "CAN startup retained grace");
+  expect(!latch.enter_session("recovered"), "armed reentry inhibited");
+  expect(!latch.startup_grace_active("recovered", 2000), "rebuild disarmed the running watchdog");
+  expect(camera_encoded_frame_fresh(8000, 11000, 3000), "running timeout boundary rejected");
+  expect(!camera_encoded_frame_fresh(8000, 11001, 3000), "running gap was given startup grace");
+  expect(latch.inhibit("recovered"), "running outage did not latch");
+  expect(!latch.arm_for_control("recovered"), "video recovery bypassed the session latch");
+  expect(!latch.startup_grace_active("recovered", 11002), "fault regained grace");
+  expect_throws([&] { static_cast<void>(latch.arm_for_control("startup")); }, "stale session armed control");
+  expect_throws([&] { static_cast<void>(latch.startup_grace_active("startup", 11002)); }, "stale session queried grace");
+  expect(!latch.enter_session("new-session"), "new session did not clear fault");
+  expect(latch.startup_grace_active("new-session", 12000), "new session inherited armed state");
+}
+
 void test_media_signaling_error_classification_supports_structured_and_legacy_conflicts() {
   using Kind = mine_teleop::MediaSignalingErrorKind;
   struct ConflictCase {
@@ -2760,7 +2790,8 @@ void test_control_service_applies_vehicle_hard_limits() {
   expect_near(telemetry.throttle_feedback, 0.10, 1e-9, "adapter received uncapped throttle");
   expect_near(telemetry.brake_feedback, 0.80, 1e-9, "adapter received a rewritten normalized brake intent");
   expect_near(telemetry.steering_feedback, 0.10, 1e-9, "adapter received uncapped steering");
-  const auto limits = service.control_limits();
+  const auto limits = mine_teleop::vehicle_control_limits(config);
+  expect(limits == service.control_limits(), "startup and active hard-limits wire contracts differ");
   expect_near(limits.at("max_throttle").get<double>(), 0.10, 1e-9, "reported throttle limit mismatch");
   expect_near(
       limits.at("full_scale_motor_torque_nm").get<double>(),
@@ -4012,6 +4043,7 @@ int main() {
       {"missing_v4l2_path_remains_retryable", test_missing_v4l2_path_remains_retryable},
       {"media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes", test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes},
       {"critical_camera_control_latch_persists_until_a_new_session", test_critical_camera_control_latch_persists_until_a_new_session},
+      {"camera_startup_grace_and_running_freshness", test_camera_startup_grace_and_running_freshness},
       {"media_signaling_error_classification_supports_structured_and_legacy_conflicts", test_media_signaling_error_classification_supports_structured_and_legacy_conflicts},
       {"vehicle_config_validates_chassis_control_speed_range", test_vehicle_config_validates_chassis_control_speed_range},
       {"dynamic_adapter_target_speed_uses_configured_ceiling", test_dynamic_adapter_target_speed_uses_configured_ceiling},

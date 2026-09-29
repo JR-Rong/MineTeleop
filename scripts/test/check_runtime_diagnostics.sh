@@ -149,7 +149,7 @@ for text in \
   'inhibit_control_for_critical_camera' \
   'stop_control_for_pipeline_fault(issue_code)' \
   'enforce_critical_camera_freshness' \
-  'last_encoded_steady_ms.load() > 0' \
+  'camera_encoded_frame_fresh' \
   'camera_lane_reopen_scheduled' \
   'camera_reopen_exhausted'; do
   require_text "$media_runtime" "$text"

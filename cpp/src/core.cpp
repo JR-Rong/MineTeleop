@@ -2837,32 +2837,7 @@ VehicleControlService::VehicleControlService(
       telemetry_interval_ms_(telemetry_interval_ms) {
   if (!adapter_) throw std::invalid_argument("vehicle adapter is required");
   if (telemetry_interval_ms_ <= 0) throw std::invalid_argument("telemetry interval must be positive");
-  Json deceleration_profile = Json::array();
-  for (const auto& stage : config.control.deceleration_profile) {
-    deceleration_profile.push_back(
-        {{"after_ms", stage.after_ms}, {"brake", stage.brake}});
-  }
-  read_only_control_safety_ = {
-      {"control_rate_hz", config.control.rate_hz},
-      {"max_command_gap_ms", config.control.max_command_gap_ms},
-      {"degraded_timeout_ms", config.control.degraded_timeout_ms},
-      {"control_timeout_ms", config.control.control_timeout_ms},
-      {"deceleration_profile", std::move(deceleration_profile)},
-      {"speed_feedback_timeout_ms",
-       config.field_safety.speed_feedback_timeout_ms},
-      {"hard_overspeed_margin_kph",
-       config.field_safety.hard_overspeed_margin_kph},
-      {"require_can_feedback_before_control",
-       config.field_safety.require_can_feedback_before_control},
-      {"require_local_estop_reset",
-       config.field_safety.require_local_estop_reset},
-      {"require_time_sync", config.field_safety.require_time_sync},
-      {"max_time_sync_uncertainty_ms",
-       config.field_safety.max_time_sync_uncertainty_ms},
-      {"time_sync_interval_ms", config.field_safety.time_sync_interval_ms},
-      {"time_sync_samples", config.field_safety.time_sync_samples},
-      {"commissioning_mode", config.field_safety.commissioning_mode},
-  };
+  control_limits_ = vehicle_control_limits(config);
 }
 
 VehicleControlService::~VehicleControlService() {
@@ -3552,21 +3527,47 @@ void VehicleControlService::clear_session_profile() noexcept {
   }
 }
 
-Json VehicleControlService::control_limits() const {
+Json vehicle_control_limits(const VehicleConfig& config) {
+  Json deceleration_profile = Json::array();
+  for (const auto& stage : config.control.deceleration_profile) {
+    deceleration_profile.push_back(
+        {{"after_ms", stage.after_ms}, {"brake", stage.brake}});
+  }
+  const Json read_only_control_safety = {
+      {"control_rate_hz", config.control.rate_hz},
+      {"max_command_gap_ms", config.control.max_command_gap_ms},
+      {"degraded_timeout_ms", config.control.degraded_timeout_ms},
+      {"control_timeout_ms", config.control.control_timeout_ms},
+      {"deceleration_profile", std::move(deceleration_profile)},
+      {"speed_feedback_timeout_ms",
+       config.field_safety.speed_feedback_timeout_ms},
+      {"hard_overspeed_margin_kph",
+       config.field_safety.hard_overspeed_margin_kph},
+      {"require_can_feedback_before_control",
+       config.field_safety.require_can_feedback_before_control},
+      {"require_local_estop_reset",
+       config.field_safety.require_local_estop_reset},
+      {"require_time_sync", config.field_safety.require_time_sync},
+      {"max_time_sync_uncertainty_ms",
+       config.field_safety.max_time_sync_uncertainty_ms},
+      {"time_sync_interval_ms", config.field_safety.time_sync_interval_ms},
+      {"time_sync_samples", config.field_safety.time_sync_samples},
+      {"commissioning_mode", config.field_safety.commissioning_mode},
+  };
   return {
-      {"max_speed_kph", max_speed_kph_},
-      {"max_throttle", max_throttle_},
-      {"full_scale_motor_torque_nm", full_scale_motor_torque_nm_},
-      {"max_brake_pressure_bar", max_brake_pressure_bar_},
-      {"max_steering_angle_deg", max_steering_angle_deg_},
-      {"default_speed_pid_kp", default_speed_pid_kp_},
-      {"default_speed_pid_ki", default_speed_pid_ki_},
-      {"default_speed_pid_kd", default_speed_pid_kd_},
+      {"max_speed_kph", config.field_safety.max_speed_kph},
+      {"max_throttle", config.field_safety.max_throttle},
+      {"full_scale_motor_torque_nm", config.field_safety.full_scale_motor_torque_nm},
+      {"max_brake_pressure_bar", config.field_safety.max_brake_pressure_bar},
+      {"max_steering_angle_deg", config.field_safety.max_steering_angle_deg},
+      {"default_speed_pid_kp", config.field_safety.speed_pid_kp},
+      {"default_speed_pid_ki", config.field_safety.speed_pid_ki},
+      {"default_speed_pid_kd", config.field_safety.speed_pid_kd},
       {"default_speed_pid_derivative_filter_tau_ms",
-       default_speed_pid_derivative_filter_tau_ms_},
-      {"default_speed_pid_max_dt_ms", default_speed_pid_max_dt_ms_},
+       config.field_safety.speed_pid_derivative_filter_tau_ms},
+      {"default_speed_pid_max_dt_ms", config.field_safety.speed_pid_max_dt_ms},
       {"default_motor_torque_rise_rate_nm_per_s",
-       default_motor_torque_rise_rate_nm_per_s_},
+       config.field_safety.motor_torque_rise_rate_nm_per_s},
       {"motor_torque_rise_rate_limits_nm_per_s",
        {{"min", 0.0}, {"max", kMaxMotorTorqueRiseRateNmPerSecond}}},
       {"speed_pid_limits",
@@ -3579,12 +3580,16 @@ Json VehicleControlService::control_limits() const {
            {"max_dt_ms",
             {{"min", kMinSpeedPidMaxDtMs}, {"max", kMaxSpeedPidMaxDtMs}}},
        }},
-      {"speed_feedback_timeout_ms", speed_feedback_timeout_ms_},
-      {"hard_overspeed_margin_kph", hard_overspeed_margin_kph_},
+      {"speed_feedback_timeout_ms", config.field_safety.speed_feedback_timeout_ms},
+      {"hard_overspeed_margin_kph", config.field_safety.hard_overspeed_margin_kph},
       {"speed_feedback_timeout_ms_read_only", true},
       {"hard_overspeed_margin_kph_read_only", true},
-      {"read_only_control_safety", read_only_control_safety_},
+      {"read_only_control_safety", read_only_control_safety},
   };
+}
+
+Json VehicleControlService::control_limits() const {
+  return control_limits_;
 }
 
 Json VehicleControlService::session_control_profile() const {

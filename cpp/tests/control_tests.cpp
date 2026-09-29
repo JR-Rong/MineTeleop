@@ -852,7 +852,7 @@ void test_control_page_contract() {
   const auto telemetry_limits_update = response.body.find(
       "updateVehicleHardLimits(message.control_limits)", telemetry_profile_update);
   const auto handshake_vcu_update = response.body.find(
-      "updateVcuHandshakeState({...nextVcuStatus,driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)})");
+      "updateVcuHandshakeState({...nextVcuStatus,issue_code:message.issue_code||'',driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)})");
   const auto handshake_limits_update = response.body.find(
       "updateVehicleHardLimits(message.hard_limits)", handshake_vcu_update);
   expect(

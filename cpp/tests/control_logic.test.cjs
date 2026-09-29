@@ -1017,6 +1017,19 @@ test('VCU reducer retains only authorized convergence waits and resets terminal 
   assert.equal(logic.transitionVcuState(false, readyVcu).everReady, true);
 });
 
+test('vehicle startup and camera inhibition diagnostics remain distinct from CAN faults', () => {
+  const pending = logic.vehicleControlDiagnostic('critical_camera_not_ready');
+  assert.equal(pending.level, 'warn');
+  assert.match(pending.text, /尚未启动/);
+  const inhibited = logic.vehicleControlDiagnostic('critical_camera_failed');
+  assert.equal(inhibited.level, 'critical');
+  assert.match(inhibited.text, /画面恢复不会解除锁定/);
+  assert.match(inhibited.text, /结束会话/);
+  assert.match(logic.vehicleControlDiagnostic('vcu_adapter_start_failed').text, /CAN 配置/);
+  assert.equal(logic.vehicleControlDiagnostic(''), null);
+  assert.equal(logic.vehicleControlDiagnostic('future-code'), null);
+});
+
 if (failed > 0) {
   console.error(`${failed} of ${passed + failed} control logic tests failed`);
   process.exitCode = 1;

@@ -772,6 +772,9 @@ class DynamicLibraryVehicleAdapter final : public VehicleAdapter {
 
 std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& config);
 
+// The same complete wire contract is available before and after CAN startup.
+[[nodiscard]] Json vehicle_control_limits(const VehicleConfig& config);
+
 class VehicleControlService {
  public:
   VehicleControlService(
@@ -841,7 +844,7 @@ class VehicleControlService {
       kDefaultMotorTorqueRiseRateNmPerSecond};
   int speed_feedback_timeout_ms_{200};
   double hard_overspeed_margin_kph_{3.6};
-  Json read_only_control_safety_;
+  Json control_limits_;
   int telemetry_interval_ms_;
   std::optional<std::int64_t> last_telemetry_ms_;
   std::uint64_t telemetry_sequence_{0};

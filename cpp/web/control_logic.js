@@ -267,6 +267,22 @@
     return profile;
   }
 
+  function vehicleControlDiagnostic(issueCode) {
+    if (issueCode === 'critical_camera_failed') return {
+      level: 'critical', title: '关键视频故障，控制已锁定',
+      text: '关键视频中断或启动超时，本会话已禁止控制。画面恢复不会解除锁定；请结束会话，待视频正常后重新连接并确认限幅、完成 VCU 握手。',
+    };
+    if (issueCode === 'critical_camera_not_ready') return {
+      level: 'warn', title: '等待关键视频就绪',
+      text: '正在等待关键视频编码输出，VCU 适配器尚未启动；视频就绪后将继续准备控制，当前不能握手或驾驶。',
+    };
+    if (issueCode === 'vcu_adapter_start_failed') return {
+      level: 'critical', title: 'VCU 适配器启动失败',
+      text: '车端 VCU 适配器未能启动，请检查 CAN 配置、桥接库及车端日志；驾驶保持禁用。',
+    };
+    return null;
+  }
+
   function normalizeVehicleHardLimits(value) {
     if (!value || typeof value !== 'object') throw new TypeError('vehicle hard limits must be an object');
     const maxSpeedKph = requireFiniteRange(value.max_speed_kph, 0, 72, 'max_speed_kph');
@@ -1253,6 +1269,7 @@
     deriveControl,
     normalizeControlProfile,
     normalizeVehicleHardLimits,
+    vehicleControlDiagnostic,
     mergeControlProfileWithHardLimits,
     controlProfileFromVehicleDefaults,
     controlProfileThrottleLimit,
