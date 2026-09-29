@@ -267,9 +267,14 @@ Current runtimes additionally require the 104-byte runtime-control V3 size query
 `mine_teleop_chassis_configure_runtime_control_v3` (profile version 4), and
 `mine_teleop_chassis_apply_state_v3` with explicit operator activity. Legacy V1/V2
 POD layouts and symbols remain unchanged. Missing V3 capabilities fail before CAN opens.
-The V4 profile keeps EPBs parked through arming. Fresh operator input requests release;
+The V4 profile keeps EPBs parked through arming and requests zero EHB pressure
+until all actuator modes have reached Ready. Starting with the next 20 ms CAN
+cycle, automatic parking requests 100 bar, capped by the vehicle's ordinary
+braking ceiling. Later gear/mode rechecks retain this parking pressure.
+Fresh operator input requests release;
 traction waits for EPB feedback newer than that release request. The local monotonic
-idle timer ignores neutral heartbeats. Expiry removes torque, applies the vehicle's
-ordinary braking ceiling, then parks only with fresh zero-speed and zero-torque feedback. Clearing a
+idle timer ignores neutral heartbeats. Expiry removes torque, applies the same
+100 bar parking request (subject to the vehicle ceiling), then parks only with
+fresh zero-speed and zero-torque feedback. Clearing a
 profile does not switch a parked controller back to the legacy release behavior.
 The control watchdog, physical emergency and staged disarm retain priority.

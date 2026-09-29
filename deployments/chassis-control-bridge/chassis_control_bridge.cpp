@@ -61,6 +61,7 @@ constexpr double kMaxSteeringAngleRad = 0.5235987755982988;  // 30 degrees
 constexpr double kRadiansToDegrees = 57.29577951308232;
 constexpr double kFeedbackTimeoutSeconds = 0.5;
 constexpr double kDisarmTimeoutSeconds = 15.0;
+constexpr double kAutomaticParkingBrakePressureBar = 100.0;
 constexpr std::uintmax_t kDefaultLogMaxBytes = 128U * 1024U * 1024U;
 constexpr int kDefaultLogRotations = 10;
 constexpr std::array<std::uint32_t, 29> kCriticalFeedbackIds{
@@ -1385,7 +1386,7 @@ class BridgeRuntime {
     controller_.set_automatic_parking(parking_idle_timeout_ms >= 0, true,
         speed_feedback_fresh_locked(now) && feedback_fresh_locked(now) &&
             std::abs(controller_.feedback().speed_mps) <= 0.1,
-        max_ordinary_brake_pressure_bar_);
+        automatic_parking_pressure_bar_locked());
     applied_revision = runtime_control_.revision;
     try {
       logger_.event(
@@ -1909,6 +1910,14 @@ class BridgeRuntime {
   }
 
  private:
+  double automatic_parking_pressure_bar_locked() const {
+    // EHB must enter by-wire mode at zero pressure. Retain parking pressure
+    // across later gear/mode rechecks after this handshake has reached Ready.
+    return session_ready_latched_
+        ? std::min(kAutomaticParkingBrakePressureBar, max_ordinary_brake_pressure_bar_)
+        : 0.0;
+  }
+
   bool arming_timeout_recovery_ready_locked(Clock::time_point now) const {
     return recoverable_arming_timeout_ && io_error_ == -ETIMEDOUT &&
         controller_.state() == mine_teleop::vcu::State::Disarmed &&
@@ -2326,7 +2335,7 @@ class BridgeRuntime {
     const bool automatic_parking = runtime_control_.parking_idle_timeout_ms >= 0;
     controller_.set_automatic_parking(automatic_parking, idle_park,
         speed_fresh && feedback_fresh_locked(now) && measured_speed_magnitude_mps <= 0.1,
-        max_ordinary_brake_pressure_bar_);
+        automatic_parking_pressure_bar_locked());
     const bool parking_allows_traction = !automatic_parking ||
         (!idle_park && feedback_fresh_locked(now) && controller_.parking_released());
 

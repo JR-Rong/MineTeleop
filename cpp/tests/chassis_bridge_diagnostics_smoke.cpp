@@ -480,12 +480,15 @@ std::size_t count_logged_events(
   return count;
 }
 
-void test_runtime_operator_parking() {
+void test_runtime_operator_parking(double vehicle_brake_limit_bar) {
   int sockets[2];
   expect(::socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) == 0, "parking test transport failed");
   const auto fd = std::to_string(sockets[0]);
   ::setenv("MINE_TELEOP_CHASSIS_TEST_FD", fd.c_str(), 1);
   auto config = valid_v4_config("mt-test", 800);
+  config.max_ordinary_brake_pressure_bar = vehicle_brake_limit_bar;
+  const auto parking_pressure_raw = static_cast<std::uint64_t>(
+      std::llround(std::min(100.0, vehicle_brake_limit_bar) * 10.0));
   expect(mine_teleop_chassis_open_v4(&config) == 0, "parking runtime open failed");
   ::unsetenv("MINE_TELEOP_CHASSIS_TEST_FD");
   auto feedback = runtime_feedback(3, 1, 2, 0.0);
@@ -508,21 +511,38 @@ void test_runtime_operator_parking() {
   expect(mine_teleop_chassis_request_parallel_handshake() == 0, "parked arming request failed");
   expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE), "parking handshake wait failed");
   feedback = runtime_feedback(5, 1, 2, 0.0);
+  for (int& mode : feedback.ehb_mode) mode = 0;
   expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "handshake feedback failed");
   expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR), "automatic handshake released parking");
+  auto frames = drain_can_frames(sockets[1], 40);
+  expect_all_brake_pressure_raw(frames, 0, "initial WaitGear");
   expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "gear feedback failed");
   expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_ACTUATOR_MODES), "automatic gear wait failed");
+  frames = drain_can_frames(sockets[1], 40);
+  expect_all_brake_pressure_raw(frames, 0, "initial WaitActuatorModes");
+  for (const auto id : {0x18FFD0F5U, 0x18FAD0F5U}) {
+    for (unsigned channel = 0; channel < 4; ++channel) {
+      expect(can_signal(last_frame_with_id(frames, id), channel * 16U, 4) == 1,
+          "zero-pressure arming withdrew the EHB by-wire request");
+    }
+  }
+  MineTeleopChassisHandshakeStatus status{};
+  expect(mine_teleop_chassis_read_handshake_status(&status) == 0 && status.ready == 0,
+      "zero-pressure arming bypassed EHB mode feedback");
+  for (int& mode : feedback.ehb_mode) mode = 1;
   expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "mode feedback failed");
   expect(wait_for_handshake_state(MINE_TELEOP_VCU_READY), "automatic handshake never reached Ready");
   const std::array<double, 4> steering{};
   MineTeleopChassisApplyResultV1 applied{};
   auto apply = [&](bool active) {
     expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "parking refresh failed");
-    expect(mine_teleop_chassis_apply_state_v3(1, 0.0, active ? -0.1 : 0.0,
+    expect(mine_teleop_chassis_apply_state_v3(1, 0.0,
+        active ? -5.0 / vehicle_brake_limit_bar : 0.0,
         steering.data(), 4, active ? 1 : 0, &applied) == 0, "parking command rejected");
   };
   apply(false);
-  auto frames = drain_can_frames(sockets[1], 40);
+  frames = drain_can_frames(sockets[1], 40);
+  expect_all_brake_pressure_raw(frames, parking_pressure_raw, "Ready parking");
   expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), 0, 2) == 2,
       "neutral heartbeat released parking after handshake");
   apply(true);  // A brake key is a valid operator action even without traction.
@@ -530,6 +550,9 @@ void test_runtime_operator_parking() {
   expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), 0, 2) == 1,
       "brake input did not release parking");
   feedback = runtime_feedback(5, 1, 1, 0.0);
+  apply(true);
+  frames = drain_can_frames(sockets[1], 40);
+  expect_all_brake_pressure_raw(frames, 50, "released operator brake");
   const auto released_at = std::chrono::steady_clock::now();
   while (std::chrono::steady_clock::now() - released_at < std::chrono::milliseconds(600)) {
     apply(false);
@@ -537,13 +560,55 @@ void test_runtime_operator_parking() {
   }
   expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), 0, 2) == 2,
       "neutral heartbeats prevented the 500 ms local parking deadline");
-  MineTeleopChassisHandshakeStatus status{};
+  expect_all_brake_pressure_raw(frames, parking_pressure_raw, "idle parking");
   expect(mine_teleop_chassis_read_handshake_status(&status) == 0 && status.ready == 1,
       "automatic idle parking revoked the handshake");
+  // A gear recheck after Ready must retain braking, not repeat initial arming.
+  feedback = runtime_feedback(5, 1, 2, 0.0);
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+      mine_teleop_chassis_apply_state_v3(3, 0.0, 0.0,
+          steering.data(), 4, 0, &applied) == 0, "parked gear change rejected");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR), "gear recheck missing");
+  frames = drain_can_frames(sockets[1], 40);
+  expect_all_brake_pressure_raw(frames, parking_pressure_raw, "retained WaitGear");
+  feedback = runtime_feedback(5, 3, 2, 0.0);
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "gear recheck feedback failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_ACTUATOR_MODES), "mode recheck missing");
+  frames = drain_can_frames(sockets[1], 40);
+  expect_all_brake_pressure_raw(frames, parking_pressure_raw, "retained WaitActuatorModes");
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "mode recheck feedback failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_READY), "gear recheck never reached Ready");
   expect(mine_teleop_chassis_clear_runtime_control_v1(&result) == 0, "profile clear failed");
   frames = drain_can_frames(sockets[1], 40);
   expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), 0, 2) == 2,
       "clearing a profile released automatic parking");
+  expect_all_brake_pressure_raw(frames, parking_pressure_raw, "cleared profile parking");
+  expect(mine_teleop_chassis_emergency_stop() == 0, "parking emergency stop failed");
+  frames = drain_can_frames(sockets[1], 40);
+  expect_all_brake_pressure_raw(frames, 4095, "parking emergency priority");
+  expect(mine_teleop_chassis_disconnect_parallel_handshake() == 0,
+      "parking disconnect failed");
+  complete_runtime_disarm(3, "parking pressure reset");
+
+  // A new explicit handshake must not inherit the previous Ready latch.
+  feedback = runtime_feedback(3, 1, 2, 0.0);
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0 &&
+      mine_teleop_chassis_configure_runtime_control_v3(&profile, &result) == 0 &&
+      mine_teleop_chassis_request_parallel_handshake() == 0,
+      "parking rearm failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARALLEL_HANDSHAKE),
+      "parking rearm handshake wait failed");
+  feedback = runtime_feedback(5, 1, 2, 0.0);
+  for (int& mode : feedback.ehb_mode) mode = 0;
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0,
+      "parking rearm feedback failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR), "parking rearm gear wait failed");
+  frames = drain_can_frames(sockets[1], 40);
+  expect_all_brake_pressure_raw(frames, 0, "new handshake after disarm");
+  expect(mine_teleop_chassis_emergency_stop() == 0, "arming emergency stop failed");
+  frames = drain_can_frames(sockets[1], 40);
+  expect_all_brake_pressure_raw(frames, 4095, "zero-pressure arming emergency priority");
+  complete_runtime_disarm(1, "zero-pressure arming emergency");
   expect(mine_teleop_chassis_close() == 0, "parking runtime close failed");
   ::close(sockets[0]);
   ::close(sockets[1]);
@@ -2561,7 +2626,8 @@ int main() {
         "handshake revoke diagnostic was missing, duplicated, or incomplete");
     std::filesystem::remove(physical_log_path, error);
 
-    test_runtime_operator_parking();
+    test_runtime_operator_parking(327.6);
+    test_runtime_operator_parking(60.0);
     std::cout << "chassis_bridge_diagnostics_smoke=passed\n";
     return 0;
   } catch (const std::exception& error) {
