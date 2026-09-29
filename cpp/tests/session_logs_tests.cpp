@@ -34,7 +34,8 @@ void collection_and_zip() {
     return Json{{"session_id", id}, {"sent_at_utc_ms", time}, {"message", message},
                 {"password", "do-not-export"}, {"service_instance_id", "service-a"}}.dump() + "\n";
   };
-  write(dir.path / "audit.jsonl", record("session-000001", "selected {\"password\":\"embedded-secret\"}", start));
+  write(dir.path / "audit.jsonl", record("session-000001",
+      "selected {\"password\":\"embedded-secret\"} Authorization: Bearer bearer-secret", start));
   write(dir.path / "audit.20260928T010000Z.part00.jsonl", record("session-000001", "rotated", start + 2));
   write(dir.path / "audit.jsonl.1", record("session-000002", "other-session", start) +
       record("session-000001", "old-collision", start - 100000));
@@ -44,6 +45,7 @@ void collection_and_zip() {
   check(text.find("other-session") == std::string::npos && text.find("old-collision") == std::string::npos, "session scope leaked");
   check(text.find("do-not-export") == std::string::npos && text.find("[redacted]") != std::string::npos, "credential leaked");
   check(text.find("embedded-secret") == std::string::npos, "embedded credential leaked");
+  check(text.find("bearer-secret") == std::string::npos, "raw HTTP authorization leaked");
   const auto chunk = session_log_chunk(dir.path / "snapshot", manifest, "cloud.jsonl", 0);
   append_session_log_chunk(dir.path / "copy", chunk);
   check(read(dir.path / "copy/cloud.jsonl") == text, "chunk roundtrip lost bytes");

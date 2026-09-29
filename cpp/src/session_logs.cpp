@@ -63,6 +63,10 @@ std::string redact_text(std::string text, const std::vector<std::string>& secret
       text.replace(pos, secret.size(), "[redacted]"); pos += 10;
     }
   }
+  // Raw stdout can contain an HTTP header inside a JSON string. Redact the
+  // complete Bearer value before the generic key=value rule sees whitespace.
+  static const std::regex bearer(R"(\bBearer\s+[A-Za-z0-9._~+/=-]+)", std::regex::icase);
+  text = std::regex_replace(text, bearer, "Bearer [redacted]");
   static const std::regex credential(
       R"((([?&]|\b)(?:[a-z_]*token|password|authorization|credential|secret|api_key)["']?\s*[=:]\s*["']?)[^\s&"',}]+)",
       std::regex::icase);
