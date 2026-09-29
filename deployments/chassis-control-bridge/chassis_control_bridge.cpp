@@ -1383,7 +1383,7 @@ class BridgeRuntime {
     speed_control_ = next_speed_control;
     runtime_control_ = next;
     operator_idle_.reset();
-    controller_.set_automatic_parking(parking_idle_timeout_ms >= 0, true,
+    controller_.set_automatic_parking(automatic_parking_enabled_locked(), true,
         speed_feedback_fresh_locked(now) && feedback_fresh_locked(now) &&
             std::abs(controller_.feedback().speed_mps) <= 0.1,
         automatic_parking_pressure_bar_locked());
@@ -1910,6 +1910,12 @@ class BridgeRuntime {
   }
 
  private:
+  bool automatic_parking_enabled_locked() const {
+    // First complete the proven EPB-release arming sequence. Automatic parking
+    // can retain authority only after this handshake has reached Ready.
+    return runtime_control_.parking_idle_timeout_ms >= 0 && session_ready_latched_;
+  }
+
   double automatic_parking_pressure_bar_locked() const {
     // EHB must enter by-wire mode at zero pressure. Retain parking pressure
     // across later gear/mode rechecks after this handshake has reached Ready.
@@ -2332,7 +2338,7 @@ class BridgeRuntime {
     const bool idle_park = !runtime_control_.active || operator_idle_.expired(
         std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count(),
         runtime_control_.parking_idle_timeout_ms);
-    const bool automatic_parking = runtime_control_.parking_idle_timeout_ms >= 0;
+    const bool automatic_parking = automatic_parking_enabled_locked();
     controller_.set_automatic_parking(automatic_parking, idle_park,
         speed_fresh && feedback_fresh_locked(now) && measured_speed_magnitude_mps <= 0.1,
         automatic_parking_pressure_bar_locked());
@@ -2449,6 +2455,14 @@ class BridgeRuntime {
           command.motor_torque_nm.fill(0.0);
         }
         command.brake_pressure_bar.fill(requested_pressure_bar);
+      }
+      if (runtime_control_.parking_idle_timeout_ms >= 0 && !session_ready_latched_) {
+        // Keep the former initial-arming output restrictions while EPBs are
+        // released. Emergency/disarm braking is applied later by the controller.
+        command.motor_torque_nm.fill(0.0);
+        command.motor_speed_rpm.fill(0.0);
+        command.steering_angle_deg.fill(0.0);
+        command.brake_pressure_bar.fill(0.0);
       }
     } catch (const std::exception& error) {
       latch_chassis_control_fault_locked(error.what());

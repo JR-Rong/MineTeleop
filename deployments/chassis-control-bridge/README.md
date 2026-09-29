@@ -267,7 +267,9 @@ Current runtimes additionally require the 104-byte runtime-control V3 size query
 `mine_teleop_chassis_configure_runtime_control_v3` (profile version 4), and
 `mine_teleop_chassis_apply_state_v3` with explicit operator activity. Legacy V1/V2
 POD layouts and symbols remain unchanged. Missing V3 capabilities fail before CAN opens.
-The V4 profile keeps EPBs parked through arming and requests zero EHB pressure
+The V4 profile first requests EPB release after handshake status 5 and waits
+for fresh release feedback from all four EPBs before requesting gear and actuator
+modes. Initial arming requests zero EHB pressure and suppresses steering/traction
 until all actuator modes have reached Ready. Starting with the next 20 ms CAN
 cycle, automatic parking requests 100 bar, capped by the vehicle's ordinary
 braking ceiling. Later gear/mode rechecks retain this parking pressure.

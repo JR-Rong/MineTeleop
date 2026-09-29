@@ -513,9 +513,42 @@ void test_runtime_operator_parking(double vehicle_brake_limit_bar) {
   feedback = runtime_feedback(5, 1, 2, 0.0);
   for (int& mode : feedback.ehb_mode) mode = 0;
   expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "handshake feedback failed");
-  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR), "automatic handshake released parking");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARKING_BRAKE_RELEASED),
+      "automatic parking skipped initial EPB release");
   auto frames = drain_can_frames(sockets[1], 40);
+  for (unsigned channel = 0; channel < 4; ++channel) {
+    expect(can_signal(last_frame_with_id(frames, 0x18FBD0F5U), channel * 8U, 2) == 1,
+        "initial handshake did not request every EPB release");
+    expect(can_signal(last_frame_with_id(frames, 0x18FFD0F5U), channel * 16U, 4) == 0 &&
+        can_signal(last_frame_with_id(frames, 0x18FAD0F5U), channel * 16U, 4) == 0,
+        "EHB mode requested before EPB release confirmation");
+  }
+  expect_all_brake_pressure_raw(frames, 0, "initial EPB release");
+  MineTeleopChassisHandshakeStatus status{};
+  expect(mine_teleop_chassis_read_handshake_status(&status) == 0 &&
+      status.state == MINE_TELEOP_VCU_WAIT_PARKING_BRAKE_RELEASED,
+      "parked feedback did not hold initial EPB release wait");
+  feedback.epb_status[0] = feedback.epb_status[1] = feedback.epb_status[2] = 1;
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "partial EPB feedback failed");
+  frames = drain_can_frames(sockets[1], 40);
+  expect(mine_teleop_chassis_read_handshake_status(&status) == 0 &&
+      status.state == MINE_TELEOP_VCU_WAIT_PARKING_BRAKE_RELEASED,
+      "partial EPB release bypassed the four-channel gate");
+  feedback.epb_status[3] = 1;
+  expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "released EPB feedback failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR), "EPB release did not permit gear wait");
+  const std::array<double, 4> early_steering{1.0, 1.0, 1.0, 1.0};
+  MineTeleopChassisApplyResultV1 applied{};
+  expect(mine_teleop_chassis_apply_state_v3(1, 0.0, -5.0 / vehicle_brake_limit_bar,
+      early_steering.data(), 4, 1, &applied) == 0, "early arming input rejected");
+  frames = drain_can_frames(sockets[1], 40);
   expect_all_brake_pressure_raw(frames, 0, "initial WaitGear");
+  for (const auto id : {0x18F8D0F5U, 0x18F9D0F5U}) {
+    for (unsigned axis = 0; axis < 2; ++axis) {
+      expect(can_signal(last_frame_with_id(frames, id), axis * 32U + 8U, 16) == 15750,
+          "early arming input restored steering output");
+    }
+  }
   expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "gear feedback failed");
   expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_ACTUATOR_MODES), "automatic gear wait failed");
   frames = drain_can_frames(sockets[1], 40);
@@ -526,14 +559,12 @@ void test_runtime_operator_parking(double vehicle_brake_limit_bar) {
           "zero-pressure arming withdrew the EHB by-wire request");
     }
   }
-  MineTeleopChassisHandshakeStatus status{};
   expect(mine_teleop_chassis_read_handshake_status(&status) == 0 && status.ready == 0,
       "zero-pressure arming bypassed EHB mode feedback");
   for (int& mode : feedback.ehb_mode) mode = 1;
   expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "mode feedback failed");
   expect(wait_for_handshake_state(MINE_TELEOP_VCU_READY), "automatic handshake never reached Ready");
   const std::array<double, 4> steering{};
-  MineTeleopChassisApplyResultV1 applied{};
   auto apply = [&](bool active) {
     expect(mine_teleop_chassis_update_feedback(&feedback) == 0, "parking refresh failed");
     expect(mine_teleop_chassis_apply_state_v3(1, 0.0,
@@ -602,7 +633,8 @@ void test_runtime_operator_parking(double vehicle_brake_limit_bar) {
   for (int& mode : feedback.ehb_mode) mode = 0;
   expect(mine_teleop_chassis_update_feedback(&feedback) == 0,
       "parking rearm feedback failed");
-  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_GEAR), "parking rearm gear wait failed");
+  expect(wait_for_handshake_state(MINE_TELEOP_VCU_WAIT_PARKING_BRAKE_RELEASED),
+      "parking rearm skipped EPB release");
   frames = drain_can_frames(sockets[1], 40);
   expect_all_brake_pressure_raw(frames, 0, "new handshake after disarm");
   expect(mine_teleop_chassis_emergency_stop() == 0, "arming emergency stop failed");
