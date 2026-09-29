@@ -496,7 +496,7 @@ std::jthread start_vehicle_log_worker(const VehicleConfig& config, std::string t
   const auto can = log_path("MINE_TELEOP_VCU_LOG_PATH", "/var/log/mine-teleop/vcu-can.jsonl");
   return std::jthread([config, token = std::move(token), runtime, can](std::stop_token stop) {
     HttpClient http(std::chrono::seconds(2), config.cloud.resolve_entries, config.cloud.ca_bundle);
-    const auto url = normalize_signaling_http_url(config.cloud.signaling_url) + "/diagnostics/vehicle";
+    const auto url = normalize_signaling_http_url(config.cloud.signaling_url) + "/sessions/logs/vehicle";
     std::string last_attempt;
     while (pause(stop, 3000)) {
       try {
@@ -547,7 +547,7 @@ ControllerLogExport::ControllerLogExport(std::string origin, std::vector<std::st
       HttpClient http(std::chrono::seconds(2), resolve, ca);
       const auto call = [&](std::string_view operation, Json body = Json::object()) {
         body["operation"] = operation; body["driver_id"] = driver; body["token"] = token;
-        return http.post_json_response(origin + "/diagnostics/driver", body);
+        return http.post_json_response(origin + "/sessions/logs/driver", body);
       };
       const auto started = call("start", {{"key", key}});
       const auto id = started.at("export_id").get<std::string>();

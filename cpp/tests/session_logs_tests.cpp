@@ -122,12 +122,12 @@ void three_endpoint_export() {
   write(dir.path / "browser.jsonl", Json{{"sent_at_utc_ms", timestamp}, {"session_id", id},
       {"event", "browser-event"}, {"password", "must-redact"}, {"message", token}}.dump() + "\n");
   static_cast<void>(http.post_json_response(origin + "/sessions/" + id + "/end", {{"actor", "driver"}, {"token", token}}));
-  auto records = http.post_json_response(origin + "/diagnostics/driver", {{"operation", "list"}, {"driver_id", "driver"}, {"token", token}}).at("sessions");
+  auto records = http.post_json_response(origin + "/sessions/logs/driver", {{"operation", "list"}, {"driver_id", "driver"}, {"token", token}}).at("sessions");
   check(records.size() == 1, "closed session absent"); const auto key = records[0].at("key");
   const auto other = login("other", "other-password");
-  check(http.post_json(origin + "/diagnostics/driver", {{"operation", "start"}, {"key", key},
+  check(http.post_json(origin + "/sessions/logs/driver", {{"operation", "start"}, {"key", key},
       {"driver_id", "other"}, {"token", other}}).status >= 400, "other driver exported session");
-  check(http.post_json(origin + "/diagnostics/vehicle", {{"operation", "poll"}, {"vehicle_id", "vehicle"},
+  check(http.post_json(origin + "/sessions/logs/vehicle", {{"operation", "poll"}, {"vehicle_id", "vehicle"},
       {"device_token", "wrong"}}).status == 401, "wrong device credential accepted");
   env("MINE_TELEOP_VEHICLE_RUNTIME_LOG_PATH", (dir.path / "vehicle-runtime.log").string());
   env("MINE_TELEOP_VCU_LOG_PATH", (dir.path / "vcu.jsonl").string());

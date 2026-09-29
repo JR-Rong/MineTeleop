@@ -2258,7 +2258,7 @@ ServerResponse SignalingService::handle_diagnostics(const HttpRequest& request) 
   if (request.method != "POST") return ServerResponse::json(405, {{"error", "POST required"}});
   const auto value = request.json_body();
   const auto operation = required_string(value, "operation");
-  if (request.path == "/diagnostics/vehicle") {
+  if (request.path == "/sessions/logs/vehicle") {
     const auto vehicle = required_string(value, "vehicle_id");
     bool idle = true;
     {
@@ -2271,7 +2271,7 @@ ServerResponse SignalingService::handle_diagnostics(const HttpRequest& request) 
     }
     return ServerResponse::json(200, session_logs_->vehicle(vehicle, value, idle));
   }
-  if (request.path != "/diagnostics/driver") return ServerResponse::json(404, {{"error", "not found"}});
+  if (request.path != "/sessions/logs/driver") return ServerResponse::json(404, {{"error", "not found"}});
   const auto driver = required_string(value, "driver_id");
   std::unordered_set<std::string> allowed;
   {
@@ -2671,7 +2671,7 @@ ServerResponse SignalingService::handle(const HttpRequest& request) {
       std::lock_guard lock(mutex_);
       enforce_api_rate_limit(request, now_ms());
     }
-    if (request.path.starts_with("/diagnostics/")) {
+    if (request.path.starts_with("/sessions/logs/")) {
       response = handle_diagnostics(request);
       response.headers.emplace_back("Cache-Control", "no-store");
     } else if (request.path.starts_with("/mobile/api/")) {
@@ -6113,7 +6113,7 @@ Json DriverConsoleRuntime::log_sessions() {
   { std::lock_guard lock(mutex_); token = driver_token_; }
   if (token.empty()) throw std::invalid_argument("请先登录后查看会话日志");
   HttpClient http(std::chrono::seconds(2), config_.resolve_entries, config_.ca_bundle);
-  return http.post_json_response(signaling_http_url_ + "/diagnostics/driver",
+  return http.post_json_response(signaling_http_url_ + "/sessions/logs/driver",
       {{"operation", "list"}, {"driver_id", driver_id()}, {"token", token}});
 }
 
