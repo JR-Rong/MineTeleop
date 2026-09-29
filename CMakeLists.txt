@@ -93,6 +93,10 @@ set(MINE_TELEOP_CAMERA_VIEW_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/camer
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CAMERA_VIEW_JS_SOURCE}")
 file(READ "${MINE_TELEOP_CAMERA_VIEW_JS_SOURCE}" MINE_TELEOP_CAMERA_VIEW_JS)
 string(APPEND MINE_TELEOP_CONTROL_LOGIC_JS "\n${MINE_TELEOP_CAMERA_VIEW_JS}")
+set(MINE_TELEOP_SESSION_LOG_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/session_logs.js")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_SESSION_LOG_JS_SOURCE}")
+file(READ "${MINE_TELEOP_SESSION_LOG_JS_SOURCE}" MINE_TELEOP_SESSION_LOG_JS)
+string(APPEND MINE_TELEOP_CONTROL_LOGIC_JS "\n${MINE_TELEOP_SESSION_LOG_JS}")
 string(REPLACE "\r\n" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
 string(REPLACE "\r" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
 mine_teleop_make_adjacent_raw_literals(
@@ -146,6 +150,7 @@ add_library(mine_teleop_runtime
   "${MINE_TELEOP_GENERATED_SERVER_SOURCE}"
   cpp/src/websocket.cpp
   cpp/src/console_assets.cpp
+  cpp/src/session_logs.cpp
 )
 target_include_directories(mine_teleop_runtime
   PUBLIC
@@ -334,6 +339,15 @@ if(MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
   )
 endif()
 
+if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
+  enable_testing()
+  add_executable(mine-teleop-session-logs-tests cpp/tests/session_logs_tests.cpp)
+  target_link_libraries(mine-teleop-session-logs-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-session-logs-tests)
+  add_test(NAME mine-teleop-session-logs-tests COMMAND mine-teleop-session-logs-tests)
+  set_tests_properties(mine-teleop-session-logs-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+
 if(MINE_TELEOP_BUILD_TESTS)
   enable_testing()
   add_executable(mine-teleop-console-assets-tests cpp/tests/console_assets_tests.cpp)
@@ -417,6 +431,11 @@ if(MINE_TELEOP_BUILD_TESTS)
     )
     set_tests_properties(mine-teleop-signaling-rejects-public-bind PROPERTIES WILL_FAIL TRUE)
   endif()
+  add_executable(mine-teleop-mobile-approval-tests cpp/tests/mobile_approval_tests.cpp)
+  target_link_libraries(mine-teleop-mobile-approval-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-mobile-approval-tests)
+  add_test(NAME mine-teleop-mobile-approval-tests COMMAND mine-teleop-mobile-approval-tests)
+
   add_executable(mine-teleop-control-tests cpp/tests/control_tests.cpp)
   target_link_libraries(mine-teleop-control-tests PRIVATE mine_teleop_runtime)
   mine_teleop_enable_warnings(mine-teleop-control-tests)

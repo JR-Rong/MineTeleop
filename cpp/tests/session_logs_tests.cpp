@@ -1,0 +1,164 @@
+#include "mine_teleop/session_logs.hpp"
+#include "mine_teleop/server.hpp"
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <thread>
+
+using namespace mine_teleop;
+namespace fs = std::filesystem;
+namespace {
+void check(bool condition, const char* message) { if (!condition) throw std::runtime_error(message); }
+struct Directory {
+  fs::path path = fs::temp_directory_path() / ("session-log-test-" + random_token(8));
+  Directory() { fs::create_directories(path); }
+  ~Directory() { std::error_code error; fs::remove_all(path, error); }
+};
+void write(const fs::path& path, const std::string& text) { std::ofstream out(path, std::ios::binary); out << text; }
+std::string read(const fs::path& path) { std::ifstream in(path, std::ios::binary); return {std::istreambuf_iterator<char>(in), {}}; }
+void env(const char* key, const std::string& value) {
+#if defined(_WIN32)
+  _putenv_s(key, value.c_str());
+#else
+  setenv(key, value.c_str(), 1);
+#endif
+}
+Json metadata(std::int64_t start) {
+  return {{"key", "service-a_session-000001"}, {"service_instance_id", "service-a"},
+      {"session_id", "session-000001"}, {"driver_id", "driver"}, {"vehicle_id", "vehicle"},
+      {"started_at_utc_ms", start}, {"ended_at_utc_ms", start + 1000}};
+}
+void collection_and_zip() {
+  Directory dir; const auto start = now_ms(); const auto session = metadata(start);
+  const auto record = [&](std::string id, std::string message, std::int64_t time) {
+    return Json{{"session_id", id}, {"sent_at_utc_ms", time}, {"message", message},
+                {"password", "do-not-export"}, {"service_instance_id", "service-a"}}.dump() + "\n";
+  };
+  write(dir.path / "audit.jsonl", record("session-000001",
+      "selected {\"password\":\"embedded-secret\"} Authorization: Bearer bearer-secret", start));
+  write(dir.path / "audit.20260928T010000Z.part00.jsonl", record("session-000001", "rotated", start + 2));
+  write(dir.path / "audit.jsonl.1", record("session-000002", "other-session", start) +
+      record("session-000001", "old-collision", start - 100000));
+  const auto manifest = collect_session_logs({{dir.path / "audit.jsonl", "cloud.jsonl", true}}, session, dir.path / "snapshot");
+  const auto text = read(dir.path / "snapshot/cloud.jsonl");
+  check(text.find("selected") != std::string::npos && text.find("rotated") != std::string::npos, "rotation omitted");
+  check(text.find("other-session") == std::string::npos && text.find("old-collision") == std::string::npos, "session scope leaked");
+  check(text.find("do-not-export") == std::string::npos && text.find("[redacted]") != std::string::npos, "credential leaked");
+  check(text.find("embedded-secret") == std::string::npos, "embedded credential leaked");
+  check(text.find("bearer-secret") == std::string::npos, "raw HTTP authorization leaked");
+  const auto chunk = session_log_chunk(dir.path / "snapshot", manifest, "cloud.jsonl", 0);
+  append_session_log_chunk(dir.path / "copy", chunk);
+  check(read(dir.path / "copy/cloud.jsonl") == text, "chunk roundtrip lost bytes");
+  bool denied = false;
+  try { session_log_chunk(dir.path / "snapshot", manifest, "../audit.jsonl", 0); } catch (...) { denied = true; }
+  check(denied, "path traversal allowed");
+  denied = false;
+  try { append_session_log_chunk(dir.path / "copy", chunk); } catch (...) { denied = true; }
+  check(denied, "out of order duplicate chunk accepted");
+  write(dir.path / "snapshot/empty.log", "");
+  write_session_zip(dir.path / "snapshot", dir.path / "session.zip");
+  const auto zip = read(dir.path / "session.zip");
+  check(zip.starts_with("PK\3\4") && zip.find("PK\5\6") != std::string::npos && zip.find("empty.log") != std::string::npos,
+        "ZIP does not contain valid records including empty file");
+  const auto missing = collect_session_logs({{dir.path / "missing", "missing.log"}}, session, dir.path / "missing-snapshot");
+  check(missing.at("status") == "partial", "missing log reported complete");
+  write(dir.path / "dropped.jsonl", Json{{"logged_at_utc_ms", start}, {"event", "trace"},
+      {"details", {{"dropped_since_last", 2}}}}.dump() + "\n");
+  const auto dropped = collect_session_logs({{dir.path / "dropped.jsonl", "dropped.jsonl"}}, session, dir.path / "dropped-snapshot");
+  check(dropped.at("status") == "partial", "source queue loss reported complete");
+  // The actual bridge uses ISO UTC `ts` and a 16-frame array, not session IDs.
+  const auto can_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::sys_days(std::chrono::year{2026}/9/28).time_since_epoch()).count() + 123;
+  Json frames = Json::array();
+  for (int i = 0; i < 16; ++i) frames.push_back({{"id", i}, {"data", "00 7D"}});
+  write(dir.path / "can.jsonl", Json{{"ts", "2026-09-28T00:00:00.123Z"},
+      {"kind", "can_tx_batch"}, {"frames", frames}}.dump() + "\n");
+  collect_session_logs({{dir.path / "can.jsonl", "can.jsonl"}}, metadata(can_time), dir.path / "can-snapshot");
+  check(Json::parse(read(dir.path / "can-snapshot/can.jsonl")).at("frames").size() == 16,
+        "ISO bridge record lost timestamp or CAN frames");
+  const auto snapshot_catalog = dir.path / "persist/audit.jsonl"; fs::create_directories(snapshot_catalog.parent_path());
+  { SessionLogBroker broker(snapshot_catalog); broker.remember(session); }
+  { SessionLogBroker broker(snapshot_catalog);
+    check(broker.sessions("driver").size() == 1 && broker.sessions("other").empty(), "catalog restart/ownership failed");
+    const auto job = broker.start(session, false); const auto state = broker.status(job.at("export_id").get<std::string>(), "driver");
+    check(state.at("vehicle").at("reason") == "vehicle_offline", "offline vehicle was not reported");
+  }
+}
+
+void package_configuration() {
+  const auto config = load_vehicle_config("configs/vehicle-agent.three-machine.field.yaml");
+  check(config.vehicle_adapter.bridge_library_path == fs::absolute("lib/vendor/chassis/libmine_teleop_chassis_bridge.so").lexically_normal(),
+        "bridge root is not package cwd");
+  Directory directory; write(directory.path / "external.yaml", read("configs/vehicle-agent.three-machine.field.yaml"));
+  check(load_vehicle_config(directory.path / "external.yaml").vehicle_adapter.bridge_library_path == config.vehicle_adapter.bridge_library_path,
+        "external YAML changed bridge root");
+  const auto cameras = config.enabled_cameras(); check(cameras.size() == 2, "capture channel count");
+  for (std::size_t i=0;i<cameras.size();++i) check(cameras[i].backend == "ccg2" &&
+      cameras[i].device == "/dev/ccg2-channel-" + std::to_string(i) && cameras[i].capture_width == 1920 &&
+      cameras[i].capture_height == 1080 && cameras[i].capture_fps == 30 && cameras[i].critical_for_control,
+      "invalid default CCG2 input");
+}
+
+void three_endpoint_export() {
+  Directory dir;
+  SignalingServerConfig config;
+  config.driver_passwords = {{"driver", "driver-password"}, {"other", "other-password"}};
+  config.device_tokens = {{"vehicle", "device-secret"}};
+  config.driver_vehicle_permissions = {{"driver", {"vehicle"}}, {"other", {"vehicle"}}};
+  config.audit_log_path = (dir.path / "audit.jsonl").string();
+  config.api_rate_limit_requests = 10000;
+  SignalingService service(config);
+  SimpleHttpServer server("127.0.0.1", 0, [&](const HttpRequest& request) { return service.handle(request); }); server.start();
+  const auto origin = "http://127.0.0.1:" + std::to_string(server.port()); HttpClient http;
+  const auto login = [&](const std::string& id, const std::string& password) {
+    return http.post_json_response(origin + "/auth/driver_login", {{"driver_id", id}, {"password", password}}).at("token").get<std::string>();
+  };
+  const auto token = login("driver", "driver-password");
+  static_cast<void>(http.post_json_response(origin + "/vehicles/online", {{"vehicle_id", "vehicle"}, {"device_token", "device-secret"}, {"connection_id", "test"}}));
+  const auto session = http.post_json_response(origin + "/sessions", {{"driver_id", "driver"}, {"vehicle_id", "vehicle"}, {"token", token}});
+  const auto id = session.at("session_id").get<std::string>(); const auto timestamp = now_ms();
+  const auto event = Json{{"logged_at_utc_ms", timestamp}, {"session_id", id}, {"event", "retained-test-event"},
+      {"password", "must-redact"}, {"message", "device-secret"}}.dump() + "\n";
+  write(dir.path / "vehicle-runtime.log", event);
+  write(dir.path / "vcu.jsonl", Json{{"logged_at_utc_ms", timestamp}, {"kind", "can_tx_batch"}, {"data", "test-CAN-evidence"}}.dump() + "\n");
+  write(dir.path / "browser.jsonl", Json{{"sent_at_utc_ms", timestamp}, {"session_id", id},
+      {"event", "browser-event"}, {"password", "must-redact"}, {"message", token}}.dump() + "\n");
+  static_cast<void>(http.post_json_response(origin + "/sessions/" + id + "/end", {{"actor", "driver"}, {"token", token}}));
+  auto records = http.post_json_response(origin + "/sessions/logs/driver", {{"operation", "list"}, {"driver_id", "driver"}, {"token", token}}).at("sessions");
+  check(records.size() == 1, "closed session absent"); const auto key = records[0].at("key");
+  const auto other = login("other", "other-password");
+  check(http.post_json(origin + "/sessions/logs/driver", {{"operation", "start"}, {"key", key},
+      {"driver_id", "other"}, {"token", other}}).status >= 400, "other driver exported session");
+  check(http.post_json(origin + "/sessions/logs/vehicle", {{"operation", "poll"}, {"vehicle_id", "vehicle"},
+      {"device_token", "wrong"}}).status == 401, "wrong device credential accepted");
+  env("MINE_TELEOP_VEHICLE_RUNTIME_LOG_PATH", (dir.path / "vehicle-runtime.log").string());
+  env("MINE_TELEOP_VCU_LOG_PATH", (dir.path / "vcu.jsonl").string());
+  VehicleConfig vehicle; vehicle.vehicle_id = "vehicle"; vehicle.cloud.signaling_url = origin;
+  auto worker = start_vehicle_log_worker(vehicle, "device-secret");
+  ControllerLogExport exported(origin, {}, {}, "driver", token, key.get<std::string>(), dir.path / "browser.jsonl");
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+  while (exported.status().at("state") == "collecting" && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const auto status = exported.status();
+  check(status.at("state") == "ready", status.dump().c_str());
+  const auto zip = exported.zip();
+  for (const auto* required : {"controller/control-browser-events.jsonl", "cloud/signaling-audit.jsonl",
+                               "vehicle/runtime.log", "vehicle/vcu-can.jsonl", "manifest.json", "test-CAN-evidence"})
+    check(zip.find(required) != std::string::npos, "three-endpoint ZIP omitted source");
+  check(zip.find("must-redact") == std::string::npos && zip.find("device-secret") == std::string::npos, "ZIP leaked credential");
+  if (const char* output = std::getenv("MINE_TELEOP_TEST_EXPORT_ZIP")) write(output, zip);
+  worker.request_stop(); worker.join();
+  // A pending vehicle upload must not turn a desktop close into a 3-minute join.
+  auto pending = std::make_unique<ControllerLogExport>(origin, std::vector<std::string>{}, fs::path{},
+      "driver", token, key.get<std::string>(), dir.path / "browser.jsonl");
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  check(pending->status().at("state") == "collecting", "export was not pending");
+  const auto cancelled_at = std::chrono::steady_clock::now(); pending.reset();
+  check(std::chrono::steady_clock::now() - cancelled_at < std::chrono::seconds(3), "export cancellation blocked shutdown");
+  server.stop();
+}
+}
+int main() {
+  try { package_configuration(); collection_and_zip(); three_endpoint_export(); std::cout << "session_log_export_tests=passed\n"; return 0; }
+  catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+}

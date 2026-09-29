@@ -8,6 +8,12 @@ dist
 cpp-build
 __pycache__
 *.pyc
+configs/secrets
+configs/*.password
+configs/*.token
+config/app-token
+apps
+output
 
 # Private CI inputs are supplied only through explicit build contexts.
 .ci-deps/

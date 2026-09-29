@@ -99,6 +99,10 @@ class MediaSignalingSequence {
 // A critical-camera fault revokes control for the remainder of the current
 // cloud session.  The media service may reconstruct VehicleMediaRuntime while
 // that session is still active, so this latch must outlive one runtime object.
+inline constexpr int kCriticalCameraStartupTimeoutMs = 15000;
+[[nodiscard]] bool camera_encoded_frame_fresh(
+    std::int64_t last_encoded_ms, std::int64_t now_ms, int timeout_ms);
+
 class CriticalCameraControlLatch {
  public:
   // Selects the active non-empty session.  Entering the same session preserves
@@ -109,11 +113,17 @@ class CriticalCameraControlLatch {
   // Callers must enter the session before reporting a fault.
   [[nodiscard]] bool inhibit(std::string_view session_id);
   [[nodiscard]] bool inhibited_for(std::string_view session_id) const;
+  // Grace is only for admission before the first adapter start. Both its
+  // deadline and the armed state survive same-session media reconstruction.
+  [[nodiscard]] bool startup_grace_active(std::string_view session_id, std::int64_t now_ms);
+  [[nodiscard]] bool arm_for_control(std::string_view session_id);
 
  private:
   mutable std::mutex mutex_;
   std::string session_id_;
   bool inhibited_{false};
+  bool armed_{false};
+  std::optional<std::int64_t> startup_started_ms_;
 };
 
 struct EncodedFrame {

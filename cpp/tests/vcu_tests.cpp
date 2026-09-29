@@ -146,9 +146,9 @@ CanFrame motor_torque_feedback(
   frame.data[0] = static_cast<std::uint8_t>(speed_raw & 0xFFU);
   frame.data[1] = static_cast<std::uint8_t>(
       ((speed_raw >> 8U) & 0x3FU) | (speed_valid ? 0x80U : 0U));
-  const auto raw = static_cast<std::uint16_t>(std::llround((torque_nm + 800.0) / 0.1));
+  const auto raw = static_cast<std::uint16_t>(std::llround((torque_nm + 3200.0) / 0.1));
   frame.data[2] = static_cast<std::uint8_t>(raw & 0xFFU);
-  frame.data[3] = static_cast<std::uint8_t>((raw >> 8U) & 0x3FU);
+  frame.data[3] = static_cast<std::uint8_t>((raw >> 8U) & 0xFFU);
   return frame;
 }
 
@@ -286,6 +286,92 @@ void complete_emergency_disarm(ParallelController& controller) {
   expect(controller.state() == State::Disarmed, "emergency disarm did not complete");
 }
 
+void test_operator_idle_parking_deadlines() {
+  mine_teleop::vcu::OperatorIdleParking timer;
+  expect(timer.expired(0, 500), "handshake without input must stay parked");
+  timer.observe(true, 1000);
+  expect(!timer.expired(1000, 0), "held input cannot expire at zero delay");
+  timer.observe(false, 1050);
+  expect(timer.expired(1050, 0), "zero delay must park on key release");
+  for (int now = 1100; now < 1500; now += 50) {
+    timer.observe(false, now);
+    expect(!timer.expired(now, 500), "neutral heartbeat shortened the deadline");
+  }
+  expect(timer.expired(1500, 500), "neutral heartbeat renewed the deadline");
+  expect(!timer.expired(1999, 1000) && timer.expired(2000, 1000),
+      "one-second boundary is incorrect");
+  timer.observe(true, 3000);
+  expect(!timer.expired(3199, 0) && timer.expired(3200, 0),
+      "lost sender did not expire its held-input lease");
+  expect(timer.expired(3500, 500), "lost sender did not park locally");
+  for (int now = 4000; now <= 5000; now += 50) {
+    timer.observe(true, now);
+    expect(!timer.expired(now + 25, 0), "held key pulsed parking at zero delay");
+  }
+  timer.reset();
+  expect(timer.expired(5001, 500), "previous handshake leaked operator activity");
+}
+
+void test_automatic_parking_preserves_handshake_and_release_feedback_gate() {
+  ParallelController controller;
+  prepare_parking_gate(controller);
+  controller.set_automatic_parking(true, true, true, 50.0);
+  expect(controller.request_parallel_handshake(), "parked handshake rejected");
+  for (int i = 0; i < 6; ++i) static_cast<void>(controller.tick());
+  controller.ingest(handshake_feedback(5));
+  auto frames = controller.tick();
+  expect(controller.state() == State::WaitGear, "automatic handshake waited for EPB release");
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) != 1,
+      "handshake released EPB without an operator input");
+  controller.ingest(gear_feedback(1));
+  static_cast<void>(controller.tick());
+  send_mode_feedback(controller);
+  frames = controller.tick();
+  expect(controller.ready(), "parked controller did not become ready");
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 2,
+      "Ready released EPB without input");
+
+  // Even an earlier released status cannot satisfy a new release request.
+  controller.ingest(parking_brake_feedback(1));
+  controller.set_automatic_parking(true, false, true, 50.0);
+  Command command;
+  command.gear = 1;
+  command.motor_torque_nm.fill(100.0);
+  expect(controller.set_command(command), "automatic command rejected");
+  frames = controller.tick();
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 1,
+      "operator input did not request EPB release");
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) == 32000,
+      "torque escaped before fresh EPB release feedback");
+  controller.ingest(parking_brake_feedback(1));
+  frames = controller.tick();
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) == 33000,
+      "fresh release feedback did not unlock the requested torque");
+
+  controller.set_automatic_parking(true, true, false, 50.0);
+  frames = controller.tick();
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 0,
+      "idle parking changed EPB without fresh zero-speed confirmation");
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) == 32000 &&
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduEhb01), 4, 12) == 500,
+      "idle parking did not remove torque and apply service braking");
+  controller.set_automatic_parking(true, true, true, 50.0);
+  controller.ingest(motor_torque_feedback(0, 10.0));
+  frames = controller.tick();
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 0,
+      "parking engaged before actual torque reached zero");
+  controller.ingest(motor_torque_feedback(0, 0.0));
+  frames = controller.tick();
+  expect(controller.ready() &&
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), 0, 2) == 2,
+      "stopped idle parking lost authority or did not park");
+  controller.emergency_stop();
+  frames = controller.tick();
+  expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) == 32000 &&
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduEhb01), 4, 12) == 4095,
+      "automatic parking weakened emergency braking");
+}
+
 void test_protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding() {
   ParallelController controller;
   const auto initial = controller.tick();
@@ -298,7 +384,7 @@ void test_protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding
 
   const auto& initial_motor = find_frame(initial, mine_teleop::vcu::ids::kAduMcu01);
   expect(signal(initial_motor, 0, 3) == 0, "initial motor command is enabled");
-  expect(signal(initial_motor, 8, 14) == 8000, "zero torque was not encoded with its -800 offset");
+  expect(signal(initial_motor, 8, 16) == 32000, "zero torque was not encoded with its -3200 offset");
   expect(signal(initial_motor, 24, 14) == 8000, "zero speed was not encoded with its -8000 offset");
   const auto& standby_shake = find_frame(initial, mine_teleop::vcu::ids::kAduShake);
   expect(
@@ -349,7 +435,7 @@ void test_arming_uses_current_epb_semantics_and_gates_control() {
 
   const auto& motor = find_frame(frames, mine_teleop::vcu::ids::kAduMcu01);
   expect(signal(motor, 0, 3) == 1 && signal(motor, 3, 3) == 1, "motor torque mode is not enabled");
-  expect(signal(motor, 8, 14) == 9200, "120 Nm torque encoded incorrectly");
+  expect(signal(motor, 8, 16) == 33200, "120 Nm torque encoded incorrectly");
 
   const auto& steering = find_frame(frames, mine_teleop::vcu::ids::kAduEps01);
   expect(signal(steering, 0, 8) == 1, "EPS by-wire mode is not enabled");
@@ -416,6 +502,50 @@ void test_vehicle_speed_request_is_permanently_zero_quality_zero() {
       "explicitly invalid vehicle speed request was exposed as valid");
 }
 
+void test_20260916_motor_torque_wire_vectors() {
+  ParallelController controller;
+  advance_to_ready(controller);
+
+  // Fixed wire vectors independent of the feedback fixture's encoder.
+  const std::array<std::pair<double, std::array<std::uint8_t, 2>>, 3> vectors{{
+      {0.0, {0x00, 0x7D}},
+      {640.0, {0x00, 0x96}},
+      {-640.0, {0x00, 0x64}},
+  }};
+  for (const auto& [torque, bytes] : vectors) {
+    Command command;
+    command.gear = 3;
+    command.motor_torque_nm.fill(torque);
+    command.motor_speed_rpm.fill(100.0);
+    expect(controller.set_command(command), "wire-vector command rejected");
+    const auto frames = controller.tick();
+    for (std::size_t motor = 0; motor < kMotorStatus01Ids.size(); ++motor) {
+      const auto& tx = find_frame(frames, 0x18F0D0F5U + (motor << 16U));
+      expect(tx.data == std::array<std::uint8_t, 8>{
+          0x09, bytes[0], bytes[1], 0xA4, 0x1F, 0, 0, 0},
+          "20260916 torque encoding or adjacent speed bits differ from wire vector");
+      CanFrame rx{kMotorStatus01Ids[motor]};
+      rx.data = {0x40, 0x9F, bytes[0], bytes[1], 0x00, 0x7D, 0x2F, 0x36};
+      expect(controller.ingest(rx), "wire-vector feedback rejected");
+      expect(controller.feedback().motor_torque_valid[motor] &&
+          std::abs(controller.feedback().motor_torque_nm[motor] - torque) < 1e-9,
+          "20260916 torque feedback differs from wire vector");
+    }
+  }
+
+  controller.request_disarm();
+  static_cast<void>(controller.tick());
+  for (const auto id : kMotorStatus01Ids) {
+    CanFrame rx{id};
+    // Field capture: zero speed, zero torque, zero current, 693.55 V.
+    rx.data = {0x40, 0x9F, 0x00, 0x7D, 0x00, 0x7D, 0x2F, 0x36};
+    expect(controller.ingest(rx), "captured zero-torque feedback rejected");
+  }
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmStop,
+      "captured zero torque did not allow disarm to proceed");
+}
+
 void test_motor_torque_resolution_preserves_quantized_ceiling() {
   ParallelController controller;
   advance_to_ready(controller);
@@ -428,7 +558,7 @@ void test_motor_torque_resolution_preserves_quantized_ceiling() {
     const auto frames = controller.tick();
     const auto& motor = find_frame(frames, mine_teleop::vcu::ids::kAduMcu01);
     const double decoded_torque_nm =
-        static_cast<double>(signal(motor, 8, 14)) * 0.1 - 800.0;
+        static_cast<double>(signal(motor, 8, 16)) * 0.1 - 3200.0;
     expect(
         std::abs(decoded_torque_nm - requested_torque_nm) < 1e-9,
         "0.1 Nm motor torque ceiling changed during CAN encoding");
@@ -452,7 +582,7 @@ void test_drive_gear_gate_withdraws_traction_and_preserves_steering_brake() {
               missing_gear_feedback.tick(),
               mine_teleop::vcu::ids::kAduMcu01),
           8,
-          14) == 8000,
+          16) == 32000,
       "missing gear feedback did not keep traction at zero");
 
   ParallelController controller;
@@ -464,7 +594,7 @@ void test_drive_gear_gate_withdraws_traction_and_preserves_steering_brake() {
   expect(controller.set_command(drive), "ready D traction was rejected");
   auto frames = controller.tick();
   expect(
-      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) == 8800,
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) == 32800,
       "ready D traction did not reach the motor frame");
 
   expect(controller.ingest(speed_feedback(2.0)), "moving speed feedback was rejected");
@@ -479,7 +609,7 @@ void test_drive_gear_gate_withdraws_traction_and_preserves_steering_brake() {
   expect(!controller.set_command(reverse), "moving D-to-R change was accepted");
   frames = controller.tick();
   expect(
-      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) == 8000,
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) == 32000,
       "rejected moving gear change retained the previous traction");
   expect(
       signal(find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed), 8, 8) == 0,
@@ -493,7 +623,7 @@ void test_drive_gear_gate_withdraws_traction_and_preserves_steering_brake() {
   const auto& wait_gear_motor = find_frame(frames, mine_teleop::vcu::ids::kAduMcu01);
   const auto& wait_gear_steering = find_frame(frames, mine_teleop::vcu::ids::kAduEps01);
   const auto& wait_gear_brake = find_frame(frames, mine_teleop::vcu::ids::kAduEhb01);
-  expect(signal(wait_gear_motor, 8, 14) == 8000, "WaitGear emitted motor torque");
+  expect(signal(wait_gear_motor, 8, 16) == 32000, "WaitGear emitted motor torque");
   expect(
       signal(wait_gear_steering, 8, 16) == 15870,
       "WaitGear did not preserve desired steering angle");
@@ -510,7 +640,7 @@ void test_drive_gear_gate_withdraws_traction_and_preserves_steering_brake() {
       controller.state() == State::WaitActuatorModes,
       "reverse gear feedback did not enter WaitActuatorModes");
   expect(
-      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) == 8000,
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) == 32000,
       "WaitActuatorModes emitted motor torque");
   expect(
       signal(find_frame(frames, mine_teleop::vcu::ids::kAduEps01), 8, 16) == 15870 &&
@@ -529,7 +659,7 @@ void test_ready_actual_gear_mismatch_forces_safe_wait() {
   const auto frames = controller.tick();
   expect(controller.state() == State::WaitGear, "actual gear mismatch remained Ready");
   expect(
-      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) == 8000,
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) == 32000,
       "actual gear mismatch retained traction torque");
   expect(
       signal(find_frame(frames, mine_teleop::vcu::ids::kAduEhb01), 4, 12) > 0,
@@ -599,7 +729,7 @@ void test_physical_emergency_latches_until_disarm_and_explicit_handshake() {
       signal(
           find_frame(controller.tick(), mine_teleop::vcu::ids::kAduMcu01),
           8,
-          14) == 8800,
+          16) == 32800,
       "physical ESTOP setup did not transmit traction");
 
   auto physical_emergency = gear_feedback(3);
@@ -614,8 +744,8 @@ void test_physical_emergency_latches_until_disarm_and_explicit_handshake() {
 
   auto frames = controller.tick();
   expect(
-      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) ==
-              8000 &&
+      signal(find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) ==
+              32000 &&
           signal(find_frame(frames, mine_teleop::vcu::ids::kAduEhb01), 4, 12) >
               0 &&
           signal(
@@ -769,7 +899,7 @@ void test_fresh_manual_status_revokes_each_post_handshake_arming_phase() {
         "revoked handshake released or parked EPB before zero-speed confirmation");
     expect(
         signal(motor, 0, 3) == 1 && signal(motor, 3, 3) == 1 &&
-            signal(motor, 8, 14) == 8000,
+            signal(motor, 8, 16) == 32000,
         "revoked handshake did not retain torque mode with a zero-torque request");
     expect(
         signal(brake, 0, 4) == 1 && signal(brake, 4, 12) == 4095,
@@ -911,8 +1041,8 @@ void test_manual_handshake_revocation_survives_newer_status_before_tick() {
       signal(
           find_frame(frames, mine_teleop::vcu::ids::kAduShake), 0, 8) == 0 &&
           signal(
-              find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) ==
-              8000,
+              find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) ==
+              32000,
       "same-batch 3-to-5 revocation continued handshake or torque output");
 }
 
@@ -1017,7 +1147,7 @@ void test_handshake_loss_forces_zero_torque_and_calibrated_brake() {
   const auto frames = controller.tick();
   expect(controller.state() == State::Fault, "parallel handshake loss did not latch a fault");
   const auto& motor = find_frame(frames, mine_teleop::vcu::ids::kAduMcu01);
-  expect(signal(motor, 8, 14) == 8000, "fault output did not encode zero torque");
+  expect(signal(motor, 8, 16) == 32000, "fault output did not encode zero torque");
   const auto& brake = find_frame(frames, mine_teleop::vcu::ids::kAduEhb01);
   expect(signal(brake, 4, 12) == 250, "fault output did not use calibrated brake pressure");
 }
@@ -1102,8 +1232,8 @@ void test_arming_estop_reverses_handshake_without_forward_progress() {
     const auto frames = controller.tick();
     expect(
         signal(
-            find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) ==
-            8000,
+            find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) ==
+            32000,
         "arming ESTOP emitted traction torque");
     const auto& speed =
         find_frame(frames, mine_teleop::vcu::ids::kAduVehicleSpeed);
@@ -1136,8 +1266,8 @@ void test_arming_estop_reverses_handshake_without_forward_progress() {
   expect(faulted.state() == State::Fault, "arming transport fault advanced the handshake");
   expect(
       signal(
-          find_frame(fault_frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) ==
-          8000 &&
+          find_frame(fault_frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) ==
+          32000 &&
           signal(
               find_frame(fault_frames, mine_teleop::vcu::ids::kAduEhb01), 4, 12) ==
               250,
@@ -1181,8 +1311,8 @@ void test_arming_physical_emergency_is_latched_and_recoverable_only_after_disarm
     const auto frames = controller.tick();
     expect(
         signal(
-            find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 14) ==
-            8000,
+            find_frame(frames, mine_teleop::vcu::ids::kAduMcu01), 8, 16) ==
+            32000,
         "released physical arming ESTOP resumed traction before recovery");
     complete_emergency_disarm(controller);
     expect(
@@ -1199,6 +1329,10 @@ void test_arming_physical_emergency_is_latched_and_recoverable_only_after_disarm
 
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
+      {"20260916_motor_torque_wire_vectors", test_20260916_motor_torque_wire_vectors},
+      {"operator_idle_parking_deadlines", test_operator_idle_parking_deadlines},
+      {"automatic_parking_handshake_and_feedback",
+       test_automatic_parking_preserves_handshake_and_release_feedback_gate},
       {"protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding",
        test_protocol_frames_reuse_intelligent_handshake_and_physical_zero_encoding},
       {"arming_uses_current_epb_semantics_and_gates_control",
