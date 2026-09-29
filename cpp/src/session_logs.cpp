@@ -239,7 +239,9 @@ Json session_log_chunk(const fs::path& directory, const Json& manifest,
                        std::string_view name, std::uint64_t offset) {
   require(safe_name(name), "invalid snapshot file");
   const auto& files = manifest.at("files");
-  const auto entry = std::find_if(files.begin(), files.end(), [&](const Json& f) { return f.at("name") == name; });
+  const auto entry = std::find_if(files.begin(), files.end(), [&](const Json& f) {
+    return f.at("name").get_ref<const std::string&>() == name;
+  });
   require(entry != files.end(), "snapshot file is not in manifest");
   const auto size = entry->at("bytes").get<std::uint64_t>();
   require(offset <= size && size <= kFileLimit, "invalid snapshot offset");
@@ -297,18 +299,19 @@ void write_session_zip(const fs::path& directory, const fs::path& destination) {
   for (auto& entry : entries) {
     entry.offset = static_cast<std::uint32_t>(output.tellp());
     put(0x04034b50,4); put(20,2); put(0x800,2); put(0,2); put(0,2); put(0x21,2);
-    put(entry.crc,4); put(entry.size,4); put(entry.size,4); put(entry.name.size(),2); put(0,2);
+    put(entry.crc,4); put(entry.size,4); put(entry.size,4); put(static_cast<std::uint32_t>(entry.name.size()),2); put(0,2);
     output << entry.name; std::ifstream input(entry.path, std::ios::binary);
     if (entry.size) output << input.rdbuf();
   }
   const auto central = static_cast<std::uint32_t>(output.tellp());
   for (const auto& entry : entries) {
     put(0x02014b50,4); put(20,2); put(20,2); put(0x800,2); put(0,2); put(0,2); put(0x21,2);
-    put(entry.crc,4); put(entry.size,4); put(entry.size,4); put(entry.name.size(),2);
+    put(entry.crc,4); put(entry.size,4); put(entry.size,4); put(static_cast<std::uint32_t>(entry.name.size()),2);
     put(0,2); put(0,2); put(0,2); put(0,2); put(0,4); put(entry.offset,4); output << entry.name;
   }
   const auto central_size = static_cast<std::uint32_t>(output.tellp()) - central;
-  put(0x06054b50,4); put(0,2); put(0,2); put(entries.size(),2); put(entries.size(),2);
+  put(0x06054b50,4); put(0,2); put(0,2);
+  put(static_cast<std::uint32_t>(entries.size()),2); put(static_cast<std::uint32_t>(entries.size()),2);
   put(central_size,4); put(central,4); put(0,2); output.flush();
   require(static_cast<bool>(output), "cannot finish ZIP");
 }
@@ -374,7 +377,7 @@ Json SessionLogBroker::sessions(std::string_view driver) const {
   Json result = Json::array();
   for (const auto& [key, record] : impl_->records) {
     (void)key;
-    if (record.at("driver_id") == driver && record.value("ended_at_utc_ms", 0LL) > 0) result.push_back(record);
+    if (record.at("driver_id").get_ref<const std::string&>() == driver && record.value("ended_at_utc_ms", 0LL) > 0) result.push_back(record);
   }
   std::sort(result.begin(), result.end(), [](const Json& a, const Json& b) {
     return a.at("started_at_utc_ms").template get<std::int64_t>() > b.at("started_at_utc_ms").template get<std::int64_t>();
@@ -385,7 +388,8 @@ Json SessionLogBroker::sessions(std::string_view driver) const {
 Json SessionLogBroker::session(std::string_view key, std::string_view driver) const {
   std::lock_guard lock(impl_->mutex);
   const auto found = impl_->records.find(std::string(key));
-  require(found != impl_->records.end() && found->second.at("driver_id") == driver, "session not found for this driver");
+  require(found != impl_->records.end() && found->second.at("driver_id").get_ref<const std::string&>() == driver,
+          "session not found for this driver");
   require(found->second.value("ended_at_utc_ms", 0LL) > 0, "end the session before exporting logs");
   return found->second;
 }
