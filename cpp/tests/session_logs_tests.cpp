@@ -85,6 +85,46 @@ void collection_and_zip() {
   }
 }
 
+void session_window_scan_priority() {
+  Directory dir; const auto start = now_ms();
+  const auto record = [&](std::int64_t time, std::string message) {
+    return Json{{"session_id", "session-000001"}, {"logged_at_utc_ms", time}, {"message", message}}.dump() + "\n";
+  };
+  const auto base = dir.path / "runtime.log";
+  write(base.string() + ".2", record(start - 100000, "older"));
+  // A historical session can straddle two rotations.
+  write(base.string() + ".1", record(start - 99000, "older-end"));
+  write(base, record(start, "latest"));
+  write(base.string() + ".3", "{invalid-json}\n" + record(start, "unknown-edge"));
+  // An out-of-order middle record must not be excluded by edge sampling.
+  const auto padding = record(start - 200000, std::string(40000, 'x'));
+  write(base.string() + ".4", padding + padding + record(start, "clock-jump") + padding + padding);
+  const auto mtime = fs::file_time_type::clock::now();
+  for (int i = 1; i <= 4; ++i) fs::last_write_time(base.string() + "." + std::to_string(i), mtime - std::chrono::hours(i));
+  fs::last_write_time(base, mtime);
+  const auto collect = [&](std::int64_t timestamp, const char* name) {
+    return collect_session_logs({{base, "runtime.log"}}, metadata(timestamp), dir.path / name);
+  };
+  const auto latest = collect(start, "latest");
+  const auto latest_files = latest.at("files").at(0).at("source_files");
+  check(latest_files.at(0) == "runtime.log.3" && latest_files.at(1) == "runtime.log",
+        "older unrelated rotations can exhaust budget before latest session");
+  const auto text = read(dir.path / "latest/runtime.log");
+  for (const auto* message : {"latest", "unknown-edge", "clock-jump"})
+    check(text.find(message) != std::string::npos, "timestamp sampling excluded a matching record");
+  const auto historical = collect(start - 100000, "historical");
+  const auto historical_files = historical.at("files").at(0).at("source_files");
+  check(historical_files.at(0) == "runtime.log.2" && historical_files.at(1) == "runtime.log.1",
+        "current file displaced requested historical session rotations");
+  const auto old_text = read(dir.path / "historical/runtime.log");
+  check(old_text.find("older") < old_text.find("older-end") && old_text.find("latest") == std::string::npos,
+        "historical window or rotation ordering changed");
+  std::stop_source stop; stop.request_stop();
+  const auto cancelled = collect_session_logs({{base, "runtime.log"}}, metadata(start), dir.path / "cancelled", {}, stop.get_token());
+  check(cancelled.at("status") == "partial" && cancelled.at("files").at(0).at("probe_bytes") == 0,
+        "cancelled export still sampled rotations");
+}
+
 void package_configuration() {
   const auto config = load_vehicle_config("configs/vehicle-agent.three-machine.field.yaml");
   check(config.vehicle_adapter.bridge_library_path == fs::absolute("lib/vendor/chassis/libmine_teleop_chassis_bridge.so").lexically_normal(),
@@ -159,6 +199,6 @@ void three_endpoint_export() {
 }
 }
 int main() {
-  try { package_configuration(); collection_and_zip(); three_endpoint_export(); std::cout << "session_log_export_tests=passed\n"; return 0; }
+  try { package_configuration(); collection_and_zip(); session_window_scan_priority(); three_endpoint_export(); std::cout << "session_log_export_tests=passed\n"; return 0; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

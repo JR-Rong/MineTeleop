@@ -224,6 +224,40 @@ void audit_fail_closed() {
   }
   std::filesystem::remove_all(root);
 }
+void approval_reaper_survives_audit_failure() {
+  const auto root = std::filesystem::temp_directory_path() / ("mobile-reaper-audit-" + random_token(6));
+  std::filesystem::create_directories(root);
+  auto c = configuration(); c.audit_log_path = (root / "audit.jsonl").string();
+  c.mobile_approval_timeout_ms = 500; c.connection_reaper_interval_ms = 20;
+  c.driver_heartbeat_timeout_ms = 60000; c.vehicle_heartbeat_timeout_ms = 60000;
+  for (bool approved : {false, true}) {
+    std::atomic<bool> broken{false}, attempted{false};
+    {
+      Fixture f(c, [&] { if (broken) attempted = true; return now_ms(); });
+      check(f.connect("v2").status == 200, "unrelated active session was not created");
+      const auto id = f.pending();
+      if (approved) check(f.decide(id).status == 200, "approval setup failed");
+      std::filesystem::remove(c.audit_log_path); std::filesystem::create_directory(c.audit_log_path);
+      broken = true;
+      // No HTTP/service calls until the background reaper attempts its audit.
+      // Before the fix this uncaught write failure aborts the entire process.
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!attempted && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      check(attempted, "background approval expiry was not exercised");
+      check(f.service.health().at("active_sessions") == 1, "audit failure ended unrelated session");
+      check(f.inbox().at(0).at("state") == "expired" && f.decide(id).status == 409,
+            "audit failure left expired approval usable");
+      check(f.connect().status == 503 && f.service.health().at("active_sessions") == 1,
+            "broken audit sink permitted new authority");
+      broken = false; std::filesystem::remove(c.audit_log_path);
+      const auto fresh = f.pending();
+      check(fresh != id && f.decide(fresh).status == 200 && f.connect().status == 200,
+            "approval flow did not recover after restoring audit sink");
+    }
+  }
+  std::filesystem::remove_all(root);
+}
 void invalid_config_and_restart() {
   for (int scenario = 0; scenario < 5; ++scenario) {
     auto c = configuration();
@@ -449,6 +483,7 @@ int main() {
       {"independent_app_token_expiry",independent_app_token_expiry},{"gate_and_single_use",gate_and_single_use},{"permissions_and_race",permissions_and_race},
       {"rejection_and_expiry",rejection_and_expiry},{"connection_generation_and_revocation",connection_generation_and_revocation},
       {"authentication_and_api_routes",authentication_and_api_routes},{"audit_fail_closed",audit_fail_closed},
+      {"approval_reaper_survives_audit_failure",approval_reaper_survives_audit_failure},
       {"invalid_config_and_restart",invalid_config_and_restart},{"heartbeat_and_login_expiry",heartbeat_and_login_expiry},
       {"expiry_during_audit",expiry_during_audit},{"yaml_policy",yaml_policy},{"automatic_driver_runtime",automatic_driver_runtime},
       {"scoped_retry_and_cancellation",scoped_retry_and_cancellation},{"cancel_during_grant_response",cancel_during_grant_response}}) {

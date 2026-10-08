@@ -144,6 +144,59 @@ std::vector<fs::path> log_family(const fs::path& path) {
   });
   return result;
 }
+void prioritize_session_files(std::vector<fs::path>& paths, std::int64_t begin,
+                              std::int64_t end, std::uint64_t& scanned, std::stop_token stop) {
+  // Sample both ends before spending the scan budget on unrelated rotations.
+  // Samples are hints, never grounds to exclude a file: clocks can jump and
+  // asynchronous writers can interleave records. Unknown files remain eligible.
+  constexpr std::size_t sample_bytes = 64 * 1024;
+  constexpr std::uint64_t probe_limit = 8 * 1024 * 1024;
+  struct Candidate { fs::path path; int priority; };
+  std::vector<Candidate> candidates;
+  for (const auto& path : paths) {
+    int priority = 1;
+    if (!stop.stop_requested() && scanned + 2 * sample_bytes <= probe_limit) {
+      std::ifstream input(path, std::ios::binary | std::ios::ate);
+      const auto size = input ? static_cast<std::streamoff>(input.tellg()) : 0;
+      std::int64_t first = 0, last = 0;
+      bool head_timestamp = false, tail_timestamp = false;
+      for (int edge = 0; size > 0 && edge < 2; ++edge) {
+        const auto offset = edge == 0 ? 0 : std::max<std::streamoff>(0, size - sample_bytes);
+        input.clear(); input.seekg(offset);
+        std::string sample(static_cast<std::size_t>(std::min<std::streamoff>(sample_bytes, size - offset)), '\0');
+        input.read(sample.data(), static_cast<std::streamsize>(sample.size()));
+        sample.resize(static_cast<std::size_t>(input.gcount())); scanned += sample.size();
+        std::size_t pos = 0;
+        if (offset > 0) { // Discard a possibly partial first record in the tail.
+          const auto newline = sample.find('\n');
+          pos = newline == std::string::npos ? sample.size() : newline + 1;
+        }
+        while (pos < sample.size()) {
+          const auto newline = sample.find('\n', pos);
+          if (newline == std::string::npos && offset + static_cast<std::streamoff>(sample.size()) < size) break;
+          const auto line_end = newline == std::string::npos ? sample.size() : newline;
+          const auto value = Json::parse(sample.substr(pos, line_end - pos), nullptr, false);
+          const auto timestamp = value.is_object() ? record_time(value) : 0;
+          if (timestamp) {
+            (edge == 0 ? head_timestamp : tail_timestamp) = true;
+            if (!first || timestamp < first) first = timestamp;
+            last = std::max(last, timestamp);
+            if (timestamp >= begin && timestamp <= end) priority = 0;
+          }
+          pos = line_end + 1;
+        }
+      }
+      if (priority != 0 && head_timestamp && tail_timestamp)
+        priority = first <= end && last >= begin ? 0 : 2;
+    }
+    candidates.push_back({path, priority});
+  }
+  // Keep the original chronological file order within each priority group.
+  std::stable_sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+    return a.priority < b.priority;
+  });
+  for (std::size_t i = 0; i < paths.size(); ++i) paths[i] = std::move(candidates[i].path);
+}
 std::string hex(std::string_view bytes) {
   constexpr char digits[] = "0123456789abcdef";
   std::string result; result.reserve(bytes.size() * 2);
@@ -184,7 +237,10 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources, const Js
     bool limited = false, failed = false, dropped = false;
     std::ofstream output(destination / source.name, std::ios::binary | std::ios::trunc);
     if (!output) throw std::runtime_error("cannot create log snapshot");
-    const auto paths = log_family(source.path);
+    auto paths = log_family(source.path);
+    prioritize_session_files(paths, begin, end, scanned, stop);
+    report["probe_bytes"] = scanned;
+    report["scan_order"] = "UTC-window candidates, unknown ranges, other rotations";
     for (const auto& path : paths) {
       report["source_files"].push_back(path.filename().string());
       std::ifstream input(path, std::ios::binary);

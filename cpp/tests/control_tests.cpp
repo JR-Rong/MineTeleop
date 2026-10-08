@@ -553,6 +553,17 @@ void test_control_page_contract() {
           response.body.find("完成后请从页面重新申请 VCU 握手") !=
               std::string::npos,
       "explicit VCU handshake controls are missing");
+  for (const auto* label : {
+           "initial:'启动 1/5 · 低握手帧'",
+           "wait_parallel_handshake:'启动 2/5 · 智驾状态 5'",
+           "wait_parking_brake_released:'启动 3/5 · 等待电子驻车释放'",
+           "wait_gear:'启动 4/5 · 挡位闭环（零牵引）'",
+           "wait_actuator_modes:'启动 5/5 · 执行器模式（零牵引）'"}) {
+    expect(response.body.find(label) != std::string::npos,
+           "handshake title does not match the five fixed startup phases");
+  }
+  expect(response.body.find("保持驻车") == std::string::npos,
+         "handshake UI claims EPB remains applied after release");
   const auto diagnose_handshake =
       response.body.find("function diagnoseVcuHandshake");
   const auto handshake_revoked_gate = response.body.find(
