@@ -358,6 +358,8 @@ if(MINE_TELEOP_BUILD_TESTS)
     find_program(MINE_TELEOP_NODE_EXECUTABLE NAMES node nodejs REQUIRED)
     add_test(NAME mine-teleop-camera-view-tests
       COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/camera_view.test.cjs)
+    add_test(NAME mine-teleop-session-logs-js-tests
+      COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} --test ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/session_logs.test.cjs)
     add_test(NAME mine-teleop-scene-state-tests
       COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/scene_state.test.mjs)
     add_test(

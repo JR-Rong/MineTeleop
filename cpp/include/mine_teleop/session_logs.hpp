@@ -23,7 +23,9 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources,
                           std::stop_token stop = {});
 Json session_log_chunk(const std::filesystem::path& directory, const Json& manifest,
                        std::string_view name, std::uint64_t offset);
-void append_session_log_chunk(const std::filesystem::path& directory, const Json& chunk);
+// Upload retries may only repeat bytes already stored at the same offset.
+void append_session_log_chunk(const std::filesystem::path& directory, const Json& chunk,
+                              bool allow_retry = false);
 void write_session_zip(const std::filesystem::path& directory,
                        const std::filesystem::path& destination);
 

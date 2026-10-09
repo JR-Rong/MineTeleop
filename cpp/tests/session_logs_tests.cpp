@@ -1,6 +1,7 @@
 #include "mine_teleop/session_logs.hpp"
 #include "mine_teleop/server.hpp"
 #include <cstdlib>
+#include <atomic>
 #include <fstream>
 #include <iostream>
 #include <thread>
@@ -55,6 +56,12 @@ void collection_and_zip() {
   denied = false;
   try { append_session_log_chunk(dir.path / "copy", chunk); } catch (...) { denied = true; }
   check(denied, "out of order duplicate chunk accepted");
+  append_session_log_chunk(dir.path / "copy", chunk, true);
+  check(read(dir.path / "copy/cloud.jsonl") == text, "retried upload duplicated bytes");
+  auto changed = chunk; changed["data_hex"] = "00";
+  denied = false;
+  try { append_session_log_chunk(dir.path / "copy", changed, true); } catch (...) { denied = true; }
+  check(denied, "conflicting retry overwrote uploaded data");
   write(dir.path / "snapshot/empty.log", "");
   write_session_zip(dir.path / "snapshot", dir.path / "session.zip");
   const auto zip = read(dir.path / "session.zip");
@@ -83,6 +90,69 @@ void collection_and_zip() {
     const auto job = broker.start(session, false); const auto state = broker.status(job.at("export_id").get<std::string>(), "driver");
     check(state.at("vehicle").at("reason") == "vehicle_offline", "offline vehicle was not reported");
   }
+}
+
+void trace_batch_session_filter() {
+  Directory dir; const auto start = now_ms();
+  const auto command = [&](std::string session, std::string marker, std::int64_t time) {
+    return Json{{"trace_session_id", session}, {"command_sent_at_utc_ms", time},
+                {"marker", marker}, {"control_token", "batch-secret"}};
+  };
+  const auto batch = [&](std::string service, std::int64_t time, Json commands) {
+    return Json{{"service_instance_id", service}, {"sent_at_utc_ms", time},
+        {"event", "cloud_native_control_trace_batch"}, {"details", {{"commands", commands}}}}.dump() + "\n";
+  };
+  // A batch can flush late and contain another driver's session. Filter its
+  // records independently; retain matching commands without leaking siblings.
+  write(dir.path / "audit.jsonl", batch("service-a", start + 4000, Json::array({
+      command("session-000001", "wanted", start), command("session-000002", "other-driver", start),
+      command("session-000001", "out-of-window", start - 10000)})) +
+      batch("service-b", start, Json::array({command("session-000001", "old-service", start)})) +
+      batch("service-a", start, Json::array({command("session-000002", "unrelated-batch", start)})));
+  collect_session_logs({{dir.path / "audit.jsonl", "cloud.jsonl", true}}, metadata(start), dir.path / "out");
+  const auto text = read(dir.path / "out/cloud.jsonl");
+  check(text.find("wanted") != std::string::npos, "session command batch omitted");
+  for (const auto* excluded : {"other-driver", "out-of-window", "old-service", "unrelated-batch", "batch-secret"})
+    check(text.find(excluded) == std::string::npos, "trace batch scope or credential leak");
+  check(Json::parse(text).at("details").at("commands").size() == 1, "unrelated commands survived filtering");
+  write(dir.path / "runtime.log", Json{{"event", "vehicle_control_trace_batch"}, {"event_at_utc_ms", start},
+      {"commands", {command("session-000001", "vehicle-wanted", start),
+                    command("session-000002", "vehicle-other", start)}}}.dump() + "\n");
+  collect_session_logs({{dir.path / "runtime.log", "runtime.log"}}, metadata(start), dir.path / "vehicle-out");
+  const auto vehicle = Json::parse(read(dir.path / "vehicle-out/runtime.log"));
+  check(vehicle.at("commands").size() == 1 && vehicle.at("commands").at(0).at("marker") == "vehicle-wanted",
+        "vehicle trace batch leaked another session");
+}
+
+void vehicle_export_failure_reporting() {
+  Directory dir; SessionLogBroker broker(dir.path / "audit.jsonl");
+  const auto session = metadata(now_ms());
+  {
+    SessionLogBroker unclaimed(dir.path / "unclaimed/audit.jsonl");
+    const auto id = unclaimed.start(session, true).at("export_id").get<std::string>();
+    const auto status = unclaimed.status(id, "driver", true);
+    check(status.at("vehicle").at("reason") == "vehicle_worker_unresponsive", "unclaimed task reported as upload failure");
+  }
+  const auto id = broker.start(session, true).at("export_id").get<std::string>();
+  broker.vehicle("vehicle", {{"operation", "poll"}}, true);
+  const Json chunk = {{"name", "runtime.log"}, {"offset", 0}, {"data_hex", "616263"}};
+  broker.vehicle("vehicle", {{"operation", "append"}, {"export_id", id}, {"chunk", chunk}}, true);
+  broker.vehicle("vehicle", {{"operation", "append"}, {"export_id", id}, {"chunk", chunk}}, true);
+  auto status = broker.status(id, "driver");
+  check(status.at("vehicle_progress").at("bytes_received") == 3, "retry counted duplicate progress");
+  broker.vehicle("vehicle", {{"operation", "failed"}, {"export_id", id}, {"stage", "upload"}}, true);
+  status = broker.status(id, "driver");
+  check(status.at("vehicle").at("reason") == "vehicle_upload_failed", "upload failure reason hidden");
+  check(status.at("vehicle").at("files").at(0).at("bytes") == 3, "partial upload discarded");
+  const auto retained = broker.chunk(id, "driver", {{"source", "vehicle"}, {"name", "runtime.log"}, {"offset", 0}});
+  check(retained.at("data_hex") == "616263", "partial upload cannot be downloaded");
+  SessionLogBroker cancelled(dir.path / "cancelled/audit.jsonl");
+  const auto cancelled_id = cancelled.start(session, true).at("export_id").get<std::string>();
+  cancelled.vehicle("vehicle", {{"operation", "poll"}}, true);
+  const auto stopped = cancelled.vehicle("vehicle", {{"operation", "append"}, {"export_id", cancelled_id}, {"chunk", chunk}}, false);
+  check(stopped.at("cancelled").get<bool>() &&
+      cancelled.status(cancelled_id, "driver").at("vehicle").at("reason") == "new_control_session_started",
+      "export continued after control session resumed");
 }
 
 void session_window_scan_priority() {
@@ -148,7 +218,27 @@ void three_endpoint_export() {
   config.audit_log_path = (dir.path / "audit.jsonl").string();
   config.api_rate_limit_requests = 10000;
   SignalingService service(config);
-  SimpleHttpServer server("127.0.0.1", 0, [&](const HttpRequest& request) { return service.handle(request); }); server.start();
+  std::atomic<int> append_attempts{0}, finish_attempts{0};
+  std::atomic<bool> permanent_upload_failure{false};
+  SimpleHttpServer server("127.0.0.1", 0, [&](const HttpRequest& request) {
+    if (request.path == "/sessions/logs/vehicle") {
+      const auto operation = request.json_body().value("operation", "");
+      if (operation == "append") {
+        if (permanent_upload_failure) return ServerResponse::json(503, {{"error", "persistent upload failure"}});
+        const auto attempt = ++append_attempts;
+        if (attempt == 1) return ServerResponse::json(503, {{"error", "temporary upload failure"}});
+        auto response = service.handle(request);
+        if (attempt == 2) return ServerResponse::json(503, {{"error", "append succeeded but response lost"}});
+        return response;
+      }
+      if (operation == "finish") {
+        auto response = service.handle(request);
+        if (++finish_attempts == 1) return ServerResponse::json(503, {{"error", "finish succeeded but response lost"}});
+        return response;
+      }
+    }
+    return service.handle(request);
+  }); server.start();
   const auto origin = "http://127.0.0.1:" + std::to_string(server.port()); HttpClient http;
   const auto login = [&](const std::string& id, const std::string& password) {
     return http.post_json_response(origin + "/auth/driver_login", {{"driver_id", id}, {"password", password}}).at("token").get<std::string>();
@@ -159,7 +249,8 @@ void three_endpoint_export() {
   const auto id = session.at("session_id").get<std::string>(); const auto timestamp = now_ms();
   const auto event = Json{{"logged_at_utc_ms", timestamp}, {"session_id", id}, {"event", "retained-test-event"},
       {"password", "must-redact"}, {"message", "device-secret"}}.dump() + "\n";
-  write(dir.path / "vehicle-runtime.log", event);
+  write(dir.path / "vehicle-runtime.log", event + Json{{"logged_at_utc_ms", timestamp}, {"session_id", id},
+      {"event", "large-runtime-record"}, {"payload", std::string(300000, 'x')}}.dump() + "\n");
   write(dir.path / "vcu.jsonl", Json{{"logged_at_utc_ms", timestamp}, {"kind", "can_tx_batch"}, {"data", "test-CAN-evidence"}}.dump() + "\n");
   write(dir.path / "browser.jsonl", Json{{"sent_at_utc_ms", timestamp}, {"session_id", id},
       {"event", "browser-event"}, {"password", "must-redact"}, {"message", token}}.dump() + "\n");
@@ -176,17 +267,26 @@ void three_endpoint_export() {
   VehicleConfig vehicle; vehicle.vehicle_id = "vehicle"; vehicle.cloud.signaling_url = origin;
   auto worker = start_vehicle_log_worker(vehicle, "device-secret");
   ControllerLogExport exported(origin, {}, {}, "driver", token, key.get<std::string>(), dir.path / "browser.jsonl");
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(18);
   while (exported.status().at("state") == "collecting" && std::chrono::steady_clock::now() < deadline)
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   const auto status = exported.status();
   check(status.at("state") == "ready", status.dump().c_str());
+  check(append_attempts >= 5 && finish_attempts == 2, "transient failures did not retry append and finish");
   const auto zip = exported.zip();
   for (const auto* required : {"controller/control-browser-events.jsonl", "cloud/signaling-audit.jsonl",
                                "vehicle/runtime.log", "vehicle/vcu-can.jsonl", "manifest.json", "test-CAN-evidence"})
     check(zip.find(required) != std::string::npos, "three-endpoint ZIP omitted source");
   check(zip.find("must-redact") == std::string::npos && zip.find("device-secret") == std::string::npos, "ZIP leaked credential");
   if (const char* output = std::getenv("MINE_TELEOP_TEST_EXPORT_ZIP")) write(output, zip);
+  permanent_upload_failure = true;
+  ControllerLogExport failed(origin, {}, {}, "driver", token, key.get<std::string>(), dir.path / "browser.jsonl");
+  const auto failed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+  while (failed.status().at("state") == "collecting" && std::chrono::steady_clock::now() < failed_deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const auto failure = failed.status();
+  check(failure.at("state") == "ready" && !failure.at("complete").get<bool>(), "exhausted upload retry did not finish as partial");
+  check(failure.at("manifest").at("vehicle").at("reason") == "vehicle_upload_failed", "worker swallowed upload failure");
   worker.request_stop(); worker.join();
   // A pending vehicle upload must not turn a desktop close into a 3-minute join.
   auto pending = std::make_unique<ControllerLogExport>(origin, std::vector<std::string>{}, fs::path{},
@@ -199,6 +299,6 @@ void three_endpoint_export() {
 }
 }
 int main() {
-  try { package_configuration(); collection_and_zip(); session_window_scan_priority(); three_endpoint_export(); std::cout << "session_log_export_tests=passed\n"; return 0; }
+  try { package_configuration(); collection_and_zip(); trace_batch_session_filter(); vehicle_export_failure_reporting(); session_window_scan_priority(); three_endpoint_export(); std::cout << "session_log_export_tests=passed\n"; return 0; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

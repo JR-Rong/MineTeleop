@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <regex>
@@ -21,6 +22,8 @@ constexpr std::uint64_t kFileLimit = 64 * 1024 * 1024;
 constexpr std::uint64_t kScanLimit = 512 * 1024 * 1024;
 constexpr std::size_t kChunkBytes = 256 * 1024;
 constexpr std::int64_t kRetentionMs = 7LL * 24 * 60 * 60 * 1000;
+constexpr std::int64_t kVehicleIdleTimeoutMs = 180000;
+constexpr std::int64_t kExportTimeoutMs = 10 * 60 * 1000;
 
 void require(bool condition, const char* message) {
   if (!condition) throw std::invalid_argument(message);
@@ -117,6 +120,28 @@ std::string record_session(const Json& value) {
     if (value.contains(key) && value[key].is_string() && !value[key].get<std::string>().empty()) return value[key];
   if (value.contains("details")) return record_session(value["details"]);
   return {};
+}
+std::optional<bool> select_trace_commands(Json& value, std::string_view session_id,
+                                         std::int64_t begin, std::int64_t end) {
+  const auto event = value.value("event", "");
+  if (event != "cloud_native_control_trace_batch" &&
+      event != "vehicle_control_trace_batch" &&
+      event != "driver_native_control_trace_batch") return std::nullopt;
+  auto& payload = event == "vehicle_control_trace_batch" ? value : value["details"];
+  if (!payload.is_object() || !payload.contains("commands") || !payload["commands"].is_array()) return std::nullopt;
+  auto& commands = payload["commands"].get_ref<Json::array_t&>();
+  std::erase_if(commands, [&](const Json& command) {
+    if (record_session(command) != session_id) return true;
+    auto timestamp = record_time(command);
+    if (!timestamp && command.contains("command_sent_at_utc_ms") && command["command_sent_at_utc_ms"].is_number_integer())
+      timestamp = command["command_sent_at_utc_ms"].get<std::int64_t>();
+    if (!timestamp) timestamp = record_time(value);
+    return !timestamp || timestamp < begin || timestamp > end;
+  });
+  // A cloud batch can contain multiple sessions. Never include its unrelated
+  // commands merely because one entry belongs to the requested session.
+  payload["trace_session_id"] = commands.empty() ? "" : std::string(session_id);
+  return !commands.empty();
 }
 Json missing(std::string_view reason) {
   return {{"status", "partial"}, {"reason", reason}, {"files", Json::array()}};
@@ -253,10 +278,12 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources, const Js
         auto value = Json::parse(line, nullptr, false);
         if (!value.is_object()) { ++unattributed; continue; }
         const auto timestamp = record_time(value);
+        const auto trace_batch = select_trace_commands(value, id, begin, end);
         const auto record_id = record_session(value);
         if (timestamp) { if (!first || timestamp < first) first = timestamp; last = std::max(last, timestamp); }
+        if (trace_batch && !*trace_batch) continue;
         if (!record_id.empty() && record_id != id) continue;
-        if (timestamp && (timestamp < begin || timestamp > end)) continue;
+        if (!trace_batch && timestamp && (timestamp < begin || timestamp > end)) continue;
         if (!timestamp) { ++unattributed; continue; }
         if (source.require_session_id && record_id != id) continue;
         if (record_id.empty()) ++unscoped;
@@ -315,7 +342,7 @@ Json session_log_chunk(const fs::path& directory, const Json& manifest,
           {"next_offset", offset + data.size()}, {"eof", offset + data.size() == size}};
 }
 
-void append_session_log_chunk(const fs::path& directory, const Json& chunk) {
+void append_session_log_chunk(const fs::path& directory, const Json& chunk, bool allow_retry) {
   const auto name = chunk.at("name").get<std::string>();
   require(safe_name(name), "invalid upload file");
   const auto offset = chunk.at("offset").get<std::uint64_t>();
@@ -325,7 +352,16 @@ void append_session_log_chunk(const fs::path& directory, const Json& chunk) {
   const auto path = directory / name;
   std::error_code error;
   const auto size = fs::exists(path) ? fs::file_size(path, error) : 0;
-  require(!error && size == offset && !fs::is_symlink(path), "snapshot offset mismatch");
+  require(!error && !fs::is_symlink(path), "invalid snapshot file");
+  if (allow_retry && fs::exists(path) && offset <= size && data.size() <= size - offset) {
+    std::ifstream input(path, std::ios::binary);
+    input.seekg(static_cast<std::streamoff>(offset));
+    std::string existing(data.size(), '\0');
+    input.read(existing.data(), static_cast<std::streamsize>(existing.size()));
+    require(input && existing == data, "retried snapshot chunk differs");
+    return; // The preceding append succeeded, but its HTTP response was lost.
+  }
+  require(size == offset, "snapshot offset mismatch");
   std::ofstream output(path, std::ios::binary | std::ios::app); output.write(data.data(), data.size());
   require(static_cast<bool>(output), "cannot append log snapshot");
 }
@@ -382,7 +418,26 @@ struct SessionLogBroker::Impl {
     Json session, cloud, vehicle_manifest;
     TemporaryDirectory temporary;
     std::int64_t created{now_ms()};
+    std::int64_t vehicle_activity{created};
+    bool vehicle_claimed{false};
+    std::uint64_t vehicle_bytes{0};
     std::jthread worker;
+
+    void fail_vehicle(std::string_view reason) {
+      vehicle_manifest = missing(reason);
+      for (const auto* name : {"runtime.log", "vcu-can.jsonl"}) {
+        const auto path = temporary.path / "vehicle" / name;
+        if (fs::is_regular_file(path) && !fs::is_symlink(path)) {
+          vehicle_manifest["files"].push_back({{"name", name}, {"bytes", fs::file_size(path)},
+              {"status", "partial"}, {"issues", {"incomplete_upload"}}});
+        }
+      }
+    }
+    void expire_vehicle(bool forced = false) {
+      if (!vehicle_manifest.is_null()) return;
+      if (forced || now_ms() - created > kExportTimeoutMs || now_ms() - vehicle_activity > kVehicleIdleTimeoutMs)
+        fail_vehicle(vehicle_claimed ? "vehicle_upload_timeout" : "vehicle_worker_unresponsive");
+    }
   };
   fs::path audit, catalog;
   TemporaryDirectory fallback;
@@ -458,9 +513,8 @@ Json SessionLogBroker::start(const Json& session, bool vehicle_online) {
   // Only finished jobs can be discarded without joining a live worker here.
   for (auto it = impl_->jobs.begin(); it != impl_->jobs.end();) {
     auto& job = *it->second;
-    if (job.vehicle_manifest.is_null() && now_ms() - job.created > 180000)
-      job.vehicle_manifest = missing("vehicle_timeout_offline_or_unsupported_version");
-    if (!job.cloud.is_null() && now_ms() - job.created > 10 * 60 * 1000)
+    job.expire_vehicle();
+    if (!job.cloud.is_null() && !job.vehicle_manifest.is_null() && now_ms() - job.created > kExportTimeoutMs)
       it = impl_->jobs.erase(it);
     else ++it;
   }
@@ -489,11 +543,11 @@ Json SessionLogBroker::start(const Json& session, bool vehicle_online) {
 }
 Json SessionLogBroker::status(std::string_view id, std::string_view driver, bool finish_partial) {
   std::lock_guard lock(impl_->mutex); auto& job = impl_->job(id, driver);
-  if ((finish_partial || now_ms() - job.created > 180000) && job.vehicle_manifest.is_null())
-    job.vehicle_manifest = missing("vehicle_timeout_offline_or_unsupported_version");
+  job.expire_vehicle(finish_partial);
   return {{"export_id", job.id}, {"session", job.session},
           {"ready", !job.cloud.is_null() && !job.vehicle_manifest.is_null()},
-          {"cloud", job.cloud}, {"vehicle", job.vehicle_manifest}};
+          {"cloud", job.cloud}, {"vehicle", job.vehicle_manifest},
+          {"vehicle_progress", {{"claimed", job.vehicle_claimed}, {"bytes_received", job.vehicle_bytes}}}};
 }
 Json SessionLogBroker::chunk(std::string_view id, std::string_view driver, const Json& request) {
   std::lock_guard lock(impl_->mutex); auto& job = impl_->job(id, driver);
@@ -514,20 +568,37 @@ Json SessionLogBroker::vehicle(std::string_view vehicle, const Json& request, bo
   const auto operation = request.at("operation").get<std::string>();
   if (operation == "poll") {
     if (idle) for (auto& [id, job] : impl_->jobs) {
-      if (job->vehicle == vehicle && job->vehicle_manifest.is_null() && now_ms() - job->created < 180000)
+      job->expire_vehicle();
+      if (job->vehicle == vehicle && job->vehicle_manifest.is_null()) {
+        if (!job->vehicle_claimed) { job->vehicle_claimed = true; job->vehicle_activity = now_ms(); }
         return {{"export_id", id}, {"session", job->session}};
+      }
     }
     return Json::object();
   }
   const auto found = impl_->jobs.find(request.at("export_id").get<std::string>());
   require(found != impl_->jobs.end() && found->second->vehicle == vehicle, "export not found for vehicle");
   auto& job = *found->second;
+  job.expire_vehicle();
+  if (operation == "finish" && !job.vehicle_manifest.is_null() && job.vehicle_manifest == request.at("manifest"))
+    return {{"accepted", true}};
+  if (!job.vehicle_manifest.is_null() && job.vehicle_manifest.contains("reason")) return {{"cancelled", true}};
   require(job.vehicle_manifest.is_null(), "vehicle snapshot is already closed");
-  if (!idle) { job.vehicle_manifest = missing("new_control_session_started"); return {{"cancelled", true}}; }
+  if (!idle) { job.fail_vehicle("new_control_session_started"); return {{"cancelled", true}}; }
+  if (operation == "failed") {
+    const auto stage = request.at("stage").get<std::string>();
+    require(stage == "collection" || stage == "upload" || stage == "finish", "invalid export failure stage");
+    job.fail_vehicle("vehicle_" + stage + "_failed");
+    return {{"accepted", true}};
+  }
   if (operation == "append") {
     const auto& chunk = request.at("chunk");
     require(allowed_vehicle_file(chunk.at("name")), "unapproved vehicle log file");
-    append_session_log_chunk(job.temporary.path / "vehicle", chunk);
+    const auto path = job.temporary.path / "vehicle" / chunk.at("name").get<std::string>();
+    const auto before = fs::exists(path) ? fs::file_size(path) : 0;
+    append_session_log_chunk(job.temporary.path / "vehicle", chunk, true);
+    job.vehicle_bytes += fs::file_size(path) - before;
+    job.vehicle_activity = now_ms();
     return {{"accepted", true}};
   }
   if (operation == "finish") {
@@ -555,24 +626,35 @@ std::jthread start_vehicle_log_worker(const VehicleConfig& config, std::string t
   const auto runtime = log_path("MINE_TELEOP_VEHICLE_RUNTIME_LOG_PATH", "/var/log/mine-teleop/vehicle-runtime.log");
   const auto can = log_path("MINE_TELEOP_VCU_LOG_PATH", "/var/log/mine-teleop/vcu-can.jsonl");
   return std::jthread([config, token = std::move(token), runtime, can](std::stop_token stop) {
-    HttpClient http(std::chrono::seconds(2), config.cloud.resolve_entries, config.cloud.ca_bundle);
+    HttpClient http(std::chrono::seconds(5), config.cloud.resolve_entries, config.cloud.ca_bundle);
     const auto url = normalize_signaling_http_url(config.cloud.signaling_url) + "/sessions/logs/vehicle";
     std::string last_attempt;
+    std::int64_t last_poll_error_log_ms = 0;
     while (pause(stop, 3000)) {
+      std::string id, stage = "poll";
+      const auto call = [&](Json request) {
+        request["vehicle_id"] = config.vehicle_id; request["device_token"] = token;
+        for (int attempt = 0; ; ++attempt) {
+          try { return http.post_json_response(url, request); }
+          catch (const HttpStatusError& error) {
+            if (error.status() != 429 && error.status() < 500) throw;
+            if (attempt >= 2 || !pause(stop, 500 * (attempt + 1))) throw;
+          } catch (const HttpTransportError&) {
+            if (attempt >= 2 || !pause(stop, 500 * (attempt + 1))) throw;
+          }
+        }
+      };
       try {
-        const auto call = [&](Json request) {
-          request["vehicle_id"] = config.vehicle_id; request["device_token"] = token;
-          return http.post_json_response(url, request);
-        };
         const auto task = call({{"operation", "poll"}});
         if (!task.contains("export_id")) continue;
-        const auto id = task.at("export_id").get<std::string>();
-        if (id == last_attempt) continue; // Lost/partial transfers are reported, never duplicated.
-        last_attempt = id;
+        id = task.at("export_id").get<std::string>();
+        if (id == last_attempt) continue;
+        stage = "collection";
         TemporaryDirectory snapshot;
         auto manifest = collect_session_logs({{runtime, "runtime.log"}, {can, "vcu-can.jsonl"}},
                                              task.at("session"), snapshot.path, {token}, stop);
         bool cancelled = false;
+        stage = "upload";
         for (const auto& file : manifest.at("files")) {
           std::uint64_t offset = 0;
           do {
@@ -586,8 +668,27 @@ std::jthread start_vehicle_log_worker(const VehicleConfig& config, std::string t
           } while (true);
           if (cancelled) break;
         }
+        stage = "finish";
         if (!cancelled && !stop.stop_requested()) call({{"operation", "finish"}, {"export_id", id}, {"manifest", manifest}});
-      } catch (const std::exception&) { /* Retry polling; the cloud marks incomplete transfers after timeout. */ }
+        last_attempt = id;
+      } catch (const std::exception& error) {
+        // Never print HTTP bodies: they can contain credentials. Report the
+        // bounded stage and preserve any chunks already received by the cloud.
+        const auto* http_error = dynamic_cast<const HttpStatusError*>(&error);
+        const auto* transport_error = dynamic_cast<const HttpTransportError*>(&error);
+        if (stage != "poll" || now_ms() - last_poll_error_log_ms >= 60000) {
+          std::cerr << Json({{"event", "vehicle_log_export_failed"}, {"event_at_utc_ms", now_ms()},
+                            {"stage", stage}, {"export_id", id},
+                            {"http_status", http_error ? http_error->status() : 0},
+                            {"issue_code", http_error ? "http_status_error" :
+                                transport_error ? "http_transport_error" : "log_processing_failed"}}).dump() << '\n';
+          if (stage == "poll") last_poll_error_log_ms = now_ms();
+        }
+        if (!id.empty() && !stop.stop_requested()) {
+          try { call({{"operation", "failed"}, {"export_id", id}, {"stage", stage}}); last_attempt = id; }
+          catch (const std::exception&) { last_attempt = id; /* Cloud progress timeout retains partial data. */ }
+        }
+      }
     }
   });
 }
@@ -619,9 +720,13 @@ ControllerLogExport::ControllerLogExport(std::string origin, std::vector<std::st
           session, root / "controller", {token}, stop);
       // Desktop events are optional; their absence is still explicitly represented.
       Json remote;
-      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(185);
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kExportTimeoutMs + 5000);
       while (!stop.stop_requested()) {
         remote = call("status", {{"export_id", id}, {"finish_partial", std::chrono::steady_clock::now() >= deadline}});
+        {
+          std::lock_guard lock(impl_->mutex);
+          impl_->progress["vehicle_progress"] = remote.value("vehicle_progress", Json::object());
+        }
         if (remote.at("ready").get<bool>()) break;
         if (!pause(stop, 1000)) return;
       }

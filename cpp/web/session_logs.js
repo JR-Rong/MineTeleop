@@ -3,6 +3,34 @@
   function sessionLabel(session) {
     return `${session.session_id} · ${session.vehicle_id} · ${new Date(session.started_at_utc_ms).toLocaleString()}`;
   }
+  function exportStatusMessage(value) {
+    if (value.state === 'collecting') {
+      const progress = value.vehicle_progress || {};
+      const detail = progress.claimed ? `车端已接任务，已接收 ${(Number(progress.bytes_received || 0) / 1048576).toFixed(1)} MB。` : '等待车端接收采集任务。';
+      return `正在收集三端日志。${detail}请保持车辆空闲、三端在线；最长约 10 分钟。`;
+    }
+    if (value.complete) return '收集完成，可以保存 ZIP。';
+    const reasons = {
+      vehicle_offline: '车端离线',
+      vehicle_worker_unresponsive: '车端未响应采集任务，请检查车端版本及日志采集进程',
+      vehicle_upload_timeout: '车端上传中断或超时',
+      vehicle_collection_failed: '车端读取日志失败',
+      vehicle_upload_failed: '车端上传失败，重试后仍未完成',
+      vehicle_finish_failed: '车端上传完成确认失败',
+      new_control_session_started: '车辆重新进入控制会话，日志采集已停止',
+      vehicle_timeout_offline_or_unsupported_version: '车端未完成采集，请检查在线状态及版本',
+      cloud_log_read_failed: '云端读取日志失败',
+    };
+    const labels = {vehicle: '车端', cloud: '云端', controller: '控制端'};
+    const missing = Object.entries(labels).flatMap(([source, label]) => {
+      const report = value.manifest?.[source];
+      if (!report || report.status === 'available') return [];
+      if (report.reason) return [reasons[report.reason] || `${label}日志不完整（${report.reason}）`];
+      const files = (report.files || []).filter(file => !file.optional && file.status !== 'available');
+      return files.length ? [`${label}日志缺失或截断：${files.map(file => file.name).join('、')}`] : [];
+    });
+    return `仅收集到部分日志：${missing.join('；') || '可选日志缺失或截断'}。可以保存现有日志，详细原因见 ZIP 清单。`;
+  }
   function install() {
     const button = document.getElementById('export-session-logs');
     if (!button) return;
@@ -34,11 +62,11 @@
         download.hidden = value.state !== 'ready';
         start.disabled = value.state === 'collecting' || !select.value;
         if (value.state === 'collecting') {
-          message.textContent = '正在收集三端日志，请保持车端和控制端在线。最多等待约 3 分钟。';
+          message.textContent = exportStatusMessage(value);
           if (dialog.open) timer = setTimeout(poll, 1500);
         } else if (value.state === 'ready') {
           filename = value.filename;
-          message.textContent = value.complete ? '收集完成，可以保存 ZIP。' : '收集完成，但存在缺失或截断。ZIP 内 manifest.json 列出了各端原因。';
+          message.textContent = exportStatusMessage(value);
         } else if (value.state === 'failed') message.textContent = value.message;
       } catch (error) { fail(error); }
     }
@@ -77,6 +105,6 @@
     dialog.querySelector('#log-export-close').onclick = () => dialog.close();
     dialog.addEventListener('close', () => clearTimeout(timer));
   }
-  root.MineTeleopSessionLogs = {install, sessionLabel};
-  if (typeof module !== 'undefined') module.exports = {sessionLabel};
+  root.MineTeleopSessionLogs = {install, sessionLabel, exportStatusMessage};
+  if (typeof module !== 'undefined') module.exports = {sessionLabel, exportStatusMessage};
 })(typeof globalThis !== 'undefined' ? globalThis : this);
