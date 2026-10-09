@@ -162,9 +162,10 @@ void vehicle_export_failure_reporting() {
       {{"name", "vcu-can.jsonl"}, {"bytes", 3}}}}};
   const Json finish = {{"operation", "finish"}, {"export_id", complete_id}, {"manifest", manifest}};
   completed.vehicle("vehicle", finish, true);
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (!completed.status(complete_id, "driver").at("ready").get<bool>() && std::chrono::steady_clock::now() < deadline)
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  check(completed.status(complete_id, "driver").at("ready").get<bool>(), "receipt fixture collection timed out");
   completed.release(complete_id, "driver");
   check(completed.vehicle("vehicle", finish, true).at("accepted").get<bool>(), "released export lost finish receipt");
   bool denied = false;
