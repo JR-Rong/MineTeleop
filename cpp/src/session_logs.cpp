@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -58,6 +59,49 @@ bool pause(std::stop_token stop, int milliseconds) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   return !stop.stop_requested();
 }
+std::string redact_credentials(std::string_view text, bool bearer) {
+  const auto word = [](unsigned char c) { return std::isalnum(c) || c == '_'; };
+  const auto space = [](unsigned char c) { return std::isspace(c); };
+  std::string result;
+  std::size_t copied = 0;
+  for (std::size_t pos = 0; pos < text.size();) {
+    if (!word(text[pos]) || (pos && word(text[pos - 1]))) { ++pos; continue; }
+    const auto begin = pos;
+    while (pos < text.size() && word(text[pos])) ++pos;
+    std::string key(text.substr(begin, pos - begin));
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+    const bool token = key.ends_with("token") && std::all_of(key.begin(), key.end(), [](unsigned char c) {
+      return (c >= 'a' && c <= 'z') || c == '_';
+    });
+    if (bearer ? key != "bearer" : !token && key != "password" && key != "authorization" &&
+        key != "credential" && key != "secret" && key != "api_key") continue;
+    auto value = pos;
+    if (bearer) {
+      if (value == text.size() || !space(text[value])) continue;
+    } else if (value < text.size() && (text[value] == '"' || text[value] == '\'')) ++value;
+    while (value < text.size() && space(text[value])) ++value;
+    if (!bearer) {
+      if (value == text.size() || (text[value] != '=' && text[value] != ':')) continue;
+      ++value;
+      while (value < text.size() && space(text[value])) ++value;
+      if (value < text.size() && (text[value] == '"' || text[value] == '\'')) ++value;
+    }
+    auto end = value;
+    while (end < text.size()) {
+      const auto c = static_cast<unsigned char>(text[end]);
+      if (bearer ? !(std::isalnum(c) || std::string_view("._~+/=-").find(c) != std::string_view::npos)
+                 : space(c) || std::string_view("&\"',}").find(c) != std::string_view::npos) break;
+      ++end;
+    }
+    if (end == value) continue;
+    result.append(text.substr(copied, value - copied));
+    result += "[redacted]";
+    copied = end;
+    pos = end;
+  }
+  result.append(text.substr(copied));
+  return result;
+}
 std::string redact_text(std::string text, const std::vector<std::string>& secrets) {
   for (const auto& secret : secrets) {
     if (secret.empty()) continue;
@@ -68,12 +112,9 @@ std::string redact_text(std::string text, const std::vector<std::string>& secret
   }
   // Raw stdout can contain an HTTP header inside a JSON string. Redact the
   // complete Bearer value before the generic key=value rule sees whitespace.
-  static const std::regex bearer(R"(\bBearer\s+[A-Za-z0-9._~+/=-]+)", std::regex::icase);
-  text = std::regex_replace(text, bearer, "Bearer [redacted]");
-  static const std::regex credential(
-      R"((([?&]|\b)(?:[a-z_]*token|password|authorization|credential|secret|api_key)["']?\s*[=:]\s*["']?)[^\s&"',}]+)",
-      std::regex::icase);
-  return std::regex_replace(text, credential, "$1[redacted]");
+  // libstdc++ regex recursion can exhaust the stack on long log strings.
+  // Scan each word/value iteratively while preserving the same redaction rules.
+  return redact_credentials(redact_credentials(text, true), false);
 }
 Json redact(Json value, const std::vector<std::string>& secrets, int depth = 0) {
   if (depth > 64) return "[depth-limited]";
@@ -443,6 +484,8 @@ struct SessionLogBroker::Impl {
   TemporaryDirectory fallback;
   mutable std::mutex mutex;
   std::map<std::string, Json> records;
+  struct Receipt { std::string id, vehicle; Json manifest; std::int64_t created; };
+  std::deque<Receipt> released_exports;
   std::map<std::string, std::unique_ptr<Job>> jobs;
 
   explicit Impl(fs::path path) : audit(std::move(path)) {
@@ -561,6 +604,12 @@ Json SessionLogBroker::chunk(std::string_view id, std::string_view driver, const
 void SessionLogBroker::release(std::string_view id, std::string_view driver) {
   std::lock_guard lock(impl_->mutex); auto& job = impl_->job(id, driver);
   require(!job.cloud.is_null() && !job.vehicle_manifest.is_null(), "export is still collecting");
+  // The controller can finish downloading before the vehicle retries a lost
+  // finish response. Keep a bounded receipt while immediately freeing files.
+  auto& receipts = impl_->released_exports;
+  while (!receipts.empty() && (receipts.size() >= 16 || now_ms() - receipts.front().created > kVehicleIdleTimeoutMs))
+    receipts.pop_front();
+  receipts.push_back({job.id, job.vehicle, job.vehicle_manifest, now_ms()});
   impl_->jobs.erase(std::string(id));
 }
 Json SessionLogBroker::vehicle(std::string_view vehicle, const Json& request, bool idle) {
@@ -576,7 +625,14 @@ Json SessionLogBroker::vehicle(std::string_view vehicle, const Json& request, bo
     }
     return Json::object();
   }
-  const auto found = impl_->jobs.find(request.at("export_id").get<std::string>());
+  const auto export_id = request.at("export_id").get<std::string>();
+  const auto found = impl_->jobs.find(export_id);
+  if (found == impl_->jobs.end() && operation == "finish") {
+    for (const auto& receipt : impl_->released_exports)
+      if (receipt.id == export_id && receipt.vehicle == vehicle &&
+          now_ms() - receipt.created <= kVehicleIdleTimeoutMs && receipt.manifest == request.at("manifest"))
+        return {{"accepted", true}};
+  }
   require(found != impl_->jobs.end() && found->second->vehicle == vehicle, "export not found for vehicle");
   auto& job = *found->second;
   job.expire_vehicle();

@@ -1,7 +1,11 @@
 'use strict';
-const test = require('node:test');
-const assert = require('node:assert/strict');
+const assert = require('assert').strict;
 const {exportStatusMessage} = require('../web/session_logs.js');
+let failed = 0;
+function test(name, body) {
+  try { body(); console.log('[PASS] ' + name); }
+  catch (error) { failed++; console.error('[FAIL] ' + name, error); }
+}
 
 test('shows whether the vehicle claimed a task and made upload progress', () => {
   assert.match(exportStatusMessage({state: 'collecting'}), /等待车端/);
@@ -19,3 +23,4 @@ test('reports missing required files and treats optional logs separately', () =>
   assert.match(message, /runtime\.log/);
   assert.match(exportStatusMessage({state: 'ready', complete: true}), /收集完成/);
 });
+process.exitCode = failed ? 1 : 0;

@@ -23,7 +23,7 @@
     };
     const labels = {vehicle: '车端', cloud: '云端', controller: '控制端'};
     const missing = Object.entries(labels).flatMap(([source, label]) => {
-      const report = value.manifest?.[source];
+      const report = value.manifest && value.manifest[source];
       if (!report || report.status === 'available') return [];
       if (report.reason) return [reasons[report.reason] || `${label}日志不完整（${report.reason}）`];
       const files = (report.files || []).filter(file => !file.optional && file.status !== 'available');

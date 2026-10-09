@@ -153,6 +153,26 @@ void vehicle_export_failure_reporting() {
   check(stopped.at("cancelled").get<bool>() &&
       cancelled.status(cancelled_id, "driver").at("vehicle").at("reason") == "new_control_session_started",
       "export continued after control session resumed");
+  SessionLogBroker completed(dir.path / "completed/audit.jsonl");
+  const auto complete_id = completed.start(session, true).at("export_id").get<std::string>();
+  for (const auto* name : {"runtime.log", "vcu-can.jsonl"})
+    completed.vehicle("vehicle", {{"operation", "append"}, {"export_id", complete_id},
+        {"chunk", {{"name", name}, {"offset", 0}, {"data_hex", "616263"}}}}, true);
+  const Json manifest = {{"status", "available"}, {"files", {{{"name", "runtime.log"}, {"bytes", 3}},
+      {{"name", "vcu-can.jsonl"}, {"bytes", 3}}}}};
+  const Json finish = {{"operation", "finish"}, {"export_id", complete_id}, {"manifest", manifest}};
+  completed.vehicle("vehicle", finish, true);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (!completed.status(complete_id, "driver").at("ready").get<bool>() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  completed.release(complete_id, "driver");
+  check(completed.vehicle("vehicle", finish, true).at("accepted").get<bool>(), "released export lost finish receipt");
+  bool denied = false;
+  try { completed.vehicle("other-vehicle", finish, true); } catch (...) { denied = true; }
+  check(denied, "finish receipt crossed vehicle ownership");
+  denied = false; auto conflicting = finish; conflicting["manifest"]["status"] = "partial";
+  try { completed.vehicle("vehicle", conflicting, true); } catch (...) { denied = true; }
+  check(denied, "finish receipt accepted changed manifest");
 }
 
 void session_window_scan_priority() {
@@ -209,6 +229,24 @@ void package_configuration() {
       "invalid default CCG2 input");
 }
 
+void long_log_redaction() {
+  Directory dir; const auto start = now_ms();
+  const auto secret = std::string(300000, 'y');
+  const auto plain = std::string(300000, 'x');
+  std::string records;
+  for (const auto& message : {plain, "Authorization: Bearer " + secret,
+       "?device_token=" + secret + "&keep=ok", "{\"PASSWORD\":\"" + secret + "\"}",
+       std::string(20000, 'a') + "_token=" + secret})
+    records += Json{{"session_id", "session-000001"}, {"logged_at_utc_ms", start}, {"message", message}}.dump() + "\n";
+  write(dir.path / "runtime.log", records);
+  collect_session_logs({{dir.path / "runtime.log", "runtime.log"}}, metadata(start), dir.path / "snapshot");
+  const auto text = read(dir.path / "snapshot/runtime.log");
+  check(text.find(plain) != std::string::npos, "long noncredential text lost");
+  check(text.find(secret) == std::string::npos && text.find("[redacted]") != std::string::npos,
+        "long credential leaked");
+  check(text.find("&keep=ok") != std::string::npos, "credential redaction consumed adjacent parameter");
+}
+
 void three_endpoint_export() {
   Directory dir;
   SignalingServerConfig config;
@@ -219,6 +257,7 @@ void three_endpoint_export() {
   config.api_rate_limit_requests = 10000;
   SignalingService service(config);
   std::atomic<int> append_attempts{0}, finish_attempts{0};
+  std::atomic<bool> finish_acknowledged{false};
   std::atomic<bool> permanent_upload_failure{false};
   SimpleHttpServer server("127.0.0.1", 0, [&](const HttpRequest& request) {
     if (request.path == "/sessions/logs/vehicle") {
@@ -234,6 +273,7 @@ void three_endpoint_export() {
       if (operation == "finish") {
         auto response = service.handle(request);
         if (++finish_attempts == 1) return ServerResponse::json(503, {{"error", "finish succeeded but response lost"}});
+        finish_acknowledged = response.status == 200;
         return response;
       }
     }
@@ -268,11 +308,15 @@ void three_endpoint_export() {
   auto worker = start_vehicle_log_worker(vehicle, "device-secret");
   ControllerLogExport exported(origin, {}, {}, "driver", token, key.get<std::string>(), dir.path / "browser.jsonl");
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(18);
-  while (exported.status().at("state") == "collecting" && std::chrono::steady_clock::now() < deadline)
+  // The cloud exposes a ready ZIP before the vehicle retries its lost finish
+  // response. Wait for both independent completions before asserting retries.
+  while ((exported.status().at("state") == "collecting" || !finish_acknowledged) &&
+         std::chrono::steady_clock::now() < deadline)
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   const auto status = exported.status();
   check(status.at("state") == "ready", status.dump().c_str());
-  check(append_attempts >= 5 && finish_attempts == 2, "transient failures did not retry append and finish");
+  check(append_attempts >= 5 && finish_attempts == 2 && finish_acknowledged,
+        "transient failures did not retry append and finish");
   const auto zip = exported.zip();
   for (const auto* required : {"controller/control-browser-events.jsonl", "cloud/signaling-audit.jsonl",
                                "vehicle/runtime.log", "vehicle/vcu-can.jsonl", "manifest.json", "test-CAN-evidence"})
@@ -299,6 +343,6 @@ void three_endpoint_export() {
 }
 }
 int main() {
-  try { package_configuration(); collection_and_zip(); trace_batch_session_filter(); vehicle_export_failure_reporting(); session_window_scan_priority(); three_endpoint_export(); std::cout << "session_log_export_tests=passed\n"; return 0; }
+  try { package_configuration(); collection_and_zip(); trace_batch_session_filter(); vehicle_export_failure_reporting(); session_window_scan_priority(); long_log_redaction(); three_endpoint_export(); std::cout << "session_log_export_tests=passed\n"; return 0; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
