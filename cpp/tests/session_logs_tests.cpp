@@ -326,11 +326,14 @@ void three_endpoint_export() {
   if (const char* output = std::getenv("MINE_TELEOP_TEST_EXPORT_ZIP")) write(output, zip);
   permanent_upload_failure = true;
   ControllerLogExport failed(origin, {}, {}, "driver", token, key.get<std::string>(), dir.path / "browser.jsonl");
-  const auto failed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+  // Three upload attempts can each take 5s, in addition to polling, backoff,
+  // and collecting the partial ZIP. This checks completion, not a latency SLA.
+  const auto failed_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
   while (failed.status().at("state") == "collecting" && std::chrono::steady_clock::now() < failed_deadline)
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   const auto failure = failed.status();
-  check(failure.at("state") == "ready" && !failure.at("complete").get<bool>(), "exhausted upload retry did not finish as partial");
+  check(failure.at("state") == "ready" && !failure.at("complete").get<bool>(),
+        ("exhausted upload retry did not finish as partial: " + failure.dump()).c_str());
   check(failure.at("manifest").at("vehicle").at("reason") == "vehicle_upload_failed", "worker swallowed upload failure");
   worker.request_stop(); worker.join();
   // A pending vehicle upload must not turn a desktop close into a 3-minute join.

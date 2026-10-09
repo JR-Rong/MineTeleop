@@ -1558,7 +1558,7 @@ void test_field_config_pins_tls_route_without_system_dns() {
   expect(
       config.field_safety.require_can_feedback_before_control,
       "field vehicle CAN feedback gate is disabled");
-  expect(config.hardware.can_interface == "can1", "field vehicle CAN interface is not can1");
+  expect(config.hardware.can_interface == "can0", "field vehicle CAN interface is not can0");
   expect(config.hardware.can_bitrate == 500000, "field vehicle CAN bitrate is not 500 kbit/s");
   expect(
       config.hardware.can_tx_queue_length == 100,
