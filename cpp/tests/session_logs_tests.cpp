@@ -223,7 +223,7 @@ void package_configuration() {
   Directory directory; write(directory.path / "external.yaml", read("configs/vehicle-agent.three-machine.field.yaml"));
   check(load_vehicle_config(directory.path / "external.yaml").vehicle_adapter.bridge_library_path == config.vehicle_adapter.bridge_library_path,
         "external YAML changed bridge root");
-  const auto cameras = config.enabled_cameras(); check(cameras.size() == 2, "capture channel count");
+  const auto cameras = config.enabled_cameras(); check(cameras.size() == 6, "capture channel count");
   for (std::size_t i=0;i<cameras.size();++i) check(cameras[i].backend == "ccg2" &&
       cameras[i].device == "/dev/ccg2-channel-" + std::to_string(i) && cameras[i].capture_width == 1920 &&
       cameras[i].capture_height == 1080 && cameras[i].capture_fps == 30 && cameras[i].critical_for_control,

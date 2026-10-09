@@ -1492,7 +1492,7 @@ void test_field_config_pins_tls_route_without_system_dns() {
   expect(mine_teleop::load_vehicle_config(external_config).vehicle_adapter.bridge_library_path ==
       config.vehicle_adapter.bridge_library_path, "external YAML changed package-relative bridge root");
   const auto cameras = config.enabled_cameras();
-  expect(cameras.size() == 2, "default capture-card channel count changed");
+  expect(cameras.size() == 6, "default capture-card channel count changed");
   for (std::size_t index = 0; index < cameras.size(); ++index) {
     const auto& camera = cameras[index];
     expect(camera.backend == "ccg2" && camera.device == "/dev/ccg2-channel-" + std::to_string(index) &&

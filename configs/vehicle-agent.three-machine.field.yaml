@@ -36,24 +36,24 @@ control:
 media:
   realtime_profiles:
     realtime_720p30:
-      codec: h264
+      codec: h265
       encoder: auto
       width: 1280
       height: 720
       fps: 30
-      bitrate_kbps: 2500
+      bitrate_kbps: 1500
   record_profiles:
     reuse_realtime:
-      codec: h264
+      codec: h265
       encoder: reuse_realtime
       width: source
       height: source
       fps: source
-      bitrate_kbps: 2500
+      bitrate_kbps: 1500
       segment_seconds: 2
 
 cameras:
-  - id: ccg2_channel_0
+  - id: drive_front
     enabled: true
     critical_for_control: true
     reopen_attempts: 3
@@ -65,7 +65,7 @@ cameras:
     capture_fps: 30
     realtime_profile: realtime_720p30
     record_profile: reuse_realtime
-  - id: ccg2_channel_1
+  - id: drive_rear
     enabled: true
     critical_for_control: true
     reopen_attempts: 3
@@ -77,10 +77,58 @@ cameras:
     capture_fps: 30
     realtime_profile: realtime_720p30
     record_profile: reuse_realtime
+  - id: fish_front
+    enabled: true
+    critical_for_control: true
+    reopen_attempts: 3
+    reopen_backoff_ms: 500
+    backend: ccg2
+    device: /dev/ccg2-channel-2
+    capture_width: 1920
+    capture_height: 1080
+    capture_fps: 30
+    realtime_profile: realtime_720p30
+    record_profile: reuse_realtime
+  - id: fish_rear
+    enabled: true
+    critical_for_control: true
+    reopen_attempts: 3
+    reopen_backoff_ms: 500
+    backend: ccg2
+    device: /dev/ccg2-channel-3
+    capture_width: 1920
+    capture_height: 1080
+    capture_fps: 30
+    realtime_profile: realtime_720p30
+    record_profile: reuse_realtime
+  - id: fish_left
+    enabled: true
+    critical_for_control: true
+    reopen_attempts: 3
+    reopen_backoff_ms: 500
+    backend: ccg2
+    device: /dev/ccg2-channel-4
+    capture_width: 1920
+    capture_height: 1080
+    capture_fps: 30
+    realtime_profile: realtime_720p30
+    record_profile: reuse_realtime
+  - id: fish_right
+    enabled: true
+    critical_for_control: true
+    reopen_attempts: 3
+    reopen_backoff_ms: 500
+    backend: ccg2
+    device: /dev/ccg2-channel-5
+    capture_width: 1920
+    capture_height: 1080
+    capture_fps: 30
+    realtime_profile: realtime_720p30
+    record_profile: reuse_realtime
 
 hardware:
   can:
-    interface: can1
+    interface: can0
     bitrate: 500000
     tx_queue_length: 100
   encoding:
@@ -149,5 +197,5 @@ vehicle_adapter:
   type: can
   integration:
     chassis_control:
-      can_interface: can1
+      can_interface: can0
       bridge_library_path: ./lib/vendor/chassis/libmine_teleop_chassis_bridge.so
