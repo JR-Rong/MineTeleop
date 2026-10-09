@@ -210,6 +210,8 @@ class RotatingRuntimeLog {
       error = "runtime log is unavailable";
       return false;
     }
+    // Preserve complete timestamped records across ordinary file rotation.
+    if (value.size() <= max_bytes_ && bytes_ + value.size() > max_bytes_ && !rotate(error)) return false;
     const char* cursor = value.data();
     std::size_t remaining = value.size();
     while (remaining > 0) {
@@ -441,12 +443,9 @@ std::string sanitize_persisted_line(std::string_view raw_line) {
   auto line = strip_leading_vendor_resets(raw_line);
   if (terminal_only_vendor_line(line)) return {};
 
-  std::string_view ending;
   if (!line.empty() && line.back() == '\n') {
-    ending = "\n";
     line.remove_suffix(1);
     if (!line.empty() && line.back() == '\r') {
-      ending = "\r\n";
       line.remove_suffix(1);
     }
   }
@@ -482,9 +481,14 @@ std::string sanitize_persisted_line(std::string_view raw_line) {
     }
   }
   if (line.empty()) return {};
-  std::string sanitized(line);
-  sanitized.append(ending);
-  return sanitized;
+  // Keep original JSON fields visible, and timestamp unstructured GStreamer
+  // output too, so a completed session can be selected without guessing.
+  const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  const auto prefix = "{\"logged_at_utc_ms\":" + std::to_string(timestamp) + ",";
+  if (line.front() == '{' && line.back() == '}')
+    return prefix + std::string(line.substr(1)) + "\n";
+  return prefix + "\"event\":\"vehicle_runtime_output\",\"message\":\"" + json_escape(line) + "\"}\n";
 }
 
 // Buffers relayed output per stream, splits it into lines, and persists

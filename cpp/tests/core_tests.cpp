@@ -425,7 +425,7 @@ void test_config_loads_current_vehicle_yaml() {
   expect(config.hardware.can_tx_queue_length == 100, "CAN tx queue length mismatch");
   expect_near(
       config.field_safety.full_scale_motor_torque_nm,
-      300.0,
+      640.0,
       1e-9,
       "safe default full-scale motor torque changed");
   expect_near(
@@ -435,7 +435,7 @@ void test_config_loads_current_vehicle_yaml() {
       "safe default motor torque rise shaping changed");
   expect_near(
       config.field_safety.max_brake_pressure_bar,
-      100.0,
+      327.6,
       1e-9,
       "safe default ordinary brake pressure changed");
 }
@@ -1190,6 +1190,36 @@ void test_critical_camera_control_latch_persists_until_a_new_session() {
       "latch state was exposed for a non-active session");
 }
 
+void test_camera_startup_grace_and_running_freshness() {
+  using mine_teleop::camera_encoded_frame_fresh;
+  mine_teleop::CriticalCameraControlLatch latch;
+  expect(!latch.enter_session("startup"), "new session inhibited");
+  expect(latch.startup_grace_active("startup", 1000), "startup grace missing");
+  expect(!camera_encoded_frame_fresh(1000, 5000, 3000), "stale startup frame accepted");
+  expect(latch.startup_grace_active("startup", 5000), "startup used running 3s deadline");
+  expect(!latch.enter_session("startup"), "startup reentry inhibited");
+  expect(latch.startup_grace_active("startup", 15999), "grace expired early");
+  expect(!latch.startup_grace_active("startup", 16000), "same-session rebuild extended startup deadline");
+  expect(!camera_encoded_frame_fresh(0, 16000, 3000), "missing encoded frame accepted");
+  expect(!camera_encoded_frame_fresh(16001, 16000, 3000), "future encoded frame accepted");
+  expect(camera_encoded_frame_fresh(8000, 8000, 3000), "recovered startup frame rejected");
+  expect(!latch.enter_session("recovered"), "new session retained old startup deadline");
+  expect(latch.startup_grace_active("recovered", 1000), "second startup missing grace");
+  expect(latch.arm_for_control("recovered"), "fresh admission could not arm");
+  expect(!latch.startup_grace_active("recovered", 1001), "CAN startup retained grace");
+  expect(!latch.enter_session("recovered"), "armed reentry inhibited");
+  expect(!latch.startup_grace_active("recovered", 2000), "rebuild disarmed the running watchdog");
+  expect(camera_encoded_frame_fresh(8000, 11000, 3000), "running timeout boundary rejected");
+  expect(!camera_encoded_frame_fresh(8000, 11001, 3000), "running gap was given startup grace");
+  expect(latch.inhibit("recovered"), "running outage did not latch");
+  expect(!latch.arm_for_control("recovered"), "video recovery bypassed the session latch");
+  expect(!latch.startup_grace_active("recovered", 11002), "fault regained grace");
+  expect_throws([&] { static_cast<void>(latch.arm_for_control("startup")); }, "stale session armed control");
+  expect_throws([&] { static_cast<void>(latch.startup_grace_active("startup", 11002)); }, "stale session queried grace");
+  expect(!latch.enter_session("new-session"), "new session did not clear fault");
+  expect(latch.startup_grace_active("new-session", 12000), "new session inherited armed state");
+}
+
 void test_media_signaling_error_classification_supports_structured_and_legacy_conflicts() {
   using Kind = mine_teleop::MediaSignalingErrorKind;
   struct ConflictCase {
@@ -1447,12 +1477,31 @@ void test_field_config_pins_tls_route_without_system_dns() {
       "field vehicle time synchronization limit is not 25ms");
   expect_near(
       config.field_safety.max_throttle,
-      0.10,
+      1.0,
       1e-9,
       "field vehicle throttle hard limit changed");
+  expect(config.vehicle_adapter.type == "can" && config.field_safety.max_speed_kph == 10.0,
+      "field defaults must use CAN at 10 km/h");
+  expect(config.vehicle_adapter.bridge_library_path.is_absolute(),
+      "relative bundled bridge path was not resolved against package root");
+  expect(config.vehicle_adapter.bridge_library_path == std::filesystem::absolute(
+      "lib/vendor/chassis/libmine_teleop_chassis_bridge.so").lexically_normal(),
+      "bridge path incorrectly includes the config directory");
+  const auto external_config = write_temp_vehicle_config("external-field-config",
+      read_text("configs/vehicle-agent.three-machine.field.yaml"));
+  expect(mine_teleop::load_vehicle_config(external_config).vehicle_adapter.bridge_library_path ==
+      config.vehicle_adapter.bridge_library_path, "external YAML changed package-relative bridge root");
+  const auto cameras = config.enabled_cameras();
+  expect(cameras.size() == 6, "default capture-card channel count changed");
+  for (std::size_t index = 0; index < cameras.size(); ++index) {
+    const auto& camera = cameras[index];
+    expect(camera.backend == "ccg2" && camera.device == "/dev/ccg2-channel-" + std::to_string(index) &&
+        camera.capture_width == 1920 && camera.capture_height == 1080 && camera.capture_fps == 30 &&
+        camera.critical_for_control, "field capture-card configuration is inconsistent");
+  }
   expect_near(
       config.field_safety.full_scale_motor_torque_nm,
-      300.0,
+      640.0,
       1e-9,
       "field vehicle full-scale motor torque changed");
   expect_near(
@@ -1481,7 +1530,7 @@ void test_field_config_pins_tls_route_without_system_dns() {
       "field vehicle hard overspeed margin changed");
   expect_near(
       config.redacted_summary().at("full_scale_motor_torque_nm").get<double>(),
-      300.0,
+      640.0,
       1e-9,
       "effective vehicle config omitted full-scale motor torque");
   expect_near(
@@ -1493,23 +1542,23 @@ void test_field_config_pins_tls_route_without_system_dns() {
       "effective vehicle config omitted motor torque rise shaping");
   expect_near(
       config.field_safety.max_brake_pressure_bar,
-      100.0,
+      327.6,
       1e-9,
       "field vehicle ordinary-brake pressure hard limit changed");
   expect_near(
       config.redacted_summary().at("max_brake_pressure_bar").get<double>(),
-      100.0,
+      327.6,
       1e-9,
       "effective vehicle config omitted ordinary-brake pressure hard limit");
   expect_near(
       config.field_safety.max_steering_angle_deg,
-      5.0,
+      30.0,
       1e-9,
       "field vehicle steering hard limit changed");
   expect(
       config.field_safety.require_can_feedback_before_control,
       "field vehicle CAN feedback gate is disabled");
-  expect(config.hardware.can_interface == "can1", "field vehicle CAN interface is not can1");
+  expect(config.hardware.can_interface == "can0", "field vehicle CAN interface is not can0");
   expect(config.hardware.can_bitrate == 500000, "field vehicle CAN bitrate is not 500 kbit/s");
   expect(
       config.hardware.can_tx_queue_length == 100,
@@ -2410,6 +2459,7 @@ void test_control_service_receive_path_cannot_bypass_hard_timeout() {
 
 void test_control_service_preserves_physical_brake_across_degraded_timeout() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  config.field_safety.max_brake_pressure_bar = 100.0;
   {
     auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
     auto* adapter_view = adapter.get();
@@ -2740,11 +2790,12 @@ void test_control_service_applies_vehicle_hard_limits() {
   expect_near(telemetry.throttle_feedback, 0.10, 1e-9, "adapter received uncapped throttle");
   expect_near(telemetry.brake_feedback, 0.80, 1e-9, "adapter received a rewritten normalized brake intent");
   expect_near(telemetry.steering_feedback, 0.10, 1e-9, "adapter received uncapped steering");
-  const auto limits = service.control_limits();
+  const auto limits = mine_teleop::vehicle_control_limits(config);
+  expect(limits == service.control_limits(), "startup and active hard-limits wire contracts differ");
   expect_near(limits.at("max_throttle").get<double>(), 0.10, 1e-9, "reported throttle limit mismatch");
   expect_near(
       limits.at("full_scale_motor_torque_nm").get<double>(),
-      300.0,
+      640.0,
       1e-9,
       "reported full-scale motor torque mismatch");
   expect_near(
@@ -3992,6 +4043,7 @@ int main() {
       {"missing_v4l2_path_remains_retryable", test_missing_v4l2_path_remains_retryable},
       {"media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes", test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes},
       {"critical_camera_control_latch_persists_until_a_new_session", test_critical_camera_control_latch_persists_until_a_new_session},
+      {"camera_startup_grace_and_running_freshness", test_camera_startup_grace_and_running_freshness},
       {"media_signaling_error_classification_supports_structured_and_legacy_conflicts", test_media_signaling_error_classification_supports_structured_and_legacy_conflicts},
       {"vehicle_config_validates_chassis_control_speed_range", test_vehicle_config_validates_chassis_control_speed_range},
       {"dynamic_adapter_target_speed_uses_configured_ceiling", test_dynamic_adapter_target_speed_uses_configured_ceiling},

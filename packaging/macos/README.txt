@@ -62,7 +62,7 @@ Contents:
 
 Local logs:
 
-  Browser UTC events are written to .local/logs/control-browser-events.jsonl.
+  Browser UTC events are written to log/control-browser-events.jsonl.
   The bundled config limits each file to 2 MiB and retains the current file
   plus two numbered backups. Password, token, secret, and credential fields
   are redacted before writing. These logs are local diagnostics, not a

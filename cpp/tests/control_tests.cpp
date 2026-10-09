@@ -553,6 +553,17 @@ void test_control_page_contract() {
           response.body.find("完成后请从页面重新申请 VCU 握手") !=
               std::string::npos,
       "explicit VCU handshake controls are missing");
+  for (const auto* label : {
+           "initial:'启动 1/5 · 低握手帧'",
+           "wait_parallel_handshake:'启动 2/5 · 智驾状态 5'",
+           "wait_parking_brake_released:'启动 3/5 · 等待电子驻车释放'",
+           "wait_gear:'启动 4/5 · 挡位闭环（零牵引）'",
+           "wait_actuator_modes:'启动 5/5 · 执行器模式（零牵引）'"}) {
+    expect(response.body.find(label) != std::string::npos,
+           "handshake title does not match the five fixed startup phases");
+  }
+  expect(response.body.find("保持驻车") == std::string::npos,
+         "handshake UI claims EPB remains applied after release");
   const auto diagnose_handshake =
       response.body.find("function diagnoseVcuHandshake");
   const auto handshake_revoked_gate = response.body.find(
@@ -704,7 +715,7 @@ void test_control_page_contract() {
               std::string::npos,
       "legacy PID defaults can still auto-submit without explicit operator confirmation");
   expect(
-      response.body.find("pidChanged=!prior||requested.speed_pid_kp!==prior.speed_pid_kp") !=
+      response.body.find("pidChanged=!prior||requested.parking_idle_timeout_ms!==prior.parking_idle_timeout_ms||requested.speed_pid_kp!==prior.speed_pid_kp") !=
               std::string::npos &&
       response.body.find(
               "requested.motor_torque_rise_rate_nm_per_s!==prior.motor_torque_rise_rate_nm_per_s") !=
@@ -852,7 +863,7 @@ void test_control_page_contract() {
   const auto telemetry_limits_update = response.body.find(
       "updateVehicleHardLimits(message.control_limits)", telemetry_profile_update);
   const auto handshake_vcu_update = response.body.find(
-      "updateVcuHandshakeState({...nextVcuStatus,driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)})");
+      "updateVcuHandshakeState({...nextVcuStatus,issue_code:message.issue_code||'',driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)})");
   const auto handshake_limits_update = response.body.find(
       "updateVehicleHardLimits(message.hard_limits)", handshake_vcu_update);
   expect(
@@ -1232,18 +1243,18 @@ void test_driver_gamepad_config() {
       "field driver log rotation capacity is too small for batched command traces");
   expect(field.max_time_sync_uncertainty_ms == 25, "field driver time synchronization limit is not 25ms");
   expect(
-      field.control_limits.initial_target_speed_kph == 2.0,
+      field.control_limits.initial_target_speed_kph == 5.0,
       "field driver initial target speed changed");
   expect(
-      field.control_limits.initial_max_motor_torque_nm == 300.0,
+      field.control_limits.initial_max_motor_torque_nm == 320.0,
       "field driver initial per-motor torque request changed");
   expect(
-      field.control_limits.initial_max_brake_pressure_bar == 100.0 &&
-          field.control_limits.initial_service_brake_pressure_bar == 30.0 &&
-          field.control_limits.initial_hard_brake_pressure_bar == 100.0,
+      field.control_limits.initial_max_brake_pressure_bar == 163.8 &&
+          field.control_limits.initial_service_brake_pressure_bar == 163.8 &&
+          field.control_limits.initial_hard_brake_pressure_bar == 163.8,
       "field driver initial per-EHB pressure requests changed");
   expect(
-      field.control_limits.initial_max_steering_angle_deg == 3.0,
+      field.control_limits.initial_max_steering_angle_deg == 30.0,
       "field driver initial steering limit changed");
 }
 
@@ -2932,7 +2943,8 @@ void test_driver_vehicle_switch_releases_old_session() {
   profile_request.method = "POST";
   profile_request.path = "/api/control-profile";
   const mine_teleop::Json valid_profile = {
-      {"profile_version", 3},
+      {"profile_version", 4},
+      {"parking_idle_timeout_ms", 500},
       {"target_speed_kph", 3.0},
       {"max_motor_torque_nm", 250.0},
       {"max_brake_pressure_bar", 80.0},
@@ -2951,6 +2963,11 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(profile_response.status == 200, "session control profile could not be prepared");
   const auto profile_result = mine_teleop::Json::parse(profile_response.body);
   const auto& profile_envelope = profile_result.at("request");
+  const auto vehicle_profile_request =
+      mine_teleop::SessionControlProfileRequest::from_json(profile_envelope);
+  expect(
+      vehicle_profile_request.profile.to_json() == valid_profile,
+      "vehicle parser did not receive the complete requested control profile");
   expect(
       profile_result.value("prepared", false) &&
           profile_result.value("transport", "") == "webrtc_data_channel" &&
@@ -2964,7 +2981,7 @@ void test_driver_vehicle_switch_releases_old_session() {
       "prepared session profile lost authenticated envelope identity");
   expect(
       !profile_envelope.contains("profile") &&
-          profile_envelope.value("profile_version", 0) == 3 &&
+          profile_envelope.value("profile_version", 0) == 4 &&
           profile_envelope.value("target_speed_kph", -1.0) == 3.0 &&
           profile_envelope.value("max_motor_torque_nm", -1.0) == 250.0 &&
           profile_envelope.value("max_brake_pressure_bar", -1.0) == 80.0 &&
@@ -2988,7 +3005,7 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(
       prepared_profile.value("target_speed_kph", -1.0) == 3.0 &&
           prepared_profile.value("max_motor_torque_nm", -1.0) == 250.0 &&
-          prepared_profile.value("profile_version", 0) == 3 &&
+          prepared_profile.value("profile_version", 0) == 4 &&
           prepared_profile.value("initialized", false) &&
           prepared_profile.value("max_steering_angle_deg", -1.0) == 3.0 &&
           prepared_profile.value("speed_pid_kp", -1.0) == 1.5 &&
@@ -2997,6 +3014,22 @@ void test_driver_vehicle_switch_releases_old_session() {
           prepared_profile.value("last_prepared_seq", std::uint64_t{0}) ==
               profile_envelope.value("seq", std::uint64_t{0}),
       "prepared session profile state does not match its DataChannel envelope");
+
+  for (const int parking_timeout_ms : {0, 750, 1000}) {
+    auto requested_profile = valid_profile;
+    requested_profile["parking_idle_timeout_ms"] = parking_timeout_ms;
+    profile_request.body = requested_profile.dump();
+    const auto response = control_app.handle(profile_request);
+    expect(response.status == 200, "valid parking timeout could not be prepared");
+    const auto result = mine_teleop::Json::parse(response.body);
+    const auto vehicle_request =
+        mine_teleop::SessionControlProfileRequest::from_json(result.at("request"));
+    expect(
+        vehicle_request.profile.to_json() == requested_profile &&
+            result.at("control_profile").at("parking_idle_timeout_ms") ==
+                parking_timeout_ms,
+        "parking timeout changed between controller state and vehicle wire profile");
+  }
 
   auto invalid_profile = valid_profile;
   invalid_profile["max_motor_torque_nm"] = 640.1;
@@ -3156,7 +3189,8 @@ void test_driver_vehicle_switch_releases_old_session() {
       "rejected legacy control-limit mutation changed the active profile");
 
   profile_request.body = mine_teleop::Json({
-      {"profile_version", 3},
+      {"profile_version", 4},
+      {"parking_idle_timeout_ms", 500},
       {"target_speed_kph", 0.0},
       {"max_motor_torque_nm", 0.0},
       {"max_brake_pressure_bar", 0.0},
@@ -3208,12 +3242,13 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(!ended.value("connected", true), "explicit session end did not clear local authority");
   const auto reset_profile = driver.control_profile();
   expect(
-      reset_profile.value("target_speed_kph", -1.0) == 2.0 &&
-          reset_profile.value("max_motor_torque_nm", -1.0) == 300.0 &&
+      reset_profile.value("target_speed_kph", -1.0) == 5.0 &&
+          reset_profile.value("max_motor_torque_nm", -1.0) == 320.0 &&
           reset_profile.value("max_brake_pressure_bar", -1.0) == 100.0 &&
           reset_profile.value("service_brake_pressure_bar", -1.0) == 10.0 &&
           reset_profile.value("hard_brake_pressure_bar", -1.0) == 25.0 &&
-          reset_profile.value("profile_version", 0) == 3 &&
+          reset_profile.value("profile_version", 0) == 4 &&
+          reset_profile.value("parking_idle_timeout_ms", -1) == 500 &&
           !reset_profile.value("initialized", true) &&
           reset_profile.value("speed_pid_kp", -1.0) == 0.0 &&
           reset_profile.value("speed_pid_max_dt_ms", -1) == 0 &&

@@ -41,7 +41,7 @@ sudo journalctl -u haproxy.service -n 200 --no-pager
 
 控制逐段时序写入 `/var/log/mine-teleop/signaling-audit.jsonl*`，事件名为
 `cloud_native_control_trace_batch`。控制端的浏览器意图与原生 sender 时序共同写入包内
-`.local/logs/control-browser-events.jsonl*`；车端接收/apply 时序写入
+`log/control-browser-events.jsonl*`；车端接收/apply 时序写入
 `/var/log/mine-teleop/vehicle-runtime.log*`。复现时三端文件必须覆盖同一
 `trace_session_id`，再按 `seq`、`intent_seq` 和 `delivery_cursor` 对齐。
 
@@ -213,7 +213,7 @@ VCU/CAN 启动、日志落盘、收发、反馈超时、握手门禁和 disarm �
 ### `command_age_exceeded` / `command_gap_exceeded`
 
 三机驾驶端配置默认启用批量控制追踪。复现后同时收集控制端包根目录
-`.local/logs/control-browser-events.jsonl*`、控制端 `/api/status` 快照和车端 runtime
+`log/control-browser-events.jsonl*`、控制端 `/api/status` 快照和车端 runtime
 日志。先用 `trace_session_id`、`trace_vehicle_id` 确认浏览器意图属于哪个原始会话，
 再用原生命令的 `session_id + seq` 对齐控制端 `native_control` 状态与车端
 `vehicle_control_trace_batch.commands`；车端批次的 `dropped_total` 增长只表示诊断记录

@@ -94,8 +94,33 @@ if ([string]::IsNullOrWhiteSpace($VcpkgRoot)) {
 $VcpkgRoot = (Resolve-Path $VcpkgRoot).Path
 
 if ($null -eq (Get-Command cmake -ErrorAction SilentlyContinue)) {
-  throw "cmake is required but was not found in PATH. Install Visual Studio 2022 with Desktop development with C++."
+  throw "cmake is required but was not found in PATH. Install Visual Studio with the C++ build tools."
 }
+
+# Hosted Windows images can advance to a new Visual Studio major version.
+# Match an installed C++ instance to a generator advertised by this CMake.
+$VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path -LiteralPath $VsWhere -PathType Leaf)) {
+  throw "vswhere.exe is required to locate Visual Studio C++ build tools"
+}
+$VisualStudioInstances = @(& $VsWhere -products '*' -format json | ConvertFrom-Json)
+if ($LASTEXITCODE -ne 0) { throw "Cannot enumerate Visual Studio installations" }
+$CmakeCapabilities = & cmake -E capabilities | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw "Cannot enumerate CMake generators" }
+$VisualStudioInstance = $null
+$VisualStudioGenerator = $null
+foreach ($instance in ($VisualStudioInstances | Sort-Object { [version]$_.installationVersion } -Descending)) {
+  if (-not (Test-Path -LiteralPath (Join-Path $instance.installationPath "VC\Tools\MSVC") -PathType Container)) { continue }
+  $major = ([version]$instance.installationVersion).Major
+  $generator = @($CmakeCapabilities.generators | Where-Object { $_.name -like "Visual Studio $major *" })
+  if ($generator.Count -eq 1) {
+    $VisualStudioInstance = $instance.installationPath
+    $VisualStudioGenerator = $generator[0].name
+    break
+  }
+}
+if ($null -eq $VisualStudioGenerator) { throw "No installed Visual Studio C++ instance has a matching CMake generator; update CMake or install the matching build tools" }
+Write-Host "==> Using $VisualStudioGenerator at $VisualStudioInstance"
 
 $VcpkgExecutable = Join-Path $VcpkgRoot "vcpkg.exe"
 $VcpkgToolchain = Join-Path $VcpkgRoot "scripts\buildsystems\vcpkg.cmake"
@@ -165,7 +190,8 @@ Write-Host "==> Configuring Windows control client (architecture=$Architecture, 
 Invoke-CheckedCommand -Command "cmake" -CommandArguments @(
   "-S", $RepoRoot,
   "-B", $BuildDirectory,
-  "-G", "Visual Studio 17 2022",
+  "-G", $VisualStudioGenerator,
+  "-DCMAKE_GENERATOR_INSTANCE=$VisualStudioInstance",
   "-A", $CmakeArchitecture,
   "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain",
   "-DVCPKG_TARGET_TRIPLET=$Triplet",
@@ -184,7 +210,7 @@ Write-Host "==> Building Windows control client and portable safety test (jobs=$
 Invoke-CheckedCommand -Command "cmake" -CommandArguments @(
   "--build", $BuildDirectory,
   "--config", "Release",
-  "--target", "mine-teleop-control", "mine-teleop-native-control-intent-tests",
+  "--target", "mine-teleop-control", "mine-teleop-native-control-intent-tests", "mine-teleop-session-logs-tests",
   "--parallel", "$BuildJobs"
 )
 
@@ -194,7 +220,7 @@ Invoke-CheckedCommand -Command "ctest" -CommandArguments @(
   "-C", "Release",
   "--output-on-failure",
   "--no-tests=error",
-  "-R", "^mine-teleop-native-control-intent-tests$"
+  "-R", "^mine-teleop-(native-control-intent|session-logs)-tests$"
 )
 
 $ConfigurationDirectory = Join-Path $BuildDirectory "Release"

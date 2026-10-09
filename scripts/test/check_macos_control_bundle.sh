@@ -148,7 +148,8 @@ fi
 kill -INT "$control_pid"
 wait "$control_pid"
 control_pid=""
-log_path="$package_root/.local/logs/control-browser-events.jsonl"
+log_relative_path="log/control-browser-events.jsonl"
+log_path="$package_root/$log_relative_path"
 if [[ ! -s "$log_path" ]] || ! grep -F '"event":"package_log_probe"' "$log_path" >/dev/null || \
     ! grep -F '"password":"[redacted]"' "$log_path" >/dev/null; then
   printf 'packaged browser event log is missing its redacted probe event\n' >&2
@@ -162,4 +163,4 @@ if lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | grep -F "127.0.0.1:$port" >
   printf 'packaged control client did not release its loopback port\n' >&2
   exit 2
 fi
-printf 'bundle_runtime_check=passed health=%s port=%s log=%s\n' "$health" "$port" ".local/logs/control-browser-events.jsonl"
+printf 'bundle_runtime_check=passed health=%s port=%s log=%s\n' "$health" "$port" "$log_relative_path"
