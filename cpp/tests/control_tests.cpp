@@ -4445,8 +4445,8 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
             "Sec-WebSocket-Accept: " + mine_teleop::websocket_accept_key(key->second) + "\r\n\r\n");
         ++*connections;
         mine_teleop::ServerWebSocketConnection connection(socket, 512 * 1024);
-        std::deque<mine_teleop::Json> pending;
-        auto next_ack = std::chrono::steady_clock::now() + std::chrono::milliseconds(350);
+        std::deque<std::pair<std::chrono::steady_clock::time_point, mine_teleop::Json>> pending;
+        bool first_packet = true;
         try {
           while (true) {
             const auto received = connection.receive_json(std::chrono::milliseconds(10));
@@ -4465,13 +4465,18 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
                 connection.send_json({{"error", response.body}});
                 break;
               }
-              pending.push_back(mine_teleop::Json::parse(response.body));
+              // Warm up before the first-ACK deadline, then impose packet
+              // latency directly instead of relying on a growing queue.
+              const auto delay = std::chrono::milliseconds(first_packet ? 350 : 600);
+              first_packet = false;
+              pending.emplace_back(
+                  std::chrono::steady_clock::now() + delay,
+                  mine_teleop::Json::parse(response.body));
             }
             if (!pending.empty() && !drop_acknowledgements->load() &&
-                std::chrono::steady_clock::now() >= next_ack) {
-              connection.send_json(pending.front());
+                std::chrono::steady_clock::now() >= pending.front().first) {
+              connection.send_json(pending.front().second);
               pending.pop_front();
-              next_ack = std::chrono::steady_clock::now() + std::chrono::milliseconds(80);
             }
           }
         } catch (const std::exception&) {
@@ -4488,6 +4493,8 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   mine_teleop::DriverConfig driver_config;
   driver_config.driver_id = "driver-console-001";
   driver_config.signaling_url = base;
+  // A slower send cadence proves coverage does not require queue growth.
+  driver_config.rate_hz = 10;
   allow_qemu_test_scheduler_time_sync(driver_config);
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
   const auto connected = driver.connect("vehicle-001");
@@ -4501,12 +4508,16 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   while (std::chrono::steady_clock::now() < healthy_deadline) {
     const auto native = driver.status().at("native_control");
     expect(native.value("send_failures_total", 0U) == 0,
-           "advancing delayed ACKs caused the native driver to reconnect");
+           "advancing delayed ACKs caused the native driver to reconnect: " + native.dump());
     oldest_age = std::max(oldest_age, native.value("unacknowledged_age_ms", std::int64_t{0}));
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  expect(oldest_age >= 500 && connections->load() == 1,
-         "fixture did not exercise an old pending packet with a live ACK pipeline");
+  const auto healthy_native = driver.status().at("native_control");
+  expect(oldest_age >= 500 && connections->load() == 1 &&
+             healthy_native.value("last_ack_seq", 0U) > 1,
+         "fixture did not exercise an old pending packet with a live ACK pipeline: max_age_ms=" +
+             std::to_string(oldest_age) + ", connections=" + std::to_string(connections->load()) +
+             ", native=" + healthy_native.dump());
   drop_acknowledgements->store(true);
   bool stalled = false;
   const auto stalled_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);

@@ -139,3 +139,22 @@ ACK、空窗后新流量、重连重置及队列上限。真实 loopback WebSock
 修复生效的前提。PR 中之前的驻车/输入恢复修复仍需要对应车端及驾驶端更新。
 session-000031 的 CAN 末批已有四路 EPB=2，转发驻车 Mode=2；这不是原始
 EPB 执行器实际反馈，不能据此宣布机械驻车问题已解决。
+
+## macOS CI：延迟 ACK fixture 的覆盖条件
+
+`aad4067` 的 macOS CI 编译通过，但
+`native_control_delayed_ack_progress_and_real_stall` 未满足最老待确认包超过
+500 ms 的前置条件。原 fixture 按 80 ms 间隔返回 ACK，依赖发送频率更高来
+积压队列；实际发包节奏变慢时，ACK 能追平队列，测试没有制造出目标场景。
+在本机 macOS 中把测试发包频率设为 10 Hz 可稳定复现同一断言：19 条指令
+已发送、零发送失败、只有一个连接，但最老包最大年龄仅为 309 ms。
+
+修复只调整 fixture：首包 ACK 在收到后等待 350 ms，后续每包等待 600 ms，
+以逐包单调时间截止点控制返回。测试使用 10 Hz 验证无需依赖队列增长，仍必须
+同时证明 ACK 持续推进、包龄超过 500 ms、未重连，以及停止 ACK 后触发原有
+500 ms 失效与退避。失败输出补充包龄峰值、连接数和 native_control 状态。
+生产发包频率、ACK 超时、车端 800 ms 门限与 CI 门禁均没有改动。
+
+本机 macOS/arm64 使用 `scripts/build/build_macos_control_bundle.sh test`
+通过完整 12/12 CTest，并通过包哈希、静态依赖、JavaScript 语法和运行时 health
+检查。本机 SDK 为 macOS 26.5；GitHub runner 的独立验证以当前提交 CI 为准。
