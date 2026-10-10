@@ -158,3 +158,17 @@ EPB 执行器实际反馈，不能据此宣布机械驻车问题已解决。
 本机 macOS/arm64 使用 `scripts/build/build_macos_control_bundle.sh test`
 通过完整 12/12 CTest，并通过包哈希、静态依赖、JavaScript 语法和运行时 health
 检查。本机 SDK 为 macOS 26.5；GitHub runner 的独立验证以当前提交 CI 为准。
+
+随后 `8a25b10` 的 GitHub macOS runner 已通过 ACK 回归，但另一个既有三端日志
+测试失败于 `worker swallowed upload failure`。该 fixture 仅上线一次，没有
+模拟车辆 runtime 的持续心跳；默认在线租约为 15 秒，慢速导出后第二次请求可能
+直接进入 `vehicle_offline`，而不是测试预期的上传失败路径。
+
+受控验证在第二次导出前等待 16 秒，同时保持驾驶端认证活跃：原 fixture 按预期
+失败，manifest 原因为 `vehicle_offline`。补上带 `connection_generation` 的
+车辆心跳后，同样的等待验证通过（31.12 秒）。最终源码移除这段临时等待，
+保留真实心跳、心跳失败检查和包含实际 manifest 的错误输出。生产 15 秒在线
+租约、30 秒测试等待预算、上传重试与任何安全门限均未修改。
+
+补心跳后的最终源码再次通过本机 macOS/arm64 完整 12/12 CTest、包哈希、
+静态依赖、JavaScript 语法及运行时 health 检查。
