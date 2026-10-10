@@ -84,12 +84,14 @@ for text in \
 done
 
 # Media must negotiate independently of VCU adapter availability.  The
-# adapter is started only after the WebRTC DataChannel opens; adapter startup
+# driving adapter is started only after the WebRTC DataChannel opens; a
+# parking-only adapter can gather feedback through the independent safety WSS.
+# Adapter startup
 # and runtime failures disable control but must not become media-pipeline
 # errors that tear down the camera tracks.
 control_open_block="$(sed -n '/static void on_control_channel_open/,/static void on_control_channel_close/p' "$media_runtime")"
 control_message_block="$(sed -n '/  void handle_control_message(/,/  void send_vcu_handshake_status(/p' "$media_runtime")"
-control_start_block="$(sed -n '/  \[\[nodiscard\]\] bool start_control_service()/,/  void configure_control_data_channel()/p' "$media_runtime")"
+control_start_block="$(sed -n '/  \[\[nodiscard\]\] bool start_control_service(/,/  void configure_control_data_channel()/p' "$media_runtime")"
 control_channel_block="$(sed -n '/  void configure_control_data_channel()/,/  void tick_control_service()/p' "$media_runtime")"
 control_tick_block="$(sed -n '/  void tick_control_service()/,/  \[\[nodiscard\]\] std::string current_pipeline_error/p' "$media_runtime")"
 pipeline_fault_block="$(sed -n '/  void stop_control_for_pipeline_fault(/,/  void set_pipeline_error(/p' "$media_runtime")"
@@ -97,7 +99,7 @@ critical_camera_block="$(sed -n '/  void inhibit_control_for_critical_camera(/,/
 
 for contract in \
   'control DataChannel open starts the VCU adapter|self->start_control_service()' \
-  'session teardown cannot resurrect the VCU adapter|stop_requested || !control_link_open || control_channel == nullptr' \
+  'session teardown cannot resurrect the VCU adapter|lifecycle_stopping || (stop_requested && !parking_only)' \
   'adapter startup failure keeps video alive|control_not_started_video_continues' \
   'adapter startup failure closes only the unsafe control channel|gst_webrtc_data_channel_close(channel)' \
   'adapter runtime failure reports a control-only fault|adapter_runtime_failed' \
@@ -110,6 +112,8 @@ for contract in \
     exit 1
   fi
 done
+require_text "$media_runtime" '(stop_requested && !control_quiescing)'
+require_text "$media_runtime" 'lifecycle_stopping=true;stop_requested = true;'
 require_text "$media_runtime" '!control_link_opened_this_attempt'
 if ! grep -F --quiet 'VehicleStopReason::MediaPipelineFailed' <<<"$pipeline_fault_block"; then
   printf 'media/control isolation contract missing: media pipeline close provenance\n' >&2
@@ -138,8 +142,8 @@ if [[ "$(grep -F -c 'if (control_channel != channel) return;' <<<"$control_messa
 fi
 
 require_text "$media_header" 'kCameraAppSrcMaxBuffers = 2'
-require_text "$media_source" '(uyvy ? " max-bytes=0" : " max-bytes=524288")'
-require_text "$media_source" 'caps=video/x-raw,format=UYVY'
+require_text "$media_source" '((uyvy || rgba) ? " max-bytes=0" : " max-bytes=524288")'
+require_text "$media_source" 'caps=video/x-raw,format='
 require_text "$media_source" '! jpegdec'
 require_text "$media_runtime" 'camera_input_caps_mismatch'
 require_text "$catalog" 'camera_input_caps_mismatch'

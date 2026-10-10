@@ -53,5 +53,12 @@ class VideoEncoder {
 [[nodiscard]] std::unique_ptr<VideoEncoder> create_video_encoder(const EncoderCandidate& candidate);
 [[nodiscard]] bool gstreamer_factory_available(std::string_view factory_name);
 [[nodiscard]] Json probe_video_encoders();
+// Macroblock/frame and macroblock/second constraints, independent of codec name.
+int minimum_h264_level_idc(int width, int height, int fps);
+bool h264_answer_supports(std::string_view sdp,const std::vector<MediaProfile>& profiles,const std::vector<int>& encoded_levels={});
+std::string h264_profile_level_id(std::string_view sprop_parameter_sets);
+std::string h264_level_name(int level_idc);
+Json media_environment(const VehicleConfig&,const EncoderCandidate&);
+Json probe_media_profiles(const VehicleConfig&,const EncoderCandidate&,bool software_fixture=false);
 
 }  // namespace mine_teleop

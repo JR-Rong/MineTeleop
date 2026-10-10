@@ -28,7 +28,7 @@ usage() {
 Usage:
   sudo ./deploy-cloud.sh [options]
 
-Install or upgrade the Mine Teleop cloud bundle on Ubuntu 22.04 x86_64. The
+Install or upgrade the Mine Teleop cloud bundle on Ubuntu 24.04 x86_64 (coturn 4.6.1 + SQLite). The
 script installs the signaling service under /opt/mine-teleop, installs and
 groups signaling/coturn/Caddy/HAProxy with mine-teleop-cloud.target, validates
 configuration, starts the target, and checks http://127.0.0.1:8765/health.
@@ -37,7 +37,7 @@ Configuration options:
   --signaling-config PATH      Identity YAML installed as signaling-server.yaml.
   --identity-secrets-dir PATH  Directory whose regular files are installed with
                                mode 0600 under /etc/mine-teleop/secrets.
-  --turn-secret-file PATH      Coturn REST shared-secret file.
+  --turn-secret-file PATH      Local coturn CLI password file (REST secrets are per lease).
   --turn-realm REALM           Coturn realm and credential-signing realm.
   --turn-host HOST             Public STUN/TURN host. Defaults to TURN realm.
   --env-file PATH              Optional systemd EnvironmentFile replacement.
@@ -85,7 +85,12 @@ require_package_layout() {
     "$package_root/deployments/systemd/mine-teleop-turn-server.service" \
     "$package_root/deployments/systemd/mine-teleop-cloud.target" \
     "$package_root/deployments/turnserver/turnserver.conf.template" \
-    "$package_root/scripts/render_turnserver_config.sh"; do
+    "$package_root/scripts/render_turnserver_config.sh" \
+    "$package_root/deployments/systemd/mine-teleop-relay-manager.service" \
+    "$package_root/deployments/systemd/mine-teleop-relay-shaping.service" \
+    "$package_root/scripts/relay/manager.py" \
+    "$package_root/scripts/relay/start_shaping.sh" \
+    "$package_root/scripts/relay/shape_egress.sh"; do
     [[ -e "$required" ]] || die "cloud package is incomplete: missing ${required#"$package_root/"}"
   done
 }
@@ -215,7 +220,7 @@ fi
 
 state_file="$config_dir/cloud-bundle.env"
 turn_config_path="$config_dir/turnserver.conf"
-turn_secret_path="$config_dir/secrets/turn-static-auth.secret"
+turn_secret_path="$config_dir/secrets/turn-cli.password"
 signaling_config_path="$config_dir/signaling-server.yaml"
 caddy_config_path="/etc/caddy/Caddyfile"
 haproxy_config_path="/etc/haproxy/haproxy.cfg"
@@ -294,7 +299,7 @@ if [[ "$install_packages" == "true" ]]; then
     caddy \
     coturn \
     curl \
-    haproxy; then
+    haproxy python3 sqlite3 iproute2 nftables; then
     die "package installation failed; fix apt sources or preinstall packages and use --skip-package-install"
   fi
 fi
@@ -305,9 +310,21 @@ for required_command in caddy curl haproxy turnserver; do
   }
 done
 
+[[ "$(turnserver --version 2>&1 | tail -1)" == "4.6.1" ]] || die "validated relay requires coturn 4.6.1 with SQLite"
+getent passwd mine-teleop-relay >/dev/null || useradd --system --home-dir /var/lib/mine-teleop-relay --shell /usr/sbin/nologin mine-teleop-relay
+install -d -m 0750 -o mine-teleop-relay -g mine-teleop-relay /var/lib/mine-teleop-relay
+install -d -m 0700 /var/lib/mine-teleop-relay/leases
+# Stop both the managed and distribution coturn before copying its database.
 printf '==> stopping the existing cloud target\n'
 systemctl stop mine-teleop-cloud.target 2>/dev/null || true
 systemctl disable --now coturn.service 2>/dev/null || true
+if [[ ! -f /var/lib/mine-teleop-relay/turndb.sqlite ]]; then
+  install -m 0640 -o mine-teleop-relay -g mine-teleop-relay /var/lib/turn/turndb /var/lib/mine-teleop-relay/turndb.sqlite
+fi
+# Migration occurs with no allocations alive. Secrets are restored exclusively
+# from confirmed, current ledger entries by the manager, never a legacy realm.
+cp -a /var/lib/mine-teleop-relay/turndb.sqlite /var/lib/mine-teleop-relay/turndb.before-lease-migration.sqlite
+sqlite3 /var/lib/mine-teleop-relay/turndb.sqlite 'DELETE FROM turn_secret;'
 
 deployment_timestamp="$(date -u +%Y%m%d-%H%M%S)"
 backup_root="/var/backups/mine-teleop/$deployment_timestamp"
@@ -403,10 +420,22 @@ if [[ -n "$turn_realm" ]]; then
     --output "$turn_config_path"
 fi
 
+# Coturn runs under a separate identity. Give it only its configuration and
+# TLS material; all identity credentials and the budget ledger stay root-only.
+chgrp mine-teleop-relay "$config_dir" "$config_dir/tls"
+if [[ -f "$turn_config_path" ]]; then chgrp mine-teleop-relay "$turn_config_path"; chmod 0640 "$turn_config_path"; fi
+find "$config_dir/tls" -maxdepth 1 -type f -exec chgrp mine-teleop-relay {} + -exec chmod 0640 {} +
+# The template environment is intentionally not installed automatically: the
+# operator must specify the public bottleneck interface for this maintenance.
+if [[ "$start_services" == "true" ]]; then
+  grep -Eq '^MINE_TELEOP_RELAY_INTERFACE=[A-Za-z0-9_.:-]+$' "$config_dir/mine-teleop.env" || die 'set MINE_TELEOP_RELAY_INTERFACE in --env-file before starting the relay'
+fi
 printf '==> installing systemd units\n'
 for unit in \
   mine-teleop-signaling-server.service \
   mine-teleop-turn-server.service \
+  mine-teleop-relay-manager.service \
+  mine-teleop-relay-shaping.service \
   mine-teleop-cloud.target; do
   install_config_file \
     "$prefix/deployments/systemd/$unit" \
@@ -427,10 +456,13 @@ if [[ -n "$turn_realm" && -n "$turn_host" ]]; then
   cat >"$override_temporary" <<EOF
 [Service]
 ExecStart=
-ExecStart=/opt/mine-teleop/lib/ld-linux-x86-64.so.2 --library-path /opt/mine-teleop/lib /opt/mine-teleop/bin/mine-teleop-signaling-server --config /etc/mine-teleop/signaling-server.yaml --host 127.0.0.1 --port 8765 --driver-token-ttl-ms 3600000 --control-token-ttl-ms 300000 --vehicle-heartbeat-ms 15000 --driver-heartbeat-ms 15000 --trusted-proxy-addresses 127.0.0.1,::1 --stun-urls stun:${turn_host}:3478 --turn-urls turn:${turn_host}:3478?transport=udp,turn:${turn_host}:3478?transport=tcp,turn:${turn_host}:6000?transport=tcp,turn:${turn_host}:443?transport=tcp --turn-realm ${turn_realm} --turn-static-auth-secret-file /etc/mine-teleop/secrets/turn-static-auth.secret --turn-credential-ttl-seconds 600 --api-rate-limit-requests 6000 --audit-log /var/log/mine-teleop/signaling-audit.jsonl --audit-log-retention-days 7 --native-control-trace
+ExecStart=/opt/mine-teleop/lib/ld-linux-x86-64.so.2 --library-path /opt/mine-teleop/lib /opt/mine-teleop/bin/mine-teleop-signaling-server --config /etc/mine-teleop/signaling-server.yaml --host 127.0.0.1 --port 8765 --driver-token-ttl-ms 3600000 --control-token-ttl-ms 300000 --vehicle-heartbeat-ms 15000 --driver-heartbeat-ms 15000 --trusted-proxy-addresses 127.0.0.1,::1 --stun-urls stun:${turn_host}:3478 --turn-urls turn:${turn_host}:3478?transport=udp,turn:${turn_host}:3478?transport=tcp,turn:${turn_host}:6000?transport=tcp,turn:${turn_host}:443?transport=tcp --turn-realm ${turn_realm} --relay-state-dir /var/lib/mine-teleop-relay/leases --relay-capacity-bps 8000000 --relay-egress-copies 2 --turn-credential-ttl-seconds 600 --api-rate-limit-requests 6000 --audit-log /var/log/mine-teleop/signaling-audit.jsonl --audit-log-retention-days 7 --native-control-trace
 EOF
   install_config_file "$override_temporary" "$override_path" 0644
   rm -f "$override_temporary"
+
+  sed -i "/^MINE_TELEOP_TURN_REALM=/d" "$config_dir/mine-teleop.env"
+  printf "MINE_TELEOP_TURN_REALM=%s\n" "$turn_realm" >> "$config_dir/mine-teleop.env"
 
   state_temporary="$(mktemp)"
   printf '%s\n' \
@@ -452,7 +484,7 @@ if [[ -f "$signaling_config_path" ]]; then
   if [[ -n "$turn_realm" ]]; then
     signaling_validation+=(
       --turn-realm "$turn_realm"
-      --turn-static-auth-secret-file "$turn_secret_path"
+      --relay-state-dir /var/lib/mine-teleop-relay/leases
     )
   fi
   signaling_validation+=(--validate-config)

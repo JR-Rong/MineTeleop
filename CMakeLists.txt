@@ -144,6 +144,10 @@ mine_teleop_enable_warnings(mine_teleop_vcu)
 # This library is the shared protocol/session/HTTP core used by all control
 # packages. It intentionally has no camera, JPEG, or GStreamer dependency.
 add_library(mine_teleop_runtime
+  cpp/src/surround_math.cpp
+  cpp/src/surround.cpp
+  cpp/src/relay.cpp
+  cpp/src/media_health.cpp
   cpp/src/core.cpp
   cpp/src/http.cpp
   cpp/src/platform.cpp
@@ -232,7 +236,6 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
 
   add_library(mine_teleop_vehicle_runtime
     cpp/src/media.cpp
-    cpp/src/upload.cpp
     cpp/src/video.cpp
     cpp/src/webrtc_media.cpp
   )
@@ -320,6 +323,9 @@ install(TARGETS mine_teleop_runtime
 install(DIRECTORY cpp/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY configs/ DESTINATION share/mine-teleop/configs)
 install(DIRECTORY cpp/web/assets/ DESTINATION share/mine-teleop/assets)
+install(PROGRAMS tools/calibration/mine-teleop-calibrate DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES tools/calibration/quality.py tools/calibration/requirements.txt DESTINATION share/mine-teleop/calibration)
+install(DIRECTORY scripts/relay/ DESTINATION share/mine-teleop/relay)
 install(DIRECTORY protocol/ DESTINATION share/mine-teleop/protocol)
 
 if(MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
@@ -629,10 +635,22 @@ if(MINE_TELEOP_BUILD_TESTS)
       mine-teleop-vehicle-runtime-log-relay
       PROPERTIES TIMEOUT 30
     )
+    add_executable(mine-teleop-surround-relay-tests cpp/tests/surround_relay_tests.cpp)
+    target_link_libraries(mine-teleop-surround-relay-tests PRIVATE mine_teleop_vehicle_runtime)
+    add_test(NAME mine-teleop-surround-relay-tests COMMAND mine-teleop-surround-relay-tests)
     add_executable(mine-teleop-cpp-tests cpp/tests/core_tests.cpp)
     target_link_libraries(mine-teleop-cpp-tests PRIVATE mine_teleop_vehicle_runtime)
     mine_teleop_enable_warnings(mine-teleop-cpp-tests)
     add_test(NAME mine-teleop-cpp-tests COMMAND mine-teleop-cpp-tests)
     set_tests_properties(mine-teleop-cpp-tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   endif()
+endif()
+
+option(MINE_TELEOP_SOFTWARE_MEDIA_FIXTURES "Run x264/OpenH264 Docker-only media fixtures" OFF)
+if(MINE_TELEOP_BUILD_TESTS AND MINE_TELEOP_BUILD_VEHICLE_RUNTIME AND MINE_TELEOP_SOFTWARE_MEDIA_FIXTURES)
+  add_executable(mine-teleop-media-pipeline-fixture cpp/tests/media_pipeline_fixture.cpp)
+  target_link_libraries(mine-teleop-media-pipeline-fixture PRIVATE mine_teleop_vehicle_runtime)
+  add_test(NAME mine-teleop-media-pipeline-fixture COMMAND mine-teleop-media-pipeline-fixture)
+  add_test(NAME mine-teleop-fish-diagnostic-pipeline-fixture COMMAND mine-teleop-media-pipeline-fixture --fish-diagnostic)
+  set_tests_properties(mine-teleop-media-pipeline-fixture mine-teleop-fish-diagnostic-pipeline-fixture PROPERTIES TIMEOUT 30)
 endif()

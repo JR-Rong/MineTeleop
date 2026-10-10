@@ -52,16 +52,6 @@ media:
       bitrate_kbps: 1200
       keyframe_interval_frames: 30
       low_latency: true
-  record_profiles:
-    record_source_h265:
-      codec: h265
-      encoder: reuse_realtime
-      width: source
-      height: source
-      fps: source
-      bitrate_kbps: 8000
-      segment_seconds: 60
-
 cameras:
   - id: front
     enabled: true
@@ -70,7 +60,6 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p
-    record_profile: record_source_h265
   - id: rear
     enabled: false
     device: testsrc
@@ -78,7 +67,6 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p
-    record_profile: record_source_h265
 
 hardware:
   can:
@@ -107,24 +95,13 @@ field_safety:
   require_local_estop_reset: true
   require_time_sync: true
 
-recording:
-  root_dir: .local/recordings
-  retention_target_hours: 8
-  min_free_gb: 5
-  delete_uploaded_when_below_free_gb: 2
-  delete_unuploaded_when_below_free_gb: false
-  upload_lag_policy: alert_and_preserve_uploaded_only
-
-upload:
-  enabled: true
-  backend: local_archive
-  max_bandwidth_mbps: 5
-  trigger_segments: 20
-  trigger_network_idle: true
-  direct_file_upload: true
-  presigned_url_refresh_margin_seconds: 300
-  retry_initial_seconds: 10
-  retry_max_seconds: 600
-
 vehicle_adapter:
   type: mock
+
+# Calibrated vehicles use two streams only after hardware/field qualification.
+surround:
+  mode: auto
+  calibration_file: ""
+  profile: 720p
+  max_frame_age_ms: 100
+  max_skew_ms: 0 # measured acceptance limit; 20 ms remains the alignment target

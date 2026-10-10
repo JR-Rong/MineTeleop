@@ -40,16 +40,6 @@ media:
       height: 720
       fps: 30
       bitrate_kbps: 2500
-  record_profiles:
-    reuse_realtime:
-      codec: h264
-      encoder: reuse_realtime
-      width: source
-      height: source
-      fps: source
-      bitrate_kbps: 2500
-      segment_seconds: 2
-
 cameras:
   - id: ccg2_channel_0
     enabled: true
@@ -62,7 +52,6 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p30
-    record_profile: reuse_realtime
   - id: ccg2_channel_1
     enabled: true
     critical_for_control: false
@@ -74,7 +63,6 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p30
-    record_profile: reuse_realtime
 
 hardware:
   can:
@@ -106,16 +94,13 @@ field_safety:
   time_sync_interval_ms: 30000
   time_sync_samples: 7
 
-recording:
-  enabled: true
-  root_dir: recordings
-  min_free_gb: 1
-  delete_uploaded_when_below_free_gb: 0.5
-  delete_unuploaded_when_below_free_gb: false
-
-upload:
-  enabled: false
-  backend: local_archive
-
 vehicle_adapter:
   type: mock
+
+# Calibrated vehicles use two streams only after hardware/field qualification.
+surround:
+  mode: auto
+  calibration_file: ""
+  profile: 720p
+  max_frame_age_ms: 100
+  max_skew_ms: 0 # measured acceptance limit; 20 ms remains the alignment target

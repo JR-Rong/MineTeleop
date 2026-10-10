@@ -1,4 +1,5 @@
 #pragma once
+#include "mine_teleop/relay.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -114,6 +115,9 @@ struct SignalingServerConfig {
   std::vector<std::string> stun_urls{"stun:127.0.0.1:3478"};
   std::vector<std::string> turn_urls;
   std::string turn_realm;
+  std::filesystem::path relay_state_dir;
+  double relay_capacity_bps{8000000};
+  double relay_egress_copies{2};
   std::string turn_static_auth_secret;
   std::int64_t turn_credential_ttl_seconds{600};
   std::size_t max_signaling_payload_bytes{512 * 1024};
@@ -240,7 +244,7 @@ class SignalingService {
       std::string_view session_id,
       std::string_view recipient,
       std::uint64_t delivery_cursor,
-      bool control_only = false);
+      bool control_only = false, bool include_quiesce = false);
   [[nodiscard]] const Session& require_active_session(std::string_view session_id) const;
   [[nodiscard]] const Session& require_participant(std::string_view session_id, std::string_view participant) const;
   void validate_driver_token(std::string_view driver_id, std::string_view token);
@@ -273,6 +277,7 @@ class SignalingService {
   std::function<std::int64_t()> audit_clock_;
   mutable std::mutex mutex_;
   mutable std::mutex audit_log_mutex_;
+  std::unique_ptr<RelayBudget> relay_budget_;
   mutable std::int64_t audit_log_period_start_ms_{-1};
   mutable std::int64_t audit_log_last_retention_period_ms_{-1};
   std::unordered_map<std::string, DriverToken> driver_tokens_;
@@ -367,8 +372,9 @@ class DriverConsoleRuntime {
   void prepare_shutdown();
   [[nodiscard]] Json poll_signaling();
   [[nodiscard]] Json send_media_capabilities(const Json& input);
-  [[nodiscard]] Json ice_servers();
+  [[nodiscard]] Json ice_servers(const Json& input=Json::object());
   [[nodiscard]] Json send_media_fallback(const Json& input);
+  [[nodiscard]] Json request_media_change(const Json&);
   [[nodiscard]] Json send_webrtc_answer(const Json& input);
   [[nodiscard]] Json send_webrtc_ice_candidate(const Json& input);
   [[nodiscard]] Json ingest_webrtc_metrics(const Json& input);
@@ -500,6 +506,8 @@ class DriverConsoleRuntime {
   std::string last_webrtc_audit_key_;
   Json authorized_vehicles_ = Json::array();
   NativeControlIntentStore native_control_intent_;
+  std::string control_media_attempt_;
+  std::string pending_media_quiesce_id_;
   std::atomic<bool> native_control_estop_wakeup_{false};
   std::atomic<std::uint64_t> native_control_commands_sent_{0};
   std::atomic<std::uint64_t> native_control_send_failures_{0};

@@ -77,6 +77,7 @@ RUN meson setup /tmp/gstreamer-build /tmp/gstreamer \
          -Dgst-plugins-base:app=enabled \
          -Dgst-plugins-base:typefind=enabled \
          -Dgst-plugins-base:videoconvertscale=enabled \
+         -Dgst-plugins-base:videorate=enabled \
          -Dgst-plugins-base:videotestsrc=enabled \
          -Dgst-plugins-good:isomp4=enabled \
          -Dgst-plugins-good:jpeg=enabled \
@@ -242,6 +243,7 @@ RUN set -e; \
     cp /src/configs/mine-teleop-field-root.crt /bundle/config/mine-teleop-field-root.crt; \
     cp /src/deployments/udev/99-mine-teleop-basler.rules /bundle/deployments/udev/; \
     cp /src/scripts/deploy/setup_basler_usb_access.sh /bundle/scripts/; \
+    cp -a /src/scripts/relay /bundle/scripts/; \
     chmod +x /bundle/scripts/setup_basler_usb_access.sh; \
     cp /etc/ssl/certs/ca-certificates.crt /bundle/config/ca-certificates.crt; \
     cp -L /opt/aravis/lib/libaravis*.so* /bundle/lib/; \
@@ -340,7 +342,7 @@ ENV GST_REGISTRY="/tmp/mine-teleop-gstreamer-registry.bin"
 ENV SSL_CERT_FILE="/opt/mine-teleop/etc/ssl/certs/ca-certificates.crt"
 RUN groupadd --system mineteleop \
     && useradd --system --gid mineteleop --home-dir /opt/mine-teleop --shell /usr/sbin/nologin mineteleop \
-    && mkdir -p /var/lib/mine-teleop/recordings /var/lib/mine-teleop/uploader \
+    && mkdir -p /var/lib/mine-teleop/calibration /var/lib/mine-teleop/cameras \
     && chown -R mineteleop:mineteleop /var/lib/mine-teleop
 USER mineteleop
 WORKDIR /opt/mine-teleop

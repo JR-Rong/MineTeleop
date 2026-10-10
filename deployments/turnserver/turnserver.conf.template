@@ -1,6 +1,6 @@
 # Mine Teleop coturn configuration template.
-# Render ${MINE_TELEOP_TURN_REALM} and ${MINE_TELEOP_TURN_STATIC_AUTH_SECRET}
-# from the deployment secret store before starting turnserver.
+# Render ${MINE_TELEOP_TURN_REALM} and ${MINE_TELEOP_TURN_CLI_PASSWORD}
+# from the local management secret store. Lease secrets are stored in SQLite.
 
 listening-port=3478
 # Private listener for HAProxy's binary PROXY protocol. Keep this port off the
@@ -13,7 +13,11 @@ max-port=49200
 realm=${MINE_TELEOP_TURN_REALM}
 fingerprint
 use-auth-secret
-static-auth-secret=${MINE_TELEOP_TURN_STATIC_AUTH_SECRET}
+userdb=/var/lib/mine-teleop-relay/turndb.sqlite
+cli-ip=127.0.0.1
+cli-port=5766
+cli-password=${MINE_TELEOP_TURN_CLI_PASSWORD}
+cli-max-output-sessions=10000
 
 cert=/etc/mine-teleop/tls/turn.crt
 pkey=/etc/mine-teleop/tls/turn.key
@@ -24,7 +28,8 @@ no-multicast-peers
 
 # Capacity guards keep this relay isolated from other business traffic.
 total-quota=1200
-bps-capacity=0
+bps-capacity=1000000
+max-bps=1000000
 
 # Log allocations and bindings so relay usage can be audited per session user.
 verbose

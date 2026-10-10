@@ -104,3 +104,13 @@ body .camera-placeholder{position:absolute;inset:0;display:grid;place-items:cent
 body .camera-placeholder[hidden]{display:none}
 body .camera[data-state="stale"],body .camera[data-state="offline"]{border-color:#b7791f}
 body .camera[data-state="stale"] .camera-placeholder,body .camera[data-state="offline"] .camera-placeholder{color:#fbbf24}
+
+body .visual-stage>#cameras.camera-adjustable-grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));grid-template-rows:none;grid-auto-flow:row dense;grid-auto-rows:min-content;align-content:start;overflow:auto;min-height:0}
+body .camera-adjustable-grid .camera{height:auto;min-height:0;position:relative}
+body .camera canvas{width:100%;height:100%;display:block;object-fit:contain}
+body .camera video[hidden]{display:none}
+.camera-resize{position:absolute;width:16px;height:16px;min-width:0;padding:0;border-radius:3px;background:#7dd3fc99;z-index:4;touch-action:none}
+.camera-resize.nw{left:0;top:0;cursor:nwse-resize}.camera-resize.ne{right:0;top:0;cursor:nesw-resize}.camera-resize.sw{left:0;bottom:0;cursor:nesw-resize}.camera-resize.se{right:0;bottom:0;cursor:nwse-resize}
+.camera-focused{border-color:#7dd3fc}.camera-toolbar{flex-wrap:wrap}.camera-toolbar select{max-width:160px;font-size:11px;padding:4px}
+
+body .camera-adjustable-grid .camera>video,body .camera-adjustable-grid .camera>canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}

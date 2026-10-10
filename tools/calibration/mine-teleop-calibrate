@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Offline maintenance: numbered ChArUco -> omnidir -> held-out validation.
+
+All ground geometry is measured in metres in +X front/+Y left/+Z up.
+A solver result is a draft; validate atomically replaces an accepted file only
+when every fixed held-out point, seam and measured performance profile passes.
+"""
+import argparse
+import csv
+import fcntl
+import hashlib
+import json
+import math
+from html import escape
+import os
+import subprocess
+import sys
+from pathlib import Path
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw
+from scipy.optimize import least_squares
+
+IDS = ('fish_front', 'fish_rear', 'fish_left', 'fish_right')
+BOARD_IDS = 17
+SQUARE = .3
+
+
+def strict_json(text):
+    def invalid(value):raise ValueError('non-finite JSON value '+value)
+    return json.loads(text,parse_constant=invalid)
+
+
+def validate_survey(field):
+    if set(field['boards'])!={f'A{i+1}' for i in range(8)}:raise ValueError('exactly eight numbered boards required')
+    region=field['ground_region'];length,width=field['vehicle_length_m'],field['vehicle_width_m']
+    if not all(math.isfinite(x) for x in [*region,length,width]) or min(length,width)<=0 or region[0]>=region[1] or region[2]>=region[3]:raise ValueError('invalid surveyed dimensions')
+    corners=[]
+    for plate in field['boards'].values():
+        origin,u,v=np.asarray(plate['origin']),np.asarray(plate['u']),np.asarray(plate['v'])
+        if not np.isfinite(np.r_[origin,u,v]).all() or abs(np.linalg.norm(u)-1)>1e-5 or abs(np.linalg.norm(v)-1)>1e-5 or abs(u@v)>1e-5 or abs(u[2])+abs(v[2])>1e-5:raise ValueError('ground board axes must be orthonormal and horizontal')
+        expected=[origin,origin+2.1*u,origin+2.1*u+1.5*v,origin+1.5*v]
+        if not np.allclose(expected,plate['corners'],atol=.005,rtol=0):raise ValueError('surveyed board corners disagree with its origin/direction')
+        corners.extend(origin+float(x)*u+float(y)*v for y in np.arange(.3,1.5,.3) for x in np.arange(.3,2.1,.3))
+        for point in expected:
+            if not region[0]<=point[0]<=region[1] or not region[2]<=point[1]<=region[3] or abs(point[2])>.005:raise ValueError('board outside surveyed ground region')
+    points=field['check_points']
+    if len({p['id'] for p in points})!=len(points) or len(points)<32:raise ValueError('independent check IDs must be unique')
+    for point in points:
+        xyz=np.asarray(point['world'])
+        if not np.isfinite(xyz).all() or not region[0]<=xyz[0]<=region[1] or not region[2]<=xyz[1]<=region[3] or abs(xyz[2])>.005 or (abs(xyz[0])<length/2 and abs(xyz[1])<width/2):raise ValueError('check point outside effective ground')
+        if np.min(np.linalg.norm(np.asarray(corners)-xyz,axis=1))<.01:raise ValueError('check point duplicates a solve corner')
+    if field['surveyed'] and not all(isinstance(field[key],(int,float)) and 0<=field[key]<=.005 for key in ('measurement_accuracy_m','ground_flatness_m')):raise ValueError('survey precision/flatness exceeds 5 mm')
+
+
+def atomic(path, document):
+    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_suffix(path.suffix+'.tmp')
+    with open(tmp,'w') as file:
+        json.dump(document,file,ensure_ascii=False,allow_nan=False,sort_keys=True,indent=2)
+        file.flush();os.fsync(file.fileno())
+    os.replace(tmp,path)
+
+
+def envelope(document):
+    payload=json.dumps(document,ensure_ascii=False,allow_nan=False,sort_keys=True,separators=(',',':'))
+    return {'payload':payload,'sha256':hashlib.sha256(payload.encode()).hexdigest()}
+
+
+def read_calibration(path):
+    packed=strict_json(Path(path).read_text());payload=packed['payload']
+    if hashlib.sha256(payload.encode()).hexdigest()!=packed['sha256']:
+        raise ValueError('calibration hash mismatch')
+    return strict_json(payload),packed['sha256']
+
+
+def camera_identity(metadata):
+    return {key:metadata[key] for key in ('device','installation_id','capture_width','capture_height','runtime_size')}
+
+
+def board_model(index):
+    dictionary=cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
+    if hasattr(cv2.aruco,'CharucoBoard_create'):
+        result=cv2.aruco.CharucoBoard_create(7,5,SQUARE,.21,dictionary)
+        result.setIds(np.arange(index*BOARD_IDS,(index+1)*BOARD_IDS,dtype=np.int32))
+    else:
+        result=cv2.aruco.CharucoBoard((7,5),SQUARE,.21,dictionary,
+                  np.arange(index*BOARD_IDS,(index+1)*BOARD_IDS,dtype=np.int32))
+    return result
+
+
+def detect(image, index):
+    model=board_model(index)
+    detector=cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
+    if hasattr(cv2.aruco,'ArucoDetector'):
+        corners,ids,_=cv2.aruco.ArucoDetector(detector).detectMarkers(image)
+    else:
+        corners,ids,_=cv2.aruco.detectMarkers(image,detector)
+    if ids is None:return None
+    selected=[i for i,identity in enumerate(ids.flatten()) if index*BOARD_IDS<=identity<(index+1)*BOARD_IDS]
+    if len(selected)<4:return None
+    count,points,corner_ids=cv2.aruco.interpolateCornersCharuco([corners[i] for i in selected],ids[selected],image,model)
+    if count<8:return None
+    chess=model.getChessboardCorners() if hasattr(model,'getChessboardCorners') else model.chessboardCorners
+    return np.asarray(chess)[corner_ids.flatten()].astype(np.float64).reshape(1,-1,3),points.astype(np.float64).reshape(1,-1,2)
+
+
+def field(args):
+    root=Path(args.out);root.mkdir(parents=True,exist_ok=True)
+    length,width=args.length,args.width
+    if min(length,width)<=0:raise ValueError('positive measured vehicle dimensions required')
+    distance=1.2
+    positions=[(length/2+distance,width/2+distance),(length/2+distance,0),(length/2+distance,-width/2-distance),
+               (0,width/2+distance),(0,-width/2-distance),(-length/2-distance,width/2+distance),
+               (-length/2-distance,0),(-length/2-distance,-width/2-distance)]
+    plates={}
+    for i,(x,y) in enumerate(positions):
+        plates[f'A{i+1}']={'origin':[x-.75,y-1.05,0],'u':[0,1,0],'v':[1,0,0],
+                          'corners':[[x-.75,y-1.05,0],[x-.75,y+1.05,0],[x+.75,y+1.05,0],[x+.75,y-1.05,0]]}
+        model=board_model(i)
+        board=model.generateImage((2800,2000)) if hasattr(model,'generateImage') else model.draw((2800,2000))
+        cv2.imwrite(str(root/f'A{i+1}.png'),board)
+    checks=[]
+    for region in range(8):
+        angle=region*math.pi/4
+        for offset in (.25,.75,1.25,2):
+            cx,sy=math.cos(angle),math.sin(angle)
+            x=math.copysign(length/2+offset*abs(cx),cx) if abs(cx)>1e-6 else 0
+            y=math.copysign(width/2+offset*abs(sy),sy) if abs(sy)>1e-6 else 0
+            checks.append({'id':136+len(checks),'region':region,'world':[x,y,0],'camera_ids':[['fish_front'],['fish_front','fish_left'],['fish_left'],['fish_rear','fish_left'],['fish_rear'],['fish_rear','fish_right'],['fish_right'],['fish_front','fish_right']][region]})
+    document={'schema':1,'vehicle_id':args.vehicle_id,'vehicle_length_m':length,'vehicle_width_m':width,
+      'ground_region':[-length/2-3,length/2+3,-width/2-3,width/2+3],
+      'surveyed':False,'boards':plates,'check_points':checks,'measurement_accuracy_m':None,'ground_flatness_m':None}
+    if args.survey:
+        measured=strict_json(Path(args.survey).read_text())
+        if measured['vehicle_id']!=args.vehicle_id:raise ValueError('survey vehicle mismatch')
+        document=measured
+    validate_survey(document)
+    length,width=document['vehicle_length_m'],document['vehicle_width_m']
+    atomic(root/'field.json',document)
+    with open(root/'coordinates.csv','w') as out:
+        writer=csv.writer(out,lineterminator='\n');writer.writerow(['identity','corner','X_m','Y_m','Z_m'])
+        for name,plate in document['boards'].items():
+            for i,corner in enumerate(plate['corners']):writer.writerow([name,i,*corner])
+        for point in document['check_points']:writer.writerow([f'check-{point["id"]}','centre',*point['world']])
+    xmin,xmax,ymin,ymax=document['ground_region'];scale=60;pad=90
+    w,h=int((ymax-ymin)*scale)+2*pad,int((xmax-xmin)*scale)+2*pad
+    image=Image.new('RGB',(w,h),'#f8fafc');draw=ImageDraw.Draw(image)
+    def pixel(point):return (pad+(ymax-point[1])*scale,pad+(xmax-point[0])*scale)
+    svg=[f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}"><rect width="100%" height="100%" fill="#f8fafc"/>']
+    def rectangle(corners,fill,stroke):
+        points=[pixel(c) for c in corners];draw.polygon(points,fill=fill,outline=stroke,width=2)
+        svg.append('<polygon points="'+' '.join(f'{x:.2f},{y:.2f}' for x,y in points)+f'" fill="{fill}" stroke="{stroke}" stroke-width="2"/>')
+    def text(position,label):
+        draw.text(position,label,fill='#172554');svg.append(f'<text x="{position[0]}" y="{position[1]+12}" font-family="sans-serif" font-size="13" fill="#172554">{escape(label)}</text>')
+    rectangle([[xmin,ymin,0],[xmin,ymax,0],[xmax,ymax,0],[xmax,ymin,0]],'#eff6ff','#64748b')
+    rectangle([[-length/2,-width/2,0],[-length/2,width/2,0],[length/2,width/2,0],[length/2,-width/2,0]],'#94a3b8','#334155')
+    text(pixel([0,0,0]),'Vehicle datum (0,0,0)')
+    for name,plate in document['boards'].items():
+        rectangle(plate['corners'],'#ffffff','#2563eb');text(pixel(plate['corners'][2]),name+' 2.10 x 1.50 m')
+        label=pixel(plate['corners'][2]);text((label[0],label[1]+16),f'origin X={plate["origin"][0]:.2f}, Y={plate["origin"][1]:.2f}')
+    for point in document['check_points']:
+        x,y=pixel(point['world']);draw.ellipse((x-3,y-3,x+3,y+3),fill='#dc2626');svg.append(f'<circle cx="{x}" cy="{y}" r="3" fill="#dc2626"/>')
+    text((pad,12),f'Field {xmax-xmin:.2f} x {ymax-ymin:.2f} m; +X FRONT UP, +Y LEFT')
+    text((pad,32),f'Vehicle {length:.2f} x {width:.2f} m; board gap initial 1.20 m')
+    text((pad,h-50),'SURVEYED drawing' if document['surveyed'] else 'LAYOUT TEMPLATE - measure coordinates before construction/solve')
+    text((pad,h-30),'Red: 32 independent checks (never used by solve); units: metres')
+    image.save(root/'field.png');svg.append('</svg>');(root/'field.svg').write_text('\n'.join(svg))
+    # Print independent coded targets; record target centre as the measured point.
+    dictionary=cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
+    for point in document['check_points']:
+        marker=cv2.aruco.generateImageMarker(dictionary,point['id'],400) if hasattr(cv2.aruco,'generateImageMarker') else cv2.aruco.drawMarker(dictionary,point['id'],400)
+        cv2.imwrite(str(root/f'check-{point["id"]}.png'),marker)
+    print(json.dumps({'field':str(root/'field.json'),'diagram':str(root/'field.png'),'surveyed':document['surveyed']}))
+
+
+def capture(args):
+    if not args.vehicle_stopped:raise ValueError('capture requires stopped vehicle, driving runtime exited and --vehicle-stopped')
+    root=Path(args.out);root.mkdir(parents=True,exist_ok=True)
+    manifest_path=root/'dataset.json'
+    dataset=strict_json(manifest_path.read_text()) if manifest_path.exists() else {'schema':1,'samples':[],'cameras':{}}
+    lock_root=Path(os.environ.get('MINE_TELEOP_CAMERA_LOCK_DIR','/run/lock/mine-teleop-cameras'));lock_root.mkdir(parents=True,exist_ok=True)
+    lock=lock_root/('vehicle-'+hashlib.sha256(args.vehicle_id.encode()).hexdigest()+'.lock')
+    with open(lock,'a') as owner:
+        fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        for i in range(args.samples):
+            input(f'{args.camera} {args.role} sample {i+1}: reposition board, then Enter ')
+            photo=root/f'{args.camera}-{args.role}-{len(dataset["samples"]):04d}.ppm'
+            proc=subprocess.run([args.runtime,'calibration-capture','--config',args.config,'--camera-id',args.camera,'--output',str(photo),'--maintenance-lock-fd',str(owner.fileno())],check=True,capture_output=True,text=True,pass_fds=(owner.fileno(),))
+            metadata=strict_json(proc.stdout.strip().splitlines()[-1]);image=cv2.imread(str(photo))
+            previous=dataset['cameras'].get(args.camera)
+            if previous and camera_identity(previous)!=camera_identity(metadata):
+                raise ValueError('camera identity/installation/capture geometry changed during sample collection')
+            detections=sum(detect(image,index) is not None for index in range(8))
+            if args.role=='check':
+                dictionary=cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
+                corners,markers,_=cv2.aruco.ArucoDetector(dictionary).detectMarkers(image) if hasattr(cv2.aruco,'ArucoDetector') else cv2.aruco.detectMarkers(image,dictionary)
+                detections=0
+                checks_path=root/'checks.json'
+                check_data=strict_json(checks_path.read_text()) if checks_path.exists() else {'observations':[],'blind_zones':[]}
+                for quad,number in zip(corners,[] if markers is None else markers.flatten()):
+                    if not 136<=number<168:continue
+                    source=np.float32([[0,0],[1,0],[1,1],[0,1]])
+                    transform=cv2.getPerspectiveTransform(source,quad.reshape(4,2).astype(np.float32))
+                    point=cv2.perspectiveTransform(np.float32([[[.5,.5]]]),transform).reshape(2)
+                    key=(int(number),args.camera)
+                    check_data['observations']=[obs for obs in check_data['observations'] if (obs['id'],obs['camera_id'])!=key]
+                    check_data['observations'].append({'id':int(number),'camera_id':args.camera,'pixel':point.tolist(),'image':photo.with_suffix('.png').name})
+                    detections+=1
+                atomic(checks_path,check_data)
+            if not detections:print('Rejected: no sufficiently visible numbered board');photo.unlink();continue
+            png=photo.with_suffix('.png');Image.open(photo).save(png);photo.unlink()
+            dataset['cameras'][args.camera]=metadata
+            dataset['samples'].append({'camera_id':args.camera,'role':args.role,'file':png.name,'metadata':metadata})
+            atomic(manifest_path,dataset)
+
+
+def project(points, rvec,tvec,K,xi,D):
+    result,_=cv2.omnidir.projectPoints(np.ascontiguousarray(points,dtype=np.float64).reshape(1,-1,3),np.asarray(rvec,dtype=np.float64),np.asarray(tvec,dtype=np.float64),np.asarray(K,dtype=np.float64),float(xi),np.asarray(D,dtype=np.float64))
+    return result.reshape(-1,2)
+
+
+def solve(args):
+    root=Path(args.dataset);dataset=strict_json((root/'dataset.json').read_text());field=strict_json(Path(args.field).read_text())
+    validate_survey(field)
+    if not field['surveyed']:raise ValueError('solve requires measured/surveyed board coordinates')
+    report={'survey_sha256':hashlib.sha256(Path(args.field).read_bytes()).hexdigest(),'schema':1,'vehicle_id':field['vehicle_id'],'model':'opencv_omnidir','transform':'T_vehicle_from_camera_m',
+            'pixel_mapping':'crop_orientation_resize_pixel_centres','cameras':{},'acceptance':{'static_pass':False,'dynamic_pass':False,'profiles':{}},
+            'vehicle_length_m':field['vehicle_length_m'],'vehicle_width_m':field['vehicle_width_m'],'ground_region':field['ground_region']}
+    for camera in IDS:
+        objects,pixels=[],[];ground_objects,ground_pixels=[],[];observed_boards=set();centres=[];intrinsic_files=[]
+        samples=[s for s in dataset['samples'] if s['camera_id']==camera]
+        metadata=dataset['cameras'][camera];width,height=metadata['runtime_size']
+        if not metadata['installation_id']:raise ValueError(f'{camera}: installation_id required')
+        for sample in samples:
+            if camera_identity(sample['metadata'])!=camera_identity(metadata):
+                raise ValueError(f'{camera}: sample identity/installation/capture geometry mismatch')
+            image=cv2.imread(str(root/sample['file']))
+            if image is None or image.shape[1::-1]!=(width,height):raise ValueError('sample dimensions mismatch')
+            for index in range(8):
+                found=detect(image,index)
+                if found is None:continue
+                obj,img=found
+                if sample['role']=='intrinsic':
+                    objects.append(obj);pixels.append(img);centres.append(img.reshape(-1,2).mean(axis=0));intrinsic_files.append(sample["file"])
+                elif sample['role']=='extrinsic':
+                    plate=field['boards'][f'A{index+1}'];world=np.array(plate['origin'])+obj.reshape(-1,3)[:,0,None]*plate['u']+obj.reshape(-1,3)[:,1,None]*plate['v']
+                    ground_objects.extend(world);ground_pixels.extend(img.reshape(-1,2));observed_boards.add(index)
+        if len({s['file'] for s in samples if s['role']=='intrinsic'})<20 or len(objects)<20:raise ValueError(f'{camera}: at least 20 valid intrinsic samples required')
+        # Reject clustered views rather than obtaining a deceptively small RMS.
+        centres=np.asarray(centres)
+        if np.ptp(centres[:,0])<width*.4 or np.ptp(centres[:,1])<height*.4:
+            raise ValueError(f'{camera}: centre/edge coverage is insufficient')
+        criteria=(cv2.TERM_CRITERIA_COUNT|cv2.TERM_CRITERIA_EPS,200,1e-8)
+        rms,K,xi,D,rvecs,tvecs,selected=cv2.omnidir.calibrate(objects,pixels,(width,height),None,None,None,0,criteria)
+        if len({intrinsic_files[int(i)] for i in selected.flatten()})<20 or rms>1.5:raise ValueError(f'{camera}: intrinsic RMS/sample selection failed: {rms}')
+        normals=np.array([cv2.Rodrigues(rvec)[0][:,2] for rvec in rvecs])
+        if len(normals)<20 or np.min(normals@normals.T)>math.cos(math.radians(12)):
+            raise ValueError(f'{camera}: intrinsic board inclination diversity insufficient')
+        if len(observed_boards)<3:raise ValueError(f'{camera}: at least three ground boards required')
+        world=np.asarray(ground_objects,dtype=np.float64);observed=np.asarray(ground_pixels,dtype=np.float64)
+        if np.linalg.matrix_rank(world[:,:2]-world[:,:2].mean(axis=0))<2:raise ValueError('degenerate ground observations')
+        undistorted=cv2.omnidir.undistortPoints(observed.reshape(1,-1,2),K,D,xi,np.eye(3)).reshape(-1,2)
+        normalized=cv2.undistortPoints(observed.reshape(1,-1,2),K,D).reshape(-1,2)
+        radius2=(normalized**2).sum(axis=1);root_term=1+(1-xi.item()**2)*radius2
+        ray_z=(xi.item()+np.sqrt(np.maximum(0,root_term)))/(1+radius2)-xi.item()
+        valid=np.isfinite(undistorted).all(axis=1)&(root_term>=0)&(ray_z>.15)
+        if valid.sum()<12:raise ValueError('too few forward rays for initial pose')
+        ok,rvec,tvec=cv2.solvePnP(world[valid],undistorted[valid],np.eye(3),None,flags=cv2.SOLVEPNP_ITERATIVE)
+        if not ok:raise ValueError('extrinsic initialization failed')
+        def residual(parameters):return (project(world,parameters[:3],parameters[3:],K,xi.item(),D)-observed).flatten()
+        optimum=least_squares(residual,np.r_[rvec.flatten(),tvec.flatten()],loss='linear',max_nfev=500,xtol=1e-10,ftol=1e-10,gtol=1e-10)
+        if not optimum.success or np.linalg.matrix_rank(optimum.jac)<6:raise ValueError('extrinsic solve degenerate')
+        camera_from_vehicle=np.eye(4);camera_from_vehicle[:3,:3]=cv2.Rodrigues(optimum.x[:3])[0];camera_from_vehicle[:3,3]=optimum.x[3:]
+        vehicle_from_camera=np.linalg.inv(camera_from_vehicle)
+        if vehicle_from_camera[2,3]<=0:raise ValueError('camera pose below ground')
+        fingerprint=f'{camera}:{metadata["device"]}:{metadata["installation_id"]}:{metadata.get("capture_width",width)}x{metadata.get("capture_height",height)}'
+        report['cameras'][camera]={'device':metadata['device'],'installation_fingerprint':hashlib.sha256(fingerprint.encode()).hexdigest(),
+          'K':K.flatten().tolist(),'xi':xi.item(),'D':D.flatten().tolist(),'T_vehicle_from_camera':vehicle_from_camera.flatten().tolist(),
+          'A_runtime_from_calibration':np.eye(3).flatten().tolist(),'sensor_size':[width,height],'calibration_size':[width,height],'runtime_size':[width,height],
+          'image_transform':{'crop':[0,0,width,height],'rotation_deg':0,'mirror_x':False,'mirror_y':False,'resize':[width,height]},
+          'intrinsic_samples':len({intrinsic_files[int(i)] for i in selected.flatten()}),'intrinsic_rms_px':rms,'ground_board_count':len(observed_boards),
+          'timestamp_quality':'v4l2_soe' if metadata['exposure_time_trusted'] else 'software_alignment',
+          'extrinsic_rms_px':float(np.sqrt(np.mean(optimum.fun**2)))}
+    # Corner boards must have genuinely been observed from adjacent cameras.
+    pairs={0:('fish_front','fish_left'),2:('fish_front','fish_right'),5:('fish_rear','fish_left'),7:('fish_rear','fish_right')}
+    for index,pair in pairs.items():
+        for camera in pair:
+            if not any(detect(cv2.imread(str(root/s['file'])),index) is not None for s in dataset['samples'] if s['camera_id']==camera and s['role']=='extrinsic'):
+                raise ValueError(f'A{index+1}: adjacent camera {camera} lacks co-visibility')
+    atomic(args.out,envelope(report));print(json.dumps({'draft':args.out,'qualified':False}))
+
+
+def ground(camera, pixel):
+    K=np.asarray(camera['K']).reshape(3,3);D=np.asarray(camera['D']).reshape(4);xi=camera['xi']
+    A=np.asarray(camera['A_runtime_from_calibration']).reshape(3,3);p=np.linalg.solve(A,[*pixel,1]);p=p[:2]/p[2]
+    y=(p[1]-K[1,2])/K[1,1];x=(p[0]-K[0,2]-K[0,1]*y)/K[0,0];xd,yd=x,y
+    for _ in range(30):
+        r=x*x+y*y;radial=1+D[0]*r+D[1]*r*r
+        x=(xd-2*D[2]*x*y-D[3]*(r+2*x*x))/radial
+        y=(yd-D[2]*(r+2*y*y)-2*D[3]*x*y)/radial
+    r=x*x+y*y;inside=1+(1-xi*xi)*r
+    if inside<0:raise ValueError('check point ray outside omnidir domain')
+    lam=(xi+math.sqrt(inside))/(1+r);ray=np.array([lam*x,lam*y,lam-xi])
+    T=np.asarray(camera['T_vehicle_from_camera']).reshape(4,4);ray=T[:3,:3]@ray;centre=T[:3,3]
+    if abs(ray[2])<1e-9 or -centre[2]/ray[2]<=0:raise ValueError('check point has no ground intersection')
+    return centre-centre[2]/ray[2]*ray
+
+
+def p95(errors):
+    return sorted(errors)[math.ceil(.95*len(errors))-1]
+
+
+def geometry_hash(cal):
+    geometry={key:cal[key] for key in ('cameras','ground_region','vehicle_id','vehicle_length_m','vehicle_width_m')}
+    return hashlib.sha256(json.dumps(geometry,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+
+
+def validate(args):
+    cal,_=read_calibration(args.calibration);field=strict_json(Path(args.field).read_text());checks=strict_json(Path(args.checks).read_text())
+    validate_survey(field)
+    if cal['survey_sha256']!=hashlib.sha256(Path(args.field).read_bytes()).hexdigest():raise ValueError('survey changed since solve')
+    expected={p['id']:p for p in field['check_points']};observations=checks['observations'];observed_ids={p['id'] for p in observations}
+    expected_pairs={(identity,camera) for identity,point in expected.items() for camera in point['camera_ids']}
+    observed_pairs=[(point['id'],point['camera_id']) for point in observations]
+    if len(expected)<32 or observed_ids!=set(expected) or set(observed_pairs)!=expected_pairs or len(observed_pairs)!=len(set(observed_pairs)):raise ValueError('all fixed independent check points are required; no deletion permitted')
+    if {p['region'] for p in expected.values()}!=set(range(8)):raise ValueError('checks must cover eight ground regions')
+    errors=[]
+    for obs in observations:
+        point=ground(cal['cameras'][obs['camera_id']],obs['pixel']);error=float(np.linalg.norm(point[:2]-np.asarray(expected[obs['id']]['world'])[:2]));errors.append(error)
+    static=field['vehicle_id']==cal['vehicle_id'] and field['surveyed'] and field['measurement_accuracy_m']<=.005 and field['ground_flatness_m']<=.005 and p95(errors)<=.05 and max(errors)<=.10
+    dynamic=strict_json(Path(args.dynamic).read_text());seams={'front-left','front-right','rear-left','rear-right'}
+    tested={(s['seam'],s['speed_mps']) for s in dynamic['samples']}
+    dynamic_pass=tested=={(seam,speed) for seam in seams for speed in (.5,1.0)} and len(dynamic['samples'])==8
+    for sample in dynamic['samples']:
+        dynamic_pass=dynamic_pass and len(sample['errors_m'])>=100 and all(math.isfinite(e) and e>=0 for e in sample['errors_m']) and p95(sample['errors_m'])<=.10 and not sample['lost_targets'] and not sample['duplicated_targets']
+    performance=strict_json(Path(args.performance).read_text());profiles={}
+    # Installed executable and source-tree entry point share this helper.
+    module_dir=Path(__file__).resolve().parent
+    if not (module_dir/'quality.py').exists():module_dir=module_dir.parent/'share'/'mine-teleop'/'calibration'
+    sys.path.insert(0,str(module_dir))
+    from quality import passed_quality
+    geometry=geometry_hash(cal)
+    timing=performance['timing']
+    phase=performance['phase_one']
+    vehicle=performance['vehicle_environment']
+    phase_pass=(performance['geometry_hash']==geometry and phase['encoder_canvases_passed'] and
+      phase['sdp_receive_levels_passed'] and phase['software_decode_canvases_passed'] and bool(phase['offer_sha256']) and bool(phase['answer_sha256']) and
+      all(vehicle.get(key) and 'unverified' not in vehicle[key] for key in ('cpu','encoder','driver','kernel','gstreamer','capture_driver')) and
+      timing['clock_domain']=='CLOCK_MONOTONIC' and timing['age_basis'] in ('v4l2_soe','v4l2_eof','read_completion') and
+      0<timing['hard_max_skew_ms']<=40 and 0<timing['max_frame_age_ms']<=100 and 0<=timing['alignment_wait_ms']<=20 and
+      (timing['age_basis']=='v4l2_soe' or timing['external_alignment_verified']))
+    for name,result in performance['profiles'].items():
+        quality_path=Path(args.performance).parent/result['quality_report']
+        quality=strict_json(quality_path.read_text())
+        profiles[name]=(phase_pass and passed_quality(quality,name,geometry) and name in ('full','720p','540p') and result['coverage_verified'] and result['source_resolution']==[1280,720] and result['source_fps']==30 and result['runs']>=3 and result['seconds_per_run']>=600 and result['warmup_seconds']>=30 and result['bev_fps']>=20 and
+          result['width']>=384 and result['height']>=672 and result['paired_extra_latency_p95_ms']<=50 and result['optical_uncertainty_ms']<=5 and
+          result['drive_roi_ssim_drop']<=.02 and result['bev_ssim']>=.95 and result['visibility_cases_passed'] and result['software_decoder_verified'] and
+          performance['cpu']=='i5-12400' and performance['ram_gb']>=16 and performance['os']=='Windows 11' and performance['electron']=='44.3.0' and
+          bool(performance['os_build']) and bool(performance['chromium']) and result['codec']=='H264' and result['b_frames']==0)
+    report={'static_pass':bool(static),'dynamic_pass':bool(dynamic_pass),'profiles':profiles,'check_points':len(expected),'p95_m':p95(errors),'max_m':max(errors),
+            'measurement_accuracy_m':field['measurement_accuracy_m'],'ground_flatness_m':field['ground_flatness_m'],'errors_m':errors,
+            'geometry_hash':geometry,'timing':timing,'vehicle_environment':vehicle,'phase_one':phase,'blind_zones':checks['blind_zones'],'quality_hashes':{name:hashlib.sha256((Path(args.performance).parent/result['quality_report']).read_bytes()).hexdigest() for name,result in performance['profiles'].items()},'source_hashes':{name:hashlib.sha256(Path(path).read_bytes()).hexdigest() for name,path in [('checks',args.checks),('dynamic',args.dynamic),('performance',args.performance),('survey',args.field)]}}
+    atomic(args.report,report)
+    if not static or not dynamic_pass or not any(profiles.values()):
+        raise ValueError('acceptance failed; previous accepted calibration preserved; inspect report')
+    cal['geometry_hash']=geometry;cal['acceptance']=report;atomic(args.out,envelope(cal));print(json.dumps({'accepted':args.out,'report':args.report}))
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__);commands=parser.add_subparsers(dest='command',required=True)
+    b=commands.add_parser('board');b.add_argument('--length',type=float,required=True);b.add_argument('--width',type=float,required=True);b.add_argument('--vehicle-id',required=True);b.add_argument('--out',required=True);b.add_argument('--survey')
+    c=commands.add_parser('capture');c.add_argument('--config',required=True);c.add_argument('--vehicle-id',required=True);c.add_argument('--camera',choices=IDS,required=True);c.add_argument('--role',choices=('intrinsic','extrinsic','check'),required=True);c.add_argument('--samples',type=int,default=20);c.add_argument('--out',required=True);c.add_argument('--runtime',default='mine-teleop');c.add_argument('--vehicle-stopped',action='store_true')
+    s=commands.add_parser('solve');s.add_argument('--dataset',required=True);s.add_argument('--field',required=True);s.add_argument('--out',required=True)
+    v=commands.add_parser('validate');v.add_argument('--calibration',required=True);v.add_argument('--field',required=True);v.add_argument('--checks',required=True);v.add_argument('--dynamic',required=True);v.add_argument('--performance',required=True);v.add_argument('--report',required=True);v.add_argument('--out',required=True)
+    args=parser.parse_args()
+    try:{'board':field,'capture':capture,'solve':solve,'validate':validate}[args.command](args)
+    except Exception as error:
+        failure={'event':'calibration_failed','stage':args.command,'error':str(error)}
+        if hasattr(args,'out'):atomic(str(args.out)+'.failed.json',failure)
+        print(json.dumps(failure),file=sys.stderr);return 2
+    return 0
+
+if __name__=='__main__':sys.exit(main())

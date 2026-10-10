@@ -1,0 +1,6 @@
+# Standalone maintenance environment; absent from the driving runtime.
+numpy==2.2.6
+opencv-contrib-python-headless==4.13.0.92
+scipy==1.15.3
+Pillow==11.3.0
+PyYAML==6.0.2

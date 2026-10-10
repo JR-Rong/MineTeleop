@@ -509,7 +509,7 @@ void test_control_page_contract() {
           response.body.find("state=controlLogic.deriveKeyState(pressedControlKeys)") !=
               std::string::npos,
       "physical key codes are not reduced into held control actions");
-  const auto keyboard_handler = response.body.find("addEventListener('keydown'");
+  const auto keyboard_handler = response.body.find("addEventListener('keydown',e=>");
   const auto keyboard_prevent_default = response.body.find("e.preventDefault()", keyboard_handler);
   const auto keyboard_connection_gate = response.body.find("if(!polling)", keyboard_handler);
   expect(
@@ -650,7 +650,7 @@ void test_control_page_contract() {
           response.body.find("controlLogic.mergeControlProfileWithHardLimits") !=
               std::string::npos &&
           response.body.find("controlLogic.deriveControl") != std::string::npos &&
-          response.body.find("post('/api/control-profile',requested)") != std::string::npos &&
+          response.body.find("post('/api/control-profile',{...requested,control_epoch:activeEpoch,media_attempt_id:activeAttempt})") != std::string::npos &&
           response.body.find("get('/api/control-limits').then") == std::string::npos &&
           response.body.find("sendPendingControlProfile()") != std::string::npos &&
           response.body.find("now-lastControlProfileSendAt<200") != std::string::npos &&
@@ -752,7 +752,7 @@ void test_control_page_contract() {
               std::string::npos &&
           response.body.find("async function writeControlIntent(extra,announceUnavailable)") !=
               std::string::npos &&
-          response.body.find("const intent=nativeIntentEnvelope(outgoing)") !=
+          response.body.find("const intent={...nativeIntentEnvelope(outgoing),control_epoch:controlEpoch}") !=
               std::string::npos &&
           response.body.find(
               "pendingGearTransition=controlLogic.recordForwardedGearCommand"
@@ -947,7 +947,7 @@ void test_control_page_contract() {
           response.body.find("attach(id,e.track)") != std::string::npos,
       "browser video elements are not isolated to their individual WebRTC tracks");
   expect(
-      response.body.find("cameraView.configure(remoteCameraIds)") != std::string::npos &&
+      response.body.find("cameraView.configure(remoteCameraIds,{") != std::string::npos &&
           response.body.find("if(peer!==nextPeer||e.track.kind!=='video')return") != std::string::npos &&
           response.body.find("MineTeleopCameraView.mount(cameraGrid)") != std::string::npos,
       "camera slots must be declared before tracks and reject callbacks from old peers");
@@ -1284,7 +1284,7 @@ std::string cpp_function_contract(
 
 void test_vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start() {
   const auto source = read_text_file("cpp/src/webrtc_media.cpp");
-  const auto start_service = cpp_function_contract(source, "[[nodiscard]] bool start_control_service()");
+  const auto start_service = cpp_function_contract(source, "[[nodiscard]] bool start_control_service(bool parking_only=false)");
   const auto configure_channel = cpp_function_contract(source, "void configure_control_data_channel()");
   const auto send_status = cpp_function_contract(source, "void send_vcu_handshake_status_locked(std::string_view result)");
   constexpr std::string_view reset = "control_status_seq = 0;";
@@ -1379,6 +1379,15 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
   const auto native_control_watchdog_loop = cpp_function_contract(
       source,
       "void native_control_watchdog_loop(std::stop_token stop_token) noexcept");
+  const auto parking_start=cpp_function_contract(source,"[[nodiscard]] bool start_control_service(bool parking_only=false)");
+  const auto parking_tick=cpp_function_contract(source,"void tick_control_service()");
+  const auto final_teardown=cpp_function_contract(source,"void stop_pipeline()");
+  expect(native_control_websocket_loop.find("lifecycle_stopping.load()")!=std::string::npos &&
+      native_control_watchdog_loop.find("lifecycle_stopping.load()")!=std::string::npos &&
+      parking_start.find("(stop_requested && !parking_only)")!=std::string::npos &&
+      parking_tick.find("(stop_requested && !control_quiescing)")!=std::string::npos &&
+      final_teardown.find("lifecycle_stopping=true")!=std::string::npos,
+      "media failure stopped parking WSS/feedback or allowed normal control to reopen");
   const auto start_native_control_transport = cpp_function_contract(
       source,
       "void start_native_control_transport()");
@@ -1569,7 +1578,7 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
   expect(
       process_signaling.find("control_command") == std::string::npos &&
           process_signaling.find(
-              "signaling.poll(\"webrtc_answer,ice_candidate,media_fallback\")") !=
+              "signaling.poll(\"webrtc_answer,ice_candidate,media_fallback,media_path_health\")") !=
               std::string::npos &&
           native_control_websocket_url.find("signaling_websocket_url(") !=
               std::string::npos &&
@@ -1686,7 +1695,7 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
               "control-command receive WebSocket cannot be send-only") !=
               std::string::npos &&
           signaling_websocket.find(
-              "control_receive_only ? std::string_view(\"control_command\")") !=
+              "requested_types==\"control_command\" ? std::string_view(\"control_command\")") !=
               std::string::npos &&
           signaling_websocket.find(
               "control-command receive WebSocket accepts delivery acknowledgements only") !=
@@ -2661,14 +2670,8 @@ void test_credential_purpose_separation_and_stale_control_replay() {
   const auto ice = http.get_json(
       base + "/sessions/" + first_session_id + "/ice_servers?actor=driver-purpose&token=" +
       http.url_encode(driver_token));
-  std::string turn_credential;
-  for (const auto& server_config : ice.at("ice_servers")) {
-    if (server_config.contains("credential")) {
-      turn_credential = server_config.at("credential").get<std::string>();
-      break;
-    }
-  }
-  expect(!turn_credential.empty(), "TURN credential was not issued for purpose-isolation testing");
+  for(const auto& entry:ice.at("ice_servers"))expect(!entry.contains("credential"),"TURN credentials bypassed relay admission");
+  const auto turn_credential=std::string("dGVzdC1vbmx5LXR1cm4tY3JlZGVudGlhbA==");
   expect(
       http.get(
               base + "/sessions/" + first_session_id + "?actor=driver-purpose&token=" +
@@ -4392,6 +4395,35 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
           native_control_confirmed.message.value("acknowledged", 0) == 1,
       "control-only vehicle WebSocket acknowledgement was not confirmed");
   native_control_receiver.close();
+
+  auto quiesce=signaling_request_for(session_id,2,"vehicle-001","driver-console-001","driver-console-001","vehicle-001","token",token,"media_quiesce",{{"request_id","park-1"},{"media_attempt_id","attempt-1"},{"control_epoch",7},{"mode","full"},{"profile","720p"}});
+  const auto quiesce_ack=http.post_json_response(base+"/signaling/"+session_id+"/messages",quiesce);
+  const auto quiesce_cursor=quiesce_ack.at("delivery_cursor").get<std::uint64_t>();
+  mine_teleop::WebSocketClient parking_receiver;
+  const auto parking_url=mine_teleop::signaling_websocket_url(base,session_id,"vehicle-001",std::to_string(vehicle_generation))+"&types=control_command,media_quiesce";
+  parking_receiver.connect(parking_url,{{"X-Mine-Teleop-Device-Token","vehicle-secret-1"}});
+  const auto parking_delivery=parking_receiver.receive_json(std::chrono::seconds(1));
+  expect(parking_delivery.status==mine_teleop::WebSocketReceiveStatus::Message && parking_delivery.message.at("messages").size()==1 && parking_delivery.message.at("messages").at(0).value("type","")=="media_quiesce","typed safety WSS consumed SDP/capabilities instead of parking request");
+  parking_receiver.send_json({{"event","signaling_delivery_ack"},{"delivery_cursor",quiesce_cursor}});
+  const auto parking_confirmed=receive_event(parking_receiver,"signaling_delivery_acknowledged",std::chrono::seconds(1));
+  expect(parking_confirmed.message.value("acknowledged",0)==1,"parking request cursor was not acknowledged");
+  parking_receiver.close();parking_receiver.connect(parking_url,{{"X-Mine-Teleop-Device-Token","vehicle-secret-1"}});
+  expect(parking_receiver.receive_json(std::chrono::milliseconds(150)).status==mine_teleop::WebSocketReceiveStatus::Timeout,"acknowledged parking request replayed after reconnect");parking_receiver.close();
+  auto forged=signaling_request_for(session_id,3,"vehicle-001","driver-console-001","driver-console-001","vehicle-001","token",token,"media_quiesce_ack",{{"request_id","park-1"},{"parked",true},{"control_epoch",8}});
+  expect(http.post_json(base+"/signaling/"+session_id+"/messages",forged).status==401,"browser forged vehicle parking confirmation");
+  auto parked=signaling_request_for(session_id,2,"vehicle-001","driver-console-001","vehicle-001","driver-console-001","device_token","vehicle-secret-1","media_quiesce_ack",{{"request_id","park-1"},{"parked",true},{"control_epoch",8}});
+  parked["connection_generation"]=vehicle_generation;
+  expect(http.post_json(base+"/signaling/"+session_id+"/messages",parked).status==200,"authenticated vehicle parking confirmation failed");
+  const auto verified=http.get_json(base+"/signaling/"+session_id+"/messages?recipient=driver-console-001&token="+http.url_encode(token)+"&types=media_quiesce_ack");
+  expect(verified.at("messages").size()==1 && verified.at("messages").at(0).at("payload").at("control_epoch")==8,"parking epoch confirmation was lost");
+
+  auto path_health=signaling_request_for(session_id,4,"vehicle-001","driver-console-001","driver-console-001","vehicle-001","token",token,"media_path_health",{{"media_attempt_id","attempt-1"},{"control_epoch",8},{"direct_selected",true},{"healthy_stream_ids",mine_teleop::Json::array({"drive_mosaic","surround_bev"})},{"control_data_channel_open",true}});
+  expect(http.post_json(base+"/signaling/"+session_id+"/messages",path_health).status==200,"driver receive health was not routed");
+  const auto received_health=http.get_json(base+"/signaling/"+session_id+"/messages?recipient=vehicle-001&device_token=vehicle-secret-1&connection_generation="+std::to_string(vehicle_generation)+"&types=media_path_health");
+  expect(received_health.at("messages").size()==1 && received_health.at("messages").at(0).at("payload").at("media_attempt_id")=="attempt-1","receive health lost attempt identity");
+  auto wrong_actor=signaling_request_for(session_id,3,"vehicle-001","driver-console-001","vehicle-001","driver-console-001","device_token","vehicle-secret-1","media_path_health",{{"direct_selected",true}});
+  wrong_actor["connection_generation"]=vehicle_generation;
+  expect(http.post_json(base+"/signaling/"+session_id+"/messages",wrong_actor).status==401,"vehicle forged controller receive health");
 
   const auto vehicle_messages = http.get_json(
       base + "/signaling/" + session_id + "/messages?recipient=vehicle-001&device_token=vehicle-secret-1"

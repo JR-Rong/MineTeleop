@@ -1,0 +1,47 @@
+name: Surround and relay fixtures
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: surround-features-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  features:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build reproducible software fixture environment
+        run: |
+          docker build --target gstreamer -f deployments/cpp/Dockerfile.build -t mine-teleop-gst128:local .
+          docker build -f scripts/test/Dockerfile.features -t mine-teleop-features .
+      - name: Native regression, actual H264 SDP/decode, calibration and maintenance
+        run: |
+          docker run -d --name mine-feature-check -v "$PWD:/workspace" mine-teleop-features sleep infinity
+          docker exec mine-feature-check bash scripts/test/check_surround_features.sh
+      - name: Actual coturn SQLite reclamation and isolated egress shaping
+        run: |
+          docker run --rm --cap-add NET_ADMIN --network none -v "$PWD:/workspace:ro" \
+            -e TEST_RELAY_INTERFACE=lo mine-teleop-features bash -c \
+            'bash scripts/relay/shape_egress.sh --apply lo 0 >/dev/null && python3 scripts/test/relay_manager_test.py'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Native console browser interaction and actual CPU WASM
+        run: |
+          npm install --prefix "$RUNNER_TEMP/mine-pw" playwright@1.62.1
+          docker exec -d mine-feature-check /tmp/mine-teleop-feature-build/mine-teleop-control --no-open-browser --port 18678 --browser-event-log /tmp/browser-fixture.jsonl
+          PLAYWRIGHT_MODULE="$RUNNER_TEMP/mine-pw/node_modules/playwright" \
+            TEST_DOCKER_CONTEXT=default TEST_CONTAINER=mine-feature-check \
+            TEST_BROWSER_CHANNEL=chrome TEST_SCREENSHOTS="$RUNNER_TEMP/browser-qa" \
+            node scripts/test/surround_browser_test.mjs
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: surround-browser-qa
+          path: ${{ runner.temp }}/browser-qa
+          if-no-files-found: ignore

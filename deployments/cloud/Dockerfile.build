@@ -74,6 +74,7 @@ RUN set -eu; \
     cp -a /src/deployments/caddy /bundle/deployments/caddy; \
     cp -a /src/deployments/haproxy /bundle/deployments/haproxy; \
     cp -a /src/deployments/turnserver /bundle/deployments/turnserver; \
+    cp -a /src/scripts/relay /bundle/scripts/; \
     install -m 0755 /src/scripts/deploy/deploy_cloud_bundle.sh /bundle/deploy-cloud.sh; \
     install -m 0755 \
       /src/scripts/deploy/render_turnserver_config.sh \

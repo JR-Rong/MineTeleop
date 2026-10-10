@@ -3,7 +3,7 @@
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/session_logs.hpp"
-#include "mine_teleop/upload.hpp"
+#include "mine_teleop/surround.hpp"
 #include "mine_teleop/video.hpp"
 
 #include <algorithm>
@@ -28,6 +28,9 @@
 #include <vector>
 
 #include <sys/wait.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 namespace {
@@ -35,6 +38,23 @@ namespace {
 using mine_teleop::ControlCommand;
 using mine_teleop::Json;
 using mine_teleop::VehicleConfig;
+
+class VehicleMaintenanceGuard {
+ public:
+  explicit VehicleMaintenanceGuard(const mine_teleop::VehicleConfig& config,bool exclusive=false,int inherited=-1){
+    const auto root=std::filesystem::path(std::getenv("MINE_TELEOP_CAMERA_LOCK_DIR")?std::getenv("MINE_TELEOP_CAMERA_LOCK_DIR"):"/run/lock/mine-teleop-cameras");
+    std::filesystem::create_directories(root);fd_=::open((root/("vehicle-"+mine_teleop::sha256_text(config.vehicle_id)+".lock")).c_str(),O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW,0600);
+    if(inherited>=0){struct stat owned{},passed{};
+      if(fd_<0||::fstat(fd_,&owned)||::fstat(inherited,&passed)||owned.st_dev!=passed.st_dev||owned.st_ino!=passed.st_ino){if(fd_>=0)::close(fd_);throw std::runtime_error("invalid maintenance lock descriptor");}
+      ::close(fd_);fd_=inherited;
+    }
+    if(fd_<0||::flock(fd_,(exclusive?LOCK_EX:LOCK_SH)|LOCK_NB)!=0){if(fd_>=0)::close(fd_);throw std::runtime_error("vehicle is in camera calibration maintenance");}
+  }
+  ~VehicleMaintenanceGuard(){::close(fd_);}
+  VehicleMaintenanceGuard(const VehicleMaintenanceGuard&)=delete;
+  VehicleMaintenanceGuard& operator=(const VehicleMaintenanceGuard&)=delete;
+ private:int fd_=-1;
+};
 
 class Arguments {
  public:
@@ -167,7 +187,6 @@ Usage:
   mine-teleop vehicle-agent [options]
   mine-teleop vehicle-media-agent [options]
   mine-teleop vehicle-runtime [options]
-  mine-teleop vehicle-uploader [options]
   mine-teleop signaling-server [options]
   mine-teleop driver-console [options]
   mine-teleop media-probe
@@ -240,19 +259,13 @@ Vehicle media options:
   --capture-interval-ms N       optional interval between capture rounds
   --frame-timeout-ms N          native camera timeout (default 3000)
   --simulate-primary-failure-after-frames N  bench-only NVENC failover injection
-  --record                      reuse encoded H.264/H.265 packets for MP4 segments
-  --recording-root PATH         recording destination (defaults to config)
 
 Unified vehicle runtime:
-  vehicle-runtime reads control/media/recording settings and the device-token
+  vehicle-runtime reads control/media settings and the device-token
   file from the vehicle YAML, then supervises both foreground services.
 
-Vehicle uploader options:
-  --config PATH                 vehicle YAML (default configs/vehicle-agent.dev.yaml)
-  --recording-root PATH         override configured recording root
-  --archive-root PATH           local archive destination (default .local/archive)
-  --service                     keep scanning until terminated
-  --poll-interval-ms N          service scan interval (default 5000)
+Video recording/upload commands are retired; existing files are retained.
+Calibration: mine-teleop-calibrate board|capture|solve|validate (maintenance tool).
 
 Native smoke options:
   --signaling-http-url URL      signaling origin (default http://127.0.0.1:8765)
@@ -369,6 +382,7 @@ int run_loop(const VehicleConfig& config, const Arguments& arguments) {
 int run_vehicle_agent(const Arguments& arguments) {
   const auto config_path = arguments.value("--config", "configs/vehicle-agent.dev.yaml");
   auto config = mine_teleop::load_vehicle_config(config_path);
+  VehicleMaintenanceGuard maintenance_guard(config);
   apply_ice_transport_policy_override(arguments, config.cloud.ice_transport_policy);
   std::cout << config.redacted_summary().dump() << '\n';
   if (arguments.has("--preflight")) {
@@ -454,6 +468,9 @@ int run_signaling_server(const Arguments& arguments) {
   config.turn_static_auth_secret = turn_secret_file.empty()
       ? environment("MINE_TELEOP_TURN_STATIC_AUTH_SECRET")
       : read_secret(turn_secret_file, "TURN static auth secret");
+  config.relay_state_dir=arguments.value("--relay-state-dir",environment("MINE_TELEOP_RELAY_STATE_DIR"));
+  config.relay_capacity_bps=arguments.integer("--relay-capacity-bps",8000000);
+  config.relay_egress_copies=arguments.integer("--relay-egress-copies",2);
   config.turn_credential_ttl_seconds = arguments.integer("--turn-credential-ttl-seconds", 600);
   config.audit_log_path = arguments.value("--audit-log");
   config.audit_log_max_bytes = arguments.integer("--audit-log-max-bytes", 64 * 1024 * 1024);
@@ -530,7 +547,6 @@ struct VehicleMediaLaunch {
   std::string signaling_url;
   std::string device_token;
   int frame_timeout_ms{3000};
-  std::filesystem::path recording_root;
   std::optional<std::string> forced_codec;
   int simulate_primary_failure_after_frames{0};
   std::string connection_id;
@@ -556,7 +572,6 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
           launch.signaling_url,
           launch.device_token,
           launch.frame_timeout_ms,
-          launch.recording_root,
           launch.forced_codec,
           launch.simulate_primary_failure_after_frames,
           launch.connection_id,
@@ -655,11 +670,11 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
 int run_vehicle_media_agent(const Arguments& arguments) {
   auto config = mine_teleop::load_vehicle_config(arguments.value("--config", "configs/vehicle-agent.dev.yaml"));
   apply_ice_transport_policy_override(arguments, config.cloud.ice_transport_policy);
+  if(arguments.has("--diagnostic-partition")){
+    if(config.field_safety.commissioning_mode!="bench")throw std::invalid_argument("partition comparison requires an isolated bench configuration");
+    config.runtime.control_enabled=false;config.surround.diagnostic_partition=true;config.surround.profile="720p";
+  }
   const auto token = device_token(arguments, config);
-  const auto recording_root =
-      arguments.has("--record") || config.recording.enabled
-          ? std::filesystem::path(arguments.value("--recording-root", config.recording.root_dir.string()))
-          : std::filesystem::path{};
   std::optional<std::string> forced_codec;
   if (arguments.has("--codec")) forced_codec = arguments.value("--codec");
   const bool service = arguments.has("--service");
@@ -669,7 +684,6 @@ int run_vehicle_media_agent(const Arguments& arguments) {
           arguments.value("--signaling-http-url", config.cloud.signaling_url),
           token,
           arguments.integer("--frame-timeout-ms", config.runtime.media_frame_timeout_ms),
-          recording_root,
           forced_codec,
           arguments.integer("--simulate-primary-failure-after-frames", 0),
           "vehicle-media-" + mine_teleop::random_token(12),
@@ -727,6 +741,7 @@ int wait_status_code(int status) {
 int run_vehicle_runtime(const Arguments& arguments) {
   const auto config_path = arguments.value("--config", "config/vehicle-agent.yaml");
   auto config = mine_teleop::load_vehicle_config(config_path);
+  VehicleMaintenanceGuard maintenance_guard(config);
   const auto signaling_override = arguments.value("--signaling-http-url");
   if (!signaling_override.empty()) config.cloud.signaling_url = signaling_override;
   apply_ice_transport_policy_override(arguments, config.cloud.ice_transport_policy);
@@ -757,14 +772,12 @@ int run_vehicle_runtime(const Arguments& arguments) {
     }
     if (config.runtime.media_enabled) {
       const auto pid = spawn_service("media", [config, token, connection_id] {
-        const auto recording_root = config.recording.enabled ? config.recording.root_dir : std::filesystem::path{};
         return run_vehicle_media_loop(
             {
                 config,
                 config.cloud.signaling_url,
                 token,
                 config.runtime.media_frame_timeout_ms,
-                recording_root,
                 std::nullopt,
                 0,
                 connection_id,
@@ -790,7 +803,7 @@ int run_vehicle_runtime(const Arguments& arguments) {
                    {"control_enabled", config.runtime.control_enabled},
                    {"control_transport", config.runtime.control_enabled ? "native_signaling_websocket" : "disabled"},
                    {"media_enabled", config.runtime.media_enabled},
-                   {"recording_enabled", config.recording.enabled},
+                   {"video_recording_removed", true},
                    {"vehicle_adapter_type", config.vehicle_adapter.type},
                    {"can_interface", config.hardware.can_interface},
                    {"can_bitrate", config.hardware.can_bitrate},
@@ -825,23 +838,25 @@ int run_vehicle_runtime(const Arguments& arguments) {
   return code == 0 ? 1 : code;
 }
 
-int run_vehicle_uploader(const Arguments& arguments) {
-  const auto config = mine_teleop::load_vehicle_config(arguments.value("--config", "configs/vehicle-agent.dev.yaml"));
-  mine_teleop::LocalArchiveUploader uploader(
-      arguments.value("--recording-root", config.recording.root_dir.string()),
-      arguments.value("--archive-root", ".local/archive"),
-      config.upload.max_bandwidth_mbps);
-  const bool service = arguments.has("--service") || arguments.has("--service-mode");
-  const int poll_interval_ms = arguments.integer("--poll-interval-ms", 5000);
-  if (poll_interval_ms <= 0) throw std::invalid_argument("--poll-interval-ms must be positive");
-  do {
-    const auto result = uploader.process_once();
-    auto record = result.to_json();
-    record["backlog"] = uploader.backlog();
-    std::cout << record.dump() << std::endl;
-    if (!service) return result.action == "failed" ? 2 : 0;
-    if (result.action == "idle") std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms));
-  } while (true);
+int run_calibration_capture(const Arguments& arguments){
+  const auto config=mine_teleop::load_vehicle_config(arguments.value("--config","configs/vehicle-agent.dev.yaml"));
+  VehicleMaintenanceGuard maintenance_guard(config,true,arguments.integer("--maintenance-lock-fd",-1));
+  const auto id=arguments.value("--camera-id");
+  auto found=std::find_if(config.cameras.begin(),config.cameras.end(),[&](const auto& camera){return camera.id==id;});
+  if(found==config.cameras.end())throw std::invalid_argument("unknown calibration camera");
+  auto profile=config.realtime_profile(found->realtime_profile);const auto input=mine_teleop::camera_input_spec(*found,profile);
+  profile.codec=input.codec;profile.width=input.width;profile.height=input.height;profile.fps=input.fps;
+  mine_teleop::CameraFrameSource source(*found,profile);auto frame=source.next(1);
+  std::string rgba;
+  if(frame.codec=="uyvy"){
+    rgba.resize(std::size_t(frame.width)*frame.height*4);
+    mine_teleop::surround::resize_into({reinterpret_cast<const std::uint8_t*>(frame.payload.data()),frame.width,frame.height,std::size_t(frame.width)*2,mine_teleop::surround::Format::Uyvy},reinterpret_cast<std::uint8_t*>(rgba.data()),frame.width,frame.height,std::size_t(frame.width)*4);
+  }else rgba=mine_teleop::decode_frame_rgba(frame);
+  const auto output=std::filesystem::path(arguments.value("--output"));if(output.empty())throw std::invalid_argument("calibration output required");
+  std::ofstream image(output,std::ios::binary);image<<"P6\n"<<frame.width<<' '<<frame.height<<"\n255\n";
+  for(std::size_t i=0;i<rgba.size();i+=4)image.write(rgba.data()+i,3);
+  if(!image)throw std::runtime_error("calibration image write failed");
+  std::cout<<Json({{"file",output.string()},{"camera_id",id},{"device",found->device},{"installation_id",found->installation_id},{"capture_width",found->capture_width},{"capture_height",found->capture_height},{"runtime_size",{frame.width,frame.height}},{"source_sequence",frame.source_sequence},{"sequence_valid",frame.source_sequence_valid},{"v4l2_timestamp_us",frame.v4l2_timestamp_us},{"v4l2_timestamp_flags",frame.v4l2_timestamp_flags},{"read_started_steady_ms",frame.read_started_steady_ms},{"read_finished_steady_ms",frame.read_finished_steady_ms},{"exposure_time_trusted",frame.exposure_time_trusted}}).dump()<<'\n';return 0;
 }
 
 int run_http_health(const Arguments& arguments) {
@@ -998,6 +1013,10 @@ int main(int argc, char** argv) {
     }
     const std::string command(argv[1]);
     Arguments arguments(argc, argv, 2);
+  if(arguments.has("--record")||arguments.has("--recording-root")){
+    std::cerr<<"Video recording has been removed; existing files are retained.\n";return 2;
+  }
+
     if (command == "version" || command == "--version") {
       std::cout << "mine-teleop 0.2.0 cpp ubuntu22.04\n";
       return 0;
@@ -1033,7 +1052,15 @@ int main(int argc, char** argv) {
       }
       return run_vehicle_runtime(arguments);
     }
-    if (command == "vehicle-uploader") return run_vehicle_uploader(arguments);
+    if(command=="calibration-capture")return run_calibration_capture(arguments);
+    if(command=="media-profile-probe"){
+      const auto config=mine_teleop::load_vehicle_config(arguments.value("--config","configs/vehicle-agent.dev.yaml"));
+      const auto backend=mine_teleop::parse_encoder_backend(arguments.value("--backend",config.hardware.preferred_encoder));
+      const auto report=mine_teleop::probe_media_profiles(config,{backend,mine_teleop::VideoCodec::H264},arguments.has("--software-fixture"));
+      if(arguments.has("--out")){std::ofstream out(arguments.value("--out"));out<<report.dump(2);if(!out)throw std::runtime_error("probe report write failed");}
+      std::cout<<report.dump()<<'\n';return std::all_of(report.at("canvases").begin(),report.at("canvases").end(),[](const auto& row){return row.value("passed",false);})?0:2;
+    }
+    if(command=="vehicle-uploader"){std::cerr<<"Video recording/upload has been removed; use your external recorder. Existing files are retained.\n";return 2;}
     if (command == "http-health") return run_http_health(arguments);
     if (command == "time-sync") return run_time_sync(arguments);
     if (command == "vehicle-online") return run_vehicle_online(arguments);

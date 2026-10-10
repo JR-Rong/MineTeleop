@@ -1,23 +1,32 @@
 #include "mine_teleop/media.hpp"
 
 #include "mine_teleop/server.hpp"
-#include "mine_teleop/upload.hpp"
+#include "mine_teleop/surround.hpp"
+#include "mine_teleop/media_health.hpp"
 #include "mine_teleop/video.hpp"
 
 #include <gst/app/gstappsrc.h>
+#include <linux/videodev2.h>
 #include <gst/gst.h>
 #include <gst/sdp/sdp.h>
 #define GST_USE_UNSTABLE_API
 #include <gst/webrtc/webrtc.h>
+#include <gst/webrtc/ice.h>
+#include <gst/webrtc/icetransport.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstring>
+#include <cstdlib>
 #include <condition_variable>
 #include <ctime>
 #include <deque>
 #include <filesystem>
+#include <sys/file.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -28,6 +37,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <syncstream>
+#include <set>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -106,15 +116,25 @@ bool camera_encoded_frame_fresh(std::int64_t last_encoded_ms, std::int64_t now_m
       now_ms - last_encoded_ms <= timeout_ms;
 }
 
+CriticalCameraControlLatch::CriticalCameraControlLatch()
+    : control_epoch_(std::stoull(random_token(6), nullptr, 16)) {}
+std::uint64_t CriticalCameraControlLatch::control_epoch() const {std::lock_guard lock(mutex_);return control_epoch_;}
+std::uint64_t CriticalCameraControlLatch::revoke_input(){std::lock_guard lock(mutex_);return ++control_epoch_;}
+
+bool CriticalCameraControlLatch::rebuild_allowed() const {std::lock_guard lock(mutex_);return rebuild_allowed_;}
+void CriticalCameraControlLatch::confirm_parked_rebuild(){std::lock_guard lock(mutex_);rebuild_allowed_=true;}
+
 bool CriticalCameraControlLatch::enter_session(std::string_view session_id) {
   if (session_id.empty()) {
     throw std::invalid_argument("critical camera control latch requires a non-empty session id");
   }
   std::lock_guard lock(mutex_);
   if (session_id_ != session_id) {
+    if(!session_id_.empty())++control_epoch_;
     session_id_ = session_id;
     inhibited_ = false;
     armed_ = false;
+    rebuild_allowed_=true;
     startup_started_ms_.reset();
   }
   return inhibited_;
@@ -164,6 +184,7 @@ bool CriticalCameraControlLatch::arm_for_control(std::string_view session_id) {
   }
   if (inhibited_) return false;
   armed_ = true;
+  rebuild_allowed_=false;
   return true;
 }
 
@@ -212,26 +233,6 @@ std::string pipeline_identifier(std::string_view value) {
   }
   if (result.empty() || std::isdigit(static_cast<unsigned char>(result.front()))) result.insert(result.begin(), '_');
   return result;
-}
-
-std::string quote_pipeline(std::string_view value) {
-  std::string result{"\""};
-  for (const auto character : value) {
-    if (character == '\\' || character == '"') result.push_back('\\');
-    result.push_back(character);
-  }
-  result.push_back('"');
-  return result;
-}
-
-std::string iso_time(std::int64_t timestamp_ms) {
-  const std::time_t seconds = static_cast<std::time_t>(timestamp_ms / 1000);
-  std::tm value{};
-  gmtime_r(&seconds, &value);
-  std::ostringstream output;
-  output << std::put_time(&value, "%Y-%m-%dT%H:%M:%S") << '.' << std::setw(3) << std::setfill('0')
-         << (timestamp_ms % 1000) << 'Z';
-  return output.str();
 }
 
 CameraIssue classify_camera_issue_impl(std::string_view error) {
@@ -427,7 +428,7 @@ class MediaSignalingClient {
                session_id_,
                vehicle_id_,
                std::to_string(connection_generation_)) +
-        "&types=control_command";
+        "&types=control_command,media_quiesce";
   }
 
   [[nodiscard]] HttpHeaders native_control_websocket_headers() const {
@@ -435,12 +436,17 @@ class MediaSignalingClient {
     return {{"X-Mine-Teleop-Device-Token", device_token_}};
   }
 
-  Json ice_servers() {
+  Json ice_servers(std::string_view attempt="") {
     require_session();
     return http_.get_json(
         origin_ + "/sessions/" + http_.url_encode(session_id_) + "/ice_servers?actor=" +
-            http_.url_encode(vehicle_id_) + "&connection_generation=" + std::to_string(connection_generation_),
+            http_.url_encode(vehicle_id_) + "&connection_generation=" + std::to_string(connection_generation_)+"&media_attempt_id="+http_.url_encode(attempt),
         {{"X-Mine-Teleop-Device-Token", device_token_}});
+  }
+
+  Json relay(std::string_view operation,Json payload){
+    payload["actor"]=vehicle_id_;payload["device_token"]=device_token_;payload["connection_generation"]=connection_generation_;
+    return http_.post_json_response(origin_+"/sessions/"+http_.url_encode(session_id_)+"/relay/"+std::string(operation),payload);
   }
 
   [[nodiscard]] std::string url_encode(std::string_view value) const { return http_.url_encode(value); }
@@ -557,6 +563,17 @@ struct VehicleMediaRuntime::Impl {
     std::int64_t pipeline_started_steady_ms{0};
     std::mutex error_mutex;
     std::string error;
+    std::mutex frame_mutex;
+    std::shared_ptr<const EncodedFrame> latest;
+    std::deque<std::shared_ptr<const EncodedFrame>> history;
+    std::uint64_t source_generation{};
+    struct Provenance { std::vector<SourceFrameIdentity> inputs; bool healthy; Json stages=Json::object(); };
+    std::map<GstClockTime,Provenance> provenance;
+    std::map<GstClockTime,Json> encoded_provenance;
+    std::uint32_t last_trace_timestamp{};
+    bool trace_seen{};int actual_h264_level{};
+    GstSegment encoded_segment;
+    Lane(){gst_segment_init(&encoded_segment,GST_FORMAT_TIME);}
   };
 
   Impl(
@@ -564,7 +581,6 @@ struct VehicleMediaRuntime::Impl {
       std::string signaling_url,
       std::string device_token,
       int next_frame_timeout_ms,
-      std::filesystem::path next_recording_root,
       std::optional<std::string> next_forced_codec,
       int next_simulate_primary_failure_after_frames,
       std::string connection_id,
@@ -584,13 +600,16 @@ struct VehicleMediaRuntime::Impl {
                 ? std::move(next_critical_camera_control_latch)
                 : std::make_shared<CriticalCameraControlLatch>()),
         frame_timeout_ms(next_frame_timeout_ms),
-        recording_root(std::move(next_recording_root)),
         forced_codec(std::move(next_forced_codec)),
         simulate_primary_failure_after_frames(next_simulate_primary_failure_after_frames) {
     if (frame_timeout_ms <= 0) throw std::invalid_argument("frame timeout must be positive");
     if (simulate_primary_failure_after_frames < 0) {
       throw std::invalid_argument("simulated primary failure frame count must be non-negative");
     }
+    const auto lock_root=std::filesystem::path(std::getenv("MINE_TELEOP_CAMERA_LOCK_DIR")?std::getenv("MINE_TELEOP_CAMERA_LOCK_DIR"):"/run/lock/mine-teleop-cameras");
+    std::filesystem::create_directories(lock_root);
+    maintenance_lock_fd=::open((lock_root/("vehicle-"+sha256_text(config.vehicle_id)+".lock")).c_str(),O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW,0600);
+    if(maintenance_lock_fd<0||::flock(maintenance_lock_fd,LOCK_SH|LOCK_NB)!=0){if(maintenance_lock_fd>=0)::close(maintenance_lock_fd);maintenance_lock_fd=-1;throw std::runtime_error("vehicle cameras locked for calibration maintenance");}
     start_control_trace_worker();
   }
 
@@ -602,6 +621,7 @@ struct VehicleMediaRuntime::Impl {
     } catch (...) {
     }
     stop_control_trace_worker();
+    if(maintenance_lock_fd>=0)::close(maintenance_lock_fd);
   }
 
   // control_mutex must be held. A fresh gear is scoped to one active
@@ -805,16 +825,43 @@ struct VehicleMediaRuntime::Impl {
 
   static GstPadProbeReturn count_encoded(GstPad*, GstPadProbeInfo* info, gpointer user_data) {
     auto* lane = static_cast<Lane*>(user_data);
+    if(GST_PAD_PROBE_INFO_TYPE(info)&GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM){
+      auto* event=GST_PAD_PROBE_INFO_EVENT(info);
+      if(GST_EVENT_TYPE(event)==GST_EVENT_SEGMENT){const GstSegment* segment=nullptr;gst_event_parse_segment(event,&segment);std::lock_guard lock(lane->frame_mutex);lane->encoded_segment=*segment;}
+      return GST_PAD_PROBE_OK;
+    }
     if ((GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) != 0) {
       ++lane->encoded;
       const auto encoded_at_ms = lane->owner->signaling.now_ms();
       lane->last_encoded_ms = encoded_at_ms;
       lane->last_encoded_steady_ms = steady_now_ms();
+      auto* encoded=GST_PAD_PROBE_INFO_BUFFER(info);
+      if(encoded&&GST_BUFFER_PTS_IS_VALID(encoded)){
+        std::lock_guard lock(lane->frame_mutex);const auto pts=gst_segment_to_running_time(&lane->encoded_segment,GST_FORMAT_TIME,GST_BUFFER_PTS(encoded));auto it=lane->provenance.find(pts);
+        if(it!=lane->provenance.end()){
+          const bool credited=lane->owner->health.encoded(std::hash<std::string>{}(lane->camera.id),it->second.inputs,steady_now_ms(),it->second.healthy);
+          if(lane->owner->config.runtime.media_frame_trace){
+            Json sources=Json::array();
+            for(const auto& f:it->second.inputs)sources.push_back({
+                {"camera_id",f.camera_id},{"source_generation",f.source_generation},
+                {"source_sequence",f.sequence},{"source_steady_ms",f.captured_steady_ms},{"time_quality",f.time_quality},{"read_started_steady_ms",f.read_started_steady_ms},{"read_finished_steady_ms",f.read_finished_steady_ms},
+                {"frame_id",lane->owner->media_attempt_id+":"+f.camera_id+":"+std::to_string(f.source_generation)+":"+std::to_string(f.sequence)}});
+            lane->encoded_provenance[pts]={{"stream_id",lane->camera.id},
+                {"composite_id",lane->owner->media_attempt_id+":"+lane->camera.id+":"+std::to_string(pts)},
+                {"pts_ns",pts},{"stages",it->second.stages},{"source_frames",sources},{"healthy",credited},
+                {"encoded_steady_ms",steady_now_ms()}};
+            while(lane->encoded_provenance.size()>64)lane->encoded_provenance.erase(lane->encoded_provenance.begin());
+          }
+          lane->provenance.erase(lane->provenance.begin(),std::next(it));
+        }
+      }
       GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
       if (buffer != nullptr && GST_BUFFER_PTS_IS_VALID(buffer)) {
-        const auto captured_at_ms = lane->pipeline_started_ms + static_cast<std::int64_t>(GST_BUFFER_PTS(buffer) / GST_MSECOND);
+        GstClockTime running;{std::lock_guard lock(lane->frame_mutex);running=gst_segment_to_running_time(&lane->encoded_segment,GST_FORMAT_TIME,GST_BUFFER_PTS(buffer));}
+        if(running==GST_CLOCK_TIME_NONE)return GST_PAD_PROBE_OK;
+        const auto captured_at_ms = lane->pipeline_started_steady_ms + static_cast<std::int64_t>(running / GST_MSECOND);
         const auto latency_ms = static_cast<std::uint64_t>(std::max<std::int64_t>(
-            0, encoded_at_ms - captured_at_ms));
+            0, steady_now_ms() - captured_at_ms));
         ++lane->encode_latency_samples;
         lane->encode_latency_total_ms += latency_ms;
         auto observed = lane->encode_latency_max_ms.load();
@@ -825,12 +872,38 @@ struct VehicleMediaRuntime::Impl {
     return GST_PAD_PROBE_OK;
   }
 
-  static void on_ice_candidate(GstElement*, guint mline_index, gchar* candidate, gpointer user_data) {
-    // GStreamer 1.28 emits a final empty candidate after ICE gathering is
-    // complete.  Trickle ICE endpoints accept only real candidates; the empty
-    // marker must not be sent as an application signaling message.
-    if (candidate == nullptr || *candidate == '\0') return;
+  static GstPadProbeReturn trace_rtp(GstPad*,GstPadProbeInfo* info,gpointer user_data){
+    auto* lane=static_cast<Lane*>(user_data);
+    if(!lane->owner->config.runtime.media_frame_trace)return GST_PAD_PROBE_OK;
+    auto inspect=[&](GstBuffer* buffer){
+      if(!buffer||!GST_BUFFER_PTS_IS_VALID(buffer))return;
+      GstMapInfo bytes;if(!gst_buffer_map(buffer,&bytes,GST_MAP_READ))return;
+      const auto* b=bytes.data;
+      if(bytes.size>=12&&(b[0]>>6)==2&&(b[1]&128)){
+        const auto stamp=(std::uint32_t(b[4])<<24)|(std::uint32_t(b[5])<<16)|(std::uint32_t(b[6])<<8)|b[7];
+        std::lock_guard lock(lane->frame_mutex);
+        const auto pts=gst_segment_to_running_time(&lane->encoded_segment,GST_FORMAT_TIME,GST_BUFFER_PTS(buffer));
+        const auto it=lane->encoded_provenance.find(pts);
+        if(it!=lane->encoded_provenance.end()&&(!lane->trace_seen||lane->last_trace_timestamp!=stamp)){
+          auto trace=it->second;trace["rtp_timestamp"]=stamp;
+          trace["ssrc"]=(std::uint32_t(b[8])<<24)|(std::uint32_t(b[9])<<16)|(std::uint32_t(b[10])<<8)|b[11];
+          trace["rtp_marker_sequence"]=(unsigned(b[2])<<8)|b[3];
+          trace["rtp_steady_ms"]=steady_now_ms();lane->trace_seen=true;lane->last_trace_timestamp=stamp;
+          lane->owner->queue_signal("media_frame",std::move(trace));
+        }
+      }
+      gst_buffer_unmap(buffer,&bytes);
+    };
+    if(GST_PAD_PROBE_INFO_TYPE(info)&GST_PAD_PROBE_TYPE_BUFFER)inspect(GST_PAD_PROBE_INFO_BUFFER(info));
+    if(GST_PAD_PROBE_INFO_TYPE(info)&GST_PAD_PROBE_TYPE_BUFFER_LIST){
+      auto* list=GST_PAD_PROBE_INFO_BUFFER_LIST(info);for(unsigned i=0;i<gst_buffer_list_length(list);++i)inspect(gst_buffer_list_get(list,i));
+    }
+    return GST_PAD_PROBE_OK;
+  }
+
+  static void on_ice_candidate(GstElement* origin, guint mline_index, gchar* candidate, gpointer user_data) {
     auto* self = static_cast<Impl*>(user_data);
+    if(self->stop_requested||origin!=self->webrtc)return;
     const auto count = ++self->local_ice_candidate_count;
     if (count == 1) {
       self->emit_diagnostic(
@@ -844,7 +917,7 @@ struct VehicleMediaRuntime::Impl {
     }
     self->queue_signal(
         "ice_candidate",
-        {{"candidate", candidate}, {"sdpMLineIndex", mline_index}});
+        {{"candidate", candidate?candidate:""}, {"end_of_candidates",candidate==nullptr||*candidate=='\0'}, {"sdpMLineIndex", mline_index}});
   }
 
   static void on_control_channel_open(GstWebRTCDataChannel* channel, gpointer user_data) {
@@ -970,8 +1043,12 @@ struct VehicleMediaRuntime::Impl {
         nullptr);
   }
 
+  struct OfferContext {Impl* owner;GstElement* origin;std::string attempt;};
   static void on_offer_created(GstPromise* promise, gpointer user_data) {
-    auto* self = static_cast<Impl*>(user_data);
+    auto* context=static_cast<OfferContext*>(user_data);auto* self=context->owner;
+    if(self->stop_requested||context->origin!=self->webrtc||context->attempt!=self->media_attempt_id){
+      gst_promise_unref(promise);return;
+    }
     if (gst_promise_wait(promise) != GST_PROMISE_RESULT_REPLIED) {
       gst_promise_unref(promise);
       self->set_pipeline_error(
@@ -996,31 +1073,58 @@ struct VehicleMediaRuntime::Impl {
       return;
     }
 
-    GstPromise* local = gst_promise_new();
-    g_signal_emit_by_name(self->webrtc, "set-local-description", offer, local);
-    gst_promise_interrupt(local);
-    gst_promise_unref(local);
+    auto completion=std::make_shared<DescriptionCompletion>();
+    GstPromise* local=gst_promise_new_with_change_func(description_completed,
+        new std::shared_ptr<DescriptionCompletion>(completion),destroy_description_completion);
+    g_signal_emit_by_name(self->webrtc,"set-local-description",offer,local);
 
     gchar* text = gst_sdp_message_as_text(offer->sdp);
     Json tracks = Json::array();
     for (const auto& lane : self->lanes) {
       tracks.push_back({
           {"camera_id", lane->camera.id},
+          {"stream_id",lane->camera.id},
+          {"kind",lane->camera.id=="drive_mosaic"?"drive_mosaic":lane->camera.id=="surround_bev"?"surround_bev":lane->camera.id=="fish_diagnostic"?"fish_diagnostic":"camera"},
+          {"source_camera_ids",lane->camera.id=="drive_mosaic"?Json::array({"drive_front","drive_rear"}):(lane->camera.id=="surround_bev"||lane->camera.id=="fish_diagnostic")?Json::array({"fish_front","fish_rear","fish_left","fish_right"}):Json::array({lane->camera.id})},
+          {"regions",lane->camera.id=="drive_mosaic"?Json::array({{{"camera_id","drive_front"},{"x",0},{"y",0},{"width",lane->profile.width},{"height",lane->profile.height/2}},{{"camera_id","drive_rear"},{"x",0},{"y",lane->profile.height/2},{"width",lane->profile.width},{"height",lane->profile.height/2}}}):Json::array()},
+          {"calibration_hash",self->calibration?self->calibration->hash:""},
           {"codec", to_string(self->active_candidate.codec)},
           {"backend", to_string(self->active_candidate.backend)},
           {"width", lane->profile.width},
           {"height", lane->profile.height},
           {"fps", lane->profile.fps},
+          {"minimum_h264_level_idc",minimum_h264_level_idc(lane->profile.width,lane->profile.height,lane->profile.fps)},
           {"bitrate_kbps", lane->profile.bitrate_kbps},
+          {"driving_available",!self->config.surround.diagnostic_partition},
       });
+      if(lane->camera.id=="fish_diagnostic"){
+        Json regions=Json::array();const std::array<std::string,4> ids{"fish_front","fish_rear","fish_left","fish_right"};
+        for(unsigned i=0;i<4;++i)regions.push_back({{"camera_id",ids[i]},{"x",(i%2)*1280},{"y",(i/2)*720},{"width",1280},{"height",720}});
+        tracks.back()["regions"]=std::move(regions);
+      }
     }
-    self->queue_signal(
-        "webrtc_offer",
-        {{"type", "offer"},
+    Json published_calibration=self->calibration?self->calibration->document:Json(nullptr);
+    if(self->calibration&&!self->two_stream)for(const auto& lane:self->lanes){
+      if(!published_calibration.at("cameras").contains(lane->camera.id))continue;
+      auto& c=published_calibration["cameras"][lane->camera.id];
+      const auto size=c.at("runtime_size").get<std::array<int,2>>();
+      const double sx=double(lane->profile.width)/size[0],sy=double(lane->profile.height)/size[1];
+      auto a=c.at("A_runtime_from_calibration").get<std::array<double,9>>();
+      for(unsigned k=0;k<3;++k){a[k]=sx*a[k]+(.5*sx-.5)*a[6+k];a[3+k]=sy*a[3+k]+(.5*sy-.5)*a[6+k];}
+      c["A_runtime_from_calibration"]=a;c["runtime_size"]={lane->profile.width,lane->profile.height};
+      c["image_transform"]["resize"]=c["runtime_size"];
+    }
+    std::lock_guard description_lock(self->description_mutex);
+    self->local_description={local,completion,Json{
+        {"type","webrtc_offer"},{"payload",
+        {{"type", "offer"},{"vehicle_id",self->config.vehicle_id},{"media_protocol_version",2},
          {"sdp", text == nullptr ? "" : text},
          {"codec", to_string(self->active_candidate.codec)},
          {"backend", to_string(self->active_candidate.backend)},
-         {"media_tracks", std::move(tracks)}});
+         {"media_tracks", std::move(tracks)},
+         {"media_mode",self->config.surround.diagnostic_partition?"two-partition-diagnostic":self->two_stream?"two":"full"},
+         {"calibration",published_calibration},
+         {"media_attempt_id",self->media_attempt_id},{"relay_lease_id",self->relay_activated?self->relay_lease.value("lease_id",""):""},{"control_epoch",self->critical_camera_control_latch->control_epoch()}}}}};
     self->emit_diagnostic(
         "vehicle_webrtc_offer_created",
         "webrtc_offer_created",
@@ -1037,12 +1141,14 @@ struct VehicleMediaRuntime::Impl {
 
   static void on_negotiation_needed(GstElement* webrtc, gpointer user_data) {
     auto* self = static_cast<Impl*>(user_data);
-    GstPromise* promise = gst_promise_new_with_change_func(on_offer_created, self, nullptr);
-    g_signal_emit_by_name(webrtc, "create-offer", nullptr, promise);
+    if(self->stop_requested||webrtc!=self->webrtc)return;
+    self->offer_requested=true;
   }
 
   void queue_signal(std::string type, Json payload) {
     std::lock_guard lock(signal_mutex);
+    payload["media_attempt_id"]=media_attempt_id;
+    if(type=="media_frame"&&pending_signals.size()>=256)return;
     pending_signals.emplace_back(std::move(type), std::move(payload));
   }
 
@@ -1054,6 +1160,8 @@ struct VehicleMediaRuntime::Impl {
       std::string_view operator_action,
       bool retryable,
       Json details = Json::object()) const {
+    details["media_attempt_id"]=media_attempt_id;
+    details["control_epoch"]=critical_camera_control_latch->control_epoch();
     details["event"] = event;
     details["issue_code"] = issue_code;
     details["stage"] = stage;
@@ -1075,6 +1183,9 @@ struct VehicleMediaRuntime::Impl {
     GstWebRTCDataChannel* channel_to_close = nullptr;
     {
       std::lock_guard lock(control_mutex);
+      critical_camera_control_latch->revoke_input();
+      const bool retain_latched_fault=control_service &&
+          (control_service->safety_state()==SafetyState::Estop || control_service->safety_state()==SafetyState::Fault);
       control_service_issue_code = std::string(issue_code);
       invalidate_native_control_trusted_gear_locked();
       if (control_service_started && control_service) {
@@ -1090,7 +1201,7 @@ struct VehicleMediaRuntime::Impl {
         }
       }
       control_service_started = false;
-      control_service.reset();
+      if(!retain_latched_fault)control_service.reset();
       send_vcu_handshake_status_locked("media_pipeline_failed");
       if (control_channel != nullptr) {
         channel_to_close = GST_WEBRTC_DATA_CHANNEL(g_object_ref(control_channel));
@@ -1209,6 +1320,7 @@ struct VehicleMediaRuntime::Impl {
       std::string_view data,
       ControlMessageTransport transport,
       const NativeControlDeliveryTraceContext* delivery_trace) {
+    check_local_relay_deadline();
     const auto callback_entered_monotonic_ms = steady_now_ms();
     const auto callback_entered_at_utc_ms = signaling.now_ms();
     const std::string transport_name(control_transport_name(transport));
@@ -1233,8 +1345,12 @@ struct VehicleMediaRuntime::Impl {
       ++rejected_control_commands;
       return;
     }
+    if(relay_path_invalid.load()){++rejected_control_commands;return;}
     try {
       const auto message = Json::parse(data);
+      if(control_quiescing||message.value("control_epoch",std::uint64_t{0})!=critical_camera_control_latch->control_epoch()){
+        ++rejected_control_commands;return;
+      }
       if (message.value("type", "") == "session_control_profile") {
         if (transport != ControlMessageTransport::DataChannel) {
           ++rejected_control_commands;
@@ -1243,6 +1359,7 @@ struct VehicleMediaRuntime::Impl {
         const auto request = SessionControlProfileRequest::from_json(message);
         std::lock_guard lock(control_mutex);
         if (control_channel != channel) return;
+        if (control_quiescing || message.value("control_epoch",std::uint64_t{0})!=critical_camera_control_latch->control_epoch()) return;
         SessionControlProfileResult result;
         if (stop_requested || control_inhibited || !control_service_started ||
             !control_service || !control_link_open) {
@@ -1283,6 +1400,7 @@ struct VehicleMediaRuntime::Impl {
         const auto action = message.value("action", "");
         std::lock_guard lock(control_mutex);
         if (control_channel != channel) return;
+        if (control_quiescing || message.value("control_epoch",std::uint64_t{0})!=critical_camera_control_latch->control_epoch()) return;
         if (stop_requested || control_inhibited || !control_service_started ||
             !control_service || !control_link_open) {
           send_vcu_handshake_status_locked("driver_not_connected");
@@ -1354,6 +1472,11 @@ struct VehicleMediaRuntime::Impl {
           command.brake == 0.0;
       const auto control_mutex_wait_started_monotonic_ms = steady_now_ms();
       std::unique_lock lock(control_mutex);
+      // A callback can pass the initial check before quiesce takes the mutex.
+      // Validate again at the actuation boundary, after any epoch transition.
+      if(control_quiescing||command.control_epoch!=critical_camera_control_latch->control_epoch()){
+        ++rejected_control_commands;return;
+      }
       const auto control_mutex_acquired_monotonic_ms = steady_now_ms();
       const auto control_mutex_acquired_at_utc_ms = signaling.now_ms();
       const auto active_session_id = signaling.session_id();
@@ -1887,8 +2010,12 @@ struct VehicleMediaRuntime::Impl {
     std::uint64_t newest_estop_cursor = 0;
     std::size_t valid_messages = 0;
     std::string first_protocol_issue;
+    bool handled_quiesce=false;
     for (const auto& message : messages) {
       try {
+        if(message.value("type","")=="media_quiesce"){
+          request_quiesce(message.at("payload"));handled_quiesce=true;continue;
+        }
         if (!message.is_object() ||
             message.value("type", "") != "control_command") {
           throw std::invalid_argument("unexpected message type");
@@ -1925,6 +2052,7 @@ struct VehicleMediaRuntime::Impl {
       }
     }
     const auto selected = newest_estop ? newest_estop : newest;
+    if(!selected&&handled_quiesce){websocket.send_json({{"event","signaling_delivery_ack"},{"delivery_cursor",delivery_cursor}},kNativeControlWebSocketSendTimeout);return;}
     if (!selected) {
       throw std::invalid_argument(
           first_protocol_issue.empty()
@@ -2077,17 +2205,17 @@ struct VehicleMediaRuntime::Impl {
       std::chrono::milliseconds delay) const noexcept {
     auto remaining = delay;
     while (remaining.count() > 0 && !stop_token.stop_requested() &&
-           !stop_requested.load()) {
+           !lifecycle_stopping.load()) {
       const auto slice = std::min(remaining, std::chrono::milliseconds(25));
       std::this_thread::sleep_for(slice);
       remaining -= slice;
     }
-    return !stop_token.stop_requested() && !stop_requested.load();
+    return !stop_token.stop_requested() && !lifecycle_stopping.load();
   }
 
   void native_control_websocket_loop(std::stop_token stop_token) noexcept {
     auto reconnect_delay = kNativeControlReconnectInitialDelay;
-    while (!stop_token.stop_requested() && !stop_requested.load()) {
+    while (!stop_token.stop_requested() && !lifecycle_stopping.load()) {
       native_control_websocket_connection_attempts_total.fetch_add(
           1,
           std::memory_order_relaxed);
@@ -2099,7 +2227,7 @@ struct VehicleMediaRuntime::Impl {
         websocket.connect(
             signaling.native_control_websocket_url(),
             signaling.native_control_websocket_headers());
-        if (stop_token.stop_requested() || stop_requested.load()) break;
+        if (stop_token.stop_requested() || lifecycle_stopping.load()) break;
         native_control_websocket_connected.store(true, std::memory_order_relaxed);
         const auto connections =
             native_control_websocket_connections_total.fetch_add(
@@ -2115,7 +2243,7 @@ struct VehicleMediaRuntime::Impl {
         native_control_websocket_last_connected_at_ms.store(
             signaling.now_ms(),
             std::memory_order_relaxed);
-        while (!stop_token.stop_requested() && !stop_requested.load()) {
+        while (!stop_token.stop_requested() && !lifecycle_stopping.load()) {
           const auto received = websocket.receive_json(
               kNativeControlWebSocketReceiveTimeout);
           if (received.status == WebSocketReceiveStatus::Timeout) continue;
@@ -2136,15 +2264,15 @@ struct VehicleMediaRuntime::Impl {
         }
         native_control_websocket_connected.store(false, std::memory_order_relaxed);
       } catch (const std::invalid_argument& error) {
-        if (!stop_token.stop_requested() && !stop_requested.load()) {
+        if (!stop_token.stop_requested() && !lifecycle_stopping.load()) {
           note_native_control_transport_error(error.what(), true);
         }
       } catch (const std::exception& error) {
-        if (!stop_token.stop_requested() && !stop_requested.load()) {
+        if (!stop_token.stop_requested() && !lifecycle_stopping.load()) {
           note_native_control_transport_error(error.what(), false);
         }
       } catch (...) {
-        if (!stop_token.stop_requested() && !stop_requested.load()) {
+        if (!stop_token.stop_requested() && !lifecycle_stopping.load()) {
           note_native_control_transport_error(
               "unknown native control WebSocket failure",
               false);
@@ -2161,13 +2289,14 @@ struct VehicleMediaRuntime::Impl {
 
   void native_control_watchdog_loop(std::stop_token stop_token) noexcept {
     auto next_tick = std::chrono::steady_clock::now();
-    while (!stop_token.stop_requested() && !stop_requested.load()) {
+    while (!stop_token.stop_requested() && !lifecycle_stopping.load()) {
       const auto before_wait = std::chrono::steady_clock::now();
       if (before_wait < next_tick) std::this_thread::sleep_until(next_tick);
-      if (stop_token.stop_requested() || stop_requested.load()) break;
+      if (stop_token.stop_requested() || lifecycle_stopping.load()) break;
       next_tick += kNativeControlWatchdogInterval;
       native_control_watchdog_ticks_total.fetch_add(1, std::memory_order_relaxed);
       try {
+        check_local_relay_deadline();
         tick_control_service();
       } catch (...) {
         // tick_control_service owns its fail-safe shutdown and diagnostics.
@@ -2258,6 +2387,8 @@ struct VehicleMediaRuntime::Impl {
         {"driver_id", signaling.driver_id()},
         {"session_id", signaling.session_id()},
         {"control_status_seq", ++control_status_seq},
+        {"control_epoch",critical_camera_control_latch->control_epoch()},
+        {"media_attempt_id",media_attempt_id},
         {"command_seq", command_seq},
         {"intent_seq", intent_seq},
         {"accepted", false},
@@ -2283,6 +2414,8 @@ struct VehicleMediaRuntime::Impl {
     if (sequence == last_vehicle_telemetry_seq) return;
     auto payload_value = telemetry;
     payload_value["control_status_seq"] = ++control_status_seq;
+    payload_value["control_epoch"]=critical_camera_control_latch->control_epoch();
+    payload_value["media_attempt_id"]=media_attempt_id;
     const auto payload = payload_value.dump();
     gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
     last_vehicle_telemetry_seq = sequence;
@@ -2294,6 +2427,8 @@ struct VehicleMediaRuntime::Impl {
     auto message = result.to_json();
     message["event"] = "session_control_profile_status";
     message["control_status_seq"] = ++control_status_seq;
+    message["control_epoch"]=critical_camera_control_latch->control_epoch();
+    message["media_attempt_id"]=media_attempt_id;
     if (control_service_started && control_service) {
       message["hard_limits"] = control_service->control_limits();
       message["session_control_profile"] =
@@ -2334,11 +2469,14 @@ struct VehicleMediaRuntime::Impl {
       }
       Json message = {
           {"event", "vcu_handshake_status"},
+          {"control_epoch",critical_camera_control_latch->control_epoch()},
           {"protocol_version", kProtocolVersion},
           {"vehicle_id", config.vehicle_id},
           {"driver_id", signaling.driver_id()},
           {"session_id", signaling.session_id()},
           {"control_status_seq", ++control_status_seq},
+        {"control_epoch",critical_camera_control_latch->control_epoch()},
+        {"media_attempt_id",media_attempt_id},
           {"sent_at_utc_ms", signaling.now_ms()},
           {"driver_connected", true},
           {"result", result},
@@ -2396,6 +2534,7 @@ struct VehicleMediaRuntime::Impl {
     GstWebRTCDataChannel* channel_to_close = nullptr;
     {
       std::lock_guard lock(control_mutex);
+      critical_camera_control_latch->revoke_input();
       control_service_issue_code = "critical_camera_failed";
       invalidate_native_control_trusted_gear_locked();
       if (control_service_started && control_service) {
@@ -2460,35 +2599,17 @@ struct VehicleMediaRuntime::Impl {
   }
 
   [[nodiscard]] bool critical_cameras_ready() const {
-    return std::all_of(lanes.begin(), lanes.end(), [&](const auto& lane) {
-      const auto last_encoded_ms = lane->last_encoded_steady_ms.load();
-      return !lane->camera.critical_for_control ||
-          (!lane->disabled.load() && camera_encoded_frame_fresh(
-              last_encoded_ms, steady_now_ms(), frame_timeout_ms));
-    });
+    return health.stale(steady_now_ms(),frame_timeout_ms,true).empty();
   }
 
   void enforce_critical_camera_freshness() {
-    if (!config.runtime.control_enabled || stop_requested || control_inhibited) return;
-    const auto now_ms = steady_now_ms();
-    // Admission can wait for capture/encoder/WebRTC startup without granting
-    // control. Once CAN starts, the original running watchdog always applies.
-    const bool startup_grace = critical_camera_control_latch->startup_grace_active(
-        signaling.session_id(), now_ms);
-    for (const auto& lane : lanes) {
-      if (!lane->camera.critical_for_control || lane->disabled.load()) continue;
-      const auto last_encoded_ms = lane->last_encoded_steady_ms.load();
-      const auto freshness_reference_ms = last_encoded_ms > 0
-          ? last_encoded_ms
-          : lane->pipeline_started_steady_ms;
-      if (freshness_reference_ms <= 0 || now_ms - freshness_reference_ms <= frame_timeout_ms) continue;
-      if (startup_grace) continue;
-      if (stop_requested) return;
-      inhibit_control_for_critical_camera(
-          *lane,
-          "critical camera encoded output has been stale for more than " +
-              std::to_string(frame_timeout_ms) + " ms");
-      return;
+    if(!config.runtime.control_enabled||stop_requested||control_inhibited)return;
+    const auto now=steady_now_ms();
+    if(critical_camera_control_latch->startup_grace_active(signaling.session_id(),now))return;
+    const auto failure=health.stale(now,frame_timeout_ms,false);
+    if(failure.empty())return;
+    for(auto* lane:capture_lanes())if(lane->camera.critical_for_control&&failure.starts_with(lane->camera.id+":")){
+      inhibit_control_for_critical_camera(*lane,failure);return;
     }
   }
 
@@ -2519,28 +2640,32 @@ struct VehicleMediaRuntime::Impl {
     }
   }
 
-  [[nodiscard]] bool start_control_service() {
+  [[nodiscard]] bool start_control_service(bool parking_only=false) {
     if (!config.runtime.control_enabled) return false;
     try {
       {
         std::lock_guard lock(control_mutex);
+        if (control_service && (control_service->safety_state()==SafetyState::Estop || control_service->safety_state()==SafetyState::Fault)) {
+          control_service_issue_code="latched_fault_requires_existing_reset";
+          return false;
+        }
         if (control_service_started && control_service) return true;
         // The on-open callback can race session teardown.  Recheck lifecycle
         // state while holding the same mutex used by stop_pipeline before
         // opening CAN, otherwise a late callback could resurrect the adapter
         // after the session has already closed.
-        if (stop_requested || !control_link_open || control_channel == nullptr) {
+        if (lifecycle_stopping || (stop_requested && !parking_only) || (!parking_only && (!control_link_open || control_channel == nullptr))) {
           return false;
         }
         if (control_inhibited) {
           control_service_issue_code = "critical_camera_failed";
           return false;
         }
-        if (!critical_cameras_ready()) {
+        if (!parking_only && !critical_cameras_ready()) {
           control_service_issue_code = "critical_camera_not_ready";
           return false;
         }
-        if (!critical_camera_control_latch->arm_for_control(signaling.session_id())) {
+        if (!parking_only && !critical_camera_control_latch->arm_for_control(signaling.session_id())) {
           control_service_issue_code = "critical_camera_failed";
           return false;
         }
@@ -2556,7 +2681,7 @@ struct VehicleMediaRuntime::Impl {
         // A critical camera can fail while a vendor adapter is synchronously
         // opening.  The latch is set before it waits for this mutex, so check
         // again before publishing the adapter as ready or accepting commands.
-        if (stop_requested || control_inhibited) {
+        if (lifecycle_stopping || (stop_requested && !parking_only) || control_inhibited) {
           try {
             control_service->close(
                 control_inhibited
@@ -2677,9 +2802,36 @@ struct VehicleMediaRuntime::Impl {
     }
   }
 
+  void request_quiesce(const Json& request){
+    if(lifecycle_stopping)return;
+    if(request.value("media_attempt_id","")!=media_attempt_id||request.value("control_epoch",std::uint64_t{0})!=critical_camera_control_latch->control_epoch())return;
+    const auto mode=request.value("mode",config.surround.mode),profile=request.value("profile",config.surround.profile);
+    if((mode!="full"&&mode!="two")||(profile!="720p"&&profile!="540p")||request.value("request_id","").empty())return;
+    if(!control_inhibited)static_cast<void>(start_control_service(true));
+    std::lock_guard lock(control_mutex);
+    if(control_service && (control_service->safety_state()==SafetyState::Estop||control_service->safety_state()==SafetyState::Fault)){queue_signal("media_quiesce_ack",{{"request_id",request.at("request_id")},{"parked",false},{"control_epoch",critical_camera_control_latch->control_epoch()},{"reason","latched_fault_requires_existing_reset"}});return;}
+    if(!control_service_started||!control_service){queue_signal("media_quiesce_ack",{{"request_id",request.at("request_id")},{"parked",false},{"reason","vehicle_feedback_unavailable"}});return;}
+    control_quiescing=true;critical_camera_control_latch->revoke_input();invalidate_native_control_trusted_gear_locked();
+    native_control_command_freshness_cutoff_at_ms=signaling.now_ms();
+    control_service->disconnect_vcu_handshake();
+    quiesce_request=request;quiesce_deadline=steady_now_ms()+10000;
+  }
+  void check_quiesce(){
+    std::lock_guard lock(control_mutex);
+    if(quiesce_request.is_null()||!control_service)return;
+    const auto handshake=control_service->vcu_handshake_status();
+    const auto& history=control_service->telemetry_history();
+    bool fresh=false;
+    if(!history.empty()){const auto& last=history.back();const auto age=signaling.now_ms()-last.value("sent_at_utc_ms",std::int64_t{0});fresh=age>=0&&age<=std::min(200,config.field_safety.speed_feedback_timeout_ms)&&!last.value("estop",false)&&last.value("can_feedback",Json::object()).value("feedback_fresh",false);}
+    const bool parked=fresh&&handshake.speed_valid&&std::abs(handshake.speed_mps)<=.1&&handshake.parking_ready&&!handshake.ready&&!handshake.requested&&!handshake.disarming&&handshake.handshake_valid;
+    if(!parked&&steady_now_ms()<quiesce_deadline)return;
+    queue_signal("media_quiesce_ack",{{"request_id",quiesce_request.at("request_id")},{"parked",parked},{"control_epoch",critical_camera_control_latch->control_epoch()},{"reason",parked?"vehicle_confirmed_parked":"parking_feedback_not_confirmed"}});
+    if(parked){config.surround.mode=quiesce_request.value("mode",config.surround.mode);config.surround.profile=quiesce_request.value("profile",config.surround.profile);critical_camera_control_latch->confirm_parked_rebuild();media_rebuild_requested=true;}
+    quiesce_request=nullptr;
+  }
   void tick_control_service() {
     std::unique_lock lock(control_mutex);
-    if (stop_requested || control_inhibited || !control_service_started || !control_service) return;
+    if (lifecycle_stopping || (stop_requested && !control_quiescing) || control_inhibited || !control_service_started || !control_service) return;
     const auto timestamp_ms = signaling.now_ms();
     try {
       control_service->tick(timestamp_ms);
@@ -2770,6 +2922,7 @@ struct VehicleMediaRuntime::Impl {
             });
           };
           std::vector<VideoCodec> result;
+          if(config.surround.mode!="full"&&supports(VideoCodec::H264))return {VideoCodec::H264};
           if (supports(preferred)) result.push_back(preferred);
           if (fallback != preferred && supports(fallback)) result.push_back(fallback);
           if (!result.empty()) return result;
@@ -2795,37 +2948,23 @@ struct VehicleMediaRuntime::Impl {
       const auto payloader = encoder.codec() == VideoCodec::H265 ? "rtph265pay" : "rtph264pay";
       const auto encoding_name = encoder.codec() == VideoCodec::H265 ? "H265" : "H264";
       const auto elementary_caps = encoder.codec() == VideoCodec::H265 ? "video/x-h265" : "video/x-h264";
-      const auto recording_stream_format = encoder.codec() == VideoCodec::H265 ? "hvc1" : "avc";
       VideoEncoderSettings settings{lane->profile.bitrate_kbps, std::max(1, lane->profile.fps)};
       pipeline_text
           << build_camera_input_pipeline("source_" + id, lane->input, lane->profile)
           << "! " << encoder.pipeline_stage(settings, "encoder_" + id) << ' '
           << "! " << parser << " config-interval=-1 "
-          << "! " << elementary_caps << ",stream-format=byte-stream,alignment=au "
+          << "! " << elementary_caps << ",stream-format=byte-stream,alignment=au"
+          << (encoder.codec()==VideoCodec::H264 ? ",level=(string)"+h264_level_name(minimum_h264_level_idc(lane->profile.width,lane->profile.height,lane->profile.fps))+" " : "") << ' '
+          << "! valve name=gate_" << id << " drop=" << (media_admission_ready?"false":"true") << " drop-mode=transform-to-gap "
           << "! tee name=encoded_" << id << ' '
+
           << "encoded_" << id << ". ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream "
           << "! " << payloader << " name=pay_" << id << " config-interval=-1 pt=" << payload_type << ' '
-          << "! application/x-rtp,media=video,encoding-name=" << encoding_name << ",payload=" << payload_type
+          << "! capsfilter name=rtp_caps_" << id << " caps=\"application/x-rtp,media=video,encoding-name=" << encoding_name << ",payload=" << payload_type
           << (encoder.codec() == VideoCodec::H265
                   ? ",profile-id=(string)1,tier-flag=(string)0,tx-mode=(string)SRST"
                   : "")
-          << " ! webrtc. ";
-      if (!recording_root.empty() && !lane->camera.record_profile.empty()) {
-        const auto& record_profile = config.record_profile(lane->camera.record_profile);
-        const auto directory = recording_root / config.vehicle_id / signaling.session_id() / lane->camera.id;
-        std::filesystem::create_directories(directory);
-        const auto pattern = directory / (std::to_string(signaling.now_ms()) + "_" + lane->camera.id + "_%05d.mp4");
-        pipeline_text
-            << "encoded_" << id << ". ! queue max-size-buffers="
-            << std::max(2, lane->profile.fps * 2)
-            << " max-size-bytes=0 max-size-time=0 leaky=downstream "
-            << "! " << parser << " config-interval=-1 "
-            << "! " << elementary_caps << ",stream-format=" << recording_stream_format << ",alignment=au "
-            << "! splitmuxsink name=recorder_" << id
-            << " muxer-factory=mp4mux async-finalize=true max-size-time="
-            << static_cast<std::int64_t>(record_profile.segment_seconds) * GST_SECOND
-            << " location=" << quote_pipeline(pattern.string()) << ' ';
-      }
+          << "\" ! webrtc. ";
       ++payload_type;
     }
     return pipeline_text.str();
@@ -2886,15 +3025,120 @@ struct VehicleMediaRuntime::Impl {
   }
 
   void prepare_lanes() {
-    lanes.clear();
+    lanes.clear();inputs.clear();surround_renderer.reset();
+    two_stream=false;calibration.reset();
+    if(!config.surround.diagnostic_partition&&!config.surround.calibration_file.empty()) {
+      try{calibration=load_surround_calibration(config.surround.calibration_file,config);
+        const auto& approved=calibration->document.at("acceptance");
+        if(approved.at("vehicle_environment")!=media_environment(config,active_candidate))throw std::runtime_error("vehicle CPU/driver/GStreamer/encoder baseline changed; repeat phase-one qualification");
+        if(config.surround.max_skew_ms==0)config.surround.max_skew_ms=approved.at("timing").at("hard_max_skew_ms").get<int>();
+        if(config.surround.max_frame_age_ms>approved.at("timing").at("max_frame_age_ms").get<int>())throw std::runtime_error("configured age exceeds measured admission limit");
+        if(config.surround.max_skew_ms>approved.at("timing").at("hard_max_skew_ms").get<int>())throw std::runtime_error("configured alignment limit exceeds the measured admission limit");
+        two_stream=config.surround.mode!="full";}
+      catch(const std::exception& error){if(config.surround.mode=="two")throw;emit_diagnostic("vehicle_surround_unavailable","calibration_not_qualified","calibration",error.what(),"Complete calibration and field acceptance before enabling two-stream driving.",false);}
+    }
+    if(config.surround.diagnostic_partition){
+      if(config.runtime.control_enabled||config.field_safety.commissioning_mode!="bench")throw std::runtime_error("diagnostic partition is prohibited for driving");
+      two_stream=true;config.surround.max_skew_ms=40;
+    }
+    if(config.surround.mode=="two"&&!two_stream)throw std::runtime_error("two-stream mode requires accepted calibration");
+    std::vector<std::string> critical;
     for (const auto& camera : config.enabled_cameras()) {
       auto lane = std::make_unique<Lane>();
       lane->owner = this;
       lane->camera = camera;
       lane->profile = config.realtime_profile(camera.realtime_profile);
       lane->input = camera_input_spec(camera, lane->profile);
+      if(camera.critical_for_control)critical.push_back(camera.id);
       lanes.push_back(std::move(lane));
     }
+    health.reset(critical,steady_now_ms());
+    if(two_stream) {
+      const std::array<std::string,6> ids{"drive_front","drive_rear","fish_front","fish_rear","fish_left","fish_right"};
+      for(const auto& id:ids)if(std::none_of(lanes.begin(),lanes.end(),[&](const auto& x){return x->camera.id==id&&x->camera.critical_for_control;}))throw std::runtime_error("two-stream mode requires six critical cameras: "+id);
+      if(lanes.size()!=6)throw std::runtime_error("two-stream mode requires exactly six configured inputs");
+      inputs=std::move(lanes);lanes.clear();
+      const bool low=config.surround.profile=="540p";
+      for(int i=0;i<2;++i){auto lane=std::make_unique<Lane>();lane->owner=this;
+        lane->camera.id=i?(config.surround.diagnostic_partition?"fish_diagnostic":"surround_bev"):"drive_mosaic";lane->camera.critical_for_control=true;
+        lane->profile=config.realtime_profile(inputs.front()->camera.realtime_profile);
+        lane->profile.width=i?(low?384:512):(low?960:1280);
+        lane->profile.height=i?(low?672:896):(low?1080:1440);
+        lane->profile.fps=i?20:30;lane->profile.bitrate_kbps=i?(low?800:1200):(low?1400:2800);
+        if(config.surround.diagnostic_partition){lane->profile.width=i?2560:1280;lane->profile.height=1440;lane->profile.fps=30;lane->profile.bitrate_kbps=i?6000:3000;}
+        lane->input={"rgba",lane->profile.width,lane->profile.height,lane->profile.fps};
+        lanes.push_back(std::move(lane));
+      }
+      if(!config.surround.diagnostic_partition)surround_renderer=std::make_unique<surround::Renderer>(calibration->cameras,calibration->region,
+          calibration->vehicle_length,calibration->vehicle_width,lanes[1]->profile.width,lanes[1]->profile.height);
+    }
+  }
+
+  std::vector<Lane*> capture_lanes() const {
+    std::vector<Lane*> out;for(const auto& l:two_stream?inputs:lanes)out.push_back(l.get());return out;
+  }
+  SourceFrameIdentity identity(const EncodedFrame& f) const {
+    return {f.camera_id,f.seq,f.captured_steady_ms,true,f.source_generation,
+      f.exposure_time_trusted?"v4l2_soe":((f.v4l2_timestamp_flags&V4L2_BUF_FLAG_TIMESTAMP_MASK)==V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC?"v4l2_eof":"read_completion"),f.read_started_steady_ms,f.read_finished_steady_ms};
+  }
+  void push_frame(Lane& lane,const EncodedFrame& frame,std::vector<SourceFrameIdentity> used,bool healthy_frame,Json stages=Json::object()) {
+    GstBuffer* buffer=gst_buffer_new_allocate(nullptr,frame.payload.size(),nullptr);
+    if(!buffer)throw std::runtime_error("cannot allocate composed frame");
+    gst_buffer_fill(buffer,0,frame.payload.data(),frame.payload.size());
+    const auto pts=GstClockTime(std::max<std::int64_t>(0,frame.captured_steady_ms-lane.pipeline_started_steady_ms))*GST_MSECOND;
+    GST_BUFFER_PTS(buffer)=pts;GST_BUFFER_DTS(buffer)=GST_CLOCK_TIME_NONE;
+    GST_BUFFER_DURATION(buffer)=GST_SECOND/GstClockTime(lane.input.fps);
+    {std::lock_guard lock(lane.frame_mutex);lane.provenance[pts]={std::move(used),healthy_frame,std::move(stages)};while(lane.provenance.size()>32)lane.provenance.erase(lane.provenance.begin());}
+    const auto flow=gst_app_src_push_buffer(GST_APP_SRC(lane.appsrc),buffer);
+    if(flow!=GST_FLOW_OK&&!stop_requested)throw std::runtime_error("composite appsrc rejected frame");
+    ++lane.pushed;++lane.captured;lane.last_capture_ms=frame.captured_at_ms;
+  }
+  void start_compositors() {
+    if(!two_stream)return;
+    for(unsigned index=0;index<2;++index){auto* lane=lanes[index].get();lane->thread=std::thread([this,lane,index]{
+      const std::vector<std::string> ids=index?std::vector<std::string>{"fish_front","fish_rear","fish_left","fish_right"}:std::vector<std::string>{"drive_front","drive_rear"};
+      const auto interval=std::chrono::nanoseconds(1000000000/lane->profile.fps);auto deadline=std::chrono::steady_clock::now();
+      while(!stop_requested){try{
+        const auto alignment_started=steady_now_ms();
+        std::array<std::shared_ptr<const EncodedFrame>,4> frames{};std::array<surround::Image,4> images{};
+        std::vector<SourceFrameIdentity> used;unsigned mask=0;
+        if(index){
+          const auto wait_until=steady_now_ms()+(config.surround.diagnostic_partition?20:calibration->document.at("acceptance").at("timing").at("alignment_wait_ms").get<int>());
+          do {
+            std::array<std::vector<std::shared_ptr<const EncodedFrame>>,4> histories;
+            for(unsigned i=0;i<4;++i){auto it=std::find_if(inputs.begin(),inputs.end(),[&](const auto& x){return x->camera.id==ids[i];});
+              std::lock_guard lock((*it)->frame_mutex);histories[i].assign((*it)->history.begin(),(*it)->history.end());}
+            std::int64_t best=0;
+            for(unsigned bits=0;bits<16;++bits){std::int64_t lo=std::numeric_limits<std::int64_t>::max(),hi=0;bool valid=true;
+              std::array<std::shared_ptr<const EncodedFrame>,4> group;
+              for(unsigned i=0;i<4;++i){auto choice=(bits>>i)&1u;if(choice>=histories[i].size()){valid=false;break;}
+                group[i]=histories[i][choice];const auto stamp=group[i]->captured_steady_ms;
+                if(stamp<=0||steady_now_ms()-stamp>config.surround.max_frame_age_ms){valid=false;break;}lo=std::min(lo,stamp);hi=std::max(hi,stamp);}
+              if(valid&&hi-lo<=config.surround.max_skew_ms&&lo>best){frames=group;best=lo;}}
+            if(best||stop_requested||steady_now_ms()>=wait_until)break;
+            std::unique_lock lock(alignment_mutex);alignment_cv.wait_for(lock,std::chrono::milliseconds(2));
+          }while(true);
+        }
+        const auto now=steady_now_ms();
+        for(unsigned i=0;i<ids.size();++i){if(!index){auto it=std::find_if(inputs.begin(),inputs.end(),[&](const auto& x){return x->camera.id==ids[i];});
+            std::lock_guard lock((*it)->frame_mutex);frames[i]=(*it)->latest;}
+          if(!frames[i])continue;
+          const auto& f=*frames[i];
+          images[i]={reinterpret_cast<const std::uint8_t*>(f.payload.data()),f.width,f.height,std::size_t(f.width)*(f.codec=="uyvy"?2:4),f.codec=="uyvy"?surround::Format::Uyvy:surround::Format::Rgba};
+          if(f.captured_steady_ms>0&&now>=f.captured_steady_ms&&now-f.captured_steady_ms<=config.surround.max_frame_age_ms){mask|=1u<<i;used.push_back(identity(f));}
+        }
+        bool healthy_frame=used.size()==ids.size()&&health.composed(index,used,now,config.surround.max_frame_age_ms,index?config.surround.max_skew_ms:100);
+        EncodedFrame result;result.camera_id=lane->camera.id;result.codec="rgba";result.width=lane->profile.width;result.height=lane->profile.height;result.captured_at_ms=signaling.now_ms();result.captured_steady_ms=now;
+        result.payload.assign(std::size_t(result.width)*result.height*4,char(0));auto* rgba=reinterpret_cast<std::uint8_t*>(result.payload.data());
+        if(index&&config.surround.diagnostic_partition){
+          for(unsigned i=0;i<4;++i)if(mask&(1u<<i))surround::resize_into(images[i],rgba+((i/2)*std::size_t(result.height/2)*result.width+(i%2)*(result.width/2))*4,result.width/2,result.height/2,std::size_t(result.width)*4);
+        }else if(index){if(!healthy_frame)mask=0;surround_renderer->render(images,mask,rgba);}
+        else for(unsigned i=0;i<2;++i)if(mask&(1u<<i))surround::resize_into(images[i],rgba+std::size_t(i)*result.width*(result.height/2)*4,result.width,result.height/2,std::size_t(result.width)*4);
+        push_frame(*lane,result,std::move(used),healthy_frame,{{"alignment_started_steady_ms",alignment_started},{"composition_started_steady_ms",now},{"composition_finished_steady_ms",steady_now_ms()}});
+      }catch(const std::exception& error){if(!stop_requested)inhibit_control_for_critical_camera(*lane,error.what());}
+      deadline+=interval;auto now=std::chrono::steady_clock::now();if(deadline<now)deadline=now;std::this_thread::sleep_until(deadline);
+      }
+    });}
   }
 
   [[nodiscard]] std::unique_ptr<CameraFrameSource> create_camera_source(const Lane& lane) const {
@@ -2927,13 +3171,27 @@ struct VehicleMediaRuntime::Impl {
       pipeline_operator_action.clear();
       pipeline_error_retryable = false;
     }
-    stop_requested = false;
+    lifecycle_stopping=false;stop_requested = false;control_quiescing=false;
+    offer_started=false;offer_requested=false;
+    relay_path_invalid=false;relay_fault_stopped=false;
+    media_attempt_id=random_token(16);
     local_ice_candidate_count = 0;
     remote_ice_candidate_count = 0;
     answer_received_at_ms.reset();
     control_not_open_warning_fired = false;
     control_link_opened_this_attempt = false;
+    if(!critical_camera_control_latch->rebuild_allowed()){
+      set_pipeline_error("vehicle parking acknowledgement required for media rebuild","media_quiesce_required","media_rebuild","Request vehicle-confirmed parking/disarm before retrying media.",false);return false;
+    }
+    media_rebuild_requested=false;
     prepare_lanes();
+    relay_lease=Json::object();relay_confirmed=false;relay_activated=false;relay_released=false;
+    relay_deadline=0;relay_terminal=false;selected_transport=0;direct_since=0;driver_direct_health_until=0;last_relay_renew=0;media_admission_ready=true;
+    try{relay_lease=signaling.relay("request",{{"media_attempt_id",media_attempt_id},{"profile",two_stream&&!config.surround.diagnostic_partition?(config.surround.profile=="540p"?"two-540p":"two-720p"):"full"}});
+      if(relay_lease.value("approved",false)){media_admission_ready=false;relay_deadline=steady_now_ms()+15000;}
+      else emit_diagnostic("vehicle_relay_denied","relay_admission_denied","relay_admission",relay_lease.value("reason",""),"Direct ICE remains available; relay needs capacity and a qualified profile.",false);
+    }catch(const std::exception& error){emit_diagnostic("vehicle_relay_unavailable","relay_admission_unavailable","relay_admission",error.what(),"Direct ICE remains available.",true);}
+    ice_configuration=signaling.ice_servers();
     auto encoder_choice = create_video_encoder(candidate);
     if (encoder_choice->factory_name().empty()) {
       set_pipeline_error(
@@ -3021,8 +3279,14 @@ struct VehicleMediaRuntime::Impl {
       }
       GstPad* encoder_src = gst_element_get_static_pad(lane->encoder, "src");
       if (encoder_src != nullptr) {
-        gst_pad_add_probe(encoder_src, GST_PAD_PROBE_TYPE_BUFFER, count_encoded, lane.get(), nullptr);
+        gst_pad_add_probe(encoder_src,static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER|GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM), count_encoded, lane.get(), nullptr);
         gst_object_unref(encoder_src);
+      }
+      if(config.runtime.media_frame_trace){
+        auto* pay=gst_bin_get_by_name(GST_BIN(pipeline),("pay_"+pipeline_identifier(lane->camera.id)).c_str());
+        auto* src=pay?gst_element_get_static_pad(pay,"src"):nullptr;
+        if(src){gst_pad_add_probe(src,static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER|GST_PAD_PROBE_TYPE_BUFFER_LIST),trace_rtp,lane.get(),nullptr);gst_object_unref(src);}
+        if(pay)gst_object_unref(pay);
       }
     }
 
@@ -3038,11 +3302,11 @@ struct VehicleMediaRuntime::Impl {
       return false;
     }
     started_ms = signaling.now_ms();
-    for (const auto& lane : lanes) {
+    for (auto* lane : capture_lanes()) {
       lane->pipeline_started_ms = started_ms;
       lane->pipeline_started_steady_ms = steady_now_ms();
-      lane->thread = std::thread([this, lane = lane.get(), capture_interval_ms] {
-        std::uint64_t sequence = 0;
+      lane->thread = std::thread([this, lane, capture_interval_ms] {
+        std::uint64_t sequence = 0,wrap=0;std::uint32_t previous_source_sequence=0;bool sequence_seen=false;
         bool recovery_pending = false;
         const bool pace_test_source =
             classify_camera_source(lane->camera) == CameraSourceKind::TestSource &&
@@ -3053,7 +3317,7 @@ struct VehicleMediaRuntime::Impl {
         auto next_test_source_frame = std::chrono::steady_clock::now();
         while (!stop_requested) {
           try {
-            if (!lane->source) lane->source = create_camera_source(*lane);
+            if (!lane->source) {lane->source = create_camera_source(*lane);++lane->source_generation;wrap=0;sequence_seen=false;}
             if (pace_test_source) {
               const auto current = std::chrono::steady_clock::now();
               if (current < next_test_source_frame) {
@@ -3063,6 +3327,7 @@ struct VehicleMediaRuntime::Impl {
               }
             }
             auto frame = lane->source->next(++sequence);
+            frame.source_generation=lane->source_generation;
             if (stop_requested) break;
             if (classify_camera_source(lane->camera) == CameraSourceKind::Ccg2 &&
                 (frame.codec != lane->input.codec || frame.width != lane->input.width ||
@@ -3136,15 +3401,38 @@ struct VehicleMediaRuntime::Impl {
                    {"source_sequence_valid", frame.source_sequence_valid},
                    {"source_sequence", frame.source_sequence},
                    {"source_sequence_gap", frame.source_sequence_gap},
+                   {"v4l2_timestamp_us",frame.v4l2_timestamp_us},{"v4l2_timestamp_flags",frame.v4l2_timestamp_flags},
+                   {"exposure_time_trusted",frame.exposure_time_trusted},{"read_started_steady_ms",frame.read_started_steady_ms},{"read_finished_steady_ms",frame.read_finished_steady_ms},
                    {"source_timeperframe_numerator", frame.source_timeperframe_numerator},
                    {"source_timeperframe_denominator", frame.source_timeperframe_denominator},
                    {"sequence", sequence}});
             }
+            auto source_identity=identity(frame);
+            if(frame.source_sequence_valid){if(sequence_seen&&frame.source_sequence<previous_source_sequence&&std::uint32_t(frame.source_sequence-previous_source_sequence)<=0x7fffffffU)wrap+=std::uint64_t{1}<<32;sequence_seen=true;previous_source_sequence=frame.source_sequence;source_identity.sequence=wrap+frame.source_sequence;frame.seq=source_identity.sequence;}
+            bool timing_valid=true;
+            if(two_stream&&!config.surround.diagnostic_partition&&lane->camera.id.starts_with("fish_")){
+              const auto basis=calibration->document.at("acceptance").at("timing").at("age_basis").get<std::string>();
+              timing_valid=source_identity.time_quality==basis;
+            }
+            const bool raw_valid=timing_valid&&health.captured(source_identity,steady_now_ms());
+            if(!two_stream&&!raw_valid){++lane->dropped;continue;}
+            if(two_stream){
+              if(!raw_valid)frame.captured_steady_ms=0;
+              if(frame.codec!="uyvy"){frame.payload=decode_frame_rgba(frame);frame.codec="rgba";}
+              {std::lock_guard lock(lane->frame_mutex);lane->latest=std::make_shared<EncodedFrame>(std::move(frame));
+                if(!raw_valid)lane->history.clear();
+                else {lane->history.push_back(lane->latest);while(lane->history.size()>2)lane->history.pop_front();}}
+              alignment_cv.notify_all();
+              if(pace_test_source)next_test_source_frame+=test_source_interval;
+              if(capture_interval_ms>0)std::this_thread::sleep_for(std::chrono::milliseconds(capture_interval_ms));
+              continue;
+            }
             GstBuffer* buffer = gst_buffer_new_allocate(nullptr, frame.payload.size(), nullptr);
             if (buffer == nullptr) throw std::runtime_error("cannot allocate GStreamer camera buffer");
             gst_buffer_fill(buffer, 0, frame.payload.data(), frame.payload.size());
-            const auto elapsed_ms = std::max<std::int64_t>(0, frame.captured_at_ms - started_ms);
+            const auto elapsed_ms = std::max<std::int64_t>(0, frame.captured_steady_ms - lane->pipeline_started_steady_ms);
             GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(elapsed_ms) * GST_MSECOND;
+            {std::lock_guard lock(lane->frame_mutex);lane->provenance[GST_BUFFER_PTS(buffer)]={{source_identity},raw_valid};while(lane->provenance.size()>32)lane->provenance.erase(lane->provenance.begin());}
             GST_BUFFER_DTS(buffer) = GST_CLOCK_TIME_NONE;
             GST_BUFFER_DURATION(buffer) = GST_SECOND / static_cast<GstClockTime>(std::max(1, lane->input.fps));
             if (recovered_this_frame) {
@@ -3248,6 +3536,7 @@ struct VehicleMediaRuntime::Impl {
         }
       });
     }
+    start_compositors();
     try {
       start_native_control_transport();
     } catch (const std::exception& error) {
@@ -3267,7 +3556,11 @@ struct VehicleMediaRuntime::Impl {
   }
 
   void stop_pipeline() {
-    stop_requested = true;
+    lifecycle_stopping=true;stop_requested = true;
+    if(webrtc)g_signal_handlers_disconnect_by_data(webrtc,this);
+    relay_deadline=0;
+    if(transport_stats.promise){gst_promise_interrupt(transport_stats.promise);gst_promise_unref(transport_stats.promise);transport_stats={};}
+    if(pipeline)critical_camera_control_latch->revoke_input();
     GstWebRTCDataChannel* channel_to_close = nullptr;
     {
       std::lock_guard lock(control_mutex);
@@ -3295,6 +3588,7 @@ struct VehicleMediaRuntime::Impl {
     // control_mutex, but neither can produce adapter output after the guarded
     // close/reset above. Join only after that fail-safe boundary has completed.
     stop_native_control_transport_threads();
+    if(relay_lease.value("approved",false)&&!relay_released){try{signaling.relay("release",{{"media_attempt_id",media_attempt_id}});}catch(...){}relay_released=true;}
     if (channel_to_close != nullptr) {
       g_signal_handlers_disconnect_by_data(channel_to_close, this);
       gst_webrtc_data_channel_close(channel_to_close);
@@ -3303,10 +3597,8 @@ struct VehicleMediaRuntime::Impl {
     // Let capture threads observe stop_requested and finish before EOS.  A
     // source may return its last frame while teardown is in progress; joining
     // first prevents a push-after-EOS race on appsrc.
-    for (const auto& lane : lanes) {
-      if (lane->thread.joinable()) lane->thread.join();
-      lane->source.reset();
-    }
+    for(auto* lane:capture_lanes()){if(lane->thread.joinable())lane->thread.join();lane->source.reset();}
+    if(two_stream)for(const auto& lane:lanes)if(lane->thread.joinable())lane->thread.join();
     if (pipeline != nullptr) {
       for (const auto& lane : lanes) {
         if (lane->appsrc != nullptr) gst_app_src_end_of_stream(GST_APP_SRC(lane->appsrc));
@@ -3320,6 +3612,9 @@ struct VehicleMediaRuntime::Impl {
       }
       gst_element_set_state(pipeline, GST_STATE_NULL);
     }
+#if GST_CHECK_VERSION(1,28,0)
+    if(auto* ice=tracked_ice.exchange(nullptr)){g_signal_handlers_disconnect_by_data(ice,this);gst_object_unref(ice);}
+#endif
     for (const auto& lane : lanes) {
       if (lane->appsrc != nullptr) {
         gst_object_unref(lane->appsrc);
@@ -3334,57 +3629,12 @@ struct VehicleMediaRuntime::Impl {
       gst_object_unref(webrtc);
       webrtc = nullptr;
     }
+    {std::lock_guard lock(description_mutex);for(auto* p:{&offer_description,&local_description,&remote_description})if(p->promise){gst_promise_interrupt(p->promise);gst_promise_unref(p->promise);*p={};}pending_remote_ice.clear();}
     if (pipeline != nullptr) {
       gst_object_unref(pipeline);
       pipeline = nullptr;
     }
-    try {
-      write_recording_sidecars();
-    } catch (const std::exception& error) {
-      emit_diagnostic(
-          "vehicle_recording_sidecar_failed",
-          "recording_sidecar_write_failed",
-          "recording_finalize",
-          error.what(),
-          "Check recording directory permissions, free space, and filesystem health.",
-          true);
-      throw;
-    }
-  }
-
-  void write_recording_sidecars() const {
-    const auto session_root = recording_root / config.vehicle_id / signaling.session_id();
-    if (recording_root.empty() || !std::filesystem::exists(session_root)) return;
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(session_root)) {
-      if (!entry.is_regular_file() || entry.path().extension() != ".mp4") continue;
-      auto metadata_path = entry.path();
-      metadata_path.replace_extension(".json");
-      if (std::filesystem::exists(metadata_path)) continue;
-      const auto camera_id = entry.path().parent_path().filename().string();
-      const auto segment_id = entry.path().stem().string();
-      const auto timestamp = signaling.now_ms();
-      const Json metadata = {
-          {"vehicle_id", config.vehicle_id},
-          {"session_id", signaling.session_id()},
-          {"camera_id", camera_id},
-          {"segment_id", segment_id},
-          {"started_at", iso_time(timestamp)},
-          {"ended_at", iso_time(timestamp)},
-          {"codec", to_string(active_candidate.codec)},
-          {"encoder", to_string(active_candidate.backend)},
-          {"upload_state", "pending"},
-          {"video_file", entry.path().filename().string()},
-          {"file_size_bytes", entry.file_size()},
-          {"video_sha256", sha256_file(entry.path())},
-      };
-      const auto temporary = metadata_path.string() + ".tmp";
-      {
-        std::ofstream output(temporary, std::ios::trunc);
-        if (!output) throw std::runtime_error("cannot write recording sidecar: " + metadata_path.string());
-        output << std::setw(2) << metadata << '\n';
-      }
-      std::filesystem::rename(temporary, metadata_path);
-    }
+    {std::lock_guard lock(signal_mutex);pending_signals.clear();}
   }
 
   void flush_outgoing_signals() {
@@ -3396,11 +3646,222 @@ struct VehicleMediaRuntime::Impl {
     for (const auto& [type, payload] : values) signaling.send(type, payload);
   }
 
+  struct DescriptionCompletion {std::atomic<bool> complete{false};bool success{false};};
+  struct PendingDescription {GstPromise* promise{nullptr};std::shared_ptr<DescriptionCompletion> completion;Json message;};
+  static void destroy_description_completion(gpointer p){delete static_cast<std::shared_ptr<DescriptionCompletion>*>(p);}
+  static void description_completed(GstPromise* promise,gpointer p){
+    const auto state=*static_cast<std::shared_ptr<DescriptionCompletion>*>(p);
+    if(gst_promise_wait(promise)==GST_PROMISE_RESULT_REPLIED){const auto* reply=gst_promise_get_reply(promise);state->success=!reply||!gst_structure_has_field(reply,"error");}
+    state->complete.store(true,std::memory_order_release);
+  }
+  void finish_descriptions(){
+    // GStreamer callbacks only complete promises. The media thread owns all
+    // SDP application and publication, so retired callbacks cannot mutate it.
+    if(!offer_started&&offer_requested&&media_admission_ready&&webrtc){
+      bool caps_ready=true;
+      for(const auto& lane:lanes){
+        if(!lane->encoded.load()){caps_ready=false;break;}
+        if(active_candidate.codec==VideoCodec::H264){
+          auto* pay=gst_bin_get_by_name(GST_BIN(pipeline),("pay_"+pipeline_identifier(lane->camera.id)).c_str());
+          auto* pad=pay?gst_element_get_static_pad(pay,"src"):nullptr;auto* caps=pad?gst_pad_get_current_caps(pad):nullptr;
+          const auto* sprop=caps?gst_structure_get_string(gst_caps_get_structure(caps,0),"sprop-parameter-sets"):nullptr;
+          const auto profile=h264_profile_level_id(sprop?sprop:"");
+          if(profile.empty())caps_ready=false;
+          else {
+            lane->actual_h264_level=int(std::strtoul(profile.c_str(),nullptr,16)&255);
+            if(lane->actual_h264_level<minimum_h264_level_idc(lane->profile.width,lane->profile.height,lane->profile.fps)){
+              caps_ready=false;set_pipeline_error("actual RTP H.264 SPS level is insufficient","h264_encoder_level_insufficient","encoder_qualification","Use a qualified encoder or parked full preview.",false);
+            }else{
+              auto* filter=gst_bin_get_by_name(GST_BIN(pipeline),("rtp_caps_"+pipeline_identifier(lane->camera.id)).c_str());
+              auto* out=filter?gst_element_get_static_pad(filter,"src"):nullptr;auto* current=out?gst_pad_get_current_caps(out):nullptr;
+              const auto* advertised=current?gst_structure_get_string(gst_caps_get_structure(current,0),"profile-level-id"):nullptr;
+              if(!filter||!advertised||profile!=advertised){
+                caps_ready=false;auto* wanted=gst_caps_copy(caps);gst_caps_set_simple(wanted,"profile-level-id",G_TYPE_STRING,profile.c_str(),nullptr);if(filter)g_object_set(filter,"caps",wanted,nullptr);gst_caps_unref(wanted);
+              }
+              if(current)gst_caps_unref(current);
+              if(out)gst_object_unref(out);
+              if(filter)gst_object_unref(filter);
+            }
+          }
+          if(caps)gst_caps_unref(caps);
+          if(pad)gst_object_unref(pad);
+          if(pay)gst_object_unref(pay);
+        }
+      }
+      if(caps_ready&&active_candidate.codec==VideoCodec::H264){
+        GArray* transceivers=nullptr;g_signal_emit_by_name(webrtc,"get-transceivers",&transceivers);
+        caps_ready=transceivers&&transceivers->len==lanes.size();
+        if(caps_ready)for(unsigned i=0;i<transceivers->len;++i){
+          auto* filter=gst_bin_get_by_name(GST_BIN(pipeline),("rtp_caps_"+pipeline_identifier(lanes[i]->camera.id)).c_str());
+          auto* out=filter?gst_element_get_static_pad(filter,"src"):nullptr;
+          auto* preferences=out?gst_pad_get_current_caps(out):nullptr;
+          if(preferences)g_object_set(g_array_index(transceivers,GstWebRTCRTPTransceiver*,i),"codec-preferences",preferences,nullptr);
+          else caps_ready=false;
+          if(preferences)gst_caps_unref(preferences);
+          if(out)gst_object_unref(out);
+          if(filter)gst_object_unref(filter);
+        }
+        if(transceivers)g_array_unref(transceivers);
+      }
+      if(caps_ready){offer_started=true;offer_requested=false;
+        auto completion=std::make_shared<DescriptionCompletion>();auto* promise=gst_promise_new_with_change_func(description_completed,new std::shared_ptr<DescriptionCompletion>(completion),destroy_description_completion);
+        offer_description={promise,completion,Json{{"attempt",media_attempt_id}}};g_signal_emit_by_name(webrtc,"create-offer",nullptr,promise);
+      }
+    }
+    if(offer_description.promise&&offer_description.completion->complete.load(std::memory_order_acquire)){
+      auto pending=std::move(offer_description);offer_description={};
+      OfferContext context{this,webrtc,pending.message.at("attempt")};on_offer_created(pending.promise,&context);
+    }
+
+    std::lock_guard lock(description_mutex);
+    for(auto* pending:{&local_description,&remote_description}){
+      if(!pending->promise||!pending->completion->complete.load(std::memory_order_acquire))continue;
+      const bool remote=pending==&remote_description;
+      if(!pending->completion->success)set_pipeline_error("SDP description rejected","webrtc_sdp_set_failed","sdp","Inspect SDP and codec negotiation logs.",true);
+      else if(remote){answer_received=true;answer_received_at_ms=signaling.now_ms();
+        for(const auto& ice:pending_remote_ice)g_signal_emit_by_name(webrtc,"add-ice-candidate",ice.value("sdpMLineIndex",0U),ice.value("end_of_candidates",false)?nullptr:ice.value("candidate","").c_str());
+        remote_ice_candidate_count+=pending_remote_ice.size();pending_remote_ice.clear();
+        emit_diagnostic("vehicle_webrtc_answer_applied","webrtc_answer_applied","sdp","","Remote SDP completed; queued candidates applied.",true);
+      }else queue_signal(pending->message.at("type"),pending->message.at("payload"));
+      gst_promise_unref(pending->promise);*pending={};
+    }
+  }
+  void update_relay(){
+    if(!relay_lease.value("approved",false)||relay_released)return;
+    if(relay_terminal){signaling.relay("release",{{"media_attempt_id",media_attempt_id}});relay_released=true;return;}
+    const auto now=steady_now_ms();
+    if(now-last_relay_renew>=5000){
+      try{const auto state=signaling.relay("renew",{{"lease_id",relay_lease.at("lease_id")},{"media_attempt_id",media_attempt_id}});
+        if(relay_terminal.load()||steady_now_ms()>=relay_deadline.load())return;
+        relay_deadline=now+15000;last_relay_renew=now;
+        if(state.value("usage",Json::object()).value("over_budget",false)){
+          // Both initial profiles already use their qualified bitrate floor.
+          // Resolution/profile changes require parking rather than an unsafe
+          // unqualified downshift while driving.
+          stop_control_for_pipeline_fault("relay_budget_exceeded");
+          set_pipeline_error("relay sustained egress exceeds the accepted profile budget","relay_budget_exceeded","relay_budget","Park before selecting a different accepted profile.",false);return;
+        }
+      }catch(const std::exception& error){emit_diagnostic("vehicle_relay_renew_failed","relay_renew_failed","relay_lease",error.what(),"Local lease deadline remains authoritative.",true);last_relay_renew=now;}
+    }
+    if(!relay_confirmed&&critical_cameras_ready()){
+      double applied=0;
+      for(const auto& lane:lanes){
+        auto* spec=g_object_class_find_property(G_OBJECT_GET_CLASS(lane->encoder),"bitrate");
+        if(!spec)throw std::runtime_error("encoder has no readable bitrate policy");
+        GValue value=G_VALUE_INIT,number=G_VALUE_INIT;g_value_init(&value,spec->value_type);g_value_init(&number,G_TYPE_DOUBLE);
+        g_object_get_property(G_OBJECT(lane->encoder),"bitrate",&value);
+        const bool ok=g_value_transform(&value,&number);if(ok)applied+=g_value_get_double(&number)*1000;
+        g_value_unset(&number);g_value_unset(&value);if(!ok)throw std::runtime_error("encoder bitrate policy cannot be verified");
+      }
+      if(applied!=relay_lease.at("video_bps").get<double>())throw std::runtime_error("applied encoder policy differs from relay lease");
+      signaling.relay("confirm",{{"lease_id",relay_lease.at("lease_id")},{"media_attempt_id",media_attempt_id},{"policy_version",relay_lease.at("policy_version")},{"applied_video_bps",applied},{"healthy_encoded_frames",true}});
+      relay_confirmed=true;
+    }
+    if(relay_confirmed&&!relay_activated){
+      const auto ice=signaling.ice_servers(media_attempt_id);
+      if(ice.value("relay_lease_id","")!=relay_lease.value("lease_id",""))return;
+      ice_configuration=ice;configure_ice_servers();relay_activated=true;media_admission_ready=true;
+      for(const auto& lane:lanes){auto* valve=gst_bin_get_by_name(GST_BIN(pipeline),("gate_"+pipeline_identifier(lane->camera.id)).c_str());if(valve){g_object_set(valve,"drop",FALSE,nullptr);gst_object_unref(valve);}}
+      on_negotiation_needed(webrtc,this);
+    }
+    if(selected_transport.load()==1&&driver_direct_health_until>=now&&direct_since>0&&now-direct_since>=10000){signaling.relay("release",{{"media_attempt_id",media_attempt_id}});relay_released=true;relay_deadline=0;
+      emit_diagnostic("vehicle_relay_reclaim_started","relay_reclaim_started","relay_lease","","Direct media and control healthy for ten seconds; quota awaits allocation reclamation.",true);}
+  }
+  void check_local_relay_deadline(){
+    if(relay_path_invalid.load()&&!relay_fault_stopped.exchange(true)){
+      stop_control_for_pipeline_fault("relay_without_lease");
+      set_pipeline_error("relay selection has no current local qualification","relay_without_lease","relay_lease","Park and obtain a new media attempt before restoring relay.",false);
+    }
+    const auto deadline=relay_deadline.load();
+    if(deadline>0&&steady_now_ms()>=deadline&&!relay_terminal.exchange(true)){relay_deadline=0;
+      if(selected_transport.load()!=1){stop_control_for_pipeline_fault("relay_lease_expired");set_pipeline_error("local relay lease expired","relay_lease_expired","relay_lease","Restore admission and confirm vehicle parking before retrying.",false);}
+      // A proven direct transport keeps its authority; returning to relay
+      // after this terminal revocation requires parked admission.
+    }
+  }
+  static const GstStructure* stats_object(const GstStructure* root,const char* id){
+    if(!id)return nullptr;
+    const auto* v=gst_structure_get_value(root,id);
+    return v&&GST_VALUE_HOLDS_STRUCTURE(v)?gst_value_get_structure(v):nullptr;
+  }
+#if GST_CHECK_VERSION(1,28,0)
+  static void selected_pair_changed(GstWebRTCICETransport* ice,gpointer data){
+    auto* self=static_cast<Impl*>(data);if(self->stop_requested||ice!=self->tracked_ice)return;
+    GstWebRTCICEConnectionState state;g_object_get(ice,"state",&state,nullptr);
+    auto* pair=gst_webrtc_ice_transport_get_selected_candidate_pair(ice);
+    int path=0;
+    if(pair&&pair->local&&pair->remote&&pair->local->stats&&pair->remote->stats&&
+        (state==GST_WEBRTC_ICE_CONNECTION_STATE_CONNECTED||state==GST_WEBRTC_ICE_CONNECTION_STATE_COMPLETED)){
+      const auto* a=pair->local->stats->type;const auto* b=pair->remote->stats->type;
+      if(a&&b)path=(std::string_view(a)=="relay"||std::string_view(b)=="relay")?2:1;
+    }
+    if(pair)gst_webrtc_ice_candidate_pair_free(pair);
+    self->selected_transport=path;
+    if(path==2&&(!self->relay_activated.load()||self->relay_released.load()||self->relay_terminal.load()||
+         steady_now_ms()>=self->relay_deadline.load()))self->relay_path_invalid=true;
+  }
+  static void transport_state_changed(GstWebRTCICETransport* ice,GParamSpec*,gpointer data){selected_pair_changed(ice,data);}
+  void bind_transport_notifications(){
+    if(tracked_ice)return;
+    GArray* transceivers=nullptr;g_signal_emit_by_name(webrtc,"get-transceivers",&transceivers);
+    if(!transceivers)return;
+    for(unsigned i=0;i<transceivers->len&&!tracked_ice;++i){
+      auto* trans=g_array_index(transceivers,GstWebRTCRTPTransceiver*,i);
+      GstWebRTCRTPSender* sender=nullptr;GstWebRTCDTLSTransport* dtls=nullptr;GstWebRTCICETransport* ice=nullptr;
+      g_object_get(trans,"sender",&sender,nullptr);if(sender)g_object_get(sender,"transport",&dtls,nullptr);
+      if(dtls)g_object_get(dtls,"transport",&ice,nullptr);
+      if(sender)gst_object_unref(sender);
+      if(dtls)gst_object_unref(dtls);
+      if(ice){tracked_ice=ice;g_signal_connect(ice,"on-selected-candidate-pair-change",G_CALLBACK(selected_pair_changed),this);
+        g_signal_connect(ice,"notify::state",G_CALLBACK(transport_state_changed),this);selected_pair_changed(ice,this);}
+    }
+    g_array_unref(transceivers);
+  }
+#endif
+  void sample_transport(){
+    if(!webrtc||!answer_received)return;
+#if GST_CHECK_VERSION(1,28,0)
+    bind_transport_notifications();
+#endif
+    const auto now=steady_now_ms();
+    if(selected_transport.load()!=1||driver_direct_health_until<now)direct_since=0;
+    if(transport_stats.promise&&transport_stats.completion->complete.load(std::memory_order_acquire)){
+      bool selected=false,relay=false;const auto* reply=gst_promise_get_reply(transport_stats.promise);
+      if(reply)for(int i=0;i<gst_structure_n_fields(reply);++i){const auto* transport=stats_object(reply,gst_structure_nth_field_name(reply,i));if(!transport)continue;
+        const auto* pair=stats_object(reply,gst_structure_get_string(transport,"selected-candidate-pair-id"));if(!pair)continue;
+        const auto* local=stats_object(reply,gst_structure_get_string(pair,"local-candidate-id"));const auto* remote=stats_object(reply,gst_structure_get_string(pair,"remote-candidate-id"));
+        if(!local||!remote)continue;
+        const auto* lt=gst_structure_get_string(local,"candidate-type");const auto* rt=gst_structure_get_string(remote,"candidate-type");if(!lt||!rt)continue;
+        selected=true;relay=std::string_view(lt)=="relay"||std::string_view(rt)=="relay";
+        const auto path=std::string(lt)+"/"+rt;if(path!=selected_path){selected_path=path;emit_diagnostic("vehicle_ice_selected_pair","ice_selected_pair","ice_connectivity","","Actual transport selected candidate pair changed.",true,{{"local_type",lt},{"remote_type",rt},{"relay",relay}});}break;
+      }
+#if !GST_CHECK_VERSION(1,28,0)
+      selected_transport=selected?(relay?2:1):0;
+#endif
+      if(selected&&!relay&&control_link_open&&critical_cameras_ready()&&driver_direct_health_until>=now){if(!direct_since)direct_since=now;}else direct_since=0;
+      if(selected&&relay&&(!relay_activated||relay_released||relay_terminal.load())){stop_control_for_pipeline_fault("relay_without_lease");set_pipeline_error("selected relay has no current lease","relay_without_lease","relay_lease","Request a parked media restart.",false);}
+      gst_promise_unref(transport_stats.promise);transport_stats={};
+    }
+    if(!transport_stats.promise&&now-last_transport_stats>=1000){auto completion=std::make_shared<DescriptionCompletion>();auto* promise=gst_promise_new_with_change_func(description_completed,new std::shared_ptr<DescriptionCompletion>(completion),destroy_description_completion);transport_stats={promise,completion,Json{}};last_transport_stats=now;g_signal_emit_by_name(webrtc,"get-stats",nullptr,promise);}
+  }
   void process_signaling() {
-    const auto response = signaling.poll("webrtc_answer,ice_candidate,media_fallback");
+    finish_descriptions();
+    sample_transport();
+    update_relay();
+    const auto response = signaling.poll("webrtc_answer,ice_candidate,media_fallback,media_path_health");
     for (const auto& message : response.value("messages", Json::array())) {
       const auto type = message.value("type", "");
       const auto payload = message.value("payload", Json::object());
+      if(payload.value("media_attempt_id","")!=media_attempt_id)continue;
+      if(type=="media_path_health"){
+        bool all=payload.value("direct_selected",false)&&payload.value("control_data_channel_open",false)&&payload.value("control_epoch",std::uint64_t{0})==critical_camera_control_latch->control_epoch();
+        const auto reported=payload.value("healthy_stream_ids",Json::array());std::set<std::string> healthy;
+        if(!reported.is_array())all=false;
+        else for(const auto& id:reported){if(!id.is_string()){all=false;break;}healthy.insert(id.get<std::string>());}
+        for(const auto& lane:lanes)if(!healthy.contains(lane->camera.id))all=false;
+        driver_direct_health_until=all?steady_now_ms()+2500:0;if(!all)direct_since=0;
+        continue;
+      }
       if (type == "webrtc_answer") {
         const auto sdp_text = payload.value("sdp", "");
         GstSDPMessage* sdp = nullptr;
@@ -3416,17 +3877,27 @@ struct VehicleMediaRuntime::Impl {
               false);
           return;
         }
+        if(active_candidate.codec==VideoCodec::H264){
+          std::vector<MediaProfile> profiles;std::vector<int> levels;for(const auto& lane:lanes){profiles.push_back(lane->profile);levels.push_back(lane->actual_h264_level);}
+          if(!h264_answer_supports(sdp_text,profiles,levels)){
+            gst_sdp_message_free(sdp);
+            set_pipeline_error("controller SDP cannot receive the encoded H.264 canvas","h264_receive_level_insufficient","sdp","Use a qualified decoder/encoder pair or switch to full preview after parking.",false);return;
+          }
+        }
+
         auto* answer = gst_webrtc_session_description_new(GST_WEBRTC_SDP_TYPE_ANSWER, sdp);
-        GstPromise* promise = gst_promise_new();
-        g_signal_emit_by_name(webrtc, "set-remote-description", answer, promise);
-        gst_promise_interrupt(promise);
-        gst_promise_unref(promise);
+        auto completion=std::make_shared<DescriptionCompletion>();
+        GstPromise* promise=gst_promise_new_with_change_func(description_completed,
+          new std::shared_ptr<DescriptionCompletion>(completion),destroy_description_completion);
+        {std::lock_guard lock(description_mutex);
+          if(remote_description.promise){gst_promise_unref(promise);gst_webrtc_session_description_free(answer);continue;}
+          remote_description={promise,completion,Json{}};
+        }
+        g_signal_emit_by_name(webrtc,"set-remote-description",answer,promise);
         gst_webrtc_session_description_free(answer);
-        answer_received = true;
-        answer_received_at_ms = signaling.now_ms();
         emit_diagnostic(
-            "vehicle_webrtc_answer_applied",
-            "webrtc_answer_applied",
+            "vehicle_webrtc_answer_setting",
+            "webrtc_answer_setting",
             "webrtc_answer",
             "",
             "No action is required; wait for ICE/DTLS connection and video frames.",
@@ -3436,8 +3907,9 @@ struct VehicleMediaRuntime::Impl {
       } else if (type == "ice_candidate") {
         const auto candidate = payload.value("candidate", "");
         const auto index = payload.value("sdpMLineIndex", 0U);
-        if (!candidate.empty()) {
-          g_signal_emit_by_name(webrtc, "add-ice-candidate", index, candidate.c_str());
+        if (!candidate.empty()||payload.value("end_of_candidates",false)) {
+          if(!answer_received){if(pending_remote_ice.size()<512)pending_remote_ice.push_back(payload);continue;}
+          g_signal_emit_by_name(webrtc, "add-ice-candidate", index, candidate.empty()?nullptr:candidate.c_str());
           const auto count = ++remote_ice_candidate_count;
           if (count == 1) {
             emit_diagnostic(
@@ -3700,7 +4172,9 @@ struct VehicleMediaRuntime::Impl {
       codec_fallback_requested = false;
       const auto candidate = candidates[candidate_index];
       const auto attempt_started = signaling.now_ms();
-      if (!start_pipeline(candidate, capture_interval_ms)) {
+      bool pipeline_started=false;
+      try{pipeline_started=start_pipeline(candidate,capture_interval_ms);}catch(const std::exception& e){set_pipeline_error(e.what(),"media_profile_unsupported","media_profile","Keep parked; use full-mode preview or repeat encoder/calibration qualification.",false);}
+      if (!pipeline_started) {
         const auto error = current_pipeline_error();
         attempts.push_back({
             {"backend", to_string(candidate.backend)},
@@ -3709,7 +4183,9 @@ struct VehicleMediaRuntime::Impl {
             {"failure", current_pipeline_failure()},
             {"error", error}});
         errors.push_back(error);
+        const bool preview_fallback=two_stream&&!config.surround.diagnostic_partition&&config.surround.mode=="auto"&&critical_camera_control_latch->rebuild_allowed();
         stop_pipeline();
+        if(preview_fallback){config.surround.mode="full";emit_diagnostic("vehicle_media_profile_fallback","two_stream_unsupported","media_profile",error,"Full-mode preview selected; repeat two-stream qualification.",false);--candidate_index;continue;}
         if (candidate_index + 1 < candidates.size()) ++failover_count;
         continue;
       }
@@ -3721,6 +4197,10 @@ struct VehicleMediaRuntime::Impl {
         try {
           flush_outgoing_signals();
           process_signaling();
+        } catch (const HttpTransportError& error) {
+          if(!continuous)throw;
+          set_pipeline_error(error.what(),"session_signaling_transport_failed","session_signaling",
+              "Restore WSS and request vehicle-confirmed parking before rebuilding media.",true);
         } catch (const std::exception& error) {
           emit_diagnostic(
               "vehicle_media_signaling_failed",
@@ -3733,7 +4213,14 @@ struct VehicleMediaRuntime::Impl {
           throw;
         }
         poll_bus();
-        if (!current_pipeline_error().empty()) break;
+        check_quiesce();
+        if(media_rebuild_requested)break;
+        if(!current_pipeline_error().empty()){
+          if(!continuous||critical_camera_control_latch->rebuild_allowed())break;
+          queue_signal("media_status",{{"control_epoch",critical_camera_control_latch->control_epoch()},{"control_issue_code","media_quiesce_required"},{"failure",current_pipeline_failure()}});
+          try{flush_outgoing_signals();}catch(const HttpTransportError&){}
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));continue;
+        }
         enforce_critical_camera_freshness();
         start_control_when_cameras_ready();
         // The independent native-control watchdog thread owns the VCU tick;
@@ -3769,6 +4256,7 @@ struct VehicleMediaRuntime::Impl {
                {"backend", to_string(candidate.backend)},
                {"control_issue_code", control_inhibited.load() ? "critical_camera_failed" : ""},
                {"time_sync", signaling.time_sync_status().to_json()},
+               {"control_epoch",critical_camera_control_latch->control_epoch()},{"source_health",health.snapshot(steady_now_ms())},
                {"lanes", lane_metrics(std::max<std::int64_t>(1, signaling.now_ms() - attempt_started))}});
           next_media_status_ms = signaling.now_ms() + 1000;
         }
@@ -3799,10 +4287,13 @@ struct VehicleMediaRuntime::Impl {
                {"remote_ice_candidates", remote_ice_candidate_count.load()},
                {"safety_action", "local_full_stop"}});
         }
+        check_quiesce();
+        if(media_rebuild_requested)break;
         if (!current_pipeline_error().empty()) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
       }
       flush_outgoing_signals();
+      if(media_rebuild_requested){stop_pipeline();--candidate_index;continue;}
       const auto elapsed = std::max<std::int64_t>(1, signaling.now_ms() - attempt_started);
       final_lanes = lane_metrics(elapsed);
       if (current_pipeline_error().empty() && !answer_received) {
@@ -3851,7 +4342,7 @@ struct VehicleMediaRuntime::Impl {
     bool fps_passed = !final_lanes.empty();
     for (const auto& lane : final_lanes) {
       const auto encoded_fps = lane.value("encoded_fps", 0.0);
-      if (encoded_fps < config.hardware.min_realtime_fps) {
+      if (encoded_fps < (lane.value("camera_id","")=="surround_bev"?20:config.hardware.min_realtime_fps)) {
         if (lane.value("critical_for_control", true)) fps_passed = false;
         emit_diagnostic(
             "vehicle_camera_performance_failed",
@@ -3898,8 +4389,6 @@ struct VehicleMediaRuntime::Impl {
         {"time_sync", signaling.time_sync_status().to_json()},
         {"fps_passed", fps_passed},
         {"control_inhibited", control_inhibited.load()},
-        {"recording_enabled", !recording_root.empty()},
-        {"recording_root", recording_root.string()},
         {"failover_count", failover_count},
         {"attempts", std::move(attempts)},
         {"errors", std::move(errors)},
@@ -3996,18 +4485,25 @@ struct VehicleMediaRuntime::Impl {
     return summary;
   }
 
+  int maintenance_lock_fd{-1};
   VehicleConfig config;
   MediaSignalingClient signaling;
   std::shared_ptr<CriticalCameraControlLatch> critical_camera_control_latch;
   int frame_timeout_ms;
-  std::filesystem::path recording_root;
   std::optional<std::string> forced_codec;
   int simulate_primary_failure_after_frames;
   GstElement* pipeline{nullptr};
   GstElement* webrtc{nullptr};
   GstWebRTCDataChannel* control_channel{nullptr};
   std::vector<std::unique_ptr<Lane>> lanes;
+  std::vector<std::unique_ptr<Lane>> inputs;
+  MediaHealth health;
+  bool two_stream{false};
+  std::optional<SurroundCalibration> calibration;
+  std::unique_ptr<surround::Renderer> surround_renderer;
   std::atomic<bool> stop_requested{false};
+  // Media faults fence driving; parking WSS/feedback survive until teardown.
+  std::atomic<bool> lifecycle_stopping{false};
   std::mutex signal_mutex;
   std::deque<std::pair<std::string, Json>> pending_signals;
   mutable std::mutex error_mutex;
@@ -4019,6 +4515,23 @@ struct VehicleMediaRuntime::Impl {
   mutable std::mutex diagnostic_mutex;
   EncoderCandidate active_candidate{EncoderBackend::Nvenc, VideoCodec::H265};
   std::int64_t started_ms{0};
+  std::string media_attempt_id;
+  std::mutex description_mutex;
+  PendingDescription offer_description,local_description,remote_description,transport_stats;
+  Json relay_lease=Json::object();
+  std::atomic<bool> media_admission_ready{true};
+  bool relay_confirmed{};
+  std::atomic<bool> relay_activated{false},relay_released{false};
+  std::atomic<bool> relay_path_invalid{false},relay_fault_stopped{false};
+#if GST_CHECK_VERSION(1,28,0)
+  std::atomic<GstWebRTCICETransport*> tracked_ice{};
+#endif
+  std::atomic<std::int64_t> relay_deadline{0};
+  std::atomic<bool> relay_terminal{false};
+  std::atomic<int> selected_transport{0};
+  std::int64_t last_relay_renew{},direct_since{},last_transport_stats{},driver_direct_health_until{};
+  std::string selected_path;
+  std::vector<Json> pending_remote_ice;
   bool answer_received{false};
   std::optional<std::int64_t> answer_received_at_ms;
   bool control_not_open_warning_fired{false};
@@ -4026,7 +4539,7 @@ struct VehicleMediaRuntime::Impl {
   bool codec_fallback_requested{false};
   std::uint64_t failover_count{0};
   std::string last_negotiation_warning;
-  Json ice_configuration{Json::object()};
+  Json ice_configuration = Json::object();
   std::mutex control_trace_mutex;
   std::condition_variable control_trace_cv;
   std::deque<Json> control_trace_queue;
@@ -4047,6 +4560,14 @@ struct VehicleMediaRuntime::Impl {
   std::string control_service_issue_code;
   std::atomic<bool> control_link_open{false};
   std::atomic<bool> control_inhibited{false};
+  Json quiesce_request;
+  std::atomic<bool> offer_started{false};
+  std::atomic<bool> offer_requested{false};
+  std::int64_t quiesce_deadline{};
+  std::atomic<bool> media_rebuild_requested{false};
+  std::atomic<bool> control_quiescing{false};
+  std::mutex alignment_mutex;
+  std::condition_variable alignment_cv;
   std::atomic<bool> control_link_ever_opened{false};
   std::atomic<bool> control_link_opened_this_attempt{false};
   std::atomic<std::uint64_t> accepted_control_commands{0};
@@ -4112,7 +4633,6 @@ VehicleMediaRuntime::VehicleMediaRuntime(
     std::string signaling_url,
     std::string device_token,
     int frame_timeout_ms,
-    std::filesystem::path recording_root,
     std::optional<std::string> forced_codec,
     int simulate_primary_failure_after_frames,
     std::string connection_id,
@@ -4123,7 +4643,6 @@ VehicleMediaRuntime::VehicleMediaRuntime(
           std::move(signaling_url),
           std::move(device_token),
           frame_timeout_ms,
-          std::move(recording_root),
           std::move(forced_codec),
           simulate_primary_failure_after_frames,
           std::move(connection_id),

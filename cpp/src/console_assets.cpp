@@ -9,7 +9,7 @@ namespace mine_teleop {
 ServerResponse serve_console_asset(const DriverConfig& config, std::string_view path) {
   static const std::unordered_map<std::string, std::string> types{
       {".js", "text/javascript; charset=utf-8"}, {".css", "text/css; charset=utf-8"},
-      {".json", "application/json"}, {".glb", "model/gltf-binary"},
+      {".wasm", "application/wasm"}, {".json", "application/json"}, {".glb", "model/gltf-binary"},
       {".gltf", "model/gltf+json"}, {".fbx", "application/octet-stream"},
       {".obj", "text/plain"}, {".mtl", "text/plain"}, {".bin", "application/octet-stream"},
       {".png", "image/png"}, {".jpg", "image/jpeg"}, {".jpeg", "image/jpeg"},

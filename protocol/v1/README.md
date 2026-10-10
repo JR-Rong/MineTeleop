@@ -47,3 +47,7 @@ closed
 through `reserved`, `connecting`, `active`, optional `degraded`, `stopping`,
 and `closed`. Closing a session clears its control token before any later
 session can be created.
+
+## Media protocol 2 safety extension
+
+The base command version remains 1. Every driving command and native intent in a media-protocol-2 session carries the vehicle-issued `control_epoch`; profile/VCU handshake requests and their confirmations carry both `control_epoch` and `media_attempt_id`. The vehicle rejects missing/old epochs before actuation. Changing epoch clears retained input and requires a fresh neutral intent followed by new operator input. `media_quiesce`/ack use a unique `request_id` over authenticated WSS; no page state may attest to parking. Critical camera faults remain latched for the same cloud session. See [surround protocol and frame provenance](../../docs/surround-and-relay.md).
