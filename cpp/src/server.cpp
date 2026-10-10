@@ -3023,7 +3023,41 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
           }
           acknowledgement = enqueue_signaling_message(parts[1], received.message, participant);
         }
-        connection.send_json(acknowledgement);
+        Json acknowledgement_trace;
+        if (native_control_trace_ && received.message.value("type", "") == "control_command") {
+          acknowledgement_trace = {
+              {"trace_session_id", parts[1]},
+              {"vehicle_id", received.message.value("vehicle_id", "")},
+              {"driver_id", received.message.value("driver_id", "")},
+              {"seq", acknowledgement.value("seq", std::uint64_t{0})},
+              {"intent_seq", received.message.at("payload").value("intent_seq", std::uint64_t{0})},
+              {"delivery_cursor", acknowledgement.value("delivery_cursor", std::uint64_t{0})},
+              {"cloud_received_at_utc_ms", acknowledgement.value("cloud_received_at_utc_ms", std::int64_t{0})},
+              {"cloud_queued_at_utc_ms", acknowledgement.value("cloud_queued_at_utc_ms", std::int64_t{0})},
+              {"ack_send_started_at_utc_ms", now_ms()},
+              {"ack_send_started_monotonic_ms", monotonic_now_ms()},
+          };
+        }
+        const auto finish_ack_trace = [&](bool sent, const char* error = nullptr) {
+          if (acknowledgement_trace.is_null()) return;
+          const auto completed_monotonic_ms = monotonic_now_ms();
+          acknowledgement_trace["stage"] = sent
+              ? "ingress_ack_send_completed" : "ingress_ack_send_failed";
+          acknowledgement_trace["ack_send_completed_at_utc_ms"] = now_ms();
+          acknowledgement_trace["ack_send_completed_monotonic_ms"] = completed_monotonic_ms;
+          acknowledgement_trace["ack_send_call_ms"] = std::max<std::int64_t>(
+              0, completed_monotonic_ms - acknowledgement_trace.at(
+                  "ack_send_started_monotonic_ms").get<std::int64_t>());
+          if (error) acknowledgement_trace["error"] = error;
+          native_control_trace_->enqueue(std::move(acknowledgement_trace));
+        };
+        try {
+          connection.send_json(acknowledgement);
+        } catch (const std::exception& error) {
+          finish_ack_trace(false, error.what());
+          throw;
+        }
+        finish_ack_trace(true);
       } catch (const std::exception& error) {
         connection.send_json({{"error", error.what()}, {"event", "signaling_message_rejected"}});
       }
@@ -4547,6 +4581,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
     std::int64_t send_completed_at_utc_ms = 0;
     std::int64_t send_completed_monotonic_ms = 0;
     std::int64_t unacknowledged_age_ms = 0;
+    std::int64_t ack_stall_age_ms = 0;
     std::uint64_t last_ack_seq = 0;
     {
       std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
@@ -4564,9 +4599,8 @@ bool DriverConsoleRuntime::send_native_control_sample() {
             "native control signaling websocket is not connected");
       }
       // Drain acknowledgements from earlier packets without making the 20 Hz
-      // schedule depend on a cloud round trip. Track the oldest packet that is
-      // still pending, rather than accumulating time across an ACK pipeline
-      // whose sequence is continuously advancing.
+      // schedule depend on a cloud round trip. A delayed ACK pipeline is live
+      // while its cumulative sequence advances; packet age remains diagnostic.
       acknowledgement_drain_started_monotonic_ms = monotonic_now_ms();
       for (int drained = 0; drained < 16; ++drained) {
         const auto received =
@@ -4586,16 +4620,12 @@ bool DriverConsoleRuntime::send_native_control_sample() {
         }
         const auto acknowledged_seq =
             received.message.value("seq", std::uint64_t{0});
-        if (acknowledged_seq == 0 || acknowledged_seq > sequence) {
-          throw std::runtime_error(
-              "native control signaling acknowledgement sequence is invalid");
-        }
-        control_signaling_last_ack_seq_ =
-            std::max(control_signaling_last_ack_seq_, acknowledged_seq);
-        control_signaling_ack_window_.acknowledge_through(
-            control_signaling_last_ack_seq_);
         const auto acknowledgement_received_at_utc_ms = clock_.now_ms();
         const auto acknowledgement_received_monotonic_ms = monotonic_now_ms();
+        const bool ack_advanced = control_signaling_ack_window_.acknowledge_through(
+            acknowledged_seq, acknowledgement_received_monotonic_ms);
+        control_signaling_last_ack_seq_ =
+            std::max(control_signaling_last_ack_seq_, acknowledged_seq);
         native_control_last_ack_received_at_utc_ms_.store(
             acknowledgement_received_at_utc_ms,
             std::memory_order_relaxed);
@@ -4610,6 +4640,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
         if (native_control_trace_) {
           drained_acknowledgements.push_back({
               {"seq", acknowledged_seq},
+              {"ack_advanced", ack_advanced},
               {"ack_received_at_utc_ms", acknowledgement_received_at_utc_ms},
               {"ack_received_monotonic_ms", acknowledgement_received_monotonic_ms},
               {"cloud_received_at_utc_ms", cloud_received_at_utc_ms},
@@ -4624,8 +4655,10 @@ bool DriverConsoleRuntime::send_native_control_sample() {
                                       std::uint64_t{0})},
           });
         }
-        control_signaling_next_connect_monotonic_ms_ = 0;
-        control_signaling_reconnect_delay_ms_ = 100;
+        if (ack_advanced) {
+          control_signaling_next_connect_monotonic_ms_ = 0;
+          control_signaling_reconnect_delay_ms_ = 100;
+        }
       }
       acknowledgement_drain_completed_monotonic_ms = monotonic_now_ms();
       if (native_control_trace_) {
@@ -4640,20 +4673,29 @@ bool DriverConsoleRuntime::send_native_control_sample() {
         trace_record["acknowledgements"] = drained_acknowledgements;
       }
       const auto monotonic_ms = monotonic_now_ms();
+      ack_stall_age_ms = control_signaling_ack_window_.stall_age_ms(monotonic_ms);
+      unacknowledged_age_ms =
+          control_signaling_ack_window_.oldest_age_ms(monotonic_ms);
+      if (native_control_trace_) {
+        trace_record["last_ack_seq"] = control_signaling_last_ack_seq_;
+        trace_record["oldest_unacknowledged_seq"] =
+            control_signaling_ack_window_.oldest_sequence();
+        trace_record["unacknowledged_count"] =
+            control_signaling_ack_window_.pending_count();
+        trace_record["unacknowledged_age_ms"] = unacknowledged_age_ms;
+        trace_record["ack_stall_age_ms"] = ack_stall_age_ms;
+        trace_record["unacknowledged_limit"] =
+            detail::NativeControlAcknowledgementWindow::kMaxPendingPackets;
+      }
       if (control_signaling_ack_window_.pending_count() > 0) {
-        unacknowledged_age_ms =
-            control_signaling_ack_window_.oldest_age_ms(monotonic_ms);
-        if (native_control_trace_) {
-          trace_record["last_ack_seq"] = control_signaling_last_ack_seq_;
-          trace_record["oldest_unacknowledged_seq"] =
-              control_signaling_ack_window_.oldest_sequence();
-          trace_record["unacknowledged_count"] =
-              control_signaling_ack_window_.pending_count();
-          trace_record["unacknowledged_age_ms"] = unacknowledged_age_ms;
-        }
-        if (unacknowledged_age_ms >= 500) {
+        if (ack_stall_age_ms >= 500) {
           throw std::runtime_error(
               "native control signaling acknowledgements stalled for 500ms");
+        }
+        if (control_signaling_ack_window_.pending_count() >=
+            detail::NativeControlAcknowledgementWindow::kMaxPendingPackets) {
+          throw std::runtime_error(
+              "native control acknowledgement backlog exceeded 128 packets");
         }
       }
       last_ack_seq = control_signaling_last_ack_seq_;
@@ -4703,6 +4745,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       trace_record["acknowledgements"] = std::move(drained_acknowledgements);
       trace_record["last_ack_seq"] = last_ack_seq;
       trace_record["unacknowledged_age_ms"] = unacknowledged_age_ms;
+      trace_record["ack_stall_age_ms"] = ack_stall_age_ms;
       trace_record["send_started_at_utc_ms"] = send_started_at_utc_ms;
       trace_record["send_started_monotonic_ms"] = send_started_monotonic_ms;
       trace_record["send_completed_at_utc_ms"] = send_completed_at_utc_ms;
@@ -6029,6 +6072,8 @@ Json DriverConsoleRuntime::status() {
   std::uint64_t native_control_last_ack_seq = 0;
   std::int64_t native_control_next_connect_monotonic_ms = 0;
   std::int64_t native_control_unacknowledged_age_ms = 0;
+  std::int64_t native_control_ack_stall_age_ms = 0;
+  std::size_t native_control_unacknowledged_count = 0;
   int native_control_reconnect_delay_ms = 0;
   {
     std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
@@ -6039,6 +6084,9 @@ Json DriverConsoleRuntime::status() {
         control_signaling_next_connect_monotonic_ms_;
     native_control_unacknowledged_age_ms =
         control_signaling_ack_window_.oldest_age_ms(monotonic_now_ms());
+    native_control_ack_stall_age_ms =
+        control_signaling_ack_window_.stall_age_ms(monotonic_now_ms());
+    native_control_unacknowledged_count = control_signaling_ack_window_.pending_count();
     native_control_reconnect_delay_ms = control_signaling_reconnect_delay_ms_;
   }
   const auto native_sample = native_control_intent_.sample(monotonic_now_ms());
@@ -6100,6 +6148,9 @@ Json DriverConsoleRuntime::status() {
         {"last_seq", native_control_last_seq_.load()},
         {"last_ack_seq", native_control_last_ack_seq},
         {"unacknowledged_age_ms", native_control_unacknowledged_age_ms},
+        {"ack_stall_age_ms", native_control_ack_stall_age_ms},
+        {"unacknowledged_count", native_control_unacknowledged_count},
+        {"unacknowledged_limit", detail::NativeControlAcknowledgementWindow::kMaxPendingPackets},
         {"last_ack_received_at_utc_ms",
          native_control_last_ack_received_at_utc_ms_.load()},
         {"last_ack_cloud_received_at_utc_ms",
