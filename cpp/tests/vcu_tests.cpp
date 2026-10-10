@@ -1197,8 +1197,19 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
   expect(signal(shake, 16, 8) == 0, "CloudShakeReq was asserted during disarm");
 
   prepare_parking_gate(controller);
-  static_cast<void>(controller.tick());
+  frames = controller.tick();
   expect(controller.disarmed(), "manual handshake status 3 did not complete disarm");
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    const auto& parked = find_frame(frames, mine_teleop::vcu::ids::kAduEpb);
+    for (int axis = 0; axis < 4; ++axis) {
+      expect(signal(parked, axis * 8, 2) == 2,
+          "completed disarm withdrew an EPB parking request");
+    }
+    const auto& neutral = find_frame(frames, mine_teleop::vcu::ids::kAduShake);
+    expect(signal(neutral, 0, 8) == 0 && signal(neutral, 8, 8) == 1,
+        "completed disarm did not retain manual authority and N");
+    frames = controller.tick();
+  }
   expect(
       controller.request_parallel_handshake(),
       "a fully disarmed N/park/manual controller could not start a new explicit handshake");

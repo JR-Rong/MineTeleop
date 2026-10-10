@@ -1,4 +1,5 @@
 #include "mine_teleop/core.hpp"
+#include "mine_teleop/detail/native_control_acknowledgement_window.hpp"
 
 #include <cstdint>
 #include <exception>
@@ -156,6 +157,64 @@ void test_estop_is_sticky() {
       "lease expiry or invalidation cleared the ESTOP latch");
 }
 
+template <typename Function>
+void expect_throws(Function&& function, std::string_view message) {
+  try {
+    function();
+  } catch (const std::exception&) {
+    return;
+  }
+  throw TestFailure(std::string(message));
+}
+
+void test_native_control_ack_progress_replays_session31_and_bounds_backlog() {
+  using Window = mine_teleop::detail::NativeControlAcknowledgementWindow;
+  Window window;
+  // Relative monotonic times from session-000031, without wall-clock sleeps.
+  const std::int64_t sent_times[] = {0, 61, 124, 188, 251, 315, 376, 440, 501, 566};
+  std::uint64_t sequence = 1807;
+  for (const auto sent_time : sent_times) {
+    window.note_sent(sequence++, sent_time);
+  }
+  expect(window.acknowledge_through(1807, 440), "first delayed ACK did not advance");
+  expect(window.acknowledge_through(1808, 565), "second delayed ACK did not advance");
+  expect(
+      window.oldest_sequence() == 1809 && window.pending_count() == 8 &&
+          window.oldest_age_ms(628) == 504 && window.stall_age_ms(628) == 63,
+      "session31's live ACK pipeline was mistaken for a 500ms connection stall");
+  expect(
+      !window.acknowledge_through(1808, 700) &&
+          !window.acknowledge_through(1807, 900) &&
+          window.stall_age_ms(1064) == 499 && window.stall_age_ms(1065) == 500,
+      "duplicate or regressing ACKs refreshed the 500ms liveness deadline");
+  expect_throws([&] { window.acknowledge_through(1817, 1060); },
+                "an ACK for an unsent packet was accepted as progress");
+  expect(window.stall_age_ms(1065) == 500, "invalid ACK refreshed liveness");
+  window.acknowledge_through(1816, 1100);
+  expect(window.stall_age_ms(4900) == 0, "an empty ACK window timed out");
+  window.note_sent(1817, 5000);
+  expect(window.stall_age_ms(5499) == 499 && window.stall_age_ms(5500) == 500,
+         "new traffic inherited an idle ACK deadline or lost the first-ACK timeout");
+  window.reset();
+  expect(window.stall_age_ms(6000) == 0, "reconnect retained the old progress deadline");
+  window.note_sent(1, 0);
+  window.note_sent(3, 60);
+  expect_throws([&] { window.acknowledge_through(2, 90); },
+                "an ACK for a skipped sequence was accepted as progress");
+  expect_throws([&] { window.acknowledge_through(0, 90); },
+                "a zero-sequence ACK was accepted as progress");
+  expect(window.pending_count() == 2 && window.stall_age_ms(500) == 500,
+         "an unsent-sequence ACK changed the pending window or its deadline");
+  window.reset();
+  for (std::size_t seq = 1; seq <= Window::kMaxPendingPackets; ++seq) {
+    window.note_sent(seq, static_cast<std::int64_t>(seq));
+  }
+  expect_throws([&] { window.note_sent(Window::kMaxPendingPackets + 1, 200); },
+                "advancing but slow ACKs can grow the pending queue without a bound");
+  expect(window.pending_count() == Window::kMaxPendingPackets,
+         "the pending-packet bound was exceeded");
+}
+
 struct TestCase {
   const char* name;
   void (*function)();
@@ -171,6 +230,8 @@ int main() {
        test_invalidate_does_not_restore_old_throttle},
       {"fresh_neutral_interlock", test_fresh_neutral_interlock},
       {"estop_is_sticky", test_estop_is_sticky},
+      {"native_control_ack_progress_replays_session31_and_bounds_backlog",
+       test_native_control_ack_progress_replays_session31_and_bounds_backlog},
   };
 
   int failures = 0;

@@ -852,9 +852,10 @@ std::vector<CanFrame> ParallelController::tick() {
   } else if (state_ == State::DisarmParkingBrake) {
     gear = kNeutralGear;
     parking_brake.fill(kParkingBrakePark);
-  } else if (state_ == State::DisarmManual) {
+  } else if (state_ == State::DisarmManual || state_ == State::Disarmed) {
     gear = kNeutralGear;
     handshake_request = kNoRequest;
+    // Keep the confirmed parking request in the final batch sent before close.
     parking_brake.fill(kParkingBrakePark);
   }
 

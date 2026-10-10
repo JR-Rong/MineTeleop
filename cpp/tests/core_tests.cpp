@@ -6,8 +6,11 @@
 #include "mine_teleop/video.hpp"
 
 #include <gst/gst.h>
+#include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <filesystem>
@@ -299,7 +302,7 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
 
   void apply_safe_stop(
       const mine_teleop::ControlOutput& output,
-      mine_teleop::VehicleStopContext) override {
+      mine_teleop::VehicleStopContext context) override {
     ++safe_stop_attempts;
     if (safe_stop_throws) {
       throw std::runtime_error("adapter safe stop failed");
@@ -310,6 +313,7 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
           "adapter-owned safe stop rejected duplicate ordinary safe stop");
     }
     last_safe_output = output;
+    last_stop_context = context;
     ++safe_stops;
   }
 
@@ -397,6 +401,7 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
   std::optional<std::string> rejected_control_gear;
   std::optional<ControlCommand> last_control;
   mine_teleop::ControlOutput last_safe_output;
+  mine_teleop::VehicleStopContext last_stop_context;
   mine_teleop::VehicleTelemetry telemetry;
   mine_teleop::VcuHandshakeStatus handshake;
 };
@@ -1044,6 +1049,66 @@ void test_ccg2_camera_input_pipeline_is_gstreamer_parseable() {
   expect(
       parsed,
       "GStreamer could not parse the CCG2 30-to-25 FPS input pipeline: " + error);
+}
+
+void test_encoded_frame_queues_preserve_reference_frames_under_backpressure() {
+  gst_init(nullptr, nullptr);
+  for (const auto codec : {"h264", "h265"}) {
+    for (const auto limit : {2, 60}) {
+      const auto description = "appsrc name=input is-live=true format=time caps=video/x-" +
+          std::string(codec) + ",stream-format=byte-stream,alignment=au ! " +
+          mine_teleop::build_encoded_frame_queue("encoded_queue", limit) +
+          "! appsink name=output max-buffers=1 drop=false sync=false";
+      GError* error = nullptr;
+      auto* pipeline = gst_parse_launch(description.c_str(), &error);
+      const std::string parse_error = error == nullptr ? "" : error->message;
+      if (error != nullptr) g_error_free(error);
+      if (pipeline == nullptr || !parse_error.empty()) {
+        if (pipeline != nullptr) gst_object_unref(pipeline);
+        throw TestFailure("encoded queue pipeline did not parse: " + parse_error);
+      }
+      auto* input = gst_bin_get_by_name(GST_BIN(pipeline), "input");
+      auto* output = gst_bin_get_by_name(GST_BIN(pipeline), "output");
+      auto* queue = gst_bin_get_by_name(GST_BIN(pipeline), "encoded_queue");
+      std::atomic<bool> full{false};
+      g_signal_connect(queue, "overrun", G_CALLBACK(+[](GstElement*, gpointer data) {
+        static_cast<std::atomic<bool>*>(data)->store(true);
+      }), &full);
+      const auto state = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+      const auto count = limit + 8;
+      bool pushed = true;
+      for (int index = 0; index < count; ++index) {
+        auto* buffer = gst_buffer_new_allocate(nullptr, 1, nullptr);
+        GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(index) * GST_MSECOND;
+        if (index != 0) GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+        pushed = gst_app_src_push_buffer(GST_APP_SRC(input), buffer) == GST_FLOW_OK && pushed;
+      }
+      gst_app_src_end_of_stream(GST_APP_SRC(input));
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (!full && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      int delivered = 0;
+      bool ordered = true;
+      while (auto* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(output), 2 * GST_SECOND)) {
+        const auto* buffer = gst_sample_get_buffer(sample);
+        ordered = ordered && GST_BUFFER_PTS(buffer) == static_cast<GstClockTime>(delivered) * GST_MSECOND;
+        ++delivered;
+        gst_sample_unref(sample);
+      }
+      gst_element_set_state(pipeline, GST_STATE_NULL);
+      gst_object_unref(input);
+      gst_object_unref(output);
+      gst_object_unref(queue);
+      gst_object_unref(pipeline);
+      expect(state != GST_STATE_CHANGE_FAILURE && pushed && full,
+             "encoded queue fixture did not establish downstream backpressure");
+      expect(delivered == count && ordered,
+             "encoded queue discarded or reordered reference access units: codec=" +
+                 std::string(codec) + ", limit=" + std::to_string(limit) +
+                 ", delivered=" + std::to_string(delivered) + "/" + std::to_string(count));
+    }
+  }
 }
 
 void test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap() {
@@ -2454,6 +2519,93 @@ void test_control_service_receive_path_cannot_bypass_hard_timeout() {
   expect(
       adapter_view->status().applied_command_count == controls_before_timeout,
       "a command reached the adapter after receive-path hard timeout");
+  service.close();
+}
+
+void test_held_forward_and_left_rearm_after_control_gap() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
+  auto* view = adapter.get();
+  mine_teleop::VehicleControlService service(
+      config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(0);
+  activate_adapter_owned_session_profile(service, *view);
+  std::uint64_t seq = 0;
+  for (std::int64_t now = 0; now <= 60000; now += 50) {
+    auto held = command(++seq, now);
+    held.steering = 0.0;
+    expect(service.receive_command(held, now).accepted,
+        "held forward lost control during the first minute");
+    service.tick(now);
+  }
+  auto left = command(++seq, 60050);
+  left.steering = -1.0;
+  expect(service.receive_command(left, 60050).accepted,
+      "adding left to held forward was rejected on a healthy link");
+  expect(view->last_control && view->last_control->throttle > 0.0 &&
+      view->last_control->steering < 0.0 && view->last_control->gear == "D",
+      "combined forward/left did not reach the adapter");
+
+  // Match the field trace: a 223 ms delivery gap, then another 101 ms before
+  // the held command arrives while DEGRADED. Both replies must request re-arm.
+  left.seq = ++seq;
+  left.sent_at_utc_ms = 60273;
+  const auto gap = service.receive_command(left, 60273);
+  expect(!gap.accepted && gap.reason == "command_gap_exceeded" &&
+      gap.issue_code == "control_input_rearm_required",
+      "delivery gap did not immediately request input re-arm");
+  left.seq = ++seq;
+  left.sent_at_utc_ms = 60374;
+  const auto held = service.receive_command(left, 60374);
+  expect(!held.accepted && held.reason == "degraded_neutral_required" &&
+      held.issue_code == "control_input_rearm_required",
+      "degraded held input did not request re-arm");
+  expect(view->last_safe_output.throttle == 0.0,
+      "degraded held input retained traction");
+  auto neutral = command(++seq, 60450);
+  neutral.steering = 0.0;
+  neutral.throttle = 0.0;
+  expect(service.receive_command(neutral, 60450).accepted,
+      "prompt fresh neutral response did not recover degraded control");
+  expect(service.session_control_profile().at("active").get<bool>() &&
+      service.safety_state() == mine_teleop::SafetyState::ControlActive,
+      "re-arm unnecessarily revoked the confirmed session profile");
+  left.seq = ++seq;
+  left.sent_at_utc_ms = 60500;
+  expect(service.receive_command(left, 60500).accepted,
+      "fresh forward/left remained blocked after neutral re-arm");
+  service.close();
+}
+
+void test_timeout_profile_revocation_preserves_watchdog_stop() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
+  auto* view = adapter.get();
+  mine_teleop::VehicleControlService service(
+      config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(0);
+  activate_adapter_owned_session_profile(service, *view);
+  expect(service.receive_command(command(1, 0), 0).accepted,
+      "initial command was rejected");
+  service.tick(800);
+  expect(!service.session_control_profile().at("active").get<bool>(),
+      "hard timeout did not revoke the session profile");
+  expect(!service.receive_command(command(2, 810), 810).accepted,
+      "first packet bypassed hard timeout");
+  const auto late = service.receive_command(command(3, 820), 820);
+  expect(!late.accepted && late.reason == "session_control_profile_required",
+      "revoked profile did not continue blocking control");
+  expect(view->last_stop_context.source == mine_teleop::VehicleStopSource::Watchdog &&
+      view->last_stop_context.reason == mine_teleop::VehicleStopReason::OuterControlTimeout,
+      "profile revocation replaced watchdog provenance with a software fault");
+  expect_near(view->last_safe_output.brake, 0.3, 1e-9,
+      "profile revocation replaced the first staged timeout brake");
+  service.tick(1300);
+  expect_near(view->last_safe_output.brake, 0.6, 1e-9,
+      "timeout brake progression stopped after profile revocation");
+  service.tick(2300);
+  expect(view->last_safe_output.full_emergency_brake && view->last_safe_output.brake == 1.0,
+      "timeout did not reach full safety braking");
   service.close();
 }
 
@@ -4037,6 +4189,7 @@ int main() {
       {"camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2", test_camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2},
       {"camera_input_pipeline_resamples_only_mismatched_ccg2_fps", test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps},
       {"ccg2_camera_input_pipeline_is_gstreamer_parseable", test_ccg2_camera_input_pipeline_is_gstreamer_parseable},
+      {"encoded_frame_queues_preserve_reference_frames_under_backpressure", test_encoded_frame_queues_preserve_reference_frames_under_backpressure},
       {"v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap", test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap},
       {"camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults", test_camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults},
       {"ccg2_example_config_defines_two_explicit_capture_lanes", test_ccg2_example_config_defines_two_explicit_capture_lanes},
@@ -4070,6 +4223,10 @@ int main() {
        test_control_service_recovers_from_degraded_command_gap_without_profile_reapply},
       {"control_service_receive_path_cannot_bypass_hard_timeout",
        test_control_service_receive_path_cannot_bypass_hard_timeout},
+      {"held_forward_and_left_rearm_after_control_gap",
+       test_held_forward_and_left_rearm_after_control_gap},
+      {"timeout_profile_revocation_preserves_watchdog_stop",
+       test_timeout_profile_revocation_preserves_watchdog_stop},
       {"control_service_preserves_physical_brake_across_degraded_timeout", test_control_service_preserves_physical_brake_across_degraded_timeout},
       {"control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshake",
        test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshake},

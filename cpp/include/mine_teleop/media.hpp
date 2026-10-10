@@ -48,6 +48,8 @@ struct CameraInputSpec {
     std::string_view source_name,
     const CameraInputSpec& input,
     const MediaProfile& output_profile);
+[[nodiscard]] std::string build_encoded_frame_queue(
+    std::string_view name, int max_buffers);
 
 struct CameraIssue {
   std::string_view code;

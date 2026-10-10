@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -1767,6 +1768,9 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
   const auto oldest_pending_age = send_sample.find(
       "control_signaling_ack_window_.oldest_age_ms(monotonic_ms)",
       acknowledgement_progress);
+  const auto progress_age = send_sample.find(
+      "control_signaling_ack_window_.stall_age_ms(monotonic_ms)",
+      acknowledgement_progress);
   const auto acknowledgement_stall = send_sample.find(
       "native control signaling acknowledgements stalled for 500ms",
       oldest_pending_age);
@@ -1775,12 +1779,15 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
   expect(
       acknowledgement_progress != std::string::npos &&
           oldest_pending_age != std::string::npos &&
+          progress_age != std::string::npos &&
           acknowledgement_stall != std::string::npos &&
           record_transmitted_packet != std::string::npos &&
-          acknowledgement_progress < oldest_pending_age &&
+          acknowledgement_progress < progress_age &&
+          progress_age < acknowledgement_stall &&
+          send_sample.find("if (ack_stall_age_ms >= 500)") != std::string::npos &&
           oldest_pending_age < acknowledgement_stall &&
           websocket_send < record_transmitted_packet,
-      "native ACK timeout is not tied to the oldest actually transmitted packet");
+      "native ACK timeout is not tied to progress of actually transmitted packets");
 
   const auto intent_update_lock = update_intent.find(
       "std::lock_guard update_lock(native_control_update_mutex_)");
@@ -1845,7 +1852,7 @@ void test_native_control_acknowledgement_window_tracks_oldest_pending_packet() {
 
   window.note_sent(1653, 0);
   window.note_sent(1654, 62);
-  window.acknowledge_through(1653);
+  window.acknowledge_through(1653, 126);
   expect(
       window.oldest_sequence() == 1654 &&
           window.oldest_age_ms(126) == 64 &&
@@ -1853,7 +1860,7 @@ void test_native_control_acknowledgement_window_tracks_oldest_pending_packet() {
       "ACK progress inherited the age of a packet that was already acknowledged");
 
   window.note_sent(1655, 126);
-  window.acknowledge_through(1654);
+  window.acknowledge_through(1654, 189);
   expect(
       window.oldest_sequence() == 1655 &&
           window.oldest_age_ms(189) == 63 &&
@@ -1864,7 +1871,7 @@ void test_native_control_acknowledgement_window_tracks_oldest_pending_packet() {
   expect(
       window.oldest_age_ms(626) == 500,
       "a genuinely stalled oldest packet did not retain its send timestamp");
-  window.acknowledge_through(1656);
+  window.acknowledge_through(1656, 626);
   expect(
       window.oldest_sequence() == 0 && window.oldest_age_ms(1000) == 0 &&
           window.pending_count() == 0,
@@ -4415,6 +4422,123 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
   server.stop();
 }
 
+void test_native_control_delayed_ack_progress_and_real_stall() {
+  mine_teleop::SignalingServerConfig signaling_config;
+  signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
+  signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
+  signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
+  auto signaling = std::make_shared<mine_teleop::SignalingService>(signaling_config);
+  auto connections = std::make_shared<std::atomic<int>>(0);
+  auto drop_acknowledgements = std::make_shared<std::atomic<bool>>(false);
+  mine_teleop::SimpleHttpServer server(
+      "127.0.0.1", 0,
+      [signaling](const auto& request) { return signaling->handle(request); },
+      8 * 1024 * 1024,
+      [signaling, connections, drop_acknowledgements](int socket, const auto& request) {
+        if (!request.query.contains("send_only")) {
+          return signaling->handle_websocket(socket, request);
+        }
+        const auto key = request.headers.find("sec-websocket-key");
+        if (key == request.headers.end()) return false;
+        raw_send_all(socket,
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: " + mine_teleop::websocket_accept_key(key->second) + "\r\n\r\n");
+        ++*connections;
+        mine_teleop::ServerWebSocketConnection connection(socket, 512 * 1024);
+        std::deque<std::pair<std::chrono::steady_clock::time_point, mine_teleop::Json>> pending;
+        bool first_packet = true;
+        try {
+          while (true) {
+            const auto received = connection.receive_json(std::chrono::milliseconds(10));
+            if (received.status == mine_teleop::WebSocketReceiveStatus::Closed) break;
+            if (received.status == mine_teleop::WebSocketReceiveStatus::Message) {
+              // Enqueue through the real cloud service; delay only the return ACK.
+              mine_teleop::HttpRequest post;
+              post.method = "POST";
+              post.path = request.path.substr(0, request.path.size() - 3) + "/messages";
+              post.target = post.path;
+              auto authenticated_message = received.message;
+              authenticated_message["token"] = request.headers.at("x-mine-teleop-driver-token");
+              post.body = authenticated_message.dump();
+              const auto response = signaling->handle(post);
+              if (response.status != 200) {
+                connection.send_json({{"error", response.body}});
+                break;
+              }
+              // Warm up before the first-ACK deadline, then impose packet
+              // latency directly instead of relying on a growing queue.
+              const auto delay = std::chrono::milliseconds(first_packet ? 350 : 600);
+              first_packet = false;
+              pending.emplace_back(
+                  std::chrono::steady_clock::now() + delay,
+                  mine_teleop::Json::parse(response.body));
+            }
+            if (!pending.empty() && !drop_acknowledgements->load() &&
+                std::chrono::steady_clock::now() >= pending.front().first) {
+              connection.send_json(pending.front().second);
+              pending.pop_front();
+            }
+          }
+        } catch (const std::exception&) {
+          // Driver disconnect/reconnect terminates this loopback fixture.
+        }
+        return true;
+      });
+  server.start();
+  const auto base = "http://127.0.0.1:" + std::to_string(server.port());
+  mine_teleop::HttpClient http;
+  static_cast<void>(http.post_json_response(base + "/vehicles/online",
+      {{"vehicle_id", "vehicle-001"}, {"device_token", "vehicle-secret-1"},
+       {"connection_id", "delayed-ack-vehicle"}}));
+  mine_teleop::DriverConfig driver_config;
+  driver_config.driver_id = "driver-console-001";
+  driver_config.signaling_url = base;
+  // A slower send cadence proves coverage does not require queue growth.
+  driver_config.rate_hz = 10;
+  allow_qemu_test_scheduler_time_sync(driver_config);
+  mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
+  const auto connected = driver.connect("vehicle-001");
+  static_cast<void>(driver.update_control_intent(
+      {{"session_id", connected.at("session_id")},
+       {"session_generation", connected.at("control_session_generation")},
+       {"ui_instance_id", "delayed-ack-test"}, {"intent_seq", 1},
+       {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0}}));
+  std::int64_t oldest_age = 0;
+  const auto healthy_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < healthy_deadline) {
+    const auto native = driver.status().at("native_control");
+    expect(native.value("send_failures_total", 0U) == 0,
+           "advancing delayed ACKs caused the native driver to reconnect: " + native.dump());
+    oldest_age = std::max(oldest_age, native.value("unacknowledged_age_ms", std::int64_t{0}));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  const auto healthy_native = driver.status().at("native_control");
+  expect(oldest_age >= 500 && connections->load() == 1 &&
+             healthy_native.value("last_ack_seq", 0U) > 1,
+         "fixture did not exercise an old pending packet with a live ACK pipeline: max_age_ms=" +
+             std::to_string(oldest_age) + ", connections=" + std::to_string(connections->load()) +
+             ", native=" + healthy_native.dump());
+  drop_acknowledgements->store(true);
+  bool stalled = false;
+  const auto stalled_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < stalled_deadline) {
+    const auto native = driver.status().at("native_control");
+    if (native.value("send_failures_total", 0U) > 0) {
+      expect(native.value("last_error", "") ==
+                 "native control signaling acknowledgements stalled for 500ms" &&
+                 native.value("requires_fresh_input", false) &&
+                 native.value("reconnect_delay_ms", 0) >= 100,
+             "real ACK loss did not retain the 500ms failure, input invalidation, and backoff");
+      stalled = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  expect(stalled, "native control remained connected after ACK progress stopped");
+  static_cast<void>(driver.disconnect("delayed_ack_test_complete"));
+  server.stop();
+}
+
 void test_native_control_three_hop_trace_correlation() {
   const auto root = std::filesystem::temp_directory_path() /
       ("mine-teleop-native-control-trace-" + mine_teleop::random_token(6));
@@ -4594,6 +4718,11 @@ void test_native_control_three_hop_trace_correlation() {
           vehicle_delivery_cursor) &&
           has_command(
               cloud_commands,
+              "ingress_ack_send_completed",
+              vehicle_received_seq,
+              vehicle_delivery_cursor) &&
+          has_command(
+              cloud_commands,
               "delivery_send_completed",
               vehicle_received_seq,
               vehicle_delivery_cursor) &&
@@ -4602,11 +4731,14 @@ void test_native_control_three_hop_trace_correlation() {
               "delivery_ack_received",
               vehicle_received_seq,
               vehicle_delivery_cursor),
-      "cloud trace does not correlate ingress, vehicle delivery, and vehicle ACK");
+      "cloud trace does not correlate ingress ACK, vehicle delivery, and vehicle ACK");
   for (const auto field : {
            "driver_native_control_trace_batch",
            "sender_wakeup_lag_ms",
            "acknowledgement_drain_ms",
+           "ack_stall_age_ms",
+           "ack_advanced",
+           "unacknowledged_limit",
            "send_started_at_utc_ms",
            "send_completed_at_utc_ms",
            "send_call_ms",
@@ -4619,6 +4751,10 @@ void test_native_control_three_hop_trace_correlation() {
   for (const auto field : {
            "cloud_native_control_trace_batch",
            "ingress_queued",
+           "ingress_ack_send_completed",
+           "ack_send_started_at_utc_ms",
+           "ack_send_completed_at_utc_ms",
+           "ack_send_call_ms",
            "delivery_send_completed",
            "delivery_ack_received",
            "driver_to_cloud_utc_delta_ms",
@@ -6099,6 +6235,8 @@ int main() {
        test_websocket_delivery_replay_and_idempotent_acknowledgement},
       {"native_control_three_hop_trace_correlation",
        test_native_control_three_hop_trace_correlation},
+      {"native_control_delayed_ack_progress_and_real_stall",
+       test_native_control_delayed_ack_progress_and_real_stall},
       {"mac_runtime_retries_uncertain_websocket_send_without_duplication",
        test_mac_runtime_retries_uncertain_websocket_send_without_duplication},
       {"expired_websocket_authority_clears_local_control", test_expired_websocket_authority_clears_local_control},

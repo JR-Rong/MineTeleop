@@ -1062,7 +1062,7 @@ const operatorSpeed=document.getElementById('operator-speed'),operatorActualGear
 const keyIndicators={left:document.getElementById('key-left'),right:document.getElementById('key-right'),up:document.getElementById('key-up'),down:document.getElementById('key-down'),service_brake:document.getElementById('key-service-brake'),hard_brake:document.getElementById('key-hard-brake')};
 const controlReadouts={gear:document.getElementById('control-gear'),steering:document.getElementById('control-steering'),throttle:document.getElementById('control-throttle'),brake:document.getElementById('control-brake')};
 const operatorControlReadouts={gear:document.getElementById('operator-control-gear'),steering:document.getElementById('operator-control-steering'),throttle:document.getElementById('operator-control-throttle'),brake:document.getElementById('operator-control-brake')};
-let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,gearRejectionInhibited=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,lastVehicleSafetyState='',vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,pendingGearTransition=null,gearTransitionGeneration=0,lastControlStatusSeq=0,lastControlPrepareTimeoutLogAt=0,lastControlPrepareExpiredLogAt=0,activeControlPrepareAbort=null,activeControlPrepareIsEstop=false,activeControlPreparePreemptedByEstop=false;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
+let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,gearRejectionInhibited=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,lastVehicleSafetyState='',vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,pendingGearTransition=null,gearTransitionGeneration=0,lastControlStatusSeq=0,lastControlPrepareTimeoutLogAt=0,lastControlPrepareExpiredLogAt=0,activeControlPrepareAbort=null,activeControlPrepareIsEstop=false,activeControlPreparePreemptedByEstop=false;let lastMediaMetricsLogAt=null;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
 let gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();
 const uiInstanceId=(globalThis.crypto?.randomUUID?.()||`ui-${Date.now()}-${Math.random().toString(16).slice(2)}`).replace(/[^A-Za-z0-9_-]/g,'_');
 let connectRequestGeneration=0;
@@ -1213,7 +1213,7 @@ function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}
 function updateVcuHandshakeState(value){gearChangeStationaryEvidence=controlLogic.updateGearChangeStationaryEvidence(gearChangeStationaryEvidence,value,lastControlStatusSeq,performance.now());value={...value,gear_change_stationary_confirmed:gearChangeStationaryEvidence.confirmed};const transition=controlLogic.transitionVcuState(vcuEverReady,value);vcuHandshake=value;vcuEverReady=transition.everReady;if(transition.resetInput)resetControlAuthorityInput()}
 function applyVehicleSafetyState(value){const next=String(value||'');if(next==='DEGRADED'){clearControlInput(false);if(lastVehicleSafetyState!=='DEGRADED'){lastKeyboardEvent.textContent='控制命令短暂中断，输入已清除 · 请释放后重新按下';statusPanel.textContent='车端进入可恢复降级：牵引已清零；请释放控制键后重新按下';clientLog('driver_input_cleared_on_degraded',{previous_safety_state:lastVehicleSafetyState||null})}}lastVehicleSafetyState=next}
 function suspendSignalingPoll(){const generation=++signalingGeneration;polling=false;if(signalingPollAbort){signalingPollAbort.abort();signalingPollAbort=null}return generation}
-function closeRealtimeSession(){flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;lastVehicleSafetyState='';vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();cameraView.reset();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
+function closeRealtimeSession(){flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;lastVehicleSafetyState='';vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();lastMediaMetricsLogAt=null;cameraView.reset();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
 function renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason)){estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner}
 function latchEstop(source){if(estopLatched)return false;estopLatched=true;clientLog('control_estop_request_latched',{source});renderEstopRequest();renderMonitoring();return true}
 function firstConnectedGamepad(){const pads=navigator.getGamepads?navigator.getGamepads():[];if(activeGamepadIndex!==null&&pads[activeGamepadIndex]?.connected)return pads[activeGamepadIndex];for(const pad of pads)if(pad?.connected){activeGamepadIndex=pad.index;return pad}activeGamepadIndex=null;return null}
@@ -1423,7 +1423,7 @@ async function startFromOffer(offer){
             if(gearRejectionMatched){rollbackFrom=pendingGearTransition.toGear;rollbackTo=pendingGearTransition.fromGear}
             selectedGear=gearRejectionState.selectedGear;pendingGearRequest=gearRejectionState.pendingGearRequest;pendingGearTransition=gearRejectionState.pendingGearTransition;gearRejectionInhibited=gearRejectionState.inhibitOrdinaryControl;clearControlInput(false);
             if(gearRejectionState.sendRollback)send({},false).catch(console.error);
-          }else if(rejection.clearInput)clearControlInput();
+          }else if(rejection.action==='rearm_input'){clearControlInput(false);send({},false).catch(console.error)}else if(rejection.clearInput)clearControlInput();
           statusPanel.textContent=gearRejectionMatched?rejection.text:(rejection.action==='rollback_gear_change'?'换挡拒绝无法关联，普通控制已冻结；请安全断开并重新握手。':rejection.text);
           const commandSeq=Number(message.command_seq);
           clientLog('driver_control_command_rejected',{issue_code:rejection.issueCode,command_seq:Number.isSafeInteger(commandSeq)&&commandSeq>0?commandSeq:null,gear_rejection_matched:gearRejectionMatched,rollback_from:rollbackFrom,rollback_to:rollbackTo});
@@ -1513,11 +1513,13 @@ async function collectMetrics(){
     const processingMs=decoded>0?Number(s.totalProcessingDelay||0)*1000/decoded:0;
     const cameraId=cameraByMid.get(s.mid||'')||'',lane=(mediaStatus.lanes||[]).find(l=>l.camera_id===cameraId)||{};
     const captureEncodeMs=Number(lane.capture_to_encoded_ms||0),latencyMs=captureEncodeMs+rtt*500+jitterMs+processingMs;
-    streams.push({camera_id:cameraId,mid:s.mid||'',codec_id:s.codecId||'',fps,bitrate_kbps:bitrateKbps,frames_decoded:decoded,frames_dropped:Number(s.framesDropped||0),packets_lost:packetsLost,packets_received:packetsReceived,packet_loss_percent:(packetsLost+packetsReceived)>0?100*packetsLost/(packetsLost+packetsReceived):0,jitter_ms:Number(s.jitter||0)*1000,capture_to_encoded_ms:captureEncodeMs,jitter_buffer_ms:jitterMs,processing_ms:processingMs,round_trip_ms:rtt*1000,estimated_end_to_end_latency_ms:latencyMs,passed:fps>=20&&latencyMs<=200})
+    streams.push({camera_id:cameraId,mid:s.mid||'',codec_id:s.codecId||'',fps,bitrate_kbps:bitrateKbps,frames_decoded:decoded,key_frames_decoded:s.keyFramesDecoded??null,frames_received:s.framesReceived??null,frames_dropped:Number(s.framesDropped||0),nack_count:s.nackCount??null,pli_count:s.pliCount??null,fir_count:s.firCount??null,decoder_implementation:s.decoderImplementation??null,decode_ms_per_frame:decoded>0&&typeof s.totalDecodeTime==='number'?s.totalDecodeTime*1000/decoded:null,codec_mime_type:report.get(s.codecId)?.mimeType||'',packets_lost:packetsLost,packets_received:packetsReceived,packet_loss_percent:(packetsLost+packetsReceived)>0?100*packetsLost/(packetsLost+packetsReceived):0,jitter_ms:Number(s.jitter||0)*1000,capture_to_encoded_ms:captureEncodeMs,jitter_buffer_ms:jitterMs,processing_ms:processingMs,round_trip_ms:rtt*1000,estimated_end_to_end_latency_ms:latencyMs,passed:fps>=20&&latencyMs<=200})
   }
   const timeSync=latestRuntimeStatus.time_sync||mediaStatus.time_sync||{},turnConfigured=hasTurnServer();
   const controlOutcomes={...controlOutcomeSession.metrics};
   const metrics={sampled_at_ms:sampledAt,connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',control_rtt_ms:rtt*1000,connection_method:connectionMethod,turn_configured:turnConfigured,turn_in_use:turnInUse,time_sync:timeSync,clock_uncertainty_ms:Number(timeSync.uncertainty_ms||0),latency_method:'capture-to-encoded + rtt/2 + jitter-buffer + browser-processing',control_outcomes:controlOutcomes,control_outcomes_balanced:controlLogic.controlOutcomesBalanced(controlOutcomes),streams,passed:streams.length>0&&streams.every(s=>s.passed)};
+  const mediaLogAt=performance.now();
+  if(lastMediaMetricsLogAt===null||mediaLogAt-lastMediaMetricsLogAt>=5000){lastMediaMetricsLogAt=mediaLogAt;clientLog('driver_media_metrics',metrics)}
   await post('/api/webrtc/metrics',metrics);
   if(metrics.codec==='h265'&&metrics.connection_state==='connected'&&streams.length){h265FailureSamples=streams.some(s=>s.fps<20)?h265FailureSamples+1:0;if(h265FailureSamples>=3&&!h265FallbackSent){h265FallbackSent=true;await post('/api/webrtc/fallback',{codec:'h264',reason:'h265_decode_fps_below_20'})}}else h265FailureSamples=0;
   latestMetrics=metrics;renderMonitoring();statusPanel.textContent=`${metrics.connection_state||'等待连接'} · ${streams.length} 路视频 · RTT ${formatMetric(metrics.control_rtt_ms,1,' ms')} · ${metrics.connection_method||'unknown'}`
@@ -3023,7 +3025,41 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
           }
           acknowledgement = enqueue_signaling_message(parts[1], received.message, participant);
         }
-        connection.send_json(acknowledgement);
+        Json acknowledgement_trace;
+        if (native_control_trace_ && received.message.value("type", "") == "control_command") {
+          acknowledgement_trace = {
+              {"trace_session_id", parts[1]},
+              {"vehicle_id", received.message.value("vehicle_id", "")},
+              {"driver_id", received.message.value("driver_id", "")},
+              {"seq", acknowledgement.value("seq", std::uint64_t{0})},
+              {"intent_seq", received.message.at("payload").value("intent_seq", std::uint64_t{0})},
+              {"delivery_cursor", acknowledgement.value("delivery_cursor", std::uint64_t{0})},
+              {"cloud_received_at_utc_ms", acknowledgement.value("cloud_received_at_utc_ms", std::int64_t{0})},
+              {"cloud_queued_at_utc_ms", acknowledgement.value("cloud_queued_at_utc_ms", std::int64_t{0})},
+              {"ack_send_started_at_utc_ms", now_ms()},
+              {"ack_send_started_monotonic_ms", monotonic_now_ms()},
+          };
+        }
+        const auto finish_ack_trace = [&](bool sent, const char* error = nullptr) {
+          if (acknowledgement_trace.is_null()) return;
+          const auto completed_monotonic_ms = monotonic_now_ms();
+          acknowledgement_trace["stage"] = sent
+              ? "ingress_ack_send_completed" : "ingress_ack_send_failed";
+          acknowledgement_trace["ack_send_completed_at_utc_ms"] = now_ms();
+          acknowledgement_trace["ack_send_completed_monotonic_ms"] = completed_monotonic_ms;
+          acknowledgement_trace["ack_send_call_ms"] = std::max<std::int64_t>(
+              0, completed_monotonic_ms - acknowledgement_trace.at(
+                  "ack_send_started_monotonic_ms").get<std::int64_t>());
+          if (error) acknowledgement_trace["error"] = error;
+          native_control_trace_->enqueue(std::move(acknowledgement_trace));
+        };
+        try {
+          connection.send_json(acknowledgement);
+        } catch (const std::exception& error) {
+          finish_ack_trace(false, error.what());
+          throw;
+        }
+        finish_ack_trace(true);
       } catch (const std::exception& error) {
         connection.send_json({{"error", error.what()}, {"event", "signaling_message_rejected"}});
       }
@@ -4547,6 +4583,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
     std::int64_t send_completed_at_utc_ms = 0;
     std::int64_t send_completed_monotonic_ms = 0;
     std::int64_t unacknowledged_age_ms = 0;
+    std::int64_t ack_stall_age_ms = 0;
     std::uint64_t last_ack_seq = 0;
     {
       std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
@@ -4564,9 +4601,8 @@ bool DriverConsoleRuntime::send_native_control_sample() {
             "native control signaling websocket is not connected");
       }
       // Drain acknowledgements from earlier packets without making the 20 Hz
-      // schedule depend on a cloud round trip. Track the oldest packet that is
-      // still pending, rather than accumulating time across an ACK pipeline
-      // whose sequence is continuously advancing.
+      // schedule depend on a cloud round trip. A delayed ACK pipeline is live
+      // while its cumulative sequence advances; packet age remains diagnostic.
       acknowledgement_drain_started_monotonic_ms = monotonic_now_ms();
       for (int drained = 0; drained < 16; ++drained) {
         const auto received =
@@ -4586,16 +4622,12 @@ bool DriverConsoleRuntime::send_native_control_sample() {
         }
         const auto acknowledged_seq =
             received.message.value("seq", std::uint64_t{0});
-        if (acknowledged_seq == 0 || acknowledged_seq > sequence) {
-          throw std::runtime_error(
-              "native control signaling acknowledgement sequence is invalid");
-        }
-        control_signaling_last_ack_seq_ =
-            std::max(control_signaling_last_ack_seq_, acknowledged_seq);
-        control_signaling_ack_window_.acknowledge_through(
-            control_signaling_last_ack_seq_);
         const auto acknowledgement_received_at_utc_ms = clock_.now_ms();
         const auto acknowledgement_received_monotonic_ms = monotonic_now_ms();
+        const bool ack_advanced = control_signaling_ack_window_.acknowledge_through(
+            acknowledged_seq, acknowledgement_received_monotonic_ms);
+        control_signaling_last_ack_seq_ =
+            std::max(control_signaling_last_ack_seq_, acknowledged_seq);
         native_control_last_ack_received_at_utc_ms_.store(
             acknowledgement_received_at_utc_ms,
             std::memory_order_relaxed);
@@ -4610,6 +4642,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
         if (native_control_trace_) {
           drained_acknowledgements.push_back({
               {"seq", acknowledged_seq},
+              {"ack_advanced", ack_advanced},
               {"ack_received_at_utc_ms", acknowledgement_received_at_utc_ms},
               {"ack_received_monotonic_ms", acknowledgement_received_monotonic_ms},
               {"cloud_received_at_utc_ms", cloud_received_at_utc_ms},
@@ -4624,8 +4657,10 @@ bool DriverConsoleRuntime::send_native_control_sample() {
                                       std::uint64_t{0})},
           });
         }
-        control_signaling_next_connect_monotonic_ms_ = 0;
-        control_signaling_reconnect_delay_ms_ = 100;
+        if (ack_advanced) {
+          control_signaling_next_connect_monotonic_ms_ = 0;
+          control_signaling_reconnect_delay_ms_ = 100;
+        }
       }
       acknowledgement_drain_completed_monotonic_ms = monotonic_now_ms();
       if (native_control_trace_) {
@@ -4640,20 +4675,29 @@ bool DriverConsoleRuntime::send_native_control_sample() {
         trace_record["acknowledgements"] = drained_acknowledgements;
       }
       const auto monotonic_ms = monotonic_now_ms();
+      ack_stall_age_ms = control_signaling_ack_window_.stall_age_ms(monotonic_ms);
+      unacknowledged_age_ms =
+          control_signaling_ack_window_.oldest_age_ms(monotonic_ms);
+      if (native_control_trace_) {
+        trace_record["last_ack_seq"] = control_signaling_last_ack_seq_;
+        trace_record["oldest_unacknowledged_seq"] =
+            control_signaling_ack_window_.oldest_sequence();
+        trace_record["unacknowledged_count"] =
+            control_signaling_ack_window_.pending_count();
+        trace_record["unacknowledged_age_ms"] = unacknowledged_age_ms;
+        trace_record["ack_stall_age_ms"] = ack_stall_age_ms;
+        trace_record["unacknowledged_limit"] =
+            detail::NativeControlAcknowledgementWindow::kMaxPendingPackets;
+      }
       if (control_signaling_ack_window_.pending_count() > 0) {
-        unacknowledged_age_ms =
-            control_signaling_ack_window_.oldest_age_ms(monotonic_ms);
-        if (native_control_trace_) {
-          trace_record["last_ack_seq"] = control_signaling_last_ack_seq_;
-          trace_record["oldest_unacknowledged_seq"] =
-              control_signaling_ack_window_.oldest_sequence();
-          trace_record["unacknowledged_count"] =
-              control_signaling_ack_window_.pending_count();
-          trace_record["unacknowledged_age_ms"] = unacknowledged_age_ms;
-        }
-        if (unacknowledged_age_ms >= 500) {
+        if (ack_stall_age_ms >= 500) {
           throw std::runtime_error(
               "native control signaling acknowledgements stalled for 500ms");
+        }
+        if (control_signaling_ack_window_.pending_count() >=
+            detail::NativeControlAcknowledgementWindow::kMaxPendingPackets) {
+          throw std::runtime_error(
+              "native control acknowledgement backlog exceeded 128 packets");
         }
       }
       last_ack_seq = control_signaling_last_ack_seq_;
@@ -4703,6 +4747,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       trace_record["acknowledgements"] = std::move(drained_acknowledgements);
       trace_record["last_ack_seq"] = last_ack_seq;
       trace_record["unacknowledged_age_ms"] = unacknowledged_age_ms;
+      trace_record["ack_stall_age_ms"] = ack_stall_age_ms;
       trace_record["send_started_at_utc_ms"] = send_started_at_utc_ms;
       trace_record["send_started_monotonic_ms"] = send_started_monotonic_ms;
       trace_record["send_completed_at_utc_ms"] = send_completed_at_utc_ms;
@@ -6029,6 +6074,8 @@ Json DriverConsoleRuntime::status() {
   std::uint64_t native_control_last_ack_seq = 0;
   std::int64_t native_control_next_connect_monotonic_ms = 0;
   std::int64_t native_control_unacknowledged_age_ms = 0;
+  std::int64_t native_control_ack_stall_age_ms = 0;
+  std::size_t native_control_unacknowledged_count = 0;
   int native_control_reconnect_delay_ms = 0;
   {
     std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
@@ -6039,6 +6086,9 @@ Json DriverConsoleRuntime::status() {
         control_signaling_next_connect_monotonic_ms_;
     native_control_unacknowledged_age_ms =
         control_signaling_ack_window_.oldest_age_ms(monotonic_now_ms());
+    native_control_ack_stall_age_ms =
+        control_signaling_ack_window_.stall_age_ms(monotonic_now_ms());
+    native_control_unacknowledged_count = control_signaling_ack_window_.pending_count();
     native_control_reconnect_delay_ms = control_signaling_reconnect_delay_ms_;
   }
   const auto native_sample = native_control_intent_.sample(monotonic_now_ms());
@@ -6100,6 +6150,9 @@ Json DriverConsoleRuntime::status() {
         {"last_seq", native_control_last_seq_.load()},
         {"last_ack_seq", native_control_last_ack_seq},
         {"unacknowledged_age_ms", native_control_unacknowledged_age_ms},
+        {"ack_stall_age_ms", native_control_ack_stall_age_ms},
+        {"unacknowledged_count", native_control_unacknowledged_count},
+        {"unacknowledged_limit", detail::NativeControlAcknowledgementWindow::kMaxPendingPackets},
         {"last_ack_received_at_utc_ms",
          native_control_last_ack_received_at_utc_ms_.load()},
         {"last_ack_cloud_received_at_utc_ms",

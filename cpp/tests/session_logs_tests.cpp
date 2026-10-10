@@ -285,7 +285,27 @@ void three_endpoint_export() {
     return http.post_json_response(origin + "/auth/driver_login", {{"driver_id", id}, {"password", password}}).at("token").get<std::string>();
   };
   const auto token = login("driver", "driver-password");
-  static_cast<void>(http.post_json_response(origin + "/vehicles/online", {{"vehicle_id", "vehicle"}, {"device_token", "device-secret"}, {"connection_id", "test"}}));
+  const auto online = http.post_json_response(origin + "/vehicles/online",
+      {{"vehicle_id", "vehicle"}, {"device_token", "device-secret"}, {"connection_id", "test"}});
+  const auto vehicle_generation = online.at("connection_generation").get<std::uint64_t>();
+  std::atomic<bool> heartbeat_failed{false};
+  // The export worker does not own vehicle presence. Model the separate
+  // runtime heartbeat so slow retries cannot turn this into an offline test.
+  std::jthread heartbeat([&](std::stop_token stop) {
+    HttpClient keepalive_http(std::chrono::seconds(2));
+    while (!stop.stop_requested()) {
+      try {
+        static_cast<void>(keepalive_http.post_json_response(origin + "/vehicles/heartbeat",
+            {{"vehicle_id", "vehicle"}, {"device_token", "device-secret"},
+             {"connection_generation", vehicle_generation}}));
+      } catch (const std::exception&) {
+        heartbeat_failed = true;
+        return;
+      }
+      for (int tick = 0; tick < 10 && !stop.stop_requested(); ++tick)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
   const auto session = http.post_json_response(origin + "/sessions", {{"driver_id", "driver"}, {"vehicle_id", "vehicle"}, {"token", token}});
   const auto id = session.at("session_id").get<std::string>(); const auto timestamp = now_ms();
   const auto event = Json{{"logged_at_utc_ms", timestamp}, {"session_id", id}, {"event", "retained-test-event"},
@@ -334,7 +354,8 @@ void three_endpoint_export() {
   const auto failure = failed.status();
   check(failure.at("state") == "ready" && !failure.at("complete").get<bool>(),
         ("exhausted upload retry did not finish as partial: " + failure.dump()).c_str());
-  check(failure.at("manifest").at("vehicle").at("reason") == "vehicle_upload_failed", "worker swallowed upload failure");
+  check(failure.at("manifest").at("vehicle").at("reason") == "vehicle_upload_failed",
+        ("worker swallowed upload failure: " + failure.dump()).c_str());
   worker.request_stop(); worker.join();
   // A pending vehicle upload must not turn a desktop close into a 3-minute join.
   auto pending = std::make_unique<ControllerLogExport>(origin, std::vector<std::string>{}, fs::path{},
@@ -343,6 +364,8 @@ void three_endpoint_export() {
   check(pending->status().at("state") == "collecting", "export was not pending");
   const auto cancelled_at = std::chrono::steady_clock::now(); pending.reset();
   check(std::chrono::steady_clock::now() - cancelled_at < std::chrono::seconds(3), "export cancellation blocked shutdown");
+  heartbeat.request_stop(); heartbeat.join();
+  check(!heartbeat_failed, "fixture lost authenticated vehicle heartbeat");
   server.stop();
 }
 }

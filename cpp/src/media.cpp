@@ -169,6 +169,17 @@ std::string build_camera_input_pipeline(
   return pipeline.str();
 }
 
+std::string build_encoded_frame_queue(std::string_view name, int max_buffers) {
+  if (name.empty() || max_buffers <= 0) {
+    throw std::invalid_argument("encoded frame queue configuration is invalid");
+  }
+  // H.264/H.265 access units can reference earlier frames. Backpressure must
+  // reach the raw-input queues, where dropping old frames is independent.
+  return "queue name=" + std::string(name) + " max-size-buffers=" +
+      std::to_string(max_buffers) +
+      " max-size-bytes=0 max-size-time=0 leaky=no ";
+}
+
 namespace {
 
 std::string environment_or(std::string_view name, std::string fallback) {
