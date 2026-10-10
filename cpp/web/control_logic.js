@@ -1053,6 +1053,15 @@
 
   function deriveControlCommandRejection(issueCodeValue) {
     const issueCode = String(issueCodeValue || '');
+    if (issueCode === 'control_input_rearm_required') {
+      return {
+        issueCode,
+        action: 'rearm_input',
+        clearInput: true,
+        severity: 'warn',
+        text: '控制命令短暂中断，输入已清除并保持当前挡位；请释放控制键后重新按下。',
+      };
+    }
     if (issueCode === 'vcu_drive_gear_change_moving_or_stale') {
       return {
         issueCode,

@@ -2295,6 +2295,30 @@ int main() {
     ::close(pressure_transport[0]);
     ::close(pressure_transport[1]);
     const auto pressure_events = read_json_lines(pressure_log_path);
+    std::size_t final_park_batch = pressure_events.size();
+    std::size_t disarm_complete = pressure_events.size();
+    for (std::size_t index = 0; index < pressure_events.size(); ++index) {
+      const auto& event = pressure_events[index];
+      if (event.value("kind", "") == "can_tx_batch" &&
+          event.value("state", "") == "disarmed" &&
+          event.value("send_ok", false)) {
+        bool parked = false;
+        bool neutral = false;
+        for (const auto& frame : event.at("frames")) {
+          if (frame.value("id", "") == "0x18FBD0F5") {
+            parked = frame.value("data", "") == "02 02 02 02 00 00 00 00";
+          }
+          if (frame.value("id", "") == "0x18FCD0F5") {
+            neutral = frame.value("data", "") == "00 01 00 00 00 00 00 00";
+          }
+        }
+        expect(parked && neutral, "final disarmed CAN batch withdrew EPB park or N");
+        if (final_park_batch == pressure_events.size()) final_park_batch = index;
+      }
+      if (event.value("name", "") == "disarm_complete") disarm_complete = index;
+    }
+    expect(final_park_batch < disarm_complete,
+        "close reported disarm_complete before a successful parked CAN batch");
     expect(
         std::any_of(
             pressure_events.begin(),

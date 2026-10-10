@@ -1756,6 +1756,8 @@ struct VehicleMediaRuntime::Impl {
               result.reason,
               result.issue_code == "vcu_drive_gear_change_moving_or_stale"
                   ? "Stop the vehicle, restore fresh speed and gear feedback, release the direction control, and select the intended gear again."
+                  : result.issue_code == "control_input_rearm_required"
+                  ? "Send fresh zero-traction/zero-steering input in the current gear, then release and press the controls again."
                   : feedback_problem
                   ? "Inspect VCU feedback freshness and the VCU JSONL log before requesting control."
                   : "Inspect command identity, sequence, timing, token, and configured safety limits.",
@@ -1765,6 +1767,8 @@ struct VehicleMediaRuntime::Impl {
                {"safety_action",
                 result.issue_code == "vcu_drive_gear_change_moving_or_stale"
                     ? "traction_withdrawn_retained_gear"
+                    : result.issue_code == "control_input_rearm_required"
+                    ? "fresh_neutral_input_requested"
                     : "local_full_stop"}});
         }
       }
@@ -2242,6 +2246,8 @@ struct VehicleMediaRuntime::Impl {
     const std::string stable_issue_code =
         issue_code == "vcu_drive_gear_change_moving_or_stale"
         ? "vcu_drive_gear_change_moving_or_stale"
+        : issue_code == "control_input_rearm_required"
+        ? "control_input_rearm_required"
         : "vcu_control_apply_rejected";
     const auto timestamp_ms = signaling.now_ms();
     if (stable_issue_code == last_control_rejection_status_issue_code &&

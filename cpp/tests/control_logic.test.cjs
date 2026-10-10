@@ -363,6 +363,22 @@ test('status sequence rejects stale values and reports accepted gaps', () => {
 });
 
 test('control rejection presentation exposes only stable issue-code guidance', () => {
+  const rearm = logic.deriveControlCommandRejection('control_input_rearm_required');
+  assert.equal(rearm.action, 'rearm_input');
+  assert.equal(rearm.clearInput, true);
+  assert.equal(rearm.severity, 'warn');
+  const pressed = logic.createKeySet(['ArrowUp', 'ArrowLeft']);
+  const blocked = logic.createKeySet();
+  logic.blockAndClearKeys(pressed, blocked);
+  assert.equal(logic.deriveKeyState(pressed).up, false);
+  assert.equal(logic.deriveKeyState(pressed).left, false);
+  assert.equal(logic.pressKey(pressed, blocked, 'ArrowUp').accepted, false);
+  assert.equal(logic.pressKey(pressed, blocked, 'ArrowLeft').accepted, false);
+  logic.releaseKey(pressed, blocked, 'ArrowUp');
+  logic.releaseKey(pressed, blocked, 'ArrowLeft');
+  assert.equal(logic.pressKey(pressed, blocked, 'ArrowUp').accepted, true);
+  assert.equal(logic.pressKey(pressed, blocked, 'ArrowLeft').accepted, true);
+
   const gearRejected = logic.deriveControlCommandRejection(
       'vcu_drive_gear_change_moving_or_stale');
   assert.deepEqual(gearRejected, {

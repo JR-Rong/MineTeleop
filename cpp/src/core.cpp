@@ -3183,10 +3183,20 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     evaluate_control_watchdog(timestamp_ms);
     result = receiver_.accept(command, timestamp_ms);
   }
-  if (!result.accepted || !result.command) return result;
+  if (!result.accepted || !result.command) {
+    if (result.reason == "command_gap_exceeded" && active_session_profile_ &&
+        (safety_.state() == SafetyState::ControlActive ||
+         safety_.state() == SafetyState::Degraded)) {
+      result.issue_code = "control_input_rearm_required";
+    }
+    return result;
+  }
   auto& effective = *result.command;
   if (!effective.estop && !active_session_profile_) {
-    if (!adapter_safe_stop_active_) {
+    // A hard timeout already owns the staged watchdog stop. Do not replace it
+    // with SessionProfileRequired when the next packet observes the revocation.
+    if (!adapter_safe_stop_active_ &&
+        safety_.state() != SafetyState::TimeoutBrake) {
       adapter_->apply_safe_stop(
           ControlOutput{"N", 0.0, 0.0, 1.0, false, true},
           {VehicleStopSource::SoftwareFault,
@@ -3202,6 +3212,7 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     result.accepted = false;
     result.reason = "degraded_neutral_required";
     result.command.reset();
+    result.issue_code = "control_input_rearm_required";
     return result;
   }
   const auto vehicle_limited_throttle =

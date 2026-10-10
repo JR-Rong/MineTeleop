@@ -1858,6 +1858,7 @@ class BridgeRuntime {
           MINE_TELEOP_CHASSIS_STOP_REASON_SESSION_LOST);
       latch_stop_provenance_locked(stop_context.source, stop_context.reason);
       controller_.request_disarm();
+      disarmed_transmitted_ = false;
       software_estop_ = true;
       logger_.event(
           "disarm_requested",
@@ -1873,10 +1874,14 @@ class BridgeRuntime {
     bool disarmed = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
-      disarmed = condition_.wait_for(
+      condition_.wait_for(
           lock,
           std::chrono::duration<double>(kDisarmTimeoutSeconds),
-          [&] { return controller_.disarmed() || !running_.load(); });
+          [&] {
+            return (controller_.disarmed() && disarmed_transmitted_) ||
+                !running_.load();
+          });
+      disarmed = controller_.disarmed() && disarmed_transmitted_;
     }
     if (!disarmed) {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -2980,7 +2985,6 @@ class BridgeRuntime {
           next_feedback_log = Clock::now() + std::chrono::milliseconds(500);
         }
         update_feedback_locked();
-        condition_.notify_all();
       }
 
       std::vector<std::uint32_t> failed_send_ids;
@@ -2992,6 +2996,16 @@ class BridgeRuntime {
           transmit_state,
           ++transmit_cycle,
           failed_send_ids);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // close() must not report completion before the final safe batch has
+        // actually reached the CAN socket. Failed sends keep the wait active.
+        disarmed_transmitted_ = failed_send_ids.empty() &&
+            (transmit_state == mine_teleop::vcu::State::Standby ||
+             transmit_state == mine_teleop::vcu::State::Disarmed) &&
+            controller_.disarmed();
+        condition_.notify_all();
+      }
       if (failed_send_ids.empty()) {
         consecutive_send_failures = 0;
       } else if (++consecutive_send_failures == 3) {
@@ -3061,6 +3075,7 @@ class BridgeRuntime {
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   SocketCan socket_;
+  bool disarmed_transmitted_{false};
   ProtocolLogger logger_;
   ParallelController controller_;
   std::atomic<bool> running_{false};

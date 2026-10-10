@@ -1423,7 +1423,7 @@ async function startFromOffer(offer){
             if(gearRejectionMatched){rollbackFrom=pendingGearTransition.toGear;rollbackTo=pendingGearTransition.fromGear}
             selectedGear=gearRejectionState.selectedGear;pendingGearRequest=gearRejectionState.pendingGearRequest;pendingGearTransition=gearRejectionState.pendingGearTransition;gearRejectionInhibited=gearRejectionState.inhibitOrdinaryControl;clearControlInput(false);
             if(gearRejectionState.sendRollback)send({},false).catch(console.error);
-          }else if(rejection.clearInput)clearControlInput();
+          }else if(rejection.action==='rearm_input'){clearControlInput(false);send({},false).catch(console.error)}else if(rejection.clearInput)clearControlInput();
           statusPanel.textContent=gearRejectionMatched?rejection.text:(rejection.action==='rollback_gear_change'?'换挡拒绝无法关联，普通控制已冻结；请安全断开并重新握手。':rejection.text);
           const commandSeq=Number(message.command_seq);
           clientLog('driver_control_command_rejected',{issue_code:rejection.issueCode,command_seq:Number.isSafeInteger(commandSeq)&&commandSeq>0?commandSeq:null,gear_rejection_matched:gearRejectionMatched,rollback_from:rollbackFrom,rollback_to:rollbackTo});
