@@ -3622,7 +3622,9 @@ void test_local_proxy_preserves_upstream_auth_status() {
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
   signaling_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
-  signaling_config.token_ttl_ms = 80;
+  // Leave room for login on loaded/emulated builders, then observe actual
+  // server expiry instead of assuming a short fixed sleep crossed its clock.
+  signaling_config.token_ttl_ms = 1000;
   signaling_config.connection_reaper_interval_ms = 5;
   auto signaling = std::make_shared<mine_teleop::SignalingService>(std::move(signaling_config));
   mine_teleop::SimpleHttpServer server(
@@ -3640,7 +3642,13 @@ void test_local_proxy_preserves_upstream_auth_status() {
   auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(
       driver_config, "vehicle-001", "dev-password");
   static_cast<void>(runtime->login("dev-password"));
-  std::this_thread::sleep_for(std::chrono::milliseconds(130));
+  const auto expiry_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (signaling->health().value("online_drivers", std::size_t{1}) != 0 &&
+         std::chrono::steady_clock::now() < expiry_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  expect(signaling->health().value("online_drivers", std::size_t{1}) == 0,
+      "test driver token did not expire on the server");
 
   mine_teleop::DriverConsoleHttpApp app(runtime);
   mine_teleop::HttpRequest request;

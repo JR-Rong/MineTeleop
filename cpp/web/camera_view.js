@@ -49,18 +49,19 @@
       if(shown){emitFrame({...shown,source_trace:trace,association:'rtp_exact_late_sidecar'});presentedTraces.delete(key);}
       else{frameTraces.set(key,trace);boundFrames(frameTraces);}}
     function reportFrame(id,metadata){
-      const now=performance.now(),prior=reportedStreams.get(id),frames=metadata?.presentedFrames;
+      metadata=metadata||{};
+      const now=performance.now(),prior=reportedStreams.get(id),frames=metadata.presentedFrames;
       if(Number.isFinite(frames)&&(!prior||frames>prior.frames))reportedStreams.set(id,{at:now,frames,gap:!prior||prior.gap||now-prior.at>100});
-      const key=id+':'+metadata?.rtpTimestamp,trace=frameTraces.get(key);
-      const detail={stream_id:id,rtp_timestamp:metadata?.rtpTimestamp??null,presented_frames:metadata?.presentedFrames,
-        media_time:metadata?.mediaTime,display_monotonic_ms:performance.now(),browser_time_origin_ms:performance.timeOrigin,
+      const key=id+':'+metadata.rtpTimestamp,trace=frameTraces.get(key);
+      const detail={stream_id:id,rtp_timestamp:metadata.rtpTimestamp==null?null:metadata.rtpTimestamp,presented_frames:metadata.presentedFrames,
+        media_time:metadata.mediaTime,display_monotonic_ms:performance.now(),browser_time_origin_ms:performance.timeOrigin,
         source_trace:trace||null,association:trace?'rtp_exact':'unmatched',capture_time_quality:'browser_estimate'};
-      emitFrame(detail);if(trace)frameTraces.delete(key);else if(Number.isInteger(metadata?.rtpTimestamp)){presentedTraces.set(key,detail);boundFrames(presentedTraces);}}
+      emitFrame(detail);if(trace)frameTraces.delete(key);else if(Number.isInteger(metadata.rtpTimestamp)){presentedTraces.set(key,detail);boundFrames(presentedTraces);}}
     function loadLayout(){try{const saved=JSON.parse(localStorage.getItem('mine-teleop-layout:'+scope)||'{}');layout=saved&&typeof saved==='object'&&!Array.isArray(saved)?saved:{}}catch{layout={}}}
     function saveLayout(){try{localStorage.setItem('mine-teleop-layout:'+scope,JSON.stringify(layout))}catch{}}
     function reflow(){
       grid.classList.add('camera-adjustable-grid');
-      for(const [id,entry] of entries){const span=focus?(id===focus?10:2):Math.max(2,Math.min(12,Number(layout[id]?.span)||6));
+      for(const [id,entry] of entries){const span=focus?(id===focus?10:2):Math.max(2,Math.min(12,Number(layout[id]&&layout[id].span)||6));
         entry.box.style.gridColumn='span '+span;entry.box.style.aspectRatio=String(entry.aspect||16/9);
         entry.box.style.order=focus&&id===focus?'-1':'';entry.box.style.maxHeight='none';
         entry.box.classList.toggle('camera-focused',id===focus);}
@@ -78,7 +79,7 @@
           const done=()=>{handle.removeEventListener('pointermove',move);handle.removeEventListener('pointerup',done);handle.removeEventListener('pointercancel',done);saveLayout();};
           handle.addEventListener('pointermove',move);handle.addEventListener('pointerup',done);handle.addEventListener('pointercancel',done);
         });
-        handle.addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key))return;event.preventDefault();focus=null;layout[id]={span:Math.max(2,Math.min(12,(Number(layout[id]?.span)||6)+(['ArrowRight','ArrowUp'].includes(event.key)?1:-1)))};reflow();saveLayout();});
+        handle.addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key))return;event.preventDefault();focus=null;layout[id]={span:Math.max(2,Math.min(12,(Number(layout[id]&&layout[id].span)||6)+(['ArrowRight','ArrowUp'].includes(event.key)?1:-1)))};reflow();saveLayout();});
         entry.box.append(handle);
       }
     }
@@ -95,7 +96,7 @@
       if(video.readyState<2)return;
       let frame;try{frame=new VideoFrame(video,{timestamp:Math.round((metadata.captureTime||metadata.expectedDisplayTime||performance.now())*1000)});}catch{return;}
 
-      pendingFrames.set(id,{id,frame,rtp_timestamp:metadata.rtpTimestamp??null,received:performance.timeOrigin+performance.now(),aligned:performance.timeOrigin+(metadata.captureTime||metadata.expectedDisplayTime||performance.now())});sendWorkerFrames();
+      pendingFrames.set(id,{id,frame,rtp_timestamp:metadata.rtpTimestamp==null?null:metadata.rtpTimestamp,received:performance.timeOrigin+performance.now(),aligned:performance.timeOrigin+(metadata.captureTime||metadata.expectedDisplayTime||performance.now())});sendWorkerFrames();
     }
     function startBev(calibration){
       if(!calibration||!['fish_front','fish_rear','fish_left','fish_right'].every(id=>entries.has(id)))return;
@@ -170,10 +171,11 @@
       descriptors=new Map((options.streams||ids.filter(item=>typeof item==='object')).map(item=>[item.stream_id||item.camera_id,item]));
       const panels=[];
       for(const item of ids){const id=typeof item==='string'?item:item.stream_id||item.camera_id,description=descriptors.get(id);
-        if(description?.kind==='drive_mosaic')for(const region of description.regions||[])panels.push(region.camera_id);else panels.push(id);}
+        if(description&&description.kind==='drive_mosaic')for(const region of description.regions||[])panels.push(region.camera_id);else panels.push(id);}
       for(const id of orderedCameraIds(panels)){const entry=ensure(id);const stream=[...descriptors.values()].find(item=>(item.regions||[]).some(region=>region.camera_id===id))||descriptors.get(id);
-        if(stream?.kind==='surround_bev')entry.aspect=stream.width/stream.height;}
-      reorder();reflow();if(options.mode!=='two'&&options.calibration?.acceptance?.profiles?.full)startBev(options.calibration);
+        if(stream&&stream.kind==='surround_bev')entry.aspect=stream.width/stream.height;}
+      const acceptance=options.calibration&&options.calibration.acceptance;
+      reorder();reflow();if(options.mode!=='two'&&acceptance&&acceptance.profiles&&acceptance.profiles.full)startBev(options.calibration);
     }
 
     function presentedFrames(video) {
@@ -196,7 +198,7 @@
 
     function attach(id, track) {
       const description=descriptors.get(id);
-      if(description?.kind==='drive_mosaic'){
+      if(description&&description.kind==='drive_mosaic'){
         const video=document.createElement('video');video.muted=true;video.autoplay=true;video.playsInline=true;video.style.cssText='position:absolute;width:1px;height:1px;opacity:0;pointer-events:none';grid.append(video);video.srcObject=new MediaStream([track]);
         const panels=(description.regions||[]).map(region=>{const entry=ensure(region.camera_id);entry.video.hidden=true;entry.track=track;entry.mosaicFrames=0;entry.aspect=region.width/region.height;entry.canvas=document.createElement('canvas');entry.canvas.width=region.width;entry.canvas.height=region.height;entry.box.append(entry.canvas);return {entry,region};});
         const ownGeneration=generation;let callback=0;

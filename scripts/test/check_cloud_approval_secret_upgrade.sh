@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Run the actual deploy script and signaling binary in disposable containers.
-# Only service-manager/proxy commands are stubbed; no host /etc or /opt is touched.
+# Only service-manager/proxy commands are stubbed. The supported deployment
+# environment uses real, pinned coturn/SQLite; no host /etc or /opt is touched.
 bundle="${1:-}"
 [[ -d "$bundle" && -f "$bundle/deploy-cloud.sh" ]] || {
   printf 'usage: %s /path/to/extracted-cloud-bundle\n' "$0" >&2
@@ -16,6 +17,14 @@ cleanup() {
   rm -rf "$temporary"
 }
 trap cleanup EXIT
+fixture_image="mine-teleop-cloud-upgrade-fixture:coturn461"
+docker build --platform linux/amd64 -t "$fixture_image" - <<'DOCKERFILE'
+FROM ubuntu:24.04
+RUN apt-get -o Acquire::Retries=5 update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y \
+      --no-install-recommends coturn=4.6.1-1build4 sqlite3 && \
+    rm -rf /var/lib/apt/lists/*
+DOCKERFILE
 cat >"$temporary/check.sh" <<'CONTAINER'
 set -eu
 set -o pipefail
@@ -42,7 +51,7 @@ auth:
       device_token_file: secrets/identity
       mobile_approval_required: true
 YAML
-for command in systemctl caddy curl haproxy turnserver; do
+for command in systemctl caddy curl haproxy; do
   ln -s /bin/true "/tmp/stubs/$command"
 done
 export PATH="/tmp/stubs:$PATH"
@@ -88,7 +97,7 @@ printf 'cloud_approval_upgrade=%s passed (two upgrades, two validation directori
 CONTAINER
 for scenario in migrate preserve override; do
   container_id="$(docker create --platform linux/amd64 -e "SCENARIO=$scenario" \
-    ubuntu:22.04 bash /tmp/check.sh)"
+    "$fixture_image" bash /tmp/check.sh)"
   docker cp "$bundle" "$container_id:/bundle"
   docker cp "$temporary/check.sh" "$container_id:/tmp/check.sh"
   docker start --attach "$container_id"

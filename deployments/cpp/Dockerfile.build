@@ -204,7 +204,12 @@ ARG MINE_TELEOP_BUILD_JOBS=2
 ARG MINE_TELEOP_BUILD_TESTS=OFF
 
 COPY --from=aravis /opt/aravis /opt/aravis
-ENV PKG_CONFIG_PATH="/opt/aravis/lib/pkgconfig"
+# Compile and test against the same pinned API as the bundled runtime. Distro
+# 1.20 headers cannot enable the selected-candidate-pair API shipped in 1.28.
+COPY --from=gstreamer /opt/gstreamer /opt/gstreamer
+ENV PKG_CONFIG_PATH="/opt/gstreamer/lib/pkgconfig:/opt/aravis/lib/pkgconfig"
+ENV LD_LIBRARY_PATH="/opt/gstreamer/lib:/opt/aravis/lib"
+ENV GST_PLUGIN_SYSTEM_PATH="/opt/gstreamer/lib/gstreamer-1.0"
 
 WORKDIR /src
 COPY . .

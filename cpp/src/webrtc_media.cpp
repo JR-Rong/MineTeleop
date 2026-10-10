@@ -11,8 +11,10 @@
 #include <gst/sdp/sdp.h>
 #define GST_USE_UNSTABLE_API
 #include <gst/webrtc/webrtc.h>
+#if GST_CHECK_VERSION(1,28,0)
 #include <gst/webrtc/ice.h>
 #include <gst/webrtc/icetransport.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
