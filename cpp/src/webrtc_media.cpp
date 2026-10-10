@@ -533,11 +533,13 @@ struct VehicleMediaRuntime::Impl {
     std::unique_ptr<CameraFrameSource> source;
     GstElement* appsrc{nullptr};
     GstElement* encoder{nullptr};
+    GstElement* send_queue{nullptr};
     std::thread thread;
     std::atomic<std::uint64_t> captured{0};
     std::atomic<std::uint64_t> pushed{0};
     std::atomic<std::uint64_t> encoded{0};
     std::atomic<std::uint64_t> dropped{0};
+    std::atomic<std::uint64_t> encoded_queue_backpressure{0};
     std::atomic<bool> source_sequence_valid{false};
     std::atomic<std::uint64_t> source_sequence{0};
     std::atomic<std::uint64_t> source_sequence_gap{0};
@@ -2809,7 +2811,7 @@ struct VehicleMediaRuntime::Impl {
           << "! " << parser << " config-interval=-1 "
           << "! " << elementary_caps << ",stream-format=byte-stream,alignment=au "
           << "! tee name=encoded_" << id << ' '
-          << "encoded_" << id << ". ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream "
+          << "encoded_" << id << ". ! " << build_encoded_frame_queue("send_queue_" + id, 2)
           << "! " << payloader << " name=pay_" << id << " config-interval=-1 pt=" << payload_type << ' '
           << "! application/x-rtp,media=video,encoding-name=" << encoding_name << ",payload=" << payload_type
           << (encoder.codec() == VideoCodec::H265
@@ -2822,9 +2824,8 @@ struct VehicleMediaRuntime::Impl {
         std::filesystem::create_directories(directory);
         const auto pattern = directory / (std::to_string(signaling.now_ms()) + "_" + lane->camera.id + "_%05d.mp4");
         pipeline_text
-            << "encoded_" << id << ". ! queue max-size-buffers="
-            << std::max(2, lane->profile.fps * 2)
-            << " max-size-bytes=0 max-size-time=0 leaky=downstream "
+            << "encoded_" << id << ". ! "
+            << build_encoded_frame_queue("record_queue_" + id, std::max(2, lane->profile.fps * 2))
             << "! " << parser << " config-interval=-1 "
             << "! " << elementary_caps << ",stream-format=" << recording_stream_format << ",alignment=au "
             << "! splitmuxsink name=recorder_" << id
@@ -3014,7 +3015,8 @@ struct VehicleMediaRuntime::Impl {
       const auto id = pipeline_identifier(lane->camera.id);
       lane->appsrc = gst_bin_get_by_name(GST_BIN(pipeline), ("source_" + id).c_str());
       lane->encoder = gst_bin_get_by_name(GST_BIN(pipeline), ("encoder_" + id).c_str());
-      if (lane->appsrc == nullptr || lane->encoder == nullptr) {
+      lane->send_queue = gst_bin_get_by_name(GST_BIN(pipeline), ("send_queue_" + id).c_str());
+      if (lane->appsrc == nullptr || lane->encoder == nullptr || lane->send_queue == nullptr) {
         set_pipeline_error(
             "media pipeline lane is incomplete: " + lane->camera.id,
             "gstreamer_camera_lane_incomplete",
@@ -3025,6 +3027,9 @@ struct VehicleMediaRuntime::Impl {
         stop_pipeline();
         return false;
       }
+      g_signal_connect(lane->send_queue, "overrun", G_CALLBACK(+[](GstElement*, gpointer data) {
+        ++static_cast<Lane*>(data)->encoded_queue_backpressure;
+      }), lane.get());
       GstPad* encoder_src = gst_element_get_static_pad(lane->encoder, "src");
       if (encoder_src != nullptr) {
         gst_pad_add_probe(encoder_src, GST_PAD_PROBE_TYPE_BUFFER, count_encoded, lane.get(), nullptr);
@@ -3335,6 +3340,10 @@ struct VehicleMediaRuntime::Impl {
         gst_object_unref(lane->encoder);
         lane->encoder = nullptr;
       }
+      if (lane->send_queue != nullptr) {
+        gst_object_unref(lane->send_queue);
+        lane->send_queue = nullptr;
+      }
     }
     if (webrtc != nullptr) {
       gst_object_unref(webrtc);
@@ -3521,6 +3530,10 @@ struct VehicleMediaRuntime::Impl {
       const auto appsrc_queued_buffers = lane->appsrc == nullptr
           ? guint64{0}
           : gst_app_src_get_current_level_buffers(GST_APP_SRC(lane->appsrc));
+      guint encoded_queued_buffers = 0;
+      if (lane->send_queue != nullptr) {
+        g_object_get(lane->send_queue, "current-level-buffers", &encoded_queued_buffers, nullptr);
+      }
       result.push_back({
           {"camera_id", lane->camera.id},
           {"critical_for_control", lane->camera.critical_for_control},
@@ -3532,6 +3545,8 @@ struct VehicleMediaRuntime::Impl {
           {"pipeline_backlog_or_drop_frames", lane->pushed.load() > lane->encoded.load() ? lane->pushed.load() - lane->encoded.load() : 0},
           {"appsrc_queued_buffers", appsrc_queued_buffers},
           {"appsrc_queue_limit_buffers", kCameraAppSrcMaxBuffers},
+          {"encoded_queued_buffers", encoded_queued_buffers},
+          {"encoded_queue_backpressure_count", lane->encoded_queue_backpressure.load()},
           {"failure_count", lane->failure_count.load()},
           {"reopen_count", lane->reopen_count.load()},
           {"encoded_fps", lane->encoded.load() * 1000.0 / static_cast<double>(std::max<std::int64_t>(1, elapsed_ms))},
@@ -3721,6 +3736,7 @@ struct VehicleMediaRuntime::Impl {
       }
       const auto deadline = duration_ms > 0 ? total_started_ms + duration_ms : std::numeric_limits<std::int64_t>::max();
       auto next_media_status_ms = signaling.now_ms();
+      auto next_media_log_monotonic_ms = steady_now_ms();
       while (!frame_target_reached(frame_count) && (continuous || signaling.now_ms() < deadline)) {
         while (g_main_context_iteration(nullptr, false)) {
         }
@@ -3769,13 +3785,24 @@ struct VehicleMediaRuntime::Impl {
           }
         }
         if (signaling.now_ms() >= next_media_status_ms) {
+          const Json status = {
+              {"codec", to_string(candidate.codec)},
+              {"backend", to_string(candidate.backend)},
+              {"control_issue_code", control_inhibited.load() ? "critical_camera_failed" : ""},
+              {"time_sync", signaling.time_sync_status().to_json()},
+              {"lanes", lane_metrics(std::max<std::int64_t>(1, signaling.now_ms() - attempt_started))}};
+          if (steady_now_ms() >= next_media_log_monotonic_ms) {
+            std::cout << Json({
+                {"event", "vehicle_media_status"},
+                {"event_at_utc_ms", signaling.now_ms()},
+                {"event_at_monotonic_ms", steady_now_ms()},
+                {"vehicle_id", config.vehicle_id},
+                {"session_id", signaling.session_id()},
+                {"status", status}}).dump() << '\n';
+            next_media_log_monotonic_ms = steady_now_ms() + 5000;
+          }
           queue_signal(
-              "media_status",
-              {{"codec", to_string(candidate.codec)},
-               {"backend", to_string(candidate.backend)},
-               {"control_issue_code", control_inhibited.load() ? "critical_camera_failed" : ""},
-               {"time_sync", signaling.time_sync_status().to_json()},
-               {"lanes", lane_metrics(std::max<std::int64_t>(1, signaling.now_ms() - attempt_started))}});
+              "media_status", status);
           next_media_status_ms = signaling.now_ms() + 1000;
         }
         if (simulate_primary_failure_after_frames > 0 && candidate_index == 0 && !simulated_failure_fired &&

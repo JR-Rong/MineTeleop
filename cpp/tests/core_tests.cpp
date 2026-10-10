@@ -6,8 +6,11 @@
 #include "mine_teleop/video.hpp"
 
 #include <gst/gst.h>
+#include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <filesystem>
@@ -1046,6 +1049,66 @@ void test_ccg2_camera_input_pipeline_is_gstreamer_parseable() {
   expect(
       parsed,
       "GStreamer could not parse the CCG2 30-to-25 FPS input pipeline: " + error);
+}
+
+void test_encoded_frame_queues_preserve_reference_frames_under_backpressure() {
+  gst_init(nullptr, nullptr);
+  for (const auto codec : {"h264", "h265"}) {
+    for (const auto limit : {2, 60}) {
+      const auto description = "appsrc name=input is-live=true format=time caps=video/x-" +
+          std::string(codec) + ",stream-format=byte-stream,alignment=au ! " +
+          mine_teleop::build_encoded_frame_queue("encoded_queue", limit) +
+          "! appsink name=output max-buffers=1 drop=false sync=false";
+      GError* error = nullptr;
+      auto* pipeline = gst_parse_launch(description.c_str(), &error);
+      const std::string parse_error = error == nullptr ? "" : error->message;
+      if (error != nullptr) g_error_free(error);
+      if (pipeline == nullptr || !parse_error.empty()) {
+        if (pipeline != nullptr) gst_object_unref(pipeline);
+        throw TestFailure("encoded queue pipeline did not parse: " + parse_error);
+      }
+      auto* input = gst_bin_get_by_name(GST_BIN(pipeline), "input");
+      auto* output = gst_bin_get_by_name(GST_BIN(pipeline), "output");
+      auto* queue = gst_bin_get_by_name(GST_BIN(pipeline), "encoded_queue");
+      std::atomic<bool> full{false};
+      g_signal_connect(queue, "overrun", G_CALLBACK(+[](GstElement*, gpointer data) {
+        static_cast<std::atomic<bool>*>(data)->store(true);
+      }), &full);
+      const auto state = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+      const auto count = limit + 8;
+      bool pushed = true;
+      for (int index = 0; index < count; ++index) {
+        auto* buffer = gst_buffer_new_allocate(nullptr, 1, nullptr);
+        GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(index) * GST_MSECOND;
+        if (index != 0) GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+        pushed = gst_app_src_push_buffer(GST_APP_SRC(input), buffer) == GST_FLOW_OK && pushed;
+      }
+      gst_app_src_end_of_stream(GST_APP_SRC(input));
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (!full && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      int delivered = 0;
+      bool ordered = true;
+      while (auto* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(output), 2 * GST_SECOND)) {
+        const auto* buffer = gst_sample_get_buffer(sample);
+        ordered = ordered && GST_BUFFER_PTS(buffer) == static_cast<GstClockTime>(delivered) * GST_MSECOND;
+        ++delivered;
+        gst_sample_unref(sample);
+      }
+      gst_element_set_state(pipeline, GST_STATE_NULL);
+      gst_object_unref(input);
+      gst_object_unref(output);
+      gst_object_unref(queue);
+      gst_object_unref(pipeline);
+      expect(state != GST_STATE_CHANGE_FAILURE && pushed && full,
+             "encoded queue fixture did not establish downstream backpressure");
+      expect(delivered == count && ordered,
+             "encoded queue discarded or reordered reference access units: codec=" +
+                 std::string(codec) + ", limit=" + std::to_string(limit) +
+                 ", delivered=" + std::to_string(delivered) + "/" + std::to_string(count));
+    }
+  }
 }
 
 void test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap() {
@@ -4126,6 +4189,7 @@ int main() {
       {"camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2", test_camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2},
       {"camera_input_pipeline_resamples_only_mismatched_ccg2_fps", test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps},
       {"ccg2_camera_input_pipeline_is_gstreamer_parseable", test_ccg2_camera_input_pipeline_is_gstreamer_parseable},
+      {"encoded_frame_queues_preserve_reference_frames_under_backpressure", test_encoded_frame_queues_preserve_reference_frames_under_backpressure},
       {"v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap", test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap},
       {"camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults", test_camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults},
       {"ccg2_example_config_defines_two_explicit_capture_lanes", test_ccg2_example_config_defines_two_explicit_capture_lanes},
