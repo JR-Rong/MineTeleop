@@ -6,7 +6,7 @@
 
 - Vehicle Agent：运行在车端 Ubuntu 工控机。
 - Driver Console：运行在远端模拟驾驶器 Windows/Linux。
-- Cloud Control Plane：云端信令、鉴权、会话和上传协调服务。
+- Cloud Control Plane：云端信令、鉴权、会话和中转准入服务。
 - Realtime Relay：STUN/TURN 或后续 SFU/媒体中继节点。
 
 ```mermaid
@@ -65,7 +65,7 @@ flowchart LR
 1. Camera Source 采集原始帧。
 2. Preprocess 分流：
    - 实时流：缩放到实时配置分辨率，例如 720p。
-   - 录像流：保留采集原分辨率。
+   - 两路模式：车端行车分区合成和标定鸟瞰，输出描述绑定源相机。
 3. Realtime Encoder 使用低延迟编码参数生成 H.264。
 4. WebRTC 通过 P2P 或 TURN UDP 发送到驾驶端。
 5. 驾驶端解码并显示。
@@ -75,7 +75,7 @@ flowchart LR
 - 实时流使用短队列。
 - 网络拥塞时优先丢旧帧。
 - 允许动态调整码率、帧率或分辨率。
-- 不允许上传任务影响实时编码线程。
+- 日志收集不能影响实时编码线程。
 
 ### 控制链路
 
@@ -96,20 +96,9 @@ flowchart LR
 - 急停命令一旦到达车端即锁存，不依赖驾驶端持续发送。
 - 云端只做鉴权和有界的 latest-only 命令暂存/转发，不执行车辆控制或安全决策，也不允许旧命令积压重放。
 
-### 录像上传链路
+### 环视与中转准入
 
-1. Record Encoder 生成分段文件。
-2. Segment Recorder 写入本地目录和元数据。
-3. Upload Queue 根据策略挑选文件。
-4. Uploader 逐文件直传对象存储；默认不做 zip/tar 打包或二次转码。
-5. 上传状态更新到本地索引。
-
-设计要求：
-
-- 上传低优先级。
-- 支持断点重试。
-- 支持限速。
-- 支持磁盘水位保护。
+车端两路合成、逐相机健康检查、控制代次、停车确认及中转闭环见 [当前架构](surround-and-relay.md)。视频录制和上传进程已移除；既有录像保留。
 
 ## 进程划分建议
 
@@ -117,7 +106,6 @@ flowchart LR
 
 - 当前 `vehicle-runtime` 由原生媒体进程建立 WebRTC 视频以及用于 profile/VCU/status 的 DataChannel，并由独立 control-only WSS 接收控制命令、独立 50 ms 线程推进看门狗；车端仍运行 Control Receiver、Safety State Machine 与 Vehicle Adapter，控制 WSS 失联和进程正常退出都会本地全停。
 - 在接入真实 CAN 前，仍必须用进程强杀、媒体阻塞和底层控制器看门狗完成故障隔离验收；如果底层看门狗不能独立保证停车，再把安全执行拆为独立高优先级进程和有界本地 IPC。
-- `vehicle-uploader`：低优先级上传进程或独立服务，负责上传队列、限速和重试。
 - `mine-teleop-control`：跨平台 C++ 回环服务，使用系统浏览器呈现驾驶页面；浏览器提交最新输入意图，原生线程以 20 Hz 通过独立控制 WSS 发送命令。
 - `signaling-server`：云端信令和会话管理服务。
 - `turn-server`：coturn 或等价 TURN 服务。
@@ -126,7 +114,6 @@ flowchart LR
 
 后续可继续拆分：
 
-- `vehicle-recorder`
 
 拆分前提是接口稳定，且有监控和进程监管能力。
 
@@ -163,4 +150,4 @@ flowchart LR
 
 驾驶端不应直接绕过会话系统控制车辆。所有控制命令必须带有会话身份和控制权验证。
 
-录像上传不属于实时控制路径。上传失败只能影响云端归档状态，不应影响视频预览和控制命令。
+视频录制与上传由外部项目承担；本项目仅保留日志收集、控制审计和标定照片。

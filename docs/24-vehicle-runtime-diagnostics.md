@@ -208,7 +208,6 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `vehicle_media_connection_stale` / `vehicle_connection_generation_stale` | HTTP 409 `vehicle_connection_generation_stale` | `server_issue_code`, `safety_action=local_full_stop` | 非自动重试，进程 fail-closed |
 | `vehicle_media_signaling_sequence_conflict` / `signaling_sequence_conflict` | HTTP 409 `signaling_sequence_older` 或 `signaling_sequence_reused` | `server_issue_code`, `safety_action=local_full_stop` | 非自动重试，进程 fail-closed |
 | `vehicle_media_signaling_conflict` / `unclassified_signaling_conflict` | 其他无法安全分类的 HTTP 409 | `server_issue_code`, `safety_action=local_full_stop` | 非自动重试，进程 fail-closed |
-| `vehicle_recording_sidecar_failed` / `recording_sidecar_write_failed` | 录像 sidecar 创建/rename 失败 | `error` | 每次 finalize 失败 |
 | `vehicle_camera_performance_failed` / `camera_encoded_fps_below_minimum` | 任一路编码 FPS 低于阈值 | camera/FPS/frame counts | 每次 summary |
 | `vehicle_camera_performance_warning` / `camera_capture_to_encode_latency_high` | capture→encode 峰值超过预算 | camera/latency/budget | 每次 summary |
 
@@ -392,3 +391,5 @@ jq -c 'select(
   .name == "feedback_timeout"
 )' /var/log/mine-teleop/vcu-can.jsonl*
 ```
+
+环视帧身份、三层健康与relay诊断见 [当前实现](surround-and-relay.md)。录像sidecar事件不再产生。

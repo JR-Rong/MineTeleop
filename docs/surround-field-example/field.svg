@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="708" height="900" viewBox="0 0 708 900"><rect width="100%" height="100%" fill="#f8fafc"/>
+<polygon points="618.00,810.00 90.00,810.00 90.00,90.00 618.00,90.00" fill="#eff6ff" stroke="#64748b" stroke-width="2"/>
+<polygon points="438.00,630.00 270.00,630.00 270.00,270.00 438.00,270.00" fill="#94a3b8" stroke="#334155" stroke-width="2"/>
+<text x="354.0" y="462.0" font-family="sans-serif" font-size="13" fill="#172554">Vehicle datum (0,0,0)</text>
+<polygon points="261.00,243.00 135.00,243.00 135.00,153.00 261.00,153.00" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text x="135.00000000000006" y="165.0" font-family="sans-serif" font-size="13" fill="#172554">A1 2.10 x 1.50 m</text>
+<text x="135.00000000000006" y="181.0" font-family="sans-serif" font-size="13" fill="#172554">origin X=3.45, Y=1.55</text>
+<polygon points="417.00,243.00 291.00,243.00 291.00,153.00 417.00,153.00" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text x="291.0" y="165.0" font-family="sans-serif" font-size="13" fill="#172554">A2 2.10 x 1.50 m</text>
+<text x="291.0" y="181.0" font-family="sans-serif" font-size="13" fill="#172554">origin X=3.45, Y=-1.05</text>
+<polygon points="573.00,243.00 447.00,243.00 447.00,153.00 573.00,153.00" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text x="447.0" y="165.0" font-family="sans-serif" font-size="13" fill="#172554">A3 2.10 x 1.50 m</text>
+<text x="447.0" y="181.0" font-family="sans-serif" font-size="13" fill="#172554">origin X=3.45, Y=-3.65</text>
+<polygon points="261.00,495.00 135.00,495.00 135.00,405.00 261.00,405.00" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text x="135.00000000000006" y="417.0" font-family="sans-serif" font-size="13" fill="#172554">A4 2.10 x 1.50 m</text>
+<text x="135.00000000000006" y="433.0" font-family="sans-serif" font-size="13" fill="#172554">origin X=-0.75, Y=1.55</text>
+<polygon points="573.00,495.00 447.00,495.00 447.00,405.00 573.00,405.00" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text x="447.0" y="417.0" font-family="sans-serif" font-size="13" fill="#172554">A5 2.10 x 1.50 m</text>
+<text x="447.0" y="433.0" font-family="sans-serif" font-size="13" fill="#172554">origin X=-0.75, Y=-3.65</text>
+<polygon points="261.00,747.00 135.00,747.00 135.00,657.00 261.00,657.00" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text x="135.00000000000006" y="669.0" font-family="sans-serif" font-size="13" fill="#172554">A6 2.10 x 1.50 m</text>
+<text x="135.00000000000006" y="685.0" font-family="sans-serif" font-size="13" fill="#172554">origin X=-4.95, Y=1.55</text>
+<polygon points="417.00,747.00 291.00,747.00 291.00,657.00 417.00,657.00" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text x="291.0" y="669.0" font-family="sans-serif" font-size="13" fill="#172554">A7 2.10 x 1.50 m</text>
+<text x="291.0" y="685.0" font-family="sans-serif" font-size="13" fill="#172554">origin X=-4.95, Y=-1.05</text>
+<polygon points="573.00,747.00 447.00,747.00 447.00,657.00 573.00,657.00" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text x="447.0" y="669.0" font-family="sans-serif" font-size="13" fill="#172554">A8 2.10 x 1.50 m</text>
+<text x="447.0" y="685.0" font-family="sans-serif" font-size="13" fill="#172554">origin X=-4.95, Y=-3.65</text>
+<circle cx="354.0" cy="255.0" r="3" fill="#dc2626"/>
+<circle cx="354.0" cy="225.0" r="3" fill="#dc2626"/>
+<circle cx="354.0" cy="195.0" r="3" fill="#dc2626"/>
+<circle cx="354.0" cy="150.0" r="3" fill="#dc2626"/>
+<circle cx="259.3933982822018" cy="259.3933982822018" r="3" fill="#dc2626"/>
+<circle cx="238.1801948466054" cy="238.18019484660536" r="3" fill="#dc2626"/>
+<circle cx="216.96699141100896" cy="216.96699141100893" r="3" fill="#dc2626"/>
+<circle cx="185.14718625761435" cy="185.1471862576143" r="3" fill="#dc2626"/>
+<circle cx="255.00000000000003" cy="450.0" r="3" fill="#dc2626"/>
+<circle cx="225.00000000000003" cy="450.0" r="3" fill="#dc2626"/>
+<circle cx="195.00000000000003" cy="450.0" r="3" fill="#dc2626"/>
+<circle cx="150.00000000000003" cy="450.0" r="3" fill="#dc2626"/>
+<circle cx="259.3933982822018" cy="640.6066017177982" r="3" fill="#dc2626"/>
+<circle cx="238.18019484660536" cy="661.8198051533947" r="3" fill="#dc2626"/>
+<circle cx="216.96699141100896" cy="683.033008588991" r="3" fill="#dc2626"/>
+<circle cx="185.1471862576143" cy="714.8528137423857" r="3" fill="#dc2626"/>
+<circle cx="354.0" cy="645.0" r="3" fill="#dc2626"/>
+<circle cx="354.0" cy="675.0" r="3" fill="#dc2626"/>
+<circle cx="354.0" cy="705.0" r="3" fill="#dc2626"/>
+<circle cx="354.0" cy="750.0" r="3" fill="#dc2626"/>
+<circle cx="448.60660171779824" cy="640.6066017177982" r="3" fill="#dc2626"/>
+<circle cx="469.8198051533946" cy="661.8198051533947" r="3" fill="#dc2626"/>
+<circle cx="491.0330085889911" cy="683.033008588991" r="3" fill="#dc2626"/>
+<circle cx="522.8528137423857" cy="714.8528137423857" r="3" fill="#dc2626"/>
+<circle cx="453.00000000000006" cy="450.0" r="3" fill="#dc2626"/>
+<circle cx="483.00000000000006" cy="450.0" r="3" fill="#dc2626"/>
+<circle cx="513.0" cy="450.0" r="3" fill="#dc2626"/>
+<circle cx="558.0" cy="450.0" r="3" fill="#dc2626"/>
+<circle cx="448.60660171779824" cy="259.3933982822018" r="3" fill="#dc2626"/>
+<circle cx="469.81980515339467" cy="238.18019484660536" r="3" fill="#dc2626"/>
+<circle cx="491.0330085889911" cy="216.96699141100893" r="3" fill="#dc2626"/>
+<circle cx="522.8528137423857" cy="185.1471862576143" r="3" fill="#dc2626"/>
+<text x="90" y="24" font-family="sans-serif" font-size="13" fill="#172554">Field 12.00 x 8.80 m; +X FRONT UP, +Y LEFT</text>
+<text x="90" y="44" font-family="sans-serif" font-size="13" fill="#172554">Vehicle 6.00 x 2.80 m; board gap initial 1.20 m</text>
+<text x="90" y="862" font-family="sans-serif" font-size="13" fill="#172554">LAYOUT TEMPLATE - measure coordinates before construction/solve</text>
+<text x="90" y="882" font-family="sans-serif" font-size="13" fill="#172554">Red: 32 independent checks (never used by solve); units: metres</text>
+</svg>

@@ -13,7 +13,7 @@
     const button=document.getElementById(id);button.title=button.textContent;button.textContent=label;
   }
   const cameraHeader=document.createElement('div');cameraHeader.className='camera-toolbar';
-  cameraHeader.innerHTML='<strong>相机画面</strong><span class="camera-layout-active">多路平铺</span><button type="button" disabled title="环视拼接与相机绑定将在后续接入">360° 环视 · 待接入</button>';
+  cameraHeader.innerHTML='<strong>相机画面</strong><span class="camera-layout-active">多路平铺</span><button type="button" id="surround-toggle">360° 环视</button><select id="media-profile" aria-label="传输画面"><option value="full:720p">完整相机</option><option value="two:720p">两路 · 720p</option><option value="two:540p">两路 · 540p</option></select><button type="button" id="media-retry">停车后切换 / 重试直连</button>';
   document.querySelector('.visual-stage').prepend(cameraHeader);
   const scene=document.createElement('section');scene.className='scene-panel';scene.setAttribute('aria-label','自车三维场景');
   scene.innerHTML='<div class="scene-heading"><h2>3D 场景</h2><button class="scene-resume" type="button" disabled>恢复自动</button></div><div class="scene-view-status">等待模型</div><div class="scene-canvas"></div><div class="scene-status" role="status">正在初始化 3D…</div>';

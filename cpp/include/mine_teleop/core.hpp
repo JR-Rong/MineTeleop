@@ -77,6 +77,7 @@ struct ControlCommand {
   bool estop{false};
   std::string control_token;
   bool operator_active{false};
+  std::uint64_t control_epoch{0};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -91,6 +92,8 @@ struct NativeControlIntent {
   double throttle{0.0};
   double brake{0.0};
   bool estop{false};
+
+  std::uint64_t control_epoch{0};
 
   void validate() const;
   [[nodiscard]] bool is_neutral() const;
@@ -125,6 +128,9 @@ class NativeControlIntentStore {
   [[nodiscard]] NativeControlIntentSample sample(std::int64_t now_monotonic_ms);
   void invalidate();
   void reset();
+  // Trusted vehicle signaling owns the epoch. Never relabel retained input.
+  void set_epoch(std::uint64_t epoch, bool resume = true);
+  void suspend();
 
   [[nodiscard]] int lease_ms() const { return lease_ms_; }
 
@@ -135,6 +141,8 @@ class NativeControlIntentStore {
   std::int64_t received_at_monotonic_ms_{0};
   bool requires_fresh_input_{true};
   bool estop_latched_{false};
+  std::optional<std::uint64_t> epoch_;
+  bool suspended_{false};
 };
 
 struct SessionControlProfile {
@@ -400,6 +408,7 @@ struct VehicleRuntimeConfig {
   bool control_enabled{true};
   bool media_enabled{true};
   bool control_log_commands{false};
+  bool media_frame_trace{false};
   int teleop_poll_interval_ms{50};
   int media_frame_timeout_ms{3000};
   int media_capture_interval_ms{0};
@@ -413,7 +422,6 @@ struct MediaProfile {
   int height{720};
   int fps{30};
   int bitrate_kbps{3000};
-  int segment_seconds{60};
 };
 
 struct CameraConfig {
@@ -428,25 +436,7 @@ struct CameraConfig {
   int capture_height{720};
   int capture_fps{30};
   std::string realtime_profile;
-  std::string record_profile;
-};
-
-struct RecordingConfig {
-  bool enabled{false};
-  std::filesystem::path root_dir{".local/recordings"};
-  double min_free_gb{5.0};
-  double delete_uploaded_when_below_free_gb{2.0};
-  bool delete_unuploaded_when_below_free_gb{false};
-};
-
-struct UploadConfig {
-  bool enabled{false};
-  std::string backend{"local_archive"};
-  double max_bandwidth_mbps{5.0};
-  int trigger_segments{20};
-  bool trigger_network_idle{true};
-  int retry_initial_seconds{10};
-  int retry_max_seconds{600};
+  std::string installation_id;
 };
 
 struct VehicleAdapterConfig {
@@ -495,6 +485,15 @@ struct FieldSafetyConfig {
   int time_sync_samples{7};
 };
 
+struct SurroundConfig {
+  bool diagnostic_partition{false}; // CLI-only, isolated bench; never a driving profile.
+  std::string mode{"auto"};
+  std::filesystem::path calibration_file;
+  std::string profile{"720p"};
+  int max_frame_age_ms{100};
+  int max_skew_ms{0};
+};
+
 struct VehicleConfig {
   std::string vehicle_id;
   std::string vehicle_name;
@@ -502,16 +501,14 @@ struct VehicleConfig {
   VehicleRuntimeConfig runtime;
   ControlConfig control;
   std::vector<MediaProfile> realtime_profiles;
-  std::vector<MediaProfile> record_profiles;
   std::vector<CameraConfig> cameras;
-  RecordingConfig recording;
-  UploadConfig upload;
+  SurroundConfig surround;
+  bool deprecated_video_config{false};
   VehicleAdapterConfig vehicle_adapter;
   HardwareConfig hardware;
   FieldSafetyConfig field_safety;
 
   [[nodiscard]] const MediaProfile& realtime_profile(std::string_view name) const;
-  [[nodiscard]] const MediaProfile& record_profile(std::string_view name) const;
   [[nodiscard]] std::vector<CameraConfig> enabled_cameras() const;
   [[nodiscard]] Json redacted_summary() const;
 };

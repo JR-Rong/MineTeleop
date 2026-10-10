@@ -1,0 +1,15 @@
+[Unit]
+Description=MineTeleop public media shaping and control priority
+After=network-online.target
+Wants=network-online.target
+Before=mine-teleop-turn-server.service mine-teleop-relay-manager.service
+PartOf=mine-teleop-cloud.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/mine-teleop/mine-teleop.env
+ExecStart=/opt/mine-teleop/scripts/relay/start_shaping.sh
+
+[Install]
+WantedBy=multi-user.target

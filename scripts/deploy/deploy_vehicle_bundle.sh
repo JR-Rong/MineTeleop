@@ -257,7 +257,7 @@ run_remote() {
 printf '==> deploying %s to %s:%s\n' "$BUNDLE" "$SSH_TARGET" "$REMOTE_DIR"
 run_remote "prepare remote directory" "$(cat <<EOF
 set -euo pipefail
-mkdir -p "$REMOTE_DIR" "$REMOTE_DIR/logs" "$REMOTE_DIR/data/recordings" "$REMOTE_DIR/data/uploader" "$REMOTE_DIR/data/uploader-archive"
+mkdir -p "$REMOTE_DIR" "$REMOTE_DIR/logs" "$REMOTE_DIR/data/calibration"
 EOF
 )"
 

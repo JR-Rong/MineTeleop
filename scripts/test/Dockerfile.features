@@ -1,0 +1,24 @@
+ARG GSTREAMER_FIXTURE_IMAGE=mine-teleop-gst128:local
+FROM ${GSTREAMER_FIXTURE_IMAGE} AS production-gstreamer
+FROM ubuntu:24.04
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build pkg-config ca-certificates curl \
+    libcurl4-openssl-dev libssl-dev libyaml-cpp-dev nlohmann-json3-dev \
+    libjpeg-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-nice \
+    libopencv-contrib-dev python3 python3-venv python3-numpy python3-opencv python3-pil python3-scipy python3-yaml \
+    nodejs npm emscripten coturn=4.6.1-1build4 iproute2 nftables haproxy gstreamer1.0-tools clang-format && rm -rf /var/lib/apt/lists/*
+COPY --from=production-gstreamer /opt/gstreamer /opt/gstreamer
+# Use the production core/plugins. Only software codec fixtures come from the
+# distro; do not allow its duplicate webrtc/libnice plugins to shadow 1.28.5.
+RUN mkdir -p /opt/mine-fixture-codecs && \
+    fixture_multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)" && \
+    ln -s "/usr/lib/$fixture_multiarch/gstreamer-1.0/libgstx264.so" /opt/mine-fixture-codecs/ && \
+    ln -s "/usr/lib/$fixture_multiarch/gstreamer-1.0/libgstopenh264.so" /opt/mine-fixture-codecs/
+ENV LD_LIBRARY_PATH=/opt/gstreamer/lib
+ENV PKG_CONFIG_PATH=/opt/gstreamer/lib/pkgconfig
+ENV GST_PLUGIN_SYSTEM_PATH=/opt/gstreamer/lib/gstreamer-1.0
+ENV GST_PLUGIN_PATH=/opt/mine-fixture-codecs
+WORKDIR /workspace

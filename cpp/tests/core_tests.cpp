@@ -2,7 +2,6 @@
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/server.hpp"
-#include "mine_teleop/upload.hpp"
 #include "mine_teleop/video.hpp"
 
 #include <gst/gst.h>
@@ -1116,8 +1115,7 @@ void test_ccg2_example_config_defines_two_explicit_capture_lanes() {
             camera.capture_fps == 30,
         "CCG2 example camera capture mode is not 1920x1080 at 30 FPS");
     expect(
-        camera.realtime_profile == "realtime_720p30" &&
-            camera.record_profile == "reuse_realtime",
+        camera.realtime_profile == "realtime_720p30",
         "CCG2 example camera profile bindings changed");
   }
 }
@@ -1443,7 +1441,7 @@ void test_bench_config_drives_unified_vehicle_runtime() {
   expect(config.runtime.control_log_commands, "bench runtime control logging is disabled");
   expect(config.runtime.teleop_poll_interval_ms == 50, "bench teleop poll interval changed");
   expect(config.runtime.media_frame_timeout_ms == 3000, "bench media frame timeout changed");
-  expect(config.recording.enabled, "bench recording is disabled");
+  expect(!config.deprecated_video_config, "bench config retains recording settings");
   expect(
       config.cloud.device_token_file == std::filesystem::path("configs/device-token"),
       "relative device token file was not resolved from the config directory");
@@ -3466,26 +3464,9 @@ void test_signaling_presence_generation_and_automatic_release() {
       base + "/sessions/" + session_1.at("session_id").get<std::string>() +
       "/ice_servers?actor=vehicle-1&device_token=device-1&connection_generation=" +
       std::to_string(vehicle_1_generation));
-  expect(driver_ice.at("ice_servers").size() == 2, "driver did not receive STUN and TURN ICE entries");
-  expect(vehicle_ice.at("ice_servers").size() == 2, "vehicle did not receive STUN and TURN ICE entries");
-  expect(
-      driver_ice.at("ice_servers").at(0).at("urls") == vehicle_ice.at("ice_servers").at(0).at("urls") &&
-          driver_ice.at("ice_servers").at(1).at("urls") == vehicle_ice.at("ice_servers").at(1).at("urls"),
-      "driver and vehicle received different ICE endpoints");
-  const auto driver_turn_username = driver_ice.at("ice_servers").at(1).at("username").get<std::string>();
-  const auto vehicle_turn_username = vehicle_ice.at("ice_servers").at(1).at("username").get<std::string>();
-  const auto driver_turn_credential = driver_ice.at("ice_servers").at(1).at("credential").get<std::string>();
-  expect(
-      driver_turn_username.find(session_1.at("session_id").get<std::string>()) != std::string::npos &&
-          driver_turn_username.ends_with(":driver-1"),
-      "driver TURN username is not bound to its session and actor");
-  expect(
-      vehicle_turn_username.ends_with(":vehicle-1") && vehicle_turn_username != driver_turn_username,
-      "vehicle TURN username is not independently actor-bound");
-  expect(!driver_turn_credential.empty(), "TURN REST credential is empty");
-  expect(
-      driver_ice.value("expires_at_utc_ms", 0LL) > mine_teleop::now_ms(),
-      "TURN REST credential is not short-lived");
+  expect(driver_ice.at("ice_servers").size()==1&&vehicle_ice.at("ice_servers").size()==1,"unapproved clients received relay credentials");
+  expect(driver_ice.at("ice_servers").at(0).at("urls")==vehicle_ice.at("ice_servers").at(0).at("urls"),"STUN endpoints differ");
+  const auto driver_turn_credential=std::string("dGVzdC1vbmx5LXR1cm4tY3JlZGVudGlhbA==");
 
   const auto cross_vehicle = http.post_json(
       base + "/signaling/" + session_2.at("session_id").get<std::string>() + "/messages",
@@ -3985,36 +3966,6 @@ void test_driver_console_page_keeps_waiting_state_during_background_intent_refre
       "driver console page does not expose the pending vehicle-media state");
 }
 
-void test_local_archive_uploader_is_atomic_and_resumable() {
-  const auto root = std::filesystem::path("/tmp") / ("mine-teleop-upload-test-" + mine_teleop::random_token(6));
-  const auto recordings = root / "recordings";
-  const auto archive = root / "archive";
-  const auto segment_dir = recordings / "vehicle-001" / "session-001" / "front";
-  std::filesystem::create_directories(segment_dir);
-  const auto video = segment_dir / "segment-001.mp4";
-  const auto metadata = segment_dir / "segment-001.json";
-  {
-    std::ofstream output(video, std::ios::binary);
-    output << "native-segment-payload";
-  }
-  {
-    std::ofstream output(metadata);
-    output << mine_teleop::Json({
-        {"vehicle_id", "vehicle-001"},
-        {"session_id", "session-001"},
-        {"camera_id", "front"},
-        {"segment_id", "segment-001"},
-        {"upload_state", "pending"},
-    }).dump();
-  }
-  mine_teleop::LocalArchiveUploader uploader(recordings, archive);
-  const auto result = uploader.process_once();
-  expect(result.action == "uploaded", "pending segment was not archived");
-  expect(std::filesystem::is_regular_file(archive / result.object_path), "archived video is missing");
-  expect(mine_teleop::sha256_file(video) == mine_teleop::sha256_file(archive / result.object_path), "archive hash mismatch");
-  expect(uploader.process_once().action == "idle", "uploaded segment was processed twice");
-  std::filesystem::remove_all(root);
-}
 
 }  // namespace
 
@@ -4096,7 +4047,6 @@ int main() {
       {"native_driver_to_vehicle_signaling_control_payload", test_native_driver_to_vehicle_signaling_control_payload},
       {"driver_console_page_keeps_waiting_state_during_background_intent_refresh", test_driver_console_page_keeps_waiting_state_during_background_intent_refresh},
       {"driver_login_lists_only_authorized_vehicles", test_driver_login_lists_only_authorized_vehicles},
-      {"local_archive_uploader_is_atomic_and_resumable", test_local_archive_uploader_is_atomic_and_resumable},
   };
   int failures = 0;
   for (const auto& [name, test] : tests) {

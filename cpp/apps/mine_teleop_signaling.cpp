@@ -315,6 +315,9 @@ int main(int argc, char** argv) {
     config.turn_static_auth_secret = turn_secret_file.empty()
         ? environment("MINE_TELEOP_TURN_STATIC_AUTH_SECRET")
         : read_secret(turn_secret_file, "TURN static auth secret");
+    config.relay_state_dir=arguments.value("--relay-state-dir",environment("MINE_TELEOP_RELAY_STATE_DIR"));
+    config.relay_capacity_bps=arguments.integer("--relay-capacity-bps",8000000);
+    config.relay_egress_copies=arguments.integer("--relay-egress-copies",2);
     config.turn_credential_ttl_seconds = arguments.integer("--turn-credential-ttl-seconds", 600);
     config.audit_log_path = arguments.value("--audit-log");
     config.audit_log_max_bytes = configured_integer(

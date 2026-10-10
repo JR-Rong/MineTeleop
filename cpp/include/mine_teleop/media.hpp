@@ -105,6 +105,7 @@ inline constexpr int kCriticalCameraStartupTimeoutMs = 15000;
 
 class CriticalCameraControlLatch {
  public:
+  CriticalCameraControlLatch();
   // Selects the active non-empty session.  Entering the same session preserves
   // its latch; entering a different session starts with control uninhibited.
   [[nodiscard]] bool enter_session(std::string_view session_id);
@@ -117,12 +118,18 @@ class CriticalCameraControlLatch {
   // deadline and the armed state survive same-session media reconstruction.
   [[nodiscard]] bool startup_grace_active(std::string_view session_id, std::int64_t now_ms);
   [[nodiscard]] bool arm_for_control(std::string_view session_id);
+  std::uint64_t control_epoch() const;
+  std::uint64_t revoke_input();
+  bool rebuild_allowed() const;
+  void confirm_parked_rebuild();
 
  private:
   mutable std::mutex mutex_;
   std::string session_id_;
   bool inhibited_{false};
   bool armed_{false};
+  bool rebuild_allowed_{true};
+  std::uint64_t control_epoch_{0};
   std::optional<std::int64_t> startup_started_ms_;
 };
 
@@ -145,8 +152,17 @@ struct EncodedFrame {
   std::uint64_t source_sequence_gap{0};
   std::uint32_t source_timeperframe_numerator{0};
   std::uint32_t source_timeperframe_denominator{0};
+  std::int64_t read_started_steady_ms{0};
+  std::int64_t read_finished_steady_ms{0};
+  std::int64_t captured_steady_ms{0};
+  std::int64_t v4l2_timestamp_us{0};
+  std::uint32_t v4l2_timestamp_flags{0};
+  bool exposure_time_trusted{false};
+  std::uint64_t source_generation{0};
 
 };
+
+std::string decode_frame_rgba(const EncodedFrame& frame);
 
 class CameraFrameSource {
  public:
@@ -191,6 +207,9 @@ class CameraFrameSource {
   int child_pid_{-1};
   std::string buffer_;
   int device_fd_{-1};
+  int ownership_fd_{-1};
+  std::int64_t last_timestamp_us_{0};
+  std::uint32_t last_timestamp_flags_{0};
   bool streaming_{false};
   int output_width_{0};
   int output_height_{0};
@@ -212,7 +231,6 @@ class VehicleMediaRuntime {
       std::string signaling_url,
       std::string device_token,
       int frame_timeout_ms = 3000,
-      std::filesystem::path recording_root = {},
       std::optional<std::string> forced_codec = std::nullopt,
       int simulate_primary_failure_after_frames = 0,
       std::string connection_id = {},

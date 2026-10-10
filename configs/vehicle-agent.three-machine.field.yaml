@@ -42,16 +42,6 @@ media:
       height: 720
       fps: 30
       bitrate_kbps: 1500
-  record_profiles:
-    reuse_realtime:
-      codec: h265
-      encoder: reuse_realtime
-      width: source
-      height: source
-      fps: source
-      bitrate_kbps: 1500
-      segment_seconds: 2
-
 cameras:
   - id: drive_front
     enabled: true
@@ -64,7 +54,6 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p30
-    record_profile: reuse_realtime
   - id: drive_rear
     enabled: true
     critical_for_control: true
@@ -76,7 +65,6 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p30
-    record_profile: reuse_realtime
   - id: fish_front
     enabled: true
     critical_for_control: true
@@ -88,7 +76,6 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p30
-    record_profile: reuse_realtime
   - id: fish_rear
     enabled: true
     critical_for_control: true
@@ -100,7 +87,6 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p30
-    record_profile: reuse_realtime
   - id: fish_left
     enabled: true
     critical_for_control: true
@@ -112,7 +98,6 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p30
-    record_profile: reuse_realtime
   - id: fish_right
     enabled: true
     critical_for_control: true
@@ -124,7 +109,6 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p30
-    record_profile: reuse_realtime
 
 hardware:
   can:
@@ -181,21 +165,17 @@ field_safety:
   time_sync_interval_ms: 30000
   time_sync_samples: 7
 
-recording:
-  enabled: false
-  root_dir: recordings
-  min_free_gb: 1
-  delete_uploaded_when_below_free_gb: 0.5
-  delete_unuploaded_when_below_free_gb: false
-
-upload:
-  enabled: false
-  backend: local_archive
-
-# Native CAN adapter; packaged launcher resolves the bundled bridge library.
 vehicle_adapter:
   type: can
   integration:
     chassis_control:
       can_interface: can0
       bridge_library_path: ./lib/vendor/chassis/libmine_teleop_chassis_bridge.so
+
+# Calibrated vehicles use two streams only after hardware/field qualification.
+surround:
+  mode: auto
+  calibration_file: ""
+  profile: 720p
+  max_frame_age_ms: 100
+  max_skew_ms: 0 # measured acceptance limit; 20 ms remains the alignment target

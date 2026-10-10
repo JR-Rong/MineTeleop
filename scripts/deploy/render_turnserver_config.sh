@@ -7,7 +7,7 @@ Usage:
   render_turnserver_config.sh --realm REALM --secret-file PATH --output PATH [--template PATH]
   render_turnserver_config.sh --self-test
 
-Render the coturn template atomically with mode 0600. The shared secret is read
+Render the coturn template atomically with mode 0600. The local CLI password is read
 from a file and is never printed.
 EOF
 }
@@ -47,7 +47,7 @@ render_config() {
   temporary_path="$(mktemp "$output_dir/.turnserver.conf.XXXXXX")"
   trap 'rm -f "$temporary_path"' RETURN
   realm_placeholder='${MINE_TELEOP_TURN_REALM}'
-  secret_placeholder='${MINE_TELEOP_TURN_STATIC_AUTH_SECRET}'
+  secret_placeholder='${MINE_TELEOP_TURN_CLI_PASSWORD}'
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line//$realm_placeholder/$realm}"
     line="${line//$secret_placeholder/$secret}"
@@ -72,7 +72,7 @@ self_test() {
   printf '%s\n' 'self-test-shared-secret' >"$secret_path"
   output="$(render_config "$repo_root/deployments/turnserver/turnserver.conf.template" "$output_path" "teleop.self.test" "$secret_path")"
   grep -q '^realm=teleop.self.test$' "$output_path"
-  grep -q '^static-auth-secret=self-test-shared-secret$' "$output_path"
+  grep -q '^cli-password=self-test-shared-secret$' "$output_path"
   [[ "$(stat -c '%a' "$output_path" 2>/dev/null || stat -f '%Lp' "$output_path")" == "600" ]]
   if grep -q 'self-test-shared-secret' <<<"$output"; then
     printf 'turnserver renderer leaked the shared secret\n' >&2

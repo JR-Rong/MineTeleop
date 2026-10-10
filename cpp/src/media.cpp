@@ -1,4 +1,5 @@
 #include "mine_teleop/media.hpp"
+#include "mine_teleop/surround.hpp"
 
 #include <cstddef>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/file.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -142,7 +144,8 @@ std::string build_camera_input_pipeline(
     throw std::invalid_argument("camera input pipeline configuration is invalid");
   }
   const bool uyvy = input.codec == "uyvy";
-  if (!uyvy && input.codec != "mjpeg" && input.codec != "jpeg") {
+  const bool rgba = input.codec == "rgba";
+  if (!uyvy && !rgba && input.codec != "mjpeg" && input.codec != "jpeg") {
     throw std::invalid_argument("camera input pipeline codec is unsupported: " + input.codec);
   }
 
@@ -150,17 +153,17 @@ std::string build_camera_input_pipeline(
   pipeline << "appsrc name=" << source_name
            << " is-live=true format=time do-timestamp=false emit-signals=false block=false max-buffers="
            << kCameraAppSrcMaxBuffers
-           << (uyvy ? " max-bytes=0" : " max-bytes=524288")
+           << ((uyvy || rgba) ? " max-bytes=0" : " max-bytes=524288")
            << " max-time=0 leaky-type=downstream ";
-  if (uyvy) {
-    pipeline << "caps=video/x-raw,format=UYVY,width=" << input.width
+  if (uyvy || rgba) {
+    pipeline << "caps=video/x-raw,format=" << (rgba ? "RGBA" : "UYVY") << ",width=" << input.width
              << ",height=" << input.height << ",framerate=" << input.fps << "/1 ";
   } else {
     pipeline << "caps=image/jpeg,width=" << input.width << ",height=" << input.height
              << ",framerate=" << input.fps << "/1 ";
   }
   pipeline << "! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ";
-  if (!uyvy) pipeline << "! jpegdec ";
+  if (!uyvy && !rgba) pipeline << "! jpegdec ";
   pipeline << "! videoconvert ! videoscale ";
   if (uyvy && input.fps != output_profile.fps) pipeline << "! videorate ";
   pipeline << "! video/x-raw,format=NV12,width=" << output_profile.width
@@ -338,6 +341,7 @@ CameraFrameSource::CameraFrameSource(CameraConfig camera, MediaProfile profile, 
 CameraFrameSource::~CameraFrameSource() {
   stop_vendor_bridge();
   stop_v4l2();
+  if(ownership_fd_>=0)::close(ownership_fd_);
 }
 
 void CameraFrameSource::start_vendor_bridge() {
@@ -619,6 +623,8 @@ std::string CameraFrameSource::read_v4l2_uyvy() {
       if (errno == EAGAIN) continue;
       throw std::runtime_error("VIDIOC_DQBUF failed for " + camera_.device + ": " + std::strerror(errno));
     }
+    last_timestamp_us_ = std::int64_t(buffer.timestamp.tv_sec)*1000000 + buffer.timestamp.tv_usec;
+    last_timestamp_flags_ = buffer.flags & (V4L2_BUF_FLAG_TIMESTAMP_MASK | V4L2_BUF_FLAG_TSTAMP_SRC_MASK);
     if (buffer.index >= mapped_buffers_.size()) {
       throw std::runtime_error("V4L2 returned an invalid capture buffer for " + camera_.device);
     }
@@ -688,6 +694,15 @@ std::string CameraFrameSource::read_v4l2_jpeg() {
       if (errno == EAGAIN) continue;
       throw std::runtime_error("VIDIOC_DQBUF failed for " + camera_.device + ": " + std::strerror(errno));
     }
+    last_timestamp_us_ = std::int64_t(buffer.timestamp.tv_sec)*1000000 + buffer.timestamp.tv_usec;
+    last_timestamp_flags_ = buffer.flags & (V4L2_BUF_FLAG_TIMESTAMP_MASK | V4L2_BUF_FLAG_TSTAMP_SRC_MASK);
+    last_dequeued_v4l2_sequence_ = buffer.sequence;
+    last_dequeued_v4l2_sequence_gap_ = v4l2_sequence_gap(last_delivered_v4l2_sequence_, buffer.sequence);
+    last_delivered_v4l2_sequence_ = buffer.sequence;
+    if (buffer.flags & V4L2_BUF_FLAG_ERROR) {
+      ioctl_retry(device_fd_, VIDIOC_QBUF, &buffer);
+      throw std::runtime_error("V4L2 capture buffer flagged error: " + camera_.id);
+    }
     if (buffer.index >= mapped_buffers_.size() || buffer.bytesused > mapped_buffers_[buffer.index].length) {
       throw std::runtime_error("V4L2 returned an invalid capture buffer for " + camera_.device);
     }
@@ -718,8 +733,35 @@ std::string CameraFrameSource::generate_test_jpeg(std::uint64_t sequence) const 
   return encode_rgb_jpeg(rgb, width, height, 80);
 }
 
+std::string decode_frame_rgba(const EncodedFrame& frame) {
+  jpeg_decompress_struct decoder{};JpegErrorManager error{};
+  decoder.err=jpeg_std_error(&error.base);error.base.error_exit=jpeg_error_exit;
+  unsigned char* pixels=nullptr;
+  if(setjmp(error.jump)){jpeg_destroy_decompress(&decoder);std::free(pixels);throw std::runtime_error(error.message);}
+  jpeg_create_decompress(&decoder);
+  jpeg_mem_src(&decoder,reinterpret_cast<const unsigned char*>(frame.payload.data()),frame.payload.size());
+  jpeg_read_header(&decoder,TRUE);decoder.out_color_space=JCS_EXT_RGBA;
+  if(int(decoder.image_width)!=frame.width||int(decoder.image_height)!=frame.height){jpeg_destroy_decompress(&decoder);throw std::runtime_error("JPEG source dimensions mismatch");}
+  jpeg_start_decompress(&decoder);
+  const auto bytes=std::size_t(frame.width)*frame.height*4;
+  pixels=static_cast<unsigned char*>(std::malloc(bytes));
+  if(!pixels){jpeg_destroy_decompress(&decoder);throw std::bad_alloc();}
+  while(decoder.output_scanline<decoder.output_height){auto* row=pixels+std::size_t(decoder.output_scanline)*frame.width*4;jpeg_read_scanlines(&decoder,&row,1);}
+  jpeg_finish_decompress(&decoder);jpeg_destroy_decompress(&decoder);
+  std::string result(reinterpret_cast<char*>(pixels),bytes);std::free(pixels);return result;
+}
+
 EncodedFrame CameraFrameSource::next(std::uint64_t sequence) {
-  const auto captured = now_ms();
+  if(ownership_fd_<0 && mode_!=Mode::TestSource) {
+    const auto root=std::filesystem::path(environment_or("MINE_TELEOP_CAMERA_LOCK_DIR","/run/lock/mine-teleop-cameras"));
+    std::filesystem::create_directories(root);
+    std::error_code error;const auto canonical=std::filesystem::canonical(camera_.device,error);
+    const auto name=sha256_text(error?camera_.device:canonical.string());
+    ownership_fd_=::open((root/(name+".lock")).c_str(),O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW,0600);
+    if(ownership_fd_<0||::flock(ownership_fd_,LOCK_EX|LOCK_NB)!=0){if(ownership_fd_>=0)::close(ownership_fd_);ownership_fd_=-1;throw std::runtime_error("camera is owned by another runtime/maintenance tool: "+camera_.id);}
+  }
+  const auto read_start = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
   std::string payload;
   std::string codec{"mjpeg"};
   switch (mode_) {
@@ -738,6 +780,13 @@ EncodedFrame CameraFrameSource::next(std::uint64_t sequence) {
       break;
   }
   if (codec == "mjpeg") require_jpeg(payload, camera_.id);
+  const auto read_end = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  const bool monotonic = (last_timestamp_flags_ & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+  const auto source_time = monotonic && last_timestamp_us_ > 0 ? last_timestamp_us_/1000 : read_end;
+  if(source_time > read_end || read_end-source_time > frame_timeout_ms_)
+    throw std::runtime_error("camera timestamp outside freshness window: " + camera_.id);
+  const auto captured = now_ms() - (read_end-source_time);
   return {
       camera_.id,
       sequence,
@@ -757,6 +806,8 @@ EncodedFrame CameraFrameSource::next(std::uint64_t sequence) {
       last_dequeued_v4l2_sequence_gap_,
       v4l2_timeperframe_numerator_,
       v4l2_timeperframe_denominator_,
+      read_start, read_end, source_time, last_timestamp_us_, last_timestamp_flags_,
+      monotonic && (last_timestamp_flags_ & V4L2_BUF_FLAG_TSTAMP_SRC_MASK) == V4L2_BUF_FLAG_TSTAMP_SRC_SOE,
   };
 }
 

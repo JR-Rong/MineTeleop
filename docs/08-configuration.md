@@ -184,15 +184,6 @@ media:
       bitrate_kbps: 1200
       keyframe_interval_frames: 30
       low_latency: true
-  record_profiles:
-    record_source_h265:
-      codec: h265
-      encoder: reuse_realtime
-      width: source
-      height: source
-      fps: source
-      bitrate_kbps: 8000
-      segment_seconds: 60
 
 cameras:
   - id: front
@@ -206,7 +197,6 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p
-    record_profile: record_source_h265
   - id: rear
     enabled: true
     critical_for_control: true
@@ -218,7 +208,6 @@ cameras:
     capture_height: 1080
     capture_fps: 30
     realtime_profile: realtime_720p
-    record_profile: record_source_h265
 
 hardware:
   can:

@@ -1,5 +1,6 @@
 #include "mine_teleop/core.hpp"
 
+#include <iostream>
 #include <algorithm>
 #include <cerrno>
 #include <cctype>
@@ -1032,6 +1033,7 @@ Json ControlCommand::to_json() const {
   value["brake"] = brake;
   value["estop"] = estop;
   value["operator_active"] = operator_active;
+  value["control_epoch"] = control_epoch;
   value["control_token"] = control_token;
   return value;
 }
@@ -1058,6 +1060,7 @@ ControlCommand ControlCommand::from_json(const Json& value) {
     command.brake = value.at("brake").get<double>();
     command.estop = value.value("estop", false);
     command.operator_active = value.value("operator_active", false);
+    command.control_epoch = value.value("control_epoch",std::uint64_t{0});
     command.control_token = value.at("control_token").get<std::string>();
   } catch (const Json::exception& error) {
     throw std::invalid_argument(std::string("invalid control command: ") + error.what());
@@ -1102,6 +1105,8 @@ NativeControlIntentUpdate NativeControlIntentStore::update(
     throw std::invalid_argument("intent receive time must be non-negative");
   }
   std::lock_guard lock(mutex_);
+  if (suspended_ || (epoch_ && intent.control_epoch != *epoch_))
+    return {false, false, true, "stale_control_epoch"};
   const bool incoming_estop = intent.estop;
   const bool incoming_neutral = intent.is_neutral();
   // ESTOP is session-sticky. Normalize the incoming value before replay and
@@ -1126,7 +1131,7 @@ NativeControlIntentUpdate NativeControlIntentStore::update(
   // A sticky ESTOP must not make an originally non-neutral command from a
   // replacement UI look safe enough to bypass the fresh-neutral interlock.
   // A newly requested ESTOP remains allowed to preempt that interlock.
-  if (requires_fresh_input_ && !incoming_neutral && !incoming_estop) {
+  if (requires_fresh_input_ && (!incoming_neutral || (epoch_ && intent.gear!="N")) && !incoming_estop) {
     return {false, same_ui && intent.intent_seq == latest_->intent_seq, true, "fresh_neutral_required"};
   }
 
@@ -1143,7 +1148,7 @@ NativeControlIntentSample NativeControlIntentStore::sample(std::int64_t now_mono
     throw std::invalid_argument("intent sample time must be non-negative");
   }
   std::lock_guard lock(mutex_);
-  if (!latest_) return {};
+  if (suspended_ || !latest_) return {};
   const auto age_ms = std::max<std::int64_t>(0, now_monotonic_ms - received_at_monotonic_ms_);
   const bool fresh = age_ms < lease_ms_;
   if (!fresh && !latest_->is_neutral() && !latest_->estop) requires_fresh_input_ = true;
@@ -1168,6 +1173,25 @@ void NativeControlIntentStore::reset() {
   received_at_monotonic_ms_ = 0;
   requires_fresh_input_ = true;
   estop_latched_ = false;
+  epoch_.reset();
+  suspended_ = false;
+}
+
+void NativeControlIntentStore::set_epoch(std::uint64_t epoch, bool resume) {
+  std::lock_guard lock(mutex_);
+  if (epoch_ == epoch && (!suspended_ || !resume)) return;
+  latest_.reset();
+  received_at_monotonic_ms_ = 0;
+  requires_fresh_input_ = true;
+  epoch_ = epoch;
+  if(resume)suspended_ = false;
+}
+
+void NativeControlIntentStore::suspend() {
+  std::lock_guard lock(mutex_);
+  latest_.reset();
+  requires_fresh_input_ = true;
+  suspended_ = true;
 }
 
 void SessionControlProfile::validate() const {
@@ -1689,13 +1713,7 @@ const MediaProfile& VehicleConfig::realtime_profile(std::string_view name) const
   return *found;
 }
 
-const MediaProfile& VehicleConfig::record_profile(std::string_view name) const {
-  const auto found = std::find_if(record_profiles.begin(), record_profiles.end(), [&](const auto& value) {
-    return value.name == name;
-  });
-  if (found == record_profiles.end()) throw std::runtime_error("unknown record media profile: " + std::string(name));
-  return *found;
-}
+
 
 std::vector<CameraConfig> VehicleConfig::enabled_cameras() const {
   std::vector<CameraConfig> result;
@@ -1726,6 +1744,8 @@ Json VehicleConfig::redacted_summary() const {
       {"teleop_poll_interval_ms", runtime.teleop_poll_interval_ms},
       {"camera_count", enabled.size()},
       {"critical_camera_count", critical_camera_count},
+      {"video_recording_removed",true},{"deprecated_video_config_ignored",deprecated_video_config},
+      {"media_mode",surround.mode},{"surround_profile",surround.profile},
       {"vehicle_adapter_type", vehicle_adapter.type},
       {"can_interface", hardware.can_interface},
       {"can_bitrate", hardware.can_bitrate},
@@ -1746,9 +1766,6 @@ Json VehicleConfig::redacted_summary() const {
       {"max_steering_angle_deg", field_safety.max_steering_angle_deg},
       {"require_time_sync", field_safety.require_time_sync},
       {"max_time_sync_uncertainty_ms", field_safety.max_time_sync_uncertainty_ms},
-      {"recording_root", recording.root_dir.string()},
-      {"recording_enabled", recording.enabled},
-      {"upload_enabled", upload.enabled},
   };
 }
 
@@ -1791,6 +1808,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.runtime.control_enabled = optional<bool>(runtime, "control_enabled", true);
   config.runtime.media_enabled = optional<bool>(runtime, "media_enabled", true);
   config.runtime.control_log_commands = optional<bool>(runtime, "control_log_commands", false);
+  config.runtime.media_frame_trace = optional<bool>(runtime, "media_frame_trace", false);
   config.runtime.teleop_poll_interval_ms = optional<int>(runtime, "teleop_poll_interval_ms", 50);
   config.runtime.media_frame_timeout_ms = optional<int>(runtime, "media_frame_timeout_ms", 3000);
   config.runtime.media_capture_interval_ms = optional<int>(runtime, "media_capture_interval_ms", 0);
@@ -1852,27 +1870,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
     config.realtime_profiles.push_back(std::move(value));
   }
 
-  const auto records = root["media"]["record_profiles"];
-  if (records && records.IsMap()) {
-    for (const auto& entry : records) {
-      MediaProfile value;
-      value.name = entry.first.as<std::string>();
-      const auto node = entry.second;
-      value.codec = optional<std::string>(node, "codec", "h264");
-      value.encoder = optional<std::string>(node, "encoder", "x264");
-      const auto width = node["width"];
-      const auto height = node["height"];
-      const auto fps = node["fps"];
-      value.width = width && width.IsScalar() && width.Scalar() != "source" ? width.as<int>() : 0;
-      value.height = height && height.IsScalar() && height.Scalar() != "source" ? height.as<int>() : 0;
-      value.fps = fps && fps.IsScalar() && fps.Scalar() != "source" ? fps.as<int>() : 0;
-      value.bitrate_kbps = required<int>(node, "bitrate_kbps", value.name);
-      value.segment_seconds = optional<int>(node, "segment_seconds", 60);
-      if (value.segment_seconds <= 0) throw std::runtime_error("record segment_seconds must be positive");
-      config.record_profiles.push_back(std::move(value));
-    }
-  }
-
+  config.deprecated_video_config=bool(root["media"]["record_profiles"]||root["recording"]||root["upload"]);
   const auto cameras = root["cameras"];
   if (!cameras || !cameras.IsSequence()) throw std::runtime_error("cameras must be a list");
   std::unordered_set<std::string> camera_ids;
@@ -1892,7 +1890,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
     camera.capture_height = optional<int>(node, "capture_height", 720);
     camera.capture_fps = optional<int>(node, "capture_fps", 30);
     camera.realtime_profile = required<std::string>(node, "realtime_profile", camera.id);
-    camera.record_profile = optional<std::string>(node, "record_profile", "");
+    camera.installation_id = optional<std::string>(node,"installation_id","");
     if (camera.reopen_attempts < 0 || camera.reopen_attempts > 10) {
       throw std::runtime_error(camera.id + ".reopen_attempts must be in [0, 10]");
     }
@@ -1909,7 +1907,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
           camera.id + ".capture_width must be positive and even; capture_height and capture_fps must be positive");
     }
     static_cast<void>(config.realtime_profile(camera.realtime_profile));
-    if (!camera.record_profile.empty()) static_cast<void>(config.record_profile(camera.record_profile));
+    if(node["record_profile"])config.deprecated_video_config=true;
     config.cameras.push_back(std::move(camera));
   }
   const auto enabled_cameras = config.enabled_cameras();
@@ -2073,24 +2071,22 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
         "field_safety local speed PID, feedback timeout, max dt, or hard overspeed margin is invalid");
   }
 
-  const auto recording = root["recording"];
-  config.recording.enabled = optional<bool>(recording, "enabled", false);
-  config.recording.root_dir = optional<std::string>(recording, "root_dir", ".local/recordings");
-  config.recording.min_free_gb = optional<double>(recording, "min_free_gb", 5.0);
-  config.recording.delete_uploaded_when_below_free_gb =
-      optional<double>(recording, "delete_uploaded_when_below_free_gb", 2.0);
-  config.recording.delete_unuploaded_when_below_free_gb =
-      optional<bool>(recording, "delete_unuploaded_when_below_free_gb", false);
-
-  const auto upload = root["upload"];
-  config.upload.enabled = optional<bool>(upload, "enabled", false);
-  config.upload.backend = optional<std::string>(upload, "backend", "local_archive");
-  config.upload.max_bandwidth_mbps = optional<double>(upload, "max_bandwidth_mbps", 5.0);
-  config.upload.trigger_segments = optional<int>(upload, "trigger_segments", 20);
-  config.upload.trigger_network_idle = optional<bool>(upload, "trigger_network_idle", true);
-  config.upload.retry_initial_seconds = optional<int>(upload, "retry_initial_seconds", 10);
-  config.upload.retry_max_seconds = optional<int>(upload, "retry_max_seconds", 600);
-
+  if (const auto node = root["surround"]) {
+    config.surround.mode = node["mode"].as<std::string>("auto");
+    config.surround.calibration_file = node["calibration_file"].as<std::string>("");
+    if(!config.surround.calibration_file.empty()&&config.surround.calibration_file.is_relative())
+      config.surround.calibration_file=path.parent_path()/config.surround.calibration_file;
+    config.surround.profile = node["profile"].as<std::string>("720p");
+    config.surround.max_frame_age_ms = node["max_frame_age_ms"].as<int>(100);
+    config.surround.max_skew_ms = node["max_skew_ms"].as<int>(0);
+    if (config.surround.mode != "auto" && config.surround.mode != "full" && config.surround.mode != "two")
+      throw std::invalid_argument("surround.mode must be auto/full/two");
+    if (config.surround.profile != "720p" && config.surround.profile != "540p")
+      throw std::invalid_argument("surround.profile must be 720p/540p");
+    if (config.surround.max_frame_age_ms <= 0 || config.surround.max_frame_age_ms > 100 ||
+        config.surround.max_skew_ms < 0 || config.surround.max_skew_ms > 40)
+      throw std::invalid_argument("surround freshness limits must not exceed 100/40 ms; 0 selects the measured acceptance limit; 20 ms is the alignment target");
+  }
   const auto adapter = root["vehicle_adapter"];
   config.vehicle_adapter.type = optional<std::string>(adapter, "type", "can");
   config.vehicle_adapter.can_interface = config.hardware.can_interface;
@@ -2137,6 +2133,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
         "non-mock vehicle adapter requires hardware.can.tx_queue_length >= 16");
   }
 
+  if(config.deprecated_video_config)std::cerr<<Json{{"event","deprecated_video_config_ignored"},{"message","Video recording and uploading have been removed; existing files are retained."}}.dump()<<'\n';
   return config;
 }
 

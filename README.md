@@ -2,7 +2,7 @@
 
 Mine Teleop is now a native C++20 runtime. Vehicle media targets Ubuntu 22.04;
 the separated browser-based control client now builds natively on macOS arm64.
-Production control, signaling, driver-console, vehicle-media, recorder/uploader,
+Production control, signaling, driver-console, vehicle-media,
 and camera bridge entry points do not require Python.
 
 ## Guides
@@ -26,10 +26,9 @@ and camera bridge entry points do not require Python.
   native JPEG test frames.
 - `cpp/src/video.cpp`: unified hardware `VideoEncoder` selection with NVIDIA
   NVENC first and Intel VAAPI second.
-- `cpp/src/webrtc_media.cpp`: multi-camera WebRTC/SRTP publishing and
-  encoded-packet MP4 segmentation.
-- `cpp/src/upload.cpp`: atomic sidecar scanning, SHA-256 verification,
-  bandwidth limiting, and resumable local archive upload.
+- `cpp/src/webrtc_media.cpp`: multi-camera and two-stream WebRTC/SRTP,
+  per-source safety checks, parking epochs and relay admission.
+- `cpp/src/surround_math.cpp`: shared native/WASM calibrated ground projection.
 - `cpp/bridges/mvs_camera_bridge.cpp`: optional Hikrobot MVS bridge.
 - `cpp/bridges/aravis_camera_bridge.cpp`: minimal Aravis/libusb USB3 Vision
   bridge for Basler and other GenICam cameras.
@@ -358,9 +357,8 @@ capabilities without using the removed per-frame upload path.
   when the browser advertises it. If browser stats report any H.265 track below
   20 fps for three consecutive samples, the vehicle skips the remaining H.265
   backend and renegotiates H.264, preferring NVENC before VAAPI.
-- Realtime encoding defaults to NVENC and falls back to Intel VAAPI. Recording
-  tees the already encoded H.264/H.265 access units into `splitmuxsink/mp4mux`;
-  no second encoder process is launched.
+- Realtime encoding defaults to NVENC and falls back to Intel VAAPI.
+  Video recording and upload are handled outside this project.
 - The Aravis/libusb bridge is built from a pinned source revision with USB3
   Vision enabled and viewer, GStreamer plugin, introspection, documentation,
   tests, and packet-socket support disabled. `aravis:`, `basler:`, and legacy
@@ -371,3 +369,5 @@ capabilities without using the removed per-frame upload path.
   dynamic chassis bridge and require CAN feedback.
 - The strict test artifact carries its userspace dynamic loader and libraries,
   but not the Ubuntu kernel or kernel-mode GPU/camera drivers.
+
+Surround/two-stream transmission, calibration, safety epochs and relay admission: [implementation and qualification guide](docs/surround-and-relay.md). Video recording/uploader have been removed; old files are retained.

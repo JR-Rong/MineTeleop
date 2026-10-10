@@ -1,0 +1,24 @@
+[Unit]
+Description=MineTeleop relay lease metering and asynchronous allocation reclamation
+After=mine-teleop-turn-server.service mine-teleop-signaling-server.service
+Requires=mine-teleop-turn-server.service
+PartOf=mine-teleop-cloud.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/mine-teleop/mine-teleop.env
+User=root
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/mine-teleop-relay /var/log/mine-teleop
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+ExecStart=/usr/bin/python3 /opt/mine-teleop/scripts/relay/manager.py --state-dir /var/lib/mine-teleop-relay/leases --database /var/lib/mine-teleop-relay/turndb.sqlite --realm ${MINE_TELEOP_TURN_REALM} --cli-password-file /etc/mine-teleop/secrets/turn-cli.password --interface ${MINE_TELEOP_RELAY_INTERFACE}
+Restart=on-failure
+RestartSec=2
+StandardOutput=append:/var/log/mine-teleop/relay-manager.jsonl
+StandardError=append:/var/log/mine-teleop/relay-manager.jsonl
+
+[Install]
+WantedBy=multi-user.target
