@@ -1,5 +1,6 @@
 #include "mine_teleop/media.hpp"
 
+#include "mine_teleop/gstreamer_media.hpp"
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/upload.hpp"
 #include "mine_teleop/video.hpp"
@@ -33,6 +34,22 @@
 #include <vector>
 
 namespace mine_teleop {
+
+void isolate_bundled_rtp_lane_eos(GstPad* rtp_src_pad, std::atomic<bool>& pipeline_stopping) {
+  if (rtp_src_pad == nullptr) throw std::invalid_argument("camera RTP source pad is missing");
+  gst_pad_add_probe(
+      rtp_src_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+      +[](GstPad*, GstPadProbeInfo* info, gpointer data) {
+        const auto* stopping = static_cast<const std::atomic<bool>*>(data);
+        // A failed camera may finalize its encoder/recording, but its EOS must
+        // not end the shared RTP session used by the other bundled cameras.
+        if (GST_EVENT_TYPE(GST_PAD_PROBE_INFO_EVENT(info)) == GST_EVENT_EOS && !stopping->load()) {
+          return GST_PAD_PROBE_DROP;
+        }
+        return GST_PAD_PROBE_OK;
+      },
+      &pipeline_stopping, nullptr);
+}
 
 CameraFailureDecision camera_failure_decision(
     const CameraConfig& camera,
@@ -3016,17 +3033,24 @@ struct VehicleMediaRuntime::Impl {
       lane->appsrc = gst_bin_get_by_name(GST_BIN(pipeline), ("source_" + id).c_str());
       lane->encoder = gst_bin_get_by_name(GST_BIN(pipeline), ("encoder_" + id).c_str());
       lane->send_queue = gst_bin_get_by_name(GST_BIN(pipeline), ("send_queue_" + id).c_str());
-      if (lane->appsrc == nullptr || lane->encoder == nullptr || lane->send_queue == nullptr) {
+      auto* payloader = gst_bin_get_by_name(GST_BIN(pipeline), ("pay_" + id).c_str());
+      auto* rtp_src_pad = payloader == nullptr ? nullptr : gst_element_get_static_pad(payloader, "src");
+      if (payloader != nullptr) gst_object_unref(payloader);
+      if (lane->appsrc == nullptr || lane->encoder == nullptr || lane->send_queue == nullptr ||
+          rtp_src_pad == nullptr) {
+        if (rtp_src_pad != nullptr) gst_object_unref(rtp_src_pad);
         set_pipeline_error(
             "media pipeline lane is incomplete: " + lane->camera.id,
             "gstreamer_camera_lane_incomplete",
             "pipeline_link",
-            "Check that the camera ID produces valid GStreamer element names and that appsrc/encoder elements were created.",
+            "Check the camera element names and appsrc/encoder/queue/RTP payloader elements.",
             false,
             {{"camera_id", lane->camera.id}, {"device", lane->camera.device}});
         stop_pipeline();
         return false;
       }
+      isolate_bundled_rtp_lane_eos(rtp_src_pad, stop_requested);
+      gst_object_unref(rtp_src_pad);
       g_signal_connect(lane->send_queue, "overrun", G_CALLBACK(+[](GstElement*, gpointer data) {
         ++static_cast<Lane*>(data)->encoded_queue_backpressure;
       }), lane.get());

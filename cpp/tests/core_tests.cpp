@@ -1,4 +1,5 @@
 #include "mine_teleop/core.hpp"
+#include "mine_teleop/gstreamer_media.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/server.hpp"
@@ -10,6 +11,7 @@
 #include <gst/app/gstappsink.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <chrono>
@@ -1109,6 +1111,70 @@ void test_encoded_frame_queues_preserve_reference_frames_under_backpressure() {
                  ", delivered=" + std::to_string(delivered) + "/" + std::to_string(count));
     }
   }
+}
+
+void test_disabled_camera_eos_does_not_end_bundled_healthy_video() {
+  gst_init(nullptr, nullptr);
+  GError* error = nullptr;
+  auto* pipeline = gst_parse_launch(
+      "rtpfunnel name=bundle ! appsink name=output sync=false "
+      "appsrc name=healthy is-live=true format=time caps=application/x-rtp,media=video,encoding-name=H264,clock-rate=90000,payload=96,ssrc=(uint)111 ! bundle.sink_0 "
+      "appsrc name=failed is-live=true format=time caps=application/x-rtp,media=video,encoding-name=H264,clock-rate=90000,payload=96,ssrc=(uint)222 ! bundle.sink_1",
+      &error);
+  const std::string parse_error = error == nullptr ? "" : error->message;
+  if (error != nullptr) g_error_free(error);
+  if (pipeline == nullptr || !parse_error.empty()) {
+    if (pipeline != nullptr) gst_object_unref(pipeline);
+    throw TestFailure("bundled RTP fixture did not parse: " + parse_error);
+  }
+  auto* healthy = gst_bin_get_by_name(GST_BIN(pipeline), "healthy");
+  auto* failed = gst_bin_get_by_name(GST_BIN(pipeline), "failed");
+  auto* output = gst_bin_get_by_name(GST_BIN(pipeline), "output");
+  auto* healthy_pad = gst_element_get_static_pad(healthy, "src");
+  auto* failed_pad = gst_element_get_static_pad(failed, "src");
+  std::atomic<bool> stopping{false};
+  mine_teleop::isolate_bundled_rtp_lane_eos(healthy_pad, stopping);
+  mine_teleop::isolate_bundled_rtp_lane_eos(failed_pad, stopping);
+  const auto state = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+  const auto push_packet = [](GstElement* source, int sequence, guint8 ssrc) {
+    const auto timestamp = static_cast<std::uint32_t>(sequence * 3000);
+    const std::array<guint8, 13> packet{
+        0x80, 0x60, 0, static_cast<guint8>(sequence),
+        static_cast<guint8>(timestamp >> 24), static_cast<guint8>(timestamp >> 16),
+        static_cast<guint8>(timestamp >> 8), static_cast<guint8>(timestamp),
+        0, 0, 0, ssrc, 0x41};
+    auto* buffer = gst_buffer_new_allocate(nullptr, packet.size(), nullptr);
+    gst_buffer_fill(buffer, 0, packet.data(), packet.size());
+    GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(sequence) * GST_SECOND / 30;
+    return gst_app_src_push_buffer(GST_APP_SRC(source), buffer) == GST_FLOW_OK;
+  };
+  bool pushed = push_packet(healthy, 0, 111) && push_packet(failed, 0, 222);
+  int initial_packets = 0;
+  for (int index = 0; index < 2; ++index) {
+    auto* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(output), 2 * GST_SECOND);
+    if (sample != nullptr) { ++initial_packets; gst_sample_unref(sample); }
+  }
+  const bool failed_eos_handled = gst_pad_push_event(failed_pad, gst_event_new_eos());
+  int healthy_packets = 0;
+  for (int index = 1; index <= 20; ++index) {
+    pushed = push_packet(healthy, index, 111) && pushed;
+    auto* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(output), 100 * GST_MSECOND);
+    if (sample != nullptr) { ++healthy_packets; gst_sample_unref(sample); }
+  }
+  const bool ended_after_lane_failure = gst_app_sink_is_eos(GST_APP_SINK(output));
+  stopping = true;
+  const bool shutdown_eos_handled = gst_pad_push_event(healthy_pad, gst_event_new_eos());
+  const bool ended_on_shutdown = gst_app_sink_is_eos(GST_APP_SINK(output));
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_object_unref(healthy_pad); gst_object_unref(failed_pad);
+  gst_object_unref(healthy); gst_object_unref(failed); gst_object_unref(output);
+  gst_object_unref(pipeline);
+  expect(state != GST_STATE_CHANGE_FAILURE && pushed && initial_packets == 2,
+         "bundled RTP fixture did not establish both active camera streams");
+  expect(failed_eos_handled && healthy_packets == 20 && !ended_after_lane_failure,
+         "failed camera EOS ended healthy bundled video: received=" + std::to_string(healthy_packets));
+  expect(shutdown_eos_handled && ended_on_shutdown,
+         "camera EOS isolation prevented whole-pipeline shutdown");
 }
 
 void test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap() {
@@ -4190,6 +4256,7 @@ int main() {
       {"camera_input_pipeline_resamples_only_mismatched_ccg2_fps", test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps},
       {"ccg2_camera_input_pipeline_is_gstreamer_parseable", test_ccg2_camera_input_pipeline_is_gstreamer_parseable},
       {"encoded_frame_queues_preserve_reference_frames_under_backpressure", test_encoded_frame_queues_preserve_reference_frames_under_backpressure},
+      {"disabled_camera_eos_does_not_end_bundled_healthy_video", test_disabled_camera_eos_does_not_end_bundled_healthy_video},
       {"v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap", test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap},
       {"camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults", test_camera_issue_classification_distinguishes_ccg2_fps_and_buffer_faults},
       {"ccg2_example_config_defines_two_explicit_capture_lanes", test_ccg2_example_config_defines_two_explicit_capture_lanes},
