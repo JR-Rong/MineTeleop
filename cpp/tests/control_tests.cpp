@@ -795,7 +795,7 @@ void test_control_page_contract() {
   expect(
       response.body.find("function applyVehicleSafetyState(value)") !=
               std::string::npos &&
-          response.body.find("next==='DEGRADED'){clearControlInput(false)") !=
+          response.body.find("next==='DEGRADED'){clearControlInput(false,'vehicle_degraded')") !=
               std::string::npos &&
           response.body.find("next==='DEGRADED'&&lastVehicleSafetyState") ==
               std::string::npos &&
@@ -810,7 +810,7 @@ void test_control_page_contract() {
           response.body.find("controlLogic.requiresFreshInput(value)") != std::string::npos &&
           response.body.find("controlLogic.transitionVcuState(vcuEverReady,value)") !=
               std::string::npos &&
-          response.body.find("function resetControlAuthorityInput(){vcuEverReady=false;clearControlInput()}") !=
+          response.body.find("function resetControlAuthorityInput(reason='control_authority_reset'){vcuEverReady=false;clearControlInput(true,reason)}") !=
               std::string::npos &&
           response.body.find("if(!vcuEverReady&&!vcuMockUnsupported())") != std::string::npos &&
           response.body.find("首次握手完成后请重新按下") != std::string::npos,
@@ -1070,7 +1070,7 @@ void test_control_page_contract() {
               std::string::npos,
       "a completed VCU disconnect can silently reapply a legacy session profile");
   const auto neutralize_input = response.body.find(
-      "function neutralizeInput(){clearControlInput(false);send({},false).catch(console.error)}");
+      "function neutralizeInput(event){clearControlInput(false,event?.type==='blur'?'window_blur':'document_hidden');send({},false).catch(console.error)}");
   const auto blur_neutralize = response.body.find(
       "addEventListener('blur',neutralizeInput)", neutralize_input);
   const auto hidden_neutralize = response.body.find(

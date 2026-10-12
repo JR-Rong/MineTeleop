@@ -3,20 +3,32 @@
 const assert = require('assert').strict;
 const fs = require('fs');
 const path = require('path');
+const vm = require('vm');
 const logic = require('../web/control_logic.js');
 const controlPageSource = fs.readFileSync(path.join(__dirname, '../src/server.cpp'), 'utf8');
 
 let passed = 0;
 let failed = 0;
+const pendingTests = [];
 function test(name, body) {
-  try {
-    body();
+  function pass() {
     passed += 1;
     console.log(`[PASS] ${name}`);
-  } catch (error) {
+  }
+  function fail(error) {
     failed += 1;
     console.error(`[FAIL] ${name}`);
     console.error(error && error.stack ? error.stack : error);
+  }
+  try {
+    const result = body();
+    if (result && typeof result.then === 'function') {
+      pendingTests.push(Promise.resolve(result).then(pass, fail));
+    } else {
+      pass();
+    }
+  } catch (error) {
+    fail(error);
   }
 }
 
@@ -29,6 +41,177 @@ const readyVcu = {
   speed_mps: 0,
   gear_change_stationary_confirmed: true,
 };
+
+// Execute the shipped page's request handler, with deterministic local HTTP
+// responses and timers. A synthetic reducer would miss its input-clearing bug.
+function intentPageFixture(codes = ['ArrowUp', 'ArrowLeft']) {
+  const pressed = new Set(codes);
+  const blocked = new Set();
+  const logs = [];
+  const timers = new Map();
+  const requests = [];
+  let timerId = 0;
+  let elapsed = 1000;
+  const context = {
+    controlLogic: logic,
+    peer: {connectionState: 'connected'},
+    controlChannel: {readyState: 'open'},
+    controlAuthorityLost: false,
+    gearRejectionInhibited: false,
+    controlProfileState: {acknowledged: true},
+    vcuHandshake: readyVcu,
+    pendingGearTransition: null,
+    estopLatched: false,
+    activeControlPreparePreemptedByEstop: false,
+    nativeControlSessionId: 'test-session',
+    nativeControlSessionGeneration: 1,
+    lastNativeIntentSnapshot: 'held-input',
+    consoleConfig: {intent_lease_ms: 200},
+    performance: {now: () => elapsed},
+    webrtcLabel: {}, statusPanel: {}, lastKeyboardEvent: {},
+    vcuStateKeepsHeldInput: () => false,
+    vcuDrivingReady: () => true,
+    currentControl: () => {
+      const keys = logic.deriveKeyState(pressed);
+      return {gear: 'D', throttle: keys.up ? 0.5 : 0,
+        steering: keys.left ? -1 : keys.right ? 1 : 0,
+        brake: 0, estop: context.estopLatched};
+    },
+    nativeIntentEnvelope: outgoing => Object.assign({
+      session_id: context.nativeControlSessionId,
+      session_generation: context.nativeControlSessionGeneration,
+      intent_seq: 62,
+    }, outgoing),
+    controlInputDiagnostic: () => ({pressed_codes: Array.from(pressed), blocked_codes: Array.from(blocked)}),
+    clearControlInput: (resetGear, reason) => {
+      logic.blockAndClearKeys(pressed, blocked);
+      logs.push({event: 'cleared', reason});
+    },
+    resetControlAuthorityInput: () => { context.controlAuthorityLost = true; logic.blockAndClearKeys(pressed, blocked); },
+    resetControlProfileSession: () => { context.controlProfileState.acknowledged = false; },
+    clientLog: (event, details) => logs.push({event, details}),
+    setTimeout: callback => { const id = ++timerId; timers.set(id, callback); return id; },
+    clearTimeout: id => timers.delete(id),
+    AbortController: class {
+      constructor() { this.signal = {}; }
+      abort() { if (this.signal.onAbort) this.signal.onAbort(); }
+    },
+    post: (url, intent, signal) => new Promise((resolve, reject) => {
+      signal.onAbort = () => reject(Object.assign(new Error('delayed local response'), {name: 'AbortError'}));
+      requests.push({url, intent, resolve, reject});
+    }),
+  };
+  vm.createContext(context);
+  const start = controlPageSource.indexOf('async function writeControlIntent(');
+  const end = controlPageSource.indexOf('function reportControlQueueError(', start);
+  assert.ok(start >= 0 && end > start);
+  vm.runInContext(controlPageSource.slice(start, end), context);
+  return {context, pressed, blocked, logs, requests,
+    timeout: () => { elapsed += 150; Array.from(timers.values()).forEach(callback => callback()); }};
+}
+
+test('delayed local intent response keeps all four held directions and can refresh again', async () => {
+  for (const code of ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']) {
+    const fixture = intentPageFixture([code]);
+    const first = fixture.context.writeControlIntent({}, false);
+    fixture.timeout();
+    assert.equal((await first).reason, 'control_intent_update_timeout');
+    assert.deepEqual(Array.from(fixture.pressed), [code]);
+    assert.equal(fixture.blocked.size, 0);
+    assert.equal(fixture.logs[0].details.input_retained, true);
+    assert.equal(fixture.logs[0].details.request_elapsed_ms, 150);
+    const next = fixture.context.writeControlIntent({}, false);
+    fixture.requests[1].resolve({accepted: true, duplicate: true, intent_seq: 62});
+    assert.equal((await next).sent, true);
+    assert.equal(fixture.pressed.has(code), true);
+  }
+});
+
+test('response timeout cannot erase a newer key or resurrect a released key', async () => {
+  const fixture = intentPageFixture(['ArrowUp']);
+  const first = fixture.context.writeControlIntent({}, false);
+  logic.releaseKey(fixture.pressed, fixture.blocked, 'ArrowUp');
+  logic.pressKey(fixture.pressed, fixture.blocked, 'ArrowLeft');
+  fixture.timeout();
+  await first;
+  assert.deepEqual(Array.from(fixture.pressed), ['ArrowLeft']);
+  const next = fixture.context.writeControlIntent({}, false);
+  assert.equal(fixture.requests[1].intent.throttle, 0);
+  assert.equal(fixture.requests[1].intent.steering, -1);
+  fixture.requests[1].resolve({accepted: true, duplicate: false, intent_seq: 63});
+  await next;
+});
+
+test('real native lease rejection still blocks held keys until physical release', async () => {
+  const fixture = intentPageFixture();
+  const request = fixture.context.writeControlIntent({}, false);
+  fixture.requests[0].resolve({accepted: false, reason: 'fresh_neutral_required', requires_fresh_input: true});
+  assert.equal((await request).sent, false);
+  assert.equal(fixture.pressed.size, 0);
+  assert.equal(logic.pressKey(fixture.pressed, fixture.blocked, 'ArrowUp').accepted, false);
+  assert.equal(fixture.logs[0].reason, 'native_intent_rearm_required');
+  logic.releaseKey(fixture.pressed, fixture.blocked, 'ArrowUp');
+  assert.equal(logic.pressKey(fixture.pressed, fixture.blocked, 'ArrowUp').accepted, true);
+});
+
+test('timed out prior session and ESTOP preemption cannot clear current keys', async () => {
+  const fixture = intentPageFixture();
+  const stale = fixture.context.writeControlIntent({}, false);
+  fixture.context.nativeControlSessionGeneration = 2;
+  fixture.timeout();
+  assert.equal((await stale).reason, 'stale_control_intent_response');
+  assert.equal(fixture.pressed.size, 2);
+  assert.equal(fixture.logs.length, 0);
+  const urgent = fixture.context.writeControlIntent({}, false);
+  fixture.context.activeControlPreparePreemptedByEstop = true;
+  fixture.context.estopLatched = true;
+  fixture.timeout();
+  assert.equal((await urgent).reason, 'control_intent_preempted_by_estop');
+  assert.equal(fixture.context.estopLatched, true);
+  assert.equal(fixture.logs.length, 0);
+});
+
+test('missing vehicle profile still neutralizes input and forbids driving', async () => {
+  const fixture = intentPageFixture();
+  fixture.context.controlProfileState.acknowledged = false;
+  const request = fixture.context.writeControlIntent({}, true);
+  assert.equal(fixture.requests[0].intent.throttle, 0);
+  assert.equal(fixture.requests[0].intent.steering, 0);
+  assert.equal(fixture.logs[0].reason, 'control_profile_not_acknowledged');
+  fixture.requests[0].resolve({accepted: true, duplicate: true});
+  assert.equal((await request).blocked_reason, 'control_profile_not_acknowledged');
+});
+
+test('duplicate profile telemetry preserves operator guidance but revocation still resets input', () => {
+  const profile = controlProfile();
+  const logs = [];
+  const resets = [];
+  const context = {
+    controlLogic: logic,
+    controlProfileState: {requestedProfile: profile, pendingRequestSeq: 7},
+    pendingControlProfileEnvelope: {},
+    statusPanel: {},
+    clientLog: event => logs.push(event),
+    resetControlAuthorityInput: reason => resets.push(reason),
+    renderControlLimits: () => {}, renderMonitoring: () => {},
+  };
+  vm.createContext(context);
+  const start = controlPageSource.indexOf('function applyControlProfileStatus(');
+  const end = controlPageSource.indexOf('function controlProfileParkingReady(', start);
+  assert.ok(start >= 0 && end > start);
+  vm.runInContext(controlPageSource.slice(start, end), context);
+  const status = {accepted: true, active: true, last_request_seq: 7,
+    applied_revision: 7, effective_profile: profile, reason: 'accepted'};
+  assert.equal(context.applyControlProfileStatus(status), true);
+  context.statusPanel.textContent = '请释放后重新按下';
+  assert.equal(context.applyControlProfileStatus(status), true);
+  assert.equal(context.statusPanel.textContent, '请释放后重新按下');
+  assert.deepEqual(logs, ['session_control_profile_accepted']);
+  context.applyControlProfileStatus({...status, accepted: false, active: false,
+    reason: 'session_profile_cleared'});
+  assert.equal(context.controlProfileState.acknowledged, false);
+  assert.deepEqual(resets, ['session_control_profile_invalidated']);
+});
 
 test('telemetry freshness separates local receipt age from synchronized source age', () => {
   const telemetry = {sent_at_utc_ms: 100000};
@@ -1071,9 +1254,11 @@ test('vehicle startup and camera inhibition diagnostics remain distinct from CAN
   assert.equal(logic.vehicleControlDiagnostic('future-code'), null);
 });
 
-if (failed > 0) {
-  console.error(`${failed} of ${passed + failed} control logic tests failed`);
-  process.exitCode = 1;
-} else {
-  console.log(`${passed} control logic tests passed`);
-}
+Promise.all(pendingTests).then(() => {
+  if (failed > 0) {
+    console.error(`${failed} of ${passed + failed} control logic tests failed`);
+    process.exitCode = 1;
+  } else {
+    console.log(`${passed} control logic tests passed`);
+  }
+});

@@ -94,6 +94,38 @@ void test_invalidate_does_not_restore_old_throttle() {
   expect_zero_actuation(sample.intent, "rejected input restored throttle after invalidate");
 }
 
+void test_held_input_refreshes_for_a_minute_but_real_expiry_still_requires_neutral() {
+  mine_teleop::NativeControlIntentStore store(200);
+  auto neutral = neutral_intent(1);
+  expect(store.update(neutral, 0).accepted, "initial neutral intent was rejected");
+  auto held = neutral;
+  held.intent_seq = 2;
+  held.throttle = 0.5;
+  held.steering = -1.0;
+  std::int64_t last_refresh = 0;
+  for (std::int64_t time = 66; time <= 61000; time += 66) {
+    expect(store.update(held, time).accepted, "unchanged held intent refresh was rejected");
+    const auto sample = store.sample(time + 60);
+    expect(sample.fresh && !sample.requires_fresh_input &&
+               sample.intent.throttle == 0.5 && sample.intent.steering == -1.0,
+           "a continuously refreshed long hold lost actuation");
+    last_refresh = time;
+  }
+  const auto expired = store.sample(last_refresh + 200);
+  expect(!expired.fresh && expired.requires_fresh_input,
+         "the unchanged 200ms lease failed to expire");
+  expect_zero_actuation(expired.intent, "real expiry retained actuation");
+  held.intent_seq = 3;
+  expect(store.update(held, last_refresh + 201).reason == "fresh_neutral_required",
+         "a held key resumed traction after real expiry without neutral re-arm");
+  neutral.intent_seq = 4;
+  expect(store.update(neutral, last_refresh + 202).accepted,
+         "fresh neutral re-arm was rejected");
+  held.intent_seq = 5;
+  expect(store.update(held, last_refresh + 203).accepted,
+         "fresh input after neutral re-arm was rejected");
+}
+
 void test_fresh_neutral_interlock() {
   mine_teleop::NativeControlIntentStore store(150);
   auto drive = neutral_intent(1);
@@ -228,6 +260,8 @@ int main() {
        test_lease_expiry_neutralizes_and_preserves_gear},
       {"invalidate_does_not_restore_old_throttle",
        test_invalidate_does_not_restore_old_throttle},
+      {"held_input_refreshes_for_a_minute_but_real_expiry_still_requires_neutral",
+       test_held_input_refreshes_for_a_minute_but_real_expiry_still_requires_neutral},
       {"fresh_neutral_interlock", test_fresh_neutral_interlock},
       {"estop_is_sticky", test_estop_is_sticky},
       {"native_control_ack_progress_replays_session31_and_bounds_backlog",
