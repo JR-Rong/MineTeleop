@@ -1025,6 +1025,27 @@ void test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps() {
       "legacy MJPEG pipeline behavior changed when input and output FPS differ");
 }
 
+void test_encoder_latency_accounts_for_shifted_segments() {
+  GstSegment segment;
+  gst_segment_init(&segment, GST_FORMAT_TIME);
+  expect(mine_teleop::encoded_frame_latency_ms(segment, 100 * GST_MSECOND, 150) == 50,
+         "unshifted encoder latency changed");
+  const auto offset = GST_SECOND * 60 * 60 * 1000 - 100 * GST_MSECOND;
+  segment.start = offset;
+  segment.position = offset;
+  expect(mine_teleop::encoded_frame_latency_ms(segment, offset + 100 * GST_MSECOND, 150) == 50,
+         "NVENC-style PTS offset hid a real 50ms encode delay");
+  expect(!mine_teleop::encoded_frame_latency_ms(segment, offset - GST_MSECOND, 150),
+         "PTS outside the output segment became zero latency");
+  expect(!mine_teleop::encoded_frame_latency_ms(segment, offset + 200 * GST_MSECOND, 150),
+         "future frame became zero latency");
+  expect(!mine_teleop::encoded_frame_latency_ms(segment, GST_CLOCK_TIME_NONE, 150),
+         "missing PTS became valid latency");
+  segment.format = GST_FORMAT_UNDEFINED;
+  expect(!mine_teleop::encoded_frame_latency_ms(segment, 100 * GST_MSECOND, 150),
+         "missing segment became valid latency");
+}
+
 void test_ccg2_camera_input_pipeline_is_gstreamer_parseable() {
   mine_teleop::MediaProfile output;
   output.width = 1280;
@@ -4255,6 +4276,7 @@ int main() {
       {"camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2", test_camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2},
       {"camera_input_pipeline_resamples_only_mismatched_ccg2_fps", test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps},
       {"ccg2_camera_input_pipeline_is_gstreamer_parseable", test_ccg2_camera_input_pipeline_is_gstreamer_parseable},
+      {"encoder_latency_accounts_for_shifted_segments", test_encoder_latency_accounts_for_shifted_segments},
       {"encoded_frame_queues_preserve_reference_frames_under_backpressure", test_encoded_frame_queues_preserve_reference_frames_under_backpressure},
       {"disabled_camera_eos_does_not_end_bundled_healthy_video", test_disabled_camera_eos_does_not_end_bundled_healthy_video},
       {"v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap", test_v4l2_sequence_gap_handles_first_consecutive_missing_and_wrap},

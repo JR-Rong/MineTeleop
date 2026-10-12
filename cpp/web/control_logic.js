@@ -1247,6 +1247,36 @@
     return terminalControlOutcomeCount(current) === current.prepared;
   }
 
+  function telemetryFreshness(message, receivedAtMonotonicMs, nowMonotonicMs, synchronizedNowMs) {
+    const receivedAge = message && receivedAtMonotonicMs != null &&
+        Number.isFinite(receivedAtMonotonicMs) && Number.isFinite(nowMonotonicMs)
+        ? Math.max(0, nowMonotonicMs - receivedAtMonotonicMs) : null;
+    const sourceAge = message && message.sent_at_utc_ms != null && synchronizedNowMs != null &&
+        Number.isFinite(Number(message.sent_at_utc_ms)) && Number.isFinite(synchronizedNowMs)
+        ? Math.max(0, synchronizedNowMs - Number(message.sent_at_utc_ms)) : null;
+    return {
+      received_age_ms: receivedAge,
+      source_age_ms: sourceAge,
+      fresh: receivedAge !== null && receivedAge <= 500 && sourceAge !== null && sourceAge <= 500,
+    };
+  }
+
+  function selectedIcePair(report) {
+    for (const stat of report.values()) {
+      if (stat.type !== 'transport' || !stat.selectedCandidatePairId) continue;
+      const pair = report.get(stat.selectedCandidatePairId);
+      if (pair?.type === 'candidate-pair') return {pair, transport: stat, method: 'transport'};
+    }
+    // Older browsers may omit transport.selectedCandidatePairId. A successful
+    // connectivity check alone does not identify the pair carrying media.
+    for (const pair of report.values()) {
+      if (pair.type === 'candidate-pair' && pair.state === 'succeeded' && pair.nominated === true) {
+        return {pair, transport: null, method: 'nominated_fallback'};
+      }
+    }
+    return {pair: null, transport: null, method: 'unavailable'};
+  }
+
   return Object.freeze({
     KEY_BINDINGS,
     CONTROL_ACTIONS,
@@ -1298,5 +1328,7 @@
     createControlOutcomeMetrics,
     reduceControlOutcome,
     controlOutcomesBalanced,
+    telemetryFreshness,
+    selectedIcePair,
   });
 });

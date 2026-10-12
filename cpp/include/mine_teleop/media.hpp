@@ -161,6 +161,8 @@ class CameraFrameSource {
   [[nodiscard]] EncodedFrame next(std::uint64_t sequence);
   [[nodiscard]] const std::string& camera_id() const { return camera_.id; }
   [[nodiscard]] const std::vector<std::string>& command() const { return command_; }
+  // Read on the capture thread, including immediately after a failed read.
+  [[nodiscard]] Json capture_diagnostics() const;
   [[nodiscard]] std::optional<std::uint32_t> last_v4l2_sequence() const {
     return last_dequeued_v4l2_sequence_;
   }
@@ -204,6 +206,13 @@ class CameraFrameSource {
   std::optional<std::uint32_t> last_delivered_v4l2_sequence_;
   std::optional<std::uint32_t> last_dequeued_v4l2_sequence_;
   std::uint64_t last_dequeued_v4l2_sequence_gap_{0};
+  std::string v4l2_driver_, v4l2_card_, v4l2_bus_info_;
+  bool last_v4l2_buffer_valid_{false};
+  std::uint32_t last_v4l2_buffer_flags_{0}, last_v4l2_buffer_index_{0};
+  std::int64_t last_v4l2_timestamp_us_{0};
+  int last_v4l2_poll_revents_{0};
+  std::uint64_t v4l2_dequeue_eagain_count_{0};
+  std::int64_t last_read_duration_ms_{0};
   std::vector<MappedBuffer> mapped_buffers_;
 };
 

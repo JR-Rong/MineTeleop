@@ -30,6 +30,31 @@ const readyVcu = {
   gear_change_stationary_confirmed: true,
 };
 
+test('telemetry freshness separates local receipt age from synchronized source age', () => {
+  const telemetry = {sent_at_utc_ms: 100000};
+  // A browser clock 40 seconds ahead must not make fresh telemetry look delayed.
+  assert.deepEqual(logic.telemetryFreshness(telemetry, 1000, 1100, 140100 - 40000), {
+    received_age_ms: 100, source_age_ms: 100, fresh: true,
+  });
+  assert.deepEqual(logic.telemetryFreshness(telemetry, 1000, 41100, 140100), {
+    received_age_ms: 40100, source_age_ms: 40100, fresh: false,
+  });
+  assert.equal(logic.telemetryFreshness(telemetry, 1000, 1001, 140100).fresh, false,
+      'a newly received but old source record became fresh');
+  assert.equal(logic.telemetryFreshness(telemetry, 1000, 1001, null).fresh, false);
+  assert.equal(logic.telemetryFreshness(null, null, 41100, 140100).received_age_ms, null);
+});
+
+test('ICE diagnostics follow the transport selected pair instead of another successful check', () => {
+  const active = {id: 'active', type: 'candidate-pair', state: 'succeeded', nominated: false};
+  const unused = {id: 'unused', type: 'candidate-pair', state: 'succeeded', nominated: true};
+  const transport = {id: 'dtls', type: 'transport', selectedCandidatePairId: 'active'};
+  const report = new Map([['unused', unused], ['active', active], ['dtls', transport]]);
+  assert.deepEqual(logic.selectedIcePair(report), {pair: active, transport, method: 'transport'});
+  assert.equal(logic.selectedIcePair(new Map([['active', active]])).pair, null);
+  assert.equal(logic.selectedIcePair(new Map([['unused', unused]])).method, 'nominated_fallback');
+});
+
 test('browser native intent envelope is bound to the connected session generation', () => {
   assert.equal(
       controlPageSource.includes(

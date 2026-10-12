@@ -35,6 +35,17 @@
 
 namespace mine_teleop {
 
+std::optional<std::uint64_t> encoded_frame_latency_ms(
+    const GstSegment& segment, GstClockTime pts, std::int64_t elapsed_ms) {
+  if (segment.format != GST_FORMAT_TIME || !GST_CLOCK_TIME_IS_VALID(pts) || elapsed_ms < 0) {
+    return std::nullopt;
+  }
+  const auto running_time = gst_segment_to_running_time(&segment, GST_FORMAT_TIME, pts);
+  if (!GST_CLOCK_TIME_IS_VALID(running_time) ||
+      running_time / GST_MSECOND > static_cast<std::uint64_t>(elapsed_ms)) return std::nullopt;
+  return static_cast<std::uint64_t>(elapsed_ms) - running_time / GST_MSECOND;
+}
+
 void isolate_bundled_rtp_lane_eos(GstPad* rtp_src_pad, std::atomic<bool>& pipeline_stopping) {
   if (rtp_src_pad == nullptr) throw std::invalid_argument("camera RTP source pad is missing");
   gst_pad_add_probe(
@@ -568,6 +579,13 @@ struct VehicleMediaRuntime::Impl {
     std::atomic<std::uint64_t> encode_latency_samples{0};
     std::atomic<std::uint64_t> encode_latency_total_ms{0};
     std::atomic<std::uint64_t> encode_latency_max_ms{0};
+    std::atomic<std::uint64_t> encode_latency_invalid_samples{0};
+    std::atomic<bool> encode_latency_current_valid{false};
+    std::atomic<std::uint64_t> encoder_output_pts_ms{0};
+    std::atomic<std::uint64_t> encoder_segment_start_ms{0};
+    GstSegment encoder_output_segment{}; // Only the encoder src probe accesses this.
+    std::atomic<std::int64_t> last_capture_steady_ms{0};
+    std::atomic<std::int64_t> capture_interval_max_ms{0};
     std::atomic<bool> first_frame_reported{false};
     std::atomic<int> failure_count{0};
     std::atomic<int> reopen_count{0};
@@ -824,21 +842,39 @@ struct VehicleMediaRuntime::Impl {
 
   static GstPadProbeReturn count_encoded(GstPad*, GstPadProbeInfo* info, gpointer user_data) {
     auto* lane = static_cast<Lane*>(user_data);
+    if ((GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) != 0) {
+      auto* event = GST_PAD_PROBE_INFO_EVENT(info);
+      if (GST_EVENT_TYPE(event) == GST_EVENT_SEGMENT) {
+        const GstSegment* segment = nullptr;
+        gst_event_parse_segment(event, &segment);
+        gst_segment_copy_into(segment, &lane->encoder_output_segment);
+        lane->encoder_segment_start_ms = segment->start / GST_MSECOND;
+      } else if (GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_STOP) {
+        gst_segment_init(&lane->encoder_output_segment, GST_FORMAT_UNDEFINED);
+      }
+      return GST_PAD_PROBE_OK;
+    }
     if ((GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) != 0) {
       ++lane->encoded;
       const auto encoded_at_ms = lane->owner->signaling.now_ms();
       lane->last_encoded_ms = encoded_at_ms;
       lane->last_encoded_steady_ms = steady_now_ms();
       GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+      const auto latency = buffer == nullptr ? std::nullopt : encoded_frame_latency_ms(
+          lane->encoder_output_segment, GST_BUFFER_PTS(buffer), encoded_at_ms - lane->pipeline_started_ms);
+      lane->encode_latency_current_valid = latency.has_value();
       if (buffer != nullptr && GST_BUFFER_PTS_IS_VALID(buffer)) {
-        const auto captured_at_ms = lane->pipeline_started_ms + static_cast<std::int64_t>(GST_BUFFER_PTS(buffer) / GST_MSECOND);
-        const auto latency_ms = static_cast<std::uint64_t>(std::max<std::int64_t>(
-            0, encoded_at_ms - captured_at_ms));
+        lane->encoder_output_pts_ms = GST_BUFFER_PTS(buffer) / GST_MSECOND;
+      }
+      if (latency) {
+        const auto latency_ms = *latency;
         ++lane->encode_latency_samples;
         lane->encode_latency_total_ms += latency_ms;
         auto observed = lane->encode_latency_max_ms.load();
         while (latency_ms > observed && !lane->encode_latency_max_ms.compare_exchange_weak(observed, latency_ms)) {
         }
+      } else {
+        ++lane->encode_latency_invalid_samples;
       }
     }
     return GST_PAD_PROBE_OK;
@@ -1077,7 +1113,7 @@ struct VehicleMediaRuntime::Impl {
     details["issue_code"] = issue_code;
     details["stage"] = stage;
     details["subsystem"] = "vehicle_media";
-    details["severity"] = error.empty() ? "info" : "error";
+    if (!details.contains("severity")) details["severity"] = error.empty() ? "info" : "error";
     details["retryable"] = retryable;
     details["event_at_utc_ms"] = signaling.now_ms();
     details["vehicle_id"] = config.vehicle_id;
@@ -1216,6 +1252,9 @@ struct VehicleMediaRuntime::Impl {
             {"source_sequence_valid", failed_source_sequence.has_value()},
             {"source_sequence", failed_source_sequence.value_or(0)},
             {"source_sequence_gap", failed_source_sequence_gap},
+            {"capture_diagnostics", lane.source == nullptr ? Json::object() : lane.source->capture_diagnostics()},
+            {"last_capture_age_ms", lane.last_capture_steady_ms.load() == 0 ? -1 :
+                steady_now_ms() - lane.last_capture_steady_ms.load()},
             {"critical_for_control", lane.camera.critical_for_control},
             {"failure_count", failure_count},
             {"reopen_attempts", lane.camera.reopen_attempts},
@@ -3056,9 +3095,18 @@ struct VehicleMediaRuntime::Impl {
       }), lane.get());
       GstPad* encoder_src = gst_element_get_static_pad(lane->encoder, "src");
       if (encoder_src != nullptr) {
-        gst_pad_add_probe(encoder_src, GST_PAD_PROBE_TYPE_BUFFER, count_encoded, lane.get(), nullptr);
+        gst_pad_add_probe(encoder_src, static_cast<GstPadProbeType>(
+            GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM), count_encoded, lane.get(), nullptr);
         gst_object_unref(encoder_src);
       }
+      auto* factory = gst_element_get_factory(lane->encoder);
+      auto* gstreamer_version = gst_version_string();
+      emit_diagnostic("vehicle_media_lane_configured", "media_lane_diagnostics_ready", "pipeline_config",
+          "", "Use the capture, encoder and receiver counters to locate the first stalled stage.", true,
+          {{"camera_id", lane->camera.id}, {"gstreamer_version", gstreamer_version},
+           {"encoder_factory", factory == nullptr ? "" : GST_OBJECT_NAME(factory)},
+           {"diagnostics_schema_version", 2}});
+      g_free(gstreamer_version);
     }
 
     const auto state = gst_element_set_state(pipeline, GST_STATE_PLAYING);
@@ -3079,6 +3127,7 @@ struct VehicleMediaRuntime::Impl {
       lane->thread = std::thread([this, lane = lane.get(), capture_interval_ms] {
         std::uint64_t sequence = 0;
         bool recovery_pending = false;
+        auto next_capture_sample_ms = std::int64_t{0};
         const bool pace_test_source =
             classify_camera_source(lane->camera) == CameraSourceKind::TestSource &&
             capture_interval_ms == 0;
@@ -3126,7 +3175,23 @@ struct VehicleMediaRuntime::Impl {
             }
             frame.captured_at_ms = signaling.from_local_system_ms(frame.captured_at_ms);
             ++lane->captured;
+            const auto captured_steady_ms = steady_now_ms();
+            const auto previous_capture_ms = lane->last_capture_steady_ms.exchange(captured_steady_ms);
+            const auto capture_gap_ms = previous_capture_ms == 0 ? 0 : captured_steady_ms - previous_capture_ms;
+            auto observed_gap = lane->capture_interval_max_ms.load();
+            while (capture_gap_ms > observed_gap && !lane->capture_interval_max_ms.compare_exchange_weak(
+                observed_gap, capture_gap_ms)) {}
             lane->last_capture_ms = frame.captured_at_ms;
+            if (captured_steady_ms >= next_capture_sample_ms) {
+              next_capture_sample_ms = captured_steady_ms + 5000;
+              emit_diagnostic("vehicle_camera_capture_sample", "camera_capture_sample", "camera_capture",
+                  "", "V4L2 metadata does not verify pixel integrity; correlate a raw frame and board/kernel diagnostics.", true,
+                  {{"camera_id", lane->camera.id}, {"device", lane->camera.device},
+                   {"captured_frames", lane->captured.load()}, {"encoded_frames", lane->encoded.load()},
+                   {"capture_interval_ms", capture_gap_ms}, {"capture_interval_max_ms", lane->capture_interval_max_ms.load()},
+                   {"payload_bytes", frame.payload.size()}, {"source_sequence", frame.source_sequence},
+                   {"capture_diagnostics", lane->source->capture_diagnostics()}});
+            }
             const bool recovered_this_frame = recovery_pending;
             if (recovered_this_frame) {
               recovery_pending = false;
@@ -3519,7 +3584,25 @@ struct VehicleMediaRuntime::Impl {
             "gstreamer_bus_error",
             "pipeline_runtime",
             "Inspect the GStreamer error/debug text and the affected camera or encoder.",
-            true);
+            true, {{"source_element", GST_MESSAGE_SRC(message) == nullptr ? "" : GST_OBJECT_NAME(GST_MESSAGE_SRC(message))}});
+      } else if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_WARNING) {
+        ++gstreamer_warning_count;
+        const auto current = steady_now_ms();
+        if (gstreamer_warning_count <= 10 || current >= next_gstreamer_warning_log_ms) {
+          next_gstreamer_warning_log_ms = current + 5000;
+          GError* warning = nullptr;
+          gchar* debug = nullptr;
+          gst_message_parse_warning(message, &warning, &debug);
+          emit_diagnostic("vehicle_media_pipeline_warning", "gstreamer_bus_warning", "pipeline_runtime",
+              warning == nullptr ? "unknown GStreamer warning" : std::string(warning->message).substr(0, 2048),
+              "Correlate the source element, capture samples and receiver loss/decode counters.", true,
+              {{"source_element", GST_MESSAGE_SRC(message) == nullptr ? "" : GST_OBJECT_NAME(GST_MESSAGE_SRC(message))},
+               {"severity", "warning"},
+               {"debug", debug == nullptr ? "" : std::string(debug).substr(0, 2048)},
+               {"warning_count", gstreamer_warning_count}});
+          if (warning != nullptr) g_error_free(warning);
+          g_free(debug);
+        }
       }
       gst_message_unref(message);
     }
@@ -3579,6 +3662,16 @@ struct VehicleMediaRuntime::Impl {
                                            : static_cast<double>(lane->encode_latency_total_ms.load()) /
                                                  static_cast<double>(lane->encode_latency_samples.load())},
           {"capture_to_encoded_max_ms", lane->encode_latency_max_ms.load()},
+          {"capture_to_encoded_valid", lane->encode_latency_current_valid.load()},
+          {"capture_to_encoded_samples", lane->encode_latency_samples.load()},
+          {"capture_to_encoded_invalid_samples", lane->encode_latency_invalid_samples.load()},
+          {"encoder_output_pts_ms", lane->encoder_output_pts_ms.load()},
+          {"encoder_segment_start_ms", lane->encoder_segment_start_ms.load()},
+          {"last_capture_age_ms", lane->last_capture_steady_ms.load() == 0 ? -1 :
+              steady_now_ms() - lane->last_capture_steady_ms.load()},
+          {"last_encoded_age_ms", lane->last_encoded_steady_ms.load() == 0 ? -1 :
+              steady_now_ms() - lane->last_encoded_steady_ms.load()},
+          {"capture_interval_max_ms", lane->capture_interval_max_ms.load()},
           {"width", lane->profile.width},
           {"height", lane->profile.height},
           {"target_fps", lane->profile.fps},
@@ -3795,7 +3888,8 @@ struct VehicleMediaRuntime::Impl {
                   "media_runtime_time_sync_uncertainty_exceeded",
                   "time_sync_refresh",
                   "Stabilize network time synchronization before resuming teleoperation.",
-                  true);
+                  true, {{"time_sync", status.to_json()},
+                         {"limit_ms", config.field_safety.max_time_sync_uncertainty_ms}});
             }
           } catch (const std::exception& error) {
             if (config.field_safety.require_time_sync) {
@@ -4076,6 +4170,8 @@ struct VehicleMediaRuntime::Impl {
   mutable std::mutex diagnostic_mutex;
   EncoderCandidate active_candidate{EncoderBackend::Nvenc, VideoCodec::H265};
   std::int64_t started_ms{0};
+  std::uint64_t gstreamer_warning_count{0};
+  std::int64_t next_gstreamer_warning_log_ms{0};
   bool answer_received{false};
   std::optional<std::int64_t> answer_received_at_ms;
   bool control_not_open_warning_fired{false};
