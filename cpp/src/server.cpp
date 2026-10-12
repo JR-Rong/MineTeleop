@@ -1286,7 +1286,7 @@ async function writeControlIntent(extra,announceUnavailable){
   }catch(error){
     if(intent.session_id!==nativeControlSessionId||intent.session_generation!==nativeControlSessionGeneration)return{sent:false,reason:'stale_control_intent_response'};
     if(error.name==='AbortError'){
-      if(activeControlPreparePreemptedByEstop&&!estopRequested)return{sent:false,reason:'control_intent_preempted_by_estop'};
+      if(activeControlPreparePreemptedByEstop&&!estopRequested){clearControlInput(false,'estop_preemption');return{sent:false,reason:'control_intent_preempted_by_estop'}};
       // A response deadline cannot tell whether the native store accepted this
       // refresh. Its unchanged lease and fresh-neutral interlock own expiry;
       // clearing here turns a delayed local response into a false key release.

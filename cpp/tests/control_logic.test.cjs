@@ -154,7 +154,7 @@ test('real native lease rejection still blocks held keys until physical release'
   assert.equal(logic.pressKey(fixture.pressed, fixture.blocked, 'ArrowUp').accepted, true);
 });
 
-test('timed out prior session and ESTOP preemption cannot clear current keys', async () => {
+test('prior session timeout preserves current keys and ESTOP preemption still neutralizes', async () => {
   const fixture = intentPageFixture();
   const stale = fixture.context.writeControlIntent({}, false);
   fixture.context.nativeControlSessionGeneration = 2;
@@ -168,7 +168,9 @@ test('timed out prior session and ESTOP preemption cannot clear current keys', a
   fixture.timeout();
   assert.equal((await urgent).reason, 'control_intent_preempted_by_estop');
   assert.equal(fixture.context.estopLatched, true);
-  assert.equal(fixture.logs.length, 0);
+  assert.equal(fixture.pressed.size, 0);
+  assert.equal(fixture.logs[0].reason, 'estop_preemption');
+  assert.equal(fixture.logs.some(entry => entry.event === 'control_intent_update_timeout'), false);
 });
 
 test('missing vehicle profile still neutralizes input and forbids driving', async () => {
