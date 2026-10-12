@@ -127,6 +127,7 @@ mine_teleop::SessionControlProfileRequest session_profile_request(
   request.control_token = "token";
   request.profile.profile_version =
       mine_teleop::kSessionControlProfileVersion;
+  request.profile.consecutive_late_frame_limit = 1;
   request.profile.target_speed_kph = target_speed_kph;
   request.profile.max_motor_torque_nm = max_motor_torque_nm;
   request.profile.max_brake_pressure_bar = max_brake_pressure_bar;
@@ -2664,6 +2665,85 @@ void test_held_forward_and_left_rearm_after_control_gap() {
   service.close();
 }
 
+void test_configurable_late_frames_and_independent_hard_timeout() {
+  for (int limit = 1; limit <= 5; ++limit) {
+    auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+    auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+    auto* view = adapter.get();
+    mine_teleop::VehicleControlService service(
+        config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    auto profile = session_profile_request(100, 0);
+    profile.profile.consecutive_late_frame_limit = limit;
+    expect(service.receive_session_profile(profile, 0).accepted, "late frame profile rejected");
+    expect(service.receive_command(command(1, 0), 0).accepted, "initial command rejected");
+    auto unauthenticated = command(2, 0);
+    unauthenticated.control_token = "wrong";
+    expect(!service.receive_command(unauthenticated, 201).accepted &&
+        service.control_timing(201).at("consecutive_late_frames") == 0,
+        "unauthenticated packet changed the timing count");
+    std::uint64_t seq = 2;
+    for (int frame = 1; frame <= limit; ++frame) {
+      auto expired = command(seq++, 0);
+      const auto rejected = service.receive_command(expired, 201 + frame);
+      expect(!rejected.accepted && rejected.reason == "command_age_exceeded", "expired command executed");
+      expect(service.control_timing(201 + frame).at("consecutive_late_frames") == frame,
+          "new expired frame was not counted exactly once");
+      expect((rejected.issue_code == "control_input_rearm_required") == (frame == limit),
+          "re-arm did not match the configured threshold");
+      expect(!service.receive_command(expired, 201 + frame).accepted &&
+          service.control_timing(201 + frame).at("consecutive_late_frames") == frame,
+          "duplicate expired packet inflated the counter");
+    }
+    expect(view->read_telemetry().throttle_feedback == 0.0, "threshold did not withdraw traction");
+    auto held = command(seq++, 250);
+    auto held_result = service.receive_command(held, 250);
+    expect(!held_result.accepted && held_result.issue_code == "control_input_rearm_required",
+        "fresh held input bypassed the latched re-arm");
+    auto neutral = command(seq++, 260);
+    neutral.throttle = neutral.steering = 0.0;
+    expect(service.receive_command(neutral, 260).accepted, "zero input could not re-arm");
+    expect(!service.control_timing(260).at("rearm_required").get<bool>() &&
+        service.session_control_profile().at("active").get<bool>(), "recovery revoked profile or retained latch");
+    expect(service.receive_command(command(seq++, 270), 270).accepted, "fresh press did not resume control");
+    // Arrival of arbitrarily many expired frames must not restart 800 ms.
+    for (std::int64_t now = 500; now <= 1070; now += 50)
+      expect(!service.receive_command(command(seq++, 0), now).accepted, "late frame executed during outage");
+    service.tick(1070);
+    expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
+        !service.session_control_profile().at("active").get<bool>(), "old arrivals postponed hard timeout");
+    expect(!service.receive_command(command(seq++, 1071), 1071).accepted, "post-timeout input revived revoked profile");
+    service.close();
+  }
+
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+  mine_teleop::VehicleControlService service(
+      config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(0);
+  auto profile = session_profile_request(100, 0);
+  profile.profile.consecutive_late_frame_limit = 3;
+  expect(service.receive_session_profile(profile, 0).accepted, "default tolerance profile rejected");
+  expect(service.receive_command(command(1, 0), 0).accepted, "initial command rejected");
+  expect(!service.receive_command(command(2, 0), 250).accepted, "single late frame executed");
+  service.tick(300);
+  expect(!service.control_timing(300).at("rearm_required").get<bool>(), "transient soft timeout latched held input");
+  expect(service.receive_command(command(3, 350), 350).accepted, "fresh input did not recover transient jitter");
+  expect(service.control_timing(350).at("consecutive_late_frames") == 0,
+      "valid fresh frame did not clear consecutive count");
+  service.tick(1150);
+  expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake,
+      "complete absence of frames failed to stop at 800 ms");
+  service.close();
+
+  mine_teleop::SessionControlProfile defaults;
+  expect(defaults.consecutive_late_frame_limit == 3, "default is not three frames");
+  for (int invalid : {0, 6}) {
+    defaults.consecutive_late_frame_limit = invalid;
+    expect_throws([&] { defaults.validate(); }, "invalid frame limit accepted");
+  }
+}
+
 void test_timeout_profile_revocation_preserves_watchdog_stop() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
@@ -4314,6 +4394,7 @@ int main() {
        test_control_service_receive_path_cannot_bypass_hard_timeout},
       {"held_forward_and_left_rearm_after_control_gap",
        test_held_forward_and_left_rearm_after_control_gap},
+      {"configurable_late_frames_and_independent_hard_timeout", test_configurable_late_frames_and_independent_hard_timeout},
       {"timeout_profile_revocation_preserves_watchdog_stop",
        test_timeout_profile_revocation_preserves_watchdog_stop},
       {"control_service_preserves_physical_brake_across_degraded_timeout", test_control_service_preserves_physical_brake_across_degraded_timeout},

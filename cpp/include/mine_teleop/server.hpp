@@ -286,6 +286,7 @@ class SignalingService {
   std::unordered_map<std::string, Session> sessions_;
   std::unordered_map<std::string, std::vector<Message>> messages_;
   std::unordered_map<std::string, Message> latest_control_messages_;
+  std::unordered_map<std::string, Json> latest_vehicle_control_feedback_;
   std::unordered_map<std::string, AcceptedMessage> last_accepted_messages_;
   std::unordered_map<std::string, std::uint64_t> next_delivery_cursors_;
   std::unordered_map<std::string, LoginFailureState> login_failures_;
@@ -480,6 +481,7 @@ class DriverConsoleRuntime {
   int speed_pid_max_dt_ms_{0};
   double motor_torque_rise_rate_nm_per_s_{0.0};
   int parking_idle_timeout_ms_{500};
+  int consecutive_late_frame_limit_{3};
   bool control_profile_initialized_{false};
   std::uint64_t last_control_profile_prepared_seq_{0};
   std::atomic<double> service_brake_limit_{0.3};
@@ -508,6 +510,9 @@ class DriverConsoleRuntime {
   std::atomic<std::int64_t> native_control_last_gap_ms_{0};
   std::atomic<std::int64_t> native_control_max_gap_ms_{0};
   std::atomic<std::uint64_t> native_control_last_seq_{0};
+  std::atomic<std::uint64_t> native_control_last_feedback_command_seq_{0};
+  std::atomic<std::uint64_t> native_control_rearm_status_seq_{0};
+  std::atomic<std::uint64_t> native_control_vehicle_accepted_command_seq_{0};
   std::atomic<std::int64_t> native_control_scheduled_at_monotonic_ms_{0};
   std::atomic<std::int64_t> native_control_last_ack_received_at_utc_ms_{0};
   std::atomic<std::int64_t> native_control_last_ack_cloud_received_at_utc_ms_{0};

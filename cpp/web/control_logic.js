@@ -28,10 +28,11 @@
   const GEAR_CHANGE_STATIONARY_SPEED_MPS = 0.1;
   const GEAR_CHANGE_STATIONARY_MIN_SAMPLES = 3;
   const GEAR_CHANGE_STATIONARY_MIN_DURATION_MS = 200;
-  const CONTROL_PROFILE_VERSION = 4;
+  const CONTROL_PROFILE_VERSION = 5;
   const CONTROL_PROFILE_FIELDS = Object.freeze([
     'profile_version',
     'parking_idle_timeout_ms',
+    'consecutive_late_frame_limit',
     'target_speed_kph',
     'max_motor_torque_nm',
     'max_brake_pressure_bar',
@@ -227,13 +228,14 @@
     if (keys.length !== CONTROL_PROFILE_FIELDS.length ||
         !CONTROL_PROFILE_FIELDS.every(
             field => Object.prototype.hasOwnProperty.call(value, field))) {
-      throw new TypeError('control profile must contain exactly the V4 fields');
+      throw new TypeError('control profile must contain exactly the V5 fields');
     }
     if (value.profile_version !== CONTROL_PROFILE_VERSION) {
       throw new TypeError(`profile_version must be ${CONTROL_PROFILE_VERSION}`);
     }
     const profile = {
       profile_version: CONTROL_PROFILE_VERSION,
+      consecutive_late_frame_limit: requireIntegerRange(value.consecutive_late_frame_limit, 1, 5, 'consecutive_late_frame_limit'),
       parking_idle_timeout_ms: requireIntegerRange(value.parking_idle_timeout_ms, 0, 1000, 'parking_idle_timeout_ms'),
       target_speed_kph: requireFiniteRange(value.target_speed_kph, 0, 72, 'target_speed_kph'),
       max_motor_torque_nm: requireFiniteRange(
@@ -384,6 +386,7 @@
     return {
       profile_version: CONTROL_PROFILE_VERSION,
       parking_idle_timeout_ms: requested.parking_idle_timeout_ms,
+      consecutive_late_frame_limit: requested.consecutive_late_frame_limit,
       target_speed_kph: Math.min(requested.target_speed_kph, hard.max_target_speed_kph),
       max_motor_torque_nm: Math.min(
           requested.max_motor_torque_nm, hard.full_scale_motor_torque_nm),
@@ -423,6 +426,7 @@
     return mergeControlProfileWithHardLimits({
       profile_version: CONTROL_PROFILE_VERSION,
       parking_idle_timeout_ms: 500,
+      consecutive_late_frame_limit: 3,
       target_speed_kph: hard.max_target_speed_kph / 2,
       max_motor_torque_nm: hard.full_scale_motor_torque_nm / 2,
       max_brake_pressure_bar: hard.max_brake_pressure_bar / 2,
@@ -447,6 +451,14 @@
     return clamp(profile.target_speed_kph / hard.max_speed_kph, 0, hard.max_throttle);
   }
 
+  function degradedInputRearmRequired(timing, lastNativeAcceptedControlSeq) {
+    if (timing && timing.rearm_required === false) return false;
+    const seq = timing && timing.last_valid_command_seq;
+    if (Number.isSafeInteger(seq) && seq > 0 &&
+        Number.isSafeInteger(lastNativeAcceptedControlSeq) && lastNativeAcceptedControlSeq > seq) return false;
+    return true;
+  }
+
   function controlProfilesEqual(leftValue, rightValue) {
     let left;
     let right;
@@ -456,20 +468,7 @@
     } catch (_) {
       return false;
     }
-    return left.target_speed_kph === right.target_speed_kph &&
-        left.max_motor_torque_nm === right.max_motor_torque_nm &&
-        left.max_brake_pressure_bar === right.max_brake_pressure_bar &&
-        left.service_brake_pressure_bar === right.service_brake_pressure_bar &&
-        left.hard_brake_pressure_bar === right.hard_brake_pressure_bar &&
-        left.max_steering_angle_deg === right.max_steering_angle_deg &&
-        left.speed_pid_kp === right.speed_pid_kp &&
-        left.speed_pid_ki === right.speed_pid_ki &&
-        left.speed_pid_kd === right.speed_pid_kd &&
-        left.speed_pid_derivative_filter_tau_ms ===
-            right.speed_pid_derivative_filter_tau_ms &&
-        left.speed_pid_max_dt_ms === right.speed_pid_max_dt_ms &&
-        left.motor_torque_rise_rate_nm_per_s ===
-            right.motor_torque_rise_rate_nm_per_s;
+    return CONTROL_PROFILE_FIELDS.every(field => left[field] === right[field]);
   }
 
   function reduceControlProfileStatus(stateValue, statusValue) {
@@ -1312,6 +1311,8 @@
     mergeControlProfileWithHardLimits,
     controlProfileFromVehicleDefaults,
     controlProfileThrottleLimit,
+    controlProfilesEqual,
+    degradedInputRearmRequired,
     reduceControlProfileStatus,
     reduceGamepadNeutralInterlock,
     reduceStatusSequence,

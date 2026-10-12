@@ -632,8 +632,9 @@ test('control rejection presentation exposes only stable issue-code guidance', (
 
 function controlProfile(overrides = {}) {
   return {
-    profile_version: 4,
+    profile_version: 5,
     parking_idle_timeout_ms: 500,
+    consecutive_late_frame_limit: 3,
     target_speed_kph: 12,
     max_motor_torque_nm: 300,
     max_brake_pressure_bar: 90,
@@ -704,12 +705,13 @@ function vehicleHardLimits(overrides = {}) {
   };
 }
 
-test('session control profile V4 validation and hard-limit merge preserve ordering', () => {
+test('session control profile V5 validation and hard-limit merge preserve ordering', () => {
   const requested = controlProfile();
   const hard = vehicleHardLimits();
   assert.deepEqual(logic.mergeControlProfileWithHardLimits(requested, hard), {
-    profile_version: 4,
+    profile_version: 5,
     parking_idle_timeout_ms: 500,
+    consecutive_late_frame_limit: 3,
     target_speed_kph: 4,
     max_motor_torque_nm: 165,
     max_brake_pressure_bar: 50,
@@ -752,13 +754,13 @@ test('session control profile V4 validation and hard-limit merge preserve orderi
       /speed_pid_max_dt_ms must be an integer/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, profile_version: 1}),
-      /profile_version must be 4/);
+      /profile_version must be 5/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, profile_version: 2}),
-      /profile_version must be 4/);
+      /profile_version must be 5/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, unexpected_field: 1}),
-      /exactly the V4 fields/);
+      /exactly the V5 fields/);
   assert.throws(
       () => logic.normalizeControlProfile(
           {...requested, motor_torque_rise_rate_nm_per_s: -1}),
@@ -771,7 +773,7 @@ test('session control profile V4 validation and hard-limit merge preserve orderi
   delete v2Profile.motor_torque_rise_rate_nm_per_s;
   assert.throws(
       () => logic.normalizeControlProfile(v2Profile),
-      /exactly the V4 fields/);
+      /exactly the V5 fields/);
 });
 
 test('PID defaults come only from complete vehicle limits and accept kp hard min zero', () => {
@@ -795,6 +797,11 @@ test('PID defaults come only from complete vehicle limits and accept kp hard min
   assert.equal(profile.max_brake_pressure_bar, hard.max_brake_pressure_bar / 2);
   assert.equal(profile.max_steering_angle_deg, hard.max_steering_angle_deg);
   assert.equal(profile.parking_idle_timeout_ms, 500);
+  assert.equal(profile.consecutive_late_frame_limit, 3);
+  for (const limit of [1,2,3,4,5])
+    assert.equal(logic.normalizeControlProfile({...profile, consecutive_late_frame_limit:limit}).consecutive_late_frame_limit, limit);
+  for (const limit of [0,6,1.5,NaN,'3'])
+    assert.throws(() => logic.normalizeControlProfile({...profile, consecutive_late_frame_limit:limit}), /consecutive_late_frame_limit/);
   for (const timeout of [0, 1000])
     assert.equal(logic.normalizeControlProfile({...profile, parking_idle_timeout_ms: timeout}).parking_idle_timeout_ms, timeout);
   for (const timeout of [-1, 1001, 0.5, NaN])
@@ -912,6 +919,22 @@ test('vehicle fixed safety limits are exact, read-only, consistent, and preserve
       /timeout ordering is invalid/);
 });
 
+test('delayed degradation cannot clear input accepted later through the native vehicle result', () => {
+  assert.equal(logic.degradedInputRearmRequired({rearm_required:false}, 0), false);
+  assert.equal(logic.degradedInputRearmRequired({rearm_required:true,last_valid_command_seq:39}, 40), false);
+  assert.equal(logic.degradedInputRearmRequired({rearm_required:true,last_valid_command_seq:40}, 40), true);
+  assert.equal(logic.degradedInputRearmRequired({rearm_required:true,last_valid_command_seq:41}, 40), true);
+  for(const timing of [undefined,{}, {last_valid_command_seq:-1}, {last_valid_command_seq:'39'}])
+    assert.equal(logic.degradedInputRearmRequired(timing, 40), true);
+});
+
+test('profile equality checks every configurable field, independent of JSON order', () => {
+  const profile=controlProfile();
+  assert(logic.controlProfilesEqual(profile,Object.fromEntries(Object.entries(profile).reverse())));
+  for(const field of ['consecutive_late_frame_limit','parking_idle_timeout_ms'])
+    assert.equal(logic.controlProfilesEqual(profile,{...profile,[field]:profile[field]+1}),false);
+});
+
 test('session control profile ACK only activates the matching pending request', () => {
   const requested = controlProfile({target_speed_kph: 2, max_motor_torque_nm: 100});
   const pending = {
@@ -940,6 +963,13 @@ test('session control profile ACK only activates the matching pending request', 
   assert.equal(mismatched.acknowledged, false);
   assert.equal(mismatched.invalidated, true);
   assert.equal(mismatched.reason, 'effective_profile_mismatch');
+
+  for(const field of ['consecutive_late_frame_limit','parking_idle_timeout_ms']) {
+    const result=logic.reduceControlProfileStatus(pending,{active:true,accepted:true,last_request_seq:7,applied_revision:7,
+      effective_profile:{...requested,[field]:requested[field]+1}});
+    assert.equal(result.acknowledged,false);
+    assert.equal(result.reason,'effective_profile_mismatch');
+  }
 
   const missingRevision = logic.reduceControlProfileStatus(pending, {
     active: true, accepted: true, last_request_seq: 7, effective_profile: requested,

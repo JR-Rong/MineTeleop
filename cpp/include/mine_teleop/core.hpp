@@ -30,7 +30,7 @@ inline constexpr double kDefaultMaxBrakePressureBar = 327.6;
 inline constexpr double kMaxOrdinaryBrakePressureBar = 327.6;
 inline constexpr double kMaxEmergencyBrakePressureBar = 409.5;
 inline constexpr int kSessionControlProfileMaxAgeMs = 2000;
-inline constexpr int kSessionControlProfileVersion = 4;
+inline constexpr int kSessionControlProfileVersion = 5;
 static_assert(kMaxFullScaleMotorTorqueNm <= 800.0 * 0.8);
 static_assert(kMaxFullScaleMotorTorqueNm <= 838.3 * 0.8);
 
@@ -152,6 +152,7 @@ struct SessionControlProfile {
   int speed_pid_max_dt_ms{100};
   double motor_torque_rise_rate_nm_per_s{kDefaultMotorTorqueRiseRateNmPerSecond};
   int parking_idle_timeout_ms{500};
+  int consecutive_late_frame_limit{3};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -265,6 +266,9 @@ class ControlReceiver {
       int timestamp_warning_skew_ms = 5000);
 
   ReceiveResult accept(const ControlCommand& command, std::int64_t receive_time_ms);
+  void set_consecutive_late_frame_limit(int limit);
+  [[nodiscard]] int consecutive_late_frame_limit() const { return consecutive_late_frame_limit_; }
+  [[nodiscard]] int consecutive_late_frames() const { return consecutive_late_frames_; }
 
  private:
   std::string vehicle_id_;
@@ -277,6 +281,9 @@ class ControlReceiver {
   int timestamp_warning_skew_ms_;
   std::optional<std::uint64_t> last_seq_;
   std::optional<std::int64_t> last_valid_receive_ms_;
+  int consecutive_late_frame_limit_{1};
+  int consecutive_late_frames_{0};
+  std::optional<std::uint64_t> last_timing_violation_seq_;
 };
 
 enum class SafetyState {
@@ -360,6 +367,7 @@ class SafetyStateMachine {
   bool reset_estop(bool local_confirmed, std::string_view authorized_by, std::int64_t now_ms);
   bool reset_to_standby();
   void mark_fault();
+  void require_input_rearm();
 
   [[nodiscard]] SafetyState state() const { return state_; }
   [[nodiscard]] std::optional<std::int64_t> last_valid_receive_ms() const { return last_valid_receive_ms_; }
@@ -806,6 +814,7 @@ class VehicleControlService {
   }
   [[nodiscard]] Json control_limits() const;
   [[nodiscard]] Json session_control_profile() const;
+  [[nodiscard]] Json control_timing(std::int64_t now_ms) const;
   [[nodiscard]] const std::deque<Json>& telemetry_history() const { return telemetry_history_; }
   [[nodiscard]] Json summary() const;
 
@@ -854,6 +863,7 @@ class VehicleControlService {
   std::optional<SessionControlProfileResult> last_session_profile_result_;
   std::optional<ControlCommand> last_effective_command_;
   bool adapter_safe_stop_active_{false};
+  bool timing_rearm_required_{false};
   bool started_{false};
 };
 

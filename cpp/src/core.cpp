@@ -1171,10 +1171,12 @@ void NativeControlIntentStore::reset() {
 }
 
 void SessionControlProfile::validate() const {
+  if (consecutive_late_frame_limit < 1 || consecutive_late_frame_limit > 5)
+    throw std::invalid_argument("consecutive_late_frame_limit must be in [1, 5]");
   if (parking_idle_timeout_ms < 0 || parking_idle_timeout_ms > 1000)
     throw std::invalid_argument("parking_idle_timeout_ms must be in [0, 1000]");
   if (profile_version != kSessionControlProfileVersion) {
-    throw std::invalid_argument("session control profile version must be 4");
+    throw std::invalid_argument("session control profile version must be 5");
   }
   require_finite_range(target_speed_kph, 0.0, kChassisControlMaxTargetSpeedKph, "target_speed_kph");
   require_finite_range(
@@ -1234,6 +1236,7 @@ Json SessionControlProfile::to_json() const {
   return {
       {"profile_version", profile_version},
       {"parking_idle_timeout_ms", parking_idle_timeout_ms},
+      {"consecutive_late_frame_limit", consecutive_late_frame_limit},
       {"target_speed_kph", target_speed_kph},
       {"max_motor_torque_nm", max_motor_torque_nm},
       {"max_brake_pressure_bar", max_brake_pressure_bar},
@@ -1255,6 +1258,10 @@ SessionControlProfile SessionControlProfile::from_json(const Json& value) {
   }
   SessionControlProfile profile;
   try {
+    if (!value.at("consecutive_late_frame_limit").is_number_integer() ||
+        value.at("consecutive_late_frame_limit") < 1 || value.at("consecutive_late_frame_limit") > 5)
+      throw std::invalid_argument("consecutive_late_frame_limit must be an integer in [1, 5]");
+    profile.consecutive_late_frame_limit = value.at("consecutive_late_frame_limit").get<int>();
     if (!value.at("parking_idle_timeout_ms").is_number_integer() ||
         value.at("parking_idle_timeout_ms") < 0 || value.at("parking_idle_timeout_ms") > 1000)
       throw std::invalid_argument("parking_idle_timeout_ms must be an integer");
@@ -1512,6 +1519,15 @@ ControlReceiver::ControlReceiver(
   }
 }
 
+void ControlReceiver::set_consecutive_late_frame_limit(int limit) {
+  if (limit < 1 || limit > 5) throw std::invalid_argument("late frame limit must be in [1, 5]");
+  if (limit != consecutive_late_frame_limit_) {
+    consecutive_late_frame_limit_ = limit;
+    consecutive_late_frames_ = 0;
+    last_timing_violation_seq_.reset();
+  }
+}
+
 ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_t receive_time_ms) {
   if (receive_time_ms < 0) {
     throw std::invalid_argument("receive_time_ms must be non-negative");
@@ -1530,8 +1546,16 @@ ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_
     return {false, "control_token_invalid", std::nullopt, {}};
   }
   if (last_seq_ && command.seq <= *last_seq_) return {false, "old_seq", std::nullopt, {}};
+  if (!command.estop && last_timing_violation_seq_ && command.seq <= *last_timing_violation_seq_)
+    return {false, "old_seq", std::nullopt, {}};
   const auto timestamp_delta_ms = receive_time_ms - command.sent_at_utc_ms;
   if (!command.estop && timestamp_delta_ms > max_command_gap_ms_) {
+    // Only new, authenticated sequences contribute. Replays cannot inflate the
+    // count, and invalid arrivals never refresh the last effective watchdog.
+    if (!last_timing_violation_seq_ || command.seq > *last_timing_violation_seq_) {
+      last_timing_violation_seq_ = command.seq;
+      consecutive_late_frames_ = std::min(consecutive_late_frames_ + 1, 5);
+    }
     return {false, "command_age_exceeded", std::nullopt, {}};
   }
   if (!command.estop && timestamp_delta_ms < -max_command_gap_ms_) {
@@ -1540,7 +1564,7 @@ ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_
   if (last_valid_receive_ms_ && receive_time_ms < *last_valid_receive_ms_) {
     return {false, "receive_time_reversed", std::nullopt, {}};
   }
-  if (last_valid_receive_ms_ && receive_time_ms - *last_valid_receive_ms_ > max_command_gap_ms_ && !command.estop) {
+  if (last_valid_receive_ms_ && receive_time_ms - *last_valid_receive_ms_ > max_command_gap_ms_ && !command.estop && consecutive_late_frame_limit_ == 1) {
     // Drop the first command after a gap, but re-arm timing so the next fresh
     // heartbeat can recover instead of permanently locking out control.
     last_valid_receive_ms_ = receive_time_ms;
@@ -1548,6 +1572,7 @@ ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_
   }
   last_seq_ = command.seq;
   last_valid_receive_ms_ = receive_time_ms;
+  consecutive_late_frames_ = 0;
   std::vector<std::string> warnings;
   if (std::llabs(receive_time_ms - command.sent_at_utc_ms) > timestamp_warning_skew_ms_) {
     warnings.emplace_back("driver_timestamp_skew");
@@ -1670,6 +1695,10 @@ void SafetyStateMachine::enter_standby() {
 }
 
 void SafetyStateMachine::mark_fault() { state_ = SafetyState::Fault; }
+
+void SafetyStateMachine::require_input_rearm() {
+  if (state_ == SafetyState::ControlActive) state_ = SafetyState::Degraded;
+}
 
 double SafetyStateMachine::brake_for_timeout(std::int64_t timestamp_ms) const {
   const auto entered = timeout_entered_ms_.value_or(timestamp_ms);
@@ -2498,7 +2527,7 @@ std::uint64_t DynamicLibraryVehicleAdapter::configure_runtime_control_profile(
   }
   const BridgeRuntimeControlConfigV3 config{
       sizeof(BridgeRuntimeControlConfigV3),
-      static_cast<std::uint32_t>(profile.profile_version),
+      4U, // The chassis V3 ABI remains V4; frame tolerance is owned by the service.
       profile_revision,
       profile.target_speed_kph / 3.6,
       profile.max_motor_torque_nm,
@@ -3085,7 +3114,8 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
   const bool first_profile = !active_session_profile_;
   if ((first_profile || target_speed_increase || torque_increase ||
        brake_parameters_changed || steering_changed || pid_parameters_changed ||
-       request.profile.parking_idle_timeout_ms != current_profile.parking_idle_timeout_ms) &&
+       request.profile.parking_idle_timeout_ms != current_profile.parking_idle_timeout_ms ||
+       request.profile.consecutive_late_frame_limit != current_profile.consecutive_late_frame_limit) &&
       !mock_bench_bypass) {
     VcuHandshakeStatus handshake_status;
     bool handshake_status_available = false;
@@ -3155,6 +3185,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
   }
 
   active_session_profile_ = request.profile;
+  receiver_.set_consecutive_late_frame_limit(request.profile.consecutive_late_frame_limit);
   return cache_result(profile_result(
       request,
       timestamp_ms,
@@ -3184,9 +3215,13 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     result = receiver_.accept(command, timestamp_ms);
   }
   if (!result.accepted || !result.command) {
-    if (result.reason == "command_gap_exceeded" && active_session_profile_ &&
+    if ((result.reason == "command_gap_exceeded" ||
+         (result.reason == "command_age_exceeded" && receiver_.consecutive_late_frames() >= receiver_.consecutive_late_frame_limit())) && active_session_profile_ &&
         (safety_.state() == SafetyState::ControlActive ||
          safety_.state() == SafetyState::Degraded)) {
+      timing_rearm_required_ = true;
+      safety_.require_input_rearm();
+      evaluate_control_watchdog(timestamp_ms);
       result.issue_code = "control_input_rearm_required";
     }
     return result;
@@ -3204,7 +3239,8 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     }
     return {false, "session_control_profile_required", std::nullopt, {}};
   }
-  if (!effective.estop && safety_.state() == SafetyState::Degraded &&
+  if (!effective.estop && (timing_rearm_required_ ||
+      (safety_.state() == SafetyState::Degraded && receiver_.consecutive_late_frame_limit() == 1)) &&
       (effective.throttle > 1e-9 || std::abs(effective.steering) > 1e-9)) {
     // Recovery is intentionally explicit: a command gap withdraws traction,
     // and a fresh neutral command must be applied before any prior held input
@@ -3309,6 +3345,7 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
       return result;
     }
     safety_.on_valid_command(safety_command, timestamp_ms);
+    timing_rearm_required_ = false;
     last_effective_command_ = *result.command;
     return result;
   }
@@ -3480,6 +3517,17 @@ void VehicleControlService::close(VehicleStopContext context) {
   started_ = false;
 }
 
+Json VehicleControlService::control_timing(std::int64_t timestamp_ms) const {
+  const auto last_valid = safety_.last_valid_receive_ms();
+  return {{"consecutive_late_frame_limit", receiver_.consecutive_late_frame_limit()},
+          {"consecutive_late_frames", receiver_.consecutive_late_frames()},
+          {"last_valid_command_seq", last_effective_command_ ? last_effective_command_->seq : 0},
+          {"rearm_required", timing_rearm_required_ ||
+              (safety_.state() == SafetyState::Degraded && receiver_.consecutive_late_frame_limit() == 1)},
+          {"last_valid_control_age_ms", last_valid ? Json(std::max<std::int64_t>(0, timestamp_ms - *last_valid)) : Json(nullptr)},
+          {"control_timeout_ms", control_limits_.at("read_only_control_safety").at("control_timeout_ms")}};
+}
+
 Json VehicleControlService::build_telemetry(std::int64_t timestamp_ms) {
   const auto telemetry = adapter_->read_telemetry();
   return {
@@ -3491,6 +3539,7 @@ Json VehicleControlService::build_telemetry(std::int64_t timestamp_ms) {
       {"seq", ++telemetry_sequence_},
       {"sent_at_utc_ms", timestamp_ms},
       {"safety_state", to_string(safety_.state())},
+      {"control_timing", control_timing(timestamp_ms)},
       {"speed_mps", telemetry.speed_mps},
       {"gear", telemetry.gear},
       {"steering_feedback", telemetry.steering_feedback},
@@ -3523,6 +3572,7 @@ bool VehicleControlService::refresh_adapter_safe_stop_state() noexcept {
 }
 
 void VehicleControlService::clear_session_profile() noexcept {
+  timing_rearm_required_ = false;
   active_session_profile_.reset();
   last_effective_command_.reset();
   if (last_session_profile_result_) {

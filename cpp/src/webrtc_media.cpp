@@ -1266,7 +1266,8 @@ struct VehicleMediaRuntime::Impl {
       GstWebRTCDataChannel* channel,
       std::string_view data,
       ControlMessageTransport transport,
-      const NativeControlDeliveryTraceContext* delivery_trace) {
+      const NativeControlDeliveryTraceContext* delivery_trace,
+      Json* native_feedback = nullptr) {
     const auto callback_entered_monotonic_ms = steady_now_ms();
     const auto callback_entered_at_utc_ms = signaling.now_ms();
     const std::string transport_name(control_transport_name(transport));
@@ -1754,6 +1755,15 @@ struct VehicleMediaRuntime::Impl {
             completed_monotonic_ms);
         throw;
       }
+      std::uint64_t rearm_status_seq = 0;
+      if (config.runtime.control_log_commands &&
+          (result.reason == "command_age_exceeded" || result.reason == "command_gap_exceeded" ||
+           result.issue_code == "control_input_rearm_required")) {
+        const auto timing = control_service->control_timing(received_at_ms);
+        enqueue_control_trace({{"stage", "control_timing_decision"}, {"session_id", command.session_id},
+                               {"vehicle_id", command.vehicle_id}, {"seq", command.seq},
+                               {"reason", result.reason}, {"control_timing", timing}});
+      }
       if (result.accepted && result.command) {
         const auto accepted_count = ++accepted_control_commands;
         if (command.estop && !native_control_estop_frozen_gear) {
@@ -1792,7 +1802,7 @@ struct VehicleMediaRuntime::Impl {
         ++rejected_control_commands;
         const auto now_ms = signaling.now_ms();
         if (!result.issue_code.empty()) {
-          send_control_command_rejected_locked(command.seq, intent_seq, result.issue_code);
+          rearm_status_seq = send_control_command_rejected_locked(command.seq, intent_seq, result.issue_code);
         }
         if (result.reason != last_control_rejection_reason ||
             !last_control_rejection_log_ms ||
@@ -1829,6 +1839,13 @@ struct VehicleMediaRuntime::Impl {
                     ? "fresh_neutral_input_requested"
                     : "local_full_stop"}});
         }
+      }
+      if (native_feedback) {
+        *native_feedback = {{"session_id", command.session_id}, {"vehicle_id", command.vehicle_id},
+                            {"driver_id", command.driver_id}, {"command_seq", command.seq},
+                            {"intent_seq", intent_seq}, {"accepted", result.accepted},
+                            {"rearm_required", result.issue_code == "control_input_rearm_required"},
+                            {"control_status_seq", rearm_status_seq}};
       }
       lock.unlock();
       queue_control_trace(
@@ -1907,6 +1924,7 @@ struct VehicleMediaRuntime::Impl {
   void handle_native_control_websocket_envelope(
       WebSocketClient& websocket,
       const Json& envelope) {
+    Json native_feedback = Json::object();
     const auto envelope_received_at_utc_ms = signaling.now_ms();
     const auto envelope_received_monotonic_ms = steady_now_ms();
     if (!envelope.is_object()) {
@@ -2055,7 +2073,7 @@ struct VehicleMediaRuntime::Impl {
           nullptr,
           payload.dump(),
           ControlMessageTransport::NativeSignaling,
-          &delivery_trace);
+          &delivery_trace, &native_feedback);
     }
 
     // Acknowledge the delivered view even when its ordinary command was
@@ -2064,13 +2082,13 @@ struct VehicleMediaRuntime::Impl {
     const auto ack_send_started_at_utc_ms = signaling.now_ms();
     const auto ack_send_started_monotonic_ms = steady_now_ms();
     try {
-      websocket.send_json(
-          {{"event", "signaling_delivery_ack"},
-           {"delivery_cursor", delivery_cursor},
-           {"trace_session_id", payload.value("session_id", "")},
-           {"seq", payload.value("seq", std::uint64_t{0})},
-           {"intent_seq", payload.value("intent_seq", std::uint64_t{0})}},
-          kNativeControlWebSocketSendTimeout);
+      Json delivery_ack = {{"event", "signaling_delivery_ack"},
+                           {"delivery_cursor", delivery_cursor},
+                           {"trace_session_id", payload.value("session_id", "")},
+                           {"seq", payload.value("seq", std::uint64_t{0})},
+                           {"intent_seq", payload.value("intent_seq", std::uint64_t{0})}};
+      if (!native_feedback.empty()) delivery_ack["control_feedback"] = native_feedback;
+      websocket.send_json(delivery_ack, kNativeControlWebSocketSendTimeout);
     } catch (const std::exception& error) {
       if (config.runtime.control_log_commands) {
         try {
@@ -2177,9 +2195,23 @@ struct VehicleMediaRuntime::Impl {
         native_control_websocket_last_connected_at_ms.store(
             signaling.now_ms(),
             std::memory_order_relaxed);
+        std::int64_t previous_receive_completed_ms = steady_now_ms();
         while (!stop_token.stop_requested() && !stop_requested.load()) {
+          const auto receive_started_ms = steady_now_ms();
           const auto received = websocket.receive_json(
               kNativeControlWebSocketReceiveTimeout);
+          const auto receive_completed_ms = steady_now_ms();
+          if (config.runtime.control_log_commands &&
+              (received.status == WebSocketReceiveStatus::Message || receive_started_ms - previous_receive_completed_ms >= 100)) {
+            enqueue_control_trace({{"stage", "websocket_receive_loop"}, {"session_id", signaling.session_id()},
+                                   {"vehicle_id", config.vehicle_id},
+                                   {"receive_started_monotonic_ms", receive_started_ms},
+                                   {"receive_completed_monotonic_ms", receive_completed_ms},
+                                   {"between_receive_calls_ms", std::max<std::int64_t>(0, receive_started_ms - previous_receive_completed_ms)},
+                                   {"receive_wait_ms", receive_completed_ms - receive_started_ms},
+                                   {"message_received", received.status == WebSocketReceiveStatus::Message}});
+          }
+          previous_receive_completed_ms = receive_completed_ms;
           if (received.status == WebSocketReceiveStatus::Timeout) continue;
           if (received.status == WebSocketReceiveStatus::Closed) {
             throw std::runtime_error("native control WebSocket closed");
@@ -2296,11 +2328,10 @@ struct VehicleMediaRuntime::Impl {
     }
   }
 
-  void send_control_command_rejected_locked(
+  std::uint64_t send_control_command_rejected_locked(
       std::uint64_t command_seq,
       std::uint64_t intent_seq,
       std::string_view issue_code) {
-    if (control_channel == nullptr || !control_link_open) return;
     const std::string stable_issue_code =
         issue_code == "vcu_drive_gear_change_moving_or_stale"
         ? "vcu_drive_gear_change_moving_or_stale"
@@ -2311,7 +2342,7 @@ struct VehicleMediaRuntime::Impl {
     if (stable_issue_code == last_control_rejection_status_issue_code &&
         last_control_rejection_status_ms &&
         timestamp_ms - *last_control_rejection_status_ms < 500) {
-      return;
+      return last_control_rejection_status_seq;
     }
     last_control_rejection_status_issue_code = stable_issue_code;
     last_control_rejection_status_ms = timestamp_ms;
@@ -2321,13 +2352,15 @@ struct VehicleMediaRuntime::Impl {
         {"vehicle_id", config.vehicle_id},
         {"driver_id", signaling.driver_id()},
         {"session_id", signaling.session_id()},
-        {"control_status_seq", ++control_status_seq},
+        {"control_status_seq", last_control_rejection_status_seq = ++control_status_seq},
         {"command_seq", command_seq},
         {"intent_seq", intent_seq},
         {"accepted", false},
         {"issue_code", stable_issue_code},
     }).dump();
-    gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
+    if (control_channel != nullptr && control_link_open)
+      gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
+    return last_control_rejection_status_seq;
   }
 
   void send_vcu_handshake_status(std::string_view result) {
@@ -2729,14 +2762,16 @@ struct VehicleMediaRuntime::Impl {
         g_object_unref(channel);
         return;
       }
-      // Status ordering is scoped to the DataChannel, not the adapter.  A
-      // channel may publish driver_connected before critical cameras become
-      // ready and then start the adapter later without replacing the channel.
-      // Resetting in start_control_service would make that later status replay
-      // an already-used sequence number and be rejected by the controller.
-      control_status_seq = 0;
-      last_control_rejection_status_issue_code.clear();
-      last_control_rejection_status_ms.reset();
+      // Both native feedback and DataChannel messages use this session's
+      // ordering. Replacing only the media channel must not roll it back.
+      const auto status_session_id = signaling.session_id();
+      if (control_status_session_id != status_session_id) {
+        control_status_session_id = status_session_id;
+        control_status_seq = 0;
+        last_control_rejection_status_seq = 0;
+        last_control_rejection_status_issue_code.clear();
+        last_control_rejection_status_ms.reset();
+      }
       control_channel = channel;
     }
   }
@@ -4250,7 +4285,9 @@ struct VehicleMediaRuntime::Impl {
   std::atomic<std::int64_t> native_control_transport_last_error_log_monotonic_ms{0};
   std::optional<std::int64_t> last_vcu_status_ms;
   std::uint64_t last_vehicle_telemetry_seq{0};
+  std::string control_status_session_id;
   std::uint64_t control_status_seq{0};
+  std::uint64_t last_control_rejection_status_seq{0};
   std::string last_vcu_handshake_state;
   std::string last_control_rejection_reason;
   std::optional<std::int64_t> last_control_rejection_log_ms;

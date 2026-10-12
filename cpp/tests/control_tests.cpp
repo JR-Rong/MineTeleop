@@ -716,7 +716,7 @@ void test_control_page_contract() {
               std::string::npos,
       "legacy PID defaults can still auto-submit without explicit operator confirmation");
   expect(
-      response.body.find("pidChanged=!prior||requested.parking_idle_timeout_ms!==prior.parking_idle_timeout_ms||requested.speed_pid_kp!==prior.speed_pid_kp") !=
+      response.body.find("pidChanged=!prior||requested.consecutive_late_frame_limit!==prior.consecutive_late_frame_limit||requested.parking_idle_timeout_ms!==prior.parking_idle_timeout_ms||requested.speed_pid_kp!==prior.speed_pid_kp") !=
               std::string::npos &&
       response.body.find(
               "requested.motor_torque_rise_rate_nm_per_s!==prior.motor_torque_rise_rate_nm_per_s") !=
@@ -793,16 +793,16 @@ void test_control_page_contract() {
           response.body.find("retiredBrowserPacketPath") == std::string::npos,
       "a retired 50ms browser packet heartbeat or ordinary DataChannel send remains active");
   expect(
-      response.body.find("function applyVehicleSafetyState(value)") !=
+      response.body.find("function applyVehicleSafetyState(value,timing)") !=
               std::string::npos &&
-          response.body.find("next==='DEGRADED'){clearControlInput(false,'vehicle_degraded')") !=
+          response.body.find("next==='DEGRADED'&&controlLogic.degradedInputRearmRequired(timing,lastNativeAcceptedControlSeq)){clearControlInput(false,'vehicle_degraded')") !=
               std::string::npos &&
           response.body.find("next==='DEGRADED'&&lastVehicleSafetyState") ==
               std::string::npos &&
           response.body.find("clearControlInput(false)") != std::string::npos &&
           response.body.find("driver_input_cleared_on_degraded") !=
               std::string::npos &&
-          response.body.find("applyVehicleSafetyState(message.safety_state)") !=
+          response.body.find("applyVehicleSafetyState(message.safety_state,message.control_timing)") !=
               std::string::npos,
       "recoverable vehicle degradation can replay held driver input");
   expect(
@@ -1295,16 +1295,18 @@ void test_vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter
        position = source.find(reset, position + reset.size())) {
     ++reset_count;
   }
-  expect(reset_count == 1, "control status sequence has a reset outside its DataChannel scope");
+  expect(reset_count == 1, "control status sequence has a reset outside its session scope");
   expect(
       start_service.find(reset) == std::string::npos,
       "delayed adapter start can roll back the active DataChannel status sequence");
+  expect(configure_channel.find("if (control_status_session_id != status_session_id)") != std::string::npos,
+      "media-only replacement can roll back native feedback status ordering");
   const auto channel_reset = configure_channel.find(reset);
   const auto channel_publish = configure_channel.find("control_channel = channel;");
   expect(
       channel_reset != std::string::npos && channel_publish != std::string::npos &&
           channel_reset < channel_publish,
-      "a newly published DataChannel does not establish a fresh status sequence scope");
+      "a newly published DataChannel does not establish its session status sequence scope");
   expect(
       send_status.find("++control_status_seq") != std::string::npos,
       "VCU handshake status does not advance the shared DataChannel sequence");
@@ -2031,7 +2033,7 @@ void test_structured_control_rejection_is_safe_and_rate_limited() {
   const auto handler = cpp_function_contract(source, "void handle_control_message(");
   const auto sender = cpp_function_contract(
       source,
-      "void send_control_command_rejected_locked(");
+      "std::uint64_t send_control_command_rejected_locked(");
   expect(
       handler.find(
           "send_control_command_rejected_locked(command.seq, intent_seq, result.issue_code)") !=
@@ -2059,7 +2061,7 @@ void test_structured_control_rejection_is_safe_and_rate_limited() {
       sender.find("{\"vehicle_id\", config.vehicle_id}") != std::string::npos &&
           sender.find("{\"driver_id\", signaling.driver_id()}") != std::string::npos &&
           sender.find("{\"session_id\", signaling.session_id()}") != std::string::npos &&
-          sender.find("{\"control_status_seq\", ++control_status_seq}") !=
+          sender.find("{\"control_status_seq\", last_control_rejection_status_seq = ++control_status_seq}") !=
               std::string::npos &&
           sender.find("{\"command_seq\", command_seq}") != std::string::npos &&
           sender.find("{\"intent_seq\", intent_seq}") != std::string::npos,
@@ -2957,8 +2959,9 @@ void test_driver_vehicle_switch_releases_old_session() {
   profile_request.method = "POST";
   profile_request.path = "/api/control-profile";
   const mine_teleop::Json valid_profile = {
-      {"profile_version", 4},
+      {"profile_version", 5},
       {"parking_idle_timeout_ms", 500},
+      {"consecutive_late_frame_limit", 3},
       {"target_speed_kph", 3.0},
       {"max_motor_torque_nm", 250.0},
       {"max_brake_pressure_bar", 80.0},
@@ -2995,7 +2998,7 @@ void test_driver_vehicle_switch_releases_old_session() {
       "prepared session profile lost authenticated envelope identity");
   expect(
       !profile_envelope.contains("profile") &&
-          profile_envelope.value("profile_version", 0) == 4 &&
+          profile_envelope.value("profile_version", 0) == 5 &&
           profile_envelope.value("target_speed_kph", -1.0) == 3.0 &&
           profile_envelope.value("max_motor_torque_nm", -1.0) == 250.0 &&
           profile_envelope.value("max_brake_pressure_bar", -1.0) == 80.0 &&
@@ -3019,7 +3022,7 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(
       prepared_profile.value("target_speed_kph", -1.0) == 3.0 &&
           prepared_profile.value("max_motor_torque_nm", -1.0) == 250.0 &&
-          prepared_profile.value("profile_version", 0) == 4 &&
+          prepared_profile.value("profile_version", 0) == 5 &&
           prepared_profile.value("initialized", false) &&
           prepared_profile.value("max_steering_angle_deg", -1.0) == 3.0 &&
           prepared_profile.value("speed_pid_kp", -1.0) == 1.5 &&
@@ -3203,8 +3206,9 @@ void test_driver_vehicle_switch_releases_old_session() {
       "rejected legacy control-limit mutation changed the active profile");
 
   profile_request.body = mine_teleop::Json({
-      {"profile_version", 4},
+      {"profile_version", 5},
       {"parking_idle_timeout_ms", 500},
+      {"consecutive_late_frame_limit", 3},
       {"target_speed_kph", 0.0},
       {"max_motor_torque_nm", 0.0},
       {"max_brake_pressure_bar", 0.0},
@@ -3261,7 +3265,7 @@ void test_driver_vehicle_switch_releases_old_session() {
           reset_profile.value("max_brake_pressure_bar", -1.0) == 100.0 &&
           reset_profile.value("service_brake_pressure_bar", -1.0) == 10.0 &&
           reset_profile.value("hard_brake_pressure_bar", -1.0) == 25.0 &&
-          reset_profile.value("profile_version", 0) == 4 &&
+          reset_profile.value("profile_version", 0) == 5 &&
           reset_profile.value("parking_idle_timeout_ms", -1) == 500 &&
           !reset_profile.value("initialized", true) &&
           reset_profile.value("speed_pid_kp", -1.0) == 0.0 &&
@@ -4394,9 +4398,23 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
           native_control_delivery.message.at("messages").at(0).value("type", "") ==
               "control_command",
       "control-only vehicle WebSocket did not receive exactly its native command");
+  auto feedback = mine_teleop::Json{{"session_id", session_id}, {"vehicle_id", "vehicle-001"},
+      {"driver_id", "driver-console-001"}, {"command_seq", 1}, {"intent_seq", 1},
+      {"accepted", false}, {"rearm_required", true}, {"control_status_seq", 77}};
+  for (const auto* invalid_field : {"session_id", "command_seq"}) {
+    auto invalid_feedback = feedback;
+    if (std::string_view(invalid_field) == "session_id") invalid_feedback[invalid_field] = "other-session";
+    else invalid_feedback[invalid_field] = 2;
+    native_control_receiver.send_json({{"event", "signaling_delivery_ack"},
+        {"delivery_cursor", native_control_cursor}, {"trace_session_id", session_id},
+        {"seq", 1}, {"intent_seq", 1}, {"control_feedback", invalid_feedback}});
+    const auto rejected_feedback = native_control_receiver.receive_json(std::chrono::seconds(1));
+    expect(rejected_feedback.status == mine_teleop::WebSocketReceiveStatus::Message &&
+        rejected_feedback.message.contains("error"), "wrong-session or future vehicle feedback accepted");
+  }
   native_control_receiver.send_json(
-      {{"event", "signaling_delivery_ack"},
-       {"delivery_cursor", native_control_cursor}});
+      {{"event", "signaling_delivery_ack"}, {"delivery_cursor", native_control_cursor},
+       {"trace_session_id", session_id}, {"seq", 1}, {"intent_seq", 1}, {"control_feedback", feedback}});
   const auto native_control_confirmed = receive_event(
       native_control_receiver,
       "signaling_delivery_acknowledged",
@@ -4663,10 +4681,66 @@ void test_native_control_three_hop_trace_correlation() {
              {"delivery_cursor", delivery_cursor},
              {"trace_session_id", session_id},
              {"seq", acknowledged_seq},
-             {"intent_seq", acknowledged_intent_seq}});
+             {"intent_seq", acknowledged_intent_seq},
+             {"control_feedback", {{"session_id", session_id}, {"vehicle_id", "vehicle-001"},
+                {"driver_id", "driver-console-001"}, {"command_seq", acknowledged_seq},
+                {"intent_seq", acknowledged_intent_seq}, {"accepted", false},
+                {"rearm_required", true}, {"control_status_seq", 77}}}});
       }
       expect(correlated_delivery, "native control trace test did not receive the active intent");
+      bool zero_heartbeat_received = false;
+      const auto rearm_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (std::chrono::steady_clock::now() < rearm_deadline && !zero_heartbeat_received) {
+        const auto next = receiver.receive_json(std::chrono::milliseconds(100));
+        if (next.status != mine_teleop::WebSocketReceiveStatus::Message ||
+            next.message.value("event", "") != "signaling_messages") continue;
+        for (const auto& message : next.message.at("messages")) {
+          const auto& payload = message.at("payload");
+          if (payload.value("intent_requires_fresh_input", false) &&
+              payload.value("gear", "") == "D" && payload.value("throttle", 1.0) == 0.0 &&
+              payload.value("steering", 1.0) == 0.0) {
+            zero_heartbeat_received = true;
+            receiver.send_json({{"event", "signaling_delivery_ack"},
+                {"delivery_cursor", next.message.at("delivery_cursor")}, {"trace_session_id", session_id},
+                {"seq", message.at("seq")}, {"intent_seq", payload.at("intent_seq")},
+                {"control_feedback", {{"session_id", session_id}, {"vehicle_id", "vehicle-001"},
+                    {"driver_id", "driver-console-001"}, {"command_seq", message.at("seq")},
+                    {"intent_seq", payload.at("intent_seq")}, {"accepted", true},
+                    {"rearm_required", false}, {"control_status_seq", 0}}}});
+          }
+        }
+      }
+      expect(zero_heartbeat_received, "native feedback did not clear held input with media absent");
+      auto held_again = mine_teleop::Json{{"session_id", session_id}, {"session_generation", session_generation},
+                            {"ui_instance_id", "three-hop-trace-test"}, {"intent_seq", 3},
+                            {"gear", "D"}, {"steering", 0.1}, {"throttle", 0.2}, {"brake", 0.0}};
+      mine_teleop::Json blocked;
+      const auto accepted_result_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      do {
+        blocked = driver.update_control_intent(held_again);
+        if (blocked.value("vehicle_accepted_command_seq", std::uint64_t{0}) > vehicle_received_seq) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      } while (std::chrono::steady_clock::now() < accepted_result_deadline);
+      expect(blocked.value("vehicle_accepted_command_seq", std::uint64_t{0}) > vehicle_received_seq,
+          "vehicle acceptance did not reach the page independently of ingress ACKs");
+      expect(!blocked.value("accepted", true) && blocked.value("reason", "") == "fresh_neutral_required" &&
+          blocked.value("rearm_control_status_seq", 0) == 77,
+          "native feedback failed to require new neutral input or expose media sequence watermark");
+      held_again["intent_seq"] = 4;
+      held_again["steering"] = held_again["throttle"] = 0.0;
+      expect(driver.update_control_intent(held_again).value("accepted", false), "neutral could not restore native input");
+      held_again["intent_seq"] = 5;
+      held_again["throttle"] = 0.2;
+      expect(driver.update_control_intent(held_again).value("accepted", false), "fresh press could not restore native input");
+      receiver.send_json({{"event", "signaling_delivery_ack"}, {"delivery_cursor", vehicle_delivery_cursor},
+          {"trace_session_id", session_id}, {"seq", vehicle_received_seq}, {"intent_seq", 2},
+          {"control_feedback", {{"session_id", session_id}, {"vehicle_id", "vehicle-001"},
+              {"driver_id", "driver-console-001"}, {"command_seq", vehicle_received_seq},
+              {"intent_seq", 2}, {"accepted", false}, {"rearm_required", true}, {"control_status_seq", 77}}}});
       std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      held_again["intent_seq"] = 6;
+      expect(driver.update_control_intent(held_again).value("accepted", false),
+          "duplicate vehicle result cleared fresh input again");
       receiver.close();
       static_cast<void>(driver.disconnect("three_hop_trace_test_complete"));
     }
