@@ -1265,7 +1265,7 @@
     for (const stat of report.values()) {
       if (stat.type !== 'transport' || !stat.selectedCandidatePairId) continue;
       const pair = report.get(stat.selectedCandidatePairId);
-      if (pair?.type === 'candidate-pair') return {pair, transport: stat, method: 'transport'};
+      if (pair && pair.type === 'candidate-pair') return {pair, transport: stat, method: 'transport'};
     }
     // Older browsers may omit transport.selectedCandidatePairId. A successful
     // connectivity check alone does not identify the pair carrying media.
