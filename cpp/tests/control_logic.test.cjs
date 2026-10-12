@@ -32,6 +32,28 @@ function test(name, body) {
   }
 }
 
+test('shipped browser logs identify the loaded page without changing diagnostic payloads', () => {
+  const requests = [];
+  const context = vm.createContext({
+    consoleConfig: {console_source_sha256: 'built-page-source', diagnostics_revision: 'traction-diagnostics-v1'},
+    uiInstanceId: 'page-instance', Date,
+    console: {info: () => {}},
+    fetch: (url, options) => {requests.push(JSON.parse(options.body)); return Promise.resolve({});},
+  });
+  const handler = controlPageSource.match(/^function clientLog\(event,details=\{\}\).*$/m);
+  assert(handler, 'shipped browser event handler was not found');
+  vm.runInContext(handler[0], context);
+  context.clientLog('control_intent_response_timeout', {
+    intent_seq: 62, input_retained: true, page_source_sha256: 'forged-or-stale',
+  });
+  const details = requests[0].details;
+  assert.equal(details.intent_seq, 62);
+  assert.equal(details.input_retained, true);
+  assert.equal(details.page_source_sha256, 'built-page-source');
+  assert.equal(details.diagnostics_revision, 'traction-diagnostics-v1');
+  assert.equal(details.ui_instance_id, 'page-instance');
+});
+
 const readyVcu = {
   supported: true,
   state: 'ready',

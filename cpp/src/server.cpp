@@ -975,6 +975,8 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
 
 std::string console_html(const DriverConfig& config) {
   const Json page_config = {
+      {"diagnostics_revision", "traction-diagnostics-v1"},
+      {"console_source_sha256", web::kConsoleSourceSha256},
       {"rate_hz", config.rate_hz},
       {"intent_lease_ms", config.intent_lease_ms},
       {"estop_hold_ms", config.estop_hold_ms},
@@ -1071,7 +1073,8 @@ let controlOutcomeSession={metrics:controlLogic.createControlOutcomeMetrics()};
 function responseError(response,body){const error=Error(body.error||response.status);error.status=response.status;return error}
 async function post(path,body={},signal=null){const options={method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)};if(signal)options.signal=signal;const r=await fetch(path,options);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 async function get(path){const r=await fetch(path);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
-function clientLog(event,details={}){const entry={event,sent_at_utc_ms:Date.now(),details};console.info(JSON.stringify(entry));fetch('/api/browser-event',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(entry),keepalive:true}).catch(()=>{})}
+function clientLog(event,details={}){const entry={event,sent_at_utc_ms:Date.now(),details:{...details,page_source_sha256:consoleConfig.console_source_sha256,diagnostics_revision:consoleConfig.diagnostics_revision,ui_instance_id:uiInstanceId}};console.info(JSON.stringify(entry));fetch('/api/browser-event',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(entry),keepalive:true}).catch(()=>{})}
+clientLog('driver_page_loaded',{user_agent:navigator.userAgent});
 function createControlTraceSummary(){return{interval_started_at_utc_ms:Date.now(),heartbeat_tick_count:0,heartbeat_enqueued_count:0,heartbeat_coalesced_count:0,timer_lag_sample_count:0,timer_lag_total_ms:0,timer_lag_max_ms:0,explicit_send_count:0,backpressure_count:0,max_buffered_amount_bytes:0,prepare_timeout_count:0,prepare_expired_count:0,prepare_preempted_by_estop_count:0,queue_unhandled_error_count:0}}
 function noteIntentRefresh(now){if(!controlTraceEnabled)return;controlTraceSummary.heartbeat_tick_count++;if(lastHeartbeatTraceAt!==null){const lag=Math.max(0,now-lastHeartbeatTraceAt-intentRefreshIntervalMs);controlTraceSummary.timer_lag_sample_count++;controlTraceSummary.timer_lag_total_ms+=lag;controlTraceSummary.timer_lag_max_ms=Math.max(controlTraceSummary.timer_lag_max_ms,lag)}lastHeartbeatTraceAt=now}
 function noteControlBackpressure(bufferedAmount){if(!controlTraceEnabled)return;const bytes=Math.max(0,Number(bufferedAmount)||0);controlTraceSummary.backpressure_count++;controlTraceSummary.max_buffered_amount_bytes=Math.max(controlTraceSummary.max_buffered_amount_bytes,bytes)}
@@ -6283,6 +6286,8 @@ Json DriverConsoleRuntime::record_browser_event(const Json& input) {
       {"event", event},
       {"sent_at_utc_ms", received_at},
       {"browser_sent_at_utc_ms", browser_sent_at},
+      {"runtime_console_source_sha256", web::kConsoleSourceSha256},
+      {"runtime_diagnostics_revision", "traction-diagnostics-v1"},
       {"driver_id", driver_id()},
       {"vehicle_id", vehicle},
       {"session_id", session},

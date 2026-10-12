@@ -1,4 +1,5 @@
 #include "mine_teleop/vcu.hpp"
+#include "mine_teleop/detail/traction_diagnostics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -861,6 +862,110 @@ void test_feedback_decoding_uses_si_units_and_complete_snapshot() {
   expect(!controller.ingest(short_frame), "short CAN feedback frame was accepted");
 }
 
+void test_diagnostic_status_fields_use_dbc_wire_vectors() {
+  ParallelController controller;
+  auto motor = motor_torque_feedback(2, -320.0, -25.0);
+  motor.data[4] = 0x80;  // 32,640 * 0.05 - 1600 = 32 A.
+  motor.data[5] = 0x7F;
+  auto mode = motor_mode_feedback(2, 1);
+  mode.data[0] |= 4;  // Enable PWM ON.
+  mode.data[1] = 2;
+  auto brake = brake_feedback(1, 1, 144.0);
+  brake.data[2] = 0x16;  // fault level 2, code 5.
+  brake.data[6] = 0x1D;  // fault level 1, code 7.
+  expect(controller.ingest(motor) && controller.ingest(mode) && controller.ingest(brake),
+         "diagnostic wire vectors were rejected");
+  const auto& feedback = controller.feedback();
+  expect(std::abs(feedback.motor_current_a[2] - 32.0) < 1e-9 &&
+             feedback.motor_inverter_status[2] == 4 && feedback.motor_fault_level[2] == 2,
+         "motor current/inverter/fault diagnostic decoding is incorrect");
+  expect(feedback.brake_fault_level[2] == 2 && feedback.brake_fault_code[2] == 5 &&
+             feedback.brake_fault_level[3] == 1 && feedback.brake_fault_code[3] == 7 &&
+             std::abs(feedback.brake_pressure_bar[2] - 144.0) < 1e-9,
+         "paired EHB pressure/fault diagnostic decoding is incorrect");
+}
+
+void test_traction_diagnostics_observe_final_wire_and_continuous_fresh_feedback() {
+  using namespace mine_teleop::diagnostics;
+  ParallelController controller;
+  advance_to_ready(controller, 3);
+  Command command;
+  command.gear = 3;
+  command.motor_torque_nm.fill(320.0);
+  command.brake_pressure_bar.fill(0.0);
+  expect(controller.set_command(command), "diagnostic setup command was rejected");
+  const auto sent = decode_sent_actuation(controller.tick());
+  expect(sent.motor_mask == 255 && sent.brake_frames_present && sent.parking_frame_present &&
+             std::abs(sent.torque_nm[0] - 320.0) < 1e-9 && sent.motor_mode[0] == 1 &&
+             sent.parking_request[0] == 1 && sent.brake_pressure_bar[0] == 0.0,
+         "diagnostics did not decode the final generated CAN batch: mask=" +
+             std::to_string(sent.motor_mask) + " torque=" + std::to_string(sent.torque_nm[0]) +
+             " mode=" + std::to_string(sent.motor_mode[0]) +
+             " parking=" + std::to_string(sent.parking_request[0]) +
+             " brakes_present=" + std::to_string(sent.brake_frames_present));
+  mine_teleop::vcu::Feedback feedback;
+  feedback.motor_torque_valid.fill(true);
+  TorqueResponseMonitor monitor;
+  monitor.observe(0, sent, true, true, feedback, 255);
+  monitor.observe(500, sent, true, true, feedback, 255);
+  expect(
+             monitor.observe(999, sent, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "a transient response delay was treated as a sustained zero feedback observation");
+  auto observation = monitor.observe(1000, sent, true, true, feedback, 255);
+  expect(observation.qualifying_motor_mask == 255 && observation.longest_duration_ms == 1000,
+         "session59/62 nonzero TX and zero motor feedback was not observed after 1 second");
+  feedback.motor_torque_nm[0] = 3.0;
+  expect(monitor.observe(1020, sent, true, true, feedback, 255).qualifying_motor_mask == 254,
+         "responding motors were not removed independently");
+  expect(monitor.observe(1040, sent, false, true, feedback, 255).qualifying_motor_mask == 0 &&
+             monitor.observe(1060, sent, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "a failed send did not reset the continuous observation");
+  expect(monitor.observe(2060, sent, true, true, feedback, 0).qualifying_motor_mask == 0 &&
+             monitor.observe(3060, sent, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "stale feedback was counted toward a no-response duration");
+  feedback.motor_torque_valid.fill(false);
+  expect(monitor.observe(4060, sent, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "missing torque quality was treated as zero feedback");
+  feedback.motor_torque_valid.fill(true);
+  auto reverse = sent;
+  reverse.torque_nm.fill(-320.0);
+  monitor.observe(5000, sent, true, true, feedback, 255);
+  monitor.observe(5500, sent, true, true, feedback, 255);
+  expect(monitor.observe(6000, reverse, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "a direction change retained the former observation");
+  monitor.observe(6500, reverse, true, true, feedback, 255);
+  expect(monitor.observe(7000, reverse, true, true, feedback, 255).qualifying_motor_mask == 254,
+         "a direction change did not start a new observation");
+  expect(monitor.observe(7020, reverse, true, false, feedback, 255).qualifying_motor_mask == 0,
+         "leaving Ready did not end the observation");
+  monitor.observe(7040, sent, true, true, feedback, 255);
+  expect(monitor.observe(8060, sent, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "a scheduler gap was counted as continuously observed motor feedback");
+
+  controller.set_automatic_parking(true, true, true, 100.0);
+  const auto parked = decode_sent_actuation(controller.tick());
+  expect(std::abs(parked.torque_nm[0]) < 1e-9 &&
+             std::abs(parked.brake_pressure_bar[0] - 100.0) < 1e-9,
+         "diagnostics used desired torque instead of the parking-gated CAN output");
+  expect(monitor.observe(8000, parked, true, true, feedback, 255).qualifying_motor_mask == 0 &&
+             monitor.observe(10000, parked, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "parking-gated zero CAN output was misreported as a motor response failure");
+}
+
+void test_traction_diagnostics_are_rate_limited() {
+  mine_teleop::diagnostics::StateLogLimiter limiter;
+  int count = 0;
+  for (int now = 0; now <= 10000; now += 20) {
+    if (limiter.due(static_cast<std::uint64_t>(now % 40), now)) ++count;
+  }
+  expect(count <= 11, "oscillating gates generated logs at CAN frequency");
+  mine_teleop::diagnostics::StateLogLimiter steady;
+  expect(steady.due(1, 0) && !steady.due(1, 4999) && steady.due(1, 5000),
+         "steady diagnostics did not use the five-second repeat interval");
+  expect(!steady.due(2, 5020) && steady.due(2, 6000),
+         "a change during the throttle interval was lost instead of reported later");
+}
+
 void test_fresh_manual_status_revokes_each_post_handshake_arming_phase() {
   for (const auto arming_state : {
            State::WaitParkingBrakeReleased,
@@ -1340,6 +1445,10 @@ void test_arming_physical_emergency_is_latched_and_recoverable_only_after_disarm
 
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
+      {"diagnostic_status_fields_use_dbc_wire_vectors", test_diagnostic_status_fields_use_dbc_wire_vectors},
+      {"traction_diagnostics_observe_final_wire_and_continuous_fresh_feedback",
+       test_traction_diagnostics_observe_final_wire_and_continuous_fresh_feedback},
+      {"traction_diagnostics_are_rate_limited", test_traction_diagnostics_are_rate_limited},
       {"20260916_motor_torque_wire_vectors", test_20260916_motor_torque_wire_vectors},
       {"operator_idle_parking_deadlines", test_operator_idle_parking_deadlines},
       {"automatic_parking_handshake_and_feedback",

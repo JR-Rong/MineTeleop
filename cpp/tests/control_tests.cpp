@@ -2744,7 +2744,7 @@ void test_browser_event_logging_rotation_and_redaction() {
   config.driver_id = "driver-console-001";
   config.signaling_url = "https://signal.example.test";
   config.browser_event_log_path = log_path;
-  config.browser_event_log_max_bytes = 1024;
+  config.browser_event_log_max_bytes = 1536;
   config.browser_event_log_files = 2;
   auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(config, "vehicle-001", "dev-password");
   mine_teleop::DriverConsoleHttpApp app(runtime);
@@ -2758,6 +2758,7 @@ void test_browser_event_logging_rotation_and_redaction() {
         {"sent_at_utc_ms", mine_teleop::now_ms()},
         {"details",
          {{"index", index},
+          {"page_source_sha256", "old-loaded-page"},
           {"password", "never-write-this-secret"},
           {"nested", {{"access_token", "also-never-write-this"}}},
           {"message", std::string(640, static_cast<char>('a' + index))}}},
@@ -2772,6 +2773,12 @@ void test_browser_event_logging_rotation_and_redaction() {
   expect(persisted.find("control_monitor_state") != std::string::npos, "browser event name was not written");
   expect(persisted.find("[redacted]") != std::string::npos, "browser event credentials were not redacted");
   expect(persisted.find("never-write-this") == std::string::npos, "browser event log contains a credential");
+  const auto first_record = mine_teleop::Json::parse(
+      persisted.substr(0, persisted.find('\n')));
+  expect(first_record.value("runtime_console_source_sha256", "").size() == 64 &&
+             first_record.value("runtime_diagnostics_revision", "") == "traction-diagnostics-v1" &&
+             first_record["details"].value("page_source_sha256", "") == "old-loaded-page",
+         "runtime source identity was not attached to events from an older page");
 
   request.body = mine_teleop::Json({
       {"event", "control_trace_batch"},

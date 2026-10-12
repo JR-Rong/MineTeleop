@@ -107,6 +107,9 @@ mine_teleop_make_adjacent_raw_literals(
   MINE_TELEOP_CONTROL_LOGIC_JS_MAX_CHUNK_BYTES
 )
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop")
+file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/server.cpp" MINE_TELEOP_CONSOLE_CPP_SHA256)
+string(SHA256 MINE_TELEOP_CONSOLE_SOURCE_SHA256
+  "${MINE_TELEOP_CONSOLE_CPP_SHA256}|${MINE_TELEOP_CONTROL_LOGIC_JS}")
 configure_file(
   cmake/control_logic_js.hpp.in
   "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop/control_logic_js.hpp"
@@ -579,6 +582,9 @@ if(MINE_TELEOP_BUILD_TESTS)
       PRIVATE MINE_TELEOP_CHASSIS_TESTING=1
     )
     mine_teleop_enable_warnings(mine-teleop-chassis-bridge-compile-test)
+    include(cmake/ChassisDiagnosticsIdentity.cmake)
+    mine_teleop_chassis_diagnostics_identity(
+      mine-teleop-chassis-bridge-compile-test "${CMAKE_CURRENT_SOURCE_DIR}")
 
     add_executable(mine-teleop-chassis-bridge-diagnostics-smoke
       cpp/tests/chassis_bridge_diagnostics_smoke.cpp
