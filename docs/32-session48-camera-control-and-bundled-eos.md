@@ -82,7 +82,11 @@ CTest 为 23/24，仅未修改的独立底盘握手诊断目标失败；它不�
 测试断言或安全门限。只在 Docker 恢复旧 EOS 转发后，新增回归按预期失败，
 健康路收到 0/20，其他 70 个 core 测试通过；恢复修复并重新构建后完整回归通过。
 测试副本与工作区的三份代码文件 SHA-256 一致，`git diff --check` 通过。
-Ubuntu 22.04/GStreamer 1.20 与最终 x64 包的验证以当前提交 CI 为准。
+随后 Ubuntu 22.04/arm64、GStreamer 1.20.3 的最终完整串行 CTest 同样为
+24/24 通过。`e844a88` 的车端 CI 首次失败于基础测试镜像未安装 rtpfunnel：
+该阶段只有 base 插件。已补入 `gstreamer1.0-plugins-good` 测试依赖，并沿用
+已有两秒取样等待预算保留全部断言。生产的编码器、安全门限和最终 bundled
+GStreamer 版本不变；当前 x64 完整包结果以最新提交 CI 为准。
 
 本包 manifest 标记 `complete=false`，驾驶端报告日志队列丢弃，runtime 含缺少
 UTC 的记录；`vcu-can.jsonl` 为 0 字节，扫描的 CAN 轮转范围早于当前会话。因此

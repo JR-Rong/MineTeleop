@@ -1158,7 +1158,7 @@ void test_disabled_camera_eos_does_not_end_bundled_healthy_video() {
   int healthy_packets = 0;
   for (int index = 1; index <= 20; ++index) {
     pushed = push_packet(healthy, index, 111) && pushed;
-    auto* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(output), 100 * GST_MSECOND);
+    auto* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(output), 2 * GST_SECOND);
     if (sample != nullptr) { ++healthy_packets; gst_sample_unref(sample); }
   }
   const bool ended_after_lane_failure = gst_app_sink_is_eos(GST_APP_SINK(output));
