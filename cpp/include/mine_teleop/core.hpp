@@ -102,6 +102,7 @@ struct NativeControlIntentUpdate {
   bool duplicate{false};
   bool requires_fresh_input{true};
   std::string reason;
+  bool preserve_brake_during_rearm{false};
 };
 
 struct NativeControlIntentSample {
@@ -123,7 +124,7 @@ class NativeControlIntentStore {
       NativeControlIntent intent,
       std::int64_t received_at_monotonic_ms);
   [[nodiscard]] NativeControlIntentSample sample(std::int64_t now_monotonic_ms);
-  void invalidate();
+  void invalidate(bool preserve_brake = false);
   void reset();
 
   [[nodiscard]] int lease_ms() const { return lease_ms_; }
@@ -134,6 +135,7 @@ class NativeControlIntentStore {
   std::optional<NativeControlIntent> latest_;
   std::int64_t received_at_monotonic_ms_{0};
   bool requires_fresh_input_{true};
+  bool preserve_brake_during_rearm_{false};
   bool estop_latched_{false};
 };
 

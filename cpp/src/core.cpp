@@ -1104,6 +1104,8 @@ NativeControlIntentUpdate NativeControlIntentStore::update(
   std::lock_guard lock(mutex_);
   const bool incoming_estop = intent.estop;
   const bool incoming_neutral = intent.is_neutral();
+  const bool incoming_brake_only = !intent.estop && intent.throttle <= 1e-9 &&
+      std::abs(intent.steering) <= 1e-9;
   // ESTOP is session-sticky. Normalize the incoming value before replay and
   // fingerprint checks so a producer which refreshes the same sequence with
   // estop=false cannot create a false conflict after the latch has already
@@ -1116,7 +1118,10 @@ NativeControlIntentUpdate NativeControlIntentStore::update(
     intent.brake = 0.0;
   }
   const bool same_ui = latest_ && latest_->ui_instance_id == intent.ui_instance_id;
-  if (latest_ && !same_ui) requires_fresh_input_ = true;
+  if (latest_ && !same_ui) {
+    requires_fresh_input_ = true;
+    preserve_brake_during_rearm_ = false;
+  }
   if (same_ui && intent.intent_seq < latest_->intent_seq) {
     return {false, false, requires_fresh_input_, "old_intent_seq"};
   }
@@ -1126,16 +1131,22 @@ NativeControlIntentUpdate NativeControlIntentStore::update(
   // A sticky ESTOP must not make an originally non-neutral command from a
   // replacement UI look safe enough to bypass the fresh-neutral interlock.
   // A newly requested ESTOP remains allowed to preempt that interlock.
-  if (requires_fresh_input_ && !incoming_neutral && !incoming_estop) {
-    return {false, same_ui && intent.intent_seq == latest_->intent_seq, true, "fresh_neutral_required"};
+  if (requires_fresh_input_ && !incoming_neutral && !incoming_estop &&
+      !(preserve_brake_during_rearm_ && incoming_brake_only)) {
+    return {false, same_ui && intent.intent_seq == latest_->intent_seq, true,
+            "fresh_neutral_required", preserve_brake_during_rearm_};
   }
 
   const bool duplicate = same_ui && intent.intent_seq == latest_->intent_seq;
-  if (requires_fresh_input_ && incoming_neutral) requires_fresh_input_ = false;
+  if (requires_fresh_input_ && incoming_neutral) {
+    requires_fresh_input_ = false;
+    preserve_brake_during_rearm_ = false;
+  }
   if (intent.estop) estop_latched_ = true;
   latest_ = std::move(intent);
   received_at_monotonic_ms_ = received_at_monotonic_ms;
-  return {true, duplicate, requires_fresh_input_, duplicate ? "refreshed" : "accepted"};
+  return {true, duplicate, requires_fresh_input_, duplicate ? "refreshed" : "accepted",
+          requires_fresh_input_ && preserve_brake_during_rearm_};
 }
 
 NativeControlIntentSample NativeControlIntentStore::sample(std::int64_t now_monotonic_ms) {
@@ -1146,20 +1157,24 @@ NativeControlIntentSample NativeControlIntentStore::sample(std::int64_t now_mono
   if (!latest_) return {};
   const auto age_ms = std::max<std::int64_t>(0, now_monotonic_ms - received_at_monotonic_ms_);
   const bool fresh = age_ms < lease_ms_;
-  if (!fresh && !latest_->is_neutral() && !latest_->estop) requires_fresh_input_ = true;
+  if (!fresh && !latest_->is_neutral() && !latest_->estop) {
+    requires_fresh_input_ = true;
+    preserve_brake_during_rearm_ = false;
+  }
   auto effective = *latest_;
   if (requires_fresh_input_ && !effective.estop) {
     effective.steering = 0.0;
     effective.throttle = 0.0;
-    effective.brake = 0.0;
+    if (!preserve_brake_during_rearm_ || !fresh) effective.brake = 0.0;
   }
   effective.estop = estop_latched_;
   return {true, fresh, requires_fresh_input_, std::move(effective)};
 }
 
-void NativeControlIntentStore::invalidate() {
+void NativeControlIntentStore::invalidate(bool preserve_brake) {
   std::lock_guard lock(mutex_);
   requires_fresh_input_ = true;
+  preserve_brake_during_rearm_ = preserve_brake;
 }
 
 void NativeControlIntentStore::reset() {
@@ -1167,6 +1182,7 @@ void NativeControlIntentStore::reset() {
   latest_.reset();
   received_at_monotonic_ms_ = 0;
   requires_fresh_input_ = true;
+  preserve_brake_during_rearm_ = false;
   estop_latched_ = false;
 }
 
@@ -1258,6 +1274,9 @@ SessionControlProfile SessionControlProfile::from_json(const Json& value) {
   }
   SessionControlProfile profile;
   try {
+    if (!value.at("profile_version").is_number_integer() ||
+        value.at("profile_version") != kSessionControlProfileVersion)
+      throw std::invalid_argument("session control profile version must be integer 5");
     if (!value.at("consecutive_late_frame_limit").is_number_integer() ||
         value.at("consecutive_late_frame_limit") < 1 || value.at("consecutive_late_frame_limit") > 5)
       throw std::invalid_argument("consecutive_late_frame_limit must be an integer in [1, 5]");

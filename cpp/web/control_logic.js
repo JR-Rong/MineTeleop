@@ -657,11 +657,15 @@
     return {mapped: true, changed: pressedCodes.delete(code), action};
   }
 
-  function blockAndClearKeys(pressedCodes, blockedCodes) {
+  function blockAndClearKeys(pressedCodes, blockedCodes, preserveBrake = false) {
     requireKeySet(pressedCodes, 'pressedCodes');
     requireKeySet(blockedCodes, 'blockedCodes');
-    for (const code of pressedCodes) blockedCodes.add(code);
-    pressedCodes.clear();
+    for (const code of pressedCodes) {
+      const action = keyAction(code);
+      if (preserveBrake && (action === 'service_brake' || action === 'hard_brake')) continue;
+      blockedCodes.add(code);
+      pressedCodes.delete(code);
+    }
   }
 
   function deriveKeyState(pressedCodes) {
@@ -930,15 +934,18 @@
     throttle,
     brake,
     gearRequestPending = false,
+    preserveBrakeDuringRearm = false,
+    steering = 0,
   }) {
     const sampledThrottle = clamp(finiteNumber(throttle), 0, 1);
     const sampledBrake = clamp(finiteNumber(brake), 0, 1);
-    if (!authorityReady || gearRequestPending) {
-      return {requiresNeutral: true, throttle: 0, brake: 0};
-    }
+    if (!authorityReady) return {requiresNeutral: true, throttle: 0, brake: 0};
+    if (gearRequestPending) return {
+      requiresNeutral: true, throttle: 0, brake: preserveBrakeDuringRearm ? sampledBrake : 0};
     if (requiresNeutral) {
-      const pedalsNeutral = sampledThrottle === 0 && sampledBrake === 0;
-      return {requiresNeutral: !pedalsNeutral, throttle: 0, brake: 0};
+      const pedalsNeutral = sampledThrottle === 0 && sampledBrake === 0 &&
+          (!preserveBrakeDuringRearm || finiteNumber(steering) === 0);
+      return {requiresNeutral: !pedalsNeutral, throttle: 0, brake: preserveBrakeDuringRearm ? sampledBrake : 0};
     }
     return {requiresNeutral: false, throttle: sampledThrottle, brake: sampledBrake};
   }

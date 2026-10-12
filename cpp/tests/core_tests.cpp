@@ -2379,6 +2379,24 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   expect(
       rise_rate_accepted.accepted,
       "parked rise-rate change was rejected");
+  adapter_view->handshake.parking_ready = false;
+  auto count_change = rise_rate_apply;
+  count_change.seq = 11;
+  count_change.sent_at_utc_ms = 100;
+  count_change.profile.consecutive_late_frame_limit = 5;
+  const auto count_blocked = service.receive_session_profile(count_change, 100);
+  expect(!count_blocked.accepted && count_blocked.reason == "parking_ready_required_for_profile_increase" &&
+      service.control_timing(100).at("consecutive_late_frame_limit") == 1,
+      "frame count changed before parking and vehicle confirmation");
+  adapter_view->handshake.parking_ready = true;
+  adapter_view->handshake.state = "standby";
+  count_change.seq = 12;
+  count_change.sent_at_utc_ms = 110;
+  const auto count_applied = service.receive_session_profile(count_change, 110);
+  expect(count_applied.accepted && count_applied.effective_profile &&
+      count_applied.effective_profile->consecutive_late_frame_limit == 5 &&
+      service.control_timing(110).at("consecutive_late_frame_limit") == 5,
+      "confirmed frame count did not reach the actual receiver");
   service.close();
 }
 
@@ -2665,6 +2683,32 @@ void test_held_forward_and_left_rearm_after_control_gap() {
   service.close();
 }
 
+void test_idle_zero_heartbeats_do_not_trigger_control_timeout() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+  mine_teleop::VehicleControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  service.start(0);
+  auto profile = session_profile_request(100, 0);
+  profile.profile.consecutive_late_frame_limit = 3;
+  expect(service.receive_session_profile(profile, 0).accepted, "profile rejected");
+  std::uint64_t seq = 1;
+  for (std::int64_t now = 0; now <= 60000; now += 50) {
+    auto idle = command(seq++, now);
+    idle.steering = idle.throttle = idle.brake = 0.0;
+    idle.operator_active = false;
+    expect(service.receive_command(idle, now).accepted, "idle zero heartbeat rejected");
+    service.tick(now);
+    expect(service.safety_state() == mine_teleop::SafetyState::ControlActive &&
+        service.session_control_profile().at("active").get<bool>(), "not pressing keys triggered the 800 ms transport timeout");
+  }
+  service.tick(60799);
+  expect(service.session_control_profile().at("active").get<bool>(), "hard timeout triggered before 800 ms");
+  service.tick(60800);
+  expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
+      !service.session_control_profile().at("active").get<bool>(), "actual heartbeat outage did not trigger at 800 ms");
+  service.close();
+}
+
 void test_configurable_late_frames_and_independent_hard_timeout() {
   for (int limit = 1; limit <= 5; ++limit) {
     auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
@@ -2738,6 +2782,15 @@ void test_configurable_late_frames_and_independent_hard_timeout() {
 
   mine_teleop::SessionControlProfile defaults;
   expect(defaults.consecutive_late_frame_limit == 3, "default is not three frames");
+  const auto complete = defaults.to_json();
+  for (const auto& invalid_version : {mine_teleop::Json(4), mine_teleop::Json(5.5)}) {
+    auto malformed = complete;
+    malformed["profile_version"] = invalid_version;
+    expect_throws([&] { mine_teleop::SessionControlProfile::from_json(malformed); }, "unsupported profile version accepted");
+  }
+  auto missing = complete;
+  missing.erase("consecutive_late_frame_limit");
+  expect_throws([&] { mine_teleop::SessionControlProfile::from_json(missing); }, "missing frame count silently defaulted");
   for (int invalid : {0, 6}) {
     defaults.consecutive_late_frame_limit = invalid;
     expect_throws([&] { defaults.validate(); }, "invalid frame limit accepted");
@@ -4394,6 +4447,7 @@ int main() {
        test_control_service_receive_path_cannot_bypass_hard_timeout},
       {"held_forward_and_left_rearm_after_control_gap",
        test_held_forward_and_left_rearm_after_control_gap},
+      {"idle_zero_heartbeats_do_not_trigger_control_timeout", test_idle_zero_heartbeats_do_not_trigger_control_timeout},
       {"configurable_late_frames_and_independent_hard_timeout", test_configurable_late_frames_and_independent_hard_timeout},
       {"timeout_profile_revocation_preserves_watchdog_stop",
        test_timeout_profile_revocation_preserves_watchdog_stop},

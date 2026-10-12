@@ -919,6 +919,33 @@ test('vehicle fixed safety limits are exact, read-only, consistent, and preserve
       /timeout ordering is invalid/);
 });
 
+test('motion rearm retains held keyboard and analog brakes, with authority and expiry gates intact', () => {
+  const pressed=new Set(['ArrowUp','ArrowLeft','Space','KeyB']),blocked=new Set();
+  logic.blockAndClearKeys(pressed,blocked,true);
+  assert.deepEqual([...pressed],['Space','KeyB']);
+  assert.deepEqual([...blocked],['ArrowUp','ArrowLeft']);
+  assert.equal(logic.pressKey(pressed,blocked,'ArrowUp').changed,false);
+  logic.releaseKey(pressed,blocked,'ArrowUp');
+  assert.equal(logic.pressKey(pressed,blocked,'ArrowUp').changed,true);
+  const request={requiresNeutral:true,authorityReady:true,throttle:1,brake:0.7,steering:0.8,preserveBrakeDuringRearm:true};
+  assert.deepEqual(logic.reduceGamepadNeutralInterlock(request),{requiresNeutral:true,throttle:0,brake:0.7});
+  assert.equal(logic.reduceGamepadNeutralInterlock({...request,throttle:0,brake:0}).requiresNeutral,true);
+  assert.equal(logic.reduceGamepadNeutralInterlock({...request,throttle:0,brake:0,steering:0}).requiresNeutral,false);
+  assert.equal(logic.reduceGamepadNeutralInterlock({...request,authorityReady:false}).brake,0);
+  assert.equal(logic.reduceGamepadNeutralInterlock({...request,preserveBrakeDuringRearm:false}).brake,0);
+  logic.blockAndClearKeys(pressed,blocked);
+  assert.equal(pressed.size,0);
+});
+
+test('browser and C++ share the current profile version and require the complete V5 fields', () => {
+  const header=fs.readFileSync(path.join(__dirname,'../include/mine_teleop/core.hpp'),'utf8');
+  const version=Number(header.match(/kSessionControlProfileVersion = (\d+);/)[1]);
+  assert.equal(logic.normalizeControlProfile(controlProfile()).profile_version,version);
+  assert.throws(()=>logic.normalizeControlProfile({...controlProfile(),profile_version:4}));
+  const missing=controlProfile();delete missing.consecutive_late_frame_limit;
+  assert.throws(()=>logic.normalizeControlProfile(missing));
+});
+
 test('delayed degradation cannot clear input accepted later through the native vehicle result', () => {
   assert.equal(logic.degradedInputRearmRequired({rearm_required:false}, 0), false);
   assert.equal(logic.degradedInputRearmRequired({rearm_required:true,last_valid_command_seq:39}, 40), false);

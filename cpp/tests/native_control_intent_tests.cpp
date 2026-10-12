@@ -94,6 +94,43 @@ void test_invalidate_does_not_restore_old_throttle() {
   expect_zero_actuation(sample.intent, "rejected input restored throttle after invalidate");
 }
 
+void test_vehicle_rearm_preserves_fresh_braking_without_restoring_motion() {
+  mine_teleop::NativeControlIntentStore store(200);
+  auto neutral = neutral_intent(1);
+  expect(store.update(neutral, 0).accepted, "initial neutral rejected");
+  auto held = neutral;
+  held.intent_seq = 2;
+  held.throttle = 0.3;
+  held.steering = -0.2;
+  held.brake = 0.6;
+  expect(store.update(held, 10).accepted, "initial braking intent rejected");
+  store.invalidate(true);
+  const auto sample = store.sample(11);
+  expect(sample.requires_fresh_input && sample.intent.throttle == 0.0 &&
+      sample.intent.steering == 0.0 && sample.intent.brake == 0.6,
+      "vehicle re-arm released continuously held braking");
+  expect(!store.update(held, 12).accepted, "old held motion was restored");
+  auto brake_only = held;
+  brake_only.intent_seq = 3;
+  brake_only.throttle = brake_only.steering = 0.0;
+  for (std::int64_t time = 20; time <= 1000; time += 50) {
+    const auto update = store.update(brake_only, time);
+    expect(update.accepted && update.requires_fresh_input && update.preserve_brake_during_rearm,
+        "live brake-only refresh cleared motion interlock or was rejected");
+    expect(store.sample(time + 49).intent.brake == 0.6, "ongoing braking faded during re-arm");
+  }
+  expect_zero_actuation(store.sample(1170).intent, "real lease expiry retained stale ordinary braking");
+  const auto expired = store.update(brake_only, 1171);
+  expect(!expired.accepted && !expired.preserve_brake_during_rearm,
+      "old braking bypassed the expired input interlock");
+  neutral.intent_seq = 4;
+  expect(store.update(neutral, 1172).accepted, "neutral after brake release did not re-arm");
+  held.intent_seq = 5;
+  expect(store.update(held, 1173).accepted, "fresh motion did not resume after release/repress");
+  store.invalidate();
+  expect_zero_actuation(store.sample(1174).intent, "transport failure inherited vehicle-only brake preservation");
+}
+
 void test_held_input_refreshes_for_a_minute_but_real_expiry_still_requires_neutral() {
   mine_teleop::NativeControlIntentStore store(200);
   auto neutral = neutral_intent(1);
@@ -256,6 +293,8 @@ struct TestCase {
 
 int main() {
   const TestCase tests[] = {
+      {"vehicle_rearm_preserves_fresh_braking_without_restoring_motion",
+       test_vehicle_rearm_preserves_fresh_braking_without_restoring_motion},
       {"lease_expiry_neutralizes_and_preserves_gear",
        test_lease_expiry_neutralizes_and_preserves_gear},
       {"invalidate_does_not_restore_old_throttle",
