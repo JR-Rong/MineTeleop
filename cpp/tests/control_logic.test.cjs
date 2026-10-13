@@ -1478,7 +1478,8 @@ test('delayed good DataChannel status and older soft signal cannot erase a hard 
     gearChangeStationaryEvidence:logic.createGearChangeStationaryEvidence(),lastControlStatusSeq:0,vcuEverReady:true,
     performance:{now:()=>1000},renderMonitoring(){},resetControlAuthorityInput(){}});
   for(const name of ['updateVcuHandshakeState','applyMediaStatus']) {
-    const declaration=name==='updateVcuHandshakeState'?controlPageSource.split('\n').find(x=>x.startsWith('function '+name+'(')):controlPageSource.match(/^function applyMediaStatus\(payload\)\{[\s\S]*?^\}/m)?.[0];
+    const handler=controlPageSource.match(/^function applyMediaStatus\(payload\)\{[\s\S]*?^\}/m);
+    const declaration=name==='updateVcuHandshakeState'?controlPageSource.split('\n').find(x=>x.startsWith('function '+name+'(')):handler&&handler[0];
     assert(declaration);vm.runInContext(declaration,context);
   }
   context.applyMediaStatus({control_issue_code:'control_recovery_timeout',control_recovery:{cause:'time_sync',timeout_ms:5000}});
