@@ -7,9 +7,11 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -67,6 +69,86 @@ std::string socket_error_message(int error) { return std::strerror(error); }
 
 NativeSocket native_socket(SocketHandle socket) {
   return static_cast<NativeSocket>(socket);
+}
+
+Json socket_transport_diagnostics(SocketHandle socket) {
+  Json result = {{"sample_monotonic_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count()}, {"platform", platform_name()},
+      {"tcp_info_available", false}};
+  if (socket == kInvalidSocket) {
+    result["socket_available"] = false;
+    return result;
+  }
+  result["socket_available"] = true;
+  sockaddr_storage peer{};
+#if defined(_WIN32)
+  int peer_size = sizeof(peer);
+  u_long pending = 0;
+  if (::ioctlsocket(native_socket(socket), FIONREAD, &pending) == 0)
+    result["socket_receive_pending_bytes"] = pending;
+#else
+  socklen_t peer_size = sizeof(peer);
+  int pending = 0;
+  if (::ioctl(native_socket(socket), FIONREAD, &pending) == 0)
+    result["socket_receive_pending_bytes"] = pending;
+#endif
+  if (::getpeername(native_socket(socket), reinterpret_cast<sockaddr*>(&peer), &peer_size) == 0) {
+    std::array<char, NI_MAXHOST> host{};
+    std::array<char, NI_MAXSERV> port{};
+    if (::getnameinfo(reinterpret_cast<sockaddr*>(&peer), peer_size, host.data(), host.size(),
+            port.data(), port.size(), NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+      result["peer_address"] = host.data();
+      result["peer_port"] = port.data();
+    }
+  }
+#if defined(_WIN32)
+  // Documented SIO_TCP_INFO v0 ABI. Keep the existing Win7 compile baseline;
+  // querying this optional Win10+ IOCTL imports no newer Windows function.
+  struct WindowsTcpInfoV0 {
+    ULONG state, mss;
+    ULONG64 connection_time_ms;
+    BOOLEAN timestamps_enabled;
+    ULONG rtt_us, min_rtt_us, bytes_in_flight, cwnd, snd_wnd, rcv_wnd, rcv_buf;
+    ULONG64 bytes_out, bytes_in;
+    ULONG bytes_reordered, bytes_retrans, fast_retrans, dup_acks_in, timeout_episodes;
+    UCHAR syn_retrans;
+  } info{};
+  static_assert(sizeof(WindowsTcpInfoV0) == 88);
+  DWORD version = 0, returned = 0;
+  if (::WSAIoctl(native_socket(socket), _WSAIORW(IOC_VENDOR, 39), &version, sizeof(version),
+          &info, sizeof(info), &returned, nullptr, nullptr) == 0 && returned >= sizeof(info)) {
+    result.update({{"tcp_info_available", true}, {"tcp_state", info.state}, {"tcp_rtt_us", info.rtt_us},
+        {"tcp_bytes_in_flight", info.bytes_in_flight}, {"tcp_retransmitted_bytes_total", info.bytes_retrans},
+        {"tcp_retransmission_timeout_episodes_total", info.timeout_episodes},
+        {"tcp_bytes_sent_total", info.bytes_out}, {"tcp_bytes_received_total", info.bytes_in},
+        {"tcp_send_window_bytes", info.snd_wnd}});
+  } else result["tcp_info_error_code"] = WSAGetLastError();
+#elif defined(__APPLE__)
+  tcp_connection_info info{};
+  socklen_t size = sizeof(info);
+  if (::getsockopt(native_socket(socket), IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &size) == 0) {
+    result.update({{"tcp_info_available", true}, {"tcp_state", info.tcpi_state},
+        {"tcp_rtt_us", static_cast<std::uint64_t>(info.tcpi_srtt) * 1000},
+        {"tcp_rto_us", static_cast<std::uint64_t>(info.tcpi_rto) * 1000},
+        {"tcp_send_queue_bytes", info.tcpi_snd_sbbytes},
+        {"tcp_retransmitted_bytes_total", info.tcpi_txretransmitbytes},
+        {"tcp_bytes_sent_total", info.tcpi_txbytes}, {"tcp_bytes_received_total", info.tcpi_rxbytes},
+        {"tcp_send_window_bytes", info.tcpi_snd_wnd}});
+  } else result["tcp_info_error_code"] = errno;
+#elif defined(__linux__)
+  tcp_info info{};
+  socklen_t size = sizeof(info);
+  if (::getsockopt(native_socket(socket), IPPROTO_TCP, TCP_INFO, &info, &size) == 0) {
+    result.update({{"tcp_info_available", true}, {"tcp_state", info.tcpi_state}, {"tcp_rtt_us", info.tcpi_rtt},
+        {"tcp_rto_us", info.tcpi_rto}, {"tcp_unacknowledged_segments", info.tcpi_unacked},
+        {"tcp_retransmitted_segments_total", info.tcpi_total_retrans}, {"tcp_current_retransmits", info.tcpi_retransmits}});
+  } else result["tcp_info_error_code"] = errno;
+#ifdef TIOCOUTQ
+  int queued = 0;
+  if (::ioctl(native_socket(socket), TIOCOUTQ, &queued) == 0) result["tcp_send_queue_bytes"] = queued;
+#endif
+#endif
+  return result;
 }
 
 void enable_tcp_nodelay_best_effort(NativeSocket socket) noexcept {
@@ -441,6 +523,8 @@ void ServerWebSocketConnection::send_frame(std::uint8_t opcode, std::string_view
 
 void ServerWebSocketConnection::send_json(const Json& value) const { send_frame(0x1, value.dump()); }
 
+Json ServerWebSocketConnection::transport_diagnostics() const { return socket_transport_diagnostics(socket_); }
+
 void ServerWebSocketConnection::send_close(std::uint16_t code, std::string_view reason) const {
   if (!valid_websocket_close_code(code)) throw std::invalid_argument("invalid websocket close status code");
   if (reason.size() > 123) throw std::invalid_argument("websocket close reason is too long");
@@ -453,13 +537,15 @@ void ServerWebSocketConnection::send_close(std::uint16_t code, std::string_view 
 }
 
 WebSocketReceiveResult ServerWebSocketConnection::receive_json(std::chrono::milliseconds timeout) {
+  const auto receive_started = std::chrono::steady_clock::now();
   while (true) {
     if (!wait_socket(socket_, kPollRead, timeout)) return {WebSocketReceiveStatus::Timeout, Json::object()};
     // The caller's short timeout is an idle poll interval. Once any part of a
     // frame is readable, allow a separate bounded window for the rest of that
     // valid TCP frame to arrive instead of consuming the poll's remaining few
     // milliseconds as the frame-assembly deadline.
-    const auto frame_deadline = std::chrono::steady_clock::now() + kWebSocketFrameAssemblyTimeout;
+    const auto frame_started = std::chrono::steady_clock::now();
+    const auto frame_deadline = frame_started + kWebSocketFrameAssemblyTimeout;
     std::array<char, 2> header{};
     if (!socket_receive_exact(socket_, header.data(), header.size(), frame_deadline)) {
       return {WebSocketReceiveStatus::Closed, Json::object()};
@@ -502,6 +588,7 @@ WebSocketReceiveResult ServerWebSocketConnection::receive_json(std::chrono::mill
     if (length > 0 && !socket_receive_exact(socket_, payload.data(), payload.size(), frame_deadline)) {
       return {WebSocketReceiveStatus::Closed, Json::object()};
     }
+    const auto frame_completed = std::chrono::steady_clock::now();
     for (std::size_t index = 0; index < payload.size(); ++index) {
       payload[index] = static_cast<char>(static_cast<unsigned char>(payload[index]) ^ mask[index % mask.size()]);
     }
@@ -518,9 +605,13 @@ WebSocketReceiveResult ServerWebSocketConnection::receive_json(std::chrono::mill
     if (!final) throw std::invalid_argument("fragmented websocket messages are not supported");
     if (opcode != 0x1) throw std::invalid_argument("only text websocket frames are supported");
     try {
+      const auto parse_started = std::chrono::steady_clock::now();
       auto value = Json::parse(payload);
       if (!value.is_object()) throw std::invalid_argument("websocket message must be a JSON object");
-      return {WebSocketReceiveStatus::Message, std::move(value)};
+      return {WebSocketReceiveStatus::Message, std::move(value),
+          std::chrono::duration_cast<std::chrono::milliseconds>(frame_started - receive_started).count(),
+          std::chrono::duration_cast<std::chrono::milliseconds>(frame_completed - frame_started).count(),
+          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - parse_started).count()};
     } catch (const Json::exception& error) {
       throw std::invalid_argument(std::string("invalid websocket JSON: ") + error.what());
     }
@@ -533,6 +624,10 @@ struct WebSocketClient::Impl {
   std::filesystem::path ca_bundle;
   curl_socket_t socket{CURL_SOCKET_BAD};
   std::string buffered;
+  std::int64_t last_transport_sample_monotonic_ms{0};
+  std::uint64_t partial_frame_polls{0};
+  const std::int64_t connection_started_monotonic_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
   std::size_t max_message_bytes{8 * 1024 * 1024};
   bool peer_closed{false};
 
@@ -808,13 +903,19 @@ void WebSocketClient::send_json(const Json& value, std::chrono::milliseconds tim
 WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds timeout) {
   if (!connected()) throw std::runtime_error("websocket is not connected");
   const auto deadline = std::chrono::steady_clock::now() + timeout;
+  const auto incomplete = [&]() -> WebSocketReceiveResult {
+    if (impl_->peer_closed) {
+      close();
+      return {WebSocketReceiveStatus::Closed, Json::object()};
+    }
+    if (!impl_->buffered.empty()) ++impl_->partial_frame_polls;
+    // TCP/TLS may split any header or payload. Retain every byte for the next
+    // poll; a short/zero idle deadline says nothing about protocol validity.
+    return {WebSocketReceiveStatus::Timeout, Json::object()};
+  };
   while (true) {
     if (!impl_->ensure_bytes(2, deadline)) {
-      if (impl_->peer_closed) {
-        close();
-        return {WebSocketReceiveStatus::Closed, Json::object()};
-      }
-      return {WebSocketReceiveStatus::Timeout, Json::object()};
+      return incomplete();
     }
     const auto first = static_cast<unsigned char>(impl_->buffered[0]);
     const auto second = static_cast<unsigned char>(impl_->buffered[1]);
@@ -826,13 +927,13 @@ WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds t
     std::uint64_t length = second & 0x7fU;
     std::size_t header_size = 2;
     if (length == 126) {
-      if (!impl_->ensure_bytes(4, deadline)) throw std::runtime_error("incomplete websocket frame");
+      if (!impl_->ensure_bytes(4, deadline)) return incomplete();
       length = (static_cast<std::uint64_t>(static_cast<unsigned char>(impl_->buffered[2])) << 8U) |
           static_cast<unsigned char>(impl_->buffered[3]);
       if (length < 126U) throw std::runtime_error("websocket frame length is not minimally encoded");
       header_size = 4;
     } else if (length == 127) {
-      if (!impl_->ensure_bytes(10, deadline)) throw std::runtime_error("incomplete websocket frame");
+      if (!impl_->ensure_bytes(10, deadline)) return incomplete();
       if ((static_cast<unsigned char>(impl_->buffered[2]) & 0x80U) != 0) {
         throw std::runtime_error("invalid websocket frame length");
       }
@@ -850,7 +951,7 @@ WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds t
       throw std::runtime_error("websocket frame length is unsupported");
     }
     if (!impl_->ensure_bytes(header_size + static_cast<std::size_t>(length), deadline)) {
-      throw std::runtime_error("incomplete websocket frame");
+      return incomplete();
     }
     const auto payload = impl_->buffered.substr(header_size, static_cast<std::size_t>(length));
     impl_->buffered.erase(0, header_size + static_cast<std::size_t>(length));
@@ -878,6 +979,20 @@ WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds t
       throw std::runtime_error(std::string("invalid websocket JSON: ") + error.what());
     }
   }
+}
+
+Json WebSocketClient::transport_diagnostics(std::chrono::milliseconds minimum_interval) {
+  if (!impl_) return {{"socket_available", false}, {"tcp_info_available", false}};
+  const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (impl_->last_transport_sample_monotonic_ms > 0 &&
+      timestamp - impl_->last_transport_sample_monotonic_ms < minimum_interval.count()) return nullptr;
+  impl_->last_transport_sample_monotonic_ms = timestamp;
+  auto result = socket_transport_diagnostics(static_cast<SocketHandle>(impl_->socket));
+  result["buffered_receive_bytes"] = impl_->buffered.size();
+  result["partial_frame_polls_total"] = impl_->partial_frame_polls;
+  result["connection_started_monotonic_ms"] = impl_->connection_started_monotonic_ms;
+  return result;
 }
 
 }  // namespace mine_teleop

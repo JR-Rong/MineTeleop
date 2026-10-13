@@ -4571,6 +4571,119 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
   server.stop();
 }
 
+void test_websocket_client_preserves_partial_ack_across_polls() {
+  for (const auto& [payload_size, prefix_size] :
+       std::vector<std::pair<std::size_t, std::size_t>>{{20, 2}, {200, 2}, {200, 3}, {70000, 9}, {70000, 20}, {21, 2}}) {
+    const bool truncate_at_eof = payload_size == 21;
+    auto prefix_sent = std::make_shared<std::atomic<bool>>(false);
+    auto release_suffix = std::make_shared<std::atomic<bool>>(false);
+    auto outbound_received = std::make_shared<std::atomic<bool>>(false);
+    const mine_teleop::Json acknowledgement = {{"event", "signaling_ack"}, {"padding", std::string(payload_size, 'a')}};
+    mine_teleop::SimpleHttpServer server(
+        "127.0.0.1", 0, [](const auto&) { return mine_teleop::ServerResponse::json(404, {}); },
+        8 * 1024 * 1024,
+        [=](int socket, const auto& request) {
+          raw_send_all(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+              "Sec-WebSocket-Accept: " + mine_teleop::websocket_accept_key(request.headers.at("sec-websocket-key")) + "\r\n\r\n");
+          const auto payload = acknowledgement.dump();
+          std::string frame(1, '\x81');
+          if (payload.size() < 126) frame.push_back(static_cast<char>(payload.size()));
+          else if (payload.size() <= 0xffff) {
+            frame.push_back('\x7e');
+            frame.push_back(static_cast<char>(payload.size() >> 8));
+            frame.push_back(static_cast<char>(payload.size()));
+          } else {
+            frame.push_back('\x7f');
+            for (int shift = 56; shift >= 0; shift -= 8)
+              frame.push_back(static_cast<char>(static_cast<std::uint64_t>(payload.size()) >> shift));
+          }
+          frame += payload;
+          raw_send_all(socket, std::string_view(frame).substr(0, prefix_size));
+          prefix_sent->store(true);
+          const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+          while (!release_suffix->load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          try {
+            mine_teleop::ServerWebSocketConnection connection(socket, 512 * 1024);
+            const auto outbound = connection.receive_json(std::chrono::milliseconds(500));
+            outbound_received->store(outbound.status == mine_teleop::WebSocketReceiveStatus::Message &&
+                outbound.message.value("event", "") == "fresh_control");
+            if (truncate_at_eof) {
+              ::shutdown(socket, SHUT_WR);
+              return true;
+            }
+            raw_send_all(socket, std::string_view(frame).substr(prefix_size));
+            connection.send_json({{"event", "next_ack"}});
+            static_cast<void>(connection.receive_json(std::chrono::milliseconds(500)));
+          } catch (const std::exception&) {
+            // A failed assertion closes the test client; always release the fixture.
+          }
+          return true;
+        });
+    server.start();
+    mine_teleop::WebSocketClient client;
+    try {
+      client.connect("ws://127.0.0.1:" + std::to_string(server.port()) + "/partial-ack");
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+      while (!prefix_sent->load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      expect(prefix_sent->load(), "partial ACK fixture did not send a prefix");
+      for (int poll = 0; poll < 3; ++poll) {
+        expect(client.receive_json(std::chrono::milliseconds(poll == 0 ? 10 : 0)).status == mine_teleop::WebSocketReceiveStatus::Timeout &&
+            client.connected(), "partial TCP ACK was treated as a protocol error or disconnect");
+      }
+      const auto transport = client.transport_diagnostics();
+      expect(transport.value("tcp_info_available", false) && transport.value("peer_address", "") == "127.0.0.1" &&
+          transport.value("buffered_receive_bytes", 0U) == prefix_size && transport.value("partial_frame_polls_total", 0U) >= 3,
+          "partial ACK/TCP diagnostics did not report the actual buffered prefix and live loopback socket");
+      expect(client.transport_diagnostics(std::chrono::hours(1)).is_null(), "normal TCP samples were not rate limited");
+      client.send_json({{"event", "fresh_control"}}, std::chrono::milliseconds(20));
+      release_suffix->store(true);
+      const auto received = client.receive_json(std::chrono::seconds(2));
+      if (truncate_at_eof) {
+        expect(received.status == mine_teleop::WebSocketReceiveStatus::Closed && !client.connected(),
+            "EOF with a partial frame was mistaken for a valid ACK or left connected");
+        server.stop();
+        continue;
+      }
+      expect(received.status == mine_teleop::WebSocketReceiveStatus::Message && received.message == acknowledgement &&
+          outbound_received->load(), "ACK bytes were lost or blocked fresh outbound control across partial polls");
+      const auto next = client.receive_json(std::chrono::seconds(2));
+      expect(next.status == mine_teleop::WebSocketReceiveStatus::Message && next.message.value("event", "") == "next_ack",
+          "partial ACK assembly consumed bytes from the following frame");
+      client.close();
+      server.stop();
+    } catch (...) {
+      release_suffix->store(true);
+      client.close();
+      server.stop();
+      throw;
+    }
+  }
+}
+
+void test_websocket_receive_timing_separates_frame_assembly() {
+  int pair[2]{-1, -1};
+  expect(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0, "receive timing socketpair failed");
+  const auto frame = raw_masked_websocket_frame(0x81U, mine_teleop::Json{{"seq", 1}}.dump());
+  std::jthread writer([&] {
+    raw_send_all(pair[0], std::string_view(frame).substr(0, 2));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    raw_send_all(pair[0], std::string_view(frame).substr(2));
+  });
+  mine_teleop::ServerWebSocketConnection connection(pair[1], 1024);
+  const auto received = connection.receive_json(std::chrono::seconds(1));
+  const auto transport = connection.transport_diagnostics();
+  writer.join();
+  ::close(pair[0]);
+  ::close(pair[1]);
+  expect(received.status == mine_teleop::WebSocketReceiveStatus::Message && received.message.value("seq", 0) == 1 &&
+      received.frame_assembly_ms >= 75 && received.receive_wait_ms >= 0 && received.json_parse_ms >= 0,
+      "frame assembly delay was hidden in cloud application processing");
+  expect(!transport.value("tcp_info_available", true) && !transport.contains("tcp_rtt_us") &&
+      transport.contains("tcp_info_error_code"), "unsupported TCP diagnostics claimed successful zero-valued counters");
+}
+
 void test_native_control_delayed_ack_progress_and_real_stall() {
   mine_teleop::SignalingServerConfig signaling_config;
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
@@ -5118,7 +5231,10 @@ void test_native_control_three_hop_trace_correlation() {
            "send_completed_at_utc_ms",
            "send_call_ms",
            "successful_send_gap_ms",
-           "successful_send_monotonic_gap_ms"}) {
+           "successful_send_monotonic_gap_ms",
+           "transport",
+           "tcp_info_available",
+           "partial_frame_polls_total"}) {
     expect(
         driver_log.find(field) != std::string::npos,
         std::string("driver native control trace omitted ") + field);
@@ -5133,12 +5249,34 @@ void test_native_control_three_hop_trace_correlation() {
            "delivery_send_completed",
            "delivery_ack_received",
            "driver_to_cloud_utc_delta_ms",
+           "cloud_frame_received_at_utc_ms",
+           "cloud_frame_received_monotonic_ms",
+           "cloud_receive_started_monotonic_ms",
+           "cloud_receive_call_ms",
+           "cloud_receive_wait_ms",
+           "cloud_frame_assembly_ms",
+           "cloud_json_parse_ms",
+           "cloud_receive_loop_gap_ms",
+           "cloud_loop_mutex_wait_ms",
+           "cloud_loop_authority_check_ms",
+           "cloud_ingress_mutex_wait_ms",
+           "cloud_ingress_authority_check_ms",
+           "tcp_info_available",
            "cloud_mailbox_to_send_ms",
            "delivery_cursor",
            "trace_session_id"}) {
     expect(
         cloud_log.find(field) != std::string::npos,
         std::string("cloud native control trace omitted ") + field);
+  }
+  for (const auto& command : cloud_commands) {
+    if (command.value("stage", "") != "ingress_ack_send_completed") continue;
+    expect(command.at("cloud_frame_received_monotonic_ms").get<std::int64_t>() <=
+        command.at("ack_send_started_monotonic_ms").get<std::int64_t>() &&
+        command.at("cloud_frame_received_at_utc_ms").get<std::int64_t>() <=
+        command.at("cloud_received_at_utc_ms").get<std::int64_t>() &&
+        command.at("cloud_ingress_mutex_wait_ms").get<std::int64_t>() >= 0,
+        "cloud diagnostic timestamps do not bracket pre-lock receive and enqueue");
   }
   for (const auto secret : {
            "trace-driver-password",
@@ -6616,6 +6754,8 @@ int main() {
        test_native_control_three_hop_trace_correlation},
       {"native_control_delayed_ack_progress_and_real_stall",
        test_native_control_delayed_ack_progress_and_real_stall},
+      {"websocket_client_preserves_partial_ack_across_polls", test_websocket_client_preserves_partial_ack_across_polls},
+      {"websocket_receive_timing_separates_frame_assembly", test_websocket_receive_timing_separates_frame_assembly},
       {"mac_runtime_retries_uncertain_websocket_send_without_duplication",
        test_mac_runtime_retries_uncertain_websocket_send_without_duplication},
       {"expired_websocket_authority_clears_local_control", test_expired_websocket_authority_clears_local_control},

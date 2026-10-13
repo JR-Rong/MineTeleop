@@ -24,6 +24,9 @@ enum class WebSocketReceiveStatus {
 struct WebSocketReceiveResult {
   WebSocketReceiveStatus status{WebSocketReceiveStatus::Timeout};
   Json message{Json::object()};
+  std::int64_t receive_wait_ms{0};
+  std::int64_t frame_assembly_ms{0};
+  std::int64_t json_parse_ms{0};
 };
 
 [[nodiscard]] std::string websocket_accept_key(std::string_view client_key);
@@ -40,6 +43,7 @@ class ServerWebSocketConnection {
   [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout);
   void send_json(const Json& value) const;
   void send_close(std::uint16_t code = 1000, std::string_view reason = {}) const;
+  [[nodiscard]] Json transport_diagnostics() const;
 
  private:
   void send_frame(std::uint8_t opcode, std::string_view payload) const;
@@ -68,6 +72,8 @@ class WebSocketClient {
   void send_json(const Json& value);
   void send_json(const Json& value, std::chrono::milliseconds timeout);
   [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout);
+  // null means the rate limit skipped this sample; unsupported counters stay absent.
+  [[nodiscard]] Json transport_diagnostics(std::chrono::milliseconds minimum_interval = {});
 
  private:
   struct Impl;

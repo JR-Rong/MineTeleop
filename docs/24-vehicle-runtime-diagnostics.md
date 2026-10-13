@@ -228,6 +228,34 @@ stale 非零丢弃和严格零值 stale heartbeat 接受/拒绝计数；
 才是不受校时影响的调度/处理证据。profile、握手或状态 DataChannel 正常不能证明
 普通控制 WSS 正常，反之亦然。
 
+### 控制 WSS 积压与软件等待的区分
+
+`driver_native_control_trace_batch` 的 `send_completed` 每秒附一次 `transport`，
+ACK 真停滞及发送失败前另采样（`failure_transport`）。记录实际 socket 的 peer、
+TCP RTT、重传累计、待发送/未读字节，以及客户端已读但未拼完的
+`buffered_receive_bytes` / `partial_frame_polls_total`。各平台按实际 API 提供字段，
+`tcp_info_available=false` / 缺字段表示不支持或查询失败，不能解释成重传为零。
+Windows 使用可选 Win10+ SIO_TCP_INFO v0，保留既有 Win7 编译基线；
+Linux TCP_INFO 的重传以 segment 计，Windows/macOS 以 byte 计，不能混算。
+累计值只在相同 peer 和 `connection_started_monotonic_ms` 内比较。
+
+云端 `ingress_ack_send_completed` / `failed` 增加：完整帧解析后、取锁前的
+`cloud_frame_received_*`，`cloud_receive_wait_ms`、`cloud_frame_assembly_ms`、
+`cloud_json_parse_ms`、`cloud_receive_loop_gap_ms`，以及循环权限检查和入队前的
+`cloud_loop_mutex_wait_ms` / `cloud_ingress_mutex_wait_ms` / 对应 authority_check_ms。
+loop gap 是前一次 receive 调用结束到本次调用开始，正常 idle poll 等待另计。
+原 `cloud_received_*` 仍为入队函数开始，已在锁内，原 processing_ms 不包含锁等待。
+云端同样每秒附一次当前 socket 的 transport，并保留已有 ACK send 起止/耗时。
+`cloud_receive_started_monotonic_ms` / `cloud_receive_call_ms` 保留完整调用边界；
+接收或拼帧抛错时另记录 `ingress_receive_failed` 的起止、错误和 TCP 快照。
+
+RTT/重传增加能证明该 TCP hop 的传输压力，不能单独证明无线断网；云端 socket
+peer 可能是 TLS 反向代理，此时云端 TCP_INFO 只覆盖代理到服务的一跳。FIONREAD
+是内核未读字节，WSS 下可能是密文，不能当作完整命令计数；客户端 buffered 字节
+是已经从 TLS 取出、尚未完成 WebSocket 拼帧的字节。send 返回仅表示交给 socket/TLS，
+不表示车端已经收到。结合三个阶段的 seq 和单调耗时判断，参见
+[session-000075 进一步诊断](40-control-wss-delay-diagnostics.md)。
+
 ### HTTP 409 与 signaling sequence
 
 服务端 409 响应携带结构化 `issue_code`，车端必须按上表区分“会话已结束”、

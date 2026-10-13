@@ -2867,10 +2867,16 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
     std::uint64_t last_delivery_cursor_sent = 0;
     std::uint64_t last_control_seq_sent = 0;
     auto last_delivery_sent_at = std::chrono::steady_clock::time_point{};
+    std::int64_t last_transport_sample_monotonic_ms = 0;
+    std::int64_t last_receive_completed_monotonic_ms = 0;
+    const auto socket_connection_started_monotonic_ms = monotonic_now_ms();
     while (true) {
       Json pending = Json::array();
+      const auto loop_mutex_wait_started = monotonic_now_ms();
+      std::int64_t loop_mutex_acquired = 0;
       try {
         std::lock_guard lock(mutex_);
+        loop_mutex_acquired = monotonic_now_ms();
         cleanup_expired_connections(now_ms());
         const auto& session = require_participant(parts[1], participant);
         validate_actor_credential(session, participant, credentials);
@@ -2886,6 +2892,7 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
         connection.send_close(1008, "signaling authority lost");
         return true;
       }
+      const auto loop_check_completed = monotonic_now_ms();
       if (!send_only && !pending.empty()) {
         const auto delivery_cursor = pending.back().value("delivery_cursor", std::uint64_t{0});
         const auto timestamp = std::chrono::steady_clock::now();
@@ -2963,16 +2970,36 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       }
 
       WebSocketReceiveResult received;
+      const auto receive_started_monotonic_ms = monotonic_now_ms();
       try {
         received = connection.receive_json(
             std::chrono::milliseconds(send_only ? 10 : 50));
       } catch (const std::exception& error) {
+        if (send_only && native_control_trace_) {
+          Json failure = {{"stage", "ingress_receive_failed"}, {"trace_session_id", parts[1]},
+              {"driver_id", participant}, {"error", error.what()},
+              {"cloud_receive_started_monotonic_ms", receive_started_monotonic_ms},
+              {"cloud_receive_failed_monotonic_ms", monotonic_now_ms()},
+              {"cloud_receive_failed_at_utc_ms", now_ms()}};
+          try {
+            failure["transport"] = connection.transport_diagnostics();
+            failure["transport"]["connection_started_monotonic_ms"] = socket_connection_started_monotonic_ms;
+          } catch (const std::exception&) {
+            failure["transport_sample_failed"] = true;
+          }
+          native_control_trace_->enqueue(std::move(failure));
+        }
         connection.send_json({{"error", error.what()}, {"event", "websocket_protocol_error"}});
         connection.send_close(1002, "websocket protocol error");
         return true;
       }
+      const auto frame_received_monotonic_ms = monotonic_now_ms();
+      const auto receive_loop_gap_ms = last_receive_completed_monotonic_ms > 0
+          ? std::max<std::int64_t>(0, receive_started_monotonic_ms - last_receive_completed_monotonic_ms) : 0;
+      last_receive_completed_monotonic_ms = frame_received_monotonic_ms;
       if (received.status == WebSocketReceiveStatus::Timeout) continue;
       if (received.status == WebSocketReceiveStatus::Closed) return true;
+      const auto frame_received_at_utc_ms = now_ms();
       try {
         if (!send_only && received.message.value("event", "") == "signaling_delivery_ack") {
           const auto delivery_cursor = required_uint64(received.message, "delivery_cursor");
@@ -3079,8 +3106,12 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
               "control-command receive WebSocket accepts delivery acknowledgements only");
         }
         Json acknowledgement;
+        const auto ingress_mutex_wait_started = monotonic_now_ms();
+        std::int64_t ingress_mutex_acquired = 0;
+        std::int64_t authority_check_completed = 0;
         {
           std::lock_guard lock(mutex_);
+          ingress_mutex_acquired = monotonic_now_ms();
           cleanup_expired_connections(now_ms());
           const auto& session = require_participant(parts[1], participant);
           validate_actor_credential(session, participant, credentials);
@@ -3088,6 +3119,7 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
             throw std::invalid_argument(
                 "send-only control WebSocket accepts control_command messages only");
           }
+          authority_check_completed = monotonic_now_ms();
           acknowledgement = enqueue_signaling_message(parts[1], received.message, participant);
           if (send_only) {
             const auto feedback = latest_vehicle_control_feedback_.find(session.session_id);
@@ -3108,7 +3140,28 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
               {"cloud_queued_at_utc_ms", acknowledgement.value("cloud_queued_at_utc_ms", std::int64_t{0})},
               {"ack_send_started_at_utc_ms", now_ms()},
               {"ack_send_started_monotonic_ms", monotonic_now_ms()},
+              {"cloud_frame_received_at_utc_ms", frame_received_at_utc_ms},
+              {"cloud_frame_received_monotonic_ms", frame_received_monotonic_ms},
+              {"cloud_receive_started_monotonic_ms", receive_started_monotonic_ms},
+              {"cloud_receive_call_ms", std::max<std::int64_t>(0, frame_received_monotonic_ms - receive_started_monotonic_ms)},
+              {"cloud_receive_wait_ms", received.receive_wait_ms},
+              {"cloud_frame_assembly_ms", received.frame_assembly_ms},
+              {"cloud_json_parse_ms", received.json_parse_ms},
+              {"cloud_receive_loop_gap_ms", receive_loop_gap_ms},
+              {"cloud_loop_mutex_wait_ms", std::max<std::int64_t>(0, loop_mutex_acquired - loop_mutex_wait_started)},
+              {"cloud_loop_authority_check_ms", std::max<std::int64_t>(0, loop_check_completed - loop_mutex_acquired)},
+              {"cloud_ingress_mutex_wait_ms", std::max<std::int64_t>(0, ingress_mutex_acquired - ingress_mutex_wait_started)},
+              {"cloud_ingress_authority_check_ms", std::max<std::int64_t>(0, authority_check_completed - ingress_mutex_acquired)},
           };
+          if (frame_received_monotonic_ms - last_transport_sample_monotonic_ms >= 1000) {
+            try {
+              acknowledgement_trace["transport"] = connection.transport_diagnostics();
+              acknowledgement_trace["transport"]["connection_started_monotonic_ms"] = socket_connection_started_monotonic_ms;
+              last_transport_sample_monotonic_ms = frame_received_monotonic_ms;
+            } catch (const std::exception&) {
+              acknowledgement_trace["transport_sample_failed"] = true;
+            }
+          }
         }
         const auto finish_ack_trace = [&](bool sent, const char* error = nullptr) {
           if (acknowledgement_trace.is_null()) return;
@@ -4836,6 +4889,13 @@ bool DriverConsoleRuntime::send_native_control_sample() {
         trace_record["ack_stall_age_ms"] = ack_stall_age_ms;
         trace_record["unacknowledged_limit"] =
             detail::NativeControlAcknowledgementWindow::kMaxPendingPackets;
+        try {
+          auto transport = control_signaling_websocket_->transport_diagnostics(
+              std::chrono::milliseconds(ack_stall_age_ms >= 500 ? 0 : 1000));
+          if (!transport.is_null()) trace_record["transport"] = std::move(transport);
+        } catch (const std::exception&) {
+          trace_record["transport_sample_failed"] = true;
+        }
       }
       if (control_signaling_ack_window_.pending_count() > 0) {
         if (ack_stall_age_ms >= 500) {
@@ -4914,6 +4974,15 @@ bool DriverConsoleRuntime::send_native_control_sample() {
   } catch (const std::exception& error) {
     if (native_control_trace_) {
       trace_record["stage"] = "send_failed";
+      // Observe the socket before failure handling closes it, without waiting
+      // for another operation or changing the existing reconnect decision.
+      try {
+        std::unique_lock websocket_lock(control_signaling_websocket_mutex_, std::try_to_lock);
+        if (websocket_lock.owns_lock() && control_signaling_websocket_)
+          trace_record["failure_transport"] = control_signaling_websocket_->transport_diagnostics();
+      } catch (const std::exception&) {
+        trace_record["transport_sample_failed"] = true;
+      }
       trace_record["error"] = error.what();
       trace_record["failure_at_utc_ms"] = clock_.now_ms();
       trace_record["failure_monotonic_ms"] = monotonic_now_ms();
