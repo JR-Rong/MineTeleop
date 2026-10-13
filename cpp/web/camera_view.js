@@ -28,12 +28,18 @@
     return camera ? camera.label : id;
   }
 
-  function frameHealth(previous, {frames, now, startedAt, muted = false, ended = false, disconnected = false}) {
+  function frameHealth(previous, {frames, now, startedAt, muted = false, ended = false, disconnected = false, staleMs = STALE_MS}) {
     const advanced = Number.isFinite(frames) && frames > 0 && frames !== previous.frames;
     const lastFrameAt = muted || ended || disconnected ? null : advanced ? now : previous.lastFrameAt;
-    const stale = now - (lastFrameAt == null ? startedAt : lastFrameAt) >= STALE_MS;
+    const stale = now - (lastFrameAt == null ? startedAt : lastFrameAt) >= staleMs;
     const status = ended || disconnected ? 'offline' : muted || stale ? 'stale' : lastFrameAt == null ? 'waiting' : 'live';
     return {frames, lastFrameAt, status};
+  }
+
+  function criticalFrameFresh(health, now, staleMs) {
+    return Number.isFinite(staleMs) && staleMs > 0 && health.frames > 0 &&
+        health.lastFrameAt != null && now >= health.lastFrameAt &&
+        now - health.lastFrameAt < staleMs && health.status === 'live';
   }
 
   function mount(grid) {
@@ -108,6 +114,7 @@
         entry.health = frameHealth(entry.health, {
           frames: presentedFrames(entry.video),
           now, startedAt: entry.startedAt,
+          staleMs: entry.criticalStaleMs || STALE_MS,
           muted: Boolean(entry.track && entry.track.muted), ended: Boolean(entry.track && entry.track.readyState === 'ended'), disconnected,
         });
         paint(entry, entry.health.status);
@@ -136,8 +143,25 @@
       refresh();
     }
 
-    return {configure, attach, reset, refresh, setConnectionState};
+    function criticalHealth(ids, staleMs) {
+      for (const id of ids) if (entries.has(id)) entries.get(id).criticalStaleMs = staleMs;
+      refresh();
+      const now = performance.now();
+      const missing = ids.filter(id => {
+        const entry = entries.get(id);
+        if (!entry) return true;
+        const fresh = entry.track && !entry.track.muted && entry.track.readyState !== 'ended' &&
+            !disconnected && criticalFrameFresh(entry.health, now, staleMs);
+        entry.criticalRecoveryFrames = fresh ? Math.min(3, (entry.criticalRecoveryFrames || 0) +
+            Math.max(0, entry.health.frames - (entry.criticalFrameCounter || 0))) : 0;
+        entry.criticalFrameCounter = entry.health.frames;
+        return !fresh || entry.criticalRecoveryFrames < 3;
+      });
+      return {ready: ids.length > 0 && missing.length === 0, missing};
+    }
+
+    return {configure, attach, reset, refresh, setConnectionState, criticalHealth};
   }
 
-  return Object.freeze({CAMERAS, STALE_MS, orderedCameraIds, cameraLabel, frameHealth, mount});
+  return Object.freeze({CAMERAS, STALE_MS, orderedCameraIds, cameraLabel, frameHealth, criticalFrameFresh, mount});
 });

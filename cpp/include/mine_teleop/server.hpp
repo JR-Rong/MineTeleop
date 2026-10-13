@@ -482,6 +482,8 @@ class DriverConsoleRuntime {
   double motor_torque_rise_rate_nm_per_s_{0.0};
   int parking_idle_timeout_ms_{500};
   int consecutive_late_frame_limit_{3};
+  int critical_camera_stale_brake_ms_{500};
+  int critical_camera_recovery_timeout_ms_{5000};
   bool control_profile_initialized_{false};
   std::uint64_t last_control_profile_prepared_seq_{0};
   std::atomic<double> service_brake_limit_{0.3};

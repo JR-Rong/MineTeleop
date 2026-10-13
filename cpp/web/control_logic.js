@@ -28,11 +28,13 @@
   const GEAR_CHANGE_STATIONARY_SPEED_MPS = 0.1;
   const GEAR_CHANGE_STATIONARY_MIN_SAMPLES = 3;
   const GEAR_CHANGE_STATIONARY_MIN_DURATION_MS = 200;
-  const CONTROL_PROFILE_VERSION = 5;
+  const CONTROL_PROFILE_VERSION = 6;
   const CONTROL_PROFILE_FIELDS = Object.freeze([
     'profile_version',
     'parking_idle_timeout_ms',
     'consecutive_late_frame_limit',
+    'critical_camera_stale_brake_ms',
+    'critical_camera_recovery_timeout_ms',
     'target_speed_kph',
     'max_motor_torque_nm',
     'max_brake_pressure_bar',
@@ -228,7 +230,7 @@
     if (keys.length !== CONTROL_PROFILE_FIELDS.length ||
         !CONTROL_PROFILE_FIELDS.every(
             field => Object.prototype.hasOwnProperty.call(value, field))) {
-      throw new TypeError('control profile must contain exactly the V5 fields');
+      throw new TypeError('control profile must contain exactly the V6 fields');
     }
     if (value.profile_version !== CONTROL_PROFILE_VERSION) {
       throw new TypeError(`profile_version must be ${CONTROL_PROFILE_VERSION}`);
@@ -237,6 +239,8 @@
       profile_version: CONTROL_PROFILE_VERSION,
       consecutive_late_frame_limit: requireIntegerRange(value.consecutive_late_frame_limit, 1, 5, 'consecutive_late_frame_limit'),
       parking_idle_timeout_ms: requireIntegerRange(value.parking_idle_timeout_ms, 0, 1000, 'parking_idle_timeout_ms'),
+      critical_camera_stale_brake_ms: requireIntegerRange(value.critical_camera_stale_brake_ms, 100, 3000, 'critical_camera_stale_brake_ms'),
+      critical_camera_recovery_timeout_ms: requireIntegerRange(value.critical_camera_recovery_timeout_ms, 1000, 30000, 'critical_camera_recovery_timeout_ms'),
       target_speed_kph: requireFiniteRange(value.target_speed_kph, 0, 72, 'target_speed_kph'),
       max_motor_torque_nm: requireFiniteRange(
           value.max_motor_torque_nm, 0, 640.0, 'max_motor_torque_nm'),
@@ -270,6 +274,10 @@
   }
 
   function vehicleControlDiagnostic(issueCode) {
+    if (issueCode === 'critical_camera_braking_wait') return {
+      level: 'warn', title: '关键画面中断，制动等待恢复',
+      text: '牵引已撤销，车辆正在制动；当前会话与参数保留。画面恢复后释放旧运动输入，再重新按下继续；持续超时将进入安全停车。',
+    };
     if (issueCode === 'critical_camera_failed') return {
       level: 'critical', title: '关键视频故障，控制已锁定',
       text: '关键视频中断或启动超时，本会话已禁止控制。画面恢复不会解除锁定；请结束会话，待视频正常后重新连接并确认限幅、完成 VCU 握手。',
@@ -326,6 +334,8 @@
           value.max_brake_pressure_bar, 0, 327.6, 'max_brake_pressure_bar'),
       max_steering_angle_deg: requireFiniteRange(
           value.max_steering_angle_deg, 0, 30, 'max_steering_angle_deg'),
+      default_critical_camera_stale_brake_ms: requireIntegerRange(value.default_critical_camera_stale_brake_ms, 100, 3000, 'default_critical_camera_stale_brake_ms'),
+      default_critical_camera_recovery_timeout_ms: requireIntegerRange(value.default_critical_camera_recovery_timeout_ms, 1000, 30000, 'default_critical_camera_recovery_timeout_ms'),
       default_speed_pid_kp: requireFiniteRange(
           value.default_speed_pid_kp, speedPidLimits.kp.min, speedPidLimits.kp.max,
           'default_speed_pid_kp'),
@@ -387,6 +397,8 @@
       profile_version: CONTROL_PROFILE_VERSION,
       parking_idle_timeout_ms: requested.parking_idle_timeout_ms,
       consecutive_late_frame_limit: requested.consecutive_late_frame_limit,
+      critical_camera_stale_brake_ms: requested.critical_camera_stale_brake_ms,
+      critical_camera_recovery_timeout_ms: requested.critical_camera_recovery_timeout_ms,
       target_speed_kph: Math.min(requested.target_speed_kph, hard.max_target_speed_kph),
       max_motor_torque_nm: Math.min(
           requested.max_motor_torque_nm, hard.full_scale_motor_torque_nm),
@@ -427,6 +439,8 @@
       profile_version: CONTROL_PROFILE_VERSION,
       parking_idle_timeout_ms: 500,
       consecutive_late_frame_limit: 3,
+      critical_camera_stale_brake_ms: hard.default_critical_camera_stale_brake_ms,
+      critical_camera_recovery_timeout_ms: hard.default_critical_camera_recovery_timeout_ms,
       target_speed_kph: hard.max_target_speed_kph / 2,
       max_motor_torque_nm: hard.full_scale_motor_torque_nm / 2,
       max_brake_pressure_bar: hard.max_brake_pressure_bar / 2,

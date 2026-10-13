@@ -98,10 +98,11 @@ class MediaSignalingSequence {
   std::uint64_t value_{0};
 };
 
-// A critical-camera fault revokes control for the remainder of the current
-// cloud session.  The media service may reconstruct VehicleMediaRuntime while
-// that session is still active, so this latch must outlive one runtime object.
+// Only a sustained critical-video outage latches the session. The braking
+// deadline also survives reconstruction so retries cannot extend it forever.
 inline constexpr int kCriticalCameraStartupTimeoutMs = 15000;
+inline constexpr int kCriticalCameraRecoveryStableMs = 300;
+enum class CriticalVideoPhase { Ready, BrakingWait, Recovered, Locked };
 [[nodiscard]] bool camera_encoded_frame_fresh(
     std::int64_t last_encoded_ms, std::int64_t now_ms, int timeout_ms);
 
@@ -119,6 +120,9 @@ class CriticalCameraControlLatch {
   // deadline and the armed state survive same-session media reconstruction.
   [[nodiscard]] bool startup_grace_active(std::string_view session_id, std::int64_t now_ms);
   [[nodiscard]] bool arm_for_control(std::string_view session_id);
+  [[nodiscard]] CriticalVideoPhase observe_video(
+      std::string_view session_id, bool ready, std::int64_t now_ms, int recovery_timeout_ms);
+  [[nodiscard]] bool braking_wait_for(std::string_view session_id) const;
 
  private:
   mutable std::mutex mutex_;
@@ -126,6 +130,8 @@ class CriticalCameraControlLatch {
   bool inhibited_{false};
   bool armed_{false};
   std::optional<std::int64_t> startup_started_ms_;
+  std::optional<std::int64_t> braking_started_ms_;
+  std::optional<std::int64_t> recovered_started_ms_;
 };
 
 struct EncodedFrame {

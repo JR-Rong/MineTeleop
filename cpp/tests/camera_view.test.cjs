@@ -1,6 +1,6 @@
 'use strict';
 const assert = require('assert').strict;
-const {orderedCameraIds, cameraLabel, frameHealth} = require('../web/camera_view.js');
+const {orderedCameraIds, cameraLabel, frameHealth, criticalFrameFresh} = require('../web/camera_view.js');
 let failed = 0;
 function test(name, body) {
   try { body(); console.log('[PASS] ' + name); }
@@ -50,5 +50,16 @@ test('reset frame counters wait for the first frame of a new track', () => {
   const reset = sample({frames: 100, lastFrameAt: null}, 0, 0);
   assert.equal(reset.status, 'waiting');
   assert.equal(sample(reset, 100, 1).status, 'live');
+});
+test('critical-video freshness uses confirmed timing before the visual three-second overlay', () => {
+  const live = sample(empty, 100, 1);
+  assert(criticalFrameFresh(live, 599, 500));
+  assert(!criticalFrameFresh(live, 600, 500));
+  assert.equal(sample(live, 600, 1, {staleMs:500}).status, 'stale');
+  assert(!criticalFrameFresh(empty, 100, 500));
+  assert(!criticalFrameFresh(live, 99, 500));
+  assert(!criticalFrameFresh(sample(live, 200, 2, {muted:true}), 200, 500));
+  assert(criticalFrameFresh(sample(live, 700, 2), 700, 500));
+  assert(criticalFrameFresh(live, 999, 1000));
 });
 process.exitCode = failed ? 1 : 0;

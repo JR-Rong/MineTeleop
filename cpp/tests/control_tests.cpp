@@ -716,7 +716,7 @@ void test_control_page_contract() {
               std::string::npos,
       "legacy PID defaults can still auto-submit without explicit operator confirmation");
   expect(
-      response.body.find("pidChanged=!prior||requested.consecutive_late_frame_limit!==prior.consecutive_late_frame_limit||requested.parking_idle_timeout_ms!==prior.parking_idle_timeout_ms||requested.speed_pid_kp!==prior.speed_pid_kp") !=
+      response.body.find("pidChanged=!prior||requested.consecutive_late_frame_limit!==prior.consecutive_late_frame_limit||requested.parking_idle_timeout_ms!==prior.parking_idle_timeout_ms||requested.critical_camera_stale_brake_ms!==prior.critical_camera_stale_brake_ms||requested.critical_camera_recovery_timeout_ms!==prior.critical_camera_recovery_timeout_ms||requested.speed_pid_kp!==prior.speed_pid_kp") !=
               std::string::npos &&
       response.body.find(
               "requested.motor_torque_rise_rate_nm_per_s!==prior.motor_torque_rise_rate_nm_per_s") !=
@@ -2959,9 +2959,11 @@ void test_driver_vehicle_switch_releases_old_session() {
   profile_request.method = "POST";
   profile_request.path = "/api/control-profile";
   const mine_teleop::Json valid_profile = {
-      {"profile_version", 5},
+      {"profile_version", 6},
       {"parking_idle_timeout_ms", 500},
       {"consecutive_late_frame_limit", 3},
+      {"critical_camera_stale_brake_ms", 500},
+      {"critical_camera_recovery_timeout_ms", 5000},
       {"target_speed_kph", 3.0},
       {"max_motor_torque_nm", 250.0},
       {"max_brake_pressure_bar", 80.0},
@@ -2998,12 +3000,15 @@ void test_driver_vehicle_switch_releases_old_session() {
   for (int limit = 1; limit <= 5; ++limit) {
     auto requested = valid_profile;
     requested["consecutive_late_frame_limit"] = limit;
+    requested["critical_camera_stale_brake_ms"] = 500 + limit * 100;
+    requested["critical_camera_recovery_timeout_ms"] = 2000 + limit * 1000;
     const auto prepared = driver.prepare_control_profile(requested);
     const auto wire = mine_teleop::SessionControlProfileRequest::from_json(prepared.at("request"));
     const auto applied = vehicle_service.receive_session_profile(wire, wire.sent_at_utc_ms);
     expect(applied.accepted && applied.applied_revision == wire.seq &&
         applied.effective_profile && applied.effective_profile->to_json() == requested &&
-        vehicle_service.control_timing(wire.sent_at_utc_ms).at("consecutive_late_frame_limit") == limit,
+        vehicle_service.control_timing(wire.sent_at_utc_ms).at("consecutive_late_frame_limit") == limit &&
+        vehicle_service.critical_video_timing() == std::pair{500 + limit * 100, 2000 + limit * 1000},
         "driver and vehicle disagreed on a confirmed profile or did not apply the requested frame limit");
   }
   vehicle_service.close();
@@ -3021,7 +3026,7 @@ void test_driver_vehicle_switch_releases_old_session() {
       "prepared session profile lost authenticated envelope identity");
   expect(
       !profile_envelope.contains("profile") &&
-          profile_envelope.value("profile_version", 0) == 5 &&
+          profile_envelope.value("profile_version", 0) == 6 &&
           profile_envelope.value("target_speed_kph", -1.0) == 3.0 &&
           profile_envelope.value("max_motor_torque_nm", -1.0) == 250.0 &&
           profile_envelope.value("max_brake_pressure_bar", -1.0) == 80.0 &&
@@ -3046,7 +3051,7 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(
       prepared_profile.value("target_speed_kph", -1.0) == 3.0 &&
           prepared_profile.value("max_motor_torque_nm", -1.0) == 250.0 &&
-          prepared_profile.value("profile_version", 0) == 5 &&
+          prepared_profile.value("profile_version", 0) == 6 &&
           prepared_profile.value("initialized", false) &&
           prepared_profile.value("max_steering_angle_deg", -1.0) == 3.0 &&
           prepared_profile.value("speed_pid_kp", -1.0) == 1.5 &&
@@ -3230,9 +3235,11 @@ void test_driver_vehicle_switch_releases_old_session() {
       "rejected legacy control-limit mutation changed the active profile");
 
   profile_request.body = mine_teleop::Json({
-      {"profile_version", 5},
+      {"profile_version", 6},
       {"parking_idle_timeout_ms", 500},
       {"consecutive_late_frame_limit", 3},
+      {"critical_camera_stale_brake_ms", 500},
+      {"critical_camera_recovery_timeout_ms", 5000},
       {"target_speed_kph", 0.0},
       {"max_motor_torque_nm", 0.0},
       {"max_brake_pressure_bar", 0.0},
@@ -3289,7 +3296,7 @@ void test_driver_vehicle_switch_releases_old_session() {
           reset_profile.value("max_brake_pressure_bar", -1.0) == 100.0 &&
           reset_profile.value("service_brake_pressure_bar", -1.0) == 10.0 &&
           reset_profile.value("hard_brake_pressure_bar", -1.0) == 25.0 &&
-          reset_profile.value("profile_version", 0) == 5 &&
+          reset_profile.value("profile_version", 0) == 6 &&
           reset_profile.value("parking_idle_timeout_ms", -1) == 500 &&
           !reset_profile.value("initialized", true) &&
           reset_profile.value("speed_pid_kp", -1.0) == 0.0 &&

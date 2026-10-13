@@ -82,6 +82,8 @@ function intentPageFixture(codes = ['ArrowUp', 'ArrowLeft']) {
     gearRejectionInhibited: false,
     controlProfileState: {acknowledged: true},
     vcuHandshake: readyVcu,
+    vehicleTelemetry: null,
+    driverCriticalVideoHealth: () => ({ready: true, missing: []}),
     pendingGearTransition: null,
     estopLatched: false,
     activeControlPreparePreemptedByEstop: false,
@@ -632,9 +634,11 @@ test('control rejection presentation exposes only stable issue-code guidance', (
 
 function controlProfile(overrides = {}) {
   return {
-    profile_version: 5,
+    profile_version: 6,
     parking_idle_timeout_ms: 500,
     consecutive_late_frame_limit: 3,
+    critical_camera_stale_brake_ms: 500,
+    critical_camera_recovery_timeout_ms: 5000,
     target_speed_kph: 12,
     max_motor_torque_nm: 300,
     max_brake_pressure_bar: 90,
@@ -682,6 +686,8 @@ function vehicleHardLimits(overrides = {}) {
     full_scale_motor_torque_nm: 165,
     max_brake_pressure_bar: 50,
     max_steering_angle_deg: 8,
+    default_critical_camera_stale_brake_ms: 500,
+    default_critical_camera_recovery_timeout_ms: 5000,
     default_speed_pid_kp: 1.5,
     default_speed_pid_ki: 0.2,
     default_speed_pid_kd: 0.1,
@@ -705,13 +711,15 @@ function vehicleHardLimits(overrides = {}) {
   };
 }
 
-test('session control profile V5 validation and hard-limit merge preserve ordering', () => {
+test('session control profile V6 validation and hard-limit merge preserve ordering', () => {
   const requested = controlProfile();
   const hard = vehicleHardLimits();
   assert.deepEqual(logic.mergeControlProfileWithHardLimits(requested, hard), {
-    profile_version: 5,
+    profile_version: 6,
     parking_idle_timeout_ms: 500,
     consecutive_late_frame_limit: 3,
+    critical_camera_stale_brake_ms: 500,
+    critical_camera_recovery_timeout_ms: 5000,
     target_speed_kph: 4,
     max_motor_torque_nm: 165,
     max_brake_pressure_bar: 50,
@@ -754,13 +762,13 @@ test('session control profile V5 validation and hard-limit merge preserve orderi
       /speed_pid_max_dt_ms must be an integer/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, profile_version: 1}),
-      /profile_version must be 5/);
+      /profile_version must be 6/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, profile_version: 2}),
-      /profile_version must be 5/);
+      /profile_version must be 6/);
   assert.throws(
       () => logic.normalizeControlProfile({...requested, unexpected_field: 1}),
-      /exactly the V5 fields/);
+      /exactly the V6 fields/);
   assert.throws(
       () => logic.normalizeControlProfile(
           {...requested, motor_torque_rise_rate_nm_per_s: -1}),
@@ -773,11 +781,13 @@ test('session control profile V5 validation and hard-limit merge preserve orderi
   delete v2Profile.motor_torque_rise_rate_nm_per_s;
   assert.throws(
       () => logic.normalizeControlProfile(v2Profile),
-      /exactly the V5 fields/);
+      /exactly the V6 fields/);
 });
 
 test('PID defaults come only from complete vehicle limits and accept kp hard min zero', () => {
   const hard = vehicleHardLimits({
+    default_critical_camera_stale_brake_ms: 500,
+    default_critical_camera_recovery_timeout_ms: 5000,
     default_speed_pid_kp: 3.25,
     default_speed_pid_ki: 0.75,
     default_speed_pid_kd: 0.5,
@@ -937,7 +947,7 @@ test('motion rearm retains held keyboard and analog brakes, with authority and e
   assert.equal(pressed.size,0);
 });
 
-test('browser and C++ share the current profile version and require the complete V5 fields', () => {
+test('browser and C++ share the current profile version and require the complete V6 fields', () => {
   const header=fs.readFileSync(path.join(__dirname,'../include/mine_teleop/core.hpp'),'utf8');
   const version=Number(header.match(/kSessionControlProfileVersion = (\d+);/)[1]);
   assert.equal(logic.normalizeControlProfile(controlProfile()).profile_version,version);
@@ -958,7 +968,7 @@ test('delayed degradation cannot clear input accepted later through the native v
 test('profile equality checks every configurable field, independent of JSON order', () => {
   const profile=controlProfile();
   assert(logic.controlProfilesEqual(profile,Object.fromEntries(Object.entries(profile).reverse())));
-  for(const field of ['consecutive_late_frame_limit','parking_idle_timeout_ms'])
+  for(const field of ['consecutive_late_frame_limit','parking_idle_timeout_ms','critical_camera_stale_brake_ms','critical_camera_recovery_timeout_ms'])
     assert.equal(logic.controlProfilesEqual(profile,{...profile,[field]:profile[field]+1}),false);
 });
 
@@ -991,7 +1001,7 @@ test('session control profile ACK only activates the matching pending request', 
   assert.equal(mismatched.invalidated, true);
   assert.equal(mismatched.reason, 'effective_profile_mismatch');
 
-  for(const field of ['consecutive_late_frame_limit','parking_idle_timeout_ms']) {
+  for(const field of ['consecutive_late_frame_limit','parking_idle_timeout_ms','critical_camera_stale_brake_ms','critical_camera_recovery_timeout_ms']) {
     const result=logic.reduceControlProfileStatus(pending,{active:true,accepted:true,last_request_seq:7,applied_revision:7,
       effective_profile:{...requested,[field]:requested[field]+1}});
     assert.equal(result.acknowledged,false);
@@ -1333,6 +1343,51 @@ test('vehicle startup and camera inhibition diagnostics remain distinct from CAN
   assert.match(logic.vehicleControlDiagnostic('vcu_adapter_start_failed').text, /CAN 配置/);
   assert.equal(logic.vehicleControlDiagnostic(''), null);
   assert.equal(logic.vehicleControlDiagnostic('future-code'), null);
+});
+
+test('video protection timings reject missing, old, fractional and out-of-range values', () => {
+  for(const field of ['critical_camera_stale_brake_ms','critical_camera_recovery_timeout_ms']){
+    const missing=controlProfile();delete missing[field];assert.throws(()=>logic.normalizeControlProfile(missing));
+    for(const invalid of [0, 0.5, 30001])assert.throws(()=>logic.normalizeControlProfile({...controlProfile(),[field]:invalid}));
+  }
+  assert.throws(()=>logic.normalizeControlProfile({...controlProfile(),profile_version:5}));
+  assert.equal(logic.normalizeControlProfile(controlProfile()).critical_camera_recovery_timeout_ms,5000);
+  assert.match(logic.vehicleControlDiagnostic('critical_camera_braking_wait').text,/当前会话与参数保留/);
+});
+
+test('shipped view health distinguishes optional-only cameras from unknown critical configuration', () => {
+  const context=vm.createContext({mediaStatus:{lanes:[]},controlProfileState:{effectiveProfile:null},
+    vehicleHardLimits:{default_critical_camera_stale_brake_ms:700},
+    cameraView:{criticalHealth:(ids,staleMs)=>({ready:ids.length>0,missing:ids,staleMs})}});
+  const handler=controlPageSource.match(/^function driverCriticalVideoHealth\(\)\{[\s\S]*?^\}/m);
+  assert(handler);vm.runInContext(handler[0],context);
+  assert.equal(context.driverCriticalVideoHealth().ready,false);
+  context.mediaStatus={lanes:[{camera_id:'aux',critical_for_control:false}]};
+  assert.equal(context.driverCriticalVideoHealth().ready,true);
+  context.mediaStatus={lanes:[{camera_id:'unknown'}]};
+  assert.equal(context.driverCriticalVideoHealth().ready,false);
+  context.mediaStatus={lanes:[{camera_id:'front',critical_for_control:true}]};
+  assert.equal(context.driverCriticalVideoHealth().staleMs,700);
+  context.controlProfileState.effectiveProfile={critical_camera_stale_brake_ms:900};
+  assert.equal(context.driverCriticalVideoHealth().staleMs,900);
+});
+
+test('lost critical view sends neutral without disconnecting or clearing the profile', async () => {
+  const fixture=intentPageFixture();
+  fixture.context.driverCriticalVideoHealth=()=>({ready:false,missing:['front']});
+  const request=fixture.context.writeControlIntent({},true);
+  assert.equal(fixture.requests.length,1);
+  assert.equal(fixture.requests[0].intent.throttle,0);
+  assert.equal(fixture.requests[0].intent.steering,0);
+  assert.equal(fixture.context.controlProfileState.acknowledged,true);
+  assert.equal(fixture.context.controlAuthorityLost,false);
+  assert(fixture.blocked.has('ArrowUp'));
+  fixture.requests[0].resolve({accepted:true});await request;
+  fixture.context.driverCriticalVideoHealth=()=>({ready:true,missing:[]});
+  const recovered=fixture.context.writeControlIntent({},false);
+  assert.equal(fixture.requests[1].intent.throttle,0);
+  assert.equal(fixture.requests[1].intent.steering,0);
+  fixture.requests[1].resolve({accepted:true});await recovered;
 });
 
 Promise.all(pendingTests).then(() => {
