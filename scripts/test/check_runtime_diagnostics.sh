@@ -125,6 +125,30 @@ for text in 'VehicleStopReason::OuterControlTimeout' 'VehicleStopReason::MediaPi
     exit 1
   fi
 done
+# A media readiness change after hard stop is not another driving stop or an
+# authority recovery. Keep transition-only evidence that distinguishes a
+# capture/encoder gap, driver readiness and an actual software brake call.
+recovery_transition_block="$(sed -n '/  void apply_control_recovery_phase(/,/  void pause_control_for_critical_camera(/p' "$media_runtime")"
+for text in \
+  '"critical_lanes", std::move(critical_lanes)' \
+  '"last_capture_age_ms"' \
+  '"last_encoded_age_ms"' \
+  '"recovery_encoded_baseline"' \
+  '"control_service_active"' \
+  '"session_profile_active"' \
+  '"safety_state", to_string(state)' \
+  '"control_timing", timing' \
+  '"soft_brake_request_active"' \
+  '"soft_brake_applied_this_transition"' \
+  'after.safe_stop_count > before->safe_stop_count' \
+  'state == SafetyState::ControlActive || state == SafetyState::Degraded' \
+  'readiness_observed_control_not_active' \
+  'if (record_transition) sample_readiness()'; do
+  if ! grep -F --quiet "$text" <<<"$recovery_transition_block"; then
+    printf 'control recovery transition diagnostics missing: %s\n' "$text" >&2
+    exit 1
+  fi
+done
 if ! grep -F --quiet 'VehicleStopReason::VcuStateFault' <<<"$control_tick_block"; then
   printf 'media/control isolation contract missing: adapter runtime fault close provenance\n' >&2
   exit 1

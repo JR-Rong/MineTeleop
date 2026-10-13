@@ -4807,14 +4807,23 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     input["steering"] = input["throttle"] = 0.0;
     const auto braking = driver.update_control_intent(input);
     expect(braking.value("accepted", false), "zero-motion recovery rejected ongoing braking");
+    const auto braking_recovered = [&] {
+      const auto feedback = vehicle->read_telemetry();
+      return last_applied_intent == 3 && feedback.throttle_feedback == 0 &&
+          (held_brake == 0 || (fresh_braking_seen && feedback.brake_feedback > 0));
+    };
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (last_applied_intent != 3 && std::chrono::steady_clock::now() < deadline) {
+    // Packet identity alone is not the recovery condition. A batch can first
+    // apply intent 3 before the re-arm/braking observation has arrived.
+    while (!braking_recovered() && std::chrono::steady_clock::now() < deadline) {
       static_cast<void>(driver.update_control_intent(input));
       process_delivery(false);
     }
-    expect(last_applied_intent == 3 && vehicle->read_telemetry().throttle_feedback == 0 &&
-        (held_brake == 0 || (fresh_braking_seen && vehicle->read_telemetry().brake_feedback > 0)),
-        "actual vehicle did not recover zero motion while retaining braking");
+    expect(braking_recovered(),
+        "actual vehicle did not recover zero motion while retaining braking: held=" + std::to_string(held_brake) +
+        ":last_intent=" + std::to_string(last_applied_intent) + ":fresh_braking=" + std::to_string(fresh_braking_seen) +
+        ":safety=" + std::string(mine_teleop::to_string(service.safety_state())) +
+        ":vehicle=" + last_vehicle_rejection + ":sender=" + driver.status().at("native_control").value("last_error", ""));
     input["intent_seq"] = 4;
     input["brake"] = 0.0;
     expect(driver.update_control_intent(input).value("accepted", false), "full neutral input rejected");

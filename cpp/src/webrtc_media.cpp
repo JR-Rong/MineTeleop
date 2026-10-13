@@ -2707,11 +2707,53 @@ struct VehicleMediaRuntime::Impl {
     const bool waiting = phase == ControlRecoveryPhase::BrakingWait;
     if (new_wait) for (const auto& lane : lanes) lane->video_wait_encoded_baseline = lane->encoded.load();
     bool changed = false;
+    bool soft_brake_request_active = false;
+    bool soft_brake_applied_this_transition = false;
+    Json control_snapshot;
+    Json critical_lanes;
+    std::int64_t sampled_at_monotonic_ms = 0;
+    const auto sample_readiness = [&] {
+      sampled_at_monotonic_ms = steady_now_ms();
+      critical_lanes = Json::array();
+      for (const auto& lane : lanes) {
+        if (!lane->camera.critical_for_control) continue;
+        const auto last_capture = lane->last_capture_steady_ms.load();
+        const auto last_encoded = lane->last_encoded_steady_ms.load();
+        critical_lanes.push_back({{"camera_id", lane->camera.id}, {"device", lane->camera.device},
+            {"captured_frames", lane->captured.load()}, {"encoded_frames", lane->encoded.load()},
+            {"last_capture_age_ms", last_capture > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - last_capture)) : Json(nullptr)},
+            {"last_encoded_age_ms", last_encoded > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - last_encoded)) : Json(nullptr)},
+            {"recovery_encoded_baseline", lane->video_wait_encoded_baseline.load()},
+            {"encoded_queue_backpressure_count", lane->encoded_queue_backpressure.load()},
+            {"failure_count", lane->failure_count.load()}, {"camera_faulted", lane->camera_faulted.load()},
+            {"disabled", lane->disabled.load()}});
+      }
+    };
     try {
       std::lock_guard lock(control_mutex);
       if (control_service_started && control_service) {
         changed = control_service->control_braking_wait() != waiting;
+        const bool record_transition = changed || new_wait || phase == ControlRecoveryPhase::Recovered ||
+            (waiting && control_service_issue_code != "control_recovery_braking_wait");
+        const auto before = record_transition
+            ? std::optional(control_service->adapter_status()) : std::nullopt;
+        if (record_transition) sample_readiness();
         control_service->set_control_braking_wait(waiting, signaling.now_ms(), control_recovery_latch->cause_for(signaling.session_id()));
+        if (before) {
+          const auto after = control_service->adapter_status();
+          const auto state = control_service->safety_state();
+          const bool profile_active = control_service->session_control_profile().value("active", false);
+          const auto timing = control_service->control_timing(signaling.now_ms());
+          soft_brake_request_active = profile_active && after.opened &&
+              (state == SafetyState::ControlActive || state == SafetyState::Degraded) &&
+              (waiting || timing.value("recovery_brake_hold", false));
+          soft_brake_applied_this_transition = soft_brake_request_active &&
+              after.safe_stop_count > before->safe_stop_count;
+          control_snapshot = {{"control_service_active", true}, {"session_profile_active", profile_active},
+              {"safety_state", to_string(state)}, {"control_timing", timing},
+              {"adapter_safe_stop_count_before", before->safe_stop_count},
+              {"adapter_safe_stop_count_after", after.safe_stop_count}};
+        }
       }
       if (waiting && control_service_started) {
         changed = changed || control_service_issue_code != "control_recovery_braking_wait";
@@ -2730,11 +2772,19 @@ struct VehicleMediaRuntime::Impl {
           false);
       return;
     }
-    if (changed || new_wait || phase == ControlRecoveryPhase::Recovered) emit_diagnostic(
+    if (changed || new_wait || phase == ControlRecoveryPhase::Recovered) {
+      // Sample at the transition: five-second media reports cannot explain a
+      // short encoded-frame gap. These counters describe software outputs;
+      // physical brake completion still requires correlated CAN feedback.
+      if (sampled_at_monotonic_ms == 0) sample_readiness();
+      if (control_snapshot.is_null())
+        control_snapshot = {{"control_service_active", false}, {"session_profile_active", false}};
+      emit_diagnostic(
         waiting ? "vehicle_control_braking_wait" : "vehicle_control_recovered",
         waiting ? "control_recovery_braking_wait" : "control_recovered",
         "control_recovery", "",
-        waiting ? "Keep motion input neutral while control readiness recovers; the session and profile remain installed."
+        !soft_brake_request_active ? "Control authority is inactive; readiness changes do not restore driving authority."
+            : waiting ? "Keep motion input neutral while control readiness recovers; the session and profile remain installed."
                 : "Control readiness recovered; release old motion controls and provide fresh neutral input before driving again.",
         true, {{"stale_brake_ms", stale_brake_ms},
                {"recovery_timeout_ms", recovery_timeout_ms},
@@ -2742,9 +2792,16 @@ struct VehicleMediaRuntime::Impl {
                {"recovery_deadline_monotonic_ms", control_recovery_latch->deadline_for(signaling.session_id()).has_value() ? Json(*control_recovery_latch->deadline_for(signaling.session_id())) : Json(nullptr)},
                {"camera_id", failed_lane ? failed_lane->camera.id : "driver_or_critical_video"},
                {"time_sync", signaling.time_sync_status().to_json()},
+               {"readiness_sampled_at_monotonic_ms", sampled_at_monotonic_ms},
+               {"critical_lanes", std::move(critical_lanes)},
+               {"control_snapshot", std::move(control_snapshot)},
+               {"soft_brake_request_active", soft_brake_request_active},
+               {"soft_brake_applied_this_transition", soft_brake_applied_this_transition},
                {"recovery_cause", control_recovery_latch->cause_for(signaling.session_id()) == ControlRecoveryCause::CriticalVideo
                    ? "critical_video" : control_recovery_latch->cause_for(signaling.session_id()) == ControlRecoveryCause::InputLease ? "input_lease" : "time_sync"},
-               {"safety_action", waiting ? "brake_with_session_retained" : "fresh_neutral_input_requested"}});
+               {"safety_action", !soft_brake_request_active ? "readiness_observed_control_not_active"
+                   : waiting ? "brake_with_session_retained" : "fresh_neutral_input_requested"}});
+    }
   }
 
   void pause_control_for_critical_camera(Lane& lane) {

@@ -317,6 +317,7 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
     }
     last_safe_output = output;
     last_stop_context = context;
+    safe_output_history.push_back(output);
     ++safe_stops;
   }
 
@@ -404,6 +405,7 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
   std::optional<std::string> rejected_control_gear;
   std::optional<ControlCommand> last_control;
   mine_teleop::ControlOutput last_safe_output;
+  std::vector<mine_teleop::ControlOutput> safe_output_history;
   mine_teleop::VehicleStopContext last_stop_context;
   mine_teleop::VehicleTelemetry telemetry;
   mine_teleop::VcuHandshakeStatus handshake;
@@ -2803,6 +2805,76 @@ void test_idle_zero_heartbeats_do_not_trigger_control_timeout() {
   service.close();
 }
 
+void test_recovery_braking_never_emits_zero_pressure_on_rejected_commands() {
+  using Cause = mine_teleop::ControlRecoveryCause;
+  using State = mine_teleop::SafetyState;
+  for (const auto cause : {Cause::CriticalVideo, Cause::TimeSynchronization, Cause::InputLease}) {
+    auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+    auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
+    auto* view = adapter.get();
+    mine_teleop::VehicleControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 10000);
+    service.start(0);
+    view->handshake.state = "standby";
+    view->handshake.ready = false;
+    view->handshake.parking_ready = true;
+    auto profile = session_profile_request(100, 0);
+    profile.profile.max_brake_pressure_bar = profile.profile.service_brake_pressure_bar = profile.profile.hard_brake_pressure_bar = 0;
+    expect(service.receive_session_profile(profile, 0).accepted, "brake history fixture profile rejected");
+    view->set_safe_stop(false, true, false);
+    expect(service.receive_command(command(1, 0), 0).accepted, "brake history fixture motion rejected");
+    view->safe_output_history.clear();
+    const auto no_brake_release = [&](std::string_view phase) {
+      expect(!view->safe_output_history.empty(), "recovery did not emit a safety output");
+      for (const auto& output : view->safe_output_history) {
+        expect(output.brake == 1 && output.throttle == 0 && output.steering == 0 && !output.estop,
+            "recovery safety output was weakened during " + std::string(phase));
+      }
+      expect(service.control_timing(400).at("last_valid_command_seq") == 1 &&
+          service.session_control_profile().at("applied_revision") == 100,
+          "rejected command refreshed control liveness or revoked the retained profile");
+    };
+    service.set_control_braking_wait(true, 50, cause);
+    no_brake_release("wait startup");
+    std::uint64_t seq = 2;
+    for (const int now : {100, 150, 200, 250}) {
+      const auto rejected = service.receive_command(command(seq++, now), now);
+      expect(!rejected.accepted && rejected.reason == "degraded_neutral_required",
+          "held motion bypassed recovery rearm");
+      no_brake_release("held motion rejection");
+    }
+    auto late = command(seq++, 0);
+    expect(!service.receive_command(late, 275).accepted, "expired recovery command was accepted");
+    no_brake_release("late packet rejection");
+    auto untrusted = command(seq++, 300); untrusted.control_token = "wrong";
+    expect(!service.receive_command(untrusted, 300).accepted, "untrusted recovery command was accepted");
+    no_brake_release("invalid identity rejection");
+    service.set_control_braking_wait(false, 325);
+    no_brake_release("recovered readiness with brake hold");
+    expect(!service.receive_command(command(seq++, 350), 350).accepted,
+        "recovered readiness resurrected held motion without neutral");
+    no_brake_release("held motion during recovery hold");
+    service.tick(399);
+    no_brake_release("DEGRADED periodic tick");
+    expect(service.control_timing(399).at("last_valid_control_age_ms") == 399,
+        "rejected packets or local brake output refreshed the real control watchdog");
+    auto neutral = command(seq++, 400); neutral.throttle = neutral.steering = 0;
+    expect(service.receive_command(neutral, 400).accepted && view->last_safe_output.brake == 1,
+        "fresh recovery neutral released independent braking");
+    expect(service.receive_command(command(seq++, 450), 450).accepted &&
+        !service.control_timing(450).at("recovery_brake_hold").get<bool>(),
+        "fresh motion could not release the brake hold");
+    service.set_control_braking_wait(true, 500, cause);
+    service.tick(1249);
+    expect(service.session_control_profile().at("active").get<bool>(),
+        "800 ms hard watchdog fired early during recovery braking");
+    service.tick(1250);
+    expect(service.safety_state() == State::TimeoutBrake &&
+        !service.session_control_profile().at("active").get<bool>(),
+        "local recovery brake bypassed the independent 800 ms hard watchdog");
+    service.close();
+  }
+}
+
 void test_time_and_input_faults_brake_independently_and_recover_without_new_profile() {
   using Gate = mine_teleop::NeutralHeartbeatGate;
   using State = mine_teleop::SafetyState;
@@ -4628,6 +4700,7 @@ int main() {
        test_held_forward_and_left_rearm_after_control_gap},
       {"video_braking_preserves_profile_and_only_real_commands_refresh_control", test_video_braking_preserves_profile_and_only_real_commands_refresh_control},
       {"idle_zero_heartbeats_do_not_trigger_control_timeout", test_idle_zero_heartbeats_do_not_trigger_control_timeout},
+      {"recovery_braking_never_emits_zero_pressure_on_rejected_commands", test_recovery_braking_never_emits_zero_pressure_on_rejected_commands},
       {"time_and_input_faults_brake_independently_and_recover_without_new_profile", test_time_and_input_faults_brake_independently_and_recover_without_new_profile},
       {"configurable_late_frames_and_independent_hard_timeout", test_configurable_late_frames_and_independent_hard_timeout},
       {"timeout_profile_revocation_preserves_watchdog_stop",

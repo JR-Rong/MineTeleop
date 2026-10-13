@@ -394,3 +394,9 @@ jq -c 'select(
 ```
 
 V7 的 `vehicle_control_braking_wait` / `vehicle_control_recovered` 记录共同恢复门限、首次故障类型和校时状态。`time_sync_refresh` 追踪记录采样耗时、最新估计、`anchor_accepted`、上一份有效锚点时刻及错误。驾驶端 `intent_received` 与发送追踪包含输入年龄、租约、输入/时钟健康标志；安全心跳仍需身份、序号、年龄及保留挡位校验。网络真正无有效控制达到原门限时，仍先执行控制 watchdog。
+
+转换时还记录 `critical_lanes` 的采集/编码年龄、恢复基线和背压，以及 `control_snapshot`
+的控制服务/参数有效性、`safety_state` 与 `control_timing`。`soft_brake_request_active`
+区分当前制动保持与硬停车后的媒体状态变化，`soft_brake_applied_this_transition` 由
+适配器成功安全输出调用计数差判定，只证明软件 API 返回，不证明物理 EHB/EPB 完成。
+字段只随转换记录，不按帧刷日志；分析方法与例证见 [session-000075](39-session75-stop-analysis.md)。

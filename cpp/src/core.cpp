@@ -3566,9 +3566,17 @@ void VehicleControlService::evaluate_control_watchdog(std::int64_t timestamp_ms)
             VehicleStopSource::DriverPage,
             VehicleStopReason::OperatorEstop};
       }
-      adapter_->apply_safe_stop(
-          safety_.current_output(timestamp_ms),
-          stop_context);
+      if (safety_.state() == SafetyState::Degraded &&
+          (control_braking_wait_ || recovery_brake_hold_)) {
+        // Receive can reject old motion before its ordinary apply path runs.
+        // Never pulse the previous command's brake value between recovery
+        // safety outputs, including when rearm first enters DEGRADED.
+        apply_recovery_brake();
+      } else {
+        adapter_->apply_safe_stop(
+            safety_.current_output(timestamp_ms),
+            stop_context);
+      }
     }
     // DEGRADED is the recoverable 300 ms control-gap state: traction has
     // already been withdrawn above, but the acknowledged session limits must
