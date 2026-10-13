@@ -1086,7 +1086,7 @@
     if (!waiting && !holding && !delayed) return hidden;
     const cause = waiting || holding ? String(timing.control_recovery_cause || '') : 'control_delay';
     const reasons = {critical_video: '关键视频中断或无新帧', time_sync: '时间同步不可信',
-      input_lease: '驾驶输入刷新过期', control_delay: '控制指令延迟或短暂中断'};
+      input_lease: '驾驶输入刷新过期', control_link: '控制链路 ACK 确认暂时中断', control_delay: '控制指令延迟或短暂中断'};
     const reason = reasons[cause] || '控制链路暂时异常';
     // Report the last authoritative vehicle state without claiming that old
     // feedback confirms current physical braking or a completed stop.

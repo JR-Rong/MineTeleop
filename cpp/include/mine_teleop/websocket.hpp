@@ -15,6 +15,8 @@
 
 namespace mine_teleop {
 
+inline constexpr std::string_view kNativeControlCapabilities = "v7-feedback-ack-wait-v1";
+
 enum class WebSocketReceiveStatus {
   Message,
   Timeout,
@@ -30,6 +32,7 @@ struct WebSocketReceiveResult {
 };
 
 [[nodiscard]] std::string websocket_accept_key(std::string_view client_key);
+[[nodiscard]] Json websocket_transport_diagnostics(SocketHandle socket);
 [[nodiscard]] std::string signaling_websocket_url(
     std::string_view signaling_url,
     std::string_view session_id,
@@ -69,6 +72,7 @@ class WebSocketClient {
   void close();
   [[nodiscard]] bool connected() const;
   [[nodiscard]] const std::string& url() const { return url_; }
+  [[nodiscard]] std::string response_header(std::string_view name) const;
   void send_json(const Json& value);
   void send_json(const Json& value, std::chrono::milliseconds timeout);
   [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout);

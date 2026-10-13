@@ -299,6 +299,38 @@ void test_native_control_ack_progress_replays_session31_and_bounds_backlog() {
          "the pending-packet bound was exceeded");
 }
 
+void test_ack_stall_brakes_without_reconnect_and_requires_recent_stable_progress() {
+  using Recovery = mine_teleop::detail::NativeControlAckRecovery;
+  Recovery recovery;
+  expect(!recovery.observe(499, 10, 499, 10, 10, 5000).entered, "ACK wait entered before 500ms");
+  auto transition = recovery.observe(500, 10, 500, 10, 10, 5000);
+  expect(transition.entered && recovery.waiting() && !transition.reconnect_due && recovery.deadline() == 5500,
+      "500ms ACK stall closed a recoverable connection");
+  expect(!recovery.observe(1000, 5, 0, 11, 800, 30000).recovered && recovery.deadline() == 5500,
+      "old queued ACK or changed configuration cleared/extended the wait");
+  expect(!recovery.observe(1100, 4, 0, 12, 30, 5000).recovered, "one recent ACK cleared the wait");
+  expect(!recovery.observe(1500, 4, 400, 12, 30, 5000).recovered, "duplicate ACK recovered a stalled stream");
+  expect(recovery.observe(1501, 3, 0, 13, 30, 5000).recovered && !recovery.waiting(),
+      "continuing fresh ACKs did not restore the same connection");
+  recovery.enter(2000, 1000, 13);
+  expect(!recovery.observe(2999, 10, 900, 13, 30, 30000).reconnect_due,
+      "bounded ACK wait reconnected too early");
+  expect(recovery.observe(3000, 10, 1000, 13, 30, 30000).reconnect_due,
+      "persistent ACK loss never requested a bounded reconnect");
+  recovery.connection_reopened(3100);
+  expect(recovery.waiting() && recovery.deadline() == 4100 &&
+      !recovery.observe(3101, 0, 0, 0, 0, 5000).recovered, "new socket silently restored motion without an ACK");
+  expect(!recovery.observe(3200, 2, 0, 30, 20, 5000).recovered &&
+      recovery.observe(3500, 1, 0, 31, 20, 5000).recovered, "fresh ACK recovery after actual reconnect deadlocked");
+
+  mine_teleop::detail::NativeControlAcknowledgementWindow window;
+  window.note_sent(1, 100);
+  expect(window.acknowledge_through(1, 850) && window.last_ack_packet_age_ms() == 750,
+      "ACK packet age was not tied to its actual send");
+  expect(!window.acknowledge_through(1, 900) && window.last_ack_packet_age_ms() == 750,
+      "duplicate ACK forged a recent packet");
+}
+
 struct TestCase {
   const char* name;
   void (*function)();
@@ -308,6 +340,7 @@ struct TestCase {
 
 int main() {
   const TestCase tests[] = {
+      {"ack_stall_brakes_without_reconnect_and_requires_recent_stable_progress", test_ack_stall_brakes_without_reconnect_and_requires_recent_stable_progress},
       {"delayed_refresh_cannot_bypass_expiry_between_sender_ticks", test_delayed_refresh_cannot_bypass_expiry_between_sender_ticks},
       {"vehicle_rearm_preserves_fresh_braking_without_restoring_motion",
        test_vehicle_rearm_preserves_fresh_braking_without_restoring_motion},

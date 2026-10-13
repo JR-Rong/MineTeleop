@@ -45,11 +45,106 @@
 
 namespace mine_teleop {
 
+enum class ControlObservationPhase { Idle, Sample, Connect, AckDrain, Send, Failure,
+  LoopMutex, LoopCheck, DeliverySend, Receive, IngressMutex, IngressCheck, IngressAck, DeliveryAck };
+
+class ControlConnectionObservation {
+ public:
+  ControlConnectionObservation(SocketHandle socket = kInvalidSocket, std::string session = {},
+      std::string actor = {}, std::string role = "driver_sender")
+      : socket_(socket), session_(std::move(session)), actor_(std::move(actor)), role_(std::move(role)) {
+    started_ = steady_ms();
+    begin(ControlObservationPhase::Idle);
+  }
+  static std::int64_t steady_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  void begin(ControlObservationPhase phase, std::uint64_t seq = 0) {
+    epoch_.fetch_add(1, std::memory_order_acq_rel);
+    phase_started_.store(steady_ms());
+    phase_.store(phase);
+    if (seq) seq_.store(seq);
+    epoch_.fetch_add(1, std::memory_order_release);
+  }
+  void detach() { std::lock_guard lock(socket_mutex_); socket_ = kInvalidSocket; detached_ = true; }
+  [[nodiscard]] std::int64_t started() const { return started_; }
+  Json sample(bool include_socket = true) {
+    const auto epoch = epoch_.load(std::memory_order_acquire);
+    static constexpr std::array names{"idle", "sample", "connect", "ack_drain", "send", "failure_handling",
+        "loop_mutex_wait", "loop_authority_check", "vehicle_delivery_send", "receive_frame",
+        "ingress_mutex_wait", "ingress_authority_check", "ingress_ack_send", "vehicle_ack_send"};
+    const auto phase = phase_.load();
+    const auto phase_started = phase_started_.load();
+    const auto seq = seq_.load();
+    const bool stable = (epoch % 2 == 0 && epoch == epoch_.load(std::memory_order_acquire));
+    Json result = {{"stage", "connection_observer_sample"}, {"role", role_}, {"trace_session_id", session_},
+        {"actor", actor_}, {"seq", seq}, {"phase", names.at(static_cast<std::size_t>(phase))},
+        {"phase_snapshot_stable", stable}, {"sample_monotonic_ms", steady_ms()},
+        {"native_control_capabilities", kNativeControlCapabilities},
+        {"connection_started_monotonic_ms", started_}};
+    if (stable) {
+      result["phase_started_monotonic_ms"] = phase_started;
+      result["phase_elapsed_ms"] = std::max<std::int64_t>(0, steady_ms() - phase_started);
+    }
+    if (include_socket) {
+      // Socket lifetime is guarded separately from service/control locks. The
+      // handler detaches before the HTTP server can close/reuse this descriptor.
+      std::unique_lock lock(socket_mutex_, std::try_to_lock);
+      if (lock.owns_lock() && !detached_) result["transport"] = websocket_transport_diagnostics(socket_);
+      else result["socket_sample_skipped"] = true;
+    }
+    return result;
+  }
+ private:
+  std::mutex socket_mutex_;
+  SocketHandle socket_;
+  bool detached_{false};
+  const std::string session_, actor_, role_;
+  std::int64_t started_{0};
+  std::atomic<std::uint64_t> epoch_{0}, seq_{0};
+  std::atomic<ControlObservationPhase> phase_{ControlObservationPhase::Idle};
+  std::atomic<std::int64_t> phase_started_{0};
+};
+
+class ControlConnectionObserverRegistry {
+ public:
+  std::shared_ptr<ControlConnectionObservation> observe(SocketHandle socket, std::string session,
+      std::string actor, std::string role) {
+    std::lock_guard lock(mutex_);
+    std::erase_if(states_, [](const auto& state) { return state.expired(); });
+    if (states_.size() >= 256) return {};
+    auto state = std::make_shared<ControlConnectionObservation>(socket, std::move(session), std::move(actor), std::move(role));
+    states_.push_back(state);
+    return state;
+  }
+  Json sample() {
+    std::vector<std::shared_ptr<ControlConnectionObservation>> active;
+    {
+      std::unique_lock lock(mutex_, std::try_to_lock);
+      if (!lock.owns_lock()) return Json::array();
+      for (const auto& weak : states_) if (auto state = weak.lock()) active.push_back(std::move(state));
+    }
+    Json result = Json::array();
+    for (const auto& state : active) result.push_back(state->sample());
+    return result;
+  }
+ private:
+  std::mutex mutex_;
+  std::vector<std::weak_ptr<ControlConnectionObservation>> states_;
+};
+
+struct ScopedControlConnectionObservation {
+  std::shared_ptr<ControlConnectionObservation> state;
+  ~ScopedControlConnectionObservation() { if (state) state->detach(); }
+};
+
 class AsyncControlTrace {
  public:
   using Emitter = std::function<void(Json)>;
+  using Observer = std::function<Json()>;
 
-  explicit AsyncControlTrace(Emitter emitter) : emitter_(std::move(emitter)) {
+  explicit AsyncControlTrace(Emitter emitter, Observer observer = {})
+      : emitter_(std::move(emitter)), observer_(std::move(observer)) {
     if (!emitter_) throw std::invalid_argument("control trace emitter is required");
     accepting_.store(true, std::memory_order_release);
     try {
@@ -111,6 +206,7 @@ class AsyncControlTrace {
     std::uint64_t emitted_total = 0;
     std::uint64_t reported_dropped_total = 0;
     std::uint64_t output_error_total = 0;
+    auto last_observed = std::chrono::steady_clock::time_point{};
     try {
       for (;;) {
         Json commands = Json::array();
@@ -132,8 +228,20 @@ class AsyncControlTrace {
         }
 
         const auto command_count = commands.size();
+        Json observations = Json::array();
+        const auto observer_now = std::chrono::steady_clock::now();
+        if (!final && observer_ && observer_now - last_observed >= std::chrono::seconds(1)) {
+          try {
+            observations = observer_();
+            for (auto& observation : observations) {
+              observation["observer_heartbeat_gap_ms"] = last_observed == std::chrono::steady_clock::time_point{}
+                  ? Json(nullptr) : Json(std::chrono::duration_cast<std::chrono::milliseconds>(observer_now - last_observed).count());
+            }
+          } catch (...) { observations = Json::array(); }
+          last_observed = observer_now;
+        }
         const auto dropped_total = dropped_total_.load(std::memory_order_relaxed);
-        if (command_count > 0 || dropped_total != reported_dropped_total || final) {
+        if (command_count > 0 || !observations.empty() || dropped_total != reported_dropped_total || final) {
           try {
             const auto next_emitted_total = emitted_total + command_count;
             emitter_({
@@ -141,6 +249,7 @@ class AsyncControlTrace {
                 {"final", final},
                 {"queue_capacity", kQueueCapacity},
                 {"commands", std::move(commands)},
+                {"observations", std::move(observations)},
                 {"enqueued_total", enqueued_total_.load(std::memory_order_relaxed)},
                 {"emitted_total", next_emitted_total},
                 {"dropped_since_last", dropped_total - reported_dropped_total},
@@ -162,6 +271,7 @@ class AsyncControlTrace {
   }
 
   Emitter emitter_;
+  Observer observer_;
   std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<Json> queue_;
@@ -1982,14 +2092,16 @@ SignalingService::SignalingService(
     }
   }
   if (config_.native_control_trace_commands && !config_.audit_log_path.empty()) {
+    control_connection_observers_ = std::make_shared<ControlConnectionObserverRegistry>();
     native_control_trace_ = std::make_unique<AsyncControlTrace>(
         [this](Json details) {
           audit("cloud_native_control_trace_batch", std::move(details));
-        });
+        }, [registry = control_connection_observers_] { return registry->sample(); });
   }
   audit(
       "signaling_service_started",
       {{"runtime", "cpp"},
+       {"native_control_capabilities", kNativeControlCapabilities},
        {"native_control_trace_commands", config_.native_control_trace_commands},
        {"audit_log_max_bytes", config_.audit_log_max_bytes},
        {"audit_log_files", config_.audit_log_files},
@@ -2055,6 +2167,7 @@ Json SignalingService::health() const {
       {"status", alerts.empty() ? "ok" : "degraded"},
       {"runtime", "cpp"},
       {"service_instance_id", service_instance_id_},
+      {"native_control_capabilities", kNativeControlCapabilities},
       {"alerts", std::move(alerts)},
       {"alert_count", alert_count},
       {"online_vehicles", online_vehicles_.size()},
@@ -2862,20 +2975,29 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
         socket,
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
         "Sec-WebSocket-Accept: " +
-            accept + "\r\nX-Request-ID: " + request_id.value() + "\r\n\r\n");
+            accept + "\r\nX-Request-ID: " + request_id.value() +
+            "\r\nX-Mine-Teleop-Control-Capabilities: " + std::string(kNativeControlCapabilities) + "\r\n\r\n");
     ServerWebSocketConnection connection(socket, config_.max_signaling_payload_bytes);
+    ScopedControlConnectionObservation observation{control_connection_observers_ && (send_only || control_receive_only)
+        ? control_connection_observers_->observe(socket, parts[1], participant,
+            send_only ? "cloud_control_ingress" : "cloud_control_delivery") : nullptr};
+    const auto observe_phase = [&](ControlObservationPhase phase, std::uint64_t seq = 0) {
+      if (observation.state) observation.state->begin(phase, seq);
+    };
     std::uint64_t last_delivery_cursor_sent = 0;
     std::uint64_t last_control_seq_sent = 0;
     auto last_delivery_sent_at = std::chrono::steady_clock::time_point{};
     std::int64_t last_transport_sample_monotonic_ms = 0;
     std::int64_t last_receive_completed_monotonic_ms = 0;
-    const auto socket_connection_started_monotonic_ms = monotonic_now_ms();
+    const auto socket_connection_started_monotonic_ms = observation.state ? observation.state->started() : monotonic_now_ms();
     while (true) {
       Json pending = Json::array();
       const auto loop_mutex_wait_started = monotonic_now_ms();
       std::int64_t loop_mutex_acquired = 0;
       try {
+        observe_phase(ControlObservationPhase::LoopMutex);
         std::lock_guard lock(mutex_);
+        observe_phase(ControlObservationPhase::LoopCheck);
         loop_mutex_acquired = monotonic_now_ms();
         cleanup_expired_connections(now_ms());
         const auto& session = require_participant(parts[1], participant);
@@ -2923,6 +3045,7 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
           const auto send_started_at_utc_ms = now_ms();
           const auto send_started_monotonic_ms = monotonic_now_ms();
           try {
+            observe_phase(ControlObservationPhase::DeliverySend, last_control_seq_sent);
             connection.send_json(
                 {{"event", "signaling_messages"},
                  {"delivery_cursor", delivery_cursor},
@@ -2972,6 +3095,7 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       WebSocketReceiveResult received;
       const auto receive_started_monotonic_ms = monotonic_now_ms();
       try {
+        observe_phase(ControlObservationPhase::Receive);
         received = connection.receive_json(
             std::chrono::milliseconds(send_only ? 10 : 50));
       } catch (const std::exception& error) {
@@ -3095,6 +3219,7 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
             acknowledgement_trace["acknowledged"] = acknowledged;
             native_control_trace_->enqueue(std::move(acknowledgement_trace));
           }
+          observe_phase(ControlObservationPhase::DeliveryAck, reported_seq);
           connection.send_json(
               {{"event", "signaling_delivery_acknowledged"},
                {"delivery_cursor", delivery_cursor},
@@ -3110,7 +3235,9 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
         std::int64_t ingress_mutex_acquired = 0;
         std::int64_t authority_check_completed = 0;
         {
+          observe_phase(ControlObservationPhase::IngressMutex, received.message.value("seq", std::uint64_t{0}));
           std::lock_guard lock(mutex_);
+          observe_phase(ControlObservationPhase::IngressCheck);
           ingress_mutex_acquired = monotonic_now_ms();
           cleanup_expired_connections(now_ms());
           const auto& session = require_participant(parts[1], participant);
@@ -3177,6 +3304,7 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
           native_control_trace_->enqueue(std::move(acknowledgement_trace));
         };
         try {
+          observe_phase(ControlObservationPhase::IngressAck);
           connection.send_json(acknowledgement);
         } catch (const std::exception& error) {
           finish_ack_trace(false, error.what());
@@ -3586,7 +3714,8 @@ ServerResponse SignalingService::handle_get(const HttpRequest& request) {
       }
     }
     audit("authorized_vehicles_listed", {{"driver_id", driver_id}, {"vehicle_count", vehicles.size()}});
-    return ServerResponse::json(200, {{"driver_id", driver_id}, {"vehicles", std::move(vehicles)}});
+    return ServerResponse::json(200, {{"driver_id", driver_id}, {"vehicles", std::move(vehicles)},
+        {"native_control_capabilities", kNativeControlCapabilities}});
   }
   if (parts.size() == 3 && parts[0] == "signaling" && parts[2] == "messages") {
     const auto recipient = query_value(request, "recipient");
@@ -4382,6 +4511,33 @@ DriverConfig load_driver_config(const std::string& path) {
   return config;
 }
 
+Json DriverConsoleRuntime::native_control_observation() {
+  auto observation = native_control_observation_state_->sample(false);
+  {
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    observation["scope_snapshot_available"] = lock.owns_lock();
+    if (lock.owns_lock()) {
+      observation["trace_session_id"] = session_id_;
+      observation["session_generation"] = control_session_generation_;
+    }
+  }
+  observation["commands_sent_total"] = native_control_commands_sent_.load();
+  observation["last_sent_monotonic_ms"] = native_control_last_sent_monotonic_ms_.load();
+  {
+    std::unique_lock lock(control_signaling_websocket_mutex_, std::try_to_lock);
+    observation["control_socket_lock_busy"] = !lock.owns_lock();
+    if (lock.owns_lock()) {
+      observation["last_ack_seq"] = control_signaling_last_ack_seq_;
+      observation["ack_stall_age_ms"] = control_signaling_ack_window_.stall_age_ms(monotonic_now_ms());
+      observation["unacknowledged_count"] = control_signaling_ack_window_.pending_count();
+      observation["ack_braking_wait"] = control_signaling_ack_recovery_.waiting();
+      observation["cloud_capabilities_verified"] = control_signaling_capabilities_verified_;
+      if (control_signaling_websocket_) observation["transport"] = control_signaling_websocket_->transport_diagnostics();
+    }
+  }
+  return observation;
+}
+
 DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehicle_id, std::string password)
     : config_(std::move(config)),
       driver_id_(config_.driver_id),
@@ -4397,12 +4553,15 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
     throw std::invalid_argument("public signaling URL must use HTTPS or WSS; HTTP/WS is allowed only on loopback");
   }
   if (config_.control_trace_commands && !config_.browser_event_log_path.empty()) {
+    native_control_observation_state_ = std::make_shared<ControlConnectionObservation>();
     native_control_trace_ = std::make_unique<AsyncControlTrace>(
         [this](Json details) {
           std::string trace_session_id;
           const auto& commands = details["commands"];
           if (commands.is_array() && !commands.empty()) {
             trace_session_id = commands.front().value("trace_session_id", "");
+          } else if (details.contains("observations") && !details.at("observations").empty()) {
+            trace_session_id = details.at("observations").front().value("trace_session_id", "");
           }
           const auto timestamp_ms = now_ms();
           append_driver_log_record({
@@ -4414,7 +4573,7 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
               {"session_id", trace_session_id},
               {"details", std::move(details)},
           });
-        });
+        }, [this] { return Json::array({native_control_observation()}); });
   }
   native_control_sender_ = std::jthread(
       [this](std::stop_token stop_token) { native_control_sender_loop(stop_token); });
@@ -4485,7 +4644,7 @@ void DriverConsoleRuntime::close_signaling_websocket() {
 bool DriverConsoleRuntime::connect_control_signaling_websocket(
     std::string_view session_id,
     std::string_view token,
-    std::uint64_t expected_generation) {
+    std::uint64_t expected_generation, bool estop_only) {
   const auto url = signaling_websocket_url(
                        config_.signaling_url,
                        session_id,
@@ -4507,16 +4666,23 @@ bool DriverConsoleRuntime::connect_control_signaling_websocket(
   if (control_signaling_websocket_ && control_signaling_websocket_->connected() &&
       control_signaling_websocket_->url() == url &&
       control_signaling_websocket_session_id_ == session_id) {
+    if (!estop_only && !control_signaling_capabilities_verified_)
+      throw std::runtime_error("云端原生控制能力不匹配：缺少恢复反馈或 ACK 制动等待支持，请更新云端包");
     return true;
   }
   auto next = std::make_unique<WebSocketClient>(
       std::chrono::seconds(1), config_.resolve_entries, config_.ca_bundle);
   next->connect(url, {{"X-Mine-Teleop-Driver-Token", std::string(token)}});
+  const bool capabilities_verified = next->response_header("x-mine-teleop-control-capabilities") == kNativeControlCapabilities;
+  if (!estop_only && !capabilities_verified)
+    throw std::runtime_error("云端原生控制能力不匹配：缺少恢复反馈或 ACK 制动等待支持，请更新云端包");
   if (control_signaling_websocket_) control_signaling_websocket_->close();
   control_signaling_websocket_ = std::move(next);
   control_signaling_websocket_session_id_ = std::string(session_id);
+  control_signaling_capabilities_verified_ = capabilities_verified;
   control_signaling_last_ack_seq_ = 0;
   control_signaling_ack_window_.reset();
+  control_signaling_ack_recovery_.connection_reopened(monotonic_now_ms());
   control_signaling_next_connect_monotonic_ms_ = 0;
   return true;
 }
@@ -4526,8 +4692,10 @@ void DriverConsoleRuntime::close_control_signaling_websocket() {
   if (control_signaling_websocket_) control_signaling_websocket_->close();
   control_signaling_websocket_.reset();
   control_signaling_websocket_session_id_.clear();
+  control_signaling_capabilities_verified_ = false;
   control_signaling_last_ack_seq_ = 0;
   control_signaling_ack_window_.reset();
+  control_signaling_ack_recovery_.reset();
   control_signaling_next_connect_monotonic_ms_ = 0;
   control_signaling_reconnect_delay_ms_ = 100;
 }
@@ -4556,22 +4724,28 @@ void DriverConsoleRuntime::note_native_control_failure(
     std::string_view session_id,
     std::uint64_t generation) {
   std::lock_guard update_lock(native_control_update_mutex_);
+  int recovery_timeout_ms = 5000;
   {
     std::lock_guard lock(mutex_);
     if (session_id_ != session_id || control_session_generation_ != generation) {
       return;
     }
+    recovery_timeout_ms = control_recovery_timeout_ms_;
   }
   ++native_control_send_failures_;
   {
     std::lock_guard lock(native_control_status_mutex_);
     native_control_last_error_ = std::move(error);
   }
-  native_control_intent_.invalidate();
+  const auto frozen_gear = native_control_intent_.sample(monotonic_now_ms()).intent.gear;
+  native_control_intent_.invalidate(true);
   std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
+  if (!control_signaling_ack_recovery_.waiting()) control_signaling_recovery_gear_ = frozen_gear;
+  control_signaling_ack_recovery_.enter(monotonic_now_ms(), recovery_timeout_ms, control_signaling_last_ack_seq_);
   if (control_signaling_websocket_) control_signaling_websocket_->close();
   control_signaling_websocket_.reset();
   control_signaling_websocket_session_id_.clear();
+  control_signaling_capabilities_verified_ = false;
   control_signaling_last_ack_seq_ = 0;
   control_signaling_ack_window_.reset();
   const auto now_monotonic_ms = monotonic_now_ms();
@@ -4582,6 +4756,11 @@ void DriverConsoleRuntime::note_native_control_failure(
 }
 
 bool DriverConsoleRuntime::send_native_control_sample() {
+  if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::Sample);
+  struct FinishPhase {
+    std::shared_ptr<ControlConnectionObservation> state;
+    ~FinishPhase() { if (state) state->begin(ControlObservationPhase::Idle); }
+  } finish_phase{native_control_observation_state_};
   const auto sample_started_monotonic_ms = monotonic_now_ms();
   const auto sample_started_at_utc_ms = clock_.now_ms();
   const auto scheduled_at_monotonic_ms =
@@ -4596,6 +4775,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
   std::int64_t control_token_expires_at_ms = 0;
   std::uint64_t sequence = 0;
   std::uint64_t generation = 0;
+  int recovery_timeout_ms = 5000;
   Json trace_record;
   {
     std::lock_guard update_lock(native_control_update_mutex_);
@@ -4618,6 +4798,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       vehicle = vehicle_id_;
       control_token_expires_at_ms = control_token_expires_at_ms_;
       generation = control_session_generation_;
+      recovery_timeout_ms = control_recovery_timeout_ms_;
       sequence = ++control_sequence_;
     }
   }
@@ -4699,10 +4880,11 @@ bool DriverConsoleRuntime::send_native_control_sample() {
 
     const auto connect_started_at_utc_ms = clock_.now_ms();
     const auto connect_started_monotonic_ms = monotonic_now_ms();
+    if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::Connect, sequence);
     if (!connect_control_signaling_websocket(
             session,
             driver_token,
-            generation)) {
+            generation, command.estop)) {
       if (native_control_trace_) {
         trace_record["stage"] = "send_skipped";
         trace_record["reason"] = "session_changed_or_reconnect_backoff";
@@ -4756,6 +4938,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       // schedule depend on a cloud round trip. A delayed ACK pipeline is live
       // while its cumulative sequence advances; packet age remains diagnostic.
       acknowledgement_drain_started_monotonic_ms = monotonic_now_ms();
+      if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::AckDrain);
       for (int drained = 0; drained < 16; ++drained) {
         const auto received =
             control_signaling_websocket_->receive_json(std::chrono::milliseconds(0));
@@ -4844,6 +5027,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
               {"vehicle_feedback_rearm_required", received.message.value("vehicle_control_feedback", Json::object()).value("rearm_required", false)},
               {"seq", acknowledged_seq},
               {"ack_advanced", ack_advanced},
+              {"ack_packet_age_ms", ack_advanced ? Json(control_signaling_ack_window_.last_ack_packet_age_ms()) : Json(nullptr)},
               {"ack_received_at_utc_ms", acknowledgement_received_at_utc_ms},
               {"ack_received_monotonic_ms", acknowledgement_received_monotonic_ms},
               {"cloud_received_at_utc_ms", cloud_received_at_utc_ms},
@@ -4879,7 +5063,48 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       ack_stall_age_ms = control_signaling_ack_window_.stall_age_ms(monotonic_ms);
       unacknowledged_age_ms =
           control_signaling_ack_window_.oldest_age_ms(monotonic_ms);
+      const auto recovery_transition = control_signaling_ack_recovery_.observe(
+          monotonic_ms, control_signaling_ack_window_.pending_count(), ack_stall_age_ms,
+          control_signaling_last_ack_seq_, control_signaling_ack_window_.last_ack_packet_age_ms(), recovery_timeout_ms);
+      if (recovery_transition.entered) control_signaling_recovery_gear_ = command.gear;
+      if (recovery_transition.entered || recovery_transition.recovered) {
+        // Invalidate at both boundaries: neutral refreshes during the wait
+        // cannot arm motion before ACK recovery has actually been confirmed.
+        native_control_intent_.invalidate(true);
+        if (native_control_trace_) native_control_trace_->enqueue({
+            {"stage", recovery_transition.entered ? "ack_braking_wait_entered" : "ack_braking_wait_recovered"},
+            {"trace_session_id", session}, {"seq", sequence}, {"intent_seq", sample.intent.intent_seq},
+            {"event_monotonic_ms", monotonic_ms}, {"ack_stall_age_ms", ack_stall_age_ms},
+            {"last_ack_seq", control_signaling_last_ack_seq_},
+            {"last_ack_packet_age_ms", control_signaling_ack_window_.last_ack_packet_age_ms()},
+            {"recovery_deadline_monotonic_ms", control_signaling_ack_recovery_.deadline()},
+            {"action", recovery_transition.entered ? "withdraw_motion_keep_socket_request_vehicle_braking"
+                : "require_fresh_neutral_keep_session"}});
+      }
+      command.control_link_ready = !control_signaling_ack_recovery_.waiting();
+      if (!command.estop && (control_signaling_ack_recovery_.waiting() || recovery_transition.recovered)) {
+        command.throttle = command.steering = 0.0;
+        command.gear = control_signaling_recovery_gear_;
+        command.operator_active = sample.fresh && command.brake > 0.0;
+        // V7 compatibility: old relays may strip the new cause field, but
+        // input-not-ready still requests the same independent safety brake.
+        if (control_signaling_ack_recovery_.waiting()) command.operator_input_ready = false;
+        payload["intent_fresh"] = sample.fresh;
+        payload["intent_requires_fresh_input"] = true;
+      }
+      payload.update(command.to_json());
+      envelope["payload"] = payload;
       if (native_control_trace_) {
+        trace_record["ack_braking_wait"] = control_signaling_ack_recovery_.waiting();
+        trace_record["ack_recovery_deadline_monotonic_ms"] = control_signaling_ack_recovery_.deadline();
+        trace_record["last_ack_packet_age_ms"] = control_signaling_ack_window_.last_ack_packet_age_ms();
+        trace_record["control_link_ready"] = command.control_link_ready;
+        trace_record["operator_input_ready"] = command.operator_input_ready;
+        trace_record["effective_gear"] = command.gear;
+        trace_record["effective_throttle"] = command.throttle;
+        trace_record["effective_steering"] = command.steering;
+        trace_record["intent_fresh"] = payload.at("intent_fresh");
+        trace_record["intent_requires_fresh_input"] = payload.at("intent_requires_fresh_input");
         trace_record["last_ack_seq"] = control_signaling_last_ack_seq_;
         trace_record["oldest_unacknowledged_seq"] =
             control_signaling_ack_window_.oldest_sequence();
@@ -4891,18 +5116,16 @@ bool DriverConsoleRuntime::send_native_control_sample() {
             detail::NativeControlAcknowledgementWindow::kMaxPendingPackets;
         try {
           auto transport = control_signaling_websocket_->transport_diagnostics(
-              std::chrono::milliseconds(ack_stall_age_ms >= 500 ? 0 : 1000));
+              std::chrono::milliseconds(recovery_transition.entered ? 0 : 1000));
           if (!transport.is_null()) trace_record["transport"] = std::move(transport);
         } catch (const std::exception&) {
           trace_record["transport_sample_failed"] = true;
         }
       }
+      if (!command.estop && recovery_transition.reconnect_due)
+        throw std::runtime_error("native control ACK recovery deadline exceeded");
       if (control_signaling_ack_window_.pending_count() > 0) {
-        if (ack_stall_age_ms >= 500) {
-          throw std::runtime_error(
-              "native control signaling acknowledgements stalled for 500ms");
-        }
-        if (control_signaling_ack_window_.pending_count() >=
+        if (!command.estop && control_signaling_ack_window_.pending_count() >=
             detail::NativeControlAcknowledgementWindow::kMaxPendingPackets) {
           throw std::runtime_error(
               "native control acknowledgement backlog exceeded 128 packets");
@@ -4911,6 +5134,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       last_ack_seq = control_signaling_last_ack_seq_;
       send_started_at_utc_ms = clock_.now_ms();
       send_started_monotonic_ms = monotonic_now_ms();
+      if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::Send);
       control_signaling_websocket_->send_json(
           envelope,
           std::chrono::milliseconds(20));
@@ -4972,6 +5196,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
     }
     return true;
   } catch (const std::exception& error) {
+    if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::Failure);
     if (native_control_trace_) {
       trace_record["stage"] = "send_failed";
       // Observe the socket before failure handling closes it, without waiting
@@ -5306,6 +5531,7 @@ Json DriverConsoleRuntime::fetch_authorized_vehicles(
       {"token_expires_at_utc_ms", expires_at_ms},
       {"service_instance_id", service_instance_id},
       {"vehicles", listed},
+      {"native_control_capabilities", response.value("native_control_capabilities", "")},
   };
 }
 
@@ -5480,7 +5706,10 @@ Json DriverConsoleRuntime::connect_locked(std::string_view requested_vehicle_id,
   if (target.empty()) throw std::invalid_argument("vehicle_id is required");
 
   auto validate_target = [&] {
-    const auto available = vehicles().at("vehicles");
+    const auto catalog = vehicles();
+    if (catalog.value("native_control_capabilities", "") != kNativeControlCapabilities)
+      throw std::runtime_error("云端原生控制能力不匹配：缺少恢复反馈或 ACK 制动等待支持，请更新云端包");
+    const auto available = catalog.at("vehicles");
     const auto selected = std::find_if(available.begin(), available.end(), [&](const auto& value) {
       return value.value("vehicle_id", "") == target;
     });
@@ -6347,6 +6576,10 @@ Json DriverConsoleRuntime::status() {
   std::int64_t native_control_ack_stall_age_ms = 0;
   std::size_t native_control_unacknowledged_count = 0;
   int native_control_reconnect_delay_ms = 0;
+  bool native_control_ack_braking_wait = false;
+  bool native_control_capabilities_verified = false;
+  std::int64_t native_control_ack_recovery_deadline_ms = 0;
+  std::int64_t native_control_last_ack_packet_age_ms = 0;
   {
     std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
     native_control_websocket_connected =
@@ -6360,6 +6593,10 @@ Json DriverConsoleRuntime::status() {
         control_signaling_ack_window_.stall_age_ms(monotonic_now_ms());
     native_control_unacknowledged_count = control_signaling_ack_window_.pending_count();
     native_control_reconnect_delay_ms = control_signaling_reconnect_delay_ms_;
+    native_control_ack_braking_wait = control_signaling_ack_recovery_.waiting();
+    native_control_capabilities_verified = control_signaling_capabilities_verified_;
+    native_control_ack_recovery_deadline_ms = control_signaling_ack_recovery_.deadline();
+    native_control_last_ack_packet_age_ms = control_signaling_ack_window_.last_ack_packet_age_ms();
   }
   const auto native_sample = native_control_intent_.sample(monotonic_now_ms());
   std::string native_control_last_error;
@@ -6393,6 +6630,7 @@ Json DriverConsoleRuntime::status() {
       {"pending_signaling_deliveries", pending_deliveries},
       {"native_control",
        {{"transport", "native_signaling_websocket"},
+        {"cloud_capabilities_verified", native_control_capabilities_verified},
         {"session_generation", control_session_generation_},
         {"rate_hz", config_.rate_hz},
         {"intent_lease_ms", native_control_intent_.lease_ms()},
@@ -6422,6 +6660,9 @@ Json DriverConsoleRuntime::status() {
         {"last_ack_seq", native_control_last_ack_seq},
         {"unacknowledged_age_ms", native_control_unacknowledged_age_ms},
         {"ack_stall_age_ms", native_control_ack_stall_age_ms},
+        {"ack_braking_wait", native_control_ack_braking_wait},
+        {"ack_recovery_deadline_monotonic_ms", native_control_ack_recovery_deadline_ms},
+        {"last_ack_packet_age_ms", native_control_last_ack_packet_age_ms},
         {"unacknowledged_count", native_control_unacknowledged_count},
         {"unacknowledged_limit", detail::NativeControlAcknowledgementWindow::kMaxPendingPackets},
         {"last_ack_received_at_utc_ms",

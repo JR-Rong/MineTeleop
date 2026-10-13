@@ -1486,6 +1486,10 @@ struct VehicleMediaRuntime::Impl {
       const auto control_mutex_acquired_monotonic_ms = steady_now_ms();
       const auto control_mutex_acquired_at_utc_ms = signaling.now_ms();
       const auto active_session_id = signaling.session_id();
+      if (command.session_id == active_session_id && command.vehicle_id == config.vehicle_id) {
+        last_parsed_control_arrival_ms = callback_entered_at_utc_ms;
+        last_parsed_control_arrival_seq = command.seq;
+      }
       const bool control_log_commands = config.runtime.control_log_commands;
       const auto queue_control_trace = [this,
                                         &command,
@@ -1542,6 +1546,7 @@ struct VehicleMediaRuntime::Impl {
               {"critical_video_ready", command.critical_video_ready},
               {"control_time_sync_ready", command.control_time_sync_ready},
               {"operator_input_ready", command.operator_input_ready},
+              {"control_link_ready", command.control_link_ready},
               {"stale_safe_heartbeat", stale_safe_heartbeat},
               {"delivery_cursor", delivery_cursor},
               {"cloud_queued_at_utc_ms", cloud_queued_at_utc_ms},
@@ -1800,6 +1805,8 @@ struct VehicleMediaRuntime::Impl {
       std::int64_t receive_apply_completed_monotonic_ms = 0;
       try {
         result = control_service->receive_command(command, received_at_ms);
+        last_evaluated_control_seq = command.seq;
+        last_evaluated_control_reason = result.reason;
         receive_apply_completed_at_utc_ms = signaling.now_ms();
         receive_apply_completed_monotonic_ms = steady_now_ms();
       } catch (...) {
@@ -1860,6 +1867,7 @@ struct VehicleMediaRuntime::Impl {
               std::memory_order_relaxed);
         }
         last_control_received_at_ms = received_at_ms;
+        last_accepted_control_seq = command.seq;
         native_control_last_accepted_monotonic_ms =
             control_mutex_acquired_monotonic_ms;
         if (accepted_count == 1 || accepted_count % 100 == 0) {
@@ -1917,6 +1925,7 @@ struct VehicleMediaRuntime::Impl {
                     : "local_full_stop"}});
         }
       }
+      observe_control_hard_stop_locked(received_at_ms);
       if (native_feedback) {
         *native_feedback = {{"session_id", command.session_id}, {"vehicle_id", command.vehicle_id},
                             {"driver_id", command.driver_id}, {"command_seq", command.seq},
@@ -2615,9 +2624,10 @@ struct VehicleMediaRuntime::Impl {
       if (control_service_started && control_service) {
         try {
           control_service->close({
-              cause == ControlRecoveryCause::InputLease ? VehicleStopSource::Watchdog : VehicleStopSource::SoftwareFault,
+              (cause == ControlRecoveryCause::InputLease || cause == ControlRecoveryCause::ControlLink)
+                  ? VehicleStopSource::Watchdog : VehicleStopSource::SoftwareFault,
               cause == ControlRecoveryCause::CriticalVideo ? VehicleStopReason::CriticalCameraFailed
-                  : cause == ControlRecoveryCause::InputLease ? VehicleStopReason::OuterControlTimeout
+                  : (cause == ControlRecoveryCause::InputLease || cause == ControlRecoveryCause::ControlLink) ? VehicleStopReason::OuterControlTimeout
                   : VehicleStopReason::MediaPipelineFailed});
         } catch (const std::exception& error) {
           close_error = error.what();
@@ -2641,8 +2651,7 @@ struct VehicleMediaRuntime::Impl {
         false,
         {{"camera_id", lane ? lane->camera.id : ""},
          {"device", lane ? lane->camera.device : ""},
-         {"recovery_cause", cause == ControlRecoveryCause::CriticalVideo ? "critical_video"
-             : cause == ControlRecoveryCause::InputLease ? "input_lease" : "time_sync"},
+         {"recovery_cause", to_string(cause)},
          {"safety_action", "local_full_stop_control_channel_closed_video_continues"},
          {"captured_frames", lane ? lane->captured.load() : 0},
          {"encoded_frames", lane ? lane->encoded.load() : 0},
@@ -2797,8 +2806,7 @@ struct VehicleMediaRuntime::Impl {
                {"control_snapshot", std::move(control_snapshot)},
                {"soft_brake_request_active", soft_brake_request_active},
                {"soft_brake_applied_this_transition", soft_brake_applied_this_transition},
-               {"recovery_cause", control_recovery_latch->cause_for(signaling.session_id()) == ControlRecoveryCause::CriticalVideo
-                   ? "critical_video" : control_recovery_latch->cause_for(signaling.session_id()) == ControlRecoveryCause::InputLease ? "input_lease" : "time_sync"},
+               {"recovery_cause", to_string(control_recovery_latch->cause_for(signaling.session_id()))},
                {"safety_action", !soft_brake_request_active ? "readiness_observed_control_not_active"
                    : waiting ? "brake_with_session_retained" : "fresh_neutral_input_requested"}});
     }
@@ -2840,6 +2848,7 @@ struct VehicleMediaRuntime::Impl {
       if (control_service_started && control_service) {
         ready = ready && control_service->driver_critical_video_ready();
         if (!control_service->operator_input_ready()) { ready = false; cause = ControlRecoveryCause::InputLease; }
+        if (!control_service->driver_control_link_ready()) { ready = false; cause = ControlRecoveryCause::ControlLink; }
         if (!control_service->driver_time_sync_ready()) { ready = false; cause = ControlRecoveryCause::TimeSynchronization; }
       }
     }
@@ -3040,12 +3049,45 @@ struct VehicleMediaRuntime::Impl {
     }
   }
 
+  // Runs under control_mutex, including receive-triggered watchdog decisions.
+  // Arrival is diagnostic evidence only; rejected packets never renew control.
+  void observe_control_hard_stop_locked(std::int64_t timestamp_ms) noexcept {
+    if (!config.runtime.control_log_commands || !control_service) return;
+    const auto state = control_service->safety_state();
+    const bool hard = state == SafetyState::TimeoutBrake || state == SafetyState::Fault || state == SafetyState::Estop;
+    if (!hard) { last_observed_hard_stop_state.reset(); return; }
+    if (last_observed_hard_stop_state == state) return;
+    last_observed_hard_stop_state = state;
+    try {
+      enqueue_control_trace({
+          {"stage", "control_hard_stop_transition"}, {"event_at_utc_ms", timestamp_ms},
+          {"session_id", signaling.session_id()}, {"vehicle_id", config.vehicle_id},
+          {"safety_state", to_string(state)}, {"session_profile_active", control_service->session_control_profile().value("active", false)},
+          {"control_timing", control_service->control_timing(timestamp_ms)},
+          {"last_parsed_control_arrival_seq", last_parsed_control_arrival_seq},
+          {"last_parsed_control_arrival_age_ms", last_parsed_control_arrival_ms
+              ? Json(std::max<std::int64_t>(0, timestamp_ms - *last_parsed_control_arrival_ms)) : Json(nullptr)},
+          {"last_evaluated_control_seq", last_evaluated_control_seq},
+          {"last_evaluated_control_reason", bounded_control_trace_text(last_evaluated_control_reason)},
+          {"last_accepted_control_seq", last_accepted_control_seq},
+          {"last_accepted_control_age_ms", last_control_received_at_ms.load() > 0
+              ? Json(std::max<std::int64_t>(0, timestamp_ms - last_control_received_at_ms.load())) : Json(nullptr)},
+          {"control_status_seq", control_status_seq},
+          {"accepted_commands_total", accepted_control_commands.load()},
+          {"rejected_commands_total", rejected_control_commands.load()},
+          {"native_wss_last_message_at_utc_ms", native_control_websocket_last_message_at_ms.load()},
+          {"watchdog_ticks_total", native_control_watchdog_ticks_total.load()},
+          {"watchdog_skipped_intervals_total", native_control_watchdog_skipped_intervals_total.load()}});
+    } catch (...) { note_control_trace_drop(); }
+  }
+
   void tick_control_service() {
     std::unique_lock lock(control_mutex);
     if (stop_requested || control_inhibited || !control_service_started || !control_service) return;
     const auto timestamp_ms = signaling.now_ms();
     try {
       control_service->tick(timestamp_ms);
+      observe_control_hard_stop_locked(timestamp_ms);
     } catch (const std::exception& error) {
       emit_diagnostic(
           "vehicle_vcu_runtime_failed",
@@ -4553,6 +4595,12 @@ struct VehicleMediaRuntime::Impl {
   std::uint64_t last_control_rejection_status_seq{0};
   std::string last_vcu_handshake_state;
   std::string last_control_rejection_reason;
+  std::optional<SafetyState> last_observed_hard_stop_state;
+  std::optional<std::int64_t> last_parsed_control_arrival_ms;
+  std::uint64_t last_parsed_control_arrival_seq{0};
+  std::uint64_t last_evaluated_control_seq{0};
+  std::string last_evaluated_control_reason;
+  std::uint64_t last_accepted_control_seq{0};
   std::optional<std::int64_t> last_control_rejection_log_ms;
   std::string last_control_rejection_status_issue_code;
   std::optional<std::int64_t> last_control_rejection_status_ms;

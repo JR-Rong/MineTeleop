@@ -2808,7 +2808,7 @@ void test_idle_zero_heartbeats_do_not_trigger_control_timeout() {
 void test_recovery_braking_never_emits_zero_pressure_on_rejected_commands() {
   using Cause = mine_teleop::ControlRecoveryCause;
   using State = mine_teleop::SafetyState;
-  for (const auto cause : {Cause::CriticalVideo, Cause::TimeSynchronization, Cause::InputLease}) {
+  for (const auto cause : {Cause::CriticalVideo, Cause::TimeSynchronization, Cause::InputLease, Cause::ControlLink}) {
     auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
     auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
     auto* view = adapter.get();
@@ -2886,7 +2886,8 @@ void test_time_and_input_faults_brake_independently_and_recover_without_new_prof
   expect(mine_teleop::neutral_heartbeat_gate(State::TimeoutBrake, true, 50, 300) == Gate::InactiveState &&
       mine_teleop::neutral_heartbeat_gate(State::ControlActive, true, -1, 300) == Gate::NativeGap,
       "braking wait revived a hard stop or untrusted native clock");
-  for (const bool time_fault : {false, true}) {
+  for (const auto cause : {mine_teleop::ControlRecoveryCause::InputLease,
+      mine_teleop::ControlRecoveryCause::TimeSynchronization, mine_teleop::ControlRecoveryCause::ControlLink}) {
     auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
     auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
     auto* view = adapter.get();
@@ -2897,13 +2898,17 @@ void test_time_and_input_faults_brake_independently_and_recover_without_new_prof
     expect(service.receive_session_profile(profile, 0).accepted, "recovery profile rejected");
     expect(service.receive_command(command(1, 0), 0).accepted, "initial motion rejected");
     auto blocked = command(2, 50);
-    blocked.control_time_sync_ready = !time_fault;
-    blocked.operator_input_ready = time_fault;
+    blocked.control_time_sync_ready = cause != mine_teleop::ControlRecoveryCause::TimeSynchronization;
+    blocked.operator_input_ready = cause == mine_teleop::ControlRecoveryCause::TimeSynchronization;
+    blocked.control_link_ready = cause != mine_teleop::ControlRecoveryCause::ControlLink;
     expect(!service.receive_command(blocked, 50).accepted && service.control_braking_wait(), "unready motion was executed");
     expect(view->read_telemetry().throttle_feedback == 0 && view->read_telemetry().brake_feedback == 1,
         "time/input loss did not apply independent braking");
-    expect(service.control_timing(50).at("control_recovery_cause") == (time_fault ? "time_sync" : "input_lease"),
+    expect(service.control_timing(50).at("control_recovery_cause") == mine_teleop::to_string(cause),
         "vehicle feedback cannot distinguish the recoverable braking cause");
+    auto legacy_relay = blocked.to_json(); legacy_relay.erase("control_link_ready");
+    expect(mine_teleop::ControlCommand::from_json(legacy_relay).operator_input_ready == blocked.operator_input_ready,
+        "stripping optional link cause lost the mandatory V7 brake request");
     std::uint64_t seq = 3;
     for (int now = 100; now <= 1000; now += 50) {
       auto neutral = blocked; neutral.seq = seq++; neutral.sent_at_utc_ms = now;

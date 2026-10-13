@@ -23,6 +23,8 @@
 namespace mine_teleop {
 
 class AsyncControlTrace;
+class ControlConnectionObservation;
+class ControlConnectionObserverRegistry;
 class SessionLogBroker;
 class ControllerLogExport;
 
@@ -294,6 +296,7 @@ class SignalingService {
   std::unordered_set<std::string> trusted_proxy_addresses_;
   std::unordered_map<std::string, ApiRateState> api_rate_limits_;
   ApiRateState api_rate_limit_overflow_;
+  std::shared_ptr<ControlConnectionObserverRegistry> control_connection_observers_;
   std::unique_ptr<AsyncControlTrace> native_control_trace_;
   std::unique_ptr<SessionLogBroker> session_logs_;
   std::int64_t api_rate_limit_last_cleanup_ms_{0};
@@ -402,7 +405,7 @@ class DriverConsoleRuntime {
   [[nodiscard]] bool connect_control_signaling_websocket(
       std::string_view session_id,
       std::string_view token,
-      std::uint64_t expected_generation = 0);
+      std::uint64_t expected_generation = 0, bool estop_only = false);
   void close_control_signaling_websocket();
   void reset_native_control_state();
   void native_control_sender_loop(std::stop_token stop_token);
@@ -487,6 +490,8 @@ class DriverConsoleRuntime {
   int critical_camera_stale_brake_ms_{500};
   int control_recovery_timeout_ms_{5000};
   bool control_profile_initialized_{false};
+  [[nodiscard]] Json native_control_observation();
+  std::shared_ptr<ControlConnectionObservation> native_control_observation_state_;
   std::uint64_t last_control_profile_prepared_seq_{0};
   std::atomic<double> service_brake_limit_{0.3};
   std::atomic<double> hard_brake_limit_{1.0};
@@ -496,8 +501,11 @@ class DriverConsoleRuntime {
   std::string signaling_websocket_session_id_;
   std::unique_ptr<WebSocketClient> control_signaling_websocket_;
   std::string control_signaling_websocket_session_id_;
+  bool control_signaling_capabilities_verified_{false};
   std::uint64_t control_signaling_last_ack_seq_{0};
   detail::NativeControlAcknowledgementWindow control_signaling_ack_window_;
+  detail::NativeControlAckRecovery control_signaling_ack_recovery_;
+  std::string control_signaling_recovery_gear_{"N"};
   std::int64_t control_signaling_next_connect_monotonic_ms_{0};
   int control_signaling_reconnect_delay_ms_{100};
   std::uint64_t signaling_delivery_cursor_{0};

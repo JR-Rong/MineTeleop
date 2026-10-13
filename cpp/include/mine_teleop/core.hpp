@@ -80,6 +80,7 @@ struct ControlCommand {
   bool critical_video_ready{true};
   bool control_time_sync_ready{true};
   bool operator_input_ready{true};
+  bool control_link_ready{true};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -306,7 +307,7 @@ enum class SafetyState {
 };
 
 std::string_view to_string(SafetyState state);
-enum class ControlRecoveryCause { CriticalVideo, TimeSynchronization, InputLease };
+enum class ControlRecoveryCause { CriticalVideo, TimeSynchronization, InputLease, ControlLink };
 std::string_view to_string(ControlRecoveryCause cause);
 
 struct DecelerationStage {
@@ -834,6 +835,7 @@ class VehicleControlService {
   [[nodiscard]] bool driver_critical_video_ready() const { return driver_critical_video_ready_; }
   [[nodiscard]] bool driver_time_sync_ready() const { return driver_time_sync_ready_; }
   [[nodiscard]] bool operator_input_ready() const { return operator_input_ready_; }
+  [[nodiscard]] bool driver_control_link_ready() const { return driver_control_link_ready_; }
   [[nodiscard]] std::pair<int, int> recovery_timing() const;
   [[nodiscard]] const std::deque<Json>& telemetry_history() const { return telemetry_history_; }
   [[nodiscard]] Json summary() const;
@@ -891,6 +893,7 @@ class VehicleControlService {
   bool driver_critical_video_ready_{true};
   bool driver_time_sync_ready_{true};
   bool operator_input_ready_{true};
+  bool driver_control_link_ready_{true};
   bool started_{false};
 };
 

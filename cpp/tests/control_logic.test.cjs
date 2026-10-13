@@ -1109,7 +1109,7 @@ test('zero maximum brake pressure disables analog, service, and hard brake scala
 });
 
 test('recoverable braking banner uses vehicle feedback and identifies the cause', () => {
-  for (const [cause, text] of [['critical_video', /关键视频/], ['time_sync', /时间同步/], ['input_lease', /刷新过期/]]) {
+  for (const [cause, text] of [['critical_video', /关键视频/], ['time_sync', /时间同步/], ['input_lease', /刷新过期/], ['control_link', /ACK 确认/]]) {
     const telemetry = {safety_state: 'CONTROL_ACTIVE', control_timing: {control_braking_wait: true, control_recovery_cause: cause}};
     const presentation = logic.deriveControlRecoveryPresentation(true, telemetry, true, false);
     assert.equal(presentation.visible, true);

@@ -129,6 +129,21 @@ done
 # authority recovery. Keep transition-only evidence that distinguishes a
 # capture/encoder gap, driver readiness and an actual software brake call.
 recovery_transition_block="$(sed -n '/  void apply_control_recovery_phase(/,/  void pause_control_for_critical_camera(/p' "$media_runtime")"
+hard_transition_block="$(sed -n '/  void observe_control_hard_stop_locked(/,/  void tick_control_service()/p' "$media_runtime")"
+for text in '"control_hard_stop_transition"' '"last_parsed_control_arrival_age_ms"' \
+  '"last_evaluated_control_reason"' '"last_accepted_control_age_ms"' \
+  '"watchdog_skipped_intervals_total"'; do
+  if ! grep -F --quiet "$text" <<<"$hard_transition_block"; then
+    printf 'first hard stop diagnostics missing: %s\n' "$text" >&2
+    exit 1
+  fi
+done
+for block in "$control_message_block" "$control_tick_block"; do
+  if ! grep -F --quiet 'observe_control_hard_stop_locked(' <<<"$block"; then
+    printf 'first hard stop diagnostics missing: receive/tick observation\n' >&2
+    exit 1
+  fi
+done
 for text in \
   '"critical_lanes", std::move(critical_lanes)' \
   '"last_capture_age_ms"' \

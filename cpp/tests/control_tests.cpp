@@ -1843,7 +1843,7 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
       "native sender does not sample intent and snapshot its session generation under one update lock");
 
   const auto connect = send_sample.find(
-      "connect_control_signaling_websocket(\n            session,\n            driver_token,\n            generation)",
+      "connect_control_signaling_websocket(\n            session,\n            driver_token,\n            generation, command.estop)",
       snapshot_scope_end);
   const auto send_revalidation = send_sample.find(
       "if (session_id_ != session || control_token_ != control_token ||\n"
@@ -1867,7 +1867,7 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
       "control_signaling_ack_window_.stall_age_ms(monotonic_ms)",
       acknowledgement_progress);
   const auto acknowledgement_stall = send_sample.find(
-      "native control signaling acknowledgements stalled for 500ms",
+      "native control ACK recovery deadline exceeded",
       oldest_pending_age);
   const auto record_transmitted_packet = send_sample.find(
       "control_signaling_ack_window_.note_sent(", websocket_send);
@@ -1879,7 +1879,8 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
           record_transmitted_packet != std::string::npos &&
           acknowledgement_progress < progress_age &&
           progress_age < acknowledgement_stall &&
-          send_sample.find("if (ack_stall_age_ms >= 500)") != std::string::npos &&
+          send_sample.find("control_signaling_ack_recovery_.observe(") != std::string::npos &&
+          send_sample.find("recovery_transition.reconnect_due") != std::string::npos &&
           oldest_pending_age < acknowledgement_stall &&
           websocket_send < record_transmitted_packet,
       "native ACK timeout is not tied to progress of actually transmitted packets");
@@ -4571,6 +4572,156 @@ void test_websocket_delivery_replay_and_idempotent_acknowledgement() {
   server.stop();
 }
 
+void test_native_control_capability_mismatch_rejects_before_motion() {
+  mine_teleop::SignalingServerConfig config;
+  config.driver_passwords = {{"driver-console-001", "capability-password"}};
+  config.device_tokens = {{"vehicle-001", "capability-device"}};
+  config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
+  auto signaling = std::make_shared<mine_teleop::SignalingService>(config);
+  std::atomic<bool> strip_catalog{true}, strip_upgrade{false};
+  std::atomic<bool> legacy_estop_received{false};
+  std::atomic<int> forbidden_motion{0};
+  std::mutex fixture_socket_mutex;
+  int active_native_socket = -1;
+  mine_teleop::SimpleHttpServer server("127.0.0.1", 0,
+      [&](const auto& request) {
+        auto response = signaling->handle(request);
+        if (strip_catalog.load() && request.path.starts_with("/drivers/") && request.path.ends_with("/vehicles") && response.status == 200) {
+          auto body = mine_teleop::Json::parse(response.body); body.erase("native_control_capabilities"); response.body = body.dump();
+        }
+        return response;
+      }, 8 * 1024 * 1024,
+      [&](int socket, const auto& request) {
+        if (!strip_upgrade.load() || !request.query.contains("send_only")) {
+          if (!request.query.contains("send_only")) return signaling->handle_websocket(socket, request);
+          { std::lock_guard lock(fixture_socket_mutex); active_native_socket = socket; }
+          const auto handled = signaling->handle_websocket(socket, request);
+          { std::lock_guard lock(fixture_socket_mutex); active_native_socket = -1; }
+          return handled;
+        }
+        raw_send_all(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: " + mine_teleop::websocket_accept_key(request.headers.at("sec-websocket-key")) + "\r\n\r\n");
+        try {
+          mine_teleop::ServerWebSocketConnection connection(socket, 1024 * 1024);
+          const auto packet = connection.receive_json(std::chrono::seconds(1));
+          if (packet.status == mine_teleop::WebSocketReceiveStatus::Message) {
+            if (!packet.message.at("payload").value("estop", false)) ++forbidden_motion;
+            else {
+              // The legacy backend still authenticates the existing session.
+              mine_teleop::HttpRequest post; post.method = "POST";
+              post.path = request.path.substr(0, request.path.size() - 3) + "/messages"; post.target = post.path;
+              auto authenticated = packet.message; authenticated["token"] = request.headers.at("x-mine-teleop-driver-token");
+              post.body = authenticated.dump();
+              legacy_estop_received.store(signaling->handle(post).status == 200);
+            }
+          }
+        } catch (const std::exception&) {}
+        return true;
+      });
+  server.start();
+  const auto base = "http://127.0.0.1:" + std::to_string(server.port());
+  mine_teleop::HttpClient http;
+  static_cast<void>(http.post_json_response(base + "/vehicles/online",
+      {{"vehicle_id", "vehicle-001"}, {"device_token", "capability-device"}, {"connection_id", "capability-vehicle"}}));
+  mine_teleop::DriverConfig driver_config; driver_config.driver_id = "driver-console-001"; driver_config.signaling_url = base;
+  allow_qemu_test_scheduler_time_sync(driver_config);
+  mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "capability-password");
+  expect_throws([&] { static_cast<void>(driver.connect("vehicle-001")); }, "old HTTP backend silently admitted control");
+  expect(!driver.status().value("connected", true) && signaling->health().at("active_sessions") == 0,
+      "HTTP capability failure created or retained vehicle authority");
+  strip_catalog.store(false); strip_upgrade.store(true);
+  expect_throws([&] { static_cast<void>(driver.connect("vehicle-001")); }, "different legacy WSS backend silently admitted control");
+  expect(forbidden_motion.load() == 0 && !driver.status().value("connected", true),
+      "native capability failure transmitted an ordinary command");
+  strip_upgrade.store(false);
+  const auto connected = driver.connect("vehicle-001");
+  expect(connected.value("connected", false), "compatible cloud could not reconnect after capability rejection");
+  strip_upgrade.store(true);
+  { std::lock_guard lock(fixture_socket_mutex);
+    expect(active_native_socket >= 0, "native capability fixture has no live socket");
+    ::shutdown(active_native_socket, SHUT_RDWR);
+  }
+  expect(driver.update_control_intent({{"session_id", connected.at("session_id")},
+      {"session_generation", connected.at("control_session_generation")}, {"ui_instance_id", "capability-estop-ui"},
+      {"intent_seq", 1}, {"gear", "N"}, {"throttle", 0}, {"steering", 0}, {"brake", 0}, {"estop", true}}).value("accepted", false),
+      "capability mismatch blocked local sticky ESTOP");
+  const auto estop_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!legacy_estop_received.load() && std::chrono::steady_clock::now() < estop_deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  expect(legacy_estop_received.load() && forbidden_motion.load() == 0,
+      "legacy capability backend blocked authenticated ESTOP or admitted ordinary motion");
+  static_cast<void>(driver.disconnect("capability_test_complete"));
+  server.stop();
+}
+
+void test_independent_cloud_observer_records_blocked_receive_and_mutex() {
+  for (const bool block_mutex : {false, true}) {
+    const auto root = std::filesystem::temp_directory_path() / ("mine-teleop-independent-observer-" + mine_teleop::random_token(6));
+    std::filesystem::create_directories(root);
+    mine_teleop::SignalingServerConfig config;
+    config.driver_passwords = {{"driver-console-001", "observer-password"}, {"other-driver", "other-password"}};
+    config.device_tokens = {{"vehicle-001", "observer-device"}};
+    config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
+    config.audit_log_path = (root / "audit.jsonl").string(); config.native_control_trace_commands = true;
+    config.connection_reaper_interval_ms = 50;
+    static thread_local bool slow_audit_here = false;
+    std::atomic<bool> audit_entered{false};
+    auto signaling = std::make_shared<mine_teleop::SignalingService>(config, [&] {
+      if (slow_audit_here && !audit_entered.exchange(true)) std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+      return mine_teleop::now_ms();
+    });
+    mine_teleop::SimpleHttpServer server("127.0.0.1", 0,
+        [signaling](const auto& request) { return signaling->handle(request); }, 8 * 1024 * 1024,
+        [signaling](int socket, const auto& request) { return signaling->handle_websocket(socket, request); });
+    server.start();
+    const auto base = "http://127.0.0.1:" + std::to_string(server.port()); mine_teleop::HttpClient http;
+    static_cast<void>(http.post_json_response(base + "/vehicles/online", {{"vehicle_id", "vehicle-001"},
+        {"device_token", "observer-device"}, {"connection_id", "observer-vehicle"}}));
+    const auto login = http.post_json_response(base + "/auth/driver_login", {{"driver_id", "driver-console-001"}, {"password", "observer-password"}});
+    const auto session = http.post_json_response(base + "/sessions", {{"driver_id", "driver-console-001"},
+        {"vehicle_id", "vehicle-001"}, {"token", login.at("token")}});
+    const auto session_id = session.at("session_id").get<std::string>();
+    const int socket = raw_websocket_connect(server.port(), "/signaling/" + session_id + "/ws?participant=driver-console-001&send_only=1",
+        nullptr, "X-Mine-Teleop-Driver-Token: " + login.at("token").get<std::string>() + "\r\n");
+    mine_teleop::ControlCommand command; command.vehicle_id = "vehicle-001"; command.driver_id = "driver-console-001";
+    command.session_id = session_id; command.seq = 1; command.sent_at_utc_ms = mine_teleop::now_ms(); command.control_token = session.at("control_token");
+    auto envelope = command.to_json(); envelope["sender"] = command.driver_id; envelope["recipient"] = command.vehicle_id;
+    envelope["payload"] = command.to_json();
+    const auto frame = raw_masked_websocket_frame(0x81U, envelope.dump());
+    std::jthread slow_request;
+    if (block_mutex) {
+      slow_request = std::jthread([&] {
+        slow_audit_here = true;
+        mine_teleop::HttpRequest request; request.method = "POST"; request.path = request.target = "/auth/driver_login";
+        request.body = mine_teleop::Json{{"driver_id", "other-driver"}, {"password", "other-password"}}.dump();
+        static_cast<void>(signaling->handle(request)); slow_audit_here = false;
+      });
+      const auto entered_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      while (!audit_entered.load() && std::chrono::steady_clock::now() < entered_deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      expect(audit_entered.load(), "software mutex fixture never blocked");
+      raw_send_all(socket, frame);
+    } else raw_send_all(socket, std::string_view(frame).substr(0, 2));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    bool observed = false;
+    std::ifstream input(config.audit_log_path); std::string line;
+    while (std::getline(input, line)) {
+      const auto record = mine_teleop::Json::parse(line, nullptr, false);
+      if (record.is_discarded() || record.value("event", "") != "cloud_native_control_trace_batch") continue;
+      for (const auto& item : record.at("details").value("observations", mine_teleop::Json::array())) {
+        const auto phase = item.value("phase", "");
+        if (item.value("trace_session_id", "") == session_id && item.value("role", "") == "cloud_control_ingress" &&
+            item.value("phase_snapshot_stable", false) && item.value("phase_elapsed_ms", 0) >= 500 &&
+            (block_mutex ? phase == "loop_mutex_wait" || phase == "ingress_mutex_wait" : phase == "receive_frame")) observed = true;
+      }
+    }
+    if (!block_mutex) raw_send_all(socket, std::string_view(frame).substr(2));
+    if (slow_request.joinable()) slow_request.join();
+    static_cast<void>(raw_receive_websocket_json(socket)); ::close(socket);
+    server.stop(); signaling.reset(); std::filesystem::remove_all(root);
+    expect(observed, "independent observer disappeared while the receive handler or service mutex was blocked");
+  }
+}
+
 void test_websocket_client_preserves_partial_ack_across_polls() {
   for (const auto& [payload_size, prefix_size] :
        std::vector<std::pair<std::size_t, std::size_t>>{{20, 2}, {200, 2}, {200, 3}, {70000, 9}, {70000, 20}, {21, 2}}) {
@@ -4584,7 +4735,8 @@ void test_websocket_client_preserves_partial_ack_across_polls() {
         8 * 1024 * 1024,
         [=](int socket, const auto& request) {
           raw_send_all(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-              "Sec-WebSocket-Accept: " + mine_teleop::websocket_accept_key(request.headers.at("sec-websocket-key")) + "\r\n\r\n");
+              "Sec-WebSocket-Accept: " + mine_teleop::websocket_accept_key(request.headers.at("sec-websocket-key")) +
+              "\r\nX-Mine-Teleop-Control-Capabilities: " + std::string(mine_teleop::kNativeControlCapabilities) + "\r\n\r\n");
           const auto payload = acknowledgement.dump();
           std::string frame(1, '\x81');
           if (payload.size() < 126) frame.push_back(static_cast<char>(payload.size()));
@@ -4692,11 +4844,12 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   auto signaling = std::make_shared<mine_teleop::SignalingService>(signaling_config);
   auto connections = std::make_shared<std::atomic<int>>(0);
   auto drop_acknowledgements = std::make_shared<std::atomic<bool>>(false);
+  auto acknowledgement_delay_ms = std::make_shared<std::atomic<int>>(600);
   mine_teleop::SimpleHttpServer server(
       "127.0.0.1", 0,
       [signaling](const auto& request) { return signaling->handle(request); },
       8 * 1024 * 1024,
-      [signaling, connections, drop_acknowledgements](int socket, const auto& request) {
+      [signaling, connections, drop_acknowledgements, acknowledgement_delay_ms](int socket, const auto& request) {
         if (!request.query.contains("send_only")) {
           return signaling->handle_websocket(socket, request);
         }
@@ -4704,7 +4857,8 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
         if (key == request.headers.end()) return false;
         raw_send_all(socket,
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-            "Sec-WebSocket-Accept: " + mine_teleop::websocket_accept_key(key->second) + "\r\n\r\n");
+            "Sec-WebSocket-Accept: " + mine_teleop::websocket_accept_key(key->second) +
+            "\r\nX-Mine-Teleop-Control-Capabilities: " + std::string(mine_teleop::kNativeControlCapabilities) + "\r\n\r\n");
         ++*connections;
         mine_teleop::ServerWebSocketConnection connection(socket, 512 * 1024);
         std::deque<std::pair<std::chrono::steady_clock::time_point, mine_teleop::Json>> pending;
@@ -4729,7 +4883,7 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
               }
               // Warm up before the first-ACK deadline, then impose packet
               // latency directly instead of relying on a growing queue.
-              const auto delay = std::chrono::milliseconds(first_packet ? 350 : 600);
+              const auto delay = std::chrono::milliseconds(first_packet ? 350 : acknowledgement_delay_ms->load());
               first_packet = false;
               pending.emplace_back(
                   std::chrono::steady_clock::now() + delay,
@@ -4749,9 +4903,9 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   server.start();
   const auto base = "http://127.0.0.1:" + std::to_string(server.port());
   mine_teleop::HttpClient http;
-  static_cast<void>(http.post_json_response(base + "/vehicles/online",
+  const auto online = http.post_json_response(base + "/vehicles/online",
       {{"vehicle_id", "vehicle-001"}, {"device_token", "vehicle-secret-1"},
-       {"connection_id", "delayed-ack-vehicle"}}));
+       {"connection_id", "delayed-ack-vehicle"}});
   mine_teleop::DriverConfig driver_config;
   driver_config.driver_id = "driver-console-001";
   driver_config.signaling_url = base;
@@ -4760,14 +4914,64 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   allow_qemu_test_scheduler_time_sync(driver_config);
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
   const auto connected = driver.connect("vehicle-001");
-  static_cast<void>(driver.update_control_intent(
-      {{"session_id", connected.at("session_id")},
+  mine_teleop::SessionControlProfile profile;
+  profile.target_speed_kph = 2; profile.max_motor_torque_nm = 80;
+  profile.max_brake_pressure_bar = 80; profile.service_brake_pressure_bar = 20; profile.hard_brake_pressure_bar = 60;
+  const auto profile_request = mine_teleop::SessionControlProfileRequest::from_json(
+      driver.prepare_control_profile(profile.to_json()).at("request"));
+  auto vehicle_config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  expect(vehicle_config.control.control_timeout_ms == 800, "ACK fixture changed the vehicle hard watchdog");
+  auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>(); auto* vehicle = adapter.get();
+  mine_teleop::VehicleControlService service(vehicle_config, "driver-console-001", connected.at("session_id"),
+      profile_request.control_token, std::move(adapter), 100);
+  service.start(profile_request.sent_at_utc_ms);
+  expect(service.receive_session_profile(profile_request, profile_request.sent_at_utc_ms).accepted, "ACK recovery profile rejected");
+  mine_teleop::WebSocketClient receiver;
+  receiver.connect(mine_teleop::signaling_websocket_url(base, connected.at("session_id").get<std::string>(), "vehicle-001",
+      std::to_string(online.at("connection_generation").get<std::uint64_t>())) + "&types=control_command",
+      {{"X-Mine-Teleop-Device-Token", "vehicle-secret-1"}});
+  bool vehicle_link_wait_seen = false;
+  std::string last_vehicle_reason;
+  std::uint64_t last_vehicle_seq = 0;
+  const auto process_vehicle = [&] {
+    const auto received = receiver.receive_json(std::chrono::milliseconds(0));
+    if (received.status != mine_teleop::WebSocketReceiveStatus::Message || received.message.value("event", "") != "signaling_messages") return;
+    for (const auto& message : received.message.at("messages")) {
+      const auto& payload = message.at("payload");
+      auto command = mine_teleop::ControlCommand::from_json(payload);
+      if (command.seq > last_vehicle_seq) {
+        const auto now = mine_teleop::now_ms();
+        const auto applied = service.receive_command(command, now);
+        last_vehicle_reason = applied.reason + ":age=" + std::to_string(now - command.sent_at_utc_ms) +
+            ":timing=" + service.control_timing(now).dump();
+        last_vehicle_seq = command.seq;
+        if (!command.control_link_ready) {
+          expect(command.throttle == 0 && command.steering == 0 && !command.operator_input_ready,
+              "ACK wait retained nonzero motion or input readiness");
+          if (applied.accepted) {
+            expect(service.control_braking_wait() && vehicle->read_telemetry().brake_feedback == 1,
+                "ACK wait failed to apply independent vehicle braking: " + last_vehicle_reason);
+            vehicle_link_wait_seen = true;
+          }
+        } else if (vehicle_link_wait_seen && service.control_braking_wait() && command.operator_input_ready)
+          service.set_control_braking_wait(false, now);
+      }
+      receiver.send_json({{"event", "signaling_delivery_ack"}, {"delivery_cursor", received.message.at("delivery_cursor")},
+          {"trace_session_id", connected.at("session_id")}, {"seq", command.seq}, {"intent_seq", payload.at("intent_seq")}});
+    }
+  };
+  mine_teleop::Json input = {{"session_id", connected.at("session_id")},
        {"session_generation", connected.at("control_session_generation")},
        {"ui_instance_id", "delayed-ack-test"}, {"intent_seq", 1},
-       {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0}}));
+       {"gear", "D"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0}};
+  expect(driver.update_control_intent(input).value("accepted", false), "ACK fixture neutral rejected");
+  input["intent_seq"] = 2; input["throttle"] = 0.2;
+  expect(driver.update_control_intent(input).value("accepted", false), "ACK fixture held motion rejected");
   std::int64_t oldest_age = 0;
   const auto healthy_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (std::chrono::steady_clock::now() < healthy_deadline) {
+    static_cast<void>(driver.update_control_intent(input));
+    process_vehicle();
     const auto native = driver.status().at("native_control");
     expect(native.value("send_failures_total", 0U) == 0,
            "advancing delayed ACKs caused the native driver to reconnect: " + native.dump());
@@ -4784,19 +4988,70 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   bool stalled = false;
   const auto stalled_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (std::chrono::steady_clock::now() < stalled_deadline) {
+    static_cast<void>(driver.update_control_intent(input));
+    process_vehicle();
     const auto native = driver.status().at("native_control");
-    if (native.value("send_failures_total", 0U) > 0) {
-      expect(native.value("last_error", "") ==
-                 "native control signaling acknowledgements stalled for 500ms" &&
+    if (native.value("ack_braking_wait", false) && vehicle_link_wait_seen) {
+      expect(native.value("send_failures_total", 0U) == 0 && native.value("websocket_connected", false) && connections->load() == 1 &&
                  native.value("requires_fresh_input", false) &&
-                 native.value("reconnect_delay_ms", 0) >= 100,
-             "real ACK loss did not retain the 500ms failure, input invalidation, and backoff");
+                 service.session_control_profile().at("active").get<bool>(),
+             "500ms ACK loss closed a recoverable socket or lost vehicle authority");
       stalled = true;
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  expect(stalled, "native control remained connected after ACK progress stopped");
+  expect(stalled, "ACK stall did not start a same-session vehicle braking wait: " + last_vehicle_reason);
+  acknowledgement_delay_ms->store(0);
+  drop_acknowledgements->store(false);
+  bool recovered = false;
+  const auto recovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (std::chrono::steady_clock::now() < recovery_deadline) {
+    static_cast<void>(driver.update_control_intent(input));
+    process_vehicle();
+    const auto native = driver.status().at("native_control");
+    expect(native.value("send_failures_total", 0U) == 0 && connections->load() == 1 &&
+        service.session_control_profile().at("active").get<bool>(), "short ACK loss caused a reconnect or hard vehicle stop");
+    if (!native.value("ack_braking_wait", true)) { recovered = true; break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  expect(recovered, "recent ACK progress did not recover the original socket");
+  auto old_motion = input;
+  expect(!driver.update_control_intent(old_motion).value("accepted", true), "ACK recovery resurrected motion without fresh neutral");
+  input["intent_seq"] = 3; input["throttle"] = 0.0;
+  expect(driver.update_control_intent(input).value("accepted", false), "post-recovery neutral rejected");
+  const auto neutral_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+  while (std::chrono::steady_clock::now() < neutral_deadline) {
+    static_cast<void>(driver.update_control_intent(input)); process_vehicle();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  input["intent_seq"] = 4; input["throttle"] = 0.2;
+  expect(driver.update_control_intent(input).value("accepted", false), "fresh press could not restore input");
+  const auto motion_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (vehicle->read_telemetry().throttle_feedback <= 0 && std::chrono::steady_clock::now() < motion_deadline) {
+    static_cast<void>(driver.update_control_intent(input)); process_vehicle();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  expect(vehicle->read_telemetry().throttle_feedback > 0 &&
+      service.session_control_profile().at("applied_revision") == profile_request.seq && connections->load() == 1,
+      "fresh motion failed to resume with the same confirmed profile and socket");
+  // Continued absence remains bounded; a driver recovery window cannot keep
+  // an unresponsive ACK path alive forever.
+  drop_acknowledgements->store(true);
+  const auto long_stall_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
+  bool bounded_reconnect = false;
+  while (std::chrono::steady_clock::now() < long_stall_deadline) {
+    static_cast<void>(driver.update_control_intent(input)); process_vehicle();
+    const auto native = driver.status().at("native_control");
+    if (native.value("send_failures_total", 0U) > 0) {
+      expect(native.value("last_error", "") == "native control ACK recovery deadline exceeded" && native.value("requires_fresh_input", false),
+          "persistent ACK loss bypassed the bounded braking recovery");
+      bounded_reconnect = true; break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  expect(bounded_reconnect, "persistent ACK loss never reached bounded reconnect");
+  receiver.close(); service.close();
   static_cast<void>(driver.disconnect("delayed_ack_test_complete"));
   server.stop();
 }
@@ -5307,7 +5562,8 @@ void test_mac_runtime_retries_uncertain_websocket_send_without_duplication() {
             socket,
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
             "Sec-WebSocket-Accept: " +
-                mine_teleop::websocket_accept_key(key->second) + "\r\n\r\n");
+                mine_teleop::websocket_accept_key(key->second) +
+                "\r\nX-Mine-Teleop-Control-Capabilities: " + std::string(mine_teleop::kNativeControlCapabilities) + "\r\n\r\n");
         mine_teleop::ServerWebSocketConnection connection(socket, 512 * 1024);
         const auto received = connection.receive_json(std::chrono::seconds(2));
         if (received.status != mine_teleop::WebSocketReceiveStatus::Message) return true;
@@ -6755,6 +7011,8 @@ int main() {
       {"native_control_delayed_ack_progress_and_real_stall",
        test_native_control_delayed_ack_progress_and_real_stall},
       {"websocket_client_preserves_partial_ack_across_polls", test_websocket_client_preserves_partial_ack_across_polls},
+      {"native_control_capability_mismatch_rejects_before_motion", test_native_control_capability_mismatch_rejects_before_motion},
+      {"independent_cloud_observer_records_blocked_receive_and_mutex", test_independent_cloud_observer_records_blocked_receive_and_mutex},
       {"websocket_receive_timing_separates_frame_assembly", test_websocket_receive_timing_separates_frame_assembly},
       {"mac_runtime_retries_uncertain_websocket_send_without_duplication",
        test_mac_runtime_retries_uncertain_websocket_send_without_duplication},

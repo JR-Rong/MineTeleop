@@ -473,6 +473,8 @@ std::string websocket_accept_key(std::string_view client_key) {
   return base64_encode(digest.data(), digest.size());
 }
 
+Json websocket_transport_diagnostics(SocketHandle socket) { return socket_transport_diagnostics(socket); }
+
 std::string signaling_websocket_url(
     std::string_view signaling_url,
     std::string_view session_id,
@@ -624,6 +626,7 @@ struct WebSocketClient::Impl {
   std::filesystem::path ca_bundle;
   curl_socket_t socket{CURL_SOCKET_BAD};
   std::string buffered;
+  std::unordered_map<std::string, std::string> handshake_headers;
   std::int64_t last_transport_sample_monotonic_ms{0};
   std::uint64_t partial_frame_polls{0};
   const std::int64_t connection_started_monotonic_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -863,6 +866,7 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
     throw std::runtime_error("websocket upgrade failed: " + status_line);
   }
   const auto headers = parse_http_headers(response);
+  impl_->handshake_headers = headers;
   const auto upgrade = headers.find("upgrade");
   const auto connection = headers.find("connection");
   const auto accept = headers.find("sec-websocket-accept");
@@ -887,6 +891,12 @@ void WebSocketClient::close() {
 
 bool WebSocketClient::connected() const {
   return impl_ && impl_->curl != nullptr && impl_->socket != CURL_SOCKET_BAD;
+}
+
+std::string WebSocketClient::response_header(std::string_view name) const {
+  if (!impl_) return {};
+  const auto found = impl_->handshake_headers.find(lower(std::string(name)));
+  return found == impl_->handshake_headers.end() ? std::string{} : found->second;
 }
 
 void WebSocketClient::send_json(const Json& value) {

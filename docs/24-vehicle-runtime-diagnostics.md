@@ -256,6 +256,15 @@ peer 可能是 TLS 反向代理，此时云端 TCP_INFO 只覆盖代理到服务
 不表示车端已经收到。结合三个阶段的 seq 和单调耗时判断，参见
 [session-000075 进一步诊断](40-control-wss-delay-diagnostics.md)。
 
+新的 `details.observations` 每秒从既有异步 trace worker 观察连接当前阶段、
+`phase_elapsed_ms`、`observer_heartbeat_gap_ms` 和 TCP 快照；即使接收帧、ACK 写
+或服务互斥锁尚未返回，也能保留阶段证据。驾驶端控制锁被占用时只报告
+`control_socket_lock_busy`，不阻塞控制线程。日志输出自身阻塞也会推迟观察，
+采样缺失不是独立断网证明。`control_hard_stop_transition` 仅在首次观察到硬状态
+时记录最后解析命令/核心校验结果/最后合法应用与 watchdog 计数，区分到达被拒绝
+和无报文；解析不等同合法。新增 ACK 制动等待、三端能力校验和 session-000076
+逐条证据见 [docs/41](41-ack-braking-recovery-and-session76.md)。
+
 ### HTTP 409 与 signaling sequence
 
 服务端 409 响应携带结构化 `issue_code`，车端必须按上表区分“会话已结束”、

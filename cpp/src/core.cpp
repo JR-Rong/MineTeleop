@@ -1021,6 +1021,8 @@ void ControlCommand::validate() const {
   require_finite_range(steering, -1.0, 1.0, "steering");
   require_finite_range(throttle, 0.0, 1.0, "throttle");
   require_finite_range(brake, 0.0, 1.0, "brake");
+  if (!estop && !control_link_ready && operator_input_ready)
+    throw std::invalid_argument("control link wait must also withdraw operator input readiness");
 }
 
 Json ControlCommand::to_json() const {
@@ -1035,6 +1037,7 @@ Json ControlCommand::to_json() const {
   value["critical_video_ready"] = critical_video_ready;
   value["control_time_sync_ready"] = control_time_sync_ready;
   value["operator_input_ready"] = operator_input_ready;
+  value["control_link_ready"] = control_link_ready;
   value["control_token"] = control_token;
   return value;
 }
@@ -1066,6 +1069,9 @@ ControlCommand ControlCommand::from_json(const Json& value) {
     // An authenticated ESTOP never depends on a newer producer schema.
     command.control_time_sync_ready = command.estop || value.at("control_time_sync_ready").get<bool>();
     command.operator_input_ready = command.estop || value.at("operator_input_ready").get<bool>();
+    // Optional diagnostic cause, with safety mirrored in the mandatory input
+    // readiness bit. A V7 relay that strips it still causes independent braking.
+    command.control_link_ready = command.estop || value.value("control_link_ready", true);
     command.control_token = value.at("control_token").get<std::string>();
   } catch (const Json::exception& error) {
     throw std::invalid_argument(std::string("invalid control command: ") + error.what());
@@ -1631,6 +1637,7 @@ std::string_view to_string(ControlRecoveryCause cause) {
     case ControlRecoveryCause::CriticalVideo: return "critical_video";
     case ControlRecoveryCause::TimeSynchronization: return "time_sync";
     case ControlRecoveryCause::InputLease: return "input_lease";
+    case ControlRecoveryCause::ControlLink: return "control_link";
   }
   return "unknown";
 }
@@ -3313,8 +3320,10 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     driver_critical_video_ready_ = effective.critical_video_ready;
     driver_time_sync_ready_ = effective.control_time_sync_ready;
     operator_input_ready_ = effective.operator_input_ready;
-    if (!driver_critical_video_ready_ || !driver_time_sync_ready_ || !operator_input_ready_)
+    driver_control_link_ready_ = effective.control_link_ready;
+    if (!driver_critical_video_ready_ || !driver_time_sync_ready_ || !operator_input_ready_ || !driver_control_link_ready_)
       set_control_braking_wait(true, timestamp_ms, !driver_time_sync_ready_ ? ControlRecoveryCause::TimeSynchronization
+          : !driver_control_link_ready_ ? ControlRecoveryCause::ControlLink
           : !operator_input_ready_ ? ControlRecoveryCause::InputLease : ControlRecoveryCause::CriticalVideo);
   }
   if (!effective.estop && (control_braking_wait_ || timing_rearm_required_ ||
@@ -3647,6 +3656,7 @@ Json VehicleControlService::control_timing(std::int64_t timestamp_ms) const {
           {"driver_critical_video_ready", driver_critical_video_ready_},
           {"driver_time_sync_ready", driver_time_sync_ready_},
           {"operator_input_ready", operator_input_ready_},
+          {"driver_control_link_ready", driver_control_link_ready_},
           {"rearm_required", control_braking_wait_ || timing_rearm_required_ ||
               (safety_.state() == SafetyState::Degraded && receiver_.consecutive_late_frame_limit() == 1)},
           {"last_valid_control_age_ms", last_valid ? Json(std::max<std::int64_t>(0, timestamp_ms - *last_valid)) : Json(nullptr)},
