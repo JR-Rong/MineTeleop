@@ -1091,10 +1091,12 @@
     // Report the last authoritative vehicle state without claiming that old
     // feedback confirms current physical braking or a completed stop.
     const banner = !feedbackFresh
-      ? `车端此前已报告制动等待（${reason}）；反馈已过期，当前制动状态待确认。`
-      : holding && !waiting && !delayed
+      ? `车端此前已报告${waiting || holding ? '制动等待' : '控制暂缓'}（${reason}）；反馈已过期，当前控制状态待确认。`
+      : holding && !waiting
         ? `链路已恢复，车端制动保持；当前会话保留，请释放旧按键后重新按下继续控车。`
-        : `车端制动等待：${reason}；当前会话保留。恢复后释放旧按键再重新按下；持续故障将安全停车。`;
+        : waiting
+          ? `车端制动等待：${reason}；当前会话保留。恢复后释放旧按键再重新按下；持续故障将安全停车。`
+          : `车端控制暂缓：${reason}，牵引已撤销；当前会话保留。请释放旧按键再重新按下；持续无有效控制将安全停车。`;
     return {visible: true, severity: 'warn', banner, alert: banner, cause};
   }
 

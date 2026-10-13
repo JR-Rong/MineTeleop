@@ -1121,6 +1121,8 @@ test('recoverable braking banner uses vehicle feedback and identifies the cause'
   const delayed = logic.deriveControlRecoveryPresentation(true, {safety_state: 'DEGRADED'}, true, false);
   assert.equal(delayed.cause, 'control_delay');
   assert.match(delayed.banner, /控制指令延迟/);
+  assert.match(delayed.banner, /控制暂缓.*牵引已撤销/);
+  assert.doesNotMatch(delayed.banner, /制动等待/);
   assert.equal(logic.deriveControlRecoveryPresentation(true, {safety_state: 'CONTROL_ACTIVE', control_timing: {}}, true, false).visible, false);
 });
 
@@ -1140,6 +1142,7 @@ test('yellow braking feedback yields to hard stops and marks stale confirmation'
 test('recovered brake hold stays visible until fresh motion releases it', () => {
   const telemetry = {safety_state: 'CONTROL_ACTIVE', control_timing: {control_braking_wait: false, recovery_brake_hold: true, control_recovery_cause: 'critical_video'}};
   assert.match(logic.deriveControlRecoveryPresentation(true, telemetry, true, false).banner, /链路已恢复.*制动保持.*重新按下/);
+  assert.match(logic.deriveControlRecoveryPresentation(true, {...telemetry, safety_state: 'DEGRADED'}, true, false).banner, /链路已恢复.*制动保持/);
   telemetry.control_timing.recovery_brake_hold = false;
   assert.equal(logic.deriveControlRecoveryPresentation(true, telemetry, true, false).visible, false);
 });
