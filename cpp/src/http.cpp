@@ -56,9 +56,10 @@ Json time_probe_tcp(CURL* handle) {
 }
 
 int observe_time_request(CURL* handle, curl_infotype type, char*, std::size_t, void* context) noexcept {
+  if (type != CURLINFO_HEADER_OUT || context == nullptr) return 0;
   auto& wire = *static_cast<TimeProbeWire*>(context);
   // Ignore internal curl handles, TLS records, headers and content. No payload is logged.
-  if (handle != wire.handle || type != CURLINFO_HEADER_OUT) return 0;
+  if (handle != wire.handle) return 0;
   wire.sent_utc_ms = now_ms();
   wire.sent_steady = std::chrono::steady_clock::now();
   wire.received_utc_ms = 0;
@@ -282,9 +283,13 @@ HttpResponse HttpClient::request(
     }
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
   } catch (...) {
+    curl_easy_reset(curl);
     if (headers != nullptr) curl_slist_free_all(headers);
     throw;
   }
+  // Clear request-owned callback/header/error-buffer pointers before their
+  // storage dies. Reset preserves curl's live connections and DNS/TLS caches.
+  curl_easy_reset(curl);
   if (headers != nullptr) curl_slist_free_all(headers);
   return response;
 }

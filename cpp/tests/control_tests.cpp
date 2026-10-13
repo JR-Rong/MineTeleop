@@ -439,7 +439,12 @@ void test_time_probe_excludes_client_queue_and_retains_failed_sample_diagnostics
   expect(diagnostics.front().at("timestamp_scope") == "http_header_out_to_body_received" &&
       diagnostics.front().at("http").contains("tcp_before_send") && diagnostics.front().at("http").contains("tcp_at_receive"),
       "probe lost its real exchange timestamps and own TCP observations");
-  const auto trusted_local = status.accepted_anchor_local_ms;
+  expect_throws([&] { static_cast<void>(http.get(base + "/time?client_send_ms=1", {{"bad\nheader", "value"}})); },
+      "invalid request header was accepted");
+  expect(http.get(base + "/health").status == 404 && clock.synchronize(http, base, 3, 25).acceptable(25),
+      "failed probe cleanup broke ordinary requests or the next synchronization");
+  const auto trusted_anchor = clock.status();
+  const auto trusted_local = trusted_anchor.accepted_anchor_local_ms;
   samples = 0; fail_third = true;
   bool detailed_timeout = false;
   try { static_cast<void>(clock.synchronize(mine_teleop::HttpClient(std::chrono::milliseconds(50)), base, 3, 25)); }

@@ -98,7 +98,10 @@ capture_fps 与编码 fps 后，必须在停车台架上核对协商值、5 s �
 
 Docker Ubuntu 24.04/arm64、GStreamer 1.28.5、Aravis OFF 完整构建与 CTest 23/23
 通过（43.52 s）；最终采样有效性标记、初始化及测试时钟改动后，控制/核心针对性
-回归 2/2 通过（38.72 s），测试时钟快照恢复再由核心回归通过（2.54 s）。
+回归 2/2 通过（38.72 s），测试时钟快照恢复再由核心回归通过（2.54 s）。HTTP 请求成功/失败后清理借用的
+回调、头与错误缓冲引用，保持连接缓存；错误请求后复用客户端的控制回归通过
+（37.55 s）。[curl reset](https://curl.se/libcurl/c/curl_easy_reset.html) 保留连接及
+DNS/TLS 会话缓存。
 server.cpp 使用 CMake 生成副本，验证前显式重新配置以确保副本与当前源码一致。
 
 - Reuse：复用现有 HttpClient、四时间戳状态、跨平台 TCP 采样、异步 trace 与
