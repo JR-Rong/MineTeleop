@@ -2622,7 +2622,7 @@ struct VehicleMediaRuntime::Impl {
     const bool waiting = phase == CriticalVideoPhase::BrakingWait;
     if (new_wait) for (const auto& lane : lanes) lane->video_wait_encoded_baseline = lane->encoded.load();
     bool changed = false;
-    {
+    try {
       std::lock_guard lock(control_mutex);
       if (control_service_started && control_service) {
         changed = control_service->critical_video_braking_wait() != waiting;
@@ -2635,6 +2635,15 @@ struct VehicleMediaRuntime::Impl {
       else if (control_service_issue_code == "critical_camera_braking_wait") control_service_issue_code.clear();
       if (changed || phase == CriticalVideoPhase::Recovered)
         send_vcu_handshake_status_locked(waiting ? "critical_video_braking_wait" : "critical_video_recovered");
+    } catch (const std::exception& error) {
+      // A failed physical brake must revoke control immediately, including
+      // when this transition runs inside a capture thread's error handler.
+      set_pipeline_error(
+          "critical video safety output failed: " + std::string(error.what()),
+          "critical_video_brake_failed", "camera_safety",
+          "Keep the vehicle stopped and inspect the adapter/CAN failure; use the physical emergency stop if braking is unavailable.",
+          false);
+      return;
     }
     if (changed || new_wait || phase == CriticalVideoPhase::Recovered) emit_diagnostic(
         waiting ? "vehicle_critical_video_braking_wait" : "vehicle_critical_video_recovered",
