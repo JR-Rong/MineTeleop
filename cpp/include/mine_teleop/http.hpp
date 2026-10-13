@@ -54,6 +54,15 @@ class HttpTransportError : public std::runtime_error {
   Json timing_;
 };
 
+class TimeSyncSampleError : public std::runtime_error {
+ public:
+  TimeSyncSampleError(std::string message, Json diagnostics)
+      : std::runtime_error(std::move(message)), diagnostics_(std::move(diagnostics)) {}
+  [[nodiscard]] const Json& diagnostics() const { return diagnostics_; }
+ private:
+  Json diagnostics_;
+};
+
 class HttpClient {
  public:
   explicit HttpClient(std::chrono::milliseconds timeout = std::chrono::seconds(5));

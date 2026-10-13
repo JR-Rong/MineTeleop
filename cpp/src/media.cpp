@@ -530,6 +530,8 @@ void CameraFrameSource::start_v4l2() {
     parameters.parm.capture.timeperframe.numerator = 1;
     parameters.parm.capture.timeperframe.denominator = static_cast<__u32>(profile_.fps);
     const auto set_parameters_result = ioctl_retry(device_fd_, VIDIOC_S_PARM, &parameters);
+    v4l2_timeperframe_supported_ = set_parameters_result == 0 &&
+        (parameters.parm.capture.capability & V4L2_CAP_TIMEPERFRAME) != 0;
     if (set_parameters_result < 0 && (ccg2 || errno != EINVAL)) {
       throw std::runtime_error("VIDIOC_S_PARM failed for " + camera_.device + ": " + std::strerror(errno));
     }
@@ -605,6 +607,7 @@ void CameraFrameSource::stop_v4l2() {
   last_v4l2_bytes_used_ = 0;
   v4l2_timeperframe_numerator_ = 0;
   v4l2_timeperframe_denominator_ = 0;
+  v4l2_timeperframe_supported_ = false;
   last_delivered_v4l2_sequence_.reset();
   last_dequeued_v4l2_sequence_.reset();
   last_dequeued_v4l2_sequence_gap_ = 0;
@@ -795,6 +798,13 @@ EncodedFrame CameraFrameSource::next(std::uint64_t sequence) {
 
 Json CameraFrameSource::capture_diagnostics() const {
   return {{"read_duration_ms", last_read_duration_ms_},
+          {"requested_capture_fps", profile_.fps},
+          {"driver_timeperframe_supported", v4l2_timeperframe_supported_},
+          {"driver_timeperframe_numerator", v4l2_timeperframe_numerator_},
+          {"driver_timeperframe_denominator", v4l2_timeperframe_denominator_},
+          {"driver_negotiated_fps", v4l2_timeperframe_numerator_ > 0
+              ? Json(static_cast<double>(v4l2_timeperframe_denominator_) / v4l2_timeperframe_numerator_) : Json(nullptr)},
+          {"frame_rate_scope", "driver_delivery_not_sensor_verification"},
           {"buffer_metadata_scope", "last_dequeued_buffer"},
           {"driver", v4l2_driver_}, {"card", v4l2_card_}, {"bus_info", v4l2_bus_info_},
           {"buffer_valid", last_v4l2_buffer_valid_},

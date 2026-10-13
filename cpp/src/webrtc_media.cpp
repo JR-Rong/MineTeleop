@@ -2387,6 +2387,7 @@ struct VehicleMediaRuntime::Impl {
       const auto started = steady_now_ms();
       std::string error;
       Json http_failure;
+      Json sample_failure;
       try {
         static_cast<void>(signaling.synchronize_time(config.field_safety.time_sync_samples,
                                                     config.field_safety.max_time_sync_uncertainty_ms));
@@ -2394,12 +2395,13 @@ struct VehicleMediaRuntime::Impl {
         signaling.mark_time_sync_failed();
         error = std::string(failure.what()).substr(0, 512);
         if (const auto* transport = dynamic_cast<const HttpTransportError*>(&failure)) http_failure = transport->timing();
+        if (const auto* sample = dynamic_cast<const TimeSyncSampleError*>(&failure)) { sample_failure = sample->diagnostics(); http_failure = sample_failure.value("http_failure", Json(nullptr)); }
       }
       try {
         enforce_control_recovery();
         enqueue_control_trace({{"stage", "time_sync_refresh"}, {"session_id", signaling.session_id()},
             {"duration_ms", steady_now_ms() - started}, {"time_sync", signaling.time_sync_status().to_json(true)},
-            {"error", error}, {"http_failure", std::move(http_failure)}, {"safety_action", "recovery_guard_owns_control"}});
+            {"error", error}, {"http_failure", std::move(http_failure)}, {"sample_failure", std::move(sample_failure)}, {"safety_action", "recovery_guard_owns_control"}});
       } catch (const std::exception& failure) {
         set_pipeline_error(failure.what(), "control_recovery_brake_failed", "control_recovery",
                            "Keep the vehicle stopped and inspect the adapter/CAN failure.", false);
@@ -3074,18 +3076,20 @@ struct VehicleMediaRuntime::Impl {
     if (last_observed_hard_stop_state == state) return;
     last_observed_hard_stop_state = state;
     try {
+      const auto timing = control_service->control_timing(timestamp_ms);
       enqueue_control_trace({
           {"stage", "control_hard_stop_transition"}, {"event_at_utc_ms", timestamp_ms},
           {"session_id", signaling.session_id()}, {"vehicle_id", config.vehicle_id},
           {"safety_state", to_string(state)}, {"session_profile_active", control_service->session_control_profile().value("active", false)},
-          {"control_timing", control_service->control_timing(timestamp_ms)},
+          {"control_timing", timing},
           {"last_parsed_control_arrival_seq", last_parsed_control_arrival_seq},
           {"last_parsed_control_arrival_age_ms", last_parsed_control_arrival_ms
               ? Json(std::max<std::int64_t>(0, timestamp_ms - *last_parsed_control_arrival_ms)) : Json(nullptr)},
           {"last_evaluated_control_seq", last_evaluated_control_seq},
           {"last_evaluated_control_reason", bounded_control_trace_text(last_evaluated_control_reason)},
           {"last_accepted_control_seq", last_accepted_control_seq},
-          {"last_accepted_control_age_ms", last_control_received_at_ms.load() > 0
+          {"last_accepted_control_age_ms", timing.at("last_valid_control_age_ms")},
+          {"last_accepted_control_utc_age_ms", last_control_received_at_ms.load() > 0
               ? Json(std::max<std::int64_t>(0, timestamp_ms - last_control_received_at_ms.load())) : Json(nullptr)},
           {"control_status_seq", control_status_seq},
           {"accepted_commands_total", accepted_control_commands.load()},
@@ -3484,6 +3488,8 @@ struct VehicleMediaRuntime::Impl {
         std::uint64_t sequence = 0;
         bool recovery_pending = false;
         auto next_capture_sample_ms = std::int64_t{0};
+        std::int64_t previous_capture_sample_ms = 0;
+        std::uint64_t previous_capture_sample_frames = 0;
         const bool pace_test_source =
             classify_camera_source(lane->camera) == CameraSourceKind::TestSource &&
             capture_interval_ms == 0;
@@ -3540,10 +3546,18 @@ struct VehicleMediaRuntime::Impl {
             lane->last_capture_ms = frame.captured_at_ms;
             if (captured_steady_ms >= next_capture_sample_ms) {
               next_capture_sample_ms = captured_steady_ms + 5000;
+              const auto sampled_frames = lane->captured.load();
+              const auto sample_duration_ms = previous_capture_sample_ms > 0 ? captured_steady_ms - previous_capture_sample_ms : 0;
+              const Json observed_fps = sample_duration_ms > 0
+                  ? Json((sampled_frames - previous_capture_sample_frames) * 1000.0 / sample_duration_ms) : Json(nullptr);
+              previous_capture_sample_ms = captured_steady_ms;
+              previous_capture_sample_frames = sampled_frames;
               emit_diagnostic("vehicle_camera_capture_sample", "camera_capture_sample", "camera_capture",
                   "", "V4L2 metadata does not verify pixel integrity; correlate a raw frame and board/kernel diagnostics.", true,
                   {{"camera_id", lane->camera.id}, {"device", lane->camera.device},
                    {"captured_frames", lane->captured.load()}, {"encoded_frames", lane->encoded.load()},
+                   {"requested_capture_fps", lane->input.fps}, {"target_encode_fps", lane->profile.fps},
+                   {"capture_fps_observed", observed_fps}, {"capture_fps_sample_duration_ms", sample_duration_ms},
                    {"capture_interval_ms", capture_gap_ms}, {"capture_interval_max_ms", lane->capture_interval_max_ms.load()},
                    {"payload_bytes", frame.payload.size()}, {"source_sequence", frame.source_sequence},
                    {"capture_diagnostics", lane->source->capture_diagnostics()}});

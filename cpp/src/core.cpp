@@ -1581,7 +1581,12 @@ void ControlReceiver::set_consecutive_late_frame_limit(int limit) {
 }
 
 ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_t receive_time_ms) {
-  if (receive_time_ms < 0) {
+  return accept(command, receive_time_ms, receive_time_ms);
+}
+
+ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_t receive_time_ms,
+    std::int64_t arrival_monotonic_ms) {
+  if (receive_time_ms < 0 || arrival_monotonic_ms < 0) {
     throw std::invalid_argument("receive_time_ms must be non-negative");
   }
   try {
@@ -1613,17 +1618,17 @@ ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_
   if (!command.estop && timestamp_delta_ms < -max_command_gap_ms_) {
     return {false, "command_timestamp_in_future", std::nullopt, {}};
   }
-  if (last_valid_receive_ms_ && receive_time_ms < *last_valid_receive_ms_) {
+  if (last_valid_receive_ms_ && arrival_monotonic_ms < *last_valid_receive_ms_) {
     return {false, "receive_time_reversed", std::nullopt, {}};
   }
-  if (last_valid_receive_ms_ && receive_time_ms - *last_valid_receive_ms_ > max_command_gap_ms_ && !command.estop && consecutive_late_frame_limit_ == 1) {
+  if (last_valid_receive_ms_ && arrival_monotonic_ms - *last_valid_receive_ms_ > max_command_gap_ms_ && !command.estop && consecutive_late_frame_limit_ == 1) {
     // Drop the first command after a gap, but re-arm timing so the next fresh
     // heartbeat can recover instead of permanently locking out control.
-    last_valid_receive_ms_ = receive_time_ms;
+    last_valid_receive_ms_ = arrival_monotonic_ms;
     return {false, "command_gap_exceeded", std::nullopt, {}};
   }
   last_seq_ = command.seq;
-  last_valid_receive_ms_ = receive_time_ms;
+  last_valid_receive_ms_ = arrival_monotonic_ms;
   consecutive_late_frames_ = 0;
   std::vector<std::string> warnings;
   if (std::llabs(receive_time_ms - command.sent_at_utc_ms) > timestamp_warning_skew_ms_) {
@@ -2900,7 +2905,8 @@ VehicleControlService::VehicleControlService(
     std::string session_id,
     std::string control_token,
     std::unique_ptr<VehicleAdapter> adapter,
-    int telemetry_interval_ms)
+    int telemetry_interval_ms,
+    std::function<std::int64_t()> monotonic_clock)
     : vehicle_id_(config.vehicle_id),
       driver_id_(std::move(driver_id)),
       session_id_(std::move(session_id)),
@@ -2914,6 +2920,9 @@ VehicleControlService::VehicleControlService(
           kProtocolVersion,
           true,
           control_token_),
+      monotonic_clock_(monotonic_clock ? std::move(monotonic_clock) : [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      }),
       safety_(
           config.control.degraded_timeout_ms,
           config.control.control_timeout_ms,
@@ -2948,7 +2957,7 @@ VehicleControlService::~VehicleControlService() {
   }
 }
 
-void VehicleControlService::start(std::int64_t timestamp_ms) {
+void VehicleControlService::start(std::int64_t /*timestamp_ms*/) {
   if (started_) return;
   adapter_->open();
   try {
@@ -2957,7 +2966,7 @@ void VehicleControlService::start(std::int64_t timestamp_ms) {
     adapter_->close();
     throw;
   }
-  safety_.mark_ready(timestamp_ms);
+  safety_.mark_ready(monotonic_clock_());
   started_ = true;
 }
 
@@ -3271,23 +3280,24 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
 
 ReceiveResult VehicleControlService::receive_command(const ControlCommand& command, std::int64_t timestamp_ms) {
   if (!started_) throw std::runtime_error("vehicle control service is not started");
+  const auto arrival_monotonic_ms = monotonic_clock_();
   ReceiveResult result;
   if (command.estop) {
-    result = receiver_.accept(command, timestamp_ms);
+    result = receiver_.accept(command, timestamp_ms, arrival_monotonic_ms);
     if (result.accepted && result.command) {
       // Latch a valid ESTOP and revoke traction authority before any adapter
       // call. A failed physical stop must never lose the outer safety latch.
-      safety_.on_valid_command(*result.command, timestamp_ms);
+      safety_.on_valid_command(*result.command, arrival_monotonic_ms);
       clear_session_profile();
     } else {
-      evaluate_control_watchdog(timestamp_ms);
+      evaluate_control_watchdog();
     }
   } else {
     // The receive path can keep running even if the periodic loop is delayed.
     // Advance the same watchdog here so fresh packets cannot bypass a hard
     // timeout merely because tick() has not been scheduled.
-    evaluate_control_watchdog(timestamp_ms);
-    result = receiver_.accept(command, timestamp_ms);
+    evaluate_control_watchdog();
+    result = receiver_.accept(command, timestamp_ms, arrival_monotonic_ms);
   }
   if (!result.accepted || !result.command) {
     if ((result.reason == "command_gap_exceeded" ||
@@ -3296,7 +3306,7 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
          safety_.state() == SafetyState::Degraded)) {
       timing_rearm_required_ = true;
       safety_.require_input_rearm();
-      evaluate_control_watchdog(timestamp_ms);
+      evaluate_control_watchdog();
       result.issue_code = "control_input_rearm_required";
     }
     return result;
@@ -3389,7 +3399,7 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     if (!adapter_safety_observed) {
       safety_.mark_fault();
       adapter_->apply_safe_stop(
-          safety_.current_output(timestamp_ms),
+          safety_.current_output(monotonic_clock_()),
           {VehicleStopSource::SoftwareFault,
            VehicleStopReason::AdapterSafetyStatusUnavailable});
       clear_session_profile();
@@ -3398,7 +3408,7 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     if (feedback_poll_failed && require_feedback_before_control_) {
       safety_.mark_fault();
       adapter_->apply_safe_stop(
-          safety_.current_output(timestamp_ms),
+          safety_.current_output(monotonic_clock_()),
           {VehicleStopSource::SoftwareFault,
            VehicleStopReason::CanFeedbackMissing});
       clear_session_profile();
@@ -3443,7 +3453,7 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
       result.issue_code = error.issue_code();
       return result;
     }
-    safety_.on_valid_command(safety_command, timestamp_ms);
+    safety_.on_valid_command(safety_command, arrival_monotonic_ms);
     timing_rearm_required_ = false;
     last_effective_command_ = *result.command;
     return result;
@@ -3452,7 +3462,7 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
   // ESTOP is a safety latch, not an ordinary actuator transaction: preserve
   // it even when the adapter cannot apply the physical stop. Ordinary commands
   // received while ESTOP/Fault is already latched must not reach apply_control.
-  safety_.on_valid_command(safety_command, timestamp_ms);
+  safety_.on_valid_command(safety_command, arrival_monotonic_ms);
   if (!adapter_safe_stop_active_ ||
       safety_.state() == SafetyState::Estop ||
       safety_.state() == SafetyState::Fault) {
@@ -3468,7 +3478,7 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
               VehicleStopSource::SoftwareFault,
               VehicleStopReason::VcuStateFault};
     adapter_->apply_safe_stop(
-        safety_.current_output(timestamp_ms),
+        safety_.current_output(monotonic_clock_()),
         stop_context);
   }
   return result;
@@ -3513,13 +3523,14 @@ void VehicleControlService::tick(std::int64_t timestamp_ms) {
       safety_.state() != SafetyState::Fault) {
     safety_.mark_fault();
   }
-  evaluate_control_watchdog(timestamp_ms);
+  evaluate_control_watchdog();
   apply_recovery_brake();
-  if (!last_telemetry_ms_ || timestamp_ms - *last_telemetry_ms_ >= telemetry_interval_ms_) {
+  const auto telemetry_monotonic_ms = monotonic_clock_();
+  if (!last_telemetry_ms_ || telemetry_monotonic_ms - *last_telemetry_ms_ >= telemetry_interval_ms_) {
     try {
       if (telemetry_history_.size() == kMaxVehicleTelemetryHistory) telemetry_history_.pop_front();
       telemetry_history_.push_back(build_telemetry(timestamp_ms));
-      last_telemetry_ms_ = timestamp_ms;
+      last_telemetry_ms_ = telemetry_monotonic_ms;
     } catch (...) {
       // Control safety was already evaluated above from the same adapter. A
       // failed observability snapshot must not tear down an adapter-owned stop
@@ -3528,13 +3539,13 @@ void VehicleControlService::tick(std::int64_t timestamp_ms) {
   }
 }
 
-void VehicleControlService::set_control_braking_wait(bool waiting, std::int64_t timestamp_ms, ControlRecoveryCause cause) {
+void VehicleControlService::set_control_braking_wait(bool waiting, std::int64_t /*timestamp_ms*/, ControlRecoveryCause cause) {
   if (control_braking_wait_ == waiting) return;
   control_braking_wait_ = waiting;
   if (waiting) { recovery_brake_hold_ = true; recovery_cause_ = cause; }
   timing_rearm_required_ = true;
   safety_.require_input_rearm();
-  evaluate_control_watchdog(timestamp_ms);
+  evaluate_control_watchdog();
   if (waiting) apply_recovery_brake();
 }
 
@@ -3548,8 +3559,8 @@ void VehicleControlService::apply_recovery_brake(std::string_view gear_override)
   adapter_->apply_safe_stop(ControlOutput{gear, 0.0, 0.0, 1.0, false, false}, {});
 }
 
-void VehicleControlService::evaluate_control_watchdog(std::int64_t timestamp_ms) {
-  safety_.tick(timestamp_ms);
+void VehicleControlService::evaluate_control_watchdog() {
+  safety_.tick(monotonic_clock_());
   if (safety_.state() == SafetyState::Degraded || safety_.state() == SafetyState::TimeoutBrake ||
       safety_.state() == SafetyState::Estop || safety_.state() == SafetyState::Fault) {
     // Revoke software traction authority before touching the adapter. This
@@ -3583,7 +3594,7 @@ void VehicleControlService::evaluate_control_watchdog(std::int64_t timestamp_ms)
         apply_recovery_brake();
       } else {
         adapter_->apply_safe_stop(
-            safety_.current_output(timestamp_ms),
+            safety_.current_output(monotonic_clock_()),
             stop_context);
       }
     }
@@ -3599,7 +3610,7 @@ void VehicleControlService::evaluate_control_watchdog(std::int64_t timestamp_ms)
 bool VehicleControlService::reset_estop(
     bool local_confirmed,
     std::string_view authorized_by,
-    std::int64_t timestamp_ms) {
+    std::int64_t /*timestamp_ms*/) {
   if (safety_.state() != SafetyState::Estop || !local_confirmed || authorized_by.empty()) {
     return false;
   }
@@ -3628,7 +3639,7 @@ bool VehicleControlService::reset_estop(
     return false;
   }
 
-  const bool reset = safety_.reset_estop(local_confirmed, authorized_by, timestamp_ms);
+  const bool reset = safety_.reset_estop(local_confirmed, authorized_by, monotonic_clock_());
   if (!reset) return false;
   adapter_safe_stop_active_ = false;
   static_cast<void>(refresh_adapter_safe_stop_state());
@@ -3645,9 +3656,10 @@ void VehicleControlService::close(VehicleStopContext context) {
   started_ = false;
 }
 
-Json VehicleControlService::control_timing(std::int64_t timestamp_ms) const {
+Json VehicleControlService::control_timing(std::int64_t /*timestamp_ms*/) const {
   const auto last_valid = safety_.last_valid_receive_ms();
-  return {{"consecutive_late_frame_limit", receiver_.consecutive_late_frame_limit()},
+  return {{"timer_domain", "steady_clock"},
+          {"consecutive_late_frame_limit", receiver_.consecutive_late_frame_limit()},
           {"consecutive_late_frames", receiver_.consecutive_late_frames()},
           {"last_valid_command_seq", last_effective_command_ ? last_effective_command_->seq : 0},
           {"control_braking_wait", control_braking_wait_},
@@ -3659,7 +3671,7 @@ Json VehicleControlService::control_timing(std::int64_t timestamp_ms) const {
           {"driver_control_link_ready", driver_control_link_ready_},
           {"rearm_required", control_braking_wait_ || timing_rearm_required_ ||
               (safety_.state() == SafetyState::Degraded && receiver_.consecutive_late_frame_limit() == 1)},
-          {"last_valid_control_age_ms", last_valid ? Json(std::max<std::int64_t>(0, timestamp_ms - *last_valid)) : Json(nullptr)},
+          {"last_valid_control_age_ms", last_valid ? Json(std::max<std::int64_t>(0, monotonic_clock_() - *last_valid)) : Json(nullptr)},
           {"control_timeout_ms", control_limits_.at("read_only_control_safety").at("control_timeout_ms")}};
 }
 

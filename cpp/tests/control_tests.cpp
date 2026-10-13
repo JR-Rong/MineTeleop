@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -401,20 +402,112 @@ void test_poor_time_samples_do_not_replace_the_accepted_clock_anchor() {
   server.stop();
 }
 
+void test_time_probe_excludes_client_queue_and_retains_failed_sample_diagnostics() {
+  std::atomic<bool> holding{false};
+  std::atomic<int> samples{0};
+  std::atomic<bool> fail_third{false}, invalid_server_duration{false};
+  auto cloud = std::make_shared<mine_teleop::SignalingService>(mine_teleop::SignalingServerConfig{});
+  mine_teleop::SimpleHttpServer server("127.0.0.1", 0, [&](const mine_teleop::HttpRequest& request) {
+    if (request.path == "/hold") { holding = true; std::this_thread::sleep_for(std::chrono::milliseconds(150)); return mine_teleop::ServerResponse::json(200, {}); }
+    if (request.path == "/time") {
+      const int index = samples++;
+      if (fail_third && index == 2) std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      auto response = cloud->handle(request);
+      if (invalid_server_duration) {
+        auto body = mine_teleop::Json::parse(response.body);
+        body["server_send_ms"] = body.at("server_receive_ms").get<std::int64_t>() + 500;
+        response.body = body.dump();
+      }
+      return response;
+    }
+    return mine_teleop::ServerResponse::json(404, {});
+  });
+  server.start();
+  const auto base = "http://127.0.0.1:" + std::to_string(server.port());
+  mine_teleop::HttpClient http;
+  auto hold = std::async(std::launch::async, [&] { return http.get(base + "/hold"); });
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!holding && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+  expect(holding, "HTTP queue fixture did not acquire the shared client");
+  mine_teleop::SynchronizedClock clock;
+  const auto status = clock.synchronize(http, base, 3, 25);
+  static_cast<void>(hold.get());
+  const auto diagnostics = status.to_json(true).at("samples");
+  expect(status.acceptable(25) && std::abs(status.offset_ms) <= 25 &&
+      diagnostics.front().at("http").at("client_mutex_wait_ms") >= 50,
+      "client queue time contaminated the synchronization delay/offset");
+  expect(diagnostics.front().at("timestamp_scope") == "http_header_out_to_body_received" &&
+      diagnostics.front().at("http").contains("tcp_before_send") && diagnostics.front().at("http").contains("tcp_at_receive"),
+      "probe lost its real exchange timestamps and own TCP observations");
+  const auto trusted_local = status.accepted_anchor_local_ms;
+  samples = 0; fail_third = true;
+  bool detailed_timeout = false;
+  try { static_cast<void>(clock.synchronize(mine_teleop::HttpClient(std::chrono::milliseconds(50)), base, 3, 25)); }
+  catch (const mine_teleop::TimeSyncSampleError& error) {
+    detailed_timeout = error.diagnostics().at("failed_sample_index") == 2 &&
+        error.diagnostics().at("completed_samples").size() == 2 && error.diagnostics().at("http_failure").contains("tcp_before_send");
+  }
+  expect(detailed_timeout && !clock.status().acceptable(25) && clock.status().accepted_anchor_local_ms == trusted_local,
+      "partial failed cohort lost diagnostics or left stale readiness authorized");
+  fail_third = false; invalid_server_duration = true;
+  bool inconsistent_rejected = false;
+  try { static_cast<void>(clock.synchronize(http, base, 3, 25)); }
+  catch (const mine_teleop::TimeSyncSampleError& error) {
+    inconsistent_rejected = error.diagnostics().at("completed_samples").size() == 1 &&
+        !error.diagnostics().at("completed_samples").front().at("valid").get<bool>() &&
+        std::string(error.what()).find("inconsistent") != std::string::npos;
+  }
+  expect(inconsistent_rejected && !clock.status().acceptable(25), "impossible server processing created a false zero-RTT trusted clock");
+  server.stop();
+}
+
+void test_time_uncertainty_covers_the_median_shift_from_best_sample() {
+  std::atomic<int> sample{0};
+  mine_teleop::SimpleHttpServer server("127.0.0.1", 0, [&](const mine_teleop::HttpRequest& request) {
+    const int index = sample++;
+    const auto sent = std::stoll(request.query.at("client_send_ms"));
+    const auto delay = index == 0 ? 20 : index == 1 ? 80 : 100;
+    const auto synthetic_time = sent + delay / 2 + (index == 0 ? 0 : 20);
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    return mine_teleop::ServerResponse::json(200, {{"client_send_ms", sent},
+        {"server_receive_ms", synthetic_time}, {"server_send_ms", synthetic_time}});
+  });
+  server.start();
+  mine_teleop::SynchronizedClock clock;
+  const auto status = clock.synchronize(mine_teleop::HttpClient{}, "http://127.0.0.1:" + std::to_string(server.port()), 3, 25);
+  const auto diagnostics = status.to_json(true).at("samples");
+  const auto best = *std::min_element(diagnostics.begin(), diagnostics.end(), [](const auto& a, const auto& b) {
+    return a.at("round_trip_ms").template get<std::int64_t>() < b.at("round_trip_ms").template get<std::int64_t>();
+  });
+  const auto best_radius = (best.at("round_trip_ms").get<std::int64_t>() + 1) / 2;
+  const auto shifted = std::abs(status.offset_ms - best.at("offset_ms").get<std::int64_t>());
+  expect(shifted >= 5 && status.uncertainty_ms >= best_radius + shifted && !status.anchor_accepted,
+      "median estimate falsely narrowed the valid low-RTT sample's error interval");
+  server.stop();
+}
+
 void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
   std::atomic<int> delay_ms{0};
   std::atomic<bool> slow_probe_started{false};
+  std::atomic<bool> simulate_network_delay{false};
   mine_teleop::SignalingServerConfig cloud_config;
   cloud_config.driver_passwords = {{"driver-console-001", "slow-time-password"}};
   cloud_config.device_tokens = {{"vehicle-001", "slow-time-device"}};
   cloud_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
   auto cloud = std::make_shared<mine_teleop::SignalingService>(cloud_config);
   mine_teleop::SimpleHttpServer server("127.0.0.1", 0, [&](const auto& request) {
+    auto routed = request;
     if (request.path == "/time" && delay_ms.load() > 0) {
       slow_probe_started = true;
       std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms.load()));
     }
-    return cloud->handle(request);
+    // Explicitly model transit before server ingress only in the network phase.
+    if (simulate_network_delay && request.path == "/time") {
+      routed.received_at_utc_ms = mine_teleop::now_ms();
+      routed.received_at_monotonic_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      routed.parsed_at_monotonic_ms = routed.received_at_monotonic_ms;
+    }
+    return cloud->handle(routed);
   }, 8 * 1024 * 1024, [cloud](int socket, const auto& request) { return cloud->handle_websocket(socket, request); });
   server.start();
   const auto base = "http://127.0.0.1:" + std::to_string(server.port());
@@ -433,7 +526,22 @@ void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
     const mine_teleop::Json neutral = {{"session_id", session}, {"session_generation", generation},
         {"ui_instance_id", "slow-time-ui"}, {"intent_seq", 1}, {"gear", "N"}, {"steering", 0}, {"throttle", 0}, {"brake", 0}};
     expect(driver.update_control_intent(neutral).at("accepted").get<bool>(), "neutral input rejected");
+    const auto first_anchor = driver.status().at("time_sync").at("accepted_anchor_local_ms").get<std::int64_t>();
     delay_ms = 350;
+    bool slow_processing_seen = false;
+    const auto software_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < software_deadline && !slow_processing_seen) {
+      const auto started = std::chrono::steady_clock::now();
+      const auto status = driver.status();
+      expect(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(200), "monitoring blocked on slow server processing");
+      expect(driver.update_control_intent(neutral).at("accepted").get<bool>(), "live input rejected while /time server waited");
+      slow_processing_seen = slow_probe_started && status.at("time_sync").at("accepted_anchor_local_ms").get<std::int64_t>() > first_anchor;
+      expect(status.at("time_sync").value("synchronized", false) && status.at("time_sync").at("uncertainty_ms") <= 25,
+          "350ms measured server processing was mislabeled as untrusted network time: " + status.at("time_sync").dump());
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    expect(slow_processing_seen, "fixture never completed its slow server-processing cohort");
+    simulate_network_delay = true;
     bool bad_seen = false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline && !bad_seen) {
@@ -5064,7 +5172,7 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
     const auto native = driver.status().at("native_control");
     if (native.value("send_failures_total", 0U) > 0) {
       expect(native.value("last_error", "") == "native control ACK recovery deadline exceeded" && native.value("requires_fresh_input", false),
-          "persistent ACK loss bypassed the bounded braking recovery");
+          "persistent ACK loss bypassed the bounded braking recovery: " + native.dump());
       bounded_reconnect = true; break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -6988,6 +7096,8 @@ int main() {
       {"driver_time_sync_uncertainty_fails_closed_at_production_default",
        test_driver_time_sync_uncertainty_fails_closed_at_production_default},
       {"poor_time_samples_do_not_replace_the_accepted_clock_anchor", test_poor_time_samples_do_not_replace_the_accepted_clock_anchor},
+      {"time_probe_excludes_client_queue_and_retains_failed_sample_diagnostics", test_time_probe_excludes_client_queue_and_retains_failed_sample_diagnostics},
+      {"time_uncertainty_covers_the_median_shift_from_best_sample", test_time_uncertainty_covers_the_median_shift_from_best_sample},
       {"slow_time_refresh_does_not_block_status_or_expire_live_input", test_slow_time_refresh_does_not_block_status_or_expire_live_input},
       {"control_page_contract", test_control_page_contract},
       {"driver_gamepad_config", test_driver_gamepad_config},

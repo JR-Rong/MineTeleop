@@ -1,4 +1,5 @@
 #include "mine_teleop/core.hpp"
+#include "control_time_fixture.hpp"
 #include "mine_teleop/gstreamer_media.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
@@ -143,7 +144,7 @@ mine_teleop::SessionControlProfileRequest session_profile_request(
 }
 
 void activate_session_profile(
-    mine_teleop::VehicleControlService& service,
+    mine_teleop::test::LogicalTimeControlService& service,
     std::uint64_t seq = 1,
     std::int64_t timestamp_ms = 0) {
   const auto result = service.receive_session_profile(
@@ -412,7 +413,7 @@ class AdapterOwnedSafeStopAdapter final : public mine_teleop::VehicleAdapter {
 };
 
 void activate_adapter_owned_session_profile(
-    mine_teleop::VehicleControlService& service,
+    mine_teleop::test::LogicalTimeControlService& service,
     AdapterOwnedSafeStopAdapter& adapter,
     std::uint64_t seq = 1,
     std::int64_t timestamp_ms = 0) {
@@ -1024,6 +1025,18 @@ void test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps() {
   expect(
       unchanged.find("videorate") == std::string::npos,
       "CCG2 input added videorate even though input and output FPS match");
+
+  for (const int fps : {20, 25}) {
+    mine_teleop::CameraConfig direct;
+    direct.id = "ccg2_direct"; direct.backend = "ccg2"; direct.device = "/dev/ccg2-channel-0";
+    direct.capture_width = 1920; direct.capture_height = 1080; direct.capture_fps = fps;
+    output.fps = fps;
+    const auto input = mine_teleop::camera_input_spec(direct, output);
+    const auto pipe = mine_teleop::build_camera_input_pipeline("source_direct", input, output);
+    expect(input.fps == fps && pipe.find("videorate") == std::string::npos,
+        "direct 20/25Hz acquisition was converted into a 30Hz capture-and-resample path");
+  }
+  output.fps = 25;
 
   const mine_teleop::CameraInputSpec legacy_30_fps{"mjpeg", 1280, 720, 30};
   const auto legacy =
@@ -2154,7 +2167,7 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
   auto* adapter_view = adapter.get();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
   expect_near(
@@ -2267,7 +2280,7 @@ void test_session_control_profile_ack_sequence_limits_and_clear() {
 void test_session_control_profile_uses_independent_two_second_age_window() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
 
@@ -2323,7 +2336,7 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
   auto* adapter_view = adapter.get();
   adapter_view->handshake.parking_ready = false;
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
 
@@ -2460,7 +2473,7 @@ void test_control_service_commits_only_successfully_applied_commands() {
   {
     auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
     auto* adapter_view = adapter.get();
-    mine_teleop::VehicleControlService service(
+    mine_teleop::test::LogicalTimeControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
     service.start(0);
     activate_adapter_owned_session_profile(service, *adapter_view);
@@ -2499,7 +2512,7 @@ void test_control_service_commits_only_successfully_applied_commands() {
   {
     auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
     auto* adapter_view = adapter.get();
-    mine_teleop::VehicleControlService service(
+    mine_teleop::test::LogicalTimeControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
     service.start(0);
     activate_adapter_owned_session_profile(service, *adapter_view);
@@ -2533,7 +2546,7 @@ void test_control_service_commits_only_successfully_applied_commands() {
   {
     auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
     auto* adapter_view = adapter.get();
-    mine_teleop::VehicleControlService service(
+    mine_teleop::test::LogicalTimeControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
     service.start(0);
     activate_adapter_owned_session_profile(service, *adapter_view);
@@ -2566,11 +2579,57 @@ void test_control_service_commits_only_successfully_applied_commands() {
   }
 }
 
+void test_control_watchdog_and_telemetry_ignore_utc_anchor_steps() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  std::int64_t monotonic_ms = 1000;
+  mine_teleop::VehicleControlService service(config, "driver-001", "session-001", "token",
+      std::make_unique<mine_teleop::MockVehicleAdapter>(), 100, [&] { return monotonic_ms; });
+  service.start(10000);
+  expect(service.receive_session_profile(session_profile_request(1, 10000), 10000).accepted,
+      "clock-step fixture did not accept the profile");
+  expect(service.receive_command(command(1, 10000), 10000).accepted, "initial fresh command rejected");
+
+  monotonic_ms = 1020;
+  service.tick(15000);
+  expect(service.safety_state() == mine_teleop::SafetyState::ControlActive,
+      "UTC forward step caused a false hard timeout");
+  expect(service.receive_command(command(2, 15000), 15000).accepted,
+      "UTC forward step caused a false receive gap");
+
+  monotonic_ms = 1040;
+  service.tick(5000);
+  expect(service.receive_command(command(3, 5000), 5000).accepted,
+      "UTC backward step caused receive_time_reversed");
+  monotonic_ms = 1060;
+  expect(service.receive_command(command(4, 4700), 5000).reason == "command_age_exceeded",
+      "monotonic watchdog bypassed UTC command freshness");
+  expect(service.receive_command(command(5, 6000), 5000).reason == "command_timestamp_in_future",
+      "monotonic watchdog bypassed UTC future-command rejection");
+
+  monotonic_ms = 1120;
+  service.tick(4000);
+  expect(service.telemetry_history().size() == 2,
+      "UTC backward step suppressed the next monotonic telemetry interval");
+  expect(service.telemetry_history().back().at("sent_at_utc_ms") == 4000,
+      "wire telemetry lost its UTC timestamp");
+  monotonic_ms = 1839;
+  service.tick(90000);
+  const auto timing = service.control_timing(90000);
+  expect(service.safety_state() == mine_teleop::SafetyState::Degraded &&
+      timing.at("last_valid_control_age_ms") == 799 && timing.at("timer_domain") == "steady_clock",
+      "rejected packets renewed the watchdog or UTC jump changed its age");
+  monotonic_ms = 1840;
+  service.tick(3000);
+  expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
+      !service.session_control_profile().at("active").get<bool>(),
+      "real 800 ms no-valid-control interval failed to revoke traction");
+}
+
 void test_control_service_reports_safe_stop_output_after_timeout() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
   auto* adapter_view = adapter.get();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
   activate_session_profile(service);
@@ -2604,7 +2663,7 @@ void test_control_service_recovers_from_degraded_command_gap_without_profile_rea
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
   auto* adapter_view = adapter.get();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
   activate_session_profile(service);
@@ -2659,7 +2718,7 @@ void test_control_service_receive_path_cannot_bypass_hard_timeout() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
   auto* adapter_view = adapter.get();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
   activate_session_profile(service);
@@ -2694,7 +2753,7 @@ void test_held_forward_and_left_rearm_after_control_gap() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
   auto* view = adapter.get();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
   activate_adapter_owned_session_profile(service, *view);
@@ -2749,7 +2808,7 @@ void test_video_braking_preserves_profile_and_only_real_commands_refresh_control
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
   auto* view = adapter.get();
-  mine_teleop::VehicleControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  mine_teleop::test::LogicalTimeControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
   auto profile = session_profile_request(100, 0);
   profile.profile.consecutive_late_frame_limit = 3;
@@ -2807,7 +2866,7 @@ void test_video_braking_preserves_profile_and_only_real_commands_refresh_control
 void test_idle_zero_heartbeats_do_not_trigger_control_timeout() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
-  mine_teleop::VehicleControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 100);
+  mine_teleop::test::LogicalTimeControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
   auto profile = session_profile_request(100, 0);
   profile.profile.consecutive_late_frame_limit = 3;
@@ -2837,7 +2896,7 @@ void test_recovery_braking_never_emits_zero_pressure_on_rejected_commands() {
     auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
     auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
     auto* view = adapter.get();
-    mine_teleop::VehicleControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 10000);
+    mine_teleop::test::LogicalTimeControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 10000);
     service.start(0);
     view->handshake.state = "standby";
     view->handshake.ready = false;
@@ -2916,7 +2975,7 @@ void test_time_and_input_faults_brake_independently_and_recover_without_new_prof
     auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
     auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
     auto* view = adapter.get();
-    mine_teleop::VehicleControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    mine_teleop::test::LogicalTimeControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 100);
     service.start(0);
     auto profile = session_profile_request(100, 0);
     profile.profile.max_brake_pressure_bar = profile.profile.service_brake_pressure_bar = profile.profile.hard_brake_pressure_bar = 0;
@@ -2986,7 +3045,7 @@ void test_configurable_late_frames_and_independent_hard_timeout() {
     auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
     auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
     auto* view = adapter.get();
-    mine_teleop::VehicleControlService service(
+    mine_teleop::test::LogicalTimeControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
     service.start(0);
     auto profile = session_profile_request(100, 0);
@@ -3034,7 +3093,7 @@ void test_configurable_late_frames_and_independent_hard_timeout() {
 
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
   auto profile = session_profile_request(100, 0);
@@ -3081,7 +3140,7 @@ void test_timeout_profile_revocation_preserves_watchdog_stop() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
   auto* view = adapter.get();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
   activate_adapter_owned_session_profile(service, *view);
@@ -3115,7 +3174,7 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
   {
     auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
     auto* adapter_view = adapter.get();
-    mine_teleop::VehicleControlService service(
+    mine_teleop::test::LogicalTimeControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
     service.start(0);
     adapter_view->handshake.state = "standby";
@@ -3174,7 +3233,7 @@ void test_control_service_preserves_physical_brake_across_degraded_timeout() {
   {
     auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
     auto* adapter_view = adapter.get();
-    mine_teleop::VehicleControlService service(
+    mine_teleop::test::LogicalTimeControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 10000);
     service.start(0);
     activate_adapter_owned_session_profile(service, *adapter_view);
@@ -3197,7 +3256,7 @@ void test_control_service_defers_to_adapter_owned_safe_stop_until_fresh_handshak
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
   auto* adapter_view = adapter.get();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 10000);
   service.start(0);
   activate_adapter_owned_session_profile(service, *adapter_view);
@@ -3289,7 +3348,7 @@ void test_adapter_handshake_does_not_clear_outer_estop_or_fault() {
   {
     auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
     auto* adapter_view = adapter.get();
-    mine_teleop::VehicleControlService service(
+    mine_teleop::test::LogicalTimeControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
     service.start(0);
     adapter_view->set_safe_stop(true, true, false);
@@ -3317,7 +3376,7 @@ void test_adapter_handshake_does_not_clear_outer_estop_or_fault() {
     auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
     auto* adapter_view = adapter.get();
     adapter_view->telemetry_throws = true;
-    mine_teleop::VehicleControlService service(
+    mine_teleop::test::LogicalTimeControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
     service.start(0);
     activate_adapter_owned_session_profile(service, *adapter_view);
@@ -3341,7 +3400,7 @@ void test_reset_estop_rejects_unreadable_disarming_and_hard_adapter_stops() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<AdapterOwnedSafeStopAdapter>();
   auto* adapter_view = adapter.get();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
 
@@ -3379,7 +3438,7 @@ void test_reset_estop_clears_soft_stop_before_fresh_control() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
   auto* adapter_view = adapter.get();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
 
@@ -3415,7 +3474,7 @@ void test_control_service_applies_vehicle_hard_limits() {
   config.field_safety.max_steering_angle_deg = 3.0;
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
   auto* adapter_view = adapter.get();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
   const auto profile = service.receive_session_profile(
@@ -3525,7 +3584,7 @@ void test_control_service_applies_session_steering_limit() {
   config.field_safety.max_steering_angle_deg = 5.0;
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
   auto* adapter_view = adapter.get();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
   auto profile = session_profile_request(1, 0);
@@ -3560,7 +3619,7 @@ void test_control_service_applies_session_steering_limit() {
 
 void test_control_service_bounds_telemetry_history() {
   const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config,
       "driver-001",
       "session-001",
@@ -3620,7 +3679,7 @@ void test_control_service_close_preserves_stop_provenance() {
   {
     auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
     auto* adapter_view = adapter.get();
-    mine_teleop::VehicleControlService service(
+    mine_teleop::test::LogicalTimeControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
     service.start(0);
     service.close({
@@ -3636,7 +3695,7 @@ void test_control_service_close_preserves_stop_provenance() {
   {
     auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
     auto* adapter_view = adapter.get();
-    mine_teleop::VehicleControlService service(
+    mine_teleop::test::LogicalTimeControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
     service.start(0);
     service.close({
@@ -3652,7 +3711,7 @@ void test_control_service_close_preserves_stop_provenance() {
   {
     auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
     auto* adapter_view = adapter.get();
-    mine_teleop::VehicleControlService service(
+    mine_teleop::test::LogicalTimeControlService service(
         config, "driver-001", "session-001", "token", std::move(adapter), 100);
     service.start(0);
     service.close();
@@ -3670,7 +3729,7 @@ void test_control_service_requires_feedback_before_actuation_but_allows_estop() 
   config.field_safety.require_can_feedback_before_control = true;
   auto adapter = std::make_unique<NoFeedbackAdapter>();
   auto* adapter_view = adapter.get();
-  mine_teleop::VehicleControlService service(
+  mine_teleop::test::LogicalTimeControlService service(
       config, "driver-001", "session-001", "token", std::move(adapter), 100);
   service.start(0);
   activate_session_profile(service);
@@ -4725,6 +4784,7 @@ int main() {
       {"real_adapter_profile_changes_require_parking_and_apply_before_ack", test_real_adapter_profile_changes_require_parking_and_apply_before_ack},
       {"control_service_commits_only_successfully_applied_commands",
        test_control_service_commits_only_successfully_applied_commands},
+      {"control_watchdog_and_telemetry_ignore_utc_anchor_steps", test_control_watchdog_and_telemetry_ignore_utc_anchor_steps},
       {"control_service_reports_safe_stop_output_after_timeout", test_control_service_reports_safe_stop_output_after_timeout},
       {"control_service_recovers_from_degraded_command_gap_without_profile_reapply",
        test_control_service_recovers_from_degraded_command_gap_without_profile_reapply},

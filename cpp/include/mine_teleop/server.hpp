@@ -36,6 +36,10 @@ struct HttpRequest {
   std::unordered_map<std::string, std::string> query;
   std::unordered_map<std::string, std::string> headers;
   std::string body;
+  // Local receive boundary, before application routing/locks. Never from headers.
+  std::optional<std::int64_t> received_at_utc_ms;
+  std::optional<std::int64_t> received_at_monotonic_ms;
+  std::optional<std::int64_t> parsed_at_monotonic_ms;
 
   [[nodiscard]] Json json_body() const;
 };

@@ -452,8 +452,28 @@ V7 的 `vehicle_control_braking_wait` / `vehicle_control_recovered` 记录共同
 - `http.dns_ms/connect_ms/tls_ms/first_byte_ms/total_ms`：libcurl 从请求开始累计的
   阶段时刻，单位 ms；不是可直接相加的独立耗时。连接复用或失败时部分值可为零。
 - `server_api_gate_wait_ms`：云端 API 限流门锁等待；旧云端没有此字段时为 null。
-  这个值未改变四时间戳校时公式。失败请求记录 `details.http_failure` 的已知 HTTP
-  时序；错误不能被当作完整采样或可信锚点。
+  新云端还记录 `server_before_handler_ms/server_parse_ms/server_processing_monotonic_ms`。
+  T2 在收到完整请求后、解析与业务锁之前；已知云端处理等待由 T3−T2 扣除。
+- `http.request_sent_at_utc_ms/body_received_at_utc_ms/exchange_monotonic_ms`：新客户端
+  的 HTTP 发送头/接收体边界。`timestamp_scope` 区分实际回调与旧调用边界回退；
+  DNS/TLS 和客户端锁等待不再计入该校时交换 RTT。回调不是网卡物理收发时间。
+- `http.tcp_before_send/tcp_at_receive`：仅在该次 curl 所拥有的套接字仍有效时采样；
+  可用时包含 TCP RTT、重传和缓冲。平台不支持或拿不到 socket 时显式标不可用。
+  不记录 URL、凭证、HTTP 头或正文；零重传不能证明没有网络/代理排队。
+- 失败组记录 `details.sample_failure.failed_sample_index/completed_samples` 和
+  `details.http_failure`；`completed_samples` 表示 HTTP 已完成的样本，`valid=false`
+  标明时间校验失败，不能把未完成或矛盾采样当作可信锚点。
+
+`control_timing.timer_domain=steady_clock` 的有效控制年龄、车端接收间隔和遥测发布
+间隔使用单调时钟。包内 UTC 年龄校验不变；硬停车追踪保留单调
+`last_accepted_control_age_ms`，另以 `last_accepted_control_utc_age_ms` 供校时诊断。
+UTC 锚点前后跳不应被误算成真实控制断流；真实无有效控制仍按原门限停车。
+
+`vehicle_camera_capture_sample` 增加 `requested_capture_fps/target_encode_fps`、
+`capture_fps_observed/capture_fps_sample_duration_ms`；首个无完整窗口的样本为 null。
+`capture_diagnostics` 记录 timeperframe 能力、分子/分母及 `driver_negotiated_fps`。
+这些记录核验驱动交付频率，不证明传感器物理采集频率。完整复核见
+[校时、采集频率与硬停车复核](43-time-sync-threshold-capture-and-stop-review.md)。
 
 被拒绝的采样组不替换上一份可信 UTC/单调时钟锚点，立即进入恢复重试资格；不可信
 阶段工作线程以 100 ms 轮询，可信阶段仍为 500 ms。样本数、不确定度阈值和车端

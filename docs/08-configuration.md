@@ -369,6 +369,13 @@ MJPEG/testsrc/vendor pipeline 保持原状。`VIDIOC_S_PARM` 成功返回后，�
 `timeperframe` 分子、分母必须非零，且必须精确等于配置的 `1/capture_fps`；驱动返回
 其它速率时启动失败并报告 `camera_ccg2_fps_mismatch`，不会按近似值继续运行。
 
+要请求 20/25 Hz 直接采集，将每路 `capture_fps` 与使用的 realtime profile `fps`
+同时设为 20/25；匹配时不添加 `videorate`。请求是否成功应检查启动协商值与
+`vehicle_camera_capture_sample` 的 5 s 实测交付帧率。V4L2 允许驱动跳帧实现速率，
+因此这些值不能证明传感器曝光或级联触发已降频，仍需板卡/驱动厂商核验。
+关键视频的毫秒制动/恢复门限不随 FPS 自动延长；20 Hz 正常帧间隔是 50 ms，
+25 Hz 是 40 ms。现场配置保持原值，修改前需在停车台架上确认支持的模式。
+
 示例的 `hardware.encoding` 有意使用 `preferred_encoder: vaapi`、
 `fallback_encoder: nvenc`。Ubuntu 22.04/GStreamer 1.20.3 的目标机上，RTX 2000 Ada
 NVCodec 会在运行期报告 `Selected preset not supported`，而 Intel VAAPI 已用同一

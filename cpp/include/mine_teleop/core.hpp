@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <deque>
 #include <filesystem>
 #include <memory>
@@ -276,6 +277,8 @@ class ControlReceiver {
       int timestamp_warning_skew_ms = 5000);
 
   ReceiveResult accept(const ControlCommand& command, std::int64_t receive_time_ms);
+  ReceiveResult accept(const ControlCommand& command, std::int64_t receive_time_ms,
+      std::int64_t arrival_monotonic_ms);
   void set_consecutive_late_frame_limit(int limit);
   [[nodiscard]] int consecutive_late_frame_limit() const { return consecutive_late_frame_limit_; }
   [[nodiscard]] int consecutive_late_frames() const { return consecutive_late_frames_; }
@@ -799,13 +802,16 @@ std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& conf
 
 class VehicleControlService {
  public:
+  // Method timestamps remain UTC for packet validation/wire telemetry. Elapsed
+  // control and telemetry intervals use steady_clock (injectable in tests).
   VehicleControlService(
       const VehicleConfig& config,
       std::string driver_id,
       std::string session_id,
       std::string control_token,
       std::unique_ptr<VehicleAdapter> adapter,
-      int telemetry_interval_ms = 100);
+      int telemetry_interval_ms = 100,
+      std::function<std::int64_t()> monotonic_clock = {});
   ~VehicleControlService();
 
   void start(std::int64_t now_ms);
@@ -842,7 +848,7 @@ class VehicleControlService {
 
  private:
   [[nodiscard]] bool refresh_adapter_safe_stop_state() noexcept;
-  void evaluate_control_watchdog(std::int64_t now_ms);
+  void evaluate_control_watchdog();
   void apply_recovery_brake(std::string_view gear_override = {});
   void clear_session_profile() noexcept;
   [[nodiscard]] SessionControlProfileResult profile_result(
@@ -859,6 +865,7 @@ class VehicleControlService {
   std::string control_token_;
   std::string commissioning_mode_;
   ControlReceiver receiver_;
+  std::function<std::int64_t()> monotonic_clock_;
   SafetyStateMachine safety_;
   std::unique_ptr<VehicleAdapter> adapter_;
   bool require_feedback_before_control_{true};

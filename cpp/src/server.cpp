@@ -1020,8 +1020,12 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
     if (wire.size() > max_headers) throw std::invalid_argument("HTTP headers too large");
   }
 
+  const auto headers_received_at_utc_ms = now_ms();
+  const auto headers_received_at_monotonic_ms = monotonic_now_ms();
   std::istringstream headers(wire.substr(0, header_end));
   HttpRequest request;
+  request.received_at_utc_ms = headers_received_at_utc_ms;
+  request.received_at_monotonic_ms = headers_received_at_monotonic_ms;
   std::string request_line;
   if (!std::getline(headers, request_line)) throw std::invalid_argument("missing HTTP request line");
   request_line = trim(std::move(request_line));
@@ -1061,6 +1065,8 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
     }
     if (received == 0) throw std::invalid_argument("client closed before sending HTTP body");
     wire.append(buffer.data(), static_cast<std::size_t>(received));
+    request.received_at_utc_ms = now_ms();
+    request.received_at_monotonic_ms = monotonic_now_ms();
   }
   request.body = wire.substr(body_start, content_length);
 
@@ -1080,6 +1086,7 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
       start = end + 1;
     }
   }
+  request.parsed_at_monotonic_ms = monotonic_now_ms();
   return request;
 }
 
@@ -2830,6 +2837,8 @@ ServerResponse SignalingService::handle_mobile_api(const HttpRequest& request) {
 ServerResponse SignalingService::handle(const HttpRequest& request) {
   RequestIdScope request_id("request-" + random_token(12));
   ServerResponse response;
+  const auto entered_at_utc_ms = now_ms();
+  const auto entered_at_monotonic_ms = monotonic_now_ms();
   std::int64_t api_gate_wait_ms = 0;
   try {
     {
@@ -2849,6 +2858,14 @@ ServerResponse SignalingService::handle(const HttpRequest& request) {
       response = handle_get(request);
       if (request.path == "/time" && response.status == 200) {
         auto body = Json::parse(response.body);
+        body["server_receive_ms"] = request.received_at_utc_ms.value_or(entered_at_utc_ms);
+        body["server_send_ms"] = now_ms();
+        body["timestamp_scope"] = "http_request_received_to_response_ready";
+        body["server_before_handler_ms"] = request.received_at_monotonic_ms
+            ? Json(std::max<std::int64_t>(0, entered_at_monotonic_ms - *request.received_at_monotonic_ms)) : Json(nullptr);
+        body["server_parse_ms"] = request.received_at_monotonic_ms && request.parsed_at_monotonic_ms
+            ? Json(std::max<std::int64_t>(0, *request.parsed_at_monotonic_ms - *request.received_at_monotonic_ms)) : Json(nullptr);
+        body["server_processing_monotonic_ms"] = monotonic_now_ms() - request.received_at_monotonic_ms.value_or(entered_at_monotonic_ms);
         body["server_api_gate_wait_ms"] = api_gate_wait_ms;
         response.body = body.dump();
       }
@@ -5315,11 +5332,13 @@ void DriverConsoleRuntime::time_sync_loop(std::stop_token stop_token) {
     const auto started = monotonic_now_ms();
     std::string error;
     Json http_failure;
+    Json sample_failure;
     try {
       static_cast<void>(refresh_time_sync());
     } catch (const std::exception& failure) {
       error = std::string(failure.what()).substr(0, 512);
       if (const auto* transport = dynamic_cast<const HttpTransportError*>(&failure)) http_failure = transport->timing();
+      if (const auto* sample = dynamic_cast<const TimeSyncSampleError*>(&failure)) { sample_failure = sample->diagnostics(); http_failure = sample_failure.value("http_failure", Json(nullptr)); }
       if (clock_.status().acceptable(config_.max_time_sync_uncertainty_ms)) clock_.mark_refresh_failed();
       // Keep the transport/session alive, but no previously held motion may
       // become executable merely because a later time sample is good.
@@ -5328,7 +5347,7 @@ void DriverConsoleRuntime::time_sync_loop(std::stop_token stop_token) {
     if (native_control_trace_) native_control_trace_->enqueue({
         {"stage", "time_sync_refresh"}, {"trace_session_id", session},
         {"duration_ms", monotonic_now_ms() - started},
-        {"time_sync", clock_.status().to_json(true)}, {"error", error}, {"http_failure", std::move(http_failure)},
+        {"time_sync", clock_.status().to_json(true)}, {"error", error}, {"http_failure", std::move(http_failure)}, {"sample_failure", std::move(sample_failure)},
         {"safety_action", error.empty() ? "fresh_input_after_recovery" : "brake_with_session_retained"}});
   }
 }

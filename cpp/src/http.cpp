@@ -1,6 +1,7 @@
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/curl_tls.hpp"
 #include "mine_teleop/platform.hpp"
+#include "mine_teleop/websocket.hpp"
 
 #include <curl/curl.h>
 
@@ -36,6 +37,45 @@ std::size_t append_body(char* data, std::size_t size, std::size_t count, void* o
   const auto bytes = size * count;
   static_cast<std::string*>(output)->append(data, bytes);
   return bytes;
+}
+
+struct TimeProbeWire {
+  CURL* handle{nullptr};
+  std::string* body{nullptr};
+  std::int64_t sent_utc_ms{0}, received_utc_ms{0};
+  std::chrono::steady_clock::time_point sent_steady{}, received_steady{};
+  int requests_sent{0};
+  Json tcp_before_send, tcp_at_receive;
+};
+
+Json time_probe_tcp(CURL* handle) {
+  curl_socket_t socket = CURL_SOCKET_BAD;
+  if (curl_easy_getinfo(handle, CURLINFO_ACTIVESOCKET, &socket) != CURLE_OK || socket == CURL_SOCKET_BAD)
+    return {{"socket_available", false}, {"tcp_info_available", false}};
+  return websocket_transport_diagnostics(static_cast<SocketHandle>(socket));
+}
+
+int observe_time_request(CURL* handle, curl_infotype type, char*, std::size_t, void* context) noexcept {
+  auto& wire = *static_cast<TimeProbeWire*>(context);
+  // Ignore internal curl handles, TLS records, headers and content. No payload is logged.
+  if (handle != wire.handle || type != CURLINFO_HEADER_OUT) return 0;
+  wire.sent_utc_ms = now_ms();
+  wire.sent_steady = std::chrono::steady_clock::now();
+  wire.received_utc_ms = 0;
+  ++wire.requests_sent;
+  try { wire.tcp_before_send = time_probe_tcp(handle); } catch (...) {}
+  return 0;
+}
+
+std::size_t receive_time_body(char* data, std::size_t size, std::size_t count, void* context) noexcept {
+  auto& wire = *static_cast<TimeProbeWire*>(context);
+  wire.received_utc_ms = now_ms();
+  wire.received_steady = std::chrono::steady_clock::now();
+  try {
+    wire.tcp_at_receive = time_probe_tcp(wire.handle);
+    wire.body->append(data, size * count);
+    return size * count;
+  } catch (...) { return 0; }
 }
 
 Json decode_json_response(const HttpResponse& response) {
@@ -158,6 +198,10 @@ HttpResponse HttpClient::request(
   CURL* curl = impl_->curl;
   curl_easy_reset(curl);
   HttpResponse response;
+  const bool time_probe = method == "GET" && url.find("/time?client_send_ms=") != std::string_view::npos;
+  TimeProbeWire wire;
+  wire.handle = curl;
+  wire.body = &response.body;
   curl_slist* headers = nullptr;
   const std::string request_url(url);
   const std::string ca_bundle = impl_->ca_bundle.string();
@@ -184,6 +228,13 @@ HttpResponse HttpClient::request(
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "mine-teleop-cpp/0.2");
+    if (time_probe) {
+      curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+      curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, observe_time_request);
+      curl_easy_setopt(curl, CURLOPT_DEBUGDATA, &wire);
+      curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive_time_body);
+      curl_easy_setopt(curl, CURLOPT_WRITEDATA, &wire);
+    }
     for (const auto& [name, value] : request_headers) {
       if (name.empty() || name.find_first_of(":\r\n") != std::string::npos ||
           value.find_first_of("\r\n") != std::string::npos) {
@@ -206,9 +257,14 @@ HttpResponse HttpClient::request(
       curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
     }
     const auto result = curl_easy_perform(curl);
-    if (method == "GET" && url.find("/time?client_send_ms=") != std::string_view::npos) {
+    if (time_probe) {
       response.timing = {{"client_mutex_wait_ms", std::chrono::duration_cast<std::chrono::milliseconds>(acquired - waiting_started).count()},
-                         {"curl_result", static_cast<int>(result)}};
+                         {"curl_result", static_cast<int>(result)}, {"requests_sent", wire.requests_sent},
+                         {"request_sent_at_utc_ms", wire.sent_utc_ms > 0 ? Json(wire.sent_utc_ms) : Json(nullptr)},
+                         {"body_received_at_utc_ms", wire.received_utc_ms > 0 ? Json(wire.received_utc_ms) : Json(nullptr)},
+                         {"exchange_monotonic_ms", wire.sent_utc_ms > 0 && wire.received_utc_ms > 0
+                             ? Json(std::chrono::duration_cast<std::chrono::milliseconds>(wire.received_steady - wire.sent_steady).count()) : Json(nullptr)},
+                         {"tcp_before_send", wire.tcp_before_send}, {"tcp_at_receive", wire.tcp_at_receive}};
       for (const auto& [name, info] : std::initializer_list<std::pair<const char*, CURLINFO>>{
           {"dns_ms", CURLINFO_NAMELOOKUP_TIME}, {"connect_ms", CURLINFO_CONNECT_TIME},
           {"tls_ms", CURLINFO_APPCONNECT_TIME}, {"first_byte_ms", CURLINFO_STARTTRANSFER_TIME}, {"total_ms", CURLINFO_TOTAL_TIME}}) {
@@ -268,25 +324,59 @@ TimeSyncStatus SynchronizedClock::synchronize(
   for (int index = 0; index < sample_count; ++index) {
     const auto client_send_ms = mine_teleop::now_ms();
     const auto request_started = std::chrono::steady_clock::now();
-    const auto http_response = http.get(origin + "/time?client_send_ms=" + std::to_string(client_send_ms));
-    const auto client_receive_ms = mine_teleop::now_ms();
-    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - request_started).count();
-    const auto response = decode_json_response(http_response);
-    const auto echoed_client_send_ms = response.at("client_send_ms").get<std::int64_t>();
-    const auto server_receive_ms = response.at("server_receive_ms").get<std::int64_t>();
-    const auto server_send_ms = response.at("server_send_ms").get<std::int64_t>();
-    if (echoed_client_send_ms != client_send_ms || server_send_ms < server_receive_ms) {
-      throw std::runtime_error("signaling time endpoint returned an invalid four-timestamp sample");
+    HttpResponse http_response;
+    try {
+      http_response = http.get(origin + "/time?client_send_ms=" + std::to_string(client_send_ms));
+      const auto client_receive_ms = mine_teleop::now_ms();
+      const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - request_started).count();
+      const auto response = decode_json_response(http_response);
+      const auto echoed_client_send_ms = response.at("client_send_ms").get<std::int64_t>();
+      const auto server_receive_ms = response.at("server_receive_ms").get<std::int64_t>();
+      const auto server_send_ms = response.at("server_send_ms").get<std::int64_t>();
+      if (echoed_client_send_ms != client_send_ms || server_send_ms < server_receive_ms) {
+        throw std::runtime_error("signaling time endpoint returned an invalid four-timestamp sample");
+      }
+      const auto& timing = http_response.timing;
+      const bool wire_timestamps = timing.contains("request_sent_at_utc_ms") && timing.at("request_sent_at_utc_ms").is_number_integer() &&
+          timing.contains("body_received_at_utc_ms") && timing.at("body_received_at_utc_ms").is_number_integer();
+      const auto sample_send_ms = wire_timestamps ? timing.at("request_sent_at_utc_ms").get<std::int64_t>() : client_send_ms;
+      const auto sample_receive_ms = wire_timestamps ? timing.at("body_received_at_utc_ms").get<std::int64_t>() : client_receive_ms;
+      const auto server_processing_ms = server_send_ms - server_receive_ms;
+      const auto round_trip_ms = std::max<std::int64_t>(0, sample_receive_ms - sample_send_ms - server_processing_ms);
+      const auto offset_ms = ((server_receive_ms - sample_send_ms) + (server_send_ms - sample_receive_ms)) / 2;
+
+      diagnostics.push_back({{"index", index}, {"round_trip_ms", round_trip_ms}, {"offset_ms", offset_ms},
+          {"server_processing_ms", server_processing_ms}, {"monotonic_elapsed_ms", elapsed_ms},
+          {"wall_clock_elapsed_ms", client_receive_ms - client_send_ms},
+          {"wall_clock_step_ms", client_receive_ms - client_send_ms - elapsed_ms},
+          {"server_api_gate_wait_ms", response.value("server_api_gate_wait_ms", Json(nullptr))}, {"http", http_response.timing}});
+      diagnostics.back()["timestamp_scope"] = wire_timestamps ? "http_header_out_to_body_received" : "call_to_return_fallback";
+      diagnostics.back()["server_timestamp_scope"] = response.value("timestamp_scope", "legacy_handler_boundary");
+      diagnostics.back()["server_before_handler_ms"] = response.value("server_before_handler_ms", Json(nullptr));
+      diagnostics.back()["server_parse_ms"] = response.value("server_parse_ms", Json(nullptr));
+      diagnostics.back()["server_processing_monotonic_ms"] = response.value("server_processing_monotonic_ms", Json(nullptr));
+      const auto wall_exchange_ms = sample_receive_ms - sample_send_ms;
+      const auto mono_exchange_ms = wire_timestamps && timing.at("exchange_monotonic_ms").is_number_integer()
+          ? timing.at("exchange_monotonic_ms").get<std::int64_t>() : elapsed_ms;
+      diagnostics.back()["exchange_wall_clock_step_ms"] = wall_exchange_ms - mono_exchange_ms;
+      diagnostics.back()["valid"] = false;
+      const auto clock_step_limit_ms = std::max(1, max_uncertainty_ms.value_or(25));
+      if (wall_exchange_ms < 0 || std::abs(wall_exchange_ms - mono_exchange_ms) > clock_step_limit_ms ||
+          server_processing_ms > wall_exchange_ms + clock_step_limit_ms) {
+        throw std::runtime_error("four-timestamp sample has inconsistent wall/monotonic elapsed time or server processing duration");
+      }
+      diagnostics.back()["valid"] = true;
+      samples.push_back({offset_ms, round_trip_ms});
+    } catch (const std::exception& error) {
+      Json detail = {{"failed_sample_index", index}, {"completed_samples", diagnostics}, {"http", http_response.timing}};
+      if (const auto* transport = dynamic_cast<const HttpTransportError*>(&error)) detail["http_failure"] = transport->timing();
+      {
+        std::lock_guard lock(mutex_);
+        status_.synchronized = false;
+        status_.anchor_accepted = false;
+      }
+      throw TimeSyncSampleError(error.what(), std::move(detail));
     }
-    const auto server_processing_ms = server_send_ms - server_receive_ms;
-    const auto round_trip_ms = std::max<std::int64_t>(0, client_receive_ms - client_send_ms - server_processing_ms);
-    const auto offset_ms = ((server_receive_ms - client_send_ms) + (server_send_ms - client_receive_ms)) / 2;
-    samples.push_back({offset_ms, round_trip_ms});
-    diagnostics.push_back({{"index", index}, {"round_trip_ms", round_trip_ms}, {"offset_ms", offset_ms},
-        {"server_processing_ms", server_processing_ms}, {"monotonic_elapsed_ms", elapsed_ms},
-        {"wall_clock_elapsed_ms", client_receive_ms - client_send_ms},
-        {"wall_clock_step_ms", client_receive_ms - client_send_ms - elapsed_ms},
-        {"server_api_gate_wait_ms", response.value("server_api_gate_wait_ms", Json(nullptr))}, {"http", http_response.timing}});
   }
   std::sort(samples.begin(), samples.end(), [](const auto& left, const auto& right) {
     return left.round_trip_ms < right.round_trip_ms;
@@ -305,7 +395,8 @@ TimeSyncStatus SynchronizedClock::synchronize(
       true,
       selected_offset_ms,
       samples.front().round_trip_ms,
-      std::max<std::int64_t>((samples.front().round_trip_ms + 1) / 2, offset_spread_ms),
+      std::max<std::int64_t>((samples.front().round_trip_ms + 1) / 2 +
+          std::abs(selected_offset_ms - samples.front().offset_ms), offset_spread_ms),
       mine_teleop::now_ms(),
       static_cast<int>(samples.size()),
   };

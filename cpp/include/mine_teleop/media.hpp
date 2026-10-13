@@ -218,6 +218,7 @@ class CameraFrameSource {
   std::size_t last_v4l2_bytes_used_{0};
   std::uint32_t v4l2_timeperframe_numerator_{0};
   std::uint32_t v4l2_timeperframe_denominator_{0};
+  bool v4l2_timeperframe_supported_{false};
   std::optional<std::uint32_t> last_delivered_v4l2_sequence_;
   std::optional<std::uint32_t> last_dequeued_v4l2_sequence_;
   std::uint64_t last_dequeued_v4l2_sequence_gap_{0};
