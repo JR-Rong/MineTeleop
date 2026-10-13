@@ -1012,6 +1012,11 @@ void test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps() {
   expect(
       converted.find("videorate") != std::string::npos,
       "CCG2 30 FPS input did not add videorate for a 25 FPS output");
+  output.fps = 20;
+  const auto twenty = mine_teleop::build_camera_input_pipeline("source_ccg2_20", ccg2_30_fps, output);
+  expect(twenty.find("videorate") != std::string::npos && twenty.find("framerate=20/1") != std::string::npos,
+      "CCG2 30 FPS capture cannot independently produce 20 FPS output");
+  output.fps = 25;
 
   const mine_teleop::CameraInputSpec ccg2_25_fps{"uyvy", 1920, 1080, 25};
   const auto unchanged =
@@ -1351,6 +1356,10 @@ void test_critical_video_wait_recovers_and_never_extends_the_hard_deadline() {
   expect(!latch.enter_session("video"), "new session inhibited");
   expect(latch.observe_recovery("video", true, 100, 5000) == Phase::Ready, "healthy video started braking");
   expect(latch.observe_recovery("video", false, 200, 5000) == Phase::BrakingWait, "missing video did not start braking");
+  const auto reported = latch.recovery_status_for("video");
+  expect(reported.at("cause") == "critical_video" && reported.at("timeout_ms") == 5000 &&
+      reported.at("deadline_monotonic_ms") == 5200, "vehicle status cannot explain its frozen stop deadline");
+  expect_throws([&] { static_cast<void>(latch.recovery_status_for("other")); }, "recovery explanation crossed sessions");
   expect(!latch.enter_session("video") && latch.braking_wait_for("video"), "runtime rebuild lost braking state");
   expect(latch.observe_recovery("video", true, 1000, 5000) == Phase::BrakingWait, "one good observation released braking");
   expect(latch.observe_recovery("video", false, 1100, 5000) == Phase::BrakingWait, "repeated loss cleared braking");
@@ -4308,6 +4317,9 @@ void test_signaling_time_sync_common_domain() {
   const auto direct = http.get_json(base + "/time?client_send_ms=12345");
   expect(direct.value("client_send_ms", 0) == 12345, "time endpoint did not echo the client timestamp");
   expect(direct.value("time_domain", "") == "signaling_server", "time endpoint domain changed");
+  expect(direct.contains("server_api_gate_wait_ms") && direct.at("server_api_gate_wait_ms") >= 0 &&
+      status.to_json(true).at("samples").front().at("server_api_gate_wait_ms") != nullptr,
+      "cloud time endpoint lost its API gate timing in client diagnostics");
   server.stop();
 }
 
@@ -4530,7 +4542,8 @@ void test_native_driver_to_vehicle_signaling_control_payload() {
       receiver.receive_session_profile(profile, received_at_ms).accepted,
       "vehicle receiver did not ACK the session profile before control");
   const auto applied = receiver.receive_command(control, received_at_ms);
-  expect(applied.accepted, "vehicle receiver did not accept the native signaling control payload");
+  expect(applied.accepted, "vehicle receiver did not accept the native signaling control payload: " + applied.reason +
+      ", command_age_ms=" + std::to_string(received_at_ms - control.sent_at_utc_ms));
   const auto duplicate = receiver.receive_command(control, received_at_ms + 1);
   expect(!duplicate.accepted && duplicate.reason == "old_seq", "vehicle receiver accepted a duplicate command");
   receiver.close();

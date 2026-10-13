@@ -152,7 +152,9 @@ HttpResponse HttpClient::request(
   if (!url.starts_with("http://") && !url.starts_with("https://")) {
     throw std::invalid_argument("HTTP URL must use http or https");
   }
+  const auto waiting_started = std::chrono::steady_clock::now();
   std::lock_guard lock(impl_->mutex);
+  const auto acquired = std::chrono::steady_clock::now();
   CURL* curl = impl_->curl;
   curl_easy_reset(curl);
   HttpResponse response;
@@ -204,9 +206,23 @@ HttpResponse HttpClient::request(
       curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
     }
     const auto result = curl_easy_perform(curl);
+    if (method == "GET" && url.find("/time?client_send_ms=") != std::string_view::npos) {
+      response.timing = {{"client_mutex_wait_ms", std::chrono::duration_cast<std::chrono::milliseconds>(acquired - waiting_started).count()},
+                         {"curl_result", static_cast<int>(result)}};
+      for (const auto& [name, info] : std::initializer_list<std::pair<const char*, CURLINFO>>{
+          {"dns_ms", CURLINFO_NAMELOOKUP_TIME}, {"connect_ms", CURLINFO_CONNECT_TIME},
+          {"tls_ms", CURLINFO_APPCONNECT_TIME}, {"first_byte_ms", CURLINFO_STARTTRANSFER_TIME}, {"total_ms", CURLINFO_TOTAL_TIME}}) {
+        double seconds = 0;
+        if (curl_easy_getinfo(curl, info, &seconds) == CURLE_OK) response.timing[name] = seconds * 1000.0;
+      }
+      char* peer = nullptr;
+      if (curl_easy_getinfo(curl, CURLINFO_PRIMARY_IP, &peer) == CURLE_OK && peer) response.timing["peer_address"] = peer;
+      long connections = 0;
+      if (curl_easy_getinfo(curl, CURLINFO_NUM_CONNECTS, &connections) == CURLE_OK) response.timing["new_connections"] = connections;
+    }
     if (result != CURLE_OK) {
       const auto detail = error_buffer.front() == '\0' ? curl_easy_strerror(result) : error_buffer.data();
-      throw HttpTransportError(std::string("HTTP request failed: ") + detail);
+      throw HttpTransportError(std::string("HTTP request failed: ") + detail, std::move(response.timing));
     }
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
   } catch (...) {
@@ -217,8 +233,8 @@ HttpResponse HttpClient::request(
   return response;
 }
 
-Json TimeSyncStatus::to_json() const {
-  return {
+Json TimeSyncStatus::to_json(bool include_samples) const {
+  Json result = {
       {"time_domain", "signaling_server"},
       {"synchronized", synchronized},
       {"offset_ms", offset_ms},
@@ -229,6 +245,8 @@ Json TimeSyncStatus::to_json() const {
       {"anchor_accepted", anchor_accepted},
       {"accepted_anchor_local_ms", accepted_anchor_local_ms},
   };
+  if (include_samples) result["samples"] = samples ? *samples : Json::array();
+  return result;
 }
 
 bool TimeSyncStatus::acceptable(int max_uncertainty_ms) const {
@@ -245,12 +263,15 @@ TimeSyncStatus SynchronizedClock::synchronize(
     std::int64_t round_trip_ms;
   };
   std::vector<Sample> samples;
+  Json diagnostics = Json::array();
   samples.reserve(static_cast<std::size_t>(sample_count));
   for (int index = 0; index < sample_count; ++index) {
     const auto client_send_ms = mine_teleop::now_ms();
-    const auto response = http.get_json(
-        origin + "/time?client_send_ms=" + std::to_string(client_send_ms));
+    const auto request_started = std::chrono::steady_clock::now();
+    const auto http_response = http.get(origin + "/time?client_send_ms=" + std::to_string(client_send_ms));
     const auto client_receive_ms = mine_teleop::now_ms();
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - request_started).count();
+    const auto response = decode_json_response(http_response);
     const auto echoed_client_send_ms = response.at("client_send_ms").get<std::int64_t>();
     const auto server_receive_ms = response.at("server_receive_ms").get<std::int64_t>();
     const auto server_send_ms = response.at("server_send_ms").get<std::int64_t>();
@@ -261,6 +282,11 @@ TimeSyncStatus SynchronizedClock::synchronize(
     const auto round_trip_ms = std::max<std::int64_t>(0, client_receive_ms - client_send_ms - server_processing_ms);
     const auto offset_ms = ((server_receive_ms - client_send_ms) + (server_send_ms - client_receive_ms)) / 2;
     samples.push_back({offset_ms, round_trip_ms});
+    diagnostics.push_back({{"index", index}, {"round_trip_ms", round_trip_ms}, {"offset_ms", offset_ms},
+        {"server_processing_ms", server_processing_ms}, {"monotonic_elapsed_ms", elapsed_ms},
+        {"wall_clock_elapsed_ms", client_receive_ms - client_send_ms},
+        {"wall_clock_step_ms", client_receive_ms - client_send_ms - elapsed_ms},
+        {"server_api_gate_wait_ms", response.value("server_api_gate_wait_ms", Json(nullptr))}, {"http", http_response.timing}});
   }
   std::sort(samples.begin(), samples.end(), [](const auto& left, const auto& right) {
     return left.round_trip_ms < right.round_trip_ms;
@@ -283,6 +309,7 @@ TimeSyncStatus SynchronizedClock::synchronize(
       mine_teleop::now_ms(),
       static_cast<int>(samples.size()),
   };
+  next.samples = std::make_shared<const Json>(std::move(diagnostics));
 
   const auto next_steady_anchor = std::chrono::steady_clock::now();
   const auto proposed_synchronized_ms = next.synchronized_at_local_ms + next.offset_ms;
@@ -331,7 +358,7 @@ TimeSyncStatus SynchronizedClock::status() const {
 bool SynchronizedClock::refresh_due(int interval_ms) const {
   if (interval_ms <= 0) throw std::invalid_argument("time sync refresh interval must be positive");
   std::lock_guard lock(mutex_);
-  return !status_.synchronized ||
+  return !status_.synchronized || !status_.anchor_accepted ||
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - steady_anchor_).count() >=
           interval_ms;
 }

@@ -273,14 +273,19 @@
     return profile;
   }
 
-  function vehicleControlDiagnostic(issueCode) {
+  function vehicleControlDiagnostic(issueCode, recovery) {
+    const causes = {time_sync: '时间同步不可信', input_lease: '驾驶输入刷新过期',
+      control_link: '控制链路 ACK 确认中断', critical_video: '关键视频中断或无新帧'};
+    const cause = recovery && causes[recovery.cause];
+    const timeout = recovery && Number(recovery.timeout_ms);
+    const deadline = Number.isFinite(timeout) && timeout > 0 ? `${timeout / 1000} 秒` : '配置期限';
     if (issueCode === 'control_recovery_braking_wait') return {
       level: 'warn', title: '控制暂缓，制动等待恢复',
-      text: '牵引已撤销，车辆正在制动；当前会话与参数保留。视频、时间同步与输入刷新恢复后，释放旧运动输入再重新按下继续；持续超时将安全停车。',
+      text: `${cause ? '原因：' + cause + '。' : ''}牵引已撤销，车辆正在制动；当前会话与参数保留。故障恢复后保持制动等待新操作；持续超过${deadline}将安全停车。`,
     };
     if (issueCode === 'control_recovery_timeout') return {
-      level: 'critical', title: '控制故障持续超时，控制已锁定',
-      text: '时间同步或输入刷新未在等待期限内稳定恢复。车辆已安全停车；请结束会话，待链路正常后重新连接。',
+      level: 'critical', title: cause ? `${cause}，恢复超时` : '控制故障持续超时，控制已锁定',
+      text: `${cause || '控制就绪条件'}持续超过${deadline}未稳定恢复。车辆已安全停车、控制已锁定；请结束会话，待故障恢复后重新连接。`,
     };
     if (issueCode === 'critical_camera_failed') return {
       level: 'critical', title: '关键视频故障，控制已锁定',
@@ -1075,6 +1080,17 @@
     return {kind: 'none', visible: false, severity: '', banner: '', alert: ''};
   }
 
+  function deriveControlStopPresentation(localEstop, vehicleEstop, stopSource, stopReason, handshake) {
+    const safety = deriveEstopPresentation(localEstop, vehicleEstop, stopSource, stopReason);
+    if (safety.visible && safety.kind !== 'software_fault') return safety;
+    const diagnostic = vehicleControlDiagnostic(handshake && handshake.issue_code, handshake && handshake.control_recovery);
+    if (diagnostic && diagnostic.level === 'critical') {
+      return {kind: 'control_fault', visible: true, severity: 'critical',
+        banner: diagnostic.text, alert: diagnostic.text};
+    }
+    return safety;
+  }
+
   function deriveControlRecoveryPresentation(connected, telemetry, feedbackFresh, hardStopVisible) {
     const hidden = {visible: false, severity: '', banner: '', alert: '', cause: ''};
     if (!connected || !telemetry || hardStopVisible || telemetry.estop === true ||
@@ -1358,6 +1374,7 @@
     normalizeControlProfile,
     normalizeVehicleHardLimits,
     vehicleControlDiagnostic,
+    deriveControlStopPresentation,
     mergeControlProfileWithHardLimits,
     controlProfileFromVehicleDefaults,
     controlProfileThrottleLimit,

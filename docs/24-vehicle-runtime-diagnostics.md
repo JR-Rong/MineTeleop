@@ -437,3 +437,34 @@ V7 的 `vehicle_control_braking_wait` / `vehicle_control_recovered` 记录共同
 区分当前制动保持与硬停车后的媒体状态变化，`soft_brake_applied_this_transition` 由
 适配器成功安全输出调用计数差判定，只证明软件 API 返回，不证明物理 EHB/EPB 完成。
 字段只随转换记录，不按帧刷日志；分析方法与例证见 [session-000075](39-session75-stop-analysis.md)。
+
+
+## 校时请求与页面停车原因（session-000006）
+
+`time_sync_refresh.details.time_sync.samples` 仅随校时刷新追踪记录，最多 15 个样本；
+普通状态、控制循环和媒体状态不重复携带这份详细数组。样本包括：
+
+- `round_trip_ms`、`offset_ms`、`server_processing_ms`：既有四时间戳计算结果。
+- `monotonic_elapsed_ms`、`wall_clock_elapsed_ms`、`wall_clock_step_ms`：本地等待与
+  系统墙钟变化的对比；小幅差值可能来自取整/调度，不能单独认定系统发生跳时。
+- `http.client_mutex_wait_ms`：等待本地 HttpClient 互斥锁的时间；`peer_address`、
+  `new_connections` 和 `curl_result` 描述实际请求的连接及结果。
+- `http.dns_ms/connect_ms/tls_ms/first_byte_ms/total_ms`：libcurl 从请求开始累计的
+  阶段时刻，单位 ms；不是可直接相加的独立耗时。连接复用或失败时部分值可为零。
+- `server_api_gate_wait_ms`：云端 API 限流门锁等待；旧云端没有此字段时为 null。
+  这个值未改变四时间戳校时公式。失败请求记录 `details.http_failure` 的已知 HTTP
+  时序；错误不能被当作完整采样或可信锚点。
+
+被拒绝的采样组不替换上一份可信 UTC/单调时钟锚点，立即进入恢复重试资格；不可信
+阶段工作线程以 100 ms 轮询，可信阶段仍为 500 ms。样本数、不确定度阈值和车端
+首次故障硬截止点保持原规则。它减少可避免的等待，不保证持续高延迟能在期限内恢复。
+
+车端既有 `vcu_handshake_status` 和 `media_status` 增加可选 `control_recovery`：
+`cause`、`phase`、冻结的 `timeout_ms` 及 `deadline_monotonic_ms`。单调时刻只用于
+车端关联日志，页面不跨机器比较该值。红色条显示具体原因与恢复期限，并在控制
+DataChannel 关闭后保留；物理急停和人工急停仍优先。信令中的硬故障也将页面控制
+资格置为 fault，后续健康媒体状态不能解锁。新会话清除上一会话的原因。
+
+关键画面遮罩在连续 1000 ms 无呈现新帧后显示；制动仍按协商的
+`critical_camera_stale_brake_ms` 判断，非关键画面仍为 3000 ms。完整实例和 FPS
+配置边界见 [session-000006](42-session006-time-sync-and-video-display.md)。

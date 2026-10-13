@@ -248,6 +248,14 @@ std::optional<std::int64_t> SessionControlRecoveryLatch::deadline_for(std::strin
   return braking_started_ms_ ? std::optional<std::int64_t>(*braking_started_ms_ + braking_timeout_ms_) : std::nullopt;
 }
 
+Json SessionControlRecoveryLatch::recovery_status_for(std::string_view session_id) const {
+  std::lock_guard lock(mutex_);
+  if (session_id.empty() || session_id_ != session_id) throw std::logic_error("control recovery session mismatch");
+  return {{"cause", to_string(cause_)}, {"phase", inhibited_ ? "locked" : braking_started_ms_ ? "braking_wait" : "ready"},
+          {"timeout_ms", braking_timeout_ms_},
+          {"deadline_monotonic_ms", braking_started_ms_ ? Json(*braking_started_ms_ + braking_timeout_ms_) : Json(nullptr)}};
+}
+
 NeutralHeartbeatGate neutral_heartbeat_gate(
     SafetyState state, bool braking_wait, std::int64_t native_gap_ms, int degraded_timeout_ms) {
   if (state != SafetyState::ControlActive && !(braking_wait && state == SafetyState::Degraded))
@@ -2373,22 +2381,25 @@ struct VehicleMediaRuntime::Impl {
 
   void time_sync_loop(std::stop_token stop_token) noexcept {
     while (!stop_token.stop_requested() && !stop_requested.load()) {
-      if (!wait_for_native_control_reconnect(stop_token, std::chrono::milliseconds(500))) break;
+      const auto poll_ms = signaling.time_sync_status().acceptable(config.field_safety.max_time_sync_uncertainty_ms) ? 500 : 100;
+      if (!wait_for_native_control_reconnect(stop_token, std::chrono::milliseconds(poll_ms))) break;
       if (!signaling.time_sync_refresh_due(config.field_safety.time_sync_interval_ms)) continue;
       const auto started = steady_now_ms();
       std::string error;
+      Json http_failure;
       try {
         static_cast<void>(signaling.synchronize_time(config.field_safety.time_sync_samples,
                                                     config.field_safety.max_time_sync_uncertainty_ms));
       } catch (const std::exception& failure) {
         signaling.mark_time_sync_failed();
         error = std::string(failure.what()).substr(0, 512);
+        if (const auto* transport = dynamic_cast<const HttpTransportError*>(&failure)) http_failure = transport->timing();
       }
       try {
         enforce_control_recovery();
         enqueue_control_trace({{"stage", "time_sync_refresh"}, {"session_id", signaling.session_id()},
-            {"duration_ms", steady_now_ms() - started}, {"time_sync", signaling.time_sync_status().to_json()},
-            {"error", error}, {"safety_action", "recovery_guard_owns_control"}});
+            {"duration_ms", steady_now_ms() - started}, {"time_sync", signaling.time_sync_status().to_json(true)},
+            {"error", error}, {"http_failure", std::move(http_failure)}, {"safety_action", "recovery_guard_owns_control"}});
       } catch (const std::exception& failure) {
         set_pipeline_error(failure.what(), "control_recovery_brake_failed", "control_recovery",
                            "Keep the vehicle stopped and inspect the adapter/CAN failure.", false);
@@ -2564,6 +2575,10 @@ struct VehicleMediaRuntime::Impl {
       };
       if (!control_service_issue_code.empty()) {
         message["issue_code"] = control_service_issue_code;
+      }
+      if (control_service_issue_code == "control_recovery_braking_wait" ||
+          control_service_issue_code == "control_recovery_timeout" || control_service_issue_code == "critical_camera_failed") {
+        message["control_recovery"] = control_recovery_latch->recovery_status_for(signaling.session_id());
       }
       const auto payload = message.dump();
       gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
@@ -4244,6 +4259,7 @@ struct VehicleMediaRuntime::Impl {
               {"codec", to_string(candidate.codec)},
               {"backend", to_string(candidate.backend)},
               {"control_issue_code", control_inhibited.load() ? std::string(recovery_inhibition_issue()) : control_recovery_latch->braking_wait_for(signaling.session_id()) ? "control_recovery_braking_wait" : ""},
+              {"control_recovery", control_recovery_latch->recovery_status_for(signaling.session_id())},
               {"time_sync", signaling.time_sync_status().to_json()},
               {"lanes", lane_metrics(std::max<std::int64_t>(1, signaling.now_ms() - attempt_started))}};
           if (steady_now_ms() >= next_media_log_monotonic_ms) {

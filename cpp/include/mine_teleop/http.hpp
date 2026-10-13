@@ -17,6 +17,7 @@ namespace mine_teleop {
 struct HttpResponse {
   long status{0};
   std::string body;
+  Json timing;
 };
 
 using HttpHeaders = std::vector<std::pair<std::string, std::string>>;
@@ -46,6 +47,11 @@ class HttpStatusError : public std::runtime_error {
 class HttpTransportError : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
+  HttpTransportError(std::string message, Json timing)
+      : std::runtime_error(std::move(message)), timing_(std::move(timing)) {}
+  [[nodiscard]] const Json& timing() const { return timing_; }
+ private:
+  Json timing_;
 };
 
 class HttpClient {
@@ -85,8 +91,10 @@ struct TimeSyncStatus {
   int sample_count{0};
   bool anchor_accepted{false};
   std::int64_t accepted_anchor_local_ms{0};
+  // Share immutable diagnostics so control-loop status reads stay lightweight.
+  std::shared_ptr<const Json> samples;
 
-  [[nodiscard]] Json to_json() const;
+  [[nodiscard]] Json to_json(bool include_samples = false) const;
   [[nodiscard]] bool acceptable(int max_uncertainty_ms) const;
 };
 

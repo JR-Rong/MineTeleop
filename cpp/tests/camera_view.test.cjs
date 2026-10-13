@@ -62,4 +62,35 @@ test('critical-video freshness uses confirmed timing before the visual three-sec
   assert(criticalFrameFresh(sample(live, 700, 2), 700, 500));
   assert(criticalFrameFresh(live, 999, 1000));
 });
+test('critical overlay waits one second independently of braking threshold and resets membership', () => {
+  const fs=require('fs'),vm=require('vm');let now=0;
+  class Element {
+    constructor(tag){this.tag=tag;this.children=[];this.dataset={};this.frames=0;this.hidden=false;}
+    append(...items){this.children.push(...items)}
+    replaceChildren(...items){this.children=items}
+    insertBefore(item,before){this.children=this.children.filter(x=>x!==item);const i=this.children.indexOf(before);this.children.splice(i<0?this.children.length:i,0,item)}
+    setAttribute(){}
+    getVideoPlaybackQuality(){return {totalVideoFrames:this.frames,droppedVideoFrames:0}}
+  }
+  const context=vm.createContext({document:{createElement:tag=>new Element(tag)},performance:{now:()=>now},MediaStream:class {}});
+  vm.runInContext(fs.readFileSync(require.resolve('../web/camera_view.js'),'utf8'),context);
+  const api=context.MineTeleopCameraView,grid=new Element('grid'),view=api.mount(grid);
+  view.configure(['front','aux']);
+  const track={muted:false,readyState:'live',addEventListener(){},removeEventListener(){}};
+  view.attach('front',track);view.attach('aux',{...track});
+  const front=grid.children.find(x=>x.dataset.cameraId==='front'),aux=grid.children.find(x=>x.dataset.cameraId==='aux');
+  for(now=100;now<=166;now+=33){front.children[1].frames++;aux.children[1].frames++;view.criticalHealth(['front'],500)}
+  now=666;assert.equal(view.criticalHealth(['front'],500).ready,false);assert.equal(front.dataset.state,'live');
+  now=1165;view.refresh();assert.equal(front.dataset.state,'live');
+  now=1166;view.refresh();assert.equal(front.dataset.state,'stale');assert.equal(aux.dataset.state,'live');
+  view.criticalHealth([],500);assert.equal(front.dataset.state,'live');
+  now=3166;view.refresh();assert.equal(front.dataset.state,'stale');assert.equal(aux.dataset.state,'stale');
+  now=4000;view.configure(['front']);view.attach('front',track);
+  const second=grid.children[0];
+  for(now=4100;now<=4166;now+=33){second.children[1].frames++;view.criticalHealth(['front'],2000)}
+  now=5266;assert.equal(view.criticalHealth(['front'],2000).ready,true);assert.equal(second.dataset.state,'stale');
+  now=6000;second.children[1].frames++;view.criticalHealth(['front'],500);track.muted=true;
+  now=6100;assert.equal(view.criticalHealth(['front'],500).ready,false);assert.equal(second.dataset.state,'live');
+  now=7000;view.refresh();assert.equal(second.dataset.state,'stale');
+});
 process.exitCode = failed ? 1 : 0;

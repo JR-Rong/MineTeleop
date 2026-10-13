@@ -13,6 +13,7 @@
     ['fish_left', '左鱼眼'], ['fish_right', '右鱼眼'],
   ].map(([id, label]) => Object.freeze({id, label})));
   const STALE_MS = 3000;
+  const CRITICAL_DISPLAY_STALE_MS = 1000;
 
   function orderedCameraIds(ids) {
     const unique = [...new Set(ids.filter(id => typeof id === 'string' && id.length))];
@@ -39,7 +40,7 @@
   function criticalFrameFresh(health, now, staleMs) {
     return Number.isFinite(staleMs) && staleMs > 0 && health.frames > 0 &&
         health.lastFrameAt != null && now >= health.lastFrameAt &&
-        now - health.lastFrameAt < staleMs && health.status === 'live';
+        now - health.lastFrameAt < staleMs && health.status !== 'offline';
   }
 
   function mount(grid) {
@@ -114,8 +115,10 @@
         entry.health = frameHealth(entry.health, {
           frames: presentedFrames(entry.video),
           now, startedAt: entry.startedAt,
-          staleMs: entry.criticalStaleMs || STALE_MS,
-          muted: Boolean(entry.track && entry.track.muted), ended: Boolean(entry.track && entry.track.readyState === 'ended'), disconnected,
+          staleMs: entry.criticalForControl ? CRITICAL_DISPLAY_STALE_MS : STALE_MS,
+          // Critical-view overlays follow actually presented frames. Muting
+          // still withdraws control immediately in criticalHealth below.
+          muted: !entry.criticalForControl && Boolean(entry.track && entry.track.muted), ended: Boolean(entry.track && entry.track.readyState === 'ended'), disconnected,
         });
         paint(entry, entry.health.status);
       }
@@ -144,7 +147,8 @@
     }
 
     function criticalHealth(ids, staleMs) {
-      for (const id of ids) if (entries.has(id)) entries.get(id).criticalStaleMs = staleMs;
+      const criticalIds = new Set(ids);
+      for (const [id, entry] of entries) entry.criticalForControl = criticalIds.has(id);
       refresh();
       const now = performance.now();
       const missing = ids.filter(id => {
@@ -163,5 +167,5 @@
     return {configure, attach, reset, refresh, setConnectionState, criticalHealth};
   }
 
-  return Object.freeze({CAMERAS, STALE_MS, orderedCameraIds, cameraLabel, frameHealth, criticalFrameFresh, mount});
+  return Object.freeze({CAMERAS, STALE_MS, CRITICAL_DISPLAY_STALE_MS, orderedCameraIds, cameraLabel, frameHealth, criticalFrameFresh, mount});
 });

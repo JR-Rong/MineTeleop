@@ -1446,6 +1446,49 @@ test('lost critical view sends neutral without disconnecting or clearing the pro
   fixture.requests[1].resolve({accepted:true});await recovered;
 });
 
+test('hard stop banner retains exact recovery cause and deadline without telemetry', () => {
+  for (const [cause, label] of [['time_sync',/时间同步/], ['input_lease',/输入刷新/], ['control_link',/ACK/]]) {
+    const handshake={issue_code:'control_recovery_timeout',control_recovery:{cause,timeout_ms:5000,phase:'locked'}};
+    const p=logic.deriveControlStopPresentation(false,false,'','',handshake);
+    assert.equal(p.visible,true);assert.equal(p.severity,'critical');assert.match(p.banner,label);
+    assert.match(p.banner,/5 秒/);assert.match(p.banner,/控制已锁定/);
+    assert.equal(logic.deriveControlStopPresentation(false,false,'','',{}).visible,false);
+    assert.equal(logic.deriveControlStopPresentation(true,false,'','',handshake).kind,'local_pending');
+    assert.equal(logic.deriveControlStopPresentation(false,true,'physical_estop','',handshake).kind,'physical_estop');
+  }
+  const video=logic.deriveControlStopPresentation(false,false,'','',{issue_code:'critical_camera_failed'});
+  assert.match(video.banner,/关键视频/);
+});
+
+test('signaling fault status locks motion and preserves the reason before DataChannel feedback', () => {
+  const context=vm.createContext({mediaStatus:{lanes:[]},vcuHandshake:{ready:true,state:'ready'},controlLogic:logic,
+    renderMonitoring(){},updateVcuHandshakeState(value){context.vcuHandshake=value}});
+  const handler=controlPageSource.match(/^function applyMediaStatus\(payload\)\{[\s\S]*?^\}/m);
+  assert(handler);vm.runInContext(handler[0],context);
+  context.applyMediaStatus({control_issue_code:'control_recovery_braking_wait',control_recovery:{cause:'time_sync',timeout_ms:5000}});
+  assert.equal(context.vcuHandshake.ready,true);
+  context.applyMediaStatus({control_issue_code:'control_recovery_timeout',control_recovery:{cause:'time_sync',timeout_ms:5000}});
+  assert.equal(context.vcuHandshake.ready,false);assert.equal(context.vcuHandshake.state,'fault');
+  assert.match(logic.deriveControlStopPresentation(false,false,'','',context.vcuHandshake).banner,/时间同步.*5 秒/);
+  context.applyMediaStatus({control_issue_code:''});assert.equal(context.vcuHandshake.ready,false);
+});
+
+test('delayed good DataChannel status and older soft signal cannot erase a hard stop', () => {
+  const context=vm.createContext({mediaStatus:{lanes:[]},vcuHandshake:{ready:true,state:'ready'},controlLogic:logic,
+    gearChangeStationaryEvidence:logic.createGearChangeStationaryEvidence(),lastControlStatusSeq:0,vcuEverReady:true,
+    performance:{now:()=>1000},renderMonitoring(){},resetControlAuthorityInput(){}});
+  for(const name of ['updateVcuHandshakeState','applyMediaStatus']) {
+    const declaration=name==='updateVcuHandshakeState'?controlPageSource.split('\n').find(x=>x.startsWith('function '+name+'(')):controlPageSource.match(/^function applyMediaStatus\(payload\)\{[\s\S]*?^\}/m)?.[0];
+    assert(declaration);vm.runInContext(declaration,context);
+  }
+  context.applyMediaStatus({control_issue_code:'control_recovery_timeout',control_recovery:{cause:'time_sync',timeout_ms:5000}});
+  context.updateVcuHandshakeState({ready:true,state:'ready',issue_code:'',adapter_ready:true});
+  assert.equal(context.vcuHandshake.ready,false);assert.equal(context.vcuHandshake.issue_code,'control_recovery_timeout');
+  context.applyMediaStatus({control_issue_code:'control_recovery_braking_wait',control_recovery:{cause:'critical_video',timeout_ms:10000}});
+  assert.equal(context.vcuHandshake.issue_code,'control_recovery_timeout');assert.equal(context.vcuHandshake.control_recovery.cause,'time_sync');
+  assert.match(logic.deriveControlStopPresentation(false,false,'','',context.vcuHandshake).banner,/时间同步.*5 秒/);
+});
+
 Promise.all(pendingTests).then(() => {
   if (failed > 0) {
     console.error(`${failed} of ${passed + failed} control logic tests failed`);

@@ -129,6 +129,7 @@ class SessionControlRecoveryLatch {
   [[nodiscard]] bool braking_wait_for(std::string_view session_id) const;
   [[nodiscard]] ControlRecoveryCause cause_for(std::string_view session_id) const;
   [[nodiscard]] std::optional<std::int64_t> deadline_for(std::string_view session_id) const;
+  [[nodiscard]] Json recovery_status_for(std::string_view session_id) const;
 
  private:
   mutable std::mutex mutex_;

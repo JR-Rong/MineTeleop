@@ -380,6 +380,19 @@ void test_poor_time_samples_do_not_replace_the_accepted_clock_anchor() {
   expect(clock.now_ms() >= before && clock.now_ms() - before < 2000, "poor sample replaced the trusted UTC anchor");
   expect(clock.from_local_system_ms(local_stamp) == capture_stamp && !clock.status().anchor_accepted,
       "poor sample shifted capture/encoder timestamps despite its rejected UTC anchor");
+  expect(clock.refresh_due(30000), "rejected early sample postponed recovery until the normal 30s interval");
+  expect(!clock.status().to_json().contains("samples"), "frequent status payload copied verbose time diagnostics");
+  const auto samples = clock.status().to_json(true).at("samples");
+  expect(samples.size() == 3 && samples.front().at("http").at("total_ms") > 50 &&
+      samples.front().contains("wall_clock_step_ms"), "time diagnostics cannot distinguish HTTP delay and local clock movement");
+  const auto failure = [&] {
+    try { static_cast<void>(mine_teleop::HttpClient(std::chrono::milliseconds(20)).get(base + "/time?client_send_ms=1")); }
+    catch (const mine_teleop::HttpTransportError& e) {
+      return e.timing().contains("first_byte_ms") && e.timing().contains("total_ms");
+    }
+    return false;
+  }();
+  expect(failure, "failed time request lost its HTTP phase timings");
   clock.mark_refresh_failed();
   expect(!clock.status().synchronized && clock.now_ms() - before < 2000, "transport failure discarded the last anchor");
   expect(clock.from_local_system_ms(local_stamp) == capture_stamp, "failed refresh discarded the accepted capture offset");
@@ -955,7 +968,7 @@ void test_control_page_contract() {
   const auto telemetry_limits_update = response.body.find(
       "updateVehicleHardLimits(message.control_limits)", telemetry_profile_update);
   const auto handshake_vcu_update = response.body.find(
-      "updateVcuHandshakeState({...nextVcuStatus,issue_code:message.issue_code||'',driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)})");
+      "updateVcuHandshakeState({...nextVcuStatus,issue_code:message.issue_code||'',control_recovery:message.control_recovery||null,driver_connected:Boolean(message.driver_connected),adapter_ready:vcuAdapterReady(nextVcuStatus,message.adapter_ready)})");
   const auto handshake_limits_update = response.body.find(
       "updateVehicleHardLimits(message.hard_limits)", handshake_vcu_update);
   expect(
@@ -1138,9 +1151,9 @@ void test_control_page_contract() {
               std::string::npos,
       "an older vehicle without adapter_ready cannot use the compatibility-safe unknown state");
   const auto estop_monitor = response.body.find(
-      "const estopPresentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason)");
+      "const estopPresentation=controlLogic.deriveControlStopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason,vcuHandshake)");
   const auto estop_banner = response.body.find(
-      "function renderEstopRequest(presentation=controlLogic.deriveEstopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason))");
+      "function renderEstopRequest(presentation=controlLogic.deriveControlStopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason,vcuHandshake))");
   expect(
       estop_monitor != std::string::npos && estop_banner != std::string::npos &&
           response.body.find("renderEstopRequest(estopPresentation)", estop_monitor) !=
@@ -5197,7 +5210,8 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
         "actual vehicle did not recover zero motion while retaining braking: held=" + std::to_string(held_brake) +
         ":last_intent=" + std::to_string(last_applied_intent) + ":fresh_braking=" + std::to_string(fresh_braking_seen) +
         ":safety=" + std::string(mine_teleop::to_string(service.safety_state())) +
-        ":vehicle=" + last_vehicle_rejection + ":sender=" + driver.status().at("native_control").value("last_error", ""));
+        ":vehicle=" + last_vehicle_rejection + ":sender=" + driver.status().at("native_control").value("last_error", "") +
+        ":time_sync=" + driver.status().at("time_sync").dump());
     input["intent_seq"] = 4;
     input["brake"] = 0.0;
     expect(driver.update_control_intent(input).value("accepted", false), "full neutral input rejected");
