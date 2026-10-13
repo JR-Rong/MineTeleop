@@ -1033,6 +1033,8 @@ Json ControlCommand::to_json() const {
   value["estop"] = estop;
   value["operator_active"] = operator_active;
   value["critical_video_ready"] = critical_video_ready;
+  value["control_time_sync_ready"] = control_time_sync_ready;
+  value["operator_input_ready"] = operator_input_ready;
   value["control_token"] = control_token;
   return value;
 }
@@ -1060,6 +1062,10 @@ ControlCommand ControlCommand::from_json(const Json& value) {
     command.estop = value.value("estop", false);
     command.operator_active = value.value("operator_active", false);
     command.critical_video_ready = value.value("critical_video_ready", true);
+    // New readiness metadata is mandatory for motion/heartbeat transport.
+    // An authenticated ESTOP never depends on a newer producer schema.
+    command.control_time_sync_ready = command.estop || value.at("control_time_sync_ready").get<bool>();
+    command.operator_input_ready = command.estop || value.at("operator_input_ready").get<bool>();
     command.control_token = value.at("control_token").get<std::string>();
   } catch (const Json::exception& error) {
     throw std::invalid_argument(std::string("invalid control command: ") + error.what());
@@ -1104,6 +1110,13 @@ NativeControlIntentUpdate NativeControlIntentStore::update(
     throw std::invalid_argument("intent receive time must be non-negative");
   }
   std::lock_guard lock(mutex_);
+  if (latest_ && received_at_monotonic_ms - received_at_monotonic_ms_ >= lease_ms_ &&
+      !latest_->is_neutral() && !latest_->estop) {
+    // Expiry is also checked at ingress: a delayed refresh must not revive
+    // held motion simply because the periodic sender has not sampled yet.
+    requires_fresh_input_ = true;
+    preserve_brake_during_rearm_ = false;
+  }
   const bool incoming_estop = intent.estop;
   const bool incoming_neutral = intent.is_neutral();
   const bool incoming_brake_only = !intent.estop && intent.throttle <= 1e-9 &&
@@ -1170,7 +1183,7 @@ NativeControlIntentSample NativeControlIntentStore::sample(std::int64_t now_mono
     if (!preserve_brake_during_rearm_ || !fresh) effective.brake = 0.0;
   }
   effective.estop = estop_latched_;
-  return {true, fresh, requires_fresh_input_, std::move(effective)};
+  return {true, fresh, requires_fresh_input_, std::move(effective), age_ms};
 }
 
 void NativeControlIntentStore::invalidate(bool preserve_brake) {
@@ -1190,14 +1203,14 @@ void NativeControlIntentStore::reset() {
 
 void SessionControlProfile::validate() const {
   if (critical_camera_stale_brake_ms < 100 || critical_camera_stale_brake_ms > 3000 ||
-      critical_camera_recovery_timeout_ms < 1000 || critical_camera_recovery_timeout_ms > 30000)
+      control_recovery_timeout_ms < 1000 || control_recovery_timeout_ms > 30000)
     throw std::invalid_argument("critical camera profile timing is outside its allowed range");
   if (consecutive_late_frame_limit < 1 || consecutive_late_frame_limit > 5)
     throw std::invalid_argument("consecutive_late_frame_limit must be in [1, 5]");
   if (parking_idle_timeout_ms < 0 || parking_idle_timeout_ms > 1000)
     throw std::invalid_argument("parking_idle_timeout_ms must be in [0, 1000]");
   if (profile_version != kSessionControlProfileVersion) {
-    throw std::invalid_argument("session control profile version must be 6");
+    throw std::invalid_argument("session control profile version must be 7");
   }
   require_finite_range(target_speed_kph, 0.0, kChassisControlMaxTargetSpeedKph, "target_speed_kph");
   require_finite_range(
@@ -1259,7 +1272,7 @@ Json SessionControlProfile::to_json() const {
       {"parking_idle_timeout_ms", parking_idle_timeout_ms},
       {"consecutive_late_frame_limit", consecutive_late_frame_limit},
       {"critical_camera_stale_brake_ms", critical_camera_stale_brake_ms},
-      {"critical_camera_recovery_timeout_ms", critical_camera_recovery_timeout_ms},
+      {"control_recovery_timeout_ms", control_recovery_timeout_ms},
       {"target_speed_kph", target_speed_kph},
       {"max_motor_torque_nm", max_motor_torque_nm},
       {"max_brake_pressure_bar", max_brake_pressure_bar},
@@ -1283,14 +1296,14 @@ SessionControlProfile SessionControlProfile::from_json(const Json& value) {
   try {
     if (!value.at("profile_version").is_number_integer() ||
         value.at("profile_version") != kSessionControlProfileVersion)
-      throw std::invalid_argument("session control profile version must be integer 6");
+      throw std::invalid_argument("session control profile version must be integer 7");
     if (!value.at("critical_camera_stale_brake_ms").is_number_integer() ||
         value.at("critical_camera_stale_brake_ms") < 100 || value.at("critical_camera_stale_brake_ms") > 3000 ||
-        !value.at("critical_camera_recovery_timeout_ms").is_number_integer() ||
-        value.at("critical_camera_recovery_timeout_ms") < 1000 || value.at("critical_camera_recovery_timeout_ms") > 30000)
+        !value.at("control_recovery_timeout_ms").is_number_integer() ||
+        value.at("control_recovery_timeout_ms") < 1000 || value.at("control_recovery_timeout_ms") > 30000)
       throw std::invalid_argument("critical camera profile timing must use bounded integer milliseconds");
     profile.critical_camera_stale_brake_ms = value.at("critical_camera_stale_brake_ms").get<int>();
-    profile.critical_camera_recovery_timeout_ms = value.at("critical_camera_recovery_timeout_ms").get<int>();
+    profile.control_recovery_timeout_ms = value.at("control_recovery_timeout_ms").get<int>();
     if (!value.at("consecutive_late_frame_limit").is_number_integer() ||
         value.at("consecutive_late_frame_limit") < 1 || value.at("consecutive_late_frame_limit") > 5)
       throw std::invalid_argument("consecutive_late_frame_limit must be an integer in [1, 5]");
@@ -1613,6 +1626,15 @@ ReceiveResult ControlReceiver::accept(const ControlCommand& command, std::int64_
   return {true, "accepted", command, std::move(warnings)};
 }
 
+std::string_view to_string(ControlRecoveryCause cause) {
+  switch (cause) {
+    case ControlRecoveryCause::CriticalVideo: return "critical_video";
+    case ControlRecoveryCause::TimeSynchronization: return "time_sync";
+    case ControlRecoveryCause::InputLease: return "input_lease";
+  }
+  return "unknown";
+}
+
 std::string_view to_string(SafetyState state) {
   switch (state) {
     case SafetyState::Init:
@@ -1857,9 +1879,13 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.runtime.media_frame_timeout_ms = optional<int>(runtime, "media_frame_timeout_ms", 3000);
   config.runtime.media_capture_interval_ms = optional<int>(runtime, "media_capture_interval_ms", 0);
   config.runtime.critical_camera_stale_brake_ms = optional<int>(runtime, "critical_camera_stale_brake_ms", 500);
-  config.runtime.critical_camera_recovery_timeout_ms = optional<int>(runtime, "critical_camera_recovery_timeout_ms", 5000);
+  const auto legacy_recovery_ms = optional<int>(runtime, "critical_camera_recovery_timeout_ms", 5000);
+  config.runtime.control_recovery_timeout_ms = optional<int>(runtime, "control_recovery_timeout_ms", legacy_recovery_ms);
+  if (runtime["critical_camera_recovery_timeout_ms"] && runtime["control_recovery_timeout_ms"] &&
+      config.runtime.control_recovery_timeout_ms != legacy_recovery_ms)
+    throw std::runtime_error("conflicting legacy/new control recovery timeout settings");
   if (config.runtime.critical_camera_stale_brake_ms < 100 || config.runtime.critical_camera_stale_brake_ms > 3000 ||
-      config.runtime.critical_camera_recovery_timeout_ms < 1000 || config.runtime.critical_camera_recovery_timeout_ms > 30000) {
+      config.runtime.control_recovery_timeout_ms < 1000 || config.runtime.control_recovery_timeout_ms > 30000) {
     throw std::runtime_error("critical camera timing requires stale_brake_ms in [100, 3000] and recovery_timeout_ms in [1000, 30000]");
   }
   if (!config.runtime.control_enabled && !config.runtime.media_enabled) {
@@ -3156,7 +3182,7 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
        request.profile.parking_idle_timeout_ms != current_profile.parking_idle_timeout_ms ||
        request.profile.consecutive_late_frame_limit != current_profile.consecutive_late_frame_limit ||
        request.profile.critical_camera_stale_brake_ms != current_profile.critical_camera_stale_brake_ms ||
-       request.profile.critical_camera_recovery_timeout_ms != current_profile.critical_camera_recovery_timeout_ms) &&
+       request.profile.control_recovery_timeout_ms != current_profile.control_recovery_timeout_ms) &&
       !mock_bench_bypass) {
     VcuHandshakeStatus handshake_status;
     bool handshake_status_available = false;
@@ -3205,7 +3231,8 @@ SessionControlProfileResult VehicleControlService::receive_session_profile(
       reapplied.throttle = std::min(
           reapplied.throttle,
           std::min(max_throttle_, profile_throttle_limit));
-      adapter_->apply_control(reapplied);
+      if (control_braking_wait_ || recovery_brake_hold_) apply_recovery_brake(reapplied.gear);
+      else adapter_->apply_control(reapplied);
       last_effective_command_ = std::move(reapplied);
     }
   } catch (...) {
@@ -3284,12 +3311,16 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     // Only authenticated, fresh, in-order commands may change the driver's
     // view-health report. It withdraws motion before this command can apply.
     driver_critical_video_ready_ = effective.critical_video_ready;
-    if (!driver_critical_video_ready_) set_critical_video_braking_wait(true, timestamp_ms);
+    driver_time_sync_ready_ = effective.control_time_sync_ready;
+    operator_input_ready_ = effective.operator_input_ready;
+    if (!driver_critical_video_ready_ || !driver_time_sync_ready_ || !operator_input_ready_)
+      set_control_braking_wait(true, timestamp_ms, !driver_time_sync_ready_ ? ControlRecoveryCause::TimeSynchronization
+          : !operator_input_ready_ ? ControlRecoveryCause::InputLease : ControlRecoveryCause::CriticalVideo);
   }
-  if (!effective.estop && (critical_video_braking_wait_ || timing_rearm_required_ ||
+  if (!effective.estop && (control_braking_wait_ || timing_rearm_required_ ||
       (safety_.state() == SafetyState::Degraded && receiver_.consecutive_late_frame_limit() == 1)) &&
       (effective.throttle > 1e-9 || std::abs(effective.steering) > 1e-9 ||
-       (critical_video_braking_wait_ && last_effective_command_ && effective.gear != last_effective_command_->gear))) {
+       (control_braking_wait_ && last_effective_command_ && effective.gear != last_effective_command_->gear))) {
     // Recovery is intentionally explicit: a command gap withdraws traction,
     // and a fresh neutral command must be applied before any prior held input
     // can produce torque again. Brake remains allowed during this re-arm.
@@ -3384,12 +3415,17 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
       safety_.state() != SafetyState::Estop &&
       safety_.state() != SafetyState::Fault) {
     try {
-      if (critical_video_braking_wait_) {
-        apply_critical_video_brake();
+      const bool fresh_motion = !control_braking_wait_ &&
+          (result.command->throttle > 1e-9 || std::abs(result.command->steering) > 1e-9);
+      if (control_braking_wait_ || (recovery_brake_hold_ && !fresh_motion)) {
+        apply_recovery_brake(result.command->gear);
         result.command->brake = safety_command.brake = 1.0;
-        result.warnings.emplace_back("critical_video_safety_brake_applied");
+        result.warnings.emplace_back("control_recovery_safety_brake_applied");
       } else {
         adapter_->apply_control(*result.command);
+        // Rejected actuator/gear transactions must leave the independent
+        // brake held. Release only after fresh motion was actually accepted.
+        if (fresh_motion) recovery_brake_hold_ = false;
       }
     } catch (const VehicleAdapterControlRejected& error) {
       result.accepted = false;
@@ -3469,7 +3505,7 @@ void VehicleControlService::tick(std::int64_t timestamp_ms) {
     safety_.mark_fault();
   }
   evaluate_control_watchdog(timestamp_ms);
-  apply_critical_video_brake();
+  apply_recovery_brake();
   if (!last_telemetry_ms_ || timestamp_ms - *last_telemetry_ms_ >= telemetry_interval_ms_) {
     try {
       if (telemetry_history_.size() == kMaxVehicleTelemetryHistory) telemetry_history_.pop_front();
@@ -3483,19 +3519,21 @@ void VehicleControlService::tick(std::int64_t timestamp_ms) {
   }
 }
 
-void VehicleControlService::set_critical_video_braking_wait(bool waiting, std::int64_t timestamp_ms) {
-  if (critical_video_braking_wait_ == waiting) return;
-  critical_video_braking_wait_ = waiting;
+void VehicleControlService::set_control_braking_wait(bool waiting, std::int64_t timestamp_ms, ControlRecoveryCause cause) {
+  if (control_braking_wait_ == waiting) return;
+  control_braking_wait_ = waiting;
+  if (waiting) { recovery_brake_hold_ = true; recovery_cause_ = cause; }
   timing_rearm_required_ = true;
   safety_.require_input_rearm();
   evaluate_control_watchdog(timestamp_ms);
-  if (waiting) apply_critical_video_brake();
+  if (waiting) apply_recovery_brake();
 }
 
-void VehicleControlService::apply_critical_video_brake() {
-  if (!critical_video_braking_wait_ || !active_session_profile_ || adapter_safe_stop_active_ ||
+void VehicleControlService::apply_recovery_brake(std::string_view gear_override) {
+  if ((!control_braking_wait_ && !recovery_brake_hold_) || !active_session_profile_ || adapter_safe_stop_active_ ||
       (safety_.state() != SafetyState::ControlActive && safety_.state() != SafetyState::Degraded)) return;
-  const auto gear = last_effective_command_ ? last_effective_command_->gear : adapter_->read_telemetry().gear;
+  const auto gear = !gear_override.empty() ? std::string(gear_override)
+      : last_effective_command_ ? last_effective_command_->gear : adapter_->read_telemetry().gear;
   // This is the existing non-latching safety output, not a synthetic received
   // command. It keeps the handshake and profile but never refreshes 800 ms.
   adapter_->apply_safe_stop(ControlOutput{gear, 0.0, 0.0, 1.0, false, false}, {});
@@ -3595,19 +3633,23 @@ Json VehicleControlService::control_timing(std::int64_t timestamp_ms) const {
   return {{"consecutive_late_frame_limit", receiver_.consecutive_late_frame_limit()},
           {"consecutive_late_frames", receiver_.consecutive_late_frames()},
           {"last_valid_command_seq", last_effective_command_ ? last_effective_command_->seq : 0},
-          {"critical_video_braking_wait", critical_video_braking_wait_},
+          {"control_braking_wait", control_braking_wait_},
+          {"recovery_brake_hold", recovery_brake_hold_},
+          {"control_recovery_cause", (control_braking_wait_ || recovery_brake_hold_) ? to_string(recovery_cause_) : ""},
           {"driver_critical_video_ready", driver_critical_video_ready_},
-          {"rearm_required", critical_video_braking_wait_ || timing_rearm_required_ ||
+          {"driver_time_sync_ready", driver_time_sync_ready_},
+          {"operator_input_ready", operator_input_ready_},
+          {"rearm_required", control_braking_wait_ || timing_rearm_required_ ||
               (safety_.state() == SafetyState::Degraded && receiver_.consecutive_late_frame_limit() == 1)},
           {"last_valid_control_age_ms", last_valid ? Json(std::max<std::int64_t>(0, timestamp_ms - *last_valid)) : Json(nullptr)},
           {"control_timeout_ms", control_limits_.at("read_only_control_safety").at("control_timeout_ms")}};
 }
 
-std::pair<int, int> VehicleControlService::critical_video_timing() const {
+std::pair<int, int> VehicleControlService::recovery_timing() const {
   if (active_session_profile_) return {active_session_profile_->critical_camera_stale_brake_ms,
-                                      active_session_profile_->critical_camera_recovery_timeout_ms};
+                                      active_session_profile_->control_recovery_timeout_ms};
   return {control_limits_.at("default_critical_camera_stale_brake_ms").get<int>(),
-          control_limits_.at("default_critical_camera_recovery_timeout_ms").get<int>()};
+          control_limits_.at("default_control_recovery_timeout_ms").get<int>()};
 }
 
 Json VehicleControlService::build_telemetry(std::int64_t timestamp_ms) {
@@ -3700,7 +3742,7 @@ Json vehicle_control_limits(const VehicleConfig& config) {
   return {
       {"max_speed_kph", config.field_safety.max_speed_kph},
       {"default_critical_camera_stale_brake_ms", config.runtime.critical_camera_stale_brake_ms},
-      {"default_critical_camera_recovery_timeout_ms", config.runtime.critical_camera_recovery_timeout_ms},
+      {"default_control_recovery_timeout_ms", config.runtime.control_recovery_timeout_ms},
       {"max_throttle", config.field_safety.max_throttle},
       {"full_scale_motor_torque_nm", config.field_safety.full_scale_motor_torque_nm},
       {"max_brake_pressure_bar", config.field_safety.max_brake_pressure_bar},

@@ -407,6 +407,7 @@ class DriverConsoleRuntime {
   void reset_native_control_state();
   void native_control_sender_loop(std::stop_token stop_token);
   void native_control_lease_loop(std::stop_token stop_token);
+  void time_sync_loop(std::stop_token stop_token);
   [[nodiscard]] bool send_native_control_sample();
   void note_native_control_failure(
       std::string error,
@@ -431,6 +432,7 @@ class DriverConsoleRuntime {
   std::string password_;
   std::string signaling_http_url_;
   HttpClient http_;
+  HttpClient time_sync_http_;
   SynchronizedClock clock_;
   mutable std::mutex mutex_;
   std::mutex approval_wait_mutex_;
@@ -483,7 +485,7 @@ class DriverConsoleRuntime {
   int parking_idle_timeout_ms_{500};
   int consecutive_late_frame_limit_{3};
   int critical_camera_stale_brake_ms_{500};
-  int critical_camera_recovery_timeout_ms_{5000};
+  int control_recovery_timeout_ms_{5000};
   bool control_profile_initialized_{false};
   std::uint64_t last_control_profile_prepared_seq_{0};
   std::atomic<double> service_brake_limit_{0.3};
@@ -522,6 +524,7 @@ class DriverConsoleRuntime {
   std::unique_ptr<AsyncControlTrace> native_control_trace_;
   std::jthread native_control_sender_;
   std::jthread native_control_lease_;
+  std::jthread time_sync_worker_;
 };
 
 class DriverConsoleHttpApp {

@@ -547,8 +547,8 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
   // its signaling cursor and critical-camera control latch outside that
   // reconstruction loop.
   auto signaling_sequence = std::make_shared<mine_teleop::MediaSignalingSequence>();
-  auto critical_camera_control_latch =
-      std::make_shared<mine_teleop::CriticalCameraControlLatch>();
+  auto control_recovery_latch =
+      std::make_shared<mine_teleop::SessionControlRecoveryLatch>();
   while (true) {
     try {
       mine_teleop::VehicleMediaRuntime runtime(
@@ -561,7 +561,7 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
           launch.simulate_primary_failure_after_frames,
           launch.connection_id,
           signaling_sequence,
-          critical_camera_control_latch);
+          control_recovery_latch);
       const auto summary = runtime.run(launch.frame_count, launch.duration_ms, launch.capture_interval_ms);
       std::cout << summary.dump() << '\n';
       if (!service) return summary.value("passed", false) ? 0 : 2;

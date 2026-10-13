@@ -94,6 +94,21 @@ void test_invalidate_does_not_restore_old_throttle() {
   expect_zero_actuation(sample.intent, "rejected input restored throttle after invalidate");
 }
 
+void test_delayed_refresh_cannot_bypass_expiry_between_sender_ticks() {
+  mine_teleop::NativeControlIntentStore store(200);
+  auto neutral = neutral_intent(1);
+  expect(store.update(neutral, 0).accepted, "neutral rejected");
+  auto held = neutral; held.intent_seq = 2; held.throttle = 0.5;
+  expect(store.update(held, 10).accepted, "held input rejected");
+  expect(store.update(held, 210).reason == "fresh_neutral_required",
+      "late refresh revived motion without a periodic expiry sample");
+  expect_zero_actuation(store.sample(211).intent, "late refresh restored traction");
+  neutral.intent_seq = 3;
+  expect(store.update(neutral, 212).accepted, "neutral recovery rejected");
+  held.intent_seq = 4;
+  expect(store.update(held, 213).accepted, "release/repress did not recover in the same store");
+}
+
 void test_vehicle_rearm_preserves_fresh_braking_without_restoring_motion() {
   mine_teleop::NativeControlIntentStore store(200);
   auto neutral = neutral_intent(1);
@@ -293,6 +308,7 @@ struct TestCase {
 
 int main() {
   const TestCase tests[] = {
+      {"delayed_refresh_cannot_bypass_expiry_between_sender_ticks", test_delayed_refresh_cannot_bypass_expiry_between_sender_ticks},
       {"vehicle_rearm_preserves_fresh_braking_without_restoring_motion",
        test_vehicle_rearm_preserves_fresh_braking_without_restoring_motion},
       {"lease_expiry_neutralizes_and_preserves_gear",

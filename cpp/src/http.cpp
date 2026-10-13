@@ -226,6 +226,8 @@ Json TimeSyncStatus::to_json() const {
       {"uncertainty_ms", uncertainty_ms},
       {"synchronized_at_local_ms", synchronized_at_local_ms},
       {"sample_count", sample_count},
+      {"anchor_accepted", anchor_accepted},
+      {"accepted_anchor_local_ms", accepted_anchor_local_ms},
   };
 }
 
@@ -234,7 +236,8 @@ bool TimeSyncStatus::acceptable(int max_uncertainty_ms) const {
 }
 
 TimeSyncStatus SynchronizedClock::synchronize(
-    const HttpClient& http, std::string_view signaling_origin, int sample_count) {
+    const HttpClient& http, std::string_view signaling_origin, int sample_count,
+    std::optional<int> max_uncertainty_ms) {
   if (sample_count < 3 || sample_count > 15) throw std::invalid_argument("time sync sample count must be between 3 and 15");
   const auto origin = normalize_signaling_http_url(signaling_origin);
   struct Sample {
@@ -284,22 +287,40 @@ TimeSyncStatus SynchronizedClock::synchronize(
   const auto next_steady_anchor = std::chrono::steady_clock::now();
   const auto proposed_synchronized_ms = next.synchronized_at_local_ms + next.offset_ms;
   std::lock_guard lock(mutex_);
-  synchronized_anchor_ms_ = proposed_synchronized_ms;
-  steady_anchor_ = next_steady_anchor;
+  // A poor network sample reports loss of trust but cannot replace the last
+  // accepted UTC/steady anchor. Callers prohibit motion until trust recovers.
+  if (!max_uncertainty_ms || next.acceptable(*max_uncertainty_ms)) {
+    synchronized_anchor_ms_ = proposed_synchronized_ms;
+    steady_anchor_ = next_steady_anchor;
+    has_accepted_anchor_ = true;
+    accepted_offset_ms_ = next.offset_ms;
+    next.anchor_accepted = true;
+    next.accepted_anchor_local_ms = next.synchronized_at_local_ms;
+  } else {
+    next.accepted_anchor_local_ms = status_.accepted_anchor_local_ms;
+  }
   status_ = next;
   return status_;
 }
 
+void SynchronizedClock::mark_refresh_failed() {
+  std::lock_guard lock(mutex_);
+  status_.synchronized = false;
+  status_.anchor_accepted = false;
+}
+
 std::int64_t SynchronizedClock::now_ms() const {
   std::lock_guard lock(mutex_);
-  if (!status_.synchronized) return mine_teleop::now_ms();
+  if (!has_accepted_anchor_) return mine_teleop::now_ms();
   return synchronized_anchor_ms_ +
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - steady_anchor_).count();
 }
 
 std::int64_t SynchronizedClock::from_local_system_ms(std::int64_t local_time_ms) const {
   std::lock_guard lock(mutex_);
-  return status_.synchronized ? local_time_ms + status_.offset_ms : local_time_ms;
+  // Capture timestamps also feed encoder PTS. A rejected network sample must
+  // not jump that timeline while actuation is safely waiting for recovery.
+  return has_accepted_anchor_ ? local_time_ms + accepted_offset_ms_ : local_time_ms;
 }
 
 TimeSyncStatus SynchronizedClock::status() const {

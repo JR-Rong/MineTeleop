@@ -30,7 +30,7 @@ inline constexpr double kDefaultMaxBrakePressureBar = 327.6;
 inline constexpr double kMaxOrdinaryBrakePressureBar = 327.6;
 inline constexpr double kMaxEmergencyBrakePressureBar = 409.5;
 inline constexpr int kSessionControlProfileMaxAgeMs = 2000;
-inline constexpr int kSessionControlProfileVersion = 6;
+inline constexpr int kSessionControlProfileVersion = 7;
 static_assert(kMaxFullScaleMotorTorqueNm <= 800.0 * 0.8);
 static_assert(kMaxFullScaleMotorTorqueNm <= 838.3 * 0.8);
 
@@ -78,6 +78,8 @@ struct ControlCommand {
   std::string control_token;
   bool operator_active{false};
   bool critical_video_ready{true};
+  bool control_time_sync_ready{true};
+  bool operator_input_ready{true};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -112,6 +114,7 @@ struct NativeControlIntentSample {
   bool fresh{false};
   bool requires_fresh_input{true};
   NativeControlIntent intent;
+  std::int64_t age_ms{0};
 };
 
 // Holds only the latest browser input intent. The native sender samples this
@@ -158,7 +161,7 @@ struct SessionControlProfile {
   int parking_idle_timeout_ms{500};
   int consecutive_late_frame_limit{3};
   int critical_camera_stale_brake_ms{500};
-  int critical_camera_recovery_timeout_ms{5000};
+  int control_recovery_timeout_ms{5000};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -303,6 +306,8 @@ enum class SafetyState {
 };
 
 std::string_view to_string(SafetyState state);
+enum class ControlRecoveryCause { CriticalVideo, TimeSynchronization, InputLease };
+std::string_view to_string(ControlRecoveryCause cause);
 
 struct DecelerationStage {
   int after_ms{0};
@@ -418,7 +423,7 @@ struct VehicleRuntimeConfig {
   int media_frame_timeout_ms{3000};
   int media_capture_interval_ms{0};
   int critical_camera_stale_brake_ms{500};
-  int critical_camera_recovery_timeout_ms{5000};
+  int control_recovery_timeout_ms{5000};
 };
 
 struct MediaProfile {
@@ -823,17 +828,20 @@ class VehicleControlService {
   [[nodiscard]] Json control_limits() const;
   [[nodiscard]] Json session_control_profile() const;
   [[nodiscard]] Json control_timing(std::int64_t now_ms) const;
-  void set_critical_video_braking_wait(bool waiting, std::int64_t now_ms);
-  [[nodiscard]] bool critical_video_braking_wait() const { return critical_video_braking_wait_; }
+  void set_control_braking_wait(bool waiting, std::int64_t now_ms,
+      ControlRecoveryCause cause = ControlRecoveryCause::CriticalVideo);
+  [[nodiscard]] bool control_braking_wait() const { return control_braking_wait_; }
   [[nodiscard]] bool driver_critical_video_ready() const { return driver_critical_video_ready_; }
-  [[nodiscard]] std::pair<int, int> critical_video_timing() const;
+  [[nodiscard]] bool driver_time_sync_ready() const { return driver_time_sync_ready_; }
+  [[nodiscard]] bool operator_input_ready() const { return operator_input_ready_; }
+  [[nodiscard]] std::pair<int, int> recovery_timing() const;
   [[nodiscard]] const std::deque<Json>& telemetry_history() const { return telemetry_history_; }
   [[nodiscard]] Json summary() const;
 
  private:
   [[nodiscard]] bool refresh_adapter_safe_stop_state() noexcept;
   void evaluate_control_watchdog(std::int64_t now_ms);
-  void apply_critical_video_brake();
+  void apply_recovery_brake(std::string_view gear_override = {});
   void clear_session_profile() noexcept;
   [[nodiscard]] SessionControlProfileResult profile_result(
       const SessionControlProfileRequest& request,
@@ -877,8 +885,12 @@ class VehicleControlService {
   std::optional<ControlCommand> last_effective_command_;
   bool adapter_safe_stop_active_{false};
   bool timing_rearm_required_{false};
-  bool critical_video_braking_wait_{false};
+  bool control_braking_wait_{false};
+  bool recovery_brake_hold_{false};
+  ControlRecoveryCause recovery_cause_{ControlRecoveryCause::CriticalVideo};
   bool driver_critical_video_ready_{true};
+  bool driver_time_sync_ready_{true};
+  bool operator_input_ready_{true};
   bool started_{false};
 };
 

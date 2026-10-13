@@ -93,7 +93,7 @@ control_start_block="$(sed -n '/  \[\[nodiscard\]\] bool start_control_service()
 control_channel_block="$(sed -n '/  void configure_control_data_channel()/,/  void tick_control_service()/p' "$media_runtime")"
 control_tick_block="$(sed -n '/  void tick_control_service()/,/  \[\[nodiscard\]\] std::string current_pipeline_error/p' "$media_runtime")"
 pipeline_fault_block="$(sed -n '/  void stop_control_for_pipeline_fault(/,/  void set_pipeline_error(/p' "$media_runtime")"
-critical_camera_block="$(sed -n '/  void inhibit_control_for_critical_camera(/,/  \[\[nodiscard\]\] bool critical_cameras_ready()/p' "$media_runtime")"
+critical_camera_block="$(sed -n '/  void inhibit_control_for_recovery(/,/  \[\[nodiscard\]\] bool critical_cameras_ready()/p' "$media_runtime")"
 
 for contract in \
   'control DataChannel open starts the VCU adapter|self->start_control_service()' \
@@ -119,6 +119,12 @@ if ! grep -F --quiet 'VehicleStopReason::CriticalCameraFailed' <<<"$critical_cam
   printf 'media/control isolation contract missing: critical camera close provenance\n' >&2
   exit 1
 fi
+for text in 'VehicleStopReason::OuterControlTimeout' 'VehicleStopReason::MediaPipelineFailed' 'ControlRecoveryCause::InputLease' 'ControlRecoveryCause::CriticalVideo'; do
+  if ! grep -F --quiet "$text" <<<"$critical_camera_block"; then
+    printf 'control recovery close provenance missing: %s\n' "$text" >&2
+    exit 1
+  fi
+done
 if ! grep -F --quiet 'VehicleStopReason::VcuStateFault' <<<"$control_tick_block"; then
   printf 'media/control isolation contract missing: adapter runtime fault close provenance\n' >&2
   exit 1
@@ -146,16 +152,16 @@ require_text "$catalog" 'camera_input_caps_mismatch'
 
 for text in \
   'camera_failure_decision' \
-  'inhibit_control_for_critical_camera' \
+  'inhibit_control_for_recovery' \
   'stop_control_for_pipeline_fault(issue_code)' \
-  'enforce_critical_camera_freshness' \
+  'enforce_control_recovery' \
   'camera_encoded_frame_fresh' \
   'camera_lane_reopen_scheduled' \
   'camera_reopen_exhausted'; do
   require_text "$media_runtime" "$text"
 done
 
-# A critical-camera fault is a session-scoped safety latch.  Encoded frames
+# Expiry of the sustained-fault deadline creates a session-scoped safety latch. Encoded frames
 # may still drain from bounded queues after the source has failed, and another
 # critical lane may remain healthy, so no media callback may clear the latch
 # inside the same VehicleMediaRuntime or while the service reconstructs it for
@@ -167,15 +173,15 @@ if grep -F --quiet 'control_inhibited.exchange(false)' "$media_runtime" ||
   printf 'media/control isolation contract failed: critical-camera inhibition can clear inside one cloud session\n' >&2
   exit 1
 fi
-require_text "$media_runtime" 'Camera recovery restores video only; end this session and complete a fresh VCU handshake before driving again.'
+require_text "$media_runtime" 'Keep the vehicle stopped; the recovery deadline expired. End this session and complete a fresh VCU handshake before driving again.'
 require_text "$catalog" '必须结束当前 session，在新 session 重建该 DataChannel、control-only WSS 并重新完成 VCU 握手'
-require_text "$media_runtime" 'critical_camera_control_latch->enter_session(signaling.session_id())'
-require_text "$media_runtime" 'critical_camera_control_latch->inhibit(signaling.session_id())'
-require_text "$vehicle_app" 'std::make_shared<mine_teleop::CriticalCameraControlLatch>()'
-require_text "$vehicle_app" 'critical_camera_control_latch);'
+require_text "$media_runtime" 'control_recovery_latch->enter_session(signaling.session_id())'
+require_text "$media_runtime" 'control_recovery_latch->inhibit(signaling.session_id())'
+require_text "$vehicle_app" 'std::make_shared<mine_teleop::SessionControlRecoveryLatch>()'
+require_text "$vehicle_app" 'control_recovery_latch);'
 
 service_loop_block="$(sed -n '/int run_vehicle_media_loop/,/^}/p' "$vehicle_app")"
-latch_line="$(grep -n -m1 'std::make_shared<mine_teleop::CriticalCameraControlLatch>()' <<<"$service_loop_block" | cut -d: -f1)"
+latch_line="$(grep -n -m1 'std::make_shared<mine_teleop::SessionControlRecoveryLatch>()' <<<"$service_loop_block" | cut -d: -f1)"
 loop_line="$(grep -n -m1 '  while (true)' <<<"$service_loop_block" | cut -d: -f1)"
 if [[ -z "$latch_line" || -z "$loop_line" || "$latch_line" -ge "$loop_line" ]]; then
   printf 'media/control isolation contract failed: critical-camera latch is not shared across runtime reconstruction\n' >&2

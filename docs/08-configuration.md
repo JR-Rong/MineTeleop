@@ -73,7 +73,7 @@ runtime:
   teleop_poll_interval_ms: 500
   media_frame_timeout_ms: 3000
   critical_camera_stale_brake_ms: 500
-  critical_camera_recovery_timeout_ms: 5000
+  control_recovery_timeout_ms: 5000
   media_capture_interval_ms: 0
 
 cloud:
@@ -887,7 +887,7 @@ CAN 前拒绝启动，旧会话参数不会被默默按新行为解释。本地�
 
 控制端“当前会话驾驶与 PID 参数”中的 `consecutive_late_frame_limit` 为连续迟到帧数，
 默认 3，可选整数 1–5。修改该项需 N 挡、零速、电子驻车及 standby/disarmed（或隔离 mock 台架），
-并等待车端精确确认 V6 会话快照。旧版车端不支持 V6 时会拒绝，不会静默采用其他阈值。
+并等待车端精确确认 V7 会话快照。旧版车端不支持 V7 时会拒绝，不会静默采用其他阈值。
 车端对超过 200 ms 的命令始终丢弃，只累计新的、身份和令牌有效的序号；重复与乱序包不增加计数。
 未达阈值时，新有效帧清除计数，300 ms 降级撤牵引可在当前会话内恢复；达到阈值时要求新零输入，
 释放方向键后重新按下即可恢复。1 帧保留原先首次控制间隔超限也要求重新输入的行为。
@@ -913,10 +913,14 @@ CAN 前拒绝启动，旧会话参数不会被默默按新行为解释。本地�
 真实输入租约过期、页面替换、失焦、急停或权限撤销仍执行原有保护，不把过期刹车标记为新鲜。
 
 控制端“实车调试限幅”可设置 `critical_camera_stale_brake_ms`（整数 100–3000 ms，
-默认 500）与 `critical_camera_recovery_timeout_ms`（整数 1000–30000 ms，页面以秒输入，
-默认 5 s）。这两个字段属于完整 V6 会话快照，必须停车、N、零速、EPB 且
+默认 500）与 `control_recovery_timeout_ms`（整数 1000–30000 ms，页面以秒输入，
+默认 5 s）。这两个字段属于完整 V7 会话快照，必须停车、N、零速、EPB 且
 standby/disarmed（或隔离 mock 台架），并由车端应用后精确 ACK 才生效。
 车端 `runtime` 中同名值只提供未配置会话时的默认值；页面从车端默认值预填，
-不自动提交。V5、缺失、非整数、越界或反馈值不一致均拒绝，更新时必须同步两端包。
+不自动提交。V6 及更旧版本、缺失、非整数、越界或反馈值不一致均拒绝，更新时必须同步驾驶端、
+云端和车端三个包，并重新打开驾驶页面。旧 YAML 的 `critical_camera_recovery_timeout_ms`
+兼容为新恢复上限的别名；同时填写且值不同会拒绝启动，防止静默选错门限。
 采集等待 `media_frame_timeout_ms` 和控制链路 `control_timeout_ms=800` 不由这些字段改写。
-详细恢复状态与日志见 [关键视频制动等待](37-critical-video-braking-recovery.md)。
+视频、时间同步和输入租约共用恢复等待上限。详细状态与日志见 [控制故障制动恢复](38-time-sync-input-lease-recovery.md)。
+驾驶端收到车端可恢复制动反馈时，在主画面显示黄色提示条；恢复后提示制动保持与重新输入。
+红色安全停车/急停提示优先，过期遥测明确标注当前状态待确认；视频或 RTT 指标变差本身不等于车端已制动。

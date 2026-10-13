@@ -98,15 +98,18 @@ class MediaSignalingSequence {
   std::uint64_t value_{0};
 };
 
-// Only a sustained critical-video outage latches the session. The braking
+// Only a sustained recoverable control fault latches the session. The braking
 // deadline also survives reconstruction so retries cannot extend it forever.
 inline constexpr int kCriticalCameraStartupTimeoutMs = 15000;
-inline constexpr int kCriticalCameraRecoveryStableMs = 300;
-enum class CriticalVideoPhase { Ready, BrakingWait, Recovered, Locked };
+inline constexpr int kControlRecoveryStableMs = 300;
+enum class ControlRecoveryPhase { Ready, BrakingWait, Recovered, Locked };
+enum class NeutralHeartbeatGate { Accepted, InactiveState, NativeGap };
+[[nodiscard]] NeutralHeartbeatGate neutral_heartbeat_gate(
+    SafetyState state, bool braking_wait, std::int64_t native_gap_ms, int degraded_timeout_ms);
 [[nodiscard]] bool camera_encoded_frame_fresh(
     std::int64_t last_encoded_ms, std::int64_t now_ms, int timeout_ms);
 
-class CriticalCameraControlLatch {
+class SessionControlRecoveryLatch {
  public:
   // Selects the active non-empty session.  Entering the same session preserves
   // its latch; entering a different session starts with control uninhibited.
@@ -120,9 +123,12 @@ class CriticalCameraControlLatch {
   // deadline and the armed state survive same-session media reconstruction.
   [[nodiscard]] bool startup_grace_active(std::string_view session_id, std::int64_t now_ms);
   [[nodiscard]] bool arm_for_control(std::string_view session_id);
-  [[nodiscard]] CriticalVideoPhase observe_video(
-      std::string_view session_id, bool ready, std::int64_t now_ms, int recovery_timeout_ms);
+  [[nodiscard]] ControlRecoveryPhase observe_recovery(
+      std::string_view session_id, bool ready, std::int64_t now_ms, int recovery_timeout_ms,
+      ControlRecoveryCause cause = ControlRecoveryCause::CriticalVideo);
   [[nodiscard]] bool braking_wait_for(std::string_view session_id) const;
+  [[nodiscard]] ControlRecoveryCause cause_for(std::string_view session_id) const;
+  [[nodiscard]] std::optional<std::int64_t> deadline_for(std::string_view session_id) const;
 
  private:
   mutable std::mutex mutex_;
@@ -132,6 +138,8 @@ class CriticalCameraControlLatch {
   std::optional<std::int64_t> startup_started_ms_;
   std::optional<std::int64_t> braking_started_ms_;
   std::optional<std::int64_t> recovered_started_ms_;
+  int braking_timeout_ms_{0};
+  ControlRecoveryCause cause_{ControlRecoveryCause::CriticalVideo};
 };
 
 struct EncodedFrame {
@@ -234,7 +242,7 @@ class VehicleMediaRuntime {
       int simulate_primary_failure_after_frames = 0,
       std::string connection_id = {},
       std::shared_ptr<MediaSignalingSequence> signaling_sequence = {},
-      std::shared_ptr<CriticalCameraControlLatch> critical_camera_control_latch = {});
+      std::shared_ptr<SessionControlRecoveryLatch> control_recovery_latch = {});
   ~VehicleMediaRuntime();
 
   VehicleMediaRuntime(const VehicleMediaRuntime&) = delete;

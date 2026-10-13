@@ -358,6 +358,97 @@ void test_signaling_time_sync_applies_backward_utc_correction() {
   server.stop();
 }
 
+void test_poor_time_samples_do_not_replace_the_accepted_clock_anchor() {
+  std::atomic<bool> poor{false};
+  mine_teleop::SimpleHttpServer server("127.0.0.1", 0, [&](const mine_teleop::HttpRequest& request) {
+    if (request.path != "/time") return mine_teleop::ServerResponse::json(404, {{"error", "not found"}});
+    const auto sent = std::stoll(request.query.at("client_send_ms"));
+    if (poor.load()) std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    const auto utc = mine_teleop::now_ms() + (poor.load() ? 10000 : 0);
+    return mine_teleop::ServerResponse::json(200, {{"client_send_ms", sent}, {"server_receive_ms", utc}, {"server_send_ms", utc}});
+  });
+  server.start();
+  mine_teleop::HttpClient http;
+  mine_teleop::SynchronizedClock clock;
+  const auto base = "http://127.0.0.1:" + std::to_string(server.port());
+  expect(clock.synchronize(http, base, 3, 25).acceptable(25), "initial clock sample unacceptable");
+  const auto before = clock.now_ms();
+  const auto local_stamp = mine_teleop::now_ms();
+  const auto capture_stamp = clock.from_local_system_ms(local_stamp);
+  poor = true;
+  expect(!clock.synchronize(http, base, 3, 25).acceptable(25), "poor clock cohort appeared trusted");
+  expect(clock.now_ms() >= before && clock.now_ms() - before < 2000, "poor sample replaced the trusted UTC anchor");
+  expect(clock.from_local_system_ms(local_stamp) == capture_stamp && !clock.status().anchor_accepted,
+      "poor sample shifted capture/encoder timestamps despite its rejected UTC anchor");
+  clock.mark_refresh_failed();
+  expect(!clock.status().synchronized && clock.now_ms() - before < 2000, "transport failure discarded the last anchor");
+  expect(clock.from_local_system_ms(local_stamp) == capture_stamp, "failed refresh discarded the accepted capture offset");
+  poor = false;
+  expect(clock.synchronize(http, base, 3, 25).acceptable(25), "good clock did not recover");
+  server.stop();
+}
+
+void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
+  std::atomic<int> delay_ms{0};
+  std::atomic<bool> slow_probe_started{false};
+  mine_teleop::SignalingServerConfig cloud_config;
+  cloud_config.driver_passwords = {{"driver-console-001", "slow-time-password"}};
+  cloud_config.device_tokens = {{"vehicle-001", "slow-time-device"}};
+  cloud_config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
+  auto cloud = std::make_shared<mine_teleop::SignalingService>(cloud_config);
+  mine_teleop::SimpleHttpServer server("127.0.0.1", 0, [&](const auto& request) {
+    if (request.path == "/time" && delay_ms.load() > 0) {
+      slow_probe_started = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms.load()));
+    }
+    return cloud->handle(request);
+  }, 8 * 1024 * 1024, [cloud](int socket, const auto& request) { return cloud->handle_websocket(socket, request); });
+  server.start();
+  const auto base = "http://127.0.0.1:" + std::to_string(server.port());
+  mine_teleop::HttpClient http;
+  static_cast<void>(http.post_json_response(base + "/vehicles/online",
+      {{"vehicle_id", "vehicle-001"}, {"device_token", "slow-time-device"}, {"connection_id", "slow-time-vehicle"}}));
+  mine_teleop::DriverConfig config;
+  config.driver_id = "driver-console-001"; config.signaling_url = base;
+  config.time_sync_interval_ms = 200; config.time_sync_samples = 3;
+  expect(config.intent_lease_ms == 200 && config.max_time_sync_uncertainty_ms == 25, "fixture relaxed a production safety limit");
+  {
+    mine_teleop::DriverConsoleRuntime driver(config, "vehicle-001", "slow-time-password");
+    const auto connected = driver.connect("vehicle-001");
+    const auto session = connected.at("session_id").get<std::string>();
+    const auto generation = connected.at("control_session_generation").get<std::uint64_t>();
+    const mine_teleop::Json neutral = {{"session_id", session}, {"session_generation", generation},
+        {"ui_instance_id", "slow-time-ui"}, {"intent_seq", 1}, {"gear", "N"}, {"steering", 0}, {"throttle", 0}, {"brake", 0}};
+    expect(driver.update_control_intent(neutral).at("accepted").get<bool>(), "neutral input rejected");
+    delay_ms = 350;
+    bool bad_seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline && !bad_seen) {
+      const auto started = std::chrono::steady_clock::now();
+      const auto status = driver.status();
+      expect(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(200), "monitoring blocked on network time samples");
+      expect(driver.update_control_intent(neutral).at("accepted").get<bool>(), "live neutral refresh rejected");
+      expect(driver.status().at("native_control").value("intent_fresh", false), "slow time sampling expired refreshed local input");
+      bad_seen = status.at("time_sync").at("uncertainty_ms").get<std::int64_t>() > 25;
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    expect(slow_probe_started && bad_seen, "fixture did not produce a slow, untrusted time cohort");
+    delay_ms = 0;
+    bool recovered = false;
+    const auto recovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (std::chrono::steady_clock::now() < recovery_deadline && !recovered) {
+      static_cast<void>(driver.update_control_intent(neutral));
+      const auto status = driver.status();
+      recovered = status.at("time_sync").value("synchronized", false) && status.at("time_sync").at("uncertainty_ms") <= 25;
+      expect(status.at("session_id") == session && status.at("control_session_generation") == generation,
+          "time recovery disconnected or replaced the active control session");
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    expect(recovered, "time sync did not recover with the same session");
+  }
+  server.stop();
+}
+
 void test_driver_time_sync_uncertainty_fails_closed_at_production_default() {
   constexpr std::int64_t kSyntheticOffsetStepMs = 10'000;
   std::atomic<int> time_samples{0};
@@ -716,7 +807,7 @@ void test_control_page_contract() {
               std::string::npos,
       "legacy PID defaults can still auto-submit without explicit operator confirmation");
   expect(
-      response.body.find("pidChanged=!prior||requested.consecutive_late_frame_limit!==prior.consecutive_late_frame_limit||requested.parking_idle_timeout_ms!==prior.parking_idle_timeout_ms||requested.critical_camera_stale_brake_ms!==prior.critical_camera_stale_brake_ms||requested.critical_camera_recovery_timeout_ms!==prior.critical_camera_recovery_timeout_ms||requested.speed_pid_kp!==prior.speed_pid_kp") !=
+      response.body.find("pidChanged=!prior||requested.consecutive_late_frame_limit!==prior.consecutive_late_frame_limit||requested.parking_idle_timeout_ms!==prior.parking_idle_timeout_ms||requested.critical_camera_stale_brake_ms!==prior.critical_camera_stale_brake_ms||requested.control_recovery_timeout_ms!==prior.control_recovery_timeout_ms||requested.speed_pid_kp!==prior.speed_pid_kp") !=
               std::string::npos &&
       response.body.find(
               "requested.motor_torque_rise_rate_nm_per_s!==prior.motor_torque_rise_rate_nm_per_s") !=
@@ -1442,15 +1533,15 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
       "if (!profile_active || !handshake_ready)", profile_readiness_gate);
   const auto stale_safe_gate = native_command_path.find(
       "if (stale_safe_heartbeat)", handshake_readiness_gate);
-  const auto stale_safe_active_gate = native_command_path.find(
-      "control_service->safety_state() != SafetyState::ControlActive",
-      stale_safe_gate);
   const auto stale_safe_gap_clock = native_command_path.find(
       "const auto previous_accepted_monotonic_ms =",
-      stale_safe_active_gate);
+      stale_safe_gate);
+  const auto heartbeat_admission = native_command_path.find("neutral_heartbeat_gate(", stale_safe_gap_clock);
+  const auto stale_safe_active_gate = native_command_path.find(
+      "heartbeat_gate == NeutralHeartbeatGate::InactiveState", heartbeat_admission);
   const auto stale_safe_gap_gate = native_command_path.find(
-      "control_mutex_acquired_monotonic_ms - previous_accepted_monotonic_ms >=",
-      stale_safe_gap_clock);
+      "heartbeat_gate == NeutralHeartbeatGate::NativeGap",
+      stale_safe_active_gate);
   const auto stale_safe_gap_reject = native_command_path.find(
       "stale_safe_heartbeat_native_gap_elapsed",
       stale_safe_gap_gate);
@@ -1498,9 +1589,10 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
           estop_gear_gate < profile_readiness_gate &&
           profile_readiness_gate < handshake_readiness_gate &&
           handshake_readiness_gate < stale_safe_gate &&
-          stale_safe_gate < stale_safe_active_gate &&
-          stale_safe_active_gate < stale_safe_gap_clock &&
-          stale_safe_gap_clock < stale_safe_gap_gate &&
+          stale_safe_gate < stale_safe_gap_clock &&
+          stale_safe_gap_clock < heartbeat_admission &&
+          heartbeat_admission < stale_safe_active_gate &&
+          stale_safe_active_gate < stale_safe_gap_gate &&
           stale_safe_gap_gate < stale_safe_gap_reject &&
           stale_safe_gap_reject < stale_safe_gear_gate &&
           stale_safe_gear_gate < receive_command &&
@@ -1525,12 +1617,13 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
               stale_safe_gap_clock) <
               stale_safe_gap_gate &&
           native_command_path.find(
-              "control_mutex_acquired_monotonic_ms < previous_accepted_monotonic_ms",
+              "control_mutex_acquired_monotonic_ms >= previous_accepted_monotonic_ms",
               stale_safe_gap_clock) <
-              stale_safe_gap_gate &&
+              heartbeat_admission &&
           native_command_path.find(
-              "config.control.degraded_timeout_ms", stale_safe_gap_gate) <
-              stale_safe_gap_reject &&
+              "config.control.degraded_timeout_ms", heartbeat_admission) <
+              stale_safe_active_gate &&
+          native_command_path.find("control_service->control_braking_wait()", heartbeat_admission) < stale_safe_active_gate &&
           native_command_path.find(
               "native_control_stale_safe_native_gap_discards_total",
               stale_safe_gap_gate) <
@@ -2959,11 +3052,11 @@ void test_driver_vehicle_switch_releases_old_session() {
   profile_request.method = "POST";
   profile_request.path = "/api/control-profile";
   const mine_teleop::Json valid_profile = {
-      {"profile_version", 6},
+      {"profile_version", 7},
       {"parking_idle_timeout_ms", 500},
       {"consecutive_late_frame_limit", 3},
       {"critical_camera_stale_brake_ms", 500},
-      {"critical_camera_recovery_timeout_ms", 5000},
+      {"control_recovery_timeout_ms", 5000},
       {"target_speed_kph", 3.0},
       {"max_motor_torque_nm", 250.0},
       {"max_brake_pressure_bar", 80.0},
@@ -3001,14 +3094,14 @@ void test_driver_vehicle_switch_releases_old_session() {
     auto requested = valid_profile;
     requested["consecutive_late_frame_limit"] = limit;
     requested["critical_camera_stale_brake_ms"] = 500 + limit * 100;
-    requested["critical_camera_recovery_timeout_ms"] = 2000 + limit * 1000;
+    requested["control_recovery_timeout_ms"] = 2000 + limit * 1000;
     const auto prepared = driver.prepare_control_profile(requested);
     const auto wire = mine_teleop::SessionControlProfileRequest::from_json(prepared.at("request"));
     const auto applied = vehicle_service.receive_session_profile(wire, wire.sent_at_utc_ms);
     expect(applied.accepted && applied.applied_revision == wire.seq &&
         applied.effective_profile && applied.effective_profile->to_json() == requested &&
         vehicle_service.control_timing(wire.sent_at_utc_ms).at("consecutive_late_frame_limit") == limit &&
-        vehicle_service.critical_video_timing() == std::pair{500 + limit * 100, 2000 + limit * 1000},
+        vehicle_service.recovery_timing() == std::pair{500 + limit * 100, 2000 + limit * 1000},
         "driver and vehicle disagreed on a confirmed profile or did not apply the requested frame limit");
   }
   vehicle_service.close();
@@ -3026,7 +3119,7 @@ void test_driver_vehicle_switch_releases_old_session() {
       "prepared session profile lost authenticated envelope identity");
   expect(
       !profile_envelope.contains("profile") &&
-          profile_envelope.value("profile_version", 0) == 6 &&
+          profile_envelope.value("profile_version", 0) == 7 &&
           profile_envelope.value("target_speed_kph", -1.0) == 3.0 &&
           profile_envelope.value("max_motor_torque_nm", -1.0) == 250.0 &&
           profile_envelope.value("max_brake_pressure_bar", -1.0) == 80.0 &&
@@ -3051,7 +3144,7 @@ void test_driver_vehicle_switch_releases_old_session() {
   expect(
       prepared_profile.value("target_speed_kph", -1.0) == 3.0 &&
           prepared_profile.value("max_motor_torque_nm", -1.0) == 250.0 &&
-          prepared_profile.value("profile_version", 0) == 6 &&
+          prepared_profile.value("profile_version", 0) == 7 &&
           prepared_profile.value("initialized", false) &&
           prepared_profile.value("max_steering_angle_deg", -1.0) == 3.0 &&
           prepared_profile.value("speed_pid_kp", -1.0) == 1.5 &&
@@ -3235,11 +3328,11 @@ void test_driver_vehicle_switch_releases_old_session() {
       "rejected legacy control-limit mutation changed the active profile");
 
   profile_request.body = mine_teleop::Json({
-      {"profile_version", 6},
+      {"profile_version", 7},
       {"parking_idle_timeout_ms", 500},
       {"consecutive_late_frame_limit", 3},
       {"critical_camera_stale_brake_ms", 500},
-      {"critical_camera_recovery_timeout_ms", 5000},
+      {"control_recovery_timeout_ms", 5000},
       {"target_speed_kph", 0.0},
       {"max_motor_torque_nm", 0.0},
       {"max_brake_pressure_bar", 0.0},
@@ -3296,7 +3389,7 @@ void test_driver_vehicle_switch_releases_old_session() {
           reset_profile.value("max_brake_pressure_bar", -1.0) == 100.0 &&
           reset_profile.value("service_brake_pressure_bar", -1.0) == 10.0 &&
           reset_profile.value("hard_brake_pressure_bar", -1.0) == 25.0 &&
-          reset_profile.value("profile_version", 0) == 6 &&
+          reset_profile.value("profile_version", 0) == 7 &&
           reset_profile.value("parking_idle_timeout_ms", -1) == 500 &&
           !reset_profile.value("initialized", true) &&
           reset_profile.value("speed_pid_kp", -1.0) == 0.0 &&
@@ -6471,6 +6564,8 @@ int main() {
        test_signaling_time_sync_applies_backward_utc_correction},
       {"driver_time_sync_uncertainty_fails_closed_at_production_default",
        test_driver_time_sync_uncertainty_fails_closed_at_production_default},
+      {"poor_time_samples_do_not_replace_the_accepted_clock_anchor", test_poor_time_samples_do_not_replace_the_accepted_clock_anchor},
+      {"slow_time_refresh_does_not_block_status_or_expire_live_input", test_slow_time_refresh_does_not_block_status_or_expire_live_input},
       {"control_page_contract", test_control_page_contract},
       {"driver_gamepad_config", test_driver_gamepad_config},
       {"vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start",

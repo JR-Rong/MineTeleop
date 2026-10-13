@@ -14,5 +14,8 @@
   "estop": false,
   "future_extension": {
     "ignored": true
-  }
+  },
+  "critical_video_ready": true,
+  "control_time_sync_ready": true,
+  "operator_input_ready": true
 }

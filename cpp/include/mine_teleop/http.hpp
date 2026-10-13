@@ -83,6 +83,8 @@ struct TimeSyncStatus {
   std::int64_t uncertainty_ms{0};
   std::int64_t synchronized_at_local_ms{0};
   int sample_count{0};
+  bool anchor_accepted{false};
+  std::int64_t accepted_anchor_local_ms{0};
 
   [[nodiscard]] Json to_json() const;
   [[nodiscard]] bool acceptable(int max_uncertainty_ms) const;
@@ -90,7 +92,9 @@ struct TimeSyncStatus {
 
 class SynchronizedClock {
  public:
-  TimeSyncStatus synchronize(const HttpClient& http, std::string_view signaling_origin, int sample_count = 7);
+  TimeSyncStatus synchronize(const HttpClient& http, std::string_view signaling_origin, int sample_count = 7,
+                             std::optional<int> max_uncertainty_ms = std::nullopt);
+  void mark_refresh_failed();
   [[nodiscard]] std::int64_t now_ms() const;
   [[nodiscard]] std::int64_t from_local_system_ms(std::int64_t local_time_ms) const;
   [[nodiscard]] TimeSyncStatus status() const;
@@ -101,6 +105,8 @@ class SynchronizedClock {
   TimeSyncStatus status_;
   std::chrono::steady_clock::time_point steady_anchor_{};
   std::int64_t synchronized_anchor_ms_{0};
+  bool has_accepted_anchor_{false};
+  std::int64_t accepted_offset_ms_{0};
 };
 
 std::string normalize_signaling_http_url(std::string_view url);

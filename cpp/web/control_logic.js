@@ -28,13 +28,13 @@
   const GEAR_CHANGE_STATIONARY_SPEED_MPS = 0.1;
   const GEAR_CHANGE_STATIONARY_MIN_SAMPLES = 3;
   const GEAR_CHANGE_STATIONARY_MIN_DURATION_MS = 200;
-  const CONTROL_PROFILE_VERSION = 6;
+  const CONTROL_PROFILE_VERSION = 7;
   const CONTROL_PROFILE_FIELDS = Object.freeze([
     'profile_version',
     'parking_idle_timeout_ms',
     'consecutive_late_frame_limit',
     'critical_camera_stale_brake_ms',
-    'critical_camera_recovery_timeout_ms',
+    'control_recovery_timeout_ms',
     'target_speed_kph',
     'max_motor_torque_nm',
     'max_brake_pressure_bar',
@@ -230,7 +230,7 @@
     if (keys.length !== CONTROL_PROFILE_FIELDS.length ||
         !CONTROL_PROFILE_FIELDS.every(
             field => Object.prototype.hasOwnProperty.call(value, field))) {
-      throw new TypeError('control profile must contain exactly the V6 fields');
+      throw new TypeError('control profile must contain exactly the V7 fields');
     }
     if (value.profile_version !== CONTROL_PROFILE_VERSION) {
       throw new TypeError(`profile_version must be ${CONTROL_PROFILE_VERSION}`);
@@ -240,7 +240,7 @@
       consecutive_late_frame_limit: requireIntegerRange(value.consecutive_late_frame_limit, 1, 5, 'consecutive_late_frame_limit'),
       parking_idle_timeout_ms: requireIntegerRange(value.parking_idle_timeout_ms, 0, 1000, 'parking_idle_timeout_ms'),
       critical_camera_stale_brake_ms: requireIntegerRange(value.critical_camera_stale_brake_ms, 100, 3000, 'critical_camera_stale_brake_ms'),
-      critical_camera_recovery_timeout_ms: requireIntegerRange(value.critical_camera_recovery_timeout_ms, 1000, 30000, 'critical_camera_recovery_timeout_ms'),
+      control_recovery_timeout_ms: requireIntegerRange(value.control_recovery_timeout_ms, 1000, 30000, 'control_recovery_timeout_ms'),
       target_speed_kph: requireFiniteRange(value.target_speed_kph, 0, 72, 'target_speed_kph'),
       max_motor_torque_nm: requireFiniteRange(
           value.max_motor_torque_nm, 0, 640.0, 'max_motor_torque_nm'),
@@ -274,9 +274,13 @@
   }
 
   function vehicleControlDiagnostic(issueCode) {
-    if (issueCode === 'critical_camera_braking_wait') return {
-      level: 'warn', title: '关键画面中断，制动等待恢复',
-      text: '牵引已撤销，车辆正在制动；当前会话与参数保留。画面恢复后释放旧运动输入，再重新按下继续；持续超时将进入安全停车。',
+    if (issueCode === 'control_recovery_braking_wait') return {
+      level: 'warn', title: '控制暂缓，制动等待恢复',
+      text: '牵引已撤销，车辆正在制动；当前会话与参数保留。视频、时间同步与输入刷新恢复后，释放旧运动输入再重新按下继续；持续超时将安全停车。',
+    };
+    if (issueCode === 'control_recovery_timeout') return {
+      level: 'critical', title: '控制故障持续超时，控制已锁定',
+      text: '时间同步或输入刷新未在等待期限内稳定恢复。车辆已安全停车；请结束会话，待链路正常后重新连接。',
     };
     if (issueCode === 'critical_camera_failed') return {
       level: 'critical', title: '关键视频故障，控制已锁定',
@@ -335,7 +339,7 @@
       max_steering_angle_deg: requireFiniteRange(
           value.max_steering_angle_deg, 0, 30, 'max_steering_angle_deg'),
       default_critical_camera_stale_brake_ms: requireIntegerRange(value.default_critical_camera_stale_brake_ms, 100, 3000, 'default_critical_camera_stale_brake_ms'),
-      default_critical_camera_recovery_timeout_ms: requireIntegerRange(value.default_critical_camera_recovery_timeout_ms, 1000, 30000, 'default_critical_camera_recovery_timeout_ms'),
+      default_control_recovery_timeout_ms: requireIntegerRange(value.default_control_recovery_timeout_ms, 1000, 30000, 'default_control_recovery_timeout_ms'),
       default_speed_pid_kp: requireFiniteRange(
           value.default_speed_pid_kp, speedPidLimits.kp.min, speedPidLimits.kp.max,
           'default_speed_pid_kp'),
@@ -398,7 +402,7 @@
       parking_idle_timeout_ms: requested.parking_idle_timeout_ms,
       consecutive_late_frame_limit: requested.consecutive_late_frame_limit,
       critical_camera_stale_brake_ms: requested.critical_camera_stale_brake_ms,
-      critical_camera_recovery_timeout_ms: requested.critical_camera_recovery_timeout_ms,
+      control_recovery_timeout_ms: requested.control_recovery_timeout_ms,
       target_speed_kph: Math.min(requested.target_speed_kph, hard.max_target_speed_kph),
       max_motor_torque_nm: Math.min(
           requested.max_motor_torque_nm, hard.full_scale_motor_torque_nm),
@@ -440,7 +444,7 @@
       parking_idle_timeout_ms: 500,
       consecutive_late_frame_limit: 3,
       critical_camera_stale_brake_ms: hard.default_critical_camera_stale_brake_ms,
-      critical_camera_recovery_timeout_ms: hard.default_critical_camera_recovery_timeout_ms,
+      control_recovery_timeout_ms: hard.default_control_recovery_timeout_ms,
       target_speed_kph: hard.max_target_speed_kph / 2,
       max_motor_torque_nm: hard.full_scale_motor_torque_nm / 2,
       max_brake_pressure_bar: hard.max_brake_pressure_bar / 2,
@@ -1071,6 +1075,29 @@
     return {kind: 'none', visible: false, severity: '', banner: '', alert: ''};
   }
 
+  function deriveControlRecoveryPresentation(connected, telemetry, feedbackFresh, hardStopVisible) {
+    const hidden = {visible: false, severity: '', banner: '', alert: '', cause: ''};
+    if (!connected || !telemetry || hardStopVisible || telemetry.estop === true ||
+        ['ESTOP', 'FAULT', 'TIMEOUT_BRAKE'].includes(telemetry.safety_state)) return hidden;
+    const timing = telemetry.control_timing || {};
+    const waiting = timing.control_braking_wait === true;
+    const holding = timing.recovery_brake_hold === true;
+    const delayed = telemetry.safety_state === 'DEGRADED';
+    if (!waiting && !holding && !delayed) return hidden;
+    const cause = waiting || holding ? String(timing.control_recovery_cause || '') : 'control_delay';
+    const reasons = {critical_video: '关键视频中断或无新帧', time_sync: '时间同步不可信',
+      input_lease: '驾驶输入刷新过期', control_delay: '控制指令延迟或短暂中断'};
+    const reason = reasons[cause] || '控制链路暂时异常';
+    // Report the last authoritative vehicle state without claiming that old
+    // feedback confirms current physical braking or a completed stop.
+    const banner = !feedbackFresh
+      ? `车端此前已报告制动等待（${reason}）；反馈已过期，当前制动状态待确认。`
+      : holding && !waiting && !delayed
+        ? `链路已恢复，车端制动保持；当前会话保留，请释放旧按键后重新按下继续控车。`
+        : `车端制动等待：${reason}；当前会话保留。恢复后释放旧按键再重新按下；持续故障将安全停车。`;
+    return {visible: true, severity: 'warn', banner, alert: banner, cause};
+  }
+
   function deriveControlCommandRejection(issueCodeValue) {
     const issueCode = String(issueCodeValue || '');
     if (issueCode === 'control_input_rearm_required') {
@@ -1338,6 +1365,7 @@
     reduceGamepadNeutralInterlock,
     reduceStatusSequence,
     deriveEstopPresentation,
+    deriveControlRecoveryPresentation,
     deriveControlCommandRejection,
     isCurrentPeer,
     isCurrentControlChannel,

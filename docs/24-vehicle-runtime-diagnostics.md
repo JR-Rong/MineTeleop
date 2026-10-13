@@ -151,18 +151,18 @@ CCG2 的 `vehicle_camera_first_frame`、`vehicle_camera_failed` 和 lane metrics
 
 | `event` / `issue_code` | 条件 | 控制与媒体结果 |
 | --- | --- | --- |
-| `vehicle_camera_failed` / 具体 camera issue | 单路采集首次或再次失败 | `critical_for_control=true` 时首个已确认故障立即本地安全停车、锁止控制并关闭 profile/VCU/status DataChannel；原生 WSS 命令继续被锁存拒绝，非关键 lane 不改变控制权限 |
-| `vehicle_camera_reopen_scheduled` / `camera_lane_reopen_scheduled` | 故障可重试且累计失败次数未超过 `reopen_attempts` | 只销毁并重开故障采集源，其他 lane 不重建；关键相机的控制锁止保持不变 |
-| `vehicle_camera_recovered` / `camera_lane_recovered` | 重开后的第一帧到达 | 视频恢复；若为关键相机，同一云端 session 的控制锁止保持不变，不能把该事件当作恢复驾驶权限 |
+| `vehicle_camera_failed` / 具体 camera issue | 单路采集首次或再次失败 | `critical_for_control=true` 时立即独立制动等待，保留会话/参数；非关键 lane 不改变控制权限 |
+| `vehicle_camera_reopen_scheduled` / `camera_lane_reopen_scheduled` | 故障可重试且累计失败次数未超过 `reopen_attempts` | 只销毁并重开故障采集源，其他 lane 不重建；已有等待截止点不延长 |
+| `vehicle_camera_recovered` / `camera_lane_recovered` | 重开后的第一帧到达 | 视频恢复不等于恢复驾驶；所有关键帧与输入/校时稳定恢复后要求新零输入和释放重按；已超时硬锁存不解除 |
 | `vehicle_camera_lane_disabled` / `camera_reopen_exhausted` | 不可重试或重开额度耗尽 | 关键 lane 禁用且继续保持停车；非关键 lane 只结束自身视频，其他 lane 与当前控制继续 |
-| `vehicle_control_inhibited_by_camera` / `critical_camera_control_inhibited` | 关键相机首次确认失败 | 保持车辆停止并关闭 profile/VCU/status DataChannel；必须结束当前 session，在新 session 重建该 DataChannel、control-only WSS 并重新完成 VCU 握手 |
-| `vehicle_control_inhibition_retained` / `critical_camera_control_inhibition_retained` | 媒体 service 在同一云端 session 内重建 runtime | 继续拒绝控制并保留视频能力；结束当前 session 后才能在新 session 重新握手 |
-| `vehicle_control_inhibition_latch_failed` / `critical_camera_control_latch_failed` | 内部 session 作用域不一致，无法更新共享锁存 | runtime-local 锁存仍立即安全停车；保持物理隔离并结束当前 session，禁止继续驾驶 |
+| `vehicle_control_recovery_timeout` / `critical_camera_failed`、`control_recovery_timeout` | 视频、校时或输入故障持续到恢复等待截止点 | 保持车辆停止并关闭 profile/VCU/status DataChannel；必须结束当前 session，在新 session 重建该 DataChannel、control-only WSS 并重新完成 VCU 握手 |
+| `vehicle_control_inhibition_retained` / `control_recovery_inhibition_retained` | 已超时硬锁存的同一 session 重建 runtime | 继续拒绝控制并保留视频能力；结束当前 session 后才能在新 session 重新握手 |
+| `vehicle_control_inhibition_latch_failed` / `control_recovery_latch_failed` | 内部 session 作用域不一致，无法更新共享锁存 | runtime-local 锁存仍立即安全停车；保持物理隔离并结束当前 session，禁止继续驾驶 |
 
 默认 `reopen_attempts=3` 是同一次媒体运行尝试内的累计上限：前三次可重试采集故障
 各触发一次单路重开，第四次禁用 lane；成功取帧不会把额度恢复成无限重试。
 允许范围是 `0..10`，`0` 表示首故障直接禁用；`reopen_backoff_ms` 默认
-`500 ms`、范围 `0..60000 ms`。关键相机的安全锁存不会因捕获、编码恢复或同一云端
+`500 ms`、范围 `0..60000 ms`。超出恢复期限后的安全锁存不会因捕获、编码恢复或同一云端
 session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧、多关键相机交错
 恢复、短暂画面恢复或媒体 transport 重试自行重新获得驾驶权限。
 
@@ -200,8 +200,8 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `vehicle_control_data_channel_closed` | 已打开的 channel 关闭 | 命令计数、最后接收时间 | 每次状态变化 |
 | `vehicle_native_control_websocket_failed` / `native_control_websocket_connection_failed` | 车端 control-only WSS 连接、读取、关闭或 ACK 失败 | `consecutive_errors`, `errors_total`, `safety_action=local_watchdog_safe_stop` | 最多每秒一次 |
 | `vehicle_native_control_websocket_failed` / `native_control_websocket_protocol_failed` | 控制 WSS envelope/type/cursor/`intent_seq`/`intent_fresh` 非法 | 同上及协议错误文本 | 最多每秒一次 |
-| `vehicle_media_pipeline_failed` / `media_runtime_time_sync_failed` | session 中刷新时间同步失败 | `error` | 每个 candidate 首错一次 |
-| `vehicle_media_pipeline_failed` / `media_runtime_time_sync_uncertainty_exceeded` | 刷新不确定度越界 | limit | 每个 candidate 首错一次 |
+| `vehicle_media_pipeline_failed` / `media_runtime_time_sync_failed` | 旧包运行阶段校时失败记录；V7 改为制动等待 | `error` | 每个 candidate 首错一次 |
+| `vehicle_media_pipeline_failed` / `media_runtime_time_sync_uncertainty_exceeded` | 旧包校时不确定度越界记录；V7 改为制动等待 | limit | 每个 candidate 首错一次 |
 | `vehicle_media_signaling_failed` / `session_signaling_exchange_failed` | offer/answer/ICE 消息收发失败 | `error` | 每次 session 失败 |
 | `vehicle_media_session_ended` / `active_media_session_ended` | HTTP 404 或 409 `session_not_active` | `http_status`, `server_issue_code`, retry delay | 等待新的有效会话 |
 | `vehicle_media_connection_refresh` / `vehicle_registration_refresh_required` | HTTP 409 `vehicle_offline` | `server_issue_code` | 刷新车辆在线注册 |
@@ -392,3 +392,5 @@ jq -c 'select(
   .name == "feedback_timeout"
 )' /var/log/mine-teleop/vcu-can.jsonl*
 ```
+
+V7 的 `vehicle_control_braking_wait` / `vehicle_control_recovered` 记录共同恢复门限、首次故障类型和校时状态。`time_sync_refresh` 追踪记录采样耗时、最新估计、`anchor_accepted`、上一份有效锚点时刻及错误。驾驶端 `intent_received` 与发送追踪包含输入年龄、租约、输入/时钟健康标志；安全心跳仍需身份、序号、年龄及保留挡位校验。网络真正无有效控制达到原门限时，仍先执行控制 watchdog。

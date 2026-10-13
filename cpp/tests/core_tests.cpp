@@ -1319,8 +1319,8 @@ void test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_
       "empty session id was accepted as a media sequence scope");
 }
 
-void test_critical_camera_control_latch_persists_until_a_new_session() {
-  mine_teleop::CriticalCameraControlLatch latch;
+void test_control_recovery_latch_persists_until_a_new_session() {
+  mine_teleop::SessionControlRecoveryLatch latch;
   expect(!latch.enter_session("session-a"), "new session unexpectedly inherited camera inhibition");
   expect(!latch.inhibited_for("session-a"), "new session started inhibited");
   expect(latch.inhibit("session-a"), "first camera fault did not transition the session latch");
@@ -1344,31 +1344,31 @@ void test_critical_camera_control_latch_persists_until_a_new_session() {
 }
 
 void test_critical_video_wait_recovers_and_never_extends_the_hard_deadline() {
-  using Phase = mine_teleop::CriticalVideoPhase;
-  mine_teleop::CriticalCameraControlLatch latch;
+  using Phase = mine_teleop::ControlRecoveryPhase;
+  mine_teleop::SessionControlRecoveryLatch latch;
   expect(!latch.enter_session("video"), "new session inhibited");
-  expect(latch.observe_video("video", true, 100, 5000) == Phase::Ready, "healthy video started braking");
-  expect(latch.observe_video("video", false, 200, 5000) == Phase::BrakingWait, "missing video did not start braking");
+  expect(latch.observe_recovery("video", true, 100, 5000) == Phase::Ready, "healthy video started braking");
+  expect(latch.observe_recovery("video", false, 200, 5000) == Phase::BrakingWait, "missing video did not start braking");
   expect(!latch.enter_session("video") && latch.braking_wait_for("video"), "runtime rebuild lost braking state");
-  expect(latch.observe_video("video", true, 1000, 5000) == Phase::BrakingWait, "one good observation released braking");
-  expect(latch.observe_video("video", false, 1100, 5000) == Phase::BrakingWait, "repeated loss cleared braking");
-  expect(latch.observe_video("video", true, 1200, 5000) == Phase::BrakingWait, "unstable recovery released braking");
-  expect(latch.observe_video("video", true, 1499, 5000) == Phase::BrakingWait, "recovery stability ended early");
-  expect(latch.observe_video("video", true, 1500, 5000) == Phase::Recovered, "stable video did not recover in session");
+  expect(latch.observe_recovery("video", true, 1000, 5000) == Phase::BrakingWait, "one good observation released braking");
+  expect(latch.observe_recovery("video", false, 1100, 5000) == Phase::BrakingWait, "repeated loss cleared braking");
+  expect(latch.observe_recovery("video", true, 1200, 5000) == Phase::BrakingWait, "unstable recovery released braking");
+  expect(latch.observe_recovery("video", true, 1499, 5000) == Phase::BrakingWait, "recovery stability ended early");
+  expect(latch.observe_recovery("video", true, 1500, 5000) == Phase::Recovered, "stable video did not recover in session");
   expect(!latch.braking_wait_for("video") && !latch.inhibited_for("video"), "timely recovery latched control");
-  expect(latch.observe_video("video", false, 2000, 5000) == Phase::BrakingWait, "second outage missing");
+  expect(latch.observe_recovery("video", false, 2000, 5000) == Phase::BrakingWait, "second outage missing");
   expect(!latch.enter_session("video"), "rebuild prematurely latched control");
-  expect(latch.observe_video("video", false, 6999, 5000) == Phase::BrakingWait, "video stop triggered before five seconds");
-  expect(latch.observe_video("video", true, 7000, 5000) == Phase::Locked, "deadline frame bypassed the due hard stop");
-  expect(latch.enter_session("video") && latch.observe_video("video", true, 7300, 5000) == Phase::Locked,
+  expect(latch.observe_recovery("video", false, 6999, 5000) == Phase::BrakingWait, "video stop triggered before five seconds");
+  expect(latch.observe_recovery("video", true, 7000, 5000) == Phase::Locked, "deadline frame bypassed the due hard stop");
+  expect(latch.enter_session("video") && latch.observe_recovery("video", true, 7300, 5000) == Phase::Locked,
       "same-session reconstruction bypassed sustained-video lock");
   expect(!latch.enter_session("new-video") && !latch.braking_wait_for("new-video"), "new session inherited old braking deadline");
-  expect_throws([&] { latch.observe_video("video", false, 7300, 5000); }, "old runtime changed a new session");
+  expect_throws([&] { latch.observe_recovery("video", false, 7300, 5000); }, "old runtime changed a new session");
 }
 
 void test_camera_startup_grace_and_running_freshness() {
   using mine_teleop::camera_encoded_frame_fresh;
-  mine_teleop::CriticalCameraControlLatch latch;
+  mine_teleop::SessionControlRecoveryLatch latch;
   expect(!latch.enter_session("startup"), "new session inhibited");
   expect(latch.startup_grace_active("startup", 1000), "startup grace missing");
   expect(!camera_encoded_frame_fresh(1000, 5000, 3000), "stale startup frame accepted");
@@ -2423,15 +2423,15 @@ void test_real_adapter_profile_changes_require_parking_and_apply_before_ack() {
   auto video_change = count_change;
   video_change.seq = 13; video_change.sent_at_utc_ms = 120;
   video_change.profile.critical_camera_stale_brake_ms = 700;
-  video_change.profile.critical_camera_recovery_timeout_ms = 7000;
+  video_change.profile.control_recovery_timeout_ms = 7000;
   adapter_view->handshake.parking_ready = false;
   const auto video_blocked = service.receive_session_profile(video_change, 120);
-  expect(!video_blocked.accepted && service.critical_video_timing() == std::pair{500,5000},
+  expect(!video_blocked.accepted && service.recovery_timing() == std::pair{500,5000},
       "video timing changed without parking and exact ACK");
   adapter_view->handshake.parking_ready = true;
   video_change.seq = 14; video_change.sent_at_utc_ms = 130;
   const auto video_applied = service.receive_session_profile(video_change, 130);
-  expect(video_applied.accepted && video_applied.effective_profile && service.critical_video_timing() == std::pair{700,7000},
+  expect(video_applied.accepted && video_applied.effective_profile && service.recovery_timing() == std::pair{700,7000},
       "parked confirmed video timing did not reach the actual runtime");
   service.close();
 }
@@ -2467,6 +2467,21 @@ void test_control_service_commits_only_successfully_applied_commands() {
     expect(
         service.receive_command(command(2, 1), 1).accepted,
         "fresh command did not recover after a structured adapter rejection");
+    service.set_control_braking_wait(true, 50, mine_teleop::ControlRecoveryCause::InputLease);
+    service.set_control_braking_wait(false, 100);
+    auto neutral = command(3, 110); neutral.throttle = neutral.steering = 0;
+    expect(service.receive_command(neutral, 110).accepted, "recovery neutral was rejected");
+    adapter_view->structured_rejection_issue_code = "vcu_drive_gear_change_moving_or_stale";
+    expect(!service.receive_command(command(4, 150), 150).accepted &&
+        service.control_timing(150).at("recovery_brake_hold").get<bool>(),
+        "rejected recovery motion released the independent brake hold");
+    service.tick(160);
+    expect(adapter_view->last_safe_output.brake == 1,
+        "rejected recovery motion lost the refreshed safety brake");
+    adapter_view->structured_rejection_issue_code.reset();
+    expect(service.receive_command(command(5, 190), 190).accepted &&
+        !service.control_timing(190).at("recovery_brake_hold").get<bool>(),
+        "accepted fresh recovery motion could not release the brake hold");
     service.close();
   }
 
@@ -2732,9 +2747,9 @@ void test_video_braking_preserves_profile_and_only_real_commands_refresh_control
   expect(service.receive_session_profile(profile, 0).accepted, "video fixture profile rejected");
   expect(service.receive_command(command(1, 0), 0).accepted, "initial motion rejected");
   auto bad_identity = command(2, 50); bad_identity.control_token = "wrong"; bad_identity.critical_video_ready = false;
-  expect(!service.receive_command(bad_identity, 50).accepted && !service.critical_video_braking_wait(), "untrusted view-health changed protection");
+  expect(!service.receive_command(bad_identity, 50).accepted && !service.control_braking_wait(), "untrusted view-health changed protection");
   auto lost = command(2, 100); lost.critical_video_ready = false;
-  expect(!service.receive_command(lost, 100).accepted && service.critical_video_braking_wait(), "lost driver view applied motion");
+  expect(!service.receive_command(lost, 100).accepted && service.control_braking_wait(), "lost driver view applied motion");
   expect(view->read_telemetry().throttle_feedback == 0 && view->read_telemetry().brake_feedback == 1,
       "video loss did not immediately withdraw traction and apply independent braking");
   std::uint64_t seq = 3;
@@ -2745,7 +2760,7 @@ void test_video_braking_preserves_profile_and_only_real_commands_refresh_control
     expect(service.session_control_profile().at("active").get<bool>() && view->read_telemetry().brake_feedback == 1,
         "video wait revoked profile or released the safety brake");
   }
-  service.set_critical_video_braking_wait(false, 3001);
+  service.set_control_braking_wait(false, 3001);
   auto motion = command(seq++, 3050); motion.critical_video_ready = true;
   expect(!service.receive_command(motion, 3050).accepted, "recovery resurrected old motion without neutral");
   auto neutral = command(seq++, 3100); neutral.steering = neutral.throttle = 0; neutral.critical_video_ready = true;
@@ -2753,7 +2768,7 @@ void test_video_braking_preserves_profile_and_only_real_commands_refresh_control
   motion.seq = seq++; motion.sent_at_utc_ms = 3150;
   expect(service.receive_command(motion, 3150).accepted && view->read_telemetry().throttle_feedback > 0,
       "fresh motion did not recover using retained session profile");
-  service.set_critical_video_braking_wait(true, 3200);
+  service.set_control_braking_wait(true, 3200);
   service.tick(3949);
   expect(service.session_control_profile().at("active").get<bool>(), "independent 800 ms triggered early");
   service.tick(3950);
@@ -2786,6 +2801,82 @@ void test_idle_zero_heartbeats_do_not_trigger_control_timeout() {
   expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
       !service.session_control_profile().at("active").get<bool>(), "actual heartbeat outage did not trigger at 800 ms");
   service.close();
+}
+
+void test_time_and_input_faults_brake_independently_and_recover_without_new_profile() {
+  using Gate = mine_teleop::NeutralHeartbeatGate;
+  using State = mine_teleop::SafetyState;
+  expect(mine_teleop::neutral_heartbeat_gate(State::Degraded, true, 400, 300) == Gate::Accepted,
+      "verified neutral heartbeat cannot maintain an already braking wait");
+  expect(mine_teleop::neutral_heartbeat_gate(State::Degraded, false, 50, 300) == Gate::InactiveState &&
+      mine_teleop::neutral_heartbeat_gate(State::ControlActive, false, 300, 300) == Gate::NativeGap,
+      "ordinary stale UI input bypassed native gap protection");
+  expect(mine_teleop::neutral_heartbeat_gate(State::TimeoutBrake, true, 50, 300) == Gate::InactiveState &&
+      mine_teleop::neutral_heartbeat_gate(State::ControlActive, true, -1, 300) == Gate::NativeGap,
+      "braking wait revived a hard stop or untrusted native clock");
+  for (const bool time_fault : {false, true}) {
+    auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+    auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+    auto* view = adapter.get();
+    mine_teleop::VehicleControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    auto profile = session_profile_request(100, 0);
+    profile.profile.max_brake_pressure_bar = profile.profile.service_brake_pressure_bar = profile.profile.hard_brake_pressure_bar = 0;
+    expect(service.receive_session_profile(profile, 0).accepted, "recovery profile rejected");
+    expect(service.receive_command(command(1, 0), 0).accepted, "initial motion rejected");
+    auto blocked = command(2, 50);
+    blocked.control_time_sync_ready = !time_fault;
+    blocked.operator_input_ready = time_fault;
+    expect(!service.receive_command(blocked, 50).accepted && service.control_braking_wait(), "unready motion was executed");
+    expect(view->read_telemetry().throttle_feedback == 0 && view->read_telemetry().brake_feedback == 1,
+        "time/input loss did not apply independent braking");
+    expect(service.control_timing(50).at("control_recovery_cause") == (time_fault ? "time_sync" : "input_lease"),
+        "vehicle feedback cannot distinguish the recoverable braking cause");
+    std::uint64_t seq = 3;
+    for (int now = 100; now <= 1000; now += 50) {
+      auto neutral = blocked; neutral.seq = seq++; neutral.sent_at_utc_ms = now;
+      neutral.throttle = neutral.steering = 0;
+      expect(service.receive_command(neutral, now).accepted, "real braking heartbeat rejected");
+      service.tick(now);
+      expect(service.session_control_profile().at("active").get<bool>() && view->read_telemetry().brake_feedback == 1,
+          "braking wait lost its session or released the safety brake");
+    }
+    service.set_control_braking_wait(false, 1001);
+    auto fresh = command(seq++, 1050);
+    expect(!service.receive_command(fresh, 1050).accepted, "recovery resurrected motion without fresh neutral");
+    auto neutral = fresh; neutral.seq = seq++; neutral.sent_at_utc_ms = 1100; neutral.throttle = neutral.steering = 0;
+    expect(service.receive_command(neutral, 1100).accepted, "fresh neutral rejected");
+    expect(view->read_telemetry().brake_feedback == 1 && service.control_timing(1100).at("recovery_brake_hold").get<bool>(),
+        "restored networking released the safety brake before fresh motion input");
+    fresh.seq = seq++; fresh.sent_at_utc_ms = 1150;
+    expect(service.receive_command(fresh, 1150).accepted && view->read_telemetry().throttle_feedback > 0 &&
+        !service.control_timing(1150).at("recovery_brake_hold").get<bool>() && service.session_control_profile().at("applied_revision") == 100,
+        "recovered motion required a new profile/session");
+    auto wire = fresh.to_json(); wire.erase("operator_input_ready");
+    expect_throws([&] { mine_teleop::ControlCommand::from_json(wire); }, "old relay silently stripped input readiness");
+    wire["estop"] = true; wire.erase("control_time_sync_ready");
+    expect(mine_teleop::ControlCommand::from_json(wire).estop, "legacy authenticated ESTOP depended on new health fields");
+    service.close();
+  }
+  using Cause = mine_teleop::ControlRecoveryCause;
+  using Phase = mine_teleop::ControlRecoveryPhase;
+  mine_teleop::SessionControlRecoveryLatch latch;
+  expect(!latch.enter_session("mixed"), "new recovery session inhibited");
+  expect(latch.observe_recovery("mixed", false, 0, 5000, Cause::TimeSynchronization) == Phase::BrakingWait, "time fault did not wait");
+  expect(!latch.enter_session("mixed"), "runtime rebuild inhibited before deadline");
+  expect(latch.observe_recovery("mixed", false, 4999, 30000, Cause::InputLease) == Phase::BrakingWait,
+      "changed fault type ended the original wait");
+  expect(latch.cause_for("mixed") == Cause::TimeSynchronization &&
+      latch.deadline_for("mixed") == 5000 && latch.observe_recovery("mixed", true, 5000, 30000) == Phase::Locked,
+      "changed cause, profile, or one good frame extended the original deadline");
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  const auto legacy = write_temp_vehicle_config("legacy-recovery", "runtime:\n  critical_camera_recovery_timeout_ms: 7000\n" + base);
+  expect(mine_teleop::load_vehicle_config(legacy).runtime.control_recovery_timeout_ms == 7000,
+      "legacy YAML recovery timing silently fell back to a different default");
+  const auto conflict = write_temp_vehicle_config("conflicting-recovery",
+      "runtime:\n  critical_camera_recovery_timeout_ms: 7000\n  control_recovery_timeout_ms: 5000\n" + base);
+  expect_throws([&] { mine_teleop::load_vehicle_config(conflict); }, "conflicting recovery configuration was silently accepted");
+  std::filesystem::remove(legacy); std::filesystem::remove(conflict);
 }
 
 void test_configurable_late_frames_and_independent_hard_timeout() {
@@ -2868,7 +2959,7 @@ void test_configurable_late_frames_and_independent_hard_timeout() {
     expect_throws([&] { mine_teleop::SessionControlProfile::from_json(malformed); }, "unsupported profile version accepted");
   }
   auto missing = complete;
-  for (const auto field : {"critical_camera_stale_brake_ms", "critical_camera_recovery_timeout_ms"}) {
+  for (const auto field : {"critical_camera_stale_brake_ms", "control_recovery_timeout_ms"}) {
     auto missing_video = complete; missing_video.erase(field);
     expect_throws([&] { mine_teleop::SessionControlProfile::from_json(missing_video); }, "missing video timing silently defaulted");
     auto fractional = complete; fractional[field] = 500.5;
@@ -4504,7 +4595,7 @@ int main() {
       {"ccg2_example_config_defines_two_explicit_capture_lanes", test_ccg2_example_config_defines_two_explicit_capture_lanes},
       {"missing_v4l2_path_remains_retryable", test_missing_v4l2_path_remains_retryable},
       {"media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes", test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes},
-      {"critical_camera_control_latch_persists_until_a_new_session", test_critical_camera_control_latch_persists_until_a_new_session},
+      {"control_recovery_latch_persists_until_a_new_session", test_control_recovery_latch_persists_until_a_new_session},
       {"critical_video_wait_recovers_and_never_extends_the_hard_deadline", test_critical_video_wait_recovers_and_never_extends_the_hard_deadline},
       {"camera_startup_grace_and_running_freshness", test_camera_startup_grace_and_running_freshness},
       {"media_signaling_error_classification_supports_structured_and_legacy_conflicts", test_media_signaling_error_classification_supports_structured_and_legacy_conflicts},
@@ -4537,6 +4628,7 @@ int main() {
        test_held_forward_and_left_rearm_after_control_gap},
       {"video_braking_preserves_profile_and_only_real_commands_refresh_control", test_video_braking_preserves_profile_and_only_real_commands_refresh_control},
       {"idle_zero_heartbeats_do_not_trigger_control_timeout", test_idle_zero_heartbeats_do_not_trigger_control_timeout},
+      {"time_and_input_faults_brake_independently_and_recover_without_new_profile", test_time_and_input_faults_brake_independently_and_recover_without_new_profile},
       {"configurable_late_frames_and_independent_hard_timeout", test_configurable_late_frames_and_independent_hard_timeout},
       {"timeout_profile_revocation_preserves_watchdog_stop",
        test_timeout_profile_revocation_preserves_watchdog_stop},

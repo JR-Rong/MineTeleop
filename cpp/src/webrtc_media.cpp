@@ -134,7 +134,7 @@ bool camera_encoded_frame_fresh(std::int64_t last_encoded_ms, std::int64_t now_m
       now_ms - last_encoded_ms <= timeout_ms;
 }
 
-bool CriticalCameraControlLatch::enter_session(std::string_view session_id) {
+bool SessionControlRecoveryLatch::enter_session(std::string_view session_id) {
   if (session_id.empty()) {
     throw std::invalid_argument("critical camera control latch requires a non-empty session id");
   }
@@ -145,12 +145,14 @@ bool CriticalCameraControlLatch::enter_session(std::string_view session_id) {
     armed_ = false;
     startup_started_ms_.reset();
     braking_started_ms_.reset();
+    braking_timeout_ms_ = 0;
     recovered_started_ms_.reset();
+    cause_ = ControlRecoveryCause::CriticalVideo;
   }
   return inhibited_;
 }
 
-bool CriticalCameraControlLatch::inhibit(std::string_view session_id) {
+bool SessionControlRecoveryLatch::inhibit(std::string_view session_id) {
   if (session_id.empty()) {
     throw std::invalid_argument("critical camera control latch requires a non-empty session id");
   }
@@ -166,7 +168,7 @@ bool CriticalCameraControlLatch::inhibit(std::string_view session_id) {
   return first_inhibition;
 }
 
-bool CriticalCameraControlLatch::inhibited_for(std::string_view session_id) const {
+bool SessionControlRecoveryLatch::inhibited_for(std::string_view session_id) const {
   if (session_id.empty()) {
     throw std::invalid_argument("critical camera control latch requires a non-empty session id");
   }
@@ -177,7 +179,7 @@ bool CriticalCameraControlLatch::inhibited_for(std::string_view session_id) cons
   return inhibited_;
 }
 
-bool CriticalCameraControlLatch::startup_grace_active(std::string_view session_id, std::int64_t now_ms) {
+bool SessionControlRecoveryLatch::startup_grace_active(std::string_view session_id, std::int64_t now_ms) {
   std::lock_guard lock(mutex_);
   if (session_id.empty() || session_id_ != session_id || now_ms < 0) {
     throw std::logic_error("invalid critical camera startup scope or time");
@@ -187,7 +189,7 @@ bool CriticalCameraControlLatch::startup_grace_active(std::string_view session_i
       now_ms - *startup_started_ms_ < kCriticalCameraStartupTimeoutMs;
 }
 
-bool CriticalCameraControlLatch::arm_for_control(std::string_view session_id) {
+bool SessionControlRecoveryLatch::arm_for_control(std::string_view session_id) {
   std::lock_guard lock(mutex_);
   if (session_id.empty() || session_id_ != session_id) {
     throw std::logic_error("critical camera control scope does not match the active session");
@@ -197,34 +199,65 @@ bool CriticalCameraControlLatch::arm_for_control(std::string_view session_id) {
   return true;
 }
 
-CriticalVideoPhase CriticalCameraControlLatch::observe_video(
-    std::string_view session_id, bool ready, std::int64_t now_ms, int recovery_timeout_ms) {
+ControlRecoveryPhase SessionControlRecoveryLatch::observe_recovery(
+    std::string_view session_id, bool ready, std::int64_t now_ms, int recovery_timeout_ms,
+    ControlRecoveryCause cause) {
   std::lock_guard lock(mutex_);
   if (session_id.empty() || session_id_ != session_id || now_ms < 0 || recovery_timeout_ms <= 0)
     throw std::logic_error("invalid critical-video protection scope or time");
-  if (inhibited_) return CriticalVideoPhase::Locked;
-  if (!ready && !braking_started_ms_) braking_started_ms_ = now_ms;
-  if (!braking_started_ms_) return CriticalVideoPhase::Ready;
+  if (inhibited_) return ControlRecoveryPhase::Locked;
+  if (!ready && !braking_started_ms_) {
+    braking_started_ms_ = now_ms;
+    braking_timeout_ms_ = recovery_timeout_ms;
+    cause_ = cause;
+  }
+  if (!braking_started_ms_) return ControlRecoveryPhase::Ready;
   // A frame arriving at the hard deadline cannot clear an already due stop.
-  if (now_ms - *braking_started_ms_ >= recovery_timeout_ms) {
+  if (now_ms - *braking_started_ms_ >= braking_timeout_ms_) {
     inhibited_ = true;
-    return CriticalVideoPhase::Locked;
+    return ControlRecoveryPhase::Locked;
   }
   if (!ready) recovered_started_ms_.reset();
   else if (!recovered_started_ms_) recovered_started_ms_ = now_ms;
-  else if (now_ms - *recovered_started_ms_ >= kCriticalCameraRecoveryStableMs) {
+  else if (now_ms - *recovered_started_ms_ >= kControlRecoveryStableMs) {
     braking_started_ms_.reset();
+    braking_timeout_ms_ = 0;
     recovered_started_ms_.reset();
-    return CriticalVideoPhase::Recovered;
+    return ControlRecoveryPhase::Recovered;
   }
-  return CriticalVideoPhase::BrakingWait;
+  return ControlRecoveryPhase::BrakingWait;
 }
 
-bool CriticalCameraControlLatch::braking_wait_for(std::string_view session_id) const {
+bool SessionControlRecoveryLatch::braking_wait_for(std::string_view session_id) const {
   std::lock_guard lock(mutex_);
   if (session_id.empty() || session_id_ != session_id)
     throw std::logic_error("critical-video protection session mismatch");
   return braking_started_ms_.has_value() && !inhibited_;
+}
+
+ControlRecoveryCause SessionControlRecoveryLatch::cause_for(std::string_view session_id) const {
+  std::lock_guard lock(mutex_);
+  if (session_id.empty() || session_id_ != session_id)
+    throw std::logic_error("control recovery session mismatch");
+  return cause_;
+}
+
+std::optional<std::int64_t> SessionControlRecoveryLatch::deadline_for(std::string_view session_id) const {
+  std::lock_guard lock(mutex_);
+  if (session_id.empty() || session_id_ != session_id) throw std::logic_error("control recovery session mismatch");
+  return braking_started_ms_ ? std::optional<std::int64_t>(*braking_started_ms_ + braking_timeout_ms_) : std::nullopt;
+}
+
+NeutralHeartbeatGate neutral_heartbeat_gate(
+    SafetyState state, bool braking_wait, std::int64_t native_gap_ms, int degraded_timeout_ms) {
+  if (state != SafetyState::ControlActive && !(braking_wait && state == SafetyState::Degraded))
+    return NeutralHeartbeatGate::InactiveState;
+  if (native_gap_ms < 0 || (!braking_wait && native_gap_ms >= degraded_timeout_ms))
+    return NeutralHeartbeatGate::NativeGap;
+  // Only authenticated, age-checked zero packets in the retained fresh gear
+  // reach this gate. During braking wait, real heartbeats can maintain braking
+  // even after degradation; receive_command still enforces the hard watchdog.
+  return NeutralHeartbeatGate::Accepted;
 }
 
 namespace {
@@ -430,6 +463,7 @@ class MediaSignalingClient {
         device_token_(std::move(device_token)),
         connection_id_(std::move(connection_id)),
         http_(std::chrono::seconds(5), resolve_entries, ca_bundle),
+        time_sync_http_(std::chrono::milliseconds(500), resolve_entries, ca_bundle),
         sequence_(sequence ? std::move(sequence) : std::make_shared<MediaSignalingSequence>()) {
     if (vehicle_id_.empty() || device_token_.empty()) throw std::invalid_argument("vehicle id and device token are required");
     if (connection_id_.empty()) {
@@ -447,9 +481,10 @@ class MediaSignalingClient {
     connection_generation_ = response.at("connection_generation").get<std::uint64_t>();
   }
 
-  TimeSyncStatus synchronize_time(int sample_count) {
-    return clock_.synchronize(http_, origin_, sample_count);
+  TimeSyncStatus synchronize_time(int sample_count, int max_uncertainty_ms) {
+    return clock_.synchronize(time_sync_http_, origin_, sample_count, max_uncertainty_ms);
   }
+  void mark_time_sync_failed() { clock_.mark_refresh_failed(); }
 
   [[nodiscard]] TimeSyncStatus time_sync_status() const { return clock_.status(); }
   [[nodiscard]] bool time_sync_refresh_due(int interval_ms) const { return clock_.refresh_due(interval_ms); }
@@ -551,6 +586,7 @@ class MediaSignalingClient {
   std::string connection_id_;
   std::uint64_t connection_generation_{0};
   HttpClient http_;
+  HttpClient time_sync_http_;
   SynchronizedClock clock_;
   std::string session_id_;
   std::string driver_id_;
@@ -640,7 +676,7 @@ struct VehicleMediaRuntime::Impl {
       int next_simulate_primary_failure_after_frames,
       std::string connection_id,
       std::shared_ptr<MediaSignalingSequence> signaling_sequence,
-      std::shared_ptr<CriticalCameraControlLatch> next_critical_camera_control_latch)
+      std::shared_ptr<SessionControlRecoveryLatch> next_control_recovery_latch)
       : config(std::move(next_config)),
         signaling(
             std::move(signaling_url),
@@ -650,10 +686,10 @@ struct VehicleMediaRuntime::Impl {
             std::move(signaling_sequence),
             config.cloud.resolve_entries,
             config.cloud.ca_bundle),
-        critical_camera_control_latch(
-            next_critical_camera_control_latch
-                ? std::move(next_critical_camera_control_latch)
-                : std::make_shared<CriticalCameraControlLatch>()),
+        control_recovery_latch(
+            next_control_recovery_latch
+                ? std::move(next_control_recovery_latch)
+                : std::make_shared<SessionControlRecoveryLatch>()),
         frame_timeout_ms(next_frame_timeout_ms),
         recording_root(std::move(next_recording_root)),
         forced_codec(std::move(next_forced_codec)),
@@ -961,7 +997,7 @@ struct VehicleMediaRuntime::Impl {
     bool adapter_ready = false;
     if (control_inhibited) {
       std::lock_guard lock(self->control_mutex);
-      self->control_service_issue_code = "critical_camera_failed";
+      self->control_service_issue_code = std::string(self->recovery_inhibition_issue());
     } else if (cameras_ready) {
       adapter_ready = self->start_control_service();
     } else {
@@ -1503,6 +1539,9 @@ struct VehicleMediaRuntime::Impl {
               {"seq", command.seq},
               {"intent_seq", intent_seq},
               {"intent_fresh", intent_fresh},
+              {"critical_video_ready", command.critical_video_ready},
+              {"control_time_sync_ready", command.control_time_sync_ready},
+              {"operator_input_ready", command.operator_input_ready},
               {"stale_safe_heartbeat", stale_safe_heartbeat},
               {"delivery_cursor", delivery_cursor},
               {"cloud_queued_at_utc_ms", cloud_queued_at_utc_ms},
@@ -1684,7 +1723,12 @@ struct VehicleMediaRuntime::Impl {
         }
       }
       if (stale_safe_heartbeat) {
-        if (control_service->safety_state() != SafetyState::ControlActive) {
+        const auto previous_accepted_monotonic_ms = native_control_last_accepted_monotonic_ms.load();
+        const auto gap = previous_accepted_monotonic_ms > 0 && control_mutex_acquired_monotonic_ms >= previous_accepted_monotonic_ms
+            ? control_mutex_acquired_monotonic_ms - previous_accepted_monotonic_ms : -1;
+        const auto heartbeat_gate = neutral_heartbeat_gate(control_service->safety_state(),
+            control_service->control_braking_wait(), gap, config.control.degraded_timeout_ms);
+        if (heartbeat_gate == NeutralHeartbeatGate::InactiveState) {
           native_control_stale_safe_inactive_state_discards_total.fetch_add(
               1,
               std::memory_order_relaxed);
@@ -1699,12 +1743,7 @@ struct VehicleMediaRuntime::Impl {
               std::nullopt);
           return;
         }
-        const auto previous_accepted_monotonic_ms =
-            native_control_last_accepted_monotonic_ms.load();
-        if (previous_accepted_monotonic_ms <= 0 ||
-            control_mutex_acquired_monotonic_ms < previous_accepted_monotonic_ms ||
-            control_mutex_acquired_monotonic_ms - previous_accepted_monotonic_ms >=
-                config.control.degraded_timeout_ms) {
+        if (heartbeat_gate == NeutralHeartbeatGate::NativeGap) {
           // Close the scheduling race in which the independent watchdog has
           // not yet observed an already-expired native packet gap. Otherwise
           // receive_command could advance to DEGRADED and immediately recover
@@ -1750,6 +1789,10 @@ struct VehicleMediaRuntime::Impl {
             std::memory_order_relaxed);
       }
       const auto received_at_ms = control_mutex_acquired_at_utc_ms;
+      if (!command.estop && config.field_safety.require_time_sync &&
+          !signaling.time_sync_status().acceptable(config.field_safety.max_time_sync_uncertainty_ms)) {
+        control_service->set_control_braking_wait(true, received_at_ms, ControlRecoveryCause::TimeSynchronization);
+      }
       const auto receive_apply_started_at_utc_ms = signaling.now_ms();
       const auto receive_apply_started_monotonic_ms = steady_now_ms();
       ReceiveResult result;
@@ -2299,7 +2342,7 @@ struct VehicleMediaRuntime::Impl {
       next_tick += kNativeControlWatchdogInterval;
       native_control_watchdog_ticks_total.fetch_add(1, std::memory_order_relaxed);
       try {
-        enforce_critical_camera_freshness();
+        enforce_control_recovery();
         tick_control_service();
       } catch (...) {
         // tick_control_service owns its fail-safe shutdown and diagnostics.
@@ -2319,12 +2362,40 @@ struct VehicleMediaRuntime::Impl {
     }
   }
 
+  void time_sync_loop(std::stop_token stop_token) noexcept {
+    while (!stop_token.stop_requested() && !stop_requested.load()) {
+      if (!wait_for_native_control_reconnect(stop_token, std::chrono::milliseconds(500))) break;
+      if (!signaling.time_sync_refresh_due(config.field_safety.time_sync_interval_ms)) continue;
+      const auto started = steady_now_ms();
+      std::string error;
+      try {
+        static_cast<void>(signaling.synchronize_time(config.field_safety.time_sync_samples,
+                                                    config.field_safety.max_time_sync_uncertainty_ms));
+      } catch (const std::exception& failure) {
+        signaling.mark_time_sync_failed();
+        error = std::string(failure.what()).substr(0, 512);
+      }
+      try {
+        enforce_control_recovery();
+        enqueue_control_trace({{"stage", "time_sync_refresh"}, {"session_id", signaling.session_id()},
+            {"duration_ms", steady_now_ms() - started}, {"time_sync", signaling.time_sync_status().to_json()},
+            {"error", error}, {"safety_action", "recovery_guard_owns_control"}});
+      } catch (const std::exception& failure) {
+        set_pipeline_error(failure.what(), "control_recovery_brake_failed", "control_recovery",
+                           "Keep the vehicle stopped and inspect the adapter/CAN failure.", false);
+      }
+    }
+  }
+
   void start_native_control_transport() {
-    if (!config.runtime.control_enabled || stop_requested.load()) return;
+    if (stop_requested.load()) return;
     if (native_control_websocket_thread.joinable() ||
-        native_control_watchdog_thread.joinable()) {
+        native_control_watchdog_thread.joinable() || time_sync_worker.joinable()) {
       throw std::logic_error("native control transport threads are already running");
     }
+    // Media-only deployments still refresh their capture timestamp clock.
+    time_sync_worker = std::jthread([this](std::stop_token token) { time_sync_loop(token); });
+    if (!config.runtime.control_enabled) return;
     {
       std::lock_guard lock(control_mutex);
       native_control_last_accepted_fresh_gear.reset();
@@ -2345,13 +2416,13 @@ struct VehicleMediaRuntime::Impl {
             native_control_websocket_loop(stop_token);
           });
     } catch (...) {
-      native_control_watchdog_thread.request_stop();
-      native_control_watchdog_thread.join();
+      stop_native_control_transport_threads();
       throw;
     }
   }
 
   void stop_native_control_transport_threads() {
+    if (time_sync_worker.joinable()) time_sync_worker.request_stop();
     if (native_control_websocket_thread.joinable()) {
       native_control_websocket_thread.request_stop();
     }
@@ -2364,6 +2435,7 @@ struct VehicleMediaRuntime::Impl {
     if (native_control_watchdog_thread.joinable()) {
       native_control_watchdog_thread.join();
     }
+    if (time_sync_worker.joinable()) time_sync_worker.join();
   }
 
   std::uint64_t send_control_command_rejected_locked(
@@ -2514,12 +2586,19 @@ struct VehicleMediaRuntime::Impl {
     }
   }
 
-  void inhibit_control_for_critical_camera(const Lane& lane, std::string_view failure) {
+  [[nodiscard]] std::string_view recovery_inhibition_issue() const {
+    return control_recovery_latch->cause_for(signaling.session_id()) == ControlRecoveryCause::CriticalVideo
+        ? "critical_camera_failed" : "control_recovery_timeout";
+  }
+
+  void inhibit_control_for_recovery(const Lane* lane, std::string_view failure) {
     if (control_inhibited.exchange(true)) return;
+    const auto cause = control_recovery_latch->cause_for(signaling.session_id());
+    const std::string issue(recovery_inhibition_issue());
 
     std::optional<std::string> latch_error;
     try {
-      static_cast<void>(critical_camera_control_latch->inhibit(signaling.session_id()));
+      static_cast<void>(control_recovery_latch->inhibit(signaling.session_id()));
     } catch (const std::exception& error) {
       // The runtime-local latch already blocks commands.  Continue the safe
       // stop even if a programming or lifecycle error prevents the shared
@@ -2531,50 +2610,54 @@ struct VehicleMediaRuntime::Impl {
     GstWebRTCDataChannel* channel_to_close = nullptr;
     {
       std::lock_guard lock(control_mutex);
-      control_service_issue_code = "critical_camera_failed";
+      control_service_issue_code = issue;
       invalidate_native_control_trusted_gear_locked();
       if (control_service_started && control_service) {
         try {
           control_service->close({
-              VehicleStopSource::SoftwareFault,
-              VehicleStopReason::CriticalCameraFailed});
+              cause == ControlRecoveryCause::InputLease ? VehicleStopSource::Watchdog : VehicleStopSource::SoftwareFault,
+              cause == ControlRecoveryCause::CriticalVideo ? VehicleStopReason::CriticalCameraFailed
+                  : cause == ControlRecoveryCause::InputLease ? VehicleStopReason::OuterControlTimeout
+                  : VehicleStopReason::MediaPipelineFailed});
         } catch (const std::exception& error) {
           close_error = error.what();
         }
       }
       control_service_started = false;
       control_service.reset();
-      send_vcu_handshake_status_locked("critical_camera_failed");
+      send_vcu_handshake_status_locked(issue);
       if (control_channel != nullptr) {
         channel_to_close = GST_WEBRTC_DATA_CHANNEL(g_object_ref(control_channel));
       }
     }
 
-    const auto last_encoded_ms = lane.last_encoded_steady_ms.load();
+    const auto last_encoded_ms = lane ? lane->last_encoded_steady_ms.load() : 0;
     emit_diagnostic(
-        "vehicle_control_inhibited_by_camera",
-        "critical_camera_control_inhibited",
-        "camera_safety",
+        "vehicle_control_recovery_timeout",
+        issue,
+        "control_recovery",
         std::string(failure),
-        "Keep the vehicle stopped. Camera recovery restores video only; end this session and complete a fresh VCU handshake before driving again.",
+        "Keep the vehicle stopped; the recovery deadline expired. End this session and complete a fresh VCU handshake before driving again.",
         false,
-        {{"camera_id", lane.camera.id},
-         {"device", lane.camera.device},
+        {{"camera_id", lane ? lane->camera.id : ""},
+         {"device", lane ? lane->camera.device : ""},
+         {"recovery_cause", cause == ControlRecoveryCause::CriticalVideo ? "critical_video"
+             : cause == ControlRecoveryCause::InputLease ? "input_lease" : "time_sync"},
          {"safety_action", "local_full_stop_control_channel_closed_video_continues"},
-         {"captured_frames", lane.captured.load()},
-         {"encoded_frames", lane.encoded.load()},
+         {"captured_frames", lane ? lane->captured.load() : 0},
+         {"encoded_frames", lane ? lane->encoded.load() : 0},
          {"last_encoded_age_ms", last_encoded_ms > 0
              ? Json(steady_now_ms() - last_encoded_ms) : Json(nullptr)},
          {"startup_timeout_ms", kCriticalCameraStartupTimeoutMs}});
     if (latch_error) {
       emit_diagnostic(
           "vehicle_control_inhibition_latch_failed",
-          "critical_camera_control_latch_failed",
+          "control_recovery_latch_failed",
           "camera_safety",
           *latch_error,
           "Keep the vehicle stopped, end the current session, and do not resume control until a fresh session and VCU handshake succeed.",
           false,
-          {{"camera_id", lane.camera.id},
+          {{"camera_id", lane ? lane->camera.id : ""},
            {"safety_action", "local_full_stop_physical_estop_if_state_uncertain"}});
     }
     if (close_error) {
@@ -2585,7 +2668,7 @@ struct VehicleMediaRuntime::Impl {
           *close_error,
           "Use the physical emergency stop, keep the vehicle isolated, and inspect the VCU JSONL log/CAN interface.",
           true,
-          {{"camera_id", lane.camera.id},
+          {{"camera_id", lane ? lane->camera.id : ""},
            {"safety_action", "physical_estop_required_video_continues"}});
     }
     if (channel_to_close != nullptr) {
@@ -2595,6 +2678,8 @@ struct VehicleMediaRuntime::Impl {
   }
 
   [[nodiscard]] bool critical_cameras_ready() const {
+    if (config.field_safety.require_time_sync && !signaling.time_sync_status().acceptable(config.field_safety.max_time_sync_uncertainty_ms)) return false;
+    if (control_recovery_latch->braking_wait_for(signaling.session_id())) return false;
     return std::all_of(lanes.begin(), lanes.end(), [&](const auto& lane) {
       const auto last_encoded_ms = lane->last_encoded_steady_ms.load();
       return !lane->camera.critical_for_control ||
@@ -2603,80 +2688,85 @@ struct VehicleMediaRuntime::Impl {
     });
   }
 
-  [[nodiscard]] std::pair<int, int> critical_video_timing_configured() {
+  [[nodiscard]] std::pair<int, int> recovery_timing_configured() {
     std::lock_guard lock(control_mutex);
-    return control_service_started && control_service ? control_service->critical_video_timing()
-        : std::pair{config.runtime.critical_camera_stale_brake_ms, config.runtime.critical_camera_recovery_timeout_ms};
+    return control_service_started && control_service ? control_service->recovery_timing()
+        : std::pair{config.runtime.critical_camera_stale_brake_ms, config.runtime.control_recovery_timeout_ms};
   }
 
-  void apply_critical_video_phase(CriticalVideoPhase phase, const Lane* failed_lane = nullptr, bool new_wait = false) {
-    if (phase == CriticalVideoPhase::Locked) {
+  void apply_control_recovery_phase(ControlRecoveryPhase phase, const Lane* failed_lane = nullptr, bool new_wait = false) {
+    if (phase == ControlRecoveryPhase::Locked) {
       const auto lane = failed_lane ? failed_lane : [&]() -> const Lane* {
         for (const auto& candidate : lanes) if (candidate->camera.critical_for_control) return candidate.get();
         return nullptr;
       }();
-      if (lane) inhibit_control_for_critical_camera(*lane, "critical video did not recover before the braking-wait deadline");
+      inhibit_control_for_recovery(lane, "control readiness did not recover before the braking-wait deadline");
       return;
     }
-    const auto [stale_brake_ms, recovery_timeout_ms] = critical_video_timing_configured();
-    const bool waiting = phase == CriticalVideoPhase::BrakingWait;
+    const auto [stale_brake_ms, recovery_timeout_ms] = recovery_timing_configured();
+    const bool waiting = phase == ControlRecoveryPhase::BrakingWait;
     if (new_wait) for (const auto& lane : lanes) lane->video_wait_encoded_baseline = lane->encoded.load();
     bool changed = false;
     try {
       std::lock_guard lock(control_mutex);
       if (control_service_started && control_service) {
-        changed = control_service->critical_video_braking_wait() != waiting;
-        control_service->set_critical_video_braking_wait(waiting, signaling.now_ms());
+        changed = control_service->control_braking_wait() != waiting;
+        control_service->set_control_braking_wait(waiting, signaling.now_ms(), control_recovery_latch->cause_for(signaling.session_id()));
       }
       if (waiting && control_service_started) {
-        changed = changed || control_service_issue_code != "critical_camera_braking_wait";
-        control_service_issue_code = "critical_camera_braking_wait";
+        changed = changed || control_service_issue_code != "control_recovery_braking_wait";
+        control_service_issue_code = "control_recovery_braking_wait";
       }
-      else if (control_service_issue_code == "critical_camera_braking_wait") control_service_issue_code.clear();
-      if (changed || phase == CriticalVideoPhase::Recovered)
-        send_vcu_handshake_status_locked(waiting ? "critical_video_braking_wait" : "critical_video_recovered");
+      else if (control_service_issue_code == "control_recovery_braking_wait") control_service_issue_code.clear();
+      if (changed || phase == ControlRecoveryPhase::Recovered)
+        send_vcu_handshake_status_locked(waiting ? "control_braking_wait" : "control_recovered");
     } catch (const std::exception& error) {
       // A failed physical brake must revoke control immediately, including
       // when this transition runs inside a capture thread's error handler.
       set_pipeline_error(
-          "critical video safety output failed: " + std::string(error.what()),
-          "critical_video_brake_failed", "camera_safety",
+          "control recovery safety output failed: " + std::string(error.what()),
+          "control_recovery_brake_failed", "control_recovery",
           "Keep the vehicle stopped and inspect the adapter/CAN failure; use the physical emergency stop if braking is unavailable.",
           false);
       return;
     }
-    if (changed || new_wait || phase == CriticalVideoPhase::Recovered) emit_diagnostic(
-        waiting ? "vehicle_critical_video_braking_wait" : "vehicle_critical_video_recovered",
-        waiting ? "critical_camera_braking_wait" : "critical_camera_recovered",
-        "camera_safety", "",
-        waiting ? "Keep motion input neutral while video recovers; the current session and profile remain installed."
-                : "Video recovered; release old motion controls and provide fresh neutral input before driving again.",
+    if (changed || new_wait || phase == ControlRecoveryPhase::Recovered) emit_diagnostic(
+        waiting ? "vehicle_control_braking_wait" : "vehicle_control_recovered",
+        waiting ? "control_recovery_braking_wait" : "control_recovered",
+        "control_recovery", "",
+        waiting ? "Keep motion input neutral while control readiness recovers; the session and profile remain installed."
+                : "Control readiness recovered; release old motion controls and provide fresh neutral input before driving again.",
         true, {{"stale_brake_ms", stale_brake_ms},
                {"recovery_timeout_ms", recovery_timeout_ms},
-               {"recovery_stable_ms", kCriticalCameraRecoveryStableMs},
+               {"recovery_stable_ms", kControlRecoveryStableMs},
+               {"recovery_deadline_monotonic_ms", control_recovery_latch->deadline_for(signaling.session_id()).has_value() ? Json(*control_recovery_latch->deadline_for(signaling.session_id())) : Json(nullptr)},
                {"camera_id", failed_lane ? failed_lane->camera.id : "driver_or_critical_video"},
+               {"time_sync", signaling.time_sync_status().to_json()},
+               {"recovery_cause", control_recovery_latch->cause_for(signaling.session_id()) == ControlRecoveryCause::CriticalVideo
+                   ? "critical_video" : control_recovery_latch->cause_for(signaling.session_id()) == ControlRecoveryCause::InputLease ? "input_lease" : "time_sync"},
                {"safety_action", waiting ? "brake_with_session_retained" : "fresh_neutral_input_requested"}});
   }
 
   void pause_control_for_critical_camera(Lane& lane) {
-    std::lock_guard phase_lock(critical_video_phase_mutex);
+    std::lock_guard phase_lock(control_recovery_phase_mutex);
     lane.camera_faulted = true;
-    const auto timing = critical_video_timing_configured();
-    const bool was_waiting = critical_camera_control_latch->braking_wait_for(signaling.session_id());
-    apply_critical_video_phase(critical_camera_control_latch->observe_video(
+    const auto timing = recovery_timing_configured();
+    const bool was_waiting = control_recovery_latch->braking_wait_for(signaling.session_id());
+    apply_control_recovery_phase(control_recovery_latch->observe_recovery(
         signaling.session_id(), false, steady_now_ms(), timing.second), &lane, !was_waiting);
   }
 
-  void enforce_critical_camera_freshness() {
+  void enforce_control_recovery() {
     // Observe and apply one transition together: a capture failure must not
     // race a previously observed Ready phase that would release its brake.
-    std::lock_guard phase_lock(critical_video_phase_mutex);
+    std::lock_guard phase_lock(control_recovery_phase_mutex);
     if (!config.runtime.control_enabled || stop_requested || control_inhibited) return;
     const auto now_ms = steady_now_ms();
-    const auto [stale_brake_ms, recovery_timeout_ms] = critical_video_timing_configured();
-    const bool was_waiting = critical_camera_control_latch->braking_wait_for(signaling.session_id());
-    const bool startup_grace = critical_camera_control_latch->startup_grace_active(signaling.session_id(), now_ms);
+    const auto [stale_brake_ms, recovery_timeout_ms] = recovery_timing_configured();
+    const bool was_waiting = control_recovery_latch->braking_wait_for(signaling.session_id());
+    const bool startup_grace = control_recovery_latch->startup_grace_active(signaling.session_id(), now_ms);
     bool ready = true;
+    auto cause = ControlRecoveryCause::CriticalVideo;
     const Lane* failed_lane = nullptr;
     for (const auto& lane : lanes) {
       if (!lane->camera.critical_for_control) continue;
@@ -2690,14 +2780,20 @@ struct VehicleMediaRuntime::Impl {
     }
     {
       std::lock_guard lock(control_mutex);
-      if (control_service_started && control_service)
+      if (control_service_started && control_service) {
         ready = ready && control_service->driver_critical_video_ready();
+        if (!control_service->operator_input_ready()) { ready = false; cause = ControlRecoveryCause::InputLease; }
+        if (!control_service->driver_time_sync_ready()) { ready = false; cause = ControlRecoveryCause::TimeSynchronization; }
+      }
+    }
+    if (config.field_safety.require_time_sync && !signaling.time_sync_status().acceptable(config.field_safety.max_time_sync_uncertainty_ms)) {
+      ready = false; cause = ControlRecoveryCause::TimeSynchronization;
     }
     // Startup still grants no authority while waiting for its first frames.
     // Once braking starts, same-session retries never restart either deadline.
-    if (startup_grace && !was_waiting) return;
-    const auto phase = critical_camera_control_latch->observe_video(signaling.session_id(), ready, now_ms, recovery_timeout_ms);
-    apply_critical_video_phase(phase, failed_lane, !was_waiting && phase == CriticalVideoPhase::BrakingWait);
+    if (startup_grace && !was_waiting && cause == ControlRecoveryCause::CriticalVideo) return;
+    const auto phase = control_recovery_latch->observe_recovery(signaling.session_id(), ready, now_ms, recovery_timeout_ms, cause);
+    apply_control_recovery_phase(phase, failed_lane, !was_waiting && phase == ControlRecoveryPhase::BrakingWait);
   }
 
   void start_control_when_cameras_ready() {
@@ -2741,15 +2837,15 @@ struct VehicleMediaRuntime::Impl {
           return false;
         }
         if (control_inhibited) {
-          control_service_issue_code = "critical_camera_failed";
+          control_service_issue_code = std::string(recovery_inhibition_issue());
           return false;
         }
         if (!critical_cameras_ready()) {
           control_service_issue_code = "critical_camera_not_ready";
           return false;
         }
-        if (!critical_camera_control_latch->arm_for_control(signaling.session_id())) {
-          control_service_issue_code = "critical_camera_failed";
+        if (!control_recovery_latch->arm_for_control(signaling.session_id())) {
+          control_service_issue_code = std::string(recovery_inhibition_issue());
           return false;
         }
         invalidate_native_control_trusted_gear_locked();
@@ -2786,7 +2882,7 @@ struct VehicleMediaRuntime::Impl {
           }
           control_service.reset();
           control_service_issue_code = control_inhibited
-              ? "critical_camera_failed"
+              ? std::string(recovery_inhibition_issue())
               : "media_pipeline_failed";
           return false;
         }
@@ -3866,7 +3962,7 @@ struct VehicleMediaRuntime::Impl {
     last_negotiation_warning.clear();
     TimeSyncStatus initial_time_sync;
     try {
-      initial_time_sync = signaling.synchronize_time(config.field_safety.time_sync_samples);
+      initial_time_sync = signaling.synchronize_time(config.field_safety.time_sync_samples, config.field_safety.max_time_sync_uncertainty_ms);
     } catch (const std::exception& error) {
       emit_diagnostic(
           "vehicle_media_time_sync_failed",
@@ -3940,14 +4036,14 @@ struct VehicleMediaRuntime::Impl {
           std::chrono::milliseconds(config.runtime.teleop_poll_interval_ms));
     }
     const bool inherited_control_inhibition =
-        critical_camera_control_latch->enter_session(signaling.session_id());
+        control_recovery_latch->enter_session(signaling.session_id());
     control_inhibited.store(inherited_control_inhibition);
     if (inherited_control_inhibition) {
       emit_diagnostic(
           "vehicle_control_inhibition_retained",
-          "critical_camera_control_inhibition_retained",
+          "control_recovery_inhibition_retained",
           "camera_safety",
-          "a critical-camera fault already inhibited control for this active session",
+          "a sustained control fault already inhibited control for this active session",
           "Keep the vehicle stopped. End this session, start a new session, and complete a fresh VCU handshake before driving again.",
           false,
           {{"safety_action", "control_disabled_video_may_continue"}});
@@ -4039,40 +4135,16 @@ struct VehicleMediaRuntime::Impl {
         }
         poll_bus();
         if (!current_pipeline_error().empty()) break;
-        enforce_critical_camera_freshness();
+        enforce_control_recovery();
         start_control_when_cameras_ready();
         // The independent native-control watchdog thread owns the VCU tick;
         // media HTTP latency must not schedule control safety progression.
-        if (signaling.time_sync_refresh_due(config.field_safety.time_sync_interval_ms)) {
-          try {
-            const auto status = signaling.synchronize_time(config.field_safety.time_sync_samples);
-            if (config.field_safety.require_time_sync &&
-                !status.acceptable(config.field_safety.max_time_sync_uncertainty_ms)) {
-              set_pipeline_error(
-                  "media time synchronization uncertainty exceeds " +
-                      std::to_string(config.field_safety.max_time_sync_uncertainty_ms) + "ms",
-                  "media_runtime_time_sync_uncertainty_exceeded",
-                  "time_sync_refresh",
-                  "Stabilize network time synchronization before resuming teleoperation.",
-                  true, {{"time_sync", status.to_json()},
-                         {"limit_ms", config.field_safety.max_time_sync_uncertainty_ms}});
-            }
-          } catch (const std::exception& error) {
-            if (config.field_safety.require_time_sync) {
-              set_pipeline_error(
-                  "media time synchronization failed: " + std::string(error.what()),
-                  "media_runtime_time_sync_failed",
-                  "time_sync_refresh",
-                  "Check signaling-server reachability and network latency before resuming.",
-                  true);
-            }
-          }
-        }
+        // Dedicated time sampling keeps media and control transport progressing.
         if (signaling.now_ms() >= next_media_status_ms) {
           const Json status = {
               {"codec", to_string(candidate.codec)},
               {"backend", to_string(candidate.backend)},
-              {"control_issue_code", control_inhibited.load() ? "critical_camera_failed" : critical_camera_control_latch->braking_wait_for(signaling.session_id()) ? "critical_camera_braking_wait" : ""},
+              {"control_issue_code", control_inhibited.load() ? std::string(recovery_inhibition_issue()) : control_recovery_latch->braking_wait_for(signaling.session_id()) ? "control_recovery_braking_wait" : ""},
               {"time_sync", signaling.time_sync_status().to_json()},
               {"lanes", lane_metrics(std::max<std::int64_t>(1, signaling.now_ms() - attempt_started))}};
           if (steady_now_ms() >= next_media_log_monotonic_ms) {
@@ -4315,7 +4387,7 @@ struct VehicleMediaRuntime::Impl {
 
   VehicleConfig config;
   MediaSignalingClient signaling;
-  std::shared_ptr<CriticalCameraControlLatch> critical_camera_control_latch;
+  std::shared_ptr<SessionControlRecoveryLatch> control_recovery_latch;
   int frame_timeout_ms;
   std::filesystem::path recording_root;
   std::optional<std::string> forced_codec;
@@ -4356,7 +4428,7 @@ struct VehicleMediaRuntime::Impl {
   std::atomic<std::uint64_t> control_trace_dropped_total{0};
   std::mutex control_mutex;
   // Acquired before control_mutex; no control handler takes this mutex.
-  std::mutex critical_video_phase_mutex;
+  std::mutex control_recovery_phase_mutex;
   std::unique_ptr<VehicleControlService> control_service;
   // Guarded by control_mutex. Stale-safe heartbeats may only preserve this
   // accepted fresh gear; ESTOP freezes its gear for the pipeline lifetime.
@@ -4364,6 +4436,7 @@ struct VehicleMediaRuntime::Impl {
   std::optional<std::string> native_control_estop_frozen_gear;
   std::jthread native_control_watchdog_thread;
   std::jthread native_control_websocket_thread;
+  std::jthread time_sync_worker;
   bool control_service_started{false};
   std::string control_service_issue_code;
   std::atomic<bool> control_link_open{false};
@@ -4440,7 +4513,7 @@ VehicleMediaRuntime::VehicleMediaRuntime(
     int simulate_primary_failure_after_frames,
     std::string connection_id,
     std::shared_ptr<MediaSignalingSequence> signaling_sequence,
-    std::shared_ptr<CriticalCameraControlLatch> critical_camera_control_latch)
+    std::shared_ptr<SessionControlRecoveryLatch> control_recovery_latch)
     : impl_(std::make_unique<Impl>(
           std::move(config),
           std::move(signaling_url),
@@ -4451,7 +4524,7 @@ VehicleMediaRuntime::VehicleMediaRuntime(
           simulate_primary_failure_after_frames,
           std::move(connection_id),
           std::move(signaling_sequence),
-          std::move(critical_camera_control_latch))) {}
+          std::move(control_recovery_latch))) {}
 
 VehicleMediaRuntime::~VehicleMediaRuntime() = default;
 
