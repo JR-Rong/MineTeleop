@@ -5020,9 +5020,15 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   expect(!driver.update_control_intent(old_motion).value("accepted", true), "ACK recovery resurrected motion without fresh neutral");
   input["intent_seq"] = 3; input["throttle"] = 0.0;
   expect(driver.update_control_intent(input).value("accepted", false), "post-recovery neutral rejected");
-  const auto neutral_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+  // Only the automatic refresh of the same zero intent continues. The
+  // operator does not issue another command for longer than both 2s and 5s.
+  const auto neutral_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
   while (std::chrono::steady_clock::now() < neutral_deadline) {
     static_cast<void>(driver.update_control_intent(input)); process_vehicle();
+    expect(service.session_control_profile().at("active").get<bool>() &&
+        vehicle->read_telemetry().throttle_feedback == 0 && vehicle->read_telemetry().brake_feedback == 1 &&
+        connections->load() == 1 && driver.status().at("native_control").value("send_failures_total", 1U) == 0,
+        "idle operator after link recovery caused hard parking, reconnect or brake release");
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
   input["intent_seq"] = 4; input["throttle"] = 0.2;

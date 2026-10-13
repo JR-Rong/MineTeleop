@@ -2767,13 +2767,29 @@ void test_video_braking_preserves_profile_and_only_real_commands_refresh_control
   expect(!service.receive_command(motion, 3050).accepted, "recovery resurrected old motion without neutral");
   auto neutral = command(seq++, 3100); neutral.steering = neutral.throttle = 0; neutral.critical_video_ready = true;
   expect(service.receive_command(neutral, 3100).accepted, "video recovery neutral rejected");
-  motion.seq = seq++; motion.sent_at_utc_ms = 3150;
-  expect(service.receive_command(motion, 3150).accepted && view->read_telemetry().throttle_feedback > 0,
+  // No further operator motion request: the live console's periodic neutral
+  // heartbeat must retain the session and brake for much longer than 2s/5s.
+  // Recovering the camera must not start a human-response countdown.
+  for (int now = 3150; now <= 63100; now += 50) {
+    auto idle = neutral; idle.seq = seq++; idle.sent_at_utc_ms = now;
+    idle.operator_active = false;
+    expect(service.receive_command(idle, now).accepted, "post-video idle heartbeat rejected");
+    service.tick(now);
+    expect(service.session_control_profile().at("active").get<bool>() &&
+        service.session_control_profile().at("applied_revision") == profile.seq &&
+        service.safety_state() == mine_teleop::SafetyState::ControlActive &&
+        service.control_timing(now).at("recovery_brake_hold").get<bool>() &&
+        !service.control_timing(now).at("control_braking_wait").get<bool>() &&
+        view->read_telemetry().throttle_feedback == 0 && view->read_telemetry().brake_feedback == 1,
+        "operator inactivity after video recovery revoked authority or released braking");
+  }
+  motion.seq = seq++; motion.sent_at_utc_ms = 63150;
+  expect(service.receive_command(motion, 63150).accepted && view->read_telemetry().throttle_feedback > 0,
       "fresh motion did not recover using retained session profile");
-  service.set_control_braking_wait(true, 3200);
-  service.tick(3949);
+  service.set_control_braking_wait(true, 63200);
+  service.tick(63949);
   expect(service.session_control_profile().at("active").get<bool>(), "independent 800 ms triggered early");
-  service.tick(3950);
+  service.tick(63950);
   expect(!service.session_control_profile().at("active").get<bool>() && service.safety_state() == mine_teleop::SafetyState::TimeoutBrake,
       "local video brake synthesized control liveness and bypassed 800 ms");
   service.close();
