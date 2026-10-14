@@ -1,5 +1,6 @@
 #include "mine_teleop/core.hpp"
 #include "mine_teleop/http.hpp"
+#include "mine_teleop/media.hpp"
 #include "mine_teleop/platform.hpp"
 #include "mine_teleop/server.hpp"
 
@@ -5332,6 +5333,7 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     std::string last_vehicle_rejection;
     std::deque<Json> recent_vehicle_commands;
     Json first_hard_stop;
+    std::optional<std::chrono::steady_clock::time_point> ready_since;
     const auto process_delivery = [&] {
       const auto received = receiver.receive_json(std::chrono::milliseconds(0));
       if (received.status != mine_teleop::WebSocketReceiveStatus::Message ||
@@ -5350,6 +5352,16 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
           ++expired_frames;
         }
         const auto result = service.receive_command(command, now);
+        // The real vehicle runtime arbitrates readiness independently of
+        // receive_command. Model that retained-session recovery here too.
+        const bool ready = result.accepted && command.operator_input_ready &&
+            command.control_link_ready && command.control_time_sync_ready && command.critical_video_ready &&
+            command.throttle == 0 && command.steering == 0 && !command.estop;
+        if (!ready) ready_since.reset();
+        else if (!ready_since) ready_since = std::chrono::steady_clock::now();
+        else if (service.control_braking_wait() && std::chrono::steady_clock::now() - *ready_since >=
+            std::chrono::milliseconds(mine_teleop::kControlRecoveryStableMs))
+          service.set_control_braking_wait(false, now);
         recent_vehicle_commands.push_back({{"seq", command.seq}, {"intent_seq", intent_seq},
             {"age_ms", now - command.sent_at_utc_ms}, {"accepted", result.accepted}, {"reason", result.reason},
             {"brake", command.brake}, {"steering", command.steering},
@@ -5433,7 +5445,7 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     expect(braking.value("accepted", false), "zero-motion recovery rejected ongoing braking");
     const auto braking_recovered = [&] { return vehicle_pump.inspect([&] {
       const auto feedback = vehicle->read_telemetry();
-      return last_applied_intent == 3 && feedback.throttle_feedback == 0 &&
+      return last_applied_intent == 3 && feedback.throttle_feedback == 0 && !service.control_braking_wait() &&
           (held_brake == 0 || (fresh_braking_seen && feedback.brake_feedback > 0));
     }); };
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -5451,6 +5463,13 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     input["intent_seq"] = 4;
     input["brake"] = 0.0;
     expect(driver.update_control_intent(input).value("accepted", false), "full neutral input rejected");
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (vehicle_pump.inspect([&] { return last_applied_intent != 4; }) && std::chrono::steady_clock::now() < deadline) {
+      static_cast<void>(driver.update_control_intent(input));
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    expect(vehicle_pump.inspect([&] { return last_applied_intent == 4 && !service.control_braking_wait(); }),
+        "full neutral never reached the recovered vehicle" + vehicle_diagnostic());
     input["intent_seq"] = 5;
     input["throttle"] = 0.2;
     input["steering"] = 0.1;
@@ -5464,7 +5483,8 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     expect(vehicle_pump.inspect([&] { return last_applied_intent == 5 && last_applied_seq > profile_request.seq &&
         vehicle->read_telemetry().throttle_feedback > 0 && service.session_control_profile().at("active").get<bool>() &&
         service.session_control_profile().at("applied_revision") == profile_request.seq; }),
-        "fresh motion did not apply at vehicle using the same confirmed profile");
+        "fresh motion did not apply at vehicle using the same confirmed profile" + vehicle_diagnostic() +
+        ":native=" + driver.status().at("native_control").dump());
     vehicle_pump.stop();
     vehicle_pump.inspect([] {});
     receiver.close();
