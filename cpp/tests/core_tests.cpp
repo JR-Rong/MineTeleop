@@ -4585,13 +4585,16 @@ void test_native_driver_to_vehicle_signaling_control_payload() {
       control.gear == "D" && control.steering == 0.1 &&
           control.throttle == 0.2 && control.brake == 0.0,
       "native control command did not preserve the latest intent values");
-  mine_teleop::VehicleControlService receiver(
+  mine_teleop::test::LogicalTimeControlService receiver(
       vehicle_config,
       "driver-console-001",
       control.session_id,
       vehicle_session.at("control_token").get<std::string>(),
       std::make_unique<mine_teleop::MockVehicleAdapter>());
-  const auto received_at_ms = mine_teleop::now_ms();
+  // This fixture verifies the transported payload, not host UTC stability.
+  // Driver timestamps use its accepted cloud anchor; raw host UTC can step
+  // between send and this logical receiver. Real-clock three-hop tests remain.
+  const auto received_at_ms = control.sent_at_utc_ms + 1;
   receiver.start(received_at_ms);
   auto profile = session_profile_request(1, received_at_ms);
   profile.driver_id = "driver-console-001";
@@ -4605,6 +4608,15 @@ void test_native_driver_to_vehicle_signaling_control_payload() {
       ", command_age_ms=" + std::to_string(received_at_ms - control.sent_at_utc_ms));
   const auto duplicate = receiver.receive_command(control, received_at_ms + 1);
   expect(!duplicate.accepted && duplicate.reason == "old_seq", "vehicle receiver accepted a duplicate command");
+  auto future = control;
+  future.seq += 1;
+  future.sent_at_utc_ms = received_at_ms + vehicle_config.control.max_command_gap_ms + 100;
+  expect(receiver.receive_command(future, received_at_ms + 2).reason == "command_timestamp_in_future",
+      "logical payload fixture stopped rejecting future commands");
+  auto stale = control;
+  stale.seq += 2;
+  expect(receiver.receive_command(stale, control.sent_at_utc_ms + vehicle_config.control.max_command_gap_ms + 1).reason == "command_age_exceeded",
+      "logical payload fixture stopped rejecting old commands");
   receiver.close();
   const auto disconnected = driver.disconnect("test_disconnect");
   expect(disconnected.value("state", "") == "offline", "driver console disconnect did not release authority");

@@ -103,3 +103,9 @@ Browser plugin not available，因此使用现有 Playwright/Chrome；不连接�
 桌面与移动视口检查、截图和无应用 console error 仅证明 fixture UI，不能代替实车、
 真实链路及 CCG2 画面质量验收。本次改进可消除软件排队/重复计时并提高归因能力，
 不能承诺覆盖 session-000008 中持续过期命令的真实传输退化。
+
+复核还修复了 native_driver_to_vehicle_signaling_control_payload 的测试域混用：
+驾驶端发送时戳来自已接受的云端锚点，而夹具用原始宿主 UTC 接收；Docker UTC 回调
+可能造成偶发未来年龄。该 payload 夹具使用明确的逻辑接收点，并增加未来/过期拒绝
+断言，生产规则不变；真实三端 steady/校时测试仍保留。一次四时戳一致性 fixture
+失败在单项复测通过，未因此放宽生产校时验证。
