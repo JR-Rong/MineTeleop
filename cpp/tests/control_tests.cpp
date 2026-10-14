@@ -5210,7 +5210,9 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
     if (!native.value("ack_braking_wait", true)) { recovered = true; break; }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  expect(recovered, "recent ACK progress did not recover the original socket");
+  expect(recovered, "recent ACK progress did not recover the original socket: " +
+      driver.status().at("native_control").dump() + ":vehicle=" +
+      vehicle_pump.inspect([&] { return last_vehicle_reason; }));
   auto old_motion = input;
   expect(!driver.update_control_intent(old_motion).value("accepted", true), "ACK recovery resurrected motion without fresh neutral");
   input["intent_seq"] = 3; input["throttle"] = 0.0;
@@ -5368,6 +5370,11 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
       }
     };
     LoopbackVehiclePump vehicle_pump(process_delivery);
+    const auto vehicle_diagnostic = [&] { return vehicle_pump.inspect([&] {
+      return ":last_intent=" + std::to_string(last_applied_intent) + ":fresh_braking=" + std::to_string(fresh_braking_seen) +
+          ":safety=" + std::string(mine_teleop::to_string(service.safety_state())) + ":vehicle=" + last_vehicle_rejection +
+          ":first_hard_stop=" + first_hard_stop.dump() + ":recent_commands=" + Json(recent_vehicle_commands).dump();
+    }); };
     Json input = {{"session_id", session}, {"session_generation", connected.at("control_session_generation")},
         {"ui_instance_id", "native-recovery-ui"}, {"intent_seq", 1}, {"gear", "D"},
         {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0}};
@@ -5395,7 +5402,9 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
       if (!blocked.value("accepted", true) && blocked.value("reason", "") == "fresh_neutral_required") break;
     }
     expect(vehicle_pump.inspect([&] { return expired_frames == 3; }) && !blocked.value("accepted", true), "threshold did not reach native driver interlock");
-    expect(vehicle_pump.inspect([&] { return service.session_control_profile().at("active").get<bool>(); }), "recoverable jitter revoked actual vehicle profile");
+    expect(vehicle_pump.inspect([&] { return service.session_control_profile().at("active").get<bool>(); }),
+        "recoverable jitter revoked actual vehicle profile" + vehicle_diagnostic() +
+        ":blocked=" + blocked.dump() + ":native=" + driver.status().at("native_control").dump());
     inject_delay = false;
     if (held_brake > 0) {
       expect(blocked.value("preserve_brake_during_rearm", false),
@@ -5426,14 +5435,9 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
       vehicle_pump.inspect([] {});
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    const auto vehicle_diagnostic = vehicle_pump.inspect([&] {
-      return ":last_intent=" + std::to_string(last_applied_intent) + ":fresh_braking=" + std::to_string(fresh_braking_seen) +
-          ":safety=" + std::string(mine_teleop::to_string(service.safety_state())) + ":vehicle=" + last_vehicle_rejection +
-          ":first_hard_stop=" + first_hard_stop.dump() + ":recent_commands=" + Json(recent_vehicle_commands).dump();
-    });
     expect(braking_recovered(),
         "actual vehicle did not recover zero motion while retaining braking: held=" + std::to_string(held_brake) +
-        vehicle_diagnostic + ":native=" + driver.status().at("native_control").dump() +
+        vehicle_diagnostic() + ":native=" + driver.status().at("native_control").dump() +
         ":time_sync=" + driver.status().at("time_sync").dump());
     input["intent_seq"] = 4;
     input["brake"] = 0.0;
