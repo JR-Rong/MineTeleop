@@ -15,7 +15,7 @@
 
 namespace mine_teleop {
 
-inline constexpr std::string_view kNativeControlCapabilities = "v7-feedback-ack-wait-v1";
+inline constexpr std::string_view kNativeControlCapabilities = "v9-revision-recovery-v1";
 
 enum class WebSocketReceiveStatus {
   Message,

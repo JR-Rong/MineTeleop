@@ -366,7 +366,8 @@ void automatic_driver_runtime() {
       r.headers["x-mine-teleop-approver-token"] = token;
       return service.handle(r);
     };
-    check(post("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","runtime-test"}}).status == 200, "fixture registration failed");
+    check(post("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","runtime-test"},
+        {"native_control_capabilities", kNativeControlCapabilities}}).status == 200, "fixture registration failed");
     const auto token = body(post("/mobile/api/login", {{"password","approval-secret"}})).at("token").get<std::string>();
     DriverConfig dc; dc.driver_id = "d1"; dc.signaling_url = "ws://127.0.0.1:" + std::to_string(server.port()) + "/signaling";
     dc.max_time_sync_uncertainty_ms = 2000; // Fixture exercises protocol compatibility, not clock safety.
@@ -400,7 +401,8 @@ void automatic_driver_runtime() {
       check(connecting.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
           "prepare_shutdown did not wake pending approval before HTTP stop");
     } else if (scenario == "replace") {
-      check(post("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","replacement"}}).status == 200, "replacement failed");
+      check(post("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","replacement"},
+          {"native_control_capabilities", kNativeControlCapabilities}}).status == 200, "replacement failed");
     }
     check(connecting.wait_for(std::chrono::seconds(4)) == std::future_status::ready, "single connect did not finish promptly: " + scenario);
     bool connected = false;
@@ -460,7 +462,8 @@ void cancel_during_grant_response() {
     HttpRequest r; r.method = "POST"; r.path = path; r.body = data.dump(); r.headers["x-mine-teleop-approver-token"] = token;
     return service.handle(r);
   };
-  call("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","race"}});
+  call("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","race"},
+      {"native_control_capabilities", kNativeControlCapabilities}});
   const auto token = body(call("/mobile/api/login", {{"password","approval-secret"}})).at("token").get<std::string>();
   DriverConfig dc; dc.driver_id = "d1"; dc.signaling_url = "ws://127.0.0.1:" + std::to_string(server.port()) + "/signaling"; dc.max_time_sync_uncertainty_ms = 2000;
   DriverConsoleRuntime driver(dc, "v1", "driver-secret");

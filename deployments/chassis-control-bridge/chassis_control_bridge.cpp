@@ -1147,6 +1147,7 @@ class BridgeRuntime {
             "\",\"operator_action\":\"No action is required.\"",
         true);
     running_.store(true);
+    close_result_ = -EINPROGRESS;
     io_thread_ = std::thread(&BridgeRuntime::io_loop, this);
     return 0;
   }
@@ -1755,11 +1756,16 @@ class BridgeRuntime {
     std::lock_guard<std::mutex> lock(mutex_);
     MineTeleopChassisHandshakeStatus status{};
     const auto state = controller_.state();
+    const bool final_safe_batch_pending =
+        state == mine_teleop::vcu::State::Disarmed && !disarmed_transmitted_;
     const auto& feedback = controller_.feedback();
-    status.state = handshake_state_code(state);
+    // The protocol state alone does not confirm that its final safe commands
+    // reached the transport. Keep the operator-facing exit pending until then.
+    status.state = handshake_state_code(final_safe_batch_pending
+        ? mine_teleop::vcu::State::DisarmManual : state);
     status.requested = controller_.handshake_requested() ? 1 : 0;
     status.ready = controller_.ready() ? 1 : 0;
-    status.disarming = is_disarming(state) ? 1 : 0;
+    status.disarming = (is_disarming(state) || final_safe_batch_pending) ? 1 : 0;
     status.parking_ready =
         (parking_gate_fresh_locked(Clock::now()) && controller_.parking_ready())
         ? 1
@@ -1902,12 +1908,24 @@ class BridgeRuntime {
             ",\"io_error\":" + std::to_string(io_error_));
   }
 
-  void close() {
+  int close() {
     if (!running_.load()) {
       if (io_thread_.joinable()) io_thread_.join();
+      if (close_result_ == -EINPROGRESS) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        close_result_ = io_error_ != 0 ? io_error_ : -EIO;
+        logger_.issue(
+            "disarm_failed",
+            "vcu_disarm_incomplete",
+            "vcu_close",
+            "VCU I/O stopped before safe exit could be confirmed",
+            "Exit is incomplete; keep the vehicle isolated and use the independent hardware safety path.",
+            "safe_exit_unconfirmed",
+            "\"result\":" + std::to_string(close_result_));
+      }
       socket_.close();
       logger_.close();
-      return;
+      return close_result_;
     }
 
     {
@@ -1941,6 +1959,7 @@ class BridgeRuntime {
                 !running_.load();
           });
       disarmed = controller_.disarmed() && disarmed_transmitted_;
+      close_result_ = disarmed ? 0 : (io_error_ != 0 ? io_error_ : -ETIMEDOUT);
     }
     if (!disarmed) {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1949,10 +1968,11 @@ class BridgeRuntime {
           "vcu_disarm_timeout",
           "vcu_close",
           "VCU did not complete the reverse handshake within the timeout",
-          "Keep the vehicle isolated; inspect feedback/state and use the independent hardware safety path.",
-          "local_full_stop",
+          "Exit is incomplete; keep the vehicle isolated, inspect feedback/state, and use the independent hardware safety path.",
+          "safe_exit_unconfirmed",
           "\"timeout_ms\":" +
               std::to_string(static_cast<int>(kDisarmTimeoutSeconds * 1000.0)) +
+              ",\"result\":" + std::to_string(close_result_) +
               ",\"state\":\"" +
               std::string(mine_teleop::vcu::state_name(controller_.state())) + "\"");
       logger_.feedback(controller_.feedback(), controller_.state());
@@ -1971,6 +1991,7 @@ class BridgeRuntime {
     if (io_thread_.joinable()) io_thread_.join();
     socket_.close();
     logger_.close();
+    return close_result_;
   }
 
  private:
@@ -3271,6 +3292,7 @@ class BridgeRuntime {
   std::condition_variable condition_;
   SocketCan socket_;
   bool disarmed_transmitted_{false};
+  int close_result_{0};
   ProtocolLogger logger_;
   TractionEvaluation traction_evaluation_;
   mine_teleop::diagnostics::TorqueResponseMonitor torque_response_monitor_;
@@ -4065,8 +4087,7 @@ extern "C" int mine_teleop_chassis_close() {
       std::lock_guard<std::mutex> lock(g_api_mutex);
       runtime = std::move(g_runtime);
     }
-    if (runtime) runtime->close();
-    return 0;
+    return runtime ? runtime->close() : 0;
   } catch (...) {
     return -5;
   }

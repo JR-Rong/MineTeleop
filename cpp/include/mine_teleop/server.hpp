@@ -18,6 +18,7 @@
 #include "mine_teleop/core.hpp"
 #include "mine_teleop/detail/native_control_acknowledgement_window.hpp"
 #include "mine_teleop/http.hpp"
+#include "mine_teleop/media.hpp"
 #include "mine_teleop/websocket.hpp"
 
 namespace mine_teleop {
@@ -177,6 +178,9 @@ class SignalingService {
     std::uint64_t generation{0};
     std::int64_t connected_at_ms{0};
     std::int64_t last_seen_at_ms{0};
+    // Vehicle declaration, scoped to this connection generation. Empty means
+    // unknown/legacy; the cloud's own capability cannot establish this value.
+    std::string native_control_capabilities{};
   };
   struct RelayUsageSample {
     std::uint64_t sequence{0};
@@ -369,9 +373,13 @@ class DriverConsoleRuntime {
 
   [[nodiscard]] Json login(std::string_view password = {}, std::string_view driver_id = {});
   [[nodiscard]] Json vehicles();
-  [[nodiscard]] Json connect(std::string_view vehicle_id = {});
+  [[nodiscard]] Json connect(std::string_view vehicle_id = {}, std::string_view ui_instance_id = {});
   [[nodiscard]] Json end_session(std::string_view reason = "driver_session_end");
+  [[nodiscard]] Json end_session_scoped(const Json& input);
   [[nodiscard]] Json disconnect(std::string_view reason = "driver_console_disconnect");
+  // Browser release always carries its observed identity/session/page scope.
+  // The unguarded overload above remains for internal owner-pipe shutdown.
+  [[nodiscard]] Json disconnect_scoped(const Json& input);
   void prepare_shutdown();
   [[nodiscard]] Json poll_signaling();
   [[nodiscard]] Json send_media_capabilities(const Json& input);
@@ -396,10 +404,13 @@ class DriverConsoleRuntime {
 
  private:
   [[nodiscard]] Json login_locked(std::string_view password);
-  [[nodiscard]] Json connect_locked(std::string_view requested_vehicle_id, std::uint64_t generation);
+  [[nodiscard]] Json connect_locked(std::string_view requested_vehicle_id, std::uint64_t generation,
+                                    std::string_view ui_instance_id);
   [[nodiscard]] Json await_control_session(const std::string& vehicle_id, const std::string& token,
                                            std::uint64_t generation);
   [[nodiscard]] Json end_session_locked(std::string_view reason);
+  [[nodiscard]] Json disconnect_locked(std::string_view reason);
+  [[nodiscard]] Json release_scoped(const Json& input, bool end_session_only);
   void cancel_pending_connect();
   [[nodiscard]] std::string driver_id() const;
   [[nodiscard]] Json fetch_authorized_vehicles(std::string_view token, std::int64_t expires_at_ms);
@@ -445,12 +456,17 @@ class DriverConsoleRuntime {
   HttpClient http_;
   HttpClient time_sync_http_;
   SynchronizedClock clock_;
+  TimeSyncReadinessGate time_sync_readiness_gate_;
   mutable std::mutex mutex_;
   std::mutex approval_wait_mutex_;
   std::condition_variable approval_wait_cv_;
   std::atomic<std::uint64_t> connect_cancellation_generation_{0};
   std::atomic<bool> shutting_down_{false};
   Json pending_mobile_approval_ = Json::object();
+  std::optional<std::uint64_t> pending_connect_generation_;
+  std::string pending_connect_ui_instance_id_;
+  // Protected by mutex_; reserved while native_control_update_mutex_ is held.
+  bool logout_scope_reserved_{false};
   mutable std::mutex browser_event_log_mutex_;
   mutable std::mutex time_sync_mutex_;
   mutable std::mutex control_lease_mutex_;
@@ -459,6 +475,9 @@ class DriverConsoleRuntime {
   mutable std::mutex signaling_send_mutex_;
   mutable std::mutex signaling_websocket_mutex_;
   mutable std::mutex control_signaling_websocket_mutex_;
+  ReadinessRevisionFence control_source_revision_fence_;
+  std::uint64_t recovery_bad_sample_revision_{0};
+  std::uint64_t recovery_brake_revision_{0};
   mutable std::mutex native_control_status_mutex_;
   mutable std::mutex native_control_wait_mutex_;
   // Serializes browser-intent acceptance with native session resets. This
@@ -472,6 +491,7 @@ class DriverConsoleRuntime {
   std::uint64_t signaling_restart_recoveries_{0};
   bool signaling_available_{false};
   std::string session_id_;
+  std::string session_creator_ui_instance_id_;
   std::string control_token_;
   std::int64_t control_token_expires_at_ms_{0};
   std::int64_t control_token_renew_at_ms_{0};

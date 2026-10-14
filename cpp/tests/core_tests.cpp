@@ -153,6 +153,54 @@ void activate_session_profile(
   expect(result.accepted, "session control profile was rejected: " + result.reason);
 }
 
+// VehicleControlService owns the physical brake/re-arm, while the runtime's
+// shared latch owns the confirmed 300ms health window. Exercise both actual
+// objects here: a single neutral packet does not stand in for that owner.
+std::int64_t confirm_common_recovery_window(
+    mine_teleop::test::LogicalTimeControlService& service,
+    std::uint64_t& seq,
+    std::int64_t started_ms,
+    mine_teleop::ControlRecoveryCause cause = mine_teleop::ControlRecoveryCause::ControlLink) {
+  using Phase = mine_teleop::ControlRecoveryPhase;
+  mine_teleop::SessionControlRecoveryLatch latch;
+  static_cast<void>(latch.enter_session("session-001"));
+  expect(service.control_braking_wait(), "recovery fixture has no physical braking wait to confirm");
+  expect(latch.observe_recovery("session-001", false, started_ms, 5000, cause) == Phase::BrakingWait,
+      "shared recovery latch did not observe the braking wait");
+  const auto healthy = [&] {
+    return service.driver_critical_video_ready() && service.driver_time_sync_ready() &&
+        service.operator_input_ready() && service.driver_control_link_ready() && service.recovery_samples_healthy();
+  };
+  expect(healthy(), "first accepted neutral did not establish all required raw health conditions");
+  expect(latch.observe_recovery("session-001", healthy(), started_ms, 5000, cause) == Phase::BrakingWait,
+      "one healthy sample released the common window");
+  for (const std::int64_t elapsed_ms : {50, 100, 150, 200, 250, 299, 300}) {
+    auto neutral = command(seq++, started_ms + elapsed_ms);
+    neutral.throttle = neutral.steering = 0.0;
+    expect(service.receive_command(neutral, started_ms + elapsed_ms).accepted,
+        "real fresh neutral heartbeat was rejected during the common health window");
+    const auto phase = latch.observe_recovery("session-001", healthy(), started_ms + elapsed_ms, 5000, cause);
+    if (elapsed_ms < 300) {
+      expect(phase == Phase::BrakingWait && service.control_braking_wait() &&
+          service.control_timing(started_ms + elapsed_ms).at("recovery_brake_hold").get<bool>(),
+          "shared health window or independent brake ended before 300ms");
+    } else {
+      expect(phase == Phase::Recovered, "complete common health window did not recover");
+      service.set_control_braking_wait(false, started_ms + elapsed_ms, cause);
+    }
+    expect(service.session_control_profile().at("active").get<bool>(),
+        "real braking heartbeats revoked the confirmed session profile");
+  }
+  expect(!service.control_braking_wait() && service.control_timing(started_ms + 300).at("recovery_brake_hold").get<bool>(),
+      "window recovery did not retain braking until fresh release and new press");
+  auto release = command(seq++, started_ms + 310);
+  release.throttle = release.steering = 0.0;
+  expect(service.receive_command(release, started_ms + 310).accepted &&
+      service.control_timing(started_ms + 310).at("recovery_brake_hold").get<bool>(),
+      "post-window release was rejected or prematurely released independent braking");
+  return started_ms + 320;
+}
+
 mine_teleop::Json signaling_request(
     std::string_view vehicle_id,
     std::string_view driver_id,
@@ -1009,7 +1057,7 @@ void test_camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2() {
       "CCG2 pipeline retained the legacy JPEG decoder or byte cap");
 }
 
-void test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps() {
+void test_camera_input_pipeline_always_bounds_raw_delivery_without_duplication() {
   mine_teleop::MediaProfile output;
   output.width = 1280;
   output.height = 720;
@@ -1031,8 +1079,8 @@ void test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps() {
   const auto unchanged =
       mine_teleop::build_camera_input_pipeline("source_ccg2_25", ccg2_25_fps, output);
   expect(
-      unchanged.find("videorate") == std::string::npos,
-      "CCG2 input added videorate even though input and output FPS match");
+      unchanged.find("videorate drop-only=true max-rate=25") != std::string::npos,
+      "equal declared FPS removed the independent raw delivery ceiling");
 
   for (const int fps : {20, 25}) {
     mine_teleop::CameraConfig direct;
@@ -1041,8 +1089,8 @@ void test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps() {
     output.fps = fps;
     const auto input = mine_teleop::camera_input_spec(direct, output);
     const auto pipe = mine_teleop::build_camera_input_pipeline("source_direct", input, output);
-    expect(input.fps == fps && pipe.find("videorate") == std::string::npos,
-        "direct 20/25Hz acquisition was converted into a 30Hz capture-and-resample path");
+    expect(input.fps == fps && pipe.find("videorate drop-only=true max-rate=" + std::to_string(fps)) != std::string::npos,
+        "direct 20/25 FPS acquisition lost its requested device rate or raw fallback ceiling");
   }
   output.fps = 25;
 
@@ -1050,8 +1098,8 @@ void test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps() {
   const auto legacy =
       mine_teleop::build_camera_input_pipeline("source_legacy_30", legacy_30_fps, output);
   expect(
-      legacy.find("videorate") == std::string::npos,
-      "legacy MJPEG pipeline behavior changed when input and output FPS differ");
+      legacy.find("videorate drop-only=true max-rate=25") != std::string::npos,
+      "MJPEG delivery lacks the same safe raw fallback ceiling");
 }
 
 void test_encoder_latency_accounts_for_shifted_segments() {
@@ -1371,15 +1419,16 @@ void test_control_recovery_latch_persists_until_a_new_session() {
       "latch state was exposed for a non-active session");
 }
 
-void test_critical_video_wait_recovers_and_never_extends_the_hard_deadline() {
+void test_critical_video_wait_recovers_and_retains_session() {
   using Phase = mine_teleop::ControlRecoveryPhase;
   mine_teleop::SessionControlRecoveryLatch latch;
   expect(!latch.enter_session("video"), "new session inhibited");
   expect(latch.observe_recovery("video", true, 100, 5000) == Phase::Ready, "healthy video started braking");
   expect(latch.observe_recovery("video", false, 200, 5000) == Phase::BrakingWait, "missing video did not start braking");
   const auto reported = latch.recovery_status_for("video");
-  expect(reported.at("cause") == "critical_video" && reported.at("timeout_ms") == 5000 &&
-      reported.at("deadline_monotonic_ms") == 5200, "vehicle status cannot explain its frozen stop deadline");
+  expect(reported.at("cause") == "critical_video" && reported.at("legacy_timeout_ms") == 5000 && reported.at("timeout_ms").is_null() &&
+      reported.at("deadline_monotonic_ms").is_null() && reported.at("session_retained") == true,
+      "vehicle status advertised an obsolete hard deadline");
   expect_throws([&] { static_cast<void>(latch.recovery_status_for("other")); }, "recovery explanation crossed sessions");
   expect(!latch.enter_session("video") && latch.braking_wait_for("video"), "runtime rebuild lost braking state");
   expect(latch.observe_recovery("video", true, 1000, 5000) == Phase::BrakingWait, "one good observation released braking");
@@ -1391,9 +1440,11 @@ void test_critical_video_wait_recovers_and_never_extends_the_hard_deadline() {
   expect(latch.observe_recovery("video", false, 2000, 5000) == Phase::BrakingWait, "second outage missing");
   expect(!latch.enter_session("video"), "rebuild prematurely latched control");
   expect(latch.observe_recovery("video", false, 6999, 5000) == Phase::BrakingWait, "video stop triggered before five seconds");
-  expect(latch.observe_recovery("video", true, 7000, 5000) == Phase::Locked, "deadline frame bypassed the due hard stop");
-  expect(latch.enter_session("video") && latch.observe_recovery("video", true, 7300, 5000) == Phase::Locked,
-      "same-session reconstruction bypassed sustained-video lock");
+  expect(latch.observe_recovery("video", true, 7000, 5000) == Phase::BrakingWait, "elapsed wait revoked session or bypassed health window");
+  expect(!latch.enter_session("video") && latch.observe_recovery("video", true, 7299, 5000) == Phase::BrakingWait,
+      "same-session reconstruction bypassed 300ms healthy window");
+  expect(latch.observe_recovery("video", true, 7300, 5000) == Phase::Recovered,
+      "stable video could not recover in retained session");
   expect(!latch.enter_session("new-video") && !latch.braking_wait_for("new-video"), "new session inherited old braking deadline");
   expect_throws([&] { latch.observe_recovery("video", false, 7300, 5000); }, "old runtime changed a new session");
 }
@@ -2100,10 +2151,16 @@ void test_native_control_intent_is_latest_only_and_estop_sticky() {
   replacement_ui.ui_instance_id = "ui-2";
   replacement_ui.intent_seq = 1;
   replacement_ui.throttle = 0.2;
+  const auto prior_owner = store.ownership_scope();
   update = store.update(replacement_ui, 1001);
   expect(
-      !update.accepted && update.requires_fresh_input &&
-          update.reason == "fresh_neutral_required",
+      !update.accepted && update.reason == "input_page_not_current" &&
+          store.ownership_scope() == prior_owner,
+      "an unconfirmed replacement page changed ordinary input ownership");
+  update = store.update(replacement_ui, 1001, prior_owner.second, true);
+  expect(
+      !update.accepted && update.reason == "fresh_neutral_required" &&
+          store.ownership_scope() == prior_owner && store.sample(1001).intent.estop,
       "a replacement page restored non-neutral input without a neutral handshake");
   store.reset();
   expect(!store.sample(1002).active, "session reset retained a prior native intent");
@@ -2713,7 +2770,12 @@ void test_control_service_recovers_from_degraded_command_gap_without_profile_rea
       service.safety_state() == mine_teleop::SafetyState::ControlActive,
       "fresh neutral command did not restore active control");
   expect(
-      service.receive_command(command(5, 380), 380).accepted,
+      !service.receive_command(command(5, 380), 380).accepted && service.control_braking_wait(),
+      "a single neutral packet bypassed the common health confirmation");
+  std::uint64_t seq = 6;
+  const auto fresh_press_ms = confirm_common_recovery_window(service, seq, 370);
+  expect(
+      service.receive_command(command(seq++, fresh_press_ms), fresh_press_ms).accepted,
       "fresh input remained blocked after explicit neutral recovery");
   expect(
       service.session_control_profile().at("active").get<bool>() &&
@@ -2807,7 +2869,13 @@ void test_held_forward_and_left_rearm_after_control_gap() {
       "re-arm unnecessarily revoked the confirmed session profile");
   left.seq = ++seq;
   left.sent_at_utc_ms = 60500;
-  expect(service.receive_command(left, 60500).accepted,
+  expect(!service.receive_command(left, 60500).accepted && service.control_braking_wait(),
+      "held forward/left bypassed 300ms common health confirmation");
+  ++seq;
+  const auto fresh_press_ms = confirm_common_recovery_window(service, seq, 60450);
+  left.seq = seq++;
+  left.sent_at_utc_ms = fresh_press_ms;
+  expect(service.receive_command(left, fresh_press_ms).accepted,
       "fresh forward/left remained blocked after neutral re-arm");
   service.close();
 }
@@ -3008,14 +3076,18 @@ void test_recovery_braking_never_emits_zero_pressure_on_rejected_commands() {
     auto neutral = command(seq++, 400); neutral.throttle = neutral.steering = 0;
     expect(service.receive_command(neutral, 400).accepted && view->last_safe_output.brake == 1,
         "fresh recovery neutral released independent braking");
-    expect(service.receive_command(command(seq++, 450), 450).accepted &&
-        !service.control_timing(450).at("recovery_brake_hold").get<bool>(),
+    expect(!service.receive_command(command(seq++, 450), 450).accepted &&
+        service.control_timing(450).at("recovery_brake_hold").get<bool>(),
+        "fresh motion bypassed the common healthy window after one neutral");
+    const auto fresh_press_ms = confirm_common_recovery_window(service, seq, 400, cause);
+    expect(service.receive_command(command(seq++, fresh_press_ms), fresh_press_ms).accepted &&
+        !service.control_timing(fresh_press_ms).at("recovery_brake_hold").get<bool>(),
         "fresh motion could not release the brake hold");
-    service.set_control_braking_wait(true, 500, cause);
-    service.tick(1249);
+    service.set_control_braking_wait(true, fresh_press_ms + 50, cause);
+    service.tick(fresh_press_ms + 799);
     expect(service.session_control_profile().at("active").get<bool>(),
         "800 ms hard watchdog fired early during recovery braking");
-    service.tick(1250);
+    service.tick(fresh_press_ms + 800);
     expect(service.safety_state() == State::TimeoutBrake &&
         !service.session_control_profile().at("active").get<bool>(),
         "local recovery brake bypassed the independent 800 ms hard watchdog");
@@ -3092,8 +3164,10 @@ void test_time_and_input_faults_brake_independently_and_recover_without_new_prof
   expect(latch.observe_recovery("mixed", false, 4999, 30000, Cause::InputLease) == Phase::BrakingWait,
       "changed fault type ended the original wait");
   expect(latch.cause_for("mixed") == Cause::TimeSynchronization &&
-      latch.deadline_for("mixed") == 5000 && latch.observe_recovery("mixed", true, 5000, 30000) == Phase::Locked,
-      "changed cause, profile, or one good frame extended the original deadline");
+      !latch.deadline_for("mixed") && latch.observe_recovery("mixed", true, 5000, 30000) == Phase::BrakingWait,
+      "changing fault categories revoked session or skipped healthy window");
+  expect(latch.observe_recovery("mixed", true, 5300, 30000) == Phase::Recovered,
+      "shared 300ms health did not recover retained session");
   const auto base = read_text("configs/vehicle-agent.dev.yaml");
   const auto legacy = write_temp_vehicle_config("legacy-recovery", "runtime:\n  critical_camera_recovery_timeout_ms: 7000\n" + base);
   expect(mine_teleop::load_vehicle_config(legacy).runtime.control_recovery_timeout_ms == 7000,
@@ -3142,16 +3216,22 @@ void test_configurable_late_frames_and_independent_hard_timeout() {
     auto neutral = command(seq++, 260);
     neutral.throttle = neutral.steering = 0.0;
     expect(service.receive_command(neutral, 260).accepted, "zero input could not re-arm");
-    expect(!service.control_timing(260).at("rearm_required").get<bool>() &&
-        service.session_control_profile().at("active").get<bool>(), "recovery revoked profile or retained latch");
-    expect(service.receive_command(command(seq++, 270), 270).accepted, "fresh press did not resume control");
+    expect(service.control_timing(260).at("rearm_required").get<bool>() &&
+        service.session_control_profile().at("active").get<bool>(), "one neutral bypassed shared health wait or revoked profile");
+    expect(!service.receive_command(command(seq++, 270), 270).accepted,
+        "fresh press bypassed the common healthy window");
+    const auto fresh_press_ms = confirm_common_recovery_window(service, seq, 260);
+    expect(!service.control_timing(fresh_press_ms - 10).at("rearm_required").get<bool>() &&
+        service.session_control_profile().at("active").get<bool>(), "confirmed recovery revoked profile or retained latch");
+    expect(service.receive_command(command(seq++, fresh_press_ms), fresh_press_ms).accepted, "fresh press did not resume control");
     // Arrival of arbitrarily many expired frames must not restart 800 ms.
-    for (std::int64_t now = 500; now <= 1070; now += 50)
+    for (std::int64_t now = fresh_press_ms + 250; now <= fresh_press_ms + 800; now += 50)
       expect(!service.receive_command(command(seq++, 0), now).accepted, "late frame executed during outage");
-    service.tick(1070);
+    service.tick(fresh_press_ms + 800);
     expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
         !service.session_control_profile().at("active").get<bool>(), "old arrivals postponed hard timeout");
-    expect(!service.receive_command(command(seq++, 1071), 1071).accepted, "post-timeout input revived revoked profile");
+    expect(!service.receive_command(command(seq++, fresh_press_ms + 801), fresh_press_ms + 801).accepted,
+        "post-timeout input revived revoked profile");
     service.close();
   }
 
@@ -3166,11 +3246,17 @@ void test_configurable_late_frames_and_independent_hard_timeout() {
   expect(service.receive_command(command(1, 0), 0).accepted, "initial command rejected");
   expect(!service.receive_command(command(2, 0), 250).accepted, "single late frame executed");
   service.tick(300);
-  expect(!service.control_timing(300).at("rearm_required").get<bool>(), "transient soft timeout latched held input");
-  expect(service.receive_command(command(3, 350), 350).accepted, "fresh input did not recover transient jitter");
+  expect(!service.receive_command(command(3, 350), 350).accepted, "old held motion revived after independent input absence");
   expect(service.control_timing(350).at("consecutive_late_frames") == 0,
       "valid fresh frame did not clear consecutive count");
-  service.tick(1150);
+  auto release = command(4, 400); release.throttle = release.steering = 0.0;
+  expect(service.receive_command(release, 400).accepted, "fresh neutral during the wait was rejected");
+  expect(!service.receive_command(command(5, 401), 401).accepted && service.control_braking_wait(),
+      "one neutral after input absence bypassed the shared health window");
+  std::uint64_t seq = 6;
+  const auto fresh_press_ms = confirm_common_recovery_window(service, seq, 400);
+  expect(service.receive_command(command(seq++, fresh_press_ms), fresh_press_ms).accepted, "new press could not resume");
+  service.tick(fresh_press_ms + 800);
   expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake,
       "complete absence of frames failed to stop at 800 ms");
   service.close();
@@ -4562,7 +4648,7 @@ void test_native_driver_to_vehicle_signaling_control_payload() {
   mine_teleop::HttpClient http;
   const auto online = http.post_json_response(
       base + "/vehicles/online",
-      {{"vehicle_id", "vehicle-001"},
+      {{"native_control_capabilities", mine_teleop::kNativeControlCapabilities}, {"vehicle_id", "vehicle-001"},
        {"device_token", "dev-device-secret"},
        {"connection_id", "data-channel-test-vehicle"}});
   const auto vehicle_generation = online.at("connection_generation").get<std::uint64_t>();
@@ -4583,9 +4669,26 @@ void test_native_driver_to_vehicle_signaling_control_payload() {
   const auto session_id = connection.at("session_id").get<std::string>();
   const auto session_generation =
       connection.at("control_session_generation").get<std::uint64_t>();
+  // This is a transport fixture with declared healthy browser observations,
+  // not a camera-health test. Old intent producers must be rejected rather
+  // than silently acquire the new raw-health/revision defaults.
+  const mine_teleop::Json legacy_neutral = {
+      {"session_id", session_id}, {"session_generation", session_generation},
+      {"ui_instance_id", "native-control-integration-test"}, {"intent_seq", 1},
+      {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0}};
+  expect_throws([&] { static_cast<void>(driver.update_control_intent(legacy_neutral)); },
+      "legacy intent without raw video health was silently accepted");
+  auto missing_revisions = legacy_neutral;
+  missing_revisions["critical_video_sample_healthy"] = true;
+  expect_throws([&] { static_cast<void>(driver.update_control_intent(missing_revisions)); },
+      "intent without video event revisions was silently accepted");
   const auto neutral = driver.update_control_intent(
       {{"session_id", session_id},
        {"session_generation", session_generation},
+       {"critical_video_ready", true},
+       {"critical_video_sample_healthy", true},
+       {"critical_video_bad_sample_revision", 0},
+       {"critical_video_brake_revision", 0},
        {"ui_instance_id", "native-control-integration-test"},
        {"intent_seq", 1},
        {"gear", "N"},
@@ -4599,6 +4702,10 @@ void test_native_driver_to_vehicle_signaling_control_payload() {
   const auto active = driver.update_control_intent(
       {{"session_id", session_id},
        {"session_generation", session_generation},
+       {"critical_video_ready", true},
+       {"critical_video_sample_healthy", true},
+       {"critical_video_bad_sample_revision", 0},
+       {"critical_video_brake_revision", 0},
        {"ui_instance_id", "native-control-integration-test"},
        {"intent_seq", 2},
        {"gear", "D"},
@@ -4717,12 +4824,12 @@ void test_driver_login_lists_only_authorized_vehicles() {
   mine_teleop::HttpClient http;
   static_cast<void>(http.post_json_response(
       base + "/vehicles/online",
-      {{"vehicle_id", "vehicle-001"},
+      {{"native_control_capabilities", mine_teleop::kNativeControlCapabilities}, {"vehicle_id", "vehicle-001"},
        {"device_token", "vehicle-secret-1"},
        {"connection_id", "authorized-list-vehicle-1"}}));
   static_cast<void>(http.post_json_response(
       base + "/vehicles/online",
-      {{"vehicle_id", "vehicle-002"},
+      {{"native_control_capabilities", mine_teleop::kNativeControlCapabilities}, {"vehicle_id", "vehicle-002"},
        {"device_token", "vehicle-secret-2"},
        {"connection_id", "authorized-list-vehicle-2"}}));
 
@@ -4807,6 +4914,29 @@ void test_local_archive_uploader_is_atomic_and_resumable() {
   std::filesystem::remove_all(root);
 }
 
+void test_uploader_requires_closed_fragment_and_defers_digest() {
+  const auto root = std::filesystem::temp_directory_path() / ("mine_teleop_closed_upload_" + mine_teleop::random_token(6));
+  const auto recordings = root / "recordings", archive = root / "archive";
+  std::filesystem::create_directories(recordings);
+  auto write = [&](const std::string& name, const mine_teleop::Json& value) { std::ofstream out(recordings / name); out << value.dump(); };
+  // An open file and summary sort before the good sidecar. Neither becomes a
+  // pending segment or blocks the independent complete-segment queue.
+  { std::ofstream out(recordings / "00-open.mp4"); out << "unfinalized"; }
+  write("00-open.json", {{"schema_version",1},{"kind","recording_segment"},{"upload_state","pending"},{"finalized",false},{"incomplete",true},{"recording_status","open"}});
+  write("01-summary.json", {{"schema_version",1},{"kind","recording_session_summary"}});
+  { std::ofstream out(recordings / "02-closed.mp4"); out << "actual closed fixture content"; }
+  write("02-closed.json", {{"schema_version",1},{"kind","recording_segment"},{"upload_state","pending"},{"finalized",true},{"incomplete",false},{"recording_status","complete"},{"hash_state","pending"},{"segment_id","closed"}});
+  mine_teleop::LocalArchiveUploader uploader(recordings, archive);
+  expect(uploader.backlog()["pending_segments"] == 1, "open/new-summary metadata counted as pending video");
+  const auto result = uploader.process_once();
+  expect(result.action == "uploaded" && result.segment_id == "closed", "incomplete metadata blocks closed segment");
+  expect(!std::filesystem::exists(archive / "00-open.mp4") && !std::filesystem::exists(archive / "01-summary.json"), "incomplete/summary archived as complete video");
+  std::ifstream input(archive / "02-closed.json"); mine_teleop::Json value; input >> value;
+  expect(value["hash_state"] == "verified" && value["video_sha256"] == mine_teleop::sha256_file(recordings / "02-closed.mp4"), "independent archive failed to fill actual deferred digest");
+  expect(uploader.process_once().action == "idle" && uploader.backlog()["pending_segments"] == 0, "unfinished metadata defaulted to pending after archive");
+  std::filesystem::remove_all(root);
+}
+
 }  // namespace
 
 int main() {
@@ -4826,7 +4956,7 @@ int main() {
       {"camera_backend_config_rejects_unknown_and_invalid_ccg2_modes", test_camera_backend_config_rejects_unknown_and_invalid_ccg2_modes},
       {"ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames", test_ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames},
       {"camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2", test_camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2},
-      {"camera_input_pipeline_resamples_only_mismatched_ccg2_fps", test_camera_input_pipeline_resamples_only_mismatched_ccg2_fps},
+      {"camera_input_pipeline_always_bounds_raw_delivery_without_duplication", test_camera_input_pipeline_always_bounds_raw_delivery_without_duplication},
       {"ccg2_camera_input_pipeline_is_gstreamer_parseable", test_ccg2_camera_input_pipeline_is_gstreamer_parseable},
       {"encoder_latency_accounts_for_shifted_segments", test_encoder_latency_accounts_for_shifted_segments},
       {"encoded_frame_queues_preserve_reference_frames_under_backpressure", test_encoded_frame_queues_preserve_reference_frames_under_backpressure},
@@ -4837,7 +4967,7 @@ int main() {
       {"missing_v4l2_path_remains_retryable", test_missing_v4l2_path_remains_retryable},
       {"media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes", test_media_signaling_sequence_is_monotonic_within_scope_and_resets_between_scopes},
       {"control_recovery_latch_persists_until_a_new_session", test_control_recovery_latch_persists_until_a_new_session},
-      {"critical_video_wait_recovers_and_never_extends_the_hard_deadline", test_critical_video_wait_recovers_and_never_extends_the_hard_deadline},
+      {"critical_video_wait_recovers_and_never_extends_the_hard_deadline", test_critical_video_wait_recovers_and_retains_session},
       {"camera_startup_grace_and_running_freshness", test_camera_startup_grace_and_running_freshness},
       {"media_signaling_error_classification_supports_structured_and_legacy_conflicts", test_media_signaling_error_classification_supports_structured_and_legacy_conflicts},
       {"vehicle_config_validates_chassis_control_speed_range", test_vehicle_config_validates_chassis_control_speed_range},
@@ -4903,6 +5033,7 @@ int main() {
       {"driver_console_page_keeps_waiting_state_during_background_intent_refresh", test_driver_console_page_keeps_waiting_state_during_background_intent_refresh},
       {"driver_login_lists_only_authorized_vehicles", test_driver_login_lists_only_authorized_vehicles},
       {"local_archive_uploader_is_atomic_and_resumable", test_local_archive_uploader_is_atomic_and_resumable},
+      {"uploader_requires_closed_fragment_and_defers_digest", test_uploader_requires_closed_fragment_and_defers_digest},
   };
   int failures = 0;
   for (const auto& [name, test] : tests) {

@@ -1,11 +1,14 @@
 #include "mine_teleop/media.hpp"
 
 #include "mine_teleop/gstreamer_media.hpp"
+#include "mine_teleop/detail/gstreamer_freshness.hpp"
+#include "mine_teleop/recording.hpp"
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/upload.hpp"
 #include "mine_teleop/video.hpp"
 
 #include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
 #include <gst/gst.h>
 #include <gst/sdp/sdp.h>
 #define GST_USE_UNSTABLE_API
@@ -37,13 +40,7 @@ namespace mine_teleop {
 
 std::optional<std::uint64_t> encoded_frame_latency_ms(
     const GstSegment& segment, GstClockTime pts, std::int64_t elapsed_ms) {
-  if (segment.format != GST_FORMAT_TIME || !GST_CLOCK_TIME_IS_VALID(pts) || elapsed_ms < 0) {
-    return std::nullopt;
-  }
-  const auto running_time = gst_segment_to_running_time(&segment, GST_FORMAT_TIME, pts);
-  if (!GST_CLOCK_TIME_IS_VALID(running_time) ||
-      running_time / GST_MSECOND > static_cast<std::uint64_t>(elapsed_ms)) return std::nullopt;
-  return static_cast<std::uint64_t>(elapsed_ms) - running_time / GST_MSECOND;
+  return detail::encoded_running_time_age_ms(segment, pts, elapsed_ms);
 }
 
 void isolate_bundled_rtp_lane_eos(GstPad* rtp_src_pad, std::atomic<bool>& pipeline_stopping) {
@@ -132,128 +129,6 @@ std::uint64_t MediaSignalingSequence::current() const {
 bool camera_encoded_frame_fresh(std::int64_t last_encoded_ms, std::int64_t now_ms, int timeout_ms) {
   return last_encoded_ms > 0 && now_ms >= last_encoded_ms &&
       now_ms - last_encoded_ms <= timeout_ms;
-}
-
-bool SessionControlRecoveryLatch::enter_session(std::string_view session_id) {
-  if (session_id.empty()) {
-    throw std::invalid_argument("critical camera control latch requires a non-empty session id");
-  }
-  std::lock_guard lock(mutex_);
-  if (session_id_ != session_id) {
-    session_id_ = session_id;
-    inhibited_ = false;
-    armed_ = false;
-    startup_started_ms_.reset();
-    braking_started_ms_.reset();
-    braking_timeout_ms_ = 0;
-    recovered_started_ms_.reset();
-    cause_ = ControlRecoveryCause::CriticalVideo;
-  }
-  return inhibited_;
-}
-
-bool SessionControlRecoveryLatch::inhibit(std::string_view session_id) {
-  if (session_id.empty()) {
-    throw std::invalid_argument("critical camera control latch requires a non-empty session id");
-  }
-  std::lock_guard lock(mutex_);
-  if (session_id_.empty()) {
-    throw std::logic_error("critical camera control latch session was not entered");
-  }
-  if (session_id_ != session_id) {
-    throw std::logic_error("critical camera control latch session does not match the active session");
-  }
-  const bool first_inhibition = !inhibited_;
-  inhibited_ = true;
-  return first_inhibition;
-}
-
-bool SessionControlRecoveryLatch::inhibited_for(std::string_view session_id) const {
-  if (session_id.empty()) {
-    throw std::invalid_argument("critical camera control latch requires a non-empty session id");
-  }
-  std::lock_guard lock(mutex_);
-  if (session_id_ != session_id) {
-    throw std::logic_error("critical camera control latch session does not match the active session");
-  }
-  return inhibited_;
-}
-
-bool SessionControlRecoveryLatch::startup_grace_active(std::string_view session_id, std::int64_t now_ms) {
-  std::lock_guard lock(mutex_);
-  if (session_id.empty() || session_id_ != session_id || now_ms < 0) {
-    throw std::logic_error("invalid critical camera startup scope or time");
-  }
-  if (!startup_started_ms_) startup_started_ms_ = now_ms;
-  return !inhibited_ && !armed_ && now_ms >= *startup_started_ms_ &&
-      now_ms - *startup_started_ms_ < kCriticalCameraStartupTimeoutMs;
-}
-
-bool SessionControlRecoveryLatch::arm_for_control(std::string_view session_id) {
-  std::lock_guard lock(mutex_);
-  if (session_id.empty() || session_id_ != session_id) {
-    throw std::logic_error("critical camera control scope does not match the active session");
-  }
-  if (inhibited_) return false;
-  armed_ = true;
-  return true;
-}
-
-ControlRecoveryPhase SessionControlRecoveryLatch::observe_recovery(
-    std::string_view session_id, bool ready, std::int64_t now_ms, int recovery_timeout_ms,
-    ControlRecoveryCause cause) {
-  std::lock_guard lock(mutex_);
-  if (session_id.empty() || session_id_ != session_id || now_ms < 0 || recovery_timeout_ms <= 0)
-    throw std::logic_error("invalid critical-video protection scope or time");
-  if (inhibited_) return ControlRecoveryPhase::Locked;
-  if (!ready && !braking_started_ms_) {
-    braking_started_ms_ = now_ms;
-    braking_timeout_ms_ = recovery_timeout_ms;
-    cause_ = cause;
-  }
-  if (!braking_started_ms_) return ControlRecoveryPhase::Ready;
-  // A frame arriving at the hard deadline cannot clear an already due stop.
-  if (now_ms - *braking_started_ms_ >= braking_timeout_ms_) {
-    inhibited_ = true;
-    return ControlRecoveryPhase::Locked;
-  }
-  if (!ready) recovered_started_ms_.reset();
-  else if (!recovered_started_ms_) recovered_started_ms_ = now_ms;
-  else if (now_ms - *recovered_started_ms_ >= kControlRecoveryStableMs) {
-    braking_started_ms_.reset();
-    braking_timeout_ms_ = 0;
-    recovered_started_ms_.reset();
-    return ControlRecoveryPhase::Recovered;
-  }
-  return ControlRecoveryPhase::BrakingWait;
-}
-
-bool SessionControlRecoveryLatch::braking_wait_for(std::string_view session_id) const {
-  std::lock_guard lock(mutex_);
-  if (session_id.empty() || session_id_ != session_id)
-    throw std::logic_error("critical-video protection session mismatch");
-  return braking_started_ms_.has_value() && !inhibited_;
-}
-
-ControlRecoveryCause SessionControlRecoveryLatch::cause_for(std::string_view session_id) const {
-  std::lock_guard lock(mutex_);
-  if (session_id.empty() || session_id_ != session_id)
-    throw std::logic_error("control recovery session mismatch");
-  return cause_;
-}
-
-std::optional<std::int64_t> SessionControlRecoveryLatch::deadline_for(std::string_view session_id) const {
-  std::lock_guard lock(mutex_);
-  if (session_id.empty() || session_id_ != session_id) throw std::logic_error("control recovery session mismatch");
-  return braking_started_ms_ ? std::optional<std::int64_t>(*braking_started_ms_ + braking_timeout_ms_) : std::nullopt;
-}
-
-Json SessionControlRecoveryLatch::recovery_status_for(std::string_view session_id) const {
-  std::lock_guard lock(mutex_);
-  if (session_id.empty() || session_id_ != session_id) throw std::logic_error("control recovery session mismatch");
-  return {{"cause", to_string(cause_)}, {"phase", inhibited_ ? "locked" : braking_started_ms_ ? "braking_wait" : "ready"},
-          {"timeout_ms", braking_timeout_ms_},
-          {"deadline_monotonic_ms", braking_started_ms_ ? Json(*braking_started_ms_ + braking_timeout_ms_) : Json(nullptr)}};
 }
 
 NeutralHeartbeatGate neutral_heartbeat_gate(
@@ -485,7 +360,8 @@ class MediaSignalingClient {
         origin_ + "/vehicles/online",
         {{"vehicle_id", vehicle_id_},
          {"device_token", device_token_},
-         {"connection_id", connection_id_}});
+         {"connection_id", connection_id_},
+         {"native_control_capabilities", kNativeControlCapabilities}});
     connection_generation_ = response.at("connection_generation").get<std::uint64_t>();
   }
 
@@ -499,6 +375,9 @@ class MediaSignalingClient {
   [[nodiscard]] std::int64_t now_ms() const { return clock_.now_ms(); }
   [[nodiscard]] std::int64_t from_local_system_ms(std::int64_t value) const {
     return clock_.from_local_system_ms(value);
+  }
+  [[nodiscard]] std::int64_t from_steady_time(std::chrono::steady_clock::time_point value) const {
+    return clock_.from_steady_time(value);
   }
 
   bool discover_session() {
@@ -638,9 +517,13 @@ struct VehicleMediaRuntime::Impl {
     GstElement* appsrc{nullptr};
     GstElement* encoder{nullptr};
     GstElement* send_queue{nullptr};
+    GstElement* record_tap{nullptr};
+    std::size_t recording_index{std::numeric_limits<std::size_t>::max()};
+    std::unique_ptr<detail::EncodedSendFreshness> send_freshness;
     std::thread thread;
     std::atomic<std::uint64_t> captured{0};
     std::atomic<std::uint64_t> pushed{0};
+    std::atomic<std::uint64_t> raw_to_encoder{0};
     std::atomic<std::uint64_t> encoded{0};
     std::atomic<std::uint64_t> dropped{0};
     std::atomic<std::uint64_t> encoded_queue_backpressure{0};
@@ -939,7 +822,8 @@ struct VehicleMediaRuntime::Impl {
       lane->last_encoded_steady_ms = steady_now_ms();
       GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
       const auto latency = buffer == nullptr ? std::nullopt : encoded_frame_latency_ms(
-          lane->encoder_output_segment, GST_BUFFER_PTS(buffer), encoded_at_ms - lane->pipeline_started_ms);
+          lane->encoder_output_segment, GST_BUFFER_PTS(buffer),
+          lane->last_encoded_steady_ms.load() - lane->pipeline_started_steady_ms);
       lane->encode_latency_current_valid = latency.has_value();
       if (buffer != nullptr && GST_BUFFER_PTS_IS_VALID(buffer)) {
         lane->encoder_output_pts_ms = GST_BUFFER_PTS(buffer) / GST_MSECOND;
@@ -1803,7 +1687,7 @@ struct VehicleMediaRuntime::Impl {
       }
       const auto received_at_ms = control_mutex_acquired_at_utc_ms;
       if (!command.estop && config.field_safety.require_time_sync &&
-          !signaling.time_sync_status().acceptable(config.field_safety.max_time_sync_uncertainty_ms)) {
+          !vehicle_time_readiness().ready) {
         control_service->set_control_braking_wait(true, received_at_ms, ControlRecoveryCause::TimeSynchronization);
       }
       const auto receive_apply_started_at_utc_ms = signaling.now_ms();
@@ -2703,14 +2587,23 @@ struct VehicleMediaRuntime::Impl {
     }
   }
 
+  [[nodiscard]] TimeSyncReadinessState vehicle_time_readiness() const {
+    return vehicle_time_sync_readiness_gate.observe(signaling.time_sync_status(),
+        config.field_safety.max_time_sync_uncertainty_ms, steady_now_ms(),
+        TimeSyncReadinessGate::candidate_timeout_ms(config.field_safety.time_sync_interval_ms,
+            config.field_safety.time_sync_samples));
+  }
+
   [[nodiscard]] bool critical_cameras_ready() const {
-    if (config.field_safety.require_time_sync && !signaling.time_sync_status().acceptable(config.field_safety.max_time_sync_uncertainty_ms)) return false;
+    if (config.field_safety.require_time_sync && !vehicle_time_readiness().ready) return false;
     if (control_recovery_latch->braking_wait_for(signaling.session_id())) return false;
     return std::all_of(lanes.begin(), lanes.end(), [&](const auto& lane) {
-      const auto last_encoded_ms = lane->last_encoded_steady_ms.load();
       return !lane->camera.critical_for_control ||
-          (!lane->disabled.load() && camera_encoded_frame_fresh(
-              last_encoded_ms, steady_now_ms(), frame_timeout_ms));
+          (!lane->disabled.load() && !lane->camera_faulted.load() && lane->send_freshness &&
+           !lane->send_freshness->invalid_sample_blocked.load() &&
+           lane->send_freshness->consecutive_anomalies.load() < 3 &&
+           camera_encoded_frame_fresh(lane->send_freshness->last_fresh_frame_ms.load(),
+               steady_now_ms(), lane->send_freshness->max_age_ms.load()));
     });
   }
 
@@ -2731,7 +2624,8 @@ struct VehicleMediaRuntime::Impl {
     }
     const auto [stale_brake_ms, recovery_timeout_ms] = recovery_timing_configured();
     const bool waiting = phase == ControlRecoveryPhase::BrakingWait;
-    if (new_wait) for (const auto& lane : lanes) lane->video_wait_encoded_baseline = lane->encoded.load();
+    if (new_wait) for (const auto& lane : lanes)
+      lane->video_wait_encoded_baseline = lane->send_freshness ? lane->send_freshness->fresh_frames.load() : 0;
     bool changed = false;
     bool soft_brake_request_active = false;
     bool soft_brake_applied_this_transition = false;
@@ -2746,11 +2640,25 @@ struct VehicleMediaRuntime::Impl {
         const auto last_capture = lane->last_capture_steady_ms.load();
         const auto last_encoded = lane->last_encoded_steady_ms.load();
         critical_lanes.push_back({{"camera_id", lane->camera.id}, {"device", lane->camera.device},
-            {"captured_frames", lane->captured.load()}, {"encoded_frames", lane->encoded.load()},
+            {"recording", recording_status_for(*lane)},
+          {"captured_frames", lane->captured.load()}, {"encoded_frames", lane->encoded.load()},
             {"last_capture_age_ms", last_capture > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - last_capture)) : Json(nullptr)},
             {"last_encoded_age_ms", last_encoded > 0 ? Json(std::max<std::int64_t>(0, sampled_at_monotonic_ms - last_encoded)) : Json(nullptr)},
             {"recovery_encoded_baseline", lane->video_wait_encoded_baseline.load()},
             {"encoded_queue_backpressure_count", lane->encoded_queue_backpressure.load()},
+          {"send_freshness_scope", "capture_pts_to_send_queue_source_monotonic_not_network_delivery"},
+          {"fresh_send_frames", lane->send_freshness == nullptr ? 0 : lane->send_freshness->fresh_frames.load()},
+          {"send_waiting_idr", lane->send_freshness != nullptr && lane->send_freshness->blocked.load()},
+          {"send_consecutive_anomalies", lane->send_freshness == nullptr ? 0 : lane->send_freshness->consecutive_anomalies.load()},
+          {"send_invalid_sample_blocked", lane->send_freshness != nullptr && lane->send_freshness->invalid_sample_blocked.load()},
+          {"send_last_sample_id_ns", lane->send_freshness == nullptr || !GST_CLOCK_TIME_IS_VALID(lane->send_freshness->last_sample_id_ns.load())
+              ? Json(nullptr) : Json(lane->send_freshness->last_sample_id_ns.load())},
+          {"send_stale_access_units_dropped", lane->send_freshness == nullptr ? 0 : lane->send_freshness->dropped_stale.load()},
+          {"send_invalid_access_units_dropped", lane->send_freshness == nullptr ? 0 : lane->send_freshness->dropped_invalid.load()},
+          {"send_dependent_access_units_dropped", lane->send_freshness == nullptr ? 0 : lane->send_freshness->dropped_waiting_idr.load()},
+          {"send_key_unit_requests", lane->send_freshness == nullptr ? 0 : lane->send_freshness->key_unit_requests.load()},
+          {"send_key_unit_request_failures", lane->send_freshness == nullptr ? 0 : lane->send_freshness->key_unit_request_failures.load()},
+          {"last_forwarded_frame_age_ms", lane->send_freshness == nullptr ? Json(nullptr) : Json(lane->send_freshness->last_forwarded_age_ms.load())},
             {"failure_count", lane->failure_count.load()}, {"camera_faulted", lane->camera_faulted.load()},
             {"disabled", lane->disabled.load()}});
       }
@@ -2850,32 +2758,58 @@ struct VehicleMediaRuntime::Impl {
     bool ready = true;
     auto cause = ControlRecoveryCause::CriticalVideo;
     const Lane* failed_lane = nullptr;
+    std::vector<ReadinessSampleRevision> revisions;
+    for (const auto& lane : lanes) {
+      if (lane->camera.critical_for_control && lane->send_freshness)
+        revisions.push_back({"video:" + lane->camera.id,
+            lane->send_freshness->bad_sample_revision.load(), lane->send_freshness->brake_sample_revision.load()});
+    }
     for (const auto& lane : lanes) {
       if (!lane->camera.critical_for_control) continue;
-      if (lane->disabled.load() || lane->camera_faulted.load() || !camera_encoded_frame_fresh(
-              lane->last_encoded_steady_ms.load(), now_ms, stale_brake_ms) ||
-          (was_waiting && lane->encoded.load() < lane->video_wait_encoded_baseline.load() + 3)) {
+      if (lane->send_freshness) lane->send_freshness->max_age_ms = stale_brake_ms;
+      if (lane->disabled.load() || lane->camera_faulted.load() || !lane->send_freshness ||
+          lane->send_freshness->invalid_sample_blocked.load() ||
+          lane->send_freshness->consecutive_anomalies.load() >= 3 ||
+          !camera_encoded_frame_fresh(lane->send_freshness->last_fresh_frame_ms.load(), now_ms, stale_brake_ms) ||
+          (was_waiting && (lane->send_freshness->consecutive_anomalies.load() != 0 ||
+           lane->send_freshness->fresh_frames.load() < lane->video_wait_encoded_baseline.load() + 3))) {
         ready = false;
         failed_lane = lane.get();
         break;
       }
     }
+    bool receive_path_waiting = false;
     {
       std::lock_guard lock(control_mutex);
       if (control_service_started && control_service) {
+        receive_path_waiting = control_service->control_braking_wait();
+        revisions.push_back({"driver", control_service->recovery_bad_sample_revision(),
+            control_service->recovery_brake_revision()});
         ready = ready && control_service->driver_critical_video_ready();
+        if (was_waiting || receive_path_waiting)
+          ready = ready && control_service->recovery_samples_healthy() &&
+              control_service->control_timing(signaling.now_ms()).value("consecutive_late_frames", 0) == 0;
         if (!control_service->operator_input_ready()) { ready = false; cause = ControlRecoveryCause::InputLease; }
         if (!control_service->driver_control_link_ready()) { ready = false; cause = ControlRecoveryCause::ControlLink; }
         if (!control_service->driver_time_sync_ready()) { ready = false; cause = ControlRecoveryCause::TimeSynchronization; }
       }
     }
-    if (config.field_safety.require_time_sync && !signaling.time_sync_status().acceptable(config.field_safety.max_time_sync_uncertainty_ms)) {
+    const auto time_readiness = vehicle_time_readiness();
+    if (config.field_safety.require_time_sync)
+      revisions.push_back({"clock", time_readiness.bad_cohort_revision, time_readiness.brake_cohort_revision});
+    if (config.field_safety.require_time_sync &&
+        (!time_readiness.ready || ((was_waiting || receive_path_waiting) && !time_readiness.latest_candidate_healthy))) {
       ready = false; cause = ControlRecoveryCause::TimeSynchronization;
     }
+    if (receive_path_waiting && !was_waiting)
+      static_cast<void>(control_recovery_latch->observe_recovery(signaling.session_id(), false,
+          now_ms, recovery_timeout_ms, cause));
     // Startup still grants no authority while waiting for its first frames.
-    // Once braking starts, same-session retries never restart either deadline.
+    // A readiness wait retains the same session. Command and feedback absence
+    // remain governed by their independent watchdogs, not this stable window.
     if (startup_grace && !was_waiting && cause == ControlRecoveryCause::CriticalVideo) return;
-    const auto phase = control_recovery_latch->observe_recovery(signaling.session_id(), ready, now_ms, recovery_timeout_ms, cause);
+    const auto phase = control_recovery_latch->observe_readiness(
+        signaling.session_id(), ready, now_ms, recovery_timeout_ms, cause, revisions);
     apply_control_recovery_phase(phase, failed_lane, !was_waiting && phase == ControlRecoveryPhase::BrakingWait);
   }
 
@@ -3219,7 +3153,6 @@ struct VehicleMediaRuntime::Impl {
       const auto payloader = encoder.codec() == VideoCodec::H265 ? "rtph265pay" : "rtph264pay";
       const auto encoding_name = encoder.codec() == VideoCodec::H265 ? "H265" : "H264";
       const auto elementary_caps = encoder.codec() == VideoCodec::H265 ? "video/x-h265" : "video/x-h264";
-      const auto recording_stream_format = encoder.codec() == VideoCodec::H265 ? "hvc1" : "avc";
       VideoEncoderSettings settings{lane->profile.bitrate_kbps, std::max(1, lane->profile.fps)};
       pipeline_text
           << build_camera_input_pipeline("source_" + id, lane->input, lane->profile)
@@ -3235,19 +3168,9 @@ struct VehicleMediaRuntime::Impl {
                   : "")
           << " ! webrtc. ";
       if (!recording_root.empty() && !lane->camera.record_profile.empty()) {
-        const auto& record_profile = config.record_profile(lane->camera.record_profile);
-        const auto directory = recording_root / config.vehicle_id / signaling.session_id() / lane->camera.id;
-        std::filesystem::create_directories(directory);
-        const auto pattern = directory / (std::to_string(signaling.now_ms()) + "_" + lane->camera.id + "_%05d.mp4");
         pipeline_text
             << "encoded_" << id << ". ! "
-            << build_encoded_frame_queue("record_queue_" + id, std::max(2, lane->profile.fps * 2))
-            << "! " << parser << " config-interval=-1 "
-            << "! " << elementary_caps << ",stream-format=" << recording_stream_format << ",alignment=au "
-            << "! splitmuxsink name=recorder_" << id
-            << " muxer-factory=mp4mux async-finalize=true max-size-time="
-            << static_cast<std::int64_t>(record_profile.segment_seconds) * GST_SECOND
-            << " location=" << quote_pipeline(pattern.string()) << ' ';
+            << "appsink name=record_tap_" << id << " emit-signals=true max-buffers=1 drop=false sync=false async=false enable-last-sample=false ";
       }
       ++payload_type;
     }
@@ -3340,6 +3263,52 @@ struct VehicleMediaRuntime::Impl {
     return !stop_requested;
   }
 
+  Json recording_status_for(const Lane& lane) const {
+    const bool configured = !recording_root.empty() && !lane.camera.record_profile.empty();
+    if (configured && isolated_recording && lane.recording_index != std::numeric_limits<std::size_t>::max())
+      return isolated_recording->lane_status(lane.recording_index);
+    if (configured && lane.recording_index < recording_final_status.size()) return recording_final_status[lane.recording_index];
+    return {{"schema_version", 1}, {"configured_enabled", configured}, {"active", false},
+      {"state", configured ? "failed" : "disabled"}, {"incomplete", configured}, {"recording_attempt_id", recording_attempt_id},
+      {"issue_code", configured ? "recording_start_failed" : ""},
+      {"next_action", configured ? "Recording is incomplete; inspect recorder/storage. Live video continues." : "Recording is disabled."},
+      {"summary_persisted", false}, {"final_eos_received", false}, {"cleanup_pending", false}, {"status_revision", configured ? 1 : 0},
+      {"error", recording_setup_error}};
+  }
+
+  void prepare_recording(const EncoderCandidate& candidate) {
+    recording_final_status.clear(); recording_setup_error.clear();
+    if (recording_current_session != signaling.session_id()) {
+      recording_current_session = signaling.session_id(); recording_session_incomplete = false;
+    }
+    try {
+    RecordingSessionSettings settings;
+    settings.vehicle_id = config.vehicle_id; settings.session_id = signaling.session_id(); settings.root = recording_root;
+    settings.attempt_id = random_token(12); recording_attempt_id = settings.attempt_id;
+    settings.incomplete_before = recording_session_incomplete;
+    Json expected = Json::array();
+    for (const auto& lane : lanes) {
+      if (recording_root.empty() || lane->camera.record_profile.empty()) continue;
+      const auto& profile = config.record_profile(lane->camera.record_profile);
+      lane->recording_index = settings.lanes.size();
+      settings.lanes.push_back({lane->camera.id, to_string(candidate.codec), to_string(candidate.backend), lane->profile.fps, profile.segment_seconds});
+      expected.push_back(lane->camera.id);
+    }
+    if (settings.lanes.empty()) return;
+    emit_diagnostic("vehicle_recording_attempt_started", "recording_attempt_requested", "recording_start", "",
+      "Recording startup is independent of live video; completion requires recorder evidence.", true,
+      {{"recording_attempt_id", recording_attempt_id}, {"reported_at_utc_ms", signaling.now_ms()},
+       {"configured_enabled", true}, {"summary_persisted", false}, {"recording_expected_cameras", expected}});
+    isolated_recording = std::make_unique<IsolatedRecordingSession>(std::move(settings));
+    }
+    catch (const std::exception& error) {
+      recording_setup_error = error.what(); recording_session_incomplete = true;
+      emit_diagnostic("vehicle_recording_failed", "recording_start_failed", "recording_start", error.what(),
+        "Recording is incomplete. Inspect recorder resources; live video continues.", false,
+        {{"recording_attempt_id", recording_attempt_id}, {"reported_at_utc_ms", signaling.now_ms()}, {"active", false}, {"incomplete", true}, {"summary_persisted", false}});
+    }
+  }
+
   bool start_pipeline(const EncoderCandidate& candidate, int capture_interval_ms) {
     active_candidate = candidate;
     {
@@ -3367,6 +3336,7 @@ struct VehicleMediaRuntime::Impl {
           false);
       return false;
     }
+    prepare_recording(candidate);
     GError* parse_error = nullptr;
     const auto description = build_pipeline(*encoder_choice);
     pipeline = gst_parse_launch(description.c_str(), &parse_error);
@@ -3432,6 +3402,28 @@ struct VehicleMediaRuntime::Impl {
       lane->appsrc = gst_bin_get_by_name(GST_BIN(pipeline), ("source_" + id).c_str());
       lane->encoder = gst_bin_get_by_name(GST_BIN(pipeline), ("encoder_" + id).c_str());
       lane->send_queue = gst_bin_get_by_name(GST_BIN(pipeline), ("send_queue_" + id).c_str());
+      lane->record_tap = gst_bin_get_by_name(GST_BIN(pipeline), ("record_tap_" + id).c_str());
+      if (lane->record_tap != nullptr) {
+        g_signal_connect(lane->record_tap, "new-sample", G_CALLBACK(+[](GstAppSink* sink, gpointer data) -> GstFlowReturn {
+          auto& lane = *static_cast<Lane*>(data);
+          auto* sample = gst_app_sink_pull_sample(sink);
+          if (sample != nullptr) {
+            if (lane.owner->isolated_recording) {
+              const auto* segment = gst_sample_get_segment(sample);
+              if (segment) lane.owner->isolated_recording->admit(lane.recording_index, gst_sample_get_buffer(sample), *segment);
+              else lane.owner->isolated_recording->reject_admission(lane.recording_index, false);
+            }
+            gst_sample_unref(sample);
+          }
+          // Even failed recording keeps consuming this tap. Never propagate a
+          // disk/worker admission error back into the shared encoded tee.
+          return GST_FLOW_OK;
+        }), lane.get());
+        g_signal_connect(lane->record_tap, "eos", G_CALLBACK(+[](GstAppSink*, gpointer data) {
+          auto& lane = *static_cast<Lane*>(data);
+          if (lane.owner->isolated_recording) lane.owner->isolated_recording->end_lane(lane.recording_index);
+        }), lane.get());
+      }
       auto* payloader = gst_bin_get_by_name(GST_BIN(pipeline), ("pay_" + id).c_str());
       auto* rtp_src_pad = payloader == nullptr ? nullptr : gst_element_get_static_pad(payloader, "src");
       if (payloader != nullptr) gst_object_unref(payloader);
@@ -3453,6 +3445,21 @@ struct VehicleMediaRuntime::Impl {
       g_signal_connect(lane->send_queue, "overrun", G_CALLBACK(+[](GstElement*, gpointer data) {
         ++static_cast<Lane*>(data)->encoded_queue_backpressure;
       }), lane.get());
+      lane->send_freshness = std::make_unique<detail::EncodedSendFreshness>(
+          candidate.codec == VideoCodec::H265 ? detail::AccessUnitCodec::H265 : detail::AccessUnitCodec::H264,
+          static_cast<std::uint64_t>(config.runtime.critical_camera_stale_brake_ms));
+      auto* send_src = gst_element_get_static_pad(lane->send_queue, "src");
+      detail::attach_encoded_send_freshness(send_src, *lane->send_freshness);
+      gst_object_unref(send_src);
+      auto* encoder_sink = gst_element_get_static_pad(lane->encoder, "sink");
+      if (encoder_sink != nullptr) {
+        gst_pad_add_probe(encoder_sink, GST_PAD_PROBE_TYPE_BUFFER,
+            +[](GstPad*, GstPadProbeInfo*, gpointer data) -> GstPadProbeReturn {
+              ++static_cast<Lane*>(data)->raw_to_encoder;
+              return GST_PAD_PROBE_OK;
+            }, lane.get(), nullptr);
+        gst_object_unref(encoder_sink);
+      }
       GstPad* encoder_src = gst_element_get_static_pad(lane->encoder, "src");
       if (encoder_src != nullptr) {
         gst_pad_add_probe(encoder_src, static_cast<GstPadProbeType>(
@@ -3484,6 +3491,7 @@ struct VehicleMediaRuntime::Impl {
     for (const auto& lane : lanes) {
       lane->pipeline_started_ms = started_ms;
       lane->pipeline_started_steady_ms = steady_now_ms();
+      lane->send_freshness->origin_steady_ms = lane->pipeline_started_steady_ms;
       lane->thread = std::thread([this, lane = lane.get(), capture_interval_ms] {
         std::uint64_t sequence = 0;
         bool recovery_pending = false;
@@ -3535,9 +3543,10 @@ struct VehicleMediaRuntime::Impl {
                    {"source_sequence", frame.source_sequence},
                    {"source_sequence_gap", frame.source_sequence_gap}});
             }
-            frame.captured_at_ms = signaling.from_local_system_ms(frame.captured_at_ms);
+            frame.captured_at_ms = signaling.from_steady_time(frame.captured_steady_at);
             ++lane->captured;
-            const auto captured_steady_ms = steady_now_ms();
+            const auto captured_steady_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                frame.captured_steady_at.time_since_epoch()).count();
             const auto previous_capture_ms = lane->last_capture_steady_ms.exchange(captured_steady_ms);
             const auto capture_gap_ms = previous_capture_ms == 0 ? 0 : captured_steady_ms - previous_capture_ms;
             auto observed_gap = lane->capture_interval_max_ms.load();
@@ -3553,9 +3562,11 @@ struct VehicleMediaRuntime::Impl {
               previous_capture_sample_ms = captured_steady_ms;
               previous_capture_sample_frames = sampled_frames;
               emit_diagnostic("vehicle_camera_capture_sample", "camera_capture_sample", "camera_capture",
-                  "", "V4L2 metadata does not verify pixel integrity; correlate a raw frame and board/kernel diagnostics.", true,
+                  "", "Compare observed delivery FPS with the capture request. Nominal settings do not verify sensor cadence; report device limitations and validate the raw drop-only fallback when delivery is faster.", true,
                   {{"camera_id", lane->camera.id}, {"device", lane->camera.device},
-                   {"captured_frames", lane->captured.load()}, {"encoded_frames", lane->encoded.load()},
+                   {"captured_frames", lane->captured.load()},
+                   {"raw_to_encoder_frames", lane->raw_to_encoder.load()}, {"encoded_frames", lane->encoded.load()},
+                   {"fresh_send_frames", lane->send_freshness->fresh_frames.load()},
                    {"requested_capture_fps", lane->input.fps}, {"target_encode_fps", lane->profile.fps},
                    {"capture_fps_observed", observed_fps}, {"capture_fps_sample_duration_ms", sample_duration_ms},
                    {"capture_interval_ms", capture_gap_ms}, {"capture_interval_max_ms", lane->capture_interval_max_ms.load()},
@@ -3611,10 +3622,16 @@ struct VehicleMediaRuntime::Impl {
                    {"source_timeperframe_denominator", frame.source_timeperframe_denominator},
                    {"sequence", sequence}});
             }
+            const auto elapsed_ms = captured_steady_ms - lane->pipeline_started_steady_ms;
+            if (elapsed_ms < 0) {
+              // A driver buffer can predate pipeline admission. Discard this
+              // independent raw/JPEG frame instead of relabelling it as new.
+              ++lane->dropped;
+              continue;
+            }
             GstBuffer* buffer = gst_buffer_new_allocate(nullptr, frame.payload.size(), nullptr);
             if (buffer == nullptr) throw std::runtime_error("cannot allocate GStreamer camera buffer");
             gst_buffer_fill(buffer, 0, frame.payload.data(), frame.payload.size());
-            const auto elapsed_ms = std::max<std::int64_t>(0, frame.captured_at_ms - started_ms);
             GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(elapsed_ms) * GST_MSECOND;
             GST_BUFFER_DTS(buffer) = GST_CLOCK_TIME_NONE;
             GST_BUFFER_DURATION(buffer) = GST_SECOND / static_cast<GstClockTime>(std::max(1, lane->input.fps));
@@ -3777,10 +3794,14 @@ struct VehicleMediaRuntime::Impl {
       if (lane->thread.joinable()) lane->thread.join();
       lane->source.reset();
     }
+    if (isolated_recording && (pipeline == nullptr || std::any_of(lanes.begin(), lanes.end(), [](const auto& lane) {
+          return lane->recording_index != std::numeric_limits<std::size_t>::max() && lane->record_tap == nullptr;
+        }))) isolated_recording->abort("recording_parent_eos_missing");
     if (pipeline != nullptr) {
       for (const auto& lane : lanes) {
         if (lane->appsrc != nullptr) gst_app_src_end_of_stream(GST_APP_SRC(lane->appsrc));
       }
+      if (isolated_recording) isolated_recording->request_stop();
       GstBus* bus = gst_element_get_bus(pipeline);
       if (bus != nullptr) {
         GstMessage* message = gst_bus_timed_pop_filtered(
@@ -3803,6 +3824,10 @@ struct VehicleMediaRuntime::Impl {
         gst_object_unref(lane->send_queue);
         lane->send_queue = nullptr;
       }
+      if (lane->record_tap != nullptr) {
+        g_signal_handlers_disconnect_by_data(lane->record_tap, lane.get());
+        gst_object_unref(lane->record_tap); lane->record_tap = nullptr;
+      }
     }
     if (webrtc != nullptr) {
       gst_object_unref(webrtc);
@@ -3812,52 +3837,18 @@ struct VehicleMediaRuntime::Impl {
       gst_object_unref(pipeline);
       pipeline = nullptr;
     }
-    try {
-      write_recording_sidecars();
-    } catch (const std::exception& error) {
-      emit_diagnostic(
-          "vehicle_recording_sidecar_failed",
-          "recording_sidecar_write_failed",
-          "recording_finalize",
-          error.what(),
-          "Check recording directory permissions, free space, and filesystem health.",
-          true);
-      throw;
-    }
-  }
-
-  void write_recording_sidecars() const {
-    const auto session_root = recording_root / config.vehicle_id / signaling.session_id();
-    if (recording_root.empty() || !std::filesystem::exists(session_root)) return;
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(session_root)) {
-      if (!entry.is_regular_file() || entry.path().extension() != ".mp4") continue;
-      auto metadata_path = entry.path();
-      metadata_path.replace_extension(".json");
-      if (std::filesystem::exists(metadata_path)) continue;
-      const auto camera_id = entry.path().parent_path().filename().string();
-      const auto segment_id = entry.path().stem().string();
-      const auto timestamp = signaling.now_ms();
-      const Json metadata = {
-          {"vehicle_id", config.vehicle_id},
-          {"session_id", signaling.session_id()},
-          {"camera_id", camera_id},
-          {"segment_id", segment_id},
-          {"started_at", iso_time(timestamp)},
-          {"ended_at", iso_time(timestamp)},
-          {"codec", to_string(active_candidate.codec)},
-          {"encoder", to_string(active_candidate.backend)},
-          {"upload_state", "pending"},
-          {"video_file", entry.path().filename().string()},
-          {"file_size_bytes", entry.file_size()},
-          {"video_sha256", sha256_file(entry.path())},
-      };
-      const auto temporary = metadata_path.string() + ".tmp";
-      {
-        std::ofstream output(temporary, std::ios::trunc);
-        if (!output) throw std::runtime_error("cannot write recording sidecar: " + metadata_path.string());
-        output << std::setw(2) << metadata << '\n';
+    if (isolated_recording) {
+      isolated_recording->finish();
+      for (const auto& lane : lanes) {
+        if (lane->recording_index == std::numeric_limits<std::size_t>::max()) continue;
+        const auto status = isolated_recording->lane_status(lane->recording_index);
+        if (status.value("incomplete", true) || status.value("state", "") != "finalized") recording_session_incomplete = true;
+        recording_final_status.push_back(status);
       }
-      std::filesystem::rename(temporary, metadata_path);
+      emit_diagnostic("vehicle_recording_attempt_finished", recording_session_incomplete ? "recording_incomplete" : "recording_attempt_finalized", "recording_finalize", "",
+        recording_session_incomplete ? "Recording is incomplete; preserve completed clips and inspect storage." : "This recording attempt finalized; earlier session coverage is not implied.", true,
+        {{"recording_attempt_id", recording_attempt_id}, {"reported_at_utc_ms", signaling.now_ms()}, {"incomplete", recording_session_incomplete}, {"recording", isolated_recording->session_status()}});
+      isolated_recording.reset();
     }
   }
 
@@ -4037,6 +4028,7 @@ struct VehicleMediaRuntime::Impl {
           {"lane_state", lane->disabled.load() ? "disabled" : (error.empty() ? "active" : "recovering")},
           {"captured_frames", lane->captured.load()},
           {"pushed_frames", lane->pushed.load()},
+          {"raw_to_encoder_frames", lane->raw_to_encoder.load()},
           {"encoded_frames", lane->encoded.load()},
           {"dropped_frames", lane->dropped.load()},
           {"pipeline_backlog_or_drop_frames", lane->pushed.load() > lane->encoded.load() ? lane->pushed.load() - lane->encoded.load() : 0},
@@ -4044,6 +4036,19 @@ struct VehicleMediaRuntime::Impl {
           {"appsrc_queue_limit_buffers", kCameraAppSrcMaxBuffers},
           {"encoded_queued_buffers", encoded_queued_buffers},
           {"encoded_queue_backpressure_count", lane->encoded_queue_backpressure.load()},
+          {"send_freshness_scope", "capture_pts_to_send_queue_source_monotonic_not_network_delivery"},
+          {"fresh_send_frames", lane->send_freshness == nullptr ? 0 : lane->send_freshness->fresh_frames.load()},
+          {"send_waiting_idr", lane->send_freshness != nullptr && lane->send_freshness->blocked.load()},
+          {"send_consecutive_anomalies", lane->send_freshness == nullptr ? 0 : lane->send_freshness->consecutive_anomalies.load()},
+          {"send_invalid_sample_blocked", lane->send_freshness != nullptr && lane->send_freshness->invalid_sample_blocked.load()},
+          {"send_last_sample_id_ns", lane->send_freshness == nullptr || !GST_CLOCK_TIME_IS_VALID(lane->send_freshness->last_sample_id_ns.load())
+              ? Json(nullptr) : Json(lane->send_freshness->last_sample_id_ns.load())},
+          {"send_stale_access_units_dropped", lane->send_freshness == nullptr ? 0 : lane->send_freshness->dropped_stale.load()},
+          {"send_invalid_access_units_dropped", lane->send_freshness == nullptr ? 0 : lane->send_freshness->dropped_invalid.load()},
+          {"send_dependent_access_units_dropped", lane->send_freshness == nullptr ? 0 : lane->send_freshness->dropped_waiting_idr.load()},
+          {"send_key_unit_requests", lane->send_freshness == nullptr ? 0 : lane->send_freshness->key_unit_requests.load()},
+          {"send_key_unit_request_failures", lane->send_freshness == nullptr ? 0 : lane->send_freshness->key_unit_request_failures.load()},
+          {"last_forwarded_frame_age_ms", lane->send_freshness == nullptr ? Json(nullptr) : Json(lane->send_freshness->last_forwarded_age_ms.load())},
           {"failure_count", lane->failure_count.load()},
           {"reopen_count", lane->reopen_count.load()},
           {"encoded_fps", lane->encoded.load() * 1000.0 / static_cast<double>(std::max<std::int64_t>(1, elapsed_ms))},
@@ -4270,6 +4275,8 @@ struct VehicleMediaRuntime::Impl {
         // Dedicated time sampling keeps media and control transport progressing.
         if (signaling.now_ms() >= next_media_status_ms) {
           const Json status = {
+              {"vehicle_id", config.vehicle_id}, {"session_id", signaling.session_id()}, {"reported_at_utc_ms", signaling.now_ms()},
+              {"recording_attempt_id", recording_attempt_id},
               {"codec", to_string(candidate.codec)},
               {"backend", to_string(candidate.backend)},
               {"control_issue_code", control_inhibited.load() ? std::string(recovery_inhibition_issue()) : control_recovery_latch->braking_wait_for(signaling.session_id()) ? "control_recovery_braking_wait" : ""},
@@ -4352,6 +4359,10 @@ struct VehicleMediaRuntime::Impl {
           {"error", error},
       });
       stop_pipeline();
+      for (auto& row : final_lanes) {
+        for (const auto& lane : lanes) if (row.value("camera_id", "") == lane->camera.id) row["recording"] = recording_status_for(*lane);
+      }
+      attempts.back()["lanes"] = final_lanes;
       if (passed) {
         successful = candidate;
         break;
@@ -4517,8 +4528,13 @@ struct VehicleMediaRuntime::Impl {
   VehicleConfig config;
   MediaSignalingClient signaling;
   std::shared_ptr<SessionControlRecoveryLatch> control_recovery_latch;
+  mutable TimeSyncReadinessGate vehicle_time_sync_readiness_gate;
   int frame_timeout_ms;
   std::filesystem::path recording_root;
+  std::unique_ptr<IsolatedRecordingSession> isolated_recording;
+  std::vector<Json> recording_final_status;
+  std::string recording_attempt_id, recording_current_session, recording_setup_error;
+  bool recording_session_incomplete{false};
   std::optional<std::string> forced_codec;
   int simulate_primary_failure_after_frames;
   GstElement* pipeline{nullptr};

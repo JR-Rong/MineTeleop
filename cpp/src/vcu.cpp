@@ -419,11 +419,7 @@ bool ParallelController::request_parallel_handshake() {
 void ParallelController::request_disarm() {
   if (state_ == State::Standby || state_ == State::Disarmed) return;
   emergency_stop_ = true;
-  if (state_ == State::Initial) {
-    enter(State::Disarmed);
-    return;
-  }
-  if (state_ == State::WaitParallelHandshake) {
+  if (state_ == State::Initial || state_ == State::WaitParallelHandshake) {
     enter(State::DisarmManual);
     return;
   }
@@ -595,11 +591,10 @@ void ParallelController::enter(State state) {
 bool ParallelController::begin_arming_emergency_disarm() {
   switch (state_) {
     case State::Initial:
-      enter(State::Disarmed);
-      return true;
     case State::WaitParallelHandshake:
       // The parking brake is still applied here. Withdraw ShakeReq and require
-      // a fresh manual-handshake confirmation before another arming attempt.
+      // fresh manual/N/zero-speed/parking feedback before declaring exit complete,
+      // including an exit during the initial low-handshake interval.
       enter(State::DisarmManual);
       return true;
     case State::WaitParkingBrakeReleased:

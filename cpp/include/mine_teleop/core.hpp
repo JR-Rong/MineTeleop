@@ -82,6 +82,12 @@ struct ControlCommand {
   bool control_time_sync_ready{true};
   bool operator_input_ready{true};
   bool control_link_ready{true};
+  // Raw current sample health, distinct from a tolerated (<3) anomaly gate.
+  // Required on ordinary V8 transport so a shared recovery window cannot be
+  // renewed by repetitions of a failed candidate or a tolerated bad ACK.
+  bool recovery_sample_healthy{true};
+  std::uint64_t recovery_bad_sample_revision{0};
+  std::uint64_t recovery_brake_revision{0};
 
   void validate() const;
   [[nodiscard]] Json to_json() const;
@@ -97,6 +103,11 @@ struct NativeControlIntent {
   double brake{0.0};
   bool estop{false};
   bool critical_video_ready{true};
+  // Raw observation remains separate from the tolerated control-ready gate.
+  // Unknown observations cannot complete a recovery health window.
+  bool critical_video_sample_healthy{false};
+  std::uint64_t critical_video_bad_sample_revision{0};
+  std::uint64_t critical_video_brake_revision{0};
 
   void validate() const;
   [[nodiscard]] bool is_neutral() const;
@@ -109,6 +120,12 @@ struct NativeControlIntentUpdate {
   bool requires_fresh_input{true};
   std::string reason;
   bool preserve_brake_during_rearm{false};
+  std::uint64_t ui_control_epoch{0};
+  std::uint64_t accepted_sample_id{0};
+  std::uint64_t accepted_refresh_sample_id{0};
+  std::uint64_t refresh_sample_id{0};
+  unsigned int consecutive_refresh_anomalies{0};
+  bool refresh_sample_healthy{false};
 };
 
 struct NativeControlIntentSample {
@@ -117,6 +134,15 @@ struct NativeControlIntentSample {
   bool requires_fresh_input{true};
   NativeControlIntent intent;
   std::int64_t age_ms{0};
+  std::uint64_t ui_control_epoch{0};
+  std::uint64_t accepted_sample_id{0};
+  std::uint64_t accepted_refresh_sample_id{0};
+  std::string owner_ui_instance_id;
+  std::uint64_t refresh_sample_id{0};
+  unsigned int consecutive_refresh_anomalies{0};
+  bool refresh_sample_healthy{false};
+  std::uint64_t refresh_bad_sample_revision{0};
+  std::uint64_t refresh_brake_revision{0};
 };
 
 // Holds only the latest browser input intent. The native sender samples this
@@ -129,12 +155,18 @@ class NativeControlIntentStore {
 
   NativeControlIntentUpdate update(
       NativeControlIntent intent,
-      std::int64_t received_at_monotonic_ms);
+      std::int64_t received_at_monotonic_ms,
+      std::optional<std::uint64_t> expected_ui_control_epoch = std::nullopt,
+      bool takeover = false,
+      std::optional<std::int64_t> applied_at_monotonic_ms = std::nullopt);
+  // Start safe native heartbeats without assigning ownership to a browser.
+  void begin_session(std::int64_t received_at_monotonic_ms);
   [[nodiscard]] NativeControlIntentSample sample(std::int64_t now_monotonic_ms);
   void invalidate(bool preserve_brake = false);
   void reset();
 
   [[nodiscard]] int lease_ms() const { return lease_ms_; }
+  [[nodiscard]] std::pair<std::string, std::uint64_t> ownership_scope() const;
 
  private:
   int lease_ms_;
@@ -144,6 +176,19 @@ class NativeControlIntentStore {
   bool requires_fresh_input_{true};
   bool preserve_brake_during_rearm_{false};
   bool estop_latched_{false};
+  // One owner and a monotonic epoch replace an unbounded retired-page set.
+  std::string owner_ui_instance_id_;
+  std::uint64_t ui_control_epoch_{0};
+  std::uint64_t accepted_sample_id_{0};
+  std::uint64_t accepted_refresh_sample_id_{0};
+  std::optional<std::int64_t> last_refresh_received_at_monotonic_ms_;
+  std::optional<NativeControlIntent> last_observed_owner_intent_;
+  std::optional<std::int64_t> last_observed_owner_received_at_monotonic_ms_;
+  std::uint64_t refresh_sample_id_{0};
+  unsigned int consecutive_refresh_anomalies_{0};
+  bool refresh_sample_healthy_{false};
+  std::uint64_t refresh_bad_sample_revision_{0};
+  std::uint64_t refresh_brake_revision_{0};
 };
 
 struct SessionControlProfile {
@@ -310,7 +355,7 @@ enum class SafetyState {
 };
 
 std::string_view to_string(SafetyState state);
-enum class ControlRecoveryCause { CriticalVideo, TimeSynchronization, InputLease, ControlLink };
+enum class ControlRecoveryCause { CriticalVideo, TimeSynchronization, InputLease, ControlLink, ReadinessHistory };
 std::string_view to_string(ControlRecoveryCause cause);
 
 struct DecelerationStage {
@@ -841,6 +886,9 @@ class VehicleControlService {
   [[nodiscard]] bool driver_critical_video_ready() const { return driver_critical_video_ready_; }
   [[nodiscard]] bool driver_time_sync_ready() const { return driver_time_sync_ready_; }
   [[nodiscard]] bool operator_input_ready() const { return operator_input_ready_; }
+  [[nodiscard]] bool recovery_samples_healthy() const { return recovery_samples_healthy_; }
+  [[nodiscard]] std::uint64_t recovery_bad_sample_revision() const { return recovery_bad_sample_revision_; }
+  [[nodiscard]] std::uint64_t recovery_brake_revision() const { return recovery_brake_revision_; }
   [[nodiscard]] bool driver_control_link_ready() const { return driver_control_link_ready_; }
   [[nodiscard]] std::pair<int, int> recovery_timing() const;
   [[nodiscard]] const std::deque<Json>& telemetry_history() const { return telemetry_history_; }
@@ -902,6 +950,9 @@ class VehicleControlService {
   bool driver_time_sync_ready_{true};
   bool operator_input_ready_{true};
   bool driver_control_link_ready_{true};
+  bool recovery_samples_healthy_{true};
+  std::uint64_t recovery_bad_sample_revision_{0};
+  std::uint64_t recovery_brake_revision_{0};
   bool started_{false};
 };
 

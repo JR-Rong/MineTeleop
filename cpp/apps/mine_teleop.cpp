@@ -880,7 +880,8 @@ int run_vehicle_online(const Arguments& arguments) {
       signaling + "/vehicles/online",
       {{"vehicle_id", vehicle_id},
        {"device_token", device_token},
-       {"connection_id", "vehicle-online-cli-" + mine_teleop::random_token(12)}});
+       {"connection_id", "vehicle-online-cli-" + mine_teleop::random_token(12)},
+       {"native_control_capabilities", mine_teleop::kNativeControlCapabilities}});
   std::cout << Json({{"event", "vehicle_online_cli"}, {"passed", true}, {"response", response}}).dump() << '\n';
   return 0;
 }
@@ -898,9 +899,11 @@ int run_control_smoke(const Arguments& arguments) {
       signaling + "/vehicles/online",
       {{"vehicle_id", vehicle_id},
        {"device_token", device_token},
-       {"connection_id", "control-smoke-" + mine_teleop::random_token(12)}});
+       {"connection_id", "control-smoke-" + mine_teleop::random_token(12)},
+       {"native_control_capabilities", mine_teleop::kNativeControlCapabilities}});
   const auto connection_generation = online.at("connection_generation").get<std::uint64_t>();
-  const auto connection = http.post_json_response(console + "/api/connect", Json::object());
+  const auto connection = http.post_json_response(
+      console + "/api/connect", {{"vehicle_id", vehicle_id}, {"ui_instance_id", "control-smoke"}});
   const auto session = http.get_json(
       signaling + "/vehicles/" + http.url_encode(vehicle_id) + "/session?connection_generation=" +
           std::to_string(connection_generation),
@@ -908,11 +911,18 @@ int run_control_smoke(const Arguments& arguments) {
   const auto session_id = connection.at("session_id").get<std::string>();
   const auto control_session_generation =
       connection.at("control_session_generation").get<std::uint64_t>();
+  // This control-plane smoke is a synthetic producer. Its fixed healthy video
+  // metadata exercises the wire contract; it does not observe a camera frame.
   const auto neutral = http.post_json_response(
       console + "/api/control-intent",
       {{"session_id", session_id},
        {"session_generation", control_session_generation},
        {"ui_instance_id", "control-smoke"},
+       {"ui_control_epoch", 0},
+       {"takeover", true},
+       {"critical_video_sample_healthy", true},
+       {"critical_video_bad_sample_revision", 0},
+       {"critical_video_brake_revision", 0},
        {"intent_seq", 1},
        {"gear", "N"},
        {"steering", 0.0},
@@ -924,6 +934,11 @@ int run_control_smoke(const Arguments& arguments) {
       {{"session_id", session_id},
        {"session_generation", control_session_generation},
        {"ui_instance_id", "control-smoke"},
+       {"ui_control_epoch", neutral.at("ui_control_epoch")},
+       {"takeover", false},
+       {"critical_video_sample_healthy", true},
+       {"critical_video_bad_sample_revision", 0},
+       {"critical_video_brake_revision", 0},
        {"intent_seq", 2},
        {"gear", "D"},
        {"steering", 0.125},
@@ -966,11 +981,16 @@ int run_control_smoke(const Arguments& arguments) {
                       delivered_command.value("intent_fresh", false) &&
                       command.vehicle_id == vehicle_id && command.session_id == session.value("session_id", "") &&
                       command.control_token == session.value("control_token", "") &&
+                      command.gear == "D" && command.steering == 0.125 && command.throttle == 0.25 &&
+                      !command.estop && command.operator_active && command.control_time_sync_ready &&
+                      command.operator_input_ready && command.critical_video_ready && command.control_link_ready &&
                       capabilities.value("queued", 0) == 1 && console_status.value("connected", false);
   std::cout << Json({
                    {"event", "native_control_plane_smoke"},
                    {"runtime", "cpp"},
                    {"passed", passed},
+                   {"input_source", "synthetic_control_plane_smoke"},
+                   {"video_observation_performed", false},
                    {"session_id", session.value("session_id", "")},
                    {"control_transport", control.value("transport", "")},
                    {"control_intent_accepted", control.value("accepted", false)},

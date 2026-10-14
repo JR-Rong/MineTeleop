@@ -1038,6 +1038,9 @@ Json ControlCommand::to_json() const {
   value["control_time_sync_ready"] = control_time_sync_ready;
   value["operator_input_ready"] = operator_input_ready;
   value["control_link_ready"] = control_link_ready;
+  value["recovery_sample_healthy"] = recovery_sample_healthy;
+  value["recovery_bad_sample_revision"] = recovery_bad_sample_revision;
+  value["recovery_brake_revision"] = recovery_brake_revision;
   value["control_token"] = control_token;
   return value;
 }
@@ -1069,6 +1072,17 @@ ControlCommand ControlCommand::from_json(const Json& value) {
     // An authenticated ESTOP never depends on a newer producer schema.
     command.control_time_sync_ready = command.estop || value.at("control_time_sync_ready").get<bool>();
     command.operator_input_ready = command.estop || value.at("operator_input_ready").get<bool>();
+    command.recovery_sample_healthy = command.estop || value.at("recovery_sample_healthy").get<bool>();
+    if (!command.estop) {
+      for (const auto* field : {"recovery_bad_sample_revision", "recovery_brake_revision"}) {
+        const auto& revision = value.at(field);
+        if (!revision.is_number_unsigned() &&
+            !(revision.is_number_integer() && revision.get<std::int64_t>() >= 0))
+          throw std::invalid_argument(std::string(field) + " must be a non-negative integer");
+      }
+      command.recovery_bad_sample_revision = value.at("recovery_bad_sample_revision").get<std::uint64_t>();
+      command.recovery_brake_revision = value.at("recovery_brake_revision").get<std::uint64_t>();
+    }
     // Optional diagnostic cause, with safety mirrored in the mandatory input
     // readiness bit. A V7 relay that strips it still causes independent braking.
     command.control_link_ready = command.estop || value.value("control_link_ready", true);
@@ -1108,25 +1122,61 @@ NativeControlIntentStore::NativeControlIntentStore(int lease_ms)
   }
 }
 
+std::pair<std::string, std::uint64_t> NativeControlIntentStore::ownership_scope() const {
+  std::lock_guard lock(mutex_);
+  return {owner_ui_instance_id_, ui_control_epoch_};
+}
+
 NativeControlIntentUpdate NativeControlIntentStore::update(
     NativeControlIntent intent,
-    std::int64_t received_at_monotonic_ms) {
+    std::int64_t received_at_monotonic_ms,
+    std::optional<std::uint64_t> expected_ui_control_epoch,
+    bool takeover,
+    std::optional<std::int64_t> applied_at_monotonic_ms) {
   intent.validate();
   if (received_at_monotonic_ms < 0) {
     throw std::invalid_argument("intent receive time must be non-negative");
   }
+  const auto applied_at = applied_at_monotonic_ms.value_or(received_at_monotonic_ms);
+  if (applied_at < received_at_monotonic_ms) throw std::invalid_argument("intent apply time predates receive time");
   std::lock_guard lock(mutex_);
-  if (latest_ && received_at_monotonic_ms - received_at_monotonic_ms_ >= lease_ms_ &&
-      !latest_->is_neutral() && !latest_->estop) {
-    // Expiry is also checked at ingress: a delayed refresh must not revive
-    // held motion simply because the periodic sender has not sampled yet.
-    requires_fresh_input_ = true;
-    preserve_brake_during_rearm_ = false;
-  }
   const bool incoming_estop = intent.estop;
   const bool incoming_neutral = intent.is_neutral();
   const bool incoming_brake_only = !intent.estop && intent.throttle <= 1e-9 &&
       std::abs(intent.steering) <= 1e-9;
+  const auto rejected = [&](std::string reason, bool duplicate = false) {
+    return NativeControlIntentUpdate{false, duplicate, requires_fresh_input_,
+        std::move(reason), preserve_brake_during_rearm_, ui_control_epoch_,
+        accepted_sample_id_, accepted_refresh_sample_id_, refresh_sample_id_,
+        consecutive_refresh_anomalies_, refresh_sample_healthy_};
+  };
+  const bool changing_owner = !incoming_estop && owner_ui_instance_id_ != intent.ui_instance_id;
+  const bool same_ui = latest_ && latest_->ui_instance_id == intent.ui_instance_id;
+  if (!incoming_estop) {
+    // HTTP acceptance order can differ from socket ingress order across pages.
+    // A late neutral from any page must not rewind the current input lease.
+    if ((latest_ && received_at_monotonic_ms < received_at_monotonic_ms_) ||
+        (last_observed_owner_received_at_monotonic_ms_ &&
+            received_at_monotonic_ms < *last_observed_owner_received_at_monotonic_ms_)) {
+      return rejected("old_intent_arrival");
+    }
+    if (changing_owner && !owner_ui_instance_id_.empty()) {
+      if (!takeover) return rejected("input_page_not_current");
+      if (!expected_ui_control_epoch || *expected_ui_control_epoch != ui_control_epoch_) {
+        return rejected("input_page_takeover_conflict");
+      }
+    } else if (expected_ui_control_epoch && *expected_ui_control_epoch != ui_control_epoch_) {
+      // A lost handshake response may be retried, but only a neutral
+      // handshake from the current owner can use its preceding epoch.
+      const bool handshake_retry = takeover && incoming_neutral && same_ui &&
+          ui_control_epoch_ > 0 && *expected_ui_control_epoch == ui_control_epoch_ - 1;
+      if (!handshake_retry) return rejected("input_page_epoch_mismatch");
+    }
+    if (changing_owner && !incoming_neutral) return rejected("fresh_neutral_required");
+    if (changing_owner && ui_control_epoch_ == std::numeric_limits<std::uint64_t>::max()) {
+      return rejected("input_page_epoch_exhausted");
+    }
+  }
   // ESTOP is session-sticky. Normalize the incoming value before replay and
   // fingerprint checks so a producer which refreshes the same sequence with
   // estop=false cannot create a false conflict after the latch has already
@@ -1138,40 +1188,115 @@ NativeControlIntentUpdate NativeControlIntentStore::update(
     intent.throttle = 0.0;
     intent.brake = 0.0;
   }
-  const bool same_ui = latest_ && latest_->ui_instance_id == intent.ui_instance_id;
-  if (same_ui && !incoming_estop && received_at_monotonic_ms < received_at_monotonic_ms_) {
-    return {false, false, requires_fresh_input_, "old_intent_arrival"};
+  auto prior = same_ui ? latest_ : std::optional<NativeControlIntent>{};
+  if (owner_ui_instance_id_ == intent.ui_instance_id && last_observed_owner_intent_ &&
+      (!prior || last_observed_owner_intent_->intent_seq >= prior->intent_seq)) {
+    prior = last_observed_owner_intent_;
   }
-  if (latest_ && !same_ui) {
+  if (prior && estop_latched_) {
+    prior->estop = true;
+    prior->steering = prior->throttle = prior->brake = 0.0;
+  }
+  if (prior && intent.intent_seq < prior->intent_seq) {
+    return rejected("old_intent_seq");
+  }
+  if (prior && intent.intent_seq == prior->intent_seq && intent != *prior) {
+    return rejected("intent_seq_conflict");
+  }
+  if (latest_ && applied_at - received_at_monotonic_ms_ >= lease_ms_ &&
+      !latest_->is_neutral() && !latest_->estop) {
+    // Expiry is also checked at ingress: a delayed refresh must not revive
+    // held motion simply because the periodic sender has not sampled yet.
     requires_fresh_input_ = true;
     preserve_brake_during_rearm_ = false;
   }
-  if (same_ui && intent.intent_seq < latest_->intent_seq) {
-    return {false, false, requires_fresh_input_, "old_intent_seq"};
+  const bool new_refresh_sample = !incoming_estop &&
+      (!last_refresh_received_at_monotonic_ms_ ||
+          received_at_monotonic_ms > *last_refresh_received_at_monotonic_ms_);
+  if (!incoming_estop && !changing_owner) {
+    // Even a legitimate refresh blocked by expiry/re-arm establishes arrival
+    // and sequence fences; older data cannot later masquerade as recovery.
+    last_observed_owner_intent_ = intent;
+    last_observed_owner_received_at_monotonic_ms_ = received_at_monotonic_ms;
   }
-  if (same_ui && intent.intent_seq == latest_->intent_seq && intent != *latest_) {
-    return {false, false, requires_fresh_input_, "intent_seq_conflict"};
+  if (!incoming_estop && applied_at - received_at_monotonic_ms >= lease_ms_) {
+    if (new_refresh_sample) {
+      last_refresh_received_at_monotonic_ms_ = received_at_monotonic_ms;
+      ++refresh_sample_id_;
+      refresh_sample_healthy_ = false;
+      ++refresh_bad_sample_revision_;
+      if (consecutive_refresh_anomalies_ == 2) ++refresh_brake_revision_;
+      consecutive_refresh_anomalies_ = std::min(3U, consecutive_refresh_anomalies_ + 1U);
+      if (consecutive_refresh_anomalies_ >= 3) {
+        requires_fresh_input_ = true;
+        preserve_brake_during_rearm_ = false;
+      }
+    }
+    return rejected("local_input_request_expired");
   }
   // A sticky ESTOP must not make an originally non-neutral command from a
   // replacement UI look safe enough to bypass the fresh-neutral interlock.
   // A newly requested ESTOP remains allowed to preempt that interlock.
   if (requires_fresh_input_ && !incoming_neutral && !incoming_estop &&
       !(preserve_brake_during_rearm_ && incoming_brake_only)) {
-    return {false, same_ui && intent.intent_seq == latest_->intent_seq, true,
-            "fresh_neutral_required", preserve_brake_during_rearm_};
+    return rejected("fresh_neutral_required", same_ui && intent.intent_seq == latest_->intent_seq);
   }
 
   const bool duplicate = same_ui && intent.intent_seq == latest_->intent_seq;
+  if (changing_owner) {
+    owner_ui_instance_id_ = intent.ui_instance_id;
+    ++ui_control_epoch_;
+    requires_fresh_input_ = true;
+    preserve_brake_during_rearm_ = false;
+    last_observed_owner_intent_ = intent;
+    last_observed_owner_received_at_monotonic_ms_ = received_at_monotonic_ms;
+  }
   if (requires_fresh_input_ && incoming_neutral) {
     requires_fresh_input_ = false;
     preserve_brake_during_rearm_ = false;
   }
   if (intent.estop) estop_latched_ = true;
-  latest_ = std::move(intent);
+  if (incoming_estop && latest_ && !same_ui) {
+    // A legal ESTOP from a retired page retains priority without transferring
+    // ordinary input ownership or resetting the current owner's sequence.
+    latest_->estop = true;
+    latest_->steering = latest_->throttle = latest_->brake = 0.0;
+  } else {
+    latest_ = std::move(intent);
+  }
+  if (!duplicate) ++accepted_sample_id_;
+  if (new_refresh_sample) {
+    last_refresh_received_at_monotonic_ms_ = received_at_monotonic_ms;
+    ++refresh_sample_id_;
+    refresh_sample_healthy_ = true;
+    consecutive_refresh_anomalies_ = 0;
+    ++accepted_refresh_sample_id_;
+  }
   received_at_monotonic_ms_ = incoming_estop
       ? std::max(received_at_monotonic_ms_, received_at_monotonic_ms) : received_at_monotonic_ms;
   return {true, duplicate, requires_fresh_input_, duplicate ? "refreshed" : "accepted",
-          requires_fresh_input_ && preserve_brake_during_rearm_};
+          requires_fresh_input_ && preserve_brake_during_rearm_, ui_control_epoch_,
+          accepted_sample_id_, accepted_refresh_sample_id_, refresh_sample_id_,
+          consecutive_refresh_anomalies_, refresh_sample_healthy_};
+}
+
+void NativeControlIntentStore::begin_session(std::int64_t received_at_monotonic_ms) {
+  if (received_at_monotonic_ms < 0) throw std::invalid_argument("intent receive time must be non-negative");
+  std::lock_guard lock(mutex_);
+  latest_ = NativeControlIntent{"native-session-bootstrap", 1, "N", 0.0, 0.0, 0.0, false};
+  received_at_monotonic_ms_ = received_at_monotonic_ms;
+  requires_fresh_input_ = true;
+  preserve_brake_during_rearm_ = false;
+  estop_latched_ = false;
+  owner_ui_instance_id_.clear();
+  ui_control_epoch_ = accepted_sample_id_ = accepted_refresh_sample_id_ = 0;
+  last_refresh_received_at_monotonic_ms_.reset();
+  last_observed_owner_intent_.reset();
+  last_observed_owner_received_at_monotonic_ms_.reset();
+  refresh_sample_id_ = 0;
+  consecutive_refresh_anomalies_ = 0;
+  refresh_sample_healthy_ = false;
+  refresh_bad_sample_revision_ = refresh_brake_revision_ = 0;
 }
 
 NativeControlIntentSample NativeControlIntentStore::sample(std::int64_t now_monotonic_ms) {
@@ -1181,7 +1306,7 @@ NativeControlIntentSample NativeControlIntentStore::sample(std::int64_t now_mono
   std::lock_guard lock(mutex_);
   if (!latest_) return {};
   const auto age_ms = std::max<std::int64_t>(0, now_monotonic_ms - received_at_monotonic_ms_);
-  const bool fresh = age_ms < lease_ms_;
+  const bool fresh = age_ms < lease_ms_ && consecutive_refresh_anomalies_ < 3;
   if (!fresh && !latest_->is_neutral() && !latest_->estop) {
     requires_fresh_input_ = true;
     preserve_brake_during_rearm_ = false;
@@ -1193,7 +1318,10 @@ NativeControlIntentSample NativeControlIntentStore::sample(std::int64_t now_mono
     if (!preserve_brake_during_rearm_ || !fresh) effective.brake = 0.0;
   }
   effective.estop = estop_latched_;
-  return {true, fresh, requires_fresh_input_, std::move(effective), age_ms};
+  return {true, fresh, requires_fresh_input_, std::move(effective), age_ms,
+      ui_control_epoch_, accepted_sample_id_, accepted_refresh_sample_id_, owner_ui_instance_id_,
+      refresh_sample_id_, consecutive_refresh_anomalies_, refresh_sample_healthy_,
+      refresh_bad_sample_revision_, refresh_brake_revision_};
 }
 
 void NativeControlIntentStore::invalidate(bool preserve_brake) {
@@ -1209,6 +1337,15 @@ void NativeControlIntentStore::reset() {
   requires_fresh_input_ = true;
   preserve_brake_during_rearm_ = false;
   estop_latched_ = false;
+  owner_ui_instance_id_.clear();
+  ui_control_epoch_ = accepted_sample_id_ = accepted_refresh_sample_id_ = 0;
+  last_refresh_received_at_monotonic_ms_.reset();
+  last_observed_owner_intent_.reset();
+  last_observed_owner_received_at_monotonic_ms_.reset();
+  refresh_sample_id_ = 0;
+  consecutive_refresh_anomalies_ = 0;
+  refresh_sample_healthy_ = false;
+  refresh_bad_sample_revision_ = refresh_brake_revision_ = 0;
 }
 
 void SessionControlProfile::validate() const {
@@ -1647,6 +1784,7 @@ std::string_view to_string(ControlRecoveryCause cause) {
     case ControlRecoveryCause::TimeSynchronization: return "time_sync";
     case ControlRecoveryCause::InputLease: return "input_lease";
     case ControlRecoveryCause::ControlLink: return "control_link";
+    case ControlRecoveryCause::ReadinessHistory: return "readiness_history";
   }
   return "unknown";
 }
@@ -3297,6 +3435,10 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     // Advance the same watchdog here so fresh packets cannot bypass a hard
     // timeout merely because tick() has not been scheduled.
     evaluate_control_watchdog();
+    if (active_session_profile_ && safety_.state() == SafetyState::Degraded &&
+        safety_.last_valid_receive_ms() && arrival_monotonic_ms - *safety_.last_valid_receive_ms() >=
+            control_limits_.at("read_only_control_safety").at("degraded_timeout_ms").get<int>())
+      set_control_braking_wait(true, timestamp_ms, ControlRecoveryCause::ControlLink);
     result = receiver_.accept(command, timestamp_ms, arrival_monotonic_ms);
   }
   if (!result.accepted || !result.command) {
@@ -3306,6 +3448,7 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
          safety_.state() == SafetyState::Degraded)) {
       timing_rearm_required_ = true;
       safety_.require_input_rearm();
+      set_control_braking_wait(true, timestamp_ms, ControlRecoveryCause::ControlLink);
       evaluate_control_watchdog();
       result.issue_code = "control_input_rearm_required";
     }
@@ -3333,13 +3476,18 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     driver_time_sync_ready_ = effective.control_time_sync_ready;
     operator_input_ready_ = effective.operator_input_ready;
     driver_control_link_ready_ = effective.control_link_ready;
+    recovery_samples_healthy_ = effective.recovery_sample_healthy;
+    const bool historical_brake_event = effective.recovery_brake_revision != recovery_brake_revision_;
+    recovery_bad_sample_revision_ = effective.recovery_bad_sample_revision;
+    recovery_brake_revision_ = effective.recovery_brake_revision;
+    if (historical_brake_event) set_control_braking_wait(true, timestamp_ms, ControlRecoveryCause::ReadinessHistory);
     if (!driver_critical_video_ready_ || !driver_time_sync_ready_ || !operator_input_ready_ || !driver_control_link_ready_)
       set_control_braking_wait(true, timestamp_ms, !driver_time_sync_ready_ ? ControlRecoveryCause::TimeSynchronization
           : !driver_control_link_ready_ ? ControlRecoveryCause::ControlLink
           : !operator_input_ready_ ? ControlRecoveryCause::InputLease : ControlRecoveryCause::CriticalVideo);
   }
   if (!effective.estop && (control_braking_wait_ || timing_rearm_required_ ||
-      (safety_.state() == SafetyState::Degraded && receiver_.consecutive_late_frame_limit() == 1)) &&
+      safety_.state() == SafetyState::Degraded) &&
       (effective.throttle > 1e-9 || std::abs(effective.steering) > 1e-9 ||
        (control_braking_wait_ && last_effective_command_ && effective.gear != last_effective_command_->gear))) {
     // Recovery is intentionally explicit: a command gap withdraws traction,
@@ -3456,7 +3604,7 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
       return result;
     }
     safety_.on_valid_command(safety_command, arrival_monotonic_ms);
-    timing_rearm_required_ = false;
+    if (!control_braking_wait_) timing_rearm_required_ = false;
     last_effective_command_ = *result.command;
     return result;
   }
@@ -3672,6 +3820,9 @@ Json VehicleControlService::control_timing(std::int64_t /*timestamp_ms*/) const 
           {"driver_time_sync_ready", driver_time_sync_ready_},
           {"operator_input_ready", operator_input_ready_},
           {"driver_control_link_ready", driver_control_link_ready_},
+          {"recovery_samples_healthy", recovery_samples_healthy_},
+          {"recovery_bad_sample_revision", recovery_bad_sample_revision_},
+          {"recovery_brake_revision", recovery_brake_revision_},
           {"rearm_required", control_braking_wait_ || timing_rearm_required_ ||
               (safety_.state() == SafetyState::Degraded && receiver_.consecutive_late_frame_limit() == 1)},
           {"last_valid_control_age_ms", last_valid ? Json(std::max<std::int64_t>(0, monotonic_clock_() - *last_valid)) : Json(nullptr)},

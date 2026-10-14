@@ -58,6 +58,7 @@ RUN printf '%s\n' \
       cmake \
       crossbuild-essential-amd64 \
       nodejs \
+      python3 \
       pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -145,7 +146,7 @@ RUN printf '%s\n' \
     && cmake --build /tmp/libsrtp-build --parallel 1 \
     && cmake --install /tmp/libsrtp-build
 
-FROM target-deps AS verify
+FROM target-deps AS verify-base
 
 ARG MINE_TELEOP_BUILD_TESTS=OFF
 
@@ -156,7 +157,22 @@ COPY --from=cross-libsrtp /tmp/libsrtp-source /tmp/libsrtp-source
 COPY --from=cross-libsrtp /tmp/libsrtp-build /tmp/libsrtp-build
 COPY --from=cross-libsrtp /opt/libsrtp /opt/libsrtp
 
-RUN readelf -h /opt/mine-teleop/bin/mine-teleop \
+FROM verify-base AS verify-test
+
+ARG MINE_TELEOP_BUILD_TESTS=OFF
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Software codecs are only test fixtures. The product bundle inherits
+# verify-base, so none of these plugins or their libraries enter its closure.
+RUN if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends \
+        gstreamer1.0-plugins-ugly gstreamer1.0-libav python3 \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# The complete test registry includes an explicitly loopback-only CLI scenario.
+RUN --network=none readelf -h /opt/mine-teleop/bin/mine-teleop \
       | grep -q 'Advanced Micro Devices X86-64' \
     && readelf -h /opt/libsrtp/lib/libsrtp2.so.2.4.2 \
       | grep -q 'Advanced Micro Devices X86-64' \
@@ -172,9 +188,18 @@ RUN readelf -h /opt/mine-teleop/bin/mine-teleop \
               --run-loop \
               --duration-ms 1000 \
               --disconnect-at-ms 200; \
-       fi
+       fi \
+    && if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \
+         printf 'tests_executed=yes\n'; \
+       else \
+         printf 'tests_executed=no\n'; \
+       fi > /tmp/verification-complete
 
-FROM verify AS bundle
+FROM verify-base AS bundle
+
+# Copy only this result to make the verification stage a build dependency.
+# Tests=OFF records no execution; a failed full registry produces no marker.
+COPY --from=verify-test /tmp/verification-complete /tmp/verification-complete
 
 ARG MINE_TELEOP_SOURCE_COMMIT=unknown
 ARG MINE_TELEOP_BUILT_AT_UTC=unknown

@@ -26,6 +26,7 @@ option(
 option(MINE_TELEOP_BUILD_CONTROL_CLIENT "Build the portable control client" ON)
 option(MINE_TELEOP_BUILD_SIGNALING_SERVER "Build the standalone signaling server" ON)
 option(MINE_TELEOP_BUILD_VEHICLE_RUNTIME "Build Linux vehicle media and packaging targets" ${MINE_TELEOP_VEHICLE_DEFAULT})
+option(MINE_TELEOP_BUILD_BENCH_PROBES "Build explicit camera bench tools (never automatic tests)" OFF)
 option(MINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES "Build camera bridges when bundled vendor SDKs are present" ON)
 option(MINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE "Build the lightweight Aravis USB3 Vision camera bridge" ON)
 option(MINE_TELEOP_FETCH_MISSING_DEPS "Fetch pinned yaml-cpp and nlohmann-json sources when absent" OFF)
@@ -148,6 +149,7 @@ mine_teleop_enable_warnings(mine_teleop_vcu)
 # packages. It intentionally has no camera, JPEG, or GStreamer dependency.
 add_library(mine_teleop_runtime
   cpp/src/core.cpp
+  cpp/src/control_recovery.cpp
   cpp/src/http.cpp
   cpp/src/platform.cpp
   "${MINE_TELEOP_GENERATED_SERVER_SOURCE}"
@@ -220,6 +222,13 @@ if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
   install(TARGETS mine-teleop-control RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
+if(UNIX)
+  add_library(mine_teleop_recording_transport cpp/src/recording.cpp)
+  target_include_directories(mine_teleop_recording_transport PUBLIC cpp/include)
+  target_link_libraries(mine_teleop_recording_transport PUBLIC nlohmann_json::nlohmann_json Threads::Threads)
+  mine_teleop_enable_warnings(mine_teleop_recording_transport)
+endif()
+
 if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
   if(WIN32)
     message(FATAL_ERROR "The vehicle media runtime is Linux-only; configure with -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=OFF")
@@ -231,10 +240,13 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
     gstreamer-app-1.0>=1.20
     gstreamer-sdp-1.0>=1.20
     gstreamer-webrtc-1.0>=1.20
+    gstreamer-video-1.0>=1.20
   )
 
   add_library(mine_teleop_vehicle_runtime
     cpp/src/media.cpp
+    cpp/src/recording_gstreamer.cpp
+    cpp/src/recording_worker.cpp
     cpp/src/upload.cpp
     cpp/src/video.cpp
     cpp/src/webrtc_media.cpp
@@ -247,10 +259,22 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
   target_link_libraries(mine_teleop_vehicle_runtime
     PUBLIC
       mine_teleop_runtime
+      mine_teleop_recording_transport
       JPEG::JPEG
       PkgConfig::GSTREAMER
   )
   mine_teleop_enable_warnings(mine_teleop_vehicle_runtime)
+
+  if(MINE_TELEOP_BUILD_BENCH_PROBES)
+    add_executable(mine-teleop-bench-capture-probe cpp/tests/bench_capture_probe.cpp)
+    target_link_libraries(mine-teleop-bench-capture-probe PRIVATE mine_teleop_vehicle_runtime)
+    mine_teleop_enable_warnings(mine-teleop-bench-capture-probe)
+  endif()
+
+  add_executable(mine-teleop-recorder cpp/apps/mine_teleop_recorder.cpp)
+  target_link_libraries(mine-teleop-recorder PRIVATE mine_teleop_vehicle_runtime)
+  mine_teleop_enable_warnings(mine-teleop-recorder)
+  set_target_properties(mine-teleop-recorder PROPERTIES BUILD_RPATH "$ORIGIN/../lib" INSTALL_RPATH "$ORIGIN/../lib")
 
   add_executable(mine-teleop cpp/apps/mine_teleop.cpp)
   target_link_libraries(mine-teleop PRIVATE mine_teleop_vehicle_runtime)
@@ -309,7 +333,7 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
     endif()
   endif()
 
-  install(TARGETS mine-teleop mine-teleop-run mine_teleop_vehicle_runtime
+  install(TARGETS mine-teleop mine-teleop-recorder mine-teleop-run mine_teleop_vehicle_runtime mine_teleop_recording_transport
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -344,6 +368,26 @@ endif()
 
 if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
   enable_testing()
+  if(UNIX)
+    add_executable(mine-teleop-bench-containment-tests cpp/tests/bench_capture_containment_tests.cpp)
+    target_include_directories(mine-teleop-bench-containment-tests PRIVATE cpp/include)
+    target_link_libraries(mine-teleop-bench-containment-tests PRIVATE nlohmann_json::nlohmann_json)
+    mine_teleop_enable_warnings(mine-teleop-bench-containment-tests)
+    add_test(NAME mine-teleop-bench-containment-tests COMMAND mine-teleop-bench-containment-tests)
+    add_executable(mine-teleop-recording-transport-tests cpp/tests/recording_transport_tests.cpp)
+    target_link_libraries(mine-teleop-recording-transport-tests PRIVATE mine_teleop_recording_transport)
+    mine_teleop_enable_warnings(mine-teleop-recording-transport-tests)
+    add_test(NAME mine-teleop-recording-transport-tests COMMAND mine-teleop-recording-transport-tests)
+    set_tests_properties(mine-teleop-recording-transport-tests PROPERTIES TIMEOUT 45)
+  endif()
+  foreach(suite IN ITEMS clock-fault native-control-ack control-recovery)
+    string(REPLACE "-" "_" source_name "${suite}")
+    add_executable(mine-teleop-${suite}-tests cpp/tests/${source_name}_tests.cpp)
+    target_link_libraries(mine-teleop-${suite}-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+    mine_teleop_enable_warnings(mine-teleop-${suite}-tests)
+    add_test(NAME mine-teleop-${suite}-tests COMMAND mine-teleop-${suite}-tests)
+    set_tests_properties(mine-teleop-${suite}-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+  endforeach()
   add_executable(mine-teleop-session-logs-tests cpp/tests/session_logs_tests.cpp)
   target_link_libraries(mine-teleop-session-logs-tests PRIVATE mine_teleop_runtime)
   mine_teleop_enable_warnings(mine-teleop-session-logs-tests)
@@ -446,6 +490,29 @@ if(MINE_TELEOP_BUILD_TESTS)
   mine_teleop_enable_warnings(mine-teleop-control-tests)
   add_test(NAME mine-teleop-control-tests COMMAND mine-teleop-control-tests)
   set_tests_properties(mine-teleop-control-tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+  add_executable(mine-teleop-media-freshness-tests cpp/tests/media_freshness_tests.cpp)
+  target_include_directories(mine-teleop-media-freshness-tests PRIVATE cpp/include)
+  mine_teleop_enable_warnings(mine-teleop-media-freshness-tests)
+  add_test(NAME mine-teleop-media-freshness-tests COMMAND mine-teleop-media-freshness-tests)
+  if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
+    add_executable(mine-teleop-recording-upload-tests cpp/tests/recording_upload_tests.cpp)
+    target_link_libraries(mine-teleop-recording-upload-tests PRIVATE mine_teleop_vehicle_runtime)
+    mine_teleop_enable_warnings(mine-teleop-recording-upload-tests)
+    add_test(NAME mine-teleop-recording-upload-tests COMMAND mine-teleop-recording-upload-tests)
+    add_executable(mine-teleop-recording-gstreamer-tests cpp/tests/recording_gstreamer_tests.cpp)
+    target_link_libraries(mine-teleop-recording-gstreamer-tests PRIVATE mine_teleop_vehicle_runtime)
+    mine_teleop_enable_warnings(mine-teleop-recording-gstreamer-tests)
+    add_test(NAME mine-teleop-recording-gstreamer-tests COMMAND mine-teleop-recording-gstreamer-tests)
+    set_tests_properties(mine-teleop-recording-gstreamer-tests PROPERTIES TIMEOUT 120)
+    add_test(NAME mine-teleop-recorder-help COMMAND mine-teleop-recorder --help)
+    set_tests_properties(mine-teleop-recorder-help PROPERTIES PASS_REGULAR_EXPRESSION "mine-teleop-recorder")
+    add_executable(mine-teleop-media-freshness-gstreamer-tests cpp/tests/media_freshness_gstreamer_tests.cpp)
+    target_link_libraries(mine-teleop-media-freshness-gstreamer-tests PRIVATE mine_teleop_vehicle_runtime)
+    mine_teleop_enable_warnings(mine-teleop-media-freshness-gstreamer-tests)
+    add_test(NAME mine-teleop-media-freshness-gstreamer-tests COMMAND mine-teleop-media-freshness-gstreamer-tests)
+    set_tests_properties(mine-teleop-media-freshness-gstreamer-tests PROPERTIES TIMEOUT 60)
+  endif()
 
   add_executable(mine-teleop-vcu-tests cpp/tests/vcu_tests.cpp)
   target_link_libraries(mine-teleop-vcu-tests PRIVATE mine_teleop_vcu)
@@ -625,6 +692,17 @@ if(MINE_TELEOP_BUILD_TESTS)
   endif()
 
   if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      find_package(Python3 COMPONENTS Interpreter REQUIRED)
+      add_test(
+        NAME mine-teleop-control-smoke-loopback
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/control_smoke_loopback.py
+          --binary $<TARGET_FILE:mine-teleop>
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}/control-smoke-loopback-results
+      )
+      set_tests_properties(mine-teleop-control-smoke-loopback PROPERTIES TIMEOUT 30)
+    endif()
     add_test(
       NAME mine-teleop-vehicle-runtime-log-relay
       COMMAND bash

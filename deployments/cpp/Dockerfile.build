@@ -181,6 +181,9 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
         libgstreamer-plugins-bad1.0-dev \
         gstreamer1.0-plugins-base \
         gstreamer1.0-plugins-good \
+        gstreamer1.0-plugins-bad \
+        gstreamer1.0-plugins-ugly \
+        gstreamer1.0-libav \
         libglib2.0-dev \
         libjpeg-dev \
         libusb-1.0-0-dev \
@@ -190,6 +193,7 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
         libyaml-cpp-dev \
         nlohmann-json3-dev \
         nodejs \
+        python3 \
         patchelf \
         pkg-config \
         v4l-utils \
@@ -208,7 +212,9 @@ ENV PKG_CONFIG_PATH="/opt/aravis/lib/pkgconfig"
 
 WORKDIR /src
 COPY . .
-RUN cmake -S . -B /tmp/mine-teleop-build \
+# Regression tests create only isolated loopback mock services. Dependencies
+# were installed above; the configure/build/test step must have no external NIC.
+RUN --network=none cmake -S . -B /tmp/mine-teleop-build \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DCMAKE_INSTALL_PREFIX=/opt/mine-teleop \
       -DMINE_TELEOP_BUILD_TESTS="$MINE_TELEOP_BUILD_TESTS" \

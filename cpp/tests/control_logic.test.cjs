@@ -10,12 +10,31 @@ const controlPageSource = fs.readFileSync(path.join(__dirname, '../src/server.cp
 let passed = 0;
 let failed = 0;
 const pendingTests = [];
+const unfinishedTests = new Set();
+class OfflineAbortController {
+  constructor() {
+    const listeners=new Set();this.listeners=listeners;
+    this.signal={aborted:false,reason:undefined,onabort:null,
+      addEventListener(type,callback){if(type==='abort')listeners.add(callback)},
+      removeEventListener(type,callback){if(type==='abort')listeners.delete(callback)}};
+  }
+  abort(reason) {
+    if(this.signal.aborted)return;
+    this.signal.aborted=true;this.signal.reason=reason===undefined?Object.assign(new Error('request was aborted'),{name:'AbortError'}):reason;
+    const event={type:'abort',target:this.signal};
+    if(this.signal.onAbort)this.signal.onAbort(event);
+    if(this.signal.onabort)this.signal.onabort(event);
+    for(const callback of this.listeners)callback(event);
+  }
+}
 function test(name, body) {
   function pass() {
+    unfinishedTests.delete(name);
     passed += 1;
     console.log(`[PASS] ${name}`);
   }
   function fail(error) {
+    unfinishedTests.delete(name);
     failed += 1;
     console.error(`[FAIL] ${name}`);
     console.error(error && error.stack ? error.stack : error);
@@ -23,6 +42,7 @@ function test(name, body) {
   try {
     const result = body();
     if (result && typeof result.then === 'function') {
+      unfinishedTests.add(name);
       pendingTests.push(Promise.resolve(result).then(pass, fail));
     } else {
       pass();
@@ -71,6 +91,7 @@ function intentPageFixture(codes = ['ArrowUp', 'ArrowLeft']) {
   const blocked = new Set();
   const logs = [];
   const timers = new Map();
+  const timerDeadlines = new Map();
   const requests = [];
   let timerId = 0;
   let elapsed = 1000;
@@ -79,17 +100,20 @@ function intentPageFixture(codes = ['ArrowUp', 'ArrowLeft']) {
     peer: {connectionState: 'connected'},
     controlChannel: {readyState: 'open'},
     controlAuthorityLost: false,
+    safeLogoutAttempt: null,
     gearRejectionInhibited: false,
     controlProfileState: {acknowledged: true},
     vcuHandshake: readyVcu,
     vehicleTelemetry: null,
-    driverCriticalVideoHealth: () => ({ready: true, missing: []}),
+    driverCriticalVideoHealth: () => ({ready: true, sample_healthy: true, missing: []}),
     driverTimeSyncReady: () => true,
+    latestRuntimeStatus: {time_sync_readiness: {ready: true, latest_candidate_healthy: true}},
     pendingGearTransition: null,
     estopLatched: false,
     activeControlRequests: new Map(), controlTraceEnabled: false, nativeIntentSeq: 62,
     nativeControlSessionId: 'test-session',
     nativeControlSessionGeneration: 1,
+    nativeControlUiEpoch: 1, nativeControlTakeoverPending: false, nativeControlPageRetired: false,
     lastNativeIntentSnapshot: 'held-input',
     consoleConfig: {intent_lease_ms: 200},
     performance: {now: () => elapsed},
@@ -115,23 +139,38 @@ function intentPageFixture(codes = ['ArrowUp', 'ArrowLeft']) {
     resetControlAuthorityInput: () => { context.controlAuthorityLost = true; logic.blockAndClearKeys(pressed, blocked); },
     resetControlProfileSession: () => { context.controlProfileState.acknowledged = false; },
     clientLog: (event, details) => logs.push({event, details}),
-    setTimeout: callback => { const id = ++timerId; timers.set(id, callback); return id; },
-    clearTimeout: id => timers.delete(id),
-    AbortController: class {
-      constructor() { this.signal = {}; }
-      abort() { if (this.signal.onAbort) this.signal.onAbort(); }
-    },
+    setTimeout: (callback, delay) => { const id = ++timerId; timers.set(id, callback); timerDeadlines.set(id, elapsed + delay); return id; },
+    clearTimeout: id => { timers.delete(id); timerDeadlines.delete(id); },
+    AbortController: OfflineAbortController,
     post: (url, intent, signal) => new Promise((resolve, reject) => {
       signal.onAbort = () => reject(Object.assign(new Error('delayed local response'), {name: 'AbortError'}));
-      requests.push({url, intent, resolve, reject});
+      requests.push({url, intent, resolve, reject, startedAt: elapsed});
     }),
   };
   vm.createContext(context);
+  const clockGateStart = controlPageSource.indexOf('function driverControlTimeSyncReady(');
+  const clockGateEnd = controlPageSource.indexOf('function nativeIntentEnvelope(', clockGateStart);
+  assert.ok(clockGateStart >= 0 && clockGateEnd > clockGateStart);
+  vm.runInContext(controlPageSource.slice(clockGateStart, clockGateEnd), context);
   const start = controlPageSource.indexOf('async function writeControlIntent(');
   const end = controlPageSource.indexOf('function reportControlQueueError(', start);
   assert.ok(start >= 0 && end > start);
   vm.runInContext(controlPageSource.slice(start, end), context);
   return {context, pressed, blocked, logs, requests,
+    advanceTo: async (now, delayedCallbacks = false) => {
+      if (delayedCallbacks) elapsed = now;
+      for (;;) {
+        const due = Array.from(timerDeadlines.entries()).filter(([, time]) => time <= now)
+          .sort((a, b) => a[1] - b[1])[0];
+        if (!due) break;
+        if (!delayedCallbacks) elapsed = due[1];
+        const callback = timers.get(due[0]);
+        timerDeadlines.delete(due[0]); timers.delete(due[0]);
+        callback();
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      elapsed = now;
+    },
     timeout: () => { elapsed += 150; Array.from(timers.values()).forEach(callback => callback()); }};
 }
 
@@ -268,7 +307,7 @@ test('ICE diagnostics follow the transport selected pair instead of another succ
 test('browser native intent envelope is bound to the connected session generation', () => {
   assert.equal(
       controlPageSource.includes(
-          "return{session_id:nativeControlSessionId,session_generation:nativeControlSessionGeneration,ui_instance_id:uiInstanceId,intent_seq:nativeIntentSeq,...normalized}"),
+          "return{session_id:nativeControlSessionId,session_generation:nativeControlSessionGeneration,ui_instance_id:uiInstanceId,intent_seq:nativeIntentSeq,ui_control_epoch:nativeControlUiEpoch,takeover:nativeControlTakeoverPending&&!normalized.estop,...normalized}"),
       true);
   assert.equal(
       controlPageSource.includes(
@@ -278,6 +317,22 @@ test('browser native intent envelope is bound to the connected session generatio
       controlPageSource.includes(
           "nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot=''"),
       true);
+});
+
+test('vehicle catalog displays an incompatible version cause instead of online control readiness', () => {
+  const options=[];
+  const context=vm.createContext({latestRuntimeStatus:{connected:false},connecting:false,connectButton:{},
+    vehicleSelect:{value:'',replaceChildren(){options.length=0;},appendChild(value){options.push(value);}},
+    document:{createElement(){return {};}}});
+  const start=controlPageSource.indexOf('function renderVehicles('),end=controlPageSource.indexOf('function renderAuthExpiry(',start);
+  assert.ok(start>=0&&end>start);vm.runInContext(controlPageSource.slice(start,end),context);
+  context.renderVehicles([{vehicle_id:'old-vehicle',state:'online',controllable:false,native_control_compatible:false},
+    {vehicle_id:'precise-vehicle',state:'online',controllable:false,native_control_compatible:false,control_issue_message:'车端协议能力不匹配，请更新'},
+    {vehicle_id:'current-vehicle',state:'online',controllable:true,native_control_compatible:true}]);
+  assert.equal(options[0].disabled,true);assert.match(options[0].textContent,/版本不兼容.*更新/);
+  assert.doesNotMatch(options[0].textContent,/在线可控/);
+  assert.equal(options[1].textContent,'precise-vehicle · 车端协议能力不匹配，请更新');
+  assert.equal(options[2].disabled,false);assert.match(options[2].textContent,/在线可控/);
 });
 
 test('fixed keyboard bindings expose two brakes and paired direction keys', () => {
@@ -1109,7 +1164,7 @@ test('zero maximum brake pressure disables analog, service, and hard brake scala
 });
 
 test('recoverable braking banner uses vehicle feedback and identifies the cause', () => {
-  for (const [cause, text] of [['critical_video', /关键视频/], ['time_sync', /时间同步/], ['input_lease', /刷新过期/], ['control_link', /ACK 确认/]]) {
+  for (const [cause, text] of [['critical_video', /关键视频/], ['time_sync', /时间同步/], ['input_lease', /输入刷新/], ['control_link', /ACK 确认/]]) {
     const telemetry = {safety_state: 'CONTROL_ACTIVE', control_timing: {control_braking_wait: true, control_recovery_cause: cause}};
     const presentation = logic.deriveControlRecoveryPresentation(true, telemetry, true, false);
     assert.equal(presentation.visible, true);
@@ -1140,11 +1195,62 @@ test('yellow braking feedback yields to hard stops and marks stale confirmation'
 });
 
 test('recovered brake hold stays visible until fresh motion releases it', () => {
-  const telemetry = {safety_state: 'CONTROL_ACTIVE', control_timing: {control_braking_wait: false, recovery_brake_hold: true, control_recovery_cause: 'critical_video'}};
-  assert.match(logic.deriveControlRecoveryPresentation(true, telemetry, true, false).banner, /链路已恢复.*制动保持.*重新按下/);
-  assert.match(logic.deriveControlRecoveryPresentation(true, {...telemetry, safety_state: 'DEGRADED'}, true, false).banner, /链路已恢复.*制动保持/);
+  const telemetry = {safety_state: 'CONTROL_ACTIVE', control_timing: {control_braking_wait: false, recovery_brake_hold: true, control_recovery_cause: 'critical_video', recovery_samples_healthy: true}};
+  assert.match(logic.deriveControlRecoveryPresentation(true, telemetry, true, false).banner, /制动保持.*释放.*重新按下/);
+  assert.match(logic.deriveControlRecoveryPresentation(true, {...telemetry, safety_state: 'DEGRADED'}, true, false).banner, /制动保持.*下一步/);
+  for (const recovery_samples_healthy of [false, undefined]) {
+    const pending = {...telemetry, control_timing: {...telemetry.control_timing, recovery_samples_healthy}};
+    const banner = logic.deriveControlRecoveryPresentation(true, pending, true, false).banner;
+    assert.match(banner, /当前阻挡.*等待/);
+    assert.doesNotMatch(banner, /链路已恢复|重新按下/);
+  }
   telemetry.control_timing.recovery_brake_hold = false;
   assert.equal(logic.deriveControlRecoveryPresentation(true, telemetry, true, false).visible, false);
+});
+
+test('recovery guidance uses current four readiness causes rather than the first historical cause', () => {
+  const fields = {critical_video: 'driver_critical_video_ready', input_lease: 'operator_input_ready',
+    control_link: 'driver_control_link_ready', time_sync: 'driver_time_sync_ready'};
+  const labels = {critical_video: /关键视频/, input_lease: /输入刷新/, control_link: /ACK/, time_sync: /时间同步/};
+  for (const [cause, field] of Object.entries(fields)) {
+    const guidance = logic.controlRecoveryGuidance({control_braking_wait: true,
+      control_recovery_cause: 'time_sync', recovery_samples_healthy: false, [field]: false});
+    assert.equal(guidance.phase, 'wait_conditions');
+    assert.deepEqual(guidance.causes, [cause]);
+    assert.match(guidance.reason, labels[cause]);
+    assert.match(guidance.text, /当前阻挡.*下一步/);
+    assert.doesNotMatch(guidance.text, /已停稳|已经停车|立即行驶|重新连接/);
+  }
+  const optional = logic.controlRecoveryGuidance({control_braking_wait: true,
+    critical_video_required: false, driver_critical_video_ready: false,
+    recovery_samples_healthy: true});
+  assert.deepEqual(optional.causes, [], 'non-critical video was relabeled as a control blocker');
+  assert.equal(optional.phase, 'healthy_window');
+});
+
+test('healthy confirmation, fresh input and stale feedback have distinct recovery guidance', () => {
+  const waiting = {control_braking_wait: true, recovery_brake_hold: true, rearm_required: true,
+    recovery_samples_healthy: true, control_recovery_cause: 'critical_video'};
+  const healthy = logic.controlRecoveryGuidance(waiting);
+  assert.equal(healthy.phase, 'healthy_window');
+  assert.match(healthy.nextStep, /300 ms.*后/);
+  assert.doesNotMatch(healthy.reason, /已恢复|已就绪/);
+  const rearm = logic.controlRecoveryGuidance({...waiting, control_braking_wait: false});
+  assert.equal(rearm.phase, 'await_fresh_input');
+  assert.match(rearm.nextStep, /释放.*重新按下/);
+  const renewedFailure = logic.controlRecoveryGuidance({...waiting,
+    control_braking_wait: false, recovery_samples_healthy: false});
+  assert.equal(renewedFailure.phase, 'wait_conditions');
+  assert.doesNotMatch(renewedFailure.nextStep, /重新按下/);
+  const stale = logic.controlRecoveryGuidance({...waiting, control_braking_wait: false}, false);
+  assert.equal(stale.phase, 'feedback_unknown');
+  assert.match(stale.reason, /待确认/);
+  assert.doesNotMatch(stale.nextStep, /重新按下/);
+  assert.equal(logic.controlRecoveryGuidance({}).visible, false);
+  assert.equal(logic.controlRecoveryGuidance(null).visible, false);
+  const unknown = logic.controlRecoveryGuidance({control_braking_wait: true, control_recovery_cause: 'unexpected'});
+  assert.match(unknown.reason, /尚未确认/);
+  assert.doesNotMatch(unknown.reason, /unexpected/);
 });
 
 test('ESTOP presentation distinguishes local and vehicle telemetry states', () => {
@@ -1298,6 +1404,212 @@ test('slow responses do not serialize heartbeats; backlog is bounded and ESTOP h
   // A heartbeat cannot abort the outstanding urgent request.
   assert.equal(fixture.context.activeControlRequests.size,1);
   fixture.requests[4].resolve({accepted:true});assert.equal((await urgent).sent,true);
+});
+
+test('production 66ms refresh and 150ms response deadlines stay bounded under slow HTTP and a 124.5ms timer lag', async () => {
+  const fixture = intentPageFixture(['ArrowUp']);
+  await fixture.advanceTo(0);
+  const queue = logic.createLatestControlWriteQueue(fixture.context.writeControlIntent,
+    error => { throw error; }, (token, reason) => {
+      const active = fixture.context.activeControlRequests.get(token);
+      if (active && !active.estop) { active.preemptedReason = reason; active.controller.abort(); }
+    });
+  const first = queue.send({}, false);
+  for (const tick of [66, 132]) {
+    await fixture.advanceTo(tick); queue.enqueueHeartbeat();
+  }
+  // Simulate the observed timer lag without executing browser callbacks in
+  // the blocked interval. The native lease test separately proves the 200ms
+  // boundary; this test measures actual production queue dispatch times.
+  await fixture.advanceTo(256.5, true);
+  assert.equal(fixture.context.activeControlRequests.size <= 2, true);
+  for (let tick = 264; tick <= 660; tick += 66) {
+    await fixture.advanceTo(tick); queue.enqueueHeartbeat();
+    assert.equal(fixture.context.activeControlRequests.size <= 2, true);
+  }
+  assert.equal((await first).reason, 'control_intent_update_timeout');
+  const times = fixture.requests.map(request => request.startedAt);
+  const gaps = times.slice(1).map((time, index) => time - times[index]);
+  assert.equal(Math.max(...gaps), 190.5);
+  assert.equal(gaps.every(gap => gap < 200), true, 'request serialization exceeded the unchanged lease');
+  assert.equal(fixture.pressed.has('ArrowUp'), true, 'response timeout manufactured a physical key release');
+  await fixture.advanceTo(1000);
+});
+
+function useProductionIntentEnvelope(fixture) {
+  fixture.context.uiInstanceId = 'page-under-test';
+  const start = controlPageSource.indexOf('function nativeIntentEnvelope(');
+  const end = controlPageSource.indexOf('async function writeControlIntent(', start);
+  assert.ok(start >= 0 && end > start);
+  vm.runInContext(controlPageSource.slice(start, end), fixture.context);
+}
+
+function useProductionCameraView(fixture) {
+  class Element {
+    constructor(tag) { this.tag=tag; this.children=[]; this.dataset={}; this.frames=0; this.paused=false; this.readyState=4; }
+    append(...items) { this.children.push(...items); }
+    replaceChildren(...items) { this.children=items; }
+    insertBefore(item, before) { this.children=this.children.filter(value=>value!==item); const index=this.children.indexOf(before); this.children.splice(index<0?this.children.length:index,0,item); }
+    setAttribute() {}
+    getVideoPlaybackQuality() { return {totalVideoFrames:this.frames,droppedVideoFrames:0}; }
+  }
+  fixture.context.document={createElement:tag=>new Element(tag)};
+  fixture.context.MediaStream=class {};
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../web/camera_view.js'),'utf8'),fixture.context);
+  const grid=new Element('grid'),view=fixture.context.MineTeleopCameraView.mount(grid),listeners=new Map();
+  const track={muted:false,readyState:'live',
+    addEventListener(name,callback) { if(!listeners.has(name))listeners.set(name,new Set());listeners.get(name).add(callback); },
+    removeEventListener(name,callback) { const callbacks=listeners.get(name);if(callbacks)callbacks.delete(callback); },
+    emit(name) { for(const callback of listeners.get(name)||[])callback(); }};
+  view.configure(['front']);view.attach('front',track);
+  const video=grid.children[0].children[1];
+  fixture.context.driverCriticalVideoHealth=()=>view.criticalHealth(['front'],500);
+  return {view,track,video};
+}
+
+test('actual CameraView and shipped writer tolerate two raw faults, propagate raw health and clear at the third', async () => {
+  const fixture=intentPageFixture(['ArrowUp']);
+  await fixture.advanceTo(0);
+  const camera=useProductionCameraView(fixture);
+  useProductionIntentEnvelope(fixture);
+  for(const now of [100,133,166]) {
+    await fixture.advanceTo(now);camera.video.frames++;fixture.context.driverCriticalVideoHealth();
+  }
+  assert.equal(fixture.context.driverCriticalVideoHealth().ready,true);
+  for(const [index,now] of [200,220,240].entries()) {
+    if(index) { await fixture.advanceTo(now-10);camera.track.muted=false;camera.track.emit('unmute'); }
+    await fixture.advanceTo(now);camera.track.muted=true;camera.track.emit('mute');
+    const health=fixture.context.driverCriticalVideoHealth();
+    assert.equal(health.cameras[0].consecutive_anomalies,index+1);
+    assert.equal(health.sample_healthy,false);
+    const result=fixture.context.writeControlIntent({},false),request=fixture.requests[index];
+    assert.equal(request.intent.critical_video_sample_healthy,false,'raw fault was silently relabeled normal for recovery');
+    assert.equal(request.intent.critical_video_ready,index<2);
+    assert.equal(request.intent.throttle,index<2?0.5:0);
+    assert.equal(fixture.pressed.has('ArrowUp'),index<2,'writer bypassed or delayed the qualified video threshold');
+    request.resolve({accepted:true});await result;
+  }
+  assert.equal(fixture.context.controlProfileState.acknowledged,true);
+  assert.equal(fixture.context.controlAuthorityLost,false);
+  await fixture.advanceTo(250);camera.track.muted=false;camera.track.emit('unmute');
+  await fixture.advanceTo(260);camera.video.frames++;
+  const recovered=fixture.context.writeControlIntent({},false);
+  assert.equal(fixture.requests[3].intent.critical_video_sample_healthy,true);
+  assert.equal(fixture.requests[3].intent.throttle,0,'new normal video resurrected an old physical long press');
+  assert.equal(fixture.blocked.has('ArrowUp'),true);
+  fixture.requests[3].resolve({accepted:true});await recovered;
+});
+
+test('writer uses the qualified clock gate while raw clock faults remain diagnostic', async () => {
+  const fixture=intentPageFixture(['ArrowUp']);useProductionIntentEnvelope(fixture);
+  fixture.context.driverTimeSyncReady=()=>false;
+  for(const count of [1,2,3]) {
+    fixture.context.latestRuntimeStatus.time_sync_readiness={ready:count<3,latest_candidate_healthy:false,consecutive_anomalies:count};
+    const result=fixture.context.writeControlIntent({},false),request=fixture.requests[count-1];
+    assert.equal(request.intent.throttle,count<3?0.5:0,'raw clock trust bypassed qualified control readiness');
+    assert.equal(fixture.pressed.has('ArrowUp'),count<3);
+    request.resolve({accepted:true});await result;
+  }
+  assert.equal(fixture.context.controlProfileState.acknowledged,true);
+  assert.equal(fixture.context.controlAuthorityLost,false);
+  const unknown=intentPageFixture(['ArrowUp']);
+  unknown.context.latestRuntimeStatus.time_sync_readiness=undefined;
+  const result=unknown.context.writeControlIntent({},false);
+  assert.equal(unknown.requests[0].intent.throttle,0,'missing qualified clock metadata assumed readiness');
+  unknown.requests[0].resolve({accepted:true});await result;
+});
+
+test('missing page metadata asks for reload without blocking a legal emergency request', async () => {
+  const fixture=intentPageFixture(['ArrowUp']);
+  const result=fixture.context.writeControlIntent({},false);
+  fixture.requests[0].reject(Object.assign(new Error('refresh page'),{status:400,issue_code:'control_page_metadata_missing'}));
+  assert.equal((await result).reason,'control_page_metadata_missing');
+  assert.equal(fixture.pressed.size,0);
+  assert.match(fixture.context.statusPanel.textContent,/当前阻挡.*刷新页面/);
+  assert.equal(fixture.context.controlAuthorityLost,false);
+  fixture.context.estopLatched=true;
+  const urgent=fixture.context.writeControlIntent({estop:true},false);
+  assert.equal(fixture.requests[1].intent.estop,true);
+  fixture.requests[1].resolve({accepted:true});await urgent;
+});
+
+test('new page sends neutral until confirmed takeover and then requires physical release', async () => {
+  const fixture = intentPageFixture(['ArrowUp']);
+  useProductionIntentEnvelope(fixture);
+  fixture.context.nativeControlUiEpoch = 7;
+  fixture.context.nativeControlTakeoverPending = true;
+  const handshake = fixture.context.writeControlIntent({}, false);
+  const intent = fixture.requests[0].intent;
+  assert.equal(intent.takeover, true);
+  assert.equal(intent.ui_control_epoch, 7);
+  assert.equal(intent.throttle, 0);
+  assert.equal(fixture.blocked.has('ArrowUp'), true);
+  fixture.requests[0].resolve({accepted: true, ui_control_epoch: 8, intent_seq: intent.intent_seq});
+  assert.equal((await handshake).sent, true);
+  assert.equal(fixture.context.nativeControlUiEpoch, 8);
+  assert.equal(fixture.context.nativeControlTakeoverPending, false);
+  assert.equal(logic.pressKey(fixture.pressed, fixture.blocked, 'ArrowUp').changed, false);
+  logic.releaseKey(fixture.pressed, fixture.blocked, 'ArrowUp');
+  logic.pressKey(fixture.pressed, fixture.blocked, 'ArrowUp');
+  const drive = fixture.context.writeControlIntent({}, false);
+  assert.equal(fixture.requests[1].intent.takeover, false);
+  assert.equal(fixture.requests[1].intent.ui_control_epoch, 8);
+  assert.equal(fixture.requests[1].intent.throttle, 0.5);
+  fixture.requests[1].resolve({accepted: true, intent_seq: fixture.requests[1].intent.intent_seq});
+  await drive;
+});
+
+test('Abort after server acceptance retries the neutral handshake without reviving held motion', async () => {
+  const fixture = intentPageFixture(['ArrowUp']);
+  useProductionIntentEnvelope(fixture);
+  fixture.context.nativeControlUiEpoch = 3;
+  fixture.context.nativeControlTakeoverPending = true;
+  const first = fixture.context.writeControlIntent({}, false);
+  // Acceptance is unknowable after response cancellation. Retry the same
+  // epoch with neutral input; production Store accepts this owner idempotently.
+  fixture.timeout();
+  assert.equal((await first).reason, 'control_intent_update_timeout');
+  assert.equal(fixture.context.nativeControlTakeoverPending, true);
+  const retry = fixture.context.writeControlIntent({}, false);
+  assert.equal(fixture.requests[1].intent.ui_control_epoch, 3);
+  assert.equal(fixture.requests[1].intent.throttle, 0);
+  fixture.requests[1].resolve({accepted: true, duplicate: true, ui_control_epoch: 4});
+  assert.equal((await retry).sent, true);
+  assert.equal(fixture.context.nativeControlUiEpoch, 4);
+  assert.equal(fixture.blocked.has('ArrowUp'), true);
+});
+
+test('reconnecting the current page confirms its existing epoch without motion', async () => {
+  const fixture = intentPageFixture(['ArrowUp']);
+  useProductionIntentEnvelope(fixture);
+  fixture.context.nativeControlUiEpoch = 7;
+  fixture.context.nativeControlTakeoverPending = true;
+  const handshake = fixture.context.writeControlIntent({}, false);
+  fixture.requests[0].resolve({accepted: true, ui_control_epoch: 7});
+  assert.equal((await handshake).sent, true);
+  assert.equal(fixture.context.nativeControlUiEpoch, 7);
+  assert.equal(fixture.context.nativeControlTakeoverPending, false);
+  assert.equal(fixture.pressed.size, 0);
+});
+
+test('retired page stops ordinary refreshes while legal ESTOP retains its session and priority', async () => {
+  const fixture = intentPageFixture(['ArrowUp']);
+  useProductionIntentEnvelope(fixture);
+  const obsolete = fixture.context.writeControlIntent({}, false);
+  fixture.requests[0].resolve({accepted: false, reason: 'input_page_not_current'});
+  assert.equal((await obsolete).sent, false);
+  assert.equal(fixture.context.nativeControlPageRetired, true);
+  assert.match(fixture.context.statusPanel.textContent, /当前阻挡.*下一步/);
+  assert.equal((await fixture.context.writeControlIntent({}, false)).reason, 'input_page_not_current');
+  assert.equal(fixture.requests.length, 1, 'retired page kept sending ordinary refreshes');
+  fixture.context.estopLatched = true;
+  const urgent = fixture.context.writeControlIntent({estop: true}, true);
+  assert.equal(fixture.requests[1].intent.estop, true);
+  assert.equal(fixture.requests[1].intent.session_id, 'test-session');
+  fixture.requests[1].resolve({accepted: true, ui_control_epoch: 9});
+  assert.equal((await urgent).sent, true);
+  assert.equal(fixture.context.nativeControlPageRetired, true);
+  assert.equal(fixture.context.nativeControlUiEpoch, 1, 'retired ESTOP silently adopted a new ordinary epoch');
 });
 
 test('session reset discards pending old ESTOP and allows a new session without waiting', async () => {
@@ -1509,6 +1821,7 @@ test('shipped view health distinguishes optional-only cameras from unknown criti
 test('untrusted driver time sends neutral and retains the session until fresh input', async () => {
   const fixture=intentPageFixture();
   fixture.context.driverTimeSyncReady=()=>false;
+  fixture.context.latestRuntimeStatus.time_sync_readiness={ready:false,latest_candidate_healthy:false};
   const request=fixture.context.writeControlIntent({},true);
   assert.equal(fixture.requests[0].intent.throttle,0);
   assert.equal(fixture.requests[0].intent.steering,0);
@@ -1516,6 +1829,7 @@ test('untrusted driver time sends neutral and retains the session until fresh in
   assert.equal(fixture.context.controlAuthorityLost,false);
   fixture.requests[0].resolve({accepted:true});await request;
   fixture.context.driverTimeSyncReady=()=>true;
+  fixture.context.latestRuntimeStatus.time_sync_readiness={ready:true,latest_candidate_healthy:true};
   const recovered=fixture.context.writeControlIntent({},false);
   assert.equal(fixture.requests[1].intent.throttle,0);
   fixture.requests[1].resolve({accepted:true});await recovered;
@@ -1556,7 +1870,7 @@ test('hard stop banner retains exact recovery cause and deadline without telemet
 
 test('signaling fault status locks motion and preserves the reason before DataChannel feedback', () => {
   const context=vm.createContext({mediaStatus:{lanes:[]},vcuHandshake:{ready:true,state:'ready'},controlLogic:logic,
-    renderMonitoring(){},updateVcuHandshakeState(value){context.vcuHandshake=value}});
+    performance:{now:()=>1000},renderMonitoring(){},updateVcuHandshakeState(value){context.vcuHandshake=value}});
   const handler=controlPageSource.match(/^function applyMediaStatus\(payload\)\{[\s\S]*?^\}/m);
   assert(handler);vm.runInContext(handler[0],context);
   context.applyMediaStatus({control_issue_code:'control_recovery_braking_wait',control_recovery:{cause:'time_sync',timeout_ms:5000}});
@@ -1584,7 +1898,394 @@ test('delayed good DataChannel status and older soft signal cannot erase a hard 
   assert.match(logic.deriveControlStopPresentation(false,false,'','',context.vcuHandshake).banner,/时间同步.*5 秒/);
 });
 
+// Run the shipped logout and VCU sender against a local deterministic transport.
+// Completion evidence is a real vehicle-telemetry schema, not an HTTP success.
+function logoutPageFixture() {
+  let elapsed=1000,timerId=0,closeCount=0;
+  const timers=new Map(),calls=[],packets=[];
+  class Clock extends Date { static now(){return 100000+elapsed} }
+  const runtime={authenticated:true,connected:true,driver_id:'driver',vehicle_id:'vehicle',session_id:'session',
+    control_session_generation:7,connect_cancellation_generation:9,native_control:{ui_control_epoch:3,owner_ui_instance_id:'page'},time_sync:{synchronized:true,uncertainty_ms:1,offset_ms:0}};
+  const context=vm.createContext({controlLogic:logic,safeLogoutAttempt:null,connectRequestGeneration:1,
+    nativeControlSessionId:'session',nativeControlSessionGeneration:7,nativeControlUiEpoch:3,uiInstanceId:'page',
+    lastControlStatusSeq:50,latestRuntimeStatus:{...runtime,time_sync:{synchronized:true,uncertainty_ms:1,offset_ms:0}},
+    vehicleTelemetry:null,vehicleTelemetryReceivedAt:null,authenticated:true,polling:true,connecting:false,
+    controlAuthorityLost:false,estopLatched:false,driverIdInput:{value:'driver'},
+    peer:{connectionState:'connected'},controlChannel:{readyState:'open',send:data=>packets.push(JSON.parse(data))},
+    vcuHandshake:{supported:true,state:'ready',ready:true,adapter_ready:true},controlProfileState:{acknowledged:true},
+    performance:{now:()=>elapsed},Date:Clock,AbortController:OfflineAbortController,
+    driverTimeSyncReady:()=>Boolean(context.latestRuntimeStatus.time_sync&&context.latestRuntimeStatus.time_sync.synchronized===true),
+    connectButton:{},webrtcLabel:{},statusPanel:{},sessionPanel:{},vcuPanel:{},monitorPanel:{},loginPanel:{},
+    clientLog:(event,details)=>calls.push({event,details}),resetControlAuthorityInput:()=>calls.push({event:'clear_input'}),
+    renderAuthExpiry(){},renderMonitoring(){},renderCanFeedback(){},
+    closeRealtimeSession(){closeCount++;context.controlChannel=null;context.peer=null;context.nativeControlSessionId='';context.nativeControlSessionGeneration=0;context.nativeControlUiEpoch=0},
+    get:async path=>{calls.push({get:path});return {...runtime,native_control:{...runtime.native_control}}},
+    post:async(path,body)=>{calls.push({post:path,body});return {session_id:body.expected_session_id}},
+    setTimeout(callback,delay){const id=++timerId;timers.set(id,{callback,at:elapsed+delay});return id},
+    clearTimeout:id=>timers.delete(id)});
+  const sender=controlPageSource.split('\n').find(line=>line.startsWith('function sendVcuHandshakeCommand('));
+  assert(sender);vm.runInContext(sender,context);
+  const start=controlPageSource.indexOf('function pageReleaseScope('),end=controlPageSource.indexOf("addEventListener('pagehide'",start);
+  assert(start>=0&&end>start);vm.runInContext(controlPageSource.slice(start,end),context);
+  async function settle(){await new Promise(resolve=>setImmediate(resolve))}
+  async function advanceTo(now){
+    for(;;){const due=[...timers.entries()].filter(([,timer])=>timer.at<=now).sort((a,b)=>a[1].at-b[1].at)[0];if(!due)break;
+      elapsed=due[1].at;timers.delete(due[0]);due[1].callback();await settle()}
+    elapsed=now;await settle();
+  }
+  function telemetry(overrides={}){
+    const message={event:'vehicle_telemetry',session_id:'session',vehicle_id:'vehicle',driver_id:'driver',control_status_seq:51,sent_at_utc_ms:Clock.now(),estop:false,
+      vehicle_adapter:{opened:true,healthy:true},vcu_handshake:{supported:true,state:'disarmed',requested:false,ready:false,disarming:false},
+      can_feedback:{supported:true,feedback_fresh:true,max_feedback_age_ms:5,speed_valid:true,speed_mps:0,gear_valid:true,gear:1,
+        handshake_valid:true,handshake_status:3,parking_brake_valid:[true,true,true,true],parking_brake_status:[2,2,2,2]},...overrides};
+    context.vehicleTelemetry=message;context.vehicleTelemetryReceivedAt=elapsed;return message;
+  }
+  return{context,runtime,calls,packets,settle,advanceTo,telemetry,closeCount:()=>closeCount,now:()=>elapsed};
+}
+
+test('shipped logout waits for a new final CAN disarmed report before releasing the session and preserves ESTOP', async()=>{
+  const fixture=logoutPageFixture();fixture.context.estopLatched=true;
+  const exit=fixture.context.logout();await fixture.settle();
+  assert.equal(fixture.packets.length,1);assert.equal(fixture.packets[0].event,'vcu_handshake_command');assert.equal(fixture.packets[0].action,'disconnect');
+  assert.equal(fixture.closeCount(),0);assert(!fixture.calls.some(call=>call.post));
+  fixture.telemetry({vcu_handshake:{supported:true,state:'disarm_manual',requested:false,ready:false,disarming:true}});
+  await fixture.advanceTo(1100);assert.equal(fixture.closeCount(),0);assert(!fixture.calls.some(call=>call.post));
+  fixture.telemetry({control_status_seq:52,estop:true});await fixture.advanceTo(1200);
+  const result=await exit;assert.equal(result.confirmed,true);assert.equal(fixture.closeCount(),1);assert.equal(fixture.context.authenticated,false);
+  const release=fixture.calls.find(call=>call.post==='/api/disconnect');assert.equal(release.body.expected_session_id,'session');
+  assert.equal(release.body.expected_control_session_generation,7);assert.equal(release.body.expected_ui_control_epoch,3);assert.equal(release.body.ui_instance_id,'page');
+  assert.equal(fixture.context.estopLatched,true);assert.match(fixture.context.statusPanel.textContent,/最终 CAN 写入已确认/);
+  assert.match(fixture.context.statusPanel.textContent,/须本地确认后复位/);assert(!fixture.context.statusPanel.textContent.includes('已安全退出'));
+});
+
+test('shipped logout bounds confirmation at 15 seconds and HTTP release alone never proves safety', async()=>{
+  const fixture=logoutPageFixture();const exit=fixture.context.logout();await fixture.settle();
+  await fixture.advanceTo(15900);assert(!fixture.calls.some(call=>call.post));
+  await fixture.advanceTo(16000);const result=await exit;assert.equal(result.confirmed,false);assert.equal(result.reason,'timeout');
+  assert.equal(fixture.closeCount(),1);assert.match(fixture.context.statusPanel.textContent,/安全退出未确认.*超时/);
+  assert.match(fixture.context.statusPanel.textContent,/本地核实停车和制动状态/);
+});
+
+test('shipped logout rejects old sequence, old source feedback and untrusted clock then accepts only fresh current evidence', async()=>{
+  const fixture=logoutPageFixture();const exit=fixture.context.logout();await fixture.settle();
+  fixture.telemetry({control_status_seq:50});await fixture.advanceTo(1100);assert(!fixture.calls.some(call=>call.post));
+  fixture.telemetry({control_status_seq:51,sent_at_utc_ms:100900});await fixture.advanceTo(1200);assert(!fixture.calls.some(call=>call.post));
+  fixture.context.latestRuntimeStatus.time_sync.synchronized=false;fixture.telemetry({control_status_seq:52});
+  await fixture.advanceTo(1300);assert(!fixture.calls.some(call=>call.post));
+  fixture.context.latestRuntimeStatus.time_sync.synchronized=true;fixture.telemetry({control_status_seq:53});
+  await fixture.advanceTo(1400);assert.equal((await exit).confirmed,true);
+});
+
+test('shipped logout leaves a replacement session and peer untouched', async()=>{
+  const fixture=logoutPageFixture();const exit=fixture.context.logout();await fixture.settle();
+  fixture.context.nativeControlSessionId='replacement';fixture.context.nativeControlSessionGeneration=8;
+  const replacement={connectionState:'connected'};fixture.context.peer=replacement;
+  fixture.telemetry({session_id:'replacement',control_status_seq:52});await fixture.advanceTo(1100);
+  assert.equal((await exit).reason,'session_changed');assert.equal(fixture.closeCount(),0);assert(!fixture.calls.some(call=>call.post));
+  assert.equal(fixture.context.peer,replacement);assert.equal(fixture.context.authenticated,true);assert.match(fixture.context.statusPanel.textContent,/安全退出未确认/);
+});
+
+test('shipped logout on a retired page cannot disconnect the owner even before VCU command', async()=>{
+  const fixture=logoutPageFixture();fixture.runtime.native_control={ui_control_epoch:4,owner_ui_instance_id:'replacement-page'};
+  assert.equal((await fixture.context.logout()).reason,'session_changed');assert.equal(fixture.packets.length,0);
+  assert.equal(fixture.closeCount(),0);assert(!fixture.calls.some(call=>call.post));
+});
+
+test('shipped logout reports unsupported adapters and link loss as unconfirmed', async()=>{
+  const unsupported=logoutPageFixture();unsupported.context.vcuHandshake={supported:false,state:'unsupported'};
+  assert.equal((await unsupported.context.logout()).reason,'unsupported');assert.equal(unsupported.packets.length,0);
+  assert.match(unsupported.context.statusPanel.textContent,/控制会话已释放；安全退出未确认/);
+  const lost=logoutPageFixture();const exit=lost.context.logout();await lost.settle();lost.context.controlChannel.readyState='closed';
+  await lost.advanceTo(1100);assert.equal((await exit).reason,'link_lost');assert.match(lost.context.statusPanel.textContent,/反馈链路中断/);
+});
+
+test('shipped logout does not treat failed HTTP release as safety completion and can retry', async()=>{
+  const fixture=logoutPageFixture();fixture.context.post=async()=>{throw Error('local release rejected')};
+  const exit=fixture.context.logout();await fixture.settle();fixture.telemetry();await fixture.advanceTo(1100);
+  assert.equal((await exit).reason,'release_failed');assert.equal(fixture.closeCount(),0);assert.equal(fixture.context.authenticated,true);
+  assert.match(fixture.context.statusPanel.textContent,/安全退出未确认/);assert.equal(fixture.context.safeLogoutAttempt,null);
+  fixture.context.post=async()=>({session_id:'session'});const retry=fixture.context.logout();await fixture.settle();
+  fixture.telemetry({control_status_seq:52});await fixture.advanceTo(1200);assert.equal((await retry).confirmed,true);
+});
+
+test('logout feedback helper requires complete new CAN evidence and never substitutes a handshake HTTP acknowledgement',()=>{
+  const fixture=logoutPageFixture();const request={session_id:'session',vehicle_id:'vehicle',driver_id:'driver',status_floor:50,started_at_monotonic_ms:1000,source_floor_utc_ms:101000};
+  const message=fixture.telemetry(),judge=value=>logic.safeLogoutFeedback(request,value,1000,1000,101000);
+  assert.equal(judge(message).confirmed,true);
+  for(const changed of [{event:'vcu_handshake_status'},{session_id:'old'},{driver_id:'other-driver'},{sent_at_utc_ms:101001},{sent_at_utc_ms:100999},
+    {can_feedback:{...message.can_feedback,parking_brake_valid:[true,true,false,true]}},
+    {can_feedback:{...message.can_feedback,feedback_fresh:false}},
+    {can_feedback:{...message.can_feedback,gear:3}}, {can_feedback:{...message.can_feedback,speed_mps:0.11}},
+    {vehicle_adapter:{opened:true,healthy:false}}, {vcu_handshake:{...message.vcu_handshake,disarming:true}}]){
+    assert.equal(judge({...message,...changed}).confirmed,false,JSON.stringify(changed));
+  }
+  assert.equal(logic.safeLogoutFeedback(request,message,1000,1601,101601).confirmed,false);
+  assert.equal(logic.safeLogoutFeedback(request,message,1000,1000,null).confirmed,false);
+});
+
+test('ordinary writes are frozen during logout while a legal ESTOP remains dispatchable',async()=>{
+  const fixture=intentPageFixture();fixture.context.safeLogoutAttempt={};
+  assert.equal((await fixture.context.writeControlIntent({},true)).reason,'safe_logout_in_progress');assert.equal(fixture.requests.length,0);
+  fixture.context.estopLatched=true; // The shipped emergency button latches before send.
+  const urgent=fixture.context.writeControlIntent({estop:true},true);assert.equal(fixture.requests.length,1);assert.equal(fixture.requests[0].intent.estop,true);
+  fixture.requests[0].resolve({accepted:true});assert.equal((await urgent).sent,true);
+});
+
+test('shipped logout sends one VCU exit for repeated clicks and turns a failed VCU send into an unconfirmed release',async()=>{
+  const repeated=logoutPageFixture();const first=repeated.context.logout(),second=repeated.context.logout();await repeated.settle();
+  assert.equal(repeated.packets.length,1);repeated.telemetry();await repeated.advanceTo(1100);await Promise.all([first,second]);
+  assert.equal(repeated.calls.filter(call=>call.post==='/api/disconnect').length,1);
+  const failed=logoutPageFixture();failed.context.controlChannel.send=()=>{throw Error('DataChannel send failed')};
+  assert.equal((await failed.context.logout()).reason,'request_failed');assert.equal(failed.closeCount(),1);
+  assert(failed.calls.some(call=>call.post==='/api/disconnect'));assert.match(failed.context.statusPanel.textContent,/安全退出未确认/);
+});
+
+test('shipped logout excludes disarmed feedback received during the HTTP preflight before the real VCU request',async()=>{
+  const fixture=logoutPageFixture();let resolvePreflight,reads=0;
+  fixture.context.get=async()=>++reads===1?await new Promise(resolve=>{resolvePreflight=resolve}):fixture.runtime;
+  const exit=fixture.context.logout();await fixture.settle();fixture.telemetry();fixture.context.lastControlStatusSeq=51;
+  await fixture.advanceTo(1100);resolvePreflight(fixture.runtime);await fixture.settle();
+  assert.equal(fixture.packets.length,1);await fixture.advanceTo(1200);assert(!fixture.calls.some(call=>call.post));
+  fixture.telemetry({control_status_seq:52});await fixture.advanceTo(1300);assert.equal((await exit).confirmed,true);
+});
+
+test('shipped logout without an active vehicle releases only the scoped login and does not invent VCU completion',async()=>{
+  const fixture=logoutPageFixture();Object.assign(fixture.context,{nativeControlSessionId:'',nativeControlSessionGeneration:0,nativeControlUiEpoch:0});
+  Object.assign(fixture.runtime,{session_id:'',connected:false,native_control:{ui_control_epoch:0,owner_ui_instance_id:''}});
+  assert.equal((await fixture.context.logout()).reason,'no_active_session');assert.equal(fixture.packets.length,0);
+  const release=fixture.calls.find(call=>call.post==='/api/disconnect');assert.equal(release.body.expected_session_id,'');
+  assert.equal(release.body.expected_control_session_generation,7);assert.equal(release.body.expected_driver_id,'driver');
+  assert.match(fixture.context.statusPanel.textContent,/安全退出未确认.*没有活动车端会话/);
+});
+
+test('shipped logout preserves a new local peer established while the scoped HTTP release is in flight',async()=>{
+  const fixture=logoutPageFixture();let completeRelease;
+  fixture.context.post=async()=>await new Promise(resolve=>{completeRelease=resolve});
+  const exit=fixture.context.logout();await fixture.settle();fixture.telemetry();await fixture.advanceTo(1100);
+  assert(completeRelease);const replacement={connectionState:'connected'};
+  fixture.context.peer=replacement;fixture.context.nativeControlSessionId='replacement';fixture.context.nativeControlSessionGeneration=8;
+  completeRelease({session_id:'session'});await fixture.settle();assert.equal((await exit).reason,'session_changed');
+  assert.equal(fixture.closeCount(),0);assert.equal(fixture.context.peer,replacement);assert.equal(fixture.context.authenticated,true);
+});
+
+test('shipped logout consumes a missing HTTP release response with a bounded unconfirmed result and keeps ESTOP',async()=>{
+  const fixture=logoutPageFixture();fixture.context.estopLatched=true;fixture.context.post=()=>new Promise(()=>{});
+  const exit=fixture.context.logout();await fixture.settle();fixture.telemetry();await fixture.advanceTo(1100);
+  await fixture.advanceTo(2600);assert.equal((await exit).reason,'release_failed');assert.equal(fixture.closeCount(),0);
+  assert.equal(fixture.context.estopLatched,true);assert.equal(fixture.context.safeLogoutAttempt,null);assert.match(fixture.context.statusPanel.textContent,/安全退出未确认/);
+});
+
+test('shipped pagehide preserves the old release scope before clearing local session fields',()=>{
+  const fixture=logoutPageFixture(),listeners=new Map(),requests=[];
+  fixture.context.addEventListener=(event,handler)=>listeners.set(event,handler);fixture.context.flushControlTrace=()=>{};
+  fixture.context.fetch=(url,options)=>{requests.push({url,options});return Promise.resolve({})};
+  const declaration=controlPageSource.split('\n').find(line=>line.startsWith("addEventListener('pagehide'"));assert(declaration);
+  vm.runInContext(declaration,fixture.context);listeners.get('pagehide')();
+  assert.equal(fixture.context.nativeControlSessionId,'');assert.equal(fixture.closeCount(),1);
+  const body=JSON.parse(requests[0].options.body);assert.equal(body.expected_session_id,'session');assert.equal(body.expected_control_session_generation,7);
+  assert.equal(body.expected_ui_control_epoch,3);assert.equal(body.expected_connect_cancellation_generation,9);assert.equal(requests[0].options.keepalive,true);
+});
+
+test('shipped signaling failure releases only its snapshotted scope after closing local transport',async()=>{
+  const fixture=logoutPageFixture();fixture.context.signalingGeneration=1;fixture.context.signalingPollAbort=null;
+  fixture.context.post=async(path,body)=>{if(path==='/api/poll-signaling')throw Error('signal transport lost');fixture.calls.push({post:path,body});return {}};
+  const declaration=controlPageSource.split('\n').find(line=>line.startsWith('async function pollSignaling('));assert(declaration);
+  vm.runInContext(declaration,fixture.context);await fixture.context.pollSignaling(1);
+  const release=fixture.calls.find(call=>call.post==='/api/end-session');assert(release);
+  assert.equal(fixture.context.nativeControlSessionId,'');assert.equal(release.body.expected_session_id,'session');
+  assert.equal(release.body.expected_control_session_generation,7);assert.equal(release.body.expected_ui_control_epoch,3);
+});
+
+test('shipped connect setup failure scopes cleanup to its returned session before clearing local metadata',async()=>{
+  const fixture=logoutPageFixture();Object.assign(fixture.context,{nativeControlSessionId:'',nativeControlSessionGeneration:0,nativeControlUiEpoch:0,
+    polling:false,vehicleSelect:{value:'vehicle'},signalingGeneration:1,controlTraceScope:{},lastNativeIntentSnapshot:'',
+    nativeControlTakeoverPending:false,nativeControlPageRetired:false,flushControlTrace(){},setControlTraceScope(){}});
+  Object.assign(fixture.runtime,{connected:false,session_id:''});Object.assign(fixture.context.latestRuntimeStatus,{connected:false,session_id:''});
+  const connected={driver_id:'driver',vehicle_id:'vehicle',session_id:'new-session',control_session_generation:8,ui_control_epoch:0,connect_cancellation_generation:10};
+  fixture.context.post=async(path,body)=>{
+    fixture.calls.push({post:path,body});if(path==='/api/connect')return connected;
+    if(path==='/api/webrtc/ice-servers')throw Error('media setup failed');return {};
+  };
+  const declaration=controlPageSource.split('\n').find(line=>line.startsWith('async function connect('));assert(declaration);
+  vm.runInContext(declaration,fixture.context);await assert.rejects(fixture.context.connect(),/media setup failed/);
+  const release=fixture.calls.find(call=>call.post==='/api/end-session');assert(release);
+  assert.equal(release.body.expected_session_id,'new-session');assert.equal(release.body.expected_control_session_generation,8);
+  assert.equal(release.body.expected_ui_control_epoch,0);assert.equal(release.body.expected_connect_cancellation_generation,10);
+  assert.equal(fixture.calls.find(call=>call.post==='/api/connect').body.ui_instance_id,'page');
+});
+
+test('shipped logout of an unclaimed session allows only its recorded creator page',async()=>{
+  for(const creator of ['page','other-page',undefined]){
+    const fixture=logoutPageFixture();fixture.context.nativeControlUiEpoch=0;fixture.context.vcuHandshake={supported:false,state:'unsupported'};
+    fixture.runtime.native_control={ui_control_epoch:0,owner_ui_instance_id:''};fixture.runtime.session_creator_ui_instance_id=creator;
+    const result=await fixture.context.logout();assert.equal(result.reason,creator==='page'?'unsupported':'session_changed');
+    assert.equal(fixture.calls.some(call=>call.post==='/api/disconnect'),creator==='page');
+  }
+});
+
+function recordingLane(overrides={}) {
+  return {schema_version:1,configured_enabled:true,active:true,state:'recording',incomplete:false,
+    issue_code:'',next_action:'',recording_attempt_id:'recording-attempt',status_revision:2,
+    accepted_access_units:12,worker_input_access_units:12,finalized_segments:0,unfinished_segments:1,
+    final_eos_received:false,cleanup_pending:false,summary_persisted:true,summary_revision:2,reported_at_utc_ms:100166,...overrides};
+}
+
+async function recordingMonitorFixture() {
+  const fixture=intentPageFixture(['ArrowUp']);await fixture.advanceTo(0);
+  const camera=useProductionCameraView(fixture);useProductionIntentEnvelope(fixture);
+  for(const now of [100,133,166]){await fixture.advanceTo(now);camera.video.frames++;fixture.context.driverCriticalVideoHealth()}
+  const metrics=new Map(),context=fixture.context;
+  class Element {
+    constructor(){this.children=[];this.textContent='';this.className='';this.classList={remove(){},add(){}}}
+    appendChild(child){this.children.push(child)}
+    replaceChildren(){this.children=[]}
+  }
+  const document={createElement:()=>new Element(),getElementById:id=>{if(!metrics.has(id))metrics.set(id,new Element());return metrics.get(id)}};
+  class Clock extends Date {static now(){return 100000+context.performance.now()}}
+  Object.assign(context,{document,Date:Clock,authenticated:true,mediaStatus:{lanes:[]},mediaStatusReceivedAt:null,
+    recordingMonitorState:{scopeKey:'',incomplete:false},latestMetrics:{codec:'h264',backend:'software',streams:[{camera_id:'front',fps:30,bitrate_kbps:2000,packet_loss_percent:0,estimated_end_to_end_latency_ms:100}]},
+    monitorPanel:new Element(),alertsPanel:new Element(),streamMetrics:new Element(),vehicleSelect:{value:'vehicle'},lastAlertKey:'',
+    renderEstopRequest(){},renderControlRecovery:()=>({visible:false}),renderVcuHandshake(){},renderCanFeedback(){},renderControlState(){},
+    hasTurnServer:()=>false,formatMetric:(value,digits,suffix)=>value==null?'未知':Number(value).toFixed(digits)+(suffix||''),
+    updateVcuHandshakeState(){throw Error('recording-only status changed the VCU gate')}});
+  Object.assign(context.latestRuntimeStatus,{vehicle_id:'vehicle',connected:true,session_id:'test-session',
+    authorized_vehicles:[{vehicle_id:'vehicle',online:true}],time_sync:{synchronized:true,uncertainty_ms:1,offset_ms:0}});
+  context.consoleConfig.max_time_sync_uncertainty_ms=25;
+  const render=controlPageSource.split('\n').find(line=>line.startsWith('function renderMonitoring('));assert(render);
+  const metric=controlPageSource.split('\n').find(line=>line.startsWith('function setMetric('));assert(metric);
+  const a=controlPageSource.indexOf('function renderRecordingStatus('),b=controlPageSource.indexOf('function driverTimeSyncReady(',a);
+  const apply=controlPageSource.match(/^function applyMediaStatus\(payload\)\{[\s\S]*?^\}/m);assert(a>=0&&b>a&&apply);
+  vm.runInContext(metric+'\n'+controlPageSource.slice(a,b)+'\n'+render+'\n'+apply[0],context);
+  const publish=(recording,extra={})=>context.applyMediaStatus({vehicle_id:'vehicle',session_id:'test-session',reported_at_utc_ms:Clock.now(),
+    control_issue_code:'',lanes:[{camera_id:'front',critical_for_control:true,recording}],...extra});
+  return {fixture,context,metrics,publish,camera};
+}
+
+test('actual shipped monitor reports recording failures and next action without changing held input or video readiness',async()=>{
+  const {fixture,context,metrics,publish}=await recordingMonitorFixture();
+  const input=JSON.stringify(context.currentControl()),profile=JSON.stringify(context.controlProfileState);
+  const intent=JSON.stringify(context.nativeIntentEnvelope(context.currentControl()));assert.equal(context.driverCriticalVideoHealth().ready,true);
+  publish(recordingLane({state:'failed',active:false,incomplete:true,issue_code:'recording_disk_full',next_action:'车辆空闲后清理磁盘空间，再检查录制日志'}));
+  assert.equal(metrics.get('metric-recording').textContent,'录像不完整');assert.match(context.alertsPanel.textContent,/front.*录像不完整.*下一步.*清理磁盘/);
+  assert.equal(context.alertsPanel.className,'alerts warn');assert.equal(context.driverCriticalVideoHealth().ready,true);
+  assert.equal(JSON.stringify(context.currentControl()),input);assert.equal(JSON.stringify(context.controlProfileState),profile);
+  assert.equal(JSON.stringify(context.nativeIntentEnvelope(context.currentControl())),intent);assert(fixture.pressed.has('ArrowUp'));assert.equal(fixture.requests.length,0);
+  publish(recordingLane());assert.equal(metrics.get('metric-recording').textContent,'录像不完整');assert.match(context.alertsPanel.textContent,/不能补回此前缺口/);
+});
+
+test('actual shipped monitor keeps missing, mismatched and expired recording status unconfirmed',async()=>{
+  const {context,metrics,publish}=await recordingMonitorFixture();
+  publish(undefined);assert.match(metrics.get('metric-recording').textContent,/未确认/);
+  publish(recordingLane(),{session_id:'old-session'});assert.match(metrics.get('metric-recording').textContent,/未确认/);
+  publish(recordingLane(),{reported_at_utc_ms:0});assert.match(metrics.get('metric-recording').textContent,/未确认/);
+  publish(recordingLane());assert.match(metrics.get('metric-recording').textContent,/录制进行中.*待结束确认/);
+  context.mediaStatusReceivedAt-=3001;context.renderMonitoring();assert.match(metrics.get('metric-recording').textContent,/未确认/);
+});
+
+test('actual shipped monitor cannot refresh stale worker evidence with a new parent poll',async()=>{
+  const {context,metrics,publish}=await recordingMonitorFixture();
+  for(const workerTime of [undefined,null,0,97165,100167,'100166']){
+    publish(recordingLane({reported_at_utc_ms:workerTime}));
+    assert.match(metrics.get('metric-recording').textContent,/未确认/);
+    assert.equal(context.driverCriticalVideoHealth().ready,true);assert(context.currentControl().throttle>0);
+  }
+  publish(recordingLane({reported_at_utc_ms:97166}));assert.match(metrics.get('metric-recording').textContent,/录制进行中/);
+  publish(recordingLane({state:'failed',active:false,incomplete:true,issue_code:'recording_admission_overflow',reported_at_utc_ms:97165}));
+  assert.match(metrics.get('metric-recording').textContent,/录像不完整.*未确认/);
+  publish(recordingLane());assert.equal(metrics.get('metric-recording').textContent,'录像不完整');
+});
+
+test('actual shipped monitor accepts only real final EOS and closed segment evidence for current-attempt finalization',async()=>{
+  const {context,metrics,publish}=await recordingMonitorFixture();
+  const finalized=recordingLane({active:false,state:'finalized',final_eos_received:true,finalized_segments:1,unfinished_segments:0});
+  for(const bad of [{final_eos_received:false},{unfinished_segments:1},{finalized_segments:0},{worker_input_access_units:11},{summary_persisted:false},{status_revision:0}]){
+    publish({...finalized,...bad});assert.match(metrics.get('metric-recording').textContent,/未确认/);assert.doesNotMatch(metrics.get('metric-recording').textContent,/封装完成/);
+  }
+  publish(finalized);assert.match(metrics.get('metric-recording').textContent,/本次录像封装完成/);
+  publish({...finalized,incomplete:true});assert.match(metrics.get('metric-recording').textContent,/完整性待确认/);
+  publish(finalized);assert.match(metrics.get('metric-recording').textContent,/完整性待确认/);
+  context.nativeControlSessionId='new-session';publish(finalized,{session_id:'new-session'});assert.match(metrics.get('metric-recording').textContent,/本次录像封装完成/);
+});
+
+test('actual shipped monitor handles malformed and duplicate recording lanes without throwing or claiming readiness',async()=>{
+  const {context,metrics,publish}=await recordingMonitorFixture();
+  for(const lanes of [[null],[false],[3],['invalid'],[{camera_id:'front',recording:3}],
+    [{camera_id:'front',recording:recordingLane()},{camera_id:'front',recording:recordingLane()}],
+    [{camera_id:'front',recording:recordingLane({accepted_access_units:null})}],
+    [{camera_id:'front',recording:recordingLane({incomplete:'false'})}],
+    [{camera_id:null,recording:recordingLane({incomplete:true,issue_code:'recording_admission_overflow'})}],
+    [{camera_id:'front',recording:recordingLane({configured_enabled:false,active:true,state:'disabled'})}],
+    [{camera_id:'front',recording:recordingLane({configured_enabled:false,active:false,state:'recording'})}]]){
+    assert.doesNotThrow(()=>publish(undefined,{lanes}));assert.match(metrics.get('metric-recording').textContent,/未确认/);
+    assert.equal(context.driverCriticalVideoHealth().ready,true);
+  }
+  context.latestRuntimeStatus.vehicle_id=undefined;publish(recordingLane(),{vehicle_id:undefined});
+  assert.match(metrics.get('metric-recording').textContent,/未确认/);
+});
+
+test('actual shipped monitor distinguishes unconfirmed finalization evidence from proven AU loss and scopes both to the current session',async()=>{
+  const {context,metrics,publish,fixture}=await recordingMonitorFixture();
+  const input=JSON.stringify(context.currentControl());
+  publish(recordingLane({state:'failed',active:false,incomplete:true,issue_code:'recording_status_unconfirmed',
+    next_action:'保留片段并核查最终封装证据'}));
+  assert.match(metrics.get('metric-recording').textContent,/证据不足.*完整性待确认/);
+  assert.match(context.alertsPanel.textContent,/保留片段.*封装证据/);assert.doesNotMatch(context.alertsPanel.textContent,/缺口|缺录|无法补录|不能补回/);
+  publish(recordingLane({active:false,state:'finalized',final_eos_received:true,finalized_segments:1,unfinished_segments:0}));
+  assert.match(metrics.get('metric-recording').textContent,/完整性待确认/);assert.doesNotMatch(context.alertsPanel.textContent,/缺口|不能补回/);
+  publish(recordingLane({state:'failed',active:false,incomplete:true,issue_code:'recording_admission_overflow'}));
+  assert.equal(metrics.get('metric-recording').textContent,'录像不完整');assert.match(context.alertsPanel.textContent,/已确认缺口.*不能补回/);
+  publish(recordingLane({state:'failed',active:false,incomplete:true,issue_code:'recording_status_unconfirmed'}));
+  assert.equal(metrics.get('metric-recording').textContent,'录像不完整');assert.match(context.alertsPanel.textContent,/已确认缺口/);
+  context.nativeControlSessionId='new-session';publish(recordingLane({state:'failed',active:false,incomplete:true,issue_code:'recording_status_unconfirmed'}),{session_id:'new-session'});
+  assert.match(metrics.get('metric-recording').textContent,/完整性待确认/);assert.doesNotMatch(context.alertsPanel.textContent,/已确认缺口|不能补回/);
+  publish(recordingLane(),{session_id:'new-session'});assert.match(metrics.get('metric-recording').textContent,/完整性待确认/);
+  context.nativeControlSessionId='third-session';publish(recordingLane(),{session_id:'third-session'});
+  assert.match(metrics.get('metric-recording').textContent,/录制进行中/);assert.equal(context.recordingMonitorState.incomplete,false);
+  assert.equal(JSON.stringify(context.currentControl()),input);assert.equal(context.driverCriticalVideoHealth().ready,true);assert.equal(fixture.requests.length,0);
+});
+
+test('actual shipped monitor renders vehicle-only ESTOP and its source in the critical banner before recovery and recording warnings',async()=>{
+  const {context,publish}=await recordingMonitorFixture();
+  context.estopStatus={hidden:true,textContent:''};context.controlRecoveryStatus={hidden:true,textContent:''};
+  context.vehicleTelemetry=null;context.vehicleTelemetryReceivedAt=null;context.polling=true;
+  const banner=controlPageSource.split('\n').find(line=>line.startsWith('function renderEstopRequest('));
+  const recovery=controlPageSource.split('\n').find(line=>line.startsWith('function renderControlRecovery('));
+  assert(banner);assert(recovery);vm.runInContext(banner+'\n'+recovery,context);
+  publish(recordingLane({state:'failed',active:false,incomplete:true,issue_code:'recording_admission_overflow',next_action:'检查录像存储'}));
+  context.estopLatched=false;
+  for(const [source,reason,label] of [['physical_estop','physical-test-reason',/物理急停/],
+    ['page_request','page-test-reason',/控制页面/],['software_fault','software-test-reason',/软件故障/],['unknown_source','',/车端遥测.*急停/]]){
+    context.vehicleTelemetry={estop:true,stop_source:source,stop_reason:reason,safety_state:'ESTOP',
+      sent_at_utc_ms:context.Date.now(),control_timing:{control_braking_wait:true,control_recovery_cause:'critical_video'}};
+    context.vehicleTelemetryReceivedAt=context.performance.now();context.renderMonitoring();
+    assert.equal(context.estopLatched,false);assert.equal(context.estopStatus.hidden,false);assert.match(context.estopStatus.textContent,label);
+    assert.equal(context.alertsPanel.className,'alerts critical');assert.match(context.alertsPanel.textContent,label);
+    assert.match(context.alertsPanel.textContent,/录像不完整/);assert.equal(context.controlRecoveryStatus.hidden,true);
+    if(reason){assert(context.estopStatus.textContent.includes(reason));assert(context.alertsPanel.textContent.includes(reason))}
+    const shown=context.estopStatus.textContent;context.renderEstopRequest();assert.equal(context.estopStatus.textContent,shown);
+  }
+  context.estopLatched=true;context.vehicleTelemetry={estop:true,stop_source:'physical_estop',stop_reason:'still-physical'};
+  context.renderMonitoring();assert.match(context.estopStatus.textContent,/物理急停.*still-physical/);
+  context.vehicleTelemetry=null;context.renderMonitoring();assert.match(context.estopStatus.textContent,/请求已锁定.*等待车端/);
+  assert.equal(context.alertsPanel.className,'alerts critical');
+  context.estopLatched=false;context.renderMonitoring();assert.equal(context.estopStatus.hidden,true);
+  assert.equal(context.alertsPanel.className,'alerts warn');assert.match(context.alertsPanel.textContent,/录像不完整/);
+});
+
+test('offline AbortController delivers one abort event and preserves its reason without disabling production cancellation',()=>{
+  const controller=new OfflineAbortController(),reason=Object.assign(Error('deadline'),{name:'AbortError'}),events=[];
+  controller.signal.addEventListener('abort',event=>events.push(event));controller.abort(reason);controller.abort(Error('second'));
+  assert.equal(controller.signal.aborted,true);assert.equal(controller.signal.reason,reason);assert.equal(events.length,1);assert.equal(events[0].target,controller.signal);
+});
+
+// An unresolved Promise alone does not keep Node alive. A stuck asynchronous
+// safety test must fail, rather than let the process exit with a false green.
+const completionDeadline = setTimeout(() => {
+  console.error(`Unfinished control logic tests: ${Array.from(unfinishedTests).join(', ')}`);
+  process.exitCode = 1;
+}, 10000);
 Promise.all(pendingTests).then(() => {
+  clearTimeout(completionDeadline);
   if (failed > 0) {
     console.error(`${failed} of ${passed + failed} control logic tests failed`);
     process.exitCode = 1;

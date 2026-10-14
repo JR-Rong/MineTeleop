@@ -98,8 +98,8 @@ class MediaSignalingSequence {
   std::uint64_t value_{0};
 };
 
-// Only a sustained recoverable control fault latches the session. The braking
-// deadline also survives reconstruction so retries cannot extend it forever.
+// Recoverable readiness faults retain the session and its independent brake.
+// Explicit inhibition remains reserved for non-recoverable safety failures.
 inline constexpr int kCriticalCameraStartupTimeoutMs = 15000;
 inline constexpr int kControlRecoveryStableMs = 300;
 enum class ControlRecoveryPhase { Ready, BrakingWait, Recovered, Locked };
@@ -108,6 +108,23 @@ enum class NeutralHeartbeatGate { Accepted, InactiveState, NativeGap };
     SafetyState state, bool braking_wait, std::int64_t native_gap_ms, int degraded_timeout_ms);
 [[nodiscard]] bool camera_encoded_frame_fresh(
     std::int64_t last_encoded_ms, std::int64_t now_ms, int timeout_ms);
+
+struct ReadinessSampleRevision {
+  std::string source;
+  std::uint64_t bad{0};
+  std::uint64_t brake{0};
+};
+struct ReadinessRevisionChanges { bool bad{false}; bool brake{false}; };
+// Persistent producer revisions survive latest-value coalescing. The current
+// bounded source set replaces the previous set; no historical source list grows.
+class ReadinessRevisionFence {
+ public:
+  [[nodiscard]] ReadinessRevisionChanges observe(const std::vector<ReadinessSampleRevision>& sources);
+  void reset() { initialized_ = false; sources_.clear(); }
+ private:
+  bool initialized_{false};
+  std::vector<ReadinessSampleRevision> sources_;
+};
 
 class SessionControlRecoveryLatch {
  public:
@@ -126,13 +143,19 @@ class SessionControlRecoveryLatch {
   [[nodiscard]] ControlRecoveryPhase observe_recovery(
       std::string_view session_id, bool ready, std::int64_t now_ms, int recovery_timeout_ms,
       ControlRecoveryCause cause = ControlRecoveryCause::CriticalVideo);
+  [[nodiscard]] ControlRecoveryPhase observe_readiness(
+      std::string_view session_id, bool ready, std::int64_t now_ms, int recovery_timeout_ms,
+      ControlRecoveryCause cause, const std::vector<ReadinessSampleRevision>& sources);
   [[nodiscard]] bool braking_wait_for(std::string_view session_id) const;
   [[nodiscard]] ControlRecoveryCause cause_for(std::string_view session_id) const;
   [[nodiscard]] std::optional<std::int64_t> deadline_for(std::string_view session_id) const;
   [[nodiscard]] Json recovery_status_for(std::string_view session_id) const;
 
  private:
+  [[nodiscard]] ControlRecoveryPhase observe_recovery_locked(
+      bool ready, std::int64_t now_ms, int recovery_timeout_ms, ControlRecoveryCause cause);
   mutable std::mutex mutex_;
+  ReadinessRevisionFence revisions_;
   std::string session_id_;
   bool inhibited_{false};
   bool armed_{false};
@@ -162,12 +185,24 @@ struct EncodedFrame {
   std::uint64_t source_sequence_gap{0};
   std::uint32_t source_timeperframe_numerator{0};
   std::uint32_t source_timeperframe_denominator{0};
+  // Host monotonic acquisition time; device timestamp is used only when the
+  // driver explicitly labels it monotonic. This is independent of wall jumps.
+  std::chrono::steady_clock::time_point captured_steady_at{};
 
+};
+
+// Explicit opt-in for the supervised bench utility only. The source borrows
+// this descriptor until lazy startup then owns a CLOEXEC duplicate of the same
+// open file-description. The supervisor retains the original through restore.
+struct BenchPreopenedV4l2Fd {
+  int value{-1};
+  std::function<void(std::string_view, int, int, const Json&)> observe_ioctl;
 };
 
 class CameraFrameSource {
  public:
   CameraFrameSource(CameraConfig camera, MediaProfile profile, int frame_timeout_ms = 3000);
+  CameraFrameSource(CameraConfig camera, MediaProfile profile, int frame_timeout_ms, BenchPreopenedV4l2Fd bench);
   ~CameraFrameSource();
 
   CameraFrameSource(const CameraFrameSource&) = delete;
@@ -210,6 +245,7 @@ class CameraFrameSource {
   int child_pid_{-1};
   std::string buffer_;
   int device_fd_{-1};
+  BenchPreopenedV4l2Fd bench_preopened_;
   bool streaming_{false};
   int output_width_{0};
   int output_height_{0};
@@ -229,6 +265,11 @@ class CameraFrameSource {
   int last_v4l2_poll_revents_{0};
   std::uint64_t v4l2_dequeue_eagain_count_{0};
   std::int64_t last_read_duration_ms_{0};
+  bool last_capture_used_device_timestamp_{false};
+  bool v4l2_timeperframe_readback_{false};
+  bool v4l2_timeperframe_set_accepted_{false};
+  std::uint32_t v4l2_set_timeperframe_numerator_{0};
+  std::uint32_t v4l2_set_timeperframe_denominator_{0};
   std::vector<MappedBuffer> mapped_buffers_;
 };
 

@@ -1104,16 +1104,48 @@
     const reasons = {critical_video: '关键视频中断或无新帧', time_sync: '时间同步不可信',
       input_lease: '驾驶输入刷新过期', control_link: '控制链路 ACK 确认暂时中断', control_delay: '控制指令延迟或短暂中断'};
     const reason = reasons[cause] || '控制链路暂时异常';
+    const guidance = controlRecoveryGuidance(timing, feedbackFresh);
     // Report the last authoritative vehicle state without claiming that old
     // feedback confirms current physical braking or a completed stop.
     const banner = !feedbackFresh
       ? `车端此前已报告${waiting || holding ? '制动等待' : '控制暂缓'}（${reason}）；反馈已过期，当前控制状态待确认。`
-      : holding && !waiting
-        ? `链路已恢复，车端制动保持；当前会话保留，请释放旧按键后重新按下继续控车。`
-        : waiting
-          ? `车端制动等待：${reason}；当前会话保留。恢复后释放旧按键再重新按下；持续故障将安全停车。`
+      : guidance.visible
+        ? `车端报告${waiting ? '制动等待' : '制动保持'}；当前会话保留。${guidance.text}`
           : `车端控制暂缓：${reason}，牵引已撤销；当前会话保留。请释放旧按键再重新按下；持续无有效控制将安全停车。`;
     return {visible: true, severity: 'warn', banner, alert: banner, cause};
+  }
+
+  function controlRecoveryGuidance(timingValue, feedbackFresh = true) {
+    const timing = timingValue && typeof timingValue === 'object' ? timingValue : {};
+    const waiting = timing.control_braking_wait === true;
+    const holding = timing.recovery_brake_hold === true;
+    const rearm = timing.rearm_required === true;
+    const hidden = {visible: false, phase: 'none', causes: [], reason: '', nextStep: '', text: ''};
+    if (!waiting && !holding && !rearm) return hidden;
+    const labels = {critical_video: '关键视频未就绪', input_lease: '驾驶输入刷新未就绪',
+      control_link: '控制链路 ACK 确认未就绪', time_sync: '时间同步不可信'};
+    const causes = [];
+    if (timing.critical_video_required !== false && timing.driver_critical_video_ready === false) causes.push('critical_video');
+    if (timing.operator_input_ready === false) causes.push('input_lease');
+    if (timing.driver_control_link_ready === false) causes.push('control_link');
+    if (timing.driver_time_sync_ready === false) causes.push('time_sync');
+    let phase, reason, nextStep;
+    if (!feedbackFresh) {
+      phase = 'feedback_unknown'; reason = '车端恢复反馈已过期，当前状态待确认';
+      nextStep = '保持方向输入释放，等待新鲜车端反馈';
+    } else if (causes.length || timing.recovery_samples_healthy !== true) {
+      phase = 'wait_conditions'; reason = causes.length ? causes.map(cause => labels[cause]).join('、') :
+        timing.recovery_samples_healthy === false ? '必需条件尚未连续健康' : '必需条件恢复尚未确认';
+      if (!causes.length && timing.recovery_samples_healthy !== false && labels[timing.control_recovery_cause]) reason += `（上次：${labels[timing.control_recovery_cause]}）`;
+      nextStep = '保持方向输入释放，等待条件恢复及连续健康确认';
+    } else if (waiting) {
+      phase = 'healthy_window'; reason = '必需条件正在连续健康确认';
+      nextStep = '保持方向输入释放，等待 300 ms 连续健康确认后再重新操作';
+    } else {
+      phase = 'await_fresh_input'; reason = '等待新的驾驶操作，制动保持';
+      nextStep = '释放旧方向输入、归零后重新按下；持续制动可保持';
+    }
+    return {visible: true, phase, causes, reason, nextStep, text: `当前阻挡：${reason} · 下一步：${nextStep}`};
   }
 
   function deriveControlCommandRejection(issueCodeValue) {
@@ -1415,6 +1447,116 @@
     };
   }
 
+  function recordingPresentation(status, scope, receivedAtMonotonicMs, nowMonotonicMs, synchronizedNowMs, previous = {}) {
+    const scopeKey = scope && scope.session_id ? `${scope.vehicle_id}:${scope.session_id}` : '';
+    if (!scopeKey) return {scopeKey, incomplete: false, text: '未连接', level: '', alerts: []};
+    const matches = scope && typeof scope.vehicle_id === 'string' && scope.vehicle_id && typeof scope.session_id === 'string' && scope.session_id &&
+        status && status.session_id === scope.session_id && status.vehicle_id === scope.vehicle_id;
+    const lanes = matches && Array.isArray(status.lanes) ? status.lanes : [];
+    const gap = previous.scopeKey === scopeKey && previous.incomplete === true ||
+        lanes.some(lane => lane && typeof lane === 'object' && typeof lane.camera_id === 'string' && lane.camera_id &&
+          lane.recording && lane.recording.schema_version === 1 && typeof lane.recording.incomplete === 'boolean' &&
+          (lane.recording.incomplete === true || lane.recording.state === 'failed'));
+    // The producer also sets incomplete for lost finalization evidence. Only
+    // a known AU/storage loss cause proves a gap; do not turn unknown into loss.
+    const knownLoss = record => ['recording_admission_overflow', 'recording_invalid_access_unit', 'recording_disk_full'].includes(record.issue_code);
+    const gapConfirmed = previous.scopeKey === scopeKey && previous.gapConfirmed === true ||
+        lanes.some(lane => lane && typeof lane.camera_id === 'string' && lane.camera_id && lane.recording &&
+          lane.recording.schema_version === 1 && typeof lane.recording.incomplete === 'boolean' &&
+          (lane.recording.incomplete === true || lane.recording.state === 'failed') && knownLoss(lane.recording));
+    const idleAction = '车辆空闲后检查存储空间、目录权限和车端录制日志';
+    const unknown = () => ({scopeKey, incomplete: gap, gapConfirmed, text: gapConfirmed ? '录像不完整，当前状态未确认' : gap ? '录像证据不足，完整性待确认' : '录像状态未确认',
+      level: 'warn', alerts: [`${gapConfirmed ? '本会话录像存在已确认缺口；' : gap ? '录像证据不足，完整性待确认；' : ''}录像状态未确认。下一步：${idleAction}；保留已有片段和日志，旧版车端请更新以取得录制反馈。`]});
+    // Media status normally arrives once per second. This three-second bound
+    // controls diagnostic presentation only, never the critical-video gate.
+    if (!matches || !lanes.length || lanes.length > 64 || !Number.isFinite(receivedAtMonotonicMs) ||
+        !Number.isFinite(nowMonotonicMs) || nowMonotonicMs < receivedAtMonotonicMs || nowMonotonicMs - receivedAtMonotonicMs > 3000 ||
+        !Number.isFinite(status.reported_at_utc_ms) || !Number.isFinite(synchronizedNowMs) ||
+        status.reported_at_utc_ms > synchronizedNowMs || synchronizedNowMs - status.reported_at_utc_ms > 3000) return unknown();
+    const states = ['disabled', 'starting', 'recording', 'failed', 'finalizing', 'finalized', 'cleanup_pending'];
+    const number = value => Number.isSafeInteger(value) && value >= 0;
+    if (lanes.some(lane => !lane || typeof lane !== 'object' || typeof lane.camera_id !== 'string' || !lane.camera_id || !lane.recording ||
+        lane.recording.schema_version !== 1 || !states.includes(lane.recording.state) ||
+        typeof lane.recording.recording_attempt_id !== 'string' || lane.recording.configured_enabled === true && !lane.recording.recording_attempt_id ||
+        lane.recording.configured_enabled === false && (lane.recording.active !== false || lane.recording.state !== 'disabled') ||
+        ['configured_enabled', 'active', 'incomplete', 'final_eos_received', 'cleanup_pending', 'summary_persisted']
+          .some(key => typeof lane.recording[key] !== 'boolean') ||
+        ['accepted_access_units', 'worker_input_access_units', 'finalized_segments', 'unfinished_segments', 'status_revision', 'summary_revision']
+          .some(key => !number(lane.recording[key]))) || new Set(lanes.map(lane => lane.camera_id)).size !== lanes.length) return unknown();
+    const enabled = lanes.filter(lane => lane.recording.configured_enabled === true);
+    // A fresh parent poll can carry old child status. Use the worker's source
+    // timestamp too; receiving the same status again cannot renew its evidence.
+    if (enabled.some(lane => !number(lane.recording.reported_at_utc_ms) || lane.recording.reported_at_utc_ms === 0 ||
+        lane.recording.reported_at_utc_ms > synchronizedNowMs || synchronizedNowMs - lane.recording.reported_at_utc_ms > 3000)) return unknown();
+    const action = lane => typeof lane.recording.next_action === 'string' && lane.recording.next_action.trim()
+      ? lane.recording.next_action.trim().slice(0, 512) : idleAction;
+    if (gap) {
+      const faults = enabled.filter(lane => lane.recording.incomplete || lane.recording.state === 'failed' || lane.recording.cleanup_pending);
+      const alerts = faults.length ? faults.map(lane => `${lane.camera_id}：${knownLoss(lane.recording) ? '录像不完整，已确认缺口，不能补回此前缺录' : '录像证据不足，完整性待确认'}${lane.recording.cleanup_pending ? '，收尾未完成' : ''}。下一步：${action(lane)}。`) : [];
+      if (gapConfirmed) alerts.push(`本会话录像存在已确认缺口；当前录制恢复也不能补回此前缺口。下一步：${idleAction}，保存现有日志和录像供核查。`);
+      else if (!faults.length) alerts.push(`此前录像完整性尚未获确认；当前录制恢复不能证明此前完整。下一步：${idleAction}，保留已有片段和日志核查封装证据。`);
+      return {scopeKey, incomplete: true, gapConfirmed, text: gapConfirmed ? '录像不完整' : '录像证据不足，完整性待确认', level: 'warn', alerts};
+    }
+    if (!enabled.length) return {scopeKey, incomplete: false, text: '未启用', level: '', alerts: []};
+    if (enabled.every(lane => {const value=lane.recording;return value.state==='finalized' && !value.active && value.final_eos_received &&
+        !value.cleanup_pending && value.summary_persisted && value.accepted_access_units>0 &&
+        value.worker_input_access_units===value.accepted_access_units && value.finalized_segments>0 && value.unfinished_segments===0 && value.status_revision>0 && value.summary_revision>0}))
+      return {scopeKey, incomplete: false, text: '车端报告本次录像封装完成', level: '', alerts: []};
+    if (enabled.some(lane => lane.recording.cleanup_pending)) return {scopeKey, incomplete: false, text: '录像收尾未完成', level: 'warn',
+      alerts: [`录像收尾仍待确认。下一步：${idleAction}，等待车端完成清理；保留已有片段。`]};
+    if (enabled.some(lane => lane.recording.state==='finalizing')) return {scopeKey, incomplete: false, text: '录像封装中', level: 'warn', alerts: []};
+    if (enabled.every(lane => lane.recording.state==='recording' && lane.recording.active && lane.recording.worker_input_access_units>0))
+      return {scopeKey, incomplete: false, text: '录制进行中，完整性待结束确认', level: '', alerts: []};
+    if (enabled.some(lane => lane.recording.state==='starting')) return {scopeKey, incomplete: false, text: '录像启动中', level: 'warn', alerts: []};
+    return unknown();
+  }
+
+  function safeLogoutFeedback(request, message, receivedAtMonotonicMs, nowMonotonicMs, synchronizedNowMs) {
+    const rejected = reason => ({confirmed: false, reason});
+    if (!request || !message || message.event !== 'vehicle_telemetry') return rejected('feedback_missing');
+    if (message.session_id !== request.session_id || message.vehicle_id !== request.vehicle_id || message.driver_id !== request.driver_id) return rejected('session_changed');
+    if (!Number.isSafeInteger(message.control_status_seq) || message.control_status_seq <= request.status_floor ||
+        !Number.isFinite(receivedAtMonotonicMs) || receivedAtMonotonicMs < request.started_at_monotonic_ms) return rejected('feedback_not_new');
+    if (!Number.isFinite(synchronizedNowMs) || !Number.isFinite(request.source_floor_utc_ms)) return rejected('clock_untrusted');
+    const sentAt = message.sent_at_utc_ms;
+    if (!Number.isFinite(sentAt) || sentAt < request.source_floor_utc_ms || sentAt > synchronizedNowMs ||
+        !telemetryFreshness(message, receivedAtMonotonicMs, nowMonotonicMs, synchronizedNowMs).fresh) return rejected('feedback_stale');
+    const adapter = message.vehicle_adapter || {}, handshake = message.vcu_handshake || {}, feedback = message.can_feedback || {};
+    if (adapter.opened !== true || adapter.healthy !== true || adapter.last_error || handshake.state === 'fault' || handshake.state === 'closed') return rejected('adapter_failed');
+    // The current bridge exposes Disarmed only after the final safe CAN batch
+    // succeeded. A local command/HTTP response or a cached handshake is not evidence.
+    if (handshake.supported !== true || handshake.state !== 'disarmed' || handshake.disarming !== false ||
+        handshake.ready !== false || handshake.requested !== false) return rejected('disarm_pending');
+    const parked = Array.isArray(feedback.parking_brake_valid) && feedback.parking_brake_valid.length === 4 &&
+        feedback.parking_brake_valid.every(value => value === true) && Array.isArray(feedback.parking_brake_status) &&
+        feedback.parking_brake_status.length === 4 && feedback.parking_brake_status.every(value => value === 2);
+    // Keep the bridge's existing 0.1 m/s stopped tolerance; this is protocol
+    // evidence, not a new chassis threshold or proof of mechanical parking.
+    if (feedback.supported !== true || feedback.feedback_fresh !== true || !Number.isFinite(feedback.max_feedback_age_ms) ||
+        feedback.max_feedback_age_ms < 0 || feedback.max_feedback_age_ms > 500 || feedback.speed_valid !== true ||
+        !Number.isFinite(feedback.speed_mps) || Math.abs(feedback.speed_mps) > 0.1 || feedback.gear_valid !== true ||
+        feedback.gear !== 1 || feedback.handshake_valid !== true || feedback.handshake_status !== 3 || !parked) return rejected('can_feedback_unconfirmed');
+    return {confirmed: true, reason: 'disarm_confirmed', control_status_seq: message.control_status_seq, estop_confirmed: message.estop === true};
+  }
+
+  function safeLogoutPresentation(result, released, estopLatched) {
+    const labels = {feedback_missing: '尚无车端反馈', feedback_not_new: '未收到退出请求后的新反馈',
+      feedback_stale: '车端反馈已过期', clock_untrusted: '反馈源时间不可信', adapter_failed: '车端适配器或 CAN 故障',
+      disarm_pending: '车端退出尚未完成', can_feedback_unconfirmed: '完整 CAN 退出反馈未确认',
+      timeout: '等待车端确认超时', link_lost: '反馈链路中断', session_changed: '会话或操作页面已变化',
+      unsupported: '当前适配器没有可验证的 VCU 退出反馈', no_active_session: '没有活动车端会话',
+      request_failed: '退出请求未确认', release_failed: '控制会话释放未确认'};
+    const confirmed = result && result.confirmed === true && released === true;
+    const reason = labels[result && result.reason] || '车端安全状态未确认';
+    let text = confirmed
+      ? '车端退出协议及最终 CAN 写入已确认；控制会话已释放。下一步：在车辆本地核实停车状态。'
+      : `${released ? '控制会话已释放；' : ''}安全退出未确认（${reason}）。下一步：在车辆本地核实停车和制动状态；必要时使用物理急停。`;
+    if (estopLatched) text += result && result.estop_confirmed === true
+      ? ' 此次退出期间车端已报告急停；急停请求仍保持锁存，须本地确认后复位。'
+      : ' 急停请求仍保持锁存；请在车辆本地核实，须本地确认后复位。';
+    return {confirmed, text};
+  }
+
   function selectedIcePair(report) {
     for (const stat of report.values()) {
       if (stat.type !== 'transport' || !stat.selectedCandidatePairId) continue;
@@ -1474,6 +1616,7 @@
     reduceStatusSequence,
     deriveEstopPresentation,
     deriveControlRecoveryPresentation,
+    controlRecoveryGuidance,
     deriveControlCommandRejection,
     isCurrentPeer,
     isCurrentControlChannel,
@@ -1490,6 +1633,9 @@
     reduceControlOutcome,
     controlOutcomesBalanced,
     telemetryFreshness,
+    recordingPresentation,
+    safeLogoutFeedback,
+    safeLogoutPresentation,
     selectedIcePair,
   });
 });
