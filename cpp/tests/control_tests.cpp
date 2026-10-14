@@ -504,9 +504,12 @@ void test_time_uncertainty_covers_the_median_shift_from_best_sample() {
   mine_teleop::SimpleHttpServer server("127.0.0.1", 0, [&](const mine_teleop::HttpRequest& request) {
     const int index = sample++;
     const auto sent = std::stoll(request.query.at("client_send_ms"));
-    const auto delay = index == 0 ? 20 : index == 1 ? 80 : 100;
-    const auto synthetic_time = sent + delay / 2 + (index == 0 ? 0 : 20);
+    const auto delay = index == 0 ? 20 : index == 1 ? 200 : 250;
     std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    // Use elapsed UTC at the actual reply boundary, rather than assuming
+    // sleep_for(delay) also equals the real HTTP exchange duration. Keep a
+    // large offset separation so CI scheduling jitter cannot erase the case.
+    const auto synthetic_time = (sent + mine_teleop::now_ms()) / 2 + (index == 0 ? 0 : 500);
     return mine_teleop::ServerResponse::json(200, {{"client_send_ms", sent},
         {"server_receive_ms", synthetic_time}, {"server_send_ms", synthetic_time}});
   });
@@ -519,8 +522,8 @@ void test_time_uncertainty_covers_the_median_shift_from_best_sample() {
   });
   const auto best_radius = (best.at("round_trip_ms").get<std::int64_t>() + 1) / 2;
   const auto shifted = std::abs(status.offset_ms - best.at("offset_ms").get<std::int64_t>());
-  expect(shifted >= 5 && status.uncertainty_ms >= best_radius + shifted && !status.anchor_accepted,
-      "median estimate falsely narrowed the valid low-RTT sample's error interval");
+  expect(shifted >= 250 && status.uncertainty_ms >= best_radius + shifted && !status.anchor_accepted,
+      "median estimate falsely narrowed the valid low-RTT sample's error interval: " + status.to_json(true).dump());
   server.stop();
 }
 
@@ -6775,7 +6778,9 @@ void test_driver_login_failure_rate_limit_and_recovery() {
   config.driver_vehicle_permissions = {{"driver-1", {"vehicle-1"}}};
   config.login_max_failures = 3;
   config.login_failure_window_ms = 1000;
-  config.login_lockout_ms = 25;
+  // Audit I/O and runner scheduling can exceed 25ms before the next assertion.
+  // Exercise a full lockout interval instead of racing its normal expiry.
+  config.login_lockout_ms = 1000;
   const auto audit_path = std::filesystem::path("/tmp") /
       ("mine-teleop-login-rate-limit-" + mine_teleop::random_token(6) + ".jsonl");
   config.audit_log_path = audit_path.string();
@@ -6836,7 +6841,7 @@ void test_driver_login_failure_rate_limit_and_recovery() {
       }),
       "active login lockout alert is missing");
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(40));
+  std::this_thread::sleep_for(std::chrono::milliseconds(config.login_lockout_ms + 50));
   const auto recovered = login("driver-1", "correct-password");
   expect(recovered.status == 200, "login did not recover after lockout expiry");
   expect(
