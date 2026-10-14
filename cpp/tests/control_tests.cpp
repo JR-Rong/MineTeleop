@@ -5577,6 +5577,11 @@ void arbitrate_loopback_control_recovery(
 }
 
 void test_native_control_delayed_ack_progress_and_real_stall() {
+  const auto trace_root = std::filesystem::temp_directory_path() /
+      ("mine-teleop-delayed-ack-" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directories(trace_root);
+  const auto trace_path = trace_root / "driver-events.jsonl";
   mine_teleop::SignalingServerConfig signaling_config;
   signaling_config.driver_passwords = {{"driver-console-001", "dev-password"}};
   signaling_config.device_tokens = {{"vehicle-001", "vehicle-secret-1"}};
@@ -5651,6 +5656,10 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   driver_config.signaling_url = base;
   // A slower send cadence proves coverage does not require queue growth.
   driver_config.rate_hz = 10;
+  driver_config.control_trace_commands = true;
+  driver_config.browser_event_log_path = trace_path;
+  driver_config.browser_event_log_max_bytes = 16 * 1024 * 1024;
+  expect(driver_config.intent_lease_ms == 200, "ACK fixture changed the native input lease");
   allow_qemu_test_scheduler_time_sync(driver_config);
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
   const auto connected = driver.connect("vehicle-001");
@@ -5661,6 +5670,7 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
       .acceptable(driver_config.max_time_sync_uncertainty_ms), "ACK fixture vehicle clock not synchronized");
   mine_teleop::SessionControlProfile profile;
   profile.target_speed_kph = 2; profile.max_motor_torque_nm = 80;
+  expect(profile.control_recovery_timeout_ms == 5000, "ACK fixture changed the recovery deadline");
   profile.max_brake_pressure_bar = 80; profile.service_brake_pressure_bar = 20; profile.hard_brake_pressure_bar = 60;
   const auto profile_request = mine_teleop::SessionControlProfileRequest::from_json(
       driver.prepare_control_profile(profile.to_json()).at("request"));
@@ -5834,17 +5844,52 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   drop_acknowledgements->store(true);
   const auto long_stall_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
   bool bounded_reconnect = false;
+  std::int64_t original_ack_deadline_ms = 0;
   while (std::chrono::steady_clock::now() < long_stall_deadline) {
     static_cast<void>(driver.update_control_intent(declare_native_input_video_sample(input))); vehicle_pump.inspect([] {});
     const auto native = driver.status().at("native_control");
+    if (native.value("send_failures_total", 0U) == 0 &&
+        native.value("ack_braking_wait", false) && original_ack_deadline_ms == 0) {
+      original_ack_deadline_ms = native.at("ack_recovery_deadline_monotonic_ms").get<std::int64_t>();
+    }
     if (native.value("send_failures_total", 0U) > 0) {
-      expect(native.value("last_error", "") == "native control ACK recovery deadline exceeded" && native.value("requires_fresh_input", false),
-          "persistent ACK loss bypassed the bounded braking recovery: " + native.dump());
-      bounded_reconnect = true; break;
+      // A successful reconnect may clear last_error before this observer runs.
+      // Assert the actual failure event, not a cumulative counter combined
+      // with another connection's transient status. Transport errors remain
+      // failures of this ACK-only fixture and are never accepted as timeout.
+      mine_teleop::Json failure = mine_teleop::Json::object();
+      std::ifstream trace(trace_path);
+      std::string line;
+      while (std::getline(trace, line) && failure.empty()) {
+        const auto record = mine_teleop::Json::parse(line, nullptr, false);
+        if (record.is_discarded() ||
+            record.value("event", "") != "driver_native_control_trace_batch") continue;
+        for (const auto& event : record.at("details").value("commands", mine_teleop::Json::array())) {
+          const auto stage = event.value("stage", "");
+          if (event.value("trace_session_id", "") == recovery_session &&
+              (stage == "send_failed" || stage == "ack_poll_failed")) {
+            failure = event;
+            break;
+          }
+        }
+      }
+      // Trace batches flush asynchronously. Keep the original seven-second
+      // outer bound while awaiting the first failure's durable evidence.
+      if (!failure.empty()) {
+        expect(failure.value("error", "") == "native control ACK recovery deadline exceeded" &&
+            native.value("requires_fresh_input", false),
+            "persistent ACK loss bypassed the bounded braking recovery: " +
+                native.dump() + ":failure=" + failure.dump() + ":trace=" + trace_path.string());
+        expect(original_ack_deadline_ms > 0 &&
+            failure.value("ack_recovery_deadline_monotonic_ms", std::int64_t{0}) == original_ack_deadline_ms &&
+            failure.value("failure_monotonic_ms", std::int64_t{0}) >= original_ack_deadline_ms,
+            "persistent ACK loss reconnected before its original five-second deadline: " + failure.dump());
+        bounded_reconnect = true; break;
+      }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  expect(bounded_reconnect, "persistent ACK loss never reached bounded reconnect");
+  expect(bounded_reconnect, "persistent ACK loss never reached bounded reconnect: trace=" + trace_path.string());
   vehicle_pump.stop();
   vehicle_pump.inspect([] {});
   receiver.close(); service.close();

@@ -1182,6 +1182,8 @@ const keyIndicators={left:document.getElementById('key-left'),right:document.get
 const controlReadouts={gear:document.getElementById('control-gear'),steering:document.getElementById('control-steering'),throttle:document.getElementById('control-throttle'),brake:document.getElementById('control-brake')};
 const operatorControlReadouts={gear:document.getElementById('operator-control-gear'),steering:document.getElementById('operator-control-steering'),throttle:document.getElementById('operator-control-throttle'),brake:document.getElementById('operator-control-brake')};
 let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,gamepadPreserveBrakeDuringRearm=false,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,gearRejectionInhibited=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,lastVehicleSafetyState='',vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,pendingGearTransition=null,gearTransitionGeneration=0,lastControlStatusSeq=0,lastNativeAcceptedControlSeq=0,lastControlPrepareTimeoutLogAt=0,lastControlPrepareExpiredLogAt=0,activeControlRequests=new Map();let vehicleTelemetryReceivedAt=null,lastFeedbackHealthLogAt=null,lastFeedbackHealthKey='';let lastMediaMetricsLogAt=null;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
+let mediaPeerEpoch=0,mediaOfferScope=null,mediaHasOffer=false,mediaScopeIssue='';
+const retiredMediaScopes=new Set();
 let gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();
 const uiInstanceId=(globalThis.crypto?.randomUUID?.()||`ui-${Date.now()}-${Math.random().toString(16).slice(2)}`).replace(/[^A-Za-z0-9_-]/g,'_');
 let connectRequestGeneration=0;
@@ -1309,7 +1311,7 @@ function diagnoseVcuHandshake(channelOpen){
   return{level:stateName==='ready'?'ok':'warn',text:stages[stateName]||`VCU 状态无法识别：${stateName}。`};
 }
 function renderVcuHandshake(){const labels={unavailable:'等待车端状态',unsupported:'当前适配器不支持 VCU 握手',closed:'车端适配器已关闭',standby:'待机（未请求）',initial:'启动 1/5 · 低握手帧',wait_parallel_handshake:'启动 2/5 · 智驾状态 5',wait_parking_brake_released:'启动 3/5 · 等待电子驻车释放',wait_gear:'启动 4/5 · 挡位闭环（零牵引）',wait_actuator_modes:'启动 5/5 · 执行器模式（零牵引）',ready:'握手成功（平行驾驶）',disarm_torque:'退出 1/5 · 扭矩归零',disarm_stop:'退出 2/5 · 车辆零速',disarm_neutral:'退出 3/5 · N 挡',disarm_parking_brake:'退出 4/5 · 电子驻车',disarm_manual:'退出 5/5 · 人工状态 3',disarmed:'车端报告退出协议完成',fault:'VCU 通讯故障'};const channelOpen=Boolean(controlChannel&&controlChannel.readyState==='open'),supported=Boolean(vcuHandshake.supported),ready=Boolean(vcuHandshake.ready),disarming=Boolean(vcuHandshake.disarming),requested=Boolean(vcuHandshake.requested),adapterReady=vcuHandshake.adapter_ready===true,diagnostic=diagnoseVcuHandshake(channelOpen),vmcSuffix=vcuHandshake.vmc_fault_code_valid&&Number(vcuHandshake.vmc_fault_code)!==0?` · VMC ${vcuHandshake.vmc_fault_code}`:'';vcuStatus.textContent=(controlLogic.vehicleControlDiagnostic(vcuHandshake.issue_code,vcuHandshake.control_recovery)?.title||labels[vcuHandshake.state]||vcuHandshake.state||'未知')+vmcSuffix;vcuStatus.className=ready&&adapterReady&&controlProfileState.acknowledged?'ok':(diagnostic.level==='critical'?'critical':'warn');vcuGate.textContent=diagnostic.text;vcuGate.className=`gate-copy ${diagnostic.level}`;const selector=vcuHandshake.driver_gear_request_valid?vcuGearLabel(vcuHandshake.driver_gear_request):'未知',speed=vcuHandshake.speed_valid?`${Number(vcuHandshake.speed_mps).toFixed(2)} m/s`:'未知',manual=vcuHandshake.handshake_valid?String(vcuHandshake.handshake_status):'未知',epb=Array.isArray(vcuHandshake.epb_status)?vcuHandshake.epb_status.map(vcuEpbLabel).join('/'):'未知',vmc=vcuHandshake.vmc_fault_code_valid?String(vcuHandshake.vmc_fault_code):'未知',parkingSwitch=vcuHandshake.parking_brake_switch_valid?vcuSwitchLabel(vcuHandshake.parking_brake_switch,'已拉起','已松开'):'未知',brakePedal=vcuHandshake.brake_pedal_switch_valid?vcuSwitchLabel(vcuHandshake.brake_pedal_switch,'已踩下','已松开'):'未知';vcuGate.title=`控制链路 ${channelOpen?'已连接':'未连接'} · 参数 ${controlProfileState.acknowledged?'已确认':'未确认'} · 选择器 ${selector} · 车速 ${speed} · 电子驻车 ${epb} · VCU状态 ${manual} · VMC故障码 ${vmc} · 物理手刹 ${parkingSwitch} · 制动踏板 ${brakePedal}`;vcuConnectButton.disabled=!channelOpen||!controlProfileState.acknowledged||!adapterReady||!supported||!vcuHandshake.parking_ready||requested||ready||disarming;vcuDisconnectButton.disabled=!channelOpen||!adapterReady||!supported||(!requested&&!ready&&!disarming)}
-function renderMonitoring(){const estopPresentation=controlLogic.deriveControlStopPresentation(estopLatched,Boolean(vehicleTelemetry&&vehicleTelemetry.estop===true),(vehicleTelemetry?vehicleTelemetry.stop_source:undefined),(vehicleTelemetry?vehicleTelemetry.stop_reason:undefined),vcuHandshake);renderEstopRequest(estopPresentation);const recoveryPresentation=renderControlRecovery(estopPresentation.visible);renderVcuHandshake();renderCanFeedback();renderControlState();const recording=renderRecordingStatus();if(!authenticated){monitorPanel.hidden=true;return}monitorPanel.hidden=false;const runtime=latestRuntimeStatus||{},metrics=latestMetrics||{streams:[]},vehicles=runtime.authorized_vehicles||[],selected=vehicles.find(v=>v.vehicle_id===(runtime.vehicle_id||vehicleSelect.value));setMetric('metric-vehicle',selected?(selected.online?`${selected.vehicle_id} 在线`:`${selected.vehicle_id} 离线`):'未知',(selected&&selected.online)?'ok':'warn');setMetric('metric-session',runtime.connected?`${runtime.session_id||'活动'} · ${metrics.connection_state||'等待媒体'}`:'未连接',runtime.connected?'ok':'warn');const authority=runtime.connected&&!controlAuthorityLost;setMetric('metric-authority',authority?'已获得':'无',authority?'ok':(controlAuthorityLost?'critical':'warn'));const codec=metrics.codec||mediaStatus.codec||'',backend=metrics.backend||mediaStatus.backend||'';setMetric('metric-video',codec||backend?`${codec||'未知'} / ${backend||'未知'}`:'等待媒体',codec?'ok':'warn');setMetric('metric-rtt',formatMetric(metrics.control_rtt_ms,1,' ms'),Number(metrics.control_rtt_ms)>200?'critical':(metrics.control_rtt_ms!=null&&Number.isFinite(Number(metrics.control_rtt_ms))?'ok':'warn'));setMetric('metric-network',metrics.connection_method||'未知',metrics.connection_method==='TURN'?'warn':(metrics.connection_method&&metrics.connection_method!=='unknown'?'ok':'warn'));const turnConfigured=Boolean((metrics.turn_configured===null||metrics.turn_configured===undefined?hasTurnServer():metrics.turn_configured));setMetric('metric-turn',metrics.turn_in_use?'正在中继':(turnConfigured?'已配置，未使用':'未配置'),metrics.turn_in_use?'warn':(turnConfigured?'ok':'warn'));const sync=runtime.time_sync||metrics.time_sync||{},timeTrusted=runtime.signaling_available!==false&&Boolean(sync.synchronized)&&Number(sync.uncertainty_ms)<=consoleConfig.max_time_sync_uncertainty_ms;setMetric('metric-time',timeTrusted?`可信 ±${sync.uncertainty_ms} ms`:`不可信${Number.isFinite(Number(sync.uncertainty_ms))?` ±${sync.uncertainty_ms} ms`:''}`,timeTrusted?'ok':'critical');streamMetrics.replaceChildren();const streams=metrics.streams||[];if(!streams.length){const row=document.createElement('tr');const cell=document.createElement('td');cell.colSpan=5;cell.className='muted';cell.textContent='等待视频轨道';row.appendChild(cell);streamMetrics.appendChild(row)}for(const stream of streams){const row=document.createElement('tr');const loss=Number(stream.packet_loss_percent||0),fps=Number(stream.fps||0),latency=(stream.estimated_end_to_end_latency_ms===null||stream.estimated_end_to_end_latency_ms===undefined?null:stream.estimated_end_to_end_latency_ms);for(const [text,level] of [[MineTeleopCameraView.cameraLabel(stream.camera_id||stream.mid||'unknown'),''],[formatMetric(fps,1),fps<20?'critical':'ok'],[formatMetric(stream.bitrate_kbps,0,' kbps'),''],[formatMetric(loss,2,'%'),loss>2?'warn':''],[formatMetric(latency,1,' ms'),latency===null?'warn':latency>200?'critical':'ok']]){const cell=document.createElement('td');cell.textContent=text;if(level)cell.className=level;row.appendChild(cell)}streamMetrics.appendChild(row)}const alerts=[];let severity='';if(estopPresentation.visible){alerts.push(estopPresentation.alert);severity=estopPresentation.severity}else if(recoveryPresentation.visible){alerts.push(recoveryPresentation.alert);severity='warn'}if(controlAuthorityLost){alerts.push('控制权或信令已丢失，当前页面不会继续发送驾驶命令');severity='critical'}else if(runtime.connected&&(!controlChannel||controlChannel.readyState!=='open')){alerts.push('控制 DataChannel 尚未就绪');if(!severity)severity='warn'}if((vcuHandshake.supported&&!vcuHandshake.ready)||controlLogic.vehicleControlDiagnostic(vcuHandshake.issue_code,vcuHandshake.control_recovery)){const diagnostic=diagnoseVcuHandshake(Boolean(controlChannel&&controlChannel.readyState==='open'));alerts.push(diagnostic.text);if(diagnostic.level==='critical')severity='critical';else if(!severity)severity='warn'}if(!timeTrusted){alerts.push('时间同步不可信，端到端时延只作参考');severity='critical'}for(const stream of streams){if(Number(stream.estimated_end_to_end_latency_ms)>200){alerts.push(`${stream.camera_id||'视频'} 时延超过 200 ms`);severity='critical'}if(Number(stream.fps)<20){alerts.push(`${stream.camera_id||'视频'} 低于 20 FPS`);severity='critical'}}for(const message of recording.alerts)alerts.push(message);if(recording.alerts.length&&!severity)severity='warn';if(!alerts.length)alerts.push(streams.length?'当前指标在目标范围内':'尚无媒体指标；控制命令不会在链路未就绪时发送');alertsPanel.textContent=alerts.join('；');alertsPanel.className=`alerts ${severity}`.trim();const alertKey=`${severity}:${alerts.join('|')}`;if(alertKey!==lastAlertKey){clientLog('control_monitor_state',{severity:severity||'ok',alerts});lastAlertKey=alertKey}}
+function renderMonitoring(){const estopPresentation=controlLogic.deriveControlStopPresentation(estopLatched,Boolean(vehicleTelemetry&&vehicleTelemetry.estop===true),(vehicleTelemetry?vehicleTelemetry.stop_source:undefined),(vehicleTelemetry?vehicleTelemetry.stop_reason:undefined),vcuHandshake);renderEstopRequest(estopPresentation);const recoveryPresentation=renderControlRecovery(estopPresentation.visible);renderVcuHandshake();renderCanFeedback();renderControlState();const recording=renderRecordingStatus();if(!authenticated){monitorPanel.hidden=true;return}monitorPanel.hidden=false;const runtime=latestRuntimeStatus||{},metrics=latestMetrics||{streams:[]},vehicles=runtime.authorized_vehicles||[],selected=vehicles.find(v=>v.vehicle_id===(runtime.vehicle_id||vehicleSelect.value));setMetric('metric-vehicle',selected?(selected.online?`${selected.vehicle_id} 在线`:`${selected.vehicle_id} 离线`):'未知',(selected&&selected.online)?'ok':'warn');setMetric('metric-session',runtime.connected?`${runtime.session_id||'活动'} · ${metrics.connection_state||'等待媒体'}`:'未连接',runtime.connected?'ok':'warn');const authority=runtime.connected&&!controlAuthorityLost;setMetric('metric-authority',authority?'已获得':'无',authority?'ok':(controlAuthorityLost?'critical':'warn'));const codec=metrics.codec||mediaStatus.codec||'',backend=metrics.backend||mediaStatus.backend||'';setMetric('metric-video',codec||backend?`${codec||'未知'} / ${backend||'未知'}`:'等待媒体',codec?'ok':'warn');setMetric('metric-rtt',formatMetric(metrics.control_rtt_ms,1,' ms'),Number(metrics.control_rtt_ms)>200?'critical':(metrics.control_rtt_ms!=null&&Number.isFinite(Number(metrics.control_rtt_ms))?'ok':'warn'));setMetric('metric-network',metrics.connection_method||'未知',metrics.connection_method==='TURN'?'warn':(metrics.connection_method&&metrics.connection_method!=='unknown'?'ok':'warn'));const turnConfigured=Boolean((metrics.turn_configured===null||metrics.turn_configured===undefined?hasTurnServer():metrics.turn_configured));setMetric('metric-turn',metrics.turn_in_use?'正在中继':(turnConfigured?'已配置，未使用':'未配置'),metrics.turn_in_use?'warn':(turnConfigured?'ok':'warn'));const sync=runtime.time_sync||metrics.time_sync||{},timeTrusted=runtime.signaling_available!==false&&Boolean(sync.synchronized)&&Number(sync.uncertainty_ms)<=consoleConfig.max_time_sync_uncertainty_ms;setMetric('metric-time',timeTrusted?`可信 ±${sync.uncertainty_ms} ms`:`不可信${Number.isFinite(Number(sync.uncertainty_ms))?` ±${sync.uncertainty_ms} ms`:''}`,timeTrusted?'ok':'critical');streamMetrics.replaceChildren();const streams=metrics.streams||[];if(!streams.length){const row=document.createElement('tr');const cell=document.createElement('td');cell.colSpan=5;cell.className='muted';cell.textContent='等待视频轨道';row.appendChild(cell);streamMetrics.appendChild(row)}for(const stream of streams){const row=document.createElement('tr');const loss=Number(stream.packet_loss_percent||0),fps=Number(stream.fps||0),latency=(stream.estimated_end_to_end_latency_ms===null||stream.estimated_end_to_end_latency_ms===undefined?null:stream.estimated_end_to_end_latency_ms);for(const [text,level] of [[MineTeleopCameraView.cameraLabel(stream.camera_id||stream.mid||'unknown'),''],[formatMetric(fps,1),fps<20?'critical':'ok'],[formatMetric(stream.bitrate_kbps,0,' kbps'),''],[formatMetric(loss,2,'%'),loss>2?'warn':''],[formatMetric(latency,1,' ms'),latency===null?'warn':latency>200?'critical':'ok']]){const cell=document.createElement('td');cell.textContent=text;if(level)cell.className=level;row.appendChild(cell)}streamMetrics.appendChild(row)}const alerts=[];let severity='';if(estopPresentation.visible){alerts.push(estopPresentation.alert);severity=estopPresentation.severity}else if(recoveryPresentation.visible){alerts.push(recoveryPresentation.alert);severity='warn'}const mediaDiagnostic=controlLogic.mediaScopeDiagnostic(mediaStatus.local_scope_issue||mediaStatus.media_negotiation?.issue_code);if(mediaDiagnostic){alerts.push(mediaDiagnostic.text);if(!severity)severity='warn'}if(controlAuthorityLost){alerts.push('控制权或信令已丢失，当前页面不会继续发送驾驶命令');severity='critical'}else if(runtime.connected&&(!controlChannel||controlChannel.readyState!=='open')){alerts.push('控制 DataChannel 尚未就绪');if(!severity)severity='warn'}if((vcuHandshake.supported&&!vcuHandshake.ready)||controlLogic.vehicleControlDiagnostic(vcuHandshake.issue_code,vcuHandshake.control_recovery)){const diagnostic=diagnoseVcuHandshake(Boolean(controlChannel&&controlChannel.readyState==='open'));alerts.push(diagnostic.text);if(diagnostic.level==='critical')severity='critical';else if(!severity)severity='warn'}if(!timeTrusted){alerts.push('时间同步不可信，端到端时延只作参考');severity='critical'}for(const stream of streams){if(Number(stream.estimated_end_to_end_latency_ms)>200){alerts.push(`${stream.camera_id||'视频'} 时延超过 200 ms`);severity='critical'}if(Number(stream.fps)<20){alerts.push(`${stream.camera_id||'视频'} 低于 20 FPS`);severity='critical'}}for(const message of recording.alerts)alerts.push(message);if(recording.alerts.length&&!severity)severity='warn';if(!alerts.length)alerts.push(streams.length?'当前指标在目标范围内':'尚无媒体指标；控制命令不会在链路未就绪时发送');alertsPanel.textContent=alerts.join('；');alertsPanel.className=`alerts ${severity}`.trim();const alertKey=`${severity}:${alerts.join('|')}`;if(alertKey!==lastAlertKey){clientLog('control_monitor_state',{severity:severity||'ok',alerts});lastAlertKey=alertKey}}
 async function refreshRuntimeStatus(){if(!authenticated)return;try{latestRuntimeStatus=await get('/api/status');if(connecting&&latestRuntimeStatus.pending_mobile_approval?.request_id){webrtcLabel.textContent='等待手机确认';statusPanel.textContent=`车辆 ${latestRuntimeStatus.pending_mobile_approval.vehicle_id} 等待手机确认，同意后自动连接；可点击安全退出取消。`}if(polling&&!latestRuntimeStatus.connected){closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='控制权丢失'}renderMonitoring()}catch(error){controlAuthorityLost=true;resetControlAuthorityInput();webrtcLabel.textContent='本地状态读取失败';alertsPanel.textContent='无法读取本地运行状态: '+error.message;alertsPanel.className='alerts critical'}}
 function clamp(value,min,max){return Math.min(max,Math.max(min,value))}
 function resetControlProfileSession(){controlProfileGeneration+=1;controlProfileState={requestedProfile:null,pendingRequestSeq:0,effectiveProfile:null,effectiveRequestSeq:0,effectiveAppliedRevision:0,acknowledged:false,reason:''};pendingControlProfileEnvelope=null;lastControlProfileSendAt=0;controlProfilePrepareInFlight=false;vehicleHardLimits={received:false}}
@@ -1342,7 +1344,7 @@ function resetControlAuthorityInput(reason='control_authority_reset'){vcuEverRea
 function updateVcuHandshakeState(value){const locked=vcuHandshake.issue_code==='control_recovery_timeout'||vcuHandshake.issue_code==='critical_camera_failed';if(locked)value={...value,issue_code:vcuHandshake.issue_code,control_recovery:vcuHandshake.control_recovery,ready:false,state:'fault'};gearChangeStationaryEvidence=controlLogic.updateGearChangeStationaryEvidence(gearChangeStationaryEvidence,value,lastControlStatusSeq,performance.now());value={...value,gear_change_stationary_confirmed:gearChangeStationaryEvidence.confirmed};const transition=controlLogic.transitionVcuState(vcuEverReady,value);vcuHandshake=value;vcuEverReady=transition.everReady;if(transition.resetInput)resetControlAuthorityInput('vcu_state_'+String(value.state||'unavailable'))}
 function applyVehicleSafetyState(value,timing){const next=String(value||'');if(next==='DEGRADED'&&controlLogic.degradedInputRearmRequired(timing,lastNativeAcceptedControlSeq)){clearControlInput(false,'vehicle_degraded',true);if(lastVehicleSafetyState!=='DEGRADED'){lastKeyboardEvent.textContent='控制命令短暂中断，输入已清除 · 请释放后重新按下';statusPanel.textContent='车端进入可恢复降级：牵引已清零；请释放控制键后重新按下';clientLog('driver_input_cleared_on_degraded',{previous_safety_state:lastVehicleSafetyState||null})}}lastVehicleSafetyState=next}
 function suspendSignalingPoll(){const generation=++signalingGeneration;polling=false;if(signalingPollAbort){signalingPollAbort.abort();signalingPollAbort=null}return generation}
-function closeRealtimeSession(){controlWriteQueue.reset();flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';nativeControlUiEpoch=0;nativeControlTakeoverPending=false;nativeControlPageRetired=false;lastNativeAcceptedControlSeq=0;const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;vehicleTelemetryReceivedAt=null;lastFeedbackHealthLogAt=null;lastFeedbackHealthKey='';lastVehicleSafetyState='';mediaStatus={lanes:[]};vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();lastMediaMetricsLogAt=null;cameraView.reset();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
+function closeRealtimeSession(){++mediaPeerEpoch;mediaOfferScope=null;mediaHasOffer=false;mediaScopeIssue='';retiredMediaScopes.clear();controlWriteQueue.reset();flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';nativeControlUiEpoch=0;nativeControlTakeoverPending=false;nativeControlPageRetired=false;lastNativeAcceptedControlSeq=0;const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;vehicleTelemetryReceivedAt=null;lastFeedbackHealthLogAt=null;lastFeedbackHealthKey='';lastVehicleSafetyState='';mediaStatus={lanes:[]};vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();lastMediaMetricsLogAt=null;cameraView.reset();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
 function renderEstopRequest(presentation=controlLogic.deriveControlStopPresentation(estopLatched,Boolean(vehicleTelemetry&&vehicleTelemetry.estop===true),(vehicleTelemetry?vehicleTelemetry.stop_source:undefined),(vehicleTelemetry?vehicleTelemetry.stop_reason:undefined),vcuHandshake)){estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner}
 function renderControlRecovery(hardStopVisible){const sync=latestRuntimeStatus.time_sync||{},trusted=sync.synchronized===true&&Number(sync.uncertainty_ms)<=consoleConfig.max_time_sync_uncertainty_ms,freshness=controlLogic.telemetryFreshness(vehicleTelemetry,vehicleTelemetryReceivedAt,performance.now(),trusted?Date.now()+Number(sync.offset_ms||0):null),fresh=freshness.received_age_ms!==null&&freshness.received_age_ms<=500&&(freshness.source_age_ms===null||freshness.source_age_ms<=500),presentation=controlLogic.deriveControlRecoveryPresentation(polling&&!controlAuthorityLost,vehicleTelemetry,fresh,hardStopVisible);controlRecoveryStatus.hidden=!presentation.visible;controlRecoveryStatus.textContent=presentation.banner;return presentation}
 function latchEstop(source){if(estopLatched)return false;estopLatched=true;clientLog('control_estop_request_latched',{source});renderEstopRequest();renderMonitoring();return true}
@@ -1594,8 +1596,14 @@ function editingTarget(target){return ['INPUT','SELECT','TEXTAREA','BUTTON'].inc
 addEventListener('keydown',e=>{const binding=keys[e.code],estopKey=e.code==='KeyE';if(!binding&&!estopKey)return;if(editingTarget(e.target))return;e.preventDefault();if(binding&&!e.repeat)clientLog('driver_input_keydown',{code:e.code,...controlInputDiagnostic()});if(!polling){if(binding)controlLogic.blockKey(blockedControlKeys,e.code);lastKeyboardEvent.textContent=`${estopKey?'急停':keyNames[binding]}已截获 · 等待连接`;return}if(estopKey){if(!e.repeat){lastKeyboardEvent.textContent='急停请求已锁定 · E';latchEstop('键盘 E');send({estop:true}).catch(console.error)}return}if(blockedControlKeys.has(e.code)){lastKeyboardEvent.textContent=`${keyNames[binding]}需释放后重新按下 · ${e.code}`;return}if(vcuStateRequiresFreshInput(vcuHandshake)){controlLogic.blockKey(blockedControlKeys,e.code);lastKeyboardEvent.textContent=`${keyNames[binding]}已阻止 · 等待 VCU 恢复后重新按下`;return}if(!vcuEverReady&&!vcuMockUnsupported()){controlLogic.blockKey(blockedControlKeys,e.code);lastKeyboardEvent.textContent=`${keyNames[binding]}已阻止 · 首次握手完成后请重新按下`;return}const pressed=controlLogic.pressKey(pressedControlKeys,blockedControlKeys,e.code);if(pressed.changed){syncControlKeyState();updateSelectedGearFromHeldDirections();lastKeyboardEvent.textContent=`${keyNames[binding]}按下 · ${e.code}`;renderControlState();send().catch(console.error)}});
 addEventListener('keyup',e=>{const binding=keys[e.code];if(!binding)return;if(!editingTarget(e.target))e.preventDefault();clientLog('driver_input_keyup',{code:e.code,...controlInputDiagnostic()});const released=controlLogic.releaseKey(pressedControlKeys,blockedControlKeys,e.code);syncControlKeyState();updateSelectedGearFromHeldDirections();lastKeyboardEvent.textContent=`${keyNames[binding]}释放 · ${e.code}`;renderControlState();if(released.changed&&polling)send().catch(console.error)});
 function applyMediaStatus(payload){
+  const id=payload?.media_negotiation?.id;
+  if(id&&mediaOfferScope?.id&&id!==mediaOfferScope.id)return;
+  const localScopeIssue=mediaStatus.local_scope_issue;
   mediaStatus=payload||{lanes:[]};
+  if(localScopeIssue)mediaStatus.local_scope_issue=localScopeIssue;
   mediaStatusReceivedAt=performance.now();
+  const mediaDiagnostic=controlLogic.mediaScopeDiagnostic(mediaStatus.media_negotiation?.issue_code);
+  if(mediaDiagnostic)statusPanel.textContent=mediaDiagnostic.text;
   const diagnostic=controlLogic.vehicleControlDiagnostic(mediaStatus.control_issue_code,mediaStatus.control_recovery);
   if(diagnostic&&diagnostic.level==='critical'){
     updateVcuHandshakeState({...vcuHandshake,issue_code:mediaStatus.control_issue_code,control_recovery:mediaStatus.control_recovery||null,ready:false,state:'fault'});
@@ -1606,13 +1614,38 @@ function applyMediaStatus(payload){
   }
   renderMonitoring();
 }
-async function pollSignaling(generation){const controller=new AbortController();signalingPollAbort=controller;while(polling&&generation===signalingGeneration){try{const data=await post('/api/poll-signaling',{},controller.signal);if(generation!==signalingGeneration)break;for(const message of data.messages||[]){if(message.type==='webrtc_offer')await startFromOffer(message.payload||{});if(message.type==='ice_candidate')await addIce(message.payload||{});if(message.type==='media_status')applyMediaStatus(message.payload)}}catch(e){if(generation!==signalingGeneration||e.name==='AbortError')break;const failedScope=pageReleaseScope();closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='控制权或信令中断';statusPanel.textContent='信令轮询失败，已停止驾驶命令: '+e.message;post('/api/end-session',safeLogoutReleaseBody(failedScope,'signaling_poll_failed')).catch(()=>{});clientLog('signaling_poll_failed',{error:e.message});renderMonitoring();break}await new Promise(r=>setTimeout(r,100))}if(signalingPollAbort===controller)signalingPollAbort=null}
-async function addIce(candidate){if(!candidate.candidate)return;if(!peer||!peer.remoteDescription){pendingIce.push(candidate);return}await peer.addIceCandidate(candidate)}
+async function pollSignaling(generation){const controller=new AbortController();signalingPollAbort=controller;while(polling&&generation===signalingGeneration){try{const data=await post('/api/poll-signaling',{},controller.signal);if(generation!==signalingGeneration)break;const messages=data.messages||[];let latestOffer=-1,offerCount=0;messages.forEach((message,index)=>{if(message.type==='webrtc_offer'){latestOffer=index;offerCount++}});const latestScope=latestOffer>=0?controlLogic.iceOfferScope(messages[latestOffer].payload||{},!mediaHasOffer&&offerCount===1):null;for(let index=0;index<messages.length;index++){if(generation!==signalingGeneration)break;const message=messages[index];if(message.type==='webrtc_offer'&&index!==latestOffer)continue;if(message.type==='ice_candidate'&&latestScope&&!controlLogic.iceCandidateMatchesOffer(message.payload||{},latestScope))continue;if(message.type==='webrtc_offer')await startFromOffer(message.payload||{});if(message.type==='ice_candidate')await addIce(message.payload||{});if(message.type==='media_status')applyMediaStatus(message.payload)}}catch(e){if(generation!==signalingGeneration||e.name==='AbortError')break;const failedScope=pageReleaseScope();closeRealtimeSession();controlAuthorityLost=true;webrtcLabel.textContent='控制权或信令中断';statusPanel.textContent='信令轮询失败，已停止驾驶命令: '+e.message;post('/api/end-session',safeLogoutReleaseBody(failedScope,'signaling_poll_failed')).catch(()=>{});clientLog('signaling_poll_failed',{error:e.message});renderMonitoring();break}await new Promise(r=>setTimeout(r,100))}if(signalingPollAbort===controller)signalingPollAbort=null}
+function currentMediaPeer(instance,epoch,session,generation){return peer===instance&&mediaPeerEpoch===epoch&&nativeControlSessionId===session&&nativeControlSessionGeneration===generation}
+function showMediaScopeIssue(){if(mediaScopeIssue==='media_ice_scope_missing')return;mediaScopeIssue='media_ice_scope_missing';mediaStatus.local_scope_issue=mediaScopeIssue;statusPanel.textContent=controlLogic.mediaScopeDiagnostic(mediaScopeIssue).text;clientLog('driver_media_scope_rejected',{issue_code:mediaScopeIssue});renderMonitoring()}
+function retireMediaOffer(scope){if(!scope)return;for(const key of [scope.id?`id:${scope.id}`:'',...scope.ufrags.map(value=>`ufrag:${value}`)])if(key)retiredMediaScopes.add(key);while(retiredMediaScopes.size>256)retiredMediaScopes.delete(retiredMediaScopes.values().next().value)}
+async function addIce(candidate){
+  if(!candidate||typeof candidate.candidate!=='string'||!candidate.candidate)return;
+  const scope=controlLogic.iceCandidateScope(candidate);
+  if((scope.id&&retiredMediaScopes.has(`id:${scope.id}`))||(!scope.id&&scope.ufrag&&retiredMediaScopes.has(`ufrag:${scope.ufrag}`)))return;
+  if(!peer||!peer.remoteDescription||!controlLogic.iceCandidateMatchesOffer(candidate,mediaOfferScope)){
+    if(!scope.id&&!scope.ufrag&&mediaHasOffer&&!controlLogic.iceCandidateMatchesOffer(candidate,mediaOfferScope)){showMediaScopeIssue();return}
+    if(candidate.candidate.length>8192||pendingIce.length>=128)throw Error('ICE candidate buffer exceeds limit');
+    pendingIce.push(candidate);return;
+  }
+  const instance=peer,epoch=mediaPeerEpoch,session=nativeControlSessionId,generation=nativeControlSessionGeneration;
+  try{await instance.addIceCandidate({candidate:candidate.candidate,sdpMid:candidate.sdpMid,sdpMLineIndex:candidate.sdpMLineIndex,usernameFragment:candidate.usernameFragment})}
+  catch(error){if(currentMediaPeer(instance,epoch,session,generation))throw error}
+}
 function offeredVideoCameraIds(sdp,tracks){const mapping=new Map(),cameraIds=(tracks||[]).map(track=>track.camera_id).filter(Boolean);let cameraIndex=0;for(const section of String(sdp||'').split(/\r?\nm=/).slice(1)){if(!section.startsWith('video '))continue;const match=section.match(/(?:^|\r?\n)a=mid:([^\r\n]+)/),cameraId=cameraIds[cameraIndex++];if(match&&cameraId)mapping.set(match[1],cameraId)}return mapping}
 const cameraView=MineTeleopCameraView.mount(cameraGrid);
 function attach(cameraId,track){if(emptyStage.isConnected)emptyStage.remove();cameraView.attach(cameraId,track)}
 async function startFromOffer(offer){
-  if(peer)peer.close();
+  const previousPeer=peer,nextScope=controlLogic.iceOfferScope(offer,!mediaHasOffer);
+  if(nextScope.id&&(retiredMediaScopes.has(`id:${nextScope.id}`)||mediaOfferScope&&mediaOfferScope.id===nextScope.id))return;
+  const queued=pendingIce;
+  retireMediaOffer(mediaOfferScope);
+  // A repeated ufrag can belong to renegotiation on the same ICE transport.
+  // The unique negotiation id, when supplied, remains the stronger fence.
+  for(const value of nextScope.ufrags)retiredMediaScopes.delete(`ufrag:${value}`);
+  if(nextScope.id)retiredMediaScopes.delete(`id:${nextScope.id}`);
+  peer=null;const epoch=++mediaPeerEpoch;
+  mediaOfferScope=nextScope;mediaHasOffer=true;mediaScopeIssue='';delete mediaStatus.local_scope_issue;
+  if(previousPeer)previousPeer.close();
   controlChannel=null;
   resetControlProfileSession();
   lastControlStatusSeq=0;
@@ -1620,7 +1653,7 @@ async function startFromOffer(offer){
   lastVehicleSafetyState='';
   vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};
   resetControlAuthorityInput();
-  pendingIce=[];
+  pendingIce=queued.filter(candidate=>{const scope=controlLogic.iceCandidateScope(candidate);return !(scope.id&&retiredMediaScopes.has(`id:${scope.id}`))&&!(scope.ufrag&&!scope.id&&retiredMediaScopes.has(`ufrag:${scope.ufrag}`))&&Boolean(scope.id||scope.ufrag||controlLogic.iceCandidateMatchesOffer(candidate,nextScope))});
   cameraByMid.clear();
   assignedCameraIds.clear();
   previousStats.clear();
@@ -1631,9 +1664,11 @@ async function startFromOffer(offer){
   offeredCameraByMid=offeredVideoCameraIds(offer.sdp,offer.media_tracks||[]);
   const nextPeer=new RTCPeerConnection({bundlePolicy:'max-bundle',iceServers,iceTransportPolicy:consoleConfig.ice_transport_policy});
   peer=nextPeer;
+  const sourceSession=nativeControlSessionId,sourceGeneration=nativeControlSessionGeneration;
+  const current=()=>currentMediaPeer(nextPeer,epoch,sourceSession,sourceGeneration);
   webrtcLabel.textContent=`协商 ${offer.codec||''}/${offer.backend||''}`;
   nextPeer.onconnectionstatechange=()=>{
-    if(peer!==nextPeer)return;
+    if(!current())return;
     const connectionState=nextPeer.connectionState;
     cameraView.setConnectionState(connectionState);
     webrtcLabel.textContent=connectionState;
@@ -1655,10 +1690,10 @@ async function startFromOffer(offer){
     if(connectionState==='connected'&&controlChannel?.readyState==='open')webrtcLabel.textContent='控制链路已连接';
     renderMonitoring();
   };
-  nextPeer.onicecandidateerror=e=>clientLog('webrtc_ice_candidate_error',{endpoint:safeIceEndpoint(e.url),error_code:Number(e.errorCode||0),...controlLogic.iceServerError(e)});
+  nextPeer.onicecandidateerror=e=>{if(current())clientLog('webrtc_ice_candidate_error',{endpoint:safeIceEndpoint(e.url),error_code:Number(e.errorCode||0),...controlLogic.iceServerError(e)})};
   nextPeer.ondatachannel=e=>{
     const channel=e.channel;
-    if(!controlLogic.isCurrentPeer(peer,nextPeer)){channel.close();return}
+    if(!current()){channel.close();return}
     if(channel.label!=='control'||channel.protocol!=='mine-teleop-control-v1'||channel.ordered||channel.maxRetransmits!==0){
       channel.close();
       webrtcLabel.textContent='控制通道参数非法';
@@ -1669,7 +1704,7 @@ async function startFromOffer(offer){
     controlChannel=channel;
     channel.bufferedAmountLowThreshold=1024;
     channel.onopen=()=>{
-      if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
+      if(!current()||!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
       gearRejectionInhibited=false;
       webrtcLabel.textContent='控制链路已连接';
       resetControlAuthorityInput();
@@ -1681,7 +1716,7 @@ async function startFromOffer(offer){
       renderMonitoring();
     };
     channel.onmessage=async event=>{
-      if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
+      if(!current()||!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
       try{
         const message=JSON.parse(event.data);
         if(!['vehicle_telemetry','vcu_handshake_status','session_control_profile_status','control_command_rejected'].includes(message.event))return;
@@ -1733,10 +1768,10 @@ async function startFromOffer(offer){
         else if(vcuHandshake.state==='disarmed')statusPanel.textContent=safeLogoutAttempt?'车端报告退出协议完成；仍等待本次退出的新鲜完整 CAN 确认':'车端报告 VCU 退出协议完成；停车状态需本地核实';
         clientLog('driver_vcu_handshake_status',{result:message.result,issue_code:vcuHandshake.issue_code,control_recovery:vcuHandshake.control_recovery,adapter_ready:vcuHandshake.adapter_ready,state:vcuHandshake.state,ready:Boolean(vcuHandshake.ready),parking_ready:Boolean(vcuHandshake.parking_ready),handshake_revoked:Boolean(vcuHandshake.handshake_revoked),vmc_fault_code:vcuHandshake.vmc_fault_code_valid?Number(vcuHandshake.vmc_fault_code):null});
         renderMonitoring();
-      }catch(error){clientLog('control_datachannel_message_invalid',{error:error.message})}
+      }catch(error){if(current())clientLog('control_datachannel_message_invalid',{error:error.message})}
     };
     channel.onclose=()=>{
-      if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
+      if(!current()||!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
       flushControlTrace('datachannel_close');
       controlChannel=null;
       resetControlAuthorityInput();
@@ -1749,7 +1784,7 @@ async function startFromOffer(offer){
       renderMonitoring();
     };
     channel.onerror=()=>{
-      if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
+      if(!current()||!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
       flushControlTrace('datachannel_error');
       clientLog('control_datachannel_error',{ready_state:channel.readyState,buffered_amount_bytes:Math.max(0,Number(channel.bufferedAmount)||0),peer_connection_state:nextPeer.connectionState});
       resetControlAuthorityInput();
@@ -1759,18 +1794,28 @@ async function startFromOffer(offer){
       renderMonitoring();
     };
   };
-  nextPeer.onicecandidate=e=>{if(e.candidate)post('/api/webrtc/ice-candidate',{candidate:e.candidate.toJSON()}).catch(console.error)};
-  nextPeer.ontrack=e=>{if(peer!==nextPeer||e.track.kind!=='video')return;const mid=e.transceiver.mid||'',id=offeredCameraByMid.get(mid)||remoteCameraIds.find(cameraId=>!assignedCameraIds.has(cameraId))||mid||e.track.id;assignedCameraIds.add(id);cameraByMid.set(mid,id);attach(id,e.track)};
-  await nextPeer.setRemoteDescription({type:'offer',sdp:offer.sdp});
-  while(pendingIce.length)await addIce(pendingIce.shift());
-  const answer=await nextPeer.createAnswer();
-  await nextPeer.setLocalDescription(answer);
-  await post('/api/webrtc/answer',{type:'answer',sdp:nextPeer.localDescription.sdp});
+  nextPeer.onicecandidate=e=>{if(!current()||!e.candidate)return;post('/api/webrtc/ice-candidate',{source_session_id:sourceSession,source_control_session_generation:sourceGeneration,media_negotiation_id:nextScope.id,candidate:e.candidate.toJSON()}).catch(error=>{if(current())clientLog('webrtc_ice_signal_error',{stage:'candidate',error:error.message})})};
+  nextPeer.ontrack=e=>{if(!current()||e.track.kind!=='video')return;const mid=e.transceiver.mid||'',id=offeredCameraByMid.get(mid)||remoteCameraIds.find(cameraId=>!assignedCameraIds.has(cameraId))||mid||e.track.id;assignedCameraIds.add(id);cameraByMid.set(mid,id);attach(id,e.track)};
+  try{
+    await nextPeer.setRemoteDescription({type:'offer',sdp:offer.sdp});
+    if(!current())return;
+    const candidates=pendingIce;pendingIce=[];
+    for(const candidate of candidates){if(!current())return;if(controlLogic.iceCandidateMatchesOffer(candidate,nextScope))await addIce(candidate);else pendingIce.push(candidate)}
+    const answer=await nextPeer.createAnswer();
+    if(!current())return;
+    await nextPeer.setLocalDescription(answer);
+    if(!current())return;
+    await post('/api/webrtc/answer',{type:'answer',sdp:nextPeer.localDescription.sdp,media_negotiation_id:nextScope.id,source_session_id:sourceSession,source_control_session_generation:sourceGeneration});
+  }catch(error){if(current())throw error}
 }
 setInterval(()=>cameraView.refresh(),500);
 async function collectMetrics(){
   if(!peer)return;
-  const report=await peer.getStats(),sampledAt=Date.now();
+  const instance=peer,epoch=mediaPeerEpoch,sourceSession=nativeControlSessionId,sourceGeneration=nativeControlSessionGeneration,sourceOfferId=mediaOfferScope?.id||'';
+  const current=()=>currentMediaPeer(instance,epoch,sourceSession,sourceGeneration);
+  try{
+  const report=await instance.getStats(),sampledAt=Date.now();
+  if(!current())return;
   let rtt=null,connectionMethod='unknown',turnInUse=false;
   const selection=controlLogic.selectedIcePair(report),selectedPair=selection.pair;
   if(selectedPair){rtt=typeof selectedPair.currentRoundTripTime==='number'&&Number.isFinite(selectedPair.currentRoundTripTime)?selectedPair.currentRoundTripTime:null;const local=report.get(selectedPair.localCandidateId),remote=report.get(selectedPair.remoteCandidateId),types=[local?.candidateType,remote?.candidateType];turnInUse=types.includes('relay');connectionMethod=turnInUse?'TURN':(types.some(type=>type==='srflx'||type==='prflx')?'STUN':'direct')}
@@ -1792,10 +1837,14 @@ async function collectMetrics(){
   const controlOutcomes={...controlOutcomeSession.metrics};
   const metrics={sampled_at_ms:sampledAt,connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',control_rtt_ms:rtt===null?null:rtt*1000,selected_candidate_pair:selectedPair?{id:selectedPair.id,selection_method:selection.method,state:selectedPair.state,nominated:selectedPair.nominated??null,transport_id:selection.transport?.id??selectedPair.transportId??null,local_candidate_type:report.get(selectedPair.localCandidateId)?.candidateType??null,remote_candidate_type:report.get(selectedPair.remoteCandidateId)?.candidateType??null,protocol:report.get(selectedPair.localCandidateId)?.protocol??null,relay_protocol:report.get(selectedPair.localCandidateId)?.relayProtocol??null,current_round_trip_time_s:selectedPair.currentRoundTripTime??null,available_outgoing_bitrate_bps:selectedPair.availableOutgoingBitrate??null,bytes_sent:selectedPair.bytesSent??null,bytes_received:selectedPair.bytesReceived??null,requests_sent:selectedPair.requestsSent??null,responses_received:selectedPair.responsesReceived??null}:null,connection_method:connectionMethod,turn_configured:turnConfigured,turn_in_use:turnInUse,time_sync:timeSync,clock_uncertainty_ms:Number(timeSync.uncertainty_ms||0),latency_method:'capture-to-encoded + rtt/2 + receiver-processing (buffer + decode fallback)',control_outcomes:controlOutcomes,control_outcomes_balanced:controlLogic.controlOutcomesBalanced(controlOutcomes),streams,passed:streams.length>0&&streams.every(s=>s.passed)};
   const mediaLogAt=performance.now();
+  metrics.source_session_id=sourceSession;metrics.source_control_session_generation=sourceGeneration;metrics.media_negotiation_id=sourceOfferId;
   if(lastMediaMetricsLogAt===null||mediaLogAt-lastMediaMetricsLogAt>=5000){lastMediaMetricsLogAt=mediaLogAt;clientLog('driver_media_metrics',metrics);clientLog('driver_ice_connectivity',{ice_transport_policy:consoleConfig.ice_transport_policy,ice_connection_state:peer.iceConnectionState,ice_gathering_state:peer.iceGatheringState,...controlLogic.iceConnectivity(report,selectedPair)})}
   await post('/api/webrtc/metrics',metrics);
-  if(metrics.codec==='h265'&&metrics.connection_state==='connected'&&streams.length){h265FailureSamples=streams.some(s=>s.fps<20)?h265FailureSamples+1:0;if(h265FailureSamples>=3&&!h265FallbackSent){h265FallbackSent=true;await post('/api/webrtc/fallback',{codec:'h264',reason:'h265_decode_fps_below_20'})}}else h265FailureSamples=0;
+  if(!current())return;
+  if(metrics.codec==='h265'&&metrics.connection_state==='connected'&&streams.length){h265FailureSamples=streams.some(s=>s.fps<20)?h265FailureSamples+1:0;if(h265FailureSamples>=3&&!h265FallbackSent){h265FallbackSent=true;await post('/api/webrtc/fallback',{codec:'h264',reason:'h265_decode_fps_below_20',media_negotiation_id:mediaOfferScope?.id||'',source_session_id:sourceSession,source_control_session_generation:sourceGeneration})}}else h265FailureSamples=0;
+  if(!current())return;
   latestMetrics=metrics;renderMonitoring();statusPanel.textContent=`${metrics.connection_state||'等待连接'} · ${streams.length} 路视频 · RTT ${formatMetric(metrics.control_rtt_ms,1,' ms')} · ${metrics.connection_method||'unknown'}`
+  }catch(error){if(current())throw error}
 }
 setInterval(()=>collectMetrics().catch(console.error),1000);
 setInterval(()=>refreshRuntimeStatus().catch(console.error),1000);
@@ -6455,11 +6504,45 @@ Json DriverConsoleRuntime::poll_signaling() {
     if (session_id_ != session) throw std::runtime_error("driver session changed during signaling poll");
     signaling_messages_ = messages;
     signaling_available_ = true;
+    if (media_scope_session_ != session) {
+      media_scope_session_ = session; media_scope_id_.clear(); media_offer_count_ = 0; media_scope_legacy_allowed_ = true;
+    }
+    for (const auto& message : messages) {
+      if (message.value("type", "") != "webrtc_offer") continue;
+      const auto payload = message.value("payload", Json::object());
+      const auto id = payload.value("media_negotiation_id", "");
+      if (id.empty() || id != media_scope_id_) { ++media_offer_count_; media_scope_id_ = id; }
+      media_scope_legacy_allowed_ = payload.value("legacy_bootstrap_allowed", media_offer_count_ == 1);
+    }
   }
   return {{"session_id", session}, {"messages", messages}};
 }
 
-Json DriverConsoleRuntime::send_signaling_message(std::string_view type, const Json& payload) {
+void DriverConsoleRuntime::validate_media_source_scope_locked(const Json& input) const {
+  if (!input.contains("source_session_id") && !input.contains("source_control_session_generation")) return;
+  if (!input.contains("source_session_id") || !input.at("source_session_id").is_string() ||
+      !input.contains("source_control_session_generation") ||
+      !input.at("source_control_session_generation").is_number_unsigned())
+    throw std::invalid_argument("WebRTC source session scope is incomplete");
+  if (input.at("source_session_id") != session_id_ ||
+      input.at("source_control_session_generation").get<std::uint64_t>() != control_session_generation_)
+    throw std::runtime_error("WebRTC source session changed");
+}
+
+void DriverConsoleRuntime::validate_media_negotiation_locked(const Json& input) const {
+  if (media_scope_session_ != session_id_ || media_offer_count_ == 0) return;
+  const auto id = input.value("media_negotiation_id", "");
+  if (!id.empty() && !media_scope_id_.empty() && id != media_scope_id_)
+    throw std::runtime_error("WebRTC negotiation changed; discard this old media request");
+  // A retry requires both peers to identify the offer. Source session alone
+  // cannot distinguish delayed responses to two offers in the same session.
+  if ((!media_scope_legacy_allowed_ && id.empty()) ||
+      (media_offer_count_ > 1 && (id.empty() || media_scope_id_.empty())))
+    throw std::runtime_error("媒体信令版本不兼容：重试缺少协商标识。请保持车辆停止，统一更新控制端和车端包，重新打开控制页面并建立新会话。");
+}
+
+Json DriverConsoleRuntime::send_signaling_message(
+    std::string_view type, const Json& payload, const Json* source_scope) {
   std::lock_guard send_lock(signaling_send_mutex_);
   std::string token;
   std::string session;
@@ -6469,6 +6552,8 @@ Json DriverConsoleRuntime::send_signaling_message(std::string_view type, const J
   {
     std::lock_guard lock(mutex_);
     if (session_id_.empty() || driver_token_.empty()) throw std::runtime_error("driver console is not connected");
+    if (source_scope) validate_media_source_scope_locked(*source_scope);
+    if (source_scope) validate_media_negotiation_locked(payload);
     token = driver_token_;
     session = session_id_;
     identity = driver_id();
@@ -6605,23 +6690,39 @@ Json DriverConsoleRuntime::send_media_fallback(const Json& input) {
   if (!input.is_object() || lower(input.value("codec", "")) != "h264") {
     throw std::invalid_argument("media fallback must request H.264");
   }
-  return send_signaling_message(
-      "media_fallback", {{"codec", "h264"}, {"reason", input.value("reason", "browser_decode_failure")}});
+  Json payload{{"codec", "h264"}, {"reason", input.value("reason", "browser_decode_failure")}};
+  if (input.contains("media_negotiation_id")) {
+    if (!input["media_negotiation_id"].is_string() || input["media_negotiation_id"].get_ref<const std::string&>().size() > 128)
+      throw std::invalid_argument("WebRTC negotiation identity is invalid");
+    if (input["media_negotiation_id"] != "") payload["media_negotiation_id"] = input["media_negotiation_id"];
+  }
+  return send_signaling_message("media_fallback", payload, &input);
 }
 
 Json DriverConsoleRuntime::send_webrtc_answer(const Json& input) {
   if (!input.is_object() || input.value("type", "") != "answer" || input.value("sdp", "").empty()) {
     throw std::invalid_argument("WebRTC answer must contain type=answer and SDP");
   }
-  return send_signaling_message("webrtc_answer", {{"type", "answer"}, {"sdp", input.at("sdp")}});
+  Json payload{{"type", "answer"}, {"sdp", input.at("sdp")}};
+  if (input.contains("media_negotiation_id")) {
+    if (!input["media_negotiation_id"].is_string() || input["media_negotiation_id"].get_ref<const std::string&>().size() > 128)
+      throw std::invalid_argument("WebRTC negotiation identity is invalid");
+    if (input["media_negotiation_id"] != "") payload["media_negotiation_id"] = input["media_negotiation_id"];
+  }
+  return send_signaling_message("webrtc_answer", payload, &input);
 }
 
 Json DriverConsoleRuntime::send_webrtc_ice_candidate(const Json& input) {
-  const auto candidate = input.contains("candidate") && input.at("candidate").is_object() ? input.at("candidate") : input;
+  auto candidate = input.contains("candidate") && input.at("candidate").is_object() ? input.at("candidate") : input;
   if (!candidate.is_object() || candidate.value("candidate", "").empty()) {
     throw std::invalid_argument("WebRTC ICE candidate is required");
   }
-  return send_signaling_message("ice_candidate", candidate);
+  if (input.contains("media_negotiation_id")) {
+    if (!input["media_negotiation_id"].is_string() || input["media_negotiation_id"].get_ref<const std::string&>().size() > 128)
+      throw std::invalid_argument("WebRTC negotiation identity is invalid");
+    if (input["media_negotiation_id"] != "") candidate["media_negotiation_id"] = input["media_negotiation_id"];
+  }
+  return send_signaling_message("ice_candidate", candidate, &input);
 }
 
 Json DriverConsoleRuntime::ingest_webrtc_metrics(const Json& input) {
@@ -6655,6 +6756,8 @@ Json DriverConsoleRuntime::ingest_webrtc_metrics(const Json& input) {
   bool should_report = false;
   {
     std::lock_guard lock(mutex_);
+    validate_media_source_scope_locked(input);
+    validate_media_negotiation_locked(input);
     webrtc_metrics_ = input;
     webrtc_metrics_["received_at_ms"] = received_at_ms;
     audit_key = session_id_ + "\n" + report_key;

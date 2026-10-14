@@ -414,7 +414,10 @@ class DriverConsoleRuntime {
   void cancel_pending_connect();
   [[nodiscard]] std::string driver_id() const;
   [[nodiscard]] Json fetch_authorized_vehicles(std::string_view token, std::int64_t expires_at_ms);
-  [[nodiscard]] Json send_signaling_message(std::string_view type, const Json& payload);
+  [[nodiscard]] Json send_signaling_message(
+      std::string_view type, const Json& payload, const Json* source_scope = nullptr);
+  void validate_media_source_scope_locked(const Json& input) const;
+  void validate_media_negotiation_locked(const Json& input) const;
   void connect_signaling_websocket(std::string_view session_id, std::string_view token);
   void close_signaling_websocket();
   [[nodiscard]] bool connect_control_signaling_websocket(
@@ -538,6 +541,11 @@ class DriverConsoleRuntime {
   int control_signaling_reconnect_delay_ms_{100};
   std::uint64_t signaling_delivery_cursor_{0};
   std::uint64_t signaling_websocket_reconnects_{0};
+  // Protected by mutex_; counts offers delivered to this session's page.
+  std::string media_scope_session_;
+  std::string media_scope_id_;
+  std::uint64_t media_offer_count_{0};
+  bool media_scope_legacy_allowed_{true};
   Json webrtc_metrics_ = Json::object();
   std::string last_webrtc_audit_key_;
   Json authorized_vehicles_ = Json::array();

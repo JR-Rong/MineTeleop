@@ -489,6 +489,67 @@ CameraIssue classify_camera_issue(std::string_view error) {
 }
 
 struct VehicleMediaRuntime::Impl {
+  struct MediaSignalState {
+    std::mutex mutex;
+    Impl* owner{nullptr};
+    GstElement* peer{nullptr};
+    std::string negotiation_id;
+    std::string compatibility_issue;
+    bool local_description_ready{false};
+    bool offer_queued{false};
+    std::vector<std::string> local_ufrags;
+    std::vector<std::string> remote_ufrags;
+    std::deque<Json> pending_remote_candidates;
+    std::deque<Json> pending_local_candidates;
+    std::deque<std::pair<std::string, Json>> pending;
+    std::size_t attempt_count{0};
+    std::size_t offer_count{0};
+    std::string session_id;
+    void begin_attempt(Impl* next_owner, GstElement* next_peer, const std::string& session) {
+      std::lock_guard lock(mutex);
+      if (session_id != session) { session_id = session; attempt_count = 0; offer_count = 0; }
+      owner = next_owner; peer = next_peer; negotiation_id.clear(); compatibility_issue.clear();
+      local_description_ready = false; offer_queued = false;
+      local_ufrags.clear(); remote_ufrags.clear();
+      pending_local_candidates.clear(); pending_remote_candidates.clear(); pending.clear();
+      ++attempt_count;
+    }
+  };
+  struct MediaOfferContext {
+    std::shared_ptr<MediaSignalState> state;
+    GstElement* peer;
+    std::string negotiation_id;
+    ~MediaOfferContext() { gst_object_unref(peer); }
+  };
+  struct MediaPeerReference {
+    GstElement* value;
+    ~MediaPeerReference() { gst_object_unref(value); }
+  };
+  static std::vector<std::string> ice_ufrags(std::string_view sdp) {
+    std::vector<std::string> result;
+    for (std::size_t begin = 0; begin < sdp.size();) {
+      const auto end = sdp.find('\n', begin);
+      auto line = sdp.substr(begin, end == std::string_view::npos ? sdp.size() - begin : end - begin);
+      if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+      constexpr std::string_view prefix = "a=ice-ufrag:";
+      if (line.starts_with(prefix) && line.size() > prefix.size() && line.size() - prefix.size() <= 256 && result.size() < 128) {
+        const std::string value(line.substr(prefix.size()));
+        if (std::find(result.begin(), result.end(), value) == result.end()) result.push_back(value);
+      }
+      if (end == std::string_view::npos) break;
+      begin = end + 1;
+    }
+    return result;
+  }
+  static std::string candidate_ufrag(const Json& candidate) {
+    if (candidate.contains("usernameFragment") && candidate["usernameFragment"].is_string())
+      return candidate["usernameFragment"].get<std::string>();
+    const auto text = candidate.value("candidate", "");
+    const auto position = text.find(" ufrag ");
+    if (position == std::string::npos) return {};
+    const auto begin = position + 7;
+    return text.substr(begin, text.find(' ', begin) - begin);
+  }
   static constexpr std::size_t kControlTraceQueueCapacity = 256;
   static constexpr std::size_t kControlTraceBatchMaxRecords = 32;
   static constexpr std::size_t kControlTraceBatchCommandsMaxBytes = 40U * 1024U;
@@ -842,12 +903,17 @@ struct VehicleMediaRuntime::Impl {
     return GST_PAD_PROBE_OK;
   }
 
-  static void on_ice_candidate(GstElement*, guint mline_index, gchar* candidate, gpointer user_data) {
+  static void on_ice_candidate(GstElement* peer, guint mline_index, gchar* candidate, gpointer user_data) {
     // GStreamer 1.28 emits a final empty candidate after ICE gathering is
     // complete.  Trickle ICE endpoints accept only real candidates; the empty
     // marker must not be sent as an application signaling message.
     if (candidate == nullptr || *candidate == '\0') return;
-    auto* self = static_cast<Impl*>(user_data);
+    const auto state = *static_cast<std::shared_ptr<MediaSignalState>*>(user_data);
+    std::lock_guard lock(state->mutex);
+    if (state->peer != peer || state->owner == nullptr || state->negotiation_id.empty() || !state->local_description_ready) return;
+    auto* self = state->owner;
+    const auto ufrag = candidate_ufrag(Json{{"candidate", candidate}});
+    if (!ufrag.empty() && std::find(state->local_ufrags.begin(), state->local_ufrags.end(), ufrag) == state->local_ufrags.end()) return;
     const auto count = ++self->local_ice_candidate_count;
     if (count == 1) {
       self->emit_diagnostic(
@@ -859,9 +925,17 @@ struct VehicleMediaRuntime::Impl {
           true,
           {{"candidate_count", count}, {"sdp_mline_index", mline_index}});
     }
-    self->queue_signal(
-        "ice_candidate",
-        {{"candidate", candidate}, {"sdpMLineIndex", mline_index}});
+    Json payload{{"candidate", candidate}, {"sdpMLineIndex", mline_index},
+        {"media_negotiation_id", state->negotiation_id}};
+    if (state->offer_queued) {
+      state->pending.emplace_back("ice_candidate", std::move(payload));
+    } else if (state->pending_local_candidates.size() < 128) {
+      state->pending_local_candidates.push_back(std::move(payload));
+    } else {
+      self->set_pipeline_error("WebRTC local ICE candidate buffer exceeds limit",
+          "webrtc_ice_buffer_limit", "ice_gathering",
+          "Inspect interface/candidate count before retrying the media connection.", false);
+    }
   }
 
   static void on_control_channel_open(GstWebRTCDataChannel* channel, gpointer user_data) {
@@ -988,10 +1062,15 @@ struct VehicleMediaRuntime::Impl {
   }
 
   static void on_offer_created(GstPromise* promise, gpointer user_data) {
-    auto* self = static_cast<Impl*>(user_data);
+    const auto* context = static_cast<MediaOfferContext*>(user_data);
+    const auto state = context->state;
+    const auto negotiation_id = context->negotiation_id;
+    MediaPeerReference source{GST_ELEMENT(gst_object_ref(context->peer))};
     if (gst_promise_wait(promise) != GST_PROMISE_RESULT_REPLIED) {
       gst_promise_unref(promise);
-      self->set_pipeline_error(
+      std::lock_guard lock(state->mutex);
+      if (state->peer != source.value || state->owner == nullptr || state->negotiation_id != negotiation_id) return;
+      state->owner->set_pipeline_error(
           "WebRTC offer promise failed",
           "webrtc_offer_promise_failed",
           "webrtc_offer",
@@ -1004,7 +1083,9 @@ struct VehicleMediaRuntime::Impl {
     gst_structure_get(reply, "offer", GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &offer, nullptr);
     gst_promise_unref(promise);
     if (offer == nullptr) {
-      self->set_pipeline_error(
+      std::lock_guard lock(state->mutex);
+      if (state->peer != source.value || state->owner == nullptr || state->negotiation_id != negotiation_id) return;
+      state->owner->set_pipeline_error(
           "WebRTC offer is missing",
           "webrtc_offer_missing",
           "webrtc_offer",
@@ -1013,13 +1094,14 @@ struct VehicleMediaRuntime::Impl {
       return;
     }
 
-    GstPromise* local = gst_promise_new();
-    g_signal_emit_by_name(self->webrtc, "set-local-description", offer, local);
-    gst_promise_interrupt(local);
-    gst_promise_unref(local);
-
     gchar* text = gst_sdp_message_as_text(offer->sdp);
     Json tracks = Json::array();
+    {
+    std::lock_guard lock(state->mutex);
+    if (state->peer != source.value || state->owner == nullptr || state->negotiation_id != negotiation_id) {
+      g_free(text); gst_webrtc_session_description_free(offer); return;
+    }
+    auto* self = state->owner;
     for (const auto& lane : self->lanes) {
       tracks.push_back({
           {"camera_id", lane->camera.id},
@@ -1031,13 +1113,37 @@ struct VehicleMediaRuntime::Impl {
           {"bitrate_kbps", lane->profile.bitrate_kbps},
       });
     }
-    self->queue_signal(
-        "webrtc_offer",
-        {{"type", "offer"},
+    }
+    {
+      std::lock_guard lock(state->mutex);
+      if (state->peer != source.value || state->owner == nullptr || state->negotiation_id != negotiation_id) {
+        g_free(text); gst_webrtc_session_description_free(offer); return;
+      }
+      state->local_ufrags = ice_ufrags(text == nullptr ? "" : text);
+      state->local_description_ready = true;
+    }
+    GstPromise* local = gst_promise_new();
+    // The captured source is held alive; an old promise never touches the
+    // replacement self->webrtc. Candidate callbacks may run during this call.
+    g_signal_emit_by_name(source.value, "set-local-description", offer, local);
+    gst_promise_interrupt(local);
+    gst_promise_unref(local);
+    {
+    std::lock_guard lock(state->mutex);
+    if (state->peer == source.value && state->owner != nullptr && state->negotiation_id == negotiation_id) {
+    auto* self = state->owner;
+    state->pending.emplace_back("webrtc_offer", Json{
+         {"type", "offer"},
          {"sdp", text == nullptr ? "" : text},
+         {"media_negotiation_id", negotiation_id},
+         {"legacy_bootstrap_allowed", state->attempt_count == 1 && state->offer_count == 1},
          {"codec", to_string(self->active_candidate.codec)},
          {"backend", to_string(self->active_candidate.backend)},
          {"media_tracks", std::move(tracks)}});
+    state->offer_queued = true;
+    for (auto& candidate : state->pending_local_candidates)
+      state->pending.emplace_back("ice_candidate", std::move(candidate));
+    state->pending_local_candidates.clear();
     self->emit_diagnostic(
         "vehicle_webrtc_offer_created",
         "webrtc_offer_created",
@@ -1048,19 +1154,42 @@ struct VehicleMediaRuntime::Impl {
         {{"track_count", self->lanes.size()},
          {"codec", to_string(self->active_candidate.codec)},
          {"backend", to_string(self->active_candidate.backend)}});
+    }
+    }
     g_free(text);
     gst_webrtc_session_description_free(offer);
   }
 
   static void on_negotiation_needed(GstElement* webrtc, gpointer user_data) {
-    auto* self = static_cast<Impl*>(user_data);
-    GstPromise* promise = gst_promise_new_with_change_func(on_offer_created, self, nullptr);
+    const auto state = *static_cast<std::shared_ptr<MediaSignalState>*>(user_data);
+    std::unique_ptr<MediaOfferContext> context;
+    {
+      std::lock_guard lock(state->mutex);
+      if (state->peer != webrtc || state->owner == nullptr) return;
+      // Fixed lanes use a new webrtcbin for every retry. Keep this peer's
+      // epoch immutable, including the check-to-description-emission gap.
+      // Same-peer renegotiation and ICE restart are not supported here.
+      if (!state->negotiation_id.empty()) return;
+      state->negotiation_id = random_token(12);
+      state->local_description_ready = false; state->offer_queued = false;
+      state->local_ufrags.clear(); state->pending_local_candidates.clear();
+      ++state->offer_count;
+      state->remote_ufrags.clear(); state->pending_remote_candidates.clear();
+      std::erase_if(state->pending, [](const auto& value) {
+        return value.first == "webrtc_offer" || value.first == "ice_candidate";
+      });
+      context.reset(new MediaOfferContext{
+          state, GST_ELEMENT(gst_object_ref(webrtc)), state->negotiation_id});
+    }
+    GstPromise* promise = gst_promise_new_with_change_func(on_offer_created, context.release(),
+        +[](gpointer value) { delete static_cast<MediaOfferContext*>(value); });
     g_signal_emit_by_name(webrtc, "create-offer", nullptr, promise);
   }
 
   void queue_signal(std::string type, Json payload) {
-    std::lock_guard lock(signal_mutex);
-    pending_signals.emplace_back(std::move(type), std::move(payload));
+    std::lock_guard lock(media_signal_state->mutex);
+    if (media_signal_state->peer != nullptr)
+      media_signal_state->pending.emplace_back(std::move(type), std::move(payload));
   }
 
   void emit_diagnostic(
@@ -3366,8 +3495,15 @@ struct VehicleMediaRuntime::Impl {
       stop_pipeline();
       return false;
     }
-    g_signal_connect(webrtc, "on-negotiation-needed", G_CALLBACK(on_negotiation_needed), this);
-    g_signal_connect(webrtc, "on-ice-candidate", G_CALLBACK(on_ice_candidate), this);
+    media_signal_state->begin_attempt(this, webrtc, signaling.session_id());
+    const auto connect_media_signal = [&](const char* name, GCallback callback) {
+      auto* state = new std::shared_ptr<MediaSignalState>(media_signal_state);
+      g_signal_connect_data(webrtc, name, callback, state,
+          +[](gpointer data, GClosure*) { delete static_cast<std::shared_ptr<MediaSignalState>*>(data); },
+          static_cast<GConnectFlags>(0));
+    };
+    connect_media_signal("on-negotiation-needed", G_CALLBACK(on_negotiation_needed));
+    connect_media_signal("on-ice-candidate", G_CALLBACK(on_ice_candidate));
     try {
       configure_ice_servers();
     } catch (const std::exception& error) {
@@ -3755,6 +3891,17 @@ struct VehicleMediaRuntime::Impl {
 
   void stop_pipeline() {
     stop_requested = true;
+    {
+      std::lock_guard lock(media_signal_state->mutex);
+      media_signal_state->owner = nullptr; media_signal_state->peer = nullptr;
+      media_signal_state->compatibility_issue.clear();
+      media_signal_state->negotiation_id.clear(); media_signal_state->remote_ufrags.clear();
+      media_signal_state->local_description_ready = false;
+      media_signal_state->offer_queued = false;
+      media_signal_state->local_ufrags.clear();
+      media_signal_state->pending_local_candidates.clear();
+      media_signal_state->pending_remote_candidates.clear(); media_signal_state->pending.clear();
+    }
     GstWebRTCDataChannel* channel_to_close = nullptr;
     {
       std::lock_guard lock(control_mutex);
@@ -3855,10 +4002,59 @@ struct VehicleMediaRuntime::Impl {
   void flush_outgoing_signals() {
     std::deque<std::pair<std::string, Json>> values;
     {
-      std::lock_guard lock(signal_mutex);
-      values.swap(pending_signals);
+      std::lock_guard lock(media_signal_state->mutex);
+      values.swap(media_signal_state->pending);
     }
-    for (const auto& [type, payload] : values) signaling.send(type, payload);
+    for (const auto& [type, payload] : values) {
+      if (type == "webrtc_offer" || type == "ice_candidate") {
+        std::lock_guard lock(media_signal_state->mutex);
+        if (media_signal_state->peer == nullptr ||
+            payload.value("media_negotiation_id", "") != media_signal_state->negotiation_id) continue;
+      }
+      signaling.send(type, payload);
+    }
+  }
+
+  void apply_remote_ice(const Json& payload) {
+    const auto candidate = payload.value("candidate", "");
+    if (candidate.empty()) return;
+    if (candidate.size() > 8192) throw std::runtime_error("WebRTC ICE candidate exceeds limit");
+    GstElement* source = nullptr;
+    {
+      std::lock_guard lock(media_signal_state->mutex);
+      auto& state = *media_signal_state;
+      if (state.peer == nullptr || state.negotiation_id.empty()) return;
+      const auto id = payload.value("media_negotiation_id", "");
+      if (!id.empty() && id != state.negotiation_id) return;
+      const auto ufrag = candidate_ufrag(payload);
+      if (state.remote_ufrags.empty()) {
+        // Even tagged trickle candidates wait for the corresponding answer.
+        // This keeps pre-answer candidates within the application scope fence.
+        if (id.empty() && ufrag.empty() && (state.attempt_count != 1 || state.offer_count != 1)) return;
+        if (state.pending_remote_candidates.size() >= 128) throw std::runtime_error("WebRTC ICE candidate buffer exceeds limit");
+        state.pending_remote_candidates.push_back(payload); return;
+      }
+      if (!ufrag.empty()) {
+        if (std::find(state.remote_ufrags.begin(), state.remote_ufrags.end(), ufrag) == state.remote_ufrags.end()) return;
+      } else if (id.empty() && (state.attempt_count != 1 || state.offer_count != 1)) return;
+      source = GST_ELEMENT(gst_object_ref(state.peer));
+    }
+    MediaPeerReference reference{source};
+    const auto index = payload.value("sdpMLineIndex", 0U);
+    g_signal_emit_by_name(source, "add-ice-candidate", index, candidate.c_str());
+    const auto count = ++remote_ice_candidate_count;
+    if (count == 1) emit_diagnostic("vehicle_webrtc_remote_ice_candidate_received",
+        "webrtc_remote_ice_candidate_available", "ice_connectivity", "",
+        "No action is required; this is a connectivity milestone.", true,
+        {{"candidate_count", count}, {"sdp_mline_index", index}});
+  }
+
+  Json media_scope_status() const {
+    std::lock_guard lock(media_signal_state->mutex);
+    return {{"id", media_signal_state->negotiation_id},
+        {"issue_code", media_signal_state->compatibility_issue},
+        {"next_action", media_signal_state->compatibility_issue.empty() ? "" :
+            "Keep control stopped. Update controller and vehicle packages together, reopen the control page, and start a fresh session."}};
   }
 
   void process_signaling() {
@@ -3867,12 +4063,38 @@ struct VehicleMediaRuntime::Impl {
       const auto type = message.value("type", "");
       const auto payload = message.value("payload", Json::object());
       if (type == "webrtc_answer") {
+        GstElement* source = nullptr;
+        std::string negotiation_id;
+        {
+          std::lock_guard lock(media_signal_state->mutex);
+          if (media_signal_state->peer == nullptr || media_signal_state->negotiation_id.empty()) continue;
+          const auto id = payload.value("media_negotiation_id", "");
+          if (!id.empty() && id != media_signal_state->negotiation_id) continue;
+          // An untagged legacy answer cannot be associated with a retry.
+          // Keep first-connection compatibility, then require the offer id.
+          if (id.empty() && !media_signal_state->remote_ufrags.empty()) continue;
+          if (id.empty() && (media_signal_state->attempt_count != 1 || media_signal_state->offer_count != 1)) {
+            if (media_signal_state->compatibility_issue.empty()) {
+              media_signal_state->compatibility_issue = "media_negotiation_scope_missing";
+              emit_diagnostic("vehicle_media_scope_rejected", "media_negotiation_scope_missing", "webrtc_answer",
+                  "The retry answer does not identify its offer.",
+                  "Keep control stopped. Update controller and vehicle packages together, reopen the control page, and start a fresh session.",
+                  false, {{"media_negotiation_id", media_signal_state->negotiation_id}});
+            }
+            continue;
+          }
+          source = GST_ELEMENT(gst_object_ref(media_signal_state->peer));
+          negotiation_id = media_signal_state->negotiation_id;
+        }
+        MediaPeerReference reference{source};
         const auto sdp_text = payload.value("sdp", "");
         GstSDPMessage* sdp = nullptr;
         if (gst_sdp_message_new(&sdp) != GST_SDP_OK ||
             gst_sdp_message_parse_buffer(
                 reinterpret_cast<const guint8*>(sdp_text.data()), sdp_text.size(), sdp) != GST_SDP_OK) {
           if (sdp != nullptr) gst_sdp_message_free(sdp);
+          std::lock_guard lock(media_signal_state->mutex);
+          if (media_signal_state->peer != source || media_signal_state->negotiation_id != negotiation_id) continue;
           set_pipeline_error(
               "driver returned an invalid WebRTC answer SDP",
               "webrtc_answer_sdp_invalid",
@@ -3882,11 +4104,24 @@ struct VehicleMediaRuntime::Impl {
           return;
         }
         auto* answer = gst_webrtc_session_description_new(GST_WEBRTC_SDP_TYPE_ANSWER, sdp);
+        std::deque<Json> pending;
+        {
+          std::lock_guard lock(media_signal_state->mutex);
+          if (media_signal_state->peer != source || media_signal_state->negotiation_id != negotiation_id) {
+            gst_webrtc_session_description_free(answer); continue;
+          }
+          media_signal_state->compatibility_issue.clear();
+          media_signal_state->remote_ufrags = ice_ufrags(sdp_text);
+          pending.swap(media_signal_state->pending_remote_candidates);
+        }
         GstPromise* promise = gst_promise_new();
-        g_signal_emit_by_name(webrtc, "set-remote-description", answer, promise);
+        g_signal_emit_by_name(source, "set-remote-description", answer, promise);
         gst_promise_interrupt(promise);
         gst_promise_unref(promise);
         gst_webrtc_session_description_free(answer);
+        for (const auto& candidate : pending) apply_remote_ice(candidate);
+        std::lock_guard lock(media_signal_state->mutex);
+        if (media_signal_state->peer != source || media_signal_state->negotiation_id != negotiation_id) continue;
         answer_received = true;
         answer_received_at_ms = signaling.now_ms();
         emit_diagnostic(
@@ -3899,23 +4134,13 @@ struct VehicleMediaRuntime::Impl {
             {{"codec", to_string(active_candidate.codec)},
              {"backend", to_string(active_candidate.backend)}});
       } else if (type == "ice_candidate") {
-        const auto candidate = payload.value("candidate", "");
-        const auto index = payload.value("sdpMLineIndex", 0U);
-        if (!candidate.empty()) {
-          g_signal_emit_by_name(webrtc, "add-ice-candidate", index, candidate.c_str());
-          const auto count = ++remote_ice_candidate_count;
-          if (count == 1) {
-            emit_diagnostic(
-                "vehicle_webrtc_remote_ice_candidate_received",
-                "webrtc_remote_ice_candidate_available",
-                "ice_connectivity",
-                "",
-                "No action is required; this is a connectivity milestone.",
-                true,
-                {{"candidate_count", count}, {"sdp_mline_index", index}});
-          }
-        }
+        apply_remote_ice(payload);
       } else if (type == "media_fallback" && active_candidate.codec == VideoCodec::H265) {
+        {
+          std::lock_guard lock(media_signal_state->mutex);
+          const auto id = payload.value("media_negotiation_id", "");
+          if (!id.empty() && id != media_signal_state->negotiation_id) continue;
+        }
         codec_fallback_requested = true;
         set_pipeline_error(
             "browser requested H.264 fallback: " + payload.value("reason", "decode failure"),
@@ -4279,6 +4504,7 @@ struct VehicleMediaRuntime::Impl {
               {"recording_attempt_id", recording_attempt_id},
               {"codec", to_string(candidate.codec)},
               {"backend", to_string(candidate.backend)},
+              {"media_negotiation", media_scope_status()},
               {"control_issue_code", control_inhibited.load() ? std::string(recovery_inhibition_issue()) : control_recovery_latch->braking_wait_for(signaling.session_id()) ? "control_recovery_braking_wait" : ""},
               {"control_recovery", control_recovery_latch->recovery_status_for(signaling.session_id())},
               {"time_sync", signaling.time_sync_status().to_json()},
@@ -4542,8 +4768,7 @@ struct VehicleMediaRuntime::Impl {
   GstWebRTCDataChannel* control_channel{nullptr};
   std::vector<std::unique_ptr<Lane>> lanes;
   std::atomic<bool> stop_requested{false};
-  std::mutex signal_mutex;
-  std::deque<std::pair<std::string, Json>> pending_signals;
+  std::shared_ptr<MediaSignalState> media_signal_state{std::make_shared<MediaSignalState>()};
   mutable std::mutex error_mutex;
   std::string pipeline_error;
   std::string pipeline_issue_code;

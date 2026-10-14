@@ -1306,6 +1306,41 @@
     return Object.freeze({send, enqueueHeartbeat, reset});
   }
 
+  function iceOfferScope(offer, allowLegacyBootstrap) {
+    const id = typeof offer.media_negotiation_id === 'string' && offer.media_negotiation_id.length <= 128
+      ? offer.media_negotiation_id : '';
+    const ufrags = [];
+    const expression = /(?:^|\r?\n)a=ice-ufrag:([^\s\r\n]+)/g;
+    for (let match; (match = expression.exec(String(offer.sdp || '')));) {
+      if (match[1].length <= 256 && !ufrags.includes(match[1]) && ufrags.length < 128) ufrags.push(match[1]);
+    }
+    return {id, ufrags, allowLegacyBootstrap: Boolean(allowLegacyBootstrap) && offer.legacy_bootstrap_allowed !== false && !id};
+  }
+
+  function iceCandidateScope(candidate) {
+    const id = typeof candidate.media_negotiation_id === 'string' && candidate.media_negotiation_id.length <= 128
+      ? candidate.media_negotiation_id : '';
+    const match = String(candidate.candidate || '').match(/(?:^|\s)ufrag\s+([^\s]+)/);
+    const ufrag = typeof candidate.usernameFragment === 'string' ? candidate.usernameFragment : match ? match[1] : '';
+    return {id, ufrag: ufrag.length <= 256 ? ufrag : ''};
+  }
+
+  function iceCandidateMatchesOffer(candidate, offer) {
+    if (!offer) return false;
+    const scope = iceCandidateScope(candidate);
+    if (scope.id) {
+      if (!offer.id || scope.id !== offer.id) return false;
+      return !scope.ufrag || offer.ufrags.includes(scope.ufrag);
+    }
+    if (scope.ufrag) return offer.ufrags.includes(scope.ufrag);
+    return offer.allowLegacyBootstrap === true;
+  }
+
+  function mediaScopeDiagnostic(issue) {
+    if (!['media_negotiation_scope_missing', 'media_ice_scope_missing'].includes(issue)) return null;
+    return {level: 'warn', text: '媒体信令版本不兼容，重试缺少协商标识。请保持车辆停止，统一更新控制端和车端包，重新打开控制页面并建立新会话。'};
+  }
+
   function iceServerError(error) {
     const url = String(error.url || ''), message = String(error.errorText || '');
     const explicit = url.match(/[?&]transport=(udp|tcp)(?:&|$)/i);
@@ -1637,5 +1672,9 @@
     safeLogoutFeedback,
     safeLogoutPresentation,
     selectedIcePair,
+    mediaScopeDiagnostic,
+    iceOfferScope,
+    iceCandidateScope,
+    iceCandidateMatchesOffer,
   });
 });

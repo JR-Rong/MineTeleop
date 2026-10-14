@@ -413,6 +413,15 @@ if(MINE_TELEOP_BUILD_TESTS)
       NAME mine-teleop-control-logic-js-tests
       COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/control_logic.test.cjs
     )
+    add_test(NAME mine-teleop-ice-page-tests
+      COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/ice_page.test.cjs)
+  endif()
+  if(MINE_TELEOP_BUILD_CONTROL_CLIENT AND MINE_TELEOP_BUILD_SIGNALING_SERVER)
+    add_executable(mine-teleop-ice-signaling-tests cpp/tests/ice_signaling_tests.cpp)
+    target_link_libraries(mine-teleop-ice-signaling-tests PRIVATE mine_teleop_runtime)
+    mine_teleop_enable_warnings(mine-teleop-ice-signaling-tests)
+    add_test(NAME mine-teleop-ice-signaling-tests COMMAND mine-teleop-ice-signaling-tests)
+    set_tests_properties(mine-teleop-ice-signaling-tests PROPERTIES TIMEOUT 60)
   endif()
   if(MINE_TELEOP_BUILD_SIGNALING_SERVER)
     add_test(NAME mine-teleop-signaling-help COMMAND mine-teleop-signaling-server --help)
@@ -512,6 +521,23 @@ if(MINE_TELEOP_BUILD_TESTS)
     mine_teleop_enable_warnings(mine-teleop-media-freshness-gstreamer-tests)
     add_test(NAME mine-teleop-media-freshness-gstreamer-tests COMMAND mine-teleop-media-freshness-gstreamer-tests)
     set_tests_properties(mine-teleop-media-freshness-gstreamer-tests PROPERTIES TIMEOUT 60)
+    if(UNIX)
+      find_package(Python3 COMPONENTS Interpreter REQUIRED)
+      add_test(NAME mine-teleop-ice-vehicle-callback-mock-tests
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/ice_vehicle_callbacks.test.py
+          --output ${CMAKE_CURRENT_BINARY_DIR}/ice-vehicle-callback-mock
+          --compiler ${CMAKE_CXX_COMPILER}
+          --json-include "$<TARGET_PROPERTY:nlohmann_json::nlohmann_json,INTERFACE_INCLUDE_DIRECTORIES>")
+      set_tests_properties(mine-teleop-ice-vehicle-callback-mock-tests PROPERTIES TIMEOUT 90)
+      add_test(NAME mine-teleop-ice-gstreamer-init-tests
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/ice_gstreamer_init.test.py
+          --output ${CMAKE_CURRENT_BINARY_DIR}/ice-gstreamer-init
+          --compiler ${CMAKE_CXX_COMPILER}
+          --json-include "$<TARGET_PROPERTY:nlohmann_json::nlohmann_json,INTERFACE_INCLUDE_DIRECTORIES>")
+      set_tests_properties(mine-teleop-ice-gstreamer-init-tests PROPERTIES TIMEOUT 90)
+    endif()
   endif()
 
   add_executable(mine-teleop-vcu-tests cpp/tests/vcu_tests.cpp)
