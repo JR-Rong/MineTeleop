@@ -1139,6 +1139,9 @@ NativeControlIntentUpdate NativeControlIntentStore::update(
     intent.brake = 0.0;
   }
   const bool same_ui = latest_ && latest_->ui_instance_id == intent.ui_instance_id;
+  if (same_ui && !incoming_estop && received_at_monotonic_ms < received_at_monotonic_ms_) {
+    return {false, false, requires_fresh_input_, "old_intent_arrival"};
+  }
   if (latest_ && !same_ui) {
     requires_fresh_input_ = true;
     preserve_brake_during_rearm_ = false;
@@ -1165,7 +1168,8 @@ NativeControlIntentUpdate NativeControlIntentStore::update(
   }
   if (intent.estop) estop_latched_ = true;
   latest_ = std::move(intent);
-  received_at_monotonic_ms_ = received_at_monotonic_ms;
+  received_at_monotonic_ms_ = incoming_estop
+      ? std::max(received_at_monotonic_ms_, received_at_monotonic_ms) : received_at_monotonic_ms;
   return {true, duplicate, requires_fresh_input_, duplicate ? "refreshed" : "accepted",
           requires_fresh_input_ && preserve_brake_during_rearm_};
 }

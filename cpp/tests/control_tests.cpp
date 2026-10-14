@@ -968,7 +968,7 @@ void test_control_page_contract() {
           response.body.find(
               "nativeControlSessionId=String(session.session_id||'');nativeControlSessionGeneration=Number(session.control_session_generation)") !=
               std::string::npos &&
-          response.body.find("async function writeControlIntent(extra,announceUnavailable)") !=
+          response.body.find("async function writeControlIntent(extra,announceUnavailable,requestToken={})") !=
               std::string::npos &&
           response.body.find("const intent=nativeIntentEnvelope(outgoing)") !=
               std::string::npos &&
@@ -990,10 +990,10 @@ void test_control_page_contract() {
           response.body.find("controlWriteQueue.enqueueHeartbeat()") != std::string::npos &&
           response.body.find("const enqueued=enqueueIntentRefresh()") != std::string::npos &&
           response.body.find("const controller=new AbortController()") != std::string::npos &&
-          response.body.find("activeControlPrepareAbort=controller") != std::string::npos &&
-          response.body.find("activeControlPrepareAbort&&!activeControlPrepareIsEstop") !=
+          response.body.find("activeControlRequests.set(requestToken,requestState)") != std::string::npos &&
+          response.body.find("active&&(!active.estop||reason==='session_changed')") !=
               std::string::npos &&
-          response.body.find("reason:'control_intent_preempted_by_estop'") !=
+          response.body.find("reason:'control_intent_preempted_'+requestState.preemptedReason") !=
               std::string::npos &&
           response.body.find("latchEstop('Gamepad'))send({estop:true},false)") !=
               std::string::npos &&
@@ -2018,7 +2018,7 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
       "          control_session_generation_ != expected_session_generation)",
       intent_update_lock);
   const auto store_update = update_intent.find(
-      "native_control_intent_.update(intent, monotonic_now_ms())",
+      "native_control_intent_.update(intent, received_at)",
       intent_session_check);
   expect(
       intent_update_lock != std::string::npos &&
@@ -3354,6 +3354,21 @@ void test_driver_vehicle_switch_releases_old_session() {
        {"steering", 0.0},
        {"throttle", 0.0},
        {"brake", 0.0}});
+  mine_teleop::HttpRequest delayed_intent_request;
+  delayed_intent_request.received_at_monotonic_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count() - 10000;
+  const auto expired_local_intent = driver.update_control_intent(
+      {{"session_id", second_session_id}, {"session_generation", second_control_session_generation},
+       {"ui_instance_id", "switch-test-ui"}, {"intent_seq", 9999}, {"gear", "N"},
+       {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0}}, &delayed_intent_request);
+  expect(!expired_local_intent.value("accepted", true) &&
+      expired_local_intent.value("reason", "") == "local_input_request_expired",
+      "local HTTP waiting revived a ten-second-old input");
+  expect(expired_local_intent.at("local_http_timing").at("receive_to_apply_ms").get<int>() >= 10000 &&
+      neutral_intent.at("local_http_timing").value("timestamp_scope", "") == "local_http_received_to_intent_applied",
+      "input timing diagnostics did not separate native HTTP ingress from apply");
+
   expect(
       neutral_intent.value("accepted", false) &&
           neutral_intent.value("transport", "") == "native_signaling_websocket",

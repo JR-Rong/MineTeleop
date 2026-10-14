@@ -109,6 +109,23 @@ void test_delayed_refresh_cannot_bypass_expiry_between_sender_ticks() {
   expect(store.update(held, 213).accepted, "release/repress did not recover in the same store");
 }
 
+void test_out_of_order_local_refresh_cannot_rewind_lease_or_restore_released_motion() {
+  mine_teleop::NativeControlIntentStore store(200);
+  auto neutral = neutral_intent(1);
+  expect(store.update(neutral, 0).accepted, "neutral rejected");
+  auto motion = neutral; motion.intent_seq = 2; motion.throttle = 0.5;
+  expect(store.update(motion, 20).accepted && store.update(motion, 80).accepted, "refresh rejected");
+  expect(store.update(motion, 40).reason == "old_intent_arrival", "old refresh rewound lease");
+  expect(store.sample(100).age_ms == 20, "old refresh changed authoritative receive time");
+  neutral.intent_seq = 3;
+  expect(store.update(neutral, 110).accepted, "release rejected");
+  expect(!store.update(motion, 120).accepted, "old held request overwrote release");
+  expect_zero_actuation(store.sample(121).intent, "out of order held input restored traction");
+  auto estop = neutral; estop.intent_seq = 4; estop.estop = true;
+  expect(store.update(estop, 100).accepted && store.sample(122).intent.estop,
+      "late ESTOP was rejected because its local receive timestamp was older");
+}
+
 void test_vehicle_rearm_preserves_fresh_braking_without_restoring_motion() {
   mine_teleop::NativeControlIntentStore store(200);
   auto neutral = neutral_intent(1);
@@ -340,6 +357,7 @@ struct TestCase {
 
 int main() {
   const TestCase tests[] = {
+      {"out_of_order_local_refresh_cannot_rewind_lease_or_restore_released_motion", test_out_of_order_local_refresh_cannot_rewind_lease_or_restore_released_motion},
       {"ack_stall_brakes_without_reconnect_and_requires_recent_stable_progress", test_ack_stall_brakes_without_reconnect_and_requires_recent_stable_progress},
       {"delayed_refresh_cannot_bypass_expiry_between_sender_ticks", test_delayed_refresh_cannot_bypass_expiry_between_sender_ticks},
       {"vehicle_rearm_preserves_fresh_braking_without_restoring_motion",

@@ -385,7 +385,7 @@ class DriverConsoleRuntime {
   [[nodiscard]] Json control_profile() const;
   [[nodiscard]] Json prepare_control_profile(const Json& input);
   [[nodiscard]] Json send_control(const Json& input);
-  [[nodiscard]] Json update_control_intent(const Json& input);
+  [[nodiscard]] Json update_control_intent(const Json& input, const HttpRequest* request = nullptr);
   [[nodiscard]] Json record_browser_event(const Json& input);
   [[nodiscard]] Json status();
   [[nodiscard]] Json log_sessions();

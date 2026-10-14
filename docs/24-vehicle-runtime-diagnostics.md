@@ -488,3 +488,33 @@ DataChannel 关闭后保留；物理急停和人工急停仍优先。信令中�
 关键画面遮罩在连续 1000 ms 无呈现新帧后显示；制动仍按协商的
 `critical_camera_stale_brake_ms` 判断，非关键画面仍为 3000 ms。完整实例和 FPS
 配置边界见 [session-000006](42-session006-time-sync-and-video-display.md)。
+
+## 驾驶端输入、关键画面及 ICE 诊断
+
+`intent_received.local_http_timing` 区分本地 HTTP receive 到 handler、update/runtime
+互斥锁等待、handler 和 receive-to-apply 时间。该时间不包含响应完整写回及浏览器
+处理，不能把客户端剩余耗时直接全部归为网络。输入 lease 从真实 receive 起算。
+`local_input_request_expired` 表示普通请求在应用前已经过期；`old_intent_arrival`
+表示较旧本地接收边界，不允许它覆盖/回退已接受输入租约。
+
+`control_trace_batch.summary` 增加 `intent_response_preempted_count`、
+`intent_http_sample_count`、HTTP elapsed/server-wait/server-processing 最大值，
+以及支持 Long Tasks 的浏览器的 `long_task_count` / `long_task_max_ms`。
+心跳 timer lag 与长任务是不同观察量，未记录长任务不证明 UI 没有被调度延迟。
+成功返回的本地 HTTP timing 可与原生 trace 对照；已取消请求仍需原生接收记录归因。
+
+`driver_critical_video_health` 在 ready/具体原因变化时记录，持续故障最多补每秒一次
+同状态快照；含配置门限、每个关键相机的 frame_age/presented/recovery_frames、
+track_state/muted、video_ready_state/paused、overlay_state、页面可见性和最近接收统计。
+原因区分 camera_missing、track_missing、track_ended、track_muted、no_presented_frame、
+presented_frame_stale、peer_disconnected、recovering_frames；空的未知配置单独标明。
+同一帧的反复健康检查不计作新恢复帧。原始画面未采样，不能以这些指标证明不存在花屏。
+
+`driver_ice_connectivity` 每 5 秒与媒体指标一起记录：实际 ice_transport_policy、
+ICE 连接/收集状态、local/remote 候选类型数量、检查状态汇总，最多 16 个候选对的
+请求/响应计数、RTT、relay_protocol；选中对和直接检查优先。截断标记明确，
+不包含候选地址、SDP 或凭证。详见 docs/44-session008-input-video-and-ice-diagnostics.md。
+
+ICE server 错误同时记录实际 URL 的 udp/tcp transport 和错误类别
+（DNS 解析、server timeout 或未分类），不保存可能携带敏感信息的原始 errorText。
+旧日志 safe endpoint 去掉了 transport 查询参数，不能据 6000 的 endpoint 认定 UDP/TCP。

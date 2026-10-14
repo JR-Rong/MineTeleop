@@ -87,7 +87,7 @@ function intentPageFixture(codes = ['ArrowUp', 'ArrowLeft']) {
     driverTimeSyncReady: () => true,
     pendingGearTransition: null,
     estopLatched: false,
-    activeControlPreparePreemptedByEstop: false,
+    activeControlRequests: new Map(), controlTraceEnabled: false, nativeIntentSeq: 62,
     nativeControlSessionId: 'test-session',
     nativeControlSessionGeneration: 1,
     lastNativeIntentSnapshot: 'held-input',
@@ -105,7 +105,7 @@ function intentPageFixture(codes = ['ArrowUp', 'ArrowLeft']) {
     nativeIntentEnvelope: outgoing => Object.assign({
       session_id: context.nativeControlSessionId,
       session_generation: context.nativeControlSessionGeneration,
-      intent_seq: 62,
+      intent_seq: context.nativeIntentSeq,
     }, outgoing),
     controlInputDiagnostic: () => ({pressed_codes: Array.from(pressed), blocked_codes: Array.from(blocked)}),
     clearControlInput: (resetGear, reason) => {
@@ -188,10 +188,10 @@ test('prior session timeout preserves current keys and ESTOP preemption still ne
   assert.equal(fixture.pressed.size, 2);
   assert.equal(fixture.logs.length, 0);
   const urgent = fixture.context.writeControlIntent({}, false);
-  fixture.context.activeControlPreparePreemptedByEstop = true;
+  Array.from(fixture.context.activeControlRequests.values())[0].preemptedReason = 'estop';
   fixture.context.estopLatched = true;
   fixture.timeout();
-  assert.equal((await urgent).reason, 'control_intent_preempted_by_estop');
+  assert.equal((await urgent).reason, 'control_intent_preempted_estop');
   assert.equal(fixture.context.estopLatched, true);
   assert.equal(fixture.pressed.size, 0);
   assert.equal(fixture.logs[0].reason, 'estop_preemption');
@@ -1258,48 +1258,131 @@ test('control prepare deadline reserves at least half the command-gap budget', (
   assert.equal(logic.controlPrepareDeadlineMs(undefined), 100);
 });
 
-test('latest-write queue bounds heartbeat backlog and preserves a pending ESTOP', async () => {
-  const deferred = [];
-  const calls = [];
-  const writeControl = (extra, announceUnavailable) => {
-    calls.push({extra, announceUnavailable});
-    return new Promise((resolve, reject) => deferred.push({resolve, reject}));
-  };
-  const unhandled = [];
-  let urgentWrites = 0;
-  const queue = logic.createLatestControlWriteQueue(
-      writeControl,
-      error => unhandled.push(error),
-      () => {
-        urgentWrites += 1;
-        if (deferred[0]) {
-          deferred[0].resolve({sent: false, reason: 'control_prepare_preempted_by_estop'});
-        }
-      });
-
-  const first = queue.send({throttle: 0.4}, false);
-  assert.equal(calls.length, 1);
+test('slow responses do not serialize heartbeats; backlog is bounded and ESTOP has a reserved slot', async () => {
+  const fixture = intentPageFixture(['ArrowUp']);
+  const queue = logic.createLatestControlWriteQueue(fixture.context.writeControlIntent,
+    error => { throw error; }, (token,reason) => {
+      const active = fixture.context.activeControlRequests.get(token);
+      if (active && !active.estop) { active.preemptedReason = reason; active.controller.abort(); }
+    });
+  const first = queue.send({}, false);
+  assert.equal(fixture.requests.length, 1);
   assert.equal(queue.enqueueHeartbeat(), true);
-  assert.equal(queue.enqueueHeartbeat(), false);
-  const estop = queue.send({estop: true}, true);
-  assert.equal(urgentWrites, 1);
+  assert.equal(fixture.requests.length, 2, 'live heartbeat waited behind slow response');
+  // Two slow ordinary requests plus a single latest pending refresh; no replay backlog.
+  assert.equal(queue.enqueueHeartbeat(), true);assert.equal(queue.enqueueHeartbeat(), false);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fixture.requests.length, 3);
+  assert.equal((await first).reason, 'control_intent_preempted_latest_input');
+  assert.equal(fixture.pressed.has('ArrowUp'), true);
+  // A < 2-tick response can complete instead of being cancelled at every heartbeat.
+  fixture.requests[1].resolve({accepted:true,duplicate:true});
+  await new Promise(resolve => setImmediate(resolve));
+  logic.releaseKey(fixture.pressed, fixture.blocked, 'ArrowUp');fixture.context.nativeIntentSeq++;
+  const release = queue.send({}, false);
+  assert.equal(fixture.requests[3].intent.throttle,0);
+  fixture.context.estopLatched=true;
+  const urgent=queue.send({estop:true},true);
+  assert.equal(fixture.requests.length,5,'ESTOP waited behind two ordinary responses');
+  assert.equal(fixture.requests[4].intent.estop,true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await release).reason,'control_intent_preempted_estop');
+  assert.equal(queue.enqueueHeartbeat(),true);
+  assert.equal(fixture.requests.length,6);
+  fixture.requests[5].resolve({accepted:true});
+  await new Promise(resolve => setImmediate(resolve));
+  // A heartbeat cannot abort the outstanding urgent request.
+  assert.equal(fixture.context.activeControlRequests.size,1);
+  fixture.requests[4].resolve({accepted:true});assert.equal((await urgent).sent,true);
+});
 
-  await Promise.resolve();
-  await Promise.resolve();
-  assert.equal(calls.length, 2);
-  assert.deepEqual(calls[1], {extra: {estop: true}, announceUnavailable: true});
-  assert.equal(queue.enqueueHeartbeat(), true);
-  assert.equal(queue.enqueueHeartbeat(), false);
+test('session reset discards pending old ESTOP and allows a new session without waiting', async () => {
+  const writes=[],aborts=[];
+  const queue=logic.createLatestControlWriteQueue((extra,announce,token)=>new Promise(resolve=>writes.push({extra,resolve,token})),null,(token,reason)=>aborts.push({token,reason}));
+  const first=queue.send({},false),second=queue.send({},false);
+  const urgent=queue.send({estop:true},false);
+  const oldPending=queue.send({estop:true},false);
+  assert.equal(writes.length,3);queue.reset();
+  assert.equal((await oldPending).reason,'control_queue_session_changed');
+  assert.equal(aborts.filter(x=>x.reason==='session_changed').length,3);
+  const next=queue.send({},false);assert.equal(writes.length,4);assert.equal(Boolean(writes[3].extra.estop),false);
+  writes.slice(0,3).forEach(x=>x.resolve({sent:false}));await Promise.all([first,second,urgent]);
+  writes[3].resolve({sent:true});await next;
+  assert.equal(writes.length,4,'old completion replayed discarded input in new session');
+});
 
-  deferred[1].resolve({id: 2});
-  await Promise.resolve();
-  await Promise.resolve();
-  assert.equal(calls.length, 3);
-  deferred[2].resolve({id: 3});
-  assert.deepEqual(await first, {sent: false, reason: 'control_prepare_preempted_by_estop'});
-  assert.deepEqual(await estop, {id: 2});
-  await Promise.resolve();
-  assert.deepEqual(unhandled, []);
+test('out-of-order response cannot rearm, confirm old gear or revoke a newer input', async () => {
+  const fixture = intentPageFixture(['ArrowUp']);
+  const old = fixture.context.writeControlIntent({}, false);
+  fixture.context.nativeIntentSeq++;
+  const current = fixture.context.writeControlIntent({}, false);
+  fixture.requests[1].resolve({accepted:true,intent_seq:63}); await current;
+  fixture.requests[0].resolve({accepted:false,reason:'fresh_neutral_required'});
+  assert.equal((await old).reason,'superseded_control_intent_response');
+  assert.equal(fixture.pressed.has('ArrowUp'),true);
+  const expiredAuth=fixture.context.writeControlIntent({},false);
+  fixture.context.nativeIntentSeq++;
+  fixture.requests[2].reject(Object.assign(new Error('old auth result'),{status:401}));
+  assert.equal((await expiredAuth).reason,'superseded_control_intent_response');
+  assert.equal(fixture.context.controlAuthorityLost,false);
+});
+
+test('ICE server error preserves transport and distinguishes DNS from timeout without logging raw text', () => {
+  const dns=logic.iceServerError({url:'turn:user:secret@example.test:6000?transport=tcp',errorText:'TURN host lookup received error'});
+  assert.equal(dns.server_transport,'tcp');assert.equal(dns.error_category,'dns_resolution');
+  assert.equal(logic.iceServerError({url:'stun:example.test:3478',errorText:'request timed out'}).error_category,'server_timeout');
+  assert.equal(logic.iceServerError({url:'turns:example.test:5349'}).server_transport,'tcp');
+  assert.equal(logic.iceServerError({url:'turn:example.test:3478'}).server_transport,'udp');
+  assert(!/secret|example/.test(JSON.stringify(dns)));
+});
+
+test('ICE diagnostics retain failed direct checks, bound output and omit addresses and credentials', () => {
+  const report=new Map();
+  report.set('host',{type:'local-candidate',candidateType:'host',protocol:'udp',address:'private-address'});
+  report.set('srflx',{type:'remote-candidate',candidateType:'srflx',protocol:'udp',address:'public-address'});
+  report.set('relay',{type:'local-candidate',candidateType:'relay',protocol:'udp',relayProtocol:'tcp',username:'secret'});
+  for(let i=0;i<40;i++)report.set('pair'+i,{id:'pair'+i,type:'candidate-pair',state:'waiting',localCandidateId:'relay',remoteCandidateId:'srflx'});
+  report.set('direct',{id:'direct',type:'candidate-pair',state:'failed',localCandidateId:'host',remoteCandidateId:'srflx',requestsSent:6,responsesReceived:0});
+  const summary=logic.iceConnectivity(report,{id:'pair39'});
+  assert.equal(summary.pairs.length,16);assert.equal(summary.pairs_truncated,true);
+  assert.equal(summary.pairs[0].id,'pair39');assert.equal(summary.pairs[0].relay_protocol,'tcp');
+  assert.equal(summary.pairs[1].id,'direct');assert.equal(summary.pairs[1].responses_received,0);
+  assert.equal(summary.candidates.local['host/udp'],1);assert.equal(summary.pair_states.failed,1);
+  assert(!/private-address|public-address|secret/.test(JSON.stringify(summary)));
+});
+
+test('critical video health logs transitions and bounded stale snapshots with local wait evidence', () => {
+  const logs=[];let now=0;
+  const context=vm.createContext({polling:true,nativeControlSessionId:'s',nativeControlSessionGeneration:1,
+    performance:{now:()=>now},document:{hidden:false,visibilityState:'visible'},latestMetrics:{streams:[],sampled_at_ms:123},
+    controlTraceSummary:{timer_lag_max_ms:210,long_task_max_ms:180},clientLog:(event,details)=>logs.push({event,details})});
+  const a=controlPageSource.indexOf("let lastCriticalVideoHealthKey="),b=controlPageSource.indexOf('function driverCriticalVideoHealth()',a);
+  vm.runInContext(controlPageSource.slice(a,b),context);
+  const bad={ready:false,missing:['front'],cameras:[{camera_id:'front',reason:'track_muted'}]};
+  context.recordCriticalVideoHealth(bad,500);
+  for(now=10;now<1000;now+=10)context.recordCriticalVideoHealth(bad,500);
+  assert.equal(logs.length,1);context.recordCriticalVideoHealth(bad,500);assert.equal(logs.length,2);
+  context.recordCriticalVideoHealth({ready:true,missing:[],cameras:[{camera_id:'front',reason:'ready'}]},500);
+  assert.equal(logs.length,3);assert.equal(logs[0].details.heartbeat_lag_max_ms,210);
+  assert.equal(logs[0].details.long_task_max_ms,180);assert.equal(logs[0].details.document_hidden,false);
+});
+
+test('receiver latency counts jitter residence once and missing stats stay unknown', () => {
+  const stats={framesDecoded:100,totalProcessingDelay:12,jitterBufferDelay:10,
+    jitterBufferEmittedCount:100,totalDecodeTime:0.6};
+  const measured=logic.receiverLatency(stats,20,0.1);
+  assert.equal(measured.latencyMs,190); // 20 + 50 + 120, not 290.
+  assert.equal(measured.jitterMs,100);assert.equal(measured.decodeMs,6);
+  assert.equal(measured.method,'rtp-arrival-to-decode');
+  delete stats.totalProcessingDelay;
+  assert.equal(logic.receiverLatency(stats,20,0.1).latencyMs,176);
+  assert.equal(logic.receiverLatency(stats,20,0.1).method,'jitter-buffer-plus-decode');
+  for(const value of [undefined,null,NaN,Infinity,-1]){
+    assert.equal(logic.receiverLatency({},value,0.1).latencyMs,null);
+    assert.equal(logic.receiverLatency(stats,20,value).latencyMs,null);
+  }
+  assert.equal(logic.receiverLatency({framesDecoded:0,totalProcessingDelay:0},20,0.1).latencyMs,null);
+  assert.equal(logic.receiverLatency({framesDecoded:1,totalProcessingDelay:0},0,0).latencyMs,0);
 });
 
 test('waiterless heartbeat rejection is consumed and the queue continues', async () => {
@@ -1398,7 +1481,7 @@ test('video protection timings reject missing, old, fractional and out-of-range 
 test('shipped view health distinguishes optional-only cameras from unknown critical configuration', () => {
   const context=vm.createContext({mediaStatus:{lanes:[]},controlProfileState:{effectiveProfile:null},
     vehicleHardLimits:{default_critical_camera_stale_brake_ms:700},
-    cameraView:{criticalHealth:(ids,staleMs)=>({ready:ids.length>0,missing:ids,staleMs})}});
+    recordCriticalVideoHealth:health=>health, cameraView:{criticalHealth:(ids,staleMs)=>({ready:ids.length>0,missing:ids,staleMs})}});
   const handler=controlPageSource.match(/^function driverCriticalVideoHealth\(\)\{[\s\S]*?^\}/m);
   assert(handler);vm.runInContext(handler[0],context);
   assert.equal(context.driverCriticalVideoHealth().ready,false);

@@ -92,5 +92,28 @@ test('critical overlay waits one second independently of braking threshold and r
   now=6000;second.children[1].frames++;view.criticalHealth(['front'],500);track.muted=true;
   now=6100;assert.equal(view.criticalHealth(['front'],500).ready,false);assert.equal(second.dataset.state,'live');
   now=7000;view.refresh();assert.equal(second.dataset.state,'stale');
+  assert.equal(view.criticalHealth(['front'],500).cameras[0].reason,'track_muted');
+  track.muted=false;track.readyState='ended';
+  assert.equal(view.criticalHealth(['front'],500).cameras[0].reason,'track_ended');
+  view.setConnectionState('disconnected');
+  assert.equal(view.criticalHealth(['front'],500).cameras[0].reason,'peer_disconnected');
+  view.setConnectionState('connected');
+  assert.equal(view.criticalHealth(['missing'],500).cameras[0].reason,'camera_missing');
+  view.configure(['front']);
+  assert.equal(view.criticalHealth(['front'],500).cameras[0].reason,'track_missing');
+  track.readyState='live';view.attach('front',track);
+  const video=grid.children[0].children[1];
+  assert.equal(view.criticalHealth(['front'],500).cameras[0].reason,'no_presented_frame');
+  video.frames++;
+  assert.equal(view.criticalHealth(['front'],500).cameras[0].reason,'recovering_frames');
+  for(let i=0;i<5;i++)assert.equal(view.criticalHealth(['front'],500).cameras[0].recovery_frames,1);
+  video.frames+=2;assert.equal(view.criticalHealth(['front'],500).ready,true);
+  now+=500;const stale=view.criticalHealth(['front'],500).cameras[0];
+  assert.equal(stale.reason,'presented_frame_stale');assert.equal(stale.frame_age_ms,500);
+  now++;video.frames+=3;assert.equal(view.criticalHealth(['front'],500).ready,true);
+  // Replacing a track must gather three new frames even if the previous track was ready.
+  view.attach('front',track);video.frames++;
+  assert.equal(view.criticalHealth(['front'],500).ready,false);
+
 });
 process.exitCode = failed ? 1 : 0;

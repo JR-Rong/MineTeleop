@@ -131,6 +131,8 @@
       entry.startedAt = performance.now();
       entry.video.srcObject = new MediaStream([track]);
       entry.health = {frames: presentedFrames(entry.video), lastFrameAt: null};
+      entry.criticalRecoveryFrames = 0;
+      entry.criticalFrameCounter = entry.health.frames;
       paint(entry, 'waiting');
       const update = () => refresh();
       for (const event of ['mute', 'unmute', 'ended']) track.addEventListener(event, update);
@@ -151,17 +153,29 @@
       for (const [id, entry] of entries) entry.criticalForControl = criticalIds.has(id);
       refresh();
       const now = performance.now();
-      const missing = ids.filter(id => {
+      const cameras = ids.map(id => {
         const entry = entries.get(id);
-        if (!entry) return true;
-        const fresh = entry.track && !entry.track.muted && entry.track.readyState !== 'ended' &&
+        if (!entry) return {camera_id: id, ready: false, reason: 'camera_missing'};
+        const track = entry.track;
+        const fresh = track && !track.muted && track.readyState !== 'ended' &&
             !disconnected && criticalFrameFresh(entry.health, now, staleMs);
         entry.criticalRecoveryFrames = fresh ? Math.min(3, (entry.criticalRecoveryFrames || 0) +
             Math.max(0, entry.health.frames - (entry.criticalFrameCounter || 0))) : 0;
         entry.criticalFrameCounter = entry.health.frames;
-        return !fresh || entry.criticalRecoveryFrames < 3;
+        const reason = disconnected ? 'peer_disconnected' : !track ? 'track_missing'
+          : track.readyState === 'ended' ? 'track_ended' : track.muted ? 'track_muted'
+          : entry.health.lastFrameAt == null ? 'no_presented_frame'
+          : !fresh ? 'presented_frame_stale'
+          : entry.criticalRecoveryFrames < 3 ? 'recovering_frames' : 'ready';
+        return {camera_id: id, ready: fresh === true && entry.criticalRecoveryFrames >= 3,
+          reason, frame_age_ms: entry.health.lastFrameAt == null ? null : Math.max(0, now - entry.health.lastFrameAt),
+          presented_frames: entry.health.frames, recovery_frames: entry.criticalRecoveryFrames,
+          track_state: track ? track.readyState : null, track_muted: Boolean(track && track.muted),
+          video_ready_state: entry.video.readyState, video_paused: entry.video.paused,
+          overlay_state: entry.health.status, stale_ms: staleMs};
       });
-      return {ready: ids.length > 0 && missing.length === 0, missing};
+      const missing = cameras.filter(camera => !camera.ready).map(camera => camera.camera_id);
+      return {ready: ids.length > 0 && missing.length === 0, missing, cameras};
     }
 
     return {configure, attach, reset, refresh, setConnectionState, criticalHealth};

@@ -1177,15 +1177,15 @@
       : 100;
   }
 
-  function createLatestControlWriteQueue(writeControl, onUnhandledError, onUrgentWrite) {
+  function createLatestControlWriteQueue(writeControl, onUnhandledError, onPreemptWrite) {
     if (typeof writeControl !== 'function') throw new TypeError('writeControl must be a function');
     const reportUnhandled = typeof onUnhandledError === 'function'
       ? onUnhandledError
       : function noop() {};
-    const notifyUrgent = typeof onUrgentWrite === 'function'
-      ? onUrgentWrite
+    const notifyPreempt = typeof onPreemptWrite === 'function'
+      ? onPreemptWrite
       : function noop() {};
-    let active = false;
+    const active = new Set();
     let pending = null;
 
     function mergeExtra(current, incoming) {
@@ -1194,30 +1194,44 @@
       });
     }
 
-    async function drain() {
-      if (active) return;
-      active = true;
-      try {
-        while (pending) {
-          const request = pending;
-          pending = null;
-          try {
-            const result = await writeControl(request.extra, request.announceUnavailable);
-            for (const waiter of request.waiters) waiter.resolve(result);
-          } catch (error) {
-            if (!request.waiters.length) reportUnhandled(error);
-            for (const waiter of request.waiters) waiter.reject(error);
-          }
-        }
-      } finally {
-        active = false;
-        if (pending) drain().catch(reportUnhandled);
+    function preempt(request, reason) {
+      if ((request.extra.estop && reason !== 'session_changed') || request.preempted) return;
+      request.preempted = true;
+      notifyPreempt(request, reason);
+    }
+
+    function drain() {
+      if (!pending) return;
+      const urgent = Boolean(pending.extra.estop);
+      if (urgent) {
+        // Reserve a third slot for ESTOP; ordinary responses never consume it.
+        for (const request of active) preempt(request, 'estop');
       }
+      const limit = urgent ? 3 : 2;
+      if (active.size >= limit) {
+        const oldest = Array.from(active).find(request => !request.extra.estop && !request.preempted);
+        if (oldest) preempt(oldest, urgent ? 'estop' : 'latest_input');
+        return;
+      }
+      const request = pending;
+      pending = null;
+      active.add(request);
+      let result;
+      try { result = writeControl(request.extra, request.announceUnavailable, request); }
+      catch (error) { result = Promise.reject(error); }
+      Promise.resolve(result).then(value => {
+        for (const waiter of request.waiters) waiter.resolve(value);
+      }, error => {
+        if (!request.waiters.length) reportUnhandled(error);
+        for (const waiter of request.waiters) waiter.reject(error);
+      }).finally(() => {
+        active.delete(request);
+        drain();
+      }).catch(reportUnhandled);
     }
 
     function send(extra, announceUnavailable) {
       return new Promise(function enqueue(resolve, reject) {
-        const urgent = Boolean(extra && extra.estop);
         if (pending) {
           pending.extra = mergeExtra(pending.extra, extra);
           pending.announceUnavailable = pending.announceUnavailable || announceUnavailable;
@@ -1229,19 +1243,89 @@
             waiters: [{resolve, reject}],
           };
         }
-        if (urgent && active) notifyUrgent();
-        drain().catch(reportUnhandled);
+        drain();
       });
     }
 
     function enqueueHeartbeat() {
       if (pending) return false;
       pending = {extra: {}, announceUnavailable: false, waiters: []};
-      drain().catch(reportUnhandled);
+      drain();
       return true;
     }
 
-    return Object.freeze({send, enqueueHeartbeat});
+    function reset() {
+      if (pending) {
+        for (const waiter of pending.waiters) waiter.resolve({sent: false, reason: 'control_queue_session_changed'});
+        pending = null;
+      }
+      for (const request of active) {
+        // A preempted request may still be settling; revoke all old slots.
+        notifyPreempt(request, 'session_changed');
+      }
+      active.clear();
+    }
+
+    return Object.freeze({send, enqueueHeartbeat, reset});
+  }
+
+  function iceServerError(error) {
+    const url = String(error.url || ''), message = String(error.errorText || '');
+    const explicit = url.match(/[?&]transport=(udp|tcp)(?:&|$)/i);
+    return {server_transport: explicit ? explicit[1].toLowerCase()
+      : /^(turns|stuns):/i.test(url) ? 'tcp' : 'udp',
+      error_category: /host lookup|name resolution|dns|resolve/i.test(message) ? 'dns_resolution'
+        : /timed out|timeout/i.test(message) ? 'server_timeout' : 'unclassified'};
+  }
+
+  function iceConnectivity(report, selectedPair) {
+    const candidates = {local: {}, remote: {}};
+    const states = {}, pairs = [];
+    for (const value of report.values()) {
+      const side = value.type === 'local-candidate' ? 'local'
+        : value.type === 'remote-candidate' ? 'remote' : null;
+      if (side) {
+        const key = String(value.candidateType || 'unknown') + '/' + String(value.protocol || 'unknown');
+        candidates[side][key] = (candidates[side][key] || 0) + 1;
+      }
+      if (value.type !== 'candidate-pair') continue;
+      const local = report.get(value.localCandidateId) || {}, remote = report.get(value.remoteCandidateId) || {};
+      const state = value.state || 'unknown'; states[state] = (states[state] || 0) + 1;
+      pairs.push({id: value.id, selected: Boolean(selectedPair && selectedPair.id === value.id),
+        state, nominated: value.nominated === true,
+        local_type: local.candidateType || null, remote_type: remote.candidateType || null,
+        protocol: local.protocol || null, relay_protocol: local.relayProtocol || null,
+        requests_sent: value.requestsSent == null ? null : value.requestsSent,
+        responses_received: value.responsesReceived == null ? null : value.responsesReceived,
+        round_trip_ms: Number.isFinite(value.currentRoundTripTime) ? value.currentRoundTripTime * 1000 : null});
+    }
+    // Bound logs; retain the selected pair and failing direct checks ahead of
+    // unused relay permutations. No candidate IPs, SDP or credentials.
+    const rank = pair => pair.selected ? 0
+      : pair.local_type && pair.remote_type && pair.local_type !== 'relay' && pair.remote_type !== 'relay' ? 1 : 2;
+    pairs.sort((a, b) => rank(a) - rank(b));
+    return {candidates, pair_states: states, pair_count: pairs.length,
+      pairs: pairs.slice(0, 16), pairs_truncated: pairs.length > 16};
+  }
+
+  function receiverLatency(stats, captureEncodeMs, roundTripSeconds) {
+    function average(total, count) {
+      return Number.isFinite(total) && total >= 0 && Number.isFinite(count) && count > 0
+        ? total * 1000 / count : null;
+    }
+    const processingMs = average(stats.totalProcessingDelay, stats.framesDecoded);
+    const jitterMs = average(stats.jitterBufferDelay, stats.jitterBufferEmittedCount);
+    const decodeMs = average(stats.totalDecodeTime, stats.framesDecoded);
+    // First RTP arrival -> decode already covers jitter/assembly waiting.
+    // Older browsers can supply the narrower buffer + decode approximation.
+    const receiverMs = processingMs !== null ? processingMs
+      : jitterMs !== null && decodeMs !== null ? jitterMs + decodeMs : null;
+    const valid = value => Number.isFinite(value) && value >= 0;
+    return {processingMs, jitterMs, decodeMs, receiverMs,
+      method: processingMs !== null ? 'rtp-arrival-to-decode'
+        : receiverMs !== null ? 'jitter-buffer-plus-decode' : 'unavailable',
+      latencyMs: valid(captureEncodeMs) && valid(roundTripSeconds) && receiverMs !== null
+        ? captureEncodeMs + roundTripSeconds * 500 + receiverMs : null};
   }
 
   const CONTROL_OUTCOMES = Object.freeze([
@@ -1392,6 +1476,9 @@
     controlIntentSuperseded,
     controlPrepareDeadlineMs,
     createLatestControlWriteQueue,
+    receiverLatency,
+    iceConnectivity,
+    iceServerError,
     CONTROL_OUTCOMES,
     shouldLogControlOutcome,
     createControlOutcomeMetrics,

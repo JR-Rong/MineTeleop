@@ -1181,7 +1181,7 @@ const operatorSpeed=document.getElementById('operator-speed'),operatorActualGear
 const keyIndicators={left:document.getElementById('key-left'),right:document.getElementById('key-right'),up:document.getElementById('key-up'),down:document.getElementById('key-down'),service_brake:document.getElementById('key-service-brake'),hard_brake:document.getElementById('key-hard-brake')};
 const controlReadouts={gear:document.getElementById('control-gear'),steering:document.getElementById('control-steering'),throttle:document.getElementById('control-throttle'),brake:document.getElementById('control-brake')};
 const operatorControlReadouts={gear:document.getElementById('operator-control-gear'),steering:document.getElementById('operator-control-steering'),throttle:document.getElementById('operator-control-throttle'),brake:document.getElementById('operator-control-brake')};
-let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,gamepadPreserveBrakeDuringRearm=false,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,gearRejectionInhibited=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,lastVehicleSafetyState='',vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,pendingGearTransition=null,gearTransitionGeneration=0,lastControlStatusSeq=0,lastNativeAcceptedControlSeq=0,lastControlPrepareTimeoutLogAt=0,lastControlPrepareExpiredLogAt=0,activeControlPrepareAbort=null,activeControlPrepareIsEstop=false,activeControlPreparePreemptedByEstop=false;let vehicleTelemetryReceivedAt=null,lastFeedbackHealthLogAt=null,lastFeedbackHealthKey='';let lastMediaMetricsLogAt=null;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
+let peer=null,controlChannel=null,pendingIce=[],remoteCameraIds=[],offeredCameraByMid=new Map(),iceServers=[],polling=false,connecting=false,authenticated=false,mediaStatus={lanes:[]},h265FailureSamples=0,h265FallbackSent=false,estopLatched=false,gamepadEstopPressedAt=0,gamepadRequiresNeutral=true,gamepadPreserveBrakeDuringRearm=false,activeGamepadIndex=null,latestMetrics={streams:[]},latestRuntimeStatus={},lastAlertKey='',controlAuthorityLost=false,gearRejectionInhibited=false,signalingGeneration=0,signalingPollAbort=null,vehicleTelemetry=null,lastVehicleSafetyState='',vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null},vcuEverReady=false,selectedGear='N',pendingGearRequest=null,pendingGearTransition=null,gearTransitionGeneration=0,lastControlStatusSeq=0,lastNativeAcceptedControlSeq=0,lastControlPrepareTimeoutLogAt=0,lastControlPrepareExpiredLogAt=0,activeControlRequests=new Map();let vehicleTelemetryReceivedAt=null,lastFeedbackHealthLogAt=null,lastFeedbackHealthKey='';let lastMediaMetricsLogAt=null;const previousStats=new Map(),cameraByMid=new Map(),assignedCameraIds=new Set();
 let gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();
 const uiInstanceId=(globalThis.crypto?.randomUUID?.()||`ui-${Date.now()}-${Math.random().toString(16).slice(2)}`).replace(/[^A-Za-z0-9_-]/g,'_');
 let connectRequestGeneration=0;
@@ -1191,8 +1191,9 @@ function responseError(response,body){const error=Error(body.error||response.sta
 async function post(path,body={},signal=null){const options={method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)};if(signal)options.signal=signal;const r=await fetch(path,options);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 async function get(path){const r=await fetch(path);const j=await r.json();if(!r.ok)throw responseError(r,j);return j}
 function clientLog(event,details={}){const entry={event,sent_at_utc_ms:Date.now(),details:{...details,page_source_sha256:consoleConfig.console_source_sha256,diagnostics_revision:consoleConfig.diagnostics_revision,ui_instance_id:uiInstanceId}};console.info(JSON.stringify(entry));fetch('/api/browser-event',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(entry),keepalive:true}).catch(()=>{})}
-clientLog('driver_page_loaded',{user_agent:navigator.userAgent});
-function createControlTraceSummary(){return{interval_started_at_utc_ms:Date.now(),heartbeat_tick_count:0,heartbeat_enqueued_count:0,heartbeat_coalesced_count:0,timer_lag_sample_count:0,timer_lag_total_ms:0,timer_lag_max_ms:0,explicit_send_count:0,backpressure_count:0,max_buffered_amount_bytes:0,prepare_timeout_count:0,prepare_expired_count:0,prepare_preempted_by_estop_count:0,queue_unhandled_error_count:0}}
+clientLog('driver_page_loaded',{user_agent:navigator.userAgent,ice_transport_policy:consoleConfig.ice_transport_policy,long_task_observer_supported:typeof PerformanceObserver==='function'&&PerformanceObserver.supportedEntryTypes?.includes('longtask')===true});
+if(controlTraceEnabled&&typeof PerformanceObserver==='function'&&PerformanceObserver.supportedEntryTypes?.includes('longtask')){const observer=new PerformanceObserver(list=>{if(!polling)return;for(const item of list.getEntries()){controlTraceSummary.long_task_count++;controlTraceSummary.long_task_max_ms=Math.max(controlTraceSummary.long_task_max_ms,item.duration)}});observer.observe({type:'longtask',buffered:false})}
+function createControlTraceSummary(){return{interval_started_at_utc_ms:Date.now(),heartbeat_tick_count:0,heartbeat_enqueued_count:0,heartbeat_coalesced_count:0,timer_lag_sample_count:0,timer_lag_total_ms:0,timer_lag_max_ms:0,explicit_send_count:0,intent_response_preempted_count:0,intent_http_sample_count:0,intent_http_elapsed_max_ms:0,intent_http_server_wait_max_ms:0,intent_http_server_processing_max_ms:0,long_task_count:0,long_task_max_ms:0,backpressure_count:0,max_buffered_amount_bytes:0,prepare_timeout_count:0,prepare_expired_count:0,prepare_preempted_by_estop_count:0,queue_unhandled_error_count:0}}
 function noteIntentRefresh(now){if(!controlTraceEnabled)return;controlTraceSummary.heartbeat_tick_count++;if(lastHeartbeatTraceAt!==null){const lag=Math.max(0,now-lastHeartbeatTraceAt-intentRefreshIntervalMs);controlTraceSummary.timer_lag_sample_count++;controlTraceSummary.timer_lag_total_ms+=lag;controlTraceSummary.timer_lag_max_ms=Math.max(controlTraceSummary.timer_lag_max_ms,lag)}lastHeartbeatTraceAt=now}
 function noteControlBackpressure(bufferedAmount){if(!controlTraceEnabled)return;const bytes=Math.max(0,Number(bufferedAmount)||0);controlTraceSummary.backpressure_count++;controlTraceSummary.max_buffered_amount_bytes=Math.max(controlTraceSummary.max_buffered_amount_bytes,bytes)}
 function setControlTraceScope(sessionId='',vehicleId=''){if(!controlTraceEnabled)return;const next={session_id:String(sessionId||''),vehicle_id:String(vehicleId||'')};if(next.session_id===controlTraceScope.session_id&&next.vehicle_id===controlTraceScope.vehicle_id)return;if(controlTraceScope.session_id||controlTraceScope.vehicle_id)flushControlTrace('session_scope_change');controlTraceScope=next}
@@ -1200,7 +1201,7 @@ function sameControlTraceScope(scope){return Boolean(scope)&&String(scope.sessio
 function emitControlTraceBatch(reason,scope,commands,summary,sampleTransport=true){const samples=summary.timer_lag_sample_count;summary.interval_ended_at_utc_ms=Date.now();summary.timer_lag_average_ms=samples?summary.timer_lag_total_ms/samples:0;summary.peer_connection_state=sampleTransport?(peer?.connectionState||'none'):null;summary.data_channel_ready_state=sampleTransport?(controlChannel?.readyState||'none'):null;summary.data_channel_buffered_amount_bytes=sampleTransport?Math.max(0,Number(controlChannel?.bufferedAmount)||0):null;clientLog('control_trace_batch',{reason,trace_session_id:String(scope&&scope.session_id||''),trace_vehicle_id:String(scope&&scope.vehicle_id||''),commands,summary})}
 function noteScopedControlTraceCounter(field,scope){if(!controlTraceEnabled)return;if(sameControlTraceScope(scope)){controlTraceSummary[field]++;return}const summary=createControlTraceSummary();summary[field]=1;emitControlTraceBatch(`late_${field}`,scope,[],summary,false)}
 function queueTerminalControlTrace(outcome,command,trace){if(!controlTraceEnabled||!trace)return;const seq=Number(command&&command.seq);if(!Number.isSafeInteger(seq)||seq<=0)return;const scope={session_id:String(command&&command.session_id||trace.scope&&trace.scope.session_id||''),vehicle_id:String(command&&command.vehicle_id||trace.scope&&trace.scope.vehicle_id||'')},item={session_id:scope.session_id,seq,browser_prepare_started_at_utc_ms:trace.browserPrepareStartedAtUtcMs,native_command_sent_at_utc_ms:Number(command&&command.sent_at_utc_ms)||null,prepare_elapsed_ms:trace.prepareElapsedMs,data_channel_send_invoked_at_utc_ms:trace.dataChannelSendInvokedAtUtcMs,buffered_amount_bytes:trace.bufferedAmountBytes,outcome,browser_terminal_at_utc_ms:Date.now(),estop:Boolean(trace.estop)};if(!sameControlTraceScope(scope)){const summary=createControlTraceSummary();summary.interval_started_at_utc_ms=Number(trace.browserPrepareStartedAtUtcMs)||summary.interval_started_at_utc_ms;emitControlTraceBatch('late_terminal',scope,[item],summary,false);return}controlTraceBuffer.push(item);if(controlTraceBuffer.length>=48)flushControlTrace('capacity')}
-function flushControlTrace(reason='interval'){if(!controlTraceEnabled)return false;const summary=controlTraceSummary,scope=controlTraceScope,commands=controlTraceBuffer.splice(0,controlTraceBuffer.length),hasActivity=commands.length||summary.heartbeat_tick_count||summary.explicit_send_count||summary.backpressure_count||summary.prepare_timeout_count||summary.prepare_expired_count||summary.prepare_preempted_by_estop_count||summary.queue_unhandled_error_count;controlTraceSummary=createControlTraceSummary();if(!hasActivity)return false;emitControlTraceBatch(reason,scope,commands,summary);return true}
+function flushControlTrace(reason='interval'){if(!controlTraceEnabled)return false;const summary=controlTraceSummary,scope=controlTraceScope,commands=controlTraceBuffer.splice(0,controlTraceBuffer.length),hasActivity=commands.length||summary.intent_response_preempted_count||summary.intent_http_sample_count||summary.long_task_count||summary.heartbeat_tick_count||summary.explicit_send_count||summary.backpressure_count||summary.prepare_timeout_count||summary.prepare_expired_count||summary.prepare_preempted_by_estop_count||summary.queue_unhandled_error_count;controlTraceSummary=createControlTraceSummary();if(!hasActivity)return false;emitControlTraceBatch(reason,scope,commands,summary);return true}
 function recordTerminalControlOutcome(outcome,command,session,trace,details={}){recordControlOutcome(outcome,command,session,details);queueTerminalControlTrace(outcome,command,trace)}
 function resetControlOutcomeSession(){controlOutcomeSession={metrics:controlLogic.createControlOutcomeMetrics()}}
 function recordControlOutcome(outcome,command,session=controlOutcomeSession,details={}){const sequence=Number(command&&command.seq);session.metrics=controlLogic.reduceControlOutcome(session.metrics,outcome,sequence);if(controlLogic.shouldLogControlOutcome(outcome))clientLog('control_command_browser_outcome',{session_id:String(command&&command.session_id||''),vehicle_id:String(command&&command.vehicle_id||''),outcome,control_seq:sequence,...session.metrics,...details})}
@@ -1338,7 +1339,7 @@ function resetControlAuthorityInput(reason='control_authority_reset'){vcuEverRea
 function updateVcuHandshakeState(value){const locked=vcuHandshake.issue_code==='control_recovery_timeout'||vcuHandshake.issue_code==='critical_camera_failed';if(locked)value={...value,issue_code:vcuHandshake.issue_code,control_recovery:vcuHandshake.control_recovery,ready:false,state:'fault'};gearChangeStationaryEvidence=controlLogic.updateGearChangeStationaryEvidence(gearChangeStationaryEvidence,value,lastControlStatusSeq,performance.now());value={...value,gear_change_stationary_confirmed:gearChangeStationaryEvidence.confirmed};const transition=controlLogic.transitionVcuState(vcuEverReady,value);vcuHandshake=value;vcuEverReady=transition.everReady;if(transition.resetInput)resetControlAuthorityInput('vcu_state_'+String(value.state||'unavailable'))}
 function applyVehicleSafetyState(value,timing){const next=String(value||'');if(next==='DEGRADED'&&controlLogic.degradedInputRearmRequired(timing,lastNativeAcceptedControlSeq)){clearControlInput(false,'vehicle_degraded',true);if(lastVehicleSafetyState!=='DEGRADED'){lastKeyboardEvent.textContent='控制命令短暂中断，输入已清除 · 请释放后重新按下';statusPanel.textContent='车端进入可恢复降级：牵引已清零；请释放控制键后重新按下';clientLog('driver_input_cleared_on_degraded',{previous_safety_state:lastVehicleSafetyState||null})}}lastVehicleSafetyState=next}
 function suspendSignalingPoll(){const generation=++signalingGeneration;polling=false;if(signalingPollAbort){signalingPollAbort.abort();signalingPollAbort=null}return generation}
-function closeRealtimeSession(){flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';lastNativeAcceptedControlSeq=0;const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;vehicleTelemetryReceivedAt=null;lastFeedbackHealthLogAt=null;lastFeedbackHealthKey='';lastVehicleSafetyState='';mediaStatus={lanes:[]};vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();lastMediaMetricsLogAt=null;cameraView.reset();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
+function closeRealtimeSession(){controlWriteQueue.reset();flushControlTrace('session_close');controlTraceScope={session_id:'',vehicle_id:''};lastHeartbeatTraceAt=null;nativeControlSessionId='';nativeControlSessionGeneration=0;lastNativeIntentSnapshot='';lastNativeAcceptedControlSeq=0;const generation=suspendSignalingPoll();gearRejectionInhibited=false;resetControlAuthorityInput();resetControlProfileSession();lastControlStatusSeq=0;gearChangeStationaryEvidence=controlLogic.createGearChangeStationaryEvidence();resetControlOutcomeSession();if(controlChannel)controlChannel.close();if(peer)peer.close();controlChannel=null;peer=null;vehicleTelemetry=null;vehicleTelemetryReceivedAt=null;lastFeedbackHealthLogAt=null;lastFeedbackHealthKey='';lastVehicleSafetyState='';mediaStatus={lanes:[]};vcuHandshake={supported:false,state:'unavailable',ready:false,requested:false,disarming:false,parking_ready:false,driver_connected:false,adapter_ready:null};pendingIce=[];remoteCameraIds=[];offeredCameraByMid.clear();cameraByMid.clear();assignedCameraIds.clear();previousStats.clear();lastMediaMetricsLogAt=null;cameraView.reset();cameraGrid.replaceChildren(emptyStage);renderMonitoring();return generation}
 function renderEstopRequest(presentation=controlLogic.deriveControlStopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason,vcuHandshake)){estopStatus.hidden=!presentation.visible;estopStatus.textContent=presentation.banner}
 function renderControlRecovery(hardStopVisible){const sync=latestRuntimeStatus.time_sync||{},trusted=sync.synchronized===true&&Number(sync.uncertainty_ms)<=consoleConfig.max_time_sync_uncertainty_ms,freshness=controlLogic.telemetryFreshness(vehicleTelemetry,vehicleTelemetryReceivedAt,performance.now(),trusted?Date.now()+Number(sync.offset_ms||0):null),fresh=freshness.received_age_ms!==null&&freshness.received_age_ms<=500&&(freshness.source_age_ms===null||freshness.source_age_ms<=500),presentation=controlLogic.deriveControlRecoveryPresentation(polling&&!controlAuthorityLost,vehicleTelemetry,fresh,hardStopVisible);controlRecoveryStatus.hidden=!presentation.visible;controlRecoveryStatus.textContent=presentation.banner;return presentation}
 function latchEstop(source){if(estopLatched)return false;estopLatched=true;clientLog('control_estop_request_latched',{source});renderEstopRequest();renderMonitoring();return true}
@@ -1364,11 +1365,22 @@ function handleVehicleRefreshError(error){if(error.status===401){requireLogin('�
 async function login(){const driver_id=driverIdInput.value.trim();if(!driver_id)throw Error('请输入驾驶员 ID');const password=passwordInput.value;if(!password)throw Error('请输入驾驶员密码');passwordInput.value='';const result=await post('/api/login',{driver_id,password});authenticated=true;controlAuthorityLost=false;webrtcLabel.textContent='未连接';loginPanel.hidden=true;sessionPanel.hidden=false;vcuPanel.hidden=false;renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);sampleGamepad();latestRuntimeStatus=await get('/api/status');renderMonitoring();statusPanel.textContent=`已登录 ${result.driver_id}，请选择在线车辆`;clientLog('driver_login_succeeded',{driver_id:result.driver_id,authorized_vehicle_count:(result.vehicles||[]).length})}
 async function refreshVehicles(){if(!authenticated)return;const result=await get('/api/vehicles');renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);if(result.signaling_available===false){controlAuthorityLost=true;resetControlAuthorityInput();connectButton.disabled=true;statusPanel.textContent='信令服务暂时不可用；车辆列表为安全快照，禁止建立控制会话';renderMonitoring();return}if(result.signaling_restart_recovered){closeRealtimeSession();controlAuthorityLost=true;latestRuntimeStatus=await get('/api/status');connectButton.textContent='连接所选车辆';webrtcLabel.textContent='服务已恢复，需重新建立控制会话';statusPanel.textContent='信令服务已重启，驾驶员身份已自动恢复；旧控制权未恢复，请重新选择车辆';clientLog('signaling_restart_recovered',{previous_service_instance_id:result.previous_service_instance_id,service_instance_id:result.service_instance_id,control_authority_recovered:false});renderMonitoring()}}
 function sendVcuHandshakeCommand(action){if(!controlChannel||controlChannel.readyState!=='open')throw Error('控制 DataChannel 尚未连接');if(action==='connect'&&!controlProfileState.acknowledged)throw Error('会话控制参数尚未获得车端确认');if(vcuHandshake.adapter_ready!==true)throw Error('VCU 适配器尚未就绪');if(!['connect','disconnect'].includes(action))throw Error('VCU 握手命令非法');if(action==='disconnect'){resetControlAuthorityInput();vcuHandshake={...vcuHandshake,ready:false,disarming:true}}else{gearRejectionInhibited=false;vcuHandshake={...vcuHandshake,requested:true}}renderMonitoring();controlChannel.send(JSON.stringify({event:'vcu_handshake_command',action,sent_at_utc_ms:Date.now()}));clientLog('driver_vcu_handshake_command',{action});statusPanel.textContent=action==='connect'?'已请求开始 VCU 平行驾驶握手':'已请求安全断开 VCU 握手'}
+let lastCriticalVideoHealthKey='',lastCriticalVideoHealthLogAt=null;
+function recordCriticalVideoHealth(health,staleMs){
+  if(!polling)return health;
+  const now=performance.now(),key=JSON.stringify([nativeControlSessionId,nativeControlSessionGeneration,health.ready,health.reason||null,(health.cameras||[]).map(camera=>[camera.camera_id,camera.reason])]);
+  if(key!==lastCriticalVideoHealthKey||(!health.ready&&(lastCriticalVideoHealthLogAt===null||now-lastCriticalVideoHealthLogAt>=1000))){
+    lastCriticalVideoHealthKey=key;lastCriticalVideoHealthLogAt=now;
+    clientLog('driver_critical_video_health',{...health,session_id:nativeControlSessionId,session_generation:nativeControlSessionGeneration,timestamp_scope:'browser_monotonic_snapshot',snapshot_at_monotonic_ms:now,stale_ms:staleMs,document_hidden:document.hidden,visibility_state:document.visibilityState,metrics_sampled_at_utc_ms:latestMetrics.sampled_at_ms||null,receive_metrics:(latestMetrics.streams||[]).filter(stream=>(health.cameras||[]).some(camera=>camera.camera_id===stream.camera_id)),heartbeat_lag_max_ms:controlTraceSummary.timer_lag_max_ms,long_task_max_ms:controlTraceSummary.long_task_max_ms})
+  }
+  return health
+}
 function driverCriticalVideoHealth(){
   const lanes=mediaStatus.lanes||[],ids=lanes.filter(lane=>lane.critical_for_control===true).map(lane=>lane.camera_id);
-  if(lanes.length>0&&ids.length===0&&lanes.every(lane=>lane.critical_for_control===false)){cameraView.criticalHealth([],1000);return{ready:true,missing:[]}};
+  if(lanes.length>0&&ids.length===0&&lanes.every(lane=>lane.critical_for_control===false)){cameraView.criticalHealth([],1000);return recordCriticalVideoHealth({ready:true,missing:[],cameras:[]},null)};
   const profile=controlProfileState.effectiveProfile,staleMs=profile?profile.critical_camera_stale_brake_ms:(vehicleHardLimits.default_critical_camera_stale_brake_ms||500);
-  return cameraView.criticalHealth(ids,staleMs)
+  const health=cameraView.criticalHealth(ids,staleMs);
+  return recordCriticalVideoHealth(ids.length?health:{...health,reason:'critical_configuration_unknown'},staleMs)
 }
 function driverTimeSyncReady(){
   const sync=latestRuntimeStatus.time_sync||{},limit=Number(consoleConfig.max_time_sync_uncertainty_ms);
@@ -1381,7 +1393,7 @@ function nativeIntentEnvelope(outgoing){
   if(!nativeIntentSeq||snapshot!==lastNativeIntentSnapshot){nativeIntentSeq++;lastNativeIntentSnapshot=snapshot}
   return{session_id:nativeControlSessionId,session_generation:nativeControlSessionGeneration,ui_instance_id:uiInstanceId,intent_seq:nativeIntentSeq,...normalized}
 }
-async function writeControlIntent(extra,announceUnavailable){
+async function writeControlIntent(extra,announceUnavailable,requestToken={}){
   const activePeer=peer,activeChannel=controlChannel,estopRequested=estopLatched||Boolean(extra.estop);
   if(controlAuthorityLost){
     resetControlAuthorityInput();
@@ -1415,24 +1427,27 @@ async function writeControlIntent(extra,announceUnavailable){
   const transitionGeneration=!blockReason&&!estopRequested&&pendingGearTransition?pendingGearTransition.generation:0;
   const intent=nativeIntentEnvelope(outgoing);
   const requestStartedAt=performance.now(),controller=new AbortController(),deadlineMs=Math.max(75,Math.min(150,Math.floor(Number(consoleConfig.intent_lease_ms||200)*0.75))),timer=setTimeout(()=>controller.abort(),deadlineMs);
-  activeControlPrepareAbort=controller;activeControlPrepareIsEstop=estopRequested;
+  const requestState={controller,estop:estopRequested,preemptedReason:null};activeControlRequests.set(requestToken,requestState);
   let accepted;
   try{
     accepted=await post('/api/control-intent',intent,controller.signal)
   }catch(error){
     if(intent.session_id!==nativeControlSessionId||intent.session_generation!==nativeControlSessionGeneration)return{sent:false,reason:'stale_control_intent_response'};
     if(error.name==='AbortError'){
-      if(activeControlPreparePreemptedByEstop&&!estopRequested){clearControlInput(false,'estop_preemption');return{sent:false,reason:'control_intent_preempted_by_estop'}};
+      if(requestState.preemptedReason&&!estopRequested){if(requestState.preemptedReason==='estop')clearControlInput(false,'estop_preemption');if(controlTraceEnabled)controlTraceSummary.intent_response_preempted_count++;return{sent:false,reason:'control_intent_preempted_'+requestState.preemptedReason}};
       // A response deadline cannot tell whether the native store accepted this
       // refresh. Its unchanged lease and fresh-neutral interlock own expiry;
       // clearing here turns a delayed local response into a false key release.
       clientLog('control_intent_update_timeout',{intent_seq:intent.intent_seq,deadline_ms:deadlineMs,request_elapsed_ms:Math.max(0,performance.now()-requestStartedAt),input_retained:true,...controlInputDiagnostic()});
       return{sent:false,reason:'control_intent_update_timeout'}
     }
+    if(requestState.preemptedReason||intent.intent_seq<nativeIntentSeq)return{sent:false,reason:'superseded_control_intent_response'};
     if([401,403,409].includes(error.status)){controlAuthorityLost=true;resetControlAuthorityInput();resetControlProfileSession()}
     throw error
-  }finally{clearTimeout(timer);if(activeControlPrepareAbort===controller){activeControlPrepareAbort=null;activeControlPrepareIsEstop=false;activeControlPreparePreemptedByEstop=false}}
+  }finally{clearTimeout(timer);activeControlRequests.delete(requestToken)}
   if(intent.session_id!==nativeControlSessionId||intent.session_generation!==nativeControlSessionGeneration)return{sent:false,reason:'stale_control_intent_response'};
+  if(requestState.preemptedReason||intent.intent_seq<nativeIntentSeq)return{sent:false,reason:'superseded_control_intent_response'};
+  if(controlTraceEnabled){controlTraceSummary.intent_http_sample_count++;controlTraceSummary.intent_http_elapsed_max_ms=Math.max(controlTraceSummary.intent_http_elapsed_max_ms,performance.now()-requestStartedAt);const timing=accepted.local_http_timing||{};controlTraceSummary.intent_http_server_wait_max_ms=Math.max(controlTraceSummary.intent_http_server_wait_max_ms,Number(timing.before_handler_ms||0));controlTraceSummary.intent_http_server_processing_max_ms=Math.max(controlTraceSummary.intent_http_server_processing_max_ms,Number(timing.handler_ms||0))}
   if(Number.isSafeInteger(accepted.vehicle_accepted_command_seq)&&accepted.vehicle_accepted_command_seq>lastNativeAcceptedControlSeq)lastNativeAcceptedControlSeq=accepted.vehicle_accepted_command_seq;
   if(Number.isSafeInteger(accepted.rearm_control_status_seq)&&accepted.rearm_control_status_seq>lastControlStatusSeq)lastControlStatusSeq=accepted.rearm_control_status_seq;
   if(!accepted.accepted){
@@ -1452,7 +1467,7 @@ async function writeControlIntent(extra,announceUnavailable){
   return{...accepted,sent:true,blocked_reason:blockReason||null}
 }
 function reportControlQueueError(error){if(controlTraceEnabled)noteScopedControlTraceCounter('queue_unhandled_error_count',error&&typeof error==='object'?(controlTraceErrorScopes.get(error)||controlTraceScope):controlTraceScope);console.error(error)}
-const controlWriteQueue=controlLogic.createLatestControlWriteQueue(writeControlIntent,reportControlQueueError,()=>{if(activeControlPrepareAbort&&!activeControlPrepareIsEstop){activeControlPreparePreemptedByEstop=true;activeControlPrepareAbort.abort()}});
+const controlWriteQueue=controlLogic.createLatestControlWriteQueue(writeControlIntent,reportControlQueueError,(token,reason)=>{const active=activeControlRequests.get(token);if(active&&(!active.estop||reason==='session_changed')){active.preemptedReason=reason;active.controller.abort()}});
 function enqueueIntentRefresh(){return controlWriteQueue.enqueueHeartbeat()}
 async function send(extra={},announceUnavailable=true){if(controlTraceEnabled)controlTraceSummary.explicit_send_count++;return controlWriteQueue.send(extra,announceUnavailable)}
 async function refreshControlIntent(){const now=performance.now();if(!polling){lastHeartbeatTraceAt=null;return}noteIntentRefresh(now);sampleGamepad();sendPendingControlProfile();const enqueued=enqueueIntentRefresh();if(controlTraceEnabled){if(enqueued)controlTraceSummary.heartbeat_enqueued_count++;else controlTraceSummary.heartbeat_coalesced_count++}}
@@ -1543,7 +1558,7 @@ async function startFromOffer(offer){
     if(connectionState==='connected'&&controlChannel?.readyState==='open')webrtcLabel.textContent='控制链路已连接';
     renderMonitoring();
   };
-  nextPeer.onicecandidateerror=e=>clientLog('webrtc_ice_candidate_error',{endpoint:safeIceEndpoint(e.url),error_code:Number(e.errorCode||0)});
+  nextPeer.onicecandidateerror=e=>clientLog('webrtc_ice_candidate_error',{endpoint:safeIceEndpoint(e.url),error_code:Number(e.errorCode||0),...controlLogic.iceServerError(e)});
   nextPeer.ondatachannel=e=>{
     const channel=e.channel;
     if(!controlLogic.isCurrentPeer(peer,nextPeer)){channel.close();return}
@@ -1670,17 +1685,17 @@ async function collectMetrics(){
     if(prior){const seconds=(sampledAt-prior.sampledAt)/1000;if(seconds>0){if(!fps)fps=(decoded-prior.framesDecoded)/seconds;bitrateKbps=Math.max(0,(bytesReceived-prior.bytesReceived)*8/seconds/1000)}}
     const packetDelta=prior?Math.max(0,packetsReceived-prior.packetsReceived):null,lostDelta=prior?Math.max(0,packetsLost-prior.packetsLost):null;
     previousStats.set(statsKey,{sampledAt,framesDecoded:decoded,bytesReceived,packetsReceived,packetsLost});
-    const jitterMs=Number(s.jitterBufferEmittedCount||0)>0?Number(s.jitterBufferDelay||0)*1000/Number(s.jitterBufferEmittedCount):0;
-    const processingMs=decoded>0?Number(s.totalProcessingDelay||0)*1000/decoded:0;
+
     const cameraId=cameraByMid.get(s.mid||'')||'',lane=(mediaStatus.lanes||[]).find(l=>l.camera_id===cameraId)||{};
-    const captureEncodeMs=lane.capture_to_encoded_valid===false?null:Number(lane.capture_to_encoded_ms||0),latencyMs=captureEncodeMs===null||rtt===null?null:captureEncodeMs+rtt*500+jitterMs+processingMs;
-    streams.push({camera_id:cameraId,mid:s.mid||'',codec_id:s.codecId||'',fps,bitrate_kbps:bitrateKbps,frames_decoded:decoded,key_frames_decoded:s.keyFramesDecoded??null,frames_received:s.framesReceived??null,frames_dropped:Number(s.framesDropped||0),nack_count:s.nackCount??null,pli_count:s.pliCount??null,fir_count:s.firCount??null,decoder_implementation:s.decoderImplementation??null,decode_ms_per_frame:decoded>0&&typeof s.totalDecodeTime==='number'?s.totalDecodeTime*1000/decoded:null,codec_mime_type:report.get(s.codecId)?.mimeType||'',packets_lost:packetsLost,packets_received:packetsReceived,packet_loss_percent:(packetsLost+packetsReceived)>0?100*packetsLost/(packetsLost+packetsReceived):0,jitter_ms:Number(s.jitter||0)*1000,capture_to_encoded_ms:captureEncodeMs,jitter_buffer_ms:jitterMs,processing_ms:processingMs,round_trip_ms:rtt===null?null:rtt*1000,interval_packets_received:packetDelta,interval_packets_lost:lostDelta,interval_packet_loss_percent:packetDelta!==null&&packetDelta+lostDelta>0?100*lostDelta/(packetDelta+lostDelta):null,freeze_count:s.freezeCount??null,total_freezes_duration_s:s.totalFreezesDuration??null,last_packet_received_timestamp_ms:s.lastPacketReceivedTimestamp??null,total_decode_time_s:s.totalDecodeTime??null,total_processing_delay_s:s.totalProcessingDelay??null,estimated_end_to_end_latency_ms:latencyMs,passed:fps>=20&&latencyMs!==null&&latencyMs<=200})
+    const captureEncodeMs=lane.capture_to_encoded_valid===false||typeof lane.capture_to_encoded_ms!=='number'?null:lane.capture_to_encoded_ms;
+    const latency=controlLogic.receiverLatency(s,captureEncodeMs,rtt),{jitterMs,processingMs,latencyMs}=latency;
+    streams.push({camera_id:cameraId,mid:s.mid||'',codec_id:s.codecId||'',fps,bitrate_kbps:bitrateKbps,frames_decoded:decoded,key_frames_decoded:s.keyFramesDecoded??null,frames_received:s.framesReceived??null,frames_dropped:Number(s.framesDropped||0),nack_count:s.nackCount??null,pli_count:s.pliCount??null,fir_count:s.firCount??null,decoder_implementation:s.decoderImplementation??null,decode_ms_per_frame:decoded>0&&typeof s.totalDecodeTime==='number'?s.totalDecodeTime*1000/decoded:null,codec_mime_type:report.get(s.codecId)?.mimeType||'',packets_lost:packetsLost,packets_received:packetsReceived,packet_loss_percent:(packetsLost+packetsReceived)>0?100*packetsLost/(packetsLost+packetsReceived):0,jitter_ms:Number(s.jitter||0)*1000,capture_to_encoded_ms:captureEncodeMs,jitter_buffer_ms:jitterMs,processing_ms:processingMs,receiver_latency_method:latency.method,round_trip_ms:rtt===null?null:rtt*1000,interval_packets_received:packetDelta,interval_packets_lost:lostDelta,interval_packet_loss_percent:packetDelta!==null&&packetDelta+lostDelta>0?100*lostDelta/(packetDelta+lostDelta):null,freeze_count:s.freezeCount??null,total_freezes_duration_s:s.totalFreezesDuration??null,last_packet_received_timestamp_ms:s.lastPacketReceivedTimestamp??null,total_decode_time_s:s.totalDecodeTime??null,total_processing_delay_s:s.totalProcessingDelay??null,estimated_end_to_end_latency_ms:latencyMs,passed:fps>=20&&latencyMs!==null&&latencyMs<=200})
   }
   const timeSync=latestRuntimeStatus.time_sync||mediaStatus.time_sync||{},turnConfigured=hasTurnServer();
   const controlOutcomes={...controlOutcomeSession.metrics};
-  const metrics={sampled_at_ms:sampledAt,connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',control_rtt_ms:rtt===null?null:rtt*1000,selected_candidate_pair:selectedPair?{id:selectedPair.id,selection_method:selection.method,state:selectedPair.state,nominated:selectedPair.nominated??null,transport_id:selection.transport?.id??selectedPair.transportId??null,local_candidate_type:report.get(selectedPair.localCandidateId)?.candidateType??null,remote_candidate_type:report.get(selectedPair.remoteCandidateId)?.candidateType??null,protocol:report.get(selectedPair.localCandidateId)?.protocol??null,relay_protocol:report.get(selectedPair.localCandidateId)?.relayProtocol??null,current_round_trip_time_s:selectedPair.currentRoundTripTime??null,available_outgoing_bitrate_bps:selectedPair.availableOutgoingBitrate??null,bytes_sent:selectedPair.bytesSent??null,bytes_received:selectedPair.bytesReceived??null,requests_sent:selectedPair.requestsSent??null,responses_received:selectedPair.responsesReceived??null}:null,connection_method:connectionMethod,turn_configured:turnConfigured,turn_in_use:turnInUse,time_sync:timeSync,clock_uncertainty_ms:Number(timeSync.uncertainty_ms||0),latency_method:'capture-to-encoded + rtt/2 + jitter-buffer + browser-processing',control_outcomes:controlOutcomes,control_outcomes_balanced:controlLogic.controlOutcomesBalanced(controlOutcomes),streams,passed:streams.length>0&&streams.every(s=>s.passed)};
+  const metrics={sampled_at_ms:sampledAt,connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',control_rtt_ms:rtt===null?null:rtt*1000,selected_candidate_pair:selectedPair?{id:selectedPair.id,selection_method:selection.method,state:selectedPair.state,nominated:selectedPair.nominated??null,transport_id:selection.transport?.id??selectedPair.transportId??null,local_candidate_type:report.get(selectedPair.localCandidateId)?.candidateType??null,remote_candidate_type:report.get(selectedPair.remoteCandidateId)?.candidateType??null,protocol:report.get(selectedPair.localCandidateId)?.protocol??null,relay_protocol:report.get(selectedPair.localCandidateId)?.relayProtocol??null,current_round_trip_time_s:selectedPair.currentRoundTripTime??null,available_outgoing_bitrate_bps:selectedPair.availableOutgoingBitrate??null,bytes_sent:selectedPair.bytesSent??null,bytes_received:selectedPair.bytesReceived??null,requests_sent:selectedPair.requestsSent??null,responses_received:selectedPair.responsesReceived??null}:null,connection_method:connectionMethod,turn_configured:turnConfigured,turn_in_use:turnInUse,time_sync:timeSync,clock_uncertainty_ms:Number(timeSync.uncertainty_ms||0),latency_method:'capture-to-encoded + rtt/2 + receiver-processing (buffer + decode fallback)',control_outcomes:controlOutcomes,control_outcomes_balanced:controlLogic.controlOutcomesBalanced(controlOutcomes),streams,passed:streams.length>0&&streams.every(s=>s.passed)};
   const mediaLogAt=performance.now();
-  if(lastMediaMetricsLogAt===null||mediaLogAt-lastMediaMetricsLogAt>=5000){lastMediaMetricsLogAt=mediaLogAt;clientLog('driver_media_metrics',metrics)}
+  if(lastMediaMetricsLogAt===null||mediaLogAt-lastMediaMetricsLogAt>=5000){lastMediaMetricsLogAt=mediaLogAt;clientLog('driver_media_metrics',metrics);clientLog('driver_ice_connectivity',{ice_transport_policy:consoleConfig.ice_transport_policy,ice_connection_state:peer.iceConnectionState,ice_gathering_state:peer.iceGatheringState,...controlLogic.iceConnectivity(report,selectedPair)})}
   await post('/api/webrtc/metrics',metrics);
   if(metrics.codec==='h265'&&metrics.connection_state==='connected'&&streams.length){h265FailureSamples=streams.some(s=>s.fps<20)?h265FailureSamples+1:0;if(h265FailureSamples>=3&&!h265FallbackSent){h265FallbackSent=true;await post('/api/webrtc/fallback',{codec:'h264',reason:'h265_decode_fps_below_20'})}}else h265FailureSamples=0;
   latestMetrics=metrics;renderMonitoring();statusPanel.textContent=`${metrics.connection_state||'等待连接'} · ${streams.length} 路视频 · RTT ${formatMetric(metrics.control_rtt_ms,1,' ms')} · ${metrics.connection_method||'unknown'}`
@@ -6535,7 +6550,10 @@ Json DriverConsoleRuntime::send_control(const Json& input) {
       "legacy browser control packet preparation is retired; use /api/control-intent");
 }
 
-Json DriverConsoleRuntime::update_control_intent(const Json& input) {
+Json DriverConsoleRuntime::update_control_intent(const Json& input, const HttpRequest* request) {
+  const auto entered_at = monotonic_now_ms();
+  const auto received_at = request ? request->received_at_monotonic_ms.value_or(entered_at) : entered_at;
+  std::int64_t update_lock_wait_ms = 0, runtime_lock_wait_ms = 0, applied_at = entered_at;
   if (!input.is_object()) throw std::invalid_argument("control intent must be an object");
   const auto expected_session_id = required_string(input, "session_id");
   const auto expected_session_generation = required_uint64(input, "session_generation");
@@ -6555,9 +6573,13 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input) {
   intent.validate();
   NativeControlIntentUpdate result;
   {
+    const auto lock_started = monotonic_now_ms();
     std::lock_guard update_lock(native_control_update_mutex_);
+    update_lock_wait_ms = monotonic_now_ms() - lock_started;
     {
+      const auto runtime_lock_started = monotonic_now_ms();
       std::lock_guard lock(mutex_);
+      runtime_lock_wait_ms = monotonic_now_ms() - runtime_lock_started;
       if (session_id_.empty() || driver_token_.empty() || control_token_.empty()) {
         throw std::runtime_error("driver console is not connected");
       }
@@ -6567,15 +6589,28 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input) {
             "control intent belongs to a stale or different native control session");
       }
     }
-    result = native_control_intent_.update(intent, monotonic_now_ms());
+    const auto apply_started_at = monotonic_now_ms();
+    if (!intent.estop && apply_started_at - received_at >= native_control_intent_.lease_ms()) {
+      const auto sample = native_control_intent_.sample(apply_started_at);
+      result = {false, false, sample.requires_fresh_input, "local_input_request_expired"};
+    } else {
+      result = native_control_intent_.update(intent, received_at);
+    }
+    applied_at = monotonic_now_ms();
   }
+  const Json timing = {{"timestamp_scope", "local_http_received_to_intent_applied"},
+      {"before_handler_ms", std::max<std::int64_t>(0, entered_at - received_at)},
+      {"update_mutex_wait_ms", update_lock_wait_ms}, {"runtime_mutex_wait_ms", runtime_lock_wait_ms},
+      {"handler_ms", monotonic_now_ms() - entered_at},
+      {"receive_to_apply_ms", std::max<std::int64_t>(0, applied_at - received_at)}};
   if (native_control_trace_) {
     const auto sample = native_control_intent_.sample(monotonic_now_ms());
     native_control_trace_->enqueue({{"stage", "intent_received"}, {"trace_session_id", expected_session_id},
-        {"intent_seq", intent.intent_seq}, {"accepted", result.accepted}, {"reason", result.reason},
+        {"intent_seq", intent.intent_seq}, {"stored_intent_seq", sample.intent.intent_seq}, {"accepted", result.accepted}, {"reason", result.reason},
         {"intent_age_ms", sample.age_ms}, {"intent_lease_ms", native_control_intent_.lease_ms()},
         {"requires_fresh_input", result.requires_fresh_input},
-        {"received_at_monotonic_ms", monotonic_now_ms()}});
+        {"received_at_monotonic_ms", received_at}, {"applied_at_monotonic_ms", applied_at},
+        {"local_http_timing", timing}});
   }
   if (result.accepted && intent.estop) {
     native_control_estop_wakeup_.store(true);
@@ -6595,6 +6630,7 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input) {
       {"lease_ms", native_control_intent_.lease_ms()},
       {"transport", "native_signaling_websocket"},
       {"delivery_state", "native_periodic_sender_owned"},
+      {"local_http_timing", timing},
   };
 }
 
@@ -6903,7 +6939,7 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
           {{"error", "legacy control-limit mutation is retired; use /api/control-profile"}});
     }
     if (request.method == "POST" && request.path == "/api/control-profile") return ServerResponse::json(200, runtime_->prepare_control_profile(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/control-intent") return ServerResponse::json(200, runtime_->update_control_intent(request.json_body()));
+    if (request.method == "POST" && request.path == "/api/control-intent") return ServerResponse::json(200, runtime_->update_control_intent(request.json_body(), &request));
     if (request.method == "POST" && request.path == "/api/control") {
       return ServerResponse::json(
           410,
