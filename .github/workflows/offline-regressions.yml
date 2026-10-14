@@ -140,6 +140,7 @@ jobs:
               'mine-teleop-control-tests': [
                   'configs/driver-console.dev.yaml',
                   'configs/driver-console.three-machine.dev.yaml',
+                  'configs/mine-teleop-field-root.crt',
                   'configs/vehicle-agent.dev.yaml',
                   'protocol/v1/control-command.valid.json',
               ],

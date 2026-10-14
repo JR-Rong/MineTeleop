@@ -657,6 +657,8 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
   const auto connected = driver->connect("vehicle-001");
   auto app = std::make_shared<mine_teleop::DriverConsoleHttpApp>(driver);
   std::atomic<bool> delayed_ingress_seen{false};
+  std::atomic<bool> response_delay_applied{false};
+  Json response_delay_acceptance;
   mine_teleop::SimpleHttpServer local_server("127.0.0.1", 0, [&](const auto& request) {
     const auto body = request.json_body();
     if (body.value("test_before_handler_delay_ms", 0) > 0) {
@@ -665,6 +667,8 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
     }
     auto response = app->handle(request);
     if (body.value("test_response_delay_ms", 0) > 0) {
+      response_delay_acceptance = Json::parse(response.body);
+      response_delay_applied.store(true, std::memory_order_release);
       std::this_thread::sleep_for(std::chrono::milliseconds(body.at("test_response_delay_ms").template get<int>()));
     }
     return response;
@@ -727,16 +731,52 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
       "late retired-page HTTP request changed the current page's input");
 
   const auto refresh_before_abort = native.at("accepted_refresh_sample_id").get<std::uint64_t>();
+  // A refresh is identified by a strictly newer monotonic millisecond. Make
+  // that precondition explicit rather than depending on HTTP call overhead.
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
   auto slow_response = input; slow_response["test_response_delay_ms"] = 220;
-  bool response_aborted = false;
-  try {
-    static_cast<void>(mine_teleop::HttpClient(std::chrono::milliseconds(75)).post_json_response(
-        local_base + "/api/control-intent", slow_response));
-  } catch (const std::exception&) { response_aborted = true; }
+  struct ResponseSocket {
+    int value{-1};
+    ~ResponseSocket() { if (value >= 0) ::close(value); }
+  } response_socket;
+  response_socket.value = ::socket(AF_INET, SOCK_STREAM, 0);
+  expect(response_socket.value >= 0, "cannot create cancellation fixture socket");
+  const timeval response_send_timeout{2, 0};
+  expect(::setsockopt(response_socket.value, SOL_SOCKET, SO_SNDTIMEO,
+      &response_send_timeout, sizeof(response_send_timeout)) == 0,
+      "cannot bound cancellation fixture socket send");
+  sockaddr_in local_address{};
+  local_address.sin_family = AF_INET;
+  local_address.sin_port = htons(local_server.port());
+  local_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  expect(::connect(response_socket.value, reinterpret_cast<const sockaddr*>(&local_address),
+      sizeof(local_address)) == 0, "cannot connect cancellation fixture socket");
+  const auto slow_body = slow_response.dump();
+  raw_send_all(response_socket.value, "POST /api/control-intent HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+      "Content-Type: application/json\r\nContent-Length: " + std::to_string(slow_body.size()) +
+      "\r\nConnection: close\r\n\r\n" + slow_body);
+  const auto apply_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!response_delay_applied.load(std::memory_order_acquire) &&
+      std::chrono::steady_clock::now() < apply_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  expect(response_delay_applied.load(std::memory_order_acquire) &&
+      response_delay_acceptance.value("accepted", false) &&
+      response_delay_acceptance.at("accepted_refresh_sample_id").get<std::uint64_t>() > refresh_before_abort,
+      "cancelled request was not accepted before its response was held");
+  // Closing this real client socket cancels only its pending response. A
+  // timer-based HTTP timeout could resume after the independent200ms lease.
+  const bool response_aborted = ::shutdown(response_socket.value, SHUT_RDWR) == 0;
+  const int cancelled_socket = std::exchange(response_socket.value, -1);
+  expect(::close(cancelled_socket) == 0, "cannot close cancelled fixture response");
   native = driver->status().at("native_control");
   expect(response_aborted && native.at("accepted_refresh_sample_id").get<std::uint64_t>() > refresh_before_abort &&
       native.value("intent_fresh", false) && native.at("effective_throttle") == 0.4,
-      "response cancellation was confused with native rejection or immediately cleared held motion");
+      "response cancellation was confused with native rejection or immediately cleared held motion: " +
+          Json{{"response_aborted", response_aborted}, {"refresh_before", refresh_before_abort},
+               {"refresh_after", native.at("accepted_refresh_sample_id")},
+               {"intent_age_ms", native.at("intent_age_ms")}, {"intent_fresh", native.at("intent_fresh")},
+               {"effective_throttle", native.at("effective_throttle")}}.dump());
   input["intent_seq"] = 3; input["steering"] = -0.2;
   for (int refresh = 0; refresh < 4; ++refresh) {
     expect(http.post_json_response(local_base + "/api/control-intent", input).value("accepted", false),
@@ -7892,7 +7932,21 @@ void test_source_aware_api_and_websocket_rate_limit() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  bool runtime_only = false;
+  if (argc == 2 && std::string_view(argv[1]) == "--runtime-only") {
+    runtime_only = true;
+  } else if (argc != 1) {
+    std::cerr << "Usage: mine-teleop-control-tests [--runtime-only]\n";
+    return 64;
+  }
+  const std::unordered_set<std::string> source_contracts{
+      "vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start",
+      "stale_control_data_channel_callbacks_are_fail_silent",
+      "vehicle_native_signaling_control_transport_is_single_path",
+      "driver_native_control_session_snapshot_and_backoff_contract",
+      "vehicle_control_command_trace_is_bounded_async_and_timed",
+      "structured_control_rejection_is_safe_and_rate_limited"};
   std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"shared_control_protocol_vector", test_shared_control_protocol_vector},
       {"loopback_http_server_and_port_conflict", test_loopback_http_server_and_port_conflict},
@@ -7969,15 +8023,26 @@ int main() {
   if (std::getenv("MINE_TELEOP_TEST_WSS_URL") != nullptr) {
     tests.emplace_back("external_https_wss_mac_runtime", test_external_https_wss_mac_runtime);
   }
-  int failures = 0;
+  int failures = 0, passed = 0, blocked = 0;
   for (const auto& [name, test] : tests) {
+    if (runtime_only && source_contracts.contains(name)) {
+      ++blocked;
+      std::cout << "[BLOCKED] " << name
+                << ": source-contract requires cpp/src/server.cpp or cpp/src/webrtc_media.cpp; runtime-only mode excludes source inspection\n";
+      continue;
+    }
     try {
       test();
+      ++passed;
       std::cout << "[PASS] " << name << '\n';
     } catch (const std::exception& error) {
       ++failures;
       std::cerr << "[FAIL] " << name << ": " << error.what() << '\n';
     }
   }
-  return failures == 0 ? 0 : 1;
+  std::cout << "[SUITE] " << mine_teleop::Json{
+      {"scope", runtime_only ? "runtime-only" : "complete"}, {"registered", tests.size()},
+      {"passed", passed}, {"failed", failures}, {"blocked", blocked},
+      {"runtime_passed", failures == 0}, {"complete", blocked == 0}}.dump() << '\n';
+  return failures > 0 ? 1 : blocked > 0 ? 2 : 0;
 }
