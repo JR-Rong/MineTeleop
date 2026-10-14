@@ -20,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -32,6 +33,38 @@ namespace {
 void expect(bool condition, std::string_view message) {
   if (!condition) throw std::runtime_error(std::string(message));
 }
+
+// Model the vehicle's independent receive loop. Status queries on the driver
+// must not stop the fixture from consuming commands or refreshing its watchdog.
+class LoopbackVehiclePump {
+ public:
+  explicit LoopbackVehiclePump(std::function<void()> receive)
+      : worker_([this, receive = std::move(receive)](std::stop_token stop) {
+          while (!stop.stop_requested()) {
+            {
+              std::lock_guard lock(mutex_);
+              try { receive(); }
+              catch (...) { failure_ = std::current_exception(); return; }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+        }) {}
+  ~LoopbackVehiclePump() { stop(); }
+  void stop() {
+    worker_.request_stop();
+    if (worker_.joinable()) worker_.join();
+  }
+  template <typename Function>
+  auto inspect(Function&& function) {
+    std::lock_guard lock(mutex_);
+    if (failure_) std::rethrow_exception(failure_);
+    return function();
+  }
+ private:
+  std::mutex mutex_;
+  std::exception_ptr failure_;
+  std::jthread worker_;
+};
 
 void allow_qemu_test_scheduler_time_sync(mine_teleop::DriverConfig& config) {
   constexpr int kTestOnlyMaxUncertaintyMs = 2000;
@@ -493,6 +526,7 @@ void test_time_uncertainty_covers_the_median_shift_from_best_sample() {
 
 void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
   std::atomic<int> delay_ms{0};
+  std::atomic<int> slow_time_samples{0};
   std::atomic<bool> slow_probe_started{false};
   std::atomic<bool> simulate_network_delay{false};
   mine_teleop::SignalingServerConfig cloud_config;
@@ -505,6 +539,7 @@ void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
     if (request.path == "/time" && delay_ms.load() > 0) {
       slow_probe_started = true;
       std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms.load()));
+      ++slow_time_samples;
     }
     // Explicitly model transit before server ingress only in the network phase.
     if (simulate_network_delay && request.path == "/time") {
@@ -540,9 +575,13 @@ void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
       const auto status = driver.status();
       expect(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(200), "monitoring blocked on slow server processing");
       expect(driver.update_control_intent(neutral).at("accepted").get<bool>(), "live input rejected while /time server waited");
-      slow_processing_seen = slow_probe_started && status.at("time_sync").at("accepted_anchor_local_ms").get<std::int64_t>() > first_anchor;
-      expect(status.at("time_sync").value("synchronized", false) && status.at("time_sync").at("uncertainty_ms") <= 25,
-          "350ms measured server processing was mislabeled as untrusted network time: " + status.at("time_sync").dump());
+      // An external UTC step can correctly reject an individual cohort. The
+      // completed slow cohort, rather than every intermediate snapshot, must
+      // prove that measured server processing does not count as network RTT.
+      slow_processing_seen = slow_time_samples >= config.time_sync_samples * 2 &&
+          status.at("time_sync").value("synchronized", false) &&
+          status.at("time_sync").at("uncertainty_ms") <= 25 &&
+          status.at("time_sync").at("accepted_anchor_local_ms").get<std::int64_t>() > first_anchor;
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
     expect(slow_processing_seen, "fixture never completed its slow server-processing cohort");
@@ -5070,12 +5109,12 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>(); auto* vehicle = adapter.get();
   mine_teleop::VehicleControlService service(vehicle_config, "driver-console-001", connected.at("session_id"),
       profile_request.control_token, std::move(adapter), 100);
-  service.start(vehicle_clock.now_ms());
-  expect(service.receive_session_profile(profile_request, vehicle_clock.now_ms()).accepted, "ACK recovery profile rejected");
   mine_teleop::WebSocketClient receiver;
   receiver.connect(mine_teleop::signaling_websocket_url(base, connected.at("session_id").get<std::string>(), "vehicle-001",
       std::to_string(online.at("connection_generation").get<std::uint64_t>())) + "&types=control_command",
       {{"X-Mine-Teleop-Device-Token", "vehicle-secret-1"}});
+  service.start(vehicle_clock.now_ms());
+  expect(service.receive_session_profile(profile_request, vehicle_clock.now_ms()).accepted, "ACK recovery profile rejected");
   bool vehicle_link_wait_seen = false;
   std::string last_vehicle_reason;
   std::uint64_t last_vehicle_seq = 0;
@@ -5106,6 +5145,7 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
           {"trace_session_id", connected.at("session_id")}, {"seq", command.seq}, {"intent_seq", payload.at("intent_seq")}});
     }
   };
+  LoopbackVehiclePump vehicle_pump(process_vehicle);
   mine_teleop::Json input = {{"session_id", connected.at("session_id")},
        {"session_generation", connected.at("control_session_generation")},
        {"ui_instance_id", "delayed-ack-test"}, {"intent_seq", 1},
@@ -5117,7 +5157,7 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   const auto healthy_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (std::chrono::steady_clock::now() < healthy_deadline) {
     static_cast<void>(driver.update_control_intent(input));
-    process_vehicle();
+    vehicle_pump.inspect([] {});
     const auto native = driver.status().at("native_control");
     expect(native.value("send_failures_total", 0U) == 0,
            "advancing delayed ACKs caused the native driver to reconnect: " + native.dump());
@@ -5135,12 +5175,12 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   const auto stalled_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (std::chrono::steady_clock::now() < stalled_deadline) {
     static_cast<void>(driver.update_control_intent(input));
-    process_vehicle();
+    vehicle_pump.inspect([] {});
     const auto native = driver.status().at("native_control");
-    if (native.value("ack_braking_wait", false) && vehicle_link_wait_seen) {
+    if (native.value("ack_braking_wait", false) && vehicle_pump.inspect([&] { return vehicle_link_wait_seen; })) {
       expect(native.value("send_failures_total", 0U) == 0 && native.value("websocket_connected", false) && connections->load() == 1 &&
                  native.value("requires_fresh_input", false) &&
-                 service.session_control_profile().at("active").get<bool>(),
+                 vehicle_pump.inspect([&] { return service.session_control_profile().at("active").get<bool>(); }),
              "500ms ACK loss closed a recoverable socket or lost vehicle authority");
       stalled = true;
       break;
@@ -5149,7 +5189,7 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   }
   if (!stalled) {
     const auto status = driver.status();
-    throw std::runtime_error("ACK stall did not start a same-session vehicle braking wait: " + last_vehicle_reason +
+    throw std::runtime_error("ACK stall did not start a same-session vehicle braking wait: " + vehicle_pump.inspect([&] { return last_vehicle_reason; }) +
         ", driver_clock=" + status.at("time_sync").dump() +
         ", vehicle_clock=" + vehicle_clock.status().to_json().dump() +
         ", native=" + status.at("native_control").dump());
@@ -5160,10 +5200,10 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   const auto recovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
   while (std::chrono::steady_clock::now() < recovery_deadline) {
     static_cast<void>(driver.update_control_intent(input));
-    process_vehicle();
+    vehicle_pump.inspect([] {});
     const auto native = driver.status().at("native_control");
     expect(native.value("send_failures_total", 0U) == 0 && connections->load() == 1 &&
-        service.session_control_profile().at("active").get<bool>(), "short ACK loss caused a reconnect or hard vehicle stop");
+        vehicle_pump.inspect([&] { return service.session_control_profile().at("active").get<bool>(); }), "short ACK loss caused a reconnect or hard vehicle stop");
     if (!native.value("ack_braking_wait", true)) { recovered = true; break; }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
@@ -5176,9 +5216,13 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   // operator does not issue another command for longer than both 2s and 5s.
   const auto neutral_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
   while (std::chrono::steady_clock::now() < neutral_deadline) {
-    static_cast<void>(driver.update_control_intent(input)); process_vehicle();
-    expect(service.session_control_profile().at("active").get<bool>() &&
-        vehicle->read_telemetry().throttle_feedback == 0 && vehicle->read_telemetry().brake_feedback == 1 &&
+    static_cast<void>(driver.update_control_intent(input)); vehicle_pump.inspect([] {});
+    const auto safely_held = vehicle_pump.inspect([&] {
+      const auto telemetry = vehicle->read_telemetry();
+      return service.session_control_profile().at("active").get<bool>() &&
+          telemetry.throttle_feedback == 0 && telemetry.brake_feedback == 1;
+    });
+    expect(safely_held &&
         connections->load() == 1 && driver.status().at("native_control").value("send_failures_total", 1U) == 0,
         "idle operator after link recovery caused hard parking, reconnect or brake release");
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -5186,12 +5230,12 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   input["intent_seq"] = 4; input["throttle"] = 0.2;
   expect(driver.update_control_intent(input).value("accepted", false), "fresh press could not restore input");
   const auto motion_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-  while (vehicle->read_telemetry().throttle_feedback <= 0 && std::chrono::steady_clock::now() < motion_deadline) {
-    static_cast<void>(driver.update_control_intent(input)); process_vehicle();
+  while (vehicle_pump.inspect([&] { return vehicle->read_telemetry().throttle_feedback <= 0; }) && std::chrono::steady_clock::now() < motion_deadline) {
+    static_cast<void>(driver.update_control_intent(input)); vehicle_pump.inspect([] {});
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  expect(vehicle->read_telemetry().throttle_feedback > 0 &&
-      service.session_control_profile().at("applied_revision") == profile_request.seq && connections->load() == 1,
+  expect(vehicle_pump.inspect([&] { return vehicle->read_telemetry().throttle_feedback > 0 &&
+      service.session_control_profile().at("applied_revision") == profile_request.seq; }) && connections->load() == 1,
       "fresh motion failed to resume with the same confirmed profile and socket");
   // Continued absence remains bounded; a driver recovery window cannot keep
   // an unresponsive ACK path alive forever.
@@ -5199,7 +5243,7 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   const auto long_stall_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
   bool bounded_reconnect = false;
   while (std::chrono::steady_clock::now() < long_stall_deadline) {
-    static_cast<void>(driver.update_control_intent(input)); process_vehicle();
+    static_cast<void>(driver.update_control_intent(input)); vehicle_pump.inspect([] {});
     const auto native = driver.status().at("native_control");
     if (native.value("send_failures_total", 0U) > 0) {
       expect(native.value("last_error", "") == "native control ACK recovery deadline exceeded" && native.value("requires_fresh_input", false),
@@ -5209,6 +5253,8 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
   expect(bounded_reconnect, "persistent ACK loss never reached bounded reconnect");
+  vehicle_pump.stop();
+  vehicle_pump.inspect([] {});
   receiver.close(); service.close();
   static_cast<void>(driver.disconnect("delayed_ack_test_complete"));
   server.stop();
@@ -5238,6 +5284,9 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "recovery-driver-password");
     const auto connected = driver.connect("vehicle-001");
     const auto session = connected.at("session_id").get<std::string>();
+    mine_teleop::SynchronizedClock vehicle_clock;
+    expect(vehicle_clock.synchronize(http, base, 7, driver_config.max_time_sync_uncertainty_ms)
+        .acceptable(driver_config.max_time_sync_uncertainty_ms), "recovery fixture vehicle clock not synchronized");
     mine_teleop::SessionControlProfile profile;
     profile.target_speed_kph = 2;
     profile.max_motor_torque_nm = 80;
@@ -5252,22 +5301,23 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     auto* vehicle = adapter.get();
     mine_teleop::VehicleControlService service(config, "driver-console-001", session,
         profile_request.control_token, std::move(adapter), 100);
-    service.start(profile_request.sent_at_utc_ms);
-    const auto confirmed = service.receive_session_profile(profile_request, profile_request.sent_at_utc_ms);
-    expect(confirmed.accepted && confirmed.effective_profile &&
-        confirmed.effective_profile->to_json() == profile.to_json(), "actual driver/vehicle profile handshake mismatched");
     mine_teleop::WebSocketClient receiver;
     receiver.connect(mine_teleop::signaling_websocket_url(base, session, "vehicle-001",
         std::to_string(online.at("connection_generation").get<std::uint64_t>())) + "&types=control_command",
         {{"X-Mine-Teleop-Device-Token", "recovery-device-token"}});
+    service.start(vehicle_clock.now_ms());
+    const auto confirmed = service.receive_session_profile(profile_request, vehicle_clock.now_ms());
+    expect(confirmed.accepted && confirmed.effective_profile &&
+        confirmed.effective_profile->to_json() == profile.to_json(), "actual driver/vehicle profile handshake mismatched");
     std::uint64_t last_applied_intent = 0;
     std::uint64_t last_applied_seq = 0;
+    std::atomic<bool> inject_delay{false};
     int expired_frames = 0;
     bool held_applied = false;
     bool fresh_braking_seen = false;
     std::string last_vehicle_rejection;
-    const auto process_delivery = [&](bool inject_delay) {
-      const auto received = receiver.receive_json(std::chrono::milliseconds(100));
+    const auto process_delivery = [&] {
+      const auto received = receiver.receive_json(std::chrono::milliseconds(0));
       if (received.status != mine_teleop::WebSocketReceiveStatus::Message ||
           received.message.value("event", "") != "signaling_messages") return;
       for (const auto& message : received.message.at("messages")) {
@@ -5275,10 +5325,10 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
         if (!payload.value("intent_fresh", false)) continue;
         auto command = mine_teleop::ControlCommand::from_json(payload);
         const auto intent_seq = payload.value("intent_seq", std::uint64_t{0});
-        const auto now = mine_teleop::now_ms();
+        const auto now = vehicle_clock.now_ms();
         // Inject three delayed frames only after the actual held command was
         // applied. Identity, sequence, driver sender and ACK transport are real.
-        if (inject_delay && held_applied && intent_seq == 2 && expired_frames < 3 &&
+        if (inject_delay.load() && held_applied && intent_seq == 2 && expired_frames < 3 &&
             (command.throttle > 0 || std::abs(command.steering) > 0)) {
           command.sent_at_utc_ms = now - 250;
           ++expired_frames;
@@ -5304,17 +5354,20 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
                 {"accepted", result.accepted}, {"rearm_required", rearm}, {"control_status_seq", rearm ? 77 : 0}}}});
       }
     };
+    LoopbackVehiclePump vehicle_pump(process_delivery);
     Json input = {{"session_id", session}, {"session_generation", connected.at("control_session_generation")},
         {"ui_instance_id", "native-recovery-ui"}, {"intent_seq", 1}, {"gear", "D"},
         {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0}};
     expect(driver.update_control_intent(input).value("accepted", false), "neutral driver input rejected");
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (last_applied_intent != 1 && std::chrono::steady_clock::now() < deadline) {
+    while (vehicle_pump.inspect([&] { return last_applied_intent != 1; }) && std::chrono::steady_clock::now() < deadline) {
       static_cast<void>(driver.update_control_intent(input));
-      process_delivery(false);
+      vehicle_pump.inspect([] {});
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    expect(last_applied_intent == 1, "initial native neutral never applied at vehicle: " + last_vehicle_rejection +
+    expect(vehicle_pump.inspect([&] { return last_applied_intent == 1; }), "initial native neutral never applied at vehicle: " + vehicle_pump.inspect([&] { return last_vehicle_rejection; }) +
         ":sender=" + driver.status().at("native_control").value("last_error", ""));
+    inject_delay = true;
     input["intent_seq"] = 2;
     input["steering"] = 0.1;
     input["throttle"] = held_brake > 0 ? 0.0 : 0.2;
@@ -5323,33 +5376,38 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     Json blocked;
     while (std::chrono::steady_clock::now() < deadline) {
-      process_delivery(true);
+      vehicle_pump.inspect([] {});
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
       blocked = driver.update_control_intent(input);
       if (!blocked.value("accepted", true) && blocked.value("reason", "") == "fresh_neutral_required") break;
     }
-    expect(expired_frames == 3 && !blocked.value("accepted", true), "threshold did not reach native driver interlock");
-    expect(service.session_control_profile().at("active").get<bool>(), "recoverable jitter revoked actual vehicle profile");
+    expect(vehicle_pump.inspect([&] { return expired_frames == 3; }) && !blocked.value("accepted", true), "threshold did not reach native driver interlock");
+    expect(vehicle_pump.inspect([&] { return service.session_control_profile().at("active").get<bool>(); }), "recoverable jitter revoked actual vehicle profile");
+    inject_delay = false;
     input["intent_seq"] = 3;
     input["steering"] = input["throttle"] = 0.0;
     const auto braking = driver.update_control_intent(input);
     expect(braking.value("accepted", false), "zero-motion recovery rejected ongoing braking");
-    const auto braking_recovered = [&] {
+    const auto braking_recovered = [&] { return vehicle_pump.inspect([&] {
       const auto feedback = vehicle->read_telemetry();
       return last_applied_intent == 3 && feedback.throttle_feedback == 0 &&
           (held_brake == 0 || (fresh_braking_seen && feedback.brake_feedback > 0));
-    };
+    }); };
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     // Packet identity alone is not the recovery condition. A batch can first
     // apply intent 3 before the re-arm/braking observation has arrived.
     while (!braking_recovered() && std::chrono::steady_clock::now() < deadline) {
       static_cast<void>(driver.update_control_intent(input));
-      process_delivery(false);
+      vehicle_pump.inspect([] {});
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    const auto vehicle_diagnostic = vehicle_pump.inspect([&] {
+      return ":last_intent=" + std::to_string(last_applied_intent) + ":fresh_braking=" + std::to_string(fresh_braking_seen) +
+          ":safety=" + std::string(mine_teleop::to_string(service.safety_state())) + ":vehicle=" + last_vehicle_rejection;
+    });
     expect(braking_recovered(),
         "actual vehicle did not recover zero motion while retaining braking: held=" + std::to_string(held_brake) +
-        ":last_intent=" + std::to_string(last_applied_intent) + ":fresh_braking=" + std::to_string(fresh_braking_seen) +
-        ":safety=" + std::string(mine_teleop::to_string(service.safety_state())) +
-        ":vehicle=" + last_vehicle_rejection + ":sender=" + driver.status().at("native_control").value("last_error", "") +
+        vehicle_diagnostic + ":sender=" + driver.status().at("native_control").value("last_error", "") +
         ":time_sync=" + driver.status().at("time_sync").dump());
     input["intent_seq"] = 4;
     input["brake"] = 0.0;
@@ -5359,14 +5417,17 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     input["steering"] = 0.1;
     expect(driver.update_control_intent(input).value("accepted", false), "fresh press rejected after neutral recovery");
     deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (last_applied_intent != 5 && std::chrono::steady_clock::now() < deadline) {
+    while (vehicle_pump.inspect([&] { return last_applied_intent != 5; }) && std::chrono::steady_clock::now() < deadline) {
       static_cast<void>(driver.update_control_intent(input));
-      process_delivery(false);
+      vehicle_pump.inspect([] {});
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    expect(last_applied_intent == 5 && last_applied_seq > profile_request.seq &&
+    expect(vehicle_pump.inspect([&] { return last_applied_intent == 5 && last_applied_seq > profile_request.seq &&
         vehicle->read_telemetry().throttle_feedback > 0 && service.session_control_profile().at("active").get<bool>() &&
-        service.session_control_profile().at("applied_revision") == profile_request.seq,
+        service.session_control_profile().at("applied_revision") == profile_request.seq; }),
         "fresh motion did not apply at vehicle using the same confirmed profile");
+    vehicle_pump.stop();
+    vehicle_pump.inspect([] {});
     receiver.close();
     service.close();
     static_cast<void>(driver.disconnect("native_recovery_test_complete"));

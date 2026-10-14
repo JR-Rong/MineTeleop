@@ -1272,14 +1272,18 @@ test('slow responses do not serialize heartbeats; backlog is bounded and ESTOP h
   // Two slow ordinary requests plus a single latest pending refresh; no replay backlog.
   assert.equal(queue.enqueueHeartbeat(), true);assert.equal(queue.enqueueHeartbeat(), false);
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(fixture.requests.length, 3);
-  assert.equal((await first).reason, 'control_intent_preempted_latest_input');
-  assert.equal(fixture.pressed.has('ArrowUp'), true);
-  // A < 2-tick response can complete instead of being cancelled at every heartbeat.
-  fixture.requests[1].resolve({accepted:true,duplicate:true});
+  assert.equal(fixture.requests.length, 2);
+  assert.equal(fixture.context.activeControlRequests.size, 2);
+  // A response between the third tick (132ms) and its own 150ms deadline
+  // remains usable; the single waiting heartbeat dispatches on completion.
+  fixture.requests[0].resolve({accepted:true,duplicate:true});
+  assert.equal((await first).sent,true);
   await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fixture.requests.length,3);
+  assert.equal(fixture.pressed.has('ArrowUp'),true);
   logic.releaseKey(fixture.pressed, fixture.blocked, 'ArrowUp');fixture.context.nativeIntentSeq++;
   const release = queue.send({}, false);
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(fixture.requests[3].intent.throttle,0);
   fixture.context.estopLatched=true;
   const urgent=queue.send({estop:true},true);

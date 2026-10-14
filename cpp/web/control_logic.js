@@ -1209,8 +1209,13 @@
       }
       const limit = urgent ? 3 : 2;
       if (active.size >= limit) {
-        const oldest = Array.from(active).find(request => !request.extra.estop && !request.preempted);
-        if (oldest) preempt(oldest, urgent ? 'estop' : 'latest_input');
+        // A heartbeat waits in the single latest slot for an existing response
+        // deadline. Cancelling at the third 66ms tick would starve otherwise
+        // valid 132-150ms replies, including gear-transition confirmations.
+        if (pending.waiters.length) {
+          const oldest = Array.from(active).find(request => !request.extra.estop && !request.preempted);
+          if (oldest) preempt(oldest, urgent ? 'estop' : 'latest_input');
+        }
         return;
       }
       const request = pending;
