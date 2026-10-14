@@ -109,3 +109,9 @@ Browser plugin not available，因此使用现有 Playwright/Chrome；不连接�
 可能造成偶发未来年龄。该 payload 夹具使用明确的逻辑接收点，并增加未来/过期拒绝
 断言，生产规则不变；真实三端 steady/校时测试仍保留。一次四时戳一致性 fixture
 失败在单项复测通过，未因此放宽生产校时验证。
+
+macOS CI 的 ACK 延迟 fixture 也混用了驾驶端校时锚点与原始宿主 UTC，出现年龄
+767 ms、有效控制 2350 ms 的拒绝/超时；测试原意只延迟 ACK。修正夹具车端也同步
+同一云端，仍用实际 steady_clock 看门狗、真实三端 WSS 和 200/800 ms 原门限。
+失败信息增加 driver/vehicle 校时状态及 native sender 状态，用于判定真实队列/
+调度迟到与时钟域问题，不通过放宽安全断言掩盖命令延迟。

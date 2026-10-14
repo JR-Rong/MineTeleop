@@ -5055,6 +5055,11 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   allow_qemu_test_scheduler_time_sync(driver_config);
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "dev-password");
   const auto connected = driver.connect("vehicle-001");
+  // Production compares two cloud-synchronized clocks. A raw host UTC step
+  // must not turn this ACK-only impairment fixture into a command-age outage.
+  mine_teleop::SynchronizedClock vehicle_clock;
+  expect(vehicle_clock.synchronize(http, base, 7, driver_config.max_time_sync_uncertainty_ms)
+      .acceptable(driver_config.max_time_sync_uncertainty_ms), "ACK fixture vehicle clock not synchronized");
   mine_teleop::SessionControlProfile profile;
   profile.target_speed_kph = 2; profile.max_motor_torque_nm = 80;
   profile.max_brake_pressure_bar = 80; profile.service_brake_pressure_bar = 20; profile.hard_brake_pressure_bar = 60;
@@ -5065,8 +5070,8 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>(); auto* vehicle = adapter.get();
   mine_teleop::VehicleControlService service(vehicle_config, "driver-console-001", connected.at("session_id"),
       profile_request.control_token, std::move(adapter), 100);
-  service.start(profile_request.sent_at_utc_ms);
-  expect(service.receive_session_profile(profile_request, profile_request.sent_at_utc_ms).accepted, "ACK recovery profile rejected");
+  service.start(vehicle_clock.now_ms());
+  expect(service.receive_session_profile(profile_request, vehicle_clock.now_ms()).accepted, "ACK recovery profile rejected");
   mine_teleop::WebSocketClient receiver;
   receiver.connect(mine_teleop::signaling_websocket_url(base, connected.at("session_id").get<std::string>(), "vehicle-001",
       std::to_string(online.at("connection_generation").get<std::uint64_t>())) + "&types=control_command",
@@ -5081,7 +5086,7 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
       const auto& payload = message.at("payload");
       auto command = mine_teleop::ControlCommand::from_json(payload);
       if (command.seq > last_vehicle_seq) {
-        const auto now = mine_teleop::now_ms();
+        const auto now = vehicle_clock.now_ms();
         const auto applied = service.receive_command(command, now);
         last_vehicle_reason = applied.reason + ":age=" + std::to_string(now - command.sent_at_utc_ms) +
             ":timing=" + service.control_timing(now).dump();
@@ -5142,7 +5147,13 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  expect(stalled, "ACK stall did not start a same-session vehicle braking wait: " + last_vehicle_reason);
+  if (!stalled) {
+    const auto status = driver.status();
+    throw std::runtime_error("ACK stall did not start a same-session vehicle braking wait: " + last_vehicle_reason +
+        ", driver_clock=" + status.at("time_sync").dump() +
+        ", vehicle_clock=" + vehicle_clock.status().to_json().dump() +
+        ", native=" + status.at("native_control").dump());
+  }
   acknowledgement_delay_ms->store(0);
   drop_acknowledgements->store(false);
   bool recovered = false;
