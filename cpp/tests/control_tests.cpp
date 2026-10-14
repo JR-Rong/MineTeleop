@@ -5316,6 +5316,8 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     bool held_applied = false;
     bool fresh_braking_seen = false;
     std::string last_vehicle_rejection;
+    std::deque<Json> recent_vehicle_commands;
+    Json first_hard_stop;
     const auto process_delivery = [&] {
       const auto received = receiver.receive_json(std::chrono::milliseconds(0));
       if (received.status != mine_teleop::WebSocketReceiveStatus::Message ||
@@ -5334,6 +5336,14 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
           ++expired_frames;
         }
         const auto result = service.receive_command(command, now);
+        recent_vehicle_commands.push_back({{"seq", command.seq}, {"intent_seq", intent_seq},
+            {"age_ms", now - command.sent_at_utc_ms}, {"accepted", result.accepted}, {"reason", result.reason},
+            {"brake", command.brake}, {"steering", command.steering},
+            {"rearm", payload.value("intent_requires_fresh_input", false)},
+            {"timing", service.control_timing(now)}});
+        if (recent_vehicle_commands.size() > 8) recent_vehicle_commands.pop_front();
+        if (first_hard_stop.is_null() && service.safety_state() == mine_teleop::SafetyState::TimeoutBrake)
+          first_hard_stop = recent_vehicle_commands;
         if (!result.accepted) last_vehicle_rejection = result.reason + ":age=" + std::to_string(now - command.sent_at_utc_ms);
         if (result.accepted) {
           last_applied_seq = command.seq;
@@ -5384,6 +5394,18 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     expect(vehicle_pump.inspect([&] { return expired_frames == 3; }) && !blocked.value("accepted", true), "threshold did not reach native driver interlock");
     expect(vehicle_pump.inspect([&] { return service.session_control_profile().at("active").get<bool>(); }), "recoverable jitter revoked actual vehicle profile");
     inject_delay = false;
+    if (held_brake > 0) {
+      expect(blocked.value("preserve_brake_during_rearm", false),
+          "vehicle rearm lost live braking: " + blocked.dump());
+      // Verify automatic rearm braking before issuing the new UI intent,
+      // so automatic brake retention and operator recovery are separate phases.
+      deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+      while (!vehicle_pump.inspect([&] { return fresh_braking_seen; }) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      expect(vehicle_pump.inspect([&] { return fresh_braking_seen; }),
+          "automatic rearm packet failed to retain held braking: " + driver.status().at("native_control").dump() +
+          ":vehicle=" + vehicle_pump.inspect([&] { return Json(recent_vehicle_commands).dump(); }));
+    }
     input["intent_seq"] = 3;
     input["steering"] = input["throttle"] = 0.0;
     const auto braking = driver.update_control_intent(input);
@@ -5403,11 +5425,12 @@ void test_native_recovery_applies_at_vehicle_and_preserves_confirmed_profile() {
     }
     const auto vehicle_diagnostic = vehicle_pump.inspect([&] {
       return ":last_intent=" + std::to_string(last_applied_intent) + ":fresh_braking=" + std::to_string(fresh_braking_seen) +
-          ":safety=" + std::string(mine_teleop::to_string(service.safety_state())) + ":vehicle=" + last_vehicle_rejection;
+          ":safety=" + std::string(mine_teleop::to_string(service.safety_state())) + ":vehicle=" + last_vehicle_rejection +
+          ":first_hard_stop=" + first_hard_stop.dump() + ":recent_commands=" + Json(recent_vehicle_commands).dump();
     });
     expect(braking_recovered(),
         "actual vehicle did not recover zero motion while retaining braking: held=" + std::to_string(held_brake) +
-        vehicle_diagnostic + ":sender=" + driver.status().at("native_control").value("last_error", "") +
+        vehicle_diagnostic + ":native=" + driver.status().at("native_control").dump() +
         ":time_sync=" + driver.status().at("time_sync").dump());
     input["intent_seq"] = 4;
     input["brake"] = 0.0;
