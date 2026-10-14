@@ -175,6 +175,7 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
         build-essential \
         ca-certificates \
         cmake \
+        curl \
         libcurl4-openssl-dev \
         libgstreamer1.0-dev \
         libgstreamer-plugins-base1.0-dev \
@@ -184,6 +185,7 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-plugins-ugly \
         gstreamer1.0-libav \
+        gstreamer1.0-nice \
         libglib2.0-dev \
         libjpeg-dev \
         libusb-1.0-0-dev \
@@ -192,12 +194,12 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
         libssl-dev \
         libyaml-cpp-dev \
         nlohmann-json3-dev \
-        nodejs \
         python3 \
         patchelf \
         pkg-config \
         v4l-utils \
         vainfo \
+        xz-utils \
         zlib1g-dev \
     && if [ "$TARGETARCH" = "amd64" ]; then \
          apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends intel-media-va-driver; \
@@ -206,6 +208,26 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
 
 ARG MINE_TELEOP_BUILD_JOBS=2
 ARG MINE_TELEOP_BUILD_TESTS=OFF
+
+# The test SDK uses Ubuntu's Gst 1.20 plugins, including NICE, and executes
+# shipped browser methods with the same Node major as the offline suite.
+# Node is build-only and is never copied into the vehicle artifact.
+ENV PATH="/opt/mine-teleop-test-node/bin:${PATH}"
+RUN if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \
+      case "$(dpkg --print-architecture)" in \
+        amd64) node_arch=x64; node_sha=f4cb75bb036f0d0eddf6b79d9596df1aaab9ddccd6a20bf489be5abe9467e84e ;; \
+        arm64) node_arch=arm64; node_sha=eab80cb88f8fda1e65f5e8d0420c9809bdb320b03fd34976ab7161b6e703b910 ;; \
+        *) echo "unsupported test Node architecture" >&2; exit 1 ;; \
+      esac; \
+      curl --fail --location --retry 5 --connect-timeout 15 \
+        "https://nodejs.org/dist/v22.16.0/node-v22.16.0-linux-${node_arch}.tar.xz" \
+        --output /tmp/mine-teleop-test-node.tar.xz \
+      && echo "$node_sha  /tmp/mine-teleop-test-node.tar.xz" | sha256sum --check - \
+      && mkdir -p /opt/mine-teleop-test-node \
+      && tar -xJf /tmp/mine-teleop-test-node.tar.xz --strip-components=1 -C /opt/mine-teleop-test-node \
+      && rm /tmp/mine-teleop-test-node.tar.xz \
+      && test "$(node --version)" = "v22.16.0"; \
+    fi
 
 COPY --from=aravis /opt/aravis /opt/aravis
 ENV PKG_CONFIG_PATH="/opt/aravis/lib/pkgconfig"

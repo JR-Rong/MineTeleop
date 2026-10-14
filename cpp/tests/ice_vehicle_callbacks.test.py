@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src/webrtc_media.cpp"
@@ -116,7 +117,9 @@ void complete(GstElement& peer,const std::string& ufrag="local",bool failed=fals
 }
 Json ice(const std::string& id,const std::string& ufrag="remote") {
   Json payload={{"candidate","candidate:fixture 1 udp 1 127.0.0.1 9000 typ host"},{"sdpMLineIndex",0}};
-  if(!id.empty())payload["media_negotiation_id"]=id;if(!ufrag.empty())payload["usernameFragment"]=ufrag;return payload;
+  if(!id.empty())payload["media_negotiation_id"]=id;
+  if(!ufrag.empty())payload["usernameFragment"]=ufrag;
+  return payload;
 }
 void received(Impl& impl,const std::string& type,Json payload) {
   impl.signaling.incoming={{"messages",Json::array({{{"type",type},{"payload",std::move(payload)}}})}};impl.process_signaling();
@@ -171,7 +174,8 @@ void case_stale_invalid_answer() {
 }
 void case_bounded_pending() {
   Impl impl;GstElement peer;activate(impl,peer);negotiate(impl,peer);complete(peer);const auto id=impl.media_signal_state->negotiation_id;
-  for(int n=0;n<128;n++)received(impl,"ice_candidate",ice(id));bool rejected=false;
+  for(int n=0;n<128;n++)received(impl,"ice_candidate",ice(id));
+  bool rejected=false;
   try{received(impl,"ice_candidate",ice(id));}catch(const std::runtime_error&){rejected=true;}
   expect(rejected&&impl.media_signal_state->pending_remote_candidates.size()==128,"remote queue exceeded bound");
 }
@@ -254,9 +258,19 @@ def main():
     command += [str(unit), "-o", str(binary)]
     built = subprocess.run(command, capture_output=True, text=True)
     (args.output / "build.log").write_text(built.stdout + built.stderr)
+    # CTest's output-on-failure must show the compiler/runtime diagnostics,
+    # rather than only the artifact manifest and an opaque exit code.
+    if built.stdout:
+        print(built.stdout, end="", file=sys.stdout)
+    if built.stderr:
+        print(built.stderr, end="", file=sys.stderr)
     result = subprocess.run([str(binary)], capture_output=True, text=True) if built.returncode == 0 else None
     if result:
         (args.output / "result.log").write_text(result.stdout + result.stderr)
+        if result.stdout:
+            print(result.stdout, end="", file=sys.stdout)
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
     manifest = {"scope":__doc__, "source_sha256":hashlib.sha256(source.encode()).hexdigest(), "source_path":str(args.source),
         "script_sha256":hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "command":command,
         "generated_unit_sha256":hashlib.sha256(unit.read_bytes()).hexdigest(),"compile_exit":built.returncode,
