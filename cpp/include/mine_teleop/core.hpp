@@ -869,6 +869,7 @@ class VehicleControlService {
   SafetyStateMachine safety_;
   std::unique_ptr<VehicleAdapter> adapter_;
   bool require_feedback_before_control_{true};
+  bool critical_video_required_{true};
   double max_speed_kph_{40.0};
   double max_throttle_{1.0};
   double full_scale_motor_torque_nm_{kDefaultFullScaleMotorTorqueNm};

@@ -788,7 +788,7 @@ void test_vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries
   }
 }
 
-void test_control_enabled_vehicle_requires_an_enabled_critical_camera() {
+void test_control_enabled_vehicle_allows_all_cameras_noncritical() {
   const auto base = read_text("configs/vehicle-agent.dev.yaml");
   auto no_critical_contents = base;
   replace_once(
@@ -796,9 +796,10 @@ void test_control_enabled_vehicle_requires_an_enabled_critical_camera() {
       "  - id: front\n",
       "  - id: front\n    critical_for_control: false\n");
   const auto no_critical_path = write_temp_vehicle_config("no-critical-camera", no_critical_contents);
-  expect_throws(
-      [&] { static_cast<void>(mine_teleop::load_vehicle_config(no_critical_path)); },
-      "control-enabled vehicle accepted no enabled critical cameras");
+  const auto optional_config = mine_teleop::load_vehicle_config(no_critical_path);
+  expect(optional_config.runtime.control_enabled && optional_config.enabled_cameras().size() == 1 &&
+      optional_config.redacted_summary().at("critical_camera_count") == 0,
+      "control-enabled vehicle rejected all noncritical cameras or counted the disabled critical camera");
   std::error_code error;
   std::filesystem::remove(no_critical_path, error);
 
@@ -816,6 +817,13 @@ void test_control_enabled_vehicle_requires_an_enabled_critical_camera() {
       }) == 1,
       "control-enabled vehicle did not preserve exactly one critical camera");
   std::filesystem::remove(one_critical_path, error);
+
+  auto no_enabled_contents = no_critical_contents;
+  replace_once(no_enabled_contents, "    enabled: true\n", "    enabled: false\n");
+  const auto no_enabled_path = write_temp_vehicle_config("no-enabled-camera", no_enabled_contents);
+  expect_throws([&] { static_cast<void>(mine_teleop::load_vehicle_config(no_enabled_path)); },
+      "optional camera control policy accidentally allowed an empty enabled camera configuration");
+  std::filesystem::remove(no_enabled_path, error);
 }
 
 void test_camera_failure_decision_is_bounded_and_fail_closed() {
@@ -2804,6 +2812,62 @@ void test_held_forward_and_left_rearm_after_control_gap() {
   service.close();
 }
 
+void test_noncritical_video_reports_do_not_brake_but_other_protections_remain() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  for (auto& camera : config.cameras) if (camera.enabled) camera.critical_for_control = false;
+  // A disabled critical camera must not re-enable the video control gate.
+  expect(config.cameras.back().critical_for_control && !config.cameras.back().enabled,
+      "optional video fixture lost its disabled critical camera");
+  {
+    auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+    auto* view = adapter.get();
+    mine_teleop::test::LogicalTimeControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    expect(service.receive_session_profile(session_profile_request(100, 0), 0).accepted, "optional video profile rejected");
+    for (int now = 0; now <= 10000; now += 50) {
+      auto motion = command(static_cast<std::uint64_t>(now / 50 + 1), now);
+      motion.critical_video_ready = false;
+      expect(service.receive_command(motion, now).accepted, "noncritical video report blocked fresh motion");
+      service.tick(now);
+      const auto timing = service.control_timing(now);
+      expect(!service.control_braking_wait() && !timing.at("critical_video_required").get<bool>() &&
+          timing.at("driver_critical_video_ready").get<bool>() && view->read_telemetry().throttle_feedback > 0 &&
+          service.session_control_profile().at("active").get<bool>(),
+          "all-optional video created a braking wait or revoked control authority");
+    }
+    service.tick(10799);
+    expect(service.session_control_profile().at("active").get<bool>(), "optional video changed the watchdog deadline");
+    service.tick(10800);
+    expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
+        !service.session_control_profile().at("active").get<bool>(),
+        "all-optional video bypassed the independent control watchdog");
+    service.close();
+  }
+  for (const auto cause : {mine_teleop::ControlRecoveryCause::TimeSynchronization,
+                          mine_teleop::ControlRecoveryCause::InputLease,
+                          mine_teleop::ControlRecoveryCause::ControlLink}) {
+    auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
+    auto* view = adapter.get();
+    mine_teleop::test::LogicalTimeControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    expect(service.receive_session_profile(session_profile_request(100, 0), 0).accepted, "readiness profile rejected");
+    expect(service.receive_command(command(1, 0), 0).accepted, "initial optional video motion rejected");
+    auto lost = command(2, 50); lost.critical_video_ready = false;
+    lost.control_time_sync_ready = cause != mine_teleop::ControlRecoveryCause::TimeSynchronization;
+    lost.operator_input_ready = cause != mine_teleop::ControlRecoveryCause::InputLease &&
+        cause != mine_teleop::ControlRecoveryCause::ControlLink;
+    lost.control_link_ready = cause != mine_teleop::ControlRecoveryCause::ControlLink;
+    expect(!service.receive_command(lost, 50).accepted && service.control_braking_wait() &&
+        view->read_telemetry().throttle_feedback == 0 && view->read_telemetry().brake_feedback == 1 &&
+        service.control_timing(50).at("control_recovery_cause") == mine_teleop::to_string(cause),
+        "all-optional video disabled a non-video protection");
+    auto estop = command(3, 100); estop.estop = true; estop.critical_video_ready = false;
+    expect(service.receive_command(estop, 100).accepted && service.safety_state() == mine_teleop::SafetyState::Estop,
+        "all-optional video blocked or disabled ESTOP");
+    service.close();
+  }
+}
+
 void test_video_braking_preserves_profile_and_only_real_commands_refresh_control() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
@@ -4755,7 +4819,7 @@ int main() {
       {"vehicle_config_requires_monotonic_final_full_safety_brake", test_vehicle_config_requires_monotonic_final_full_safety_brake},
       {"vehicle_config_validates_local_speed_pid_safety_fields", test_vehicle_config_validates_local_speed_pid_safety_fields},
       {"vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries", test_vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries},
-      {"control_enabled_vehicle_requires_an_enabled_critical_camera", test_control_enabled_vehicle_requires_an_enabled_critical_camera},
+      {"control_enabled_vehicle_allows_all_cameras_noncritical", test_control_enabled_vehicle_allows_all_cameras_noncritical},
       {"camera_failure_decision_is_bounded_and_fail_closed", test_camera_failure_decision_is_bounded_and_fail_closed},
       {"camera_source_classification_is_canonical", test_camera_source_classification_is_canonical},
       {"camera_input_spec_is_explicit_for_ccg2_and_legacy_safe", test_camera_input_spec_is_explicit_for_ccg2_and_legacy_safe},
@@ -4804,6 +4868,7 @@ int main() {
        test_control_service_receive_path_cannot_bypass_hard_timeout},
       {"held_forward_and_left_rearm_after_control_gap",
        test_held_forward_and_left_rearm_after_control_gap},
+      {"noncritical_video_reports_do_not_brake_but_other_protections_remain", test_noncritical_video_reports_do_not_brake_but_other_protections_remain},
       {"video_braking_preserves_profile_and_only_real_commands_refresh_control", test_video_braking_preserves_profile_and_only_real_commands_refresh_control},
       {"idle_zero_heartbeats_do_not_trigger_control_timeout", test_idle_zero_heartbeats_do_not_trigger_control_timeout},
       {"recovery_braking_never_emits_zero_pressure_on_rejected_commands", test_recovery_braking_never_emits_zero_pressure_on_rejected_commands},

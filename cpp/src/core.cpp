@@ -2024,13 +2024,6 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   }
   const auto enabled_cameras = config.enabled_cameras();
   if (enabled_cameras.empty()) throw std::runtime_error("at least one camera must be enabled");
-  if (config.runtime.control_enabled &&
-      std::none_of(enabled_cameras.begin(), enabled_cameras.end(), [](const auto& camera) {
-        return camera.critical_for_control;
-      })) {
-    throw std::runtime_error(
-        "control-enabled vehicle requires at least one enabled camera with critical_for_control: true");
-  }
 
   const auto hardware = root["hardware"];
   const auto can = hardware["can"];
@@ -2933,6 +2926,9 @@ VehicleControlService::VehicleControlService(
           config.control.deceleration_profile),
       adapter_(std::move(adapter)),
       require_feedback_before_control_(config.field_safety.require_can_feedback_before_control),
+      critical_video_required_(std::any_of(config.cameras.begin(), config.cameras.end(), [](const auto& camera) {
+        return camera.enabled && camera.critical_for_control;
+      })),
       max_speed_kph_(config.field_safety.max_speed_kph),
       max_throttle_(config.field_safety.max_throttle),
       full_scale_motor_torque_nm_(config.field_safety.full_scale_motor_torque_nm),
@@ -3331,7 +3327,9 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
   if (!effective.estop) {
     // Only authenticated, fresh, in-order commands may change the driver's
     // view-health report. It withdraws motion before this command can apply.
-    driver_critical_video_ready_ = effective.critical_video_ready;
+    // The vehicle's enabled camera configuration owns this gate. With no
+    // critical cameras, a stale/unknown browser video report cannot enable it.
+    driver_critical_video_ready_ = !critical_video_required_ || effective.critical_video_ready;
     driver_time_sync_ready_ = effective.control_time_sync_ready;
     operator_input_ready_ = effective.operator_input_ready;
     driver_control_link_ready_ = effective.control_link_ready;
@@ -3669,6 +3667,7 @@ Json VehicleControlService::control_timing(std::int64_t /*timestamp_ms*/) const 
           {"control_braking_wait", control_braking_wait_},
           {"recovery_brake_hold", recovery_brake_hold_},
           {"control_recovery_cause", (control_braking_wait_ || recovery_brake_hold_) ? to_string(recovery_cause_) : ""},
+          {"critical_video_required", critical_video_required_},
           {"driver_critical_video_ready", driver_critical_video_ready_},
           {"driver_time_sync_ready", driver_time_sync_ready_},
           {"operator_input_ready", operator_input_ready_},

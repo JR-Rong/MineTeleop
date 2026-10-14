@@ -1491,6 +1491,13 @@ test('shipped view health distinguishes optional-only cameras from unknown criti
   assert.equal(context.driverCriticalVideoHealth().ready,false);
   context.mediaStatus={lanes:[{camera_id:'aux',critical_for_control:false}]};
   assert.equal(context.driverCriticalVideoHealth().ready,true);
+  context.mediaStatus={lanes:['front','left','rear1','rear2'].map(camera_id=>({camera_id,critical_for_control:false}))};
+  assert.equal(context.driverCriticalVideoHealth().ready,true);
+  // A single explicitly critical lane restores protection for a lost view.
+  context.cameraView.criticalHealth=()=>({ready:false,missing:['front'],cameras:[]});
+  context.mediaStatus.lanes[0].critical_for_control=true;
+  assert.equal(context.driverCriticalVideoHealth().ready,false);
+  context.cameraView.criticalHealth=(ids,staleMs)=>({ready:ids.length>0,missing:ids,staleMs});
   context.mediaStatus={lanes:[{camera_id:'unknown'}]};
   assert.equal(context.driverCriticalVideoHealth().ready,false);
   context.mediaStatus={lanes:[{camera_id:'front',critical_for_control:true}]};
