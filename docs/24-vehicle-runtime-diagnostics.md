@@ -518,3 +518,11 @@ ICE 连接/收集状态、local/remote 候选类型数量、检查状态汇总�
 ICE server 错误同时记录实际 URL 的 udp/tcp transport 和错误类别
 （DNS 解析、server timeout 或未分类），不保存可能携带敏感信息的原始 errorText。
 旧日志 safe endpoint 去掉了 transport 查询参数，不能据 6000 的 endpoint 认定 UDP/TCP。
+
+驾驶端原生 ACK 不再仅在下一次发控制包时读取。发送间隔内每 20 ms 非阻塞轮询，
+仍复用同一 ACK 校验/反馈/窗口实现，不增加控制发送频率。
+`acknowledgements_polled` 记录本地 poll 起点/处理耗时及各 ACK 的读取 UTC/steady
+时刻、序号和确认年龄；`timestamp_scope=native_websocket_ack_drain`。这是应用读取
+边界，仍含线程调度/解密，不能当作内核收包时刻或纯网络 RTT。
+`ack_poll_failed` 在关闭连接前尽力记录 socket/TCP 诊断，并保持会话/generation
+校验和既有失败处理。新增日志仅使用现有 opt-in 异步 native trace。

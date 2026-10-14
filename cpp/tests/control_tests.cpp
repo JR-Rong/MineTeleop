@@ -2026,8 +2026,14 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
           send_sample.find("return false;", send_revalidation) < websocket_send,
       "native sender can wrap an old intent sample in a replacement session before WSS send");
 
+  const auto acknowledgement_drain = cpp_function_contract(source,
+      "bool DriverConsoleRuntime::drain_native_control_acknowledgements_locked(");
   const auto acknowledgement_progress = send_sample.find(
-      "control_signaling_ack_window_.acknowledge_through(");
+      "drain_native_control_acknowledgements_locked(");
+  expect(acknowledgement_drain.find("control_signaling_ack_window_.acknowledge_through(") != std::string::npos &&
+      acknowledgement_drain.find("receive_json(std::chrono::milliseconds(0))") != std::string::npos &&
+      sender_loop.find("poll_native_control_acknowledgements()") != std::string::npos,
+      "native ACK reception still waits for the next command send");
   const auto oldest_pending_age = send_sample.find(
       "control_signaling_ack_window_.oldest_age_ms(monotonic_ms)",
       acknowledgement_progress);
@@ -2098,7 +2104,7 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
           close_control_websocket.find(
               "control_signaling_reconnect_delay_ms_ = 100") !=
               std::string::npos &&
-          send_sample.find(
+          acknowledgement_drain.find(
               "control_signaling_reconnect_delay_ms_ = 100") !=
               std::string::npos &&
           sender_loop.find("send_native_control_sample()") !=
@@ -5199,7 +5205,7 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   }
   acknowledgement_delay_ms->store(0);
   drop_acknowledgements->store(false);
-  bool recovered = false;
+  bool recovered = false, ack_between_sends_seen = false;
   const auto recovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
   while (std::chrono::steady_clock::now() < recovery_deadline) {
     static_cast<void>(driver.update_control_intent(input));
@@ -5207,7 +5213,10 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
     const auto native = driver.status().at("native_control");
     expect(native.value("send_failures_total", 0U) == 0 && connections->load() == 1 &&
         vehicle_pump.inspect([&] { return service.session_control_profile().at("active").get<bool>(); }), "short ACK loss caused a reconnect or hard vehicle stop");
-    if (!native.value("ack_braking_wait", true)) { recovered = true; break; }
+    ack_between_sends_seen = ack_between_sends_seen ||
+        (native.value("last_ack_seq", 0U) == native.value("last_seq", 0U) &&
+         native.value("unacknowledged_count", 1U) == 0);
+    if (!native.value("ack_braking_wait", true) && ack_between_sends_seen) { recovered = true; break; }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
   expect(recovered, "recent ACK progress did not recover the original socket: " +

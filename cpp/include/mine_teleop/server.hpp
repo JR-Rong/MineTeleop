@@ -416,6 +416,10 @@ class DriverConsoleRuntime {
   void native_control_lease_loop(std::stop_token stop_token);
   void time_sync_loop(std::stop_token stop_token);
   [[nodiscard]] bool send_native_control_sample();
+  void poll_native_control_acknowledgements();
+  [[nodiscard]] bool drain_native_control_acknowledgements_locked(
+      std::string_view session, std::string_view identity, std::string_view vehicle,
+      Json& drained_acknowledgements);
   void note_native_control_failure(
       std::string error,
       std::string_view session_id,

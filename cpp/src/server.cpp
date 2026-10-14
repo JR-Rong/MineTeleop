@@ -4808,6 +4808,148 @@ void DriverConsoleRuntime::note_native_control_failure(
       std::min(control_signaling_reconnect_delay_ms_ * 2, 1000);
 }
 
+bool DriverConsoleRuntime::drain_native_control_acknowledgements_locked(
+    std::string_view session, std::string_view identity, std::string_view vehicle,
+    Json& drained_acknowledgements) {
+  // The caller owns control_signaling_websocket_mutex_ and verifies generation.
+  bool requires_rearm = false;
+  for (int drained = 0; drained < 16; ++drained) {
+    const auto received =
+        control_signaling_websocket_->receive_json(std::chrono::milliseconds(0));
+    if (received.status == WebSocketReceiveStatus::Timeout) break;
+    if (received.status == WebSocketReceiveStatus::Closed) {
+      throw std::runtime_error("native control signaling websocket closed");
+    }
+    if (received.message.contains("error")) {
+      throw std::runtime_error(received.message.value(
+          "error", "native control signaling message was rejected"));
+    }
+    if (received.message.value("event", "") != "signaling_ack" ||
+        received.message.value("type", "") != "control_command") {
+      throw std::runtime_error(
+          "native control signaling acknowledgement is invalid");
+    }
+    const auto acknowledged_seq =
+        received.message.value("seq", std::uint64_t{0});
+    const auto acknowledgement_received_at_utc_ms = clock_.now_ms();
+    const auto acknowledgement_received_monotonic_ms = monotonic_now_ms();
+    const bool ack_advanced = control_signaling_ack_window_.acknowledge_through(
+        acknowledged_seq, acknowledgement_received_monotonic_ms);
+    if (received.message.contains("vehicle_control_feedback")) {
+      const auto& feedback = received.message.at("vehicle_control_feedback");
+      const auto feedback_seq = required_uint64(feedback, "command_seq");
+      const auto status_seq = required_uint64(feedback, "control_status_seq");
+      if (feedback.value("session_id", "") != session ||
+          feedback.value("vehicle_id", "") != vehicle || feedback.value("driver_id", "") != identity ||
+          feedback_seq == 0 || feedback_seq > acknowledged_seq ||
+          // UI intent sequences restart on page replacement. The session
+          // command sequence above binds feedback to actual sent traffic.
+          required_uint64(feedback, "intent_seq") == 0 ||
+          !feedback.at("rearm_required").is_boolean() || !feedback.at("accepted").is_boolean())
+        throw std::runtime_error("native vehicle control feedback scope is invalid");
+      if (feedback_seq > native_control_last_feedback_command_seq_) {
+        native_control_last_feedback_command_seq_ = feedback_seq;
+        if (feedback.at("accepted").get<bool>())
+          native_control_vehicle_accepted_command_seq_.store(feedback_seq);
+        if (feedback.at("rearm_required").get<bool>() && !feedback.at("accepted").get<bool>() && status_seq > 0) {
+          native_control_intent_.invalidate(true);
+          native_control_rearm_status_seq_.store(std::max(native_control_rearm_status_seq_.load(), status_seq));
+          requires_rearm = true;
+          if (native_control_trace_) native_control_trace_->enqueue(
+              {{"stage", "vehicle_input_rearm_received"}, {"session_id", session}, {"vehicle_id", vehicle},
+               {"command_seq", feedback_seq}, {"control_status_seq", status_seq}, {"intent_seq", feedback.at("intent_seq")}});
+        }
+      }
+    }
+    control_signaling_last_ack_seq_ =
+        std::max(control_signaling_last_ack_seq_, acknowledged_seq);
+    native_control_last_ack_received_at_utc_ms_.store(
+        acknowledgement_received_at_utc_ms,
+        std::memory_order_relaxed);
+    const auto cloud_received_at_utc_ms = received.message.value(
+        "cloud_received_at_utc_ms",
+        std::int64_t{0});
+    if (cloud_received_at_utc_ms > 0) {
+      native_control_last_ack_cloud_received_at_utc_ms_.store(
+          cloud_received_at_utc_ms,
+          std::memory_order_relaxed);
+    }
+    if (native_control_trace_) {
+      drained_acknowledgements.push_back({
+          {"vehicle_feedback_present", received.message.contains("vehicle_control_feedback")},
+          {"vehicle_feedback_command_seq", received.message.value("vehicle_control_feedback", Json::object()).value("command_seq", std::uint64_t{0})},
+          {"vehicle_feedback_rearm_required", received.message.value("vehicle_control_feedback", Json::object()).value("rearm_required", false)},
+          {"seq", acknowledged_seq},
+          {"ack_advanced", ack_advanced},
+          {"ack_packet_age_ms", ack_advanced ? Json(control_signaling_ack_window_.last_ack_packet_age_ms()) : Json(nullptr)},
+          {"ack_received_at_utc_ms", acknowledgement_received_at_utc_ms},
+          {"ack_received_monotonic_ms", acknowledgement_received_monotonic_ms},
+          {"cloud_received_at_utc_ms", cloud_received_at_utc_ms},
+          {"cloud_queued_at_utc_ms", received.message.value(
+                                            "cloud_queued_at_utc_ms",
+                                            std::int64_t{0})},
+          {"cloud_ingress_processing_ms", received.message.value(
+                                               "cloud_ingress_processing_ms",
+                                               std::int64_t{0})},
+          {"delivery_cursor", received.message.value(
+                                  "delivery_cursor",
+                                  std::uint64_t{0})},
+      });
+    }
+    if (ack_advanced) {
+      control_signaling_next_connect_monotonic_ms_ = 0;
+      control_signaling_reconnect_delay_ms_ = 100;
+    }
+  }
+  return requires_rearm;
+}
+
+void DriverConsoleRuntime::poll_native_control_acknowledgements() {
+  std::string session, identity, vehicle;
+  std::uint64_t generation = 0, sequence = 0;
+  {
+    std::lock_guard lock(mutex_);
+    if (session_id_.empty()) return;
+    session = session_id_; identity = driver_id(); vehicle = vehicle_id_;
+    generation = control_session_generation_; sequence = control_sequence_;
+  }
+  const auto started = monotonic_now_ms();
+  try {
+    Json acknowledgements = Json::array();
+    {
+      std::unique_lock websocket_lock(control_signaling_websocket_mutex_, std::try_to_lock);
+      if (!websocket_lock.owns_lock() || !control_signaling_websocket_ ||
+          !control_signaling_websocket_->connected() || control_signaling_websocket_session_id_ != session) return;
+      {
+        std::lock_guard lock(mutex_);
+        if (session_id_ != session || control_session_generation_ != generation) return;
+      }
+      if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::AckDrain);
+      static_cast<void>(drain_native_control_acknowledgements_locked(session, identity, vehicle, acknowledgements));
+      if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::Idle);
+    }
+    if (native_control_trace_ && !acknowledgements.empty()) native_control_trace_->enqueue({
+        {"stage", "acknowledgements_polled"}, {"trace_session_id", session}, {"seq", sequence},
+        {"session_generation", generation}, {"poll_started_monotonic_ms", started},
+        {"timestamp_scope", "native_websocket_ack_drain"},
+        {"poll_processing_ms", monotonic_now_ms() - started}, {"acknowledgements", std::move(acknowledgements)}});
+  } catch (const std::exception& error) {
+    if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::Failure);
+    if (native_control_trace_) {
+      Json failure = {{"stage", "ack_poll_failed"}, {"trace_session_id", session},
+          {"session_generation", generation}, {"seq", sequence}, {"error", error.what()},
+          {"poll_processing_ms", monotonic_now_ms() - started}};
+      try {
+        std::unique_lock websocket_lock(control_signaling_websocket_mutex_, std::try_to_lock);
+        if (websocket_lock.owns_lock() && control_signaling_websocket_)
+          failure["failure_transport"] = control_signaling_websocket_->transport_diagnostics();
+      } catch (const std::exception&) { failure["transport_sample_failed"] = true; }
+      native_control_trace_->enqueue(std::move(failure));
+    }
+    note_native_control_failure(error.what(), session, generation);
+  }
+}
+
 bool DriverConsoleRuntime::send_native_control_sample() {
   if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::Sample);
   struct FinishPhase {
@@ -4992,112 +5134,29 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       // while its cumulative sequence advances; packet age remains diagnostic.
       acknowledgement_drain_started_monotonic_ms = monotonic_now_ms();
       if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::AckDrain);
-      for (int drained = 0; drained < 16; ++drained) {
-        const auto received =
-            control_signaling_websocket_->receive_json(std::chrono::milliseconds(0));
-        if (received.status == WebSocketReceiveStatus::Timeout) break;
-        if (received.status == WebSocketReceiveStatus::Closed) {
-          throw std::runtime_error("native control signaling websocket closed");
-        }
-        if (received.message.contains("error")) {
-          throw std::runtime_error(received.message.value(
-              "error", "native control signaling message was rejected"));
-        }
-        if (received.message.value("event", "") != "signaling_ack" ||
-            received.message.value("type", "") != "control_command") {
-          throw std::runtime_error(
-              "native control signaling acknowledgement is invalid");
-        }
-        const auto acknowledged_seq =
-            received.message.value("seq", std::uint64_t{0});
-        const auto acknowledgement_received_at_utc_ms = clock_.now_ms();
-        const auto acknowledgement_received_monotonic_ms = monotonic_now_ms();
-        const bool ack_advanced = control_signaling_ack_window_.acknowledge_through(
-            acknowledged_seq, acknowledgement_received_monotonic_ms);
-        if (received.message.contains("vehicle_control_feedback")) {
-          const auto& feedback = received.message.at("vehicle_control_feedback");
-          const auto feedback_seq = required_uint64(feedback, "command_seq");
-          const auto status_seq = required_uint64(feedback, "control_status_seq");
-          if (feedback.value("session_id", "") != session ||
-              feedback.value("vehicle_id", "") != vehicle || feedback.value("driver_id", "") != identity ||
-              feedback_seq == 0 || feedback_seq > acknowledged_seq ||
-              // UI intent sequences restart on page replacement. The session
-              // command sequence above binds feedback to actual sent traffic.
-              required_uint64(feedback, "intent_seq") == 0 ||
-              !feedback.at("rearm_required").is_boolean() || !feedback.at("accepted").is_boolean())
-            throw std::runtime_error("native vehicle control feedback scope is invalid");
-          if (feedback_seq > native_control_last_feedback_command_seq_) {
-            native_control_last_feedback_command_seq_ = feedback_seq;
-            if (feedback.at("accepted").get<bool>())
-              native_control_vehicle_accepted_command_seq_.store(feedback_seq);
-            if (feedback.at("rearm_required").get<bool>() && !feedback.at("accepted").get<bool>() && status_seq > 0) {
-              native_control_intent_.invalidate(true);
-              native_control_rearm_status_seq_.store(std::max(native_control_rearm_status_seq_.load(), status_seq));
-              // This cycle's payload was built before draining ACKs. Neutralize
-              // it too; retain gear and an already latched ESTOP. A zero
-              // response may be fresh only while the original UI lease is live.
-              if (!command.estop) {
-                command.steering = command.throttle = 0.0;
-                command.operator_active = sample.fresh && command.brake > 0.0;
-                payload["steering"] = 0.0;
-                payload["throttle"] = 0.0;
-                payload["operator_active"] = command.operator_active;
-                payload["intent_fresh"] = sample.fresh;
-                payload["intent_requires_fresh_input"] = true;
-                envelope["payload"] = payload;
-                if (native_control_trace_) {
-                  trace_record["steering"] = 0.0;
-                  trace_record["throttle"] = 0.0;
-                  trace_record["operator_active"] = command.operator_active;
-                  trace_record["intent_fresh"] = sample.fresh;
-                  trace_record["intent_requires_fresh_input"] = true;
-                  trace_record["native_rearm_neutralized"] = true;
-                }
-              }
-              if (native_control_trace_) native_control_trace_->enqueue(
-                  {{"stage", "vehicle_input_rearm_received"}, {"session_id", session}, {"vehicle_id", vehicle},
-                   {"command_seq", feedback_seq}, {"control_status_seq", status_seq}, {"intent_seq", feedback.at("intent_seq")}});
-            }
+      const auto requires_rearm = drain_native_control_acknowledgements_locked(
+          session, identity, vehicle, drained_acknowledgements);
+      if (requires_rearm) {
+        // This cycle's payload was built before draining ACKs. Neutralize
+        // it too; retain gear and an already latched ESTOP. A zero
+        // response may be fresh only while the original UI lease is live.
+        if (!command.estop) {
+          command.steering = command.throttle = 0.0;
+          command.operator_active = sample.fresh && command.brake > 0.0;
+          payload["steering"] = 0.0;
+          payload["throttle"] = 0.0;
+          payload["operator_active"] = command.operator_active;
+          payload["intent_fresh"] = sample.fresh;
+          payload["intent_requires_fresh_input"] = true;
+          envelope["payload"] = payload;
+          if (native_control_trace_) {
+            trace_record["steering"] = 0.0;
+            trace_record["throttle"] = 0.0;
+            trace_record["operator_active"] = command.operator_active;
+            trace_record["intent_fresh"] = sample.fresh;
+            trace_record["intent_requires_fresh_input"] = true;
+            trace_record["native_rearm_neutralized"] = true;
           }
-        }
-        control_signaling_last_ack_seq_ =
-            std::max(control_signaling_last_ack_seq_, acknowledged_seq);
-        native_control_last_ack_received_at_utc_ms_.store(
-            acknowledgement_received_at_utc_ms,
-            std::memory_order_relaxed);
-        const auto cloud_received_at_utc_ms = received.message.value(
-            "cloud_received_at_utc_ms",
-            std::int64_t{0});
-        if (cloud_received_at_utc_ms > 0) {
-          native_control_last_ack_cloud_received_at_utc_ms_.store(
-              cloud_received_at_utc_ms,
-              std::memory_order_relaxed);
-        }
-        if (native_control_trace_) {
-          drained_acknowledgements.push_back({
-              {"vehicle_feedback_present", received.message.contains("vehicle_control_feedback")},
-              {"vehicle_feedback_command_seq", received.message.value("vehicle_control_feedback", Json::object()).value("command_seq", std::uint64_t{0})},
-              {"vehicle_feedback_rearm_required", received.message.value("vehicle_control_feedback", Json::object()).value("rearm_required", false)},
-              {"seq", acknowledged_seq},
-              {"ack_advanced", ack_advanced},
-              {"ack_packet_age_ms", ack_advanced ? Json(control_signaling_ack_window_.last_ack_packet_age_ms()) : Json(nullptr)},
-              {"ack_received_at_utc_ms", acknowledgement_received_at_utc_ms},
-              {"ack_received_monotonic_ms", acknowledgement_received_monotonic_ms},
-              {"cloud_received_at_utc_ms", cloud_received_at_utc_ms},
-              {"cloud_queued_at_utc_ms", received.message.value(
-                                                "cloud_queued_at_utc_ms",
-                                                std::int64_t{0})},
-              {"cloud_ingress_processing_ms", received.message.value(
-                                                   "cloud_ingress_processing_ms",
-                                                   std::int64_t{0})},
-              {"delivery_cursor", received.message.value(
-                                      "delivery_cursor",
-                                      std::uint64_t{0})},
-          });
-        }
-        if (ack_advanced) {
-          control_signaling_next_connect_monotonic_ms_ = 0;
-          control_signaling_reconnect_delay_ms_ = 100;
         }
       }
       acknowledgement_drain_completed_monotonic_ms = monotonic_now_ms();
@@ -5279,14 +5338,23 @@ void DriverConsoleRuntime::native_control_sender_loop(std::stop_token stop_token
       std::max(1, static_cast<int>(std::llround(1000.0 / config_.rate_hz))));
   auto next_send = std::chrono::steady_clock::now();
   while (!stop_token.stop_requested()) {
+    bool urgent = false;
+    const auto next_poll = std::min(next_send,
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
     {
       std::unique_lock lock(native_control_wait_mutex_);
-      native_control_cv_.wait_until(lock, next_send, [&] {
+      urgent = native_control_cv_.wait_until(lock, next_poll, [&] {
         return stop_token.stop_requested() ||
             native_control_estop_wakeup_.exchange(false);
       });
     }
     if (stop_token.stop_requested()) break;
+    if (!urgent && std::chrono::steady_clock::now() < next_send) {
+      // Record ACK arrival between sends, without increasing command rate or
+      // including the sender's idle period in recovery ACK age.
+      poll_native_control_acknowledgements();
+      continue;
+    }
     native_control_scheduled_at_monotonic_ms_.store(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             next_send.time_since_epoch())
