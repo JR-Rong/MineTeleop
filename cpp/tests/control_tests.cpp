@@ -1606,13 +1606,22 @@ void test_control_page_contract() {
       response.body.find("srcObject = new MediaStream([track])") != std::string::npos &&
           response.body.find("attach(id,e.track)") != std::string::npos,
       "browser video elements are not isolated to their individual WebRTC tracks");
-  expect(
-      response.body.find("cameraView.configure(remoteCameraIds)") != std::string::npos &&
-          response.body.find("if(peer!==nextPeer||e.track.kind!=='video')return") != std::string::npos &&
-          response.body.find("MineTeleopCameraView.mount(cameraGrid)") != std::string::npos,
-      "camera slots must be declared before tracks and reject callbacks from old peers");
   const auto ontrack_handler = response.body.find("nextPeer.ontrack=e=>");
   const auto remote_description = response.body.find("await nextPeer.setRemoteDescription", ontrack_handler);
+  const auto camera_mount = response.body.find("MineTeleopCameraView.mount(cameraGrid)");
+  const auto start_offer = response.body.find("async function startFromOffer(");
+  const auto camera_configure = response.body.find("cameraView.configure(remoteCameraIds)", start_offer);
+  const auto current_closure = response.body.find(
+      "const current=()=>currentMediaPeer(nextPeer,epoch,sourceSession,sourceGeneration);", start_offer);
+  expect(
+      camera_mount != std::string::npos && start_offer != std::string::npos &&
+          camera_configure != std::string::npos && current_closure != std::string::npos &&
+          ontrack_handler != std::string::npos && remote_description != std::string::npos &&
+          camera_mount < camera_configure && camera_configure < current_closure &&
+          current_closure < ontrack_handler && ontrack_handler < remote_description &&
+          response.body.find("nextPeer.ontrack=e=>{if(!current()||e.track.kind!=='video')return;") != std::string::npos &&
+          response.body.find("function currentMediaPeer(instance,epoch,session,generation){return peer===instance&&mediaPeerEpoch===epoch&&nativeControlSessionId===session&&nativeControlSessionGeneration===generation}") != std::string::npos,
+      "camera slots must precede track delivery, and track callbacks must match peer, epoch, session and generation");
   expect(
       ontrack_handler != std::string::npos &&
           remote_description != std::string::npos &&
@@ -1627,7 +1636,7 @@ void test_control_page_contract() {
   expect(
       response.body.find("if(connectionState==='disconnected')") != std::string::npos &&
           response.body.find("if(['failed','closed'].includes(connectionState))") != std::string::npos &&
-          response.body.find("peer!==nextPeer") != std::string::npos,
+          response.body.find("nextPeer.onconnectionstatechange=()=>{\n    if(!current())return;") != std::string::npos,
       "a transient or stale peer state change can discard a recoverable control DataChannel");
   const auto offer_start = response.body.find("async function startFromOffer");
   const auto offer_authority_reset = response.body.find("resetControlAuthorityInput()", offer_start);
@@ -1639,11 +1648,14 @@ void test_control_page_contract() {
       "a new peer or closed DataChannel can inherit stale VCU authority/input state");
   const auto data_channel_handler = response.body.find("nextPeer.ondatachannel=e=>{");
   const auto data_channel_peer_gate = response.body.find(
-      "if(!controlLogic.isCurrentPeer(peer,nextPeer)){channel.close();return}",
+      "if(!current()){channel.close();return}",
       data_channel_handler);
+  const auto data_channel_parameters_gate = response.body.find(
+      "if(channel.label!=='control'||channel.protocol!=='mine-teleop-control-v1'||channel.ordered||channel.maxRetransmits!==0){",
+      data_channel_peer_gate);
   const auto data_channel_status_reset = response.body.find(
       "lastControlStatusSeq=0;",
-      data_channel_peer_gate);
+      data_channel_parameters_gate);
   const auto data_channel_publish = response.body.find(
       "controlChannel=channel;",
       data_channel_status_reset);
@@ -1652,7 +1664,7 @@ void test_control_page_contract() {
   const auto channel_close_handler = response.body.find("channel.onclose=()=>{", channel_message_handler);
   const auto channel_error_handler = response.body.find("channel.onerror=()=>{", channel_close_handler);
   const std::string channel_identity_gate =
-      "if(!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;";
+      "if(!current()||!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;";
   const auto channel_open_gate = response.body.find(channel_identity_gate, channel_open_handler);
   const auto channel_message_gate = response.body.find(channel_identity_gate, channel_message_handler);
   const auto channel_close_gate = response.body.find(channel_identity_gate, channel_close_handler);
@@ -1660,15 +1672,24 @@ void test_control_page_contract() {
   const auto channel_error_end = response.body.find("};", channel_error_gate);
   expect(
       data_channel_handler != std::string::npos && data_channel_peer_gate != std::string::npos &&
+          data_channel_parameters_gate != std::string::npos &&
           data_channel_status_reset != std::string::npos && data_channel_publish != std::string::npos &&
-          data_channel_peer_gate < data_channel_status_reset &&
+          response.body.find("nextPeer.ondatachannel=e=>{\n    const channel=e.channel;\n    if(!current()){channel.close();return}", data_channel_handler) == data_channel_handler &&
+          data_channel_peer_gate < data_channel_parameters_gate &&
+          data_channel_parameters_gate < data_channel_status_reset &&
           data_channel_status_reset < data_channel_publish,
       "a stale peer can publish a control DataChannel or a new channel can inherit an old status sequence");
   expect(
-      channel_open_gate != std::string::npos && channel_open_gate < channel_message_handler &&
-          channel_message_gate != std::string::npos && channel_message_gate < channel_close_handler &&
-          channel_close_gate != std::string::npos && channel_close_gate < channel_error_handler &&
-          channel_error_gate != std::string::npos,
+      channel_open_handler != std::string::npos && channel_open_gate != std::string::npos &&
+          channel_message_handler != std::string::npos && channel_message_gate != std::string::npos &&
+          channel_close_handler != std::string::npos && channel_close_gate != std::string::npos &&
+          channel_error_handler != std::string::npos && channel_error_gate != std::string::npos &&
+          response.body.find("channel.onopen=()=>{\n      " + channel_identity_gate, channel_open_handler) == channel_open_handler &&
+          response.body.find("channel.onmessage=async event=>{\n      " + channel_identity_gate, channel_message_handler) == channel_message_handler &&
+          response.body.find("channel.onclose=()=>{\n      " + channel_identity_gate, channel_close_handler) == channel_close_handler &&
+          response.body.find("channel.onerror=()=>{\n      " + channel_identity_gate, channel_error_handler) == channel_error_handler &&
+          channel_open_gate < channel_message_handler && channel_message_gate < channel_close_handler &&
+          channel_close_gate < channel_error_handler,
       "control DataChannel lifecycle callbacks do not reject stale peer or channel identities");
   expect(
       response.body.find("controlChannel=null;", channel_close_gate) < channel_error_handler &&

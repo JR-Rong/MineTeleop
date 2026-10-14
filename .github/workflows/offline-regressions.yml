@@ -108,6 +108,7 @@ jobs:
             mine-teleop-clock-fault-tests \
             mine-teleop-native-control-ack-tests \
             mine-teleop-control-recovery-tests \
+            mine-teleop-control-tests \
             mine-teleop-native-control-intent-tests \
             mine-teleop-session-logs-tests
           do
@@ -136,6 +137,12 @@ jobs:
           fixture_dependencies = {
               'mine-teleop-control-recovery-tests': ['configs/vehicle-agent.dev.yaml'],
               'mine-teleop-session-logs-tests': ['configs/vehicle-agent.three-machine.field.yaml'],
+              'mine-teleop-control-tests': [
+                  'configs/driver-console.dev.yaml',
+                  'configs/driver-console.three-machine.dev.yaml',
+                  'configs/vehicle-agent.dev.yaml',
+                  'protocol/v1/control-command.valid.json',
+              ],
           }
           for name, files in fixture_dependencies.items():
               binaries[name]['external_fixture_files'] = files
