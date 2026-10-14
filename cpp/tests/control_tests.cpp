@@ -658,6 +658,7 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
   auto app = std::make_shared<mine_teleop::DriverConsoleHttpApp>(driver);
   std::atomic<bool> delayed_ingress_seen{false};
   std::atomic<bool> response_delay_applied{false};
+  std::atomic<bool> response_delay_completed{false};
   Json response_delay_acceptance;
   mine_teleop::SimpleHttpServer local_server("127.0.0.1", 0, [&](const auto& request) {
     const auto body = request.json_body();
@@ -670,6 +671,7 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
       response_delay_acceptance = Json::parse(response.body);
       response_delay_applied.store(true, std::memory_order_release);
       std::this_thread::sleep_for(std::chrono::milliseconds(body.at("test_response_delay_ms").template get<int>()));
+      response_delay_completed.store(true, std::memory_order_release);
     }
     return response;
   });
@@ -783,9 +785,40 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
         "slow cancelled response serialized a later input refresh");
     std::this_thread::sleep_for(std::chrono::milliseconds(45));
   }
+  // The cancelled handler holds its already-accepted response for220ms.
+  // Four45ms refreshes alone do not prove that the old handler has finished.
+  const auto completion_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!response_delay_completed.load(std::memory_order_acquire) &&
+      std::chrono::steady_clock::now() < completion_deadline) {
+    expect(http.post_json_response(local_base + "/api/control-intent", input).value("accepted", false),
+        "current input refresh failed while waiting for cancelled response completion");
+    std::this_thread::sleep_for(std::chrono::milliseconds(45));
+  }
+  expect(response_delay_completed.load(std::memory_order_acquire),
+      "cancelled response handler did not complete before the bounded assertion");
   native = driver->status().at("native_control");
   expect(native.at("effective_intent_seq") == 3 && native.at("effective_steering") == -0.2 &&
       native.value("intent_fresh", false), "late response completion restored an older operation");
+  // Exercise actual ingress after that completion, including both obsolete
+  // sequence and retired-page identity. Neither request may refresh or rewind
+  // the operation that remains held by the current page.
+  const auto refresh_after_completion = native.at("accepted_refresh_sample_id");
+  auto completed_old_operation = slow_response; completed_old_operation.erase("test_response_delay_ms");
+  const auto old_operation_rejection = http.post_json_response(local_base + "/api/control-intent", completed_old_operation);
+  expect(!old_operation_rejection.value("accepted", true) &&
+      old_operation_rejection.value("reason", "") == "old_intent_seq",
+      "completed cancelled response's old operation was accepted after a newer operation");
+  auto completed_retired_page = delayed_old; completed_retired_page.erase("test_before_handler_delay_ms");
+  const auto retired_page_rejection = http.post_json_response(local_base + "/api/control-intent", completed_retired_page);
+  expect(!retired_page_rejection.value("accepted", true) &&
+      retired_page_rejection.value("reason", "") == "input_page_not_current",
+      "retired page ordinary input was accepted after cancelled response completion");
+  native = driver->status().at("native_control");
+  expect(native.at("effective_intent_seq") == 3 && native.at("effective_steering") == -0.2 &&
+      native.at("effective_throttle") == 0.4 && native.value("intent_fresh", false) &&
+      native.at("owner_ui_instance_id") == "new-http-page" && native.at("ui_control_epoch") == 2 &&
+      native.at("accepted_refresh_sample_id") == refresh_after_completion,
+      "post-completion obsolete input changed current motion, ownership or input freshness");
   const auto sent_before_stall = native.at("commands_sent_total").get<std::uint64_t>();
   std::this_thread::sleep_for(std::chrono::milliseconds(230));
   const auto stalled = driver->status(); native = stalled.at("native_control");

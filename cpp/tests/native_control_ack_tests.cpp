@@ -175,6 +175,9 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
   auto signaling = std::make_shared<mine_teleop::SignalingService>(config);
   std::atomic<int> connections{0}, normal_packets{0}, estop_packets{0};
   std::atomic<bool> stop{false};
+  std::atomic<std::uint64_t> sixth_estop_sequence{0};
+  std::mutex witness_mutex;
+  Json sixth_estop_identity, sixth_estop_ack_identity;
   std::mutex input_mutex;
   Json emergency_input;
   mine_teleop::DriverConsoleRuntime* runtime = nullptr;
@@ -222,7 +225,38 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
                   "full-window emergency packet retained motion");
               // Keep three full-window urgent writes unacknowledged, then
               // cumulatively ACK an exact sent emergency identity.
-              if (count >= 4) connection.send_json(Json::parse(response.body));
+              if (count >= 4) {
+                const auto acknowledgement = Json::parse(response.body);
+                if (count == 6) {
+                  const auto& payload = received.message.at("payload");
+                  const auto command_seq = payload.at("seq").get<std::uint64_t>();
+                  {
+                    std::lock_guard lock(input_mutex);
+                    expect(payload.at("session_id") == emergency_input.at("session_id") &&
+                        payload.at("intent_seq") == emergency_input.at("intent_seq") &&
+                        payload.at("driver_id") == "driver-console-001" &&
+                        payload.at("vehicle_id") == "vehicle-001" && command_seq > 128,
+                        "sixth emergency packet belongs to a different operation or session");
+                  }
+                  expect(acknowledgement.value("event", "") == "signaling_ack" &&
+                      acknowledgement.value("type", "") == "control_command" &&
+                      acknowledgement.at("seq") == command_seq,
+                      "cloud ACK did not identify the exact sixth emergency packet");
+                  {
+                    std::lock_guard lock(witness_mutex);
+                    // Whitelist identity and safety values; never retain or
+                    // print an authentication token from the wire payload.
+                    sixth_estop_identity = {{"seq", command_seq}, {"intent_seq", payload.at("intent_seq")},
+                        {"session_id", payload.at("session_id")}, {"driver_id", payload.at("driver_id")},
+                        {"vehicle_id", payload.at("vehicle_id")}, {"estop", payload.at("estop")},
+                        {"throttle", payload.at("throttle")}, {"steering", payload.at("steering")}};
+                    sixth_estop_ack_identity = {{"event", acknowledgement.at("event")},
+                        {"type", acknowledgement.at("type")}, {"seq", acknowledgement.at("seq")}};
+                  }
+                  sixth_estop_sequence.store(command_seq, std::memory_order_release);
+                }
+                connection.send_json(acknowledgement);
+              }
             }
           }
         } catch (const std::exception& error) {
@@ -251,10 +285,22 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
         {"gear", "D"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 1.0}, {"estop", true}};
   }
   Json native;
+  std::string observed_session;
+  const auto expected_session = connected.at("session_id").get<std::string>();
+  const auto expected_generation = connected.at("control_session_generation").get<std::uint64_t>();
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (std::chrono::steady_clock::now() < deadline) {
-    native = driver.status().at("native_control");
-    if (estop_packets.load() >= 6 && native.value("last_ack_seq", 0U) > 128U) break;
+    // Read a durable peer witness first, then wait for local send accounting
+    // and cumulative ACK progress to cover that exact emergency identity.
+    // A server count observed after an older status snapshot is insufficient.
+    const auto target = sixth_estop_sequence.load(std::memory_order_acquire);
+    const auto status = driver.status();
+    native = status.at("native_control");
+    observed_session = status.value("session_id", "");
+    if (target > 128 && observed_session == expected_session &&
+        native.value("session_generation", 0U) == expected_generation &&
+        native.value("last_seq", 0U) >= target && native.value("last_ack_seq", 0U) >= target &&
+        native.value("commands_sent_total", 0U) >= 134U) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   stop.store(true);
@@ -264,8 +310,22 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
     std::lock_guard lock(error_mutex);
     expect(fixture_error.empty(), "full send-path mock failed: " + fixture_error);
   }
-  expect(normal_packets.load() == 128 && estop_packets.load() >= 6,
+  Json emergency_identity, acknowledgement_identity;
+  {
+    std::lock_guard lock(witness_mutex);
+    emergency_identity = sixth_estop_identity;
+    acknowledgement_identity = sixth_estop_ack_identity;
+  }
+  const auto witnessed_seq = sixth_estop_sequence.load(std::memory_order_acquire);
+  expect(normal_packets.load() == 128 && estop_packets.load() >= 6 && witnessed_seq > 128 &&
+      !emergency_identity.empty() && acknowledgement_identity.value("seq", 0U) == witnessed_seq,
       "fixture did not execute repeated urgent writes at the full capacity boundary: " + native.dump());
+  expect(observed_session == expected_session && native.value("session_generation", 0U) == expected_generation &&
+      native.value("last_seq", 0U) >= witnessed_seq && native.value("last_ack_seq", 0U) >= witnessed_seq &&
+      emergency_identity.at("session_id") == expected_session && emergency_identity.at("intent_seq") == 1 &&
+      emergency_identity.at("estop") == true && emergency_identity.at("throttle") == 0.0 &&
+      emergency_identity.at("steering") == 0.0 && native.value("effective_estop", false),
+      "local accounting/ACK snapshot did not cover the witnessed emergency identity: " + native.dump());
   expect(connections.load() == 1 && native.value("websocket_connected", false) &&
       native.value("send_failures_total", 1U) == 0 && native.value("commands_sent_total", 0U) >= 134U &&
       native.value("last_ack_seq", 0U) > 128U && native.value("unacknowledged_count", 129U) <= 128U &&
