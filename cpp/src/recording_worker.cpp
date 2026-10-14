@@ -151,7 +151,15 @@ class Worker {
       auto* sink = gst_element_factory_make("filesink", nullptr);
       if (!lane->source || !recorder || !sink) throw std::runtime_error("recording pipeline elements missing");
       const auto pattern = (lane->directory / (std::to_string(worker_utc_ms()) + "_" + attempt + "_%05d.mp4.partial")).string();
+      bool sink_finalized = false;
+      const auto finalized_observer = +[](gpointer data, GObject*) { *static_cast<bool*>(data) = true; };
+      const bool sink_was_floating = hooks.emit_file_diagnostics && g_object_is_floating(sink);
+      // Keep a caller-owned reference: splitmuxsink's sink setter consumes a
+      // floating factory reference, so the later caller unref must be separate.
+      gst_object_ref_sink(sink);
+      if (hooks.emit_file_diagnostics) g_object_weak_ref(G_OBJECT(sink), finalized_observer, &sink_finalized);
       g_object_set(recorder, "sink", sink, "location", hooks.disk_full ? "/dev/full" : pattern.c_str(), nullptr);
+      const auto sink_refs_after_property = hooks.emit_file_diagnostics ? GST_OBJECT_REFCOUNT_VALUE(sink) : 0;
       if (hooks.stall_write_ms > 0 || hooks.stall_finalize_ms > 0) {
         auto* pad = gst_element_get_static_pad(sink, "sink");
         gst_pad_add_probe(pad, static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM), +[](GstPad*, GstPadProbeInfo* info, gpointer data) -> GstPadProbeReturn {
@@ -164,7 +172,28 @@ class Worker {
         gst_object_unref(pad);
       }
       gst_object_unref(sink); gst_object_unref(recorder);
-      if (gst_element_set_state(lane->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) throw std::runtime_error("recording pipeline failed to play");
+      if (hooks.emit_file_diagnostics) {
+        if (!sink_finalized) g_object_weak_unref(G_OBJECT(sink), finalized_observer, &sink_finalized);
+        test_diagnostic([&] { return Json{{"event", "provided_sink_ownership"}, {"camera_id", lane->id},
+          {"factory_floating", sink_was_floating}, {"refs_after_property", sink_refs_after_property},
+          {"finalized_after_caller_unref", sink_finalized}}; });
+      }
+      if (gst_element_set_state(lane->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        if (hooks.emit_file_diagnostics) {
+          auto* bus = gst_element_get_bus(lane->pipeline);
+          while (auto* message = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR)) {
+            GError* failure = nullptr; gchar* debug = nullptr;
+            gst_message_parse_error(message, &failure, &debug);
+            test_diagnostic([&] { return Json{{"event", "startup_gst_bus_error"}, {"camera_id", lane->id},
+              {"error", failure ? std::string(failure->message).substr(0, 1024) : ""},
+              {"debug", debug ? std::string(debug).substr(0, 2048) : ""},
+              {"source", GST_OBJECT_NAME(GST_MESSAGE_SRC(message)) ? GST_OBJECT_NAME(GST_MESSAGE_SRC(message)) : ""}}; });
+            if (failure) g_error_free(failure); g_free(debug); gst_message_unref(message);
+          }
+          gst_object_unref(bus);
+        }
+        throw std::runtime_error("recording pipeline failed to play");
+      }
       lanes.push_back(std::move(lane));
     }
     publish("starting", false);
@@ -175,6 +204,22 @@ class Worker {
       {"recording_attempt_id", attempt}, {"status_revision", lane.revision}, {"accepted_access_units", lane.accepted}, {"worker_input_access_units", lane.input},
       {"finalized_segments", lane.finalized}, {"unfinished_segments", lane.pending.size()}, {"final_eos_received", eos},
       {"cleanup_pending", false}, {"summary_persisted", persisted}, {"summary_revision", summary_revision}, {"reported_at_utc_ms", worker_utc_ms()}};
+  }
+  template <typename Build>
+  void test_diagnostic(Build&& build) const noexcept {
+    if (!hooks.emit_file_diagnostics) return;
+    try {
+      auto value = build(); // Synchronous; all JSON allocation stays inside this guard.
+      value["recording_attempt_id"] = attempt;
+      value["reported_at_utc_ms"] = worker_utc_ms();
+      Json cameras = Json::array();
+      for (const auto& lane : lanes) cameras.push_back({{"camera_id", lane->id}, {"input", lane->input},
+        {"accepted", lane->accepted}, {"finalized", lane->finalized}, {"pending", lane->pending},
+        {"ended", lane->ended}, {"bus_eos", lane->bus_eos}});
+      value["cameras"] = std::move(cameras);
+      std::ofstream output(session_root / ("recording-worker-" + attempt + ".diagnostic.jsonl"), std::ios::app);
+      output << value.dump() << '\n';
+    } catch (...) {} // Test evidence must never change the recorder result.
   }
   void publish(const std::string& state, bool eos) {
     ++summary_revision; persisted = false;
@@ -205,6 +250,9 @@ class Worker {
         gst_message_parse_error(message, &error, &debug);
         const bool full = error && error->domain == GST_RESOURCE_ERROR && error->code == GST_RESOURCE_ERROR_NO_SPACE_LEFT;
         const auto text = error ? std::string(error->message) : "recording pipeline error";
+        test_diagnostic([&] { return Json{{"event", "gst_bus_error"}, {"camera_id", lane.id},
+          {"error", text.substr(0, 1024)}, {"debug", debug ? std::string(debug).substr(0, 2048) : ""},
+          {"source", GST_OBJECT_NAME(GST_MESSAGE_SRC(message)) ? GST_OBJECT_NAME(GST_MESSAGE_SRC(message)) : ""}}; });
         if (error) g_error_free(error); g_free(debug); gst_message_unref(message); gst_object_unref(bus);
         issue = full ? "recording_disk_full" : "recording_write_failed";
         throw std::runtime_error(text);
@@ -216,6 +264,7 @@ class Worker {
           const auto* location = gst_structure_get_string(structure, "location");
           if (location && !hooks.disk_full) {
             const std::string name(location);
+            test_diagnostic([&] { return Json{{"event", gst_structure_get_name(structure)}, {"camera_id", lane.id}, {"location", name}}; });
             if (gst_structure_has_name(structure, "splitmuxsink-fragment-opened")) {
               lane.pending.insert(name);
               if (lane.pending.size() > 2) throw std::runtime_error("recording pending fragments exceed bound");
@@ -248,6 +297,9 @@ class Worker {
     if (header.lane >= lanes.size()) throw std::runtime_error("recording packet has unknown camera index");
     auto& lane = *lanes[header.lane];
     if (lane.ended) throw std::runtime_error("recording packet after lane EOS");
+    if (lane.input == 0) test_diagnostic([&] { return Json{{"event", "first_access_unit"}, {"camera_id", lane.id},
+      {"pts", header.pts}, {"dts", header.dts}, {"duration", header.duration}, {"flags", header.buffer_flags},
+      {"segment_start", header.start}, {"segment_time", header.time}, {"segment_base", header.base}}; });
     if (!std::isfinite(header.rate) || header.rate <= 0 || !std::isfinite(header.applied_rate) || header.applied_rate <= 0)
       throw std::runtime_error("invalid recording timestamp segment");
     GstSegment segment; gst_segment_init(&segment, GST_FORMAT_TIME);
@@ -271,6 +323,7 @@ class Worker {
   bool end(const RecordingWireHeader& header) {
     if (header.lane >= lanes.size()) throw std::runtime_error("recording EOS unknown camera index");
     auto& lane = *lanes[header.lane];
+    test_diagnostic([&] { return Json{{"event", "lane_end_received"}, {"camera_id", lane.id}, {"expected_access_units", header.pts}}; });
     if (lane.ended || lane.input != header.pts || lane.input == 0) throw std::runtime_error("recording EOS does not cover every accepted AU");
     lane.accepted = header.pts; lane.ended = true;
     if (gst_app_src_end_of_stream(GST_APP_SRC(lane.source)) != GST_FLOW_OK) throw std::runtime_error("recording appsrc EOS failed");
@@ -285,9 +338,11 @@ class Worker {
     }
     for (const auto& item : lanes) if (item->finalized == 0 || !item->pending.empty()) throw std::runtime_error("recording EOS lacks closed-fragment evidence");
     publish("finalized", true);
+    test_diagnostic([&] { return Json{{"event", "worker_finalized"}}; });
     return true;
   }
   void failed(const std::string& error) noexcept {
+    test_diagnostic([&] { return Json{{"event", "worker_failed"}, {"error", error.substr(0, 2048)}, {"issue_code", issue}}; });
     incomplete = true; if (issue.empty()) issue = "recording_worker_failed";
     try { publish("failed", false); }
     catch (const std::exception&) {
@@ -314,11 +369,20 @@ int run_recording_worker(int input_fd, int status_fd, RecordingWorkerTestHooks h
       ::fcntl(status_fd, F_SETFL, ::fcntl(status_fd, F_GETFL) | O_NONBLOCK) < 0) return 2;
   std::unique_ptr<Worker> worker;
   std::string attempt;
+  std::filesystem::path test_trace;
   try {
     const auto start = read_header(input_fd);
     if (start.type != RecordingPacketType::Start) throw std::runtime_error("recording worker requires startup packet");
     const auto config = Json::parse(read_payload(input_fd, start.bytes, detail::kRecordingConfigByteLimit));
     attempt = config.at("recording_attempt_id").get<std::string>();
+    if (hooks.emit_file_diagnostics) {
+      const auto vehicle = config.at("vehicle_id").get<std::string>();
+      const auto session = config.at("session_id").get<std::string>();
+      validate_component(vehicle); validate_component(session); validate_component(attempt);
+      const auto directory = std::filesystem::path(config.at("root").get<std::string>()) / vehicle / session;
+      std::filesystem::create_directories(directory);
+      test_trace = directory / ("recording-worker-" + attempt + ".diagnostic.jsonl");
+    }
     gst_init(nullptr, nullptr);
     worker = std::make_unique<Worker>(config, status_fd, hooks);
     while (true) {
@@ -330,6 +394,11 @@ int run_recording_worker(int input_fd, int status_fd, RecordingWorkerTestHooks h
   } catch (const std::exception& error) {
     if (worker) worker->failed(error.what());
     else if (!attempt.empty()) {
+      if (!test_trace.empty()) {
+        try { std::ofstream output(test_trace, std::ios::app); output << Json({{"event", "worker_start_failed"},
+          {"recording_attempt_id", attempt}, {"error", std::string(error.what()).substr(0, 2048)}}).dump() << '\n'; }
+        catch (...) {}
+      }
       try { send_status(status_fd, {{"recording_attempt_id", attempt}, {"state", "failed"}, {"incomplete", true}, {"summary_persisted", false}, {"issue_code", "recording_start_failed"}, {"error", std::string(error.what()).substr(0,256)}, {"reported_at_utc_ms", worker_utc_ms()}}, std::chrono::steady_clock::now() + std::chrono::milliseconds(500)); }
       catch (...) {}
     }

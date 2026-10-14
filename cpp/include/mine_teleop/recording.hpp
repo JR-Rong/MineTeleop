@@ -57,6 +57,7 @@ struct RecordingWorkerTestHooks {
   int stall_finalize_ms{0};
   bool disk_full{false};
   std::uint64_t exit_after_access_units{0};
+  bool emit_file_diagnostics{false};
 };
 int run_recording_worker(int input_fd, int status_fd, RecordingWorkerTestHooks hooks = {});
 
