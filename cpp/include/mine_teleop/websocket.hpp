@@ -29,6 +29,9 @@ struct WebSocketReceiveResult {
   std::int64_t receive_wait_ms{0};
   std::int64_t frame_assembly_ms{0};
   std::int64_t json_parse_ms{0};
+  // Byte counts and local steady-clock observations only; never frame content.
+  // Application read completion is not a kernel/network arrival timestamp.
+  Json read_diagnostics = Json::object();
 };
 
 [[nodiscard]] std::string websocket_accept_key(std::string_view client_key);
@@ -75,6 +78,7 @@ class WebSocketClient {
   [[nodiscard]] std::string response_header(std::string_view name) const;
   void send_json(const Json& value);
   void send_json(const Json& value, std::chrono::milliseconds timeout);
+  void enable_read_diagnostics(bool enabled = true);
   [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout);
   // null means the rate limit skipped this sample; unsupported counters stay absent.
   [[nodiscard]] Json transport_diagnostics(std::chrono::milliseconds minimum_interval = {});
@@ -86,6 +90,7 @@ class WebSocketClient {
   std::unique_ptr<Impl> impl_;
   std::chrono::milliseconds timeout_;
   std::string url_;
+  bool read_diagnostics_enabled_{false};
 };
 
 }  // namespace mine_teleop

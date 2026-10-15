@@ -32,6 +32,7 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -350,7 +351,8 @@ void random_bytes(unsigned char* output, std::size_t size) {
 #endif
 }
 
-bool wait_socket(SocketHandle socket, short events, std::chrono::milliseconds timeout) {
+bool wait_socket(SocketHandle socket, short events, std::chrono::milliseconds timeout,
+    std::uint64_t* interrupted_count = nullptr) {
 #if defined(_WIN32)
   WSAPOLLFD descriptor{native_socket(socket), events, 0};
 #else
@@ -369,6 +371,7 @@ bool wait_socket(SocketHandle socket, short events, std::chrono::milliseconds ti
     if (!socket_error_interrupted(error)) {
       throw std::runtime_error("poll failed: " + socket_error_message(error));
     }
+    if (interrupted_count) ++*interrupted_count;
   }
 }
 
@@ -621,6 +624,10 @@ WebSocketReceiveResult ServerWebSocketConnection::receive_json(std::chrono::mill
 }
 
 struct WebSocketClient::Impl {
+  struct ReadSpan {
+    std::uint64_t begin, end;
+    std::int64_t started_ms, completed_ms;
+  };
   CURL* curl{nullptr};
   curl_slist* resolve_entries{nullptr};
   std::filesystem::path ca_bundle;
@@ -629,10 +636,66 @@ struct WebSocketClient::Impl {
   std::unordered_map<std::string, std::string> handshake_headers;
   std::int64_t last_transport_sample_monotonic_ms{0};
   std::uint64_t partial_frame_polls{0};
+  std::uint64_t received_bytes{0}, consumed_bytes{0}, receive_calls{0}, receive_again{0}, idle_timeouts{0};
+  std::uint64_t read_poll_calls{0};
+  std::uint64_t read_poll_interrupted{0};
+  bool read_diagnostics_enabled{false};
+  std::int64_t read_poll_wait_ms{0}, longest_receive_call_ms{0}, longest_read_poll_ms{0};
+  std::deque<ReadSpan> read_spans;
   const std::int64_t connection_started_monotonic_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
   std::size_t max_message_bytes{8 * 1024 * 1024};
   bool peer_closed{false};
+
+  static std::int64_t steady_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  Json read_snapshot() const {
+    Json result = {{"timestamp_scope", "application_decrypted_read_completion"},
+        {"connection_started_monotonic_ms", connection_started_monotonic_ms},
+        {"buffered_receive_bytes", buffered.size()}, {"received_bytes_total", received_bytes},
+        {"consumed_bytes_total", consumed_bytes}, {"curl_receive_calls_total", receive_calls},
+        {"curl_again_total", receive_again}, {"idle_timeouts_total", idle_timeouts},
+        {"partial_frame_polls_total", partial_frame_polls}, {"read_poll_calls_total", read_poll_calls},
+        {"read_poll_interrupted_total", read_poll_interrupted},
+        {"read_poll_wait_ms_total", read_poll_wait_ms}, {"longest_curl_receive_call_ms", longest_receive_call_ms},
+        {"longest_read_poll_ms", longest_read_poll_ms}};
+    if (!read_spans.empty()) {
+      result["buffer_head_first_observed_monotonic_ms"] = read_spans.front().begin <= consumed_bytes
+          ? Json(read_spans.front().completed_ms) : Json(nullptr);
+      result["last_read_completed_monotonic_ms"] = read_spans.back().completed_ms;
+    }
+    return result;
+  }
+
+  Json frame_snapshot(std::size_t frame_bytes) const {
+    auto result = read_snapshot();
+    result["frame_stream_begin"] = consumed_bytes;
+    result["frame_bytes"] = frame_bytes;
+    const auto end = consumed_bytes + frame_bytes;
+    const ReadSpan* first = nullptr;
+    const ReadSpan* last = nullptr;
+    for (const auto& span : read_spans) {
+      if (span.begin <= consumed_bytes && consumed_bytes < span.end) first = &span;
+      if (span.begin < end && end <= span.end) last = &span;
+    }
+    result["frame_read_timing_complete"] = first != nullptr && last != nullptr;
+    if (first && last) {
+      result["frame_first_read_started_monotonic_ms"] = first->started_ms;
+      result["frame_first_observed_monotonic_ms"] = first->completed_ms;
+      result["frame_last_observed_monotonic_ms"] = last->completed_ms;
+      result["frame_observed_span_ms"] = std::max<std::int64_t>(0, last->completed_ms - first->completed_ms);
+    }
+    return result;
+  }
+
+  void consume(std::size_t size) {
+    buffered.erase(0, size);
+    consumed_bytes += size;
+    while (!read_spans.empty() && read_spans.front().end <= consumed_bytes) read_spans.pop_front();
+  }
 
   Impl(const std::vector<std::string>& entries, std::filesystem::path next_ca_bundle)
       : ca_bundle(std::move(next_ca_bundle)) {
@@ -683,23 +746,46 @@ struct WebSocketClient::Impl {
     while (true) {
       std::array<char, 16 * 1024> buffer{};
       std::size_t received = 0;
+      const auto read_started_ms = read_diagnostics_enabled ? steady_ms() : 0;
+      if (read_diagnostics_enabled) ++receive_calls;
       const auto result = curl_easy_recv(curl, buffer.data(), buffer.size(), &received);
+      const auto read_completed_ms = read_diagnostics_enabled ? steady_ms() : 0;
+      if (read_diagnostics_enabled)
+        longest_receive_call_ms = std::max(longest_receive_call_ms, read_completed_ms - read_started_ms);
       if (result == CURLE_OK) {
         if (received == 0) {
           peer_closed = true;
           return false;
         }
         buffered.append(buffer.data(), received);
+        const auto span_begin = received_bytes;
+        received_bytes += received;
+        if (read_diagnostics_enabled) {
+          try { read_spans.push_back({span_begin, received_bytes, read_started_ms, read_completed_ms}); }
+          catch (...) { read_spans.clear(); }
+        }
+        // A malicious byte-at-a-time peer must not grow diagnostic storage.
+        // Lost timing coverage is explicit; protocol bytes remain untouched.
+        if (read_spans.size() > 128) read_spans.pop_front();
         return true;
       }
       if (result != CURLE_AGAIN) throw std::runtime_error(std::string("websocket receive failed: ") + curl_easy_strerror(result));
+      if (read_diagnostics_enabled) ++receive_again;
       const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline || !wait_socket(
+      if (now >= deadline) return false;
+      const auto poll_started_ms = read_diagnostics_enabled ? steady_ms() : 0;
+      if (read_diagnostics_enabled) ++read_poll_calls;
+      const auto ready = wait_socket(
               static_cast<SocketHandle>(socket),
               kPollRead,
-              std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now))) {
-        return false;
+              std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now),
+              read_diagnostics_enabled ? &read_poll_interrupted : nullptr);
+      if (read_diagnostics_enabled) {
+        const auto poll_ms = steady_ms() - poll_started_ms;
+        read_poll_wait_ms += poll_ms;
+        longest_read_poll_ms = std::max(longest_read_poll_ms, poll_ms);
       }
+      if (!ready) return false;
     }
   }
 
@@ -782,6 +868,7 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
   const auto authority = port.empty() ? authority_host : authority_host + ":" + port;
 
   impl_ = std::make_unique<Impl>(resolve_entries_, ca_bundle_);
+  impl_->read_diagnostics_enabled = read_diagnostics_enabled_;
   impl_->curl = curl_easy_init();
   if (impl_->curl == nullptr) throw std::runtime_error("curl_easy_init failed");
   curl_easy_setopt(impl_->curl, CURLOPT_URL, transport_url.c_str());
@@ -858,7 +945,7 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
   }
   const auto end = impl_->buffered.find("\r\n\r\n") + 4;
   const auto response = impl_->buffered.substr(0, end);
-  impl_->buffered.erase(0, end);
+  impl_->consume(end);
   const auto line_end = response.find("\r\n");
   if (line_end == std::string::npos || response.substr(0, line_end).find(" 101 ") == std::string::npos) {
     const auto status_line = response.substr(0, line_end);
@@ -910,8 +997,14 @@ void WebSocketClient::send_json(const Json& value, std::chrono::milliseconds tim
   impl_->send_frame(0x1, value.dump(), timeout);
 }
 
+void WebSocketClient::enable_read_diagnostics(bool enabled) {
+  read_diagnostics_enabled_ = enabled;
+  if (impl_) impl_->read_diagnostics_enabled = enabled;
+}
+
 WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds timeout) {
   if (!connected()) throw std::runtime_error("websocket is not connected");
+  const auto receive_started_ms = Impl::steady_ms();
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   const auto incomplete = [&]() -> WebSocketReceiveResult {
     if (impl_->peer_closed) {
@@ -919,9 +1012,18 @@ WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds t
       return {WebSocketReceiveStatus::Closed, Json::object()};
     }
     if (!impl_->buffered.empty()) ++impl_->partial_frame_polls;
+    if (impl_->read_diagnostics_enabled) ++impl_->idle_timeouts;
     // TCP/TLS may split any header or payload. Retain every byte for the next
     // poll; a short/zero idle deadline says nothing about protocol validity.
-    return {WebSocketReceiveStatus::Timeout, Json::object()};
+    WebSocketReceiveResult result{WebSocketReceiveStatus::Timeout, Json::object()};
+    if (impl_->read_diagnostics_enabled) {
+      try {
+        result.read_diagnostics = impl_->read_snapshot();
+        result.read_diagnostics["receive_started_monotonic_ms"] = receive_started_ms;
+        result.read_diagnostics["receive_completed_monotonic_ms"] = Impl::steady_ms();
+      } catch (...) { result.read_diagnostics = nullptr; }
+    }
+    return result;
   };
   while (true) {
     if (!impl_->ensure_bytes(2, deadline)) {
@@ -963,8 +1065,14 @@ WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds t
     if (!impl_->ensure_bytes(header_size + static_cast<std::size_t>(length), deadline)) {
       return incomplete();
     }
+    const auto frame_bytes = header_size + static_cast<std::size_t>(length);
+    Json read_diagnostics = nullptr;
+    if (impl_->read_diagnostics_enabled) {
+      try { read_diagnostics = impl_->frame_snapshot(frame_bytes); }
+      catch (...) { /* Missing diagnostic coverage must not discard protocol bytes. */ }
+    }
     const auto payload = impl_->buffered.substr(header_size, static_cast<std::size_t>(length));
-    impl_->buffered.erase(0, header_size + static_cast<std::size_t>(length));
+    impl_->consume(frame_bytes);
     if (opcode == 0x8) {
       try {
         validate_websocket_close_payload(payload);
@@ -982,9 +1090,20 @@ WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds t
     if (!final) throw std::runtime_error("fragmented websocket messages are not supported");
     if (opcode != 0x1) throw std::runtime_error("only text websocket frames are supported");
     try {
+      const auto parse_started_ms = impl_->read_diagnostics_enabled ? Impl::steady_ms() : 0;
       auto value = Json::parse(payload);
       if (!value.is_object()) throw std::runtime_error("websocket message must be a JSON object");
-      return {WebSocketReceiveStatus::Message, std::move(value)};
+      WebSocketReceiveResult result{WebSocketReceiveStatus::Message, std::move(value)};
+      if (impl_->read_diagnostics_enabled && read_diagnostics.is_object()) try {
+        result.json_parse_ms = Impl::steady_ms() - parse_started_ms;
+        if (read_diagnostics.value("frame_read_timing_complete", false))
+          read_diagnostics["frame_last_observed_to_parse_ms"] = std::max<std::int64_t>(
+              0, parse_started_ms - read_diagnostics.at("frame_last_observed_monotonic_ms").get<std::int64_t>());
+        read_diagnostics["receive_started_monotonic_ms"] = receive_started_ms;
+        read_diagnostics["receive_completed_monotonic_ms"] = Impl::steady_ms();
+      } catch (...) { read_diagnostics = nullptr; }
+      result.read_diagnostics = std::move(read_diagnostics);
+      return result;
     } catch (const Json::exception& error) {
       throw std::runtime_error(std::string("invalid websocket JSON: ") + error.what());
     }

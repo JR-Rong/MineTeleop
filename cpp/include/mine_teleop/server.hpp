@@ -280,6 +280,7 @@ class SignalingService {
 
   SignalingServerConfig config_;
   std::string service_instance_id_;
+  std::string diagnostic_fingerprint_key_;
   std::function<std::int64_t()> audit_clock_;
   mutable std::mutex mutex_;
   mutable std::mutex audit_log_mutex_;
@@ -581,5 +582,7 @@ class DriverConsoleHttpApp {
 };
 
 std::string random_token(std::size_t bytes = 24);
+// A pseudonymous diagnostic join key; never used to grant authority.
+std::string diagnostic_fingerprint(std::string_view value, std::string_view key);
 
 }  // namespace mine_teleop

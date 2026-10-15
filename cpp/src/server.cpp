@@ -46,7 +46,7 @@
 namespace mine_teleop {
 
 enum class ControlObservationPhase { Idle, Sample, Connect, AckDrain, Send, Failure,
-  LoopMutex, LoopCheck, DeliverySend, Receive, IngressMutex, IngressCheck, IngressAck, DeliveryAck };
+  LoopMutex, LoopCheck, DeliverySend, Receive, IngressMutex, IngressCheck, IngressAck, DeliveryAck, TransportSample };
 
 class ControlConnectionObservation {
  public:
@@ -72,7 +72,7 @@ class ControlConnectionObservation {
     const auto epoch = epoch_.load(std::memory_order_acquire);
     static constexpr std::array names{"idle", "sample", "connect", "ack_drain", "send", "failure_handling",
         "loop_mutex_wait", "loop_authority_check", "vehicle_delivery_send", "receive_frame",
-        "ingress_mutex_wait", "ingress_authority_check", "ingress_ack_send", "vehicle_ack_send"};
+        "ingress_mutex_wait", "ingress_authority_check", "ingress_ack_send", "vehicle_ack_send", "transport_sample"};
     const auto phase = phase_.load();
     const auto phase_started = phase_started_.load();
     const auto seq = seq_.load();
@@ -2149,6 +2149,23 @@ std::string random_token(std::size_t bytes) {
   return output.str();
 }
 
+std::string diagnostic_fingerprint(std::string_view value, std::string_view key) {
+  if (key.empty() || key.size() > 4096) throw std::invalid_argument("diagnostic fingerprint key is invalid");
+  std::array<unsigned char, 32> digest{};
+#if defined(__APPLE__)
+  CCHmac(kCCHmacAlgSHA256, key.data(), key.size(), value.data(), value.size(), digest.data());
+#else
+  unsigned int length = 0;
+  if (!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
+          reinterpret_cast<const unsigned char*>(value.data()), value.size(), digest.data(), &length) || length != digest.size())
+    throw std::runtime_error("diagnostic fingerprint failed");
+#endif
+  std::ostringstream output;
+  output << std::hex << std::setfill('0');
+  for (std::size_t index = 0; index < 16; ++index) output << std::setw(2) << static_cast<int>(digest[index]);
+  return output.str();
+}
+
 Json SignalingService::Session::to_json(bool include_control_token) const {
   Json value = {
       {"session_id", session_id},
@@ -2186,6 +2203,7 @@ SignalingService::SignalingService(
     std::function<std::int64_t()> audit_clock)
     : config_(std::move(config)),
       service_instance_id_("service-" + random_token(12)),
+      diagnostic_fingerprint_key_(random_token()),
       audit_clock_(std::move(audit_clock)) {
   if (config_.mobile_approval_timeout_ms <= 0 || config_.mobile_approval_timeout_ms > 600000) {
     throw std::invalid_argument("mobile approval timeout must be between 1 and 600000 ms");
@@ -3241,6 +3259,20 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
             if (delivered.value("type", "") == "control_command")
               last_control_seq_sent = std::max(last_control_seq_sent, delivered.value("seq", std::uint64_t{0}));
           }
+          const auto diagnostic_transport = [&] {
+            auto sample = connection.transport_diagnostics();
+            sample["peer_is_loopback"] = sample.contains("peer_address")
+                ? Json(is_loopback_bind_address(sample.at("peer_address").get<std::string>())) : Json(nullptr);
+            sample.erase("peer_address");
+            return sample;
+          };
+          if (trace_delivery) {
+            observe_phase(ControlObservationPhase::TransportSample, last_control_seq_sent);
+            const auto sample_started_ms = monotonic_now_ms();
+            try { delivery_trace["transport_before_send"] = diagnostic_transport(); }
+            catch (...) { delivery_trace["transport_before_send_unavailable"] = true; }
+            delivery_trace["transport_before_send_sample_ms"] = monotonic_now_ms() - sample_started_ms;
+          }
           const auto send_started_at_utc_ms = now_ms();
           const auto send_started_monotonic_ms = monotonic_now_ms();
           try {
@@ -3284,6 +3316,11 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
                 std::max<std::int64_t>(
                     0,
                     send_completed_monotonic_ms - send_started_monotonic_ms);
+            observe_phase(ControlObservationPhase::TransportSample, last_control_seq_sent);
+            const auto sample_started_ms = monotonic_now_ms();
+            try { delivery_trace["transport_after_send"] = diagnostic_transport(); }
+            catch (...) { delivery_trace["transport_after_send_unavailable"] = true; }
+            delivery_trace["transport_after_send_sample_ms"] = monotonic_now_ms() - sample_started_ms;
             native_control_trace_->enqueue(std::move(delivery_trace));
           }
           last_delivery_cursor_sent = std::max(last_delivery_cursor_sent, delivery_cursor);
@@ -4123,7 +4160,31 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
     const auto capabilities = optional_string(value, "native_control_capabilities");
     if (capabilities.size() > 128) throw std::invalid_argument("vehicle control capability declaration is too long");
     const auto timestamp_ms = now_ms();
+    const auto registration_started_monotonic_ms = monotonic_now_ms();
     const auto current = online_vehicles_.find(vehicle_id);
+    std::string connection_fingerprint, previous_fingerprint, source_fingerprint;
+    try {
+      connection_fingerprint = diagnostic_fingerprint("connection:" + connection_id, diagnostic_fingerprint_key_);
+      if (current != online_vehicles_.end())
+        previous_fingerprint = diagnostic_fingerprint("connection:" + current->second.connection_id, diagnostic_fingerprint_key_);
+      source_fingerprint = diagnostic_fingerprint("source:" + request_source(request), diagnostic_fingerprint_key_);
+    } catch (...) { /* Diagnostic allocation/crypto failure cannot reject registration. */ }
+    const auto previous_generation = current == online_vehicles_.end() ? std::uint64_t{0} : current->second.generation;
+    const auto registration_diagnostic = [&](std::uint64_t generation, std::string_view policy) {
+      try {
+        if (!native_control_trace_) return;
+        // The service mutex is held: use the existing bounded, nonblocking
+        // trace queue. Diagnostic disk failures must not change admission.
+        native_control_trace_->enqueue({{"stage", "vehicle_registration_observed"}, {"vehicle_id", vehicle_id},
+          {"registration_request_id", active_request_id},
+          {"connection_fingerprint", connection_fingerprint}, {"previous_connection_fingerprint", previous_fingerprint},
+          {"source_fingerprint", source_fingerprint}, {"previous_connection_generation", previous_generation},
+          {"connection_generation", generation}, {"duplicate_policy", policy},
+          {"registration_observed_monotonic_ms", registration_started_monotonic_ms},
+          {"registration_completed_monotonic_ms", monotonic_now_ms()},
+          {"native_control_capabilities", capabilities}});
+      } catch (...) { /* Diagnostics are best effort. */ }
+    };
     if (current != online_vehicles_.end() && current->second.connection_id == connection_id) {
       const bool capabilities_changed = current->second.native_control_capabilities != capabilities;
       if (capabilities_changed) {
@@ -4137,11 +4198,15 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
             {"connection_generation", current->second.generation}, {"native_control_capabilities", capabilities}});
       }
       current->second.last_seen_at_ms = timestamp_ms;
+      registration_diagnostic(current->second.generation,
+          capabilities_changed ? "capabilities_changed_new_generation" : "same_connection_refresh");
       return ServerResponse::json(
           200,
           {{"vehicle_id", vehicle_id},
            {"state", "online"},
            {"connection_generation", current->second.generation},
+           {"registration_request_id", active_request_id},
+           {"connection_fingerprint", connection_fingerprint},
            {"native_control_capabilities", current->second.native_control_capabilities},
            {"duplicate_policy", capabilities_changed ? "capabilities_changed_new_generation" : "same_connection_refresh"}});
     }
@@ -4155,11 +4220,14 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
     const auto generation = ++connection_generation_;
     online_vehicles_[vehicle_id] = ConnectionPresence{connection_id, generation, timestamp_ms, timestamp_ms, capabilities};
     audit("vehicle_online", {{"vehicle_id", vehicle_id}, {"connection_generation", generation}});
+    registration_diagnostic(generation, replacing ? "replace_previous_connection" : "new_connection");
     return ServerResponse::json(
         200,
         {{"vehicle_id", vehicle_id},
          {"state", "online"},
          {"connection_generation", generation},
+         {"registration_request_id", active_request_id},
+         {"connection_fingerprint", connection_fingerprint},
          {"native_control_capabilities", capabilities},
          {"duplicate_policy", replacing ? "replace_previous_connection" : "new_connection"}});
   }

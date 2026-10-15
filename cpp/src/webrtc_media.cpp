@@ -35,6 +35,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 namespace mine_teleop {
 
@@ -356,6 +357,8 @@ class MediaSignalingClient {
   }
 
   void register_online() {
+    const auto started_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
     const auto response = http_.post_json_response(
         origin_ + "/vehicles/online",
         {{"vehicle_id", vehicle_id_},
@@ -363,7 +366,36 @@ class MediaSignalingClient {
          {"connection_id", connection_id_},
          {"native_control_capabilities", kNativeControlCapabilities}});
     connection_generation_ = response.at("connection_generation").get<std::uint64_t>();
+    // No I/O here; the owner emits this through its bounded trace worker.
+    const auto receipt_field = [&](std::string_view field) -> std::string {
+      const auto found = response.find(std::string(field));
+      if (found == response.end() || !found->is_string()) return {};
+      const auto value = found->get<std::string>();
+      const auto hex = [](std::string_view text) {
+        return std::all_of(text.begin(), text.end(), [](char character) {
+          return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
+        });
+      };
+      if (field == "connection_fingerprint") return value.size() == 32 && hex(value) ? value : std::string{};
+      if (field == "registration_request_id") return value.starts_with("request-") && value.size() == 32 &&
+          hex(std::string_view(value).substr(8)) ? value : std::string{};
+      return value == "same_connection_refresh" || value == "capabilities_changed_new_generation" ||
+          value == "replace_previous_connection" || value == "new_connection" ? value : std::string{};
+    };
+    try { registration_diagnostics_ = Json({{"stage", "vehicle_registration_completed"},
+        {"vehicle_id", vehicle_id_}, {"process_id", ::getpid()},
+        {"media_client_instance_id", runtime_instance_id_}, {"media_client_created_monotonic_ms", runtime_started_ms_},
+        {"registration_started_monotonic_ms", started_ms},
+        {"registration_completed_monotonic_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()},
+        {"registration_request_id", receipt_field("registration_request_id")},
+        {"connection_fingerprint", receipt_field("connection_fingerprint")},
+        {"connection_generation", connection_generation_},
+        {"duplicate_policy", receipt_field("duplicate_policy")}});
+    } catch (...) { registration_diagnostics_ = Json::object(); }
   }
+
+  [[nodiscard]] const Json& registration_diagnostics() const { return registration_diagnostics_; }
 
   TimeSyncStatus synchronize_time(int sample_count, int max_uncertainty_ms) {
     return clock_.synchronize(time_sync_http_, origin_, sample_count, max_uncertainty_ms);
@@ -472,6 +504,10 @@ class MediaSignalingClient {
   std::string device_token_;
   std::string connection_id_;
   std::uint64_t connection_generation_{0};
+  Json registration_diagnostics_ = Json::object();
+  const std::string runtime_instance_id_{"runtime-" + random_token(12)};
+  const std::int64_t runtime_started_ms_{std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count()};
   HttpClient http_;
   HttpClient time_sync_http_;
   SynchronizedClock clock_;
@@ -2224,7 +2260,7 @@ struct VehicleMediaRuntime::Impl {
     const auto ack_send_completed_monotonic_ms = steady_now_ms();
     if (config.runtime.control_log_commands) {
       try {
-        enqueue_control_trace({
+        Json acknowledgement_trace = {
             {"stage", "delivery_ack_sent"},
             {"vehicle_feedback_present", !native_feedback.empty()},
             {"vehicle_feedback_rearm_required", native_feedback.value("rearm_required", false)},
@@ -2244,7 +2280,15 @@ struct VehicleMediaRuntime::Impl {
                                                     0,
                                                     ack_send_completed_monotonic_ms -
                                                         ack_send_started_monotonic_ms)},
-        });
+        };
+        try {
+          auto transport = websocket.transport_diagnostics();
+          transport["peer_is_loopback"] = transport.contains("peer_address")
+              ? Json(is_loopback_bind_address(transport.at("peer_address").get<std::string>())) : Json(nullptr);
+          transport.erase("peer_address");
+          acknowledgement_trace["transport_after_ack_send"] = std::move(transport);
+        } catch (...) { acknowledgement_trace["transport_sample_unavailable"] = true; }
+        enqueue_control_trace(std::move(acknowledgement_trace));
       } catch (...) {
         note_control_trace_drop();
       }
@@ -2286,6 +2330,7 @@ struct VehicleMediaRuntime::Impl {
             kNativeControlWebSocketConnectTimeout,
             config.cloud.resolve_entries,
             config.cloud.ca_bundle);
+        websocket.enable_read_diagnostics(config.runtime.control_log_commands);
         websocket.connect(
             signaling.native_control_websocket_url(),
             signaling.native_control_websocket_headers());
@@ -2306,20 +2351,51 @@ struct VehicleMediaRuntime::Impl {
             signaling.now_ms(),
             std::memory_order_relaxed);
         std::int64_t previous_receive_completed_ms = steady_now_ms();
+        std::int64_t next_idle_diagnostic_ms = 0;
         while (!stop_token.stop_requested() && !stop_requested.load()) {
           const auto receive_started_ms = steady_now_ms();
           const auto received = websocket.receive_json(
               kNativeControlWebSocketReceiveTimeout);
           const auto receive_completed_ms = steady_now_ms();
           if (config.runtime.control_log_commands &&
-              (received.status == WebSocketReceiveStatus::Message || receive_started_ms - previous_receive_completed_ms >= 100)) {
-            enqueue_control_trace({{"stage", "websocket_receive_loop"}, {"session_id", signaling.session_id()},
+              (received.status == WebSocketReceiveStatus::Message || receive_completed_ms >= next_idle_diagnostic_ms ||
+               receive_started_ms - previous_receive_completed_ms >= 100)) {
+            try {
+            Json trace = {{"stage", "websocket_receive_loop"}, {"session_id", signaling.session_id()},
                                    {"vehicle_id", config.vehicle_id},
+                                   {"connection_number", connections},
+                                   {"websocket_request_id", websocket.response_header("x-request-id").substr(0, 128)},
                                    {"receive_started_monotonic_ms", receive_started_ms},
                                    {"receive_completed_monotonic_ms", receive_completed_ms},
                                    {"between_receive_calls_ms", std::max<std::int64_t>(0, receive_started_ms - previous_receive_completed_ms)},
                                    {"receive_wait_ms", receive_completed_ms - receive_started_ms},
-                                   {"message_received", received.status == WebSocketReceiveStatus::Message}});
+                                   {"json_parse_ms", received.json_parse_ms},
+                                   {"read_diagnostics", received.read_diagnostics},
+                                   {"message_received", received.status == WebSocketReceiveStatus::Message}};
+            try {
+              const auto& envelope = received.message;
+              if (envelope.is_object() && envelope.contains("delivery_cursor") && envelope.at("delivery_cursor").is_number_unsigned())
+                trace["delivery_cursor"] = envelope.at("delivery_cursor");
+              if (envelope.is_object() && envelope.contains("messages") && envelope.at("messages").is_array() &&
+                  !envelope.at("messages").empty()) {
+                const auto& message = envelope.at("messages").front();
+                trace["envelope_message_count"] = envelope.at("messages").size();
+                if (message.is_object() && message.contains("payload") && message.at("payload").is_object()) {
+                  const auto& payload = message.at("payload");
+                  if (payload.contains("seq") && payload.at("seq").is_number_unsigned()) trace["first_message_seq"] = payload.at("seq");
+                }
+              }
+              auto transport = websocket.transport_diagnostics(std::chrono::seconds(1));
+              if (!transport.is_null()) {
+                transport["peer_is_loopback"] = transport.contains("peer_address")
+                    ? Json(is_loopback_bind_address(transport.at("peer_address").get<std::string>())) : Json(nullptr);
+                transport.erase("peer_address");
+                trace["transport"] = std::move(transport);
+              }
+            } catch (...) { trace["transport_sample_unavailable"] = true; }
+            enqueue_control_trace(std::move(trace));
+            next_idle_diagnostic_ms = receive_completed_ms + 250;
+            } catch (...) { note_control_trace_drop(); }
           }
           previous_receive_completed_ms = receive_completed_ms;
           if (received.status == WebSocketReceiveStatus::Timeout) continue;
@@ -4348,6 +4424,10 @@ struct VehicleMediaRuntime::Impl {
     }
     try {
       signaling.register_online();
+      try {
+        if (config.runtime.control_log_commands && !signaling.registration_diagnostics().empty())
+          enqueue_control_trace(signaling.registration_diagnostics());
+      } catch (...) { note_control_trace_drop(); }
     } catch (const std::exception& error) {
       emit_diagnostic(
           "vehicle_media_signaling_failed",

@@ -5573,15 +5573,23 @@ void test_websocket_client_preserves_partial_ack_across_polls() {
         });
     server.start();
     mine_teleop::WebSocketClient client;
+    client.enable_read_diagnostics();
     try {
       client.connect("ws://127.0.0.1:" + std::to_string(server.port()) + "/partial-ack");
       const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
       while (!prefix_sent->load() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       expect(prefix_sent->load(), "partial ACK fixture did not send a prefix");
+      std::int64_t prefix_observed_ms = 0;
       for (int poll = 0; poll < 3; ++poll) {
-        expect(client.receive_json(std::chrono::milliseconds(poll == 0 ? 10 : 0)).status == mine_teleop::WebSocketReceiveStatus::Timeout &&
+        const auto partial = client.receive_json(std::chrono::milliseconds(poll == 0 ? 10 : 0));
+        expect(partial.status == mine_teleop::WebSocketReceiveStatus::Timeout &&
             client.connected(), "partial TCP ACK was treated as a protocol error or disconnect");
+        expect(partial.read_diagnostics.at("buffered_receive_bytes") == prefix_size &&
+            partial.read_diagnostics.at("idle_timeouts_total").get<int>() >= poll + 1 &&
+            partial.read_diagnostics.value("timestamp_scope", "") == "application_decrypted_read_completion",
+            "partial/idle diagnostics lost the buffered prefix or mislabeled the clock boundary");
+        prefix_observed_ms = partial.read_diagnostics.at("buffer_head_first_observed_monotonic_ms").get<std::int64_t>();
       }
       const auto transport = client.transport_diagnostics();
       expect(transport.value("tcp_info_available", false) && transport.value("peer_address", "") == "127.0.0.1" &&
@@ -5589,6 +5597,7 @@ void test_websocket_client_preserves_partial_ack_across_polls() {
           "partial ACK/TCP diagnostics did not report the actual buffered prefix and live loopback socket");
       expect(client.transport_diagnostics(std::chrono::hours(1)).is_null(), "normal TCP samples were not rate limited");
       client.send_json({{"event", "fresh_control"}}, std::chrono::milliseconds(20));
+      if (payload_size == 20) std::this_thread::sleep_for(std::chrono::milliseconds(100));
       release_suffix->store(true);
       const auto received = client.receive_json(std::chrono::seconds(2));
       if (truncate_at_eof) {
@@ -5599,9 +5608,22 @@ void test_websocket_client_preserves_partial_ack_across_polls() {
       }
       expect(received.status == mine_teleop::WebSocketReceiveStatus::Message && received.message == acknowledgement &&
           outbound_received->load(), "ACK bytes were lost or blocked fresh outbound control across partial polls");
+      const auto& timing = received.read_diagnostics;
+      expect(timing.value("frame_read_timing_complete", false) &&
+          timing.at("frame_first_observed_monotonic_ms") == prefix_observed_ms &&
+          timing.at("frame_last_observed_monotonic_ms").get<std::int64_t>() >= prefix_observed_ms &&
+          timing.at("partial_frame_polls_total").get<int>() >= 3 &&
+          timing.dump().find("padding") == std::string::npos,
+          "frame diagnostics lost first-byte timing across polls or disclosed payload");
+      if (payload_size == 20) expect(timing.at("frame_observed_span_ms").get<int>() >= 75,
+          "delayed frame suffix was hidden by a short final read call");
       const auto next = client.receive_json(std::chrono::seconds(2));
       expect(next.status == mine_teleop::WebSocketReceiveStatus::Message && next.message.value("event", "") == "next_ack",
           "partial ACK assembly consumed bytes from the following frame");
+      expect(next.read_diagnostics.value("frame_read_timing_complete", false) &&
+          next.read_diagnostics.at("frame_stream_begin").get<std::uint64_t>() ==
+              timing.at("frame_stream_begin").get<std::uint64_t>() + timing.at("frame_bytes").get<std::uint64_t>(),
+          "coalesced next frame inherited the previous frame's byte range");
       client.close();
       server.stop();
     } catch (...) {
@@ -5611,6 +5633,89 @@ void test_websocket_client_preserves_partial_ack_across_polls() {
       throw;
     }
   }
+}
+
+void test_vehicle_registration_diagnostics_correlates_replacement_and_source() {
+  expect(mine_teleop::diagnostic_fingerprint("The quick brown fox jumps over the lazy dog", "key") ==
+      "f7bc83f430538424b13298e6aa6fb143", "diagnostic HMAC vector differs across platforms");
+  const auto root = std::filesystem::temp_directory_path() / ("mine-teleop-registration-diag-" + mine_teleop::random_token(8));
+  std::filesystem::create_directories(root);
+  mine_teleop::SignalingServerConfig config;
+  config.driver_passwords = {{"driver-diag", "fixture-password"}};
+  config.device_tokens = {{"vehicle-diag", "fixture-device-credential"}};
+  config.driver_vehicle_permissions = {{"driver-diag", {"vehicle-diag"}}};
+  config.trusted_proxy_addresses = {"127.0.0.1"};
+  config.audit_log_path = (root / "audit.jsonl").string();
+  config.native_control_trace_commands = true;
+  {
+    mine_teleop::SignalingService service(config);
+    const auto online = [&](std::string_view id, std::string_view peer, std::string_view forwarded) {
+      mine_teleop::HttpRequest request;
+      request.method = "POST"; request.path = request.target = "/vehicles/online";
+      request.peer_address = peer;
+      request.headers["x-forwarded-for"] = forwarded;
+      request.body = mine_teleop::Json{{"vehicle_id", "vehicle-diag"}, {"device_token", "fixture-device-credential"},
+          {"connection_id", id}, {"native_control_capabilities", mine_teleop::kNativeControlCapabilities}}.dump();
+      auto response = service.handle(request);
+      expect(response.status == 200, "registration diagnostic changed admission");
+      auto body = mine_teleop::Json::parse(response.body);
+      expect(body.at("registration_request_id") == response_header(response, "X-Request-ID"),
+          "registration PID-side receipt cannot join server audit request");
+      expect(body.value("connection_fingerprint", "").size() == 32, "registration fingerprint is absent");
+      return body;
+    };
+    const auto first = online("fixture-connection-one", "127.0.0.1", "192.0.2.77, 198.51.100.25");
+    const auto refresh = online("fixture-connection-one", "127.0.0.1", "192.0.2.88, 198.51.100.25");
+    const auto replacement = online("fixture-connection-two", "198.51.100.25", "203.0.113.199");
+    expect(first.at("connection_generation") == refresh.at("connection_generation") &&
+        first.at("connection_fingerprint") == refresh.at("connection_fingerprint") &&
+        replacement.at("connection_generation") > first.at("connection_generation") &&
+        replacement.at("connection_fingerprint") != first.at("connection_fingerprint"),
+        "diagnostics changed refresh/replacement identity policy");
+    std::string line, raw;
+    std::vector<mine_teleop::Json> observations;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (observations.size() < 3 && std::chrono::steady_clock::now() < deadline) {
+      observations.clear(); raw.clear();
+      std::ifstream input(config.audit_log_path);
+      while (std::getline(input, line)) {
+        raw += line;
+        auto record = mine_teleop::Json::parse(line, nullptr, false);
+        if (record.is_discarded() || record.value("event", "") != "cloud_native_control_trace_batch") continue;
+        for (const auto& command : record.at("details").at("commands")) {
+          if (command.value("stage", "") == "vehicle_registration_observed")
+            observations.push_back({{"request_id", command.at("registration_request_id")}, {"details", command}});
+        }
+      }
+      if (observations.size() < 3) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    expect(observations.size() == 3, "registration attempts are missing from diagnostic audit");
+    for (std::size_t index = 0; index < observations.size(); ++index) {
+      const auto& observation = observations[index];
+      const auto& receipt = index == 0 ? first : index == 1 ? refresh : replacement;
+      expect(observation.at("request_id") == receipt.at("registration_request_id") &&
+          observation.at("details").at("connection_fingerprint") == receipt.at("connection_fingerprint"),
+          "registration receipt and audit refer to different attempts");
+      expect(observation.at("details").at("source_fingerprint") == observations[0].at("details").at("source_fingerprint"),
+          "untrusted XFF or left-most proxy input changed the trusted source fingerprint");
+    }
+    expect(observations.back().at("details").at("previous_connection_fingerprint") == first.at("connection_fingerprint") &&
+        observations.back().at("details").at("previous_connection_generation") == first.at("connection_generation"),
+        "replacement audit lost the previous identity/generation");
+    for (const auto private_value : {"fixture-connection-one", "fixture-connection-two", "fixture-device-credential", "198.51.100.25", "203.0.113.199"})
+      expect(raw.find(private_value) == std::string::npos, "registration diagnostic exposed raw identity/credential/source");
+    std::filesystem::remove(config.audit_log_path);
+    std::filesystem::create_directory(config.audit_log_path);
+    const auto log_unwritable = online("fixture-connection-two", "198.51.100.25", "");
+    expect(log_unwritable.at("connection_generation") == replacement.at("connection_generation"),
+        "diagnostic disk failure changed a successful same-connection refresh");
+    // Async diagnostic failure must never surface as an admission failure.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    const auto after_log_failure = online("fixture-connection-two", "198.51.100.25", "");
+    expect(after_log_failure.at("connection_generation") == replacement.at("connection_generation"),
+        "a failed diagnostic worker changed admission");
+  }
+  std::filesystem::remove_all(root);
 }
 
 void test_websocket_receive_timing_separates_frame_assembly() {
@@ -6529,6 +6634,19 @@ void test_native_control_three_hop_trace_correlation() {
         std::string("cloud native control trace omitted ") + field);
   }
   for (const auto& command : cloud_commands) {
+    if (command.value("stage", "") == "delivery_send_completed") {
+      expect(command.at("transport_before_send").at("peer_is_loopback") == true &&
+          command.at("transport_after_send").at("peer_is_loopback") == true &&
+          !command.at("transport_before_send").contains("peer_address") &&
+          !command.at("transport_after_send").contains("peer_address") &&
+          command.at("transport_before_send_sample_ms").get<std::int64_t>() >= 0 &&
+          command.at("transport_after_send_sample_ms").get<std::int64_t>() >= 0 &&
+          command.at("transport_before_send").at("sample_monotonic_ms").get<std::int64_t>() <=
+              command.at("cloud_delivery_send_started_monotonic_ms").get<std::int64_t>() &&
+          command.at("transport_after_send").at("sample_monotonic_ms").get<std::int64_t>() >=
+              command.at("cloud_delivery_send_completed_monotonic_ms").get<std::int64_t>(),
+          "delivery diagnostics lost socket stage, privacy, or actual send timing boundaries");
+    }
     if (command.value("stage", "") != "ingress_ack_send_completed") continue;
     expect(command.at("cloud_frame_received_monotonic_ms").get<std::int64_t>() <=
         command.at("ack_send_started_monotonic_ms").get<std::int64_t>() &&
@@ -8040,6 +8158,7 @@ int main(int argc, char** argv) {
       {"vehicle_native_control_capability_admission_and_generation", test_vehicle_native_control_capability_admission_and_generation},
       {"independent_cloud_observer_records_blocked_receive_and_mutex", test_independent_cloud_observer_records_blocked_receive_and_mutex},
       {"websocket_receive_timing_separates_frame_assembly", test_websocket_receive_timing_separates_frame_assembly},
+      {"vehicle_registration_diagnostics_correlates_replacement_and_source", test_vehicle_registration_diagnostics_correlates_replacement_and_source},
       {"mac_runtime_retries_uncertain_websocket_send_without_duplication",
        test_mac_runtime_retries_uncertain_websocket_send_without_duplication},
       {"expired_websocket_authority_clears_local_control", test_expired_websocket_authority_clears_local_control},
