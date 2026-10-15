@@ -372,8 +372,27 @@ endif()
 
 if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
   enable_testing()
-  find_package(Python3 COMPONENTS Interpreter QUIET)
+  add_executable(mine-teleop-websocket-send-tests cpp/tests/websocket_send_tests.cpp)
+  target_link_libraries(mine-teleop-websocket-send-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-websocket-send-tests)
+  add_test(NAME mine-teleop-websocket-send-tests COMMAND mine-teleop-websocket-send-tests)
+  set_tests_properties(mine-teleop-websocket-send-tests PROPERTIES TIMEOUT 10)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
   if(Python3_Interpreter_FOUND)
+    add_test(NAME mine-teleop-websocket-send-tls-tests
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/websocket_send_tls.test.py" $<TARGET_FILE:mine-teleop-websocket-send-tests>)
+    set_tests_properties(mine-teleop-websocket-send-tls-tests PROPERTIES TIMEOUT 30)
+    set(MINE_TELEOP_RECOVERY_ENFORCER "${CMAKE_CURRENT_BINARY_DIR}/recovery_enforcer.inc")
+    add_custom_command(OUTPUT "${MINE_TELEOP_RECOVERY_ENFORCER}"
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/extract_recovery_enforcer.py"
+        --source "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/webrtc_media.cpp" --output "${MINE_TELEOP_RECOVERY_ENFORCER}"
+      DEPENDS cpp/tests/extract_recovery_enforcer.py cpp/src/webrtc_media.cpp VERBATIM)
+    add_executable(mine-teleop-recovery-enforcer-tests cpp/tests/recovery_enforcer_tests.cpp "${MINE_TELEOP_RECOVERY_ENFORCER}")
+    target_include_directories(mine-teleop-recovery-enforcer-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(mine-teleop-recovery-enforcer-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+    mine_teleop_enable_warnings(mine-teleop-recovery-enforcer-tests)
+    add_test(NAME mine-teleop-recovery-enforcer-tests COMMAND mine-teleop-recovery-enforcer-tests)
+    set_tests_properties(mine-teleop-recovery-enforcer-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 10)
     set(MINE_TELEOP_AUTHORITY_WORKER "${CMAKE_CURRENT_BINARY_DIR}/authority_worker_methods.inc")
     set(MINE_TELEOP_AUTHORITY_CACHE "${CMAKE_CURRENT_BINARY_DIR}/authority_lease_cache.inc")
     add_custom_command(OUTPUT "${MINE_TELEOP_AUTHORITY_WORKER}" "${MINE_TELEOP_AUTHORITY_CACHE}"

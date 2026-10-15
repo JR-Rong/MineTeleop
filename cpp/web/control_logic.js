@@ -275,7 +275,7 @@
 
   function vehicleControlDiagnostic(issueCode, recovery) {
     const causes = {time_sync: '时间同步不可信', input_lease: '驾驶输入刷新过期',
-      control_link: '控制链路 ACK 确认中断', critical_video: '关键视频中断或无新帧'};
+      control_link: '控制命令延迟或中断', critical_video: '关键视频中断或无新帧'};
     const cause = recovery && causes[recovery.cause];
     const timeout = recovery && Number(recovery.timeout_ms);
     const deadline = Number.isFinite(timeout) && timeout > 0 ? `${timeout / 1000} 秒` : '配置期限';
@@ -480,6 +480,34 @@
     if (Number.isSafeInteger(seq) && seq > 0 &&
         Number.isSafeInteger(lastNativeAcceptedControlSeq) && lastNativeAcceptedControlSeq > seq) return false;
     return true;
+  }
+
+  // Display only: ICE, cloud ingress and software vehicle results are distinct
+  // measurements. None of these values authorizes motion or proves CAN action.
+  function controlLatencyPresentation(metrics, runtime, sessionId, generation) {
+    const number = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+    const seq = value => Number.isSafeInteger(value) && value > 0 ? value : null;
+    const ms = value => number(value) === null ? '未知' : `${Math.round(value)} ms`;
+    const media = number(metrics && metrics.media_transport_rtt_ms);
+    const native = runtime && runtime.native_control || {};
+    const scoped = Boolean(sessionId) && runtime && runtime.connected === true &&
+      runtime.session_id === sessionId && runtime.control_session_generation === generation &&
+      native.session_generation === generation;
+    const result = scoped && native.vehicle_result_latency || {};
+    const ackSeq = scoped ? seq(native.last_ack_seq) : null;
+    const resultSeq = seq(result.command_seq), acceptedSeq = seq(result.last_accepted_command_seq);
+    return {
+      media: {text: ms(media), level: media === null ? 'warn' : ''},
+      cloud: {text: ackSeq === null ? '尚无入口确认' :
+        `#${ackSeq} · 包龄 ${ms(native.last_ack_packet_age_ms)} · 收到后 ${ms(native.last_ack_receive_age_ms)} · 进度停滞 ${ms(native.ack_stall_age_ms)}`,
+        level: ackSeq === null || native.ack_braking_wait === true ? 'warn' : ''},
+      vehicle: {text: resultSeq === null ? '尚无关联结果' :
+        `#${resultSeq} · ${result.accepted === true ? '软件接受' : result.accepted === false ? '软件拒绝' : '结果未知'} · 往返 ${ms(result.round_trip_ms)} · 收到后 ${ms(result.result_age_ms)}`,
+        level: resultSeq === null || result.accepted !== true ? 'warn' : ''},
+      accepted: {text: acceptedSeq === null ? '尚无关联接受结果' :
+        `#${acceptedSeq} · 收到后 ${ms(result.last_accepted_result_age_ms)}`,
+        level: acceptedSeq === null ? 'warn' : ''},
+    };
   }
 
   function controlProfilesEqual(leftValue, rightValue) {
@@ -1102,7 +1130,7 @@
     if (!waiting && !holding && !delayed) return hidden;
     const cause = waiting || holding ? String(timing.control_recovery_cause || '') : 'control_delay';
     const reasons = {critical_video: '关键视频中断或无新帧', time_sync: '时间同步不可信',
-      input_lease: '驾驶输入刷新过期', control_link: '控制链路 ACK 确认暂时中断', control_delay: '控制指令延迟或短暂中断'};
+      input_lease: '驾驶输入刷新过期', control_link: '控制命令延迟或短暂中断', control_delay: '控制指令延迟或短暂中断'};
     const reason = reasons[cause] || '控制链路暂时异常';
     const guidance = controlRecoveryGuidance(timing, feedbackFresh);
     // Report the last authoritative vehicle state without claiming that old
@@ -1123,7 +1151,7 @@
     const hidden = {visible: false, phase: 'none', causes: [], reason: '', nextStep: '', text: ''};
     if (!waiting && !holding && !rearm) return hidden;
     const labels = {critical_video: '关键视频未就绪', input_lease: '驾驶输入刷新未就绪',
-      control_link: '控制链路 ACK 确认未就绪', time_sync: '时间同步不可信'};
+      control_link: '控制命令时效或链路未就绪', time_sync: '时间同步不可信'};
     const causes = [];
     if (timing.critical_video_required !== false && timing.driver_critical_video_ready === false) causes.push('critical_video');
     if (timing.operator_input_ready === false) causes.push('input_lease');
@@ -1677,6 +1705,7 @@
     controlProfileThrottleLimit,
     controlProfilesEqual,
     degradedInputRearmRequired,
+    controlLatencyPresentation,
     reduceControlProfileStatus,
     reduceGamepadNeutralInterlock,
     reduceStatusSequence,

@@ -210,7 +210,7 @@ Write-Host "==> Building Windows control client and portable safety test (jobs=$
 Invoke-CheckedCommand -Command "cmake" -CommandArguments @(
   "--build", $BuildDirectory,
   "--config", "Release",
-  "--target", "mine-teleop-control", "mine-teleop-native-control-intent-tests", "mine-teleop-session-logs-tests",
+  "--target", "mine-teleop-control", "mine-teleop-native-control-intent-tests", "mine-teleop-session-logs-tests", "mine-teleop-websocket-send-tests",
   "--parallel", "$BuildJobs"
 )
 
@@ -220,7 +220,7 @@ Invoke-CheckedCommand -Command "ctest" -CommandArguments @(
   "-C", "Release",
   "--output-on-failure",
   "--no-tests=error",
-  "-R", "^mine-teleop-(native-control-intent|session-logs)-tests$"
+  "-R", "^mine-teleop-(native-control-intent|session-logs|websocket-send|websocket-send-tls)-tests$"
 )
 
 $ConfigurationDirectory = Join-Path $BuildDirectory "Release"

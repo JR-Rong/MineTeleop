@@ -27,6 +27,13 @@ void exact_vehicle_results() {
   expect(!window.note_result(3564, 80, 4900, true), "old result renewed progress");
   expect(window.snapshot().last->received_monotonic_ms == 4711 && window.snapshot().samples == 2,
       "duplicate changed last sample");
+  window.note_sent(3566,82,4800);
+  expect(window.note_result(3566,82,5000,false).has_value(),"new rejection missing");
+  const auto state=window.snapshot();
+  expect(state.last->command_seq==3566 && !state.last->accepted && state.last_accepted &&
+      state.last_accepted->command_seq==3565 && state.last_accepted->received_monotonic_ms==4711,
+      "fresh rejection pretended that last software acceptance was also fresh");
+  window.reset(); expect(!window.snapshot().last_accepted,"new session retained accepted result");
 }
 
 void bounded_unknown_results() {

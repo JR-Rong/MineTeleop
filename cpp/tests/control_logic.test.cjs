@@ -1021,6 +1021,34 @@ test('delayed degradation cannot clear input accepted later through the native v
     assert.equal(logic.degradedInputRearmRequired(timing, 40), true);
 });
 
+test('media ICE, cloud ingress and correlated vehicle results remain independent in the shipped monitor', () => {
+  const runtime={connected:true,session_id:'s',control_session_generation:7,native_control:{session_generation:7,
+    last_ack_seq:3930,last_ack_packet_age_ms:59,last_ack_receive_age_ms:10,ack_stall_age_ms:0,
+    vehicle_result_latency:{command_seq:3929,accepted:false,round_trip_ms:310,result_age_ms:20,
+      last_accepted_command_seq:3927,last_accepted_result_age_ms:2037}}};
+  let view=logic.controlLatencyPresentation({media_transport_rtt_ms:3,control_rtt_ms:3},runtime,'s',7);
+  assert.equal(view.media.text,'3 ms');assert.match(view.cloud.text,/#3930/);
+  assert.match(view.vehicle.text,/#3929.*软件拒绝.*310 ms/);
+  assert.match(view.accepted.text,/#3927.*2037 ms/);
+  assert(!JSON.stringify(view).includes('已执行'));
+  runtime.native_control.last_ack_seq=4000;
+  view=logic.controlLatencyPresentation({control_rtt_ms:1},runtime,'s',7);
+  assert.equal(view.media.text,'未知','legacy control_rtt field still masquerades as media/control measurement');
+  assert.match(view.accepted.text,/#3927.*2037 ms/,'fresh cloud ACK refreshed vehicle acceptance');
+  for(const [session,generation] of [['old',7],['s',8]]) {
+    const stale=logic.controlLatencyPresentation({media_transport_rtt_ms:3},runtime,session,generation);
+    assert.equal(stale.cloud.text,'尚无入口确认');assert.equal(stale.vehicle.text,'尚无关联结果');
+  }
+  runtime.native_control.vehicle_result_latency={command_seq:9,accepted:true,round_trip_ms:null,result_age_ms:null};
+  view=logic.controlLatencyPresentation({},runtime,'s',7);
+  assert.match(view.vehicle.text,/往返 未知.*收到后 未知/);
+  assert.equal(view.accepted.text,'尚无关联接受结果');
+  assert(controlPageSource.includes('<span>媒体 ICE RTT</span>'));
+  assert(controlPageSource.includes("setMetric('metric-cloud-ack',latency.cloud.text"));
+  assert(controlPageSource.includes("setMetric('metric-vehicle-result',latency.vehicle.text"));
+  assert(controlPageSource.includes('control_rtt_ms:null'));
+});
+
 test('profile equality checks every configurable field, independent of JSON order', () => {
   const profile=controlProfile();
   assert(logic.controlProfilesEqual(profile,Object.fromEntries(Object.entries(profile).reverse())));
@@ -1164,7 +1192,7 @@ test('zero maximum brake pressure disables analog, service, and hard brake scala
 });
 
 test('recoverable braking banner uses vehicle feedback and identifies the cause', () => {
-  for (const [cause, text] of [['critical_video', /关键视频/], ['time_sync', /时间同步/], ['input_lease', /输入刷新/], ['control_link', /ACK 确认/]]) {
+  for (const [cause, text] of [['critical_video', /关键视频/], ['time_sync', /时间同步/], ['input_lease', /输入刷新/], ['control_link', /控制命令/]]) {
     const telemetry = {safety_state: 'CONTROL_ACTIVE', control_timing: {control_braking_wait: true, control_recovery_cause: cause}};
     const presentation = logic.deriveControlRecoveryPresentation(true, telemetry, true, false);
     assert.equal(presentation.visible, true);
@@ -1211,7 +1239,7 @@ test('recovered brake hold stays visible until fresh motion releases it', () => 
 test('recovery guidance uses current four readiness causes rather than the first historical cause', () => {
   const fields = {critical_video: 'driver_critical_video_ready', input_lease: 'operator_input_ready',
     control_link: 'driver_control_link_ready', time_sync: 'driver_time_sync_ready'};
-  const labels = {critical_video: /关键视频/, input_lease: /输入刷新/, control_link: /ACK/, time_sync: /时间同步/};
+  const labels = {critical_video: /关键视频/, input_lease: /输入刷新/, control_link: /控制命令/, time_sync: /时间同步/};
   for (const [cause, field] of Object.entries(fields)) {
     const guidance = logic.controlRecoveryGuidance({control_braking_wait: true,
       control_recovery_cause: 'time_sync', recovery_samples_healthy: false, [field]: false});
@@ -1443,6 +1471,28 @@ function useProductionIntentEnvelope(fixture) {
   assert.ok(start >= 0 && end > start);
   vm.runInContext(controlPageSource.slice(start, end), fixture.context);
 }
+
+test('a two-second page pause is distinct from slow HTTP responses and does not replay a catch-up queue', async () => {
+  const fixture=intentPageFixture(['ArrowUp']);await fixture.advanceTo(0);
+  useProductionIntentEnvelope(fixture);
+  const queue=logic.createLatestControlWriteQueue(fixture.context.writeControlIntent,error=>{throw error;},
+    (token,reason)=>{const active=fixture.context.activeControlRequests.get(token);if(active){active.preemptedReason=reason;active.controller.abort();}});
+  const first=queue.send({},false);
+  for(const tick of [66,132]){await fixture.advanceTo(tick);queue.enqueueHeartbeat();}
+  await fixture.advanceTo(2316.7,true);
+  assert.equal((await first).reason,'control_intent_update_timeout');
+  assert.equal(fixture.requests.length,3,'pause accumulated a replay backlog');
+  assert.equal(fixture.requests[2].startedAt-fixture.requests[1].startedAt,2250.7);
+  assert.equal(fixture.pressed.has('ArrowUp'),true,'HTTP timeout fabricated a key release');
+  // The native store, rather than the HTTP timeout, owns the unchanged lease.
+  fixture.requests[2].resolve({accepted:false,reason:'fresh_neutral_required',requires_fresh_input:true});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(fixture.pressed.size,0);
+  assert.equal(logic.pressKey(fixture.pressed,fixture.blocked,'ArrowUp').accepted,false);
+  logic.releaseKey(fixture.pressed,fixture.blocked,'ArrowUp');
+  assert.equal(logic.pressKey(fixture.pressed,fixture.blocked,'ArrowUp').accepted,true);
+  queue.reset();await new Promise(resolve=>setImmediate(resolve));
+});
 
 function useProductionCameraView(fixture) {
   class Element {
@@ -1855,7 +1905,7 @@ test('lost critical view sends neutral without disconnecting or clearing the pro
 });
 
 test('hard stop banner retains exact recovery cause and deadline without telemetry', () => {
-  for (const [cause, label] of [['time_sync',/时间同步/], ['input_lease',/输入刷新/], ['control_link',/ACK/]]) {
+  for (const [cause, label] of [['time_sync',/时间同步/], ['input_lease',/输入刷新/], ['control_link',/控制命令/]]) {
     const handshake={issue_code:'control_recovery_timeout',control_recovery:{cause,timeout_ms:5000,phase:'locked'}};
     const p=logic.deriveControlStopPresentation(false,false,'','',handshake);
     assert.equal(p.visible,true);assert.equal(p.severity,'critical');assert.match(p.banner,label);

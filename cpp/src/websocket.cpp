@@ -1,12 +1,15 @@
 #include "mine_teleop/websocket.hpp"
 #include "mine_teleop/curl_tls.hpp"
 #include "mine_teleop/platform.hpp"
+#include "mine_teleop/detail/websocket_send_deadline.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <processthreadsapi.h>
 #else
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -71,6 +74,40 @@ std::string socket_error_message(int error) { return std::strerror(error); }
 NativeSocket native_socket(SocketHandle socket) {
   return static_cast<NativeSocket>(socket);
 }
+
+// Retain our own descriptor for exactly this TCP endpoint. Even if libcurl
+// retires its original descriptor on an error, a delayed observer cannot act
+// on a descriptor number/handle already reused by another connection.
+struct ShutdownSocket {
+  NativeSocket value;
+  explicit ShutdownSocket(NativeSocket original) {
+#if defined(_WIN32)
+    WSAPROTOCOL_INFOW info{};
+    if (::WSADuplicateSocketW(original, ::GetCurrentProcessId(), &info) != 0)
+      throw std::runtime_error("cannot retain websocket interruption socket");
+    value = ::WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, &info, 0,
+        WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+    if (value == INVALID_SOCKET) throw std::runtime_error("cannot retain websocket interruption socket");
+#else
+    value = ::fcntl(original, F_DUPFD_CLOEXEC, 0);
+    if (value < 0) throw std::runtime_error("cannot retain websocket interruption socket");
+#endif
+  }
+  ~ShutdownSocket() {
+#if defined(_WIN32)
+    ::closesocket(value);
+#else
+    ::close(value);
+#endif
+  }
+  void interrupt() const noexcept {
+#if defined(_WIN32)
+    static_cast<void>(::shutdown(value, SD_BOTH));
+#else
+    static_cast<void>(::shutdown(value, SHUT_RDWR));
+#endif
+  }
+};
 
 Json socket_transport_diagnostics(SocketHandle socket) {
   Json result = {{"sample_monotonic_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -636,6 +673,11 @@ WebSocketReceiveResult ServerWebSocketConnection::receive_json(std::chrono::mill
   }
 }
 
+std::function<void()> detail::websocket_socket_interrupter(SocketHandle socket) {
+  auto retained = std::make_shared<ShutdownSocket>(native_socket(socket));
+  return [retained]() noexcept { retained->interrupt(); };
+}
+
 struct WebSocketClient::Impl {
   struct ReadSpan {
     std::uint64_t begin, end;
@@ -659,6 +701,10 @@ struct WebSocketClient::Impl {
       std::chrono::steady_clock::now().time_since_epoch()).count();
   std::size_t max_message_bytes{8 * 1024 * 1024};
   bool peer_closed{false};
+  bool send_failed{false};
+  Json last_send = Json::object();
+  std::function<void()> socket_interrupt;
+  std::unique_ptr<detail::WebSocketSendDeadline> send_deadline;
 
   static std::int64_t steady_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -729,29 +775,70 @@ struct WebSocketClient::Impl {
   }
 
   ~Impl() {
+    // The observer never touches CURL. Join it before curl can free the socket
+    // so a late deadline cannot shut down a subsequently reused descriptor.
+    // Do not let TLS close-notify cleanup start another unbounded network
+    // wait after the WebSocket close attempt has already ended.
+    if (socket_interrupt) socket_interrupt();
+    send_deadline.reset();
     if (curl != nullptr) curl_easy_cleanup(curl);
+    socket_interrupt = {};
     if (resolve_entries != nullptr) curl_slist_free_all(resolve_entries);
   }
 
-  void send_all(std::string_view value, std::chrono::milliseconds timeout) {
-    std::size_t sent = 0;
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (sent < value.size()) {
-      std::size_t count = 0;
-      const auto result = curl_easy_send(curl, value.data() + sent, value.size() - sent, &count);
-      if (result == CURLE_OK) {
-        if (count == 0) throw std::runtime_error("websocket closed while sending");
-        sent += count;
-        continue;
-      }
-      if (result != CURLE_AGAIN) throw std::runtime_error(std::string("websocket send failed: ") + curl_easy_strerror(result));
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline || !wait_socket(
-              static_cast<SocketHandle>(socket),
-              kPollWrite,
-              std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now))) {
-        throw std::runtime_error("websocket send timed out");
-      }
+  void send_all(std::string_view value, std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop = {}, Json preparation = Json::object()) {
+    last_send = std::move(preparation);
+    last_send["io_started_monotonic_ms"] = steady_ms();
+    last_send["deadline_monotonic_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(deadline.time_since_epoch()).count();
+    last_send["frame_bytes"] = value.size();
+    detail::WebSocketWriteObservation observation;
+    const auto record = [&] {
+      last_send["io_completed_monotonic_ms"] = steady_ms();
+      last_send["curl_send_calls"] = observation.calls;
+      last_send["curl_again_count"] = observation.again;
+      last_send["longest_curl_send_call_ms"] = observation.longest_call_ms;
+      last_send["poll_calls"] = observation.polls;
+      last_send["poll_wait_ms"] = observation.poll_ms;
+      last_send["curl_reported_bytes"] = observation.bytes;
+      last_send["cancel_requested"] = stop.stop_requested();
+      last_send["socket_interrupted"] = send_deadline && send_deadline->interrupted();
+    };
+    if (!send_deadline) {
+      socket_interrupt = detail::websocket_socket_interrupter(static_cast<SocketHandle>(socket));
+      send_deadline = std::make_unique<detail::WebSocketSendDeadline>(socket_interrupt);
+    }
+    send_deadline->arm(deadline);
+    struct Disarm {
+      detail::WebSocketSendDeadline& guard;
+      ~Disarm() { guard.disarm(); }
+    } disarm{*send_deadline};
+    std::stop_callback cancellation(stop, [this] { send_deadline->interrupt(); });
+    try {
+      detail::send_websocket_bytes(value, deadline, stop,
+          [this](std::string_view remaining) {
+            std::size_t count = 0;
+            const auto result = curl_easy_send(curl, remaining.data(), remaining.size(), &count);
+            last_send["curl_last_result"] = static_cast<int>(result);
+            if (result != CURLE_OK && result != CURLE_AGAIN)
+              throw std::runtime_error(std::string("websocket send failed: ") + curl_easy_strerror(result));
+            return detail::WebSocketWriteProgress{count, result == CURLE_AGAIN};
+          }, [this](auto remaining) { return wait_socket(static_cast<SocketHandle>(socket), kPollWrite, remaining); },
+          [] { return std::chrono::steady_clock::now(); },
+          [this] { return send_deadline->interrupted(); }, observation);
+      if (!send_deadline->finish()) throw std::runtime_error("websocket send timed out");
+      last_send["completed"] = true;
+      record();
+    } catch (...) {
+      // Partial WebSocket/TLS records cannot carry the next command. Retire
+      // the stream; the existing owner performs cleanup/reconnect, no replay.
+      send_failed = true;
+      last_send["timed_out"] = !stop.stop_requested() &&
+          (std::chrono::steady_clock::now() >= deadline || send_deadline->interrupted());
+      send_deadline->interrupt();
+      last_send["completed"] = false;
+      record();
+      throw;
     }
   }
 
@@ -809,7 +896,9 @@ struct WebSocketClient::Impl {
     return true;
   }
 
-  void send_frame(std::uint8_t opcode, std::string_view payload, std::chrono::milliseconds timeout) {
+  void send_frame(std::uint8_t opcode, std::string_view payload,
+      std::chrono::steady_clock::time_point deadline, std::stop_token stop = {}, std::int64_t serialization_ms = 0) {
+    const auto frame_started = steady_ms();
     std::array<unsigned char, 4> mask{};
     random_bytes(mask.data(), mask.size());
     std::string frame;
@@ -830,7 +919,8 @@ struct WebSocketClient::Impl {
     for (std::size_t index = 0; index < payload.size(); ++index) {
       frame.push_back(static_cast<char>(static_cast<unsigned char>(payload[index]) ^ mask[index % mask.size()]));
     }
-    send_all(frame, timeout);
+    send_all(frame, deadline, stop, {{"serialization_ms", serialization_ms},
+        {"frame_build_ms", steady_ms() - frame_started}});
   }
 };
 
@@ -944,7 +1034,7 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
     request += name + ": " + value + "\r\n";
   }
   request += "\r\n";
-  impl_->send_all(request, timeout_);
+  impl_->send_all(request, std::chrono::steady_clock::now() + timeout_);
   const auto deadline = std::chrono::steady_clock::now() + timeout_;
   while (impl_->buffered.find("\r\n\r\n") == std::string::npos) {
     if (impl_->buffered.size() > 64 * 1024) {
@@ -982,9 +1072,9 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
 }
 
 void WebSocketClient::close() {
-  if (impl_ && impl_->curl != nullptr && impl_->socket != CURL_SOCKET_BAD) {
+  if (connected()) {
     try {
-      impl_->send_frame(0x8, std::string("\x03\xe8", 2), std::chrono::milliseconds(250));
+      impl_->send_frame(0x8, std::string("\x03\xe8", 2), std::chrono::steady_clock::now() + std::chrono::milliseconds(250));
     } catch (const std::exception&) {
     }
   }
@@ -993,7 +1083,7 @@ void WebSocketClient::close() {
 }
 
 bool WebSocketClient::connected() const {
-  return impl_ && impl_->curl != nullptr && impl_->socket != CURL_SOCKET_BAD;
+  return impl_ && impl_->curl != nullptr && impl_->socket != CURL_SOCKET_BAD && !impl_->send_failed;
 }
 
 std::string WebSocketClient::response_header(std::string_view name) const {
@@ -1007,10 +1097,21 @@ void WebSocketClient::send_json(const Json& value) {
 }
 
 void WebSocketClient::send_json(const Json& value, std::chrono::milliseconds timeout) {
+  send_json(value, timeout, {});
+}
+
+void WebSocketClient::send_json(const Json& value, std::chrono::milliseconds timeout, std::stop_token stop) {
   if (!connected()) throw std::runtime_error("websocket is not connected");
   if (timeout.count() <= 0) throw std::invalid_argument("websocket send timeout must be positive");
   if (!value.is_object()) throw std::invalid_argument("websocket JSON message must be an object");
-  impl_->send_frame(0x1, value.dump(), timeout);
+  const auto started = std::chrono::steady_clock::now();
+  const auto bytes = value.dump();
+  impl_->send_frame(0x1, bytes, started + timeout, stop,
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+}
+
+Json WebSocketClient::last_send_diagnostics() const {
+  return impl_ ? impl_->last_send : Json(nullptr);
 }
 
 void WebSocketClient::enable_read_diagnostics(bool enabled) {
@@ -1099,7 +1200,7 @@ WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds t
       return {WebSocketReceiveStatus::Closed, Json::object()};
     }
     if (opcode == 0x9) {
-      impl_->send_frame(0xa, payload, timeout_);
+      impl_->send_frame(0xa, payload, std::chrono::steady_clock::now() + timeout_);
       continue;
     }
     if (opcode == 0xa) continue;
@@ -1137,6 +1238,10 @@ Json WebSocketClient::transport_diagnostics(std::chrono::milliseconds minimum_in
   result["buffered_receive_bytes"] = impl_->buffered.size();
   result["partial_frame_polls_total"] = impl_->partial_frame_polls;
   result["connection_started_monotonic_ms"] = impl_->connection_started_monotonic_ms;
+  if (const auto* version = curl_version_info(CURLVERSION_NOW)) {
+    result["curl_runtime_version"] = version->version ? version->version : "unknown";
+    result["curl_tls_backend"] = version->ssl_version ? version->ssl_version : "unknown";
+  }
   return result;
 }
 

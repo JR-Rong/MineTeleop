@@ -537,10 +537,45 @@ struct TestCase {
   void (*function)();
 };
 
+void test_session016_recorded_ack_drain_preserves_brake_and_fresh_neutral() {
+  using namespace mine_teleop::detail;
+  NativeControlAcknowledgementWindow window; NativeControlAckRecovery recovery;
+  mine_teleop::NativeControlIntentStore store(200);
+  auto neutral=neutral_intent(1);expect(store.update(neutral,6504100).accepted,"field neutral failed");
+  auto held=neutral;held.intent_seq=2;held.throttle=0.5;
+  expect(store.update(held,6504110).accepted,"field held input failed");
+  // Session016 browser464 commands[23], native monotonic timestamps. These
+  // are advancing sent identities, not repeated samples of the same ACK.
+  const std::int64_t ages[]={499,437,374,309,246,183,126,62};
+  for(std::uint64_t index=0;index<8;++index) {
+    const auto received=6504122+(index>=6?1:0);
+    window.note_sent(976+index,received-ages[index]);
+  }
+  unsigned entered=0,recovered=0;
+  for(std::uint64_t index=0;index<8;++index) {
+    const auto received=6504122+(index>=6?1:0);
+    const auto seq=976+index;
+    expect(window.acknowledge_through(seq,received),"recorded ACK did not advance");
+    const auto transition=recovery.note_ack_progress(received,seq,window.last_ack_packet_age_ms(),5000);
+    if(transition.entered){++entered;expect(seq==978,"field wait entered at wrong ACK");}
+    if(transition.recovered){++recovered;expect(seq==981,"field wait recovered at wrong ACK");}
+    if(transition.entered||transition.recovered)store.invalidate(true);
+  }
+  expect(entered==1 && recovered==1 && !recovery.waiting() &&
+    recovery.bad_sample_revision()==5 && recovery.brake_sample_revision()==1,
+    "same-drain fresh ACK erased distinct late samples or their brake event");
+  expect(store.sample(6504123).fresh && store.sample(6504123).intent.throttle==0 &&
+    store.sample(6504123).requires_fresh_input,"fresh ACK replayed old motion");
+  held.intent_seq=3;expect(store.update(held,6504124).reason=="fresh_neutral_required","old hold resumed");
+  neutral.intent_seq=4;expect(store.update(neutral,6504125).accepted,"field neutral rearm failed");
+  held.intent_seq=5;expect(store.update(held,6504126).accepted,"field new press failed");
+}
+
 }  // namespace
 
 int main() {
   const TestCase tests[] = {
+      {"session016_recorded_ack_drain",test_session016_recorded_ack_drain_preserves_brake_and_fresh_neutral},
       {"raw_video_sample_is_preserved_separately_from_input_and_qualified_video", test_raw_video_sample_is_preserved_separately_from_input_and_qualified_video},
       {"ingress_anomaly_samples_are_distinct_and_timeout_is_independent", test_ingress_anomaly_samples_are_distinct_and_timeout_is_independent},
       {"confirmed_page_takeover_retires_late_neutral_without_retiring_estop", test_confirmed_page_takeover_retires_late_neutral_without_retiring_estop},

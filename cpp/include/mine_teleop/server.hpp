@@ -461,7 +461,7 @@ class DriverConsoleRuntime {
   void native_control_sender_loop(std::stop_token stop_token);
   void native_control_lease_loop(std::stop_token stop_token);
   void time_sync_loop(std::stop_token stop_token);
-  [[nodiscard]] bool send_native_control_sample();
+  [[nodiscard]] bool send_native_control_sample(std::stop_token stop = {});
   void poll_native_control_acknowledgements();
   [[nodiscard]] bool direct_control_continuation_available_locked();
   void consume_feedback_status_locked(const Json& value, std::string_view session,
@@ -631,6 +631,7 @@ class DriverConsoleRuntime {
   std::atomic<std::uint64_t> native_control_vehicle_accepted_command_seq_{0};
   std::atomic<std::int64_t> native_control_scheduled_at_monotonic_ms_{0};
   std::atomic<std::int64_t> native_control_last_ack_received_at_utc_ms_{0};
+  std::atomic<std::int64_t> native_control_last_ack_received_monotonic_ms_{0};
   std::atomic<std::int64_t> native_control_last_ack_cloud_received_at_utc_ms_{0};
   std::string native_control_last_error_;
   std::unique_ptr<AsyncControlTrace> native_control_trace_;

@@ -885,6 +885,7 @@ class VehicleControlService {
   void set_control_braking_wait(bool waiting, std::int64_t now_ms,
       ControlRecoveryCause cause = ControlRecoveryCause::CriticalVideo);
   [[nodiscard]] bool control_braking_wait() const { return control_braking_wait_; }
+  [[nodiscard]] ControlRecoveryCause control_recovery_cause() const { return recovery_cause_; }
   [[nodiscard]] bool driver_critical_video_ready() const { return driver_critical_video_ready_; }
   [[nodiscard]] bool driver_time_sync_ready() const { return driver_time_sync_ready_; }
   [[nodiscard]] bool operator_input_ready() const { return operator_input_ready_; }

@@ -1783,7 +1783,9 @@ void test_control_page_contract() {
       "Gamepad disconnect does not zero its own axes without clearing keyboard input");
   expect(response.body.find("车辆必须本地确认后才能复位") != std::string::npos, "ESTOP latch feedback is missing");
   expect(response.body.find("运行监控") != std::string::npos, "operator monitoring panel is missing");
-  expect(response.body.find("控制 RTT") != std::string::npos, "control RTT display is missing");
+  expect(response.body.find("媒体 ICE RTT") != std::string::npos &&
+      response.body.find("云入口 ACK") != std::string::npos && response.body.find("车端软件结果") != std::string::npos,
+      "distinct media/cloud/vehicle latency displays are missing");
   expect(response.body.find("packet_loss_percent") != std::string::npos, "per-stream packet-loss metric is missing");
   expect(response.body.find("connection_method") != std::string::npos, "ICE path classification is missing");
   expect(
@@ -2612,7 +2614,7 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
   const auto source = read_text_file("cpp/src/server.cpp");
   const auto send_sample = cpp_function_contract(
       source,
-      "bool DriverConsoleRuntime::send_native_control_sample()");
+      "bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop)");
   const auto update_intent = cpp_function_contract(
       source,
       "Json DriverConsoleRuntime::update_control_intent(");
@@ -2750,7 +2752,7 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
           acknowledgement_drain.find(
               "control_signaling_reconnect_delay_ms_ = 100") !=
               std::string::npos &&
-          sender_loop.find("send_native_control_sample()") !=
+          sender_loop.find("send_native_control_sample(stop_token)") !=
               std::string::npos &&
           status.find("{\"next_connect_in_ms\",") != std::string::npos &&
           status.find("{\"reconnect_delay_ms\", native_control_reconnect_delay_ms}") !=

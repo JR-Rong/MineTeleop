@@ -4,10 +4,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <stop_token>
 #include <vector>
 
 #include "mine_teleop/http.hpp"
@@ -36,6 +38,10 @@ struct WebSocketReceiveResult {
 
 [[nodiscard]] std::string websocket_accept_key(std::string_view client_key);
 [[nodiscard]] Json websocket_transport_diagnostics(SocketHandle socket);
+namespace detail {
+// Owns a duplicate descriptor; never closes or calls curl on the original.
+[[nodiscard]] std::function<void()> websocket_socket_interrupter(SocketHandle socket);
+}
 [[nodiscard]] std::string signaling_websocket_url(
     std::string_view signaling_url,
     std::string_view session_id,
@@ -78,6 +84,9 @@ class WebSocketClient {
   [[nodiscard]] std::string response_header(std::string_view name) const;
   void send_json(const Json& value);
   void send_json(const Json& value, std::chrono::milliseconds timeout);
+  void send_json(const Json& value, std::chrono::milliseconds timeout, std::stop_token stop);
+  // The caller serializes access, including snapshots after a failed send.
+  [[nodiscard]] Json last_send_diagnostics() const;
   void enable_read_diagnostics(bool enabled = true);
   [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout);
   // null means the rate limit skipped this sample; unsupported counters stay absent.

@@ -3244,6 +3244,7 @@ struct VehicleMediaRuntime::Impl {
       if (sampled_at_monotonic_ms == 0) sample_readiness();
       if (control_snapshot.is_null())
         control_snapshot = {{"control_service_active", false}, {"session_profile_active", false}};
+      const auto service_cause = control_snapshot.value("control_timing", Json::object()).value("control_recovery_cause", "");
       emit_diagnostic(
         waiting ? "vehicle_control_braking_wait" : "vehicle_control_recovered",
         waiting ? "control_recovery_braking_wait" : "control_recovered",
@@ -3255,7 +3256,8 @@ struct VehicleMediaRuntime::Impl {
                {"recovery_timeout_ms", recovery_timeout_ms},
                {"recovery_stable_ms", kControlRecoveryStableMs},
                {"recovery_deadline_monotonic_ms", control_recovery_latch->deadline_for(signaling.session_id()).has_value() ? Json(*control_recovery_latch->deadline_for(signaling.session_id())) : Json(nullptr)},
-               {"camera_id", failed_lane ? failed_lane->camera.id : "driver_or_critical_video"},
+               {"camera_id", failed_lane ? failed_lane->camera.id : ""},
+               {"failed_camera_present", failed_lane != nullptr},
                {"time_sync", signaling.time_sync_status().to_json()},
                {"readiness_sampled_at_monotonic_ms", sampled_at_monotonic_ms},
                {"critical_lanes", std::move(critical_lanes)},
@@ -3263,6 +3265,8 @@ struct VehicleMediaRuntime::Impl {
                {"soft_brake_request_active", soft_brake_request_active},
                {"soft_brake_applied_this_transition", soft_brake_applied_this_transition},
                {"recovery_cause", to_string(control_recovery_latch->cause_for(signaling.session_id()))},
+               {"recovery_latched_cause", to_string(control_recovery_latch->cause_for(signaling.session_id()))},
+               {"control_service_recovery_cause", service_cause},
                {"safety_action", !soft_brake_request_active ? "readiness_observed_control_not_active"
                    : waiting ? "brake_with_session_retained" : "fresh_neutral_input_requested"}});
     }
@@ -3314,9 +3318,14 @@ struct VehicleMediaRuntime::Impl {
       std::lock_guard lock(control_mutex);
       if (control_service_started && control_service) {
         receive_path_waiting = control_service->control_braking_wait();
+        // An already active receive-path wait may have healthy current flags
+        // (late packets or a coalesced historical event). Preserve its actual
+        // source instead of latching the default camera cause in the observer.
+        if (receive_path_waiting && !failed_lane) cause = control_service->control_recovery_cause();
         revisions.push_back({"driver", control_service->recovery_bad_sample_revision(),
             control_service->recovery_brake_revision()});
         ready = ready && control_service->driver_critical_video_ready();
+        if (!control_service->driver_critical_video_ready()) cause = ControlRecoveryCause::CriticalVideo;
         if (was_waiting || receive_path_waiting)
           ready = ready && control_service->recovery_samples_healthy() &&
               control_service->control_timing(signaling.now_ms()).value("consecutive_late_frames", 0) == 0;

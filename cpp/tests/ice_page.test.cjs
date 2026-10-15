@@ -185,7 +185,8 @@ test('ICE-ROUTE-SIM-001', async()=>{
       ['remote',{id:'remote',type:'remote-candidate',candidateType:directReachable?'host':'relay',protocol:'udp'}]]);
     f.peers[0].stats=report;await f.context.collectMetrics();
     const reported=f.posts.find(p=>p.route==='/api/webrtc/metrics').body;
-    assert.equal(reported.connection_method,directReachable?'direct':'TURN');assert.equal(reported.control_rtt_ms,30);
+    assert.equal(reported.connection_method,directReachable?'direct':'TURN');
+    assert.equal(reported.media_transport_rtt_ms,30);assert.equal(reported.control_rtt_ms,null);
     assert.equal(reported.source_session_id,'session-fixture');assert.equal(reported.media_negotiation_id,'a');
     const selected=controlLogic.selectedIcePair(report);assert.equal(selected.pair.id,'selected');
     const diagnostic=controlLogic.iceConnectivity(report,selected.pair);assert.equal(diagnostic.pairs.find(p=>p.selected).local_type,directReachable?'host':'relay');
@@ -200,7 +201,8 @@ test('ICE-PATH-METRICS-001', async()=>{
   f.peers[0].stats=report;await f.context.collectMetrics();
   const value=f.posts.find(p=>p.route==='/api/webrtc/metrics').body;
   assert.equal(value.network_path,'turn_tcp');assert.equal(value.media_transport_rtt_ms,50);
-  assert.equal(value.control_rtt_source,'media_ice_pair_legacy_field');
+  assert.equal(value.control_rtt_source,'not_measured_by_media_stats');
+  assert.equal(value.control_rtt_ms,null,'media RTT falsely populated control latency');
   assert.equal(value.ice_connectivity.path_checks.turn_tcp.selected_pairs,1);
   report.delete('r');await f.context.collectMetrics();
   const unknown=f.posts.filter(p=>p.route==='/api/webrtc/metrics').at(-1).body;

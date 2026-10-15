@@ -25,6 +25,7 @@ class VehicleResultLatencyWindow {
   };
   struct Snapshot {
     std::optional<Sample> last;
+    std::optional<Sample> last_accepted;
     std::size_t retained_sends;
     std::uint64_t samples;
     std::uint64_t evicted_sends;
@@ -66,6 +67,7 @@ class VehicleResultLatencyWindow {
       }
       last_ = Sample{seq, intent_seq, received_monotonic_ms - sent.started_ms,
           received_monotonic_ms, accepted, sent.data_channel, piggyback_return, feedback_data_channel};
+      if (accepted) last_accepted_ = last_;
       ++samples_;
       // Latest-mailbox semantics allow earlier sends to have been superseded.
       // This does not infer any received/accepted result for those sequences.
@@ -77,7 +79,7 @@ class VehicleResultLatencyWindow {
   }
 
   [[nodiscard]] Snapshot snapshot() const noexcept {
-    return {last_, size_, samples_, evicted_sends_, uncorrelated_results_, invalid_timing_};
+    return {last_, last_accepted_, size_, samples_, evicted_sends_, uncorrelated_results_, invalid_timing_};
   }
 
  private:
@@ -88,6 +90,7 @@ class VehicleResultLatencyWindow {
   std::size_t size_{0};
   std::uint64_t last_sent_seq_{0};
   std::optional<Sample> last_;
+  std::optional<Sample> last_accepted_;
   std::uint64_t samples_{0};
   std::uint64_t evicted_sends_{0};
   std::uint64_t uncorrelated_results_{0};
