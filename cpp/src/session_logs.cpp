@@ -324,7 +324,13 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources, const Js
         if (timestamp) { if (!first || timestamp < first) first = timestamp; last = std::max(last, timestamp); }
         if (trace_batch && !*trace_batch) continue;
         if (!record_id.empty() && record_id != id) continue;
-        if (!trace_batch && timestamp && (timestamp < begin || timestamp > end)) continue;
+        // Recorder draining can finish after the ordinary two-second log tail.
+        // Preserve only its exactly scoped completion record beyond that tail;
+        // unrelated runtime lines still obey the normal UTC/session selection.
+        const bool recording_completion = record_id == id &&
+            value.value("event", "") == "vehicle_recording_attempt_finished" &&
+            value.contains("vehicle_id") && value.at("vehicle_id") == session.at("vehicle_id");
+        if (!trace_batch && timestamp && (timestamp < begin || (timestamp > end && !recording_completion))) continue;
         if (!timestamp) { ++unattributed; continue; }
         if (source.require_session_id && record_id != id) continue;
         if (record_id.empty()) ++unscoped;
@@ -442,7 +448,7 @@ Json session_recording_evidence(const Json& summary, const Json& session, const 
         number(summary, "reported_at_utc_ms") >= attempt_fence.value("reported_at_utc_ms", std::uint64_t{0}) &&
         !(attempt_fence.value("kind", "") == "status" && !attempt_fence.value("summary_persisted", false) &&
           attempt_fence.value("reported_at_utc_ms", std::uint64_t{0}) >= number(summary, "reported_at_utc_ms"));
-    complete = complete && producer_attempt_complete && fence_valid &&
+    complete = complete && !gap && producer_attempt_complete && fence_valid &&
         number(summary, "reported_at_utc_ms") >= session.at("ended_at_utc_ms").get<std::uint64_t>();
     if (complete) {
       require(summary.at("completed_at_utc_ms").is_number_integer() &&
@@ -504,6 +510,11 @@ Json collect_session_recording_evidence(const fs::path& recording_root, const Js
         std::string attempt; std::uint64_t reported = 0; bool persisted = false;
         if (kind == "vehicle_recording_attempt_started") {
           attempt = event.value("recording_attempt_id", ""); reported = event.value("reported_at_utc_ms", std::uint64_t{0});
+        } else if (kind == "vehicle_recording_attempt_finished") {
+          // A terminal failure can be newer than the last persisted worker
+          // summary. Success logs alone never supply positive EOS/file proof.
+          if (!event.value("incomplete", false)) continue;
+          attempt = event.value("recording_attempt_id", ""); reported = event.value("reported_at_utc_ms", std::uint64_t{0});
         } else if (kind == "vehicle_media_status" && event.contains("status") && event.at("status").contains("lanes")) {
           persisted = true;
           for (const auto& lane : event.at("status").at("lanes")) {
@@ -518,10 +529,12 @@ Json collect_session_recording_evidence(const fs::path& recording_root, const Js
           }
         } else continue;
         if (attempt.empty() || reported < session.at("started_at_utc_ms").get<std::uint64_t>()) continue;
+        if (kind == "vehicle_recording_attempt_finished") gap = true;
         if (reported == latest && fence.is_object() && fence.value("recording_attempt_id", "") != attempt) ambiguous = true;
         if (reported >= latest) {
           latest = reported; fence = {{"recording_attempt_id", attempt}, {"reported_at_utc_ms", reported},
-              {"source_complete", !ambiguous}, {"kind", kind == "vehicle_recording_attempt_started" ? "started" : "status"},
+              {"source_complete", !ambiguous}, {"kind", kind == "vehicle_recording_attempt_started" ? "started" :
+                  kind == "vehicle_recording_attempt_finished" ? "finished" : "status"},
               {"summary_persisted", persisted}, {"incomplete", gap}};
         }
       }

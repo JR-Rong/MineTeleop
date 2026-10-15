@@ -426,6 +426,10 @@ struct IsolatedRecordingSession::Impl {
           "Finalization evidence is unconfirmed. Preserve clips and inspect recorder status; recording completeness is unknown." :
           "Recording is incomplete. Preserve completed clips and inspect storage/recorder health; live video continues.";
       value["status_revision"] = value.value("status_revision", std::uint64_t{0}) + 1;
+      // This failure/revision is a parent observation. The worker's previous
+      // on-disk summary does not persist the overlay, even if that older
+      // snapshot was successfully written. Keep its revision/time as provenance.
+      value["summary_persisted"] = false;
     }
     if (!local_error.empty()) value["error"] = local_error;
     return value;

@@ -44,6 +44,58 @@ Json recording_summary(const Json& session) {
       {"cameras", Json::array({{{"camera_id", "front"}, {"recording", lane}}})}};
 }
 
+void recording_terminal_failure_after_session_end() {
+  Directory dir; const auto session = metadata(now_ms());
+  const auto directory = dir.path / "recordings" / "vehicle" / "session-000001";
+  fs::create_directories(directory);
+  auto summary = recording_summary(session);
+  summary["state"] = "recording"; summary["attempt_complete"] = false;
+  summary["final_eos_received"] = false; summary["completed_at_utc_ms"] = nullptr;
+  summary["reported_at_utc_ms"] = session.at("ended_at_utc_ms").get<std::int64_t>() - 500;
+  auto& lane = summary["cameras"][0]["recording"];
+  lane["state"] = "recording"; lane["active"] = true; lane["final_eos_received"] = false;
+  lane["unfinished_segments"] = 1;
+  write(directory / "recording-session.status", summary.dump());
+  const auto started = Json{{"event", "vehicle_recording_attempt_started"}, {"vehicle_id", "vehicle"},
+      {"session_id", "session-000001"}, {"recording_attempt_id", "attempt-current"},
+      {"reported_at_utc_ms", session.at("started_at_utc_ms")}};
+  const auto finished_at = session.at("ended_at_utc_ms").get<std::int64_t>() + 8600;
+  const auto finished = Json{{"event", "vehicle_recording_attempt_finished"}, {"vehicle_id", "vehicle"},
+      {"session_id", "session-000001"}, {"recording_attempt_id", "attempt-current"},
+      {"event_at_utc_ms", finished_at}, {"reported_at_utc_ms", finished_at}, {"incomplete", true}};
+  auto other = finished; other["session_id"] = "session-000002";
+  auto other_vehicle = finished; other_vehicle["vehicle_id"] = "other-vehicle";
+  const auto snapshot = dir.path / "snapshot/runtime.log";
+  write(dir.path / "runtime.log", started.dump() + "\n" + finished.dump() + "\n" +
+      other.dump() + "\n" + other_vehicle.dump() + "\n");
+  collect_session_logs({{dir.path / "runtime.log", "runtime.log"}}, session, dir.path / "snapshot");
+  const auto exported = read(snapshot);
+  check(exported.find("vehicle_recording_attempt_finished") != std::string::npos,
+        "bounded recorder completion after the ordinary UTC tail was dropped");
+  check(exported.find("other-vehicle") == std::string::npos && exported.find("session-000002") == std::string::npos,
+        "late recorder completion crossed its vehicle/session boundary");
+  const auto evidence = collect_session_recording_evidence(dir.path / "recordings", session, {}, snapshot, true);
+  check(evidence.at("evidence_status") == "incomplete" && evidence.at("complete") == false &&
+        evidence.at("attempt_complete") == false,
+        "terminal runtime failure was hidden by an older persisted recording snapshot");
+  check(evidence.at("attempt_fence").at("kind") == "finished" &&
+        evidence.at("attempt_fence").at("reported_at_utc_ms") == finished_at,
+        "completion failure did not retain its actual terminal observation time");
+  // Even a positive disk snapshot cannot erase explicit terminal negative
+  // evidence for that same attempt, including equal/coarse wall timestamps.
+  auto conflicting = recording_summary(session);
+  conflicting["reported_at_utc_ms"] = finished_at;
+  write(directory / "recording-session.status", conflicting.dump());
+  check(collect_session_recording_evidence(dir.path / "recordings", session, {}, snapshot, true)
+            .at("attempt_complete") == false, "terminal failure did not veto otherwise complete disk evidence");
+  write(directory / "recording-session.status", summary.dump());
+  // Logs are only negative evidence. A success event cannot upgrade stale disk state.
+  auto success = finished; success["incomplete"] = false;
+  write(snapshot, started.dump() + "\n" + success.dump() + "\n");
+  check(collect_session_recording_evidence(dir.path / "recordings", session, {}, snapshot, true)
+            .at("evidence_status") == "unknown", "success log fabricated persisted EOS proof");
+}
+
 void recording_evidence_scope_and_completion() {
   Directory dir; const auto session = metadata(now_ms());
   const auto directory = dir.path / "recordings" / "vehicle" / "session-000001";
@@ -449,6 +501,6 @@ void three_endpoint_export() {
 }
 }
 int main() {
-  try { package_configuration(); collection_and_zip(); recording_evidence_scope_and_completion(); trace_batch_session_filter(); vehicle_export_failure_reporting(); session_window_scan_priority(); long_log_redaction(); three_endpoint_export(); std::cout << "session_log_export_tests=passed\n"; return 0; }
+  try { package_configuration(); collection_and_zip(); recording_terminal_failure_after_session_end(); recording_evidence_scope_and_completion(); trace_batch_session_filter(); vehicle_export_failure_reporting(); session_window_scan_priority(); long_log_redaction(); three_endpoint_export(); std::cout << "session_log_export_tests=passed\n"; return 0; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

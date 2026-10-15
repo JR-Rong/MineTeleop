@@ -77,6 +77,8 @@ void eos_stall(const std::filesystem::path& self) {
     check(elapsed>=std::chrono::milliseconds(7900)&&elapsed<std::chrono::seconds(9),"actual EOS/drain stops within independent 8s parent budget");
     check(value["accepted_access_units"]==1&&value["worker_input_access_units"]==1,"stalled worker actually received complete AU and matching End");
     check(value["state"]=="failed"&&value["issue_code"]=="recording_finalize_timeout"&&value["incomplete"]==true&&value["final_eos_received"]==false&&value["cleanup_pending"]==false,"EOS stall cannot be finalized or leave child pending");
+    check(value["summary_persisted"]==false&&value["summary_revision"]==3&&value["status_revision"]==4,
+          "parent timeout must not reuse the previous worker snapshot's persistence proof");
     observed={{"event","recording_eos_stall_observed"},{"elapsed_ms",std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()},{"issue_code",value["issue_code"]},{"final_eos_received",value["final_eos_received"]},{"cleanup_pending",value["cleanup_pending"]},{"fd_before",before}};
   }
   check(fd_count()==before,"EOS-timeout resource cleanup");
