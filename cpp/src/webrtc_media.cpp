@@ -2,6 +2,7 @@
 #include "mine_teleop/detail/control_transport.hpp"
 #include "mine_teleop/detail/direct_authority.hpp"
 #include "mine_teleop/detail/emergency_stop.hpp"
+#include "mine_teleop/detail/feedback_transport.hpp"
 
 #include "mine_teleop/gstreamer_media.hpp"
 #include "mine_teleop/detail/gstreamer_freshness.hpp"
@@ -1207,6 +1208,7 @@ struct VehicleMediaRuntime::Impl {
          {"type", "offer"},
          {"control_transport_capability", self->signaling.transport_mac_key().size() >= 32 ? detail::kControlTransportCapability : std::string_view{}},
          {"emergency_stop_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kEmergencyStopCapability : std::string_view{}},
+         {"feedback_transport_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kFeedbackTransportCapability : std::string_view{}},
          {"sdp", text == nullptr ? "" : text},
          {"media_negotiation_id", negotiation_id},
          {"legacy_bootstrap_allowed", state->attempt_count == 1 && state->offer_count == 1},
@@ -1578,7 +1580,7 @@ struct VehicleMediaRuntime::Impl {
       if (command.session_id != signaling.session_id() || command.vehicle_id != config.vehicle_id ||
           command.driver_id != signaling.driver_id() || command.control_token != signaling.control_token())
         throw std::invalid_argument("control result authority mismatch");
-      if ((message.contains("control_transport") || message.contains("emergency_stop")) && !detail::verify_transport_message(message, signaling.transport_mac_key(), false))
+      if ((message.contains("control_transport") || message.contains("emergency_stop") || message.contains("feedback_request")) && !detail::verify_transport_message(message, signaling.transport_mac_key(), false))
         throw std::invalid_argument("native control authentication failed");
       std::string current_attempt;
       { std::lock_guard scope_lock(media_signal_state->mutex); current_attempt = media_signal_state->negotiation_id; }
@@ -1593,6 +1595,8 @@ struct VehicleMediaRuntime::Impl {
         const auto stamp = detail::ControlTransportStamp::from_json(message.at("control_transport"));
         result_message["control_transport"] = stamp.to_json();
       }
+      if (message.contains("feedback_request") && message.at("feedback_request").is_object() && message.at("feedback_request").dump().size() <= 1024)
+        result_message["feedback_request"] = message.at("feedback_request");
       bool emergency_reserved = false, verified_stop_only = false;
       if (message.contains("emergency_stop") && message.at("emergency_stop").is_object() && message.at("emergency_stop").dump().size() <= 1024)
         result_message["emergency_stop"] = message.at("emergency_stop");
@@ -1605,6 +1609,7 @@ struct VehicleMediaRuntime::Impl {
         result_message["result_seq"] = ++control_result_seq;
         result_message["authority_epoch"] = control_transport_fence.epoch();
         if (direct_authority.configured()) result_message["direct_authority"] = direct_authority.status(steady_now_ms());
+        if (message.contains("feedback_request") || feedback_transport_fence.negotiated()) result_message["feedback_transport"] = feedback_transport_fence.state();
         if (config.runtime.experimental_direct_authority_max_ms > 0) {
           if (control_service) emergency_stop_receiver.observe_latched(control_service->safety_state() == SafetyState::Estop);
           result_message["emergency_reset_epoch"] = emergency_stop_receiver.reset_epoch();
@@ -1613,10 +1618,15 @@ struct VehicleMediaRuntime::Impl {
         if (signaling.transport_mac_key().size() >= 32)
           result_message["vehicle_mac"] = detail::transport_message_mac(result_message, signaling.transport_mac_key(), true);
         if (emergency_reserved) static_cast<void>(emergency_stop_receiver.complete(message, result_message));
-        latest_control_result = result_message;
-        if (native_feedback) *native_feedback = result_message;
-        if (control_link_open && control_channel &&
-            ((transport == ControlMessageTransport::DataChannel && control_channel == channel) || message.contains("emergency_stop")))
+        const bool selected_feedback = feedback_transport_fence.negotiated() && message.contains("feedback_request") && !command.estop;
+        const bool probe = selected_feedback && message.at("feedback_request").value("probe", false);
+        const bool via_wss = !selected_feedback || probe || feedback_transport_fence.path() == detail::ControlPath::Wss;
+        const bool via_dc = selected_feedback ? probe || feedback_transport_fence.path() == detail::ControlPath::DataChannel :
+            transport == ControlMessageTransport::DataChannel || message.contains("emergency_stop");
+        if (via_wss) latest_control_result = result_message;
+        if (native_feedback && via_wss) *native_feedback = result_message;
+        if (control_link_open && control_channel && via_dc &&
+            (transport != ControlMessageTransport::DataChannel || control_channel == channel))
           gst_webrtc_data_channel_send_string(control_channel, result_message.dump().c_str());
       }};
       const bool stale_safe_heartbeat =
@@ -1817,7 +1827,7 @@ struct VehicleMediaRuntime::Impl {
           (!direct_authority.configured() || !direct_authority.allows(message.value("direct_authority", Json(nullptr)), steady_now_ms()))) {
         ++rejected_control_commands; result_message["reason"] = "direct_authority_unavailable"; return;
       }
-      if (message.contains("control_transport") || control_transport_fence.negotiated()) {
+      if (message.contains("control_transport") || message.contains("feedback_request") || control_transport_fence.negotiated()) {
         const auto decision = control_transport_fence.admit(command,
             message.contains("control_transport") ? &message.at("control_transport") : nullptr,
             transport == ControlMessageTransport::DataChannel ? detail::ControlPath::DataChannel : detail::ControlPath::Wss,
@@ -1835,6 +1845,20 @@ struct VehicleMediaRuntime::Impl {
         }
       } else {
         result_message["transport_admitted"] = true;
+      }
+      if (!command.estop && config.runtime.experimental_direct_authority_max_ms > 0 && message.contains("feedback_request")) {
+        const auto before = feedback_transport_fence.state();
+        static_cast<void>(feedback_transport_fence.select(message.at("feedback_request"), direct_authority.reference(), current_attempt, control_status_seq));
+        if (before != feedback_transport_fence.state()) {
+          pending_control_status.clear();
+          // Re-publish current snapshots with new status publication sequences;
+          // original CAN/evidence timestamps remain unchanged.
+          for (const auto& [kind, snapshot] : latest_feedback_status) {
+            if (kind == "control_command_rejected") continue; // Event notification is not a fresh state snapshot.
+            auto status = snapshot; status["control_status_seq"] = ++control_status_seq;
+            send_control_status_locked(std::move(status));
+          }
+        }
       }
       if (!command.estop && !intent_fresh && !stale_safe_heartbeat) {
         native_control_stale_nonzero_intents_discarded_total.fetch_add(
@@ -2495,11 +2519,14 @@ struct VehicleMediaRuntime::Impl {
             std::vector<Json> ordered_status;
             for (const auto& [event, status] : statuses) { static_cast<void>(event); ordered_status.push_back(status); }
             std::sort(ordered_status.begin(), ordered_status.end(), [](const Json& left, const Json& right) {
-              return left.at("control_status_seq").get<std::uint64_t>() < right.at("control_status_seq").get<std::uint64_t>(); });
-            for (const auto& status : ordered_status)
-              websocket.send_json({{"event", "vehicle_control_status"}, {"protocol", detail::kControlTransportCapability},
+              return (left.contains("status") ? left.at("status") : left).at("control_status_seq").get<std::uint64_t>() <
+                  (right.contains("status") ? right.at("status") : right).at("control_status_seq").get<std::uint64_t>(); });
+            for (const auto& status : ordered_status) {
+              if (status.value("event", "") == "vehicle_control_status") websocket.send_json(status, kNativeControlWebSocketSendTimeout);
+              else websocket.send_json({{"event", "vehicle_control_status"}, {"protocol", detail::kControlTransportCapability},
                   {"session_id", signaling.session_id()}, {"vehicle_id", config.vehicle_id}, {"driver_id", signaling.driver_id()},
                   {"status", status}}, kNativeControlWebSocketSendTimeout);
+            }
             if (result.is_object() && result.value("result_seq", std::uint64_t{0}) > last_result_sent) {
               websocket.send_json(result, kNativeControlWebSocketSendTimeout);
               last_result_sent = result.at("result_seq").get<std::uint64_t>();
@@ -2800,6 +2827,25 @@ struct VehicleMediaRuntime::Impl {
   }
 
   void send_control_status_locked(Json message) {
+    if (config.runtime.experimental_direct_authority_max_ms > 0) {
+      const auto kind = message.value("event", "");
+      if (kind != "vehicle_telemetry" && kind != "vcu_handshake_status" && kind != "session_control_profile_status" && kind != "control_command_rejected") return;
+      if ((message.contains("session_id") && message.at("session_id") != signaling.session_id()) ||
+          (message.contains("vehicle_id") && message.at("vehicle_id") != config.vehicle_id) ||
+          (message.contains("driver_id") && message.at("driver_id") != signaling.driver_id())) return;
+      message["session_id"] = signaling.session_id(); message["vehicle_id"] = config.vehicle_id; message["driver_id"] = signaling.driver_id();
+      latest_feedback_status[kind] = message;
+      if (feedback_transport_fence.negotiated()) {
+        Json wrapper = {{"event", "vehicle_control_status"}, {"protocol", detail::kControlTransportCapability},
+            {"session_id", signaling.session_id()}, {"vehicle_id", config.vehicle_id}, {"driver_id", signaling.driver_id()},
+            {"feedback_transport", feedback_transport_fence.state()}, {"status", std::move(message)}};
+        wrapper["vehicle_mac"] = detail::transport_message_mac(wrapper, signaling.transport_mac_key(), true);
+        if (feedback_transport_fence.path() == detail::ControlPath::DataChannel && control_channel && control_link_open)
+          gst_webrtc_data_channel_send_string(control_channel, wrapper.dump().c_str());
+        else if (feedback_transport_fence.path() == detail::ControlPath::Wss) pending_control_status[kind] = std::move(wrapper);
+        return;
+      }
+    }
     if (control_channel != nullptr && control_link_open &&
         (!control_transport_fence.negotiated() || control_transport_fence.path() == detail::ControlPath::DataChannel)) {
       gst_webrtc_data_channel_send_string(control_channel, message.dump().c_str());
@@ -4718,6 +4764,7 @@ struct VehicleMediaRuntime::Impl {
     }
     control_transport_fence.reset(config.vehicle_id, signaling.driver_id(), signaling.session_id(), signaling.control_token());
     emergency_stop_receiver.reset(config.vehicle_id, signaling.driver_id(), signaling.session_id(), signaling.control_token());
+    feedback_transport_fence.reset(); latest_feedback_status.clear(); pending_control_status.clear();
     const bool inherited_control_inhibition =
         control_recovery_latch->enter_session(signaling.session_id());
     control_inhibited.store(inherited_control_inhibition);
@@ -5107,6 +5154,8 @@ struct VehicleMediaRuntime::Impl {
   detail::ControlTransportFence control_transport_fence;
   detail::DirectAuthorityLease direct_authority;
   detail::EmergencyStopReceiver emergency_stop_receiver;
+  detail::FeedbackTransportFence feedback_transport_fence;
+  std::map<std::string, Json> latest_feedback_status;
   Json latest_control_result;
   std::map<std::string, Json> pending_control_status;
   std::uint64_t last_control_management_seq{0};

@@ -22,6 +22,7 @@
 #include "mine_teleop/detail/control_transport_sender.hpp"
 #include "mine_teleop/detail/direct_authority.hpp"
 #include "mine_teleop/detail/emergency_stop.hpp"
+#include "mine_teleop/detail/feedback_transport.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/websocket.hpp"
@@ -463,6 +464,8 @@ class DriverConsoleRuntime {
   [[nodiscard]] bool send_native_control_sample();
   void poll_native_control_acknowledgements();
   [[nodiscard]] bool direct_control_continuation_available_locked();
+  void consume_feedback_status_locked(const Json& value, std::string_view session,
+      std::string_view vehicle, std::string_view driver, detail::ControlPath returned);
   void observe_emergency_stop_result_verified(const Json& result, bool data_channel_return);
   // Caller holds native_control_update_mutex_; no transport lock or network I/O.
   [[nodiscard]] Json publish_native_emergency_locked(const NativeControlIntentSample& sample,
@@ -579,6 +582,10 @@ class DriverConsoleRuntime {
   bool control_transport_cloud_capable_{false};
   bool control_transport_vehicle_capable_{false}; // mutex_
   bool emergency_stop_vehicle_capable_{false}; // mutex_
+  bool feedback_transport_vehicle_capable_{false}; // mutex_
+  detail::FeedbackTransportSender feedback_transport_sender_; // existing transport mutex
+  bool feedback_transport_enabled_{false};
+  bool feedback_transport_dc_is_p2p_{false};
   std::mutex emergency_stop_mutex_;
   Json emergency_stop_latest_frame_, emergency_stop_last_result_;
   std::string emergency_stop_owner_, emergency_stop_attempt_;

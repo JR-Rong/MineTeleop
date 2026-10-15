@@ -2,12 +2,12 @@ const assert = require('node:assert/strict');
 const api = require('../web/control_transport.js');
 function fixture() {
   let time = 0, current = {session:'s',generation:7,ui:'owner',uiEpoch:2,attempt:'a',ready:true};
-  const requests = [], frames = [], boundaries = [], raw = [];
+  const requests = [], frames = [], boundaries = [], raw = [], statuses = [];
   let reply = () => ({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:1},valid_for_ms:100,frame_json:'{"native":"original bytes"}',
     frame:{seq:1,intent_seq:1,session_id:'s',sent_at_utc_ms:123,control_transport:{protocol:api.protocol,path:'dc',media_attempt:'a'}}});
   const courier = api.createCourier({scope:()=>current,now:()=>time,
-    post:async(path,body)=>{requests.push({path,body});return reply()},send:(frame,bytes)=>{assert.equal(typeof bytes,'string');frames.push(frame);raw.push(bytes)},onBoundary:()=>boundaries.push(true)});
-  return {courier,requests,frames,boundaries,raw,setTime:value=>time=value,setScope:value=>current=value,
+    post:async(path,body)=>{requests.push({path,body});return reply()},send:(frame,bytes)=>{assert.equal(typeof bytes,'string');frames.push(frame);raw.push(bytes)},onBoundary:()=>boundaries.push(true),onStatus:value=>statuses.push(value)});
+  return {courier,requests,frames,boundaries,raw,statuses,setTime:value=>time=value,setScope:value=>current=value,
     setReply:value=>reply=value,scope:()=>current};
 }
 const cases = [];
@@ -59,6 +59,28 @@ test('unclaimed page and missing media scope cannot fetch native packets',async(
   for(const patch of [{uiEpoch:0},{session:''},{attempt:''},{ui:''}]) {
     const f=fixture();f.setScope({...f.scope(),...patch});await f.courier.tick();assert.equal(f.requests.length,0);
   }
+});
+const feedbackStamp=epoch=>({protocol:api.feedbackProtocol,enabled:true,epoch,from_epoch:epoch-1,path:'dc',media_attempt:'a',authority_issuer:'issuer',authority_epoch:7,status_floor:0});
+const feedbackStatus=(epoch,seq,kind='vehicle_telemetry')=>({event:'vehicle_control_status',protocol:api.protocol,session_id:'s',feedback_transport:feedbackStamp(epoch),status:{event:kind,control_status_seq:seq}});
+test('feedback epoch is compared before four-kind mailbox sequences and native-only status delivery',async()=>{
+  const f=fixture();f.setReply(()=>({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:1},feedback_transport:feedbackStamp(1)}));await f.courier.tick();
+  assert.equal(f.courier.receive(feedbackStatus(1,Number.MAX_SAFE_INTEGER)),true);
+  assert.equal(f.courier.receive(feedbackStatus(2,1)),true);
+  assert.equal(f.courier.receive(feedbackStatus(99,2)),false);
+  f.setReply(()=>({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:1},feedback_transport:feedbackStamp(2),
+    statuses:[{...feedbackStatus(1,Number.MAX_SAFE_INTEGER).status,feedback_transport:feedbackStamp(1)}, {...feedbackStatus(2,1).status,feedback_transport:feedbackStamp(2)}]}));
+  await f.courier.tick();assert.equal(f.requests[1].body.vehicle_statuses.length,1);assert.equal(f.requests[1].body.vehicle_statuses[0].status.control_status_seq,1);
+  assert.equal(f.statuses.length,1);assert.equal(f.statuses[0].control_status_seq,1);assert.equal(f.boundaries.length,1,'feedback-only switch cleared ordinary input');
+  const result=(epoch,seq)=>({event:'vehicle_control_result',protocol:api.protocol,session_id:'s',command_seq:seq,result_seq:seq,feedback_transport:feedbackStamp(epoch)});
+  assert.equal(f.courier.receive(result(1,Number.MAX_SAFE_INTEGER)),false);assert.equal(f.courier.receive(result(2,3)),true);
+});
+test('feedback snapshots arriving during an HTTP request survive and retired scope cannot leak them',async()=>{
+  const f=fixture();f.courier.receive(feedbackStatus(1,1));let resolve;
+  f.setReply(()=>new Promise(done=>resolve=done));const pending=f.courier.tick();f.courier.receive(feedbackStatus(1,2));
+  resolve({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'wss',revision:1},feedback_transport:feedbackStamp(1)});await pending;
+  f.setReply(()=>({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'wss',revision:1},feedback_transport:feedbackStamp(1)}));await f.courier.tick();
+  assert.equal(f.requests[1].body.vehicle_statuses[0].status.control_status_seq,2);
+  f.setScope({...f.scope(),attempt:'new'});await f.courier.tick();assert.equal(f.requests[2].body.vehicle_statuses,undefined);
 });
 function emergencyFixture() {
   let time=0,current={session:'s',generation:7,ui:'owner',uiEpoch:2,attempt:'a',ready:true};

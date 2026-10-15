@@ -27,6 +27,10 @@ struct Fixture {
   ControlTransportFence fence;
   DirectAuthorityLease car_authority;
   EmergencyStopReceiver emergency_receiver;
+  FeedbackTransportFence feedback_fence;
+  bool feedback_enabled{false}, drop_dc_feedback{false};
+  Json pending_dc_feedback, last_feedback_command;
+  std::uint64_t feedback_status_sequence{};
   std::mutex car_mutex;
   std::jthread car_watchdog;
   std::filesystem::path authority_directory;
@@ -38,7 +42,7 @@ struct Fixture {
   std::int64_t last_input{0};
   std::deque<std::pair<std::int64_t, Json>> delayed;
   std::vector<Json> received_statuses;
-  explicit Fixture(bool direct = false) : direct_enabled(direct) {
+  explicit Fixture(bool direct = false, bool feedback = false) : feedback_enabled(feedback), direct_enabled(direct) {
     SignalingServerConfig config;
     if (direct_enabled) {
       authority_directory = std::filesystem::temp_directory_path() / ("mine-direct-loopback-" + std::to_string(steady()));
@@ -90,7 +94,8 @@ struct Fixture {
         {"connection_generation", generation}, {"type", "webrtc_offer"},
         {"payload", {{"type", "offer"}, {"sdp", "v=0\r\na=ice-ufrag:offline\r\n"},
                      {"media_negotiation_id", "media-a"}, {"control_transport_capability", kControlTransportCapability},
-                     {"emergency_stop_capability", direct_enabled ? kEmergencyStopCapability : std::string_view{}}}}});
+                     {"emergency_stop_capability", direct_enabled ? kEmergencyStopCapability : std::string_view{}},
+                     {"feedback_transport_capability", feedback_enabled ? kFeedbackTransportCapability : std::string_view{}}}}});
     static_cast<void>(http.post_json_response(base + "/signaling/" + session + "/messages", offer));
     static_cast<void>(driver->poll_signaling());
     input();
@@ -169,6 +174,10 @@ struct Fixture {
     if (!direct_enabled || command.estop || car_authority.allows(payload.value("direct_authority", Json(nullptr)), steady()))
       decision = fence.admit(command, payload.contains("control_transport") ? &payload.at("control_transport") : nullptr,
           path, "media-a", utc(), utc() + 10000, 200, !direct_enabled || car_authority.valid(steady()), verified_stop);
+    if (feedback_enabled && decision.admitted && !command.estop && payload.contains("feedback_request")) {
+      static_cast<void>(feedback_fence.select(payload.at("feedback_request"), car_authority.reference(), "media-a", feedback_status_sequence));
+      last_feedback_command = payload;
+    }
     ReceiveResult applied;
     if (decision.admitted) {
       if (decision.changed) vehicle->set_control_braking_wait(true, utc(), ControlRecoveryCause::ControlLink);
@@ -182,11 +191,15 @@ struct Fixture {
             payload.at("control_transport").at("action") == "select"}, {"authority_epoch", fence.epoch()},
         {"reason", decision.admitted ? applied.reason : std::string(decision.reason)}};
     if (payload.contains("control_transport")) result["control_transport"] = payload.at("control_transport");
+    if (feedback_enabled && payload.contains("feedback_request")) {
+      result["feedback_request"] = payload.at("feedback_request"); result["feedback_transport"] = feedback_fence.state();
+    }
     if (direct_enabled) {
       result["direct_authority"] = car_authority.status(steady());
       result["emergency_reset_epoch"] = emergency_receiver.reset_epoch();
       result["command_received_path"] = control_path_name(path);
     }
+    if (feedback_enabled && feedback_fence.negotiated()) result["feedback_transport"] = feedback_fence.state();
     if (verified_stop) {
       emergency_receiver.observe_latched(vehicle->safety_state() == SafetyState::Estop);
       result["emergency_stop"] = payload.at("emergency_stop");
@@ -195,6 +208,19 @@ struct Fixture {
     result["vehicle_mac"] = transport_message_mac(result, signing_key, true);
     if (verified_stop) expect(emergency_receiver.complete(payload, result), "production emergency cache did not commit result");
     return result;
+  }
+  void route_feedback(const Json& result, const Json& payload) {
+    const bool selected = payload.contains("feedback_request") && feedback_fence.negotiated();
+    const bool probe = selected && payload.at("feedback_request").value("probe", false);
+    if (!selected || probe || feedback_fence.path() == ControlPath::Wss) delayed.emplace_back(steady() + 60, result);
+    if (!drop_dc_feedback && selected && (probe || feedback_fence.path() == ControlPath::DataChannel)) pending_dc_feedback = result;
+  }
+  Json feedback_status(std::uint64_t sequence, Json stamp, std::string_view kind = "vehicle_telemetry") {
+    Json result = {{"event", "vehicle_control_status"}, {"protocol", kControlTransportCapability},
+        {"session_id", session}, {"vehicle_id", "transport-vehicle"}, {"driver_id", "transport-driver"},
+        {"feedback_transport", std::move(stamp)}, {"status", {{"event", kind}, {"session_id", session},
+        {"vehicle_id", "transport-vehicle"}, {"driver_id", "transport-driver"}, {"control_status_seq", sequence}}}};
+    result["vehicle_mac"] = transport_message_mac(result, signing_key, true); return result;
   }
   void pump(bool dc_ready) {
     renew_authority();
@@ -209,19 +235,24 @@ struct Fixture {
           {"trace_session_id", session}, {"seq", payload.at("seq")}, {"intent_seq", payload.at("intent_seq")}});
       // Model the reported distinction: cloud ingress remains fast while the
       // actual vehicle result is slower than the simulated DC byte path.
-      delayed.emplace_back(steady() + 60, std::move(result));
+      if (feedback_enabled) route_feedback(result, payload); else delayed.emplace_back(steady() + 60, std::move(result));
     }
     while (cloud_online && !delayed.empty() && delayed.front().first <= steady()) {
       vehicle_socket.send_json(delayed.front().second); delayed.pop_front();
     }
     auto request = scope(dc_ready);
+    if (pending_dc_feedback.is_object()) { request["vehicle_result"] = pending_dc_feedback; pending_dc_feedback = Json(nullptr); }
     auto response = driver->control_transport_bridge(request);
     for (const auto& status : response.at("statuses")) received_statuses.push_back(status);
     if (dc_ready && response.at("frame_json").is_string()) {
       const auto payload = Json::parse(response.at("frame_json").get<std::string>());
       expect(payload.at("seq").get<std::uint64_t>() > last_dc_seq, "bridge replayed a frame");
       last_dc_seq = payload.at("seq").get<std::uint64_t>(); ++dc_commands;
-      request = scope(true); request["vehicle_result"] = apply(payload, ControlPath::DataChannel);
+      request = scope(true);
+      if (feedback_enabled) {
+        route_feedback(apply(payload, ControlPath::DataChannel), payload);
+        if (pending_dc_feedback.is_object()) { request["vehicle_result"] = pending_dc_feedback; pending_dc_feedback = Json(nullptr); }
+      } else request["vehicle_result"] = apply(payload, ControlPath::DataChannel);
       static_cast<void>(driver->control_transport_bridge(request));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -263,6 +294,72 @@ void integration() {
         "WSS status return reordered or duplicated vehicle status sequences");
     expect(fixture.received_statuses[index].at("session_id") == fixture.session, "WSS status lost session scope");
   }
+}
+
+void actual_feedback_selection_is_independent_and_rejects_retired_statuses() {
+  Fixture fixture(true, true); fixture.drop_dc_feedback = true;
+  bool ready = false;
+  auto deadline = steady() + 8000;
+  while (steady() < deadline) {
+    fixture.pump(true);
+    const auto state = fixture.driver->status().at("native_control").at("control_transport");
+    if (state.at("path") == "dc" && !state.at("selecting").get<bool>() && !state.at("qualifying").get<bool>() &&
+        state.at("feedback_transport").value("path", "") == "wss" && !state.at("feedback_transport").value("selecting", true)) { ready = true; break; }
+  }
+  expect(ready, "actual native could not use DC commands with independent WSS feedback");
+  const auto before = fixture.driver->status().at("native_control").at("control_transport");
+  const auto old_feedback = fixture.feedback_fence.state();
+  fixture.vehicle_socket.send_json(fixture.feedback_status(++fixture.feedback_status_sequence, old_feedback));
+  const auto status_deadline = steady() + 1500;
+  while (steady() < status_deadline && fixture.received_statuses.empty()) fixture.pump(true);
+  expect(!fixture.received_statuses.empty() && fixture.received_statuses.back().at("control_status_seq") == 1,
+      "selected WSS feedback failed to carry authenticated status");
+  fixture.drop_dc_feedback = false;
+  ready = false; deadline = steady() + 5000;
+  while (steady() < deadline) {
+    fixture.pump(true);
+    const auto state = fixture.driver->status().at("native_control").at("control_transport");
+    if (state.at("feedback_transport").value("path", "") == "dc" && !state.at("feedback_transport").value("selecting", true)) { ready = true; break; }
+  }
+  expect(ready, "actual native did not prefer healthy P2P feedback after return health recovered");
+  const auto after = fixture.driver->status().at("native_control").at("control_transport");
+  expect(after.at("epoch") == before.at("epoch") && after.at("path") == "dc", "feedback switch changed ordinary command epoch/path");
+  auto request = fixture.scope(true);
+  request["vehicle_statuses"] = Json::array({fixture.feedback_status(std::numeric_limits<std::uint64_t>::max(), old_feedback),
+      fixture.feedback_status(2, fixture.feedback_fence.state())});
+  const auto response = fixture.driver->control_transport_bridge(request);
+  expect(response.at("statuses").size() == 1 && response.at("statuses").front().at("control_status_seq") == 2,
+      "retired high feedback sequence poisoned the actual native status reducer");
+  const auto duplicate = fixture.driver->control_transport_bridge(request);
+  expect(duplicate.at("statuses").empty(), "duplicate status falsely advanced native state");
+  auto tampered = fixture.feedback_status(3, fixture.feedback_fence.state()); tampered["status"]["control_status_seq"] = 999;
+  request["vehicle_statuses"] = Json::array({tampered, fixture.feedback_status(3, fixture.feedback_fence.state())});
+  const auto clean = fixture.driver->control_transport_bridge(request);
+  expect(clean.at("statuses").size() == 1 && clean.at("statuses").front().at("control_status_seq") == 3,
+      "unverified high status poisoned native feedback watermark");
+  request["vehicle_statuses"] = Json::array({fixture.feedback_status(5, fixture.feedback_fence.state(), "vcu_handshake_status"),
+      fixture.feedback_status(4, fixture.feedback_fence.state())});
+  const auto batch = fixture.driver->control_transport_bridge(request);
+  expect(batch.at("statuses").size() == 2 && batch.at("statuses").front().at("control_status_seq") == 4 &&
+      batch.at("statuses").back().at("control_status_seq") == 5, "four-kind batch advanced global watermark before ordering snapshots");
+  fixture.feedback_status_sequence = 5;
+  // Old epoch high seq traverses the actual cloud cache/socket as well.
+  fixture.vehicle_socket.send_json(fixture.feedback_status(std::numeric_limits<std::uint64_t>::max(), old_feedback));
+  fixture.drop_dc_feedback = true; ready = false; deadline = steady() + 3000;
+  while (steady() < deadline) {
+    fixture.pump(true);
+    const auto state = fixture.driver->status().at("native_control").at("control_transport");
+    if (state.at("feedback_transport").value("path", "") == "wss" && !state.at("feedback_transport").value("selecting", true)) { ready = true; break; }
+  }
+  expect(ready, "one-way DC return loss did not independently select WSS feedback backup");
+  const auto fallback = fixture.driver->status().at("native_control").at("control_transport");
+  expect(fallback.at("epoch") == before.at("epoch") && fallback.at("path") == "dc", "return-only fault changed healthy command axis");
+  fixture.received_statuses.clear();
+  fixture.vehicle_socket.send_json(fixture.feedback_status(++fixture.feedback_status_sequence, fixture.feedback_fence.state()));
+  deadline = steady() + 1500;
+  while (steady() < deadline && fixture.received_statuses.empty()) fixture.pump(true);
+  expect(fixture.received_statuses.size() == 1 && fixture.received_statuses.front().at("control_status_seq") == 6,
+      "retired high sequence poisoned actual cloud WSS status cache/socket watermark");
 }
 
 void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
@@ -379,6 +476,6 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
 }
 }  // namespace
 int main() {
-  try { integration(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { integration(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

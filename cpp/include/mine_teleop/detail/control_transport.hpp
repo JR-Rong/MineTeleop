@@ -108,6 +108,11 @@ inline Json bounded_vehicle_control_result(const Json& value, std::string_view s
       throw std::invalid_argument("invalid direct authority result");
     result["direct_authority"] = value.at("direct_authority");
   }
+  for (const auto* key : {"feedback_transport", "feedback_request"}) if (value.contains(key)) {
+    if (!value.at(key).is_null() && (!value.at(key).is_object() || value.at(key).dump().size() > 1024))
+      throw std::invalid_argument("invalid feedback result identity");
+    result[key] = value.at(key);
+  }
   if (value.contains("emergency_stop")) {
     if (!value.at("emergency_stop").is_object() || value.at("emergency_stop").dump().size() > 1024)
       throw std::invalid_argument("invalid emergency result identity");
@@ -144,8 +149,14 @@ inline Json bounded_vehicle_control_status(const Json& value, std::string_view s
     if (message.contains(key) && message.at(key) != expected) throw std::invalid_argument("vehicle status identity mismatch");
     message[key] = expected;
   }
-  return {{"event", "vehicle_control_status"}, {"protocol", kControlTransportCapability},
+  Json result = {{"event", "vehicle_control_status"}, {"protocol", kControlTransportCapability},
       {"session_id", session}, {"vehicle_id", vehicle}, {"driver_id", driver}, {"status", std::move(message)}};
+  if (value.contains("feedback_transport")) {
+    if (!value.at("feedback_transport").is_object() || value.at("feedback_transport").dump().size() > 1024)
+      throw std::invalid_argument("invalid feedback status identity");
+    result["feedback_transport"] = value.at("feedback_transport"); result["vehicle_mac"] = value.at("vehicle_mac");
+  }
+  return result;
 }
 
 // Session-owned, serialized by the SAME mutex as VehicleControlService. It

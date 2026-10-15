@@ -15,6 +15,7 @@ class ControlTransportSender {
  public:
   struct Receipt { bool matched{false}; bool boundary{false}; std::int64_t round_trip_ms{0}; bool current{false}; };
   void reset() { *this = {}; }
+  void reset_feedback_comparison() { wss_.reset(); dc_.reset(); baseline_wss_ms_.reset(); }
   void set_data_channel_is_p2p(bool value) { dc_is_p2p_ = value; }
   [[nodiscard]] ControlPath path() const { return stamp_.path; }
   [[nodiscard]] bool negotiated() const { return stamp_.epoch != 0; }
