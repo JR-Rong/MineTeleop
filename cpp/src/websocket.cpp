@@ -102,6 +102,15 @@ Json socket_transport_diagnostics(SocketHandle socket) {
       result["peer_port"] = port.data();
     }
   }
+  // The ephemeral port joins this exact connection to a host-scoped ss/TCP
+  // observation. Do not emit the local address or a reusable descriptor.
+  sockaddr_storage local{};
+  auto local_size = static_cast<decltype(peer_size)>(sizeof(local));
+  if (::getsockname(native_socket(socket), reinterpret_cast<sockaddr*>(&local), &local_size) == 0) {
+    std::array<char, NI_MAXSERV> port{};
+    if (::getnameinfo(reinterpret_cast<sockaddr*>(&local), local_size, nullptr, 0,
+            port.data(), port.size(), NI_NUMERICSERV) == 0) result["local_port"] = port.data();
+  }
 #if defined(_WIN32)
   // Documented SIO_TCP_INFO v0 ABI. Keep the existing Win7 compile baseline;
   // querying this optional Win10+ IOCTL imports no newer Windows function.

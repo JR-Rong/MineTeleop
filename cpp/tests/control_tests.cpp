@@ -5528,6 +5528,8 @@ void test_websocket_client_preserves_partial_ack_across_polls() {
     auto prefix_sent = std::make_shared<std::atomic<bool>>(false);
     auto release_suffix = std::make_shared<std::atomic<bool>>(false);
     auto outbound_received = std::make_shared<std::atomic<bool>>(false);
+    auto server_peer_port = std::make_shared<std::atomic<unsigned>>(0);
+    auto server_local_port = std::make_shared<std::atomic<unsigned>>(0);
     const mine_teleop::Json acknowledgement = {{"event", "signaling_ack"}, {"padding", std::string(payload_size, 'a')}};
     mine_teleop::SimpleHttpServer server(
         "127.0.0.1", 0, [](const auto&) { return mine_teleop::ServerResponse::json(404, {}); },
@@ -5536,6 +5538,10 @@ void test_websocket_client_preserves_partial_ack_across_polls() {
           raw_send_all(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
               "Sec-WebSocket-Accept: " + mine_teleop::websocket_accept_key(request.headers.at("sec-websocket-key")) +
               "\r\nX-Mine-Teleop-Control-Capabilities: " + std::string(mine_teleop::kNativeControlCapabilities) + "\r\n\r\n");
+          mine_teleop::ServerWebSocketConnection diagnostic_connection(socket, 512 * 1024);
+          const auto transport = diagnostic_connection.transport_diagnostics();
+          server_peer_port->store(static_cast<unsigned>(std::stoul(transport.at("peer_port").get<std::string>())));
+          server_local_port->store(static_cast<unsigned>(std::stoul(transport.at("local_port").get<std::string>())));
           const auto payload = acknowledgement.dump();
           std::string frame(1, '\x81');
           if (payload.size() < 126) frame.push_back(static_cast<char>(payload.size()));
@@ -5595,6 +5601,11 @@ void test_websocket_client_preserves_partial_ack_across_polls() {
       expect(transport.value("tcp_info_available", false) && transport.value("peer_address", "") == "127.0.0.1" &&
           transport.value("buffered_receive_bytes", 0U) == prefix_size && transport.value("partial_frame_polls_total", 0U) >= 3,
           "partial ACK/TCP diagnostics did not report the actual buffered prefix and live loopback socket");
+      expect(std::stoul(transport.at("local_port").get<std::string>()) == server_peer_port->load() &&
+          std::stoul(transport.at("peer_port").get<std::string>()) == server_local_port->load() &&
+          server_peer_port->load() > 0 && server_local_port->load() > 0 &&
+          !transport.contains("local_address") && !transport.contains("socket_fd"),
+          "TCP observations cannot join the exact loopback connection without exposing local identity");
       expect(client.transport_diagnostics(std::chrono::hours(1)).is_null(), "normal TCP samples were not rate limited");
       client.send_json({{"event", "fresh_control"}}, std::chrono::milliseconds(20));
       if (payload_size == 20) std::this_thread::sleep_for(std::chrono::milliseconds(100));
