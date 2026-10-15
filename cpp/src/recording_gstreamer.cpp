@@ -3,7 +3,9 @@
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
+#include <algorithm>
 #include <chrono>
+#include <thread>
 
 namespace mine_teleop {
 void IsolatedRecordingSession::admit(std::size_t index, GstBuffer* buffer, const GstSegment& segment) noexcept {
@@ -58,16 +60,37 @@ RecordingTap::~RecordingTap() {
 
 void stop_recording_pipeline(GstElement* pipeline, std::span<GstElement* const> sources,
                              std::span<RecordingTap* const> taps, IsolatedRecordingSession* recording) {
-  static_cast<void>(taps);
-  for (auto* source : sources) if (source != nullptr) gst_app_src_end_of_stream(GST_APP_SRC(source));
+  bool sources_ended = !sources.empty();
+  for (auto* source : sources) {
+    if (source == nullptr) { sources_ended = false; continue; }
+    const auto result = gst_app_src_end_of_stream(GST_APP_SRC(source));
+    sources_ended = sources_ended && (result == GST_FLOW_OK || result == GST_FLOW_EOS);
+  }
   if (recording) recording->request_stop();
   GstBus* bus = gst_element_get_bus(pipeline);
-  if (bus != nullptr) {
+  if (recording != nullptr) {
+    const auto all_taps_ended = [&] {
+      return !taps.empty() && std::all_of(taps.begin(), taps.end(), [](const auto* tap) {
+        return tap != nullptr && tap->eos_received();
+      });
+    };
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (sources_ended && !taps.empty() && !all_taps_ended() && std::chrono::steady_clock::now() < deadline) {
+      // An unrelated RTC bus ERROR/EOS cannot prove that encoded recording
+      // lanes have drained. Their actual serialized EOS callbacks own End.
+      if (bus != nullptr) {
+        auto* message = gst_bus_timed_pop_filtered(
+            bus, 20 * GST_MSECOND, static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+        if (message != nullptr) gst_message_unref(message);
+      } else std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!sources_ended || !all_taps_ended()) recording->abort("recording_parent_eos_missing");
+  } else if (bus != nullptr) {
     GstMessage* message = gst_bus_timed_pop_filtered(
         bus, 3 * GST_SECOND, static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
     if (message != nullptr) gst_message_unref(message);
-    gst_object_unref(bus);
   }
+  if (bus != nullptr) gst_object_unref(bus);
   gst_element_set_state(pipeline, GST_STATE_NULL);
 }
 }  // namespace mine_teleop::detail

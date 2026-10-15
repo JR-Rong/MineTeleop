@@ -4003,7 +4003,8 @@ struct VehicleMediaRuntime::Impl {
       lane->source.reset();
     }
     if (isolated_recording && (pipeline == nullptr || std::any_of(lanes.begin(), lanes.end(), [](const auto& lane) {
-          return lane->recording_index != std::numeric_limits<std::size_t>::max() && lane->record_tap == nullptr;
+          return lane->recording_index != std::numeric_limits<std::size_t>::max() &&
+              (lane->record_tap == nullptr || !lane->recording_tap);
         }))) isolated_recording->abort("recording_parent_eos_missing");
     if (pipeline != nullptr) {
       std::vector<GstElement*> sources;
