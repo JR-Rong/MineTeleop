@@ -15,6 +15,7 @@ import json
 import shlex
 from pathlib import Path
 import subprocess
+import sys
 
 CPP_ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,6 +49,7 @@ PRELUDE = r'''
 #include <vector>
 #include <nlohmann/json.hpp>
 using Json=nlohmann::json;
+namespace detail { constexpr std::string_view kControlTransportCapability="native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability="native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability="native-feedback-transport-v1"; }
 using namespace std::chrono_literals;
 enum class VideoCodec {H264,H265};
 const char* to_string(VideoCodec value){return value==VideoCodec::H264?"h264":"h265";}
@@ -57,6 +59,7 @@ struct FakeSignaling {
   std::vector<std::pair<std::string,Json>> sent;
   std::int64_t now_ms() const{return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();}
   void send(const std::string& type,const Json& payload){std::lock_guard lock(mutex);sent.emplace_back(type,payload);}
+  const std::string& transport_mac_key() const {static const std::string key;return key;}
 };
 struct CallbackGate {
   std::mutex mutex;std::condition_variable cv;void* target=nullptr;
@@ -68,6 +71,7 @@ struct Impl {
 '''
 
 MEMBERS = r'''
+  struct {struct {int experimental_direct_authority_max_ms=0;} runtime;} config;
   struct Lane {struct {std::string id;} camera;struct {int width=16,height=16,fps=20,bitrate_kbps=1;} profile;};
   std::vector<std::unique_ptr<Lane>> lanes;
   struct {VideoCodec codec=VideoCodec::H264,backend=VideoCodec::H264;} active_candidate;
@@ -311,6 +315,10 @@ def main():
     command += [str(unit), *shlex.split(flags.stdout), "-o", str(binary)]
     built = subprocess.run(command, capture_output=True, text=True) if flags.returncode == 0 else None
     (args.output / "build.log").write_text(built.stdout + built.stderr if built else "pkg-config failed; compilation not run\n")
+    if flags.returncode:
+        print((flags.stdout + flags.stderr)[-8000:], file=sys.stderr)
+    elif built.returncode:
+        print((built.stdout + built.stderr)[-8000:], file=sys.stderr)
     timed_out = False
     result = None
     if built and built.returncode == 0 and not args.compile_only:
@@ -323,6 +331,8 @@ def main():
             (args.output / "result.log").write_text(stdout + stderr + "\nTIMEOUT after35s; runtime test failed\n")
     if result:
         (args.output / "result.log").write_text(result.stdout + result.stderr)
+        if result.returncode:
+            print((result.stdout + result.stderr)[-8000:], file=sys.stderr)
     end = datetime.datetime.now(datetime.timezone.utc).isoformat()
     status = "compile_failed" if not built or built.returncode else "compiled_not_run" if args.compile_only else "timed_out" if timed_out else "passed" if result.returncode == 0 else "blocked_missing_plugins" if result.returncode == 2 else "failed"
     manifest = {"scope":__doc__, "status":status, "source_sha256":hashlib.sha256(source.encode()).hexdigest(),
