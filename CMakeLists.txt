@@ -374,6 +374,17 @@ if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
   enable_testing()
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
+    set(MINE_TELEOP_AUTHORITY_ENTRY "${CMAKE_CURRENT_BINARY_DIR}/vehicle_authority_entry.inc")
+    add_custom_command(OUTPUT "${MINE_TELEOP_AUTHORITY_ENTRY}"
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/extract_vehicle_authority_entry.py"
+        --source "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/webrtc_media.cpp" --output "${MINE_TELEOP_AUTHORITY_ENTRY}"
+      DEPENDS cpp/tests/extract_vehicle_authority_entry.py cpp/src/webrtc_media.cpp VERBATIM)
+    add_executable(mine-teleop-vehicle-authority-entry-tests cpp/tests/vehicle_authority_entry_tests.cpp "${MINE_TELEOP_AUTHORITY_ENTRY}")
+    target_include_directories(mine-teleop-vehicle-authority-entry-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(mine-teleop-vehicle-authority-entry-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+    mine_teleop_enable_warnings(mine-teleop-vehicle-authority-entry-tests)
+    add_test(NAME mine-teleop-vehicle-authority-entry-tests COMMAND mine-teleop-vehicle-authority-entry-tests)
+    set_tests_properties(mine-teleop-vehicle-authority-entry-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
     set(MINE_TELEOP_FEEDBACK_METHOD "${CMAKE_CURRENT_BINARY_DIR}/feedback_vehicle_method.inc")
     add_custom_command(OUTPUT "${MINE_TELEOP_FEEDBACK_METHOD}"
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/extract_feedback_vehicle_method.py"

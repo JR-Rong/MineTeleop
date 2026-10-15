@@ -2226,11 +2226,31 @@ struct VehicleMediaRuntime::Impl {
     if (!envelope.is_object()) {
       throw std::invalid_argument("native control WebSocket envelope must be an object");
     }
+    const auto event = envelope.value("event", "");
+    if (event == "signaling_authority_lost") {
+      std::lock_guard lock(control_mutex);
+      if (direct_authority.configured()) {
+        if (direct_authority.observe_authenticated_cloud_denial(envelope, native_control_websocket_authority_scope)) {
+          invalidate_native_control_trusted_gear_locked();
+          if (control_service_started && control_service)
+            control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+        }
+        return; // A stale/duplicate denial also must not become a new connection fault.
+      }
+    }
     if (envelope.contains("error")) {
+      // A cloud-declared rejection is not an absent/unreachable transport.
+      { std::lock_guard lock(control_mutex);
+        auto denial = envelope; denial["event"] = "signaling_authority_lost";
+        if (direct_authority.observe_authenticated_cloud_denial(denial, native_control_websocket_authority_scope)) {
+          invalidate_native_control_trusted_gear_locked();
+          if (control_service_started && control_service)
+            control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+        }
+      }
       throw std::runtime_error(
           envelope.value("error", "native control WebSocket was rejected"));
     }
-    const auto event = envelope.value("event", "");
     if (event == "control_authority_lease") {
       signaling.observe_lease(envelope.at("expires_at_utc_ms").get<std::int64_t>());
       return;
@@ -2488,6 +2508,7 @@ struct VehicleMediaRuntime::Impl {
             config.cloud.resolve_entries,
             config.cloud.ca_bundle);
         websocket.enable_read_diagnostics(config.runtime.control_log_commands);
+        { std::lock_guard lock(control_mutex); native_control_websocket_authority_scope = direct_authority.scope(); }
         websocket.connect(
             signaling.native_control_websocket_url(),
             signaling.native_control_websocket_headers());
@@ -2594,6 +2615,18 @@ struct VehicleMediaRuntime::Impl {
               std::memory_order_relaxed);
         }
         native_control_websocket_connected.store(false, std::memory_order_relaxed);
+      } catch (const HttpStatusError& error) {
+        if (!stop_token.stop_requested() && !stop_requested.load()) {
+          if (!detail::transient_cloud_failure(error)) {
+            std::lock_guard lock(control_mutex);
+            if (direct_authority.observe_authenticated_cloud_denial({{"event", "signaling_authority_lost"}}, native_control_websocket_authority_scope)) {
+              invalidate_native_control_trusted_gear_locked();
+              if (control_service_started && control_service)
+                control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+            }
+          }
+          note_native_control_transport_error(error.what(), false);
+        }
       } catch (const std::invalid_argument& error) {
         if (!stop_token.stop_requested() && !stop_requested.load()) {
           note_native_control_transport_error(error.what(), true);
@@ -5153,6 +5186,7 @@ struct VehicleMediaRuntime::Impl {
   GstElement* webrtc{nullptr};
   detail::ControlTransportFence control_transport_fence;
   detail::DirectAuthorityLease direct_authority;
+  Json native_control_websocket_authority_scope;
   detail::EmergencyStopReceiver emergency_stop_receiver;
   detail::FeedbackTransportFence feedback_transport_fence;
   std::map<std::string, Json> latest_feedback_status;

@@ -574,6 +574,7 @@ class DriverConsoleRuntime {
   std::string signaling_websocket_session_id_;
   std::unique_ptr<WebSocketClient> control_signaling_websocket_;
   std::string control_signaling_websocket_session_id_;
+  Json control_signaling_websocket_authority_scope_;
   bool control_signaling_capabilities_verified_{false};
   std::uint64_t control_signaling_last_ack_seq_{0};
   detail::NativeControlAcknowledgementWindow control_signaling_ack_window_;

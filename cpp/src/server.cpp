@@ -3265,11 +3265,16 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       {"token", credential_value(request, "token", "x-mine-teleop-driver-token")},
       {"device_token", credential_value(request, "device_token", "x-mine-teleop-device-token")},
       {"connection_generation", query_value(request, "connection_generation")}};
+  Json authenticated_authority_scope;
   auto authenticate = [&] {
     std::lock_guard lock(mutex_);
     cleanup_expired_connections(now_ms());
     const auto& session = require_participant(parts[1], participant);
     validate_actor_credential(session, participant, credentials);
+    if (session.direct_authority_enabled) authenticated_authority_scope = {
+        {"protocol", detail::kDirectAuthorityCapability}, {"issuer", service_instance_id_},
+        {"vehicle_id", session.vehicle_id}, {"driver_id", session.driver_id}, {"session_id", session.session_id},
+        {"connection_generation", online_vehicles_.at(session.vehicle_id).generation}, {"authority_epoch", 0}};
     if (send_only && participant != session.driver_id) {
       throw Unauthorized("send-only signaling is restricted to the session driver");
     }
@@ -3378,7 +3383,18 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
               false);
         }
       } catch (const std::exception& error) {
-        connection.send_json({{"error", error.what()}, {"event", "signaling_authority_lost"}});
+        Json denial = {{"error", error.what()}, {"event", "signaling_authority_lost"}};
+        if (authenticated_authority_scope.is_object()) {
+          auto scope = authenticated_authority_scope;
+          { std::lock_guard lock(mutex_);
+            const auto grant = direct_authority_journal_.find(scope.at("vehicle_id").get<std::string>());
+            if (grant != direct_authority_journal_.end() && grant->value("issuer", "") == scope.at("issuer").get<std::string>() &&
+                grant->value("session_id", "") == scope.at("session_id").get<std::string>() &&
+                grant->value("connection_generation", std::uint64_t{0}) == scope.at("connection_generation").get<std::uint64_t>())
+              scope["authority_epoch"] = grant->at("authority_epoch"); }
+          denial["authority_scope"] = std::move(scope);
+        }
+        connection.send_json(denial);
         connection.send_close(1008, "signaling authority lost");
         return true;
       }
@@ -5257,14 +5273,26 @@ bool DriverConsoleRuntime::connect_control_signaling_websocket(
   }
   auto next = std::make_unique<WebSocketClient>(
       std::chrono::seconds(1), config_.resolve_entries, config_.ca_bundle);
-  next->connect(url + (config_.enable_experimental_control_transport ? "&transport_protocol=" + std::string(detail::kControlTransportCapability) : ""),
-      {{"X-Mine-Teleop-Driver-Token", std::string(token)}});
+  Json authority_scope;
+  { std::lock_guard authority_lock(direct_authority_mutex_); authority_scope = direct_authority_.scope(); }
+  try {
+    next->connect(url + (config_.enable_experimental_control_transport ? "&transport_protocol=" + std::string(detail::kControlTransportCapability) : ""),
+        {{"X-Mine-Teleop-Driver-Token", std::string(token)}});
+  } catch (const HttpStatusError& error) {
+    if (!detail::transient_cloud_failure(error)) {
+      std::lock_guard authority_lock(direct_authority_mutex_);
+      if (direct_authority_.observe_authenticated_cloud_denial({{"event", "signaling_authority_lost"}}, authority_scope))
+        native_control_intent_.invalidate(true);
+    }
+    throw;
+  }
   const bool capabilities_verified = next->response_header("x-mine-teleop-control-capabilities") == kNativeControlCapabilities;
   if (!estop_only && !capabilities_verified)
     throw std::runtime_error("云端原生控制能力不匹配：缺少恢复反馈或 ACK 制动等待支持，请更新云端包");
   if (control_signaling_websocket_) control_signaling_websocket_->close();
   control_signaling_websocket_ = std::move(next);
   control_signaling_websocket_session_id_ = std::string(session_id);
+  control_signaling_websocket_authority_scope_ = std::move(authority_scope);
   control_signaling_capabilities_verified_ = capabilities_verified;
   control_transport_cloud_capable_ = config_.enable_experimental_control_transport && control_signaling_websocket_->response_header("x-mine-teleop-transport-capabilities") == detail::kControlTransportCapability;
   control_signaling_last_ack_seq_ = 0;
@@ -5279,6 +5307,7 @@ void DriverConsoleRuntime::close_control_signaling_websocket() {
   if (control_signaling_websocket_) control_signaling_websocket_->close();
   control_signaling_websocket_.reset();
   control_signaling_websocket_session_id_.clear();
+  control_signaling_websocket_authority_scope_ = Json(nullptr);
   control_signaling_capabilities_verified_ = false;
   control_signaling_last_ack_seq_ = 0;
   control_signaling_ack_window_.reset();
@@ -5352,6 +5381,7 @@ void DriverConsoleRuntime::note_native_control_failure(
   if (control_signaling_websocket_) control_signaling_websocket_->close();
   control_signaling_websocket_.reset();
   control_signaling_websocket_session_id_.clear();
+  control_signaling_websocket_authority_scope_ = Json(nullptr);
   control_signaling_capabilities_verified_ = false;
   control_signaling_last_ack_seq_ = 0;
   control_signaling_ack_window_.reset();
@@ -5690,7 +5720,20 @@ bool DriverConsoleRuntime::drain_native_control_acknowledgements_locked(
     if (received.status == WebSocketReceiveStatus::Closed) {
       throw std::runtime_error("native control signaling websocket closed");
     }
+    if (received.message.value("event", "") == "signaling_authority_lost") {
+      std::lock_guard authority_lock(direct_authority_mutex_);
+      if (direct_authority_.configured()) {
+        if (direct_authority_.observe_authenticated_cloud_denial(received.message, control_signaling_websocket_authority_scope_))
+          native_control_intent_.invalidate(true);
+        continue;
+      }
+    }
     if (received.message.contains("error")) {
+      { std::lock_guard authority_lock(direct_authority_mutex_);
+        auto denial = received.message; denial["event"] = "signaling_authority_lost";
+        if (direct_authority_.observe_authenticated_cloud_denial(denial, control_signaling_websocket_authority_scope_))
+          native_control_intent_.invalidate(true);
+      }
       throw std::invalid_argument(received.message.value(
           "error", "native control signaling message was rejected"));
     }

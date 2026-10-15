@@ -963,6 +963,9 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
   if (line_end == std::string::npos || response.substr(0, line_end).find(" 101 ") == std::string::npos) {
     const auto status_line = response.substr(0, line_end);
     close();
+    std::istringstream status(status_line); std::string version; long code = 0;
+    if (status >> version >> code && version.starts_with("HTTP/") && code >= 100 && code <= 599)
+      throw HttpStatusError(code, "websocket upgrade failed: " + status_line);
     throw std::runtime_error("websocket upgrade failed: " + status_line);
   }
   const auto headers = parse_http_headers(response);

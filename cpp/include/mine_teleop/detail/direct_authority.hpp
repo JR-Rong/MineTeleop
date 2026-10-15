@@ -60,6 +60,43 @@ class DirectAuthorityLease {
     session_ = std::move(session); connection_generation_ = connection_generation; maximum_duration_ms_ = maximum_duration_ms;
   }
   bool configured() const { return maximum_duration_ms_ > 0 && !issuer_.empty() && !session_.empty() && connection_generation_ > 0; }
+  // Public identity captured by the authenticated WSS connection, never by a
+  // DC/page packet. A connection can span normal renewals of this session.
+  Json scope() const {
+    return configured() ? Json{{"protocol", kDirectAuthorityCapability}, {"issuer", issuer_},
+        {"vehicle_id", vehicle_}, {"driver_id", driver_}, {"session_id", session_},
+        {"connection_generation", connection_generation_}, {"authority_epoch", grant_ ? grant_->epoch : 0}} : Json(nullptr);
+  }
+  // ONLY the authenticated cloud WSS receiver may call this. No transport
+  // timeout/disconnect, DC message, or unscoped browser input calls it.
+  bool observe_authenticated_cloud_denial(const Json& envelope, const Json& connection_scope) {
+    if (!configured() || revoked_ || !matches_scope(connection_scope) ||
+        envelope.value("event", "") != "signaling_authority_lost") return false;
+    if (envelope.contains("authority_scope")) {
+      const auto& stated = envelope.at("authority_scope");
+      try {
+        // Known foreign identities are stale even if another field is malformed.
+        bool malformed = !stated.is_object();
+        for (const auto* field : {"issuer", "vehicle_id", "driver_id", "session_id"}) if (stated.is_object() && stated.contains(field)) {
+          if (!stated.at(field).is_string()) malformed = true;
+          else if (stated.at(field) != connection_scope.at(field)) return false;
+        }
+        if (stated.is_object() && stated.contains("connection_generation")) {
+          try { if (ControlTransportStamp::uint(stated, "connection_generation") != connection_generation_) return false; }
+          catch (const std::exception&) { malformed = true; }
+        }
+        if (malformed || !matches_scope(stated)) throw std::invalid_argument("malformed cloud denial scope");
+        const auto epoch = ControlTransportStamp::uint(stated, "authority_epoch");
+        if (grant_ && epoch && epoch != grant_->epoch) return false;
+      } catch (const std::exception&) {
+        // A malformed explicit denial on this trusted/current connection is
+        // still fail-closed; it is not a transient network outage.
+      }
+    }
+    // Legacy cloud notices lack a scope: they deny this connection's complete
+    // session. The captured identity still prevents affecting a new session.
+    revoke(); return true;
+  }
   void begin_request(std::string nonce, std::int64_t started) {
     if (!configured() || revoked_ || nonce.empty() || nonce.size() > 128 || started < 0 || started < last_observed_ms_)
       throw std::invalid_argument("direct authority request is invalid");
@@ -114,6 +151,13 @@ class DirectAuthorityLease {
   std::uint64_t rearm_revision() const { return rearm_revision_; }
   bool renewal_due(std::int64_t now) const { return configured() && !revoked_ && (!grant_ || now >= renew_at_ms_); }
  private:
+  bool matches_scope(const Json& value) const {
+    try {
+      return value.is_object() && value.value("protocol", "") == kDirectAuthorityCapability &&
+          value.at("issuer") == issuer_ && value.at("vehicle_id") == vehicle_ && value.at("driver_id") == driver_ &&
+          value.at("session_id") == session_ && ControlTransportStamp::uint(value, "connection_generation") == connection_generation_;
+    } catch (const std::exception&) { return false; }
+  }
   std::string issuer_, vehicle_, driver_, session_, pending_nonce_;
   std::uint64_t connection_generation_{}, rearm_revision_{};
   std::int64_t maximum_duration_ms_{}, pending_started_ms_{}, deadline_ms_{}, renew_at_ms_{}, last_observed_ms_{};

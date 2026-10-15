@@ -29,7 +29,7 @@ struct Fixture {
   EmergencyStopReceiver emergency_receiver;
   FeedbackTransportFence feedback_fence;
   bool feedback_enabled{false}, drop_dc_feedback{false};
-  Json pending_dc_feedback, last_feedback_command;
+  Json pending_dc_feedback, last_feedback_command, last_received_payload;
   std::uint64_t feedback_status_sequence{};
   std::mutex car_mutex;
   std::jthread car_watchdog;
@@ -160,6 +160,7 @@ struct Fixture {
   }
   Json apply(const Json& payload, ControlPath path) {
     std::lock_guard lock(car_mutex);
+    last_received_payload = payload;
     if (payload.contains("control_transport")) expect(verify_transport_message(payload, signing_key, false), "native byte authentication failed");
     const auto command = ControlCommand::from_json(payload);
     bool verified_stop = false;
@@ -362,6 +363,56 @@ void actual_feedback_selection_is_independent_and_rejects_retired_statuses() {
       "retired high sequence poisoned actual cloud WSS status cache/socket watermark");
 }
 
+void actual_cloud_explicit_denial_revokes_before_short_deadline() {
+  Fixture fixture(true);
+  bool ready = false; auto deadline = steady() + 8000;
+  while (steady() < deadline) {
+    fixture.pump(true);
+    if (fixture.driver->status().at("native_control").at("control_transport").at("direct_authority").value("continuation_available", false)) { ready = true; break; }
+  }
+  expect(ready, "revoke fixture never became a healthy direct session");
+  fixture.renew_authority(true);
+  deadline = steady() + 1000;
+  while (steady() < deadline) {
+    fixture.pump(true);
+    if (fixture.driver->status().at("native_control").at("control_transport").at("direct_authority").value("remaining_ms", 0) > 400) break;
+  }
+  Json socket_scope, fresh;
+  { std::lock_guard lock(fixture.car_mutex); socket_scope = fixture.car_authority.scope(); fresh = fixture.last_received_payload; }
+  static_cast<void>(fixture.http.post_json_response(fixture.base + "/sessions/" + fixture.session + "/control_authority/revoke",
+      {{"actor", "transport-vehicle"}, {"device_token", "fixture-device"}, {"connection_generation", fixture.generation}, {"reason", "offline-fixture-explicit-revoke"}}));
+  Json denial; deadline = steady() + 500;
+  while (steady() < deadline) {
+    const auto received = fixture.vehicle_socket.receive_json(std::chrono::milliseconds(10));
+    if (received.status == WebSocketReceiveStatus::Message && received.message.value("event", "") == "signaling_authority_lost") { denial = received.message; break; }
+  }
+  expect(denial.is_object() && denial.contains("authority_scope"), "real cloud did not emit scoped explicit denial");
+  { std::lock_guard lock(fixture.car_mutex);
+    expect(fixture.car_authority.valid(steady()), "revocation arrived only after natural fixture lease expiry");
+    expect(fixture.car_authority.observe_authenticated_cloud_denial(denial, socket_scope), "real cloud scope did not match accepted vehicle authority");
+    fixture.vehicle->set_control_braking_wait(true, utc(), ControlRecoveryCause::ControlLink);
+    expect(fixture.vehicle->control_braking_wait(), "real common service did not enter immediate revoke braking"); }
+  fresh["seq"] = fresh.at("seq").get<std::uint64_t>() + 1; fresh["sent_at_utc_ms"] = utc();
+  fresh["native_mac"] = transport_message_mac(fresh, fixture.signing_key, false);
+  expect(!fixture.apply(fresh, ControlPath::DataChannel).at("accepted").get<bool>(), "fresh DC command remained admitted after explicit denial");
+  bool native_revoked = false; deadline = steady() + 500;
+  while (steady() < deadline) {
+    const auto authority = fixture.driver->status().at("native_control").at("control_transport").at("direct_authority");
+    if (authority.value("revoked", false)) { native_revoked = true; break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  expect(native_revoked, "real native treated explicit cloud denial as bounded transport grace");
+}
+void websocket_upgrade_status_preserves_denial_vs_transient_service_failure() {
+  for (const int code : {401, 403, 404, 409, 503}) {
+    SimpleHttpServer server("127.0.0.1", 0, [code](const HttpRequest&) { return ServerResponse::json(code, {{"error", "fixture"}}); });
+    server.start(); WebSocketClient client(std::chrono::milliseconds(200)); bool observed = false;
+    try { client.connect("ws://127.0.0.1:" + std::to_string(server.port()) + "/fixture-denied"); }
+    catch (const HttpStatusError& error) { observed = error.status() == code && transient_cloud_failure(error) == (code == 503); }
+    server.stop(); expect(observed, "authenticated WebSocket upgrade denial was erased into an indistinguishable transport error");
+  }
+}
+
 void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
   Fixture fixture(true);
   const auto ready_deadline = steady() + 8000;
@@ -476,6 +527,6 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
 }
 }  // namespace
 int main() {
-  try { integration(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { integration(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
