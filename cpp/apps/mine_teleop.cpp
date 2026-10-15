@@ -635,6 +635,21 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
                    }).dump()
                 << std::endl;
       std::this_thread::sleep_for(retry_delay);
+    } catch (const mine_teleop::TimeSyncSampleError& error) {
+      // SynchronizedClock wraps the exchange error with sample diagnostics.
+      // Only transient transport failure inherits the existing service retry;
+      // bad samples and HTTP authority/protocol errors remain fail-closed.
+      if (!service || !error.diagnostics().contains("http_failure")) throw;
+      std::cout << Json({
+                       {"event", "vehicle_media_time_sync_retry"},
+                       {"issue_code", "initial_time_sync_transport_failed"},
+                       {"stage", "time_sync"},
+                       {"error", error.what()},
+                       {"retryable", true},
+                       {"retry_after_ms", std::chrono::duration_cast<std::chrono::milliseconds>(kTransportRestartDelay).count()},
+                   }).dump()
+                << std::endl;
+      std::this_thread::sleep_for(kTransportRestartDelay);
     } catch (const mine_teleop::HttpTransportError& error) {
       if (!service) throw;
       std::cout << Json({
