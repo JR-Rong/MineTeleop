@@ -15,6 +15,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace mine_teleop {
 namespace {
@@ -290,8 +291,10 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources, const Js
   const auto begin = session.at("started_at_utc_ms").get<std::int64_t>() - 2000;
   const auto end = session.at("ended_at_utc_ms").get<std::int64_t>() + 2000;
   const auto id = session.at("session_id").get<std::string>();
+  const auto session_started = session.at("started_at_utc_ms").get<std::int64_t>();
+  const auto session_ended = session.at("ended_at_utc_ms").get<std::int64_t>();
   Json result = {{"status", "available"}, {"files", Json::array()},
-      {"selection", "session_id and UTC window; unscoped records use UTC window"},
+      {"selection", "session_id and UTC window; late runtime recording completion requires an attempt-start anchor inside the session"},
       {"window_start_utc_ms", begin}, {"window_end_utc_ms", end},
       {"redacted", true}, {"file_limit_bytes", kFileLimit}};
   for (const auto& source : sources) {
@@ -301,6 +304,10 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources, const Js
     std::uint64_t scanned = 0, written = 0, unscoped = 0, unattributed = 0;
     std::int64_t first = 0, last = 0;
     bool limited = false, failed = false, dropped = false;
+    std::unordered_set<std::string> recording_attempts;
+    std::vector<std::pair<std::string, std::string>> late_recording;
+    std::size_t late_recording_bytes = 0;
+    constexpr std::size_t kAttemptLimit = 4096, kLateRecordingLimit = 4 * 1024 * 1024;
     std::ofstream output(destination / source.name, std::ios::binary | std::ios::trunc);
     if (!output) throw std::runtime_error("cannot create log snapshot");
     auto paths = log_family(source.path);
@@ -327,24 +334,50 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources, const Js
         // Recorder draining can finish after the ordinary two-second log tail.
         // Preserve only its exactly scoped completion record beyond that tail;
         // unrelated runtime lines still obey the normal UTC/session selection.
-        const bool recording_completion = record_id == id &&
-            value.value("event", "") == "vehicle_recording_attempt_finished" &&
+        const bool recording_scope = source.name == "runtime.log" && record_id == id &&
             value.contains("vehicle_id") && value.at("vehicle_id") == session.at("vehicle_id");
+        const auto kind = value.value("event", "");
+        const std::string attempt = value.contains("recording_attempt_id") && value.at("recording_attempt_id").is_string()
+            ? value.at("recording_attempt_id").get<std::string>() : "";
+        const bool recording_completion = recording_scope && kind == "vehicle_recording_attempt_finished" && safe_name(attempt);
         if (!trace_batch && timestamp && (timestamp < begin || (timestamp > end && !recording_completion))) continue;
         if (!timestamp) { ++unattributed; continue; }
         if (source.require_session_id && record_id != id) continue;
         if (record_id.empty()) ++unscoped;
         if (source.require_session_id && value.contains("service_instance_id") &&
             value["service_instance_id"] != session.at("service_instance_id")) continue;
+        // SIDs can repeat after a cloud restart. The ordinary +/-2s log tail
+        // must not grant a new recording attempt authority over this session.
+        if (recording_scope && kind == "vehicle_recording_attempt_started" && safe_name(attempt) &&
+            timestamp >= session_started && timestamp <= session_ended) {
+          recording_attempts.insert(attempt);
+          if (recording_attempts.size() > kAttemptLimit) { limited = true; break; }
+        }
         if (value.value("event", "") == "desktop_log_dropped" ||
             (value.contains("details") && value["details"].is_object() &&
              value["details"].value("dropped_since_last", 0LL) > 0)) dropped = true;
         line = redact(std::move(value), secrets).dump(-1, ' ', false, Json::error_handler_t::replace) + '\n';
+        if (recording_completion && timestamp > end) {
+          if (late_recording.size() >= kAttemptLimit || late_recording_bytes + line.size() > kLateRecordingLimit) {
+            limited = true; break;
+          }
+          late_recording_bytes += line.size();
+          late_recording.emplace_back(attempt, std::move(line));
+          continue;
+        }
         if (written + line.size() > kFileLimit) { limited = true; break; }
         output << line; written += line.size();
       }
       if (!input.eof() && !limited && !stop.stop_requested()) failed = true;
       if (limited || stop.stop_requested()) break;
+    }
+    // Rotation order may expose completion before its anchor. Match only
+    // after scanning, without expanding the original file/scan bounds.
+    for (const auto& [attempt, line] : late_recording) {
+      if (stop.stop_requested()) break;
+      if (!recording_attempts.contains(attempt)) continue;
+      if (written + line.size() > kFileLimit) { limited = true; break; }
+      output << line; written += line.size();
     }
     output.flush(); if (!output) throw std::runtime_error("cannot finish log snapshot");
     report["bytes"] = written; report["unscoped_records"] = unscoped;

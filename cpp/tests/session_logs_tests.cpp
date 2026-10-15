@@ -65,15 +65,24 @@ void recording_terminal_failure_after_session_end() {
       {"event_at_utc_ms", finished_at}, {"reported_at_utc_ms", finished_at}, {"incomplete", true}};
   auto other = finished; other["session_id"] = "session-000002";
   auto other_vehicle = finished; other_vehicle["vehicle_id"] = "other-vehicle";
+  auto reused_session = finished; reused_session["recording_attempt_id"] = "later-unrelated-attempt";
+  reused_session["driver_id"] = "other-driver-must-not-export";
+  reused_session["reported_at_utc_ms"] = finished_at + 1000;
+  reused_session["event_at_utc_ms"] = finished_at + 1000;
+  auto reused_start = started; reused_start["recording_attempt_id"] = "later-unrelated-attempt";
+  reused_start["reported_at_utc_ms"] = session.at("ended_at_utc_ms").get<std::int64_t>() + 1000;
   const auto snapshot = dir.path / "snapshot/runtime.log";
-  write(dir.path / "runtime.log", started.dump() + "\n" + finished.dump() + "\n" +
-      other.dump() + "\n" + other_vehicle.dump() + "\n");
+  // Rotation scan order need not place the attempt-start before completion.
+  write(dir.path / "runtime.log", finished.dump() + "\n" + reused_session.dump() + "\n" +
+      other.dump() + "\n" + other_vehicle.dump() + "\n" + reused_start.dump() + "\n" + started.dump() + "\n");
   collect_session_logs({{dir.path / "runtime.log", "runtime.log"}}, session, dir.path / "snapshot");
   const auto exported = read(snapshot);
   check(exported.find("vehicle_recording_attempt_finished") != std::string::npos,
         "bounded recorder completion after the ordinary UTC tail was dropped");
   check(exported.find("other-vehicle") == std::string::npos && exported.find("session-000002") == std::string::npos,
         "late recorder completion crossed its vehicle/session boundary");
+  check(exported.find("other-driver-must-not-export") == std::string::npos,
+        "late completion from a reused session ID crossed the current attempt boundary");
   const auto evidence = collect_session_recording_evidence(dir.path / "recordings", session, {}, snapshot, true);
   check(evidence.at("evidence_status") == "incomplete" && evidence.at("complete") == false &&
         evidence.at("attempt_complete") == false,
