@@ -464,6 +464,9 @@ class DriverConsoleRuntime {
   void poll_native_control_acknowledgements();
   [[nodiscard]] bool direct_control_continuation_available_locked();
   void observe_emergency_stop_result_verified(const Json& result, bool data_channel_return);
+  // Caller holds native_control_update_mutex_; no transport lock or network I/O.
+  [[nodiscard]] Json publish_native_emergency_locked(const NativeControlIntentSample& sample,
+      Json payload, std::uint64_t generation);
   [[nodiscard]] bool drain_native_control_acknowledgements_locked(
       std::string_view session, std::string_view identity, std::string_view vehicle,
       Json& drained_acknowledgements);

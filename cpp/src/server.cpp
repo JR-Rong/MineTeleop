@@ -5310,7 +5310,7 @@ void DriverConsoleRuntime::note_native_control_failure(
     std::string error,
     std::string_view session_id,
     std::uint64_t generation) {
-  std::lock_guard update_lock(native_control_update_mutex_);
+  std::unique_lock update_lock(native_control_update_mutex_);
   int recovery_timeout_ms = 5000;
   {
     std::lock_guard lock(mutex_);
@@ -5326,7 +5326,10 @@ void DriverConsoleRuntime::note_native_control_failure(
   }
   const auto frozen_gear = native_control_intent_.sample(monotonic_now_ms()).intent.gear;
   native_control_intent_.invalidate(true);
+  update_lock.unlock(); // Never hold input acceptance behind an unrelated WSS operation.
   std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
+  { std::lock_guard lock(mutex_);
+    if (session_id_ != session_id || control_session_generation_ != generation) return; }
   if (!control_signaling_ack_recovery_.waiting()) control_signaling_recovery_gear_ = frozen_gear;
   control_signaling_ack_recovery_.enter(monotonic_now_ms(), recovery_timeout_ms, control_signaling_last_ack_seq_);
   if (control_signaling_websocket_) control_signaling_websocket_->close();
@@ -5435,6 +5438,53 @@ Json DriverConsoleRuntime::send_control_management(const Json& input) {
   return send_signaling_message("control_management", payload, &input);
 }
 
+Json DriverConsoleRuntime::publish_native_emergency_locked(const NativeControlIntentSample& sample,
+    Json payload, std::uint64_t generation) {
+  if (!config_.enable_experimental_direct_authority || !sample.intent.estop) return Json(nullptr);
+  std::lock_guard state_lock(mutex_);
+  if (session_id_.empty() || control_session_generation_ != generation || !emergency_stop_vehicle_capable_ ||
+      control_transport_mac_key_.size() < 32 || media_scope_id_.empty()) return Json(nullptr);
+  const auto current = native_control_intent_.sample(monotonic_now_ms());
+  if (!current.active || !current.intent.estop || current.owner_ui_instance_id != sample.owner_ui_instance_id ||
+      current.ui_control_epoch != sample.ui_control_epoch) return Json(nullptr);
+  Json authority;
+  { std::lock_guard lock(direct_authority_mutex_); authority = direct_authority_.reference(); }
+  if (!authority.is_object()) return Json(nullptr);
+  if (!payload.is_object()) {
+    // Serialize the accepted STOP event through the SAME native sequence
+    // allocator as periodic commands. No browser wire command or new worker.
+    ControlCommand command;
+    command.vehicle_id = vehicle_id_; command.driver_id = driver_id(); command.session_id = session_id_;
+    command.control_token = control_token_; command.seq = ++control_sequence_; command.sent_at_utc_ms = clock_.now_ms();
+    command.gear = current.intent.gear; command.estop = true; command.brake = 1.0;
+    payload = command.to_json(); payload["intent_seq"] = current.intent.intent_seq;
+    payload["intent_fresh"] = current.fresh; payload["intent_requires_fresh_input"] = true;
+  }
+  if (payload.at("session_id") != session_id_ || payload.at("vehicle_id") != vehicle_id_) return Json(nullptr);
+  payload["estop"] = true; payload["throttle"] = payload["steering"] = 0.0;
+  payload["brake"] = 1.0; payload["operator_active"] = false;
+  const auto published = monotonic_now_ms();
+  std::lock_guard stop_lock(emergency_stop_mutex_);
+  if (emergency_stop_owner_ != sample.owner_ui_instance_id || emergency_stop_ui_epoch_ != sample.ui_control_epoch ||
+      emergency_stop_session_generation_ != generation || emergency_stop_attempt_ != media_scope_id_) {
+    emergency_stop_latency_.reset(); emergency_stop_last_result_ = Json(nullptr);
+  } else if (emergency_stop_latest_frame_.is_object() &&
+      payload.at("seq").get<std::uint64_t>() <= emergency_stop_latest_frame_.at("seq").get<std::uint64_t>()) {
+    return Json(nullptr); // An earlier periodic sample cannot replace an urgent event.
+  }
+  payload["emergency_stop"] = {{"protocol", detail::kEmergencyStopCapability}, {"authority", authority},
+      {"reset_epoch", emergency_stop_reset_epoch_}, {"media_attempt", media_scope_id_}};
+  payload["native_mac"] = detail::transport_message_mac(payload, control_transport_mac_key_, false);
+  emergency_stop_latest_frame_ = payload; emergency_stop_published_ms_ = published;
+  emergency_stop_owner_ = sample.owner_ui_instance_id; emergency_stop_ui_epoch_ = sample.ui_control_epoch;
+  emergency_stop_session_generation_ = generation; emergency_stop_attempt_ = media_scope_id_;
+  emergency_stop_latency_.note_sent(payload.at("seq").get<std::uint64_t>(), payload.at("intent_seq").get<std::uint64_t>(), published, true);
+  if (native_control_trace_) native_control_trace_->enqueue({{"stage", "emergency_native_published"},
+      {"trace_session_id", session_id_}, {"seq", payload.at("seq")}, {"intent_seq", payload.at("intent_seq")},
+      {"published_monotonic_ms", published}, {"scope_ui_epoch", sample.ui_control_epoch}});
+  return payload;
+}
+
 void DriverConsoleRuntime::observe_emergency_stop_result_verified(const Json& result, bool data_channel_return) {
   std::optional<detail::VehicleResultLatencyWindow::Sample> sample;
   {
@@ -5511,11 +5561,11 @@ Json DriverConsoleRuntime::emergency_stop_bridge(const Json& input) {
 }
 
 Json DriverConsoleRuntime::control_transport_bridge(const Json& input) {
-  std::lock_guard update_lock(native_control_update_mutex_);
   std::string session, vehicle, driver, attempt, owner;
   std::uint64_t ui_epoch = 0;
   bool capable = false;
   {
+    std::lock_guard update_lock(native_control_update_mutex_);
     std::lock_guard lock(mutex_);
     validate_media_source_scope_locked(input); validate_media_negotiation_locked(input);
     if (required_string(input, "source_session_id") != session_id_ ||
@@ -5530,6 +5580,11 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input) {
   }
   if (!input.at("dc_ready").is_boolean()) throw std::invalid_argument("dc_ready must be boolean");
   std::lock_guard transport_lock(control_signaling_websocket_mutex_);
+  { std::lock_guard lock(mutex_);
+    const auto ownership = native_control_intent_.ownership_scope();
+    if (session_id_ != session || control_session_generation_ != required_uint64(input, "source_control_session_generation") ||
+        media_scope_id_ != attempt || ownership.first != owner || ownership.second != ui_epoch)
+      throw Conflict("transport bridge scope changed while waiting", "control_transport_scope_mismatch"); }
   const auto now = monotonic_now_ms();
   control_transport_dc_ready_ = capable && control_transport_cloud_capable_ && input.at("dc_ready").get<bool>();
   const auto network_path = input.value("dc_network_path", "unknown");
@@ -5909,33 +5964,10 @@ bool DriverConsoleRuntime::send_native_control_sample() {
     envelope["type"] = "control_command";
     envelope["payload"] = payload;
     Json emergency_payload;
-    if (command.estop && config_.enable_experimental_direct_authority && vehicle_stop_capable && !current_media_attempt.empty()) {
-      Json authority;
-      { std::lock_guard lock(direct_authority_mutex_); authority = direct_authority_.reference(); }
-      if (authority.is_object()) {
-        std::uint64_t reset_epoch;
-        { std::lock_guard lock(emergency_stop_mutex_); reset_epoch = emergency_stop_reset_epoch_; }
-        emergency_payload = payload;
-        emergency_payload["emergency_stop"] = {{"protocol", detail::kEmergencyStopCapability}, {"authority", authority},
-            {"reset_epoch", reset_epoch}, {"media_attempt", current_media_attempt}};
-        emergency_payload["native_mac"] = detail::transport_message_mac(emergency_payload, transport_signing_key, false);
-        const auto published = monotonic_now_ms();
-        { std::lock_guard lock(emergency_stop_mutex_);
-          if (emergency_stop_owner_ != sample.owner_ui_instance_id || emergency_stop_ui_epoch_ != sample.ui_control_epoch ||
-              emergency_stop_session_generation_ != generation || emergency_stop_attempt_ != current_media_attempt) {
-            emergency_stop_latency_.reset(); emergency_stop_last_result_ = Json(nullptr);
-          }
-          emergency_stop_latest_frame_ = emergency_payload; emergency_stop_published_ms_ = published;
-          emergency_stop_owner_ = sample.owner_ui_instance_id; emergency_stop_ui_epoch_ = sample.ui_control_epoch;
-          emergency_stop_session_generation_ = generation; emergency_stop_attempt_ = current_media_attempt;
-          emergency_stop_latency_.note_sent(sequence, sample.intent.intent_seq, published, true); }
-        if (native_control_trace_) native_control_trace_->enqueue({{"stage", "emergency_native_published"},
-            {"trace_session_id", session}, {"seq", sequence}, {"intent_seq", sample.intent.intent_seq},
-            {"published_monotonic_ms", published}, {"scope_ui_epoch", sample.ui_control_epoch}});
-        // Publish BEFORE WSS connect/drain/write, through an independent lock.
-        // Ordinary commands still use their one selected path and old broker.
-        envelope["payload"] = emergency_payload;
-      }
+    if (command.estop && config_.enable_experimental_direct_authority && vehicle_stop_capable) {
+      std::lock_guard update_lock(native_control_update_mutex_);
+      emergency_payload = publish_native_emergency_locked(sample, payload, generation);
+      if (emergency_payload.is_object()) envelope["payload"] = emergency_payload;
     }
 
     const auto connect_started_at_utc_ms = clock_.now_ms();
@@ -7850,6 +7882,12 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input, const HttpRe
     const auto apply_started_at = monotonic_now_ms();
     result = native_control_intent_.update(
         intent, received_at, expected_ui_control_epoch, takeover, apply_started_at);
+    if (result.accepted && !result.duplicate && intent.estop) {
+      // The accepted native latch and its DC publication must not wait for a
+      // prior ordinary WSS operation on the periodic sender thread.
+      static_cast<void>(publish_native_emergency_locked(native_control_intent_.sample(monotonic_now_ms()),
+          Json(nullptr), expected_session_generation));
+    }
     applied_at = monotonic_now_ms();
   }
   const Json timing = {{"timestamp_scope", "local_http_received_to_intent_applied"},

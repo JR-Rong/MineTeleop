@@ -51,11 +51,16 @@ physical confirmation. Ordinary cloud ingress ACKs remain insufficient.
 
 ## Explicit limits
 
-The native periodic producer must first reach and sample the emergency intent.
-This bridge avoids this event's subsequent WSS block; it cannot preempt an
-earlier already-blocked ordinary WSS operation. It is not a proof of minimum
-physical stopping latency or complete emergency preemption. The independent
-vehicle watchdog and short-authority expiry remain in force.
+At the original checkpoint, the periodic producer had to reach the emergency
+intent before publication. The follow-up now serializes a newly accepted STOP
+event in the existing native input handler, using the same native global
+sequence allocator and the same signed publication helper. It takes no WSS
+lock and performs no network I/O. A previously sampled periodic event cannot
+replace a newer urgent event. Ordinary bridge/failure processing no longer
+holds the input-acceptance lock while waiting for WSS; its scope is rechecked
+after that wait. No new worker, browser command producer, lease or timeout was
+introduced. This is still not proof of minimum physical stopping latency; the
+independent vehicle watchdog and short-authority expiry remain in force.
 
 The existing shared WebRTC association can itself be impaired. An open DC is
 only an available bounded stop attempt, not evidence of healthy command
@@ -87,3 +92,15 @@ No bench, production cloud, Mac UI, network settings or credentials were used.
 Full Linux/GStreamer compilation and coordinated field checks remain required;
 the local machine lacks `gstreamer-webrtc-1.0`. The blocked Docker environment
 has not been reset or modified.
+
+## Follow-up: ordinary WSS blocked before STOP exists
+
+On 2026-10-15 at 08:50 UTC the localhost fixture first held an ordinary native
+WSS upgrade for 700 ms, then also blocked the ordinary byte bridge on that
+transport lock, and only then submitted the first STOP intent. Native accepted
+and latched it, published signed DC bytes, and accepted the real receiver's
+software latch result while both ordinary operations were still blocked.
+Emergency receiver, actual localhost integration and JS courier CTest targets
+passed **3/3 in 4.49 s**. Evidence: `urgent-stop-build.log` and
+`urgent-stop-loopback.log` in the delegating task directory. No remote resource
+was contacted. The 600 ms grant remains a test fixture, not an approved default.

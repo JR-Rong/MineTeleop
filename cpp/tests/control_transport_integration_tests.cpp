@@ -308,7 +308,7 @@ void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
         "cloud silence left vehicle authorization/motion live past independent deadline"); }
 }
 
-void emergency_broker_delivers_while_wss_upgrade_is_blocked() {
+void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
   std::atomic<bool> wss_waiting{false}, wss_finished{false}; // Outlive the fixture/server callbacks.
   Fixture fixture(true);
   const auto ready_deadline = steady() + 8000;
@@ -324,6 +324,8 @@ void emergency_broker_delivers_while_wss_upgrade_is_blocked() {
     fixture.pump(true);
     if (fixture.driver->status().at("native_control").at("control_transport").at("direct_authority").value("remaining_ms", 0) > 400) break;
   }
+  auto unavailable = fixture.scope(false);
+  static_cast<void>(fixture.driver->control_transport_bridge(unavailable));
   fixture.stop_cloud();
   const auto port = fixture.server->port();
   fixture.server = std::make_unique<SimpleHttpServer>("127.0.0.1", port,
@@ -345,8 +347,19 @@ void emergency_broker_delivers_while_wss_upgrade_is_blocked() {
         {"critical_video_bad_sample_revision", std::uint64_t{0}}, {"critical_video_brake_revision", std::uint64_t{0}}});
   };
   const auto started = steady();
-  while (!wss_waiting.load() && steady() - started < 1000) { static_cast<void>(press_stop()); std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
-  expect(wss_waiting.load() && !wss_finished.load(), "fixture failed to hold real native WSS upgrade in flight");
+  while (!wss_waiting.load() && steady() - started < 2000) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  expect(wss_waiting.load() && !wss_finished.load(), "fixture failed to block ordinary WSS before STOP exists");
+  std::atomic<bool> bridge_entered{false}, bridge_done{false};
+  std::jthread blocked_ordinary_bridge([&] {
+    bridge_entered.store(true);
+    try { static_cast<void>(fixture.driver->control_transport_bridge(unavailable)); } catch (...) {}
+    bridge_done.store(true);
+  });
+  while (!bridge_entered.load()) std::this_thread::yield();
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  expect(!bridge_done.load() && !wss_finished.load(), "fixture did not also block ordinary courier on WSS");
+  const auto accepted = press_stop(); // First STOP happens strictly AFTER ordinary WSS entered its stall.
+  expect(accepted.at("accepted") == true && !wss_finished.load(), "native STOP latch waited for the blocked ordinary WSS call");
   Json request = {{"source_session_id", fixture.session}, {"source_control_session_generation", fixture.native_generation},
       {"media_negotiation_id", "media-a"}, {"ui_instance_id", "owner"}, {"ui_control_epoch", fixture.ui_epoch},
       {"dc_ready", true}, {"last_seen_seq", 0}};
@@ -366,6 +379,6 @@ void emergency_broker_delivers_while_wss_upgrade_is_blocked() {
 }
 }  // namespace
 int main() {
-  try { integration(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_while_wss_upgrade_is_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { integration(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
