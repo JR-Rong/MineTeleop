@@ -15,7 +15,7 @@ struct Entry {
   DirectAuthorityLease direct_authority;
   Json native_control_websocket_authority_scope;
   std::mutex control_mutex;
-  bool control_service_started{true};
+  bool control_service_started{true}, direct_authority_stop_failed{false};
   std::unique_ptr<test::LogicalTimeControlService> control_service;
   unsigned invalidations{};
   void invalidate_native_control_trusted_gear_locked() { ++invalidations; }

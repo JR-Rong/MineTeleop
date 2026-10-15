@@ -2231,9 +2231,7 @@ struct VehicleMediaRuntime::Impl {
       std::lock_guard lock(control_mutex);
       if (direct_authority.configured()) {
         if (direct_authority.observe_authenticated_cloud_denial(envelope, native_control_websocket_authority_scope)) {
-          invalidate_native_control_trusted_gear_locked();
-          if (control_service_started && control_service)
-            control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+          brake_direct_authority_locked();
         }
         return; // A stale/duplicate denial also must not become a new connection fault.
       }
@@ -2243,9 +2241,7 @@ struct VehicleMediaRuntime::Impl {
       { std::lock_guard lock(control_mutex);
         auto denial = envelope; denial["event"] = "signaling_authority_lost";
         if (direct_authority.observe_authenticated_cloud_denial(denial, native_control_websocket_authority_scope)) {
-          invalidate_native_control_trusted_gear_locked();
-          if (control_service_started && control_service)
-            control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+          brake_direct_authority_locked();
         }
       }
       throw std::runtime_error(
@@ -2620,9 +2616,7 @@ struct VehicleMediaRuntime::Impl {
           if (!detail::transient_cloud_failure(error)) {
             std::lock_guard lock(control_mutex);
             if (direct_authority.observe_authenticated_cloud_denial({{"event", "signaling_authority_lost"}}, native_control_websocket_authority_scope)) {
-              invalidate_native_control_trusted_gear_locked();
-              if (control_service_started && control_service)
-                control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+              brake_direct_authority_locked();
             }
           }
           note_native_control_transport_error(error.what(), false);
@@ -2728,6 +2722,7 @@ struct VehicleMediaRuntime::Impl {
       signaling.bound_direct_session_requests(authority.at("maximum_duration_ms").get<int>());
       direct_authority.configure(authority.at("issuer").get<std::string>(), config.vehicle_id, signaling.driver_id(), signaling.session_id(),
           authority.at("connection_generation").get<std::uint64_t>(), authority.at("maximum_duration_ms").get<int>());
+      direct_authority_stop_failed = false;
       direct_authority_worker = std::jthread([this](std::stop_token token) { direct_authority_loop(token); });
     }
     {
@@ -2774,7 +2769,28 @@ struct VehicleMediaRuntime::Impl {
     if (direct_authority_worker.joinable()) direct_authority_worker.join();
   }
 
-  void direct_authority_loop(std::stop_token token) {
+  // Caller owns control_mutex. A failed physical stop never escapes a worker
+  // catch or becomes a claimed success; the existing tick fault path closes it.
+  void brake_direct_authority_locked() noexcept {
+    try {
+      invalidate_native_control_trusted_gear_locked();
+      if (control_service_started && control_service)
+        control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+    } catch (...) {
+      direct_authority.revoke(); direct_authority_stop_failed = true;
+    }
+  }
+
+  void mark_direct_authority_worker_failed() noexcept {
+    try {
+      std::lock_guard lock(control_mutex);
+      direct_authority.revoke(); direct_authority_stop_failed = true;
+      invalidate_native_control_trusted_gear_locked();
+    } catch (...) { control_inhibited.store(true); }
+  }
+
+  void direct_authority_loop(std::stop_token token) noexcept {
+    try {
     const auto duration = signaling.direct_authority_configuration().at("maximum_duration_ms").get<int>();
     std::int64_t next_attempt_ms = 0;
     while (!token.stop_requested() && !stop_requested.load()) {
@@ -2799,25 +2815,25 @@ struct VehicleMediaRuntime::Impl {
           // next authenticated request retires the observed expired epoch;
           // only a new epoch can recover the vehicle after that boundary.
           if (accepted && revision != direct_authority.rearm_revision() && control_service_started && control_service) {
-            invalidate_native_control_trusted_gear_locked();
-            control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+            brake_direct_authority_locked();
           }
         } catch (const HttpStatusError& error) {
           // An authenticated denial is a revocation, never a network grace.
           if (error.status() == 401 || error.status() == 403 || error.status() == 404 || error.status() == 409) {
             std::lock_guard lock(control_mutex); direct_authority.revoke();
-            if (control_service_started && control_service) control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+            brake_direct_authority_locked();
           }
         } catch (const HttpTransportError&) {
           // No refresh. The independent watchdog enforces the old deadline.
         } catch (const std::exception&) {
           std::lock_guard lock(control_mutex); direct_authority.revoke();
-          if (control_service_started && control_service) control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+          brake_direct_authority_locked();
         }
       }
       // Existing watchdog cadence, not a cloud liveness heartbeat/deadline.
       std::this_thread::sleep_for(kNativeControlWatchdogInterval);
     }
+    } catch (...) { mark_direct_authority_worker_failed(); }
   }
 
   std::uint64_t send_control_command_rejected_locked(
@@ -3542,11 +3558,12 @@ struct VehicleMediaRuntime::Impl {
     if (stop_requested || control_inhibited || !control_service_started || !control_service) return;
     const auto timestamp_ms = signaling.now_ms();
     emergency_stop_receiver.observe_latched(control_service->safety_state() == SafetyState::Estop);
-    if (direct_authority.observe_expiry(steady_now_ms())) {
-      invalidate_native_control_trusted_gear_locked();
-      control_service->set_control_braking_wait(true, timestamp_ms, ControlRecoveryCause::ControlLink);
-    }
     try {
+      if (direct_authority_stop_failed) throw std::runtime_error("direct authority worker/physical brake failed; stop is unconfirmed");
+      if (direct_authority.observe_expiry(steady_now_ms())) {
+        invalidate_native_control_trusted_gear_locked();
+        control_service->set_control_braking_wait(true, timestamp_ms, ControlRecoveryCause::ControlLink);
+      }
       control_service->tick(timestamp_ms);
       observe_control_hard_stop_locked(timestamp_ms);
     } catch (const std::exception& error) {
@@ -5186,6 +5203,7 @@ struct VehicleMediaRuntime::Impl {
   GstElement* webrtc{nullptr};
   detail::ControlTransportFence control_transport_fence;
   detail::DirectAuthorityLease direct_authority;
+  bool direct_authority_stop_failed{false}; // control_mutex; terminal until new runtime/session setup
   Json native_control_websocket_authority_scope;
   detail::EmergencyStopReceiver emergency_stop_receiver;
   detail::FeedbackTransportFence feedback_transport_fence;
