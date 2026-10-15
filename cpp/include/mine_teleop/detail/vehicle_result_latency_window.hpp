@@ -19,6 +19,9 @@ class VehicleResultLatencyWindow {
     std::int64_t round_trip_ms;
     std::int64_t received_monotonic_ms;
     bool accepted;
+    bool data_channel;
+    bool piggyback_return;
+    bool feedback_data_channel;
   };
   struct Snapshot {
     std::optional<Sample> last;
@@ -35,13 +38,13 @@ class VehicleResultLatencyWindow {
   // measurement includes write duration. Fixed storage cannot fail a send or
   // ESTOP because diagnostic bookkeeping is full.
   void note_sent(std::uint64_t seq, std::uint64_t intent_seq,
-      std::int64_t send_started_monotonic_ms) noexcept {
+      std::int64_t send_started_monotonic_ms, bool data_channel = false) noexcept {
     if (seq == 0 || intent_seq == 0 || seq <= last_sent_seq_ || send_started_monotonic_ms < 0) return;
     if (size_ == kCapacity) {
       pop_front();
       ++evicted_sends_;
     }
-    sends_[(head_ + size_) % kCapacity] = {seq, intent_seq, send_started_monotonic_ms};
+    sends_[(head_ + size_) % kCapacity] = {seq, intent_seq, send_started_monotonic_ms, data_channel};
     ++size_;
     last_sent_seq_ = seq;
   }
@@ -50,7 +53,7 @@ class VehicleResultLatencyWindow {
   // superseded/evicted sends stay unknown; duplicates cannot renew progress.
   // accepted means a software control-service result, never physical CAN ACK.
   std::optional<Sample> note_result(std::uint64_t seq, std::uint64_t intent_seq,
-      std::int64_t received_monotonic_ms, bool accepted) noexcept {
+      std::int64_t received_monotonic_ms, bool accepted, bool piggyback_return = true, bool feedback_data_channel = false) noexcept {
     if (last_ && seq <= last_->command_seq) return std::nullopt;
     std::size_t index = 0;
     for (; index < size_; ++index) {
@@ -62,7 +65,7 @@ class VehicleResultLatencyWindow {
         return std::nullopt;
       }
       last_ = Sample{seq, intent_seq, received_monotonic_ms - sent.started_ms,
-          received_monotonic_ms, accepted};
+          received_monotonic_ms, accepted, sent.data_channel, piggyback_return, feedback_data_channel};
       ++samples_;
       // Latest-mailbox semantics allow earlier sends to have been superseded.
       // This does not infer any received/accepted result for those sequences.
@@ -78,7 +81,7 @@ class VehicleResultLatencyWindow {
   }
 
  private:
-  struct Sent { std::uint64_t seq{0}; std::uint64_t intent_seq{0}; std::int64_t started_ms{0}; };
+  struct Sent { std::uint64_t seq{0}; std::uint64_t intent_seq{0}; std::int64_t started_ms{0}; bool data_channel{false}; };
   void pop_front() noexcept { head_ = (head_ + 1) % kCapacity; --size_; }
   std::array<Sent, kCapacity> sends_{};
   std::size_t head_{0};

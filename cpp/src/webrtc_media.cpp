@@ -1,4 +1,5 @@
 #include "mine_teleop/media.hpp"
+#include "mine_teleop/detail/control_transport.hpp"
 
 #include "mine_teleop/gstreamer_media.hpp"
 #include "mine_teleop/detail/gstreamer_freshness.hpp"
@@ -23,9 +24,11 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <limits>
 #include <optional>
@@ -422,6 +425,8 @@ class MediaSignalingClient {
     session_id_ = next_session_id;
     driver_id_ = response.value("driver_id", "");
     control_token_ = response.value("control_token", "");
+    transport_mac_key_ = response.value("transport_mac_key", "");
+    control_lease_expires_at_ms_.store(response.value("control_token_expires_at_utc_ms", std::int64_t{0}));
     return !session_id_.empty() && !driver_id_.empty() && !control_token_.empty();
   }
 
@@ -441,7 +446,8 @@ class MediaSignalingClient {
                session_id_,
                vehicle_id_,
                std::to_string(connection_generation_)) +
-        "&types=control_command";
+        "&types=control_command" + (transport_mac_key_.size() >= 32
+                   ? "&transport_protocol=" + std::string(detail::kControlTransportCapability) : "");
   }
 
   [[nodiscard]] HttpHeaders native_control_websocket_headers() const {
@@ -488,6 +494,9 @@ class MediaSignalingClient {
   [[nodiscard]] const std::string& session_id() const { return session_id_; }
   [[nodiscard]] const std::string& driver_id() const { return driver_id_; }
   [[nodiscard]] const std::string& control_token() const { return control_token_; }
+  [[nodiscard]] const std::string& transport_mac_key() const { return transport_mac_key_; }
+  [[nodiscard]] std::int64_t control_lease_expiry() const { return control_lease_expires_at_ms_.load(); }
+  void observe_lease(std::int64_t expiry) { if (expiry > 0) control_lease_expires_at_ms_.store(expiry); }
 
  private:
   void require_connection() const {
@@ -514,6 +523,8 @@ class MediaSignalingClient {
   std::string session_id_;
   std::string driver_id_;
   std::string control_token_;
+  std::string transport_mac_key_;
+  std::atomic<std::int64_t> control_lease_expires_at_ms_{0};
   std::shared_ptr<MediaSignalingSequence> sequence_;
   std::mutex send_mutex_;
 };
@@ -1045,6 +1056,10 @@ struct VehicleMediaRuntime::Impl {
     if (!was_open) return;
     self->invalidate_native_control_trusted_gear_locked();
     ++self->control_link_loss_count;
+    if (self->control_transport_fence.negotiated() && self->control_service_started && self->control_service) {
+      self->control_service->set_control_braking_wait(true, self->signaling.now_ms(), ControlRecoveryCause::ControlLink);
+      return;
+    }
     if (self->control_service_started && self->control_service) {
       try {
         self->control_service->close();
@@ -1170,6 +1185,7 @@ struct VehicleMediaRuntime::Impl {
     auto* self = state->owner;
     state->pending.emplace_back("webrtc_offer", Json{
          {"type", "offer"},
+         {"control_transport_capability", self->signaling.transport_mac_key().size() >= 32 ? detail::kControlTransportCapability : std::string_view{}},
          {"sdp", text == nullptr ? "" : text},
          {"media_negotiation_id", negotiation_id},
          {"legacy_bootstrap_allowed", state->attempt_count == 1 && state->offer_count == 1},
@@ -1422,16 +1438,13 @@ struct VehicleMediaRuntime::Impl {
     try {
       const auto message = Json::parse(data);
       if (message.value("type", "") == "session_control_profile") {
-        if (transport != ControlMessageTransport::DataChannel) {
-          ++rejected_control_commands;
-          return;
-        }
         const auto request = SessionControlProfileRequest::from_json(message);
         std::lock_guard lock(control_mutex);
-        if (control_channel != channel) return;
+        if (transport != ControlMessageTransport::DataChannel && !control_transport_fence.negotiated()) { ++rejected_control_commands; return; }
+        if (transport == ControlMessageTransport::DataChannel && control_channel != channel) return;
         SessionControlProfileResult result;
         if (stop_requested || control_inhibited || !control_service_started ||
-            !control_service || !control_link_open) {
+            !control_service || (!control_link_open && !control_transport_fence.negotiated())) {
           result.protocol_version = request.protocol_version;
           result.vehicle_id = request.vehicle_id;
           result.driver_id = request.driver_id;
@@ -1462,15 +1475,12 @@ struct VehicleMediaRuntime::Impl {
         return;
       }
       if (message.value("event", "") == "vcu_handshake_command") {
-        if (transport != ControlMessageTransport::DataChannel) {
-          ++rejected_control_commands;
-          return;
-        }
         const auto action = message.value("action", "");
         std::lock_guard lock(control_mutex);
-        if (control_channel != channel) return;
+        if (transport != ControlMessageTransport::DataChannel && !control_transport_fence.negotiated()) { ++rejected_control_commands; return; }
+        if (transport == ControlMessageTransport::DataChannel && control_channel != channel) return;
         if (stop_requested || control_inhibited || !control_service_started ||
-            !control_service || !control_link_open) {
+            !control_service || (!control_link_open && !control_transport_fence.negotiated())) {
           send_vcu_handshake_status_locked("driver_not_connected");
           return;
         }
@@ -1508,7 +1518,7 @@ struct VehicleMediaRuntime::Impl {
             accepted ? "command_accepted" : "command_rejected");
         return;
       }
-      if (transport == ControlMessageTransport::DataChannel) {
+      if (transport == ControlMessageTransport::DataChannel && !message.contains("control_transport")) {
         // Session profile and VCU handshake status still use the browser's
         // DataChannel, but periodic actuation commands have a single native
         // signaling path.  Reject mixed-version browser commands so one seq
@@ -1533,7 +1543,40 @@ struct VehicleMediaRuntime::Impl {
       const auto wire_requested_gear = command.gear;
       const auto intent_seq = message.value("intent_seq", std::uint64_t{0});
       if (intent_seq == 0) throw std::invalid_argument("intent_seq must be positive");
-      const bool intent_fresh = message.value("intent_fresh", false);
+      if (!message.contains("intent_fresh") || !message.at("intent_fresh").is_boolean())
+        throw std::invalid_argument("intent_fresh must be a boolean");
+      const bool intent_fresh = message.at("intent_fresh").get<bool>();
+      if (command.session_id != signaling.session_id() || command.vehicle_id != config.vehicle_id ||
+          command.driver_id != signaling.driver_id() || command.control_token != signaling.control_token())
+        throw std::invalid_argument("control result authority mismatch");
+      if (message.contains("control_transport") && !detail::verify_transport_message(message, signaling.transport_mac_key(), false))
+        throw std::invalid_argument("native control authentication failed");
+      std::string current_attempt;
+      { std::lock_guard scope_lock(media_signal_state->mutex); current_attempt = media_signal_state->negotiation_id; }
+      Json result_message = {{"event", "vehicle_control_result"}, {"protocol", detail::kControlTransportCapability},
+          {"session_id", command.session_id}, {"vehicle_id", command.vehicle_id}, {"driver_id", command.driver_id},
+          {"command_seq", command.seq}, {"intent_seq", intent_seq}, {"accepted", false},
+          {"rearm_required", false}, {"control_status_seq", 0}, {"reason", "control_not_applied"},
+          {"transport_admitted", false}, {"transport_selected", false}};
+      if (message.contains("control_transport")) {
+        const auto stamp = detail::ControlTransportStamp::from_json(message.at("control_transport"));
+        result_message["control_transport"] = stamp.to_json();
+      }
+      struct PublishResult {
+        std::function<void()> publish;
+        ~PublishResult() { try { publish(); } catch (...) {} }
+      } publish_result{[&, this] {
+        if (signaling.transport_mac_key().size() < 32) return;
+        std::lock_guard result_lock(control_mutex);
+        result_message["result_seq"] = ++control_result_seq;
+        result_message["authority_epoch"] = control_transport_fence.epoch();
+        if (signaling.transport_mac_key().size() >= 32)
+          result_message["vehicle_mac"] = detail::transport_message_mac(result_message, signaling.transport_mac_key(), true);
+        latest_control_result = result_message;
+        if (native_feedback) *native_feedback = result_message;
+        if (transport == ControlMessageTransport::DataChannel && control_channel == channel && control_link_open)
+          gst_webrtc_data_channel_send_string(channel, result_message.dump().c_str());
+      }};
       const bool stale_safe_heartbeat =
           !command.estop && !intent_fresh &&
           command.steering == 0.0 && command.throttle == 0.0 &&
@@ -1691,7 +1734,7 @@ struct VehicleMediaRuntime::Impl {
         }
       };
       if (stop_requested || control_inhibited ||
-          !control_service_started || !control_service || !control_link_open) {
+          !control_service_started || !control_service || (!control_link_open && !control_transport_fence.negotiated())) {
         ++rejected_control_commands;
         const std::string_view reason = stop_requested
             ? "runtime_stop_requested"
@@ -1710,6 +1753,25 @@ struct VehicleMediaRuntime::Impl {
             std::nullopt,
             std::nullopt);
         return;
+      }
+      if (transport == ControlMessageTransport::DataChannel && control_channel != channel) return;
+      if (message.contains("control_transport") || control_transport_fence.negotiated()) {
+        const auto decision = control_transport_fence.admit(command,
+            message.contains("control_transport") ? &message.at("control_transport") : nullptr,
+            transport == ControlMessageTransport::DataChannel ? detail::ControlPath::DataChannel : detail::ControlPath::Wss,
+            current_attempt, signaling.now_ms(), signaling.control_lease_expiry(), config.control.max_command_gap_ms,
+            native_control_websocket_connected.load() && native_control_transport_cloud_capable.load());
+        result_message["reason"] = decision.reason;
+        result_message["transport_admitted"] = decision.admitted;
+        result_message["transport_selected"] = decision.admitted && message.contains("control_transport") &&
+            message.at("control_transport").value("action", "") == "select";
+        if (!decision.admitted) { ++rejected_control_commands; return; }
+        if (decision.changed) {
+          invalidate_native_control_trusted_gear_locked();
+          control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+        }
+      } else {
+        result_message["transport_admitted"] = true;
       }
       if (!command.estop && !intent_fresh && !stale_safe_heartbeat) {
         native_control_stale_nonzero_intents_discarded_total.fetch_add(
@@ -1983,12 +2045,16 @@ struct VehicleMediaRuntime::Impl {
         }
       }
       observe_control_hard_stop_locked(received_at_ms);
-      if (native_feedback) {
+      control_transport_fence.note_legacy_sequence(command.seq);
+      result_message["accepted"] = result.accepted;
+      result_message["reason"] = result.reason;
+      result_message["rearm_required"] = result.issue_code == "control_input_rearm_required";
+      result_message["control_status_seq"] = rearm_status_seq;
+      if (native_feedback && signaling.transport_mac_key().size() < 32) {
         *native_feedback = {{"session_id", command.session_id}, {"vehicle_id", command.vehicle_id},
-                            {"driver_id", command.driver_id}, {"command_seq", command.seq},
-                            {"intent_seq", intent_seq}, {"accepted", result.accepted},
-                            {"rearm_required", result.issue_code == "control_input_rearm_required"},
-                            {"control_status_seq", rearm_status_seq}};
+            {"driver_id", command.driver_id}, {"command_seq", command.seq}, {"intent_seq", intent_seq},
+            {"accepted", result.accepted}, {"rearm_required", result.issue_code == "control_input_rearm_required"},
+            {"control_status_seq", rearm_status_seq}};
       }
       lock.unlock();
       queue_control_trace(
@@ -2078,6 +2144,10 @@ struct VehicleMediaRuntime::Impl {
           envelope.value("error", "native control WebSocket was rejected"));
     }
     const auto event = envelope.value("event", "");
+    if (event == "control_authority_lease") {
+      signaling.observe_lease(envelope.at("expires_at_utc_ms").get<std::int64_t>());
+      return;
+    }
     if (event == "signaling_delivery_acknowledged") {
       native_control_delivery_acknowledgements_total.fetch_add(
           1,
@@ -2335,7 +2405,9 @@ struct VehicleMediaRuntime::Impl {
             signaling.native_control_websocket_url(),
             signaling.native_control_websocket_headers());
         if (stop_token.stop_requested() || stop_requested.load()) break;
+        native_control_transport_cloud_capable.store(signaling.transport_mac_key().size() >= 32 && websocket.response_header("x-mine-teleop-transport-capabilities") == detail::kControlTransportCapability);
         native_control_websocket_connected.store(true, std::memory_order_relaxed);
+        std::uint64_t last_result_sent = 0;
         const auto connections =
             native_control_websocket_connections_total.fetch_add(
                 1,
@@ -2353,6 +2425,23 @@ struct VehicleMediaRuntime::Impl {
         std::int64_t previous_receive_completed_ms = steady_now_ms();
         std::int64_t next_idle_diagnostic_ms = 0;
         while (!stop_token.stop_requested() && !stop_requested.load()) {
+          if (native_control_transport_cloud_capable.load()) {
+            Json result;
+            std::map<std::string, Json> statuses;
+            { std::lock_guard result_lock(control_mutex); result = latest_control_result; statuses.swap(pending_control_status); }
+            std::vector<Json> ordered_status;
+            for (const auto& [event, status] : statuses) { static_cast<void>(event); ordered_status.push_back(status); }
+            std::sort(ordered_status.begin(), ordered_status.end(), [](const Json& left, const Json& right) {
+              return left.at("control_status_seq").get<std::uint64_t>() < right.at("control_status_seq").get<std::uint64_t>(); });
+            for (const auto& status : ordered_status)
+              websocket.send_json({{"event", "vehicle_control_status"}, {"protocol", detail::kControlTransportCapability},
+                  {"session_id", signaling.session_id()}, {"vehicle_id", config.vehicle_id}, {"driver_id", signaling.driver_id()},
+                  {"status", status}}, kNativeControlWebSocketSendTimeout);
+            if (result.is_object() && result.value("result_seq", std::uint64_t{0}) > last_result_sent) {
+              websocket.send_json(result, kNativeControlWebSocketSendTimeout);
+              last_result_sent = result.at("result_seq").get<std::uint64_t>();
+            }
+          }
           const auto receive_started_ms = steady_now_ms();
           const auto received = websocket.receive_json(
               kNativeControlWebSocketReceiveTimeout);
@@ -2578,9 +2667,8 @@ struct VehicleMediaRuntime::Impl {
         {"intent_seq", intent_seq},
         {"accepted", false},
         {"issue_code", stable_issue_code},
-    }).dump();
-    if (control_channel != nullptr && control_link_open)
-      gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
+    });
+    send_control_status_locked(payload);
     return last_control_rejection_status_seq;
   }
 
@@ -2589,8 +2677,20 @@ struct VehicleMediaRuntime::Impl {
     send_vcu_handshake_status_locked(result);
   }
 
+  void send_control_status_locked(Json message) {
+    if (control_channel != nullptr && control_link_open &&
+        (!control_transport_fence.negotiated() || control_transport_fence.path() == detail::ControlPath::DataChannel)) {
+      gst_webrtc_data_channel_send_string(control_channel, message.dump().c_str());
+    } else if (control_transport_fence.negotiated()) {
+      if ((message.contains("session_id") && message.at("session_id") != signaling.session_id()) ||
+          (message.contains("vehicle_id") && message.at("vehicle_id") != config.vehicle_id) ||
+          (message.contains("driver_id") && message.at("driver_id") != signaling.driver_id())) return;
+      pending_control_status[message.value("event", "unknown")] = std::move(message);
+    }
+  }
+
   void send_latest_vehicle_telemetry_locked() {
-    if (control_channel == nullptr || !control_link_open ||
+    if ((!control_link_open && !control_transport_fence.negotiated()) ||
         !control_service_started || !control_service) {
       return;
     }
@@ -2601,14 +2701,13 @@ struct VehicleMediaRuntime::Impl {
     if (sequence == last_vehicle_telemetry_seq) return;
     auto payload_value = telemetry;
     payload_value["control_status_seq"] = ++control_status_seq;
-    const auto payload = payload_value.dump();
-    gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
+    send_control_status_locked(std::move(payload_value));
     last_vehicle_telemetry_seq = sequence;
   }
 
   void send_session_control_profile_status_locked(
       const SessionControlProfileResult& result) {
-    if (control_channel == nullptr || !control_link_open) return;
+    if (!control_link_open && !control_transport_fence.negotiated()) return;
     auto message = result.to_json();
     message["event"] = "session_control_profile_status";
     message["control_status_seq"] = ++control_status_seq;
@@ -2617,8 +2716,7 @@ struct VehicleMediaRuntime::Impl {
       message["session_control_profile"] =
           control_service->session_control_profile();
     }
-    const auto payload = message.dump();
-    gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
+    send_control_status_locked(std::move(message));
   }
 
   [[nodiscard]] Json configured_control_limits() const {
@@ -2626,7 +2724,7 @@ struct VehicleMediaRuntime::Impl {
   }
 
   void send_vcu_handshake_status_locked(std::string_view result) {
-    if (control_channel == nullptr || !control_link_open) return;
+    if (!control_link_open && !control_transport_fence.negotiated()) return;
     try {
       VcuHandshakeStatus status;
       Json hard_limits = configured_control_limits();
@@ -2671,8 +2769,7 @@ struct VehicleMediaRuntime::Impl {
           control_service_issue_code == "control_recovery_timeout" || control_service_issue_code == "critical_camera_failed") {
         message["control_recovery"] = control_recovery_latch->recovery_status_for(signaling.session_id());
       }
-      const auto payload = message.dump();
-      gst_webrtc_data_channel_send_string(control_channel, payload.c_str());
+      send_control_status_locked(std::move(message));
       if (status.state != last_vcu_handshake_state) {
         emit_diagnostic(
             "vehicle_vcu_handshake_state_changed",
@@ -3285,12 +3382,12 @@ struct VehicleMediaRuntime::Impl {
       }
       return;
     }
-    if (control_link_open &&
+    if ((control_link_open || control_transport_fence.negotiated()) &&
         (!last_vcu_status_ms || timestamp_ms - *last_vcu_status_ms >= 500)) {
       send_vcu_handshake_status_locked("status_update");
       last_vcu_status_ms = timestamp_ms;
     }
-    if (control_link_open) send_latest_vehicle_telemetry_locked();
+    if (control_link_open || control_transport_fence.negotiated()) send_latest_vehicle_telemetry_locked();
   }
 
   [[nodiscard]] std::string current_pipeline_error() const {
@@ -4075,6 +4172,24 @@ struct VehicleMediaRuntime::Impl {
     }
   }
 
+  void process_control_management(const Json& message, const Json& payload) {
+        const auto sent = payload.value("sent_at_utc_ms", std::int64_t{0});
+        const auto now = signaling.now_ms();
+        const auto seq = message.value("seq", std::uint64_t{0});
+        bool allowed = false;
+        { std::lock_guard control_lock(control_mutex);
+          allowed = control_transport_fence.negotiated() && native_control_websocket_connected.load() &&
+              native_control_transport_cloud_capable.load() && signaling.control_lease_expiry() > now &&
+              payload.value("protocol", "") == detail::kControlTransportCapability &&
+              payload.value("session_id", "") == signaling.session_id() && payload.value("vehicle_id", "") == config.vehicle_id &&
+              payload.value("driver_id", "") == signaling.driver_id() && payload.value("control_token", "") == signaling.control_token() &&
+              sent >= now - config.control.max_command_gap_ms && sent <= now + config.control.max_command_gap_ms &&
+              seq > last_control_management_seq;
+          if (allowed) last_control_management_seq = seq;
+        }
+        if (allowed) handle_control_message(nullptr, payload.at("message").dump(), ControlMessageTransport::NativeSignaling, nullptr);
+  }
+
   void flush_outgoing_signals() {
     std::deque<std::pair<std::string, Json>> values;
     {
@@ -4134,10 +4249,11 @@ struct VehicleMediaRuntime::Impl {
   }
 
   void process_signaling() {
-    const auto response = signaling.poll("webrtc_answer,ice_candidate,media_fallback");
+    const auto response = signaling.poll("webrtc_answer,ice_candidate,media_fallback,control_management");
     for (const auto& message : response.value("messages", Json::array())) {
       const auto type = message.value("type", "");
       const auto payload = message.value("payload", Json::object());
+      if (type == "control_management") { process_control_management(message, payload); continue; }
       if (type == "webrtc_answer") {
         GstElement* source = nullptr;
         std::string negotiation_id;
@@ -4473,6 +4589,7 @@ struct VehicleMediaRuntime::Impl {
       std::this_thread::sleep_for(
           std::chrono::milliseconds(config.runtime.teleop_poll_interval_ms));
     }
+    control_transport_fence.reset(config.vehicle_id, signaling.driver_id(), signaling.session_id(), signaling.control_token());
     const bool inherited_control_inhibition =
         control_recovery_latch->enter_session(signaling.session_id());
     control_inhibited.store(inherited_control_inhibition);
@@ -4845,6 +4962,12 @@ struct VehicleMediaRuntime::Impl {
   int simulate_primary_failure_after_frames;
   GstElement* pipeline{nullptr};
   GstElement* webrtc{nullptr};
+  detail::ControlTransportFence control_transport_fence;
+  Json latest_control_result;
+  std::map<std::string, Json> pending_control_status;
+  std::uint64_t last_control_management_seq{0};
+  std::uint64_t control_result_seq{0};
+  std::atomic<bool> native_control_transport_cloud_capable{false};
   GstWebRTCDataChannel* control_channel{nullptr};
   std::vector<std::unique_ptr<Lane>> lanes;
   std::atomic<bool> stop_requested{false};

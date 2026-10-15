@@ -18,6 +18,8 @@
 #include "mine_teleop/core.hpp"
 #include "mine_teleop/detail/native_control_acknowledgement_window.hpp"
 #include "mine_teleop/detail/vehicle_result_latency_window.hpp"
+#include "mine_teleop/detail/control_transport.hpp"
+#include "mine_teleop/detail/control_transport_sender.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/websocket.hpp"
@@ -196,6 +198,7 @@ class SignalingService {
     std::int64_t started_at_utc_ms{0};
     SessionState state{SessionState::Online};
     std::string control_token;
+    std::string transport_mac_key; // Never serialized by Session::to_json or logs.
     std::int64_t control_token_expires_at_ms{0};
     std::uint64_t relay_bytes_sent{0};
     std::uint64_t relay_bytes_received{0};
@@ -299,6 +302,8 @@ class SignalingService {
   std::unordered_map<std::string, std::vector<Message>> messages_;
   std::unordered_map<std::string, Message> latest_control_messages_;
   std::unordered_map<std::string, Json> latest_vehicle_control_feedback_;
+  std::unordered_map<std::string, Json> latest_vehicle_transport_results_;
+  std::unordered_map<std::string, Json> latest_vehicle_transport_status_;
   std::unordered_map<std::string, AcceptedMessage> last_accepted_messages_;
   std::unordered_map<std::string, std::uint64_t> next_delivery_cursors_;
   std::unordered_map<std::string, LoginFailureState> login_failures_;
@@ -352,6 +357,9 @@ struct DriverConfig {
   std::vector<std::string> resolve_entries;
   std::filesystem::path ca_bundle;
   std::string ice_transport_policy{"all"};
+  // Internal opt-in for controlled validation; no YAML/CLI activation until
+  // the direct-control cloud-authority failure policy has been reviewed.
+  bool enable_experimental_control_transport{false};
   std::filesystem::path browser_event_log_path;
   std::uint64_t browser_event_log_max_bytes{2 * 1024 * 1024};
   int browser_event_log_files{3};
@@ -395,6 +403,10 @@ class DriverConsoleRuntime {
   [[nodiscard]] Json control_profile() const;
   [[nodiscard]] Json prepare_control_profile(const Json& input);
   [[nodiscard]] Json send_control(const Json& input);
+  [[nodiscard]] Json send_control_management(const Json& input);
+  [[nodiscard]] Json control_transport_bridge(const Json& input);
+  [[nodiscard]] bool consume_vehicle_control_result_locked(const Json& result, std::string_view session,
+      std::string_view vehicle, std::string_view driver, std::int64_t now, bool direct_return = false);
   [[nodiscard]] Json update_control_intent(const Json& input, const HttpRequest* request = nullptr);
   [[nodiscard]] Json record_browser_event(const Json& input);
   [[nodiscard]] Json status();
@@ -498,6 +510,7 @@ class DriverConsoleRuntime {
   std::string session_id_;
   std::string session_creator_ui_instance_id_;
   std::string control_token_;
+  std::string control_transport_mac_key_;
   std::int64_t control_token_expires_at_ms_{0};
   std::int64_t control_token_renew_at_ms_{0};
   std::uint64_t sequence_{0};
@@ -538,6 +551,19 @@ class DriverConsoleRuntime {
   std::uint64_t control_signaling_last_ack_seq_{0};
   detail::NativeControlAcknowledgementWindow control_signaling_ack_window_;
   detail::VehicleResultLatencyWindow control_vehicle_result_latency_;
+  detail::ControlTransportSender control_transport_sender_;
+  bool control_transport_cloud_capable_{false};
+  bool control_transport_vehicle_capable_{false}; // mutex_
+  bool control_transport_dc_ready_{false};
+  std::string control_transport_bridge_attempt_, control_transport_bridge_owner_;
+  std::uint64_t control_transport_bridge_ui_epoch_{0};
+  std::int64_t control_transport_bridge_seen_ms_{0};
+  Json control_transport_pending_status_ = Json::object();
+  Json control_transport_latest_dc_;
+  std::int64_t control_transport_latest_dc_at_ms_{0};
+  detail::NativeControlAcknowledgementWindow control_dc_ack_window_;
+  detail::NativeControlAckRecovery control_dc_ack_recovery_;
+  std::uint64_t control_dc_last_ack_seq_{0};
   detail::NativeControlAckRecovery control_signaling_ack_recovery_;
   std::string control_signaling_recovery_gear_{"N"};
   std::int64_t control_signaling_next_connect_monotonic_ms_{0};

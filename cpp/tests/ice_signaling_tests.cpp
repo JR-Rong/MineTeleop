@@ -44,6 +44,8 @@ struct Fixture {
     driver_config.signaling_url = websocket ? "ws://127.0.0.1:" + std::to_string(server->port()) + "/signaling" : base;
     driver = std::make_unique<mine_teleop::DriverConsoleRuntime>(driver_config, "ice-vehicle", "fixture-password");
     static_cast<void>(driver->connect("ice-vehicle"));
+    expect(driver->status().at("native_control").at("control_transport").at("experimental_enabled") == false,
+        "default driver activated unreviewed direct-control authority semantics");
   }
   ~Fixture() { driver.reset(); server->stop(); }
   Json scope() const {

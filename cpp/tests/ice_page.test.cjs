@@ -33,6 +33,7 @@ function fixture() {
     async getStats() { if (gates.stats) { gates.stats.entered=true; await gates.stats.promise; } return this.stats || new Map(); }
   }
   const context = vm.createContext({
+    MineTeleopControlTransport:require('../web/control_transport.js'),setInterval(){},
     peer:null,controlChannel:null,pendingIce:[],mediaPeerEpoch:0,mediaOfferScope:null,mediaHasOffer:false,
     retiredMediaScopes:new Set(),mediaScopeIssue:'',nativeControlSessionId:'session-fixture',nativeControlSessionGeneration:7,
     lastControlStatusSeq:0,cameraByMid:new Map(),assignedCameraIds:new Set(),previousStats:new Map(),

@@ -1966,6 +1966,28 @@ test('shipped logout bounds confirmation at 15 seconds and HTTP release alone ne
   assert.match(fixture.context.statusPanel.textContent,/本地核实停车和制动状态/);
 });
 
+test('negotiated WSS logout awaits management delivery and fresh final CAN evidence after DC closes', async()=>{
+  const fixture=logoutPageFixture();let deliver;const messages=[];
+  fixture.context.controlChannel=null;
+  fixture.context.controlTransportCourier={negotiated:()=>true,activePath:()=> 'wss',epoch:()=>2};
+  fixture.context.sendControlManagement=message=>{messages.push(message);return new Promise(resolve=>{deliver=resolve})};
+  const exit=fixture.context.logout();await fixture.settle();
+  assert.equal(messages.length,1);assert.equal(messages[0].action,'disconnect');assert.equal(fixture.closeCount(),0);
+  assert(!fixture.calls.some(call=>call.post));deliver({});await fixture.settle();
+  assert(!fixture.calls.some(call=>call.post));fixture.telemetry();await fixture.advanceTo(1100);
+  assert.equal((await exit).confirmed,true);assert.equal(fixture.closeCount(),1);
+});
+
+test('negotiated WSS logout cannot confirm across a transport epoch change', async()=>{
+  const fixture=logoutPageFixture();let epoch=2;
+  fixture.context.controlChannel=null;
+  fixture.context.controlTransportCourier={negotiated:()=>true,activePath:()=> 'wss',epoch:()=>epoch};
+  fixture.context.sendControlManagement=async()=>({});
+  const exit=fixture.context.logout();await fixture.settle();epoch=3;
+  fixture.telemetry();await fixture.advanceTo(1100);
+  assert.equal((await exit).confirmed,false);assert.match(fixture.context.statusPanel.textContent,/安全退出未确认/);
+});
+
 test('shipped logout rejects old sequence, old source feedback and untrusted clock then accepts only fresh current evidence', async()=>{
   const fixture=logoutPageFixture();const exit=fixture.context.logout();await fixture.settle();
   fixture.telemetry({control_status_seq:50});await fixture.advanceTo(1100);assert(!fixture.calls.some(call=>call.post));

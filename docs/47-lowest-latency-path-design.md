@@ -1,5 +1,7 @@
 # PR24 最低健康延迟路径：证据、实施设计与验收
 
+第二阶段已形成默认关闭的本地实验实现，最新范围、权威失联待决事项和验收缺口见 [48-experimental-native-dc-control.md](48-experimental-native-dc-control.md)；下文“未实现”描述保留第一阶段交付时状态。
+
 基线 `2cae265cd350776bdbbe15bc495a281a9b805e6d`。本改动只在本机隔离检出开发；没有部署、操作 Mac UI、连接台架、改变网络或修改既有工作树。所有后续集成仍交主线程进入 PR24，不另建 PR、不合并、不 force push。
 
 ## 已确认的调用图

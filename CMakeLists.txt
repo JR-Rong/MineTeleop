@@ -98,6 +98,10 @@ set(MINE_TELEOP_SESSION_LOG_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/sessi
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_SESSION_LOG_JS_SOURCE}")
 file(READ "${MINE_TELEOP_SESSION_LOG_JS_SOURCE}" MINE_TELEOP_SESSION_LOG_JS)
 string(APPEND MINE_TELEOP_CONTROL_LOGIC_JS "\n${MINE_TELEOP_SESSION_LOG_JS}")
+set(MINE_TELEOP_CONTROL_TRANSPORT_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_transport.js")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_TRANSPORT_JS_SOURCE}")
+file(READ "${MINE_TELEOP_CONTROL_TRANSPORT_JS_SOURCE}" MINE_TELEOP_CONTROL_TRANSPORT_JS)
+string(APPEND MINE_TELEOP_CONTROL_LOGIC_JS "\n${MINE_TELEOP_CONTROL_TRANSPORT_JS}")
 string(REPLACE "\r\n" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
 string(REPLACE "\r" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
 mine_teleop_make_adjacent_raw_literals(
@@ -368,6 +372,16 @@ endif()
 
 if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
   enable_testing()
+  add_executable(mine-teleop-control-transport-integration-tests cpp/tests/control_transport_integration_tests.cpp)
+  target_link_libraries(mine-teleop-control-transport-integration-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+  mine_teleop_enable_warnings(mine-teleop-control-transport-integration-tests)
+  add_test(NAME mine-teleop-control-transport-integration-tests COMMAND mine-teleop-control-transport-integration-tests)
+  set_tests_properties(mine-teleop-control-transport-integration-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
+  add_executable(mine-teleop-control-transport-tests cpp/tests/control_transport_tests.cpp)
+  target_link_libraries(mine-teleop-control-transport-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+  mine_teleop_enable_warnings(mine-teleop-control-transport-tests)
+  add_test(NAME mine-teleop-control-transport-tests COMMAND mine-teleop-control-transport-tests)
+  set_tests_properties(mine-teleop-control-transport-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
   add_executable(mine-teleop-latency-path-tests cpp/tests/latency_path_tests.cpp)
   target_include_directories(mine-teleop-latency-path-tests PRIVATE cpp/include)
   mine_teleop_enable_warnings(mine-teleop-latency-path-tests)
@@ -417,6 +431,8 @@ if(MINE_TELEOP_BUILD_TESTS)
       NAME mine-teleop-control-logic-js-tests
       COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/control_logic.test.cjs
     )
+    add_test(NAME mine-teleop-control-transport-js-tests
+      COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/control_transport.test.cjs)
     add_test(NAME mine-teleop-ice-page-tests
       COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/ice_page.test.cjs)
   endif()
