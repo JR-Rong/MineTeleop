@@ -1792,7 +1792,7 @@ async function startFromOffer(offer){
       if(!current()||!controlLogic.isCurrentControlChannel(peer,nextPeer,controlChannel,channel))return;
       try{
         const message=JSON.parse(event.data);
-        if(message.event==='vehicle_control_result'){controlTransportCourier.receive(message);return}
+        if(message.event==='vehicle_control_result'){if(message.emergency_stop)emergencyStopCourier.receive(message);controlTransportCourier.receive(message);return}
         applyVehicleControlMessage(message);
       }catch(error){if(current())clientLog('control_datachannel_message_invalid',{error:error.message})}
     };
@@ -1843,6 +1843,15 @@ const controlTransportCourier=MineTeleopControlTransport.createCourier({
   onBoundary:()=>{clearControlInput(false,'control_transport_boundary',true);lastNativeIntentSnapshot=''},
 });
 setInterval(()=>controlTransportCourier.tick().catch(error=>clientLog('control_transport_bridge_error',{error:error.message})),25);
+const emergencyStopCourier=MineTeleopControlTransport.createEmergencyCourier({
+  scope:()=>latestRuntimeStatus.native_control?.emergency_stop_capability===MineTeleopControlTransport.emergencyProtocol&&polling&&nativeControlSessionId&&mediaOfferScope?.id?{
+    session:nativeControlSessionId,generation:nativeControlSessionGeneration,ui:uiInstanceId,uiEpoch:nativeControlUiEpoch,
+    attempt:mediaOfferScope.id,ready:Boolean(controlChannel?.readyState==='open')}:null,
+  post,now:()=>performance.now(),send:bytes=>{if(controlChannel?.readyState==='open'&&Number(controlChannel.bufferedAmount)<=Math.max(0,Number(controlChannel.bufferedAmountLowThreshold)||0))controlChannel.send(bytes)},
+  onConfirmation:seq=>{clientLog('driver_emergency_software_latched',{command_seq:seq,physical_execution_confirmed:false});statusPanel.textContent='车端已锁存急停；执行机构状态仍需查看新鲜 CAN 反馈。'},
+});
+setInterval(()=>emergencyStopCourier.tick().catch(error=>clientLog('emergency_stop_bridge_error',{error:error.message})),25);
+
 setInterval(()=>cameraView.refresh(),500);
 async function collectMetrics(){
   if(!peer)return;
@@ -5285,9 +5294,14 @@ void DriverConsoleRuntime::reset_native_control_state() {
     std::lock_guard lock(mutex_);
     control_sequence_ = 0;
     control_transport_vehicle_capable_ = false;
+    emergency_stop_vehicle_capable_ = false;
     control_transport_mac_key_.clear();
     ++control_session_generation_;
   }
+  { std::lock_guard lock(emergency_stop_mutex_);
+    emergency_stop_latest_frame_ = emergency_stop_last_result_ = Json(nullptr);
+    emergency_stop_owner_.clear(); emergency_stop_attempt_.clear(); emergency_stop_ui_epoch_ = emergency_stop_session_generation_ = emergency_stop_reset_epoch_ = 0;
+    emergency_stop_published_ms_ = 0; emergency_stop_latency_.reset(); }
   native_control_estop_wakeup_.store(false);
   native_control_cv_.notify_all();
 }
@@ -5335,6 +5349,11 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
   if (!detail::verify_transport_message(input, signing_key, true))
     throw std::invalid_argument("vehicle result authentication failed");
   const auto result = detail::bounded_vehicle_control_result(input, session, vehicle, driver);
+  if (result.contains("emergency_stop")) observe_emergency_stop_result_verified(result, direct_return);
+  if (result.contains("emergency_reset_epoch")) {
+    std::lock_guard lock(emergency_stop_mutex_);
+    emergency_stop_reset_epoch_ = std::max(emergency_stop_reset_epoch_, result.at("emergency_reset_epoch").get<std::uint64_t>());
+  }
   if (config_.enable_experimental_direct_authority && result.contains("direct_authority")) {
     std::lock_guard authority_lock(direct_authority_mutex_);
     const auto& authority = result.at("direct_authority");
@@ -5416,6 +5435,81 @@ Json DriverConsoleRuntime::send_control_management(const Json& input) {
   return send_signaling_message("control_management", payload, &input);
 }
 
+void DriverConsoleRuntime::observe_emergency_stop_result_verified(const Json& result, bool data_channel_return) {
+  std::optional<detail::VehicleResultLatencyWindow::Sample> sample;
+  {
+    std::lock_guard lock(emergency_stop_mutex_);
+    if (result.contains("emergency_reset_epoch"))
+      emergency_stop_reset_epoch_ = std::max(emergency_stop_reset_epoch_, result.at("emergency_reset_epoch").get<std::uint64_t>());
+    sample = emergency_stop_latency_.note_result(result.at("command_seq").get<std::uint64_t>(),
+        result.at("intent_seq").get<std::uint64_t>(), monotonic_now_ms(), result.at("accepted").get<bool>(), false, data_channel_return);
+    if (sample) emergency_stop_last_result_ = result;
+  }
+  if (sample && native_control_trace_) native_control_trace_->enqueue({{"stage", "emergency_software_result_received"},
+      {"trace_session_id", result.at("session_id")}, {"seq", sample->command_seq}, {"intent_seq", sample->intent_seq},
+      {"accepted", sample->accepted}, {"software_estop_latched", result.value("software_estop_latched", false)},
+      {"command_received_path", result.value("command_received_path", "unknown")}, {"return_path", data_channel_return ? "dc" : "wss"},
+      {"round_trip_ms", sample->round_trip_ms}, {"physical_execution_confirmed", false}});
+}
+
+Json DriverConsoleRuntime::emergency_stop_bridge(const Json& input) {
+  // No ordinary transport/update mutex: a stuck WSS connect/write must not
+  // block fetching an already-published native emergency. No network I/O.
+  std::string session, vehicle, driver, key, attempt, owner;
+  std::uint64_t generation, ui_epoch;
+  bool enabled;
+  {
+    std::lock_guard lock(mutex_);
+    validate_media_source_scope_locked(input); validate_media_negotiation_locked(input);
+    const auto ownership = native_control_intent_.ownership_scope();
+    session = required_string(input, "source_session_id"); generation = required_uint64(input, "source_control_session_generation");
+    owner = required_string(input, "ui_instance_id"); ui_epoch = required_uint64(input, "ui_control_epoch");
+    if (session != session_id_ || generation != control_session_generation_ || ownership.first.empty() ||
+        owner != ownership.first || ui_epoch != ownership.second)
+      throw Conflict("emergency bridge belongs to a retired session/page", "emergency_scope_mismatch");
+    attempt = media_scope_id_; vehicle = vehicle_id_; driver = driver_id(); key = control_transport_mac_key_;
+    enabled = config_.enable_experimental_direct_authority && emergency_stop_vehicle_capable_ && key.size() >= 32;
+  }
+  std::optional<Json> result;
+  if (input.contains("vehicle_result")) {
+    if (!enabled || !detail::verify_transport_message(input.at("vehicle_result"), key, true))
+      throw std::invalid_argument("emergency result authentication failed");
+    result = detail::bounded_vehicle_control_result(input.at("vehicle_result"), session, vehicle, driver);
+    if (!result->contains("emergency_stop") || result->at("emergency_stop").value("protocol", "") != detail::kEmergencyStopCapability)
+      throw std::invalid_argument("emergency result identity is missing");
+  }
+  if (result) observe_emergency_stop_result_verified(*result, true);
+  Json current_authority;
+  { std::lock_guard lock(direct_authority_mutex_); current_authority = direct_authority_.reference(); }
+  const auto now = monotonic_now_ms();
+  const auto last_seen = detail::ControlTransportStamp::uint(input, "last_seen_seq");
+  std::lock_guard lock(emergency_stop_mutex_);
+  const bool scoped = enabled && emergency_stop_latest_frame_.is_object() && emergency_stop_owner_ == owner &&
+      emergency_stop_ui_epoch_ == ui_epoch && emergency_stop_session_generation_ == generation && emergency_stop_attempt_ == attempt &&
+      current_authority.is_object() && emergency_stop_latest_frame_.at("emergency_stop").at("authority").at("issuer") == current_authority.at("issuer") &&
+      emergency_stop_latest_frame_.at("emergency_stop").at("authority").at("authority_epoch") == current_authority.at("authority_epoch");
+  const auto age = now - emergency_stop_published_ms_;
+  const bool available = scoped && input.value("dc_ready", false) && age >= 0 && age < detail::kNativeBridgePublicationMaxAgeMs &&
+      emergency_stop_latest_frame_.at("seq").get<std::uint64_t>() > last_seen;
+  const auto timing = emergency_stop_latency_.snapshot();
+  const bool confirmed = scoped && emergency_stop_last_result_.is_object() && timing.last &&
+      now >= timing.last->received_monotonic_ms && now - timing.last->received_monotonic_ms <= detail::NativeControlAckRecovery::kFreshAckMs &&
+      emergency_stop_latest_frame_.at("emergency_stop").at("reset_epoch").get<std::uint64_t>() == emergency_stop_reset_epoch_ &&
+      emergency_stop_last_result_.at("emergency_stop").at("reset_epoch") == emergency_stop_latest_frame_.at("emergency_stop").at("reset_epoch") &&
+      emergency_stop_last_result_.at("emergency_stop").at("authority").at("authority_epoch") == emergency_stop_latest_frame_.at("emergency_stop").at("authority").at("authority_epoch") &&
+      emergency_stop_last_result_.at("accepted").get<bool>() && emergency_stop_last_result_.value("software_estop_latched", false);
+  return {{"protocol", detail::kEmergencyStopCapability}, {"enabled", enabled},
+      {"frame", available ? emergency_stop_latest_frame_ : Json(nullptr)},
+      {"frame_json", available ? Json(emergency_stop_latest_frame_.dump()) : Json(nullptr)},
+      {"valid_for_ms", available ? detail::kNativeBridgePublicationMaxAgeMs - age : 0},
+      {"software_latched_confirmed", confirmed}, {"physical_execution_confirmed", false}, {"covers_all_commands", false},
+      {"round_trip_ms", timing.last ? Json(timing.last->round_trip_ms) : Json(nullptr)},
+      {"dispatch", "native_emergency_publication_and_wss_attempt"},
+      {"command_received_path", emergency_stop_last_result_.is_object() ? emergency_stop_last_result_.value("command_received_path", "unknown") : "unknown"},
+      {"feedback_path", timing.last ? Json(timing.last->feedback_data_channel ? "dc" : "wss") : Json(nullptr)},
+      {"confirmed_command_seq", confirmed ? emergency_stop_last_result_.at("command_seq") : Json(nullptr)}};
+}
+
 Json DriverConsoleRuntime::control_transport_bridge(const Json& input) {
   std::lock_guard update_lock(native_control_update_mutex_);
   std::string session, vehicle, driver, attempt, owner;
@@ -5452,8 +5546,7 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input) {
   // has a conservative local publication allowance, independent of cloud
   // failure detection; it never extends the vehicle's timestamp limit.
   const auto age = now - control_transport_latest_dc_at_ms_;
-  constexpr std::int64_t kExperimentalBridgePublicationMaxAgeMs = 100;
-  const auto allowance = kExperimentalBridgePublicationMaxAgeMs;
+  const auto allowance = detail::kNativeBridgePublicationMaxAgeMs;
   if (control_transport_dc_ready_ && control_transport_latest_dc_.is_object() && age >= 0 && age < allowance &&
       control_transport_latest_dc_.value("seq", std::uint64_t{0}) > last_seen &&
       control_transport_latest_dc_.value("bridge_owner", "") == owner &&
@@ -5701,7 +5794,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
   std::uint64_t generation = 0;
   int recovery_timeout_ms = 5000;
   Json trace_record;
-  bool vehicle_transport_capable = false;
+  bool vehicle_transport_capable = false, vehicle_stop_capable = false;
   std::string current_media_attempt, transport_signing_key;
   {
     std::lock_guard update_lock(native_control_update_mutex_);
@@ -5728,6 +5821,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       sequence = ++control_sequence_;
       vehicle_transport_capable = config_.enable_experimental_control_transport && control_transport_vehicle_capable_ && control_transport_mac_key_.size() >= 32;
       transport_signing_key = control_transport_mac_key_;
+      vehicle_stop_capable = emergency_stop_vehicle_capable_;
       current_media_attempt = media_scope_id_;
     }
   }
@@ -5794,6 +5888,9 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       trace_record["effective_throttle"] = command.throttle;
       trace_record["effective_steering"] = command.steering;
     }
+    if (command.estop && config_.enable_experimental_direct_authority && vehicle_stop_capable) {
+      command.throttle = command.steering = 0.0; command.brake = 1.0; command.operator_active = false;
+    }
     command.validate();
     auto payload = command.to_json();
     payload["intent_seq"] = sample.intent.intent_seq;
@@ -5811,6 +5908,35 @@ bool DriverConsoleRuntime::send_native_control_sample() {
     envelope["recipient"] = vehicle;
     envelope["type"] = "control_command";
     envelope["payload"] = payload;
+    Json emergency_payload;
+    if (command.estop && config_.enable_experimental_direct_authority && vehicle_stop_capable && !current_media_attempt.empty()) {
+      Json authority;
+      { std::lock_guard lock(direct_authority_mutex_); authority = direct_authority_.reference(); }
+      if (authority.is_object()) {
+        std::uint64_t reset_epoch;
+        { std::lock_guard lock(emergency_stop_mutex_); reset_epoch = emergency_stop_reset_epoch_; }
+        emergency_payload = payload;
+        emergency_payload["emergency_stop"] = {{"protocol", detail::kEmergencyStopCapability}, {"authority", authority},
+            {"reset_epoch", reset_epoch}, {"media_attempt", current_media_attempt}};
+        emergency_payload["native_mac"] = detail::transport_message_mac(emergency_payload, transport_signing_key, false);
+        const auto published = monotonic_now_ms();
+        { std::lock_guard lock(emergency_stop_mutex_);
+          if (emergency_stop_owner_ != sample.owner_ui_instance_id || emergency_stop_ui_epoch_ != sample.ui_control_epoch ||
+              emergency_stop_session_generation_ != generation || emergency_stop_attempt_ != current_media_attempt) {
+            emergency_stop_latency_.reset(); emergency_stop_last_result_ = Json(nullptr);
+          }
+          emergency_stop_latest_frame_ = emergency_payload; emergency_stop_published_ms_ = published;
+          emergency_stop_owner_ = sample.owner_ui_instance_id; emergency_stop_ui_epoch_ = sample.ui_control_epoch;
+          emergency_stop_session_generation_ = generation; emergency_stop_attempt_ = current_media_attempt;
+          emergency_stop_latency_.note_sent(sequence, sample.intent.intent_seq, published, true); }
+        if (native_control_trace_) native_control_trace_->enqueue({{"stage", "emergency_native_published"},
+            {"trace_session_id", session}, {"seq", sequence}, {"intent_seq", sample.intent.intent_seq},
+            {"published_monotonic_ms", published}, {"scope_ui_epoch", sample.ui_control_epoch}});
+        // Publish BEFORE WSS connect/drain/write, through an independent lock.
+        // Ordinary commands still use their one selected path and old broker.
+        envelope["payload"] = emergency_payload;
+      }
+    }
 
     const auto connect_started_at_utc_ms = clock_.now_ms();
     const auto connect_started_monotonic_ms = monotonic_now_ms();
@@ -6053,6 +6179,7 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       if (!command.estop) control_transport_sender_.decorate(envelope["payload"]);
       if (envelope.at("payload").contains("control_transport"))
         envelope["payload"]["native_mac"] = detail::transport_message_mac(envelope.at("payload"), transport_signing_key, false);
+      if (emergency_payload.is_object()) envelope["payload"] = emergency_payload; // Exact same signed bytes on both carriers.
       const auto actual_path = command.estop ? detail::ControlPath::Wss : control_transport_sender_.path();
       if (actual_path == detail::ControlPath::DataChannel) {
         // One latest slot: a blocked page cannot accumulate or retimestamp
@@ -6069,8 +6196,10 @@ bool DriverConsoleRuntime::send_native_control_sample() {
       }
       send_completed_at_utc_ms = clock_.now_ms();
       send_completed_monotonic_ms = monotonic_now_ms();
-      control_transport_sender_.note_sent(envelope.at("payload"), actual_path, send_started_monotonic_ms);
-      control_vehicle_result_latency_.note_sent(sequence, sample.intent.intent_seq, send_started_monotonic_ms, actual_path == detail::ControlPath::DataChannel);
+      if (!emergency_payload.is_object()) {
+        control_transport_sender_.note_sent(envelope.at("payload"), actual_path, send_started_monotonic_ms);
+        control_vehicle_result_latency_.note_sent(sequence, sample.intent.intent_seq, send_started_monotonic_ms, actual_path == detail::ControlPath::DataChannel);
+      } // Dual stop timing uses its earliest publication and actual car-reported receive carrier, never a fabricated WSS RTT.
       if (actual_path == detail::ControlPath::Wss)
         control_signaling_ack_window_.note_sent(sequence, send_completed_monotonic_ms, command.estop);
       if (native_control_trace_) {
@@ -7138,6 +7267,7 @@ Json DriverConsoleRuntime::poll_signaling() {
       if (id.empty() || id != media_scope_id_) { ++media_offer_count_; media_scope_id_ = id; }
       media_scope_legacy_allowed_ = payload.value("legacy_bootstrap_allowed", media_offer_count_ == 1);
       control_transport_vehicle_capable_ = payload.value("control_transport_capability", "") == detail::kControlTransportCapability;
+      emergency_stop_vehicle_capable_ = payload.value("emergency_stop_capability", "") == detail::kEmergencyStopCapability;
     }
   }
   return {{"session_id", session}, {"messages", messages}};
@@ -7924,6 +8054,7 @@ Json DriverConsoleRuntime::status() {
         {"last_ack_packet_age_ms", native_control_last_ack_packet_age_ms},
         {"vehicle_result_latency", std::move(vehicle_result_latency)},
         {"control_transport", std::move(control_transport_status)},
+        {"emergency_stop_capability", emergency_stop_vehicle_capable_ ? Json(detail::kEmergencyStopCapability) : Json(nullptr)},
         {"unacknowledged_count", native_control_unacknowledged_count},
         {"unacknowledged_limit", detail::NativeControlAcknowledgementWindow::kMaxPendingPackets},
         {"last_ack_received_at_utc_ms",
@@ -8126,6 +8257,7 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
           {{"error", "legacy control-limit mutation is retired; use /api/control-profile"}});
     }
     if (request.method == "POST" && request.path == "/api/control-transport/management") return ServerResponse::json(200, runtime_->send_control_management(request.json_body()));
+    if (request.method == "POST" && request.path == "/api/control-transport/emergency") return ServerResponse::json(200, runtime_->emergency_stop_bridge(request.json_body()));
     if (request.method == "POST" && request.path == "/api/control-transport/bridge") return ServerResponse::json(200, runtime_->control_transport_bridge(request.json_body()));
     if (request.method == "POST" && request.path == "/api/control-profile") return ServerResponse::json(200, runtime_->prepare_control_profile(request.json_body()));
     if (request.method == "POST" && request.path == "/api/control-intent") {

@@ -21,6 +21,7 @@
 #include "mine_teleop/detail/control_transport.hpp"
 #include "mine_teleop/detail/control_transport_sender.hpp"
 #include "mine_teleop/detail/direct_authority.hpp"
+#include "mine_teleop/detail/emergency_stop.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/websocket.hpp"
@@ -420,6 +421,7 @@ class DriverConsoleRuntime {
   [[nodiscard]] Json send_control(const Json& input);
   [[nodiscard]] Json send_control_management(const Json& input);
   [[nodiscard]] Json control_transport_bridge(const Json& input);
+  [[nodiscard]] Json emergency_stop_bridge(const Json& input);
   [[nodiscard]] bool consume_vehicle_control_result_locked(const Json& result, std::string_view session,
       std::string_view vehicle, std::string_view driver, std::int64_t now, bool direct_return = false);
   [[nodiscard]] Json update_control_intent(const Json& input, const HttpRequest* request = nullptr);
@@ -461,6 +463,7 @@ class DriverConsoleRuntime {
   [[nodiscard]] bool send_native_control_sample();
   void poll_native_control_acknowledgements();
   [[nodiscard]] bool direct_control_continuation_available_locked();
+  void observe_emergency_stop_result_verified(const Json& result, bool data_channel_return);
   [[nodiscard]] bool drain_native_control_acknowledgements_locked(
       std::string_view session, std::string_view identity, std::string_view vehicle,
       Json& drained_acknowledgements);
@@ -572,6 +575,13 @@ class DriverConsoleRuntime {
   detail::ControlTransportSender control_transport_sender_;
   bool control_transport_cloud_capable_{false};
   bool control_transport_vehicle_capable_{false}; // mutex_
+  bool emergency_stop_vehicle_capable_{false}; // mutex_
+  std::mutex emergency_stop_mutex_;
+  Json emergency_stop_latest_frame_, emergency_stop_last_result_;
+  std::string emergency_stop_owner_, emergency_stop_attempt_;
+  std::uint64_t emergency_stop_ui_epoch_{}, emergency_stop_session_generation_{}, emergency_stop_reset_epoch_{};
+  std::int64_t emergency_stop_published_ms_{};
+  detail::VehicleResultLatencyWindow emergency_stop_latency_;
   bool control_transport_dc_ready_{false};
   std::string control_transport_bridge_attempt_, control_transport_bridge_owner_;
   std::uint64_t control_transport_bridge_ui_epoch_{0};

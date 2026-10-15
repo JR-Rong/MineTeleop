@@ -37,7 +37,7 @@ PRELUDE = r'''
 #include <utility>
 #include <nlohmann/json.hpp>
 using Json=nlohmann::json;
-namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; }
+namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability = "native-stop-only-v1"; }
 using guint=unsigned;using guint8=unsigned char;using gchar=char;using gpointer=void*;
 struct GstSDPMessage {std::string text;};
 struct GstWebRTCSessionDescription {GstSDPMessage* sdp;};
@@ -90,6 +90,7 @@ struct Signaling {Json incoming={{"messages",Json::array()}};std::vector<std::pa
 struct Impl {
 '''
 MEMBERS = r'''
+  struct { struct { int experimental_direct_authority_max_ms=0; } runtime; } config;
   void flush_control_status() {} // Control status has separate protocol/service coverage.
   void process_control_management(const Json&,const Json&) {}
   struct Lane {struct {std::string id="front";} camera;struct {int width=1,height=1,fps=1,bitrate_kbps=1;} profile;};

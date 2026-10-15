@@ -108,6 +108,21 @@ inline Json bounded_vehicle_control_result(const Json& value, std::string_view s
       throw std::invalid_argument("invalid direct authority result");
     result["direct_authority"] = value.at("direct_authority");
   }
+  if (value.contains("emergency_stop")) {
+    if (!value.at("emergency_stop").is_object() || value.at("emergency_stop").dump().size() > 1024)
+      throw std::invalid_argument("invalid emergency result identity");
+    result["emergency_stop"] = value.at("emergency_stop");
+  }
+  if (value.contains("software_estop_latched")) {
+    if (!value.at("software_estop_latched").is_boolean()) throw std::invalid_argument("invalid emergency result state");
+    result["software_estop_latched"] = value.at("software_estop_latched");
+  }
+  if (value.contains("emergency_reset_epoch")) result["emergency_reset_epoch"] = ControlTransportStamp::uint(value, "emergency_reset_epoch");
+  if (value.contains("command_received_path")) {
+    const auto path = value.at("command_received_path").get<std::string>();
+    if (path != "dc" && path != "wss") throw std::invalid_argument("invalid received command path");
+    result["command_received_path"] = path;
+  }
   if (value.contains("control_transport"))
     result["control_transport"] = ControlTransportStamp::from_json(value.at("control_transport")).to_json();
   return result;
@@ -145,7 +160,7 @@ class ControlTransportFence {
   }
   Decision admit(const ControlCommand& command, const Json* stamp_json, ControlPath received_path,
       std::string_view current_media_attempt, std::int64_t now_utc_ms, std::int64_t lease_expires_at_ms,
-      int max_command_gap_ms, bool cloud_authority_live) {
+      int max_command_gap_ms, bool cloud_authority_live, bool verified_stop_only = false) {
     if (session_.empty() || command.vehicle_id != vehicle_ || command.driver_id != driver_ ||
         command.session_id != session_ || command.control_token != token_)
       return {false, false, "transport_authority_mismatch"};
@@ -160,8 +175,8 @@ class ControlTransportFence {
       return {false, false, "transport_command_expired"};
     // Emergency WSS bypasses ONLY the ordinary path/epoch barrier. Identity,
     // token, global sequence and the common receiver's ESTOP latch still apply.
-    if (command.estop && received_path == ControlPath::Wss) {
-      last_seq_ = command.seq; return {true, false, "emergency_wss"};
+    if (command.estop && (received_path == ControlPath::Wss || verified_stop_only)) {
+      last_seq_ = command.seq; return {true, false, received_path == ControlPath::Wss ? "emergency_wss" : "emergency_dc_verified"};
     }
     if (!stamp_json) {
       if (epoch_ != 0 || received_path != ControlPath::Wss) return {false, false, "transport_stamp_required"};

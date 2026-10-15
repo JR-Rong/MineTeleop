@@ -26,13 +26,14 @@ struct Fixture {
   WebSocketClient vehicle_socket;
   ControlTransportFence fence;
   DirectAuthorityLease car_authority;
+  EmergencyStopReceiver emergency_receiver;
   std::mutex car_mutex;
   std::jthread car_watchdog;
   std::filesystem::path authority_directory;
   bool direct_enabled{false}, cloud_online{true};
   std::uint64_t lease_nonce{0};
   std::string base, session, control_token, signing_key;
-  std::uint64_t generation{0}, ui_epoch{0}, intent_seq{0}, result_seq{0}, last_dc_seq{0};
+  std::uint64_t generation{0}, native_generation{0}, ui_epoch{0}, intent_seq{0}, result_seq{0}, last_dc_seq{0};
   std::uint64_t wss_commands{0}, dc_commands{0};
   std::int64_t last_input{0};
   std::deque<std::pair<std::int64_t, Json>> delayed;
@@ -63,6 +64,7 @@ struct Fixture {
     const auto connected = driver->connect("transport-vehicle", "owner");
     expect(!connected.contains("transport_mac_key"), "local UI connect response exposed signing material");
     session = connected.at("session_id").get<std::string>();
+    native_generation = connected.at("control_session_generation").get<std::uint64_t>();
     const auto discovered = http.get_json(base + "/vehicles/transport-vehicle/session?connection_generation=" + std::to_string(generation),
         {{"X-Mine-Teleop-Device-Token", "fixture-device"}});
     control_token = discovered.at("control_token").get<std::string>();
@@ -79,6 +81,7 @@ struct Fixture {
     profile.session_id = session; profile.control_token = control_token; profile.seq = 1; profile.sent_at_utc_ms = utc();
     expect(vehicle->receive_session_profile(profile, utc()).accepted, "offline vehicle profile rejected");
     fence.reset("transport-vehicle", "transport-driver", session, control_token);
+    emergency_receiver.reset("transport-vehicle", "transport-driver", session, control_token);
     vehicle_socket.connect(signaling_websocket_url(base, session, "transport-vehicle", std::to_string(generation)) +
         "&types=control_command&transport_protocol=" + std::string(kControlTransportCapability),
         {{"X-Mine-Teleop-Device-Token", "fixture-device"}});
@@ -86,7 +89,8 @@ struct Fixture {
     offer.update({{"sender", "transport-vehicle"}, {"recipient", "transport-driver"}, {"device_token", "fixture-device"},
         {"connection_generation", generation}, {"type", "webrtc_offer"},
         {"payload", {{"type", "offer"}, {"sdp", "v=0\r\na=ice-ufrag:offline\r\n"},
-                     {"media_negotiation_id", "media-a"}, {"control_transport_capability", kControlTransportCapability}}}});
+                     {"media_negotiation_id", "media-a"}, {"control_transport_capability", kControlTransportCapability},
+                     {"emergency_stop_capability", direct_enabled ? kEmergencyStopCapability : std::string_view{}}}}});
     static_cast<void>(http.post_json_response(base + "/signaling/" + session + "/messages", offer));
     static_cast<void>(driver->poll_signaling());
     input();
@@ -96,7 +100,7 @@ struct Fixture {
         while (!token.stop_requested()) {
           { std::lock_guard lock(car_mutex);
             if (car_authority.observe_expiry(steady())) vehicle->set_control_braking_wait(true, utc(), ControlRecoveryCause::ControlLink);
-            vehicle->tick(utc()); }
+            vehicle->tick(utc()); emergency_receiver.observe_latched(vehicle->safety_state() == SafetyState::Estop); }
           std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
       });
@@ -153,10 +157,18 @@ struct Fixture {
     std::lock_guard lock(car_mutex);
     if (payload.contains("control_transport")) expect(verify_transport_message(payload, signing_key, false), "native byte authentication failed");
     const auto command = ControlCommand::from_json(payload);
+    bool verified_stop = false;
+    if (payload.contains("emergency_stop")) {
+      emergency_receiver.observe_latched(vehicle->safety_state() == SafetyState::Estop);
+      const auto stop = emergency_receiver.inspect(payload, signing_key, car_authority.reference(), "media-a", path == ControlPath::DataChannel, utc(), 200);
+      if (stop.action == EmergencyStopReceiver::Action::Cached) return stop.cached;
+      expect(stop.action == EmergencyStopReceiver::Action::ApplyOnce, "fixture production emergency receiver rejected valid stop");
+      verified_stop = true;
+    }
     ControlTransportFence::Decision decision{false, false, "direct_authority_unavailable"};
     if (!direct_enabled || command.estop || car_authority.allows(payload.value("direct_authority", Json(nullptr)), steady()))
       decision = fence.admit(command, payload.contains("control_transport") ? &payload.at("control_transport") : nullptr,
-          path, "media-a", utc(), utc() + 10000, 200, !direct_enabled || car_authority.valid(steady()));
+          path, "media-a", utc(), utc() + 10000, 200, !direct_enabled || car_authority.valid(steady()), verified_stop);
     ReceiveResult applied;
     if (decision.admitted) {
       if (decision.changed) vehicle->set_control_braking_wait(true, utc(), ControlRecoveryCause::ControlLink);
@@ -170,8 +182,18 @@ struct Fixture {
             payload.at("control_transport").at("action") == "select"}, {"authority_epoch", fence.epoch()},
         {"reason", decision.admitted ? applied.reason : std::string(decision.reason)}};
     if (payload.contains("control_transport")) result["control_transport"] = payload.at("control_transport");
-    if (direct_enabled) result["direct_authority"] = car_authority.status(steady());
+    if (direct_enabled) {
+      result["direct_authority"] = car_authority.status(steady());
+      result["emergency_reset_epoch"] = emergency_receiver.reset_epoch();
+      result["command_received_path"] = control_path_name(path);
+    }
+    if (verified_stop) {
+      emergency_receiver.observe_latched(vehicle->safety_state() == SafetyState::Estop);
+      result["emergency_stop"] = payload.at("emergency_stop");
+      result["software_estop_latched"] = vehicle->safety_state() == SafetyState::Estop;
+    }
     result["vehicle_mac"] = transport_message_mac(result, signing_key, true);
+    if (verified_stop) expect(emergency_receiver.complete(payload, result), "production emergency cache did not commit result");
     return result;
   }
   void pump(bool dc_ready) {
@@ -285,8 +307,65 @@ void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
     expect(!fixture.car_authority.valid(steady()) && (fixture.vehicle->control_braking_wait() || fixture.vehicle->safety_state() == SafetyState::TimeoutBrake),
         "cloud silence left vehicle authorization/motion live past independent deadline"); }
 }
+
+void emergency_broker_delivers_while_wss_upgrade_is_blocked() {
+  std::atomic<bool> wss_waiting{false}, wss_finished{false}; // Outlive the fixture/server callbacks.
+  Fixture fixture(true);
+  const auto ready_deadline = steady() + 8000;
+  bool ready = false;
+  while (steady() < ready_deadline) {
+    fixture.pump(true);
+    if (fixture.driver->status().at("native_control").at("control_transport").at("direct_authority").value("continuation_available", false)) { ready = true; break; }
+  }
+  expect(ready, "emergency fixture never reached qualified direct state");
+  fixture.renew_authority(true);
+  const auto refresh_deadline = steady() + 1000;
+  while (steady() < refresh_deadline) {
+    fixture.pump(true);
+    if (fixture.driver->status().at("native_control").at("control_transport").at("direct_authority").value("remaining_ms", 0) > 400) break;
+  }
+  fixture.stop_cloud();
+  const auto port = fixture.server->port();
+  fixture.server = std::make_unique<SimpleHttpServer>("127.0.0.1", port,
+      [&fixture](const HttpRequest& request) { return fixture.cloud->handle(request); }, 8 * 1024 * 1024,
+      [&fixture, &wss_waiting, &wss_finished](SocketHandle socket, const HttpRequest& request) {
+        const auto send_only = request.query.find("send_only");
+        if (send_only != request.query.end() && send_only->second == "1") {
+          wss_waiting.store(true); std::this_thread::sleep_for(std::chrono::milliseconds(700));
+          wss_finished.store(true); return false;
+        }
+        return fixture.cloud->handle_websocket(socket, request);
+      });
+  fixture.server->start(); // Only the old localhost fixture port; no vehicle/cloud deployment.
+  const auto press_stop = [&] {
+    return fixture.driver->update_control_intent({{"session_id", fixture.session}, {"session_generation", fixture.native_generation},
+        {"ui_instance_id", "owner"}, {"ui_control_epoch", fixture.ui_epoch}, {"takeover", false}, {"intent_seq", ++fixture.intent_seq},
+        {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0}, {"estop", true},
+        {"critical_video_ready", true}, {"critical_video_sample_healthy", true},
+        {"critical_video_bad_sample_revision", std::uint64_t{0}}, {"critical_video_brake_revision", std::uint64_t{0}}});
+  };
+  const auto started = steady();
+  while (!wss_waiting.load() && steady() - started < 1000) { static_cast<void>(press_stop()); std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+  expect(wss_waiting.load() && !wss_finished.load(), "fixture failed to hold real native WSS upgrade in flight");
+  Json request = {{"source_session_id", fixture.session}, {"source_control_session_generation", fixture.native_generation},
+      {"media_negotiation_id", "media-a"}, {"ui_instance_id", "owner"}, {"ui_control_epoch", fixture.ui_epoch},
+      {"dc_ready", true}, {"last_seen_seq", 0}};
+  const auto response = fixture.driver->emergency_stop_bridge(request); // Actual native endpoint implementation, no normal bridge mutex.
+  expect(response.at("frame_json").is_string(), "blocked WSS prevented fetching already-published emergency bytes");
+  const auto payload = Json::parse(response.at("frame_json").get<std::string>());
+  expect(payload.at("estop") == true && payload.at("brake") == 1.0 && verify_transport_message(payload, fixture.signing_key, false), "native emergency bytes were forged or not stop-only");
+  const auto result = fixture.apply(payload, ControlPath::DataChannel); // Production MAC/stop receiver + real common safety service.
+  request["last_seen_seq"] = payload.at("seq"); request["vehicle_result"] = result;
+  const auto confirmed = fixture.driver->emergency_stop_bridge(request);
+  expect(confirmed.at("software_latched_confirmed") == true && confirmed.at("physical_execution_confirmed") == false &&
+      confirmed.at("command_received_path") == "dc" && confirmed.at("feedback_path") == "dc" && !wss_finished.load(),
+      "software stop confirmation waited for WSS or mislabeled actual delivery/physical state");
+  auto tampered = result; tampered["software_estop_latched"] = false; request["vehicle_result"] = tampered;
+  bool rejected = false; try { static_cast<void>(fixture.driver->emergency_stop_bridge(request)); } catch (const std::invalid_argument&) { rejected = true; }
+  expect(rejected, "page could forge an emergency software result");
+}
 }  // namespace
 int main() {
-  try { integration(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including real cloud socket outage and short authority; loopback only, no WebRTC or hardware proof\n"; }
+  try { integration(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_while_wss_upgrade_is_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
