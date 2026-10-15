@@ -413,6 +413,28 @@ void websocket_upgrade_status_preserves_denial_vs_transient_service_failure() {
   }
 }
 
+void review_r4_late_stop_result_is_historical_not_current() {
+  Fixture fixture(true); const auto deadline = steady() + 8000; bool ready = false;
+  while (steady() < deadline) { fixture.pump(true); if (fixture.driver->status().at("native_control").at("control_transport").at("direct_authority").value("continuation_available", false)) { ready = true; break; } }
+  expect(ready, "R4 fixture did not qualify");
+  static_cast<void>(fixture.driver->update_control_intent({{"session_id", fixture.session}, {"session_generation", fixture.native_generation},
+      {"ui_instance_id", "owner"}, {"ui_control_epoch", fixture.ui_epoch}, {"takeover", false}, {"intent_seq", ++fixture.intent_seq},
+      {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0}, {"estop", true}, {"critical_video_ready", true}}));
+  auto request = fixture.scope(true); request["last_seen_seq"] = 0;
+  const auto published = fixture.driver->emergency_stop_bridge(request);
+  expect(published.at("frame_json").is_string(), "R4 STOP not published");
+  const auto frame = Json::parse(published.at("frame_json").get<std::string>());
+  const auto stored = fixture.apply(frame, ControlPath::DataChannel);
+  { std::lock_guard lock(fixture.car_mutex); expect(fixture.vehicle->reset_estop(true, "local-fixture", utc()), "R4 local reset rejected");
+    fixture.emergency_receiver.observe_latched(fixture.vehicle->safety_state() == SafetyState::Estop); }
+  std::this_thread::sleep_for(std::chrono::milliseconds(260)); request["vehicle_result"] = stored;
+  const auto result = fixture.driver->emergency_stop_bridge(request);
+  { std::lock_guard lock(fixture.car_mutex); expect(fixture.vehicle->safety_state() != SafetyState::Estop && fixture.emergency_receiver.reset_epoch() == 1, "R4 reset unexpectedly changed"); }
+  expect(result.at("round_trip_ms").get<std::int64_t>() > NativeControlAckRecovery::kFreshAckMs, "R4 fixture delay did not cross existing200ms");
+  expect(result.at("software_latched_confirmed") == false, "COUNTEREXAMPLE R4: late old STOP result became fresh confirmation after local reset");
+  expect(result.at("historical_software_latch_result") == true, "late successful STOP evidence was discarded instead of retained as history");
+}
+
 void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
   Fixture fixture(true);
   const auto ready_deadline = steady() + 8000;
@@ -526,7 +548,7 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
   expect(rejected, "page could forge an emergency software result");
 }
 }  // namespace
-int main() {
-  try { integration(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+int main(int argc, char** argv) {
+  try { if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

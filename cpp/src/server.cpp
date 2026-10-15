@@ -5605,8 +5605,12 @@ Json DriverConsoleRuntime::emergency_stop_bridge(const Json& input) {
   const bool available = scoped && input.value("dc_ready", false) && age >= 0 && age < detail::kNativeBridgePublicationMaxAgeMs &&
       emergency_stop_latest_frame_.at("seq").get<std::uint64_t>() > last_seen;
   const auto timing = emergency_stop_latency_.snapshot();
-  const bool confirmed = scoped && emergency_stop_last_result_.is_object() && timing.last &&
-      now >= timing.last->received_monotonic_ms && now - timing.last->received_monotonic_ms <= detail::NativeControlAckRecovery::kFreshAckMs &&
+  // Freshness starts at original native publication, not at a delayed reply's
+  // arrival. Keep late successful results as history without a current latch claim.
+  const bool result_fresh = timing.last && now >= timing.last->received_monotonic_ms &&
+      timing.last->round_trip_ms >= 0 && timing.last->round_trip_ms <= detail::NativeControlAckRecovery::kFreshAckMs &&
+      now - timing.last->received_monotonic_ms <= detail::NativeControlAckRecovery::kFreshAckMs - timing.last->round_trip_ms;
+  const bool confirmed = scoped && emergency_stop_last_result_.is_object() && result_fresh &&
       emergency_stop_latest_frame_.at("emergency_stop").at("reset_epoch").get<std::uint64_t>() == emergency_stop_reset_epoch_ &&
       emergency_stop_last_result_.at("emergency_stop").at("reset_epoch") == emergency_stop_latest_frame_.at("emergency_stop").at("reset_epoch") &&
       emergency_stop_last_result_.at("emergency_stop").at("authority").at("authority_epoch") == emergency_stop_latest_frame_.at("emergency_stop").at("authority").at("authority_epoch") &&
@@ -5616,6 +5620,8 @@ Json DriverConsoleRuntime::emergency_stop_bridge(const Json& input) {
       {"frame_json", available ? Json(emergency_stop_latest_frame_.dump()) : Json(nullptr)},
       {"valid_for_ms", available ? detail::kNativeBridgePublicationMaxAgeMs - age : 0},
       {"software_latched_confirmed", confirmed}, {"physical_execution_confirmed", false}, {"covers_all_commands", false},
+      {"historical_software_latch_result", !confirmed && emergency_stop_last_result_.is_object() &&
+          emergency_stop_last_result_.value("accepted", false) && emergency_stop_last_result_.value("software_estop_latched", false)},
       {"round_trip_ms", timing.last ? Json(timing.last->round_trip_ms) : Json(nullptr)},
       {"dispatch", "native_emergency_publication_and_wss_attempt"},
       {"command_received_path", emergency_stop_last_result_.is_object() ? emergency_stop_last_result_.value("command_received_path", "unknown") : "unknown"},
