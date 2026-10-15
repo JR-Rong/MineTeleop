@@ -1766,7 +1766,7 @@ void test_control_page_contract() {
           response.body.find("control_authority_recovered:false") != std::string::npos,
       "signaling restart recovery does not preserve the no-authority operator state");
   expect(
-      response.body.find("if(result.signaling_available===false)") != std::string::npos &&
+      response.body.find("if(result.signaling_available===false&&result.direct_authority_continuation!==true)") != std::string::npos &&
           response.body.find("车辆列表为安全快照，禁止建立控制会话") != std::string::npos &&
           response.body.find("connectButton.disabled=true") != std::string::npos,
       "signaling outage vehicle refresh is not fail-safe and locally readable");
@@ -2215,7 +2215,7 @@ void test_stale_control_data_channel_callbacks_are_fail_silent() {
 
   const auto profile_branch = handler.substr(profile_begin, handshake_begin - profile_begin);
   const auto handshake_branch = handler.substr(handshake_begin, command_begin - handshake_begin);
-  constexpr std::string_view stale_guard = "if (control_channel != channel) return;";
+  constexpr std::string_view stale_guard = "if (transport == ControlMessageTransport::DataChannel && control_channel != channel) return;";
   const auto profile_stale = profile_branch.find(stale_guard);
   const auto profile_unavailable = profile_branch.find(
       "if (stop_requested || control_inhibited || !control_service_started");
@@ -2274,7 +2274,7 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
   const auto handshake_begin = handler.find(
       "if (message.value(\"event\", \"\") == \"vcu_handshake_command\")");
   const auto legacy_reject = handler.find(
-      "if (transport == ControlMessageTransport::DataChannel)", handshake_begin);
+      "if (transport == ControlMessageTransport::DataChannel && !message.contains(\"control_transport\") && !message.contains(\"emergency_stop\"))", handshake_begin);
   const auto command_begin = handler.find(
       "auto command = ControlCommand::from_json(message)", legacy_reject);
   expect(
@@ -2290,7 +2290,20 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
           handler.substr(handshake_begin, legacy_reject - handshake_begin)
                   .find("transport != ControlMessageTransport::DataChannel") !=
               std::string::npos,
-      "session profile or VCU handshake escaped the browser DataChannel transport");
+      "profile or handshake bypasses legacy-DC/authenticated-management transport qualification");
+  const auto management = cpp_function_contract(source, "void process_control_management(");
+  expect(management.find("native_control_websocket_connected.load()") != std::string::npos &&
+      management.find("native_control_transport_cloud_capable.load()") != std::string::npos &&
+      management.find("signaling.control_lease_expiry() > now") != std::string::npos &&
+      management.find("payload.value(\"control_token\", \"\") == signaling.control_token()") != std::string::npos &&
+      management.find("seq > last_control_management_seq") != std::string::npos &&
+      management.find("if (allowed) handle_control_message(") != std::string::npos &&
+      handler.substr(profile_begin, handshake_begin - profile_begin).find("if (config.runtime.experimental_direct_authority_max_ms > 0 &&") != std::string::npos &&
+      handler.substr(profile_begin, handshake_begin - profile_begin).find("(transport == ControlMessageTransport::DataChannel || !direct_authority.valid(steady_now_ms()))") != std::string::npos &&
+      handler.substr(handshake_begin, legacy_reject - handshake_begin).find("if (action == \"connect\" && config.runtime.experimental_direct_authority_max_ms > 0 &&") != std::string::npos &&
+      handler.substr(handshake_begin, legacy_reject - handshake_begin).find("(transport == ControlMessageTransport::DataChannel || !direct_authority.valid(steady_now_ms()))") != std::string::npos &&
+      handler.substr(handshake_begin, legacy_reject - handshake_begin).find("authority_cloud_delivery_required") != std::string::npos,
+      "management can change parameters or start VCU without current authenticated cloud delivery");
   expect(
       handler.substr(legacy_reject, command_begin - legacy_reject)
                   .find("legacy_data_channel_control_disabled") != std::string::npos,
@@ -2298,11 +2311,21 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
 
   const auto native_command_path = handler.substr(command_begin);
   expect(
-      native_command_path.find("control_channel != channel") == std::string::npos &&
-          native_command_path.find("!control_service_started || !control_service || !control_link_open") !=
+      native_command_path.find("if (control_channel != channel) return;") == std::string::npos &&
+          native_command_path.find("if (transport == ControlMessageTransport::DataChannel && control_channel != channel) return;") != std::string::npos &&
+          native_command_path.find("!control_service_started || !control_service || (!control_link_open && !control_transport_fence.negotiated())") !=
               std::string::npos &&
           native_command_path.find("control_inhibited") != std::string::npos,
       "native signaling control either depends on a browser channel pointer or bypasses readiness gates");
+  const auto authentication = native_command_path.find("!detail::verify_transport_message(message, signaling.transport_mac_key(), false)");
+  const auto fence = native_command_path.find("control_transport_fence.admit(command,");
+  const auto admission_reject = native_command_path.find("if (!decision.admitted)", fence);
+  const auto application = native_command_path.find("control_service->receive_command(command, received_at_ms)");
+  expect(authentication != std::string::npos && fence != std::string::npos && admission_reject != std::string::npos &&
+      application != std::string::npos && authentication < fence && fence < admission_reject && admission_reject < application &&
+      native_command_path.find("direct_authority.allows(") < fence &&
+      native_command_path.find("signaling.control_lease_expiry()", fence) < admission_reject,
+      "authenticated direct ordinary commands bypass authority/long-lease/epoch admission before common apply");
   expect(
       native_command_path.find("{\"transport\", transport_name}") != std::string::npos,
       "native vehicle control trace does not identify its transport");
@@ -2452,7 +2475,7 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
   expect(
       process_signaling.find("control_command") == std::string::npos &&
           process_signaling.find(
-              "signaling.poll(\"webrtc_answer,ice_candidate,media_fallback\")") !=
+              "signaling.poll(\"webrtc_answer,ice_candidate,media_fallback,control_management\")") !=
               std::string::npos &&
           native_control_websocket_url.find("signaling_websocket_url(") !=
               std::string::npos &&
@@ -2928,7 +2951,7 @@ void test_structured_control_rejection_is_safe_and_rate_limited() {
           std::string::npos,
       "a native signaling control rejection is not correlated to both command and browser intent sequences");
   const auto legacy_data_channel_reject = handler.find(
-      "if (transport == ControlMessageTransport::DataChannel)");
+      "if (transport == ControlMessageTransport::DataChannel && !message.contains(\"control_transport\") && !message.contains(\"emergency_stop\"))");
   const auto native_command_parse = handler.find(
       "auto command = ControlCommand::from_json(message)", legacy_data_channel_reject);
   expect(

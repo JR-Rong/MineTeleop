@@ -1350,33 +1350,64 @@
         : /timed out|timeout/i.test(message) ? 'server_timeout' : 'unclassified'};
   }
 
+  function iceNetworkPath(report, pair) {
+    if (!pair) return 'unknown';
+    const local = report.get(pair.localCandidateId), remote = report.get(pair.remoteCandidateId);
+    const known = value => value && ['host', 'srflx', 'prflx', 'relay'].includes(value.candidateType);
+    if (!known(local) || !known(remote)) return 'unknown';
+    const relays = [local, remote].filter(value => value.candidateType === 'relay');
+    if (!relays.length) return 'p2p';
+    // A relay candidate's protocol=udp does NOT describe the client->TURN leg.
+    const transports = relays.map(value => value.relayProtocol);
+    if (transports.includes('tls')) return 'turn_tls';
+    if (transports.includes('tcp')) return 'turn_tcp';
+    return transports.every(value => value === 'udp') ? 'turn_udp' : 'turn_unknown';
+  }
+
   function iceConnectivity(report, selectedPair) {
     const candidates = {local: {}, remote: {}};
-    const states = {}, pairs = [];
+    const states = {}, paths = {}, pairs = [];
+    const count = value => Number.isFinite(value) && value >= 0 ? value : null;
+    const token = (value, allowed) => allowed.includes(value) ? value : 'unknown';
     for (const value of report.values()) {
       const side = value.type === 'local-candidate' ? 'local'
         : value.type === 'remote-candidate' ? 'remote' : null;
       if (side) {
-        const key = String(value.candidateType || 'unknown') + '/' + String(value.protocol || 'unknown');
+        const key = token(value.candidateType, ['host', 'srflx', 'prflx', 'relay']) + '/' + token(value.protocol, ['udp', 'tcp']);
         candidates[side][key] = (candidates[side][key] || 0) + 1;
       }
       if (value.type !== 'candidate-pair') continue;
       const local = report.get(value.localCandidateId) || {}, remote = report.get(value.remoteCandidateId) || {};
-      const state = value.state || 'unknown'; states[state] = (states[state] || 0) + 1;
-      pairs.push({id: value.id, selected: Boolean(selectedPair && selectedPair.id === value.id),
-        state, nominated: value.nominated === true,
-        local_type: local.candidateType || null, remote_type: remote.candidateType || null,
-        protocol: local.protocol || null, relay_protocol: local.relayProtocol || null,
-        requests_sent: value.requestsSent == null ? null : value.requestsSent,
-        responses_received: value.responsesReceived == null ? null : value.responsesReceived,
-        round_trip_ms: Number.isFinite(value.currentRoundTripTime) ? value.currentRoundTripTime * 1000 : null});
+      const state = token(value.state, ['frozen', 'waiting', 'in-progress', 'failed', 'succeeded']);
+      states[state] = (states[state] || 0) + 1;
+      const path = iceNetworkPath(report, value), selected = Boolean(selectedPair && selectedPair.id === value.id);
+      const requests = count(value.requestsSent), responses = count(value.responsesReceived);
+      const summary = paths[path] || (paths[path] = {pairs: 0, attempted_pairs: 0, responding_pairs: 0,
+        succeeded_pairs: 0, failed_pairs: 0, selected_pairs: 0, requests_sent: 0, responses_received: 0,
+        request_counter_pairs: 0, response_counter_pairs: 0});
+      summary.pairs++; summary.attempted_pairs += requests > 0 ? 1 : 0;
+      summary.responding_pairs += responses > 0 ? 1 : 0;
+      summary.succeeded_pairs += state === 'succeeded' ? 1 : 0;
+      summary.failed_pairs += state === 'failed' ? 1 : 0; summary.selected_pairs += selected ? 1 : 0;
+      if (requests !== null) { summary.requests_sent += requests; summary.request_counter_pairs++; }
+      if (responses !== null) { summary.responses_received += responses; summary.response_counter_pairs++; }
+      pairs.push({id: value.id, selected, state, nominated: value.nominated === true, network_path: path,
+        local_type: token(local.candidateType, ['host', 'srflx', 'prflx', 'relay']),
+        remote_type: token(remote.candidateType, ['host', 'srflx', 'prflx', 'relay']),
+        protocol: token(local.protocol, ['udp', 'tcp']),
+        relay_protocol: token(local.relayProtocol, ['udp', 'tcp', 'tls']),
+        remote_relay_protocol: token(remote.relayProtocol, ['udp', 'tcp', 'tls']),
+        requests_sent: requests, responses_received: responses,
+        requests_received: count(value.requestsReceived), responses_sent: count(value.responsesSent),
+        bytes_sent: count(value.bytesSent), bytes_received: count(value.bytesReceived),
+        round_trip_ms: count(value.currentRoundTripTime) === null ? null : value.currentRoundTripTime * 1000});
     }
-    // Bound logs; retain the selected pair and failing direct checks ahead of
-    // unused relay permutations. No candidate IPs, SDP or credentials.
-    const rank = pair => pair.selected ? 0
-      : pair.local_type && pair.remote_type && pair.local_type !== 'relay' && pair.remote_type !== 'relay' ? 1 : 2;
+    // Summaries cover ALL pairs, even when detail is truncated. Retain the
+    // selected path and failed/attempted direct checks ahead of waiting pairs.
+    const rank = pair => pair.selected ? 0 : pair.network_path === 'p2p'
+      ? pair.state === 'failed' ? 1 : pair.requests_sent > 0 ? 2 : 3 : 4;
     pairs.sort((a, b) => rank(a) - rank(b));
-    return {candidates, pair_states: states, pair_count: pairs.length,
+    return {candidates, pair_states: states, path_checks: paths, pair_count: pairs.length,
       pairs: pairs.slice(0, 16), pairs_truncated: pairs.length > 16};
   }
 
@@ -1661,6 +1692,7 @@
     createLatestControlWriteQueue,
     receiverLatency,
     iceConnectivity,
+    iceNetworkPath,
     iceServerError,
     CONTROL_OUTCOMES,
     shouldLogControlOutcome,

@@ -17,6 +17,12 @@
 
 #include "mine_teleop/core.hpp"
 #include "mine_teleop/detail/native_control_acknowledgement_window.hpp"
+#include "mine_teleop/detail/vehicle_result_latency_window.hpp"
+#include "mine_teleop/detail/control_transport.hpp"
+#include "mine_teleop/detail/control_transport_sender.hpp"
+#include "mine_teleop/detail/direct_authority.hpp"
+#include "mine_teleop/detail/emergency_stop.hpp"
+#include "mine_teleop/detail/feedback_transport.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/websocket.hpp"
@@ -108,6 +114,10 @@ struct SignalingServerConfig {
   std::int64_t approver_token_ttl_ms{12 * 60 * 60 * 1000};
   std::int64_t token_ttl_ms{30 * 60 * 1000};
   std::int64_t control_token_ttl_ms{5 * 60 * 1000};
+  // Internal review-only configuration. Zero disables short direct authority;
+  // no YAML/CLI activation. A stable exclusive durable journal is mandatory.
+  std::int64_t experimental_direct_authority_lease_ms{0};
+  std::filesystem::path experimental_direct_authority_journal;
   std::int64_t vehicle_heartbeat_timeout_ms{15 * 1000};
   std::int64_t driver_heartbeat_timeout_ms{15 * 1000};
   std::int64_t connection_reaper_interval_ms{250};
@@ -195,6 +205,8 @@ class SignalingService {
     std::int64_t started_at_utc_ms{0};
     SessionState state{SessionState::Online};
     std::string control_token;
+    std::string transport_mac_key; // Never serialized by Session::to_json or logs.
+    bool direct_authority_enabled{false};
     std::int64_t control_token_expires_at_ms{0};
     std::uint64_t relay_bytes_sent{0};
     std::uint64_t relay_bytes_received{0};
@@ -268,6 +280,9 @@ class SignalingService {
   void close_sessions_for_driver(std::string_view driver_id, std::string_view reason);
   void transition_session(Session& session, SessionState next, std::string_view reason);
   void close_session(Session& session, std::string_view reason);
+  void persist_direct_authority_state(const Json& snapshot);
+  [[nodiscard]] ServerResponse handle_direct_authority_post(const HttpRequest& request);
+  [[nodiscard]] bool direct_authority_vehicle_reserved(std::string_view vehicle) const;
   std::string approver_login_bucket(const HttpRequest& request, std::int64_t timestamp_ms);
   void enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms, bool approver = false);
   void record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms, bool approver = false);
@@ -280,6 +295,11 @@ class SignalingService {
 
   SignalingServerConfig config_;
   std::string service_instance_id_;
+  std::shared_ptr<void> direct_authority_journal_lock_;
+  std::mutex direct_authority_write_mutex_;
+  Json direct_authority_journal_ = Json::object();
+  std::unordered_map<std::string, std::int64_t> direct_authority_reservations_;
+  std::uint64_t direct_authority_next_epoch_{0};
   std::string diagnostic_fingerprint_key_;
   std::function<std::int64_t()> audit_clock_;
   mutable std::mutex mutex_;
@@ -298,6 +318,8 @@ class SignalingService {
   std::unordered_map<std::string, std::vector<Message>> messages_;
   std::unordered_map<std::string, Message> latest_control_messages_;
   std::unordered_map<std::string, Json> latest_vehicle_control_feedback_;
+  std::unordered_map<std::string, Json> latest_vehicle_transport_results_;
+  std::unordered_map<std::string, Json> latest_vehicle_transport_status_;
   std::unordered_map<std::string, AcceptedMessage> last_accepted_messages_;
   std::unordered_map<std::string, std::uint64_t> next_delivery_cursors_;
   std::unordered_map<std::string, LoginFailureState> login_failures_;
@@ -351,6 +373,10 @@ struct DriverConfig {
   std::vector<std::string> resolve_entries;
   std::filesystem::path ca_bundle;
   std::string ice_transport_policy{"all"};
+  // Internal opt-in for controlled validation; no YAML/CLI activation until
+  // the direct-control cloud-authority failure policy has been reviewed.
+  bool enable_experimental_control_transport{false};
+  bool enable_experimental_direct_authority{false};
   std::filesystem::path browser_event_log_path;
   std::uint64_t browser_event_log_max_bytes{2 * 1024 * 1024};
   int browser_event_log_files{3};
@@ -394,6 +420,11 @@ class DriverConsoleRuntime {
   [[nodiscard]] Json control_profile() const;
   [[nodiscard]] Json prepare_control_profile(const Json& input);
   [[nodiscard]] Json send_control(const Json& input);
+  [[nodiscard]] Json send_control_management(const Json& input);
+  [[nodiscard]] Json control_transport_bridge(const Json& input);
+  [[nodiscard]] Json emergency_stop_bridge(const Json& input);
+  [[nodiscard]] bool consume_vehicle_control_result_locked(const Json& result, std::string_view session,
+      std::string_view vehicle, std::string_view driver, std::int64_t now, bool direct_return = false);
   [[nodiscard]] Json update_control_intent(const Json& input, const HttpRequest* request = nullptr);
   [[nodiscard]] Json record_browser_event(const Json& input);
   [[nodiscard]] Json status();
@@ -432,6 +463,13 @@ class DriverConsoleRuntime {
   void time_sync_loop(std::stop_token stop_token);
   [[nodiscard]] bool send_native_control_sample();
   void poll_native_control_acknowledgements();
+  [[nodiscard]] bool direct_control_continuation_available_locked();
+  void consume_feedback_status_locked(const Json& value, std::string_view session,
+      std::string_view vehicle, std::string_view driver, detail::ControlPath returned);
+  void observe_emergency_stop_result_verified(const Json& result, bool data_channel_return);
+  // Caller holds native_control_update_mutex_; no transport lock or network I/O.
+  [[nodiscard]] Json publish_native_emergency_locked(const NativeControlIntentSample& sample,
+      Json payload, std::uint64_t generation);
   [[nodiscard]] bool drain_native_control_acknowledgements_locked(
       std::string_view session, std::string_view identity, std::string_view vehicle,
       Json& drained_acknowledgements);
@@ -497,6 +535,9 @@ class DriverConsoleRuntime {
   std::string session_id_;
   std::string session_creator_ui_instance_id_;
   std::string control_token_;
+  std::string control_transport_mac_key_;
+  detail::DirectAuthorityLease direct_authority_;
+  std::mutex direct_authority_mutex_;
   std::int64_t control_token_expires_at_ms_{0};
   std::int64_t control_token_renew_at_ms_{0};
   std::uint64_t sequence_{0};
@@ -533,9 +574,35 @@ class DriverConsoleRuntime {
   std::string signaling_websocket_session_id_;
   std::unique_ptr<WebSocketClient> control_signaling_websocket_;
   std::string control_signaling_websocket_session_id_;
+  Json control_signaling_websocket_authority_scope_;
   bool control_signaling_capabilities_verified_{false};
   std::uint64_t control_signaling_last_ack_seq_{0};
   detail::NativeControlAcknowledgementWindow control_signaling_ack_window_;
+  detail::VehicleResultLatencyWindow control_vehicle_result_latency_;
+  detail::ControlTransportSender control_transport_sender_;
+  bool control_transport_cloud_capable_{false};
+  bool control_transport_vehicle_capable_{false}; // mutex_
+  bool emergency_stop_vehicle_capable_{false}; // mutex_
+  bool feedback_transport_vehicle_capable_{false}; // mutex_
+  detail::FeedbackTransportSender feedback_transport_sender_; // existing transport mutex
+  bool feedback_transport_enabled_{false};
+  bool feedback_transport_dc_is_p2p_{false};
+  std::mutex emergency_stop_mutex_;
+  Json emergency_stop_latest_frame_, emergency_stop_last_result_;
+  std::string emergency_stop_owner_, emergency_stop_attempt_;
+  std::uint64_t emergency_stop_ui_epoch_{}, emergency_stop_session_generation_{}, emergency_stop_reset_epoch_{};
+  std::int64_t emergency_stop_published_ms_{};
+  detail::VehicleResultLatencyWindow emergency_stop_latency_;
+  bool control_transport_dc_ready_{false};
+  std::string control_transport_bridge_attempt_, control_transport_bridge_owner_;
+  std::uint64_t control_transport_bridge_ui_epoch_{0};
+  std::int64_t control_transport_bridge_seen_ms_{0};
+  Json control_transport_pending_status_ = Json::object();
+  Json control_transport_latest_dc_;
+  std::int64_t control_transport_latest_dc_at_ms_{0};
+  detail::NativeControlAcknowledgementWindow control_dc_ack_window_;
+  detail::NativeControlAckRecovery control_dc_ack_recovery_;
+  std::uint64_t control_dc_last_ack_seq_{0};
   detail::NativeControlAckRecovery control_signaling_ack_recovery_;
   std::string control_signaling_recovery_gear_{"N"};
   std::int64_t control_signaling_next_connect_monotonic_ms_{0};

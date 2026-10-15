@@ -37,6 +37,7 @@ PRELUDE = r'''
 #include <utility>
 #include <nlohmann/json.hpp>
 using Json=nlohmann::json;
+namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability = "native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability = "native-feedback-transport-v1"; }
 using guint=unsigned;using guint8=unsigned char;using gchar=char;using gpointer=void*;
 struct GstSDPMessage {std::string text;};
 struct GstWebRTCSessionDescription {GstSDPMessage* sdp;};
@@ -84,10 +85,14 @@ struct Signaling {Json incoming={{"messages",Json::array()}};std::vector<std::pa
   Json poll(const char*){return std::exchange(incoming,Json{{"messages",Json::array()}});}
   void send(const std::string& type,const Json& payload){sent.emplace_back(type,payload);}
   std::int64_t now_ms(){return 42;}
+  const std::string& transport_mac_key() const { static const std::string key(32, 'f'); return key; }
 };
 struct Impl {
 '''
 MEMBERS = r'''
+  struct { struct { int experimental_direct_authority_max_ms=0; } runtime; } config;
+  void flush_control_status() {} // Control status has separate protocol/service coverage.
+  void process_control_management(const Json&,const Json&) {}
   struct Lane {struct {std::string id="front";} camera;struct {int width=1,height=1,fps=1,bitrate_kbps=1;} profile;};
   std::vector<std::unique_ptr<Lane>> lanes;
   struct {VideoCodec codec=VideoCodec::H264,backend=VideoCodec::H264;} active_candidate;

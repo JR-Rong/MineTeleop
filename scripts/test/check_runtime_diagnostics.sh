@@ -169,14 +169,16 @@ if ! grep -F --quiet 'VehicleStopReason::VcuStateFault' <<<"$control_tick_block"
   exit 1
 fi
 # Profile and handshake callbacks must reject a stale DataChannel before they
-# can publish a rejection/status to the replacement channel. Ordinary control
-# is no longer accepted from any DataChannel: it must be rejected before the
-# native control validation/apply path. The executable control contract test
-# verifies the ordering; this package-level check keeps both boundaries in the
-# production source.
-if [[ "$(grep -F -c 'if (control_channel != channel) return;' <<<"$control_message_block")" -lt 2 ]] ||
+# can publish a rejection/status to the replacement channel. Legacy browser
+# actuation is rejected; negotiated native DC bytes must pass MAC and the common
+# transport fence. The executable contract checks ordering; this check retains
+# all boundaries rather than requiring the retired unconditional DC rejection.
+if [[ "$(grep -F -c 'if (transport == ControlMessageTransport::DataChannel && control_channel != channel) return;' <<<"$control_message_block")" -lt 3 ]] ||
    [[ "$(grep -F -c 'stop_requested || control_inhibited || !control_service_started' <<<"$control_message_block")" -lt 2 ]] ||
-   ! grep -F --quiet 'if (transport == ControlMessageTransport::DataChannel)' <<<"$control_message_block" ||
+   ! grep -F --quiet 'if (transport == ControlMessageTransport::DataChannel && !message.contains("control_transport") && !message.contains("emergency_stop"))' <<<"$control_message_block" ||
+   ! grep -F --quiet '!detail::verify_transport_message(message, signaling.transport_mac_key(), false)' <<<"$control_message_block" ||
+   ! grep -F --quiet 'control_transport_fence.admit(command,' <<<"$control_message_block" ||
+   ! grep -F --quiet 'if (!decision.admitted)' <<<"$control_message_block" ||
    ! grep -F --quiet 'legacy_data_channel_control_disabled' <<<"$control_message_block"; then
   printf 'media/control isolation contract missing: stale or tearing-down DataChannel commands are rejected\n' >&2
   exit 1

@@ -23,6 +23,7 @@ PURE_TESTS = (
     ("release helpers", (sys.executable, "-m", "unittest", "discover", "-s", "scripts/ci", "-p", "test_*.py", "-v")),
     ("desktop helpers", ("node", "--test", "desktop/test/log-directory.test.cjs", "desktop/test/diagnostic-log.test.cjs", "desktop/test/native-controller.test.cjs", "desktop/test/native-process.test.cjs")),
     ("control logic", ("node", "cpp/tests/control_logic.test.cjs")),
+    ("control transport courier", ("node", "cpp/tests/control_transport.test.cjs")),
     ("camera presentation", ("node", "cpp/tests/camera_view.test.cjs")),
     ("session log presentation", ("node", "cpp/tests/session_logs.test.cjs")),
     ("scene state", ("node", "cpp/tests/scene_state.test.mjs")),

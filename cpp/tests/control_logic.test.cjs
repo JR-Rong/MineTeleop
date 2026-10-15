@@ -1966,6 +1966,28 @@ test('shipped logout bounds confirmation at 15 seconds and HTTP release alone ne
   assert.match(fixture.context.statusPanel.textContent,/本地核实停车和制动状态/);
 });
 
+test('negotiated WSS logout awaits management delivery and fresh final CAN evidence after DC closes', async()=>{
+  const fixture=logoutPageFixture();let deliver;const messages=[];
+  fixture.context.controlChannel=null;
+  fixture.context.controlTransportCourier={negotiated:()=>true,activePath:()=> 'wss',epoch:()=>2};
+  fixture.context.sendControlManagement=message=>{messages.push(message);return new Promise(resolve=>{deliver=resolve})};
+  const exit=fixture.context.logout();await fixture.settle();
+  assert.equal(messages.length,1);assert.equal(messages[0].action,'disconnect');assert.equal(fixture.closeCount(),0);
+  assert(!fixture.calls.some(call=>call.post));deliver({});await fixture.settle();
+  assert(!fixture.calls.some(call=>call.post));fixture.telemetry();await fixture.advanceTo(1100);
+  assert.equal((await exit).confirmed,true);assert.equal(fixture.closeCount(),1);
+});
+
+test('negotiated WSS logout cannot confirm across a transport epoch change', async()=>{
+  const fixture=logoutPageFixture();let epoch=2;
+  fixture.context.controlChannel=null;
+  fixture.context.controlTransportCourier={negotiated:()=>true,activePath:()=> 'wss',epoch:()=>epoch};
+  fixture.context.sendControlManagement=async()=>({});
+  const exit=fixture.context.logout();await fixture.settle();epoch=3;
+  fixture.telemetry();await fixture.advanceTo(1100);
+  assert.equal((await exit).confirmed,false);assert.match(fixture.context.statusPanel.textContent,/安全退出未确认/);
+});
+
 test('shipped logout rejects old sequence, old source feedback and untrusted clock then accepts only fresh current evidence', async()=>{
   const fixture=logoutPageFixture();const exit=fixture.context.logout();await fixture.settle();
   fixture.telemetry({control_status_seq:50});await fixture.advanceTo(1100);assert(!fixture.calls.some(call=>call.post));
@@ -2292,4 +2314,31 @@ Promise.all(pendingTests).then(() => {
   } else {
     console.log(`${passed} control logic tests passed`);
   }
+});
+
+
+test('ICE path classification never infers TURN UDP from candidate protocol or missing remote data', () => {
+  const report=new Map([['l',{candidateType:'host',protocol:'udp'}],['r',{candidateType:'srflx',protocol:'udp'}]]);
+  const pair={localCandidateId:'l',remoteCandidateId:'r'};
+  assert.equal(logic.iceNetworkPath(report,pair),'p2p');
+  report.get('l').candidateType='relay';assert.equal(logic.iceNetworkPath(report,pair),'turn_unknown');
+  report.get('l').relayProtocol='udp';assert.equal(logic.iceNetworkPath(report,pair),'turn_udp');
+  report.get('r').candidateType='relay';assert.equal(logic.iceNetworkPath(report,pair),'turn_unknown');
+  report.get('r').relayProtocol='tcp';assert.equal(logic.iceNetworkPath(report,pair),'turn_tcp');
+  report.get('r').relayProtocol='tls';assert.equal(logic.iceNetworkPath(report,pair),'turn_tls');
+  report.delete('r');assert.equal(logic.iceNetworkPath(report,pair),'unknown');
+});
+
+test('ICE check summary covers truncated pairs and distinguishes absent counters from zero responses', () => {
+  const report=new Map([['l',{type:'local-candidate',candidateType:'host',protocol:'udp'}],
+    ['r',{type:'remote-candidate',candidateType:'srflx',protocol:'udp'}]]);
+  for(let n=0;n<30;n++)report.set('p'+n,{id:'p'+n,type:'candidate-pair',state:'waiting',localCandidateId:'l',remoteCandidateId:'r'});
+  report.set('failed',{id:'failed',type:'candidate-pair',state:'failed',localCandidateId:'l',remoteCandidateId:'r',requestsSent:41,responsesReceived:0});
+  report.set('ok',{id:'ok',type:'candidate-pair',state:'succeeded',localCandidateId:'l',remoteCandidateId:'r',requestsSent:2,responsesReceived:2});
+  const result=logic.iceConnectivity(report,{id:'ok'}), path=result.path_checks.p2p;
+  assert.equal(result.pairs.length,16);assert.equal(result.pairs[1].id,'failed');
+  assert.equal(path.pairs,32);assert.equal(path.attempted_pairs,2);assert.equal(path.responding_pairs,1);
+  assert.equal(path.request_counter_pairs,2);assert.equal(path.response_counter_pairs,2);
+  assert.equal(path.requests_sent,43);assert.equal(path.responses_received,2);assert.equal(path.failed_pairs,1);
+  assert.equal(result.pairs[1].responses_received,0);assert.equal(result.pairs[2].requests_sent,null);
 });
