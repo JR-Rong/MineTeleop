@@ -124,8 +124,10 @@ int tls_client(int argc,char** argv) {
   throws([&]{client.send_json({{"estop",true}},20ms);});
   const auto close_started=Clock::now();client.close();
   const auto close_ms=std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-close_started).count();
+  // Retain phase evidence even when the backend/cleanup bound fails on CI.
+  std::cout<<Json{{"failed_send_ms",failed_ms},{"close_ms",close_ms},{"send",diagnostics},{"transport",transport}}.dump()<<std::endl;
   expect(failed_ms<2000 && close_ms<2000,"blocked TLS send or owner cleanup exceeded isolated bound");
-  std::cout<<Json{{"failed_send_ms",failed_ms},{"close_ms",close_ms},{"send",diagnostics},{"transport",transport}}.dump()<<'\n';return 0;
+  return 0;
 }
 }
 int main(int argc,char** argv) {

@@ -219,6 +219,7 @@ Invoke-CheckedCommand -Command "ctest" -CommandArguments @(
   "--test-dir", $BuildDirectory,
   "-C", "Release",
   "--output-on-failure",
+  "--verbose",
   "--no-tests=error",
   "-R", "^mine-teleop-(native-control-intent|session-logs|websocket-send|websocket-send-tls)-tests$"
 )
