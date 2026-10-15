@@ -661,13 +661,31 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
   std::atomic<bool> response_delay_applied{false};
   std::atomic<bool> response_delay_completed{false};
   Json response_delay_acceptance;
+  const auto steady_ms = [] {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  std::mutex ingress_witness_mutex;
+  Json ingress_witness = Json::array();
   mine_teleop::SimpleHttpServer local_server("127.0.0.1", 0, [&](const auto& request) {
+    const auto handler_entered = steady_ms();
     const auto body = request.json_body();
     if (body.value("test_before_handler_delay_ms", 0) > 0) {
       delayed_ingress_seen = true;
       std::this_thread::sleep_for(std::chrono::milliseconds(body.at("test_before_handler_delay_ms").template get<int>()));
     }
     auto response = app->handle(request);
+    const auto applied = steady_ms();
+    if (request.path == "/api/control-intent") {
+      const auto result = Json::parse(response.body);
+      std::lock_guard lock(ingress_witness_mutex);
+      if (ingress_witness.size() < 64) ingress_witness.push_back({
+          {"intent_seq", body.value("intent_seq", 0)}, {"ui_instance_id", body.value("ui_instance_id", "")},
+          {"received_at_monotonic_ms", request.received_at_monotonic_ms.value_or(0)},
+          {"handler_entered_monotonic_ms", handler_entered}, {"applied_monotonic_ms", applied},
+          {"accepted", result.value("accepted", false)}, {"reason", result.value("reason", "")},
+          {"local_http_timing", result.value("local_http_timing", Json(nullptr))}});
+    }
     if (body.value("test_response_delay_ms", 0) > 0) {
       response_delay_acceptance = Json::parse(response.body);
       response_delay_applied.store(true, std::memory_order_release);
@@ -782,8 +800,18 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
                {"effective_throttle", native.at("effective_throttle")}}.dump());
   input["intent_seq"] = 3; input["steering"] = -0.2;
   for (int refresh = 0; refresh < 4; ++refresh) {
-    expect(http.post_json_response(local_base + "/api/control-intent", input).value("accepted", false),
-        "slow cancelled response serialized a later input refresh");
+    const auto sent = steady_ms();
+    const auto refreshed = http.post_json_response(local_base + "/api/control-intent", input);
+    if (!refreshed.value("accepted", false)) {
+      Json witness;
+      { std::lock_guard lock(ingress_witness_mutex); witness = ingress_witness; }
+      const auto failure_native = driver->status().at("native_control");
+      throw std::runtime_error("later input refresh was rejected: " + Json{
+          {"refresh_index", refresh}, {"client_sent_monotonic_ms", sent},
+          {"client_returned_monotonic_ms", steady_ms()},
+          {"response", refreshed}, {"response_delay_completed", response_delay_completed.load()},
+          {"ingress_witness", witness}, {"native_control", failure_native}}.dump());
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(45));
   }
   // The cancelled handler holds its already-accepted response for220ms.
