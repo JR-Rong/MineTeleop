@@ -2,14 +2,18 @@
 // No HTTP, WebRTC peer, physical camera, CAN, server, or installation is used.
 #include "mine_teleop/recording.hpp"
 #include "mine_teleop/detail/gstreamer_freshness.hpp"
+#include "mine_teleop/detail/recording_pipeline.hpp"
 #include "mine_teleop/media.hpp"
 #include <gst/app/gstappsink.h>
+#include <gst/app/gstappsrc.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <unistd.h>
 #include <fcntl.h>
@@ -43,6 +47,58 @@ unsigned decode_file(const std::filesystem::path& path,const std::string& codec)
 }
 int fd_count(){int count=0;for(int fd=0;fd<1024;++fd)if(::fcntl(fd,F_GETFD)>=0)++count;return count;}
 Json read(const std::filesystem::path& path){std::ifstream input(path);Json value;input>>value;return value;}
+void active_recording_stop_with_shared_error(const std::filesystem::path& self,const std::filesystem::path& root){
+  constexpr unsigned frames=20;
+  RecordingSessionSettings settings;settings.vehicle_id="vehicle";settings.session_id="active_stop";
+  settings.attempt_id="active_stop";settings.root=root;settings.worker_executable=self;
+  settings.lanes.push_back({"camera","h264","software",20,1});
+  IsolatedRecordingSession recorder(settings);
+  Pipeline pipeline("appsrc name=source is-live=true format=time caps=video/x-raw,format=I420,width=160,height=120,framerate=20/1 ! x264enc tune=zerolatency speed-preset=ultrafast key-int-max=20 bframes=0 byte-stream=true ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! tee name=t t. ! queue ! fakesink sync=false async=false t. ! appsink name=record emit-signals=true max-buffers=1 drop=false sync=false async=false enable-last-sample=false");
+  auto* source=pipeline.element("source");auto* sink=pipeline.element("record");
+  detail::RecordingTap tap(sink,&recorder,0);
+  struct Gate {std::mutex mutex;std::condition_variable changed;bool entered{false},release{false},stop_done{false};} gate;
+  struct Cleanup {Gate& gate;GstElement* pipeline;~Cleanup(){
+    {std::lock_guard lock(gate.mutex);gate.release=true;}gate.changed.notify_all();
+    gst_element_set_state(pipeline,GST_STATE_NULL);
+  }} cleanup{gate,pipeline.value};
+  auto* pad=gst_element_get_static_pad(sink,"sink");
+  const auto probe=gst_pad_add_probe(pad,GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,+[](GstPad*,GstPadProbeInfo* info,gpointer data){
+    if(GST_EVENT_TYPE(GST_PAD_PROBE_INFO_EVENT(info))!=GST_EVENT_EOS)return GST_PAD_PROBE_OK;
+    auto& gate=*static_cast<Gate*>(data);std::unique_lock lock(gate.mutex);
+    gate.entered=true;gate.changed.notify_all();gate.changed.wait(lock,[&]{return gate.release;});
+    return GST_PAD_PROBE_OK;
+  },&gate,nullptr);
+  check(gst_element_set_state(pipeline.value,GST_STATE_PLAYING)!=GST_STATE_CHANGE_FAILURE,"active stop fixture play");
+  for(unsigned index=0;index<frames;++index){
+    auto* buffer=gst_buffer_new_allocate(nullptr,160*120*3/2,nullptr);
+    gst_buffer_memset(buffer,0,128,160*120*3/2);GST_BUFFER_PTS(buffer)=index*50*GST_MSECOND;GST_BUFFER_DURATION(buffer)=50*GST_MSECOND;
+    check(gst_app_src_push_buffer(GST_APP_SRC(source),buffer)==GST_FLOW_OK,"active stop fixture input");
+  }
+  const auto ready=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+  while(recorder.lane_status(0)["accepted_access_units"]!=frames&&std::chrono::steady_clock::now()<ready)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  check(recorder.lane_status(0)["accepted_access_units"]==frames,"encoded AUs did not reach actual production recording tap");
+  auto* error=g_error_new_literal(GST_STREAM_ERROR,GST_STREAM_ERROR_FAILED,"synthetic shared RTC branch error");
+  const bool posted=gst_element_post_message(pipeline.value,gst_message_new_error(GST_OBJECT(pipeline.value),error,"offline synthetic error"));g_error_free(error);
+  check(posted,"synthetic shared bus ERROR was not injected");
+  // Only the production stop requests EOS. The event itself establishes the
+  // stop-entry barrier; elapsed time before stop cannot release it early.
+  std::jthread release([&]{
+    {std::unique_lock lock(gate.mutex);gate.changed.wait(lock,[&]{return gate.entered||gate.stop_done;});if(!gate.entered)return;}
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    {std::lock_guard lock(gate.mutex);gate.release=true;}gate.changed.notify_all();});
+  GstElement* sources[]{source};detail::RecordingTap* taps[]{&tap};
+  detail::stop_recording_pipeline(pipeline.value,sources,taps,&recorder);
+  {std::lock_guard lock(gate.mutex);gate.stop_done=true;}gate.changed.notify_all();
+  release.join();const bool eos=tap.eos_received();
+  if(!eos)recorder.abort("recording_parent_eos_missing");recorder.finish();
+  const auto state=recorder.lane_status(0);
+  gst_pad_remove_probe(pad,probe);gst_object_unref(pad);gst_object_unref(source);gst_object_unref(sink);
+  check(eos,"shared pipeline ERROR truncated production recording tap before its actual EOS");
+  check(state["state"]=="finalized"&&state["final_eos_received"]==true&&state["accepted_access_units"]==frames&&state["worker_input_access_units"]==frames,"active production stop did not finalize every accepted AU");
+  unsigned decoded=0;for(const auto& entry:std::filesystem::directory_iterator(root/"vehicle/active_stop/camera"))if(entry.path().extension()==".mp4")decoded+=decode_file(entry.path(),"h264");
+  check(decoded==frames,"active stop recording did not decode all source pictures");
+  std::cout<<"PASS production active stop ignores unrelated bus ERROR until real recording tap EOS, exact AUs="<<frames<<'\n';
+}
 void scenario(const std::filesystem::path& self,const std::filesystem::path& root,const std::string& mode,const std::string& codec,int lane_count=1,unsigned frames=120){
   const auto session=mode+"_"+codec;const auto dir=root/"vehicle"/session;std::filesystem::remove_all(dir);
   RecordingSessionSettings settings;settings.vehicle_id="vehicle";settings.session_id=session;settings.attempt_id=mode;settings.root=root;settings.worker_executable=self;
@@ -85,6 +141,7 @@ int main(int argc,char** argv){
     return run_recording_worker(3,4,hooks);
   }
   try{gst_init(nullptr,nullptr);const auto self=std::filesystem::absolute(argv[0]);const auto root=std::filesystem::temp_directory_path()/("mine_teleop_recording_gst_"+std::to_string(::getpid()));std::filesystem::create_directories(root);
+    active_recording_stop_with_shared_error(self,root);
     scenario(self,root,"healthy","h264",2);scenario(self,root,"healthy","h265");
     for(const auto* mode:{"slowwrite","slowfinalize","diskfull","workerdead"}){const auto helper=root/mode;std::filesystem::create_symlink(self,helper);scenario(helper,root,mode,"h264",1,std::string(mode)=="slowfinalize"?20:120);}
     const auto before=fd_count();for(int i=0;i<3;++i)scenario(self,root,"reconnect","h264",1,40);check(fd_count()==before,"actual recorder reconnect leaked parent FDs");int child_status=0;check(::waitpid(-1,&child_status,WNOHANG)<0&&errno==ECHILD,"actual recorder left unreaped child");

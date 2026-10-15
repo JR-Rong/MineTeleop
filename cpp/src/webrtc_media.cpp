@@ -2,6 +2,7 @@
 
 #include "mine_teleop/gstreamer_media.hpp"
 #include "mine_teleop/detail/gstreamer_freshness.hpp"
+#include "mine_teleop/detail/recording_pipeline.hpp"
 #include "mine_teleop/recording.hpp"
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/upload.hpp"
@@ -615,6 +616,7 @@ struct VehicleMediaRuntime::Impl {
     GstElement* encoder{nullptr};
     GstElement* send_queue{nullptr};
     GstElement* record_tap{nullptr};
+    std::unique_ptr<detail::RecordingTap> recording_tap;
     std::size_t recording_index{std::numeric_limits<std::size_t>::max()};
     std::unique_ptr<detail::EncodedSendFreshness> send_freshness;
     std::thread thread;
@@ -3616,25 +3618,8 @@ struct VehicleMediaRuntime::Impl {
       lane->send_queue = gst_bin_get_by_name(GST_BIN(pipeline), ("send_queue_" + id).c_str());
       lane->record_tap = gst_bin_get_by_name(GST_BIN(pipeline), ("record_tap_" + id).c_str());
       if (lane->record_tap != nullptr) {
-        g_signal_connect(lane->record_tap, "new-sample", G_CALLBACK(+[](GstAppSink* sink, gpointer data) -> GstFlowReturn {
-          auto& lane = *static_cast<Lane*>(data);
-          auto* sample = gst_app_sink_pull_sample(sink);
-          if (sample != nullptr) {
-            if (lane.owner->isolated_recording) {
-              const auto* segment = gst_sample_get_segment(sample);
-              if (segment) lane.owner->isolated_recording->admit(lane.recording_index, gst_sample_get_buffer(sample), *segment);
-              else lane.owner->isolated_recording->reject_admission(lane.recording_index, false);
-            }
-            gst_sample_unref(sample);
-          }
-          // Even failed recording keeps consuming this tap. Never propagate a
-          // disk/worker admission error back into the shared encoded tee.
-          return GST_FLOW_OK;
-        }), lane.get());
-        g_signal_connect(lane->record_tap, "eos", G_CALLBACK(+[](GstAppSink*, gpointer data) {
-          auto& lane = *static_cast<Lane*>(data);
-          if (lane.owner->isolated_recording) lane.owner->isolated_recording->end_lane(lane.recording_index);
-        }), lane.get());
+        lane->recording_tap = std::make_unique<detail::RecordingTap>(
+            lane->record_tap, isolated_recording.get(), lane->recording_index);
       }
       auto* payloader = gst_bin_get_by_name(GST_BIN(pipeline), ("pay_" + id).c_str());
       auto* rtp_src_pad = payloader == nullptr ? nullptr : gst_element_get_static_pad(payloader, "src");
@@ -4021,18 +4006,13 @@ struct VehicleMediaRuntime::Impl {
           return lane->recording_index != std::numeric_limits<std::size_t>::max() && lane->record_tap == nullptr;
         }))) isolated_recording->abort("recording_parent_eos_missing");
     if (pipeline != nullptr) {
+      std::vector<GstElement*> sources;
+      std::vector<detail::RecordingTap*> taps;
       for (const auto& lane : lanes) {
-        if (lane->appsrc != nullptr) gst_app_src_end_of_stream(GST_APP_SRC(lane->appsrc));
+        if (lane->appsrc != nullptr) sources.push_back(lane->appsrc);
+        if (lane->recording_tap) taps.push_back(lane->recording_tap.get());
       }
-      if (isolated_recording) isolated_recording->request_stop();
-      GstBus* bus = gst_element_get_bus(pipeline);
-      if (bus != nullptr) {
-        GstMessage* message = gst_bus_timed_pop_filtered(
-            bus, 3 * GST_SECOND, static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
-        if (message != nullptr) gst_message_unref(message);
-        gst_object_unref(bus);
-      }
-      gst_element_set_state(pipeline, GST_STATE_NULL);
+      detail::stop_recording_pipeline(pipeline, sources, taps, isolated_recording.get());
     }
     for (const auto& lane : lanes) {
       if (lane->appsrc != nullptr) {
@@ -4048,7 +4028,7 @@ struct VehicleMediaRuntime::Impl {
         lane->send_queue = nullptr;
       }
       if (lane->record_tap != nullptr) {
-        g_signal_handlers_disconnect_by_data(lane->record_tap, lane.get());
+        lane->recording_tap.reset();
         gst_object_unref(lane->record_tap); lane->record_tap = nullptr;
       }
     }
