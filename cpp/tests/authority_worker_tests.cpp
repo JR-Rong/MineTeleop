@@ -30,9 +30,9 @@ struct ThrowAdapter : VehicleAdapter {
 };
 struct FixtureSignaling {
  bool malformed=false, success=false, wrong_nonce=false;std::atomic<unsigned> calls{0};
- std::int64_t utc=0; std::atomic<std::int64_t> long_expiry{1049};
- std::int64_t control_lease_expiry()const{return long_expiry.load();}
- void observe_lease(std::int64_t value){long_expiry.store(value);}
+ std::int64_t utc=0; std::atomic<std::int64_t> control_lease_expires_at_ms_{1049};
+ std::int64_t control_lease_expiry()const{return control_lease_expires_at_ms_.load();}
+ #include "authority_lease_cache.inc"
  Json direct_authority_configuration(){return malformed?Json::object():Json{{"maximum_duration_ms",600}};}
  Json renew_direct_authority(std::string nonce,int,std::uint64_t){++calls;if(!success)throw HttpStatusError(401,"fixture authenticated revocation");
  DirectAuthorityGrant grant{"issuer","vehicle-001","driver-001","session-001",wrong_nonce?"foreign-nonce":nonce,1,1,1,utc,utc+600,600};
@@ -83,6 +83,8 @@ void authenticated_short_renewal_refreshes_long_cutoff(){
  while(!worker.signaling.calls.load()&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
  std::this_thread::sleep_for(std::chrono::milliseconds(10));thread.request_stop();thread.join();
  expect(worker.direct_authority.valid(150),"healthy short renewal rejected");
+ worker.signaling.observe_lease(1049); // Late WSS notification after accepted HTTP renewal.
+ expect(worker.signaling.control_lease_expiry()==2000,"COUNTEREXAMPLE R3 ordering: late old WSS lease regressed authenticated HTTP deadline");
  ControlTransportFence fence;fence.reset("vehicle-001","driver-001","session-001","fixture");
  ControlCommand command;command.vehicle_id="vehicle-001";command.driver_id="driver-001";command.session_id="session-001";command.control_token="fixture";command.seq=1;command.sent_at_utc_ms=1050;
  ControlTransportStamp stamp{1,0,1,ControlPath::DataChannel,"media-a",true};auto wire=stamp.to_json();

@@ -22,3 +22,10 @@ worker、cutoff、既有cloud/journal/authority目标 **3/3通过**，日志
 实验仍默认关闭；600ms/80ms只为fixture。此变化要求启用实验时三端
 匹配，旧实验云缺少该截止字段会失败关闭。完整Linux/GStreamer和
 跨机验证待主线程协调，没有台架访问、部署或推送。
+
+补充交错反例 `review-r3-ordering-before.log` 使用实际提取的
+`MediaSignalingClient::observe_lease`：HTTP刚安装2000后，迟到WSS的
+1049又把缓存写回旧值。现同会话只接受更大的已认证截止；新session
+的discovery仍直接重置缓存，明确撤权仍独立terminal revoke。短grant
+截止和双重门禁均不变。实际缓存方法、worker、Lease/Fence回归见
+`review-r3-ordering-after.log`，不依赖测试中手写缓存setter。

@@ -513,7 +513,14 @@ class MediaSignalingClient {
          {"nonce", std::move(nonce)}, {"maximum_duration_ms", maximum_duration_ms}, {"retired_authority_epoch", retired_epoch}});
   }
   [[nodiscard]] std::int64_t control_lease_expiry() const { return control_lease_expires_at_ms_.load(); }
-  void observe_lease(std::int64_t expiry) { if (expiry > 0) control_lease_expires_at_ms_.store(expiry); }
+  void observe_lease(std::int64_t expiry) {
+    if (expiry <= 0) return;
+    // Current-session renewal only extends this deadline. A delayed WSS lease
+    // cannot regress a newer authenticated RPC value; discover_session resets
+    // the cache for a new session, and explicit denial revokes independently.
+    auto current = control_lease_expires_at_ms_.load();
+    while (expiry > current && !control_lease_expires_at_ms_.compare_exchange_weak(current, expiry)) {}
+  }
 
  private:
   void require_connection() const {

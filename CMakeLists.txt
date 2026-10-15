@@ -375,11 +375,12 @@ if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
     set(MINE_TELEOP_AUTHORITY_WORKER "${CMAKE_CURRENT_BINARY_DIR}/authority_worker_methods.inc")
-    add_custom_command(OUTPUT "${MINE_TELEOP_AUTHORITY_WORKER}"
+    set(MINE_TELEOP_AUTHORITY_CACHE "${CMAKE_CURRENT_BINARY_DIR}/authority_lease_cache.inc")
+    add_custom_command(OUTPUT "${MINE_TELEOP_AUTHORITY_WORKER}" "${MINE_TELEOP_AUTHORITY_CACHE}"
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/extract_authority_worker_methods.py"
-        --source "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/webrtc_media.cpp" --output "${MINE_TELEOP_AUTHORITY_WORKER}"
+        --source "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/webrtc_media.cpp" --output "${MINE_TELEOP_AUTHORITY_WORKER}" --lease-cache-output "${MINE_TELEOP_AUTHORITY_CACHE}"
       DEPENDS cpp/tests/extract_authority_worker_methods.py cpp/src/webrtc_media.cpp VERBATIM)
-    add_executable(mine-teleop-authority-worker-tests cpp/tests/authority_worker_tests.cpp "${MINE_TELEOP_AUTHORITY_WORKER}")
+    add_executable(mine-teleop-authority-worker-tests cpp/tests/authority_worker_tests.cpp "${MINE_TELEOP_AUTHORITY_WORKER}" "${MINE_TELEOP_AUTHORITY_CACHE}")
     target_include_directories(mine-teleop-authority-worker-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_link_libraries(mine-teleop-authority-worker-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
     mine_teleop_enable_warnings(mine-teleop-authority-worker-tests)
