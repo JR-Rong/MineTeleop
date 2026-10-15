@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -667,6 +668,22 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
   };
   std::mutex ingress_witness_mutex;
   Json ingress_witness = Json::array();
+  struct ResponseGate {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool waiting{false}, released{false}, timed_out{false};
+    std::int64_t old_applied_ns{0}, released_ns{0};
+    std::array<Json, 4> refreshes;
+    static std::int64_t now_ns() {
+      return std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void release() {
+      std::lock_guard lock(mutex);
+      if (!released) { released = true; released_ns = now_ns(); }
+      cv.notify_all();
+    }
+  } response_gate;
   mine_teleop::SimpleHttpServer local_server("127.0.0.1", 0, [&](const auto& request) {
     const auto handler_entered = steady_ms();
     const auto body = request.json_body();
@@ -686,15 +703,36 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
           {"accepted", result.value("accepted", false)}, {"reason", result.value("reason", "")},
           {"local_http_timing", result.value("local_http_timing", Json(nullptr))}});
     }
-    if (body.value("test_response_delay_ms", 0) > 0) {
+    if (body.contains("test_refresh_index")) {
+      const auto index = body.at("test_refresh_index").template get<std::size_t>();
+      std::lock_guard lock(response_gate.mutex);
+      expect(index < response_gate.refreshes.size(), "invalid concurrent-refresh fixture index");
+      response_gate.refreshes[index] = {{"response", Json::parse(response.body)},
+          {"applied_ns", ResponseGate::now_ns()}, {"client_sent_ms", body.at("test_client_sent_ms")},
+          {"received_ms", request.received_at_monotonic_ms.value_or(0)},
+          {"applied_while_old_waiting", response_gate.waiting && !response_gate.released && !response_gate.timed_out}};
+      response_gate.cv.notify_all();
+    }
+    if (body.value("test_response_gate", false)) {
+      std::unique_lock lock(response_gate.mutex);
       response_delay_acceptance = Json::parse(response.body);
+      response_gate.old_applied_ns = ResponseGate::now_ns();
+      response_gate.waiting = true;
       response_delay_applied.store(true, std::memory_order_release);
-      std::this_thread::sleep_for(std::chrono::milliseconds(body.at("test_response_delay_ms").template get<int>()));
+      response_gate.cv.notify_all();
+      if (!response_gate.cv.wait_for(lock, std::chrono::seconds(2), [&] { return response_gate.released; }))
+        response_gate.timed_out = true;
       response_delay_completed.store(true, std::memory_order_release);
+      response_gate.cv.notify_all();
     }
     return response;
   });
   local_server.start();
+  std::array<std::future<Json>, 4> refresh_jobs;
+  struct ReleaseResponseOnExit {
+    ResponseGate& gate;
+    ~ReleaseResponseOnExit() { gate.release(); }
+  } release_response_on_exit{response_gate};
   const auto local_base = "http://127.0.0.1:" + std::to_string(local_server.port());
   Json input = {{"session_id", connected.at("session_id")},
       {"session_generation", connected.at("control_session_generation")},
@@ -755,7 +793,7 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
   // A refresh is identified by a strictly newer monotonic millisecond. Make
   // that precondition explicit rather than depending on HTTP call overhead.
   std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  auto slow_response = input; slow_response["test_response_delay_ms"] = 220;
+  auto slow_response = input; slow_response["test_response_gate"] = true;
   struct ResponseSocket {
     int value{-1};
     ~ResponseSocket() { if (value >= 0) ::close(value); }
@@ -799,40 +837,91 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
                {"intent_age_ms", native.at("intent_age_ms")}, {"intent_fresh", native.at("intent_fresh")},
                {"effective_throttle", native.at("effective_throttle")}}.dump());
   input["intent_seq"] = 3; input["steering"] = -0.2;
+  std::int64_t previous_dispatch_ms = 0;
   for (int refresh = 0; refresh < 4; ++refresh) {
+    // Pace from sends, not completed responses. Each request owns its client;
+    // only the prior application witness orders ingress, never its response.
+    // At most four real HTTP operations can be in flight.
+    if (refresh > 0) {
+      std::this_thread::sleep_until(std::chrono::steady_clock::time_point(
+          std::chrono::milliseconds(previous_dispatch_ms + 45)));
+    }
     const auto sent = steady_ms();
-    const auto refreshed = http.post_json_response(local_base + "/api/control-intent", input);
+    previous_dispatch_ms = sent;
+    auto refresh_input = input;
+    refresh_input["test_refresh_index"] = refresh;
+    refresh_input["test_client_sent_ms"] = sent;
+    refresh_jobs[refresh] = std::async(std::launch::async, [local_base, refresh_input, steady_ms] {
+      const auto started = steady_ms();
+      auto result = mine_teleop::HttpClient(std::chrono::seconds(2)).post_json_response(
+          local_base + "/api/control-intent", refresh_input);
+      result["fixture_client_started_ms"] = started;
+      result["fixture_client_returned_ms"] = steady_ms();
+      return result;
+    });
+    Json applied_refresh;
+    {
+      std::unique_lock lock(response_gate.mutex);
+      expect(response_gate.cv.wait_for(lock, std::chrono::seconds(2), [&] {
+        return !response_gate.refreshes[refresh].is_null() || response_gate.timed_out;
+      }) && !response_gate.timed_out, "new HTTP handler did not apply while the old response was held");
+      applied_refresh = response_gate.refreshes[refresh];
+    }
+    const auto& refreshed = applied_refresh.at("response");
     if (!refreshed.value("accepted", false)) {
       Json witness;
       { std::lock_guard lock(ingress_witness_mutex); witness = ingress_witness; }
       const auto failure_native = driver->status().at("native_control");
       throw std::runtime_error("later input refresh was rejected: " + Json{
           {"refresh_index", refresh}, {"client_sent_monotonic_ms", sent},
-          {"client_returned_monotonic_ms", steady_ms()},
+          {"failure_observed_monotonic_ms", steady_ms()},
           {"response", refreshed}, {"response_delay_completed", response_delay_completed.load()},
           {"ingress_witness", witness}, {"native_control", failure_native}}.dump());
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(45));
+    expect(applied_refresh.at("applied_while_old_waiting") == true,
+        "new input acceptance did not overlap the held old response");
   }
-  // The cancelled handler holds its already-accepted response for220ms.
-  // Four45ms refreshes alone do not prove that the old handler has finished.
-  const auto completion_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  while (!response_delay_completed.load(std::memory_order_acquire) &&
-      std::chrono::steady_clock::now() < completion_deadline) {
-    expect(http.post_json_response(local_base + "/api/control-intent", input).value("accepted", false),
-        "current input refresh failed while waiting for cancelled response completion");
-    std::this_thread::sleep_for(std::chrono::milliseconds(45));
+  response_gate.release();
+  Json client_responses = Json::array();
+  for (std::size_t index = 0; index < refresh_jobs.size(); ++index) {
+    try {
+      auto refreshed = refresh_jobs[index].get();
+      expect(refreshed.value("accepted", false), "concurrent HTTP response lost its actual acceptance: " + refreshed.dump());
+      client_responses.push_back(std::move(refreshed));
+    } catch (const std::exception& error) {
+      Json witness;
+      { std::lock_guard lock(ingress_witness_mutex); witness = ingress_witness; }
+      throw std::runtime_error("concurrent input response failed: " + Json{{"refresh_index", index},
+          {"error", error.what()}, {"observed_ms", steady_ms()}, {"ingress_witness", witness}}.dump());
+    }
   }
-  expect(response_delay_completed.load(std::memory_order_acquire),
-      "cancelled response handler did not complete before the bounded assertion");
+  const auto all_responses_observed_ms = steady_ms();
+  {
+    std::unique_lock lock(response_gate.mutex);
+    expect(response_gate.cv.wait_for(lock, std::chrono::seconds(2), [&] {
+      return response_delay_completed.load(std::memory_order_acquire);
+    }) && !response_gate.timed_out, "cancelled response handler did not complete after explicit release");
+    for (const auto& refresh : response_gate.refreshes) {
+      expect(response_gate.old_applied_ns < refresh.at("applied_ns").get<std::int64_t>() &&
+          refresh.at("applied_ns").get<std::int64_t>() < response_gate.released_ns,
+          "old/new application and response-release ordering was not witnessed");
+    }
+  }
+  const auto concurrency_evidence = [&] {
+    std::lock_guard lock(response_gate.mutex);
+    return Json{{"old_applied_ns", response_gate.old_applied_ns},
+        {"old_response_released_ns", response_gate.released_ns}, {"refreshes", response_gate.refreshes},
+        {"all_responses_observed_ms", all_responses_observed_ms}, {"client_responses", client_responses}};
+  };
   native = driver->status().at("native_control");
-  expect(native.at("effective_intent_seq") == 3 && native.at("effective_steering") == -0.2 &&
-      native.value("intent_fresh", false), "late response completion restored an older operation");
+  if (!(native.at("effective_intent_seq") == 3 && native.at("effective_steering") == -0.2 &&
+      native.value("intent_fresh", false))) throw std::runtime_error("post-release motion/freshness changed: " +
+          Json{{"observed_ms", steady_ms()}, {"native_control", native}, {"concurrency", concurrency_evidence()}}.dump());
   // Exercise actual ingress after that completion, including both obsolete
   // sequence and retired-page identity. Neither request may refresh or rewind
   // the operation that remains held by the current page.
   const auto refresh_after_completion = native.at("accepted_refresh_sample_id");
-  auto completed_old_operation = slow_response; completed_old_operation.erase("test_response_delay_ms");
+  auto completed_old_operation = slow_response; completed_old_operation.erase("test_response_gate");
   const auto old_operation_rejection = http.post_json_response(local_base + "/api/control-intent", completed_old_operation);
   expect(!old_operation_rejection.value("accepted", true) &&
       old_operation_rejection.value("reason", "") == "old_intent_seq",
@@ -843,11 +932,12 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
       retired_page_rejection.value("reason", "") == "input_page_not_current",
       "retired page ordinary input was accepted after cancelled response completion");
   native = driver->status().at("native_control");
-  expect(native.at("effective_intent_seq") == 3 && native.at("effective_steering") == -0.2 &&
+  if (!(native.at("effective_intent_seq") == 3 && native.at("effective_steering") == -0.2 &&
       native.at("effective_throttle") == 0.4 && native.value("intent_fresh", false) &&
       native.at("owner_ui_instance_id") == "new-http-page" && native.at("ui_control_epoch") == 2 &&
-      native.at("accepted_refresh_sample_id") == refresh_after_completion,
-      "post-completion obsolete input changed current motion, ownership or input freshness");
+      native.at("accepted_refresh_sample_id") == refresh_after_completion))
+    throw std::runtime_error("post-completion obsolete input changed current motion, ownership or input freshness: " +
+          Json{{"observed_ms", steady_ms()}, {"native_control", native}, {"concurrency", concurrency_evidence()}}.dump());
   const auto sent_before_stall = native.at("commands_sent_total").get<std::uint64_t>();
   std::this_thread::sleep_for(std::chrono::milliseconds(230));
   const auto stalled = driver->status(); native = stalled.at("native_control");
@@ -922,6 +1012,8 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
   static_cast<void>(driver->disconnect("offline_page_test_complete"));
   driver.reset();
   cloud_server.stop();
+  // Keep CI stdout backpressure outside every 200ms freshness assertion.
+  std::cout << "[HTTP_CONCURRENCY] " << concurrency_evidence().dump() << '\n';
 }
 
 void test_local_http_release_scope_prevents_retired_page_and_takeover_races() {

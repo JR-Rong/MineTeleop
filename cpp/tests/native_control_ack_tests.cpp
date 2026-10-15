@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -174,10 +175,12 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
   config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
   auto signaling = std::make_shared<mine_teleop::SignalingService>(config);
   std::atomic<int> connections{0}, normal_packets{0}, estop_packets{0};
+  std::atomic<int> warmup_acknowledgements{0};
+  std::atomic<std::uint64_t> warmup_ack_sequence{0};
   std::atomic<bool> stop{false};
   std::atomic<std::uint64_t> sixth_estop_sequence{0};
   std::mutex witness_mutex;
-  Json sixth_estop_identity, sixth_estop_ack_identity;
+  Json capacity_identity, sixth_estop_identity, sixth_estop_ack_identity;
   std::mutex input_mutex;
   Json emergency_input;
   mine_teleop::DriverConsoleRuntime* runtime = nullptr;
@@ -195,10 +198,29 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
         ++connections;
         mine_teleop::ServerWebSocketConnection connection(socket, 512 * 1024);
         try {
+          std::deque<Json> unacknowledged_normal;
+          bool emergency_requested = false;
+          auto last_warmup_ack = std::chrono::steady_clock::now();
+          const auto acknowledge_oldest_during_warmup = [&] {
+            const auto now = std::chrono::steady_clock::now();
+            if (emergency_requested || unacknowledged_normal.empty() ||
+                now - last_warmup_ack < std::chrono::milliseconds(500)) return;
+            // Real, sparse progress keeps the production five-second ACK
+            // recovery deadline alive while this actual 128-entry window fills.
+            const auto ack = unacknowledged_normal.front();
+            connection.send_json(ack);
+            unacknowledged_normal.pop_front();
+            warmup_ack_sequence = ack.at("seq").get<std::uint64_t>();
+            ++warmup_acknowledgements;
+            last_warmup_ack = now;
+          };
           while (!stop.load()) {
             const auto received = connection.receive_json(std::chrono::milliseconds(10));
             if (received.status == mine_teleop::WebSocketReceiveStatus::Closed) break;
-            if (received.status != mine_teleop::WebSocketReceiveStatus::Message) continue;
+            if (received.status != mine_teleop::WebSocketReceiveStatus::Message) {
+              acknowledge_oldest_during_warmup();
+              continue;
+            }
             const bool estop = received.message.at("payload").value("estop", false);
             mine_teleop::HttpRequest post;
             post.method = "POST";
@@ -210,14 +232,32 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
             const auto response = signaling->handle(post);
             expect(response.status == 200, "loopback cloud rejected native control: " + response.body);
             if (!estop) {
-              if (++normal_packets == 128) {
+              expect(!emergency_requested, "ordinary packet raced ahead of the full-window emergency");
+              ++normal_packets;
+              unacknowledged_normal.push_back(Json::parse(response.body));
+              if (unacknowledged_normal.size() == 128) {
                 // Trigger inside the real receive handler: the next urgent
-                // sender pass sees the full window before any ordinary retry.
-                std::lock_guard lock(input_mutex);
-                expect(runtime && !emergency_input.empty(), "ESTOP fixture input was not ready");
-                expect(runtime->update_control_intent(emergency_input).value("accepted", false),
-                    "valid emergency intent did not latch at the capacity boundary");
+                // sender pass sees 128 real ordinary unacknowledged identities.
+                // Freeze warmup ACKs before latching; do not query status first.
+                emergency_requested = true;
+                {
+                  std::lock_guard lock(input_mutex);
+                  expect(runtime && !emergency_input.empty(), "ESTOP fixture input was not ready");
+                  expect(runtime->update_control_intent(emergency_input).value("accepted", false),
+                      "valid emergency intent did not latch at the capacity boundary");
+                }
+                const auto status = runtime->status();
+                const auto& pending = status.at("native_control");
+                expect(pending.at("unacknowledged_count") == 128 &&
+                    pending.at("last_ack_seq") == warmup_ack_sequence.load(),
+                    "wire capacity boundary did not match real local accounting: " + pending.dump());
+                std::lock_guard lock(witness_mutex);
+                capacity_identity = {{"session_id", status.at("session_id")},
+                    {"session_generation", pending.at("session_generation")},
+                    {"pending", pending.at("unacknowledged_count")},
+                    {"last_warmup_ack_seq", pending.at("last_ack_seq")}};
               }
+              acknowledge_oldest_during_warmup();
             } else {
               const auto count = ++estop_packets;
               expect(received.message.at("payload").at("throttle") == 0.0 &&
@@ -267,12 +307,25 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
   server.start();
   const auto base = "http://127.0.0.1:" + std::to_string(server.port());
   mine_teleop::HttpClient http;
-  static_cast<void>(http.post_json_response(base + "/vehicles/online", {{"native_control_capabilities", mine_teleop::kNativeControlCapabilities}, {"vehicle_id", "vehicle-001"},
-      {"device_token", "ack-test-device"}, {"connection_id", "full-window-fixture"}}));
+  const auto online = http.post_json_response(base + "/vehicles/online", {{"native_control_capabilities", mine_teleop::kNativeControlCapabilities}, {"vehicle_id", "vehicle-001"},
+      {"device_token", "ack-test-device"}, {"connection_id", "full-window-fixture"}});
+  std::atomic<bool> heartbeat_failed{false};
+  std::jthread heartbeat([&](std::stop_token token) {
+    mine_teleop::HttpClient keepalive(std::chrono::seconds(2));
+    while (!token.stop_requested()) {
+      try {
+        static_cast<void>(keepalive.post_json_response(base + "/vehicles/heartbeat",
+            {{"vehicle_id", "vehicle-001"}, {"device_token", "ack-test-device"},
+             {"connection_generation", online.at("connection_generation")}}));
+      } catch (const std::exception&) { heartbeat_failed = true; return; }
+      for (int tick = 0; tick < 10 && !token.stop_requested(); ++tick)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
   mine_teleop::DriverConfig driver_config;
   driver_config.driver_id = "driver-console-001";
   driver_config.signaling_url = base;
-  driver_config.rate_hz = 100;
+  driver_config.rate_hz = 20;
   // All production clock/lease limits remain unchanged in this regression.
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "ack-test-password");
   runtime = &driver;
@@ -288,7 +341,9 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
   std::string observed_session;
   const auto expected_session = connected.at("session_id").get<std::string>();
   const auto expected_generation = connected.at("control_session_generation").get<std::uint64_t>();
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  // This is a fixture completion budget, not a production safety timeout.
+  // Sparse real ACK progress permits the window to fill at the default rate.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
   while (std::chrono::steady_clock::now() < deadline) {
     // Read a durable peer witness first, then wait for local send accounting
     // and cumulative ACK progress to cover that exact emergency identity.
@@ -300,24 +355,32 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
     if (target > 128 && observed_session == expected_session &&
         native.value("session_generation", 0U) == expected_generation &&
         native.value("last_seq", 0U) >= target && native.value("last_ack_seq", 0U) >= target &&
-        native.value("commands_sent_total", 0U) >= 134U) break;
+        native.value("commands_sent_total", 0U) >= static_cast<unsigned>(normal_packets.load()) + 6U) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   stop.store(true);
   static_cast<void>(driver.disconnect("full_window_ack_fixture_complete"));
+  heartbeat.request_stop();
+  heartbeat.join();
   server.stop();
   {
     std::lock_guard lock(error_mutex);
     expect(fixture_error.empty(), "full send-path mock failed: " + fixture_error);
   }
-  Json emergency_identity, acknowledgement_identity;
+  Json capacity_witness, emergency_identity, acknowledgement_identity;
   {
     std::lock_guard lock(witness_mutex);
+    capacity_witness = capacity_identity;
     emergency_identity = sixth_estop_identity;
     acknowledgement_identity = sixth_estop_ack_identity;
   }
   const auto witnessed_seq = sixth_estop_sequence.load(std::memory_order_acquire);
-  expect(normal_packets.load() == 128 && estop_packets.load() >= 6 && witnessed_seq > 128 &&
+  expect(!heartbeat_failed && warmup_acknowledgements.load() > 0 &&
+      normal_packets.load() - warmup_acknowledgements.load() == 128 &&
+      capacity_witness.value("pending", 0) == 128 &&
+      capacity_witness.value("session_id", "") == expected_session &&
+      capacity_witness.value("session_generation", 0U) == expected_generation &&
+      estop_packets.load() >= 6 && witnessed_seq > 128 &&
       !emergency_identity.empty() && acknowledgement_identity.value("seq", 0U) == witnessed_seq,
       "fixture did not execute repeated urgent writes at the full capacity boundary: " + native.dump());
   expect(observed_session == expected_session && native.value("session_generation", 0U) == expected_generation &&
@@ -327,10 +390,15 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
       emergency_identity.at("steering") == 0.0 && native.value("effective_estop", false),
       "local accounting/ACK snapshot did not cover the witnessed emergency identity: " + native.dump());
   expect(connections.load() == 1 && native.value("websocket_connected", false) &&
-      native.value("send_failures_total", 1U) == 0 && native.value("commands_sent_total", 0U) >= 134U &&
+      native.value("send_failures_total", 1U) == 0 &&
+      native.value("commands_sent_total", 0U) >= static_cast<unsigned>(normal_packets.load()) + 6U &&
       native.value("last_ack_seq", 0U) > 128U && native.value("unacknowledged_count", 129U) <= 128U &&
       native.value("last_error", "nonempty").empty(),
       "successful ESTOP send/accounting was treated as socket failure or lost ACK identity: " + native.dump());
+  std::cout << "[ACK_CAPACITY] " << Json{{"normal_packets", normal_packets.load()},
+      {"warmup_acknowledgements", warmup_acknowledgements.load()}, {"capacity", capacity_witness},
+      {"estop_packets", estop_packets.load()}, {"sixth_estop", emergency_identity},
+      {"sixth_ack", acknowledgement_identity}}.dump() << '\n';
   // Sending/receiving ESTOP is not physical vehicle feedback. No fake vehicle
   // status is supplied and this test makes no claim of mechanical braking.
 }
