@@ -593,9 +593,19 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
       {"dc_ready", true}, {"last_seen_seq", 0}};
   const auto response = fixture.driver->emergency_stop_bridge(request); // Actual native endpoint implementation, no normal bridge mutex.
   expect(response.at("frame_json").is_string(), "blocked WSS prevented fetching already-published emergency bytes");
+  // R5: a browser that proved it did not call send retains last_seen=0 and
+  // refetches the same publication, not a newly signed command/deadline.
+  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  const auto retry = fixture.driver->emergency_stop_bridge(request);
+  expect(retry.at("frame_json") == response.at("frame_json") &&
+      retry.at("valid_for_ms").get<int>() < response.at("valid_for_ms").get<int>(),
+      "unqueued STOP refetch changed signed bytes or renewed publication window");
   const auto payload = Json::parse(response.at("frame_json").get<std::string>());
   expect(payload.at("estop") == true && payload.at("brake") == 1.0 && verify_transport_message(payload, fixture.signing_key, false), "native emergency bytes were forged or not stop-only");
   const auto result = fixture.apply(payload, ControlPath::DataChannel); // Production MAC/stop receiver + real common safety service.
+  const auto applied_sequence = fixture.result_seq;
+  expect(fixture.apply(payload, ControlPath::Wss) == result && fixture.result_seq == applied_sequence,
+      "same signed STOP on backup WSS reapplied rather than returning its cached result");
   request["last_seen_seq"] = payload.at("seq"); request["vehicle_result"] = result;
   const auto confirmed = fixture.driver->emergency_stop_bridge(request);
   expect(confirmed.at("software_latched_confirmed") == true && confirmed.at("physical_execution_confirmed") == false &&
@@ -604,6 +614,14 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
   auto tampered = result; tampered["software_estop_latched"] = false; request["vehicle_result"] = tampered;
   bool rejected = false; try { static_cast<void>(fixture.driver->emergency_stop_bridge(request)); } catch (const std::invalid_argument&) { rejected = true; }
   expect(rejected, "page could forge an emergency software result");
+  request.erase("vehicle_result"); request["last_seen_seq"] = 0;
+  std::this_thread::sleep_for(std::chrono::milliseconds(retry.at("valid_for_ms").get<int>() + 1));
+  expect(!wss_finished.load() && fixture.driver->emergency_stop_bridge(request).at("frame").is_null(),
+      "original unqueued publication remained fetchable past100ms or WSS stall precondition ended");
+  expect(press_stop().at("accepted") == true, "new explicit STOP intent rejected");
+  const auto latest = fixture.driver->emergency_stop_bridge(request);
+  expect(latest.at("frame").at("seq").get<std::uint64_t>() > payload.at("seq").get<std::uint64_t>() &&
+      latest.at("frame_json") != response.at("frame_json"), "native bridge returned old STOP instead of the new explicit latest publication");
 }
 }  // namespace
 int main(int argc, char** argv) {

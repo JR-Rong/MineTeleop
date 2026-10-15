@@ -1850,7 +1850,14 @@ const emergencyStopCourier=MineTeleopControlTransport.createEmergencyCourier({
   scope:()=>latestRuntimeStatus.native_control?.emergency_stop_capability===MineTeleopControlTransport.emergencyProtocol&&polling&&nativeControlSessionId&&mediaOfferScope?.id?{
     session:nativeControlSessionId,generation:nativeControlSessionGeneration,ui:uiInstanceId,uiEpoch:nativeControlUiEpoch,
     attempt:mediaOfferScope.id,ready:Boolean(controlChannel?.readyState==='open')}:null,
-  post,now:()=>performance.now(),send:bytes=>{if(controlChannel?.readyState==='open'&&Number(controlChannel.bufferedAmount)<=Math.max(0,Number(controlChannel.bufferedAmountLowThreshold)||0))controlChannel.send(bytes)},
+  post,now:()=>performance.now(),send:bytes=>{
+    const channel=controlChannel;
+    if(channel?.readyState!=='open')return;
+    const buffered=Number(channel.bufferedAmount),threshold=Number(channel.bufferedAmountLowThreshold);
+    if(!Number.isFinite(buffered)||buffered<0||!Number.isFinite(threshold)||threshold<0)return;
+    if(buffered>threshold)return MineTeleopControlTransport.emergencyBackpressure;
+    channel.send(bytes);return true;
+  },
   onConfirmation:seq=>{clientLog('driver_emergency_software_latched',{command_seq:seq,physical_execution_confirmed:false});statusPanel.textContent='车端已锁存急停；执行机构状态仍需查看新鲜 CAN 反馈。'},
 });
 setInterval(()=>emergencyStopCourier.tick().catch(error=>clientLog('emergency_stop_bridge_error',{error:error.message})),25);

@@ -7,6 +7,9 @@
   const protocol = 'native-control-transport-v1';
   const feedbackProtocol = 'native-feedback-transport-v1';
   const emergencyProtocol = 'native-stop-only-v1';
+  // Only this exact local marker means send was not called due to buffer
+  // pressure. False/undefined, exceptions and missing ACKs never request retry.
+  const emergencyBackpressure = Object.freeze({reason:'buffered_amount_above_threshold'});
   function createEmergencyCourier({scope, post, now, send, onConfirmation = () => {}}) {
     let busy=false,key='',lastSeen=0,lastConfirmed=0,result=null;
     const scopeKey=value=>JSON.stringify([value.session,value.generation,value.ui,value.uiEpoch,value.attempt]);
@@ -40,12 +43,15 @@
         }
         const frame=response.frame;
         if(!frame||!Number.isSafeInteger(frame.seq)||frame.seq<=lastSeen)return;
-        lastSeen=frame.seq; // No catch-up, regeneration or cross-epoch retry.
+        const previousSeen=lastSeen;
+        lastSeen=frame.seq; // Discard by default, including invalid/expired frames and send errors.
         if(response.enabled!==true||!latest.ready||frame.session_id!==latest.session||frame.estop!==true||
             frame.throttle!==0||frame.steering!==0||frame.brake!==1||frame.emergency_stop?.protocol!==emergencyProtocol||
             frame.emergency_stop.media_attempt!==latest.attempt||typeof response.frame_json!=='string'||response.frame_json.length>64*1024||
             !Number.isFinite(response.valid_for_ms)||response.valid_for_ms<=0||now()-started>=response.valid_for_ms)return;
-        send(response.frame_json);
+        if(send(response.frame_json)===emergencyBackpressure)lastSeen=previousSeen;
+        // Refetch only the current native publication on the existing tick;
+        // never cache bytes, regenerate a timestamp or retry an enqueued frame.
       } finally {busy=false}
     }
     return Object.freeze({tick,receive});
@@ -133,5 +139,5 @@
     }
     return Object.freeze({tick, receive, negotiated: () => negotiated, activePath: () => path, epoch: () => epoch, feedback: () => feedback});
   }
-  return Object.freeze({protocol, feedbackProtocol, emergencyProtocol, createCourier, createEmergencyCourier});
+  return Object.freeze({protocol, feedbackProtocol, emergencyProtocol, emergencyBackpressure, createCourier, createEmergencyCourier});
 });

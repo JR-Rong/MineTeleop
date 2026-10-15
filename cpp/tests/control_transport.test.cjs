@@ -1,4 +1,6 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const api = require('../web/control_transport.js');
 function fixture() {
   let time = 0, current = {session:'s',generation:7,ui:'owner',uiEpoch:2,attempt:'a',ready:true};
@@ -141,7 +143,92 @@ test('emergency result mailbox keeps advancing current-session results during HT
   f.setReply(f.response);await f.courier.tick();assert.equal(f.requests[1].body.vehicle_result.command_seq,2);
   assert.equal(f.courier.receive({...result(3),session_id:'retired'}),false);
 });
+// Extract the actual shipped callback and threshold, so a fixture cannot silently
+// replace the production 1024-byte low watermark with the old review's zero.
+function emergencyBufferFixture(overrideSend) {
+  const source=fs.readFileSync(path.join(__dirname,'../src/server.cpp'),'utf8');
+  const section=source.slice(source.indexOf('const emergencyStopCourier='),source.indexOf('setInterval(()=>emergencyStopCourier.tick()'));
+  const prefix='post,now:()=>performance.now(),send:bytes=>';
+  const start=section.indexOf(prefix);assert.ok(start>=0,'shipped emergency callback missing');
+  const body=section.slice(start+prefix.length,section.indexOf('\n  onConfirmation:',start)).trim().replace(/,$/,'');
+  const threshold=Number(source.match(/channel\.bufferedAmountLowThreshold=(\d+);/)[1]);assert.equal(threshold,1024);
+  let time=0,current={session:'s',generation:7,ui:'owner',uiEpoch:2,attempt:'a',ready:true},publication,replyHook=null,enabled=true;
+  const nativeScope={...current},requests=[],sent=[];
+  const channel={readyState:'open',bufferedAmount:threshold+1,bufferedAmountLowThreshold:threshold,send:bytes=>sent.push(bytes)};
+  const send=overrideSend||new Function('controlChannel','MineTeleopControlTransport',`return bytes=>${body}`)(channel,api);
+  function publish(seq=1) {
+    const frame={seq,intent_seq:seq*7,session_id:'s',sent_at_utc_ms:123+time,estop:true,throttle:0,steering:0,brake:1,
+      native_mac:`immutable-fixture-mac-${seq}`,emergency_stop:{protocol:api.emergencyProtocol,media_attempt:'a',reset_epoch:0,authority:{issuer:'fixture',authority_epoch:4,lease_seq:2}}};
+    publication={frame,bytes:JSON.stringify(frame),published:time};return publication;
+  }
+  publish();
+  const courier=api.createEmergencyCourier({scope:()=>current,now:()=>time,send,post:async(_url,request)=>{
+    requests.push(request);
+    const scoped=request.source_session_id===nativeScope.session&&request.source_control_session_generation===nativeScope.generation&&
+      request.ui_instance_id===nativeScope.ui&&request.ui_control_epoch===nativeScope.uiEpoch&&request.media_negotiation_id===nativeScope.attempt;
+    const age=time-publication.published;
+    const available=enabled&&scoped&&request.dc_ready&&age>=0&&age<100&&publication.frame.seq>request.last_seen_seq;
+    const response={protocol:api.emergencyProtocol,enabled,valid_for_ms:available?100-age:0,
+      frame:available?publication.frame:null,frame_json:available?publication.bytes:null};
+    return replyHook?replyHook(response):response;
+  }});
+  return {courier,channel,requests,sent,publish,scope:()=>current,setScope:value=>current=value,setTime:value=>time=value,
+    setReplyHook:value=>replyHook=value,setEnabled:value=>enabled=value,publication:()=>publication};
+}
+test('R5 actual 1025-byte backpressure preserves the same unqueued STOP until recovery, then consumes once',async()=>{
+  const f=emergencyBufferFixture(),original=f.publication();await f.courier.tick();assert.equal(f.sent.length,0);
+  f.setTime(25);f.channel.bufferedAmount=0;await f.courier.tick();
+  assert.equal(f.requests[1].last_seen_seq,0,'COUNTEREXAMPLE R5: skipped send consumed the still-valid original STOP');
+  assert.deepEqual(f.sent,[original.bytes]);assert.equal(f.publication(),original,'courier regenerated publication');
+  f.setTime(50);await f.courier.tick();assert.equal(f.requests[2].last_seen_seq,1);assert.equal(f.sent.length,1,'missing ACK caused an enqueued STOP retry');
+});
+test('R5 actual 1024-byte threshold sends once and unknown outcomes or throws never qualify for retry',async()=>{
+  const ready=emergencyBufferFixture();ready.channel.bufferedAmount=1024;await ready.courier.tick();
+  ready.setTime(25);await ready.courier.tick();assert.equal(ready.sent.length,1);
+  for(const outcome of [undefined,false,0,'backpressure',{reason:'buffered_amount_above_threshold'},Promise.resolve(api.emergencyBackpressure)]) {
+    let calls=0;const f=emergencyBufferFixture(()=>{calls++;return outcome});f.channel.bufferedAmount=0;
+    await f.courier.tick();f.setTime(25);await f.courier.tick();assert.equal(calls,1,'unknown callback result retried');
+    assert.equal(f.requests[1].last_seen_seq,1);
+  }
+  const thrown=emergencyBufferFixture();thrown.channel.bufferedAmount=0;let calls=0;
+  thrown.channel.send=()=>{calls++;throw new Error('fixture send failed')};
+  await assert.rejects(thrown.courier.tick(),/fixture send failed/);thrown.setTime(25);await thrown.courier.tick();
+  assert.equal(calls,1,'throwing send retried');assert.equal(thrown.requests[1].last_seen_seq,1);
+});
+test('R5 recovery never extends the original 100ms publication or reuses an expired reply',async()=>{
+  const f=emergencyBufferFixture(),original=f.publication();await f.courier.tick();
+  f.setTime(100);f.channel.bufferedAmount=0;await f.courier.tick();assert.equal(f.requests[1].last_seen_seq,0);
+  assert.equal(f.sent.length,0);assert.equal(f.publication(),original);
+  const delayed=emergencyBufferFixture();await delayed.courier.tick();delayed.setTime(99);delayed.channel.bufferedAmount=0;
+  delayed.setReplyHook(response=>{assert.equal(response.valid_for_ms,1);delayed.setTime(100);return response});
+  await delayed.courier.tick();assert.equal(delayed.sent.length,0,'HTTP delay renewed original publication');
+});
+test('R5 a newer native STOP replaces the blocked frame without catch-up or resigning',async()=>{
+  const f=emergencyBufferFixture(),old=f.publication();await f.courier.tick();f.setTime(10);const latest=f.publish(2);
+  f.setTime(25);f.channel.bufferedAmount=0;await f.courier.tick();
+  assert.deepEqual(f.sent,[latest.bytes]);assert.notEqual(latest.bytes,old.bytes);assert.equal(f.publication(),latest);
+  f.setTime(50);await f.courier.tick();assert.equal(f.requests[2].last_seen_seq,2);assert.equal(f.sent.length,1);
+});
+test('R5 a blocked STOP cannot cross current session generation page or media scope, including a late HTTP reply',async()=>{
+  for(const patch of [{session:'other'},{generation:8},{ui:'replacement'},{uiEpoch:3},{attempt:'new'}]) {
+    const f=emergencyBufferFixture();await f.courier.tick();f.setTime(25);f.channel.bufferedAmount=0;
+    let complete;f.setReplyHook(response=>new Promise(resolve=>complete=()=>resolve(response)));
+    const pending=f.courier.tick();await f.courier.tick();assert.equal(f.requests.length,2,'overlapping HTTP fetch');
+    f.setScope({...f.scope(),...patch});complete();await pending;assert.equal(f.sent.length,0);
+    f.setReplyHook(null);await f.courier.tick();assert.equal(f.sent.length,0,'old native scope leaked after replacement');
+  }
+  const disabled=emergencyBufferFixture();await disabled.courier.tick();disabled.setTime(25);disabled.channel.bufferedAmount=0;
+  disabled.setEnabled(false);await disabled.courier.tick();assert.equal(disabled.sent.length,0,'cached frame bypassed native eligibility');
+});
+test('R5 a closed channel or invalid buffer evidence is terminal rather than guessed backpressure',async()=>{
+  for(const patch of [{readyState:'closed'},{bufferedAmount:NaN},{bufferedAmount:Infinity},{bufferedAmount:-1},{bufferedAmountLowThreshold:NaN}]) {
+    const f=emergencyBufferFixture();Object.assign(f.channel,{bufferedAmount:0,...patch});await f.courier.tick();assert.equal(f.sent.length,0);
+    Object.assign(f.channel,{readyState:'open',bufferedAmount:0,bufferedAmountLowThreshold:1024});f.setTime(25);await f.courier.tick();
+    assert.equal(f.requests[1].last_seen_seq,1);assert.equal(f.sent.length,0,'unknown channel state retried');
+  }
+});
 (async()=>{
-  for(const {name,action} of cases){await action();console.log('PASS '+name)}
-  console.log(`${cases.length} transport courier cases passed; no sockets`);
+  const selected=process.argv.includes('--r5-only')?cases.filter(value=>value.name.startsWith('R5 ')):cases;
+  for(const {name,action} of selected){await action();console.log('PASS '+name)}
+  console.log(`${selected.length} transport courier cases passed; no sockets`);
 })().catch(error=>{console.error(error);process.exitCode=1});
