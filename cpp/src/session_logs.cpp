@@ -340,19 +340,25 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources, const Js
         const std::string attempt = value.contains("recording_attempt_id") && value.at("recording_attempt_id").is_string()
             ? value.at("recording_attempt_id").get<std::string>() : "";
         const bool recording_completion = recording_scope && kind == "vehicle_recording_attempt_finished" && safe_name(attempt);
-        if (!trace_batch && timestamp && (timestamp < begin || (timestamp > end && !recording_completion))) continue;
-        if (!timestamp) { ++unattributed; continue; }
         if (source.require_session_id && record_id != id) continue;
-        if (record_id.empty()) ++unscoped;
         if (source.require_session_id && value.contains("service_instance_id") &&
             value["service_instance_id"] != session.at("service_instance_id")) continue;
-        // SIDs can repeat after a cloud restart. The ordinary +/-2s log tail
-        // must not grant a new recording attempt authority over this session.
+        // SIDs can repeat after a cloud restart. Only the producer's start
+        // timestamp may anchor an attempt inside the actual session. Launcher
+        // logged_at is relay time and can be late or on a different clock.
+        const auto reported = value.find("reported_at_utc_ms");
         if (recording_scope && kind == "vehicle_recording_attempt_started" && safe_name(attempt) &&
-            timestamp >= session_started && timestamp <= session_ended) {
-          recording_attempts.insert(attempt);
-          if (recording_attempts.size() > kAttemptLimit) { limited = true; break; }
+            reported != value.end() && reported->is_number_integer() &&
+            (!reported->is_number_unsigned() || reported->get<std::uint64_t>() <= INT64_MAX)) {
+          const auto produced_at = reported->get<std::int64_t>();
+          if (produced_at >= session_started && produced_at <= session_ended) {
+            recording_attempts.insert(attempt);
+            if (recording_attempts.size() > kAttemptLimit) { limited = true; break; }
+          }
         }
+        if (!trace_batch && timestamp && (timestamp < begin || (timestamp > end && !recording_completion))) continue;
+        if (!timestamp) { ++unattributed; continue; }
+        if (record_id.empty()) ++unscoped;
         if (value.value("event", "") == "desktop_log_dropped" ||
             (value.contains("details") && value["details"].is_object() &&
              value["details"].value("dropped_since_last", 0LL) > 0)) dropped = true;

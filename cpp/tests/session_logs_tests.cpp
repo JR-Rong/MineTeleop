@@ -90,6 +90,35 @@ void recording_terminal_failure_after_session_end() {
   check(evidence.at("attempt_fence").at("kind") == "finished" &&
         evidence.at("attempt_fence").at("reported_at_utc_ms") == finished_at,
         "completion failure did not retain its actual terminal observation time");
+  // The packaged launcher timestamps stdout when it relays it. Its delay
+  // cannot move a real attempt out of this session or a later attempt into it.
+  auto delayed_start = started;
+  delayed_start["logged_at_utc_ms"] = session.at("ended_at_utc_ms").get<std::int64_t>() + 3000;
+  delayed_start["relay_marker"] = "delayed-start-remains-outside-ordinary-log-window";
+  auto misleading_relay = reused_start;
+  misleading_relay["logged_at_utc_ms"] = session.at("started_at_utc_ms");
+  auto missing_producer_start = started;
+  missing_producer_start["recording_attempt_id"] = "missing-producer-time";
+  missing_producer_start.erase("reported_at_utc_ms");
+  missing_producer_start["logged_at_utc_ms"] = session.at("started_at_utc_ms");
+  auto missing_producer_finished = finished;
+  missing_producer_finished["recording_attempt_id"] = "missing-producer-time";
+  missing_producer_finished["driver_id"] = "missing-producer-must-not-export";
+  write(dir.path / "runtime.log", finished.dump() + "\n" + reused_session.dump() + "\n" +
+      misleading_relay.dump() + "\n" + missing_producer_finished.dump() + "\n" +
+      missing_producer_start.dump() + "\n" + delayed_start.dump() + "\n");
+  const auto delayed_snapshot = dir.path / "delayed/runtime.log";
+  collect_session_logs({{dir.path / "runtime.log", "runtime.log"}}, session, dir.path / "delayed");
+  const auto delayed_export = read(delayed_snapshot);
+  check(delayed_export.find("\"recording_attempt_id\":\"attempt-current\"") != std::string::npos,
+        "launcher relay delay hid a valid producer-time attempt anchor");
+  check(delayed_export.find("other-driver-must-not-export") == std::string::npos &&
+        delayed_export.find("missing-producer-must-not-export") == std::string::npos,
+        "launcher timestamps authorized a late completion without an in-session producer-time anchor");
+  check(delayed_export.find("delayed-start-remains-outside-ordinary-log-window") == std::string::npos,
+        "producer-time anchoring widened the ordinary log UTC window");
+  check(collect_session_recording_evidence(dir.path / "recordings", session, {}, delayed_snapshot, true)
+            .at("evidence_status") == "incomplete", "relay delay hid actual terminal failure evidence");
   // Even a positive disk snapshot cannot erase explicit terminal negative
   // evidence for that same attempt, including equal/coarse wall timestamps.
   auto conflicting = recording_summary(session);
