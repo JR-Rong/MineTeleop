@@ -128,11 +128,14 @@ def scenario(binary, output, name, environment):
         "vehicle": {"id": "synthetic-vehicle"},
         "cloud": {"signaling_url": f"http://127.0.0.1:{fixture.server_port}"},
         "runtime": {"control_enabled": False, "media_enabled": True, "teleop_poll_interval_ms": 20},
+        "control": {"timeout_action": {"deceleration_profile": [
+            {"after_ms": 0, "brake": 0.3}, {"after_ms": 500, "brake": 0.6},
+            {"after_ms": 1500, "brake": "vehicle_defined_max_safe"}]}},
         "media": {"realtime_profiles": {"synthetic": {"width": 160, "height": 120,
                     "fps": 20, "bitrate_kbps": 200}}},
         "cameras": [{"id": "synthetic-camera", "device": "testsrc", "realtime_profile": "synthetic"}],
         "field_safety": {"commissioning_mode": "bench", "max_speed_kph": 0, "require_time_sync": True},
-        "hardware": {"can": {"interface": "synthetic-no-can"}},
+        "hardware": {"can": {"interface": "test-no-can"}, "encoding": {}, "network": {}},
         "vehicle_adapter": {"type": "mock"},
         "recording": {"enabled": False}, "upload": {"enabled": False},
     }))
@@ -155,6 +158,8 @@ def scenario(binary, output, name, environment):
             if name in {"unauthorized", "invalid-sample"}:
                 if code is not None:
                     assert code == 2 and registered == 0, "invalid initial clock must fail before registration"
+                    assert fixture.faulted and fixture.time_requests == 1, "negative case exited before its time endpoint injection"
+                    assert "vehicle_media_time_sync_failed" in names, "negative case did not fail in production time synchronization"
                     assert "vehicle_media_time_sync_retry" not in names, "nontransport sample failure was retried"
                     break
             elif name == "always-timeout":
@@ -216,7 +221,9 @@ def main():
         try:
             results.append(scenario(binary, output, name, environment))
         except (AssertionError, OSError, subprocess.SubprocessError) as error:
-            results.append({"scenario": name, "passed": False, "error": str(error)})
+            results.append({"scenario": name, "passed": False, "error": str(error),
+                            "stdout_tail": (output / name / "runtime.stdout").read_text(errors="replace")[-6000:],
+                            "stderr_tail": (output / name / "runtime.stderr").read_text(errors="replace")[-2000:]})
     (output / "result.json").write_text(json.dumps(results, indent=2) + "\n")
     print(json.dumps(results))
     return 0 if all(result["passed"] for result in results) else 1
