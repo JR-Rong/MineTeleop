@@ -465,6 +465,8 @@ struct CloudConfig {
 [[nodiscard]] bool ice_transport_policy_is_valid(std::string_view value);
 
 struct VehicleRuntimeConfig {
+  // Internal only: zero keeps the reviewed default closed. Not YAML-loaded.
+  int experimental_direct_authority_max_ms{0};
   bool control_enabled{true};
   bool media_enabled{true};
   bool control_log_commands{false};

@@ -20,6 +20,7 @@
 #include "mine_teleop/detail/vehicle_result_latency_window.hpp"
 #include "mine_teleop/detail/control_transport.hpp"
 #include "mine_teleop/detail/control_transport_sender.hpp"
+#include "mine_teleop/detail/direct_authority.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/websocket.hpp"
@@ -111,6 +112,10 @@ struct SignalingServerConfig {
   std::int64_t approver_token_ttl_ms{12 * 60 * 60 * 1000};
   std::int64_t token_ttl_ms{30 * 60 * 1000};
   std::int64_t control_token_ttl_ms{5 * 60 * 1000};
+  // Internal review-only configuration. Zero disables short direct authority;
+  // no YAML/CLI activation. A stable exclusive durable journal is mandatory.
+  std::int64_t experimental_direct_authority_lease_ms{0};
+  std::filesystem::path experimental_direct_authority_journal;
   std::int64_t vehicle_heartbeat_timeout_ms{15 * 1000};
   std::int64_t driver_heartbeat_timeout_ms{15 * 1000};
   std::int64_t connection_reaper_interval_ms{250};
@@ -199,6 +204,7 @@ class SignalingService {
     SessionState state{SessionState::Online};
     std::string control_token;
     std::string transport_mac_key; // Never serialized by Session::to_json or logs.
+    bool direct_authority_enabled{false};
     std::int64_t control_token_expires_at_ms{0};
     std::uint64_t relay_bytes_sent{0};
     std::uint64_t relay_bytes_received{0};
@@ -272,6 +278,9 @@ class SignalingService {
   void close_sessions_for_driver(std::string_view driver_id, std::string_view reason);
   void transition_session(Session& session, SessionState next, std::string_view reason);
   void close_session(Session& session, std::string_view reason);
+  void persist_direct_authority_state(const Json& snapshot);
+  [[nodiscard]] ServerResponse handle_direct_authority_post(const HttpRequest& request);
+  [[nodiscard]] bool direct_authority_vehicle_reserved(std::string_view vehicle) const;
   std::string approver_login_bucket(const HttpRequest& request, std::int64_t timestamp_ms);
   void enforce_login_rate_limit(std::string_view driver_id, std::int64_t timestamp_ms, bool approver = false);
   void record_login_failure(std::string_view driver_id, std::int64_t timestamp_ms, bool approver = false);
@@ -284,6 +293,11 @@ class SignalingService {
 
   SignalingServerConfig config_;
   std::string service_instance_id_;
+  std::shared_ptr<void> direct_authority_journal_lock_;
+  std::mutex direct_authority_write_mutex_;
+  Json direct_authority_journal_ = Json::object();
+  std::unordered_map<std::string, std::int64_t> direct_authority_reservations_;
+  std::uint64_t direct_authority_next_epoch_{0};
   std::string diagnostic_fingerprint_key_;
   std::function<std::int64_t()> audit_clock_;
   mutable std::mutex mutex_;
@@ -360,6 +374,7 @@ struct DriverConfig {
   // Internal opt-in for controlled validation; no YAML/CLI activation until
   // the direct-control cloud-authority failure policy has been reviewed.
   bool enable_experimental_control_transport{false};
+  bool enable_experimental_direct_authority{false};
   std::filesystem::path browser_event_log_path;
   std::uint64_t browser_event_log_max_bytes{2 * 1024 * 1024};
   int browser_event_log_files{3};
@@ -445,6 +460,7 @@ class DriverConsoleRuntime {
   void time_sync_loop(std::stop_token stop_token);
   [[nodiscard]] bool send_native_control_sample();
   void poll_native_control_acknowledgements();
+  [[nodiscard]] bool direct_control_continuation_available_locked();
   [[nodiscard]] bool drain_native_control_acknowledgements_locked(
       std::string_view session, std::string_view identity, std::string_view vehicle,
       Json& drained_acknowledgements);
@@ -511,6 +527,8 @@ class DriverConsoleRuntime {
   std::string session_creator_ui_instance_id_;
   std::string control_token_;
   std::string control_transport_mac_key_;
+  detail::DirectAuthorityLease direct_authority_;
+  std::mutex direct_authority_mutex_;
   std::int64_t control_token_expires_at_ms_{0};
   std::int64_t control_token_renew_at_ms_{0};
   std::uint64_t sequence_{0};

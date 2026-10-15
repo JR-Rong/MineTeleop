@@ -28,7 +28,7 @@
         const response = await post('/api/control-transport/bridge', {
           source_session_id: current.session, source_control_session_generation: current.generation,
           media_negotiation_id: current.attempt, ui_instance_id: current.ui, ui_control_epoch: current.uiEpoch,
-          dc_ready: current.ready === true, last_seen_seq: lastSeen,
+          dc_ready: current.ready === true, dc_network_path: current.networkPath || "unknown", last_seen_seq: lastSeen,
           ...(sentResult ? {vehicle_result: sentResult} : {}),
         });
         const latest = scope();

@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <deque>
+#include <filesystem>
 #include <iostream>
 #include <thread>
 
@@ -24,14 +25,26 @@ struct Fixture {
   HttpClient http;
   WebSocketClient vehicle_socket;
   ControlTransportFence fence;
+  DirectAuthorityLease car_authority;
+  std::mutex car_mutex;
+  std::jthread car_watchdog;
+  std::filesystem::path authority_directory;
+  bool direct_enabled{false}, cloud_online{true};
+  std::uint64_t lease_nonce{0};
   std::string base, session, control_token, signing_key;
   std::uint64_t generation{0}, ui_epoch{0}, intent_seq{0}, result_seq{0}, last_dc_seq{0};
   std::uint64_t wss_commands{0}, dc_commands{0};
   std::int64_t last_input{0};
   std::deque<std::pair<std::int64_t, Json>> delayed;
   std::vector<Json> received_statuses;
-  explicit Fixture() {
+  explicit Fixture(bool direct = false) : direct_enabled(direct) {
     SignalingServerConfig config;
+    if (direct_enabled) {
+      authority_directory = std::filesystem::temp_directory_path() / ("mine-direct-loopback-" + std::to_string(steady()));
+      std::filesystem::create_directory(authority_directory);
+      config.experimental_direct_authority_lease_ms = 600; // REVIEW fixture only; all product defaults remain disabled.
+      config.experimental_direct_authority_journal = authority_directory / "authority.json";
+    }
     config.driver_passwords = {{"transport-driver", "fixture-password"}};
     config.device_tokens = {{"transport-vehicle", "fixture-device"}};
     config.driver_vehicle_permissions = {{"transport-driver", {"transport-vehicle"}}};
@@ -45,6 +58,7 @@ struct Fixture {
         {"native_control_capabilities", kNativeControlCapabilities}});
     generation = online.at("connection_generation").get<std::uint64_t>();
     DriverConfig driver_config; driver_config.enable_experimental_control_transport = true; driver_config.driver_id = "transport-driver"; driver_config.signaling_url = base;
+    driver_config.enable_experimental_direct_authority = direct_enabled;
     driver = std::make_unique<DriverConsoleRuntime>(driver_config, "transport-vehicle", "fixture-password");
     const auto connected = driver->connect("transport-vehicle", "owner");
     expect(!connected.contains("transport_mac_key"), "local UI connect response exposed signing material");
@@ -53,6 +67,10 @@ struct Fixture {
         {{"X-Mine-Teleop-Device-Token", "fixture-device"}});
     control_token = discovered.at("control_token").get<std::string>();
     signing_key = discovered.at("transport_mac_key").get<std::string>();
+    if (direct_enabled) {
+      const auto& authority = discovered.at("direct_authority_configuration");
+      car_authority.configure(authority.at("issuer").get<std::string>(), "transport-vehicle", "transport-driver", session, generation, 600);
+    }
     auto config_vehicle = load_vehicle_config("configs/vehicle-agent.dev.yaml"); config_vehicle.vehicle_id = "transport-vehicle";
     vehicle = std::make_unique<test::LogicalTimeControlService>(config_vehicle, "transport-driver", session,
         control_token, std::make_unique<MockVehicleAdapter>());
@@ -72,8 +90,49 @@ struct Fixture {
     static_cast<void>(http.post_json_response(base + "/signaling/" + session + "/messages", offer));
     static_cast<void>(driver->poll_signaling());
     input();
+    if (direct_enabled) {
+      renew_authority(true);
+      car_watchdog = std::jthread([this](std::stop_token token) {
+        while (!token.stop_requested()) {
+          { std::lock_guard lock(car_mutex);
+            if (car_authority.observe_expiry(steady())) vehicle->set_control_braking_wait(true, utc(), ControlRecoveryCause::ControlLink);
+            vehicle->tick(utc()); }
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      });
+    }
   }
-  ~Fixture() { driver.reset(); vehicle_socket.close(); server->stop(); vehicle->close(); }
+  ~Fixture() {
+    driver.reset(); car_watchdog.request_stop(); if (car_watchdog.joinable()) car_watchdog.join();
+    vehicle_socket.close(); server->stop(); vehicle->close(); cloud.reset();
+    if (!authority_directory.empty()) std::filesystem::remove_all(authority_directory);
+  }
+  void renew_authority(bool force = false) {
+    if (!direct_enabled || !cloud_online) return;
+    const auto nonce = "fixture-nonce-" + std::to_string(++lease_nonce);
+    std::uint64_t retired = 0;
+    { std::lock_guard lock(car_mutex);
+      if (!force && !car_authority.renewal_due(steady())) return;
+      if (!car_authority.valid(steady()) && car_authority.reference().is_object()) retired = car_authority.reference().at("authority_epoch").get<std::uint64_t>();
+      car_authority.begin_request(nonce, steady()); }
+    const auto grant = http.post_json_response(base + "/vehicles/transport-vehicle/direct-authority", {
+        {"device_token", "fixture-device"}, {"connection_generation", generation}, {"session_id", session},
+        {"nonce", nonce}, {"maximum_duration_ms", 600}, {"retired_authority_epoch", retired}});
+    std::lock_guard lock(car_mutex);
+    expect(car_authority.accept_authenticated_cloud(grant, steady(), utc(), 0), "vehicle did not accept real cloud short grant");
+  }
+  void stop_cloud() { cloud_online = false; server->stop(); vehicle_socket.close(); delayed.clear(); }
+  void restore_cloud() {
+    const auto port = server->port();
+    server = std::make_unique<SimpleHttpServer>("127.0.0.1", port,
+        [this](const HttpRequest& request) { return cloud->handle(request); }, 8 * 1024 * 1024,
+        [this](SocketHandle socket, const HttpRequest& request) { return cloud->handle_websocket(socket, request); });
+    server->start();
+    vehicle_socket.connect(signaling_websocket_url(base, session, "transport-vehicle", std::to_string(generation)) +
+        "&types=control_command&transport_protocol=" + std::string(kControlTransportCapability),
+        {{"X-Mine-Teleop-Device-Token", "fixture-device"}});
+    cloud_online = true;
+  }
   void input() {
     const auto status = driver->status();
     auto result = driver->update_control_intent({{"session_id", session}, {"session_generation", status.at("control_session_generation")},
@@ -88,13 +147,16 @@ struct Fixture {
     const auto status = driver->status();
     return {{"source_session_id", session}, {"source_control_session_generation", status.at("control_session_generation")},
         {"media_negotiation_id", "media-a"}, {"ui_instance_id", "owner"}, {"ui_control_epoch", ui_epoch},
-        {"dc_ready", ready}, {"last_seen_seq", last_dc_seq}};
+        {"dc_ready", ready}, {"dc_network_path", direct_enabled ? "p2p" : "unknown"}, {"last_seen_seq", last_dc_seq}};
   }
   Json apply(const Json& payload, ControlPath path) {
+    std::lock_guard lock(car_mutex);
     if (payload.contains("control_transport")) expect(verify_transport_message(payload, signing_key, false), "native byte authentication failed");
     const auto command = ControlCommand::from_json(payload);
-    const auto decision = fence.admit(command, payload.contains("control_transport") ? &payload.at("control_transport") : nullptr,
-        path, "media-a", utc(), utc() + 10000, 200, true);
+    ControlTransportFence::Decision decision{false, false, "direct_authority_unavailable"};
+    if (!direct_enabled || command.estop || car_authority.allows(payload.value("direct_authority", Json(nullptr)), steady()))
+      decision = fence.admit(command, payload.contains("control_transport") ? &payload.at("control_transport") : nullptr,
+          path, "media-a", utc(), utc() + 10000, 200, !direct_enabled || car_authority.valid(steady()));
     ReceiveResult applied;
     if (decision.admitted) {
       if (decision.changed) vehicle->set_control_braking_wait(true, utc(), ControlRecoveryCause::ControlLink);
@@ -108,12 +170,14 @@ struct Fixture {
             payload.at("control_transport").at("action") == "select"}, {"authority_epoch", fence.epoch()},
         {"reason", decision.admitted ? applied.reason : std::string(decision.reason)}};
     if (payload.contains("control_transport")) result["control_transport"] = payload.at("control_transport");
+    if (direct_enabled) result["direct_authority"] = car_authority.status(steady());
     result["vehicle_mac"] = transport_message_mac(result, signing_key, true);
     return result;
   }
   void pump(bool dc_ready) {
+    renew_authority();
     if (steady() - last_input >= 60) input();
-    const auto received = vehicle_socket.receive_json(std::chrono::milliseconds(1));
+    const auto received = cloud_online ? vehicle_socket.receive_json(std::chrono::milliseconds(1)) : WebSocketReceiveResult{};
     if (received.status == WebSocketReceiveStatus::Message && received.message.value("event", "") == "signaling_messages") {
       const auto& messages = received.message.at("messages");
       const auto& payload = messages.back().at("payload");
@@ -125,7 +189,7 @@ struct Fixture {
       // actual vehicle result is slower than the simulated DC byte path.
       delayed.emplace_back(steady() + 60, std::move(result));
     }
-    while (!delayed.empty() && delayed.front().first <= steady()) {
+    while (cloud_online && !delayed.empty() && delayed.front().first <= steady()) {
       vehicle_socket.send_json(delayed.front().second); delayed.pop_front();
     }
     auto request = scope(dc_ready);
@@ -178,8 +242,51 @@ void integration() {
     expect(fixture.received_statuses[index].at("session_id") == fixture.session, "WSS status lost session scope");
   }
 }
+
+void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
+  Fixture fixture(true);
+  const auto ready_deadline = steady() + 8000;
+  bool ready = false;
+  while (steady() < ready_deadline) {
+    fixture.pump(true);
+    const auto authority = fixture.driver->status().at("native_control").at("control_transport").at("direct_authority");
+    if (authority.value("continuation_available", false)) { ready = true; break; }
+  }
+  expect(ready, "real native producer never established a healthy short-authorized direct continuation");
+  fixture.renew_authority(true);
+  const auto refresh_deadline = steady() + 1000;
+  std::int64_t remaining = 0;
+  while (steady() < refresh_deadline) {
+    fixture.pump(true);
+    const auto authority = fixture.driver->status().at("native_control").at("control_transport").at("direct_authority");
+    remaining = authority.value("remaining_ms", std::int64_t{0});
+    if (authority.value("continuation_available", false) && remaining > 400) break;
+  }
+  expect(remaining > 400, "fixture did not observe a fresh vehicle-accepted grant before outage");
+  const auto before = fixture.dc_commands;
+  fixture.stop_cloud(); // Actual localhost HTTP/WSS sockets close, not just a boolean in the sender.
+  const auto outage_deadline = steady() + 100;
+  while (steady() < outage_deadline) fixture.pump(true);
+  const auto during = fixture.driver->status().at("native_control").at("control_transport");
+  expect(fixture.dc_commands > before && during.at("path") == "dc" && during.at("direct_authority").value("valid", false),
+      "healthy direct command/result stream stopped solely because cloud sockets closed inside the accepted lease");
+  fixture.restore_cloud(); fixture.renew_authority(true);
+  const auto recovered_deadline = steady() + 1000;
+  while (steady() < recovered_deadline) {
+    fixture.pump(true);
+    if (fixture.driver->status().at("native_control").at("control_transport").at("direct_authority").value("remaining_ms", 0) > 400) break;
+  }
+  expect(fixture.driver->status().at("native_control").at("control_transport").at("path") == "dc", "cloud recovery displaced a healthy preferred direct path");
+  fixture.stop_cloud();
+  // No pump/status dependency here: native may be stuck reconnecting to dead
+  // WSS. The vehicle expiry/watchdog runs on its own thread as in production.
+  std::this_thread::sleep_for(std::chrono::milliseconds(700));
+  { std::lock_guard lock(fixture.car_mutex);
+    expect(!fixture.car_authority.valid(steady()) && (fixture.vehicle->control_braking_wait() || fixture.vehicle->safety_state() == SafetyState::TimeoutBrake),
+        "cloud silence left vehicle authorization/motion live past independent deadline"); }
+}
 }  // namespace
 int main() {
-  try { integration(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed; loopback only, no WebRTC or hardware proof\n"; }
+  try { integration(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including real cloud socket outage and short authority; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

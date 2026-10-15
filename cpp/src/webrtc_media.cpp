@@ -1,5 +1,6 @@
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/detail/control_transport.hpp"
+#include "mine_teleop/detail/direct_authority.hpp"
 
 #include "mine_teleop/gstreamer_media.hpp"
 #include "mine_teleop/detail/gstreamer_freshness.hpp"
@@ -351,6 +352,7 @@ class MediaSignalingClient {
         connection_id_(std::move(connection_id)),
         http_(std::chrono::seconds(5), resolve_entries, ca_bundle),
         time_sync_http_(std::chrono::milliseconds(500), resolve_entries, ca_bundle),
+        direct_resolve_entries_(resolve_entries), direct_ca_bundle_(ca_bundle),
         sequence_(sequence ? std::move(sequence) : std::make_shared<MediaSignalingSequence>()) {
     if (vehicle_id_.empty() || device_token_.empty()) throw std::invalid_argument("vehicle id and device token are required");
     if (connection_id_.empty()) {
@@ -426,13 +428,14 @@ class MediaSignalingClient {
     driver_id_ = response.value("driver_id", "");
     control_token_ = response.value("control_token", "");
     transport_mac_key_ = response.value("transport_mac_key", "");
+    direct_authority_configuration_ = response.value("direct_authority_configuration", Json(nullptr));
     control_lease_expires_at_ms_.store(response.value("control_token_expires_at_utc_ms", std::int64_t{0}));
     return !session_id_.empty() && !driver_id_.empty() && !control_token_.empty();
   }
 
   Json poll(std::string_view types) {
     require_session();
-    return http_.get_json(
+    return (direct_session_http_ ? *direct_session_http_ : http_).get_json(
         origin_ + "/signaling/" + http_.url_encode(session_id_) + "/messages?recipient=" +
             http_.url_encode(vehicle_id_) + "&connection_generation=" + std::to_string(connection_generation_) +
             "&types=" + http_.url_encode(types),
@@ -486,7 +489,7 @@ class MediaSignalingClient {
     request["connection_generation"] = connection_generation_;
     request["type"] = type;
     request["payload"] = payload;
-    static_cast<void>(http_.post_json_response(
+    static_cast<void>((direct_session_http_ ? *direct_session_http_ : http_).post_json_response(
         origin_ + "/signaling/" + http_.url_encode(session_id_) + "/messages",
         request));
   }
@@ -495,6 +498,17 @@ class MediaSignalingClient {
   [[nodiscard]] const std::string& driver_id() const { return driver_id_; }
   [[nodiscard]] const std::string& control_token() const { return control_token_; }
   [[nodiscard]] const std::string& transport_mac_key() const { return transport_mac_key_; }
+  [[nodiscard]] const Json& direct_authority_configuration() const { return direct_authority_configuration_; }
+  void bound_direct_session_requests(int budget_ms) {
+    direct_session_http_ = std::make_unique<HttpClient>(std::chrono::milliseconds(std::max(1, budget_ms / 3)), direct_resolve_entries_, direct_ca_bundle_);
+  }
+  Json renew_direct_authority(std::string nonce, int maximum_duration_ms, std::uint64_t retired_epoch) {
+    require_session();
+    HttpClient bounded(std::chrono::milliseconds(std::max(1, maximum_duration_ms / 3)), direct_resolve_entries_, direct_ca_bundle_);
+    return bounded.post_json_response(origin_ + "/vehicles/" + bounded.url_encode(vehicle_id_) + "/direct-authority",
+        {{"device_token", device_token_}, {"connection_generation", connection_generation_}, {"session_id", session_id_},
+         {"nonce", std::move(nonce)}, {"maximum_duration_ms", maximum_duration_ms}, {"retired_authority_epoch", retired_epoch}});
+  }
   [[nodiscard]] std::int64_t control_lease_expiry() const { return control_lease_expires_at_ms_.load(); }
   void observe_lease(std::int64_t expiry) { if (expiry > 0) control_lease_expires_at_ms_.store(expiry); }
 
@@ -524,6 +538,10 @@ class MediaSignalingClient {
   std::string driver_id_;
   std::string control_token_;
   std::string transport_mac_key_;
+  Json direct_authority_configuration_;
+  std::unique_ptr<HttpClient> direct_session_http_;
+  std::vector<std::string> direct_resolve_entries_;
+  std::filesystem::path direct_ca_bundle_;
   std::atomic<std::int64_t> control_lease_expires_at_ms_{0};
   std::shared_ptr<MediaSignalingSequence> sequence_;
   std::mutex send_mutex_;
@@ -1440,8 +1458,12 @@ struct VehicleMediaRuntime::Impl {
       if (message.value("type", "") == "session_control_profile") {
         const auto request = SessionControlProfileRequest::from_json(message);
         std::lock_guard lock(control_mutex);
-        if (transport != ControlMessageTransport::DataChannel && !control_transport_fence.negotiated()) { ++rejected_control_commands; return; }
+        if (transport != ControlMessageTransport::DataChannel && !control_transport_fence.negotiated() && !direct_authority.valid(steady_now_ms())) { ++rejected_control_commands; return; }
         if (transport == ControlMessageTransport::DataChannel && control_channel != channel) return;
+        if (config.runtime.experimental_direct_authority_max_ms > 0 &&
+            (transport == ControlMessageTransport::DataChannel || !direct_authority.valid(steady_now_ms()))) {
+          ++rejected_control_commands; return; // Parameter changes require a live authenticated cloud delivery.
+        }
         SessionControlProfileResult result;
         if (stop_requested || control_inhibited || !control_service_started ||
             !control_service || (!control_link_open && !control_transport_fence.negotiated())) {
@@ -1477,12 +1499,16 @@ struct VehicleMediaRuntime::Impl {
       if (message.value("event", "") == "vcu_handshake_command") {
         const auto action = message.value("action", "");
         std::lock_guard lock(control_mutex);
-        if (transport != ControlMessageTransport::DataChannel && !control_transport_fence.negotiated()) { ++rejected_control_commands; return; }
+        if (transport != ControlMessageTransport::DataChannel && !control_transport_fence.negotiated() && !direct_authority.valid(steady_now_ms())) { ++rejected_control_commands; return; }
         if (transport == ControlMessageTransport::DataChannel && control_channel != channel) return;
         if (stop_requested || control_inhibited || !control_service_started ||
             !control_service || (!control_link_open && !control_transport_fence.negotiated())) {
           send_vcu_handshake_status_locked("driver_not_connected");
           return;
+        }
+        if (action == "connect" && config.runtime.experimental_direct_authority_max_ms > 0 &&
+            (transport == ControlMessageTransport::DataChannel || !direct_authority.valid(steady_now_ms()))) {
+          ++rejected_control_commands; send_vcu_handshake_status_locked("authority_cloud_delivery_required"); return;
         }
         bool accepted = false;
         try {
@@ -1570,6 +1596,7 @@ struct VehicleMediaRuntime::Impl {
         std::lock_guard result_lock(control_mutex);
         result_message["result_seq"] = ++control_result_seq;
         result_message["authority_epoch"] = control_transport_fence.epoch();
+        if (direct_authority.configured()) result_message["direct_authority"] = direct_authority.status(steady_now_ms());
         if (signaling.transport_mac_key().size() >= 32)
           result_message["vehicle_mac"] = detail::transport_message_mac(result_message, signaling.transport_mac_key(), true);
         latest_control_result = result_message;
@@ -1755,12 +1782,17 @@ struct VehicleMediaRuntime::Impl {
         return;
       }
       if (transport == ControlMessageTransport::DataChannel && control_channel != channel) return;
+      if (!command.estop && config.runtime.experimental_direct_authority_max_ms > 0 &&
+          (!direct_authority.configured() || !direct_authority.allows(message.value("direct_authority", Json(nullptr)), steady_now_ms()))) {
+        ++rejected_control_commands; result_message["reason"] = "direct_authority_unavailable"; return;
+      }
       if (message.contains("control_transport") || control_transport_fence.negotiated()) {
         const auto decision = control_transport_fence.admit(command,
             message.contains("control_transport") ? &message.at("control_transport") : nullptr,
             transport == ControlMessageTransport::DataChannel ? detail::ControlPath::DataChannel : detail::ControlPath::Wss,
             current_attempt, signaling.now_ms(), signaling.control_lease_expiry(), config.control.max_command_gap_ms,
-            native_control_websocket_connected.load() && native_control_transport_cloud_capable.load());
+            direct_authority.configured() ? direct_authority.valid(steady_now_ms()) :
+                (native_control_websocket_connected.load() && native_control_transport_cloud_capable.load()));
         result_message["reason"] = decision.reason;
         result_message["transport_admitted"] = decision.admitted;
         result_message["transport_selected"] = decision.admitted && message.contains("control_transport") &&
@@ -2596,6 +2628,17 @@ struct VehicleMediaRuntime::Impl {
     // Media-only deployments still refresh their capture timestamp clock.
     time_sync_worker = std::jthread([this](std::stop_token token) { time_sync_loop(token); });
     if (!config.runtime.control_enabled) return;
+    if (config.runtime.experimental_direct_authority_max_ms > 0) {
+      signaling.bound_direct_session_requests(config.runtime.experimental_direct_authority_max_ms);
+      const auto& authority = signaling.direct_authority_configuration();
+      if (!authority.is_object() || authority.value("protocol", "") != detail::kDirectAuthorityCapability ||
+          authority.at("maximum_duration_ms").get<int>() > config.runtime.experimental_direct_authority_max_ms ||
+          config.runtime.experimental_direct_authority_max_ms > config.control.control_timeout_ms)
+        throw std::invalid_argument("experimental direct authority capability/budget mismatch");
+      direct_authority.configure(authority.at("issuer").get<std::string>(), config.vehicle_id, signaling.driver_id(), signaling.session_id(),
+          authority.at("connection_generation").get<std::uint64_t>(), config.runtime.experimental_direct_authority_max_ms);
+      direct_authority_worker = std::jthread([this](std::stop_token token) { direct_authority_loop(token); });
+    }
     {
       std::lock_guard lock(control_mutex);
       native_control_last_accepted_fresh_gear.reset();
@@ -2622,6 +2665,7 @@ struct VehicleMediaRuntime::Impl {
   }
 
   void stop_native_control_transport_threads() {
+    if (direct_authority_worker.joinable()) direct_authority_worker.request_stop();
     if (time_sync_worker.joinable()) time_sync_worker.request_stop();
     if (native_control_websocket_thread.joinable()) {
       native_control_websocket_thread.request_stop();
@@ -2636,6 +2680,52 @@ struct VehicleMediaRuntime::Impl {
       native_control_watchdog_thread.join();
     }
     if (time_sync_worker.joinable()) time_sync_worker.join();
+    if (direct_authority_worker.joinable()) direct_authority_worker.join();
+  }
+
+  void direct_authority_loop(std::stop_token token) {
+    std::int64_t next_attempt_ms = 0;
+    while (!token.stop_requested() && !stop_requested.load()) {
+      bool due;
+      { std::lock_guard lock(control_mutex); due = direct_authority.renewal_due(steady_now_ms()) && steady_now_ms() >= next_attempt_ms; }
+      if (due) {
+        const auto nonce = random_token(12);
+        try {
+          std::uint64_t retired_epoch = 0;
+          { std::lock_guard lock(control_mutex);
+            if (!direct_authority.valid(steady_now_ms()) && direct_authority.reference().is_object()) retired_epoch = direct_authority.reference().value("authority_epoch", std::uint64_t{0});
+            direct_authority.begin_request(nonce, steady_now_ms()); }
+          next_attempt_ms = steady_now_ms() + config.runtime.experimental_direct_authority_max_ms / 3;
+          const auto response = signaling.renew_direct_authority(nonce, config.runtime.experimental_direct_authority_max_ms, retired_epoch);
+          const auto clock = signaling.time_sync_status();
+          std::lock_guard lock(control_mutex);
+          const auto revision = direct_authority.rearm_revision();
+          const bool accepted = clock.acceptable(config.field_safety.max_time_sync_uncertainty_ms) &&
+              direct_authority.accept_authenticated_cloud(response, steady_now_ms(), signaling.now_ms(), clock.uncertainty_ms);
+          if (accepted) next_attempt_ms = 0;
+          // A delayed or conservatively expired response grants nothing. The
+          // next authenticated request retires the observed expired epoch;
+          // only a new epoch can recover the vehicle after that boundary.
+          if (accepted && revision != direct_authority.rearm_revision() && control_service_started && control_service) {
+            invalidate_native_control_trusted_gear_locked();
+            control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+          }
+        } catch (const HttpStatusError& error) {
+          // An authenticated denial is a revocation, never a network grace.
+          if (error.status() == 401 || error.status() == 403 || error.status() == 404 || error.status() == 409) {
+            std::lock_guard lock(control_mutex); direct_authority.revoke();
+            if (control_service_started && control_service) control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+          }
+        } catch (const HttpTransportError&) {
+          // No refresh. The independent watchdog enforces the old deadline.
+        } catch (const std::exception&) {
+          std::lock_guard lock(control_mutex); direct_authority.revoke();
+          if (control_service_started && control_service) control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
+        }
+      }
+      // Existing watchdog cadence, not a cloud liveness heartbeat/deadline.
+      std::this_thread::sleep_for(kNativeControlWatchdogInterval);
+    }
   }
 
   std::uint64_t send_control_command_rejected_locked(
@@ -3340,6 +3430,10 @@ struct VehicleMediaRuntime::Impl {
     std::unique_lock lock(control_mutex);
     if (stop_requested || control_inhibited || !control_service_started || !control_service) return;
     const auto timestamp_ms = signaling.now_ms();
+    if (direct_authority.observe_expiry(steady_now_ms())) {
+      invalidate_native_control_trusted_gear_locked();
+      control_service->set_control_braking_wait(true, timestamp_ms, ControlRecoveryCause::ControlLink);
+    }
     try {
       control_service->tick(timestamp_ms);
       observe_control_hard_stop_locked(timestamp_ms);
@@ -4178,7 +4272,7 @@ struct VehicleMediaRuntime::Impl {
         const auto seq = message.value("seq", std::uint64_t{0});
         bool allowed = false;
         { std::lock_guard control_lock(control_mutex);
-          allowed = control_transport_fence.negotiated() && native_control_websocket_connected.load() &&
+          allowed = (control_transport_fence.negotiated() || direct_authority.valid(steady_now_ms())) && native_control_websocket_connected.load() &&
               native_control_transport_cloud_capable.load() && signaling.control_lease_expiry() > now &&
               payload.value("protocol", "") == detail::kControlTransportCapability &&
               payload.value("session_id", "") == signaling.session_id() && payload.value("vehicle_id", "") == config.vehicle_id &&
@@ -4678,6 +4772,17 @@ struct VehicleMediaRuntime::Impl {
           flush_outgoing_signals();
           process_signaling();
         } catch (const std::exception& error) {
+          bool preserve_direct = false;
+          if (detail::transient_cloud_failure(error)) {
+            std::lock_guard lock(control_mutex);
+            const auto now = steady_now_ms();
+            const auto last = native_control_last_accepted_monotonic_ms.load();
+            preserve_direct = direct_authority.valid(now) && control_transport_fence.path() == detail::ControlPath::DataChannel &&
+                control_link_open && !control_inhibited && control_service_started && control_service &&
+                control_service->safety_state() == SafetyState::ControlActive && last > 0 && now >= last &&
+                now - last < config.control.degraded_timeout_ms && vehicle_time_readiness().ready;
+          }
+          if (!preserve_direct) {
           emit_diagnostic(
               "vehicle_media_signaling_failed",
               "session_signaling_exchange_failed",
@@ -4687,6 +4792,9 @@ struct VehicleMediaRuntime::Impl {
               true,
               {{"safety_action", "local_full_stop"}});
           throw;
+          }
+          // Preserve only the already-authorized healthy PC; no grant, ICE
+          // restart, VCU connect or parameter increase can occur offline.
         }
         poll_bus();
         if (!current_pipeline_error().empty()) break;
@@ -4963,6 +5071,7 @@ struct VehicleMediaRuntime::Impl {
   GstElement* pipeline{nullptr};
   GstElement* webrtc{nullptr};
   detail::ControlTransportFence control_transport_fence;
+  detail::DirectAuthorityLease direct_authority;
   Json latest_control_result;
   std::map<std::string, Json> pending_control_status;
   std::uint64_t last_control_management_seq{0};
@@ -5010,6 +5119,7 @@ struct VehicleMediaRuntime::Impl {
   std::jthread native_control_watchdog_thread;
   std::jthread native_control_websocket_thread;
   std::jthread time_sync_worker;
+  std::jthread direct_authority_worker;
   bool control_service_started{false};
   std::string control_service_issue_code;
   std::atomic<bool> control_link_open{false};

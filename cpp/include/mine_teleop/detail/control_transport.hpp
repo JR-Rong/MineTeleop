@@ -103,6 +103,11 @@ inline Json bounded_vehicle_control_result(const Json& value, std::string_view s
   if (reason.size() > 128) throw std::invalid_argument("vehicle result reason is too long");
   result["reason"] = reason;
   if (value.contains("vehicle_mac")) result["vehicle_mac"] = value.at("vehicle_mac");
+  if (value.contains("direct_authority")) {
+    if (!value.at("direct_authority").is_object() || value.at("direct_authority").dump().size() > 4096)
+      throw std::invalid_argument("invalid direct authority result");
+    result["direct_authority"] = value.at("direct_authority");
+  }
   if (value.contains("control_transport"))
     result["control_transport"] = ControlTransportStamp::from_json(value.at("control_transport")).to_json();
   return result;

@@ -15,6 +15,7 @@ class ControlTransportSender {
  public:
   struct Receipt { bool matched{false}; bool boundary{false}; std::int64_t round_trip_ms{0}; bool current{false}; };
   void reset() { *this = {}; }
+  void set_data_channel_is_p2p(bool value) { dc_is_p2p_ = value; }
   [[nodiscard]] ControlPath path() const { return stamp_.path; }
   [[nodiscard]] bool negotiated() const { return stamp_.epoch != 0; }
   [[nodiscard]] bool selecting() const { return selecting_; }
@@ -36,7 +37,8 @@ class ControlTransportSender {
     ++revision_;
   }
 
-  // Optional performance trial uses actual WSS results as baseline, and holds
+  // Healthy proven P2P is preferred even if WSS is momentarily faster.
+  // Relay/unknown DC retains real-result comparison against WSS. A trial holds
   // motion until DC also has three actual accepted neutral command results.
   // A trial runs once per media attempt; it never equates ICE/probe RTT to ACK.
   bool consider_dc(std::string_view attempt, std::int64_t now, int timeout_ms) {
@@ -45,8 +47,8 @@ class ControlTransportSender {
         (last_wss_result_ms_ < 0 || now - last_wss_result_ms_ > NativeControlAckRecovery::kStallMs ||
          last_wss_result_age_ms_ > NativeControlAckRecovery::kFreshAckMs);
     if (attempt.empty() || path() != ControlPath::Wss || holding_motion() ||
-        (!wss_.healthy(now) && !unhealthy_wss) ||
-        (trial_attempt_ == attempt && (!unhealthy_wss || now < next_trial_ms_))) return false;
+        (!dc_is_p2p_ && !wss_.healthy(now) && !unhealthy_wss) ||
+        (trial_attempt_ == attempt && (now < next_trial_ms_ || (!dc_is_p2p_ && !unhealthy_wss)))) return false;
     trial_attempt_ = attempt;
     begin(ControlPath::DataChannel, std::string(attempt), now, timeout_ms);
     return true;
@@ -117,7 +119,7 @@ class ControlTransportSender {
       auto& health = sent.path == ControlPath::Wss ? wss_ : dc_;
       health.add(age, now);
       if (qualifying_ && !selecting_ && sent.path == ControlPath::DataChannel && sent.neutral && dc_.healthy(now)) {
-        if (baseline_wss_ms_ && dc_.mean() && *dc_.mean() >= *baseline_wss_ms_) {
+        if (!dc_is_p2p_ && baseline_wss_ms_ && dc_.mean() && *dc_.mean() >= *baseline_wss_ms_) {
           begin(ControlPath::Wss, {}, now, timeout_ms);
         } else { qualifying_ = false; ++revision_; }
         receipt.boundary = true;
@@ -129,7 +131,7 @@ class ControlTransportSender {
   Json status() const {
     return {{"protocol", kControlTransportCapability}, {"epoch", stamp_.epoch},
         {"path", control_path_name(path())}, {"media_attempt", attempt()}, {"selecting", selecting_},
-        {"qualifying", qualifying_}, {"revision", revision_}, {"retained_sends", sent_.size()},
+        {"qualifying", qualifying_}, {"dc_path_is_p2p", dc_is_p2p_}, {"revision", revision_}, {"retained_sends", sent_.size()},
         {"wss_result_mean_ms", wss_.mean() ? Json(*wss_.mean()) : Json(nullptr)},
         {"dc_result_mean_ms", dc_.mean() ? Json(*dc_.mean()) : Json(nullptr)}};
   }
@@ -148,7 +150,7 @@ class ControlTransportSender {
   };
   struct Sent { std::uint64_t seq, intent; ControlPath path; Json stamp; std::int64_t started; bool neutral, estop; };
   ControlTransportStamp stamp_;
-  bool selecting_{false}, qualifying_{false};
+  bool selecting_{false}, qualifying_{false}, dc_is_p2p_{false};
   std::uint64_t remote_epoch_{0}, revision_{0}, last_result_seq_{0};
   std::int64_t deadline_{0}, last_dc_result_ms_{-1}, first_wss_sent_ms_{-1}, next_trial_ms_{0}, last_wss_result_ms_{-1}, last_wss_result_age_ms_{0};
   std::string trial_attempt_;

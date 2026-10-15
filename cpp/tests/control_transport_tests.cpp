@@ -118,6 +118,27 @@ void cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial() {
   expect(!sender.consider_dc("media-a", 502, 5000), "failed candidate retried without debounce");
 }
 
+void healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup() {
+  ControlTransportSender initial; initial.set_data_channel_is_p2p(true);
+  expect(initial.consider_dc("media-a", 0, 5000) && initial.holding_motion(), "default proven direct path waited for cloud performance baseline");
+  ControlTransportSender sender; sender.set_data_channel_is_p2p(true); baseline(sender);
+  expect(sender.consider_dc("media-a", 200, 5000), "direct trial lost after faster WSS baseline");
+  for (std::uint64_t seq = 4; seq <= 6; ++seq) {
+    auto frame = payload(seq, seq * 50); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, seq * 50);
+    expect(sender.note_result(response(frame, true, seq == 4), seq * 50 + 80, 5000).matched, "healthy direct qualification lost");
+  }
+  expect(sender.path() == ControlPath::DataChannel && !sender.holding_motion(), "healthy direct path never qualified");
+  expect(!sender.observe(true, "media-a", 450, 5000) && sender.path() == ControlPath::DataChannel,
+      "healthy direct path left merely because cloud might be faster");
+  expect(sender.observe(false, "media-a", 451, 5000) && sender.path() == ControlPath::Wss,
+      "direct preference prevented genuine cloud fallback");
+  expect(!sender.consider_dc("media-a", 452, 5000), "direct failure retried without existing recovery debounce");
+  auto fallback = payload(7, 452); sender.decorate(fallback); sender.note_sent(fallback, ControlPath::Wss, 452);
+  expect(sender.note_result(response(fallback, true, true), 472, 5000).matched && !sender.selecting(),
+      "fallback did not complete its own epoch barrier before another trial");
+  expect(sender.consider_dc("media-a", 5451, 5000), "recovered direct candidate was never retried");
+}
+
 void signatures_bind_native_bytes_and_vehicle_results() {
   const std::string key = "01234567890123456789012345678901"; // Public test vector, never a deployed key.
   expect(control_transport_mac("abc", key) == "d5c75dc69d8243aa0882a04342d9ff7c73537a0311a7950800607be225594009", "SHA256 MAC disagrees with independent test vector");
@@ -216,7 +237,7 @@ void real_service_switch_does_not_disable_watchdog() {
 int main() {
   try {
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
-    slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "9 control transport cases passed; real common safety service, no sockets\n";
+    slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
+    std::cout << "10 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
