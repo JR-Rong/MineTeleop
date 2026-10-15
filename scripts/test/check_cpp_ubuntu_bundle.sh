@@ -39,6 +39,7 @@ for required_path in \
   "$package_name/bin/mine-teleop-run" \
   "$package_name/bin/mine-teleop-recorder" \
   "$package_name/bin/mine-teleop-aravis-camera" \
+  "$package_name/lib/gstreamer-1.0/libgstvideorate.so" \
   "$package_name/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
   "$package_name/lib/vendor/chassis/libchassis_control.so" \
   "$package_name/config/vehicle-agent.yaml" \
@@ -103,9 +104,13 @@ container_id="$(docker create --platform linux/amd64 --network none \
     ldd "$root/bin/mine-teleop-recorder" > /tmp/recorder-runtime-ldd.txt
     ! grep -q "not found" /tmp/recorder-runtime-ldd.txt
     "$root/bin/mine-teleop-recorder" --help | grep -F "mine-teleop-recorder" >/dev/null
-    for plugin in webrtcbin srtpenc sctpenc sctpdec dtlsenc dtlsdec nicesrc v4l2src va nvcodec h264parse rtph264pay appsrc appsink splitmuxsink mp4mux filesink h265parse; do
+    for plugin in webrtcbin srtpenc sctpenc sctpdec dtlsenc dtlsdec nicesrc v4l2src va nvcodec h264parse rtph264pay appsrc appsink splitmuxsink mp4mux filesink h265parse videorate; do
       "$root/bin/gst-inspect-1.0" "$plugin" >/dev/null
     done
+    "$root/bin/gst-launch-1.0" -q videotestsrc num-buffers=30 \
+      "!" "video/x-raw,format=UYVY,width=64,height=48,framerate=30/1" \
+      "!" videorate drop-only=true max-rate=20 "!" videoconvert "!" videoscale \
+      "!" "video/x-raw,format=NV12,width=64,height=48,framerate=20/1" "!" fakesink sync=false
   ')"
 docker cp "$archive" "$container_id:/tmp/mine-teleop-bundle.tar.gz"
 docker start --attach "$container_id"

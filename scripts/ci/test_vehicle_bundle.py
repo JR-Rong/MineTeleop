@@ -18,6 +18,7 @@ PACKAGE = "mine-teleop-vehicle-ubuntu22.04-x64-fixture"
 PACKAGE_FILES = (
     "bin/mine-teleop", "bin/mine-teleop-run", "bin/mine-teleop-recorder",
     "bin/mine-teleop-aravis-camera", "lib/vendor/chassis/libmine_teleop_chassis_bridge.so",
+    "lib/gstreamer-1.0/libgstvideorate.so",
     "lib/vendor/chassis/libchassis_control.so", "config/vehicle-agent.yaml",
     "config/mine-teleop-field-root.crt", "deployments/udev/99-mine-teleop-basler.rules",
     "scripts/setup_basler_usb_access.sh", "BUILD-INFO.txt", "README.txt",
@@ -69,6 +70,14 @@ class VehicleBundleAdmissionTests(unittest.TestCase):
         invocation = self.marker.read_text()
         self.assertIn("create --platform linux/amd64 --network none", invocation)
         self.assertNotIn("ubuntu_bundle_check=passed", result.stdout)
+
+    def test_missing_videorate_is_rejected_before_any_runtime_check(self):
+        relative = "lib/gstreamer-1.0/libgstvideorate.so"
+        self.package(omit=relative)
+        result = self.check()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("required bundle path is missing: " + PACKAGE + "/" + relative, result.stderr)
+        self.assertFalse(self.marker.exists(), "missing videorate reached Docker execution")
 
     def test_missing_checksum_is_rejected_before_any_runtime_check(self):
         self.package()

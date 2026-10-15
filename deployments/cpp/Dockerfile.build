@@ -77,6 +77,7 @@ RUN meson setup /tmp/gstreamer-build /tmp/gstreamer \
          -Dgst-plugins-base:app=enabled \
          -Dgst-plugins-base:typefind=enabled \
          -Dgst-plugins-base:videoconvertscale=enabled \
+         -Dgst-plugins-base:videorate=enabled \
          -Dgst-plugins-base:videotestsrc=enabled \
          -Dgst-plugins-good:isomp4=enabled \
          -Dgst-plugins-good:jpeg=enabled \
@@ -345,15 +346,21 @@ RUN set -e; \
       /bundle/bin/mine-teleop-run version; \
       /bundle/bin/mine-teleop-run config-check --config /bundle/config/vehicle-agent.yaml; \
       LD_LIBRARY_PATH=/bundle/lib /bundle/bin/mine-teleop-aravis-camera --list --json | grep -q '"device_count":0'; \
+      export GST_REGISTRY=/tmp/mine-teleop-bundle-plugin-registry.bin; \
       GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib /bundle/bin/gst-inspect-1.0 srtpenc >/dev/null; \
       GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib \
         /bundle/bin/gst-launch-1.0 -q fakesrc num-buffers=1 sizetype=fixed sizemax=100 filltype=zero \
         '!' 'application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96,ssrc=(uint)1' \
         '!' srtpenc random-key=true '!' fakesink; \
-      for plugin in webrtcbin sctpenc sctpdec dtlsenc dtlsdec v4l2src va h264parse rtph264pay; do \
+      for plugin in webrtcbin sctpenc sctpdec dtlsenc dtlsdec v4l2src va h264parse rtph264pay videorate; do \
         GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib \
           /bundle/bin/gst-inspect-1.0 "$plugin" >/dev/null; \
       done; \
+      GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib \
+        /bundle/bin/gst-launch-1.0 -q videotestsrc num-buffers=30 \
+        '!' 'video/x-raw,format=UYVY,width=64,height=48,framerate=30/1' \
+        '!' videorate drop-only=true max-rate=20 '!' videoconvert '!' videoscale \
+        '!' 'video/x-raw,format=NV12,width=64,height=48,framerate=20/1' '!' fakesink sync=false; \
     fi
 
 FROM ubuntu:22.04 AS runtime
