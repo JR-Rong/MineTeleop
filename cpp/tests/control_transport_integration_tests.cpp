@@ -614,11 +614,17 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
   expect(response.at("frame_json").is_string(), "blocked WSS prevented fetching already-published emergency bytes");
   // R5: a browser that proved it did not call send retains last_seen=0 and
   // refetches the same publication, not a newly signed command/deadline.
-  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  // The JS courier's 25ms retry tick has separate deterministic coverage. A
+  // host sleep here can overshoot the unchanged 100ms native publication and
+  // turn a correct expiry into a false "changed bytes" failure on busy runners.
+  const auto refetch_started = steady();
   const auto retry = fixture.driver->emergency_stop_bridge(request);
-  expect(retry.at("frame_json") == response.at("frame_json") &&
-      retry.at("valid_for_ms").get<int>() < response.at("valid_for_ms").get<int>(),
-      "unqueued STOP refetch changed signed bytes or renewed publication window");
+  const auto refetch_evidence = Json{{"elapsed_ms", steady() - refetch_started},
+      {"first_valid_for_ms", response.at("valid_for_ms")}, {"retry_valid_for_ms", retry.at("valid_for_ms")},
+      {"same_signed_bytes", retry.at("frame_json") == response.at("frame_json")}};
+  if (retry.at("frame_json") != response.at("frame_json") ||
+      retry.at("valid_for_ms").get<int>() > response.at("valid_for_ms").get<int>())
+    throw std::runtime_error("unqueued STOP refetch changed signed bytes or renewed publication window: " + refetch_evidence.dump());
   const auto payload = Json::parse(response.at("frame_json").get<std::string>());
   expect(payload.at("estop") == true && payload.at("brake") == 1.0 && verify_transport_message(payload, fixture.signing_key, false), "native emergency bytes were forged or not stop-only");
   const auto result = fixture.apply(payload, ControlPath::DataChannel); // Production MAC/stop receiver + real common safety service.
@@ -641,9 +647,10 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
   const auto latest = fixture.driver->emergency_stop_bridge(request);
   expect(latest.at("frame").at("seq").get<std::uint64_t>() > payload.at("seq").get<std::uint64_t>() &&
       latest.at("frame_json") != response.at("frame_json"), "native bridge returned old STOP instead of the new explicit latest publication");
+  std::cout << "[STOP_REFETCH] " << refetch_evidence.dump() << '\n';
 }
 }  // namespace
 int main(int argc, char** argv) {
-  try { if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
