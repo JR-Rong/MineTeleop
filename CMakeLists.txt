@@ -728,6 +728,14 @@ if(MINE_TELEOP_BUILD_TESTS)
           --output-dir ${CMAKE_CURRENT_BINARY_DIR}/control-smoke-loopback-results
       )
       set_tests_properties(mine-teleop-control-smoke-loopback PROPERTIES TIMEOUT 30)
+      add_test(
+        NAME mine-teleop-media-time-sync-retry-loopback
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/media_time_sync_retry_loopback.py
+          --binary $<TARGET_FILE:mine-teleop>
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}/media-time-sync-retry-results
+      )
+      set_tests_properties(mine-teleop-media-time-sync-retry-loopback PROPERTIES TIMEOUT 45)
     endif()
     add_test(
       NAME mine-teleop-vehicle-runtime-log-relay
