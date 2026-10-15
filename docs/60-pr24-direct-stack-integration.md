@@ -46,3 +46,9 @@ GStreamer与六平台以提交后同head CI为准。每次CI的SHA、运行/产�
 CAN/VCU及物理停车尚待协调验收，媒体HTTP/控制生命周期耦合仍未解决。
 
 测试线继续使用原f901冻结包；新版本仅在该轮结束并由主线程安排后接包。
+
+首轮769e4ad的Windows x64 CI在Json与std::string_view直接比较时报MSVC
+重载歧义。后续修正显式读取JSON字符串再作身份/path比较；非字符串身份
+仍报原scope invalid_argument，字段、签名、路径选择和时限不变。该轮
+Linux/GStreamer整程序编译已通过；Windows红灯及后续同head CI分别保存，
+不能将前一提交的编译/测试结果归给后一提交。

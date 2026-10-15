@@ -97,7 +97,7 @@ class ControlTransportSender {
     Receipt receipt{true, false, age};
     const auto actual_epoch = result.at("authority_epoch").get<std::uint64_t>();
     if (selecting_ && !sent.stamp.is_null() && sent.stamp.at("epoch") == stamp_.epoch &&
-        sent.stamp.at("path") == control_path_name(stamp_.path)) {
+        sent.stamp.at("path").get_ref<const std::string&>() == control_path_name(stamp_.path)) {
       remote_epoch_ = actual_epoch;
       if (result.at("transport_selected").get<bool>() && actual_epoch == stamp_.epoch) {
         selecting_ = false; stamp_.select = false; ++revision_; receipt.boundary = true;
@@ -109,7 +109,7 @@ class ControlTransportSender {
     }
     const bool current = (!negotiated() && sent.stamp.is_null() && sent.path == ControlPath::Wss) ||
         (!sent.stamp.is_null() && sent.stamp.at("epoch") == stamp_.epoch &&
-         sent.stamp.at("path") == control_path_name(stamp_.path) && sent.stamp.at("media_attempt") == stamp_.media_attempt);
+         sent.stamp.at("path").get_ref<const std::string&>() == control_path_name(stamp_.path) && sent.stamp.at("media_attempt") == stamp_.media_attempt);
     receipt.current = current;
     if (current && sent.path == ControlPath::Wss) { last_wss_result_ms_ = now; last_wss_result_age_ms_ = age; }
     if (current && sent.path == ControlPath::DataChannel && result.at("transport_admitted").get<bool>())

@@ -200,6 +200,13 @@ void bounded_status_rejects_unsupported_kinds_and_scope_mismatch() {
       "authenticated status lost normalized session identity");
   auto invalid = status; invalid["status"]["driver_id"] = "other";
   throws([&] { bounded_vehicle_control_status(invalid, "session-001", "vehicle-001", "driver-001"); });
+  for (const auto* identity : {"session_id", "vehicle_id", "driver_id"}) {
+    invalid = status; invalid["status"][identity] = 7;
+    bool rejected = false;
+    try { static_cast<void>(bounded_vehicle_control_status(invalid, "session-001", "vehicle-001", "driver-001")); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "non-string status identity did not fail closed with the same scope error");
+  }
   invalid = status; invalid["status"]["event"] = "control_command";
   throws([&] { bounded_vehicle_control_status(invalid, "session-001", "vehicle-001", "driver-001"); });
   invalid = status; invalid["status"]["control_status_seq"] = 0;

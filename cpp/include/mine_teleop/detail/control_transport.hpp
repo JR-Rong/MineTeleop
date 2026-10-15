@@ -146,7 +146,8 @@ inline Json bounded_vehicle_control_status(const Json& value, std::string_view s
       ControlTransportStamp::uint(message, "control_status_seq") == 0 || message.dump().size() > 48 * 1024)
     throw std::invalid_argument("vehicle status kind or size is invalid");
   for (const auto& [key, expected] : {std::pair{"session_id", session}, {"vehicle_id", vehicle}, {"driver_id", driver}}) {
-    if (message.contains(key) && message.at(key) != expected) throw std::invalid_argument("vehicle status identity mismatch");
+    if (message.contains(key) && (!message.at(key).is_string() || message.at(key).get_ref<const std::string&>() != expected))
+      throw std::invalid_argument("vehicle status identity mismatch");
     message[key] = expected;
   }
   Json result = {{"event", "vehicle_control_status"}, {"protocol", kControlTransportCapability},
