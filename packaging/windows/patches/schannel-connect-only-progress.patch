@@ -1,0 +1,62 @@
+--- a/lib/vtls/schannel.c
++++ b/lib/vtls/schannel.c
+@@ -1844,6 +1844,11 @@
+            called every second */
+         if(!timeout || timeout > 1000)
+           timeout = 1000;
++        /* connect-only callers own an absolute send deadline/stop callback.
++           Do not hide it behind the normal one-second renegotiation wait. */
++        if(data->set.connect_only && data->set.fxferinfo &&
++           !data->progress.hide && timeout > 1)
++          timeout = 1;
+
+         if(timeout > remaining)
+           timeout = remaining;
+@@ -1988,6 +1993,12 @@
+       size_t this_write = 0;
+       int what;
+       timediff_t timeout_ms = Curl_timeleft(data, NULL, FALSE);
++      const bool caller_deadline = data->set.connect_only &&
++        data->set.fxferinfo && !data->progress.hide;
++      if(caller_deadline && Curl_pgrsUpdate(data)) {
++        result = CURLE_ABORTED_BY_CALLBACK;
++        break;
++      }
+       if(timeout_ms < 0) {
+         /* we already got the timeout */
+         failf(data, "schannel: timed out sending data "
+@@ -1997,6 +2008,11 @@
+       }
+       else if(!timeout_ms)
+         timeout_ms = TIMEDIFF_T_MAX;
++      /* A quantum is not a renewed send budget: the caller callback checks
++         its original absolute deadline. Keep the same encrypted record and
++         partial-write offset until it completes or the callback aborts it. */
++      if(caller_deadline && timeout_ms > 1)
++        timeout_ms = 1;
+       what = SOCKET_WRITABLE(Curl_conn_cf_get_socket(cf, data), timeout_ms);
+       if(what < 0) {
+         /* fatal error */
+@@ -2005,6 +2021,8 @@
+         break;
+       }
+       else if(what == 0) {
++        if(caller_deadline)
++          continue;
+         failf(data, "schannel: timed out sending data "
+               "(bytes sent: %zu)", *pnwritten);
+         result = CURLE_OPERATION_TIMEDOUT;
+--- a/include/curl/curl.h
++++ b/include/curl/curl.h
+@@ -59,7 +59,10 @@
+ #define CURL_IGNORE_DEPRECATION(statements)     statements
+ #endif
+
+-#include "curlver.h"         /* libcurl version defines   */
++#include "curlver.h"
++
++/* Pinned Schannel connect-only progress/deadline polling contract. */
++#define CURL_SCHANNEL_CONNECT_ONLY_PROGRESS 1         /* libcurl version defines   */
+ #include "system.h"          /* determine things runtime */
+
+ #include <stdio.h>

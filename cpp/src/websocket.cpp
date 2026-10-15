@@ -705,6 +705,24 @@ struct WebSocketClient::Impl {
   Json last_send = Json::object();
   std::function<void()> socket_interrupt;
   std::unique_ptr<detail::WebSocketSendDeadline> send_deadline;
+  std::optional<std::chrono::steady_clock::time_point> active_send_deadline;
+  std::stop_token active_send_stop;
+  std::optional<std::chrono::steady_clock::time_point> last_send_progress;
+  std::uint64_t send_progress_calls{0};
+  std::int64_t longest_send_progress_gap_ms{0};
+
+  static int send_progress(void* context, curl_off_t, curl_off_t, curl_off_t, curl_off_t) noexcept {
+    auto& owner = *static_cast<Impl*>(context);
+    if (owner.send_failed) return 1;  // remains cancelled through owner cleanup
+    if (!owner.active_send_deadline) return 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (owner.last_send_progress) owner.longest_send_progress_gap_ms = std::max(
+        owner.longest_send_progress_gap_ms,
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - *owner.last_send_progress).count());
+    owner.last_send_progress = now;
+    ++owner.send_progress_calls;
+    return owner.active_send_stop.stop_requested() || now >= *owner.active_send_deadline ? 1 : 0;
+  }
 
   static std::int64_t steady_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -779,6 +797,7 @@ struct WebSocketClient::Impl {
     // so a late deadline cannot shut down a subsequently reused descriptor.
     // Do not let TLS close-notify cleanup start another unbounded network
     // wait after the WebSocket close attempt has already ended.
+    send_failed = true;
     if (socket_interrupt) socket_interrupt();
     send_deadline.reset();
     if (curl != nullptr) curl_easy_cleanup(curl);
@@ -803,16 +822,27 @@ struct WebSocketClient::Impl {
       last_send["curl_reported_bytes"] = observation.bytes;
       last_send["cancel_requested"] = stop.stop_requested();
       last_send["socket_interrupted"] = send_deadline && send_deadline->interrupted();
+      last_send["progress_callback_calls"] = send_progress_calls;
+      last_send["longest_progress_callback_gap_ms"] = longest_send_progress_gap_ms;
     };
     if (!send_deadline) {
       socket_interrupt = detail::websocket_socket_interrupter(static_cast<SocketHandle>(socket));
       send_deadline = std::make_unique<detail::WebSocketSendDeadline>(socket_interrupt);
     }
     send_deadline->arm(deadline);
+    active_send_deadline = deadline;
+    active_send_stop = stop;
+    last_send_progress.reset();
+    send_progress_calls = 0;
+    longest_send_progress_gap_ms = 0;
     struct Disarm {
-      detail::WebSocketSendDeadline& guard;
-      ~Disarm() { guard.disarm(); }
-    } disarm{*send_deadline};
+      Impl& owner;
+      ~Disarm() {
+        owner.active_send_deadline.reset();
+        owner.active_send_stop = {};
+        owner.send_deadline->disarm();
+      }
+    } disarm{*this};
     std::stop_callback cancellation(stop, [this] { send_deadline->interrupt(); });
     try {
       detail::send_websocket_bytes(value, deadline, stop,
@@ -983,6 +1013,11 @@ void WebSocketClient::connect(std::string_view url, const HttpHeaders& request_h
   curl_easy_setopt(impl_->curl, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(timeout_.count()));
   curl_easy_setopt(impl_->curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_.count()));
   curl_easy_setopt(impl_->curl, CURLOPT_NOSIGNAL, 1L);
+  // The pinned Windows Schannel overlay polls this callback even while
+  // flushing one TLS record. CURL and these fields stay on the owner thread.
+  curl_easy_setopt(impl_->curl, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(impl_->curl, CURLOPT_XFERINFOFUNCTION, &Impl::send_progress);
+  curl_easy_setopt(impl_->curl, CURLOPT_XFERINFODATA, impl_.get());
   curl_easy_setopt(impl_->curl, CURLOPT_USERAGENT, "mine-teleop-websocket/0.2");
   const auto ca_bundle = impl_->ca_bundle.string();
   if (!ca_bundle.empty()) {

@@ -148,10 +148,39 @@ if (-not [string]::IsNullOrWhiteSpace($VcpkgTrackedStatus)) {
   throw "The pinned vcpkg checkout has tracked modifications; refusing a non-reproducible package"
 }
 
+# Copy the immutable upstream port into a private overlay. Never edit the
+# pinned vcpkg checkout or accidentally reuse an installed unpatched curl.
+$CurlPatch = Join-Path $RepoRoot "packaging\windows\patches\schannel-connect-only-progress.patch"
+$CurlPatchHash = (Get-FileHash -LiteralPath $CurlPatch -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($CurlPatchHash -ne [string]$DependencyLock.curl.schannel_send_progress_patch_sha256) {
+  throw "Schannel send-progress patch does not match the dependency lock"
+}
+$OverlayRoot = Join-Path $BuildDirectory "vcpkg-overlays"
+$CurlOverlay = Join-Path $OverlayRoot "curl"
+$InstalledRoot = Join-Path $BuildDirectory "vcpkg-installed"
+New-Item -ItemType Directory -Path $CurlOverlay -Force | Out-Null
+Copy-Item -Path (Join-Path $VcpkgRoot "ports\curl\*") -Destination $CurlOverlay -Recurse -Force
+Copy-Item -LiteralPath $CurlPatch -Destination $CurlOverlay -Force
+$OverlayPortfile = Join-Path $CurlOverlay "portfile.cmake"
+$PortfileText = Get-Content -LiteralPath $OverlayPortfile -Raw
+$PatchSection = [regex]'(?m)^    PATCHES\r?$'
+if ($PatchSection.Matches($PortfileText).Count -ne 1) {
+  throw "Pinned curl port has an unexpected patch list"
+}
+$PortfileText = $PatchSection.Replace($PortfileText, "    PATCHES`n        schannel-connect-only-progress.patch")
+[IO.File]::WriteAllText($OverlayPortfile, $PortfileText)
+$OverlayManifestPath = Join-Path $CurlOverlay "vcpkg.json"
+$OverlayManifest = Get-Content -LiteralPath $OverlayManifestPath -Raw | ConvertFrom-Json
+$OverlayManifest | Add-Member -NotePropertyName "port-version" -NotePropertyValue ([int]$DependencyLock.curl.overlay_revision) -Force
+$OverlayManifest | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $OverlayManifestPath -Encoding utf8
+Write-Host "==> Pinned Schannel progress overlay SHA-256: $CurlPatchHash"
+
 if (-not $SkipDependencyInstall) {
   Write-Host "==> Installing control-client dependencies for $Triplet"
   Invoke-CheckedCommand -Command $VcpkgExecutable -CommandArguments @(
     "install",
+    "--overlay-ports=$OverlayRoot",
+    "--x-install-root=$InstalledRoot",
     "curl:$Triplet",
     "openssl:$Triplet",
     "yaml-cpp:$Triplet",
@@ -159,7 +188,7 @@ if (-not $SkipDependencyInstall) {
   )
 }
 
-$VcpkgPackageList = @(& $VcpkgExecutable "list")
+$VcpkgPackageList = @(& $VcpkgExecutable "list" "--x-install-root=$InstalledRoot")
 if ($LASTEXITCODE -ne 0) {
   throw "Cannot list installed vcpkg dependencies"
 }
@@ -176,6 +205,10 @@ $CurlPortVersion = (($CurlPackageLine[0] -split "\s+")[1])
 if (($CurlPortVersion -split "#")[0] -ne $ExpectedCurlPortVersion) {
   throw "Windows dependency lock requires curl port $ExpectedCurlPortVersion, got $CurlPortVersion"
 }
+$ExpectedOverlayVersion = "$ExpectedCurlPortVersion#$([int]$DependencyLock.curl.overlay_revision)"
+if ($CurlPortVersion -ne $ExpectedOverlayVersion) {
+  throw "Windows bundle requires patched curl $ExpectedOverlayVersion, got $CurlPortVersion"
+}
 
 $CmakeArchitecture = if ($Architecture -eq "arm64") { "ARM64" } else { "x64" }
 # Match the dependency triplet's CRT linkage (ARM64 uses the static CRT).
@@ -188,6 +221,7 @@ New-Item -ItemType Directory -Path $BuildDirectory -Force | Out-Null
 
 Write-Host "==> Configuring Windows control client (architecture=$Architecture, triplet=$Triplet)"
 Invoke-CheckedCommand -Command "cmake" -CommandArguments @(
+  "-U", "CURL_*",
   "-S", $RepoRoot,
   "-B", $BuildDirectory,
   "-G", $VisualStudioGenerator,
@@ -195,6 +229,8 @@ Invoke-CheckedCommand -Command "cmake" -CommandArguments @(
   "-A", $CmakeArchitecture,
   "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain",
   "-DVCPKG_TARGET_TRIPLET=$Triplet",
+  "-DVCPKG_OVERLAY_PORTS=$OverlayRoot",
+  "-DVCPKG_INSTALLED_DIR=$InstalledRoot",
   "-DCMAKE_MSVC_RUNTIME_LIBRARY=$MsvcRuntime",
   "-DVCPKG_APPLOCAL_DEPS=ON",
   "-DMINE_TELEOP_CURL_LINKAGE=$ExpectedCurlLinkage",
@@ -344,6 +380,8 @@ $DependencyManifest = [ordered]@{
     runtime_version = $ActualCurlRuntimeVersion
     tls_backend = $ActualCurlTlsBackend
     linkage = $ActualCurlLinkage
+    schannel_send_progress_patch_sha256 = $CurlPatchHash
+    overlay_revision = [int]$DependencyLock.curl.overlay_revision
   }
   runtime_files = @($RuntimeFiles)
 }
@@ -367,6 +405,7 @@ $TestsExecuted = if ($SmokeTest) {
   "libcurl_runtime_version=$ActualCurlRuntimeVersion",
   "libcurl_tls_backend=$ActualCurlTlsBackend",
   "libcurl_linkage=$ActualCurlLinkage",
+  "libcurl_schannel_send_progress_patch_sha256=$CurlPatchHash",
   "native_tests_built=yes",
   "runtime_tests_executed=$TestsExecuted",
   "dependency_manifest=DEPENDENCIES.json",

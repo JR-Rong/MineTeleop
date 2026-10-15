@@ -5,6 +5,9 @@
 #if defined(_WIN32) && LIBCURL_VERSION_NUM < 0x081100
 #error "MineTeleop Windows WSS requires libcurl 8.17.0 or newer"
 #endif
+#if defined(_WIN32) && !defined(CURL_SCHANNEL_CONNECT_ONLY_PROGRESS)
+#error "MineTeleop Windows WSS requires the pinned Schannel progress overlay; use build_windows_control_bundle.ps1"
+#endif
 
 namespace mine_teleop {
 

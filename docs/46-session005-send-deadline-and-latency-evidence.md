@@ -97,3 +97,30 @@ accepted seq清掉保护。本轮保留该行为，未认定它是016按键清�
 没有复现或修复网络/内核/TLS代理缓冲的唯一现场根因，没有启用实验
 控制直连。摄像头2/4的真实V4L2故障、CAN64MiB导出预算缺失退出尾部
 仍属独立问题；本轮没有声称这些问题、实车制动或最终物理停车已验收。
+
+## Windows Schannel 实测补充
+
+初始实现的真实Windows x64 CI暴露了平台差异：锁定的
+curl 8.17.0-DEV/Schannel在no-read TLS fixture中，单次发送阻塞
+11989ms，关闭清理0ms；观察器已触发但shutdown副本未及时唤醒发送。
+因此Mac通过不能作为Windows发送期限通过的证据。
+
+锁定版`Curl_timeleft`在connect-only非连接阶段返回0，Schannel内部
+将其作为无限可写等待。本次Windows依赖overlay仅对启用了标准
+进度回调的connect-only发送，把等待分成1ms轮询，并在原TLS record
+的缓冲和偏移上继续写。每次轮询检查owner提供的原始单调绝对期限
+和stop token；取消时返回失败，整条连接停用。没有将已发的部分
+密文返回为可重试的新明文，没有重新开始20ms预算。重协商中的
+同类等待也检查该回调；失败状态延续到owner清理完成。
+
+补丁SHA与overlay revision进入Windows依赖锁、manifest和BUILD-INFO。
+构建脚本复制干净的固定vcpkg port至独立overlay/installed目录，
+不修改vcpkg checkout；Windows编译要求patched curl头的能力标记，
+缺少补丁时拒绝构建。原版本、静态链接和Schannel后端检查保留。
+
+真实localhost TLS测试现在覆盖三种情况：接收端逐帧校验8条大消息
+内容/序号；不读对端下的20ms发送期限；独立stop请求取消较长发送。
+两种失败都要求连接不可复用，且发送和owner清理各小于原2秒fixture
+上限；Windows还要求实际Schannel及非零回调调用次数。具体耗时与
+最终通过状态须查看对应提交的CI日志。1ms轮询不是硬实时调度保证，
+控制、安全阈值和原有断言均未降低。

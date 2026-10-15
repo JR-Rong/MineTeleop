@@ -108,19 +108,42 @@ void test_original_descriptor_reuse_cannot_redirect_interruption() {
 int tls_client(int argc,char** argv) {
   expect(argc==4,"TLS fixture needs URL and temporary CA");
   WebSocketClient client(2s,{},argv[3]);client.connect(argv[2]);
+  if(std::string_view(argv[1])=="--tls-client-drain") {
+    for(int index=0;index<8;++index)
+      client.send_json({{"probe",std::string(16*1024,'x')},{"seq",index}},2s);
+    const auto reply=client.receive_json(2s);
+    expect(reply.status==WebSocketReceiveStatus::Message && reply.message.value("received",0)==8,
+        "TLS retry corrupted, duplicated or lost a record");
+    const auto started=Clock::now();client.close();
+    const auto close_ms=std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-started).count();
+    expect(close_ms<2000,"healthy TLS owner cleanup exceeded isolated bound");
+    std::cout<<Json{{"received",8},{"close_ms",close_ms}}.dump()<<std::endl;
+    return 0;
+  }
+  const bool cancel=std::string_view(argv[1])=="--tls-client-cancel";
+  std::stop_source stop;
+  WebSocketSendDeadline cancellation([&]{stop.request_stop();});
   const Json payload={{"probe",std::string(16*1024,'x')}};
   bool failed=false; std::int64_t failed_ms=0;
   for(int index=0;index<4096;++index) {
     const auto started=Clock::now();
-    try { client.send_json(payload,20ms); }
+    if(cancel)cancellation.arm(started+20ms);
+    try { client.send_json(payload,cancel?5000ms:20ms,stop.get_token()); }
     catch(const std::exception&) {
       failed=true;failed_ms=std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-started).count();break;
     }
+    if(cancel)cancellation.disarm();
   }
+  cancellation.disarm();
   const auto diagnostics=client.last_send_diagnostics();
   const auto transport=client.transport_diagnostics();
   expect(failed && !client.connected(),"no-read TLS stream remained writable/reusable indefinitely");
   expect(diagnostics.value("curl_send_calls",0)>0,"test expired only during frame preparation");
+  expect(!cancel || diagnostics.value("cancel_requested",false),"TLS fixture failed without observing cancellation");
+#ifdef _WIN32
+  expect(transport.value("curl_tls_backend",std::string{}).starts_with("Schannel"),"Windows TLS fixture did not exercise Schannel");
+  expect(diagnostics.value("progress_callback_calls",0)>0,"Schannel blocked send did not poll its caller deadline");
+#endif
   throws([&]{client.send_json({{"estop",true}},20ms);});
   const auto close_started=Clock::now();client.close();
   const auto close_ms=std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-close_started).count();
@@ -132,7 +155,9 @@ int tls_client(int argc,char** argv) {
 }
 int main(int argc,char** argv) {
   try {
-    if(argc>1 && std::string_view(argv[1])=="--tls-client")return tls_client(argc,argv);
+    if(argc>1 && (std::string_view(argv[1])=="--tls-client" ||
+        std::string_view(argv[1])=="--tls-client-cancel" ||
+        std::string_view(argv[1])=="--tls-client-drain"))return tls_client(argc,argv);
     test_all_progress_paths_obey_one_deadline();
     test_blocking_backend_is_interrupted_and_cancel_can_join();
     test_completed_operation_disarms_old_deadlines();
