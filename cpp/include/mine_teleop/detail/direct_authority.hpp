@@ -52,6 +52,19 @@ struct DirectAuthorityGrant {
   }
 };
 
+// Read ONLY from an authenticated short-authority RPC response. The worker
+// installs this cache value only after accepting that response's nonce/scope.
+inline std::int64_t direct_authority_control_lease_expiry(const Json& response) {
+  const auto grant = DirectAuthorityGrant::parse(response);
+  const auto& field = response.at("control_token_expires_at_utc_ms");
+  if (!field.is_number_integer() || (field.is_number_unsigned() && field.get<std::uint64_t>() >
+      static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())))
+    throw std::invalid_argument("authority response session deadline is not a bounded integer");
+  const auto expiry = field.get<std::int64_t>();
+  if (expiry < grant.expires_utc_ms) throw std::invalid_argument("short authority exceeds authenticated session deadline");
+  return expiry;
+}
+
 class DirectAuthorityLease {
  public:
   void configure(std::string issuer, std::string vehicle, std::string driver, std::string session,

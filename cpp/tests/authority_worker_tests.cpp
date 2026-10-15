@@ -29,12 +29,17 @@ struct ThrowAdapter : VehicleAdapter {
  VehicleAdapterStatus status() const override{return inner.status();}
 };
 struct FixtureSignaling {
- bool malformed=false;std::atomic<unsigned> calls{0};
+ bool malformed=false, success=false, wrong_nonce=false;std::atomic<unsigned> calls{0};
+ std::int64_t utc=0; std::atomic<std::int64_t> long_expiry{1049};
+ std::int64_t control_lease_expiry()const{return long_expiry.load();}
+ void observe_lease(std::int64_t value){long_expiry.store(value);}
  Json direct_authority_configuration(){return malformed?Json::object():Json{{"maximum_duration_ms",600}};}
- Json renew_direct_authority(std::string,int,std::uint64_t){++calls;throw HttpStatusError(401,"fixture authenticated revocation");}
+ Json renew_direct_authority(std::string nonce,int,std::uint64_t){++calls;if(!success)throw HttpStatusError(401,"fixture authenticated revocation");
+ DirectAuthorityGrant grant{"issuer","vehicle-001","driver-001","session-001",wrong_nonce?"foreign-nonce":nonce,1,1,1,utc,utc+600,600};
+ auto response=grant.json();response["control_token_expires_at_utc_ms"]=2000;return response;}
  struct Clock{int uncertainty_ms=0; bool acceptable(int)const{return true;}};
  Clock time_sync_status(){return {};}
- std::int64_t now_ms(){return 0;}
+ std::int64_t now_ms(){return utc;}
 };
 struct Worker {
  FixtureSignaling signaling;
@@ -70,9 +75,29 @@ void initialize(Worker& worker){
  ControlCommand command;command.vehicle_id="vehicle-001";command.driver_id="driver-001";command.session_id="session-001";command.control_token="fixture";command.seq=1;command.gear="D";command.throttle=.5;
  expect(worker.control_service->receive_command(command,0).accepted,"initial command rejected");
 }
-int main(){
+void authenticated_short_renewal_refreshes_long_cutoff(){
+ ThrowAdapter::throw_stop=false;fixture_mono=150;Worker worker;initialize(worker);worker.control_service_started=false;
+ worker.signaling.success=true;worker.signaling.utc=1050;
+ std::jthread thread([&](std::stop_token token){worker.direct_authority_loop(token);});
+ const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(1);
+ while(!worker.signaling.calls.load()&&std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
+ std::this_thread::sleep_for(std::chrono::milliseconds(10));thread.request_stop();thread.join();
+ expect(worker.direct_authority.valid(150),"healthy short renewal rejected");
+ ControlTransportFence fence;fence.reset("vehicle-001","driver-001","session-001","fixture");
+ ControlCommand command;command.vehicle_id="vehicle-001";command.driver_id="driver-001";command.session_id="session-001";command.control_token="fixture";command.seq=1;command.sent_at_utc_ms=1050;
+ ControlTransportStamp stamp{1,0,1,ControlPath::DataChannel,"media-a",true};auto wire=stamp.to_json();
+ const auto decision=fence.admit(command,&wire,ControlPath::DataChannel,"media-a",1050,worker.signaling.control_lease_expiry(),200,worker.direct_authority.valid(150));
+ expect(decision.admitted,"COUNTEREXAMPLE R3: authenticated short renewal did not refresh stale long-lease cutoff");
+ worker.control_service->close();
+ Worker wrong;initialize(wrong);wrong.control_service_started=false;wrong.signaling.success=true;wrong.signaling.wrong_nonce=true;wrong.signaling.utc=1050;
+ std::jthread rejected([&](std::stop_token token){wrong.direct_authority_loop(token);});
+ while(!wrong.signaling.calls.load())std::this_thread::yield();std::this_thread::sleep_for(std::chrono::milliseconds(10));rejected.request_stop();rejected.join();
+ expect(wrong.signaling.control_lease_expiry()==1049,"unaccepted nonce updated long authority cache");wrong.control_service->close();
+}
+int main(int argc,char** argv){
  std::set_terminate([]{std::cerr<<"COUNTEREXAMPLE R2: adapter exception escaped actual authority worker; terminate exit86\n"<<std::flush;std::_Exit(86);});
  try{
+  if(argc>1&&std::string_view(argv[1])=="--review-r3-only"){authenticated_short_renewal_refreshes_long_cutoff();std::cout<<"R3 authenticated cutoff propagation passed\n";return 0;}
   Worker worker;initialize(worker);
   // The real service remains active; swap only the injected adapter's safe-stop behavior through its shared fixture flag.
   ThrowAdapter::throw_stop=true;

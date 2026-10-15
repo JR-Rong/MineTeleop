@@ -385,6 +385,8 @@ if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
     mine_teleop_enable_warnings(mine-teleop-authority-worker-tests)
     add_test(NAME mine-teleop-authority-worker-tests COMMAND mine-teleop-authority-worker-tests)
     set_tests_properties(mine-teleop-authority-worker-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 10)
+    add_test(NAME mine-teleop-authority-cutoff-tests COMMAND mine-teleop-authority-worker-tests --review-r3-only)
+    set_tests_properties(mine-teleop-authority-cutoff-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 10)
     set(MINE_TELEOP_AUTHORITY_ENTRY "${CMAKE_CURRENT_BINARY_DIR}/vehicle_authority_entry.inc")
     add_custom_command(OUTPUT "${MINE_TELEOP_AUTHORITY_ENTRY}"
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/extract_vehicle_authority_entry.py"

@@ -117,6 +117,10 @@ void actual_cloud_revoke_does_not_free_the_old_grant_early() {
   auto wrong = cloud.request("x"); wrong["device_token"] = "wrong"; cloud.post("/vehicles/v/direct-authority", wrong, 401);
   auto low = cloud.request("x"); low["maximum_duration_ms"] = 79; cloud.post("/vehicles/v/direct-authority", low, 409);
   const auto first = cloud.post("/vehicles/v/direct-authority", cloud.request("n1"));
+  expect(direct_authority_control_lease_expiry(first) == cloud.session.at("control_token_expires_at_utc_ms").get<std::int64_t>(),
+      "authenticated authority reply omitted/current long session deadline");
+  auto inconsistent = first; inconsistent["control_token_expires_at_utc_ms"] = first.at("expires_at_utc_ms").get<std::int64_t>() - 1;
+  rejects([&] { static_cast<void>(direct_authority_control_lease_expiry(inconsistent)); });
   expect(cloud.post("/vehicles/v/direct-authority", cloud.request("n1")) == first, "same nonce extended actual cloud grant");
   cloud.post("/sessions/" + cloud.session.at("session_id").get<std::string>() + "/end", {{"actor", "d1"}, {"token", cloud.login1.at("token")}});
   cloud.post("/sessions", cloud.session_body(true), 409);

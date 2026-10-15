@@ -4321,7 +4321,9 @@ ServerResponse SignalingService::handle_direct_authority_post(const HttpRequest&
     detail::DirectAuthorityGrant grant{service_instance_id_, vehicle, session.driver_id, session_id, nonce,
         generation, epoch, old_sequence + 1, now, now + duration, duration};
     if (grant.expires_utc_ms > session.control_token_expires_at_ms) throw Unauthorized("session token requires renewal before short authority");
-    direct_authority_journal_[vehicle] = grant.json();
+    auto issued = grant.json();
+    issued["control_token_expires_at_utc_ms"] = session.control_token_expires_at_ms;
+    direct_authority_journal_[vehicle] = issued;
     direct_authority_reservations_[vehicle] = monotonic + duration;
     // Persist before replying. On failure the in-memory reservation remains
     // conservative; no grant is issued and no second owner can be activated.
@@ -4330,7 +4332,7 @@ ServerResponse SignalingService::handle_direct_authority_post(const HttpRequest&
     persist_direct_authority_state(durable_snapshot);
     state_lock.lock();
     static_cast<void>(require_participant(session_id, vehicle));
-    return ServerResponse::json(200, grant.json());
+    return ServerResponse::json(200, issued);
   }
   return ServerResponse::json(404, {{"error", "not found"}});
 }

@@ -2805,12 +2805,13 @@ struct VehicleMediaRuntime::Impl {
             direct_authority.begin_request(nonce, steady_now_ms()); }
           next_attempt_ms = steady_now_ms() + duration / 3;
           const auto response = signaling.renew_direct_authority(nonce, config.runtime.experimental_direct_authority_max_ms, retired_epoch);
+          const auto control_lease_expiry = detail::direct_authority_control_lease_expiry(response);
           const auto clock = signaling.time_sync_status();
           std::lock_guard lock(control_mutex);
           const auto revision = direct_authority.rearm_revision();
           const bool accepted = clock.acceptable(config.field_safety.max_time_sync_uncertainty_ms) &&
               direct_authority.accept_authenticated_cloud(response, steady_now_ms(), signaling.now_ms(), clock.uncertainty_ms);
-          if (accepted) next_attempt_ms = 0;
+          if (accepted) { signaling.observe_lease(control_lease_expiry); next_attempt_ms = 0; }
           // A delayed or conservatively expired response grants nothing. The
           // next authenticated request retires the observed expired epoch;
           // only a new epoch can recover the vehicle after that boundary.
