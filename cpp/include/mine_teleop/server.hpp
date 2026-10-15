@@ -17,6 +17,7 @@
 
 #include "mine_teleop/core.hpp"
 #include "mine_teleop/detail/native_control_acknowledgement_window.hpp"
+#include "mine_teleop/detail/vehicle_result_latency_window.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/websocket.hpp"
@@ -536,6 +537,7 @@ class DriverConsoleRuntime {
   bool control_signaling_capabilities_verified_{false};
   std::uint64_t control_signaling_last_ack_seq_{0};
   detail::NativeControlAcknowledgementWindow control_signaling_ack_window_;
+  detail::VehicleResultLatencyWindow control_vehicle_result_latency_;
   detail::NativeControlAckRecovery control_signaling_ack_recovery_;
   std::string control_signaling_recovery_gear_{"N"};
   std::int64_t control_signaling_next_connect_monotonic_ms_{0};

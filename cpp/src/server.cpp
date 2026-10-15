@@ -1818,7 +1818,8 @@ async function collectMetrics(){
   if(!current())return;
   let rtt=null,connectionMethod='unknown',turnInUse=false;
   const selection=controlLogic.selectedIcePair(report),selectedPair=selection.pair;
-  if(selectedPair){rtt=typeof selectedPair.currentRoundTripTime==='number'&&Number.isFinite(selectedPair.currentRoundTripTime)?selectedPair.currentRoundTripTime:null;const local=report.get(selectedPair.localCandidateId),remote=report.get(selectedPair.remoteCandidateId),types=[local?.candidateType,remote?.candidateType];turnInUse=types.includes('relay');connectionMethod=turnInUse?'TURN':(types.some(type=>type==='srflx'||type==='prflx')?'STUN':'direct')}
+  const networkPath=controlLogic.iceNetworkPath(report,selectedPair);
+  if(selectedPair){rtt=typeof selectedPair.currentRoundTripTime==='number'&&Number.isFinite(selectedPair.currentRoundTripTime)&&selectedPair.currentRoundTripTime>=0?selectedPair.currentRoundTripTime:null;const local=report.get(selectedPair.localCandidateId),remote=report.get(selectedPair.remoteCandidateId),types=[local?.candidateType,remote?.candidateType];turnInUse=types.includes('relay');connectionMethod=turnInUse?'TURN':networkPath==='unknown'?'unknown':(types.some(type=>type==='srflx'||type==='prflx')?'STUN':'direct')}
   const streams=[];
   for(const s of report.values()){
     if(s.type!=='inbound-rtp'||(s.kind||s.mediaType)!=='video')continue;
@@ -1835,7 +1836,7 @@ async function collectMetrics(){
   }
   const timeSync=latestRuntimeStatus.time_sync||mediaStatus.time_sync||{},turnConfigured=hasTurnServer();
   const controlOutcomes={...controlOutcomeSession.metrics};
-  const metrics={sampled_at_ms:sampledAt,connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',control_rtt_ms:rtt===null?null:rtt*1000,selected_candidate_pair:selectedPair?{id:selectedPair.id,selection_method:selection.method,state:selectedPair.state,nominated:selectedPair.nominated??null,transport_id:selection.transport?.id??selectedPair.transportId??null,local_candidate_type:report.get(selectedPair.localCandidateId)?.candidateType??null,remote_candidate_type:report.get(selectedPair.remoteCandidateId)?.candidateType??null,protocol:report.get(selectedPair.localCandidateId)?.protocol??null,relay_protocol:report.get(selectedPair.localCandidateId)?.relayProtocol??null,current_round_trip_time_s:selectedPair.currentRoundTripTime??null,available_outgoing_bitrate_bps:selectedPair.availableOutgoingBitrate??null,bytes_sent:selectedPair.bytesSent??null,bytes_received:selectedPair.bytesReceived??null,requests_sent:selectedPair.requestsSent??null,responses_received:selectedPair.responsesReceived??null}:null,connection_method:connectionMethod,turn_configured:turnConfigured,turn_in_use:turnInUse,time_sync:timeSync,clock_uncertainty_ms:Number(timeSync.uncertainty_ms||0),latency_method:'capture-to-encoded + rtt/2 + receiver-processing (buffer + decode fallback)',control_outcomes:controlOutcomes,control_outcomes_balanced:controlLogic.controlOutcomesBalanced(controlOutcomes),streams,passed:streams.length>0&&streams.every(s=>s.passed)};
+  const metrics={network_path:networkPath,media_transport_rtt_ms:rtt===null?null:rtt*1000,control_rtt_source:'media_ice_pair_legacy_field',ice_connectivity:controlLogic.iceConnectivity(report,selectedPair),sampled_at_ms:sampledAt,connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',control_rtt_ms:rtt===null?null:rtt*1000,selected_candidate_pair:selectedPair?{id:selectedPair.id,selection_method:selection.method,state:selectedPair.state,nominated:selectedPair.nominated??null,transport_id:selection.transport?.id??selectedPair.transportId??null,local_candidate_type:report.get(selectedPair.localCandidateId)?.candidateType??null,remote_candidate_type:report.get(selectedPair.remoteCandidateId)?.candidateType??null,protocol:report.get(selectedPair.localCandidateId)?.protocol??null,relay_protocol:report.get(selectedPair.localCandidateId)?.relayProtocol??null,current_round_trip_time_s:selectedPair.currentRoundTripTime??null,available_outgoing_bitrate_bps:selectedPair.availableOutgoingBitrate??null,bytes_sent:selectedPair.bytesSent??null,bytes_received:selectedPair.bytesReceived??null,requests_sent:selectedPair.requestsSent??null,responses_received:selectedPair.responsesReceived??null}:null,connection_method:connectionMethod,turn_configured:turnConfigured,turn_in_use:turnInUse,time_sync:timeSync,clock_uncertainty_ms:Number(timeSync.uncertainty_ms||0),latency_method:'capture-to-encoded + rtt/2 + receiver-processing (buffer + decode fallback)',control_outcomes:controlOutcomes,control_outcomes_balanced:controlLogic.controlOutcomesBalanced(controlOutcomes),streams,passed:streams.length>0&&streams.every(s=>s.passed)};
   const mediaLogAt=performance.now();
   metrics.source_session_id=sourceSession;metrics.source_control_session_generation=sourceGeneration;metrics.media_negotiation_id=sourceOfferId;
   if(lastMediaMetricsLogAt===null||mediaLogAt-lastMediaMetricsLogAt>=5000){lastMediaMetricsLogAt=mediaLogAt;clientLog('driver_media_metrics',metrics);clientLog('driver_ice_connectivity',{ice_transport_policy:consoleConfig.ice_transport_policy,ice_connection_state:peer.iceConnectionState,ice_gathering_state:peer.iceGatheringState,...controlLogic.iceConnectivity(report,selectedPair)})}
@@ -4990,6 +4991,7 @@ void DriverConsoleRuntime::close_control_signaling_websocket() {
   control_signaling_last_ack_seq_ = 0;
   control_signaling_ack_window_.reset();
   control_signaling_ack_recovery_.reset();
+  control_vehicle_result_latency_.reset();
   control_source_revision_fence_.reset();
   recovery_bad_sample_revision_ = recovery_brake_revision_ = 0;
   control_signaling_next_connect_monotonic_ms_ = 0;
@@ -5078,6 +5080,7 @@ bool DriverConsoleRuntime::drain_native_control_acknowledgements_locked(
     const auto acknowledgement_received_monotonic_ms = monotonic_now_ms();
     const bool ack_advanced = control_signaling_ack_window_.acknowledge_through(
         acknowledged_seq, acknowledgement_received_monotonic_ms);
+    std::optional<detail::VehicleResultLatencyWindow::Sample> vehicle_result_sample;
     if (received.message.contains("vehicle_control_feedback")) {
       const auto& feedback = received.message.at("vehicle_control_feedback");
       const auto feedback_seq = required_uint64(feedback, "command_seq");
@@ -5091,6 +5094,9 @@ bool DriverConsoleRuntime::drain_native_control_acknowledgements_locked(
           !feedback.at("rearm_required").is_boolean() || !feedback.at("accepted").is_boolean())
         throw std::runtime_error("native vehicle control feedback scope is invalid");
       if (feedback_seq > native_control_last_feedback_command_seq_) {
+        vehicle_result_sample = control_vehicle_result_latency_.note_result(
+            feedback_seq, required_uint64(feedback, "intent_seq"),
+            acknowledgement_received_monotonic_ms, feedback.at("accepted").get<bool>());
         native_control_last_feedback_command_seq_ = feedback_seq;
         if (feedback.at("accepted").get<bool>())
           native_control_vehicle_accepted_command_seq_.store(feedback_seq);
@@ -5147,6 +5153,8 @@ bool DriverConsoleRuntime::drain_native_control_acknowledgements_locked(
           {"vehicle_feedback_present", received.message.contains("vehicle_control_feedback")},
           {"vehicle_feedback_command_seq", received.message.value("vehicle_control_feedback", Json::object()).value("command_seq", std::uint64_t{0})},
           {"vehicle_feedback_rearm_required", received.message.value("vehicle_control_feedback", Json::object()).value("rearm_required", false)},
+          {"vehicle_result_round_trip_ms", vehicle_result_sample ? Json(vehicle_result_sample->round_trip_ms) : Json(nullptr)},
+          {"vehicle_result_latency_correlated", vehicle_result_sample.has_value()},
           {"seq", acknowledged_seq},
           {"ack_advanced", ack_advanced},
           {"ack_consecutive_anomalies", control_signaling_ack_recovery_.consecutive_anomalies()},
@@ -5542,6 +5550,8 @@ bool DriverConsoleRuntime::send_native_control_sample() {
           std::chrono::milliseconds(20));
       send_completed_at_utc_ms = clock_.now_ms();
       send_completed_monotonic_ms = monotonic_now_ms();
+      control_vehicle_result_latency_.note_sent(
+          sequence, sample.intent.intent_seq, send_started_monotonic_ms);
       control_signaling_ack_window_.note_sent(
           sequence, send_completed_monotonic_ms, command.estop);
     }
@@ -7241,6 +7251,7 @@ Json DriverConsoleRuntime::status() {
   bool native_control_capabilities_verified = false;
   std::int64_t native_control_ack_recovery_deadline_ms = 0;
   std::int64_t native_control_last_ack_packet_age_ms = 0;
+  Json vehicle_result_latency;
   {
     std::lock_guard websocket_lock(control_signaling_websocket_mutex_);
     native_control_websocket_connected =
@@ -7258,6 +7269,25 @@ Json DriverConsoleRuntime::status() {
     native_control_capabilities_verified = control_signaling_capabilities_verified_;
     native_control_ack_recovery_deadline_ms = control_signaling_ack_recovery_.deadline();
     native_control_last_ack_packet_age_ms = control_signaling_ack_window_.last_ack_packet_age_ms();
+    const auto result = control_vehicle_result_latency_.snapshot();
+    const auto now = monotonic_now_ms();
+    vehicle_result_latency = {
+        {"method", "native_send_start_to_vehicle_result_received"},
+        {"path", "cloud_wss"},
+        {"includes_cloud_piggyback_wait", true},
+        {"physical_execution_confirmed", false},
+        {"command_seq", result.last ? Json(result.last->command_seq) : Json(nullptr)},
+        {"intent_seq", result.last ? Json(result.last->intent_seq) : Json(nullptr)},
+        {"round_trip_ms", result.last ? Json(result.last->round_trip_ms) : Json(nullptr)},
+        {"accepted", result.last ? Json(result.last->accepted) : Json(nullptr)},
+        {"result_age_ms", result.last && now >= result.last->received_monotonic_ms
+            ? Json(now - result.last->received_monotonic_ms) : Json(nullptr)},
+        {"samples_total", result.samples},
+        {"retained_sends", result.retained_sends},
+        {"retention_limit", detail::VehicleResultLatencyWindow::kCapacity},
+        {"evicted_sends_total", result.evicted_sends},
+        {"uncorrelated_results_total", result.uncorrelated_results},
+        {"invalid_timing_total", result.invalid_timing}};
   }
   const auto native_sample = native_control_intent_.sample(monotonic_now_ms());
   std::string native_control_last_error;
@@ -7338,6 +7368,7 @@ Json DriverConsoleRuntime::status() {
         {"ack_braking_wait", native_control_ack_braking_wait},
         {"ack_recovery_deadline_monotonic_ms", native_control_ack_recovery_deadline_ms},
         {"last_ack_packet_age_ms", native_control_last_ack_packet_age_ms},
+        {"vehicle_result_latency", std::move(vehicle_result_latency)},
         {"unacknowledged_count", native_control_unacknowledged_count},
         {"unacknowledged_limit", detail::NativeControlAcknowledgementWindow::kMaxPendingPackets},
         {"last_ack_received_at_utc_ms",

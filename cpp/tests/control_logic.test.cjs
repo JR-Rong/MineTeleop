@@ -2293,3 +2293,30 @@ Promise.all(pendingTests).then(() => {
     console.log(`${passed} control logic tests passed`);
   }
 });
+
+
+test('ICE path classification never infers TURN UDP from candidate protocol or missing remote data', () => {
+  const report=new Map([['l',{candidateType:'host',protocol:'udp'}],['r',{candidateType:'srflx',protocol:'udp'}]]);
+  const pair={localCandidateId:'l',remoteCandidateId:'r'};
+  assert.equal(logic.iceNetworkPath(report,pair),'p2p');
+  report.get('l').candidateType='relay';assert.equal(logic.iceNetworkPath(report,pair),'turn_unknown');
+  report.get('l').relayProtocol='udp';assert.equal(logic.iceNetworkPath(report,pair),'turn_udp');
+  report.get('r').candidateType='relay';assert.equal(logic.iceNetworkPath(report,pair),'turn_unknown');
+  report.get('r').relayProtocol='tcp';assert.equal(logic.iceNetworkPath(report,pair),'turn_tcp');
+  report.get('r').relayProtocol='tls';assert.equal(logic.iceNetworkPath(report,pair),'turn_tls');
+  report.delete('r');assert.equal(logic.iceNetworkPath(report,pair),'unknown');
+});
+
+test('ICE check summary covers truncated pairs and distinguishes absent counters from zero responses', () => {
+  const report=new Map([['l',{type:'local-candidate',candidateType:'host',protocol:'udp'}],
+    ['r',{type:'remote-candidate',candidateType:'srflx',protocol:'udp'}]]);
+  for(let n=0;n<30;n++)report.set('p'+n,{id:'p'+n,type:'candidate-pair',state:'waiting',localCandidateId:'l',remoteCandidateId:'r'});
+  report.set('failed',{id:'failed',type:'candidate-pair',state:'failed',localCandidateId:'l',remoteCandidateId:'r',requestsSent:41,responsesReceived:0});
+  report.set('ok',{id:'ok',type:'candidate-pair',state:'succeeded',localCandidateId:'l',remoteCandidateId:'r',requestsSent:2,responsesReceived:2});
+  const result=logic.iceConnectivity(report,{id:'ok'}), path=result.path_checks.p2p;
+  assert.equal(result.pairs.length,16);assert.equal(result.pairs[1].id,'failed');
+  assert.equal(path.pairs,32);assert.equal(path.attempted_pairs,2);assert.equal(path.responding_pairs,1);
+  assert.equal(path.request_counter_pairs,2);assert.equal(path.response_counter_pairs,2);
+  assert.equal(path.requests_sent,43);assert.equal(path.responses_received,2);assert.equal(path.failed_pairs,1);
+  assert.equal(result.pairs[1].responses_received,0);assert.equal(result.pairs[2].requests_sent,null);
+});

@@ -190,6 +190,22 @@ test('ICE-ROUTE-SIM-001', async()=>{
     const diagnostic=controlLogic.iceConnectivity(report,selected.pair);assert.equal(diagnostic.pairs.find(p=>p.selected).local_type,directReachable?'host':'relay');
   }
 });
+test('ICE-PATH-METRICS-001', async()=>{
+  const f=fixture();await f.context.startFromOffer(offer('a'));
+  const report=new Map([['t',{type:'transport',selectedCandidatePairId:'p'}],
+    ['p',{id:'p',type:'candidate-pair',state:'succeeded',localCandidateId:'l',remoteCandidateId:'r',currentRoundTripTime:0.05}],
+    ['l',{type:'local-candidate',candidateType:'relay',protocol:'udp',relayProtocol:'tcp'}],
+    ['r',{type:'remote-candidate',candidateType:'relay',protocol:'udp'}]]);
+  f.peers[0].stats=report;await f.context.collectMetrics();
+  const value=f.posts.find(p=>p.route==='/api/webrtc/metrics').body;
+  assert.equal(value.network_path,'turn_tcp');assert.equal(value.media_transport_rtt_ms,50);
+  assert.equal(value.control_rtt_source,'media_ice_pair_legacy_field');
+  assert.equal(value.ice_connectivity.path_checks.turn_tcp.selected_pairs,1);
+  report.delete('r');await f.context.collectMetrics();
+  const unknown=f.posts.filter(p=>p.route==='/api/webrtc/metrics').at(-1).body;
+  assert.equal(unknown.network_path,'unknown');assert.equal(unknown.connection_method,'TURN');
+  assert.equal(unknown.turn_in_use,true,'known local relay must remain compatible with native ingress');
+});
 (async()=>{
   const results=[];
   for(const {id,fn} of tests) {
