@@ -17,7 +17,7 @@ struct FeedbackTransportStamp {
   std::uint64_t epoch{}, from_epoch{}, authority_epoch{}, floor{};
   ControlPath path{ControlPath::Wss};
   std::string attempt, issuer;
-  static FeedbackTransportStamp parse(const Json& value) {
+  static FeedbackTransportStamp parse(const Json& value, bool allow_uninitialized = false) {
     if (!value.is_object() || value.dump().size() > 1024 || value.value("protocol", "") != kFeedbackTransportCapability)
       throw std::invalid_argument("invalid feedback transport");
     FeedbackTransportStamp result;
@@ -27,7 +27,7 @@ struct FeedbackTransportStamp {
     result.issuer = value.at("authority_issuer").get<std::string>();
     result.attempt = value.at("media_attempt").get<std::string>();
     const auto path = value.at("path").get<std::string>();
-    if (!result.epoch || !result.authority_epoch || result.issuer.empty() || result.issuer.size() > 128 ||
+    if ((!result.epoch && (!allow_uninitialized || value.value("state", "") != "uninitialized" || result.from_epoch != 0 || path != "wss")) || !result.authority_epoch || result.issuer.empty() || result.issuer.size() > 128 ||
         result.attempt.empty() || result.attempt.size() > 128 || (path != "dc" && path != "wss"))
       throw std::invalid_argument("invalid feedback identity");
     result.path = path == "dc" ? ControlPath::DataChannel : ControlPath::Wss;
@@ -64,6 +64,16 @@ class FeedbackTransportFence {
   bool negotiated() const { return stamp_.epoch != 0; }
   ControlPath path() const { return stamp_.path; }
   Json state() const { return negotiated() ? stamp_.json() : Json(nullptr); }
+  Json response(const Json& request, const Json& authority, std::string_view attempt, std::uint64_t status_seq) const {
+    if (negotiated()) return state();
+    try {
+      auto initial = FeedbackTransportStamp::parse(request);
+      if (!authority.is_object() || initial.issuer != authority.at("issuer").get<std::string>() ||
+          initial.authority_epoch != ControlTransportStamp::uint(authority, "authority_epoch") || initial.attempt != attempt) return Json(nullptr);
+      initial.epoch = initial.from_epoch = 0; initial.path = ControlPath::Wss; initial.floor = status_seq;
+      auto value = initial.json(); value["state"] = "uninitialized"; return value;
+    } catch (const std::exception&) { return Json(nullptr); }
+  }
  private:
   FeedbackTransportStamp stamp_;
 };
@@ -73,7 +83,7 @@ class FeedbackTransportFence {
 // duplicated ordinary commands or extra network/worker architecture.
 class FeedbackTransportSender {
  public:
-  struct Receipt { bool progress{}, boundary{}; };
+  struct Receipt { bool progress{}, boundary{}, command_reconciliation{}; };
   void reset() { *this = {}; }
   bool active() const { return stamp_.epoch != 0; }
   bool matches_event(const Json& value) const {
@@ -130,16 +140,29 @@ class FeedbackTransportSender {
     const auto requested = FeedbackTransportStamp::parse(found->request);
     if (!requested.same(stamp_)) return {}; // Before any health, authority or result watermark mutation.
     if (!value.at("feedback_transport").is_object()) return {};
-    const auto actual = FeedbackTransportStamp::parse(value.at("feedback_transport"));
+    const auto actual = FeedbackTransportStamp::parse(value.at("feedback_transport"), true);
+    const bool command_conflict = !found->delivered && seq > delivered_seq_ && value.value("reason", "") == "transport_epoch_conflict" &&
+        !value.at("accepted").get<bool>() && !value.at("transport_admitted").get<bool>() && found->command_stamp.is_object();
+    if (!actual.epoch) {
+      // Explicit, exact-event, current-context zero is only startup repair.
+      // null/missing state and a peer that was already confirmed never reset us.
+      if (confirmed_ || ever_confirmed_ || !found->request.at("select").get<bool>() || seq <= reconciled_seq_ ||
+          actual.issuer != stamp_.issuer || actual.authority_epoch != stamp_.authority_epoch || actual.attempt != stamp_.attempt) return {};
+      reconciled_seq_ = seq; stamp_.epoch = 0;
+      begin(ControlPath::Wss, stamp_.attempt, stamp_.issuer, stamp_.authority_epoch, now);
+      if (command_conflict) { found->delivered = true; delivered_seq_ = seq; }
+      return {false, false, command_conflict}; // Reject-only command CAS repair, no feedback health.
+    }
     if (!actual.same(stamp_)) {
       if (!confirmed_ && found->request.at("select").get<bool>() && seq > reconciled_seq_) {
         reconciled_seq_ = seq; stamp_.epoch = actual.epoch;
         begin(ControlPath::Wss, stamp_.attempt, stamp_.issuer, stamp_.authority_epoch, now);
       }
-      return {};
+      if (command_conflict) { found->delivered = true; delivered_seq_ = seq; }
+      return {false, false, command_conflict};
     }
     bool boundary = false;
-    if (!confirmed_) { confirmed_ = true; stamp_.floor = actual.floor; ++revision_; boundary = true; }
+    if (!confirmed_) { confirmed_ = ever_confirmed_ = true; stamp_.floor = actual.floor; ++revision_; boundary = true; }
     if (actual.floor != stamp_.floor) return {};
     auto& arrival = returned == ControlPath::DataChannel ? found->dc : found->wss;
     if (arrival) return {}; // Duplicate cannot refresh health or progress.
@@ -243,6 +266,6 @@ class FeedbackTransportSender {
   std::string context_;
   std::uint64_t revision_{}, probe_seq_{}, delivered_seq_{}, status_seq_{}, reconciled_seq_{};
   std::int64_t probe_started_{}, selected_at_{}, next_trial_{};
-  bool confirmed_{};
+  bool confirmed_{}, ever_confirmed_{};
 };
 } // namespace mine_teleop::detail

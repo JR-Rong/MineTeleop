@@ -29,7 +29,10 @@ struct Fixture {
   EmergencyStopReceiver emergency_receiver;
   FeedbackTransportFence feedback_fence;
   bool feedback_enabled{false}, drop_dc_feedback{false}, inject_candidate_notification{false}, candidate_notification_sent{false};
-  Json pending_dc_feedback, last_feedback_command, last_received_payload;
+  Json pending_dc_feedback, last_feedback_command, last_received_payload, lost_initial_feedback;
+  bool drop_initial_feedback{false}, pause_after_feedback_loss{false};
+  std::string media_attempt{"media-a"};
+  std::int64_t car_control_lease_expiry{};
   std::uint64_t feedback_status_sequence{};
   std::mutex car_mutex;
   std::jthread car_watchdog;
@@ -72,6 +75,7 @@ struct Fixture {
     const auto discovered = http.get_json(base + "/vehicles/transport-vehicle/session?connection_generation=" + std::to_string(generation),
         {{"X-Mine-Teleop-Device-Token", "fixture-device"}});
     control_token = discovered.at("control_token").get<std::string>();
+    car_control_lease_expiry = discovered.at("control_token_expires_at_utc_ms").get<std::int64_t>();
     signing_key = discovered.at("transport_mac_key").get<std::string>();
     if (direct_enabled) {
       const auto& authority = discovered.at("direct_authority_configuration");
@@ -93,7 +97,7 @@ struct Fixture {
     offer.update({{"sender", "transport-vehicle"}, {"recipient", "transport-driver"}, {"device_token", "fixture-device"},
         {"connection_generation", generation}, {"type", "webrtc_offer"},
         {"payload", {{"type", "offer"}, {"sdp", "v=0\r\na=ice-ufrag:offline\r\n"},
-                     {"media_negotiation_id", "media-a"}, {"control_transport_capability", kControlTransportCapability},
+                     {"media_negotiation_id", media_attempt}, {"control_transport_capability", kControlTransportCapability},
                      {"emergency_stop_capability", direct_enabled ? kEmergencyStopCapability : std::string_view{}},
                      {"feedback_transport_capability", feedback_enabled ? kFeedbackTransportCapability : std::string_view{}}}}});
     static_cast<void>(http.post_json_response(base + "/signaling/" + session + "/messages", offer));
@@ -129,6 +133,7 @@ struct Fixture {
         {"nonce", nonce}, {"maximum_duration_ms", 600}, {"retired_authority_epoch", retired}});
     std::lock_guard lock(car_mutex);
     expect(car_authority.accept_authenticated_cloud(grant, steady(), utc(), 0), "vehicle did not accept real cloud short grant");
+    car_control_lease_expiry = direct_authority_control_lease_expiry(grant);
   }
   void stop_cloud() { cloud_online = false; server->stop(); vehicle_socket.close(); delayed.clear(); }
   void restore_cloud() {
@@ -155,7 +160,7 @@ struct Fixture {
   Json scope(bool ready) {
     const auto status = driver->status();
     return {{"source_session_id", session}, {"source_control_session_generation", status.at("control_session_generation")},
-        {"media_negotiation_id", "media-a"}, {"ui_instance_id", "owner"}, {"ui_control_epoch", ui_epoch},
+        {"media_negotiation_id", media_attempt}, {"ui_instance_id", "owner"}, {"ui_control_epoch", ui_epoch},
         {"dc_ready", ready}, {"dc_network_path", direct_enabled ? "p2p" : "unknown"}, {"last_seen_seq", last_dc_seq}};
   }
   Json apply(const Json& payload, ControlPath path) {
@@ -166,7 +171,7 @@ struct Fixture {
     bool verified_stop = false;
     if (payload.contains("emergency_stop")) {
       emergency_receiver.observe_latched(vehicle->safety_state() == SafetyState::Estop);
-      const auto stop = emergency_receiver.inspect(payload, signing_key, car_authority.reference(), "media-a", path == ControlPath::DataChannel, utc(), 200);
+      const auto stop = emergency_receiver.inspect(payload, signing_key, car_authority.reference(), media_attempt, path == ControlPath::DataChannel, utc(), 200);
       if (stop.action == EmergencyStopReceiver::Action::Cached) return stop.cached;
       expect(stop.action == EmergencyStopReceiver::Action::ApplyOnce, "fixture production emergency receiver rejected valid stop");
       verified_stop = true;
@@ -174,9 +179,9 @@ struct Fixture {
     ControlTransportFence::Decision decision{false, false, "direct_authority_unavailable"};
     if (!direct_enabled || command.estop || car_authority.allows(payload.value("direct_authority", Json(nullptr)), steady()))
       decision = fence.admit(command, payload.contains("control_transport") ? &payload.at("control_transport") : nullptr,
-          path, "media-a", utc(), utc() + 10000, 200, !direct_enabled || car_authority.valid(steady()), verified_stop);
+          path, media_attempt, utc(), car_control_lease_expiry, 200, !direct_enabled || car_authority.valid(steady()), verified_stop);
     if (feedback_enabled && decision.admitted && !command.estop && payload.contains("feedback_request")) {
-      static_cast<void>(feedback_fence.select(payload.at("feedback_request"), car_authority.reference(), "media-a", feedback_status_sequence));
+      static_cast<void>(feedback_fence.select(payload.at("feedback_request"), car_authority.reference(), media_attempt, feedback_status_sequence));
       last_feedback_command = payload;
     }
     ReceiveResult applied;
@@ -193,7 +198,7 @@ struct Fixture {
         {"reason", decision.admitted ? applied.reason : std::string(decision.reason)}};
     if (payload.contains("control_transport")) result["control_transport"] = payload.at("control_transport");
     if (feedback_enabled && payload.contains("feedback_request")) {
-      result["feedback_request"] = payload.at("feedback_request"); result["feedback_transport"] = feedback_fence.state();
+      result["feedback_request"] = payload.at("feedback_request"); result["feedback_transport"] = feedback_fence.response(payload.at("feedback_request"), car_authority.reference(), media_attempt, feedback_status_sequence);
     }
     if (direct_enabled) {
       result["direct_authority"] = car_authority.status(steady());
@@ -230,6 +235,12 @@ struct Fixture {
         {"vehicle_id", "transport-vehicle"}, {"driver_id", "transport-driver"}, {"control_status_seq", sequence}}}};
     result["vehicle_mac"] = transport_message_mac(result, signing_key, true); return result;
   }
+  bool drop_before_receiver(const Json& payload) {
+    if (drop_initial_feedback && !lost_initial_feedback.is_object() && payload.contains("feedback_request")) {
+      lost_initial_feedback = payload; pause_after_feedback_loss = true;
+    }
+    return pause_after_feedback_loss;
+  }
   void pump(bool dc_ready) {
     renew_authority();
     if (steady() - last_input >= 60) input();
@@ -238,12 +249,13 @@ struct Fixture {
       const auto& messages = received.message.at("messages");
       const auto& payload = messages.back().at("payload");
       ++wss_commands;
-      auto result = apply(payload, ControlPath::Wss);
+      const bool dropped = drop_before_receiver(payload);
+      auto result = dropped ? Json(nullptr) : apply(payload, ControlPath::Wss);
       vehicle_socket.send_json({{"event", "signaling_delivery_ack"}, {"delivery_cursor", received.message.at("delivery_cursor")},
           {"trace_session_id", session}, {"seq", payload.at("seq")}, {"intent_seq", payload.at("intent_seq")}});
       // Model the reported distinction: cloud ingress remains fast while the
       // actual vehicle result is slower than the simulated DC byte path.
-      if (feedback_enabled) route_feedback(result, payload); else delayed.emplace_back(steady() + 60, std::move(result));
+      if (!dropped) { if (feedback_enabled) route_feedback(result, payload); else delayed.emplace_back(steady() + 60, std::move(result)); }
     }
     while (cloud_online && !delayed.empty() && delayed.front().first <= steady()) {
       vehicle_socket.send_json(delayed.front().second); delayed.pop_front();
@@ -256,6 +268,7 @@ struct Fixture {
       const auto payload = Json::parse(response.at("frame_json").get<std::string>());
       expect(payload.at("seq").get<std::uint64_t>() > last_dc_seq, "bridge replayed a frame");
       last_dc_seq = payload.at("seq").get<std::uint64_t>(); ++dc_commands;
+      if (drop_before_receiver(payload)) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); return; }
       request = scope(true);
       if (feedback_enabled) {
         route_feedback(apply(payload, ControlPath::DataChannel), payload);
@@ -453,6 +466,33 @@ void review_r6_actual_native_retains_one_shot_candidate_notification() {
   expect(fixture.received_statuses.size() == 1, "candidate rejection was delivered repeatedly after confirmation");
 }
 
+void review_r7_actual_native_repairs_initial_loss_across_attempt() {
+  Fixture fixture(true, true); fixture.drop_initial_feedback = true;
+  auto deadline = steady() + 4000;
+  while (steady() < deadline && !fixture.lost_initial_feedback.is_object()) fixture.pump(true);
+  expect(fixture.lost_initial_feedback.is_object() && !fixture.feedback_fence.negotiated(), "R7 initial selection was not lost before vehicle init");
+  fixture.media_attempt = "media-b";
+  auto offer = ProtocolMetadata{kProtocolVersion,"transport-vehicle","transport-driver",fixture.session,2,utc()}.to_json();
+  offer.update({{"sender","transport-vehicle"},{"recipient","transport-driver"},{"device_token","fixture-device"},{"connection_generation",fixture.generation},
+      {"type","webrtc_offer"},{"payload",{{"type","offer"},{"sdp","v=0\r\na=ice-ufrag:second\r\n"},{"media_negotiation_id",fixture.media_attempt},
+      {"control_transport_capability",kControlTransportCapability},{"emergency_stop_capability",kEmergencyStopCapability},{"feedback_transport_capability",kFeedbackTransportCapability}}}});
+  static_cast<void>(fixture.http.post_json_response(fixture.base+"/signaling/"+fixture.session+"/messages",offer));
+  bool new_offer_seen = false; deadline = steady() + 1500;
+  while (steady() < deadline && !new_offer_seen) {
+    const auto polled = fixture.driver->poll_signaling();
+    for (const auto& message : polled.at("messages")) if (message.value("type", "") == "webrtc_offer" &&
+        message.at("payload").value("media_negotiation_id", "") == fixture.media_attempt) new_offer_seen = true;
+  }
+  expect(new_offer_seen, "new scoped media offer was not delivered to actual native signaling");
+  fixture.pause_after_feedback_loss = false;
+  bool recovered = false; deadline = steady() + 5000;
+  while (steady() < deadline) {
+    fixture.pump(true); const auto state = fixture.driver->status().at("native_control").at("control_transport").at("feedback_transport");
+    if (state.value("media_attempt","") == fixture.media_attempt && state.value("enabled",false) && !state.value("selecting",true)) { recovered = true; break; }
+  }
+  expect(recovered && fixture.feedback_fence.negotiated(), "actual native remained stuck after exact scoped epoch0 repair");
+}
+
 void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
   Fixture fixture(true);
   const auto ready_deadline = steady() + 8000;
@@ -567,6 +607,6 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
 }
 }  // namespace
 int main(int argc, char** argv) {
-  try { if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

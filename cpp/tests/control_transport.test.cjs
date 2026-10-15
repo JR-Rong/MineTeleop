@@ -82,6 +82,16 @@ test('feedback snapshots arriving during an HTTP request survive and retired sco
   assert.equal(f.requests[1].body.vehicle_statuses[0].status.control_status_seq,2);
   f.setScope({...f.scope(),attempt:'new'});await f.courier.tick();assert.equal(f.requests[2].body.vehicle_statuses,undefined);
 });
+test('explicit scoped zero is forwarded only for the current pending selection, never as a reset authority',async()=>{
+  const f=fixture();let state={...feedbackStamp(2),path:'wss',selecting:true};
+  f.setReply(()=>({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'wss',revision:1},feedback_transport:state}));await f.courier.tick();
+  const result={event:'vehicle_control_result',protocol:api.protocol,session_id:'s',command_seq:10,result_seq:10,
+    feedback_request:{...state,select:true,probe:true},feedback_transport:{...state,epoch:0,from_epoch:0,state:'uninitialized'}};
+  assert.equal(f.courier.receive(result),true);state={...feedbackStamp(1),path:'wss',selecting:true};await f.courier.tick();
+  assert.equal(f.requests[1].body.vehicle_result.feedback_transport.epoch,0);assert.equal(f.courier.feedback().epoch,1);
+  const missing=structuredClone(result);delete missing.feedback_transport.state;assert.equal(f.courier.receive(missing),false);
+  state={...feedbackStamp(2),path:'wss',selecting:false};await f.courier.tick();assert.equal(f.courier.receive(result),false,'confirmed state accepted zero downgrade');
+});
 function emergencyFixture() {
   let time=0,current={session:'s',generation:7,ui:'owner',uiEpoch:2,attempt:'a',ready:true};
   const requests=[],sent=[],confirmed=[];

@@ -73,7 +73,13 @@
           !Number.isSafeInteger(message.result_seq) || message.result_seq <= 0) return false;
       if (key !== scopeKey(current)) { key = scopeKey(current); lastSeen = revision = 0; result = null; negotiated = false; epoch = 0; feedback = {}; statuses.clear(); }
       if (message.emergency_stop) return false;
-      const feedbackEpoch = value => value?.feedback_transport?.epoch || 0;
+      const explicitZero = value => value?.feedback_transport?.epoch === 0 && value.feedback_transport.state === 'uninitialized' &&
+        value.feedback_transport.protocol === feedbackProtocol && value.feedback_transport.from_epoch === 0 && value.feedback_transport.path === 'wss' &&
+        value.feedback_request?.protocol === feedbackProtocol && value.feedback_request.media_attempt === current.attempt &&
+        value.feedback_transport.media_attempt === current.attempt && value.feedback_transport.authority_issuer === value.feedback_request.authority_issuer &&
+        value.feedback_transport.authority_epoch === value.feedback_request.authority_epoch;
+      const feedbackEpoch = value => explicitZero(value) ? value.feedback_request.epoch : value?.feedback_transport?.epoch || 0;
+      if (feedback.enabled === true && explicitZero(message) && (feedback.selecting !== true || feedbackEpoch(message) !== feedback.epoch)) return false;
       if (feedback.enabled === true && (!Number.isSafeInteger(feedbackEpoch(message)) || feedbackEpoch(message) < feedback.epoch ||
           feedbackEpoch(message) > feedback.epoch + 1 || message.feedback_transport?.media_attempt !== current.attempt)) return false;
       if (!result || feedbackEpoch(message) > feedbackEpoch(result) ||

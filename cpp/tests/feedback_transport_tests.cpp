@@ -1,4 +1,5 @@
 #include "mine_teleop/detail/feedback_transport.hpp"
+#include "mine_teleop/detail/control_transport_sender.hpp"
 
 #include <iostream>
 
@@ -12,12 +13,14 @@ struct Harness {
   FeedbackTransportFence car;
   Json authority = {{"issuer", "fixture-issuer"}, {"authority_epoch", 7}, {"lease_seq", 1}};
   std::string attempt{"media-a"};
+  Json command_stamp;
   std::uint64_t seq{}, results{}, forward_epoch{3};
   Json command(std::int64_t now, ControlPath forward = ControlPath::Wss, bool p2p = true) {
     sender.observe(true, p2p, attempt, authority, forward, forward_epoch, now, 5000);
     ControlCommand command; command.vehicle_id = "v"; command.driver_id = "d"; command.session_id = "s";
     command.control_token = "fixture-token"; command.seq = ++seq; command.sent_at_utc_ms = now;
     auto value = command.to_json(); value["intent_seq"] = seq;
+    if (command_stamp.is_object()) value["control_transport"] = command_stamp;
     sender.decorate(value); value["native_mac"] = transport_message_mac(value, key, false);
     sender.sent(value, forward, now); return value;
   }
@@ -30,6 +33,7 @@ struct Harness {
         {"control_status_seq", 0}, {"transport_admitted", true}, {"transport_selected", false}, {"authority_epoch", 3},
         {"reason", "accepted"}, {"feedback_request", command.at("feedback_request")}, {"feedback_transport", car.state()},
         {"command_received_path", control_path_name(forward)}};
+    if (command.contains("control_transport")) result["control_transport"] = command.at("control_transport");
     result["vehicle_mac"] = transport_message_mac(result, key, true); return result;
   }
   FeedbackTransportSender::Receipt receive(const Json& result, ControlPath returned, std::int64_t now) {
@@ -153,6 +157,70 @@ void review_r6_candidate_status_survives_selection_confirmation() {
   expect(h.sender.status(released.front(),ControlPath::Wss),"buffered event failed exact floor/scope revalidation");
   expect(pending_statuses(h.sender).empty()&&!h.sender.status(released.front(),ControlPath::Wss),"candidate event was delivered twice");
 }
+template<class Fence> Json scoped_state(Fence& fence,const Json& request,const Json& authority,std::string_view attempt) {
+  if constexpr (requires { fence.response(request,authority,attempt,std::uint64_t{3}); }) return fence.response(request,authority,attempt,3);
+  else return fence.state();
+}
+void review_r7_lost_first_selection_recovers_explicit_zero() {
+  Harness h; static_cast<void>(h.command(1000)); h.attempt="media-b"; bool recovered=false;
+  for(int index=0;index<6;++index) {
+    const auto now=1050+index*50; const auto command=h.command(now);
+    const bool selected=h.car.select(command.at("feedback_request"),h.authority,h.attempt,3);
+    Json result={{"event","vehicle_control_result"},{"protocol",kControlTransportCapability},{"session_id","s"},{"vehicle_id","v"},{"driver_id","d"},
+      {"command_seq",command.at("seq")},{"intent_seq",command.at("intent_seq")},{"result_seq",++h.results},{"accepted",true},{"rearm_required",false},
+      {"control_status_seq",0},{"transport_admitted",true},{"transport_selected",false},{"authority_epoch",3},{"reason","accepted"},
+      {"feedback_request",command.at("feedback_request")},{"feedback_transport",scoped_state(h.car,command.at("feedback_request"),h.authority,h.attempt)},{"command_received_path","wss"}};
+    result["vehicle_mac"]=transport_message_mac(result,key,true);
+    const auto receipt=h.receive(result,ControlPath::Wss,now+5);
+    if(selected&&receipt.progress&&!h.sender.status().at("selecting").get<bool>()){recovered=true;break;}
+  }
+  expect(recovered,"COUNTEREXAMPLE R7: lost initial selection/new attempt remained stuck against vehicle epoch0");
+}
+void review_r7_zero_never_resets_from_null_foreign_or_confirmed_state() {
+  Harness h; static_cast<void>(h.command(1000)); h.attempt="media-b";
+  const auto command=h.command(1050);
+  Json result={{"event","vehicle_control_result"},{"protocol",kControlTransportCapability},{"session_id","s"},{"vehicle_id","v"},{"driver_id","d"},
+    {"command_seq",command.at("seq")},{"intent_seq",command.at("intent_seq")},{"result_seq",1},{"accepted",false},{"rearm_required",false},
+    {"control_status_seq",0},{"transport_admitted",false},{"transport_selected",false},{"authority_epoch",0},{"reason","transport_epoch_conflict"},
+    {"feedback_request",command.at("feedback_request")},{"feedback_transport",h.car.response(command.at("feedback_request"),h.authority,h.attempt,3)},{"command_received_path","wss"}};
+  for(const auto mode:{"null","marker","authority","attempt"}) {
+    auto invalid=result;
+    if(std::string_view(mode)=="null")invalid["feedback_transport"]=nullptr;
+    if(std::string_view(mode)=="marker")invalid["feedback_transport"].erase("state");
+    if(std::string_view(mode)=="authority")invalid["feedback_transport"]["authority_epoch"]=6;
+    if(std::string_view(mode)=="attempt")invalid["feedback_transport"]["media_attempt"]="old";
+    invalid["vehicle_mac"]=transport_message_mac(invalid,key,true);
+    try{expect(!h.receive(invalid,ControlPath::Wss,1060).command_reconciliation,"invalid zero repaired command authority");}catch(const std::invalid_argument&){}
+    expect(h.sender.status().at("epoch")==2,"unbound/null zero downgraded candidate epoch");
+  }
+  Harness active; auto selected=active.qualify(); active.receive(selected,ControlPath::DataChannel,1160);
+  const auto next=active.command(1200); auto reply=active.reply(next); FeedbackTransportFence empty;
+  reply["feedback_transport"]=empty.response(next.at("feedback_request"),active.authority,active.attempt,3);reply["vehicle_mac"]=transport_message_mac(reply,key,true);
+  expect(!active.receive(reply,ControlPath::Wss,1210).progress&&active.sender.status().at("epoch")==2,"zero downgraded previously confirmed feedback");
+}
+void review_r7_command_conflict_repairs_without_feedback_health() {
+  Harness h; h.forward_epoch=2; ControlTransportSender forward; forward.begin(ControlPath::Wss,{},900,5000);forward.begin(ControlPath::Wss,{},950,5000);
+  Json initial={{"seq",1}};forward.decorate(initial);h.command_stamp=initial.at("control_transport");
+  auto lost=h.command(1000);forward.note_sent(lost,ControlPath::Wss,1000);h.attempt="media-b";
+  auto command=h.command(1050);forward.note_sent(command,ControlPath::Wss,1050);
+  ControlTransportFence car;car.reset("v","d","s","fixture-token");const auto parsed=ControlCommand::from_json(command);
+  const auto rejection=car.admit(parsed,&command.at("control_transport"),ControlPath::Wss,h.attempt,1050,2000,200,true);
+  expect(!rejection.admitted&&rejection.reason=="transport_epoch_conflict","coupled conflict fixture invalid");
+  Json result={{"event","vehicle_control_result"},{"protocol",kControlTransportCapability},{"session_id","s"},{"vehicle_id","v"},{"driver_id","d"},
+    {"command_seq",command.at("seq")},{"intent_seq",command.at("intent_seq")},{"result_seq",1},{"accepted",false},{"rearm_required",false},
+    {"control_status_seq",0},{"transport_admitted",false},{"transport_selected",false},{"authority_epoch",car.epoch()},{"reason",rejection.reason},
+    {"control_transport",command.at("control_transport")},{"feedback_request",command.at("feedback_request")},
+    {"feedback_transport",h.car.response(command.at("feedback_request"),h.authority,h.attempt,3)},{"command_received_path","wss"}};
+  result["vehicle_mac"]=transport_message_mac(result,key,true);
+  const auto receipt=h.receive(result,ControlPath::Wss,1055);
+  expect(!receipt.progress&&receipt.command_reconciliation&&forward.note_result(result,1055,5000).boundary,"exact rejection was swallowed instead of existing command CAS repair");
+  Json next={{"seq",3}};forward.decorate(next);h.command_stamp=next.at("control_transport");h.forward_epoch=1;
+  auto retry=h.command(1100);forward.note_sent(retry,ControlPath::Wss,1100);
+  const auto admitted=car.admit(ControlCommand::from_json(retry),&retry.at("control_transport"),ControlPath::Wss,h.attempt,1100,2000,200,true);
+  expect(admitted.admitted,"command axis never recovered from exact reject-only CAS");
+  auto accepted=h.reply(retry);accepted["authority_epoch"]=car.epoch();accepted["transport_selected"]=true;accepted["vehicle_mac"]=transport_message_mac(accepted,key,true);
+  expect(h.receive(accepted,ControlPath::Wss,1110).progress&&forward.note_result(accepted,1110,5000).matched&&!forward.selecting(),"zero repair failed to initialize both existing axes");
+}
 void bounded_history_and_one_probe() {
   Harness h; auto first = h.reply(h.command(1000));
   expect(h.sender.status().at("probe_pending") == true, "probe was not reserved");
@@ -164,9 +232,10 @@ void bounded_history_and_one_probe() {
 int main(int argc,char** argv) {
   try {
     if(argc>1&&std::string_view(argv[1])=="--review-r6-only"){review_r6_candidate_status_survives_selection_confirmation();return 0;}
+    if(argc>1&&std::string_view(argv[1])=="--review-r7-only"){review_r7_lost_first_selection_recovers_explicit_zero();review_r7_zero_never_resets_from_null_foreign_or_confirmed_state();review_r7_command_conflict_repairs_without_feedback_health();return 0;}
     vehicle_selection_cas_scope_and_no_motion_dependency(); four_forward_return_combinations_and_preferred_p2p();
     feedback_loss_falls_back_without_changing_command_axis(); old_epoch_high_sequence_is_filtered_before_status_watermark();
-    exact_results_reject_duplicates_reordering_and_context_changes(); lost_selection_reconciles_only_from_its_exact_result(); bounded_history_and_one_probe(); review_r6_candidate_status_survives_selection_confirmation();
-    std::cout << "8 production feedback transport groups passed; real MAC, four forward/return combinations, no sockets\n";
+    exact_results_reject_duplicates_reordering_and_context_changes(); lost_selection_reconciles_only_from_its_exact_result(); bounded_history_and_one_probe(); review_r6_candidate_status_survives_selection_confirmation(); review_r7_lost_first_selection_recovers_explicit_zero(); review_r7_zero_never_resets_from_null_foreign_or_confirmed_state(); review_r7_command_conflict_repairs_without_feedback_health();
+    std::cout << "11 production feedback transport groups passed; real MAC, four forward/return combinations, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -5433,7 +5433,7 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
           {"command_received_path", result.value("command_received_path", "unknown")}, {"return_path", direct_return ? "dc" : "wss"},
           {"dc_path_is_p2p", feedback_transport_dc_is_p2p_}});
     }
-    if (!receipt.progress) return false;
+    if (!receipt.progress && !receipt.command_reconciliation) return false;
   }
   int timeout_ms;
   { std::lock_guard lock(mutex_); timeout_ms = control_recovery_timeout_ms_; }

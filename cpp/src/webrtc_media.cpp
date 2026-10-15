@@ -1609,7 +1609,9 @@ struct VehicleMediaRuntime::Impl {
         result_message["result_seq"] = ++control_result_seq;
         result_message["authority_epoch"] = control_transport_fence.epoch();
         if (direct_authority.configured()) result_message["direct_authority"] = direct_authority.status(steady_now_ms());
-        if (message.contains("feedback_request") || feedback_transport_fence.negotiated()) result_message["feedback_transport"] = feedback_transport_fence.state();
+        if (message.contains("feedback_request")) result_message["feedback_transport"] = feedback_transport_fence.response(
+            message.at("feedback_request"), direct_authority.reference(), current_attempt, control_status_seq);
+        else if (feedback_transport_fence.negotiated()) result_message["feedback_transport"] = feedback_transport_fence.state();
         if (config.runtime.experimental_direct_authority_max_ms > 0) {
           if (control_service) emergency_stop_receiver.observe_latched(control_service->safety_state() == SafetyState::Estop);
           result_message["emergency_reset_epoch"] = emergency_stop_receiver.reset_epoch();
