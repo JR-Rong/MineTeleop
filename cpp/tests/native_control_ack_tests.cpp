@@ -403,6 +403,7 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
   // status is supplied and this test makes no claim of mechanical braking.
 }
 
+std::string coalesced_ack_frame(const Json& value);
 void test_runtime_counts_each_drained_ack_and_duplicate_does_not_recover() {
   mine_teleop::SignalingServerConfig config;
   config.driver_passwords = {{"driver-console-001", "ack-samples-password"}};
@@ -410,7 +411,7 @@ void test_runtime_counts_each_drained_ack_and_duplicate_does_not_recover() {
   config.driver_vehicle_permissions = {{"driver-console-001", {"vehicle-001"}}};
   auto signaling = std::make_shared<mine_teleop::SignalingService>(config);
   std::atomic<int> connections{0};
-  std::atomic<bool> release_fresh{false}, late_batch_sent{false}, stop{false};
+  std::atomic<bool> release_fresh{false}, late_batch_sent{false}, pending_prepared{false}, stop{false};
   std::atomic<std::uint64_t> third_sequence{0};
   std::mutex error_mutex;
   std::string fixture_error;
@@ -452,10 +453,12 @@ void test_runtime_counts_each_drained_ack_and_duplicate_does_not_recover() {
                 connection.send_json(ack);
               }
             }
-            if (!late_batch_sent.load() && std::chrono::steady_clock::now() >= release_at) {
-              for (const auto& ack : first_three) connection.send_json(ack);
+            if (pending_prepared.load() && !late_batch_sent.load() && std::chrono::steady_clock::now() >= release_at) {
+              std::string batch;
+              for (const auto& ack : first_three) batch += coalesced_ack_frame(ack);
               // These are real duplicate return messages, not new samples.
-              for (int index = 0; index < 4; ++index) connection.send_json(first_three.back());
+              for (int index = 0; index < 4; ++index) batch += coalesced_ack_frame(first_three.back());
+              send_handshake(socket, batch); // One write establishes the same-drain injection premise.
               late_batch_sent.store(true);
             }
           }
@@ -476,16 +479,36 @@ void test_runtime_counts_each_drained_ack_and_duplicate_does_not_recover() {
   mine_teleop::DriverConsoleRuntime driver(driver_config, "vehicle-001", "ack-samples-password");
   static_cast<void>(driver.connect("vehicle-001"));
   Json late_native;
-  const auto late_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(450);
-  while (std::chrono::steady_clock::now() < late_deadline) {
+  const auto preparation_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  auto late_deadline = std::chrono::steady_clock::time_point::min();
+  std::int64_t pending_age_at_anchor = -1;
+  // The independent500ms absence clock starts at the first pending send, not
+  // connect(). Infer a conservative lower bound from a snapshot taken between
+  // sample_started and return. Keep the SAME450ms observation window.
+  while (std::chrono::steady_clock::now() < preparation_deadline && !pending_prepared.load()) {
+    const auto sample_started = std::chrono::steady_clock::now();
     late_native = driver.status().at("native_control");
+    if (late_native.value("unacknowledged_count", 0U) > 0 && late_native.value("last_ack_seq", 0U) == 0 &&
+        !late_native.value("ack_braking_wait", true)) {
+      pending_age_at_anchor = late_native.value("unacknowledged_age_ms", std::int64_t{-1});
+      if (pending_age_at_anchor >= 0 && pending_age_at_anchor < 450) {
+        late_deadline = sample_started + std::chrono::milliseconds(450 - pending_age_at_anchor);
+        pending_prepared.store(true);
+      } else break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  auto late_observed_at = std::chrono::steady_clock::now();
+  while (pending_prepared.load() && std::chrono::steady_clock::now() < late_deadline) {
+    late_native = driver.status().at("native_control");
+    late_observed_at = std::chrono::steady_clock::now();
     if (late_batch_sent.load() && late_native.value("last_ack_seq", 0U) == third_sequence.load() &&
         late_native.value("ack_braking_wait", false)) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
   // Assert before the independent 500ms absence timeout could mask bad sample
   // counting. Duplicate ACKs were already present in the same receive drain.
-  const bool three_sample_wait = late_batch_sent.load() &&
+  const bool three_sample_wait = pending_prepared.load() && late_observed_at < late_deadline && late_batch_sent.load() &&
       late_native.value("last_ack_seq", 0U) == third_sequence.load() &&
       late_native.value("ack_braking_wait", false) &&
       late_native.value("last_ack_packet_age_ms", std::int64_t{0}) > 200 &&
@@ -503,6 +526,9 @@ void test_runtime_counts_each_drained_ack_and_duplicate_does_not_recover() {
   static_cast<void>(driver.disconnect("ack_samples_fixture_complete"));
   server.stop();
   { std::lock_guard lock(error_mutex); expect(fixture_error.empty(), "ACK samples mock failed: " + fixture_error); }
+  std::cout << "[ACK_BATCH] " << Json{{"pending_prepared", pending_prepared.load()}, {"pending_age_at_anchor_ms", pending_age_at_anchor},
+      {"window_from_pending_ms", 450}, {"late_batch_sent", late_batch_sent.load()}, {"third_sequence", third_sequence.load()},
+      {"observed_before_deadline", late_observed_at < late_deadline}, {"native", late_native}}.dump() << '\n';
   expect(three_sample_wait, "three late ACKs in one drain did not enter braking (or duplicates cleared it): " + late_native.dump());
   expect(connections.load() == 1 && fresh_native.value("send_failures_total", 1U) == 0 &&
       !fresh_native.value("ack_braking_wait", true) && fresh_native.value("requires_fresh_input", false) &&

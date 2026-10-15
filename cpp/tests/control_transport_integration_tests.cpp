@@ -514,11 +514,30 @@ void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
   }
   expect(remaining > 400, "fixture did not observe a fresh vehicle-accepted grant before outage");
   const auto before = fixture.dc_commands;
-  fixture.stop_cloud(); // Actual localhost HTTP/WSS sockets close, not just a boolean in the sender.
-  const auto outage_deadline = steady() + 100;
+  // Cloud shutdown must not pause the independently healthy driver/DC pump.
+  // server.stop() closes real sockets but may join workers for longer than the
+  // entire100ms observation interval. Joining first manufactured input loss.
+  fixture.cloud_online = false; fixture.vehicle_socket.close(); fixture.delayed.clear();
+  const auto outage_started = steady();
+  std::jthread cloud_shutdown([&] { fixture.server->stop(); });
+  bool cloud_socket_closed = false;
+  const auto cut_deadline = outage_started + remaining - 100;
+  while (steady() < cut_deadline) {
+    fixture.pump(true);
+    if (!fixture.driver->status().at("native_control").value("websocket_connected", true)) { cloud_socket_closed = true; break; }
+  }
+  const auto cut_observed_at = steady();
+  const auto before_observation = fixture.dc_commands;
+  const auto outage_deadline = cut_observed_at + 100;
   while (steady() < outage_deadline) fixture.pump(true);
   const auto during = fixture.driver->status().at("native_control").at("control_transport");
-  expect(fixture.dc_commands > before && during.at("path") == "dc" && during.at("direct_authority").value("valid", false),
+  const auto observed_at = steady();
+  cloud_shutdown.join();
+  std::cout << "[DIRECT_OUTAGE] " << Json{{"grant_remaining_before_cut_ms", remaining},
+      {"cut_wait_ms", cut_observed_at - outage_started}, {"cloud_socket_closed", cloud_socket_closed},
+      {"observation_elapsed_ms", observed_at - cut_observed_at}, {"shutdown_join_elapsed_ms", steady() - outage_started},
+      {"dc_commands_before", before}, {"dc_commands_at_cut", before_observation}, {"dc_commands_during", fixture.dc_commands}, {"transport", during}}.dump() << '\n';
+  expect(cloud_socket_closed && fixture.dc_commands > before_observation && during.at("path") == "dc" && during.at("direct_authority").value("valid", false),
       "healthy direct command/result stream stopped solely because cloud sockets closed inside the accepted lease");
   fixture.restore_cloud(); fixture.renew_authority(true);
   const auto recovered_deadline = steady() + 1000;

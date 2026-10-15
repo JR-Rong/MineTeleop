@@ -52,3 +52,22 @@ CAN/VCU及物理停车尚待协调验收，媒体HTTP/控制生命周期耦合�
 仍报原scope invalid_argument，字段、签名、路径选择和时限不变。该轮
 Linux/GStreamer整程序编译已通过；Windows红灯及后续同head CI分别保存，
 不能将前一提交的编译/测试结果归给后一提交。
+
+首轮Offline54/55、Vehicle53/54唯一失败为真实Gst初始化fixture的生成C++
+编译：替身没有跟随实际offer回调补齐能力常量、transport_mac_key和实验配置。
+补齐默认关闭的绑定，实际回调原样提取；编译/运行失败会打印至多8KiB诊断，
+不只留JSON。无真实Gst的本机仅验证Python和故意编译失败的stderr可见性，
+没有把该fixture当作Gst运行通过；以新head CI为准。
+
+Darwin32/34的两项失败另保留原日志：短失联用例同步server.stop/join时
+暂停了独立输入/DC泵；ACK用例connect后450ms预算包含首包尚未pending的
+启动等待，旧失败未保存ACK批次是否已发，不能唯一判定底层调度/网络原因。
+修正仅作用fixture：关闭云时继续泵，先观察实际native WSS关闭，再在原
+有效租期内观察100ms新DC进展；不先等待server清理结束。ACK450ms窗口
+从真实最老pending的保守起点计算，观察时间也必须早于该截止；原200ms
+样本年龄和500ms无进展断言保留，ACK批次一次写入以建立同drain注入前提。
+准备首个pending的2秒是测试准备预算，不是生产门限。ACK128满窗及共享
+恢复窗口用例函数体与f901逐字节一致。
+
+本机该两项复核2/2通过17.73秒，Windows比较修正受影响17/17通过。
+旧失败没有被重跑覆盖，后续精确head的全量Linux和六平台结果另行保存。
