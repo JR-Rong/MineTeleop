@@ -163,12 +163,37 @@ class FeedbackTransportSender {
   }
   bool status(const Json& wrapper, ControlPath returned) {
     try {
-      if (!confirmed_ || !wrapper.contains("feedback_transport")) return false;
+      if (!wrapper.contains("feedback_transport")) return false;
       const auto stamp = FeedbackTransportStamp::parse(wrapper.at("feedback_transport"));
       const auto seq = ControlTransportStamp::uint(wrapper.at("status"), "control_status_seq");
-      if (!stamp.same(stamp_) || stamp.floor != stamp_.floor || returned != stamp_.path || seq <= stamp_.floor || seq <= status_seq_) return false;
+      if (!stamp.same(stamp_) || returned != stamp_.path || seq <= stamp.floor || seq <= status_seq_) return false;
+      if (!confirmed_) {
+        // Caller has already authenticated identity and MAC. Retain only four
+        // current-candidate kinds; neither UI watermark nor health advances.
+        const auto kind = wrapper.at("status").value("event", "");
+        if (kind != "vehicle_telemetry" && kind != "vcu_handshake_status" && kind != "session_control_profile_status" && kind != "control_command_rejected") return false;
+        if (!candidate_status_.contains(kind) || seq > ControlTransportStamp::uint(candidate_status_.at(kind).at("status"), "control_status_seq"))
+          candidate_status_[kind] = wrapper;
+        return false;
+      }
+      if (stamp.floor != stamp_.floor) return false;
       status_seq_ = seq; return true;
     } catch (const std::exception&) { return false; }
+  }
+  // Drain once only after exact confirmation. The caller re-authenticates and
+  // passes these back through status(), so floor/scope/order are checked again.
+  Json take_pending_statuses() {
+    Json result = Json::array();
+    if (!confirmed_) return result;
+    for (const auto& wrapper : candidate_status_) {
+      const auto stamp = FeedbackTransportStamp::parse(wrapper.at("feedback_transport"));
+      if (stamp.same(stamp_) && stamp.floor == stamp_.floor &&
+          ControlTransportStamp::uint(wrapper.at("status"), "control_status_seq") > std::max(stamp_.floor, status_seq_)) result.push_back(wrapper);
+    }
+    candidate_status_ = Json::object();
+    std::sort(result.begin(), result.end(), [](const Json& left, const Json& right) {
+      return ControlTransportStamp::uint(left.at("status"), "control_status_seq") < ControlTransportStamp::uint(right.at("status"), "control_status_seq"); });
+    return result;
   }
   bool eligible_status(const Json& message) const {
     try { const auto stamp = FeedbackTransportStamp::parse(message.at("feedback_transport"));
@@ -209,9 +234,10 @@ class FeedbackTransportSender {
     if (stamp_.epoch == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("feedback epoch exhausted");
     const auto previous = stamp_.epoch;
     stamp_ = {previous + 1, previous, authority, 0, path, std::move(attempt), std::move(issuer)};
-    confirmed_ = false; selected_at_ = now; probe_seq_ = 0; ++revision_;
+    confirmed_ = false; selected_at_ = now; probe_seq_ = 0; candidate_status_ = Json::object(); ++revision_;
   }
   FeedbackTransportStamp stamp_;
+  Json candidate_status_ = Json::object();
   std::deque<Sent> sent_;
   Health dc_, wss_; Rolling paired_dc_, paired_wss_;
   std::string context_;

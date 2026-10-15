@@ -28,7 +28,7 @@ struct Fixture {
   DirectAuthorityLease car_authority;
   EmergencyStopReceiver emergency_receiver;
   FeedbackTransportFence feedback_fence;
-  bool feedback_enabled{false}, drop_dc_feedback{false};
+  bool feedback_enabled{false}, drop_dc_feedback{false}, inject_candidate_notification{false}, candidate_notification_sent{false};
   Json pending_dc_feedback, last_feedback_command, last_received_payload;
   std::uint64_t feedback_status_sequence{};
   std::mutex car_mutex;
@@ -213,6 +213,13 @@ struct Fixture {
   void route_feedback(const Json& result, const Json& payload) {
     const bool selected = payload.contains("feedback_request") && feedback_fence.negotiated();
     const bool probe = selected && payload.at("feedback_request").value("probe", false);
+    if (inject_candidate_notification && selected && !candidate_notification_sent) {
+      auto notification = feedback_status(++feedback_status_sequence, feedback_fence.state(), "control_command_rejected");
+      notification["status"]["issue_code"] = "vcu_drive_gear_change_moving_or_stale";
+      notification["status"]["command_seq"] = payload.at("seq"); notification["status"]["intent_seq"] = payload.at("intent_seq");
+      notification["vehicle_mac"] = transport_message_mac(notification, signing_key, true);
+      vehicle_socket.send_json(notification); candidate_notification_sent = true;
+    }
     if (!selected || probe || feedback_fence.path() == ControlPath::Wss) delayed.emplace_back(steady() + 60, result);
     if (!drop_dc_feedback && selected && (probe || feedback_fence.path() == ControlPath::DataChannel)) pending_dc_feedback = result;
   }
@@ -435,6 +442,17 @@ void review_r4_late_stop_result_is_historical_not_current() {
   expect(result.at("historical_software_latch_result") == true, "late successful STOP evidence was discarded instead of retained as history");
 }
 
+void review_r6_actual_native_retains_one_shot_candidate_notification() {
+  Fixture fixture(true, true); fixture.inject_candidate_notification = true; fixture.drop_dc_feedback = true;
+  const auto deadline = steady() + 4000;
+  while (steady() < deadline && fixture.received_statuses.empty()) fixture.pump(true);
+  expect(fixture.candidate_notification_sent && fixture.received_statuses.size() == 1 &&
+      fixture.received_statuses.front().value("issue_code", "") == "vcu_drive_gear_change_moving_or_stale",
+      "candidate rejection sent before delayed selection result did not reach native UI queue");
+  for (int index=0;index<20;++index) fixture.pump(true);
+  expect(fixture.received_statuses.size() == 1, "candidate rejection was delivered repeatedly after confirmation");
+}
+
 void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
   Fixture fixture(true);
   const auto ready_deadline = steady() + 8000;
@@ -549,6 +567,6 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
 }
 }  // namespace
 int main(int argc, char** argv) {
-  try { if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

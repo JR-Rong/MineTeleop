@@ -136,6 +136,23 @@ void lost_selection_reconciles_only_from_its_exact_result() {
   expect(rebased.at("feedback_request").at("from_epoch") == 1 && h.receive(current, ControlPath::Wss, 1255).progress,
       "exact authenticated CAS result could not reconcile lost proposal");
 }
+template<class Sender> Json pending_statuses(Sender& sender) {
+  if constexpr (requires { sender.take_pending_statuses(); }) return sender.take_pending_statuses();
+  else return Json::array();
+}
+void review_r6_candidate_status_survives_selection_confirmation() {
+  Harness h; const auto command = h.command(1000); const auto reply = h.reply(command);
+  auto notification = h.status(reply.at("feedback_transport"),4); notification["status"]["event"]="control_command_rejected";
+  notification["status"]["issue_code"]="vcu_drive_gear_change_moving_or_stale";
+  notification["vehicle_mac"]=transport_message_mac(notification,key,true);
+  expect(verify_transport_message(notification,key,true),"R6 fixture signature failed");
+  expect(!h.sender.status(notification,ControlPath::Wss),"candidate status was prematurely exposed before confirmation");
+  expect(h.receive(reply,ControlPath::Wss,1010).progress,"R6 selection result failed");
+  const auto released=pending_statuses(h.sender);
+  expect(released.size()==1,"COUNTEREXAMPLE R6: authenticated candidate rejection was consumed before selection confirmation");
+  expect(h.sender.status(released.front(),ControlPath::Wss),"buffered event failed exact floor/scope revalidation");
+  expect(pending_statuses(h.sender).empty()&&!h.sender.status(released.front(),ControlPath::Wss),"candidate event was delivered twice");
+}
 void bounded_history_and_one_probe() {
   Harness h; auto first = h.reply(h.command(1000));
   expect(h.sender.status().at("probe_pending") == true, "probe was not reserved");
@@ -144,11 +161,12 @@ void bounded_history_and_one_probe() {
   expect(h.sender.status().at("retained_sends") == 128 && !h.sender.matches_event(first), "feedback history grew or retained evicted old event");
 }
 }
-int main() {
+int main(int argc,char** argv) {
   try {
+    if(argc>1&&std::string_view(argv[1])=="--review-r6-only"){review_r6_candidate_status_survives_selection_confirmation();return 0;}
     vehicle_selection_cas_scope_and_no_motion_dependency(); four_forward_return_combinations_and_preferred_p2p();
     feedback_loss_falls_back_without_changing_command_axis(); old_epoch_high_sequence_is_filtered_before_status_watermark();
-    exact_results_reject_duplicates_reordering_and_context_changes(); lost_selection_reconciles_only_from_its_exact_result(); bounded_history_and_one_probe();
-    std::cout << "7 production feedback transport groups passed; real MAC, four forward/return combinations, no sockets\n";
+    exact_results_reject_duplicates_reordering_and_context_changes(); lost_selection_reconciles_only_from_its_exact_result(); bounded_history_and_one_probe(); review_r6_candidate_status_survives_selection_confirmation();
+    std::cout << "8 production feedback transport groups passed; real MAC, four forward/return combinations, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

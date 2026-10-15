@@ -5424,6 +5424,9 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
     const auto receipt = feedback_transport_sender_.result(result,
         direct_return ? detail::ControlPath::DataChannel : detail::ControlPath::Wss, now);
     if (receipt.boundary) {
+      for (const auto& status : feedback_transport_sender_.take_pending_statuses())
+        consume_feedback_status_locked(status, session, vehicle, driver,
+            detail::FeedbackTransportStamp::parse(status.at("feedback_transport")).path);
       control_transport_sender_.reset_feedback_comparison();
       if (native_control_trace_) native_control_trace_->enqueue({{"stage", "feedback_transport_selected"},
           {"trace_session_id", session}, {"seq", result.at("command_seq")}, {"feedback_transport", result.at("feedback_transport")},
