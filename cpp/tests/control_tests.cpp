@@ -5,6 +5,7 @@
 #include "mine_teleop/server.hpp"
 
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -5530,6 +5531,8 @@ void test_websocket_client_preserves_partial_ack_across_polls() {
     auto outbound_received = std::make_shared<std::atomic<bool>>(false);
     auto server_peer_port = std::make_shared<std::atomic<unsigned>>(0);
     auto server_local_port = std::make_shared<std::atomic<unsigned>>(0);
+    auto server_nodelay_before = std::make_shared<std::atomic<int>>(-1);
+    auto server_nodelay_after = std::make_shared<std::atomic<int>>(-1);
     const mine_teleop::Json acknowledgement = {{"event", "signaling_ack"}, {"padding", std::string(payload_size, 'a')}};
     mine_teleop::SimpleHttpServer server(
         "127.0.0.1", 0, [](const auto&) { return mine_teleop::ServerResponse::json(404, {}); },
@@ -5538,7 +5541,19 @@ void test_websocket_client_preserves_partial_ack_across_polls() {
           raw_send_all(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
               "Sec-WebSocket-Accept: " + mine_teleop::websocket_accept_key(request.headers.at("sec-websocket-key")) +
               "\r\nX-Mine-Teleop-Control-Capabilities: " + std::string(mine_teleop::kNativeControlCapabilities) + "\r\n\r\n");
+          int no_delay = -1;
+          socklen_t option_size = sizeof(no_delay);
+          if (::getsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &no_delay, &option_size) == 0)
+            server_nodelay_before->store(no_delay);
+          // Test the accepted TCP socket, independently of listener inheritance
+          // and the client's own policy. Keep socketpair fixtures unchanged.
+          no_delay = 0;
+          expect(::setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay)) == 0,
+              "could not prepare accepted TCP socket with Nagle enabled");
           mine_teleop::ServerWebSocketConnection diagnostic_connection(socket, 512 * 1024);
+          option_size = sizeof(no_delay);
+          if (::getsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &no_delay, &option_size) == 0)
+            server_nodelay_after->store(no_delay);
           const auto transport = diagnostic_connection.transport_diagnostics();
           server_peer_port->store(static_cast<unsigned>(std::stoul(transport.at("peer_port").get<std::string>())));
           server_local_port->store(static_cast<unsigned>(std::stoul(transport.at("local_port").get<std::string>())));
@@ -5586,6 +5601,11 @@ void test_websocket_client_preserves_partial_ack_across_polls() {
       while (!prefix_sent->load() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       expect(prefix_sent->load(), "partial ACK fixture did not send a prefix");
+      // An enabled boolean socket option may be returned as a platform flag.
+      expect(server_nodelay_before->load() >= 0 && server_nodelay_after->load() > 0,
+          "server websocket left Nagle enabled on its accepted TCP socket: before=" +
+              std::to_string(server_nodelay_before->load()) + ":after=" +
+              std::to_string(server_nodelay_after->load()));
       std::int64_t prefix_observed_ms = 0;
       for (int poll = 0; poll < 3; ++poll) {
         const auto partial = client.receive_json(std::chrono::milliseconds(poll == 0 ? 10 : 0));

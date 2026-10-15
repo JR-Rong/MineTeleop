@@ -514,6 +514,10 @@ std::string signaling_websocket_url(
 ServerWebSocketConnection::ServerWebSocketConnection(SocketHandle socket, std::size_t max_message_bytes)
     : socket_(socket), max_message_bytes_(max_message_bytes) {
   if (socket_ < 0 || max_message_bytes_ == 0) throw std::invalid_argument("invalid server websocket connection");
+  // ACKs and control deliveries are small latency-sensitive frames. Apply the
+  // same policy as the client to the accepted TCP socket; non-TCP test sockets
+  // continue to work when this optional socket option is unsupported.
+  enable_tcp_nodelay_best_effort(native_socket(socket_));
 }
 
 void ServerWebSocketConnection::send_frame(std::uint8_t opcode, std::string_view payload) const {
