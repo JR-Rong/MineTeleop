@@ -1480,7 +1480,7 @@ struct VehicleMediaRuntime::Impl {
         }
         SessionControlProfileResult result;
         if (stop_requested || control_inhibited || !control_service_started ||
-            !control_service || (!control_link_open && !control_transport_fence.negotiated())) {
+            !control_service || (!control_link_open && !control_transport_fence.negotiated() && !cloud_control_authority_live_locked())) {
           result.protocol_version = request.protocol_version;
           result.vehicle_id = request.vehicle_id;
           result.driver_id = request.driver_id;
@@ -1516,7 +1516,7 @@ struct VehicleMediaRuntime::Impl {
         if (transport != ControlMessageTransport::DataChannel && !control_transport_fence.negotiated() && !direct_authority.valid(steady_now_ms())) { ++rejected_control_commands; return; }
         if (transport == ControlMessageTransport::DataChannel && control_channel != channel) return;
         if (stop_requested || control_inhibited || !control_service_started ||
-            !control_service || (!control_link_open && !control_transport_fence.negotiated())) {
+            !control_service || (!control_link_open && !control_transport_fence.negotiated() && !cloud_control_authority_live_locked())) {
           send_vcu_handshake_status_locked("driver_not_connected");
           return;
         }
@@ -1797,7 +1797,7 @@ struct VehicleMediaRuntime::Impl {
         }
       };
       if (stop_requested || control_inhibited ||
-          !control_service_started || !control_service || (!control_link_open && !control_transport_fence.negotiated())) {
+          !control_service_started || !control_service || (!control_link_open && !control_transport_fence.negotiated() && !cloud_control_authority_live_locked())) {
         ++rejected_control_commands;
         const std::string_view reason = stop_requested
             ? "runtime_stop_requested"
@@ -2910,16 +2910,17 @@ struct VehicleMediaRuntime::Impl {
     if (control_channel != nullptr && control_link_open &&
         (!control_transport_fence.negotiated() || control_transport_fence.path() == detail::ControlPath::DataChannel)) {
       gst_webrtc_data_channel_send_string(control_channel, message.dump().c_str());
-    } else if (control_transport_fence.negotiated()) {
+    } else if (control_transport_fence.negotiated() || cloud_control_authority_live_locked()) {
       if ((message.contains("session_id") && message.at("session_id") != signaling.session_id()) ||
           (message.contains("vehicle_id") && message.at("vehicle_id") != config.vehicle_id) ||
           (message.contains("driver_id") && message.at("driver_id") != signaling.driver_id())) return;
-      pending_control_status[message.value("event", "unknown")] = std::move(message);
+      const auto event = message.value("event", "unknown");
+      pending_control_status[event] = std::move(message);
     }
   }
 
   void send_latest_vehicle_telemetry_locked() {
-    if ((!control_link_open && !control_transport_fence.negotiated()) ||
+    if ((!control_link_open && !control_transport_fence.negotiated() && !cloud_control_authority_live_locked()) ||
         !control_service_started || !control_service) {
       return;
     }
@@ -2936,7 +2937,7 @@ struct VehicleMediaRuntime::Impl {
 
   void send_session_control_profile_status_locked(
       const SessionControlProfileResult& result) {
-    if (!control_link_open && !control_transport_fence.negotiated()) return;
+    if (!control_link_open && !control_transport_fence.negotiated() && !cloud_control_authority_live_locked()) return;
     auto message = result.to_json();
     message["event"] = "session_control_profile_status";
     message["control_status_seq"] = ++control_status_seq;
@@ -2953,7 +2954,7 @@ struct VehicleMediaRuntime::Impl {
   }
 
   void send_vcu_handshake_status_locked(std::string_view result) {
-    if (!control_link_open && !control_transport_fence.negotiated()) return;
+    if (!control_link_open && !control_transport_fence.negotiated() && !cloud_control_authority_live_locked()) return;
     try {
       VcuHandshakeStatus status;
       Json hard_limits = configured_control_limits();
@@ -3353,12 +3354,19 @@ struct VehicleMediaRuntime::Impl {
     apply_control_recovery_phase(phase, failed_lane, !was_waiting && phase == ControlRecoveryPhase::BrakingWait);
   }
 
+  // Called with control_mutex held. This grants no offline authority: both
+  // the authenticated native socket and the regular cloud lease must be live.
+  bool cloud_control_authority_live_locked() const {
+    return native_control_websocket_connected.load() && native_control_transport_cloud_capable.load() &&
+        signaling.control_lease_expiry() > signaling.now_ms();
+  }
+
   void start_control_when_cameras_ready() {
     if (!config.runtime.control_enabled || control_inhibited || !critical_cameras_ready()) return;
     {
       std::lock_guard lock(control_mutex);
-      if (stop_requested || !control_link_open || control_channel == nullptr ||
-          control_service_started || control_service_issue_code != "critical_camera_not_ready") {
+      if (stop_requested || (!(control_link_open && control_channel != nullptr) && !cloud_control_authority_live_locked()) ||
+          control_service_started || (control_service_issue_code != "critical_camera_not_ready" && !control_service_issue_code.empty())) {
         return;
       }
     }
@@ -3390,7 +3398,7 @@ struct VehicleMediaRuntime::Impl {
         // state while holding the same mutex used by stop_pipeline before
         // opening CAN, otherwise a late callback could resurrect the adapter
         // after the session has already closed.
-        if (stop_requested || !control_link_open || control_channel == nullptr) {
+        if (stop_requested || (!(control_link_open && control_channel != nullptr) && !cloud_control_authority_live_locked())) {
           return false;
         }
         if (control_inhibited) {
@@ -3626,12 +3634,12 @@ struct VehicleMediaRuntime::Impl {
       }
       return;
     }
-    if ((control_link_open || control_transport_fence.negotiated()) &&
+    if ((control_link_open || control_transport_fence.negotiated() || cloud_control_authority_live_locked()) &&
         (!last_vcu_status_ms || timestamp_ms - *last_vcu_status_ms >= 500)) {
       send_vcu_handshake_status_locked("status_update");
       last_vcu_status_ms = timestamp_ms;
     }
-    if (control_link_open || control_transport_fence.negotiated()) send_latest_vehicle_telemetry_locked();
+    if (control_link_open || control_transport_fence.negotiated() || cloud_control_authority_live_locked()) send_latest_vehicle_telemetry_locked();
   }
 
   [[nodiscard]] std::string current_pipeline_error() const {

@@ -227,6 +227,46 @@ test('R5 a closed channel or invalid buffer evidence is terminal rather than gue
     assert.equal(f.requests[1].last_seen_seq,1);assert.equal(f.sent.length,0,'unknown channel state retried');
   }
 });
+test('product reads the SCTP selected candidate pair and never media statistics',async()=>{
+  const channel={readyState:'open'};
+  let pair={local:{type:'host'},remote:{type:'srflx'}};
+  const ice={state:'connected',getSelectedCandidatePair:()=>pair};
+  const peer={connectionState:'connected',sctp:{state:'connected',transport:{state:'connected',iceTransport:ice}}};
+  assert.deepEqual(api.dataChannelRoute(peer,channel),{networkPath:'p2p',ready:true});
+  for(const type of ['host','srflx','prflx']) {
+    pair={local:{type},remote:{type:'prflx'}};
+    assert.equal(api.dataChannelRoute(peer,channel).ready,true);
+  }
+  for(const side of ['local','remote']) {
+    pair={local:{type:'host'},remote:{type:'srflx'}};pair[side].type='relay';
+    assert.deepEqual(api.dataChannelRoute(peer,channel),{networkPath:'turn_unknown',ready:false});
+  }
+  for(const invalid of [null,{}, {local:{type:'host'}}, {local:{type:'host'},remote:{type:'unknown'}}]) {
+    pair=invalid;assert.deepEqual(api.dataChannelRoute(peer,channel),{networkPath:'unknown',ready:false});
+  }
+  ice.getSelectedCandidatePair=()=>{throw Error('unsupported')};
+  assert.equal(api.dataChannelRoute(peer,channel).ready,false);
+  assert.equal(api.dataChannelRoute({connectionState:'connected'},channel).ready,false);
+  ice.getSelectedCandidatePair=()=>({local:{type:'host'},remote:{type:'host'}});
+  assert.equal(api.dataChannelRoute(peer,channel,'cloud_only').ready,false);
+  for(const target of [peer,peer.sctp,peer.sctp.transport,ice,channel]) {
+    const key=target===peer?'connectionState':target===channel?'readyState':'state',old=target[key];
+    target[key]='disconnected';assert.equal(api.dataChannelRoute(peer,channel).ready,false);target[key]=old;
+  }
+});
+test('a P2P to TURN switch while fetching discards native bytes without replay',async()=>{
+  const f=fixture();f.setScope({...f.scope(),networkPath:'p2p',ready:true});
+  let resolve;f.setReply(()=>new Promise(done=>resolve=done));const pending=f.courier.tick();
+  f.setScope({...f.scope(),networkPath:'turn_unknown',ready:false});
+  resolve({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:1},valid_for_ms:100,frame_json:'{}',
+    frame:{seq:1,session_id:'s',control_transport:{protocol:api.protocol,path:'dc',media_attempt:'a'}}});
+  await pending;assert.equal(f.frames.length,0);
+  f.setScope({...f.scope(),networkPath:'p2p',ready:true});
+  f.setReply(()=>({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:1},valid_for_ms:100,frame_json:'{}',
+    frame:{seq:1,session_id:'s',control_transport:{protocol:api.protocol,path:'dc',media_attempt:'a'}}}));
+  await f.courier.tick();assert.equal(f.frames.length,0,'discarded pre-switch packet replayed');
+  assert.equal(f.requests[1].body.last_seen_seq,1);
+});
 (async()=>{
   const selected=process.argv.includes('--r5-only')?cases.filter(value=>value.name.startsWith('R5 ')):cases;
   for(const {name,action} of selected){await action();console.log('PASS '+name)}

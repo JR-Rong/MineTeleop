@@ -79,6 +79,7 @@ class Arguments {
         "--driver-password",
         "--signaling-url",
         "--ice-transport-policy",
+        "--control-transport",
         "--no-open-browser",
         "--desktop-managed",
         "--browser-event-log",
@@ -130,6 +131,7 @@ Options:
   --driver-password VALUE    development override (prefer MINE_TELEOP_DRIVER_PASSWORD)
   --signaling-url URL        override cloud.signaling_url
   --ice-transport-policy P   all (default) or relay (forced TURN)
+  --control-transport P     p2p_preferred (default) or cloud_only
   --no-open-browser          do not open the default browser
   --desktop-managed          exit when the owning desktop pipe closes
   --browser-event-log PATH   write browser events outside the application bundle
@@ -207,6 +209,12 @@ int run(const Arguments& arguments, const char* executable) {
       throw std::invalid_argument("--ice-transport-policy must be all or relay");
     }
     config.ice_transport_policy = ice_transport_policy;
+  }
+  const auto control_transport_mode = arguments.value("--control-transport");
+  if (!control_transport_mode.empty()) {
+    if (!mine_teleop::control_transport_mode_is_valid(control_transport_mode))
+      throw std::invalid_argument("--control-transport must be p2p_preferred or cloud_only");
+    config.control_transport_mode = control_transport_mode;
   }
   const auto configured_password = environment("MINE_TELEOP_DRIVER_PASSWORD");
   const auto password = arguments.value(

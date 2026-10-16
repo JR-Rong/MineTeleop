@@ -38,6 +38,8 @@ struct Fixture {
   std::jthread car_watchdog;
   std::filesystem::path authority_directory;
   bool direct_enabled{false}, cloud_online{true};
+  std::string dc_network_path{"unknown"}, last_result_reason;
+  double requested_throttle{0.0};
   std::uint64_t lease_nonce{0};
   std::string base, session, control_token, signing_key;
   std::uint64_t generation{0}, native_generation{0}, ui_epoch{0}, intent_seq{0}, result_seq{0}, last_dc_seq{0};
@@ -45,7 +47,8 @@ struct Fixture {
   std::int64_t last_input{0};
   std::deque<std::pair<std::int64_t, Json>> delayed;
   std::vector<Json> received_statuses;
-  explicit Fixture(bool direct = false, bool feedback = false) : feedback_enabled(feedback), direct_enabled(direct) {
+  explicit Fixture(bool direct = false, bool feedback = false, bool product = false,
+      std::string mode = "p2p_preferred") : feedback_enabled(feedback), direct_enabled(direct) {
     SignalingServerConfig config;
     if (direct_enabled) {
       authority_directory = std::filesystem::temp_directory_path() / ("mine-direct-loopback-" + std::to_string(steady()));
@@ -65,7 +68,12 @@ struct Fixture {
         {"device_token", "fixture-device"}, {"connection_id", "offline-transport-runtime"},
         {"native_control_capabilities", kNativeControlCapabilities}});
     generation = online.at("connection_generation").get<std::uint64_t>();
-    DriverConfig driver_config; driver_config.enable_experimental_control_transport = true; driver_config.driver_id = "transport-driver"; driver_config.signaling_url = base;
+    auto driver_config = product ? load_driver_config("configs/driver-console.dev.yaml") : DriverConfig{};
+    driver_config.control_transport_mode = std::move(mode);
+    driver_config.browser_event_log_path.clear();
+    driver_config.enable_experimental_control_transport = !product;
+    driver_config.driver_id = "transport-driver"; driver_config.signaling_url = base;
+    dc_network_path = direct_enabled ? "p2p" : "unknown";
     driver_config.enable_experimental_direct_authority = direct_enabled;
     driver = std::make_unique<DriverConsoleRuntime>(driver_config, "transport-vehicle", "fixture-password");
     const auto connected = driver->connect("transport-vehicle", "owner");
@@ -151,17 +159,17 @@ struct Fixture {
     const auto status = driver->status();
     auto result = driver->update_control_intent({{"session_id", session}, {"session_generation", status.at("control_session_generation")},
         {"ui_instance_id", "owner"}, {"ui_control_epoch", ui_epoch}, {"takeover", ui_epoch == 0},
-        {"intent_seq", ++intent_seq}, {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0},
+        {"intent_seq", ++intent_seq}, {"gear", requested_throttle > 0 ? "D" : "N"}, {"steering", 0.0}, {"throttle", requested_throttle}, {"brake", 0.0},
         {"estop", false}, {"critical_video_ready", true}, {"critical_video_sample_healthy", true},
         {"critical_video_bad_sample_revision", std::uint64_t{0}}, {"critical_video_brake_revision", std::uint64_t{0}}});
-    expect(result.at("accepted").get<bool>(), "native neutral lease update rejected");
+    expect(result.at("accepted").get<bool>() || (requested_throttle > 0 && result.at("requires_fresh_input").get<bool>()), "native input update rejected outside the recovery interlock");
     ui_epoch = result.at("ui_control_epoch").get<std::uint64_t>(); last_input = steady();
   }
   Json scope(bool ready) {
     const auto status = driver->status();
     return {{"source_session_id", session}, {"source_control_session_generation", status.at("control_session_generation")},
         {"media_negotiation_id", media_attempt}, {"ui_instance_id", "owner"}, {"ui_control_epoch", ui_epoch},
-        {"dc_ready", ready}, {"dc_network_path", direct_enabled ? "p2p" : "unknown"}, {"last_seen_seq", last_dc_seq}};
+        {"dc_ready", ready}, {"dc_network_path", dc_network_path}, {"last_seen_seq", last_dc_seq}};
   }
   Json apply(const Json& payload, ControlPath path) {
     std::lock_guard lock(car_mutex);
@@ -179,7 +187,7 @@ struct Fixture {
     ControlTransportFence::Decision decision{false, false, "direct_authority_unavailable"};
     if (!direct_enabled || command.estop || car_authority.allows(payload.value("direct_authority", Json(nullptr)), steady()))
       decision = fence.admit(command, payload.contains("control_transport") ? &payload.at("control_transport") : nullptr,
-          path, media_attempt, utc(), car_control_lease_expiry, 200, !direct_enabled || car_authority.valid(steady()), verified_stop);
+          path, media_attempt, utc(), car_control_lease_expiry, 200, direct_enabled ? car_authority.valid(steady()) : cloud_online, verified_stop);
     if (feedback_enabled && decision.admitted && !command.estop && payload.contains("feedback_request")) {
       static_cast<void>(feedback_fence.select(payload.at("feedback_request"), car_authority.reference(), media_attempt, feedback_status_sequence));
       last_feedback_command = payload;
@@ -211,6 +219,7 @@ struct Fixture {
       result["emergency_stop"] = payload.at("emergency_stop");
       result["software_estop_latched"] = vehicle->safety_state() == SafetyState::Estop;
     }
+    last_result_reason = result.at("reason").get<std::string>();
     result["vehicle_mac"] = transport_message_mac(result, signing_key, true);
     if (verified_stop) expect(emergency_receiver.complete(payload, result), "production emergency cache did not commit result");
     return result;
@@ -279,6 +288,77 @@ struct Fixture {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 };
+void product_startup_and_p2p_cloud_recovery() {
+  Fixture fixture(false, false, true);
+  auto state = [&] { return fixture.driver->status().at("native_control").at("control_transport"); };
+  auto until = [&](std::string_view path, std::uint64_t after_epoch, bool ready) {
+    const auto deadline = steady() + 8000;
+    while (steady() < deadline) {
+      fixture.pump(ready); const auto value = state();
+      if (value.at("path") == path && value.at("epoch").get<std::uint64_t>() > after_epoch &&
+          !value.at("selecting").get<bool>() && !value.at("qualifying").get<bool>()) return value.at("epoch").get<std::uint64_t>();
+    }
+    throw std::runtime_error("product failed route qualification: " + fixture.last_result_reason + " " + state().dump());
+  };
+  const auto cloud_epoch = until("wss", 0, false);
+  expect(fixture.wss_commands > 0 && fixture.dc_commands == 0 && state().at("mode") == "p2p_preferred" &&
+      state().at("experimental_enabled") == false && state().at("direct_authority").at("configured") == false,
+      "normal YAML startup required experimental flags/DC/short authority");
+  fixture.dc_network_path = "turn_unknown";
+  const auto relay_deadline = steady() + 250;
+  while (steady() < relay_deadline) fixture.pump(true);
+  expect(fixture.dc_commands == 0 && state().at("path") == "wss", "TURN was called product P2P");
+  fixture.dc_network_path = "p2p";
+  const auto direct_epoch = until("dc", cloud_epoch, true);
+  const auto retired = fixture.last_received_payload;
+  // The page continues refreshing an old held motion request across both
+  // switches. Native must keep it neutral until a real release/repress.
+  fixture.input(); // Release the completed initial route boundary before pressing motion.
+  fixture.requested_throttle = 0.4; fixture.input();
+  fixture.dc_network_path = "unknown";
+  const auto fallback_epoch = until("wss", direct_epoch, true);
+  expect(fixture.fence.path() == ControlPath::Wss && fixture.apply(retired, ControlPath::DataChannel).at("transport_admitted") == false,
+      "retired direct command re-entered after fallback");
+  fixture.input();
+  expect(fixture.driver->status().at("native_control").at("requires_fresh_input") == true &&
+      fixture.driver->status().at("native_control").at("effective_throttle") == 0.0 &&
+      fixture.last_received_payload.at("throttle") == 0.0,
+      "held pre-switch motion rearmed after cloud fallback");
+  // Release inside the existing 800ms vehicle watchdog. Keeping a rejected
+  // nonzero request through the entire 5s retry delay must hard-stop, not renew
+  // the input lease or install a new profile.
+  fixture.requested_throttle = 0.0; fixture.input();
+  fixture.dc_network_path = "p2p";
+  const auto recovered_epoch = until("dc", fallback_epoch, true);
+  expect(recovered_epoch > fallback_epoch, "recovered P2P reused an old route epoch");
+  fixture.requested_throttle = 0.4; fixture.input();
+  expect(fixture.driver->status().at("native_control").at("requires_fresh_input") == true &&
+      fixture.driver->status().at("native_control").at("effective_throttle") == 0.0,
+      "P2P recovery bypassed the release/repress interlock");
+  fixture.requested_throttle = 0.0; fixture.input();
+  expect(fixture.driver->status().at("native_control").at("requires_fresh_input") == false,
+      "actual neutral release did not retire the recovered input latch");
+  auto fresh = fixture.last_received_payload;
+  fresh["seq"] = fresh.at("seq").get<std::uint64_t>() + 1000;
+  fresh["sent_at_utc_ms"] = utc();
+  fresh["native_mac"] = transport_message_mac(fresh, fixture.signing_key, false);
+  fixture.cloud_online = false;
+  const auto denied = fixture.apply(fresh, ControlPath::DataChannel);
+  fixture.cloud_online = true;
+  expect(denied.at("transport_admitted") == false && denied.at("reason") == "transport_authority_unavailable",
+      "product P2P survived loss of live cloud authority");
+  fixture.car_control_lease_expiry = utc() - 1;
+  expect(fixture.apply(fresh, ControlPath::DataChannel).at("reason") == "transport_authority_unavailable", "expired regular lease admitted P2P");
+  std::cout << "[PRODUCT_DIRECT] normal YAML, live cloud authority, no-DC bootstrap, TURN exclusion, P2P/cloud/P2P epochs passed\n";
+}
+void product_cloud_only_never_trials_dc() {
+  Fixture fixture(false, false, true, "cloud_only"); fixture.dc_network_path = "p2p";
+  const auto deadline = steady() + 700;
+  while (steady() < deadline) fixture.pump(true);
+  const auto state = fixture.driver->status().at("native_control").at("control_transport");
+  expect(state.at("epoch").get<std::uint64_t>() > 0 && state.at("path") == "wss" && fixture.dc_commands == 0 && fixture.wss_commands > 0,
+      "cloud_only product configuration trialled direct commands");
+}
 void integration() {
   Fixture fixture;
   const auto deadline = steady() + 10000;
@@ -651,6 +731,6 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
 }
 }  // namespace
 int main(int argc, char** argv) {
-  try { if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

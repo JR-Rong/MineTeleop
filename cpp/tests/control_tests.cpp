@@ -2315,7 +2315,7 @@ void test_vehicle_native_signaling_control_transport_is_single_path() {
   expect(
       native_command_path.find("if (control_channel != channel) return;") == std::string::npos &&
           native_command_path.find("if (transport == ControlMessageTransport::DataChannel && control_channel != channel) return;") != std::string::npos &&
-          native_command_path.find("!control_service_started || !control_service || (!control_link_open && !control_transport_fence.negotiated())") !=
+          native_command_path.find("!control_service_started || !control_service || (!control_link_open && !control_transport_fence.negotiated() && !cloud_control_authority_live_locked())") !=
               std::string::npos &&
           native_command_path.find("control_inhibited") != std::string::npos,
       "native signaling control either depends on a browser channel pointer or bypasses readiness gates");

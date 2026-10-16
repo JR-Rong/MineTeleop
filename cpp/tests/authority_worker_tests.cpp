@@ -39,7 +39,7 @@ struct FixtureSignaling {
  auto response=grant.json();response["control_token_expires_at_utc_ms"]=2000;return response;}
  struct Clock{int uncertainty_ms=0; bool acceptable(int)const{return true;}};
  Clock time_sync_status(){return {};}
- std::int64_t now_ms(){return utc;}
+ std::int64_t now_ms()const{return utc;}
 };
 struct Worker {
  FixtureSignaling signaling;
@@ -47,6 +47,7 @@ struct Worker {
  std::atomic<bool> stop_requested{false};std::mutex control_mutex;DirectAuthorityLease direct_authority;
  bool control_service_started=true;std::unique_ptr<test::LogicalTimeControlService> control_service;
  void invalidate_native_control_trusted_gear_locked(){}
+ std::atomic<bool> native_control_websocket_connected{false}, native_control_transport_cloud_capable{false};
  std::atomic<bool> control_inhibited{false}; bool control_link_open=false, direct_authority_stop_failed=false;
  EmergencyStopReceiver emergency_stop_receiver; ControlTransportFence control_transport_fence;
  std::optional<std::int64_t> last_vcu_status_ms; std::string control_service_issue_code;

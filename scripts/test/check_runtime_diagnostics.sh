@@ -97,7 +97,7 @@ critical_camera_block="$(sed -n '/  void inhibit_control_for_recovery(/,/  \[\[n
 
 for contract in \
   'control DataChannel open starts the VCU adapter|self->start_control_service()' \
-  'session teardown cannot resurrect the VCU adapter|stop_requested || !control_link_open || control_channel == nullptr' \
+  'session teardown cannot resurrect the VCU adapter|stop_requested || (!(control_link_open && control_channel != nullptr) && !cloud_control_authority_live_locked())' \
   'adapter startup failure keeps video alive|control_not_started_video_continues' \
   'adapter startup failure closes only the unsafe control channel|gst_webrtc_data_channel_close(channel)' \
   'adapter runtime failure reports a control-only fault|adapter_runtime_failed' \

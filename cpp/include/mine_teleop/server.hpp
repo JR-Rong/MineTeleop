@@ -373,8 +373,9 @@ struct DriverConfig {
   std::vector<std::string> resolve_entries;
   std::filesystem::path ca_bundle;
   std::string ice_transport_policy{"all"};
-  // Internal opt-in for controlled validation; no YAML/CLI activation until
-  // the direct-control cloud-authority failure policy has been reviewed.
+  // Ordinary control keeps live cloud authority in both product modes.
+  // Experimental relay comparison and short offline authority remain separate.
+  std::string control_transport_mode{"p2p_preferred"};
   bool enable_experimental_control_transport{false};
   bool enable_experimental_direct_authority{false};
   std::filesystem::path browser_event_log_path;
@@ -392,6 +393,10 @@ struct DriverConfig {
 };
 
 DriverConfig load_driver_config(const std::string& path);
+
+inline bool control_transport_mode_is_valid(std::string_view mode) {
+  return mode == "p2p_preferred" || mode == "cloud_only";
+}
 
 class DriverConsoleRuntime {
  public:
@@ -594,6 +599,7 @@ class DriverConsoleRuntime {
   std::int64_t emergency_stop_published_ms_{};
   detail::VehicleResultLatencyWindow emergency_stop_latency_;
   bool control_transport_dc_ready_{false};
+  std::string control_transport_dc_network_path_{"unknown"};
   std::string control_transport_bridge_attempt_, control_transport_bridge_owner_;
   std::uint64_t control_transport_bridge_ui_epoch_{0};
   std::int64_t control_transport_bridge_seen_ms_{0};

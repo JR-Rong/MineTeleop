@@ -1375,7 +1375,7 @@ function requireLogin(message){closeRealtimeSession();authenticated=false;contro
 function handleVehicleRefreshError(error){if(error.status===401){requireLogin('登录已失效，请重新认证: '+error.message);return}statusPanel.textContent='车辆状态刷新失败，当前会话已保留: '+error.message;clientLog('vehicle_list_refresh_failed',{error:error.message})}
 async function login(){const driver_id=driverIdInput.value.trim();if(!driver_id)throw Error('请输入驾驶员 ID');const password=passwordInput.value;if(!password)throw Error('请输入驾驶员密码');passwordInput.value='';const result=await post('/api/login',{driver_id,password});authenticated=true;controlAuthorityLost=false;webrtcLabel.textContent='未连接';loginPanel.hidden=true;sessionPanel.hidden=false;vcuPanel.hidden=false;renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);sampleGamepad();latestRuntimeStatus=await get('/api/status');renderMonitoring();statusPanel.textContent=`已登录 ${result.driver_id}，请选择在线车辆`;clientLog('driver_login_succeeded',{driver_id:result.driver_id,authorized_vehicle_count:(result.vehicles||[]).length})}
 async function refreshVehicles(){if(!authenticated)return;const result=await get('/api/vehicles');renderVehicles(result.vehicles||[]);renderAuthExpiry(result.token_expires_at_utc_ms);if(result.signaling_available===false&&result.direct_authority_continuation!==true){controlAuthorityLost=true;resetControlAuthorityInput();connectButton.disabled=true;statusPanel.textContent='信令服务暂时不可用；车辆列表为安全快照，禁止建立控制会话';renderMonitoring();return}if(result.signaling_restart_recovered){closeRealtimeSession();controlAuthorityLost=true;latestRuntimeStatus=await get('/api/status');connectButton.textContent='连接所选车辆';webrtcLabel.textContent='服务已恢复，需重新建立控制会话';statusPanel.textContent='信令服务已重启，驾驶员身份已自动恢复；旧控制权未恢复，请重新选择车辆';clientLog('signaling_restart_recovered',{previous_service_instance_id:result.previous_service_instance_id,service_instance_id:result.service_instance_id,control_authority_recovered:false});renderMonitoring()}}
-function sendVcuHandshakeCommand(action){if((!controlChannel||controlChannel.readyState!=='open')&&!controlTransportCourier.negotiated())throw Error('控制传输尚未连接');if(action==='connect'&&!controlProfileState.acknowledged)throw Error('会话控制参数尚未获得车端确认');if(vcuHandshake.adapter_ready!==true)throw Error('VCU 适配器尚未就绪');if(!['connect','disconnect'].includes(action))throw Error('VCU 握手命令非法');if(action==='disconnect'){resetControlAuthorityInput();vcuHandshake={...vcuHandshake,ready:false,disarming:true}}else{gearRejectionInhibited=false;vcuHandshake={...vcuHandshake,requested:true}}renderMonitoring();const message={event:'vcu_handshake_command',action,sent_at_utc_ms:Date.now()};let delivery;if(controlChannel?.readyState==='open'&&(action==='disconnect'||latestRuntimeStatus.native_control?.control_transport?.direct_authority?.configured!==true))controlChannel.send(JSON.stringify(message));else delivery=sendControlManagement(message);clientLog('driver_vcu_handshake_command',{action});statusPanel.textContent=action==='connect'?'已请求开始 VCU 平行驾驶握手':'已请求安全断开 VCU 握手';return delivery}
+function sendVcuHandshakeCommand(action){if((!controlChannel||controlChannel.readyState!=='open')&&!controlTransportCourier.negotiated())throw Error('控制传输尚未连接');if(action==='connect'&&!controlProfileState.acknowledged)throw Error('会话控制参数尚未获得车端确认');if(vcuHandshake.adapter_ready!==true)throw Error('VCU 适配器尚未就绪');if(!['connect','disconnect'].includes(action))throw Error('VCU 握手命令非法');if(action==='disconnect'){resetControlAuthorityInput();vcuHandshake={...vcuHandshake,ready:false,disarming:true}}else{gearRejectionInhibited=false;vcuHandshake={...vcuHandshake,requested:true}}renderMonitoring();const message={event:'vcu_handshake_command',action,sent_at_utc_ms:Date.now()};const delivery=sendControlManagement(message);clientLog('driver_vcu_handshake_command',{action});statusPanel.textContent=action==='connect'?'已请求开始 VCU 平行驾驶握手':'已请求安全断开 VCU 握手';return delivery}
 let lastCriticalVideoHealthKey='',lastCriticalVideoHealthLogAt=null;
 function recordCriticalVideoHealth(health,staleMs){
   if(!polling)return health;
@@ -1686,7 +1686,7 @@ function controlManagementScope(){return{source_session_id:nativeControlSessionI
   media_negotiation_id:mediaOfferScope?.id||'',ui_instance_id:uiInstanceId,ui_control_epoch:nativeControlUiEpoch}}
 function sendControlManagement(message){
   const authority=latestRuntimeStatus.native_control?.control_transport?.direct_authority||{},disconnect=message.event==='vcu_handshake_command'&&message.action==='disconnect';
-  if(controlChannel?.readyState==='open'&&(!authority.configured||disconnect)){controlChannel.send(JSON.stringify(message));return Promise.resolve()}
+  if(!controlTransportCourier.negotiated()&&controlChannel?.readyState==='open'&&(!authority.configured||disconnect)){controlChannel.send(JSON.stringify(message));return Promise.resolve()}
   if(!controlTransportCourier.negotiated()&&authority.valid!==true)return Promise.reject(Error('控制传输尚未协商'));
   return post('/api/control-transport/management',{...controlManagementScope(),message})
 }
@@ -1838,9 +1838,9 @@ async function startFromOffer(offer){
   }catch(error){if(current())throw error}
 }
 const controlTransportCourier=MineTeleopControlTransport.createCourier({
-  scope:()=>latestRuntimeStatus.native_control?.control_transport?.experimental_enabled===true&&polling&&!controlAuthorityLost&&nativeControlSessionId&&mediaOfferScope?.id?{
+  scope:()=>latestRuntimeStatus.native_control?.control_transport?.enabled===true&&polling&&!controlAuthorityLost&&nativeControlSessionId&&mediaOfferScope?.id?{
     session:nativeControlSessionId,generation:nativeControlSessionGeneration,ui:uiInstanceId,uiEpoch:nativeControlUiEpoch,
-    attempt:mediaOfferScope.id,networkPath:latestMetrics.media_negotiation_id===mediaOfferScope.id?(latestMetrics.network_path||"unknown"):"unknown",ready:Boolean(peer?.connectionState==='connected'&&controlChannel?.readyState==='open')}:null,
+    attempt:mediaOfferScope.id,...MineTeleopControlTransport.dataChannelRoute(peer,controlChannel,latestRuntimeStatus.native_control.control_transport.mode,latestRuntimeStatus.native_control.control_transport.experimental_enabled===true)}:null,
   post,now:()=>performance.now(),onStatus:message=>applyVehicleControlMessage(message,true),
   send:(frame,bytes)=>{if(controlChannel?.readyState==='open'&&Number(controlChannel.bufferedAmount)===0)controlChannel.send(bytes)},
   onBoundary:()=>{clearControlInput(false,'control_transport_boundary',true);lastNativeIntentSnapshot=''},
@@ -5012,6 +5012,10 @@ DriverConfig load_driver_config(const std::string& path) {
         "control.keyboard is no longer supported; keyboard bindings are fixed: "
         "Arrow/WASD directions, Space service brake, B hard brake, E ESTOP");
   }
+  if (root["control"] && root["control"]["transport_mode"])
+    config.control_transport_mode = root["control"]["transport_mode"].as<std::string>();
+  if (!control_transport_mode_is_valid(config.control_transport_mode))
+    throw std::invalid_argument("control.transport_mode must be p2p_preferred or cloud_only");
   if (root["control"] && root["control"]["rate_hz"]) config.rate_hz = root["control"]["rate_hz"].as<int>();
   if (root["control"] && root["control"]["intent_lease_ms"]) {
     config.intent_lease_ms = root["control"]["intent_lease_ms"].as<int>();
@@ -5155,8 +5159,8 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
       http_(std::chrono::seconds(5), config_.resolve_entries, config_.ca_bundle),
       time_sync_http_(std::chrono::milliseconds(500), config_.resolve_entries, config_.ca_bundle),
       native_control_intent_(config_.intent_lease_ms) {
-  if (config_.enable_experimental_direct_authority && !config_.enable_experimental_control_transport)
-    throw std::invalid_argument("short direct authority requires the native control transport capability");
+  if (!control_transport_mode_is_valid(config_.control_transport_mode))
+    throw std::invalid_argument("control.transport_mode must be p2p_preferred or cloud_only");
   if (vehicle_id_.empty()) throw std::invalid_argument("vehicle id is required");
   reset_control_profile_locked();
   if (!signaling_url_is_secure_or_loopback(config_.signaling_url)) {
@@ -5274,7 +5278,7 @@ bool DriverConsoleRuntime::connect_control_signaling_websocket(
     }
   }
   if (control_signaling_websocket_ && control_signaling_websocket_->connected() &&
-      control_signaling_websocket_->url() == url + (config_.enable_experimental_control_transport ? "&transport_protocol=" + std::string(detail::kControlTransportCapability) : "") &&
+      control_signaling_websocket_->url() == url + ("&transport_protocol=" + std::string(detail::kControlTransportCapability)) &&
       control_signaling_websocket_session_id_ == session_id) {
     if (!estop_only && !control_signaling_capabilities_verified_)
       throw std::runtime_error("云端原生控制能力不匹配：缺少恢复反馈或 ACK 制动等待支持，请更新云端包");
@@ -5285,7 +5289,7 @@ bool DriverConsoleRuntime::connect_control_signaling_websocket(
   Json authority_scope;
   { std::lock_guard authority_lock(direct_authority_mutex_); authority_scope = direct_authority_.scope(); }
   try {
-    next->connect(url + (config_.enable_experimental_control_transport ? "&transport_protocol=" + std::string(detail::kControlTransportCapability) : ""),
+    next->connect(url + ("&transport_protocol=" + std::string(detail::kControlTransportCapability)),
         {{"X-Mine-Teleop-Driver-Token", std::string(token)}});
   } catch (const HttpStatusError& error) {
     if (!detail::transient_cloud_failure(error)) {
@@ -5303,7 +5307,7 @@ bool DriverConsoleRuntime::connect_control_signaling_websocket(
   control_signaling_websocket_session_id_ = std::string(session_id);
   control_signaling_websocket_authority_scope_ = std::move(authority_scope);
   control_signaling_capabilities_verified_ = capabilities_verified;
-  control_transport_cloud_capable_ = config_.enable_experimental_control_transport && control_signaling_websocket_->response_header("x-mine-teleop-transport-capabilities") == detail::kControlTransportCapability;
+  control_transport_cloud_capable_ = control_signaling_websocket_->response_header("x-mine-teleop-transport-capabilities") == detail::kControlTransportCapability;
   control_signaling_last_ack_seq_ = 0;
   control_signaling_ack_window_.reset();
   control_signaling_ack_recovery_.connection_reopened(monotonic_now_ms());
@@ -5325,7 +5329,7 @@ void DriverConsoleRuntime::close_control_signaling_websocket() {
   control_transport_sender_.reset(); control_transport_cloud_capable_ = false;
   feedback_transport_sender_.reset(); feedback_transport_enabled_ = feedback_transport_dc_is_p2p_ = false;
   { std::lock_guard authority_lock(direct_authority_mutex_); direct_authority_ = {}; }
-  control_transport_dc_ready_ = false; control_transport_bridge_attempt_.clear();
+  control_transport_dc_ready_ = false; control_transport_dc_network_path_ = "unknown"; control_transport_bridge_attempt_.clear();
   control_transport_bridge_owner_.clear(); control_transport_bridge_seen_ms_ = 0;
   control_transport_latest_dc_ = Json(); control_transport_pending_status_ = Json::object(); control_dc_ack_window_.reset(); control_dc_ack_recovery_.reset();
   control_dc_last_ack_seq_ = 0;
@@ -5671,7 +5675,7 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input) {
     if (ownership.first.empty() || ownership.first != owner || ownership.second != ui_epoch)
       throw Conflict("transport bridge belongs to a retired page", "control_transport_owner_mismatch");
     session = session_id_; vehicle = vehicle_id_; driver = driver_id(); attempt = media_scope_id_;
-    capable = config_.enable_experimental_control_transport && control_transport_vehicle_capable_ && control_transport_mac_key_.size() >= 32;
+    capable = control_transport_vehicle_capable_ && control_transport_mac_key_.size() >= 32;
     feedback_capable = config_.enable_experimental_direct_authority && feedback_transport_vehicle_capable_;
   }
   if (!input.at("dc_ready").is_boolean()) throw std::invalid_argument("dc_ready must be boolean");
@@ -5682,10 +5686,13 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input) {
         media_scope_id_ != attempt || ownership.first != owner || ownership.second != ui_epoch)
       throw Conflict("transport bridge scope changed while waiting", "control_transport_scope_mismatch"); }
   const auto now = monotonic_now_ms();
-  control_transport_dc_ready_ = capable && control_transport_cloud_capable_ && input.at("dc_ready").get<bool>();
   const auto network_path = input.value("dc_network_path", "unknown");
   if (network_path != "p2p" && network_path != "turn_udp" && network_path != "turn_tcp" && network_path != "turn_tls" && network_path != "turn_unknown" && network_path != "unknown")
     throw std::invalid_argument("invalid DC path classification");
+  control_transport_dc_network_path_ = network_path;
+  control_transport_dc_ready_ = capable && control_transport_cloud_capable_ && input.at("dc_ready").get<bool>() &&
+      config_.control_transport_mode != "cloud_only" &&
+      (network_path == "p2p" || config_.enable_experimental_control_transport);
   control_transport_sender_.set_data_channel_is_p2p(network_path == "p2p");
   feedback_transport_dc_is_p2p_ = network_path == "p2p";
   feedback_transport_enabled_ = capable && feedback_capable;
@@ -5993,7 +6000,7 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
       generation = control_session_generation_;
       recovery_timeout_ms = control_recovery_timeout_ms_;
       sequence = ++control_sequence_;
-      vehicle_transport_capable = config_.enable_experimental_control_transport && control_transport_vehicle_capable_ && control_transport_mac_key_.size() >= 32;
+      vehicle_transport_capable = control_transport_vehicle_capable_ && control_transport_mac_key_.size() >= 32;
       transport_signing_key = control_transport_mac_key_;
       vehicle_stop_capable = emergency_stop_vehicle_capable_;
       current_media_attempt = media_scope_id_;
@@ -6210,6 +6217,10 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
           control_transport_bridge_ui_epoch_ == sample.ui_control_epoch &&
           monotonic_ms >= control_transport_bridge_seen_ms_ &&
           monotonic_ms - control_transport_bridge_seen_ms_ < native_control_intent_.lease_ms();
+      // Bootstrap a fenced cloud route even if ICE/DC never opens. Neutral
+      // selection is admitted before common profile/VCU readiness checks.
+      if (vehicle_transport_capable && control_transport_cloud_capable_ && !control_transport_sender_.negotiated())
+        control_transport_sender_.begin(detail::ControlPath::Wss, {}, monotonic_ms, recovery_timeout_ms);
       static_cast<void>(control_transport_sender_.observe(dc_ready, current_media_attempt, monotonic_ms, recovery_timeout_ms));
       if (dc_ready && control_transport_sender_.consider_dc(current_media_attempt, monotonic_ms, recovery_timeout_ms)) {
         control_dc_ack_window_.reset(); control_dc_ack_recovery_.reset(); control_dc_last_ack_seq_ = 0;
@@ -6907,8 +6918,7 @@ Json DriverConsoleRuntime::await_control_session(
       if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("手机审批已超时");
       Json request = {{"driver_id", current_driver}, {"vehicle_id", vehicle_id}, {"token", token},
           {"required_native_control_capabilities", kNativeControlCapabilities}};
-      if (config_.enable_experimental_control_transport)
-        request["required_control_transport_capability"] = detail::kControlTransportCapability;
+      request["required_control_transport_capability"] = detail::kControlTransportCapability;
       if (config_.enable_experimental_direct_authority)
         request["required_direct_authority_capability"] = detail::kDirectAuthorityCapability;
       if (!approval_id.empty()) request["approval_request_id"] = approval_id;
@@ -8141,7 +8151,16 @@ Json DriverConsoleRuntime::status() {
     native_control_ack_recovery_deadline_ms = control_signaling_ack_recovery_.deadline();
     native_control_last_ack_packet_age_ms = control_signaling_ack_window_.last_ack_packet_age_ms();
     control_transport_status = control_transport_sender_.status();
+    control_transport_status["enabled"] = true;
+    control_transport_status["mode"] = config_.control_transport_mode;
     control_transport_status["experimental_enabled"] = config_.enable_experimental_control_transport;
+    control_transport_status["cloud_capable"] = control_transport_cloud_capable_;
+    control_transport_status["dc_network_path"] = control_transport_dc_network_path_;
+    control_transport_status["dc_ready"] = control_transport_dc_ready_;
+    { std::lock_guard state_lock(mutex_);
+      control_transport_status["vehicle_capable"] = control_transport_vehicle_capable_;
+      control_transport_status["session_key_present"] = control_transport_mac_key_.size() >= 32; }
+    control_transport_status["cloud_authority_required"] = !config_.enable_experimental_direct_authority;
     control_transport_status["feedback_transport"] = feedback_transport_sender_.status();
     { std::lock_guard authority_lock(direct_authority_mutex_);
       control_transport_status["direct_authority"] = direct_authority_.status(monotonic_now_ms()); }

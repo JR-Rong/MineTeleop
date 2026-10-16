@@ -10,7 +10,7 @@ a = p.parse_args()
 source = Path(a.source).read_text()
 
 def method(name):
-    start = source.find('  void ' + name + '(')
+    start = source.find(('  bool ' if name == 'cloud_control_authority_live_locked' else '  void ') + name + '(')
     if start < 0:
         return ''
     depth = 0
@@ -24,7 +24,7 @@ def method(name):
     raise RuntimeError('incomplete authority method: ' + name)
 
 Path(a.output).write_text('\n'.join(method(name) for name in [
-    'brake_direct_authority_locked', 'mark_direct_authority_worker_failed',
+    'cloud_control_authority_live_locked', 'brake_direct_authority_locked', 'mark_direct_authority_worker_failed',
     'direct_authority_loop', 'tick_control_service']) + '\n')
 if a.lease_cache_output:
     Path(a.lease_cache_output).write_text(method('observe_lease') + '\n')

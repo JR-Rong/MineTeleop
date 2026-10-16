@@ -1973,6 +1973,10 @@ function logoutPageFixture() {
     post:async(path,body)=>{calls.push({post:path,body});return {session_id:body.expected_session_id}},
     setTimeout(callback,delay){const id=++timerId;timers.set(id,{callback,at:elapsed+delay});return id},
     clearTimeout:id=>timers.delete(id)});
+  context.controlTransportCourier={negotiated:()=>false,epoch:()=>0,activePath:()=>"wss"};
+  context.mediaOfferScope={id:'attempt'};
+  const managementStart=controlPageSource.indexOf('function controlManagementScope('),managementEnd=controlPageSource.indexOf('function currentMediaPeer(',managementStart);
+  assert(managementStart>=0&&managementEnd>managementStart);vm.runInContext(controlPageSource.slice(managementStart,managementEnd),context);
   const sender=controlPageSource.split('\n').find(line=>line.startsWith('function sendVcuHandshakeCommand('));
   assert(sender);vm.runInContext(sender,context);
   const start=controlPageSource.indexOf('function pageReleaseScope('),end=controlPageSource.indexOf("addEventListener('pagehide'",start);
@@ -1992,6 +1996,15 @@ function logoutPageFixture() {
   }
   return{context,runtime,calls,packets,settle,advanceTo,telemetry,closeCount:()=>closeCount,now:()=>elapsed};
 }
+
+test('product VCU management stays on authenticated cloud after route negotiation with an open DC',async()=>{
+  const fixture=logoutPageFixture();fixture.context.controlTransportCourier={negotiated:()=>true};
+  await fixture.context.sendVcuHandshakeCommand('disconnect');
+  assert.equal(fixture.packets.length,0);
+  const sent=fixture.calls.find(call=>call.post==='/api/control-transport/management');
+  assert(sent);assert.equal(sent.body.source_session_id,'session');assert.equal(sent.body.ui_control_epoch,3);
+  assert.equal(sent.body.message.action,'disconnect');
+});
 
 test('shipped logout waits for a new final CAN disarmed report before releasing the session and preserves ESTOP', async()=>{
   const fixture=logoutPageFixture();fixture.context.estopLatched=true;

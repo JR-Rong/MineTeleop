@@ -186,6 +186,7 @@ Vehicle options:
   --device-token TOKEN          or set MINE_TELEOP_DEVICE_TOKEN
   --signaling-http-url URL      defaults to cloud.signaling_url
   --ice-transport-policy P      all (default) or relay (forced TURN)
+  --control-transport P         p2p_preferred (default) or cloud_only
   --duration-ms N               local smoke duration (default 1500)
   --disconnect-at-ms N          stop local commands at N (default 500)
 
@@ -235,6 +236,7 @@ Vehicle media options:
   --device-token TOKEN          or set MINE_TELEOP_DEVICE_TOKEN
   --codec h265|h264             force codec instead of browser negotiation
   --ice-transport-policy P      all (default) or relay (forced TURN)
+  --control-transport P         p2p_preferred (default) or cloud_only
   --frames N                    frames per camera (default 30)
   --duration-ms N               optional duration limit
   --capture-interval-ms N       optional interval between capture rounds
@@ -505,6 +507,12 @@ int run_driver_console(const Arguments& arguments) {
   const auto signaling_override = arguments.value("--signaling-http-url");
   if (!signaling_override.empty()) config.signaling_url = signaling_override;
   apply_ice_transport_policy_override(arguments, config.ice_transport_policy);
+  const auto control_transport_mode = arguments.value("--control-transport");
+  if (!control_transport_mode.empty()) {
+    if (!mine_teleop::control_transport_mode_is_valid(control_transport_mode))
+      throw std::invalid_argument("--control-transport must be p2p_preferred or cloud_only");
+    config.control_transport_mode = control_transport_mode;
+  }
   const auto password = arguments.value(
       "--driver-password", environment("MINE_TELEOP_DRIVER_PASSWORD").empty() ? "dev-password" : environment("MINE_TELEOP_DRIVER_PASSWORD"));
   auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(

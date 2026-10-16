@@ -7,6 +7,25 @@
   const protocol = 'native-control-transport-v1';
   const feedbackProtocol = 'native-feedback-transport-v1';
   const emergencyProtocol = 'native-stop-only-v1';
+  // Read the transport carrying SCTP, not a media stats candidate pair. No
+  // candidate addresses or credentials leave this function. Unknown stays WSS.
+  function dataChannelRoute(peer, channel, mode = 'p2p_preferred', experimentalRelay = false) {
+    let networkPath = 'unknown';
+    const sctp = peer?.sctp, dtls = sctp?.transport, ice = dtls?.iceTransport;
+    const open = peer?.connectionState === 'connected' && channel?.readyState === 'open';
+    const connected = open && sctp?.state === 'connected' && dtls?.state === 'connected' &&
+      ['connected','completed'].includes(ice?.state);
+    if (connected) {
+      try {
+        const pair = ice.getSelectedCandidatePair();
+        const types = [pair?.local?.type, pair?.remote?.type];
+        if (types.includes('relay')) networkPath = 'turn_unknown';
+        else if (types.every(type => ['host','srflx','prflx'].includes(type))) networkPath = 'p2p';
+      } catch (_) { /* Missing/unsupported selected pair remains unknown. */ }
+    }
+    return {networkPath, ready: mode !== 'cloud_only' &&
+      (connected && networkPath === 'p2p' || experimentalRelay && open)};
+  }
   // Only this exact local marker means send was not called due to buffer
   // pressure. False/undefined, exceptions and missing ACKs never request retry.
   const emergencyBackpressure = Object.freeze({reason:'buffered_amount_above_threshold'});
@@ -139,5 +158,5 @@
     }
     return Object.freeze({tick, receive, negotiated: () => negotiated, activePath: () => path, epoch: () => epoch, feedback: () => feedback});
   }
-  return Object.freeze({protocol, feedbackProtocol, emergencyProtocol, emergencyBackpressure, createCourier, createEmergencyCourier});
+  return Object.freeze({protocol, feedbackProtocol, emergencyProtocol, emergencyBackpressure, dataChannelRoute, createCourier, createEmergencyCourier});
 });

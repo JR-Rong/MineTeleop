@@ -16,6 +16,8 @@ ui:
   show_debug_overlay: true
 
 control:
+  # Uses live cloud authority; TURN/unknown control paths stay on cloud WSS.
+  transport_mode: p2p_preferred
   rate_hz: 20
   estop_hold_ms: 500
   # Speed PID defaults and bounds are vehicle-owned control_limits telemetry;
