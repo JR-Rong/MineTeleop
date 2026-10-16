@@ -6821,19 +6821,48 @@ void test_native_control_three_hop_trace_correlation() {
         cloud_log.find(field) != std::string::npos,
         std::string("cloud native control trace omitted ") + field);
   }
+  const auto check_delivery_diagnostics = [&](const mine_teleop::Json& command, bool require_live_peer) {
+    const auto& before = command.at("transport_before_send");
+    const auto& after = command.at("transport_after_send");
+    const auto& before_peer = before.at("peer_is_loopback");
+    const auto& after_peer = after.at("peer_is_loopback");
+    // getpeername can become unavailable after the peer closes, even when the
+    // preceding write returned success. Unknown is not a non-loopback peer and
+    // a successful write is not an end-to-end delivery acknowledgement.
+    const bool peers_valid = require_live_peer ? before_peer == true && after_peer == true :
+        (before_peer.is_null() || before_peer == true) && (after_peer.is_null() || after_peer == true);
+    const auto context = mine_teleop::Json{{"seq", command.at("seq")},
+        {"delivery_cursor", command.at("delivery_cursor")}, {"require_live_peer", require_live_peer},
+        {"before_peer_is_loopback", before_peer}, {"after_peer_is_loopback", after_peer},
+        {"before_address_redacted", !before.contains("peer_address")}, {"after_address_redacted", !after.contains("peer_address")},
+        {"before_sample_ms", before.at("sample_monotonic_ms")},
+        {"send_started_ms", command.at("cloud_delivery_send_started_monotonic_ms")},
+        {"send_completed_ms", command.at("cloud_delivery_send_completed_monotonic_ms")},
+        {"after_sample_ms", after.at("sample_monotonic_ms")}};
+    expect(peers_valid && !before.contains("peer_address") && !after.contains("peer_address") &&
+        command.at("transport_before_send_sample_ms").get<std::int64_t>() >= 0 &&
+        command.at("transport_after_send_sample_ms").get<std::int64_t>() >= 0 &&
+        before.at("sample_monotonic_ms").get<std::int64_t>() <=
+            command.at("cloud_delivery_send_started_monotonic_ms").get<std::int64_t>() &&
+        after.at("sample_monotonic_ms").get<std::int64_t>() >=
+            command.at("cloud_delivery_send_completed_monotonic_ms").get<std::int64_t>(),
+        "delivery diagnostics lost socket stage, privacy, or actual send timing boundaries: " + context.dump());
+  };
+  mine_teleop::Json live_correlated_delivery;
   for (const auto& command : cloud_commands) {
     if (command.value("stage", "") == "delivery_send_completed") {
-      expect(command.at("transport_before_send").at("peer_is_loopback") == true &&
-          command.at("transport_after_send").at("peer_is_loopback") == true &&
-          !command.at("transport_before_send").contains("peer_address") &&
-          !command.at("transport_after_send").contains("peer_address") &&
-          command.at("transport_before_send_sample_ms").get<std::int64_t>() >= 0 &&
-          command.at("transport_after_send_sample_ms").get<std::int64_t>() >= 0 &&
-          command.at("transport_before_send").at("sample_monotonic_ms").get<std::int64_t>() <=
-              command.at("cloud_delivery_send_started_monotonic_ms").get<std::int64_t>() &&
-          command.at("transport_after_send").at("sample_monotonic_ms").get<std::int64_t>() >=
-              command.at("cloud_delivery_send_completed_monotonic_ms").get<std::int64_t>(),
-          "delivery diagnostics lost socket stage, privacy, or actual send timing boundaries");
+      // Privacy and actual send-time bounds remain mandatory for EVERY sample,
+      // including the optional peer metadata produced during socket teardown.
+      check_delivery_diagnostics(command, false);
+      if (command.value("trace_session_id", "") == trace_session_id &&
+          command.value("intent_seq", std::uint64_t{0}) == 2 &&
+          command.value("seq", std::uint64_t{0}) == vehicle_received_seq &&
+          command.value("delivery_cursor", std::uint64_t{0}) == vehicle_delivery_cursor &&
+          command.at("transport_before_send").at("peer_is_loopback") == true &&
+          command.at("transport_after_send").at("peer_is_loopback") == true) {
+        check_delivery_diagnostics(command, true);
+        live_correlated_delivery = command;
+      }
     }
     if (command.value("stage", "") != "ingress_ack_send_completed") continue;
     expect(command.at("cloud_frame_received_monotonic_ms").get<std::int64_t>() <=
@@ -6843,6 +6872,23 @@ void test_native_control_three_hop_trace_correlation() {
         command.at("cloud_ingress_mutex_wait_ms").get<std::int64_t>() >= 0,
         "cloud diagnostic timestamps do not bracket pre-lock receive and enqueue");
   }
+  expect(live_correlated_delivery.is_object(), "acknowledged correlated delivery lacks complete live loopback diagnostics");
+  auto unavailable = live_correlated_delivery;
+  unavailable["transport_after_send"]["peer_is_loopback"] = nullptr;
+  check_delivery_diagnostics(unavailable, false);
+  expect_throws([&] { check_delivery_diagnostics(unavailable, true); }, "unknown peer satisfied the live correlated delivery assertion");
+  auto non_loopback = live_correlated_delivery;
+  non_loopback["transport_after_send"]["peer_is_loopback"] = false;
+  expect_throws([&] { check_delivery_diagnostics(non_loopback, false); }, "non-loopback peer satisfied fixture isolation");
+  auto leaked = live_correlated_delivery;
+  leaked["transport_after_send"]["peer_address"] = "synthetic-private-address";
+  expect_throws([&] { check_delivery_diagnostics(leaked, false); }, "teardown metadata bypassed address redaction");
+  auto late_before = live_correlated_delivery;
+  late_before["transport_before_send"]["sample_monotonic_ms"] = late_before.at("cloud_delivery_send_started_monotonic_ms").get<std::int64_t>() + 1;
+  expect_throws([&] { check_delivery_diagnostics(late_before, false); }, "before-send sample did not bracket the actual write");
+  auto early_after = live_correlated_delivery;
+  early_after["transport_after_send"]["sample_monotonic_ms"] = early_after.at("cloud_delivery_send_completed_monotonic_ms").get<std::int64_t>() - 1;
+  expect_throws([&] { check_delivery_diagnostics(early_after, false); }, "after-send sample did not bracket the actual write");
   for (const auto secret : {
            "trace-driver-password",
            "trace-device-token"}) {
