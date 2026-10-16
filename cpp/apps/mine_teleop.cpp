@@ -186,7 +186,6 @@ Vehicle options:
   --device-token TOKEN          or set MINE_TELEOP_DEVICE_TOKEN
   --signaling-http-url URL      defaults to cloud.signaling_url
   --ice-transport-policy P      all (default) or relay (forced TURN)
-  --control-transport P         p2p_preferred (default) or cloud_only
   --duration-ms N               local smoke duration (default 1500)
   --disconnect-at-ms N          stop local commands at N (default 500)
 
@@ -229,6 +228,7 @@ Driver console options:
   --vehicle-id ID               target vehicle (default vehicle-001)
   --driver-password PASSWORD    or set MINE_TELEOP_DRIVER_PASSWORD
   --signaling-http-url URL      override driver configuration
+  --control-transport P         p2p_preferred (default) or cloud_only
 
 Vehicle media options:
   --config PATH                 vehicle YAML (default configs/vehicle-agent.dev.yaml)
@@ -236,7 +236,6 @@ Vehicle media options:
   --device-token TOKEN          or set MINE_TELEOP_DEVICE_TOKEN
   --codec h265|h264             force codec instead of browser negotiation
   --ice-transport-policy P      all (default) or relay (forced TURN)
-  --control-transport P         p2p_preferred (default) or cloud_only
   --frames N                    frames per camera (default 30)
   --duration-ms N               optional duration limit
   --capture-interval-ms N       optional interval between capture rounds
