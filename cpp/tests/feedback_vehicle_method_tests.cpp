@@ -1,4 +1,5 @@
 #include "mine_teleop/detail/feedback_transport.hpp"
+#include "mine_teleop/detail/emergency_stop.hpp"
 #include "mine_teleop/media.hpp"
 #include <mutex>
 
@@ -46,6 +47,7 @@ struct Startup {
     std::string session_id() const { return "s"; }
     std::string driver_id() const { return "d"; }
     std::string control_token() const { return "t"; }
+    std::string transport_mac_key() const { return std::string(64, 'k'); }
   } signaling;
   std::atomic<bool> native_control_websocket_connected{true}, native_control_transport_cloud_capable{true};
   std::atomic<bool> stop_requested{false}, control_inhibited{false};
@@ -66,6 +68,77 @@ struct Startup {
       std::string_view, bool, const Json&) {}
 #include "control_startup_method.inc"
 };
+
+struct EarlyResult : Startup {
+  enum class ControlMessageTransport { DataChannel, NativeSignaling };
+  ControlTransportFence control_transport_fence;
+  FeedbackTransportFence feedback_transport_fence;
+  DirectAuthorityLease direct_authority;
+  EmergencyStopReceiver emergency_stop_receiver;
+  std::uint64_t control_result_seq{}, control_status_seq{}, rejected_control_commands{};
+  Json latest_control_result;
+  std::string trace_reason;
+  bool receive_apply_invoked{};
+  static std::int64_t steady_now_ms() { return 1000; }
+  template<class... Times>
+  void queue_control_trace(const ReceiveResult*, std::string_view reason, bool invoked, Times...) {
+    if (config.runtime.control_log_commands) trace_reason = reason;
+    receive_apply_invoked = invoked;
+  }
+  void deliver(ControlCommand command, ControlMessageTransport transport, FakeChannel* channel, Json* native_feedback) {
+    const Json message = Json::object();
+    const std::uint64_t intent_seq = 9;
+    const std::string current_attempt = "fixture-attempt";
+#include "control_early_result.inc"
+    throw std::runtime_error("early rejection fixture unexpectedly passed its guard");
+  }
+};
+
+void early_rejection_publishes_precise_signed_result() {
+  // All four reasons, both service-unavailable states, both receive paths, and
+  // tracing disabled/enabled. Gst is a byte sink; there is no real connection.
+  for (const bool trace : {false, true}) for (const bool dc : {false, true}) for (int gate = 0; gate != 5; ++gate) {
+    EarlyResult value;
+    expect(value.start_control_service(), "mock service fixture did not start");
+    value.config.runtime.control_log_commands = trace;
+    FakeChannel channel;
+    value.control_channel = &channel;
+    value.control_link_open = true;
+    const char* reason = nullptr;
+    if (gate == 0) { value.stop_requested = true; value.control_inhibited = true; reason = "runtime_stop_requested"; }
+    if (gate == 1) { value.control_inhibited = true; reason = "control_inhibited"; }
+    if (gate == 2) { value.control_service_started = false; reason = "control_service_unavailable"; }
+    if (gate == 3) { value.control_service->close(); value.control_service.reset(); reason = "control_service_unavailable"; }
+    if (gate == 4) { value.control_link_open = false; value.native_control_websocket_connected = false; reason = "control_link_not_open"; }
+    ControlCommand command;
+    command.vehicle_id = value.config.vehicle_id; command.driver_id = "d"; command.session_id = "s";
+    command.control_token = "t"; command.seq = 42;
+    Json feedback;
+    value.deliver(command, dc ? EarlyResult::ControlMessageTransport::DataChannel : EarlyResult::ControlMessageTransport::NativeSignaling,
+        &channel, &feedback);
+    const auto verify = [&](const Json& result) {
+      expect(result.at("reason") == reason, "published result lost the precise early rejection reason");
+      expect(!result.at("accepted").get<bool>() && !result.at("rearm_required").get<bool>() &&
+          !result.at("transport_admitted").get<bool>() && !result.at("transport_selected").get<bool>(),
+          "diagnostic rejection changed acceptance, rearm or transport semantics");
+      expect(result.at("command_seq") == 42 && result.at("intent_seq") == 9 && result.at("result_seq") == 1,
+          "early result lost sequence correlation");
+      expect(verify_transport_message(result, value.signaling.transport_mac_key(), true), "early result MAC is invalid");
+      const auto bounded = bounded_vehicle_control_result(result, "s", value.config.vehicle_id, "d");
+      expect(bounded.at("reason") == reason && verify_transport_message(bounded, value.signaling.transport_mac_key(), true),
+          "wire normalization dropped the reason or changed the signed result");
+    };
+    verify(feedback);
+    expect(value.latest_control_result == feedback, "native feedback and WSS result differ");
+    expect(channel.sent.size() == (dc && value.control_link_open ? 1U : 0U), "early result used an unavailable DC");
+    for (const auto& sent : channel.sent) verify(sent);
+    expect(value.rejected_control_commands == 1 && !value.receive_apply_invoked,
+        "early rejection invoked the common receiver or counted incorrectly");
+    expect(trace ? value.trace_reason == reason : value.trace_reason.empty(), "trace setting changed rejection diagnostics");
+    if (value.control_service)
+      expect(value.control_service->adapter_status().applied_command_count == 0, "early rejection applied a mock command");
+  }
+}
 void cloud_only_startup_retains_all_safety_gates() {
   for (int gate = 0; gate != 7; ++gate) {
     Startup value;
@@ -136,6 +209,6 @@ void cloud_bootstrap_feedback_requires_live_authenticated_lease() {
 }
 }
 int main() {
-  try { cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
+  try { early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

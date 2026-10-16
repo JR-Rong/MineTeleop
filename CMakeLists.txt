@@ -420,11 +420,13 @@ if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
     set_tests_properties(mine-teleop-vehicle-authority-entry-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
     set(MINE_TELEOP_FEEDBACK_METHOD "${CMAKE_CURRENT_BINARY_DIR}/feedback_vehicle_method.inc")
     set(MINE_TELEOP_STARTUP_METHOD "${CMAKE_CURRENT_BINARY_DIR}/control_startup_method.inc")
-    add_custom_command(OUTPUT "${MINE_TELEOP_FEEDBACK_METHOD}" "${MINE_TELEOP_STARTUP_METHOD}"
+    set(MINE_TELEOP_EARLY_RESULT "${CMAKE_CURRENT_BINARY_DIR}/control_early_result.inc")
+    add_custom_command(OUTPUT "${MINE_TELEOP_FEEDBACK_METHOD}" "${MINE_TELEOP_STARTUP_METHOD}" "${MINE_TELEOP_EARLY_RESULT}"
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/extract_feedback_vehicle_method.py"
         --source "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/webrtc_media.cpp" --output "${MINE_TELEOP_FEEDBACK_METHOD}" --startup-output "${MINE_TELEOP_STARTUP_METHOD}"
+        --result-output "${MINE_TELEOP_EARLY_RESULT}"
       DEPENDS cpp/tests/extract_feedback_vehicle_method.py cpp/src/webrtc_media.cpp VERBATIM)
-    add_executable(mine-teleop-feedback-vehicle-method-tests cpp/tests/feedback_vehicle_method_tests.cpp "${MINE_TELEOP_FEEDBACK_METHOD}" "${MINE_TELEOP_STARTUP_METHOD}")
+    add_executable(mine-teleop-feedback-vehicle-method-tests cpp/tests/feedback_vehicle_method_tests.cpp "${MINE_TELEOP_FEEDBACK_METHOD}" "${MINE_TELEOP_STARTUP_METHOD}" "${MINE_TELEOP_EARLY_RESULT}")
     target_include_directories(mine-teleop-feedback-vehicle-method-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_link_libraries(mine-teleop-feedback-vehicle-method-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
     mine_teleop_enable_warnings(mine-teleop-feedback-vehicle-method-tests)

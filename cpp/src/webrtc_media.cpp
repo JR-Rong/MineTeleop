@@ -1806,6 +1806,7 @@ struct VehicleMediaRuntime::Impl {
             : (!control_service_started || !control_service)
             ? "control_service_unavailable"
             : "control_link_not_open";
+        result_message["reason"] = std::string(reason);
         lock.unlock();
         queue_control_trace(
             nullptr,
