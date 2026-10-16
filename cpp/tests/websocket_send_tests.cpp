@@ -79,10 +79,15 @@ void test_completed_operation_disarms_old_deadlines() {
   std::atomic<int> interrupts{0};
   {
     WebSocketSendDeadline deadline([&]{++interrupts;});
-    deadline.arm(Clock::now()+20ms);expect(deadline.finish(),"normal operation did not finish");
-    deadline.arm(Clock::now()+100ms);
+    // This checks timer ownership, not the20ms transport SLA tested above.
+    // Wait past the retired timer, with a distinct live deadline that survives
+    // ordinary runner preemption; never mistake an expired new timer for an
+    // old timer firing on its replacement.
+    const auto old_deadline=Clock::now()+1s;
+    deadline.arm(old_deadline);expect(deadline.finish(),"normal operation did not finish");
+    deadline.arm(Clock::now()+5s);
     std::mutex mutex;std::condition_variable wake;std::unique_lock lock(mutex);
-    wake.wait_for(lock,30ms,[]{return false;});
+    wake.wait_until(lock,old_deadline+10ms,[]{return false;});
     expect(interrupts==0,"old timer interrupted a newer operation");
     expect(deadline.finish(),"new operation lost its own deadline");
   }

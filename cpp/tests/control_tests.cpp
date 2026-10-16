@@ -588,10 +588,14 @@ void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
     const mine_teleop::Json neutral = {{"session_id", session}, {"session_generation", generation},
         {"ui_instance_id", "slow-time-ui"}, {"intent_seq", 1}, {"gear", "N"}, {"steering", 0}, {"throttle", 0}, {"brake", 0}};
     expect(driver.update_control_intent(declare_native_input_video_sample(neutral)).at("accepted").get<bool>(), "neutral input rejected");
-    const auto first_anchor = driver.status().at("time_sync").at("accepted_anchor_local_ms").get<std::int64_t>();
+    const auto initial_sync = driver.status().at("time_sync");
+    const auto first_candidate = initial_sync.at("candidate_generation").get<std::uint64_t>();
     delay_ms = 350;
     bool slow_processing_seen = false;
-    const auto software_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    // Permit bounded candidate retries after real host clock discontinuities;
+    // a complete accepted cohort must still meet the unchanged25ms limit.
+    const auto software_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    mine_teleop::Json last_slow_sync;
     while (std::chrono::steady_clock::now() < software_deadline && !slow_processing_seen) {
       const auto started = std::chrono::steady_clock::now();
       const auto status = driver.status();
@@ -600,13 +604,21 @@ void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
       // An external UTC step can correctly reject an individual cohort. The
       // completed slow cohort, rather than every intermediate snapshot, must
       // prove that measured server processing does not count as network RTT.
+      last_slow_sync = status.at("time_sync");
+      // Candidate generations are monotonic. UTC anchor values need not move
+      // forward after an actual backward wall-clock correction. Two decisions
+      // also exclude an already in-flight fast/mixed cohort at phase entry.
       slow_processing_seen = slow_time_samples >= config.time_sync_samples * 2 &&
-          status.at("time_sync").value("synchronized", false) &&
-          status.at("time_sync").at("uncertainty_ms") <= 25 &&
-          status.at("time_sync").at("accepted_anchor_local_ms").get<std::int64_t>() > first_anchor;
+          last_slow_sync.value("synchronized", false) && last_slow_sync.value("anchor_accepted", false) &&
+          last_slow_sync.at("sample_count") == config.time_sync_samples &&
+          last_slow_sync.at("uncertainty_ms") <= 25 &&
+          last_slow_sync.at("candidate_generation").get<std::uint64_t>() >= first_candidate + 2;
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
-    expect(slow_processing_seen, "fixture never completed its slow server-processing cohort");
+    std::cout << "[SLOW_TIME_COHORT] " << mine_teleop::Json{{"slow_samples", slow_time_samples.load()},
+        {"first_candidate_generation", first_candidate}, {"last_candidate", last_slow_sync},
+        {"completed_healthy_slow_cohort", slow_processing_seen}}.dump() << '\n';
+    expect(slow_processing_seen, "fixture never completed its slow server-processing cohort: " + last_slow_sync.dump());
     simulate_network_delay = true;
     bool bad_seen = false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
