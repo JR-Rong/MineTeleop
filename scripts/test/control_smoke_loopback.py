@@ -5,14 +5,17 @@ Execute inside a Linux network namespace with only loopback enabled. This is
 control-plane delivery validation, not a camera or vehicle acceptance test.
 """
 import argparse
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
 import platform
 import socket
-import subprocess
+import tempfile
 import time
 import urllib.request
+
+from process_capture import LoggedProcess
 
 
 def main():
@@ -27,6 +30,8 @@ def main():
         parser.error("--binary must identify the built mine-teleop executable")
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    # A retry preserves the previous failure logs; each capture owns new files.
+    output = Path(tempfile.mkdtemp(prefix="run-", dir=output))
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith("MINE_TELEOP_") and key not in
                    {"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS"} and
@@ -57,17 +62,19 @@ def main():
          "--driver-console-url", console_url, "--device-token", "loopback-synthetic-device"],
     ]
     (output / "commands.json").write_text(json.dumps(commands, indent=2), encoding="utf-8")
-    processes, logs = [], []
-    try:
+    redactions = ('loopback-synthetic-password', 'loopback-synthetic-device')
+    processes = []
+    with ExitStack() as owned:
         for index, (command, origin) in enumerate(zip(commands[:2], (cloud_url, console_url))):
-            log = (output / f"server-{index}.log").open("wb")
-            logs.append(log)
-            process = subprocess.Popen(command, cwd=output, env=environment, stdout=log, stderr=subprocess.STDOUT)
+            process = owned.enter_context(LoggedProcess(
+                command, cwd=output, env=environment, secrets=redactions,
+                stdout_path=output / f"server-{index}.stdout.log",
+                stderr_path=output / f"server-{index}.stderr.log"))
             processes.append(process)
             deadline = time.monotonic() + 5
             while True:
                 if process.poll() is not None:
-                    raise RuntimeError(f"local mock {index} exited: {process.returncode}")
+                    raise RuntimeError(f"local mock {index} exited: {process.process.returncode}")
                 try:
                     with direct_http.open(origin + "/health", timeout=0.2) as response:
                         if response.status == 200:
@@ -77,24 +84,20 @@ def main():
                 if time.monotonic() > deadline:
                     raise RuntimeError(f"local mock {index} did not become healthy")
                 time.sleep(0.02)
-        completed = subprocess.run(commands[2], cwd=output, env=environment, capture_output=True, timeout=15)
-        (output / "control-smoke.stdout.jsonl").write_bytes(completed.stdout)
-        (output / "control-smoke.stderr.log").write_bytes(completed.stderr)
-        result = {"exit_code": completed.returncode, "network_interfaces": ["lo"],
-                  "scope": "synthetic control-plane only", "video_observation_performed": False}
-        (output / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-        print(json.dumps(result))
-        return completed.returncode
-    finally:
-        for process in reversed(processes):
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
-        for log in logs:
-            log.close()
+        with LoggedProcess(commands[2], cwd=output, env=environment, secrets=redactions,
+                           stdout_path=output / "control-smoke.stdout.jsonl",
+                           stderr_path=output / "control-smoke.stderr.log") as smoke:
+            exit_code = smoke.wait(timeout=15)
+        processes.append(smoke)
+    # Report only after every child and log reader has finished successfully.
+    logs = [{"name": item.paths[0].name, "raw_bytes": item.raw_bytes,
+             "rotations": item.rotations, "dropped_lines": item.dropped_lines}
+            for process in processes for item in process.captures]
+    result = {"exit_code": exit_code, "network_interfaces": ["lo"], "logs": logs,
+              "scope": "synthetic control-plane only", "video_observation_performed": False}
+    (output / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(json.dumps(result))
+    return exit_code
 
 
 if __name__ == "__main__":
