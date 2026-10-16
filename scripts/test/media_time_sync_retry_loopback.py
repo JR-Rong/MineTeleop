@@ -17,6 +17,8 @@ import threading
 import time
 from urllib.parse import parse_qs, urlsplit
 
+SECRET_CANARY = "time-diagnostic-secret-canary"
+
 
 class Fixture(ThreadingHTTPServer):
     daemon_threads = True
@@ -43,6 +45,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Synthetic-Secret", SECRET_CANARY)
             self.end_headers()
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
@@ -77,8 +80,18 @@ class Handler(BaseHTTPRequestHandler):
             elif inject and self.server.scenario == "invalid-sample":
                 self.respond(200, {"client_send_ms": sent + 1, "server_receive_ms": now, "server_send_ms": now})
             else:
-                self.respond(200, {"client_send_ms": sent, "server_receive_ms": now,
-                                   "server_send_ms": int(time.time() * 1000)})
+                body = {"client_send_ms": sent, "server_receive_ms": now,
+                        "server_send_ms": int(time.time() * 1000),
+                        "device_token": SECRET_CANARY,
+                        "timestamp_scope": "Bearer " + SECRET_CANARY,
+                        "server_api_gate_wait_ms": {"password": SECRET_CANARY},
+                        "server_before_handler_ms": 0, "server_parse_ms": 0,
+                        "server_processing_monotonic_ms": int(time.time() * 1000) - now}
+                if self.server.scenario in {"over-budget", "cli-over-budget"}:
+                    # Delay after the response-ready timestamp: model network
+                    # return delay, not processing that the estimator subtracts.
+                    time.sleep(0.108)
+                self.respond(200, body)
         elif parsed.path == "/vehicles/synthetic-vehicle/session":
             if self.server.scenario == "after-session-end" and discovery == 1:
                 self.respond(409, {"error": "synthetic session ended", "issue_code": "session_not_active"})
@@ -117,6 +130,50 @@ def events(path):
     return result
 
 
+def check_samples(status):
+    assert len(status["samples"]) == 7, "complete cohort diagnostics missing"
+    assert SECRET_CANARY not in json.dumps(status), "server text/header/body leaked a secret"
+    for sample in status["samples"]:
+        assert sample["valid"] is True
+        assert sample["server_timestamp_scope"] == "unrecognized"
+        assert sample["server_api_gate_wait_ms"] is None
+        assert sample["server_before_handler_ms"] == 0 and sample["server_parse_ms"] == 0
+        assert sample["timestamp_scope"] == "http_header_out_to_body_received"
+        assert {"dns_ms", "connect_ms", "tls_ms", "first_byte_ms", "total_ms",
+                "exchange_monotonic_ms", "requests_sent"} <= sample["http"].keys(), "HTTP phases lost"
+
+
+def cli_scenario(binary, output, name, environment, limit, expected_pass):
+    root = output / name
+    root.mkdir(exist_ok=True)
+    fixture = Fixture(name)
+    server_thread = threading.Thread(target=fixture.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        result = subprocess.run([str(binary), "time-sync", "--signaling-http-url",
+            f"http://127.0.0.1:{fixture.server_port}", "--samples", "7",
+            "--max-uncertainty-ms", str(limit)], cwd=root, env=environment,
+            capture_output=True, text=True, timeout=8)
+        (root / "runtime.stdout").write_text(result.stdout)
+        (root / "runtime.stderr").write_text(result.stderr)
+        assert result.returncode == (0 if expected_pass else 2), result.stderr
+        status = json.loads(result.stdout)
+        assert status["passed"] is expected_pass and status["anchor_accepted"] is expected_pass
+        assert status["has_accepted_anchor"] is expected_pass
+        assert status["candidate_classification_max_uncertainty_ms"] == limit
+        assert status["max_uncertainty_ms"] == limit
+        assert (status["uncertainty_ms"] <= limit) is expected_pass
+        assert fixture.time_requests == 7 and fixture.registrations == 0 and not fixture.unexpected
+        check_samples(status)
+        assert SECRET_CANARY not in result.stdout + result.stderr
+        return {"scenario": name, "passed": True, "uncertainty_ms": status["uncertainty_ms"],
+                "anchor_accepted": status["anchor_accepted"], "limit_ms": limit}
+    finally:
+        fixture.shutdown()
+        fixture.server_close()
+        server_thread.join(timeout=2)
+
+
 def scenario(binary, output, name, environment):
     root = output / name
     root.mkdir(exist_ok=True)
@@ -127,7 +184,7 @@ def scenario(binary, output, name, environment):
     config.write_text(json.dumps({
         "vehicle": {"id": "synthetic-vehicle"},
         "cloud": {"signaling_url": f"http://127.0.0.1:{fixture.server_port}"},
-        "runtime": {"control_enabled": False, "media_enabled": True, "teleop_poll_interval_ms": 20},
+        "runtime": {"control_enabled": name == "over-budget", "media_enabled": True, "teleop_poll_interval_ms": 20},
         "control": {"timeout_action": {"deceleration_profile": [
             {"after_ms": 0, "brake": 0.3}, {"after_ms": 500, "brake": 0.6},
             {"after_ms": 1500, "brake": "vehicle_defined_max_safe"}]}},
@@ -155,12 +212,21 @@ def scenario(binary, output, name, environment):
             with fixture.lock:
                 registered, discovered = fixture.registrations, fixture.discoveries
                 requests = list(fixture.requests)
-            if name in {"unauthorized", "invalid-sample"}:
+            if name in {"unauthorized", "invalid-sample", "over-budget"}:
                 if code is not None:
                     assert code == 2 and registered == 0, "invalid initial clock must fail before registration"
-                    assert fixture.faulted and fixture.time_requests == 1, "negative case exited before its time endpoint injection"
+                    assert fixture.faulted and fixture.time_requests == (7 if name == "over-budget" else 1), "negative case exited before its time endpoint injection"
                     assert "vehicle_media_time_sync_failed" in names, "negative case did not fail in production time synchronization"
                     assert "vehicle_media_time_sync_retry" not in names, "nontransport sample failure was retried"
+                    if name == "over-budget":
+                        diagnostic = next(value for value in observed if value.get("issue_code") == "media_time_sync_uncertainty_exceeded")
+                        assert diagnostic["limit_ms"] == 25 and diagnostic["uncertainty_ms"] > 25
+                        status = diagnostic["time_sync"]
+                        assert not status["anchor_accepted"] and not status["has_accepted_anchor"]
+                        assert status["uncertainty_ms"] == diagnostic["uncertainty_ms"]
+                        assert status["candidate_classification_max_uncertainty_ms"] == 25
+                        assert discovered == 0, "rejected startup clock reached session discovery"
+                        check_samples(status)
                     break
             elif name == "always-timeout":
                 if code is not None:
@@ -173,8 +239,9 @@ def scenario(binary, output, name, environment):
             elif code is not None:
                 raise AssertionError(f"transient initial time failure terminated runtime: {code}")
             elif registered >= target and discovered >= target + 2:
-                assert "vehicle_media_time_sync_retry" in names, "production retry diagnostic absent"
-                assert fixture.time_requests >= 7 * target + 1, "registration preceded a full good time cohort"
+                if name != "good":
+                    assert "vehicle_media_time_sync_retry" in names, "production retry diagnostic absent"
+                assert fixture.time_requests >= 7 * target + (0 if name == "good" else 1), "registration preceded a full good time cohort"
                 if name == "after-session-end":
                     assert "vehicle_media_session_ended" in names, "session-end reconstruction was not exercised"
                 break
@@ -182,6 +249,8 @@ def scenario(binary, output, name, environment):
         else:
             raise AssertionError("production media service did not reach the required retry/failure boundary")
         assert not fixture.unexpected, "fixture unexpectedly reached an active media/control stage"
+        assert SECRET_CANARY not in stdout.read_text() + stderr.read_text(), "diagnostics leaked a response secret"
+        assert "loopback-synthetic-device" not in stdout.read_text() + stderr.read_text(), "diagnostics leaked the device token"
         assert not any(value.get("event") in {"vehicle_media_lane_configured", "vehicle_vcu_adapter_ready",
             "vehicle_webrtc_offer_created", "vehicle_recording_attempt_started"} for value in observed), "no session was granted"
         return {"scenario": name, "passed": True, "registrations": registered,
@@ -217,9 +286,14 @@ def main():
         if not key.startswith("MINE_TELEOP_") and key not in {"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS"}
         and key.lower() not in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}}
     results = []
-    for name in ["initial-timeout", "after-session-end", "always-timeout", "unauthorized", "invalid-sample"]:
+    for name in ["initial-timeout", "after-session-end", "always-timeout", "unauthorized", "invalid-sample", "over-budget", "good",
+                 "cli-over-budget", "cli-good", "cli-custom-limit"]:
         try:
-            results.append(scenario(binary, output, name, environment))
+            if name.startswith("cli-"):
+                results.append(cli_scenario(binary, output, name, environment,
+                    1 if name == "cli-custom-limit" else 25, name == "cli-good"))
+            else:
+                results.append(scenario(binary, output, name, environment))
         except (AssertionError, OSError, subprocess.SubprocessError) as error:
             results.append({"scenario": name, "passed": False, "error": str(error),
                             "stdout_tail": (output / name / "runtime.stdout").read_text(errors="replace")[-6000:],

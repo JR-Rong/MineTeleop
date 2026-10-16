@@ -881,8 +881,8 @@ int run_time_sync(const Arguments& arguments) {
   const auto max_uncertainty_ms = arguments.integer("--max-uncertainty-ms", 25);
   mine_teleop::HttpClient http;
   mine_teleop::SynchronizedClock clock;
-  const auto status = clock.synchronize(http, signaling, samples);
-  auto result = status.to_json();
+  const auto status = clock.synchronize(http, signaling, samples, max_uncertainty_ms);
+  auto result = status.to_json(true);
   result["event"] = "time_sync_probe";
   result["logical_now_ms"] = clock.now_ms();
   result["max_uncertainty_ms"] = max_uncertainty_ms;

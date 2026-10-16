@@ -185,6 +185,48 @@ void poor_and_failed_cohorts_are_distinct_observations() {
       "new normal cohort did not restore trust and reset accepted-anchor age");
 }
 
+void initial_58ms_cohort_is_rejected_with_safe_complete_diagnostics() {
+  SimulatedTime time;
+  mine_teleop::SynchronizedClock clock(time.source());
+  const auto rejected = clock.synchronize([&](auto sent) {
+    auto response = time.reply(sent, 108);
+    auto body = mine_teleop::Json::parse(response.body);
+    body["device_token"] = "diagnostic-secret-canary";
+    body["timestamp_scope"] = "Bearer diagnostic-secret-canary";
+    body["server_api_gate_wait_ms"] = {{"password", "diagnostic-secret-canary"}};
+    body["server_before_handler_ms"] = 2;
+    body["server_parse_ms"] = 1;
+    body["server_processing_monotonic_ms"] = 0;
+    response.body = body.dump();
+    response.timing = {{"dns_ms", 1.0}, {"connect_ms", 2.0}, {"tls_ms", 3.0},
+        {"first_byte_ms", 107.0}, {"total_ms", 108.0}, {"requests_sent", 1}};
+    return response;
+  }, 7, 25);
+  expect(rejected.uncertainty_ms == 58 && !rejected.acceptable(25) &&
+      !rejected.anchor_accepted && !rejected.has_accepted_anchor &&
+      rejected.candidate_classification_max_uncertainty_ms == 25,
+      "initial 58ms cohort established an anchor under the production 25ms policy");
+  const auto diagnostic = rejected.to_json(true);
+  expect(diagnostic.at("samples").size() == 7, "rejected startup cohort lost samples");
+  expect(diagnostic.dump().find("diagnostic-secret-canary") == std::string::npos,
+      "remote response text or objects leaked credentials into timing diagnostics");
+  for (const auto& sample : diagnostic.at("samples")) {
+    expect(sample.at("round_trip_ms") == 108 && sample.at("valid") == true &&
+        sample.at("server_timestamp_scope") == "unrecognized" &&
+        sample.at("server_api_gate_wait_ms").is_null() &&
+        sample.at("server_before_handler_ms") == 2 && sample.at("server_parse_ms") == 1 &&
+        sample.at("server_processing_monotonic_ms") == 0 &&
+        sample.at("http").at("total_ms") == 108.0 &&
+        sample.at("http").contains("dns_ms") && sample.at("http").contains("connect_ms") &&
+        sample.at("http").contains("tls_ms") && sample.at("http").contains("first_byte_ms"),
+        "safe sample metadata or existing HTTP phase timings were discarded");
+  }
+  const auto accepted = clock.synchronize([&](auto sent) { return time.reply(sent); }, 7, 25);
+  expect(accepted.acceptable(25) && accepted.anchor_accepted && accepted.has_accepted_anchor &&
+      accepted.to_json(true).at("samples").size() == 7,
+      "normal initial samples did not establish a trusted anchor after a rejected cohort");
+}
+
 void server_processing_and_median_uncertainty_are_bounded() {
   SimulatedTime time;
   mine_teleop::SynchronizedClock clock(time.source());
@@ -503,6 +545,7 @@ int main() {
       {"repeated_small_wall_steps_do_not_shorten_rtt", repeated_small_wall_steps_do_not_shorten_rtt},
       {"permitted_small_step_is_inside_the_error_budget", permitted_small_step_is_inside_the_error_budget},
       {"poor_and_failed_cohorts_are_distinct_observations", poor_and_failed_cohorts_are_distinct_observations},
+      {"initial_58ms_cohort_is_rejected_with_safe_complete_diagnostics", initial_58ms_cohort_is_rejected_with_safe_complete_diagnostics},
       {"server_processing_and_median_uncertainty_are_bounded", server_processing_and_median_uncertainty_are_bounded},
       {"paired_wire_boundaries_exclude_client_queue", paired_wire_boundaries_exclude_client_queue},
       {"send_receive_pair_uncertainty_cannot_be_hidden", send_receive_pair_uncertainty_cannot_be_hidden},

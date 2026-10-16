@@ -521,16 +521,27 @@ TimeSyncStatus SynchronizedClock::synchronize(
       // A wall step must not shorten the network delay or move the UTC anchor.
       const auto round_trip_ms = std::max<std::int64_t>(0, mono_exchange_ms - server_processing_ms);
       const auto offset_ms = ((server_receive_ms - sent.wall_ms) + (server_send_ms - received.wall_ms)) / 2;
+      // Only public timing scalars and known scope names may enter diagnostics.
+      // Never echo arbitrary server text/objects (or response headers/body),
+      // which may contain credentials even when the time sample itself is valid.
+      const auto diagnostic_ms = [&](const char* key) -> Json {
+        const auto value = response.find(key);
+        return value != response.end() && value->is_number_integer() ? *value : Json(nullptr);
+      };
+      const auto server_scope = response.value("timestamp_scope", "legacy_handler_boundary");
+      const auto safe_server_scope = server_scope == "legacy_handler_boundary" ||
+              server_scope == "http_request_received_to_response_ready"
+          ? Json(server_scope) : Json("unrecognized");
       diagnostics.push_back({{"index", index}, {"round_trip_ms", round_trip_ms}, {"offset_ms", offset_ms},
           {"server_processing_ms", server_processing_ms}, {"monotonic_elapsed_ms", elapsed_ms},
           {"wall_clock_elapsed_ms", call_received.wall_ms - call_sent.wall_ms},
           {"wall_clock_step_ms", call_received.wall_ms - call_sent.wall_ms - elapsed_ms},
-          {"server_api_gate_wait_ms", response.value("server_api_gate_wait_ms", Json(nullptr))}, {"http", http_response.timing}});
+          {"server_api_gate_wait_ms", diagnostic_ms("server_api_gate_wait_ms")}, {"http", http_response.timing}});
       diagnostics.back()["timestamp_scope"] = wire_timestamps ? "http_header_out_to_body_received" : "call_to_return_fallback";
-      diagnostics.back()["server_timestamp_scope"] = response.value("timestamp_scope", "legacy_handler_boundary");
-      diagnostics.back()["server_before_handler_ms"] = response.value("server_before_handler_ms", Json(nullptr));
-      diagnostics.back()["server_parse_ms"] = response.value("server_parse_ms", Json(nullptr));
-      diagnostics.back()["server_processing_monotonic_ms"] = response.value("server_processing_monotonic_ms", Json(nullptr));
+      diagnostics.back()["server_timestamp_scope"] = safe_server_scope;
+      diagnostics.back()["server_before_handler_ms"] = diagnostic_ms("server_before_handler_ms");
+      diagnostics.back()["server_parse_ms"] = diagnostic_ms("server_parse_ms");
+      diagnostics.back()["server_processing_monotonic_ms"] = diagnostic_ms("server_processing_monotonic_ms");
       diagnostics.back()["exchange_wall_clock_step_ms"] = wall_exchange_ms - mono_exchange_ms;
       diagnostics.back()["send_timestamp_uncertainty_ms"] = sent.uncertainty_ms;
       diagnostics.back()["receive_timestamp_uncertainty_ms"] = received.uncertainty_ms;

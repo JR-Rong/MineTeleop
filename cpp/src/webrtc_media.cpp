@@ -4764,7 +4764,8 @@ struct VehicleMediaRuntime::Impl {
           "Stabilize network time synchronization before enabling teleoperation.",
           true,
           {{"uncertainty_ms", initial_time_sync.uncertainty_ms},
-           {"limit_ms", config.field_safety.max_time_sync_uncertainty_ms}});
+           {"limit_ms", config.field_safety.max_time_sync_uncertainty_ms},
+           {"time_sync", initial_time_sync.to_json(true)}});
       throw std::runtime_error(
           "media time synchronization uncertainty " + std::to_string(initial_time_sync.uncertainty_ms) +
           "ms exceeds limit " + std::to_string(config.field_safety.max_time_sync_uncertainty_ms) + "ms");
