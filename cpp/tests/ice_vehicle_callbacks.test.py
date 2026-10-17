@@ -41,9 +41,9 @@ namespace detail { constexpr std::string_view kControlTransportCapability = "nat
 using guint=unsigned;using guint8=unsigned char;using gchar=char;using gpointer=void*;
 struct GstSDPMessage {std::string text;};
 struct GstWebRTCSessionDescription {GstSDPMessage* sdp;};
-struct GstStructure {std::string sdp;};
+struct GstStructure {std::string sdp;bool error=false;};
 struct GstPromise {void(*callback)(GstPromise*,void*){};void* data{};void(*destroy)(void*){};GstStructure reply;bool replied=true;};
-struct GstElement {int refs=1;std::vector<GstPromise*> offers;std::vector<std::string> local,remote,added;};
+struct GstElement {int refs=1;std::vector<GstPromise*> offers,answers;std::vector<std::string> local,remote,added;};
 #define GST_ELEMENT(x) (x)
 constexpr int GST_PROMISE_RESULT_REPLIED=1,GST_TYPE_WEBRTC_SESSION_DESCRIPTION=0,GST_SDP_OK=0,GST_WEBRTC_SDP_TYPE_ANSWER=1;
 GstElement* gst_object_ref(GstElement* p){++p->refs;return p;}
@@ -51,6 +51,7 @@ void gst_object_unref(GstElement* p){if(--p->refs<1)throw std::runtime_error("mo
 int gst_promise_wait(GstPromise* p){return p->replied?GST_PROMISE_RESULT_REPLIED:0;}
 void gst_promise_unref(GstPromise* p){if(p->destroy)p->destroy(p->data);delete p;}
 const GstStructure* gst_promise_get_reply(GstPromise* p){return &p->reply;}
+bool gst_structure_has_field(const GstStructure* reply,const char* name){return std::string(name)=="error"&&reply->error;}
 void gst_structure_get(const GstStructure* reply,const char*,int,GstWebRTCSessionDescription** out,void*) {
   *out=new GstWebRTCSessionDescription{new GstSDPMessage{reply->sdp}};
 }
@@ -60,16 +61,21 @@ void gst_webrtc_session_description_free(GstWebRTCSessionDescription* d){delete 
 std::function<void()> before_description;
 GstPromise* gst_promise_new(){auto callback=std::exchange(before_description,{});if(callback)callback();return new GstPromise;}
 GstPromise* gst_promise_new_with_change_func(void(*callback)(GstPromise*,void*),void* data,void(*destroy)(void*)) {
-  auto* p=new GstPromise;p->callback=callback;p->data=data;p->destroy=destroy;return p;
+  auto* p=gst_promise_new();p->callback=callback;p->data=data;p->destroy=destroy;return p;
 }
 void gst_promise_interrupt(GstPromise*){}
 std::function<void(GstElement*)> local_hook;
 std::function<void()> parse_hook;
 bool invalid_parse=false;
+bool defer_answers=false;
 void g_signal_emit_by_name(GstElement* p,const char*,std::nullptr_t,GstPromise* promise){p->offers.push_back(promise);}
-void g_signal_emit_by_name(GstElement* p,const char* signal,GstWebRTCSessionDescription* description,GstPromise*) {
+void g_signal_emit_by_name(GstElement* p,const char* signal,GstWebRTCSessionDescription* description,GstPromise* promise) {
   if(std::string(signal)=="set-local-description") {p->local.push_back(description->sdp->text);if(local_hook)local_hook(p);}
-  else p->remote.push_back(description->sdp->text);
+  else {
+    p->remote.push_back(description->sdp->text);
+    if(defer_answers)p->answers.push_back(promise);
+    else if(promise->callback)promise->callback(promise,promise->data);
+  }
 }
 void g_signal_emit_by_name(GstElement* p,const char*,guint,const char* text){p->added.emplace_back(text);}
 int gst_sdp_message_new(GstSDPMessage** sdp){*sdp=new GstSDPMessage;return GST_SDP_OK;}
@@ -209,6 +215,34 @@ void case_failed_unpublished_attempt() {
   expect(impl.media_signal_state->attempt_count==1&&impl.media_signal_state->offer_count==1,"fresh session retained legacy retry counters");
 #endif
 }
+void case_answer_completion() {
+  for(int outcome=0;outcome<3;++outcome) {
+    Impl impl;GstElement peer;activate(impl,peer);negotiate(impl,peer);complete(peer);
+    defer_answers=true;answer(impl,impl.media_signal_state->negotiation_id);defer_answers=false;
+    expect(impl.answer_received,"received answer was not recorded");
+    expect(impl.media_scope_status().value("answer_apply_pending",false)&&!impl.media_scope_status().value("answer_applied",false),"queued answer was reported as applied");
+    expect(std::count(impl.diagnostics.begin(),impl.diagnostics.end(),"vehicle_webrtc_answer_applied")==0,"applied event preceded GStreamer completion");
+    expect(peer.answers.size()==1,"answer promise missing");
+    auto* p=peer.answers.front();peer.answers.clear();p->reply.error=outcome==1;p->replied=outcome!=2;p->callback(p,p->data);
+    expect(!impl.media_scope_status().value("answer_apply_pending",true),"completed answer remained pending");
+    expect(impl.media_scope_status().value("answer_applied",false)==(outcome==0),"answer outcome differed from GStreamer reply");
+    expect(impl.errors.size()==(outcome==0?0U:1U),"rejected or interrupted answer was not surfaced");
+    expect(std::count(impl.diagnostics.begin(),impl.diagnostics.end(),"vehicle_webrtc_answer_applied")== (outcome==0?1:0),"applied event did not match successful completion");
+    expect(peer.refs==1,"answer promise leaked peer reference");
+  }
+}
+void case_retired_answer_completion() {
+  for(bool rejected:{false,true}) {
+    Impl impl;GstElement peer,replacement;activate(impl,peer);negotiate(impl,peer);complete(peer);
+    defer_answers=true;answer(impl,impl.media_signal_state->negotiation_id);defer_answers=false;
+    expect(impl.media_scope_status().value("answer_apply_pending",false),"answer callback was not retained until completion");
+    activate(impl,replacement,2);negotiate(impl,replacement);complete(replacement);
+    auto* p=peer.answers.front();peer.answers.clear();p->reply.error=rejected;p->callback(p,p->data);
+    expect(impl.errors.empty()&&!impl.media_scope_status().value("answer_applied",false),"retired answer changed the replacement attempt");
+    expect(std::count(impl.diagnostics.begin(),impl.diagnostics.end(),"vehicle_webrtc_answer_applied")==0,"retired answer emitted success for replacement");
+    expect(peer.refs==1&&replacement.refs==1,"retired answer leaked a peer reference");
+  }
+}
 int main(){int failed=0;const std::vector<std::pair<const char*,void(*)()>> cases={
   {"ICE-VEHICLE-MOCK-001",case_order},{"ICE-VEHICLE-MOCK-002",case_late_callbacks},
   {"ICE-VEHICLE-MOCK-003",case_remote_order},{"ICE-VEHICLE-MOCK-004",case_legacy_retry},
@@ -221,6 +255,8 @@ int main(){int failed=0;const std::vector<std::pair<const char*,void(*)()>> case
   selected.emplace_back("ICE-VEHICLE-RACE-002",case_answer_check_to_emit);
 #ifndef RACE_ONLY
   selected.emplace_back("ICE-VEHICLE-MIXED-001",case_failed_unpublished_attempt);
+  selected.emplace_back("ICE-ANSWER-COMPLETION-001",case_answer_completion);
+  selected.emplace_back("ICE-ANSWER-COMPLETION-002",case_retired_answer_completion);
 #endif
   for(const auto& [id,run]:selected){try{run();std::cout<<"PASS "<<id<<'\n';}catch(const std::exception& e){++failed;std::cerr<<"FAIL "<<id<<": "<<e.what()<<'\n';}}
   return failed?1:0;

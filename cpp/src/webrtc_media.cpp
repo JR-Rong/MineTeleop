@@ -573,6 +573,8 @@ struct VehicleMediaRuntime::Impl {
     std::string compatibility_issue;
     bool local_description_ready{false};
     bool offer_queued{false};
+    bool answer_apply_pending{false};
+    bool answer_applied{false};
     std::vector<std::string> local_ufrags;
     std::vector<std::string> remote_ufrags;
     std::deque<Json> pending_remote_candidates;
@@ -586,6 +588,7 @@ struct VehicleMediaRuntime::Impl {
       if (session_id != session) { session_id = session; attempt_count = 0; offer_count = 0; }
       owner = next_owner; peer = next_peer; negotiation_id.clear(); compatibility_issue.clear();
       local_description_ready = false; offer_queued = false;
+      answer_apply_pending = false; answer_applied = false;
       local_ufrags.clear(); remote_ufrags.clear();
       pending_local_candidates.clear(); pending_remote_candidates.clear(); pending.clear();
       ++attempt_count;
@@ -1242,6 +1245,40 @@ struct VehicleMediaRuntime::Impl {
     }
     g_free(text);
     gst_webrtc_session_description_free(offer);
+  }
+
+  static void on_answer_applied(GstPromise* promise, gpointer user_data) {
+    // The promise owns the context. Copy the attempt identity before unref;
+    // teardown can retire this peer while the asynchronous operation finishes.
+    const auto* context = static_cast<MediaOfferContext*>(user_data);
+    const auto state = context->state;
+    const auto negotiation_id = context->negotiation_id;
+    MediaPeerReference source{GST_ELEMENT(gst_object_ref(context->peer))};
+    const bool replied = gst_promise_wait(promise) == GST_PROMISE_RESULT_REPLIED;
+    const auto* reply = replied ? gst_promise_get_reply(promise) : nullptr;
+    const bool rejected = reply != nullptr && gst_structure_has_field(reply, "error");
+    gst_promise_unref(promise);
+    std::lock_guard lock(state->mutex);
+    if (state->peer != source.value || state->owner == nullptr || state->negotiation_id != negotiation_id) return;
+    state->answer_apply_pending = false;
+    state->answer_applied = replied && !rejected;
+    auto* self = state->owner;
+    if (!state->answer_applied) {
+      // GStreamer error text can contain SDP fields. Publish a bounded issue
+      // code, never the description or the raw promise reply.
+      self->set_pipeline_error(
+          rejected ? "GStreamer rejected the controller WebRTC answer" : "WebRTC answer promise did not complete successfully",
+          rejected ? "webrtc_answer_rejected" : "webrtc_answer_promise_failed",
+          "webrtc_answer",
+          "Inspect matching offer/answer codec and media sections, GStreamer version, and negotiation state before retrying.",
+          true);
+      return;
+    }
+    self->emit_diagnostic(
+        "vehicle_webrtc_answer_applied", "webrtc_answer_applied", "webrtc_answer", "",
+        "No action is required; wait for ICE/DTLS connection and video frames.", true,
+        {{"codec", to_string(self->active_candidate.codec)},
+         {"backend", to_string(self->active_candidate.backend)}});
   }
 
   static void on_negotiation_needed(GstElement* webrtc, gpointer user_data) {
@@ -4307,6 +4344,8 @@ struct VehicleMediaRuntime::Impl {
       media_signal_state->negotiation_id.clear(); media_signal_state->remote_ufrags.clear();
       media_signal_state->local_description_ready = false;
       media_signal_state->offer_queued = false;
+      media_signal_state->answer_apply_pending = false;
+      media_signal_state->answer_applied = false;
       media_signal_state->local_ufrags.clear();
       media_signal_state->pending_local_candidates.clear();
       media_signal_state->pending_remote_candidates.clear(); media_signal_state->pending.clear();
@@ -4475,6 +4514,8 @@ struct VehicleMediaRuntime::Impl {
   Json media_scope_status() const {
     std::lock_guard lock(media_signal_state->mutex);
     return {{"id", media_signal_state->negotiation_id},
+        {"answer_apply_pending", media_signal_state->answer_apply_pending},
+        {"answer_applied", media_signal_state->answer_applied},
         {"issue_code", media_signal_state->compatibility_issue},
         {"next_action", media_signal_state->compatibility_issue.empty() ? "" :
             "Keep control stopped. Update controller and vehicle packages together, reopen the control page, and start a fresh session."}};
@@ -4537,26 +4578,20 @@ struct VehicleMediaRuntime::Impl {
           media_signal_state->compatibility_issue.clear();
           media_signal_state->remote_ufrags = ice_ufrags(sdp_text);
           pending.swap(media_signal_state->pending_remote_candidates);
+          media_signal_state->answer_apply_pending = true;
+          media_signal_state->answer_applied = false;
         }
-        GstPromise* promise = gst_promise_new();
+        auto* context = new MediaOfferContext{
+            media_signal_state, GST_ELEMENT(gst_object_ref(source)), negotiation_id};
+        GstPromise* promise = gst_promise_new_with_change_func(on_answer_applied, context,
+            +[](gpointer value) { delete static_cast<MediaOfferContext*>(value); });
         g_signal_emit_by_name(source, "set-remote-description", answer, promise);
-        gst_promise_interrupt(promise);
-        gst_promise_unref(promise);
         gst_webrtc_session_description_free(answer);
         for (const auto& candidate : pending) apply_remote_ice(candidate);
         std::lock_guard lock(media_signal_state->mutex);
         if (media_signal_state->peer != source || media_signal_state->negotiation_id != negotiation_id) continue;
         answer_received = true;
         answer_received_at_ms = signaling.now_ms();
-        emit_diagnostic(
-            "vehicle_webrtc_answer_applied",
-            "webrtc_answer_applied",
-            "webrtc_answer",
-            "",
-            "No action is required; wait for ICE/DTLS connection and video frames.",
-            true,
-            {{"codec", to_string(active_candidate.codec)},
-             {"backend", to_string(active_candidate.backend)}});
       } else if (type == "ice_candidate") {
         apply_remote_ice(payload);
       } else if (type == "media_fallback" && active_candidate.codec == VideoCodec::H265) {
@@ -5002,6 +5037,7 @@ struct VehicleMediaRuntime::Impl {
       flush_outgoing_signals();
       const auto elapsed = std::max<std::int64_t>(1, signaling.now_ms() - attempt_started);
       final_lanes = lane_metrics(elapsed);
+      const bool answer_applied = media_scope_status().value("answer_applied", false);
       if (current_pipeline_error().empty() && !answer_received) {
         set_pipeline_error(
             "controller WebRTC answer was not received",
@@ -5009,6 +5045,12 @@ struct VehicleMediaRuntime::Impl {
             "webrtc_answer",
             "Check controller login/session state, signaling messages, and browser WebRTC offer handling.",
             true);
+      }
+      if (current_pipeline_error().empty() && !answer_applied) {
+        set_pipeline_error(
+            "controller WebRTC answer application did not complete before the attempt ended",
+            "webrtc_answer_not_applied", "webrtc_answer",
+            "Inspect the matching answer completion and GStreamer negotiation state.", true);
       }
       if (current_pipeline_error().empty() && total_encoded() == 0) {
         set_pipeline_error(
@@ -5019,12 +5061,13 @@ struct VehicleMediaRuntime::Impl {
             true);
       }
       const auto error = current_pipeline_error();
-      const bool passed = error.empty() && answer_received && total_encoded() > 0 && !control_inhibited;
+      const bool passed = error.empty() && answer_applied && total_encoded() > 0 && !control_inhibited;
       attempts.push_back({
           {"backend", to_string(candidate.backend)},
           {"codec", to_string(candidate.codec)},
           {"passed", passed},
           {"answer_received", answer_received},
+          {"answer_applied", answer_applied},
           {"duration_ms", elapsed},
           {"lanes", final_lanes},
           {"failure", current_pipeline_failure()},

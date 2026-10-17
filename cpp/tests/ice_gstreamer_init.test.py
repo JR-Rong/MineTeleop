@@ -79,8 +79,8 @@ MEMBERS = r'''
   std::atomic<bool> stop_requested{false};
   std::shared_ptr<MediaSignalState> media_signal_state=std::make_shared<MediaSignalState>();
   FakeSignaling signaling;
-  std::mutex diagnostics_mutex;std::vector<std::string> errors;
-  void emit_diagnostic(std::string_view,std::string_view,std::string_view,std::string_view,std::string_view,bool,Json) {}
+  std::mutex diagnostics_mutex;std::vector<std::string> errors,diagnostics;
+  void emit_diagnostic(std::string_view event,std::string_view,std::string_view,std::string_view,std::string_view,bool,Json) {std::lock_guard lock(diagnostics_mutex);diagnostics.emplace_back(event);}
   void set_pipeline_error(std::string_view error,std::string_view,std::string_view,std::string_view,bool){std::lock_guard lock(diagnostics_mutex);errors.emplace_back(error);}
   static void on_offer_created(GstPromise* promise,gpointer data) noexcept {
     bool controlled=false;
@@ -267,13 +267,51 @@ void case_pending_callback_teardown() {
   {std::lock_guard lock(gate.mutex);gate.enabled=false;gate.target=nullptr;}
   std::cout<<"PASS ICE-GST-INIT-003\n";
 }
+void apply_description(GstElement* peer,const char* action,GstWebRTCSessionDescription* description) {
+  auto* promise=gst_promise_new();g_signal_emit_by_name(peer,action,description,promise);
+  expect(gst_promise_wait(promise)==GST_PROMISE_RESULT_REPLIED,"fixture description did not reply");
+  const auto* reply=gst_promise_get_reply(promise);
+  const bool rejected=reply&&gst_structure_has_field(reply,"error");
+  gst_promise_unref(promise);expect(!rejected,"fixture description rejected");
+}
+void case_answer_completion(bool rejected) {
+  Fixture fixture;fixture.start();const auto offer_json=fixture.offer();
+  GstSDPMessage* sdp=nullptr;gst_sdp_message_new(&sdp);
+  const std::string text=rejected?"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n":offer_json.at("sdp").get<std::string>();
+  expect(gst_sdp_message_parse_buffer(reinterpret_cast<const guint8*>(text.data()),text.size(),sdp)==GST_SDP_OK,"fixture SDP syntax invalid");
+  auto* answer=gst_webrtc_session_description_new(rejected?GST_WEBRTC_SDP_TYPE_ANSWER:GST_WEBRTC_SDP_TYPE_OFFER,sdp);
+  if(!rejected) {
+    auto* receiver=gst_element_factory_make("webrtcbin",nullptr);expect(receiver,"receiver unavailable");
+    expect(gst_element_set_state(receiver,GST_STATE_PLAYING)!=GST_STATE_CHANGE_FAILURE,"receiver did not start");
+    apply_description(receiver,"set-remote-description",answer);gst_webrtc_session_description_free(answer);answer=nullptr;
+    auto* promise=gst_promise_new();g_signal_emit_by_name(receiver,"create-answer",nullptr,promise);
+    expect(gst_promise_wait(promise)==GST_PROMISE_RESULT_REPLIED,"receiver answer did not reply");
+    const auto* reply=gst_promise_get_reply(promise);
+    expect(reply&&gst_structure_get(reply,"answer",GST_TYPE_WEBRTC_SESSION_DESCRIPTION,&answer,nullptr)&&answer,"receiver answer missing");
+    gst_promise_unref(promise);gst_element_set_state(receiver,GST_STATE_NULL);gst_object_unref(receiver);
+  }
+  const auto state=fixture.impl.media_signal_state;
+  Impl::MediaOfferContext* context=nullptr;
+  {std::lock_guard lock(state->mutex);state->answer_apply_pending=true;state->answer_applied=false;
+    context=new Impl::MediaOfferContext{state,GST_ELEMENT(gst_object_ref(fixture.peer)),state->negotiation_id};}
+  auto* promise=gst_promise_new_with_change_func(Impl::on_answer_applied,context,
+      +[](gpointer value){delete static_cast<Impl::MediaOfferContext*>(value);});
+  g_signal_emit_by_name(fixture.peer,"set-remote-description",answer,promise);gst_webrtc_session_description_free(answer);
+  expect(wait_for([&]{std::lock_guard lock(state->mutex);return !state->answer_apply_pending;}),"actual answer callback did not finish");
+  {std::lock_guard lock(state->mutex);expect(state->answer_applied!=rejected,"actual answer outcome was misreported");}
+  {std::lock_guard lock(fixture.impl.diagnostics_mutex);
+    expect(fixture.impl.errors.size()==(rejected?1U:0U),"actual answer rejection was swallowed");
+    expect(std::count(fixture.impl.diagnostics.begin(),fixture.impl.diagnostics.end(),"vehicle_webrtc_answer_applied")== (rejected?0:1),"actual answer emitted a false success milestone");}
+  fixture.stop();expect(fixture.released(),"answer callback retained its peer after teardown");
+  std::cout<<(rejected?"PASS ICE-GST-ANSWER-002":"PASS ICE-GST-ANSWER-001")<<'\n';
+}
 int main(){
   gst_init(nullptr,nullptr);bool missing=false;
   for(const char* name:{"webrtcbin","nicesrc","nicesink","appsrc","queue"}) {
     auto* factory=gst_element_factory_find(name);if(!factory){missing=true;std::cerr<<"BLOCKED missing Gst factory "<<name<<'\n';}else gst_object_unref(factory);
   }
   if(missing){gst_deinit();return 2;}
-  int result=0;try{case_initial_and_repeat();case_pending_callback_teardown();}
+  int result=0;try{case_initial_and_repeat();case_pending_callback_teardown();case_answer_completion(false);case_answer_completion(true);}
   catch(const std::exception& error){std::cerr<<"FAIL actual Gst initialization: "<<error.what()<<'\n';result=1;}
   gst_deinit();return result;
 }
