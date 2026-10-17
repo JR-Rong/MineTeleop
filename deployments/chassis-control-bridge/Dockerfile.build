@@ -18,6 +18,7 @@ WORKDIR /src/mine-teleop
 COPY deployments/chassis-control-bridge/ deployments/chassis-control-bridge/
 COPY cpp/include/ cpp/include/
 COPY cpp/src/vcu.cpp cpp/src/vcu.cpp
+COPY cmake/ChassisDiagnosticsIdentity.cmake cmake/ChassisDiagnosticsIdentity.cmake
 COPY --from=chassis_control_headers / /src/chassis-control/include/
 COPY --from=chassis_runtime /libchassis_control.so /src/chassis-runtime/libchassis_control.so
 

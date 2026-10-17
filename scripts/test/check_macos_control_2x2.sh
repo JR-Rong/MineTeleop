@@ -154,11 +154,11 @@ signaling_url="ws://127.0.0.1:$server_port/signaling"
 
 post_json "$server_origin/vehicles/online" \
   "$(jq -nc --arg id vehicle-001 --arg token "$vehicle_one_token" \
-    '{vehicle_id:$id,device_token:$token,connection_id:"mac-process-vehicle-001"}')" \
+    '{vehicle_id:$id,device_token:$token,connection_id:"mac-process-vehicle-001",native_control_capabilities:"v9-revision-recovery-v1"}')" \
   "$runtime_dir/vehicle-one-online.json"
 post_json "$server_origin/vehicles/online" \
   "$(jq -nc --arg id vehicle-002 --arg token "$vehicle_two_token" \
-    '{vehicle_id:$id,device_token:$token,connection_id:"mac-process-vehicle-002"}')" \
+    '{vehicle_id:$id,device_token:$token,connection_id:"mac-process-vehicle-002",native_control_capabilities:"v9-revision-recovery-v1"}')" \
   "$runtime_dir/vehicle-two-online.json"
 vehicle_one_generation="$(jq -er '.connection_generation' "$runtime_dir/vehicle-one-online.json")"
 vehicle_two_generation="$(jq -er '.connection_generation' "$runtime_dir/vehicle-two-online.json")"
@@ -192,8 +192,8 @@ post_json "$control_one_origin/api/login" \
 post_json "$control_two_origin/api/login" \
   "$(jq -nc --arg password "$driver_two_password" '{password:$password}')" \
   "$runtime_dir/driver-two-login.json"
-post_json "$control_one_origin/api/connect" '{"vehicle_id":"vehicle-001"}' "$runtime_dir/session-one.json"
-post_json "$control_two_origin/api/connect" '{"vehicle_id":"vehicle-002"}' "$runtime_dir/session-two.json"
+post_json "$control_one_origin/api/connect" '{"vehicle_id":"vehicle-001","ui_instance_id":"mac-2x2-one"}' "$runtime_dir/session-one.json"
+post_json "$control_two_origin/api/connect" '{"vehicle_id":"vehicle-002","ui_instance_id":"mac-2x2-two"}' "$runtime_dir/session-two.json"
 
 session_one="$(jq -er '.session_id' "$runtime_dir/session-one.json")"
 session_two="$(jq -er '.session_id' "$runtime_dir/session-two.json")"
@@ -213,19 +213,21 @@ wait_for_status "$server_origin/health" "$runtime_dir/health-active.json" \
 
 post_json "$control_one_origin/api/control-intent" \
   "$(jq -nc --arg session "$session_one" --argjson generation "$session_generation_one" \
-    '{session_id:$session,session_generation:$generation,ui_instance_id:"mac-2x2-one",intent_seq:1,gear:"N",steering:0,throttle:0,brake:0,estop:false}')" \
+    '{session_id:$session,session_generation:$generation,ui_instance_id:"mac-2x2-one",ui_control_epoch:0,takeover:true,intent_seq:1,gear:"N",steering:0,throttle:0,brake:0,estop:false,critical_video_sample_healthy:true,critical_video_bad_sample_revision:0,critical_video_brake_revision:0}')" \
   "$runtime_dir/control-one-neutral.json"
 post_json "$control_two_origin/api/control-intent" \
   "$(jq -nc --arg session "$session_two" --argjson generation "$session_generation_two" \
-    '{session_id:$session,session_generation:$generation,ui_instance_id:"mac-2x2-two",intent_seq:1,gear:"N",steering:0,throttle:0,brake:0,estop:false}')" \
+    '{session_id:$session,session_generation:$generation,ui_instance_id:"mac-2x2-two",ui_control_epoch:0,takeover:true,intent_seq:1,gear:"N",steering:0,throttle:0,brake:0,estop:false,critical_video_sample_healthy:true,critical_video_bad_sample_revision:0,critical_video_brake_revision:0}')" \
   "$runtime_dir/control-two-neutral.json"
+ui_epoch_one="$(jq -er 'select(.accepted).ui_control_epoch' "$runtime_dir/control-one-neutral.json")"
+ui_epoch_two="$(jq -er 'select(.accepted).ui_control_epoch' "$runtime_dir/control-two-neutral.json")"
 post_json "$control_one_origin/api/control-intent" \
-  "$(jq -nc --arg session "$session_one" --argjson generation "$session_generation_one" \
-    '{session_id:$session,session_generation:$generation,ui_instance_id:"mac-2x2-one",intent_seq:2,gear:"N",steering:-0.25,throttle:0.1,brake:0,estop:false}')" \
+  "$(jq -nc --arg session "$session_one" --argjson generation "$session_generation_one" --argjson epoch "$ui_epoch_one" \
+    '{session_id:$session,session_generation:$generation,ui_instance_id:"mac-2x2-one",ui_control_epoch:$epoch,takeover:false,intent_seq:2,gear:"N",steering:-0.25,throttle:0.1,brake:0,estop:false,critical_video_sample_healthy:true,critical_video_bad_sample_revision:0,critical_video_brake_revision:0}')" \
   "$runtime_dir/control-one.json"
 post_json "$control_two_origin/api/control-intent" \
-  "$(jq -nc --arg session "$session_two" --argjson generation "$session_generation_two" \
-    '{session_id:$session,session_generation:$generation,ui_instance_id:"mac-2x2-two",intent_seq:2,gear:"N",steering:0.25,throttle:0.2,brake:0,estop:false}')" \
+  "$(jq -nc --arg session "$session_two" --argjson generation "$session_generation_two" --argjson epoch "$ui_epoch_two" \
+    '{session_id:$session,session_generation:$generation,ui_instance_id:"mac-2x2-two",ui_control_epoch:$epoch,takeover:false,intent_seq:2,gear:"N",steering:0.25,throttle:0.2,brake:0,estop:false,critical_video_sample_healthy:true,critical_video_bad_sample_revision:0,critical_video_brake_revision:0}')" \
   "$runtime_dir/control-two.json"
 jq -e '.accepted and .transport == "native_signaling_websocket"' \
   "$runtime_dir/control-one.json" >/dev/null || fail 'driver one native intent was not accepted'
@@ -341,8 +343,19 @@ if (( soak_seconds > 0 )); then
   fi
 fi
 
-post_json "$control_one_origin/api/disconnect" '{"reason":"mac_process_2x2_complete"}' "$runtime_dir/disconnect-one.json"
-post_json "$control_two_origin/api/disconnect" '{"reason":"mac_process_2x2_complete"}' "$runtime_dir/disconnect-two.json"
+scoped_disconnect() {
+  local origin="$1" owner="$2" output="$3" status_file="$4" body
+  curl -fsS "$origin/api/status" >"$status_file"
+  body="$(jq -ec --arg owner "$owner" '
+    if .native_control.owner_ui_instance_id != $owner then error("fixture does not own the current session") else
+    {reason:"mac_process_2x2_complete",expected_driver_id:.driver_id,expected_session_id:.session_id,
+     expected_control_session_generation:.control_session_generation,expected_ui_control_epoch:.native_control.ui_control_epoch,
+     ui_instance_id:$owner,expected_connect_cancellation_generation:.connect_cancellation_generation} end
+  ' "$status_file")"
+  post_json "$origin/api/disconnect" "$body" "$output"
+}
+scoped_disconnect "$control_one_origin" mac-2x2-one "$runtime_dir/disconnect-one.json" "$runtime_dir/status-one-before-disconnect.json"
+scoped_disconnect "$control_two_origin" mac-2x2-two "$runtime_dir/disconnect-two.json" "$runtime_dir/status-two-before-disconnect.json"
 wait_for_status "$server_origin/health" "$runtime_dir/health-released.json" \
   '.online_vehicles == 2 and .online_drivers == 0 and .active_sessions == 0'
 

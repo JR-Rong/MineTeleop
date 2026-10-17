@@ -17,6 +17,8 @@ runtime:
   control_log_commands: true
   teleop_poll_interval_ms: 500
   media_frame_timeout_ms: 3000
+  critical_camera_stale_brake_ms: 500
+  control_recovery_timeout_ms: 5000
   media_capture_interval_ms: 0
 
 control:

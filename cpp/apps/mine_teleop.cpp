@@ -228,6 +228,7 @@ Driver console options:
   --vehicle-id ID               target vehicle (default vehicle-001)
   --driver-password PASSWORD    or set MINE_TELEOP_DRIVER_PASSWORD
   --signaling-http-url URL      override driver configuration
+  --control-transport P         p2p_preferred (default) or cloud_only
 
 Vehicle media options:
   --config PATH                 vehicle YAML (default configs/vehicle-agent.dev.yaml)
@@ -505,6 +506,12 @@ int run_driver_console(const Arguments& arguments) {
   const auto signaling_override = arguments.value("--signaling-http-url");
   if (!signaling_override.empty()) config.signaling_url = signaling_override;
   apply_ice_transport_policy_override(arguments, config.ice_transport_policy);
+  const auto control_transport_mode = arguments.value("--control-transport");
+  if (!control_transport_mode.empty()) {
+    if (!mine_teleop::control_transport_mode_is_valid(control_transport_mode))
+      throw std::invalid_argument("--control-transport must be p2p_preferred or cloud_only");
+    config.control_transport_mode = control_transport_mode;
+  }
   const auto password = arguments.value(
       "--driver-password", environment("MINE_TELEOP_DRIVER_PASSWORD").empty() ? "dev-password" : environment("MINE_TELEOP_DRIVER_PASSWORD"));
   auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(
@@ -547,8 +554,8 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
   // its signaling cursor and critical-camera control latch outside that
   // reconstruction loop.
   auto signaling_sequence = std::make_shared<mine_teleop::MediaSignalingSequence>();
-  auto critical_camera_control_latch =
-      std::make_shared<mine_teleop::CriticalCameraControlLatch>();
+  auto control_recovery_latch =
+      std::make_shared<mine_teleop::SessionControlRecoveryLatch>();
   while (true) {
     try {
       mine_teleop::VehicleMediaRuntime runtime(
@@ -561,7 +568,7 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
           launch.simulate_primary_failure_after_frames,
           launch.connection_id,
           signaling_sequence,
-          critical_camera_control_latch);
+          control_recovery_latch);
       const auto summary = runtime.run(launch.frame_count, launch.duration_ms, launch.capture_interval_ms);
       std::cout << summary.dump() << '\n';
       if (!service) return summary.value("passed", false) ? 0 : 2;
@@ -635,6 +642,21 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
                    }).dump()
                 << std::endl;
       std::this_thread::sleep_for(retry_delay);
+    } catch (const mine_teleop::TimeSyncSampleError& error) {
+      // SynchronizedClock wraps the exchange error with sample diagnostics.
+      // Only transient transport failure inherits the existing service retry;
+      // bad samples and HTTP authority/protocol errors remain fail-closed.
+      if (!service || !error.diagnostics().contains("http_failure")) throw;
+      std::cout << Json({
+                       {"event", "vehicle_media_time_sync_retry"},
+                       {"issue_code", "initial_time_sync_transport_failed"},
+                       {"stage", "time_sync"},
+                       {"error", error.what()},
+                       {"retryable", true},
+                       {"retry_after_ms", std::chrono::duration_cast<std::chrono::milliseconds>(kTransportRestartDelay).count()},
+                   }).dump()
+                << std::endl;
+      std::this_thread::sleep_for(kTransportRestartDelay);
     } catch (const mine_teleop::HttpTransportError& error) {
       if (!service) throw;
       std::cout << Json({
@@ -859,8 +881,8 @@ int run_time_sync(const Arguments& arguments) {
   const auto max_uncertainty_ms = arguments.integer("--max-uncertainty-ms", 25);
   mine_teleop::HttpClient http;
   mine_teleop::SynchronizedClock clock;
-  const auto status = clock.synchronize(http, signaling, samples);
-  auto result = status.to_json();
+  const auto status = clock.synchronize(http, signaling, samples, max_uncertainty_ms);
+  auto result = status.to_json(true);
   result["event"] = "time_sync_probe";
   result["logical_now_ms"] = clock.now_ms();
   result["max_uncertainty_ms"] = max_uncertainty_ms;
@@ -880,7 +902,8 @@ int run_vehicle_online(const Arguments& arguments) {
       signaling + "/vehicles/online",
       {{"vehicle_id", vehicle_id},
        {"device_token", device_token},
-       {"connection_id", "vehicle-online-cli-" + mine_teleop::random_token(12)}});
+       {"connection_id", "vehicle-online-cli-" + mine_teleop::random_token(12)},
+       {"native_control_capabilities", mine_teleop::kNativeControlCapabilities}});
   std::cout << Json({{"event", "vehicle_online_cli"}, {"passed", true}, {"response", response}}).dump() << '\n';
   return 0;
 }
@@ -898,9 +921,11 @@ int run_control_smoke(const Arguments& arguments) {
       signaling + "/vehicles/online",
       {{"vehicle_id", vehicle_id},
        {"device_token", device_token},
-       {"connection_id", "control-smoke-" + mine_teleop::random_token(12)}});
+       {"connection_id", "control-smoke-" + mine_teleop::random_token(12)},
+       {"native_control_capabilities", mine_teleop::kNativeControlCapabilities}});
   const auto connection_generation = online.at("connection_generation").get<std::uint64_t>();
-  const auto connection = http.post_json_response(console + "/api/connect", Json::object());
+  const auto connection = http.post_json_response(
+      console + "/api/connect", {{"vehicle_id", vehicle_id}, {"ui_instance_id", "control-smoke"}});
   const auto session = http.get_json(
       signaling + "/vehicles/" + http.url_encode(vehicle_id) + "/session?connection_generation=" +
           std::to_string(connection_generation),
@@ -908,11 +933,18 @@ int run_control_smoke(const Arguments& arguments) {
   const auto session_id = connection.at("session_id").get<std::string>();
   const auto control_session_generation =
       connection.at("control_session_generation").get<std::uint64_t>();
+  // This control-plane smoke is a synthetic producer. Its fixed healthy video
+  // metadata exercises the wire contract; it does not observe a camera frame.
   const auto neutral = http.post_json_response(
       console + "/api/control-intent",
       {{"session_id", session_id},
        {"session_generation", control_session_generation},
        {"ui_instance_id", "control-smoke"},
+       {"ui_control_epoch", 0},
+       {"takeover", true},
+       {"critical_video_sample_healthy", true},
+       {"critical_video_bad_sample_revision", 0},
+       {"critical_video_brake_revision", 0},
        {"intent_seq", 1},
        {"gear", "N"},
        {"steering", 0.0},
@@ -924,6 +956,11 @@ int run_control_smoke(const Arguments& arguments) {
       {{"session_id", session_id},
        {"session_generation", control_session_generation},
        {"ui_instance_id", "control-smoke"},
+       {"ui_control_epoch", neutral.at("ui_control_epoch")},
+       {"takeover", false},
+       {"critical_video_sample_healthy", true},
+       {"critical_video_bad_sample_revision", 0},
+       {"critical_video_brake_revision", 0},
        {"intent_seq", 2},
        {"gear", "D"},
        {"steering", 0.125},
@@ -966,11 +1003,16 @@ int run_control_smoke(const Arguments& arguments) {
                       delivered_command.value("intent_fresh", false) &&
                       command.vehicle_id == vehicle_id && command.session_id == session.value("session_id", "") &&
                       command.control_token == session.value("control_token", "") &&
+                      command.gear == "D" && command.steering == 0.125 && command.throttle == 0.25 &&
+                      !command.estop && command.operator_active && command.control_time_sync_ready &&
+                      command.operator_input_ready && command.critical_video_ready && command.control_link_ready &&
                       capabilities.value("queued", 0) == 1 && console_status.value("connected", false);
   std::cout << Json({
                    {"event", "native_control_plane_smoke"},
                    {"runtime", "cpp"},
                    {"passed", passed},
+                   {"input_source", "synthetic_control_plane_smoke"},
+                   {"video_observation_performed", false},
                    {"session_id", session.value("session_id", "")},
                    {"control_transport", control.value("transport", "")},
                    {"control_intent_accepted", control.value("accepted", false)},

@@ -39,18 +39,31 @@ void write_json_atomic(const std::filesystem::path& path, const Json& value) {
   std::filesystem::rename(temporary, path);
 }
 
-void copy_verified_atomic(const std::filesystem::path& source, const std::filesystem::path& destination) {
+std::string copy_verified_atomic(const std::filesystem::path& source, const std::filesystem::path& destination) {
   std::filesystem::create_directories(destination.parent_path());
   const auto temporary = destination.string() + ".tmp";
   std::error_code ignored;
   std::filesystem::remove(temporary, ignored);
   std::filesystem::copy_file(source, temporary, std::filesystem::copy_options::overwrite_existing);
-  if (sha256_file(source) != sha256_file(temporary)) {
+  const auto digest = sha256_file(source);
+  if (digest != sha256_file(temporary)) {
     std::filesystem::remove(temporary, ignored);
     throw std::runtime_error("archive checksum mismatch: " + source.string());
   }
   if (std::filesystem::exists(destination)) std::filesystem::remove(destination);
   std::filesystem::rename(temporary, destination);
+  return digest;
+}
+
+bool uploadable_segment(const Json& metadata) {
+  // Explicit compatibility for pre-isolation segment sidecars. New-schema
+  // summaries/open/incomplete recordings must never default to pending.
+  if (!metadata.contains("schema_version") && !metadata.contains("kind")) return true;
+  return metadata.contains("schema_version") && metadata["schema_version"] == 1 &&
+      metadata.contains("kind") && metadata["kind"] == "recording_segment" &&
+      metadata.contains("recording_status") && metadata["recording_status"] == "complete" &&
+      metadata.contains("finalized") && metadata["finalized"] == true &&
+      metadata.contains("incomplete") && metadata["incomplete"] == false;
 }
 
 std::filesystem::path safe_relative(const std::filesystem::path& root, const std::filesystem::path& path) {
@@ -130,7 +143,7 @@ UploadProcessResult LocalArchiveUploader::process_once() {
   for (const auto& metadata_path : metadata_files) {
     try {
       const auto metadata = read_json_file(metadata_path);
-      if (metadata.value("upload_state", "pending") != "pending") continue;
+      if (!uploadable_segment(metadata) || metadata.value("upload_state", "pending") != "pending") continue;
       return upload_metadata(metadata_path);
     } catch (const std::exception& error) {
       return UploadProcessResult{"failed", metadata_path.stem().string(), "", "", error.what(), 0};
@@ -141,6 +154,7 @@ UploadProcessResult LocalArchiveUploader::process_once() {
 
 UploadProcessResult LocalArchiveUploader::upload_metadata(const std::filesystem::path& metadata_path) {
   auto metadata = read_json_file(metadata_path);
+  if (!uploadable_segment(metadata)) throw std::runtime_error("recording lacks complete fragment evidence");
   const auto segment_id = metadata.value("segment_id", metadata_path.stem().string());
   if (segment_id.empty()) throw std::runtime_error("segment_id is missing from metadata");
   std::filesystem::path video_path;
@@ -157,7 +171,12 @@ UploadProcessResult LocalArchiveUploader::upload_metadata(const std::filesystem:
   const auto metadata_destination = archive_root_ / metadata_relative;
   const auto bytes = std::filesystem::file_size(video_path) + std::filesystem::file_size(metadata_path);
   const auto started = std::chrono::steady_clock::now();
-  copy_verified_atomic(video_path, video_destination);
+  const auto video_digest = copy_verified_atomic(video_path, video_destination);
+  metadata["video_sha256"] = video_digest;
+  if (metadata.contains("schema_version")) {
+    metadata["hash_state"] = "verified";
+    metadata["integrity_scope"] = "fragment_closed_and_archive_digest_verified";
+  }
 
   auto archived_metadata = metadata;
   archived_metadata["upload_state"] = "uploaded";
@@ -188,7 +207,7 @@ Json LocalArchiveUploader::backlog() const {
       if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
       try {
         const auto metadata = read_json_file(entry.path());
-        if (metadata.value("upload_state", "pending") != "pending") continue;
+        if (!uploadable_segment(metadata) || metadata.value("upload_state", "pending") != "pending") continue;
         ++pending_segments;
         auto video = entry.path();
         video.replace_extension(".mp4");

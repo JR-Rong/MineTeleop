@@ -3,3 +3,5 @@ cpp/web/assets/chunks/*.js linguist-generated=true -whitespace
 cpp/web/assets/scene.js linguist-generated=true
 cpp/web/assets/console-layout.js linguist-generated=true
 cpp/web/assets/console-layout.css linguist-generated=true
+# Dependency patch hashes identify the exact bytes on every build host.
+packaging/windows/patches/*.patch text eol=lf

@@ -4,16 +4,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <stop_token>
 #include <vector>
 
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/platform.hpp"
 
 namespace mine_teleop {
+
+inline constexpr std::string_view kNativeControlCapabilities = "v9-revision-recovery-v1";
 
 enum class WebSocketReceiveStatus {
   Message,
@@ -24,9 +28,20 @@ enum class WebSocketReceiveStatus {
 struct WebSocketReceiveResult {
   WebSocketReceiveStatus status{WebSocketReceiveStatus::Timeout};
   Json message{Json::object()};
+  std::int64_t receive_wait_ms{0};
+  std::int64_t frame_assembly_ms{0};
+  std::int64_t json_parse_ms{0};
+  // Byte counts and local steady-clock observations only; never frame content.
+  // Application read completion is not a kernel/network arrival timestamp.
+  Json read_diagnostics = Json::object();
 };
 
 [[nodiscard]] std::string websocket_accept_key(std::string_view client_key);
+[[nodiscard]] Json websocket_transport_diagnostics(SocketHandle socket);
+namespace detail {
+// Owns a duplicate descriptor; never closes or calls curl on the original.
+[[nodiscard]] std::function<void()> websocket_socket_interrupter(SocketHandle socket);
+}
 [[nodiscard]] std::string signaling_websocket_url(
     std::string_view signaling_url,
     std::string_view session_id,
@@ -40,6 +55,7 @@ class ServerWebSocketConnection {
   [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout);
   void send_json(const Json& value) const;
   void send_close(std::uint16_t code = 1000, std::string_view reason = {}) const;
+  [[nodiscard]] Json transport_diagnostics() const;
 
  private:
   void send_frame(std::uint8_t opcode, std::string_view payload) const;
@@ -65,9 +81,16 @@ class WebSocketClient {
   void close();
   [[nodiscard]] bool connected() const;
   [[nodiscard]] const std::string& url() const { return url_; }
+  [[nodiscard]] std::string response_header(std::string_view name) const;
   void send_json(const Json& value);
   void send_json(const Json& value, std::chrono::milliseconds timeout);
+  void send_json(const Json& value, std::chrono::milliseconds timeout, std::stop_token stop);
+  // The caller serializes access, including snapshots after a failed send.
+  [[nodiscard]] Json last_send_diagnostics() const;
+  void enable_read_diagnostics(bool enabled = true);
   [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout);
+  // null means the rate limit skipped this sample; unsupported counters stay absent.
+  [[nodiscard]] Json transport_diagnostics(std::chrono::milliseconds minimum_interval = {});
 
  private:
   struct Impl;
@@ -76,6 +99,7 @@ class WebSocketClient {
   std::unique_ptr<Impl> impl_;
   std::chrono::milliseconds timeout_;
   std::string url_;
+  bool read_diagnostics_enabled_{false};
 };
 
 }  // namespace mine_teleop

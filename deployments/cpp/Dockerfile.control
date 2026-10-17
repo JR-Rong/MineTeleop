@@ -5,16 +5,37 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
     && apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        curl \
         libcurl4-openssl-dev \
         libssl-dev \
-        nodejs \
         pkg-config \
         python3-pip \
+        xz-utils \
     && python3 -m pip install --no-cache-dir cmake==3.28.3 \
     && rm -rf /var/lib/apt/lists/*
 
 ARG MINE_TELEOP_BUILD_JOBS=2
 ARG MINE_TELEOP_BUILD_TESTS=OFF
+
+# Execute the shipped browser methods with the same Node major as the offline
+# regressions. Ubuntu 22.04's Node 12 cannot parse those modern browser methods.
+# This tool exists only in the test build stage; the artifact remains native.
+ENV PATH="/opt/mine-teleop-test-node/bin:${PATH}"
+RUN if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \
+      case "$(dpkg --print-architecture)" in \
+        amd64) node_arch=x64; node_sha=f4cb75bb036f0d0eddf6b79d9596df1aaab9ddccd6a20bf489be5abe9467e84e ;; \
+        arm64) node_arch=arm64; node_sha=eab80cb88f8fda1e65f5e8d0420c9809bdb320b03fd34976ab7161b6e703b910 ;; \
+        *) echo "unsupported test Node architecture" >&2; exit 1 ;; \
+      esac; \
+      curl --fail --location --retry 5 --connect-timeout 15 \
+        "https://nodejs.org/dist/v22.16.0/node-v22.16.0-linux-${node_arch}.tar.xz" \
+        --output /tmp/mine-teleop-test-node.tar.xz \
+      && echo "$node_sha  /tmp/mine-teleop-test-node.tar.xz" | sha256sum --check - \
+      && mkdir -p /opt/mine-teleop-test-node \
+      && tar -xJf /tmp/mine-teleop-test-node.tar.xz --strip-components=1 -C /opt/mine-teleop-test-node \
+      && rm /tmp/mine-teleop-test-node.tar.xz \
+      && test "$(node --version)" = "v22.16.0"; \
+    fi
 
 WORKDIR /src
 COPY . .
@@ -25,7 +46,10 @@ RUN cmake -S . -B /tmp/build \
       -DMINE_TELEOP_BUILD_SIGNALING_SERVER=OFF \
       -DMINE_TELEOP_BUILD_TESTS="$MINE_TELEOP_BUILD_TESTS" \
       -DMINE_TELEOP_FETCH_MISSING_DEPS=ON \
-    && cmake --build /tmp/build --parallel "$MINE_TELEOP_BUILD_JOBS" \
+      -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
+# Public source dependencies are ready; the actual mocks cannot reach a cloud
+# or vehicle through an external container interface.
+RUN --network=none cmake --build /tmp/build --parallel "$MINE_TELEOP_BUILD_JOBS" \
     && if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \
          ctest --test-dir /tmp/build --output-on-failure; \
        fi

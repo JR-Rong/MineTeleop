@@ -32,6 +32,9 @@ add_library(mine_teleop_chassis_bridge SHARED
   "${MINE_TELEOP_REPOSITORY_ROOT}/cpp/src/vcu.cpp"
 )
 target_compile_features(mine_teleop_chassis_bridge PRIVATE cxx_std_17)
+include("${MINE_TELEOP_REPOSITORY_ROOT}/cmake/ChassisDiagnosticsIdentity.cmake")
+mine_teleop_chassis_diagnostics_identity(
+  mine_teleop_chassis_bridge "${MINE_TELEOP_REPOSITORY_ROOT}")
 target_compile_options(
   mine_teleop_chassis_bridge
   PRIVATE

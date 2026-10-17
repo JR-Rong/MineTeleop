@@ -1,4 +1,5 @@
 #include "mine_teleop/media.hpp"
+#include "mine_teleop/detail/media_freshness.hpp"
 
 #include <cstddef>
 #include <cstdio>
@@ -161,12 +162,27 @@ std::string build_camera_input_pipeline(
   }
   pipeline << "! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ";
   if (!uyvy) pipeline << "! jpegdec ";
-  pipeline << "! videoconvert ! videoscale ";
-  if (uyvy && input.fps != output_profile.fps) pipeline << "! videorate ";
+  // Device rate negotiation is advisory on some drivers. Apply a drop-only
+  // raw-frame ceiling even when declared input FPS equals the target: actual
+  // delivery may be faster. This never duplicates an old frame to fill a gap
+  // and never discards an encoded reference access unit.
+  pipeline << "! videorate drop-only=true max-rate=" << output_profile.fps
+           << " ! videoconvert ! videoscale ";
   pipeline << "! video/x-raw,format=NV12,width=" << output_profile.width
            << ",height=" << output_profile.height << ",framerate=" << output_profile.fps << "/1 "
            << "! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ";
   return pipeline.str();
+}
+
+std::string build_encoded_frame_queue(std::string_view name, int max_buffers) {
+  if (name.empty() || max_buffers <= 0) {
+    throw std::invalid_argument("encoded frame queue configuration is invalid");
+  }
+  // H.264/H.265 access units can reference earlier frames. Backpressure must
+  // reach the raw-input queues, where dropping old frames is independent.
+  return "queue name=" + std::string(name) + " max-size-buffers=" +
+      std::to_string(max_buffers) +
+      " max-size-bytes=0 max-size-time=0 leaky=no ";
 }
 
 namespace {
@@ -302,7 +318,10 @@ std::string encode_rgb_jpeg(const std::vector<unsigned char>& rgb, int width, in
 }  // namespace
 
 CameraFrameSource::CameraFrameSource(CameraConfig camera, MediaProfile profile, int frame_timeout_ms)
-    : camera_(std::move(camera)), profile_(std::move(profile)), frame_timeout_ms_(frame_timeout_ms) {
+    : CameraFrameSource(std::move(camera), std::move(profile), frame_timeout_ms, BenchPreopenedV4l2Fd{}) {}
+
+CameraFrameSource::CameraFrameSource(CameraConfig camera, MediaProfile profile, int frame_timeout_ms, BenchPreopenedV4l2Fd bench)
+    : camera_(std::move(camera)), profile_(std::move(profile)), frame_timeout_ms_(frame_timeout_ms), bench_preopened_(std::move(bench)) {
   if (camera_.id.empty() || profile_.width <= 0 || profile_.height <= 0 || profile_.fps <= 0) {
     throw std::invalid_argument("camera media source configuration is invalid");
   }
@@ -315,6 +334,9 @@ CameraFrameSource::CameraFrameSource(CameraConfig camera, MediaProfile profile, 
       profile_.codec != "mjpeg" && profile_.codec != "jpeg") {
     throw std::invalid_argument("native camera acquisition requires an mjpeg realtime profile");
   }
+  if (bench_preopened_.value >= 0 && (source_kind != CameraSourceKind::Ccg2 ||
+      (camera_.device != "/dev/ccg2-channel-6" && camera_.device != "/dev/ccg2-channel-7")))
+    throw std::invalid_argument("bench preopened FD is limited to explicit CCG2 channels 6/7");
   output_width_ = profile_.width;
   output_height_ = profile_.height;
   switch (source_kind) {
@@ -433,7 +455,8 @@ std::string CameraFrameSource::read_vendor_jpeg() {
 
 void CameraFrameSource::start_v4l2() {
   if (device_fd_ >= 0) return;
-  device_fd_ = ::open(camera_.device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+  device_fd_ = bench_preopened_.value >= 0 ? ::fcntl(bench_preopened_.value, F_DUPFD_CLOEXEC, 5) :
+      ::open(camera_.device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (device_fd_ < 0) {
     throw std::runtime_error("cannot open V4L2 camera " + camera_.device + ": " + std::strerror(errno));
   }
@@ -442,6 +465,13 @@ void CameraFrameSource::start_v4l2() {
     if (ioctl_retry(device_fd_, VIDIOC_QUERYCAP, &capability) < 0) {
       throw std::runtime_error("VIDIOC_QUERYCAP failed for " + camera_.device + ": " + std::strerror(errno));
     }
+    const auto capability_text = [](const auto& text) {
+      return std::string(reinterpret_cast<const char*>(text),
+                         strnlen(reinterpret_cast<const char*>(text), sizeof(text)));
+    };
+    v4l2_driver_ = capability_text(capability.driver);
+    v4l2_card_ = capability_text(capability.card);
+    v4l2_bus_info_ = capability_text(capability.bus_info);
     const auto capabilities = (capability.capabilities & V4L2_CAP_DEVICE_CAPS) != 0
                                   ? capability.device_caps
                                   : capability.capabilities;
@@ -456,7 +486,12 @@ void CameraFrameSource::start_v4l2() {
     format.fmt.pix.height = static_cast<__u32>(profile_.height);
     format.fmt.pix.pixelformat = ccg2 ? V4L2_PIX_FMT_YUYV : V4L2_PIX_FMT_MJPEG;
     format.fmt.pix.field = V4L2_FIELD_ANY;
-    if (ioctl_retry(device_fd_, VIDIOC_S_FMT, &format) < 0) {
+    const auto format_result = ioctl_retry(device_fd_, VIDIOC_S_FMT, &format);
+    const auto format_errno = format_result < 0 ? errno : 0;
+    if (bench_preopened_.observe_ioctl) bench_preopened_.observe_ioctl("VIDIOC_S_FMT", format_result, format_errno,
+        {{"width", format.fmt.pix.width}, {"height", format.fmt.pix.height}, {"pixelformat", format.fmt.pix.pixelformat}, {"field", format.fmt.pix.field}, {"bytesperline", format.fmt.pix.bytesperline}, {"sizeimage", format.fmt.pix.sizeimage}, {"colorspace", format.fmt.pix.colorspace}, {"priv", format.fmt.pix.priv}, {"flags", format.fmt.pix.flags}, {"ycbcr_enc", format.fmt.pix.ycbcr_enc}, {"quantization", format.fmt.pix.quantization}, {"xfer_func", format.fmt.pix.xfer_func}});
+    errno = format_errno;
+    if (format_result < 0) {
       if (ccg2) {
         throw std::runtime_error(
             "VIDIOC_S_FMT CCG2 YUYV failed for " + camera_.device + ": " + std::strerror(errno));
@@ -512,8 +547,31 @@ void CameraFrameSource::start_v4l2() {
     parameters.parm.capture.timeperframe.numerator = 1;
     parameters.parm.capture.timeperframe.denominator = static_cast<__u32>(profile_.fps);
     const auto set_parameters_result = ioctl_retry(device_fd_, VIDIOC_S_PARM, &parameters);
-    if (set_parameters_result < 0 && (ccg2 || errno != EINVAL)) {
+    const auto parameters_errno = set_parameters_result < 0 ? errno : 0;
+    if (bench_preopened_.observe_ioctl) bench_preopened_.observe_ioctl("VIDIOC_S_PARM", set_parameters_result, parameters_errno,
+        {{"capturemode", parameters.parm.capture.capturemode}, {"capability", parameters.parm.capture.capability}, {"numerator", parameters.parm.capture.timeperframe.numerator}, {"denominator", parameters.parm.capture.timeperframe.denominator}, {"readbuffers", parameters.parm.capture.readbuffers}, {"extendedmode", parameters.parm.capture.extendedmode}});
+    errno = parameters_errno;
+    v4l2_timeperframe_set_accepted_ = set_parameters_result == 0;
+    v4l2_set_timeperframe_numerator_ = set_parameters_result == 0 ? parameters.parm.capture.timeperframe.numerator : 0;
+    v4l2_set_timeperframe_denominator_ = set_parameters_result == 0 ? parameters.parm.capture.timeperframe.denominator : 0;
+    v4l2_timeperframe_supported_ = set_parameters_result == 0 &&
+        (parameters.parm.capture.capability & V4L2_CAP_TIMEPERFRAME) != 0;
+    if (set_parameters_result < 0 && errno != EINVAL && errno != ENOTTY) {
       throw std::runtime_error("VIDIOC_S_PARM failed for " + camera_.device + ": " + std::strerror(errno));
+    }
+    // S_PARM's returned value is not evidence of actual acquisition cadence.
+    // Read the driver's current nominal setting separately when supported.
+    v4l2_streamparm readback{};
+    readback.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    const auto readback_result = ioctl_retry(device_fd_, VIDIOC_G_PARM, &readback);
+    const auto readback_errno = readback_result < 0 ? errno : 0;
+    if (bench_preopened_.observe_ioctl) bench_preopened_.observe_ioctl("VIDIOC_G_PARM", readback_result, readback_errno,
+        {{"capturemode", readback.parm.capture.capturemode}, {"capability", readback.parm.capture.capability}, {"numerator", readback.parm.capture.timeperframe.numerator}, {"denominator", readback.parm.capture.timeperframe.denominator}, {"readbuffers", readback.parm.capture.readbuffers}, {"extendedmode", readback.parm.capture.extendedmode}});
+    v4l2_timeperframe_readback_ = readback_result == 0;
+    if (v4l2_timeperframe_readback_) parameters = readback;
+    if (set_parameters_result == 0 || v4l2_timeperframe_readback_) {
+      v4l2_timeperframe_numerator_ = parameters.parm.capture.timeperframe.numerator;
+      v4l2_timeperframe_denominator_ = parameters.parm.capture.timeperframe.denominator;
     }
     if (ccg2) {
       const auto numerator = parameters.parm.capture.timeperframe.numerator;
@@ -524,16 +582,11 @@ void CameraFrameSource::start_v4l2() {
             ": numerator=" + std::to_string(numerator) +
             ", denominator=" + std::to_string(denominator));
       }
-      if (static_cast<std::uint64_t>(denominator) !=
-          static_cast<std::uint64_t>(profile_.fps) * static_cast<std::uint64_t>(numerator)) {
-        throw std::runtime_error(
-            "CCG2 driver returned unexpected timeperframe for " + camera_.device +
-            ": requested_fps=" + std::to_string(profile_.fps) +
-            ", numerator=" + std::to_string(numerator) +
-            ", denominator=" + std::to_string(denominator));
-      }
-      v4l2_timeperframe_numerator_ = numerator;
-      v4l2_timeperframe_denominator_ = denominator;
+      // Unsupported nominal cadence does not invalidate a correctly negotiated
+      // pixel layout. Keep video available with the raw drop-only ceiling and
+      // report the driver's setting; actual delivery must still be measured.
+      // Do not copy the requested S_PARM fields into a "negotiated" diagnostic
+      // when both setting and readback are unsupported.
     }
 
     v4l2_requestbuffers request{};
@@ -587,9 +640,16 @@ void CameraFrameSource::stop_v4l2() {
   last_v4l2_bytes_used_ = 0;
   v4l2_timeperframe_numerator_ = 0;
   v4l2_timeperframe_denominator_ = 0;
+  v4l2_timeperframe_supported_ = false;
+  v4l2_timeperframe_readback_ = false;
+  v4l2_timeperframe_set_accepted_ = false;
+  v4l2_set_timeperframe_numerator_ = 0;
+  v4l2_set_timeperframe_denominator_ = 0;
+  last_capture_used_device_timestamp_ = false;
   last_delivered_v4l2_sequence_.reset();
   last_dequeued_v4l2_sequence_.reset();
   last_dequeued_v4l2_sequence_gap_ = 0;
+  last_v4l2_buffer_valid_ = false;
   if (device_fd_ >= 0) {
     ::close(device_fd_);
     device_fd_ = -1;
@@ -609,6 +669,7 @@ std::string CameraFrameSource::read_v4l2_uyvy() {
     do {
       polled = ::poll(&descriptor, 1, static_cast<int>(remaining));
     } while (polled < 0 && errno == EINTR);
+    last_v4l2_poll_revents_ = descriptor.revents;
     if (polled == 0) throw std::runtime_error("timed out waiting for V4L2 frame: " + camera_.id);
     if (polled < 0) throw std::runtime_error("V4L2 poll failed for " + camera_.id + ": " + std::strerror(errno));
 
@@ -616,7 +677,7 @@ std::string CameraFrameSource::read_v4l2_uyvy() {
     buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buffer.memory = V4L2_MEMORY_MMAP;
     if (ioctl_retry(device_fd_, VIDIOC_DQBUF, &buffer) < 0) {
-      if (errno == EAGAIN) continue;
+      if (errno == EAGAIN) { ++v4l2_dequeue_eagain_count_; continue; }
       throw std::runtime_error("VIDIOC_DQBUF failed for " + camera_.device + ": " + std::strerror(errno));
     }
     if (buffer.index >= mapped_buffers_.size()) {
@@ -626,6 +687,12 @@ std::string CameraFrameSource::read_v4l2_uyvy() {
     // the DQBUF value before returning the buffer so gap diagnostics describe
     // the frame that was actually delivered.
     const auto dequeued_sequence = buffer.sequence;
+    last_v4l2_buffer_valid_ = true;
+    last_v4l2_buffer_flags_ = buffer.flags;
+    last_v4l2_buffer_index_ = buffer.index;
+    last_v4l2_timestamp_us_ = detail::checked_device_timestamp_us(
+        buffer.timestamp.tv_sec, buffer.timestamp.tv_usec).value_or(0);
+    last_v4l2_bytes_used_ = buffer.bytesused;
     last_dequeued_v4l2_sequence_ = dequeued_sequence;
     last_dequeued_v4l2_sequence_gap_ =
         v4l2_sequence_gap(last_delivered_v4l2_sequence_, dequeued_sequence);
@@ -641,8 +708,6 @@ std::string CameraFrameSource::read_v4l2_uyvy() {
     if (buffer.bytesused > mapped_buffers_[buffer.index].length) {
       throw std::runtime_error("V4L2 returned an invalid capture buffer for " + camera_.device);
     }
-    last_v4l2_bytes_used_ = static_cast<std::size_t>(buffer.bytesused);
-
     std::string frame;
     std::exception_ptr packing_error;
     try {
@@ -685,18 +750,28 @@ std::string CameraFrameSource::read_v4l2_jpeg() {
     buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buffer.memory = V4L2_MEMORY_MMAP;
     if (ioctl_retry(device_fd_, VIDIOC_DQBUF, &buffer) < 0) {
-      if (errno == EAGAIN) continue;
+      if (errno == EAGAIN) { ++v4l2_dequeue_eagain_count_; continue; }
       throw std::runtime_error("VIDIOC_DQBUF failed for " + camera_.device + ": " + std::strerror(errno));
     }
     if (buffer.index >= mapped_buffers_.size() || buffer.bytesused > mapped_buffers_[buffer.index].length) {
       throw std::runtime_error("V4L2 returned an invalid capture buffer for " + camera_.device);
     }
+    const auto dequeued_sequence = buffer.sequence;
+    last_v4l2_buffer_valid_ = true;
+    last_v4l2_buffer_flags_ = buffer.flags;
+    last_v4l2_buffer_index_ = buffer.index;
+    last_v4l2_timestamp_us_ = detail::checked_device_timestamp_us(
+        buffer.timestamp.tv_sec, buffer.timestamp.tv_usec).value_or(0);
+    last_v4l2_bytes_used_ = buffer.bytesused;
+    last_dequeued_v4l2_sequence_ = dequeued_sequence;
+    last_dequeued_v4l2_sequence_gap_ = v4l2_sequence_gap(last_delivered_v4l2_sequence_, dequeued_sequence);
     std::string frame(
         static_cast<const char*>(mapped_buffers_[buffer.index].address),
         static_cast<std::size_t>(buffer.bytesused));
     if (ioctl_retry(device_fd_, VIDIOC_QBUF, &buffer) < 0) {
       throw std::runtime_error("VIDIOC_QBUF failed for " + camera_.device + ": " + std::strerror(errno));
     }
+    last_delivered_v4l2_sequence_ = dequeued_sequence;
     return frame;
   }
 }
@@ -719,25 +794,43 @@ std::string CameraFrameSource::generate_test_jpeg(std::uint64_t sequence) const 
 }
 
 EncodedFrame CameraFrameSource::next(std::uint64_t sequence) {
+  const auto read_started = std::chrono::steady_clock::now();
   const auto captured = now_ms();
+  auto captured_steady_at = read_started;
+  last_capture_used_device_timestamp_ = false;
   std::string payload;
   std::string codec{"mjpeg"};
-  switch (mode_) {
-    case Mode::TestSource:
-      payload = generate_test_jpeg(sequence);
-      break;
-    case Mode::V4l2:
-      payload = read_v4l2_jpeg();
-      break;
-    case Mode::Ccg2:
-      payload = read_v4l2_uyvy();
-      codec = "uyvy";
-      break;
-    case Mode::VendorBridge:
-      payload = read_vendor_jpeg();
-      break;
+  try {
+    switch (mode_) {
+      case Mode::TestSource:
+        payload = generate_test_jpeg(sequence);
+        break;
+      case Mode::V4l2:
+        payload = read_v4l2_jpeg();
+        break;
+      case Mode::Ccg2:
+        payload = read_v4l2_uyvy();
+        codec = "uyvy";
+        break;
+      case Mode::VendorBridge:
+        payload = read_vendor_jpeg();
+        break;
+    }
+    if (codec == "mjpeg") require_jpeg(payload, camera_.id);
+  } catch (...) {
+    last_read_duration_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - read_started).count();
+    throw;
   }
-  if (codec == "mjpeg") require_jpeg(payload, camera_.id);
+  const auto read_finished = std::chrono::steady_clock::now();
+  last_read_duration_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+      read_finished - read_started).count();
+  const auto device_monotonic_us = (mode_ == Mode::V4l2 || mode_ == Mode::Ccg2) &&
+      (last_v4l2_buffer_flags_ & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC
+          ? std::optional<std::int64_t>(last_v4l2_timestamp_us_) : std::nullopt;
+  const auto capture_time = detail::select_capture_steady_time(read_started, read_finished, device_monotonic_us);
+  captured_steady_at = capture_time.value;
+  last_capture_used_device_timestamp_ = capture_time.used_device_timestamp;
   return {
       camera_.id,
       sequence,
@@ -757,7 +850,39 @@ EncodedFrame CameraFrameSource::next(std::uint64_t sequence) {
       last_dequeued_v4l2_sequence_gap_,
       v4l2_timeperframe_numerator_,
       v4l2_timeperframe_denominator_,
+      captured_steady_at,
   };
+}
+
+Json CameraFrameSource::capture_diagnostics() const {
+  return {{"read_duration_ms", last_read_duration_ms_},
+          {"requested_capture_fps", profile_.fps},
+          {"driver_timeperframe_supported", v4l2_timeperframe_supported_},
+          {"driver_timeperframe_readback", v4l2_timeperframe_readback_},
+          {"driver_rate_request_accepted", v4l2_timeperframe_set_accepted_},
+          {"driver_set_timeperframe_numerator", v4l2_set_timeperframe_numerator_},
+          {"driver_set_timeperframe_denominator", v4l2_set_timeperframe_denominator_},
+          {"driver_nominal_fps_matches_request", v4l2_timeperframe_numerator_ > 0
+              ? Json(static_cast<std::uint64_t>(v4l2_timeperframe_denominator_) ==
+                  static_cast<std::uint64_t>(profile_.fps) * v4l2_timeperframe_numerator_)
+              : Json(nullptr)},
+          {"capture_timestamp_scope", last_capture_used_device_timestamp_
+              ? "driver_monotonic" : "host_acquisition_start_not_sensor_verification"},
+          {"driver_timeperframe_numerator", v4l2_timeperframe_numerator_},
+          {"driver_timeperframe_denominator", v4l2_timeperframe_denominator_},
+          {"driver_negotiated_fps", v4l2_timeperframe_numerator_ > 0
+              ? Json(static_cast<double>(v4l2_timeperframe_denominator_) / v4l2_timeperframe_numerator_) : Json(nullptr)},
+          {"frame_rate_scope", "driver_delivery_not_sensor_verification"},
+          {"buffer_metadata_scope", "last_dequeued_buffer"},
+          {"driver", v4l2_driver_}, {"card", v4l2_card_}, {"bus_info", v4l2_bus_info_},
+          {"buffer_valid", last_v4l2_buffer_valid_},
+          {"buffer_flags", last_v4l2_buffer_flags_},
+          {"buffer_index", last_v4l2_buffer_index_},
+          {"device_timestamp_us", last_v4l2_timestamp_us_},
+          {"poll_revents", last_v4l2_poll_revents_},
+          {"dequeue_eagain_count", v4l2_dequeue_eagain_count_},
+          {"bytes_used", last_v4l2_bytes_used_},
+          {"bytes_per_line", v4l2_bytes_per_line_}, {"size_image", v4l2_size_image_}};
 }
 
 }  // namespace mine_teleop

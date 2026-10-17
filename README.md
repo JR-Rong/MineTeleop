@@ -132,6 +132,18 @@ IDs, allowlists, and secret file/environment references; it rejects duplicate
 IDs, empty allowlists, unknown vehicles, missing secrets, and ambiguous secret
 sources. Legacy `--driver-id`/`--vehicle-id` mode remains available for one
 development pair but cannot be mixed with multi-identity mode.
+An explicitly approved, dedicated mock account can set `mock_test_login_ttl_ms`
+under its `auth.drivers` entry (for example `14400000` for 240 minutes).
+This is disabled when omitted. Startup rejects the override unless that existing
+account's vehicle allowlist is exactly `[test_bench_001]`; the duration must be
+positive and at most four hours. Keep the isolated bench in mock/noCAN mode.
+HTTP login parameters cannot change the configured lifetime. Other accounts keep
+the existing `--driver-token-ttl-ms` value (the source default remains 30 minutes;
+an existing one-hour deployment must retain `3600000`). Heartbeats and control
+lease renewal do not extend login expiry or restore an expired control session.
+Enabling this requires a separately approved account/secret-file change and a
+coordinated signaling-service restart; this option creates no credentials and
+does not alter any existing identity or vehicle permission.
 On macOS, exercise a built signaling server and control client as two real
 control processes against one multi-identity server with:
 

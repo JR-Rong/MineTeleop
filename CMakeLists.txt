@@ -26,6 +26,7 @@ option(
 option(MINE_TELEOP_BUILD_CONTROL_CLIENT "Build the portable control client" ON)
 option(MINE_TELEOP_BUILD_SIGNALING_SERVER "Build the standalone signaling server" ON)
 option(MINE_TELEOP_BUILD_VEHICLE_RUNTIME "Build Linux vehicle media and packaging targets" ${MINE_TELEOP_VEHICLE_DEFAULT})
+option(MINE_TELEOP_BUILD_BENCH_PROBES "Build explicit camera bench tools (never automatic tests)" OFF)
 option(MINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES "Build camera bridges when bundled vendor SDKs are present" ON)
 option(MINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE "Build the lightweight Aravis USB3 Vision camera bridge" ON)
 option(MINE_TELEOP_FETCH_MISSING_DEPS "Fetch pinned yaml-cpp and nlohmann-json sources when absent" OFF)
@@ -97,6 +98,10 @@ set(MINE_TELEOP_SESSION_LOG_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/sessi
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_SESSION_LOG_JS_SOURCE}")
 file(READ "${MINE_TELEOP_SESSION_LOG_JS_SOURCE}" MINE_TELEOP_SESSION_LOG_JS)
 string(APPEND MINE_TELEOP_CONTROL_LOGIC_JS "\n${MINE_TELEOP_SESSION_LOG_JS}")
+set(MINE_TELEOP_CONTROL_TRANSPORT_JS_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/cpp/web/control_transport.js")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MINE_TELEOP_CONTROL_TRANSPORT_JS_SOURCE}")
+file(READ "${MINE_TELEOP_CONTROL_TRANSPORT_JS_SOURCE}" MINE_TELEOP_CONTROL_TRANSPORT_JS)
+string(APPEND MINE_TELEOP_CONTROL_LOGIC_JS "\n${MINE_TELEOP_CONTROL_TRANSPORT_JS}")
 string(REPLACE "\r\n" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
 string(REPLACE "\r" "\n" MINE_TELEOP_CONTROL_LOGIC_JS "${MINE_TELEOP_CONTROL_LOGIC_JS}")
 mine_teleop_make_adjacent_raw_literals(
@@ -107,6 +112,9 @@ mine_teleop_make_adjacent_raw_literals(
   MINE_TELEOP_CONTROL_LOGIC_JS_MAX_CHUNK_BYTES
 )
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop")
+file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/server.cpp" MINE_TELEOP_CONSOLE_CPP_SHA256)
+string(SHA256 MINE_TELEOP_CONSOLE_SOURCE_SHA256
+  "${MINE_TELEOP_CONSOLE_CPP_SHA256}|${MINE_TELEOP_CONTROL_LOGIC_JS}")
 configure_file(
   cmake/control_logic_js.hpp.in
   "${CMAKE_CURRENT_BINARY_DIR}/generated/mine_teleop/control_logic_js.hpp"
@@ -145,6 +153,7 @@ mine_teleop_enable_warnings(mine_teleop_vcu)
 # packages. It intentionally has no camera, JPEG, or GStreamer dependency.
 add_library(mine_teleop_runtime
   cpp/src/core.cpp
+  cpp/src/control_recovery.cpp
   cpp/src/http.cpp
   cpp/src/platform.cpp
   "${MINE_TELEOP_GENERATED_SERVER_SOURCE}"
@@ -217,6 +226,13 @@ if(MINE_TELEOP_BUILD_CONTROL_CLIENT)
   install(TARGETS mine-teleop-control RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
+if(UNIX)
+  add_library(mine_teleop_recording_transport cpp/src/recording.cpp)
+  target_include_directories(mine_teleop_recording_transport PUBLIC cpp/include)
+  target_link_libraries(mine_teleop_recording_transport PUBLIC nlohmann_json::nlohmann_json Threads::Threads)
+  mine_teleop_enable_warnings(mine_teleop_recording_transport)
+endif()
+
 if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
   if(WIN32)
     message(FATAL_ERROR "The vehicle media runtime is Linux-only; configure with -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=OFF")
@@ -228,10 +244,13 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
     gstreamer-app-1.0>=1.20
     gstreamer-sdp-1.0>=1.20
     gstreamer-webrtc-1.0>=1.20
+    gstreamer-video-1.0>=1.20
   )
 
   add_library(mine_teleop_vehicle_runtime
     cpp/src/media.cpp
+    cpp/src/recording_gstreamer.cpp
+    cpp/src/recording_worker.cpp
     cpp/src/upload.cpp
     cpp/src/video.cpp
     cpp/src/webrtc_media.cpp
@@ -244,10 +263,22 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
   target_link_libraries(mine_teleop_vehicle_runtime
     PUBLIC
       mine_teleop_runtime
+      mine_teleop_recording_transport
       JPEG::JPEG
       PkgConfig::GSTREAMER
   )
   mine_teleop_enable_warnings(mine_teleop_vehicle_runtime)
+
+  if(MINE_TELEOP_BUILD_BENCH_PROBES)
+    add_executable(mine-teleop-bench-capture-probe cpp/tests/bench_capture_probe.cpp)
+    target_link_libraries(mine-teleop-bench-capture-probe PRIVATE mine_teleop_vehicle_runtime)
+    mine_teleop_enable_warnings(mine-teleop-bench-capture-probe)
+  endif()
+
+  add_executable(mine-teleop-recorder cpp/apps/mine_teleop_recorder.cpp)
+  target_link_libraries(mine-teleop-recorder PRIVATE mine_teleop_vehicle_runtime)
+  mine_teleop_enable_warnings(mine-teleop-recorder)
+  set_target_properties(mine-teleop-recorder PROPERTIES BUILD_RPATH "$ORIGIN/../lib" INSTALL_RPATH "$ORIGIN/../lib")
 
   add_executable(mine-teleop cpp/apps/mine_teleop.cpp)
   target_link_libraries(mine-teleop PRIVATE mine_teleop_vehicle_runtime)
@@ -306,7 +337,7 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
     endif()
   endif()
 
-  install(TARGETS mine-teleop mine-teleop-run mine_teleop_vehicle_runtime
+  install(TARGETS mine-teleop mine-teleop-recorder mine-teleop-run mine_teleop_vehicle_runtime mine_teleop_recording_transport
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -341,6 +372,126 @@ endif()
 
 if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
   enable_testing()
+  add_executable(mine-teleop-websocket-send-tests cpp/tests/websocket_send_tests.cpp)
+  target_link_libraries(mine-teleop-websocket-send-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-websocket-send-tests)
+  add_test(NAME mine-teleop-websocket-send-tests COMMAND mine-teleop-websocket-send-tests)
+  set_tests_properties(mine-teleop-websocket-send-tests PROPERTIES TIMEOUT 10)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME mine-teleop-websocket-send-tls-tests
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/websocket_send_tls.test.py" $<TARGET_FILE:mine-teleop-websocket-send-tests>)
+    set_tests_properties(mine-teleop-websocket-send-tls-tests PROPERTIES TIMEOUT 30)
+    set(MINE_TELEOP_RECOVERY_ENFORCER "${CMAKE_CURRENT_BINARY_DIR}/recovery_enforcer.inc")
+    add_custom_command(OUTPUT "${MINE_TELEOP_RECOVERY_ENFORCER}"
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/extract_recovery_enforcer.py"
+        --source "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/webrtc_media.cpp" --output "${MINE_TELEOP_RECOVERY_ENFORCER}"
+      DEPENDS cpp/tests/extract_recovery_enforcer.py cpp/src/webrtc_media.cpp VERBATIM)
+    add_executable(mine-teleop-recovery-enforcer-tests cpp/tests/recovery_enforcer_tests.cpp "${MINE_TELEOP_RECOVERY_ENFORCER}")
+    target_include_directories(mine-teleop-recovery-enforcer-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(mine-teleop-recovery-enforcer-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+    mine_teleop_enable_warnings(mine-teleop-recovery-enforcer-tests)
+    add_test(NAME mine-teleop-recovery-enforcer-tests COMMAND mine-teleop-recovery-enforcer-tests)
+    set_tests_properties(mine-teleop-recovery-enforcer-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 10)
+    set(MINE_TELEOP_AUTHORITY_WORKER "${CMAKE_CURRENT_BINARY_DIR}/authority_worker_methods.inc")
+    set(MINE_TELEOP_AUTHORITY_CACHE "${CMAKE_CURRENT_BINARY_DIR}/authority_lease_cache.inc")
+    add_custom_command(OUTPUT "${MINE_TELEOP_AUTHORITY_WORKER}" "${MINE_TELEOP_AUTHORITY_CACHE}"
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/extract_authority_worker_methods.py"
+        --source "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/webrtc_media.cpp" --output "${MINE_TELEOP_AUTHORITY_WORKER}" --lease-cache-output "${MINE_TELEOP_AUTHORITY_CACHE}"
+      DEPENDS cpp/tests/extract_authority_worker_methods.py cpp/src/webrtc_media.cpp VERBATIM)
+    add_executable(mine-teleop-authority-worker-tests cpp/tests/authority_worker_tests.cpp "${MINE_TELEOP_AUTHORITY_WORKER}" "${MINE_TELEOP_AUTHORITY_CACHE}")
+    target_include_directories(mine-teleop-authority-worker-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(mine-teleop-authority-worker-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+    mine_teleop_enable_warnings(mine-teleop-authority-worker-tests)
+    add_test(NAME mine-teleop-authority-worker-tests COMMAND mine-teleop-authority-worker-tests)
+    set_tests_properties(mine-teleop-authority-worker-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 10)
+    add_test(NAME mine-teleop-authority-cutoff-tests COMMAND mine-teleop-authority-worker-tests --review-r3-only)
+    set_tests_properties(mine-teleop-authority-cutoff-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 10)
+    set(MINE_TELEOP_AUTHORITY_ENTRY "${CMAKE_CURRENT_BINARY_DIR}/vehicle_authority_entry.inc")
+    add_custom_command(OUTPUT "${MINE_TELEOP_AUTHORITY_ENTRY}"
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/extract_vehicle_authority_entry.py"
+        --source "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/webrtc_media.cpp" --output "${MINE_TELEOP_AUTHORITY_ENTRY}"
+      DEPENDS cpp/tests/extract_vehicle_authority_entry.py cpp/src/webrtc_media.cpp VERBATIM)
+    add_executable(mine-teleop-vehicle-authority-entry-tests cpp/tests/vehicle_authority_entry_tests.cpp "${MINE_TELEOP_AUTHORITY_ENTRY}")
+    target_include_directories(mine-teleop-vehicle-authority-entry-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(mine-teleop-vehicle-authority-entry-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+    mine_teleop_enable_warnings(mine-teleop-vehicle-authority-entry-tests)
+    add_test(NAME mine-teleop-vehicle-authority-entry-tests COMMAND mine-teleop-vehicle-authority-entry-tests)
+    set_tests_properties(mine-teleop-vehicle-authority-entry-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
+    set(MINE_TELEOP_FEEDBACK_METHOD "${CMAKE_CURRENT_BINARY_DIR}/feedback_vehicle_method.inc")
+    set(MINE_TELEOP_STARTUP_METHOD "${CMAKE_CURRENT_BINARY_DIR}/control_startup_method.inc")
+    set(MINE_TELEOP_EARLY_RESULT "${CMAKE_CURRENT_BINARY_DIR}/control_early_result.inc")
+    add_custom_command(OUTPUT "${MINE_TELEOP_FEEDBACK_METHOD}" "${MINE_TELEOP_STARTUP_METHOD}" "${MINE_TELEOP_EARLY_RESULT}"
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/extract_feedback_vehicle_method.py"
+        --source "${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/webrtc_media.cpp" --output "${MINE_TELEOP_FEEDBACK_METHOD}" --startup-output "${MINE_TELEOP_STARTUP_METHOD}"
+        --result-output "${MINE_TELEOP_EARLY_RESULT}"
+      DEPENDS cpp/tests/extract_feedback_vehicle_method.py cpp/src/webrtc_media.cpp VERBATIM)
+    add_executable(mine-teleop-feedback-vehicle-method-tests cpp/tests/feedback_vehicle_method_tests.cpp "${MINE_TELEOP_FEEDBACK_METHOD}" "${MINE_TELEOP_STARTUP_METHOD}" "${MINE_TELEOP_EARLY_RESULT}")
+    target_include_directories(mine-teleop-feedback-vehicle-method-tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(mine-teleop-feedback-vehicle-method-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+    mine_teleop_enable_warnings(mine-teleop-feedback-vehicle-method-tests)
+    add_test(NAME mine-teleop-feedback-vehicle-method-tests COMMAND mine-teleop-feedback-vehicle-method-tests)
+    set_tests_properties(mine-teleop-feedback-vehicle-method-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
+  endif()
+  add_executable(mine-teleop-feedback-transport-tests cpp/tests/feedback_transport_tests.cpp)
+  target_link_libraries(mine-teleop-feedback-transport-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+  mine_teleop_enable_warnings(mine-teleop-feedback-transport-tests)
+  add_test(NAME mine-teleop-feedback-transport-tests COMMAND mine-teleop-feedback-transport-tests)
+  add_test(NAME mine-teleop-feedback-candidate-tests COMMAND mine-teleop-feedback-transport-tests --review-r6-only)
+  add_test(NAME mine-teleop-feedback-zero-tests COMMAND mine-teleop-feedback-transport-tests --review-r7-only)
+  set_tests_properties(mine-teleop-feedback-zero-tests PROPERTIES TIMEOUT 30)
+  set_tests_properties(mine-teleop-feedback-candidate-tests PROPERTIES TIMEOUT 30)
+  set_tests_properties(mine-teleop-feedback-transport-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
+  add_executable(mine-teleop-emergency-stop-tests cpp/tests/emergency_stop_tests.cpp)
+  target_link_libraries(mine-teleop-emergency-stop-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+  mine_teleop_enable_warnings(mine-teleop-emergency-stop-tests)
+  add_test(NAME mine-teleop-emergency-stop-tests COMMAND mine-teleop-emergency-stop-tests)
+  set_tests_properties(mine-teleop-emergency-stop-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
+  add_executable(mine-teleop-direct-authority-tests cpp/tests/direct_authority_tests.cpp)
+  target_link_libraries(mine-teleop-direct-authority-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+  mine_teleop_enable_warnings(mine-teleop-direct-authority-tests)
+  add_test(NAME mine-teleop-direct-authority-tests COMMAND mine-teleop-direct-authority-tests)
+  set_tests_properties(mine-teleop-direct-authority-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
+  add_executable(mine-teleop-control-transport-integration-tests cpp/tests/control_transport_integration_tests.cpp)
+  target_link_libraries(mine-teleop-control-transport-integration-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+  mine_teleop_enable_warnings(mine-teleop-control-transport-integration-tests)
+  add_test(NAME mine-teleop-control-transport-integration-tests COMMAND mine-teleop-control-transport-integration-tests)
+  add_test(NAME mine-teleop-product-direct-integration-tests COMMAND mine-teleop-control-transport-integration-tests --product-only)
+  set_tests_properties(mine-teleop-product-direct-integration-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
+  add_test(NAME mine-teleop-stale-stop-integration-tests COMMAND mine-teleop-control-transport-integration-tests --review-r4-only)
+  add_test(NAME mine-teleop-feedback-zero-integration-tests COMMAND mine-teleop-control-transport-integration-tests --review-r7-only)
+  set_tests_properties(mine-teleop-feedback-zero-integration-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
+  set_tests_properties(mine-teleop-stale-stop-integration-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
+  set_tests_properties(mine-teleop-control-transport-integration-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" TIMEOUT 30)
+  add_executable(mine-teleop-control-transport-tests cpp/tests/control_transport_tests.cpp)
+  target_link_libraries(mine-teleop-control-transport-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+  mine_teleop_enable_warnings(mine-teleop-control-transport-tests)
+  add_test(NAME mine-teleop-control-transport-tests COMMAND mine-teleop-control-transport-tests)
+  set_tests_properties(mine-teleop-control-transport-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+  add_executable(mine-teleop-latency-path-tests cpp/tests/latency_path_tests.cpp)
+  target_include_directories(mine-teleop-latency-path-tests PRIVATE cpp/include)
+  mine_teleop_enable_warnings(mine-teleop-latency-path-tests)
+  add_test(NAME mine-teleop-latency-path-tests COMMAND mine-teleop-latency-path-tests)
+  if(UNIX)
+    add_executable(mine-teleop-bench-containment-tests cpp/tests/bench_capture_containment_tests.cpp)
+    target_include_directories(mine-teleop-bench-containment-tests PRIVATE cpp/include)
+    target_link_libraries(mine-teleop-bench-containment-tests PRIVATE nlohmann_json::nlohmann_json)
+    mine_teleop_enable_warnings(mine-teleop-bench-containment-tests)
+    add_test(NAME mine-teleop-bench-containment-tests COMMAND mine-teleop-bench-containment-tests)
+    add_executable(mine-teleop-recording-transport-tests cpp/tests/recording_transport_tests.cpp)
+    target_link_libraries(mine-teleop-recording-transport-tests PRIVATE mine_teleop_recording_transport)
+    mine_teleop_enable_warnings(mine-teleop-recording-transport-tests)
+    add_test(NAME mine-teleop-recording-transport-tests COMMAND mine-teleop-recording-transport-tests)
+    set_tests_properties(mine-teleop-recording-transport-tests PROPERTIES TIMEOUT 45)
+  endif()
+  foreach(suite IN ITEMS clock-fault native-control-ack control-recovery)
+    string(REPLACE "-" "_" source_name "${suite}")
+    add_executable(mine-teleop-${suite}-tests cpp/tests/${source_name}_tests.cpp)
+    target_link_libraries(mine-teleop-${suite}-tests PRIVATE mine_teleop_runtime mine_teleop_vcu)
+    mine_teleop_enable_warnings(mine-teleop-${suite}-tests)
+    add_test(NAME mine-teleop-${suite}-tests COMMAND mine-teleop-${suite}-tests)
+    set_tests_properties(mine-teleop-${suite}-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+  endforeach()
   add_executable(mine-teleop-session-logs-tests cpp/tests/session_logs_tests.cpp)
   target_link_libraries(mine-teleop-session-logs-tests PRIVATE mine_teleop_runtime)
   mine_teleop_enable_warnings(mine-teleop-session-logs-tests)
@@ -366,6 +517,17 @@ if(MINE_TELEOP_BUILD_TESTS)
       NAME mine-teleop-control-logic-js-tests
       COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/control_logic.test.cjs
     )
+    add_test(NAME mine-teleop-control-transport-js-tests
+      COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/control_transport.test.cjs)
+    add_test(NAME mine-teleop-ice-page-tests
+      COMMAND ${MINE_TELEOP_NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/ice_page.test.cjs)
+  endif()
+  if(MINE_TELEOP_BUILD_CONTROL_CLIENT AND MINE_TELEOP_BUILD_SIGNALING_SERVER)
+    add_executable(mine-teleop-ice-signaling-tests cpp/tests/ice_signaling_tests.cpp)
+    target_link_libraries(mine-teleop-ice-signaling-tests PRIVATE mine_teleop_runtime)
+    mine_teleop_enable_warnings(mine-teleop-ice-signaling-tests)
+    add_test(NAME mine-teleop-ice-signaling-tests COMMAND mine-teleop-ice-signaling-tests)
+    set_tests_properties(mine-teleop-ice-signaling-tests PROPERTIES TIMEOUT 60)
   endif()
   if(MINE_TELEOP_BUILD_SIGNALING_SERVER)
     add_test(NAME mine-teleop-signaling-help COMMAND mine-teleop-signaling-server --help)
@@ -438,11 +600,57 @@ if(MINE_TELEOP_BUILD_TESTS)
   mine_teleop_enable_warnings(mine-teleop-mobile-approval-tests)
   add_test(NAME mine-teleop-mobile-approval-tests COMMAND mine-teleop-mobile-approval-tests)
 
+  add_executable(mine-teleop-mock-login-ttl-tests cpp/tests/mock_login_ttl_tests.cpp)
+  target_link_libraries(mine-teleop-mock-login-ttl-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-mock-login-ttl-tests)
+  add_test(NAME mine-teleop-mock-login-ttl-tests COMMAND mine-teleop-mock-login-ttl-tests)
+  set_tests_properties(mine-teleop-mock-login-ttl-tests PROPERTIES TIMEOUT 20)
+
   add_executable(mine-teleop-control-tests cpp/tests/control_tests.cpp)
   target_link_libraries(mine-teleop-control-tests PRIVATE mine_teleop_runtime)
   mine_teleop_enable_warnings(mine-teleop-control-tests)
   add_test(NAME mine-teleop-control-tests COMMAND mine-teleop-control-tests)
   set_tests_properties(mine-teleop-control-tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+  add_executable(mine-teleop-media-freshness-tests cpp/tests/media_freshness_tests.cpp)
+  target_include_directories(mine-teleop-media-freshness-tests PRIVATE cpp/include)
+  mine_teleop_enable_warnings(mine-teleop-media-freshness-tests)
+  add_test(NAME mine-teleop-media-freshness-tests COMMAND mine-teleop-media-freshness-tests)
+  if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
+    add_executable(mine-teleop-recording-upload-tests cpp/tests/recording_upload_tests.cpp)
+    target_link_libraries(mine-teleop-recording-upload-tests PRIVATE mine_teleop_vehicle_runtime)
+    mine_teleop_enable_warnings(mine-teleop-recording-upload-tests)
+    add_test(NAME mine-teleop-recording-upload-tests COMMAND mine-teleop-recording-upload-tests)
+    add_executable(mine-teleop-recording-gstreamer-tests cpp/tests/recording_gstreamer_tests.cpp)
+    target_link_libraries(mine-teleop-recording-gstreamer-tests PRIVATE mine_teleop_vehicle_runtime)
+    mine_teleop_enable_warnings(mine-teleop-recording-gstreamer-tests)
+    add_test(NAME mine-teleop-recording-gstreamer-tests COMMAND mine-teleop-recording-gstreamer-tests)
+    set_tests_properties(mine-teleop-recording-gstreamer-tests PROPERTIES TIMEOUT 120)
+    add_test(NAME mine-teleop-recorder-help COMMAND mine-teleop-recorder --help)
+    set_tests_properties(mine-teleop-recorder-help PROPERTIES PASS_REGULAR_EXPRESSION "mine-teleop-recorder")
+    add_executable(mine-teleop-media-freshness-gstreamer-tests cpp/tests/media_freshness_gstreamer_tests.cpp)
+    target_link_libraries(mine-teleop-media-freshness-gstreamer-tests PRIVATE mine_teleop_vehicle_runtime)
+    mine_teleop_enable_warnings(mine-teleop-media-freshness-gstreamer-tests)
+    add_test(NAME mine-teleop-media-freshness-gstreamer-tests COMMAND mine-teleop-media-freshness-gstreamer-tests)
+    set_tests_properties(mine-teleop-media-freshness-gstreamer-tests PROPERTIES TIMEOUT 60)
+    if(UNIX)
+      find_package(Python3 COMPONENTS Interpreter REQUIRED)
+      add_test(NAME mine-teleop-ice-vehicle-callback-mock-tests
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/ice_vehicle_callbacks.test.py
+          --output ${CMAKE_CURRENT_BINARY_DIR}/ice-vehicle-callback-mock
+          --compiler ${CMAKE_CXX_COMPILER}
+          --json-include "$<TARGET_PROPERTY:nlohmann_json::nlohmann_json,INTERFACE_INCLUDE_DIRECTORIES>")
+      set_tests_properties(mine-teleop-ice-vehicle-callback-mock-tests PROPERTIES TIMEOUT 90)
+      add_test(NAME mine-teleop-ice-gstreamer-init-tests
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/ice_gstreamer_init.test.py
+          --output ${CMAKE_CURRENT_BINARY_DIR}/ice-gstreamer-init
+          --compiler ${CMAKE_CXX_COMPILER}
+          --json-include "$<TARGET_PROPERTY:nlohmann_json::nlohmann_json,INTERFACE_INCLUDE_DIRECTORIES>")
+      set_tests_properties(mine-teleop-ice-gstreamer-init-tests PROPERTIES TIMEOUT 90)
+    endif()
+  endif()
 
   add_executable(mine-teleop-vcu-tests cpp/tests/vcu_tests.cpp)
   target_link_libraries(mine-teleop-vcu-tests PRIVATE mine_teleop_vcu)
@@ -579,6 +787,9 @@ if(MINE_TELEOP_BUILD_TESTS)
       PRIVATE MINE_TELEOP_CHASSIS_TESTING=1
     )
     mine_teleop_enable_warnings(mine-teleop-chassis-bridge-compile-test)
+    include(cmake/ChassisDiagnosticsIdentity.cmake)
+    mine_teleop_chassis_diagnostics_identity(
+      mine-teleop-chassis-bridge-compile-test "${CMAKE_CURRENT_SOURCE_DIR}")
 
     add_executable(mine-teleop-chassis-bridge-diagnostics-smoke
       cpp/tests/chassis_bridge_diagnostics_smoke.cpp
@@ -619,6 +830,25 @@ if(MINE_TELEOP_BUILD_TESTS)
   endif()
 
   if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      find_package(Python3 COMPONENTS Interpreter REQUIRED)
+      add_test(
+        NAME mine-teleop-control-smoke-loopback
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/control_smoke_loopback.py
+          --binary $<TARGET_FILE:mine-teleop>
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}/control-smoke-loopback-results
+      )
+      set_tests_properties(mine-teleop-control-smoke-loopback PROPERTIES TIMEOUT 30)
+      add_test(
+        NAME mine-teleop-media-time-sync-retry-loopback
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/media_time_sync_retry_loopback.py
+          --binary $<TARGET_FILE:mine-teleop>
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}/media-time-sync-retry-results
+      )
+      set_tests_properties(mine-teleop-media-time-sync-retry-loopback PROPERTIES TIMEOUT 45)
+    endif()
     add_test(
       NAME mine-teleop-vehicle-runtime-log-relay
       COMMAND bash
