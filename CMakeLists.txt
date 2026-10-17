@@ -600,6 +600,12 @@ if(MINE_TELEOP_BUILD_TESTS)
   mine_teleop_enable_warnings(mine-teleop-mobile-approval-tests)
   add_test(NAME mine-teleop-mobile-approval-tests COMMAND mine-teleop-mobile-approval-tests)
 
+  add_executable(mine-teleop-mock-login-ttl-tests cpp/tests/mock_login_ttl_tests.cpp)
+  target_link_libraries(mine-teleop-mock-login-ttl-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-mock-login-ttl-tests)
+  add_test(NAME mine-teleop-mock-login-ttl-tests COMMAND mine-teleop-mock-login-ttl-tests)
+  set_tests_properties(mine-teleop-mock-login-ttl-tests PROPERTIES TIMEOUT 20)
+
   add_executable(mine-teleop-control-tests cpp/tests/control_tests.cpp)
   target_link_libraries(mine-teleop-control-tests PRIVATE mine_teleop_runtime)
   mine_teleop_enable_warnings(mine-teleop-control-tests)

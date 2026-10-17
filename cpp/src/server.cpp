@@ -1945,6 +1945,13 @@ SignalingServerConfig load_signaling_identity_config(const std::filesystem::path
     if (!config.driver_passwords.emplace(driver_id, password).second) {
       throw std::invalid_argument("duplicate driver id: " + driver_id);
     }
+    if (entry["mock_test_login_ttl_ms"]) {
+      try {
+        config.mock_test_login_ttl_ms.emplace(driver_id, entry["mock_test_login_ttl_ms"].as<std::int64_t>());
+      } catch (const YAML::Exception&) {
+        throw std::invalid_argument(context + ".mock_test_login_ttl_ms must be an integer");
+      }
+    }
     const auto allowed = entry["vehicles"];
     if (!allowed || !allowed.IsSequence() || allowed.size() == 0) {
       throw std::invalid_argument(context + ".vehicles must be a non-empty sequence");
@@ -2394,6 +2401,17 @@ SignalingService::SignalingService(
       if (!config_.device_tokens.contains(vehicle_id)) {
         throw std::invalid_argument("vehicle permission references an unknown vehicle");
       }
+    }
+  }
+  for (const auto& [driver_id, ttl_ms] : config_.mock_test_login_ttl_ms) {
+    const auto permissions = config_.driver_vehicle_permissions.find(driver_id);
+    if (!config_.driver_passwords.contains(driver_id) ||
+        permissions == config_.driver_vehicle_permissions.end() ||
+        permissions->second != std::unordered_set<std::string>{"test_bench_001"}) {
+      throw std::invalid_argument("mock login TTL requires an existing driver authorized only for test_bench_001");
+    }
+    if (ttl_ms <= 0 || ttl_ms > 4LL * 60 * 60 * 1000) {
+      throw std::invalid_argument("mock login TTL must be between 1ms and 4 hours");
     }
   }
   if (config_.native_control_trace_commands && !config_.audit_log_path.empty()) {
@@ -4412,7 +4430,10 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
     }
     const auto generation = ++connection_generation_;
     const std::string token = "driver-token-" + random_token();
-    driver_tokens_[token] = DriverToken{driver_id, timestamp_ms + config_.token_ttl_ms, generation};
+    const auto mock_ttl = config_.mock_test_login_ttl_ms.find(driver_id);
+    const auto login_ttl_ms = mock_ttl == config_.mock_test_login_ttl_ms.end()
+        ? config_.token_ttl_ms : mock_ttl->second;
+    driver_tokens_[token] = DriverToken{driver_id, timestamp_ms + login_ttl_ms, generation};
     online_drivers_[driver_id] = ConnectionPresence{"", generation, timestamp_ms, timestamp_ms};
     audit("driver_login", {{"driver_id", driver_id}, {"connection_generation", generation}});
     return ServerResponse::json(

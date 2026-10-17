@@ -113,6 +113,9 @@ struct SignalingServerConfig {
   std::int64_t mobile_approval_timeout_ms{120 * 1000};
   std::int64_t approver_token_ttl_ms{12 * 60 * 60 * 1000};
   std::int64_t token_ttl_ms{30 * 60 * 1000};
+  // Trusted identity-file overrides only. Each target must have exactly the
+  // isolated test_bench_001 permission; ordinary login requests cannot opt in.
+  std::unordered_map<std::string, std::int64_t> mock_test_login_ttl_ms;
   std::int64_t control_token_ttl_ms{5 * 60 * 1000};
   // Internal review-only configuration. Zero disables short direct authority;
   // no YAML/CLI activation. A stable exclusive durable journal is mandatory.
