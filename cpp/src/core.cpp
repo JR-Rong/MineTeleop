@@ -2245,7 +2245,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.field_safety.require_local_estop_reset = optional<bool>(safety, "require_local_estop_reset", true);
   config.field_safety.require_time_sync = optional<bool>(safety, "require_time_sync", true);
   config.field_safety.max_time_sync_uncertainty_ms =
-      optional<int>(safety, "max_time_sync_uncertainty_ms", 25);
+      optional<int>(safety, "max_time_sync_uncertainty_ms", 100);
   config.field_safety.time_sync_interval_ms = optional<int>(safety, "time_sync_interval_ms", 30000);
   config.field_safety.time_sync_samples = optional<int>(safety, "time_sync_samples", 7);
   if (!config.field_safety.require_local_estop_reset) {

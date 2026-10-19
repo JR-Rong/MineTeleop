@@ -321,7 +321,27 @@
         missing, cameras};
     }
 
-    return {configure, attach, reset, refresh, setConnectionState, criticalHealth};
+    function presentationSnapshot() {
+      const now = performance.now();
+      // Read the existing frame observations without qualifying or refreshing
+      // tracks: taking metrics must not count as new video or safety recovery.
+      return {sampled_at_monotonic_ms: now, timestamp_scope: 'browser_monotonic',
+        frame_age_scope: 'since_last_observed_valid_presented_frame_not_capture_latency',
+        cameras: orderedCameraIds([...entries.keys()]).map(id => {
+          const entry = entries.get(id), observed = entry.critical;
+          const age = observed.lastValidFrameAt == null ? null : now - observed.lastValidFrameAt;
+          return {camera_id: id, critical_for_control: entry.criticalForControl === true,
+            frame_age_ms: age != null && age >= 0 ? age : null,
+            presented_frames: observed.frames, sample_seq: observed.sampleSeq,
+            track_state: entry.track?.readyState ?? null,
+            track_muted: entry.track?.muted === true,
+            video_paused: entry.video.paused === true,
+            video_ready_state: entry.video.readyState,
+            overlay_state: entry.health.status};
+        })};
+    }
+
+    return {configure, attach, reset, refresh, setConnectionState, criticalHealth, presentationSnapshot};
   }
 
   return Object.freeze({CAMERAS, STALE_MS, CRITICAL_DISPLAY_STALE_MS, orderedCameraIds, cameraLabel, frameHealth, criticalFrameFresh, mount});

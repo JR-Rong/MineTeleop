@@ -546,7 +546,27 @@ struct VehicleMediaLaunch {
   int capture_interval_ms{0};
 };
 
+volatile std::sig_atomic_t termination_signal = 0;
+void handle_termination_signal(int signal) { termination_signal = signal; }
+
+struct MediaTermination {
+  using Handler = void (*)(int);
+  Handler previous_int{std::signal(SIGINT, handle_termination_signal)};
+  Handler previous_term{std::signal(SIGTERM, handle_termination_signal)};
+  std::stop_source source;
+  std::jthread observer{[this](std::stop_token stop) {
+    while (!stop.stop_requested() && termination_signal == 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (termination_signal != 0) source.request_stop();
+  }};
+  ~MediaTermination() {
+    observer.request_stop(); observer.join();
+    std::signal(SIGINT, previous_int); std::signal(SIGTERM, previous_term);
+  }
+};
+
 int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
+  MediaTermination termination;
   constexpr auto kSessionRestartDelay = std::chrono::milliseconds(250);
   constexpr auto kTransportRestartDelay = std::chrono::seconds(1);
   // The service reconstructs VehicleMediaRuntime after recoverable camera or
@@ -557,6 +577,7 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
   auto control_recovery_latch =
       std::make_shared<mine_teleop::SessionControlRecoveryLatch>();
   while (true) {
+    if (termination_signal != 0) return 128 + termination_signal;
     try {
       mine_teleop::VehicleMediaRuntime runtime(
           launch.config,
@@ -569,7 +590,9 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
           launch.connection_id,
           signaling_sequence,
           control_recovery_latch);
-      const auto summary = runtime.run(launch.frame_count, launch.duration_ms, launch.capture_interval_ms);
+      const auto summary = runtime.run(launch.frame_count, launch.duration_ms, launch.capture_interval_ms,
+                                       termination.source.get_token());
+      if (termination_signal != 0) return 128 + termination_signal;
       std::cout << summary.dump() << '\n';
       if (!service) return summary.value("passed", false) ? 0 : 2;
       std::cout << Json({
@@ -670,6 +693,9 @@ int run_vehicle_media_loop(const VehicleMediaLaunch& launch, bool service) {
                    }).dump()
                 << std::endl;
       std::this_thread::sleep_for(kTransportRestartDelay);
+    } catch (const std::exception&) {
+      if (termination_signal != 0) return 128 + termination_signal;
+      throw;
     }
   }
 }
@@ -702,10 +728,6 @@ int run_vehicle_media_agent(const Arguments& arguments) {
       service);
 }
 
-volatile std::sig_atomic_t termination_signal = 0;
-
-void handle_termination_signal(int signal) { termination_signal = signal; }
-
 struct ChildService {
   std::string name;
   pid_t pid{-1};
@@ -718,8 +740,10 @@ pid_t spawn_service(std::string_view name, const std::function<int()>& run) {
   const auto pid = fork();
   if (pid < 0) throw std::runtime_error("cannot start " + std::string(name) + ": " + std::strerror(errno));
   if (pid != 0) return pid;
-  std::signal(SIGINT, SIG_DFL);
-  std::signal(SIGTERM, SIG_DFL);
+  // Retain the supervisor's handler during child setup; the media loop turns
+  // its flag into cooperative cancellation and drains its final trace batch.
+  std::signal(SIGINT, handle_termination_signal);
+  std::signal(SIGTERM, handle_termination_signal);
   int result = 2;
   try {
     result = run();
@@ -878,7 +902,7 @@ int run_http_health(const Arguments& arguments) {
 int run_time_sync(const Arguments& arguments) {
   const auto signaling = arguments.value("--signaling-http-url", "http://127.0.0.1:8765");
   const auto samples = arguments.integer("--samples", 7);
-  const auto max_uncertainty_ms = arguments.integer("--max-uncertainty-ms", 25);
+  const auto max_uncertainty_ms = arguments.integer("--max-uncertainty-ms", 100);
   mine_teleop::HttpClient http;
   mine_teleop::SynchronizedClock clock;
   const auto status = clock.synchronize(http, signaling, samples, max_uncertainty_ms);

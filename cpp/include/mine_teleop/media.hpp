@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -291,7 +292,8 @@ class VehicleMediaRuntime {
   VehicleMediaRuntime(const VehicleMediaRuntime&) = delete;
   VehicleMediaRuntime& operator=(const VehicleMediaRuntime&) = delete;
 
-  [[nodiscard]] Json run(int frame_count, int duration_ms = -1, int capture_interval_ms = 0);
+  [[nodiscard]] Json run(int frame_count, int duration_ms = -1, int capture_interval_ms = 0,
+                         std::stop_token stop_token = {});
 
  private:
   struct Impl;

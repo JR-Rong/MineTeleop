@@ -298,7 +298,11 @@ server's application time domain before opening a session. They use 7
 four-timestamp samples, select the lowest-RTT samples, report offset/RTT/
 uncertainty, and refresh every 30 seconds. With `require_time_sync: true`, the
 vehicle refuses remote operation when uncertainty exceeds
-`max_time_sync_uncertainty_ms`; no host NTP package is required for relative
+`field_safety.max_time_sync_uncertainty_ms` (default **100 ms**). The driver
+uses `time_sync.max_uncertainty_ms`, also defaulting to **100 ms**. Explicit
+configuration values, including stricter limits, override these defaults. This
+is a clock-estimate uncertainty limit, not a command or video latency budget.
+No host NTP package is required for relative
 latency measurements. The browser only submits its latest input intent to the
 loopback control process; it does not schedule vehicle commands or send them
 over the WebRTC DataChannel. A native sender samples that intent at 20 Hz and

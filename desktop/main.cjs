@@ -50,6 +50,9 @@ async function start(){
   window=new BrowserWindow({title:'MineTeleop 控制台',width:1600,height:1000,minWidth:800,minHeight:600,show:false,backgroundColor:'#08111d',autoHideMenuBar:true,
     webPreferences:{nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true,backgroundThrottling:true,spellcheck:false}
   });
+  // The authenticated remote vehicle cannot resolve link-local mDNS names.
+  // Advertise the default route's address without granting capture permission.
+  window.webContents.setWebRTCIPHandlingPolicy('default_public_and_private_interfaces');
   const menu=Menu.buildFromTemplate([
     ...(process.platform==='darwin'?[{label:'MineTeleop',submenu:[{label:'退出 MineTeleop',accelerator:'Cmd+Q',click:()=>void shutdown()}]}]:[]),
     {label:'编辑',role:'editMenu'},

@@ -23,7 +23,14 @@ def extract(anchor, after=0):
     raise RuntimeError('vehicle method is incomplete: ' + anchor)
 
 helper = extract('  bool cloud_control_authority_live_locked() const {')
-Path(a.output).write_text(helper + extract('  void send_control_status_locked(Json message) {'))
+ordering_start = source.index('            std::vector<Json> ordered_status;',
+                             source.index('  void native_control_websocket_loop('))
+ordering_end = source.index('            for (const auto& status : ordered_status)', ordering_start)
+ordering = ('  std::vector<Json> ordered_pending_status() const {\n'
+            '    const auto& statuses = pending_control_status;\n' +
+            source[ordering_start:ordering_end] +
+            '    return ordered_status;\n  }\n')
+Path(a.output).write_text(helper + extract('  void send_control_status_locked(Json message) {') + ordering)
 Path(a.startup_output).write_text(helper + extract('  [[nodiscard]] bool start_control_service() {'))
 
 # Compile the unchanged result initializer, RAII publisher and early guard.
@@ -32,6 +39,8 @@ Path(a.startup_output).write_text(helper + extract('  [[nodiscard]] bool start_c
 start = source.index('      Json result_message = {{"event", "vehicle_control_result"}')
 end = source.index('      const bool stale_safe_heartbeat =', start)
 guard = extract('      if (stop_requested || control_inhibited ||', end)
+admission_start = source.index('        const auto decision = control_transport_fence.admit(', end)
+admission_end = source.index('        if (decision.changed)', admission_start)
 Path(a.result_output).write_text(source[start:end] +
     '      static_cast<void>(verified_stop_only);\n'
-    '      std::unique_lock lock(control_mutex);\n' + guard)
+    '      std::unique_lock lock(control_mutex);\n' + guard + source[admission_start:admission_end])

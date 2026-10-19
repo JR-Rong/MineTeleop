@@ -7,6 +7,7 @@
 #include <atomic>
 #include <map>
 #include <vector>
+#include <algorithm>
 
 namespace {
 using namespace mine_teleop;
@@ -77,6 +78,9 @@ struct EarlyResult : Startup {
   EmergencyStopReceiver emergency_stop_receiver;
   std::uint64_t control_result_seq{}, control_status_seq{}, rejected_control_commands{};
   Json latest_control_result;
+  std::vector<Json> publication_traces;
+  void enqueue_control_trace(Json value) { publication_traces.push_back(std::move(value)); }
+  void note_control_trace_drop() { throw std::runtime_error("unexpected publication trace loss"); }
   std::string trace_reason;
   bool receive_apply_invoked{};
   static std::int64_t steady_now_ms() { return 1000; }
@@ -85,14 +89,52 @@ struct EarlyResult : Startup {
     if (config.runtime.control_log_commands) trace_reason = reason;
     receive_apply_invoked = invoked;
   }
-  void deliver(ControlCommand command, ControlMessageTransport transport, FakeChannel* channel, Json* native_feedback) {
-    const Json message = Json::object();
+  void deliver(ControlCommand command, ControlMessageTransport transport, FakeChannel* channel, Json* native_feedback,
+      const Json& message = Json::object()) {
     const std::uint64_t intent_seq = 9;
     const std::string current_attempt = "fixture-attempt";
 #include "control_early_result.inc"
     throw std::runtime_error("early rejection fixture unexpectedly passed its guard");
   }
 };
+
+void transport_expiry_has_signed_reason_and_trace_without_apply() {
+  for (const bool trace : {false, true}) for (const bool dc : {false, true}) for (const int offset : {-201, 201}) {
+    EarlyResult value;
+    expect(value.start_control_service(), "expiry fixture failed to start mock service");
+    value.config.runtime.control_log_commands = trace;
+    value.config.control.max_command_gap_ms = 200;
+    FakeChannel channel;
+    value.control_channel = &channel;
+    value.control_link_open = true;
+    value.control_transport_fence.reset(value.config.vehicle_id, "d", "s", "t");
+    ControlCommand command;
+    command.vehicle_id = value.config.vehicle_id; command.driver_id = "d"; command.session_id = "s";
+    command.control_token = "t"; command.seq = 42; command.sent_at_utc_ms = 1000 + offset;
+    const ControlTransportStamp stamp{1, 0, 42, dc ? ControlPath::DataChannel : ControlPath::Wss,
+        dc ? "fixture-attempt" : "", true};
+    Json feedback;
+    value.deliver(command, dc ? EarlyResult::ControlMessageTransport::DataChannel : EarlyResult::ControlMessageTransport::NativeSignaling,
+        &channel, &feedback, {{"control_transport", stamp.to_json()}});
+    expect(feedback.at("reason") == "transport_command_expired" && !feedback.at("accepted").get<bool>() &&
+        !feedback.at("transport_admitted").get<bool>() && !feedback.at("rearm_required").get<bool>(),
+        "transport rejection lost reason or changed control semantics");
+    expect(verify_transport_message(feedback, value.signaling.transport_mac_key(), true), "expiry result lost authentication");
+    expect(trace ? value.trace_reason == "transport_command_expired" : value.trace_reason.empty(),
+        "transport admission rejection skipped its diagnostic trace");
+    expect(value.publication_traces.size() == (trace ? 1U : 0U), "publication trace enablement changed");
+    if (trace) {
+      const auto& published = value.publication_traces.front();
+      expect(published.at("seq") == command.seq && published.at("dc_send_invoked") == dc &&
+          published.at("wss_mailbox_updated") == true && published.at("result_mutex_wait_ms") == 0,
+          "publication trace lost the actual send path or command correlation");
+      expect(!published.contains("vehicle_mac") && !published.contains("control_token"), "trace leaked authentication material");
+    }
+    expect(value.rejected_control_commands == 1 && !value.receive_apply_invoked &&
+        value.control_service->adapter_status().applied_command_count == 0,
+        "expired command reached mock apply or changed rejection count");
+  }
+}
 
 void early_rejection_publishes_precise_signed_result() {
   // All four reasons, both service-unavailable states, both receive paths, and
@@ -181,6 +223,16 @@ void publish_all_four_independent_axes() {
       expect(verify_transport_message(bounded, publisher.signaling.transport_mac_key(), true), "status canonicalization broke real MAC");
     };
     for (const auto& [kind, message] : publisher.pending_control_status) { static_cast<void>(kind); verify(message); }
+    if (feedback == ControlPath::Wss) {
+      const auto ordered = publisher.ordered_pending_status();
+      expect(ordered.size() == 4, "WSS ordering lost a wrapped status");
+      expect(ordered[0].at("status").at("event") == "vehicle_telemetry" &&
+          ordered[1].at("status").at("event") == "vcu_handshake_status" &&
+          ordered[2].at("status").at("event") == "session_control_profile_status" &&
+          ordered[3].at("status").at("event") == "control_command_rejected",
+          "WSS ordering changed authenticated feedback publication order");
+      for (const auto& message : ordered) verify(message);
+    }
     for (const auto& message : channel.sent) verify(message);
     publisher.send_control_status_locked({{"event", "vehicle_telemetry"}, {"session_id", "old"}, {"control_status_seq", 999}});
     for (int i = 0; i < 100; ++i) publisher.send_control_status_locked({{"event", "unknown" + std::to_string(i)}, {"control_status_seq", 999}});
@@ -207,8 +259,38 @@ void cloud_bootstrap_feedback_requires_live_authenticated_lease() {
     expect(publisher.pending_control_status.empty(), "invalid cloud bootstrapped feedback");
   }
 }
+void raw_vcu_details_are_not_a_transport_wrapper() {
+  Publisher publisher;
+  publisher.config.runtime.experimental_direct_authority_max_ms = 0;
+  publisher.control_link_open = false;
+  publisher.native_control_websocket_connected = true;
+  publisher.native_control_transport_cloud_capable = true;
+  const Json vcu = {{"event", "vcu_handshake_status"}, {"control_status_seq", 3},
+      {"status", {{"state", "standby"}, {"ready", false}}}};
+  const Json telemetry = {{"event", "vehicle_telemetry"}, {"control_status_seq", 2}};
+  const Json profile = {{"event", "session_control_profile_status"}, {"control_status_seq", 1}};
+  const Json rejection = {{"event", "control_command_rejected"}, {"control_status_seq", 4}};
+  for (const auto& message : {vcu, telemetry, rejection, profile})
+    publisher.send_control_status_locked(message);
+  const auto retained = publisher.pending_control_status;
+  expect(publisher.ordered_pending_status() == std::vector<Json>{profile, telemetry, vcu, rejection},
+      "raw VCU details hid the top-level status publication sequence");
+  expect(publisher.pending_control_status == retained, "ordering mutated retained status payloads");
+
+  // Both forms can share the send queue during feedback-path negotiation.
+  const Json wrapped = {{"event", "vehicle_control_status"}, {"status", telemetry}};
+  publisher.pending_control_status["vehicle_telemetry"] = wrapped;
+  expect(publisher.ordered_pending_status() == std::vector<Json>{profile, wrapped, vcu, rejection},
+      "mixed raw and wrapped feedback did not retain publication order");
+  publisher.pending_control_status["vehicle_telemetry"] = {
+      {"event", "vehicle_control_status"}, {"status", {{"event", "vehicle_telemetry"}}}};
+  bool rejected = false;
+  try { static_cast<void>(publisher.ordered_pending_status()); }
+  catch (const Json::out_of_range&) { rejected = true; }
+  expect(rejected, "malformed wrapper without a publication sequence was silently admitted");
+}
 }
 int main() {
-  try { early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
+  try { transport_expiry_has_signed_reason_and_trace_without_apply(); raw_vcu_details_are_not_a_transport_wrapper(); early_rejection_publishes_precise_signed_result(); cloud_only_startup_retains_all_safety_gates(); cloud_bootstrap_feedback_requires_live_authenticated_lease(); publish_all_four_independent_axes(); std::cout << "Actual vehicle feedback publisher: expiry rejection trace, raw/wrapped status ordering, early rejection reasons, four axes, real MAC and bounded snapshots passed; fake Gst send, no ABI/network proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

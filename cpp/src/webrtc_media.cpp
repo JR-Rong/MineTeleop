@@ -3,9 +3,11 @@
 #include "mine_teleop/detail/direct_authority.hpp"
 #include "mine_teleop/detail/emergency_stop.hpp"
 #include "mine_teleop/detail/feedback_transport.hpp"
+#include "mine_teleop/detail/diagnostic_queue.hpp"
 
 #include "mine_teleop/gstreamer_media.hpp"
 #include "mine_teleop/detail/gstreamer_freshness.hpp"
+#include "mine_teleop/detail/gstreamer_webrtc_recovery.hpp"
 #include "mine_teleop/detail/recording_pipeline.hpp"
 #include "mine_teleop/recording.hpp"
 #include "mine_teleop/server.hpp"
@@ -780,24 +782,10 @@ struct VehicleMediaRuntime::Impl {
       return;
     }
     try {
-      std::unique_lock lock(control_trace_mutex, std::try_to_lock);
-      if (!lock.owns_lock()) {
+      if (!control_trace_queue.try_push(std::move(record))) {
         note_control_trace_drop();
         return;
       }
-      if (control_trace_stop_requested) {
-        lock.unlock();
-        note_control_trace_drop();
-        return;
-      }
-      if (control_trace_queue.size() >= kControlTraceQueueCapacity) {
-        lock.unlock();
-        note_control_trace_drop();
-        return;
-      }
-      control_trace_queue.push_back(std::move(record));
-      control_trace_enqueued_total.fetch_add(1, std::memory_order_relaxed);
-      lock.unlock();
       control_trace_cv.notify_one();
     } catch (...) {
       note_control_trace_drop();
@@ -819,17 +807,14 @@ struct VehicleMediaRuntime::Impl {
             std::chrono::seconds(1),
             [this] {
               return control_trace_stop_requested ||
-                  control_trace_queue.size() >= kControlTraceBatchMaxRecords;
+                  control_trace_queue.pending() >= kControlTraceBatchMaxRecords;
             });
-        const auto count = std::min(
-            control_trace_queue.size(),
-            kControlTraceBatchMaxRecords);
-        records.reserve(count);
-        for (std::size_t index = 0; index < count; ++index) {
-          records.push_back(std::move(control_trace_queue.front()));
-          control_trace_queue.pop_front();
+        records.reserve(kControlTraceBatchMaxRecords);
+        Json record;
+        for (std::size_t index = 0; index < kControlTraceBatchMaxRecords && control_trace_queue.try_pop(record); ++index) {
+          records.push_back(std::move(record));
         }
-        final = control_trace_stop_requested && control_trace_queue.empty();
+        final = control_trace_stop_requested && control_trace_queue.drained();
       }
 
       const auto emit_batch = [this,
@@ -851,7 +836,7 @@ struct VehicleMediaRuntime::Impl {
               {"final", final},
               {"queue_capacity", kControlTraceQueueCapacity},
               {"commands", std::move(commands)},
-              {"enqueued_total", control_trace_enqueued_total.load(std::memory_order_relaxed)},
+              {"enqueued_total", control_trace_queue.accepted_total()},
               {"emitted_total", next_emitted_total},
               {"dropped_since_last", dropped_since_last},
               {"dropped_total", dropped_total},
@@ -937,6 +922,7 @@ struct VehicleMediaRuntime::Impl {
     {
       std::lock_guard lock(control_trace_mutex);
       control_trace_stop_requested = true;
+      control_trace_queue.close();
     }
     control_trace_cv.notify_all();
     if (control_trace_worker.joinable()) control_trace_worker.join();
@@ -1651,7 +1637,9 @@ struct VehicleMediaRuntime::Impl {
         ~PublishResult() { try { publish(); } catch (...) {} }
       } publish_result{[&, this] {
         if (signaling.transport_mac_key().size() < 32) return;
+        const auto publish_started = steady_now_ms();
         std::lock_guard result_lock(control_mutex);
+        const auto publish_lock_acquired = steady_now_ms();
         result_message["result_seq"] = ++control_result_seq;
         result_message["authority_epoch"] = control_transport_fence.epoch();
         if (direct_authority.configured()) result_message["direct_authority"] = direct_authority.status(steady_now_ms());
@@ -1673,9 +1661,26 @@ struct VehicleMediaRuntime::Impl {
             transport == ControlMessageTransport::DataChannel || message.contains("emergency_stop");
         if (via_wss) latest_control_result = result_message;
         if (native_feedback && via_wss) *native_feedback = result_message;
-        if (control_link_open && control_channel && via_dc &&
-            (transport != ControlMessageTransport::DataChannel || control_channel == channel))
+        const bool dc_send_invoked = control_link_open && control_channel && via_dc &&
+            (transport != ControlMessageTransport::DataChannel || control_channel == channel);
+        const auto dc_send_started = steady_now_ms();
+        if (dc_send_invoked)
           gst_webrtc_data_channel_send_string(control_channel, result_message.dump().c_str());
+        const auto publish_completed = steady_now_ms();
+        if (config.runtime.control_log_commands) {
+          try {
+            enqueue_control_trace({{"stage", "vehicle_result_published"},
+                {"session_id", command.session_id}, {"trace_session_id", command.session_id},
+                {"seq", command.seq}, {"result_seq", result_message.at("result_seq")},
+                {"published_at_utc_ms", signaling.now_ms()},
+                {"publish_started_monotonic_ms", publish_started},
+                {"publish_completed_monotonic_ms", publish_completed},
+                {"result_mutex_wait_ms", publish_lock_acquired - publish_started},
+                {"result_prepare_ms", dc_send_started - publish_lock_acquired},
+                {"dc_send_call_ms", publish_completed - dc_send_started},
+                {"dc_send_invoked", dc_send_invoked}, {"wss_mailbox_updated", via_wss}});
+          } catch (...) { note_control_trace_drop(); }
+        }
       }};
       const bool stale_safe_heartbeat =
           !command.estop && !intent_fresh &&
@@ -1887,7 +1892,13 @@ struct VehicleMediaRuntime::Impl {
         result_message["transport_admitted"] = decision.admitted;
         result_message["transport_selected"] = decision.admitted && message.contains("control_transport") &&
             message.at("control_transport").value("action", "") == "select";
-        if (!decision.admitted) { ++rejected_control_commands; return; }
+        if (!decision.admitted) {
+          ++rejected_control_commands;
+          lock.unlock();
+          queue_control_trace(nullptr, decision.reason, false,
+              std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+          return;
+        }
         if (decision.changed) {
           invalidate_native_control_trusted_gear_locked();
           control_service->set_control_braking_wait(true, signaling.now_ms(), ControlRecoveryCause::ControlLink);
@@ -2453,7 +2464,7 @@ struct VehicleMediaRuntime::Impl {
                            {"seq", payload.value("seq", std::uint64_t{0})},
                            {"intent_seq", payload.value("intent_seq", std::uint64_t{0})}};
       if (!native_feedback.empty()) delivery_ack["control_feedback"] = native_feedback;
-      websocket.send_json(delivery_ack, kNativeControlWebSocketSendTimeout);
+      send_native_control_json(websocket, delivery_ack, "delivery_ack");
     } catch (const std::exception& error) {
       if (config.runtime.control_log_commands) {
         try {
@@ -2485,6 +2496,9 @@ struct VehicleMediaRuntime::Impl {
         Json acknowledgement_trace = {
             {"stage", "delivery_ack_sent"},
             {"vehicle_feedback_present", !native_feedback.empty()},
+            {"vehicle_feedback_accepted", native_feedback.value("accepted", false)},
+            {"vehicle_feedback_reason", bounded_control_trace_text(native_feedback.value("reason", "feedback_unavailable"))},
+            {"vehicle_feedback_transport_admitted", native_feedback.value("transport_admitted", false)},
             {"vehicle_feedback_rearm_required", native_feedback.value("rearm_required", false)},
             {"vehicle_feedback_status_seq", native_feedback.value("control_status_seq", std::uint64_t{0})},
             {"vehicle_id", bounded_control_trace_text(config.vehicle_id)},
@@ -2526,6 +2540,30 @@ struct VehicleMediaRuntime::Impl {
           "native control WebSocket contained an invalid sibling message: " +
           first_protocol_issue);
     }
+  }
+
+  void send_native_control_json(WebSocketClient& websocket, const Json& message, std::string_view operation) {
+    const auto started = steady_now_ms();
+    const auto trace_send = [&](bool completed) noexcept {
+      const auto elapsed = steady_now_ms() - started;
+      if (!config.runtime.control_log_commands || (completed && elapsed < 5)) return;
+      try {
+        auto transport = websocket.transport_diagnostics();
+        transport.erase("peer_address");
+        enqueue_control_trace({
+            {"stage", completed ? "vehicle_feedback_send_slow" : "vehicle_feedback_send_failed"},
+            {"session_id", signaling.session_id()}, {"trace_session_id", signaling.session_id()},
+            {"operation", operation}, {"event_at_utc_ms", signaling.now_ms()},
+            {"command_seq", message.value("command_seq", message.value("seq", std::uint64_t{0}))},
+            {"result_seq", message.value("result_seq", std::uint64_t{0})},
+            {"send_call_ms", elapsed},
+            {"send_timeout_ms", kNativeControlWebSocketSendTimeout.count()},
+            {"send_io", websocket.last_send_diagnostics()}, {"transport", std::move(transport)}});
+      } catch (...) { note_control_trace_drop(); }
+    };
+    try { websocket.send_json(message, kNativeControlWebSocketSendTimeout); }
+    catch (...) { trace_send(false); throw; }
+    trace_send(true);
   }
 
   bool wait_for_native_control_reconnect(
@@ -2584,17 +2622,18 @@ struct VehicleMediaRuntime::Impl {
             { std::lock_guard result_lock(control_mutex); result = latest_control_result; statuses.swap(pending_control_status); }
             std::vector<Json> ordered_status;
             for (const auto& [event, status] : statuses) { static_cast<void>(event); ordered_status.push_back(status); }
+            // Raw VCU status also has a "status" object containing its details.
             std::sort(ordered_status.begin(), ordered_status.end(), [](const Json& left, const Json& right) {
-              return (left.contains("status") ? left.at("status") : left).at("control_status_seq").get<std::uint64_t>() <
-                  (right.contains("status") ? right.at("status") : right).at("control_status_seq").get<std::uint64_t>(); });
+              return (left.value("event", "") == "vehicle_control_status" ? left.at("status") : left).at("control_status_seq").get<std::uint64_t>() <
+                  (right.value("event", "") == "vehicle_control_status" ? right.at("status") : right).at("control_status_seq").get<std::uint64_t>(); });
             for (const auto& status : ordered_status) {
-              if (status.value("event", "") == "vehicle_control_status") websocket.send_json(status, kNativeControlWebSocketSendTimeout);
-              else websocket.send_json({{"event", "vehicle_control_status"}, {"protocol", detail::kControlTransportCapability},
+              if (status.value("event", "") == "vehicle_control_status") send_native_control_json(websocket, status, "status");
+              else send_native_control_json(websocket, {{"event", "vehicle_control_status"}, {"protocol", detail::kControlTransportCapability},
                   {"session_id", signaling.session_id()}, {"vehicle_id", config.vehicle_id}, {"driver_id", signaling.driver_id()},
-                  {"status", status}}, kNativeControlWebSocketSendTimeout);
+                  {"status", status}}, "status");
             }
             if (result.is_object() && result.value("result_seq", std::uint64_t{0}) > last_result_sent) {
-              websocket.send_json(result, kNativeControlWebSocketSendTimeout);
+              send_native_control_json(websocket, result, "result");
               last_result_sent = result.at("result_seq").get<std::uint64_t>();
             }
           }
@@ -3757,7 +3796,7 @@ struct VehicleMediaRuntime::Impl {
           << "! application/x-rtp,media=video,encoding-name=" << encoding_name << ",payload=" << payload_type
           << (encoder.codec() == VideoCodec::H265
                   ? ",profile-id=(string)1,tier-flag=(string)0,tx-mode=(string)SRST"
-                  : "")
+                  : ",packetization-mode=(string)1")
           << " ! webrtc. ";
       if (!recording_root.empty() && !lane->camera.record_profile.empty()) {
         pipeline_text
@@ -3912,6 +3951,8 @@ struct VehicleMediaRuntime::Impl {
       pipeline_error_retryable = false;
     }
     stop_requested = false;
+    // Cancellation is terminal for this runtime, including an encoder retry.
+    if (service_stop_token.stop_requested()) { stop_requested = true; return false; }
     local_ice_candidate_count = 0;
     remote_ice_candidate_count = 0;
     answer_received_at_ms.reset();
@@ -3995,6 +4036,11 @@ struct VehicleMediaRuntime::Impl {
       return false;
     }
     configure_control_data_channel();
+    // Setting the last codec preference can immediately trigger negotiation.
+    // The first immutable offer must already include the control DataChannel.
+    if (detail::configure_webrtc_video_transceivers(webrtc) != lanes.size()) {
+      throw std::runtime_error("WebRTC video transceiver count differs from configured camera lanes");
+    }
 
     for (const auto& lane : lanes) {
       const auto id = pipeline_identifier(lane->camera.id);
@@ -4069,6 +4115,10 @@ struct VehicleMediaRuntime::Impl {
       stop_pipeline();
       return false;
     }
+    // GStreamer 1.20 does not necessarily re-emit negotiation-needed when
+    // codec preferences are set after READY. All fixed tracks and the control
+    // channel now exist; the callback's epoch guard keeps this request unique.
+    on_negotiation_needed(webrtc, &media_signal_state);
     started_ms = signaling.now_ms();
     for (const auto& lane : lanes) {
       lane->pipeline_started_ms = started_ms;
@@ -4335,6 +4385,22 @@ struct VehicleMediaRuntime::Impl {
     return true;
   }
 
+  // The caller owns control_mutex. Used by both cancellation and teardown so
+  // slow media/signaling cleanup cannot keep an adapter accepting commands.
+  void close_control_service_locked() {
+    invalidate_native_control_trusted_gear_locked();
+    if (control_service_started && control_service) {
+      try { control_service->close(); }
+      catch (const std::exception& error) {
+        emit_diagnostic("vehicle_vcu_safe_stop_failed", "vcu_safe_stop_or_close_failed", "vcu_adapter_close",
+            error.what(), "Keep the vehicle isolated and inspect the VCU JSONL log/CAN interface before restart.",
+            true, {{"safety_action", "local_full_stop_requested"}});
+      }
+    }
+    control_service_started = false;
+    control_service.reset();
+  }
+
   void stop_pipeline() {
     stop_requested = true;
     {
@@ -4355,23 +4421,7 @@ struct VehicleMediaRuntime::Impl {
       std::lock_guard lock(control_mutex);
       channel_to_close = std::exchange(control_channel, nullptr);
       control_link_open = false;
-      invalidate_native_control_trusted_gear_locked();
-      if (control_service_started && control_service) {
-        try {
-          control_service->close();
-        } catch (const std::exception& error) {
-          emit_diagnostic(
-              "vehicle_vcu_safe_stop_failed",
-              "vcu_safe_stop_or_close_failed",
-              "vcu_adapter_close",
-              error.what(),
-              "Keep the vehicle isolated and inspect the VCU JSONL log/CAN interface before restart.",
-              true,
-              {{"safety_action", "local_full_stop_requested"}});
-        }
-      }
-      control_service_started = false;
-      control_service.reset();
+      close_control_service_locked();
     }
     // The independent watchdog and WSS receiver can be waiting for
     // control_mutex, but neither can produce adapter output after the guarded
@@ -4769,7 +4819,17 @@ struct VehicleMediaRuntime::Impl {
     return result;
   }
 
-  Json run(int frame_count, int duration_ms, int capture_interval_ms) {
+  Json run(int frame_count, int duration_ms, int capture_interval_ms, std::stop_token token) {
+    service_stop_token = token;
+    std::stop_callback cancellation(token, [this] {
+      stop_requested = true;
+      std::lock_guard lock(control_mutex);
+      try { close_control_service_locked(); } catch (...) { control_inhibited = true; }
+    });
+    const auto check_stop = [&] {
+      if (token.stop_requested()) throw std::runtime_error("vehicle media stop requested");
+    };
+    check_stop();
     const bool continuous = frame_count == 0 && duration_ms == 0;
     if (!continuous && frame_count <= 0 && duration_ms < 0) {
       throw std::invalid_argument("frame_count or duration_ms is required");
@@ -4830,6 +4890,7 @@ struct VehicleMediaRuntime::Impl {
               << std::endl;
     const auto session_deadline = signaling.now_ms() + 5000;
     while (true) {
+      check_stop();
       bool discovered = false;
       try {
         discovered = signaling.discover_session();
@@ -4920,12 +4981,14 @@ struct VehicleMediaRuntime::Impl {
     EncoderCandidate successful = candidates.front();
 
     for (std::size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index) {
+      check_stop();
       answer_received = false;
       simulated_failure_fired = false;
       codec_fallback_requested = false;
       const auto candidate = candidates[candidate_index];
       const auto attempt_started = signaling.now_ms();
       if (!start_pipeline(candidate, capture_interval_ms)) {
+        check_stop();
         const auto error = current_pipeline_error();
         attempts.push_back({
             {"backend", to_string(candidate.backend)},
@@ -4942,7 +5005,9 @@ struct VehicleMediaRuntime::Impl {
       auto next_media_status_ms = signaling.now_ms();
       auto next_media_log_monotonic_ms = steady_now_ms();
       while (!frame_target_reached(frame_count) && (continuous || signaling.now_ms() < deadline)) {
+        check_stop();
         while (g_main_context_iteration(nullptr, false)) {
+          check_stop();
         }
         try {
           flush_outgoing_signals();
@@ -5269,6 +5334,7 @@ struct VehicleMediaRuntime::Impl {
   GstWebRTCDataChannel* control_channel{nullptr};
   std::vector<std::unique_ptr<Lane>> lanes;
   std::atomic<bool> stop_requested{false};
+  std::stop_token service_stop_token;
   std::shared_ptr<MediaSignalState> media_signal_state{std::make_shared<MediaSignalState>()};
   mutable std::mutex error_mutex;
   std::string pipeline_error;
@@ -5291,11 +5357,10 @@ struct VehicleMediaRuntime::Impl {
   Json ice_configuration{Json::object()};
   std::mutex control_trace_mutex;
   std::condition_variable control_trace_cv;
-  std::deque<Json> control_trace_queue;
+  detail::DiagnosticQueue<Json, kControlTraceQueueCapacity> control_trace_queue;
   std::thread control_trace_worker;
   bool control_trace_stop_requested{false};
   std::atomic<bool> control_trace_accepting{false};
-  std::atomic<std::uint64_t> control_trace_enqueued_total{0};
   std::atomic<std::uint64_t> control_trace_dropped_total{0};
   std::mutex control_mutex;
   // Acquired before control_mutex; no control handler takes this mutex.
@@ -5406,8 +5471,8 @@ VehicleMediaRuntime::VehicleMediaRuntime(
 
 VehicleMediaRuntime::~VehicleMediaRuntime() = default;
 
-Json VehicleMediaRuntime::run(int frame_count, int duration_ms, int capture_interval_ms) {
-  return impl_->run(frame_count, duration_ms, capture_interval_ms);
+Json VehicleMediaRuntime::run(int frame_count, int duration_ms, int capture_interval_ms, std::stop_token token) {
+  return impl_->run(frame_count, duration_ms, capture_interval_ms, token);
 }
 
 }  // namespace mine_teleop

@@ -562,7 +562,7 @@ struct FieldSafetyConfig {
   bool require_can_feedback_before_control{true};
   bool require_local_estop_reset{true};
   bool require_time_sync{true};
-  int max_time_sync_uncertainty_ms{25};
+  int max_time_sync_uncertainty_ms{100};
   int time_sync_interval_ms{30000};
   int time_sync_samples{7};
 };

@@ -1392,8 +1392,27 @@
     return transports.every(value => value === 'udp') ? 'turn_udp' : 'turn_unknown';
   }
 
+  function iceAddressFamily(address) {
+    const text = String(address || '');
+    if (/^[\da-f:]+(?:%[\w.-]+)?$/i.test(text) && text.includes(':')) return 'ipv6';
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) return 'ipv4';
+    if (/\.local\.?$/i.test(text)) return 'mdns';
+    return 'unknown';
+  }
+
+  function iceCandidateSummary(candidate) {
+    const parts = String(candidate?.candidate || '').trim().split(/\s+/);
+    const typeIndex = parts.indexOf('typ');
+    const type = typeIndex >= 0 ? parts[typeIndex + 1] : candidate?.type;
+    return {candidate_type: ['host', 'srflx', 'prflx', 'relay'].includes(type) ? type : 'unknown',
+      protocol: ['udp', 'tcp'].includes(String(parts[2]).toLowerCase()) ? parts[2].toLowerCase() : 'unknown',
+      address_family: iceAddressFamily(parts[4] || candidate?.address),
+      sdp_mline_index: candidate?.sdpMLineIndex ?? null};
+  }
+
   function iceConnectivity(report, selectedPair) {
     const candidates = {local: {}, remote: {}};
+    const candidateFamilies = {local: {}, remote: {}};
     const states = {}, paths = {}, pairs = [];
     const count = value => Number.isFinite(value) && value >= 0 ? value : null;
     const token = (value, allowed) => allowed.includes(value) ? value : 'unknown';
@@ -1403,6 +1422,8 @@
       if (side) {
         const key = token(value.candidateType, ['host', 'srflx', 'prflx', 'relay']) + '/' + token(value.protocol, ['udp', 'tcp']);
         candidates[side][key] = (candidates[side][key] || 0) + 1;
+        const familyKey = key + '/' + iceAddressFamily(value.address ?? value.ip);
+        candidateFamilies[side][familyKey] = (candidateFamilies[side][familyKey] || 0) + 1;
       }
       if (value.type !== 'candidate-pair') continue;
       const local = report.get(value.localCandidateId) || {}, remote = report.get(value.remoteCandidateId) || {};
@@ -1422,6 +1443,8 @@
       pairs.push({id: value.id, selected, state, nominated: value.nominated === true, network_path: path,
         local_type: token(local.candidateType, ['host', 'srflx', 'prflx', 'relay']),
         remote_type: token(remote.candidateType, ['host', 'srflx', 'prflx', 'relay']),
+        local_address_family: iceAddressFamily(local.address ?? local.ip),
+        remote_address_family: iceAddressFamily(remote.address ?? remote.ip),
         protocol: token(local.protocol, ['udp', 'tcp']),
         relay_protocol: token(local.relayProtocol, ['udp', 'tcp', 'tls']),
         remote_relay_protocol: token(remote.relayProtocol, ['udp', 'tcp', 'tls']),
@@ -1435,7 +1458,7 @@
     const rank = pair => pair.selected ? 0 : pair.network_path === 'p2p'
       ? pair.state === 'failed' ? 1 : pair.requests_sent > 0 ? 2 : 3 : 4;
     pairs.sort((a, b) => rank(a) - rank(b));
-    return {candidates, pair_states: states, path_checks: paths, pair_count: pairs.length,
+    return {candidates, candidate_families: candidateFamilies, pair_states: states, path_checks: paths, pair_count: pairs.length,
       pairs: pairs.slice(0, 16), pairs_truncated: pairs.length > 16};
   }
 
@@ -1721,6 +1744,7 @@
     createLatestControlWriteQueue,
     receiverLatency,
     iceConnectivity,
+    iceCandidateSummary,
     iceNetworkPath,
     iceServerError,
     CONTROL_OUTCOMES,

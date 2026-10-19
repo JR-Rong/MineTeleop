@@ -4,12 +4,12 @@ const path = require('node:path');
 const api = require('../web/control_transport.js');
 function fixture() {
   let time = 0, current = {session:'s',generation:7,ui:'owner',uiEpoch:2,attempt:'a',ready:true};
-  const requests = [], frames = [], boundaries = [], raw = [], statuses = [];
+  const requests = [], frames = [], boundaries = [], raw = [], statuses = [], traces = [];
   let reply = () => ({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:1},valid_for_ms:100,frame_json:'{"native":"original bytes"}',
     frame:{seq:1,intent_seq:1,session_id:'s',sent_at_utc_ms:123,control_transport:{protocol:api.protocol,path:'dc',media_attempt:'a'}}});
   const courier = api.createCourier({scope:()=>current,now:()=>time,
-    post:async(path,body)=>{requests.push({path,body});return reply()},send:(frame,bytes)=>{assert.equal(typeof bytes,'string');frames.push(frame);raw.push(bytes)},onBoundary:()=>boundaries.push(true),onStatus:value=>statuses.push(value)});
-  return {courier,requests,frames,boundaries,raw,statuses,setTime:value=>time=value,setScope:value=>current=value,
+    post:async(path,body)=>{requests.push({path,body});return reply()},send:(frame,bytes)=>{assert.equal(typeof bytes,'string');frames.push(frame);raw.push(bytes);return true},onBoundary:()=>boundaries.push(true),onStatus:value=>statuses.push(value),onTrace:value=>traces.push(value)});
+  return {courier,requests,frames,boundaries,raw,statuses,traces,setTime:value=>time=value,setScope:value=>current=value,
     setReply:value=>reply=value,scope:()=>current};
 }
 const cases = [];
@@ -47,7 +47,7 @@ test('late local delivery, closed DC and wrong frame scopes never get sent',asyn
     });await f.courier.tick();assert.equal(f.frames.length,0,kind);
   }
 });
-test('a newer vehicle result arriving during a request stays in the one-slot mailbox',async()=>{
+test('a newer vehicle result arriving during a request stays queued',async()=>{
   const f=fixture();const result=seq=>({event:'vehicle_control_result',protocol:api.protocol,session_id:'s',command_seq:seq,result_seq:seq});
   assert.equal(f.courier.receive(result(1)),true);
   let resolve;f.setReply(()=>new Promise(done=>resolve=done));const pending=f.courier.tick();
@@ -61,6 +61,69 @@ test('unclaimed page and missing media scope cannot fetch native packets',async(
   for(const patch of [{uiEpoch:0},{session:''},{attempt:''},{ui:''}]) {
     const f=fixture();f.setScope({...f.scope(),...patch});await f.courier.tick();assert.equal(f.requests.length,0);
   }
+});
+test('feedback diagnostics separate mailbox wait and HTTP delay without renewing a frame',async()=>{
+  const f=fixture();
+  const result=seq=>({event:'vehicle_control_result',protocol:api.protocol,session_id:'s',command_seq:seq,result_seq:seq});
+  f.setTime(10);f.courier.receive(result(1));f.setTime(20);f.courier.receive(result(2));
+  f.setTime(25);let resolve;f.setReply(()=>new Promise(done=>resolve=done));const pending=f.courier.tick();
+  f.setTime(30);f.courier.receive(result(3));f.setTime(240);
+  resolve({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:1},valid_for_ms:100,frame_json:'{}',
+    frame:{seq:1,session_id:'s',control_transport:{protocol:api.protocol,path:'dc',media_attempt:'a'}}});await pending;
+  const trace=f.traces.at(-1);assert.equal(trace.seq,1);assert.equal(trace.browser_mailbox_wait_ms,15);
+  assert.equal(trace.bridge_http_elapsed_ms,215);assert.equal(trace.completed,true);assert.equal(f.frames.length,0);
+  assert.equal(f.traces[1].superseded_result_seq,null);
+  f.setReply(()=>({protocol:api.protocol,enabled:false}));await f.courier.tick();
+  assert.equal(f.requests.at(-1).body.vehicle_result.result_seq,2);assert.equal(f.traces.at(-1).browser_mailbox_wait_ms,220);
+  await f.courier.tick();assert.equal(f.requests.at(-1).body.vehicle_result.result_seq,3);
+});
+test('burst receipts preserve every result including a rejection before a newer acceptance',async()=>{
+  const f=fixture(),result=seq=>({event:'vehicle_control_result',protocol:api.protocol,session_id:'s',command_seq:seq,result_seq:seq,accepted:seq!==2});
+  f.setReply(()=>({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:1}}));
+  for(let seq=1;seq<=12;seq++)assert.equal(f.courier.receive(result(seq)),true);
+  assert.equal(f.courier.receive(result(2)),true,'duplicate reception remains recognized');
+  for(let seq=1;seq<=12;seq++)await f.courier.tick();
+  assert.deepEqual(f.requests.map(request=>request.body.vehicle_result.command_seq),Array.from({length:12},(_,i)=>i+1));
+  assert.equal(f.requests[1].body.vehicle_result.accepted,false,'negative result was overwritten');
+  await f.courier.tick();assert.equal(f.requests.at(-1).body.vehicle_result,undefined);
+});
+test('failed HTTP retains all queued receipts and scope change discards the old queue',async()=>{
+  const f=fixture(),result=seq=>({event:'vehicle_control_result',protocol:api.protocol,session_id:'s',command_seq:seq,result_seq:seq});
+  f.courier.receive(result(1));let reject;f.setReply(()=>new Promise((_,fail)=>reject=fail));
+  const pending=f.courier.tick();f.courier.receive(result(2));f.courier.receive(result(3));reject(Error('fixture failure'));
+  await assert.rejects(pending,/fixture failure/);
+  f.setReply(()=>({protocol:api.protocol,enabled:false}));await f.courier.tick();await f.courier.tick();await f.courier.tick();
+  assert.deepEqual(f.requests.map(request=>request.body.vehicle_result.command_seq),[1,1,2,3]);
+  f.courier.receive(result(4));f.setScope({...f.scope(),attempt:'new'});await f.courier.tick();
+  assert.equal(f.requests.at(-1).body.vehicle_result,undefined);
+});
+test('blocked bridge has a bounded receipt queue and reports overflow explicitly',async()=>{
+  const f=fixture(),result=seq=>({event:'vehicle_control_result',protocol:api.protocol,session_id:'s',command_seq:seq,result_seq:seq});
+  for(let seq=1;seq<=64;seq++)assert.equal(f.courier.receive(result(seq)),true);
+  assert.equal(f.courier.receive(result(65)),false);
+  assert.equal(f.traces.at(-1).stage,'dc_result_queue_overflow');assert.equal(f.traces.at(-1).seq,65);
+  f.setReply(()=>({protocol:api.protocol,enabled:false}));
+  for(let seq=1;seq<=64;seq++)await f.courier.tick();
+  assert.deepEqual(f.requests.map(request=>request.body.vehicle_result.command_seq),Array.from({length:64},(_,i)=>i+1));
+});
+test('only a confirmed DataChannel send gets an actual-send trace and none is retried',async()=>{
+  for(const outcome of [true,undefined,false,{reason:'channel_buffer_not_empty'},'throw']) {
+    const f=fixture(),traces=[];let calls=0;
+    const courier=api.createCourier({scope:f.scope,now:()=>0,onBoundary:()=>{},onTrace:value=>traces.push(value),
+      post:async()=>({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:1},valid_for_ms:100,frame_json:'{}',
+        frame:{seq:1,session_id:'s',control_transport:{protocol:api.protocol,path:'dc',media_attempt:'a'}}}),
+      send:()=>{calls++;if(outcome==='throw')throw Error('fixture send');return outcome}});
+    if(outcome==='throw')await assert.rejects(courier.tick(),/fixture send/);else await courier.tick();
+    await courier.tick();assert.equal(calls,1);
+    assert.equal(traces.at(-1).stage,outcome===true?'dc_command_sent':outcome==='throw'?'dc_command_send_failed':'dc_command_not_sent');
+  }
+});
+test('trace failures cannot interrupt feedback or change control eligibility',async()=>{
+  const current={session:'s',generation:1,ui:'owner',uiEpoch:1,attempt:'a',ready:true};let requests=0;
+  const courier=api.createCourier({scope:()=>current,now:()=>0,send:()=>{},onBoundary:()=>{},
+    onTrace:()=>{throw Error('diagnostic sink failed')},post:async(_url,body)=>{requests++;assert.equal(body.vehicle_result.command_seq,1);return {protocol:api.protocol,enabled:false}}});
+  assert.equal(courier.receive({event:'vehicle_control_result',protocol:api.protocol,session_id:'s',command_seq:1,result_seq:1}),true);
+  await courier.tick();assert.equal(requests,1);
 });
 const feedbackStamp=epoch=>({protocol:api.feedbackProtocol,enabled:true,epoch,from_epoch:epoch-1,path:'dc',media_attempt:'a',authority_issuer:'issuer',authority_epoch:7,status_floor:0});
 const feedbackStatus=(epoch,seq,kind='vehicle_telemetry')=>({event:'vehicle_control_status',protocol:api.protocol,session_id:'s',feedback_transport:feedbackStamp(epoch),status:{event:kind,control_status_seq:seq}});

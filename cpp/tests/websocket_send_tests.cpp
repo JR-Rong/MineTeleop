@@ -2,10 +2,15 @@
 #include "mine_teleop/websocket.hpp"
 #include <atomic>
 #include <condition_variable>
+#include <future>
 #include <iostream>
 #include <mutex>
 #include <stop_token>
 #include <thread>
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 #ifndef _WIN32
 #include <sys/socket.h>
 #include <unistd.h>
@@ -20,6 +25,36 @@ void expect(bool value, const char* message) { if (!value) throw std::runtime_er
 template<class Run> void throws(Run run) {
   try { run(); } catch (const std::runtime_error&) { return; }
   throw std::runtime_error("expected send failure");
+}
+void test_socket_notification_wakes_idle_receive_without_losing_edges() {
+  // A second, silent local socket stands in for the network endpoint. This
+  // exercises the same two-descriptor poll on Windows and POSIX, without a
+  // network frame that could accidentally make a missing notification pass.
+  SocketWakeup network;
+  SocketWakeup wakeup;
+  ServerWebSocketConnection receiver(network.socket(), 1024);
+  for (int iteration = 0; iteration < 100; ++iteration) {
+    expect(wakeup.notify(), "notification before wait failed");
+    for (int repeat = 0; repeat < 100; ++repeat)
+      expect(wakeup.notify(), "coalescing notification failed");
+    expect(receiver.receive_json(1s, &wakeup).status == WebSocketReceiveStatus::Notified,
+        "notification before poll was lost");
+    expect(receiver.receive_json(0ms, &wakeup).status == WebSocketReceiveStatus::Timeout,
+        "coalesced notifications left a busy-loop backlog");
+  }
+  std::promise<void> starting;
+  auto ready = starting.get_future();
+  auto result = std::async(std::launch::async, [&] {
+    starting.set_value();
+    return receiver.receive_json(5s, &wakeup).status;
+  });
+  ready.wait();
+  expect(result.wait_for(20ms) == std::future_status::timeout,
+      "idle receiver returned without network input or notification");
+  expect(wakeup.notify(), "notification during wait failed");
+  expect(result.wait_for(500ms) == std::future_status::ready &&
+      result.get() == WebSocketReceiveStatus::Notified,
+      "notification did not interrupt a blocked socket wait");
 }
 void test_all_progress_paths_obey_one_deadline() {
   for (bool complete_late : {false,true}) {
@@ -50,7 +85,15 @@ void test_blocking_backend_is_interrupted_and_cancel_can_join() {
   for (bool cancel : {false,true}) {
     std::mutex mutex; std::condition_variable wake;
     bool interrupted=false, entered=false;
+#if defined(__APPLE__)
+    std::atomic<unsigned> interrupt_qos{QOS_CLASS_UNSPECIFIED};
+#endif
     WebSocketSendDeadline deadline([&] {
+#if defined(__APPLE__)
+      qos_class_t qos=QOS_CLASS_UNSPECIFIED;int relative_priority=0;
+      if(pthread_get_qos_class_np(pthread_self(),&qos,&relative_priority)==0)
+        interrupt_qos.store(static_cast<unsigned>(qos));
+#endif
       {std::lock_guard lock(mutex);interrupted=true;} wake.notify_all();
     });
     std::stop_source stop;
@@ -71,6 +114,10 @@ void test_blocking_backend_is_interrupted_and_cancel_can_join() {
     if(cancelling.joinable())cancelling.join();
     expect(interrupted && deadline.interrupted() && Clock::now()-started<1s,
       "blocked TLS-like call or cancellation failed to return within the fixture bound");
+#if defined(__APPLE__)
+    if(!cancel) expect(interrupt_qos.load()==QOS_CLASS_USER_INTERACTIVE,
+      "macOS deadline observer retained default scheduling while guarding interactive I/O");
+#endif
     expect(!deadline.finish(),"interrupted stream became reusable");
     throws([&]{deadline.arm(Clock::now()+20ms);});
   }
@@ -110,19 +157,69 @@ void test_original_descriptor_reuse_cannot_redirect_interruption() {
   ::close(original[1]);::close(replacement[0]);::close(replacement[1]);
 #endif
 }
+void test_destruction_waits_for_inflight_interruption() {
+  std::mutex mutex; std::condition_variable wake;
+  bool entered=false, release=false, destroying=false, destroyed=false;
+  auto deadline=std::make_unique<WebSocketSendDeadline>([&] {
+    std::unique_lock lock(mutex);entered=true;wake.notify_all();
+    wake.wait(lock,[&]{return release;});
+  });
+  deadline->arm(Clock::now());
+  {
+    std::unique_lock lock(mutex);
+    expect(wake.wait_for(lock,1s,[&]{return entered;}),"timer callback did not enter");
+  }
+  std::thread retiring([&, owner=std::move(deadline)]() mutable {
+    {std::lock_guard lock(mutex);destroying=true;wake.notify_all();}
+    owner.reset();
+    {std::lock_guard lock(mutex);destroyed=true;wake.notify_all();}
+  });
+  bool escaped;
+  {
+    std::unique_lock lock(mutex);wake.wait(lock,[&]{return destroying;});
+    escaped=wake.wait_for(lock,20ms,[&]{return destroyed;});
+    release=true;wake.notify_all();
+  }
+  retiring.join();
+  expect(!escaped && destroyed,"owner was released before its interruption callback returned");
+  std::atomic<int> late_calls{0};
+  for(int index=0;index<64;++index) {
+    WebSocketSendDeadline pending([&]{++late_calls;});
+    pending.arm(Clock::now()+1s);
+    // Destruction must cancel an armed timer, without touching its socket.
+  }
+  expect(late_calls==0,"destroying an armed observer invoked interruption");
+}
 int tls_client(int argc,char** argv) {
   expect(argc==4,"TLS fixture needs URL and temporary CA");
   WebSocketClient client(2s,{},argv[3]);client.connect(argv[2]);
   if(std::string_view(argv[1])=="--tls-client-drain") {
-    for(int index=0;index<8;++index)
+    for(int index=0;index<8;++index) {
+      // Force the preparation deadline without timing-sensitive CPU load. The
+      // server validates that only the fresh records traverse this same WSS.
+      bool not_started=false;
+      try { client.send_json_until({{"must_not_arrive",index}},Clock::now()-1ms); }
+      catch(const WebSocketSendNotStarted&) { not_started=true; }
+      const auto skipped=client.last_send_diagnostics();
+      expect(not_started && client.connected() && skipped.value("not_started",false) &&
+          skipped.value("curl_send_calls",1)==0 && skipped.value("curl_reported_bytes",1)==0 &&
+          !skipped.value("socket_interrupted",true),
+          "expired preparation touched the stream or retired a healthy connection");
       client.send_json({{"probe",std::string(16*1024,'x')},{"seq",index}},2s);
+      const auto timing=client.last_send_diagnostics();
+      expect(timing.value("curl_send_calls",0)>0 &&
+          timing.value("curl_send_call_total_us",-1)>=timing.value("curl_send_call_max_us",0) &&
+          timing.value("curl_send_call_max_us",-1)>=0 && timing.contains("curl_send_thread_cpu_us") &&
+          timing.value("longest_curl_send_call_ms",-1)==timing.value("curl_send_call_max_us",0)/1000,
+          "backend wall/CPU measurements missing or confused with send step timing");
+    }
     const auto reply=client.receive_json(2s);
     expect(reply.status==WebSocketReceiveStatus::Message && reply.message.value("received",0)==8,
         "TLS retry corrupted, duplicated or lost a record");
     const auto started=Clock::now();client.close();
     const auto close_ms=std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-started).count();
     expect(close_ms<2000,"healthy TLS owner cleanup exceeded isolated bound");
-    std::cout<<Json{{"received",8},{"close_ms",close_ms}}.dump()<<std::endl;
+    std::cout<<Json{{"received",8},{"expired_before_io_discarded",8},{"close_ms",close_ms}}.dump()<<std::endl;
     return 0;
   }
   const bool cancel=std::string_view(argv[1])=="--tls-client-cancel";
@@ -167,6 +264,8 @@ int main(int argc,char** argv) {
     test_blocking_backend_is_interrupted_and_cancel_can_join();
     test_completed_operation_disarms_old_deadlines();
     test_original_descriptor_reuse_cannot_redirect_interruption();
-    std::cout<<"4 websocket send deadline/ownership groups passed\n";return 0;
+    test_destruction_waits_for_inflight_interruption();
+    test_socket_notification_wakes_idle_receive_without_losing_edges();
+    std::cout<<"6 websocket deadline/ownership/notification groups passed\n";return 0;
   }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }

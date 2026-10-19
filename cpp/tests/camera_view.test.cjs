@@ -162,6 +162,35 @@ function cameraFixture(ids=['front']) {
   return {view,tracks,video,health,bootstrap,newTrack,time(value){now=value}};
 }
 
+test('presentation metrics include every configured lane without changing critical membership or consuming frames', () => {
+  const f=cameraFixture(['front','aux']);f.bootstrap();f.health(['front']);
+  const before=f.health(['front']);
+  f.time(200);f.video('front').frames++;
+  const snapshot=f.view.presentationSnapshot();
+  assert.equal(snapshot.timestamp_scope,'browser_monotonic');
+  assert.equal(snapshot.cameras.length,2);
+  const front=snapshot.cameras.find(c=>c.camera_id==='front'),aux=snapshot.cameras.find(c=>c.camera_id==='aux');
+  assert.equal(front.critical_for_control,true);assert.equal(aux.critical_for_control,false);
+  assert.equal(front.frame_age_ms,34);assert.equal(front.presented_frames,3);
+  for(let i=0;i<20;i++)assert.deepEqual(f.view.presentationSnapshot(),snapshot);
+  assert.equal(f.health(['front']).cameras[0].sample_seq,before.cameras[0].sample_seq+1);
+  assert.equal(f.view.presentationSnapshot().cameras.find(c=>c.camera_id==='front').frame_age_ms,0);
+});
+
+test('presentation age remains stale through invalid frames and resets to unknown with a new track', () => {
+  const f=cameraFixture();
+  assert.equal(f.view.presentationSnapshot().cameras[0].frame_age_ms,null);
+  f.bootstrap();f.time(200);f.tracks.front.muted=true;f.tracks.front.emit('mute');
+  f.time(700);f.video('front').frames++;f.health();
+  const snapshot=f.view.presentationSnapshot().cameras[0];
+  assert.equal(snapshot.frame_age_ms,534);assert.equal(snapshot.track_muted,true);
+  const before=f.health();for(let i=0;i<20;i++)f.view.presentationSnapshot();
+  assert.deepEqual(f.health(),before);
+  f.view.attach('front',f.newTrack());
+  assert.equal(f.view.presentationSnapshot().cameras[0].frame_age_ms,null);
+  f.view.reset();assert.equal(f.view.presentationSnapshot().cameras.length,0);
+});
+
 test('three real mute transitions tolerate two samples and repeated polls never clear or accumulate', () => {
   const f=cameraFixture();f.bootstrap();const track=f.tracks.front;
   f.time(200);track.muted=true;track.emit('mute');

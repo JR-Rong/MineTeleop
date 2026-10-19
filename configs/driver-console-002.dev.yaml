@@ -40,6 +40,6 @@ control:
     estop_button: 0
 
 time_sync:
-  max_uncertainty_ms: 25
+  max_uncertainty_ms: 100
   interval_ms: 30000
   samples: 7

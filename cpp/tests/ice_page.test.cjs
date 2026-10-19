@@ -23,6 +23,9 @@ function deferred() {
 }
 function fixture() {
   const posts = [], peers = [], logs = [], gates = {}, resets = [];
+  const presentation = {sampled_at_monotonic_ms:123, timestamp_scope:'browser_monotonic',
+    frame_age_scope:'since_last_observed_valid_presented_frame_not_capture_latency',
+    cameras:[{camera_id:'fixture-camera',frame_age_ms:7,presented_frames:12}]};
   class Peer {
     constructor(config) { this.config = config; this.added = []; this.connectionState = 'connected'; peers.push(this); }
     close() { this.closed = true; }
@@ -39,7 +42,7 @@ function fixture() {
     lastControlStatusSeq:0,cameraByMid:new Map(),assignedCameraIds:new Set(),previousStats:new Map(),
     remoteCameraIds:[],h265FailureSamples:0,h265FallbackSent:false,
     iceServers:[{urls:['stun:fixture.invalid','turn:fixture.invalid']}],consoleConfig:{ice_transport_policy:'all'},
-    RTCPeerConnection:Peer,cameraView:{configure(){},setConnectionState(){}},webrtcLabel:{},
+    RTCPeerConnection:Peer,cameraView:{configure(){},setConnectionState(){},presentationSnapshot(){return presentation}},webrtcLabel:{},
     updateVcuHandshakeState(){},resetControlProfileSession(){resets.push('profile')},resetControlAuthorityInput(){resets.push('input')},
     offeredVideoCameraIds(){return new Map()},clientLog(event,details){logs.push({event,details})},renderMonitoring(){},
     post:async(route,body)=>{posts.push({route,body}); if (gates.post) await gates.post.promise; return {}},
@@ -54,7 +57,7 @@ function fixture() {
     controlOutcomeSession:{metrics:controlLogic.createControlOutcomeMetrics()},statusPanel:{},formatMetric(){return 'fixture'},
   });
   vm.runInContext(methods, context, {filename:'actual-shipped-ice-methods'});
-  return {context, peers, posts, logs, gates, resets};
+  return {context, peers, posts, logs, gates, resets, presentation};
 }
 const offer = (id, ufrag=id) => ({media_negotiation_id:id,sdp:`v=0\r\na=ice-ufrag:${ufrag}\r\n`,media_tracks:[]});
 const candidate = (id, ufrag=id, type='host') => ({media_negotiation_id:id,usernameFragment:ufrag,
@@ -67,6 +70,27 @@ test('ICE-PAGE-001', async()=>{
   await f.context.startFromOffer(offer('attempt-a'));
   assert.equal(f.peers[0].added.length,1,'matching pre-offer ICE was lost');
   assert.equal(f.context.pendingIce.length,0);
+});
+test('ICE-IP-FAMILY-001', async()=>{
+  const f=fixture();await f.context.startFromOffer(offer('ipv6'));
+  const remote={...candidate('ipv6'),candidate:'candidate:v6 1 UDP 100 2001:db8::2 9000 typ host'};
+  await f.context.addIce(remote);
+  const local={...candidate('ipv6'),candidate:'candidate:v6 1 udp 100 2001:db8::1 9001 typ host'};
+  f.peers[0].onicecandidate({candidate:{toJSON:()=>local}});await Promise.resolve();
+  assert.equal(f.peers[0].added[0].candidate,remote.candidate,'diagnostics changed candidate forwarding');
+  for(const event of ['webrtc_remote_ice_candidate_applied','webrtc_local_ice_candidate_discovered']) {
+    const value=f.logs.find(x=>x.event===event);assert(value,event);
+    assert.equal(value.details.address_family,'ipv6');assert.equal(value.details.candidate_type,'host');
+    assert(!JSON.stringify(value).includes('2001:db8'),'diagnostic leaked full address');
+  }
+  const report=new Map([['l',{type:'local-candidate',candidateType:'host',protocol:'udp',address:'peer.local'}],
+    ['r',{type:'remote-candidate',candidateType:'host',protocol:'udp',address:'2001:db8::2'}],
+    ['p',{id:'p',type:'candidate-pair',state:'waiting',localCandidateId:'l',remoteCandidateId:'r'}]]);
+  const evidence=controlLogic.iceConnectivity(report,null);
+  assert.equal(evidence.candidate_families.local['host/udp/mdns'],1);
+  assert.equal(evidence.candidate_families.remote['host/udp/ipv6'],1);
+  assert.equal(evidence.pairs[0].remote_address_family,'ipv6');
+  assert.equal(evidence.pairs[0].selected,false,'diagnostics promoted an unselected path');
 });
 test('ICE-PAGE-002', async()=>{
   const f=fixture(); await f.context.startFromOffer(offer('a')); const old=f.peers[0];
@@ -200,6 +224,7 @@ test('ICE-PATH-METRICS-001', async()=>{
     ['r',{type:'remote-candidate',candidateType:'relay',protocol:'udp'}]]);
   f.peers[0].stats=report;await f.context.collectMetrics();
   const value=f.posts.find(p=>p.route==='/api/webrtc/metrics').body;
+  assert.deepEqual(value.presentation,f.presentation,'presentation evidence was not included with path metrics');
   assert.equal(value.network_path,'turn_tcp');assert.equal(value.media_transport_rtt_ms,50);
   assert.equal(value.control_rtt_source,'not_measured_by_media_stats');
   assert.equal(value.control_rtt_ms,null,'media RTT falsely populated control latency');

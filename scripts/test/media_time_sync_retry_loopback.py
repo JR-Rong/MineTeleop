@@ -184,14 +184,16 @@ def scenario(binary, output, name, environment):
     config.write_text(json.dumps({
         "vehicle": {"id": "synthetic-vehicle"},
         "cloud": {"signaling_url": f"http://127.0.0.1:{fixture.server_port}"},
-        "runtime": {"control_enabled": name == "over-budget", "media_enabled": True, "teleop_poll_interval_ms": 20},
+        "runtime": {"control_enabled": name == "over-budget", "media_enabled": True, "teleop_poll_interval_ms": 20,
+                    "control_log_commands": name == "good"},
         "control": {"timeout_action": {"deceleration_profile": [
             {"after_ms": 0, "brake": 0.3}, {"after_ms": 500, "brake": 0.6},
             {"after_ms": 1500, "brake": "vehicle_defined_max_safe"}]}},
         "media": {"realtime_profiles": {"synthetic": {"width": 160, "height": 120,
                     "fps": 20, "bitrate_kbps": 200}}},
         "cameras": [{"id": "synthetic-camera", "device": "testsrc", "realtime_profile": "synthetic"}],
-        "field_safety": {"commissioning_mode": "bench", "max_speed_kph": 0, "require_time_sync": True},
+        "field_safety": {"commissioning_mode": "bench", "max_speed_kph": 0, "require_time_sync": True,
+                         "max_time_sync_uncertainty_ms": 25},  # Explicit strict-policy regression, independent of defaults.
         "hardware": {"can": {"interface": "test-no-can"}, "encoding": {}, "network": {}},
         "vehicle_adapter": {"type": "mock"},
         "recording": {"enabled": False}, "upload": {"enabled": False},
@@ -253,6 +255,19 @@ def scenario(binary, output, name, environment):
         assert "loopback-synthetic-device" not in stdout.read_text() + stderr.read_text(), "diagnostics leaked the device token"
         assert not any(value.get("event") in {"vehicle_media_lane_configured", "vehicle_vcu_adapter_ready",
             "vehicle_webrtc_offer_created", "vehicle_recording_attempt_started"} for value in observed), "no session was granted"
+        if name == "good":
+            # Exercise the real supervisor -> media-child signal path while the
+            # child is awaiting a session. SIGTERM must drain its async trace.
+            stop_started = time.monotonic()
+            process.terminate()
+            assert process.wait(timeout=5) == 128 + signal.SIGTERM
+            terminal = events(stdout)
+            batches = [v for v in terminal if v.get("event") == "vehicle_control_trace_batch"]
+            assert batches and batches[-1]["final"] is True, "SIGTERM lost the final diagnostic batch"
+            assert batches[-1]["enqueued_total"] == batches[-1]["emitted_total"]
+            assert batches[-1]["dropped_total"] == batches[-1]["output_error_total"] == 0
+            assert not any(v.get("event") == "vehicle_runtime_child_error" for v in terminal)
+            assert time.monotonic() - stop_started < 5
         return {"scenario": name, "passed": True, "registrations": registered,
                 "time_requests": fixture.time_requests, "elapsed_s": round(time.monotonic() - start, 3)}
     finally:

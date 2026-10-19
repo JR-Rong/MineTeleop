@@ -88,8 +88,8 @@ class LoopbackVehiclePump {
 void allow_qemu_test_scheduler_time_sync(mine_teleop::DriverConfig& config) {
   constexpr int kTestOnlyMaxUncertaintyMs = 2000;
   expect(
-      config.max_time_sync_uncertainty_ms == 25,
-      "QEMU scheduling fixture no longer starts from the production 25ms time-sync default");
+      config.max_time_sync_uncertainty_ms == 100,
+      "QEMU scheduling fixture no longer starts from the production 100ms time-sync default");
   // These integration tests exercise session isolation and upstream auth, not
   // the time-sync safety boundary. QEMU may pause a loopback peer long enough
   // to inflate RTT/2, so only these fixtures receive a test scheduling budget.
@@ -579,7 +579,7 @@ void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
   mine_teleop::DriverConfig config;
   config.driver_id = "driver-console-001"; config.signaling_url = base;
   config.time_sync_interval_ms = 200; config.time_sync_samples = 3;
-  expect(config.intent_lease_ms == 200 && config.max_time_sync_uncertainty_ms == 25, "fixture relaxed a production safety limit");
+  expect(config.intent_lease_ms == 200 && config.max_time_sync_uncertainty_ms == 100, "fixture relaxed a production safety limit");
   {
     mine_teleop::DriverConsoleRuntime driver(config, "vehicle-001", "slow-time-password");
     const auto connected = driver.connect("vehicle-001");
@@ -593,7 +593,7 @@ void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
     delay_ms = 350;
     bool slow_processing_seen = false;
     // Permit bounded candidate retries after real host clock discontinuities;
-    // a complete accepted cohort must still meet the unchanged25ms limit.
+    // a complete accepted cohort must still meet the configured100ms limit.
     const auto software_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     mine_teleop::Json last_slow_sync;
     while (std::chrono::steady_clock::now() < software_deadline && !slow_processing_seen) {
@@ -611,7 +611,7 @@ void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
       slow_processing_seen = slow_time_samples >= config.time_sync_samples * 2 &&
           last_slow_sync.value("synchronized", false) && last_slow_sync.value("anchor_accepted", false) &&
           last_slow_sync.at("sample_count") == config.time_sync_samples &&
-          last_slow_sync.at("uncertainty_ms") <= 25 &&
+          last_slow_sync.at("uncertainty_ms") <= config.max_time_sync_uncertainty_ms &&
           last_slow_sync.at("candidate_generation").get<std::uint64_t>() >= first_candidate + 2;
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
@@ -628,7 +628,7 @@ void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
       expect(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(200), "monitoring blocked on network time samples");
       expect(driver.update_control_intent(declare_native_input_video_sample(neutral)).at("accepted").get<bool>(), "live neutral refresh rejected");
       expect(driver.status().at("native_control").value("intent_fresh", false), "slow time sampling expired refreshed local input");
-      bad_seen = status.at("time_sync").at("uncertainty_ms").get<std::int64_t>() > 25;
+      bad_seen = status.at("time_sync").at("uncertainty_ms").get<std::int64_t>() > config.max_time_sync_uncertainty_ms;
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
     expect(slow_probe_started && bad_seen, "fixture did not produce a slow, untrusted time cohort");
@@ -638,7 +638,7 @@ void test_slow_time_refresh_does_not_block_status_or_expire_live_input() {
     while (std::chrono::steady_clock::now() < recovery_deadline && !recovered) {
       static_cast<void>(driver.update_control_intent(declare_native_input_video_sample(neutral)));
       const auto status = driver.status();
-      recovered = status.at("time_sync").value("synchronized", false) && status.at("time_sync").at("uncertainty_ms") <= 25;
+      recovered = status.at("time_sync").value("synchronized", false) && status.at("time_sync").at("uncertainty_ms") <= config.max_time_sync_uncertainty_ms;
       expect(status.at("session_id") == session && status.at("control_session_generation") == generation,
           "time recovery disconnected or replaced the active control session");
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
@@ -665,7 +665,7 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
       {{"native_control_capabilities", mine_teleop::kNativeControlCapabilities}, {"vehicle_id", "vehicle-001"}, {"device_token", "offline-page-device"}, {"connection_id", "offline-page-vehicle"}});
   mine_teleop::DriverConfig config;
   config.driver_id = "driver-console-001"; config.signaling_url = cloud_base;
-  expect(config.intent_lease_ms == 200 && config.max_time_sync_uncertainty_ms == 25,
+  expect(config.intent_lease_ms == 200 && config.max_time_sync_uncertainty_ms == 100,
       "offline input integration changed a production safety budget");
   auto driver = std::make_shared<mine_teleop::DriverConsoleRuntime>(config, "vehicle-001", "offline-page-password");
   const auto connected = driver->connect("vehicle-001");
@@ -1257,8 +1257,8 @@ void test_driver_time_sync_uncertainty_fails_closed_at_production_default() {
   config.driver_id = "driver-console-001";
   config.signaling_url = "http://127.0.0.1:" + std::to_string(server.port());
   expect(
-      config.max_time_sync_uncertainty_ms == 25,
-      "driver time-sync fail-closed test no longer uses the production 25ms default");
+      config.max_time_sync_uncertainty_ms == 100,
+      "driver time-sync fail-closed test no longer uses the production 100ms default");
 
   std::string login_failure;
   mine_teleop::DriverConsoleRuntime login_runtime(config, "vehicle-001", "dev-password");
@@ -1277,11 +1277,11 @@ void test_driver_time_sync_uncertainty_fails_closed_at_production_default() {
   server.stop();
 
   expect(
-      login_failure.find("exceeds limit 25ms") != std::string::npos,
-      "driver login did not fail closed on deterministic time-sync uncertainty above 25ms");
+      login_failure.find("exceeds limit 100ms") != std::string::npos,
+      "driver login did not fail closed on deterministic time-sync uncertainty above 100ms");
   expect(
-      connect_failure.find("exceeds limit 25ms") != std::string::npos,
-      "driver connect did not fail closed on deterministic time-sync uncertainty above 25ms");
+      connect_failure.find("exceeds limit 100ms") != std::string::npos,
+      "driver connect did not fail closed on deterministic time-sync uncertainty above 100ms");
   expect(time_samples == 14, "driver time-sync fail-closed test did not collect two complete sample sets");
   expect(login_requests == 0, "driver authentication ran before unacceptable time synchronization was rejected");
   expect(
@@ -2134,7 +2134,7 @@ void test_driver_gamepad_config() {
       field.browser_event_log_max_bytes == 16 * 1024 * 1024 &&
           field.browser_event_log_files == 4,
       "field driver log rotation capacity is too small for batched command traces");
-  expect(field.max_time_sync_uncertainty_ms == 25, "field driver time synchronization limit is not 25ms");
+  expect(field.max_time_sync_uncertainty_ms == 100, "field driver time synchronization limit is not 100ms");
   expect(
       field.control_limits.initial_target_speed_kph == 5.0,
       "field driver initial target speed changed");
@@ -2818,7 +2818,7 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
   const auto worker = cpp_function_contract(source, "void control_trace_worker_loop_impl()");
   const auto trace_output = cpp_function_contract(source, "void write_control_trace_batch_line(");
   const auto stop_worker = cpp_function_contract(source, "void stop_control_trace_worker()");
-  const auto run = cpp_function_contract(source, "Json run(int frame_count, int duration_ms, int capture_interval_ms)");
+  const auto run = cpp_function_contract(source, "Json run(int frame_count, int duration_ms, int capture_interval_ms, std::stop_token token)");
   const auto callback_timestamp = handler.find("callback_entered_at_utc_ms = signaling.now_ms()");
   const auto command_parse = handler.find("auto command = ControlCommand::from_json(message)");
   const auto lock_wait_started = handler.find("control_mutex_wait_started_monotonic_ms = steady_now_ms()");
@@ -2922,8 +2922,9 @@ void test_vehicle_control_command_trace_is_bounded_async_and_timed() {
 
   expect(
       source.find("kControlTraceQueueCapacity = 256") != std::string::npos &&
-          enqueue.find("std::try_to_lock") != std::string::npos &&
-          enqueue.find("kControlTraceQueueCapacity") != std::string::npos &&
+          enqueue.find("control_trace_queue.try_push") != std::string::npos &&
+          enqueue.find("control_trace_mutex") == std::string::npos &&
+          source.find("DiagnosticQueue<Json, kControlTraceQueueCapacity>") != std::string::npos &&
           enqueue.find("note_control_trace_drop()") != std::string::npos,
       "control trace producer does not use a bounded non-blocking queue");
   expect(
@@ -3337,6 +3338,48 @@ void write_text_file(const std::filesystem::path& path, std::string_view value) 
   expect(output.good(), "cannot create test file: " + path.string());
   output << value;
   expect(output.good(), "cannot write test file: " + path.string());
+}
+
+void test_time_sync_default_and_explicit_override() {
+  const auto root = std::filesystem::temp_directory_path() /
+      ("mine-teleop-time-sync-default-" + mine_teleop::random_token(6));
+  std::filesystem::create_directories(root);
+  try {
+    const auto driver_path = root / "driver.yaml";
+    const std::string driver_base = "driver:\n  id: default-test\ncloud:\n  signaling_url: http://127.0.0.1:8765/signaling\n";
+    write_text_file(driver_path, driver_base);
+    const auto driver = mine_teleop::load_driver_config(driver_path.string());
+    const auto vehicle = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+    expect(mine_teleop::DriverConfig{}.max_time_sync_uncertainty_ms == 100 &&
+        mine_teleop::FieldSafetyConfig{}.max_time_sync_uncertainty_ms == 100 &&
+        driver.max_time_sync_uncertainty_ms == 100 &&
+        vehicle.field_safety.max_time_sync_uncertainty_ms == 100,
+        "omitted time-sync limits must use 100ms on both ends");
+    mine_teleop::TimeSyncStatus clock;
+    clock.synchronized = true;
+    for (const auto limit : {driver.max_time_sync_uncertainty_ms, vehicle.field_safety.max_time_sync_uncertainty_ms}) {
+      clock.uncertainty_ms = 100;
+      expect(clock.acceptable(limit), "100ms boundary was rejected");
+      clock.uncertainty_ms = 101;
+      expect(!clock.acceptable(limit), "101ms uncertainty was accepted");
+    }
+    write_text_file(driver_path, driver_base + "time_sync:\n  max_uncertainty_ms: 25\n");
+    const auto vehicle_path = root / "vehicle.yaml";
+    auto vehicle_yaml = read_text_file("configs/vehicle-agent.dev.yaml");
+    const auto position = vehicle_yaml.find("field_safety:\n");
+    expect(position != std::string::npos, "vehicle fixture has no safety section");
+    vehicle_yaml.insert(position + std::string("field_safety:\n").size(), "  max_time_sync_uncertainty_ms: 25\n");
+    write_text_file(vehicle_path, vehicle_yaml);
+    expect(mine_teleop::load_driver_config(driver_path.string()).max_time_sync_uncertainty_ms == 25 &&
+        mine_teleop::load_vehicle_config(vehicle_path.string()).field_safety.max_time_sync_uncertainty_ms == 25,
+        "explicit stricter time-sync policy was overwritten by defaults");
+    clock.uncertainty_ms = 26;
+    expect(!clock.acceptable(25), "explicit 25ms policy no longer rejects 26ms");
+  } catch (...) {
+    std::filesystem::remove_all(root);
+    throw;
+  }
+  std::filesystem::remove_all(root);
 }
 
 void test_driver_brake_limit_config_validation() {
@@ -8348,6 +8391,7 @@ int main(int argc, char** argv) {
       {"local_http_pending_approval_release_requires_operation_owner_and_generation", test_local_http_pending_approval_release_requires_operation_owner_and_generation},
       {"control_page_contract", test_control_page_contract},
       {"driver_gamepad_config", test_driver_gamepad_config},
+      {"time_sync_default_and_explicit_override", test_time_sync_default_and_explicit_override},
       {"vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start",
        test_vehicle_control_status_sequence_stays_monotonic_during_delayed_adapter_start},
       {"stale_control_data_channel_callbacks_are_fail_silent",

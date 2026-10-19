@@ -2,6 +2,8 @@
 #include "mine_teleop/session_logs.hpp"
 #include "mine_teleop/control_logic_js.hpp"
 #include "mine_teleop/detail/console_assets.hpp"
+#include "mine_teleop/detail/diagnostic_queue.hpp"
+#include "mine_teleop/detail/native_control_dispatch.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -21,6 +23,7 @@
 #if defined(__APPLE__)
 #include <CommonCrypto/CommonHMAC.h>
 #include <Security/Security.h>
+#include <pthread/qos.h>
 #else
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -171,16 +174,12 @@ class AsyncControlTrace {
       return;
     }
     try {
-      std::unique_lock lock(mutex_, std::try_to_lock);
-      if (!lock.owns_lock() || stop_requested_ || queue_.size() >= kQueueCapacity) {
+      if (!queue_.try_push(std::move(record))) {
         dropped_total_.fetch_add(1, std::memory_order_relaxed);
         cv_.notify_one();
         return;
       }
-      queue_.push_back(std::move(record));
-      enqueued_total_.fetch_add(1, std::memory_order_relaxed);
-      const bool full_batch = queue_.size() >= kBatchMaxRecords;
-      lock.unlock();
+      const bool full_batch = queue_.pending() >= kBatchMaxRecords;
       if (full_batch) cv_.notify_one();
     } catch (...) {
       dropped_total_.fetch_add(1, std::memory_order_relaxed);
@@ -195,6 +194,7 @@ class AsyncControlTrace {
       std::lock_guard lock(mutex_);
       if (!stop_requested_) {
         stop_requested_ = true;
+        queue_.close();
         notify = true;
       }
     }
@@ -222,14 +222,13 @@ class AsyncControlTrace {
               lock,
               std::chrono::seconds(1),
               [this] {
-                return stop_requested_ || queue_.size() >= kBatchMaxRecords;
+                return stop_requested_ || queue_.pending() >= kBatchMaxRecords;
               });
-          const auto count = std::min(queue_.size(), kBatchMaxRecords);
-          for (std::size_t index = 0; index < count; ++index) {
-            commands.push_back(std::move(queue_.front()));
-            queue_.pop_front();
+          Json record;
+          for (std::size_t index = 0; index < kBatchMaxRecords && queue_.try_pop(record); ++index) {
+            commands.push_back(std::move(record));
           }
-          final = stop_requested_ && queue_.empty();
+          final = stop_requested_ && queue_.drained();
         }
 
         const auto command_count = commands.size();
@@ -255,7 +254,7 @@ class AsyncControlTrace {
                 {"queue_capacity", kQueueCapacity},
                 {"commands", std::move(commands)},
                 {"observations", std::move(observations)},
-                {"enqueued_total", enqueued_total_.load(std::memory_order_relaxed)},
+                {"enqueued_total", queue_.accepted_total()},
                 {"emitted_total", next_emitted_total},
                 {"dropped_since_last", dropped_total - reported_dropped_total},
                 {"dropped_total", dropped_total},
@@ -279,11 +278,10 @@ class AsyncControlTrace {
   Observer observer_;
   std::mutex mutex_;
   std::condition_variable cv_;
-  std::deque<Json> queue_;
+  detail::DiagnosticQueue<Json, kQueueCapacity> queue_;
   std::thread worker_;
   bool stop_requested_{false};
   std::atomic<bool> accepting_{false};
-  std::atomic<std::uint64_t> enqueued_total_{0};
   std::atomic<std::uint64_t> dropped_total_{0};
 };
 
@@ -1402,7 +1400,7 @@ function renderRecordingStatus(){
 function driverTimeSyncReady(){
   const sync=latestRuntimeStatus.time_sync||{},limit=Number(consoleConfig.max_time_sync_uncertainty_ms);
   return sync.synchronized===true&&Number.isFinite(Number(sync.uncertainty_ms))&&
-      Number(sync.uncertainty_ms)>=0&&Number(sync.uncertainty_ms)<=(Number.isFinite(limit)?limit:25)
+      Number(sync.uncertainty_ms)>=0&&Number(sync.uncertainty_ms)<=(Number.isFinite(limit)?limit:100)
 }
 function driverControlTimeSyncReady(){
   // The native gate owns three-candidate tolerance and absence deadlines.
@@ -1703,8 +1701,8 @@ async function addIce(candidate){
     pendingIce.push(candidate);return;
   }
   const instance=peer,epoch=mediaPeerEpoch,session=nativeControlSessionId,generation=nativeControlSessionGeneration;
-  try{await instance.addIceCandidate({candidate:candidate.candidate,sdpMid:candidate.sdpMid,sdpMLineIndex:candidate.sdpMLineIndex,usernameFragment:candidate.usernameFragment})}
-  catch(error){if(currentMediaPeer(instance,epoch,session,generation))throw error}
+  try{await instance.addIceCandidate({candidate:candidate.candidate,sdpMid:candidate.sdpMid,sdpMLineIndex:candidate.sdpMLineIndex,usernameFragment:candidate.usernameFragment});if(currentMediaPeer(instance,epoch,session,generation))clientLog('webrtc_remote_ice_candidate_applied',controlLogic.iceCandidateSummary(candidate))}
+  catch(error){if(currentMediaPeer(instance,epoch,session,generation)){clientLog('webrtc_remote_ice_candidate_error',{...controlLogic.iceCandidateSummary(candidate),error_name:error.name||'Error'});throw error}}
 }
 function offeredVideoCameraIds(sdp,tracks){const mapping=new Map(),cameraIds=(tracks||[]).map(track=>track.camera_id).filter(Boolean);let cameraIndex=0;for(const section of String(sdp||'').split(/\r?\nm=/).slice(1)){if(!section.startsWith('video '))continue;const match=section.match(/(?:^|\r?\n)a=mid:([^\r\n]+)/),cameraId=cameraIds[cameraIndex++];if(match&&cameraId)mapping.set(match[1],cameraId)}return mapping}
 const cameraView=MineTeleopCameraView.mount(cameraGrid);
@@ -1823,7 +1821,7 @@ async function startFromOffer(offer){
       renderMonitoring();
     };
   };
-  nextPeer.onicecandidate=e=>{if(!current()||!e.candidate)return;post('/api/webrtc/ice-candidate',{source_session_id:sourceSession,source_control_session_generation:sourceGeneration,media_negotiation_id:nextScope.id,candidate:e.candidate.toJSON()}).catch(error=>{if(current())clientLog('webrtc_ice_signal_error',{stage:'candidate',error:error.message})})};
+  nextPeer.onicecandidate=e=>{if(!current()||!e.candidate)return;const candidate=e.candidate.toJSON();clientLog('webrtc_local_ice_candidate_discovered',controlLogic.iceCandidateSummary(candidate));post('/api/webrtc/ice-candidate',{source_session_id:sourceSession,source_control_session_generation:sourceGeneration,media_negotiation_id:nextScope.id,candidate}).catch(error=>{if(current())clientLog('webrtc_ice_signal_error',{stage:'candidate',error:error.message})})};
   nextPeer.ontrack=e=>{if(!current()||e.track.kind!=='video')return;const mid=e.transceiver.mid||'',id=offeredCameraByMid.get(mid)||remoteCameraIds.find(cameraId=>!assignedCameraIds.has(cameraId))||mid||e.track.id;assignedCameraIds.add(id);cameraByMid.set(mid,id);attach(id,e.track)};
   try{
     await nextPeer.setRemoteDescription({type:'offer',sdp:offer.sdp});
@@ -1842,7 +1840,8 @@ const controlTransportCourier=MineTeleopControlTransport.createCourier({
     session:nativeControlSessionId,generation:nativeControlSessionGeneration,ui:uiInstanceId,uiEpoch:nativeControlUiEpoch,
     attempt:mediaOfferScope.id,...MineTeleopControlTransport.dataChannelRoute(peer,controlChannel,latestRuntimeStatus.native_control.control_transport.mode,latestRuntimeStatus.native_control.control_transport.experimental_enabled===true)}:null,
   post,now:()=>performance.now(),onStatus:message=>applyVehicleControlMessage(message,true),
-  send:(frame,bytes)=>{if(controlChannel?.readyState==='open'&&Number(controlChannel.bufferedAmount)===0)controlChannel.send(bytes)},
+  onTrace:record=>{if(!controlTraceEnabled)return;const item={...record,browser_event_at_utc_ms:Date.now()};if(record.session_id!==controlTraceScope.session_id){emitControlTraceBatch('late_courier',{session_id:record.session_id},[item],createControlTraceSummary(),false);return}controlTraceBuffer.push(item);if(controlTraceBuffer.length>=48)flushControlTrace('capacity')},
+  send:(frame,bytes)=>{const channel=controlChannel;if(channel?.readyState!=='open')return {reason:'channel_not_open'};if(Number(channel.bufferedAmount)!==0)return {reason:'channel_buffer_not_empty'};channel.send(bytes);return true},
   onBoundary:()=>{clearControlInput(false,'control_transport_boundary',true);lastNativeIntentSnapshot=''},
 });
 setInterval(()=>controlTransportCourier.tick().catch(error=>clientLog('control_transport_bridge_error',{error:error.message})),25);
@@ -1892,6 +1891,7 @@ async function collectMetrics(){
   const controlOutcomes={...controlOutcomeSession.metrics};
   const metrics={media_negotiation_id:typeof mediaOfferScope==='undefined'?'':mediaOfferScope?.id||'',network_path:networkPath,media_transport_rtt_ms:rtt===null?null:rtt*1000,control_rtt_source:'not_measured_by_media_stats',ice_connectivity:controlLogic.iceConnectivity(report,selectedPair),sampled_at_ms:sampledAt,connection_state:peer.connectionState,codec:mediaStatus.codec||'',backend:mediaStatus.backend||'',control_rtt_ms:null,selected_candidate_pair:selectedPair?{id:selectedPair.id,selection_method:selection.method,state:selectedPair.state,nominated:selectedPair.nominated??null,transport_id:selection.transport?.id??selectedPair.transportId??null,local_candidate_type:report.get(selectedPair.localCandidateId)?.candidateType??null,remote_candidate_type:report.get(selectedPair.remoteCandidateId)?.candidateType??null,protocol:report.get(selectedPair.localCandidateId)?.protocol??null,relay_protocol:report.get(selectedPair.localCandidateId)?.relayProtocol??null,current_round_trip_time_s:selectedPair.currentRoundTripTime??null,available_outgoing_bitrate_bps:selectedPair.availableOutgoingBitrate??null,bytes_sent:selectedPair.bytesSent??null,bytes_received:selectedPair.bytesReceived??null,requests_sent:selectedPair.requestsSent??null,responses_received:selectedPair.responsesReceived??null}:null,connection_method:connectionMethod,turn_configured:turnConfigured,turn_in_use:turnInUse,time_sync:timeSync,clock_uncertainty_ms:Number(timeSync.uncertainty_ms||0),latency_method:'capture-to-encoded + rtt/2 + receiver-processing (buffer + decode fallback)',control_outcomes:controlOutcomes,control_outcomes_balanced:controlLogic.controlOutcomesBalanced(controlOutcomes),streams,passed:streams.length>0&&streams.every(s=>s.passed)};
   const mediaLogAt=performance.now();
+  metrics.presentation=cameraView.presentationSnapshot();
   metrics.source_session_id=sourceSession;metrics.source_control_session_generation=sourceGeneration;metrics.media_negotiation_id=sourceOfferId;
   if(lastMediaMetricsLogAt===null||mediaLogAt-lastMediaMetricsLogAt>=5000){lastMediaMetricsLogAt=mediaLogAt;clientLog('driver_media_metrics',metrics);clientLog('driver_ice_connectivity',{ice_transport_policy:consoleConfig.ice_transport_policy,ice_connection_state:peer.iceConnectionState,ice_gathering_state:peer.iceGatheringState,...controlLogic.iceConnectivity(report,selectedPair)})}
   await post('/api/webrtc/metrics',metrics);
@@ -2719,6 +2719,10 @@ void SignalingService::close_session(Session& session, std::string_view reason) 
   next_delivery_cursors_.erase(message_key(session.session_id, session.vehicle_id));
   if (session.state != SessionState::Stopping) transition_session(session, SessionState::Stopping, reason);
   transition_session(session, SessionState::Closed, reason);
+  for (const auto& participant : {session.driver_id, session.vehicle_id}) {
+    notify_signaling_recipient(session.session_id, participant);
+    signaling_wakeups_.erase(message_key(session.session_id, participant));
+  }
   remember_log_session(session, now_ms());
 }
 
@@ -3368,6 +3372,15 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       if (observation.state) observation.state->begin(phase, seq);
     };
     const bool transport_protocol = query_value(request, "transport_protocol") == detail::kControlTransportCapability;
+    std::shared_ptr<detail::SocketWakeup> wakeup;
+    if (!send_only || transport_protocol) {
+      wakeup = std::make_shared<detail::SocketWakeup>();
+      std::lock_guard lock(mutex_);
+      static_cast<void>(require_participant(parts[1], participant));
+      auto& subscribers = signaling_wakeups_[message_key(parts[1], participant)];
+      std::erase_if(subscribers, [](const auto& item) { return item.expired(); });
+      subscribers.push_back(wakeup);
+    }
     std::uint64_t last_vehicle_result_sent = 0, last_control_status_sent = 0;
     std::uint64_t last_vehicle_result_epoch_sent = 0, last_control_status_epoch_sent = 0;
     std::int64_t last_lease_expiry_sent = 0;
@@ -3546,7 +3559,7 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       try {
         observe_phase(ControlObservationPhase::Receive);
         received = connection.receive_json(
-            std::chrono::milliseconds(send_only ? 10 : 50));
+            std::chrono::milliseconds(send_only || control_receive_only ? 10 : 50), wakeup.get());
       } catch (const std::exception& error) {
         if (send_only && native_control_trace_) {
           Json failure = {{"stage", "ingress_receive_failed"}, {"trace_session_id", parts[1]},
@@ -3570,7 +3583,8 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
       const auto receive_loop_gap_ms = last_receive_completed_monotonic_ms > 0
           ? std::max<std::int64_t>(0, receive_started_monotonic_ms - last_receive_completed_monotonic_ms) : 0;
       last_receive_completed_monotonic_ms = frame_received_monotonic_ms;
-      if (received.status == WebSocketReceiveStatus::Timeout) continue;
+      if (received.status == WebSocketReceiveStatus::Timeout ||
+          received.status == WebSocketReceiveStatus::Notified) continue;
       if (received.status == WebSocketReceiveStatus::Closed) return true;
       const auto frame_received_at_utc_ms = now_ms();
       try {
@@ -3589,7 +3603,10 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
               detail::ControlTransportStamp::uint(item.at("feedback_transport"), "epoch") : std::uint64_t{0}; };
           if (!statuses.contains(event) || epoch_of(status) > epoch_of(statuses.at(event)) ||
               (epoch_of(status) == epoch_of(statuses.at(event)) && status.at("status").at("control_status_seq").get<std::uint64_t>() >
-              statuses.at(event).at("status").at("control_status_seq").get<std::uint64_t>())) statuses[event] = std::move(status);
+              statuses.at(event).at("status").at("control_status_seq").get<std::uint64_t>())) {
+            statuses[event] = std::move(status);
+            notify_signaling_recipient(session.session_id, session.driver_id);
+          }
           continue;
         }
         if (transport_protocol && control_receive_only && received.message.value("event", "") == "vehicle_control_result") {
@@ -3603,7 +3620,10 @@ bool SignalingService::handle_websocket(SocketHandle socket, const HttpRequest& 
           auto& latest = latest_vehicle_transport_results_[session.session_id];
           if (!latest.is_object() || detail::feedback_transport_epoch(result) > detail::feedback_transport_epoch(latest) ||
               (detail::feedback_transport_epoch(result) == detail::feedback_transport_epoch(latest) &&
-               result.at("result_seq").get<std::uint64_t>() > latest.value("result_seq", std::uint64_t{0}))) latest = std::move(result);
+               result.at("result_seq").get<std::uint64_t>() > latest.value("result_seq", std::uint64_t{0}))) {
+            latest = std::move(result);
+            notify_signaling_recipient(session.session_id, session.driver_id);
+          }
           continue;
         }
         if (!send_only && received.message.value("event", "") == "signaling_delivery_ack") {
@@ -3920,6 +3940,20 @@ std::size_t SignalingService::acknowledge_signaling_messages(
   return acknowledged;
 }
 
+void SignalingService::notify_signaling_recipient(std::string_view session_id, std::string_view recipient) {
+  const auto found = signaling_wakeups_.find(message_key(session_id, recipient));
+  if (found == signaling_wakeups_.end()) return;
+  std::erase_if(found->second, [&](const auto& subscriber) {
+    const auto wakeup = subscriber.lock();
+    if (!wakeup) return true;
+    // The existing bounded receive timeout remains a fallback if a local
+    // notification fails; never roll back or replay an already queued command.
+    if (!wakeup->notify()) try_audit("signaling_wakeup_failed",
+        {{"session_id", session_id}, {"recipient", recipient}});
+    return false;
+  });
+}
+
 Json SignalingService::enqueue_signaling_message(
     std::string_view session_id,
     const Json& value,
@@ -4096,6 +4130,7 @@ Json SignalingService::enqueue_signaling_message(
         cloud_queued_monotonic_ms - cloud_ingress_started_monotonic_ms);
   }
   last_accepted_messages_[sequence_key] = AcceptedMessage{metadata.seq, fingerprint, acknowledgement};
+  notify_signaling_recipient(session_id, recipient);
   if (type == "control_command" && native_control_trace_) {
     native_control_trace_->enqueue({
         {"stage", "ingress_queued"},
@@ -4714,6 +4749,7 @@ ServerResponse SignalingService::handle_post(const HttpRequest& request) {
         config_.control_token_ttl_ms > std::numeric_limits<std::int64_t>::max() - renewed_at_ms
         ? std::numeric_limits<std::int64_t>::max()
         : renewed_at_ms + config_.control_token_ttl_ms;
+    notify_signaling_recipient(session.session_id, session.vehicle_id);
     audit(
         "control_authority_renewed",
         {{"session_id", session.session_id},
@@ -5471,7 +5507,17 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
   int timeout_ms;
   { std::lock_guard lock(mutex_); timeout_ms = control_recovery_timeout_ms_; }
   const auto receipt = control_transport_sender_.note_result(result, now, timeout_ms);
-  if (!receipt.matched) return false;
+  if (!receipt.matched) {
+    // A newer result may have retired the retained send. Preserve the verified
+    // observation without treating it as current feedback or refreshing a lease.
+    if (native_control_trace_)
+      native_control_trace_->enqueue({{"stage", "vehicle_transport_result_unmatched"},
+          {"trace_session_id", session}, {"seq", result.at("command_seq")},
+          {"intent_seq", result.at("intent_seq")}, {"accepted", result.at("accepted")},
+          {"reason", result.at("reason")}, {"transport_admitted", result.at("transport_admitted")},
+          {"return_path", direct_return ? "dc" : "wss"}});
+    return false;
+  }
   const auto seq = result.at("command_seq").get<std::uint64_t>();
   const auto intent = result.at("intent_seq").get<std::uint64_t>();
   const bool accepted = result.at("accepted").get<bool>();
@@ -5497,6 +5543,8 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
   if (rearm) native_control_intent_.invalidate(true);
   if (native_control_trace_) native_control_trace_->enqueue({{"stage", "vehicle_transport_result_received"},
       {"trace_session_id", session}, {"seq", seq}, {"intent_seq", intent}, {"accepted", accepted},
+      {"reason", result.at("reason")}, {"transport_admitted", result.at("transport_admitted")},
+      {"transport_selected", result.at("transport_selected")},
       {"round_trip_ms", receipt.round_trip_ms}, {"return_path", direct_return ? "dc" : "wss"}, {"transport", result.value("control_transport", Json(nullptr))},
       {"authority_epoch", result.at("authority_epoch")}, {"feedback_transport", result.value("feedback_transport", Json(nullptr))}, {"requires_fresh_input", rearm}});
   return rearm;
@@ -5680,7 +5728,8 @@ void DriverConsoleRuntime::consume_feedback_status_locked(const Json& value, std
     control_transport_pending_status_[event] = std::move(status);
 }
 
-Json DriverConsoleRuntime::control_transport_bridge(const Json& input) {
+Json DriverConsoleRuntime::control_transport_bridge(const Json& input, const HttpRequest* request) {
+  const auto handler_entered = monotonic_now_ms();
   std::string session, vehicle, driver, attempt, owner;
   std::uint64_t ui_epoch = 0;
   bool capable = false, feedback_capable = false;
@@ -5700,7 +5749,9 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input) {
     feedback_capable = config_.enable_experimental_direct_authority && feedback_transport_vehicle_capable_;
   }
   if (!input.at("dc_ready").is_boolean()) throw std::invalid_argument("dc_ready must be boolean");
+  const auto transport_lock_started = monotonic_now_ms();
   std::lock_guard transport_lock(control_signaling_websocket_mutex_);
+  const auto transport_lock_acquired = monotonic_now_ms();
   { std::lock_guard lock(mutex_);
     const auto ownership = native_control_intent_.ownership_scope();
     if (session_id_ != session || control_session_generation_ != required_uint64(input, "source_control_session_generation") ||
@@ -5719,8 +5770,20 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input) {
   feedback_transport_enabled_ = capable && feedback_capable;
   control_transport_bridge_attempt_ = attempt; control_transport_bridge_owner_ = owner;
   control_transport_bridge_ui_epoch_ = ui_epoch; control_transport_bridge_seen_ms_ = now;
-  if (input.contains("vehicle_result"))
+  if (input.contains("vehicle_result")) {
     static_cast<void>(consume_vehicle_control_result_locked(input.at("vehicle_result"), session, vehicle, driver, now, true));
+    if (native_control_trace_) native_control_trace_->enqueue({
+        {"stage", "dc_result_bridge_received"}, {"trace_session_id", session},
+        {"seq", input.at("vehicle_result").at("command_seq")},
+        {"result_seq", input.at("vehicle_result").at("result_seq")},
+        {"received_at_utc_ms", clock_.now_ms()}, {"consumed_monotonic_ms", now},
+        {"http_received_monotonic_ms", request && request->received_at_monotonic_ms ? Json(*request->received_at_monotonic_ms) : Json(nullptr)},
+        {"before_handler_ms", request && request->received_at_monotonic_ms ? Json(std::max<std::int64_t>(0, handler_entered - *request->received_at_monotonic_ms)) : Json(nullptr)},
+        {"scope_validation_ms", transport_lock_started - handler_entered},
+        {"transport_mutex_wait_ms", transport_lock_acquired - transport_lock_started},
+        {"scope_recheck_ms", now - transport_lock_acquired},
+        {"result_processing_ms", monotonic_now_ms() - now}});
+  }
   if (input.contains("vehicle_statuses")) {
     const auto& statuses = input.at("vehicle_statuses");
     if (!statuses.is_array() || statuses.size() > 4) throw std::invalid_argument("feedback status batch exceeds four kinds");
@@ -6382,6 +6445,28 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
       if (envelope.at("payload").contains("control_transport") || envelope.at("payload").contains("feedback_request"))
         envelope["payload"]["native_mac"] = detail::transport_message_mac(envelope.at("payload"), transport_signing_key, false);
       if (emergency_payload.is_object()) envelope["payload"] = emergency_payload; // Exact same signed bytes on both carriers.
+      // ACK processing and transport preparation can outlive an input lease.
+      // A release, re-arm or newer input must retire this unsent snapshot too.
+      const auto dispatch_checked_ms = monotonic_now_ms();
+      const auto dispatch_sample = native_control_intent_.sample(dispatch_checked_ms);
+      const auto dispatch_rejection = detail::native_control_dispatch_rejection(
+          sample, dispatch_sample, dispatch_checked_ms - sample_started_monotonic_ms,
+          native_control_intent_.lease_ms());
+      if (!dispatch_rejection.empty()) {
+        if (native_control_trace_) {
+          trace_record["stage"] = "send_skipped";
+          trace_record["reason"] = dispatch_rejection;
+          trace_record["dispatch_check_monotonic_ms"] = dispatch_checked_ms;
+          trace_record["dispatch_intent_seq"] = dispatch_sample.intent.intent_seq;
+          trace_record["dispatch_intent_age_ms"] = dispatch_sample.age_ms;
+          trace_record["dispatch_intent_fresh"] = dispatch_sample.fresh;
+          trace_record["dispatch_requires_fresh_input"] = dispatch_sample.requires_fresh_input;
+          trace_record["trace_completed_at_utc_ms"] = clock_.now_ms();
+          trace_record["trace_completed_monotonic_ms"] = dispatch_checked_ms;
+          native_control_trace_->enqueue(std::move(trace_record));
+        }
+        return false;
+      }
       const auto actual_path = command.estop ? detail::ControlPath::Wss : control_transport_sender_.path();
       if (actual_path == detail::ControlPath::DataChannel) {
         // One latest slot: a blocked page cannot accumulate or retimestamp
@@ -6394,7 +6479,24 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
       } else {
         if (!control_signaling_websocket_ || !control_signaling_websocket_->connected())
           throw std::runtime_error("WSS fallback unavailable after direct path boundary");
-        control_signaling_websocket_->send_json(envelope, std::chrono::milliseconds(20), stop);
+        try {
+          control_signaling_websocket_->send_json(envelope, std::chrono::milliseconds(20), stop);
+        } catch (const WebSocketSendNotStarted& error) {
+          // Nothing entered the stream: do not manufacture a link failure or
+          // ACK progress. The next cycle samples current intent; the existing
+          // input, ACK and vehicle command-gap watchdogs keep their deadlines.
+          ++native_control_send_failures_;
+          { std::lock_guard lock(native_control_status_mutex_); native_control_last_error_ = error.what(); }
+          if (native_control_trace_) {
+            trace_record["stage"] = "send_skipped";
+            trace_record["reason"] = "preparation_deadline_expired_no_io";
+            trace_record["send_io"] = control_signaling_websocket_->last_send_diagnostics();
+            trace_record["trace_completed_at_utc_ms"] = clock_.now_ms();
+            trace_record["trace_completed_monotonic_ms"] = monotonic_now_ms();
+            native_control_trace_->enqueue(std::move(trace_record));
+          }
+          return false;
+        }
         if (native_control_trace_) trace_record["send_io"] = control_signaling_websocket_->last_send_diagnostics();
       }
       send_completed_at_utc_ms = clock_.now_ms();
@@ -6498,6 +6600,22 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
 }
 
 void DriverConsoleRuntime::native_control_sender_loop(std::stop_token stop_token) {
+#if defined(__APPLE__)
+  // Each short input/ACK exchange is latency-sensitive interactive work. The
+  // default pthread QoS can defer it while unrelated desktop work runs; keep
+  // the existing wall-clock deadlines even if this scheduling hint fails.
+  const auto scheduling_result = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+  qos_class_t effective_qos = QOS_CLASS_UNSPECIFIED;
+  int relative_priority = 0;
+  const auto scheduling_query_result = pthread_get_qos_class_np(
+      pthread_self(), &effective_qos, &relative_priority);
+  if (native_control_trace_) native_control_trace_->enqueue({
+      {"stage", "sender_thread_scheduling"}, {"platform", "macos"},
+      {"requested_qos", static_cast<int>(QOS_CLASS_USER_INTERACTIVE)},
+      {"set_result", scheduling_result}, {"query_result", scheduling_query_result},
+      {"effective_qos", static_cast<int>(effective_qos)},
+      {"relative_priority", relative_priority}});
+#endif
   const auto period = std::chrono::milliseconds(
       std::max(1, static_cast<int>(std::llround(1000.0 / config_.rate_hz))));
   auto next_send = std::chrono::steady_clock::now();
@@ -8502,7 +8620,7 @@ ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
     }
     if (request.method == "POST" && request.path == "/api/control-transport/management") return ServerResponse::json(200, runtime_->send_control_management(request.json_body()));
     if (request.method == "POST" && request.path == "/api/control-transport/emergency") return ServerResponse::json(200, runtime_->emergency_stop_bridge(request.json_body()));
-    if (request.method == "POST" && request.path == "/api/control-transport/bridge") return ServerResponse::json(200, runtime_->control_transport_bridge(request.json_body()));
+    if (request.method == "POST" && request.path == "/api/control-transport/bridge") return ServerResponse::json(200, runtime_->control_transport_bridge(request.json_body(), &request));
     if (request.method == "POST" && request.path == "/api/control-profile") return ServerResponse::json(200, runtime_->prepare_control_profile(request.json_body()));
     if (request.method == "POST" && request.path == "/api/control-intent") {
       const auto input = request.json_body();

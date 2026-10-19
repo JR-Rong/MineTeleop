@@ -256,6 +256,8 @@ class SignalingService {
       std::string_view session_id,
       const Json& value,
       std::optional<std::string_view> authenticated_actor = std::nullopt);
+  // Called with mutex_ held, after publishing the recipient's new state.
+  void notify_signaling_recipient(std::string_view session_id, std::string_view recipient);
   [[nodiscard]] Json take_signaling_messages(
       std::string_view session_id,
       std::string_view recipient,
@@ -319,6 +321,7 @@ class SignalingService {
   std::unordered_set<std::string> revoked_drivers_;
   std::unordered_map<std::string, Session> sessions_;
   std::unordered_map<std::string, std::vector<Message>> messages_;
+  std::unordered_map<std::string, std::vector<std::weak_ptr<detail::SocketWakeup>>> signaling_wakeups_;
   std::unordered_map<std::string, Message> latest_control_messages_;
   std::unordered_map<std::string, Json> latest_vehicle_control_feedback_;
   std::unordered_map<std::string, Json> latest_vehicle_transport_results_;
@@ -388,7 +391,7 @@ struct DriverConfig {
   int rate_hz{20};
   int intent_lease_ms{200};
   int estop_hold_ms{500};
-  int max_time_sync_uncertainty_ms{25};
+  int max_time_sync_uncertainty_ms{100};
   int time_sync_interval_ms{30000};
   int time_sync_samples{7};
   GamepadConfig gamepad;
@@ -429,7 +432,7 @@ class DriverConsoleRuntime {
   [[nodiscard]] Json prepare_control_profile(const Json& input);
   [[nodiscard]] Json send_control(const Json& input);
   [[nodiscard]] Json send_control_management(const Json& input);
-  [[nodiscard]] Json control_transport_bridge(const Json& input);
+  [[nodiscard]] Json control_transport_bridge(const Json& input, const HttpRequest* request = nullptr);
   [[nodiscard]] Json emergency_stop_bridge(const Json& input);
   [[nodiscard]] bool consume_vehicle_control_result_locked(const Json& result, std::string_view session,
       std::string_view vehicle, std::string_view driver, std::int64_t now, bool direct_return = false);

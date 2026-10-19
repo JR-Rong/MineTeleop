@@ -1,5 +1,6 @@
 #include "mine_teleop/core.hpp"
 #include "mine_teleop/detail/native_control_acknowledgement_window.hpp"
+#include "mine_teleop/detail/native_control_dispatch.hpp"
 
 #include <cstdint>
 #include <exception>
@@ -571,10 +572,58 @@ void test_session016_recorded_ack_drain_preserves_brake_and_fresh_neutral() {
   held.intent_seq=5;expect(store.update(held,6504126).accepted,"field new press failed");
 }
 
+void test_dispatch_revalidates_input_after_preparation() {
+  using mine_teleop::detail::native_control_dispatch_rejection;
+  mine_teleop::NativeControlIntentStore store(200);
+  auto neutral = neutral_intent(1);
+  expect(store.update(neutral, 3936388760).accepted, "neutral rejected");
+  auto motion = neutral; motion.intent_seq = 2; motion.throttle = 0.5;
+  expect(store.update(motion, 3936388774).accepted, "motion rejected");
+  const auto prepared = store.sample(3936388880);
+  expect(prepared.fresh && prepared.age_ms == 106, "field preparation did not begin fresh");
+  const auto expired = store.sample(3936389027);
+  expect(!native_control_dispatch_rejection(prepared, expired, 147, 200).empty(),
+      "session37 ACK delay dispatched input whose 200ms lease had expired");
+  expect(expired.requires_fresh_input && expired.intent.throttle == 0,
+      "dispatch recheck did not retain the existing expiry interlock");
+  expect(native_control_dispatch_rejection(expired, store.sample(3936389030), 3, 200).empty(),
+      "current fail-closed neutral heartbeat was blocked");
+
+  store.reset();
+  expect(store.update(neutral, 100).accepted && store.update(motion, 110).accepted,
+      "fresh motion setup failed");
+  const auto fresh = store.sample(120);
+  expect(store.update(motion, 160).accepted, "same input renewal rejected");
+  expect(native_control_dispatch_rejection(fresh, store.sample(180), 60, 200).empty(),
+      "ordinary duplicate input renewal retired a valid frame");
+  expect(store.update(motion, 300).accepted, "later renewal rejected");
+  expect(native_control_dispatch_rejection(fresh, store.sample(320), 200, 200) ==
+      "prepared_input_expired_no_io", "new refresh retimestamped an old prepared frame");
+  neutral.intent_seq = 3;
+  expect(store.update(neutral, 321).accepted, "release rejected");
+  expect(!native_control_dispatch_rejection(fresh, store.sample(322), 60, 200).empty(),
+      "released throttle was dispatched from a prior snapshot");
+
+  auto other = neutral_intent(1); other.ui_instance_id = "replacement-page";
+  const auto released = store.sample(322);
+  expect(store.update(other, 323, released.ui_control_epoch, true).accepted, "takeover failed");
+  expect(!native_control_dispatch_rejection(released, store.sample(324), 2, 200).empty(),
+      "retired page snapshot survived takeover");
+  auto estop = other; estop.intent_seq = 2; estop.estop = true;
+  const auto before_stop = store.sample(324);
+  expect(store.update(estop, 325).accepted, "ESTOP rejected");
+  const auto stopped = store.sample(326);
+  expect(!native_control_dispatch_rejection(before_stop, stopped, 2, 200).empty(),
+      "ordinary frame was dispatched after ESTOP preemption");
+  expect(native_control_dispatch_rejection(stopped, store.sample(1000), 674, 200).empty(),
+      "latched ESTOP lost priority due to ordinary input expiry");
+}
+
 }  // namespace
 
 int main() {
   const TestCase tests[] = {
+      {"dispatch_revalidates_input_after_preparation", test_dispatch_revalidates_input_after_preparation},
       {"session016_recorded_ack_drain",test_session016_recorded_ack_drain_preserves_brake_and_fresh_neutral},
       {"raw_video_sample_is_preserved_separately_from_input_and_qualified_video", test_raw_video_sample_is_preserved_separately_from_input_and_qualified_video},
       {"ingress_anomaly_samples_are_distinct_and_timeout_is_independent", test_ingress_anomaly_samples_are_distinct_and_timeout_is_independent},

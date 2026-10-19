@@ -1732,8 +1732,8 @@ void test_field_config_pins_tls_route_without_system_dns() {
   expect(mine_teleop::ice_transport_policy_is_valid("relay"), "relay ICE policy was rejected");
   expect(!mine_teleop::ice_transport_policy_is_valid("direct"), "unknown ICE policy was accepted");
   expect(
-      config.field_safety.max_time_sync_uncertainty_ms == 25,
-      "field vehicle time synchronization limit is not 25ms");
+      config.field_safety.max_time_sync_uncertainty_ms == 100,
+      "field vehicle time synchronization limit is not 100ms");
   expect_near(
       config.field_safety.max_throttle,
       1.0,

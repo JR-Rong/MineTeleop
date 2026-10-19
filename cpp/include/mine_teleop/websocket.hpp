@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <stop_token>
@@ -23,6 +24,15 @@ enum class WebSocketReceiveStatus {
   Message,
   Timeout,
   Closed,
+  Notified,
+};
+
+// Preparation exhausted the caller's budget before any backend write or
+// deadline-driven socket interruption. The stream remains reusable; callers
+// must discard this message, never replay it as a fresh command.
+class WebSocketSendNotStarted : public std::runtime_error {
+ public:
+  WebSocketSendNotStarted() : std::runtime_error("websocket send deadline expired before I/O") {}
 };
 
 struct WebSocketReceiveResult {
@@ -41,6 +51,22 @@ struct WebSocketReceiveResult {
 namespace detail {
 // Owns a duplicate descriptor; never closes or calls curl on the original.
 [[nodiscard]] std::function<void()> websocket_socket_interrupter(SocketHandle socket);
+
+// A coalesced, local-only notification that can share a socket poll. It owns
+// both endpoints; callers retain it while either notifying or waiting.
+class SocketWakeup {
+ public:
+  SocketWakeup();
+  ~SocketWakeup();
+  SocketWakeup(const SocketWakeup&) = delete;
+  SocketWakeup& operator=(const SocketWakeup&) = delete;
+  [[nodiscard]] bool notify() noexcept;
+  [[nodiscard]] bool consume() noexcept;
+  [[nodiscard]] SocketHandle socket() const noexcept;
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
 }
 [[nodiscard]] std::string signaling_websocket_url(
     std::string_view signaling_url,
@@ -52,7 +78,8 @@ class ServerWebSocketConnection {
  public:
   ServerWebSocketConnection(SocketHandle socket, std::size_t max_message_bytes);
 
-  [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout);
+  [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout,
+      detail::SocketWakeup* wakeup = nullptr);
   void send_json(const Json& value) const;
   void send_close(std::uint16_t code = 1000, std::string_view reason = {}) const;
   [[nodiscard]] Json transport_diagnostics() const;
@@ -85,6 +112,8 @@ class WebSocketClient {
   void send_json(const Json& value);
   void send_json(const Json& value, std::chrono::milliseconds timeout);
   void send_json(const Json& value, std::chrono::milliseconds timeout, std::stop_token stop);
+  void send_json_until(const Json& value, std::chrono::steady_clock::time_point deadline,
+      std::stop_token stop = {});
   // The caller serializes access, including snapshots after a failed send.
   [[nodiscard]] Json last_send_diagnostics() const;
   void enable_read_diagnostics(bool enabled = true);

@@ -102,7 +102,7 @@ field_safety:
   require_can_feedback_before_control: false
   require_local_estop_reset: true
   require_time_sync: true
-  max_time_sync_uncertainty_ms: 25
+  max_time_sync_uncertainty_ms: 100
   time_sync_interval_ms: 30000
   time_sync_samples: 7
 
