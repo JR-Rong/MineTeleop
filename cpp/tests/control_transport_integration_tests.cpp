@@ -30,6 +30,7 @@ struct Fixture {
   FeedbackTransportFence feedback_fence;
   bool feedback_enabled{false}, drop_dc_feedback{false}, inject_candidate_notification{false}, candidate_notification_sent{false};
   Json pending_dc_feedback, last_feedback_command, last_received_payload, lost_initial_feedback;
+  Json first_vehicle_rejection;
   bool drop_initial_feedback{false}, pause_after_feedback_loss{false};
   std::string media_attempt{"media-a"};
   std::int64_t car_control_lease_expiry{};
@@ -132,15 +133,32 @@ struct Fixture {
     if (!direct_enabled || !cloud_online) return;
     const auto nonce = "fixture-nonce-" + std::to_string(++lease_nonce);
     std::uint64_t retired = 0;
+    Json previous_authority;
+    std::int64_t request_started_ms = 0;
     { std::lock_guard lock(car_mutex);
       if (!force && !car_authority.renewal_due(steady())) return;
       if (!car_authority.valid(steady()) && car_authority.reference().is_object()) retired = car_authority.reference().at("authority_epoch").get<std::uint64_t>();
-      car_authority.begin_request(nonce, steady()); }
+      request_started_ms = steady();
+      previous_authority = car_authority.status(request_started_ms);
+      car_authority.begin_request(nonce, request_started_ms); }
     const auto grant = http.post_json_response(base + "/vehicles/transport-vehicle/direct-authority", {
         {"device_token", "fixture-device"}, {"connection_generation", generation}, {"session_id", session},
         {"nonce", nonce}, {"maximum_duration_ms", 600}, {"retired_authority_epoch", retired}});
+    const auto response_received_ms = steady();
     std::lock_guard lock(car_mutex);
-    expect(car_authority.accept_authenticated_cloud(grant, steady(), utc(), 0), "vehicle did not accept real cloud short grant");
+    const auto accepted_at_ms = steady(), accepted_at_utc_ms = utc();
+    if (!car_authority.accept_authenticated_cloud(grant, accepted_at_ms, accepted_at_utc_ms, 0)) {
+      const auto parsed = DirectAuthorityGrant::parse(grant);
+      throw std::runtime_error("vehicle did not accept real cloud short grant: " + Json{
+          {"http_elapsed_ms", response_received_ms - request_started_ms},
+          {"lock_wait_ms", accepted_at_ms - response_received_ms},
+          {"request_elapsed_ms", accepted_at_ms - request_started_ms},
+          {"response_duration_ms", parsed.duration_ms},
+          {"response_remaining_utc_ms", parsed.expires_utc_ms - accepted_at_utc_ms},
+          {"response_epoch", parsed.epoch}, {"response_lease_seq", parsed.lease_seq},
+          {"retired_epoch", retired}, {"previous_authority", previous_authority},
+          {"current_authority", car_authority.status(accepted_at_ms)}}.dump());
+    }
     car_control_lease_expiry = direct_authority_control_lease_expiry(grant);
   }
   void stop_cloud() { cloud_online = false; server->stop(); vehicle_socket.close(); delayed.clear(); }
@@ -220,6 +238,15 @@ struct Fixture {
       result["software_estop_latched"] = vehicle->safety_state() == SafetyState::Estop;
     }
     last_result_reason = result.at("reason").get<std::string>();
+    if (!result.at("accepted").get<bool>() && first_vehicle_rejection.is_null()) {
+      first_vehicle_rejection = {{"received_at_utc_ms", utc()}, {"command_seq", command.seq},
+          {"intent_seq", payload.at("intent_seq")}, {"path", control_path_name(path)},
+          {"command_age_ms", utc() - command.sent_at_utc_ms}, {"gear", command.gear},
+          {"throttle", command.throttle}, {"reason", last_result_reason},
+          {"transport_admitted", decision.admitted}, {"transport_changed", decision.changed},
+          {"safety_state", to_string(vehicle->safety_state())},
+          {"control_timing", vehicle->control_timing(utc())}};
+    }
     result["vehicle_mac"] = transport_message_mac(result, signing_key, true);
     if (verified_stop) expect(emergency_receiver.complete(payload, result), "production emergency cache did not commit result");
     return result;
@@ -304,7 +331,10 @@ void product_startup_and_p2p_cloud_recovery() {
       if (value.at("path") == path && value.at("epoch").get<std::uint64_t>() > after_epoch &&
           !value.at("selecting").get<bool>() && !value.at("qualifying").get<bool>()) return value.at("epoch").get<std::uint64_t>();
     }
-    throw std::runtime_error("product failed route qualification: " + fixture.last_result_reason + " " + state().dump());
+    throw std::runtime_error("product failed route qualification: " + Json{
+        {"target_path", path}, {"after_epoch", after_epoch},
+        {"first_vehicle_rejection", fixture.first_vehicle_rejection},
+        {"last_reason", fixture.last_result_reason}, {"transport", state()}}.dump());
   };
   const auto cloud_epoch = until("wss", 0, false);
   expect(fixture.wss_commands > 0 && fixture.dc_commands == 0 && state().at("mode") == "p2p_preferred" &&
