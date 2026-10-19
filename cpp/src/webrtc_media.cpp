@@ -1390,6 +1390,7 @@ struct VehicleMediaRuntime::Impl {
       // pipeline fault cannot leave one more control cycle runnable while the
       // media thread works its way back to the outer loop.
       stop_requested = true;
+      wake_native_control_feedback();
       stop_control_for_pipeline_fault(issue_code);
       details["codec"] = to_string(active_candidate.codec);
       details["backend"] = to_string(active_candidate.backend);
@@ -1659,7 +1660,12 @@ struct VehicleMediaRuntime::Impl {
         const bool via_wss = !selected_feedback || probe || feedback_transport_fence.path() == detail::ControlPath::Wss;
         const bool via_dc = selected_feedback ? probe || feedback_transport_fence.path() == detail::ControlPath::DataChannel :
             transport == ControlMessageTransport::DataChannel || message.contains("emergency_stop");
-        if (via_wss) latest_control_result = result_message;
+        if (via_wss) {
+          latest_control_result = result_message;
+          // The native WSS handler already sends its own result immediately.
+          // Only an asynchronous publisher needs to interrupt its receive wait.
+          if (!native_feedback) wake_native_control_feedback();
+        }
         if (native_feedback && via_wss) *native_feedback = result_message;
         const bool dc_send_invoked = control_link_open && control_channel && via_dc &&
             (transport != ControlMessageTransport::DataChannel || control_channel == channel);
@@ -1869,6 +1875,7 @@ struct VehicleMediaRuntime::Impl {
         if (stop.action == detail::EmergencyStopReceiver::Action::Cached || stop.action == detail::EmergencyStopReceiver::Action::Pending) {
           if (stop.action == detail::EmergencyStopReceiver::Action::Cached) {
             latest_control_result = stop.cached;
+            if (!native_feedback) wake_native_control_feedback();
             if (native_feedback) *native_feedback = stop.cached;
             if (control_link_open && control_channel) gst_webrtc_data_channel_send_string(control_channel, stop.cached.dump().c_str());
           }
@@ -2579,7 +2586,14 @@ struct VehicleMediaRuntime::Impl {
     return !stop_token.stop_requested() && !stop_requested.load();
   }
 
+  void wake_native_control_feedback() noexcept {
+    if (native_control_feedback_wakeup && !native_control_feedback_wakeup->notify())
+      native_control_feedback_wakeup_failures_total.fetch_add(1, std::memory_order_relaxed);
+    // A failed notification retains the original bounded receive timeout.
+  }
+
   void native_control_websocket_loop(std::stop_token stop_token) noexcept {
+    std::stop_callback cancellation(stop_token, [this] { wake_native_control_feedback(); });
     auto reconnect_delay = kNativeControlReconnectInitialDelay;
     while (!stop_token.stop_requested() && !stop_requested.load()) {
       native_control_websocket_connection_attempts_total.fetch_add(
@@ -2639,8 +2653,11 @@ struct VehicleMediaRuntime::Impl {
           }
           const auto receive_started_ms = steady_now_ms();
           const auto received = websocket.receive_json(
-              kNativeControlWebSocketReceiveTimeout);
+              kNativeControlWebSocketReceiveTimeout, native_control_feedback_wakeup.get());
           const auto receive_completed_ms = steady_now_ms();
+          if (received.status == WebSocketReceiveStatus::Notified)
+            native_control_feedback_wakeups_total.fetch_add(1, std::memory_order_relaxed);
+          if (stop_token.stop_requested() || stop_requested.load()) break;
           if (config.runtime.control_log_commands &&
               (received.status == WebSocketReceiveStatus::Message || receive_completed_ms >= next_idle_diagnostic_ms ||
                receive_started_ms - previous_receive_completed_ms >= 100)) {
@@ -2655,6 +2672,7 @@ struct VehicleMediaRuntime::Impl {
                                    {"receive_wait_ms", receive_completed_ms - receive_started_ms},
                                    {"json_parse_ms", received.json_parse_ms},
                                    {"read_diagnostics", received.read_diagnostics},
+                                   {"local_notification", received.status == WebSocketReceiveStatus::Notified},
                                    {"message_received", received.status == WebSocketReceiveStatus::Message}};
             try {
               const auto& envelope = received.message;
@@ -2682,7 +2700,8 @@ struct VehicleMediaRuntime::Impl {
             } catch (...) { note_control_trace_drop(); }
           }
           previous_receive_completed_ms = receive_completed_ms;
-          if (received.status == WebSocketReceiveStatus::Timeout) continue;
+          if (received.status == WebSocketReceiveStatus::Timeout ||
+              received.status == WebSocketReceiveStatus::Notified) continue;
           if (received.status == WebSocketReceiveStatus::Closed) {
             throw std::runtime_error("native control WebSocket closed");
           }
@@ -2980,7 +2999,10 @@ struct VehicleMediaRuntime::Impl {
         wrapper["vehicle_mac"] = detail::transport_message_mac(wrapper, signaling.transport_mac_key(), true);
         if (feedback_transport_fence.path() == detail::ControlPath::DataChannel && control_channel && control_link_open)
           gst_webrtc_data_channel_send_string(control_channel, wrapper.dump().c_str());
-        else if (feedback_transport_fence.path() == detail::ControlPath::Wss) pending_control_status[kind] = std::move(wrapper);
+        else if (feedback_transport_fence.path() == detail::ControlPath::Wss) {
+          pending_control_status[kind] = std::move(wrapper);
+          wake_native_control_feedback();
+        }
         return;
       }
     }
@@ -2993,6 +3015,7 @@ struct VehicleMediaRuntime::Impl {
           (message.contains("driver_id") && message.at("driver_id") != signaling.driver_id())) return;
       const auto event = message.value("event", "unknown");
       pending_control_status[event] = std::move(message);
+      wake_native_control_feedback();
     }
   }
 
@@ -4403,6 +4426,7 @@ struct VehicleMediaRuntime::Impl {
 
   void stop_pipeline() {
     stop_requested = true;
+    wake_native_control_feedback();
     {
       std::lock_guard lock(media_signal_state->mutex);
       media_signal_state->owner = nullptr; media_signal_state->peer = nullptr;
@@ -4823,6 +4847,7 @@ struct VehicleMediaRuntime::Impl {
     service_stop_token = token;
     std::stop_callback cancellation(token, [this] {
       stop_requested = true;
+      wake_native_control_feedback();
       std::lock_guard lock(control_mutex);
       try { close_control_service_locked(); } catch (...) { control_inhibited = true; }
     });
@@ -5289,6 +5314,8 @@ struct VehicleMediaRuntime::Impl {
               native_control_watchdog_ticks_total.load()},
              {"watchdog_skipped_intervals_total",
               native_control_watchdog_skipped_intervals_total.load()},
+             {"feedback_wakeups_total", native_control_feedback_wakeups_total.load()},
+             {"feedback_wakeup_failures_total", native_control_feedback_wakeup_failures_total.load()},
              {"last_connected_at_utc_ms",
               native_control_websocket_last_connected_at_ms.load()},
              {"last_message_at_utc_ms",
@@ -5328,6 +5355,12 @@ struct VehicleMediaRuntime::Impl {
   std::map<std::string, Json> latest_feedback_status;
   Json latest_control_result;
   std::map<std::string, Json> pending_control_status;
+  // Stable for the runtime's lifetime, including media retries and teardown.
+  // Media-only processes do not allocate a control notification endpoint.
+  const std::unique_ptr<detail::SocketWakeup> native_control_feedback_wakeup =
+      config.runtime.control_enabled ? std::make_unique<detail::SocketWakeup>() : nullptr;
+  std::atomic<std::uint64_t> native_control_feedback_wakeups_total{0};
+  std::atomic<std::uint64_t> native_control_feedback_wakeup_failures_total{0};
   std::uint64_t last_control_management_seq{0};
   std::uint64_t control_result_seq{0};
   std::atomic<bool> native_control_transport_cloud_capable{false};

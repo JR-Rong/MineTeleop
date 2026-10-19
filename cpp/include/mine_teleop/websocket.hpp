@@ -117,7 +117,10 @@ class WebSocketClient {
   // The caller serializes access, including snapshots after a failed send.
   [[nodiscard]] Json last_send_diagnostics() const;
   void enable_read_diagnostics(bool enabled = true);
-  [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout);
+  // Notification interrupts only receiving; buffered partial frames survive.
+  // The caller keeps wakeup alive and retains sole ownership of this client.
+  [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout,
+      detail::SocketWakeup* wakeup = nullptr);
   // null means the rate limit skipped this sample; unsupported counters stay absent.
   [[nodiscard]] Json transport_diagnostics(std::chrono::milliseconds minimum_interval = {});
 

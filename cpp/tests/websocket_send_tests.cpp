@@ -193,6 +193,59 @@ void test_destruction_waits_for_inflight_interruption() {
 int tls_client(int argc,char** argv) {
   expect(argc==4,"TLS fixture needs URL and temporary CA");
   WebSocketClient client(2s,{},argv[3]);client.connect(argv[2]);
+  if(std::string_view(argv[1])=="--tls-client-notification") {
+    client.enable_read_diagnostics();
+    SocketWakeup wakeup;
+    std::promise<void> starting;
+    auto ready=starting.get_future();
+    auto waiting=std::async(std::launch::async,[&] {
+      starting.set_value();
+      return client.receive_json(5s,&wakeup);
+    });
+    ready.wait();
+    expect(waiting.wait_for(20ms)==std::future_status::timeout,
+        "WSS receive returned without network input or notification");
+    expect(wakeup.notify(),"WSS notification failed");
+    expect(waiting.wait_for(500ms)==std::future_status::ready &&
+        waiting.get().status==WebSocketReceiveStatus::Notified,
+        "notification did not interrupt an idle TLS receive");
+    // Split an ordinary header, an extended header, and a payload. A local
+    // wakeup may interrupt all three, but must never discard their TLS bytes.
+    for(int index=0;index<3;++index) {
+      client.send_json({{"split",index}},2s);
+      const auto partial=client.receive_json(100ms,&wakeup);
+      expect(partial.status==WebSocketReceiveStatus::Timeout &&
+          partial.read_diagnostics.value("buffered_receive_bytes",0)>0,
+          "fixture did not leave a partial WebSocket frame");
+      const auto idle_timeouts=partial.read_diagnostics.at("idle_timeouts_total");
+      for(int repeat=0;repeat<100;++repeat)expect(wakeup.notify(),"coalesced WSS notification failed");
+      const auto started=Clock::now();
+      const auto notified=client.receive_json(5s,&wakeup);
+      expect(notified.status==WebSocketReceiveStatus::Notified && Clock::now()-started<500ms &&
+          notified.read_diagnostics.at("idle_timeouts_total")==idle_timeouts &&
+          notified.read_diagnostics.at("buffered_receive_bytes")==partial.read_diagnostics.at("buffered_receive_bytes"),
+          "notification lost a partial frame, waited for timeout, or counted as idle timeout");
+      expect(client.receive_json(20ms,&wakeup).status==WebSocketReceiveStatus::Timeout,
+          "coalesced WSS notifications left a busy-loop backlog");
+      // The same owner can publish its feedback while the inbound frame is
+      // incomplete, then resume assembling exactly that frame.
+      client.send_json({{"resume",index}},2s);
+      const auto received=client.receive_json(2s,&wakeup);
+      expect(received.status==WebSocketReceiveStatus::Message &&
+          received.message==Json({{"split",index},{"payload",std::string(256,'x')}}),
+          "local wakeup corrupted or lost a partially received TLS frame");
+    }
+    expect(wakeup.notify(),"final idle notification failed");
+    expect(client.receive_json(1s,&wakeup).status==WebSocketReceiveStatus::Notified,
+        "final notification disappeared");
+    const auto idle_started=Clock::now();
+    expect(client.receive_json(20ms,&wakeup).status==WebSocketReceiveStatus::Timeout &&
+        Clock::now()-idle_started<500ms,"notification changed the following idle deadline");
+    client.close();
+    std::cout<<Json{{"partial_frames_preserved",3},{"notification_batches_coalesced",3},
+        {"idle_receive_interrupted",true},{"deadline_retained",true}}.dump()<<std::endl;
+    return 0;
+  }
   if(std::string_view(argv[1])=="--tls-client-drain") {
     for(int index=0;index<8;++index) {
       // Force the preparation deadline without timing-sensitive CPU load. The
@@ -259,7 +312,8 @@ int main(int argc,char** argv) {
   try {
     if(argc>1 && (std::string_view(argv[1])=="--tls-client" ||
         std::string_view(argv[1])=="--tls-client-cancel" ||
-        std::string_view(argv[1])=="--tls-client-drain"))return tls_client(argc,argv);
+        std::string_view(argv[1])=="--tls-client-drain" ||
+        std::string_view(argv[1])=="--tls-client-notification"))return tls_client(argc,argv);
     test_all_progress_paths_obey_one_deadline();
     test_blocking_backend_is_interrupted_and_cancel_can_join();
     test_completed_operation_disarms_old_deadlines();

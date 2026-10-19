@@ -1,4 +1,4 @@
-"""Real TLS/WSS, local ephemeral port, no application reads after upgrade."""
+"""Real loopback TLS/WSS: deadlines, cancellation and notification wakeups."""
 import base64,hashlib,json,os,pathlib,shutil,socket,ssl,subprocess,sys,tempfile,threading
 
 openssl=shutil.which('openssl')
@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix='mine-wss-send-') as tmp:
                     nonce=next(value.strip() for name,value in headers.items() if name.lower()==b'sec-websocket-key')
                     accept=base64.b64encode(hashlib.sha1(nonce+b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest())
                     stream.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+accept+b'\r\n\r\n')
-                    if mode=='--tls-client-drain':
+                    if mode in ('--tls-client-drain','--tls-client-notification'):
                         def exact(size):
                             data=b''
                             while len(data)<size:
@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory(prefix='mine-wss-send-') as tmp:
                                 if not chunk:raise RuntimeError('incomplete TLS/WebSocket record')
                                 data+=chunk
                             return data
-                        for index in range(8):
+                        def receive():
                             prefix=exact(2)
                             if prefix[0]!=0x81 or not prefix[1]&0x80:raise RuntimeError('unexpected WebSocket framing')
                             size=prefix[1]&0x7f
@@ -42,9 +42,20 @@ with tempfile.TemporaryDirectory(prefix='mine-wss-send-') as tmp:
                             elif size==127:size=int.from_bytes(exact(8),'big')
                             if size>65536:raise RuntimeError('unbounded fixture record')
                             mask=exact(4);payload=exact(size)
-                            value=json.loads(bytes(byte^mask[offset%4] for offset,byte in enumerate(payload)))
+                            return json.loads(bytes(byte^mask[offset%4] for offset,byte in enumerate(payload)))
+                    if mode=='--tls-client-drain':
+                        for index in range(8):
+                            value=receive()
                             if value!={'probe':'x'*(16*1024),'seq':index}:raise RuntimeError('corrupted or replayed TLS record')
                         response=b'{"received":8}';stream.sendall(bytes([0x81,len(response)])+response)
+                    elif mode=='--tls-client-notification':
+                        for index,cut in enumerate((1,3,19)):
+                            if receive()!={'split':index}:raise RuntimeError('unexpected split request')
+                            payload=json.dumps({'split':index,'payload':'x'*256}).encode()
+                            frame=b'\x81\x7e'+len(payload).to_bytes(2,'big')+payload
+                            stream.sendall(frame[:cut])
+                            if receive()!={'resume':index}:raise RuntimeError('outbound feedback was lost during partial receive')
+                            stream.sendall(frame[cut:])
                     if not stop.wait(12):raise RuntimeError('client did not terminate no-read fixture')
             except BaseException as error:errors.append(str(error))
         worker=threading.Thread(target=serve);worker.start()
@@ -52,9 +63,9 @@ with tempfile.TemporaryDirectory(prefix='mine-wss-send-') as tmp:
             result=subprocess.run([sys.argv[1],mode,f'wss://127.0.0.1:{listener.getsockname()[1]}/',str(cert)],
                 capture_output=True,text=True,timeout=15)
             if result.returncode:raise RuntimeError(result.stdout+result.stderr)
-            evidence=json.loads(result.stdout);evidence['fixture']='real TLS and WSS upgrade; eight validated records' if mode=='--tls-client-drain' else 'real TLS and WSS upgrade; peer stops reading';evidence['mode']=mode
+            evidence=json.loads(result.stdout);evidence['fixture']='real loopback TLS and WSS upgrade';evidence['mode']=mode
             print(json.dumps(evidence,sort_keys=True))
         finally:
             stop.set();listener.close();worker.join(timeout=12)
         if worker.is_alive() or errors:raise RuntimeError(str(errors or 'TLS fixture did not join'))
-    for mode in ['--tls-client-drain','--tls-client','--tls-client-cancel']:run_fixture(mode)
+    for mode in ['--tls-client-drain','--tls-client','--tls-client-cancel','--tls-client-notification']:run_fixture(mode)

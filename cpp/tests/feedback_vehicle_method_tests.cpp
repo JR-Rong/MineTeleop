@@ -30,6 +30,8 @@ struct Publisher {
   ControlTransportFence control_transport_fence;
   FeedbackTransportFence feedback_transport_fence;
   std::map<std::string, Json> latest_feedback_status, pending_control_status;
+  unsigned wakeups{};
+  void wake_native_control_feedback() { ++wakeups; }
 #include "feedback_vehicle_method.inc"
 };
 void expect(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
@@ -78,6 +80,8 @@ struct EarlyResult : Startup {
   EmergencyStopReceiver emergency_stop_receiver;
   std::uint64_t control_result_seq{}, control_status_seq{}, rejected_control_commands{};
   Json latest_control_result;
+  unsigned wakeups{};
+  void wake_native_control_feedback() { ++wakeups; }
   std::vector<Json> publication_traces;
   void enqueue_control_trace(Json value) { publication_traces.push_back(std::move(value)); }
   void note_control_trace_drop() { throw std::runtime_error("unexpected publication trace loss"); }
@@ -139,7 +143,8 @@ void transport_expiry_has_signed_reason_and_trace_without_apply() {
 void early_rejection_publishes_precise_signed_result() {
   // All four reasons, both service-unavailable states, both receive paths, and
   // tracing disabled/enabled. Gst is a byte sink; there is no real connection.
-  for (const bool trace : {false, true}) for (const bool dc : {false, true}) for (int gate = 0; gate != 5; ++gate) {
+  for (const bool trace : {false, true}) for (const bool dc : {false, true})
+      for (const bool immediate_feedback : {false, true}) for (int gate = 0; gate != 5; ++gate) {
     EarlyResult value;
     expect(value.start_control_service(), "mock service fixture did not start");
     value.config.runtime.control_log_commands = trace;
@@ -157,7 +162,10 @@ void early_rejection_publishes_precise_signed_result() {
     command.control_token = "t"; command.seq = 42;
     Json feedback;
     value.deliver(command, dc ? EarlyResult::ControlMessageTransport::DataChannel : EarlyResult::ControlMessageTransport::NativeSignaling,
-        &channel, &feedback);
+        &channel, immediate_feedback ? &feedback : nullptr);
+    if (!immediate_feedback) feedback = value.latest_control_result;
+    expect(value.wakeups == (immediate_feedback ? 0U : 1U),
+        "asynchronous result did not wake WSS, or immediate WSS result notified itself");
     const auto verify = [&](const Json& result) {
       expect(result.at("reason") == reason, "published result lost the precise early rejection reason");
       expect(!result.at("accepted").get<bool>() && !result.at("rearm_required").get<bool>() &&
@@ -213,6 +221,8 @@ void publish_all_four_independent_axes() {
     for (const auto* kind : {"vehicle_telemetry", "vcu_handshake_status", "session_control_profile_status", "control_command_rejected"})
       publisher.send_control_status_locked({{"event", kind}, {"control_status_seq", ++seq}, {"evidence_received_at_utc_ms", 123}});
     expect(publisher.latest_feedback_status.size() == 4, "snapshot cache did not retain four kinds");
+    expect(publisher.wakeups == (feedback == ControlPath::Wss ? 4U : 0U),
+        "asynchronous WSS feedback did not notify its network owner, or DC feedback woke an unrelated path");
     expect(feedback == ControlPath::Wss ? publisher.pending_control_status.size() == 4 && channel.sent.empty() :
         publisher.pending_control_status.empty() && channel.sent.size() == 4, "actual vehicle publisher coupled feedback to command path");
     const auto verify = [&](const Json& message) {
@@ -249,6 +259,7 @@ void cloud_bootstrap_feedback_requires_live_authenticated_lease() {
   expect(publisher.cloud_control_authority_live_locked(), "live cloud bootstrap was unavailable");
   publisher.send_control_status_locked({{"event", "vcu_handshake_status"}, {"control_status_seq", 1}});
   expect(publisher.pending_control_status.size() == 1, "WSS-only startup lost adapter readiness status");
+  expect(publisher.wakeups == 1, "WSS-only readiness status did not wake the network owner");
   for (int kind = 0; kind != 3; ++kind) {
     publisher.pending_control_status.clear();
     publisher.native_control_websocket_connected = kind != 0;
@@ -257,6 +268,7 @@ void cloud_bootstrap_feedback_requires_live_authenticated_lease() {
     expect(!publisher.cloud_control_authority_live_locked(), "closed/unsupported/expired cloud granted bootstrap authority");
     publisher.send_control_status_locked({{"event", "vehicle_telemetry"}, {"control_status_seq", 2}});
     expect(publisher.pending_control_status.empty(), "invalid cloud bootstrapped feedback");
+    expect(publisher.wakeups == 1, "invalid cloud status woke the network owner");
   }
 }
 void raw_vcu_details_are_not_a_transport_wrapper() {
