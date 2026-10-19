@@ -68,7 +68,7 @@ class SocketWakeup {
   std::unique_ptr<Impl> impl_;
 };
 
-// Pins exactly one socket endpoint. Waiting does not access CURL or consume data,
+// Pins exactly one socket endpoint for one wait owner. Waiting does not access CURL or consume data,
 // and remains safe while the owning client closes/replaces its original fd.
 class SocketReadiness {
  public:
@@ -76,6 +76,9 @@ class SocketReadiness {
   ~SocketReadiness();
   [[nodiscard]] bool wait(std::chrono::milliseconds timeout,
       SocketWakeup* wakeup = nullptr) const;
+  // The owner retires this endpoint before freeing CURL. On Windows, shutdown
+  // of a duplicated socket alone need not interrupt an existing WSAPoll.
+  void retire() const noexcept;
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

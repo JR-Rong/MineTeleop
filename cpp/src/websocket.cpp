@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cstring>
@@ -417,23 +418,30 @@ void random_bytes(unsigned char* output, std::size_t size) {
 
 bool wait_socket(SocketHandle socket, short events, std::chrono::milliseconds timeout,
     std::uint64_t* interrupted_count = nullptr, detail::SocketWakeup* wakeup = nullptr,
-    bool* notified = nullptr) {
+    bool* notified = nullptr, detail::SocketWakeup* retirement = nullptr) {
 #if defined(_WIN32)
-  std::array<WSAPOLLFD, 2> descriptors{{{native_socket(socket), events, 0}, {}}};
+  std::array<WSAPOLLFD, 3> descriptors{{{native_socket(socket), events, 0}, {}, {}}};
 #else
-  std::array<pollfd, 2> descriptors{{{native_socket(socket), events, 0}, {}}};
+  std::array<pollfd, 3> descriptors{{{native_socket(socket), events, 0}, {}, {}}};
 #endif
-  if (wakeup) descriptors[1] = {native_socket(wakeup->socket()), kPollRead, 0};
+  unsigned count = 1;
+  if (wakeup) descriptors[count++] = {native_socket(wakeup->socket()), kPollRead, 0};
+  const auto retirement_index = count;
+  if (retirement) descriptors[count++] = {native_socket(retirement->socket()), kPollRead, 0};
   const auto bounded = std::clamp<std::int64_t>(timeout.count(), 0, std::numeric_limits<int>::max());
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(bounded);
   auto remaining = static_cast<int>(bounded);
   while (true) {
 #if defined(_WIN32)
-    const int result = ::WSAPoll(descriptors.data(), wakeup ? 2 : 1, remaining);
+    const int result = ::WSAPoll(descriptors.data(), count, remaining);
 #else
-    const int result = ::poll(descriptors.data(), wakeup ? 2 : 1, remaining);
+    const int result = ::poll(descriptors.data(), count, remaining);
 #endif
     if (result > 0) {
+      if (retirement && descriptors[retirement_index].revents) {
+        if (!retirement->consume()) throw std::runtime_error("websocket retirement wakeup receive failed");
+        return false;
+      }
       // Drain an already-readable network frame first. Leave the notification
       // pending so simultaneous mailbox updates cannot be lost or starve ACKs.
       if (descriptors[0].revents & (events | POLLERR | POLLHUP)) return true;
@@ -551,6 +559,8 @@ std::unordered_map<std::string, std::string> parse_http_headers(std::string_view
 
 struct detail::SocketReadiness::Impl {
   ShutdownSocket retained;
+  SocketWakeup retirement;
+  std::atomic<bool> retired{false};
   explicit Impl(SocketHandle socket) : retained(native_socket(socket)) {}
 };
 
@@ -558,7 +568,15 @@ detail::SocketReadiness::SocketReadiness(SocketHandle socket)
     : impl_(std::make_unique<Impl>(socket)) {}
 detail::SocketReadiness::~SocketReadiness() = default;
 bool detail::SocketReadiness::wait(std::chrono::milliseconds timeout, SocketWakeup* wakeup) const {
-  return wait_socket(static_cast<SocketHandle>(impl_->retained.value), kPollRead, timeout, nullptr, wakeup);
+  if (impl_->retired.load()) return true;
+  const bool readable = wait_socket(static_cast<SocketHandle>(impl_->retained.value), kPollRead,
+      timeout, nullptr, wakeup, nullptr, &impl_->retirement);
+  // Retirement, like POLLHUP, requires the owner to revalidate the connection;
+  // it is not an application ACK or evidence of network progress.
+  return impl_->retired.load() || readable;
+}
+void detail::SocketReadiness::retire() const noexcept {
+  if (!impl_->retired.exchange(true)) static_cast<void>(impl_->retirement.notify());
 }
 
 struct detail::SocketWakeup::Impl {
@@ -931,6 +949,7 @@ struct WebSocketClient::Impl {
     // Do not let TLS close-notify cleanup start another unbounded network
     // wait after the WebSocket close attempt has already ended.
     send_failed = true;
+    if (read_waiter) read_waiter->retire();
     if (socket_interrupt) socket_interrupt();
     send_deadline.reset();
     if (curl != nullptr) curl_easy_cleanup(curl);

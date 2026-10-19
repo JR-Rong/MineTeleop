@@ -13,7 +13,7 @@ using namespace mine_teleop;
 using namespace mine_teleop::detail;
 std::int64_t utc() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
 std::int64_t steady() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
-void expect(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+void expect(bool value, std::string_view message) { if (!value) throw std::runtime_error(std::string(message)); }
 
 // Only the DC byte courier is mocked. Native producer, cloud HTTP/WSS,
 // authentication, transport fence and the common safety service are real.
@@ -250,6 +250,13 @@ struct Fixture {
     }
     return pause_after_feedback_loss;
   }
+  Json bridge(const Json& request) {
+    auto response = driver->control_transport_bridge(request);
+    // Every bridge call consumes pending native statuses. WSS feedback can
+    // arrive between the fetch and the result upload in the same pump cycle.
+    for (const auto& status : response.at("statuses")) received_statuses.push_back(status);
+    return response;
+  }
   void pump(bool dc_ready) {
     renew_authority();
     if (steady() - last_input >= 60) input();
@@ -271,8 +278,7 @@ struct Fixture {
     }
     auto request = scope(dc_ready);
     if (pending_dc_feedback.is_object()) { request["vehicle_result"] = pending_dc_feedback; pending_dc_feedback = Json(nullptr); }
-    auto response = driver->control_transport_bridge(request);
-    for (const auto& status : response.at("statuses")) received_statuses.push_back(status);
+    auto response = bridge(request);
     if (dc_ready && response.at("frame_json").is_string()) {
       const auto payload = Json::parse(response.at("frame_json").get<std::string>());
       expect(payload.at("seq").get<std::uint64_t>() > last_dc_seq, "bridge replayed a frame");
@@ -283,7 +289,7 @@ struct Fixture {
         route_feedback(apply(payload, ControlPath::DataChannel), payload);
         if (pending_dc_feedback.is_object()) { request["vehicle_result"] = pending_dc_feedback; pending_dc_feedback = Json(nullptr); }
       } else request["vehicle_result"] = apply(payload, ControlPath::DataChannel);
-      static_cast<void>(driver->control_transport_bridge(request));
+      static_cast<void>(bridge(request));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
@@ -460,7 +466,8 @@ void actual_feedback_selection_is_independent_and_rejects_retired_statuses() {
   deadline = steady() + 1500;
   while (steady() < deadline && fixture.received_statuses.empty()) fixture.pump(true);
   expect(fixture.received_statuses.size() == 1 && fixture.received_statuses.front().at("control_status_seq") == 6,
-      "retired high sequence poisoned actual cloud WSS status cache/socket watermark");
+      "retired high sequence poisoned actual cloud WSS status cache/socket watermark: received=" +
+          Json(fixture.received_statuses).dump() + ", feedback=" + fixture.feedback_fence.state().dump());
 }
 
 void actual_cloud_explicit_denial_revokes_before_short_deadline() {

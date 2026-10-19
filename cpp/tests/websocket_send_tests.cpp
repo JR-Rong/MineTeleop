@@ -66,6 +66,12 @@ void test_readiness_wait_does_not_consume_network_or_follow_reused_descriptor() 
       "readiness observer consumed network data");
   expect(network.consume() && !waiter.wait(0ms,&wakeup),
       "readiness observer retained consumed data");
+  auto retiring=std::async(std::launch::async,[&]{return waiter.wait(5s,&wakeup);});
+  expect(retiring.wait_for(20ms)==std::future_status::timeout,"retirement fixture was not waiting");
+  waiter.retire();
+  expect(retiring.wait_for(500ms)==std::future_status::ready && retiring.get() && waiter.wait(0ms),
+      "explicit retirement did not wake and remain retired");
+  expect(!network.consume(),"local retirement fabricated network data");
 #ifndef _WIN32
   int original[2],replacement[2];
   expect(::socketpair(AF_UNIX,SOCK_STREAM,0,original)==0,"readiness socketpair failed");
@@ -239,8 +245,10 @@ int tls_client(int argc,char** argv) {
     auto retiring=std::async(std::launch::async,[&] {return waiter->wait(5s,&wakeup);});
     expect(retiring.wait_for(20ms)==std::future_status::timeout,"retirement fixture did not start idle");
     client.close(); // Destroys CURL/Impl while only the retained endpoint waits.
-    expect(retiring.wait_for(500ms)==std::future_status::ready && retiring.get() && !client.read_waiter(),
-        "retiring the owner left a stale observer blocked or exposed a replacement handle");
+    expect(retiring.wait_for(500ms)==std::future_status::ready,
+        "retiring the owner left a stale observer blocked");
+    expect(retiring.get() && !client.read_waiter(),
+        "retired observer missed closure or owner exposed a replacement handle");
     std::cout<<Json{{"network_woke_waiter",true},{"local_stop_woke_waiter",true},
         {"owner_retirement_woke_waiter",true},{"owner_received_payload",true}}.dump()<<std::endl;
     return 0;
