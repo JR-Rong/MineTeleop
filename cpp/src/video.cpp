@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -97,6 +98,17 @@ class VaapiVideoEncoder final : public VideoEncoder {
 };
 
 }  // namespace
+
+int realtime_keyframe_interval_frames(int fps, int stale_brake_ms) {
+  if (fps <= 0 || stale_brake_ms <= 0) {
+    throw std::invalid_argument("realtime keyframe interval requires positive FPS and video budget");
+  }
+  // If loss recovery feedback is delayed or lost, a one-second GOP can outlast
+  // the video safety budget. Reserve half that budget for the next IDR, leaving
+  // room for transport and decoding without changing the safety deadline.
+  const auto frames = static_cast<std::int64_t>(fps) * stale_brake_ms / 2000;
+  return static_cast<int>(std::clamp<std::int64_t>(frames, 1, fps));
+}
 
 std::string build_nvenc_pipeline_stage(
     std::string_view factory_name,

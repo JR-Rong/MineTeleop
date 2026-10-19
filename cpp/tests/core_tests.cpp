@@ -4546,6 +4546,26 @@ void test_driver_config_and_hardware_encoder_priority() {
   expect(candidates.at(0).codec == mine_teleop::VideoCodec::H265, "preferred candidate codec changed");
 }
 
+void test_realtime_keyframe_interval_reserves_video_recovery_budget() {
+  using mine_teleop::realtime_keyframe_interval_frames;
+  expect(realtime_keyframe_interval_frames(30, 500) == 7,
+         "30 FPS video retained a GOP longer than half the 500 ms recovery budget");
+  expect(realtime_keyframe_interval_frames(60, 500) == 15 &&
+             realtime_keyframe_interval_frames(15, 500) == 3,
+         "recovery interval did not account for the camera frame rate");
+  expect(realtime_keyframe_interval_frames(30, 100) == 1 &&
+             realtime_keyframe_interval_frames(1, 100) == 1,
+         "tight budgets must retain at least one frame per GOP");
+  expect(realtime_keyframe_interval_frames(30, 3000) == 30,
+         "a loose video budget must not make the former one-second GOP longer");
+  expect(realtime_keyframe_interval_frames(std::numeric_limits<int>::max(),
+                                         std::numeric_limits<int>::max()) ==
+             std::numeric_limits<int>::max(),
+         "keyframe interval arithmetic overflowed before clamping");
+  expect_throws([] { static_cast<void>(realtime_keyframe_interval_frames(0, 500)); }, "zero FPS accepted");
+  expect_throws([] { static_cast<void>(realtime_keyframe_interval_frames(30, 0)); }, "zero budget accepted");
+}
+
 void test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility() {
   const mine_teleop::VideoEncoderSettings settings{2500, 30};
   const auto stage_120 =
@@ -5026,6 +5046,7 @@ int main() {
       {"signaling_presence_generation_and_automatic_release", test_signaling_presence_generation_and_automatic_release},
       {"signaling_time_sync_common_domain", test_signaling_time_sync_common_domain},
       {"driver_config_and_hardware_encoder_priority", test_driver_config_and_hardware_encoder_priority},
+      {"realtime_keyframe_interval_reserves_video_recovery_budget", test_realtime_keyframe_interval_reserves_video_recovery_budget},
       {"nvenc_pipeline_stage_tracks_gstreamer_property_compatibility", test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility},
       {"native_testsrc_acquisition_does_not_spawn_ffmpeg", test_native_testsrc_acquisition_does_not_spawn_ffmpeg},
       {"basler_camera_uses_minimal_aravis_bridge", test_basler_camera_uses_minimal_aravis_bridge},

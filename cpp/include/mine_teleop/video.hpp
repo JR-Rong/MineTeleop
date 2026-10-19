@@ -28,6 +28,8 @@ struct VideoEncoderSettings {
   int keyframe_interval_frames{30};
 };
 
+[[nodiscard]] int realtime_keyframe_interval_frames(int fps, int stale_brake_ms);
+
 [[nodiscard]] std::string build_nvenc_pipeline_stage(
     std::string_view factory_name,
     const VideoEncoderSettings& settings,

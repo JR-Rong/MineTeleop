@@ -270,9 +270,13 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
   mine_teleop_enable_warnings(mine_teleop_vehicle_runtime)
 
   if(MINE_TELEOP_BUILD_BENCH_PROBES)
+    pkg_check_modules(GSTREAMER_RTP REQUIRED IMPORTED_TARGET gstreamer-rtp-1.0>=1.20)
     add_executable(mine-teleop-bench-capture-probe cpp/tests/bench_capture_probe.cpp)
     target_link_libraries(mine-teleop-bench-capture-probe PRIVATE mine_teleop_vehicle_runtime)
     mine_teleop_enable_warnings(mine-teleop-bench-capture-probe)
+    add_executable(mine-teleop-video-loss-recovery-probe cpp/tests/video_loss_recovery_probe.cpp)
+    target_link_libraries(mine-teleop-video-loss-recovery-probe PRIVATE mine_teleop_vehicle_runtime PkgConfig::GSTREAMER_RTP)
+    mine_teleop_enable_warnings(mine-teleop-video-loss-recovery-probe)
   endif()
 
   add_executable(mine-teleop-recorder cpp/apps/mine_teleop_recorder.cpp)

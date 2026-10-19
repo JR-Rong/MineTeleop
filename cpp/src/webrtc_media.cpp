@@ -3807,7 +3807,11 @@ struct VehicleMediaRuntime::Impl {
       const auto payloader = encoder.codec() == VideoCodec::H265 ? "rtph265pay" : "rtph264pay";
       const auto encoding_name = encoder.codec() == VideoCodec::H265 ? "H265" : "H264";
       const auto elementary_caps = encoder.codec() == VideoCodec::H265 ? "video/x-h265" : "video/x-h264";
-      VideoEncoderSettings settings{lane->profile.bitrate_kbps, std::max(1, lane->profile.fps)};
+      const auto fps = std::max(1, lane->profile.fps);
+      const auto keyframe_interval = lane->camera.critical_for_control
+          ? realtime_keyframe_interval_frames(fps, config.runtime.critical_camera_stale_brake_ms)
+          : fps;
+      VideoEncoderSettings settings{lane->profile.bitrate_kbps, keyframe_interval};
       pipeline_text
           << build_camera_input_pipeline("source_" + id, lane->input, lane->profile)
           << "! " << encoder.pipeline_stage(settings, "encoder_" + id) << ' '
