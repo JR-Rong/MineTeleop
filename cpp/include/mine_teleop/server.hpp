@@ -469,11 +469,12 @@ class DriverConsoleRuntime {
       std::uint64_t expected_generation = 0, bool estop_only = false);
   void close_control_signaling_websocket();
   void reset_native_control_state();
+  void wake_native_control_sender() noexcept;
   void native_control_sender_loop(std::stop_token stop_token);
   void native_control_lease_loop(std::stop_token stop_token);
   void time_sync_loop(std::stop_token stop_token);
   [[nodiscard]] bool send_native_control_sample(std::stop_token stop = {});
-  void poll_native_control_acknowledgements();
+  [[nodiscard]] bool poll_native_control_acknowledgements();
   [[nodiscard]] bool direct_control_continuation_available_locked();
   void consume_feedback_status_locked(const Json& value, std::string_view session,
       std::string_view vehicle, std::string_view driver, detail::ControlPath returned);
@@ -538,6 +539,10 @@ class DriverConsoleRuntime {
   // after the new session store has been initialized.
   mutable std::mutex native_control_update_mutex_;
   std::condition_variable_any native_control_cv_;
+  detail::SocketWakeup native_control_sender_wakeup_;
+  std::atomic<std::uint64_t> native_control_socket_read_wakeups_{0};
+  std::atomic<std::uint64_t> native_control_socket_wait_failures_{0};
+  std::atomic<std::uint64_t> native_control_sender_wakeup_failures_{0};
   std::string driver_token_;
   std::int64_t driver_token_expires_at_ms_{0};
   std::string signaling_service_instance_id_;

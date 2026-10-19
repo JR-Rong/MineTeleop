@@ -395,6 +395,9 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
       native.value("last_ack_seq", 0U) > 128U && native.value("unacknowledged_count", 129U) <= 128U &&
       native.value("last_error", "nonempty").empty(),
       "successful ESTOP send/accounting was treated as socket failure or lost ACK identity: " + native.dump());
+  expect(native.value("socket_read_wakeups_total",0U)>0 &&
+      native.value("socket_wait_failures_total",1U)==0 && native.value("sender_wakeup_failures_total",1U)==0,
+      "actual runtime did not observe sparse ACK readiness, or its notifications failed: " + native.dump());
   std::cout << "[ACK_CAPACITY] " << Json{{"normal_packets", normal_packets.load()},
       {"warmup_acknowledgements", warmup_acknowledgements.load()}, {"capacity", capacity_witness},
       {"estop_packets", estop_packets.load()}, {"sixth_estop", emergency_identity},

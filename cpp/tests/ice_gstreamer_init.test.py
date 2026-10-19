@@ -77,6 +77,8 @@ MEMBERS = r'''
   struct {VideoCodec codec=VideoCodec::H264,backend=VideoCodec::H264;} active_candidate;
   std::atomic<std::uint64_t> local_ice_candidate_count{0};
   std::atomic<bool> stop_requested{false};
+  unsigned feedback_wakeups=0;
+  void wake_native_control_feedback() noexcept {++feedback_wakeups;}
   std::shared_ptr<MediaSignalState> media_signal_state=std::make_shared<MediaSignalState>();
   FakeSignaling signaling;
   std::mutex diagnostics_mutex;std::vector<std::string> errors,diagnostics;
@@ -202,6 +204,7 @@ struct Fixture {
     if(stopped)return;
     stopped=true;
     impl.stop_scope();
+    expect(impl.stop_requested.load()&&impl.feedback_wakeups==1,"stop scope did not notify the control owner");
     {std::lock_guard lock(gate.mutex);gate.released=true;gate.cv.notify_all();}
     if(channel){gst_webrtc_data_channel_close(channel);g_object_unref(channel);channel=nullptr;}
     bool reached_null=true;

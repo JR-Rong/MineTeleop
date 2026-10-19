@@ -549,6 +549,18 @@ std::unordered_map<std::string, std::string> parse_http_headers(std::string_view
 
 }  // namespace
 
+struct detail::SocketReadiness::Impl {
+  ShutdownSocket retained;
+  explicit Impl(SocketHandle socket) : retained(native_socket(socket)) {}
+};
+
+detail::SocketReadiness::SocketReadiness(SocketHandle socket)
+    : impl_(std::make_unique<Impl>(socket)) {}
+detail::SocketReadiness::~SocketReadiness() = default;
+bool detail::SocketReadiness::wait(std::chrono::milliseconds timeout, SocketWakeup* wakeup) const {
+  return wait_socket(static_cast<SocketHandle>(impl_->retained.value), kPollRead, timeout, nullptr, wakeup);
+}
+
 struct detail::SocketWakeup::Impl {
   std::array<SocketHandle, 2> sockets{kInvalidSocket, kInvalidSocket};
   std::mutex mutex;
@@ -807,6 +819,7 @@ struct WebSocketClient::Impl {
   curl_slist* resolve_entries{nullptr};
   std::filesystem::path ca_bundle;
   curl_socket_t socket{CURL_SOCKET_BAD};
+  std::shared_ptr<const detail::SocketReadiness> read_waiter;
   std::string buffered;
   std::unordered_map<std::string, std::string> handshake_headers;
   std::int64_t last_transport_sample_monotonic_ms{0};
@@ -1313,6 +1326,13 @@ Json WebSocketClient::last_send_diagnostics() const {
 void WebSocketClient::enable_read_diagnostics(bool enabled) {
   read_diagnostics_enabled_ = enabled;
   if (impl_) impl_->read_diagnostics_enabled = enabled;
+}
+
+std::shared_ptr<const detail::SocketReadiness> WebSocketClient::read_waiter() const {
+  if (!connected()) return {};
+  if (!impl_->read_waiter)
+    impl_->read_waiter = std::make_shared<detail::SocketReadiness>(static_cast<SocketHandle>(impl_->socket));
+  return impl_->read_waiter;
 }
 
 WebSocketReceiveResult WebSocketClient::receive_json(std::chrono::milliseconds timeout,

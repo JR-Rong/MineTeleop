@@ -77,6 +77,10 @@ void real_common_service_stops_and_dc_rejection_does_not_refresh_watchdog() {
   service.close();
 }
 struct CloudFixture {
+  // Real journal fsync and password verification can exceed 80ms on CI.
+  // Give this fixture time to assert exclusivity before testing real expiry;
+  // the disabled product default and logical-time safety tests are unchanged.
+  static constexpr auto lease_duration = std::chrono::milliseconds(2000);
   std::filesystem::path directory;
   SignalingServerConfig config;
   std::unique_ptr<SignalingService> service;
@@ -84,7 +88,7 @@ struct CloudFixture {
   CloudFixture() {
     directory = std::filesystem::temp_directory_path() / ("mine-direct-authority-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directory(directory);
-    config.experimental_direct_authority_lease_ms = 80; // TEST only, not the 600ms review proposal or product default.
+    config.experimental_direct_authority_lease_ms = static_cast<int>(lease_duration.count());
     config.experimental_direct_authority_journal = directory / "authority.json";
     config.driver_passwords = {{"d1", "public-fixture-password"}, {"d2", "public-fixture-password"}};
     config.device_tokens = {{"v", "public-fixture-device"}}; config.driver_vehicle_permissions = {{"d1", {"v"}}, {"d2", {"v"}}};
@@ -94,7 +98,7 @@ struct CloudFixture {
   Json post(std::string path, Json body, int expected = 200) {
     HttpRequest request; request.method = "POST"; request.path = path; request.target = path; request.peer_address = "127.0.0.1"; request.body = body.dump();
     const auto response = service->handle(request);
-    if (response.status != expected) throw std::runtime_error(path + ": unexpected status " + std::to_string(response.status));
+    if (response.status != expected) throw std::runtime_error(path + ": expected " + std::to_string(expected) + ", got " + std::to_string(response.status));
     return Json::parse(response.body);
   }
   void start() { service = std::make_unique<SignalingService>(config); }
@@ -109,24 +113,28 @@ struct CloudFixture {
   }
   Json request(std::string nonce) {
     return {{"device_token", "public-fixture-device"}, {"connection_generation", online.at("connection_generation")},
-        {"session_id", session.at("session_id")}, {"nonce", std::move(nonce)}, {"maximum_duration_ms", 80}};
+        {"session_id", session.at("session_id")}, {"nonce", std::move(nonce)}, {"maximum_duration_ms", lease_duration.count()}};
   }
 };
 void actual_cloud_revoke_does_not_free_the_old_grant_early() {
   CloudFixture cloud; cloud.participants(); cloud.session = cloud.post("/sessions", cloud.session_body());
   auto wrong = cloud.request("x"); wrong["device_token"] = "wrong"; cloud.post("/vehicles/v/direct-authority", wrong, 401);
-  auto low = cloud.request("x"); low["maximum_duration_ms"] = 79; cloud.post("/vehicles/v/direct-authority", low, 409);
+  auto low = cloud.request("x"); low["maximum_duration_ms"] = CloudFixture::lease_duration.count() - 1; cloud.post("/vehicles/v/direct-authority", low, 409);
+  const auto grant_started = std::chrono::steady_clock::now();
   const auto first = cloud.post("/vehicles/v/direct-authority", cloud.request("n1"));
+  const auto grant_received = std::chrono::steady_clock::now();
   expect(direct_authority_control_lease_expiry(first) == cloud.session.at("control_token_expires_at_utc_ms").get<std::int64_t>(),
       "authenticated authority reply omitted/current long session deadline");
   auto inconsistent = first; inconsistent["control_token_expires_at_utc_ms"] = first.at("expires_at_utc_ms").get<std::int64_t>() - 1;
   rejects([&] { static_cast<void>(direct_authority_control_lease_expiry(inconsistent)); });
   expect(cloud.post("/vehicles/v/direct-authority", cloud.request("n1")) == first, "same nonce extended actual cloud grant");
   cloud.post("/sessions/" + cloud.session.at("session_id").get<std::string>() + "/end", {{"actor", "d1"}, {"token", cloud.login1.at("token")}});
+  expect(std::chrono::steady_clock::now() < grant_started + CloudFixture::lease_duration,
+      "fixture exhausted the grant before testing pre-expiry exclusivity");
   cloud.post("/sessions", cloud.session_body(true), 409);
   cloud.post("/vehicles/online", {{"vehicle_id", "v"}, {"device_token", "public-fixture-device"}, {"connection_id", "other"}}, 409);
   cloud.post("/vehicles/v/direct-authority", cloud.request("n2"), 409);
-  std::this_thread::sleep_for(std::chrono::milliseconds(90));
+  std::this_thread::sleep_until(grant_received + CloudFixture::lease_duration + std::chrono::milliseconds(1));
   expect(cloud.post("/sessions", cloud.session_body(true)).contains("session_id"), "expired old grant blocked new authority indefinitely");
   std::ifstream journal(cloud.config.experimental_direct_authority_journal); const auto text = std::string(std::istreambuf_iterator<char>(journal), {});
   expect(text.find("public-fixture-password") == std::string::npos && text.find("public-fixture-device") == std::string::npos, "durable authority journal saved credentials");
@@ -135,9 +143,15 @@ void restart_is_exclusive_and_waits_a_full_prior_duration() {
   CloudFixture cloud; cloud.participants(); cloud.session = cloud.post("/sessions", cloud.session_body());
   const auto old = cloud.post("/vehicles/v/direct-authority", cloud.request("n1"));
   rejects([&] { SignalingService duplicate(cloud.config); });
-  cloud.service.reset(); cloud.start(); cloud.participants(false);
+  cloud.service.reset();
+  const auto restart_started = std::chrono::steady_clock::now();
+  cloud.start();
+  const auto restart_completed = std::chrono::steady_clock::now();
+  cloud.participants(false);
+  expect(std::chrono::steady_clock::now() < restart_started + CloudFixture::lease_duration,
+      "fixture exhausted the restart reservation before testing exclusivity");
   cloud.post("/vehicles/online", {{"vehicle_id", "v"}, {"device_token", "public-fixture-device"}, {"connection_id", "runtime"}}, 409);
-  std::this_thread::sleep_for(std::chrono::milliseconds(90));
+  std::this_thread::sleep_until(restart_completed + CloudFixture::lease_duration + std::chrono::milliseconds(1));
   cloud.online = cloud.post("/vehicles/online", {{"vehicle_id", "v"}, {"device_token", "public-fixture-device"}, {"connection_id", "runtime"}});
   cloud.session = cloud.post("/sessions", cloud.session_body());
   const auto next = cloud.post("/vehicles/v/direct-authority", cloud.request("n2"));

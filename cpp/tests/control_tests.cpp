@@ -6268,7 +6268,9 @@ void test_native_control_delayed_ack_progress_and_real_stall() {
   }
   expect(vehicle_pump.inspect([&] { return vehicle->read_telemetry().throttle_feedback > 0 &&
       service.session_control_profile().at("applied_revision") == profile_request.seq; }) && connections->load() == 1,
-      "fresh motion failed to resume with the same confirmed profile and socket");
+      "fresh motion failed to resume with the same confirmed profile and socket: " +
+      driver.status().at("native_control").dump() + ":vehicle=" +
+      vehicle_pump.inspect([&] { return last_vehicle_reason; }));
   // Continued absence remains bounded; a driver recovery window cannot keep
   // an unresponsive ACK path alive forever.
   drop_acknowledgements->store(true);

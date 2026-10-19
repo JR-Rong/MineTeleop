@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix='mine-wss-send-') as tmp:
                     nonce=next(value.strip() for name,value in headers.items() if name.lower()==b'sec-websocket-key')
                     accept=base64.b64encode(hashlib.sha1(nonce+b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest())
                     stream.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+accept+b'\r\n\r\n')
-                    if mode in ('--tls-client-drain','--tls-client-notification'):
+                    if mode in ('--tls-client-drain','--tls-client-notification','--tls-client-readiness'):
                         def exact(size):
                             data=b''
                             while len(data)<size:
@@ -56,6 +56,9 @@ with tempfile.TemporaryDirectory(prefix='mine-wss-send-') as tmp:
                             stream.sendall(frame[:cut])
                             if receive()!={'resume':index}:raise RuntimeError('outbound feedback was lost during partial receive')
                             stream.sendall(frame[cut:])
+                    elif mode=='--tls-client-readiness':
+                        if receive()!={'probe':'readiness'}:raise RuntimeError('unexpected readiness probe')
+                        response=b'{"ready":true}';stream.sendall(bytes([0x81,len(response)])+response)
                     if not stop.wait(12):raise RuntimeError('client did not terminate no-read fixture')
             except BaseException as error:errors.append(str(error))
         worker=threading.Thread(target=serve);worker.start()
@@ -68,4 +71,4 @@ with tempfile.TemporaryDirectory(prefix='mine-wss-send-') as tmp:
         finally:
             stop.set();listener.close();worker.join(timeout=12)
         if worker.is_alive() or errors:raise RuntimeError(str(errors or 'TLS fixture did not join'))
-    for mode in ['--tls-client-drain','--tls-client','--tls-client-cancel','--tls-client-notification']:run_fixture(mode)
+    for mode in ['--tls-client-drain','--tls-client','--tls-client-cancel','--tls-client-notification','--tls-client-readiness']:run_fixture(mode)

@@ -67,6 +67,19 @@ class SocketWakeup {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// Pins exactly one socket endpoint. Waiting does not access CURL or consume data,
+// and remains safe while the owning client closes/replaces its original fd.
+class SocketReadiness {
+ public:
+  explicit SocketReadiness(SocketHandle socket);
+  ~SocketReadiness();
+  [[nodiscard]] bool wait(std::chrono::milliseconds timeout,
+      SocketWakeup* wakeup = nullptr) const;
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
 }
 [[nodiscard]] std::string signaling_websocket_url(
     std::string_view signaling_url,
@@ -121,6 +134,10 @@ class WebSocketClient {
   // The caller keeps wakeup alive and retains sole ownership of this client.
   [[nodiscard]] WebSocketReceiveResult receive_json(std::chrono::milliseconds timeout,
       detail::SocketWakeup* wakeup = nullptr);
+  // Obtain under the client's ownership lock, then wait without that lock.
+  // Only network readiness: TLS/application buffering still needs a bounded
+  // receive check. Revalidate the current client/session before consuming.
+  [[nodiscard]] std::shared_ptr<const detail::SocketReadiness> read_waiter() const;
   // null means the rate limit skipped this sample; unsupported counters stay absent.
   [[nodiscard]] Json transport_diagnostics(std::chrono::milliseconds minimum_interval = {});
 

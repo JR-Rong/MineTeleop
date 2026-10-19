@@ -5259,7 +5259,7 @@ DriverConsoleRuntime::~DriverConsoleRuntime() {
   native_control_sender_.request_stop();
   native_control_lease_.request_stop();
   time_sync_worker_.request_stop();
-  native_control_cv_.notify_all();
+  wake_native_control_sender();
   if (native_control_sender_.joinable()) native_control_sender_.join();
   if (native_control_lease_.joinable()) native_control_lease_.join();
   if (time_sync_worker_.joinable()) time_sync_worker_.join();
@@ -5420,7 +5420,7 @@ void DriverConsoleRuntime::reset_native_control_state() {
     emergency_stop_owner_.clear(); emergency_stop_attempt_.clear(); emergency_stop_ui_epoch_ = emergency_stop_session_generation_ = emergency_stop_reset_epoch_ = 0;
     emergency_stop_published_ms_ = 0; emergency_stop_latency_.reset(); }
   native_control_estop_wakeup_.store(false);
-  native_control_cv_.notify_all();
+  wake_native_control_sender();
 }
 
 void DriverConsoleRuntime::note_native_control_failure(
@@ -5983,12 +5983,12 @@ bool DriverConsoleRuntime::direct_control_continuation_available_locked() {
   return direct_authority_.valid(now);
 }
 
-void DriverConsoleRuntime::poll_native_control_acknowledgements() {
+bool DriverConsoleRuntime::poll_native_control_acknowledgements() {
   std::string session, identity, vehicle;
   std::uint64_t generation = 0, sequence = 0;
   {
     std::lock_guard lock(mutex_);
-    if (session_id_.empty()) return;
+    if (session_id_.empty()) return false;
     session = session_id_; identity = driver_id(); vehicle = vehicle_id_;
     generation = control_session_generation_; sequence = control_sequence_;
   }
@@ -5998,10 +5998,10 @@ void DriverConsoleRuntime::poll_native_control_acknowledgements() {
     {
       std::unique_lock websocket_lock(control_signaling_websocket_mutex_, std::try_to_lock);
       if (!websocket_lock.owns_lock() || !control_signaling_websocket_ ||
-          !control_signaling_websocket_->connected() || control_signaling_websocket_session_id_ != session) return;
+          !control_signaling_websocket_->connected() || control_signaling_websocket_session_id_ != session) return false;
       {
         std::lock_guard lock(mutex_);
-        if (session_id_ != session || control_session_generation_ != generation) return;
+        if (session_id_ != session || control_session_generation_ != generation) return false;
       }
       if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::AckDrain);
       static_cast<void>(drain_native_control_acknowledgements_locked(session, identity, vehicle, acknowledgements));
@@ -6012,12 +6012,13 @@ void DriverConsoleRuntime::poll_native_control_acknowledgements() {
         {"session_generation", generation}, {"poll_started_monotonic_ms", started},
         {"timestamp_scope", "native_websocket_ack_drain"},
         {"poll_processing_ms", monotonic_now_ms() - started}, {"acknowledgements", std::move(acknowledgements)}});
+    return true;
   } catch (const std::exception& error) {
     {
       std::lock_guard lock(control_signaling_websocket_mutex_);
       if (dynamic_cast<const std::invalid_argument*>(&error) == nullptr && direct_control_continuation_available_locked()) {
         if (control_signaling_websocket_) control_signaling_websocket_->close();
-        control_signaling_websocket_.reset(); control_signaling_websocket_session_id_.clear(); return;
+        control_signaling_websocket_.reset(); control_signaling_websocket_session_id_.clear(); return false;
       }
     }
     if (native_control_observation_state_) native_control_observation_state_->begin(ControlObservationPhase::Failure);
@@ -6034,6 +6035,7 @@ void DriverConsoleRuntime::poll_native_control_acknowledgements() {
     }
     note_native_control_failure(error.what(), session, generation);
   }
+  return false;
 }
 
 bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
@@ -6599,7 +6601,14 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
   }
 }
 
+void DriverConsoleRuntime::wake_native_control_sender() noexcept {
+  if (!native_control_sender_wakeup_.notify())
+    native_control_sender_wakeup_failures_.fetch_add(1, std::memory_order_relaxed);
+  native_control_cv_.notify_all();
+}
+
 void DriverConsoleRuntime::native_control_sender_loop(std::stop_token stop_token) {
+  std::stop_callback cancellation(stop_token, [this] { wake_native_control_sender(); });
 #if defined(__APPLE__)
   // Each short input/ACK exchange is latency-sensitive interactive work. The
   // default pthread QoS can defer it while unrelated desktop work runs; keep
@@ -6619,11 +6628,37 @@ void DriverConsoleRuntime::native_control_sender_loop(std::stop_token stop_token
   const auto period = std::chrono::milliseconds(
       std::max(1, static_cast<int>(std::llround(1000.0 / config_.rate_hz))));
   auto next_send = std::chrono::steady_clock::now();
+  bool socket_wait_allowed = true;
   while (!stop_token.stop_requested()) {
-    bool urgent = false;
+    bool urgent = native_control_estop_wakeup_.exchange(false);
     const auto next_poll = std::min(next_send,
         std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
-    {
+    bool socket_waited = false;
+    if (!urgent && socket_wait_allowed && std::chrono::steady_clock::now() < next_poll) {
+      try {
+        std::shared_ptr<const detail::SocketReadiness> waiter;
+        {
+          std::unique_lock lock(control_signaling_websocket_mutex_, std::try_to_lock);
+          if (lock.owns_lock() && control_signaling_websocket_)
+            waiter = control_signaling_websocket_->read_waiter();
+        }
+        // Only poll the retained endpoint here: never hold the ownership lock
+        // while waiting, and never access CURL from a second thread.
+        if (waiter) {
+          const auto remaining = std::max(std::chrono::milliseconds::zero(),
+              std::chrono::ceil<std::chrono::milliseconds>(next_poll - std::chrono::steady_clock::now()));
+          if (waiter->wait(remaining, &native_control_sender_wakeup_))
+            native_control_socket_read_wakeups_.fetch_add(1, std::memory_order_relaxed);
+          socket_waited = true;
+          urgent = native_control_estop_wakeup_.exchange(false);
+        }
+      } catch (const std::exception&) {
+        // This observer is an optimization, not evidence of network progress
+        // or failure. Keep the existing bounded receive check on any failure.
+        native_control_socket_wait_failures_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    if (!urgent && !socket_waited) {
       std::unique_lock lock(native_control_wait_mutex_);
       urgent = native_control_cv_.wait_until(lock, next_poll, [&] {
         return stop_token.stop_requested() ||
@@ -6634,7 +6669,9 @@ void DriverConsoleRuntime::native_control_sender_loop(std::stop_token stop_token
     if (!urgent && std::chrono::steady_clock::now() < next_send) {
       // Record ACK arrival between sends, without increasing command rate or
       // including the sender's idle period in recovery ACK age.
-      poll_native_control_acknowledgements();
+      // If another owner prevented draining a readable socket, back off once
+      // on the original timer instead of spinning on its unread bytes.
+      socket_wait_allowed = poll_native_control_acknowledgements();
       continue;
     }
     native_control_scheduled_at_monotonic_ms_.store(
@@ -6643,6 +6680,7 @@ void DriverConsoleRuntime::native_control_sender_loop(std::stop_token stop_token
             .count(),
         std::memory_order_relaxed);
     static_cast<void>(send_native_control_sample(stop_token));
+    socket_wait_allowed = true;
     // Never replay missed periods or emit a catch-up burst after a scheduler or
     // network stall. The next vehicle packet is always one fresh sample.
     next_send = std::chrono::steady_clock::now() + period;
@@ -7250,7 +7288,7 @@ Json DriverConsoleRuntime::connect_locked(std::string_view requested_vehicle_id,
     }
     native_control_intent_.begin_session(monotonic_now_ms());
   }
-  native_control_cv_.notify_all();
+  wake_native_control_sender();
   try {
     if (connect_cancellation_generation_.load() != generation) throw std::runtime_error("连接申请已取消");
     connect_signaling_websocket(session_id, current_token);
@@ -8212,7 +8250,7 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input, const HttpRe
   }
   if (result.accepted && intent.estop) {
     native_control_estop_wakeup_.store(true);
-    native_control_cv_.notify_all();
+    wake_native_control_sender();
   }
   return {
       {"accepted", result.accepted},
@@ -8402,6 +8440,9 @@ Json DriverConsoleRuntime::status() {
         {"reconnect_delay_ms", native_control_reconnect_delay_ms},
         {"commands_sent_total", native_control_commands_sent_.load()},
         {"send_failures_total", native_control_send_failures_.load()},
+        {"socket_read_wakeups_total", native_control_socket_read_wakeups_.load()},
+        {"socket_wait_failures_total", native_control_socket_wait_failures_.load()},
+        {"sender_wakeup_failures_total", native_control_sender_wakeup_failures_.load()},
         {"last_sent_at_utc_ms", native_control_last_sent_at_utc_ms_.load()},
         {"last_sent_monotonic_ms", native_control_last_sent_monotonic_ms_.load()},
         {"last_gap_ms", native_control_last_gap_ms_.load()},
@@ -8421,6 +8462,7 @@ Json DriverConsoleRuntime::status() {
         {"unacknowledged_limit", detail::NativeControlAcknowledgementWindow::kMaxPendingPackets},
         {"last_ack_received_at_utc_ms",
          native_control_last_ack_received_at_utc_ms_.load()},
+        {"last_ack_received_monotonic_ms", native_control_last_ack_received_monotonic_ms_.load()},
         {"last_ack_cloud_received_at_utc_ms",
          native_control_last_ack_cloud_received_at_utc_ms_.load()},
         {"last_error", native_control_last_error}}},

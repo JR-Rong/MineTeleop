@@ -56,6 +56,30 @@ void test_socket_notification_wakes_idle_receive_without_losing_edges() {
       result.get() == WebSocketReceiveStatus::Notified,
       "notification did not interrupt a blocked socket wait");
 }
+void test_readiness_wait_does_not_consume_network_or_follow_reused_descriptor() {
+  SocketWakeup network, wakeup;
+  SocketReadiness waiter(network.socket());
+  expect(!waiter.wait(0ms,&wakeup),"idle network was readable");
+  expect(wakeup.notify() && !waiter.wait(1s,&wakeup),
+      "local notification was mistaken for network readiness");
+  expect(network.notify() && waiter.wait(1s,&wakeup) && waiter.wait(0ms,&wakeup),
+      "readiness observer consumed network data");
+  expect(network.consume() && !waiter.wait(0ms,&wakeup),
+      "readiness observer retained consumed data");
+#ifndef _WIN32
+  int original[2],replacement[2];
+  expect(::socketpair(AF_UNIX,SOCK_STREAM,0,original)==0,"readiness socketpair failed");
+  SocketReadiness retained(original[0]);
+  const auto stale=original[0];::close(original[0]);
+  expect(::socketpair(AF_UNIX,SOCK_STREAM,0,replacement)==0 && replacement[0]==stale,
+      "readiness fixture did not reuse the original descriptor");
+  expect(::send(replacement[1],"new",3,0)==3 && !retained.wait(0ms),
+      "old observer followed a replacement connection");
+  expect(::send(original[1],"old",3,0)==3 && retained.wait(1s),
+      "old observer lost its pinned endpoint");
+  ::close(original[1]);::close(replacement[0]);::close(replacement[1]);
+#endif
+}
 void test_all_progress_paths_obey_one_deadline() {
   for (bool complete_late : {false,true}) {
     Clock::time_point now{};
@@ -193,6 +217,34 @@ void test_destruction_waits_for_inflight_interruption() {
 int tls_client(int argc,char** argv) {
   expect(argc==4,"TLS fixture needs URL and temporary CA");
   WebSocketClient client(2s,{},argv[3]);client.connect(argv[2]);
+  if(std::string_view(argv[1])=="--tls-client-readiness") {
+    SocketWakeup wakeup;
+    // Drain post-handshake TLS records without fabricating an application ACK.
+    expect(client.receive_json(20ms).status==WebSocketReceiveStatus::Timeout,
+        "readiness fixture sent an unsolicited message");
+    const auto waiter=client.read_waiter();
+    expect(waiter && waiter==client.read_waiter(),"readiness handle was not cached for the connection");
+    auto idle=std::async(std::launch::async,[&] {return waiter->wait(5s,&wakeup);});
+    expect(idle.wait_for(20ms)==std::future_status::timeout,"idle readiness returned without an event");
+    expect(wakeup.notify() && idle.wait_for(500ms)==std::future_status::ready && !idle.get(),
+        "local stop notification did not interrupt readiness or became network progress");
+    auto incoming=std::async(std::launch::async,[&] {return waiter->wait(5s,&wakeup);});
+    expect(incoming.wait_for(20ms)==std::future_status::timeout,"readiness consumed a stale local notification");
+    client.send_json({{"probe","readiness"}},2s);
+    expect(incoming.wait_for(500ms)==std::future_status::ready && incoming.get(),
+        "TLS data did not wake the readiness observer");
+    const auto received=client.receive_json(2s);
+    expect(received.status==WebSocketReceiveStatus::Message && received.message==Json({{"ready",true}}),
+        "readiness observer consumed TLS data instead of leaving it for the owner");
+    auto retiring=std::async(std::launch::async,[&] {return waiter->wait(5s,&wakeup);});
+    expect(retiring.wait_for(20ms)==std::future_status::timeout,"retirement fixture did not start idle");
+    client.close(); // Destroys CURL/Impl while only the retained endpoint waits.
+    expect(retiring.wait_for(500ms)==std::future_status::ready && retiring.get() && !client.read_waiter(),
+        "retiring the owner left a stale observer blocked or exposed a replacement handle");
+    std::cout<<Json{{"network_woke_waiter",true},{"local_stop_woke_waiter",true},
+        {"owner_retirement_woke_waiter",true},{"owner_received_payload",true}}.dump()<<std::endl;
+    return 0;
+  }
   if(std::string_view(argv[1])=="--tls-client-notification") {
     client.enable_read_diagnostics();
     SocketWakeup wakeup;
@@ -313,13 +365,15 @@ int main(int argc,char** argv) {
     if(argc>1 && (std::string_view(argv[1])=="--tls-client" ||
         std::string_view(argv[1])=="--tls-client-cancel" ||
         std::string_view(argv[1])=="--tls-client-drain" ||
-        std::string_view(argv[1])=="--tls-client-notification"))return tls_client(argc,argv);
+        std::string_view(argv[1])=="--tls-client-notification" ||
+        std::string_view(argv[1])=="--tls-client-readiness"))return tls_client(argc,argv);
     test_all_progress_paths_obey_one_deadline();
     test_blocking_backend_is_interrupted_and_cancel_can_join();
     test_completed_operation_disarms_old_deadlines();
     test_original_descriptor_reuse_cannot_redirect_interruption();
     test_destruction_waits_for_inflight_interruption();
     test_socket_notification_wakes_idle_receive_without_losing_edges();
-    std::cout<<"6 websocket deadline/ownership/notification groups passed\n";return 0;
+    test_readiness_wait_does_not_consume_network_or_follow_reused_descriptor();
+    std::cout<<"7 websocket deadline/ownership/notification/readiness groups passed\n";return 0;
   }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }
