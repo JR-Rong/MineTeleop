@@ -1840,12 +1840,18 @@ const controlTransportCourier=MineTeleopControlTransport.createCourier({
     session:nativeControlSessionId,generation:nativeControlSessionGeneration,ui:uiInstanceId,uiEpoch:nativeControlUiEpoch,
     attempt:mediaOfferScope.id,...MineTeleopControlTransport.dataChannelRoute(peer,controlChannel,latestRuntimeStatus.native_control.control_transport.mode,latestRuntimeStatus.native_control.control_transport.experimental_enabled===true)}:null,
   post,now:()=>performance.now(),onStatus:message=>applyVehicleControlMessage(message,true),
+  onPending:isCurrent=>controlTransportScheduler.request(isCurrent),
   onTrace:record=>{if(!controlTraceEnabled)return;const item={...record,browser_event_at_utc_ms:Date.now()};if(record.session_id!==controlTraceScope.session_id){emitControlTraceBatch('late_courier',{session_id:record.session_id},[item],createControlTraceSummary(),false);return}controlTraceBuffer.push(item);if(controlTraceBuffer.length>=48)flushControlTrace('capacity')},
   send:(frame,bytes)=>{const channel=controlChannel;if(channel?.readyState!=='open')return {reason:'channel_not_open'};if(Number(channel.bufferedAmount)!==0)return {reason:'channel_buffer_not_empty'};channel.send(bytes);return true},
   onBoundary:()=>{clearControlInput(false,'control_transport_boundary',true);lastNativeIntentSnapshot=''},
 });
-setInterval(()=>controlTransportCourier.tick().catch(error=>clientLog('control_transport_bridge_error',{error:error.message})),25);
+const controlTransportScheduler=MineTeleopControlTransport.createTickScheduler({
+  tick:()=>controlTransportCourier.tick(),now:()=>performance.now(),
+  onError:error=>clientLog('control_transport_bridge_error',{error:error.message}),
+});
+setInterval(()=>controlTransportScheduler.tick(),25);
 const emergencyStopCourier=MineTeleopControlTransport.createEmergencyCourier({
+  onPending:isCurrent=>emergencyStopScheduler.request(isCurrent),
   scope:()=>latestRuntimeStatus.native_control?.emergency_stop_capability===MineTeleopControlTransport.emergencyProtocol&&polling&&nativeControlSessionId&&mediaOfferScope?.id?{
     session:nativeControlSessionId,generation:nativeControlSessionGeneration,ui:uiInstanceId,uiEpoch:nativeControlUiEpoch,
     attempt:mediaOfferScope.id,ready:Boolean(controlChannel?.readyState==='open')}:null,
@@ -1859,7 +1865,11 @@ const emergencyStopCourier=MineTeleopControlTransport.createEmergencyCourier({
   },
   onConfirmation:seq=>{clientLog('driver_emergency_software_latched',{command_seq:seq,physical_execution_confirmed:false});statusPanel.textContent='车端已锁存急停；执行机构状态仍需查看新鲜 CAN 反馈。'},
 });
-setInterval(()=>emergencyStopCourier.tick().catch(error=>clientLog('emergency_stop_bridge_error',{error:error.message})),25);
+const emergencyStopScheduler=MineTeleopControlTransport.createTickScheduler({
+  tick:()=>emergencyStopCourier.tick(),now:()=>performance.now(),
+  onError:error=>clientLog('emergency_stop_bridge_error',{error:error.message}),
+});
+setInterval(()=>emergencyStopScheduler.tick(),25);
 
 setInterval(()=>cameraView.refresh(),500);
 async function collectMetrics(){

@@ -29,16 +29,46 @@
   // Only this exact local marker means send was not called due to buffer
   // pressure. False/undefined, exceptions and missing ACKs never request retry.
   const emergencyBackpressure = Object.freeze({reason:'buffered_amount_above_threshold'});
-  function createEmergencyCourier({scope, post, now, send, onConfirmation = () => {}}) {
+  // Both the periodic fetch and receipt notifications use this single owner.
+  // Notifications carry no data: the courier's existing bounded queues do.
+  function createTickScheduler({tick, now, onError, schedule = callback => queueMicrotask(callback)}) {
+    let running = false, queued = false, pending = null, retryAt = 0;
+    function request(isCurrent = () => true) {
+      if (!isCurrent()) { if (pending === isCurrent) pending = null; return; }
+      pending = isCurrent;
+      if (running || queued || now() < retryAt) return;
+      queued = true;
+      schedule(() => {
+        queued = false;
+        if (pending && pending()) return run();
+        pending = null;
+      });
+    }
+    async function run() {
+      if (running || now() < retryAt) return;
+      pending = null; running = true;
+      try { await tick(); }
+      catch (error) {
+        // New receipts must not turn a failing HTTP endpoint into a busy loop.
+        // Leave the data queued for the existing 25ms periodic fetch to retry.
+        pending = null; retryAt = now() + 25;
+        try { onError(error); } catch (_) {}
+      } finally { running = false; if (pending) request(pending); }
+    }
+    return Object.freeze({request, tick:run});
+  }
+  function notifyPending(callback) { try { callback(); } catch (_) { /* Periodic fetch remains the fallback. */ } }
+  function createEmergencyCourier({scope, post, now, send, onConfirmation = () => {}, onPending = () => {}}) {
     let busy=false,key='',lastSeen=0,lastConfirmed=0,result=null;
     const scopeKey=value=>JSON.stringify([value.session,value.generation,value.ui,value.uiEpoch,value.attempt]);
+    const notify=()=>{const captured=key;notifyPending(()=>onPending(()=>{const current=scope();return current&&scopeKey(current)===captured}))};
     function receive(message) {
       const current=scope();
       if(!current||message?.event!=='vehicle_control_result'||message.protocol!==protocol||
           message.session_id!==current.session||message.emergency_stop?.protocol!==emergencyProtocol||
           !Number.isSafeInteger(message.command_seq)||message.command_seq<=0)return false;
       if(key!==scopeKey(current)){key=scopeKey(current);lastSeen=lastConfirmed=0;result=null}
-      if(!result||message.command_seq>result.command_seq)result=message;
+      if(!result||message.command_seq>result.command_seq){result=message;notify()}
       return true;
     }
     async function tick() {
@@ -48,6 +78,7 @@
       const captured=scopeKey(current);
       if(key!==captured){key=captured;lastSeen=lastConfirmed=0;result=null}
       const sentResult=result,started=now();busy=true;
+      let acceptedResponse=false;
       try {
         const response=await post('/api/control-transport/emergency',{
           source_session_id:current.session,source_control_session_generation:current.generation,
@@ -55,6 +86,7 @@
           dc_ready:current.ready===true,last_seen_seq:lastSeen,...(sentResult?{vehicle_result:sentResult}:{})});
         const latest=scope();
         if(!latest||scopeKey(latest)!==captured||response?.protocol!==emergencyProtocol)return;
+        acceptedResponse=true;
         if(result===sentResult)result=null;
         if(response.enabled===true&&response.software_latched_confirmed===true&&response.physical_execution_confirmed===false&&response.covers_all_commands===false&&
             Number.isSafeInteger(response.confirmed_command_seq)&&response.confirmed_command_seq>lastConfirmed){
@@ -71,11 +103,15 @@
         if(send(response.frame_json)===emergencyBackpressure)lastSeen=previousSeen;
         // Refetch only the current native publication on the existing tick;
         // never cache bytes, regenerate a timestamp or retry an enqueued frame.
-      } finally {busy=false}
+      } finally {
+        busy=false;
+        const latest=scope();
+        if(acceptedResponse&&result&&latest&&scopeKey(latest)===captured)notify();
+      }
     }
     return Object.freeze({tick,receive});
   }
-  function createCourier({scope, post, now, send, onBoundary, onStatus = () => {}, onTrace = () => {}}) {
+  function createCourier({scope, post, now, send, onBoundary, onStatus = () => {}, onTrace = () => {}, onPending = () => {}}) {
     let busy = false, key = '', lastSeen = 0, revision = 0, negotiated = false, path = 'wss', epoch = 0, feedback = {};
     // Commands remain latest-only. Execution results are independent receipts:
     // replacing one loses evidence and can conceal a rejection between accepts.
@@ -85,6 +121,10 @@
     const trace = value => { try { onTrace(value); } catch (_) {} };
     const statuses = new Map();
     const scopeKey = value => JSON.stringify([value.session, value.generation, value.ui, value.uiEpoch, value.attempt]);
+    const notify = () => {
+      const captured = key;
+      notifyPending(() => onPending(() => { const current = scope(); return current && scopeKey(current) === captured; }));
+    };
     function receive(message) {
       const current = scope();
       if (current && key !== scopeKey(current)) { key = scopeKey(current); lastSeen = revision = 0; results.length = 0; negotiated = false; epoch = 0; feedback = {}; statuses.clear(); }
@@ -96,7 +136,9 @@
             !Number.isSafeInteger(message.status.control_status_seq) || message.status.control_status_seq <= 0) return false;
         if (key !== scopeKey(current)) { key = scopeKey(current); lastSeen = revision = 0; results.length = 0; negotiated = false; epoch = 0; feedback = {}; statuses.clear(); }
         const old = statuses.get(kind);
-        if (!old || stamp.epoch > old.feedback_transport.epoch || (stamp.epoch === old.feedback_transport.epoch && message.status.control_status_seq > old.status.control_status_seq)) statuses.set(kind, message);
+        if (!old || stamp.epoch > old.feedback_transport.epoch || (stamp.epoch === old.feedback_transport.epoch && message.status.control_status_seq > old.status.control_status_seq)) {
+          statuses.set(kind, message); notify();
+        }
         return true;
       }
       if (!current || message?.protocol !== protocol || message.event !== 'vehicle_control_result' ||
@@ -125,7 +167,7 @@
           result_seq:message.result_seq,queue_capacity:resultCapacity,queue_depth:results.length});
         return false;
       }
-      if (selected) results.push({message,receivedAt});
+      if (selected) { results.push({message,receivedAt}); notify(); }
       return true;
     }
     async function tick() {
@@ -136,7 +178,7 @@
       if (key !== capturedKey) { key = capturedKey; lastSeen = revision = 0; results.length = 0; negotiated = false; epoch = 0; feedback = {}; statuses.clear(); }
       const sentEntry = results[0], sentResult = sentEntry?.message, sentResultReceivedAt = sentEntry?.receivedAt,
         sentStatuses = [...statuses.values()], started = now(); busy = true;
-      let completed = false;
+      let completed = false, acceptedResponse = false;
       try {
         const response = await post('/api/control-transport/bridge', {
           source_session_id: current.session, source_control_session_generation: current.generation,
@@ -148,6 +190,7 @@
         completed = true;
         const latest = scope();
         if (!latest || scopeKey(latest) !== capturedKey || response?.protocol !== protocol) return;
+        acceptedResponse = true;
         if (sentEntry && results[0] === sentEntry) results.shift();
         for (const status of sentStatuses) if (statuses.get(status.status.event) === status) statuses.delete(status.status.event);
         feedback = response.feedback_transport || {};
@@ -194,9 +237,12 @@
           browser_received_monotonic_ms:sentResultReceivedAt,post_started_monotonic_ms:started,
           browser_mailbox_wait_ms:Math.max(0,started-sentResultReceivedAt),
           bridge_http_elapsed_ms:Math.max(0,now()-started)});
+        const latest = scope();
+        if (acceptedResponse && (results.length || statuses.size) && latest && scopeKey(latest) === capturedKey)
+          notify();
       }
     }
     return Object.freeze({tick, receive, negotiated: () => negotiated, activePath: () => path, epoch: () => epoch, feedback: () => feedback});
   }
-  return Object.freeze({protocol, feedbackProtocol, emergencyProtocol, emergencyBackpressure, dataChannelRoute, createCourier, createEmergencyCourier});
+  return Object.freeze({protocol, feedbackProtocol, emergencyProtocol, emergencyBackpressure, dataChannelRoute, createTickScheduler, createCourier, createEmergencyCourier});
 });

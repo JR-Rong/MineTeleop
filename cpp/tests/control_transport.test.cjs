@@ -2,15 +2,15 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const api = require('../web/control_transport.js');
-function fixture() {
+function fixture({onPending} = {}) {
   let time = 0, current = {session:'s',generation:7,ui:'owner',uiEpoch:2,attempt:'a',ready:true};
   const requests = [], frames = [], boundaries = [], raw = [], statuses = [], traces = [];
   let reply = () => ({protocol:api.protocol,enabled:true,transport:{epoch:1,path:'dc',revision:1},valid_for_ms:100,frame_json:'{"native":"original bytes"}',
     frame:{seq:1,intent_seq:1,session_id:'s',sent_at_utc_ms:123,control_transport:{protocol:api.protocol,path:'dc',media_attempt:'a'}}});
-  const courier = api.createCourier({scope:()=>current,now:()=>time,
+  const courier = api.createCourier({scope:()=>current,now:()=>time,onPending,
     post:async(path,body)=>{requests.push({path,body});return reply()},send:(frame,bytes)=>{assert.equal(typeof bytes,'string');frames.push(frame);raw.push(bytes);return true},onBoundary:()=>boundaries.push(true),onStatus:value=>statuses.push(value),onTrace:value=>traces.push(value)});
   return {courier,requests,frames,boundaries,raw,statuses,traces,setTime:value=>time=value,setScope:value=>current=value,
-    setReply:value=>reply=value,scope:()=>current};
+    setReply:value=>reply=value,scope:()=>current,now:()=>time};
 }
 const cases = [];
 const test = (name, action) => cases.push({name,action});
@@ -157,16 +157,16 @@ test('explicit scoped zero is forwarded only for the current pending selection, 
   const missing=structuredClone(result);delete missing.feedback_transport.state;assert.equal(f.courier.receive(missing),false);
   state={...feedbackStamp(2),path:'wss',selecting:false};await f.courier.tick();assert.equal(f.courier.receive(result),false,'confirmed state accepted zero downgrade');
 });
-function emergencyFixture() {
+function emergencyFixture({onPending} = {}) {
   let time=0,current={session:'s',generation:7,ui:'owner',uiEpoch:2,attempt:'a',ready:true};
   const requests=[],sent=[],confirmed=[];
   const response=()=>({protocol:api.emergencyProtocol,enabled:true,valid_for_ms:100,frame_json:'{"native_stop":"original 0.0 bytes"}',
     software_latched_confirmed:false,physical_execution_confirmed:false,covers_all_commands:false,
     frame:{seq:1,session_id:'s',estop:true,throttle:0,steering:0,brake:1,emergency_stop:{protocol:api.emergencyProtocol,media_attempt:'a'}}});
   let reply=response;
-  const courier=api.createEmergencyCourier({scope:()=>current,now:()=>time,post:async(path,body)=>{requests.push({path,body});return reply()},
+  const courier=api.createEmergencyCourier({scope:()=>current,now:()=>time,onPending,post:async(path,body)=>{requests.push({path,body});return reply()},
     send:bytes=>sent.push(bytes),onConfirmation:seq=>confirmed.push(seq)});
-  return{courier,requests,sent,confirmed,response,setReply:value=>reply=value,setTime:value=>time=value,setScope:value=>current=value,scope:()=>current};
+  return{courier,requests,sent,confirmed,response,setReply:value=>reply=value,setTime:value=>time=value,setScope:value=>current=value,scope:()=>current,now:()=>time};
 }
 test('emergency courier operates while the ordinary courier request is blocked',async()=>{
   const ordinary=fixture(),stop=emergencyFixture();let complete;
@@ -210,7 +210,7 @@ test('emergency result mailbox keeps advancing current-session results during HT
 // replace the production 1024-byte low watermark with the old review's zero.
 function emergencyBufferFixture(overrideSend) {
   const source=fs.readFileSync(path.join(__dirname,'../src/server.cpp'),'utf8');
-  const section=source.slice(source.indexOf('const emergencyStopCourier='),source.indexOf('setInterval(()=>emergencyStopCourier.tick()'));
+  const section=source.slice(source.indexOf('const emergencyStopCourier='),source.indexOf('const emergencyStopScheduler='));
   const prefix='post,now:()=>performance.now(),send:bytes=>';
   const start=section.indexOf(prefix);assert.ok(start>=0,'shipped emergency callback missing');
   const body=section.slice(start+prefix.length,section.indexOf('\n  onConfirmation:',start)).trim().replace(/,$/,'');
@@ -329,6 +329,109 @@ test('a P2P to TURN switch while fetching discards native bytes without replay',
     frame:{seq:1,session_id:'s',control_transport:{protocol:api.protocol,path:'dc',media_attempt:'a'}}}));
   await f.courier.tick();assert.equal(f.frames.length,0,'discarded pre-switch packet replayed');
   assert.equal(f.requests[1].body.last_seen_seq,1);
+});
+function wakeFixture(emergency=false) {
+  let scheduler;
+  const callbacks=[],errors=[];
+  const f=(emergency?emergencyFixture:fixture)({onPending:guard=>scheduler.request(guard)});
+  scheduler=api.createTickScheduler({tick:()=>f.courier.tick(),now:f.now,
+    schedule:callback=>callbacks.push(callback),onError:error=>errors.push(error.message)});
+  const result=seq=>({event:'vehicle_control_result',protocol:api.protocol,session_id:'s',command_seq:seq,result_seq:seq,
+    accepted:seq!==2,...(emergency?{emergency_stop:{protocol:api.emergencyProtocol}}:{})});
+  async function flush() {
+    let count=0;
+    while(callbacks.length){assert.ok(++count<=70,'unbounded notification loop');await callbacks.shift()()}
+  }
+  return {...f,scheduler,callbacks,errors,result,flush};
+}
+test('receipt wakeups drain FIFO rejections and latest status without timer or duplicate command sends',async()=>{
+  const f=wakeFixture();
+  for(let seq=1;seq<=12;seq++)f.courier.receive(f.result(seq));
+  f.courier.receive(feedbackStatus(1,1));f.courier.receive(feedbackStatus(1,2));
+  for(let i=0;i<20;i++)f.courier.receive(f.result(2));
+  assert.equal(f.requests.length,0);assert.equal(f.callbacks.length,1,'burst did not coalesce');
+  await f.flush();
+  assert.deepEqual(f.requests.map(r=>r.body.vehicle_result.command_seq),Array.from({length:12},(_,i)=>i+1));
+  assert.equal(f.requests[1].body.vehicle_result.accepted,false);
+  assert.equal(f.requests[0].body.vehicle_statuses[0].status.control_status_seq,2);
+  assert.equal(f.frames.length,1,'feedback wakeup replayed the same native command');
+  assert.ok(f.traces.filter(r=>r.stage==='dc_result_bridge_completed').every(r=>r.browser_mailbox_wait_ms===0));
+  assert.equal(f.callbacks.length,0);assert.deepEqual(f.errors,[]);
+});
+test('receipts during HTTP cause one follow-up and emergency remains independent',async()=>{
+  for(const emergency of [false,true]) {
+    const f=wakeFixture(emergency);let complete;
+    f.setReply(()=>new Promise(resolve=>complete=resolve));
+    f.courier.receive(f.result(1));const pending=f.callbacks.shift()();
+    f.courier.receive(f.result(2));f.courier.receive(f.result(3));
+    await f.scheduler.tick();assert.equal(f.requests.length,1);assert.equal(f.callbacks.length,0);
+    if(!emergency){const stop=wakeFixture(true);stop.courier.receive(stop.result(1));await stop.flush();assert.equal(stop.sent.length,1)}
+    const response=emergency?f.response():{protocol:api.protocol,enabled:false};
+    f.setReply(()=>response);complete(response);await pending;
+    assert.equal(f.callbacks.length,1);await f.flush();
+    assert.deepEqual(f.requests.map(r=>r.body.vehicle_result.command_seq),emergency?[1,3]:[1,2,3]);
+    if(emergency)assert.equal(f.sent.length,1,'emergency feedback resent a queued STOP');
+  }
+});
+test('HTTP failure cannot be accelerated by receipt bursts and keeps data for bounded retry',async()=>{
+  for(const emergency of [false,true]) {
+    const f=wakeFixture(emergency);let reject;
+    f.setReply(()=>new Promise((_,fail)=>reject=fail));
+    f.courier.receive(f.result(1));const pending=f.callbacks.shift()();
+    f.courier.receive(f.result(2));reject(Error('offline'));await pending;
+    assert.equal(f.callbacks.length,0);assert.deepEqual(f.errors,['offline']);
+    for(let i=0;i<20;i++)f.courier.receive(f.result(3));
+    await f.scheduler.tick();f.setTime(24);await f.scheduler.tick();
+    assert.equal(f.callbacks.length,0);assert.equal(f.requests.length,1);
+    f.setReply(emergency?f.response:()=>({protocol:api.protocol,enabled:false}));
+    f.setTime(25);await f.scheduler.tick();await f.flush();
+    assert.deepEqual(f.requests.map(r=>r.body.vehicle_result.command_seq),emergency?[1,3]:[1,1,2,3]);
+  }
+});
+test('retired queued notifications and in-flight responses cannot wake a replacement scope',async()=>{
+  for(const emergency of [false,true])for(const inFlight of [false,true])for(const patch of [
+    {session:'new'},{generation:8},{ui:'new'},{uiEpoch:3},{attempt:'new'}]) {
+    const f=wakeFixture(emergency);let complete,pending;
+    f.courier.receive(f.result(1));
+    if(inFlight){f.setReply(()=>new Promise(resolve=>complete=resolve));pending=f.callbacks.shift()();f.courier.receive(f.result(2))}
+    f.setScope({...f.scope(),...patch});
+    if(inFlight){complete(emergency?f.response():{protocol:api.protocol,enabled:false});await pending}
+    await f.flush();assert.equal(f.requests.length,inFlight?1:0);
+    assert.equal((emergency?f.sent:f.frames).length,0,'retired response sent bytes');
+    f.setReply(()=>({protocol:emergency?api.emergencyProtocol:api.protocol,enabled:false}));
+    await f.scheduler.tick();assert.equal(f.requests.at(-1).body.vehicle_result,undefined,'old feedback leaked into periodic fetch');
+  }
+});
+test('notification and periodic tick racing use one owner and ignore invalid protocol wake loops',async()=>{
+  const f=wakeFixture();f.courier.receive(f.result(1));
+  await f.scheduler.tick();await f.flush();assert.equal(f.requests.length,1,'queued wake repeated the periodic fetch');
+  f.setReply(()=>({protocol:'invalid'}));f.courier.receive(f.result(2));await f.flush();
+  assert.equal(f.requests.length,2);assert.equal(f.callbacks.length,0,'invalid response caused automatic retry loop');
+  assert.equal(f.courier.receive({...f.result(3),session_id:'retired'}),false);assert.equal(f.callbacks.length,0);
+  f.setReply(()=>({protocol:api.protocol,enabled:false}));await f.scheduler.tick();
+  assert.equal(f.requests.at(-1).body.vehicle_result.command_seq,2);
+});
+test('shipped page wires both result notifications to the scheduler and retains periodic fetches',async()=>{
+  const source=fs.readFileSync(path.join(__dirname,'../src/server.cpp'),'utf8');
+  const first=source.indexOf('const controlTransportCourier='),last=source.indexOf('setInterval(()=>cameraView.refresh(),500);',first);
+  assert.ok(first>=0&&last>first);
+  const requests=[],timers=[];
+  const context={MineTeleopControlTransport:api,performance:{now:()=>0},polling:true,controlAuthorityLost:false,
+    nativeControlSessionId:'s',nativeControlSessionGeneration:7,uiInstanceId:'owner',nativeControlUiEpoch:2,mediaOfferScope:{id:'a'},
+    latestRuntimeStatus:{native_control:{control_transport:{enabled:true,mode:'cloud_only'},emergency_stop_capability:api.emergencyProtocol}},
+    peer:null,controlChannel:null,controlTraceEnabled:false,applyVehicleControlMessage:()=>{},clearControlInput:()=>{},clientLog:()=>{},
+    post:async(url,body)=>{requests.push({url,body});return {protocol:url.endsWith('/emergency')?api.emergencyProtocol:api.protocol,enabled:false}},
+    setInterval:(callback,ms)=>timers.push({callback,ms})};
+  require('node:vm').runInNewContext(source.slice(first,last)+'\nglobalThis.receivers=[controlTransportCourier,emergencyStopCourier];',context);
+  assert.equal(requests.length,0);assert.equal(timers.length,2);assert.ok(timers.every(t=>t.ms===25));
+  const result={event:'vehicle_control_result',protocol:api.protocol,session_id:'s',command_seq:1,result_seq:1};
+  context.receivers[0].receive(result);
+  context.receivers[1].receive({...result,emergency_stop:{protocol:api.emergencyProtocol}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(requests.length,2,'actual page waited for a periodic tick');
+  assert.ok(requests.every(r=>r.body.vehicle_result.command_seq===1));
+  for(const timer of timers)await timer.callback();
+  assert.equal(requests.length,4,'native publication fallback was removed');
 });
 (async()=>{
   const selected=process.argv.includes('--r5-only')?cases.filter(value=>value.name.startsWith('R5 ')):cases;
