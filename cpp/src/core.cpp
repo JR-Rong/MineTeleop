@@ -1034,6 +1034,7 @@ Json ControlCommand::to_json() const {
   value["brake"] = brake;
   value["estop"] = estop;
   value["operator_active"] = operator_active;
+  value["mock_control_diagnostic"] = mock_control_diagnostic;
   value["critical_video_ready"] = critical_video_ready;
   value["control_time_sync_ready"] = control_time_sync_ready;
   value["operator_input_ready"] = operator_input_ready;
@@ -1067,6 +1068,7 @@ ControlCommand ControlCommand::from_json(const Json& value) {
     command.brake = value.at("brake").get<double>();
     command.estop = value.value("estop", false);
     command.operator_active = value.value("operator_active", false);
+    command.mock_control_diagnostic = value.value("mock_control_diagnostic", false);
     command.critical_video_ready = value.value("critical_video_ready", true);
     // New readiness metadata is mandatory for motion/heartbeat transport.
     // An authenticated ESTOP never depends on a newer producer schema.
@@ -1986,8 +1988,18 @@ Json VehicleConfig::redacted_summary() const {
       {"max_time_sync_uncertainty_ms", field_safety.max_time_sync_uncertainty_ms},
       {"recording_root", recording.root_dir.string()},
       {"recording_enabled", recording.enabled},
+      {"mock_control_diagnostic", runtime.mock_control_diagnostic},
       {"upload_enabled", upload.enabled},
   };
+}
+
+void validate_mock_control_diagnostic(const VehicleConfig& config) {
+  if (!config.runtime.mock_control_diagnostic) return;
+  if (!config.vehicle_id.starts_with("test_bench_") || config.vehicle_adapter.type != "mock" ||
+      !config.cameras.empty() || config.recording.enabled || config.upload.enabled ||
+      !config.runtime.control_enabled || !config.runtime.media_enabled) {
+    throw std::invalid_argument("mock control diagnostic requires test_bench_ identity, mock adapter, empty cameras, no recording/upload and control/signaling enabled");
+  }
 }
 
 VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
@@ -2028,6 +2040,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   const auto runtime = root["runtime"];
   config.runtime.control_enabled = optional<bool>(runtime, "control_enabled", true);
   config.runtime.media_enabled = optional<bool>(runtime, "media_enabled", true);
+  config.runtime.mock_control_diagnostic = optional<bool>(runtime, "mock_control_diagnostic", false);
   config.runtime.control_log_commands = optional<bool>(runtime, "control_log_commands", false);
   config.runtime.teleop_poll_interval_ms = optional<int>(runtime, "teleop_poll_interval_ms", 50);
   config.runtime.media_frame_timeout_ms = optional<int>(runtime, "media_frame_timeout_ms", 3000);
@@ -2161,7 +2174,8 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
     config.cameras.push_back(std::move(camera));
   }
   const auto enabled_cameras = config.enabled_cameras();
-  if (enabled_cameras.empty()) throw std::runtime_error("at least one camera must be enabled");
+  if (enabled_cameras.empty() && !config.runtime.mock_control_diagnostic)
+    throw std::runtime_error("at least one camera must be enabled");
 
   const auto hardware = root["hardware"];
   const auto can = hardware["can"];
@@ -2378,6 +2392,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
         "non-mock vehicle adapter requires hardware.can.tx_queue_length >= 16");
   }
 
+  validate_mock_control_diagnostic(config);
   return config;
 }
 
@@ -3011,6 +3026,7 @@ VehicleAdapterStatus DynamicLibraryVehicleAdapter::status() const {
 }
 
 std::unique_ptr<VehicleAdapter> create_vehicle_adapter(const VehicleConfig& config) {
+  validate_mock_control_diagnostic(config);
   if (config.vehicle_adapter.type == "mock") return std::make_unique<MockVehicleAdapter>();
   if (config.vehicle_adapter.type == "can" || config.vehicle_adapter.type == "dynamic_library") {
     return std::make_unique<DynamicLibraryVehicleAdapter>(
@@ -3067,6 +3083,7 @@ VehicleControlService::VehicleControlService(
       critical_video_required_(std::any_of(config.cameras.begin(), config.cameras.end(), [](const auto& camera) {
         return camera.enabled && camera.critical_for_control;
       })),
+      mock_control_diagnostic_(config.runtime.mock_control_diagnostic),
       max_speed_kph_(config.field_safety.max_speed_kph),
       max_throttle_(config.field_safety.max_throttle),
       full_scale_motor_torque_nm_(config.field_safety.full_scale_motor_torque_nm),
@@ -3083,6 +3100,9 @@ VehicleControlService::VehicleControlService(
       speed_feedback_timeout_ms_(config.field_safety.speed_feedback_timeout_ms),
       hard_overspeed_margin_kph_(config.field_safety.hard_overspeed_margin_kph),
       telemetry_interval_ms_(telemetry_interval_ms) {
+  validate_mock_control_diagnostic(config);
+  if (mock_control_diagnostic_ && dynamic_cast<MockVehicleAdapter*>(adapter_.get()) == nullptr)
+    throw std::invalid_argument("mock control diagnostic requires the built-in mock adapter");
   if (!adapter_) throw std::invalid_argument("vehicle adapter is required");
   if (telemetry_interval_ms_ <= 0) throw std::invalid_argument("telemetry interval must be positive");
   control_limits_ = vehicle_control_limits(config);
@@ -3455,6 +3475,8 @@ ReceiveResult VehicleControlService::receive_command(const ControlCommand& comma
     return result;
   }
   auto& effective = *result.command;
+  if (!effective.estop && effective.mock_control_diagnostic != mock_control_diagnostic_)
+    return {false, "control_diagnostic_scope_mismatch", std::nullopt, {}};
   if (!effective.estop && !active_session_profile_) {
     // A hard timeout already owns the staged watchdog stop. Do not replace it
     // with SessionProfileRequired when the next packet observes the revocation.
@@ -3816,6 +3838,7 @@ Json VehicleControlService::control_timing(std::int64_t /*timestamp_ms*/) const 
           {"recovery_brake_hold", recovery_brake_hold_},
           {"control_recovery_cause", (control_braking_wait_ || recovery_brake_hold_) ? to_string(recovery_cause_) : ""},
           {"critical_video_required", critical_video_required_},
+          {"mock_control_diagnostic", mock_control_diagnostic_},
           {"driver_critical_video_ready", driver_critical_video_ready_},
           {"driver_time_sync_ready", driver_time_sync_ready_},
           {"operator_input_ready", operator_input_ready_},

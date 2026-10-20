@@ -1099,6 +1099,7 @@ std::string console_html(const DriverConfig& config) {
       {"console_source_sha256", web::kConsoleSourceSha256},
       {"rate_hz", config.rate_hz},
       {"intent_lease_ms", config.intent_lease_ms},
+      {"mock_control_diagnostic", config.mock_control_diagnostic},
       {"estop_hold_ms", config.estop_hold_ms},
       {"max_time_sync_uncertainty_ms", config.max_time_sync_uncertainty_ms},
       {"ice_transport_policy", config.ice_transport_policy},
@@ -1365,7 +1366,7 @@ function renderControlState(){
   inputReadiness.className=`status-chip ${estopLatched||gearRejectionInhibited||terminalState?'critical':(ready?'ok':'warn')}`;
   const hardStop=controlLogic.deriveControlStopPresentation(estopLatched,vehicleTelemetry?.estop===true,vehicleTelemetry?.stop_source,vehicleTelemetry?.stop_reason,vcuHandshake);
   const sync=latestRuntimeStatus.time_sync||{},trusted=driverTimeSyncReady(),freshness=controlLogic.telemetryFreshness(vehicleTelemetry,vehicleTelemetryReceivedAt,performance.now(),trusted?Date.now()+Number(sync.offset_ms||0):null),feedbackFresh=freshness.received_age_ms!==null&&freshness.received_age_ms<=500&&(freshness.source_age_ms===null||freshness.source_age_ms<=500),guidance=controlLogic.controlRecoveryGuidance(vehicleTelemetry?.control_timing,feedbackFresh);
-  if(!estopLatched&&hardStop.visible){inputReadiness.textContent='当前阻挡：安全控制已锁定 · 下一步：核实车端故障及恢复条件';inputReadiness.className='status-chip critical'}else if(!estopLatched&&nativeControlPageRetired){inputReadiness.textContent='当前阻挡：新页面已接管 · 下一步：请在当前操作页面驾驶';inputReadiness.className='status-chip warn'}else if(!estopLatched&&nativeControlTakeoverPending){inputReadiness.textContent='当前阻挡：页面接管尚未确认 · 下一步：保持零输入，等待接管确认';inputReadiness.className='status-chip warn'}else if(!estopLatched&&polling&&guidance.visible){inputReadiness.textContent=guidance.text;inputReadiness.className='status-chip warn'}else if(!estopLatched&&polling&&(!driverCriticalVideoHealth().ready||!driverTimeSyncReady()||vcuHandshake.issue_code==='control_recovery_braking_wait')){inputReadiness.textContent=`当前阻挡：${!driverTimeSyncReady()?'时间同步不可信':!driverCriticalVideoHealth().ready?'关键视频未就绪':'恢复状态待确认'} · 下一步：保持方向输入释放，等待连续健康确认`;inputReadiness.className='status-chip warn'}
+  if(!estopLatched&&hardStop.visible){inputReadiness.textContent='当前阻挡：安全控制已锁定 · 下一步：核实车端故障及恢复条件';inputReadiness.className='status-chip critical'}else if(!estopLatched&&nativeControlPageRetired){inputReadiness.textContent='当前阻挡：新页面已接管 · 下一步：请在当前操作页面驾驶';inputReadiness.className='status-chip warn'}else if(!estopLatched&&nativeControlTakeoverPending){inputReadiness.textContent='当前阻挡：页面接管尚未确认 · 下一步：保持零输入，等待接管确认';inputReadiness.className='status-chip warn'}else if(!estopLatched&&polling&&guidance.visible){inputReadiness.textContent=guidance.text;inputReadiness.className='status-chip warn'}else if(!estopLatched&&polling&&(driverVideoBlocksControl()||!driverTimeSyncReady()||vcuHandshake.issue_code==='control_recovery_braking_wait')){inputReadiness.textContent=`当前阻挡：${!driverTimeSyncReady()?'时间同步不可信':driverVideoBlocksControl()?'关键视频未就绪':'恢复状态待确认'} · 下一步：保持方向输入释放，等待连续健康确认`;inputReadiness.className='status-chip warn'}
 }
 function renderVehicles(vehicles=[]){const previous=vehicleSelect.value,currentVehicle=latestRuntimeStatus.connected?latestRuntimeStatus.vehicle_id:'';vehicleSelect.replaceChildren();let firstSelectable='',previousAvailable=false;const labels={online:'在线可控',offline:'离线',active:'控制中',reserved:'已预留',connecting:'连接中',revoked:'已撤销'};for(const vehicle of vehicles){const option=document.createElement('option'),current=vehicle.vehicle_id===currentVehicle,selectable=vehicle.controllable||current;option.value=vehicle.vehicle_id;const controlIssue=String(vehicle.control_issue_message||(vehicle.native_control_compatible===false?'车端版本不兼容，需更新':''));option.textContent=`${vehicle.vehicle_id} · ${controlIssue||(current?'当前会话':(labels[vehicle.state]||vehicle.state))}`;option.disabled=!selectable;if(selectable&&!firstSelectable)firstSelectable=vehicle.vehicle_id;if(selectable&&vehicle.vehicle_id===previous)previousAvailable=true;vehicleSelect.appendChild(option)}vehicleSelect.value=previousAvailable?previous:firstSelectable;connectButton.disabled=connecting||!vehicleSelect.value}
 function renderAuthExpiry(expiresAt){authExpiry.textContent=expiresAt?`认证有效至 ${new Date(expiresAt).toLocaleString()}`:''}
@@ -1384,7 +1385,16 @@ function recordCriticalVideoHealth(health,staleMs){
   }
   return health
 }
+function mockControlDiagnosticReady(){
+  return consoleConfig.mock_control_diagnostic===true&&mediaStatus.mock_control_diagnostic===true&&
+    mediaStatus.adapter_type==='mock'&&mediaStatus.session_id===nativeControlSessionId&&
+    mediaStatus.vehicle_id===latestRuntimeStatus.vehicle_id&&String(mediaStatus.vehicle_id).startsWith('test_bench_')&&
+    Array.isArray(mediaStatus.lanes)&&mediaStatus.lanes.length===0&&mediaStatusReceivedAt!==null&&
+    performance.now()-mediaStatusReceivedAt>=0&&performance.now()-mediaStatusReceivedAt<3000
+}
+function driverVideoBlocksControl(){const health=driverCriticalVideoHealth();return health.required!==false&&!health.ready}
 function driverCriticalVideoHealth(){
+  if(mockControlDiagnosticReady())return recordCriticalVideoHealth({required:false,ready:false,sample_healthy:false,assessed:false,reason:'mock_control_diagnostic_no_video',missing:[],cameras:[],bad_sample_revision:0,brake_sample_revision:0},null);
   const lanes=mediaStatus.lanes||[],ids=lanes.filter(lane=>lane.critical_for_control===true).map(lane=>lane.camera_id);
   if(lanes.length>0&&ids.length===0&&lanes.every(lane=>lane.critical_for_control===false)){cameraView.criticalHealth([],1000);return recordCriticalVideoHealth({ready:true,sample_healthy:true,missing:[],cameras:[]},null)};
   const profile=controlProfileState.effectiveProfile,staleMs=profile?profile.critical_camera_stale_brake_ms:(vehicleHardLimits.default_critical_camera_stale_brake_ms||500);
@@ -1392,6 +1402,7 @@ function driverCriticalVideoHealth(){
   return recordCriticalVideoHealth(ids.length?health:{...health,reason:'critical_configuration_unknown'},staleMs)
 }
 function renderRecordingStatus(){
+  if(mockControlDiagnosticReady()){setMetric('metric-recording','Mock 控制诊断 · 视频未测试','warn');return{assessed:false,text:'视频未测试'}};
   const sync=latestRuntimeStatus.time_sync||{},sourceNow=driverTimeSyncReady()?Date.now()+Number(sync.offset_ms||0):null;
   recordingMonitorState=controlLogic.recordingPresentation(mediaStatus,{session_id:nativeControlSessionId,vehicle_id:latestRuntimeStatus.vehicle_id},mediaStatusReceivedAt,performance.now(),sourceNow,recordingMonitorState);
   setMetric('metric-recording',recordingMonitorState.text,recordingMonitorState.level);
@@ -1444,7 +1455,7 @@ async function writeControlIntent(extra,announceUnavailable,requestToken={}){
   }
   if(blockReason)clearControlInput(false,blockReason);
   if(nativeControlTakeoverPending&&!estopRequested)clearControlInput(false,'input_page_takeover_pending');
-  const viewHealth=driverCriticalVideoHealth(),videoWaiting=!viewHealth.ready||!driverControlTimeSyncReady()||vcuHandshake.issue_code==='control_recovery_braking_wait'||(vehicleTelemetry&&vehicleTelemetry.control_timing&&vehicleTelemetry.control_timing.control_braking_wait===true);
+  const viewHealth=driverCriticalVideoHealth(),videoWaiting=(viewHealth.required!==false&&!viewHealth.ready)||!driverControlTimeSyncReady()||vcuHandshake.issue_code==='control_recovery_braking_wait'||(vehicleTelemetry&&vehicleTelemetry.control_timing&&vehicleTelemetry.control_timing.control_braking_wait===true);
   if(videoWaiting&&!estopRequested)clearControlInput(false,'control_braking_wait',true);
   const outgoing=currentControl(blockReason?{}:extra);
   if((retainedWait||gearTransitionPending)&&!estopRequested)outgoing.throttle=0;
@@ -5079,6 +5090,8 @@ DriverConfig load_driver_config(const std::string& path) {
         "control.keyboard is no longer supported; keyboard bindings are fixed: "
         "Arrow/WASD directions, Space service brake, B hard brake, E ESTOP");
   }
+  if (root["control"] && root["control"]["mock_control_diagnostic"])
+    config.mock_control_diagnostic = root["control"]["mock_control_diagnostic"].as<bool>();
   if (root["control"] && root["control"]["transport_mode"])
     config.control_transport_mode = root["control"]["transport_mode"].as<std::string>();
   if (!control_transport_mode_is_valid(config.control_transport_mode))
@@ -6144,13 +6157,14 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
     command.throttle = sample.intent.throttle;
     command.brake = sample.intent.brake;
     command.estop = sample.intent.estop;
+    command.mock_control_diagnostic = config_.mock_control_diagnostic;
     command.critical_video_ready = sample.intent.critical_video_ready;
     const auto time_readiness = time_sync_readiness_gate_.observe(
         clock_.status(), config_.max_time_sync_uncertainty_ms, monotonic_now_ms(),
         TimeSyncReadinessGate::candidate_timeout_ms(config_.time_sync_interval_ms, config_.time_sync_samples));
     command.control_time_sync_ready = time_readiness.ready;
     command.recovery_sample_healthy = time_readiness.latest_candidate_healthy &&
-        sample.refresh_sample_healthy && sample.intent.critical_video_sample_healthy;
+        sample.refresh_sample_healthy && (config_.mock_control_diagnostic || sample.intent.critical_video_sample_healthy);
     command.operator_input_ready = sample.fresh;
     if (!command.control_time_sync_ready && !command.estop) {
       command.throttle = command.steering = 0.0;
@@ -6161,6 +6175,7 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
     if (native_control_trace_) {
       trace_record["control_time_sync_ready"] = command.control_time_sync_ready;
       trace_record["operator_input_ready"] = command.operator_input_ready;
+      trace_record["mock_control_diagnostic"] = config_.mock_control_diagnostic;
       trace_record["critical_video_ready"] = command.critical_video_ready;
       trace_record["effective_throttle"] = command.throttle;
       trace_record["effective_steering"] = command.steering;
@@ -6414,8 +6429,8 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
           (control_transport_sender_.path() != detail::ControlPath::DataChannel || control_dc_ack_recovery_.latest_sample_healthy());
       const auto revisions = control_source_revision_fence_.observe({
           {"input", sample.refresh_bad_sample_revision, sample.refresh_brake_revision},
-          {"video:" + sample.owner_ui_instance_id, sample.intent.critical_video_bad_sample_revision,
-              sample.intent.critical_video_brake_revision},
+          {"video:" + sample.owner_ui_instance_id, config_.mock_control_diagnostic ? 0 : sample.intent.critical_video_bad_sample_revision,
+              config_.mock_control_diagnostic ? 0 : sample.intent.critical_video_brake_revision},
           {"clock", time_readiness.bad_cohort_revision, time_readiness.brake_cohort_revision},
           {"ack", control_signaling_ack_recovery_.bad_sample_revision(),
               control_signaling_ack_recovery_.brake_sample_revision()},
@@ -7197,6 +7212,8 @@ Json DriverConsoleRuntime::connect_locked(std::string_view requested_vehicle_id,
   }
   const std::string target = requested_vehicle_id.empty() ? current_vehicle : std::string(requested_vehicle_id);
   if (target.empty()) throw std::invalid_argument("vehicle_id is required");
+  if (config_.mock_control_diagnostic && !target.starts_with("test_bench_"))
+    throw std::invalid_argument("mock control diagnostic requires test_bench_ identity");
 
   auto validate_target = [&](bool require_available = true) {
     const auto catalog = vehicles();
@@ -8440,6 +8457,8 @@ Json DriverConsoleRuntime::status() {
         {"effective_throttle", native_sample.intent.throttle},
         {"effective_brake", native_sample.intent.brake},
         {"effective_estop", native_sample.intent.estop},
+        {"mock_control_diagnostic", config_.mock_control_diagnostic},
+        {"critical_video_required", !config_.mock_control_diagnostic},
         {"effective_critical_video_ready", native_sample.intent.critical_video_ready},
         {"effective_critical_video_sample_healthy", native_sample.intent.critical_video_sample_healthy},
         {"websocket_connected", native_control_websocket_connected},

@@ -2936,6 +2936,71 @@ void test_noncritical_video_reports_do_not_brake_but_other_protections_remain() 
   }
 }
 
+void test_mock_control_diagnostic_scope_and_safety() {
+  auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
+  config.vehicle_id = "test_bench_diagnostic";
+  config.runtime.mock_control_diagnostic = true;
+  config.cameras.clear(); config.recording.enabled = false; config.upload.enabled = false;
+  mine_teleop::validate_mock_control_diagnostic(config);
+  auto valid_command = [&](std::uint64_t seq, int now) {
+    auto value = command(seq, now); value.vehicle_id = config.vehicle_id;
+    value.mock_control_diagnostic = true; value.critical_video_ready = false;
+    return value;
+  };
+  auto profile = session_profile_request(100, 0); profile.vehicle_id = config.vehicle_id;
+  for (int invalid = 0; invalid < 6; ++invalid) {
+    auto bad = config;
+    if (invalid == 0) bad.vehicle_adapter.type = "can";
+    if (invalid == 1) bad.vehicle_id = "real_vehicle";
+    if (invalid == 2) bad.cameras.push_back(mine_teleop::CameraConfig{});
+    if (invalid == 3) bad.recording.enabled = true;
+    if (invalid == 4) bad.upload.enabled = true;
+    if (invalid == 5) bad.runtime.control_enabled = false;
+    expect_throws([&] { mine_teleop::create_vehicle_adapter(bad); }, "unsafe diagnostic config accepted");
+  }
+  // Verify the YAML path, including default-mode refusal of an empty camera list.
+  auto yaml = read_text("configs/vehicle-agent.dev.yaml");
+  const auto first = yaml.find("cameras:\n"), last = yaml.find("hardware:\n", first);
+  yaml.replace(first, last-first, "cameras: []\n\n");
+  replace_once(yaml, "id: vehicle-001", "id: test_bench_diagnostic");
+  replace_once(yaml, "upload:\n  enabled: true", "upload:\n  enabled: false");
+  const auto path = write_temp_vehicle_config("mock-diagnostic", yaml);
+  expect_throws([&] { mine_teleop::load_vehicle_config(path); }, "normal mode accepted no cameras");
+  { std::ofstream out(path); out << yaml << "\nruntime:\n  mock_control_diagnostic: true\n"; }
+  expect(mine_teleop::load_vehicle_config(path).runtime.mock_control_diagnostic, "diagnostic YAML failed");
+  std::filesystem::remove(path);
+  for (int gate = 0; gate < 4; ++gate) {
+    auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>(); auto* view = adapter.get();
+    mine_teleop::test::LogicalTimeControlService service(config, "driver-001", "session-001", "token", std::move(adapter), 100);
+    service.start(0);
+    expect(service.receive_session_profile(profile, 0).accepted, "diagnostic profile rejected");
+    auto scope = valid_command(1, 0); scope.mock_control_diagnostic = false;
+    expect(service.receive_command(scope, 0).reason == "control_diagnostic_scope_mismatch", "scope mismatch allowed");
+    auto motion = valid_command(2, 50);
+    expect(mine_teleop::ControlCommand::from_json(motion.to_json()).mock_control_diagnostic, "wire scope lost");
+    expect(service.receive_command(motion, 50).accepted && view->read_telemetry().throttle_feedback > 0,
+        "camera-free mock motion failed");
+    expect(!service.receive_command(motion, 50).accepted, "replay accepted");
+    auto lost = valid_command(3, 100);
+    if (gate == 0) lost.control_time_sync_ready = false;
+    if (gate == 1) lost.operator_input_ready = false;
+    if (gate == 2) { lost.control_link_ready = false; lost.operator_input_ready = false; }
+    if (gate < 3) {
+      expect(!service.receive_command(lost, 100).accepted && service.control_braking_wait() &&
+          view->read_telemetry().throttle_feedback == 0 && view->read_telemetry().brake_feedback == 1,
+          "diagnostic disabled a control safety gate");
+    } else {
+      service.tick(850);
+      expect(service.safety_state() == mine_teleop::SafetyState::TimeoutBrake &&
+          !service.session_control_profile().at("active").get<bool>(), "diagnostic disabled watchdog");
+    }
+    auto stop = valid_command(4, gate == 3 ? 850 : 150); stop.estop = true; stop.mock_control_diagnostic = false;
+    expect(service.receive_command(stop, gate == 3 ? 850 : 150).accepted &&
+        service.safety_state() == mine_teleop::SafetyState::Estop, "diagnostic blocked ESTOP");
+    service.close();
+  }
+}
+
 void test_video_braking_preserves_profile_and_only_real_commands_refresh_control() {
   auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   auto adapter = std::make_unique<mine_teleop::MockVehicleAdapter>();
@@ -5018,6 +5083,7 @@ int main() {
        test_control_service_receive_path_cannot_bypass_hard_timeout},
       {"held_forward_and_left_rearm_after_control_gap",
        test_held_forward_and_left_rearm_after_control_gap},
+      {"mock_control_diagnostic_scope_and_safety", test_mock_control_diagnostic_scope_and_safety},
       {"noncritical_video_reports_do_not_brake_but_other_protections_remain", test_noncritical_video_reports_do_not_brake_but_other_protections_remain},
       {"video_braking_preserves_profile_and_only_real_commands_refresh_control", test_video_braking_preserves_profile_and_only_real_commands_refresh_control},
       {"idle_zero_heartbeats_do_not_trigger_control_timeout", test_idle_zero_heartbeats_do_not_trigger_control_timeout},

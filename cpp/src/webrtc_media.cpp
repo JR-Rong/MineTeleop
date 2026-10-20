@@ -728,6 +728,9 @@ struct VehicleMediaRuntime::Impl {
         recording_root(std::move(next_recording_root)),
         forced_codec(std::move(next_forced_codec)),
         simulate_primary_failure_after_frames(next_simulate_primary_failure_after_frames) {
+    validate_mock_control_diagnostic(config);
+    if (config.runtime.mock_control_diagnostic && !recording_root.empty())
+      throw std::invalid_argument("mock control diagnostic cannot record video");
     if (frame_timeout_ms <= 0) throw std::invalid_argument("frame timeout must be positive");
     if (simulate_primary_failure_after_frames < 0) {
       throw std::invalid_argument("simulated primary failure frame count must be non-negative");
@@ -4015,6 +4018,13 @@ struct VehicleMediaRuntime::Impl {
           false);
       return false;
     }
+    // With no RTP lanes parse_launch returns the single webrtcbin itself.
+    // Wrap it in a pipeline so the bus, state and lifetime match normal mode.
+    if (config.runtime.mock_control_diagnostic) {
+      auto* transport = pipeline;
+      pipeline = gst_pipeline_new(nullptr);
+      gst_bin_add(GST_BIN(pipeline), transport);
+    }
     webrtc = gst_bin_get_by_name(GST_BIN(pipeline), "webrtc");
     if (webrtc == nullptr) {
       set_pipeline_error(
@@ -5077,6 +5087,8 @@ struct VehicleMediaRuntime::Impl {
           const Json status = {
               {"vehicle_id", config.vehicle_id}, {"session_id", signaling.session_id()}, {"reported_at_utc_ms", signaling.now_ms()},
               {"recording_attempt_id", recording_attempt_id},
+              {"mock_control_diagnostic", config.runtime.mock_control_diagnostic},
+              {"adapter_type", config.vehicle_adapter.type},
               {"codec", to_string(candidate.codec)},
               {"backend", to_string(candidate.backend)},
               {"media_negotiation", media_scope_status()},
@@ -5146,7 +5158,7 @@ struct VehicleMediaRuntime::Impl {
             "webrtc_answer_not_applied", "webrtc_answer",
             "Inspect the matching answer completion and GStreamer negotiation state.", true);
       }
-      if (current_pipeline_error().empty() && total_encoded() == 0) {
+      if (!config.runtime.mock_control_diagnostic && current_pipeline_error().empty() && total_encoded() == 0) {
         set_pipeline_error(
             "no encoded video frames were produced",
             "video_frames_not_encoded",
@@ -5155,7 +5167,7 @@ struct VehicleMediaRuntime::Impl {
             true);
       }
       const auto error = current_pipeline_error();
-      const bool passed = error.empty() && answer_applied && total_encoded() > 0 && !control_inhibited;
+      const bool passed = error.empty() && answer_applied && (config.runtime.mock_control_diagnostic || total_encoded() > 0) && !control_inhibited;
       attempts.push_back({
           {"backend", to_string(candidate.backend)},
           {"codec", to_string(candidate.codec)},
@@ -5219,7 +5231,7 @@ struct VehicleMediaRuntime::Impl {
       }
     }
     const bool passed = !attempts.empty() && attempts.back().value("passed", false) &&
-        fps_passed && !control_inhibited;
+        (config.runtime.mock_control_diagnostic || fps_passed) && !control_inhibited;
     Json summary = {
         {"event", "vehicle_media_webrtc_summary"},
         {"runtime", "cpp"},
@@ -5235,6 +5247,8 @@ struct VehicleMediaRuntime::Impl {
         {"max_end_to_end_latency_ms", config.hardware.max_end_to_end_latency_ms},
         {"time_sync", signaling.time_sync_status().to_json()},
         {"fps_passed", fps_passed},
+        {"video_assessed", !config.runtime.mock_control_diagnostic},
+        {"mock_control_diagnostic", config.runtime.mock_control_diagnostic},
         {"control_inhibited", control_inhibited.load()},
         {"recording_enabled", !recording_root.empty()},
         {"recording_root", recording_root.string()},

@@ -382,6 +382,7 @@ struct DriverConfig {
   // Ordinary control keeps live cloud authority in both product modes.
   // Experimental relay comparison and short offline authority remain separate.
   std::string control_transport_mode{"p2p_preferred"};
+  bool mock_control_diagnostic{false};
   bool enable_experimental_control_transport{false};
   bool enable_experimental_direct_authority{false};
   std::filesystem::path browser_event_log_path;

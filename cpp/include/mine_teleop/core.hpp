@@ -78,6 +78,7 @@ struct ControlCommand {
   bool estop{false};
   std::string control_token;
   bool operator_active{false};
+  bool mock_control_diagnostic{false};
   bool critical_video_ready{true};
   bool control_time_sync_ready{true};
   bool operator_input_ready{true};
@@ -469,6 +470,7 @@ struct VehicleRuntimeConfig {
   int experimental_direct_authority_max_ms{0};
   bool control_enabled{true};
   bool media_enabled{true};
+  bool mock_control_diagnostic{false};
   bool control_log_commands{false};
   int teleop_poll_interval_ms{50};
   int media_frame_timeout_ms{3000};
@@ -588,6 +590,7 @@ struct VehicleConfig {
   [[nodiscard]] Json redacted_summary() const;
 };
 
+void validate_mock_control_diagnostic(const VehicleConfig& config);
 VehicleConfig load_vehicle_config(const std::filesystem::path& path);
 void validate_chassis_bridge_abi(const std::filesystem::path& library_path);
 
@@ -921,6 +924,7 @@ class VehicleControlService {
   std::unique_ptr<VehicleAdapter> adapter_;
   bool require_feedback_before_control_{true};
   bool critical_video_required_{true};
+  bool mock_control_diagnostic_{false};
   double max_speed_kph_{40.0};
   double max_throttle_{1.0};
   double full_scale_motor_torque_nm_{kDefaultFullScaleMotorTorqueNm};

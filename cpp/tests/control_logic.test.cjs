@@ -1844,8 +1844,32 @@ test('video protection timings reject missing, old, fractional and out-of-range 
   assert.match(logic.vehicleControlDiagnostic('control_recovery_braking_wait').text,/当前会话与参数保留/);
 });
 
+test('mock diagnostic requires fresh matching session status and never reports healthy video', () => {
+  let now=100;
+  const context=vm.createContext({consoleConfig:{mock_control_diagnostic:true},
+    mediaStatus:{mock_control_diagnostic:true,adapter_type:'mock',vehicle_id:'test_bench_diag',session_id:'s',lanes:[]},
+    mediaStatusReceivedAt:0,performance:{now:()=>now},nativeControlSessionId:'s',latestRuntimeStatus:{vehicle_id:'test_bench_diag'},
+    controlProfileState:{effectiveProfile:null},vehicleHardLimits:{},recordCriticalVideoHealth:health=>health,
+    cameraView:{criticalHealth:()=>({ready:false,sample_healthy:false})}});
+  const begin=controlPageSource.indexOf('function mockControlDiagnosticReady(){');
+  const end=controlPageSource.indexOf('function renderRecordingStatus(){',begin);
+  vm.runInContext(controlPageSource.slice(begin,end),context);
+  assert.equal(context.mockControlDiagnosticReady(),true);
+  assert.equal(context.driverVideoBlocksControl(),false);
+  const health=context.driverCriticalVideoHealth();
+  assert.equal(health.ready,false);assert.equal(health.sample_healthy,false);assert.equal(health.assessed,false);
+  for(const [field,value] of [['adapter_type','can'],['session_id','old'],['vehicle_id','real_vehicle'],['lanes',[{}]],['mock_control_diagnostic',false]]){
+    const previous=context.mediaStatus[field];context.mediaStatus[field]=value;
+    assert.equal(context.mockControlDiagnosticReady(),false,field);
+    assert.equal(context.driverVideoBlocksControl(),true,field);
+    context.mediaStatus[field]=previous;
+  }
+  now=3000;assert.equal(context.driverVideoBlocksControl(),true);
+  now=100;context.consoleConfig.mock_control_diagnostic=false;assert.equal(context.driverVideoBlocksControl(),true);
+});
+
 test('shipped view health distinguishes optional-only cameras from unknown critical configuration', () => {
-  const context=vm.createContext({mediaStatus:{lanes:[]},controlProfileState:{effectiveProfile:null},
+  const context=vm.createContext({mockControlDiagnosticReady:()=>false,mediaStatus:{lanes:[]},controlProfileState:{effectiveProfile:null},
     vehicleHardLimits:{default_critical_camera_stale_brake_ms:700},
     recordCriticalVideoHealth:health=>health, cameraView:{criticalHealth:(ids,staleMs)=>({ready:ids.length>0,missing:ids,staleMs})}});
   const handler=controlPageSource.match(/^function driverCriticalVideoHealth\(\)\{[\s\S]*?^\}/m);
@@ -2227,7 +2251,7 @@ async function recordingMonitorFixture() {
   }
   const document={createElement:()=>new Element(),getElementById:id=>{if(!metrics.has(id))metrics.set(id,new Element());return metrics.get(id)}};
   class Clock extends Date {static now(){return 100000+context.performance.now()}}
-  Object.assign(context,{document,Date:Clock,authenticated:true,mediaStatus:{lanes:[]},mediaStatusReceivedAt:null,
+  Object.assign(context,{mockControlDiagnosticReady:()=>false,document,Date:Clock,authenticated:true,mediaStatus:{lanes:[]},mediaStatusReceivedAt:null,
     recordingMonitorState:{scopeKey:'',incomplete:false},latestMetrics:{codec:'h264',backend:'software',streams:[{camera_id:'front',fps:30,bitrate_kbps:2000,packet_loss_percent:0,estimated_end_to_end_latency_ms:100}]},
     monitorPanel:new Element(),alertsPanel:new Element(),streamMetrics:new Element(),vehicleSelect:{value:'vehicle'},lastAlertKey:'',
     renderEstopRequest(){},renderControlRecovery:()=>({visible:false}),renderVcuHandshake(){},renderCanFeedback(){},renderControlState(){},

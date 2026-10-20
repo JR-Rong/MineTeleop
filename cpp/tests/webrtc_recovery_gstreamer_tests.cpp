@@ -225,11 +225,41 @@ void verify_start_without_camera_frames(bool configured, const std::string& code
   gst_object_unref(peer);
   gst_object_unref(pipeline);
 }
+void verify_control_only_offer() {
+  GError* error = nullptr;
+  auto* transport = gst_parse_launch("webrtcbin name=webrtc bundle-policy=max-bundle ice-transport-policy=all", &error);
+  expect(!error && transport, "control-only webrtcbin unavailable");
+  auto* pipeline = gst_pipeline_new(nullptr);
+  gst_bin_add(GST_BIN(pipeline), transport);
+  auto* peer = gst_bin_get_by_name(GST_BIN(pipeline), "webrtc");
+  expect(peer != nullptr, "control-only pipeline lost transport");
+  expect(gst_element_set_state(pipeline, GST_STATE_READY) != GST_STATE_CHANGE_FAILURE, "control-only READY failed");
+  GstWebRTCDataChannel* channel = nullptr;
+  g_signal_emit_by_name(peer, "create-data-channel", "control", nullptr, &channel);
+  expect(channel != nullptr, "control-only SCTP unavailable");
+  expect(mine_teleop::detail::configure_webrtc_video_transceivers(peer) == 0, "control-only mode created video");
+  expect(gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE, "control-only PLAYING failed");
+  auto* promise = gst_promise_new();
+  g_signal_emit_by_name(peer, "create-offer", nullptr, promise);
+  expect(gst_promise_wait(promise) == GST_PROMISE_RESULT_REPLIED, "control-only offer did not reply");
+  GstWebRTCSessionDescription* offer = nullptr;
+  const auto* reply = gst_promise_get_reply(promise);
+  expect(reply && gst_structure_get(reply, "offer", GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &offer, nullptr) && offer,
+      "control-only SDP missing");
+  expect(gst_sdp_message_medias_len(offer->sdp) == 1 &&
+      std::string(gst_sdp_media_get_media(gst_sdp_message_get_media(offer->sdp, 0))) == "application",
+      "control-only SDP must contain SCTP only");
+  gst_webrtc_session_description_free(offer); gst_promise_unref(promise);
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  g_object_unref(channel); gst_object_unref(peer); gst_object_unref(pipeline);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   gst_init(&argc, &argv);
   try {
+    verify_control_only_offer();
     verify_offer(false);
     verify_offer(true);
     for (const std::string codec : {"H264", "H265"}) {
