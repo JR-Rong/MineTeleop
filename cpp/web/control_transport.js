@@ -31,9 +31,10 @@
   const emergencyBackpressure = Object.freeze({reason:'buffered_amount_above_threshold'});
   // Both the periodic fetch and receipt notifications use this single owner.
   // Notifications carry no data: the courier's existing bounded queues do.
-  function createTickScheduler({tick, now, onError, schedule = callback => queueMicrotask(callback)}) {
+  function createTickScheduler({tick, now, onError, beforeTick = () => {}, schedule = callback => queueMicrotask(callback)}) {
     let running = false, queued = false, pending = null, retryAt = 0;
     function request(isCurrent = () => true) {
+      beforeTick();
       if (!isCurrent()) { if (pending === isCurrent) pending = null; return; }
       pending = isCurrent;
       if (running || queued || now() < retryAt) return;
@@ -45,6 +46,7 @@
       });
     }
     async function run() {
+      beforeTick();
       if (running || now() < retryAt) return;
       pending = null; running = true;
       try { await tick(); }
@@ -95,9 +97,10 @@
       if(!result||message.command_seq>result.command_seq){result=message;notify()}
       return true;
     }
+    function cancelStaleRequest() { const current=scope(); request.cancelUnless(current ? scopeKey(current) : ''); }
     async function tick() {
+      cancelStaleRequest();
       const current=scope();
-      request.cancelUnless(current ? scopeKey(current) : '');
       if(busy)return;
       if(!current||!current.session||!current.attempt||!current.ui||current.uiEpoch<=0)return;
       const captured=scopeKey(current);
@@ -134,7 +137,7 @@
         if(acceptedResponse&&result&&latest&&scopeKey(latest)===captured)notify();
       }
     }
-    return Object.freeze({tick,receive});
+    return Object.freeze({tick,receive,cancelStaleRequest});
   }
   function createCourier({scope, post, now, send, onBoundary, onStatus = () => {}, onTrace = () => {}, onPending = () => {}, requestTimeoutMs = 500}) {
     const request = scopedRequest(post, requestTimeoutMs);
@@ -196,9 +199,10 @@
       if (selected) { results.push({message,receivedAt}); notify(); }
       return true;
     }
+    function cancelStaleRequest() { const current=scope(); request.cancelUnless(current ? scopeKey(current) : ''); }
     async function tick() {
+      cancelStaleRequest();
       const current = scope();
-      request.cancelUnless(current ? scopeKey(current) : '');
       if (busy) return;
       if (!current || !current.session || !current.attempt || !current.ui || current.uiEpoch <= 0) return;
       const capturedKey = scopeKey(current);
@@ -269,7 +273,7 @@
           notify();
       }
     }
-    return Object.freeze({tick, receive, negotiated: () => negotiated, activePath: () => path, epoch: () => epoch, feedback: () => feedback});
+    return Object.freeze({tick, receive, cancelStaleRequest, negotiated: () => negotiated, activePath: () => path, epoch: () => epoch, feedback: () => feedback});
   }
   return Object.freeze({protocol, feedbackProtocol, emergencyProtocol, emergencyBackpressure, dataChannelRoute, createTickScheduler, createCourier, createEmergencyCourier});
 });

@@ -8,6 +8,34 @@
 #include <iostream>
 #include <thread>
 
+namespace mine_teleop {
+// Inspect an unfetched native publication and inject a recovery observation
+// while holding the real transport mutex. Sending/fallback/bridge stay real.
+struct DriverConsoleTransportTestAccess {
+  static Json withdraw_with_pending_motion(DriverConsoleRuntime& runtime, int cause) {
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    const auto frame = runtime.control_transport_latest_dc_;
+    if (!frame.is_object() || frame.value("throttle", 0.0) <= 0.0) return nullptr;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (cause == 0) runtime.control_signaling_ack_recovery_.enter(now, 5000, runtime.control_signaling_last_ack_seq_);
+    else if (cause == 1) runtime.control_dc_ack_recovery_.enter(now, 5000, runtime.control_dc_last_ack_seq_);
+    else if (cause == 2) runtime.control_transport_dc_ready_ = false;
+    else {
+      runtime.control_signaling_ack_window_.reset();
+      runtime.control_signaling_ack_window_.note_sent(runtime.native_control_last_seq_.load() + 1, now - 501);
+    }
+    return {{"frame", frame}, {"published_at", runtime.control_transport_latest_dc_at_ms_}};
+  }
+  static bool retired(DriverConsoleRuntime& runtime) {
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    return runtime.control_transport_sender_.path() == detail::ControlPath::Wss &&
+        runtime.control_transport_latest_dc_.is_null() && runtime.control_dc_last_ack_seq_ == 0 &&
+        runtime.control_dc_ack_window_.pending_count() == 0 && !runtime.control_dc_ack_recovery_.waiting();
+  }
+};
+}
+
 namespace {
 using namespace mine_teleop;
 using namespace mine_teleop::detail;
@@ -321,6 +349,41 @@ struct Fixture {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 };
+void product_recovery_withdraws_unfetched_motion() {
+  for (int cause = 0; cause < 4; ++cause) {
+    Fixture f(false, false, true); f.dc_network_path = "p2p";
+    auto transport = [&] { return f.driver->status().at("native_control").at("control_transport"); };
+    auto deadline = steady() + 8000;
+    while (steady() < deadline) {
+      f.pump(true);
+      if (transport().at("path") == "dc" && !transport().at("qualifying").get<bool>() &&
+          !transport().at("selecting").get<bool>()) break;
+    }
+    expect(transport().at("path") == "dc" && !transport().at("qualifying").get<bool>(), "DC not qualified");
+    f.input(); f.requested_throttle = 0.4; f.input();
+    // Do not pump/fetch any further DC frames. The native sender produces a
+    // genuinely nonzero command which the vehicle has never received.
+    Json pending;
+    deadline = steady() + 1000;
+    while (steady() < deadline && pending.is_null()) {
+      pending = DriverConsoleTransportTestAccess::withdraw_with_pending_motion(*f.driver, cause);
+      if (pending.is_null()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    expect(pending.is_object(), "no unfetched nonzero native publication");
+    expect(pending.at("frame").at("seq").get<std::uint64_t>() > f.last_dc_seq, "pending frame was already consumed");
+    deadline = steady() + 80;
+    while (steady() < deadline && transport().at("path") == "dc") std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    expect(transport().at("path") == "wss", "recovery did not withdraw DC");
+    // No WSS select has been delivered to the vehicle. Neither expiry nor
+    // replay rejection may hide a stale publication at this boundary.
+    expect(steady() - pending.at("published_at").get<std::int64_t>() < kNativeBridgePublicationMaxAgeMs,
+        "test missed the live publication window");
+    expect(f.fence.path() == ControlPath::DataChannel, "vehicle already received fallback select");
+    expect(f.bridge(f.scope(true)).at("frame_json").is_null(), "bridge returned retired nonzero DC publication");
+    expect(DriverConsoleTransportTestAccess::retired(*f.driver), "fallback retained DC publication or ACK state");
+  }
+}
+
 void product_wss_reconnect_retires_dc_and_recovers_ack() {
   Fixture fixture(false, false, true);
   fixture.dc_network_path = "p2p";
@@ -823,6 +886,6 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
 }
 }  // namespace
 int main(int argc, char** argv) {
-  try { if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

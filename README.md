@@ -337,8 +337,13 @@ the authority at the last issued deadline.
 
 ```bash
 scripts/test/run_control_plane_docker_smoke.sh
-scripts/deploy/run_control_plane_docker.sh
+scripts/deploy/run_control_plane_docker.sh # Linux host networking only
 ```
+
+The interactive script uses Linux host networking with both services bound to
+`127.0.0.1`; it does not publish a wildcard console listener. On macOS/Windows,
+use the native desktop client. The isolated Docker smoke remains available on
+Docker Desktop and exercises the image default command inside a shared network namespace.
 
 The smoke creates native signaling and console containers, grants one vehicle
 session, verifies control-message isolation, and exchanges browser media codec

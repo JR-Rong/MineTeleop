@@ -334,7 +334,7 @@ function wakeFixture(emergency=false) {
   let scheduler;
   const callbacks=[],errors=[];
   const f=(emergency?emergencyFixture:fixture)({onPending:guard=>scheduler.request(guard)});
-  scheduler=api.createTickScheduler({tick:()=>f.courier.tick(),now:f.now,
+  scheduler=api.createTickScheduler({tick:()=>f.courier.tick(),beforeTick:()=>f.courier.cancelStaleRequest(),now:f.now,
     schedule:callback=>callbacks.push(callback),onError:error=>errors.push(error.message)});
   const result=seq=>({event:'vehicle_control_result',protocol:api.protocol,session_id:'s',command_seq:seq,result_seq:seq,
     accepted:seq!==2,...(emergency?{emergency_stop:{protocol:api.emergencyProtocol}}:{})});
@@ -420,7 +420,7 @@ test('shipped page wires both result notifications to the scheduler and retains 
     nativeControlSessionId:'s',nativeControlSessionGeneration:7,uiInstanceId:'owner',nativeControlUiEpoch:2,mediaOfferScope:{id:'a'},
     latestRuntimeStatus:{native_control:{control_transport:{enabled:true,mode:'cloud_only'},emergency_stop_capability:api.emergencyProtocol}},
     peer:null,controlChannel:null,controlTraceEnabled:false,applyVehicleControlMessage:()=>{},clearControlInput:()=>{},clientLog:()=>{},
-    post:async(url,body)=>{requests.push({url,body});return {protocol:url.endsWith('/emergency')?api.emergencyProtocol:api.protocol,enabled:false}},
+    post:(...args)=>context.reply(...args),reply:async(url,body)=>{requests.push({url,body});return {protocol:url.endsWith('/emergency')?api.emergencyProtocol:api.protocol,enabled:false}},
     setInterval:(callback,ms)=>timers.push({callback,ms})};
   require('node:vm').runInNewContext(source.slice(first,last)+'\nglobalThis.receivers=[controlTransportCourier,emergencyStopCourier];',context);
   assert.equal(requests.length,0);assert.equal(timers.length,2);assert.ok(timers.every(t=>t.ms===25));
@@ -432,6 +432,12 @@ test('shipped page wires both result notifications to the scheduler and retains 
   assert.ok(requests.every(r=>r.body.vehicle_result.command_seq===1));
   for(const timer of timers)await timer.callback();
   assert.equal(requests.length,4,'native publication fallback was removed');
+  const signals=[];context.reply=(_,__,signal)=>{signals.push(signal);return new Promise(()=>{})};
+  const inFlight=timers.map(timer=>timer.callback());
+  context.mediaOfferScope={id:'replacement'};
+  for(const timer of timers)await timer.callback();
+  assert.equal(signals.length,2);assert.ok(signals.every(signal=>signal.aborted),'shipped scheduler did not cancel both lanes');
+  await Promise.all(inFlight);
 });
 test('both couriers abort a stalled HTTP request and can fetch again without replaying its reply',async()=>{
   for(const create of [api.createCourier,api.createEmergencyCourier]) {
@@ -454,6 +460,21 @@ test('both couriers cancel a pending request when the session scope changes',asy
     const pending=assert.rejects(courier.tick(),/cancelled/);
     current={...current,attempt:'new'};await courier.tick();await pending;
     assert.equal(signal.aborted,true);await courier.tick();assert.equal(calls,2);
+  }
+});
+test('production scheduler cancels stale in-flight requests in both lanes before timeout',async()=>{
+  for(const create of [api.createCourier,api.createEmergencyCourier])for(const patch of [
+    {session:'new'},{generation:2},{ui:'new'},{uiEpoch:2},{attempt:'new'},null]) {
+    let current={session:'s',generation:1,ui:'u',uiEpoch:1,attempt:'a',ready:true},calls=0,signal,resolveLate,time=0;
+    const courier=create({scope:()=>current,now:()=>time,onBoundary:()=>{},send:()=>assert.fail('retired frame sent'),
+      post:(_,__,nextSignal)=>{calls++;if(calls===1){signal=nextSignal;return new Promise(resolve=>resolveLate=resolve)}return Promise.resolve({enabled:false})}});
+    const scheduler=api.createTickScheduler({tick:()=>courier.tick(),beforeTick:()=>courier.cancelStaleRequest(),now:()=>time,onError:()=>{}});
+    const pending=scheduler.tick();await scheduler.tick();assert.equal(calls,1);
+    current=patch?{...current,...patch}:null;
+    await scheduler.tick();assert.equal(signal.aborted,true,'scheduler busy guard hid scope cancellation');
+    await pending;assert.equal(calls,1,'scheduler overlapped requests');
+    time=25;await scheduler.tick();assert.equal(calls,patch?2:1,'replacement scope stayed blocked for 500ms');
+    resolveLate({enabled:true,frame:{seq:99}});await Promise.resolve();
   }
 });
 (async()=>{

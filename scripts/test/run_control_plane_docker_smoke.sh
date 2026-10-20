@@ -30,10 +30,7 @@ done
 
 docker run -d --name "$console_name" --network "container:$server_name" \
   --security-opt "no-new-privileges:true" --cap-drop ALL \
-  "$image" driver-console \
-    --config /opt/mine-teleop/share/mine-teleop/configs/driver-console.dev.yaml \
-    --host 127.0.0.1 --port 8080 \
-    --signaling-http-url http://127.0.0.1:8765 >/dev/null
+  "$image" >/dev/null # Exercise the image's default console CMD.
 
 for _ in $(seq 1 30); do
   if docker exec "$server_name" /opt/mine-teleop/bin/mine-teleop \

@@ -1861,7 +1861,7 @@ const controlTransportCourier=MineTeleopControlTransport.createCourier({
   onBoundary:()=>{clearControlInput(false,'control_transport_boundary',true);lastNativeIntentSnapshot=''},
 });
 const controlTransportScheduler=MineTeleopControlTransport.createTickScheduler({
-  tick:()=>controlTransportCourier.tick(),now:()=>performance.now(),
+  tick:()=>controlTransportCourier.tick(),beforeTick:()=>controlTransportCourier.cancelStaleRequest(),now:()=>performance.now(),
   onError:error=>clientLog('control_transport_bridge_error',{error:error.message}),
 });
 setInterval(()=>controlTransportScheduler.tick(),25);
@@ -1881,7 +1881,7 @@ const emergencyStopCourier=MineTeleopControlTransport.createEmergencyCourier({
   onConfirmation:seq=>{clientLog('driver_emergency_software_latched',{command_seq:seq,physical_execution_confirmed:false});statusPanel.textContent='车端已锁存急停；执行机构状态仍需查看新鲜 CAN 反馈。'},
 });
 const emergencyStopScheduler=MineTeleopControlTransport.createTickScheduler({
-  tick:()=>emergencyStopCourier.tick(),now:()=>performance.now(),
+  tick:()=>emergencyStopCourier.tick(),beforeTick:()=>emergencyStopCourier.cancelStaleRequest(),now:()=>performance.now(),
   onError:error=>clientLog('emergency_stop_bridge_error',{error:error.message}),
 });
 setInterval(()=>emergencyStopScheduler.tick(),25);
@@ -5480,13 +5480,8 @@ void DriverConsoleRuntime::note_native_control_failure(
   // Ordinary DC still depends on cloud authority. Its receipts cannot clear
   // the independent WSS ACK fault: select a new, neutral WSS epoch so that a
   // real cloud ACK can recover it. Never resurrect the retired DC publication.
-  if (control_transport_sender_.path() == detail::ControlPath::DataChannel) {
-    control_transport_sender_.begin(detail::ControlPath::Wss, {}, monotonic_now_ms(), recovery_timeout_ms);
-    control_transport_latest_dc_ = Json();
-    control_dc_ack_window_.reset();
-    control_dc_ack_recovery_.reset();
-    control_dc_last_ack_seq_ = 0;
-  }
+  if (control_transport_sender_.path() == detail::ControlPath::DataChannel)
+    select_control_wss_locked(monotonic_now_ms(), recovery_timeout_ms);
   if (control_signaling_websocket_) control_signaling_websocket_->close();
   control_signaling_websocket_.reset();
   control_signaling_websocket_session_id_.clear();
@@ -5499,6 +5494,21 @@ void DriverConsoleRuntime::note_native_control_failure(
       now_monotonic_ms + control_signaling_reconnect_delay_ms_;
   control_signaling_reconnect_delay_ms_ =
       std::min(control_signaling_reconnect_delay_ms_ * 2, 1000);
+}
+
+// Caller owns control_signaling_websocket_mutex_: publication and ACK state
+// retire atomically with the route, before the browser can fetch another frame.
+void DriverConsoleRuntime::retire_control_dc_locked() {
+  control_transport_latest_dc_ = Json();
+  control_transport_latest_dc_at_ms_ = 0;
+  control_dc_ack_window_.reset();
+  control_dc_ack_recovery_.reset();
+  control_dc_last_ack_seq_ = 0;
+}
+
+void DriverConsoleRuntime::select_control_wss_locked(std::int64_t now, int timeout_ms) {
+  control_transport_sender_.begin(detail::ControlPath::Wss, {}, now, timeout_ms);
+  retire_control_dc_locked();
 }
 
 bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& input, std::string_view session,
@@ -5544,7 +5554,12 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
   }
   int timeout_ms;
   { std::lock_guard lock(mutex_); timeout_ms = control_recovery_timeout_ms_; }
+  const auto previous_path = control_transport_sender_.path();
   const auto receipt = control_transport_sender_.note_result(result, now, timeout_ms);
+  // Selection conflicts and slower relay qualification can fall back inside
+  // the sender, including while this result is being uploaded by the bridge.
+  if (previous_path == detail::ControlPath::DataChannel &&
+      control_transport_sender_.path() == detail::ControlPath::Wss) retire_control_dc_locked();
   if (!receipt.matched) {
     // A newer result may have retired the retained send. Preserve the verified
     // observation without treating it as current feedback or refreshing a lease.
@@ -5838,7 +5853,7 @@ Json DriverConsoleRuntime::control_transport_bridge(const Json& input, const Htt
   // failure detection; it never extends the vehicle's timestamp limit.
   const auto age = now - control_transport_latest_dc_at_ms_;
   const auto allowance = detail::kNativeBridgePublicationMaxAgeMs;
-  if (control_transport_dc_ready_ && control_transport_latest_dc_.is_object() && age >= 0 && age < allowance &&
+  if (control_transport_dc_ready_ && control_transport_sender_.owns_dc_publication(control_transport_latest_dc_) && age >= 0 && age < allowance &&
       control_transport_latest_dc_.value("seq", std::uint64_t{0}) > last_seen &&
       control_transport_latest_dc_.value("bridge_owner", "") == owner &&
       control_transport_latest_dc_.value("bridge_ui_epoch", std::uint64_t{0}) == ui_epoch) {
@@ -6346,11 +6361,12 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
       // Bootstrap a fenced cloud route even if ICE/DC never opens. Neutral
       // selection is admitted before common profile/VCU readiness checks.
       if (vehicle_transport_capable && control_transport_cloud_capable_ && !control_transport_sender_.negotiated())
-        control_transport_sender_.begin(detail::ControlPath::Wss, {}, monotonic_ms, recovery_timeout_ms);
+        select_control_wss_locked(monotonic_ms, recovery_timeout_ms);
       if (!direct_continuation && control_signaling_ack_recovery_.waiting() &&
           control_transport_sender_.path() == detail::ControlPath::DataChannel)
-        control_transport_sender_.begin(detail::ControlPath::Wss, {}, monotonic_ms, recovery_timeout_ms);
-      static_cast<void>(control_transport_sender_.observe(dc_ready, current_media_attempt, monotonic_ms, recovery_timeout_ms));
+        select_control_wss_locked(monotonic_ms, recovery_timeout_ms);
+      if (control_transport_sender_.observe(dc_ready, current_media_attempt, monotonic_ms, recovery_timeout_ms))
+        retire_control_dc_locked();
       if (dc_ready && !control_signaling_ack_recovery_.waiting() &&
           control_transport_sender_.consider_dc(current_media_attempt, monotonic_ms, recovery_timeout_ms)) {
         control_dc_ack_window_.reset(); control_dc_ack_recovery_.reset(); control_dc_last_ack_seq_ = 0;
@@ -6360,7 +6376,7 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
             control_dc_ack_window_.stall_age_ms(monotonic_ms), control_dc_last_ack_seq_,
             control_dc_ack_window_.last_ack_packet_age_ms(), recovery_timeout_ms);
         if (dc_transition.entered || control_dc_ack_recovery_.waiting())
-          control_transport_sender_.begin(detail::ControlPath::Wss, {}, monotonic_ms, recovery_timeout_ms);
+          select_control_wss_locked(monotonic_ms, recovery_timeout_ms);
       }
       if (control_transport_sender_.revision() != previous_transport_revision) native_control_intent_.invalidate(true);
       const bool transport_hold = control_transport_sender_.holding_motion() ||
@@ -6377,7 +6393,11 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
       const auto recovery_transition = direct_continuation ? detail::NativeControlAckRecovery::Transition{} : control_signaling_ack_recovery_.observe(
           monotonic_ms, control_signaling_ack_window_.pending_count(), ack_stall_age_ms,
           control_signaling_last_ack_seq_, control_signaling_ack_window_.last_ack_packet_age_ms(), recovery_timeout_ms);
-      if (recovery_transition.entered) control_signaling_recovery_gear_ = command.gear;
+      if (recovery_transition.entered) {
+        control_signaling_recovery_gear_ = command.gear;
+        if (control_transport_sender_.path() == detail::ControlPath::DataChannel)
+          select_control_wss_locked(monotonic_ms, recovery_timeout_ms);
+      }
       if (recovery_transition.entered || recovery_transition.recovered) {
         // Invalidate at both boundaries: neutral refreshes during the wait
         // cannot arm motion before ACK recovery has actually been confirmed.

@@ -18,6 +18,14 @@ class ControlTransportSender {
   void reset_feedback_comparison() { wss_.reset(); dc_.reset(); baseline_wss_ms_.reset(); }
   void set_data_channel_is_p2p(bool value) { dc_is_p2p_ = value; }
   [[nodiscard]] ControlPath path() const { return stamp_.path; }
+  [[nodiscard]] bool owns_dc_publication(const Json& payload) const {
+    if (path() != ControlPath::DataChannel || !payload.is_object() ||
+        !payload.contains("control_transport")) return false;
+    const auto& wire = payload.at("control_transport");
+    return wire.is_object() && wire.value("path", "") == "dc" &&
+        wire.value("epoch", std::uint64_t{0}) == stamp_.epoch &&
+        wire.value("media_attempt", "") == stamp_.media_attempt;
+  }
   [[nodiscard]] bool negotiated() const { return stamp_.epoch != 0; }
   [[nodiscard]] bool selecting() const { return selecting_; }
   [[nodiscard]] bool holding_motion() const { return selecting_ || qualifying_; }

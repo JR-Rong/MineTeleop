@@ -139,6 +139,32 @@ void healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup() {
   expect(sender.consider_dc("media-a", 5451, 5000), "recovered direct candidate was never retried");
 }
 
+void publication_is_owned_only_by_its_current_dc_epoch() {
+  for (int cause = 0; cause < 6; ++cause) {
+    ControlTransportSender sender; baseline(sender);
+    expect(sender.consider_dc("media-a", 200, 5000), "DC trial missing");
+    auto pending = payload(7, 201); pending["throttle"] = 0.4; sender.decorate(pending);
+    expect(sender.owns_dc_publication(pending), "current DC publication rejected");
+    if (cause == 0) sender.begin(ControlPath::Wss, {}, 202, 5000);
+    else if (cause == 1) sender.observe(false, "media-a", 202, 5000);
+    else if (cause == 2) sender.observe(true, "replacement", 202, 5000);
+    else if (cause == 3) sender.observe(true, "media-a", 5200, 5000);
+    else if (cause == 4) {
+      auto selection = payload(4, 201); sender.decorate(selection); sender.note_sent(selection, ControlPath::DataChannel, 201);
+      auto conflict = response(selection, false); conflict["reason"] = "transport_epoch_conflict"; conflict["authority_epoch"] = 0;
+      sender.note_result(conflict, 202, 5000);
+    } else {
+      for (std::uint64_t seq = 4; seq <= 6; ++seq) {
+        auto frame = payload(seq, seq * 100); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, seq * 100);
+        sender.note_result(response(frame, true, seq == 4), seq * 100 + 80, 5000);
+      }
+    }
+    expect(sender.path() == ControlPath::Wss && !sender.owns_dc_publication(pending), "fallback still owns pending DC motion");
+    sender.begin(ControlPath::DataChannel, "media-a", 6000, 5000);
+    expect(!sender.owns_dc_publication(pending), "next DC epoch revived old publication");
+  }
+}
+
 void failed_direct_trials_back_off_and_exhaust_per_attempt() {
   ControlTransportSender sender; sender.set_data_channel_is_p2p(true);
   std::int64_t now = 0;
@@ -263,9 +289,10 @@ void real_service_switch_does_not_disable_watchdog() {
 }  // namespace
 int main() {
   try {
+    publication_is_owned_only_by_its_current_dc_epoch();
     failed_direct_trials_back_off_and_exhaust_per_attempt();
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "11 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "12 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

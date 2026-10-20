@@ -447,6 +447,9 @@ class DriverConsoleRuntime {
   [[nodiscard]] const DriverConfig& config() const { return config_; }
 
  private:
+  friend struct DriverConsoleTransportTestAccess;
+  void retire_control_dc_locked();
+  void select_control_wss_locked(std::int64_t now, int timeout_ms);
   [[nodiscard]] Json login_locked(std::string_view password);
   [[nodiscard]] Json connect_locked(std::string_view requested_vehicle_id, std::uint64_t generation,
                                     std::string_view ui_instance_id);
