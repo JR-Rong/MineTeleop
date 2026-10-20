@@ -1406,7 +1406,7 @@ function driverCriticalVideoHealth(){
   return recordCriticalVideoHealth(ids.length?health:{...health,reason:'critical_configuration_unknown'},staleMs)
 }
 function renderRecordingStatus(){
-  if(mockControlDiagnosticReady()){setMetric('metric-recording','Mock 控制诊断 · 视频未测试','warn');return{assessed:false,text:'视频未测试'}};
+  if(mockControlDiagnosticReady()){setMetric('metric-recording','Mock 控制诊断 · 视频未测试','warn');return{assessed:false,text:'视频未测试',alerts:[]}};
   const sync=latestRuntimeStatus.time_sync||{},sourceNow=driverTimeSyncReady()?Date.now()+Number(sync.offset_ms||0):null;
   recordingMonitorState=controlLogic.recordingPresentation(mediaStatus,{session_id:nativeControlSessionId,vehicle_id:latestRuntimeStatus.vehicle_id},mediaStatusReceivedAt,performance.now(),sourceNow,recordingMonitorState);
   setMetric('metric-recording',recordingMonitorState.text,recordingMonitorState.level);

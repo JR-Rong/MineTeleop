@@ -2270,6 +2270,27 @@ async function recordingMonitorFixture() {
   return {fixture,context,metrics,publish,camera};
 }
 
+test('actual shipped monitor accepts zero-camera mock status without changing control gates',async()=>{
+  const {fixture,context,metrics,publish}=await recordingMonitorFixture();
+  context.mockControlDiagnosticReady=()=>true;
+  context.latestMetrics={streams:[]};
+  const profile=JSON.stringify(context.controlProfileState);
+  const authority=context.controlAuthorityLost;
+  const health=JSON.stringify(context.driverCriticalVideoHealth());
+  assert.doesNotThrow(()=>publish(undefined,{lanes:[]}));
+  assert.match(metrics.get('metric-recording').textContent,/Mock 控制诊断.*视频未测试/);
+  assert.equal(context.renderRecordingStatus().assessed,false);
+  assert.deepEqual(Array.from(context.renderRecordingStatus().alerts),[]);
+  assert.equal(JSON.stringify(context.driverCriticalVideoHealth()),health);
+  assert.equal(JSON.stringify(context.controlProfileState),profile);
+  assert.equal(context.controlAuthorityLost,authority);
+  assert.equal(fixture.requests.length,0);
+  // Leaving mock scope restores the ordinary recording-evidence requirement.
+  context.mockControlDiagnosticReady=()=>false;
+  publish(undefined);
+  assert.match(metrics.get('metric-recording').textContent,/未确认/);
+});
+
 test('actual shipped monitor reports recording failures and next action without changing held input or video readiness',async()=>{
   const {fixture,context,metrics,publish}=await recordingMonitorFixture();
   const input=JSON.stringify(context.currentControl()),profile=JSON.stringify(context.controlProfileState);
