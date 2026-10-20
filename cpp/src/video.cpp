@@ -1,4 +1,5 @@
 #include "mine_teleop/video.hpp"
+#include "mine_teleop/gstreamer_media.hpp"
 
 #include <gst/gst.h>
 
@@ -163,6 +164,11 @@ std::vector<EncoderCandidate> encoder_candidate_order(const HardwareConfig& hard
 std::unique_ptr<VideoEncoder> create_video_encoder(const EncoderCandidate& candidate) {
   if (candidate.backend == EncoderBackend::Nvenc) return std::make_unique<NvencVideoEncoder>(candidate.codec);
   return std::make_unique<VaapiVideoEncoder>(candidate.codec);
+}
+
+GstElement* parse_initialized_gstreamer_pipeline(const char* description, GError** error) {
+  ensure_gstreamer();
+  return gst_parse_launch(description, error);
 }
 
 bool gstreamer_factory_available(std::string_view factory_name) {

@@ -4003,7 +4003,7 @@ struct VehicleMediaRuntime::Impl {
     prepare_recording(candidate);
     GError* parse_error = nullptr;
     const auto description = build_pipeline(encoder_choice.get());
-    pipeline = gst_parse_launch(description.c_str(), &parse_error);
+    pipeline = parse_initialized_gstreamer_pipeline(description.c_str(), &parse_error);
     if (parse_error != nullptr || pipeline == nullptr) {
       const std::string message = parse_error != nullptr ? parse_error->message : "unknown pipeline parse error";
       if (parse_error != nullptr) g_error_free(parse_error);
