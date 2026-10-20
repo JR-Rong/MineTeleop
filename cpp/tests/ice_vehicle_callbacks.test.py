@@ -96,7 +96,7 @@ struct Signaling {Json incoming={{"messages",Json::array()}};std::vector<std::pa
 struct Impl {
 '''
 MEMBERS = r'''
-  struct { struct { int experimental_direct_authority_max_ms=0; } runtime; } config;
+  struct { struct { int experimental_direct_authority_max_ms=0; bool mock_control_diagnostic=false; } runtime; } config;
   void flush_control_status() {} // Control status has separate protocol/service coverage.
   void process_control_management(const Json&,const Json&) {}
   struct Lane {struct {std::string id="front";} camera;struct {int width=1,height=1,fps=1,bitrate_kbps=1;} profile;};

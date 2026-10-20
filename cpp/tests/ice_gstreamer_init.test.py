@@ -71,7 +71,7 @@ struct Impl {
 '''
 
 MEMBERS = r'''
-  struct {struct {int experimental_direct_authority_max_ms=0;} runtime;} config;
+  struct {struct {int experimental_direct_authority_max_ms=0;bool mock_control_diagnostic=false;} runtime;} config;
   struct Lane {struct {std::string id;} camera;struct {int width=16,height=16,fps=20,bitrate_kbps=1;} profile;};
   std::vector<std::unique_ptr<Lane>> lanes;
   struct {VideoCodec codec=VideoCodec::H264,backend=VideoCodec::H264;} active_candidate;
