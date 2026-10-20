@@ -39,6 +39,23 @@ Camera count:
   are arriving: verify nonempty buffers and vehicle_camera_first_frame.
   Changing the enabled set requires a media-session restart.
 
+Recording:
+
+  Keep bin/mine-teleop-recorder beside bin/mine-teleop. The media runtime
+  resolves that sibling executable directly and starts it with private IPC
+  descriptors. It does not search PATH. The helper remuxes the existing encoded
+  H.264/H.265 access units into MP4 segments; it does not run another encoder
+  or connect to a vehicle, signaling server, or uploader.
+
+  The package checker requires the helper and its resolved libraries, exercises
+  its local --help with networking disabled, and checks appsrc, appsink,
+  h264parse, h265parse, splitmuxsink, mp4mux and filesink in the bundled
+  GStreamer registry. Reusing an older base bundle still requires these checks.
+  The presence and help checks do not prove that recording can complete on a
+  particular disk. A helper failure or unfinished segment is reported as
+  failed/incomplete; it must not be treated as a finalized recording or a
+  successful upload. Realtime media and control retain their own health state.
+
 ICE policy:
 
   cloud.ice_transport_policy: all gathers direct, STUN, and TURN candidates and

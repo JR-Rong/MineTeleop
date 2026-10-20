@@ -151,18 +151,18 @@ CCG2 的 `vehicle_camera_first_frame`、`vehicle_camera_failed` 和 lane metrics
 
 | `event` / `issue_code` | 条件 | 控制与媒体结果 |
 | --- | --- | --- |
-| `vehicle_camera_failed` / 具体 camera issue | 单路采集首次或再次失败 | `critical_for_control=true` 时首个已确认故障立即本地安全停车、锁止控制并关闭 profile/VCU/status DataChannel；原生 WSS 命令继续被锁存拒绝，非关键 lane 不改变控制权限 |
-| `vehicle_camera_reopen_scheduled` / `camera_lane_reopen_scheduled` | 故障可重试且累计失败次数未超过 `reopen_attempts` | 只销毁并重开故障采集源，其他 lane 不重建；关键相机的控制锁止保持不变 |
-| `vehicle_camera_recovered` / `camera_lane_recovered` | 重开后的第一帧到达 | 视频恢复；若为关键相机，同一云端 session 的控制锁止保持不变，不能把该事件当作恢复驾驶权限 |
+| `vehicle_camera_failed` / 具体 camera issue | 单路采集首次或再次失败 | `critical_for_control=true` 时立即独立制动等待，保留会话/参数；非关键 lane 不改变控制权限 |
+| `vehicle_camera_reopen_scheduled` / `camera_lane_reopen_scheduled` | 故障可重试且累计失败次数未超过 `reopen_attempts` | 只销毁并重开故障采集源，其他 lane 不重建；已有等待截止点不延长 |
+| `vehicle_camera_recovered` / `camera_lane_recovered` | 重开后的第一帧到达 | 视频恢复不等于恢复驾驶；所有关键帧与输入/校时稳定恢复后要求新零输入和释放重按；已超时硬锁存不解除 |
 | `vehicle_camera_lane_disabled` / `camera_reopen_exhausted` | 不可重试或重开额度耗尽 | 关键 lane 禁用且继续保持停车；非关键 lane 只结束自身视频，其他 lane 与当前控制继续 |
-| `vehicle_control_inhibited_by_camera` / `critical_camera_control_inhibited` | 关键相机首次确认失败 | 保持车辆停止并关闭 profile/VCU/status DataChannel；必须结束当前 session，在新 session 重建该 DataChannel、control-only WSS 并重新完成 VCU 握手 |
-| `vehicle_control_inhibition_retained` / `critical_camera_control_inhibition_retained` | 媒体 service 在同一云端 session 内重建 runtime | 继续拒绝控制并保留视频能力；结束当前 session 后才能在新 session 重新握手 |
-| `vehicle_control_inhibition_latch_failed` / `critical_camera_control_latch_failed` | 内部 session 作用域不一致，无法更新共享锁存 | runtime-local 锁存仍立即安全停车；保持物理隔离并结束当前 session，禁止继续驾驶 |
+| `vehicle_control_recovery_timeout` / `critical_camera_failed`、`control_recovery_timeout` | 视频、校时或输入故障持续到恢复等待截止点 | 保持车辆停止并关闭 profile/VCU/status DataChannel；必须结束当前 session，在新 session 重建该 DataChannel、control-only WSS 并重新完成 VCU 握手 |
+| `vehicle_control_inhibition_retained` / `control_recovery_inhibition_retained` | 已超时硬锁存的同一 session 重建 runtime | 继续拒绝控制并保留视频能力；结束当前 session 后才能在新 session 重新握手 |
+| `vehicle_control_inhibition_latch_failed` / `control_recovery_latch_failed` | 内部 session 作用域不一致，无法更新共享锁存 | runtime-local 锁存仍立即安全停车；保持物理隔离并结束当前 session，禁止继续驾驶 |
 
 默认 `reopen_attempts=3` 是同一次媒体运行尝试内的累计上限：前三次可重试采集故障
 各触发一次单路重开，第四次禁用 lane；成功取帧不会把额度恢复成无限重试。
 允许范围是 `0..10`，`0` 表示首故障直接禁用；`reopen_backoff_ms` 默认
-`500 ms`、范围 `0..60000 ms`。关键相机的安全锁存不会因捕获、编码恢复或同一云端
+`500 ms`、范围 `0..60000 ms`。超出恢复期限后的安全锁存不会因捕获、编码恢复或同一云端
 session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧、多关键相机交错
 恢复、短暂画面恢复或媒体 transport 重试自行重新获得驾驶权限。
 
@@ -200,8 +200,8 @@ session 内重建 `VehicleMediaRuntime` 自动清除，避免故障前排队帧�
 | `vehicle_control_data_channel_closed` | 已打开的 channel 关闭 | 命令计数、最后接收时间 | 每次状态变化 |
 | `vehicle_native_control_websocket_failed` / `native_control_websocket_connection_failed` | 车端 control-only WSS 连接、读取、关闭或 ACK 失败 | `consecutive_errors`, `errors_total`, `safety_action=local_watchdog_safe_stop` | 最多每秒一次 |
 | `vehicle_native_control_websocket_failed` / `native_control_websocket_protocol_failed` | 控制 WSS envelope/type/cursor/`intent_seq`/`intent_fresh` 非法 | 同上及协议错误文本 | 最多每秒一次 |
-| `vehicle_media_pipeline_failed` / `media_runtime_time_sync_failed` | session 中刷新时间同步失败 | `error` | 每个 candidate 首错一次 |
-| `vehicle_media_pipeline_failed` / `media_runtime_time_sync_uncertainty_exceeded` | 刷新不确定度越界 | limit | 每个 candidate 首错一次 |
+| `vehicle_media_pipeline_failed` / `media_runtime_time_sync_failed` | 旧包运行阶段校时失败记录；V7 改为制动等待 | `error` | 每个 candidate 首错一次 |
+| `vehicle_media_pipeline_failed` / `media_runtime_time_sync_uncertainty_exceeded` | 旧包校时不确定度越界记录；V7 改为制动等待 | limit | 每个 candidate 首错一次 |
 | `vehicle_media_signaling_failed` / `session_signaling_exchange_failed` | offer/answer/ICE 消息收发失败 | `error` | 每次 session 失败 |
 | `vehicle_media_session_ended` / `active_media_session_ended` | HTTP 404 或 409 `session_not_active` | `http_status`, `server_issue_code`, retry delay | 等待新的有效会话 |
 | `vehicle_media_connection_refresh` / `vehicle_registration_refresh_required` | HTTP 409 `vehicle_offline` | `server_issue_code` | 刷新车辆在线注册 |
@@ -227,6 +227,43 @@ stale 非零丢弃和严格零值 stale heartbeat 接受/拒绝计数；
 跨机器 UTC delta 必须结合当时的 time-sync uncertainty 解读；同进程 monotonic delta
 才是不受校时影响的调度/处理证据。profile、握手或状态 DataChannel 正常不能证明
 普通控制 WSS 正常，反之亦然。
+
+### 控制 WSS 积压与软件等待的区分
+
+`driver_native_control_trace_batch` 的 `send_completed` 每秒附一次 `transport`，
+ACK 真停滞及发送失败前另采样（`failure_transport`）。记录实际 socket 的 peer、
+TCP RTT、重传累计、待发送/未读字节，以及客户端已读但未拼完的
+`buffered_receive_bytes` / `partial_frame_polls_total`。各平台按实际 API 提供字段，
+`tcp_info_available=false` / 缺字段表示不支持或查询失败，不能解释成重传为零。
+Windows 使用可选 Win10+ SIO_TCP_INFO v0，保留既有 Win7 编译基线；
+Linux TCP_INFO 的重传以 segment 计，Windows/macOS 以 byte 计，不能混算。
+累计值只在相同 peer 和 `connection_started_monotonic_ms` 内比较。
+
+云端 `ingress_ack_send_completed` / `failed` 增加：完整帧解析后、取锁前的
+`cloud_frame_received_*`，`cloud_receive_wait_ms`、`cloud_frame_assembly_ms`、
+`cloud_json_parse_ms`、`cloud_receive_loop_gap_ms`，以及循环权限检查和入队前的
+`cloud_loop_mutex_wait_ms` / `cloud_ingress_mutex_wait_ms` / 对应 authority_check_ms。
+loop gap 是前一次 receive 调用结束到本次调用开始，正常 idle poll 等待另计。
+原 `cloud_received_*` 仍为入队函数开始，已在锁内，原 processing_ms 不包含锁等待。
+云端同样每秒附一次当前 socket 的 transport，并保留已有 ACK send 起止/耗时。
+`cloud_receive_started_monotonic_ms` / `cloud_receive_call_ms` 保留完整调用边界；
+接收或拼帧抛错时另记录 `ingress_receive_failed` 的起止、错误和 TCP 快照。
+
+RTT/重传增加能证明该 TCP hop 的传输压力，不能单独证明无线断网；云端 socket
+peer 可能是 TLS 反向代理，此时云端 TCP_INFO 只覆盖代理到服务的一跳。FIONREAD
+是内核未读字节，WSS 下可能是密文，不能当作完整命令计数；客户端 buffered 字节
+是已经从 TLS 取出、尚未完成 WebSocket 拼帧的字节。send 返回仅表示交给 socket/TLS，
+不表示车端已经收到。结合三个阶段的 seq 和单调耗时判断，参见
+[session-000075 进一步诊断](40-control-wss-delay-diagnostics.md)。
+
+新的 `details.observations` 每秒从既有异步 trace worker 观察连接当前阶段、
+`phase_elapsed_ms`、`observer_heartbeat_gap_ms` 和 TCP 快照；即使接收帧、ACK 写
+或服务互斥锁尚未返回，也能保留阶段证据。驾驶端控制锁被占用时只报告
+`control_socket_lock_busy`，不阻塞控制线程。日志输出自身阻塞也会推迟观察，
+采样缺失不是独立断网证明。`control_hard_stop_transition` 仅在首次观察到硬状态
+时记录最后解析命令/核心校验结果/最后合法应用与 watchdog 计数，区分到达被拒绝
+和无报文；解析不等同合法。新增 ACK 制动等待、三端能力校验和 session-000076
+逐条证据见 [docs/41](41-ack-braking-recovery-and-session76.md)。
 
 ### HTTP 409 与 signaling sequence
 
@@ -392,3 +429,100 @@ jq -c 'select(
   .name == "feedback_timeout"
 )' /var/log/mine-teleop/vcu-can.jsonl*
 ```
+
+V7 的 `vehicle_control_braking_wait` / `vehicle_control_recovered` 记录共同恢复门限、首次故障类型和校时状态。`time_sync_refresh` 追踪记录采样耗时、最新估计、`anchor_accepted`、上一份有效锚点时刻及错误。驾驶端 `intent_received` 与发送追踪包含输入年龄、租约、输入/时钟健康标志；安全心跳仍需身份、序号、年龄及保留挡位校验。网络真正无有效控制达到原门限时，仍先执行控制 watchdog。
+
+转换时还记录 `critical_lanes` 的采集/编码年龄、恢复基线和背压，以及 `control_snapshot`
+的控制服务/参数有效性、`safety_state` 与 `control_timing`。`soft_brake_request_active`
+区分当前制动保持与硬停车后的媒体状态变化，`soft_brake_applied_this_transition` 由
+适配器成功安全输出调用计数差判定，只证明软件 API 返回，不证明物理 EHB/EPB 完成。
+字段只随转换记录，不按帧刷日志；分析方法与例证见 [session-000075](39-session75-stop-analysis.md)。
+
+
+## 校时请求与页面停车原因（session-000006）
+
+`time_sync_refresh.details.time_sync.samples` 仅随校时刷新追踪记录，最多 15 个样本；
+普通状态、控制循环和媒体状态不重复携带这份详细数组。样本包括：
+
+- `round_trip_ms`、`offset_ms`、`server_processing_ms`：既有四时间戳计算结果。
+- `monotonic_elapsed_ms`、`wall_clock_elapsed_ms`、`wall_clock_step_ms`：本地等待与
+  系统墙钟变化的对比；小幅差值可能来自取整/调度，不能单独认定系统发生跳时。
+- `http.client_mutex_wait_ms`：等待本地 HttpClient 互斥锁的时间；`peer_address`、
+  `new_connections` 和 `curl_result` 描述实际请求的连接及结果。
+- `http.dns_ms/connect_ms/tls_ms/first_byte_ms/total_ms`：libcurl 从请求开始累计的
+  阶段时刻，单位 ms；不是可直接相加的独立耗时。连接复用或失败时部分值可为零。
+- `server_api_gate_wait_ms`：云端 API 限流门锁等待；旧云端没有此字段时为 null。
+  新云端还记录 `server_before_handler_ms/server_parse_ms/server_processing_monotonic_ms`。
+  T2 在收到完整请求后、解析与业务锁之前；已知云端处理等待由 T3−T2 扣除。
+- `http.request_sent_at_utc_ms/body_received_at_utc_ms/exchange_monotonic_ms`：新客户端
+  的 HTTP 发送头/接收体边界。`timestamp_scope` 区分实际回调与旧调用边界回退；
+  DNS/TLS 和客户端锁等待不再计入该校时交换 RTT。回调不是网卡物理收发时间。
+- `http.tcp_before_send/tcp_at_receive`：仅在该次 curl 所拥有的套接字仍有效时采样；
+  可用时包含 TCP RTT、重传和缓冲。平台不支持或拿不到 socket 时显式标不可用。
+  不记录 URL、凭证、HTTP 头或正文；零重传不能证明没有网络/代理排队。
+- 失败组记录 `details.sample_failure.failed_sample_index/completed_samples` 和
+  `details.http_failure`；`completed_samples` 表示 HTTP 已完成的样本，`valid=false`
+  标明时间校验失败，不能把未完成或矛盾采样当作可信锚点。
+
+`control_timing.timer_domain=steady_clock` 的有效控制年龄、车端接收间隔和遥测发布
+间隔使用单调时钟。包内 UTC 年龄校验不变；硬停车追踪保留单调
+`last_accepted_control_age_ms`，另以 `last_accepted_control_utc_age_ms` 供校时诊断。
+UTC 锚点前后跳不应被误算成真实控制断流；真实无有效控制仍按原门限停车。
+
+`vehicle_camera_capture_sample` 增加 `requested_capture_fps/target_encode_fps`、
+`capture_fps_observed/capture_fps_sample_duration_ms`；首个无完整窗口的样本为 null。
+`capture_diagnostics` 记录 timeperframe 能力、分子/分母及 `driver_negotiated_fps`。
+这些记录核验驱动交付频率，不证明传感器物理采集频率。完整复核见
+[校时、采集频率与硬停车复核](43-time-sync-threshold-capture-and-stop-review.md)。
+
+被拒绝的采样组不替换上一份可信 UTC/单调时钟锚点，立即进入恢复重试资格；不可信
+阶段工作线程以 100 ms 轮询，可信阶段仍为 500 ms。样本数、不确定度阈值和车端
+首次故障硬截止点保持原规则。它减少可避免的等待，不保证持续高延迟能在期限内恢复。
+
+车端既有 `vcu_handshake_status` 和 `media_status` 增加可选 `control_recovery`：
+`cause`、`phase`、冻结的 `timeout_ms` 及 `deadline_monotonic_ms`。单调时刻只用于
+车端关联日志，页面不跨机器比较该值。红色条显示具体原因与恢复期限，并在控制
+DataChannel 关闭后保留；物理急停和人工急停仍优先。信令中的硬故障也将页面控制
+资格置为 fault，后续健康媒体状态不能解锁。新会话清除上一会话的原因。
+
+关键画面遮罩在连续 1000 ms 无呈现新帧后显示；制动仍按协商的
+`critical_camera_stale_brake_ms` 判断，非关键画面仍为 3000 ms。完整实例和 FPS
+配置边界见 [session-000006](42-session006-time-sync-and-video-display.md)。
+
+## 驾驶端输入、关键画面及 ICE 诊断
+
+`intent_received.local_http_timing` 区分本地 HTTP receive 到 handler、update/runtime
+互斥锁等待、handler 和 receive-to-apply 时间。该时间不包含响应完整写回及浏览器
+处理，不能把客户端剩余耗时直接全部归为网络。输入 lease 从真实 receive 起算。
+`local_input_request_expired` 表示普通请求在应用前已经过期；`old_intent_arrival`
+表示较旧本地接收边界，不允许它覆盖/回退已接受输入租约。
+
+`control_trace_batch.summary` 增加 `intent_response_preempted_count`、
+`intent_http_sample_count`、HTTP elapsed/server-wait/server-processing 最大值，
+以及支持 Long Tasks 的浏览器的 `long_task_count` / `long_task_max_ms`。
+心跳 timer lag 与长任务是不同观察量，未记录长任务不证明 UI 没有被调度延迟。
+成功返回的本地 HTTP timing 可与原生 trace 对照；已取消请求仍需原生接收记录归因。
+
+`driver_critical_video_health` 在 ready/具体原因变化时记录，持续故障最多补每秒一次
+同状态快照；含配置门限、每个关键相机的 frame_age/presented/recovery_frames、
+track_state/muted、video_ready_state/paused、overlay_state、页面可见性和最近接收统计。
+原因区分 camera_missing、track_missing、track_ended、track_muted、no_presented_frame、
+presented_frame_stale、peer_disconnected、recovering_frames；空的未知配置单独标明。
+同一帧的反复健康检查不计作新恢复帧。原始画面未采样，不能以这些指标证明不存在花屏。
+
+`driver_ice_connectivity` 每 5 秒与媒体指标一起记录：实际 ice_transport_policy、
+ICE 连接/收集状态、local/remote 候选类型数量、检查状态汇总，最多 16 个候选对的
+请求/响应计数、RTT、relay_protocol；选中对和直接检查优先。截断标记明确，
+不包含候选地址、SDP 或凭证。详见 docs/44-session008-input-video-and-ice-diagnostics.md。
+
+ICE server 错误同时记录实际 URL 的 udp/tcp transport 和错误类别
+（DNS 解析、server timeout 或未分类），不保存可能携带敏感信息的原始 errorText。
+旧日志 safe endpoint 去掉了 transport 查询参数，不能据 6000 的 endpoint 认定 UDP/TCP。
+
+驾驶端原生 ACK 不再仅在下一次发控制包时读取。发送间隔内每 20 ms 非阻塞轮询，
+仍复用同一 ACK 校验/反馈/窗口实现，不增加控制发送频率。
+`acknowledgements_polled` 记录本地 poll 起点/处理耗时及各 ACK 的读取 UTC/steady
+时刻、序号和确认年龄；`timestamp_scope=native_websocket_ack_drain`。这是应用读取
+边界，仍含线程调度/解密，不能当作内核收包时刻或纯网络 RTT。
+`ack_poll_failed` 在关闭连接前尽力记录 socket/TCP 诊断，并保持会话/generation
+校验和既有失败处理。新增日志仅使用现有 opt-in 异步 native trace。

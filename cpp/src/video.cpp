@@ -1,9 +1,11 @@
 #include "mine_teleop/video.hpp"
+#include "mine_teleop/gstreamer_media.hpp"
 
 #include <gst/gst.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -98,6 +100,17 @@ class VaapiVideoEncoder final : public VideoEncoder {
 
 }  // namespace
 
+int realtime_keyframe_interval_frames(int fps, int stale_brake_ms) {
+  if (fps <= 0 || stale_brake_ms <= 0) {
+    throw std::invalid_argument("realtime keyframe interval requires positive FPS and video budget");
+  }
+  // If loss recovery feedback is delayed or lost, a one-second GOP can outlast
+  // the video safety budget. Reserve half that budget for the next IDR, leaving
+  // room for transport and decoding without changing the safety deadline.
+  const auto frames = static_cast<std::int64_t>(fps) * stale_brake_ms / 2000;
+  return static_cast<int>(std::clamp<std::int64_t>(frames, 1, fps));
+}
+
 std::string build_nvenc_pipeline_stage(
     std::string_view factory_name,
     const VideoEncoderSettings& settings,
@@ -151,6 +164,11 @@ std::vector<EncoderCandidate> encoder_candidate_order(const HardwareConfig& hard
 std::unique_ptr<VideoEncoder> create_video_encoder(const EncoderCandidate& candidate) {
   if (candidate.backend == EncoderBackend::Nvenc) return std::make_unique<NvencVideoEncoder>(candidate.codec);
   return std::make_unique<VaapiVideoEncoder>(candidate.codec);
+}
+
+GstElement* parse_initialized_gstreamer_pipeline(const char* description, GError** error) {
+  ensure_gstreamer();
+  return gst_parse_launch(description, error);
 }
 
 bool gstreamer_factory_available(std::string_view factory_name) {

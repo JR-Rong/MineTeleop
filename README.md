@@ -132,6 +132,18 @@ IDs, allowlists, and secret file/environment references; it rejects duplicate
 IDs, empty allowlists, unknown vehicles, missing secrets, and ambiguous secret
 sources. Legacy `--driver-id`/`--vehicle-id` mode remains available for one
 development pair but cannot be mixed with multi-identity mode.
+An explicitly approved, dedicated mock account can set `mock_test_login_ttl_ms`
+under its `auth.drivers` entry (for example `14400000` for 240 minutes).
+This is disabled when omitted. Startup rejects the override unless that existing
+account's vehicle allowlist is exactly `[test_bench_001]`; the duration must be
+positive and at most four hours. Keep the isolated bench in mock/noCAN mode.
+HTTP login parameters cannot change the configured lifetime. Other accounts keep
+the existing `--driver-token-ttl-ms` value (the source default remains 30 minutes;
+an existing one-hour deployment must retain `3600000`). Heartbeats and control
+lease renewal do not extend login expiry or restore an expired control session.
+Enabling this requires a separately approved account/secret-file change and a
+coordinated signaling-service restart; this option creates no credentials and
+does not alter any existing identity or vehicle permission.
 On macOS, exercise a built signaling server and control client as two real
 control processes against one multi-identity server with:
 
@@ -286,7 +298,11 @@ server's application time domain before opening a session. They use 7
 four-timestamp samples, select the lowest-RTT samples, report offset/RTT/
 uncertainty, and refresh every 30 seconds. With `require_time_sync: true`, the
 vehicle refuses remote operation when uncertainty exceeds
-`max_time_sync_uncertainty_ms`; no host NTP package is required for relative
+`field_safety.max_time_sync_uncertainty_ms` (default **100 ms**). The driver
+uses `time_sync.max_uncertainty_ms`, also defaulting to **100 ms**. Explicit
+configuration values, including stricter limits, override these defaults. This
+is a clock-estimate uncertainty limit, not a command or video latency budget.
+No host NTP package is required for relative
 latency measurements. The browser only submits its latest input intent to the
 loopback control process; it does not schedule vehicle commands or send them
 over the WebRTC DataChannel. A native sender samples that intent at 20 Hz and
@@ -321,8 +337,13 @@ the authority at the last issued deadline.
 
 ```bash
 scripts/test/run_control_plane_docker_smoke.sh
-scripts/deploy/run_control_plane_docker.sh
+scripts/deploy/run_control_plane_docker.sh # Linux host networking only
 ```
+
+The interactive script uses Linux host networking with both services bound to
+`127.0.0.1`; it does not publish a wildcard console listener. On macOS/Windows,
+use the native desktop client. The isolated Docker smoke remains available on
+Docker Desktop and exercises the image default command inside a shared network namespace.
 
 The smoke creates native signaling and console containers, grants one vehicle
 session, verifies control-message isolation, and exchanges browser media codec

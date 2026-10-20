@@ -93,11 +93,11 @@ control_start_block="$(sed -n '/  \[\[nodiscard\]\] bool start_control_service()
 control_channel_block="$(sed -n '/  void configure_control_data_channel()/,/  void tick_control_service()/p' "$media_runtime")"
 control_tick_block="$(sed -n '/  void tick_control_service()/,/  \[\[nodiscard\]\] std::string current_pipeline_error/p' "$media_runtime")"
 pipeline_fault_block="$(sed -n '/  void stop_control_for_pipeline_fault(/,/  void set_pipeline_error(/p' "$media_runtime")"
-critical_camera_block="$(sed -n '/  void inhibit_control_for_critical_camera(/,/  \[\[nodiscard\]\] bool critical_cameras_ready()/p' "$media_runtime")"
+critical_camera_block="$(sed -n '/  void inhibit_control_for_recovery(/,/  \[\[nodiscard\]\] bool critical_cameras_ready()/p' "$media_runtime")"
 
 for contract in \
   'control DataChannel open starts the VCU adapter|self->start_control_service()' \
-  'session teardown cannot resurrect the VCU adapter|stop_requested || !control_link_open || control_channel == nullptr' \
+  'session teardown cannot resurrect the VCU adapter|stop_requested || (!(control_link_open && control_channel != nullptr) && !cloud_control_authority_live_locked())' \
   'adapter startup failure keeps video alive|control_not_started_video_continues' \
   'adapter startup failure closes only the unsafe control channel|gst_webrtc_data_channel_close(channel)' \
   'adapter runtime failure reports a control-only fault|adapter_runtime_failed' \
@@ -119,19 +119,66 @@ if ! grep -F --quiet 'VehicleStopReason::CriticalCameraFailed' <<<"$critical_cam
   printf 'media/control isolation contract missing: critical camera close provenance\n' >&2
   exit 1
 fi
+for text in 'VehicleStopReason::OuterControlTimeout' 'VehicleStopReason::MediaPipelineFailed' 'ControlRecoveryCause::InputLease' 'ControlRecoveryCause::CriticalVideo'; do
+  if ! grep -F --quiet "$text" <<<"$critical_camera_block"; then
+    printf 'control recovery close provenance missing: %s\n' "$text" >&2
+    exit 1
+  fi
+done
+# A media readiness change after hard stop is not another driving stop or an
+# authority recovery. Keep transition-only evidence that distinguishes a
+# capture/encoder gap, driver readiness and an actual software brake call.
+recovery_transition_block="$(sed -n '/  void apply_control_recovery_phase(/,/  void pause_control_for_critical_camera(/p' "$media_runtime")"
+hard_transition_block="$(sed -n '/  void observe_control_hard_stop_locked(/,/  void tick_control_service()/p' "$media_runtime")"
+for text in '"control_hard_stop_transition"' '"last_parsed_control_arrival_age_ms"' \
+  '"last_evaluated_control_reason"' '"last_accepted_control_age_ms"' \
+  '"watchdog_skipped_intervals_total"'; do
+  if ! grep -F --quiet "$text" <<<"$hard_transition_block"; then
+    printf 'first hard stop diagnostics missing: %s\n' "$text" >&2
+    exit 1
+  fi
+done
+for block in "$control_message_block" "$control_tick_block"; do
+  if ! grep -F --quiet 'observe_control_hard_stop_locked(' <<<"$block"; then
+    printf 'first hard stop diagnostics missing: receive/tick observation\n' >&2
+    exit 1
+  fi
+done
+for text in \
+  '"critical_lanes", std::move(critical_lanes)' \
+  '"last_capture_age_ms"' \
+  '"last_encoded_age_ms"' \
+  '"recovery_encoded_baseline"' \
+  '"control_service_active"' \
+  '"session_profile_active"' \
+  '"safety_state", to_string(state)' \
+  '"control_timing", timing' \
+  '"soft_brake_request_active"' \
+  '"soft_brake_applied_this_transition"' \
+  'after.safe_stop_count > before->safe_stop_count' \
+  'state == SafetyState::ControlActive || state == SafetyState::Degraded' \
+  'readiness_observed_control_not_active' \
+  'if (record_transition) sample_readiness()'; do
+  if ! grep -F --quiet "$text" <<<"$recovery_transition_block"; then
+    printf 'control recovery transition diagnostics missing: %s\n' "$text" >&2
+    exit 1
+  fi
+done
 if ! grep -F --quiet 'VehicleStopReason::VcuStateFault' <<<"$control_tick_block"; then
   printf 'media/control isolation contract missing: adapter runtime fault close provenance\n' >&2
   exit 1
 fi
 # Profile and handshake callbacks must reject a stale DataChannel before they
-# can publish a rejection/status to the replacement channel. Ordinary control
-# is no longer accepted from any DataChannel: it must be rejected before the
-# native control validation/apply path. The executable control contract test
-# verifies the ordering; this package-level check keeps both boundaries in the
-# production source.
-if [[ "$(grep -F -c 'if (control_channel != channel) return;' <<<"$control_message_block")" -lt 2 ]] ||
+# can publish a rejection/status to the replacement channel. Legacy browser
+# actuation is rejected; negotiated native DC bytes must pass MAC and the common
+# transport fence. The executable contract checks ordering; this check retains
+# all boundaries rather than requiring the retired unconditional DC rejection.
+if [[ "$(grep -F -c 'if (transport == ControlMessageTransport::DataChannel && control_channel != channel) return;' <<<"$control_message_block")" -lt 3 ]] ||
    [[ "$(grep -F -c 'stop_requested || control_inhibited || !control_service_started' <<<"$control_message_block")" -lt 2 ]] ||
-   ! grep -F --quiet 'if (transport == ControlMessageTransport::DataChannel)' <<<"$control_message_block" ||
+   ! grep -F --quiet 'if (transport == ControlMessageTransport::DataChannel && !message.contains("control_transport") && !message.contains("emergency_stop"))' <<<"$control_message_block" ||
+   ! grep -F --quiet '!detail::verify_transport_message(message, signaling.transport_mac_key(), false)' <<<"$control_message_block" ||
+   ! grep -F --quiet 'control_transport_fence.admit(command,' <<<"$control_message_block" ||
+   ! grep -F --quiet 'if (!decision.admitted)' <<<"$control_message_block" ||
    ! grep -F --quiet 'legacy_data_channel_control_disabled' <<<"$control_message_block"; then
   printf 'media/control isolation contract missing: stale or tearing-down DataChannel commands are rejected\n' >&2
   exit 1
@@ -146,16 +193,16 @@ require_text "$catalog" 'camera_input_caps_mismatch'
 
 for text in \
   'camera_failure_decision' \
-  'inhibit_control_for_critical_camera' \
+  'inhibit_control_for_recovery' \
   'stop_control_for_pipeline_fault(issue_code)' \
-  'enforce_critical_camera_freshness' \
+  'enforce_control_recovery' \
   'camera_encoded_frame_fresh' \
   'camera_lane_reopen_scheduled' \
   'camera_reopen_exhausted'; do
   require_text "$media_runtime" "$text"
 done
 
-# A critical-camera fault is a session-scoped safety latch.  Encoded frames
+# Expiry of the sustained-fault deadline creates a session-scoped safety latch. Encoded frames
 # may still drain from bounded queues after the source has failed, and another
 # critical lane may remain healthy, so no media callback may clear the latch
 # inside the same VehicleMediaRuntime or while the service reconstructs it for
@@ -167,15 +214,15 @@ if grep -F --quiet 'control_inhibited.exchange(false)' "$media_runtime" ||
   printf 'media/control isolation contract failed: critical-camera inhibition can clear inside one cloud session\n' >&2
   exit 1
 fi
-require_text "$media_runtime" 'Camera recovery restores video only; end this session and complete a fresh VCU handshake before driving again.'
+require_text "$media_runtime" 'Keep the vehicle stopped; the recovery deadline expired. End this session and complete a fresh VCU handshake before driving again.'
 require_text "$catalog" '必须结束当前 session，在新 session 重建该 DataChannel、control-only WSS 并重新完成 VCU 握手'
-require_text "$media_runtime" 'critical_camera_control_latch->enter_session(signaling.session_id())'
-require_text "$media_runtime" 'critical_camera_control_latch->inhibit(signaling.session_id())'
-require_text "$vehicle_app" 'std::make_shared<mine_teleop::CriticalCameraControlLatch>()'
-require_text "$vehicle_app" 'critical_camera_control_latch);'
+require_text "$media_runtime" 'control_recovery_latch->enter_session(signaling.session_id())'
+require_text "$media_runtime" 'control_recovery_latch->inhibit(signaling.session_id())'
+require_text "$vehicle_app" 'std::make_shared<mine_teleop::SessionControlRecoveryLatch>()'
+require_text "$vehicle_app" 'control_recovery_latch);'
 
 service_loop_block="$(sed -n '/int run_vehicle_media_loop/,/^}/p' "$vehicle_app")"
-latch_line="$(grep -n -m1 'std::make_shared<mine_teleop::CriticalCameraControlLatch>()' <<<"$service_loop_block" | cut -d: -f1)"
+latch_line="$(grep -n -m1 'std::make_shared<mine_teleop::SessionControlRecoveryLatch>()' <<<"$service_loop_block" | cut -d: -f1)"
 loop_line="$(grep -n -m1 '  while (true)' <<<"$service_loop_block" | cut -d: -f1)"
 if [[ -z "$latch_line" || -z "$loop_line" || "$latch_line" -ge "$loop_line" ]]; then
   printf 'media/control isolation contract failed: critical-camera latch is not shared across runtime reconstruction\n' >&2

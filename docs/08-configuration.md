@@ -72,6 +72,8 @@ runtime:
   control_log_commands: true
   teleop_poll_interval_ms: 500
   media_frame_timeout_ms: 3000
+  critical_camera_stale_brake_ms: 500
+  control_recovery_timeout_ms: 5000
   media_capture_interval_ms: 0
 
 cloud:
@@ -83,8 +85,9 @@ cloud:
 ```
 
 `runtime.media_frame_timeout_ms` 是单路采集等待下一帧的超时，默认 `3000 ms`，
-必须为正数。对关键相机而言，这也是“持续无帧”被确认成采集故障前的默认安全确认
-窗口；它不是浏览器显示的端到端时延预算，后者由
+必须为正数。它控制采集源何时报错并进行有限重开，与关键视频安全门限分开；
+关键画面无新帧默认 500 ms 进入制动等待，等待 5 s 未恢复再安全停车。
+它不是浏览器显示的端到端时延预算，后者由
 `hardware.encoding.max_end_to_end_latency_ms` 单独约束。
 
 `runtime.control_log_commands=true` 会把通过车端 control-only WSS 收到并解析的控制命令约每秒汇总为一条
@@ -321,11 +324,14 @@ pipeline。控制端按车端 offer 中实际声明的轨道逐路渲染，云�
 `reopen_attempts` 表示同一次媒体运行尝试内、单路采集源允许重开的次数，默认 `3`，
 范围 `0..10`；设为 `0` 时首个采集故障直接禁用该 lane。计数不会因中途成功取帧
 而无限重置，因此不会形成无界重开循环。`reopen_backoff_ms` 是每次重开前的退避，
-默认 `500 ms`，范围 `0..60000 ms`。关键相机的首个已确认故障会立即锁止控制并
-触发本地安全停车，同时只重开故障 lane。相机恢复只恢复视频；控制锁存跨同一云端
-session 内的 `VehicleMediaRuntime` 重建保持不变。必须结束当前 session，在新 session
-中重新建立 profile/VCU/status DataChannel 与 control-only WSS，并重新完成 VCU 握手后
-才能恢复驾驶权限。V4L2 设备路径
+默认 `500 ms`，范围 `0..60000 ms`。关键相机的已确认采集故障立即进入制动等待；
+持续无编码帧或驾驶端无新显示帧默认 500 ms 进入同一等待。制动等待保留会话、
+参数修订号与 VCU 控制服务，撤牵引并使用独立安全制动。故障 lane 仍做有限重开。
+全部关键编码/显示恢复至少 3 帧，且持续健康 300 ms 后退出等待；必须释放旧运动输入，
+提供新零输入后重新按键，禁止自动恢复此前牵引。制动等待的 5 s 截止时间不会因
+重开、偶发一帧或同会话 runtime 重建而延长；超时仍锁定本会话并进入安全停车。
+控制链路持续无有效命令的 800 ms、物理急停、CAN 和公共控制传输故障保护仍独立生效。
+V4L2 设备路径
 在 USB 拔插或 udev 重建期间
 暂时不存在时，仍按 `reopen_attempts` 做有限重试；永久路径错误应由启动 preflight
 报告。非关键相机在重开额度耗尽后只禁用自身 lane，其他视频和当前控制不受影响。
@@ -362,6 +368,13 @@ ccg2-support 会按 `xdma0_video` 的 sysfs channel index 建立
 MJPEG/testsrc/vendor pipeline 保持原状。`VIDIOC_S_PARM` 成功返回后，其
 `timeperframe` 分子、分母必须非零，且必须精确等于配置的 `1/capture_fps`；驱动返回
 其它速率时启动失败并报告 `camera_ccg2_fps_mismatch`，不会按近似值继续运行。
+
+要请求 20/25 Hz 直接采集，将每路 `capture_fps` 与使用的 realtime profile `fps`
+同时设为 20/25；匹配时不添加 `videorate`。请求是否成功应检查启动协商值与
+`vehicle_camera_capture_sample` 的 5 s 实测交付帧率。V4L2 允许驱动跳帧实现速率，
+因此这些值不能证明传感器曝光或级联触发已降频，仍需板卡/驱动厂商核验。
+关键视频的毫秒制动/恢复门限不随 FPS 自动延长；20 Hz 正常帧间隔是 50 ms，
+25 Hz 是 40 ms。现场配置保持原值，修改前需在停车台架上确认支持的模式。
 
 示例的 `hardware.encoding` 有意使用 `preferred_encoder: vaapi`、
 `fallback_encoder: nvenc`。Ubuntu 22.04/GStreamer 1.20.3 的目标机上，RTX 2000 Ada
@@ -850,7 +863,7 @@ fps/低分辨率 profile，pipeline hook 成功后才更新活动状态。
 默认现场车辆对应 5 km/h、油门比例 0.5、转向 30°、320 Nm、163.8 bar。
 
 页面“无操作自动驻车”取值 0–1 秒，默认 0.5 秒；线协议为整数
-`parking_idle_timeout_ms`（0–1000），属于 `profile_version=4` 的完整会话快照。
+`parking_idle_timeout_ms`（0–1000），属于 `profile_version=6` 的完整会话快照。
 修改延时必须在 N 挡、零速、EPB 驻车、VCU standby/disarmed 时重新确认参数。
 
 首次握手在收到状态 5 后请求释放四路 EPB，等待四路新鲜反馈全部为 1（释放），
@@ -877,3 +890,44 @@ CAN 前拒绝启动，旧会话参数不会被默默按新行为解释。本地�
 两路均为控制关键相机，使用 `/dev/ccg2-channel-0` 和 `-1` 稳定节点。
 内核驱动、稳定链接及板卡初始化须由目标主机提供；这些前提不由 YAML 自动安装。
 开发用 mock/testsrc 配置仍用于无硬件测试，不作为发布默认值。
+
+
+控制端“当前会话驾驶与 PID 参数”中的 `consecutive_late_frame_limit` 为连续迟到帧数，
+默认 3，可选整数 1–5。修改该项需 N 挡、零速、电子驻车及 standby/disarmed（或隔离 mock 台架），
+并等待车端精确确认 V7 会话快照。旧版车端不支持 V7 时会拒绝，不会静默采用其他阈值。
+车端对超过 200 ms 的命令始终丢弃，只累计新的、身份和令牌有效的序号；重复与乱序包不增加计数。
+未达阈值时，新有效帧清除计数，300 ms 降级撤牵引可在当前会话内恢复；达到阈值时要求新零输入，
+释放方向键后重新按下即可恢复。1 帧保留原先首次控制间隔超限也要求重新输入的行为。
+800 ms 持续没有有效执行的控制命令仍撤销参数并安全停车，过期包不会重置此期限。
+物理急停、硬件故障、关键相机故障及其他安全门控保持原有处理。
+
+原生控制 WebSocket 的车端 delivery ACK 新增独立 `control_feedback`，由已认证车辆报告
+命令序号、是否接受、是否要求零输入及控制状态序号。云端每会话仅保留最新一条，随下次驾驶端
+入口 ACK 通过 `vehicle_control_feedback` 返回；入口 ACK 本身仍仅表示云端收到了命令。
+驾驶端收到重新输入通知后立即清零当前原生输入，并将状态序号返回页面，避免延后的媒体通知重复清除新输入。
+这条恢复通知需要云端、车端和驾驶端同时更新。
+
+诊断中 `control_timing_decision` 记录连续迟到计数、确认阈值、重新输入状态和最后有效控制年龄；
+`websocket_receive_loop` 记录两次接收调用之间的间隔与本次等待时间，帮助区分接收线程未及时调用和等待数据。
+日志仍不能单独证明无线丢包或 TCP 重传，需结合网络采样。诊断写入现有有界异步队列。
+
+
+800 ms 控制超时从车端最后一次成功接受并应用控制命令起算，收到过期、重复、错身份或被门禁拒绝的包
+不会重置这个时间。不按键时仍由原生控制端周期发送零输入心跳，车端接受这些心跳，因此不会因为
+“800 ms 没按键”触发链路故障；无操作自动驻车是独立的 `parking_idle_timeout_ms`（默认 500 ms）。
+可恢复迟到期间，控制端只阻止旧牵引/转向输入继续生效，保留同一输入租约内仍按住的 Space/B 或手柄刹车；
+新鲜的仅制动输入可以续期并送到车端，但不解除运动输入锁。释放制动并提供完整零输入后才解除运动输入锁。
+真实输入租约过期、页面替换、失焦、急停或权限撤销仍执行原有保护，不把过期刹车标记为新鲜。
+
+控制端“实车调试限幅”可设置 `critical_camera_stale_brake_ms`（整数 100–3000 ms，
+默认 500）与 `control_recovery_timeout_ms`（整数 1000–30000 ms，页面以秒输入，
+默认 5 s）。这两个字段属于完整 V7 会话快照，必须停车、N、零速、EPB 且
+standby/disarmed（或隔离 mock 台架），并由车端应用后精确 ACK 才生效。
+车端 `runtime` 中同名值只提供未配置会话时的默认值；页面从车端默认值预填，
+不自动提交。V6 及更旧版本、缺失、非整数、越界或反馈值不一致均拒绝，更新时必须同步驾驶端、
+云端和车端三个包，并重新打开驾驶页面。旧 YAML 的 `critical_camera_recovery_timeout_ms`
+兼容为新恢复上限的别名；同时填写且值不同会拒绝启动，防止静默选错门限。
+采集等待 `media_frame_timeout_ms` 和控制链路 `control_timeout_ms=800` 不由这些字段改写。
+视频、时间同步和输入租约共用恢复等待上限。详细状态与日志见 [控制故障制动恢复](38-time-sync-input-lease-recovery.md)。
+驾驶端收到车端可恢复制动或撤牵引反馈时，在主画面显示黄色提示条，分别说明制动等待或控制暂缓；恢复后提示制动保持与重新输入。
+红色安全停车/急停提示优先，过期遥测明确标注当前状态待确认；视频或 RTT 指标变差本身不等于车端已制动。

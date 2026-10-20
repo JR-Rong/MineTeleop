@@ -44,6 +44,8 @@
 - `session_id`：当前控制会话 ID，必须是 JSON string。
 - `seq`：单调递增的非负 JSON integer，用于丢弃乱序旧命令。
 - `sent_at_utc_ms`：原生控制命令形成时的 UTC 毫秒时间，必须是 JSON integer；两端时间同步不确定度必须不超过 25 ms，否则时延数据标记为不可信。
+  25 ms 是本项目的配置默认值，最早来自 `9e5a86b`，并非已核实的标准条款要求。
+  配置出处、现场适用性及计时边界见 [校时与停车复核](43-time-sync-threshold-capture-and-stop-review.md)。
 - `control_token`：当前会话的短期控制权令牌，必须是非空 JSON string；认证续租只延长
   其服务端到期时间，不在活动控制 WSS 或 profile DataChannel 中轮换值；会话结束后
   立即失效，禁止写入日志。

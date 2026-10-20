@@ -15,6 +15,13 @@ using namespace mine_teleop;
 namespace {
 void check(bool ok, const std::string& message) { if (!ok) throw std::runtime_error(message); }
 Json body(const ServerResponse& response) { return Json::parse(response.body); }
+void wait_until_utc(std::int64_t deadline_ms) {
+  const auto bounded_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (now_ms() < deadline_ms) {
+    check(std::chrono::steady_clock::now() < bounded_deadline, "UTC clock did not reach the test expiry boundary");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+}
 SignalingServerConfig configuration() {
   SignalingServerConfig c;
   c.driver_passwords = {{"d1", "driver-secret"}, {"d2", "driver-secret"}};
@@ -103,7 +110,7 @@ void independent_app_token_expiry() {
     const auto login = body(app_login(f, "198.51.100.1"));
     check(login.at("remaining_ms").get<std::int64_t>() > 0 &&
           login.at("remaining_ms").get<std::int64_t>() <= c.approver_token_ttl_ms, "invalid App remaining TTL");
-    std::this_thread::sleep_for(std::chrono::milliseconds(180));
+    wait_until_utc(now_ms() + 180);
     check(f.call("GET", "/mobile/api/requests", Json::object(), f.approver).status == (short_app ? 401 : 200),
           "App token expiry is not independent");
     check(f.connect("v2").status == (short_app ? 200 : 401), "App TTL changed driver expiry");
@@ -280,13 +287,13 @@ void heartbeat_and_login_expiry() {
     if (vehicle_timeout) c.vehicle_heartbeat_timeout_ms = 150;
     else c.driver_heartbeat_timeout_ms = 150;
     Fixture f(c); const auto id = f.pending(); f.decide(id);
-    std::this_thread::sleep_for(std::chrono::milliseconds(180));
+    wait_until_utc(now_ms() + 180);
     check(f.decide(id).status == 409, "heartbeat expiry retained approval");
     check(f.connect().status != 200 && f.service.health().at("active_sessions") == 0, "offline participant granted authority");
   }
   auto c = configuration(); c.approver_token_ttl_ms = 150;
   Fixture f(c); const auto id = f.pending();
-  std::this_thread::sleep_for(std::chrono::milliseconds(180));
+  wait_until_utc(now_ms() + 180);
   check(f.decide(id).status == 401, "expired phone login can approve");
 }
 void expiry_during_audit() {
@@ -359,7 +366,8 @@ void automatic_driver_runtime() {
       r.headers["x-mine-teleop-approver-token"] = token;
       return service.handle(r);
     };
-    check(post("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","runtime-test"}}).status == 200, "fixture registration failed");
+    check(post("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","runtime-test"},
+        {"native_control_capabilities", kNativeControlCapabilities}}).status == 200, "fixture registration failed");
     const auto token = body(post("/mobile/api/login", {{"password","approval-secret"}})).at("token").get<std::string>();
     DriverConfig dc; dc.driver_id = "d1"; dc.signaling_url = "ws://127.0.0.1:" + std::to_string(server.port()) + "/signaling";
     dc.max_time_sync_uncertainty_ms = 2000; // Fixture exercises protocol compatibility, not clock safety.
@@ -393,7 +401,8 @@ void automatic_driver_runtime() {
       check(connecting.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
           "prepare_shutdown did not wake pending approval before HTTP stop");
     } else if (scenario == "replace") {
-      check(post("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","replacement"}}).status == 200, "replacement failed");
+      check(post("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","replacement"},
+          {"native_control_capabilities", kNativeControlCapabilities}}).status == 200, "replacement failed");
     }
     check(connecting.wait_for(std::chrono::seconds(4)) == std::future_status::ready, "single connect did not finish promptly: " + scenario);
     bool connected = false;
@@ -453,7 +462,8 @@ void cancel_during_grant_response() {
     HttpRequest r; r.method = "POST"; r.path = path; r.body = data.dump(); r.headers["x-mine-teleop-approver-token"] = token;
     return service.handle(r);
   };
-  call("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","race"}});
+  call("/vehicles/online", {{"vehicle_id","v1"},{"device_token","device-secret"},{"connection_id","race"},
+      {"native_control_capabilities", kNativeControlCapabilities}});
   const auto token = body(call("/mobile/api/login", {{"password","approval-secret"}})).at("token").get<std::string>();
   DriverConfig dc; dc.driver_id = "d1"; dc.signaling_url = "ws://127.0.0.1:" + std::to_string(server.port()) + "/signaling"; dc.max_time_sync_uncertainty_ms = 2000;
   DriverConsoleRuntime driver(dc, "v1", "driver-secret");

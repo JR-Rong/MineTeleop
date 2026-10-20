@@ -37,7 +37,9 @@ fi
 for required_path in \
   "$package_name/bin/mine-teleop" \
   "$package_name/bin/mine-teleop-run" \
+  "$package_name/bin/mine-teleop-recorder" \
   "$package_name/bin/mine-teleop-aravis-camera" \
+  "$package_name/lib/gstreamer-1.0/libgstvideorate.so" \
   "$package_name/lib/vendor/chassis/libmine_teleop_chassis_bridge.so" \
   "$package_name/lib/vendor/chassis/libchassis_control.so" \
   "$package_name/config/vehicle-agent.yaml" \
@@ -64,7 +66,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-container_id="$(docker create --platform linux/amd64 \
+container_id="$(docker create --platform linux/amd64 --network none \
   --entrypoint /bin/sh \
   ubuntu:22.04 \
   -euc '
@@ -76,6 +78,7 @@ container_id="$(docker create --platform linux/amd64 \
     test -s "$root/config/mine-teleop-field-root.crt"
     test -s "$root/lib/vendor/chassis/libmine_teleop_chassis_bridge.so"
     test -s "$root/lib/vendor/chassis/libchassis_control.so"
+    test -x "$root/bin/mine-teleop-recorder"
     test ! -e "$root/config/device-token"
     library_path="$root/lib:$root/lib/vendor/chassis:$root/lib/vendor/mvs"
     export LD_LIBRARY_PATH="$library_path"
@@ -98,9 +101,16 @@ container_id="$(docker create --platform linux/amd64 \
     export GST_PLUGIN_SCANNER="$root/bin/gst-plugin-scanner"
     export GST_REGISTRY_FORK=no
     export GST_REGISTRY=/tmp/mine-teleop-gstreamer-registry.bin
-    for plugin in webrtcbin srtpenc sctpenc sctpdec dtlsenc dtlsdec nicesrc v4l2src va nvcodec h264parse rtph264pay; do
+    ldd "$root/bin/mine-teleop-recorder" > /tmp/recorder-runtime-ldd.txt
+    ! grep -q "not found" /tmp/recorder-runtime-ldd.txt
+    "$root/bin/mine-teleop-recorder" --help | grep -F "mine-teleop-recorder" >/dev/null
+    for plugin in webrtcbin srtpenc sctpenc sctpdec dtlsenc dtlsdec nicesrc v4l2src va nvcodec h264parse rtph264pay appsrc appsink splitmuxsink mp4mux filesink h265parse videorate; do
       "$root/bin/gst-inspect-1.0" "$plugin" >/dev/null
     done
+    "$root/bin/gst-launch-1.0" -q videotestsrc num-buffers=30 \
+      "!" "video/x-raw,format=UYVY,width=64,height=48,framerate=30/1" \
+      "!" videorate drop-only=true max-rate=20 "!" videoconvert "!" videoscale \
+      "!" "video/x-raw,format=NV12,width=64,height=48,framerate=20/1" "!" fakesink sync=false
   ')"
 docker cp "$archive" "$container_id:/tmp/mine-teleop-bundle.tar.gz"
 docker start --attach "$container_id"

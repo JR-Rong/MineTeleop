@@ -1,0 +1,180 @@
+name: Offline regressions
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-regressions-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  scripts:
+    name: Fixed Python and JavaScript regressions
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: python3 scripts/test/run_offline_regressions.py
+
+  native:
+    name: Ubuntu full native tests without external networking
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Install CI build dependencies
+        run: |
+          sudo apt-get update
+          # Record the runner's actual package state before resolving the
+          # GStreamer development dependency. Diagnostics do not replace install.
+          dpkg-query -W -f='${binary:Package}\t${Version}\t${db:Status-Status}\n' \
+            'libunwind*' 'libgstreamer*' || true
+          apt-cache policy libunwind-dev libunwind8 libgstreamer1.0-dev
+          sudo apt-get --simulate -o Debug::pkgProblemResolver=yes install \
+            --no-install-recommends libunwind-dev || true
+          sudo apt-get install -y --no-install-recommends libunwind-dev
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config iproute2 \
+            libcurl4-openssl-dev libssl-dev libyaml-cpp-dev nlohmann-json3-dev libjpeg-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice
+      - name: Configure and build every native test target
+        run: |
+          cmake -S . -B build-native-offline \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DMINE_TELEOP_BUILD_TESTS=ON \
+            -DMINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS=ON \
+            -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=ON \
+            -DMINE_TELEOP_BUILD_BENCH_PROBES=ON \
+            -DMINE_TELEOP_BUILD_VENDOR_CAMERA_BRIDGES=OFF \
+            -DMINE_TELEOP_BUILD_ARAVIS_CAMERA_BRIDGE=OFF \
+            -DMINE_TELEOP_FETCH_MISSING_DEPS=OFF
+          cmake --build build-native-offline --parallel 3
+      - name: Run all registered tests with loopback only
+        run: |
+          # A fresh namespace cannot contact a vehicle, cloud, or TURN service.
+          # Keep loopback up for the real in-process HTTP/WebSocket mocks.
+          sudo unshare --net -- env PATH="$PATH" bash -euc '
+            ip link set lo up
+            exec python3 scripts/test/run_offline_regressions.py --native-build-dir build-native-offline
+          '
+      - name: Collect validated Linux offline test binaries
+        if: success()
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          # The capture probe is compiled only. It is never an automatic test.
+          # This is a test artifact, not a vehicle configuration or release.
+          actual_commit=$(git rev-parse HEAD)
+          [[ "$actual_commit" == "$SOURCE_COMMIT" ]]
+          git diff --exit-code --quiet
+          git diff --cached --exit-code --quiet
+          artifact_dir=offline-native-test-artifact
+          mkdir -p "$artifact_dir/bin" "$artifact_dir/ldd"
+          for binary in \
+            mine-teleop-bench-capture-probe \
+            mine-teleop-recorder \
+            mine-teleop \
+            mine-teleop-bench-containment-tests \
+            mine-teleop-recording-transport-tests \
+            mine-teleop-recording-upload-tests \
+            mine-teleop-recording-gstreamer-tests \
+            mine-teleop-media-freshness-tests \
+            mine-teleop-media-freshness-gstreamer-tests \
+            mine-teleop-clock-fault-tests \
+            mine-teleop-native-control-ack-tests \
+            mine-teleop-control-recovery-tests \
+            mine-teleop-control-tests \
+            mine-teleop-native-control-intent-tests \
+            mine-teleop-session-logs-tests
+          do
+            test -f "build-native-offline/$binary"
+            test -x "build-native-offline/$binary"
+            install -m 0755 "build-native-offline/$binary" "$artifact_dir/bin/$binary"
+            ldd "$artifact_dir/bin/$binary" > "$artifact_dir/ldd/$binary.txt"
+            if grep -q 'not found' "$artifact_dir/ldd/$binary.txt"; then
+              echo "::error::Offline test binary has unresolved dependencies: $binary"
+              exit 1
+            fi
+          done
+          python3 - "$artifact_dir" "$SOURCE_COMMIT" "$GITHUB_RUN_ID" <<'PYTHON'
+          import hashlib, json, pathlib, platform, subprocess, sys
+          root = pathlib.Path(sys.argv[1])
+          digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+          sources = subprocess.check_output(
+              ['git', 'ls-files', '-z', '--', 'CMakeLists.txt', 'cmake', 'cpp'], text=True
+          ).split('\0')
+          source_sha256 = {name: digest(pathlib.Path(name)) for name in sources if name}
+          binaries = {
+              path.name: {'sha256': digest(path), 'bytes': path.stat().st_size,
+                          'ldd_record': 'ldd/' + path.name + '.txt'}
+              for path in sorted((root / 'bin').iterdir())
+          }
+          fixture_dependencies = {
+              'mine-teleop-control-recovery-tests': ['configs/vehicle-agent.dev.yaml'],
+              'mine-teleop-session-logs-tests': ['configs/vehicle-agent.three-machine.field.yaml'],
+              'mine-teleop-control-tests': [
+                  'configs/driver-console.dev.yaml',
+                  'configs/driver-console.three-machine.dev.yaml',
+                  'configs/mine-teleop-field-root.crt',
+                  'configs/vehicle-agent.dev.yaml',
+                  'protocol/v1/control-command.valid.json',
+              ],
+          }
+          for name, files in fixture_dependencies.items():
+              binaries[name]['external_fixture_files'] = files
+              binaries[name]['fixtures_included'] = False
+              binaries[name]['standalone_execution'] = False
+          manifest = {
+              'schema_version': 1, 'purpose': 'offline Linux test binaries only',
+              'source_commit': sys.argv[2], 'github_run_id': sys.argv[3],
+              'platform': platform.platform(), 'architecture': platform.machine(),
+              'compiler': subprocess.check_output(['c++', '--version'], text=True).splitlines()[0],
+              'source_sha256': source_sha256, 'binaries': binaries,
+              'prerequisites': 'Ubuntu 22.04 ABI and shared libraries listed in ldd records; GStreamer runtime plugins are separate prerequisites.',
+              'fixture_boundary': 'Recovery/session-log suites require the named fixtures at source_commit; no configurations are included in this artifact.',
+              'verification': {'network_scope': 'fresh namespace with only loopback',
+                               'full_registered_ctest_succeeded': True,
+                               'capture_probe_executed': False,
+                               'physical_or_vehicle_acceptance': False},
+          }
+          (root / 'source-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PYTHON
+          (
+            cd "$artifact_dir"
+            sha256sum bin/* ldd/* source-manifest.json > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+      - name: Upload validated Linux offline test artifact
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-offline-tests-${{ github.event.pull_request.head.sha || github.sha }}
+          path: offline-native-test-artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

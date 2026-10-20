@@ -15,6 +15,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace mine_teleop {
 namespace {
@@ -149,7 +150,7 @@ std::int64_t iso_time(const std::string& text) {
   return result;
 }
 std::int64_t record_time(const Json& value) {
-  for (const auto* key : {"logged_at_utc_ms", "event_at_utc_ms", "sent_at_utc_ms", "received_at_utc_ms"})
+  for (const auto* key : {"logged_at_utc_ms", "event_at_utc_ms", "sent_at_utc_ms", "received_at_utc_ms", "reported_at_utc_ms"})
     if (value.contains(key) && value[key].is_number_integer()) return value[key].get<std::int64_t>();
   if (value.contains("ts") && value["ts"].is_string()) return iso_time(value["ts"]);
   if (value.contains("at") && value["at"].is_string()) return iso_time(value["at"]);
@@ -290,8 +291,10 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources, const Js
   const auto begin = session.at("started_at_utc_ms").get<std::int64_t>() - 2000;
   const auto end = session.at("ended_at_utc_ms").get<std::int64_t>() + 2000;
   const auto id = session.at("session_id").get<std::string>();
+  const auto session_started = session.at("started_at_utc_ms").get<std::int64_t>();
+  const auto session_ended = session.at("ended_at_utc_ms").get<std::int64_t>();
   Json result = {{"status", "available"}, {"files", Json::array()},
-      {"selection", "session_id and UTC window; unscoped records use UTC window"},
+      {"selection", "session_id and UTC window; late runtime recording completion requires an attempt-start anchor inside the session"},
       {"window_start_utc_ms", begin}, {"window_end_utc_ms", end},
       {"redacted", true}, {"file_limit_bytes", kFileLimit}};
   for (const auto& source : sources) {
@@ -301,6 +304,10 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources, const Js
     std::uint64_t scanned = 0, written = 0, unscoped = 0, unattributed = 0;
     std::int64_t first = 0, last = 0;
     bool limited = false, failed = false, dropped = false;
+    std::unordered_set<std::string> recording_attempts;
+    std::vector<std::pair<std::string, std::string>> late_recording;
+    std::size_t late_recording_bytes = 0;
+    constexpr std::size_t kAttemptLimit = 4096, kLateRecordingLimit = 4 * 1024 * 1024;
     std::ofstream output(destination / source.name, std::ios::binary | std::ios::trunc);
     if (!output) throw std::runtime_error("cannot create log snapshot");
     auto paths = log_family(source.path);
@@ -324,21 +331,59 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources, const Js
         if (timestamp) { if (!first || timestamp < first) first = timestamp; last = std::max(last, timestamp); }
         if (trace_batch && !*trace_batch) continue;
         if (!record_id.empty() && record_id != id) continue;
-        if (!trace_batch && timestamp && (timestamp < begin || timestamp > end)) continue;
-        if (!timestamp) { ++unattributed; continue; }
+        // Recorder draining can finish after the ordinary two-second log tail.
+        // Preserve only its exactly scoped completion record beyond that tail;
+        // unrelated runtime lines still obey the normal UTC/session selection.
+        const bool recording_scope = source.name == "runtime.log" && record_id == id &&
+            value.contains("vehicle_id") && value.at("vehicle_id") == session.at("vehicle_id");
+        const auto kind = value.value("event", "");
+        const std::string attempt = value.contains("recording_attempt_id") && value.at("recording_attempt_id").is_string()
+            ? value.at("recording_attempt_id").get<std::string>() : "";
+        const bool recording_completion = recording_scope && kind == "vehicle_recording_attempt_finished" && safe_name(attempt);
         if (source.require_session_id && record_id != id) continue;
-        if (record_id.empty()) ++unscoped;
         if (source.require_session_id && value.contains("service_instance_id") &&
             value["service_instance_id"] != session.at("service_instance_id")) continue;
+        // SIDs can repeat after a cloud restart. Only the producer's start
+        // timestamp may anchor an attempt inside the actual session. Launcher
+        // logged_at is relay time and can be late or on a different clock.
+        const auto reported = value.find("reported_at_utc_ms");
+        if (recording_scope && kind == "vehicle_recording_attempt_started" && safe_name(attempt) &&
+            reported != value.end() && reported->is_number_integer() &&
+            (!reported->is_number_unsigned() || reported->get<std::uint64_t>() <= INT64_MAX)) {
+          const auto produced_at = reported->get<std::int64_t>();
+          if (produced_at >= session_started && produced_at <= session_ended) {
+            recording_attempts.insert(attempt);
+            if (recording_attempts.size() > kAttemptLimit) { limited = true; break; }
+          }
+        }
+        if (!trace_batch && timestamp && (timestamp < begin || (timestamp > end && !recording_completion))) continue;
+        if (!timestamp) { ++unattributed; continue; }
+        if (record_id.empty()) ++unscoped;
         if (value.value("event", "") == "desktop_log_dropped" ||
             (value.contains("details") && value["details"].is_object() &&
              value["details"].value("dropped_since_last", 0LL) > 0)) dropped = true;
         line = redact(std::move(value), secrets).dump(-1, ' ', false, Json::error_handler_t::replace) + '\n';
+        if (recording_completion && timestamp > end) {
+          if (late_recording.size() >= kAttemptLimit || late_recording_bytes + line.size() > kLateRecordingLimit) {
+            limited = true; break;
+          }
+          late_recording_bytes += line.size();
+          late_recording.emplace_back(attempt, std::move(line));
+          continue;
+        }
         if (written + line.size() > kFileLimit) { limited = true; break; }
         output << line; written += line.size();
       }
       if (!input.eof() && !limited && !stop.stop_requested()) failed = true;
       if (limited || stop.stop_requested()) break;
+    }
+    // Rotation order may expose completion before its anchor. Match only
+    // after scanning, without expanding the original file/scan bounds.
+    for (const auto& [attempt, line] : late_recording) {
+      if (stop.stop_requested()) break;
+      if (!recording_attempts.contains(attempt)) continue;
+      if (written + line.size() > kFileLimit) { limited = true; break; }
+      output << line; written += line.size();
     }
     output.flush(); if (!output) throw std::runtime_error("cannot finish log snapshot");
     report["bytes"] = written; report["unscoped_records"] = unscoped;
@@ -361,6 +406,184 @@ Json collect_session_logs(const std::vector<SessionLogSource>& sources, const Js
     result["files"].push_back(std::move(report));
   }
   return result;
+}
+
+Json session_recording_evidence(const Json& summary, const Json& session, const Json& attempt_fence) {
+  const auto unknown = [](std::string_view issue) {
+    return Json{{"included", false}, {"evidence_status", "unknown"}, {"complete", nullptr},
+        {"source", "recording-session.status"}, {"issues", Json::array({issue})}};
+  };
+  if (!summary.is_object()) return unknown("recording_summary_unavailable");
+  try {
+    const auto boolean = [](const Json& object, const char* key) {
+      require(object.contains(key) && object.at(key).is_boolean(), "invalid recording flag");
+      return object.at(key).get<bool>();
+    };
+    const auto number = [](const Json& object, const char* key) {
+      require(object.contains(key) && object.at(key).is_number_integer() &&
+          (object.at(key).is_number_unsigned() || object.at(key).get<std::int64_t>() >= 0), "invalid recording counter");
+      return object.at(key).get<std::uint64_t>();
+    };
+    const auto text = [](const Json& object, const char* key, std::size_t limit = 180) {
+      require(object.contains(key) && object.at(key).is_string() && object.at(key).get_ref<const std::string&>().size() <= limit,
+              "invalid recording text");
+      return object.at(key).get<std::string>();
+    };
+    require(number(summary, "schema_version") == 1 && text(summary, "kind") == "recording_session_summary" &&
+        text(summary, "upload_state") == "not_applicable", "unsupported recording summary");
+    if (text(summary, "vehicle_id") != text(session, "vehicle_id") || text(summary, "session_id") != text(session, "session_id") ||
+        number(summary, "reported_at_utc_ms") < session.at("started_at_utc_ms").get<std::uint64_t>())
+      return unknown("recording_summary_scope_mismatch");
+    require(!text(summary, "recording_attempt_id").empty(), "missing recording attempt");
+    const auto configured = boolean(summary, "configured_enabled"), incomplete = boolean(summary, "incomplete");
+    const auto final_eos = boolean(summary, "final_eos_received");
+    const auto history_known = boolean(summary, "session_history_known"), producer_attempt_complete = boolean(summary, "attempt_complete");
+    const auto completeness_scope = text(summary, "completeness_scope");
+    require(completeness_scope == "current_runtime_known_attempts" || completeness_scope == "full_session", "unsupported recording completeness scope");
+    const auto revision = number(summary, "summary_revision");
+    const auto state = text(summary, "state");
+    require(summary.at("expected_cameras").is_array() && summary.at("expected_cameras").size() <= 64 &&
+        summary.at("cameras").is_array() && summary.at("cameras").size() <= 64, "invalid recording camera list");
+    std::vector<std::string> expected, observed;
+    for (const auto& camera : summary.at("expected_cameras")) {
+      require(camera.is_string(), "invalid recording camera");
+      const auto id = camera.get<std::string>();
+      require(safe_name(id) && std::find(expected.begin(), expected.end(), id) == expected.end(), "invalid recording camera");
+      expected.push_back(id);
+    }
+    bool complete = configured && !incomplete && state == "finalized" && final_eos && revision > 0 && !expected.empty();
+    bool gap = incomplete || state == "failed" || (attempt_fence.is_object() && attempt_fence.value("incomplete", false));
+    Json cameras = Json::array();
+    for (const auto& entry : summary.at("cameras")) {
+      const auto camera = text(entry, "camera_id");
+      require(std::find(expected.begin(), expected.end(), camera) != expected.end() &&
+          std::find(observed.begin(), observed.end(), camera) == observed.end(), "unexpected recording camera");
+      observed.push_back(camera);
+      const auto& recording = entry.at("recording");
+      require(number(recording, "schema_version") == 1, "unsupported recording lane");
+      const auto lane_state = text(recording, "state");
+      const auto enabled = boolean(recording, "configured_enabled"), active = boolean(recording, "active");
+      const auto lane_gap = boolean(recording, "incomplete"), eos = boolean(recording, "final_eos_received");
+      const auto cleanup = boolean(recording, "cleanup_pending");
+      const auto accepted = number(recording, "accepted_access_units"), input = number(recording, "worker_input_access_units");
+      const auto finalized = number(recording, "finalized_segments"), unfinished = number(recording, "unfinished_segments");
+      const auto lane_revision = number(recording, "status_revision");
+      const auto attempt = text(recording, "recording_attempt_id");
+      require(!attempt.empty() && attempt == text(summary, "recording_attempt_id"), "recording lane attempt mismatch");
+      gap = gap || lane_gap || lane_state == "failed";
+      complete = complete && enabled && !active && !lane_gap && !cleanup && eos && lane_state == "finalized" &&
+          accepted > 0 && input == accepted && finalized > 0 && unfinished == 0 && lane_revision > 0;
+      cameras.push_back({{"camera_id", camera}, {"recording", {{"schema_version", 1}, {"state", lane_state},
+          {"configured_enabled", enabled}, {"active", active}, {"incomplete", lane_gap}, {"final_eos_received", eos},
+          {"cleanup_pending", cleanup}, {"accepted_access_units", accepted}, {"worker_input_access_units", input},
+          {"finalized_segments", finalized}, {"unfinished_segments", unfinished}, {"status_revision", lane_revision},
+          {"recording_attempt_id", attempt}, {"issue_code", text(recording, "issue_code")},
+          {"next_action", text(recording, "next_action", 2048)}}}});
+    }
+    complete = complete && observed.size() == expected.size();
+    const bool fence_valid = attempt_fence.is_object() && attempt_fence.value("source_complete", false) &&
+        attempt_fence.value("recording_attempt_id", "") == text(summary, "recording_attempt_id") &&
+        attempt_fence.value("reported_at_utc_ms", std::uint64_t{0}) >= session.at("started_at_utc_ms").get<std::uint64_t>() &&
+        number(summary, "reported_at_utc_ms") >= attempt_fence.value("reported_at_utc_ms", std::uint64_t{0}) &&
+        !(attempt_fence.value("kind", "") == "status" && !attempt_fence.value("summary_persisted", false) &&
+          attempt_fence.value("reported_at_utc_ms", std::uint64_t{0}) >= number(summary, "reported_at_utc_ms"));
+    complete = complete && !gap && producer_attempt_complete && fence_valid &&
+        number(summary, "reported_at_utc_ms") >= session.at("ended_at_utc_ms").get<std::uint64_t>();
+    if (complete) {
+      require(summary.at("completed_at_utc_ms").is_number_integer() &&
+          summary.at("completed_at_utc_ms").get<std::int64_t>() >= session.at("started_at_utc_ms").get<std::int64_t>() &&
+          summary.at("completed_at_utc_ms").get<std::uint64_t>() <= number(summary, "reported_at_utc_ms"), "invalid recording completion time");
+    }
+    Json canonical = {{"schema_version", 1}, {"kind", "recording_session_summary"}, {"upload_state", "not_applicable"},
+        {"vehicle_id", text(summary, "vehicle_id")}, {"session_id", text(summary, "session_id")},
+        {"recording_attempt_id", text(summary, "recording_attempt_id")}, {"configured_enabled", configured}, {"state", state},
+        {"incomplete", gap}, {"expected_cameras", expected}, {"final_eos_received", final_eos},
+        {"session_history_known", history_known}, {"completeness_scope", completeness_scope}, {"attempt_complete", complete},
+        {"summary_revision", revision}, {"reported_at_utc_ms", number(summary, "reported_at_utc_ms")},
+        {"completed_at_utc_ms", complete ? summary.at("completed_at_utc_ms") : Json(nullptr)}, {"cameras", cameras}};
+    const bool disabled = !configured && state == "disabled" && expected.empty() && cameras.empty() && !gap;
+    const bool session_complete = complete && history_known && completeness_scope == "full_session";
+    Json fence = Json();
+    if (attempt_fence.is_object()) fence = {{"recording_attempt_id", attempt_fence.value("recording_attempt_id", "")},
+        {"reported_at_utc_ms", attempt_fence.value("reported_at_utc_ms", std::uint64_t{0})}, {"source_complete", attempt_fence.value("source_complete", false)},
+        {"kind", attempt_fence.value("kind", "")}, {"summary_persisted", attempt_fence.value("summary_persisted", false)},
+        {"incomplete", attempt_fence.value("incomplete", false)}};
+    return {{"included", false}, {"source", "recording-session.status"},
+        {"evidence_status", gap ? "incomplete" : disabled ? "not_enabled" : session_complete ? "finalized" : complete ? "attempt_finalized" : "unknown"},
+        {"complete", gap ? Json(false) : session_complete ? Json(true) : Json(nullptr)}, {"attempt_complete", complete},
+        {"summary", canonical}, {"attempt_fence", fence},
+        {"issues", gap ? Json::array({"recording_incomplete"}) : disabled || session_complete ? Json::array() :
+          complete ? Json::array({"recording_session_history_unconfirmed"}) : Json::array({"recording_finalization_unconfirmed"})}};
+  } catch (const std::exception&) { return unknown("recording_summary_invalid"); }
+}
+
+Json collect_session_recording_evidence(const fs::path& recording_root, const Json& session,
+                                       const std::vector<std::string>& secrets, const fs::path& runtime_snapshot,
+                                       bool runtime_source_complete) {
+  const auto unavailable = [](std::string_view issue) {
+    return Json{{"included", false}, {"evidence_status", "unknown"}, {"complete", nullptr},
+        {"source", "recording-session.status"}, {"issues", Json::array({issue})}};
+  };
+  try {
+    const auto vehicle = session.at("vehicle_id").get<std::string>(), id = session.at("session_id").get<std::string>();
+    if (recording_root.empty() || !safe_name(vehicle) || !safe_name(id)) return unavailable("recording_summary_path_invalid");
+    const auto directory = recording_root / vehicle / id, path = directory / "recording-session.status";
+    if (fs::is_symlink(recording_root / vehicle) || fs::is_symlink(directory) || fs::is_symlink(path) || !fs::is_regular_file(path))
+      return unavailable("recording_summary_unavailable");
+    // The exact small summary is independent of the runtime log UTC window.
+    // Never enumerate/upload recordings or infer completion from MP4 existence.
+    constexpr std::size_t limit = 64 * 1024;
+    std::ifstream input(path, std::ios::binary); std::string bytes(limit + 1, '\0');
+    input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (input.bad() || input.gcount() > static_cast<std::streamsize>(limit)) return unavailable("recording_summary_read_failed");
+    bytes.resize(static_cast<std::size_t>(input.gcount()));
+    const auto summary = Json::parse(bytes, nullptr, false);
+    Json fence;
+    if (runtime_source_complete && !runtime_snapshot.empty() && !fs::is_symlink(runtime_snapshot)) {
+      std::ifstream logs(runtime_snapshot, std::ios::binary); std::vector<char> line(1024 * 1024);
+      std::uint64_t latest = 0; bool gap = false, ambiguous = false;
+      while (logs.getline(line.data(), static_cast<std::streamsize>(line.size()))) {
+        const auto event = Json::parse(line.data(), nullptr, false);
+        if (!event.is_object() || event.value("session_id", "") != id || event.value("vehicle_id", "") != vehicle) continue;
+        const auto kind = event.value("event", "");
+        std::string attempt; std::uint64_t reported = 0; bool persisted = false;
+        if (kind == "vehicle_recording_attempt_started") {
+          attempt = event.value("recording_attempt_id", ""); reported = event.value("reported_at_utc_ms", std::uint64_t{0});
+        } else if (kind == "vehicle_recording_attempt_finished") {
+          // A terminal failure can be newer than the last persisted worker
+          // summary. Success logs alone never supply positive EOS/file proof.
+          if (!event.value("incomplete", false)) continue;
+          attempt = event.value("recording_attempt_id", ""); reported = event.value("reported_at_utc_ms", std::uint64_t{0});
+        } else if (kind == "vehicle_media_status" && event.contains("status") && event.at("status").contains("lanes")) {
+          persisted = true;
+          for (const auto& lane : event.at("status").at("lanes")) {
+            if (!lane.contains("recording") || !lane.at("recording").is_object()) continue;
+            const auto& recording = lane.at("recording");
+            if (!recording.value("configured_enabled", false)) continue;
+            const auto candidate = recording.value("recording_attempt_id", "");
+            if (!attempt.empty() && candidate != attempt) ambiguous = true;
+            attempt = candidate; reported = std::max(reported, recording.value("reported_at_utc_ms", std::uint64_t{0}));
+            persisted = persisted && recording.value("summary_persisted", false);
+            gap = gap || recording.value("incomplete", false) || recording.value("state", "") == "failed";
+          }
+        } else continue;
+        if (attempt.empty() || reported < session.at("started_at_utc_ms").get<std::uint64_t>()) continue;
+        if (kind == "vehicle_recording_attempt_finished") gap = true;
+        if (reported == latest && fence.is_object() && fence.value("recording_attempt_id", "") != attempt) ambiguous = true;
+        if (reported >= latest) {
+          latest = reported; fence = {{"recording_attempt_id", attempt}, {"reported_at_utc_ms", reported},
+              {"source_complete", !ambiguous}, {"kind", kind == "vehicle_recording_attempt_started" ? "started" :
+                  kind == "vehicle_recording_attempt_finished" ? "finished" : "status"},
+              {"summary_persisted", persisted}, {"incomplete", gap}};
+        }
+      }
+      if (!logs.eof()) fence = Json();
+      if (fence.is_object()) {fence["incomplete"] = gap; fence["source_complete"] = !ambiguous;}
+    }
+    // Logs only fence the latest attempt and carry negative evidence. The
+    // positive End/EOS/closed evidence still comes exclusively from the summary.
+    return session_recording_evidence(redact(summary, secrets), session, fence);
+  } catch (const std::exception&) { return unavailable("recording_summary_read_failed"); }
 }
 
 Json session_log_chunk(const fs::path& directory, const Json& manifest,
@@ -709,6 +932,9 @@ std::jthread start_vehicle_log_worker(const VehicleConfig& config, std::string t
         TemporaryDirectory snapshot;
         auto manifest = collect_session_logs({{runtime, "runtime.log"}, {can, "vcu-can.jsonl"}},
                                              task.at("session"), snapshot.path, {token}, stop);
+        const bool recording_fence_complete = manifest.at("files").at(0).at("status") == "available";
+        manifest["recording"] = collect_session_recording_evidence(config.recording.root_dir, task.at("session"), {token},
+                                                                  snapshot.path / "runtime.log", recording_fence_complete);
         bool cancelled = false;
         stage = "upload";
         for (const auto& file : manifest.at("files")) {
@@ -805,16 +1031,21 @@ ControllerLogExport::ControllerLogExport(std::string origin, std::vector<std::st
       }
       const bool complete = controller.at("status") == "available" && remote.at("cloud").at("status") == "available" &&
                             remote.at("vehicle").at("status") == "available";
+      const auto vehicle_recording = remote.at("vehicle").value("recording", Json());
+      const auto recording = session_recording_evidence(vehicle_recording.is_object() ? vehicle_recording.value("summary", Json()) : Json(), session,
+                                                       vehicle_recording.is_object() ? vehicle_recording.value("attempt_fence", Json()) : Json());
       // The downloaded snapshot now belongs to this controller. Free the
       // cloud slot so successive exports do not wait for retention expiry.
       static_cast<void>(call("release", {{"export_id", id}}));
       const Json manifest = {{"schema_version", 1}, {"session", session}, {"exported_at_utc_ms", now_ms()},
-          {"complete", complete}, {"controller", controller}, {"cloud", remote.at("cloud")}, {"vehicle", remote.at("vehicle")},
+          {"complete", complete}, {"logs_complete", complete}, {"complete_scope", "logs_only"}, {"recording", recording},
+          {"controller", controller}, {"cloud", remote.at("cloud")}, {"vehicle", remote.at("vehicle")},
           {"notes", "UTC window includes 2s before/after. CAN and raw runtime lines may be time-correlated rather than session-tagged. Credentials are redacted. Rotated-away, disabled or unavailable logs cannot be reconstructed; consult each file's issues. Videos and system journals are not included."}};
       write_json(root / "manifest.json", manifest);
       write_session_zip(root, impl_->temporary.path / "session.zip");
       std::lock_guard lock(impl_->mutex);
-      impl_->progress = {{"state", "ready"}, {"complete", complete}, {"session", session},
+      impl_->progress = {{"state", "ready"}, {"complete", complete}, {"logs_complete", complete}, {"complete_scope", "logs_only"},
+                        {"recording", recording}, {"session", session},
                         {"filename", key + ".zip"}, {"manifest", manifest}};
     } catch (const std::exception&) {
       std::lock_guard lock(impl_->mutex);

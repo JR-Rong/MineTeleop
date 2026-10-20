@@ -28,10 +28,13 @@
   const GEAR_CHANGE_STATIONARY_SPEED_MPS = 0.1;
   const GEAR_CHANGE_STATIONARY_MIN_SAMPLES = 3;
   const GEAR_CHANGE_STATIONARY_MIN_DURATION_MS = 200;
-  const CONTROL_PROFILE_VERSION = 4;
+  const CONTROL_PROFILE_VERSION = 7;
   const CONTROL_PROFILE_FIELDS = Object.freeze([
     'profile_version',
     'parking_idle_timeout_ms',
+    'consecutive_late_frame_limit',
+    'critical_camera_stale_brake_ms',
+    'control_recovery_timeout_ms',
     'target_speed_kph',
     'max_motor_torque_nm',
     'max_brake_pressure_bar',
@@ -227,14 +230,17 @@
     if (keys.length !== CONTROL_PROFILE_FIELDS.length ||
         !CONTROL_PROFILE_FIELDS.every(
             field => Object.prototype.hasOwnProperty.call(value, field))) {
-      throw new TypeError('control profile must contain exactly the V4 fields');
+      throw new TypeError('control profile must contain exactly the V7 fields');
     }
     if (value.profile_version !== CONTROL_PROFILE_VERSION) {
       throw new TypeError(`profile_version must be ${CONTROL_PROFILE_VERSION}`);
     }
     const profile = {
       profile_version: CONTROL_PROFILE_VERSION,
+      consecutive_late_frame_limit: requireIntegerRange(value.consecutive_late_frame_limit, 1, 5, 'consecutive_late_frame_limit'),
       parking_idle_timeout_ms: requireIntegerRange(value.parking_idle_timeout_ms, 0, 1000, 'parking_idle_timeout_ms'),
+      critical_camera_stale_brake_ms: requireIntegerRange(value.critical_camera_stale_brake_ms, 100, 3000, 'critical_camera_stale_brake_ms'),
+      control_recovery_timeout_ms: requireIntegerRange(value.control_recovery_timeout_ms, 1000, 30000, 'control_recovery_timeout_ms'),
       target_speed_kph: requireFiniteRange(value.target_speed_kph, 0, 72, 'target_speed_kph'),
       max_motor_torque_nm: requireFiniteRange(
           value.max_motor_torque_nm, 0, 640.0, 'max_motor_torque_nm'),
@@ -267,7 +273,20 @@
     return profile;
   }
 
-  function vehicleControlDiagnostic(issueCode) {
+  function vehicleControlDiagnostic(issueCode, recovery) {
+    const causes = {time_sync: '时间同步不可信', input_lease: '驾驶输入刷新过期',
+      control_link: '控制命令延迟或中断', critical_video: '关键视频中断或无新帧'};
+    const cause = recovery && causes[recovery.cause];
+    const timeout = recovery && Number(recovery.timeout_ms);
+    const deadline = Number.isFinite(timeout) && timeout > 0 ? `${timeout / 1000} 秒` : '配置期限';
+    if (issueCode === 'control_recovery_braking_wait') return {
+      level: 'warn', title: '控制暂缓，制动等待恢复',
+      text: `${cause ? '原因：' + cause + '。' : ''}牵引已撤销，车辆正在制动；当前会话与参数保留。故障恢复后保持制动等待新操作；持续超过${deadline}将安全停车。`,
+    };
+    if (issueCode === 'control_recovery_timeout') return {
+      level: 'critical', title: cause ? `${cause}，恢复超时` : '控制故障持续超时，控制已锁定',
+      text: `${cause || '控制就绪条件'}持续超过${deadline}未稳定恢复。车辆已安全停车、控制已锁定；请结束会话，待故障恢复后重新连接。`,
+    };
     if (issueCode === 'critical_camera_failed') return {
       level: 'critical', title: '关键视频故障，控制已锁定',
       text: '关键视频中断或启动超时，本会话已禁止控制。画面恢复不会解除锁定；请结束会话，待视频正常后重新连接并确认限幅、完成 VCU 握手。',
@@ -324,6 +343,8 @@
           value.max_brake_pressure_bar, 0, 327.6, 'max_brake_pressure_bar'),
       max_steering_angle_deg: requireFiniteRange(
           value.max_steering_angle_deg, 0, 30, 'max_steering_angle_deg'),
+      default_critical_camera_stale_brake_ms: requireIntegerRange(value.default_critical_camera_stale_brake_ms, 100, 3000, 'default_critical_camera_stale_brake_ms'),
+      default_control_recovery_timeout_ms: requireIntegerRange(value.default_control_recovery_timeout_ms, 1000, 30000, 'default_control_recovery_timeout_ms'),
       default_speed_pid_kp: requireFiniteRange(
           value.default_speed_pid_kp, speedPidLimits.kp.min, speedPidLimits.kp.max,
           'default_speed_pid_kp'),
@@ -384,6 +405,9 @@
     return {
       profile_version: CONTROL_PROFILE_VERSION,
       parking_idle_timeout_ms: requested.parking_idle_timeout_ms,
+      consecutive_late_frame_limit: requested.consecutive_late_frame_limit,
+      critical_camera_stale_brake_ms: requested.critical_camera_stale_brake_ms,
+      control_recovery_timeout_ms: requested.control_recovery_timeout_ms,
       target_speed_kph: Math.min(requested.target_speed_kph, hard.max_target_speed_kph),
       max_motor_torque_nm: Math.min(
           requested.max_motor_torque_nm, hard.full_scale_motor_torque_nm),
@@ -423,6 +447,9 @@
     return mergeControlProfileWithHardLimits({
       profile_version: CONTROL_PROFILE_VERSION,
       parking_idle_timeout_ms: 500,
+      consecutive_late_frame_limit: 3,
+      critical_camera_stale_brake_ms: hard.default_critical_camera_stale_brake_ms,
+      control_recovery_timeout_ms: hard.default_control_recovery_timeout_ms,
       target_speed_kph: hard.max_target_speed_kph / 2,
       max_motor_torque_nm: hard.full_scale_motor_torque_nm / 2,
       max_brake_pressure_bar: hard.max_brake_pressure_bar / 2,
@@ -447,6 +474,42 @@
     return clamp(profile.target_speed_kph / hard.max_speed_kph, 0, hard.max_throttle);
   }
 
+  function degradedInputRearmRequired(timing, lastNativeAcceptedControlSeq) {
+    if (timing && timing.rearm_required === false) return false;
+    const seq = timing && timing.last_valid_command_seq;
+    if (Number.isSafeInteger(seq) && seq > 0 &&
+        Number.isSafeInteger(lastNativeAcceptedControlSeq) && lastNativeAcceptedControlSeq > seq) return false;
+    return true;
+  }
+
+  // Display only: ICE, cloud ingress and software vehicle results are distinct
+  // measurements. None of these values authorizes motion or proves CAN action.
+  function controlLatencyPresentation(metrics, runtime, sessionId, generation) {
+    const number = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+    const seq = value => Number.isSafeInteger(value) && value > 0 ? value : null;
+    const ms = value => number(value) === null ? '未知' : `${Math.round(value)} ms`;
+    const media = number(metrics && metrics.media_transport_rtt_ms);
+    const native = runtime && runtime.native_control || {};
+    const scoped = Boolean(sessionId) && runtime && runtime.connected === true &&
+      runtime.session_id === sessionId && runtime.control_session_generation === generation &&
+      native.session_generation === generation;
+    const result = scoped && native.vehicle_result_latency || {};
+    const ackSeq = scoped ? seq(native.last_ack_seq) : null;
+    const resultSeq = seq(result.command_seq), acceptedSeq = seq(result.last_accepted_command_seq);
+    return {
+      media: {text: ms(media), level: media === null ? 'warn' : ''},
+      cloud: {text: ackSeq === null ? '尚无入口确认' :
+        `#${ackSeq} · 包龄 ${ms(native.last_ack_packet_age_ms)} · 收到后 ${ms(native.last_ack_receive_age_ms)} · 进度停滞 ${ms(native.ack_stall_age_ms)}`,
+        level: ackSeq === null || native.ack_braking_wait === true ? 'warn' : ''},
+      vehicle: {text: resultSeq === null ? '尚无关联结果' :
+        `#${resultSeq} · ${result.accepted === true ? '软件接受' : result.accepted === false ? '软件拒绝' : '结果未知'} · 往返 ${ms(result.round_trip_ms)} · 收到后 ${ms(result.result_age_ms)}`,
+        level: resultSeq === null || result.accepted !== true ? 'warn' : ''},
+      accepted: {text: acceptedSeq === null ? '尚无关联接受结果' :
+        `#${acceptedSeq} · 收到后 ${ms(result.last_accepted_result_age_ms)}`,
+        level: acceptedSeq === null ? 'warn' : ''},
+    };
+  }
+
   function controlProfilesEqual(leftValue, rightValue) {
     let left;
     let right;
@@ -456,20 +519,7 @@
     } catch (_) {
       return false;
     }
-    return left.target_speed_kph === right.target_speed_kph &&
-        left.max_motor_torque_nm === right.max_motor_torque_nm &&
-        left.max_brake_pressure_bar === right.max_brake_pressure_bar &&
-        left.service_brake_pressure_bar === right.service_brake_pressure_bar &&
-        left.hard_brake_pressure_bar === right.hard_brake_pressure_bar &&
-        left.max_steering_angle_deg === right.max_steering_angle_deg &&
-        left.speed_pid_kp === right.speed_pid_kp &&
-        left.speed_pid_ki === right.speed_pid_ki &&
-        left.speed_pid_kd === right.speed_pid_kd &&
-        left.speed_pid_derivative_filter_tau_ms ===
-            right.speed_pid_derivative_filter_tau_ms &&
-        left.speed_pid_max_dt_ms === right.speed_pid_max_dt_ms &&
-        left.motor_torque_rise_rate_nm_per_s ===
-            right.motor_torque_rise_rate_nm_per_s;
+    return CONTROL_PROFILE_FIELDS.every(field => left[field] === right[field]);
   }
 
   function reduceControlProfileStatus(stateValue, statusValue) {
@@ -658,11 +708,15 @@
     return {mapped: true, changed: pressedCodes.delete(code), action};
   }
 
-  function blockAndClearKeys(pressedCodes, blockedCodes) {
+  function blockAndClearKeys(pressedCodes, blockedCodes, preserveBrake = false) {
     requireKeySet(pressedCodes, 'pressedCodes');
     requireKeySet(blockedCodes, 'blockedCodes');
-    for (const code of pressedCodes) blockedCodes.add(code);
-    pressedCodes.clear();
+    for (const code of pressedCodes) {
+      const action = keyAction(code);
+      if (preserveBrake && (action === 'service_brake' || action === 'hard_brake')) continue;
+      blockedCodes.add(code);
+      pressedCodes.delete(code);
+    }
   }
 
   function deriveKeyState(pressedCodes) {
@@ -931,15 +985,18 @@
     throttle,
     brake,
     gearRequestPending = false,
+    preserveBrakeDuringRearm = false,
+    steering = 0,
   }) {
     const sampledThrottle = clamp(finiteNumber(throttle), 0, 1);
     const sampledBrake = clamp(finiteNumber(brake), 0, 1);
-    if (!authorityReady || gearRequestPending) {
-      return {requiresNeutral: true, throttle: 0, brake: 0};
-    }
+    if (!authorityReady) return {requiresNeutral: true, throttle: 0, brake: 0};
+    if (gearRequestPending) return {
+      requiresNeutral: true, throttle: 0, brake: preserveBrakeDuringRearm ? sampledBrake : 0};
     if (requiresNeutral) {
-      const pedalsNeutral = sampledThrottle === 0 && sampledBrake === 0;
-      return {requiresNeutral: !pedalsNeutral, throttle: 0, brake: 0};
+      const pedalsNeutral = sampledThrottle === 0 && sampledBrake === 0 &&
+          (!preserveBrakeDuringRearm || finiteNumber(steering) === 0);
+      return {requiresNeutral: !pedalsNeutral, throttle: 0, brake: preserveBrakeDuringRearm ? sampledBrake : 0};
     }
     return {requiresNeutral: false, throttle: sampledThrottle, brake: sampledBrake};
   }
@@ -1051,8 +1108,85 @@
     return {kind: 'none', visible: false, severity: '', banner: '', alert: ''};
   }
 
+  function deriveControlStopPresentation(localEstop, vehicleEstop, stopSource, stopReason, handshake) {
+    const safety = deriveEstopPresentation(localEstop, vehicleEstop, stopSource, stopReason);
+    if (safety.visible && safety.kind !== 'software_fault') return safety;
+    const diagnostic = vehicleControlDiagnostic(handshake && handshake.issue_code, handshake && handshake.control_recovery);
+    if (diagnostic && diagnostic.level === 'critical') {
+      return {kind: 'control_fault', visible: true, severity: 'critical',
+        banner: diagnostic.text, alert: diagnostic.text};
+    }
+    return safety;
+  }
+
+  function deriveControlRecoveryPresentation(connected, telemetry, feedbackFresh, hardStopVisible) {
+    const hidden = {visible: false, severity: '', banner: '', alert: '', cause: ''};
+    if (!connected || !telemetry || hardStopVisible || telemetry.estop === true ||
+        ['ESTOP', 'FAULT', 'TIMEOUT_BRAKE'].includes(telemetry.safety_state)) return hidden;
+    const timing = telemetry.control_timing || {};
+    const waiting = timing.control_braking_wait === true;
+    const holding = timing.recovery_brake_hold === true;
+    const delayed = telemetry.safety_state === 'DEGRADED';
+    if (!waiting && !holding && !delayed) return hidden;
+    const cause = waiting || holding ? String(timing.control_recovery_cause || '') : 'control_delay';
+    const reasons = {critical_video: '关键视频中断或无新帧', time_sync: '时间同步不可信',
+      input_lease: '驾驶输入刷新过期', control_link: '控制命令延迟或短暂中断', control_delay: '控制指令延迟或短暂中断'};
+    const reason = reasons[cause] || '控制链路暂时异常';
+    const guidance = controlRecoveryGuidance(timing, feedbackFresh);
+    // Report the last authoritative vehicle state without claiming that old
+    // feedback confirms current physical braking or a completed stop.
+    const banner = !feedbackFresh
+      ? `车端此前已报告${waiting || holding ? '制动等待' : '控制暂缓'}（${reason}）；反馈已过期，当前控制状态待确认。`
+      : guidance.visible
+        ? `车端报告${waiting ? '制动等待' : '制动保持'}；当前会话保留。${guidance.text}`
+          : `车端控制暂缓：${reason}，牵引已撤销；当前会话保留。请释放旧按键再重新按下；持续无有效控制将安全停车。`;
+    return {visible: true, severity: 'warn', banner, alert: banner, cause};
+  }
+
+  function controlRecoveryGuidance(timingValue, feedbackFresh = true) {
+    const timing = timingValue && typeof timingValue === 'object' ? timingValue : {};
+    const waiting = timing.control_braking_wait === true;
+    const holding = timing.recovery_brake_hold === true;
+    const rearm = timing.rearm_required === true;
+    const hidden = {visible: false, phase: 'none', causes: [], reason: '', nextStep: '', text: ''};
+    if (!waiting && !holding && !rearm) return hidden;
+    const labels = {critical_video: '关键视频未就绪', input_lease: '驾驶输入刷新未就绪',
+      control_link: '控制命令时效或链路未就绪', time_sync: '时间同步不可信'};
+    const causes = [];
+    if (timing.critical_video_required !== false && timing.driver_critical_video_ready === false) causes.push('critical_video');
+    if (timing.operator_input_ready === false) causes.push('input_lease');
+    if (timing.driver_control_link_ready === false) causes.push('control_link');
+    if (timing.driver_time_sync_ready === false) causes.push('time_sync');
+    let phase, reason, nextStep;
+    if (!feedbackFresh) {
+      phase = 'feedback_unknown'; reason = '车端恢复反馈已过期，当前状态待确认';
+      nextStep = '保持方向输入释放，等待新鲜车端反馈';
+    } else if (causes.length || timing.recovery_samples_healthy !== true) {
+      phase = 'wait_conditions'; reason = causes.length ? causes.map(cause => labels[cause]).join('、') :
+        timing.recovery_samples_healthy === false ? '必需条件尚未连续健康' : '必需条件恢复尚未确认';
+      if (!causes.length && timing.recovery_samples_healthy !== false && labels[timing.control_recovery_cause]) reason += `（上次：${labels[timing.control_recovery_cause]}）`;
+      nextStep = '保持方向输入释放，等待条件恢复及连续健康确认';
+    } else if (waiting) {
+      phase = 'healthy_window'; reason = '必需条件正在连续健康确认';
+      nextStep = '保持方向输入释放，等待 300 ms 连续健康确认后再重新操作';
+    } else {
+      phase = 'await_fresh_input'; reason = '等待新的驾驶操作，制动保持';
+      nextStep = '释放旧方向输入、归零后重新按下；持续制动可保持';
+    }
+    return {visible: true, phase, causes, reason, nextStep, text: `当前阻挡：${reason} · 下一步：${nextStep}`};
+  }
+
   function deriveControlCommandRejection(issueCodeValue) {
     const issueCode = String(issueCodeValue || '');
+    if (issueCode === 'control_input_rearm_required') {
+      return {
+        issueCode,
+        action: 'rearm_input',
+        clearInput: true,
+        severity: 'warn',
+        text: '控制命令短暂中断，输入已清除并保持当前挡位；请释放控制键后重新按下。',
+      };
+    }
     if (issueCode === 'vcu_drive_gear_change_moving_or_stale') {
       return {
         issueCode,
@@ -1103,15 +1237,15 @@
       : 100;
   }
 
-  function createLatestControlWriteQueue(writeControl, onUnhandledError, onUrgentWrite) {
+  function createLatestControlWriteQueue(writeControl, onUnhandledError, onPreemptWrite) {
     if (typeof writeControl !== 'function') throw new TypeError('writeControl must be a function');
     const reportUnhandled = typeof onUnhandledError === 'function'
       ? onUnhandledError
       : function noop() {};
-    const notifyUrgent = typeof onUrgentWrite === 'function'
-      ? onUrgentWrite
+    const notifyPreempt = typeof onPreemptWrite === 'function'
+      ? onPreemptWrite
       : function noop() {};
-    let active = false;
+    const active = new Set();
     let pending = null;
 
     function mergeExtra(current, incoming) {
@@ -1120,30 +1254,49 @@
       });
     }
 
-    async function drain() {
-      if (active) return;
-      active = true;
-      try {
-        while (pending) {
-          const request = pending;
-          pending = null;
-          try {
-            const result = await writeControl(request.extra, request.announceUnavailable);
-            for (const waiter of request.waiters) waiter.resolve(result);
-          } catch (error) {
-            if (!request.waiters.length) reportUnhandled(error);
-            for (const waiter of request.waiters) waiter.reject(error);
-          }
-        }
-      } finally {
-        active = false;
-        if (pending) drain().catch(reportUnhandled);
+    function preempt(request, reason) {
+      if ((request.extra.estop && reason !== 'session_changed') || request.preempted) return;
+      request.preempted = true;
+      notifyPreempt(request, reason);
+    }
+
+    function drain() {
+      if (!pending) return;
+      const urgent = Boolean(pending.extra.estop);
+      if (urgent) {
+        // Reserve a third slot for ESTOP; ordinary responses never consume it.
+        for (const request of active) preempt(request, 'estop');
       }
+      const limit = urgent ? 3 : 2;
+      if (active.size >= limit) {
+        // A heartbeat waits in the single latest slot for an existing response
+        // deadline. Cancelling at the third 66ms tick would starve otherwise
+        // valid 132-150ms replies, including gear-transition confirmations.
+        if (pending.waiters.length) {
+          const oldest = Array.from(active).find(request => !request.extra.estop && !request.preempted);
+          if (oldest) preempt(oldest, urgent ? 'estop' : 'latest_input');
+        }
+        return;
+      }
+      const request = pending;
+      pending = null;
+      active.add(request);
+      let result;
+      try { result = writeControl(request.extra, request.announceUnavailable, request); }
+      catch (error) { result = Promise.reject(error); }
+      Promise.resolve(result).then(value => {
+        for (const waiter of request.waiters) waiter.resolve(value);
+      }, error => {
+        if (!request.waiters.length) reportUnhandled(error);
+        for (const waiter of request.waiters) waiter.reject(error);
+      }).finally(() => {
+        active.delete(request);
+        drain();
+      }).catch(reportUnhandled);
     }
 
     function send(extra, announceUnavailable) {
       return new Promise(function enqueue(resolve, reject) {
-        const urgent = Boolean(extra && extra.estop);
         if (pending) {
           pending.extra = mergeExtra(pending.extra, extra);
           pending.announceUnavailable = pending.announceUnavailable || announceUnavailable;
@@ -1155,19 +1308,178 @@
             waiters: [{resolve, reject}],
           };
         }
-        if (urgent && active) notifyUrgent();
-        drain().catch(reportUnhandled);
+        drain();
       });
     }
 
     function enqueueHeartbeat() {
       if (pending) return false;
       pending = {extra: {}, announceUnavailable: false, waiters: []};
-      drain().catch(reportUnhandled);
+      drain();
       return true;
     }
 
-    return Object.freeze({send, enqueueHeartbeat});
+    function reset() {
+      if (pending) {
+        for (const waiter of pending.waiters) waiter.resolve({sent: false, reason: 'control_queue_session_changed'});
+        pending = null;
+      }
+      for (const request of active) {
+        // A preempted request may still be settling; revoke all old slots.
+        notifyPreempt(request, 'session_changed');
+      }
+      active.clear();
+    }
+
+    return Object.freeze({send, enqueueHeartbeat, reset});
+  }
+
+  function iceOfferScope(offer, allowLegacyBootstrap) {
+    const id = typeof offer.media_negotiation_id === 'string' && offer.media_negotiation_id.length <= 128
+      ? offer.media_negotiation_id : '';
+    const ufrags = [];
+    const expression = /(?:^|\r?\n)a=ice-ufrag:([^\s\r\n]+)/g;
+    for (let match; (match = expression.exec(String(offer.sdp || '')));) {
+      if (match[1].length <= 256 && !ufrags.includes(match[1]) && ufrags.length < 128) ufrags.push(match[1]);
+    }
+    return {id, ufrags, allowLegacyBootstrap: Boolean(allowLegacyBootstrap) && offer.legacy_bootstrap_allowed !== false && !id};
+  }
+
+  function iceCandidateScope(candidate) {
+    const id = typeof candidate.media_negotiation_id === 'string' && candidate.media_negotiation_id.length <= 128
+      ? candidate.media_negotiation_id : '';
+    const match = String(candidate.candidate || '').match(/(?:^|\s)ufrag\s+([^\s]+)/);
+    const ufrag = typeof candidate.usernameFragment === 'string' ? candidate.usernameFragment : match ? match[1] : '';
+    return {id, ufrag: ufrag.length <= 256 ? ufrag : ''};
+  }
+
+  function iceCandidateMatchesOffer(candidate, offer) {
+    if (!offer) return false;
+    const scope = iceCandidateScope(candidate);
+    if (scope.id) {
+      if (!offer.id || scope.id !== offer.id) return false;
+      return !scope.ufrag || offer.ufrags.includes(scope.ufrag);
+    }
+    if (scope.ufrag) return offer.ufrags.includes(scope.ufrag);
+    return offer.allowLegacyBootstrap === true;
+  }
+
+  function mediaScopeDiagnostic(issue) {
+    if (!['media_negotiation_scope_missing', 'media_ice_scope_missing'].includes(issue)) return null;
+    return {level: 'warn', text: '媒体信令版本不兼容，重试缺少协商标识。请保持车辆停止，统一更新控制端和车端包，重新打开控制页面并建立新会话。'};
+  }
+
+  function iceServerError(error) {
+    const url = String(error.url || ''), message = String(error.errorText || '');
+    const explicit = url.match(/[?&]transport=(udp|tcp)(?:&|$)/i);
+    return {server_transport: explicit ? explicit[1].toLowerCase()
+      : /^(turns|stuns):/i.test(url) ? 'tcp' : 'udp',
+      error_category: /host lookup|name resolution|dns|resolve/i.test(message) ? 'dns_resolution'
+        : /timed out|timeout/i.test(message) ? 'server_timeout' : 'unclassified'};
+  }
+
+  function iceNetworkPath(report, pair) {
+    if (!pair) return 'unknown';
+    const local = report.get(pair.localCandidateId), remote = report.get(pair.remoteCandidateId);
+    const known = value => value && ['host', 'srflx', 'prflx', 'relay'].includes(value.candidateType);
+    if (!known(local) || !known(remote)) return 'unknown';
+    const relays = [local, remote].filter(value => value.candidateType === 'relay');
+    if (!relays.length) return 'p2p';
+    // A relay candidate's protocol=udp does NOT describe the client->TURN leg.
+    const transports = relays.map(value => value.relayProtocol);
+    if (transports.includes('tls')) return 'turn_tls';
+    if (transports.includes('tcp')) return 'turn_tcp';
+    return transports.every(value => value === 'udp') ? 'turn_udp' : 'turn_unknown';
+  }
+
+  function iceAddressFamily(address) {
+    const text = String(address || '');
+    if (/^[\da-f:]+(?:%[\w.-]+)?$/i.test(text) && text.includes(':')) return 'ipv6';
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) return 'ipv4';
+    if (/\.local\.?$/i.test(text)) return 'mdns';
+    return 'unknown';
+  }
+
+  function iceCandidateSummary(candidate) {
+    const parts = String(candidate?.candidate || '').trim().split(/\s+/);
+    const typeIndex = parts.indexOf('typ');
+    const type = typeIndex >= 0 ? parts[typeIndex + 1] : candidate?.type;
+    return {candidate_type: ['host', 'srflx', 'prflx', 'relay'].includes(type) ? type : 'unknown',
+      protocol: ['udp', 'tcp'].includes(String(parts[2]).toLowerCase()) ? parts[2].toLowerCase() : 'unknown',
+      address_family: iceAddressFamily(parts[4] || candidate?.address),
+      sdp_mline_index: candidate?.sdpMLineIndex ?? null};
+  }
+
+  function iceConnectivity(report, selectedPair) {
+    const candidates = {local: {}, remote: {}};
+    const candidateFamilies = {local: {}, remote: {}};
+    const states = {}, paths = {}, pairs = [];
+    const count = value => Number.isFinite(value) && value >= 0 ? value : null;
+    const token = (value, allowed) => allowed.includes(value) ? value : 'unknown';
+    for (const value of report.values()) {
+      const side = value.type === 'local-candidate' ? 'local'
+        : value.type === 'remote-candidate' ? 'remote' : null;
+      if (side) {
+        const key = token(value.candidateType, ['host', 'srflx', 'prflx', 'relay']) + '/' + token(value.protocol, ['udp', 'tcp']);
+        candidates[side][key] = (candidates[side][key] || 0) + 1;
+        const familyKey = key + '/' + iceAddressFamily(value.address ?? value.ip);
+        candidateFamilies[side][familyKey] = (candidateFamilies[side][familyKey] || 0) + 1;
+      }
+      if (value.type !== 'candidate-pair') continue;
+      const local = report.get(value.localCandidateId) || {}, remote = report.get(value.remoteCandidateId) || {};
+      const state = token(value.state, ['frozen', 'waiting', 'in-progress', 'failed', 'succeeded']);
+      states[state] = (states[state] || 0) + 1;
+      const path = iceNetworkPath(report, value), selected = Boolean(selectedPair && selectedPair.id === value.id);
+      const requests = count(value.requestsSent), responses = count(value.responsesReceived);
+      const summary = paths[path] || (paths[path] = {pairs: 0, attempted_pairs: 0, responding_pairs: 0,
+        succeeded_pairs: 0, failed_pairs: 0, selected_pairs: 0, requests_sent: 0, responses_received: 0,
+        request_counter_pairs: 0, response_counter_pairs: 0});
+      summary.pairs++; summary.attempted_pairs += requests > 0 ? 1 : 0;
+      summary.responding_pairs += responses > 0 ? 1 : 0;
+      summary.succeeded_pairs += state === 'succeeded' ? 1 : 0;
+      summary.failed_pairs += state === 'failed' ? 1 : 0; summary.selected_pairs += selected ? 1 : 0;
+      if (requests !== null) { summary.requests_sent += requests; summary.request_counter_pairs++; }
+      if (responses !== null) { summary.responses_received += responses; summary.response_counter_pairs++; }
+      pairs.push({id: value.id, selected, state, nominated: value.nominated === true, network_path: path,
+        local_type: token(local.candidateType, ['host', 'srflx', 'prflx', 'relay']),
+        remote_type: token(remote.candidateType, ['host', 'srflx', 'prflx', 'relay']),
+        local_address_family: iceAddressFamily(local.address ?? local.ip),
+        remote_address_family: iceAddressFamily(remote.address ?? remote.ip),
+        protocol: token(local.protocol, ['udp', 'tcp']),
+        relay_protocol: token(local.relayProtocol, ['udp', 'tcp', 'tls']),
+        remote_relay_protocol: token(remote.relayProtocol, ['udp', 'tcp', 'tls']),
+        requests_sent: requests, responses_received: responses,
+        requests_received: count(value.requestsReceived), responses_sent: count(value.responsesSent),
+        bytes_sent: count(value.bytesSent), bytes_received: count(value.bytesReceived),
+        round_trip_ms: count(value.currentRoundTripTime) === null ? null : value.currentRoundTripTime * 1000});
+    }
+    // Summaries cover ALL pairs, even when detail is truncated. Retain the
+    // selected path and failed/attempted direct checks ahead of waiting pairs.
+    const rank = pair => pair.selected ? 0 : pair.network_path === 'p2p'
+      ? pair.state === 'failed' ? 1 : pair.requests_sent > 0 ? 2 : 3 : 4;
+    pairs.sort((a, b) => rank(a) - rank(b));
+    return {candidates, candidate_families: candidateFamilies, pair_states: states, path_checks: paths, pair_count: pairs.length,
+      pairs: pairs.slice(0, 16), pairs_truncated: pairs.length > 16};
+  }
+
+  function receiverLatency(stats, captureEncodeMs, roundTripSeconds) {
+    function average(total, count) {
+      return Number.isFinite(total) && total >= 0 && Number.isFinite(count) && count > 0
+        ? total * 1000 / count : null;
+    }
+    const processingMs = average(stats.totalProcessingDelay, stats.framesDecoded);
+    const jitterMs = average(stats.jitterBufferDelay, stats.jitterBufferEmittedCount);
+    const decodeMs = average(stats.totalDecodeTime, stats.framesDecoded);
+    // First RTP arrival -> decode already covers jitter/assembly waiting.
+    // Older browsers can supply the narrower buffer + decode approximation.
+    const receiverMs = processingMs !== null ? processingMs
+      : jitterMs !== null && decodeMs !== null ? jitterMs + decodeMs : null;
+    const valid = value => Number.isFinite(value) && value >= 0;
+    return {processingMs, jitterMs, decodeMs, receiverMs,
+      method: processingMs !== null ? 'rtp-arrival-to-decode'
+        : receiverMs !== null ? 'jitter-buffer-plus-decode' : 'unavailable',
+      latencyMs: valid(captureEncodeMs) && valid(roundTripSeconds) && receiverMs !== null
+        ? captureEncodeMs + roundTripSeconds * 500 + receiverMs : null};
   }
 
   const CONTROL_OUTCOMES = Object.freeze([
@@ -1238,6 +1550,146 @@
     return terminalControlOutcomeCount(current) === current.prepared;
   }
 
+  function telemetryFreshness(message, receivedAtMonotonicMs, nowMonotonicMs, synchronizedNowMs) {
+    const receivedAge = message && receivedAtMonotonicMs != null &&
+        Number.isFinite(receivedAtMonotonicMs) && Number.isFinite(nowMonotonicMs)
+        ? Math.max(0, nowMonotonicMs - receivedAtMonotonicMs) : null;
+    const sourceAge = message && message.sent_at_utc_ms != null && synchronizedNowMs != null &&
+        Number.isFinite(Number(message.sent_at_utc_ms)) && Number.isFinite(synchronizedNowMs)
+        ? Math.max(0, synchronizedNowMs - Number(message.sent_at_utc_ms)) : null;
+    return {
+      received_age_ms: receivedAge,
+      source_age_ms: sourceAge,
+      fresh: receivedAge !== null && receivedAge <= 500 && sourceAge !== null && sourceAge <= 500,
+    };
+  }
+
+  function recordingPresentation(status, scope, receivedAtMonotonicMs, nowMonotonicMs, synchronizedNowMs, previous = {}) {
+    const scopeKey = scope && scope.session_id ? `${scope.vehicle_id}:${scope.session_id}` : '';
+    if (!scopeKey) return {scopeKey, incomplete: false, text: '未连接', level: '', alerts: []};
+    const matches = scope && typeof scope.vehicle_id === 'string' && scope.vehicle_id && typeof scope.session_id === 'string' && scope.session_id &&
+        status && status.session_id === scope.session_id && status.vehicle_id === scope.vehicle_id;
+    const lanes = matches && Array.isArray(status.lanes) ? status.lanes : [];
+    const gap = previous.scopeKey === scopeKey && previous.incomplete === true ||
+        lanes.some(lane => lane && typeof lane === 'object' && typeof lane.camera_id === 'string' && lane.camera_id &&
+          lane.recording && lane.recording.schema_version === 1 && typeof lane.recording.incomplete === 'boolean' &&
+          (lane.recording.incomplete === true || lane.recording.state === 'failed'));
+    // The producer also sets incomplete for lost finalization evidence. Only
+    // a known AU/storage loss cause proves a gap; do not turn unknown into loss.
+    const knownLoss = record => ['recording_admission_overflow', 'recording_invalid_access_unit', 'recording_disk_full'].includes(record.issue_code);
+    const gapConfirmed = previous.scopeKey === scopeKey && previous.gapConfirmed === true ||
+        lanes.some(lane => lane && typeof lane.camera_id === 'string' && lane.camera_id && lane.recording &&
+          lane.recording.schema_version === 1 && typeof lane.recording.incomplete === 'boolean' &&
+          (lane.recording.incomplete === true || lane.recording.state === 'failed') && knownLoss(lane.recording));
+    const idleAction = '车辆空闲后检查存储空间、目录权限和车端录制日志';
+    const unknown = () => ({scopeKey, incomplete: gap, gapConfirmed, text: gapConfirmed ? '录像不完整，当前状态未确认' : gap ? '录像证据不足，完整性待确认' : '录像状态未确认',
+      level: 'warn', alerts: [`${gapConfirmed ? '本会话录像存在已确认缺口；' : gap ? '录像证据不足，完整性待确认；' : ''}录像状态未确认。下一步：${idleAction}；保留已有片段和日志，旧版车端请更新以取得录制反馈。`]});
+    // Media status normally arrives once per second. This three-second bound
+    // controls diagnostic presentation only, never the critical-video gate.
+    if (!matches || !lanes.length || lanes.length > 64 || !Number.isFinite(receivedAtMonotonicMs) ||
+        !Number.isFinite(nowMonotonicMs) || nowMonotonicMs < receivedAtMonotonicMs || nowMonotonicMs - receivedAtMonotonicMs > 3000 ||
+        !Number.isFinite(status.reported_at_utc_ms) || !Number.isFinite(synchronizedNowMs) ||
+        status.reported_at_utc_ms > synchronizedNowMs || synchronizedNowMs - status.reported_at_utc_ms > 3000) return unknown();
+    const states = ['disabled', 'starting', 'recording', 'failed', 'finalizing', 'finalized', 'cleanup_pending'];
+    const number = value => Number.isSafeInteger(value) && value >= 0;
+    if (lanes.some(lane => !lane || typeof lane !== 'object' || typeof lane.camera_id !== 'string' || !lane.camera_id || !lane.recording ||
+        lane.recording.schema_version !== 1 || !states.includes(lane.recording.state) ||
+        typeof lane.recording.recording_attempt_id !== 'string' || lane.recording.configured_enabled === true && !lane.recording.recording_attempt_id ||
+        lane.recording.configured_enabled === false && (lane.recording.active !== false || lane.recording.state !== 'disabled') ||
+        ['configured_enabled', 'active', 'incomplete', 'final_eos_received', 'cleanup_pending', 'summary_persisted']
+          .some(key => typeof lane.recording[key] !== 'boolean') ||
+        ['accepted_access_units', 'worker_input_access_units', 'finalized_segments', 'unfinished_segments', 'status_revision', 'summary_revision']
+          .some(key => !number(lane.recording[key]))) || new Set(lanes.map(lane => lane.camera_id)).size !== lanes.length) return unknown();
+    const enabled = lanes.filter(lane => lane.recording.configured_enabled === true);
+    // A fresh parent poll can carry old child status. Use the worker's source
+    // timestamp too; receiving the same status again cannot renew its evidence.
+    if (enabled.some(lane => !number(lane.recording.reported_at_utc_ms) || lane.recording.reported_at_utc_ms === 0 ||
+        lane.recording.reported_at_utc_ms > synchronizedNowMs || synchronizedNowMs - lane.recording.reported_at_utc_ms > 3000)) return unknown();
+    const action = lane => typeof lane.recording.next_action === 'string' && lane.recording.next_action.trim()
+      ? lane.recording.next_action.trim().slice(0, 512) : idleAction;
+    if (gap) {
+      const faults = enabled.filter(lane => lane.recording.incomplete || lane.recording.state === 'failed' || lane.recording.cleanup_pending);
+      const alerts = faults.length ? faults.map(lane => `${lane.camera_id}：${knownLoss(lane.recording) ? '录像不完整，已确认缺口，不能补回此前缺录' : '录像证据不足，完整性待确认'}${lane.recording.cleanup_pending ? '，收尾未完成' : ''}。下一步：${action(lane)}。`) : [];
+      if (gapConfirmed) alerts.push(`本会话录像存在已确认缺口；当前录制恢复也不能补回此前缺口。下一步：${idleAction}，保存现有日志和录像供核查。`);
+      else if (!faults.length) alerts.push(`此前录像完整性尚未获确认；当前录制恢复不能证明此前完整。下一步：${idleAction}，保留已有片段和日志核查封装证据。`);
+      return {scopeKey, incomplete: true, gapConfirmed, text: gapConfirmed ? '录像不完整' : '录像证据不足，完整性待确认', level: 'warn', alerts};
+    }
+    if (!enabled.length) return {scopeKey, incomplete: false, text: '未启用', level: '', alerts: []};
+    if (enabled.every(lane => {const value=lane.recording;return value.state==='finalized' && !value.active && value.final_eos_received &&
+        !value.cleanup_pending && value.summary_persisted && value.accepted_access_units>0 &&
+        value.worker_input_access_units===value.accepted_access_units && value.finalized_segments>0 && value.unfinished_segments===0 && value.status_revision>0 && value.summary_revision>0}))
+      return {scopeKey, incomplete: false, text: '车端报告本次录像封装完成', level: '', alerts: []};
+    if (enabled.some(lane => lane.recording.cleanup_pending)) return {scopeKey, incomplete: false, text: '录像收尾未完成', level: 'warn',
+      alerts: [`录像收尾仍待确认。下一步：${idleAction}，等待车端完成清理；保留已有片段。`]};
+    if (enabled.some(lane => lane.recording.state==='finalizing')) return {scopeKey, incomplete: false, text: '录像封装中', level: 'warn', alerts: []};
+    if (enabled.every(lane => lane.recording.state==='recording' && lane.recording.active && lane.recording.worker_input_access_units>0))
+      return {scopeKey, incomplete: false, text: '录制进行中，完整性待结束确认', level: '', alerts: []};
+    if (enabled.some(lane => lane.recording.state==='starting')) return {scopeKey, incomplete: false, text: '录像启动中', level: 'warn', alerts: []};
+    return unknown();
+  }
+
+  function safeLogoutFeedback(request, message, receivedAtMonotonicMs, nowMonotonicMs, synchronizedNowMs) {
+    const rejected = reason => ({confirmed: false, reason});
+    if (!request || !message || message.event !== 'vehicle_telemetry') return rejected('feedback_missing');
+    if (message.session_id !== request.session_id || message.vehicle_id !== request.vehicle_id || message.driver_id !== request.driver_id) return rejected('session_changed');
+    if (!Number.isSafeInteger(message.control_status_seq) || message.control_status_seq <= request.status_floor ||
+        !Number.isFinite(receivedAtMonotonicMs) || receivedAtMonotonicMs < request.started_at_monotonic_ms) return rejected('feedback_not_new');
+    if (!Number.isFinite(synchronizedNowMs) || !Number.isFinite(request.source_floor_utc_ms)) return rejected('clock_untrusted');
+    const sentAt = message.sent_at_utc_ms;
+    if (!Number.isFinite(sentAt) || sentAt < request.source_floor_utc_ms || sentAt > synchronizedNowMs ||
+        !telemetryFreshness(message, receivedAtMonotonicMs, nowMonotonicMs, synchronizedNowMs).fresh) return rejected('feedback_stale');
+    const adapter = message.vehicle_adapter || {}, handshake = message.vcu_handshake || {}, feedback = message.can_feedback || {};
+    if (adapter.opened !== true || adapter.healthy !== true || adapter.last_error || handshake.state === 'fault' || handshake.state === 'closed') return rejected('adapter_failed');
+    // The current bridge exposes Disarmed only after the final safe CAN batch
+    // succeeded. A local command/HTTP response or a cached handshake is not evidence.
+    if (handshake.supported !== true || handshake.state !== 'disarmed' || handshake.disarming !== false ||
+        handshake.ready !== false || handshake.requested !== false) return rejected('disarm_pending');
+    const parked = Array.isArray(feedback.parking_brake_valid) && feedback.parking_brake_valid.length === 4 &&
+        feedback.parking_brake_valid.every(value => value === true) && Array.isArray(feedback.parking_brake_status) &&
+        feedback.parking_brake_status.length === 4 && feedback.parking_brake_status.every(value => value === 2);
+    // Keep the bridge's existing 0.1 m/s stopped tolerance; this is protocol
+    // evidence, not a new chassis threshold or proof of mechanical parking.
+    if (feedback.supported !== true || feedback.feedback_fresh !== true || !Number.isFinite(feedback.max_feedback_age_ms) ||
+        feedback.max_feedback_age_ms < 0 || feedback.max_feedback_age_ms > 500 || feedback.speed_valid !== true ||
+        !Number.isFinite(feedback.speed_mps) || Math.abs(feedback.speed_mps) > 0.1 || feedback.gear_valid !== true ||
+        feedback.gear !== 1 || feedback.handshake_valid !== true || feedback.handshake_status !== 3 || !parked) return rejected('can_feedback_unconfirmed');
+    return {confirmed: true, reason: 'disarm_confirmed', control_status_seq: message.control_status_seq, estop_confirmed: message.estop === true};
+  }
+
+  function safeLogoutPresentation(result, released, estopLatched) {
+    const labels = {feedback_missing: '尚无车端反馈', feedback_not_new: '未收到退出请求后的新反馈',
+      feedback_stale: '车端反馈已过期', clock_untrusted: '反馈源时间不可信', adapter_failed: '车端适配器或 CAN 故障',
+      disarm_pending: '车端退出尚未完成', can_feedback_unconfirmed: '完整 CAN 退出反馈未确认',
+      timeout: '等待车端确认超时', link_lost: '反馈链路中断', session_changed: '会话或操作页面已变化',
+      unsupported: '当前适配器没有可验证的 VCU 退出反馈', no_active_session: '没有活动车端会话',
+      request_failed: '退出请求未确认', release_failed: '控制会话释放未确认'};
+    const confirmed = result && result.confirmed === true && released === true;
+    const reason = labels[result && result.reason] || '车端安全状态未确认';
+    let text = confirmed
+      ? '车端退出协议及最终 CAN 写入已确认；控制会话已释放。下一步：在车辆本地核实停车状态。'
+      : `${released ? '控制会话已释放；' : ''}安全退出未确认（${reason}）。下一步：在车辆本地核实停车和制动状态；必要时使用物理急停。`;
+    if (estopLatched) text += result && result.estop_confirmed === true
+      ? ' 此次退出期间车端已报告急停；急停请求仍保持锁存，须本地确认后复位。'
+      : ' 急停请求仍保持锁存；请在车辆本地核实，须本地确认后复位。';
+    return {confirmed, text};
+  }
+
+  function selectedIcePair(report) {
+    for (const stat of report.values()) {
+      if (stat.type !== 'transport' || !stat.selectedCandidatePairId) continue;
+      const pair = report.get(stat.selectedCandidatePairId);
+      if (pair && pair.type === 'candidate-pair') return {pair, transport: stat, method: 'transport'};
+    }
+    // Older browsers may omit transport.selectedCandidatePairId. A successful
+    // connectivity check alone does not identify the pair carrying media.
+    for (const pair of report.values()) {
+      if (pair.type === 'candidate-pair' && pair.state === 'succeeded' && pair.nominated === true) {
+        return {pair, transport: null, method: 'nominated_fallback'};
+      }
+    }
+    return {pair: null, transport: null, method: 'unavailable'};
+  }
+
   return Object.freeze({
     KEY_BINDINGS,
     CONTROL_ACTIONS,
@@ -1270,13 +1722,19 @@
     normalizeControlProfile,
     normalizeVehicleHardLimits,
     vehicleControlDiagnostic,
+    deriveControlStopPresentation,
     mergeControlProfileWithHardLimits,
     controlProfileFromVehicleDefaults,
     controlProfileThrottleLimit,
+    controlProfilesEqual,
+    degradedInputRearmRequired,
+    controlLatencyPresentation,
     reduceControlProfileStatus,
     reduceGamepadNeutralInterlock,
     reduceStatusSequence,
     deriveEstopPresentation,
+    deriveControlRecoveryPresentation,
+    controlRecoveryGuidance,
     deriveControlCommandRejection,
     isCurrentPeer,
     isCurrentControlChannel,
@@ -1284,10 +1742,24 @@
     controlIntentSuperseded,
     controlPrepareDeadlineMs,
     createLatestControlWriteQueue,
+    receiverLatency,
+    iceConnectivity,
+    iceCandidateSummary,
+    iceNetworkPath,
+    iceServerError,
     CONTROL_OUTCOMES,
     shouldLogControlOutcome,
     createControlOutcomeMetrics,
     reduceControlOutcome,
     controlOutcomesBalanced,
+    telemetryFreshness,
+    recordingPresentation,
+    safeLogoutFeedback,
+    safeLogoutPresentation,
+    selectedIcePair,
+    mediaScopeDiagnostic,
+    iceOfferScope,
+    iceCandidateScope,
+    iceCandidateMatchesOffer,
   });
 });

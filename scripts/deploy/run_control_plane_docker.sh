@@ -12,6 +12,13 @@ vehicle_id="${MINE_TELEOP_CONTROL_PLANE_VEHICLE_ID:-vehicle-001}"
 password="${MINE_TELEOP_CONTROL_PLANE_PASSWORD:-dev-password}"
 device_token="${MINE_TELEOP_DEVICE_TOKEN:-dev-device-secret}"
 
+# Host networking keeps the browser-facing console on the host loopback.
+# Docker Desktop's bridge cannot publish a container-loopback listener.
+if [ "$(uname -s)" != "Linux" ]; then
+  printf '%s\n' 'Interactive Docker control plane requires Linux host networking. On macOS/Windows use the native desktop client; for isolated HTTP checks use scripts/test/run_control_plane_docker_smoke.sh.' >&2
+  exit 2
+fi
+
 cleanup() {
   docker rm -f "$console_name" >/dev/null 2>&1 || true
   docker rm -f "$server_name" >/dev/null 2>&1 || true
@@ -27,46 +34,46 @@ docker run -d \
   --cap-drop ALL \
   -e MINE_TELEOP_DRIVER_PASSWORD="$password" \
   -e MINE_TELEOP_DEVICE_TOKEN="$device_token" \
-  -p "127.0.0.1:${signaling_port}:8765" \
+  --network host \
   "$image" signaling-server \
-    --host 0.0.0.0 --port 8765 \
+    --host 127.0.0.1 --port "$signaling_port" \
     --vehicle-id "$vehicle_id" \
     --audit-log /tmp/signaling-audit.jsonl >/dev/null
 
 for _ in $(seq 1 30); do
   if docker exec "$server_name" /opt/mine-teleop/bin/mine-teleop \
-    http-health --url http://127.0.0.1:8765/health >/dev/null 2>&1; then
+    http-health --url "http://127.0.0.1:${signaling_port}/health" >/dev/null 2>&1; then
     break
   fi
   sleep 0.5
 done
 docker exec "$server_name" /opt/mine-teleop/bin/mine-teleop \
-  http-health --url http://127.0.0.1:8765/health >/dev/null
+  http-health --url "http://127.0.0.1:${signaling_port}/health" >/dev/null
 docker exec "$server_name" /opt/mine-teleop/bin/mine-teleop \
-  vehicle-online --signaling-http-url http://127.0.0.1:8765 \
+  vehicle-online --signaling-http-url "http://127.0.0.1:${signaling_port}" \
   --vehicle-id "$vehicle_id" --device-token "$device_token" >/dev/null
 
 docker run -d \
   --name "$console_name" \
-  --network "container:$server_name" \
+  --network host \
   --security-opt "no-new-privileges:true" \
   --cap-drop ALL \
   -e MINE_TELEOP_DRIVER_PASSWORD="$password" \
   "$image" driver-console \
     --config /opt/mine-teleop/share/mine-teleop/configs/driver-console.dev.yaml \
-    --host 0.0.0.0 --port 8080 \
-    --signaling-http-url http://127.0.0.1:8765 \
+    --host 127.0.0.1 --port "$console_port" \
+    --signaling-http-url "http://127.0.0.1:${signaling_port}" \
     --vehicle-id "$vehicle_id" >/dev/null
 
 for _ in $(seq 1 30); do
   if docker exec "$server_name" /opt/mine-teleop/bin/mine-teleop \
-    http-health --url http://127.0.0.1:8080/health >/dev/null 2>&1; then
+    http-health --url "http://127.0.0.1:${console_port}/health" >/dev/null 2>&1; then
     break
   fi
   sleep 0.5
 done
 docker exec "$server_name" /opt/mine-teleop/bin/mine-teleop \
-  http-health --url http://127.0.0.1:8080/health >/dev/null
+  http-health --url "http://127.0.0.1:${console_port}/health" >/dev/null
 
 printf 'DRIVER_CONSOLE_URL=http://127.0.0.1:%s\n' "$console_port"
 printf 'SIGNALING_HTTP_URL=http://127.0.0.1:%s\n' "$signaling_port"

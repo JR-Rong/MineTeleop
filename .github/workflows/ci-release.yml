@@ -110,6 +110,8 @@ jobs:
         with:
           path: ${{ runner.temp }}\vcpkg-binary-cache
           key: vcpkg-windows-${{ matrix.arch }}-${{ hashFiles('packaging/windows/dependencies.lock.json') }}-control-v2
+          restore-keys: |
+            vcpkg-windows-${{ matrix.arch }}-
 
       - name: Build Windows bundle and verify embedded dependencies
         shell: pwsh

@@ -1,4 +1,5 @@
 #include "mine_teleop/vcu.hpp"
+#include "mine_teleop/detail/traction_diagnostics.hpp"
 
 #include <algorithm>
 #include <array>
@@ -861,6 +862,110 @@ void test_feedback_decoding_uses_si_units_and_complete_snapshot() {
   expect(!controller.ingest(short_frame), "short CAN feedback frame was accepted");
 }
 
+void test_diagnostic_status_fields_use_dbc_wire_vectors() {
+  ParallelController controller;
+  auto motor = motor_torque_feedback(2, -320.0, -25.0);
+  motor.data[4] = 0x80;  // 32,640 * 0.05 - 1600 = 32 A.
+  motor.data[5] = 0x7F;
+  auto mode = motor_mode_feedback(2, 1);
+  mode.data[0] |= 4;  // Enable PWM ON.
+  mode.data[1] = 2;
+  auto brake = brake_feedback(1, 1, 144.0);
+  brake.data[2] = 0x16;  // fault level 2, code 5.
+  brake.data[6] = 0x1D;  // fault level 1, code 7.
+  expect(controller.ingest(motor) && controller.ingest(mode) && controller.ingest(brake),
+         "diagnostic wire vectors were rejected");
+  const auto& feedback = controller.feedback();
+  expect(std::abs(feedback.motor_current_a[2] - 32.0) < 1e-9 &&
+             feedback.motor_inverter_status[2] == 4 && feedback.motor_fault_level[2] == 2,
+         "motor current/inverter/fault diagnostic decoding is incorrect");
+  expect(feedback.brake_fault_level[2] == 2 && feedback.brake_fault_code[2] == 5 &&
+             feedback.brake_fault_level[3] == 1 && feedback.brake_fault_code[3] == 7 &&
+             std::abs(feedback.brake_pressure_bar[2] - 144.0) < 1e-9,
+         "paired EHB pressure/fault diagnostic decoding is incorrect");
+}
+
+void test_traction_diagnostics_observe_final_wire_and_continuous_fresh_feedback() {
+  using namespace mine_teleop::diagnostics;
+  ParallelController controller;
+  advance_to_ready(controller, 3);
+  Command command;
+  command.gear = 3;
+  command.motor_torque_nm.fill(320.0);
+  command.brake_pressure_bar.fill(0.0);
+  expect(controller.set_command(command), "diagnostic setup command was rejected");
+  const auto sent = decode_sent_actuation(controller.tick());
+  expect(sent.motor_mask == 255 && sent.brake_frames_present && sent.parking_frame_present &&
+             std::abs(sent.torque_nm[0] - 320.0) < 1e-9 && sent.motor_mode[0] == 1 &&
+             sent.parking_request[0] == 1 && sent.brake_pressure_bar[0] == 0.0,
+         "diagnostics did not decode the final generated CAN batch: mask=" +
+             std::to_string(sent.motor_mask) + " torque=" + std::to_string(sent.torque_nm[0]) +
+             " mode=" + std::to_string(sent.motor_mode[0]) +
+             " parking=" + std::to_string(sent.parking_request[0]) +
+             " brakes_present=" + std::to_string(sent.brake_frames_present));
+  mine_teleop::vcu::Feedback feedback;
+  feedback.motor_torque_valid.fill(true);
+  TorqueResponseMonitor monitor;
+  monitor.observe(0, sent, true, true, feedback, 255);
+  monitor.observe(500, sent, true, true, feedback, 255);
+  expect(
+             monitor.observe(999, sent, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "a transient response delay was treated as a sustained zero feedback observation");
+  auto observation = monitor.observe(1000, sent, true, true, feedback, 255);
+  expect(observation.qualifying_motor_mask == 255 && observation.longest_duration_ms == 1000,
+         "session59/62 nonzero TX and zero motor feedback was not observed after 1 second");
+  feedback.motor_torque_nm[0] = 3.0;
+  expect(monitor.observe(1020, sent, true, true, feedback, 255).qualifying_motor_mask == 254,
+         "responding motors were not removed independently");
+  expect(monitor.observe(1040, sent, false, true, feedback, 255).qualifying_motor_mask == 0 &&
+             monitor.observe(1060, sent, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "a failed send did not reset the continuous observation");
+  expect(monitor.observe(2060, sent, true, true, feedback, 0).qualifying_motor_mask == 0 &&
+             monitor.observe(3060, sent, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "stale feedback was counted toward a no-response duration");
+  feedback.motor_torque_valid.fill(false);
+  expect(monitor.observe(4060, sent, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "missing torque quality was treated as zero feedback");
+  feedback.motor_torque_valid.fill(true);
+  auto reverse = sent;
+  reverse.torque_nm.fill(-320.0);
+  monitor.observe(5000, sent, true, true, feedback, 255);
+  monitor.observe(5500, sent, true, true, feedback, 255);
+  expect(monitor.observe(6000, reverse, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "a direction change retained the former observation");
+  monitor.observe(6500, reverse, true, true, feedback, 255);
+  expect(monitor.observe(7000, reverse, true, true, feedback, 255).qualifying_motor_mask == 254,
+         "a direction change did not start a new observation");
+  expect(monitor.observe(7020, reverse, true, false, feedback, 255).qualifying_motor_mask == 0,
+         "leaving Ready did not end the observation");
+  monitor.observe(7040, sent, true, true, feedback, 255);
+  expect(monitor.observe(8060, sent, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "a scheduler gap was counted as continuously observed motor feedback");
+
+  controller.set_automatic_parking(true, true, true, 100.0);
+  const auto parked = decode_sent_actuation(controller.tick());
+  expect(std::abs(parked.torque_nm[0]) < 1e-9 &&
+             std::abs(parked.brake_pressure_bar[0] - 100.0) < 1e-9,
+         "diagnostics used desired torque instead of the parking-gated CAN output");
+  expect(monitor.observe(8000, parked, true, true, feedback, 255).qualifying_motor_mask == 0 &&
+             monitor.observe(10000, parked, true, true, feedback, 255).qualifying_motor_mask == 0,
+         "parking-gated zero CAN output was misreported as a motor response failure");
+}
+
+void test_traction_diagnostics_are_rate_limited() {
+  mine_teleop::diagnostics::StateLogLimiter limiter;
+  int count = 0;
+  for (int now = 0; now <= 10000; now += 20) {
+    if (limiter.due(static_cast<std::uint64_t>(now % 40), now)) ++count;
+  }
+  expect(count <= 11, "oscillating gates generated logs at CAN frequency");
+  mine_teleop::diagnostics::StateLogLimiter steady;
+  expect(steady.due(1, 0) && !steady.due(1, 4999) && steady.due(1, 5000),
+         "steady diagnostics did not use the five-second repeat interval");
+  expect(!steady.due(2, 5020) && steady.due(2, 6000),
+         "a change during the throttle interval was lost instead of reported later");
+}
+
 void test_fresh_manual_status_revokes_each_post_handshake_arming_phase() {
   for (const auto arming_state : {
            State::WaitParkingBrakeReleased,
@@ -1197,14 +1302,151 @@ void test_disarm_waits_for_torque_stop_neutral_park_and_manual() {
   expect(signal(shake, 16, 8) == 0, "CloudShakeReq was asserted during disarm");
 
   prepare_parking_gate(controller);
-  static_cast<void>(controller.tick());
+  frames = controller.tick();
   expect(controller.disarmed(), "manual handshake status 3 did not complete disarm");
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    const auto& parked = find_frame(frames, mine_teleop::vcu::ids::kAduEpb);
+    for (int axis = 0; axis < 4; ++axis) {
+      expect(signal(parked, axis * 8, 2) == 2,
+          "completed disarm withdrew an EPB parking request");
+    }
+    const auto& neutral = find_frame(frames, mine_teleop::vcu::ids::kAduShake);
+    expect(signal(neutral, 0, 8) == 0 && signal(neutral, 8, 8) == 1,
+        "completed disarm did not retain manual authority and N");
+    frames = controller.tick();
+  }
   expect(
       controller.request_parallel_handshake(),
       "a fully disarmed N/park/manual controller could not start a new explicit handshake");
   expect(
       controller.state() == State::Initial,
       "reconnect did not restart the five-frame low-handshake phase");
+}
+
+void advance_to_disarm_manual(ParallelController& controller) {
+  advance_to_ready(controller);
+  controller.request_disarm();
+  for (std::size_t motor = 0; motor < kMotorStatus01Ids.size(); ++motor) {
+    controller.ingest(motor_torque_feedback(motor, 0.0));
+  }
+  static_cast<void>(controller.tick());
+  controller.ingest(speed_feedback(0.0));
+  static_cast<void>(controller.tick());
+  controller.ingest(gear_feedback(1));
+  static_cast<void>(controller.tick());
+  // Deliberately provide the eventual complete safe snapshot before entering
+  // DisarmManual. None of it may count as that phase's fresh confirmation.
+  prepare_parking_gate(controller);
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmManual, "manual-exit setup failed");
+}
+
+void test_disarm_rejects_stale_partial_and_unsafe_phase_feedback() {
+  ParallelController controller;
+  advance_to_ready(controller);
+  controller.request_disarm();
+  for (int tick = 0; tick < 4; ++tick) {
+    static_cast<void>(controller.tick());
+    expect(controller.state() == State::DisarmTorque,
+        "pre-exit zero-torque feedback completed the new torque stage");
+  }
+  for (std::size_t motor = 0; motor + 1 < kMotorStatus01Ids.size(); ++motor) {
+    controller.ingest(motor_torque_feedback(motor, 0.0));
+  }
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmTorque,
+      "seven fresh motors plus one stale motor completed torque confirmation");
+  controller.ingest(motor_torque_feedback(7, 20.0));
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmTorque, "nonzero torque completed exit");
+  controller.ingest(motor_torque_feedback(7, 0.0));
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmStop, "fresh all-zero torque did not advance");
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmStop, "old zero speed completed stop stage");
+  controller.ingest(speed_feedback(3.0));
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmStop, "moving speed completed stop stage");
+  controller.ingest(speed_feedback(0.0));
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmNeutral, "fresh zero speed did not advance");
+  controller.ingest(gear_feedback(3));
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmNeutral, "drive gear completed N stage");
+  controller.ingest(gear_feedback(1));
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmParkingBrake, "fresh N did not advance");
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmParkingBrake, "old EPB feedback completed park stage");
+  auto partial_park = parking_brake_feedback(2);
+  partial_park.data[6] = 1;
+  controller.ingest(partial_park);
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmParkingBrake,
+      "one released parking brake completed the all-four parking gate");
+  controller.ingest(parking_brake_feedback(2));
+  static_cast<void>(controller.tick());
+  expect(controller.state() == State::DisarmManual, "fresh EPB=2 did not advance");
+}
+
+void test_disarm_manual_requires_each_new_safe_feedback() {
+  for (int missing = 0; missing < 4; ++missing) {
+    ParallelController controller;
+    advance_to_disarm_manual(controller);
+    if (missing != 0) controller.ingest(handshake_feedback(3));
+    if (missing != 1) controller.ingest(gear_feedback(1));
+    if (missing != 2) controller.ingest(speed_feedback(0.0));
+    if (missing != 3) controller.ingest(parking_brake_feedback(2));
+    controller.request_disarm();
+    for (int tick = 0; tick < 4; ++tick) {
+      static_cast<void>(controller.tick());
+      expect(controller.state() == State::DisarmManual && !controller.disarmed(),
+          "missing fresh manual-exit feedback was satisfied by an older snapshot");
+    }
+    CanFrame unsafe;
+    CanFrame safe;
+    switch (missing) {
+      case 0: unsafe = handshake_feedback(5); safe = handshake_feedback(3); break;
+      case 1: unsafe = gear_feedback(3); safe = gear_feedback(1); break;
+      case 2: unsafe = speed_feedback(3.0); safe = speed_feedback(0.0); break;
+      default: unsafe = parking_brake_feedback(1); safe = parking_brake_feedback(2); break;
+    }
+    controller.ingest(unsafe);
+    static_cast<void>(controller.tick());
+    expect(!controller.disarmed(), "fresh unsafe feedback completed manual exit");
+    controller.ingest(safe);
+    const auto frames = controller.tick();
+    expect(controller.state() == State::Disarmed, "all new safe feedback did not complete exit");
+    for (std::size_t motor = 0; motor < kMotorStatus01Ids.size(); ++motor) {
+      expect(signal(find_frame(frames, 0x18F0D0F5U + (motor << 16U)), 8, 16) == 32000,
+          "completed exit retained traction in its last CAN batch");
+    }
+  }
+}
+
+void test_initial_exit_requires_new_manual_parking_feedback() {
+  for (int stop = 0; stop < 3; ++stop) {
+    ParallelController controller;
+    prepare_parking_gate(controller);
+    expect(controller.request_parallel_handshake(), "initial-exit arming failed");
+    if (stop == 0) controller.request_disarm();
+    else if (stop == 1) controller.emergency_stop();
+    else controller.ingest(gear_feedback(1, 1));
+    const auto frames = controller.tick();
+    expect(controller.state() == State::DisarmManual && !controller.disarmed(),
+        "initial-stage exit reused its pre-exit parking snapshot");
+    expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduShake), 0, 8) == 0,
+        "initial-stage emergency failed to immediately withdraw authority");
+    for (int axis = 0; axis < 4; ++axis) {
+      expect(signal(find_frame(frames, mine_teleop::vcu::ids::kAduEpb), axis * 8, 2) == 2,
+          "initial-stage emergency did not immediately retain parking");
+    }
+    static_cast<void>(controller.tick());
+    expect(!controller.disarmed(), "initial-stage exit completed without a new sample");
+    prepare_parking_gate(controller);
+    static_cast<void>(controller.tick());
+    expect(controller.state() == State::Disarmed, "new safe initial-exit snapshot did not complete");
+  }
 }
 
 void test_arming_estop_reverses_handshake_without_forward_progress() {
@@ -1329,6 +1571,10 @@ void test_arming_physical_emergency_is_latched_and_recoverable_only_after_disarm
 
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
+      {"diagnostic_status_fields_use_dbc_wire_vectors", test_diagnostic_status_fields_use_dbc_wire_vectors},
+      {"traction_diagnostics_observe_final_wire_and_continuous_fresh_feedback",
+       test_traction_diagnostics_observe_final_wire_and_continuous_fresh_feedback},
+      {"traction_diagnostics_are_rate_limited", test_traction_diagnostics_are_rate_limited},
       {"20260916_motor_torque_wire_vectors", test_20260916_motor_torque_wire_vectors},
       {"operator_idle_parking_deadlines", test_operator_idle_parking_deadlines},
       {"automatic_parking_handshake_and_feedback",
@@ -1367,6 +1613,12 @@ int main() {
        test_handshake_loss_forces_zero_torque_and_calibrated_brake},
       {"disarm_waits_for_torque_stop_neutral_park_and_manual",
        test_disarm_waits_for_torque_stop_neutral_park_and_manual},
+      {"disarm_rejects_stale_partial_and_unsafe_phase_feedback",
+       test_disarm_rejects_stale_partial_and_unsafe_phase_feedback},
+      {"disarm_manual_requires_each_new_safe_feedback",
+       test_disarm_manual_requires_each_new_safe_feedback},
+      {"initial_exit_requires_new_manual_parking_feedback",
+       test_initial_exit_requires_new_manual_parking_feedback},
       {"arming_estop_reverses_handshake_without_forward_progress",
        test_arming_estop_reverses_handshake_without_forward_progress},
       {"arming_physical_emergency_is_latched_and_recoverable_only_after_disarm",
