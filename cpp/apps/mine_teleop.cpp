@@ -1,6 +1,7 @@
 #include "mine_teleop/core.hpp"
 #include "mine_teleop/http.hpp"
 #include "mine_teleop/media.hpp"
+#include "mine_teleop/platform.hpp"
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/session_logs.hpp"
 #include "mine_teleop/upload.hpp"
@@ -502,6 +503,9 @@ int run_signaling_server(const Arguments& arguments) {
 }
 
 int run_driver_console(const Arguments& arguments) {
+  const auto host = arguments.value("--host", "127.0.0.1");
+  if (!mine_teleop::is_loopback_bind_address(host))
+    throw std::invalid_argument("driver console must bind to a loopback address");
   auto config = mine_teleop::load_driver_config(arguments.value("--config", "configs/driver-console.dev.yaml"));
   const auto signaling_override = arguments.value("--signaling-http-url");
   if (!signaling_override.empty()) config.signaling_url = signaling_override;
@@ -518,7 +522,7 @@ int run_driver_console(const Arguments& arguments) {
       std::move(config), arguments.value("--vehicle-id", "vehicle-001"), password);
   auto app = std::make_shared<mine_teleop::DriverConsoleHttpApp>(runtime);
   mine_teleop::SimpleHttpServer server(
-      arguments.value("--host", "127.0.0.1"),
+      host,
       port_option(arguments, "--port", 8080),
       [app](const auto& request) { return app->handle(request); });
   std::cout << Json({

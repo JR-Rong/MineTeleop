@@ -1290,6 +1290,53 @@ void test_driver_time_sync_uncertainty_fails_closed_at_production_default() {
       "unacceptable time synchronization left local driver authentication active");
 }
 
+void test_local_control_http_origin_boundary() {
+  mine_teleop::DriverConfig config;
+  config.signaling_url = "http://127.0.0.1:1";
+  auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(config, "vehicle-001", "fixture");
+  mine_teleop::DriverConsoleHttpApp app(runtime);
+  mine_teleop::HttpRequest request;
+  request.method = "GET"; request.path = "/api/status";
+  expect(app.handle(request).status == 403, "missing Host admitted");
+  request.headers = {{"host", "127.0.0.1:8080"}};
+  expect(app.handle(request).status == 200, "local CLI status rejected");
+  request.headers["origin"] = "http://127.0.0.1:8080";
+  request.headers["sec-fetch-site"] = "same-origin";
+  expect(app.handle(request).status == 200, "same-origin status rejected");
+  for (const auto host : {"evil.example:8080", "127.0.0.1.evil.example", "127.0.0.1:8080@evil.example", "127.0.0.1:99999", "[::1]evil"}) {
+    auto bad = request; bad.headers["host"] = host;
+    expect(app.handle(bad).status == 403, "foreign or malformed Host admitted");
+  }
+  for (const auto origin : {"http://evil.example", "http://127.0.0.1:8081", "null"}) {
+    auto bad = request; bad.headers["origin"] = origin;
+    expect(app.handle(bad).status == 403, "cross-origin request admitted");
+  }
+  auto foreign = request; foreign.headers["sec-fetch-site"] = "cross-site";
+  expect(app.handle(foreign).status == 403, "cross-site request admitted");
+  auto ipv6 = request; ipv6.headers = {{"host", "[::1]:8080"}, {"origin", "http://[::1]:8080"}};
+  expect(app.handle(ipv6).status == 200, "IPv6 loopback rejected");
+  request.method = "POST"; request.path = "/api/browser-event"; request.body = R"({"event":"fixture"})";
+  for (const auto type : {"", "text/plain", "application/x-www-form-urlencoded", "application/jsonp"}) {
+    request.headers["content-type"] = type;
+    expect(app.handle(request).status == 403, "simple cross-site body admitted");
+  }
+  request.headers["content-type"] = "application/json; charset=utf-8";
+  expect(app.handle(request).status == 200, "same-origin JSON rejected");
+  mine_teleop::SimpleHttpServer server("127.0.0.1", 0,
+      [&](const auto& received) { return app.handle(received); });
+  server.start();
+  mine_teleop::HttpClient http;
+  const auto base = "http://127.0.0.1:" + std::to_string(server.port());
+  expect(http.get(base + "/api/status").status == 200, "real loopback GET rejected");
+  expect(http.get(base + "/api/status", {{"Host", "rebind.example"}}).status == 403,
+      "HTTP parser bypassed Host policy");
+  expect(http.get(base + "/api/status", {{"Origin", "http://foreign.example"}}).status == 403,
+      "HTTP parser bypassed Origin policy");
+  expect(http.post_json(base + "/api/browser-event", {{"event", "fixture"}}).status == 200,
+      "existing local JSON client rejected");
+  server.stop();
+}
+
 void test_control_page_contract() {
   mine_teleop::DriverConfig config;
   config.driver_id = "driver-console-001";
@@ -1298,6 +1345,7 @@ void test_control_page_contract() {
   auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(config, "vehicle-001", "dev-password");
   mine_teleop::DriverConsoleHttpApp app(runtime);
   mine_teleop::HttpRequest request;
+  request.headers = {{"host", "127.0.0.1:8080"}, {"content-type", "application/json"}};
   request.method = "GET";
   request.path = "/";
   const auto response = app.handle(request);
@@ -3375,6 +3423,17 @@ void test_time_sync_default_and_explicit_override() {
         "explicit stricter time-sync policy was overwritten by defaults");
     clock.uncertainty_ms = 26;
     expect(!clock.acceptable(25), "explicit 25ms policy no longer rejects 26ms");
+    for (const auto invalid : {-1, 101, 1000}) {
+      write_text_file(driver_path, driver_base + "time_sync:\n  max_uncertainty_ms: " + std::to_string(invalid) + "\n");
+      auto invalid_vehicle = read_text_file("configs/vehicle-agent.dev.yaml");
+      invalid_vehicle.insert(position + std::string("field_safety:\n").size(),
+          "  max_time_sync_uncertainty_ms: " + std::to_string(invalid) + "\n");
+      write_text_file(vehicle_path, invalid_vehicle);
+      expect_throws([&] { static_cast<void>(mine_teleop::load_driver_config(driver_path.string())); },
+          "driver YAML could weaken the 100ms ceiling");
+      expect_throws([&] { static_cast<void>(mine_teleop::load_vehicle_config(vehicle_path.string())); },
+          "vehicle YAML could weaken the 100ms ceiling");
+    }
   } catch (...) {
     std::filesystem::remove_all(root);
     throw;
@@ -3720,6 +3779,8 @@ void test_browser_event_logging_rotation_and_redaction() {
   mine_teleop::DriverConsoleHttpApp app(runtime);
 
   mine_teleop::HttpRequest request;
+
+  request.headers = {{"host", "127.0.0.1:8080"}, {"content-type", "application/json"}};
   request.method = "POST";
   request.path = "/api/browser-event";
   for (int index = 0; index < 3; ++index) {
@@ -3859,6 +3920,7 @@ void test_driver_vehicle_switch_releases_old_session() {
   mine_teleop::DriverConsoleHttpApp control_app(driver_runtime);
   const auto post_control_intent = [&](const mine_teleop::Json& body) {
     mine_teleop::HttpRequest request;
+    request.headers = {{"host", "127.0.0.1:8080"}, {"content-type", "application/json"}};
     request.method = "POST";
     request.path = "/api/control-intent";
     request.body = body.dump();
@@ -3926,6 +3988,8 @@ void test_driver_vehicle_switch_releases_old_session() {
       "control intent with the current session generation was not accepted atomically");
 
   mine_teleop::HttpRequest profile_request;
+
+  profile_request.headers = {{"host", "127.0.0.1:8080"}, {"content-type", "application/json"}};
   profile_request.method = "POST";
   profile_request.path = "/api/control-profile";
   const mine_teleop::Json valid_profile = {
@@ -4013,6 +4077,7 @@ void test_driver_vehicle_switch_releases_old_session() {
 
   const auto restored_prepared_profile = driver.prepare_control_profile(valid_profile);
   mine_teleop::HttpRequest get_profile_request;
+  get_profile_request.headers = {{"host", "127.0.0.1:8080"}, {"content-type", "application/json"}};
   get_profile_request.method = "GET";
   get_profile_request.path = "/api/control-profile";
   const auto get_profile_response = control_app.handle(get_profile_request);
@@ -4109,6 +4174,7 @@ void test_driver_vehicle_switch_releases_old_session() {
        {"throttle", 0.0},
        {"brake", 0.0}}));
   mine_teleop::HttpRequest delayed_intent_request;
+  delayed_intent_request.headers = {{"host", "127.0.0.1:8080"}, {"content-type", "application/json"}};
   delayed_intent_request.received_at_monotonic_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count() - 10000;
@@ -4145,6 +4211,7 @@ void test_driver_vehicle_switch_releases_old_session() {
 
   for (const auto* path : {"/api/control/keyboard", "/api/control/gamepad"}) {
     mine_teleop::HttpRequest request;
+    request.headers = {{"host", "127.0.0.1:8080"}, {"content-type", "application/json"}};
     request.method = "POST";
     request.path = path;
     request.body = mine_teleop::Json({
@@ -4189,6 +4256,8 @@ void test_driver_vehicle_switch_releases_old_session() {
       "driver runtime treated the hard-brake key preset as the native analog-pedal ceiling");
 
   mine_teleop::HttpRequest get_legacy_limits_request;
+
+  get_legacy_limits_request.headers = {{"host", "127.0.0.1:8080"}, {"content-type", "application/json"}};
   get_legacy_limits_request.method = "GET";
   get_legacy_limits_request.path = "/api/control-limits";
   const auto get_legacy_limits_response = control_app.handle(get_legacy_limits_request);
@@ -4201,6 +4270,8 @@ void test_driver_vehicle_switch_releases_old_session() {
       "legacy control-limit read did not reflect the prepared physical-pressure profile");
 
   mine_teleop::HttpRequest mutate_legacy_limits_request;
+
+  mutate_legacy_limits_request.headers = {{"host", "127.0.0.1:8080"}, {"content-type", "application/json"}};
   mutate_legacy_limits_request.method = "POST";
   mutate_legacy_limits_request.path = "/api/control-limits";
   mutate_legacy_limits_request.body = mine_teleop::Json({
@@ -4620,6 +4691,7 @@ void test_web_login_selects_identity_and_requires_logout_to_switch() {
   mine_teleop::DriverConsoleHttpApp app(runtime);
   auto login = [&](const mine_teleop::Json& body) {
     mine_teleop::HttpRequest request;
+    request.headers = {{"host", "127.0.0.1:8080"}, {"content-type", "application/json"}};
     request.method = "POST";
     request.path = "/api/login";
     request.body = body.dump();
@@ -4679,6 +4751,7 @@ void test_local_proxy_preserves_upstream_auth_status() {
 
   mine_teleop::DriverConsoleHttpApp app(runtime);
   mine_teleop::HttpRequest request;
+  request.headers = {{"host", "127.0.0.1:8080"}, {"content-type", "application/json"}};
   request.method = "GET";
   request.path = "/api/vehicles";
   const auto response = app.handle(request);
@@ -8391,6 +8464,7 @@ int main(int argc, char** argv) {
       {"local_http_page_takeover_abort_reordering_and_production_lease", test_local_http_page_takeover_abort_reordering_and_production_lease},
       {"local_http_release_scope_prevents_retired_page_and_takeover_races", test_local_http_release_scope_prevents_retired_page_and_takeover_races},
       {"local_http_pending_approval_release_requires_operation_owner_and_generation", test_local_http_pending_approval_release_requires_operation_owner_and_generation},
+      {"local_control_http_origin_boundary", test_local_control_http_origin_boundary},
       {"control_page_contract", test_control_page_contract},
       {"driver_gamepad_config", test_driver_gamepad_config},
       {"time_sync_default_and_explicit_override", test_time_sync_default_and_explicit_override},

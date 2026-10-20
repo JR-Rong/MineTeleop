@@ -433,6 +433,29 @@ test('shipped page wires both result notifications to the scheduler and retains 
   for(const timer of timers)await timer.callback();
   assert.equal(requests.length,4,'native publication fallback was removed');
 });
+test('both couriers abort a stalled HTTP request and can fetch again without replaying its reply',async()=>{
+  for(const create of [api.createCourier,api.createEmergencyCourier]) {
+    let calls=0,resolveLate,signal,sends=0;
+    const scope=()=>({session:'s',generation:1,ui:'u',uiEpoch:1,attempt:'a',ready:true});
+    const courier=create({scope,now:()=>0,requestTimeoutMs:10,onBoundary:()=>{},send:()=>{sends++},
+      post:(_,__,nextSignal)=>{signal=nextSignal;calls++;return calls===1?new Promise(resolve=>resolveLate=resolve):Promise.resolve({enabled:false})}});
+    const first=courier.tick();await courier.tick();assert.equal(calls,1);
+    await assert.rejects(first,/timed out/);assert.equal(signal.aborted,true);
+    await courier.tick();assert.equal(calls,2);
+    resolveLate({enabled:true,frame:{seq:99}});await Promise.resolve();
+    assert.equal(sends,0,'obsolete HTTP reply sent a command');
+  }
+});
+test('both couriers cancel a pending request when the session scope changes',async()=>{
+  for(const create of [api.createCourier,api.createEmergencyCourier]) {
+    let current={session:'s',generation:1,ui:'u',uiEpoch:1,attempt:'a',ready:true},calls=0,signal;
+    const courier=create({scope:()=>current,now:()=>0,onBoundary:()=>{},send:()=>assert.fail('obsolete frame'),
+      post:(_,__,nextSignal)=>{signal=nextSignal;calls++;return calls===1?new Promise(()=>{}):Promise.resolve({enabled:false})}});
+    const pending=assert.rejects(courier.tick(),/cancelled/);
+    current={...current,attempt:'new'};await courier.tick();await pending;
+    assert.equal(signal.aborted,true);await courier.tick();assert.equal(calls,2);
+  }
+});
 (async()=>{
   const selected=process.argv.includes('--r5-only')?cases.filter(value=>value.name.startsWith('R5 ')):cases;
   for(const {name,action} of selected){await action();console.log('PASS '+name)}

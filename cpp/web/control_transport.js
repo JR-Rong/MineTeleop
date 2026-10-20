@@ -58,7 +58,31 @@
     return Object.freeze({request, tick:run});
   }
   function notifyPending(callback) { try { callback(); } catch (_) { /* Periodic fetch remains the fallback. */ } }
-  function createEmergencyCourier({scope, post, now, send, onConfirmation = () => {}, onPending = () => {}}) {
+  // A stuck local fetch must not own the courier forever. Abort the actual
+  // fetch as well as settling our wait; late replies never enter either lane.
+  function scopedRequest(post, timeoutMs) {
+    let active = null;
+    return {
+      cancelUnless(key) { if (active && active.key !== key) active.controller.abort(); },
+      async run(path, body, key) {
+        const controller = new AbortController();
+        const entry = {key, controller}; active = entry;
+        let abort;
+        const cancelled = new Promise((_, reject) => {
+          abort = () => reject(Error('control bridge request cancelled or timed out'));
+          controller.signal.addEventListener('abort', abort, {once:true});
+        });
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try { return await Promise.race([post(path, body, controller.signal), cancelled]); }
+        finally {
+          clearTimeout(timer); controller.signal.removeEventListener('abort', abort);
+          if (active === entry) active = null;
+        }
+      }
+    };
+  }
+  function createEmergencyCourier({scope, post, now, send, onConfirmation = () => {}, onPending = () => {}, requestTimeoutMs = 500}) {
+    const request = scopedRequest(post, requestTimeoutMs);
     let busy=false,key='',lastSeen=0,lastConfirmed=0,result=null;
     const scopeKey=value=>JSON.stringify([value.session,value.generation,value.ui,value.uiEpoch,value.attempt]);
     const notify=()=>{const captured=key;notifyPending(()=>onPending(()=>{const current=scope();return current&&scopeKey(current)===captured}))};
@@ -72,18 +96,19 @@
       return true;
     }
     async function tick() {
-      if(busy)return;
       const current=scope();
+      request.cancelUnless(current ? scopeKey(current) : '');
+      if(busy)return;
       if(!current||!current.session||!current.attempt||!current.ui||current.uiEpoch<=0)return;
       const captured=scopeKey(current);
       if(key!==captured){key=captured;lastSeen=lastConfirmed=0;result=null}
       const sentResult=result,started=now();busy=true;
       let acceptedResponse=false;
       try {
-        const response=await post('/api/control-transport/emergency',{
+        const response=await request.run('/api/control-transport/emergency',{
           source_session_id:current.session,source_control_session_generation:current.generation,
           media_negotiation_id:current.attempt,ui_instance_id:current.ui,ui_control_epoch:current.uiEpoch,
-          dc_ready:current.ready===true,last_seen_seq:lastSeen,...(sentResult?{vehicle_result:sentResult}:{})});
+          dc_ready:current.ready===true,last_seen_seq:lastSeen,...(sentResult?{vehicle_result:sentResult}:{})},captured);
         const latest=scope();
         if(!latest||scopeKey(latest)!==captured||response?.protocol!==emergencyProtocol)return;
         acceptedResponse=true;
@@ -111,7 +136,8 @@
     }
     return Object.freeze({tick,receive});
   }
-  function createCourier({scope, post, now, send, onBoundary, onStatus = () => {}, onTrace = () => {}, onPending = () => {}}) {
+  function createCourier({scope, post, now, send, onBoundary, onStatus = () => {}, onTrace = () => {}, onPending = () => {}, requestTimeoutMs = 500}) {
+    const request = scopedRequest(post, requestTimeoutMs);
     let busy = false, key = '', lastSeen = 0, revision = 0, negotiated = false, path = 'wss', epoch = 0, feedback = {};
     // Commands remain latest-only. Execution results are independent receipts:
     // replacing one loses evidence and can conceal a rejection between accepts.
@@ -171,8 +197,9 @@
       return true;
     }
     async function tick() {
-      if (busy) return;
       const current = scope();
+      request.cancelUnless(current ? scopeKey(current) : '');
+      if (busy) return;
       if (!current || !current.session || !current.attempt || !current.ui || current.uiEpoch <= 0) return;
       const capturedKey = scopeKey(current);
       if (key !== capturedKey) { key = capturedKey; lastSeen = revision = 0; results.length = 0; negotiated = false; epoch = 0; feedback = {}; statuses.clear(); }
@@ -180,13 +207,13 @@
         sentStatuses = [...statuses.values()], started = now(); busy = true;
       let completed = false, acceptedResponse = false;
       try {
-        const response = await post('/api/control-transport/bridge', {
+        const response = await request.run('/api/control-transport/bridge', {
           source_session_id: current.session, source_control_session_generation: current.generation,
           media_negotiation_id: current.attempt, ui_instance_id: current.ui, ui_control_epoch: current.uiEpoch,
           dc_ready: current.ready === true, dc_network_path: current.networkPath || "unknown", last_seen_seq: lastSeen,
           ...(sentResult ? {vehicle_result: sentResult} : {}),
           ...(sentStatuses.length ? {vehicle_statuses: sentStatuses} : {}),
-        });
+        }, capturedKey);
         completed = true;
         const latest = scope();
         if (!latest || scopeKey(latest) !== capturedKey || response?.protocol !== protocol) return;

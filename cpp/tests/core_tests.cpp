@@ -789,6 +789,8 @@ void test_vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries
       "    reopen_attempts: 0\n"
       "    reopen_backoff_ms: 60000\n");
   const auto explicit_path = write_temp_vehicle_config("explicit-camera-recovery", explicit_contents);
+  // Noncritical-only media is valid when control is disabled.
+  { std::ofstream out(explicit_path, std::ios::app); out << "\nruntime:\n  control_enabled: false\n"; }
   const auto explicit_config = mine_teleop::load_vehicle_config(explicit_path);
   const auto explicit_camera = explicit_config.enabled_cameras().front();
   expect(!explicit_camera.critical_for_control, "explicit noncritical camera setting was ignored");
@@ -836,7 +838,7 @@ void test_vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries
   }
 }
 
-void test_control_enabled_vehicle_allows_all_cameras_noncritical() {
+void test_control_enabled_vehicle_requires_critical_camera() {
   const auto base = read_text("configs/vehicle-agent.dev.yaml");
   auto no_critical_contents = base;
   replace_once(
@@ -844,10 +846,8 @@ void test_control_enabled_vehicle_allows_all_cameras_noncritical() {
       "  - id: front\n",
       "  - id: front\n    critical_for_control: false\n");
   const auto no_critical_path = write_temp_vehicle_config("no-critical-camera", no_critical_contents);
-  const auto optional_config = mine_teleop::load_vehicle_config(no_critical_path);
-  expect(optional_config.runtime.control_enabled && optional_config.enabled_cameras().size() == 1 &&
-      optional_config.redacted_summary().at("critical_camera_count") == 0,
-      "control-enabled vehicle rejected all noncritical cameras or counted the disabled critical camera");
+  expect_throws([&] { static_cast<void>(mine_teleop::load_vehicle_config(no_critical_path)); },
+      "ordinary control admitted no critical cameras");
   std::error_code error;
   std::filesystem::remove(no_critical_path, error);
 
@@ -4948,6 +4948,7 @@ void test_driver_console_page_keeps_waiting_state_during_background_intent_refre
   auto runtime = std::make_shared<mine_teleop::DriverConsoleRuntime>(config, "vehicle-001", "dev-password");
   mine_teleop::DriverConsoleHttpApp app(runtime);
   mine_teleop::HttpRequest request;
+  request.headers = {{"host", "127.0.0.1:8080"}, {"content-type", "application/json"}};
   request.method = "GET";
   request.path = "/";
   const auto response = app.handle(request);
@@ -5034,7 +5035,7 @@ int main() {
       {"vehicle_config_requires_monotonic_final_full_safety_brake", test_vehicle_config_requires_monotonic_final_full_safety_brake},
       {"vehicle_config_validates_local_speed_pid_safety_fields", test_vehicle_config_validates_local_speed_pid_safety_fields},
       {"vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries", test_vehicle_camera_recovery_config_defaults_explicit_values_and_boundaries},
-      {"control_enabled_vehicle_allows_all_cameras_noncritical", test_control_enabled_vehicle_allows_all_cameras_noncritical},
+      {"control_enabled_vehicle_requires_critical_camera", test_control_enabled_vehicle_requires_critical_camera},
       {"camera_failure_decision_is_bounded_and_fail_closed", test_camera_failure_decision_is_bounded_and_fail_closed},
       {"camera_source_classification_is_canonical", test_camera_source_classification_is_canonical},
       {"camera_input_spec_is_explicit_for_ccg2_and_legacy_safe", test_camera_input_spec_is_explicit_for_ccg2_and_legacy_safe},

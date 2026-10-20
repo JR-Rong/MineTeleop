@@ -1043,7 +1043,11 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
     if (header.empty()) continue;
     const auto separator = header.find(':');
     if (separator == std::string::npos) throw std::invalid_argument("invalid HTTP header");
-    request.headers[lower(trim(header.substr(0, separator)))] = trim(header.substr(separator + 1));
+    const auto name = lower(trim(header.substr(0, separator)));
+    if ((name == "host" || name == "origin" || name == "content-type" || name == "sec-fetch-site") &&
+        request.headers.contains(name))
+      throw std::invalid_argument("duplicate HTTP security header");
+    request.headers[name] = trim(header.substr(separator + 1));
   }
 
   std::size_t content_length = 0;
@@ -5169,7 +5173,8 @@ DriverConfig load_driver_config(const std::string& path) {
       config.intent_lease_ms < 100 || config.intent_lease_ms > 1000 || config.estop_hold_ms < 0 ||
       config.browser_event_log_max_bytes < 1024 || config.browser_event_log_files < 1 ||
       config.browser_event_log_files > 20 ||
-      config.max_time_sync_uncertainty_ms < 0 || config.time_sync_interval_ms <= 0 ||
+      config.max_time_sync_uncertainty_ms < 0 || config.max_time_sync_uncertainty_ms > 100 ||
+      config.time_sync_interval_ms <= 0 ||
       config.time_sync_samples < 3 || config.time_sync_samples > 15 || config.gamepad.steering_axis < 0 ||
       config.gamepad.throttle_axis < 0 || config.gamepad.brake_axis < 0 || config.gamepad.estop_button < 0 ||
       config.gamepad.axis_deadzone < 0.0 || config.gamepad.axis_deadzone >= 0.5 ||
@@ -5472,6 +5477,16 @@ void DriverConsoleRuntime::note_native_control_failure(
     if (session_id_ != session_id || control_session_generation_ != generation) return; }
   if (!control_signaling_ack_recovery_.waiting()) control_signaling_recovery_gear_ = frozen_gear;
   control_signaling_ack_recovery_.enter(monotonic_now_ms(), recovery_timeout_ms, control_signaling_last_ack_seq_);
+  // Ordinary DC still depends on cloud authority. Its receipts cannot clear
+  // the independent WSS ACK fault: select a new, neutral WSS epoch so that a
+  // real cloud ACK can recover it. Never resurrect the retired DC publication.
+  if (control_transport_sender_.path() == detail::ControlPath::DataChannel) {
+    control_transport_sender_.begin(detail::ControlPath::Wss, {}, monotonic_now_ms(), recovery_timeout_ms);
+    control_transport_latest_dc_ = Json();
+    control_dc_ack_window_.reset();
+    control_dc_ack_recovery_.reset();
+    control_dc_last_ack_seq_ = 0;
+  }
   if (control_signaling_websocket_) control_signaling_websocket_->close();
   control_signaling_websocket_.reset();
   control_signaling_websocket_session_id_.clear();
@@ -6332,8 +6347,12 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
       // selection is admitted before common profile/VCU readiness checks.
       if (vehicle_transport_capable && control_transport_cloud_capable_ && !control_transport_sender_.negotiated())
         control_transport_sender_.begin(detail::ControlPath::Wss, {}, monotonic_ms, recovery_timeout_ms);
+      if (!direct_continuation && control_signaling_ack_recovery_.waiting() &&
+          control_transport_sender_.path() == detail::ControlPath::DataChannel)
+        control_transport_sender_.begin(detail::ControlPath::Wss, {}, monotonic_ms, recovery_timeout_ms);
       static_cast<void>(control_transport_sender_.observe(dc_ready, current_media_attempt, monotonic_ms, recovery_timeout_ms));
-      if (dc_ready && control_transport_sender_.consider_dc(current_media_attempt, monotonic_ms, recovery_timeout_ms)) {
+      if (dc_ready && !control_signaling_ack_recovery_.waiting() &&
+          control_transport_sender_.consider_dc(current_media_attempt, monotonic_ms, recovery_timeout_ms)) {
         control_dc_ack_window_.reset(); control_dc_ack_recovery_.reset(); control_dc_last_ack_seq_ = 0;
       }
       if (control_transport_sender_.path() == detail::ControlPath::DataChannel) {
@@ -8629,8 +8648,46 @@ DriverConsoleHttpApp::DriverConsoleHttpApp(std::shared_ptr<DriverConsoleRuntime>
   if (!runtime_) throw std::invalid_argument("driver console runtime is required");
 }
 
+static bool local_control_request_allowed(const HttpRequest& request) {
+  const auto header = [&](const char* name) {
+    const auto found = request.headers.find(name);
+    return found == request.headers.end() ? std::string{} : lower(trim(found->second));
+  };
+  const auto host = header("host");
+  const auto colon = host.starts_with("[") ? host.find(']', 1) : host.find(':');
+  const auto address = host.starts_with("[")
+      ? (colon == std::string::npos ? std::string{} : host.substr(1, colon - 1))
+      : host.substr(0, colon);
+  if (!is_loopback_bind_address(address)) return false;
+  const auto suffix = colon == std::string::npos ? std::string{}
+      : host.substr(colon + (host.starts_with("[") ? 1 : 0));
+  if (!suffix.empty()) {
+    if (suffix.front() != ':' || suffix.size() < 2 || suffix.size() > 6) return false;
+    unsigned port = 0;
+    for (const auto digit : std::string_view(suffix).substr(1)) {
+      if (digit < '0' || digit > '9') return false;
+      port = port * 10 + static_cast<unsigned>(digit - '0');
+    }
+    if (port == 0 || port > 65535) return false;
+  }
+  // CLI clients may omit Origin. Browsers must be same-origin; DNS rebinding
+  // cannot supply a foreign Host, and simple cross-site forms cannot supply
+  // the required JSON media type. This is not authentication of local OS users.
+  const auto origin = header("origin");
+  if (!origin.empty() && origin != "http://" + host) return false;
+  const auto site = header("sec-fetch-site");
+  if (!site.empty() && site != "same-origin" && site != "none") return false;
+  if (request.method == "POST") {
+    const auto type = header("content-type");
+    if (trim(type.substr(0, type.find(';'))) != "application/json") return false;
+  }
+  return true;
+}
+
 ServerResponse DriverConsoleHttpApp::handle(const HttpRequest& request) const {
   try {
+    if (!local_control_request_allowed(request))
+      return ServerResponse::json(403, {{"error", "local control request origin or content type rejected"}});
     if (request.method == "GET" && request.path.starts_with("/assets/")) {
       return serve_console_asset(runtime_->config(), request.path);
     }

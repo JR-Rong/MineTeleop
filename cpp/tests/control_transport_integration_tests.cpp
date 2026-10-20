@@ -321,6 +321,39 @@ struct Fixture {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 };
+void product_wss_reconnect_retires_dc_and_recovers_ack() {
+  Fixture fixture(false, false, true);
+  fixture.dc_network_path = "p2p";
+  auto transport = [&] { return fixture.driver->status().at("native_control").at("control_transport"); };
+  auto deadline = steady() + 8000;
+  while (steady() < deadline) {
+    fixture.pump(true);
+    if (transport().at("path") == "dc" && !transport().at("qualifying").get<bool>() &&
+        !transport().at("selecting").get<bool>()) break;
+  }
+  expect(transport().at("path") == "dc" && !transport().at("qualifying").get<bool>(), "fixture never qualified DC");
+  const auto old_epoch = transport().at("epoch").get<std::uint64_t>();
+  const auto old_frame = fixture.last_received_payload;
+  const auto wss_before = fixture.wss_commands;
+  fixture.stop_cloud(); // Real TCP closure, not merely changing dc_ready.
+  fixture.restore_cloud();
+  bool recovered = false;
+  deadline = steady() + 8000;
+  while (steady() < deadline) {
+    fixture.pump(true); // DC courier remains available throughout recovery.
+    const auto native = fixture.driver->status().at("native_control");
+    const auto route = native.at("control_transport");
+    if (fixture.wss_commands > wss_before && route.at("path") == "wss" &&
+        route.at("epoch").get<std::uint64_t>() > old_epoch && !route.at("selecting").get<bool>() &&
+        !native.at("ack_braking_wait").get<bool>()) { recovered = true; break; }
+  }
+  expect(recovered, "WSS reconnect with available DC stranded ACK braking wait");
+  expect(fixture.last_received_payload.at("throttle") == 0.0 &&
+      fixture.last_received_payload.at("steering") == 0.0, "reconnect sent motion during neutral recovery");
+  expect(!fixture.apply(old_frame, ControlPath::DataChannel).at("transport_admitted").get<bool>(),
+      "retired pre-reconnect DC command was admitted");
+}
+
 void product_startup_and_p2p_cloud_recovery() {
   Fixture fixture(false, false, true);
   auto state = [&] { return fixture.driver->status().at("native_control").at("control_transport"); };
@@ -790,6 +823,6 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
 }
 }  // namespace
 int main(int argc, char** argv) {
-  try { if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

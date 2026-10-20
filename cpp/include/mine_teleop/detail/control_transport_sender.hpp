@@ -25,6 +25,9 @@ class ControlTransportSender {
   [[nodiscard]] std::uint64_t revision() const { return revision_; }
 
   void begin(ControlPath path, std::string attempt, std::int64_t now, int recovery_timeout_ms) {
+    if (path == ControlPath::Wss && stamp_.path == ControlPath::DataChannel) {
+      failed_trials_ = std::min(failed_trials_ + 1, kMaxTrialsPerAttempt);
+    }
     // A timed-out selection may already have committed at the vehicle. Try
     // retiring that epoch; an authenticated conflict result reconciles below.
     const auto previous = std::max(remote_epoch_, stamp_.epoch);
@@ -34,14 +37,19 @@ class ControlTransportSender {
     selecting_ = true; qualifying_ = path == ControlPath::DataChannel;
     deadline_ = now + recovery_timeout_ms;
     if (qualifying_) { baseline_wss_ms_ = wss_.mean(); dc_.reset(); last_dc_result_ms_ = now; }
-    else { next_trial_ms_ = now + recovery_timeout_ms; first_wss_sent_ms_ = -1; wss_.reset(); }
+    else {
+      const auto delay = std::min<std::int64_t>(60000,
+          static_cast<std::int64_t>(recovery_timeout_ms) * (std::int64_t{1} << (failed_trials_ > 0 ? failed_trials_ - 1 : 0)));
+      next_trial_ms_ = now + delay; first_wss_sent_ms_ = -1; wss_.reset();
+    }
     ++revision_;
   }
 
   // Healthy proven P2P is preferred even if WSS is momentarily faster.
   // Relay/unknown DC retains real-result comparison against WSS. A trial holds
   // motion until DC also has three actual accepted neutral command results.
-  // A trial runs once per media attempt; it never equates ICE/probe RTT to ACK.
+  // Repeated failures back off and exhaust this attempt's budget. A new media
+  // attempt permits new evidence; a ready/unknown UI flap does not reset it.
   bool consider_dc(std::string_view attempt, std::int64_t now, int timeout_ms) {
     const bool unhealthy_wss = first_wss_sent_ms_ >= 0 && now >= first_wss_sent_ms_ &&
         now - first_wss_sent_ms_ >= NativeControlAckRecovery::kStallMs &&
@@ -49,7 +57,9 @@ class ControlTransportSender {
          last_wss_result_age_ms_ > NativeControlAckRecovery::kFreshAckMs);
     if (attempt.empty() || path() != ControlPath::Wss || holding_motion() ||
         (!dc_is_p2p_ && !wss_.healthy(now) && !unhealthy_wss) ||
-        (trial_attempt_ == attempt && (now < next_trial_ms_ || (!dc_is_p2p_ && !unhealthy_wss)))) return false;
+        (trial_attempt_ == attempt && (failed_trials_ >= kMaxTrialsPerAttempt ||
+            now < next_trial_ms_ || (!dc_is_p2p_ && !unhealthy_wss)))) return false;
+    if (trial_attempt_ != attempt) failed_trials_ = 0;
     trial_attempt_ = attempt;
     begin(ControlPath::DataChannel, std::string(attempt), now, timeout_ms);
     return true;
@@ -133,11 +143,15 @@ class ControlTransportSender {
     return {{"protocol", kControlTransportCapability}, {"epoch", stamp_.epoch},
         {"path", control_path_name(path())}, {"media_attempt", attempt()}, {"selecting", selecting_},
         {"qualifying", qualifying_}, {"dc_path_is_p2p", dc_is_p2p_}, {"revision", revision_}, {"retained_sends", sent_.size()},
+        {"failed_dc_trials", failed_trials_}, {"dc_trial_limit", kMaxTrialsPerAttempt},
+        {"next_dc_trial_monotonic_ms", next_trial_ms_},
         {"wss_result_mean_ms", wss_.mean() ? Json(*wss_.mean()) : Json(nullptr)},
         {"dc_result_mean_ms", dc_.mean() ? Json(*dc_.mean()) : Json(nullptr)}};
   }
 
  private:
+  static constexpr unsigned kMaxTrialsPerAttempt = 3;
+  unsigned failed_trials_{0};
   struct Health {
     std::array<std::int64_t, NativeControlAckRecovery::kConsecutiveAnomalies> ages{};
     std::size_t count{0}, index{0}; std::int64_t progress{0};

@@ -2176,6 +2176,11 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   const auto enabled_cameras = config.enabled_cameras();
   if (enabled_cameras.empty() && !config.runtime.mock_control_diagnostic)
     throw std::runtime_error("at least one camera must be enabled");
+  if (config.runtime.control_enabled && !config.runtime.mock_control_diagnostic &&
+      std::none_of(enabled_cameras.begin(), enabled_cameras.end(), [](const auto& camera) {
+        return camera.critical_for_control;
+      }))
+    throw std::runtime_error("control-enabled vehicle requires at least one enabled critical camera");
 
   const auto hardware = root["hardware"];
   const auto can = hardware["can"];
@@ -2298,6 +2303,7 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
       config.field_safety.max_steering_angle_deg < 0.0 ||
       config.field_safety.max_steering_angle_deg > 30.0 ||
       config.field_safety.max_time_sync_uncertainty_ms < 0 ||
+      config.field_safety.max_time_sync_uncertainty_ms > 100 ||
       config.field_safety.time_sync_interval_ms <= 0 ||
       config.field_safety.time_sync_samples < 3 || config.field_safety.time_sync_samples > 15) {
     throw std::runtime_error("field_safety limits or time sync settings are invalid");

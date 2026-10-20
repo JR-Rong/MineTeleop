@@ -139,6 +139,26 @@ void healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup() {
   expect(sender.consider_dc("media-a", 5451, 5000), "recovered direct candidate was never retried");
 }
 
+void failed_direct_trials_back_off_and_exhaust_per_attempt() {
+  ControlTransportSender sender; sender.set_data_channel_is_p2p(true);
+  std::int64_t now = 0;
+  std::uint64_t seq = 1;
+  for (int failure = 1; failure <= 3; ++failure) {
+    expect(sender.consider_dc("media-a", now, 5000), "bounded candidate retry missing");
+    expect(sender.observe(false, "media-a", ++now, 5000), "failed DC did not fall back");
+    auto frame = payload(seq++, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now);
+    sender.note_result(response(frame, true, true), now + 1, 5000);
+    const auto delay = 5000 * (1 << (failure - 1));
+    expect(!sender.consider_dc("media-a", now + delay - 1, 5000), "candidate retried before backoff");
+    now += delay;
+  }
+  expect(!sender.consider_dc("media-a", now + 600000, 5000), "exhausted media attempt retried forever");
+  sender.set_data_channel_is_p2p(false); sender.set_data_channel_is_p2p(true);
+  expect(!sender.consider_dc("media-a", now + 600001, 5000), "UI readiness flap reset trial budget");
+  expect(sender.consider_dc("media-b", now + 600002, 5000) && sender.holding_motion(),
+      "new media attempt did not start a bounded neutral trial");
+}
+
 void signatures_bind_native_bytes_and_vehicle_results() {
   const std::string key = "01234567890123456789012345678901"; // Public test vector, never a deployed key.
   expect(control_transport_mac("abc", key) == "d5c75dc69d8243aa0882a04342d9ff7c73537a0311a7950800607be225594009", "SHA256 MAC disagrees with independent test vector");
@@ -243,8 +263,9 @@ void real_service_switch_does_not_disable_watchdog() {
 }  // namespace
 int main() {
   try {
+    failed_direct_trials_back_off_and_exhaust_per_attempt();
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "10 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "11 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
