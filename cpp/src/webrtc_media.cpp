@@ -1178,8 +1178,8 @@ struct VehicleMediaRuntime::Impl {
     for (const auto& lane : self->lanes) {
       tracks.push_back({
           {"camera_id", lane->camera.id},
-          {"codec", to_string(self->active_candidate.codec)},
-          {"backend", to_string(self->active_candidate.backend)},
+          {"codec", (self->config.runtime.mock_control_diagnostic ? std::string("none") : to_string(self->active_candidate.codec))},
+          {"backend", (self->config.runtime.mock_control_diagnostic ? std::string("none") : to_string(self->active_candidate.backend))},
           {"width", lane->profile.width},
           {"height", lane->profile.height},
           {"fps", lane->profile.fps},
@@ -1213,8 +1213,8 @@ struct VehicleMediaRuntime::Impl {
          {"sdp", text == nullptr ? "" : text},
          {"media_negotiation_id", negotiation_id},
          {"legacy_bootstrap_allowed", state->attempt_count == 1 && state->offer_count == 1},
-         {"codec", to_string(self->active_candidate.codec)},
-         {"backend", to_string(self->active_candidate.backend)},
+         {"codec", (self->config.runtime.mock_control_diagnostic ? std::string("none") : to_string(self->active_candidate.codec))},
+         {"backend", (self->config.runtime.mock_control_diagnostic ? std::string("none") : to_string(self->active_candidate.backend))},
          {"media_tracks", std::move(tracks)}});
     state->offer_queued = true;
     for (auto& candidate : state->pending_local_candidates)
@@ -1228,8 +1228,8 @@ struct VehicleMediaRuntime::Impl {
         "No action is required; wait for the controller answer.",
         true,
         {{"track_count", self->lanes.size()},
-         {"codec", to_string(self->active_candidate.codec)},
-         {"backend", to_string(self->active_candidate.backend)}});
+         {"codec", (self->config.runtime.mock_control_diagnostic ? std::string("none") : to_string(self->active_candidate.codec))},
+         {"backend", (self->config.runtime.mock_control_diagnostic ? std::string("none") : to_string(self->active_candidate.backend))}});
     }
     }
     g_free(text);
@@ -1266,8 +1266,8 @@ struct VehicleMediaRuntime::Impl {
     self->emit_diagnostic(
         "vehicle_webrtc_answer_applied", "webrtc_answer_applied", "webrtc_answer", "",
         "No action is required; wait for ICE/DTLS connection and video frames.", true,
-        {{"codec", to_string(self->active_candidate.codec)},
-         {"backend", to_string(self->active_candidate.backend)}});
+        {{"codec", (self->config.runtime.mock_control_diagnostic ? std::string("none") : to_string(self->active_candidate.codec))},
+         {"backend", (self->config.runtime.mock_control_diagnostic ? std::string("none") : to_string(self->active_candidate.backend))}});
   }
 
   static void on_negotiation_needed(GstElement* webrtc, gpointer user_data) {
@@ -1395,8 +1395,8 @@ struct VehicleMediaRuntime::Impl {
       stop_requested = true;
       wake_native_control_feedback();
       stop_control_for_pipeline_fault(issue_code);
-      details["codec"] = to_string(active_candidate.codec);
-      details["backend"] = to_string(active_candidate.backend);
+      details["codec"] = (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(active_candidate.codec));
+      details["backend"] = (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(active_candidate.backend));
       details["safety_action"] = "local_full_stop";
       emit_diagnostic(
           "vehicle_media_pipeline_failed",
@@ -3799,17 +3799,18 @@ struct VehicleMediaRuntime::Impl {
     return {fallback};
   }
 
-  [[nodiscard]] std::string build_pipeline(const VideoEncoder& encoder) {
+  [[nodiscard]] std::string build_pipeline(const VideoEncoder* encoder) {
     std::ostringstream pipeline_text;
     pipeline_text << "webrtcbin name=webrtc bundle-policy=max-bundle latency=0 ice-transport-policy="
                   << config.cloud.ice_transport_policy << ' ';
+    if (!lanes.empty() && encoder == nullptr) throw std::logic_error("video lanes require encoder");
     int payload_type = 96;
     for (const auto& lane : lanes) {
       const auto id = pipeline_identifier(lane->camera.id);
-      const auto parser = encoder.codec() == VideoCodec::H265 ? "h265parse" : "h264parse";
-      const auto payloader = encoder.codec() == VideoCodec::H265 ? "rtph265pay" : "rtph264pay";
-      const auto encoding_name = encoder.codec() == VideoCodec::H265 ? "H265" : "H264";
-      const auto elementary_caps = encoder.codec() == VideoCodec::H265 ? "video/x-h265" : "video/x-h264";
+      const auto parser = encoder->codec() == VideoCodec::H265 ? "h265parse" : "h264parse";
+      const auto payloader = encoder->codec() == VideoCodec::H265 ? "rtph265pay" : "rtph264pay";
+      const auto encoding_name = encoder->codec() == VideoCodec::H265 ? "H265" : "H264";
+      const auto elementary_caps = encoder->codec() == VideoCodec::H265 ? "video/x-h265" : "video/x-h264";
       const auto fps = std::max(1, lane->profile.fps);
       const auto keyframe_interval = lane->camera.critical_for_control
           ? realtime_keyframe_interval_frames(fps, config.runtime.critical_camera_stale_brake_ms)
@@ -3817,14 +3818,14 @@ struct VehicleMediaRuntime::Impl {
       VideoEncoderSettings settings{lane->profile.bitrate_kbps, keyframe_interval};
       pipeline_text
           << build_camera_input_pipeline("source_" + id, lane->input, lane->profile)
-          << "! " << encoder.pipeline_stage(settings, "encoder_" + id) << ' '
+          << "! " << encoder->pipeline_stage(settings, "encoder_" + id) << ' '
           << "! " << parser << " config-interval=-1 "
           << "! " << elementary_caps << ",stream-format=byte-stream,alignment=au "
           << "! tee name=encoded_" << id << ' '
           << "encoded_" << id << ". ! " << build_encoded_frame_queue("send_queue_" + id, 2)
           << "! " << payloader << " name=pay_" << id << " config-interval=-1 pt=" << payload_type << ' '
           << "! application/x-rtp,media=video,encoding-name=" << encoding_name << ",payload=" << payload_type
-          << (encoder.codec() == VideoCodec::H265
+          << (encoder->codec() == VideoCodec::H265
                   ? ",profile-id=(string)1,tier-flag=(string)0,tx-mode=(string)SRST"
                   : ",packetization-mode=(string)1")
           << " ! webrtc. ";
@@ -3952,7 +3953,7 @@ struct VehicleMediaRuntime::Impl {
       if (recording_root.empty() || lane->camera.record_profile.empty()) continue;
       const auto& profile = config.record_profile(lane->camera.record_profile);
       lane->recording_index = settings.lanes.size();
-      settings.lanes.push_back({lane->camera.id, to_string(candidate.codec), to_string(candidate.backend), lane->profile.fps, profile.segment_seconds});
+      settings.lanes.push_back({lane->camera.id, (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(candidate.codec)), (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(candidate.backend)), lane->profile.fps, profile.segment_seconds});
       expected.push_back(lane->camera.id);
     }
     if (settings.lanes.empty()) return;
@@ -3989,10 +3990,10 @@ struct VehicleMediaRuntime::Impl {
     control_not_open_warning_fired = false;
     control_link_opened_this_attempt = false;
     prepare_lanes();
-    auto encoder_choice = create_video_encoder(candidate);
-    if (encoder_choice->factory_name().empty()) {
+    auto encoder_choice = config.runtime.mock_control_diagnostic ? nullptr : create_video_encoder(candidate);
+    if (encoder_choice && encoder_choice->factory_name().empty()) {
       set_pipeline_error(
-          to_string(candidate.backend) + " " + to_string(candidate.codec) + " encoder factory is unavailable",
+          (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(candidate.backend)) + " " + (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(candidate.codec)) + " encoder factory is unavailable",
           "encoder_factory_unavailable",
           "encoder_selection",
           "Install/enable the requested hardware encoder or configure a working fallback backend.",
@@ -4001,7 +4002,7 @@ struct VehicleMediaRuntime::Impl {
     }
     prepare_recording(candidate);
     GError* parse_error = nullptr;
-    const auto description = build_pipeline(*encoder_choice);
+    const auto description = build_pipeline(encoder_choice.get());
     pipeline = gst_parse_launch(description.c_str(), &parse_error);
     if (parse_error != nullptr || pipeline == nullptr) {
       const std::string message = parse_error != nullptr ? parse_error->message : "unknown pipeline parse error";
@@ -4987,7 +4988,7 @@ struct VehicleMediaRuntime::Impl {
     }
     std::vector<VideoCodec> codecs;
     try {
-      codecs = negotiate_codecs(3000);
+      if (!config.runtime.mock_control_diagnostic) codecs = negotiate_codecs(3000);
     } catch (const std::exception& error) {
       emit_diagnostic(
           "vehicle_media_negotiation_failed",
@@ -4999,6 +5000,9 @@ struct VehicleMediaRuntime::Impl {
       throw;
     }
     std::vector<EncoderCandidate> candidates;
+    // Transport-only attempt: no encoder probing, codec negotiation or media element.
+    // The placeholder never reaches create_video_encoder and is labelled unassessed.
+    if (config.runtime.mock_control_diagnostic) candidates.push_back({EncoderBackend::Nvenc, VideoCodec::H264});
     for (const auto codec : codecs) {
       const auto codec_candidates = encoder_candidate_order(config.hardware, codec);
       candidates.insert(candidates.end(), codec_candidates.begin(), codec_candidates.end());
@@ -5030,8 +5034,8 @@ struct VehicleMediaRuntime::Impl {
         check_stop();
         const auto error = current_pipeline_error();
         attempts.push_back({
-            {"backend", to_string(candidate.backend)},
-            {"codec", to_string(candidate.codec)},
+            {"backend", (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(candidate.backend))},
+            {"codec", (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(candidate.codec))},
             {"passed", false},
             {"failure", current_pipeline_failure()},
             {"error", error}});
@@ -5089,8 +5093,8 @@ struct VehicleMediaRuntime::Impl {
               {"recording_attempt_id", recording_attempt_id},
               {"mock_control_diagnostic", config.runtime.mock_control_diagnostic},
               {"adapter_type", config.vehicle_adapter.type},
-              {"codec", to_string(candidate.codec)},
-              {"backend", to_string(candidate.backend)},
+              {"codec", (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(candidate.codec))},
+              {"backend", (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(candidate.backend))},
               {"media_negotiation", media_scope_status()},
               {"control_issue_code", control_inhibited.load() ? std::string(recovery_inhibition_issue()) : control_recovery_latch->braking_wait_for(signaling.session_id()) ? "control_recovery_braking_wait" : ""},
               {"control_recovery", control_recovery_latch->recovery_status_for(signaling.session_id())},
@@ -5169,8 +5173,8 @@ struct VehicleMediaRuntime::Impl {
       const auto error = current_pipeline_error();
       const bool passed = error.empty() && answer_applied && (config.runtime.mock_control_diagnostic || total_encoded() > 0) && !control_inhibited;
       attempts.push_back({
-          {"backend", to_string(candidate.backend)},
-          {"codec", to_string(candidate.codec)},
+          {"backend", (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(candidate.backend))},
+          {"codec", (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(candidate.codec))},
           {"passed", passed},
           {"answer_received", answer_received},
           {"answer_applied", answer_applied},
@@ -5239,8 +5243,8 @@ struct VehicleMediaRuntime::Impl {
         {"vehicle_id", config.vehicle_id},
         {"session_id", signaling.session_id()},
         {"transport", "webrtc-srtp"},
-        {"codec", to_string(successful.codec)},
-        {"encoder_backend", to_string(successful.backend)},
+        {"codec", (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(successful.codec))},
+        {"encoder_backend", (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(successful.backend))},
         {"camera_count", config.enabled_cameras().size()},
         {"duration_ms", total_elapsed},
         {"minimum_fps", config.hardware.min_realtime_fps},
