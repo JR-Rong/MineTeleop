@@ -1005,6 +1005,42 @@ void test_camera_backend_config_rejects_unknown_and_invalid_ccg2_modes() {
   std::filesystem::remove(odd_width_path, error);
 }
 
+void test_orin_isx031_config_uses_native_uyvy_and_independent_output_size() {
+  const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.orin-isx031-bench.yaml");
+  expect(config.vehicle_adapter.type == "mock" && !config.hardware.require_hardware_encoder,
+         "Orin bench must remain explicitly CPU/mock");
+  expect(config.enabled_cameras().size() == 2, "ISX031 bench must define two cameras");
+  for (const auto& camera : config.enabled_cameras()) {
+    expect(mine_teleop::classify_camera_source(camera) == mine_teleop::CameraSourceKind::V4l2Uyvy,
+           "ISX031 was incorrectly classified as MJPEG or the CCG2 YUYV quirk");
+    const auto& realtime = config.realtime_profile(camera.realtime_profile);
+    const auto input = mine_teleop::camera_input_spec(camera, realtime);
+    expect(input.codec == "uyvy" && input.width == 1920 && input.height == 1536 && input.fps == 30,
+           "ISX031 capture size was replaced by the smaller encoding size");
+    expect(realtime.width == 960 && realtime.height == 768, "ISX031 output must preserve aspect ratio");
+    auto capture = realtime;
+    capture.codec = input.codec; capture.width = input.width; capture.height = input.height; capture.fps = input.fps;
+    mine_teleop::CameraFrameSource source(camera, capture);
+    expect(source.command().empty(), "native UYVY source unexpectedly invokes a bridge process");
+    expect_throws([&] { mine_teleop::CameraFrameSource bad(camera, realtime); },
+                  "UYVY source accepted an encoded H.264 acquisition profile");
+    const auto pipeline = mine_teleop::build_camera_input_pipeline("isx031_input", input, realtime);
+    expect(pipeline.find("width=1920,height=1536") != std::string::npos &&
+           pipeline.find("width=960,height=768") != std::string::npos &&
+           pipeline.find("jpegdec") == std::string::npos,
+           "ISX031 raw conversion/scaling contract was lost");
+  }
+  auto yaml = read_text("configs/vehicle-agent.orin-isx031-bench.yaml");
+  replace_once(yaml, "capture_width: 1920", "capture_width: 1919");
+  const auto invalid = write_temp_vehicle_config("isx031-invalid-width", yaml);
+  expect_throws([&] { mine_teleop::load_vehicle_config(invalid); }, "UYVY odd capture width was accepted");
+  std::filesystem::remove(invalid);
+  expect(mine_teleop::classify_camera_issue("V4L2 UYVY driver did not negotiate UYVY: /dev/video0").code ==
+             "camera_uyvy_format_invalid", "native UYVY format error was misclassified");
+  expect(mine_teleop::classify_camera_issue("V4L2 UYVY V4L2 buffer flagged error for /dev/video0").retryable,
+         "native UYVY capture error lost bounded reopen behavior");
+}
+
 void test_ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames() {
   const std::string tight = "ABCDEFGHIJKLMNOP";
   expect(
@@ -4672,6 +4708,75 @@ void test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility() {
       "GStreamer 1.24 NVENC stage did not apply preset and ultra-low-latency tune");
 }
 
+void test_cpu_encoder_requires_opt_in_and_preserves_codec_fallback() {
+  const auto path = "configs/vehicle-agent.orin-cpu-bench.yaml";
+  const auto config = mine_teleop::load_vehicle_config(path);
+  expect(config.vehicle_adapter.type == "mock", "CPU bench must use the mock adapter");
+  expect(!config.hardware.require_hardware_encoder, "CPU bench did not explicitly opt in");
+  const auto h264 = mine_teleop::encoder_candidate_order(config.hardware, mine_teleop::VideoCodec::H264);
+  expect(h264.size() == 1 && h264.front().backend == mine_teleop::EncoderBackend::Cpu,
+         "CPU-only H.264 selection is missing or duplicated");
+  expect(mine_teleop::encoder_candidate_order(config.hardware, mine_teleop::VideoCodec::H265).empty(),
+         "CPU backend incorrectly advertises H.265 support");
+
+  auto hardware = config.hardware;
+  hardware.preferred_encoder = "nvenc";
+  expect(mine_teleop::encoder_candidate_order(hardware, mine_teleop::VideoCodec::H264).size() == 2,
+         "explicit hardware-to-CPU H.264 fallback was lost");
+  const auto h265 = mine_teleop::encoder_candidate_order(hardware, mine_teleop::VideoCodec::H265);
+  expect(h265.size() == 1 && h265.front().backend == mine_teleop::EncoderBackend::Nvenc,
+         "unsupported CPU codec displaced the hardware H.265 candidate");
+  hardware.require_hardware_encoder = true;
+  expect_throws([&] { mine_teleop::encoder_candidate_order(hardware, mine_teleop::VideoCodec::H264); },
+                "hardware-only policy allowed a CPU fallback");
+
+  auto yaml = read_text(path);
+  replace_once(yaml, "require_hardware_encoder: false", "require_hardware_encoder: true");
+  const auto invalid = write_temp_vehicle_config("cpu-policy", yaml);
+  expect_throws([&] { mine_teleop::load_vehicle_config(invalid); },
+                "configuration accepted CPU encoding while requiring hardware");
+  std::filesystem::remove(invalid);
+}
+
+void test_cpu_h264_encoder_produces_parsed_baseline_buffers() {
+  const auto encoder = mine_teleop::create_video_encoder(
+      {mine_teleop::EncoderBackend::Cpu, mine_teleop::VideoCodec::H264});
+  if (encoder->factory_name().empty() || !mine_teleop::gstreamer_factory_available("h264parse")) {
+    std::cout << "SKIP CPU encode integration: x264enc/h264parse not installed\n";
+    return;
+  }
+  const auto description =
+      "videotestsrc num-buffers=24 ! video/x-raw,format=NV12,width=160,height=120,framerate=30/1 ! " +
+      encoder->pipeline_stage({300, 30}, "cpu_encoder") +
+      " ! h264parse ! video/x-h264,profile=constrained-baseline,alignment=au"
+      " ! fakesink name=encoded_sink signal-handoffs=true sync=false";
+  GError* parse_error = nullptr;
+  GstElement* pipeline = mine_teleop::parse_initialized_gstreamer_pipeline(description.c_str(), &parse_error);
+  const std::string error = parse_error == nullptr ? "" : parse_error->message;
+  if (parse_error != nullptr) g_error_free(parse_error);
+  if (pipeline == nullptr || !error.empty()) {
+    if (pipeline != nullptr) gst_object_unref(pipeline);
+    throw TestFailure("CPU H.264 pipeline could not be parsed: " + error);
+  }
+  std::atomic<int> encoded_count{0};
+  auto* sink = gst_bin_get_by_name(GST_BIN(pipeline), "encoded_sink");
+  g_signal_connect(sink, "handoff", G_CALLBACK(+[](GstElement*, GstBuffer*, GstPad*, gpointer data) {
+    static_cast<std::atomic<int>*>(data)->fetch_add(1);
+  }), &encoded_count);
+  GstBus* bus = gst_element_get_bus(pipeline);
+  const auto state = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+  GstMessage* message = gst_bus_timed_pop_filtered(
+      bus, 10 * GST_SECOND, static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+  const bool eos = message != nullptr && GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS;
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  if (message != nullptr) gst_message_unref(message);
+  gst_object_unref(bus);
+  gst_object_unref(sink);
+  gst_object_unref(pipeline);
+  expect(state != GST_STATE_CHANGE_FAILURE && eos && encoded_count == 24,
+         "CPU H.264 failed to emit all 24 parsed baseline access units before EOS");
+}
+
 void test_native_testsrc_acquisition_does_not_spawn_ffmpeg() {
   const auto config = mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml");
   const auto camera = config.enabled_cameras().front();
@@ -5040,6 +5145,7 @@ int main() {
       {"camera_source_classification_is_canonical", test_camera_source_classification_is_canonical},
       {"camera_input_spec_is_explicit_for_ccg2_and_legacy_safe", test_camera_input_spec_is_explicit_for_ccg2_and_legacy_safe},
       {"camera_backend_config_rejects_unknown_and_invalid_ccg2_modes", test_camera_backend_config_rejects_unknown_and_invalid_ccg2_modes},
+      {"orin_isx031_config_uses_native_uyvy_and_independent_output_size", test_orin_isx031_config_uses_native_uyvy_and_independent_output_size},
       {"ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames", test_ccg2_uyvy_row_packing_handles_stride_and_rejects_invalid_frames},
       {"camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2", test_camera_input_pipeline_keeps_legacy_jpeg_and_adds_raw_ccg2},
       {"camera_input_pipeline_always_bounds_raw_delivery_without_duplication", test_camera_input_pipeline_always_bounds_raw_delivery_without_duplication},
@@ -5114,6 +5220,8 @@ int main() {
       {"signaling_time_sync_common_domain", test_signaling_time_sync_common_domain},
       {"driver_config_and_hardware_encoder_priority", test_driver_config_and_hardware_encoder_priority},
       {"realtime_keyframe_interval_reserves_video_recovery_budget", test_realtime_keyframe_interval_reserves_video_recovery_budget},
+      {"cpu_encoder_requires_opt_in_and_preserves_codec_fallback", test_cpu_encoder_requires_opt_in_and_preserves_codec_fallback},
+      {"cpu_h264_encoder_produces_parsed_baseline_buffers", test_cpu_h264_encoder_produces_parsed_baseline_buffers},
       {"nvenc_pipeline_stage_tracks_gstreamer_property_compatibility", test_nvenc_pipeline_stage_tracks_gstreamer_property_compatibility},
       {"native_testsrc_acquisition_does_not_spawn_ffmpeg", test_native_testsrc_acquisition_does_not_spawn_ffmpeg},
       {"basler_camera_uses_minimal_aravis_bridge", test_basler_camera_uses_minimal_aravis_bridge},

@@ -352,6 +352,7 @@ install(TARGETS mine_teleop_runtime
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
+install(PROGRAMS scripts/deploy/setup_orin_isx031.sh DESTINATION share/mine-teleop/scripts)
 install(DIRECTORY cpp/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY configs/ DESTINATION share/mine-teleop/configs)
 install(DIRECTORY cpp/web/assets/ DESTINATION share/mine-teleop/assets)

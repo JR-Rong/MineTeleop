@@ -1,0 +1,130 @@
+{
+  "base_pr": 24,
+  "base_commit": "eb0ef621c8212ba653b4821cacc944ac879ebf8c",
+  "build": "local orin ARM64 Ubuntu 22.04 container",
+  "bench": "HCK-C1202 / Orin Nano 8GB / ISX031 x2 / Jetson R36.5 / GStreamer 1.20.3",
+  "scope": "mock adapter; CAN down; no VCU handshake or driving inputs",
+  "testsrc": {
+    "samples": 9,
+    "duration_s": 39.999,
+    "streams": [
+      {
+        "camera_id": "front_test",
+        "decoded_delta": 1201,
+        "presented_delta": 1200,
+        "fps_min": 29,
+        "fps_max": 31,
+        "bitrate_kbps_mean": 2504.7,
+        "drops_start": 7,
+        "drops_end": 7,
+        "packet_loss_delta": 0,
+        "freeze_delta": 0,
+        "capture_failure_end": 0,
+        "reopen_end": 0,
+        "capture_sequence_gap_max": 0,
+        "send_stale_drop_start": 2,
+        "send_stale_drop_end": 2,
+        "raw_backlog_start": 14,
+        "raw_backlog_end": 14,
+        "estimated_latency_ms_mean": 37.0,
+        "all_videos_ready": true
+      }
+    ]
+  },
+  "isx031": {
+    "samples": 55,
+    "duration_s": 269.997,
+    "streams": [
+      {
+        "camera_id": "isx031_0",
+        "decoded_delta": 8100,
+        "presented_delta": 7569,
+        "fps_min": 29,
+        "fps_max": 31,
+        "bitrate_kbps_mean": 2499.6,
+        "drops_start": 1,
+        "drops_end": 1,
+        "packet_loss_delta": 0,
+        "freeze_delta": 0,
+        "capture_failure_end": 0,
+        "reopen_end": 0,
+        "capture_sequence_gap_max": 0,
+        "send_stale_drop_start": 4,
+        "send_stale_drop_end": 4,
+        "raw_backlog_start": 100,
+        "raw_backlog_end": 100,
+        "estimated_latency_ms_mean": 75.5,
+        "all_videos_ready": true
+      },
+      {
+        "camera_id": "isx031_1",
+        "decoded_delta": 8100,
+        "presented_delta": 7556,
+        "fps_min": 29,
+        "fps_max": 30,
+        "bitrate_kbps_mean": 2494.9,
+        "drops_start": 3,
+        "drops_end": 3,
+        "packet_loss_delta": 0,
+        "freeze_delta": 0,
+        "capture_failure_end": 0,
+        "reopen_end": 0,
+        "capture_sequence_gap_max": 0,
+        "send_stale_drop_start": 4,
+        "send_stale_drop_end": 4,
+        "raw_backlog_start": 99,
+        "raw_backlog_end": 100,
+        "estimated_latency_ms_mean": 75.0,
+        "all_videos_ready": true
+      }
+    ]
+  },
+  "regression": {
+    "ctest_total": 64,
+    "initial_final_run_passed": 62,
+    "control_clock_suite": "two timing-sensitive failures; separate rerun passed; unchanged PR24 baseline passed",
+    "remaining_failure": "mine-teleop-product-direct-integration-tests: DC not qualified; unchanged PR24 baseline also fails",
+    "final_affected_suites_passed": 5
+  },
+  "startup_observations": "Before steady window: up to 1.9 s capture/encoding delay, ~100 raw backlog/drop frames per camera, 4 stale access-unit drops per camera; no new stale drops during window. Initial decode drops 1 and 3 remain unchanged. Presented frames average ~28 fps, decoded frames ~30 fps.",
+  "limitations": [
+    "short bench session only; not 210-minute acceptance",
+    "estimated latency is not measured photon-to-display latency",
+    "native 1080 sensor mode remains unsuitable; capture native 1920x1536 and scale",
+    "270 s run precedes a CCG2-only exception-prefix compatibility repair; final binary rerun recorded separately"
+  ],
+  "tested_270s_binary_sha256": "a2a033d544929abc94e373da74bdb749983d7af7d9ce13ddb736667408c5c3d3",
+  "final_binary_sha256": "e50d6c384bf6f6a58be49db8956fb63d02bef30cd35c6e90e8f17e19307103d6",
+  "native_core_tests": {
+    "passed": 86,
+    "failed": 0
+  },
+  "final_binary_reconnect": {
+    "samples": 16,
+    "duration_s": 75.001,
+    "streams": [
+      {
+        "camera_id": "isx031_0",
+        "decoded_delta": 2250,
+        "presented_delta": 2087,
+        "decode_drop_delta": 0,
+        "packet_loss_delta": 0,
+        "freeze_delta": 0,
+        "capture_failure_end": 0,
+        "reopen_end": 0,
+        "all_videos_ready": true
+      },
+      {
+        "camera_id": "isx031_1",
+        "decoded_delta": 2250,
+        "presented_delta": 2086,
+        "decode_drop_delta": 0,
+        "packet_loss_delta": 0,
+        "freeze_delta": 0,
+        "capture_failure_end": 0,
+        "reopen_end": 0,
+        "all_videos_ready": true
+      }
+    ]
+  }
+}

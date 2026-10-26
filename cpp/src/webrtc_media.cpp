@@ -270,6 +270,15 @@ CameraIssue classify_camera_issue_impl(std::string_view error) {
   if (contains("VIDIOC_S_FMT MJPEG failed")) {
     return {"camera_mjpeg_format_rejected", "v4l2_format", "Use a width, height, and MJPEG format advertised by v4l2-ctl.", false};
   }
+  if (contains("VIDIOC_S_FMT UYVY failed") || contains("V4L2 UYVY driver")) {
+    return {"camera_uyvy_format_invalid", "v4l2_format", "Check the native UYVY dimensions and stride; initialize the ISX031 SerDes pads before starting capture.", false};
+  }
+  if (contains("V4L2 UYVY V4L2 buffer flagged error") || error.starts_with("UYVY frame is shorter")) {
+    return {"camera_uyvy_buffer_error", "v4l2_capture", "Inspect the V4L2 buffer and CSI/VI kernel log; verify sensor mode and SerDes format initialization.", true};
+  }
+  if (error.starts_with("UYVY")) {
+    return {"camera_uyvy_layout_invalid", "v4l2_format", "Inspect the negotiated dimensions, bytesperline and sizeimage before capturing again.", false};
+  }
   if (contains("VIDIOC_S_FMT CCG2 YUYV failed") ||
       contains("CCG2 driver did not negotiate reported YUYV")) {
     return {"camera_ccg2_yuyv_format_rejected", "v4l2_format", "Confirm the CCG2 node advertises YUYV at the configured width, height, and FPS.", false};
@@ -3804,6 +3813,9 @@ struct VehicleMediaRuntime::Impl {
     pipeline_text << "webrtcbin name=webrtc bundle-policy=max-bundle latency=0 ice-transport-policy="
                   << config.cloud.ice_transport_policy << ' ';
     if (!lanes.empty() && encoder == nullptr) throw std::logic_error("video lanes require encoder");
+    // The first offer precedes camera frames. Advertise the same SSRC that the
+    // payloader will send, or GStreamer 1.20 invents an unrelated SDP identity.
+    const auto ssrc_base = static_cast<guint>(g_random_int_range(1, G_MAXINT - 128));
     int payload_type = 96;
     for (const auto& lane : lanes) {
       const auto id = pipeline_identifier(lane->camera.id);
@@ -3823,8 +3835,10 @@ struct VehicleMediaRuntime::Impl {
           << "! " << elementary_caps << ",stream-format=byte-stream,alignment=au "
           << "! tee name=encoded_" << id << ' '
           << "encoded_" << id << ". ! " << build_encoded_frame_queue("send_queue_" + id, 2)
-          << "! " << payloader << " name=pay_" << id << " config-interval=-1 pt=" << payload_type << ' '
+          << "! " << payloader << " name=pay_" << id << " config-interval=-1 pt=" << payload_type
+          << " ssrc=" << ssrc_base + payload_type << ' '
           << "! application/x-rtp,media=video,encoding-name=" << encoding_name << ",payload=" << payload_type
+          << ",ssrc=(uint)" << ssrc_base + payload_type
           << (encoder->codec() == VideoCodec::H265
                   ? ",profile-id=(string)1,tier-flag=(string)0,tx-mode=(string)SRST"
                   : ",packetization-mode=(string)1")
@@ -3996,7 +4010,7 @@ struct VehicleMediaRuntime::Impl {
           (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(candidate.backend)) + " " + (config.runtime.mock_control_diagnostic ? std::string("none") : to_string(candidate.codec)) + " encoder factory is unavailable",
           "encoder_factory_unavailable",
           "encoder_selection",
-          "Install/enable the requested hardware encoder or configure a working fallback backend.",
+          "Install/enable the requested encoder or configure a working fallback backend.",
           false);
       return false;
     }
@@ -4188,7 +4202,7 @@ struct VehicleMediaRuntime::Impl {
             }
             auto frame = lane->source->next(++sequence);
             if (stop_requested) break;
-            if (classify_camera_source(lane->camera) == CameraSourceKind::Ccg2 &&
+            if (lane->input.codec == "uyvy" &&
                 (frame.codec != lane->input.codec || frame.width != lane->input.width ||
                  frame.height != lane->input.height)) {
               throw std::runtime_error(
@@ -5013,7 +5027,7 @@ struct VehicleMediaRuntime::Impl {
           "video_encoder_candidates_empty",
           "encoder_selection",
           "no video encoder candidates are configured",
-          "Configure at least one supported codec and hardware encoder backend.",
+          "Configure a supported codec and encoder backend; the CPU backend supports H.264 only.",
           false);
       throw std::runtime_error("no video encoder candidates are configured");
     }

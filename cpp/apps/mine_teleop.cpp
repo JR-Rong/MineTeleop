@@ -285,7 +285,8 @@ Json preflight(const VehicleConfig& config) {
     const auto source_kind = mine_teleop::classify_camera_source(camera);
     const bool requires_device_node =
         source_kind == mine_teleop::CameraSourceKind::V4l2 ||
-        source_kind == mine_teleop::CameraSourceKind::Ccg2;
+        source_kind == mine_teleop::CameraSourceKind::Ccg2 ||
+        source_kind == mine_teleop::CameraSourceKind::V4l2Uyvy;
     add(
         "camera:" + camera.id,
         !requires_device_node || std::filesystem::exists(camera.device),
