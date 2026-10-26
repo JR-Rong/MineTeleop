@@ -46,6 +46,7 @@ CameraSourceKind classify_camera_source(std::string_view device) {
 
 CameraSourceKind classify_camera_source(const CameraConfig& camera) {
   if (camera.backend == "auto") return classify_camera_source(camera.device);
+  if (camera.backend == "v4l2_uyvy") return CameraSourceKind::V4l2Uyvy;
   if (camera.backend == "ccg2") return CameraSourceKind::Ccg2;
   throw std::invalid_argument("unsupported camera backend: " + camera.backend);
 }
@@ -62,6 +63,8 @@ std::string_view camera_source_kind_name(CameraSourceKind kind) {
       return "v4l2";
     case CameraSourceKind::Ccg2:
       return "ccg2";
+    case CameraSourceKind::V4l2Uyvy:
+      return "v4l2_uyvy";
   }
   throw std::invalid_argument("unknown camera source kind");
 }
@@ -75,11 +78,12 @@ CameraInputSpec camera_input_spec(
       realtime_profile.height,
       realtime_profile.fps,
   };
-  if (classify_camera_source(camera) != CameraSourceKind::Ccg2) return result;
+  const auto kind = classify_camera_source(camera);
+  if (kind != CameraSourceKind::Ccg2 && kind != CameraSourceKind::V4l2Uyvy) return result;
   if (camera.capture_width <= 0 || camera.capture_height <= 0 || camera.capture_fps <= 0 ||
       camera.capture_width % 2 != 0) {
     throw std::invalid_argument(
-        "CCG2 capture requires positive dimensions/FPS and an even width: " + camera.id);
+        "UYVY capture requires positive dimensions/FPS and an even width: " + camera.id);
   }
   result.codec = "uyvy";
   result.width = camera.capture_width;
@@ -94,27 +98,27 @@ std::string pack_uyvy_rows(
     int height,
     std::size_t bytes_per_line) {
   if (width <= 0 || height <= 0 || width % 2 != 0) {
-    throw std::invalid_argument("CCG2 UYVY frame requires positive dimensions and an even width");
+    throw std::invalid_argument("UYVY frame requires positive dimensions and an even width");
   }
   const auto row_bytes = static_cast<std::size_t>(width) * 2U;
   const auto stride = bytes_per_line == 0 ? row_bytes : bytes_per_line;
   if (stride < row_bytes) {
-    throw std::runtime_error("CCG2 UYVY bytesperline is smaller than the visible row");
+    throw std::runtime_error("UYVY bytesperline is smaller than the visible row");
   }
   const auto rows_before_last = static_cast<std::size_t>(height - 1);
   if (rows_before_last > (std::numeric_limits<std::size_t>::max() - row_bytes) / stride) {
-    throw std::overflow_error("CCG2 UYVY frame layout overflows address space");
+    throw std::overflow_error("UYVY frame layout overflows address space");
   }
   const auto required_bytes = rows_before_last * stride + row_bytes;
   if (frame.size() < required_bytes) {
     throw std::runtime_error(
-        "CCG2 UYVY frame is shorter than the negotiated visible image: bytesused=" +
+        "UYVY frame is shorter than the negotiated visible image: bytesused=" +
         std::to_string(frame.size()) + ", required=" + std::to_string(required_bytes) +
         ", bytesperline=" + std::to_string(stride));
   }
   if (static_cast<std::size_t>(height) >
       std::numeric_limits<std::size_t>::max() / row_bytes) {
-    throw std::overflow_error("CCG2 UYVY packed frame size overflows address space");
+    throw std::overflow_error("UYVY packed frame size overflows address space");
   }
   std::string packed(static_cast<std::size_t>(height) * row_bytes, '\0');
   for (int row = 0; row < height; ++row) {
@@ -327,10 +331,11 @@ CameraFrameSource::CameraFrameSource(CameraConfig camera, MediaProfile profile, 
   }
   if (frame_timeout_ms_ <= 0) throw std::invalid_argument("frame timeout must be positive");
   const auto source_kind = classify_camera_source(camera_);
-  if (source_kind == CameraSourceKind::Ccg2 && profile_.codec != "uyvy") {
-    throw std::invalid_argument("CCG2 camera acquisition requires a uyvy capture profile");
+  const bool raw_uyvy = source_kind == CameraSourceKind::Ccg2 || source_kind == CameraSourceKind::V4l2Uyvy;
+  if (raw_uyvy && profile_.codec != "uyvy") {
+    throw std::invalid_argument("UYVY camera acquisition requires a uyvy capture profile");
   }
-  if (source_kind != CameraSourceKind::Ccg2 &&
+  if (!raw_uyvy &&
       profile_.codec != "mjpeg" && profile_.codec != "jpeg") {
     throw std::invalid_argument("native camera acquisition requires an mjpeg realtime profile");
   }
@@ -353,6 +358,9 @@ CameraFrameSource::CameraFrameSource(CameraConfig camera, MediaProfile profile, 
       break;
     case CameraSourceKind::Ccg2:
       mode_ = Mode::Ccg2;
+      break;
+    case CameraSourceKind::V4l2Uyvy:
+      mode_ = Mode::V4l2Uyvy;
       break;
   }
 }
@@ -480,11 +488,15 @@ void CameraFrameSource::start_v4l2() {
     }
 
     const bool ccg2 = mode_ == Mode::Ccg2;
+    const bool raw_uyvy = ccg2 || mode_ == Mode::V4l2Uyvy;
+    const std::string raw_label = ccg2 ? "CCG2" : "V4L2 UYVY";
+    const auto requested_format = ccg2 ? V4L2_PIX_FMT_YUYV :
+        (raw_uyvy ? V4L2_PIX_FMT_UYVY : V4L2_PIX_FMT_MJPEG);
     v4l2_format format{};
     format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     format.fmt.pix.width = static_cast<__u32>(profile_.width);
     format.fmt.pix.height = static_cast<__u32>(profile_.height);
-    format.fmt.pix.pixelformat = ccg2 ? V4L2_PIX_FMT_YUYV : V4L2_PIX_FMT_MJPEG;
+    format.fmt.pix.pixelformat = requested_format;
     format.fmt.pix.field = V4L2_FIELD_ANY;
     const auto format_result = ioctl_retry(device_fd_, VIDIOC_S_FMT, &format);
     const auto format_errno = format_result < 0 ? errno : 0;
@@ -496,26 +508,27 @@ void CameraFrameSource::start_v4l2() {
         throw std::runtime_error(
             "VIDIOC_S_FMT CCG2 YUYV failed for " + camera_.device + ": " + std::strerror(errno));
       }
+      if (raw_uyvy) throw std::runtime_error("VIDIOC_S_FMT UYVY failed for " + camera_.device + ": " + std::strerror(errno));
       throw std::runtime_error(
           "VIDIOC_S_FMT MJPEG failed for " + camera_.device + ": " + std::strerror(errno));
     }
-    const auto requested_format = ccg2 ? V4L2_PIX_FMT_YUYV : V4L2_PIX_FMT_MJPEG;
     if (format.fmt.pix.pixelformat != requested_format) {
       throw std::runtime_error(
           ccg2 ? "CCG2 driver did not negotiate reported YUYV: " + camera_.device
-               : "camera does not provide native MJPEG: " + camera_.device);
+               : (raw_uyvy ? "V4L2 UYVY driver did not negotiate UYVY: " + camera_.device
+                           : "camera does not provide native MJPEG: " + camera_.device));
     }
     output_width_ = static_cast<int>(format.fmt.pix.width);
     output_height_ = static_cast<int>(format.fmt.pix.height);
-    if (ccg2 && (output_width_ != profile_.width || output_height_ != profile_.height)) {
+    if (raw_uyvy && (output_width_ != profile_.width || output_height_ != profile_.height)) {
       throw std::runtime_error(
-          "CCG2 driver negotiated unexpected dimensions for " + camera_.device + ": requested " +
+          raw_label + " driver negotiated unexpected dimensions for " + camera_.device + ": requested " +
           std::to_string(profile_.width) + "x" + std::to_string(profile_.height) + ", got " +
           std::to_string(output_width_) + "x" + std::to_string(output_height_));
     }
-    if (ccg2) {
+    if (raw_uyvy) {
       if (output_width_ <= 0 || output_height_ <= 0 || output_width_ % 2 != 0) {
-        throw std::runtime_error("CCG2 driver returned invalid UYVY dimensions for " + camera_.device);
+        throw std::runtime_error(raw_label + " driver returned invalid UYVY dimensions for " + camera_.device);
       }
       const auto row_bytes = static_cast<std::size_t>(output_width_) * 2U;
       v4l2_bytes_per_line_ = format.fmt.pix.bytesperline == 0
@@ -524,19 +537,19 @@ void CameraFrameSource::start_v4l2() {
       v4l2_size_image_ = static_cast<std::size_t>(format.fmt.pix.sizeimage);
       if (v4l2_bytes_per_line_ < row_bytes) {
         throw std::runtime_error(
-            "CCG2 driver returned bytesperline smaller than the visible UYVY row for " +
+            raw_label + " driver returned bytesperline smaller than the visible UYVY row for " +
             camera_.device + ": bytesperline=" + std::to_string(v4l2_bytes_per_line_) +
             ", row_bytes=" + std::to_string(row_bytes));
       }
       const auto rows_before_last = static_cast<std::size_t>(output_height_ - 1);
       if (rows_before_last >
           (std::numeric_limits<std::size_t>::max() - row_bytes) / v4l2_bytes_per_line_) {
-        throw std::runtime_error("CCG2 driver returned an overflowing UYVY layout for " + camera_.device);
+        throw std::runtime_error(raw_label + " driver returned an overflowing UYVY layout for " + camera_.device);
       }
       const auto visible_bytes = rows_before_last * v4l2_bytes_per_line_ + row_bytes;
       if (v4l2_size_image_ != 0 && v4l2_size_image_ < visible_bytes) {
         throw std::runtime_error(
-            "CCG2 driver returned sizeimage smaller than the visible UYVY image for " +
+            raw_label + " driver returned sizeimage smaller than the visible UYVY image for " +
             camera_.device + ": sizeimage=" + std::to_string(v4l2_size_image_) +
             ", visible_bytes=" + std::to_string(visible_bytes));
       }
@@ -701,7 +714,7 @@ std::string CameraFrameSource::read_v4l2_uyvy() {
         throw std::runtime_error("VIDIOC_QBUF failed for " + camera_.device + ": " + std::strerror(errno));
       }
       throw std::runtime_error(
-          "CCG2 V4L2 buffer flagged error for " + camera_.device +
+          std::string(mode_ == Mode::Ccg2 ? "CCG2" : "V4L2 UYVY") + " V4L2 buffer flagged error for " + camera_.device +
           ": sequence=" + std::to_string(dequeued_sequence) +
           ", gap_from_last_delivered=" + std::to_string(last_dequeued_v4l2_sequence_gap_));
     }
@@ -718,6 +731,11 @@ std::string CameraFrameSource::read_v4l2_uyvy() {
           output_width_,
           output_height_,
           v4l2_bytes_per_line_);
+    } catch (const std::exception& error) {
+      // Retain existing CCG2 diagnostic codes while sharing the raw layout checker.
+      packing_error = mode_ == Mode::Ccg2
+          ? std::make_exception_ptr(std::runtime_error(std::string("CCG2 ") + error.what()))
+          : std::current_exception();
     } catch (...) {
       packing_error = std::current_exception();
     }
@@ -809,6 +827,7 @@ EncodedFrame CameraFrameSource::next(std::uint64_t sequence) {
         payload = read_v4l2_jpeg();
         break;
       case Mode::Ccg2:
+      case Mode::V4l2Uyvy:
         payload = read_v4l2_uyvy();
         codec = "uyvy";
         break;
@@ -825,7 +844,7 @@ EncodedFrame CameraFrameSource::next(std::uint64_t sequence) {
   const auto read_finished = std::chrono::steady_clock::now();
   last_read_duration_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
       read_finished - read_started).count();
-  const auto device_monotonic_us = (mode_ == Mode::V4l2 || mode_ == Mode::Ccg2) &&
+  const auto device_monotonic_us = (mode_ == Mode::V4l2 || mode_ == Mode::Ccg2 || mode_ == Mode::V4l2Uyvy) &&
       (last_v4l2_buffer_flags_ & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC
           ? std::optional<std::int64_t>(last_v4l2_timestamp_us_) : std::nullopt;
   const auto capture_time = detail::select_capture_steady_time(read_started, read_finished, device_monotonic_us);

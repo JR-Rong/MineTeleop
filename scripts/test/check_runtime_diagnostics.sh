@@ -39,9 +39,11 @@ camera_contract=(
   'must support V4L2 capture and streaming|camera_node_not_capture_capable'
   'VIDIOC_S_FMT MJPEG failed|camera_mjpeg_format_rejected'
   'VIDIOC_S_FMT CCG2 YUYV failed|camera_ccg2_yuyv_format_rejected'
-  'CCG2 driver negotiated unexpected dimensions|camera_ccg2_dimensions_mismatch'
-  'CCG2 driver returned bytesperline|camera_ccg2_layout_invalid'
-  'CCG2 UYVY frame is shorter|camera_ccg2_frame_short'
+  'driver negotiated unexpected dimensions|camera_ccg2_dimensions_mismatch'
+  'driver returned bytesperline|camera_ccg2_layout_invalid'
+  'UYVY frame is shorter|camera_uyvy_buffer_error'
+  'V4L2_PIX_FMT_UYVY|camera_uyvy_format_invalid'
+  'UYVY bytesperline|camera_uyvy_layout_invalid'
   'does not provide native MJPEG|camera_native_mjpeg_unavailable'
   'VIDIOC_S_PARM failed|camera_fps_rejected'
   'mmap buffers are unavailable|camera_mmap_buffers_unavailable'
@@ -63,7 +65,7 @@ for contract in "${camera_contract[@]}"; do
   require_text "$catalog" "$issue_code"
 done
 
-require_text "$media_header" 'enum class CameraSourceKind { TestSource, Mvs, Aravis, V4l2, Ccg2 }'
+require_text "$media_header" 'enum class CameraSourceKind { TestSource, Mvs, Aravis, V4l2, Ccg2, V4l2Uyvy }'
 for source_classifier_consumer in "$media_source" "$media_runtime" "$vehicle_app"; do
   require_text "$source_classifier_consumer" 'classify_camera_source('
 done

@@ -98,6 +98,35 @@ class VaapiVideoEncoder final : public VideoEncoder {
   VideoCodec codec_;
 };
 
+class CpuVideoEncoder final : public VideoEncoder {
+ public:
+  explicit CpuVideoEncoder(VideoCodec codec) : codec_(codec) {}
+
+  [[nodiscard]] EncoderBackend backend() const override { return EncoderBackend::Cpu; }
+  [[nodiscard]] VideoCodec codec() const override { return codec_; }
+  [[nodiscard]] std::string factory_name() const override {
+    return codec_ == VideoCodec::H264 ? first_available({"x264enc"}) : std::string{};
+  }
+  [[nodiscard]] std::string pipeline_stage(
+      const VideoEncoderSettings& settings,
+      std::string_view element_name) const override {
+    if (factory_name().empty()) throw std::runtime_error("CPU H.264 x264 encoder is unavailable");
+    std::ostringstream value;
+    // Bound encoder parallelism and buffering so a bench CPU stream leaves
+    // capacity for capture, signaling and the control watchdog.
+    value << "x264enc name=" << element_name
+          << " bitrate=" << settings.bitrate_kbps
+          << " key-int-max=" << settings.keyframe_interval_frames
+          << " speed-preset=ultrafast tune=zerolatency threads=4"
+          << " bframes=0 rc-lookahead=0 sync-lookahead=0 byte-stream=true aud=true"
+          << " ! video/x-h264,profile=constrained-baseline";
+    return value.str();
+  }
+
+ private:
+  VideoCodec codec_;
+};
+
 }  // namespace
 
 int realtime_keyframe_interval_frames(int fps, int stale_brake_ms) {
@@ -136,7 +165,12 @@ std::string to_string(VideoCodec codec) {
 }
 
 std::string to_string(EncoderBackend backend) {
-  return backend == EncoderBackend::Nvenc ? "nvenc" : "vaapi";
+  switch (backend) {
+    case EncoderBackend::Nvenc: return "nvenc";
+    case EncoderBackend::Vaapi: return "vaapi";
+    case EncoderBackend::Cpu: return "cpu";
+  }
+  throw std::invalid_argument("unknown video encoder backend");
 }
 
 VideoCodec parse_video_codec(std::string_view value) {
@@ -150,20 +184,33 @@ EncoderBackend parse_encoder_backend(std::string_view value) {
   const auto normalized = lower(value);
   if (normalized == "nvenc" || normalized == "nvidia") return EncoderBackend::Nvenc;
   if (normalized == "vaapi" || normalized == "intel") return EncoderBackend::Vaapi;
-  throw std::invalid_argument("unsupported hardware video encoder: " + std::string(value));
+  if (normalized == "cpu") return EncoderBackend::Cpu;
+  throw std::invalid_argument("unsupported video encoder: " + std::string(value));
 }
 
 std::vector<EncoderCandidate> encoder_candidate_order(const HardwareConfig& hardware, VideoCodec codec) {
   const auto preferred = parse_encoder_backend(hardware.preferred_encoder);
   const auto fallback = parse_encoder_backend(hardware.fallback_encoder);
-  std::vector<EncoderCandidate> candidates{{preferred, codec}};
-  if (fallback != preferred) candidates.push_back({fallback, codec});
+  if (hardware.require_hardware_encoder &&
+      (preferred == EncoderBackend::Cpu || fallback == EncoderBackend::Cpu)) {
+    throw std::invalid_argument("CPU encoding requires hardware.encoding.require_hardware_encoder=false");
+  }
+  std::vector<EncoderCandidate> candidates;
+  const auto append = [&](EncoderBackend backend) {
+    if (backend != EncoderBackend::Cpu || codec == VideoCodec::H264) {
+      candidates.push_back({backend, codec});
+    }
+  };
+  append(preferred);
+  if (fallback != preferred) append(fallback);
   return candidates;
 }
 
 std::unique_ptr<VideoEncoder> create_video_encoder(const EncoderCandidate& candidate) {
   if (candidate.backend == EncoderBackend::Nvenc) return std::make_unique<NvencVideoEncoder>(candidate.codec);
-  return std::make_unique<VaapiVideoEncoder>(candidate.codec);
+  if (candidate.backend == EncoderBackend::Vaapi) return std::make_unique<VaapiVideoEncoder>(candidate.codec);
+  if (candidate.backend == EncoderBackend::Cpu) return std::make_unique<CpuVideoEncoder>(candidate.codec);
+  throw std::invalid_argument("unknown video encoder backend");
 }
 
 GstElement* parse_initialized_gstreamer_pipeline(const char* description, GError** error) {
@@ -181,7 +228,7 @@ bool gstreamer_factory_available(std::string_view factory_name) {
 
 Json probe_video_encoders() {
   Json probes = Json::array();
-  for (const auto backend : {EncoderBackend::Nvenc, EncoderBackend::Vaapi}) {
+  for (const auto backend : {EncoderBackend::Nvenc, EncoderBackend::Vaapi, EncoderBackend::Cpu}) {
     for (const auto codec : {VideoCodec::H265, VideoCodec::H264}) {
       const EncoderCandidate candidate{backend, codec};
       const auto encoder = create_video_encoder(candidate);

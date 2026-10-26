@@ -17,7 +17,7 @@
 
 namespace mine_teleop {
 
-enum class CameraSourceKind { TestSource, Mvs, Aravis, V4l2, Ccg2 };
+enum class CameraSourceKind { TestSource, Mvs, Aravis, V4l2, Ccg2, V4l2Uyvy };
 
 [[nodiscard]] CameraSourceKind classify_camera_source(std::string_view device);
 [[nodiscard]] CameraSourceKind classify_camera_source(const CameraConfig& camera);
@@ -34,6 +34,7 @@ struct CameraInputSpec {
 
 // Existing sources retain their realtime-profile capture behavior.  CCG2 is
 // explicit because its V4L2 driver reports YUYV while the DMA bytes are UYVY.
+// v4l2_uyvy requests real UYVY and shares the bounded raw capture path.
 [[nodiscard]] CameraInputSpec camera_input_spec(
     const CameraConfig& camera,
     const MediaProfile& realtime_profile);
@@ -222,7 +223,7 @@ class CameraFrameSource {
   }
 
  private:
-  enum class Mode { TestSource, V4l2, Ccg2, VendorBridge };
+  enum class Mode { TestSource, V4l2, Ccg2, V4l2Uyvy, VendorBridge };
   struct MappedBuffer {
     void* address{nullptr};
     std::size_t length{0};

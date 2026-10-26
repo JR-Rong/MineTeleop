@@ -526,3 +526,9 @@ ICE server 错误同时记录实际 URL 的 udp/tcp transport 和错误类别
 边界，仍含线程调度/解密，不能当作内核收包时刻或纯网络 RTT。
 `ack_poll_failed` 在关闭连接前尽力记录 socket/TCP 诊断，并保持会话/generation
 校验和既有失败处理。新增日志仅使用现有 opt-in 异步 native trace。
+
+### 原生 UYVY（ISX031）
+
+`camera_uyvy_format_invalid` 表示原生 UYVY 格式、尺寸或 stride 协商失败；检查 capture_* 配置与 SerDes 初始化。
+`camera_uyvy_layout_invalid` 表示原始帧布局不合法，应先核对驱动的 bytesperline/sizeimage。
+`camera_uyvy_buffer_error` 表示错误 buffer 或短帧，沿用有界重开和关键相机安全策略；检查 CSI/VI 日志及 sensor_mode，不能把错误帧当成有效视频。

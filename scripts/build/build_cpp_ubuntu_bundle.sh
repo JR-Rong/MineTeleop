@@ -211,6 +211,8 @@ install -m 0644 "$repo_root/deployments/udev/99-mine-teleop-basler.rules" \
   "$output_root/deployments/udev/99-mine-teleop-basler.rules"
 install -m 0755 "$repo_root/scripts/deploy/setup_basler_usb_access.sh" \
   "$output_root/scripts/setup_basler_usb_access.sh"
+install -m 0755 "$repo_root/scripts/deploy/setup_orin_isx031.sh" \
+  "$output_root/scripts/setup_orin_isx031.sh"
 install -m 0644 "$repo_root/packaging/ubuntu-vehicle/README.txt" "$output_root/README.txt"
 printf '%s\n' \
   "source_commit=$(git -C "$repo_root" rev-parse HEAD)" \

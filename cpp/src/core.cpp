@@ -2160,10 +2160,10 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
     if (camera.reopen_backoff_ms < 0 || camera.reopen_backoff_ms > 60000) {
       throw std::runtime_error(camera.id + ".reopen_backoff_ms must be in [0, 60000]");
     }
-    if (camera.backend != "auto" && camera.backend != "ccg2") {
-      throw std::runtime_error(camera.id + ".backend must be auto or ccg2");
+    if (camera.backend != "auto" && camera.backend != "ccg2" && camera.backend != "v4l2_uyvy") {
+      throw std::runtime_error(camera.id + ".backend must be auto, ccg2 or v4l2_uyvy");
     }
-    if (camera.backend == "ccg2" &&
+    if ((camera.backend == "ccg2" || camera.backend == "v4l2_uyvy") &&
         (camera.capture_width <= 0 || camera.capture_height <= 0 || camera.capture_fps <= 0 ||
          camera.capture_width % 2 != 0)) {
       throw std::runtime_error(
@@ -2208,11 +2208,17 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.hardware.require_hardware_encoder = optional<bool>(encoding, "require_hardware_encoder", true);
   config.hardware.max_end_to_end_latency_ms = optional<int>(encoding, "max_end_to_end_latency_ms", 200);
   config.hardware.min_realtime_fps = optional<int>(encoding, "min_realtime_fps", 20);
-  if (config.hardware.preferred_encoder != "nvenc" && config.hardware.preferred_encoder != "vaapi") {
-    throw std::runtime_error("hardware.encoding.preferred_encoder must be nvenc or vaapi");
+  if (config.hardware.preferred_encoder != "nvenc" && config.hardware.preferred_encoder != "vaapi" &&
+      config.hardware.preferred_encoder != "cpu") {
+    throw std::runtime_error("hardware.encoding.preferred_encoder must be nvenc, vaapi or cpu");
   }
-  if (config.hardware.fallback_encoder != "nvenc" && config.hardware.fallback_encoder != "vaapi") {
-    throw std::runtime_error("hardware.encoding.fallback_encoder must be nvenc or vaapi");
+  if (config.hardware.fallback_encoder != "nvenc" && config.hardware.fallback_encoder != "vaapi" &&
+      config.hardware.fallback_encoder != "cpu") {
+    throw std::runtime_error("hardware.encoding.fallback_encoder must be nvenc, vaapi or cpu");
+  }
+  if (config.hardware.require_hardware_encoder &&
+      (config.hardware.preferred_encoder == "cpu" || config.hardware.fallback_encoder == "cpu")) {
+    throw std::runtime_error("CPU encoding requires hardware.encoding.require_hardware_encoder=false");
   }
   if (config.hardware.preferred_codec != "h264" && config.hardware.preferred_codec != "h265") {
     throw std::runtime_error("hardware.encoding.preferred_codec must be h264 or h265");
