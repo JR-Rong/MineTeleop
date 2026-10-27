@@ -148,3 +148,37 @@ python3 scripts/test/receiver_ab_analyze.py browser.json native.json > summary.j
 这些是短时、正常局域网、媒体专用原型的结果。原生端没有完整控制台 UI；未做 UI 压力、5G 丢包/拥塞、长时间运行、重连、原生控制输入或光学端到端测试。Mac 系统盘接近满载且有较多既有 swap，其他 Mac 应用负载未完全控制。下一步应先对齐实际显示节奏和硬件解码证据，再做相同负载下的呈现/光学延迟测试，而不是直接以本表承诺产品收益。
 
 本次最终 Mac 构建成功，3 组定向 CTest（分析口径、真实 Gst PTS 过滤、配置/参数隔离）和 104 项控制逻辑测试通过。Linux 本地容器无法启动，报 `/etc/resolv.conf: input/output error`，没有把上一版 ARM64 构建结果当成本次通过；新提交的 Linux 验证以 CI 为准。复核复用了既有 DriverConsoleRuntime/会话围栏和同一接收循环；新观测均有界且只在显式开启的探针中运行，未增加产品热路径负担。
+
+## Mac 混合 UI 台架（PR26 后续）
+
+`desktop/bench/main.cjs` 是独立、显式启动的实验入口：同一 Electron 44.3.0、同一控制台页面、窗口尺寸和压力脚本，`browser` 使用原有 WebRTC `<video>`，`native` 通过 Node-API 将 VideoToolbox/GL 视图嵌入相机区域。接收器与命令队列运行在独立线程，页面继续复用产品登录、会话围栏和信令。原生帧不会被伪造成产品的健康视频准入，台架关闭控制。此入口和 `.node` 不进入现有桌面发布包，也不改变默认客户端。
+
+原生解码与探针共用 `cpp/tests/native_receiver_core.hpp`。macOS 嵌入模式为每路创建独立 GL display context，避免 VideoToolbox GL 分配器经公共管线发现并共用另一视频轨道的 drawable；仅有两路 draw 回调不能证明两个区域都显示。必须同时检查窗口截图和两路 NSView 的子视图挂载。绘制仍使用有界队列和 `sync=false`，未实现 Moonlight 的显示刷新调度。
+
+构建需要 GStreamer GL 和 Node-API 头文件：
+
+```sh
+cmake -S . -B build-mac-receiver \
+  -DMINE_TELEOP_BUILD_VEHICLE_RUNTIME=OFF \
+  -DMINE_TELEOP_BUILD_TESTS=ON -DMINE_TELEOP_BUILD_BENCH_PROBES=ON \
+  -DMINE_TELEOP_NODE_API_INCLUDE=/absolute/node/include
+cmake --build build-mac-receiver --target mine-teleop-native-video-layer mine-teleop-native-receiver-probe
+
+# 先按前文启动独立、control_enabled:false 的远端台架及本地控制服务。
+# MINE_TELEOP_DRIVER_PASSWORD 仅由环境传入，不写入证据。
+electron desktop/bench/main.cjs --mode native \
+  --url http://127.0.0.1:18081/ --config /absolute/safe-bench.yaml \
+  --probe /absolute/build-mac-receiver/mine-teleop-native-receiver-probe \
+  --addon /absolute/build-mac-receiver/mine-teleop-native-video-layer.node \
+  --output /absolute/new-run-directory --seconds 600
+```
+
+A 组仅将 `--mode` 换为 `browser`。支持 15–1800 秒；阶段分析要求超过 50 秒，正式对照使用 600 秒。五个等长阶段为：空闲、每 100 ms 约 8 ms DOM/CPU 工作、每 100 ms 约 40 ms 工作、每约秒 200 ms 主线程停顿、恢复空闲。实际工作时间/次数、长任务、可见性与焦点变化均保存，不只记录预设值。阶段边界前后各留 5 秒，阶段内部尾部不删除。三轮以 B→A→B 顺序观察前后漂移，不能替代随机化、多设备重复实验。
+
+`ui.json` 保存 RTCStats/视频呈现观察与相同的 UI 负载；`native.json` 保存独立线程逐帧证据；`metadata.json` 和 `events.jsonl` 保存版本、显示环境、异常和原生视图挂载。`web-content.png` 只截图网页合成结果，不包含原生 NSView，不能用它验收原生视频像素。
+
+```sh
+python3 scripts/test/hybrid_receiver_analyze.py /absolute/run-B1 /absolute/run-A /absolute/run-B2
+```
+
+原生新增时间点是 SRTP 解密后、jitterbuffer 输入处的 RTP 到达时间，按帧末包/PTS 关联到解码及 GL draw；这不是相机采集时间或内核收包时间。浏览器 `receiveTime→presentationTime` 结束于 compositor submission，且 JS 的 RVFC 在 UI 卡顿时会漏采样，必须报告覆盖率。两种端点并不完全相同，优先比较各客户端在 UI 负载前后的变化；不得将两列相减宣称相机到屏幕改善了同等毫秒数。原生 30 ms jitter target 和浏览器自适应缓冲仍保留差异，本实验比较整条接收媒体路径，不能把收益全部归因于渲染器。

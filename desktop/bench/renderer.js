@@ -1,0 +1,164 @@
+async ({mode, seconds}) => {
+  const bridge = window.mineTeleopBench;
+  const send = message => bridge.send(message).catch(error => { console.error(error); throw error; });
+  const data = window.hybridBench = {schema: 'hybrid-ui-ab-v1', mode, seconds, userAgent: navigator.userAgent,
+    display: {devicePixelRatio, width: screen.width, height: screen.height}, samples: [], tracks: [], phases: [], load: [], longTasks: [], visibility: [], errors: [], overflow: 0, start: null};
+  let stopped = false, started = false, collecting = false, timer, loadTimer, nativeScope, offerSeen = false;
+  let offeredIds = [], latestNative = null, lastNativeAt = 0, previousPhase = '';
+  let observer, frameIds = [];
+  const style = document.createElement('style');
+  style.textContent = '.visual-stage .camera>video{top:32px;height:calc(100% - 32px)} #bench-load{position:fixed;right:12px;bottom:8px;width:270px;height:100px;overflow:hidden;z-index:9999;background:#102030dd;color:#cfe7fa;font:11px monospace;padding:5px;pointer-events:none}';
+  document.head.append(style);
+  const loadPanel = document.createElement('div'); loadPanel.id = 'bench-load'; document.body.append(loadPanel);
+  const rows = Array.from({length: 100}, (_, i) => { const row = document.createElement('div'); row.textContent = `bench ${i}`; loadPanel.append(row); return row; });
+  const error = value => {
+    if (stopped) return;
+    data.errors.push(String(value));
+    if (started) stop(); else { stopped = true; void send({type: 'error', error: String(value)}); }
+  };
+  addEventListener('error', event => error(event.message));
+  addEventListener('unhandledrejection', event => error(event.reason));
+  const visibility = () => data.visibility.push({at: performance.now(), hidden: document.hidden, focused: document.hasFocus()});
+  document.addEventListener('visibilitychange', visibility); addEventListener('blur', visibility); addEventListener('focus', visibility); visibility();
+  // Only this opt-in, contained bench disables driving interaction. No product
+  // safety readiness is synthesized from native frame counters.
+  for (const id of ['estop', 'control-limits-open']) document.getElementById(id).disabled = true;
+  function layout() {
+    if (mode !== 'native' || !offeredIds.length || stopped) return;
+    const rects = offeredIds.map(id => {
+      const box = document.getElementById('camera-' + id), video = box?.querySelector('video');
+      if (!video) return {x: 0, y: 0, width: 0, height: 0, visible: false};
+      const r = video.getBoundingClientRect();
+      const modal = Boolean(document.querySelector('dialog[open]'));
+      return {x: r.x, y: r.y, width: r.width, height: r.height, visible: !document.hidden && !modal && r.width > 0 && r.height > 0};
+    });
+    void send({type: 'layout', rects});
+  }
+  if (mode === 'native') {
+    // The ordinary product console owns login, session fences and signaling.
+    // Only media offer/ICE handling is replaced in this injected bench script.
+    collectMetrics = async () => {};
+    const early = [];
+    addIce = async candidate => {
+      if (!nativeScope) { if (early.length >= 128) throw Error('native early ICE overflow'); early.push(candidate); return; }
+      if (controlLogic.iceCandidateMatchesOffer(candidate, mediaOfferScope))
+        await send({type: 'candidate', payload: {...candidate, media_negotiation_id: nativeScope.media_negotiation_id}});
+    };
+    startFromOffer = async offer => {
+      if (offerSeen) throw Error('native bench stops on renegotiation');
+      offerSeen = true;
+      mediaOfferScope = controlLogic.iceOfferScope(offer, true); mediaHasOffer = true;
+      nativeScope = {source_session_id: nativeControlSessionId,
+        source_control_session_generation: nativeControlSessionGeneration, media_negotiation_id: offer.media_negotiation_id};
+      offeredIds = (offer.media_tracks || []).map(t => t.camera_id);
+      if (offeredIds.length !== 2) throw Error('hybrid A/B requires exactly two video tracks');
+      remoteCameraIds = offeredIds; cameraView.configure(offeredIds);
+      for (const id of offeredIds) document.getElementById('camera-' + id).querySelector('video').setAttribute('aria-hidden', 'true');
+      if (emptyStage.isConnected) emptyStage.remove();
+      webrtcLabel.textContent = '原生视频台架 · 控制关闭';
+      await send({type: 'offer', payload: offer});
+    };
+    bridge.onEvent(event => {
+      if (stopped) return;
+      void (async () => {
+        if (event.type === 'answer') {
+          await post('/api/webrtc/answer', {...nativeScope, type: 'answer', sdp: event.sdp});
+          for (const candidate of early.splice(0)) await addIce(candidate);
+          layout();
+        } else if (event.type === 'candidate') {
+          await post('/api/webrtc/ice-candidate', {...nativeScope, candidate: event.candidate});
+        } else if (event.type === 'sample') {
+          latestNative = event.sample; lastNativeAt = performance.now();
+          for (const id of offeredIds) {
+            const placeholder = document.querySelector('#camera-' + CSS.escape(id) + ' .camera-placeholder');
+            if (placeholder) placeholder.hidden = true;
+          }
+          if (!started && event.sample.tracks.length === 2 && event.sample.tracks.every(t => t.drawn > 30)) await start();
+        }
+      })().catch(error);
+    });
+    addEventListener('resize', layout);
+    setInterval(layout, 500);
+  }
+  function phaseAt(elapsed) {
+    const ratio = elapsed / (seconds * 1000);
+    return ratio < .2 ? 'idle' : ratio < .4 ? 'ui8' : ratio < .6 ? 'ui40' : ratio < .8 ? 'stall200' : 'recovery';
+  }
+  function load() {
+    if (stopped) return;
+    const begin = performance.now(), elapsed = begin - data.start, phase = phaseAt(elapsed);
+    if (phase !== previousPhase) { data.phases.push({name: phase, at: begin}); previousPhase = phase; }
+    const index = Math.floor(elapsed / 100);
+    const work = phase === 'ui8' ? 8 : phase === 'ui40' ? 40 : phase === 'stall200' && index % 10 === 0 ? 200 : 0;
+    if (work) {
+      for (let i = 0; i < rows.length; i++) {
+        rows[i].textContent = `${phase} #${index} row ${i} ${(index * 17 + i) % 1000}`;
+        rows[i].style.color = (index + i) % 2 ? '#9ec5ef' : '#d2e4b3';
+      }
+      void loadPanel.offsetHeight;
+      while (performance.now() - begin < work) { /* deterministic UI-thread pressure */ }
+    }
+    loadPanel.firstChild.textContent = `${mode} ${phase} ${(elapsed / 1000).toFixed(0)} / ${seconds}s`;
+    if (data.load.length < 20000) data.load.push({at: begin, phase, requested_ms: work, actual_ms: performance.now() - begin}); else data.overflow++;
+  }
+  async function sample() {
+    if (stopped || collecting) return; collecting = true;
+    try {
+      if (!polling || !nativeControlSessionId) throw Error('media session stopped');
+      const sample = {at: performance.now(), phase: phaseAt(performance.now() - data.start)};
+      if (mode === 'browser') {
+        if (peer !== data.instance || peer.connectionState !== 'connected') throw Error('browser peer changed/disconnected');
+        const report = await peer.getStats();
+        sample.stats = [...report.values()].filter(s => ['inbound-rtp', 'codec', 'transport', 'candidate-pair', 'local-candidate', 'remote-candidate'].includes(s.type));
+        sample.metrics = structuredClone(latestMetrics);
+      } else {
+        if (performance.now() - lastNativeAt > 3000) throw Error('native sample stream stopped');
+        sample.native_clock_ms = latestNative.clock_ms;
+        sample.tracks = latestNative.tracks;
+      }
+      if (data.samples.length < 1900) data.samples.push(sample); else data.overflow++;
+    } catch (e) { error(e); }
+    finally { collecting = false; }
+  }
+  async function start() {
+    if (started) return; started = true;
+    data.start = performance.now(); data.wallStart = Date.now(); data.instance = peer;
+    data.nativeStart = await send({type: 'ready', at: data.start});
+    if (mode === 'browser') {
+      for (const video of [...document.querySelectorAll('video')].filter(v => v.srcObject && v.videoWidth)) {
+        const rect = video.getBoundingClientRect();
+        const track = {camera: video.closest('.camera').dataset.cameraId, width: video.videoWidth, height: video.videoHeight,
+          displayedWidth: rect.width, displayedHeight: rect.height, frames: []}; data.tracks.push(track);
+        const frame = (now, m) => {
+          if (stopped) return;
+          if (track.frames.length < 60000) track.frames.push({now, presentationTime: m.presentationTime,
+            expectedDisplayTime: m.expectedDisplayTime, presentedFrames: m.presentedFrames, mediaTime: m.mediaTime,
+            receiveTime: m.receiveTime, rtpTimestamp: m.rtpTimestamp, processingDuration: m.processingDuration}); else data.overflow++;
+          video.requestVideoFrameCallback(frame);
+        };
+        frameIds.push([video, video.requestVideoFrameCallback(frame)]);
+      }
+    }
+    observer = new PerformanceObserver(entries => {
+      for (const entry of entries.getEntries()) if (data.longTasks.length < 20000) data.longTasks.push([entry.startTime, entry.duration]); else data.overflow++;
+    });
+    observer.observe({type: 'longtask', buffered: false});
+    await sample(); load(); timer = setInterval(sample, 1000); loadTimer = setInterval(load, 100);
+    setTimeout(stop, seconds * 1000);
+  }
+  async function stop() {
+    if (stopped) return; stopped = true;
+    data.end = performance.now(); visibility();
+    clearInterval(timer); clearInterval(loadTimer); observer?.disconnect();
+    delete data.instance;
+    await send({type: 'complete', data});
+  }
+  window.stopHybridBench = reason => { if (reason) data.errors.push(String(reason)); return stop(); };
+  if (mode === 'browser') {
+    const ready = setInterval(() => {
+      const videos = [...document.querySelectorAll('video')].filter(v => v.srcObject && v.videoWidth && !v.paused);
+      if (videos.length === 2 && peer?.connectionState === 'connected') { clearInterval(ready); void start().catch(error); }
+    }, 250);
+  }
+  return {installed: true, mode, seconds};
+}
