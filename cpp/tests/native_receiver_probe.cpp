@@ -1,5 +1,5 @@
 // Opt-in media-only bench. Reuses the product sender and session fencing, but
-// never creates a vehicle control service, sends input or claims presentation.
+// never creates a vehicle control service, sends input or claims scan-out.
 #define GST_USE_UNSTABLE_API
 #include "mine_teleop/server.hpp"
 #include <gst/app/gstappsink.h>
@@ -7,7 +7,12 @@
 #include <gst/sdp/sdp.h>
 #include <gst/rtp/gstrtpbuffer.h>
 #include <gst/webrtc/webrtc.h>
-#include <nice/agent.h>
+#include <agent.h>  // libnice's pkg-config include directory is include/nice
+#ifdef __APPLE__
+#include <gst/gstmacos.h>
+#endif
+#include <cstdlib>
+#include <functional>
 
 #include <algorithm>
 #include <atomic>
@@ -32,9 +37,9 @@ using namespace std::chrono_literals;
 double now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); }
 
 struct Options {
-  std::string config, output, decoder{"avdec_h264"};
+  std::string config, output, signaling_url, driver_id{"native-bench"}, decoder{"avdec_h264"};
   int seconds{30}, jitter_ms{30}, stall_ms{0};
-  bool validate_only{false};
+  bool validate_only{false}, display{false};
 };
 int integer(const std::string& text, int minimum, int maximum) {
   int result{};
@@ -48,18 +53,35 @@ Options options(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     const std::string flag = argv[i];
     if (flag == "--validate-only") { result.validate_only = true; continue; }
+    if (flag == "--display") { result.display = true; continue; }
     if (i + 1 >= argc) throw std::invalid_argument("missing argument: " + flag);
     const std::string value = argv[++i];
     if (flag == "--config") result.config = value;
     else if (flag == "--output") result.output = value;
+    else if (flag == "--signaling-url") result.signaling_url = value;
+    else if (flag == "--driver-id") result.driver_id = value;
     else if (flag == "--seconds") result.seconds = integer(value, 5, 300);
     else if (flag == "--jitter-ms") result.jitter_ms = integer(value, 0, 200);
     else if (flag == "--consumer-stall-ms") result.stall_ms = integer(value, 0, 500);
-    else if (flag == "--decoder" && (value == "avdec_h264" || value == "nvv4l2decoder")) result.decoder = value;
+    else if (flag == "--decoder" && (value == "avdec_h264" || value == "nvv4l2decoder" || value == "vtdec_hw")) result.decoder = value;
     else throw std::invalid_argument("unknown option: " + flag);
   }
   if (result.config.empty()) throw std::invalid_argument("--config is required");
   if (!result.validate_only && result.output.empty()) throw std::invalid_argument("--output is required");
+  // Remote mode uses a loopback signaling tunnel; media still uses direct ICE.
+  if (!result.signaling_url.empty()) {
+    const std::string prefix = "http://127.0.0.1:";
+    if (!result.signaling_url.starts_with(prefix))
+      throw std::invalid_argument("--signaling-url must use a loopback HTTP tunnel");
+    // Accept only an origin with a numeric port: no userinfo, alternate host,
+    // path or fragment that could redirect bench credentials elsewhere.
+    static_cast<void>(integer(result.signaling_url.substr(prefix.size()), 1, 65535));
+  }
+#ifndef MINE_TELEOP_PROBE_EMBEDDED_SENDER
+  if (!result.validate_only && result.signaling_url.empty())
+    throw std::invalid_argument("this build requires --signaling-url (no embedded sender)");
+#endif
+  if (result.display && result.stall_ms) throw std::invalid_argument("display mode does not inject consumer stalls");
   return result;
 }
 void validate(const VehicleConfig& config) {
@@ -161,6 +183,8 @@ struct Track {
   std::unordered_set<std::uint64_t> rtp_timestamps, decoded_pts;
   std::uint64_t rtp_packets{}, decoded_buffers{}, duplicate_decoded_pts{}, invalid_decoded_pts{}, identity_overflow{};
   Samples decode_ms, decoded_gap_ms, consumed_gap_ms, consume_wait_ms;
+  Json decoded_events = Json::array(), drawn_events = Json::array();
+  GstClockTime last_draw_pts{GST_CLOCK_TIME_NONE};
   std::uint64_t decoded{}, consumed{}, unmatched_decode{}, unmatched_consume{};
   double first{}, last_decoded{}, last_consumed{};
   int stalls{};
@@ -208,10 +232,31 @@ struct Track {
       else ++self.unmatched_decode;
       remember(self.decoded_at, GST_BUFFER_PTS(buffer), now);
       if (self.last_decoded > 0) self.decoded_gap_ms.add(now - self.last_decoded); else self.first = now;
+      if (self.decoded_events.size() < 131072) self.decoded_events.push_back({pts, now});
       self.last_decoded = now;
       ++self.decoded;
     }
     return GST_PAD_PROBE_OK;
+  }
+  // client-draw runs when GL is about to draw a sample, not at scan-out.
+  // Returning FALSE preserves glimagesink's default renderer.
+  static gboolean draw(GstElement*, gpointer, GstSample* sample, gpointer data) {
+    auto& self = *static_cast<Track*>(data);
+    auto* buffer = sample ? gst_sample_get_buffer(sample) : nullptr;
+    if (buffer) {
+      std::lock_guard lock(self.mutex);
+      const auto pts = GST_BUFFER_PTS(buffer);
+      if (GST_CLOCK_TIME_IS_VALID(pts) && pts != self.last_draw_pts) {
+        self.last_draw_pts = pts;
+        if (self.drawn_events.size() < 131072) self.drawn_events.push_back({pts, now_ms()});
+      }
+    }
+    return FALSE;
+  }
+  Json counters() {
+    std::lock_guard lock(mutex);
+    return {{"pad", pad}, {"decoded", decoded}, {"consumed", consumed}, {"drawn", drawn_events.size()},
+            {"decode_count", decode_ms.count}, {"decode_sum_ms", decode_ms.sum}};
   }
   void start(int stall_ms) {
     consumer = std::jthread([this, stall_ms](std::stop_token stop) {
@@ -248,6 +293,7 @@ struct Track {
             {"decoded_fps", decoded > 1 && last_decoded > first ? (static_cast<double>(decoded - 1) * 1000 / (last_decoded - first)) : 0},
             {"depay_to_decode", decode_ms.json()}, {"decoded_frame_gap", decoded_gap_ms.json()},
             {"consumed_frame_gap", consumed_gap_ms.json()}, {"decode_to_consume", consume_wait_ms.json()},
+            {"decoded_events_pts_ns_clock_ms", decoded_events}, {"draw_events_pts_ns_clock_ms", drawn_events},
             {"unmatched_decode_pts", unmatched_decode}, {"unmatched_consume_pts", unmatched_consume}};
   }
 };
@@ -332,6 +378,12 @@ class Receiver {
     auto result = request([&](GstPromise* promise) { g_signal_emit_by_name(peer_, "get-stats", nullptr, promise); });
     return structure_json(result.get());
   }
+  Json counters() {
+    Json result = Json::array();
+    std::lock_guard lock(mutex_);
+    for (auto& track : tracks_) result.push_back(track->counters());
+    return result;
+  }
   Json report() {
     Json tracks = Json::array();
     std::lock_guard lock(mutex_);
@@ -339,7 +391,8 @@ class Receiver {
     return {{"tracks", tracks}, {"selected_pair", selected_pair_}, {"selected_pair_changes", pair_changes_},
             {"local_candidates", local_candidates_}, {"jitter_target_ms", options_.jitter_ms},
             {"appsink_max_buffers", 1}, {"appsink_drop", true}, {"sink_sync", false}, {"decoder", options_.decoder},
-            {"display_presented", false}, {"control_tested", false}};
+            {"display_presented", false}, {"display_requested", options_.display},
+            {"display_measurement", "GL draw callback is not scan-out"}, {"control_tested", false}};
   }
  private:
   static const char* candidate_type(NiceCandidateType type) {
@@ -356,7 +409,9 @@ class Receiver {
     if (!local || !remote) return;
     std::lock_guard lock(self.mutex_);
     ++self.pair_changes_;
-    self.selected_pair_ = {{"source", "libnice-new-selected-pair-full"}, {"stream", stream}, {"component", component},
+    char local_ip[NICE_ADDRESS_STRING_LEN]{}, remote_ip[NICE_ADDRESS_STRING_LEN]{};
+    nice_address_to_string(&local->addr, local_ip); nice_address_to_string(&remote->addr, remote_ip);
+    self.selected_pair_ = {{"local_address", local_ip}, {"remote_address", remote_ip}, {"source", "libnice-new-selected-pair-full"}, {"stream", stream}, {"component", component},
         {"local_type", candidate_type(local->type)}, {"remote_type", candidate_type(remote->type)},
         {"local_transport", local->transport == NICE_CANDIDATE_TRANSPORT_UDP ? "udp" : "tcp"},
         {"remote_transport", remote->transport == NICE_CANDIDATE_TRANSPORT_UDP ? "udp" : "tcp"}};
@@ -380,9 +435,13 @@ class Receiver {
     if (tracks_.size() >= 8) throw std::runtime_error("too many receiver tracks");
     GError* error = nullptr;
     const auto decoder = options_.decoder == "nvv4l2decoder"
-        ? "nvv4l2decoder name=decoder disable-dpb=true" : "avdec_h264 name=decoder max-threads=2";
-    const auto description = std::string("rtph264depay name=depay wait-for-keyframe=true request-keyframe=true ! h264parse ! ") +
+        ? "nvv4l2decoder name=decoder disable-dpb=true" : options_.decoder == "vtdec_hw"
+        ? "vtdec_hw name=decoder" : "avdec_h264 name=decoder max-threads=2";
+    auto description = std::string("rtph264depay name=depay wait-for-keyframe=true request-keyframe=true ! h264parse ! ") +
+        decoder + " ! tee name=raw raw. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! appsink name=out sync=false max-buffers=1 drop=true wait-on-eos=false";
+    if (!options_.display) description = std::string("rtph264depay name=depay wait-for-keyframe=true request-keyframe=true ! h264parse ! ") +
         decoder + " ! appsink name=out sync=false max-buffers=1 drop=true wait-on-eos=false";
+    if (options_.display) description += " raw. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! glimagesink name=display sync=false";
     auto* bin = gst_parse_bin_from_description(description.c_str(), TRUE, &error);
     if (error || !bin) {
       const std::string message = error ? error->message : "decode bin unavailable";
@@ -392,6 +451,11 @@ class Receiver {
     auto track = std::make_unique<Track>();
     track->pad = GST_PAD_NAME(pad);
     track->sink = gst_bin_get_by_name(GST_BIN(bin), "out");
+    if (options_.display) {
+      auto* display = gst_bin_get_by_name(GST_BIN(bin), "display");
+      g_signal_connect(display, "client-draw", G_CALLBACK(Track::draw), track.get());
+      gst_object_unref(display);
+    }
     for (const auto& [name, callback] : {std::pair{"depay", Track::compressed}, std::pair{"decoder", Track::raw}}) {
       auto* element = gst_bin_get_by_name(GST_BIN(bin), name);
       auto* source = gst_element_get_static_pad(element, "src");
@@ -421,6 +485,65 @@ class Receiver {
   Json selected_pair_;
 };
 
+void receive(const Options& opts, const std::string& vehicle_id, DriverConsoleRuntime& driver,
+             Receiver& receiver, Json& result, const std::function<bool()>& done, bool embedded) {
+  try {
+    static_cast<void>(driver.login());
+    bool online = false;
+    const auto deadline = Clock::now() + 4s;
+    while (!online && Clock::now() < deadline && !done()) {
+      const auto vehicles = driver.vehicles();
+      for (const auto& item : vehicles.at("vehicles"))
+        if (item.value("vehicle_id", "") == vehicle_id && item.value("online", false)) online = true;
+      if (!online) std::this_thread::sleep_for(20ms);
+    }
+    if (!online) throw std::runtime_error("bench vehicle registration timed out");
+    const auto connected = driver.connect(vehicle_id, "native-media-probe");
+    static_cast<void>(driver.send_media_capabilities({{"codecs", {"h264"}}}));
+    Json scope{{"source_session_id", connected.at("session_id")},
+               {"source_control_session_generation", connected.at("control_session_generation")}};
+    const auto timeout = Clock::now() + std::chrono::seconds(opts.seconds + (embedded ? 15 : 0));
+    std::string negotiation;
+    std::deque<Json> early_candidates;
+    auto next_stats = Clock::now();
+    result["measurement_start_clock_ms"] = now_ms();
+    while (!done() && Clock::now() < timeout) {
+      receiver.check();
+      const auto polled = driver.poll_signaling();
+      for (const auto& message : polled.at("messages")) {
+        const auto type = message.value("type", "");
+        const auto payload = message.value("payload", Json::object());
+        if (type == "webrtc_offer") {
+          negotiation = payload.at("media_negotiation_id").get<std::string>();
+          auto answer = scope;
+          answer.update({{"type", "answer"}, {"sdp", receiver.answer(payload)}, {"media_negotiation_id", negotiation}});
+          static_cast<void>(driver.send_webrtc_answer(answer));
+          for (const auto& candidate : early_candidates) receiver.candidate(candidate);
+          early_candidates.clear();
+        } else if (type == "ice_candidate") {
+          if (!negotiation.empty()) receiver.candidate(payload);
+          else if (early_candidates.size() < 256) early_candidates.push_back(payload);
+          else throw std::runtime_error("early candidate queue overflow");
+        }
+      }
+      for (const auto& candidate : receiver.candidates()) {
+        auto outgoing = scope;
+        outgoing.update({{"candidate", candidate}, {"media_negotiation_id", negotiation}});
+        static_cast<void>(driver.send_webrtc_ice_candidate(outgoing));
+      }
+      // Preserve the selected pair while the sender is still connected.
+      if (!negotiation.empty() && Clock::now() >= next_stats) {
+        result["webrtc_stats"] = receiver.stats();
+        result["samples"].push_back({{"clock_ms", now_ms()}, {"tracks", receiver.counters()},
+                                      {"webrtc", result["webrtc_stats"]}});
+        next_stats = Clock::now() + 1s;
+      }
+    }
+    if (embedded && !done()) throw std::runtime_error("bench duration exceeded");
+  } catch (const std::exception& error) { result["error"] = error.what(); }
+}
+
+#ifdef MINE_TELEOP_PROBE_EMBEDDED_SENDER
 Json run(const Options& opts, VehicleConfig config) {
   const std::string password = random_token(), device_token = random_token();
   SignalingServerConfig signaling;
@@ -454,60 +577,10 @@ Json run(const Options& opts, VehicleConfig config) {
     vehicle_done = true;
   });
   Json result{{"schema", "native-receiver-bench-v1"}, {"runtime", gst_version_string()},
-              {"duration_requested_s", opts.seconds}, {"scope", "same-host WebRTC H264; decoder/consumer only; no display, input, CAN or WAN acceptance"},
+              {"duration_requested_s", opts.seconds}, {"scope", "same-host WebRTC H264; decoder/consumer and optional GL draw; no scan-out, input, CAN or WAN acceptance"},
               {"control_enabled", false}, {"adapter", "mock"}, {"external_signaling", false},
               {"stun_endpoint", "loopback-discard:9"}, {"turn_configured", false}};
-  try {
-    static_cast<void>(driver.login());
-    bool online = false;
-    const auto deadline = Clock::now() + 4s;
-    while (!online && Clock::now() < deadline && !vehicle_done) {
-      const auto vehicles = driver.vehicles();
-      for (const auto& item : vehicles.at("vehicles"))
-        if (item.value("vehicle_id", "") == config.vehicle_id && item.value("online", false)) online = true;
-      if (!online) std::this_thread::sleep_for(20ms);
-    }
-    if (!online) throw std::runtime_error("bench vehicle registration timed out");
-    const auto connected = driver.connect(config.vehicle_id, "native-media-probe");
-    static_cast<void>(driver.send_media_capabilities({{"codecs", {"h264"}}}));
-    Json scope{{"source_session_id", connected.at("session_id")},
-               {"source_control_session_generation", connected.at("control_session_generation")}};
-    const auto timeout = Clock::now() + std::chrono::seconds(opts.seconds + 15);
-    std::string negotiation;
-    std::deque<Json> early_candidates;
-    auto next_stats = Clock::now();
-    while (!vehicle_done && Clock::now() < timeout) {
-      receiver.check();
-      const auto polled = driver.poll_signaling();
-      for (const auto& message : polled.at("messages")) {
-        const auto type = message.value("type", "");
-        const auto payload = message.value("payload", Json::object());
-        if (type == "webrtc_offer") {
-          negotiation = payload.at("media_negotiation_id").get<std::string>();
-          auto answer = scope;
-          answer.update({{"type", "answer"}, {"sdp", receiver.answer(payload)}, {"media_negotiation_id", negotiation}});
-          static_cast<void>(driver.send_webrtc_answer(answer));
-          for (const auto& candidate : early_candidates) receiver.candidate(candidate);
-          early_candidates.clear();
-        } else if (type == "ice_candidate") {
-          if (!negotiation.empty()) receiver.candidate(payload);
-          else if (early_candidates.size() < 256) early_candidates.push_back(payload);
-          else throw std::runtime_error("early candidate queue overflow");
-        }
-      }
-      for (const auto& candidate : receiver.candidates()) {
-        auto outgoing = scope;
-        outgoing.update({{"candidate", candidate}, {"media_negotiation_id", negotiation}});
-        static_cast<void>(driver.send_webrtc_ice_candidate(outgoing));
-      }
-      // Preserve the selected pair while the sender is still connected.
-      if (!negotiation.empty() && Clock::now() >= next_stats) {
-        result["webrtc_stats"] = receiver.stats();
-        next_stats = Clock::now() + 1s;
-      }
-    }
-    if (!vehicle_done) throw std::runtime_error("bench duration exceeded");
-  } catch (const std::exception& error) { result["error"] = error.what(); }
+  receive(opts, config.vehicle_id, driver, receiver, result, [&] { return vehicle_done.load(); }, true);
   sender.request_stop(); sender.join();
   receiver.stop();
   result["receiver"] = receiver.report();
@@ -523,6 +596,36 @@ Json run(const Options& opts, VehicleConfig config) {
   result["passed"] = !result.contains("error") && vehicle_error.empty() &&
       vehicle_result.value("passed", false) && frames && direct_udp;
   result["pass_criteria"] = "sender acceptance, >30 decoded/consumed frames per configured camera, observed host/UDP pair; not a display or latency SLA";
+  try { static_cast<void>(driver.end_session("native_receiver_probe_finished")); } catch (...) {}
+  return result;
+}
+
+#endif
+
+Json run_remote(const Options& opts, const VehicleConfig& config) {
+  const auto* password = std::getenv("MINE_TELEOP_DRIVER_PASSWORD");
+  if (!password || !*password) throw std::invalid_argument("MINE_TELEOP_DRIVER_PASSWORD is required");
+  DriverConfig driver_config;
+  driver_config.driver_id = opts.driver_id; driver_config.signaling_url = opts.signaling_url;
+  driver_config.browser_event_log_path.clear();
+  DriverConsoleRuntime driver(driver_config, config.vehicle_id, password);
+  Receiver receiver(opts);
+  receiver.start();
+  Json result{{"schema", "native-receiver-remote-v1"}, {"runtime", gst_version_string()},
+              {"duration_requested_s", opts.seconds}, {"scope", "receive-only bench; sender containment must be verified separately"},
+              {"external_signaling", true}, {"control_tested", false}};
+  receive(opts, config.vehicle_id, driver, receiver, result, [] { return false; }, false);
+  receiver.stop();
+  result["receiver"] = receiver.report();
+  const auto& pair = result["receiver"]["selected_pair"];
+  bool frames = result["receiver"]["tracks"].size() == config.enabled_cameras().size();
+  for (const auto& track : result["receiver"]["tracks"])
+    frames = frames && track.at("decoded_frames").get<int>() > 30 &&
+        (!opts.display || track.at("draw_events_pts_ns_clock_ms").size() > 30);
+  result["direct_host_udp_observed"] = pair.is_object() && pair.value("local_type", "") == "host" &&
+      pair.value("remote_type", "") == "host" && pair.value("local_transport", "") == "udp" && pair.value("remote_transport", "") == "udp";
+  result["passed"] = !result.contains("error") && frames && result["direct_host_udp_observed"].get<bool>();
+  result["pass_criteria"] = "configured tracks decoded (and GL drawn if requested), host/UDP; no latency or scan-out SLA";
   try { static_cast<void>(driver.end_session("native_receiver_probe_finished")); } catch (...) {}
   return result;
 }
@@ -565,7 +668,7 @@ bool pts_self_test() {
 }
 }  // namespace
 
-int main(int argc, char** argv) {
+int probe_main(int argc, char** argv, void*) {
   try {
     if (argc == 2 && std::string(argv[1]) == "--self-test") {
       gst_init(nullptr, nullptr);
@@ -574,9 +677,11 @@ int main(int argc, char** argv) {
       return passed ? 0 : 1;
     }
     if (argc == 2 && std::string(argv[1]) == "--help") {
-      std::cout << "Media-only same-host WebRTC bench; no control or presentation acceptance.\n"
+      std::cout << "Media-only WebRTC bench; no control or scan-out acceptance.\n"
                    "--config FILE --output NEW_FILE [--seconds 5..300] [--jitter-ms 0..200]\n"
-                   "[--decoder avdec_h264|nvv4l2decoder] [--consumer-stall-ms 0..500]\n"
+                   "[--decoder avdec_h264|nvv4l2decoder|vtdec_hw] [--consumer-stall-ms 0..500]\n"
+                   "[--signaling-url http://127.0.0.1:PORT --driver-id ID] [--display]\n"
+                   "Remote mode requires MINE_TELEOP_DRIVER_PASSWORD and a separately contained sender.\n"
                    "--config FILE --validate-only checks containment without starting a runtime.\n";
       return 0;
     }
@@ -590,7 +695,12 @@ int main(int argc, char** argv) {
     if (!output) throw std::runtime_error("could not create output file");
     gst_init(nullptr, nullptr);
     Json result;
-    try { result = run(opts, config); }
+    try {
+      if (!opts.signaling_url.empty()) result = run_remote(opts, config);
+#ifdef MINE_TELEOP_PROBE_EMBEDDED_SENDER
+      else result = run(opts, config);
+#endif
+    }
     catch (const std::exception& error) {
       result = {{"schema", "native-receiver-bench-v1"}, {"passed", false}, {"startup_error", error.what()}};
     }
@@ -599,4 +709,13 @@ int main(int argc, char** argv) {
     std::cout << Json{{"event", "native_receiver_probe_complete"}, {"passed", result.at("passed")}, {"output", opts.output}}.dump() << '\n';
     return result.at("passed").get<bool>() ? 0 : 1;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+}
+
+int main(int argc, char** argv) {
+#ifdef __APPLE__
+  // Cocoa/GL must own the main thread; GStreamer runs the probe on a worker.
+  return gst_macos_main(probe_main, argc, argv, nullptr);
+#else
+  return probe_main(argc, argv, nullptr);
+#endif
 }

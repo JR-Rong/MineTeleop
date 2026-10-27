@@ -30,8 +30,16 @@ with tempfile.TemporaryDirectory(prefix='native-receiver-guard-') as directory:
     config.write_text(safe)
     evidence = pathlib.Path(directory) / 'existing.json'
     evidence.write_text('preserve-me')
-    result = subprocess.run([binary, '--config', str(config), '--output', str(evidence)],
+    result = subprocess.run([binary, '--config', str(config), '--signaling-url', 'http://127.0.0.1:1', '--output', str(evidence)],
                             capture_output=True, text=True, timeout=3)
     assert result.returncode != 0 and 'new file' in result.stderr
     assert evidence.read_text() == 'preserve-me'
-print('containment: 8 configurations and existing evidence checked')
+    for args, message in [
+        (['--signaling-url', 'https://example.com'], 'loopback'),
+        (['--signaling-url', 'http://127.0.0.1:1@example.com'], 'numeric'),
+        (['--display', '--consumer-stall-ms', '200'], 'does not inject'),
+    ]:
+        result = subprocess.run([binary, '--config', str(config), '--validate-only', *args],
+                                capture_output=True, text=True, timeout=3)
+        assert result.returncode != 0 and message in result.stderr
+print('containment: 8 configurations, 3 option guards and existing evidence checked')
