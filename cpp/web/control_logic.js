@@ -1462,6 +1462,29 @@
       pairs: pairs.slice(0, 16), pairs_truncated: pairs.length > 16};
   }
 
+  // RTC delay totals are cumulative. Their lifetime averages conceal short
+  // stalls, so keep a separate interval view without changing safety decisions.
+  function receiverIntervalStats(stats, previous) {
+    const counters = {id:stats.id,ssrc:stats.ssrc,timestamp:stats.timestamp,
+      framesDecoded:stats.framesDecoded,totalDecodeTime:stats.totalDecodeTime,
+      totalProcessingDelay:stats.totalProcessingDelay,
+      jitterBufferEmittedCount:stats.jitterBufferEmittedCount,
+      jitterBufferDelay:stats.jitterBufferDelay,jitterBufferTargetDelay:stats.jitterBufferTargetDelay};
+    const current = previous && stats.id === previous.id && stats.ssrc === previous.ssrc &&
+      Number.isFinite(stats.timestamp) && Number.isFinite(previous.timestamp) && stats.timestamp > previous.timestamp;
+    const delta = key => current && Number.isFinite(stats[key]) && Number.isFinite(previous[key]) &&
+      previous[key] >= 0 && stats[key] >= previous[key] ? stats[key] - previous[key] : null;
+    const average = (total, count) => {
+      const numerator = delta(total), denominator = delta(count);
+      return numerator !== null && denominator !== null && denominator > 0 ? numerator * 1000 / denominator : null;
+    };
+    return {counters,framesDecoded:delta('framesDecoded'),
+      decodeMs:average('totalDecodeTime','framesDecoded'),
+      processingMs:average('totalProcessingDelay','framesDecoded'),
+      jitterMs:average('jitterBufferDelay','jitterBufferEmittedCount'),
+      targetJitterMs:average('jitterBufferTargetDelay','jitterBufferEmittedCount')};
+  }
+
   function receiverLatency(stats, captureEncodeMs, roundTripSeconds) {
     function average(total, count) {
       return Number.isFinite(total) && total >= 0 && Number.isFinite(count) && count > 0
@@ -1743,6 +1766,7 @@
     controlPrepareDeadlineMs,
     createLatestControlWriteQueue,
     receiverLatency,
+    receiverIntervalStats,
     iceConnectivity,
     iceCandidateSummary,
     iceNetworkPath,
