@@ -59,7 +59,20 @@ app.on('window-all-closed', () => { void finish('window closed before completion
 app.on('before-quit', event => { if (!closing) { event.preventDefault(); void finish('application quit before completion'); } });
 app.whenReady().then(async () => {
   const origin = new URL(args.url).origin;
-  session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  const allowLan = (contents, permission, requestingUrl) => {
+    try {
+      return contents === window?.webContents && new URL(requestingUrl).origin === origin &&
+        ['local-network', 'local-network-access', 'loopback-network'].includes(permission);
+    } catch { return false; }
+  };
+  // This loopback bench explicitly connects to Orin. Denying Chromium's LAN
+  // permission blocks UDP and can leave an unintended ICE-TCP comparison.
+  session.defaultSession.setPermissionCheckHandler((contents, permission, requestingOrigin) =>
+    allowLan(contents, permission, requestingOrigin));
+  session.defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => {
+    const allowed = allowLan(contents, permission, details.requestingUrl);
+    log({event: 'permission_request', permission, allowed}); callback(allowed);
+  });
   window = new BrowserWindow({title: 'MineTeleop 媒体台架（控制关闭）', width: 1500, height: 960, show: false,
     webPreferences: {preload: path.join(__dirname, 'preload.cjs'), nodeIntegration: false, contextIsolation: true,
       sandbox: true, webSecurity: true, backgroundThrottling: true, spellcheck: false}});
