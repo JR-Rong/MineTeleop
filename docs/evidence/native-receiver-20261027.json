@@ -1,0 +1,639 @@
+{
+  "base_pr": 25,
+  "base_branch": "rjr/cx/orin-isx031-cpu",
+  "base_commit": "05bb17d2add2360dffc0557a61170eab7e5180c9",
+  "implementation_commit": "a2443ddf4eeb23453e18edbdf3c7be3d18e2ebec",
+  "probe_source_sha256": "e1a4fa1dffd0bc6414e0b4598508ed657847136a29f135e32d4182cc7101ce81",
+  "probe_binary_sha256": "fce1aef4fa2cd84513583ebc4f42eb7c4e0a017e92e9bdd5f111866d5a1ad9c3",
+  "environment": {
+    "board": "Jetson Orin Nano / HCK-C1202",
+    "l4t": "R36.5.0",
+    "kernel": "5.15.185-tegra PREEMPT_RT",
+    "gstreamer": "1.20.3",
+    "libnice": "0.1.18",
+    "power_mode_observed": "25W; unchanged by this task",
+    "sender": "CPU x264enc",
+    "receiver": "nvv4l2decoder, disable-dpb=true, NVMM output not mapped to CPU",
+    "camera_input": "2 x ISX031 1920x1536 UYVY 30fps",
+    "stream_output": "2 x 960x768 H264 30fps 2500kbps",
+    "topology": "same Orin host, loopback signaling, actual host/UDP ICE pair; no WAN or NAT acceptance"
+  },
+  "safety": {
+    "control_enabled": false,
+    "adapter": "mock",
+    "commissioning_mode": "bench",
+    "max_speed_kph": 0,
+    "recording": false,
+    "upload": false,
+    "can_before_and_after": "DOWN",
+    "camera_owners_after": []
+  },
+  "methodology": {
+    "duration_requested_seconds": 30,
+    "warmup_excluded": false,
+    "receiver_window": "first receive through sender teardown; not aligned with sender pre-stop snapshot",
+    "quantiles": "per decoded PTS / consumed sample, monotonic local times; not display or glass-to-glass latency",
+    "competitor_sampling": "once per second; abort own probe on named FrameForge/ncu process; final three runs observed none",
+    "counter_warning": "RTP timestamp and decoded PTS counts can disagree. Different PTS alone does not prove a new camera frame. No throughput-gain claim for any run with excess decoded PTS.",
+    "consumer_pause": "200ms about once per second; pause count includes startup/teardown periods; not a network fault"
+  },
+  "cases": [
+    {
+      "id": "orin-isx031-baseline-133312",
+      "raw_report_sha256": "b69f99d7ddb37b6a65e09043052efcbeb67c393931cb1a19aea87d352b6860ce",
+      "execution": {
+        "started_at_utc": "2026-10-27T13:33:12Z",
+        "can_state": "can0             DOWN           <NOARP,ECHO>",
+        "competing_process_observations": [],
+        "case": "baseline",
+        "exit_code": 0,
+        "elapsed_seconds": 37.6887900979782
+      },
+      "media_smoke_passed": true,
+      "frame_identity_warning": false,
+      "performance_gain_claim_supported": false,
+      "receiver": {
+        "appsink_drop": true,
+        "appsink_max_buffers": 1,
+        "control_tested": false,
+        "decoder": "nvv4l2decoder",
+        "display_presented": false,
+        "jitter_target_ms": 30,
+        "local_candidates": 6,
+        "selected_pair": {
+          "component": 1,
+          "local_transport": "udp",
+          "local_type": "host",
+          "remote_transport": "udp",
+          "remote_type": "host",
+          "source": "libnice-new-selected-pair-full",
+          "stream": 1
+        },
+        "selected_pair_changes": 1,
+        "sink_sync": false,
+        "tracks": [
+          {
+            "consumed_frame_gap": {
+              "count": 842,
+              "max_ms": 49.022619009017944,
+              "mean_ms": 33.00965735036659,
+              "omitted": 0,
+              "p50_ms": 33.62326800823212,
+              "p95_ms": 44.55544200539589,
+              "p99_ms": 47.226851999759674
+            },
+            "consumed_frames": 843,
+            "decode_to_consume": {
+              "count": 843,
+              "max_ms": 5.222846984863281,
+              "mean_ms": 0.06567812690672642,
+              "omitted": 0,
+              "p50_ms": 0.05549001693725586,
+              "p95_ms": 0.08627501130104065,
+              "p99_ms": 0.14266100525856018
+            },
+            "decoded_buffers": 847,
+            "decoded_fps": 30.288522301431478,
+            "decoded_frame_gap": {
+              "count": 842,
+              "max_ms": 49.021435022354126,
+              "mean_ms": 33.01580678145987,
+              "omitted": 0,
+              "p50_ms": 33.62685200572014,
+              "p95_ms": 44.566033989191055,
+              "p99_ms": 47.21994000673294
+            },
+            "decoded_frames": 843,
+            "decoded_unique_pts": 843,
+            "depay_to_decode": {
+              "count": 843,
+              "max_ms": 39.73395100235939,
+              "mean_ms": 9.684369144137078,
+              "omitted": 0,
+              "p50_ms": 8.199387013912201,
+              "p95_ms": 14.840038001537323,
+              "p99_ms": 16.691582024097443
+            },
+            "duplicate_decoded_pts": 4,
+            "identity_observation_overflow": 0,
+            "injected_consumer_stalls": 0,
+            "invalid_decoded_pts": 0,
+            "not_consumed_frames": 0,
+            "pad": "src_0",
+            "rtp_packets": 10027,
+            "rtp_unique_frame_timestamps": 843,
+            "unmatched_consume_pts": 0,
+            "unmatched_decode_pts": 0,
+            "decoded_pts_exceed_unique_rtp_by": 0
+          },
+          {
+            "consumed_frame_gap": {
+              "count": 841,
+              "max_ms": 53.0749029815197,
+              "mean_ms": 33.05742758980262,
+              "omitted": 0,
+              "p50_ms": 33.779752999544144,
+              "p95_ms": 44.95711901783943,
+              "p99_ms": 47.84927099943161
+            },
+            "consumed_frames": 842,
+            "decode_to_consume": {
+              "count": 842,
+              "max_ms": 0.6925009787082672,
+              "mean_ms": 0.058668545723810896,
+              "omitted": 0,
+              "p50_ms": 0.0548500120639801,
+              "p95_ms": 0.08064201474189758,
+              "p99_ms": 0.13930001854896545
+            },
+            "decoded_buffers": 844,
+            "decoded_fps": 30.28564759367157,
+            "decoded_frame_gap": {
+              "count": 842,
+              "max_ms": 53.067126005887985,
+              "mean_ms": 33.01894063539714,
+              "omitted": 0,
+              "p50_ms": 33.77034401893616,
+              "p95_ms": 44.95484599471092,
+              "p99_ms": 47.84872701764107
+            },
+            "decoded_frames": 843,
+            "decoded_unique_pts": 843,
+            "depay_to_decode": {
+              "count": 843,
+              "max_ms": 32.67661499977112,
+              "mean_ms": 9.8465144675963,
+              "omitted": 0,
+              "p50_ms": 8.27039697766304,
+              "p95_ms": 14.628959000110626,
+              "p99_ms": 17.027529001235962
+            },
+            "duplicate_decoded_pts": 1,
+            "identity_observation_overflow": 0,
+            "injected_consumer_stalls": 0,
+            "invalid_decoded_pts": 0,
+            "not_consumed_frames": 1,
+            "pad": "src_1",
+            "rtp_packets": 10669,
+            "rtp_unique_frame_timestamps": 843,
+            "unmatched_consume_pts": 0,
+            "unmatched_decode_pts": 0,
+            "decoded_pts_exceed_unique_rtp_by": 0
+          }
+        ]
+      },
+      "sender": {
+        "passed": true,
+        "duration_ms_including_setup_teardown": 36590,
+        "lanes_before_stop": [
+          {
+            "camera_id": "isx031_0",
+            "width": 960,
+            "height": 768,
+            "target_fps": 30,
+            "encoded_fps": 28.09250866435617,
+            "captured_frames": 844,
+            "encoded_frames": 843,
+            "fresh_send_frames": 842,
+            "dropped_frames": 0,
+            "capture_to_encoded_ms": 67.61091340450771,
+            "capture_to_encoded_max_ms": 1920,
+            "capture_to_encoded_samples": 843,
+            "capture_to_encoded_invalid_samples": 0,
+            "failure_count": 0,
+            "reopen_count": 0,
+            "send_stale_access_units_dropped": 1
+          },
+          {
+            "camera_id": "isx031_1",
+            "width": 960,
+            "height": 768,
+            "target_fps": 30,
+            "encoded_fps": 28.09250866435617,
+            "captured_frames": 844,
+            "encoded_frames": 843,
+            "fresh_send_frames": 842,
+            "dropped_frames": 0,
+            "capture_to_encoded_ms": 67.7841043890866,
+            "capture_to_encoded_max_ms": 1927,
+            "capture_to_encoded_samples": 843,
+            "capture_to_encoded_invalid_samples": 0,
+            "failure_count": 0,
+            "reopen_count": 0,
+            "send_stale_access_units_dropped": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "orin-isx031-stall200-133406",
+      "raw_report_sha256": "2dd2bebc0cf0113ed7b274c8f67d6217b8550a4afce5f208cdfcf4bf370536f8",
+      "execution": {
+        "started_at_utc": "2026-10-27T13:34:06Z",
+        "can_state": "can0             DOWN           <NOARP,ECHO>",
+        "competing_process_observations": [],
+        "case": "stall200",
+        "exit_code": 0,
+        "elapsed_seconds": 37.70838160801213
+      },
+      "media_smoke_passed": true,
+      "frame_identity_warning": true,
+      "performance_gain_claim_supported": false,
+      "receiver": {
+        "appsink_drop": true,
+        "appsink_max_buffers": 1,
+        "control_tested": false,
+        "decoder": "nvv4l2decoder",
+        "display_presented": false,
+        "jitter_target_ms": 30,
+        "local_candidates": 6,
+        "selected_pair": {
+          "component": 1,
+          "local_transport": "udp",
+          "local_type": "host",
+          "remote_transport": "udp",
+          "remote_type": "host",
+          "source": "libnice-new-selected-pair-full",
+          "stream": 1
+        },
+        "selected_pair_changes": 1,
+        "sink_sync": false,
+        "tracks": [
+          {
+            "consumed_frame_gap": {
+              "count": 740,
+              "max_ms": 200.1453199982643,
+              "mean_ms": 37.66830736620201,
+              "omitted": 0,
+              "p50_ms": 33.64717301726341,
+              "p95_ms": 46.82831099629402,
+              "p99_ms": 200.11101400852203
+            },
+            "consumed_frames": 741,
+            "decode_to_consume": {
+              "count": 741,
+              "max_ms": 36.104720026254654,
+              "mean_ms": 0.5954822969903186,
+              "omitted": 0,
+              "p50_ms": 0.05769801139831543,
+              "p95_ms": 0.11606800556182861,
+              "p99_ms": 27.724335998296738
+            },
+            "decoded_buffers": 848,
+            "decoded_fps": 30.312519607244074,
+            "decoded_frame_gap": {
+              "count": 844,
+              "max_ms": 51.087258011102676,
+              "mean_ms": 32.989669382713416,
+              "omitted": 0,
+              "p50_ms": 33.62397199869156,
+              "p95_ms": 44.71451899409294,
+              "p99_ms": 48.43303298950195
+            },
+            "decoded_frames": 845,
+            "decoded_unique_pts": 845,
+            "depay_to_decode": {
+              "count": 845,
+              "max_ms": 138.45552897453308,
+              "mean_ms": 9.957011751204552,
+              "omitted": 0,
+              "p50_ms": 8.26172399520874,
+              "p95_ms": 14.825060993432999,
+              "p99_ms": 22.29671400785446
+            },
+            "duplicate_decoded_pts": 3,
+            "identity_observation_overflow": 0,
+            "injected_consumer_stalls": 28,
+            "invalid_decoded_pts": 0,
+            "not_consumed_frames": 104,
+            "pad": "src_0",
+            "rtp_packets": 9980,
+            "rtp_unique_frame_timestamps": 844,
+            "unmatched_consume_pts": 0,
+            "unmatched_decode_pts": 0,
+            "decoded_pts_exceed_unique_rtp_by": 1
+          },
+          {
+            "consumed_frame_gap": {
+              "count": 737,
+              "max_ms": 200.23780199885368,
+              "mean_ms": 37.91693203529315,
+              "omitted": 0,
+              "p50_ms": 33.69645398855209,
+              "p95_ms": 47.363048017024994,
+              "p99_ms": 200.11242201924324
+            },
+            "consumed_frames": 738,
+            "decode_to_consume": {
+              "count": 738,
+              "max_ms": 77.97345599532127,
+              "mean_ms": 0.5595707970502254,
+              "omitted": 0,
+              "p50_ms": 0.056706011295318604,
+              "p95_ms": 0.1031389832496643,
+              "p99_ms": 17.1975180208683
+            },
+            "decoded_buffers": 848,
+            "decoded_fps": 30.28601393016109,
+            "decoded_frame_gap": {
+              "count": 844,
+              "max_ms": 50.65418899059296,
+              "mean_ms": 33.01854124170909,
+              "omitted": 0,
+              "p50_ms": 33.64230799674988,
+              "p95_ms": 45.98422199487686,
+              "p99_ms": 48.7162090241909
+            },
+            "decoded_frames": 845,
+            "decoded_unique_pts": 845,
+            "depay_to_decode": {
+              "count": 845,
+              "max_ms": 35.21221297979355,
+              "mean_ms": 9.61975792618193,
+              "omitted": 0,
+              "p50_ms": 8.135031998157501,
+              "p95_ms": 14.59679901599884,
+              "p99_ms": 17.074250012636185
+            },
+            "duplicate_decoded_pts": 3,
+            "identity_observation_overflow": 0,
+            "injected_consumer_stalls": 28,
+            "invalid_decoded_pts": 0,
+            "not_consumed_frames": 107,
+            "pad": "src_1",
+            "rtp_packets": 10776,
+            "rtp_unique_frame_timestamps": 845,
+            "unmatched_consume_pts": 0,
+            "unmatched_decode_pts": 0,
+            "decoded_pts_exceed_unique_rtp_by": 0
+          }
+        ]
+      },
+      "sender": {
+        "passed": true,
+        "duration_ms_including_setup_teardown": 36610,
+        "lanes_before_stop": [
+          {
+            "camera_id": "isx031_0",
+            "width": 960,
+            "height": 768,
+            "target_fps": 30,
+            "encoded_fps": 28.129161118508655,
+            "captured_frames": 845,
+            "encoded_frames": 845,
+            "fresh_send_frames": 843,
+            "dropped_frames": 0,
+            "capture_to_encoded_ms": 67.61538461538461,
+            "capture_to_encoded_max_ms": 1918,
+            "capture_to_encoded_samples": 845,
+            "capture_to_encoded_invalid_samples": 0,
+            "failure_count": 0,
+            "reopen_count": 0,
+            "send_stale_access_units_dropped": 1
+          },
+          {
+            "camera_id": "isx031_1",
+            "width": 960,
+            "height": 768,
+            "target_fps": 30,
+            "encoded_fps": 28.129161118508655,
+            "captured_frames": 846,
+            "encoded_frames": 845,
+            "fresh_send_frames": 844,
+            "dropped_frames": 0,
+            "capture_to_encoded_ms": 67.68047337278107,
+            "capture_to_encoded_max_ms": 1917,
+            "capture_to_encoded_samples": 845,
+            "capture_to_encoded_invalid_samples": 0,
+            "failure_count": 0,
+            "reopen_count": 0,
+            "send_stale_access_units_dropped": 1
+          }
+        ]
+      }
+    },
+    {
+      "id": "orin-isx031-jitter0-133459",
+      "raw_report_sha256": "8bfbee0328158b4b0e49d5a7d1b352e7710ea5ed7649e08eab5239a6b8d73d50",
+      "execution": {
+        "started_at_utc": "2026-10-27T13:34:59Z",
+        "can_state": "can0             DOWN           <NOARP,ECHO>",
+        "competing_process_observations": [],
+        "case": "jitter0",
+        "exit_code": 0,
+        "elapsed_seconds": 37.7312688039965
+      },
+      "media_smoke_passed": true,
+      "frame_identity_warning": true,
+      "performance_gain_claim_supported": false,
+      "receiver": {
+        "appsink_drop": true,
+        "appsink_max_buffers": 1,
+        "control_tested": false,
+        "decoder": "nvv4l2decoder",
+        "display_presented": false,
+        "jitter_target_ms": 0,
+        "local_candidates": 6,
+        "selected_pair": {
+          "component": 1,
+          "local_transport": "udp",
+          "local_type": "host",
+          "remote_transport": "udp",
+          "remote_type": "host",
+          "source": "libnice-new-selected-pair-full",
+          "stream": 1
+        },
+        "selected_pair_changes": 1,
+        "sink_sync": false,
+        "tracks": [
+          {
+            "consumed_frame_gap": {
+              "count": 905,
+              "max_ms": 50.74798399209976,
+              "mean_ms": 30.74476098342495,
+              "omitted": 0,
+              "p50_ms": 33.17435798048973,
+              "p95_ms": 43.39697501063347,
+              "p99_ms": 48.708433002233505
+            },
+            "consumed_frames": 906,
+            "decode_to_consume": {
+              "count": 906,
+              "max_ms": 1.87711301445961,
+              "mean_ms": 0.05881397449154464,
+              "omitted": 0,
+              "p50_ms": 0.0543690025806427,
+              "p95_ms": 0.07824298739433289,
+              "p99_ms": 0.11891600489616394
+            },
+            "decoded_buffers": 909,
+            "decoded_fps": 32.523727633661686,
+            "decoded_frame_gap": {
+              "count": 905,
+              "max_ms": 50.74788799881935,
+              "mean_ms": 30.746783125960366,
+              "omitted": 0,
+              "p50_ms": 33.160117983818054,
+              "p95_ms": 43.403918981552124,
+              "p99_ms": 48.70590499043465
+            },
+            "decoded_frames": 906,
+            "decoded_unique_pts": 906,
+            "depay_to_decode": {
+              "count": 906,
+              "max_ms": 38.14650997519493,
+              "mean_ms": 10.982720327331267,
+              "omitted": 0,
+              "p50_ms": 8.28786900639534,
+              "p95_ms": 26.629229992628098,
+              "p99_ms": 35.14981099963188
+            },
+            "duplicate_decoded_pts": 3,
+            "identity_observation_overflow": 0,
+            "injected_consumer_stalls": 0,
+            "invalid_decoded_pts": 0,
+            "not_consumed_frames": 0,
+            "pad": "src_0",
+            "rtp_packets": 10023,
+            "rtp_unique_frame_timestamps": 843,
+            "unmatched_consume_pts": 0,
+            "unmatched_decode_pts": 0,
+            "decoded_pts_exceed_unique_rtp_by": 63
+          },
+          {
+            "consumed_frame_gap": {
+              "count": 920,
+              "max_ms": 50.15414100885391,
+              "mean_ms": 30.251306658691686,
+              "omitted": 0,
+              "p50_ms": 33.14853298664093,
+              "p95_ms": 44.031713992357254,
+              "p99_ms": 47.22912400960922
+            },
+            "consumed_frames": 921,
+            "decode_to_consume": {
+              "count": 921,
+              "max_ms": 1.7014920115470886,
+              "mean_ms": 0.06107448052764586,
+              "omitted": 0,
+              "p50_ms": 0.054401010274887085,
+              "p95_ms": 0.08982700109481812,
+              "p99_ms": 0.13350799679756165
+            },
+            "decoded_buffers": 923,
+            "decoded_fps": 33.05569941462025,
+            "decoded_frame_gap": {
+              "count": 920,
+              "max_ms": 50.18633398413658,
+              "mean_ms": 30.251969182588486,
+              "omitted": 0,
+              "p50_ms": 33.14101400971413,
+              "p95_ms": 44.01837000250816,
+              "p99_ms": 47.352198988199234
+            },
+            "decoded_frames": 921,
+            "decoded_unique_pts": 921,
+            "depay_to_decode": {
+              "count": 921,
+              "max_ms": 36.29931801557541,
+              "mean_ms": 11.739201144500353,
+              "omitted": 0,
+              "p50_ms": 11.104211986064911,
+              "p95_ms": 29.746348977088928,
+              "p99_ms": 34.06708899140358
+            },
+            "duplicate_decoded_pts": 2,
+            "identity_observation_overflow": 0,
+            "injected_consumer_stalls": 0,
+            "invalid_decoded_pts": 0,
+            "not_consumed_frames": 0,
+            "pad": "src_1",
+            "rtp_packets": 10730,
+            "rtp_unique_frame_timestamps": 843,
+            "unmatched_consume_pts": 0,
+            "unmatched_decode_pts": 0,
+            "decoded_pts_exceed_unique_rtp_by": 78
+          }
+        ]
+      },
+      "sender": {
+        "passed": true,
+        "duration_ms_including_setup_teardown": 36585,
+        "lanes_before_stop": [
+          {
+            "camera_id": "isx031_0",
+            "width": 960,
+            "height": 768,
+            "target_fps": 30,
+            "encoded_fps": 28.089700443170837,
+            "captured_frames": 844,
+            "encoded_frames": 843,
+            "fresh_send_frames": 842,
+            "dropped_frames": 0,
+            "capture_to_encoded_ms": 67.71648873072361,
+            "capture_to_encoded_max_ms": 1925,
+            "capture_to_encoded_samples": 843,
+            "capture_to_encoded_invalid_samples": 0,
+            "failure_count": 0,
+            "reopen_count": 0,
+            "send_stale_access_units_dropped": 1
+          },
+          {
+            "camera_id": "isx031_1",
+            "width": 960,
+            "height": 768,
+            "target_fps": 30,
+            "encoded_fps": 28.089700443170837,
+            "captured_frames": 844,
+            "encoded_frames": 843,
+            "fresh_send_frames": 842,
+            "dropped_frames": 0,
+            "capture_to_encoded_ms": 67.79122182680902,
+            "capture_to_encoded_max_ms": 1926,
+            "capture_to_encoded_samples": 843,
+            "capture_to_encoded_invalid_samples": 0,
+            "failure_count": 0,
+            "reopen_count": 0,
+            "send_stale_access_units_dropped": 1
+          }
+        ]
+      }
+    }
+  ],
+  "excluded_runs": [
+    {
+      "id": "orin-isx031-baseline-132712",
+      "reason": "competing process detected; own probe terminated; not used for performance"
+    },
+    {
+      "id": "orin-isx031-stall200-131553",
+      "reason": "competing process detected; own probe terminated; not used for performance"
+    }
+  ],
+  "validation": {
+    "arm64_build": true,
+    "node_control_logic_cases_passed": 104,
+    "native_probe_tests": [
+      "configuration containment (8 configurations + existing evidence refusal)",
+      "real GStreamer pad path drops repeated/invalid PTS"
+    ],
+    "ctest_registered_final": 65,
+    "ctest_cumulative_passed": 64,
+    "initial_ctest": "54/64; old Node, missing loopback-only namespace, and timing-sensitive failures recorded",
+    "environment_repair": "Node /opt/pr25-node/bin/node; isolated Docker network=none; failed suites rerun sequentially; control clock suite passed separately",
+    "remaining_failure": "mine-teleop-product-direct-integration-tests: DC not qualified; unchanged PR25 fails too",
+    "not_verified": [
+      "same-control-PC browser/native A/B",
+      "display presentation / glass-to-glass latency",
+      "native input or control DataChannel courier",
+      "WAN / 5G / CGNAT traversal",
+      "network-loss recovery",
+      "long endurance / real vehicle"
+    ]
+  },
+  "review": {
+    "reuse": "Product media, signaling, session scope and codec pipeline reused; no replacement transport/authentication implementation.",
+    "quality": "Opt-in target, strict media-only containment, bounded samples/identity maps/candidate queues, scoped shutdown, honest unmatched and duplicate counters.",
+    "efficiency": "Independent latest-sample consumer; one buffered decoded output; RTC stats sampled at 1Hz; no production hot-path thread or safety-policy changes."
+  }
+}

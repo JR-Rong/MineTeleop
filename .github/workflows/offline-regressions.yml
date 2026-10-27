@@ -58,7 +58,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config iproute2 \
             libcurl4-openssl-dev libssl-dev libyaml-cpp-dev nlohmann-json3-dev libjpeg-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev libnice-dev \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice
       - name: Configure and build every native test target
@@ -97,6 +97,7 @@ jobs:
           mkdir -p "$artifact_dir/bin" "$artifact_dir/ldd"
           for binary in \
             mine-teleop-bench-capture-probe \
+            mine-teleop-native-receiver-probe \
             mine-teleop-recorder \
             mine-teleop \
             mine-teleop-bench-containment-tests \
