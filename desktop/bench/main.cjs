@@ -31,7 +31,8 @@ async function finish(error) {
   try {
     if (window && !window.isDestroyed()) {
       if (error) await window.webContents.executeJavaScript(`window.stopHybridBench?.(${JSON.stringify(String(error))})`).catch(() => {});
-      await window.webContents.capturePage().then(image => fs.writeFileSync(path.join(args.output, 'web-content.png'), image.toPNG()));
+      await window.webContents.capturePage().then(image => fs.writeFileSync(path.join(args.output, 'web-content.png'), image.toPNG()))
+        .catch(error => log({event: 'error', error: `web-content capture failed: ${error}`}));
       // No control commands; terminate the media session via the existing API.
       await window.webContents.executeJavaScript("post('/api/end-session',safeLogoutReleaseBody(pageReleaseScope(),'media_bench_finished')).catch(()=>{})").catch(() => {});
     }
@@ -62,7 +63,9 @@ app.whenReady().then(async () => {
   window = new BrowserWindow({title: 'MineTeleop 媒体台架（控制关闭）', width: 1500, height: 960, show: false,
     webPreferences: {preload: path.join(__dirname, 'preload.cjs'), nodeIntegration: false, contextIsolation: true,
       sandbox: true, webSecurity: true, backgroundThrottling: true, spellcheck: false}});
-  window.webContents.setWebRTCIPHandlingPolicy('default_public_and_private_interfaces');
+  // The Orin LAN may be a non-default interface (e.g. with a VPN active).
+  // The default-route-only policy can silently force ICE-TCP in this bench.
+  window.webContents.setWebRTCIPHandlingPolicy('default');
   window.webContents.setWindowOpenHandler(() => ({action: 'deny'}));
   window.webContents.on('will-navigate', (event, target) => { if (target !== args.url) event.preventDefault(); });
   window.webContents.on('will-attach-webview', event => event.preventDefault());
@@ -86,7 +89,7 @@ app.whenReady().then(async () => {
     } else if (message.type === 'ready') {
       if (addon && (lastViews.length !== 2 || lastViews.some(v => v.hidden || v.children.length !== 1))) throw Error('both native views must be visibly attached before measurement');
       clearTimeout(timeout);
-      log({event: 'measurement_started', mode: args.mode, browser_clock_ms: message.at});
+      log({event: 'measurement_started', mode: args.mode, browser_clock_ms: message.at, selected_pairs: message.selectedPairs});
       timeout = setTimeout(() => void finish('measurement watchdog expired'), (seconds + 30) * 1000);
       return addon ? JSON.parse(addon.clock()) : null;
     } else if (message.type === 'complete') {
@@ -114,7 +117,8 @@ app.whenReady().then(async () => {
   const script = fs.readFileSync(path.join(__dirname, 'renderer.js'), 'utf8');
   await window.webContents.executeJavaScript(`(${script})(${JSON.stringify({mode: args.mode, seconds})})`);
   log({event: 'page_ready', title: window.webContents.getTitle(), url: args.url, bounds: window.getBounds(),
-    display: screen.getDisplayMatching(window.getBounds()), gpu_features: app.getGPUFeatureStatus(), window_id: window.getMediaSourceId()});
+    display: screen.getDisplayMatching(window.getBounds()), gpu_features: app.getGPUFeatureStatus(), window_id: window.getMediaSourceId(),
+    webrtc_ip_handling_policy: window.webContents.getWebRTCIPHandlingPolicy()});
   timeout = setTimeout(() => void finish('login/stream startup timed out'), 90000);
   if (process.env.MINE_TELEOP_DRIVER_PASSWORD) {
     await window.webContents.executeJavaScript(`document.getElementById('driver-id').value='native-bench';document.getElementById('password').value=${JSON.stringify(process.env.MINE_TELEOP_DRIVER_PASSWORD)};document.getElementById('login').click();void 0`);
