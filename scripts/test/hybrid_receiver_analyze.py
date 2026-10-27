@@ -16,6 +16,29 @@ from receiver_ab_analyze import distribution
 PHASES = ('idle', 'ui8', 'ui40', 'stall200', 'recovery')
 
 
+def browser_transport_evidence(samples):
+    """Resolve the selected transport on every sample, never just a UI snapshot."""
+    selections = {}
+    for sample in samples:
+        stats = {row['id']: row for row in sample['stats']}
+        transports = {row['transportId'] for row in stats.values()
+                      if row['type'] == 'inbound-rtp' and row.get('kind') == 'video'}
+        assert transports, 'missing video transport evidence'
+        for transport_id in transports:
+            pair = stats[stats[transport_id]['selectedCandidatePairId']]
+            assert pair['state'] == 'succeeded', 'selected pair not succeeded'
+            local, remote = stats[pair['localCandidateId']], stats[pair['remoteCandidateId']]
+            value = dict(local_address=local.get('address'), remote_address=remote.get('address'),
+                         local_transport=local['protocol'], remote_transport=remote['protocol'],
+                         local_type=local['candidateType'], remote_type=remote['candidateType'])
+            key = (transport_id, pair['id'], json.dumps(value, sort_keys=True))
+            selections.setdefault(key, dict(pair=value, samples=0))['samples'] += 1
+    return dict(selections=list(selections.values()), direct_udp_only=all(
+        s['pair']['local_transport'] == s['pair']['remote_transport'] == 'udp' and
+        s['pair']['local_type'] != 'relay' and s['pair']['remote_type'] != 'relay'
+        for s in selections.values()))
+
+
 def select_window(samples, start, low, high, key):
     before = min(samples, key=lambda row: abs(row[key] - start - low))
     after = min(samples, key=lambda row: abs(row[key] - start - high))
@@ -118,6 +141,7 @@ def analyze(directory):
         phases[phase] = result
     return dict(mode=data['mode'], duration_s=(data['end']-data['start'])/1000, phases=phases,
         selected_pair=report['receiver']['selected_pair'] if report else data['samples'][-1].get('metrics',{}).get('selected_candidate_pair'),
+        browser_transport=browser_transport_evidence(data['samples']) if not report else None,
         limitations=['Native endpoint is GL draw, browser endpoint is compositor submission; neither is scan-out.',
           'Native arrival is jitterbuffer input after SRTP; browser receiveTime is WebRTC frame receive metadata.',
           'Use within-client load-versus-idle differences; absolute path comparisons retain these endpoint differences.',

@@ -30,7 +30,7 @@ struct Layer {
   }
   void run(Options opts, std::stop_token stop) {
     Json report{{"schema", "native-receiver-remote-v1"}, {"runtime", gst_version_string()},
-        {"measurement_start_clock_ms", bench_now_ms()}, {"samples", Json::array()}, {"passed", false}};
+        {"expected_transport", opts.ice_transport}, {"measurement_start_clock_ms", bench_now_ms()}, {"samples", Json::array()}, {"passed", false}};
     try {
       Receiver receiver(opts);
       receiver.start();
@@ -64,7 +64,9 @@ struct Layer {
       report["receiver"] = receiver.report();
       report["measurement_end_clock_ms"] = bench_now_ms();
       report["passed"] = have_offer && !report.contains("error") &&
-          report["receiver"]["tracks"].size() == opts.window_handles.size();
+          report["receiver"]["tracks"].size() == opts.window_handles.size() &&
+          report["receiver"]["selected_pair"].value("local_transport", "") == opts.ice_transport &&
+          report["receiver"]["selected_pair"].value("remote_transport", "") == opts.ice_transport;
       for (const auto& track : report["receiver"]["tracks"])
         if (track.at("draw_events_pts_ns_clock_ms").size() < 30 || track.at("identity_observation_overflow") != 0)
           report["passed"] = false;
@@ -99,7 +101,7 @@ template<typename F> napi_value guarded(napi_env env, F body) {
 napi_value create(napi_env env, napi_callback_info info) {
   return guarded(env, [&] {
     if (layer) throw std::runtime_error("native media already initialized");
-    const auto args = arguments(env, info, 2);
+    const auto args = arguments(env, info, 3);
     const auto config = load_vehicle_config(string(env, args[1], 4096));
     validate(config);
     void* data{}; size_t size{}; check(napi_get_buffer_info(env, args[0], &data, &size));
@@ -109,6 +111,8 @@ napi_value create(napi_env env, napi_callback_info info) {
     gst_init(nullptr, nullptr);
     auto next = std::make_unique<Layer>(); next->parent = parent;
     Options opts; opts.decoder = "vtdec_hw"; opts.display = true;
+    opts.ice_transport = string(env, args[2], 8);
+    if (opts.ice_transport != "udp" && opts.ice_transport != "tcp") throw std::invalid_argument("invalid bench transport");
     for (std::size_t index = 0; index < config.enabled_cameras().size(); ++index) {
       NSView* view = [[BenchVideoView alloc] initWithFrame:NSMakeRect(0, 0, 1, 1)];
       [view setWantsLayer:YES];

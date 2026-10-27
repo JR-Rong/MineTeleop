@@ -41,6 +41,7 @@ inline double bench_now_ms() { return std::chrono::duration<double, std::milli>(
 struct Options {
   std::string config, output, signaling_url, driver_id{"native-bench"}, decoder{"avdec_h264"};
   int seconds{30}, jitter_ms{30}, stall_ms{0};
+  std::string ice_transport{"auto"};  // Hybrid bench can pin the comparison transport.
   bool validate_only{false}, display{false};
   std::vector<std::uintptr_t> window_handles;
 };
@@ -359,6 +360,8 @@ class Receiver {
       g_object_unref(ice);
     }
     if (!nice_) throw std::runtime_error("libnice selected-pair observation unavailable");
+    if (options_.ice_transport == "tcp") g_object_set(nice_, "ice-udp", FALSE, nullptr);
+    else if (options_.ice_transport == "udp") g_object_set(nice_, "ice-tcp", FALSE, nullptr);
     g_signal_connect(nice_, "new-selected-pair-full", G_CALLBACK(on_pair), this);
     if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
       throw std::runtime_error("receiver failed to start");

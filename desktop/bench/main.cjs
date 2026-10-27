@@ -9,9 +9,10 @@ const args = Object.fromEntries(process.argv.slice(2).reduce((out, value, i, all
   return out;
 }, []));
 const seconds = Number(args.seconds || 600);
-if (process.platform !== 'darwin' || !['browser', 'native'].includes(args.mode) ||
+const transport = args.transport || 'udp';
+if (!['udp', 'tcp'].includes(transport) || process.platform !== 'darwin' || !['browser', 'native'].includes(args.mode) ||
     !/^http:\/\/127\.0\.0\.1:\d+\/$/.test(args.url || '') || !args.output || !args.config || !args.probe ||
-    !Number.isInteger(seconds) || seconds < 15 || seconds > 1800) throw Error('requires macOS, --mode browser|native --url http://127.0.0.1:PORT/ --config SAFE_BENCH --probe BINARY --output NEW_DIR [--seconds 15..1800] [--addon FILE]');
+    !Number.isInteger(seconds) || seconds < 15 || seconds > 1800) throw Error('requires macOS, --mode browser|native --url http://127.0.0.1:PORT/ --config SAFE_BENCH --probe BINARY --output NEW_DIR [--seconds 15..1800] [--addon FILE] [--transport udp|tcp]');
 execFileSync(args.probe, ['--config', args.config, '--validate-only'], {stdio: 'pipe'});
 fs.mkdirSync(args.output); // Refuse overwriting evidence.
 app.setPath('userData', path.join(args.output, 'electron-profile'));
@@ -43,7 +44,7 @@ async function finish(error) {
       if (!nativeReport) log({event: 'error', error: 'native shutdown timed out'});
     }
     write('resources.json', resourceSamples);
-    write('metadata.json', {mode: args.mode, duration_requested_s: seconds, versions: process.versions,
+    write('metadata.json', {mode: args.mode, expected_transport: transport, duration_requested_s: seconds, versions: process.versions,
       screen: window && !window.isDestroyed() ? window.getBounds() : null,
       errors: events.filter(e => e.event === 'error'), browser_report: Boolean(browserReport), native_report: Boolean(nativeReport),
       screenshot_note: 'web-content.png excludes embedded NSViews; use a window screenshot to verify native pixels'});
@@ -65,8 +66,8 @@ app.whenReady().then(async () => {
         ['local-network', 'local-network-access', 'loopback-network'].includes(permission);
     } catch { return false; }
   };
-  // This loopback bench explicitly connects to Orin. Denying Chromium's LAN
-  // permission blocks UDP and can leave an unintended ICE-TCP comparison.
+  // Permit only the local-network permissions needed by this contained bench.
+  // Actual ICE transport must still pass the independent measurement guard.
   session.defaultSession.setPermissionCheckHandler((contents, permission, requestingOrigin) =>
     allowLan(contents, permission, requestingOrigin));
   session.defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => {
@@ -115,7 +116,7 @@ app.whenReady().then(async () => {
   await window.loadURL(args.url);
   if (args.mode === 'native') {
     addon = require(path.resolve(args.addon));
-    log({event: 'native_created', ...JSON.parse(addon.create(window.getNativeWindowHandle(), args.config))});
+    log({event: 'native_created', ...JSON.parse(addon.create(window.getNativeWindowHandle(), args.config, transport))});
     poll = setInterval(() => {
       try {
         for (const event of JSON.parse(addon.poll())) {
@@ -128,7 +129,7 @@ app.whenReady().then(async () => {
   resources = setInterval(() => { if (resourceSamples.length < 400) resourceSamples.push({wall_ms: Date.now(), processes: app.getAppMetrics()}); }, 5000);
   window.show(); window.focus();
   const script = fs.readFileSync(path.join(__dirname, 'renderer.js'), 'utf8');
-  await window.webContents.executeJavaScript(`(${script})(${JSON.stringify({mode: args.mode, seconds})})`);
+  await window.webContents.executeJavaScript(`(${script})(${JSON.stringify({mode: args.mode, seconds, transport})})`);
   log({event: 'page_ready', title: window.webContents.getTitle(), url: args.url, bounds: window.getBounds(),
     display: screen.getDisplayMatching(window.getBounds()), gpu_features: app.getGPUFeatureStatus(), window_id: window.getMediaSourceId(),
     webrtc_ip_handling_policy: window.webContents.getWebRTCIPHandlingPolicy()});

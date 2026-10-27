@@ -1,7 +1,7 @@
-async ({mode, seconds}) => {
+async ({mode, seconds, transport = 'udp'}) => {
   const bridge = window.mineTeleopBench;
   const send = message => bridge.send(message).catch(error => { console.error(error); throw error; });
-  const data = window.hybridBench = {schema: 'hybrid-ui-ab-v1', mode, seconds, userAgent: navigator.userAgent,
+  const data = window.hybridBench = {schema: 'hybrid-ui-ab-v1', mode, seconds, expectedTransport: transport, userAgent: navigator.userAgent,
     display: {devicePixelRatio, width: screen.width, height: screen.height}, samples: [], tracks: [], phases: [], load: [], longTasks: [], visibility: [], errors: [], overflow: 0, start: null};
   let stopped = false, started = false, collecting = false, timer, loadTimer, nativeScope, offerSeen = false;
   let offeredIds = [], latestNative = null, lastNativeAt = 0, previousPhase = '';
@@ -101,15 +101,15 @@ async ({mode, seconds}) => {
     loadPanel.firstChild.textContent = `${mode} ${phase} ${(elapsed / 1000).toFixed(0)} / ${seconds}s`;
     if (data.load.length < 20000) data.load.push({at: begin, phase, requested_ms: work, actual_ms: performance.now() - begin}); else data.overflow++;
   }
-  function requireUdpPairs(report) {
+  function requireTransportPairs(report) {
     const transportIds = new Set([...report.values()].filter(s => s.type === 'inbound-rtp' && s.kind === 'video').map(s => s.transportId));
     if (!transportIds.size) throw Error('missing video transport evidence');
     return [...transportIds].map(id => {
       const pair = report.get(report.get(id)?.selectedCandidatePairId);
       const local = report.get(pair?.localCandidateId), remote = report.get(pair?.remoteCandidateId);
-      if (pair?.state !== 'succeeded' || local?.protocol !== 'udp' || remote?.protocol !== 'udp' ||
+      if (pair?.state !== 'succeeded' || local?.protocol !== transport || remote?.protocol !== transport ||
           local.candidateType === 'relay' || remote.candidateType === 'relay')
-        throw Error('LAN comparison requires a selected direct UDP pair');
+        throw Error(`LAN comparison requires a selected direct ${transport.toUpperCase()} pair`);
       return {id: pair.id, local, remote};
     });
   }
@@ -121,7 +121,7 @@ async ({mode, seconds}) => {
       if (mode === 'browser') {
         if (peer !== data.instance || peer.connectionState !== 'connected') throw Error('browser peer changed/disconnected');
         const report = await peer.getStats();
-        sample.selectedPairs = requireUdpPairs(report);
+        sample.selectedPairs = requireTransportPairs(report);
         sample.stats = [...report.values()].filter(s => ['inbound-rtp', 'codec', 'transport', 'candidate-pair', 'local-candidate', 'remote-candidate'].includes(s.type));
         sample.metrics = structuredClone(latestMetrics);
       } else {
@@ -135,7 +135,7 @@ async ({mode, seconds}) => {
   }
   async function start() {
     if (started) return; started = true;
-    const selectedPairs = mode === 'browser' ? requireUdpPairs(await peer.getStats()) : undefined;
+    const selectedPairs = mode === 'browser' ? requireTransportPairs(await peer.getStats()) : undefined;
     data.start = performance.now(); data.wallStart = Date.now(); data.instance = peer;
     data.nativeStart = await send({type: 'ready', at: data.start, selectedPairs});
     if (mode === 'browser') {
