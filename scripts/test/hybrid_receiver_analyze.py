@@ -32,7 +32,10 @@ def browser_transport_evidence(samples):
             value = dict(local_address=local.get('address'), remote_address=remote.get('address'),
                          local_transport=local['protocol'], remote_transport=remote['protocol'],
                          local_type=local['candidateType'], remote_type=remote['candidateType'],
-                         local_port=local.get('port'), remote_port=remote.get('port'))
+                         local_port=local.get('port'), remote_port=remote.get('port'),
+                         local_relay_protocol=local.get('relayProtocol'), remote_relay_protocol=remote.get('relayProtocol'),
+                         local_url=local.get('url'), remote_url=remote.get('url'),
+                         signaled_turn_urls=sample.get('signaledTurnUrls', []))
             key = (transport_id, pair['id'], json.dumps(value, sort_keys=True))
             selections.setdefault(key, dict(pair=value, samples=0))['samples'] += 1
     return dict(selections=list(selections.values()), direct_udp_only=all(
@@ -77,6 +80,9 @@ def require_network_pairs(pairs, expected_transport, network):
         assert pair['local_transport'] == pair['remote_transport'] == expected_transport, 'transport changed or differs from request'
         relay = pair['local_type'] == 'relay' or pair['remote_type'] == 'relay'
         assert not relay or network and network.get('allowRelay', False), 'relay selected in direct-only experiment'
+        for side in ('local', 'remote'):
+            if pair[side+'_type'] == 'relay':
+                assert pair.get(side+'_relay_protocol') == expected_transport, 'TURN leg transport missing or differs from request'
         if network:
             assert network['kind'] in ('wan-ipv4-udp','wan-dualstack') and expected_transport == 'udp', 'WAN mode requires UDP'
             try:
@@ -85,8 +91,17 @@ def require_network_pairs(pairs, expected_transport, network):
                 raise AssertionError('selected pair has no valid IP evidence') from error
             assert left.version == right.version and (family=='dual' or family=='ipv'+str(left.version)), 'address family differs from request'
             assert right.is_global, 'remote endpoint is not public'
-            assert (relay and pair['local_type']=='relay' and left.is_global) or str(left) in map(canonical,local), 'local endpoint differs from request'
-            assert relay or str(right) in map(canonical,remote), 'public remote endpoint differs from request'
+            for side, address, endpoints in [('local',left,local),('remote',right,remote)]:
+                assert pair[side+'_type'] in ('host','srflx','prflx','relay'), 'unknown candidate type'
+                if pair[side+'_type'] != 'relay':
+                    assert str(address) in map(canonical,endpoints), side+' endpoint differs from request'
+                    continue
+                url = pair.get(side+'_url', '')
+                server = next((s for s in network.get('turnServers', []) if s['url']==url), None)
+                assert server and url in pair.get('signaled_turn_urls', []), 'TURN server not attested by signaling/allowlist'
+                assert url.startswith('turn:') and not url.endswith('transport=tcp'), 'TURN URL is not UDP'
+                assert server.get('serverAddresses') and all(ipaddress.ip_address(ip).is_global for ip in server['serverAddresses']), 'TURN DNS evidence missing or nonpublic'
+                assert address.is_global and str(address) in map(canonical,server.get('relayAddresses', [])), 'relay outside configured TURN allocation pool'
 
 
 def path_summary(samples):
@@ -178,11 +193,10 @@ def analyze(directory):
     transport = None if report else browser_transport_evidence(data['samples'])
     network = data.get('expectedNetwork')
     assert network == metadata.get('expected_network'), 'network configuration mismatch'
-    if network:
-        pairs = ([s['selected_pair'] for s in report['samples']
-                  if data['nativeStart'] <= s['clock_ms'] <= data['nativeStart']+data['seconds']*1000]
-                 if report else [s['pair'] for s in transport['selections']])
-        require_network_pairs(pairs, data['expectedTransport'], network)
+    pairs = ([s['selected_pair'] for s in report['samples']
+              if data['nativeStart'] <= s['clock_ms'] <= data['nativeStart']+data['seconds']*1000]
+             if report else [s['pair'] for s in transport['selections']])
+    require_network_pairs(pairs, data['expectedTransport'], network)
     path_samples = []
     for sample in data['samples']:
         if report:

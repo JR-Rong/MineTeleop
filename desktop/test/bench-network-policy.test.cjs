@@ -48,8 +48,9 @@ test('IPv6 and dual-stack WAN support canonical addresses, global host candidate
   p.requirePair(pair);
   p.requireIceServers([]); // Global IPv6 host can connect without srflx.
   assert.throws(()=>p.requirePair({...pair,remote_type:'relay'}),/relay policy/);
-  const fallback=createNetworkPolicy({...v6,allowRelay:true});
-  fallback.requirePair({...pair,remote_type:'relay',remote_address:'2606:4700::3'});
+  const turn={url:'turn:[2606:4700::3]:3478?transport=udp',serverAddresses:['2606:4700::3'],relayAddresses:['2606:4700::3']};
+  const fallback=createNetworkPolicy({...v6,allowRelay:true,turnServers:[turn]});
+  assert.throws(()=>fallback.requirePair({...pair,remote_type:'relay',remote_address:'2606:4700::3'}),/relay policy/);
   fallback.requireIceServers([{urls:'turn:[2606:4700::3]:3478?transport=udp',username:'u',credential:'p'}]);
   assert.throws(()=>fallback.requireIceServers([]),/requires TURN/);
   const dual=createNetworkPolicy({...v6,family:'dual',localAddresses:[...v6.localAddresses,'192.168.1.2'],localPublicAddresses:[...v6.localPublicAddresses,'8.8.8.8'],remotePublicAddresses:[...v6.remotePublicAddresses,'1.1.1.1']});
@@ -63,4 +64,55 @@ test('serialized factory retains legacy STUN guard and does not disclose credent
   const policy=factoryCopy(normalized,addressCopy);
   assert.throws(()=>policy.requireIceServers([{urls:'stun:8.8.8.8:3478'}]),/same single STUN/);
   assert(!JSON.stringify(policy.config).includes('credential'));
+});
+
+test('UDP relay requires every relay leg and an attested TURN pool; non-relay endpoint stays pinned', () => {
+  const url='turn:turn.example.test:3478?transport=udp';
+  const config={kind:'wan-dualstack',family:'ipv4',allowRelay:true,localAddresses:['192.168.1.2'],localPublicAddresses:['8.8.8.8'],remotePublicAddresses:['1.1.1.1'],
+    turnServers:[{url,serverAddresses:['9.9.9.9'],relayAddresses:['9.9.9.10']}]};
+  const p=createNetworkPolicy(config);
+  const pair={local_address:'9.9.9.10',remote_address:'1.1.1.1',local_transport:'udp',remote_transport:'udp',local_type:'relay',remote_type:'srflx',local_relay_protocol:'udp',local_url:url};
+  assert.throws(()=>p.requirePair(pair),/relay policy/);
+  p.requireIceServers([{urls:url}]); p.requirePair(pair);
+  for(const change of [{local_relay_protocol:'tcp'},{local_relay_protocol:'tls'},{local_relay_protocol:undefined},
+      {local_url:undefined},{local_url:'turn:other.example.test:3478?transport=udp'}, {local_address:'8.8.4.4'},
+      {remote_address:'8.8.4.4'}, {remote_type:'relay',remote_address:'9.9.9.10'}])
+    assert.throws(()=>p.requirePair({...pair,...change}),/relay policy/);
+  const both={...pair,remote_type:'relay',remote_address:'9.9.9.10',remote_url:url,remote_relay_protocol:'udp'};
+  p.requirePair(both);
+  for(const protocol of ['tcp','tls',undefined])assert.throws(()=>p.requirePair({...both,remote_relay_protocol:protocol}),/relay policy/);
+  assert.equal(p.candidateAllowed('candidate:r 1 UDP 100 8.8.4.4 5000 typ relay'),false);
+  assert.throws(()=>p.requireIceServers([{urls:'turn:other.example.test:3478'}]),/allowlist/);
+});
+test('TURN DNS snapshot is resolved independently from explicit allocation pools', async () => {
+  const {resolveTurnAllowlist}=require('../bench/turn-allowlist.cjs');
+  const config={allowRelay:true,turnServers:[{url:'turn:turn.example.test:3478',relayAddresses:['9.9.9.10']}]};
+  const result=await resolveTurnAllowlist(config,async host=>{assert.equal(host,'turn.example.test');return [{address:'9.9.9.9'}]});
+  assert.deepEqual(result.turnServers[0].serverAddresses,['9.9.9.9']);
+  assert.deepEqual(result.turnServers[0].relayAddresses,['9.9.9.10']);
+  await assert.rejects(resolveTurnAllowlist(config,async()=>[{address:'127.0.0.1'}]),/public/);
+  await assert.rejects(resolveTurnAllowlist(config,async()=>[]),/public/);
+});
+test('IPv6 zones classify without disclosing interface or address in candidate summaries', () => {
+  const {iceCandidateSummary}=require('../../cpp/web/control_logic.js');
+  assert.deepEqual(iceAddressInfo('fe80::1%en0'),{family:'ipv6',scope:'link_local',address:'fe80::1'});
+  const summary=iceCandidateSummary({candidate:'candidate:x 1 UDP 100 fe80::1%en0 5000 typ host'});
+  assert.equal(summary.address_class,'link_local');
+  assert(!JSON.stringify(summary).includes('en0')); assert(!JSON.stringify(summary).includes('fe80'));
+});
+test('actual renderer fetch wrapper cannot replace current TURN evidence with a late response', async () => {
+  const vm=require('node:vm'), fs=require('node:fs');
+  const source=fs.readFileSync(require.resolve('../bench/renderer.js'),'utf8');
+  const urls=['turn:first.example.test:3478?transport=udp','turn:second.example.test:3478?transport=udp'];
+  const p=createNetworkPolicy({kind:'wan-dualstack',family:'ipv4',allowRelay:true,
+    localAddresses:['192.168.1.2'],localPublicAddresses:['8.8.8.8'],remotePublicAddresses:['1.1.1.1'],
+    turnServers:urls.map(url=>({url,serverAddresses:['9.9.9.9'],relayAddresses:['9.9.9.10']}))});
+  const pending=[];
+  const context=vm.createContext({network:p,fetchIceServers:()=>new Promise(resolve=>pending.push(resolve)),
+    mediaOfferScope:{id:'old'},nativeControlSessionId:'s',nativeControlSessionGeneration:1});
+  vm.runInContext(source.slice(source.indexOf('  if (network) {\n    const originalFetch'),source.indexOf("  if (mode === 'native')")),context);
+  const old=context.fetchIceServers();context.mediaOfferScope={id:'new'};
+  const fresh=context.fetchIceServers();pending[1]([{urls:urls[1]}]);await fresh;
+  pending[0]([{urls:urls[0]}]);await old;
+  assert.deepEqual(p.signaledTurnUrls(),[urls[1]]);
 });

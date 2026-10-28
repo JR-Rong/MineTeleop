@@ -25,6 +25,9 @@ int main() {
       require(ice_address_summary(ip)["address_class"]==scope,"address classification mismatch");
     const std::string candidate="candidate:secret 1 UDP 100 100.64.0.2 44444 typ srflx ufrag secret";
     const auto summary=ice_candidate_summary(candidate);
+    const auto scoped = ice_candidate_summary("candidate:x 1 UDP 100 fe80::1%en0 44444 typ host");
+    require(scoped["address_class"]=="link_local" && scoped["address_family"]=="ipv6", "scoped IPv6 classification lost");
+    require(scoped.dump().find("en0")==std::string::npos && scoped.dump().find("fe80")==std::string::npos,"diagnostic leaked zone/address");
     require(summary["candidate_type"]=="srflx"&&summary["address_class"]=="shared_cgnat", "candidate evidence missing");
     require(summary.dump().find("secret")==std::string::npos&&summary.dump().find("100.64")==std::string::npos,"diagnostic leaked address/ufrag");
     const std::string sdp="v=0\r\na=ice-ufrag:keep\r\na=candidate:a 1 UDP 100 2001:4860::1 5000 typ host\r\na=candidate:b 1 UDP 10 8.8.8.8 5001 typ relay\r\n";

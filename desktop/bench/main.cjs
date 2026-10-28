@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {execFileSync} = require('node:child_process');
 const {createNetworkPolicy} = require('./network-policy.cjs');
+const {resolveTurnAllowlist} = require('./turn-allowlist.cjs');
 const {iceAddressInfo} = require('../../cpp/web/control_logic.js');
 const args = Object.fromEntries(process.argv.slice(2).reduce((out, value, i, all) => {
   if (value.startsWith('--')) out.push([value.slice(2), all[i + 1]]);
@@ -13,11 +14,7 @@ const args = Object.fromEntries(process.argv.slice(2).reduce((out, value, i, all
 const seconds = Number(args.seconds || 600);
 const transport = args.transport || 'udp';
 const networkInput = args.network ? JSON.parse(fs.readFileSync(args.network, 'utf8')) : null;
-const network = networkInput ? createNetworkPolicy(networkInput, iceAddressInfo).config : null;
-if (network) {
-  if (transport !== 'udp' || !network.localAddresses.every(ip => Object.values(require('node:os').networkInterfaces()).flat().some(i => iceAddressInfo(i.address).address === ip)))
-    throw Error('WAN bench requires UDP and local addresses assigned to this Mac');
-}
+let network = null;
 if (!['udp', 'tcp'].includes(transport) || process.platform !== 'darwin' || !['browser', 'native'].includes(args.mode) ||
     !/^http:\/\/127\.0\.0\.1:\d+\/$/.test(args.url || '') || !args.output || !args.config || !args.probe ||
     !Number.isInteger(seconds) || seconds < 15 || seconds > 1800) throw Error('requires macOS, --mode browser|native --url http://127.0.0.1:PORT/ --config SAFE_BENCH --probe BINARY --output NEW_DIR [--seconds 15..1800] [--addon FILE] [--transport udp|tcp] [--network WAN_CONFIG_JSON]');
@@ -68,6 +65,10 @@ process.on('SIGINT', () => void finish('bench interrupted'));
 app.on('window-all-closed', () => { void finish('window closed before completion'); });
 app.on('before-quit', event => { if (!closing) { event.preventDefault(); void finish('application quit before completion'); } });
 app.whenReady().then(async () => {
+  network = networkInput ? createNetworkPolicy(await resolveTurnAllowlist(networkInput), iceAddressInfo).config : null;
+  if (network && (transport !== 'udp' || !network.localAddresses.every(ip => Object.values(require('node:os').networkInterfaces()).flat().some(i => iceAddressInfo(i.address).address === ip))))
+    throw Error('WAN bench requires UDP and local addresses assigned to this Mac');
+  if (network?.allowRelay) log({event:'turn_allowlist_resolved',turn_servers:network.turnServers});
   awake = powerSaveBlocker.start('prevent-display-sleep');
   const origin = new URL(args.url).origin;
   const allowLan = (contents, permission, requestingUrl) => {

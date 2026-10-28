@@ -5258,7 +5258,9 @@ struct VehicleMediaRuntime::Impl {
       if (route_retry) {
         // A connected direct path can outlive the original short-lived TURN
         // credentials. Fetch again only after the control-safe teardown.
+        check_stop();
         ice_configuration = signaling.ice_servers();
+        check_stop();
         emit_diagnostic("vehicle_ice_relay_fallback", "ice_direct_fallback", "ice_connectivity", "",
             "A new Peer/negotiation is required; prior control readiness is not restored.", true,
             {{"fallback_count", ice_route_policy->fallbacks()}, {"next_mode", ice_route_policy->mode()}, {"safety_action", "control_closed_before_retry"}});

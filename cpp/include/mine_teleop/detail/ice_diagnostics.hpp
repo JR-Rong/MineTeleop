@@ -13,6 +13,10 @@
 
 namespace mine_teleop::detail {
 inline nlohmann::json ice_address_summary(const std::string& address) {
+  // Scope IDs are interface-local metadata, never part of diagnostic output.
+  const auto zone = address.find('%');
+  const auto parsed = address.find(':') != std::string::npos && zone != std::string::npos
+      ? address.substr(0, zone) : address;
   std::array<unsigned char, 16> bytes{};
   std::string family = "unknown", scope = "unknown";
   if (inet_pton(AF_INET, address.c_str(), bytes.data()) == 1) {
@@ -24,7 +28,7 @@ inline nlohmann::json ice_address_summary(const std::string& address) {
       : (a == 192 && b == 0 && c == 2) || (a == 198 && b == 51 && c == 100) || (a == 203 && b == 0 && c == 113) ? "documentation"
       : a == 198 && (b == 18 || b == 19) ? "benchmark"
       : a >= 224 && a < 240 ? "multicast" : a == 0 || a >= 240 || (a == 192 && b == 0 && c == 0) || (a == 192 && b == 88 && c == 99) ? "reserved" : "public";
-  } else if (inet_pton(AF_INET6, address.c_str(), bytes.data()) == 1) {
+  } else if (inet_pton(AF_INET6, parsed.c_str(), bytes.data()) == 1) {
     family = "ipv6";
     bool first15zero = true;
     for (std::size_t i = 0; i < 15; ++i) first15zero = first15zero && bytes[i] == 0;

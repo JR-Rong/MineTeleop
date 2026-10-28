@@ -39,12 +39,30 @@ function createNetworkPolicy(input, inspectAddress) {
   }
   if (legacyUrl && (!/^stun:[\d.]+:(3478|19302)$/.test(legacyUrl) || !validServer(legacyUrl)))
     throw Error('WAN bench requires a real public IPv4 STUN endpoint on port 3478 or 19302');
-  function requireIceServers(servers) {
+  // TURN listening addresses and allocation pools can differ. Require both;
+  // never infer the pool from DNS, nor infer a relay leg from candidate UDP.
+  const publicIps = values => {
+    if (!Array.isArray(values)||!values.length||values.length>16) throw Error('TURN requires bounded DNS and relay address lists');
+    return values.map(value=>{const info=inspectAddress(value);if(info.scope!=='public')throw Error('TURN addresses must be public');return info.address;});
+  };
+  const configuredTurn=config.turnServers||[];
+  if (!Array.isArray(configuredTurn)||configuredTurn.length>16) throw Error('TURN allowlist must contain at most 16 servers');
+  const turnServers=configuredTurn.map(server=>{
+    if (!validServer(server.url)||!/^turns?:/.test(server.url)) throw Error('invalid TURN allowlist URL');
+    return {url:server.url,serverAddresses:publicIps(server.serverAddresses),relayAddresses:publicIps(server.relayAddresses)};
+  });
+  if (config.allowRelay && !turnServers.length) throw Error('relay arm requires an explicit TURN allowlist with DNS evidence');
+  normalized.turnServers=turnServers;
+  let signaledTurnUrls=[];
+  function requireIceServers(servers, observe = true) {
     const urls=(servers||[]).flatMap(server=>server.urls||[]);
     if (urls.some(url=>!validServer(url))) throw Error('invalid or placeholder STUN/TURN endpoint');
     if (legacyUrl && (urls.length!==1 || urls[0]!==legacyUrl))
       throw Error('legacy bench signaling must advertise the same single STUN endpoint without TURN');
     if (config.allowRelay && !urls.some(url=>/^turns?:/.test(url))) throw Error('fallback bench requires TURN from authenticated signaling');
+    if (config.allowRelay && urls.filter(url=>/^turns?:/.test(url)).some(url=>!turnServers.some(server=>server.url===url)))
+      throw Error('signaling TURN server is outside the explicit allowlist');
+    if (observe) signaledTurnUrls=urls.filter(url=>/^turns?:/.test(url));
   }
   function candidateAllowed(candidate) {
     const value=typeof candidate==='string'?candidate:candidate?.candidate;
@@ -53,20 +71,25 @@ function createNetworkPolicy(input, inspectAddress) {
     const fields=value.replace(/^a=/,'').trim().split(/\s+/), info=inspectAddress(fields[4]);
     return fields[0].startsWith('candidate:') && fields[2]?.toLowerCase()==='udp' && fields[6]==='typ' &&
       allowedFamily(info) && info.scope==='public' &&
-      (fields[7]==='relay' ? config.allowRelay : directTypes.includes(fields[7]) && remote.includes(info.address));
+      (fields[7]==='relay' ? config.allowRelay && turnServers.some(server=>signaledTurnUrls.includes(server.url)&&server.relayAddresses.includes(info.address))
+        : directTypes.includes(fields[7]) && remote.includes(info.address));
+  }
+  function relayAllowed(pair, side, info) {
+    const server=turnServers.find(item=>item.url===pair[side+'_url']);
+    return config.allowRelay && info.scope==='public' && pair[side+'_relay_protocol']==='udp' &&
+      server && /^turn:/.test(server.url) && !server.url.endsWith('transport=tcp') &&
+      signaledTurnUrls.includes(server.url) && server.relayAddresses.includes(info.address);
   }
   function requirePair(pair) {
     const l=inspectAddress(pair?.local_address), r=inspectAddress(pair?.remote_address);
-    const relay=pair?.local_type==='relay'||pair?.remote_type==='relay';
     if (!pair || pair.local_transport!=='udp' || pair.remote_transport!=='udp' || !allowedFamily(l) || !allowedFamily(r) || l.family!==r.family ||
         ![...directTypes,'relay'].includes(pair.local_type) || ![...directTypes,'relay'].includes(pair.remote_type) ||
-        (relay ? !config.allowRelay || r.scope!=='public' ||
-          (pair.local_type==='relay' ? l.scope!=='public' : !local.concat(localPublic).includes(l.address)) :
-          !local.concat(localPublic).includes(l.address) || !remote.includes(r.address)))
+        (pair.local_type==='relay' ? !relayAllowed(pair,'local',l) : !local.concat(localPublic).includes(l.address)) ||
+        (pair.remote_type==='relay' ? !relayAllowed(pair,'remote',r) : !remote.includes(r.address)))
       throw Error('selected pair differs from required public IPv4/IPv6 UDP endpoints or relay policy: '+JSON.stringify(pair));
     return pair;
   }
-  return {config:normalized,candidateAllowed,requirePair,requireIceServers,
+  return {config:normalized,candidateAllowed,requirePair,requireIceServers,signaledTurnUrls:()=>[...signaledTurnUrls],
     // Direct-only A/B excludes relay on both sides of the receiver. Sender
     // configuration must separately match the chosen diagnostic experiment.
     serversForReceiver:servers=>servers.map(server=>({...server,urls:(Array.isArray(server.urls)?server.urls:[server.urls])

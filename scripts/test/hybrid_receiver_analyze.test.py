@@ -57,9 +57,27 @@ class HybridMeasurementTests(unittest.TestCase):
         relay = dict(pair, remote_address='2606:4700::2', remote_type='relay')
         with self.assertRaises(AssertionError):
             require_network_pairs([relay], 'udp', network)
-        require_network_pairs([relay], 'udp', dict(network, allowRelay=True))
+        with self.assertRaisesRegex(AssertionError, 'TURN leg'):
+            require_network_pairs([relay], 'udp', dict(network, allowRelay=True))
         with self.assertRaises(AssertionError):
             require_network_pairs([pair], 'udp', dict(network, family='ipv4'))
+
+    def test_turn_leg_protocol_and_server_identity(self):
+        url='turn:turn.example.test:3478?transport=udp'
+        network=dict(kind='wan-dualstack',family='ipv4',allowRelay=True,localAddresses=['192.168.1.2'],localPublicAddresses=['8.8.8.8'],remotePublicAddresses=['1.1.1.1'],
+                     turnServers=[dict(url=url,serverAddresses=['9.9.9.9'],relayAddresses=['9.9.9.10'])])
+        pair=dict(local_address='9.9.9.10',remote_address='1.1.1.1',local_type='relay',remote_type='srflx',local_transport='udp',remote_transport='udp',local_relay_protocol='udp',local_url=url,signaled_turn_urls=[url])
+        require_network_pairs([pair], 'udp', network)
+        for change in [dict(local_relay_protocol='tcp'),dict(local_relay_protocol='tls'),dict(local_relay_protocol=None),dict(local_url=None),dict(signaled_turn_urls=[]),dict(local_address='8.8.4.4'),dict(remote_address='8.8.4.4'),dict(remote_type='relay')]:
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                require_network_pairs([dict(pair,**change)], 'udp', network)
+        for protocol in ['udp','tcp','tls',None]:
+            sample=self.transport_sample('udp')
+            sample['stats'][-2].update(candidateType='relay',relayProtocol=protocol,url=url)
+            sample['signaledTurnUrls']=[url]
+            extracted=browser_transport_evidence([sample])['selections'][0]['pair']
+            self.assertEqual(extracted['local_relay_protocol'],protocol)
+            self.assertEqual(extracted['local_url'],url)
 
     def test_path_history_keeps_relay_and_excludes_sampling_gaps(self):
         direct = dict(local_address='2001:4860::1', remote_address='2606:4700::1', local_type='host', remote_type='host')

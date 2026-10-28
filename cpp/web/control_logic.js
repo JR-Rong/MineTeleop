@@ -1394,7 +1394,8 @@
 
   // Shared by product diagnostics and the isolated WAN bench. No network IO.
   function iceAddressInfo(value) {
-    const text = String(value || '').toLowerCase();
+    const raw = String(value || '').toLowerCase();
+    const text = raw.includes(':') ? raw.split('%', 1)[0] : raw;
     const unknown = {family:'unknown', scope:'unknown', address:''};
     if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) {
       const p = text.split('.').map(Number), [a,b,c] = p;

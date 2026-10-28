@@ -482,6 +482,11 @@ class Receiver {
         {"local_type", candidate_type(local->type)}, {"remote_type", candidate_type(remote->type)},
         {"local_transport", local->transport == NICE_CANDIDATE_TRANSPORT_UDP ? "udp" : "tcp"},
         {"remote_transport", remote->transport == NICE_CANDIDATE_TRANSPORT_UDP ? "udp" : "tcp"}};
+    // NiceCandidate.transport describes the allocation, not the client->TURN
+    // leg. The supported libnice API cannot attest both peers' TURN legs/URLs.
+    // Preserve that absence explicitly; no configured URL may fill this gap.
+    self.selected_pair_["local_relay_protocol"] = "unknown";
+    self.selected_pair_["remote_relay_protocol"] = "unknown";
     // Latch even a brief forbidden path change between periodic samples.
     const auto& opts = self.options_;
     if (!opts.local_addresses.empty()) {
@@ -492,9 +497,9 @@ class Receiver {
           (opts.address_family == "dual" || ((std::string(local_ip).find(':') != std::string::npos) ? opts.address_family == "ipv6" : opts.address_family == "ipv4"));
       if (!family_ok || local->transport != NICE_CANDIDATE_TRANSPORT_UDP || remote->transport != NICE_CANDIDATE_TRANSPORT_UDP ||
           detail::ice_address_summary(remote_ip)["address_class"] != "public" ||
-          (relay ? !opts.allow_relay || !(local_known || (local->type == NICE_CANDIDATE_TYPE_RELAYED && detail::ice_address_summary(local_ip)["address_class"] == "public"))
-                 : !local_known || !contains(opts.remote_addresses, remote_ip)))
+          relay || !local_known || !contains(opts.remote_addresses, remote_ip))
         self.error_ = "native pair differs from required public IP endpoints or relay policy";
+      if (relay) self.error_ = "native WAN relay acceptance unavailable: TURN leg protocol/server evidence missing";
     }
   }
   static void on_candidate(GstElement*, guint index, gchar* text, gpointer data) {

@@ -297,7 +297,7 @@ GStreamer 配置函数，支持带方括号 IPv6 的服务地址和 TURN 短期�
 要启用产品回退，在测试车辆 YAML 设置 `cloud.ice_direct_timeout_ms: 3000`，信令服务
 配置真实 STUN/TURN。具体状态和安全边界见 [ICE 配置说明](08-configuration.md#ice-配置来源与直连回退)。
 不修改产品默认码率、FEC、拥塞控制、打洞算法，也没有为追求直连而定期打断健康 relay。
-`allowRelay:true` 仅表示实验允许中继，不能把它标成直连成功。原生和网页均记录 attempt
+`allowRelay:true` 仅表示实验允许中继，不能把它标成直连成功；严格验收还受下文 TURN leg 证据限制。原生和网页均记录 attempt
 的 negotiation ID / route mode；分析器另外输出采样窗口内 direct/relay 保持时长、relay
 时间占比、路径变化次数、观察到的 relay→direct 次数。采样缺口超过 3 秒不计入保持时长。
 这些是观测值，不证明控制持续可用；连接建立率还需要保留所有成功/失败尝试作为分母，
@@ -351,3 +351,66 @@ Mac 原生模块/探针构建和 6 组定向 CTest 通过；网页实际方法 1
 刷新短期凭据并拒绝迟到响应，保留配置迁移与未验收边界；Efficiency 将新增证据限制在 ICE
 事件及既有采样周期，不增加产品逐帧追踪。可沉淀为本仓库“独立出口证明 → 候选判别 →
 固定族/路径 A/B”流程，已记录方法，未创建新 skill。
+
+### PR26 二次 review：TURN 取证与车端运行循环
+
+`protocol: udp` 只证明候选传输类型，不能证明客户端到 TURN 服务的连接也是 UDP。
+[RTCStats 规范](https://www.w3.org/TR/webrtc-stats/#dom-rtcicecandidatestats-relayprotocol)
+把这一段放在 `relayProtocol`，并明确 `url` / `relayProtocol` 仅属于本地候选。
+因此网页采样与离线分析保留两端的这些字段；任一 relay leg 为 TCP、TLS 或缺失时，
+UDP arm 均拒绝通过。不会从 TURN 配置的 `?transport=udp` 推断实际传输。
+
+允许 relay 的 WAN 配置现在还必须提供显式 TURN URL 和分配地址池，例如在上述配置中增加：
+
+```json
+{
+  "allowRelay": true,
+  "turnServers": [{
+    "url": "turn:turn.example.com:3478?transport=udp",
+    "relayAddresses": ["<本次 TURN 分配池的公网 IPv4 或 IPv6>"]
+  }]
+}
+```
+
+启动时主进程解析 URL 的主机，拒绝空结果或非公网结果，把实际 DNS 快照保存为
+`turnServers[].serverAddresses`，并写入带时间的 `turn_allowlist_resolved` 事件。
+监听地址和 relay 分配池可能不同，不能用 DNS 地址代替运营者确认的分配池。
+本轮信令下发的 TURN URL 必须位于允许列表；每个选中 relay 端须同时满足实际 URL、
+`relayProtocol: udp` 和分配池检查。非 relay 一端仍须匹配指定控制端/车端地址，
+不会因为另一端是 relay 而放开。每秒样本保留当时信令 URL 列表，分析器再次核验。
+迟到的旧凭据响应也受会话、代际及 negotiation ID 围栏约束，不覆盖新 Peer 的白名单证据。
+这些证据补充既有认证会话/negotiation 围栏，不证明物理出口独立或运营商 NAT 类型。
+
+**能力限制会明确失败，不再产生假阳性：**浏览器收到远端 relay 时，标准 RTCStats
+不给出其 TURN leg，当前尚无经认证的对端取证通道，因而不能通过严格 UDP relay 验收。
+原生接收器目前使用的 libnice selected-pair 回调也不能完整证明两端 TURN leg；保存为
+`unknown` 并锁存失败。`allowRelay:true` 允许尝试连接，不能覆盖证据缺失。
+本轮没有实现这条跨端取证通道；之后需要把对端证据与相同 session、negotiation、候选对
+绑定，才能放开相应中继 arm。生产 TURN 回退仍可使用，不受台架验收限制影响。
+
+新增 `mine-teleop-vehicle-ice-fallback-runtime-tests` 直接编译并运行完整
+`VehicleMediaRuntime::run()`，连接回环认证信令服务和真实 GStreamer answerer：
+
+- matching answer 成功应用后不投递远端候选，由生产循环的直连预算触发回退。
+- 检查刷新 TURN 凭据前，控制服务、旧 channel 和旧 answer 状态已被关闭/撤销；
+  新 Peer、negotiation ID 和凭据均不同，旧 readiness 不继承。
+- 在替换 Peer 尚无 answer 时注入旧 promise completion、candidate、DataChannel 回调，
+  并把迟到的 answer/candidate 送入真正的车端 HTTP polling 路径，检查队列、ufrag、
+  answer 状态和控制状态不受污染；新 mock 服务建立后，旧 channel 仍不能关闭它。
+- 在第二次凭据请求期间发送 shutdown，检查不再生成新 offer；生产代码在刷新前后
+  增加 stop-token 检查。超过首轮预算继续观察，确认没有第三次重建。
+
+此夹具严格使用 `test_bench_*`、mock 适配器、无相机/录像/上传、无 CAN。
+为确定性检查 DataChannel 生命周期，测试调用真实 on-open 回调建立 mock 服务前置状态；
+测试屏蔽车端云控制 WSS，避免另一授权路径并发启动服务，控制台信令仍正常工作。
+没有修改产品安全门槛，也没有模拟 VCU 已就绪。其 TURN 地址故意不可达，仅验证生产
+编排和凭据替换；真实 coturn 分配与 DataChannel 收发仍由另一个组件夹具验证。
+**真实路径故障后的完整车辆控制重新就绪、TURN 质量、原生 UI 运行验收仍未证明。**
+
+同时修复 `fe80::1%en0` 诊断分类：仅解析时剥离 zone，产品候选日志仍只有地址族和类别，
+不输出原始 IP、接口名或 zone。C++ 和 JS 都有隐私负例。
+
+本轮结果与日志哈希见 [review 修复证据](evidence/pr26-review-20261028.json)。
+`cloud.ice_direct_timeout_ms` 默认仍为 **0**，现场配置未启用 direct-first；
+没有健康 relay → direct 的周期性升级。四组独立公网 A/B 仍各 **0/1800 秒**，
+本轮未连接 Orin，也没有新增 LAN A/B。

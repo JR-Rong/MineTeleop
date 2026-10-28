@@ -38,7 +38,11 @@ async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy, i
   if (network) {
     const originalFetch = fetchIceServers;
     fetchIceServers = async () => {
-      const servers=await originalFetch(); network.requireIceServers(servers);
+      const id=mediaOfferScope?.id, session=nativeControlSessionId, generation=nativeControlSessionGeneration;
+      const servers=await originalFetch();
+      // A late credential response must not overwrite the replacement peer's
+      // allowlist evidence, even though the product already fences its use.
+      network.requireIceServers(servers, id===mediaOfferScope?.id && session===nativeControlSessionId && generation===nativeControlSessionGeneration);
       return network.serversForReceiver(servers);
     };
   }
@@ -148,10 +152,12 @@ async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy, i
       const pair = report.get(report.get(id)?.selectedCandidatePairId);
       const local = report.get(pair?.localCandidateId), remote = report.get(pair?.remoteCandidateId);
       if (pair?.state !== 'succeeded' || local?.protocol !== transport || remote?.protocol !== transport ||
+          [local,remote].some(c=>c?.candidateType==='relay' && c.relayProtocol!==transport) ||
           (!networkConfig?.allowRelay && (local.candidateType === 'relay' || remote.candidateType === 'relay')))
-        throw Error(`comparison requires a selected direct ${transport.toUpperCase()} pair`);
+        throw Error(`comparison requires selected ${transport.toUpperCase()} candidates and known matching TURN legs`);
       if (network) network.requirePair({local_address:local.address,remote_address:remote.address,
-        local_transport:local.protocol,remote_transport:remote.protocol,local_type:local.candidateType,remote_type:remote.candidateType});
+        local_transport:local.protocol,remote_transport:remote.protocol,local_type:local.candidateType,remote_type:remote.candidateType,
+        local_relay_protocol:local.relayProtocol,remote_relay_protocol:remote.relayProtocol,local_url:local.url,remote_url:remote.url});
       return {id: pair.id, local, remote};
     });
   }
@@ -159,7 +165,7 @@ async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy, i
     if (stopped || collecting) return; collecting = true;
     try {
       if (!polling || !nativeControlSessionId) throw Error('media session stopped');
-      const sample = {at: performance.now(), phase: phaseAt(performance.now() - data.start)};
+      const sample = {at: performance.now(), phase: phaseAt(performance.now() - data.start), signaledTurnUrls:network?.signaledTurnUrls()};
       if (mode === 'browser') {
         if (peer !== data.instance || peer.connectionState !== 'connected') throw Error('browser peer changed/disconnected');
         const report = await peer.getStats();
