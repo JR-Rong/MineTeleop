@@ -1,23 +1,30 @@
 'use strict';
 // Explicit bench entry; never included in desktop release bundles.
-const {app, BrowserWindow, ipcMain, session, screen} = require('electron');
+const {app, BrowserWindow, ipcMain, session, screen, powerSaveBlocker} = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const {execFileSync} = require('node:child_process');
+const {createNetworkPolicy} = require('./network-policy.cjs');
 const args = Object.fromEntries(process.argv.slice(2).reduce((out, value, i, all) => {
   if (value.startsWith('--')) out.push([value.slice(2), all[i + 1]]);
   return out;
 }, []));
 const seconds = Number(args.seconds || 600);
 const transport = args.transport || 'udp';
+const network = args.network ? JSON.parse(fs.readFileSync(args.network, 'utf8')) : null;
+if (network) {
+  createNetworkPolicy(network);
+  if (transport !== 'udp' || !Object.values(require('node:os').networkInterfaces()).flat().some(i => i.address === network.localIp))
+    throw Error('WAN bench requires UDP and a local address assigned to this Mac');
+}
 if (!['udp', 'tcp'].includes(transport) || process.platform !== 'darwin' || !['browser', 'native'].includes(args.mode) ||
     !/^http:\/\/127\.0\.0\.1:\d+\/$/.test(args.url || '') || !args.output || !args.config || !args.probe ||
-    !Number.isInteger(seconds) || seconds < 15 || seconds > 1800) throw Error('requires macOS, --mode browser|native --url http://127.0.0.1:PORT/ --config SAFE_BENCH --probe BINARY --output NEW_DIR [--seconds 15..1800] [--addon FILE] [--transport udp|tcp]');
+    !Number.isInteger(seconds) || seconds < 15 || seconds > 1800) throw Error('requires macOS, --mode browser|native --url http://127.0.0.1:PORT/ --config SAFE_BENCH --probe BINARY --output NEW_DIR [--seconds 15..1800] [--addon FILE] [--transport udp|tcp] [--network WAN_CONFIG_JSON]');
 execFileSync(args.probe, ['--config', args.config, '--validate-only'], {stdio: 'pipe'});
 fs.mkdirSync(args.output); // Refuse overwriting evidence.
 app.setPath('userData', path.join(args.output, 'electron-profile'));
 app.setName('MineTeleop Media Bench');
-let window, addon, poll, timeout, closing = false, browserReport, nativeReport, layouts = 0, lastViews = [], resources;
+let window, addon, poll, timeout, closing = false, browserReport, nativeReport, layouts = 0, lastViews = [], resources, awake;
 const resourceSamples = [];
 const events = [];
 function log(value) {
@@ -44,11 +51,12 @@ async function finish(error) {
       if (!nativeReport) log({event: 'error', error: 'native shutdown timed out'});
     }
     write('resources.json', resourceSamples);
-    write('metadata.json', {mode: args.mode, expected_transport: transport, duration_requested_s: seconds, versions: process.versions,
+    write('metadata.json', {mode: args.mode, expected_transport: transport, expected_network: network, network_acceptance: 'candidate checks only; independent uplinks require separate evidence', duration_requested_s: seconds, versions: process.versions,
       screen: window && !window.isDestroyed() ? window.getBounds() : null,
       errors: events.filter(e => e.event === 'error'), browser_report: Boolean(browserReport), native_report: Boolean(nativeReport),
       screenshot_note: 'web-content.png excludes embedded NSViews; use a window screenshot to verify native pixels'});
   } finally {
+    if (awake !== undefined) powerSaveBlocker.stop(awake);
     clearInterval(poll);
     if (window && !window.isDestroyed()) window.destroy();
     app.exit(error || !browserReport || events.some(e => e.event === 'error') || (args.mode === 'native' && !nativeReport?.passed) ? 1 : 0);
@@ -59,6 +67,7 @@ process.on('SIGINT', () => void finish('bench interrupted'));
 app.on('window-all-closed', () => { void finish('window closed before completion'); });
 app.on('before-quit', event => { if (!closing) { event.preventDefault(); void finish('application quit before completion'); } });
 app.whenReady().then(async () => {
+  awake = powerSaveBlocker.start('prevent-display-sleep');
   const origin = new URL(args.url).origin;
   const allowLan = (contents, permission, requestingUrl) => {
     try {
@@ -77,9 +86,9 @@ app.whenReady().then(async () => {
   window = new BrowserWindow({title: 'MineTeleop 媒体台架（控制关闭）', width: 1500, height: 960, show: false,
     webPreferences: {preload: path.join(__dirname, 'preload.cjs'), nodeIntegration: false, contextIsolation: true,
       sandbox: true, webSecurity: true, backgroundThrottling: true, spellcheck: false}});
-  // The Orin LAN may be a non-default interface (e.g. with a VPN active).
-  // The default-route-only policy can silently force ICE-TCP in this bench.
-  window.webContents.setWebRTCIPHandlingPolicy('default');
+  // WAN runs expose the default interface's addresses for pair verification;
+  // the policy rejects a route/NIC that differs from the explicit bench config.
+  window.webContents.setWebRTCIPHandlingPolicy(network ? 'default_public_and_private_interfaces' : 'default');
   window.webContents.setWindowOpenHandler(() => ({action: 'deny'}));
   window.webContents.on('will-navigate', (event, target) => { if (target !== args.url) event.preventDefault(); });
   window.webContents.on('will-attach-webview', event => event.preventDefault());
@@ -116,7 +125,7 @@ app.whenReady().then(async () => {
   await window.loadURL(args.url);
   if (args.mode === 'native') {
     addon = require(path.resolve(args.addon));
-    log({event: 'native_created', ...JSON.parse(addon.create(window.getNativeWindowHandle(), args.config, transport))});
+    log({event: 'native_created', ...JSON.parse(addon.create(window.getNativeWindowHandle(), args.config, transport, JSON.stringify(network)))});
     poll = setInterval(() => {
       try {
         for (const event of JSON.parse(addon.poll())) {
@@ -129,7 +138,7 @@ app.whenReady().then(async () => {
   resources = setInterval(() => { if (resourceSamples.length < 400) resourceSamples.push({wall_ms: Date.now(), processes: app.getAppMetrics()}); }, 5000);
   window.show(); window.focus();
   const script = fs.readFileSync(path.join(__dirname, 'renderer.js'), 'utf8');
-  await window.webContents.executeJavaScript(`(${script})(${JSON.stringify({mode: args.mode, seconds, transport})})`);
+  await window.webContents.executeJavaScript(`(${script})(${JSON.stringify({mode: args.mode, seconds, transport, networkConfig:network})},${createNetworkPolicy.toString()})`);
   log({event: 'page_ready', title: window.webContents.getTitle(), url: args.url, bounds: window.getBounds(),
     display: screen.getDisplayMatching(window.getBounds()), gpu_features: app.getGPUFeatureStatus(), window_id: window.getMediaSourceId(),
     webrtc_ip_handling_policy: window.webContents.getWebRTCIPHandlingPolicy()});

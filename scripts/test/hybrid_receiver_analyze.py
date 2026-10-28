@@ -52,12 +52,27 @@ def presentation_summary(frames):
     delta = frames[-1]['presentedFrames'] - frames[0]['presentedFrames']
     seconds = (frames[-1]['presentationTime'] - frames[0]['presentationTime']) / 1000
     assert delta > 0 and seconds > 0, 'presentation counter reset'
+    gaps = [b['presentationTime']-a['presentationTime'] for a, b in zip(frames, frames[1:])]
     return dict(presented_fps=delta / seconds, observed_frames=len(frames),
                 callback_coverage=(len(frames)-1) / delta,
+                observed_presentation_gap=distribution(gaps),
+                observed_gaps_over_100ms=sum(v>100 for v in gaps),
+                observed_gaps_over_250ms=sum(v>250 for v in gaps),
                 observed_receive_to_presentation=distribution([
                     frame['presentationTime']-frame['receiveTime'] for frame in frames
                     if isinstance(frame.get('receiveTime'), (int, float)) and frame['presentationTime'] >= frame['receiveTime']]),
                 note='RVFC samples can miss presentations under UI load; observed tails are not a complete frame population')
+
+
+def require_network_pairs(pairs, expected_transport, network):
+    assert pairs, 'missing selected pair history'
+    for pair in pairs:
+        assert pair['local_transport'] == pair['remote_transport'] == expected_transport, 'transport changed or differs from request'
+        assert pair['local_type'] != 'relay' and pair['remote_type'] != 'relay', 'relay selected'
+        if network:
+            assert network['kind'] == 'wan-ipv4-udp' and expected_transport == 'udp', 'WAN mode requires UDP'
+            assert pair['local_address'] in (network['localIp'], network['localPublicIp']), 'local endpoint differs from request'
+            assert pair['remote_address'] == network['remotePublicIp'], 'public remote endpoint differs from request'
 
 
 def browser_window(data, low, high):
@@ -125,6 +140,15 @@ def analyze(directory):
     report = json.loads((directory/'native.json').read_text()) if data['mode']=='native' else None
     if report:
         assert report['passed'] and not report.get('error'), 'native receiver failed'
+    transport = None if report else browser_transport_evidence(data['samples'])
+    network = data.get('expectedNetwork')
+    assert network == metadata.get('expected_network'), 'network configuration mismatch'
+    if network:
+        pairs = ([s['selected_pair'] for s in report['samples']
+                  if data['nativeStart'] <= s['clock_ms'] <= data['nativeStart']+data['seconds']*1000]
+                 if report else [s['pair'] for s in transport['selections']])
+        require_network_pairs(pairs, data['expectedTransport'], network)
+    full_window = native_window(data, report, 0, data['seconds']*1000) if report else browser_window(data, 0, data['seconds']*1000)
     phases = {}
     for index, phase in enumerate(PHASES):
         # Exclude five seconds around each planned phase transition, not tails
@@ -139,13 +163,15 @@ def analyze(directory):
             actual_ms=sum(s['actual_ms'] for s in samples), window_ms=high-low,
             busy_fraction=sum(s['actual_ms'] for s in samples)/(high-low))
         phases[phase] = result
-    return dict(mode=data['mode'], duration_s=(data['end']-data['start'])/1000, phases=phases,
+    return dict(mode=data['mode'], duration_s=(data['end']-data['start'])/1000, phases=phases, full_window=full_window,
         selected_pair=report['receiver']['selected_pair'] if report else data['samples'][-1].get('metrics',{}).get('selected_candidate_pair'),
-        browser_transport=browser_transport_evidence(data['samples']) if not report else None,
+        browser_transport=transport, expected_network=network,
+        independent_uplinks_verified=False,
         limitations=['Native endpoint is GL draw, browser endpoint is compositor submission; neither is scan-out.',
           'Native arrival is jitterbuffer input after SRTP; browser receiveTime is WebRTC frame receive metadata.',
           'Use within-client load-versus-idle differences; absolute path comparisons retain these endpoint differences.',
-          'Native buffering target 30 ms versus browser adaptive buffering; not a renderer-only experiment.'])
+          'Native buffering target 30 ms versus browser adaptive buffering; not a renderer-only experiment.',
+          'Public selected pairs cannot prove independent uplinks: retain route/NIC and public-egress evidence separately.'])
 
 
 if __name__ == '__main__':

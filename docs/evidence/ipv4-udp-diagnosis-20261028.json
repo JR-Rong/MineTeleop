@@ -1,0 +1,222 @@
+{
+  "schema": "ipv4-udp-diagnosis-v1",
+  "date_utc": "2026-10-28",
+  "base_pr25": "05bb17d2add2360dffc0557a61170eab7e5180c9",
+  "prior_pr26": "c72de2f3066f5a32c872a2d8d09ae8780e87b0b0",
+  "raw_root": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/ipv4-udp-ui-ab-20261028",
+  "scope": "Same-machine Chromium socket isolation and cancelled LAN smoke only; no WAN or 30-minute acceptance.",
+  "root_cause": {
+    "configuration": "stun:127.0.0.1:9",
+    "mechanism": "Chromium 152.0.7977.78 P2PSocketUdp::DoSend calls OnError for restricted STUN destination ports; port 9 is restricted.",
+    "sources": [
+      {
+        "url": "https://github.com/chromium/chromium/blob/152.0.7977.78/services/network/p2p/socket_udp.cc#L420",
+        "sha256": "91e4c5416385c3a5bfb35e2cb1974f68bde14dc9594bd933765adae166360452"
+      },
+      {
+        "url": "https://github.com/chromium/chromium/blob/152.0.7977.78/net/base/port_util.cc#L39",
+        "sha256": "231eba402292397eac5f7e48010d2d11b61cf5397d7b9c6f8412c499c73532d1"
+      }
+    ],
+    "reproducer": {
+      "path": "rtc-self.cjs",
+      "sha256": "d9bc71d8e50db2444554b98056e1b460fad0f88b3f366597408aa7e3b0a468dd"
+    }
+  },
+  "same_machine_cases": [
+    {
+      "name": "ipv4-no-stun",
+      "stun_urls": [],
+      "electron": "44.3.0",
+      "chromium": "152.0.7977.78",
+      "received_messages": 51,
+      "states": [
+        "connected",
+        "connected"
+      ],
+      "selected_pairs": [
+        {
+          "local_address": "198.18.0.1",
+          "remote_address": "198.18.0.1",
+          "protocol": "udp",
+          "local_type": "host",
+          "remote_type": "host"
+        }
+      ],
+      "result_sha256": "43bc0f0ab48f0c81c04a67b5bb6d8a83b7185ab2e7274cecaf46cd8080d280c3",
+      "netlog_sha256": "b8c5e9724b777e703742af02df25cf37a16b1023d2c8a63a0a4ddf66d663c458",
+      "note": "Two local RTCPeerConnections; data-channel reachability only, not a media performance test."
+    },
+    {
+      "name": "ipv4-discard-stun",
+      "stun_urls": [
+        "stun:127.0.0.1:9"
+      ],
+      "electron": "44.3.0",
+      "chromium": "152.0.7977.78",
+      "received_messages": 0,
+      "states": [
+        "failed",
+        "failed"
+      ],
+      "selected_pairs": [],
+      "result_sha256": "39c3fc03c0f8d1cafa17a4e7ebee88d2787389f59545dbf007c02959d81da82f",
+      "netlog_sha256": "7f0af8db86b4b066b3291cf7df7f0deb3b5b09bba6620624c2dd0192f986b59e",
+      "note": "Two local RTCPeerConnections; data-channel reachability only, not a media performance test."
+    },
+    {
+      "name": "ipv4-unreachable-high-stun",
+      "stun_urls": [
+        "stun:127.0.0.1:34789"
+      ],
+      "electron": "44.3.0",
+      "chromium": "152.0.7977.78",
+      "received_messages": 51,
+      "states": [
+        "connected",
+        "connected"
+      ],
+      "selected_pairs": [
+        {
+          "local_address": "198.18.0.1",
+          "remote_address": "198.18.0.1",
+          "protocol": "udp",
+          "local_type": "host",
+          "remote_type": "host"
+        }
+      ],
+      "result_sha256": "69d93c8e5f634d6e2a7156cc2a69dd9a79b4b7520366caa48268f34738731976",
+      "netlog_sha256": "ee7e5a4ad159b479e5adddc7f308a04286664b80e0e0d5bbbe96a1b3f38d14fb",
+      "note": "Two local RTCPeerConnections; data-channel reachability only, not a media performance test."
+    }
+  ],
+  "orin_diagnostics": [
+    {
+      "name": "smoke-browser-ipv4",
+      "accepted": false,
+      "reason": "Endpoint guard rejected",
+      "requested_s": 90,
+      "measurement_start_events": [],
+      "errors": [
+        {
+          "wall_ms": 1793146957629,
+          "event": "error",
+          "error": "Error: selected pair differs from the required IPv4/UDP LAN endpoints"
+        }
+      ],
+      "metadata_sha256": "6e9116dd7e9979bf0992113076b977af2f853de2031723ac3db632c884079778",
+      "events_sha256": "eadab73fef52d83c5f11bda63560ce486aff1699bd8365a84238b359ad9232e8"
+    },
+    {
+      "name": "smoke-browser-ipv4-02",
+      "accepted": false,
+      "reason": "User required independent WAN; LAN smoke terminated immediately",
+      "requested_s": 90,
+      "measurement_start_events": [
+        {
+          "wall_ms": 1793147057318,
+          "event": "measurement_started",
+          "mode": "browser",
+          "browser_clock_ms": 3647.4000005722046,
+          "selected_pairs": [
+            {
+              "id": "CPLY9ZkT4r_WoBhDvY9",
+              "local": {
+                "id": "ILY9ZkT4r",
+                "timestamp": 1793147057317.808,
+                "type": "local-candidate",
+                "address": "192.168.2.1",
+                "candidateType": "prflx",
+                "foundation": "4286324240",
+                "ip": "192.168.2.1",
+                "isRemote": false,
+                "networkType": "unknown",
+                "port": 54808,
+                "priority": 1845501695,
+                "protocol": "udp",
+                "relatedAddress": "198.18.0.1",
+                "relatedPort": 54808,
+                "transportId": "Tvideo01",
+                "usernameFragment": "bHMR"
+              },
+              "remote": {
+                "id": "IWoBhDvY9",
+                "timestamp": 1793147057317.808,
+                "type": "remote-candidate",
+                "address": "192.168.2.2",
+                "candidateType": "host",
+                "foundation": "1",
+                "ip": "192.168.2.2",
+                "isRemote": true,
+                "port": 35320,
+                "priority": 2015363327,
+                "protocol": "udp",
+                "transportId": "Tvideo01",
+                "usernameFragment": "TeQ99XdWl/p6zmX8nD+hcWDPu4YIWKQD"
+              }
+            }
+          ]
+        }
+      ],
+      "errors": [
+        {
+          "wall_ms": 1793147076971,
+          "event": "error",
+          "error": "application quit before completion"
+        }
+      ],
+      "metadata_sha256": "e3b1705b4cafc57a1020bb04e329875b7c72d128df15c7a60069c10b5ae68fc9",
+      "events_sha256": "7b87fe2b2337f0e3880ca00c3d64783fc9ebbe3b31f53c4d88b36261c5f61e4e"
+    }
+  ],
+  "wan_ab": {
+    "status": "blocked_external_connectivity",
+    "requested_seconds_per_arm": 1800,
+    "completed_seconds_per_arm": 0,
+    "orin_default_route": "default via 192.168.2.1 dev gbe1 metric 600",
+    "independent_uplink_available": false,
+    "user_requested_no_lan_substitute": true,
+    "turn_or_vpn_relay_is_not_direct_acceptance": true
+  },
+  "validation": {
+    "mac_probe_and_addon_build": "passed",
+    "ctest_suites": 4,
+    "ctest_passed": 4,
+    "desktop_tests_passed": 37,
+    "desktop_tests_skipped": 6,
+    "wan_policy_unit_tests": 4,
+    "hybrid_analysis_unit_tests": 7,
+    "receiver_analysis_unit_tests": 3,
+    "native_wan_runtime_tested": false,
+    "historical_full_window_reanalysis": {
+      "sha256": "d6b0b68cb81dd25d76c4ef5126b8f6a419679c7db2cf9212cb2090e0f0df2127",
+      "native_tcp_draw_max_ms": [
+        104.70799922943115,
+        108.15216636657715
+      ],
+      "native_tcp_draw_over_100ms": [
+        1,
+        1
+      ],
+      "new_media_test": false
+    }
+  },
+  "cleanup": {
+    "local_credentials_removed": true,
+    "ssh_socket_removed": true,
+    "own_receivers_or_console_remaining": [],
+    "remote_credentials_removed": true,
+    "remote_cameras_unowned": true,
+    "remote_can": "DOWN",
+    "remote_default_route": "default via 192.168.2.1 dev gbe1 metric 600"
+  },
+  "prior_ci": {
+    "head": "c72de2f3066f5a32c872a2d8d09ae8780e87b0b0",
+    "mac_result": "failure",
+    "job_url": "https://github.com/JR-Rong/MineTeleop/actions/runs/40551495701/job/122356634210",
+    "test": "mine-teleop-product-direct-integration-tests",
+    "message": "recovery did not withdraw DC",
+    "other_builds_and_offline_linux": "success",
+    "this_change_does_not_modify_product_control_or_test_thresholds": true
+  }
+}

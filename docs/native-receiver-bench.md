@@ -5,7 +5,7 @@
 ## 实现与范围
 
 - 复用 `VehicleMediaRuntime`、`SignalingService` 和 `DriverConsoleRuntime`，走真实的 SDP/ICE/DTLS/SRTP；没有另写视频 UDP 协议。
-- 同机模式创建仅监听回环地址的临时信令服务，随机生成凭据；结束后回收本次会话和线程。跨机模式通过回环 SSH 隧道接入单独启动的台架信令服务，凭据从环境变量读取。产品信令配置要求至少一个 ICE URL，实验填入回环 discard 端口 `stun:127.0.0.1:9`，不配置 TURN。直连结论以 libnice 的实际选中候选对为证。
+- 同机模式创建仅监听回环地址的临时信令服务，随机生成凭据；结束后回收本次会话和线程。跨机模式通过回环 SSH 隧道接入单独启动的台架信令服务，凭据从环境变量读取。产品信令配置要求至少一个 ICE URL。同机诊断目前使用无服务的回环高端口 `stun:127.0.0.1:34789`，不配置 TURN；它不具备公网地址发现能力。旧实验的端口 9 占位配置会触发 Chromium UDP socket 错误，已移除，见文末根因记录。跨网实验必须使用实际可达的公网 STUN 服务。直连结论以实际选中候选对及独立出口证据为准。
 - GStreamer 1.20 的 `get-stats` 候选对字段不完整，使用 `new-selected-pair-full` 记录实际候选类型及 UDP/TCP，保留 RTP/jitterbuffer 原始统计供核查。
 - H.264 解码可选 `avdec_h264`（2 线程）、Jetson `nvv4l2decoder disable-dpb=true` 或 Mac `vtdec_hw`（只允许硬件解码）。默认仅消费 sample；`--display` 增加单帧泄漏队列与 `glimagesink sync=false`，记录 GL 绘制回调。它不读取像素，也不声称测到了扫描输出。
 - 接收端 `webrtcbin latency` 可调；解码输出 `appsink max-buffers=1 drop=true sync=false`。独立消费线程可以人为暂停，以检验“丢旧帧、追新帧”的行为。
@@ -173,7 +173,7 @@ electron desktop/bench/main.cjs --mode native \
   --output /absolute/new-run-directory --seconds 600
 ```
 
-A 组仅将 `--mode` 换为 `browser`。支持 15–1800 秒；阶段分析要求超过 50 秒，正式对照使用 600 秒。五个等长阶段为：空闲、每 100 ms 约 8 ms DOM/CPU 工作、每 100 ms 约 40 ms 工作、每约秒 200 ms 主线程停顿、恢复空闲。实际工作时间/次数、长任务、可见性与焦点变化均保存，不只记录预设值。阶段边界前后各留 5 秒，阶段内部尾部不删除。预设三轮以 B→A→B 顺序观察前后漂移，不能替代随机化、多设备重复实验。必须逐轮核对实际 ICE 传输协议；本次发现网页选中 TCP 后，又补充原生 TCP 长测，详见下面的结果与排除记录。
+A 组仅将 `--mode` 换为 `browser`。支持 15–1800 秒；阶段分析要求超过 50 秒，2026-10-27 的历史局域网对照使用 600 秒；后续正式跨网对照要求每组 1800 秒。五个等长阶段为：空闲、每 100 ms 约 8 ms DOM/CPU 工作、每 100 ms 约 40 ms 工作、每约秒 200 ms 主线程停顿、恢复空闲。实际工作时间/次数、长任务、可见性与焦点变化均保存，不只记录预设值。阶段边界前后各留 5 秒，阶段内部尾部不删除。预设三轮以 B→A→B 顺序观察前后漂移，不能替代随机化、多设备重复实验。必须逐轮核对实际 ICE 传输协议；本次发现网页选中 TCP 后，又补充原生 TCP 长测，详见下面的结果与排除记录。
 
 `ui.json` 保存 RTCStats/视频呈现观察与相同的 UI 负载；`native.json` 保存独立线程逐帧证据；`metadata.json` 和 `events.jsonl` 保存版本、显示环境、异常和原生视图挂载。`web-content.png` 只截图网页合成结果，不包含原生 NSView，不能用它验收原生视频像素。
 
@@ -190,7 +190,7 @@ python3 scripts/test/hybrid_receiver_analyze.py /absolute/run-B1 /absolute/run-A
 
 最初三轮各 600 秒，顺序为原生 UDP B1 → 网页 TCP A → 原生 UDP B2。事后核对完整 RTCStats 才发现协议不同，因此不能将这组三轮的差值直接归因于原生视频层。保留全部数据，并补测 600 秒原生 TCP B3，与网页 TCP A 比较。所有原始数据和源码/二进制哈希见 [长测证据](evidence/hybrid-ui-long-ab-20261027.json)；每个 120 秒阶段统计中间 110 秒，完整 600 秒未裁剪。
 
-协议核对暴露了实验入口的问题：`default_public_and_private_interfaces` 只使用默认路由网卡，可能遗漏 Orin 的局域网接口，已改为 `default`。参见 [Electron 的接口枚举规则](https://www.electronjs.org/docs/latest/api/web-contents#contentssetwebrtciphandlingpolicypolicy)。随后增加了仅对本测试 origin 生效的局域网权限处理，以及开始前和每秒解析实际 video transport → selected pair → local/remote candidate 的验证。不过这些改动仍未解决本机 Electron 的 UDP `error 53`；macOS UI 中 Electron 的 Local Network 已开启，具体根因未确定，没有修改系统权限、VPN 或网络保护设置。
+协议核对暴露了实验入口的问题：`default_public_and_private_interfaces` 只使用默认路由网卡，可能遗漏 Orin 的局域网接口，已改为 `default`。参见 [Electron 的接口枚举规则](https://www.electronjs.org/docs/latest/api/web-contents#contentssetwebrtciphandlingpolicypolicy)。随后增加了仅对本测试 origin 生效的局域网权限处理，以及开始前和每秒解析实际 video transport → selected pair → local/remote candidate 的验证。当时这些改动仍未解决本机 Electron 的 UDP `error 53`；macOS UI 中 Electron 的 Local Network 已开启。2026-10-28 已通过隔离实验将根因定位到端口 9 的 STUN 占位配置，见后续章节；接口枚举与权限并非已证实根因。没有修改系统权限、VPN 或网络保护设置。
 
 补测尝试 `browser-A2-udp-10min`、`browser-A3-udp-10min` 和三轮诊断 smoke 都被 UDP 准入检查拒绝，没有凑入有效长测。当前台架默认要求 UDP；显式 `--transport tcp` 可以做 TCP 对照，原生会在收集 ICE 候选前关闭 UDP。两种模式都要核对实际结果，不能仅凭启动参数称为 UDP 或 TCP。此前三轮运行源码为 `4635153`，原生 TCP 补测为 `e997de7`；后者增加了协议准入及退出错误处理，UI 工作量和解码/绘制管线保持一致。
 
@@ -229,3 +229,40 @@ Mac 构建和 4 组定向 CTest 通过（含 5 项混合分析测试、已有分
 - 原生路径仍是显式实验入口，未进入默认桌面发布包；没有驾驶输入、原生视频健康准入、弱网恢复或光学延迟验收。
 
 复核：Reuse 复用了接收器和控制台已有逻辑；Quality 将平台视图适配与接收核心分开，并对协议、会话、队列、样本数量和退出状态作检查；Efficiency 的逐帧数据只在默认关闭的实验路径采集，视图位置未变化时不重复更新。值得在本仓库固定“版本冻结 → 实际连接对准入 → 相同 UI 负载 → 分阶段指标与原始证据”流程，尚未新增独立 skill。
+
+
+## 2026-10-28 UDP 根因与跨网准入
+
+**跨网 A/B 尚未执行，网页和原生均为 0/1800 秒。** 用户要求控制端与车端处于不同网络；Orin 当前只有 `default via 192.168.2.1 dev gbe1 metric 600`，通过本台 Mac 共享上网。用户确认暂时没有独立公网连接，因此中止局域网 smoke，未以云端信令、同 NAT 回流或 VPN 中继替代真正跨网直连。前述 40 分钟结果全部属于局域网诊断，不是实际应用环境验收。[本轮证据及原始文件哈希](evidence/ipv4-udp-diagnosis-20261028.json)。
+
+根因是实验配置 `stun:127.0.0.1:9`。在实际使用的 Chromium **152.0.7977.78** 中，[P2PSocketUdp::DoSend](https://github.com/chromium/chromium/blob/152.0.7977.78/services/network/p2p/socket_udp.cc#L420) 对受限 STUN 目标端口调用 `OnError()`；[受限端口表](https://github.com/chromium/chromium/blob/152.0.7977.78/net/base/port_util.cc#L39) 包含 9。不能将此配置错误归因于浏览器天生无法 UDP 直连，也不能将此前 TCP 回退造成的差异全部归因于原生渲染。
+
+同一 Electron 44.3.0 下，用两个本机 RTCPeerConnection、只交换 IPv4/UDP 候选做三种配置对照。无 STUN 与回环高端口 34789 均建立连接、在观察阶段接收 51 条数据；端口 9 两端均 failed、接收 0 条。它们是同机数据通道隔离实验，不是视频或跨网性能验证。切换 GStreamer 环境变量与权限处理未解释这一差异。随后 Orin 网页 smoke 确认选中 `192.168.2.1 ↔ 192.168.2.2 / UDP`，但因用户要求真实跨网而立即终止，明确排除。
+
+新增 `--network /absolute/wan.json` 为两组实验共用的严格配置，字段如下；尖括号内容必须替换为当次实测值，示例本身不可运行：
+
+```json
+{
+  "kind": "wan-ipv4-udp",
+  "localIp": "<Mac 实际出口网卡的 IPv4>",
+  "localPublicIp": "<Mac 在所用 STUN 服务上观察到的公网 IPv4>",
+  "remotePublicIp": "<Orin 在同一 STUN 服务上观察到的公网 IPv4>",
+  "stunUrl": "stun:<已解析并确认可达的 STUN 公网 IPv4>:3478"
+}
+```
+
+该实验入口只接受明确的公网 IPv4 STUN 地址，端口限定 3478 或 19302；不是对产品全部 ICE 配置的限制。台架信令必须向两端公布同一个 STUN URL 且不配置 TURN，否则在开始测量前报错。发送端沿用 PR25 的 ICE 配置能力；原生接收端新增 `webrtcbin.stun-server` 配置，并在候选收集前绑定 Mac 指定地址、关闭 ICE-TCP。
+
+网页和原生使用同一候选过滤与结果检查：接收候选仅保留指定远端公网 IPv4 的 UDP host/srflx/prflx，保留 SDP 会话及 ufrag 围栏；拒绝私网、CGNAT 共享地址、保留地址、IPv6、TCP 和 relay。开始前及每秒检查实际选中候选，原生额外在 libnice 候选对变更回调中锁存任何不匹配错误，避免短暂切换被周期采样漏掉。原生保存两端地址、端口和每秒候选对。公网地址变化会使该轮失效，需要重新记录配置并开始新一轮。
+
+**两个公网候选仍不足以证明独立出口。** 必须同时保留两端物理接口/路由、STUN 映射、连接期间实际选中候选对和出口证明；排除同一共享网络的 NAT hairpin、统一 VPN 出口与中继。分析结果的 `independent_uplinks_verified` 固定为 false，必须用外部路由证据补充验收，不能仅把该字段改为 true。当前没有这种外部条件，原生 STUN 路径也尚未通过真实跨网运行验证。
+
+网络条件具备后的验收顺序：先确认两端独立出口、同一公网 STUN 和公网信令可达，再做两种接收模式短测；确认均为指定 IPv4/UDP 后冻结源码、二进制和台架配置，分别运行 `--seconds 1800 --transport udp --network /absolute/wan.json`。每组五个阶段各 6 分钟，总采样 60 分钟，保留相同 UI 工作量、窗口、视频参数及后台竞争监控。信令也必须经公网可达通道，不能继续使用本轮 Mac→Orin 私网隧道。现阶段没有部署公网台架服务或启动后台长测。
+
+分析脚本新增 P50/P99.9，并同时输出完整窗口及分阶段结果，包括 >100ms/>250ms 间隔。网页 RVFC 漏采样仍需报告覆盖率，观测间隔不等于实际屏幕停顿。用历史原生 TCP 数据回放验证，完整窗口仍检出两路 104.708/108.152ms 的间隔，各一次；没有让阶段边界掩盖尾部。接收端时间点仍不等于光学相机到屏幕延迟。
+
+本轮本地验证：Mac 原生模块和探针构建通过，4 组定向 CTest 通过（混合分析 7 项、原分析 3 项、真实 Gst PTS、隔离检查），桌面测试 37 通过/6 跳过，包含 4 项网络策略回归。未运行新的跨网媒体测试或 30 分钟 A/B，未验证生产控制链路。
+
+独立客户端的收益主要是能直接控制网卡、UDP socket、缓冲和硬解/绘制调度；仅用 Electron 包住相同网页，仍使用 Chromium 媒体路径。换成原生接收栈可减少 UI 主线程对视频路径的干扰，但仍需网络、ICE/STUN 以及适当的中继回退策略。[ICE 标准](https://www.rfc-editor.org/rfc/rfc8445) 描述了使用 STUN/TURN 完成 NAT 穿越的机制；更换 UI 不会消除运营商 NAT 和防火墙限制。当前证据不支持“换客户端就必然更容易公网直连”或“公网延迟大幅降低”的结论。
+
+收尾检查：Orin 两个相机无占用、CAN DOWN，本任务进程和 SSH 隧道已退出，两端本轮临时凭据已删除。上一提交 `c72de2f` 的 macOS CI 在 `mine-teleop-product-direct-integration-tests` 报 `recovery did not withdraw DC`（与较早轮次同一失败信息），其他平台构建及离线 Linux 通过；保留该未解决记录，没有修改控制代码或放宽测试门槛。当前提交的 CI 以 PR 实时状态为准。

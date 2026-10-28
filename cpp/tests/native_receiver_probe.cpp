@@ -67,9 +67,10 @@ Json run(const Options& opts, VehicleConfig config) {
   signaling.driver_passwords = {{"native-bench", password}};
   signaling.device_tokens = {{config.vehicle_id, device_token}};
   signaling.driver_vehicle_permissions = {{"native-bench", {config.vehicle_id}}};
-  // Product identity validation requires an ICE URL. This loopback discard
-  // endpoint cannot relay traffic; the probe deliberately uses host candidates.
-  signaling.stun_urls = {"stun:127.0.0.1:9"}; signaling.turn_urls.clear();
+  // Same-host diagnostic only: identity validation requires an ICE URL.
+  // Use an unreachable loopback high port, never Chromium-restricted port 9.
+  // This is not a STUN service or a WAN configuration.
+  signaling.stun_urls = {"stun:127.0.0.1:34789"}; signaling.turn_urls.clear();
   signaling.api_rate_limit_requests = 12000;
   auto cloud = std::make_shared<SignalingService>(signaling);
   SimpleHttpServer server("127.0.0.1", 0,
@@ -96,7 +97,7 @@ Json run(const Options& opts, VehicleConfig config) {
   Json result{{"schema", "native-receiver-bench-v1"}, {"runtime", gst_version_string()},
               {"duration_requested_s", opts.seconds}, {"scope", "same-host WebRTC H264; decoder/consumer and optional GL draw; no scan-out, input, CAN or WAN acceptance"},
               {"control_enabled", false}, {"adapter", "mock"}, {"external_signaling", false},
-              {"stun_endpoint", "loopback-discard:9"}, {"turn_configured", false}};
+              {"stun_endpoint", "loopback-unreachable:34789"}, {"turn_configured", false}};
   receive(opts, config.vehicle_id, driver, receiver, result, [&] { return vehicle_done.load(); }, true);
   sender.request_stop(); sender.join();
   receiver.stop();

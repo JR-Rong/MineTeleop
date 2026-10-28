@@ -15,7 +15,8 @@ def distribution(values):
     if not values:
         return None
     return dict(count=len(values), mean_ms=statistics.mean(values), stddev_ms=statistics.pstdev(values),
-                p95_ms=values[math.ceil(len(values)*.95)-1], p99_ms=values[math.ceil(len(values)*.99)-1], max_ms=values[-1])
+                p50_ms=values[math.ceil(len(values)*.50)-1], p95_ms=values[math.ceil(len(values)*.95)-1],
+                p99_ms=values[math.ceil(len(values)*.99)-1], p999_ms=values[math.ceil(len(values)*.999)-1], max_ms=values[-1])
 
 
 def endpoints(samples, start, clock):

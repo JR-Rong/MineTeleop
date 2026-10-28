@@ -1,5 +1,5 @@
 import unittest
-from hybrid_receiver_analyze import browser_transport_evidence, presentation_summary, select_window
+from hybrid_receiver_analyze import browser_transport_evidence, presentation_summary, select_window, require_network_pairs
 
 
 class HybridMeasurementTests(unittest.TestCase):
@@ -34,6 +34,25 @@ class HybridMeasurementTests(unittest.TestCase):
     def test_reset_presentation_counter_is_rejected(self):
         with self.assertRaisesRegex(AssertionError,'counter'):
             presentation_summary([dict(presentationTime=1,presentedFrames=10),dict(presentationTime=2,presentedFrames=1)])
+
+    def test_wan_rejects_any_lan_tcp_or_relay_sample(self):
+        network = dict(kind='wan-ipv4-udp', localIp='192.168.1.2', localPublicIp='8.8.8.8', remotePublicIp='1.1.1.1')
+        pair = dict(local_address='192.168.1.2', remote_address='1.1.1.1', local_transport='udp', remote_transport='udp', local_type='host', remote_type='srflx')
+        require_network_pairs([pair], 'udp', network)
+        for change in [dict(remote_address='192.168.2.2'), dict(remote_type='relay'), dict(local_transport='tcp'), dict(local_address='')]:
+            with self.assertRaises(AssertionError):
+                require_network_pairs([dict(pair, **change), pair], 'udp', network)
+        with self.assertRaises(AssertionError):
+            require_network_pairs([], 'udp', network)
+
+    def test_full_observation_keeps_large_gap_and_quantile_tails(self):
+        frames = [dict(presentationTime=i*33, receiveTime=i*33-12, presentedFrames=i) for i in range(1000)]
+        frames.append(dict(presentationTime=frames[-1]['presentationTime']+300, receiveTime=frames[-1]['presentationTime'], presentedFrames=1000))
+        result = presentation_summary(frames)
+        self.assertEqual(result['observed_gaps_over_250ms'], 1)
+        self.assertEqual(result['observed_presentation_gap']['max_ms'], 300)
+        self.assertEqual(result['observed_receive_to_presentation']['p50_ms'], 12)
+        self.assertEqual(result['observed_receive_to_presentation']['max_ms'], 300)
 
 
 if __name__=='__main__': unittest.main()

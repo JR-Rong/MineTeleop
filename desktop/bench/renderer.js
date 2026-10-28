@@ -1,8 +1,9 @@
-async ({mode, seconds, transport = 'udp'}) => {
+async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy) => {
   const bridge = window.mineTeleopBench;
+  const network = networkConfig ? createNetworkPolicy(networkConfig) : null;
   const send = message => bridge.send(message).catch(error => { console.error(error); throw error; });
   const data = window.hybridBench = {schema: 'hybrid-ui-ab-v1', mode, seconds, expectedTransport: transport, userAgent: navigator.userAgent,
-    display: {devicePixelRatio, width: screen.width, height: screen.height}, samples: [], tracks: [], phases: [], load: [], longTasks: [], visibility: [], errors: [], overflow: 0, start: null};
+    expectedNetwork: networkConfig, display: {devicePixelRatio, width: screen.width, height: screen.height}, samples: [], tracks: [], phases: [], load: [], longTasks: [], visibility: [], errors: [], overflow: 0, start: null};
   let stopped = false, started = false, collecting = false, timer, loadTimer, nativeScope, offerSeen = false;
   let offeredIds = [], latestNative = null, lastNativeAt = 0, previousPhase = '';
   let observer, frameIds = [];
@@ -80,6 +81,19 @@ async ({mode, seconds, transport = 'udp'}) => {
     addEventListener('resize', layout);
     setInterval(layout, 500);
   }
+  if (network) {
+    const originalOffer = startFromOffer, originalIce = addIce;
+    startFromOffer = async offer => {
+      network.requireIceServers(iceServers);
+      iceServers = network.iceServers;
+      // Keep session/ufrag/negotiation fences intact while excluding other paths.
+      pendingIce = pendingIce.filter(network.candidateAllowed);
+      return originalOffer({...offer, sdp:network.filterSdp(offer.sdp)});
+    };
+    addIce = async candidate => {
+      if (network.candidateAllowed(candidate)) return originalIce(candidate);
+    };
+  }
   function phaseAt(elapsed) {
     const ratio = elapsed / (seconds * 1000);
     return ratio < .2 ? 'idle' : ratio < .4 ? 'ui8' : ratio < .6 ? 'ui40' : ratio < .8 ? 'stall200' : 'recovery';
@@ -109,7 +123,9 @@ async ({mode, seconds, transport = 'udp'}) => {
       const local = report.get(pair?.localCandidateId), remote = report.get(pair?.remoteCandidateId);
       if (pair?.state !== 'succeeded' || local?.protocol !== transport || remote?.protocol !== transport ||
           local.candidateType === 'relay' || remote.candidateType === 'relay')
-        throw Error(`LAN comparison requires a selected direct ${transport.toUpperCase()} pair`);
+        throw Error(`comparison requires a selected direct ${transport.toUpperCase()} pair`);
+      if (network) network.requirePair({local_address:local.address,remote_address:remote.address,
+        local_transport:local.protocol,remote_transport:remote.protocol,local_type:local.candidateType,remote_type:remote.candidateType});
       return {id: pair.id, local, remote};
     });
   }
@@ -126,8 +142,10 @@ async ({mode, seconds, transport = 'udp'}) => {
         sample.metrics = structuredClone(latestMetrics);
       } else {
         if (performance.now() - lastNativeAt > 3000) throw Error('native sample stream stopped');
+        if (network) network.requirePair(latestNative.selected_pair);
         sample.native_clock_ms = latestNative.clock_ms;
         sample.tracks = latestNative.tracks;
+        sample.selected_pair = latestNative.selected_pair;
       }
       if (data.samples.length < 1900) data.samples.push(sample); else data.overflow++;
     } catch (e) { error(e); }
@@ -136,6 +154,7 @@ async ({mode, seconds, transport = 'udp'}) => {
   async function start() {
     if (started) return; started = true;
     const selectedPairs = mode === 'browser' ? requireTransportPairs(await peer.getStats()) : undefined;
+    if (mode === 'native' && network) network.requirePair(latestNative?.selected_pair);
     data.start = performance.now(); data.wallStart = Date.now(); data.instance = peer;
     data.nativeStart = await send({type: 'ready', at: data.start, selectedPairs});
     if (mode === 'browser') {

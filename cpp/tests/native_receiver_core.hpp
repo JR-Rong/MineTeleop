@@ -42,6 +42,7 @@ struct Options {
   std::string config, output, signaling_url, driver_id{"native-bench"}, decoder{"avdec_h264"};
   int seconds{30}, jitter_ms{30}, stall_ms{0};
   std::string ice_transport{"auto"};  // Hybrid bench can pin the comparison transport.
+  std::string local_address, local_public_address, remote_address, stun_uri;
   bool validate_only{false}, display{false};
   std::vector<std::uintptr_t> window_handles;
 };
@@ -347,6 +348,7 @@ class Receiver {
     gst_bin_add(GST_BIN(pipeline_), peer_);
     g_object_set(peer_, "bundle-policy", GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE,
                  "latency", static_cast<guint>(options.jitter_ms), nullptr);
+    if (!options.stun_uri.empty()) g_object_set(peer_, "stun-server", options.stun_uri.c_str(), nullptr);
     g_signal_connect(pipeline_, "deep-element-added", G_CALLBACK(on_element), this);
     g_signal_connect(peer_, "pad-added", G_CALLBACK(on_pad), this);
     g_signal_connect(peer_, "on-ice-candidate", G_CALLBACK(on_candidate), this);
@@ -360,6 +362,12 @@ class Receiver {
       g_object_unref(ice);
     }
     if (!nice_) throw std::runtime_error("libnice selected-pair observation unavailable");
+    if (!options_.local_address.empty()) {
+      NiceAddress address;
+      nice_address_init(&address);
+      if (!nice_address_set_from_string(&address, options_.local_address.c_str()) ||
+          !nice_agent_add_local_address(nice_, &address)) throw std::runtime_error("cannot bind bench ICE address");
+    }
     if (options_.ice_transport == "tcp") g_object_set(nice_, "ice-udp", FALSE, nullptr);
     else if (options_.ice_transport == "udp") g_object_set(nice_, "ice-tcp", FALSE, nullptr);
     g_signal_connect(nice_, "new-selected-pair-full", G_CALLBACK(on_pair), this);
@@ -403,6 +411,7 @@ class Receiver {
     const auto candidate = payload.contains("candidate") && payload["candidate"].is_object() ? payload["candidate"] : payload;
     g_signal_emit_by_name(peer_, "add-ice-candidate", candidate.value("sdpMLineIndex", 0U), candidate.at("candidate").get<std::string>().c_str());
   }
+  Json selected_pair() { std::lock_guard lock(mutex_); return selected_pair_; }
   std::deque<Json> candidates() { std::lock_guard lock(mutex_); std::deque<Json> result; result.swap(candidates_); return result; }
   void check() {
     { std::lock_guard lock(mutex_); if (!error_.empty()) throw std::runtime_error(error_); }
@@ -463,9 +472,17 @@ class Receiver {
     char local_ip[NICE_ADDRESS_STRING_LEN]{}, remote_ip[NICE_ADDRESS_STRING_LEN]{};
     nice_address_to_string(&local->addr, local_ip); nice_address_to_string(&remote->addr, remote_ip);
     self.selected_pair_ = {{"local_address", local_ip}, {"remote_address", remote_ip}, {"source", "libnice-new-selected-pair-full"}, {"stream", stream}, {"component", component},
+        {"local_port", nice_address_get_port(&local->addr)}, {"remote_port", nice_address_get_port(&remote->addr)},
         {"local_type", candidate_type(local->type)}, {"remote_type", candidate_type(remote->type)},
         {"local_transport", local->transport == NICE_CANDIDATE_TRANSPORT_UDP ? "udp" : "tcp"},
         {"remote_transport", remote->transport == NICE_CANDIDATE_TRANSPORT_UDP ? "udp" : "tcp"}};
+    // Latch even a brief forbidden path change between periodic samples.
+    const auto& opts = self.options_;
+    if (!opts.local_address.empty() &&
+        ((local_ip != opts.local_address && local_ip != opts.local_public_address) || remote_ip != opts.remote_address ||
+         local->type == NICE_CANDIDATE_TYPE_RELAYED || remote->type == NICE_CANDIDATE_TYPE_RELAYED ||
+         local->transport != NICE_CANDIDATE_TRANSPORT_UDP || remote->transport != NICE_CANDIDATE_TRANSPORT_UDP))
+      self.error_ = "native pair differs from required public IPv4/UDP endpoints";
   }
   static void on_candidate(GstElement*, guint index, gchar* text, gpointer data) {
     auto& self = *static_cast<Receiver*>(data);

@@ -52,7 +52,8 @@ struct Layer {
           receiver.check();
           for (const auto& candidate : receiver.candidates()) emit({{"type", "candidate"}, {"candidate", candidate}});
           if (have_offer && Clock::now() >= next_sample) {
-            auto sample = Json{{"clock_ms", bench_now_ms()}, {"tracks", receiver.counters()}, {"webrtc", receiver.stats()}};
+            const auto pair = receiver.selected_pair();
+            auto sample = Json{{"clock_ms", bench_now_ms()}, {"tracks", receiver.counters()}, {"webrtc", receiver.stats()}, {"selected_pair", pair}};
             report["samples"].push_back(sample);
             emit({{"type", "sample"}, {"sample", sample}});
             next_sample = Clock::now() + 1s;
@@ -101,7 +102,7 @@ template<typename F> napi_value guarded(napi_env env, F body) {
 napi_value create(napi_env env, napi_callback_info info) {
   return guarded(env, [&] {
     if (layer) throw std::runtime_error("native media already initialized");
-    const auto args = arguments(env, info, 3);
+    const auto args = arguments(env, info, 4);
     const auto config = load_vehicle_config(string(env, args[1], 4096));
     validate(config);
     void* data{}; size_t size{}; check(napi_get_buffer_info(env, args[0], &data, &size));
@@ -113,6 +114,17 @@ napi_value create(napi_env env, napi_callback_info info) {
     Options opts; opts.decoder = "vtdec_hw"; opts.display = true;
     opts.ice_transport = string(env, args[2], 8);
     if (opts.ice_transport != "udp" && opts.ice_transport != "tcp") throw std::invalid_argument("invalid bench transport");
+    const auto network = Json::parse(string(env, args[3], 1024));
+    if (!network.is_null()) {
+      opts.local_address = network.at("localIp").get<std::string>();
+      opts.local_public_address = network.at("localPublicIp").get<std::string>();
+      opts.remote_address = network.at("remotePublicIp").get<std::string>();
+      const auto stun_url = network.at("stunUrl").get<std::string>();
+      if (opts.ice_transport != "udp" || network.at("kind") != "wan-ipv4-udp" || !stun_url.starts_with("stun:"))
+        throw std::invalid_argument("WAN bench requires UDP and STUN");
+      // The host validates the narrow STUN input before creating this addon.
+      opts.stun_uri = "stun://" + stun_url.substr(5);
+    }
     for (std::size_t index = 0; index < config.enabled_cameras().size(); ++index) {
       NSView* view = [[BenchVideoView alloc] initWithFrame:NSMakeRect(0, 0, 1, 1)];
       [view setWantsLayer:YES];
