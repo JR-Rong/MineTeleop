@@ -685,6 +685,7 @@ if(MINE_TELEOP_BUILD_TESTS)
 
   add_executable(mine-teleop-media-freshness-tests cpp/tests/media_freshness_tests.cpp)
   target_include_directories(mine-teleop-media-freshness-tests PRIVATE cpp/include)
+  target_link_libraries(mine-teleop-media-freshness-tests PRIVATE nlohmann_json::nlohmann_json)
   mine_teleop_enable_warnings(mine-teleop-media-freshness-tests)
   add_test(NAME mine-teleop-media-freshness-tests COMMAND mine-teleop-media-freshness-tests)
   if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)

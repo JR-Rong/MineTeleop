@@ -184,5 +184,23 @@
   "orin_contacted": false,
   "new_lan_ab_runs": 0,
   "direct_timeout_default_ms": 0,
-  "healthy_relay_to_direct_upgrade": false
+  "healthy_relay_to_direct_upgrade": false,
+  "primary_source_commit": "ba5361a5b8f615422d951550822d880c33a81c28",
+  "ci_dependency_fix": {
+    "source_parent_commit": "ba5361a5b8f615422d951550822d880c33a81c28",
+    "cause": "The standalone media-freshness-tests target lacked the imported nlohmann_json header dependency. The Linux test image had system headers and masked this; fetched-only CI builds exposed it.",
+    "change": "Link nlohmann_json::nlohmann_json explicitly on the standalone target; no runtime behavior changed.",
+    "cmake_sha256": "e779d1e3d662d60b698f941caf79d00d73322d6641b9868f68ac5667edce5651",
+    "validation": "macOS fetched-only JSON include path, targeted compile and CTest passed 1/1.",
+    "log_sha256": {
+      "fetched-json-configure.log": "1fe07783432309108eb8d8186cf0bc68a26ace51662da5cf32b1db3fe86b957d",
+      "fetched-json-build.log": "20c00828c877cd29490a5f645163a5ca767a88a9fea574a04d4ccc1ea0f1fed8",
+      "fetched-json-test.log": "bcb97656c8f69898a9e1240c51f184ef7b0357db70a0bb1e364e30f2f0533d0b"
+    },
+    "failed_ci_head": "ba5361a5b8f615422d951550822d880c33a81c28",
+    "failed_ci_jobs": [
+      "https://github.com/JR-Rong/MineTeleop/actions/runs/40650684927/job/122689874702",
+      "https://github.com/JR-Rong/MineTeleop/actions/runs/40650684927/job/122689874668"
+    ]
+  }
 }
