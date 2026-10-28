@@ -36,6 +36,8 @@ PRELUDE = r'''
 #include <vector>
 #include <utility>
 #include <nlohmann/json.hpp>
+#include "mine_teleop/detail/ice_diagnostics.hpp"
+namespace detail { using mine_teleop::detail::ice_candidate_summary; using mine_teleop::detail::ice_direct_sdp; }
 using Json=nlohmann::json;
 namespace detail { constexpr std::string_view kControlTransportCapability = "native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability = "native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability = "native-feedback-transport-v1"; }
 using guint=unsigned;using guint8=unsigned char;using gchar=char;using gpointer=void*;
@@ -243,6 +245,22 @@ void case_retired_answer_completion() {
     expect(peer.refs==1&&replacement.refs==1,"retired answer leaked a peer reference");
   }
 }
+void case_direct_filter_and_fresh_fallback() {
+  Impl impl;GstElement old,replacement;
+  activate(impl,old);impl.media_signal_state->ice_route_mode="direct";
+  negotiate(impl,old);complete(old);const auto first=impl.media_signal_state->negotiation_id;
+  received(impl,"webrtc_answer",{{"media_negotiation_id",first},{"sdp","v=0\r\na=ice-ufrag:remote\r\na=candidate:r 1 UDP 1 8.8.8.8 5000 typ relay\r\n"}});
+  expect(old.remote.back().find("typ relay")==std::string::npos,"embedded relay admitted in direct stage");
+  auto relay=ice(first);relay["candidate"]="candidate:r 1 UDP 1 8.8.8.8 5000 typ relay";
+  received(impl,"ice_candidate",relay);expect(old.added.empty(),"trickle relay admitted in direct stage");
+  auto host=ice(first);host["candidate"]="candidate:v6 1 UDP 100 2001:4860::1 5000 typ host";
+  received(impl,"ice_candidate",host);expect(old.added.size()==1,"public IPv6 host was excluded");
+  activate(impl,replacement,2);impl.media_signal_state->ice_route_mode="all";
+  negotiate(impl,replacement);complete(replacement);const auto second=impl.media_signal_state->negotiation_id;
+  answer(impl,second);received(impl,"ice_candidate",relay);expect(replacement.added.empty(),"old relay crossed negotiation fence");
+  relay["media_negotiation_id"]=second;received(impl,"ice_candidate",relay);
+  expect(replacement.added.size()==1,"fresh fallback did not admit TURN");
+}
 int main(){int failed=0;const std::vector<std::pair<const char*,void(*)()>> cases={
   {"ICE-VEHICLE-MOCK-001",case_order},{"ICE-VEHICLE-MOCK-002",case_late_callbacks},
   {"ICE-VEHICLE-MOCK-003",case_remote_order},{"ICE-VEHICLE-MOCK-004",case_legacy_retry},
@@ -257,6 +275,7 @@ int main(){int failed=0;const std::vector<std::pair<const char*,void(*)()>> case
   selected.emplace_back("ICE-VEHICLE-MIXED-001",case_failed_unpublished_attempt);
   selected.emplace_back("ICE-ANSWER-COMPLETION-001",case_answer_completion);
   selected.emplace_back("ICE-ANSWER-COMPLETION-002",case_retired_answer_completion);
+  selected.emplace_back("ICE-DIRECT-FALLBACK-VEHICLE-001",case_direct_filter_and_fresh_fallback);
 #endif
   for(const auto& [id,run]:selected){try{run();std::cout<<"PASS "<<id<<'\n';}catch(const std::exception& e){++failed;std::cerr<<"FAIL "<<id<<": "<<e.what()<<'\n';}}
   return failed?1:0;
@@ -293,6 +312,7 @@ def main():
     # With no local checkout/override, use the compiler's system include path.
     # Missing dependencies fail compilation and never become a skipped PASS.
     command = [args.compiler, "-std=c++20", "-Wall", "-Wextra", "-Wpedantic", "-Werror"]
+    command += ["-I" + str(ROOT / "include")]
     command += ["-I" + str(value) for value in includes]
     if args.sanitize:
         command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]

@@ -1722,7 +1722,11 @@ async function addIce(candidate){
 function offeredVideoCameraIds(sdp,tracks){const mapping=new Map(),cameraIds=(tracks||[]).map(track=>track.camera_id).filter(Boolean);let cameraIndex=0;for(const section of String(sdp||'').split(/\r?\nm=/).slice(1)){if(!section.startsWith('video '))continue;const match=section.match(/(?:^|\r?\n)a=mid:([^\r\n]+)/),cameraId=cameraIds[cameraIndex++];if(match&&cameraId)mapping.set(match[1],cameraId)}return mapping}
 const cameraView=MineTeleopCameraView.mount(cameraGrid);
 function attach(cameraId,track){if(emptyStage.isConnected)emptyStage.remove();cameraView.attach(cameraId,track)}
+async function fetchIceServers(){return (await post('/api/webrtc/ice-servers')).ice_servers||[]}
 async function startFromOffer(offer){
+  const routeMode=offer.ice_route_mode||'all';
+  let attemptIceServers=controlLogic.iceServersForMode(iceServers,routeMode);
+  const refreshIce=mediaHasOffer;
   const previousPeer=peer,nextScope=controlLogic.iceOfferScope(offer,!mediaHasOffer);
   if(nextScope.id&&(retiredMediaScopes.has(`id:${nextScope.id}`)||mediaOfferScope&&mediaOfferScope.id===nextScope.id))return;
   const queued=pendingIce;
@@ -1750,9 +1754,17 @@ async function startFromOffer(offer){
   remoteCameraIds=(offer.media_tracks||[]).map(t=>t.camera_id).filter(id=>typeof id==='string'&&id.length);
   cameraView.configure(remoteCameraIds);
   offeredCameraByMid=offeredVideoCameraIds(offer.sdp,offer.media_tracks||[]);
-  const nextPeer=new RTCPeerConnection({bundlePolicy:'max-bundle',iceServers,iceTransportPolicy:consoleConfig.ice_transport_policy});
-  peer=nextPeer;
   const sourceSession=nativeControlSessionId,sourceGeneration=nativeControlSessionGeneration;
+  const offerCurrent=()=>epoch===mediaPeerEpoch&&sourceSession===nativeControlSessionId&&sourceGeneration===nativeControlSessionGeneration;
+  if(refreshIce){
+    let refreshed;
+    try{refreshed=await fetchIceServers()}catch(error){if(!offerCurrent())return;throw error}
+    if(!offerCurrent())return;
+    iceServers=refreshed;attemptIceServers=controlLogic.iceServersForMode(iceServers,routeMode);
+  }
+  const nextPeer=new RTCPeerConnection({bundlePolicy:'max-bundle',iceServers:attemptIceServers,iceTransportPolicy:routeMode==='relay'?'relay':consoleConfig.ice_transport_policy});
+  clientLog('webrtc_ice_route_attempt',{mode:routeMode,media_negotiation_id:nextScope.id,server_count:attemptIceServers.length});
+  peer=nextPeer;
   const current=()=>currentMediaPeer(nextPeer,epoch,sourceSession,sourceGeneration);
   webrtcLabel.textContent=`协商 ${offer.codec||''}/${offer.backend||''}`;
   nextPeer.onconnectionstatechange=()=>{

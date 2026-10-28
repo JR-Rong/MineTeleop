@@ -1,9 +1,9 @@
-async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy) => {
+async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy, iceAddressInfo) => {
   const bridge = window.mineTeleopBench;
-  const network = networkConfig ? createNetworkPolicy(networkConfig) : null;
+  const network = networkConfig ? createNetworkPolicy(networkConfig, iceAddressInfo) : null;
   const send = message => bridge.send(message).catch(error => { console.error(error); throw error; });
   const data = window.hybridBench = {schema: 'hybrid-ui-ab-v1', mode, seconds, expectedTransport: transport, userAgent: navigator.userAgent,
-    expectedNetwork: networkConfig, display: {devicePixelRatio, width: screen.width, height: screen.height}, samples: [], tracks: [], phases: [], load: [], longTasks: [], visibility: [], errors: [], overflow: 0, start: null};
+    expectedNetwork: networkConfig, display: {devicePixelRatio, width: screen.width, height: screen.height}, attempts: [], samples: [], tracks: [], phases: [], load: [], longTasks: [], visibility: [], errors: [], overflow: 0, start: null};
   let stopped = false, started = false, collecting = false, timer, loadTimer, nativeScope, offerSeen = false;
   let offeredIds = [], latestNative = null, lastNativeAt = 0, previousPhase = '';
   let observer, frameIds = [];
@@ -35,20 +35,33 @@ async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy) =
     });
     void send({type: 'layout', rects});
   }
+  if (network) {
+    const originalFetch = fetchIceServers;
+    fetchIceServers = async () => {
+      const servers=await originalFetch(); network.requireIceServers(servers);
+      return network.serversForReceiver(servers);
+    };
+  }
   if (mode === 'native') {
     // The ordinary product console owns login, session fences and signaling.
     // Only media offer/ICE handling is replaced in this injected bench script.
     collectMetrics = async () => {};
     const early = [];
+    let nativeOfferReady = false;
     addIce = async candidate => {
-      if (!nativeScope) { if (early.length >= 128) throw Error('native early ICE overflow'); early.push(candidate); return; }
+      if (!nativeScope || !nativeOfferReady) { if (early.length >= 128) throw Error('native early ICE overflow'); early.push(candidate); return; }
       if (controlLogic.iceCandidateMatchesOffer(candidate, mediaOfferScope))
         await send({type: 'candidate', payload: {...candidate, media_negotiation_id: nativeScope.media_negotiation_id}});
     };
     startFromOffer = async offer => {
-      if (offerSeen) throw Error('native bench stops on renegotiation');
-      offerSeen = true;
-      mediaOfferScope = controlLogic.iceOfferScope(offer, true); mediaHasOffer = true;
+      if (started) throw Error('measurement stops on renegotiation; retain separate attempt evidence');
+      if (!offer.media_negotiation_id) throw Error('native receiver requires a fenced offer');
+      if (mediaOfferScope?.id===offer.media_negotiation_id || retiredMediaScopes.has('id:'+offer.media_negotiation_id)) return;
+      const refreshIce=offerSeen;
+      retireMediaOffer(mediaOfferScope);
+      mediaOfferScope = controlLogic.iceOfferScope(offer, !offerSeen); mediaHasOffer = true; offerSeen = true;
+      latestNative=null; lastNativeAt=0; nativeOfferReady=false;
+      data.attempts.push({at:performance.now(),id:offer.media_negotiation_id,mode:offer.ice_route_mode||'all'});
       nativeScope = {source_session_id: nativeControlSessionId,
         source_control_session_generation: nativeControlSessionGeneration, media_negotiation_id: offer.media_negotiation_id};
       offeredIds = (offer.media_tracks || []).map(t => t.camera_id);
@@ -57,17 +70,29 @@ async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy) =
       for (const id of offeredIds) document.getElementById('camera-' + id).querySelector('video').setAttribute('aria-hidden', 'true');
       if (emptyStage.isConnected) emptyStage.remove();
       webrtcLabel.textContent = '原生视频台架 · 控制关闭';
-      await send({type: 'offer', payload: offer});
+      const scope={...nativeScope};
+      const current=()=>scope.media_negotiation_id===nativeScope?.media_negotiation_id&&scope.source_session_id===nativeControlSessionId&&scope.source_control_session_generation===nativeControlSessionGeneration;
+      if(refreshIce){
+        let servers;
+        try{servers=await fetchIceServers()}catch(error){if(!current())return;throw error}
+        if(!current())return;
+        iceServers=servers;
+      }
+      await send({type: 'offer', payload: {...offer,ice_servers:controlLogic.iceServersForMode(iceServers,offer.ice_route_mode||'all')}});
+      if(!current())return;
+      nativeOfferReady=true;
+      for(const candidate of early.splice(0))await addIce(candidate);
     };
     bridge.onEvent(event => {
-      if (stopped) return;
+      if (stopped || event.media_negotiation_id!==nativeScope?.media_negotiation_id) return;
+      const scope={...nativeScope};
       void (async () => {
         if (event.type === 'answer') {
-          await post('/api/webrtc/answer', {...nativeScope, type: 'answer', sdp: event.sdp});
+          await post('/api/webrtc/answer', {...scope, type: 'answer', sdp: event.sdp});
           for (const candidate of early.splice(0)) await addIce(candidate);
           layout();
         } else if (event.type === 'candidate') {
-          await post('/api/webrtc/ice-candidate', {...nativeScope, candidate: event.candidate});
+          await post('/api/webrtc/ice-candidate', {...scope, candidate: event.candidate});
         } else if (event.type === 'sample') {
           latestNative = event.sample; lastNativeAt = performance.now();
           for (const id of offeredIds) {
@@ -76,7 +101,7 @@ async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy) =
           }
           if (!started && event.sample.tracks.length === 2 && event.sample.tracks.every(t => t.drawn > 30)) await start();
         }
-      })().catch(error);
+      })().catch(e=>{if(scope.media_negotiation_id===nativeScope?.media_negotiation_id)error(e)});
     });
     addEventListener('resize', layout);
     setInterval(layout, 500);
@@ -84,8 +109,9 @@ async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy) =
   if (network) {
     const originalOffer = startFromOffer, originalIce = addIce;
     startFromOffer = async offer => {
+      if (mode==='browser') data.attempts.push({at:performance.now(),id:offer.media_negotiation_id,mode:offer.ice_route_mode||'all'});
       network.requireIceServers(iceServers);
-      iceServers = network.iceServers;
+      iceServers = network.serversForReceiver(iceServers);
       // Keep session/ufrag/negotiation fences intact while excluding other paths.
       pendingIce = pendingIce.filter(network.candidateAllowed);
       return originalOffer({...offer, sdp:network.filterSdp(offer.sdp)});
@@ -122,7 +148,7 @@ async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy) =
       const pair = report.get(report.get(id)?.selectedCandidatePairId);
       const local = report.get(pair?.localCandidateId), remote = report.get(pair?.remoteCandidateId);
       if (pair?.state !== 'succeeded' || local?.protocol !== transport || remote?.protocol !== transport ||
-          local.candidateType === 'relay' || remote.candidateType === 'relay')
+          (!networkConfig?.allowRelay && (local.candidateType === 'relay' || remote.candidateType === 'relay')))
         throw Error(`comparison requires a selected direct ${transport.toUpperCase()} pair`);
       if (network) network.requirePair({local_address:local.address,remote_address:remote.address,
         local_transport:local.protocol,remote_transport:remote.protocol,local_type:local.candidateType,remote_type:remote.candidateType});

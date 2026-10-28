@@ -6,6 +6,7 @@ Each run contains ui.json, metadata.json and (for native) native.json.
 No receiver-local duration is labelled glass-to-glass or scan-out latency.
 """
 import json
+import ipaddress
 import math
 import pathlib
 import statistics
@@ -30,7 +31,8 @@ def browser_transport_evidence(samples):
             local, remote = stats[pair['localCandidateId']], stats[pair['remoteCandidateId']]
             value = dict(local_address=local.get('address'), remote_address=remote.get('address'),
                          local_transport=local['protocol'], remote_transport=remote['protocol'],
-                         local_type=local['candidateType'], remote_type=remote['candidateType'])
+                         local_type=local['candidateType'], remote_type=remote['candidateType'],
+                         local_port=local.get('port'), remote_port=remote.get('port'))
             key = (transport_id, pair['id'], json.dumps(value, sort_keys=True))
             selections.setdefault(key, dict(pair=value, samples=0))['samples'] += 1
     return dict(selections=list(selections.values()), direct_udp_only=all(
@@ -66,13 +68,46 @@ def presentation_summary(frames):
 
 def require_network_pairs(pairs, expected_transport, network):
     assert pairs, 'missing selected pair history'
+    legacy = network and network['kind'] == 'wan-ipv4-udp'
+    family = 'ipv4' if legacy else network.get('family', 'dual') if network else 'dual'
+    local = [network['localIp'], network['localPublicIp']] if legacy else network.get('localAddresses', [])+network.get('localPublicAddresses', []) if network else []
+    remote = [network['remotePublicIp']] if legacy else network.get('remotePublicAddresses', []) if network else []
+    canonical = lambda value: str(ipaddress.ip_address(value))
     for pair in pairs:
         assert pair['local_transport'] == pair['remote_transport'] == expected_transport, 'transport changed or differs from request'
-        assert pair['local_type'] != 'relay' and pair['remote_type'] != 'relay', 'relay selected'
+        relay = pair['local_type'] == 'relay' or pair['remote_type'] == 'relay'
+        assert not relay or network and network.get('allowRelay', False), 'relay selected in direct-only experiment'
         if network:
-            assert network['kind'] == 'wan-ipv4-udp' and expected_transport == 'udp', 'WAN mode requires UDP'
-            assert pair['local_address'] in (network['localIp'], network['localPublicIp']), 'local endpoint differs from request'
-            assert pair['remote_address'] == network['remotePublicIp'], 'public remote endpoint differs from request'
+            assert network['kind'] in ('wan-ipv4-udp','wan-dualstack') and expected_transport == 'udp', 'WAN mode requires UDP'
+            try:
+                left, right = ipaddress.ip_address(pair['local_address']), ipaddress.ip_address(pair['remote_address'])
+            except (ValueError, KeyError) as error:
+                raise AssertionError('selected pair has no valid IP evidence') from error
+            assert left.version == right.version and (family=='dual' or family=='ipv'+str(left.version)), 'address family differs from request'
+            assert right.is_global, 'remote endpoint is not public'
+            assert (relay and pair['local_type']=='relay' and left.is_global) or str(left) in map(canonical,local), 'local endpoint differs from request'
+            assert relay or str(right) in map(canonical,remote), 'public remote endpoint differs from request'
+
+
+def path_summary(samples):
+    """Selected-path observations only, never infer NAT type or control uptime."""
+    holds = {'direct':0., 'relay':0.}
+    switches = upgrades = 0
+    previous = None
+    for at, pair in samples:
+        path = 'relay' if 'relay' in (pair['local_type'],pair['remote_type']) else 'direct'
+        identity = (path,pair.get('local_address'),pair.get('remote_address'),pair.get('local_port'),pair.get('remote_port'))
+        if previous:
+            gap = at-previous[0]
+            if 0 <= gap <= 3000: holds[previous[1]] += gap/1000
+            if identity != previous[2]: switches += 1
+            if previous[1]=='relay' and path=='direct': upgrades += 1
+        previous = (at,path,identity)
+    total = sum(holds.values())
+    return dict(selected_hold_seconds=holds, observed_seconds=total,
+        relay_fraction=holds['relay']/total if total else None,
+        path_changes_observed=switches, relay_to_direct_changes_observed=upgrades,
+        note='Sampled selected-pair durations; gaps >3s excluded. Not proof of delivery, NAT behavior or seamless control recovery.')
 
 
 def browser_window(data, low, high):
@@ -148,6 +183,14 @@ def analyze(directory):
                   if data['nativeStart'] <= s['clock_ms'] <= data['nativeStart']+data['seconds']*1000]
                  if report else [s['pair'] for s in transport['selections']])
         require_network_pairs(pairs, data['expectedTransport'], network)
+    path_samples = []
+    for sample in data['samples']:
+        if report:
+            pair = sample.get('selected_pair')
+        else:
+            selections = browser_transport_evidence([sample])['selections']
+            pair = selections[0]['pair'] if len(selections)==1 else None
+        if pair: path_samples.append((sample['at'],pair))
     full_window = native_window(data, report, 0, data['seconds']*1000) if report else browser_window(data, 0, data['seconds']*1000)
     phases = {}
     for index, phase in enumerate(PHASES):
@@ -165,7 +208,8 @@ def analyze(directory):
         phases[phase] = result
     return dict(mode=data['mode'], duration_s=(data['end']-data['start'])/1000, phases=phases, full_window=full_window,
         selected_pair=report['receiver']['selected_pair'] if report else data['samples'][-1].get('metrics',{}).get('selected_candidate_pair'),
-        browser_transport=transport, expected_network=network,
+        browser_transport=transport, expected_network=network, path_summary=path_summary(path_samples),
+        connection_attempts=data.get('attempts',[]),
         independent_uplinks_verified=False,
         limitations=['Native endpoint is GL draw, browser endpoint is compositor submission; neither is scan-out.',
           'Native arrival is jitterbuffer input after SRTP; browser receiveTime is WebRTC frame receive metadata.',

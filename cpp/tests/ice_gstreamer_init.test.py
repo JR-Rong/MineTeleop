@@ -48,6 +48,8 @@ PRELUDE = r'''
 #include <utility>
 #include <vector>
 #include <nlohmann/json.hpp>
+#include "mine_teleop/detail/ice_diagnostics.hpp"
+namespace detail { using mine_teleop::detail::ice_candidate_summary; using mine_teleop::detail::ice_direct_sdp; }
 using Json=nlohmann::json;
 namespace detail { constexpr std::string_view kControlTransportCapability="native-control-transport-v1"; constexpr std::string_view kEmergencyStopCapability="native-stop-only-v1"; constexpr std::string_view kFeedbackTransportCapability="native-feedback-transport-v1"; }
 using namespace std::chrono_literals;
@@ -348,7 +350,7 @@ def main():
     flags = subprocess.run([args.pkg_config, "--cflags", "--libs", *dependencies], capture_output=True, text=True)
     (args.output / "pkg-config.log").write_text(flags.stdout + flags.stderr)
     start = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    command = [args.compiler, "-std=c++20", "-Wall", "-Wextra", "-Wpedantic", "-Werror"]
+    command = [args.compiler, "-I" + str(CPP_ROOT / "include"), "-std=c++20", "-Wall", "-Wextra", "-Wpedantic", "-Werror"]
     includes = args.json_include.split(";") if args.json_include is not None else [str(p) for p in (CPP_ROOT.parent / "offline-deps").glob("json-*/include")]
     if args.json_include is None and len(includes) > 1:
         raise RuntimeError("ambiguous JSON includes; pass --json-include")

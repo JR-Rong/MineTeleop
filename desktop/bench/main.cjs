@@ -5,17 +5,18 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {execFileSync} = require('node:child_process');
 const {createNetworkPolicy} = require('./network-policy.cjs');
+const {iceAddressInfo} = require('../../cpp/web/control_logic.js');
 const args = Object.fromEntries(process.argv.slice(2).reduce((out, value, i, all) => {
   if (value.startsWith('--')) out.push([value.slice(2), all[i + 1]]);
   return out;
 }, []));
 const seconds = Number(args.seconds || 600);
 const transport = args.transport || 'udp';
-const network = args.network ? JSON.parse(fs.readFileSync(args.network, 'utf8')) : null;
+const networkInput = args.network ? JSON.parse(fs.readFileSync(args.network, 'utf8')) : null;
+const network = networkInput ? createNetworkPolicy(networkInput, iceAddressInfo).config : null;
 if (network) {
-  createNetworkPolicy(network);
-  if (transport !== 'udp' || !Object.values(require('node:os').networkInterfaces()).flat().some(i => i.address === network.localIp))
-    throw Error('WAN bench requires UDP and a local address assigned to this Mac');
+  if (transport !== 'udp' || !network.localAddresses.every(ip => Object.values(require('node:os').networkInterfaces()).flat().some(i => iceAddressInfo(i.address).address === ip)))
+    throw Error('WAN bench requires UDP and local addresses assigned to this Mac');
 }
 if (!['udp', 'tcp'].includes(transport) || process.platform !== 'darwin' || !['browser', 'native'].includes(args.mode) ||
     !/^http:\/\/127\.0\.0\.1:\d+\/$/.test(args.url || '') || !args.output || !args.config || !args.probe ||
@@ -138,7 +139,7 @@ app.whenReady().then(async () => {
   resources = setInterval(() => { if (resourceSamples.length < 400) resourceSamples.push({wall_ms: Date.now(), processes: app.getAppMetrics()}); }, 5000);
   window.show(); window.focus();
   const script = fs.readFileSync(path.join(__dirname, 'renderer.js'), 'utf8');
-  await window.webContents.executeJavaScript(`(${script})(${JSON.stringify({mode: args.mode, seconds, transport, networkConfig:network})},${createNetworkPolicy.toString()})`);
+  await window.webContents.executeJavaScript(`(${script})(${JSON.stringify({mode: args.mode, seconds, transport, networkConfig:network})},${createNetworkPolicy.toString()},${iceAddressInfo.toString()})`);
   log({event: 'page_ready', title: window.webContents.getTitle(), url: args.url, bounds: window.getBounds(),
     display: screen.getDisplayMatching(window.getBounds()), gpu_features: app.getGPUFeatureStatus(), window_id: window.getMediaSourceId(),
     webrtc_ip_handling_policy: window.webContents.getWebRTCIPHandlingPolicy()});

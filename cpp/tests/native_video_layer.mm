@@ -32,8 +32,9 @@ struct Layer {
     Json report{{"schema", "native-receiver-remote-v1"}, {"runtime", gst_version_string()},
         {"expected_transport", opts.ice_transport}, {"measurement_start_clock_ms", bench_now_ms()}, {"samples", Json::array()}, {"passed", false}};
     try {
-      Receiver receiver(opts);
-      receiver.start();
+      std::unique_ptr<Receiver> receiver;
+      std::string negotiation;
+      report["attempts"] = Json::array();
       bool have_offer = false;
       auto next_sample = Clock::now();
       const auto deadline = Clock::now() + 1900s;
@@ -43,31 +44,46 @@ struct Layer {
           { std::lock_guard lock(mutex); pending.swap(commands); }
           for (const auto& command : pending) {
             if (command.at("op") == "offer") {
-              const auto sdp = receiver.answer(command.at("payload"));
+              const auto& offer = command.at("payload");
+              if (receiver) {
+                if (report["attempts"].size() >= 8) throw std::runtime_error("native setup retry limit exceeded");
+                receiver->stop();
+                report["attempts"].push_back({{"media_negotiation_id", negotiation}, {"receiver", receiver->report()}, {"samples", report["samples"]}});
+                receiver.reset(); report["samples"] = Json::array();
+              }
+              negotiation = offer.at("media_negotiation_id").get<std::string>();
+              opts.ice_servers = offer.value("ice_servers", Json::array());
+              opts.ice_route_mode = offer.value("ice_route_mode", "all");
+              receiver = std::make_unique<Receiver>(opts); receiver->start();
+              const auto sdp = receiver->answer(offer);
               have_offer = true;
-              emit({{"type", "answer"}, {"sdp", sdp}});
-            } else receiver.candidate(command.at("payload"));
+              emit({{"type", "answer"}, {"sdp", sdp}, {"media_negotiation_id", negotiation}});
+            } else if (receiver) receiver->candidate(command.at("payload"));
           }
           if (Clock::now() >= deadline) throw std::runtime_error("native bench hard deadline exceeded");
-          receiver.check();
-          for (const auto& candidate : receiver.candidates()) emit({{"type", "candidate"}, {"candidate", candidate}});
+          if (!receiver) { std::this_thread::sleep_for(5ms); continue; }
+          receiver->check();
+          for (const auto& candidate : receiver->candidates()) emit({{"type", "candidate"}, {"candidate", candidate}, {"media_negotiation_id", negotiation}});
           if (have_offer && Clock::now() >= next_sample) {
-            const auto pair = receiver.selected_pair();
-            auto sample = Json{{"clock_ms", bench_now_ms()}, {"tracks", receiver.counters()}, {"webrtc", receiver.stats()}, {"selected_pair", pair}};
+            const auto pair = receiver->selected_pair();
+            auto sample = Json{{"clock_ms", bench_now_ms()}, {"tracks", receiver->counters()}, {"webrtc", receiver->stats()}, {"selected_pair", pair}};
             report["samples"].push_back(sample);
-            emit({{"type", "sample"}, {"sample", sample}});
+            emit({{"type", "sample"}, {"sample", sample}, {"media_negotiation_id", negotiation}});
             next_sample = Clock::now() + 1s;
           }
           std::this_thread::sleep_for(5ms);
         }
       } catch (const std::exception& error) { report["error"] = error.what(); }
-      receiver.stop();
-      report["receiver"] = receiver.report();
+      if (!receiver) throw std::runtime_error("native receiver never received an offer");
+      receiver->stop();
+      report["receiver"] = receiver->report();
       report["measurement_end_clock_ms"] = bench_now_ms();
       report["passed"] = have_offer && !report.contains("error") &&
           report["receiver"]["tracks"].size() == opts.window_handles.size() &&
           report["receiver"]["selected_pair"].value("local_transport", "") == opts.ice_transport &&
-          report["receiver"]["selected_pair"].value("remote_transport", "") == opts.ice_transport;
+          report["receiver"]["selected_pair"].value("remote_transport", "") == opts.ice_transport &&
+          (opts.allow_relay || (report["receiver"]["selected_pair"].value("local_type", "") != "relay" &&
+                               report["receiver"]["selected_pair"].value("remote_type", "") != "relay"));
       for (const auto& track : report["receiver"]["tracks"])
         if (track.at("draw_events_pts_ns_clock_ms").size() < 30 || track.at("identity_observation_overflow") != 0)
           report["passed"] = false;
@@ -114,16 +130,15 @@ napi_value create(napi_env env, napi_callback_info info) {
     Options opts; opts.decoder = "vtdec_hw"; opts.display = true;
     opts.ice_transport = string(env, args[2], 8);
     if (opts.ice_transport != "udp" && opts.ice_transport != "tcp") throw std::invalid_argument("invalid bench transport");
-    const auto network = Json::parse(string(env, args[3], 1024));
+    const auto network = Json::parse(string(env, args[3], 8192));
     if (!network.is_null()) {
-      opts.local_address = network.at("localIp").get<std::string>();
-      opts.local_public_address = network.at("localPublicIp").get<std::string>();
-      opts.remote_address = network.at("remotePublicIp").get<std::string>();
-      const auto stun_url = network.at("stunUrl").get<std::string>();
-      if (opts.ice_transport != "udp" || network.at("kind") != "wan-ipv4-udp" || !stun_url.starts_with("stun:"))
-        throw std::invalid_argument("WAN bench requires UDP and STUN");
-      // The host validates the narrow STUN input before creating this addon.
-      opts.stun_uri = "stun://" + stun_url.substr(5);
+      opts.local_addresses = network.at("localAddresses").get<std::vector<std::string>>();
+      opts.local_public_addresses = network.at("localPublicAddresses").get<std::vector<std::string>>();
+      opts.remote_addresses = network.at("remotePublicAddresses").get<std::vector<std::string>>();
+      opts.address_family = network.at("family").get<std::string>();
+      opts.allow_relay = network.at("allowRelay").get<bool>();
+      if (opts.ice_transport != "udp" || network.at("kind") != "wan-dualstack")
+        throw std::invalid_argument("WAN bench requires explicit dual-stack configuration and UDP");
     }
     for (std::size_t index = 0; index < config.enabled_cameras().size(); ++index) {
       NSView* view = [[BenchVideoView alloc] initWithFrame:NSMakeRect(0, 0, 1, 1)];

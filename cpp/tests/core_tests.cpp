@@ -499,6 +499,30 @@ void test_config_loads_current_vehicle_yaml() {
       "safe default ordinary brake pressure changed");
 }
 
+void test_ice_configuration_source_and_direct_budget() {
+  const auto base = read_text("configs/vehicle-agent.dev.yaml");
+  expect(mine_teleop::load_vehicle_config("configs/vehicle-agent.dev.yaml").cloud.ice_direct_timeout_ms == 0,
+         "direct-first retry must be opt-in");
+  for (const auto budget : {0, 3000, 30000, -1, 30001}) {
+    auto source = base;
+    replace_once(source, "cloud:\n", "cloud:\n  ice_direct_timeout_ms: " + std::to_string(budget) + "\n");
+    const auto path = write_temp_vehicle_config("ice-budget", source);
+    if (budget < 0 || budget > 30000) {
+      expect_throws([&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); }, "invalid ICE budget accepted");
+    } else {
+      const auto config = mine_teleop::load_vehicle_config(path);
+      expect(config.cloud.ice_direct_timeout_ms == budget, "ICE budget lost");
+      expect(config.redacted_summary().at("ice_servers_source") == "authenticated_signaling", "ICE source missing");
+    }
+    std::filesystem::remove(path);
+  }
+  for (const auto* key : {"stun_servers", "turn_servers"}) {
+    const auto path = write_temp_vehicle_config("dead-ice-key", base + "\nice:\n  " + key + ": []\n");
+    expect_throws([&] { static_cast<void>(mine_teleop::load_vehicle_config(path)); }, "unused vehicle ICE key silently accepted");
+    std::filesystem::remove(path);
+  }
+}
+
 void test_camera_identity_contract() {
   const auto base = read_text("configs/vehicle-agent.dev.yaml");
   for (const auto& id : {"fish_front", "fish_rear", "fish_left", "fish_right",
@@ -5133,6 +5157,7 @@ void test_uploader_requires_closed_fragment_and_defers_digest() {
 int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"config_loads_current_vehicle_yaml", test_config_loads_current_vehicle_yaml},
+      {"ice_configuration_source_and_direct_budget", test_ice_configuration_source_and_direct_budget},
       {"camera_identity_contract", test_camera_identity_contract},
       {"vehicle_config_rejects_unimplemented_control_safety_options", test_vehicle_config_rejects_unimplemented_control_safety_options},
       {"vehicle_config_validates_full_scale_motor_torque", test_vehicle_config_validates_full_scale_motor_torque},

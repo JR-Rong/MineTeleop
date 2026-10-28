@@ -1,5 +1,5 @@
 import unittest
-from hybrid_receiver_analyze import browser_transport_evidence, presentation_summary, select_window, require_network_pairs
+from hybrid_receiver_analyze import browser_transport_evidence, presentation_summary, select_window, require_network_pairs, path_summary
 
 
 class HybridMeasurementTests(unittest.TestCase):
@@ -44,6 +44,31 @@ class HybridMeasurementTests(unittest.TestCase):
                 require_network_pairs([dict(pair, **change), pair], 'udp', network)
         with self.assertRaises(AssertionError):
             require_network_pairs([], 'udp', network)
+
+    def test_ipv6_and_explicit_relay_arm(self):
+        network = dict(kind='wan-dualstack', family='ipv6', allowRelay=False,
+                       localAddresses=['2001:4860::1'], localPublicAddresses=['2001:4860::1'],
+                       remotePublicAddresses=['2606:4700::1'])
+        pair = dict(local_address='2001:4860::1', remote_address='2606:4700::1',
+                    local_transport='udp', remote_transport='udp', local_type='host', remote_type='host')
+        require_network_pairs([pair], 'udp', network)
+        with self.assertRaises(AssertionError):
+            require_network_pairs([dict(pair, remote_address='fe80::1')], 'udp', network)
+        relay = dict(pair, remote_address='2606:4700::2', remote_type='relay')
+        with self.assertRaises(AssertionError):
+            require_network_pairs([relay], 'udp', network)
+        require_network_pairs([relay], 'udp', dict(network, allowRelay=True))
+        with self.assertRaises(AssertionError):
+            require_network_pairs([pair], 'udp', dict(network, family='ipv4'))
+
+    def test_path_history_keeps_relay_and_excludes_sampling_gaps(self):
+        direct = dict(local_address='2001:4860::1', remote_address='2606:4700::1', local_type='host', remote_type='host')
+        relay = dict(direct, remote_type='relay')
+        summary = path_summary([(0,relay),(1000,relay),(2000,direct),(3000,direct),(9000,direct)])
+        self.assertEqual(summary['selected_hold_seconds'], dict(direct=1, relay=2))
+        self.assertEqual(summary['path_changes_observed'], 1)
+        self.assertEqual(summary['relay_to_direct_changes_observed'], 1)
+        self.assertAlmostEqual(summary['relay_fraction'], 2/3)
 
     def test_full_observation_keeps_large_gap_and_quantile_tails(self):
         frames = [dict(presentationTime=i*33, receiveTime=i*33-12, presentedFrames=i) for i in range(1000)]

@@ -4,6 +4,10 @@
 #include "mine_teleop/detail/emergency_stop.hpp"
 #include "mine_teleop/detail/feedback_transport.hpp"
 #include "mine_teleop/detail/diagnostic_queue.hpp"
+#include "mine_teleop/detail/ice_diagnostics.hpp"
+#include "mine_teleop/detail/ice_route_policy.hpp"
+#include "mine_teleop/detail/gstreamer_ice_servers.hpp"
+#include <agent.h>
 
 #include "mine_teleop/gstreamer_media.hpp"
 #include "mine_teleop/detail/gstreamer_freshness.hpp"
@@ -582,6 +586,9 @@ struct VehicleMediaRuntime::Impl {
     GstElement* peer{nullptr};
     std::string negotiation_id;
     std::string compatibility_issue;
+    std::string ice_route_mode{"all"};
+    Json selected_pair{Json::object()};
+    std::uint64_t selected_pair_changes{0};
     bool local_description_ready{false};
     bool offer_queued{false};
     bool answer_apply_pending{false};
@@ -602,6 +609,7 @@ struct VehicleMediaRuntime::Impl {
       answer_apply_pending = false; answer_applied = false;
       local_ufrags.clear(); remote_ufrags.clear();
       pending_local_candidates.clear(); pending_remote_candidates.clear(); pending.clear();
+      selected_pair = Json::object(); selected_pair_changes = 0;
       ++attempt_count;
     }
   };
@@ -993,7 +1001,9 @@ struct VehicleMediaRuntime::Impl {
     const auto ufrag = candidate_ufrag(Json{{"candidate", candidate}});
     if (!ufrag.empty() && std::find(state->local_ufrags.begin(), state->local_ufrags.end(), ufrag) == state->local_ufrags.end()) return;
     const auto count = ++self->local_ice_candidate_count;
-    if (count == 1) {
+    if (count <= 64) {
+      auto summary = detail::ice_candidate_summary(candidate);
+      summary.update({{"candidate_count", count}, {"sdp_mline_index", mline_index}, {"media_negotiation_id", state->negotiation_id}});
       self->emit_diagnostic(
           "vehicle_webrtc_ice_candidate_discovered",
           "webrtc_local_ice_candidate_available",
@@ -1001,7 +1011,7 @@ struct VehicleMediaRuntime::Impl {
           "",
           "No action is required; this is a connectivity milestone.",
           true,
-          {{"candidate_count", count}, {"sdp_mline_index", mline_index}});
+          std::move(summary));
     }
     Json payload{{"candidate", candidate}, {"sdpMLineIndex", mline_index},
         {"media_negotiation_id", state->negotiation_id}};
@@ -1221,6 +1231,7 @@ struct VehicleMediaRuntime::Impl {
          {"feedback_transport_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kFeedbackTransportCapability : std::string_view{}},
          {"sdp", text == nullptr ? "" : text},
          {"media_negotiation_id", negotiation_id},
+         {"ice_route_mode", state->ice_route_mode},
          {"legacy_bootstrap_allowed", state->attempt_count == 1 && state->offer_count == 1},
          {"codec", (self->config.runtime.mock_control_diagnostic ? std::string("none") : to_string(self->active_candidate.codec))},
          {"backend", (self->config.runtime.mock_control_diagnostic ? std::string("none") : to_string(self->active_candidate.backend))},
@@ -3853,58 +3864,53 @@ struct VehicleMediaRuntime::Impl {
     return pipeline_text.str();
   }
 
-  [[nodiscard]] std::string gstreamer_ice_uri(std::string url) const {
-    const auto separator = url.find(':');
-    if (separator == std::string::npos) return url;
-    auto remainder = url.substr(separator + 1);
-    while (remainder.starts_with("//")) remainder.erase(0, 2);
-    return url.substr(0, separator) + "://" + remainder;
+  static void on_selected_ice_pair(NiceAgent* agent, guint stream, guint component,
+      NiceCandidate* local, NiceCandidate* remote, gpointer data) {
+    if (!local || !remote) return;
+    const auto state = *static_cast<std::shared_ptr<MediaSignalState>*>(data);
+    std::lock_guard lock(state->mutex);
+    auto* self = state->owner;
+    if (!self || !state->peer || self->ice_agent != agent) return;
+    const auto describe = [](NiceCandidate* value) {
+      char address[NICE_ADDRESS_STRING_LEN]{};
+      nice_address_to_string(&value->addr, address);
+      auto result = detail::ice_address_summary(address);
+      result["candidate_type"] = value->type == NICE_CANDIDATE_TYPE_HOST ? "host" :
+          value->type == NICE_CANDIDATE_TYPE_SERVER_REFLEXIVE ? "srflx" :
+          value->type == NICE_CANDIDATE_TYPE_PEER_REFLEXIVE ? "prflx" : "relay";
+      result["protocol"] = value->transport == NICE_CANDIDATE_TRANSPORT_UDP ? "udp" : "tcp";
+      return result;
+    };
+    if (!state->selected_pair.empty()) ++state->selected_pair_changes;
+    state->selected_pair = {{"local", describe(local)}, {"remote", describe(remote)},
+        {"stream", stream}, {"component", component}, {"source", "libnice-new-selected-pair-full"},
+        {"selected_at_monotonic_ms", steady_now_ms()}};
+    self->emit_diagnostic("vehicle_ice_selected_pair", "ice_pair_selected", "ice_connectivity", "",
+        "Inspect candidate generation separately from selected path; this event is not a latency measurement.", true,
+        {{"media_negotiation_id", state->negotiation_id}, {"pair", state->selected_pair}, {"changes", state->selected_pair_changes}});
   }
 
-  [[nodiscard]] std::string gstreamer_turn_uri(
-      std::string url,
-      std::string_view username,
-      std::string_view credential) const {
-    const auto separator = url.find(':');
-    if (separator == std::string::npos) throw std::invalid_argument("TURN URL has no scheme");
-    auto remainder = url.substr(separator + 1);
-    while (remainder.starts_with("//")) remainder.erase(0, 2);
-    return url.substr(0, separator) + "://" + signaling.url_encode(username) + ":" +
-        signaling.url_encode(credential) + "@" + remainder;
+  void observe_ice_agent() {
+    GObject* ice = nullptr;
+    g_object_get(webrtc, "ice-agent", &ice, nullptr);
+    if (ice) {
+      if (g_object_class_find_property(G_OBJECT_GET_CLASS(ice), "agent")) g_object_get(ice, "agent", &ice_agent, nullptr);
+      g_object_unref(ice);
+    }
+    if (!ice_agent) throw std::runtime_error("libnice selected-pair observation unavailable");
+    auto* state = new std::shared_ptr<MediaSignalState>(media_signal_state);
+    g_signal_connect_data(ice_agent, "new-selected-pair-full", G_CALLBACK(on_selected_ice_pair), state,
+        +[](gpointer data, GClosure*) { delete static_cast<std::shared_ptr<MediaSignalState>*>(data); }, static_cast<GConnectFlags>(0));
   }
 
   void configure_ice_servers() {
-    bool stun_configured = false;
-    bool turn_configured = false;
-    for (const auto& server : ice_configuration.value("ice_servers", Json::array())) {
-      if (!server.is_object()) continue;
-      Json urls = server.value("urls", Json::array());
-      if (urls.is_string()) urls = Json::array({urls});
-      if (!urls.is_array()) continue;
-      for (const auto& value : urls) {
-        if (!value.is_string()) continue;
-        const auto url = value.get<std::string>();
-        if (!stun_configured && (url.starts_with("stun:") || url.starts_with("stuns:"))) {
-          const auto configured = gstreamer_ice_uri(url);
-          g_object_set(webrtc, "stun-server", configured.c_str(), nullptr);
-          stun_configured = true;
-        }
-        if (url.starts_with("turn:") || url.starts_with("turns:")) {
-          const auto username = server.value("username", "");
-          const auto credential = server.value("credential", "");
-          if (username.empty() || credential.empty()) throw std::runtime_error("TURN ICE server lacks credentials");
-          const auto configured = gstreamer_turn_uri(url, username, credential);
-          if (!turn_configured) {
-            g_object_set(webrtc, "turn-server", configured.c_str(), nullptr);
-            turn_configured = true;
-          } else {
-            gboolean added = FALSE;
-            g_signal_emit_by_name(webrtc, "add-turn-server", configured.c_str(), &added);
-            if (!added) throw std::runtime_error("webrtcbin rejected an additional TURN server");
-          }
-        }
-      }
-    }
+    const auto applied = detail::configure_webrtc_ice_servers(webrtc,
+        ice_configuration.value("ice_servers", Json::array()), ice_route_policy->mode() != "direct");
+    emit_diagnostic("vehicle_ice_configuration", "ice_configuration_applied", "ice_configuration", "",
+        "ICE servers originate from authenticated signaling, not vehicle YAML ice keys.", true,
+        {{"source", "authenticated_signaling"}, {"route_mode", ice_route_policy->mode()},
+         {"stun_applied", applied.at("stun_applied")}, {"turn_available", detail::ice_has_turn(ice_configuration)}, {"turn_applied", applied.at("turn_applied")},
+         {"address_families", {"ipv4", "ipv6"}}, {"direct_timeout_ms", config.cloud.ice_direct_timeout_ms}});
   }
 
   void prepare_lanes() {
@@ -4052,6 +4058,8 @@ struct VehicleMediaRuntime::Impl {
       return false;
     }
     media_signal_state->begin_attempt(this, webrtc, signaling.session_id());
+    media_signal_state->ice_route_mode = ice_route_policy->mode();
+    ice_route_policy->begin_attempt();
     const auto connect_media_signal = [&](const char* name, GCallback callback) {
       auto* state = new std::shared_ptr<MediaSignalState>(media_signal_state);
       g_signal_connect_data(webrtc, name, callback, state,
@@ -4062,6 +4070,7 @@ struct VehicleMediaRuntime::Impl {
     connect_media_signal("on-ice-candidate", G_CALLBACK(on_ice_candidate));
     try {
       configure_ice_servers();
+      observe_ice_agent();
     } catch (const std::exception& error) {
       set_pipeline_error(
           "ICE server configuration failed: " + std::string(error.what()),
@@ -4523,6 +4532,7 @@ struct VehicleMediaRuntime::Impl {
         gst_object_unref(lane->record_tap); lane->record_tap = nullptr;
       }
     }
+    if (ice_agent != nullptr) { g_object_unref(ice_agent); ice_agent = nullptr; }
     if (webrtc != nullptr) {
       gst_object_unref(webrtc);
       webrtc = nullptr;
@@ -4585,9 +4595,11 @@ struct VehicleMediaRuntime::Impl {
     if (candidate.empty()) return;
     if (candidate.size() > 8192) throw std::runtime_error("WebRTC ICE candidate exceeds limit");
     GstElement* source = nullptr;
+    std::string negotiation;
     {
       std::lock_guard lock(media_signal_state->mutex);
       auto& state = *media_signal_state;
+      if (state.ice_route_mode == "direct" && detail::ice_candidate_summary(candidate)["candidate_type"] == "relay") return;
       if (state.peer == nullptr || state.negotiation_id.empty()) return;
       const auto id = payload.value("media_negotiation_id", "");
       if (!id.empty() && id != state.negotiation_id) return;
@@ -4603,20 +4615,28 @@ struct VehicleMediaRuntime::Impl {
         if (std::find(state.remote_ufrags.begin(), state.remote_ufrags.end(), ufrag) == state.remote_ufrags.end()) return;
       } else if (id.empty() && (state.attempt_count != 1 || state.offer_count != 1)) return;
       source = GST_ELEMENT(gst_object_ref(state.peer));
+      negotiation = state.negotiation_id;
     }
     MediaPeerReference reference{source};
     const auto index = payload.value("sdpMLineIndex", 0U);
     g_signal_emit_by_name(source, "add-ice-candidate", index, candidate.c_str());
+    std::lock_guard lock(media_signal_state->mutex);
+    if (media_signal_state->peer != source || media_signal_state->negotiation_id != negotiation) return;
     const auto count = ++remote_ice_candidate_count;
-    if (count == 1) emit_diagnostic("vehicle_webrtc_remote_ice_candidate_received",
+    auto summary = detail::ice_candidate_summary(candidate);
+    summary.update({{"candidate_count", count}, {"sdp_mline_index", index}, {"media_negotiation_id", negotiation}});
+    if (count <= 64) emit_diagnostic("vehicle_webrtc_remote_ice_candidate_received",
         "webrtc_remote_ice_candidate_available", "ice_connectivity", "",
         "No action is required; this is a connectivity milestone.", true,
-        {{"candidate_count", count}, {"sdp_mline_index", index}});
+        std::move(summary));
   }
 
   Json media_scope_status() const {
     std::lock_guard lock(media_signal_state->mutex);
     return {{"id", media_signal_state->negotiation_id},
+        {"ice_route_mode", media_signal_state->ice_route_mode},
+        {"selected_pair", media_signal_state->selected_pair},
+        {"selected_pair_changes", media_signal_state->selected_pair_changes},
         {"answer_apply_pending", media_signal_state->answer_apply_pending},
         {"answer_applied", media_signal_state->answer_applied},
         {"issue_code", media_signal_state->compatibility_issue},
@@ -4632,7 +4652,7 @@ struct VehicleMediaRuntime::Impl {
       if (type == "control_management") { process_control_management(message, payload); continue; }
       if (type == "webrtc_answer") {
         GstElement* source = nullptr;
-        std::string negotiation_id;
+        std::string negotiation_id, route_mode;
         {
           std::lock_guard lock(media_signal_state->mutex);
           if (media_signal_state->peer == nullptr || media_signal_state->negotiation_id.empty()) continue;
@@ -4653,9 +4673,10 @@ struct VehicleMediaRuntime::Impl {
           }
           source = GST_ELEMENT(gst_object_ref(media_signal_state->peer));
           negotiation_id = media_signal_state->negotiation_id;
+          route_mode = media_signal_state->ice_route_mode;
         }
         MediaPeerReference reference{source};
-        const auto sdp_text = payload.value("sdp", "");
+        const auto sdp_text = route_mode == "direct" ? detail::ice_direct_sdp(payload.value("sdp", "")) : payload.value("sdp", "");
         GstSDPMessage* sdp = nullptr;
         if (gst_sdp_message_new(&sdp) != GST_SDP_OK ||
             gst_sdp_message_parse_buffer(
@@ -5000,6 +5021,8 @@ struct VehicleMediaRuntime::Impl {
           true);
       throw;
     }
+    ice_route_policy = std::make_unique<detail::IceRoutePolicy>(config.cloud.ice_direct_timeout_ms,
+        detail::ice_has_turn(ice_configuration), config.cloud.ice_transport_policy == "relay");
     std::vector<VideoCodec> codecs;
     try {
       if (!config.runtime.mock_control_diagnostic) codecs = negotiate_codecs(3000);
@@ -5037,11 +5060,13 @@ struct VehicleMediaRuntime::Impl {
     std::int64_t total_started_ms = signaling.now_ms();
     EncoderCandidate successful = candidates.front();
 
-    for (std::size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index) {
+    for (std::size_t candidate_index = 0; candidate_index < candidates.size();) {
       check_stop();
       answer_received = false;
       simulated_failure_fired = false;
       codec_fallback_requested = false;
+      bool route_retry = false;
+      bool peer_connected = false;
       const auto candidate = candidates[candidate_index];
       const auto attempt_started = signaling.now_ms();
       if (!start_pipeline(candidate, capture_interval_ms)) {
@@ -5056,6 +5081,7 @@ struct VehicleMediaRuntime::Impl {
         errors.push_back(error);
         stop_pipeline();
         if (candidate_index + 1 < candidates.size()) ++failover_count;
+        ++candidate_index;
         continue;
       }
       const auto deadline = duration_ms > 0 ? total_started_ms + duration_ms : std::numeric_limits<std::int64_t>::max();
@@ -5096,6 +5122,26 @@ struct VehicleMediaRuntime::Impl {
         }
         poll_bus();
         if (!current_pipeline_error().empty()) break;
+        GstWebRTCPeerConnectionState peer_state = GST_WEBRTC_PEER_CONNECTION_STATE_NEW;
+        g_object_get(webrtc, "connection-state", &peer_state, nullptr);
+        if (!peer_connected && peer_state == GST_WEBRTC_PEER_CONNECTION_STATE_CONNECTED) {
+          peer_connected = true;
+          emit_diagnostic("vehicle_ice_connected", "ice_connection_established", "ice_connectivity", "",
+              "Peer connected; this does not establish video freshness or control readiness.", true,
+              {{"media_negotiation", media_scope_status()}, {"attempt_elapsed_ms", signaling.now_ms() - attempt_started}});
+        }
+        bool answer_ready = false;
+        {
+          std::lock_guard lock(media_signal_state->mutex);
+          answer_ready = media_signal_state->answer_applied;
+        }
+        if (ice_route_policy->allow_relay_retry(steady_now_ms(), answer_ready,
+              peer_state == GST_WEBRTC_PEER_CONNECTION_STATE_CONNECTED, peer_state == GST_WEBRTC_PEER_CONNECTION_STATE_FAILED)) {
+          route_retry = true;
+          set_pipeline_error("direct ICE attempt failed or exceeded its connection budget", "ice_direct_fallback",
+              "ice_connectivity", "Starting a fresh media negotiation with configured TURN servers; control remains gated.", true);
+          break;
+        }
         enforce_control_recovery();
         start_control_when_cameras_ready();
         // The independent native-control watchdog thread owns the VCU tick;
@@ -5192,6 +5238,8 @@ struct VehicleMediaRuntime::Impl {
           {"passed", passed},
           {"answer_received", answer_received},
           {"answer_applied", answer_applied},
+          {"peer_connected_observed", peer_connected},
+          {"media_negotiation", media_scope_status()},
           {"duration_ms", elapsed},
           {"lanes", final_lanes},
           {"failure", current_pipeline_failure()},
@@ -5207,12 +5255,22 @@ struct VehicleMediaRuntime::Impl {
         break;
       }
       errors.push_back(error);
+      if (route_retry) {
+        // A connected direct path can outlive the original short-lived TURN
+        // credentials. Fetch again only after the control-safe teardown.
+        ice_configuration = signaling.ice_servers();
+        emit_diagnostic("vehicle_ice_relay_fallback", "ice_direct_fallback", "ice_connectivity", "",
+            "A new Peer/negotiation is required; prior control readiness is not restored.", true,
+            {{"fallback_count", ice_route_policy->fallbacks()}, {"next_mode", ice_route_policy->mode()}, {"safety_action", "control_closed_before_retry"}});
+        continue; // Retry the same encoder, after stop_pipeline closed control.
+      }
       if (codec_fallback_requested) {
         while (candidate_index + 1 < candidates.size() && candidates[candidate_index + 1].codec == candidate.codec) {
           ++candidate_index;
         }
       }
       if (candidate_index + 1 < candidates.size()) ++failover_count;
+      ++candidate_index;
     }
 
     const auto total_elapsed = std::max<std::int64_t>(1, signaling.now_ms() - total_started_ms);
@@ -5380,6 +5438,8 @@ struct VehicleMediaRuntime::Impl {
   bool recording_session_incomplete{false};
   std::optional<std::string> forced_codec;
   int simulate_primary_failure_after_frames;
+  std::unique_ptr<detail::IceRoutePolicy> ice_route_policy;
+  NiceAgent* ice_agent{nullptr};
   GstElement* pipeline{nullptr};
   GstElement* webrtc{nullptr};
   detail::ControlTransportFence control_transport_fence;

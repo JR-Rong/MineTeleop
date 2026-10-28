@@ -1,16 +1,16 @@
-# PR25 原生 WebRTC 接收台架验证
+# PR26 原生 WebRTC 接收与双栈直连验证
 
 本探针用于把 Sunshine/Moonlight 的“硬件解码、有限队列、分阶段统计”思路落到现有 WebRTC 链路上。它是媒体实验入口，不是已完成的桌面控制端。PR 的基线和合入目标都是 `rjr/cx/orin-isx031-cpu`（PR25），不改变产品默认传输或安全策略。
 
 ## 实现与范围
 
 - 复用 `VehicleMediaRuntime`、`SignalingService` 和 `DriverConsoleRuntime`，走真实的 SDP/ICE/DTLS/SRTP；没有另写视频 UDP 协议。
-- 同机模式创建仅监听回环地址的临时信令服务，随机生成凭据；结束后回收本次会话和线程。跨机模式通过回环 SSH 隧道接入单独启动的台架信令服务，凭据从环境变量读取。产品信令配置要求至少一个 ICE URL。同机诊断目前使用无服务的回环高端口 `stun:127.0.0.1:34789`，不配置 TURN；它不具备公网地址发现能力。旧实验的端口 9 占位配置会触发 Chromium UDP socket 错误，已移除，见文末根因记录。跨网实验必须使用实际可达的公网 STUN 服务。直连结论以实际选中候选对及独立出口证据为准。
+- 同机模式创建仅监听回环地址的临时信令服务，随机生成凭据；结束后回收本次会话和线程。跨机模式通过回环 SSH 隧道接入单独启动的台架信令服务，凭据从环境变量读取。产品信令配置要求至少一个 ICE URL。同机诊断目前使用无服务的回环高端口 `stun:127.0.0.1:34789`，不配置 TURN；它不具备公网地址发现能力。旧实验的端口 9 占位配置会触发 Chromium UDP socket 错误，已移除，见文末根因记录。IPv4 NAT 地址发现实验必须使用实际可达的公网 STUN 服务；公网 IPv6 host 候选本身不依赖 STUN。直连结论以实际选中候选对及独立出口证据为准。
 - GStreamer 1.20 的 `get-stats` 候选对字段不完整，使用 `new-selected-pair-full` 记录实际候选类型及 UDP/TCP，保留 RTP/jitterbuffer 原始统计供核查。
 - H.264 解码可选 `avdec_h264`（2 线程）、Jetson `nvv4l2decoder disable-dpb=true` 或 Mac `vtdec_hw`（只允许硬件解码）。默认仅消费 sample；`--display` 增加单帧泄漏队列与 `glimagesink sync=false`，记录 GL 绘制回调。它不读取像素，也不声称测到了扫描输出。
 - 接收端 `webrtcbin latency` 可调；解码输出 `appsink max-buffers=1 drop=true sync=false`。独立消费线程可以人为暂停，以检验“丢旧帧、追新帧”的行为。
 - 拒绝控制开启、非 mock、非 bench、非零速度上限、录像/上传开启的本地配置。跨机模式不能仅凭本地配置证明远端安全状态，必须另行检查实际发送端配置、相机占用和 CAN 状态。控制输入、DataChannel 命令转发、CAN、驾驶授权和屏幕扫描输出均不在本次验收范围。
-- 不做会话恢复：遇到第二次 offer、异步管线错误或协商超时会报告失败，避免把重连前后样本混在一起。
+- 独立 CLI 探针仍不做会话恢复。混合 UI 接收器允许测量开始前的新代际 offer，以验证直连失败后的回退；各次尝试分别保存。开始计时后发生 Peer 更换则终止该轮，不拼接重连前后样本。
 
 ## 构建与运行
 
@@ -266,3 +266,88 @@ Mac 构建和 4 组定向 CTest 通过（含 5 项混合分析测试、已有分
 独立客户端的收益主要是能直接控制网卡、UDP socket、缓冲和硬解/绘制调度；仅用 Electron 包住相同网页，仍使用 Chromium 媒体路径。换成原生接收栈可减少 UI 主线程对视频路径的干扰，但仍需网络、ICE/STUN 以及适当的中继回退策略。[ICE 标准](https://www.rfc-editor.org/rfc/rfc8445) 描述了使用 STUN/TURN 完成 NAT 穿越的机制；更换 UI 不会消除运营商 NAT 和防火墙限制。当前证据不支持“换客户端就必然更容易公网直连”或“公网延迟大幅降低”的结论。
 
 收尾检查：Orin 两个相机无占用、CAN DOWN，本任务进程和 SSH 隧道已退出，两端本轮临时凭据已删除。上一提交 `c72de2f` 的 macOS CI 在 `mine-teleop-product-direct-integration-tests` 报 `recovery did not withdraw DC`（与较早轮次同一失败信息），其他平台构建及离线 Linux 通过；保留该未解决记录，没有修改控制代码或放宽测试门槛。当前提交的 CI 以 PR 实时状态为准。
+
+## 2026-10-28 双栈、候选证据与有界回退
+
+本节取代上节“仅 IPv4”的新实验配置要求；旧 `wan-ipv4-udp` 仍兼容，保留其
+单 STUN、禁止 TURN 的原含义。新增 `wan-dualstack` 允许选择 `ipv4`、`ipv6` 或 `dual`，
+明确分开直连 A/B（`allowRelay:false`）和回退可用性实验（`allowRelay:true`）。
+同一物理出口、私网直连、IPv6 link-local/ULA、CGNAT 共享地址均不作为公网对端验收。
+该限制是实验隔离规则，不是“这些网络绝对不能 P2P”的结论。
+
+示例为结构模板，尖括号值必须替换，不能直接运行：
+
+```json
+{
+  "kind": "wan-dualstack",
+  "family": "ipv6",
+  "allowRelay": false,
+  "localAddresses": ["<Mac 出口网卡当次公网 IPv6>"],
+  "localPublicAddresses": ["<Mac 当次公网 IPv6>"],
+  "remotePublicAddresses": ["<Orin 独立出口当次公网 IPv6>"]
+}
+```
+
+IPv4 组将 family 改为 ipv4，localAddresses 可为网卡私网或 CGNAT 共享地址，另外提供双方实际公网
+映射地址。dual 组必须提供两族本地/远端地址；它用于选路观察，不混入固定地址族的
+四组性能 A/B。Mac 原生从 offer 取得经过网页同一策略过滤的信令 ICE 列表，复用车端的
+GStreamer 配置函数，支持带方括号 IPv6 的服务地址和 TURN 短期凭据。候选及选中对的
+类型、UDP、地址族、出口地址均受校验；原生每次选中对变化都锁存违规。
+
+要启用产品回退，在测试车辆 YAML 设置 `cloud.ice_direct_timeout_ms: 3000`，信令服务
+配置真实 STUN/TURN。具体状态和安全边界见 [ICE 配置说明](08-configuration.md#ice-配置来源与直连回退)。
+不修改产品默认码率、FEC、拥塞控制、打洞算法，也没有为追求直连而定期打断健康 relay。
+`allowRelay:true` 仅表示实验允许中继，不能把它标成直连成功。原生和网页均记录 attempt
+的 negotiation ID / route mode；分析器另外输出采样窗口内 direct/relay 保持时长、relay
+时间占比、路径变化次数、观察到的 relay→direct 次数。采样缺口超过 3 秒不计入保持时长。
+这些是观测值，不证明控制持续可用；连接建立率还需要保留所有成功/失败尝试作为分母，
+relay→direct **升级成功率尚不可验收**，因为主动升级策略未实现。
+
+### 对 review 的验证顺序与修正
+
+1. 先检查 `vehicle_ice_configuration` 的配置来源及实际 applied 值，再看两端候选日志。
+   车端 YAML 的旧 ICE 键改为显式拒绝，不再误导成生效配置。已有网页 candidate type / family
+   信息保留，补地址类别；生产车端补齐 selected-pair-full 证据，不只依赖台架探针。
+2. 没有 srflx 时检查 STUN 可达和 UDP，但同时检查是否有可达的公网 IPv6 host，不能直接断言
+   跨网不可能。100.64/10 是共享地址段，不是公网映射的必要形态；CGNAT 的 STUN 响应通常也
+   可以是公网地址。相同公网地址可能是同出口，也可能有 hairpin，不能单凭它判断 NAT 类型。
+3. 比较两个 STUN 服务时，必须复用同一个绑定 UDP socket、相同地址族且目标地址不同，
+   否则端口差异可能只是本地重绑。端口变化提示映射依赖目的端；它不单独证明过滤行为或
+   “两端无法打洞”。[RFC 5780](https://www.rfc-editor.org/rfc/rfc5780) 规定的行为发现还需服务端配合。
+4. 使用独立公网出口，先关闭 TURN 做预算相同的直连对照，再开启 TURN/回退；保留完整
+   候选、连接对和尝试时间线。前者成功说明该次直连可行；失败仅表示该次预算内失败，不能
+   直接归罪运营商。结合证据才能区分配置、可达性与选路时序。
+
+[ICE 标准](https://www.rfc-editor.org/rfc/rfc8445) 允许 IPv4/IPv6 host、srflx、prflx 和 relay
+参与检查。IPv6 可能避开 IPv4 NAT 映射，却不消除防火墙、移动网络换址、拥塞或中继需求。
+所以目标是可用路径和可解释的退化，不保证 IPv6 比 IPv4 的延迟/抖动更小。
+
+### 自动化与剩余验收
+
+新增真实 GStreamer/Libnice 集成夹具：只绑定回环 IPv4/IPv6，先验证两族 UDP DataChannel；
+再故意不投递直连候选，使策略超时，销毁旧 Peer，配置本地 coturn，只交换 relay 候选，
+要求实际选中 TURN/UDP 且收到数据，凭据使用 coturn REST 的带冒号用户名和 Base64 密码，
+覆盖 URI 转义后的实际认证。它验证协议栈配置/回退机制，不模拟运营商 NAT，不含
+摄像头、UI 绘制、驾驶命令或端到端实车恢复。缺 coturn 时该项明确 skip，不能算通过。
+实际车端回调抽取测试另验证 direct 阶段排除 relay、允许 IPv6 host、新代际允许 relay、
+拒绝旧代际候选；网页验证刷新过期 TURN 凭据及迟到刷新成功/失败的隔离。
+既有控制安全回归保持原门槛。
+
+**真实跨网进度仍为 IPv4 网页 0/1800、IPv4 原生 0/1800、IPv6 网页 0/1800、IPv6 原生 0/1800。**
+待 Orin 取得独立公网出口后，先做上述判别实验，再固定地址族及实际路径、相同 UI 五阶段
+负载，各跑 30 分钟。TURN 组单独报告连接建立时间、成功率、重连中断和路径占比，不并入
+直连延迟样本。保留 p50/p95/p99/p99.9/max、冻结与完整窗口尾部，不用局域网替代。
+
+本轮验证证据、源码及原始日志哈希见 [双栈回退证据](evidence/dualstack-fallback-20261028.json)。
+Linux ARM64/GStreamer 1.20.3/libnice 0.1.18 完整构建通过；最终全量 CTest **69/70**，
+剩余 TLS 发送时序用例单独复测通过，因此累计 70 项都有通过记录，但不称全量一次全绿。
+首轮的时钟/控制路径失败也保留；两个控制路径 suite 在修改前 `b22e6f1` 的同环境对照中
+同样未通过，本轮后续通过，尚未定位波动根因。没有放宽控制安全断言；只更新因新增 route
+mode 而过时的页面字符串检查，并用实际页面函数测试验证配置行为。补齐 openssl 后完成 TLS 复测。
+Mac 原生模块/探针构建和 6 组定向 CTest 通过；网页实际方法 19 项、控制逻辑 104 项、桌面
+39 项通过/6 项明确跳过，混合分析器 9 项通过。没有运行本轮 Mac 原生窗口回退实测。
+
+复核：Reuse 复用 ICE 服务配置、地址分类及既有安全关闭/代际围栏；Quality 限制重试次数、
+刷新短期凭据并拒绝迟到响应，保留配置迁移与未验收边界；Efficiency 将新增证据限制在 ICE
+事件及既有采样周期，不增加产品逐帧追踪。可沉淀为本仓库“独立出口证明 → 候选判别 →
+固定族/路径 A/B”流程，已记录方法，未创建新 skill。

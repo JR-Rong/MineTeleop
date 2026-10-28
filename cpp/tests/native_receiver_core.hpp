@@ -2,6 +2,8 @@
 // Shared, opt-in media bench core. No control input or scan-out claims.
 #define GST_USE_UNSTABLE_API
 #include "mine_teleop/server.hpp"
+#include "mine_teleop/detail/gstreamer_ice_servers.hpp"
+#include "mine_teleop/detail/ice_diagnostics.hpp"
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/sdp/sdp.h>
@@ -42,7 +44,10 @@ struct Options {
   std::string config, output, signaling_url, driver_id{"native-bench"}, decoder{"avdec_h264"};
   int seconds{30}, jitter_ms{30}, stall_ms{0};
   std::string ice_transport{"auto"};  // Hybrid bench can pin the comparison transport.
-  std::string local_address, local_public_address, remote_address, stun_uri;
+  std::vector<std::string> local_addresses, local_public_addresses, remote_addresses;
+  bool allow_relay{false};
+  std::string address_family{"dual"}, ice_route_mode{"all"};
+  Json ice_servers{Json::array()};
   bool validate_only{false}, display{false};
   std::vector<std::uintptr_t> window_handles;
 };
@@ -348,7 +353,8 @@ class Receiver {
     gst_bin_add(GST_BIN(pipeline_), peer_);
     g_object_set(peer_, "bundle-policy", GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE,
                  "latency", static_cast<guint>(options.jitter_ms), nullptr);
-    if (!options.stun_uri.empty()) g_object_set(peer_, "stun-server", options.stun_uri.c_str(), nullptr);
+    detail::configure_webrtc_ice_servers(peer_, options.ice_servers, options.ice_route_mode != "direct");
+    if (options.ice_route_mode == "relay") g_object_set(peer_, "ice-transport-policy", GST_WEBRTC_ICE_TRANSPORT_POLICY_RELAY, nullptr);
     g_signal_connect(pipeline_, "deep-element-added", G_CALLBACK(on_element), this);
     g_signal_connect(peer_, "pad-added", G_CALLBACK(on_pad), this);
     g_signal_connect(peer_, "on-ice-candidate", G_CALLBACK(on_candidate), this);
@@ -362,10 +368,10 @@ class Receiver {
       g_object_unref(ice);
     }
     if (!nice_) throw std::runtime_error("libnice selected-pair observation unavailable");
-    if (!options_.local_address.empty()) {
+    for (const auto& local_address : options_.local_addresses) {
       NiceAddress address;
       nice_address_init(&address);
-      if (!nice_address_set_from_string(&address, options_.local_address.c_str()) ||
+      if (!nice_address_set_from_string(&address, local_address.c_str()) ||
           !nice_agent_add_local_address(nice_, &address)) throw std::runtime_error("cannot bind bench ICE address");
     }
     if (options_.ice_transport == "tcp") g_object_set(nice_, "ice-udp", FALSE, nullptr);
@@ -478,11 +484,18 @@ class Receiver {
         {"remote_transport", remote->transport == NICE_CANDIDATE_TRANSPORT_UDP ? "udp" : "tcp"}};
     // Latch even a brief forbidden path change between periodic samples.
     const auto& opts = self.options_;
-    if (!opts.local_address.empty() &&
-        ((local_ip != opts.local_address && local_ip != opts.local_public_address) || remote_ip != opts.remote_address ||
-         local->type == NICE_CANDIDATE_TYPE_RELAYED || remote->type == NICE_CANDIDATE_TYPE_RELAYED ||
-         local->transport != NICE_CANDIDATE_TRANSPORT_UDP || remote->transport != NICE_CANDIDATE_TRANSPORT_UDP))
-      self.error_ = "native pair differs from required public IPv4/UDP endpoints";
+    if (!opts.local_addresses.empty()) {
+      const auto contains = [](const auto& values, const std::string& ip) { return std::find(values.begin(), values.end(), ip) != values.end(); };
+      const bool relay = local->type == NICE_CANDIDATE_TYPE_RELAYED || remote->type == NICE_CANDIDATE_TYPE_RELAYED;
+      const bool local_known = contains(opts.local_addresses, local_ip) || contains(opts.local_public_addresses, local_ip);
+      const bool family_ok = (std::string(local_ip).find(':') != std::string::npos) == (std::string(remote_ip).find(':') != std::string::npos) &&
+          (opts.address_family == "dual" || ((std::string(local_ip).find(':') != std::string::npos) ? opts.address_family == "ipv6" : opts.address_family == "ipv4"));
+      if (!family_ok || local->transport != NICE_CANDIDATE_TRANSPORT_UDP || remote->transport != NICE_CANDIDATE_TRANSPORT_UDP ||
+          detail::ice_address_summary(remote_ip)["address_class"] != "public" ||
+          (relay ? !opts.allow_relay || !(local_known || (local->type == NICE_CANDIDATE_TYPE_RELAYED && detail::ice_address_summary(local_ip)["address_class"] == "public"))
+                 : !local_known || !contains(opts.remote_addresses, remote_ip)))
+        self.error_ = "native pair differs from required public IP endpoints or relay policy";
+    }
   }
   static void on_candidate(GstElement*, guint index, gchar* text, gpointer data) {
     auto& self = *static_cast<Receiver*>(data);

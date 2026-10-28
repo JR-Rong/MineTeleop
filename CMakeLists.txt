@@ -278,6 +278,7 @@ if(MINE_TELEOP_BUILD_VEHICLE_RUNTIME)
     gstreamer-sdp-1.0>=1.20
     gstreamer-webrtc-1.0>=1.20
     gstreamer-video-1.0>=1.20
+    nice>=0.1.18
   )
 
   add_library(mine_teleop_vehicle_runtime
@@ -410,6 +411,10 @@ endif()
 
 if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
   enable_testing()
+  add_executable(mine-teleop-ice-route-policy-tests cpp/tests/ice_route_policy_tests.cpp)
+  target_link_libraries(mine-teleop-ice-route-policy-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-ice-route-policy-tests)
+  add_test(NAME mine-teleop-ice-route-policy-tests COMMAND mine-teleop-ice-route-policy-tests)
   add_executable(mine-teleop-websocket-send-tests cpp/tests/websocket_send_tests.cpp)
   target_link_libraries(mine-teleop-websocket-send-tests PRIVATE mine_teleop_runtime)
   mine_teleop_enable_warnings(mine-teleop-websocket-send-tests)
@@ -697,6 +702,14 @@ if(MINE_TELEOP_BUILD_TESTS)
     mine_teleop_enable_warnings(mine-teleop-media-freshness-gstreamer-tests)
     add_test(NAME mine-teleop-media-freshness-gstreamer-tests COMMAND mine-teleop-media-freshness-gstreamer-tests)
     set_tests_properties(mine-teleop-media-freshness-gstreamer-tests PROPERTIES TIMEOUT 60)
+    add_executable(mine-teleop-ice-fallback-gstreamer-tests cpp/tests/ice_fallback_gstreamer_tests.cpp)
+    target_include_directories(mine-teleop-ice-fallback-gstreamer-tests PRIVATE cpp/include)
+    target_link_libraries(mine-teleop-ice-fallback-gstreamer-tests PRIVATE PkgConfig::GSTREAMER nlohmann_json::nlohmann_json)
+    mine_teleop_enable_warnings(mine-teleop-ice-fallback-gstreamer-tests)
+    add_test(NAME mine-teleop-ice-fallback-gstreamer-tests
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/ice_fallback_gstreamer.test.py
+        $<TARGET_FILE:mine-teleop-ice-fallback-gstreamer-tests>)
+    set_tests_properties(mine-teleop-ice-fallback-gstreamer-tests PROPERTIES TIMEOUT 70 SKIP_RETURN_CODE 77)
     add_executable(mine-teleop-webrtc-recovery-tests cpp/tests/webrtc_recovery_gstreamer_tests.cpp)
     target_include_directories(mine-teleop-webrtc-recovery-tests PRIVATE cpp/include)
     target_link_libraries(mine-teleop-webrtc-recovery-tests PRIVATE PkgConfig::GSTREAMER)

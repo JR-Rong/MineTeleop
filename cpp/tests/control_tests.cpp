@@ -1849,7 +1849,7 @@ void test_control_page_contract() {
   expect(response.body.find("packet_loss_percent") != std::string::npos, "per-stream packet-loss metric is missing");
   expect(response.body.find("connection_method") != std::string::npos, "ICE path classification is missing");
   expect(
-      response.body.find("iceTransportPolicy:consoleConfig.ice_transport_policy") != std::string::npos,
+      response.body.find("iceTransportPolicy:routeMode==='relay'?'relay':consoleConfig.ice_transport_policy") != std::string::npos,
       "browser RTCPeerConnection does not apply the configured ICE transport policy");
   expect(
       response.body.find("webrtc_ice_candidate_error") != std::string::npos,
