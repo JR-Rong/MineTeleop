@@ -104,6 +104,66 @@ def require_network_pairs(pairs, expected_transport, network):
                 assert address.is_global and str(address) in map(canonical,server.get('relayAddresses', [])), 'relay outside configured TURN allocation pool'
 
 
+def fallback_validation(data, network):
+    """Permission to use TURN is not evidence that a fallback occurred."""
+    goal = (network or {}).get('validationGoal', 'media')
+    assert goal in ('media', 'fallback'), 'unknown validation goal'
+    if goal == 'media':
+        return dict(required=False, verified=False)
+    assert network.get('allowRelay'), 'fallback validation requires allowRelay'
+    attempts = data.get('attempts', [])
+    assert len(attempts) >= 2, 'fallback requires direct then all attempts'
+    direct, retry = attempts[-2:]
+    def number(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    assert direct.get('mode') == 'direct' and retry.get('mode') == 'all', 'fallback requires direct then all attempts'
+    assert all(isinstance(a.get('id'), str) and a['id'] for a in (direct, retry)), 'missing negotiation identity'
+    assert direct['id'] != retry['id'], 'fallback must create a fresh negotiation'
+    assert number(direct.get('at')) and number(retry.get('at')) and direct['at'] < retry['at'] <= data['start'], 'invalid fallback attempt chronology'
+    session, generation = retry.get('sourceSessionId'), retry.get('sourceControlSessionGeneration')
+    assert isinstance(session, str) and session and number(generation) and generation > 0, 'fallback scope missing'
+    assert (direct.get('sourceSessionId'), direct.get('sourceControlSessionGeneration')) == (session, generation), 'fallback crosses sessions'
+    for sample in data['samples']:
+        assert (sample.get('sourceSessionId'), sample.get('sourceControlSessionGeneration'), sample.get('negotiationId')) == (session, generation, retry['id']), 'fallback sample belongs to a different negotiation'
+    # Native currently fails strict TURN-leg validation already. Do not invent
+    # transport-bound receive counters from decoder/draw queue progress alone.
+    assert data['mode'] == 'browser', 'native fallback media-on-relay evidence unavailable'
+    def increased(a, b, key):
+        return number(a.get(key)) and number(b.get(key)) and 0 <= a[key] < b[key]
+    for before, after in zip(data['samples'], data['samples'][1:]):
+        gap = after['at'] - before['at']
+        if not 0 < gap <= 3000 or not data['start'] <= before['at'] < after['at'] <= data['end']:
+            continue
+        old, new = ({row['id']: row for row in sample['stats']} for sample in (before, after))
+        for video in new.values():
+            if video.get('type') != 'inbound-rtp' or video.get('kind') != 'video':
+                continue
+            previous = old.get(video['id'], {})
+            transport_id = video.get('transportId')
+            if previous.get('transportId') != transport_id:
+                continue
+            pair_id = new.get(transport_id, {}).get('selectedCandidatePairId')
+            if not pair_id or old.get(transport_id, {}).get('selectedCandidatePairId') != pair_id:
+                continue
+            left, right = old.get(pair_id, {}), new.get(pair_id, {})
+            if left.get('state') != 'succeeded' or right.get('state') != 'succeeded':
+                continue
+            if any(left.get(k) != right.get(k) for k in ('localCandidateId', 'remoteCandidateId')):
+                continue
+            if not any(new.get(right.get(k), {}).get('candidateType') == 'relay' for k in ('localCandidateId', 'remoteCandidateId')):
+                continue
+            # Recheck the complete pair evidence; TURN leg validation stays
+            # strict for both sides and for both interval endpoints.
+            evidence = browser_transport_evidence([before, after])
+            require_network_pairs([s['pair'] for s in evidence['selections']], 'udp', network)
+            if increased(left, right, 'bytesReceived') and increased(previous, video, 'bytesReceived') and increased(previous, video, 'framesDecoded'):
+                return dict(required=True, verified=True, direct_negotiation=direct['id'], retry_negotiation=retry['id'],
+                    transport_id=transport_id, pair_id=pair_id, observed_interval_ms=gap,
+                    received_bytes=video['bytesReceived']-previous['bytesReceived'], decoded_frames=video['framesDecoded']-previous['framesDecoded'],
+                    evidence='same selected relay pair at both samples with pair/inbound bytes and decoded-frame progress; sampled, not continuous path proof')
+    raise AssertionError('fallback requires valid relay observations with media progress')
+
+
 def path_summary(samples):
     """Selected-path observations only, never infer NAT type or control uptime."""
     holds = {'direct':0., 'relay':0.}
@@ -197,6 +257,7 @@ def analyze(directory):
               if data['nativeStart'] <= s['clock_ms'] <= data['nativeStart']+data['seconds']*1000]
              if report else [s['pair'] for s in transport['selections']])
     require_network_pairs(pairs, data['expectedTransport'], network)
+    fallback = fallback_validation(data, network)
     path_samples = []
     for sample in data['samples']:
         if report:
@@ -223,12 +284,15 @@ def analyze(directory):
     return dict(mode=data['mode'], duration_s=(data['end']-data['start'])/1000, phases=phases, full_window=full_window,
         selected_pair=report['receiver']['selected_pair'] if report else data['samples'][-1].get('metrics',{}).get('selected_candidate_pair'),
         browser_transport=transport, expected_network=network, path_summary=path_summary(path_samples),
-        connection_attempts=data.get('attempts',[]),
+        connection_attempts=data.get('attempts',[]), fallback_validation=fallback,
+        path_validation=dict(coverage='native-pair-change-latched' if report else 'sampled',
+            continuous_browser_path_validation=False, configured_interval_ms=1000),
         independent_uplinks_verified=False,
         limitations=['Native endpoint is GL draw, browser endpoint is compositor submission; neither is scan-out.',
           'Native arrival is jitterbuffer input after SRTP; browser receiveTime is WebRTC frame receive metadata.',
           'Use within-client load-versus-idle differences; absolute path comparisons retain these endpoint differences.',
           'Native buffering target 30 ms versus browser adaptive buffering; not a renderer-only experiment.',
+          'Browser selected-path checks are snapshots: a forbidden path between samples can be missed.',
           'Public selected pairs cannot prove independent uplinks: retain route/NIC and public-egress evidence separately.'])
 
 

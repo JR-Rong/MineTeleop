@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-10-28T07:30:33.069770+00:00",
+  "source_parent_commit": "e1d8d05d6e9c8815aa3a10af7445a050c6d6802b",
+  "source_identity": "Working-tree sources committed together with this evidence; hashes exclude this self-referential report.",
+  "pr": 26,
+  "target_branch": "rjr/cx/orin-isx031-cpu",
+  "source_sha256": {
+    "CMakeLists.txt": "9b1c9d3e0fac26aeb27f953cbb7a27161a25b03f07010a255df1504118e11c48",
+    "cpp/include/mine_teleop/detail/gstreamer_decoder.hpp": "741bdada2eda6ec089f13992e65bf6f6a5bdd8310b925f5740e8df1ec8169aea",
+    "cpp/include/mine_teleop/detail/gstreamer_freshness.hpp": "dca54ebf72bda975dcb4d515cb735ee297608c4e576011454a8722bba7ec5b34",
+    "cpp/include/mine_teleop/detail/latency_histogram.hpp": "a7038804cae1eac36212d8ad38b61be8011a0d17ab3d0f3cb4bbd5350a5a3cdd",
+    "cpp/src/video.cpp": "8b8907866fd9a9962dd1177900d47f3fac1b236d3cb8cb94bc5b3752ac35ec6f",
+    "cpp/src/webrtc_media.cpp": "b52998c78132ff5519364cd8fbdeac9029139ac9b2a268109db7228fced98f60",
+    "cpp/tests/codec_roundtrip_probe.cpp": "3056c71d1ee74f9f755850d4cb7f4c780951df034e5b4e6ce0ae703d4f1c0543",
+    "cpp/tests/media_freshness_gstreamer_tests.cpp": "064e515a5bc52ec923ab2ed55a1e7cff8f237c1a757d4e4f68e86fae141395ea",
+    "cpp/tests/media_freshness_tests.cpp": "915ce0293fa8488782427019f0139907b826a452c66c816cca06d0f3dd9f3cfb",
+    "cpp/tests/native_receiver_core.hpp": "56a4bd61cde36e4c36a39c2ba93cd648274f2fa39fdd5e0c57151b11009dd33b",
+    "cpp/tests/native_receiver_probe.cpp": "3274c820c75da87579be0f57ed54263c3479e706d0e44de15841ac2569d5ffa8",
+    "desktop/bench/network-policy.cjs": "66814e4c306c4da306cf09b49921f5f84405ddf08df7382a8613df0a3795fa67",
+    "desktop/bench/renderer.js": "9a78fb00c5b5e20a218dc09469e8bd396c7a82d5702adbced9886acd0fdff9da",
+    "desktop/test/bench-network-policy.test.cjs": "385150c817000adafe7df2cd8172dca559fba1cf16a19ccc761dca4bd9bf262b",
+    "docs/native-receiver-bench.md": "b529fe24597a0296672194677a9bbc9cc4e64097fe79a354db42406d8829125f",
+    "scripts/test/codec_roundtrip_probe.py": "a758de9664fef219f4537077881f05d19e720151a226de0eab0e3eb4576d3596",
+    "scripts/test/codec_roundtrip_probe.test.py": "57df24823156ae2a697a7e07cdf22cd57047f419f7b5dbb01556cf8d095740c0",
+    "scripts/test/hybrid_receiver_analyze.py": "6331fdaaf668ec8cadb731d0f8e54c2a846df0e59f138b73cf145e6170663c65",
+    "scripts/test/hybrid_receiver_analyze.test.py": "3b17a26a5620f297e7aff851fd9e57caca2f4813cd7a9149bdf319f911a44d75",
+    "scripts/test/run_offline_regressions.py": "06267ff119e3a00cb8603e390032874ad991d21f63eab43d7fa40c27a5cac813"
+  },
+  "artifact_root": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/pr26-review-followup-20261028",
+  "artifact_sha256": {
+    "analyzer-final.log": "26e4fc70ea6b6384bf46375bf00ad2ce38024aabcad5482770bd95e72ba6bbc6",
+    "codec-roundtrip-final.json": "5b72d791c7aa150ee54396a6c1580ad9981443f87677bc84a0f9b12956b5a81a",
+    "codec-roundtrip-verified.json": "e7fcccb261fae4e4568520d78a9ee4263d27f578fb8e20b195556135d9b5d553",
+    "codec-roundtrip.json": "3d60a3ead1d3502898e09c8596e2d88e7426e0f5056a690447af72c46eb909ef",
+    "codec-supervisor-final.log": "345747c922be839c07fbdb0f9af6301028f220763f58a7f8ff64ce59c3a1aced",
+    "followup-codec-final-build.log": "dfbecfcfaa92eca042847fb198ac6f1f7cb9d51dd8210dd89c0fadbe3bb98c91",
+    "followup-codec-final-test.log": "40bd4241f02abd284a627c9702f0f09e9a6a5e154ad79588f5585a9a369952cb",
+    "followup-corrupt-test-build.log": "a57d895fdb5e63ba285a7b3a3b7bc3c408197893cfff546e1317f756ec6ba0aa",
+    "followup-deps.log": "5e9adaac336a72a8c9c9eb864f187dcb8a5b5458ad69ac9066142642255f3e50",
+    "followup-final-build.log": "c7bc70ee02ecd848e5a2a4da114eec3031acea2f9cd0f313ac9d5925a49f8da9",
+    "followup-final-tests.log": "828d80a29a645ff289e1d0032218550e64d3ab938bc2dc81040593959786a369",
+    "followup-recovery-final-build.log": "d2fe6401ed93b229bb0472330c05c7fb67db49a3737476945e106c1d9b67d986",
+    "followup-recovery-final-test.log": "aedd02bbc4de2572c07666b5aa18ab4836363ee90acc2de8aec6cea14e73ad88",
+    "followup-recovery-tests.log": "e17733e4fcd541d3acaa7ac3b30daa92bfffd91e0edd2bab4084dc653fde1e48",
+    "followup-recovery-verified.log": "ea0b5d7099f8cfa672037075c955d242cc7ad14f5c0e7bed978ded4f9c0887af",
+    "followup-verified-tests.log": "bad23719cbb6919eba2a281cdd8e1b8eb56f802e569184f2396c2df9a620cf5f",
+    "followup-webrtc-build.log": "173b5c5d32bfc9cadc1a2b7dcda17ed8c6c5c53f642fa3834ba258af044a66c2",
+    "linux-binary-sha256.txt": "6b296a496a9c31a12a2863b4c49a85455a1bcf269050088549841949558362e8",
+    "linux-environment.txt": "70705025d4ccaab5997fda94bf303fba8a851f0d900681b916b4664a249d06ff",
+    "mac-build.log": "a4bafb4024e2110c174f175bc4d27630cebb03bfd41298089cac332740e14402",
+    "mac-codec-final-build.log": "6b3452a16d9dfcad26ef345a33734466d0641332bdb9a7ea647ac17f71924d7c",
+    "mac-configure.log": "1fe07783432309108eb8d8186cf0bc68a26ace51662da5cf32b1db3fe86b957d",
+    "mac-native-pts.log": "fcccc794d142bad94db5d372e73a0eb982dd71f63dcd9b24a940e0c8db0a085c",
+    "network-policy-final.log": "af1560e1eca10d9dd192a70ddfb7dd31f8beee69966b484cc31cf669cd81ce34",
+    "offline-final.log": "45fc53a8944cf8e302f7dd51df8e5afb244f7c281f1793fb5914c3fa31b11063",
+    "offline-regressions.log": "94a150129822c54c8a95cebef62dbe774b39bae77f96e2e7c678797095eb57c4"
+  },
+  "validation": {
+    "linux_environment": "Ubuntu 22.04 ARM64; GCC 11.4; GStreamer 1.20.3; libnice 0.1.18; only IPv4/IPv6 loopback, no route.",
+    "linux_targeted_ctest": {
+      "passed": 12,
+      "total": 12,
+      "full_suite_rerun": false,
+      "log": "followup-verified-tests.log",
+      "earlier_setup_issue": "First targeted run passed 11 tests and could not run webrtc-recovery because its target had not been built. Built it and reran all 12 successfully; original log retained.",
+      "final_delta_checks": [
+        "followup-codec-final-test.log",
+        "followup-recovery-final-test.log"
+      ]
+    },
+    "software_roundtrip": {
+      "passed": true,
+      "settings": {
+        "backend": "cpu",
+        "codec": "h264",
+        "decoder": "avdec_h264",
+        "width": 128,
+        "height": 96,
+        "fps": 20,
+        "bitrate_kbps": 125,
+        "gop": 30
+      },
+      "first_idr_and_actual_decode": true,
+      "encoded_input_output_correlations": 16,
+      "encoder_input_to_parsed_output": {
+        "count": 16,
+        "max_ms": 0,
+        "overflow": 0,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0,
+        "quantile_limit_ms": 2000,
+        "resolution_ms": 1,
+        "snapshot": "concurrent counters; final stopped snapshot is exact"
+      },
+      "peak_encoder_inputs_pending": 1,
+      "vbv_capacity_ms": 600,
+      "vbv_frame_budgets": 12.0,
+      "fallback_order": [
+        {
+          "backend": "nvenc",
+          "passed": false,
+          "error": "encoder factory unavailable"
+        },
+        {
+          "backend": "vaapi",
+          "passed": false,
+          "error": "encoder factory unavailable"
+        },
+        {
+          "backend": "cpu",
+          "passed": true,
+          "error": null
+        }
+      ],
+      "actual_camera": false,
+      "actual_render": false,
+      "hardware_encoder_tested": false
+    },
+    "recovery": {
+      "actual_force_key_unit_to_new_idr_to_decoded_pts": true,
+      "log": "followup-recovery-final-test.log",
+      "negative_cases": [
+        "old IDR cannot unlock reference chain",
+        "duplicate requests coalesced",
+        "at most one retry per episode",
+        "timeout does not admit dependent frames",
+        "CORRUPTED IDR and decoded buffers rejected"
+      ],
+      "deterministic_capture_age_fixture": true,
+      "native_decoder_automatic_rebuild": false,
+      "authenticated_remote_recovery_ack": false,
+      "vehicle_control_rearm_proven": false
+    },
+    "mac": {
+      "native_module_and_probes_build": true,
+      "native_pts_corrupt_admission_selftest": true,
+      "ui_runtime": false,
+      "hardware_decode_render_trial": false
+    },
+    "python_js": {
+      "fixed_offline_runner": "passed; six existing real-binary desktop cases explicitly skipped",
+      "codec_supervisor_cases": 4,
+      "hybrid_analyzer_cases": 13,
+      "network_policy_cases": 12,
+      "final_delta_logs": [
+        "codec-supervisor-final.log",
+        "analyzer-final.log",
+        "network-policy-final.log"
+      ]
+    },
+    "fallback_evidence": {
+      "allowRelay_is_permission_only": true,
+      "explicit_goal": "fallback",
+      "requires_fresh_negotiation": true,
+      "requires_valid_relay_pair_and_video_receive_decode_progress": true,
+      "browser_path_coverage": "sampled, not continuous",
+      "native_strict_relay_acceptance_available": false,
+      "remote_relay_leg_evidence_available": false
+    },
+    "review_lanes": {
+      "reuse": "Uses production encoder stages, decoder settings, AU parser, freshness probe, and transport allowlist. Adds one fixed-memory histogram shared by diagnostic and runtime.",
+      "quality": "Preserves generation/control barriers. Missing hardware pool and relay-leg evidence remains unknown/fail closed. No automatic startup/decode rebuild claims.",
+      "efficiency": "No allocation or lock in production histogram write; one bounded IDR retry. Keeps 1 Hz browser sampling and existing queue sizes."
+    }
+  },
+  "unverified": [
+    "Real camera startup and automatic backend qualification in VehicleMediaRuntime",
+    "NVENC/VAAPI/nvv4l2 encoder hardware and decoder surface-to-display capability",
+    "Complete decoder-error/rebuild/remote-ACK/control-admission recovery state machine",
+    "Full capture/RTP/decode/display frame identity across hosts",
+    "Driver/GPU surface pool capacity and zero-copy",
+    "Pacing/VBV/surface/VSync tuning and sustained tail-latency improvements",
+    "Actual independent-uplink WAN transport and vehicle control recovery"
+  ],
+  "wan_seconds": {
+    "ipv4_browser": 0,
+    "ipv4_native": 0,
+    "ipv6_browser": 0,
+    "ipv6_native": 0
+  },
+  "wan_target_seconds_per_arm": 1800,
+  "orin_contacted": false,
+  "new_lan_ab_runs": 0,
+  "direct_timeout_default_ms": 0,
+  "healthy_relay_to_direct_upgrade": false
+}

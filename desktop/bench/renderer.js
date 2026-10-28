@@ -4,6 +4,16 @@ async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy, i
   const send = message => bridge.send(message).catch(error => { console.error(error); throw error; });
   const data = window.hybridBench = {schema: 'hybrid-ui-ab-v1', mode, seconds, expectedTransport: transport, userAgent: navigator.userAgent,
     expectedNetwork: networkConfig, display: {devicePixelRatio, width: screen.width, height: screen.height}, attempts: [], samples: [], tracks: [], phases: [], load: [], longTasks: [], visibility: [], errors: [], overflow: 0, start: null};
+  data.pathValidation={coverage:mode==='browser'?'sampled':'native-pair-change-latched',interval_ms:1000,
+    continuous_browser_path_validation:false};
+  data.validationStatus='collection_only; run hybrid_receiver_analyze.py for acceptance';
+  const scope = () => ({negotiationId:mediaOfferScope?.id,sourceSessionId:nativeControlSessionId,
+    sourceControlSessionGeneration:nativeControlSessionGeneration});
+  const recordAttempt = (offer, at=performance.now()) => {
+    if(data.attempts.length>=64)throw Error('attempt evidence overflow');
+    data.attempts.push({at,id:offer.media_negotiation_id,
+      mode:offer.ice_route_mode||'all',...scope(),negotiationId:offer.media_negotiation_id});
+  };
   let stopped = false, started = false, collecting = false, timer, loadTimer, nativeScope, offerSeen = false;
   let offeredIds = [], latestNative = null, lastNativeAt = 0, previousPhase = '';
   let observer, frameIds = [];
@@ -65,7 +75,7 @@ async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy, i
       retireMediaOffer(mediaOfferScope);
       mediaOfferScope = controlLogic.iceOfferScope(offer, !offerSeen); mediaHasOffer = true; offerSeen = true;
       latestNative=null; lastNativeAt=0; nativeOfferReady=false;
-      data.attempts.push({at:performance.now(),id:offer.media_negotiation_id,mode:offer.ice_route_mode||'all'});
+      recordAttempt(offer);
       nativeScope = {source_session_id: nativeControlSessionId,
         source_control_session_generation: nativeControlSessionGeneration, media_negotiation_id: offer.media_negotiation_id};
       offeredIds = (offer.media_tracks || []).map(t => t.camera_id);
@@ -113,12 +123,20 @@ async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy, i
   if (network) {
     const originalOffer = startFromOffer, originalIce = addIce;
     startFromOffer = async offer => {
-      if (mode==='browser') data.attempts.push({at:performance.now(),id:offer.media_negotiation_id,mode:offer.ice_route_mode||'all'});
+      const freshBrowserOffer=mode==='browser' && offer.media_negotiation_id && mediaOfferScope?.id!==offer.media_negotiation_id && !retiredMediaScopes.has('id:'+offer.media_negotiation_id);
+      const attemptAt=performance.now(), attemptSession=nativeControlSessionId, attemptGeneration=nativeControlSessionGeneration;
+      if (freshBrowserOffer) {
+        if (started) throw Error('measurement stops on renegotiation; retain separate attempt evidence');
+      }
       network.requireIceServers(iceServers);
       iceServers = network.serversForReceiver(iceServers);
       // Keep session/ufrag/negotiation fences intact while excluding other paths.
       pendingIce = pendingIce.filter(network.candidateAllowed);
-      return originalOffer({...offer, sdp:network.filterSdp(offer.sdp)});
+      const result=await originalOffer({...offer, sdp:network.filterSdp(offer.sdp)});
+      if(freshBrowserOffer && mediaOfferScope?.id===offer.media_negotiation_id &&
+          attemptSession===nativeControlSessionId && attemptGeneration===nativeControlSessionGeneration)
+        recordAttempt(offer,attemptAt);
+      return result;
     };
     addIce = async candidate => {
       if (network.candidateAllowed(candidate)) return originalIce(candidate);
@@ -165,7 +183,7 @@ async ({mode, seconds, transport = 'udp', networkConfig}, createNetworkPolicy, i
     if (stopped || collecting) return; collecting = true;
     try {
       if (!polling || !nativeControlSessionId) throw Error('media session stopped');
-      const sample = {at: performance.now(), phase: phaseAt(performance.now() - data.start), signaledTurnUrls:network?.signaledTurnUrls()};
+      const sample = {at: performance.now(), phase: phaseAt(performance.now() - data.start), signaledTurnUrls:network?.signaledTurnUrls(),...scope()};
       if (mode === 'browser') {
         if (peer !== data.instance || peer.connectionState !== 'connected') throw Error('browser peer changed/disconnected');
         const report = await peer.getStats();

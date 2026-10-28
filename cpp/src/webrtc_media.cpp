@@ -696,6 +696,7 @@ struct VehicleMediaRuntime::Impl {
     std::atomic<std::int64_t> last_encoded_ms{0};
     std::atomic<std::int64_t> last_encoded_steady_ms{0};
     std::atomic<std::uint64_t> encode_latency_samples{0};
+    detail::LatencyHistogram capture_to_encoded_latency;
     std::atomic<std::uint64_t> encode_latency_total_ms{0};
     std::atomic<std::uint64_t> encode_latency_max_ms{0};
     std::atomic<std::uint64_t> encode_latency_invalid_samples{0};
@@ -977,6 +978,7 @@ struct VehicleMediaRuntime::Impl {
       }
       if (latency) {
         const auto latency_ms = *latency;
+        lane->capture_to_encoded_latency.add(latency_ms);
         ++lane->encode_latency_samples;
         lane->encode_latency_total_ms += latency_ms;
         auto observed = lane->encode_latency_max_ms.load();
@@ -3313,6 +3315,10 @@ struct VehicleMediaRuntime::Impl {
           {"send_dependent_access_units_dropped", lane->send_freshness == nullptr ? 0 : lane->send_freshness->dropped_waiting_idr.load()},
           {"send_key_unit_requests", lane->send_freshness == nullptr ? 0 : lane->send_freshness->key_unit_requests.load()},
           {"send_key_unit_request_failures", lane->send_freshness == nullptr ? 0 : lane->send_freshness->key_unit_request_failures.load()},
+          {"send_idr_recoveries", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recoveries.load()},
+          {"send_idr_recovery_timeouts", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recovery_timeouts.load()},
+          {"send_idr_recovery_last_ms", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recovery_last_ms.load()},
+          {"send_idr_recovery_max_ms", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recovery_max_ms.load()},
           {"last_forwarded_frame_age_ms", lane->send_freshness == nullptr ? Json(nullptr) : Json(lane->send_freshness->last_forwarded_age_ms.load())},
             {"failure_count", lane->failure_count.load()}, {"camera_faulted", lane->camera_faulted.load()},
             {"disabled", lane->disabled.load()}});
@@ -4856,6 +4862,10 @@ struct VehicleMediaRuntime::Impl {
           {"send_dependent_access_units_dropped", lane->send_freshness == nullptr ? 0 : lane->send_freshness->dropped_waiting_idr.load()},
           {"send_key_unit_requests", lane->send_freshness == nullptr ? 0 : lane->send_freshness->key_unit_requests.load()},
           {"send_key_unit_request_failures", lane->send_freshness == nullptr ? 0 : lane->send_freshness->key_unit_request_failures.load()},
+          {"send_idr_recoveries", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recoveries.load()},
+          {"send_idr_recovery_timeouts", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recovery_timeouts.load()},
+          {"send_idr_recovery_last_ms", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recovery_last_ms.load()},
+          {"send_idr_recovery_max_ms", lane->send_freshness == nullptr ? 0 : lane->send_freshness->idr_recovery_max_ms.load()},
           {"last_forwarded_frame_age_ms", lane->send_freshness == nullptr ? Json(nullptr) : Json(lane->send_freshness->last_forwarded_age_ms.load())},
           {"failure_count", lane->failure_count.load()},
           {"reopen_count", lane->reopen_count.load()},
@@ -4865,6 +4875,8 @@ struct VehicleMediaRuntime::Impl {
                                            : static_cast<double>(lane->encode_latency_total_ms.load()) /
                                                  static_cast<double>(lane->encode_latency_samples.load())},
           {"capture_to_encoded_max_ms", lane->encode_latency_max_ms.load()},
+          {"capture_to_encoded_distribution", lane->capture_to_encoded_latency.json()},
+          {"send_idr_recovery_distribution", lane->send_freshness == nullptr ? Json(nullptr) : lane->send_freshness->idr_recovery_latency.json()},
           {"capture_to_encoded_valid", lane->encode_latency_current_valid.load()},
           {"capture_to_encoded_samples", lane->encode_latency_samples.load()},
           {"capture_to_encoded_invalid_samples", lane->encode_latency_invalid_samples.load()},

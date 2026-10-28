@@ -414,3 +414,67 @@ UDP arm 均拒绝通过。不会从 TURN 配置的 `?transport=udp` 推断实际
 `cloud.ice_direct_timeout_ms` 默认仍为 **0**，现场配置未启用 direct-first；
 没有健康 relay → direct 的周期性升级。四组独立公网 A/B 仍各 **0/1800 秒**，
 本轮未连接 Orin，也没有新增 LAN A/B。
+
+### Review 补充：回退验收、真实编解码与恢复证据
+
+`allowRelay:true` 现在仍只是路径许可。普通媒体实验使用默认的
+`validationGoal:"media"`；若要验收回退，必须在 WAN 配置中显式设置
+`validationGoal:"fallback"`，并保留前述 TURN URL、DNS 和分配池证据。
+分析器要求同一 session/control generation 中有 `direct → all` 两次尝试，
+negotiation ID 不同；测量样本必须属于新协商。还必须在相邻有效样本中看到
+同一合法 relay 选中对，且该对的接收字节、对应视频流的接收字节及实际解码帧数均增长。
+全程 direct、旧协商、未知/TCP/TLS relay leg、仅队列出帧但接收计数不增长均不能通过。
+采集程序结束不等于验收通过，必须运行 `hybrid_receiver_analyze.py`。
+
+**网页证据仍是每秒采样，不是连续路径合规证明。** `path_validation` 明确记录此限制；
+两个样本之间的瞬时路径变化可能漏掉。此次没有通过新增高频轮询改变 UI 压力实验。
+原生保持 selected-pair 回调锁存违规，但完整 TURN leg 取证仍缺失，不能通过严格 relay arm。
+
+本轮采用的机制参考了 Sunshine 的实际编码/首包 IDR 检查
+（[`validate_config`](https://github.com/LizardByte/Sunshine/blob/master/src/video.cpp)）以及
+Moonlight 的实际测试帧解码与渲染路径试验
+（[`ffmpeg.cpp`](https://github.com/moonlight-stream/moonlight-qt/blob/master/app/streaming/video/ffmpeg.cpp)）。
+以下为本项目已落地的子集，不表示已复现上游完整恢复与显示架构。
+
+| 项目 | 本轮实现 | 仍未验证或未实现 |
+| --- | --- | --- |
+| 真实能力 | 独立进程运行生产编码器配置，输入 16 帧 NV12，检查首 AU 的 IDR/参数集，实际解码首帧并核对尺寸、格式、PTS | 输入是合成帧；未接入真实相机启动验收、生产自动后端选择或实际 GL 显示验收 |
+| 参数与内部排队 | 读回实际 GObject 属性；以 PTS 关联编码器 sink 到解析 AU 输出，记录分布及同时等待输出的输入数 | 属性读回不保证驱动内部实现；16 帧不足以证明长时性能，不能代替各硬件/分辨率实测 |
+| IDR 恢复 | 复用生产 freshness probe，拒绝旧 IDR 解开屏障；每次故障最多一次补发，记录恢复时间和超时；实际 ForceKeyUnit→新 IDR→匹配 PTS 的解码输出测试 | 发送端指标不是远端解码 ACK；没有新增跨端恢复确认、原生解码器自动重建或车辆控制重新就绪证明 |
+| 缓冲预算 | 报告已配置队列槽位、实际解码内存类型；原生丢弃 CORRUPTED buffer | 驱动引用 surface、GPU 在途占用和池容量未知，`verified:false`；未调整 surface、async-depth、VSync，也未宣称 zero-copy |
+| 阶段统计 | 产品采集→编码输出、请求→发送 IDR 增加 p50/p95/p99/max；复用原生 jitter 输入/解码/GL draw 的逐帧 PTS 关联 | 尚无贯穿相机、RTP、两端时钟和扫描显示的统一身份链，不能把不同边界的耗时直接相减 |
+
+启用 `MINE_TELEOP_BUILD_BENCH_PROBES=ON` 后构建 `mine-teleop-codec-roundtrip-probe`，
+通过监督脚本运行（示例为软件基线；输出文件不可覆盖）：
+
+```sh
+python3 scripts/test/codec_roundtrip_probe.py \
+  --probe build/mine-teleop-codec-roundtrip-probe \
+  --encoders cpu --decoders avdec_h264 --codec h264 \
+  --width 128 --height 96 --fps 20 --bitrate-kbps 125 --gop 30 \
+  --timeout-ms 10000 --output codec-roundtrip.json
+```
+
+按明确的顺序传 `--encoders nvenc,vaapi,cpu` 可测试失败后选择后端，
+每个组合使用新的子进程，保留每次失败原因，首次实际成功后停止。CPU 只支持 H.264；
+NVENC/VAAPI 可以分别测 H.264/H.265。`nvv4l2decoder` 可作为解码候选，仓库尚无
+nvv4l2 编码实现，不能将 NVENC 参数当成该实现的证明。监督脚本限制整次尝试的时间，
+包括驱动初始化和 teardown；超时杀进程组，未回收成功则禁止继续选择下一后端。
+这不是内核/驱动死锁恢复保证。不要直接运行无外部期限的 worker 作为生产启动过程。
+
+Linux 软件样例确认 x264 的 `bframes=0`、`rc-lookahead=0`、`sync-lookahead=0` 和
+zerolatency tune 被读回；默认 `vbv-buf-capacity=600` ms，在 20 fps 下为 12 帧码率预算。
+该样例 16 帧最多只有 1 个已输入但未输出的编码帧，说明 VBV 预算不能直接解释成排队时长。
+目前未强制缩小 VBV，需在目标码率、复杂运动、画质与吞吐约束下做后端对照。
+直方图使用 1 ms 精度（0 表示不足 1 ms），超过 2000 ms 的尾部计数保留、对应分位数
+输出 null，max 保留；不会把超范围尾部截成 2000 ms。运行中快照是并发计数，停止后精确。
+
+生产发送恢复在持续收到 AU 时，以现有 freshness 年龄预算触发一次补发，两个预算后记录
+一次超时；持续丢失的依赖帧不会引发无限请求。没有新 buffer 时仍由既有视频 watchdog
+负责停控。晚到但完整、新鲜且身份严格更新的 IDR 可恢复发送资格，不能单独恢复控制授权。
+800 ms 保护、5 s 升级和既有会话/控制重启围栏没有放宽。测试的解码确认只来自软件夹具，
+未伪装成生产控制端 ACK。保持不使用重复/static frame 更新健康状态、不用损坏画面恢复准入。
+
+本轮自动化结果见 [补充验证证据](evidence/pr26-codec-recovery-20261028.json)。
+真实相机、NVENC/VAAPI/nvv4l2 硬件、GPU surface→显示、弱网后跨端恢复和四组独立公网
+30 分钟 A/B 仍待验证；WAN 仍各 **0/1800 秒**。没有连接 Orin 或新增 LAN A/B。

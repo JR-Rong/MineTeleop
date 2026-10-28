@@ -9,6 +9,9 @@ function createNetworkPolicy(input, inspectAddress) {
     remotePublicAddresses:[input.remotePublicIp], stunUrls:[input.stunUrl]} : input;
   if (!config || config.kind !== 'wan-dualstack' || !['ipv4','ipv6','dual'].includes(config.family) ||
       typeof config.allowRelay !== 'boolean') throw Error('WAN bench requires an explicit address family and relay policy');
+  const validationGoal=input.validationGoal ?? 'media';
+  if (!['media','fallback'].includes(validationGoal) || (validationGoal==='fallback'&&!config.allowRelay))
+    throw Error('validationGoal must be media or fallback; fallback requires allowRelay');
   const allowedFamily = info => ['ipv4','ipv6'].includes(info.family) && (config.family==='dual'||info.family===config.family);
   const addresses = (values, publicOnly) => {
     if (!Array.isArray(values) || !values.length || values.length>16) throw Error('WAN bench requires bounded IPv4/IPv6 endpoint lists');
@@ -24,7 +27,7 @@ function createNetworkPolicy(input, inspectAddress) {
   if (config.family==='dual' && !['ipv4','ipv6'].every(f=>local.some(ip=>inspectAddress(ip).family===f) && remote.some(ip=>inspectAddress(ip).family===f)))
     throw Error('dual-stack bench requires both address families at both endpoints');
   const legacyUrl = legacy ? input.stunUrl : input.legacyStunUrl;
-  const normalized={...config,legacyStunUrl:legacyUrl,localAddresses:local,localPublicAddresses:localPublic,remotePublicAddresses:remote};
+  const normalized={...config,validationGoal,legacyStunUrl:legacyUrl,localAddresses:local,localPublicAddresses:localPublic,remotePublicAddresses:remote};
   const directTypes=['host','srflx','prflx'];
   function validServer(url) {
     // Port 9 was the historical Chromium socket failure. No placeholder is

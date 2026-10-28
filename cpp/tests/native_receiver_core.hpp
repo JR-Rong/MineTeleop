@@ -4,6 +4,7 @@
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/detail/gstreamer_ice_servers.hpp"
 #include "mine_teleop/detail/ice_diagnostics.hpp"
+#include "mine_teleop/detail/gstreamer_decoder.hpp"
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/sdp/sdp.h>
@@ -222,7 +223,8 @@ struct Track {
   std::mutex mutex;
   std::map<GstClockTime, double> compressed_at, decoded_at;
   std::unordered_set<std::uint64_t> rtp_timestamps, decoded_pts;
-  std::uint64_t rtp_packets{}, decoded_buffers{}, duplicate_decoded_pts{}, invalid_decoded_pts{}, identity_overflow{};
+  std::unordered_set<std::string> decoded_memory_types;
+  std::uint64_t rtp_packets{}, decoded_buffers{}, duplicate_decoded_pts{}, invalid_decoded_pts{}, corrupt_decoded_buffers{}, identity_overflow{};
   Samples decode_ms, decoded_gap_ms, consumed_gap_ms, consume_wait_ms;
   Json decoded_events = Json::array(), drawn_events = Json::array(), received_events = Json::array();
   GstClockTime last_draw_pts{GST_CLOCK_TIME_NONE};
@@ -261,12 +263,20 @@ struct Track {
   }
   static GstPadProbeReturn raw(GstPad*, GstPadProbeInfo* info, gpointer data) {
     auto& self = *static_cast<Track*>(data);
-    const auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
     if (buffer) {
       const double now = bench_now_ms();
       std::lock_guard lock(self.mutex);
       ++self.decoded_buffers;
+      if (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_CORRUPTED)) {
+        ++self.corrupt_decoded_buffers; return GST_PAD_PROBE_DROP;
+      }
       const auto pts = GST_BUFFER_PTS(buffer);
+      for(guint index=0;index<gst_buffer_n_memory(buffer) && index<64;++index) {
+        const auto* memory=gst_buffer_peek_memory(buffer,index);
+        if(self.decoded_memory_types.size()<8)
+          self.decoded_memory_types.insert(memory->allocator && memory->allocator->mem_type?memory->allocator->mem_type:"unknown");
+      }
       if (!GST_CLOCK_TIME_IS_VALID(pts)) { ++self.invalid_decoded_pts; return GST_PAD_PROBE_DROP; }
       if (self.decoded_pts.size() >= 131072) { ++self.identity_overflow; return GST_PAD_PROBE_DROP; }
       // Decoder drain may repeat an output PTS. It must not refresh frame age,
@@ -334,6 +344,8 @@ struct Track {
             {"rtp_packets", rtp_packets}, {"rtp_unique_frame_timestamps", rtp_timestamps.size()},
             {"decoded_unique_pts", decoded_pts.size()}, {"duplicate_decoded_pts", duplicate_decoded_pts},
             {"invalid_decoded_pts", invalid_decoded_pts}, {"identity_observation_overflow", identity_overflow},
+            {"corrupt_decoded_buffers", corrupt_decoded_buffers},
+            {"decoded_memory_types", decoded_memory_types},
             {"not_consumed_frames", decoded - consumed}, {"injected_consumer_stalls", stalls},
             {"decoded_fps", decoded > 1 && last_decoded > first ? (static_cast<double>(decoded - 1) * 1000 / (last_decoded - first)) : 0},
             {"depay_to_decode", decode_ms.json()}, {"decoded_frame_gap", decoded_gap_ms.json()},
@@ -447,6 +459,10 @@ class Receiver {
     std::lock_guard lock(mutex_);
     for (auto& track : tracks_) tracks.push_back(track->json());
     return {{"tracks", tracks}, {"selected_pair", selected_pair_}, {"selected_pair_changes", pair_changes_},
+      {"surface_budget", {{"consumer_queue_slots",options_.display?1:0},{"appsink_slots",1},{"consumer_held_slots",1},
+          {"display_queue_slots",options_.display?1:0},{"decoder_reference_surfaces",nullptr},
+          {"gpu_inflight_surfaces",nullptr},{"pool_capacity",nullptr},{"verified",false},
+          {"note","Known queue references may share a surface; driver pool and GL retention are unknown. No zero-copy claim."}}},
             {"local_candidates", local_candidates_}, {"jitter_target_ms", options_.jitter_ms},
             {"appsink_max_buffers", 1}, {"appsink_drop", true}, {"sink_sync", false}, {"decoder", options_.decoder},
             {"display_presented", false}, {"display_requested", options_.display},
@@ -520,9 +536,7 @@ class Receiver {
     std::lock_guard lock(mutex_);
     if (tracks_.size() >= 8) throw std::runtime_error("too many receiver tracks");
     GError* error = nullptr;
-    const auto decoder = options_.decoder == "nvv4l2decoder"
-        ? "nvv4l2decoder name=decoder disable-dpb=true" : options_.decoder == "vtdec_hw"
-        ? "vtdec_hw name=decoder" : "avdec_h264 name=decoder max-threads=2";
+    const auto decoder = detail::low_latency_decoder_stage(options_.decoder);
     auto description = std::string("rtph264depay name=depay wait-for-keyframe=true request-keyframe=true ! h264parse ! ") +
         decoder + " ! tee name=raw raw. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! appsink name=out sync=false max-buffers=1 drop=true wait-on-eos=false";
     if (!options_.display) description = std::string("rtph264depay name=depay wait-for-keyframe=true request-keyframe=true ! h264parse ! ") +

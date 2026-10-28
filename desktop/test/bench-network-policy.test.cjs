@@ -116,3 +116,35 @@ test('actual renderer fetch wrapper cannot replace current TURN evidence with a 
   pending[0]([{urls:urls[0]}]);await old;
   assert.deepEqual(p.signaledTurnUrls(),[urls[1]]);
 });
+test('fallback is an explicit validation goal, not a synonym for allowRelay', () => {
+  assert.equal(createNetworkPolicy(config).config.validationGoal,'media');
+  assert.throws(()=>createNetworkPolicy({...config,validationGoal:'fallback'}),/requires allowRelay/);
+  assert.throws(()=>createNetworkPolicy({...config,validationGoal:'anything'}),/validationGoal/);
+});
+test('renderer records only accepted current browser attempts, never skipped or superseded offers', async () => {
+  const vm=require('node:vm'),fs=require('node:fs');
+  const source=fs.readFileSync(require.resolve('../bench/renderer.js'),'utf8');
+  let release;
+  const context=vm.createContext({mode:'browser',network:policy,mediaOfferScope:null,
+    nativeControlSessionId:'s',nativeControlSessionGeneration:2,retiredMediaScopes:new Set(),
+    iceServers:[{urls:config.stunUrl}],pendingIce:[],started:false,performance:{now:()=>10},data:{attempts:[]},
+    addIce:async()=>{},startFromOffer:async offer=>{
+      if(offer.media_negotiation_id==='skip')return;
+      context.mediaOfferScope={id:offer.media_negotiation_id};
+      if(offer.media_negotiation_id==='late')await new Promise(resolve=>{release=resolve;});
+    }});
+  vm.runInContext(source.slice(source.indexOf('  const scope ='),source.indexOf('  let stopped')),context);
+  vm.runInContext(source.slice(source.indexOf('  if (network) {\n    const originalOffer'),source.indexOf('  function phaseAt')),context);
+  const offer=id=>({media_negotiation_id:id,ice_route_mode:'direct',sdp:'v=0\r\n'});
+  await context.startFromOffer(offer('skip'));
+  assert.equal(context.data.attempts.length,0);
+  await context.startFromOffer(offer('good'));
+  await context.startFromOffer(offer('good'));
+  assert.equal(context.data.attempts.length,1);
+  assert.equal(context.data.attempts[0].sourceControlSessionGeneration,2);
+  const late=context.startFromOffer(offer('late'));
+  context.mediaOfferScope={id:'replacement'};release();await late;
+  assert.equal(context.data.attempts.length,1);
+  context.started=true;
+  await assert.rejects(context.startFromOffer(offer('new')),/stops on renegotiation/);
+});

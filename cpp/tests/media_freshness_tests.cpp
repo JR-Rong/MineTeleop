@@ -1,4 +1,5 @@
 #include "mine_teleop/detail/media_freshness.hpp"
+#include "mine_teleop/detail/latency_histogram.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -133,6 +134,17 @@ void test_invalid_and_cra() {
 
 int main() {
   try {
+    LatencyHistogram histogram;
+    expect(histogram.json()["p99_ms"].is_null(),"empty histogram must not report zero latency");
+    for(unsigned ms=1;ms<=100;++ms)histogram.add(ms);
+    auto stats=histogram.json();
+    expect(stats["count"]==100 && stats["p50_ms"]==50 && stats["p95_ms"]==95 && stats["p99_ms"]==99 && stats["max_ms"]==100,
+        "millisecond histogram quantiles incorrect");
+    for(unsigned i=0;i<3;++i)histogram.add(3000);
+    stats=histogram.json();
+    expect(stats["p99_ms"].is_null() && stats["overflow"]==3 && stats["max_ms"]==3000,
+        "histogram must not clip unobserved quantile tails");
+    std::cout << "[PASS] bounded latency histogram preserves tails and unknown/overflow\n";
     test_reference_chain(AccessUnitCodec::H264);
     std::cout << "[PASS] H264 stale AU fences dependent frames until fresh complete IDR\n";
     test_reference_chain(AccessUnitCodec::H265);

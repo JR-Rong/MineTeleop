@@ -20,6 +20,8 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 PURE_TESTS = (
+    ("codec probe supervisor", (sys.executable, "scripts/test/codec_roundtrip_probe.test.py")),
+    ("hybrid evidence acceptance", (sys.executable, "scripts/test/hybrid_receiver_analyze.test.py")),
     ("release helpers", (sys.executable, "-m", "unittest", "discover", "-s", "scripts/ci", "-p", "test_*.py", "-v")),
     ("desktop helpers", ("node", "--test", "desktop/test/log-directory.test.cjs", "desktop/test/diagnostic-log.test.cjs", "desktop/test/native-controller.test.cjs", "desktop/test/native-process.test.cjs", "desktop/test/main-network-policy.test.cjs", "desktop/test/bench-network-policy.test.cjs")),
     ("control logic", ("node", "cpp/tests/control_logic.test.cjs")),

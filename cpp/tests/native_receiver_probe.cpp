@@ -167,10 +167,11 @@ bool pts_self_test() {
     ++*static_cast<std::atomic<unsigned>*>(data);
   }), &delivered);
   bool ok = gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE;
-  const GstClockTime timestamps[] = {0, 33 * GST_MSECOND, 33 * GST_MSECOND, 66 * GST_MSECOND, GST_CLOCK_TIME_NONE};
+  const GstClockTime timestamps[] = {0, 33 * GST_MSECOND, 33 * GST_MSECOND, 66 * GST_MSECOND, GST_CLOCK_TIME_NONE, 99 * GST_MSECOND};
   for (const auto pts : timestamps) {
     auto* buffer = gst_buffer_new_allocate(nullptr, 1, nullptr);
     GST_BUFFER_PTS(buffer) = pts;
+    if(pts==99*GST_MSECOND)GST_BUFFER_FLAG_SET(buffer,GST_BUFFER_FLAG_CORRUPTED);
     ok = (gst_app_src_push_buffer(GST_APP_SRC(source), buffer) == GST_FLOW_OK) && ok;
   }
   static_cast<void>(gst_app_src_end_of_stream(GST_APP_SRC(source)));
@@ -181,8 +182,8 @@ bool pts_self_test() {
   gst_element_set_state(pipeline, GST_STATE_NULL);
   gst_object_unref(bus); gst_object_unref(pad); gst_object_unref(output);
   gst_object_unref(decoded); gst_object_unref(source); gst_object_unref(pipeline);
-  return ok && delivered == 3 && track.decoded == 3 && track.decoded_buffers == 5 &&
-      track.duplicate_decoded_pts == 1 && track.invalid_decoded_pts == 1;
+  return ok && delivered == 3 && track.decoded == 3 && track.decoded_buffers == 6 &&
+      track.duplicate_decoded_pts == 1 && track.invalid_decoded_pts == 1 && track.corrupt_decoded_buffers == 1;
 }
 }  // namespace
 
