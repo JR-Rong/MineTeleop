@@ -309,6 +309,21 @@
           }
         ]
       }
+    },
+    "shared_tail_observation": {
+      "elapsed_seconds_approx": [
+        723.4,
+        1057.0
+      ],
+      "both_tracks_draw_gap_ms_approx": [
+        630,
+        562
+      ],
+      "both_tracks_jitter_input_gap_ms_approx": [
+        628,
+        561
+      ],
+      "interpretation": "Both tracks observed nearly simultaneous marker-arrival gaps before decode; jitterbuffer input is not kernel packet arrival and does not identify sender, network, or scheduling as the cause."
     }
   },
   "limits": [
