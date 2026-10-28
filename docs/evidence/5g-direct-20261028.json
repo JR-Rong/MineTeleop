@@ -1,0 +1,333 @@
+{
+  "schema": "mine-teleop-pr26-cellular-direct-v1",
+  "date": "2026-10-28",
+  "vehicle_source_commit": "920e019029c7c7593843fb182ba58026276ba822",
+  "receiver": "PR26 base plus opt-in physical interface binding in this commit",
+  "network": "Orin RM500U cellular and separate Mac physical uplink; IPv6 UDP host/host; isolated signaling via public cloud SSH; no TURN; radio RAT unverified",
+  "route_observation": "Orin route checked once per second; Mac selected libnice socket macOS physical interface binding read back on selected pair; no claim about sub-second route events",
+  "safety": "media-only isolated bench, mock, control disabled, zero speed, CAN DOWN; original 25 ms sync uncertainty limit failed at 37 ms; only the bench copy was changed to 100 ms",
+  "excluded_attempts": [
+    {
+      "name": "native-ipv6-long-01",
+      "reason": "route guard detected brief IPv4 default route via Mac shared uplink, interrupted after about 30 seconds"
+    },
+    {
+      "name": "native-ipv4-smoke-01",
+      "reason": "STUN srflx UDP present, no selected ICE pair before 90 second startup timeout"
+    }
+  ],
+  "ipv4_stun": "two destinations with the same UDP socket yielded different cellular-side mapped ports; filtering behavior not determined",
+  "native_ipv6_long": {
+    "requested_seconds": 1800,
+    "duration_seconds": 1800.0039,
+    "direct_sampled_seconds": 1800.0031,
+    "relay_sampled_seconds": 0.0,
+    "path_changes_observed": 0,
+    "pair_change_validation": "native-pair-change-latched",
+    "selected_pair": {
+      "local_type": "host",
+      "remote_type": "host",
+      "local_transport": "udp",
+      "remote_transport": "udp",
+      "interface_bound": true
+    },
+    "route_guard_failed": false,
+    "resource_conflicts": [],
+    "can_after": "DOWN",
+    "receiver_passed": true,
+    "ui_overflow": 0,
+    "receiver_samples": 1797,
+    "ui_samples": 1801,
+    "full_window": {
+      "window_seconds": 1799.426,
+      "tracks": [
+        {
+          "pad": "src_0",
+          "decoded_fps": 29.788,
+          "drawn_fps": 29.771,
+          "decode_gap_ms": {
+            "p50_ms": 34.104,
+            "p95_ms": 44.558,
+            "p99_ms": 51.85,
+            "max_ms": 629.259
+          },
+          "draw_gap_ms": {
+            "p95_ms": 44.509,
+            "p99_ms": 51.994,
+            "max_ms": 629.83
+          },
+          "draw_gaps_over_100ms": 125,
+          "draw_gaps_over_250ms": 10,
+          "jitter_input_to_draw_p99_ms": 3.247,
+          "arrival_match_coverage": 0.99965
+        },
+        {
+          "pad": "src_1",
+          "decoded_fps": 29.745,
+          "drawn_fps": 29.727,
+          "decode_gap_ms": {
+            "p50_ms": 34.343,
+            "p95_ms": 42.148,
+            "p99_ms": 50.708,
+            "max_ms": 629.136
+          },
+          "draw_gap_ms": {
+            "p95_ms": 42.285,
+            "p99_ms": 50.833,
+            "max_ms": 629.754
+          },
+          "draw_gaps_over_100ms": 137,
+          "draw_gaps_over_250ms": 8,
+          "jitter_input_to_draw_p99_ms": 3.259,
+          "arrival_match_coverage": 0.99953
+        }
+      ]
+    },
+    "phases": {
+      "idle": {
+        "window_seconds": 349.526,
+        "tracks": [
+          {
+            "pad": "src_0",
+            "decoded_fps": 29.835,
+            "drawn_fps": 29.834,
+            "decode_gap_ms": {
+              "p50_ms": 33.937,
+              "p95_ms": 44.183,
+              "p99_ms": 52.621,
+              "max_ms": 196.629
+            },
+            "draw_gap_ms": {
+              "p95_ms": 44.106,
+              "p99_ms": 52.518,
+              "max_ms": 197.648
+            },
+            "draw_gaps_over_100ms": 15,
+            "draw_gaps_over_250ms": 0,
+            "jitter_input_to_draw_p99_ms": 3.552,
+            "arrival_match_coverage": 0.99971
+          },
+          {
+            "pad": "src_1",
+            "decoded_fps": 29.818,
+            "drawn_fps": 29.819,
+            "decode_gap_ms": {
+              "p50_ms": 33.904,
+              "p95_ms": 44.458,
+              "p99_ms": 52.155,
+              "max_ms": 204.044
+            },
+            "draw_gap_ms": {
+              "p95_ms": 44.434,
+              "p99_ms": 52.117,
+              "max_ms": 203.937
+            },
+            "draw_gaps_over_100ms": 17,
+            "draw_gaps_over_250ms": 0,
+            "jitter_input_to_draw_p99_ms": 3.595,
+            "arrival_match_coverage": 0.99933
+          }
+        ]
+      },
+      "ui8": {
+        "window_seconds": 350.465,
+        "tracks": [
+          {
+            "pad": "src_0",
+            "decoded_fps": 29.775,
+            "drawn_fps": 29.774,
+            "decode_gap_ms": {
+              "p50_ms": 34.047,
+              "p95_ms": 44.606,
+              "p99_ms": 52.7,
+              "max_ms": 261.411
+            },
+            "draw_gap_ms": {
+              "p95_ms": 44.562,
+              "p99_ms": 52.958,
+              "max_ms": 261.233
+            },
+            "draw_gaps_over_100ms": 25,
+            "draw_gaps_over_250ms": 1,
+            "jitter_input_to_draw_p99_ms": 2.797,
+            "arrival_match_coverage": 1.0
+          },
+          {
+            "pad": "src_1",
+            "decoded_fps": 29.723,
+            "drawn_fps": 29.72,
+            "decode_gap_ms": {
+              "p50_ms": 34.219,
+              "p95_ms": 43.096,
+              "p99_ms": 52.869,
+              "max_ms": 272.232
+            },
+            "draw_gap_ms": {
+              "p95_ms": 42.989,
+              "p99_ms": 52.769,
+              "max_ms": 272.651
+            },
+            "draw_gaps_over_100ms": 28,
+            "draw_gaps_over_250ms": 1,
+            "jitter_input_to_draw_p99_ms": 2.788,
+            "arrival_match_coverage": 1.0
+          }
+        ]
+      },
+      "ui40": {
+        "window_seconds": 350.388,
+        "tracks": [
+          {
+            "pad": "src_0",
+            "decoded_fps": 29.773,
+            "drawn_fps": 29.751,
+            "decode_gap_ms": {
+              "p50_ms": 34.473,
+              "p95_ms": 44.67,
+              "p99_ms": 52.211,
+              "max_ms": 561.305
+            },
+            "draw_gap_ms": {
+              "p95_ms": 44.663,
+              "p99_ms": 52.488,
+              "max_ms": 561.641
+            },
+            "draw_gaps_over_100ms": 24,
+            "draw_gaps_over_250ms": 5,
+            "jitter_input_to_draw_p99_ms": 1.761,
+            "arrival_match_coverage": 0.99971
+          },
+          {
+            "pad": "src_1",
+            "decoded_fps": 29.696,
+            "drawn_fps": 29.665,
+            "decode_gap_ms": {
+              "p50_ms": 34.613,
+              "p95_ms": 40.888,
+              "p99_ms": 50.359,
+              "max_ms": 561.404
+            },
+            "draw_gap_ms": {
+              "p95_ms": 40.935,
+              "p99_ms": 50.537,
+              "max_ms": 562.003
+            },
+            "draw_gaps_over_100ms": 37,
+            "draw_gaps_over_250ms": 3,
+            "jitter_input_to_draw_p99_ms": 1.78,
+            "arrival_match_coverage": 0.99952
+          }
+        ]
+      },
+      "stall200": {
+        "window_seconds": 350.429,
+        "tracks": [
+          {
+            "pad": "src_0",
+            "decoded_fps": 29.795,
+            "drawn_fps": 29.791,
+            "decode_gap_ms": {
+              "p50_ms": 34.264,
+              "p95_ms": 44.599,
+              "p99_ms": 50.817,
+              "max_ms": 257.944
+            },
+            "draw_gap_ms": {
+              "p95_ms": 44.579,
+              "p99_ms": 50.776,
+              "max_ms": 258.329
+            },
+            "draw_gaps_over_100ms": 24,
+            "draw_gaps_over_250ms": 1,
+            "jitter_input_to_draw_p99_ms": 3.187,
+            "arrival_match_coverage": 1.0
+          },
+          {
+            "pad": "src_1",
+            "decoded_fps": 29.781,
+            "drawn_fps": 29.782,
+            "decode_gap_ms": {
+              "p50_ms": 34.494,
+              "p95_ms": 40.926,
+              "p99_ms": 48.467,
+              "max_ms": 139.662
+            },
+            "draw_gap_ms": {
+              "p95_ms": 41.092,
+              "p99_ms": 49.582,
+              "max_ms": 139.294
+            },
+            "draw_gaps_over_100ms": 21,
+            "draw_gaps_over_250ms": 0,
+            "jitter_input_to_draw_p99_ms": 3.173,
+            "arrival_match_coverage": 0.9999
+          }
+        ]
+      },
+      "recovery": {
+        "window_seconds": 350.424,
+        "tracks": [
+          {
+            "pad": "src_0",
+            "decoded_fps": 29.801,
+            "drawn_fps": 29.797,
+            "decode_gap_ms": {
+              "p50_ms": 33.945,
+              "p95_ms": 44.347,
+              "p99_ms": 51.373,
+              "max_ms": 178.598
+            },
+            "draw_gap_ms": {
+              "p95_ms": 44.313,
+              "p99_ms": 51.339,
+              "max_ms": 178.559
+            },
+            "draw_gaps_over_100ms": 30,
+            "draw_gaps_over_250ms": 0,
+            "jitter_input_to_draw_p99_ms": 3.451,
+            "arrival_match_coverage": 1.0
+          },
+          {
+            "pad": "src_1",
+            "decoded_fps": 29.73,
+            "drawn_fps": 29.726,
+            "decode_gap_ms": {
+              "p50_ms": 34.316,
+              "p95_ms": 41.461,
+              "p99_ms": 49.973,
+              "max_ms": 266.32
+            },
+            "draw_gap_ms": {
+              "p95_ms": 41.65,
+              "p99_ms": 50.031,
+              "max_ms": 266.529
+            },
+            "draw_gaps_over_100ms": 28,
+            "draw_gaps_over_250ms": 1,
+            "jitter_input_to_draw_p99_ms": 3.41,
+            "arrival_match_coverage": 1.0
+          }
+        ]
+      }
+    }
+  },
+  "limits": [
+    "No browser A/B: Mac browser traffic would follow active VPN route.",
+    "No real control or vehicle operation; no WAN failover recovery or TURN fallback test.",
+    "GL draw is not scan-out and jitterbuffer input to draw excludes capture, encoding and network.",
+    "No independent radio access technology verification or controlled mobility test.",
+    "Per-second route checks cannot exclude changes shorter than the sampling interval."
+  ],
+  "sha256": {
+    "native-ipv6-long-02/metadata.json": "28fd629c49f2e473d61a3908c06b817f29169f2c392db021b5df72573997dfd0",
+    "native-ipv6-long-02/ui.json": "b04cba43fc83a4cec434cf6ce93e5a9025e97a3a08126a681753f4926d2fb8ef",
+    "native-ipv6-long-02/native.json": "f2befa3e3b4836fc35fcc939e87108e8434f7b464cbc5916fdee9fadea3b21be",
+    "native-ipv6-long-02/events.jsonl": "c5e0697e10fac01491791fab350c7523a7d09060132bada9afe32dd9f0e1e81d",
+    "native-ipv6-long-02-analysis.json": "acfc16eed3e56dc47cc44d6cfb0c1a9db26d7eaa4f488481fc86181619bd27a3",
+    "native-ipv6-long-02-orin/vehicle.log": "c353a44284cfe4b0b6d63e68ce59df64be682ca37a1b43123ea7791cecc96f14",
+    "native-ipv6-long-02-orin/resources.log": "33fcceb128dae8388f94a47db87338e42d147a1173a0eacdf5e057fb5f4fbcc1",
+    "native-ipv6-long-02-orin/metadata.json": "f6eecf77492c9bdc8aff48439af25fad2c1c0c7295a08de8d74a956be072c365",
+    "native-ipv4-smoke-01/native.json": "e7180fb7aa46d323557feb25ea3b09ffb8ddf5fb55311d8b582f1e3354b35c96",
+    "native-ipv6-smoke-03-analysis.json": "41625d222b316404440f7b9586da86515e5516b87f8f7295f81a1180030cddbb"
+  }
+}

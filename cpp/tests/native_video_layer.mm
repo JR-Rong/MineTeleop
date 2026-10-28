@@ -133,6 +133,7 @@ napi_value create(napi_env env, napi_callback_info info) {
     const auto network = Json::parse(string(env, args[3], 8192));
     if (!network.is_null()) {
       opts.local_addresses = network.at("localAddresses").get<std::vector<std::string>>();
+      opts.local_interface = network.value("localInterface", "");
       opts.local_public_addresses = network.at("localPublicAddresses").get<std::vector<std::string>>();
       opts.remote_addresses = network.at("remotePublicAddresses").get<std::vector<std::string>>();
       opts.address_family = network.at("family").get<std::string>();

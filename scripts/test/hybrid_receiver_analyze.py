@@ -78,6 +78,7 @@ def require_network_pairs(pairs, expected_transport, network):
     canonical = lambda value: str(ipaddress.ip_address(value))
     for pair in pairs:
         assert pair['local_transport'] == pair['remote_transport'] == expected_transport, 'transport changed or differs from request'
+        assert not network or not network.get('localInterface') or pair.get('interface_bound') is True, 'selected socket lacks physical interface binding'
         relay = pair['local_type'] == 'relay' or pair['remote_type'] == 'relay'
         assert not relay or network and network.get('allowRelay', False), 'relay selected in direct-only experiment'
         for side in ('local', 'remote'):

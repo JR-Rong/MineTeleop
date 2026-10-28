@@ -12,6 +12,8 @@ function createNetworkPolicy(input, inspectAddress) {
   const validationGoal=input.validationGoal ?? 'media';
   if (!['media','fallback'].includes(validationGoal) || (validationGoal==='fallback'&&!config.allowRelay))
     throw Error('validationGoal must be media or fallback; fallback requires allowRelay');
+  if (config.localInterface !== undefined && (typeof config.localInterface !== 'string' ||
+      !/^[a-zA-Z0-9_.-]{1,15}$/.test(config.localInterface))) throw Error('invalid local interface');
   const allowedFamily = info => ['ipv4','ipv6'].includes(info.family) && (config.family==='dual'||info.family===config.family);
   const addresses = (values, publicOnly) => {
     if (!Array.isArray(values) || !values.length || values.length>16) throw Error('WAN bench requires bounded IPv4/IPv6 endpoint lists');
@@ -86,6 +88,7 @@ function createNetworkPolicy(input, inspectAddress) {
   function requirePair(pair) {
     const l=inspectAddress(pair?.local_address), r=inspectAddress(pair?.remote_address);
     if (!pair || pair.local_transport!=='udp' || pair.remote_transport!=='udp' || !allowedFamily(l) || !allowedFamily(r) || l.family!==r.family ||
+        (config.localInterface && pair.interface_bound !== true) ||
         ![...directTypes,'relay'].includes(pair.local_type) || ![...directTypes,'relay'].includes(pair.remote_type) ||
         (pair.local_type==='relay' ? !relayAllowed(pair,'local',l) : !local.concat(localPublic).includes(l.address)) ||
         (pair.remote_type==='relay' ? !relayAllowed(pair,'remote',r) : !remote.includes(r.address)))
@@ -99,4 +102,11 @@ function createNetworkPolicy(input, inspectAddress) {
       .filter(url=>config.allowRelay||!/^turns?:/.test(url))})).filter(server=>server.urls.length),
     filterSdp:sdp=>sdp.split(/\r?\n/).filter(line=>!line.startsWith('a=candidate:')||candidateAllowed(line)).join('\r\n')};
 }
-module.exports={createNetworkPolicy};
+function validatePhysicalInterface(network, mode, interfaces, inspectAddress) {
+  if (!network?.localInterface) return;
+  if (mode !== 'native') throw Error('browser ICE cannot enforce a bound physical interface');
+  const assigned = interfaces[network.localInterface] || [];
+  if (!network.localAddresses.every(ip => assigned.some(i => inspectAddress(i.address).address === ip)))
+    throw Error('WAN local addresses must belong to the pinned interface');
+}
+module.exports={createNetworkPolicy,validatePhysicalInterface};

@@ -4,7 +4,7 @@ const {app, BrowserWindow, ipcMain, session, screen, powerSaveBlocker} = require
 const fs = require('node:fs');
 const path = require('node:path');
 const {execFileSync} = require('node:child_process');
-const {createNetworkPolicy} = require('./network-policy.cjs');
+const {createNetworkPolicy, validatePhysicalInterface} = require('./network-policy.cjs');
 const {resolveTurnAllowlist} = require('./turn-allowlist.cjs');
 const {iceAddressInfo} = require('../../cpp/web/control_logic.js');
 const args = Object.fromEntries(process.argv.slice(2).reduce((out, value, i, all) => {
@@ -68,6 +68,7 @@ app.whenReady().then(async () => {
   network = networkInput ? createNetworkPolicy(await resolveTurnAllowlist(networkInput), iceAddressInfo).config : null;
   if (network && (transport !== 'udp' || !network.localAddresses.every(ip => Object.values(require('node:os').networkInterfaces()).flat().some(i => iceAddressInfo(i.address).address === ip))))
     throw Error('WAN bench requires UDP and local addresses assigned to this Mac');
+  validatePhysicalInterface(network, args.mode, require('node:os').networkInterfaces(), iceAddressInfo);
   if (network?.allowRelay) log({event:'turn_allowlist_resolved',turn_servers:network.turnServers});
   awake = powerSaveBlocker.start('prevent-display-sleep');
   const origin = new URL(args.url).origin;

@@ -55,6 +55,9 @@ class HybridMeasurementTests(unittest.TestCase):
         pair = dict(local_address='2001:4860::1', remote_address='2606:4700::1',
                     local_transport='udp', remote_transport='udp', local_type='host', remote_type='host')
         require_network_pairs([pair], 'udp', network)
+        with self.assertRaisesRegex(AssertionError,'interface binding'):
+            require_network_pairs([pair], 'udp', dict(network,localInterface='en0'))
+        require_network_pairs([dict(pair,interface_bound=True)], 'udp', dict(network,localInterface='en0'))
         with self.assertRaises(AssertionError):
             require_network_pairs([dict(pair, remote_address='fe80::1')], 'udp', network)
         relay = dict(pair, remote_address='2606:4700::2', remote_type='relay')

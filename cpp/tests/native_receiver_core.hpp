@@ -15,6 +15,8 @@
 #ifdef __APPLE__
 #include <gst/gstmacos.h>
 #include <gst/gl/gl.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #endif
 #include <cstdlib>
 #include <functional>
@@ -46,12 +48,63 @@ struct Options {
   int seconds{30}, jitter_ms{30}, stall_ms{0};
   std::string ice_transport{"auto"};  // Hybrid bench can pin the comparison transport.
   std::vector<std::string> local_addresses, local_public_addresses, remote_addresses;
+  std::string local_interface;
   bool allow_relay{false};
   std::string address_family{"dual"}, ice_route_mode{"all"};
   Json ice_servers{Json::array()};
   bool validate_only{false}, display{false};
   std::vector<std::uintptr_t> window_handles;
 };
+
+#ifdef __APPLE__
+// Opt-in WAN probe only. Bind each libnice ICE socket as soon as its host
+// candidate appears, then check the selected socket again before acceptance.
+class InterfaceBinding {
+ public:
+  explicit InterfaceBinding(const std::string& name) : index_(if_nametoindex(name.c_str())) {
+    if (!index_) throw std::invalid_argument("unknown local interface for native WAN probe");
+  }
+  static void on_candidate(NiceAgent* agent, NiceCandidate* candidate, gpointer data) {
+    auto& self = *static_cast<InterfaceBinding*>(data);
+    auto* sockets = nice_agent_get_sockets(agent, candidate->stream_id, candidate->component_id);
+    if (!sockets || sockets->len == 0) { self.failed_ = true; if (sockets) g_ptr_array_unref(sockets); return; }
+    for (guint i = 0; i < sockets->len; ++i) {
+      auto* socket = G_SOCKET(g_ptr_array_index(sockets, i));
+      if (!self.apply(socket) || !self.matches(socket)) self.failed_ = true;
+      else ++self.bound_;
+    }
+    g_ptr_array_unref(sockets);
+  }
+  bool selected(NiceAgent* agent, guint stream, guint component) {
+    auto* socket = nice_agent_get_selected_socket(agent, stream, component);
+    const bool ok = socket && !failed_.load() && bound_.load() > 0 && matches(socket);
+    if (socket) g_object_unref(socket);
+    if (!ok) failed_ = true;
+    return ok;
+  }
+  bool healthy() const { return !failed_.load() && bound_.load() > 0; }
+ private:
+  bool option(GSocket* socket, int& level, int& name) const {
+    if (!socket || g_socket_get_socket_type(socket) != G_SOCKET_TYPE_DATAGRAM) return false;
+    if (g_socket_get_family(socket) == G_SOCKET_FAMILY_IPV4) { level=IPPROTO_IP; name=IP_BOUND_IF; return true; }
+    if (g_socket_get_family(socket) == G_SOCKET_FAMILY_IPV6) { level=IPPROTO_IPV6; name=IPV6_BOUND_IF; return true; }
+    return false;
+  }
+  bool apply(GSocket* socket) const {
+    int level=0,name=0; if (!option(socket,level,name)) return false;
+    GError* error=nullptr; const bool ok=g_socket_set_option(socket,level,name,static_cast<int>(index_),&error);
+    g_clear_error(&error); return ok;
+  }
+  bool matches(GSocket* socket) const {
+    int level=0,name=0,value=0; if (!option(socket,level,name)) return false;
+    GError* error=nullptr; const bool ok=g_socket_get_option(socket,level,name,&value,&error);
+    g_clear_error(&error); return ok && value==static_cast<int>(index_);
+  }
+  unsigned index_;
+  std::atomic<bool> failed_{false};
+  std::atomic<unsigned> bound_{0};
+};
+#endif
 inline int integer(const std::string& text, int minimum, int maximum) {
   int result{};
   const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
@@ -380,6 +433,14 @@ class Receiver {
       g_object_unref(ice);
     }
     if (!nice_) throw std::runtime_error("libnice selected-pair observation unavailable");
+#ifdef __APPLE__
+    if (!options_.local_interface.empty()) {
+      interface_binding_ = std::make_unique<InterfaceBinding>(options_.local_interface);
+      g_signal_connect(nice_, "new-candidate-full", G_CALLBACK(InterfaceBinding::on_candidate), interface_binding_.get());
+    }
+#else
+    if (!options_.local_interface.empty()) throw std::runtime_error("native interface pinning is macOS-only");
+#endif
     for (const auto& local_address : options_.local_addresses) {
       NiceAddress address;
       nice_address_init(&address);
@@ -397,7 +458,12 @@ class Receiver {
     stopped_ = true;
     g_signal_handlers_disconnect_by_data(peer_, this);
     gst_element_set_state(pipeline_, GST_STATE_NULL);
-    if (nice_) g_signal_handlers_disconnect_by_data(nice_, this);
+    if (nice_) {
+      g_signal_handlers_disconnect_by_data(nice_, this);
+#ifdef __APPLE__
+      if (interface_binding_) g_signal_handlers_disconnect_by_data(nice_, interface_binding_.get());
+#endif
+    }
     for (auto& track : tracks_) track->stop();
   }
   std::string answer(const Json& offer) {
@@ -486,10 +552,17 @@ class Receiver {
     }
     return "unknown";
   }
-  static void on_pair(NiceAgent*, guint stream, guint component, NiceCandidate* local, NiceCandidate* remote, gpointer data) {
+  static void on_pair(NiceAgent* agent, guint stream, guint component, NiceCandidate* local, NiceCandidate* remote, gpointer data) {
     auto& self = *static_cast<Receiver*>(data);
     if (!local || !remote) return;
+#ifdef __APPLE__
+    const bool interface_ok = !self.interface_binding_ || self.interface_binding_->selected(agent,stream,component);
+#else
+    (void)agent;
+    const bool interface_ok = true;
+#endif
     std::lock_guard lock(self.mutex_);
+    if (!interface_ok) self.error_ = "selected ICE socket is not bound to the requested physical interface";
     ++self.pair_changes_;
     char local_ip[NICE_ADDRESS_STRING_LEN]{}, remote_ip[NICE_ADDRESS_STRING_LEN]{};
     nice_address_to_string(&local->addr, local_ip); nice_address_to_string(&remote->addr, remote_ip);
@@ -503,6 +576,7 @@ class Receiver {
     // Preserve that absence explicitly; no configured URL may fill this gap.
     self.selected_pair_["local_relay_protocol"] = "unknown";
     self.selected_pair_["remote_relay_protocol"] = "unknown";
+    self.selected_pair_["interface_bound"] = interface_ok && !self.options_.local_interface.empty();
     // Latch even a brief forbidden path change between periodic samples.
     const auto& opts = self.options_;
     if (!opts.local_addresses.empty()) {
@@ -600,6 +674,9 @@ class Receiver {
   Options options_;
   GstElement* pipeline_{}, *peer_{};
   NiceAgent* nice_{};
+#ifdef __APPLE__
+  std::unique_ptr<InterfaceBinding> interface_binding_;
+#endif
   bool stopped_{};
   std::string negotiation_, error_;
   std::mutex mutex_;

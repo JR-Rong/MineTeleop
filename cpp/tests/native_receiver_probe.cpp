@@ -185,14 +185,47 @@ bool pts_self_test() {
   return ok && delivered == 3 && track.decoded == 3 && track.decoded_buffers == 6 &&
       track.duplicate_decoded_pts == 1 && track.invalid_decoded_pts == 1 && track.corrupt_decoded_buffers == 1;
 }
+#ifdef __APPLE__
+bool interface_binding_self_test(const char* address) {
+  auto* context = g_main_context_new();
+  g_main_context_push_thread_default(context);
+  auto* agent = nice_agent_new(context, NICE_COMPATIBILITY_RFC5245);
+  g_object_set(agent, "ice-tcp", FALSE, nullptr);
+  NiceAddress local;
+  nice_address_init(&local);
+  bool ok = nice_address_set_from_string(&local, address) && nice_agent_add_local_address(agent, &local);
+  const auto stream = nice_agent_add_stream(agent, 1);
+  InterfaceBinding binding("lo0");
+  g_signal_connect(agent, "new-candidate-full", G_CALLBACK(InterfaceBinding::on_candidate), &binding);
+  ok = nice_agent_gather_candidates(agent, stream) && ok;
+  const auto deadline = Clock::now() + 2s;
+  while (!binding.healthy() && Clock::now() < deadline) {
+    while (g_main_context_iteration(context, FALSE)) {}
+    g_usleep(1000);
+  }
+  ok = ok && binding.healthy();
+  g_signal_handlers_disconnect_by_data(agent, &binding);
+  g_object_unref(agent);
+  g_main_context_pop_thread_default(context);
+  g_main_context_unref(context);
+  return ok;
+}
+#endif
 }  // namespace
 
 int probe_main(int argc, char** argv, void*) {
   try {
     if (argc == 2 && std::string(argv[1]) == "--self-test") {
       gst_init(nullptr, nullptr);
-      const bool passed = pts_self_test();
-      std::cout << "decoder PTS admission: " << (passed ? "PASS" : "FAIL") << '\n';
+      const bool pts_passed = pts_self_test();
+      bool passed = pts_passed;
+      std::cout << "decoder PTS admission: " << (pts_passed ? "PASS" : "FAIL") << '\n';
+#ifdef __APPLE__
+      const bool ipv4_passed = interface_binding_self_test("127.0.0.1");
+      const bool ipv6_passed = interface_binding_self_test("::1");
+      std::cout << "physical interface binding IPv4/IPv6: " << (ipv4_passed && ipv6_passed ? "PASS" : "FAIL") << '\n';
+      passed = pts_passed && ipv4_passed && ipv6_passed;
+#endif
       return passed ? 0 : 1;
     }
     if (argc == 2 && std::string(argv[1]) == "--help") {

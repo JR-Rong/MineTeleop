@@ -1,6 +1,6 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {createNetworkPolicy:factory} = require('../bench/network-policy.cjs');
+const {createNetworkPolicy:factory,validatePhysicalInterface} = require('../bench/network-policy.cjs');
 const {iceAddressInfo} = require('../../cpp/web/control_logic.js');
 const createNetworkPolicy = config => factory(config, iceAddressInfo);
 // Parser fixtures only: no packets are sent to these addresses.
@@ -120,6 +120,21 @@ test('fallback is an explicit validation goal, not a synonym for allowRelay', ()
   assert.equal(createNetworkPolicy(config).config.validationGoal,'media');
   assert.throws(()=>createNetworkPolicy({...config,validationGoal:'fallback'}),/requires allowRelay/);
   assert.throws(()=>createNetworkPolicy({...config,validationGoal:'anything'}),/validationGoal/);
+});
+test('physical interface pin is explicit and has a bounded safe name', () => {
+  const v6={kind:'wan-dualstack',family:'ipv6',allowRelay:false,localAddresses:['2001:4860::1'],localPublicAddresses:['2001:4860::1'],remotePublicAddresses:['2606:4700::2']};
+  assert.equal(createNetworkPolicy({...v6,localInterface:'en0'}).config.localInterface,'en0');
+  const pinned=createNetworkPolicy({...v6,localInterface:'en0'});
+  const pair={local_address:'2001:4860::1',remote_address:'2606:4700::2',local_transport:'udp',remote_transport:'udp',local_type:'host',remote_type:'host'};
+  assert.throws(()=>pinned.requirePair(pair),/selected pair/);
+  assert.throws(()=>pinned.requirePair({...pair,interface_bound:false}),/selected pair/);
+  pinned.requirePair({...pair,interface_bound:true});
+  const interfaces={en0:[{address:'2001:4860::1'}],en1:[{address:'2606:4700::2'}]};
+  validatePhysicalInterface(pinned.config,'native',interfaces,iceAddressInfo);
+  assert.throws(()=>validatePhysicalInterface(pinned.config,'browser',interfaces,iceAddressInfo),/browser ICE/);
+  assert.throws(()=>validatePhysicalInterface({...pinned.config,localInterface:'en1'},'native',interfaces,iceAddressInfo),/belong/);
+  for(const localInterface of ['', '../en0', 'en0;command', 'interface-name-too-long', 7])
+    assert.throws(()=>createNetworkPolicy({...v6,localInterface}),/invalid local interface/);
 });
 test('renderer records only accepted current browser attempts, never skipped or superseded offers', async () => {
   const vm=require('node:vm'),fs=require('node:fs');
