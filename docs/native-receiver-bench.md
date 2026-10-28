@@ -478,3 +478,14 @@ zerolatency tune 被读回；默认 `vbv-buf-capacity=600` ms，在 20 fps 下�
 本轮自动化结果见 [补充验证证据](evidence/pr26-codec-recovery-20261028.json)。
 真实相机、NVENC/VAAPI/nvv4l2 硬件、GPU surface→显示、弱网后跨端恢复和四组独立公网
 30 分钟 A/B 仍待验证；WAN 仍各 **0/1800 秒**。没有连接 Orin 或新增 LAN A/B。
+
+后续 CI 发现车辆打包镜像只有 GStreamer NICE 插件，缺少车端直接引用的
+`libnice-dev` / `nice.pc`，导致 configure 失败。三个构建入口均补齐开发依赖，
+控制平面镜像同时声明运行时库与插件；完整车辆包验收检查程序和 NICE 插件
+均解析到包内同一份 libnice，并检查 `nicesrc` 可加载。隔离 Linux 容器的 SDK、
+车端程序编译和同库解析夹具通过；完整 x86 包和底盘运行时以 CI 构建为准。
+
+macOS CI 的既有产品直连集成测试出现过路径切换及恢复失败，前一提交也有失败；
+本机同一用例连续四次通过，不能据此排除并发或安全恢复缺陷。没有通过重试、
+延长 800 ms 门槛或跳过断言来把 CI 标绿。复测结果及未解决的失败记录见
+[打包和 CI 证据](evidence/pr26-packaging-ci-20261028.json)。
