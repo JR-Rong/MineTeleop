@@ -334,6 +334,13 @@ p99 为 51.85 / 50.71 ms，最大值约 629 ms。两路 GL draw 间隔超过 100
 监测，未取得网页对照或新的 30 分钟结果。首次 IPv4 重试因检测到其他 GPU 任务而在启动前
 退出，该任务结束后才进行复测。[脱敏证据](evidence/5g-direct-recheck-20261029.json)。
 
+2026-10-29 新增 Windows 接收端的公网 IPv6 原始 UDP 预检：Windows 通过 WLAN、Orin
+通过蜂窝接口，两端分别发送 141 / 147 包并收到 127 / 123 包，异常身份包均为 0。
+双方 20 秒计时窗口并未对齐，这些数量不能计算丢包率；路由仅在启动时检查。SSH 经局域网
+管理，UDP 数据经两端公网 IPv6。该实验没有运行 ICE、视频解码或长测；Windows 网页和
+原生对照仍未完成，PR26 的嵌入式原生视频层当前依赖 macOS NSView。
+[脱敏证据](evidence/windows-cellular-udp6-20261029.json)。
+
 该窗口包含空闲、每 100 ms 分别施加 8 ms 和 40 ms UI 工作、约每秒注入 200 ms UI 卡顿、
 以及恢复阶段；分阶段统计见[脱敏证据](evidence/5g-direct-20261028.json)。采样范围内
 jitterbuffer 输入到 GL draw 的 p99 约 3.25 ms，只覆盖接收端的一段处理，不包含采集、编码、
