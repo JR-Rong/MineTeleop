@@ -225,10 +225,11 @@ struct Window {
       if (profile_seq && profile_status.is_object() && profile_status.contains("last_request_seq") &&
           profile_status.at("last_request_seq").is_number_unsigned() &&
           profile_status.at("last_request_seq").get<std::uint64_t>() == profile_seq) {
-        if (!profile_status.value("accepted", false) || !profile_status.value("active", false) ||
-            !profile_status.contains("effective_profile") || !profile_status.at("effective_profile").is_object() ||
+        if (!profile_status.value("accepted", false) || !profile_status.value("active", false))
+          throw std::runtime_error("mock control profile inactive or rejected");
+        if (!profile_status.contains("effective_profile") || !profile_status.at("effective_profile").is_object() ||
             !requested_profile || SessionControlProfile::from_json(profile_status.at("effective_profile")) != *requested_profile)
-          throw std::runtime_error("mock control profile rejected or changed");
+          throw std::runtime_error("mock control profile changed");
         profile_accepted = true;
       }
       if (value.value("event", "") == "vehicle_telemetry") {
@@ -380,7 +381,9 @@ struct Window {
       config.max_time_sync_uncertainty_ms = vehicle.field_safety.max_time_sync_uncertainty_ms;
       config.time_sync_interval_ms = vehicle.field_safety.time_sync_interval_ms;
       config.time_sync_samples = vehicle.field_safety.time_sync_samples;
-      config.browser_event_log_path.clear();
+      // Only the explicitly enabled isolated mock trace may write control
+      // diagnostics; ordinary receive-only viewing remains log-free.
+      if (!mock_control || !config.control_trace_commands) config.browser_event_log_path.clear();
       DriverConsoleRuntime driver(config, vehicle.vehicle_id, secret);
       std::fill(secret.begin(), secret.end(), '\0');
       bool connected = false;
@@ -451,7 +454,8 @@ struct Window {
                     const std::string_view detail = error.what();
                     const char* category = detail.find("mock input worker failed") != std::string_view::npos ? "input_worker" :
                         detail.find("mock courier retired") != std::string_view::npos ? "courier_retired" :
-                        detail.find("mock control profile rejected") != std::string_view::npos ? "profile_rejected" :
+                        detail.find("mock control profile inactive or rejected") != std::string_view::npos ? "profile_inactive" :
+                        detail.find("mock control profile changed") != std::string_view::npos ? "profile_changed" :
                         detail.find("retired page") != std::string_view::npos ? "retired_owner" :
                         detail.find("old session") != std::string_view::npos ? "session_changed" :
                         dynamic_cast<const Json::exception*>(&error) ? "json" : "other";
