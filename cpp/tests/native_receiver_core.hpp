@@ -149,6 +149,9 @@ struct Options {
   bool validate_only{false}, display{false}, full_window{false};
   std::vector<std::uintptr_t> window_handles;
   std::vector<std::string> camera_ids;
+  // Optional bounded software-render path. The sample is borrowed only for
+  // the duration of the callback; its caps are BGRA and its PTS was validated.
+  std::function<void(const std::string&, GstSample*)> software_frame;
   std::optional<detail::NativeMediaScope> control_scope;
   bool fixture_loopback{false};  // In-process test only; never a command-line option.
 };
@@ -400,6 +403,7 @@ struct Track {
   std::uint64_t rtp_packets{}, decoded_buffers{}, duplicate_decoded_pts{}, regressed_decoded_pts{}, invalid_decoded_pts{}, corrupt_decoded_buffers{}, identity_overflow{};
   std::optional<std::uint32_t> first_rtp_ssrc;
   std::uint64_t other_rtp_ssrc_packets{};
+  std::string consumer_error;
   Samples decode_ms, decoded_gap_ms, consumed_gap_ms, consume_wait_ms;
   Json decoded_events = Json::array(), drawn_events = Json::array(), received_events = Json::array();
   GstClockTime last_draw_pts{GST_CLOCK_TIME_NONE};
@@ -507,8 +511,8 @@ struct Track {
             {"other_rtp_ssrc_packets", other_rtp_ssrc_packets},
             {"decode_count", decode_ms.count}, {"decode_sum_ms", decode_ms.sum}};
   }
-  void start(int stall_ms) {
-    consumer = std::jthread([this, stall_ms](std::stop_token stop) {
+  void start(int stall_ms, std::function<void(const std::string&, GstSample*)> software_frame) {
+    consumer = std::jthread([this, stall_ms, software_frame = std::move(software_frame)](std::stop_token stop) {
       auto next_stall = Clock::now() + 1s;
       while (!stop.stop_requested()) {
         if (stall_ms > 0 && Clock::now() >= next_stall) {
@@ -527,6 +531,15 @@ struct Track {
           else ++unmatched_consume;
           if (last_consumed > 0) consumed_gap_ms.add(now - last_consumed);
           last_consumed = now; ++consumed;
+        }
+        if (software_frame) {
+          try { software_frame(camera_id, sample); }
+          catch (...) {
+            std::lock_guard lock(mutex);
+            consumer_error = "software frame delivery failed";
+            gst_sample_unref(sample);
+            return;
+          }
         }
         gst_sample_unref(sample);
       }
@@ -663,7 +676,13 @@ class Receiver {
   detail::NativeControlChannel* control_channel() { return control_channel_.get(); }
   std::deque<Json> candidates() { std::lock_guard lock(mutex_); std::deque<Json> result; result.swap(candidates_); return result; }
   void check() {
-    { std::lock_guard lock(mutex_); if (!error_.empty()) throw std::runtime_error(error_); }
+    { std::lock_guard lock(mutex_);
+      if (!error_.empty()) throw std::runtime_error(error_);
+      for (const auto& track : tracks_) {
+        std::lock_guard track_lock(track->mutex);
+        if (!track->consumer_error.empty()) throw std::runtime_error(track->consumer_error);
+      }
+    }
     auto* bus = gst_element_get_bus(pipeline_);
     auto* message = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR);
     gst_object_unref(bus);
@@ -800,6 +819,11 @@ class Receiver {
         decoder + " ! tee name=raw raw. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! appsink name=out sync=false max-buffers=1 drop=true wait-on-eos=false";
     if (!options_.display) description = std::string("rtph264depay name=depay wait-for-keyframe=true request-keyframe=true ! h264parse ! ") +
         decoder + " ! appsink name=out sync=false max-buffers=1 drop=true wait-on-eos=false";
+    if (options_.software_frame) {
+      if (options_.display || options_.camera_ids.empty()) throw std::runtime_error("software frame path requires mapped cameras and no GL display");
+      description = std::string("rtph264depay name=depay wait-for-keyframe=true request-keyframe=true ! h264parse ! ") +
+          decoder + " ! videoconvert ! video/x-raw,format=BGRA ! appsink name=out sync=false max-buffers=1 drop=true wait-on-eos=false";
+    }
     if (options_.display) description += " raw. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! glimagesink name=display sync=false";
     auto* bin = gst_parse_bin_from_description(description.c_str(), TRUE, &error);
     if (error || !bin) {
@@ -864,7 +888,7 @@ class Receiver {
     if (linked == GST_PAD_LINK_NOFORMAT) throw std::runtime_error("decode track pad link noformat");
     if (linked != GST_PAD_LINK_OK) throw std::runtime_error("decode track pad link failed");
     if (!gst_element_sync_state_with_parent(bin)) throw std::runtime_error("decode track state sync failed");
-    track->start(options_.stall_ms);
+    track->start(options_.stall_ms, options_.software_frame);
   }
   std::shared_ptr<ArrivalTimes> arrivals_{std::make_shared<ArrivalTimes>()};
   std::unique_ptr<detail::NativeControlChannel> control_channel_;

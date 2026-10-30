@@ -100,6 +100,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'native camera MID loopback test failed or required plugins are missing' }
           & (Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-native-receiver-mid-integration-tests.exe') --swap-identity
           if ($LASTEXITCODE -ne 0) { throw 'native camera swapped-identity negative test failed' }
+          & (Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-native-receiver-mid-integration-tests.exe') --software-frames
+          if ($LASTEXITCODE -ne 0) { throw 'native camera software frame delivery test failed' }
           python cpp/tests/windows_native_viewer_containment.test.py $viewer configs/vehicle-agent.orin-cpu-bench.yaml
           if ($LASTEXITCODE -ne 0) { throw 'native viewer containment test failed' }
           & ./packaging/windows/run-native-viewer.ps1 -GStreamerRoot $env:GST_BENCH_ROOT -ViewerPath $viewer -CheckOnly

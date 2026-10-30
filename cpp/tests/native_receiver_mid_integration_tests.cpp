@@ -1,6 +1,7 @@
 // Synthetic two-camera WebRTC loopback: no device, signaling or vehicle control.
 #include "native_receiver_core.hpp"
 #include <gio/gnetworking.h>
+#include <gst/video/video.h>
 #include <set>
 
 using namespace mine_teleop::bench;
@@ -98,7 +99,8 @@ int main(int argc, char** argv) {
   g_networking_init();
   try {
     const bool swap_identity = argc == 2 && std::string_view(argv[1]) == "--swap-identity";
-    require(argc == 1 || swap_identity, "unknown fixture argument");
+    const bool software = argc == 2 && std::string_view(argv[1]) == "--software-frames";
+    require(argc == 1 || swap_identity || software, "unknown fixture argument");
     for (const auto* name : {"videotestsrc", "x264enc", "h264parse", "rtph264pay", "webrtcbin", "avdec_h264"}) {
       auto* factory = gst_element_factory_find(name);
       if (!factory) { std::cerr << "missing synthetic test plugin " << name << '\n'; return 77; }
@@ -108,6 +110,19 @@ int main(int argc, char** argv) {
     Options options;
     options.camera_ids = {"rear", "front"};
     options.fixture_loopback = true;
+    std::atomic<unsigned> software_front{0}, software_rear{0}, software_invalid{0};
+    if (software) options.software_frame = [&](const std::string& camera, GstSample* sample) {
+      GstVideoInfo info{};
+      const auto* buffer = sample ? gst_sample_get_buffer(sample) : nullptr;
+      if (!buffer || !GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(buffer)) ||
+          !gst_video_info_from_caps(&info, gst_sample_get_caps(sample)) ||
+          GST_VIDEO_INFO_FORMAT(&info) != GST_VIDEO_FORMAT_BGRA ||
+          GST_VIDEO_INFO_WIDTH(&info) != 320 || GST_VIDEO_INFO_HEIGHT(&info) != 240) {
+        ++software_invalid;
+      } else if (camera == "front") ++software_front;
+      else if (camera == "rear") ++software_rear;
+      else ++software_invalid;
+    };
 #if GST_CHECK_VERSION(1, 22, 0)
     options.control_scope = mine_teleop::detail::NativeMediaScope{"fixture-session", 1, "test-attempt"};
 #endif
@@ -149,7 +164,8 @@ int main(int argc, char** argv) {
       const bool control_passed = true;
       (void)sent; (void)delivered; (void)responded;
 #endif
-      if (identities == std::set<std::string>{"front", "rear"} && control_passed) { passed = true; break; }
+      const bool software_passed = !software || (software_front >= 3 && software_rear >= 3 && software_invalid == 0);
+      if (identities == std::set<std::string>{"front", "rear"} && control_passed && software_passed) { passed = true; break; }
       std::this_thread::sleep_for(10ms);
     }
     const auto pair = receiver.selected_pair();

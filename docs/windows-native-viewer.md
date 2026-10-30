@@ -13,8 +13,8 @@ the latter is a bounded measurement implementation, not a finished production
 renderer. The session stops on renegotiation or media error and must be
 reconnected manually. Restart before the receiver's 131072-PTS observation
 limit is reached. A drawn frame may remain displayed after a stall; it is not
-evidence of a fresh camera frame. The status bar reports whether draw callbacks
-advanced for every configured track in the last sample and whether the selected
+evidence of a fresh camera frame. The status bar reports whether new GDI frame
+submissions advanced for every configured track in the last sample and whether the selected
 candidate pair is direct UDP, relay, other, or unknown. A separate window timer
 warns if the worker stops updating the status. These indicators do not prove
 camera capture freshness, monitor scan-out, or control safety.
@@ -98,12 +98,13 @@ this conservative filter is only a prerequisite and does not prove that a
 fresh camera image was displayed.
 
 An experimental `NativeVideoHealth` state machine tracks each critical
-camera's generation, submitted frame identity, expiry and brake revisions. Its
-tests exercise two synthetic streams through the driver bridge and mock
-vehicle service. It is not wired into the native window: a future caller must
-first provide authenticated camera identity, real renderer-submission events
-and vehicle-side capture freshness. Decoder output and GL `client-draw` are
-not sufficient evidence for enabling control.
+camera's generation, submitted frame identity, expiry and brake revisions. The
+window feeds it after successful foreground GDI submission of a MID-mapped,
+validated decoded frame; focus loss or minimization withdraws usability. The
+renderer keeps only the newest frame per camera. This is not display scan-out
+or vehicle capture freshness, and is not connected to control. Its tests also
+exercise two synthetic streams through the driver bridge and mock vehicle
+service; that fixture does not validate the Windows renderer or the vehicle.
 
 The viewing prototype binds each video section's negotiated MID and ordered
 `media_tracks` identity to the configured camera window, rejecting missing or

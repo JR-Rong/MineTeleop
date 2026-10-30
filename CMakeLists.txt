@@ -263,7 +263,7 @@ if(MINE_TELEOP_BUILD_BENCH_PROBES AND (NOT WIN32 OR MINE_TELEOP_BUILD_WINDOWS_NA
   if(WIN32)
     add_executable(mine-teleop-windows-viewer WIN32 cpp/apps/windows_native_viewer.cpp)
     target_include_directories(mine-teleop-windows-viewer PRIVATE cpp/tests)
-    target_link_libraries(mine-teleop-windows-viewer PRIVATE mine_teleop_runtime PkgConfig::RECEIVER_GST PkgConfig::RECEIVER_GL user32 shell32)
+    target_link_libraries(mine-teleop-windows-viewer PRIVATE mine_teleop_runtime PkgConfig::RECEIVER_GST PkgConfig::RECEIVER_GL user32 shell32 gdi32)
     target_link_libraries(mine-teleop-native-receiver-probe PRIVATE PkgConfig::RECEIVER_GL)
     if(MSVC)
       target_compile_options(mine-teleop-windows-viewer PRIVATE /utf-8)
@@ -479,6 +479,8 @@ if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
     set_tests_properties(mine-teleop-native-receiver-mid-integration-tests PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     add_test(NAME mine-teleop-native-receiver-swapped-mid-tests COMMAND mine-teleop-native-receiver-mid-integration-tests --swap-identity)
     set_tests_properties(mine-teleop-native-receiver-swapped-mid-tests PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+    add_test(NAME mine-teleop-native-receiver-software-frames-tests COMMAND mine-teleop-native-receiver-mid-integration-tests --software-frames)
+    set_tests_properties(mine-teleop-native-receiver-software-frames-tests PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     add_test(NAME mine-teleop-hybrid-receiver-analyzer-tests
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/hybrid_receiver_analyze.test.py")
     add_test(NAME mine-teleop-receiver-ab-analyzer-tests
