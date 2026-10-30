@@ -61,6 +61,15 @@ evidence and are not established by that test.
 
 ## Control work still required
 
+The experimental scoped DataChannel courier and its bounded receive mailbox
+are test components, not connected to this window or the production transport
+bridge. They reject a mismatched negotiation, unsuitable channel properties,
+late messages after retirement, duplicate control channels, oversized input
+and queue overflow. GStreamer without the early channel callback is rejected;
+local send success means queued, not vehicle receipt. The loopback test does
+not establish path identity, command authentication, video freshness, or any
+vehicle-control behavior. Receive-only mode remains enforced in the window.
+
 The native window is deliberately not wired to `update_control_intent`. A
 driving client must first connect the existing session-generation and input
 ownership fences, neutral takeover, input lease, focus/device-loss handling,

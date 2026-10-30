@@ -84,7 +84,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'GStreamer or libnice development metadata missing' }
           cmake -S . -B build/windows-control-x64 -DMINE_TELEOP_BUILD_BENCH_PROBES=ON -DMINE_TELEOP_BUILD_WINDOWS_NATIVE_RECEIVER=ON "-DPKG_CONFIG_EXECUTABLE=$pkg"
           if ($LASTEXITCODE -ne 0) { throw 'native probe configure failed' }
-          cmake --build build/windows-control-x64 --config Release --target mine-teleop-native-receiver-probe mine-teleop-windows-viewer mine-teleop-windows-viewer-observation-tests --parallel 3
+          cmake --build build/windows-control-x64 --config Release --target mine-teleop-native-receiver-probe mine-teleop-windows-viewer mine-teleop-windows-viewer-observation-tests mine-teleop-native-control-channel-tests --parallel 3
           if ($LASTEXITCODE -ne 0) { throw 'native probe build failed' }
           $exe = Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-native-receiver-probe.exe'
           & $exe --self-test
@@ -94,6 +94,8 @@ jobs:
           $viewer = Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-windows-viewer.exe'
           & (Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-windows-viewer-observation-tests.exe')
           if ($LASTEXITCODE -ne 0) { throw 'native viewer observation test failed' }
+          & (Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-native-control-channel-tests.exe')
+          if ($LASTEXITCODE -ne 0) { throw 'native DataChannel loopback test failed' }
           python cpp/tests/windows_native_viewer_containment.test.py $viewer configs/vehicle-agent.orin-cpu-bench.yaml
           if ($LASTEXITCODE -ne 0) { throw 'native viewer containment test failed' }
           & ./packaging/windows/run-native-viewer.ps1 -GStreamerRoot $env:GST_BENCH_ROOT -ViewerPath $viewer -CheckOnly
