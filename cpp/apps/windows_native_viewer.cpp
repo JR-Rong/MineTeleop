@@ -187,10 +187,42 @@ struct Window {
     // The sender independently checks its current clock before publication.
     std::atomic<bool> input_failed{false}, cached_clock_ok{false}, input_authorized{false};
     std::atomic<std::int64_t> clock_observed_ms{0}, input_authorized_at_ms{0};
+    // Keep diagnostics off the lease worker's I/O path and bound memory if
+    // the observation thread stalls. -1 means a short-circuited check.
+    struct GuardState {
+      bool focused, ui_alive, clock_ok, video_ready, video_sample_healthy, authorized, ready;
+      int remote_ready, direct_ready;
+      std::uint64_t bad_revision, brake_revision;
+      bool operator==(const GuardState&) const = default;
+    };
+    struct GuardEvent { std::int64_t at; GuardState state; };
+    std::mutex guard_mutex;
+    std::vector<GuardEvent> guard_events;
+    std::uint64_t guard_dropped = 0;
+    const auto flush_guard_trace = [&] {
+      if (!config.control_trace_commands) return;
+      std::vector<GuardEvent> events;
+      std::uint64_t dropped = 0;
+      { std::lock_guard lock(guard_mutex); events.swap(guard_events); std::swap(dropped, guard_dropped); }
+      if (events.empty() && !dropped) return;
+      Json records = Json::array();
+      for (const auto& event : events) {
+        const auto& s = event.state;
+        records.push_back({{"monotonic_ms", event.at}, {"focused", s.focused}, {"ui_alive", s.ui_alive},
+            {"clock_ok", s.clock_ok}, {"video_ready", s.video_ready}, {"video_sample_healthy", s.video_sample_healthy},
+            {"authorized", s.authorized}, {"ready", s.ready},
+            {"remote_ready", s.remote_ready < 0 ? Json(nullptr) : Json(s.remote_ready != 0)},
+            {"direct_ready", s.direct_ready < 0 ? Json(nullptr) : Json(s.direct_ready != 0)},
+            {"bad_revision", s.bad_revision}, {"brake_revision", s.brake_revision}});
+      }
+      std::fprintf(stderr, "%s\n", Json{{"event", "native_mock_guard_batch"}, {"records", std::move(records)},
+          {"dropped", dropped}}.dump().c_str());
+    };
     std::jthread input_worker([&](std::stop_token input_stop) {
       try {
         detail::NativeMockInputSequence input_sequence;
         bool withdrawn = false;
+        std::optional<GuardState> previous_guard;
         while (!input_stop.stop_requested() && !stop.stop_requested() && !parent.stop_requested()) {
           const auto now_ms = static_cast<std::int64_t>(bench_now_ms());
           const auto clock_at = clock_observed_ms.load();
@@ -199,11 +231,23 @@ struct Window {
           const bool focused = IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd;
           if (!focused) for (const auto& id : render->cameras) static_cast<void>(render->health->set_usable(id, 1, false));
           const bool ui_alive = focused && keyboard.heartbeat_alive(now_ms);
-          const bool ready = ui_alive && clock_ok && gate->ready(now_ms) && video_health.ready &&
-              channel->direct_udp(mock_local_ip, mock_peer_ip);
+          const int remote_ready = ui_alive && clock_ok ? static_cast<int>(gate->ready(now_ms)) : -1;
+          const int direct_ready = remote_ready == 1 && video_health.ready ?
+              static_cast<int>(channel->direct_udp(mock_local_ip, mock_peer_ip)) : -1;
+          const bool ready = ui_alive && clock_ok && remote_ready == 1 && video_health.ready && direct_ready == 1;
           const auto authorized_at = input_authorized_at_ms.load();
           const bool authorized = input_authorized.load() && authorized_at > 0 && now_ms >= authorized_at &&
               now_ms - authorized_at < 200;
+          if (config.control_trace_commands) {
+            const GuardState state{focused, ui_alive, clock_ok, video_health.ready, video_health.sample_healthy,
+                authorized, ready, remote_ready, direct_ready, video_health.bad_revision, video_health.brake_revision};
+            if (!previous_guard || *previous_guard != state) {
+              std::lock_guard lock(guard_mutex);
+              if (guard_events.size() < 128) guard_events.push_back({now_ms, state});
+              else ++guard_dropped;
+              previous_guard = state;
+            }
+          }
           const auto keyboard_input = keyboard.sample(ready && authorized, now_ms);
           const auto current_epoch = epoch.load();
           if ((ready || current_epoch != 0) && (ui_alive || !withdrawn)) {
@@ -352,6 +396,7 @@ struct Window {
       input_authorized.store(authorized);
       if (now >= next_evidence) {
         flush_dc_trace();
+        flush_guard_trace();
         const auto native = status.at("native_control");
         const auto transport = native.at("control_transport");
         const auto sends = channel->send_stats();
@@ -393,6 +438,7 @@ struct Window {
     flush_dc_trace();
     input_worker.request_stop();
     if (input_worker.joinable()) input_worker.join();
+    flush_guard_trace();
     if (courier) courier->retire();
     std::array<Samples, 2> gaps;
     { std::lock_guard lock(render->mutex); gaps = render->submission_gaps; }

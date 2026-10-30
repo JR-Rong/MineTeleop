@@ -30,6 +30,11 @@ record of command sequence, local DataChannel enqueue start/end and outcome.
 The record contains no raw packet or credentials; local enqueue is not proof of
 delivery. Correlate it with the vehicle receipt and driver dispatch traces to
 locate delay, accounting for clock uncertainty between hosts.
+It also emits bounded transition records for focus, UI heartbeat, clock,
+video, remote media, direct path and input authorization. A null check means
+that an earlier guard short-circuited it; dropped records are counted. These
+records distinguish the reasons for withdrawn input, but do not prove why a
+frame or command was delayed.
 
 The two video areas belong to the Win32 application. Signaling and frame
 reception reuse the native driver runtime and the existing receiver probe;
