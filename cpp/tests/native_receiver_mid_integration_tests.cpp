@@ -17,11 +17,11 @@ struct Sender {
     pipeline = gst_parse_launch(
       "webrtcbin name=peer bundle-policy=max-bundle "
       "videotestsrc is-live=true pattern=ball ! video/x-raw,width=320,height=240,framerate=30/1 ! "
-      "x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30 ! h264parse ! rtph264pay pt=96 ! "
-      "application/x-rtp,media=video,encoding-name=H264,payload=96 ! queue ! peer. "
+      "x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30 ! h264parse ! rtph264pay pt=96 ssrc=1000000001 ! "
+      "application/x-rtp,media=video,encoding-name=H264,payload=96,ssrc=(uint)1000000001 ! queue ! peer. "
       "videotestsrc is-live=true pattern=snow ! video/x-raw,width=320,height=240,framerate=30/1 ! "
-      "x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30 ! h264parse ! rtph264pay pt=97 ! "
-      "application/x-rtp,media=video,encoding-name=H264,payload=97 ! queue ! peer.", &error);
+      "x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30 ! h264parse ! rtph264pay pt=97 ssrc=1000000002 ! "
+      "application/x-rtp,media=video,encoding-name=H264,payload=97,ssrc=(uint)1000000002 ! queue ! peer.", &error);
     if (error) { const std::string text = error->message; g_clear_error(&error); throw std::runtime_error(text); }
     require(pipeline != nullptr, "synthetic sender unavailable");
     peer = gst_bin_get_by_name(GST_BIN(pipeline), "peer");
@@ -110,7 +110,11 @@ int main(int argc, char** argv) {
     options.control_scope = mine_teleop::detail::NativeMediaScope{"fixture-session", 1, "test-attempt"};
 #endif
     Receiver receiver(options); receiver.start();
-    const Json offer{{"media_negotiation_id", "test-attempt"}, {"sdp", sender.offer()},
+    const auto offer_sdp = sender.offer();
+    require(offer_sdp.find("a=ssrc:1000000001 ") != std::string::npos &&
+            offer_sdp.find("a=ssrc:1000000002 ") != std::string::npos,
+            "synthetic offer lacks distinct production-style SSRC identities");
+    const Json offer{{"media_negotiation_id", "test-attempt"}, {"sdp", offer_sdp},
                      {"media_tracks", Json::array({{{"camera_id", "front"}}, {{"camera_id", "rear"}}})}};
     sender.answer(receiver.answer(offer));
     const auto deadline = Clock::now() + 15s;
