@@ -62,8 +62,9 @@ evidence and are not established by that test.
 ## Control work still required
 
 The experimental scoped DataChannel courier and its bounded receive mailbox
-are test components, not connected to this window or the production transport
-bridge. They reject a mismatched negotiation, unsuitable channel properties,
+are available as an explicit receiver option, but are not enabled in this
+window or connected to the production transport bridge. They reject a
+mismatched negotiation, unsuitable channel properties,
 late messages after retirement, duplicate control channels, oversized input
 and queue overflow. GStreamer without the early channel callback is rejected;
 local send success means queued, not vehicle receipt. The loopback test does

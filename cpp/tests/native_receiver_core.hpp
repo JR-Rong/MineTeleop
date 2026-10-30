@@ -5,6 +5,7 @@
 #include "mine_teleop/detail/gstreamer_ice_servers.hpp"
 #include "mine_teleop/detail/ice_diagnostics.hpp"
 #include "mine_teleop/detail/gstreamer_decoder.hpp"
+#include "mine_teleop/detail/native_control_channel.hpp"
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/sdp/sdp.h>
@@ -148,6 +149,7 @@ struct Options {
   bool validate_only{false}, display{false}, full_window{false};
   std::vector<std::uintptr_t> window_handles;
   std::vector<std::string> camera_ids;
+  std::optional<detail::NativeMediaScope> control_scope;
   bool fixture_loopback{false};  // In-process test only; never a command-line option.
 };
 
@@ -549,6 +551,10 @@ class Receiver {
     peer_ = gst_element_factory_make("webrtcbin", "peer");
     if (!peer_) { gst_object_unref(pipeline_); pipeline_ = nullptr; throw std::runtime_error("webrtcbin unavailable"); }
     gst_bin_add(GST_BIN(pipeline_), peer_);
+    if (options.control_scope) {
+      try { control_channel_ = std::make_unique<detail::NativeControlChannel>(peer_, *options.control_scope); }
+      catch (...) { gst_object_unref(pipeline_); pipeline_ = nullptr; peer_ = nullptr; throw; }
+    }
     g_object_set(peer_, "bundle-policy", GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE,
                  "latency", static_cast<guint>(options.jitter_ms), nullptr);
     detail::configure_webrtc_ice_servers(peer_, options.ice_servers, options.ice_route_mode != "direct");
@@ -594,6 +600,7 @@ class Receiver {
   }
   void stop() {
     if (stopped_.exchange(true)) return;
+    if (control_channel_) control_channel_->retire();
     g_signal_handlers_disconnect_by_data(peer_, this);
     g_signal_handlers_disconnect_by_data(pipeline_, this);
     gst_element_set_state(pipeline_, GST_STATE_NULL);
@@ -610,6 +617,8 @@ class Receiver {
   std::string answer(const Json& offer) {
     if (!negotiation_.empty()) throw std::runtime_error("probe stops on renegotiation; new measurement required");
     negotiation_ = offer.at("media_negotiation_id").get<std::string>();
+    if (options_.control_scope && options_.control_scope->attempt != negotiation_)
+      throw std::runtime_error("control channel belongs to another media attempt");
     const auto text = filter_bench_remote_sdp(offer.at("sdp").get<std::string>(), options_.remote_addresses);
     GstSDPMessage* sdp = nullptr;
     if (gst_sdp_message_new(&sdp) != GST_SDP_OK) throw std::runtime_error("SDP allocation failed");
@@ -644,6 +653,7 @@ class Receiver {
     g_signal_emit_by_name(peer_, "add-ice-candidate", candidate.value("sdpMLineIndex", 0U), candidate.at("candidate").get<std::string>().c_str());
   }
   Json selected_pair() { std::lock_guard lock(mutex_); return selected_pair_; }
+  detail::NativeControlChannel* control_channel() { return control_channel_.get(); }
   std::deque<Json> candidates() { std::lock_guard lock(mutex_); std::deque<Json> result; result.swap(candidates_); return result; }
   void check() {
     { std::lock_guard lock(mutex_); if (!error_.empty()) throw std::runtime_error(error_); }
@@ -846,6 +856,7 @@ class Receiver {
     track->start(options_.stall_ms);
   }
   std::shared_ptr<ArrivalTimes> arrivals_{std::make_shared<ArrivalTimes>()};
+  std::unique_ptr<detail::NativeControlChannel> control_channel_;
   Options options_;
   GstElement* pipeline_{}, *peer_{};
   NiceAgent* nice_{};
