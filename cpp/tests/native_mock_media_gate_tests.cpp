@@ -79,7 +79,29 @@ void test_mock_keyboard_rearms_only_after_release() {
   keyboard.observe(true, Keys{true, false, false, false}, 310);
   require(keyboard.sample(true, 311).throttle == .25, "released key could not be freshly pressed");
 }
+void test_live_clock_keyboard_and_media_guard() {
+  using Clock = std::chrono::steady_clock;
+  const auto now = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+      Clock::now().time_since_epoch()).count(); };
+  mine_teleop::detail::NativeMockKeyboard keyboard;
+  using Keys = mine_teleop::detail::NativeMockKeyboard::Keys;
+  keyboard.observe_now(true, Keys{});
+  require(keyboard.heartbeat_alive_now(), "live keyboard heartbeat missing");
+  static_cast<void>(keyboard.sample_now(true));
+  keyboard.observe_now(true, Keys{true, false, false, false});
+  require(keyboard.sample_now(true).throttle == .25, "live keyboard did not accept a fresh held key");
+  require(keyboard.sample_now(false).throttle == 0, "live keyboard did not revoke an unsafe held key");
+  require(keyboard.sample_now(true).throttle == 0, "live keyboard resumed without a fresh release");
+
+  NativeMockMediaGate gate("session", "test_bench_one", "attempt", {"front", "rear"});
+  require(!gate.observe(status(20000, 1, 1), now(), 20000, 25), "initial media sample unexpectedly ready");
+  require(gate.observe(status(20001, 2, 2), now(), 20001, 25) && gate.ready_now(),
+          "live media guard did not accept fresh advancing cameras");
+  auto invalid = status(20002, 3, 3); invalid["adapter_type"] = "can";
+  require(!gate.observe(invalid, now(), 20002, 25) && !gate.ready_now(),
+          "live media guard did not revoke invalid evidence");
 }
-int main() { try { test_gate(); test_neutral_refresh_sequence(); test_mock_keyboard_rearms_only_after_release();
+}
+int main() { try { test_gate(); test_neutral_refresh_sequence(); test_mock_keyboard_rearms_only_after_release(); test_live_clock_keyboard_and_media_guard();
   std::cout << "PASS scoped mock media, input renewal, keyboard and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }

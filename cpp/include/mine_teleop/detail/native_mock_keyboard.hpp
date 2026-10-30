@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 #include <mutex>
 
 namespace mine_teleop::detail {
@@ -14,10 +15,12 @@ class NativeMockKeyboard {
 
   void observe(bool focused, Keys keys, std::int64_t now_ms) {
     std::lock_guard lock(mutex_);
-    focused_ = focused && now_ms > 0;
-    keys_ = focused_ ? keys : Keys{};
-    observed_at_ms_ = focused_ ? now_ms : 0;
-    if (!focused_) needs_release_ = true;
+    observe_locked(focused, keys, now_ms);
+  }
+
+  void observe_now(bool focused, Keys keys) {
+    std::lock_guard lock(mutex_);
+    observe_locked(focused, keys, now());
   }
 
   void withdraw() {
@@ -30,12 +33,41 @@ class NativeMockKeyboard {
 
   bool heartbeat_alive(std::int64_t now_ms) {
     std::lock_guard lock(mutex_);
-    return focused_ && observed_at_ms_ > 0 && now_ms >= observed_at_ms_ &&
-        now_ms - observed_at_ms_ < 150;
+    return heartbeat_alive_locked(now_ms);
+  }
+
+  bool heartbeat_alive_now() {
+    std::lock_guard lock(mutex_);
+    return heartbeat_alive_locked(now());
   }
 
   Input sample(bool safety_ready, std::int64_t now_ms) {
     std::lock_guard lock(mutex_);
+    return sample_locked(safety_ready, now_ms);
+  }
+
+  Input sample_now(bool safety_ready) {
+    std::lock_guard lock(mutex_);
+    return sample_locked(safety_ready, now());
+  }
+ private:
+  static std::int64_t now() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  void observe_locked(bool focused, Keys keys, std::int64_t now_ms) {
+    focused_ = focused && now_ms > 0;
+    keys_ = focused_ ? keys : Keys{};
+    observed_at_ms_ = focused_ ? now_ms : 0;
+    if (!focused_) needs_release_ = true;
+  }
+
+  bool heartbeat_alive_locked(std::int64_t now_ms) const {
+    return focused_ && observed_at_ms_ > 0 && now_ms >= observed_at_ms_ &&
+        now_ms - observed_at_ms_ < 150;
+  }
+
+  Input sample_locked(bool safety_ready, std::int64_t now_ms) {
     if (!safety_ready || !focused_ || observed_at_ms_ <= 0 || now_ms < observed_at_ms_ ||
         now_ms - observed_at_ms_ >= 150) {
       needs_release_ = true;
@@ -51,7 +83,6 @@ class NativeMockKeyboard {
             keys_.left == keys_.right ? 0.0 : (keys_.left ? -0.25 : 0.25),
             keys_.brake ? 0.3 : 0.0};
   }
- private:
   std::mutex mutex_;
   Keys keys_{};
   std::int64_t observed_at_ms_{};

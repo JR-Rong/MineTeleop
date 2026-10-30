@@ -1,6 +1,7 @@
 #pragma once
 
 #include <nlohmann/json.hpp>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -70,7 +71,12 @@ class NativeMockMediaGate {
   }
   bool ready(std::int64_t now_ms) const {
     std::lock_guard lock(mutex_);
-    return ready_ && now_ms >= last_good_ms_ && now_ms - last_good_ms_ < 3000;
+    return ready_locked(now_ms);
+  }
+  bool ready_now() const {
+    std::lock_guard lock(mutex_);
+    return ready_locked(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
   }
   std::string reason(std::int64_t now_ms) const {
     std::lock_guard lock(mutex_);
@@ -78,6 +84,9 @@ class NativeMockMediaGate {
     return reason_;
   }
  private:
+  bool ready_locked(std::int64_t now_ms) const {
+    return ready_ && now_ms >= last_good_ms_ && now_ms - last_good_ms_ < 3000;
+  }
   const std::string session_, vehicle_, attempt_;
   mutable std::mutex mutex_;
   std::map<std::string, std::uint64_t> ids_;

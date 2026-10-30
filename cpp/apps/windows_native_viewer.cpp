@@ -185,7 +185,7 @@ struct Window {
     if (!channel || !render->health) throw std::runtime_error("mock control requires scoped channel and critical video");
     // The input lease must not wait for signaling or the transport bridge.
     // The sender independently checks its current clock before publication.
-    std::atomic<bool> input_failed{false}, cached_clock_ok{false}, input_authorized{false};
+    std::atomic<bool> input_failed{false};
     std::atomic<std::int64_t> clock_observed_ms{0}, input_authorized_at_ms{0};
     // Keep diagnostics off the lease worker's I/O path and bound memory if
     // the observation thread stalls. -1 means a short-circuited check.
@@ -195,7 +195,7 @@ struct Window {
       std::uint64_t bad_revision, brake_revision;
       bool operator==(const GuardState&) const = default;
     };
-    struct GuardEvent { std::int64_t at; GuardState state; };
+    struct GuardEvent { std::int64_t at, authorization_at, authorization_now; GuardState state; };
     std::mutex guard_mutex;
     std::vector<GuardEvent> guard_events;
     std::uint64_t guard_dropped = 0;
@@ -213,6 +213,8 @@ struct Window {
             {"authorized", s.authorized}, {"ready", s.ready},
             {"remote_ready", s.remote_ready < 0 ? Json(nullptr) : Json(s.remote_ready != 0)},
             {"direct_ready", s.direct_ready < 0 ? Json(nullptr) : Json(s.direct_ready != 0)},
+            {"authorization_age_ms", event.authorization_at > 0 ?
+                Json(event.authorization_now - event.authorization_at) : Json(nullptr)},
             {"bad_revision", s.bad_revision}, {"brake_revision", s.brake_revision}});
       }
       std::fprintf(stderr, "%s\n", Json{{"event", "native_mock_guard_batch"}, {"records", std::move(records)},
@@ -224,31 +226,32 @@ struct Window {
         bool withdrawn = false;
         std::optional<GuardState> previous_guard;
         while (!input_stop.stop_requested() && !stop.stop_requested() && !parent.stop_requested()) {
-          const auto now_ms = static_cast<std::int64_t>(bench_now_ms());
           const auto clock_at = clock_observed_ms.load();
-          const bool clock_ok = cached_clock_ok.load() && clock_at > 0 && now_ms >= clock_at && now_ms - clock_at < 500;
+          const auto now_ms = static_cast<std::int64_t>(bench_now_ms());
+          const bool clock_ok = clock_at > 0 && now_ms >= clock_at && now_ms - clock_at < 500;
           const auto video_health = render->health->snapshot_now();
           const bool focused = IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd;
           if (!focused) for (const auto& id : render->cameras) static_cast<void>(render->health->set_usable(id, 1, false));
-          const bool ui_alive = focused && keyboard.heartbeat_alive(now_ms);
-          const int remote_ready = ui_alive && clock_ok ? static_cast<int>(gate->ready(now_ms)) : -1;
+          const bool ui_alive = focused && keyboard.heartbeat_alive_now();
+          const int remote_ready = ui_alive && clock_ok ? static_cast<int>(gate->ready_now()) : -1;
           const int direct_ready = remote_ready == 1 && video_health.ready ?
               static_cast<int>(channel->direct_udp(mock_local_ip, mock_peer_ip)) : -1;
           const bool ready = ui_alive && clock_ok && remote_ready == 1 && video_health.ready && direct_ready == 1;
           const auto authorized_at = input_authorized_at_ms.load();
-          const bool authorized = input_authorized.load() && authorized_at > 0 && now_ms >= authorized_at &&
-              now_ms - authorized_at < 200;
+          const auto authorization_now_ms = static_cast<std::int64_t>(bench_now_ms());
+          const bool authorized = authorized_at > 0 && authorization_now_ms >= authorized_at &&
+              authorization_now_ms - authorized_at < 200;
           if (config.control_trace_commands) {
             const GuardState state{focused, ui_alive, clock_ok, video_health.ready, video_health.sample_healthy,
                 authorized, ready, remote_ready, direct_ready, video_health.bad_revision, video_health.brake_revision};
             if (!previous_guard || *previous_guard != state) {
               std::lock_guard lock(guard_mutex);
-              if (guard_events.size() < 128) guard_events.push_back({now_ms, state});
+              if (guard_events.size() < 128) guard_events.push_back({now_ms, authorized_at, authorization_now_ms, state});
               else ++guard_dropped;
               previous_guard = state;
             }
           }
-          const auto keyboard_input = keyboard.sample(ready && authorized, now_ms);
+          const auto keyboard_input = keyboard.sample_now(ready && authorized);
           const auto current_epoch = epoch.load();
           if ((ready || current_epoch != 0) && (ui_alive || !withdrawn)) {
             Json input{{"session_id", session_id}, {"session_generation", generation},
@@ -327,10 +330,9 @@ struct Window {
       const auto video_health = render->health->snapshot_now();
       const bool focused = IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd;
       if (!focused) for (const auto& id : render->cameras) static_cast<void>(render->health->set_usable(id, 1, false));
-      const bool ready = focused && clock_ok && gate->ready(now_ms) && video_health.ready &&
+      const bool ready = focused && clock_ok && gate->ready_now() && video_health.ready &&
           channel->direct_udp(mock_local_ip, mock_peer_ip);
-      cached_clock_ok.store(clock_ok);
-      clock_observed_ms.store(now_ms);
+      clock_observed_ms.store(clock_ok ? now_ms : 0);
       if (input_failed.load()) throw std::runtime_error("mock input worker failed");
       const auto current_epoch = epoch.load();
       if (current_epoch == 0) {
@@ -393,7 +395,6 @@ struct Window {
           telemetry.contains("speed_mps") && telemetry.at("speed_mps").is_number() &&
           telemetry.at("speed_mps").get<double>() == 0.0;
       input_authorized_at_ms.store(authorized ? now_ms : 0);
-      input_authorized.store(authorized);
       if (now >= next_evidence) {
         flush_dc_trace();
         flush_guard_trace();
@@ -433,7 +434,7 @@ struct Window {
       }
       std::this_thread::sleep_for(10ms);
     }
-    input_authorized.store(false);
+    input_authorized_at_ms.store(0);
     keyboard.withdraw();
     flush_dc_trace();
     input_worker.request_stop();
@@ -745,9 +746,9 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         const bool focused = app->running.load() && IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
             GetForegroundWindow() == hwnd && (focus == hwnd || focus == app->video[0] || focus == app->video[1]);
         const auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
-        app->keyboard.observe(focused,
+        app->keyboard.observe_now(focused,
             {down('W') || down(VK_UP), down('A') || down(VK_LEFT), down('D') || down(VK_RIGHT),
-             down('S') || down(VK_DOWN) || down(VK_SPACE)}, static_cast<std::int64_t>(bench_now_ms()));
+             down('S') || down(VK_DOWN) || down(VK_SPACE)});
         return 0;
       }
       if (wparam == 1 && app->running.load() && detail::viewer_observation_stale(
