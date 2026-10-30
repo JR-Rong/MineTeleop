@@ -5287,8 +5287,11 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
           });
         }, [this] { return Json::array({native_control_observation()}); });
   }
-  native_control_sender_ = std::jthread(
-      [this](std::stop_token stop_token) { native_control_sender_loop(stop_token); });
+  if (!config_.receive_only) {
+    native_control_sender_ = std::jthread(
+        [this](std::stop_token stop_token) { native_control_sender_loop(stop_token); });
+  }
+  // Media still shares the session lease and needs renewal for long viewing.
   native_control_lease_ = std::jthread(
       [this](std::stop_token stop_token) { native_control_lease_loop(stop_token); });
   time_sync_worker_ = std::jthread(
@@ -5617,6 +5620,7 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
 }
 
 Json DriverConsoleRuntime::send_control_management(const Json& input) {
+  if (config_.receive_only) throw std::runtime_error("control is disabled in receive-only mode");
   Json payload;
   {
     std::lock_guard update_lock(native_control_update_mutex_);
@@ -5716,6 +5720,7 @@ void DriverConsoleRuntime::observe_emergency_stop_result_verified(const Json& re
 }
 
 Json DriverConsoleRuntime::emergency_stop_bridge(const Json& input) {
+  if (config_.receive_only) throw std::runtime_error("control is disabled in receive-only mode");
   // No ordinary transport/update mutex: a stuck WSS connect/write must not
   // block fetching an already-published native emergency. No network I/O.
   std::string session, vehicle, driver, key, attempt, owner;
@@ -5795,6 +5800,7 @@ void DriverConsoleRuntime::consume_feedback_status_locked(const Json& value, std
 }
 
 Json DriverConsoleRuntime::control_transport_bridge(const Json& input, const HttpRequest* request) {
+  if (config_.receive_only) throw std::runtime_error("control is disabled in receive-only mode");
   const auto handler_entered = monotonic_now_ms();
   std::string session, vehicle, driver, attempt, owner;
   std::uint64_t ui_epoch = 0;
@@ -7298,8 +7304,8 @@ Json DriverConsoleRuntime::connect_locked(std::string_view requested_vehicle_id,
         // owner, but their declared vehicle capability still needs checking.
         validate_target(false);
         connect_signaling_websocket(current_session, current_token);
-        static_cast<void>(
-            connect_control_signaling_websocket(current_session, current_token));
+        if (!config_.receive_only)
+          static_cast<void>(connect_control_signaling_websocket(current_session, current_token));
         std::lock_guard lock(mutex_);
         return {
             {"runtime", "cpp"},
@@ -7365,14 +7371,14 @@ Json DriverConsoleRuntime::connect_locked(std::string_view requested_vehicle_id,
       reset_control_profile_locked();
       connected_at_ms_ = connected_at_ms;
     }
-    native_control_intent_.begin_session(monotonic_now_ms());
+    if (!config_.receive_only) native_control_intent_.begin_session(monotonic_now_ms());
   }
   wake_native_control_sender();
   try {
     if (connect_cancellation_generation_.load() != generation) throw std::runtime_error("连接申请已取消");
     connect_signaling_websocket(session_id, current_token);
-    static_cast<void>(
-        connect_control_signaling_websocket(session_id, current_token));
+    if (!config_.receive_only)
+      static_cast<void>(connect_control_signaling_websocket(session_id, current_token));
     if (connect_cancellation_generation_.load() != generation) throw std::runtime_error("连接申请已取消");
   } catch (...) {
     const auto failure = std::current_exception();
@@ -8061,6 +8067,7 @@ Json DriverConsoleRuntime::control_profile() const {
 }
 
 Json DriverConsoleRuntime::prepare_control_profile(const Json& input) {
+  if (config_.receive_only) throw std::runtime_error("control is disabled in receive-only mode");
   if (!input.is_object()) {
     throw std::invalid_argument("control profile requires an object");
   }
@@ -8225,6 +8232,7 @@ Json DriverConsoleRuntime::send_control(const Json& input) {
 }
 
 Json DriverConsoleRuntime::update_control_intent(const Json& input, const HttpRequest* request) {
+  if (config_.receive_only) throw std::runtime_error("control is disabled in receive-only mode");
   const auto entered_at = monotonic_now_ms();
   const auto received_at = request ? request->received_at_monotonic_ms.value_or(entered_at) : entered_at;
   std::int64_t update_lock_wait_ms = 0, runtime_lock_wait_ms = 0, applied_at = entered_at;

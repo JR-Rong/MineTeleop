@@ -385,6 +385,9 @@ struct DriverConfig {
   bool mock_control_diagnostic{false};
   bool enable_experimental_control_transport{false};
   bool enable_experimental_direct_authority{false};
+  // In-process opt-in for a video-only viewer. It is not a YAML option and
+  // must never start the control sender, control WSS, or accept control APIs.
+  bool receive_only{false};
   std::filesystem::path browser_event_log_path;
   std::uint64_t browser_event_log_max_bytes{2 * 1024 * 1024};
   int browser_event_log_files{3};

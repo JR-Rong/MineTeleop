@@ -52,6 +52,7 @@ struct Window {
       if (vehicle.enabled_cameras().size() > video.size())
         throw std::runtime_error("viewer supports at most two camera tracks");
       auto config = load_driver_config(driver_path);
+      config.receive_only = true;
       config.max_time_sync_uncertainty_ms = vehicle.field_safety.max_time_sync_uncertainty_ms;
       config.time_sync_interval_ms = vehicle.field_safety.time_sync_interval_ms;
       config.time_sync_samples = vehicle.field_safety.time_sync_samples;

@@ -1,8 +1,9 @@
 # Windows native bench viewer
 
 `mine-teleop-windows-viewer.exe` is an experimental native Win32 and GStreamer
-H.264 viewer. It does not use a web page, accept driving input, send control
-intents, or establish a control DataChannel. It is not a driving console and
+H.264 viewer. It does not use a web page, accept driving input, or establish a
+control DataChannel. The in-process receive-only runtime disables the native
+control sender, control WSS, and control APIs. It is not a driving console and
 does not prove safety readiness, display scan-out, direct connectivity, or
 latency. No production or real-vehicle use is supported.
 
@@ -42,8 +43,15 @@ supplied vehicle config and does not relax the safety threshold.
 **The local YAML is not an attestation of the actual vehicle process.** Before
 connecting, independently verify that the running vehicle uses an equivalent
 isolated mock configuration, CAN is down, and the intended cameras are not in
-use by another task. The viewer can create a signaling session but never sends
-control commands. Do not operate a real vehicle with this experiment.
+use by another task. The viewer still creates the existing exclusive session
+and renews its session authority; this is not a passive multi-viewer session.
+Do not operate a real vehicle with this experiment.
+
+Historical correction: builds through `a96ca73` did not set receive-only mode.
+Although they had no driving input, their reused runtime bootstrapped a neutral
+intent and could attempt control heartbeats via WSS. Prior statements that
+those builds could not send any control command were incorrect. Those tests ran
+with vehicle control disabled, a mock adapter, zero speed, and CAN down.
 
 The executable's `--validate-config FILE` checks the local admission rules and
 exits without starting a window or network session; the Windows CI exercises

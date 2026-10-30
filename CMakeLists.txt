@@ -429,6 +429,11 @@ if(MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
     NAME mine-teleop-native-control-intent-tests
     COMMAND mine-teleop-native-control-intent-tests
   )
+  add_executable(mine-teleop-native-view-only-integration-tests cpp/tests/native_view_only_integration_tests.cpp)
+  target_link_libraries(mine-teleop-native-view-only-integration-tests PRIVATE mine_teleop_runtime)
+  mine_teleop_enable_warnings(mine-teleop-native-view-only-integration-tests)
+  add_test(NAME mine-teleop-native-view-only-integration-tests COMMAND mine-teleop-native-view-only-integration-tests)
+  set_tests_properties(mine-teleop-native-view-only-integration-tests PROPERTIES TIMEOUT 20)
 endif()
 
 if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)

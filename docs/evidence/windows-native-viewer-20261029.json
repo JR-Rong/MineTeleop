@@ -1,5 +1,6 @@
 {
-  "scope": "short Windows native viewer functional smoke with Orin cellular; video only, no input or CAN",
+  "scope": "short Windows native viewer functional smoke with Orin cellular; no driving input or CAN",
+  "historical_correction": "The tested viewer had no driving-input UI, but its shared runtime bootstrapped a neutral intent and could attempt control heartbeats via WSS. Vehicle control was disabled. The prior claim that the viewer could not send any control command was incorrect.",
   "source_commit": "0bb2ccbcc1ff19d2dd7b9428b269f5cb2c2bae6f",
   "windows_executable_sha256": "d9eea83082a9d0976fb49eb3430a05543463774768cfc7b5f4d42d70e5f431ba",
   "windows_runtime": "GStreamer 1.28.1 user-local installation; installer SHA-256 verified",

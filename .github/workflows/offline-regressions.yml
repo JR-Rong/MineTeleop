@@ -112,6 +112,7 @@ jobs:
             mine-teleop-control-recovery-tests \
             mine-teleop-control-tests \
             mine-teleop-native-control-intent-tests \
+            mine-teleop-native-view-only-integration-tests \
             mine-teleop-session-logs-tests
           do
             test -f "build-native-offline/$binary"
