@@ -159,6 +159,7 @@ struct Window {
     const std::string owner = "windows-native-mock";
     std::uint64_t epoch = 0, input_seq = 0, profile_seq = 0;
     bool withdrawn = false, profile_sent = false, profile_accepted = false, handshake_sent = false;
+    std::optional<SessionControlProfile> requested_profile;
     auto next_input = Clock::now();
     auto next_evidence = Clock::now();
     auto next_status = Clock::now();
@@ -174,12 +175,16 @@ struct Window {
       const auto value = envelope.contains("status") && envelope.at("status").is_object() ? envelope.at("status") : envelope;
       if (!value.is_object() || value.value("session_id", "") != session_id ||
           value.value("vehicle_id", "") != vehicle.vehicle_id || value.value("driver_id", "") != config.driver_id) return;
-      if (value.value("event", "") == "session_control_profile_status" && profile_seq &&
-          value.value("last_request_seq", std::uint64_t{0}) == profile_seq) {
-        if (!value.value("accepted", false) || !value.contains("effective_profile") ||
-            !value.at("effective_profile").is_object() ||
-            value.at("effective_profile").value("target_speed_kph", -1.0) != 0.0 ||
-            value.at("effective_profile").value("max_motor_torque_nm", -1.0) != 0.0)
+      Json profile_status;
+      if (value.value("event", "") == "session_control_profile_status") profile_status = value;
+      else if (value.value("event", "") == "vehicle_telemetry" && value.contains("session_control_profile"))
+        profile_status = value.at("session_control_profile");
+      if (profile_seq && profile_status.is_object() && profile_status.contains("last_request_seq") &&
+          profile_status.at("last_request_seq").is_number_unsigned() &&
+          profile_status.at("last_request_seq").get<std::uint64_t>() == profile_seq) {
+        if (!profile_status.value("accepted", false) || !profile_status.value("active", false) ||
+            !profile_status.contains("effective_profile") || !profile_status.at("effective_profile").is_object() ||
+            !requested_profile || SessionControlProfile::from_json(profile_status.at("effective_profile")) != *requested_profile)
           throw std::runtime_error("mock control profile rejected or changed");
         profile_accepted = true;
       }
@@ -253,6 +258,7 @@ struct Window {
           profile.max_steering_angle_deg = 0;
           profile.critical_camera_stale_brake_ms = vehicle.runtime.critical_camera_stale_brake_ms;
           profile.control_recovery_timeout_ms = vehicle.runtime.control_recovery_timeout_ms;
+          requested_profile = profile;
           auto prepared = driver.prepare_control_profile(profile.to_json());
           const auto message = prepared.at("request");
           profile_seq = message.at("seq").get<std::uint64_t>();
@@ -476,7 +482,10 @@ struct Window {
       // Report only a fixed category and phase: network errors can contain
       // addresses or credentials and must not be copied into diagnostic logs.
       const std::string_view detail = error.what();
-      const char* category = detail.find("native view has no matching media pad") != std::string_view::npos ? "unmapped_pad" :
+      const char* category = detail.find("time synchronization uncertainty") != std::string_view::npos ? "clock_uncertainty" :
+          detail.find("time sync") != std::string_view::npos ? "time_sync" :
+          detail.find("HTTP status 401") != std::string_view::npos ? "unauthorized" :
+          detail.find("native view has no matching media pad") != std::string_view::npos ? "unmapped_pad" :
           detail.find("decode track pad link noformat") != std::string_view::npos ? "track_link_noformat" :
           detail.find("decode track pad link failed") != std::string_view::npos ? "track_link_other" :
           detail.find("decode track state sync failed") != std::string_view::npos ? "track_state_sync" :
@@ -596,6 +605,23 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   int argc = 0;
   auto** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  if (argv && argc == 3 && std::wstring(argv[1]) == L"--time-sync-probe") {
+    int result = 1;
+    try {
+      const auto url = utf8(argv[2]);
+      if (url != "http://127.0.0.1:38767") throw std::invalid_argument("isolated loopback time origin required");
+      mine_teleop::HttpClient http;
+      mine_teleop::SynchronizedClock clock;
+      const auto status = clock.synchronize(http, url, 7, 25);
+      const auto summary = mine_teleop::Json{{"synchronized", status.synchronized},
+          {"uncertainty_ms", status.uncertainty_ms}, {"round_trip_ms", status.round_trip_ms},
+          {"passed", status.acceptable(25)}};
+      std::printf("%s\n", summary.dump().c_str()); std::fflush(stdout);
+      result = status.acceptable(25) ? 0 : 1;
+    } catch (...) { std::fprintf(stderr, "time_sync_probe_failed\n"); std::fflush(stderr); }
+    LocalFree(argv);
+    return result;
+  }
   if (argv && argc == 3 && (std::wstring(argv[1]) == L"--validate-config" ||
                             std::wstring(argv[1]) == L"--validate-mock-config")) {
     int result = 0;
