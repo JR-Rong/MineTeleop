@@ -79,6 +79,11 @@ frame identity and timing, with bad-sample and brake revisions; decoded or drawn
 frame counts alone are insufficient to rearm control. Retained or repeated
 images must never refresh that evidence.
 
+The receiver drops decoded buffers with invalid, corrupt, duplicate or
+regressing PTS. A timestamp discontinuity requires a new track or session;
+this conservative filter is only a prerequisite and does not prove that a
+fresh camera image was displayed.
+
 For direct control, the native WebRTC DataChannel must also implement the
 existing scoped transport bridge, frame expiry, result and feedback handling,
 and its WSS fallback without replaying an old command across a change of

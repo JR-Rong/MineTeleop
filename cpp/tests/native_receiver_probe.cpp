@@ -204,7 +204,8 @@ bool pts_self_test() {
     ++*static_cast<std::atomic<unsigned>*>(data);
   }), &delivered);
   bool ok = gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE;
-  const GstClockTime timestamps[] = {0, 33 * GST_MSECOND, 33 * GST_MSECOND, 66 * GST_MSECOND, GST_CLOCK_TIME_NONE, 99 * GST_MSECOND};
+  const GstClockTime timestamps[] = {0, 33 * GST_MSECOND, 33 * GST_MSECOND, 66 * GST_MSECOND,
+                                     10 * GST_MSECOND, GST_CLOCK_TIME_NONE, 99 * GST_MSECOND};
   for (const auto pts : timestamps) {
     auto* buffer = gst_buffer_new_allocate(nullptr, 1, nullptr);
     GST_BUFFER_PTS(buffer) = pts;
@@ -218,8 +219,22 @@ bool pts_self_test() {
   if (message) gst_message_unref(message);
   gst_element_set_state(pipeline, GST_STATE_NULL);
   auto observed = retained.lock();
-  ok = ok && observed && delivered == 3 && observed->decoded == 3 && observed->decoded_buffers == 6 &&
-      observed->duplicate_decoded_pts == 1 && observed->invalid_decoded_pts == 1 && observed->corrupt_decoded_buffers == 1;
+  ok = ok && observed && delivered == 3 && observed->decoded == 3 && observed->decoded_buffers == 7 &&
+      observed->duplicate_decoded_pts == 1 && observed->regressed_decoded_pts == 1 &&
+      observed->invalid_decoded_pts == 1 && observed->corrupt_decoded_buffers == 1;
+  if (observed) {
+    // Redraw, rollback, and an unmatched/corrupt PTS cannot advance the
+    // diagnostic draw counter even if the GL callback fires again.
+    const GstClockTime draw_pts[] = {33 * GST_MSECOND, 0 * GST_MSECOND, 33 * GST_MSECOND,
+                                     66 * GST_MSECOND, 99 * GST_MSECOND, GST_CLOCK_TIME_NONE};
+    for (const auto pts : draw_pts) {
+      auto* buffer = gst_buffer_new(); GST_BUFFER_PTS(buffer) = pts;
+      auto* sample = gst_sample_new(buffer, nullptr, nullptr, nullptr);
+      static_cast<void>(Track::draw(nullptr, nullptr, sample, observed.get()));
+      gst_sample_unref(sample); gst_buffer_unref(buffer);
+    }
+    ok = ok && observed->drawn_events.size() == 2 && observed->last_draw_pts == 66 * GST_MSECOND;
+  }
   // Drop our temporary observation before removing the actual pad probe.
   observed.reset();
   gst_pad_remove_probe(pad, probe);

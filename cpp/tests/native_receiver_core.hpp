@@ -349,10 +349,11 @@ struct Track {
   std::map<GstClockTime, double> compressed_at, decoded_at;
   std::unordered_set<std::uint64_t> rtp_timestamps, decoded_pts;
   std::unordered_set<std::string> decoded_memory_types;
-  std::uint64_t rtp_packets{}, decoded_buffers{}, duplicate_decoded_pts{}, invalid_decoded_pts{}, corrupt_decoded_buffers{}, identity_overflow{};
+  std::uint64_t rtp_packets{}, decoded_buffers{}, duplicate_decoded_pts{}, regressed_decoded_pts{}, invalid_decoded_pts{}, corrupt_decoded_buffers{}, identity_overflow{};
   Samples decode_ms, decoded_gap_ms, consumed_gap_ms, consume_wait_ms;
   Json decoded_events = Json::array(), drawn_events = Json::array(), received_events = Json::array();
   GstClockTime last_draw_pts{GST_CLOCK_TIME_NONE};
+  GstClockTime last_decoded_pts{GST_CLOCK_TIME_NONE};
   std::uint64_t decoded{}, consumed{}, unmatched_decode{}, unmatched_consume{};
   double first{}, last_decoded{}, last_consumed{};
   int stalls{};
@@ -406,7 +407,14 @@ struct Track {
       if (self.decoded_pts.size() >= 131072) { ++self.identity_overflow; return GST_PAD_PROBE_DROP; }
       // Decoder drain may repeat an output PTS. It must not refresh frame age,
       // inflate FPS or replace the newest sample with a repeat of old content.
-      if (!self.decoded_pts.insert(pts).second) { ++self.duplicate_decoded_pts; return GST_PAD_PROBE_DROP; }
+      if (self.decoded_pts.contains(pts)) { ++self.duplicate_decoded_pts; return GST_PAD_PROBE_DROP; }
+      // A distinct but older decoded frame must not renew display freshness.
+      // Discontinuous/restarted timestamps require a new track/session instead.
+      if (GST_CLOCK_TIME_IS_VALID(self.last_decoded_pts) && pts < self.last_decoded_pts) {
+        ++self.regressed_decoded_pts; return GST_PAD_PROBE_DROP;
+      }
+      self.decoded_pts.insert(pts);
+      self.last_decoded_pts = pts;
       const auto found = self.compressed_at.find(GST_BUFFER_PTS(buffer));
       if (found != self.compressed_at.end()) { self.decode_ms.add(now - found->second); self.compressed_at.erase(found); }
       else ++self.unmatched_decode;
@@ -426,7 +434,8 @@ struct Track {
     if (buffer) {
       std::lock_guard lock(self.mutex);
       const auto pts = GST_BUFFER_PTS(buffer);
-      if (GST_CLOCK_TIME_IS_VALID(pts) && pts != self.last_draw_pts) {
+      if (GST_CLOCK_TIME_IS_VALID(pts) && self.decoded_pts.contains(pts) &&
+          (!GST_CLOCK_TIME_IS_VALID(self.last_draw_pts) || pts > self.last_draw_pts)) {
         self.last_draw_pts = pts;
         if (self.drawn_events.size() < 131072) self.drawn_events.push_back({pts, bench_now_ms()});
       }
@@ -473,6 +482,7 @@ struct Track {
     return {{"pad", pad}, {"decoded_frames", decoded}, {"decoded_buffers", decoded_buffers}, {"consumed_frames", consumed},
             {"rtp_packets", rtp_packets}, {"rtp_unique_frame_timestamps", rtp_timestamps.size()},
             {"decoded_unique_pts", decoded_pts.size()}, {"duplicate_decoded_pts", duplicate_decoded_pts},
+            {"regressed_decoded_pts", regressed_decoded_pts},
             {"invalid_decoded_pts", invalid_decoded_pts}, {"identity_observation_overflow", identity_overflow},
             {"corrupt_decoded_buffers", corrupt_decoded_buffers},
             {"decoded_memory_types", decoded_memory_types},
