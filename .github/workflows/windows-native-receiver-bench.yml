@@ -6,6 +6,7 @@ on:
       - 'CMakeLists.txt'
       - 'cpp/tests/native_receiver_core.hpp'
       - 'cpp/tests/native_receiver_probe.cpp'
+      - 'cpp/tests/native_receiver_containment.test.py'
       - '.github/workflows/windows-native-receiver-bench.yml'
   workflow_dispatch:
 
@@ -72,6 +73,8 @@ jobs:
           $exe = Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-native-receiver-probe.exe'
           & $exe --self-test
           if ($LASTEXITCODE -ne 0) { throw 'native probe self-test failed' }
+          python cpp/tests/native_receiver_containment.test.py $exe configs/vehicle-agent.orin-cpu-bench.yaml
+          if ($LASTEXITCODE -ne 0) { throw 'native probe containment test failed' }
           New-Item -ItemType Directory -Path receiver-artifact | Out-Null
           Copy-Item $exe receiver-artifact/
           Get-FileHash $exe -Algorithm SHA256 | Format-List | Out-File receiver-artifact/sha256.txt

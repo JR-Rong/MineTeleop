@@ -197,6 +197,8 @@ inline Options options(int argc, char** argv) {
       throw std::invalid_argument("WAN receiver endpoints must differ");
     result.ice_transport = "udp";
     result.ice_route_mode = "direct";
+  } else if (result.address_family != "dual") {
+    throw std::invalid_argument("WAN family requires explicit local and remote addresses");
   }
   return result;
 }

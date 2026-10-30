@@ -38,8 +38,16 @@ with tempfile.TemporaryDirectory(prefix='native-receiver-guard-') as directory:
         (['--signaling-url', 'https://example.com'], 'loopback'),
         (['--signaling-url', 'http://127.0.0.1:1@example.com'], 'numeric'),
         (['--display', '--consumer-stall-ms', '200'], 'does not inject'),
+        (['--wan-family', 'ipv6'], 'explicit local and remote'),
+        (['--wan-local-address', '2606:4700::1'], 'explicit family'),
+        (['--wan-family', 'ipv6', '--wan-local-address', 'fd00::1', '--wan-remote-address', '2606:4700::1'], 'public'),
+        (['--wan-family', 'ipv6', '--wan-local-address', '2606:4700::1', '--wan-remote-address', '2606:4700:0:0:0:0:0:1'], 'must differ'),
     ]:
         result = subprocess.run([binary, '--config', str(config), '--validate-only', *args],
                                 capture_output=True, text=True, timeout=3)
         assert result.returncode != 0 and message in result.stderr
-print('containment: 8 configurations, 3 option guards and existing evidence checked')
+    result = subprocess.run([binary, '--config', str(config), '--validate-only', '--wan-family', 'ipv6',
+                             '--wan-local-address', '2606:4700::1', '--wan-remote-address', '2409:8d00::1'],
+                            capture_output=True, text=True, timeout=3)
+    assert result.returncode == 0, result.stdout + result.stderr
+print('containment: 8 configurations, WAN endpoint guards and existing evidence checked')
