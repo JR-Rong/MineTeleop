@@ -157,10 +157,10 @@ struct Window {
     const std::string session_id = session.at("session_id").get<std::string>();
     const auto generation = session.at("control_session_generation").get<std::uint64_t>();
     const std::string owner = "windows-native-mock";
-    std::uint64_t epoch = 0, input_seq = 0, profile_seq = 0;
-    bool withdrawn = false, profile_sent = false, profile_accepted = false, handshake_sent = false;
+    std::atomic<std::uint64_t> epoch{0};
+    std::uint64_t profile_seq = 0;
+    bool profile_sent = false, profile_accepted = false, handshake_sent = false;
     std::optional<SessionControlProfile> requested_profile;
-    auto next_input = Clock::now();
     auto next_evidence = Clock::now();
     auto next_status = Clock::now();
     Json cached_status;
@@ -171,6 +171,42 @@ struct Window {
     std::unique_ptr<detail::NativeControlCourier> courier;
     auto* channel = receiver.control_channel();
     if (!channel || !render->health) throw std::runtime_error("mock control requires scoped channel and critical video");
+    // The input lease must not wait for signaling or the transport bridge.
+    // The sender independently checks its current clock before publication.
+    std::atomic<bool> input_failed{false}, cached_clock_ok{false};
+    std::atomic<std::int64_t> clock_observed_ms{0};
+    std::jthread input_worker([&](std::stop_token input_stop) {
+      try {
+        std::uint64_t input_seq = 0;
+        bool withdrawn = false;
+        while (!input_stop.stop_requested() && !stop.stop_requested() && !parent.stop_requested()) {
+          const auto now_ms = static_cast<std::int64_t>(bench_now_ms());
+          const auto clock_at = clock_observed_ms.load();
+          const bool clock_ok = cached_clock_ok.load() && clock_at > 0 && now_ms >= clock_at && now_ms - clock_at < 500;
+          const auto video_health = render->health->snapshot_now();
+          const bool focused = IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd;
+          if (!focused) for (const auto& id : render->cameras) static_cast<void>(render->health->set_usable(id, 1, false));
+          const bool ready = focused && clock_ok && gate->ready(now_ms) && video_health.ready &&
+              channel->direct_udp(mock_local_ip, mock_peer_ip);
+          const auto current_epoch = epoch.load();
+          if ((ready || current_epoch != 0) && (focused || !withdrawn)) {
+            const Json input{{"session_id", session_id}, {"session_generation", generation},
+                {"ui_instance_id", owner}, {"ui_control_epoch", current_epoch}, {"takeover", current_epoch == 0},
+                {"intent_seq", ++input_seq}, {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0},
+                {"estop", false}, {"critical_video_ready", ready},
+                {"critical_video_sample_healthy", ready && video_health.sample_healthy},
+                {"critical_video_bad_sample_revision", video_health.bad_revision},
+                {"critical_video_brake_revision", video_health.brake_revision}};
+            const auto result = driver.update_control_intent(input);
+            if (!result.value("accepted", false)) throw std::runtime_error("mock input rejected");
+            epoch.store(result.at("ui_control_epoch").get<std::uint64_t>());
+            withdrawn = !focused;
+          }
+          if (focused) withdrawn = false;
+          std::this_thread::sleep_for(60ms);
+        }
+      } catch (...) { input_failed.store(true); }
+    });
     auto on_status = [&](const Json& envelope) {
       const auto value = envelope.contains("status") && envelope.at("status").is_object() ? envelope.at("status") : envelope;
       if (!value.is_object() || value.value("session_id", "") != session_id ||
@@ -220,27 +256,16 @@ struct Window {
       if (!focused) for (const auto& id : render->cameras) static_cast<void>(render->health->set_usable(id, 1, false));
       const bool ready = focused && clock_ok && gate->ready(now_ms) && video_health.ready &&
           channel->direct_udp(mock_local_ip, mock_peer_ip);
-      if (now >= next_input && (ready || epoch != 0) && (focused || !withdrawn)) {
-        const Json input{{"session_id", session_id}, {"session_generation", generation},
-            {"ui_instance_id", owner}, {"ui_control_epoch", epoch}, {"takeover", epoch == 0},
-            {"intent_seq", ++input_seq}, {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0},
-            {"estop", false}, {"critical_video_ready", ready},
-            {"critical_video_sample_healthy", ready && video_health.sample_healthy},
-            {"critical_video_bad_sample_revision", video_health.bad_revision},
-            {"critical_video_brake_revision", video_health.brake_revision}};
-        const auto result = driver.update_control_intent(input);
-        if (!result.value("accepted", false)) throw std::runtime_error("mock input rejected");
-        epoch = result.at("ui_control_epoch").get<std::uint64_t>();
-        withdrawn = !focused;
-        next_input = now + 60ms;
-      }
-      if (focused) withdrawn = false;
-      if (epoch == 0) {
+      cached_clock_ok.store(clock_ok);
+      clock_observed_ms.store(now_ms);
+      if (input_failed.load()) throw std::runtime_error("mock input worker failed");
+      const auto current_epoch = epoch.load();
+      if (current_epoch == 0) {
         // No command owner exists yet. Do not allow unsolicited telemetry to
         // fill the bounded channel before the safety gates admit neutral input.
         while (channel->pop()) {}
       } else {
-        const detail::NativeCourierScope current{{session_id, generation, attempt}, owner, epoch};
+        const detail::NativeCourierScope current{{session_id, generation, attempt}, owner, current_epoch};
         if (!courier) courier = std::make_unique<detail::NativeControlCourier>(current);
         detail::NativeControlCourier::Io io{
             [&] { return channel->pop(); }, [&] { return channel->direct_udp(mock_local_ip, mock_peer_ip); },
@@ -264,13 +289,13 @@ struct Window {
           profile_seq = message.at("seq").get<std::uint64_t>();
           static_cast<void>(driver.send_control_management({{"source_session_id", session_id},
               {"source_control_session_generation", generation}, {"media_negotiation_id", attempt},
-              {"ui_instance_id", owner}, {"ui_control_epoch", epoch}, {"message", message}}));
+              {"ui_instance_id", owner}, {"ui_control_epoch", current_epoch}, {"message", message}}));
           profile_sent = true;
         }
         if (ready && negotiated && profile_accepted && !handshake_sent) {
           static_cast<void>(driver.send_control_management({{"source_session_id", session_id},
               {"source_control_session_generation", generation}, {"media_negotiation_id", attempt},
-              {"ui_instance_id", owner}, {"ui_control_epoch", epoch},
+              {"ui_instance_id", owner}, {"ui_control_epoch", current_epoch},
               {"message", {{"event", "vcu_handshake_command"}, {"action", "connect"}}}}));
           handshake_sent = true;
         }
@@ -307,6 +332,8 @@ struct Window {
       }
       std::this_thread::sleep_for(10ms);
     }
+    input_worker.request_stop();
+    if (input_worker.joinable()) input_worker.join();
     if (courier) courier->retire();
     std::array<Samples, 2> gaps;
     { std::lock_guard lock(render->mutex); gaps = render->submission_gaps; }
