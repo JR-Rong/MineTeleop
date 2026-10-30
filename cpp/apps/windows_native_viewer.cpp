@@ -1,7 +1,8 @@
-// Windows bench viewer: native windows and native WebRTC, with no control input.
+// Windows bench viewer: native video with an explicitly isolated neutral mock mode.
 #include "native_receiver_core.hpp"
 #include "mine_teleop/detail/native_video_health.hpp"
 #include "mine_teleop/detail/native_mock_media_gate.hpp"
+#include "mine_teleop/detail/native_mock_input_sequence.hpp"
 #include "mine_teleop/detail/native_control_courier.hpp"
 #include "mine_teleop/detail/native_viewer_observation.hpp"
 #include <gst/video/video.h>
@@ -177,7 +178,7 @@ struct Window {
     std::atomic<std::int64_t> clock_observed_ms{0};
     std::jthread input_worker([&](std::stop_token input_stop) {
       try {
-        std::uint64_t input_seq = 0;
+        detail::NativeMockInputSequence input_sequence;
         bool withdrawn = false;
         while (!input_stop.stop_requested() && !stop.stop_requested() && !parent.stop_requested()) {
           const auto now_ms = static_cast<std::int64_t>(bench_now_ms());
@@ -190,13 +191,14 @@ struct Window {
               channel->direct_udp(mock_local_ip, mock_peer_ip);
           const auto current_epoch = epoch.load();
           if ((ready || current_epoch != 0) && (focused || !withdrawn)) {
-            const Json input{{"session_id", session_id}, {"session_generation", generation},
+            Json input{{"session_id", session_id}, {"session_generation", generation},
                 {"ui_instance_id", owner}, {"ui_control_epoch", current_epoch}, {"takeover", current_epoch == 0},
-                {"intent_seq", ++input_seq}, {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0},
+                {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0},
                 {"estop", false}, {"critical_video_ready", ready},
                 {"critical_video_sample_healthy", ready && video_health.sample_healthy},
                 {"critical_video_bad_sample_revision", video_health.bad_revision},
                 {"critical_video_brake_revision", video_health.brake_revision}};
+            input["intent_seq"] = input_sequence.next(input);
             const auto result = driver.update_control_intent(input);
             if (!result.value("accepted", false)) throw std::runtime_error("mock input rejected");
             epoch.store(result.at("ui_control_epoch").get<std::uint64_t>());

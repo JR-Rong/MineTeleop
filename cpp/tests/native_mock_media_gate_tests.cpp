@@ -1,4 +1,5 @@
 #include "mine_teleop/detail/native_mock_media_gate.hpp"
+#include "mine_teleop/detail/native_mock_input_sequence.hpp"
 #include <iostream>
 #include <stdexcept>
 using mine_teleop::detail::NativeMockMediaGate;
@@ -34,6 +35,20 @@ void test_gate() {
   require(gate.reason(4100) == "timestamp", "old status diagnosis wrong");
   require(!gate.ready(6100), "expired remote status retained readiness");
 }
+void test_neutral_refresh_sequence() {
+  mine_teleop::detail::NativeMockInputSequence sequence;
+  Json input{{"ui_control_epoch", 1}, {"critical_video_ready", true},
+             {"critical_video_bad_sample_revision", 0}, {"throttle", 0.0}};
+  require(sequence.next(input) == 1 && sequence.next(input) == 1, "identical renewal changed input sequence");
+  input["critical_video_ready"] = false;
+  require(sequence.next(input) == 2 && sequence.next(input) == 2, "video withdrawal did not advance sequence");
+  input["critical_video_ready"] = true;
+  require(sequence.next(input) == 3, "video recovery reused retired input sequence");
+  input["critical_video_bad_sample_revision"] = 1;
+  require(sequence.next(input) == 4, "bad sample revision did not advance sequence");
+  input["ui_control_epoch"] = 2;
+  require(sequence.next(input) == 5, "owner epoch change did not advance sequence");
 }
-int main() { try { test_gate(); std::cout << "PASS scoped mock media, sample progress and clock guard\n"; return 0; }
+}
+int main() { try { test_gate(); test_neutral_refresh_sequence(); std::cout << "PASS scoped mock media, input renewal and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }
