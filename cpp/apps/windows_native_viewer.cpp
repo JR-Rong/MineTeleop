@@ -60,6 +60,7 @@ struct Window {
         if (stop_token.stop_requested()) throw std::runtime_error("cancelled");
         const auto session = driver.connect(vehicle.vehicle_id, "windows-native-viewer");
         connected = true;
+        const auto ice = driver.ice_servers().at("ice_servers");
         static_cast<void>(driver.send_media_capabilities({{"codecs", {"h264"}}}));
         Json scope{{"source_session_id", session.at("session_id")},
                    {"source_control_session_generation", session.at("control_session_generation")}};
@@ -76,7 +77,8 @@ struct Window {
               if (receiver) throw std::runtime_error("renegotiation requires a new viewer session");
               Options options;
               options.display = true;
-              options.ice_servers = payload.value("ice_servers", Json::array());
+              options.ice_servers = payload.value("ice_servers", ice);
+              options.ice_route_mode = payload.value("ice_route_mode", "all");
               for (const auto handle : video) options.window_handles.push_back(reinterpret_cast<std::uintptr_t>(handle));
               receiver = std::make_unique<Receiver>(options);
               receiver->start();
