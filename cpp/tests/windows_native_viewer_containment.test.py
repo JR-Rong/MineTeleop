@@ -26,4 +26,23 @@ with tempfile.TemporaryDirectory(prefix='native-viewer-guard-') as directory:
         assert (result.returncode == 0) == accepted, (accepted, result.returncode)
     result = subprocess.run([binary, '--validate-config', str(path.with_name('missing.yaml'))], timeout=10)
     assert result.returncode != 0
+    mock = original.replace('id: vehicle-001', 'id: test_bench_unit').replace(
+        '  - id: front_test\n    device: testsrc\n    realtime_profile: cpu_720p30',
+        '  - id: front_test\n    device: testsrc\n    realtime_profile: cpu_720p30\n'
+        '  - id: rear_test\n    device: testsrc\n    realtime_profile: cpu_720p30')
+    assert mock != original and 'id: rear_test' in mock
+    mock_cases = [
+        (mock, True),
+        (mock.replace('id: test_bench_unit', 'id: vehicle-001'), False),
+        (mock.replace('control_enabled: true', 'control_enabled: false'), False),
+        (mock.replace('type: mock', 'type: can'), False),
+        (mock.replace('max_speed_kph: 0', 'max_speed_kph: 1'), False),
+        (mock.replace('max_time_sync_uncertainty_ms: 25', 'max_time_sync_uncertainty_ms: 26'), False),
+        (mock.replace('require_time_sync: true', 'require_time_sync: false'), False),
+        (mock.replace('  - id: rear_test\n    device: testsrc\n    realtime_profile: cpu_720p30\n', ''), False),
+    ]
+    for content, accepted in mock_cases:
+        path.write_text(content)
+        result = subprocess.run([binary, '--validate-mock-config', str(path)], timeout=10)
+        assert (result.returncode == 0) == accepted, (accepted, result.returncode)
 print('Windows native viewer: nine configuration admission cases passed')

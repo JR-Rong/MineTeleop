@@ -67,6 +67,33 @@ int main() {
     reject([&] { static_cast<void>(viewer.emergency_stop_bridge(empty)); }, "viewer accepted stop bridge input");
     static_cast<void>(viewer.end_session("viewer_test_finished"));
     static_cast<void>(viewer.disconnect("viewer_test_finished"));
+    auto deferred_config = driver_config;
+    deferred_config.receive_only = false;
+    deferred_config.defer_control_bootstrap = true;
+    const auto prior_control_websockets = control_websockets.load();
+    DriverConsoleRuntime deferred(deferred_config, "vehicle-001", "fixture-password");
+    const auto deferred_session = deferred.connect("vehicle-001", "deferred-test");
+    std::this_thread::sleep_for(700ms);
+    require(control_websockets.load() == prior_control_websockets &&
+        deferred.status().at("native_control").value("commands_sent_total", 1) == 0 &&
+        !deferred.status().at("native_control").value("intent_active", true),
+        "deferred client sent a control command before input");
+    const auto input = deferred.update_control_intent({
+        {"session_id", deferred_session.at("session_id")},
+        {"session_generation", deferred_session.at("control_session_generation")},
+        {"ui_instance_id", "deferred-test"}, {"ui_control_epoch", 0}, {"takeover", true},
+        {"intent_seq", 1}, {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0},
+        {"estop", false}, {"critical_video_ready", false}, {"critical_video_sample_healthy", false},
+        {"critical_video_bad_sample_revision", 0}, {"critical_video_brake_revision", 0}});
+    require(input.value("accepted", false), "deferred neutral input rejected");
+    const auto deferred_deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deferred_deadline &&
+           deferred.status().at("native_control").value("commands_sent_total", 0) == 0)
+      std::this_thread::sleep_for(10ms);
+    require(deferred.status().at("native_control").value("commands_sent_total", 0) > 0,
+        "deferred sender did not start after explicit input");
+    static_cast<void>(deferred.end_session("deferred_test_finished"));
+    static_cast<void>(deferred.disconnect("deferred_test_finished"));
     auto control_config = driver_config;
     control_config.receive_only = false;
     DriverConsoleRuntime control(control_config, "vehicle-001", "fixture-password");

@@ -1,5 +1,6 @@
 // In-process ICE fixture only: no signaling service, vehicle or control inputs.
 #include "mine_teleop/detail/native_control_channel.hpp"
+#include "mine_teleop/detail/native_control_courier.hpp"
 #include <agent.h>
 #include <gio/gnetworking.h>
 #include <atomic>
@@ -22,7 +23,7 @@ struct Peer {
   GstWebRTCDataChannel* decoy{};
   std::mutex mutex;
   std::vector<std::pair<guint, std::string>> candidates;
-  std::atomic<bool> open{false}, received{false};
+  std::atomic<bool> open{false}, received{false}, courier_command_received{false};
   Peer() {
     require(pipeline && rtc, "webrtcbin unavailable");
     gst_bin_add(GST_BIN(pipeline), rtc);
@@ -58,6 +59,8 @@ struct Peer {
       g_signal_connect(channel, "on-open", G_CALLBACK(+[](GstWebRTCDataChannel*, gpointer data) { static_cast<Peer*>(data)->open = true; }), this);
       g_signal_connect(channel, "on-message-string", G_CALLBACK(+[](GstWebRTCDataChannel*, gchar* text, gpointer data) {
         if (text && std::string(text) == "response") static_cast<Peer*>(data)->received = true;
+        if (text && std::string(text).find("\"fixture_command\":true") != std::string::npos)
+          static_cast<Peer*>(data)->courier_command_received = true;
       }), this);
     }
     require(gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE, "PLAYING failed");
@@ -122,6 +125,37 @@ int main(int argc, char** argv) {
     const auto route_deadline = std::chrono::steady_clock::now() + 3s;
     while (!courier.direct_udp() && std::chrono::steady_clock::now() < route_deadline) std::this_thread::sleep_for(10ms);
     require(courier.direct_udp(), "SCTP transport did not attest the loopback UDP host pair");
+    require(courier.direct_udp("127.0.0.1", "127.0.0.1") &&
+            !courier.direct_udp("127.0.0.1", "192.0.2.1"), "SCTP candidate endpoint guard failed");
+    {
+      using mine_teleop::detail::NativeControlCourier;
+      using mine_teleop::detail::NativeCourierScope;
+      using Json = nlohmann::json;
+      NativeCourierScope scope{{"fixture", 1, "attempt"}, "fixture-owner", 1};
+      NativeControlCourier bridge(scope);
+      bool ack_sent = false, ack_bridged = false;
+      const Json command{{"seq", std::uint64_t{1}}, {"session_id", "fixture"}, {"fixture_command", true},
+          {"control_transport", {{"protocol", "native-control-transport-v1"}, {"path", "dc"}, {"media_attempt", "attempt"}}}};
+      NativeControlCourier::Io io{
+          [&] { return courier.pop(); }, [&] { return courier.direct_udp(); },
+          [&](const Json& request) {
+            if (request.contains("vehicle_result")) ack_bridged = request.at("vehicle_result").value("result_seq", 0) == 1;
+            return Json{{"protocol", "native-control-transport-v1"}, {"enabled", true}, {"valid_for_ms", 100},
+                {"frame", command}, {"frame_json", command.dump()}, {"statuses", Json::array()}};
+          }, [&](const std::string& bytes) { return courier.send(bytes); }, {}};
+      const auto courier_deadline = std::chrono::steady_clock::now() + 5s;
+      while (!ack_bridged && std::chrono::steady_clock::now() < courier_deadline) {
+        require(bridge.tick(scope, io), "native courier unexpectedly retired");
+        if (a.courier_command_received && !ack_sent) {
+          const Json ack{{"event", "vehicle_control_result"}, {"protocol", "native-control-transport-v1"},
+              {"session_id", "fixture"}, {"command_seq", 1}, {"result_seq", 1}};
+          g_signal_emit_by_name(a.channel, "send-string", ack.dump().c_str()); ack_sent = true;
+        }
+        std::this_thread::sleep_for(10ms);
+      }
+      require(a.courier_command_received && ack_bridged, "native courier did not exchange command and receipt over SCTP");
+      bridge.retire();
+    }
 #else
     require(!courier.direct_udp(), "old GStreamer must not infer SCTP route from media");
 #endif

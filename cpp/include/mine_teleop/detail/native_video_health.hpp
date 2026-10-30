@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -59,16 +60,13 @@ class NativeVideoHealth {
   bool render_submitted(const std::string& camera, std::uint64_t generation,
                  std::uint64_t frame_pts, std::int64_t now_ms) {
     std::lock_guard lock(mutex_);
-    auto* track = current(camera, generation);
-    if (!track || !track->usable || !observe_clock(now_ms)) return false;
-    if (frame_pts == (std::numeric_limits<std::uint64_t>::max)()) { bad(*track); return false; }
-    if (track->last_pts && frame_pts <= *track->last_pts) return false;
-    if (track->last_submitted && now_ms - *track->last_submitted >= stale_ms_) bad(*track);
-    track->last_pts = frame_pts;
-    track->last_submitted = now_ms;
-    track->failed = false;
-    track->consecutive = (std::min)(3, track->consecutive + 1);
-    return true;
+    return render_submitted_locked(camera, generation, frame_pts, now_ms);
+  }
+  // Capture the timestamp while holding the same lock as snapshots, so two
+  // threads cannot appear to move a monotonic clock backwards due to stalls.
+  bool render_submitted_now(const std::string& camera, std::uint64_t generation, std::uint64_t frame_pts) {
+    std::lock_guard lock(mutex_);
+    return render_submitted_locked(camera, generation, frame_pts, now());
   }
 
   bool fault(const std::string& camera, std::uint64_t generation) {
@@ -81,6 +79,33 @@ class NativeVideoHealth {
 
   Snapshot snapshot(std::int64_t now_ms) {
     std::lock_guard lock(mutex_);
+    return snapshot_locked(now_ms);
+  }
+  Snapshot snapshot_now() {
+    std::lock_guard lock(mutex_);
+    return snapshot_locked(now());
+  }
+
+ private:
+  static std::int64_t now() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  bool render_submitted_locked(const std::string& camera, std::uint64_t generation,
+                               std::uint64_t frame_pts, std::int64_t now_ms) {
+    auto* track = current(camera, generation);
+    if (!track || !track->usable || !observe_clock(now_ms)) return false;
+    if (frame_pts == (std::numeric_limits<std::uint64_t>::max)()) { bad(*track); return false; }
+    if (track->last_pts && frame_pts <= *track->last_pts) return false;
+    if (track->last_submitted && now_ms - *track->last_submitted >= stale_ms_) bad(*track);
+    track->last_pts = frame_pts;
+    track->last_submitted = now_ms;
+    track->failed = false;
+    track->consecutive = (std::min)(3, track->consecutive + 1);
+    return true;
+  }
+
+  Snapshot snapshot_locked(std::int64_t now_ms) {
     if (!observe_clock(now_ms)) return {false, false, bad_revision_, brake_revision_};
     bool healthy = !overflow_ && !clock_fault_;
     bool ready = healthy;
@@ -95,7 +120,6 @@ class NativeVideoHealth {
     return {ready && !overflow_, healthy && !overflow_, bad_revision_, brake_revision_};
   }
 
- private:
   struct Track {
     std::uint64_t generation{};
     std::optional<std::uint64_t> last_pts;

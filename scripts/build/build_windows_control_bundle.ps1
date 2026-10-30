@@ -246,7 +246,7 @@ Write-Host "==> Building Windows control client and portable safety test (jobs=$
 Invoke-CheckedCommand -Command "cmake" -CommandArguments @(
   "--build", $BuildDirectory,
   "--config", "Release",
-  "--target", "mine-teleop-control", "mine-teleop-native-control-intent-tests", "mine-teleop-native-control-mailbox-tests", "mine-teleop-native-control-publication-tests", "mine-teleop-native-video-health-tests", "mine-teleop-native-view-only-integration-tests", "mine-teleop-session-logs-tests", "mine-teleop-websocket-send-tests",
+  "--target", "mine-teleop-control", "mine-teleop-native-control-intent-tests", "mine-teleop-native-control-mailbox-tests", "mine-teleop-native-control-publication-tests", "mine-teleop-native-control-courier-tests", "mine-teleop-native-video-health-tests", "mine-teleop-native-mock-media-gate-tests", "mine-teleop-native-view-only-integration-tests", "mine-teleop-session-logs-tests", "mine-teleop-websocket-send-tests",
   "--parallel", "$BuildJobs"
 )
 
@@ -257,7 +257,7 @@ Invoke-CheckedCommand -Command "ctest" -CommandArguments @(
   "--output-on-failure",
   "--verbose",
   "--no-tests=error",
-  "-R", "^mine-teleop-(native-control-intent|native-control-mailbox|native-control-publication|native-video-health|native-view-only-integration|session-logs|websocket-send|websocket-send-tls)-tests$"
+  "-R", "^mine-teleop-(native-control-intent|native-control-mailbox|native-control-publication|native-control-courier|native-video-health|native-mock-media-gate|native-view-only-integration|session-logs|websocket-send|websocket-send-tls)-tests$"
 )
 
 $ConfigurationDirectory = Join-Path $BuildDirectory "Release"

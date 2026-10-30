@@ -388,6 +388,9 @@ struct DriverConfig {
   // In-process opt-in for a video-only viewer. It is not a YAML option and
   // must never start the control sender, control WSS, or accept control APIs.
   bool receive_only{false};
+  // In-process opt-in for a control client that must verify its peer and
+  // video before creating the first input. Not loaded from YAML.
+  bool defer_control_bootstrap{false};
   std::filesystem::path browser_event_log_path;
   std::uint64_t browser_event_log_max_bytes{2 * 1024 * 1024};
   int browser_event_log_files{3};

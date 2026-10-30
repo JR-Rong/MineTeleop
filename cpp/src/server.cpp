@@ -7304,7 +7304,7 @@ Json DriverConsoleRuntime::connect_locked(std::string_view requested_vehicle_id,
         // owner, but their declared vehicle capability still needs checking.
         validate_target(false);
         connect_signaling_websocket(current_session, current_token);
-        if (!config_.receive_only)
+        if (!config_.receive_only && !config_.defer_control_bootstrap)
           static_cast<void>(connect_control_signaling_websocket(current_session, current_token));
         std::lock_guard lock(mutex_);
         return {
@@ -7371,13 +7371,16 @@ Json DriverConsoleRuntime::connect_locked(std::string_view requested_vehicle_id,
       reset_control_profile_locked();
       connected_at_ms_ = connected_at_ms;
     }
-    if (!config_.receive_only) native_control_intent_.begin_session(monotonic_now_ms());
+    if (!config_.receive_only) {
+      if (config_.defer_control_bootstrap) native_control_intent_.reset();
+      else native_control_intent_.begin_session(monotonic_now_ms());
+    }
   }
   wake_native_control_sender();
   try {
     if (connect_cancellation_generation_.load() != generation) throw std::runtime_error("连接申请已取消");
     connect_signaling_websocket(session_id, current_token);
-    if (!config_.receive_only)
+    if (!config_.receive_only && !config_.defer_control_bootstrap)
       static_cast<void>(connect_control_signaling_websocket(session_id, current_token));
     if (connect_cancellation_generation_.load() != generation) throw std::runtime_error("连接申请已取消");
   } catch (...) {

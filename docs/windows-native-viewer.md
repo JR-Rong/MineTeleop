@@ -1,11 +1,21 @@
 # Windows native bench viewer
 
 `mine-teleop-windows-viewer.exe` is an experimental native Win32 and GStreamer
-H.264 viewer. It does not use a web page, accept driving input, or establish a
-control DataChannel. The in-process receive-only runtime disables the native
+H.264 viewer. Its default mode does not use a web page, accept driving input,
+or send control commands. The in-process receive-only runtime disables the native
 control sender, control WSS, and control APIs. It is not a driving console and
 does not prove safety readiness, display scan-out, direct connectivity, or
 latency. No production or real-vehicle use is supported.
+
+An experimental, explicit `--mock-control --local-ip <ip> --peer-ip <ip>`
+mode exercises **neutral input only** against an isolated `test_bench_` mock
+vehicle with zero speed, two critical cameras, a loopback signaling tunnel and
+the existing 25 ms clock limit. Both addresses must be distinct public addresses
+in the same family. The receiver filters candidates to those endpoints and the
+SCTP transport must independently select the same UDP pair. Local configuration
+is not proof of remote containment: the test harness must verify the remote
+process, mock adapter, zero-speed configuration, CAN-down state and cellular
+route before starting. This mode is not a motion-control interface.
 
 The two video areas belong to the Win32 application. Signaling and frame
 reception reuse the native driver runtime and the existing receiver probe;

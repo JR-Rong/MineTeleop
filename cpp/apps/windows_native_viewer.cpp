@@ -1,8 +1,11 @@
 // Windows bench viewer: native windows and native WebRTC, with no control input.
 #include "native_receiver_core.hpp"
 #include "mine_teleop/detail/native_video_health.hpp"
+#include "mine_teleop/detail/native_mock_media_gate.hpp"
+#include "mine_teleop/detail/native_control_courier.hpp"
 #include "mine_teleop/detail/native_viewer_observation.hpp"
 #include <gst/video/video.h>
+#include <gio/gnetworking.h>
 #include <windows.h>
 #include <shellapi.h>
 #include <cstring>
@@ -45,6 +48,8 @@ struct RenderSession {
   std::array<std::shared_ptr<Frame>, 2> latest{};
   std::array<std::uint64_t, 2> submissions{};
   std::array<std::optional<std::uint64_t>, 2> last_submitted{};
+  std::array<double, 2> last_submission_ms{};
+  std::array<Samples, 2> submission_gaps{};
   std::vector<std::string> cameras;
   std::shared_ptr<detail::NativeVideoHealth> health;
   std::array<HWND, 2> panels{};
@@ -101,10 +106,12 @@ struct RenderSession {
       const bool visible = IsWindowVisible(parent) && !IsIconic(parent) && GetForegroundWindow() == parent;
       if (health) static_cast<void>(health->set_usable(frame->camera, 1, visible));
       if (result != 0 && result != static_cast<int>(GDI_ERROR) && GdiFlush() && visible) {
-        if (health) static_cast<void>(health->render_submitted(
-            frame->camera, 1, frame->pts, static_cast<std::int64_t>(bench_now_ms())));
+        if (health) static_cast<void>(health->render_submitted_now(frame->camera, 1, frame->pts));
         std::lock_guard lock(mutex);
         if (!last_submitted[index] || frame->pts > *last_submitted[index]) {
+          const auto submitted_at = bench_now_ms();
+          if (last_submission_ms[index] > 0) submission_gaps[index].add(submitted_at - last_submission_ms[index]);
+          last_submission_ms[index] = submitted_at;
           last_submitted[index] = frame->pts; ++submissions[index];
         }
       }
@@ -123,6 +130,8 @@ struct Window {
   std::jthread worker;
   std::atomic<bool> running{false};
   std::atomic<std::int64_t> last_observation_ms{0};
+  bool mock_control{false};
+  std::string mock_local_ip, mock_peer_ip, mock_ip_family;
 
   void suspend_render_health() {
     std::shared_ptr<RenderSession> current;
@@ -137,12 +146,176 @@ struct Window {
     PostMessageW(hwnd, WM_APP + 1, 0, 0);
   }
 
+  // Isolated bench mode deliberately sends only neutral mock input. It cannot
+  // command motion and must not be used as a production driving interface.
+  void run_mock_control(DriverConsoleRuntime& driver, Receiver& receiver,
+                        const VehicleConfig& vehicle, const DriverConfig& config,
+                        const Json& session, const std::string& attempt,
+                        const std::shared_ptr<RenderSession>& render,
+                        const std::shared_ptr<detail::NativeMockMediaGate>& gate,
+                        std::stop_token parent, std::stop_token stop) {
+    const std::string session_id = session.at("session_id").get<std::string>();
+    const auto generation = session.at("control_session_generation").get<std::uint64_t>();
+    const std::string owner = "windows-native-mock";
+    std::uint64_t epoch = 0, input_seq = 0, profile_seq = 0;
+    bool withdrawn = false, profile_sent = false, profile_accepted = false, handshake_sent = false;
+    auto next_input = Clock::now();
+    auto next_evidence = Clock::now();
+    auto next_status = Clock::now();
+    Json cached_status;
+    Json telemetry;
+    std::int64_t telemetry_at_ms = 0;
+    std::uint64_t telemetry_seq = 0, safety_stop_episodes = 0, last_result_seq = 0;
+    bool was_active = false, stop_episode = false;
+    std::unique_ptr<detail::NativeControlCourier> courier;
+    auto* channel = receiver.control_channel();
+    if (!channel || !render->health) throw std::runtime_error("mock control requires scoped channel and critical video");
+    auto on_status = [&](const Json& envelope) {
+      const auto value = envelope.contains("status") && envelope.at("status").is_object() ? envelope.at("status") : envelope;
+      if (!value.is_object() || value.value("session_id", "") != session_id ||
+          value.value("vehicle_id", "") != vehicle.vehicle_id || value.value("driver_id", "") != config.driver_id) return;
+      if (value.value("event", "") == "session_control_profile_status" && profile_seq &&
+          value.value("last_request_seq", std::uint64_t{0}) == profile_seq) {
+        if (!value.value("accepted", false) || !value.contains("effective_profile") ||
+            !value.at("effective_profile").is_object() ||
+            value.at("effective_profile").value("target_speed_kph", -1.0) != 0.0 ||
+            value.at("effective_profile").value("max_motor_torque_nm", -1.0) != 0.0)
+          throw std::runtime_error("mock control profile rejected or changed");
+        profile_accepted = true;
+      }
+      if (value.value("event", "") == "vehicle_telemetry") {
+        const auto seq = value.value("seq", std::uint64_t{0});
+        if (seq <= telemetry_seq || !value.contains("control_timing") || !value.at("control_timing").is_object()) return;
+        telemetry_seq = seq;
+        telemetry_at_ms = static_cast<std::int64_t>(bench_now_ms());
+        const auto state = value.value("safety_state", "unknown");
+        const bool braking = value.at("control_timing").value("control_braking_wait", true);
+        if (state == "CONTROL_ACTIVE" && !braking) was_active = true;
+        const bool stopped = was_active && (braking || state == "DEGRADED" || state == "TIMEOUT_BRAKE" ||
+                                            state == "ESTOP" || state == "FAULT");
+        if (stopped && !stop_episode) ++safety_stop_episodes;
+        stop_episode = stopped;
+        telemetry = {{"seq", seq}, {"safety_state", state}, {"braking_wait", braking},
+            {"control_recovery_cause", value.at("control_timing").value("control_recovery_cause", "")},
+            {"last_valid_command_seq", value.at("control_timing").value("last_valid_command_seq", std::uint64_t{0})},
+            {"stop_sequence", value.value("stop_sequence", std::uint64_t{0})},
+            {"speed_mps", value.value("speed_mps", 0.0)}};
+      }
+    };
+    while (!stop.stop_requested() && !parent.stop_requested()) {
+      const auto now = Clock::now();
+      const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+      if (now >= next_status) { cached_status = driver.status(); next_status = now + 25ms; }
+      const auto& status = cached_status;
+      const auto& sync = status.at("time_sync");
+      const bool clock_ok = sync.value("synchronized", false) && sync.value("uncertainty_ms", 999) <= 25 &&
+          sync.value("uncertainty_ms", -1) >= 0 && status.at("time_sync_readiness").value("ready", false);
+      const auto video_health = render->health->snapshot_now();
+      const bool focused = IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd;
+      if (!focused) for (const auto& id : render->cameras) static_cast<void>(render->health->set_usable(id, 1, false));
+      const bool ready = focused && clock_ok && gate->ready(now_ms) && video_health.ready &&
+          channel->direct_udp(mock_local_ip, mock_peer_ip);
+      if (now >= next_input && (ready || epoch != 0) && (focused || !withdrawn)) {
+        const Json input{{"session_id", session_id}, {"session_generation", generation},
+            {"ui_instance_id", owner}, {"ui_control_epoch", epoch}, {"takeover", epoch == 0},
+            {"intent_seq", ++input_seq}, {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0},
+            {"estop", false}, {"critical_video_ready", ready},
+            {"critical_video_sample_healthy", ready && video_health.sample_healthy},
+            {"critical_video_bad_sample_revision", video_health.bad_revision},
+            {"critical_video_brake_revision", video_health.brake_revision}};
+        const auto result = driver.update_control_intent(input);
+        if (!result.value("accepted", false)) throw std::runtime_error("mock input rejected");
+        epoch = result.at("ui_control_epoch").get<std::uint64_t>();
+        withdrawn = !focused;
+        next_input = now + 60ms;
+      }
+      if (focused) withdrawn = false;
+      if (epoch == 0) {
+        // No command owner exists yet. Do not allow unsolicited telemetry to
+        // fill the bounded channel before the safety gates admit neutral input.
+        while (channel->pop()) {}
+      } else {
+        const detail::NativeCourierScope current{{session_id, generation, attempt}, owner, epoch};
+        if (!courier) courier = std::make_unique<detail::NativeControlCourier>(current);
+        detail::NativeControlCourier::Io io{
+            [&] { return channel->pop(); }, [&] { return channel->direct_udp(mock_local_ip, mock_peer_ip); },
+            [&](const Json& request) { return driver.control_transport_bridge(request); },
+            [&](const std::string& bytes) { return channel->send(bytes); }, on_status};
+        if (!courier->tick(current, io)) throw std::runtime_error("mock courier retired");
+        const auto transport = status.at("native_control").at("control_transport");
+        const bool negotiated = transport.value("epoch", 0) > 0 && !transport.value("selecting", true);
+        if (ready && negotiated && !profile_sent) {
+          SessionControlProfile profile;
+          profile.target_speed_kph = 0; profile.max_motor_torque_nm = 0;
+          profile.max_brake_pressure_bar = vehicle.field_safety.max_brake_pressure_bar;
+          profile.service_brake_pressure_bar = std::min(config.control_limits.initial_service_brake_pressure_bar, profile.max_brake_pressure_bar);
+          profile.hard_brake_pressure_bar = std::min(config.control_limits.initial_hard_brake_pressure_bar, profile.max_brake_pressure_bar);
+          profile.max_steering_angle_deg = 0;
+          profile.critical_camera_stale_brake_ms = vehicle.runtime.critical_camera_stale_brake_ms;
+          profile.control_recovery_timeout_ms = vehicle.runtime.control_recovery_timeout_ms;
+          auto prepared = driver.prepare_control_profile(profile.to_json());
+          const auto message = prepared.at("request");
+          profile_seq = message.at("seq").get<std::uint64_t>();
+          static_cast<void>(driver.send_control_management({{"source_session_id", session_id},
+              {"source_control_session_generation", generation}, {"media_negotiation_id", attempt},
+              {"ui_instance_id", owner}, {"ui_control_epoch", epoch}, {"message", message}}));
+          profile_sent = true;
+        }
+        if (ready && negotiated && profile_accepted && !handshake_sent) {
+          static_cast<void>(driver.send_control_management({{"source_session_id", session_id},
+              {"source_control_session_generation", generation}, {"media_negotiation_id", attempt},
+              {"ui_instance_id", owner}, {"ui_control_epoch", epoch},
+              {"message", {{"event", "vcu_handshake_command"}, {"action", "connect"}}}}));
+          handshake_sent = true;
+        }
+      }
+      if (now >= next_evidence) {
+        const auto native = status.at("native_control");
+        const auto transport = native.at("control_transport");
+        const Json evidence{{"event", "native_mock_observation"}, {"monotonic_ms", now_ms},
+            {"video_ready", video_health.ready}, {"remote_media_ready", gate->ready(now_ms)},
+            {"focused", focused}, {"clock_ready", clock_ok}, {"clock_uncertainty_ms", sync.value("uncertainty_ms", -1)},
+            {"sctp_direct_udp", channel->direct_udp(mock_local_ip, mock_peer_ip)}, {"control_path", transport.value("path", "unknown")},
+            {"control_selecting", transport.value("selecting", true)}, {"intent_fresh", native.value("intent_fresh", false)},
+            {"sent_total", native.value("commands_sent_total", std::uint64_t{0})},
+            {"last_ack_seq", native.value("last_ack_seq", std::uint64_t{0})},
+            {"last_gap_ms", native.value("last_gap_ms", std::int64_t{0})},
+            {"profile_accepted", profile_accepted}, {"handshake_sent", handshake_sent},
+            {"telemetry_age_ms", telemetry_at_ms ? Json(now_ms - telemetry_at_ms) : Json(nullptr)},
+            {"telemetry", telemetry}, {"safety_stop_episodes", safety_stop_episodes}};
+        std::fprintf(stderr, "%s\n", evidence.dump().c_str()); std::fflush(stderr);
+        next_evidence = now + 1s;
+      }
+      const auto native = status.at("native_control");
+      const auto latency = native.value("vehicle_result_latency", Json(nullptr));
+      if (latency.is_object() && latency.contains("command_seq") && latency.at("command_seq").is_number_unsigned()) {
+        const auto seq = latency.at("command_seq").get<std::uint64_t>();
+        if (seq > last_result_seq) {
+          last_result_seq = seq;
+          const Json result{{"event", "native_mock_vehicle_result"}, {"monotonic_ms", now_ms},
+              {"command_seq", seq}, {"command_path", latency.value("command_path", Json(nullptr))},
+              {"round_trip_ms", latency.value("round_trip_ms", Json(nullptr))},
+              {"accepted", latency.value("accepted", Json(nullptr))}};
+          std::fprintf(stderr, "%s\n", result.dump().c_str());
+        }
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    if (courier) courier->retire();
+    std::array<Samples, 2> gaps;
+    { std::lock_guard lock(render->mutex); gaps = render->submission_gaps; }
+    const Json summary{{"event", "native_mock_render_summary"}, {"scope", "foreground GDI submission intervals, not capture-to-screen"},
+        {"streams", Json::array({gaps[0].json(), gaps[1].json()})}, {"safety_stop_episodes", safety_stop_episodes}};
+    std::fprintf(stderr, "%s\n", summary.dump().c_str()); std::fflush(stderr);
+  }
+
   void connect(std::string driver_path, std::string vehicle_path, std::string secret,
                std::stop_token stop_token) {
     const char* phase = "configuration";
     try {
       const auto vehicle = load_vehicle_config(vehicle_path);
-      validate(vehicle);  // Local configuration is not remote containment evidence.
+      if (mock_control) validate_mock_control(vehicle);
+      else validate(vehicle);  // Local configuration is not remote containment evidence.
       if (vehicle.enabled_cameras().size() > video.size())
         throw std::runtime_error("viewer supports at most two camera tracks");
       auto render = std::make_shared<RenderSession>();
@@ -158,7 +331,10 @@ struct Window {
       }
       { std::lock_guard lock(render_mutex); render_session = render; }
       auto config = load_driver_config(driver_path);
-      config.receive_only = true;
+      if (mock_control && !config.signaling_url.starts_with("ws://127.0.0.1:"))
+        throw std::runtime_error("mock control requires an isolated loopback signaling tunnel");
+      config.receive_only = !mock_control;
+      config.defer_control_bootstrap = mock_control;
       config.max_time_sync_uncertainty_ms = vehicle.field_safety.max_time_sync_uncertainty_ms;
       config.time_sync_interval_ms = vehicle.field_safety.time_sync_interval_ms;
       config.time_sync_samples = vehicle.field_safety.time_sync_samples;
@@ -167,7 +343,7 @@ struct Window {
       std::fill(secret.begin(), secret.end(), '\0');
       bool connected = false;
       try {
-        report(L"正在登录并连接车端；仅观看，控制禁用。");
+        report(mock_control ? L"正在连接隔离 mock 台架；等待安全条件。" : L"正在登录并连接车端；仅观看，控制禁用。");
         phase = "login";
         static_cast<void>(driver.login());
         if (stop_token.stop_requested()) throw std::runtime_error("cancelled");
@@ -179,6 +355,8 @@ struct Window {
         Json scope{{"source_session_id", session.at("session_id")},
                    {"source_control_session_generation", session.at("control_session_generation")}};
         std::unique_ptr<Receiver> receiver;
+        std::shared_ptr<detail::NativeMockMediaGate> mock_gate;
+        std::jthread control_worker;
         std::deque<Json> early;
         std::string negotiation;
         auto next_observation = Clock::now();
@@ -198,25 +376,63 @@ struct Window {
               options.display = false;
               options.ice_servers = payload.value("ice_servers", ice);
               options.ice_route_mode = payload.value("ice_route_mode", "all");
+              if (mock_control) {
+                options.local_addresses = {mock_local_ip};
+                options.remote_addresses = {mock_peer_ip};
+                options.address_family = mock_ip_family;
+                options.ice_transport = "udp";
+                options.ice_route_mode = "direct";
+              }
+              negotiation = payload.at("media_negotiation_id").get<std::string>();
+              if (payload.value("control_transport_capability", "") == detail::kControlTransportCapability)
+                options.control_scope = detail::NativeMediaScope{
+                    session.at("session_id").get<std::string>(),
+                    session.at("control_session_generation").get<std::uint64_t>(), negotiation};
               for (const auto& camera : vehicle.enabled_cameras()) options.camera_ids.push_back(camera.id);
               options.software_frame = [render](const std::string& camera, GstSample* sample) { render->accept(camera, sample); };
               receiver = std::make_unique<Receiver>(options);
               receiver->start();
-              negotiation = payload.at("media_negotiation_id").get<std::string>();
               auto answer = scope;
               answer.update({{"type", "answer"}, {"sdp", receiver->answer(payload)}, {"media_negotiation_id", negotiation}});
               static_cast<void>(driver.send_webrtc_answer(answer));
               for (const auto& candidate : early) receiver->candidate(candidate);
               early.clear();
-              report(L"已提交媒体应答，等待画面；仅观看，控制禁用。");
+              if (mock_control) {
+                if (!receiver->control_channel()) throw std::runtime_error("mock control capability not negotiated");
+                mock_gate = std::make_shared<detail::NativeMockMediaGate>(
+                    session.at("session_id").get<std::string>(), vehicle.vehicle_id, negotiation, render->cameras);
+                auto* target = receiver.get();
+                control_worker = std::jthread([this, &driver, target, vehicle, config, session, negotiation, render,
+                                                gate = mock_gate, stop_token](std::stop_token token) {
+                  try { run_mock_control(driver, *target, vehicle, config, session, negotiation, render, gate, stop_token, token); }
+                  catch (...) {
+                    report(L"Mock 控制终止：安全条件或控制通道失效。");
+                    try { static_cast<void>(driver.end_session("native_mock_control_error")); } catch (...) {}
+                  }
+                });
+              }
+              report(mock_control ? L"已提交媒体应答，等待双路和 mock 安全条件。" : L"已提交媒体应答，等待画面；仅观看，控制禁用。");
             } else if (type == "ice_candidate") {
               phase = "remote_candidate";
               if (receiver) receiver->candidate(payload);
               else if (early.size() < 256) early.push_back(payload);
               else throw std::runtime_error("early ICE candidate limit reached");
+            } else if (type == "media_status" && mock_gate) {
+              const auto status = driver.status();
+              const auto& sync = status.at("time_sync");
+              const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::system_clock::now().time_since_epoch()).count();
+              const auto uncertainty = sync.value("uncertainty_ms", std::int64_t{999});
+              const auto now_ms = static_cast<std::int64_t>(bench_now_ms());
+              static_cast<void>(mock_gate->observe(payload, now_ms, wall_ms + sync.value("offset_ms", std::int64_t{0}),
+                  sync.value("synchronized", false) ? uncertainty : 999));
             }
           }
           if (receiver) {
+            // Receive-only observation: no result or command is sent to the
+            // runtime until the scoped control courier is connected.
+            if (!mock_control) if (auto* channel = receiver->control_channel())
+              while (channel->pop()) {}
             phase = "local_candidates";
             for (const auto& candidate : receiver->candidates()) {
               auto outgoing = scope;
@@ -242,19 +458,20 @@ struct Window {
                 }
               }
               report((advancing ? L"渲染提交持续更新 · " : L"等待新画面或画面停滞 · ") + path +
-                  L" · 仅观看，控制禁用");
+                  (mock_control ? L" · 隔离 mock，零输入" : L" · 仅观看，控制禁用"));
               next_observation = Clock::now() + 1s;
             }
           }
           std::this_thread::sleep_for(10ms);
         }
+        if (control_worker.joinable()) { control_worker.request_stop(); control_worker.join(); }
         if (receiver) receiver->stop();
       } catch (...) {
         if (connected) { try { static_cast<void>(driver.end_session("native_viewer_error")); } catch (...) {} }
         throw;
       }
       if (connected) { try { static_cast<void>(driver.end_session("native_viewer_disconnect")); } catch (...) {} }
-      report(L"已断开；控制始终禁用。");
+      report(mock_control ? L"已断开 mock 台架。" : L"已断开；控制始终禁用。");
     } catch (const std::exception& error) {
       // Report only a fixed category and phase: network errors can contain
       // addresses or credentials and must not be copied into diagnostic logs.
@@ -379,19 +596,38 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   int argc = 0;
   auto** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-  if (argv && argc == 3 && std::wstring(argv[1]) == L"--validate-config") {
+  if (argv && argc == 3 && (std::wstring(argv[1]) == L"--validate-config" ||
+                            std::wstring(argv[1]) == L"--validate-mock-config")) {
     int result = 0;
     try {
       const auto config = mine_teleop::load_vehicle_config(utf8(argv[2]));
-      mine_teleop::bench::validate(config);
+      if (std::wstring(argv[1]) == L"--validate-mock-config") mine_teleop::bench::validate_mock_control(config);
+      else mine_teleop::bench::validate(config);
       if (config.enabled_cameras().size() > 2) result = 1;
     } catch (...) { result = 1; }
     LocalFree(argv);
     return result;
   }
+  const bool mock_control = argv && argc == 6 && std::wstring(argv[1]) == L"--mock-control" &&
+      std::wstring(argv[2]) == L"--local-ip" && std::wstring(argv[4]) == L"--peer-ip";
+  if (argc != 1 && !mock_control) { if (argv) LocalFree(argv); return 1; }
+  std::string local_ip, peer_ip, family;
+  if (mock_control) {
+    try {
+      g_networking_init();
+      local_ip = utf8(argv[3]); peer_ip = utf8(argv[5]);
+      const auto local = mine_teleop::detail::ice_address_summary(local_ip), remote = mine_teleop::detail::ice_address_summary(peer_ip);
+      family = local.value("address_family", "");
+      if (local.value("address_class", "") != "public" || remote.value("address_class", "") != "public" ||
+          (family != "ipv4" && family != "ipv6") || remote.value("address_family", "") != family ||
+          mine_teleop::bench::same_ip_address(local_ip, peer_ip)) throw std::runtime_error("invalid WAN endpoints");
+    } catch (...) { LocalFree(argv); return 1; }
+  }
   if (argv) LocalFree(argv);
   gst_init(nullptr, nullptr);
   Window app;
+  app.mock_control = mock_control;
+  app.mock_local_ip = std::move(local_ip); app.mock_peer_ip = std::move(peer_ip); app.mock_ip_family = std::move(family);
   WNDCLASSW panel{};
   panel.lpfnWndProc = panel_procedure; panel.hInstance = instance; panel.lpszClassName = L"MineTeleopNativePanel";
   if (!RegisterClassW(&panel)) return 1;
@@ -400,7 +636,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   klass.hCursor = LoadCursor(nullptr, IDC_ARROW);
   klass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
   if (!RegisterClassW(&klass)) return 1;
-  const auto hwnd = CreateWindowExW(0, klass.lpszClassName, L"MineTeleop Windows 台架视频（仅观看）",
+  const auto hwnd = CreateWindowExW(0, klass.lpszClassName,
+      mock_control ? L"MineTeleop Windows 隔离 Mock 控制（零输入）" : L"MineTeleop Windows 台架视频（仅观看）",
       WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 980, 530, nullptr, nullptr, instance, &app);
   if (!hwnd) return 1;
   ShowWindow(hwnd, show); UpdateWindow(hwnd);

@@ -3,6 +3,7 @@
 #include "mine_teleop/detail/native_control_mailbox.hpp"
 #define GST_USE_UNSTABLE_API
 #include <gst/webrtc/webrtc.h>
+#include <gio/gio.h>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -116,7 +117,7 @@ class NativeControlChannel {
   // Observe the ICE transport actually carrying this SCTP association, not a
   // media-track pair. Unknown, relay, TCP and older runtimes fail closed.
   // This is route classification only, not peer identity or WAN evidence.
-  [[nodiscard]] bool direct_udp() const {
+  [[nodiscard]] bool direct_udp(const std::string& expected_local = {}, const std::string& expected_remote = {}) const {
 #if GST_CHECK_VERSION(1, 28, 0)
     std::lock_guard send_lock(state_->send_mutex);
     {
@@ -139,17 +140,29 @@ class NativeControlChannel {
       if (!candidate || !candidate->stats || !candidate->stats->type || !candidate->stats->proto) return false;
       return native_direct_udp_candidate(candidate->stats->type, candidate->stats->proto);
     };
+    const auto address_matches = [](const GstWebRTCICECandidate* candidate, const std::string& expected) {
+      if (expected.empty()) return true;
+      if (!candidate || !candidate->stats || !candidate->stats->ipaddr) return false;
+      auto* actual = g_inet_address_new_from_string(candidate->stats->ipaddr);
+      auto* wanted = g_inet_address_new_from_string(expected.c_str());
+      const bool match = actual && wanted && g_inet_address_equal(actual, wanted);
+      if (actual) g_object_unref(actual);
+      if (wanted) g_object_unref(wanted);
+      return match;
+    };
     const bool result = peer_state == GST_WEBRTC_PEER_CONNECTION_STATE_CONNECTED &&
         sctp_state == GST_WEBRTC_SCTP_TRANSPORT_STATE_CONNECTED &&
         dtls_state == GST_WEBRTC_DTLS_TRANSPORT_STATE_CONNECTED &&
         (ice_state == GST_WEBRTC_ICE_CONNECTION_STATE_CONNECTED || ice_state == GST_WEBRTC_ICE_CONNECTION_STATE_COMPLETED) &&
-        pair && candidate_direct_udp(pair->local) && candidate_direct_udp(pair->remote);
+        pair && candidate_direct_udp(pair->local) && candidate_direct_udp(pair->remote) &&
+        address_matches(pair->local, expected_local) && address_matches(pair->remote, expected_remote);
     if (pair) gst_webrtc_ice_candidate_pair_free(pair);
     if (ice) gst_object_unref(ice);
     if (dtls) gst_object_unref(dtls);
     if (sctp) gst_object_unref(sctp);
     return result;
 #else
+    (void)expected_local; (void)expected_remote;
     return false;
 #endif
   }

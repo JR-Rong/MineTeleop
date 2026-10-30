@@ -284,6 +284,22 @@ inline void validate(const VehicleConfig& config) {
   }
 }
 
+// Isolated neutral-control experiment only. The local config is necessary
+// but is not remote mock/CAN containment evidence.
+inline void validate_mock_control(const VehicleConfig& config) {
+  if (!config.runtime.control_enabled || !config.vehicle_id.starts_with("test_bench_") ||
+      !config.field_safety.require_time_sync || config.field_safety.max_time_sync_uncertainty_ms > 25 ||
+      config.field_safety.max_time_sync_uncertainty_ms < 0)
+    throw std::invalid_argument("requires isolated mock control and the 25ms clock limit");
+  const auto cameras = config.enabled_cameras();
+  if (cameras.size() != 2 || std::any_of(cameras.begin(), cameras.end(), [](const auto& camera) {
+        return !camera.critical_for_control;
+      })) throw std::invalid_argument("requires exactly two critical cameras");
+  auto receive_only = config;
+  receive_only.runtime.control_enabled = false;
+  validate(receive_only);
+}
+
 // Bounded observations. Quantiles use all stored samples; truncation is explicit.
 struct Samples {
   std::vector<double> values;

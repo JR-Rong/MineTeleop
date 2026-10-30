@@ -2,6 +2,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 using mine_teleop::detail::NativeVideoHealth;
 namespace {
@@ -59,12 +60,22 @@ void test_clock_and_bad_sample_fail_closed() {
   require(!health.snapshot(11).sample_healthy, "clock regression accepted");
   require(!health.render_submitted("front", 1, 2, 13) && !health.snapshot(13).ready, "clock fault recovered without new session");
 }
+void test_concurrent_current_time_observations() {
+  NativeVideoHealth health({"front"}, 1000);
+  require(health.attach("front", 1) && health.set_usable("front", 1, true), "concurrent track setup failed");
+  std::jthread snapshots([&] { for (int i = 0; i < 1000; ++i) static_cast<void>(health.snapshot_now()); });
+  for (std::uint64_t seq = 1; seq <= 1000; ++seq)
+    require(health.render_submitted_now("front", 1, seq), "concurrent submission rejected");
+  snapshots.join();
+  require(health.snapshot_now().ready, "concurrent timestamps falsely latched a clock fault");
+}
 }
 int main() {
   try {
     test_two_tracks_and_stale_recovery();
     test_generation_and_lifecycle_fencing();
     test_clock_and_bad_sample_fail_closed();
+    test_concurrent_current_time_observations();
     std::cout << "PASS dual critical-video freshness, generation and clock fencing\n";
     return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
