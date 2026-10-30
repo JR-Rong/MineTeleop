@@ -12,9 +12,11 @@
 #include <gst/video/videooverlay.h>
 #include <gst/webrtc/webrtc.h>
 #include <agent.h>  // libnice's pkg-config include directory is include/nice
+#if defined(__APPLE__) || defined(_WIN32)
+#include <gst/gl/gl.h>
+#endif
 #ifdef __APPLE__
 #include <gst/gstmacos.h>
-#include <gst/gl/gl.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #endif
@@ -704,13 +706,15 @@ class Receiver {
       g_clear_error(&error); if (bin) gst_object_unref(bin); throw std::runtime_error(message);
     }
     gst_bin_add(GST_BIN(pipeline_), bin);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
     if (!options_.window_handles.empty()) {
-      // The VideoToolbox GL allocator can discover another track's context via
-      // the common pipeline. Separate display contexts keep each drawable in
-      // its own NSView; otherwise both sinks draw into the last attached view.
+      // GL elements can discover another track's context via the common
+      // pipeline. Separate displays keep each native drawable independent;
+      // WGL also rejects concurrent cross-track context sharing on Windows.
       auto* display = gst_gl_display_new();
+      if (!display) throw std::runtime_error("native GL display unavailable");
       auto* context = gst_context_new(GST_GL_DISPLAY_CONTEXT_TYPE, TRUE);
+      if (!context) { gst_object_unref(display); throw std::runtime_error("native GL context unavailable"); }
       gst_context_set_gl_display(context, display);
       gst_element_set_context(bin, context);
       gst_context_unref(context);
@@ -752,7 +756,9 @@ class Receiver {
     auto* input = gst_element_get_static_pad(bin, "sink");
     const auto linked = gst_pad_link(pad, input);
     gst_object_unref(input);
-    if (linked != GST_PAD_LINK_OK || !gst_element_sync_state_with_parent(bin)) throw std::runtime_error("decode track link/start failed");
+    if (linked == GST_PAD_LINK_NOFORMAT) throw std::runtime_error("decode track pad link noformat");
+    if (linked != GST_PAD_LINK_OK) throw std::runtime_error("decode track pad link failed");
+    if (!gst_element_sync_state_with_parent(bin)) throw std::runtime_error("decode track state sync failed");
     track->start(options_.stall_ms);
   }
   std::shared_ptr<ArrivalTimes> arrivals_{std::make_shared<ArrivalTimes>()};

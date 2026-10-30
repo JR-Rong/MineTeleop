@@ -152,7 +152,9 @@ struct Window {
       // addresses or credentials and must not be copied into diagnostic logs.
       const std::string_view detail = error.what();
       const char* category = detail.find("native view has no matching media pad") != std::string_view::npos ? "unmapped_pad" :
-          detail.find("decode track link/start failed") != std::string_view::npos ? "track_link" :
+          detail.find("decode track pad link noformat") != std::string_view::npos ? "track_link_noformat" :
+          detail.find("decode track pad link failed") != std::string_view::npos ? "track_link_other" :
+          detail.find("decode track state sync failed") != std::string_view::npos ? "track_state_sync" :
           detail.find("GStreamer promise timed out") != std::string_view::npos ? "promise_timeout" : "other";
       std::fprintf(stderr, "native_viewer_failure phase=%s category=%s\n", phase, category);
       std::fill(secret.begin(), secret.end(), '\0');

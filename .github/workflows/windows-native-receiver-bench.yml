@@ -80,7 +80,7 @@ jobs:
           $env:PATH = "$env:GST_BENCH_ROOT\bin;$env:PATH"
           $env:PKG_CONFIG_PATH = "$env:GST_BENCH_ROOT\lib\pkgconfig"
           $pkg = Join-Path $env:GST_BENCH_ROOT 'bin\pkg-config.exe'
-          & $pkg --exists gstreamer-1.0 gstreamer-app-1.0 gstreamer-sdp-1.0 gstreamer-webrtc-1.0 gstreamer-rtp-1.0 gstreamer-video-1.0 nice
+          & $pkg --exists gstreamer-1.0 gstreamer-app-1.0 gstreamer-sdp-1.0 gstreamer-webrtc-1.0 gstreamer-rtp-1.0 gstreamer-video-1.0 gstreamer-gl-1.0 nice
           if ($LASTEXITCODE -ne 0) { throw 'GStreamer or libnice development metadata missing' }
           cmake -S . -B build/windows-control-x64 -DMINE_TELEOP_BUILD_BENCH_PROBES=ON -DMINE_TELEOP_BUILD_WINDOWS_NATIVE_RECEIVER=ON "-DPKG_CONFIG_EXECUTABLE=$pkg"
           if ($LASTEXITCODE -ne 0) { throw 'native probe configure failed' }

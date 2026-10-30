@@ -27,5 +27,18 @@
     "note": "An initial run's status sampler could not read controls across processes and is excluded. The corrected sampler saw an application failure and crash shortly after ICE connection. Root cause remains unverified."
   },
   "security": {"temporary_cloud_key_removed": true, "temporary_cloud_and_orin_credentials_removed": true, "temporary_windows_key_and_credentials_removed": true},
+  "followup": {
+    "source_commit": "46f08808e5f7eeb4a29868a661c29cff2c2af137",
+    "windows_executable_sha256": "3792fa636121c58de0ae6804d60ecd6b46136b21d48fe51601ac87f2e52b0d36",
+    "windows_native_receiver_bench_ci": "passed",
+    "rtp_callback_lifetime_regression": "passed on Linux and Windows CI",
+    "outcome": "failed; Windows video not displayed",
+    "receiver_failure": "track link or state sync",
+    "pad_link_observation": "both WebRTC video pads linked successfully",
+    "gl_failure": "GL context creation failed while sharing WGL contexts; wglShareLists returned 0xaa",
+    "new_access_violation_event_observed": false,
+    "normal_exit_proven": false,
+    "note": "A later run enabled private GStreamer diagnostics to identify the WGL error. Logs were removed after extracting the failure category. This does not prove the callback lifetime fix under long-duration load."
+  },
   "ci": {"source_commit": "5f8d95fc54b3f0124fc7b3cdc0f08698a2473ad7", "windows_native_receiver_bench": "passed", "runtime_or_wan_acceptance": false}
 }
