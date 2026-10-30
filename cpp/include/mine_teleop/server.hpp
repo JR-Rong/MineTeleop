@@ -445,7 +445,9 @@ class DriverConsoleRuntime {
       std::string_view vehicle, std::string_view driver, std::int64_t now, bool direct_return = false);
   [[nodiscard]] Json update_control_intent(const Json& input, const HttpRequest* request = nullptr);
   [[nodiscard]] Json record_browser_event(const Json& input);
-  [[nodiscard]] Json status();
+  // The in-process courier can omit the signaling socket snapshot so a long
+  // poll cannot delay its safety-critical publication loop.
+  [[nodiscard]] Json status(bool omit_signaling_socket = false);
   [[nodiscard]] Json log_sessions();
   [[nodiscard]] Json start_log_export(std::string_view key);
   [[nodiscard]] Json log_export_status() const;

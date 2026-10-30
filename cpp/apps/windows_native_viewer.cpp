@@ -246,7 +246,7 @@ struct Window {
     while (!stop.stop_requested() && !parent.stop_requested()) {
       const auto now = Clock::now();
       const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-      if (now >= next_status) { cached_status = driver.status(); next_status = now + 25ms; }
+      if (now >= next_status) { cached_status = driver.status(true); next_status = now + 25ms; }
       const auto& status = cached_status;
       const auto& sync = status.at("time_sync");
       const bool clock_ok = sync.value("synchronized", false) && sync.value("uncertainty_ms", 999) <= 25 &&
@@ -453,7 +453,7 @@ struct Window {
               else if (early.size() < 256) early.push_back(payload);
               else throw std::runtime_error("early ICE candidate limit reached");
             } else if (type == "media_status" && mock_gate) {
-              const auto status = driver.status();
+              const auto status = driver.status(true);
               const auto& sync = status.at("time_sync");
               const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::system_clock::now().time_since_epoch()).count();

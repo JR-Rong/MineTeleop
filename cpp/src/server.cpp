@@ -8366,14 +8366,14 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input, const HttpRe
   };
 }
 
-Json DriverConsoleRuntime::status() {
+Json DriverConsoleRuntime::status(bool omit_signaling_socket) {
   // Monitoring is a local snapshot. Network time samples and authority
   // renewal belong to their workers and must not delay input-lease refresh.
   bool websocket_connected = false;
   std::uint64_t websocket_reconnects = 0;
   std::uint64_t delivery_cursor = 0;
   std::size_t pending_deliveries = 0;
-  {
+  if (!omit_signaling_socket) {
     std::lock_guard websocket_lock(signaling_websocket_mutex_);
     websocket_connected = signaling_websocket_ && signaling_websocket_->connected();
     websocket_reconnects = signaling_websocket_reconnects_;
@@ -8493,10 +8493,11 @@ Json DriverConsoleRuntime::status() {
       {"last_control_prepared_at_utc_ms", last_control_prepared_at_utc_ms_},
       {"control_commands_prepared_total", control_commands_prepared_total_},
       {"signaling_transport", "websocket"},
-      {"signaling_websocket_connected", websocket_connected},
-      {"signaling_websocket_reconnects", websocket_reconnects},
-      {"signaling_delivery_cursor", delivery_cursor},
-      {"pending_signaling_deliveries", pending_deliveries},
+      {"signaling_socket_snapshot_available", !omit_signaling_socket},
+      {"signaling_websocket_connected", omit_signaling_socket ? Json(nullptr) : Json(websocket_connected)},
+      {"signaling_websocket_reconnects", omit_signaling_socket ? Json(nullptr) : Json(websocket_reconnects)},
+      {"signaling_delivery_cursor", omit_signaling_socket ? Json(nullptr) : Json(delivery_cursor)},
+      {"pending_signaling_deliveries", omit_signaling_socket ? Json(nullptr) : Json(pending_deliveries)},
       {"native_control",
        {{"transport", control_transport_status.value("path", "wss") == "dc" ? "native_webrtc_data_channel_bridge" : "native_signaling_websocket"},
         {"cloud_capabilities_verified", native_control_capabilities_verified},
