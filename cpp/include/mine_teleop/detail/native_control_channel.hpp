@@ -90,7 +90,9 @@ class NativeControlChannel {
 
  public:
   NativeControlChannel(GstElement* peer, NativeMediaScope scope)
-      : state_(std::make_shared<State>(std::move(scope))), peer_(GST_ELEMENT(gst_object_ref(peer))) {
+      : state_(std::make_shared<State>(std::move(scope))) {
+    if (!peer || !GST_IS_ELEMENT(peer)) throw std::invalid_argument("invalid WebRTC peer");
+    peer_ = GST_ELEMENT(gst_object_ref(peer));
     // on-data-channel is too late to guarantee observation of early messages.
     if (!g_signal_lookup("prepare-data-channel", G_OBJECT_TYPE(peer_))) {
       gst_object_unref(peer_); peer_ = nullptr;

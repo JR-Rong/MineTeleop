@@ -86,6 +86,10 @@ struct Peer {
 int main(int argc, char** argv) {
   gst_init(&argc, &argv);
   try {
+    bool rejected_null = false;
+    try { NativeControlChannel invalid(nullptr, {"fixture", 1, "attempt"}); }
+    catch (const std::invalid_argument&) { rejected_null = true; }
+    require(rejected_null, "null peer must be rejected");
     Peer a, b;
 #if GST_CHECK_VERSION(1, 22, 0)
     NativeControlChannel courier(b.rtc, {"fixture", 1, "attempt"});
