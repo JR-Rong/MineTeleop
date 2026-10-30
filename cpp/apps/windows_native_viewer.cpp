@@ -171,6 +171,15 @@ struct Window {
     std::int64_t telemetry_at_ms = 0;
     std::uint64_t telemetry_seq = 0, safety_stop_episodes = 0, last_result_seq = 0;
     bool was_active = false, stop_episode = false;
+    Json dc_send_trace = Json::array();
+    std::uint64_t dc_send_trace_dropped = 0;
+    const auto flush_dc_trace = [&] {
+      if (!config.control_trace_commands || (dc_send_trace.empty() && !dc_send_trace_dropped)) return;
+      const Json trace{{"event", "native_mock_dc_batch"}, {"session_id", session_id},
+          {"records", std::move(dc_send_trace)}, {"dropped", dc_send_trace_dropped}};
+      std::fprintf(stderr, "%s\n", trace.dump().c_str());
+      dc_send_trace = Json::array(); dc_send_trace_dropped = 0;
+    };
     std::unique_ptr<detail::NativeControlCourier> courier;
     auto* channel = receiver.control_channel();
     if (!channel || !render->health) throw std::runtime_error("mock control requires scoped channel and critical video");
@@ -290,7 +299,20 @@ struct Window {
         detail::NativeControlCourier::Io io{
             [&] { return channel->pop(); }, [&] { return channel->direct_udp(mock_local_ip, mock_peer_ip); },
             [&](const Json& request) { return driver.control_transport_bridge(request); },
-            [&](const std::string& bytes) { return channel->send(bytes); }, on_status};
+            [&](const std::string& bytes) {
+              const auto started = static_cast<std::int64_t>(bench_now_ms());
+              const bool queued = channel->send(bytes);
+              if (config.control_trace_commands) {
+                const auto frame = Json::parse(bytes, nullptr, false);
+                if (frame.is_object() && frame.contains("seq") && frame.at("seq").is_number_unsigned()) {
+                  if (dc_send_trace.size() < 128)
+                    dc_send_trace.push_back({{"seq", frame.at("seq")}, {"started_monotonic_ms", started},
+                        {"completed_monotonic_ms", static_cast<std::int64_t>(bench_now_ms())}, {"queued", queued}});
+                  else ++dc_send_trace_dropped;
+                }
+              }
+              return queued;
+            }, on_status};
         if (!courier->tick(current, io)) throw std::runtime_error("mock courier retired");
         const auto transport = status.at("native_control").at("control_transport");
         const bool negotiated = transport.value("epoch", 0) > 0 && !transport.value("selecting", true);
@@ -329,6 +351,7 @@ struct Window {
       input_authorized_at_ms.store(authorized ? now_ms : 0);
       input_authorized.store(authorized);
       if (now >= next_evidence) {
+        flush_dc_trace();
         const auto native = status.at("native_control");
         const auto transport = native.at("control_transport");
         const auto sends = channel->send_stats();
@@ -367,6 +390,7 @@ struct Window {
     }
     input_authorized.store(false);
     keyboard.withdraw();
+    flush_dc_trace();
     input_worker.request_stop();
     if (input_worker.joinable()) input_worker.join();
     if (courier) courier->retire();

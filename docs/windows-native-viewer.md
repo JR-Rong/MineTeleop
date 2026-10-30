@@ -25,6 +25,12 @@ telemetry or control readiness is lost. Held keys must be released before a
 new press can take effect after a loss. There is no production emergency-stop
 input or authorization in this prototype.
 
+With `logging.control_trace_commands` enabled, mock mode batches a bounded
+record of command sequence, local DataChannel enqueue start/end and outcome.
+The record contains no raw packet or credentials; local enqueue is not proof of
+delivery. Correlate it with the vehicle receipt and driver dispatch traces to
+locate delay, accounting for clock uncertainty between hosts.
+
 The two video areas belong to the Win32 application. Signaling and frame
 reception reuse the native driver runtime and the existing receiver probe;
 the latter is a bounded measurement implementation, not a finished production
