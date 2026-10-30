@@ -205,6 +205,13 @@ struct Window {
           if (focused) withdrawn = false;
           std::this_thread::sleep_for(60ms);
         }
+      } catch (const std::exception& error) {
+        const std::string_view detail = error.what();
+        const char* category = detail.find("mock input rejected") != std::string_view::npos ? "rejected" :
+            detail.find("stale or different native control session") != std::string_view::npos ? "session_changed" :
+            detail.find("not connected") != std::string_view::npos ? "disconnected" : "other";
+        std::fprintf(stderr, "native_mock_input_failure category=%s\n", category); std::fflush(stderr);
+        input_failed.store(true);
       } catch (...) { input_failed.store(true); }
     });
     auto on_status = [&](const Json& envelope) {
@@ -440,7 +447,19 @@ struct Window {
                 control_worker = std::jthread([this, &driver, target, vehicle, config, session, negotiation, render,
                                                 gate = mock_gate, stop_token](std::stop_token token) {
                   try { run_mock_control(driver, *target, vehicle, config, session, negotiation, render, gate, stop_token, token); }
-                  catch (...) {
+                  catch (const std::exception& error) {
+                    const std::string_view detail = error.what();
+                    const char* category = detail.find("mock input worker failed") != std::string_view::npos ? "input_worker" :
+                        detail.find("mock courier retired") != std::string_view::npos ? "courier_retired" :
+                        detail.find("mock control profile rejected") != std::string_view::npos ? "profile_rejected" :
+                        detail.find("retired page") != std::string_view::npos ? "retired_owner" :
+                        detail.find("old session") != std::string_view::npos ? "session_changed" :
+                        dynamic_cast<const Json::exception*>(&error) ? "json" : "other";
+                    std::fprintf(stderr, "native_mock_control_failure category=%s\n", category); std::fflush(stderr);
+                    report(L"Mock 控制终止：安全条件或控制通道失效。");
+                    try { static_cast<void>(driver.end_session("native_mock_control_error")); } catch (...) {}
+                  } catch (...) {
+                    std::fprintf(stderr, "native_mock_control_failure category=unknown\n"); std::fflush(stderr);
                     report(L"Mock 控制终止：安全条件或控制通道失效。");
                     try { static_cast<void>(driver.end_session("native_mock_control_error")); } catch (...) {}
                   }
