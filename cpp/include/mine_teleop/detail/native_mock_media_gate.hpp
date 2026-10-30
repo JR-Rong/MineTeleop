@@ -29,6 +29,7 @@ class NativeMockMediaGate {
                std::int64_t uncertainty_ms) {
     std::lock_guard lock(mutex_);
     ready_ = false;
+    reason_ = "scope";
     try {
       if (!status.is_object() || monotonic_ms < 0 || synchronized_utc_ms < 0 || uncertainty_ms < 0 || uncertainty_ms > 25 ||
           status.value("session_id", "") != session_ || status.value("vehicle_id", "") != vehicle_ ||
@@ -37,12 +38,15 @@ class NativeMockMediaGate {
           status.at("media_negotiation").value("id", "") != attempt_ ||
           !status.at("media_negotiation").value("answer_applied", false)) return false;
       const auto reported = status.at("reported_at_utc_ms").get<std::int64_t>();
+      reason_ = "timestamp";
       if (reported <= last_reported_ || reported < synchronized_utc_ms - 3000 - uncertainty_ms ||
           reported > synchronized_utc_ms + uncertainty_ms) return false;
       const auto& sync = status.at("time_sync");
+      reason_ = "remote_clock";
       const auto remote_uncertainty = sync.at("uncertainty_ms").get<std::int64_t>();
       if (!sync.value("synchronized", false) || remote_uncertainty < 0 || remote_uncertainty > 25) return false;
       const auto& lanes = status.at("lanes");
+      reason_ = "lanes";
       if (!lanes.is_array() || lanes.size() != ids_.size()) return false;
       std::map<std::string, std::uint64_t> next;
       for (const auto& lane : lanes) {
@@ -59,13 +63,19 @@ class NativeMockMediaGate {
       ids_ = std::move(next);
       initialized_ = true;
       last_reported_ = reported;
+      reason_ = advancing ? "ready" : "not_advancing";
       if (advancing) { last_good_ms_ = monotonic_ms; ready_ = true; }
       return ready_;
-    } catch (const Json::exception&) { return false; }
+    } catch (const Json::exception&) { reason_ = "malformed"; return false; }
   }
   bool ready(std::int64_t now_ms) const {
     std::lock_guard lock(mutex_);
     return ready_ && now_ms >= last_good_ms_ && now_ms - last_good_ms_ < 3000;
+  }
+  std::string reason(std::int64_t now_ms) const {
+    std::lock_guard lock(mutex_);
+    if (ready_ && (now_ms < last_good_ms_ || now_ms - last_good_ms_ >= 3000)) return "expired";
+    return reason_;
   }
  private:
   const std::string session_, vehicle_, attempt_;
@@ -73,5 +83,6 @@ class NativeMockMediaGate {
   std::map<std::string, std::uint64_t> ids_;
   std::int64_t last_good_ms_{}, last_reported_{};
   bool initialized_{}, ready_{};
+  std::string reason_{"waiting"};
 };
 }  // namespace mine_teleop::detail

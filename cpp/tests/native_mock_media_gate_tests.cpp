@@ -21,7 +21,9 @@ void test_gate() {
   NativeMockMediaGate gate("session", "test_bench_one", "attempt", {"front", "rear"});
   require(!gate.observe(status(10000, 1, 1), 100, 10000, 25), "first status cannot establish advancement");
   require(gate.observe(status(11000, 2, 2), 1100, 11000, 25) && gate.ready(1100), "two advancing streams rejected");
+  require(gate.reason(1100) == "ready" && gate.reason(4100) == "expired", "ready/expiry diagnostics wrong");
   require(!gate.observe(status(12000, 3, 2), 2100, 12000, 25) && !gate.ready(2100), "stalled camera admitted");
+  require(gate.reason(2100) == "not_advancing", "stalled camera diagnosis wrong");
   require(gate.observe(status(13000, 4, 3), 3100, 13000, 25), "advancing cameras did not recover");
   auto bad = status(14000, 5, 4); bad["adapter_type"] = "can";
   require(!gate.observe(bad, 4100, 14000, 25) && !gate.ready(4100), "non-mock status admitted");
@@ -29,6 +31,7 @@ void test_gate() {
   bad = status(14000, 5, 4); bad["media_negotiation"]["id"] = "other";
   require(!gate.observe(bad, 4100, 14000, 25), "retired media attempt admitted");
   require(!gate.observe(status(9000, 5, 4), 4100, 14000, 25), "old status admitted");
+  require(gate.reason(4100) == "timestamp", "old status diagnosis wrong");
   require(!gate.ready(6100), "expired remote status retained readiness");
 }
 }

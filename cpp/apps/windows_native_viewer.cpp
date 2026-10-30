@@ -305,9 +305,11 @@ struct Window {
         const auto transport = native.at("control_transport");
         const Json evidence{{"event", "native_mock_observation"}, {"monotonic_ms", now_ms},
             {"video_ready", video_health.ready}, {"remote_media_ready", gate->ready(now_ms)},
+            {"remote_media_reason", gate->reason(now_ms)},
             {"focused", focused}, {"clock_ready", clock_ok}, {"clock_uncertainty_ms", sync.value("uncertainty_ms", -1)},
             {"sctp_direct_udp", channel->direct_udp(mock_local_ip, mock_peer_ip)}, {"control_path", transport.value("path", "unknown")},
             {"control_selecting", transport.value("selecting", true)}, {"intent_fresh", native.value("intent_fresh", false)},
+            {"control_failed_dc_trials", transport.value("failed_dc_trials", 0)},
             {"sent_total", native.value("commands_sent_total", std::uint64_t{0})},
             {"last_ack_seq", native.value("last_ack_seq", std::uint64_t{0})},
             {"last_gap_ms", native.value("last_gap_ms", std::int64_t{0})},
