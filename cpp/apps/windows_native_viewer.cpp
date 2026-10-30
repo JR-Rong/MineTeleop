@@ -92,6 +92,7 @@ struct Window {
               options.display = true;
               options.ice_servers = payload.value("ice_servers", ice);
               options.ice_route_mode = payload.value("ice_route_mode", "all");
+              for (const auto& camera : vehicle.enabled_cameras()) options.camera_ids.push_back(camera.id);
               for (const auto handle : video) options.window_handles.push_back(reinterpret_cast<std::uintptr_t>(handle));
               receiver = std::make_unique<Receiver>(options);
               receiver->start();

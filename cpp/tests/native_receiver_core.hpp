@@ -92,6 +92,50 @@ inline std::string filter_bench_remote_sdp(const std::string& sdp, const std::ve
   return output;
 }
 
+// Match the sender's ordered camera list to SDP video sections, then to the
+// configured window order. Ambiguous or incomplete mappings are unsafe.
+inline std::map<std::string, std::size_t> camera_windows_by_mid(
+    const GstSDPMessage* sdp, const Json& tracks, const std::vector<std::string>& cameras) {
+  if (!sdp || cameras.empty() || !tracks.is_array() || tracks.size() != cameras.size())
+    throw std::runtime_error("camera mapping is incomplete");
+  std::unordered_set<std::string> expected;
+  for (const auto& camera : cameras)
+    if (camera.empty() || !expected.insert(camera).second) throw std::runtime_error("duplicate configured camera");
+  std::unordered_set<std::string> assigned;
+  std::map<std::string, std::size_t> result;
+  std::size_t video_index = 0;
+  for (guint i = 0; i < gst_sdp_message_medias_len(sdp); ++i) {
+    const auto* media = gst_sdp_message_get_media(sdp, i);
+    const auto* kind = gst_sdp_media_get_media(media);
+    if (!kind || std::string_view(kind) != "video") continue;
+    if (video_index >= tracks.size() || !tracks[video_index].is_object() ||
+        !tracks[video_index].contains("camera_id") || !tracks[video_index]["camera_id"].is_string())
+      throw std::runtime_error("video section has no camera identity");
+    const auto camera = tracks[video_index++]["camera_id"].get<std::string>();
+    const auto* mid = gst_sdp_media_get_attribute_val(media, "mid");
+    const auto position = std::find(cameras.begin(), cameras.end(), camera);
+    bool bundled = false;
+    for (guint group = 0; mid; ++group) {
+      const auto* value = gst_sdp_message_get_attribute_val_n(sdp, "group", group);
+      if (!value) break;
+      std::istringstream fields(value);
+      std::string token; fields >> token;
+      if (token != "BUNDLE") continue;
+      while (fields >> token) if (token == mid) bundled = true;
+    }
+    // WebRTC bundle-only m-lines legitimately have port 0 in an offer.
+    const bool inactive_port = gst_sdp_media_get_port(media) == 0 &&
+        !(gst_sdp_media_get_attribute_val(media, "bundle-only") && bundled);
+    if (!mid || !*mid || gst_sdp_media_get_attribute_val_n(media, "mid", 1) ||
+        inactive_port || position == cameras.end() ||
+        !assigned.insert(camera).second || !result.emplace(mid, static_cast<std::size_t>(position - cameras.begin())).second)
+      throw std::runtime_error("ambiguous camera or video MID");
+  }
+  if (video_index != tracks.size() || assigned.size() != cameras.size())
+    throw std::runtime_error("camera mapping does not cover all configured tracks");
+  return result;
+}
+
 struct Options {
   std::string config, output, signaling_url, driver_id{"native-bench"}, decoder{"avdec_h264"};
   int seconds{30}, jitter_ms{30}, stall_ms{0};
@@ -103,6 +147,8 @@ struct Options {
   Json ice_servers{Json::array()};
   bool validate_only{false}, display{false}, full_window{false};
   std::vector<std::uintptr_t> window_handles;
+  std::vector<std::string> camera_ids;
+  bool fixture_loopback{false};  // In-process test only; never a command-line option.
 };
 
 #ifdef __APPLE__
@@ -341,7 +387,7 @@ struct ArrivalTimes {
   }
 };
 struct Track {
-  std::string pad;
+  std::string pad, camera_id;
   std::shared_ptr<ArrivalTimes> arrivals;
   GstElement* sink{};  // owned reference until the consumer stops
   std::jthread consumer;
@@ -449,7 +495,7 @@ struct Track {
   static void release_draw_owner(gpointer data, GClosure*) { release_callback_owner<Track>(data); }
   Json counters() {
     std::lock_guard lock(mutex);
-    return {{"pad", pad}, {"decoded", decoded}, {"consumed", consumed}, {"drawn", drawn_events.size()},
+    return {{"pad", pad}, {"camera_id", camera_id}, {"decoded", decoded}, {"consumed", consumed}, {"drawn", drawn_events.size()},
             {"decode_count", decode_ms.count}, {"decode_sum_ms", decode_ms.sum}};
   }
   void start(int stall_ms) {
@@ -479,7 +525,7 @@ struct Track {
   }
   Json json() {
     std::lock_guard lock(mutex);
-    return {{"pad", pad}, {"decoded_frames", decoded}, {"decoded_buffers", decoded_buffers}, {"consumed_frames", consumed},
+    return {{"pad", pad}, {"camera_id", camera_id}, {"decoded_frames", decoded}, {"decoded_buffers", decoded_buffers}, {"consumed_frames", consumed},
             {"rtp_packets", rtp_packets}, {"rtp_unique_frame_timestamps", rtp_timestamps.size()},
             {"decoded_unique_pts", decoded_pts.size()}, {"duplicate_decoded_pts", duplicate_decoded_pts},
             {"regressed_decoded_pts", regressed_decoded_pts},
@@ -520,6 +566,12 @@ class Receiver {
       g_object_unref(ice);
     }
     if (!nice_) throw std::runtime_error("libnice selected-pair observation unavailable");
+    if (options_.fixture_loopback) {
+      NiceAddress address; nice_address_init(&address);
+      if (!nice_address_set_from_string(&address, "127.0.0.1") || !nice_agent_add_local_address(nice_, &address))
+        throw std::runtime_error("cannot bind synthetic receiver to loopback");
+      g_object_set(nice_, "ice-tcp", FALSE, nullptr);
+    }
 #ifdef __APPLE__
     if (!options_.local_interface.empty()) {
       interface_binding_ = std::make_unique<InterfaceBinding>(options_.local_interface);
@@ -563,6 +615,12 @@ class Receiver {
     if (gst_sdp_message_new(&sdp) != GST_SDP_OK) throw std::runtime_error("SDP allocation failed");
     if (gst_sdp_message_parse_buffer(reinterpret_cast<const guint8*>(text.data()), static_cast<guint>(text.size()), sdp) != GST_SDP_OK) {
       gst_sdp_message_free(sdp); throw std::runtime_error("invalid SDP offer");
+    }
+    if (!options_.camera_ids.empty()) {
+      try {
+        auto mapping = camera_windows_by_mid(sdp, offer.value("media_tracks", Json::array()), options_.camera_ids);
+        std::lock_guard lock(mutex_); camera_windows_ = std::move(mapping);
+      } catch (...) { gst_sdp_message_free(sdp); throw; }
     }
     auto* description = gst_webrtc_session_description_new(GST_WEBRTC_SDP_TYPE_OFFER, sdp);
     try { request([&](GstPromise* promise) { g_signal_emit_by_name(peer_, "set-remote-description", description, promise); }); }
@@ -703,6 +761,18 @@ class Receiver {
     std::lock_guard lock(mutex_);
     if (stopped_.load()) return;
     if (tracks_.size() >= 8) throw std::runtime_error("too many receiver tracks");
+    int mapped_index = -1;
+    if (!options_.camera_ids.empty()) {
+      GstWebRTCRTPTransceiver* transceiver = nullptr;
+      gchar* mid = nullptr;
+      g_object_get(pad, "transceiver", &transceiver, nullptr);
+      if (transceiver) { g_object_get(transceiver, "mid", &mid, nullptr); g_object_unref(transceiver); }
+      const auto found = mid ? camera_windows_.find(mid) : camera_windows_.end();
+      if (found != camera_windows_.end() && used_camera_windows_.insert(found->second).second)
+        mapped_index = static_cast<int>(found->second);
+      g_free(mid);
+      if (mapped_index < 0) throw std::runtime_error("native view has no matching camera MID");
+    }
     GError* error = nullptr;
     const auto decoder = detail::low_latency_decoder_stage(options_.decoder);
     auto description = std::string("rtph264depay name=depay wait-for-keyframe=true request-keyframe=true ! h264parse ! ") +
@@ -733,13 +803,17 @@ class Receiver {
 #endif
     auto track = std::make_shared<Track>();
     track->pad = GST_PAD_NAME(pad);
+    if (mapped_index >= 0) track->camera_id = options_.camera_ids[static_cast<std::size_t>(mapped_index)];
     track->arrivals = arrivals_;
     track->sink = gst_bin_get_by_name(GST_BIN(bin), "out");
     if (options_.display) {
       auto* display = gst_bin_get_by_name(GST_BIN(bin), "display");
       if (!options_.window_handles.empty()) {
-        const std::string name = GST_PAD_NAME(pad);
-        const int index = name.starts_with("src_") ? integer(name.substr(4), 0, 7) : -1;
+        int index = mapped_index;
+        if (options_.camera_ids.empty()) {
+          const std::string name = GST_PAD_NAME(pad);
+          index = name.starts_with("src_") ? integer(name.substr(4), 0, 7) : -1;
+        }
         if (index < 0 || static_cast<std::size_t>(index) >= options_.window_handles.size()) {
           gst_object_unref(display);
           throw std::runtime_error("native view has no matching media pad");
@@ -783,6 +857,8 @@ class Receiver {
   std::mutex mutex_;
   std::deque<Json> candidates_;
   std::vector<std::shared_ptr<Track>> tracks_;
+  std::map<std::string, std::size_t> camera_windows_;
+  std::unordered_set<std::size_t> used_camera_windows_;
   unsigned local_candidates_{};
   unsigned pair_changes_{};
   Json selected_pair_;

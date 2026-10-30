@@ -84,11 +84,12 @@ regressing PTS. A timestamp discontinuity requires a new track or session;
 this conservative filter is only a prerequisite and does not prove that a
 fresh camera image was displayed.
 
-The viewing prototype currently chooses a window from the numeric WebRTC pad
-name. A control-capable client must instead bind each critical camera to the
-negotiated MID and `media_tracks` identity, reject missing or ambiguous
-bindings, and retire the prior identity on renegotiation. Window position or
-track count alone cannot establish which critical camera is fresh.
+The viewing prototype binds each video section's negotiated MID and ordered
+`media_tracks` identity to the configured camera window, rejecting missing or
+ambiguous identities and duplicate bindings. Renegotiation still requires a
+new viewer session. A control-capable client must also validate this mapping
+across the actual vehicle, track replacement and recovery paths; window position
+or track count alone cannot establish which critical camera is fresh.
 
 For direct control, the native WebRTC DataChannel must also implement the
 existing scoped transport bridge, frame expiry, result and feedback handling,

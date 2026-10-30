@@ -244,6 +244,44 @@ bool pts_self_test() {
   return ok;
 }
 
+bool camera_mid_self_test() {
+  const std::string text = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+      "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:front-mid\r\n"
+      "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:data\r\n"
+      "m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:rear-mid\r\n";
+  GstSDPMessage* sdp = nullptr;
+  if (gst_sdp_message_new(&sdp) != GST_SDP_OK) return false;
+  if (gst_sdp_message_parse_buffer(reinterpret_cast<const guint8*>(text.data()),
+                                   static_cast<guint>(text.size()), sdp) != GST_SDP_OK) {
+    gst_sdp_message_free(sdp); return false;
+  }
+  const Json tracks = Json::array({{{"camera_id", "front"}}, {{"camera_id", "rear"}}});
+  bool ok = false;
+  try {
+    const auto mapping = camera_windows_by_mid(sdp, tracks, {"rear", "front"});
+    ok = mapping.at("front-mid") == 1 && mapping.at("rear-mid") == 0;
+    try { static_cast<void>(camera_windows_by_mid(sdp, tracks, {"front", "front"})); ok = false; }
+    catch (const std::runtime_error&) {}
+    try { static_cast<void>(camera_windows_by_mid(sdp, Json::array({{{"camera_id", "front"}}, {{"camera_id", "front"}}}), {"front", "rear"})); ok = false; }
+    catch (const std::runtime_error&) {}
+    try { static_cast<void>(camera_windows_by_mid(sdp, tracks, {"front", "missing"})); ok = false; }
+    catch (const std::runtime_error&) {}
+  } catch (...) { ok = false; }
+  gst_sdp_message_free(sdp);
+  auto duplicate_mid = text;
+  duplicate_mid.replace(duplicate_mid.find("rear-mid"), std::string("rear-mid").size(), "front-mid");
+  sdp = nullptr;
+  if (gst_sdp_message_new(&sdp) != GST_SDP_OK) return false;
+  if (gst_sdp_message_parse_buffer(reinterpret_cast<const guint8*>(duplicate_mid.data()),
+                                   static_cast<guint>(duplicate_mid.size()), sdp) != GST_SDP_OK) ok = false;
+  else {
+    try { static_cast<void>(camera_windows_by_mid(sdp, tracks, {"front", "rear"})); ok = false; }
+    catch (const std::runtime_error&) {}
+  }
+  gst_sdp_message_free(sdp);
+  return ok;
+}
+
 bool rtp_callback_lifetime_self_test() {
   auto track = std::make_shared<Track>();
   track->arrivals = std::make_shared<ArrivalTimes>();
@@ -328,10 +366,12 @@ int probe_main(int argc, char** argv, void*) {
     if (argc == 2 && std::string(argv[1]) == "--self-test") {
       gst_init(nullptr, nullptr);
       const bool pts_passed = pts_self_test();
+      const bool camera_mid_passed = camera_mid_self_test();
       const bool rtp_lifetime_passed = rtp_callback_lifetime_self_test();
       const bool wan_passed = wan_candidate_self_test();
-      bool passed = pts_passed && rtp_lifetime_passed && wan_passed;
+      bool passed = pts_passed && camera_mid_passed && rtp_lifetime_passed && wan_passed;
       std::cout << "decoder PTS admission: " << (pts_passed ? "PASS" : "FAIL") << '\n';
+      std::cout << "camera MID mapping: " << (camera_mid_passed ? "PASS" : "FAIL") << '\n';
       std::cout << "RTP callback lifetime: " << (rtp_lifetime_passed ? "PASS" : "FAIL") << '\n';
       std::cout << "WAN candidate filtering: " << (wan_passed ? "PASS" : "FAIL") << '\n';
 #ifdef __APPLE__
