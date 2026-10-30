@@ -1,6 +1,7 @@
 // In-process ICE fixture only: no signaling service, vehicle or control inputs.
 #include "mine_teleop/detail/native_control_channel.hpp"
 #include <agent.h>
+#include <gio/gnetworking.h>
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -85,6 +86,9 @@ struct Peer {
 }
 int main(int argc, char** argv) {
   gst_init(&argc, &argv);
+  // libnice parses numeric addresses through getaddrinfo; on Windows this
+  // must run after Winsock initialization even for 127.0.0.1.
+  g_networking_init();
   try {
     bool rejected_null = false;
     try { NativeControlChannel invalid(nullptr, {"fixture", 1, "attempt"}); }

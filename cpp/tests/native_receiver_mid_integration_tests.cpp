@@ -1,5 +1,6 @@
 // Synthetic two-camera WebRTC loopback: no device, signaling or vehicle control.
 #include "native_receiver_core.hpp"
+#include <gio/gnetworking.h>
 #include <set>
 
 using namespace mine_teleop::bench;
@@ -77,6 +78,7 @@ struct Sender {
 }
 int main(int argc, char** argv) {
   gst_init(&argc, &argv);
+  g_networking_init();
   try {
     for (const auto* name : {"videotestsrc", "x264enc", "h264parse", "rtph264pay", "webrtcbin", "avdec_h264"}) {
       auto* factory = gst_element_factory_find(name);
