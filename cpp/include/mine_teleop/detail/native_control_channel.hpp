@@ -6,19 +6,25 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace mine_teleop::detail {
 
 // Experimental courier only. It never authorizes control: the caller must
 // validate the selected SCTP route, input lease and video gate independently.
 class NativeControlChannel {
+  struct Candidate {
+    GstWebRTCDataChannel* channel{};
+    gulong open_handler{}, close_handler{}, error_handler{}, message_handler{};
+  };
   struct State {
     explicit State(NativeMediaScope value) : scope(std::move(value)), mailbox(scope) {}
     NativeMediaScope scope;
     NativeControlMailbox mailbox;
     std::mutex mutex;
-    GstWebRTCDataChannel* channel{};
-    gulong open_handler{}, close_handler{}, error_handler{}, message_handler{};
+    std::mutex send_mutex;
+    GstWebRTCDataChannel* channel{};  // non-owning; held by candidates
+    std::vector<Candidate> candidates;
     bool open{}, retired{};
   };
   using Owner = std::shared_ptr<State>;
@@ -29,6 +35,25 @@ class NativeControlChannel {
   static void prepared(GstElement*, GstWebRTCDataChannel* channel, gboolean local, gpointer data) {
     const auto state = *static_cast<Owner*>(data);
     if (local || !channel) return;
+    std::lock_guard lock(state->mutex);
+    if (state->retired) return;
+    if (state->candidates.size() >= 8) {
+      state->open = false;
+      state->mailbox.retire();
+      return;
+    }
+    // For a remote in-band channel, the prepare notification may precede
+    // reception of its label and protocol. Register now; validate at open.
+    Candidate candidate;
+    candidate.channel = GST_WEBRTC_DATA_CHANNEL(g_object_ref(channel));
+    candidate.open_handler = connect_owned(channel, "on-open", G_CALLBACK(opened), state);
+    candidate.close_handler = connect_owned(channel, "on-close", G_CALLBACK(closed), state);
+    candidate.error_handler = connect_owned(channel, "on-error", G_CALLBACK(error), state);
+    candidate.message_handler = connect_owned(channel, "on-message-string", G_CALLBACK(message), state);
+    state->candidates.push_back(candidate);
+  }
+  static void opened(GstWebRTCDataChannel* channel, gpointer data) {
+    const auto state = *static_cast<Owner*>(data);
     gchar *label = nullptr, *protocol = nullptr;
     gboolean ordered = TRUE;
     gint retransmits = -1;
@@ -37,28 +62,24 @@ class NativeControlChannel {
     const std::string label_value = label ? label : "", protocol_value = protocol ? protocol : "";
     g_free(label); g_free(protocol);
     std::lock_guard lock(state->mutex);
-    if (state->retired || !state->mailbox.attach(state->scope, label_value, protocol_value,
-                                                 ordered != FALSE, retransmits)) return;
-    state->channel = GST_WEBRTC_DATA_CHANNEL(g_object_ref(channel));
-    state->open_handler = connect_owned(channel, "on-open", G_CALLBACK(opened), state);
-    state->close_handler = connect_owned(channel, "on-close", G_CALLBACK(closed), state);
-    state->error_handler = connect_owned(channel, "on-error", G_CALLBACK(error), state);
-    state->message_handler = connect_owned(channel, "on-message-string", G_CALLBACK(message), state);
+    if (state->retired) return;
+    if (state->mailbox.attach(state->scope, label_value, protocol_value, ordered != FALSE, retransmits)) {
+      state->channel = channel;
+      state->open = true;
+    } else if (!state->mailbox.usable()) state->open = false;
   }
-  static void opened(GstWebRTCDataChannel*, gpointer data) {
+  static void closed(GstWebRTCDataChannel* channel, gpointer data) {
     const auto state = *static_cast<Owner*>(data);
     std::lock_guard lock(state->mutex);
-    if (!state->retired && state->mailbox.usable()) state->open = true;
-  }
-  static void closed(GstWebRTCDataChannel*, gpointer data) {
-    const auto state = *static_cast<Owner*>(data);
-    std::lock_guard lock(state->mutex);
+    if (state->channel != channel) return;
     state->open = false;
     state->mailbox.retire();
   }
-  static void error(GstWebRTCDataChannel*, GError*, gpointer data) { closed(nullptr, data); }
-  static void message(GstWebRTCDataChannel*, gchar* value, gpointer data) {
+  static void error(GstWebRTCDataChannel* channel, GError*, gpointer data) { closed(channel, data); }
+  static void message(GstWebRTCDataChannel* channel, gchar* value, gpointer data) {
     const auto state = *static_cast<Owner*>(data);
+    std::lock_guard lock(state->mutex);
+    if (state->retired || !state->open || state->channel != channel) return;
     if (value) {
       std::size_t length = 0;
       while (length <= 64 * 1024 && value[length]) ++length;
@@ -91,15 +112,21 @@ class NativeControlChannel {
   bool send(const std::string& payload) {
 #if GST_CHECK_VERSION(1, 22, 0)
     if (payload.empty() || payload.size() > 64 * 1024 || payload.find('\0') != std::string::npos) return false;
-    std::lock_guard lock(state_->mutex);
-    if (state_->retired || !state_->open || !state_->mailbox.usable() || !state_->channel) return false;
+    std::lock_guard send_lock(state_->send_mutex);
+    GstWebRTCDataChannel* channel = nullptr;
+    {
+      std::lock_guard lock(state_->mutex);
+      if (state_->retired || !state_->open || !state_->mailbox.usable() || !state_->channel) return false;
+      channel = GST_WEBRTC_DATA_CHANNEL(g_object_ref(state_->channel));
+    }
     GstWebRTCDataChannelState ready = GST_WEBRTC_DATA_CHANNEL_STATE_CLOSED;
     guint64 buffered = 0;
-    g_object_get(state_->channel, "ready-state", &ready, "buffered-amount", &buffered, nullptr);
-    if (ready != GST_WEBRTC_DATA_CHANNEL_STATE_OPEN || buffered != 0) return false;
+    g_object_get(channel, "ready-state", &ready, "buffered-amount", &buffered, nullptr);
+    if (ready != GST_WEBRTC_DATA_CHANNEL_STATE_OPEN || buffered != 0) { g_object_unref(channel); return false; }
     GError* error = nullptr;
-    const bool ok = gst_webrtc_data_channel_send_string_full(state_->channel, payload.c_str(), &error) != FALSE;
+    const bool ok = gst_webrtc_data_channel_send_string_full(channel, payload.c_str(), &error) != FALSE;
     g_clear_error(&error);
+    g_object_unref(channel);
     return ok;
 #else
     (void)payload;
@@ -108,27 +135,26 @@ class NativeControlChannel {
   }
 
   void retire() {
-    GstWebRTCDataChannel* channel = nullptr;
-    gulong handlers[4]{};
+    std::lock_guard send_lock(state_->send_mutex);
+    std::vector<Candidate> candidates;
     {
       std::lock_guard lock(state_->mutex);
       if (state_->retired) return;
       state_->retired = true;
       state_->open = false;
       state_->mailbox.retire();
-      channel = state_->channel;
+      candidates.swap(state_->candidates);
       state_->channel = nullptr;
-      handlers[0] = state_->open_handler; handlers[1] = state_->close_handler;
-      handlers[2] = state_->error_handler; handlers[3] = state_->message_handler;
     }
     if (peer_) {
       g_signal_handler_disconnect(peer_, peer_handler_);
       gst_object_unref(peer_); peer_ = nullptr;
     }
-    if (channel) {
-      for (const auto handler : handlers) if (handler) g_signal_handler_disconnect(channel, handler);
-      gst_webrtc_data_channel_close(channel);
-      g_object_unref(channel);
+    for (const auto& candidate : candidates) {
+      for (const auto handler : {candidate.open_handler, candidate.close_handler,
+                                 candidate.error_handler, candidate.message_handler})
+        if (handler) g_signal_handler_disconnect(candidate.channel, handler);
+      g_object_unref(candidate.channel);
     }
   }
 

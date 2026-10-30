@@ -18,6 +18,7 @@ struct Peer {
   GstElement* rtc = gst_element_factory_make("webrtcbin", nullptr);
   NiceAgent* agent{};
   GstWebRTCDataChannel* channel{};
+  GstWebRTCDataChannel* decoy{};
   std::mutex mutex;
   std::vector<std::pair<guint, std::string>> candidates;
   std::atomic<bool> open{false}, received{false};
@@ -41,11 +42,14 @@ struct Peer {
   ~Peer() {
     gst_element_set_state(pipeline, GST_STATE_NULL);
     if (channel) g_object_unref(channel);
+    if (decoy) g_object_unref(decoy);
     if (agent) g_object_unref(agent);
     gst_object_unref(pipeline);
   }
   void start(bool initiator) {
     if (initiator) {
+      g_signal_emit_by_name(rtc, "create-data-channel", "unrelated", nullptr, &decoy);
+      require(decoy != nullptr, "decoy channel unavailable");
       auto* options = gst_structure_new("control", "ordered", G_TYPE_BOOLEAN, FALSE, "max-retransmits", G_TYPE_INT, 0,
                                         "protocol", G_TYPE_STRING, "mine-teleop-control-v1", nullptr);
       g_signal_emit_by_name(rtc, "create-data-channel", "control", options, &channel); gst_structure_free(options);
@@ -96,7 +100,22 @@ int main(int argc, char** argv) {
       if (delivered && courier.ready() && !responded) responded = courier.send("response");
       std::this_thread::sleep_for(10ms);
     }
+    if (!delivered || !a.received)
+      std::cerr << "loopback state: initiator_open=" << a.open << " courier_ready=" << courier.ready()
+                << " request_sent=" << sent << " request_received=" << delivered
+                << " response_queued=" << responded << " response_received=" << a.received << '\n';
     require(delivered && a.received, "bidirectional DataChannel delivery failed");
+    auto* duplicate_options = gst_structure_new("control", "ordered", G_TYPE_BOOLEAN, FALSE,
+        "max-retransmits", G_TYPE_INT, 0, "protocol", G_TYPE_STRING, "mine-teleop-control-v1", nullptr);
+    GstWebRTCDataChannel* duplicate = nullptr;
+    g_signal_emit_by_name(a.rtc, "create-data-channel", "control", duplicate_options, &duplicate);
+    gst_structure_free(duplicate_options);
+    require(duplicate != nullptr, "duplicate channel unavailable");
+    const auto duplicate_deadline = std::chrono::steady_clock::now() + 5s;
+    while (courier.ready() && std::chrono::steady_clock::now() < duplicate_deadline)
+      std::this_thread::sleep_for(10ms);
+    require(!courier.ready() && !courier.send("after-duplicate"), "duplicate channel did not fail closed");
+    g_object_unref(duplicate);
     courier.retire();
     require(!courier.ready() && !courier.send("after-retire") && !courier.pop(), "retired channel still usable");
     std::cout << "PASS scoped DataChannel loopback delivery and retirement\n";
