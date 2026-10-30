@@ -7,6 +7,8 @@ on:
       - 'cpp/tests/native_receiver_core.hpp'
       - 'cpp/tests/native_receiver_probe.cpp'
       - 'cpp/tests/native_receiver_containment.test.py'
+      - 'cpp/apps/windows_native_viewer.cpp'
+      - 'cpp/tests/windows_native_viewer_containment.test.py'
       - '.github/workflows/windows-native-receiver-bench.yml'
   workflow_dispatch:
 
@@ -79,15 +81,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'GStreamer or libnice development metadata missing' }
           cmake -S . -B build/windows-control-x64 -DMINE_TELEOP_BUILD_BENCH_PROBES=ON -DMINE_TELEOP_BUILD_WINDOWS_NATIVE_RECEIVER=ON "-DPKG_CONFIG_EXECUTABLE=$pkg"
           if ($LASTEXITCODE -ne 0) { throw 'native probe configure failed' }
-          cmake --build build/windows-control-x64 --config Release --target mine-teleop-native-receiver-probe --parallel 3
+          cmake --build build/windows-control-x64 --config Release --target mine-teleop-native-receiver-probe mine-teleop-windows-viewer --parallel 3
           if ($LASTEXITCODE -ne 0) { throw 'native probe build failed' }
           $exe = Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-native-receiver-probe.exe'
           & $exe --self-test
           if ($LASTEXITCODE -ne 0) { throw 'native probe self-test failed' }
           python cpp/tests/native_receiver_containment.test.py $exe configs/vehicle-agent.orin-cpu-bench.yaml
           if ($LASTEXITCODE -ne 0) { throw 'native probe containment test failed' }
+          $viewer = Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-windows-viewer.exe'
+          python cpp/tests/windows_native_viewer_containment.test.py $viewer configs/vehicle-agent.orin-cpu-bench.yaml
+          if ($LASTEXITCODE -ne 0) { throw 'native viewer containment test failed' }
           New-Item -ItemType Directory -Path receiver-artifact | Out-Null
           Copy-Item $exe receiver-artifact/
+          Copy-Item $viewer receiver-artifact/
           Get-FileHash $exe -Algorithm SHA256 | Format-List | Out-File receiver-artifact/sha256.txt
           git rev-parse HEAD | Out-File receiver-artifact/source-commit.txt -Encoding ascii
       - uses: actions/upload-artifact@v7
