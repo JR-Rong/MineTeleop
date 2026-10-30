@@ -121,6 +121,13 @@ int main(int argc, char** argv) {
                 << " request_sent=" << sent << " request_received=" << delivered
                 << " response_queued=" << responded << " response_received=" << a.received << '\n';
     require(delivered && a.received, "bidirectional DataChannel delivery failed");
+#if GST_CHECK_VERSION(1, 22, 0)
+    const auto send_stats = courier.send_stats();
+    require(send_stats.queued >= 1 && send_stats.unavailable >= 1 &&
+            send_stats.attempted == send_stats.queued + send_stats.buffered +
+                send_stats.unavailable + send_stats.errors,
+            "channel send diagnostics do not account for queued and rejected attempts");
+#endif
 #if GST_CHECK_VERSION(1, 28, 0)
     const auto route_deadline = std::chrono::steady_clock::now() + 3s;
     while (!courier.direct_udp() && std::chrono::steady_clock::now() < route_deadline) std::this_thread::sleep_for(10ms);

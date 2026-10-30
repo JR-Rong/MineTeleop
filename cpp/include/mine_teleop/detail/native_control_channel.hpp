@@ -4,6 +4,7 @@
 #define GST_USE_UNSTABLE_API
 #include <gst/webrtc/webrtc.h>
 #include <gio/gio.h>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -95,6 +96,13 @@ class NativeControlChannel {
   }
 
  public:
+  struct SendStats {
+    std::uint64_t attempted, queued, buffered, unavailable, errors;
+  };
+  [[nodiscard]] SendStats send_stats() const {
+    return {send_attempted_.load(), send_queued_.load(), send_buffered_.load(),
+            send_unavailable_.load(), send_errors_.load()};
+  }
   NativeControlChannel(GstElement* peer, NativeMediaScope scope)
       : state_(std::make_shared<State>(std::move(scope))) {
     if (!peer || !GST_IS_ELEMENT(peer)) throw std::invalid_argument("invalid WebRTC peer");
@@ -171,20 +179,26 @@ class NativeControlChannel {
   // A successful return means queued locally, not delivered or authenticated.
   bool send(const std::string& payload) {
 #if GST_CHECK_VERSION(1, 22, 0)
-    if (payload.empty() || payload.size() > 64 * 1024 || payload.find('\0') != std::string::npos) return false;
+    ++send_attempted_;
+    if (payload.empty() || payload.size() > 64 * 1024 || payload.find('\0') != std::string::npos) { ++send_errors_; return false; }
     std::lock_guard send_lock(state_->send_mutex);
     GstWebRTCDataChannel* channel = nullptr;
     {
       std::lock_guard lock(state_->mutex);
-      if (state_->retired || !state_->open || !state_->mailbox.usable() || !state_->channel) return false;
+      if (state_->retired || !state_->open || !state_->mailbox.usable() || !state_->channel) { ++send_unavailable_; return false; }
       channel = GST_WEBRTC_DATA_CHANNEL(g_object_ref(state_->channel));
     }
     GstWebRTCDataChannelState ready = GST_WEBRTC_DATA_CHANNEL_STATE_CLOSED;
     guint64 buffered = 0;
     g_object_get(channel, "ready-state", &ready, "buffered-amount", &buffered, nullptr);
-    if (ready != GST_WEBRTC_DATA_CHANNEL_STATE_OPEN || buffered != 0) { g_object_unref(channel); return false; }
+    if (ready != GST_WEBRTC_DATA_CHANNEL_STATE_OPEN || buffered != 0) {
+      if (ready != GST_WEBRTC_DATA_CHANNEL_STATE_OPEN) ++send_unavailable_;
+      else ++send_buffered_;
+      g_object_unref(channel); return false;
+    }
     GError* error = nullptr;
     const bool ok = gst_webrtc_data_channel_send_string_full(channel, payload.c_str(), &error) != FALSE;
+    if (ok) ++send_queued_; else ++send_errors_;
     g_clear_error(&error);
     g_object_unref(channel);
     return ok;
@@ -220,6 +234,7 @@ class NativeControlChannel {
 
  private:
   Owner state_;
+  std::atomic<std::uint64_t> send_attempted_{0}, send_queued_{0}, send_buffered_{0}, send_unavailable_{0}, send_errors_{0};
   GstElement* peer_{};
   gulong peer_handler_{};
 };
