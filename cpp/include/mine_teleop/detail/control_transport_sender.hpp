@@ -67,7 +67,11 @@ class ControlTransportSender {
         (!dc_is_p2p_ && !wss_.healthy(now) && !unhealthy_wss) ||
         (trial_attempt_ == attempt && (failed_trials_ >= kMaxTrialsPerAttempt ||
             now < next_trial_ms_ || (!dc_is_p2p_ && !unhealthy_wss)))) return false;
-    if (trial_attempt_ != attempt) failed_trials_ = 0;
+    if (trial_attempt_ != attempt) {
+      failed_trials_ = 0;
+      profile_blocked_dc_ = false;
+      profile_recovery_retry_used_ = false;
+    }
     trial_attempt_ = attempt;
     begin(ControlPath::DataChannel, std::string(attempt), now, timeout_ms);
     return true;
@@ -132,6 +136,20 @@ class ControlTransportSender {
     if (current && sent.path == ControlPath::Wss) { last_wss_result_ms_ = now; last_wss_result_age_ms_ = age; }
     if (current && sent.path == ControlPath::DataChannel && result.at("transport_admitted").get<bool>())
       last_dc_result_ms_ = now;
+    // A DC trial can happen before the operator has confirmed the required
+    // session profile. If that is the reason it was rejected, one later
+    // authenticated, fresh neutral WSS acceptance permits one new bounded
+    // trial budget. It does not bypass backoff, epoch fencing or DC health.
+    if (current && sent.path == ControlPath::DataChannel && !result.at("accepted").get<bool>() &&
+        result.value("reason", "") == "session_profile_not_ready") profile_blocked_dc_ = true;
+    if (current && sent.path == ControlPath::Wss && sent.neutral && !sent.estop &&
+        result.at("accepted").get<bool>() && result.at("transport_admitted").get<bool>() &&
+        age <= NativeControlAckRecovery::kFreshAckMs &&
+        profile_blocked_dc_ && !profile_recovery_retry_used_) {
+      failed_trials_ = 0;
+      profile_blocked_dc_ = false;
+      profile_recovery_retry_used_ = true;
+    }
     if (current && !sent.estop && (!result.at("accepted").get<bool>() || age > NativeControlAckRecovery::kFreshAckMs))
       (sent.path == ControlPath::Wss ? wss_ : dc_).reset();
     if (current && result.at("accepted").get<bool>() && !sent.estop && age <= NativeControlAckRecovery::kFreshAckMs) {
@@ -160,6 +178,7 @@ class ControlTransportSender {
  private:
   static constexpr unsigned kMaxTrialsPerAttempt = 3;
   unsigned failed_trials_{0};
+  bool profile_blocked_dc_{false}, profile_recovery_retry_used_{false};
   struct Health {
     std::array<std::int64_t, NativeControlAckRecovery::kConsecutiveAnomalies> ages{};
     std::size_t count{0}, index{0}; std::int64_t progress{0};

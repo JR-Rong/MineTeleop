@@ -185,6 +185,46 @@ void failed_direct_trials_back_off_and_exhaust_per_attempt() {
       "new media attempt did not start a bounded neutral trial");
 }
 
+void confirmed_profile_permits_only_one_new_bounded_dc_budget() {
+  ControlTransportSender sender; sender.set_data_channel_is_p2p(true);
+  std::int64_t now = 0;
+  std::uint64_t seq = 1;
+  for (int failure = 1; failure <= 3; ++failure) {
+    expect(sender.consider_dc("media-a", now, 5000), "profile-blocked DC trial missing");
+    auto frame = payload(seq++, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, now);
+    auto rejected = response(frame, false, true); rejected["reason"] = "session_profile_not_ready";
+    expect(sender.note_result(rejected, now + 1, 5000).matched, "profile rejection was not matched");
+    expect(sender.observe(false, "media-a", now + 2, 5000), "profile-blocked DC did not fall back");
+    frame = payload(seq++, now + 3); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now + 3);
+    auto unavailable = response(frame, false, true); unavailable["reason"] = "session_profile_not_ready";
+    expect(sender.note_result(unavailable, now + 4, 5000).matched, "WSS fallback was not selected");
+    now += 2 + 5000 * (1 << (failure - 1));
+  }
+  expect(!sender.consider_dc("media-a", now + 1, 5000), "unconfirmed profile reset the budget");
+  auto moving = payload(seq++, now + 2); moving["throttle"] = 0.5;
+  sender.decorate(moving); sender.note_sent(moving, ControlPath::Wss, now + 2);
+  sender.note_result(response(moving, true, false), now + 3, 5000);
+  expect(!sender.consider_dc("media-a", now + 4, 5000), "moving acceptance reset the budget");
+  auto stale = payload(seq++, now + 5); sender.decorate(stale); sender.note_sent(stale, ControlPath::Wss, now + 5);
+  sender.note_result(response(stale, true, false), now + 1005, 5000);
+  expect(!sender.consider_dc("media-a", now + 1006, 5000), "stale acceptance reset the budget");
+  auto neutral = payload(seq++, now + 1007); sender.decorate(neutral); sender.note_sent(neutral, ControlPath::Wss, now + 1007);
+  expect(sender.note_result(response(neutral, true, false), now + 1008, 5000).matched, "fresh WSS acceptance missing");
+  expect(sender.consider_dc("media-a", now + 1009, 5000) && sender.holding_motion(), "confirmed profile did not permit a bounded retry");
+  now += 1009;
+  for (int failure = 1; failure <= 3; ++failure) {
+    if (failure > 1) expect(sender.consider_dc("media-a", now, 5000), "second bounded budget ended early");
+    auto frame = payload(seq++, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, now);
+    auto rejected = response(frame, false, true); rejected["reason"] = "session_profile_not_ready";
+    sender.note_result(rejected, now + 1, 5000);
+    sender.observe(false, "media-a", now + 2, 5000);
+    frame = payload(seq++, now + 3); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now + 3);
+    sender.note_result(response(frame, true, true), now + 4, 5000);
+    now += 2 + 5000 * (1 << (failure - 1));
+  }
+  expect(!sender.consider_dc("media-a", now + 600000, 5000), "profile retry became unbounded");
+}
+
 void signatures_bind_native_bytes_and_vehicle_results() {
   const std::string key = "01234567890123456789012345678901"; // Public test vector, never a deployed key.
   expect(control_transport_mac("abc", key) == "d5c75dc69d8243aa0882a04342d9ff7c73537a0311a7950800607be225594009", "SHA256 MAC disagrees with independent test vector");
@@ -291,8 +331,9 @@ int main() {
   try {
     publication_is_owned_only_by_its_current_dc_epoch();
     failed_direct_trials_back_off_and_exhaust_per_attempt();
+    confirmed_profile_permits_only_one_new_bounded_dc_budget();
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "12 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "13 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
