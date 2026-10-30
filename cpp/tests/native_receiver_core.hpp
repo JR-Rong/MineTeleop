@@ -284,7 +284,7 @@ inline void validate(const VehicleConfig& config) {
   }
 }
 
-// Isolated neutral-control experiment only. The local config is necessary
+// Isolated zero-speed mock-control experiment only. The local config is necessary
 // but is not remote mock/CAN containment evidence.
 inline void validate_mock_control(const VehicleConfig& config) {
   if (!config.runtime.control_enabled || !config.vehicle_id.starts_with("test_bench_") ||

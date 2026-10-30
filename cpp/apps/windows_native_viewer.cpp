@@ -1,8 +1,9 @@
-// Windows bench viewer: native video with an explicitly isolated neutral mock mode.
+// Windows bench viewer: native video with an explicitly isolated mock mode.
 #include "native_receiver_core.hpp"
 #include "mine_teleop/detail/native_video_health.hpp"
 #include "mine_teleop/detail/native_mock_media_gate.hpp"
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
+#include "mine_teleop/detail/native_mock_keyboard.hpp"
 #include "mine_teleop/detail/native_control_courier.hpp"
 #include "mine_teleop/detail/native_viewer_observation.hpp"
 #include <gst/video/video.h>
@@ -131,6 +132,7 @@ struct Window {
   std::jthread worker;
   std::atomic<bool> running{false};
   std::atomic<std::int64_t> last_observation_ms{0};
+  detail::NativeMockKeyboard keyboard;
   bool mock_control{false};
   std::string mock_local_ip, mock_peer_ip, mock_ip_family;
 
@@ -147,8 +149,8 @@ struct Window {
     PostMessageW(hwnd, WM_APP + 1, 0, 0);
   }
 
-  // Isolated bench mode deliberately sends only neutral mock input. It cannot
-  // command motion and must not be used as a production driving interface.
+  // Isolated bench mode is constrained to a mock adapter and zero speed. It
+  // must not be used as a production driving interface.
   void run_mock_control(DriverConsoleRuntime& driver, Receiver& receiver,
                         const VehicleConfig& vehicle, const DriverConfig& config,
                         const Json& session, const std::string& attempt,
@@ -174,8 +176,8 @@ struct Window {
     if (!channel || !render->health) throw std::runtime_error("mock control requires scoped channel and critical video");
     // The input lease must not wait for signaling or the transport bridge.
     // The sender independently checks its current clock before publication.
-    std::atomic<bool> input_failed{false}, cached_clock_ok{false};
-    std::atomic<std::int64_t> clock_observed_ms{0};
+    std::atomic<bool> input_failed{false}, cached_clock_ok{false}, input_authorized{false};
+    std::atomic<std::int64_t> clock_observed_ms{0}, input_authorized_at_ms{0};
     std::jthread input_worker([&](std::stop_token input_stop) {
       try {
         detail::NativeMockInputSequence input_sequence;
@@ -187,13 +189,19 @@ struct Window {
           const auto video_health = render->health->snapshot_now();
           const bool focused = IsWindowVisible(hwnd) && !IsIconic(hwnd) && GetForegroundWindow() == hwnd;
           if (!focused) for (const auto& id : render->cameras) static_cast<void>(render->health->set_usable(id, 1, false));
-          const bool ready = focused && clock_ok && gate->ready(now_ms) && video_health.ready &&
+          const bool ui_alive = focused && keyboard.heartbeat_alive(now_ms);
+          const bool ready = ui_alive && clock_ok && gate->ready(now_ms) && video_health.ready &&
               channel->direct_udp(mock_local_ip, mock_peer_ip);
+          const auto authorized_at = input_authorized_at_ms.load();
+          const bool authorized = input_authorized.load() && authorized_at > 0 && now_ms >= authorized_at &&
+              now_ms - authorized_at < 200;
+          const auto keyboard_input = keyboard.sample(ready && authorized, now_ms);
           const auto current_epoch = epoch.load();
-          if ((ready || current_epoch != 0) && (focused || !withdrawn)) {
+          if ((ready || current_epoch != 0) && (ui_alive || !withdrawn)) {
             Json input{{"session_id", session_id}, {"session_generation", generation},
                 {"ui_instance_id", owner}, {"ui_control_epoch", current_epoch}, {"takeover", current_epoch == 0},
-                {"gear", "N"}, {"steering", 0.0}, {"throttle", 0.0}, {"brake", 0.0},
+                {"gear", "N"}, {"steering", keyboard_input.steering},
+                {"throttle", keyboard_input.throttle}, {"brake", keyboard_input.brake},
                 {"estop", false}, {"critical_video_ready", ready},
                 {"critical_video_sample_healthy", ready && video_health.sample_healthy},
                 {"critical_video_bad_sample_revision", video_health.bad_revision},
@@ -202,9 +210,9 @@ struct Window {
             const auto result = driver.update_control_intent(input);
             if (!result.value("accepted", false)) throw std::runtime_error("mock input rejected");
             epoch.store(result.at("ui_control_epoch").get<std::uint64_t>());
-            withdrawn = !focused;
+            withdrawn = !ui_alive;
           }
-          if (focused) withdrawn = false;
+          if (ui_alive) withdrawn = false;
           std::this_thread::sleep_for(60ms);
         }
       } catch (const std::exception& error) {
@@ -250,7 +258,9 @@ struct Window {
             {"control_recovery_cause", value.at("control_timing").value("control_recovery_cause", "")},
             {"last_valid_command_seq", value.at("control_timing").value("last_valid_command_seq", std::uint64_t{0})},
             {"stop_sequence", value.value("stop_sequence", std::uint64_t{0})},
-            {"speed_mps", value.value("speed_mps", 0.0)}};
+            {"gear", value.value("gear", "")},
+            {"speed_mps", value.contains("speed_mps") && value.at("speed_mps").is_number()
+                ? value.at("speed_mps") : Json(nullptr)}};
       }
     };
     while (!stop.stop_requested() && !parent.stop_requested()) {
@@ -310,6 +320,14 @@ struct Window {
           handshake_sent = true;
         }
       }
+      const bool authorized = ready && profile_accepted && handshake_sent && telemetry_at_ms > 0 &&
+          now_ms >= telemetry_at_ms && now_ms - telemetry_at_ms < 200 && telemetry.is_object() &&
+          telemetry.value("safety_state", "") == "CONTROL_ACTIVE" &&
+          !telemetry.value("braking_wait", true) && telemetry.value("gear", "") == "N" &&
+          telemetry.contains("speed_mps") && telemetry.at("speed_mps").is_number() &&
+          telemetry.at("speed_mps").get<double>() == 0.0;
+      input_authorized_at_ms.store(authorized ? now_ms : 0);
+      input_authorized.store(authorized);
       if (now >= next_evidence) {
         const auto native = status.at("native_control");
         const auto transport = native.at("control_transport");
@@ -347,6 +365,8 @@ struct Window {
       }
       std::this_thread::sleep_for(10ms);
     }
+    input_authorized.store(false);
+    keyboard.withdraw();
     input_worker.request_stop();
     if (input_worker.joinable()) input_worker.join();
     if (courier) courier->retire();
@@ -521,7 +541,7 @@ struct Window {
                 }
               }
               report((advancing ? L"渲染提交持续更新 · " : L"等待新画面或画面停滞 · ") + path +
-                  (mock_control ? L" · 隔离 mock，零输入" : L" · 仅观看，控制禁用"));
+                  (mock_control ? L" · 隔离 mock，零速" : L" · 仅观看，控制禁用"));
               next_observation = Clock::now() + 1s;
             }
           }
@@ -567,6 +587,7 @@ HWND control(HWND parent, const wchar_t* type, const wchar_t* caption, DWORD sty
 
 LRESULT CALLBACK panel_procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
   auto* app = reinterpret_cast<Window*>(GetWindowLongPtrW(GetParent(hwnd), GWLP_USERDATA));
+  if (msg == WM_LBUTTONDOWN && app && app->mock_control) { SetFocus(app->hwnd); return 0; }
   if (msg == WM_ERASEBKGND) return 1;
   if (msg == WM_PAINT && app) {
     std::shared_ptr<RenderSession> render;
@@ -598,14 +619,17 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       app->password = control(hwnd, L"EDIT", L"", WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL, 102, 74, 230, 24);
       app->start = control(hwnd, L"BUTTON", L"连接视频", BS_PUSHBUTTON, 345, 73, 88, 26, 1);
       app->stop = control(hwnd, L"BUTTON", L"断开", BS_PUSHBUTTON, 444, 73, 88, 26, 2);
+      if (app->mock_control)
+        control(hwnd, L"STATIC", L"仅 mock：W/↑ 油门 · A/D 转向 · S/空格 制动", 0, 545, 78, 390, 22);
       EnableWindow(app->stop, FALSE);
       app->status = control(hwnd, L"STATIC", app->message.c_str(), 0, 12, 108, 900, 25);
       app->video[0] = control(hwnd, L"MineTeleopNativePanel", L"", 0, 12, 140, 460, 300, 10);
       app->video[1] = control(hwnd, L"MineTeleopNativePanel", L"", 0, 480, 140, 460, 300, 11);
       SetTimer(hwnd, 1, 1000, nullptr);
+      if (app->mock_control) SetTimer(hwnd, 2, 50, nullptr);
       return 0;
     case WM_SIZE: {
-      if (wparam == SIZE_MINIMIZED) app->suspend_render_health();
+      if (wparam == SIZE_MINIMIZED) { app->keyboard.withdraw(); app->suspend_render_health(); }
       const int width = LOWORD(lparam), height = HIWORD(lparam);
       const int panel_width = std::max(1, (width - 36) / 2), panel_height = std::max(1, height - 152);
       MoveWindow(app->video[0], 12, 140, panel_width, panel_height, TRUE);
@@ -613,7 +637,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       return 0;
     }
     case WM_ACTIVATE:
-      if (LOWORD(wparam) == WA_INACTIVE) app->suspend_render_health();
+      if (LOWORD(wparam) == WA_INACTIVE) { app->keyboard.withdraw(); app->suspend_render_health(); }
       else for (const auto panel : app->video) InvalidateRect(panel, nullptr, FALSE);
       return 0;
     case WM_COMMAND:
@@ -631,8 +655,10 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                                       encoded = std::move(encoded)](std::stop_token token) mutable {
             app->connect(std::move(driver), std::move(vehicle), std::move(encoded), token);
           });
+          if (app->mock_control) SetFocus(hwnd);
         } catch (...) { app->running = false; app->report(L"请输入有效的配置路径和密码。"); }
       } else if (LOWORD(wparam) == 2 && app->worker.joinable()) {
+        app->keyboard.withdraw();
         app->worker.request_stop(); app->report(L"正在断开视频会话……");
       }
       return 0;
@@ -644,12 +670,24 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       return 0;
     }
     case WM_TIMER:
+      if (wparam == 2 && app->mock_control) {
+        const auto focus = GetFocus();
+        const bool focused = app->running.load() && IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
+            GetForegroundWindow() == hwnd && (focus == hwnd || focus == app->video[0] || focus == app->video[1]);
+        const auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
+        app->keyboard.observe(focused,
+            {down('W') || down(VK_UP), down('A') || down(VK_LEFT), down('D') || down(VK_RIGHT),
+             down('S') || down(VK_DOWN) || down(VK_SPACE)}, static_cast<std::int64_t>(bench_now_ms()));
+        return 0;
+      }
       if (wparam == 1 && app->running.load() && detail::viewer_observation_stale(
           static_cast<std::int64_t>(bench_now_ms()), app->last_observation_ms.load()))
         SetWindowTextW(app->status, L"状态采样中断，画面可能停滞；仅观看，控制禁用。");
       return 0;
     case WM_CLOSE:
       KillTimer(hwnd, 1);
+      KillTimer(hwnd, 2);
+      app->keyboard.withdraw();
       if (app->worker.joinable()) { app->worker.request_stop(); app->worker.join(); }
       DestroyWindow(hwnd);
       return 0;
@@ -720,7 +758,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   klass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
   if (!RegisterClassW(&klass)) return 1;
   const auto hwnd = CreateWindowExW(0, klass.lpszClassName,
-      mock_control ? L"MineTeleop Windows 隔离 Mock 控制（零输入）" : L"MineTeleop Windows 台架视频（仅观看）",
+      mock_control ? L"MineTeleop Windows 隔离 Mock 控制（零速）" : L"MineTeleop Windows 台架视频（仅观看）",
       WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 980, 530, nullptr, nullptr, instance, &app);
   if (!hwnd) return 1;
   ShowWindow(hwnd, show); UpdateWindow(hwnd);

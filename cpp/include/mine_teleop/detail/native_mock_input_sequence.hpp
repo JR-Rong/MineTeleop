@@ -9,7 +9,7 @@
 namespace mine_teleop::detail {
 
 // Only a changed input or safety/scope field advances the sequence. Identical
-// neutral heartbeats renew the real lease without retiring an in-flight send.
+// heartbeats renew the real lease without retiring an in-flight send.
 class NativeMockInputSequence {
  public:
   std::uint64_t next(const nlohmann::json& input_without_sequence) {

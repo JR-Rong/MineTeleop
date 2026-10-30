@@ -225,7 +225,8 @@ int run(const Arguments& arguments, const char* executable) {
   mine_teleop::SimpleHttpServer server(
       host,
       port_option(arguments),
-      [app](const auto& request) { return app->handle(request); });
+      [app](const auto& request) { return app->handle(request); },
+      8 * 1024 * 1024, {}, mine_teleop::HttpConnectionPolicy::BoundedKeepAlive);
 
   try {
     server.start();

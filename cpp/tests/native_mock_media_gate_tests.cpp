@@ -1,5 +1,6 @@
 #include "mine_teleop/detail/native_mock_media_gate.hpp"
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
+#include "mine_teleop/detail/native_mock_keyboard.hpp"
 #include <iostream>
 #include <stdexcept>
 using mine_teleop::detail::NativeMockMediaGate;
@@ -49,6 +50,36 @@ void test_neutral_refresh_sequence() {
   input["ui_control_epoch"] = 2;
   require(sequence.next(input) == 5, "owner epoch change did not advance sequence");
 }
+void test_mock_keyboard_rearms_only_after_release() {
+  mine_teleop::detail::NativeMockKeyboard keyboard;
+  using Keys = mine_teleop::detail::NativeMockKeyboard::Keys;
+  keyboard.observe(true, Keys{}, 100);
+  require(keyboard.heartbeat_alive(101), "foreground UI heartbeat not recorded");
+  require(keyboard.sample(true, 101).throttle == 0.0, "initial neutral did not arm");
+  keyboard.observe(true, Keys{true, true, false, false}, 110);
+  auto input = keyboard.sample(true, 111);
+  require(input.throttle == .25 && input.steering == -.25 && input.brake == 0.0,
+          "foreground mock keys were not mapped");
+  require(keyboard.sample(false, 112).throttle == 0.0, "safety loss did not neutralize input");
+  require(keyboard.sample(true, 113).throttle == 0.0, "held key resumed after safety recovery");
+  keyboard.observe(true, Keys{}, 120);
+  static_cast<void>(keyboard.sample(true, 121));
+  keyboard.observe(true, Keys{true, true, true, true}, 130);
+  input = keyboard.sample(true, 131);
+  require(input.throttle == 0.0 && input.steering == 0.0 && input.brake == .3,
+          "brake priority or opposing steering handling failed");
+  require(keyboard.sample(true, 280).brake == 0.0, "stale UI heartbeat retained input");
+  require(!keyboard.heartbeat_alive(280), "stale UI heartbeat retained lease eligibility");
+  keyboard.observe(true, Keys{true, false, false, false}, 281);
+  require(keyboard.sample(true, 282).throttle == 0.0, "stale heartbeat resumed a held key");
+  keyboard.withdraw();
+  keyboard.observe(true, Keys{true, false, false, false}, 290);
+  require(keyboard.sample(true, 291).throttle == 0.0, "focus recovery resumed a held key");
+  keyboard.observe(true, Keys{}, 300); static_cast<void>(keyboard.sample(true, 301));
+  keyboard.observe(true, Keys{true, false, false, false}, 310);
+  require(keyboard.sample(true, 311).throttle == .25, "released key could not be freshly pressed");
 }
-int main() { try { test_gate(); test_neutral_refresh_sequence(); std::cout << "PASS scoped mock media, input renewal and clock guard\n"; return 0; }
+}
+int main() { try { test_gate(); test_neutral_refresh_sequence(); test_mock_keyboard_rearms_only_after_release();
+  std::cout << "PASS scoped mock media, input renewal, keyboard and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }

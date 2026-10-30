@@ -184,7 +184,7 @@ else()
 endif()
 if(WIN32)
   target_compile_definitions(mine_teleop_runtime PUBLIC _WIN32_WINNT=0x0601)
-  target_link_libraries(mine_teleop_runtime PUBLIC ws2_32 shell32)
+  target_link_libraries(mine_teleop_runtime PUBLIC ws2_32 shell32 winmm)
 endif()
 mine_teleop_enable_warnings(mine_teleop_runtime)
 

@@ -38,6 +38,7 @@ class ControllerLogExport;
 struct HttpRequest {
   std::string method;
   std::string target;
+  std::string http_version;
   std::string peer_address;
   std::string path;
   std::unordered_map<std::string, std::string> query;
@@ -61,6 +62,8 @@ struct ServerResponse {
   static ServerResponse text(int status, std::string body, std::string content_type = "text/plain; charset=utf-8");
 };
 
+enum class HttpConnectionPolicy { Close, BoundedKeepAlive };
+
 class SimpleHttpServer {
  public:
   using Handler = std::function<ServerResponse(const HttpRequest&)>;
@@ -71,7 +74,8 @@ class SimpleHttpServer {
       std::uint16_t port,
       Handler handler,
       std::size_t max_body_bytes = 8 * 1024 * 1024,
-      WebSocketHandler websocket_handler = {});
+      WebSocketHandler websocket_handler = {},
+      HttpConnectionPolicy connection_policy = HttpConnectionPolicy::Close);
   ~SimpleHttpServer();
 
   SimpleHttpServer(const SimpleHttpServer&) = delete;
@@ -91,6 +95,7 @@ class SimpleHttpServer {
   Handler handler_;
   std::size_t max_body_bytes_;
   WebSocketHandler websocket_handler_;
+  HttpConnectionPolicy connection_policy_;
   std::atomic<bool> stopping_{false};
   mutable std::mutex clients_mutex_;
   mutable std::condition_variable clients_stopped_;

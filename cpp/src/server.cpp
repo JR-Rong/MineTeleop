@@ -10,6 +10,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <timeapi.h>
 #include <io.h>
 #else
 #include <fcntl.h>
@@ -18,6 +19,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 #if defined(__APPLE__)
@@ -976,16 +978,24 @@ void send_all(SocketHandle socket, std::string_view value) {
   }
 }
 
-void send_http_response(SocketHandle socket, const ServerResponse& response) {
+void send_http_response(SocketHandle socket, const ServerResponse& response, bool keep_alive = false) {
   std::ostringstream header;
   header << "HTTP/1.1 " << response.status << ' ' << status_reason(response.status) << "\r\n"
          << "Content-Type: " << response.content_type << "\r\n"
          << "Content-Length: " << response.body.size() << "\r\n"
-         << "Connection: close\r\n";
+         << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
   for (const auto& [name, value] : response.headers) header << name << ": " << value << "\r\n";
   header << "\r\n";
-  send_all(socket, header.str());
-  send_all(socket, response.body);
+  auto bytes = header.str();
+  if (keep_alive && response.body.size() <= 64 * 1024) {
+    // Emit small responses in one write so persistent requests do not wait for
+    // a delayed ACK between the headers and body.
+    bytes += response.body;
+    send_all(socket, bytes);
+  } else {
+    send_all(socket, bytes);
+    send_all(socket, response.body);
+  }
 }
 
 ServerResponse too_many_requests_response(const TooManyRequests& error) {
@@ -1005,9 +1015,14 @@ void add_request_id_header(ServerResponse& response, std::string_view request_id
   response.headers.emplace_back("X-Request-ID", request_id);
 }
 
-HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
+class HttpPeerDisconnected final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes,
+                          std::string& wire, bool strict_framing) {
   constexpr std::size_t max_headers = 64 * 1024;
-  std::string wire;
   std::array<char, 16 * 1024> buffer{};
   std::size_t header_end = std::string::npos;
   while ((header_end = wire.find("\r\n\r\n")) == std::string::npos) {
@@ -1018,10 +1033,14 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
       if (socket_error_interrupted(error)) continue;
       throw std::runtime_error("recv failed: " + socket_error_message(error));
     }
-    if (received == 0) throw std::invalid_argument("client closed before sending HTTP headers");
+    if (received == 0) throw HttpPeerDisconnected("client closed before sending HTTP headers");
     wire.append(buffer.data(), static_cast<std::size_t>(received));
-    if (wire.size() > max_headers) throw std::invalid_argument("HTTP headers too large");
+    const auto end = wire.find("\r\n\r\n");
+    if ((end == std::string::npos && wire.size() > max_headers) ||
+        (end != std::string::npos && end > max_headers))
+      throw std::invalid_argument("HTTP headers too large");
   }
+  if (header_end > max_headers) throw std::invalid_argument("HTTP headers too large");
 
   const auto headers_received_at_utc_ms = now_ms();
   const auto headers_received_at_monotonic_ms = monotonic_now_ms();
@@ -1037,6 +1056,7 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
   if (!(line >> request.method >> request.target >> version) || !version.starts_with("HTTP/1.")) {
     throw std::invalid_argument("invalid HTTP request line");
   }
+  request.http_version = version;
   std::string header;
   while (std::getline(headers, header)) {
     header = trim(std::move(header));
@@ -1044,14 +1064,20 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
     const auto separator = header.find(':');
     if (separator == std::string::npos) throw std::invalid_argument("invalid HTTP header");
     const auto name = lower(trim(header.substr(0, separator)));
-    if ((name == "host" || name == "origin" || name == "content-type" || name == "sec-fetch-site") &&
+    if ((name == "host" || name == "origin" || name == "content-type" || name == "sec-fetch-site" ||
+         (strict_framing && (name == "content-length" || name == "transfer-encoding" || name == "connection"))) &&
         request.headers.contains(name))
       throw std::invalid_argument("duplicate HTTP security header");
     request.headers[name] = trim(header.substr(separator + 1));
   }
+  if (strict_framing && request.headers.contains("transfer-encoding"))
+    throw std::invalid_argument("HTTP transfer encoding is not supported");
 
   std::size_t content_length = 0;
   if (const auto found = request.headers.find("content-length"); found != request.headers.end()) {
+    if (strict_framing && (found->second.empty() || !std::all_of(found->second.begin(), found->second.end(),
+          [](unsigned char ch) { return ch >= '0' && ch <= '9'; })))
+      throw std::invalid_argument("invalid Content-Length header");
     std::size_t consumed = 0;
     try {
       content_length = std::stoull(found->second, &consumed);
@@ -1070,12 +1096,13 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
       if (socket_error_interrupted(error)) continue;
       throw std::runtime_error("recv failed: " + socket_error_message(error));
     }
-    if (received == 0) throw std::invalid_argument("client closed before sending HTTP body");
+    if (received == 0) throw HttpPeerDisconnected("client closed before sending HTTP body");
     wire.append(buffer.data(), static_cast<std::size_t>(received));
     request.received_at_utc_ms = now_ms();
     request.received_at_monotonic_ms = monotonic_now_ms();
   }
   request.body = wire.substr(body_start, content_length);
+  wire.erase(0, body_start + content_length);
 
   const auto question = request.target.find('?');
   request.path = url_decode(request.target.substr(0, question));
@@ -2083,15 +2110,19 @@ SimpleHttpServer::SimpleHttpServer(
     std::uint16_t port,
     Handler handler,
     std::size_t max_body_bytes,
-    WebSocketHandler websocket_handler)
+    WebSocketHandler websocket_handler,
+    HttpConnectionPolicy connection_policy)
     : host_(std::move(host)),
       requested_port_(port),
       handler_(std::move(handler)),
       max_body_bytes_(max_body_bytes),
-      websocket_handler_(std::move(websocket_handler)) {
+      websocket_handler_(std::move(websocket_handler)),
+      connection_policy_(connection_policy) {
   if (host_.empty()) throw std::invalid_argument("HTTP host must not be empty");
   if (!handler_) throw std::invalid_argument("HTTP handler is required");
   if (max_body_bytes_ == 0) throw std::invalid_argument("HTTP max body size must be positive");
+  if (connection_policy_ == HttpConnectionPolicy::BoundedKeepAlive && websocket_handler_)
+    throw std::invalid_argument("persistent HTTP cannot share a websocket listener");
 }
 
 SimpleHttpServer::~SimpleHttpServer() { stop(); }
@@ -2147,22 +2178,53 @@ void SimpleHttpServer::open_listener() {
 }
 
 void SimpleHttpServer::serve_client(SocketHandle client_fd) const {
-  ServerResponse response;
-  try {
-    auto request = parse_request(client_fd, max_body_bytes_);
-    request.peer_address = socket_peer_address(client_fd);
-    if (websocket_handler_ && websocket_handler_(client_fd, request)) return;
-    response = handler_(request);
-  } catch (const std::length_error& error) {
-    response = ServerResponse::json(413, {{"error", error.what()}});
-  } catch (const std::invalid_argument& error) {
-    response = ServerResponse::json(400, {{"error", error.what()}});
-  } catch (const std::exception& error) {
-    response = ServerResponse::json(500, {{"error", error.what()}});
+  bool persistence = connection_policy_ == HttpConnectionPolicy::BoundedKeepAlive;
+  if (persistence) {
+#if defined(_WIN32)
+    const DWORD timeout = 3000;
+    persistence = ::setsockopt(native_socket(client_fd), SOL_SOCKET, SO_RCVTIMEO,
+                               reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0;
+#else
+    const timeval timeout{3, 0};
+    persistence = ::setsockopt(native_socket(client_fd), SOL_SOCKET, SO_RCVTIMEO,
+                               &timeout, sizeof(timeout)) == 0;
+#endif
   }
-  try {
-    send_http_response(client_fd, response);
-  } catch (const std::exception&) {
+  std::string wire;
+  constexpr std::size_t max_requests = 512;
+  for (std::size_t count = 0; count < max_requests && !stopping_; ++count) {
+    ServerResponse response;
+    bool keep_alive = false;
+    try {
+      auto request = parse_request(client_fd, max_body_bytes_, wire, persistence);
+      request.peer_address = socket_peer_address(client_fd);
+      if (websocket_handler_ && websocket_handler_(client_fd, request)) return;
+      const auto connection = request.headers.find("connection");
+      const auto connection_value = connection == request.headers.end() ? std::string{} : lower(connection->second);
+      bool close_requested = false;
+      std::istringstream tokens(connection_value);
+      for (std::string token; std::getline(tokens, token, ',');)
+        if (trim(std::move(token)) == "close") close_requested = true;
+      keep_alive = persistence && request.http_version == "HTTP/1.1" && !close_requested && count + 1 < max_requests;
+      response = handler_(request);
+    } catch (const HttpPeerDisconnected& error) {
+      if (persistence) return;
+      response = ServerResponse::json(400, {{"error", error.what()}});
+      keep_alive = false;
+    } catch (const std::length_error& error) {
+      response = ServerResponse::json(413, {{"error", error.what()}});
+      keep_alive = false;
+    } catch (const std::invalid_argument& error) {
+      response = ServerResponse::json(400, {{"error", error.what()}});
+      keep_alive = false;
+    } catch (const std::exception& error) {
+      if (persistence && wire.empty()) return;
+      response = ServerResponse::json(500, {{"error", error.what()}});
+      keep_alive = false;
+    }
+    try { send_http_response(client_fd, response, keep_alive); }
+    catch (const std::exception&) { return; }
+    if (!keep_alive) return;
   }
 }
 
@@ -6692,6 +6754,17 @@ void DriverConsoleRuntime::wake_native_control_sender() noexcept {
 
 void DriverConsoleRuntime::native_control_sender_loop(std::stop_token stop_token) {
   std::stop_callback cancellation(stop_token, [this] { wake_native_control_sender(); });
+#if defined(_WIN32)
+  // Scope the Windows timer-resolution request to the lifetime of the control
+  // sender. This does not change the command period or any safety deadline.
+  struct TimerResolution {
+    MMRESULT result{timeBeginPeriod(1)};
+    ~TimerResolution() { if (result == TIMERR_NOERROR) static_cast<void>(timeEndPeriod(1)); }
+  } timer_resolution;
+  if (native_control_trace_) native_control_trace_->enqueue({
+      {"stage", "sender_thread_scheduling"}, {"platform", "windows"},
+      {"timer_period_requested_ms", 1}, {"timer_period_result", static_cast<unsigned int>(timer_resolution.result)}});
+#endif
 #if defined(__APPLE__)
   // Each short input/ACK exchange is latency-sensitive interactive work. The
   // default pthread QoS can defer it while unrelated desktop work runs; keep

@@ -8,14 +8,22 @@ does not prove safety readiness, display scan-out, direct connectivity, or
 latency. No production or real-vehicle use is supported.
 
 An experimental, explicit `--mock-control --local-ip <ip> --peer-ip <ip>`
-mode exercises **neutral input only** against an isolated `test_bench_` mock
+mode exercises limited keyboard input against an isolated `test_bench_` mock
 vehicle with zero speed, two critical cameras, a loopback signaling tunnel and
 the existing 25 ms clock limit. Both addresses must be distinct public addresses
 in the same family. The receiver filters candidates to those endpoints and the
 SCTP transport must independently select the same UDP pair. Local configuration
 is not proof of remote containment: the test harness must verify the remote
 process, mock adapter, zero-speed configuration, CAN-down state and cellular
-route before starting. This mode is not a motion-control interface.
+route before starting. The profile retains neutral gear, zero speed, zero motor
+torque and zero steering limit; this mode is not a motion-control interface.
+Focus the main viewer or click a video panel. W/up requests mock throttle,
+A/left and D/right request mock steering, and S/down/space requests mock brake.
+Braking wins over throttle. Input is neutralized when focus, the UI heartbeat,
+critical video, clock, direct media path, acknowledged profile, fresh mock
+telemetry or control readiness is lost. Held keys must be released before a
+new press can take effect after a loss. There is no production emergency-stop
+input or authorization in this prototype.
 
 The two video areas belong to the Win32 application. Signaling and frame
 reception reuse the native driver runtime and the existing receiver probe;
@@ -93,11 +101,11 @@ pair. Older versions and missing or ambiguous state return false. The result
 is a snapshot, not proof of peer identity or a WAN route, and is not yet used
 to authorize control or to claim a relay protocol.
 
-The native window is deliberately not wired to `update_control_intent`. A
-driving client must first connect the existing session-generation and input
-ownership fences, neutral takeover, input lease, focus/device-loss handling,
-emergency-stop latch, control-profile acknowledgement, time-sync readiness and
-vehicle feedback. It must derive each critical camera's freshness from real
+The isolated mock mode is wired to `update_control_intent` with session and
+input-ownership fences, an input lease, focus handling, profile acknowledgement,
+time-sync readiness and vehicle feedback. A production driving client still
+needs its own complete input-device, emergency-stop and safety validation. It
+must derive each critical camera's freshness from real
 frame identity and timing, with bad-sample and brake revisions; decoded or drawn
 frame counts alone are insufficient to rearm control. Retained or repeated
 images must never refresh that evidence.
@@ -111,8 +119,9 @@ An experimental `NativeVideoHealth` state machine tracks each critical
 camera's generation, submitted frame identity, expiry and brake revisions. The
 window feeds it after successful foreground GDI submission of a MID-mapped,
 validated decoded frame; focus loss or minimization withdraws usability. The
-renderer keeps only the newest frame per camera. This is not display scan-out
-or vehicle capture freshness, and is not connected to control. Its tests also
+renderer keeps only the newest frame per camera. In mock mode the control gate
+uses this signal together with separate vehicle media evidence. This is not
+display scan-out or proof of vehicle capture freshness. Its tests also
 exercise two synthetic streams through the driver bridge and mock vehicle
 service; that fixture does not validate the Windows renderer or the vehicle.
 
@@ -127,10 +136,8 @@ the RTP SSRC assigned to its known test source and checks that deliberately
 swapped `media_tracks` fail that comparison. This is a fixture assertion, not
 runtime authentication of a physical camera or proof of displayed freshness.
 
-For direct control, the native WebRTC DataChannel must also implement the
-existing scoped transport bridge, frame expiry, result and feedback handling,
-and its WSS fallback without replaying an old command across a change of
-session, owner, negotiation or route. Initial validation must use an isolated
+The mock mode uses the scoped native WebRTC DataChannel courier, frame expiry,
+result and feedback handling, and WSS fallback. Validation must use an isolated
 mock vehicle, zero-speed limits and CAN down, and separately test stalls,
 disconnect, stale frames, input loss and reconnection before any long-run
 comparison. The existing 25 ms commissioning threshold is not changed here.

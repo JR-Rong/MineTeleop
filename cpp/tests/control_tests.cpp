@@ -376,6 +376,73 @@ void test_loopback_http_server_and_port_conflict() {
   expect(conflict_reported, "occupied control port did not produce a clear bind error");
 }
 
+void test_bounded_persistent_http_framing() {
+  mine_teleop::SimpleHttpServer server("127.0.0.1", 0,
+      [](const mine_teleop::HttpRequest& request) {
+        return mine_teleop::ServerResponse::text(200, request.path + ":" + request.body);
+      }, 1024, {}, mine_teleop::HttpConnectionPolicy::BoundedKeepAlive);
+  server.start();
+  auto connect = [&] {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) throw std::runtime_error("socket failed");
+    timeval timeout{5, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    sockaddr_in address{}; address.sin_family = AF_INET; address.sin_port = htons(server.port());
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+      ::close(fd); throw std::runtime_error("connect failed");
+    }
+    return fd;
+  };
+  auto response = [](int fd) {
+    std::string head;
+    while (!head.ends_with("\r\n\r\n")) head += raw_receive_exact(fd, 1);
+    const auto at = head.find("Content-Length: ");
+    expect(at != std::string::npos, "response missing content length");
+    const auto size = std::stoul(head.substr(at + 16));
+    return std::pair{head, raw_receive_exact(fd, size)};
+  };
+  const int fd = connect();
+  raw_send_all(fd, "POST /one HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nA"
+                   "GET /two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+  const auto first = response(fd), second = response(fd);
+  expect(first.first.find("Connection: keep-alive") != std::string::npos && first.second == "/one:A",
+         "first persistent response was not framed correctly");
+  expect(second.first.find("Connection: close") != std::string::npos && second.second == "/two:",
+         "pipelined request was lost or connection close ignored");
+  char byte{}; expect(::recv(fd, &byte, 1, 0) == 0, "explicit close did not close connection");
+  ::close(fd);
+  for (const auto* framing : {"Content-Length: 0\r\nContent-Length: 1\r\n", "Transfer-Encoding: chunked\r\n",
+                              "Content-Length: +1\r\n", "Connection: close\r\nConnection: keep-alive\r\n"}) {
+    const int bad = connect();
+    raw_send_all(bad, std::string("POST /bad HTTP/1.1\r\nHost: localhost\r\n") + framing + "\r\n");
+    const auto result = response(bad);
+    expect(result.first.starts_with("HTTP/1.1 400 ") && result.first.find("Connection: close") != std::string::npos,
+           "ambiguous request framing was not rejected and closed");
+    ::close(bad);
+  }
+  const int legacy = connect();
+  raw_send_all(legacy, "GET /legacy HTTP/1.0\r\nHost: localhost\r\n\r\n");
+  expect(response(legacy).first.find("Connection: close") != std::string::npos,
+         "HTTP/1.0 request unexpectedly stayed open");
+  ::close(legacy);
+  const int bounded = connect();
+  for (int i = 0; i < 512; ++i) {
+    raw_send_all(bounded, "GET /limit HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const auto result = response(bounded);
+    const auto expected = i == 511 ? "Connection: close" : "Connection: keep-alive";
+    expect(result.first.find(expected) != std::string::npos, "persistent request limit was not enforced");
+  }
+  expect(::recv(bounded, &byte, 1, 0) == 0, "request limit did not close connection");
+  ::close(bounded);
+  const int idle = connect();
+  raw_send_all(idle, "GET /idle HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  static_cast<void>(response(idle));
+  expect(::recv(idle, &byte, 1, 0) == 0, "idle persistent connection did not close");
+  ::close(idle);
+  server.stop();
+}
+
 void test_signaling_time_sync_applies_backward_utc_correction() {
   std::atomic<std::int64_t> server_offset_ms{80};
   mine_teleop::SimpleHttpServer server(
@@ -8453,6 +8520,7 @@ int main(int argc, char** argv) {
   std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"shared_control_protocol_vector", test_shared_control_protocol_vector},
       {"loopback_http_server_and_port_conflict", test_loopback_http_server_and_port_conflict},
+      {"bounded_persistent_http_framing", test_bounded_persistent_http_framing},
       {"signaling_time_sync_applies_backward_utc_correction",
        test_signaling_time_sync_applies_backward_utc_correction},
       {"driver_time_sync_uncertainty_fails_closed_at_production_default",

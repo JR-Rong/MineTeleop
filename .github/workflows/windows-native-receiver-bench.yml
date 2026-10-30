@@ -9,6 +9,9 @@ on:
       - 'cpp/tests/native_receiver_containment.test.py'
       - 'cpp/apps/windows_native_viewer.cpp'
       - 'cpp/include/mine_teleop/detail/native_viewer_observation.hpp'
+      - 'cpp/include/mine_teleop/detail/native_mock_keyboard.hpp'
+      - 'cpp/tests/native_mock_media_gate_tests.cpp'
+      - 'cpp/tests/control_http_keepalive.test.py'
       - 'cpp/tests/windows_native_viewer_containment.test.py'
       - 'cpp/tests/windows_native_viewer_observation_tests.cpp'
       - 'packaging/windows/run-native-viewer.ps1'
@@ -62,6 +65,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
           & .\scripts\build\build_windows_control_bundle.ps1 -Architecture x64 -VcpkgRoot .\.vcpkg
           if ($LASTEXITCODE -ne 0) { throw 'controller build failed' }
+      - name: Verify control HTTP connection reuse on Windows
+        run: |
+          python cpp/tests/control_http_keepalive.test.py build/windows-control-x64/Release/mine-teleop-control.exe
+          if ($LASTEXITCODE -ne 0) { throw 'control HTTP connection reuse failed' }
       - name: Install pinned GStreamer SDK into runner temporary storage
         run: |
           $ErrorActionPreference = 'Stop'
