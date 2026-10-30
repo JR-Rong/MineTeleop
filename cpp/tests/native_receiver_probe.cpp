@@ -227,6 +227,45 @@ bool pts_self_test() {
   return ok;
 }
 
+bool rtp_callback_lifetime_self_test() {
+  auto track = std::make_shared<Track>();
+  track->arrivals = std::make_shared<ArrivalTimes>();
+  std::weak_ptr<Track> retained_track = track;
+  std::weak_ptr<ArrivalTimes> retained_arrivals = track->arrivals;
+  GError* error = nullptr;
+  auto* pipeline = gst_parse_launch("appsrc name=input format=time ! identity name=rtp ! fakesink sync=false", &error);
+  if (error || !pipeline) { g_clear_error(&error); if (pipeline) gst_object_unref(pipeline); return false; }
+  auto* source = gst_bin_get_by_name(GST_BIN(pipeline), "input");
+  auto* element = gst_bin_get_by_name(GST_BIN(pipeline), "rtp");
+  auto* pad = gst_element_get_static_pad(element, "src");
+  const auto probe = gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, retained_probe<Track, Track::rtp>,
+      new std::shared_ptr<Track>(track), release_callback_owner<Track>);
+  track.reset();
+  bool ok = gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE;
+  auto* packet = gst_rtp_buffer_new_allocate(1, 0, 0);
+  GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
+  if (gst_rtp_buffer_map(packet, GST_MAP_WRITE, &rtp)) {
+    gst_rtp_buffer_set_ssrc(&rtp, 7);
+    gst_rtp_buffer_set_timestamp(&rtp, 123);
+    gst_rtp_buffer_set_marker(&rtp, TRUE);
+    gst_rtp_buffer_unmap(&rtp);
+  } else ok = false;
+  ok = (gst_app_src_push_buffer(GST_APP_SRC(source), packet) == GST_FLOW_OK) && ok;
+  static_cast<void>(gst_app_src_end_of_stream(GST_APP_SRC(source)));
+  auto* bus = gst_element_get_bus(pipeline);
+  auto* message = gst_bus_timed_pop_filtered(bus, 2 * GST_SECOND, static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+  ok = ok && message && GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS;
+  if (message) gst_message_unref(message);
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  auto observed = retained_track.lock();
+  ok = ok && observed && observed->rtp_packets == 1 && observed->rtp_timestamps.size() == 1 && !retained_arrivals.expired();
+  observed.reset();
+  gst_pad_remove_probe(pad, probe);
+  ok = ok && retained_track.expired() && retained_arrivals.expired();
+  gst_object_unref(bus); gst_object_unref(pad); gst_object_unref(element); gst_object_unref(source); gst_object_unref(pipeline);
+  return ok;
+}
+
 bool wan_candidate_self_test() {
   const std::vector<std::string> allowed{"2001:db8::2"};
   const std::string good = "candidate:1 1 UDP 123 2001:0db8:0:0:0:0:0:2 8000 typ host";
@@ -272,9 +311,11 @@ int probe_main(int argc, char** argv, void*) {
     if (argc == 2 && std::string(argv[1]) == "--self-test") {
       gst_init(nullptr, nullptr);
       const bool pts_passed = pts_self_test();
+      const bool rtp_lifetime_passed = rtp_callback_lifetime_self_test();
       const bool wan_passed = wan_candidate_self_test();
-      bool passed = pts_passed && wan_passed;
+      bool passed = pts_passed && rtp_lifetime_passed && wan_passed;
       std::cout << "decoder PTS admission: " << (pts_passed ? "PASS" : "FAIL") << '\n';
+      std::cout << "RTP callback lifetime: " << (rtp_lifetime_passed ? "PASS" : "FAIL") << '\n';
       std::cout << "WAN candidate filtering: " << (wan_passed ? "PASS" : "FAIL") << '\n';
 #ifdef __APPLE__
       const bool ipv4_passed = interface_binding_self_test("127.0.0.1");
