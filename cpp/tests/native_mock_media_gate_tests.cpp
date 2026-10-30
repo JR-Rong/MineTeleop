@@ -100,6 +100,11 @@ void test_live_clock_keyboard_and_media_guard() {
   auto invalid = status(20002, 3, 3); invalid["adapter_type"] = "can";
   require(!gate.observe(invalid, now(), 20002, 25) && !gate.ready_now(),
           "live media guard did not revoke invalid evidence");
+  using mine_teleop::detail::native_mock_input_fresh;
+  require(!native_mock_input_fresh(0, 1000) && !native_mock_input_fresh(1001, 1000),
+          "missing or future input observation was admitted");
+  require(native_mock_input_fresh(1001, 1001) && native_mock_input_fresh(1001, 1200) &&
+          !native_mock_input_fresh(1001, 1201), "200 ms input lease boundary changed");
 }
 }
 int main() { try { test_gate(); test_neutral_refresh_sequence(); test_mock_keyboard_rearms_only_after_release(); test_live_clock_keyboard_and_media_guard();

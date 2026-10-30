@@ -6,6 +6,11 @@
 
 namespace mine_teleop::detail {
 
+// A fresh observation cannot come from the future or survive the input lease.
+inline bool native_mock_input_fresh(std::int64_t observed_ms, std::int64_t now_ms) {
+  return observed_ms > 0 && now_ms >= observed_ms && now_ms - observed_ms < 200;
+}
+
 // The UI thread supplies a foreground keyboard heartbeat. This state is only
 // used by the isolated, zero-speed mock viewer; it cannot authorize motion.
 class NativeMockKeyboard {

@@ -239,8 +239,7 @@ struct Window {
           const bool ready = ui_alive && clock_ok && remote_ready == 1 && video_health.ready && direct_ready == 1;
           const auto authorized_at = input_authorized_at_ms.load();
           const auto authorization_now_ms = static_cast<std::int64_t>(bench_now_ms());
-          const bool authorized = authorized_at > 0 && authorization_now_ms >= authorized_at &&
-              authorization_now_ms - authorized_at < 200;
+          const bool authorized = detail::native_mock_input_fresh(authorized_at, authorization_now_ms);
           if (config.control_trace_commands) {
             const GuardState state{focused, ui_alive, clock_ok, video_health.ready, video_health.sample_healthy,
                 authorized, ready, remote_ready, direct_ready, video_health.bad_revision, video_health.brake_revision};
@@ -388,13 +387,16 @@ struct Window {
           handshake_sent = true;
         }
       }
-      const bool authorized = ready && profile_accepted && handshake_sent && telemetry_at_ms > 0 &&
-          now_ms >= telemetry_at_ms && now_ms - telemetry_at_ms < 200 && telemetry.is_object() &&
+      // The courier may have delivered newer telemetry after the loop's
+      // initial timestamp. Compare against a clock read taken after delivery.
+      const auto authorization_observed_ms = static_cast<std::int64_t>(bench_now_ms());
+      const bool authorized = ready && profile_accepted && handshake_sent &&
+          detail::native_mock_input_fresh(telemetry_at_ms, authorization_observed_ms) && telemetry.is_object() &&
           telemetry.value("safety_state", "") == "CONTROL_ACTIVE" &&
           !telemetry.value("braking_wait", true) && telemetry.value("gear", "") == "N" &&
           telemetry.contains("speed_mps") && telemetry.at("speed_mps").is_number() &&
           telemetry.at("speed_mps").get<double>() == 0.0;
-      input_authorized_at_ms.store(authorized ? now_ms : 0);
+      input_authorized_at_ms.store(authorized ? authorization_observed_ms : 0);
       if (now >= next_evidence) {
         flush_dc_trace();
         flush_guard_trace();
