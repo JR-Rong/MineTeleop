@@ -115,3 +115,10 @@ session, owner, negotiation or route. Initial validation must use an isolated
 mock vehicle, zero-speed limits and CAN down, and separately test stalls,
 disconnect, stale frames, input loss and reconnection before any long-run
 comparison. The existing 25 ms commissioning threshold is not changed here.
+
+The native-publication safety fixture injects reported critical-video failure
+and an expired input lease into the real driver bridge and mock control service,
+and checks that each reaches the corresponding braking wait. The byte courier
+and video health are simulated, and the initial recovery wait is explicitly
+released by the fixture: this does not test real WebRTC, displayed freshness,
+the vehicle media recovery coordinator, or automatic recovery.
