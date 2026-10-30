@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -996,6 +997,26 @@ void send_http_response(SocketHandle socket, const ServerResponse& response, boo
     send_all(socket, bytes);
     send_all(socket, response.body);
   }
+}
+
+// A persistent control connection must not queue the next request behind a
+// slow handler: doing so would timestamp old input only after that handler
+// finishes. Treat pending bytes or a socket error as a reason to close.
+bool http_input_pending(SocketHandle socket) {
+  const auto fd = native_socket(socket);
+#if !defined(_WIN32)
+  if (fd < 0 || fd >= FD_SETSIZE) return true;
+#endif
+  fd_set readable;
+  FD_ZERO(&readable);
+  FD_SET(fd, &readable);
+  timeval timeout{0, 0};
+#if defined(_WIN32)
+  const int result = ::select(0, &readable, nullptr, nullptr, &timeout);
+#else
+  const int result = ::select(fd + 1, &readable, nullptr, nullptr, &timeout);
+#endif
+  return result != 0;
 }
 
 ServerResponse too_many_requests_response(const TooManyRequests& error) {
@@ -2205,8 +2226,9 @@ void SimpleHttpServer::serve_client(SocketHandle client_fd) const {
       std::istringstream tokens(connection_value);
       for (std::string token; std::getline(tokens, token, ',');)
         if (trim(std::move(token)) == "close") close_requested = true;
-      keep_alive = persistence && request.http_version == "HTTP/1.1" && !close_requested && count + 1 < max_requests;
       response = handler_(request);
+      keep_alive = persistence && request.http_version == "HTTP/1.1" && !close_requested &&
+          count + 1 < max_requests && wire.empty() && !http_input_pending(client_fd);
     } catch (const HttpPeerDisconnected& error) {
       if (persistence) return;
       response = ServerResponse::json(400, {{"error", error.what()}});
@@ -2225,6 +2247,9 @@ void SimpleHttpServer::serve_client(SocketHandle client_fd) const {
     try { send_http_response(client_fd, response, keep_alive); }
     catch (const std::exception&) { return; }
     if (!keep_alive) return;
+    // Catch requests that arrived between the pre-send check and completion of
+    // the response; they cannot be assigned a trustworthy fresh receive time.
+    if (http_input_pending(client_fd)) return;
   }
 }
 

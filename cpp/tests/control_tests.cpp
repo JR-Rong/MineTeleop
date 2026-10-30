@@ -377,8 +377,14 @@ void test_loopback_http_server_and_port_conflict() {
 }
 
 void test_bounded_persistent_http_framing() {
+  std::promise<void> slow_entered, release_slow;
+  auto slow_ready = slow_entered.get_future();
+  auto slow_gate = release_slow.get_future().share();
+  std::atomic<int> old_input_handled{0};
   mine_teleop::SimpleHttpServer server("127.0.0.1", 0,
-      [](const mine_teleop::HttpRequest& request) {
+      [&](const mine_teleop::HttpRequest& request) {
+        if (request.path == "/slow") { slow_entered.set_value(); slow_gate.wait(); }
+        if (request.path == "/old-input") ++old_input_handled;
         return mine_teleop::ServerResponse::text(200, request.path + ":" + request.body);
       }, 1024, {}, mine_teleop::HttpConnectionPolicy::BoundedKeepAlive);
   server.start();
@@ -403,15 +409,35 @@ void test_bounded_persistent_http_framing() {
     return std::pair{head, raw_receive_exact(fd, size)};
   };
   const int fd = connect();
-  raw_send_all(fd, "POST /one HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nA"
-                   "GET /two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-  const auto first = response(fd), second = response(fd);
+  raw_send_all(fd, "POST /one HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nA");
+  const auto first = response(fd);
+  raw_send_all(fd, "GET /two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+  const auto second = response(fd);
   expect(first.first.find("Connection: keep-alive") != std::string::npos && first.second == "/one:A",
          "first persistent response was not framed correctly");
   expect(second.first.find("Connection: close") != std::string::npos && second.second == "/two:",
-         "pipelined request was lost or connection close ignored");
+         "second request was lost or connection close ignored");
   char byte{}; expect(::recv(fd, &byte, 1, 0) == 0, "explicit close did not close connection");
   ::close(fd);
+  const int pipeline = connect();
+  raw_send_all(pipeline, "GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                         "GET /old-input HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  const auto pipelined = response(pipeline);
+  expect(pipelined.second == "/first:" && pipelined.first.find("Connection: close") != std::string::npos,
+         "pipelined requests were not rejected before reuse");
+  expect(::recv(pipeline, &byte, 1, 0) == 0, "pipelined connection remained open");
+  ::close(pipeline);
+  const int queued = connect();
+  raw_send_all(queued, "GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  const bool entered = slow_ready.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  if (!entered) release_slow.set_value();
+  expect(entered, "slow HTTP handler did not start");
+  raw_send_all(queued, "GET /old-input HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  release_slow.set_value();
+  const auto slow_response = response(queued);
+  expect(slow_response.first.find("Connection: close") != std::string::npos && old_input_handled == 0,
+         "a request queued behind a slow handler was processed as fresh");
+  ::close(queued);
   for (const auto* framing : {"Content-Length: 0\r\nContent-Length: 1\r\n", "Transfer-Encoding: chunked\r\n",
                               "Content-Length: +1\r\n", "Connection: close\r\nConnection: keep-alive\r\n"}) {
     const int bad = connect();
