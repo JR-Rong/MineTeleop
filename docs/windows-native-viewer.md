@@ -12,7 +12,11 @@ the latter is a bounded measurement implementation, not a finished production
 renderer. The session stops on renegotiation or media error and must be
 reconnected manually. Restart before the receiver's 131072-PTS observation
 limit is reached. A drawn frame may remain displayed after a stall; it is not
-evidence of a fresh camera frame.
+evidence of a fresh camera frame. The status bar reports whether draw callbacks
+advanced for every configured track in the last sample and whether the selected
+candidate pair is direct UDP, relay, other, or unknown. A separate window timer
+warns if the worker stops updating the status. These indicators do not prove
+camera capture freshness, monitor scan-out, or control safety.
 
 ## Building and starting
 

@@ -1,5 +1,6 @@
 // Windows bench viewer: native windows and native WebRTC, with no control input.
 #include "native_receiver_core.hpp"
+#include "mine_teleop/detail/native_viewer_observation.hpp"
 #include <windows.h>
 #include <shellapi.h>
 
@@ -33,9 +34,11 @@ struct Window {
   std::wstring message{L"仅观看台架：控制禁用。车端隔离须独立核验。"};
   std::jthread worker;
   std::atomic<bool> running{false};
+  std::atomic<std::int64_t> last_observation_ms{0};
 
   void report(std::wstring value) {
     { std::lock_guard lock(mutex); message = std::move(value); }
+    last_observation_ms = static_cast<std::int64_t>(bench_now_ms());
     PostMessageW(hwnd, WM_APP + 1, 0, 0);
   }
 
@@ -67,6 +70,8 @@ struct Window {
         std::unique_ptr<Receiver> receiver;
         std::deque<Json> early;
         std::string negotiation;
+        auto next_observation = Clock::now();
+        std::vector<std::uint64_t> previous_draws;
         while (!stop_token.stop_requested()) {
           if (receiver) receiver->check();
           const auto polled = driver.poll_signaling();
@@ -100,6 +105,27 @@ struct Window {
               auto outgoing = scope;
               outgoing.update({{"candidate", candidate}, {"media_negotiation_id", negotiation}});
               static_cast<void>(driver.send_webrtc_ice_candidate(outgoing));
+            }
+            if (Clock::now() >= next_observation) {
+              const auto tracks = receiver->counters();
+              std::vector<std::uint64_t> current;
+              for (const auto& track : tracks) current.push_back(track.value("drawn", std::uint64_t{}));
+              const bool advancing = detail::viewer_draws_advance(current, previous_draws, vehicle.enabled_cameras().size());
+              previous_draws = std::move(current);
+              const auto pair = receiver->selected_pair();
+              std::wstring path = L"路径未确认";
+              if (pair.is_object()) {
+                switch (detail::viewer_path(pair.value("local_type", ""), pair.value("remote_type", ""),
+                                             pair.value("local_transport", ""), pair.value("remote_transport", ""))) {
+                  case detail::ViewerPath::relay: path = L"中继"; break;
+                  case detail::ViewerPath::direct_udp: path = L"UDP 直连"; break;
+                  case detail::ViewerPath::other: path = L"非 UDP 路径"; break;
+                  case detail::ViewerPath::unknown: break;
+                }
+              }
+              report((advancing ? L"绘制回调持续更新 · " : L"等待新画面或画面停滞 · ") + path +
+                  L" · 仅观看，控制禁用");
+              next_observation = Clock::now() + 1s;
             }
           }
           std::this_thread::sleep_for(10ms);
@@ -149,6 +175,7 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       app->status = control(hwnd, L"STATIC", app->message.c_str(), 0, 12, 108, 900, 25);
       app->video[0] = control(hwnd, L"STATIC", L"", SS_BLACKRECT, 12, 140, 460, 300);
       app->video[1] = control(hwnd, L"STATIC", L"", SS_BLACKRECT, 480, 140, 460, 300);
+      SetTimer(hwnd, 1, 1000, nullptr);
       return 0;
     case WM_SIZE: {
       const int width = LOWORD(lparam), height = HIWORD(lparam);
@@ -184,7 +211,13 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       EnableWindow(app->stop, app->running.load());
       return 0;
     }
+    case WM_TIMER:
+      if (wparam == 1 && app->running.load() && detail::viewer_observation_stale(
+          static_cast<std::int64_t>(bench_now_ms()), app->last_observation_ms.load()))
+        SetWindowTextW(app->status, L"状态采样中断，画面可能停滞；仅观看，控制禁用。");
+      return 0;
     case WM_CLOSE:
+      KillTimer(hwnd, 1);
       if (app->worker.joinable()) { app->worker.request_stop(); app->worker.join(); }
       DestroyWindow(hwnd);
       return 0;

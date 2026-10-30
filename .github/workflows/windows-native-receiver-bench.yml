@@ -8,7 +8,9 @@ on:
       - 'cpp/tests/native_receiver_probe.cpp'
       - 'cpp/tests/native_receiver_containment.test.py'
       - 'cpp/apps/windows_native_viewer.cpp'
+      - 'cpp/include/mine_teleop/detail/native_viewer_observation.hpp'
       - 'cpp/tests/windows_native_viewer_containment.test.py'
+      - 'cpp/tests/windows_native_viewer_observation_tests.cpp'
       - '.github/workflows/windows-native-receiver-bench.yml'
   workflow_dispatch:
 
@@ -81,7 +83,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'GStreamer or libnice development metadata missing' }
           cmake -S . -B build/windows-control-x64 -DMINE_TELEOP_BUILD_BENCH_PROBES=ON -DMINE_TELEOP_BUILD_WINDOWS_NATIVE_RECEIVER=ON "-DPKG_CONFIG_EXECUTABLE=$pkg"
           if ($LASTEXITCODE -ne 0) { throw 'native probe configure failed' }
-          cmake --build build/windows-control-x64 --config Release --target mine-teleop-native-receiver-probe mine-teleop-windows-viewer --parallel 3
+          cmake --build build/windows-control-x64 --config Release --target mine-teleop-native-receiver-probe mine-teleop-windows-viewer mine-teleop-windows-viewer-observation-tests --parallel 3
           if ($LASTEXITCODE -ne 0) { throw 'native probe build failed' }
           $exe = Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-native-receiver-probe.exe'
           & $exe --self-test
@@ -89,6 +91,8 @@ jobs:
           python cpp/tests/native_receiver_containment.test.py $exe configs/vehicle-agent.orin-cpu-bench.yaml
           if ($LASTEXITCODE -ne 0) { throw 'native probe containment test failed' }
           $viewer = Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-windows-viewer.exe'
+          & (Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-windows-viewer-observation-tests.exe')
+          if ($LASTEXITCODE -ne 0) { throw 'native viewer observation test failed' }
           python cpp/tests/windows_native_viewer_containment.test.py $viewer configs/vehicle-agent.orin-cpu-bench.yaml
           if ($LASTEXITCODE -ne 0) { throw 'native viewer containment test failed' }
           New-Item -ItemType Directory -Path receiver-artifact | Out-Null
