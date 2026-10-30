@@ -103,6 +103,7 @@ Json run(const Options& opts, VehicleConfig config) {
   VehicleMediaRuntime vehicle(config, url, device_token);
   DriverConfig driver_config;
   driver_config.driver_id = "native-bench"; driver_config.signaling_url = url;
+  driver_config.receive_only = true;
   driver_config.browser_event_log_path.clear();
   DriverConsoleRuntime driver(driver_config, config.vehicle_id, password);
   Receiver receiver(opts);
@@ -148,6 +149,7 @@ Json run_remote(const Options& opts, const VehicleConfig& config) {
   if (!password || !*password) throw std::invalid_argument("MINE_TELEOP_DRIVER_PASSWORD is required");
   DriverConfig driver_config;
   driver_config.driver_id = opts.driver_id; driver_config.signaling_url = opts.signaling_url;
+  driver_config.receive_only = true;
   driver_config.max_time_sync_uncertainty_ms = config.field_safety.max_time_sync_uncertainty_ms;
   driver_config.time_sync_interval_ms = config.field_safety.time_sync_interval_ms;
   driver_config.time_sync_samples = config.field_safety.time_sync_samples;

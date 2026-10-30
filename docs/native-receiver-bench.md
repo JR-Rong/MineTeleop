@@ -605,8 +605,11 @@ NetworkManager 配置，测试结束应删除全部临时隧道、反向代理�
 Windows x64 可显式同时设置 `MINE_TELEOP_BUILD_BENCH_PROBES=ON` 与
 `MINE_TELEOP_BUILD_WINDOWS_NATIVE_RECEIVER=ON` 构建 `mine-teleop-native-receiver-probe`。
 它复用 GStreamer/libnice 的 H.264 接收、去重、采样和可选显示；运行时依然要求
-车端配置 `control_enabled: false`、mock、bench 和零速度。它不是驾驶客户端，不能发送
-或验证控制，不具备无安全停车验收能力。普通 Windows 产品包默认不启用或附带该探针。
+车端配置 `control_enabled: false`、mock、bench 和零速度。当前探针显式启用接收专用
+模式，不发送或验证控制，不具备无安全停车验收能力。旧版探针复用默认控制运行时，
+虽然没有驾驶输入，仍可能尝试通过 WSS 发送中性心跳；此前“不能发送控制”的历史
+表述不准确。此前台架使用控制禁用、mock 和 CAN DOWN，不能据此推断控制验收。
+普通 Windows 产品包默认不启用或附带该探针。
 
 公网 IPv6 诊断使用 `--wan-family ipv6 --wan-local-address <本端公网地址>
 --wan-remote-address <指定对端公网地址>`；三者必须一起提供，ICE 被限制为 UDP，
