@@ -341,6 +341,21 @@ p99 为 51.85 / 50.71 ms，最大值约 629 ms。两路 GL draw 间隔超过 100
 原生对照仍未完成，PR26 的嵌入式原生视频层当前依赖 macOS NSView。
 [脱敏证据](evidence/windows-cellular-udp6-20261029.json)。
 
+随后在 Windows Edge 无界面模式完成真实 WebRTC 接收：Windows 和 Orin 分别经公网连接
+隔离云端信令，媒体选中两端公网 IPv6 host/host UDP，无 TURN。Windows 测试浏览器显式
+关闭 `WebRtcHideLocalIpsWithMdns`：之前默认 mDNS 候选的一轮未选出候选对，关闭后建连；
+这两个现象不能单独证明唯一根因，也不代表生产浏览器已有同样设置。按 5 秒间隔检查的
+60.047 秒窗口中，13 个样本均匹配指定地址与 UDP 直连，两路各增加 1802 个解码帧。
+Windows 所选本地公网 IPv6 已另行核实属于 WLAN；Orin 到该地址的每秒路由检查覆盖了
+窗口的大部分，但不是全部。该浏览器运行在无界面、GPU 禁用模式，视频元素处于暂停，
+只作为 ICE 和解码证据，不作为显示、光学延迟或 UI A/B 验收。
+
+更长一轮约 265 秒时，第 54 个样本不满足“选中对或两路轨道”检查而停止；前 53 个
+样本符合约束。该版本的采样器没有保留失败瞬间的各候选字段，随后一次快照仍为相同
+IPv6 host/host UDP，不能推断失败原因。另一轮因 Orin 路由保护中止，均未计入 30 分钟
+验收。受限云端测试公钥及 Windows 一次性私钥在测试后删除。完整数据见
+[Windows WebRTC 脱敏证据](evidence/windows-orin-webrtc-20261029.json)。
+
 该窗口包含空闲、每 100 ms 分别施加 8 ms 和 40 ms UI 工作、约每秒注入 200 ms UI 卡顿、
 以及恢复阶段；分阶段统计见[脱敏证据](evidence/5g-direct-20261028.json)。采样范围内
 jitterbuffer 输入到 GL draw 的 p99 约 3.25 ms，只覆盖接收端的一段处理，不包含采集、编码、
