@@ -43,6 +43,42 @@ using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 inline double bench_now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); }
 
+// Bench addresses may use different but equivalent IPv6 spellings. Compare
+// binary addresses rather than strings, without logging either address.
+inline bool same_ip_address(const std::string& left, const std::string& right) {
+  std::array<unsigned char, 16> a{}, b{};
+  for (const int family : {AF_INET, AF_INET6}) {
+    if (inet_pton(family, left.c_str(), a.data()) == 1 &&
+        inet_pton(family, right.c_str(), b.data()) == 1) return a == b;
+  }
+  return false;
+}
+
+inline bool allowed_bench_remote_candidate(std::string_view value, const std::vector<std::string>& remotes) {
+  if (remotes.empty()) return true;
+  if (value.starts_with("a=")) value.remove_prefix(2);
+  std::istringstream input{std::string(value)};
+  std::string foundation, component, protocol, priority, address, port, marker, type;
+  input >> foundation >> component >> protocol >> priority >> address >> port >> marker >> type;
+  if (!foundation.starts_with("candidate:") || (protocol != "udp" && protocol != "UDP") ||
+      marker != "typ" || (type != "host" && type != "srflx" && type != "prflx")) return false;
+  return std::any_of(remotes.begin(), remotes.end(), [&](const auto& expected) {
+    return same_ip_address(address, expected);
+  });
+}
+
+inline std::string filter_bench_remote_sdp(const std::string& sdp, const std::vector<std::string>& remotes) {
+  if (remotes.empty()) return sdp;
+  std::istringstream input(sdp);
+  std::string output, line;
+  while (std::getline(input, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.starts_with("a=candidate:") && !allowed_bench_remote_candidate(line, remotes)) continue;
+    output += line + "\r\n";
+  }
+  return output;
+}
+
 struct Options {
   std::string config, output, signaling_url, driver_id{"native-bench"}, decoder{"avdec_h264"};
   int seconds{30}, jitter_ms{30}, stall_ms{0};
@@ -128,6 +164,9 @@ inline Options options(int argc, char** argv) {
     else if (flag == "--jitter-ms") result.jitter_ms = integer(value, 0, 200);
     else if (flag == "--consumer-stall-ms") result.stall_ms = integer(value, 0, 500);
     else if (flag == "--decoder" && (value == "avdec_h264" || value == "nvv4l2decoder" || value == "vtdec_hw")) result.decoder = value;
+    else if (flag == "--wan-local-address") result.local_addresses.push_back(value);
+    else if (flag == "--wan-remote-address") result.remote_addresses.push_back(value);
+    else if (flag == "--wan-family" && (value == "ipv4" || value == "ipv6")) result.address_family = value;
     else throw std::invalid_argument("unknown option: " + flag);
   }
   if (result.config.empty()) throw std::invalid_argument("--config is required");
@@ -146,6 +185,19 @@ inline Options options(int argc, char** argv) {
     throw std::invalid_argument("this build requires --signaling-url (no embedded sender)");
 #endif
   if (result.display && result.stall_ms) throw std::invalid_argument("display mode does not inject consumer stalls");
+  if (!result.local_addresses.empty() || !result.remote_addresses.empty()) {
+    if (result.local_addresses.size() != 1 || result.remote_addresses.size() != 1 || result.address_family == "dual")
+      throw std::invalid_argument("WAN receiver requires one local and one remote address and an explicit family");
+    for (const auto& ip : {result.local_addresses.front(), result.remote_addresses.front()}) {
+      const auto info = detail::ice_address_summary(ip);
+      if (info.value("address_class", "") != "public" || info.value("address_family", "") != result.address_family)
+        throw std::invalid_argument("WAN receiver addresses must be public and match the requested family");
+    }
+    if (same_ip_address(result.local_addresses.front(), result.remote_addresses.front()))
+      throw std::invalid_argument("WAN receiver endpoints must differ");
+    result.ice_transport = "udp";
+    result.ice_route_mode = "direct";
+  }
   return result;
 }
 inline void validate(const VehicleConfig& config) {
@@ -469,7 +521,7 @@ class Receiver {
   std::string answer(const Json& offer) {
     if (!negotiation_.empty()) throw std::runtime_error("probe stops on renegotiation; new measurement required");
     negotiation_ = offer.at("media_negotiation_id").get<std::string>();
-    const auto text = offer.at("sdp").get<std::string>();
+    const auto text = filter_bench_remote_sdp(offer.at("sdp").get<std::string>(), options_.remote_addresses);
     GstSDPMessage* sdp = nullptr;
     if (gst_sdp_message_new(&sdp) != GST_SDP_OK) throw std::runtime_error("SDP allocation failed");
     if (gst_sdp_message_parse_buffer(reinterpret_cast<const guint8*>(text.data()), static_cast<guint>(text.size()), sdp) != GST_SDP_OK) {
@@ -493,6 +545,7 @@ class Receiver {
   void candidate(const Json& payload) {
     if (payload.value("media_negotiation_id", "") != negotiation_) return;
     const auto candidate = payload.contains("candidate") && payload["candidate"].is_object() ? payload["candidate"] : payload;
+    if (!allowed_bench_remote_candidate(candidate.at("candidate").get<std::string>(), options_.remote_addresses)) return;
     g_signal_emit_by_name(peer_, "add-ice-candidate", candidate.value("sdpMLineIndex", 0U), candidate.at("candidate").get<std::string>().c_str());
   }
   Json selected_pair() { std::lock_guard lock(mutex_); return selected_pair_; }
@@ -580,7 +633,9 @@ class Receiver {
     // Latch even a brief forbidden path change between periodic samples.
     const auto& opts = self.options_;
     if (!opts.local_addresses.empty()) {
-      const auto contains = [](const auto& values, const std::string& ip) { return std::find(values.begin(), values.end(), ip) != values.end(); };
+      const auto contains = [](const auto& values, const std::string& ip) {
+        return std::any_of(values.begin(), values.end(), [&](const auto& expected) { return same_ip_address(expected, ip); });
+      };
       const bool relay = local->type == NICE_CANDIDATE_TYPE_RELAYED || remote->type == NICE_CANDIDATE_TYPE_RELAYED;
       const bool local_known = contains(opts.local_addresses, local_ip) || contains(opts.local_public_addresses, local_ip);
       const bool family_ok = (std::string(local_ip).find(':') != std::string::npos) == (std::string(remote_ip).find(':') != std::string::npos) &&

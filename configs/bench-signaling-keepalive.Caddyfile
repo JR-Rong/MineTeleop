@@ -1,0 +1,13 @@
+# Isolated bench only. Keep the client side of the proxy alive while the
+# signaling server closes each backend connection; WebSocket upgrades pass
+# through unchanged. Both listeners must remain loopback-only.
+# Set XDG_CONFIG_HOME and XDG_DATA_HOME to a private temporary directory when
+# starting Caddy, so its autosave and storage never affect another instance.
+{
+    admin off
+    auto_https off
+}
+http://127.0.0.1:28766 {
+    bind 127.0.0.1
+    reverse_proxy 127.0.0.1:28765
+}

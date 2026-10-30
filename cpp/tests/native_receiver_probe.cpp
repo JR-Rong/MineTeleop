@@ -142,7 +142,11 @@ Json run_remote(const Options& opts, const VehicleConfig& config) {
         (!opts.display || track.at("draw_events_pts_ns_clock_ms").size() > 30);
   result["direct_host_udp_observed"] = pair.is_object() && pair.value("local_type", "") == "host" &&
       pair.value("remote_type", "") == "host" && pair.value("local_transport", "") == "udp" && pair.value("remote_transport", "") == "udp";
-  result["passed"] = !result.contains("error") && frames && result["direct_host_udp_observed"].get<bool>();
+  const bool expected_pair = opts.local_addresses.empty() || (pair.is_object() &&
+      same_ip_address(opts.local_addresses.front(), pair.value("local_address", "")) &&
+      same_ip_address(opts.remote_addresses.front(), pair.value("remote_address", "")));
+  result["expected_wan_endpoints_observed"] = opts.local_addresses.empty() ? Json(nullptr) : Json(expected_pair);
+  result["passed"] = !result.contains("error") && frames && expected_pair && result["direct_host_udp_observed"].get<bool>();
   result["pass_criteria"] = "configured tracks decoded (and GL drawn if requested), host/UDP; no latency or scan-out SLA";
   try { static_cast<void>(driver.end_session("native_receiver_probe_finished")); } catch (...) {}
   return result;
@@ -185,6 +189,19 @@ bool pts_self_test() {
   return ok && delivered == 3 && track.decoded == 3 && track.decoded_buffers == 6 &&
       track.duplicate_decoded_pts == 1 && track.invalid_decoded_pts == 1 && track.corrupt_decoded_buffers == 1;
 }
+
+bool wan_candidate_self_test() {
+  const std::vector<std::string> allowed{"2001:db8::2"};
+  const std::string good = "candidate:1 1 UDP 123 2001:0db8:0:0:0:0:0:2 8000 typ host";
+  const std::string bad_ip = "candidate:2 1 UDP 123 2001:db8::3 8000 typ host";
+  const std::string relay = "candidate:3 1 UDP 123 2001:db8::2 8000 typ relay";
+  const std::string tcp = "candidate:4 1 TCP 123 2001:db8::2 8000 typ host";
+  const auto sdp = filter_bench_remote_sdp("v=0\r\na=" + good + "\r\na=" + bad_ip + "\r\na=" + relay + "\r\n", allowed);
+  return allowed_bench_remote_candidate(good, allowed) && !allowed_bench_remote_candidate(bad_ip, allowed) &&
+      !allowed_bench_remote_candidate(relay, allowed) && !allowed_bench_remote_candidate(tcp, allowed) &&
+      !allowed_bench_remote_candidate("invalid", allowed) && sdp.find(good) != std::string::npos &&
+      sdp.find(bad_ip) == std::string::npos && sdp.find(relay) == std::string::npos;
+}
 #ifdef __APPLE__
 bool interface_binding_self_test(const char* address) {
   auto* context = g_main_context_new();
@@ -218,13 +235,15 @@ int probe_main(int argc, char** argv, void*) {
     if (argc == 2 && std::string(argv[1]) == "--self-test") {
       gst_init(nullptr, nullptr);
       const bool pts_passed = pts_self_test();
-      bool passed = pts_passed;
+      const bool wan_passed = wan_candidate_self_test();
+      bool passed = pts_passed && wan_passed;
       std::cout << "decoder PTS admission: " << (pts_passed ? "PASS" : "FAIL") << '\n';
+      std::cout << "WAN candidate filtering: " << (wan_passed ? "PASS" : "FAIL") << '\n';
 #ifdef __APPLE__
       const bool ipv4_passed = interface_binding_self_test("127.0.0.1");
       const bool ipv6_passed = interface_binding_self_test("::1");
       std::cout << "physical interface binding IPv4/IPv6: " << (ipv4_passed && ipv6_passed ? "PASS" : "FAIL") << '\n';
-      passed = pts_passed && ipv4_passed && ipv6_passed;
+      passed = passed && ipv4_passed && ipv6_passed;
 #endif
       return passed ? 0 : 1;
     }
@@ -233,6 +252,7 @@ int probe_main(int argc, char** argv, void*) {
                    "--config FILE --output NEW_FILE [--seconds 5..1800] [--jitter-ms 0..200]\n"
                    "[--decoder avdec_h264|nvv4l2decoder|vtdec_hw] [--consumer-stall-ms 0..500]\n"
                    "[--signaling-url http://127.0.0.1:PORT --driver-id ID] [--display]\n"
+                   "[--wan-family ipv4|ipv6 --wan-local-address IP --wan-remote-address IP]\n"
                    "Remote mode requires MINE_TELEOP_DRIVER_PASSWORD and a separately contained sender.\n"
                    "--config FILE --validate-only checks containment without starting a runtime.\n";
       return 0;

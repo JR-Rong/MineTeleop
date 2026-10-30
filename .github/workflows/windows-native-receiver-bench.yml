@@ -1,0 +1,84 @@
+name: Windows native receiver bench
+
+on:
+  pull_request:
+    paths:
+      - 'CMakeLists.txt'
+      - 'cpp/tests/native_receiver_core.hpp'
+      - 'cpp/tests/native_receiver_probe.cpp'
+      - '.github/workflows/windows-native-receiver-bench.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-native-receiver:
+    name: Windows x64 receive-only probe
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Read pinned vcpkg revision
+        id: dependencies
+        run: |
+          $lock = Get-Content packaging/windows/dependencies.lock.json -Raw | ConvertFrom-Json
+          "commit=$($lock.vcpkg_commit)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - uses: actions/checkout@v7
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ steps.dependencies.outputs.commit }}
+          path: .vcpkg
+          persist-credentials: false
+      - name: Bootstrap and build the existing portable controller
+        env:
+          VCPKG_DISABLE_METRICS: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          & .\scripts\build\build_windows_control_bundle.ps1 -Architecture x64 -VcpkgRoot .\.vcpkg
+          if ($LASTEXITCODE -ne 0) { throw 'controller build failed' }
+      - name: Install pinned GStreamer SDK into runner temporary storage
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'gstreamer-1.28.1.exe'
+          $url = 'https://gstreamer.freedesktop.org/data/pkg/windows/1.28.1/msvc/gstreamer-1.0-msvc-x86_64-1.28.1.exe'
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $expected = '2ec50356d2d0937a9ead0f99d322f81d8413b9514c9d58ed41ca58fbcf25bfde'
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'GStreamer SHA-256 mismatch' }
+          $gst = Join-Path $env:RUNNER_TEMP 'gstreamer-native-bench'
+          $p = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT','/NORESTART','/CURRENTUSER','/TYPE=devel',"/DIR=$gst") -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "GStreamer installer failed: $($p.ExitCode)" }
+          "GST_BENCH_ROOT=$gst" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build and exercise receive-only probe
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "$env:GST_BENCH_ROOT\bin;$env:PATH"
+          $env:PKG_CONFIG_PATH = "$env:GST_BENCH_ROOT\lib\pkgconfig"
+          $pkg = Join-Path $env:GST_BENCH_ROOT 'bin\pkg-config.exe'
+          & $pkg --exists gstreamer-1.0 gstreamer-app-1.0 gstreamer-sdp-1.0 gstreamer-webrtc-1.0 gstreamer-rtp-1.0 gstreamer-video-1.0 nice
+          if ($LASTEXITCODE -ne 0) { throw 'GStreamer or libnice development metadata missing' }
+          cmake -S . -B build/windows-control-x64 -DMINE_TELEOP_BUILD_BENCH_PROBES=ON -DMINE_TELEOP_BUILD_WINDOWS_NATIVE_RECEIVER=ON "-DPKG_CONFIG_EXECUTABLE=$pkg"
+          if ($LASTEXITCODE -ne 0) { throw 'native probe configure failed' }
+          cmake --build build/windows-control-x64 --config Release --target mine-teleop-native-receiver-probe --parallel 3
+          if ($LASTEXITCODE -ne 0) { throw 'native probe build failed' }
+          $exe = Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-native-receiver-probe.exe'
+          & $exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'native probe self-test failed' }
+          New-Item -ItemType Directory -Path receiver-artifact | Out-Null
+          Copy-Item $exe receiver-artifact/
+          Get-FileHash $exe -Algorithm SHA256 | Format-List | Out-File receiver-artifact/sha256.txt
+          git rev-parse HEAD | Out-File receiver-artifact/source-commit.txt -Encoding ascii
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-native-receiver-bench-x64
+          path: receiver-artifact/
+          if-no-files-found: error
+          retention-days: 7

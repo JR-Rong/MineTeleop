@@ -573,3 +573,43 @@ connected、选中指定 IPv6 UDP 地址，车端路由守卫未触发；其中 
 因此没有证明连续 30 分钟控制就绪、无安全停车。媒体诊断使用 `control_enabled: false`
 和 100 ms 台架阈值，不能替代控制安全验收。本次测试使用蜂窝接口，但 AT 串口访问权限
 不足，不能确认本次观察窗口内的无线制式。临时公钥、凭据及防火墙规则已清除。
+
+### 隔离信令校时与蜂窝出口复测准备
+
+在 Orin 的蜂窝接口到既有云主机之间，直接访问公网 HTTPS `/time` 的 5 组样本
+不确定度为 18–20 ms，均满足 25 ms；隔离 HTTP 信令经常规 SSH 转发的 20 组全部
+超限，中位数 37 ms。这里校时算法、上限和服务端时间域均未改变；短样本仅用于定位，
+不能作为长期稳定性的结论，也不能把 TCP 建连时间作为校时或媒体验收。
+
+隔离信令服务器的 HTTP 响应关闭连接，每次采样都要建立新的 SSH 转发通道。单独启动
+仅监听回环的 [台架反向代理](../configs/bench-signaling-keepalive.Caddyfile)，让代理
+与接收端之间复用 HTTP 连接；目标仍是相同的隔离信令服务，控制 WebSocket 也经过此
+代理。交错对照各 10 组，普通 SSH 交互转发 0/10 通过，加入复用后 10/10 通过，
+不确定度 17–21 ms、选中 RTT 18–23 ms。WebSocket、完整 mock 控制以及长时间运行
+必须各自实测；该代理不是对生产环境的性能或安全恢复承诺。
+
+测试时 Orin 端 SSH 转发应使用 `ssh -B <cellular-interface> -b <cellular-source>`，
+既指定设备又指定来源地址；单独指定 `-b` 不等价于绑定网络设备。代理和服务端只监听
+回环，不能把未加密 HTTP 暴露到公网；代理的 XDG 配置和数据目录必须使用独立临时目录，
+避免覆盖其他 Caddy 实例的自动保存配置。浏览器所选媒体对、实际蜂窝地址和数据通道仍需
+另外检查，不能将 SSH 参数当作全链路证明。设备消失或绑定失败应停止测试，不回退 Mac。
+
+Linux 内核的接口绑定和失败关闭行为可用
+`scripts/test/cellular_interface_failover.test.sh` 在独立 user/network namespace 验证；
+这个夹具不修改宿主机默认路由，并不模拟真实运营商故障，也不能证明任一具体运行中
+SSH 或 WebRTC socket 的绑定状态。当前用户无免密管理员权限，因此没有改台架的
+NetworkManager 配置，测试结束应删除全部临时隧道、反向代理、密钥和凭据。
+
+### Windows 原生接收原型（默认关闭）
+
+Windows x64 可显式同时设置 `MINE_TELEOP_BUILD_BENCH_PROBES=ON` 与
+`MINE_TELEOP_BUILD_WINDOWS_NATIVE_RECEIVER=ON` 构建 `mine-teleop-native-receiver-probe`。
+它复用 GStreamer/libnice 的 H.264 接收、去重、采样和可选显示；运行时依然要求
+车端配置 `control_enabled: false`、mock、bench 和零速度。它不是驾驶客户端，不能发送
+或验证控制，不具备无安全停车验收能力。普通 Windows 产品包默认不启用或附带该探针。
+
+公网 IPv6 诊断使用 `--wan-family ipv6 --wan-local-address <本端公网地址>
+--wan-remote-address <指定对端公网地址>`；三者必须一起提供，ICE 被限制为 UDP，
+远端 SDP/trickle 候选和最终选中对都检查指定地址。不能用局域网地址代替 WAN，
+不能将解码或 GL draw 当作物理显示扫描或端到端延迟。Windows 下需要实测所装
+GStreamer 插件、硬件驱动与实际窗口呈现，不能预先宣称硬件解码或零拷贝。
