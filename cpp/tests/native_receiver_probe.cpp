@@ -183,7 +183,8 @@ Json run_remote(const Options& opts, const VehicleConfig& config) {
 // Regression for repeated decoder output observed on the Orin bench. Exercise
 // the actual pad filter: duplicate/invalid PTS must not reach its downstream.
 bool pts_self_test() {
-  Track track;
+  auto track = std::make_shared<Track>();
+  std::weak_ptr<Track> retained = track;
   std::atomic<unsigned> delivered{};
   GError* error = nullptr;
   auto* pipeline = gst_parse_launch("appsrc name=input format=time ! identity name=decoded ! fakesink name=out sync=false signal-handoffs=true", &error);
@@ -194,7 +195,9 @@ bool pts_self_test() {
   auto* decoded = gst_bin_get_by_name(GST_BIN(pipeline), "decoded");
   auto* output = gst_bin_get_by_name(GST_BIN(pipeline), "out");
   auto* pad = gst_element_get_static_pad(decoded, "src");
-  gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, Track::raw, &track, nullptr);
+  const auto probe = gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, retained_probe<Track, Track::raw>,
+      new std::shared_ptr<Track>(track), release_callback_owner<Track>);
+  track.reset();  // A late callback must still own its state after the receiver releases it.
   g_signal_connect(output, "handoff", G_CALLBACK(+[](GstElement*, GstBuffer*, GstPad*, gpointer data) {
     ++*static_cast<std::atomic<unsigned>*>(data);
   }), &delivered);
@@ -212,10 +215,16 @@ bool pts_self_test() {
   ok = ok && message && GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS;
   if (message) gst_message_unref(message);
   gst_element_set_state(pipeline, GST_STATE_NULL);
+  auto observed = retained.lock();
+  ok = ok && observed && delivered == 3 && observed->decoded == 3 && observed->decoded_buffers == 6 &&
+      observed->duplicate_decoded_pts == 1 && observed->invalid_decoded_pts == 1 && observed->corrupt_decoded_buffers == 1;
+  // Drop our temporary observation before removing the actual pad probe.
+  observed.reset();
+  gst_pad_remove_probe(pad, probe);
+  ok = ok && retained.expired();
   gst_object_unref(bus); gst_object_unref(pad); gst_object_unref(output);
   gst_object_unref(decoded); gst_object_unref(source); gst_object_unref(pipeline);
-  return ok && delivered == 3 && track.decoded == 3 && track.decoded_buffers == 6 &&
-      track.duplicate_decoded_pts == 1 && track.invalid_decoded_pts == 1 && track.corrupt_decoded_buffers == 1;
+  return ok;
 }
 
 bool wan_candidate_self_test() {

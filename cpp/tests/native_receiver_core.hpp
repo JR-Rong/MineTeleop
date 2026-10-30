@@ -43,6 +43,17 @@ using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 inline double bench_now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); }
 
+// A pad or signal can outlive pipeline teardown. Keep callback state alive
+// until GStreamer destroys its registration, including an in-flight callback.
+template<typename T> void release_callback_owner(gpointer data) {
+  delete static_cast<std::shared_ptr<T>*>(data);
+}
+template<typename T, GstPadProbeReturn (*Callback)(GstPad*, GstPadProbeInfo*, gpointer)>
+GstPadProbeReturn retained_probe(GstPad* pad, GstPadProbeInfo* info, gpointer data) {
+  auto owner = *static_cast<std::shared_ptr<T>*>(data);
+  return Callback(pad, info, owner.get());
+}
+
 // Bench addresses may use different but equivalent IPv6 spellings. Compare
 // binary addresses rather than strings, without logging either address.
 inline bool same_ip_address(const std::string& left, const std::string& right) {
@@ -329,7 +340,7 @@ struct ArrivalTimes {
 };
 struct Track {
   std::string pad;
-  ArrivalTimes* arrivals{};
+  std::shared_ptr<ArrivalTimes> arrivals;
   GstElement* sink{};  // owned reference until the consumer stops
   std::jthread consumer;
   std::mutex mutex;
@@ -420,6 +431,11 @@ struct Track {
     }
     return FALSE;
   }
+  static gboolean retained_draw(GstElement* element, gpointer context, GstSample* sample, gpointer data) {
+    auto owner = *static_cast<std::shared_ptr<Track>*>(data);
+    return draw(element, context, sample, owner.get());
+  }
+  static void release_draw_owner(gpointer data, GClosure*) { release_callback_owner<Track>(data); }
   Json counters() {
     std::lock_guard lock(mutex);
     return {{"pad", pad}, {"decoded", decoded}, {"consumed", consumed}, {"drawn", drawn_events.size()},
@@ -513,9 +529,9 @@ class Receiver {
       throw std::runtime_error("receiver failed to start");
   }
   void stop() {
-    if (stopped_) return;
-    stopped_ = true;
+    if (stopped_.exchange(true)) return;
     g_signal_handlers_disconnect_by_data(peer_, this);
+    g_signal_handlers_disconnect_by_data(pipeline_, this);
     gst_element_set_state(pipeline_, GST_STATE_NULL);
     if (nice_) {
       g_signal_handlers_disconnect_by_data(nice_, this);
@@ -523,7 +539,9 @@ class Receiver {
       if (interface_binding_) g_signal_handlers_disconnect_by_data(nice_, interface_binding_.get());
 #endif
     }
-    for (auto& track : tracks_) track->stop();
+    std::vector<std::shared_ptr<Track>> tracks;
+    { std::lock_guard lock(mutex_); tracks = tracks_; }
+    for (auto& track : tracks) track->stop();
   }
   std::string answer(const Json& offer) {
     if (!negotiation_.empty()) throw std::runtime_error("probe stops on renegotiation; new measurement required");
@@ -600,7 +618,8 @@ class Receiver {
     auto* factory = gst_element_get_factory(element);
     if (!factory || std::string(gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory))) != "rtpjitterbuffer") return;
     auto* sink = gst_element_get_static_pad(element, "sink");
-    gst_pad_add_probe(sink, GST_PAD_PROBE_TYPE_BUFFER, ArrivalTimes::record, &self.arrivals_, nullptr);
+    gst_pad_add_probe(sink, GST_PAD_PROBE_TYPE_BUFFER, retained_probe<ArrivalTimes, ArrivalTimes::record>,
+        new std::shared_ptr<ArrivalTimes>(self.arrivals_), release_callback_owner<ArrivalTimes>);
     gst_object_unref(sink);
   }
   static const char* candidate_type(NiceCandidateType type) {
@@ -670,6 +689,7 @@ class Receiver {
   }
   void add_track(GstPad* pad) {
     std::lock_guard lock(mutex_);
+    if (stopped_.load()) return;
     if (tracks_.size() >= 8) throw std::runtime_error("too many receiver tracks");
     GError* error = nullptr;
     const auto decoder = detail::low_latency_decoder_stage(options_.decoder);
@@ -697,9 +717,9 @@ class Receiver {
       gst_object_unref(display);
     }
 #endif
-    auto track = std::make_unique<Track>();
+    auto track = std::make_shared<Track>();
     track->pad = GST_PAD_NAME(pad);
-    track->arrivals = &arrivals_;
+    track->arrivals = arrivals_;
     track->sink = gst_bin_get_by_name(GST_BIN(bin), "out");
     if (options_.display) {
       auto* display = gst_bin_get_by_name(GST_BIN(bin), "display");
@@ -713,37 +733,40 @@ class Receiver {
         gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(display), options_.window_handles[index]);
         gst_video_overlay_handle_events(GST_VIDEO_OVERLAY(display), FALSE);
       }
-      g_signal_connect(display, "client-draw", G_CALLBACK(Track::draw), track.get());
+      g_signal_connect_data(display, "client-draw", G_CALLBACK(Track::retained_draw),
+          new std::shared_ptr<Track>(track), Track::release_draw_owner, static_cast<GConnectFlags>(0));
       gst_object_unref(display);
     }
-    for (const auto& [name, callback] : {std::pair{"depay", Track::compressed}, std::pair{"decoder", Track::raw}}) {
+    for (const auto& [name, callback] : {std::pair{"depay", retained_probe<Track, Track::compressed>},
+                                         std::pair{"decoder", retained_probe<Track, Track::raw>}}) {
       auto* element = gst_bin_get_by_name(GST_BIN(bin), name);
       auto* source = gst_element_get_static_pad(element, "src");
-      gst_pad_add_probe(source, GST_PAD_PROBE_TYPE_BUFFER, callback, track.get(), nullptr);
+      gst_pad_add_probe(source, GST_PAD_PROBE_TYPE_BUFFER, callback,
+          new std::shared_ptr<Track>(track), release_callback_owner<Track>);
       gst_object_unref(source); gst_object_unref(element);
     }
     // Keep callback data alive even if linking or state synchronisation fails.
-    auto* track_ptr = track.get();
-    tracks_.push_back(std::move(track));
-    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, Track::rtp, track_ptr, nullptr);
+    tracks_.push_back(track);
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, retained_probe<Track, Track::rtp>,
+        new std::shared_ptr<Track>(track), release_callback_owner<Track>);
     auto* input = gst_element_get_static_pad(bin, "sink");
     const auto linked = gst_pad_link(pad, input);
     gst_object_unref(input);
     if (linked != GST_PAD_LINK_OK || !gst_element_sync_state_with_parent(bin)) throw std::runtime_error("decode track link/start failed");
-    track_ptr->start(options_.stall_ms);
+    track->start(options_.stall_ms);
   }
-  ArrivalTimes arrivals_;
+  std::shared_ptr<ArrivalTimes> arrivals_{std::make_shared<ArrivalTimes>()};
   Options options_;
   GstElement* pipeline_{}, *peer_{};
   NiceAgent* nice_{};
 #ifdef __APPLE__
   std::unique_ptr<InterfaceBinding> interface_binding_;
 #endif
-  bool stopped_{};
+  std::atomic<bool> stopped_{false};
   std::string negotiation_, error_;
   std::mutex mutex_;
   std::deque<Json> candidates_;
-  std::vector<std::unique_ptr<Track>> tracks_;
+  std::vector<std::shared_ptr<Track>> tracks_;
   unsigned local_candidates_{};
   unsigned pair_changes_{};
   Json selected_pair_;
