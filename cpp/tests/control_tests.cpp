@@ -2692,7 +2692,7 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
       "void DriverConsoleRuntime::native_control_sender_loop(");
   const auto status = cpp_function_contract(
       source,
-      "Json DriverConsoleRuntime::status()");
+      "Json DriverConsoleRuntime::status(bool omit_signaling_socket)");
 
   const auto snapshot_lock = send_sample.find(
       "std::lock_guard update_lock(native_control_update_mutex_)");
