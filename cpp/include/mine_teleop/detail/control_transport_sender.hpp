@@ -140,7 +140,8 @@ class ControlTransportSender {
     // session profile. If that is the reason it was rejected, one later
     // authenticated, fresh neutral WSS acceptance permits one new bounded
     // trial budget. It does not bypass backoff, epoch fencing or DC health.
-    if (current && sent.path == ControlPath::DataChannel && !result.at("accepted").get<bool>() &&
+    if (current && sent.path == ControlPath::DataChannel && result.at("transport_admitted").get<bool>() &&
+        !result.at("accepted").get<bool>() && age <= NativeControlAckRecovery::kFreshAckMs &&
         result.value("reason", "") == "session_profile_not_ready") profile_blocked_dc_ = true;
     if (current && sent.path == ControlPath::Wss && sent.neutral && !sent.estop &&
         result.at("accepted").get<bool>() && result.at("transport_admitted").get<bool>() &&
