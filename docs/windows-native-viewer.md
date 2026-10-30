@@ -97,6 +97,14 @@ regressing PTS. A timestamp discontinuity requires a new track or session;
 this conservative filter is only a prerequisite and does not prove that a
 fresh camera image was displayed.
 
+An experimental `NativeVideoHealth` state machine tracks each critical
+camera's generation, submitted frame identity, expiry and brake revisions. Its
+tests exercise two synthetic streams through the driver bridge and mock
+vehicle service. It is not wired into the native window: a future caller must
+first provide authenticated camera identity, real renderer-submission events
+and vehicle-side capture freshness. Decoder output and GL `client-draw` are
+not sufficient evidence for enabling control.
+
 The viewing prototype binds each video section's negotiated MID and ordered
 `media_tracks` identity to the configured camera window, rejecting missing or
 ambiguous identities and duplicate bindings. Renegotiation still requires a

@@ -1,6 +1,7 @@
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/websocket.hpp"
 #include "mine_teleop/detail/native_control_publication.hpp"
+#include "mine_teleop/detail/native_video_health.hpp"
 #include "control_time_fixture.hpp"
 
 #include <chrono>
@@ -70,6 +71,7 @@ struct Fixture {
   bool direct_enabled{false}, cloud_online{true};
   bool refresh_input{true}, video_ready{true}, video_sample_healthy{true};
   std::uint64_t video_bad_revision{0}, video_brake_revision{0};
+  NativeVideoHealth* synthetic_video_health{nullptr};
   std::string dc_network_path{"unknown"}, last_result_reason;
   double requested_throttle{0.0};
   std::uint64_t lease_nonce{0};
@@ -208,6 +210,13 @@ struct Fixture {
   }
   void input() {
     const auto status = driver->status();
+    if (synthetic_video_health) {
+      const auto health = synthetic_video_health->snapshot(steady());
+      video_ready = health.ready;
+      video_sample_healthy = health.sample_healthy;
+      video_bad_revision = health.bad_revision;
+      video_brake_revision = health.brake_revision;
+    }
     auto result = driver->update_control_intent({{"session_id", session}, {"session_generation", status.at("control_session_generation")},
         {"ui_instance_id", "owner"}, {"ui_control_epoch", ui_epoch}, {"takeover", ui_epoch == 0},
         {"intent_seq", ++intent_seq}, {"gear", requested_throttle > 0 ? "D" : "N"}, {"steering", 0.0}, {"throttle", requested_throttle}, {"brake", 0.0},
@@ -434,6 +443,49 @@ void native_publication_safety_interlocks() {
                               : "mock vehicle did not brake after the input lease expired");
   }
   std::cout << "[NATIVE_SAFETY] reported video loss and input lease expiry reached mock braking; simulated courier, video health and initial release, no recovery proof\n";
+}
+void native_dual_video_bridge_integration() {
+  NativeVideoHealth video({"front", "rear"}, 500);
+  expect(video.attach("front", 1) && video.attach("rear", 1) &&
+      video.set_usable("front", 1, true) && video.set_usable("rear", 1, true), "video fixture setup failed");
+  Fixture fixture(false, false, true);
+  fixture.dc_network_path = "p2p";
+  fixture.use_native_publication = true;
+  fixture.synthetic_video_health = &video;
+  std::uint64_t seq = 0;
+  auto present = [&](bool rear) {
+    const auto now = steady();
+    ++seq;
+    expect(video.render_submitted("front", 1, seq, now), "front synthetic presentation rejected");
+    if (rear) expect(video.render_submitted("rear", 1, seq, now), "rear synthetic presentation rejected");
+  };
+  bool initially_ready = false, simulated_release = false;
+  auto deadline = steady() + 8000;
+  while (steady() < deadline && !initially_ready) {
+    present(true); fixture.pump(true);
+    std::lock_guard lock(fixture.car_mutex);
+    const auto timing = fixture.vehicle->control_timing(utc());
+    if (!simulated_release && fixture.dc_commands >= 3 && timing.value("driver_critical_video_ready", false) &&
+        timing.value("operator_input_ready", false) && timing.value("driver_time_sync_ready", false) &&
+        timing.value("driver_control_link_ready", false)) {
+      fixture.vehicle->set_control_braking_wait(false, utc(), ControlRecoveryCause::ControlLink);
+      simulated_release = true;
+    }
+    initially_ready = simulated_release && !fixture.vehicle->control_braking_wait();
+  }
+  expect(initially_ready && video.snapshot(steady()).ready, "dual video fixture did not reach its simulated baseline");
+  bool stopped = false;
+  deadline = steady() + 4000;
+  while (steady() < deadline && !stopped) {
+    present(false); fixture.pump(true);
+    std::lock_guard lock(fixture.car_mutex);
+    const auto timing = fixture.vehicle->control_timing(utc());
+    stopped = !timing.value("driver_critical_video_ready", true) && fixture.vehicle->control_braking_wait();
+  }
+  expect(stopped, "one stalled synthetic track did not revoke mock control");
+  expect(!video.snapshot(steady()).ready && video.snapshot(steady()).brake_revision > 0,
+      "stalled video did not retain a brake revision");
+  std::cout << "[NATIVE_DUAL_VIDEO] one synthetic track stall revoked mock control; simulated presentation and courier, no recovery proof\n";
 }
 void product_recovery_withdraws_unfetched_motion() {
   for (int cause = 0; cause < 4; ++cause) {
@@ -972,6 +1024,6 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
 }
 }  // namespace
 int main(int argc, char** argv) {
-  try { if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } native_publication_bridge_integration(); native_publication_safety_interlocks(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { if (argc > 1 && std::string_view(argv[1]) == "--native-dual-video-only") { native_dual_video_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } native_publication_bridge_integration(); native_publication_safety_interlocks(); native_dual_video_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
