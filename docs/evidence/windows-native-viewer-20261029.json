@@ -36,9 +36,31 @@
     "receiver_failure": "track link or state sync",
     "pad_link_observation": "both WebRTC video pads linked successfully",
     "gl_failure": "GL context creation failed while sharing WGL contexts; wglShareLists returned 0xaa",
+    "synthetic_gl_reproduction": {"single_sink_exit_code": 0, "two_sinks_exit_code": -1, "two_sink_wgl_share_error_observed": true, "two_separate_process_exit_codes": [0, 0], "scope": "Windows interactive synthetic video only; no camera or network"},
+    "synthetic_context_isolation": {"same_pipeline_shared_display": "state_failed", "same_pipeline_per_bin_display": "eos", "scope": "Windows interactive synthetic video; no camera, WAN, display scan-out or control acceptance"},
     "new_access_violation_event_observed": false,
     "normal_exit_proven": false,
     "note": "A later run enabled private GStreamer diagnostics to identify the WGL error. Logs were removed after extracting the failure category. This does not prove the callback lifetime fix under long-duration load."
+  },
+  "gl_isolation_followup": {
+    "source_commit": "3449d49d1f31f3aa1ba3515f50f53c058bf44385",
+    "windows_executable_sha256": "1625dab9c1d62918431c06575d38672a39f002959c94c67cf9c42ceb33c1dea4",
+    "windows_native_receiver_bench_ci": "passed",
+    "windows_user_local_runtime": "GStreamer 1.28.1",
+    "scope": "short native video-only smoke; mock, control disabled, zero speed, CAN down",
+    "scheduled_one_second_ui_samples": 60,
+    "samples_reporting_two_track_draw_callbacks_advancing_and_udp_direct": 57,
+    "samples_connecting_or_waiting": 3,
+    "vehicle_camera_first_frames": 2,
+    "vehicle_selected_pair": {"local_type": "host", "remote_type": "host", "local_family": "ipv6", "remote_family": "ipv6", "local_transport": "udp", "remote_transport": "udp", "both_addresses_classified_public": true},
+    "cellular_route_guard_failed": false,
+    "other_bench_process_observations": 0,
+    "recent_viewer_crash_events_observed": 0,
+    "normal_exit_code_proven": false,
+    "endpoint_identity_independently_checked": false,
+    "display_scanout_or_capture_to_display_latency_proven": false,
+    "control_or_30_minute_acceptance": false,
+    "note": "UI observations are periodic rather than continuous. Advancing GL callbacks are not scan-out or fresh-capture evidence; do not infer a 30-minute or control result."
   },
   "ci": {"source_commit": "5f8d95fc54b3f0124fc7b3cdc0f08698a2473ad7", "windows_native_receiver_bench": "passed", "runtime_or_wan_acceptance": false}
 }

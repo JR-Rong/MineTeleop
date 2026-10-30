@@ -50,3 +50,22 @@ exits without starting a window or network session; the Windows CI exercises
 both accepted and rejected configurations. Actual Windows/Orin video, control,
 long-duration stability, and browser/native comparison require separate bench
 evidence and are not established by that test.
+
+## Control work still required
+
+The native window is deliberately not wired to `update_control_intent`. A
+driving client must first connect the existing session-generation and input
+ownership fences, neutral takeover, input lease, focus/device-loss handling,
+emergency-stop latch, control-profile acknowledgement, time-sync readiness and
+vehicle feedback. It must derive each critical camera's freshness from real
+frame identity and timing, with bad-sample and brake revisions; decoded or drawn
+frame counts alone are insufficient to rearm control. Retained or repeated
+images must never refresh that evidence.
+
+For direct control, the native WebRTC DataChannel must also implement the
+existing scoped transport bridge, frame expiry, result and feedback handling,
+and its WSS fallback without replaying an old command across a change of
+session, owner, negotiation or route. Initial validation must use an isolated
+mock vehicle, zero-speed limits and CAN down, and separately test stalls,
+disconnect, stale frames, input loss and reconnection before any long-run
+comparison. The existing 25 ms commissioning threshold is not changed here.
