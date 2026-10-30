@@ -42,6 +42,8 @@ with tempfile.TemporaryDirectory(prefix='native-receiver-guard-') as directory:
         (['--wan-local-address', '2606:4700::1'], 'explicit family'),
         (['--wan-family', 'ipv6', '--wan-local-address', 'fd00::1', '--wan-remote-address', '2606:4700::1'], 'public'),
         (['--wan-family', 'ipv6', '--wan-local-address', '2606:4700::1', '--wan-remote-address', '2606:4700:0:0:0:0:0:1'], 'must differ'),
+        (['--full-window'], 'remote signaling and display'),
+        (['--full-window', '--display', '--signaling-url', 'http://127.0.0.1:1'], 'explicit WAN endpoints'),
     ]:
         result = subprocess.run([binary, '--config', str(config), '--validate-only', *args],
                                 capture_output=True, text=True, timeout=3)

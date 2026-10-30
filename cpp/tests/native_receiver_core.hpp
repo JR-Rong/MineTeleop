@@ -88,7 +88,7 @@ struct Options {
   bool allow_relay{false};
   std::string address_family{"dual"}, ice_route_mode{"all"};
   Json ice_servers{Json::array()};
-  bool validate_only{false}, display{false};
+  bool validate_only{false}, display{false}, full_window{false};
   std::vector<std::uintptr_t> window_handles;
 };
 
@@ -154,6 +154,7 @@ inline Options options(int argc, char** argv) {
     const std::string flag = argv[i];
     if (flag == "--validate-only") { result.validate_only = true; continue; }
     if (flag == "--display") { result.display = true; continue; }
+    if (flag == "--full-window") { result.full_window = true; continue; }
     if (i + 1 >= argc) throw std::invalid_argument("missing argument: " + flag);
     const std::string value = argv[++i];
     if (flag == "--config") result.config = value;
@@ -185,6 +186,8 @@ inline Options options(int argc, char** argv) {
     throw std::invalid_argument("this build requires --signaling-url (no embedded sender)");
 #endif
   if (result.display && result.stall_ms) throw std::invalid_argument("display mode does not inject consumer stalls");
+  if (result.full_window && (result.signaling_url.empty() || !result.display))
+    throw std::invalid_argument("full-window mode requires remote signaling and display");
   if (!result.local_addresses.empty() || !result.remote_addresses.empty()) {
     if (result.local_addresses.size() != 1 || result.remote_addresses.size() != 1 || result.address_family == "dual")
       throw std::invalid_argument("WAN receiver requires one local and one remote address and an explicit family");
@@ -200,6 +203,8 @@ inline Options options(int argc, char** argv) {
   } else if (result.address_family != "dual") {
     throw std::invalid_argument("WAN family requires explicit local and remote addresses");
   }
+  if (result.full_window && result.local_addresses.empty())
+    throw std::invalid_argument("full-window mode requires explicit WAN endpoints");
   return result;
 }
 inline void validate(const VehicleConfig& config) {

@@ -9,7 +9,8 @@ ip link set lo up
 unshare -n bash -c 'ip link set lo up; exec sleep 60' &
 server_pid=$!
 server_task=
-cleanup() { if [[ -n "$server_task" ]]; then kill "$server_task" 2>/dev/null || true; fi; kill "$server_pid" 2>/dev/null || true; }
+peer_log=$(mktemp)
+cleanup() { if [[ -n "$server_task" ]]; then kill "$server_task" 2>/dev/null || true; fi; kill "$server_pid" 2>/dev/null || true; rm -f "$peer_log"; }
 trap cleanup EXIT
 ip link add cell0 type veth peer name cellpeer
 ip link add alt0 type veth peer name altpeer
@@ -27,9 +28,9 @@ nsenter -t "$server_pid" -n ip addr add 203.0.113.8/32 dev lo
 ip route add default via 10.130.2.2 dev alt0
 nsenter -t "$server_pid" -n python3 -u -c 'import socket
 s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(("203.0.113.8",34567));s.listen(4);s.settimeout(15)
-for _ in range(2):
- c,a=s.accept();c.sendall(a[0].encode());c.close()
-s.close()' &
+for _ in range(3):
+ c,a=s.accept();print(a[0],flush=True);c.sendall(a[0].encode());c.close()
+s.close()' > "$peer_log" &
 server_task=$!
 sleep 0.3
 python3 - <<'PY'
@@ -44,6 +45,12 @@ def check(interface,source):
  print('interface',interface or 'default','peer_observed_source',seen)
 check(None,'10.130.2.1')
 check('cell0','10.130.1.1')
+# The mock peer closes before SSH authentication; only the kernel-observed
+# source address is asserted below. No credentials are offered to the fixture.
+ssh=subprocess.run(['ssh','-B','cell0','-b','10.130.1.1','-p','34567',
+                    '-o','BatchMode=yes','-o','ConnectTimeout=2',
+                    'fixture@203.0.113.8'],capture_output=True,timeout=5)
+assert ssh.returncode != 0
 subprocess.run(['ip','link','set','cell0','down'],check=True)
 s=socket.socket();s.settimeout(2);s.setsockopt(socket.SOL_SOCKET,socket.SO_BINDTODEVICE,b'cell0\0')
 try:
@@ -53,3 +60,6 @@ except OSError as e:
 finally:s.close()
 PY
 wait "$server_task"
+mapfile -t peers < "$peer_log"
+[[ ${#peers[@]} == 3 && ${peers[0]} == 10.130.2.1 && ${peers[1]} == 10.130.1.1 && ${peers[2]} == 10.130.1.1 ]]
+echo 'PASS: ssh -B retained the cellular source after the default route changed'

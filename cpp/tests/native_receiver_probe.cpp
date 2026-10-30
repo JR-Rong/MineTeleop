@@ -3,7 +3,8 @@
 namespace {
 using namespace mine_teleop::bench;
 void receive(const Options& opts, const std::string& vehicle_id, DriverConsoleRuntime& driver,
-             Receiver& receiver, Json& result, const std::function<bool()>& done, bool embedded) {
+             Receiver& receiver, Json& result, const std::function<bool()>& done, bool embedded,
+             std::size_t expected_tracks) {
   try {
     static_cast<void>(driver.login());
     bool online = false;
@@ -20,11 +21,16 @@ void receive(const Options& opts, const std::string& vehicle_id, DriverConsoleRu
     Json scope{{"source_session_id", connected.at("session_id")},
                {"source_control_session_generation", connected.at("control_session_generation")}};
     const auto timeout = Clock::now() + std::chrono::seconds(opts.seconds + (embedded ? 15 : 0));
+    const auto setup_deadline = Clock::now() + 60s;
+    std::optional<Clock::time_point> window_started;
     std::string negotiation;
     std::deque<Json> early_candidates;
     auto next_stats = Clock::now();
-    result["measurement_start_clock_ms"] = bench_now_ms();
-    while (!done() && Clock::now() < timeout) {
+    if (!opts.full_window) result["measurement_start_clock_ms"] = bench_now_ms();
+    while (!done() && (opts.full_window || Clock::now() < timeout)) {
+      if (opts.full_window && !window_started && Clock::now() >= setup_deadline)
+        throw std::runtime_error("full-window receiver did not become ready before the setup deadline");
+      if (window_started && Clock::now() - *window_started >= std::chrono::seconds(opts.seconds)) break;
       receiver.check();
       const auto polled = driver.poll_signaling();
       for (const auto& message : polled.at("messages")) {
@@ -50,11 +56,27 @@ void receive(const Options& opts, const std::string& vehicle_id, DriverConsoleRu
       }
       // Preserve the selected pair while the sender is still connected.
       if (!negotiation.empty() && Clock::now() >= next_stats) {
+        const auto counters = receiver.counters();
+        if (opts.full_window && !window_started && counters.size() == expected_tracks &&
+            receiver.selected_pair().is_object() &&
+            std::all_of(counters.begin(), counters.end(), [](const auto& track) {
+              return track.value("decoded", 0) > 30 && track.value("drawn", 0) > 0;
+            })) {
+          window_started = Clock::now();
+          result["measurement_start_clock_ms"] = bench_now_ms();
+        }
         result["webrtc_stats"] = receiver.stats();
-        result["samples"].push_back({{"clock_ms", bench_now_ms()}, {"tracks", receiver.counters()},
-                                      {"webrtc", result["webrtc_stats"]}});
+        if (!opts.full_window || window_started)
+          result["samples"].push_back({{"clock_ms", bench_now_ms()}, {"tracks", counters},
+                                        {"webrtc", result["webrtc_stats"]}});
         next_stats = Clock::now() + 1s;
       }
+    }
+    receiver.check();
+    if (opts.full_window) {
+      const auto elapsed = window_started ? std::chrono::duration<double>(Clock::now() - *window_started).count() : 0.0;
+      result["full_window_elapsed_seconds"] = elapsed;
+      result["full_window_completed"] = elapsed >= opts.seconds;
     }
     if (embedded && !done()) throw std::runtime_error("bench duration exceeded");
   } catch (const std::exception& error) { result["error"] = error.what(); }
@@ -98,7 +120,8 @@ Json run(const Options& opts, VehicleConfig config) {
               {"duration_requested_s", opts.seconds}, {"scope", "same-host WebRTC H264; decoder/consumer and optional GL draw; no scan-out, input, CAN or WAN acceptance"},
               {"control_enabled", false}, {"adapter", "mock"}, {"external_signaling", false},
               {"stun_endpoint", "loopback-unreachable:34789"}, {"turn_configured", false}};
-  receive(opts, config.vehicle_id, driver, receiver, result, [&] { return vehicle_done.load(); }, true);
+  receive(opts, config.vehicle_id, driver, receiver, result, [&] { return vehicle_done.load(); }, true,
+          config.enabled_cameras().size());
   sender.request_stop(); sender.join();
   receiver.stop();
   result["receiver"] = receiver.report();
@@ -132,7 +155,8 @@ Json run_remote(const Options& opts, const VehicleConfig& config) {
   Json result{{"schema", "native-receiver-remote-v1"}, {"runtime", gst_version_string()},
               {"duration_requested_s", opts.seconds}, {"scope", "receive-only bench; sender containment must be verified separately"},
               {"external_signaling", true}, {"control_tested", false}};
-  receive(opts, config.vehicle_id, driver, receiver, result, [] { return false; }, false);
+  receive(opts, config.vehicle_id, driver, receiver, result, [] { return false; }, false,
+          config.enabled_cameras().size());
   receiver.stop();
   result["receiver"] = receiver.report();
   const auto& pair = result["receiver"]["selected_pair"];
@@ -146,7 +170,8 @@ Json run_remote(const Options& opts, const VehicleConfig& config) {
       same_ip_address(opts.local_addresses.front(), pair.value("local_address", "")) &&
       same_ip_address(opts.remote_addresses.front(), pair.value("remote_address", "")));
   result["expected_wan_endpoints_observed"] = opts.local_addresses.empty() ? Json(nullptr) : Json(expected_pair);
-  result["passed"] = !result.contains("error") && frames && expected_pair && result["direct_host_udp_observed"].get<bool>();
+  result["passed"] = !result.contains("error") && frames && expected_pair && result["direct_host_udp_observed"].get<bool>() &&
+      (!opts.full_window || result.value("full_window_completed", false));
   result["pass_criteria"] = "configured tracks decoded (and GL drawn if requested), host/UDP; no latency or scan-out SLA";
   try { static_cast<void>(driver.end_session("native_receiver_probe_finished")); } catch (...) {}
   return result;
@@ -253,6 +278,7 @@ int probe_main(int argc, char** argv, void*) {
                    "[--decoder avdec_h264|nvv4l2decoder|vtdec_hw] [--consumer-stall-ms 0..500]\n"
                    "[--signaling-url http://127.0.0.1:PORT --driver-id ID] [--display]\n"
                    "[--wan-family ipv4|ipv6 --wan-local-address IP --wan-remote-address IP]\n"
+                   "[--full-window] starts the duration only after both decoding and GL draw are observed.\n"
                    "Remote mode requires MINE_TELEOP_DRIVER_PASSWORD and a separately contained sender.\n"
                    "--config FILE --validate-only checks containment without starting a runtime.\n";
       return 0;

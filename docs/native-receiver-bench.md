@@ -610,6 +610,8 @@ Windows x64 可显式同时设置 `MINE_TELEOP_BUILD_BENCH_PROBES=ON` 与
 
 公网 IPv6 诊断使用 `--wan-family ipv6 --wan-local-address <本端公网地址>
 --wan-remote-address <指定对端公网地址>`；三者必须一起提供，ICE 被限制为 UDP，
-远端 SDP/trickle 候选和最终选中对都检查指定地址。不能用局域网地址代替 WAN，
+远端 SDP/trickle 候选和最终选中对都检查指定地址。`--full-window` 要求公网端点与
+显示，仅在每路出现实际解码与 GL draw 后开始计时，不能将建立连接的时间算进窗口。
+不能用局域网地址代替 WAN，
 不能将解码或 GL draw 当作物理显示扫描或端到端延迟。Windows 下需要实测所装
 GStreamer 插件、硬件驱动与实际窗口呈现，不能预先宣称硬件解码或零拷贝。
