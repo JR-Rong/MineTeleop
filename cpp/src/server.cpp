@@ -2216,8 +2216,10 @@ void SimpleHttpServer::serve_client(SocketHandle client_fd) const {
   for (std::size_t count = 0; count < max_requests && !stopping_; ++count) {
     ServerResponse response;
     bool keep_alive = false;
+    bool request_parsed = false;
     try {
       auto request = parse_request(client_fd, max_body_bytes_, wire, persistence);
+      request_parsed = true;
       request.peer_address = socket_peer_address(client_fd);
       if (websocket_handler_ && websocket_handler_(client_fd, request)) return;
       const auto connection = request.headers.find("connection");
@@ -2240,7 +2242,7 @@ void SimpleHttpServer::serve_client(SocketHandle client_fd) const {
       response = ServerResponse::json(400, {{"error", error.what()}});
       keep_alive = false;
     } catch (const std::exception& error) {
-      if (persistence && wire.empty()) return;
+      if (persistence && !request_parsed && wire.empty()) return;
       response = ServerResponse::json(500, {{"error", error.what()}});
       keep_alive = false;
     }

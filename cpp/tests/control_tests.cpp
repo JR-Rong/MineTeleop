@@ -385,6 +385,7 @@ void test_bounded_persistent_http_framing() {
       [&](const mine_teleop::HttpRequest& request) {
         if (request.path == "/slow") { slow_entered.set_value(); slow_gate.wait(); }
         if (request.path == "/old-input") ++old_input_handled;
+        if (request.path == "/handler-error") throw std::runtime_error("handler failure");
         return mine_teleop::ServerResponse::text(200, request.path + ":" + request.body);
       }, 1024, {}, mine_teleop::HttpConnectionPolicy::BoundedKeepAlive);
   server.start();
@@ -411,6 +412,9 @@ void test_bounded_persistent_http_framing() {
   const int fd = connect();
   raw_send_all(fd, "POST /one HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nA");
   const auto first = response(fd);
+  // Allow the server's conservative post-response pending-input check to
+  // finish; it may otherwise close even a valid very fast sequential client.
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
   raw_send_all(fd, "GET /two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
   const auto second = response(fd);
   expect(first.first.find("Connection: keep-alive") != std::string::npos && first.second == "/one:A",
@@ -438,6 +442,13 @@ void test_bounded_persistent_http_framing() {
   expect(slow_response.first.find("Connection: close") != std::string::npos && old_input_handled == 0,
          "a request queued behind a slow handler was processed as fresh");
   ::close(queued);
+  const int failed = connect();
+  raw_send_all(failed, "GET /handler-error HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  const auto failure_response = response(failed);
+  expect(failure_response.first.starts_with("HTTP/1.1 500 ") &&
+             failure_response.first.find("Connection: close") != std::string::npos,
+         "persistent handler failure did not return a closed 500 response");
+  ::close(failed);
   for (const auto* framing : {"Content-Length: 0\r\nContent-Length: 1\r\n", "Transfer-Encoding: chunked\r\n",
                               "Content-Length: +1\r\n", "Connection: close\r\nConnection: keep-alive\r\n"}) {
     const int bad = connect();
@@ -454,6 +465,7 @@ void test_bounded_persistent_http_framing() {
   ::close(legacy);
   const int bounded = connect();
   for (int i = 0; i < 512; ++i) {
+    if (i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     raw_send_all(bounded, "GET /limit HTTP/1.1\r\nHost: localhost\r\n\r\n");
     const auto result = response(bounded);
     const auto expected = i == 511 ? "Connection: close" : "Connection: keep-alive";

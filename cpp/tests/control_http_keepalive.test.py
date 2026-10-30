@@ -34,6 +34,9 @@ with tempfile.TemporaryFile() as log:
                 time.sleep(.05)
         source_port = connection.sock.getsockname()[1]
         for index in range(1, 512):
+            # The server fails closed if input arrives during its final
+            # post-response pipeline check, even if the client was very fast.
+            time.sleep(.005)
             connection.request('GET', '/health')
             result = connection.getresponse()
             assert result.status == 200
