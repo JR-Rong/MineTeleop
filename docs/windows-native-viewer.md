@@ -25,10 +25,12 @@ existing probe with the pinned GStreamer SDK. The workflow artifact contains
 the two executables, not a self-contained installer. Install the matching
 GStreamer runtime separately and make its `bin` directory available on PATH;
 ensure the WebRTC, libnice, H.264 decoder and GL plugins are available.
-Start the viewer from a working directory containing the chosen configuration
-files, or enter absolute paths in its two configuration fields. Enter the driver
-password in the password field and choose Connect. Disconnect closes the
-session; closing the window also requests disconnection.
+From the artifact directory, run `./run-native-viewer.ps1 -GStreamerRoot
+<runtime-directory>`. The launcher checks the required elements, scopes the
+runtime environment to the process, and starts the viewer. Use `-CheckOnly` to
+check dependencies without opening a window. Enter absolute paths in the two
+configuration fields, enter the driver password, and choose Connect.
+Disconnect closes the session; closing the window also requests disconnection.
 
 The vehicle YAML supplied to the viewer must describe one or two H.264 cameras,
 media enabled, control disabled, mock adapter, bench mode, zero speed, and

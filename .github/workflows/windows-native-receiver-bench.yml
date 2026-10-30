@@ -11,6 +11,7 @@ on:
       - 'cpp/include/mine_teleop/detail/native_viewer_observation.hpp'
       - 'cpp/tests/windows_native_viewer_containment.test.py'
       - 'cpp/tests/windows_native_viewer_observation_tests.cpp'
+      - 'packaging/windows/run-native-viewer.ps1'
       - '.github/workflows/windows-native-receiver-bench.yml'
   workflow_dispatch:
 
@@ -95,10 +96,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'native viewer observation test failed' }
           python cpp/tests/windows_native_viewer_containment.test.py $viewer configs/vehicle-agent.orin-cpu-bench.yaml
           if ($LASTEXITCODE -ne 0) { throw 'native viewer containment test failed' }
+          & ./packaging/windows/run-native-viewer.ps1 -GStreamerRoot $env:GST_BENCH_ROOT -ViewerPath $viewer -CheckOnly
+          if ($LASTEXITCODE -ne 0) { throw 'native viewer runtime dependencies are incomplete' }
           New-Item -ItemType Directory -Path receiver-artifact | Out-Null
           Copy-Item $exe receiver-artifact/
           Copy-Item $viewer receiver-artifact/
-          Get-FileHash $exe -Algorithm SHA256 | Format-List | Out-File receiver-artifact/sha256.txt
+          Copy-Item packaging/windows/run-native-viewer.ps1 receiver-artifact/
+          Copy-Item docs/windows-native-viewer.md receiver-artifact/
+          Get-FileHash $exe,$viewer -Algorithm SHA256 | Format-List | Out-File receiver-artifact/sha256.txt
           git rev-parse HEAD | Out-File receiver-artifact/source-commit.txt -Encoding ascii
       - uses: actions/upload-artifact@v7
         with:
