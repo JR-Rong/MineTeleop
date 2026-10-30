@@ -252,6 +252,7 @@ if(MINE_TELEOP_BUILD_BENCH_PROBES AND (NOT WIN32 OR MINE_TELEOP_BUILD_WINDOWS_NA
     target_link_libraries(mine-teleop-windows-viewer PRIVATE mine_teleop_runtime PkgConfig::RECEIVER_GST user32 shell32)
     if(MSVC)
       target_compile_options(mine-teleop-windows-viewer PRIVATE /utf-8)
+      target_link_options(mine-teleop-windows-viewer PRIVATE /MAP)
     endif()
     mine_teleop_enable_warnings(mine-teleop-windows-viewer)
     add_executable(mine-teleop-windows-viewer-observation-tests cpp/tests/windows_native_viewer_observation_tests.cpp)

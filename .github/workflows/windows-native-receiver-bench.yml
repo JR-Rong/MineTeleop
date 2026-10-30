@@ -101,6 +101,7 @@ jobs:
           New-Item -ItemType Directory -Path receiver-artifact | Out-Null
           Copy-Item $exe receiver-artifact/
           Copy-Item $viewer receiver-artifact/
+          Copy-Item (Join-Path $PWD 'build/windows-control-x64/Release/mine-teleop-windows-viewer.map') receiver-artifact/
           Copy-Item packaging/windows/run-native-viewer.ps1 receiver-artifact/
           Copy-Item docs/windows-native-viewer.md receiver-artifact/
           Get-FileHash $exe,$viewer -Algorithm SHA256 | Format-List | Out-File receiver-artifact/sha256.txt

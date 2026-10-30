@@ -3,6 +3,7 @@
 #include "mine_teleop/detail/native_viewer_observation.hpp"
 #include <windows.h>
 #include <shellapi.h>
+#include <cstdio>
 
 namespace {
 using namespace mine_teleop;
@@ -44,6 +45,7 @@ struct Window {
 
   void connect(std::string driver_path, std::string vehicle_path, std::string secret,
                std::stop_token stop_token) {
+    const char* phase = "configuration";
     try {
       const auto vehicle = load_vehicle_config(vehicle_path);
       validate(vehicle);  // Local configuration is not remote containment evidence.
@@ -59,8 +61,10 @@ struct Window {
       bool connected = false;
       try {
         report(L"正在登录并连接车端；仅观看，控制禁用。");
+        phase = "login";
         static_cast<void>(driver.login());
         if (stop_token.stop_requested()) throw std::runtime_error("cancelled");
+        phase = "connect";
         const auto session = driver.connect(vehicle.vehicle_id, "windows-native-viewer");
         connected = true;
         const auto ice = driver.ice_servers().at("ice_servers");
@@ -73,12 +77,15 @@ struct Window {
         auto next_observation = Clock::now();
         std::vector<std::uint64_t> previous_draws;
         while (!stop_token.stop_requested()) {
+          phase = "receiver_check";
           if (receiver) receiver->check();
+          phase = "signaling_poll";
           const auto polled = driver.poll_signaling();
           for (const auto& message : polled.at("messages")) {
             const auto type = message.value("type", "");
             const auto payload = message.value("payload", Json::object());
             if (type == "webrtc_offer") {
+              phase = "offer";
               if (receiver) throw std::runtime_error("renegotiation requires a new viewer session");
               Options options;
               options.display = true;
@@ -95,18 +102,21 @@ struct Window {
               early.clear();
               report(L"已提交媒体应答，等待画面；仅观看，控制禁用。");
             } else if (type == "ice_candidate") {
+              phase = "remote_candidate";
               if (receiver) receiver->candidate(payload);
               else if (early.size() < 256) early.push_back(payload);
               else throw std::runtime_error("early ICE candidate limit reached");
             }
           }
           if (receiver) {
+            phase = "local_candidates";
             for (const auto& candidate : receiver->candidates()) {
               auto outgoing = scope;
               outgoing.update({{"candidate", candidate}, {"media_negotiation_id", negotiation}});
               static_cast<void>(driver.send_webrtc_ice_candidate(outgoing));
             }
             if (Clock::now() >= next_observation) {
+              phase = "observation";
               const auto tracks = receiver->counters();
               std::vector<std::uint64_t> current;
               for (const auto& track : tracks) current.push_back(track.value("drawn", std::uint64_t{}));
@@ -137,7 +147,14 @@ struct Window {
       }
       if (connected) { try { static_cast<void>(driver.end_session("native_viewer_disconnect")); } catch (...) {} }
       report(L"已断开；控制始终禁用。");
-    } catch (const std::exception&) {
+    } catch (const std::exception& error) {
+      // Report only a fixed category and phase: network errors can contain
+      // addresses or credentials and must not be copied into diagnostic logs.
+      const std::string_view detail = error.what();
+      const char* category = detail.find("native view has no matching media pad") != std::string_view::npos ? "unmapped_pad" :
+          detail.find("decode track link/start failed") != std::string_view::npos ? "track_link" :
+          detail.find("GStreamer promise timed out") != std::string_view::npos ? "promise_timeout" : "other";
+      std::fprintf(stderr, "native_viewer_failure phase=%s category=%s\n", phase, category);
       std::fill(secret.begin(), secret.end(), '\0');
       report(stop_token.stop_requested() ? L"已取消连接。" :
           L"连接或视频失败。请检查配置、台架隔离、信令和 GStreamer 依赖。");

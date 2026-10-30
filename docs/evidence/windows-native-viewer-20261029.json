@@ -1,0 +1,31 @@
+{
+  "scope": "short Windows native viewer functional smoke with Orin cellular; video only, no input or CAN",
+  "source_commit": "0bb2ccbcc1ff19d2dd7b9428b269f5cb2c2bae6f",
+  "windows_executable_sha256": "d9eea83082a9d0976fb49eb3430a05543463774768cfc7b5f4d42d70e5f431ba",
+  "windows_runtime": "GStreamer 1.28.1 user-local installation; installer SHA-256 verified",
+  "window_smoke": {"opened": true, "closed": true, "exit_code": 0, "source_commit": "0b446009ea9b1279edcb77aa605e61bfe566c56c", "media_tested": false},
+  "live_smoke": {
+    "outcome": "failed",
+    "window_opened": true,
+    "vehicle_control_enabled": false,
+    "vehicle_adapter": "mock",
+    "vehicle_bench_max_speed_kph": 0,
+    "can_after": "DOWN",
+    "cellular_route_guard_failed": false,
+    "other_bench_process_observations": 20,
+    "other_bench_processes_paused": false,
+    "vehicle_selected_pair": {"local_type": "host", "remote_type": "host", "local_family": "ipv6", "remote_family": "ipv6", "local_transport": "udp", "remote_transport": "udp", "both_addresses_classified_public": true},
+    "endpoint_identity_independently_checked": false,
+    "first_camera_frames_observed_on_vehicle": 2,
+    "windows_drawn_frames_proven": false,
+    "viewer_status_observations": ["connecting", "waiting for frame; path unknown", "waiting for frame; direct UDP", "video failure"],
+    "windows_exit_code": -1073741819,
+    "windows_exception": "0xc0000005",
+    "windows_fault_module": "viewer-current.exe",
+    "windows_fault_offset": "0x00000000001123b8",
+    "latency_comparison_or_30_minute_acceptance": false,
+    "note": "An initial run's status sampler could not read controls across processes and is excluded. The corrected sampler saw an application failure and crash shortly after ICE connection. Root cause remains unverified."
+  },
+  "security": {"temporary_cloud_key_removed": true, "temporary_cloud_and_orin_credentials_removed": true, "temporary_windows_key_and_credentials_removed": true},
+  "ci": {"source_commit": "5f8d95fc54b3f0124fc7b3cdc0f08698a2473ad7", "windows_native_receiver_bench": "passed", "runtime_or_wan_acceptance": false}
+}
