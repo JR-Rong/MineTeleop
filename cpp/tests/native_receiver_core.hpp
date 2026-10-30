@@ -778,10 +778,14 @@ class Receiver {
       g_object_get(pad, "transceiver", &transceiver, nullptr);
       if (transceiver) { g_object_get(transceiver, "mid", &mid, nullptr); g_object_unref(transceiver); }
       const auto found = mid ? camera_windows_.find(mid) : camera_windows_.end();
-      if (found != camera_windows_.end() && used_camera_windows_.insert(found->second).second)
-        mapped_index = static_cast<int>(found->second);
+      const bool missing_mid = !mid || !*mid;
+      const bool unknown_mid = !missing_mid && found == camera_windows_.end();
+      const bool duplicate_mid = !missing_mid && !unknown_mid && !used_camera_windows_.insert(found->second).second;
+      if (!missing_mid && !unknown_mid && !duplicate_mid) mapped_index = static_cast<int>(found->second);
       g_free(mid);
-      if (mapped_index < 0) throw std::runtime_error("native view has no matching camera MID");
+      if (missing_mid) throw std::runtime_error("native view camera MID unavailable");
+      if (unknown_mid) throw std::runtime_error("native view camera MID not in offer");
+      if (duplicate_mid) throw std::runtime_error("native view camera MID already assigned");
     }
     GError* error = nullptr;
     const auto decoder = detail::low_latency_decoder_stage(options_.decoder);
