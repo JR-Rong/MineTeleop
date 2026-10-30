@@ -113,6 +113,7 @@ jobs:
             mine-teleop-control-tests \
             mine-teleop-native-control-intent-tests \
             mine-teleop-native-control-mailbox-tests \
+            mine-teleop-native-control-publication-tests \
             mine-teleop-native-control-channel-tests \
             mine-teleop-native-receiver-mid-integration-tests \
             mine-teleop-native-view-only-integration-tests \

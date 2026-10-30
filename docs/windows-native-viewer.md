@@ -70,6 +70,10 @@ and queue overflow. GStreamer without the early channel callback is rejected;
 local send success means queued, not vehicle receipt. The loopback test does
 not establish path identity, command authentication, video freshness, or any
 vehicle-control behavior. Receive-only mode remains enforced in the window.
+The native publication filter rejects expired, replayed, wrongly scoped or
+byte-mismatched bridge frames before a one-time send attempt. It is an
+experimental component, not yet connected to the runtime or window; the
+caller must serialize sends with session and owner retirement.
 
 The native window is deliberately not wired to `update_control_intent`. A
 driving client must first connect the existing session-generation and input
