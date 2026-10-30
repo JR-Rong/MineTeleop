@@ -10,6 +10,11 @@
 
 namespace mine_teleop::detail {
 
+inline bool native_direct_udp_candidate(std::string_view type, std::string_view protocol) {
+  return (type == "host" || type == "srflx" || type == "prflx") &&
+      (protocol == "udp" || protocol == "UDP");
+}
+
 // Experimental courier only. It never authorizes control: the caller must
 // validate the selected SCTP route, input lease and video gate independently.
 class NativeControlChannel {
@@ -107,6 +112,46 @@ class NativeControlChannel {
   [[nodiscard]] bool ready() const {
     std::lock_guard lock(state_->mutex);
     return !state_->retired && state_->open && state_->mailbox.usable();
+  }
+  // Observe the ICE transport actually carrying this SCTP association, not a
+  // media-track pair. Unknown, relay, TCP and older runtimes fail closed.
+  // This is route classification only, not peer identity or WAN evidence.
+  [[nodiscard]] bool direct_udp() const {
+#if GST_CHECK_VERSION(1, 28, 0)
+    std::lock_guard send_lock(state_->send_mutex);
+    {
+      std::lock_guard lock(state_->mutex);
+      if (state_->retired || !state_->open || !state_->mailbox.usable() || !peer_) return false;
+    }
+    GstWebRTCSCTPTransport* sctp = nullptr;
+    GstWebRTCDTLSTransport* dtls = nullptr;
+    GstWebRTCICETransport* ice = nullptr;
+    GstWebRTCPeerConnectionState peer_state = GST_WEBRTC_PEER_CONNECTION_STATE_NEW;
+    GstWebRTCSCTPTransportState sctp_state = GST_WEBRTC_SCTP_TRANSPORT_STATE_NEW;
+    GstWebRTCDTLSTransportState dtls_state = GST_WEBRTC_DTLS_TRANSPORT_STATE_NEW;
+    GstWebRTCICEConnectionState ice_state = GST_WEBRTC_ICE_CONNECTION_STATE_NEW;
+    g_object_get(peer_, "connection-state", &peer_state, "sctp-transport", &sctp, nullptr);
+    if (sctp) g_object_get(sctp, "state", &sctp_state, "transport", &dtls, nullptr);
+    if (dtls) g_object_get(dtls, "state", &dtls_state, "transport", &ice, nullptr);
+    if (ice) g_object_get(ice, "state", &ice_state, nullptr);
+    auto* pair = ice ? gst_webrtc_ice_transport_get_selected_candidate_pair(ice) : nullptr;
+    const auto candidate_direct_udp = [](const GstWebRTCICECandidate* candidate) {
+      if (!candidate || !candidate->stats || !candidate->stats->type || !candidate->stats->proto) return false;
+      return native_direct_udp_candidate(candidate->stats->type, candidate->stats->proto);
+    };
+    const bool result = peer_state == GST_WEBRTC_PEER_CONNECTION_STATE_CONNECTED &&
+        sctp_state == GST_WEBRTC_SCTP_TRANSPORT_STATE_CONNECTED &&
+        dtls_state == GST_WEBRTC_DTLS_TRANSPORT_STATE_CONNECTED &&
+        (ice_state == GST_WEBRTC_ICE_CONNECTION_STATE_CONNECTED || ice_state == GST_WEBRTC_ICE_CONNECTION_STATE_COMPLETED) &&
+        pair && candidate_direct_udp(pair->local) && candidate_direct_udp(pair->remote);
+    if (pair) gst_webrtc_ice_candidate_pair_free(pair);
+    if (ice) gst_object_unref(ice);
+    if (dtls) gst_object_unref(dtls);
+    if (sctp) gst_object_unref(sctp);
+    return result;
+#else
+    return false;
+#endif
   }
   std::optional<std::string> pop() { return state_->mailbox.pop(state_->scope); }
 

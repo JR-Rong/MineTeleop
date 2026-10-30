@@ -77,6 +77,11 @@ caller must serialize sends with session and owner retirement.
 An isolated integration fixture exercises that filter with the real control
 bridge, signed commands and a mock vehicle service; it simulates the DC byte
 path and does not prove WebRTC delivery or physical vehicle behavior.
+With GStreamer 1.28 or later the experimental channel can inspect the selected
+ICE pair of the SCTP transport itself and classify a connected non-relay UDP
+pair. Older versions and missing or ambiguous state return false. The result
+is a snapshot, not proof of peer identity or a WAN route, and is not yet used
+to authorize control or to claim a relay protocol.
 
 The native window is deliberately not wired to `update_control_intent`. A
 driving client must first connect the existing session-generation and input

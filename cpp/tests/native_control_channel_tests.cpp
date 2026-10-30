@@ -90,6 +90,11 @@ int main(int argc, char** argv) {
   // must run after Winsock initialization even for 127.0.0.1.
   g_networking_init();
   try {
+    using mine_teleop::detail::native_direct_udp_candidate;
+    require(native_direct_udp_candidate("host", "udp") && native_direct_udp_candidate("srflx", "UDP") &&
+            native_direct_udp_candidate("prflx", "udp"), "direct UDP candidate rejected");
+    require(!native_direct_udp_candidate("relay", "udp") && !native_direct_udp_candidate("host", "tcp") &&
+            !native_direct_udp_candidate("", "udp"), "relay, TCP or unknown candidate admitted");
     bool rejected_null = false;
     try { NativeControlChannel invalid(nullptr, {"fixture", 1, "attempt"}); }
     catch (const std::invalid_argument&) { rejected_null = true; }
@@ -97,7 +102,7 @@ int main(int argc, char** argv) {
     Peer a, b;
 #if GST_CHECK_VERSION(1, 22, 0)
     NativeControlChannel courier(b.rtc, {"fixture", 1, "attempt"});
-    require(!courier.ready() && !courier.send("before-open"), "unopened channel accepted send");
+    require(!courier.ready() && !courier.direct_udp() && !courier.send("before-open"), "unopened channel accepted send");
     a.start(true); b.start(false); a.describe(b, true); b.describe(a, false);
     bool sent = false, delivered = false, responded = false;
     const auto deadline = std::chrono::steady_clock::now() + 15s;
@@ -113,6 +118,13 @@ int main(int argc, char** argv) {
                 << " request_sent=" << sent << " request_received=" << delivered
                 << " response_queued=" << responded << " response_received=" << a.received << '\n';
     require(delivered && a.received, "bidirectional DataChannel delivery failed");
+#if GST_CHECK_VERSION(1, 28, 0)
+    const auto route_deadline = std::chrono::steady_clock::now() + 3s;
+    while (!courier.direct_udp() && std::chrono::steady_clock::now() < route_deadline) std::this_thread::sleep_for(10ms);
+    require(courier.direct_udp(), "SCTP transport did not attest the loopback UDP host pair");
+#else
+    require(!courier.direct_udp(), "old GStreamer must not infer SCTP route from media");
+#endif
     auto* duplicate_options = gst_structure_new("control", "ordered", G_TYPE_BOOLEAN, FALSE,
         "max-retransmits", G_TYPE_INT, 0, "protocol", G_TYPE_STRING, "mine-teleop-control-v1", nullptr);
     GstWebRTCDataChannel* duplicate = nullptr;
@@ -125,7 +137,7 @@ int main(int argc, char** argv) {
     require(!courier.ready() && !courier.send("after-duplicate"), "duplicate channel did not fail closed");
     g_object_unref(duplicate);
     courier.retire();
-    require(!courier.ready() && !courier.send("after-retire") && !courier.pop(), "retired channel still usable");
+    require(!courier.ready() && !courier.direct_udp() && !courier.send("after-retire") && !courier.pop(), "retired channel still usable");
     std::cout << "PASS scoped DataChannel loopback delivery and retirement\n";
 #else
     bool rejected = false;
