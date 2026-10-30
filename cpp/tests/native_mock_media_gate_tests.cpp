@@ -85,10 +85,10 @@ void test_live_clock_keyboard_and_media_guard() {
       Clock::now().time_since_epoch()).count(); };
   mine_teleop::detail::NativeMockKeyboard keyboard;
   using Keys = mine_teleop::detail::NativeMockKeyboard::Keys;
-  keyboard.observe_now(true, Keys{});
+  keyboard.observe(true, Keys{}, now());
   require(keyboard.heartbeat_alive_now(), "live keyboard heartbeat missing");
   static_cast<void>(keyboard.sample_now(true));
-  keyboard.observe_now(true, Keys{true, false, false, false});
+  keyboard.observe(true, Keys{true, false, false, false}, now());
   require(keyboard.sample_now(true).throttle == .25, "live keyboard did not accept a fresh held key");
   require(keyboard.sample_now(false).throttle == 0, "live keyboard did not revoke an unsafe held key");
   require(keyboard.sample_now(true).throttle == 0, "live keyboard resumed without a fresh release");

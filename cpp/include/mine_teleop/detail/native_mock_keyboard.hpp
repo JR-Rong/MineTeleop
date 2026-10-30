@@ -23,11 +23,6 @@ class NativeMockKeyboard {
     observe_locked(focused, keys, now_ms);
   }
 
-  void observe_now(bool focused, Keys keys) {
-    std::lock_guard lock(mutex_);
-    observe_locked(focused, keys, now());
-  }
-
   void withdraw() {
     std::lock_guard lock(mutex_);
     focused_ = false;

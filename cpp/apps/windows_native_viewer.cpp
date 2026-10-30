@@ -748,9 +748,9 @@ LRESULT CALLBACK procedure(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         const bool focused = app->running.load() && IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
             GetForegroundWindow() == hwnd && (focus == hwnd || focus == app->video[0] || focus == app->video[1]);
         const auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
-        app->keyboard.observe_now(focused,
+        app->keyboard.observe(focused,
             {down('W') || down(VK_UP), down('A') || down(VK_LEFT), down('D') || down(VK_RIGHT),
-             down('S') || down(VK_DOWN) || down(VK_SPACE)});
+             down('S') || down(VK_DOWN) || down(VK_SPACE)}, static_cast<std::int64_t>(bench_now_ms()));
         return 0;
       }
       if (wparam == 1 && app->running.load() && detail::viewer_observation_stale(
