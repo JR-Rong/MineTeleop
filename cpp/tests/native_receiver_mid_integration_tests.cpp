@@ -97,6 +97,8 @@ int main(int argc, char** argv) {
   gst_init(&argc, &argv);
   g_networking_init();
   try {
+    const bool swap_identity = argc == 2 && std::string_view(argv[1]) == "--swap-identity";
+    require(argc == 1 || swap_identity, "unknown fixture argument");
     for (const auto* name : {"videotestsrc", "x264enc", "h264parse", "rtph264pay", "webrtcbin", "avdec_h264"}) {
       auto* factory = gst_element_factory_find(name);
       if (!factory) { std::cerr << "missing synthetic test plugin " << name << '\n'; return 77; }
@@ -114,18 +116,29 @@ int main(int argc, char** argv) {
     require(offer_sdp.find("a=ssrc:1000000001 ") != std::string::npos &&
             offer_sdp.find("a=ssrc:1000000002 ") != std::string::npos,
             "synthetic offer lacks distinct production-style SSRC identities");
-    const Json offer{{"media_negotiation_id", "test-attempt"}, {"sdp", offer_sdp},
-                     {"media_tracks", Json::array({{{"camera_id", "front"}}, {{"camera_id", "rear"}}})}};
+    const Json media_tracks = swap_identity
+        ? Json::array({{{"camera_id", "rear"}}, {{"camera_id", "front"}}})
+        : Json::array({{{"camera_id", "front"}}, {{"camera_id", "rear"}}});
+    const Json offer{{"media_negotiation_id", "test-attempt"}, {"sdp", offer_sdp}, {"media_tracks", media_tracks}};
     sender.answer(receiver.answer(offer));
     const auto deadline = Clock::now() + 15s;
-    bool passed = false;
+    bool passed = false, rejected_swap = false;
     bool sent = false, delivered = false, responded = false;
     while (Clock::now() < deadline) {
       sender.exchange(receiver); receiver.check();
       std::set<std::string> identities;
       const auto tracks = receiver.counters();
-      for (const auto& track : tracks)
-        if (track.value("decoded", 0) >= 5) identities.insert(track.value("camera_id", ""));
+      for (const auto& track : tracks) {
+        if (track.value("decoded", 0) < 5) continue;
+        const auto camera = track.value("camera_id", "");
+        const auto expected_ssrc = camera == "front" ? 1000000001U : camera == "rear" ? 1000000002U : 0U;
+        const bool matches = expected_ssrc != 0 && track.value("first_rtp_ssrc", 0U) == expected_ssrc &&
+            track.value("other_rtp_ssrc_packets", 0U) == 0;
+        if (swap_identity && !matches) { rejected_swap = true; break; }
+        require(matches, "negotiated camera identity does not match its synthetic RTP source");
+        identities.insert(camera);
+      }
+      if (rejected_swap) break;
 #if GST_CHECK_VERSION(1, 22, 0)
       auto* channel = receiver.control_channel();
       if (sender.channel_open && !sent) { g_signal_emit_by_name(sender.channel, "send-string", "request"); sent = true; }
@@ -141,10 +154,14 @@ int main(int argc, char** argv) {
     }
     const auto pair = receiver.selected_pair();
     receiver.stop();
-    require(passed, "two decoded tracks did not retain their negotiated camera identities");
+    require(swap_identity ? rejected_swap : passed, "two decoded tracks did not retain their negotiated camera identities");
     require(pair.is_object() && pair.value("local_address", "") == "127.0.0.1" &&
             pair.value("remote_address", "") == "127.0.0.1" && pair.value("local_transport", "") == "udp" &&
             pair.value("remote_transport", "") == "udp", "fixture did not remain on loopback UDP");
+    if (swap_identity) {
+      std::cout << "PASS synthetic source check detected swapped camera identities\n";
+      return 0;
+    }
     std::cout << "PASS actual WebRTC pad-to-camera MID mapping with two synthetic streams";
 #if GST_CHECK_VERSION(1, 22, 0)
     std::cout << " and scoped DataChannel";

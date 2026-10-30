@@ -103,6 +103,10 @@ ambiguous identities and duplicate bindings. Renegotiation still requires a
 new viewer session. A control-capable client must also validate this mapping
 across the actual vehicle, track replacement and recovery paths; window position
 or track count alone cannot establish which critical camera is fresh.
+The synthetic two-stream loopback additionally compares each mapped camera to
+the RTP SSRC assigned to its known test source and checks that deliberately
+swapped `media_tracks` fail that comparison. This is a fixture assertion, not
+runtime authentication of a physical camera or proof of displayed freshness.
 
 For direct control, the native WebRTC DataChannel must also implement the
 existing scoped transport bridge, frame expiry, result and feedback handling,

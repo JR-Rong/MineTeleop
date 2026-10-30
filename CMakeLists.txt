@@ -473,6 +473,8 @@ if(MINE_TELEOP_BUILD_TESTS OR MINE_TELEOP_BUILD_PORTABLE_CONTROL_TESTS)
     set_tests_properties(mine-teleop-native-control-channel-tests PROPERTIES TIMEOUT 30)
     add_test(NAME mine-teleop-native-receiver-mid-integration-tests COMMAND mine-teleop-native-receiver-mid-integration-tests)
     set_tests_properties(mine-teleop-native-receiver-mid-integration-tests PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+    add_test(NAME mine-teleop-native-receiver-swapped-mid-tests COMMAND mine-teleop-native-receiver-mid-integration-tests --swap-identity)
+    set_tests_properties(mine-teleop-native-receiver-swapped-mid-tests PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     add_test(NAME mine-teleop-hybrid-receiver-analyzer-tests
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test/hybrid_receiver_analyze.test.py")
     add_test(NAME mine-teleop-receiver-ab-analyzer-tests

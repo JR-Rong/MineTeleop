@@ -398,6 +398,8 @@ struct Track {
   std::unordered_set<std::uint64_t> rtp_timestamps, decoded_pts;
   std::unordered_set<std::string> decoded_memory_types;
   std::uint64_t rtp_packets{}, decoded_buffers{}, duplicate_decoded_pts{}, regressed_decoded_pts{}, invalid_decoded_pts{}, corrupt_decoded_buffers{}, identity_overflow{};
+  std::optional<std::uint32_t> first_rtp_ssrc;
+  std::uint64_t other_rtp_ssrc_packets{};
   Samples decode_ms, decoded_gap_ms, consumed_gap_ms, consume_wait_ms;
   Json decoded_events = Json::array(), drawn_events = Json::array(), received_events = Json::array();
   GstClockTime last_draw_pts{GST_CLOCK_TIME_NONE};
@@ -416,12 +418,15 @@ struct Track {
     auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
     GstRTPBuffer packet = GST_RTP_BUFFER_INIT;
     if (buffer && gst_rtp_buffer_map(buffer, GST_MAP_READ, &packet)) {
-      const auto identity = (static_cast<std::uint64_t>(gst_rtp_buffer_get_ssrc(&packet)) << 32) |
+      const auto ssrc = gst_rtp_buffer_get_ssrc(&packet);
+      const auto identity = (static_cast<std::uint64_t>(ssrc) << 32) |
           gst_rtp_buffer_get_timestamp(&packet);
       const bool marker = gst_rtp_buffer_get_marker(&packet);
       gst_rtp_buffer_unmap(&packet);
       const double received = marker && self.arrivals ? self.arrivals->get(identity) : 0;
       std::lock_guard lock(self.mutex);
+      if (!self.first_rtp_ssrc) self.first_rtp_ssrc = ssrc;
+      else if (*self.first_rtp_ssrc != ssrc) ++self.other_rtp_ssrc_packets;
       if (received > 0 && GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(buffer)) && self.received_events.size() < 131072)
         self.received_events.push_back({GST_BUFFER_PTS(buffer), received});
       ++self.rtp_packets;
@@ -498,6 +503,8 @@ struct Track {
   Json counters() {
     std::lock_guard lock(mutex);
     return {{"pad", pad}, {"camera_id", camera_id}, {"decoded", decoded}, {"consumed", consumed}, {"drawn", drawn_events.size()},
+            {"first_rtp_ssrc", first_rtp_ssrc ? Json(*first_rtp_ssrc) : Json(nullptr)},
+            {"other_rtp_ssrc_packets", other_rtp_ssrc_packets},
             {"decode_count", decode_ms.count}, {"decode_sum_ms", decode_ms.sum}};
   }
   void start(int stall_ms) {
