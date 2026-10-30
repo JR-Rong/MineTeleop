@@ -74,6 +74,9 @@ The native publication filter rejects expired, replayed, wrongly scoped or
 byte-mismatched bridge frames before a one-time send attempt. It is an
 experimental component, not yet connected to the runtime or window; the
 caller must serialize sends with session and owner retirement.
+An isolated integration fixture exercises that filter with the real control
+bridge, signed commands and a mock vehicle service; it simulates the DC byte
+path and does not prove WebRTC delivery or physical vehicle behavior.
 
 The native window is deliberately not wired to `update_control_intent`. A
 driving client must first connect the existing session-generation and input

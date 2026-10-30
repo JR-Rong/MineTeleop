@@ -1,5 +1,6 @@
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/websocket.hpp"
+#include "mine_teleop/detail/native_control_publication.hpp"
 #include "control_time_fixture.hpp"
 
 #include <chrono>
@@ -76,6 +77,8 @@ struct Fixture {
   std::int64_t last_input{0};
   std::deque<std::pair<std::int64_t, Json>> delayed;
   std::vector<Json> received_statuses;
+  bool use_native_publication{false};
+  std::unique_ptr<NativeControlPublication> native_publication;
   explicit Fixture(bool direct = false, bool feedback = false, bool product = false,
       std::string mode = "p2p_preferred") : feedback_enabled(feedback), direct_enabled(direct) {
     SignalingServerConfig config;
@@ -333,9 +336,18 @@ struct Fixture {
     }
     auto request = scope(dc_ready);
     if (pending_dc_feedback.is_object()) { request["vehicle_result"] = pending_dc_feedback; pending_dc_feedback = Json(nullptr); }
+    const auto publication_started = steady();
     auto response = bridge(request);
     if (dc_ready && response.at("frame_json").is_string()) {
-      const auto payload = Json::parse(response.at("frame_json").get<std::string>());
+      std::string bytes = response.at("frame_json").get<std::string>();
+      if (use_native_publication) {
+        const NativeCourierScope current{{session, native_generation, media_attempt}, "owner", ui_epoch};
+        if (!native_publication) native_publication = std::make_unique<NativeControlPublication>(current);
+        const auto filtered = native_publication->take(current, response, dc_ready, steady() - publication_started);
+        if (!filtered) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); return; }
+        bytes = *filtered;
+      }
+      const auto payload = Json::parse(bytes);
       expect(payload.at("seq").get<std::uint64_t>() > last_dc_seq, "bridge replayed a frame");
       last_dc_seq = payload.at("seq").get<std::uint64_t>(); ++dc_commands;
       if (drop_before_receiver(payload)) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); return; }
@@ -349,6 +361,20 @@ struct Fixture {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 };
+void native_publication_bridge_integration() {
+  Fixture fixture(false, false, true);
+  fixture.dc_network_path = "p2p";
+  fixture.use_native_publication = true;
+  const auto deadline = steady() + 8000;
+  while (steady() < deadline) {
+    fixture.pump(true);
+    const auto transport = fixture.driver->status().at("native_control").at("control_transport");
+    if (fixture.dc_commands >= 3 && transport.at("path") == "dc" && !transport.at("selecting").get<bool>()) break;
+  }
+  expect(fixture.dc_commands >= 3 && fixture.native_publication && fixture.native_publication->last_seen() > 0,
+      "native publication filter did not deliver signed bridge frames to the mock vehicle");
+  std::cout << "[NATIVE_PUBLICATION] scoped real bridge, signed commands and mock vehicle feedback passed\n";
+}
 void product_recovery_withdraws_unfetched_motion() {
   for (int cause = 0; cause < 4; ++cause) {
     Fixture f(false, false, true); f.dc_network_path = "p2p";
@@ -886,6 +912,6 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
 }
 }  // namespace
 int main(int argc, char** argv) {
-  try { if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } native_publication_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
