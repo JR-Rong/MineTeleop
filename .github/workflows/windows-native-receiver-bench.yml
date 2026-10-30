@@ -37,6 +37,17 @@ jobs:
           ref: ${{ steps.dependencies.outputs.commit }}
           path: .vcpkg
           persist-credentials: false
+      - name: Prepare vcpkg binary cache
+        run: |
+          $cache = Join-Path $env:RUNNER_TEMP 'vcpkg-binary-cache'
+          New-Item -ItemType Directory -Path $cache -Force | Out-Null
+          "VCPKG_DEFAULT_BINARY_CACHE=$cache" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}\vcpkg-binary-cache
+          key: vcpkg-windows-x64-${{ hashFiles('packaging/windows/dependencies.lock.json') }}-control-v2
+          restore-keys: |
+            vcpkg-windows-x64-
       - name: Bootstrap and build the existing portable controller
         env:
           VCPKG_DISABLE_METRICS: '1'
