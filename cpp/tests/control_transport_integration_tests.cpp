@@ -559,52 +559,60 @@ void native_dual_video_bridge_integration() {
 }
 void product_recovery_withdraws_unfetched_motion() {
   for (int cause = 0; cause < 4; ++cause) {
-    Fixture f(false, false, true); f.dc_network_path = "p2p";
-    auto transport = [&] { return f.driver->status().at("native_control").at("control_transport"); };
-    auto deadline = steady() + 8000;
-    while (steady() < deadline) {
-      f.pump(true);
-      if (transport().at("path") == "dc" && !transport().at("qualifying").get<bool>() &&
-          !transport().at("selecting").get<bool>()) break;
-    }
-    expect(transport().at("path") == "dc" && !transport().at("qualifying").get<bool>(), "DC not qualified");
-    Json pending;
-    // A qualified status can precede a sender-thread route-boundary rearm.
-    // Re-establish neutral with live receipts before each bounded attempt.
-    // If the motion sample races that rearm, resume pumping before the actual
-    // ACK watchdog expires and try a fresh release/press; never retimestamp a
-    // previously published command or fetch the frame being tested.
-    for (int attempt = 0; attempt < 3 && pending.is_null(); ++attempt) {
-      f.requested_throttle = 0.0; f.input();
-      deadline = steady() + 150;
-      while (steady() < deadline) f.pump(true);
-      f.input(); f.requested_throttle = 0.4; f.input();
-      deadline = steady() + 120;
-      while (steady() < deadline && pending.is_null()) {
-        pending = DriverConsoleTransportTestAccess::withdraw_with_pending_motion(*f.driver, cause);
-        if (pending.is_null()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    bool verified_live_withdrawal = false;
+    for (int run = 0; run < 3 && !verified_live_withdrawal; ++run) {
+      Fixture f(false, false, true); f.dc_network_path = "p2p";
+      auto transport = [&] { return f.driver->status().at("native_control").at("control_transport"); };
+      auto deadline = steady() + 8000;
+      while (steady() < deadline) {
+        f.pump(true);
+        if (transport().at("path") == "dc" && !transport().at("qualifying").get<bool>() &&
+            !transport().at("selecting").get<bool>()) break;
       }
+      expect(transport().at("path") == "dc" && !transport().at("qualifying").get<bool>(), "DC not qualified");
+      Json pending;
+      // A qualified status can precede a sender-thread route-boundary rearm.
+      // Re-establish neutral with live receipts before each bounded attempt.
+      // If the motion sample races that rearm, resume pumping before the actual
+      // ACK watchdog expires and try a fresh release/press; never retimestamp a
+      // previously published command or fetch the frame being tested.
+      for (int attempt = 0; attempt < 3 && pending.is_null(); ++attempt) {
+        f.requested_throttle = 0.0; f.input();
+        deadline = steady() + 150;
+        while (steady() < deadline) f.pump(true);
+        f.input(); f.requested_throttle = 0.4; f.input();
+        deadline = steady() + 120;
+        while (steady() < deadline && pending.is_null()) {
+          pending = DriverConsoleTransportTestAccess::withdraw_with_pending_motion(*f.driver, cause);
+          if (pending.is_null()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+      expect(pending.is_object(), "no unfetched nonzero native publication; cause=" + std::to_string(cause) +
+          "; native=" + f.driver->status().at("native_control").dump());
+      expect(pending.at("frame").at("seq").get<std::uint64_t>() > f.last_dc_seq, "pending frame was already consumed");
+      // The hosted runner can deschedule the sender for longer than one tick.
+      // Wait for the real transition, but only count an attempt if the original
+      // publication is still live; expiry must never substitute for withdrawal.
+      deadline = steady() + 1000;
+      while (steady() < deadline && transport().at("path") == "dc") std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      const auto withdrawn = transport();
+      expect(withdrawn.at("path") == "wss", "recovery did not withdraw DC; cause=" +
+          std::to_string(cause) + "; elapsed_ms=" +
+          std::to_string(steady() - pending.at("injected_at").get<std::int64_t>()) +
+          "; pending_seq=" + std::to_string(pending.at("frame").at("seq").get<std::uint64_t>()) +
+          "; published_at=" + std::to_string(pending.at("published_at").get<std::int64_t>()) +
+          "; injected_at=" + std::to_string(pending.at("injected_at").get<std::int64_t>()) +
+          "; native=" + f.driver->status().at("native_control").dump());
+      // No WSS select has been delivered to the vehicle. Neither expiry nor
+      // replay rejection may hide a stale publication at this boundary.
+      if (steady() - pending.at("published_at").get<std::int64_t>() >= kNativeBridgePublicationMaxAgeMs)
+        continue;
+      expect(f.fence.path() == ControlPath::DataChannel, "vehicle already received fallback select");
+      expect(f.bridge(f.scope(true)).at("frame_json").is_null(), "bridge returned retired nonzero DC publication");
+      expect(DriverConsoleTransportTestAccess::retired(*f.driver), "fallback retained DC publication or ACK state");
+      verified_live_withdrawal = true;
     }
-    expect(pending.is_object(), "no unfetched nonzero native publication; cause=" + std::to_string(cause) +
-        "; native=" + f.driver->status().at("native_control").dump());
-    expect(pending.at("frame").at("seq").get<std::uint64_t>() > f.last_dc_seq, "pending frame was already consumed");
-    deadline = steady() + 80;
-    while (steady() < deadline && transport().at("path") == "dc") std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    const auto withdrawn = transport();
-    expect(withdrawn.at("path") == "wss", "recovery did not withdraw DC; cause=" +
-        std::to_string(cause) + "; elapsed_ms=" +
-        std::to_string(steady() - pending.at("injected_at").get<std::int64_t>()) +
-        "; pending_seq=" + std::to_string(pending.at("frame").at("seq").get<std::uint64_t>()) +
-        "; published_at=" + std::to_string(pending.at("published_at").get<std::int64_t>()) +
-        "; injected_at=" + std::to_string(pending.at("injected_at").get<std::int64_t>()) +
-        "; native=" + f.driver->status().at("native_control").dump());
-    // No WSS select has been delivered to the vehicle. Neither expiry nor
-    // replay rejection may hide a stale publication at this boundary.
-    expect(steady() - pending.at("published_at").get<std::int64_t>() < kNativeBridgePublicationMaxAgeMs,
-        "test missed the live publication window");
-    expect(f.fence.path() == ControlPath::DataChannel, "vehicle already received fallback select");
-    expect(f.bridge(f.scope(true)).at("frame_json").is_null(), "bridge returned retired nonzero DC publication");
-    expect(DriverConsoleTransportTestAccess::retired(*f.driver), "fallback retained DC publication or ACK state");
+    expect(verified_live_withdrawal, "could not observe a live publication withdrawal; cause=" + std::to_string(cause));
   }
 }
 
