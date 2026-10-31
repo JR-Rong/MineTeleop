@@ -1,5 +1,6 @@
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/detail/control_transport.hpp"
+#include "mine_teleop/detail/mock_compact_control.hpp"
 #include "mine_teleop/detail/direct_authority.hpp"
 #include "mine_teleop/detail/emergency_stop.hpp"
 #include "mine_teleop/detail/feedback_transport.hpp"
@@ -30,6 +31,7 @@
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
+#include <cstdlib>
 #include <ctime>
 #include <deque>
 #include <filesystem>
@@ -1155,6 +1157,29 @@ struct VehicleMediaRuntime::Impl {
         nullptr);
   }
 
+  bool mock_compact_control_enabled() const {
+    const char* enabled = std::getenv("MINE_TELEOP_MOCK_COMPACT_CONTROL");
+    return detail::mock_compact_control_allowed(enabled && std::string_view(enabled) == "1", config.vehicle_id,
+        config.vehicle_adapter.type, config.field_safety.max_speed_kph);
+  }
+
+  static void on_control_message_data(GstWebRTCDataChannel* channel, GBytes* bytes, gpointer user_data) {
+    auto* self = static_cast<Impl*>(user_data);
+    if (!self->mock_compact_control_enabled() || !bytes) return;
+    gsize length = 0;
+    const auto* data = static_cast<const std::uint8_t*>(g_bytes_get_data(bytes, &length));
+    if (!data || length > 256) { ++self->rejected_control_commands; return; }
+    std::string attempt;
+    { std::lock_guard lock(self->media_signal_state->mutex); attempt = self->media_signal_state->negotiation_id; }
+    const detail::MockCompactScope scope{self->config.vehicle_id, self->signaling.driver_id(),
+        self->signaling.session_id(), self->signaling.control_token(), attempt};
+    const auto value = detail::decode_mock_compact_control(std::span<const std::uint8_t>(data, length), scope);
+    if (!value) { ++self->rejected_control_commands; return; }
+    // The normal handler still verifies the full reconstructed MAC, scope,
+    // sequence, freshness and all existing control safety conditions.
+    self->handle_control_message(channel, value->dump(), ControlMessageTransport::DataChannel, nullptr);
+  }
+
   static void on_offer_created(GstPromise* promise, gpointer user_data) {
     const auto* context = static_cast<MediaOfferContext*>(user_data);
     const auto state = context->state;
@@ -1229,6 +1254,7 @@ struct VehicleMediaRuntime::Impl {
     state->pending.emplace_back("webrtc_offer", Json{
          {"type", "offer"},
          {"control_transport_capability", self->signaling.transport_mac_key().size() >= 32 ? detail::kControlTransportCapability : std::string_view{}},
+         {"mock_compact_control", self->mock_compact_control_enabled() ? detail::kMockCompactControl : std::string_view{}},
          {"emergency_stop_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kEmergencyStopCapability : std::string_view{}},
          {"feedback_transport_capability", self->config.runtime.experimental_direct_authority_max_ms > 0 && self->signaling.transport_mac_key().size() >= 32 ? detail::kFeedbackTransportCapability : std::string_view{}},
          {"sdp", text == nullptr ? "" : text},
@@ -3655,6 +3681,7 @@ struct VehicleMediaRuntime::Impl {
     g_signal_connect(channel, "on-close", G_CALLBACK(on_control_channel_close), this);
     g_signal_connect(channel, "on-error", G_CALLBACK(on_control_channel_error), this);
     g_signal_connect(channel, "on-message-string", G_CALLBACK(on_control_message_string), this);
+    g_signal_connect(channel, "on-message-data", G_CALLBACK(on_control_message_data), this);
     {
       std::lock_guard lock(control_mutex);
       if (stop_requested) {

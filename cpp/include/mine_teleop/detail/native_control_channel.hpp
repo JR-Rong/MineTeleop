@@ -178,9 +178,20 @@ class NativeControlChannel {
 
   // A successful return means queued locally, not delivered or authenticated.
   bool send(const std::string& payload) {
+    return send_impl(payload, false);
+  }
+
+  // Used only by the explicitly negotiated isolated-mock experiment.
+  bool send_mock_compact(const std::vector<std::uint8_t>& payload) {
+    if (payload.size() > 256) return false;
+    return send_impl(std::string(payload.begin(), payload.end()), true);
+  }
+
+ private:
+  bool send_impl(const std::string& payload, bool binary) {
 #if GST_CHECK_VERSION(1, 22, 0)
     ++send_attempted_;
-    if (payload.empty() || payload.size() > 64 * 1024 || payload.find('\0') != std::string::npos) { ++send_errors_; return false; }
+    if (payload.empty() || payload.size() > 64 * 1024 || (!binary && payload.find('\0') != std::string::npos)) { ++send_errors_; return false; }
     std::lock_guard send_lock(state_->send_mutex);
     GstWebRTCDataChannel* channel = nullptr;
     {
@@ -197,17 +208,25 @@ class NativeControlChannel {
       g_object_unref(channel); return false;
     }
     GError* error = nullptr;
-    const bool ok = gst_webrtc_data_channel_send_string_full(channel, payload.c_str(), &error) != FALSE;
+    bool ok = false;
+    if (binary) {
+      auto* bytes = g_bytes_new(payload.data(), payload.size());
+      ok = gst_webrtc_data_channel_send_data_full(channel, bytes, &error) != FALSE;
+      g_bytes_unref(bytes);
+    } else {
+      ok = gst_webrtc_data_channel_send_string_full(channel, payload.c_str(), &error) != FALSE;
+    }
     if (ok) ++send_queued_; else ++send_errors_;
     g_clear_error(&error);
     g_object_unref(channel);
     return ok;
 #else
-    (void)payload;
+    (void)payload; (void)binary;
     return false;
 #endif
   }
 
+ public:
   void retire() {
     std::lock_guard send_lock(state_->send_mutex);
     std::vector<Candidate> candidates;

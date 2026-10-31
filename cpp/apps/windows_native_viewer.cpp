@@ -6,6 +6,7 @@
 #include "mine_teleop/detail/native_mock_profile_retry.hpp"
 #include "mine_teleop/detail/native_mock_keyboard.hpp"
 #include "mine_teleop/detail/native_control_courier.hpp"
+#include "mine_teleop/detail/mock_compact_control.hpp"
 #include "mine_teleop/detail/native_viewer_observation.hpp"
 #include <gst/video/video.h>
 #include <gio/gnetworking.h>
@@ -157,7 +158,7 @@ struct Window {
                         const Json& session, const std::string& attempt,
                         const std::shared_ptr<RenderSession>& render,
                         const std::shared_ptr<detail::NativeMockMediaGate>& gate,
-                        std::stop_token parent, std::stop_token stop) {
+                        bool compact_control, std::stop_token parent, std::stop_token stop) {
     const std::string session_id = session.at("session_id").get<std::string>();
     const auto generation = session.at("control_session_generation").get<std::uint64_t>();
     const std::string owner = "windows-native-mock";
@@ -349,13 +350,15 @@ struct Window {
             [&](const Json& request) { return driver.control_transport_bridge(request); },
             [&](const std::string& bytes) {
               const auto started = static_cast<std::int64_t>(bench_now_ms());
-              const bool queued = channel->send(bytes);
+              const auto frame = Json::parse(bytes, nullptr, false);
+              const auto compact = compact_control ? detail::encode_mock_compact_control(frame) : std::nullopt;
+              const bool queued = compact ? channel->send_mock_compact(*compact) : channel->send(bytes);
               if (config.control_trace_commands) {
-                const auto frame = Json::parse(bytes, nullptr, false);
                 if (frame.is_object() && frame.contains("seq") && frame.at("seq").is_number_unsigned()) {
                   if (dc_send_trace.size() < 128)
                     dc_send_trace.push_back({{"seq", frame.at("seq")}, {"started_monotonic_ms", started},
-                        {"completed_monotonic_ms", static_cast<std::int64_t>(bench_now_ms())}, {"queued", queued}});
+                        {"completed_monotonic_ms", static_cast<std::int64_t>(bench_now_ms())}, {"queued", queued},
+                        {"wire_format", compact ? "mock-cbor" : "json"}, {"wire_bytes", compact ? compact->size() : bytes.size()}});
                   else ++dc_send_trace_dropped;
                 }
               }
@@ -541,6 +544,8 @@ struct Window {
               options.display = false;
               options.ice_servers = payload.value("ice_servers", ice);
               options.ice_route_mode = payload.value("ice_route_mode", "all");
+              const bool compact_control = mock_control &&
+                  payload.value("mock_compact_control", "") == detail::kMockCompactControl;
               if (mock_control) {
                 options.local_addresses = {mock_local_ip};
                 options.remote_addresses = {mock_peer_ip};
@@ -568,9 +573,9 @@ struct Window {
                 mock_gate = std::make_shared<detail::NativeMockMediaGate>(
                     session.at("session_id").get<std::string>(), vehicle.vehicle_id, negotiation, render->cameras);
                 auto* target = receiver.get();
-                control_worker = std::jthread([this, &driver, target, vehicle, config, session, negotiation, render,
+                control_worker = std::jthread([this, &driver, target, vehicle, config, session, negotiation, render, compact_control,
                                                 gate = mock_gate, stop_token](std::stop_token token) {
-                  try { run_mock_control(driver, *target, vehicle, config, session, negotiation, render, gate, stop_token, token); }
+                  try { run_mock_control(driver, *target, vehicle, config, session, negotiation, render, gate, compact_control, stop_token, token); }
                   catch (const std::exception& error) {
                     const std::string_view detail = error.what();
                     const char* category = detail.find("mock input worker failed") != std::string_view::npos ? "input_worker" :

@@ -1,5 +1,6 @@
 #include "mine_teleop/detail/control_transport.hpp"
 #include "mine_teleop/detail/control_transport_sender.hpp"
+#include "mine_teleop/detail/mock_compact_control.hpp"
 #include "control_time_fixture.hpp"
 #include "mine_teleop/server.hpp"
 
@@ -98,6 +99,38 @@ Json response(const Json& frame, bool accepted = true, bool selected = false) {
       {"transport_admitted", true}, {"transport_selected", selected},
       {"authority_epoch", frame.contains("control_transport") ? frame.at("control_transport").at("epoch") : Json(0)},
       {"control_transport", frame.value("control_transport", Json(nullptr))}};
+}
+void compact_mock_wire_preserves_the_signed_command() {
+  expect(mock_compact_control_allowed(true, "test_bench_001", "mock", 0.0) &&
+      !mock_compact_control_allowed(false, "test_bench_001", "mock", 0.0) &&
+      !mock_compact_control_allowed(true, "test_bench_001", "can", 0.0) &&
+      !mock_compact_control_allowed(true, "test_bench_001", "mock", 1.0) &&
+      !mock_compact_control_allowed(true, "vehicle-001", "mock", 0.0),
+      "compact wire escaped the explicitly enabled zero-speed mock scope");
+  const std::string key = "01234567890123456789012345678901";
+  auto frame = payload(7, 123456789); frame["intent_requires_fresh_input"] = false;
+  frame["control_transport"] = stamp(3, 2, ControlPath::DataChannel, 5);
+  frame["native_mac"] = transport_message_mac(frame, key, false);
+  const MockCompactScope scope{"vehicle-001", "driver-001", "session-001", "fixture", "media-a"};
+  const auto bytes = encode_mock_compact_control(frame);
+  expect(bytes && bytes->size() < 150, "compact signed mock command did not fit the budget");
+  const auto decoded = decode_mock_compact_control(*bytes, scope);
+  expect(decoded && decoded->dump() == frame.dump() && verify_transport_message(*decoded, key, false),
+      "compact mock command changed the signed bytes");
+  for (std::size_t i = 0; i < bytes->size(); ++i) {
+    auto forged = *bytes; forged[i] ^= 1;
+    const auto tampered = decode_mock_compact_control(forged, scope);
+    expect(!tampered || !verify_transport_message(*tampered, key, false), "tampered compact command was authenticated");
+  }
+  auto other = scope; other.session = "session-other";
+  const auto replay = decode_mock_compact_control(*bytes, other);
+  expect(replay && !verify_transport_message(*replay, key, false), "compact command escaped its session");
+  auto forged = *bytes; forged.resize(4);
+  expect(!decode_mock_compact_control(forged, scope), "truncated compact command was decoded");
+  auto extra = frame; extra["unexpected_extension"] = 1;
+  expect(!encode_mock_compact_control(extra), "unknown signed field was silently discarded");
+  extra = frame; extra["control_transport"]["path"] = "wss";
+  expect(!encode_mock_compact_control(extra), "compact wire accepted a non-direct command");
 }
 void late_dc_results_withdraw_publication_in_result_handler() {
   DriverConfig config; config.driver_id = "driver-001"; config.signaling_url = "http://127.0.0.1:1";
@@ -435,6 +468,7 @@ void real_service_switch_does_not_disable_watchdog() {
 }  // namespace
 int main() {
   try {
+    compact_mock_wire_preserves_the_signed_command();
     publication_is_owned_only_by_its_current_dc_epoch();
     late_dc_results_withdraw_publication_in_result_handler();
     failed_direct_trials_back_off_and_exhaust_per_attempt();
@@ -443,6 +477,6 @@ int main() {
     confirmed_profile_permits_only_one_new_bounded_dc_budget();
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "16 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "17 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
