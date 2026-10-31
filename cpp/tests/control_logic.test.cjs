@@ -2408,6 +2408,31 @@ test('offline AbortController delivers one abort event and preserves its reason 
   assert.equal(controller.signal.aborted,true);assert.equal(controller.signal.reason,reason);assert.equal(events.length,1);assert.equal(events[0].target,controller.signal);
 });
 
+test('receiver interval delays expose recent stalls without mixing stream lifetimes', () => {
+  const old={id:'inbound-1',ssrc:11,timestamp:1000,framesDecoded:100,totalDecodeTime:1,
+    totalProcessingDelay:10,jitterBufferEmittedCount:200,jitterBufferDelay:10,jitterBufferTargetDelay:8};
+  const current={...old,timestamp:2000,framesDecoded:110,totalDecodeTime:1.5,
+    totalProcessingDelay:13,jitterBufferEmittedCount:220,jitterBufferDelay:14,jitterBufferTargetDelay:10};
+  const result=logic.receiverIntervalStats(current,old);
+  assert.equal(result.framesDecoded,10);
+  assert.equal(result.decodeMs,50);
+  assert.equal(result.processingMs,300);
+  assert.equal(result.jitterMs,200);
+  assert.equal(result.targetJitterMs,100);
+  for(const previous of [undefined,{...old,id:'other'},{...old,ssrc:12},{...old,timestamp:2000}]){
+    const unavailable=logic.receiverIntervalStats(current,previous);
+    assert.equal(unavailable.decodeMs,null);assert.equal(unavailable.jitterMs,null);
+  }
+  const reset=logic.receiverIntervalStats({...current,framesDecoded:1,totalDecodeTime:0.01},old);
+  assert.equal(reset.decodeMs,null);assert.equal(reset.processingMs,null);
+  assert.equal(logic.receiverIntervalStats({...old,timestamp:2000},old).decodeMs,null);
+  for(const totalDecodeTime of [undefined,null,NaN,Infinity,-1]){
+    assert.equal(logic.receiverIntervalStats({...current,totalDecodeTime},old).decodeMs,null);
+  }
+  assert.equal(logic.receiverIntervalStats({...current,totalDecodeTime:old.totalDecodeTime},old).decodeMs,0);
+  assert.equal(logic.receiverIntervalStats(current,old).counters.totalDecodeTime,1.5);
+});
+
 // An unresolved Promise alone does not keep Node alive. A stuck asynchronous
 // safety test must fail, rather than let the process exit with a false green.
 const completionDeadline = setTimeout(() => {

@@ -1,15 +1,64 @@
 #include "mine_teleop/detail/control_transport.hpp"
 #include "mine_teleop/detail/control_transport_sender.hpp"
+#include "mine_teleop/detail/mock_compact_control.hpp"
+#include "mine_teleop/detail/mock_compact_telemetry.hpp"
 #include "control_time_fixture.hpp"
 #include "mine_teleop/server.hpp"
 
 #include <iostream>
 #include <stdexcept>
 
+namespace mine_teleop {
+struct DriverConsoleTransportTestAccess {
+  static void begin_direct(DriverConsoleRuntime& runtime, const std::string& key) {
+    { std::lock_guard lock(runtime.mutex_); runtime.control_transport_mac_key_ = key; }
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    runtime.control_transport_sender_.set_data_channel_is_p2p(true);
+    runtime.control_transport_sender_.begin(detail::ControlPath::DataChannel, "media-a", 500, 5000);
+  }
+  static Json sent(DriverConsoleRuntime& runtime, Json frame, std::int64_t sent_ms) {
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    runtime.control_transport_sender_.decorate(frame);
+    runtime.control_transport_sender_.note_sent(frame, detail::ControlPath::DataChannel, sent_ms);
+    runtime.control_dc_ack_window_.note_sent(frame.at("seq").get<std::uint64_t>(), sent_ms);
+    runtime.control_transport_latest_dc_ = frame;
+    runtime.control_transport_latest_dc_at_ms_ = sent_ms;
+    return frame;
+  }
+  static void deliver(DriverConsoleRuntime& runtime, const Json& result, std::int64_t now) {
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    static_cast<void>(runtime.consume_vehicle_control_result_locked(result, "session-001", "vehicle-001", "driver-001", now, true));
+  }
+  static bool direct_retired(DriverConsoleRuntime& runtime) {
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    return runtime.control_transport_sender_.path() == detail::ControlPath::Wss &&
+        runtime.control_transport_latest_dc_.is_null() && runtime.control_dc_ack_window_.pending_count() == 0;
+  }
+};
+}  // namespace mine_teleop
+
 namespace {
 using namespace mine_teleop;
 using namespace mine_teleop::detail;
 void expect(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+void mock_telemetry_summary_preserves_safety_fields() {
+  Json full = {{"event", "vehicle_telemetry"}, {"protocol_version", 1},
+      {"vehicle_id", "test_bench_001"}, {"driver_id", "driver"}, {"session_id", "session"},
+      {"seq", 42}, {"sent_at_utc_ms", 12345}, {"control_status_seq", 44},
+      {"safety_state", "CONTROL_ACTIVE"}, {"control_timing", {{"control_braking_wait", true},
+          {"driver_critical_video_ready", false}, {"rearm_required", true}, {"last_valid_control_age_ms", 201}}},
+      {"speed_mps", 0.0}, {"gear", "N"}, {"estop", false}, {"stop_source", ""},
+      {"stop_reason", ""}, {"stop_sequence", 0}, {"control_limits", {{"large", std::string(4000, 'x')}}}};
+  const auto compact = mock_compact_telemetry(full);
+  expect(compact && compact->at("mock_telemetry_summary") == true && compact->dump().size() <= 1200,
+      "mock telemetry summary was not bounded");
+  for (const auto* field : {"vehicle_id", "driver_id", "session_id", "seq", "sent_at_utc_ms",
+      "control_status_seq", "safety_state", "control_timing", "speed_mps", "gear", "estop",
+      "stop_source", "stop_reason", "stop_sequence"})
+    expect(compact->at(field) == full.at(field), "mock telemetry changed a safety or identity field");
+  full.erase("control_timing");
+  expect(!mock_compact_telemetry(full), "incomplete mock telemetry became a summary");
+}
 template<class F> void throws(F action) { bool failed = false; try { action(); } catch (const std::exception&) { failed = true; } expect(failed, "invalid protocol accepted"); }
 ControlCommand command(std::uint64_t seq, std::int64_t now) {
   ControlCommand value; value.vehicle_id = "vehicle-001"; value.driver_id = "driver-001";
@@ -69,6 +118,55 @@ Json response(const Json& frame, bool accepted = true, bool selected = false) {
       {"transport_admitted", true}, {"transport_selected", selected},
       {"authority_epoch", frame.contains("control_transport") ? frame.at("control_transport").at("epoch") : Json(0)},
       {"control_transport", frame.value("control_transport", Json(nullptr))}};
+}
+void compact_mock_wire_preserves_the_signed_command() {
+  expect(mock_compact_control_allowed(true, "test_bench_001", "mock", 0.0) &&
+      !mock_compact_control_allowed(false, "test_bench_001", "mock", 0.0) &&
+      !mock_compact_control_allowed(true, "test_bench_001", "can", 0.0) &&
+      !mock_compact_control_allowed(true, "test_bench_001", "mock", 1.0) &&
+      !mock_compact_control_allowed(true, "vehicle-001", "mock", 0.0),
+      "compact wire escaped the explicitly enabled zero-speed mock scope");
+  const std::string key = "01234567890123456789012345678901";
+  auto frame = payload(7, 123456789); frame["intent_requires_fresh_input"] = false;
+  frame["control_transport"] = stamp(3, 2, ControlPath::DataChannel, 5);
+  frame["native_mac"] = transport_message_mac(frame, key, false);
+  const MockCompactScope scope{"vehicle-001", "driver-001", "session-001", "fixture", "media-a"};
+  const auto bytes = encode_mock_compact_control(frame);
+  expect(bytes && bytes->size() < 150, "compact signed mock command did not fit the budget");
+  const auto decoded = decode_mock_compact_control(*bytes, scope);
+  expect(decoded && decoded->dump() == frame.dump() && verify_transport_message(*decoded, key, false),
+      "compact mock command changed the signed bytes");
+  for (std::size_t i = 0; i < bytes->size(); ++i) {
+    auto forged = *bytes; forged[i] ^= 1;
+    const auto tampered = decode_mock_compact_control(forged, scope);
+    expect(!tampered || !verify_transport_message(*tampered, key, false), "tampered compact command was authenticated");
+  }
+  auto other = scope; other.session = "session-other";
+  const auto replay = decode_mock_compact_control(*bytes, other);
+  expect(replay && !verify_transport_message(*replay, key, false), "compact command escaped its session");
+  auto forged = *bytes; forged.resize(4);
+  expect(!decode_mock_compact_control(forged, scope), "truncated compact command was decoded");
+  auto extra = frame; extra["unexpected_extension"] = 1;
+  expect(!encode_mock_compact_control(extra), "unknown signed field was silently discarded");
+  extra = frame; extra["control_transport"]["path"] = "wss";
+  expect(!encode_mock_compact_control(extra), "compact wire accepted a non-direct command");
+}
+void late_dc_results_withdraw_publication_in_result_handler() {
+  DriverConfig config; config.driver_id = "driver-001"; config.signaling_url = "http://127.0.0.1:1";
+  config.browser_event_log_path.clear();
+  DriverConsoleRuntime runtime(config, "vehicle-001", "fixture");
+  const std::string key = "01234567890123456789012345678901";
+  DriverConsoleTransportTestAccess::begin_direct(runtime, key);
+  for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+    const std::int64_t now = 1000 + static_cast<std::int64_t>(seq) * 300;
+    const auto frame = DriverConsoleTransportTestAccess::sent(runtime, payload(seq, now - 250), now - 250);
+    auto result = response(frame, true, seq == 1);
+    result["vehicle_mac"] = transport_message_mac(result, key, true);
+    DriverConsoleTransportTestAccess::deliver(runtime, result, now);
+    if (seq < 3) expect(!DriverConsoleTransportTestAccess::direct_retired(runtime), "DC retired before three late results");
+  }
+  expect(DriverConsoleTransportTestAccess::direct_retired(runtime),
+      "third late DC result did not synchronously retire publication and select WSS");
 }
 void baseline(ControlTransportSender& sender) {
   for (std::uint64_t seq = 1; seq <= 3; ++seq) {
@@ -185,6 +283,106 @@ void failed_direct_trials_back_off_and_exhaust_per_attempt() {
       "new media attempt did not start a bounded neutral trial");
 }
 
+void confirmed_profile_permits_only_one_new_bounded_dc_budget() {
+  ControlTransportSender sender; sender.set_data_channel_is_p2p(true);
+  std::int64_t now = 0;
+  std::uint64_t seq = 1;
+  for (int failure = 1; failure <= 3; ++failure) {
+    expect(sender.consider_dc("media-a", now, 5000), "profile-blocked DC trial missing");
+    auto frame = payload(seq++, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, now);
+    auto rejected = response(frame, false, true); rejected["reason"] = "session_profile_not_ready";
+    expect(sender.note_result(rejected, now + 1, 5000).matched, "profile rejection was not matched");
+    expect(sender.observe(false, "media-a", now + 2, 5000), "profile-blocked DC did not fall back");
+    frame = payload(seq++, now + 3); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now + 3);
+    auto unavailable = response(frame, false, true); unavailable["reason"] = "session_profile_not_ready";
+    expect(sender.note_result(unavailable, now + 4, 5000).matched, "WSS fallback was not selected");
+    now += 2 + 5000 * (1 << (failure - 1));
+  }
+  expect(!sender.consider_dc("media-a", now + 1, 5000), "unconfirmed profile reset the budget");
+  auto moving = payload(seq++, now + 2); moving["throttle"] = 0.5;
+  sender.decorate(moving); sender.note_sent(moving, ControlPath::Wss, now + 2);
+  sender.note_result(response(moving, true, false), now + 3, 5000);
+  expect(!sender.consider_dc("media-a", now + 4, 5000), "moving acceptance reset the budget");
+  auto stale = payload(seq++, now + 5); sender.decorate(stale); sender.note_sent(stale, ControlPath::Wss, now + 5);
+  sender.note_result(response(stale, true, false), now + 1005, 5000);
+  expect(!sender.consider_dc("media-a", now + 1006, 5000), "stale acceptance reset the budget");
+  auto neutral = payload(seq++, now + 1007); sender.decorate(neutral); sender.note_sent(neutral, ControlPath::Wss, now + 1007);
+  expect(sender.note_result(response(neutral, true, false), now + 1008, 5000).matched, "fresh WSS acceptance missing");
+  expect(sender.consider_dc("media-a", now + 1009, 5000) && sender.holding_motion(), "confirmed profile did not permit a bounded retry");
+  now += 1009;
+  for (int failure = 1; failure <= 3; ++failure) {
+    if (failure > 1) expect(sender.consider_dc("media-a", now, 5000), "second bounded budget ended early");
+    auto frame = payload(seq++, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::DataChannel, now);
+    auto rejected = response(frame, false, true); rejected["reason"] = "session_profile_not_ready";
+    sender.note_result(rejected, now + 1, 5000);
+    sender.observe(false, "media-a", now + 2, 5000);
+    frame = payload(seq++, now + 3); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now + 3);
+    sender.note_result(response(frame, true, true), now + 4, 5000);
+    now += 2 + 5000 * (1 << (failure - 1));
+  }
+  expect(!sender.consider_dc("media-a", now + 600000, 5000), "profile retry became unbounded");
+}
+
+void mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt() {
+  ControlTransportSender sender; sender.set_data_channel_is_p2p(true);
+  std::int64_t now = 0; std::uint64_t seq = 1;
+  for (int failure = 1; failure <= 3; ++failure) {
+    expect(sender.consider_dc("media-a", now, 5000), "initial bounded trial missing");
+    expect(sender.observe(false, "media-a", ++now, 5000), "failed trial did not fall back");
+    auto frame = payload(seq++, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now);
+    sender.note_result(response(frame, true, true), now + 1, 5000);
+    now += 5000 * (1 << (failure - 1));
+  }
+  // Fresh neutral WSS results are required for a continuous interval. A
+  // stale loop, owner change, or active input must reset the interval.
+  auto tick = [&](bool idle, std::uint64_t owner_epoch, std::int64_t step = 50) {
+    now += step;
+    auto frame = payload(seq++, now - 10); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now - 10);
+    expect(sender.note_result(response(frame, true, false), now, 5000).matched, "fresh WSS result missing");
+    sender.observe_mock_idle_reprobe(idle, owner_epoch, now);
+  };
+  for (int i = 0; i < 1205; ++i) { tick(false, 1); expect(!sender.consider_dc("media-a", now, 5000), "active input enabled reprobe"); }
+  for (int i = 0; i < 600; ++i) { tick(true, 1); expect(!sender.consider_dc("media-a", now, 5000), "early idle reprobe"); }
+  tick(true, 2); // ownership handoff restarts the whole idle interval
+  for (int i = 0; i < 600; ++i) { tick(true, 2); expect(!sender.consider_dc("media-a", now, 5000), "owner handoff retained idle time"); }
+  tick(true, 2, 200); // a missed lease-sized observation restarts it too
+  for (int i = 0; i < 1199; ++i) { tick(true, 2); expect(!sender.consider_dc("media-a", now, 5000), "reprobe before 60 seconds"); }
+  tick(true, 2);
+  expect(sender.consider_dc("media-a", now, 5000) && sender.holding_motion() &&
+      sender.status().at("mock_idle_reprobe_used").get<bool>(), "qualified mock reprobe missing its motion fence");
+  expect(sender.observe(false, "media-a", ++now, 5000), "failed mock reprobe did not fall back");
+  auto selected = payload(seq++, now); sender.decorate(selected); sender.note_sent(selected, ControlPath::Wss, now);
+  sender.note_result(response(selected, true, true), now + 1, 5000);
+  for (int i = 0; i < 2405; ++i) { tick(true, 2); expect(!sender.consider_dc("media-a", now, 5000), "mock reprobe exceeded its one-attempt budget"); }
+  expect(sender.consider_dc("media-b", now + 1, 5000) && sender.holding_motion(), "new media attempt did not rearm safely");
+}
+
+void mock_idle_reprobe_requires_all_fresh_neutral_guards() {
+  NativeControlIntentSample sample;
+  sample.active = sample.fresh = sample.refresh_sample_healthy = true;
+  sample.requires_fresh_input = false; sample.ui_control_epoch = 1;
+  sample.intent.critical_video_ready = sample.intent.critical_video_sample_healthy = true;
+  auto eligible = [&](bool enabled = true, bool dc = true, bool waiting = false, bool clock = true) {
+    return mock_idle_reprobe_eligible(enabled, dc, waiting, sample, clock);
+  };
+  expect(eligible(), "healthy neutral mock sample rejected");
+  expect(!eligible(false) && !eligible(true, false) && !eligible(true, true, true) &&
+      !eligible(true, true, false, false), "mock, DC, ACK, or clock guard omitted");
+  auto original = sample;
+  sample.active = false; expect(!eligible(), "inactive owner accepted"); sample = original;
+  sample.fresh = false; expect(!eligible(), "stale input accepted"); sample = original;
+  sample.refresh_sample_healthy = false; expect(!eligible(), "unhealthy refresh accepted"); sample = original;
+  sample.requires_fresh_input = true; expect(!eligible(), "unrearmed input accepted"); sample = original;
+  sample.ui_control_epoch = 0; expect(!eligible(), "missing owner accepted"); sample = original;
+  sample.intent.gear = "D"; expect(!eligible(), "drive gear accepted"); sample = original;
+  sample.intent.throttle = .1; expect(!eligible(), "throttle accepted"); sample = original;
+  sample.intent.estop = true; expect(!eligible(), "emergency accepted"); sample = original;
+  sample.intent.critical_video_ready = false; expect(!eligible(), "unready video accepted"); sample = original;
+  sample.intent.critical_video_sample_healthy = false; expect(!eligible(), "unhealthy video accepted");
+  DriverConfig invalid; invalid.mock_idle_direct_reprobe = true;
+  throws([&] { DriverConsoleRuntime runtime(invalid, "vehicle-001", "fixture"); });
+}
+
 void signatures_bind_native_bytes_and_vehicle_results() {
   const std::string key = "01234567890123456789012345678901"; // Public test vector, never a deployed key.
   expect(control_transport_mac("abc", key) == "d5c75dc69d8243aa0882a04342d9ff7c73537a0311a7950800607be225594009", "SHA256 MAC disagrees with independent test vector");
@@ -289,10 +487,16 @@ void real_service_switch_does_not_disable_watchdog() {
 }  // namespace
 int main() {
   try {
+    mock_telemetry_summary_preserves_safety_fields();
+    compact_mock_wire_preserves_the_signed_command();
     publication_is_owned_only_by_its_current_dc_epoch();
+    late_dc_results_withdraw_publication_in_result_handler();
     failed_direct_trials_back_off_and_exhaust_per_attempt();
+    mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt();
+    mock_idle_reprobe_requires_all_fresh_neutral_guards();
+    confirmed_profile_permits_only_one_new_bounded_dc_budget();
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "12 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "17 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -10,6 +10,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <timeapi.h>
 #include <io.h>
 #else
 #include <fcntl.h>
@@ -17,7 +18,9 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 #if defined(__APPLE__)
@@ -976,16 +979,44 @@ void send_all(SocketHandle socket, std::string_view value) {
   }
 }
 
-void send_http_response(SocketHandle socket, const ServerResponse& response) {
+void send_http_response(SocketHandle socket, const ServerResponse& response, bool keep_alive = false) {
   std::ostringstream header;
   header << "HTTP/1.1 " << response.status << ' ' << status_reason(response.status) << "\r\n"
          << "Content-Type: " << response.content_type << "\r\n"
          << "Content-Length: " << response.body.size() << "\r\n"
-         << "Connection: close\r\n";
+         << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
   for (const auto& [name, value] : response.headers) header << name << ": " << value << "\r\n";
   header << "\r\n";
-  send_all(socket, header.str());
-  send_all(socket, response.body);
+  auto bytes = header.str();
+  if (keep_alive && response.body.size() <= 64 * 1024) {
+    // Emit small responses in one write so persistent requests do not wait for
+    // a delayed ACK between the headers and body.
+    bytes += response.body;
+    send_all(socket, bytes);
+  } else {
+    send_all(socket, bytes);
+    send_all(socket, response.body);
+  }
+}
+
+// A persistent control connection must not queue the next request behind a
+// slow handler: doing so would timestamp old input only after that handler
+// finishes. Treat pending bytes or a socket error as a reason to close.
+bool http_input_pending(SocketHandle socket) {
+  const auto fd = native_socket(socket);
+#if !defined(_WIN32)
+  if (fd < 0 || fd >= FD_SETSIZE) return true;
+#endif
+  fd_set readable;
+  FD_ZERO(&readable);
+  FD_SET(fd, &readable);
+  timeval timeout{0, 0};
+#if defined(_WIN32)
+  const int result = ::select(0, &readable, nullptr, nullptr, &timeout);
+#else
+  const int result = ::select(fd + 1, &readable, nullptr, nullptr, &timeout);
+#endif
+  return result != 0;
 }
 
 ServerResponse too_many_requests_response(const TooManyRequests& error) {
@@ -1005,9 +1036,14 @@ void add_request_id_header(ServerResponse& response, std::string_view request_id
   response.headers.emplace_back("X-Request-ID", request_id);
 }
 
-HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
+class HttpPeerDisconnected final : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes,
+                          std::string& wire, bool strict_framing) {
   constexpr std::size_t max_headers = 64 * 1024;
-  std::string wire;
   std::array<char, 16 * 1024> buffer{};
   std::size_t header_end = std::string::npos;
   while ((header_end = wire.find("\r\n\r\n")) == std::string::npos) {
@@ -1018,10 +1054,14 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
       if (socket_error_interrupted(error)) continue;
       throw std::runtime_error("recv failed: " + socket_error_message(error));
     }
-    if (received == 0) throw std::invalid_argument("client closed before sending HTTP headers");
+    if (received == 0) throw HttpPeerDisconnected("client closed before sending HTTP headers");
     wire.append(buffer.data(), static_cast<std::size_t>(received));
-    if (wire.size() > max_headers) throw std::invalid_argument("HTTP headers too large");
+    const auto end = wire.find("\r\n\r\n");
+    if ((end == std::string::npos && wire.size() > max_headers) ||
+        (end != std::string::npos && end > max_headers))
+      throw std::invalid_argument("HTTP headers too large");
   }
+  if (header_end > max_headers) throw std::invalid_argument("HTTP headers too large");
 
   const auto headers_received_at_utc_ms = now_ms();
   const auto headers_received_at_monotonic_ms = monotonic_now_ms();
@@ -1037,6 +1077,7 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
   if (!(line >> request.method >> request.target >> version) || !version.starts_with("HTTP/1.")) {
     throw std::invalid_argument("invalid HTTP request line");
   }
+  request.http_version = version;
   std::string header;
   while (std::getline(headers, header)) {
     header = trim(std::move(header));
@@ -1044,14 +1085,20 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
     const auto separator = header.find(':');
     if (separator == std::string::npos) throw std::invalid_argument("invalid HTTP header");
     const auto name = lower(trim(header.substr(0, separator)));
-    if ((name == "host" || name == "origin" || name == "content-type" || name == "sec-fetch-site") &&
+    if ((name == "host" || name == "origin" || name == "content-type" || name == "sec-fetch-site" ||
+         (strict_framing && (name == "content-length" || name == "transfer-encoding" || name == "connection"))) &&
         request.headers.contains(name))
       throw std::invalid_argument("duplicate HTTP security header");
     request.headers[name] = trim(header.substr(separator + 1));
   }
+  if (strict_framing && request.headers.contains("transfer-encoding"))
+    throw std::invalid_argument("HTTP transfer encoding is not supported");
 
   std::size_t content_length = 0;
   if (const auto found = request.headers.find("content-length"); found != request.headers.end()) {
+    if (strict_framing && (found->second.empty() || !std::all_of(found->second.begin(), found->second.end(),
+          [](unsigned char ch) { return ch >= '0' && ch <= '9'; })))
+      throw std::invalid_argument("invalid Content-Length header");
     std::size_t consumed = 0;
     try {
       content_length = std::stoull(found->second, &consumed);
@@ -1070,12 +1117,13 @@ HttpRequest parse_request(SocketHandle socket, std::size_t max_body_bytes) {
       if (socket_error_interrupted(error)) continue;
       throw std::runtime_error("recv failed: " + socket_error_message(error));
     }
-    if (received == 0) throw std::invalid_argument("client closed before sending HTTP body");
+    if (received == 0) throw HttpPeerDisconnected("client closed before sending HTTP body");
     wire.append(buffer.data(), static_cast<std::size_t>(received));
     request.received_at_utc_ms = now_ms();
     request.received_at_monotonic_ms = monotonic_now_ms();
   }
   request.body = wire.substr(body_start, content_length);
+  wire.erase(0, body_start + content_length);
 
   const auto question = request.target.find('?');
   request.path = url_decode(request.target.substr(0, question));
@@ -1722,7 +1770,11 @@ async function addIce(candidate){
 function offeredVideoCameraIds(sdp,tracks){const mapping=new Map(),cameraIds=(tracks||[]).map(track=>track.camera_id).filter(Boolean);let cameraIndex=0;for(const section of String(sdp||'').split(/\r?\nm=/).slice(1)){if(!section.startsWith('video '))continue;const match=section.match(/(?:^|\r?\n)a=mid:([^\r\n]+)/),cameraId=cameraIds[cameraIndex++];if(match&&cameraId)mapping.set(match[1],cameraId)}return mapping}
 const cameraView=MineTeleopCameraView.mount(cameraGrid);
 function attach(cameraId,track){if(emptyStage.isConnected)emptyStage.remove();cameraView.attach(cameraId,track)}
+async function fetchIceServers(){return (await post('/api/webrtc/ice-servers')).ice_servers||[]}
 async function startFromOffer(offer){
+  const routeMode=offer.ice_route_mode||'all';
+  let attemptIceServers=controlLogic.iceServersForMode(iceServers,routeMode);
+  const refreshIce=mediaHasOffer;
   const previousPeer=peer,nextScope=controlLogic.iceOfferScope(offer,!mediaHasOffer);
   if(nextScope.id&&(retiredMediaScopes.has(`id:${nextScope.id}`)||mediaOfferScope&&mediaOfferScope.id===nextScope.id))return;
   const queued=pendingIce;
@@ -1750,9 +1802,17 @@ async function startFromOffer(offer){
   remoteCameraIds=(offer.media_tracks||[]).map(t=>t.camera_id).filter(id=>typeof id==='string'&&id.length);
   cameraView.configure(remoteCameraIds);
   offeredCameraByMid=offeredVideoCameraIds(offer.sdp,offer.media_tracks||[]);
-  const nextPeer=new RTCPeerConnection({bundlePolicy:'max-bundle',iceServers,iceTransportPolicy:consoleConfig.ice_transport_policy});
-  peer=nextPeer;
   const sourceSession=nativeControlSessionId,sourceGeneration=nativeControlSessionGeneration;
+  const offerCurrent=()=>epoch===mediaPeerEpoch&&sourceSession===nativeControlSessionId&&sourceGeneration===nativeControlSessionGeneration;
+  if(refreshIce){
+    let refreshed;
+    try{refreshed=await fetchIceServers()}catch(error){if(!offerCurrent())return;throw error}
+    if(!offerCurrent())return;
+    iceServers=refreshed;attemptIceServers=controlLogic.iceServersForMode(iceServers,routeMode);
+  }
+  const nextPeer=new RTCPeerConnection({bundlePolicy:'max-bundle',iceServers:attemptIceServers,iceTransportPolicy:routeMode==='relay'?'relay':consoleConfig.ice_transport_policy});
+  clientLog('webrtc_ice_route_attempt',{mode:routeMode,media_negotiation_id:nextScope.id,server_count:attemptIceServers.length});
+  peer=nextPeer;
   const current=()=>currentMediaPeer(nextPeer,epoch,sourceSession,sourceGeneration);
   webrtcLabel.textContent=`协商 ${offer.codec||''}/${offer.backend||''}`;
   nextPeer.onconnectionstatechange=()=>{
@@ -1905,12 +1965,13 @@ async function collectMetrics(){
     let fps=Number(s.framesPerSecond||0),bitrateKbps=0;
     if(prior){const seconds=(sampledAt-prior.sampledAt)/1000;if(seconds>0){if(!fps)fps=(decoded-prior.framesDecoded)/seconds;bitrateKbps=Math.max(0,(bytesReceived-prior.bytesReceived)*8/seconds/1000)}}
     const packetDelta=prior?Math.max(0,packetsReceived-prior.packetsReceived):null,lostDelta=prior?Math.max(0,packetsLost-prior.packetsLost):null;
-    previousStats.set(statsKey,{sampledAt,framesDecoded:decoded,bytesReceived,packetsReceived,packetsLost});
+    const interval=controlLogic.receiverIntervalStats(s,prior?.receiverCounters);
+    previousStats.set(statsKey,{sampledAt,framesDecoded:decoded,bytesReceived,packetsReceived,packetsLost,receiverCounters:interval.counters});
 
     const cameraId=cameraByMid.get(s.mid||'')||'',lane=(mediaStatus.lanes||[]).find(l=>l.camera_id===cameraId)||{};
     const captureEncodeMs=lane.capture_to_encoded_valid===false||typeof lane.capture_to_encoded_ms!=='number'?null:lane.capture_to_encoded_ms;
     const latency=controlLogic.receiverLatency(s,captureEncodeMs,rtt),{jitterMs,processingMs,latencyMs}=latency;
-    streams.push({camera_id:cameraId,mid:s.mid||'',codec_id:s.codecId||'',fps,bitrate_kbps:bitrateKbps,frames_decoded:decoded,key_frames_decoded:s.keyFramesDecoded??null,frames_received:s.framesReceived??null,frames_dropped:Number(s.framesDropped||0),nack_count:s.nackCount??null,pli_count:s.pliCount??null,fir_count:s.firCount??null,decoder_implementation:s.decoderImplementation??null,decode_ms_per_frame:decoded>0&&typeof s.totalDecodeTime==='number'?s.totalDecodeTime*1000/decoded:null,codec_mime_type:report.get(s.codecId)?.mimeType||'',packets_lost:packetsLost,packets_received:packetsReceived,packet_loss_percent:(packetsLost+packetsReceived)>0?100*packetsLost/(packetsLost+packetsReceived):0,jitter_ms:Number(s.jitter||0)*1000,capture_to_encoded_ms:captureEncodeMs,jitter_buffer_ms:jitterMs,processing_ms:processingMs,receiver_latency_method:latency.method,round_trip_ms:rtt===null?null:rtt*1000,interval_packets_received:packetDelta,interval_packets_lost:lostDelta,interval_packet_loss_percent:packetDelta!==null&&packetDelta+lostDelta>0?100*lostDelta/(packetDelta+lostDelta):null,freeze_count:s.freezeCount??null,total_freezes_duration_s:s.totalFreezesDuration??null,last_packet_received_timestamp_ms:s.lastPacketReceivedTimestamp??null,total_decode_time_s:s.totalDecodeTime??null,total_processing_delay_s:s.totalProcessingDelay??null,estimated_end_to_end_latency_ms:latencyMs,passed:fps>=20&&latencyMs!==null&&latencyMs<=200})
+    streams.push({camera_id:cameraId,mid:s.mid||'',codec_id:s.codecId||'',fps,bitrate_kbps:bitrateKbps,frames_decoded:decoded,key_frames_decoded:s.keyFramesDecoded??null,frames_received:s.framesReceived??null,frames_dropped:Number(s.framesDropped||0),nack_count:s.nackCount??null,pli_count:s.pliCount??null,fir_count:s.firCount??null,decoder_implementation:s.decoderImplementation??null,decode_ms_per_frame:decoded>0&&typeof s.totalDecodeTime==='number'?s.totalDecodeTime*1000/decoded:null,codec_mime_type:report.get(s.codecId)?.mimeType||'',packets_lost:packetsLost,packets_received:packetsReceived,packet_loss_percent:(packetsLost+packetsReceived)>0?100*packetsLost/(packetsLost+packetsReceived):0,jitter_ms:Number(s.jitter||0)*1000,capture_to_encoded_ms:captureEncodeMs,jitter_buffer_ms:jitterMs,processing_ms:processingMs,receiver_latency_method:latency.method,interval_frames_decoded:interval.framesDecoded,interval_decode_ms:interval.decodeMs,interval_processing_ms:interval.processingMs,interval_jitter_buffer_ms:interval.jitterMs,interval_jitter_target_ms:interval.targetJitterMs,round_trip_ms:rtt===null?null:rtt*1000,interval_packets_received:packetDelta,interval_packets_lost:lostDelta,interval_packet_loss_percent:packetDelta!==null&&packetDelta+lostDelta>0?100*lostDelta/(packetDelta+lostDelta):null,freeze_count:s.freezeCount??null,total_freezes_duration_s:s.totalFreezesDuration??null,last_packet_received_timestamp_ms:s.lastPacketReceivedTimestamp??null,total_decode_time_s:s.totalDecodeTime??null,total_processing_delay_s:s.totalProcessingDelay??null,estimated_end_to_end_latency_ms:latencyMs,passed:fps>=20&&latencyMs!==null&&latencyMs<=200})
   }
   const timeSync=latestRuntimeStatus.time_sync||mediaStatus.time_sync||{},turnConfigured=hasTurnServer();
   const controlOutcomes={...controlOutcomeSession.metrics};
@@ -2070,15 +2131,19 @@ SimpleHttpServer::SimpleHttpServer(
     std::uint16_t port,
     Handler handler,
     std::size_t max_body_bytes,
-    WebSocketHandler websocket_handler)
+    WebSocketHandler websocket_handler,
+    HttpConnectionPolicy connection_policy)
     : host_(std::move(host)),
       requested_port_(port),
       handler_(std::move(handler)),
       max_body_bytes_(max_body_bytes),
-      websocket_handler_(std::move(websocket_handler)) {
+      websocket_handler_(std::move(websocket_handler)),
+      connection_policy_(connection_policy) {
   if (host_.empty()) throw std::invalid_argument("HTTP host must not be empty");
   if (!handler_) throw std::invalid_argument("HTTP handler is required");
   if (max_body_bytes_ == 0) throw std::invalid_argument("HTTP max body size must be positive");
+  if (connection_policy_ == HttpConnectionPolicy::BoundedKeepAlive && websocket_handler_)
+    throw std::invalid_argument("persistent HTTP cannot share a websocket listener");
 }
 
 SimpleHttpServer::~SimpleHttpServer() { stop(); }
@@ -2134,22 +2199,59 @@ void SimpleHttpServer::open_listener() {
 }
 
 void SimpleHttpServer::serve_client(SocketHandle client_fd) const {
-  ServerResponse response;
-  try {
-    auto request = parse_request(client_fd, max_body_bytes_);
-    request.peer_address = socket_peer_address(client_fd);
-    if (websocket_handler_ && websocket_handler_(client_fd, request)) return;
-    response = handler_(request);
-  } catch (const std::length_error& error) {
-    response = ServerResponse::json(413, {{"error", error.what()}});
-  } catch (const std::invalid_argument& error) {
-    response = ServerResponse::json(400, {{"error", error.what()}});
-  } catch (const std::exception& error) {
-    response = ServerResponse::json(500, {{"error", error.what()}});
+  bool persistence = connection_policy_ == HttpConnectionPolicy::BoundedKeepAlive;
+  if (persistence) {
+#if defined(_WIN32)
+    const DWORD timeout = 3000;
+    persistence = ::setsockopt(native_socket(client_fd), SOL_SOCKET, SO_RCVTIMEO,
+                               reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0;
+#else
+    const timeval timeout{3, 0};
+    persistence = ::setsockopt(native_socket(client_fd), SOL_SOCKET, SO_RCVTIMEO,
+                               &timeout, sizeof(timeout)) == 0;
+#endif
   }
-  try {
-    send_http_response(client_fd, response);
-  } catch (const std::exception&) {
+  std::string wire;
+  constexpr std::size_t max_requests = 512;
+  for (std::size_t count = 0; count < max_requests && !stopping_; ++count) {
+    ServerResponse response;
+    bool keep_alive = false;
+    bool request_parsed = false;
+    try {
+      auto request = parse_request(client_fd, max_body_bytes_, wire, persistence);
+      request_parsed = true;
+      request.peer_address = socket_peer_address(client_fd);
+      if (websocket_handler_ && websocket_handler_(client_fd, request)) return;
+      const auto connection = request.headers.find("connection");
+      const auto connection_value = connection == request.headers.end() ? std::string{} : lower(connection->second);
+      bool close_requested = false;
+      std::istringstream tokens(connection_value);
+      for (std::string token; std::getline(tokens, token, ',');)
+        if (trim(std::move(token)) == "close") close_requested = true;
+      response = handler_(request);
+      keep_alive = persistence && request.http_version == "HTTP/1.1" && !close_requested &&
+          count + 1 < max_requests && wire.empty() && !http_input_pending(client_fd);
+    } catch (const HttpPeerDisconnected& error) {
+      if (persistence) return;
+      response = ServerResponse::json(400, {{"error", error.what()}});
+      keep_alive = false;
+    } catch (const std::length_error& error) {
+      response = ServerResponse::json(413, {{"error", error.what()}});
+      keep_alive = false;
+    } catch (const std::invalid_argument& error) {
+      response = ServerResponse::json(400, {{"error", error.what()}});
+      keep_alive = false;
+    } catch (const std::exception& error) {
+      if (persistence && !request_parsed && wire.empty()) return;
+      response = ServerResponse::json(500, {{"error", error.what()}});
+      keep_alive = false;
+    }
+    try { send_http_response(client_fd, response, keep_alive); }
+    catch (const std::exception&) { return; }
+    if (!keep_alive) return;
+    // Catch requests that arrived between the pre-send check and completion of
+    // the response; they cannot be assigned a trustworthy fresh receive time.
+    if (http_input_pending(client_fd)) return;
   }
 }
 
@@ -5247,6 +5349,11 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
   if (!control_transport_mode_is_valid(config_.control_transport_mode))
     throw std::invalid_argument("control.transport_mode must be p2p_preferred or cloud_only");
   if (vehicle_id_.empty()) throw std::invalid_argument("vehicle id is required");
+  if (config_.mock_idle_direct_reprobe &&
+      (!config_.defer_control_bootstrap || config_.receive_only ||
+       vehicle_id_.rfind("test_bench_", 0) != 0 ||
+       config_.signaling_url.rfind("ws://127.0.0.1:", 0) != 0))
+    throw std::invalid_argument("mock idle direct reprobe requires isolated mock control");
   reset_control_profile_locked();
   if (!signaling_url_is_secure_or_loopback(config_.signaling_url)) {
     throw std::invalid_argument("public signaling URL must use HTTPS or WSS; HTTP/WS is allowed only on loopback");
@@ -5274,8 +5381,11 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
           });
         }, [this] { return Json::array({native_control_observation()}); });
   }
-  native_control_sender_ = std::jthread(
-      [this](std::stop_token stop_token) { native_control_sender_loop(stop_token); });
+  if (!config_.receive_only) {
+    native_control_sender_ = std::jthread(
+        [this](std::stop_token stop_token) { native_control_sender_loop(stop_token); });
+  }
+  // Media still shares the session lease and needs renewal for long viewing.
   native_control_lease_ = std::jthread(
       [this](std::stop_token stop_token) { native_control_lease_loop(stop_token); });
   time_sync_worker_ = std::jthread(
@@ -5591,6 +5701,12 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
       control_dc_last_ack_seq_ = seq;
       const auto transition = control_dc_ack_recovery_.note_ack_progress(now, seq, receipt.round_trip_ms, timeout_ms);
       rearm = rearm || transition.entered || transition.recovered;
+      // A direct result can be consumed on the courier thread. Retire the
+      // existing DC publication in this same critical section when its ACK
+      // health enters recovery; waiting for the next sender tick would allow
+      // that courier call to fetch an older still-live motion publication.
+      if (transition.entered && control_transport_sender_.path() == detail::ControlPath::DataChannel)
+        select_control_wss_locked(now, timeout_ms);
     }
   }
   if (rearm) native_control_intent_.invalidate(true);
@@ -5604,6 +5720,7 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
 }
 
 Json DriverConsoleRuntime::send_control_management(const Json& input) {
+  if (config_.receive_only) throw std::runtime_error("control is disabled in receive-only mode");
   Json payload;
   {
     std::lock_guard update_lock(native_control_update_mutex_);
@@ -5703,6 +5820,7 @@ void DriverConsoleRuntime::observe_emergency_stop_result_verified(const Json& re
 }
 
 Json DriverConsoleRuntime::emergency_stop_bridge(const Json& input) {
+  if (config_.receive_only) throw std::runtime_error("control is disabled in receive-only mode");
   // No ordinary transport/update mutex: a stuck WSS connect/write must not
   // block fetching an already-published native emergency. No network I/O.
   std::string session, vehicle, driver, key, attempt, owner;
@@ -5782,6 +5900,7 @@ void DriverConsoleRuntime::consume_feedback_status_locked(const Json& value, std
 }
 
 Json DriverConsoleRuntime::control_transport_bridge(const Json& input, const HttpRequest* request) {
+  if (config_.receive_only) throw std::runtime_error("control is disabled in receive-only mode");
   const auto handler_entered = monotonic_now_ms();
   std::string session, vehicle, driver, attempt, owner;
   std::uint64_t ui_epoch = 0;
@@ -6367,6 +6486,10 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
         select_control_wss_locked(monotonic_ms, recovery_timeout_ms);
       if (control_transport_sender_.observe(dc_ready, current_media_attempt, monotonic_ms, recovery_timeout_ms))
         retire_control_dc_locked();
+      control_transport_sender_.observe_mock_idle_reprobe(
+          detail::mock_idle_reprobe_eligible(config_.mock_idle_direct_reprobe, dc_ready,
+              control_signaling_ack_recovery_.waiting(), sample, command.control_time_sync_ready),
+          sample.ui_control_epoch, monotonic_ms);
       if (dc_ready && !control_signaling_ack_recovery_.waiting() &&
           control_transport_sender_.consider_dc(current_media_attempt, monotonic_ms, recovery_timeout_ms)) {
         control_dc_ack_window_.reset(); control_dc_ack_recovery_.reset(); control_dc_last_ack_seq_ = 0;
@@ -6673,6 +6796,17 @@ void DriverConsoleRuntime::wake_native_control_sender() noexcept {
 
 void DriverConsoleRuntime::native_control_sender_loop(std::stop_token stop_token) {
   std::stop_callback cancellation(stop_token, [this] { wake_native_control_sender(); });
+#if defined(_WIN32)
+  // Scope the Windows timer-resolution request to the lifetime of the control
+  // sender. This does not change the command period or any safety deadline.
+  struct TimerResolution {
+    MMRESULT result{timeBeginPeriod(1)};
+    ~TimerResolution() { if (result == TIMERR_NOERROR) static_cast<void>(timeEndPeriod(1)); }
+  } timer_resolution;
+  if (native_control_trace_) native_control_trace_->enqueue({
+      {"stage", "sender_thread_scheduling"}, {"platform", "windows"},
+      {"timer_period_requested_ms", 1}, {"timer_period_result", static_cast<unsigned int>(timer_resolution.result)}});
+#endif
 #if defined(__APPLE__)
   // Each short input/ACK exchange is latency-sensitive interactive work. The
   // default pthread QoS can defer it while unrelated desktop work runs; keep
@@ -7285,8 +7419,8 @@ Json DriverConsoleRuntime::connect_locked(std::string_view requested_vehicle_id,
         // owner, but their declared vehicle capability still needs checking.
         validate_target(false);
         connect_signaling_websocket(current_session, current_token);
-        static_cast<void>(
-            connect_control_signaling_websocket(current_session, current_token));
+        if (!config_.receive_only && !config_.defer_control_bootstrap)
+          static_cast<void>(connect_control_signaling_websocket(current_session, current_token));
         std::lock_guard lock(mutex_);
         return {
             {"runtime", "cpp"},
@@ -7352,14 +7486,17 @@ Json DriverConsoleRuntime::connect_locked(std::string_view requested_vehicle_id,
       reset_control_profile_locked();
       connected_at_ms_ = connected_at_ms;
     }
-    native_control_intent_.begin_session(monotonic_now_ms());
+    if (!config_.receive_only) {
+      if (config_.defer_control_bootstrap) native_control_intent_.reset();
+      else native_control_intent_.begin_session(monotonic_now_ms());
+    }
   }
   wake_native_control_sender();
   try {
     if (connect_cancellation_generation_.load() != generation) throw std::runtime_error("连接申请已取消");
     connect_signaling_websocket(session_id, current_token);
-    static_cast<void>(
-        connect_control_signaling_websocket(session_id, current_token));
+    if (!config_.receive_only && !config_.defer_control_bootstrap)
+      static_cast<void>(connect_control_signaling_websocket(session_id, current_token));
     if (connect_cancellation_generation_.load() != generation) throw std::runtime_error("连接申请已取消");
   } catch (...) {
     const auto failure = std::current_exception();
@@ -8048,6 +8185,7 @@ Json DriverConsoleRuntime::control_profile() const {
 }
 
 Json DriverConsoleRuntime::prepare_control_profile(const Json& input) {
+  if (config_.receive_only) throw std::runtime_error("control is disabled in receive-only mode");
   if (!input.is_object()) {
     throw std::invalid_argument("control profile requires an object");
   }
@@ -8212,6 +8350,7 @@ Json DriverConsoleRuntime::send_control(const Json& input) {
 }
 
 Json DriverConsoleRuntime::update_control_intent(const Json& input, const HttpRequest* request) {
+  if (config_.receive_only) throw std::runtime_error("control is disabled in receive-only mode");
   const auto entered_at = monotonic_now_ms();
   const auto received_at = request ? request->received_at_monotonic_ms.value_or(entered_at) : entered_at;
   std::int64_t update_lock_wait_ms = 0, runtime_lock_wait_ms = 0, applied_at = entered_at;
@@ -8342,14 +8481,22 @@ Json DriverConsoleRuntime::update_control_intent(const Json& input, const HttpRe
   };
 }
 
-Json DriverConsoleRuntime::status() {
+DriverTimeSyncSnapshot DriverConsoleRuntime::time_sync_snapshot() {
+  auto clock = clock_.status();
+  auto readiness = time_sync_readiness_gate_.observe(clock,
+      config_.max_time_sync_uncertainty_ms, monotonic_now_ms(),
+      TimeSyncReadinessGate::candidate_timeout_ms(config_.time_sync_interval_ms, config_.time_sync_samples));
+  return {std::move(clock), std::move(readiness)};
+}
+
+Json DriverConsoleRuntime::status(bool omit_signaling_socket) {
   // Monitoring is a local snapshot. Network time samples and authority
   // renewal belong to their workers and must not delay input-lease refresh.
   bool websocket_connected = false;
   std::uint64_t websocket_reconnects = 0;
   std::uint64_t delivery_cursor = 0;
   std::size_t pending_deliveries = 0;
-  {
+  if (!omit_signaling_socket) {
     std::lock_guard websocket_lock(signaling_websocket_mutex_);
     websocket_connected = signaling_websocket_ && signaling_websocket_->connected();
     websocket_reconnects = signaling_websocket_reconnects_;
@@ -8469,10 +8616,11 @@ Json DriverConsoleRuntime::status() {
       {"last_control_prepared_at_utc_ms", last_control_prepared_at_utc_ms_},
       {"control_commands_prepared_total", control_commands_prepared_total_},
       {"signaling_transport", "websocket"},
-      {"signaling_websocket_connected", websocket_connected},
-      {"signaling_websocket_reconnects", websocket_reconnects},
-      {"signaling_delivery_cursor", delivery_cursor},
-      {"pending_signaling_deliveries", pending_deliveries},
+      {"signaling_socket_snapshot_available", !omit_signaling_socket},
+      {"signaling_websocket_connected", omit_signaling_socket ? Json(nullptr) : Json(websocket_connected)},
+      {"signaling_websocket_reconnects", omit_signaling_socket ? Json(nullptr) : Json(websocket_reconnects)},
+      {"signaling_delivery_cursor", omit_signaling_socket ? Json(nullptr) : Json(delivery_cursor)},
+      {"pending_signaling_deliveries", omit_signaling_socket ? Json(nullptr) : Json(pending_deliveries)},
       {"native_control",
        {{"transport", control_transport_status.value("path", "wss") == "dc" ? "native_webrtc_data_channel_bridge" : "native_signaling_websocket"},
         {"cloud_capabilities_verified", native_control_capabilities_verified},

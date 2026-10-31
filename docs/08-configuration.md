@@ -131,16 +131,8 @@ cloud:
   auth_url: https://teleop.example.com/auth
   device_cert: /etc/mine-teleop/certs/vehicle.crt
   device_key: /etc/mine-teleop/certs/vehicle.key
-
-ice:
-  stun_servers:
-    - stun:turn.example.com:3478
-  turn_servers:
-    - url: turn:turn.example.com:3478?transport=udp
-      username: mine-teleop
-      credential_mode: turn_rest
-      static_auth_secret_file: /etc/mine-teleop/turn-static-auth.secret
-      credential_ttl_seconds: 600
+  # 0 保持原有 ICE 并发选路；例如 3000 启用一次直连优先、失败后允许 TURN 的重试。
+  ice_direct_timeout_ms: 0
 
 control:
   rate_hz: 20
@@ -751,6 +743,39 @@ sender 调度延迟、建连耗时、ACK 排空、WSS send 起止/耗时以及 U
 profile/握手门禁和实际 apply。任何单侧“已提交”或“已发送”都不能作为车端已接受的
 ACK。现场三机配置启用此项，并使用 `16 MiB × 4` 轮转容量；复现完成后应按现场保留
 策略归档或删除。
+
+## ICE 配置来源与直连回退
+
+车端和网页从经过认证的信令接口 `/sessions/{session_id}/ice_servers` 取得相同的
+ICE 服务列表。STUN/TURN 地址在信令服务的 `--stun-urls` / `--turn-urls` 配置，
+短期 TURN 凭据由服务端签发；不在车辆 YAML 保存 TURN secret。
+历史示例中的 `ice.stun_servers` / `ice.turn_servers` 从未被 C++ 读取，现已删除；
+如旧配置还含这两个键，加载时会明确报错，要求迁移到信令服务，避免继续静默忽略。
+
+`cloud.ice_direct_timeout_ms` 范围为 0–30000，默认 0 保持既有同时收集候选的行为。
+设为正数且信令提供 TURN、`cloud.ice_transport_policy` 非 `relay` 时：首次 offer
+携带 `ice_route_mode: direct`，两端暂不配置 TURN，车端过滤远端 SDP/trickle 的 relay。
+从 matching answer 成功应用后起计时，未连接超时或连接状态 terminal failed 时，
+先执行已有 `stop_pipeline`，关闭控制服务与旧 Peer，再用相同编码器发起新代际 offer
+(`ice_route_mode: all`)，允许 TURN。车端在安全关闭后、网页/原生接收端在新代际协商时重新获取短期凭据，
+避免长时间直连后回退使用已过期 credential；迟到的获取结果受代际围栏保护。
+每次媒体 runtime 最多一次这种回退，
+不承诺新尝试一定成功，也不会继承旧控制就绪状态。未收到 answer 是信令问题，不启动
+此计时；没有 TURN 时不进行无意义重试。强制 relay 配置保持强制 relay。
+
+这不是原 Peer 的 `restartIce()`，不实现健康 relay 的周期性直连升级或基于 RTT/丢包
+阈值的自动重协商。双栈候选由 WebRTC/libnice 收集和检查，产品没有禁用公网 IPv6；
+最终使用哪个地址族以选中候选对为准。不能根据设置支持双栈就认定当前运营商可达。
+GStreamer 的 `stun-server` 属性仅配置列表中第一个 STUN，TURN 则逐项配置；浏览器可使用
+整个列表。固定地址族 A/B 应使用对应族可达的同一 STUN 服务，不能假定原生同时完成
+两族、多 STUN 映射探测。公网 IPv6 host 不需要先形成 srflx。
+
+产品事件 `vehicle_ice_configuration` 明确记录配置来源、STUN/TURN 是否应用与 route mode；
+每代前 64 个本地/远端候选记录类型、UDP/TCP、地址族、地址类别；
+`vehicle_ice_selected_pair` / `media_negotiation.selected_pair` 记录实际连接对与变更计数；
+`vehicle_ice_connected` 记录连接里程碑，`vehicle_ice_relay_fallback` 记录回退。
+新增候选诊断不含地址、端口、ufrag 或凭据。`peer_connected_observed` 不代表视频新鲜或
+控制可以恢复；原安全门禁仍必须满足。
 
 ## 配置校验
 

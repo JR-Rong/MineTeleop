@@ -1,0 +1,253 @@
+{
+  "generated_at_utc": "2026-10-28T03:04:18.871510+00:00",
+  "pull_request": 26,
+  "base_pull_request": 25,
+  "target_branch": "rjr/cx/orin-isx031-cpu",
+  "pre_change_commit": "b22e6f1f41fb23157018cabf8a580478416d69f5",
+  "source_identity": "Changed source file hashes, captured before commit; hashes exclude this report.",
+  "source_sha256": {
+    "CMakeLists.txt": "c55d97ca695f184b7c200d2605242310da1bf629451c3f48b71ace5394f62a14",
+    "cpp/include/mine_teleop/core.hpp": "d83af7cb762baabd1c55d4e379187c091db1cd92a5fbbe562526c8892f9cd2b0",
+    "cpp/include/mine_teleop/detail/gstreamer_ice_servers.hpp": "bc0e2d571b86cd4089106710e3608f5265872e271fc7079d8020e61223447d37",
+    "cpp/include/mine_teleop/detail/ice_diagnostics.hpp": "be9146a7be05a7399a9faf3fae6ff5d2ea41bf3b9e20cb1da3c6cd27f6d4d6b2",
+    "cpp/include/mine_teleop/detail/ice_route_policy.hpp": "5c2eb0ffade11551030980616fa3b3e0c29377d12c701d8d52cd1eb670d2d001",
+    "cpp/src/core.cpp": "63765079f1e6d4ed5aaa03324035b8a783abc4e2dc8fb56d80728c7e391a3470",
+    "cpp/src/server.cpp": "90d42df3c823a7705b8dd322a4482bcf65c92f2baba3449c7c19212e4e11cde9",
+    "cpp/src/webrtc_media.cpp": "12d18bd6248edc1e666d68d1ef73341b9ea615b1978b86c6eaadf93f40d8134d",
+    "cpp/tests/control_tests.cpp": "843c5e629f584b294a54528c246539d7361b23c1d3152fd951f4d6bf1a2acb70",
+    "cpp/tests/core_tests.cpp": "7482ba886e7cb4237786406d29db9001a135a498a294df881bb7b3b5c1faafff",
+    "cpp/tests/ice_fallback_gstreamer.test.py": "747a754c68f247a7d43a7f4c650ba5bba36ed52cc6c85ef3d593aafe290b9421",
+    "cpp/tests/ice_fallback_gstreamer_tests.cpp": "3aa682fc5a86c4d9b4432d9a26e32eb77d61f25cd6d804d3cf2e82f8b6c9cfdd",
+    "cpp/tests/ice_gstreamer_init.test.py": "a51468e607b2252e6c9bf04f55f9ef49ae884b5767db71cbab7c6f203533efa0",
+    "cpp/tests/ice_page.test.cjs": "d3efaf9725f3045d246e5c0efac722454218d5726a8d6bd02f6cc7dbc5251520",
+    "cpp/tests/ice_route_policy_tests.cpp": "fe52e7759e524066e00f3f84a7f304184db3ec28ec9244b4553a2f82a701773b",
+    "cpp/tests/ice_vehicle_callbacks.test.py": "fab4aaacf7fcc1e5f9fea30ea9db03d3a90005893ce0ff1b1d4a907b61833198",
+    "cpp/tests/native_receiver_core.hpp": "a5c99e0d91aaac2c83c1c588b312c5b169ab154879f3d30d62cb3779af300797",
+    "cpp/tests/native_video_layer.mm": "5c3c235411fd676cb31681a5c3e45963e5dd818ac689866ed9b0bcb313d46efe",
+    "cpp/web/control_logic.js": "776ad95e7560b3318d13674455e4d374193ff8411e05756780fd44b15aa1dc1b",
+    "desktop/bench/main.cjs": "004a1f2e4e5c9b6edc7e37678eb98654b4665421c1b861d892f134d7ac208a7f",
+    "desktop/bench/network-policy.cjs": "5b850cb801cf9449517f1a5a6e71fec1b7b4f395d6ee96389bf24b7df7396089",
+    "desktop/bench/renderer.js": "aa29810f73e4736382de639380739b45591b95e85e2b56765c4bd84190d914a9",
+    "desktop/test/bench-network-policy.test.cjs": "1fd094a9190ddbeab050bb5767a3644290a144194f33a02dbde0b4ac8a0af6b6",
+    "scripts/test/hybrid_receiver_analyze.py": "3e5a618e4c8d943b2deedb71300f94dcc5db9878932beae68255a6f13170dc54",
+    "scripts/test/hybrid_receiver_analyze.test.py": "2b2e62b297c8502a90eb000aed18ab7470afb83323e9df399183b38716235a24",
+    "scripts/test/run_offline_regressions.py": "03d9b487088616085934de7ba256390f99dea07b600e1d11d3baa35b4fd9a93f",
+    "configs/vehicle-agent.dev.yaml": "58a955afed2e46a78f42aaff66c200e34584f6f7aac9228dfdc2f077b16f04b5"
+  },
+  "scope": "Code and isolated loopback automated tests only. No Orin connection, camera/CAN use, LAN media experiment or independent-public-network performance test in this round.",
+  "implementation": {
+    "dual_stack": "Existing WebRTC/libnice IPv4+IPv6 retained; bench accepts explicit IPv4, IPv6 or dual-stack and independent relay permission.",
+    "fallback": "Opt-in cloud.ice_direct_timeout_ms 0..30000 (default 0). One direct-only budget after successful answer application, then control-safe teardown, refreshed authenticated ICE credentials and fresh Peer/negotiation with TURN allowed.",
+    "candidate_evidence": "First 64 local/remote candidates per attempt: type, protocol, family, address class; product selected pair from libnice, connected milestone, fallback event. No raw addresses, ports, ufrags or credentials in new product diagnostics.",
+    "compatibility": "Reject historically ignored vehicle ice.stun_servers/turn_servers; configure authenticated signaling service instead. Old WAN IPv4-only bench schema remains supported.",
+    "not_implemented": [
+      "Periodic healthy relay-to-direct upgrade",
+      "RTT/loss-driven ICE restart",
+      "New hole-punching algorithm",
+      "New congestion control/FEC/codec rate control"
+    ]
+  },
+  "validation": {
+    "linux_environment": {
+      "os": "Ubuntu 22.04 arm64 container on this Mac",
+      "gstreamer": "1.20.3",
+      "libnice": "0.1.18",
+      "node": "22.16.0",
+      "compiler": "GCC 11.4",
+      "network_interfaces": [
+        "lo"
+      ],
+      "addresses": [
+        "127.0.0.1",
+        "::1"
+      ],
+      "external_routes": []
+    },
+    "linux_full_build": "passed (vehicle runtime, CLI, native probe and all registered test targets)",
+    "linux_first_full_ctest": {
+      "passed": 65,
+      "total": 70,
+      "failed": [
+        "websocket-send-tls (openssl executable missing)",
+        "control-transport-integration (feedback selection assertion)",
+        "product-direct-integration (route qualification)",
+        "control-tests (clock timing and outdated page string contract)",
+        "media-time-sync-retry-loopback (wall/monotonic timing)"
+      ]
+    },
+    "linux_final_full_ctest": {
+      "passed": 69,
+      "total": 70,
+      "failed": [
+        "websocket-send-tls (expired during frame preparation)"
+      ],
+      "elapsed_s": 248.26
+    },
+    "linux_remaining_test_retest": {
+      "name": "websocket-send-tls",
+      "passed": true,
+      "elapsed_s": 1.23,
+      "note": "All 70 registered suites have a passing result, but no claim that the full run was green. Timing-sensitive failures retained; assertions not relaxed."
+    },
+    "pre_change_comparison": {
+      "commit": "b22e6f1f41fb23157018cabf8a580478416d69f5",
+      "tests": [
+        "control-transport-integration",
+        "product-direct-integration"
+      ],
+      "both_failed": true,
+      "note": "Control integration failed at a different timing assertion; product route qualification failed in both revisions. This does not establish a root cause or prove the tests are stable."
+    },
+    "gstreamer_fallback": {
+      "passed": true,
+      "checks": [
+        "IPv4 loopback direct UDP DataChannel delivery",
+        "IPv6 loopback direct UDP DataChannel delivery",
+        "Deliberately withheld direct candidates cause bounded timeout",
+        "Destroy old peers before fresh peers with TURN",
+        "Real selected TURN/UDP pair and DataChannel delivery using coturn REST expiring username/Base64 credential",
+        "IPv6 STUN property and direct-phase omission of TURN"
+      ],
+      "not_proven": [
+        "Carrier NAT traversal",
+        "Independent WAN reachability",
+        "TURN/TLS transport",
+        "IPv6 TURN allocation",
+        "Full vehicle control rearm after real path failure",
+        "Native window fallback rendering"
+      ]
+    },
+    "product_page_methods": {
+      "passed": 19,
+      "http_and_peer": "mocked",
+      "checks": [
+        "direct excludes TURN",
+        "fallback refreshes credentials",
+        "stale credential success/failure cannot create old peer",
+        "relay policy",
+        "IPv6 candidates",
+        "old peer/answer/candidate generation fences"
+      ]
+    },
+    "actual_vehicle_callbacks": {
+      "passed": true,
+      "fixtures": [
+        "deterministic Gst mock with direct filtering/fresh fallback candidate fences",
+        "real isolated GStreamer initialization and callback ownership"
+      ]
+    },
+    "mac": {
+      "build": "native video layer, receiver probe and route-policy test passed",
+      "gstreamer": "1.28.8",
+      "libnice": "0.1.24",
+      "targeted_ctest_passed": 6,
+      "targeted_ctest_total": 6,
+      "native_UI_runtime_AB": "not run"
+    },
+    "desktop_js": {
+      "passed": 39,
+      "skipped": 6,
+      "network_policy_cases": 6
+    },
+    "control_logic_js": {
+      "passed": 104
+    },
+    "hybrid_analyzer": {
+      "passed": 9
+    },
+    "fixed_pure_regressions": "passed"
+  },
+  "wan_acceptance_seconds": {
+    "ipv4_browser": 0,
+    "ipv4_native": 0,
+    "ipv6_browser": 0,
+    "ipv6_native": 0,
+    "required_per_arm": 1800
+  },
+  "wan_blocker": "User confirmed Orin currently lacks an independent public uplink. Prior LAN results are excluded.",
+  "next_validation": "Independent uplinks -> candidate/STUN mapping and no-TURN comparison -> fixed family/path browser/native arms under identical UI load -> separate TURN availability/path-duration report.",
+  "review": {
+    "reuse": "Shared ICE server application for vehicle/native receiver; shared address parser for product JS/bench. Existing control-safe teardown and negotiation fences reused.",
+    "quality": "One bounded opt-in retry; explicit legacy configuration migration; credential refresh is fenced; no healthy-relay interruption; strict WAN path checks remain.",
+    "efficiency": "Diagnostics bounded per ICE attempt; no added per-frame product tracing. No new NAT implementation or repeated healthy-session probing.",
+    "skill_candidate": "Repository-scoped independent-WAN evidence and receiver A/B workflow; documented, no new skill installed."
+  },
+  "mac_binary_sha256": {
+    "mine-teleop-native-video-layer.node": "fb9ed31409cda088dad0942272997af071b76d210bb840721357114da306ec53",
+    "mine-teleop-native-receiver-probe": "26474cb0816c1390598b25127e2d26cf9c15723ba7d2d3c6fb3d6f5fccad33b5"
+  },
+  "artifacts": {
+    "linux-isolation.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/linux-isolation.log",
+      "sha256": "e35a14198c76e6f78c81da47cce50c8d99cfc71d25723ed4d16f4fcc4c3038dc"
+    },
+    "linux-configure.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/linux-configure.log",
+      "sha256": "fbc4ee9b261b3006de457c48d17b396ed9f139004b5f0f086a5c8345813080ea"
+    },
+    "linux-final-build.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/linux-final-build.log",
+      "sha256": "8063373b7d51da2d5d2492bdb11376aa0057d71d62b0ae129966fd517e70fff9"
+    },
+    "linux-regressions.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/linux-regressions.log",
+      "sha256": "55e281dba884da30662e744f0d0116430a78980df31654f157b1268ec9da6ee2"
+    },
+    "linux-final-ctest.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/linux-final-ctest.log",
+      "sha256": "9e8543192a43dbb1bb98626c9bd237aadfa63375ac63bfa0d9f925aa7e1045b9"
+    },
+    "tls-retest.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/tls-retest.log",
+      "sha256": "5096b598ece84b9a8fd76531f7076114fc39fb264328e2cf9c8b7a18c1028579"
+    },
+    "fallback-detail.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/fallback-detail.log",
+      "sha256": "deaebdeea11e560040a2719f7e7bcf405e5aeebdd870ea869a8a44fc73b0a8b8"
+    },
+    "baseline-build.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/baseline-build.log",
+      "sha256": "e58029900839dcc14f4c796b25cb3613485cb19437ab008b96340f36720c7352"
+    },
+    "baseline-regressions.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/baseline-regressions.log",
+      "sha256": "6c742adae9fce90a6a7dc4b44eccc514f795f3f9da1652b595be71c4b494c309"
+    },
+    "mac-final-build.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/mac-final-build.log",
+      "sha256": "bf63e533dfbb7903f89050fefb87c241a864761a13601ee297de5199808e6d56"
+    },
+    "mac-ctest.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/mac-ctest.log",
+      "sha256": "a5cd7da1d35b6a0d89201d9b2b785456c93920a0b4cbaedb3bac44dfead4a65f"
+    },
+    "pure-regressions-final.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/pure-regressions-final.log",
+      "sha256": "d05257812e32d561a021cf508091a8d606127590deecce399482d723c955cf11"
+    },
+    "ice-page.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/ice-page.log",
+      "sha256": "aa9e7668077b4ccb4062df29a269f89011d048fb845c0154d82e56232f653f89"
+    },
+    "network-policy.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/network-policy.log",
+      "sha256": "dbc0a958979ced9fece7d766475570f0c2815dd9ae893064b28e9da47aa495ab"
+    },
+    "desktop-tests.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/desktop-tests.log",
+      "sha256": "11b0f052f6a0e10d7f70d07ab71b76e9b0d4ad3e04acde69c84c48897515b98d"
+    },
+    "analyzer.log": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/analyzer.log",
+      "sha256": "eab4281419f49474c6773f172eab4705e82da9e9196e5418e92a366609bcb99e"
+    },
+    "linux-binary-sha256.txt": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/linux-binary-sha256.txt",
+      "sha256": "74b56ee58a5c36c75e6d99ead2d865d784e379489b864d30a66c620a2651f08a"
+    },
+    "verified-source-sha256.json": {
+      "path": "/Volumes/SystemDisk/Workspace/mine-teleop-artifacts/dualstack-fallback-20261028/verified-source-sha256.json",
+      "sha256": "a22329f64f0800380a09bd3b88409491eaa2b8fe53518cb10754246385c89ea5"
+    }
+  }
+}

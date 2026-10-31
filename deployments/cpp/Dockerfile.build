@@ -189,6 +189,7 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
         gstreamer1.0-nice \
         libglib2.0-dev \
         libjpeg-dev \
+        libnice-dev \
         libusb-1.0-0-dev \
         libxml2-dev \
         libsrtp2-dev \
@@ -206,6 +207,10 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update \
          apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends intel-media-va-driver; \
        fi \
     && rm -rf /var/lib/apt/lists/*
+
+# Vehicle ICE diagnostics now use libnice directly; the GStreamer plugin
+# package alone does not provide the development headers or nice.pc.
+RUN pkg-config --atleast-version=0.1.18 nice
 
 ARG MINE_TELEOP_BUILD_JOBS=2
 ARG MINE_TELEOP_BUILD_TESTS=OFF
@@ -343,6 +348,8 @@ RUN set -e; \
     chmod +x /bundle/mine-teleop; \
     if [ "$MINE_TELEOP_BUILD_TESTS" = "ON" ]; then \
       /bundle/mine-teleop version; \
+      LD_LIBRARY_PATH=/bundle/lib ldd /bundle/bin/mine-teleop | grep -E 'libnice\.so\.[^ ]+ => /bundle/lib/'; \
+      LD_LIBRARY_PATH=/bundle/lib ldd /bundle/lib/gstreamer-1.0/libgstnice.so | grep -E 'libnice\.so\.[^ ]+ => /bundle/lib/'; \
       /bundle/bin/mine-teleop-run version; \
       /bundle/bin/mine-teleop-run config-check --config /bundle/config/vehicle-agent.yaml; \
       LD_LIBRARY_PATH=/bundle/lib /bundle/bin/mine-teleop-aravis-camera --list --json | grep -q '"device_count":0'; \
@@ -352,7 +359,7 @@ RUN set -e; \
         /bundle/bin/gst-launch-1.0 -q fakesrc num-buffers=1 sizetype=fixed sizemax=100 filltype=zero \
         '!' 'application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96,ssrc=(uint)1' \
         '!' srtpenc random-key=true '!' fakesink; \
-      for plugin in webrtcbin sctpenc sctpdec dtlsenc dtlsdec v4l2src va h264parse rtph264pay videorate; do \
+      for plugin in webrtcbin nicesrc sctpenc sctpdec dtlsenc dtlsdec v4l2src va h264parse rtph264pay videorate; do \
         GST_REGISTRY_FORK=no GST_PLUGIN_SYSTEM_PATH_1_0= GST_PLUGIN_PATH_1_0=/bundle/lib/gstreamer-1.0 LD_LIBRARY_PATH=/bundle/lib \
           /bundle/bin/gst-inspect-1.0 "$plugin" >/dev/null; \
       done; \

@@ -1,0 +1,30 @@
+{
+  "windows": {
+    "sent": 141,
+    "route": "WLAN",
+    "invalid": 0,
+    "received": 127
+  },
+  "orin": {
+    "sent": 147,
+    "received": 123,
+    "invalid": 0,
+    "route": "cellular"
+  },
+  "window_seconds": 20,
+  "scope": "raw IPv6 UDP only, not ICE or media",
+  "windows_route": "WLAN",
+  "orin_route": "cellular",
+  "signaling": "SSH management only",
+  "date": "2026-10-29",
+  "source_commit": "7ecead80d9c930308155881e770a75563ef1e7ab",
+  "duration_note": "20 second per endpoint windows; start/end times not aligned, packet counts are not a loss estimate",
+  "route_note": "Each endpoint checked physical route at startup; no continuous route sampling",
+  "limits": [
+    "No ICE, WebRTC, video decode or long-run validation",
+    "Windows app native video layer is macOS-only in current PR26",
+    "SSH management used LAN; UDP data selected public IPv6 endpoints",
+    "User VPN was not modified"
+  ],
+  "raw_sha256": "cfd8cd5bc710114673984272de03e21ab5d9791df2274aa1b69307371aaaa66c"
+}

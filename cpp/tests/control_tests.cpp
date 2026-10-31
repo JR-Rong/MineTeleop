@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -374,6 +375,116 @@ void test_loopback_http_server_and_port_conflict() {
   }
   first.stop();
   expect(conflict_reported, "occupied control port did not produce a clear bind error");
+}
+
+void test_bounded_persistent_http_framing() {
+  std::promise<void> slow_entered, release_slow;
+  auto slow_ready = slow_entered.get_future();
+  auto slow_gate = release_slow.get_future().share();
+  std::atomic<int> old_input_handled{0};
+  mine_teleop::SimpleHttpServer server("127.0.0.1", 0,
+      [&](const mine_teleop::HttpRequest& request) {
+        if (request.path == "/slow") { slow_entered.set_value(); slow_gate.wait(); }
+        if (request.path == "/old-input") ++old_input_handled;
+        if (request.path == "/handler-error") throw std::runtime_error("handler failure");
+        return mine_teleop::ServerResponse::text(200, request.path + ":" + request.body);
+      }, 1024, {}, mine_teleop::HttpConnectionPolicy::BoundedKeepAlive);
+  server.start();
+  auto connect = [&] {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) throw std::runtime_error("socket failed");
+    timeval timeout{5, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    sockaddr_in address{}; address.sin_family = AF_INET; address.sin_port = htons(server.port());
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+      ::close(fd); throw std::runtime_error("connect failed");
+    }
+    return fd;
+  };
+  auto response = [](int fd) {
+    std::string head;
+    while (!head.ends_with("\r\n\r\n")) head += raw_receive_exact(fd, 1);
+    const auto at = head.find("Content-Length: ");
+    expect(at != std::string::npos, "response missing content length");
+    const auto size = std::stoul(head.substr(at + 16));
+    return std::pair{head, raw_receive_exact(fd, size)};
+  };
+  const int fd = connect();
+  raw_send_all(fd, "POST /one HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nA");
+  const auto first = response(fd);
+  // Allow the server's conservative post-response pending-input check to
+  // finish; it may otherwise close even a valid very fast sequential client.
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  raw_send_all(fd, "GET /two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+  const auto second = response(fd);
+  expect(first.first.find("Connection: keep-alive") != std::string::npos && first.second == "/one:A",
+         "first persistent response was not framed correctly");
+  expect(second.first.find("Connection: close") != std::string::npos && second.second == "/two:",
+         "second request was lost or connection close ignored");
+  char byte{}; expect(::recv(fd, &byte, 1, 0) == 0, "explicit close did not close connection");
+  ::close(fd);
+  const int pipeline = connect();
+  raw_send_all(pipeline, "GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                         "GET /old-input HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  const auto pipelined = response(pipeline);
+  expect(pipelined.second == "/first:" && pipelined.first.find("Connection: close") != std::string::npos,
+         "pipelined requests were not rejected before reuse");
+  expect(::recv(pipeline, &byte, 1, 0) == 0, "pipelined connection remained open");
+  ::close(pipeline);
+  const int queued = connect();
+  raw_send_all(queued, "GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  const bool entered = slow_ready.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  if (!entered) release_slow.set_value();
+  expect(entered, "slow HTTP handler did not start");
+  raw_send_all(queued, "GET /old-input HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  release_slow.set_value();
+  const auto slow_response = response(queued);
+  // Input may arrive after the pre-response check but before the post-response
+  // check. In that case the header says keep-alive even though the server must
+  // immediately close without dispatching the queued request.
+  const auto following = ::recv(queued, &byte, 1, 0);
+  const bool closed = following == 0 || (following < 0 && errno == ECONNRESET);
+  expect(slow_response.second == "/slow:" && closed && old_input_handled == 0,
+         "a request queued behind a slow handler was processed as fresh or the connection stayed open");
+  ::close(queued);
+  const int failed = connect();
+  raw_send_all(failed, "GET /handler-error HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  const auto failure_response = response(failed);
+  expect(failure_response.first.starts_with("HTTP/1.1 500 ") &&
+             failure_response.first.find("Connection: close") != std::string::npos,
+         "persistent handler failure did not return a closed 500 response");
+  ::close(failed);
+  for (const auto* framing : {"Content-Length: 0\r\nContent-Length: 1\r\n", "Transfer-Encoding: chunked\r\n",
+                              "Content-Length: +1\r\n", "Connection: close\r\nConnection: keep-alive\r\n"}) {
+    const int bad = connect();
+    raw_send_all(bad, std::string("POST /bad HTTP/1.1\r\nHost: localhost\r\n") + framing + "\r\n");
+    const auto result = response(bad);
+    expect(result.first.starts_with("HTTP/1.1 400 ") && result.first.find("Connection: close") != std::string::npos,
+           "ambiguous request framing was not rejected and closed");
+    ::close(bad);
+  }
+  const int legacy = connect();
+  raw_send_all(legacy, "GET /legacy HTTP/1.0\r\nHost: localhost\r\n\r\n");
+  expect(response(legacy).first.find("Connection: close") != std::string::npos,
+         "HTTP/1.0 request unexpectedly stayed open");
+  ::close(legacy);
+  const int bounded = connect();
+  for (int i = 0; i < 512; ++i) {
+    if (i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    raw_send_all(bounded, "GET /limit HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    const auto result = response(bounded);
+    const auto expected = i == 511 ? "Connection: close" : "Connection: keep-alive";
+    expect(result.first.find(expected) != std::string::npos, "persistent request limit was not enforced");
+  }
+  expect(::recv(bounded, &byte, 1, 0) == 0, "request limit did not close connection");
+  ::close(bounded);
+  const int idle = connect();
+  raw_send_all(idle, "GET /idle HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  static_cast<void>(response(idle));
+  expect(::recv(idle, &byte, 1, 0) == 0, "idle persistent connection did not close");
+  ::close(idle);
+  server.stop();
 }
 
 void test_signaling_time_sync_applies_backward_utc_correction() {
@@ -801,10 +912,6 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
       native.at("effective_throttle") == 0.4 && !native.value("requires_fresh_input", true),
       "late retired-page HTTP request changed the current page's input");
 
-  const auto refresh_before_abort = native.at("accepted_refresh_sample_id").get<std::uint64_t>();
-  // A refresh is identified by a strictly newer monotonic millisecond. Make
-  // that precondition explicit rather than depending on HTTP call overhead.
-  std::this_thread::sleep_for(std::chrono::milliseconds(2));
   auto slow_response = input; slow_response["test_response_gate"] = true;
   struct ResponseSocket {
     int value{-1};
@@ -822,6 +929,14 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
   local_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   expect(::connect(response_socket.value, reinterpret_cast<const sockaddr*>(&local_address),
       sizeof(local_address)) == 0, "cannot connect cancellation fixture socket");
+  // Socket setup is not a page heartbeat. Refresh after setup so a slow CI
+  // scheduler cannot silently spend the production input lease before the
+  // request whose response this fixture deliberately holds.
+  const auto before_gate = http.post_json_response(local_base + "/api/control-intent", input);
+  expect(before_gate.value("accepted", false), "pre-gate page heartbeat rejected: " + before_gate.dump());
+  const auto refresh_before_abort = before_gate.at("accepted_refresh_sample_id").get<std::uint64_t>();
+  // A refresh is identified by a strictly newer monotonic millisecond.
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
   const auto slow_body = slow_response.dump();
   raw_send_all(response_socket.value, "POST /api/control-intent HTTP/1.1\r\nHost: 127.0.0.1\r\n"
       "Content-Type: application/json\r\nContent-Length: " + std::to_string(slow_body.size()) +
@@ -834,7 +949,9 @@ void test_local_http_page_takeover_abort_reordering_and_production_lease() {
   expect(response_delay_applied.load(std::memory_order_acquire) &&
       response_delay_acceptance.value("accepted", false) &&
       response_delay_acceptance.at("accepted_refresh_sample_id").get<std::uint64_t>() > refresh_before_abort,
-      "cancelled request was not accepted before its response was held");
+      "cancelled request was not accepted before its response was held: " +
+          Json{{"handler_applied", response_delay_applied.load(std::memory_order_acquire)},
+               {"refresh_before", refresh_before_abort}, {"acceptance", response_delay_acceptance}}.dump());
   // Closing this real client socket cancels only its pending response. A
   // timer-based HTTP timeout could resume after the independent200ms lease.
   const bool response_aborted = ::shutdown(response_socket.value, SHUT_RDWR) == 0;
@@ -1849,7 +1966,7 @@ void test_control_page_contract() {
   expect(response.body.find("packet_loss_percent") != std::string::npos, "per-stream packet-loss metric is missing");
   expect(response.body.find("connection_method") != std::string::npos, "ICE path classification is missing");
   expect(
-      response.body.find("iceTransportPolicy:consoleConfig.ice_transport_policy") != std::string::npos,
+      response.body.find("iceTransportPolicy:routeMode==='relay'?'relay':consoleConfig.ice_transport_policy") != std::string::npos,
       "browser RTCPeerConnection does not apply the configured ICE transport policy");
   expect(
       response.body.find("webrtc_ice_candidate_error") != std::string::npos,
@@ -2692,7 +2809,7 @@ void test_driver_native_control_session_snapshot_and_backoff_contract() {
       "void DriverConsoleRuntime::native_control_sender_loop(");
   const auto status = cpp_function_contract(
       source,
-      "Json DriverConsoleRuntime::status()");
+      "Json DriverConsoleRuntime::status(bool omit_signaling_socket)");
 
   const auto snapshot_lock = send_sample.find(
       "std::lock_guard update_lock(native_control_update_mutex_)");
@@ -8436,11 +8553,15 @@ void test_source_aware_api_and_websocket_rate_limit() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--http-framing-only") {
+    try { test_bounded_persistent_http_framing(); return 0; }
+    catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+  }
   bool runtime_only = false;
   if (argc == 2 && std::string_view(argv[1]) == "--runtime-only") {
     runtime_only = true;
   } else if (argc != 1) {
-    std::cerr << "Usage: mine-teleop-control-tests [--runtime-only]\n";
+    std::cerr << "Usage: mine-teleop-control-tests [--runtime-only|--http-framing-only]\n";
     return 64;
   }
   const std::unordered_set<std::string> source_contracts{
@@ -8453,6 +8574,7 @@ int main(int argc, char** argv) {
   std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"shared_control_protocol_vector", test_shared_control_protocol_vector},
       {"loopback_http_server_and_port_conflict", test_loopback_http_server_and_port_conflict},
+      {"bounded_persistent_http_framing", test_bounded_persistent_http_framing},
       {"signaling_time_sync_applies_backward_utc_correction",
        test_signaling_time_sync_applies_backward_utc_correction},
       {"driver_time_sync_uncertainty_fails_closed_at_production_default",

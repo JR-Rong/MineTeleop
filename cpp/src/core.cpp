@@ -1960,6 +1960,8 @@ Json VehicleConfig::redacted_summary() const {
       {"vehicle_id", vehicle_id},
       {"signaling_url", cloud.signaling_url},
       {"ice_transport_policy", cloud.ice_transport_policy},
+      {"ice_servers_source", "authenticated_signaling"},
+      {"ice_direct_timeout_ms", cloud.ice_direct_timeout_ms},
       {"device_token_file_configured", !cloud.device_token_file.empty()},
       {"control_enabled", runtime.control_enabled},
       {"media_enabled", runtime.media_enabled},
@@ -2022,6 +2024,11 @@ VehicleConfig load_vehicle_config(const std::filesystem::path& path) {
   config.cloud.resolve_entries = optional<std::vector<std::string>>(cloud, "resolve", {});
   config.cloud.ca_bundle = optional<std::string>(cloud, "ca_bundle", "");
   config.cloud.ice_transport_policy = optional<std::string>(cloud, "ice_transport_policy", "all");
+  config.cloud.ice_direct_timeout_ms = optional<int>(cloud, "ice_direct_timeout_ms", 0);
+  if (config.cloud.ice_direct_timeout_ms < 0 || config.cloud.ice_direct_timeout_ms > 30000)
+    throw std::runtime_error("cloud.ice_direct_timeout_ms must be 0..30000");
+  if (const auto ice = root["ice"]; ice && (ice["stun_servers"] || ice["turn_servers"]))
+    throw std::runtime_error("vehicle ice.stun_servers/turn_servers are unsupported; configure signaling-server stun_urls/turn_urls instead");
   if (!config.cloud.device_token_file.empty() && config.cloud.device_token_file.is_relative()) {
     config.cloud.device_token_file = (path.parent_path() / config.cloud.device_token_file).lexically_normal();
   }

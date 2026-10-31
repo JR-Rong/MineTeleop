@@ -30,6 +30,7 @@ RUN printf '%s\n' \
       libgstreamer-plugins-base1.0-dev \
       libgstreamer1.0-dev \
       libjpeg-dev \
+      libnice-dev \
       libssl-dev \
       libusb-1.0-0-dev \
       libyaml-cpp-dev \
@@ -92,7 +93,8 @@ RUN x86_64-linux-gnu-g++ --version \
       gstreamer-1.0 \
       gstreamer-app-1.0 \
       gstreamer-sdp-1.0 \
-      gstreamer-webrtc-1.0
+      gstreamer-webrtc-1.0 \
+      'nice >= 0.1.18'
 
 FROM cross-deps AS cross-build
 

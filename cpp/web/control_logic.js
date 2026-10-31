@@ -1392,12 +1392,40 @@
     return transports.every(value => value === 'udp') ? 'turn_udp' : 'turn_unknown';
   }
 
-  function iceAddressFamily(address) {
-    const text = String(address || '');
-    if (/^[\da-f:]+(?:%[\w.-]+)?$/i.test(text) && text.includes(':')) return 'ipv6';
-    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) return 'ipv4';
-    if (/\.local\.?$/i.test(text)) return 'mdns';
-    return 'unknown';
+  // Shared by product diagnostics and the isolated WAN bench. No network IO.
+  function iceAddressInfo(value) {
+    const raw = String(value || '').toLowerCase();
+    const text = raw.includes(':') ? raw.split('%', 1)[0] : raw;
+    const unknown = {family:'unknown', scope:'unknown', address:''};
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) {
+      const p = text.split('.').map(Number), [a,b,c] = p;
+      if (!p.every((v,i)=>v<=255 && String(v)===text.split('.')[i])) return unknown;
+      const scope = a===10 || (a===172&&b>=16&&b<=31) || (a===192&&b===168) ? 'private'
+        : a===100&&b>=64&&b<=127 ? 'shared_cgnat' : a===127 ? 'loopback'
+        : a===169&&b===254 ? 'link_local'
+        : (a===192&&b===0&&c===2)||(a===198&&b===51&&c===100)||(a===203&&b===0&&c===113) ? 'documentation'
+        : a===198&&(b===18||b===19) ? 'benchmark' : a>=224&&a<240 ? 'multicast'
+        : a===0||a>=240||(a===192&&b===0&&c===0)||(a===192&&b===88&&c===99) ? 'reserved' : 'public';
+      return {family:'ipv4',scope,address:text};
+    }
+    if (text.includes(':') && /^[0-9a-f:.]+$/.test(text)) {
+      try {
+        const address = new URL('http://['+text+']/').hostname.slice(1,-1);
+        const first = parseInt(address.split(':')[0] || '0',16);
+        const scope = address==='::1' ? 'loopback' : address==='::' ? 'unspecified'
+          : (first&0xfe00)===0xfc00 ? 'private' : (first&0xffc0)===0xfe80 ? 'link_local'
+          : (first&0xff00)===0xff00 ? 'multicast' : address.startsWith('2001:db8:') || (first===0x3fff && (parseInt(address.split(':')[1] || '0',16)&0xf000)===0) ? 'documentation'
+          : (first&0xe000)===0x2000 ? 'public' : 'reserved';
+        return {family:'ipv6',scope,address};
+      } catch { return unknown; }
+    }
+    return /\.local\.?$/.test(text) ? {family:'mdns',scope:'obfuscated',address:''} : unknown;
+  }
+  function iceAddressFamily(address) { return iceAddressInfo(address).family; }
+  function iceServersForMode(servers, mode) {
+    if (!['all','direct','relay'].includes(mode)) throw Error('unsupported ICE route mode');
+    return servers.map(server=>({...server, urls:(Array.isArray(server.urls)?server.urls:[server.urls])
+      .filter(url=>typeof url==='string' && (mode!=='direct'||!/^turns?:/i.test(url)))})).filter(server=>server.urls.length);
   }
 
   function iceCandidateSummary(candidate) {
@@ -1407,6 +1435,7 @@
     return {candidate_type: ['host', 'srflx', 'prflx', 'relay'].includes(type) ? type : 'unknown',
       protocol: ['udp', 'tcp'].includes(String(parts[2]).toLowerCase()) ? parts[2].toLowerCase() : 'unknown',
       address_family: iceAddressFamily(parts[4] || candidate?.address),
+      address_class: iceAddressInfo(parts[4] || candidate?.address).scope,
       sdp_mline_index: candidate?.sdpMLineIndex ?? null};
   }
 
@@ -1445,6 +1474,8 @@
         remote_type: token(remote.candidateType, ['host', 'srflx', 'prflx', 'relay']),
         local_address_family: iceAddressFamily(local.address ?? local.ip),
         remote_address_family: iceAddressFamily(remote.address ?? remote.ip),
+        local_address_class: iceAddressInfo(local.address ?? local.ip).scope,
+        remote_address_class: iceAddressInfo(remote.address ?? remote.ip).scope,
         protocol: token(local.protocol, ['udp', 'tcp']),
         relay_protocol: token(local.relayProtocol, ['udp', 'tcp', 'tls']),
         remote_relay_protocol: token(remote.relayProtocol, ['udp', 'tcp', 'tls']),
@@ -1460,6 +1491,29 @@
     pairs.sort((a, b) => rank(a) - rank(b));
     return {candidates, candidate_families: candidateFamilies, pair_states: states, path_checks: paths, pair_count: pairs.length,
       pairs: pairs.slice(0, 16), pairs_truncated: pairs.length > 16};
+  }
+
+  // RTC delay totals are cumulative. Their lifetime averages conceal short
+  // stalls, so keep a separate interval view without changing safety decisions.
+  function receiverIntervalStats(stats, previous) {
+    const counters = {id:stats.id,ssrc:stats.ssrc,timestamp:stats.timestamp,
+      framesDecoded:stats.framesDecoded,totalDecodeTime:stats.totalDecodeTime,
+      totalProcessingDelay:stats.totalProcessingDelay,
+      jitterBufferEmittedCount:stats.jitterBufferEmittedCount,
+      jitterBufferDelay:stats.jitterBufferDelay,jitterBufferTargetDelay:stats.jitterBufferTargetDelay};
+    const current = previous && stats.id === previous.id && stats.ssrc === previous.ssrc &&
+      Number.isFinite(stats.timestamp) && Number.isFinite(previous.timestamp) && stats.timestamp > previous.timestamp;
+    const delta = key => current && Number.isFinite(stats[key]) && Number.isFinite(previous[key]) &&
+      previous[key] >= 0 && stats[key] >= previous[key] ? stats[key] - previous[key] : null;
+    const average = (total, count) => {
+      const numerator = delta(total), denominator = delta(count);
+      return numerator !== null && denominator !== null && denominator > 0 ? numerator * 1000 / denominator : null;
+    };
+    return {counters,framesDecoded:delta('framesDecoded'),
+      decodeMs:average('totalDecodeTime','framesDecoded'),
+      processingMs:average('totalProcessingDelay','framesDecoded'),
+      jitterMs:average('jitterBufferDelay','jitterBufferEmittedCount'),
+      targetJitterMs:average('jitterBufferTargetDelay','jitterBufferEmittedCount')};
   }
 
   function receiverLatency(stats, captureEncodeMs, roundTripSeconds) {
@@ -1743,8 +1797,11 @@
     controlPrepareDeadlineMs,
     createLatestControlWriteQueue,
     receiverLatency,
+    receiverIntervalStats,
     iceConnectivity,
     iceCandidateSummary,
+    iceAddressInfo,
+    iceServersForMode,
     iceNetworkPath,
     iceServerError,
     CONTROL_OUTCOMES,

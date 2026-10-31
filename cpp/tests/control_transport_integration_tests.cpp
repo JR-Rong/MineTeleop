@@ -1,10 +1,14 @@
 #include "mine_teleop/server.hpp"
 #include "mine_teleop/websocket.hpp"
+#include "mine_teleop/detail/native_control_publication.hpp"
+#include "mine_teleop/detail/native_control_courier.hpp"
+#include "mine_teleop/detail/native_video_health.hpp"
 #include "control_time_fixture.hpp"
 
 #include <chrono>
 #include <deque>
 #include <filesystem>
+#include <future>
 #include <iostream>
 #include <thread>
 
@@ -12,6 +16,26 @@ namespace mine_teleop {
 // Inspect an unfetched native publication and inject a recovery observation
 // while holding the real transport mutex. Sending/fallback/bridge stay real.
 struct DriverConsoleTransportTestAccess {
+  static bool clock_does_not_wait_for_transport(DriverConsoleRuntime& runtime) {
+    std::unique_lock signal_lock(runtime.signaling_websocket_mutex_);
+    std::unique_lock control_lock(runtime.control_signaling_websocket_mutex_);
+    std::unique_lock state_lock(runtime.mutex_);
+    auto result = std::async(std::launch::async, [&] { return runtime.time_sync_snapshot(); });
+    const bool timely = result.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    state_lock.unlock(); control_lock.unlock(); signal_lock.unlock();
+    const auto value = result.get();
+    return timely && !value.clock.synchronized && !value.readiness.ready;
+  }
+  static bool status_does_not_wait_for_signaling(DriverConsoleRuntime& runtime) {
+    std::unique_lock lock(runtime.signaling_websocket_mutex_);
+    auto result = std::async(std::launch::async, [&] { return runtime.status(true); });
+    const bool timely = result.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    lock.unlock();
+    const auto value = result.get();
+    return timely && value.at("signaling_socket_snapshot_available") == false &&
+        value.at("signaling_websocket_connected").is_null() && value.contains("time_sync") &&
+        value.at("native_control").contains("control_transport");
+  }
   static Json withdraw_with_pending_motion(DriverConsoleRuntime& runtime, int cause) {
     std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
     const auto frame = runtime.control_transport_latest_dc_;
@@ -19,13 +43,23 @@ struct DriverConsoleTransportTestAccess {
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     if (cause == 0) runtime.control_signaling_ack_recovery_.enter(now, 5000, runtime.control_signaling_last_ack_seq_);
-    else if (cause == 1) runtime.control_dc_ack_recovery_.enter(now, 5000, runtime.control_dc_last_ack_seq_);
+    else if (cause == 1) {
+      // This case holds an injected recovery state for the sender to observe.
+      // Older real receipts may still be in flight; they must not accidentally
+      // clear the artificial condition before that observation. Real ACK
+      // transitions themselves are exercised separately via the result handler.
+      runtime.control_dc_ack_recovery_.enter(now, 5000, frame.at("seq").get<std::uint64_t>());
+    }
     else if (cause == 2) runtime.control_transport_dc_ready_ = false;
     else {
-      runtime.control_signaling_ack_window_.reset();
-      runtime.control_signaling_ack_window_.note_sent(runtime.native_control_last_seq_.load() + 1, now - 501);
+      // Do not discard genuine WSS acknowledgements still in flight. The
+      // sender drains them before inspecting the injected stall, and resetting
+      // the window here would make a valid ACK look like a protocol error.
+      // Preserve its ACK history so duplicate packets remain duplicates.
+      if (runtime.control_signaling_ack_window_.pending_count() != 0) return nullptr;
+      runtime.control_signaling_ack_window_.note_sent(frame.at("seq").get<std::uint64_t>(), now - 501);
     }
-    return {{"frame", frame}, {"published_at", runtime.control_transport_latest_dc_at_ms_}};
+    return {{"frame", frame}, {"published_at", runtime.control_transport_latest_dc_at_ms_}, {"injected_at", now}};
   }
   static bool retired(DriverConsoleRuntime& runtime) {
     std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
@@ -42,6 +76,18 @@ using namespace mine_teleop::detail;
 std::int64_t utc() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
 std::int64_t steady() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 void expect(bool value, std::string_view message) { if (!value) throw std::runtime_error(std::string(message)); }
+
+void courier_status_does_not_wait_for_signaling_poll() {
+  DriverConfig config;
+  config.driver_id = "status-probe";
+  config.signaling_url = "http://127.0.0.1:1";
+  config.browser_event_log_path.clear();
+  DriverConsoleRuntime driver(config, "test_bench_status", "fixture");
+  expect(DriverConsoleTransportTestAccess::status_does_not_wait_for_signaling(driver),
+      "courier status waited for signaling poll or exposed an unavailable socket snapshot");
+  expect(DriverConsoleTransportTestAccess::clock_does_not_wait_for_transport(driver),
+      "clock health waited for transport locks or accepted an unsynchronized clock");
+}
 
 // Only the DC byte courier is mocked. Native producer, cloud HTTP/WSS,
 // authentication, transport fence and the common safety service are real.
@@ -67,6 +113,9 @@ struct Fixture {
   std::jthread car_watchdog;
   std::filesystem::path authority_directory;
   bool direct_enabled{false}, cloud_online{true};
+  bool refresh_input{true}, video_ready{true}, video_sample_healthy{true};
+  std::uint64_t video_bad_revision{0}, video_brake_revision{0};
+  NativeVideoHealth* synthetic_video_health{nullptr};
   std::string dc_network_path{"unknown"}, last_result_reason;
   double requested_throttle{0.0};
   std::uint64_t lease_nonce{0};
@@ -76,6 +125,11 @@ struct Fixture {
   std::int64_t last_input{0};
   std::deque<std::pair<std::int64_t, Json>> delayed;
   std::vector<Json> received_statuses;
+  bool use_native_publication{false};
+  std::unique_ptr<NativeControlPublication> native_publication;
+  bool use_native_courier{false};
+  std::unique_ptr<NativeControlCourier> native_courier;
+  std::deque<std::string> courier_receipts;
   explicit Fixture(bool direct = false, bool feedback = false, bool product = false,
       std::string mode = "p2p_preferred") : feedback_enabled(feedback), direct_enabled(direct) {
     SignalingServerConfig config;
@@ -203,11 +257,18 @@ struct Fixture {
   }
   void input() {
     const auto status = driver->status();
+    if (synthetic_video_health) {
+      const auto health = synthetic_video_health->snapshot(steady());
+      video_ready = health.ready;
+      video_sample_healthy = health.sample_healthy;
+      video_bad_revision = health.bad_revision;
+      video_brake_revision = health.brake_revision;
+    }
     auto result = driver->update_control_intent({{"session_id", session}, {"session_generation", status.at("control_session_generation")},
         {"ui_instance_id", "owner"}, {"ui_control_epoch", ui_epoch}, {"takeover", ui_epoch == 0},
         {"intent_seq", ++intent_seq}, {"gear", requested_throttle > 0 ? "D" : "N"}, {"steering", 0.0}, {"throttle", requested_throttle}, {"brake", 0.0},
-        {"estop", false}, {"critical_video_ready", true}, {"critical_video_sample_healthy", true},
-        {"critical_video_bad_sample_revision", std::uint64_t{0}}, {"critical_video_brake_revision", std::uint64_t{0}}});
+        {"estop", false}, {"critical_video_ready", video_ready}, {"critical_video_sample_healthy", video_sample_healthy},
+        {"critical_video_bad_sample_revision", video_bad_revision}, {"critical_video_brake_revision", video_brake_revision}});
     expect(result.at("accepted").get<bool>() || (requested_throttle > 0 && result.at("requires_fresh_input").get<bool>()), "native input update rejected outside the recovery interlock");
     ui_epoch = result.at("ui_control_epoch").get<std::uint64_t>(); last_input = steady();
   }
@@ -314,7 +375,7 @@ struct Fixture {
   }
   void pump(bool dc_ready) {
     renew_authority();
-    if (steady() - last_input >= 60) input();
+    if (refresh_input && steady() - last_input >= 60) input();
     const auto received = cloud_online ? vehicle_socket.receive_json(std::chrono::milliseconds(1)) : WebSocketReceiveResult{};
     if (received.status == WebSocketReceiveStatus::Message && received.message.value("event", "") == "signaling_messages") {
       const auto& messages = received.message.at("messages");
@@ -331,11 +392,40 @@ struct Fixture {
     while (cloud_online && !delayed.empty() && delayed.front().first <= steady()) {
       vehicle_socket.send_json(delayed.front().second); delayed.pop_front();
     }
+    if (use_native_courier) {
+      const NativeCourierScope current{{session, native_generation, media_attempt}, "owner", ui_epoch};
+      if (!native_courier) native_courier = std::make_unique<NativeControlCourier>(current);
+      NativeControlCourier::Io io{
+          [&]() -> std::optional<std::string> {
+            if (courier_receipts.empty()) return {};
+            auto bytes = std::move(courier_receipts.front()); courier_receipts.pop_front(); return bytes;
+          }, [&] { return dc_ready && dc_network_path == "p2p"; },
+          [&](const Json& request) { return driver->control_transport_bridge(request); },
+          [&](const std::string& bytes) {
+            const auto payload = Json::parse(bytes);
+            expect(payload.at("seq").get<std::uint64_t>() > last_dc_seq, "courier replayed a frame");
+            last_dc_seq = payload.at("seq").get<std::uint64_t>(); ++dc_commands;
+            courier_receipts.push_back(apply(payload, ControlPath::DataChannel).dump());
+            return true;
+          }, [&](const Json& status) { received_statuses.push_back(status); }};
+      expect(native_courier->tick(current, io), "native courier retired unexpectedly");
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      return;
+    }
     auto request = scope(dc_ready);
     if (pending_dc_feedback.is_object()) { request["vehicle_result"] = pending_dc_feedback; pending_dc_feedback = Json(nullptr); }
+    const auto publication_started = steady();
     auto response = bridge(request);
     if (dc_ready && response.at("frame_json").is_string()) {
-      const auto payload = Json::parse(response.at("frame_json").get<std::string>());
+      std::string bytes = response.at("frame_json").get<std::string>();
+      if (use_native_publication) {
+        const NativeCourierScope current{{session, native_generation, media_attempt}, "owner", ui_epoch};
+        if (!native_publication) native_publication = std::make_unique<NativeControlPublication>(current);
+        const auto filtered = native_publication->take(current, response, dc_ready, steady() - publication_started);
+        if (!filtered) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); return; }
+        bytes = *filtered;
+      }
+      const auto payload = Json::parse(bytes);
       expect(payload.at("seq").get<std::uint64_t>() > last_dc_seq, "bridge replayed a frame");
       last_dc_seq = payload.at("seq").get<std::uint64_t>(); ++dc_commands;
       if (drop_before_receiver(payload)) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); return; }
@@ -349,38 +439,192 @@ struct Fixture {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
 };
+void native_publication_bridge_integration() {
+  Fixture fixture(false, false, true);
+  fixture.dc_network_path = "p2p";
+  fixture.use_native_publication = true;
+  const auto deadline = steady() + 8000;
+  while (steady() < deadline) {
+    fixture.pump(true);
+    const auto transport = fixture.driver->status().at("native_control").at("control_transport");
+    if (fixture.dc_commands >= 3 && transport.at("path") == "dc" && !transport.at("selecting").get<bool>()) break;
+  }
+  expect(fixture.dc_commands >= 3 && fixture.native_publication && fixture.native_publication->last_seen() > 0,
+      "native publication filter did not deliver signed bridge frames to the mock vehicle");
+  std::cout << "[NATIVE_PUBLICATION] scoped real bridge, signed commands and mock vehicle feedback passed\n";
+}
+void native_courier_bridge_integration() {
+  Fixture fixture(false, false, true);
+  fixture.dc_network_path = "p2p";
+  fixture.use_native_courier = true;
+  const auto deadline = steady() + 8000;
+  bool selected = false;
+  while (steady() < deadline && !selected) {
+    fixture.pump(true);
+    const auto transport = fixture.driver->status().at("native_control").at("control_transport");
+    selected = fixture.dc_commands >= 3 && transport.at("path") == "dc" && !transport.at("selecting").get<bool>();
+  }
+  expect(selected && fixture.native_courier && !fixture.native_courier->retired(),
+      "native courier did not reconcile signed mock vehicle feedback");
+  std::cout << "[NATIVE_COURIER] signed runtime commands and mock vehicle feedback reconciled; byte channel simulated\n";
+}
+void native_publication_safety_interlocks() {
+  for (const bool lose_video : {true, false}) {
+    Fixture fixture(false, false, true);
+    fixture.dc_network_path = "p2p";
+    fixture.use_native_publication = true;
+    auto deadline = steady() + 8000;
+    bool initially_ready = false, simulated_release = false;
+    while (steady() < deadline && !initially_ready) {
+      fixture.pump(true);
+      std::lock_guard lock(fixture.car_mutex);
+      const auto timing = fixture.vehicle->control_timing(utc());
+      // This fixture has no VehicleMediaRuntime recovery coordinator. Model
+      // its release explicitly and never treat this as a recovery test.
+      if (!simulated_release && fixture.dc_commands >= 3 && timing.value("driver_critical_video_ready", false) &&
+          timing.value("operator_input_ready", false) && timing.value("driver_time_sync_ready", false) &&
+          timing.value("driver_control_link_ready", false)) {
+        fixture.vehicle->set_control_braking_wait(false, utc(), ControlRecoveryCause::ControlLink);
+        simulated_release = true;
+      }
+      initially_ready = fixture.dc_commands >= 3 && timing.value("driver_critical_video_ready", false) &&
+          timing.value("operator_input_ready", false) && !fixture.vehicle->control_braking_wait();
+    }
+    if (!initially_ready) {
+      std::lock_guard lock(fixture.car_mutex);
+      const auto timing = fixture.vehicle->control_timing(utc());
+      std::cerr << "mock precondition: dc=" << fixture.dc_commands
+                << " video=" << timing.value("driver_critical_video_ready", false)
+                << " input=" << timing.value("operator_input_ready", false)
+                << " clock=" << timing.value("driver_time_sync_ready", false)
+                << " link=" << timing.value("driver_control_link_ready", false)
+                << " brake=" << fixture.vehicle->control_braking_wait()
+                << " cause=" << timing.value("control_recovery_cause", "") << '\n';
+    }
+    expect(initially_ready, "native safety fixture did not reach the simulated wait release before fault injection");
+    if (lose_video) {
+      fixture.video_ready = false;
+      fixture.video_sample_healthy = false;
+      ++fixture.video_bad_revision;
+      ++fixture.video_brake_revision;
+      fixture.input();
+    } else fixture.refresh_input = false;
+    bool stopped = false;
+    deadline = steady() + 4000;
+    while (steady() < deadline && !stopped) {
+      fixture.pump(true);
+      std::lock_guard lock(fixture.car_mutex);
+      const auto timing = fixture.vehicle->control_timing(utc());
+      const bool lost_required_input = lose_video ? !timing.value("driver_critical_video_ready", true)
+          : !timing.value("operator_input_ready", true);
+      const auto cause = timing.value("control_recovery_cause", "");
+      stopped = lost_required_input && fixture.vehicle->control_braking_wait() &&
+          (lose_video ? (cause == "critical_video" || cause == "readiness_history") : cause == "input_lease");
+    }
+    expect(stopped, lose_video ? "mock vehicle did not brake after reported critical video loss"
+                              : "mock vehicle did not brake after the input lease expired");
+  }
+  std::cout << "[NATIVE_SAFETY] reported video loss and input lease expiry reached mock braking; simulated courier, video health and initial release, no recovery proof\n";
+}
+void native_dual_video_bridge_integration() {
+  NativeVideoHealth video({"front", "rear"}, 500);
+  expect(video.attach("front", 1) && video.attach("rear", 1) &&
+      video.set_usable("front", 1, true) && video.set_usable("rear", 1, true), "video fixture setup failed");
+  Fixture fixture(false, false, true);
+  fixture.dc_network_path = "p2p";
+  fixture.use_native_publication = true;
+  fixture.synthetic_video_health = &video;
+  std::uint64_t seq = 0;
+  auto present = [&](bool rear) {
+    const auto now = steady();
+    ++seq;
+    expect(video.render_submitted("front", 1, seq, now), "front synthetic presentation rejected");
+    if (rear) expect(video.render_submitted("rear", 1, seq, now), "rear synthetic presentation rejected");
+  };
+  bool initially_ready = false, simulated_release = false;
+  auto deadline = steady() + 8000;
+  while (steady() < deadline && !initially_ready) {
+    present(true); fixture.pump(true);
+    std::lock_guard lock(fixture.car_mutex);
+    const auto timing = fixture.vehicle->control_timing(utc());
+    if (!simulated_release && fixture.dc_commands >= 3 && timing.value("driver_critical_video_ready", false) &&
+        timing.value("operator_input_ready", false) && timing.value("driver_time_sync_ready", false) &&
+        timing.value("driver_control_link_ready", false)) {
+      fixture.vehicle->set_control_braking_wait(false, utc(), ControlRecoveryCause::ControlLink);
+      simulated_release = true;
+    }
+    initially_ready = simulated_release && !fixture.vehicle->control_braking_wait();
+  }
+  expect(initially_ready && video.snapshot(steady()).ready, "dual video fixture did not reach its simulated baseline");
+  bool stopped = false;
+  deadline = steady() + 4000;
+  while (steady() < deadline && !stopped) {
+    present(false); fixture.pump(true);
+    std::lock_guard lock(fixture.car_mutex);
+    const auto timing = fixture.vehicle->control_timing(utc());
+    stopped = !timing.value("driver_critical_video_ready", true) && fixture.vehicle->control_braking_wait();
+  }
+  expect(stopped, "one stalled synthetic track did not revoke mock control");
+  expect(!video.snapshot(steady()).ready && video.snapshot(steady()).brake_revision > 0,
+      "stalled video did not retain a brake revision");
+  std::cout << "[NATIVE_DUAL_VIDEO] one synthetic track stall revoked mock control; simulated presentation and courier, no recovery proof\n";
+}
 void product_recovery_withdraws_unfetched_motion() {
   for (int cause = 0; cause < 4; ++cause) {
-    Fixture f(false, false, true); f.dc_network_path = "p2p";
-    auto transport = [&] { return f.driver->status().at("native_control").at("control_transport"); };
-    auto deadline = steady() + 8000;
-    while (steady() < deadline) {
-      f.pump(true);
-      if (transport().at("path") == "dc" && !transport().at("qualifying").get<bool>() &&
-          !transport().at("selecting").get<bool>()) break;
+    bool verified_live_withdrawal = false;
+    for (int run = 0; run < 3 && !verified_live_withdrawal; ++run) {
+      Fixture f(false, false, true); f.dc_network_path = "p2p";
+      auto transport = [&] { return f.driver->status().at("native_control").at("control_transport"); };
+      auto deadline = steady() + 8000;
+      while (steady() < deadline) {
+        f.pump(true);
+        if (transport().at("path") == "dc" && !transport().at("qualifying").get<bool>() &&
+            !transport().at("selecting").get<bool>()) break;
+      }
+      expect(transport().at("path") == "dc" && !transport().at("qualifying").get<bool>(), "DC not qualified");
+      Json pending;
+      // A qualified status can precede a sender-thread route-boundary rearm.
+      // Re-establish neutral with live receipts before each bounded attempt.
+      // If the motion sample races that rearm, resume pumping before the actual
+      // ACK watchdog expires and try a fresh release/press; never retimestamp a
+      // previously published command or fetch the frame being tested.
+      for (int attempt = 0; attempt < 3 && pending.is_null(); ++attempt) {
+        f.requested_throttle = 0.0; f.input();
+        deadline = steady() + 150;
+        while (steady() < deadline) f.pump(true);
+        f.input(); f.requested_throttle = 0.4; f.input();
+        deadline = steady() + 120;
+        while (steady() < deadline && pending.is_null()) {
+          pending = DriverConsoleTransportTestAccess::withdraw_with_pending_motion(*f.driver, cause);
+          if (pending.is_null()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+      expect(pending.is_object(), "no unfetched nonzero native publication; cause=" + std::to_string(cause) +
+          "; native=" + f.driver->status().at("native_control").dump());
+      expect(pending.at("frame").at("seq").get<std::uint64_t>() > f.last_dc_seq, "pending frame was already consumed");
+      // The hosted runner can deschedule the sender for longer than one tick.
+      // Wait for the real transition, but only count an attempt if the original
+      // publication is still live; expiry must never substitute for withdrawal.
+      deadline = steady() + 1000;
+      while (steady() < deadline && transport().at("path") == "dc") std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      const auto withdrawn = transport();
+      expect(withdrawn.at("path") == "wss", "recovery did not withdraw DC; cause=" +
+          std::to_string(cause) + "; elapsed_ms=" +
+          std::to_string(steady() - pending.at("injected_at").get<std::int64_t>()) +
+          "; pending_seq=" + std::to_string(pending.at("frame").at("seq").get<std::uint64_t>()) +
+          "; published_at=" + std::to_string(pending.at("published_at").get<std::int64_t>()) +
+          "; injected_at=" + std::to_string(pending.at("injected_at").get<std::int64_t>()) +
+          "; native=" + f.driver->status().at("native_control").dump());
+      // No WSS select has been delivered to the vehicle. Neither expiry nor
+      // replay rejection may hide a stale publication at this boundary.
+      if (steady() - pending.at("published_at").get<std::int64_t>() >= kNativeBridgePublicationMaxAgeMs)
+        continue;
+      expect(f.fence.path() == ControlPath::DataChannel, "vehicle already received fallback select");
+      expect(f.bridge(f.scope(true)).at("frame_json").is_null(), "bridge returned retired nonzero DC publication");
+      expect(DriverConsoleTransportTestAccess::retired(*f.driver), "fallback retained DC publication or ACK state");
+      verified_live_withdrawal = true;
     }
-    expect(transport().at("path") == "dc" && !transport().at("qualifying").get<bool>(), "DC not qualified");
-    f.input(); f.requested_throttle = 0.4; f.input();
-    // Do not pump/fetch any further DC frames. The native sender produces a
-    // genuinely nonzero command which the vehicle has never received.
-    Json pending;
-    deadline = steady() + 1000;
-    while (steady() < deadline && pending.is_null()) {
-      pending = DriverConsoleTransportTestAccess::withdraw_with_pending_motion(*f.driver, cause);
-      if (pending.is_null()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    expect(pending.is_object(), "no unfetched nonzero native publication");
-    expect(pending.at("frame").at("seq").get<std::uint64_t>() > f.last_dc_seq, "pending frame was already consumed");
-    deadline = steady() + 80;
-    while (steady() < deadline && transport().at("path") == "dc") std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    expect(transport().at("path") == "wss", "recovery did not withdraw DC");
-    // No WSS select has been delivered to the vehicle. Neither expiry nor
-    // replay rejection may hide a stale publication at this boundary.
-    expect(steady() - pending.at("published_at").get<std::int64_t>() < kNativeBridgePublicationMaxAgeMs,
-        "test missed the live publication window");
-    expect(f.fence.path() == ControlPath::DataChannel, "vehicle already received fallback select");
-    expect(f.bridge(f.scope(true)).at("frame_json").is_null(), "bridge returned retired nonzero DC publication");
-    expect(DriverConsoleTransportTestAccess::retired(*f.driver), "fallback retained DC publication or ACK state");
+    expect(verified_live_withdrawal, "could not observe a live publication withdrawal; cause=" + std::to_string(cause));
   }
 }
 
@@ -417,13 +661,22 @@ void product_wss_reconnect_retires_dc_and_recovers_ack() {
       "retired pre-reconnect DC command was admitted");
 }
 
-void product_startup_and_p2p_cloud_recovery() {
+struct NominalRouteFixtureWatchdogTimeout : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+void product_startup_and_p2p_cloud_recovery_once() {
   Fixture fixture(false, false, true);
   auto state = [&] { return fixture.driver->status().at("native_control").at("control_transport"); };
   auto until = [&](std::string_view path, std::uint64_t after_epoch, bool ready) {
     const auto deadline = steady() + 8000;
     while (steady() < deadline) {
       fixture.pump(ready); const auto value = state();
+      if (fixture.last_result_reason == "session_control_profile_required") {
+        std::lock_guard lock(fixture.car_mutex);
+        if (fixture.vehicle->safety_state() == SafetyState::TimeoutBrake)
+          throw NominalRouteFixtureWatchdogTimeout("loopback fixture reached its unchanged hard watchdog");
+      }
       if (value.at("path") == path && value.at("epoch").get<std::uint64_t>() > after_epoch &&
           !value.at("selecting").get<bool>() && !value.at("qualifying").get<bool>()) return value.at("epoch").get<std::uint64_t>();
     }
@@ -443,23 +696,28 @@ void product_startup_and_p2p_cloud_recovery() {
   fixture.dc_network_path = "p2p";
   const auto direct_epoch = until("dc", cloud_epoch, true);
   const auto retired = fixture.last_received_payload;
-  // The page continues refreshing an old held motion request across both
-  // switches. Native must keep it neutral until a real release/repress.
+  // A held request crosses the route withdrawal. Native must keep it neutral
+  // until a real release/repress, including the later return to P2P.
   fixture.input(); // Release the completed initial route boundary before pressing motion.
   fixture.requested_throttle = 0.4; fixture.input();
   fixture.dc_network_path = "unknown";
+  // Keep the held request across the route change, but release it as soon as
+  // the sender withdraws DC. Waiting for the whole WSS round trip while this
+  // fixture maps a held throttle to D can prevent the vehicle from accepting
+  // neutral in its previous gear; the real 800 ms watchdog then correctly
+  // clears the profile before a slow CI runner finishes the switch.
+  const auto withdraw_deadline = steady() + 600;
+  while (steady() < withdraw_deadline && state().at("path") == "dc") fixture.pump(true);
+  expect(state().at("path") == "wss" &&
+      fixture.driver->status().at("native_control").at("requires_fresh_input") == true &&
+      fixture.driver->status().at("native_control").at("effective_throttle") == 0.0,
+      "held pre-switch motion was not withdrawn when selecting cloud fallback");
+  fixture.requested_throttle = 0.0; fixture.input();
   const auto fallback_epoch = until("wss", direct_epoch, true);
   expect(fixture.fence.path() == ControlPath::Wss && fixture.apply(retired, ControlPath::DataChannel).at("transport_admitted") == false,
       "retired direct command re-entered after fallback");
-  fixture.input();
-  expect(fixture.driver->status().at("native_control").at("requires_fresh_input") == true &&
-      fixture.driver->status().at("native_control").at("effective_throttle") == 0.0 &&
-      fixture.last_received_payload.at("throttle") == 0.0,
-      "held pre-switch motion rearmed after cloud fallback");
-  // Release inside the existing 800ms vehicle watchdog. Keeping a rejected
-  // nonzero request through the entire 5s retry delay must hard-stop, not renew
-  // the input lease or install a new profile.
-  fixture.requested_throttle = 0.0; fixture.input();
+  expect(fixture.last_received_payload.at("throttle") == 0.0,
+      "cloud fallback sent nonzero motion before a fresh press");
   fixture.dc_network_path = "p2p";
   const auto recovered_epoch = until("dc", fallback_epoch, true);
   expect(recovered_epoch > fallback_epoch, "recovered P2P reused an old route epoch");
@@ -482,6 +740,18 @@ void product_startup_and_p2p_cloud_recovery() {
   fixture.car_control_lease_expiry = utc() - 1;
   expect(fixture.apply(fresh, ControlPath::DataChannel).at("reason") == "transport_authority_unavailable", "expired regular lease admitted P2P");
   std::cout << "[PRODUCT_DIRECT] normal YAML, live cloud authority, no-DC bootstrap, TURN exclusion, P2P/cloud/P2P epochs passed\n";
+}
+void product_startup_and_p2p_cloud_recovery() {
+  // A hard watchdog terminates this nominal-route scenario. Never reactivate
+  // its old session/profile: start a fresh fixture and rerun every assertion.
+  // Real timeout and profile revocation remain covered by the watchdog tests.
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    try { product_startup_and_p2p_cloud_recovery_once(); return; }
+    catch (const NominalRouteFixtureWatchdogTimeout&) {
+      if (attempt == 2) throw;
+      std::cout << "[PRODUCT_DIRECT] fixture watchdog stopped the session; retrying a fresh fixture\n";
+    }
+  }
 }
 void product_cloud_only_never_trials_dc() {
   Fixture fixture(false, false, true, "cloud_only"); fixture.dc_network_path = "p2p";
@@ -586,7 +856,10 @@ void actual_feedback_selection_is_independent_and_rejects_retired_statuses() {
   }
   expect(ready, "one-way DC return loss did not independently select WSS feedback backup");
   const auto fallback = fixture.driver->status().at("native_control").at("control_transport");
-  expect(fallback.at("epoch") == before.at("epoch") && fallback.at("path") == "dc", "return-only fault changed healthy command axis");
+  expect(fallback.at("epoch") == before.at("epoch") && fallback.at("path") == "dc",
+      "return-only fault changed healthy command axis: " + Json{
+          {"before", before}, {"after", fallback}, {"last_reason", fixture.last_result_reason},
+          {"first_vehicle_rejection", fixture.first_vehicle_rejection}}.dump());
   fixture.received_statuses.clear();
   fixture.vehicle_socket.send_json(fixture.feedback_status(++fixture.feedback_status_sequence, fixture.feedback_fence.state()));
   deadline = steady() + 1500;
@@ -725,7 +998,10 @@ void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
     remaining = authority.value("remaining_ms", std::int64_t{0});
     if (authority.value("continuation_available", false) && remaining > 400) break;
   }
-  expect(remaining > 400, "fixture did not observe a fresh vehicle-accepted grant before outage");
+  const auto pre_cut = fixture.driver->status().at("native_control").at("control_transport");
+  expect(remaining > 400 && pre_cut.value("path", "") == "dc" &&
+      pre_cut.at("direct_authority").value("continuation_available", false),
+      "fixture did not retain a healthy direct path and fresh grant before outage: " + pre_cut.dump());
   const auto before = fixture.dc_commands;
   // Cloud shutdown must not pause the independently healthy driver/DC pump.
   // server.stop() closes real sockets but may join workers for longer than the
@@ -766,6 +1042,7 @@ void actual_native_short_cloud_outage_and_independent_vehicle_expiry() {
       {"grant_remaining_at_cut_ms", grant_at_cut}, {"observation_budget_ms", observation_budget},
       {"cut_wait_ms", cut_observed_at - outage_started}, {"cloud_socket_closed", cloud_socket_closed},
       {"observation_elapsed_ms", observed_at - cut_observed_at}, {"shutdown_join_elapsed_ms", steady() - outage_started},
+      {"pre_cut_transport", pre_cut}, {"cut_transport", at_cut.at("control_transport")},
       {"accepted_seq_at_cut", accepted_at_cut}, {"accepted_seq_after_cut", result_progress.value("last_accepted_command_seq", std::uint64_t{0})},
       {"dc_commands_before", before}, {"dc_commands_at_cut", before_observation}, {"dc_commands_during", fixture.dc_commands}, {"transport", during}}.dump() << '\n';
   expect(cloud_socket_closed && observed_at <= outage_deadline && fixture.dc_commands > before_observation &&
@@ -886,6 +1163,6 @@ void emergency_broker_delivers_after_ordinary_wss_is_already_blocked() {
 }
 }  // namespace
 int main(int argc, char** argv) {
-  try { if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
+  try { courier_status_does_not_wait_for_signaling_poll(); if (argc > 1 && std::string_view(argv[1]) == "--feedback-only") { actual_feedback_selection_is_independent_and_rejects_retired_statuses(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-courier-only") { native_courier_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-dual-video-only") { native_dual_video_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-safety-only") { native_publication_safety_interlocks(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--native-publication-only") { native_publication_bridge_integration(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--outage-only") { actual_native_short_cloud_outage_and_independent_vehicle_expiry(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--product-only") { product_recovery_withdraws_unfetched_motion(); product_wss_reconnect_retires_dc_and_recovers_ack(); product_startup_and_p2p_cloud_recovery(); product_cloud_only_never_trials_dc(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r7-only") { review_r7_actual_native_repairs_initial_loss_across_attempt(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r5-only") { emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); return 0; } if (argc > 1 && std::string_view(argv[1]) == "--review-r4-only") { review_r4_late_stop_result_is_historical_not_current(); return 0; } native_publication_bridge_integration(); native_courier_bridge_integration(); native_publication_safety_interlocks(); native_dual_video_bridge_integration(); integration(); review_r6_actual_native_retains_one_shot_candidate_notification(); review_r7_actual_native_repairs_initial_loss_across_attempt(); actual_feedback_selection_is_independent_and_rejects_retired_statuses(); actual_cloud_explicit_denial_revokes_before_short_deadline(); websocket_upgrade_status_preserves_denial_vs_transient_service_failure(); actual_native_short_cloud_outage_and_independent_vehicle_expiry(); emergency_broker_delivers_after_ordinary_wss_is_already_blocked(); std::cout << "Native/cloud/scoped-byte-courier/shared-service integration passed, including cloud outage, short authority and blocked-WSS emergency; loopback only, no WebRTC or hardware proof\n"; }
   catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

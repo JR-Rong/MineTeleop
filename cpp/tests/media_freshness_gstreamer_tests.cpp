@@ -1,5 +1,7 @@
 #include "mine_teleop/detail/gstreamer_freshness.hpp"
 #include "mine_teleop/media.hpp"
+#include "mine_teleop/video.hpp"
+#include "mine_teleop/detail/gstreamer_decoder.hpp"
 
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
@@ -63,12 +65,13 @@ Bytes access_unit(AccessUnitCodec codec, std::initializer_list<int> types) {
   }
   return bytes;
 }
-void push(GstElement* source, const Bytes& bytes, GstClockTime pts) {
+void push(GstElement* source, const Bytes& bytes, GstClockTime pts, bool corrupted = false) {
   auto* buffer = gst_buffer_new_allocate(nullptr, bytes.size(), nullptr);
   gst_buffer_fill(buffer, 0, bytes.data(), bytes.size());
   GST_BUFFER_PTS(buffer) = pts;
   GST_BUFFER_DTS(buffer) = GST_CLOCK_TIME_NONE;
   GST_BUFFER_DURATION(buffer) = 50 * GST_MSECOND;
+  if(corrupted)GST_BUFFER_FLAG_SET(buffer,GST_BUFFER_FLAG_CORRUPTED);
   expect(gst_app_src_push_buffer(GST_APP_SRC(source), buffer) == GST_FLOW_OK, "offline appsrc rejected test buffer");
 }
 template <typename Predicate> void eventually(Predicate predicate, std::string_view message) {
@@ -255,6 +258,100 @@ void test_raw_delivery_ceiling_for_misreported_rate() {
       "actual 30 FPS with declared 20 FPS did not produce unique bounded 20 FPS raw output: " + std::to_string(delivered));
 }
 
+void test_bounded_idr_retry_and_old_identity() {
+  Pipeline pipeline("appsrc name=input is-live=true format=time caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
+      "queue name=send ! appsink name=output sync=false async=false");
+  auto source=element(pipeline,"input"),sink=element(pipeline,"output"),queue=element(pipeline,"send");
+  std::atomic<std::int64_t> now{1000};
+  EncodedSendFreshness state(AccessUnitCodec::H264,100);
+  state.origin_steady_ms=1000;state.now_ms=[&]{return now.load();};
+  auto* pad=gst_element_get_static_pad(queue.get(),"src");attach_encoded_send_freshness(pad,state);gst_object_unref(pad);
+  StopStreaming stop{pipeline.get()};pipeline.play();
+  const auto idr=access_unit(AccessUnitCodec::H264,{7,8,5}),delta=access_unit(AccessUnitCodec::H264,{1});
+  push(source.get(),idr,0);expect(pull_pts(sink.get())==0,"initial IDR absent");
+  now=1050;push(source.get(),Bytes{0xde},40*GST_MSECOND);eventually([&]{return state.key_unit_requests==1;},"initial request absent");
+  // The old IDR is fresh by age at this instant, but is still the old identity.
+  now=1090;push(source.get(),idr,0);
+  eventually([&]{return state.dropped_waiting_idr>=1;},"old IDR unlocked the reference chain");
+  expect(state.blocked && state.fresh_frames==1,"old IDR refreshed health");
+  now=1150;push(source.get(),delta,100*GST_MSECOND);
+  eventually([&]{return state.key_unit_requests==2;},"one bounded retry absent");
+  now=1250;push(source.get(),delta,200*GST_MSECOND);
+  eventually([&]{return state.idr_recovery_timeouts==1;},"recovery deadline not recorded");
+  for(unsigned i=0;i<10;++i)push(source.get(),delta,(201+i)*GST_MSECOND);
+  eventually([&]{return state.dropped_waiting_idr>=12;},"repeat fixture not drained");
+  expect(state.key_unit_requests==2 && state.blocked && state.idr_recovery_timeouts==1,"retry storm or premature recovery");
+  push(source.get(),idr,240*GST_MSECOND);expect(pull_pts(sink.get())==240*GST_MSECOND,"new IDR failed recovery");
+  expect(!state.blocked && state.idr_recoveries==1 && state.idr_recovery_last_ms==200,"recovery timing incorrect");
+  push(source.get(),idr,241*GST_MSECOND,true);
+  eventually([&]{return state.dropped_invalid>=2;},"CORRUPTED IDR was admitted");
+  expect(state.blocked,"corrupt IDR cleared readiness");
+  push(source.get(),idr,245*GST_MSECOND);
+  expect(pull_pts(sink.get())==245*GST_MSECOND && !state.blocked,"clean new IDR did not recover corrupt output");
+}
+
+// Actual production H.264 encoder and send probe. No natural periodic IDR can
+// mask ForceKeyUnit: GOP=200 while this sequence contains only four inputs.
+void test_actual_requested_idr_and_decode() {
+  auto encoder=mine_teleop::create_video_encoder({mine_teleop::EncoderBackend::Cpu,mine_teleop::VideoCodec::H264});
+  Pipeline encode("appsrc name=input is-live=true format=time caps=video/x-raw,format=NV12,width=128,height=96,framerate=20/1 ! "+
+      encoder->pipeline_stage({125,200},"encoder")+" ! h264parse config-interval=-1 ! "
+      "video/x-h264,stream-format=byte-stream,alignment=au ! queue name=send ! appsink name=output sync=false async=false");
+  auto input=element(encode,"input"),encoded=element(encode,"output"),queue=element(encode,"send");
+  std::atomic<std::int64_t> now{1000};
+  EncodedSendFreshness state(AccessUnitCodec::H264,500);
+  state.origin_steady_ms=1000;state.now_ms=[&]{return now.load();};
+  auto* pad=gst_element_get_static_pad(queue.get(),"src");attach_encoded_send_freshness(pad,state);gst_object_unref(pad);
+  StopStreaming stop{encode.get()};encode.play();
+  Pipeline decode("appsrc name=input is-live=false format=time caps=video/x-h264,stream-format=byte-stream,alignment=au ! h264parse ! "+
+      low_latency_decoder_stage("avdec_h264")+" ! appsink name=output sync=false async=false");
+  auto decoder_input=element(decode,"input"),decoded=element(decode,"output");decode.play();
+  const Bytes raw(128*96*3/2,128);
+  GstClockTime recovery_pts=GST_CLOCK_TIME_NONE;
+  const auto forward=[&](bool recovery) {
+    auto* sample=gst_app_sink_try_pull_sample(GST_APP_SINK(encoded.get()),2*GST_SECOND);
+    expect(sample!=nullptr,"actual encoder produced no admitted AU");
+    auto* buffer=gst_sample_get_buffer(sample);GstMapInfo map{};
+    expect(gst_buffer_map(buffer,&map,GST_MAP_READ),"cannot inspect real AU");
+    Bytes bytes(map.data,map.data+map.size);gst_buffer_unmap(buffer,&map);
+    const auto pts=gst_segment_to_running_time(gst_sample_get_segment(sample),GST_FORMAT_TIME,GST_BUFFER_PTS(buffer));
+    gst_sample_unref(sample);
+    if(recovery) {
+      const auto info=inspect_access_unit(AccessUnitCodec::H264,bytes);
+      expect(info.valid && info.idr && info.parameter_sets && pts==650*GST_MSECOND,"requested new IDR missing");
+      recovery_pts=pts;
+    }
+    push(decoder_input.get(),bytes,pts);
+  };
+  push(input.get(),raw,0);forward(false);
+  now=1050;push(input.get(),raw,50*GST_MSECOND);forward(false);
+  now=1600;push(input.get(),raw,100*GST_MSECOND);
+  eventually([&]{return state.key_unit_requests==1;},"real stale AU did not request IDR");
+  expect(state.blocked && state.fresh_frames==2,"fault did not keep send readiness blocked");
+  const auto request_seen=std::chrono::steady_clock::now();
+  now=1650;push(input.get(),raw,650*GST_MSECOND);forward(true);
+  const auto encoded_seen=std::chrono::steady_clock::now();
+  expect(state.key_unit_request_failures==0 && state.key_unit_requests==1 && state.idr_recoveries==1,"real ForceKeyUnit did not recover exactly once");
+  gst_app_src_end_of_stream(GST_APP_SRC(decoder_input.get()));
+  bool recovered=false;unsigned frames=0;
+  double decoded_recovery_ms=0;
+  while(auto* sample=gst_app_sink_try_pull_sample(GST_APP_SINK(decoded.get()),2*GST_SECOND)) {
+    auto* buffer=gst_sample_get_buffer(sample);
+    expect(!GST_BUFFER_FLAG_IS_SET(buffer,GST_BUFFER_FLAG_CORRUPTED),"decoder returned damaged recovery output");
+    // Earlier queued output cannot acknowledge recovery of this AU identity.
+    if(GST_BUFFER_PTS(buffer)==recovery_pts) {
+      recovered=true;
+      decoded_recovery_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-request_seen).count();
+    }
+    ++frames;gst_sample_unref(sample);
+  }
+  expect(recovered && frames==3,"matching new IDR never reached actual decoded output");
+  std::cout << mine_teleop::Json({{"event","actual_idr_recovery_fixture"},{"decoded_frames",frames},
+      {"recovery_pts_ns",recovery_pts},{"request_observed_to_encoded_ms",std::chrono::duration<double,std::milli>(encoded_seen-request_seen).count()},
+      {"request_observed_to_decoded_ms",decoded_recovery_ms},
+      {"scope","software codec with deterministic capture age; no network/control/render acceptance"}}).dump()<<'\n';
+}
+
 void test_actual_codec_decode_after_reference_gap(AccessUnitCodec codec) {
   const std::string name = codec == AccessUnitCodec::H264 ? "h264" : "h265";
   const auto encoder = codec == AccessUnitCodec::H264
@@ -309,6 +406,10 @@ void test_actual_codec_decode_after_reference_gap(AccessUnitCodec codec) {
 int main() {
   gst_init(nullptr, nullptr);
   try {
+    test_bounded_idr_retry_and_old_identity();
+    std::cout << "[PASS] bounded IDR retry, timeout, old-identity barrier and recovery metrics\n";
+    test_actual_requested_idr_and_decode();
+    std::cout << "[PASS] actual ForceKeyUnit -> new IDR -> matching decoded output\n";
     for (const auto codec : {AccessUnitCodec::H264, AccessUnitCodec::H265}) {
       test_send_queue_backpressure_and_sample_count(codec);
       std::cout << "[PASS] actual send queue/probe backpressure, IDR requests and new-sample counters "

@@ -461,6 +461,7 @@ struct CloudConfig {
   std::vector<std::string> resolve_entries;
   std::filesystem::path ca_bundle;
   std::string ice_transport_policy{"all"};
+  int ice_direct_timeout_ms{0};  // Opt-in bounded direct attempt; 0 preserves concurrent ICE.
 };
 
 [[nodiscard]] bool ice_transport_policy_is_valid(std::string_view value);

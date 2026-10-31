@@ -9,6 +9,14 @@
 
 namespace mine_teleop::detail {
 
+inline bool mock_idle_reprobe_eligible(bool enabled, bool dc_ready, bool ack_waiting,
+                                       const NativeControlIntentSample& sample, bool clock_ready) {
+  return enabled && dc_ready && !ack_waiting && clock_ready && sample.active && sample.fresh &&
+      !sample.requires_fresh_input && sample.ui_control_epoch != 0 && sample.refresh_sample_healthy &&
+      sample.intent.gear == "N" && sample.intent.is_neutral() && sample.intent.critical_video_ready &&
+      sample.intent.critical_video_sample_healthy;
+}
+
 // Serialized by DriverConsoleRuntime's control socket mutex. Native assigns
 // every command sequence; the browser is a bounded byte courier, never a source.
 class ControlTransportSender {
@@ -58,16 +66,43 @@ class ControlTransportSender {
   // motion until DC also has three actual accepted neutral command results.
   // Repeated failures back off and exhaust this attempt's budget. A new media
   // attempt permits new evidence; a ready/unknown UI flap does not reset it.
+  // The explicit isolated-mock option may permit one additional trial only
+  // after a sustained fresh neutral owner and healthy WSS evidence.
+  void observe_mock_idle_reprobe(bool eligible, std::uint64_t owner_epoch, std::int64_t now) {
+    if (!eligible || !owner_epoch || now < 0 || path() != ControlPath::Wss || holding_motion() ||
+        !dc_is_p2p_ || !wss_.healthy(now)) {
+      mock_idle_since_.reset(); mock_idle_epoch_ = 0; mock_idle_last_ms_ = -1; return;
+    }
+    if (!mock_idle_since_ || mock_idle_epoch_ != owner_epoch || now < mock_idle_last_ms_ ||
+        now - mock_idle_last_ms_ >= NativeControlAckRecovery::kFreshAckMs) {
+      mock_idle_since_ = now; mock_idle_epoch_ = owner_epoch;
+    }
+    mock_idle_last_ms_ = now;
+  }
   bool consider_dc(std::string_view attempt, std::int64_t now, int timeout_ms) {
     const bool unhealthy_wss = first_wss_sent_ms_ >= 0 && now >= first_wss_sent_ms_ &&
         now - first_wss_sent_ms_ >= NativeControlAckRecovery::kStallMs &&
         (last_wss_result_ms_ < 0 || now - last_wss_result_ms_ > NativeControlAckRecovery::kStallMs ||
          last_wss_result_age_ms_ > NativeControlAckRecovery::kFreshAckMs);
     if (attempt.empty() || path() != ControlPath::Wss || holding_motion() ||
-        (!dc_is_p2p_ && !wss_.healthy(now) && !unhealthy_wss) ||
-        (trial_attempt_ == attempt && (failed_trials_ >= kMaxTrialsPerAttempt ||
-            now < next_trial_ms_ || (!dc_is_p2p_ && !unhealthy_wss)))) return false;
-    if (trial_attempt_ != attempt) failed_trials_ = 0;
+        (!dc_is_p2p_ && !wss_.healthy(now) && !unhealthy_wss)) return false;
+    if (trial_attempt_ == attempt) {
+      if (now < next_trial_ms_ || (!dc_is_p2p_ && !unhealthy_wss)) return false;
+      if (failed_trials_ >= kMaxTrialsPerAttempt) {
+        if (mock_idle_reprobe_used_ || !mock_idle_since_ || now < *mock_idle_since_ ||
+            now - *mock_idle_since_ < kMockIdleReprobeMs || now < mock_idle_last_ms_ ||
+            now - mock_idle_last_ms_ >= NativeControlAckRecovery::kFreshAckMs || !wss_.healthy(now)) return false;
+        mock_idle_reprobe_used_ = true;
+        mock_idle_since_.reset(); mock_idle_epoch_ = 0; mock_idle_last_ms_ = -1;
+      }
+    }
+    if (trial_attempt_ != attempt) {
+      failed_trials_ = 0;
+      profile_blocked_dc_ = false;
+      profile_recovery_retry_used_ = false;
+      mock_idle_reprobe_used_ = false;
+      mock_idle_since_.reset(); mock_idle_epoch_ = 0; mock_idle_last_ms_ = -1;
+    }
     trial_attempt_ = attempt;
     begin(ControlPath::DataChannel, std::string(attempt), now, timeout_ms);
     return true;
@@ -132,6 +167,21 @@ class ControlTransportSender {
     if (current && sent.path == ControlPath::Wss) { last_wss_result_ms_ = now; last_wss_result_age_ms_ = age; }
     if (current && sent.path == ControlPath::DataChannel && result.at("transport_admitted").get<bool>())
       last_dc_result_ms_ = now;
+    // A DC trial can happen before the operator has confirmed the required
+    // session profile. If that is the reason it was rejected, one later
+    // authenticated, fresh neutral WSS acceptance permits one new bounded
+    // trial budget. It does not bypass backoff, epoch fencing or DC health.
+    if (current && sent.path == ControlPath::DataChannel && result.at("transport_admitted").get<bool>() &&
+        !result.at("accepted").get<bool>() && age <= NativeControlAckRecovery::kFreshAckMs &&
+        result.value("reason", "") == "session_profile_not_ready") profile_blocked_dc_ = true;
+    if (current && sent.path == ControlPath::Wss && sent.neutral && !sent.estop &&
+        result.at("accepted").get<bool>() && result.at("transport_admitted").get<bool>() &&
+        age <= NativeControlAckRecovery::kFreshAckMs &&
+        profile_blocked_dc_ && !profile_recovery_retry_used_) {
+      failed_trials_ = 0;
+      profile_blocked_dc_ = false;
+      profile_recovery_retry_used_ = true;
+    }
     if (current && !sent.estop && (!result.at("accepted").get<bool>() || age > NativeControlAckRecovery::kFreshAckMs))
       (sent.path == ControlPath::Wss ? wss_ : dc_).reset();
     if (current && result.at("accepted").get<bool>() && !sent.estop && age <= NativeControlAckRecovery::kFreshAckMs) {
@@ -152,6 +202,7 @@ class ControlTransportSender {
         {"path", control_path_name(path())}, {"media_attempt", attempt()}, {"selecting", selecting_},
         {"qualifying", qualifying_}, {"dc_path_is_p2p", dc_is_p2p_}, {"revision", revision_}, {"retained_sends", sent_.size()},
         {"failed_dc_trials", failed_trials_}, {"dc_trial_limit", kMaxTrialsPerAttempt},
+        {"mock_idle_reprobe_used", mock_idle_reprobe_used_},
         {"next_dc_trial_monotonic_ms", next_trial_ms_},
         {"wss_result_mean_ms", wss_.mean() ? Json(*wss_.mean()) : Json(nullptr)},
         {"dc_result_mean_ms", dc_.mean() ? Json(*dc_.mean()) : Json(nullptr)}};
@@ -159,7 +210,13 @@ class ControlTransportSender {
 
  private:
   static constexpr unsigned kMaxTrialsPerAttempt = 3;
+  static constexpr std::int64_t kMockIdleReprobeMs = 60000;
   unsigned failed_trials_{0};
+  bool mock_idle_reprobe_used_{false};
+  std::optional<std::int64_t> mock_idle_since_;
+  std::uint64_t mock_idle_epoch_{0};
+  std::int64_t mock_idle_last_ms_{-1};
+  bool profile_blocked_dc_{false}, profile_recovery_retry_used_{false};
   struct Health {
     std::array<std::int64_t, NativeControlAckRecovery::kConsecutiveAnomalies> ages{};
     std::size_t count{0}, index{0}; std::int64_t progress{0};
