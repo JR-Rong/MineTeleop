@@ -476,7 +476,7 @@ struct Window {
             {"last_gap_ms", native.value("last_gap_ms", std::int64_t{0})},
             {"profile_accepted", profile_accepted}, {"profile_attempts", profile_retry.attempts()},
             {"control_epoch", transport.value("epoch", std::uint64_t{0})}, {"handshake_sent", handshake_sent},
-            {"telemetry_age_ms", telemetry_at_ms ? Json(now_ms - telemetry_at_ms) : Json(nullptr)},
+            {"telemetry_age_ms", telemetry_at_ms ? Json(authorization_observed_ms - telemetry_at_ms) : Json(nullptr)},
             {"telemetry_wire_observed", telemetry_wire_observed}, {"telemetry_wire_last_seq", telemetry_wire_last_seq},
             {"telemetry_status_observed", telemetry_status_observed},
             {"telemetry", telemetry}, {"safety_stop_episodes", safety_stop_episodes}};
