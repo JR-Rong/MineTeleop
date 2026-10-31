@@ -3082,6 +3082,17 @@ struct VehicleMediaRuntime::Impl {
     if (sequence == last_vehicle_telemetry_seq) return;
     auto payload_value = telemetry;
     payload_value["control_status_seq"] = ++control_status_seq;
+    // Bench-only metadata: distinguish a stopped telemetry producer from a
+    // status lost after publication. Never log the telemetry payload itself.
+    const auto trace_now = steady_now_ms();
+    if (config.runtime.control_log_commands && config.vehicle_id.starts_with("test_bench_") &&
+        config.vehicle_adapter.type == "mock" && trace_now - last_mock_telemetry_trace_ms >= 1000) {
+      enqueue_control_trace({{"stage", "mock_telemetry_publish"}, {"seq", sequence},
+          {"event_monotonic_ms", trace_now}, {"bytes", payload_value.dump().size()},
+          {"channel_open", control_link_open.load()},
+          {"control_path", std::string(detail::control_path_name(control_transport_fence.path()))}});
+      last_mock_telemetry_trace_ms = trace_now;
+    }
     send_control_status_locked(std::move(payload_value));
     last_vehicle_telemetry_seq = sequence;
   }
@@ -5598,6 +5609,7 @@ struct VehicleMediaRuntime::Impl {
   std::atomic<std::int64_t> native_control_transport_last_error_log_monotonic_ms{0};
   std::optional<std::int64_t> last_vcu_status_ms;
   std::uint64_t last_vehicle_telemetry_seq{0};
+  std::int64_t last_mock_telemetry_trace_ms{0};
   std::string control_status_session_id;
   std::uint64_t control_status_seq{0};
   std::uint64_t last_control_rejection_status_seq{0};
