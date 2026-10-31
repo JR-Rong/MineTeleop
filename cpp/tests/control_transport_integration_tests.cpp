@@ -33,7 +33,13 @@ struct DriverConsoleTransportTestAccess {
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     if (cause == 0) runtime.control_signaling_ack_recovery_.enter(now, 5000, runtime.control_signaling_last_ack_seq_);
-    else if (cause == 1) runtime.control_dc_ack_recovery_.enter(now, 5000, runtime.control_dc_last_ack_seq_);
+    else if (cause == 1) {
+      // This case holds an injected recovery state for the sender to observe.
+      // Older real receipts may still be in flight; they must not accidentally
+      // clear the artificial condition before that observation. Real ACK
+      // transitions themselves are exercised separately via the result handler.
+      runtime.control_dc_ack_recovery_.enter(now, 5000, frame.at("seq").get<std::uint64_t>());
+    }
     else if (cause == 2) runtime.control_transport_dc_ready_ = false;
     else {
       // Do not discard genuine WSS acknowledgements still in flight. The
@@ -588,6 +594,9 @@ void product_recovery_withdraws_unfetched_motion() {
     expect(withdrawn.at("path") == "wss", "recovery did not withdraw DC; cause=" +
         std::to_string(cause) + "; elapsed_ms=" +
         std::to_string(steady() - pending.at("injected_at").get<std::int64_t>()) +
+        "; pending_seq=" + std::to_string(pending.at("frame").at("seq").get<std::uint64_t>()) +
+        "; published_at=" + std::to_string(pending.at("published_at").get<std::int64_t>()) +
+        "; injected_at=" + std::to_string(pending.at("injected_at").get<std::int64_t>()) +
         "; native=" + f.driver->status().at("native_control").dump());
     // No WSS select has been delivered to the vehicle. Neither expiry nor
     // replay rejection may hide a stale publication at this boundary.
