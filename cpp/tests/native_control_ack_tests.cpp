@@ -23,6 +23,14 @@
 #include <sys/socket.h>
 #endif
 
+namespace mine_teleop {
+struct DriverConsoleTransportTestAccess {
+  static std::uint64_t send_failures(const DriverConsoleRuntime& runtime) {
+    return runtime.native_control_send_failures_.load();
+  }
+};
+}
+
 namespace {
 using mine_teleop::Json;
 using mine_teleop::detail::NativeControlAcknowledgementWindow;
@@ -179,6 +187,7 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
   std::atomic<std::uint64_t> warmup_ack_sequence{0};
   std::atomic<bool> stop{false};
   std::atomic<std::uint64_t> sixth_estop_sequence{0};
+  std::atomic<std::uint64_t> failures_before_estop{0};
   std::mutex witness_mutex;
   Json capacity_identity, sixth_estop_identity, sixth_estop_ack_identity;
   std::mutex input_mutex;
@@ -243,6 +252,8 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
                 {
                   std::lock_guard lock(input_mutex);
                   expect(runtime && !emergency_input.empty(), "ESTOP fixture input was not ready");
+                  failures_before_estop.store(
+                      mine_teleop::DriverConsoleTransportTestAccess::send_failures(*runtime));
                   expect(runtime->update_control_intent(emergency_input).value("accepted", false),
                       "valid emergency intent did not latch at the capacity boundary");
                 }
@@ -390,16 +401,17 @@ void test_runtime_full_window_estop_send_succeeds_without_socket_failure() {
       emergency_identity.at("steering") == 0.0 && native.value("effective_estop", false),
       "local accounting/ACK snapshot did not cover the witnessed emergency identity: " + native.dump());
   expect(connections.load() == 1 && native.value("websocket_connected", false) &&
-      native.value("send_failures_total", 1U) == 0 &&
+      native.value("send_failures_total", std::uint64_t{0}) == failures_before_estop.load() &&
       native.value("commands_sent_total", 0U) >= static_cast<unsigned>(normal_packets.load()) + 6U &&
       native.value("last_ack_seq", 0U) > 128U && native.value("unacknowledged_count", 129U) <= 128U &&
       native.value("last_error", "nonempty").empty(),
-      "successful ESTOP send/accounting was treated as socket failure or lost ACK identity: " + native.dump());
+      "ESTOP send introduced a socket failure or lost ACK identity: " + native.dump());
   expect(native.value("socket_read_wakeups_total",0U)>0 &&
       native.value("socket_wait_failures_total",1U)==0 && native.value("sender_wakeup_failures_total",1U)==0,
       "actual runtime did not observe sparse ACK readiness, or its notifications failed: " + native.dump());
   std::cout << "[ACK_CAPACITY] " << Json{{"normal_packets", normal_packets.load()},
       {"warmup_acknowledgements", warmup_acknowledgements.load()}, {"capacity", capacity_witness},
+      {"warmup_send_failures", failures_before_estop.load()},
       {"estop_packets", estop_packets.load()}, {"sixth_estop", emergency_identity},
       {"sixth_ack", acknowledgement_identity}}.dump() << '\n';
   // Sending/receiving ESTOP is not physical vehicle feedback. No fake vehicle
