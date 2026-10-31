@@ -1,5 +1,6 @@
 #include "mine_teleop/detail/native_mock_media_gate.hpp"
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
+#include "mine_teleop/detail/native_mock_profile_retry.hpp"
 #include "mine_teleop/detail/native_mock_keyboard.hpp"
 #include <iostream>
 #include <stdexcept>
@@ -49,6 +50,21 @@ void test_neutral_refresh_sequence() {
   require(sequence.next(input) == 4, "bad sample revision did not advance sequence");
   input["ui_control_epoch"] = 2;
   require(sequence.next(input) == 5, "owner epoch change did not advance sequence");
+}
+void test_profile_retry_stays_bounded_and_needs_live_guards() {
+  mine_teleop::detail::NativeMockProfileRetry retry;
+  require(!retry.due(false, true, false, 0) && !retry.due(true, false, false, 0) &&
+          !retry.due(true, true, true, 0), "profile retry ignored startup gates");
+  for (unsigned n = 0; n < retry.kMaxAttempts; ++n) {
+    const auto t = static_cast<std::int64_t>(n) * retry.kRetryMs;
+    require(retry.due(true, true, false, t), "bounded profile attempt missing");
+    retry.sent(t);
+    require(!retry.due(true, true, false, t + retry.kRetryMs - 1), "profile retry too early");
+    require(!retry.due(true, true, true, t + retry.kRetryMs), "accepted profile was resent");
+    require(!retry.due(true, true, false, t - 1), "backward clock enabled retry");
+  }
+  require(!retry.due(true, true, false, 60000) && retry.attempts() == retry.kMaxAttempts,
+          "profile retry budget was not exhausted");
 }
 void test_mock_keyboard_rearms_only_after_release() {
   mine_teleop::detail::NativeMockKeyboard keyboard;
@@ -107,6 +123,6 @@ void test_live_clock_keyboard_and_media_guard() {
           !native_mock_input_fresh(1001, 1201), "200 ms input lease boundary changed");
 }
 }
-int main() { try { test_gate(); test_neutral_refresh_sequence(); test_mock_keyboard_rearms_only_after_release(); test_live_clock_keyboard_and_media_guard();
+int main() { try { test_gate(); test_neutral_refresh_sequence(); test_profile_retry_stays_bounded_and_needs_live_guards(); test_mock_keyboard_rearms_only_after_release(); test_live_clock_keyboard_and_media_guard();
   std::cout << "PASS scoped mock media, input renewal, keyboard and clock guard\n"; return 0; }
 catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; } }

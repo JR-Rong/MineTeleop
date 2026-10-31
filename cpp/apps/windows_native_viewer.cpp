@@ -3,6 +3,7 @@
 #include "mine_teleop/detail/native_video_health.hpp"
 #include "mine_teleop/detail/native_mock_media_gate.hpp"
 #include "mine_teleop/detail/native_mock_input_sequence.hpp"
+#include "mine_teleop/detail/native_mock_profile_retry.hpp"
 #include "mine_teleop/detail/native_mock_keyboard.hpp"
 #include "mine_teleop/detail/native_control_courier.hpp"
 #include "mine_teleop/detail/native_viewer_observation.hpp"
@@ -162,8 +163,10 @@ struct Window {
     const std::string owner = "windows-native-mock";
     std::atomic<std::uint64_t> epoch{0};
     std::uint64_t profile_seq = 0;
-    bool profile_sent = false, profile_accepted = false, handshake_sent = false;
+    bool profile_accepted = false, handshake_sent = false;
+    detail::NativeMockProfileRetry profile_retry;
     std::optional<SessionControlProfile> requested_profile;
+    std::optional<Json> profile_request;
     auto next_evidence = Clock::now();
     auto next_status = Clock::now();
     Json cached_status;
@@ -361,23 +364,24 @@ struct Window {
         if (!courier->tick(current, io)) throw std::runtime_error("mock courier retired");
         const auto transport = status.at("native_control").at("control_transport");
         const bool negotiated = transport.value("epoch", 0) > 0 && !transport.value("selecting", true);
-        if (ready && negotiated && !profile_sent) {
-          SessionControlProfile profile;
-          profile.target_speed_kph = 0; profile.max_motor_torque_nm = 0;
-          profile.max_brake_pressure_bar = vehicle.field_safety.max_brake_pressure_bar;
-          profile.service_brake_pressure_bar = std::min(config.control_limits.initial_service_brake_pressure_bar, profile.max_brake_pressure_bar);
-          profile.hard_brake_pressure_bar = std::min(config.control_limits.initial_hard_brake_pressure_bar, profile.max_brake_pressure_bar);
-          profile.max_steering_angle_deg = 0;
-          profile.critical_camera_stale_brake_ms = vehicle.runtime.critical_camera_stale_brake_ms;
-          profile.control_recovery_timeout_ms = vehicle.runtime.control_recovery_timeout_ms;
-          requested_profile = profile;
-          auto prepared = driver.prepare_control_profile(profile.to_json());
-          const auto message = prepared.at("request");
-          profile_seq = message.at("seq").get<std::uint64_t>();
+        if (profile_retry.due(ready, negotiated, profile_accepted, now_ms)) {
+          if (!profile_request) {
+            SessionControlProfile profile;
+            profile.target_speed_kph = 0; profile.max_motor_torque_nm = 0;
+            profile.max_brake_pressure_bar = vehicle.field_safety.max_brake_pressure_bar;
+            profile.service_brake_pressure_bar = std::min(config.control_limits.initial_service_brake_pressure_bar, profile.max_brake_pressure_bar);
+            profile.hard_brake_pressure_bar = std::min(config.control_limits.initial_hard_brake_pressure_bar, profile.max_brake_pressure_bar);
+            profile.max_steering_angle_deg = 0;
+            profile.critical_camera_stale_brake_ms = vehicle.runtime.critical_camera_stale_brake_ms;
+            profile.control_recovery_timeout_ms = vehicle.runtime.control_recovery_timeout_ms;
+            requested_profile = profile;
+            profile_request = driver.prepare_control_profile(profile.to_json()).at("request");
+            profile_seq = profile_request->at("seq").get<std::uint64_t>();
+          }
           static_cast<void>(driver.send_control_management({{"source_session_id", session_id},
               {"source_control_session_generation", generation}, {"media_negotiation_id", attempt},
-              {"ui_instance_id", owner}, {"ui_control_epoch", current_epoch}, {"message", message}}));
-          profile_sent = true;
+              {"ui_instance_id", owner}, {"ui_control_epoch", current_epoch}, {"message", *profile_request}}));
+          profile_retry.sent(now_ms);
         }
         if (ready && negotiated && profile_accepted && !handshake_sent) {
           static_cast<void>(driver.send_control_management({{"source_session_id", session_id},
@@ -416,7 +420,8 @@ struct Window {
             {"sent_total", native.value("commands_sent_total", std::uint64_t{0})},
             {"last_ack_seq", native.value("last_ack_seq", std::uint64_t{0})},
             {"last_gap_ms", native.value("last_gap_ms", std::int64_t{0})},
-            {"profile_accepted", profile_accepted}, {"handshake_sent", handshake_sent},
+            {"profile_accepted", profile_accepted}, {"profile_attempts", profile_retry.attempts()},
+            {"control_epoch", transport.value("epoch", std::uint64_t{0})}, {"handshake_sent", handshake_sent},
             {"telemetry_age_ms", telemetry_at_ms ? Json(now_ms - telemetry_at_ms) : Json(nullptr)},
             {"telemetry", telemetry}, {"safety_stop_episodes", safety_stop_episodes}};
         std::fprintf(stderr, "%s\n", evidence.dump().c_str()); std::fflush(stderr);
