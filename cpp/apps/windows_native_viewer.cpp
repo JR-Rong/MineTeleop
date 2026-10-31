@@ -410,6 +410,7 @@ struct Window {
             {"sctp_direct_udp", channel->direct_udp(mock_local_ip, mock_peer_ip)}, {"control_path", transport.value("path", "unknown")},
             {"control_selecting", transport.value("selecting", true)}, {"intent_fresh", native.value("intent_fresh", false)},
             {"control_failed_dc_trials", transport.value("failed_dc_trials", 0)},
+            {"mock_idle_reprobe_used", transport.value("mock_idle_reprobe_used", false)},
             {"channel_send", {{"attempted", sends.attempted}, {"queued", sends.queued},
                 {"buffered", sends.buffered}, {"unavailable", sends.unavailable}, {"errors", sends.errors}}},
             {"sent_total", native.value("commands_sent_total", std::uint64_t{0})},
@@ -476,6 +477,7 @@ struct Window {
         throw std::runtime_error("mock control requires an isolated loopback signaling tunnel");
       config.receive_only = !mock_control;
       config.defer_control_bootstrap = mock_control;
+      config.mock_idle_direct_reprobe = mock_control;
       config.max_time_sync_uncertainty_ms = vehicle.field_safety.max_time_sync_uncertainty_ms;
       config.time_sync_interval_ms = vehicle.field_safety.time_sync_interval_ms;
       config.time_sync_samples = vehicle.field_safety.time_sync_samples;

@@ -5349,6 +5349,11 @@ DriverConsoleRuntime::DriverConsoleRuntime(DriverConfig config, std::string vehi
   if (!control_transport_mode_is_valid(config_.control_transport_mode))
     throw std::invalid_argument("control.transport_mode must be p2p_preferred or cloud_only");
   if (vehicle_id_.empty()) throw std::invalid_argument("vehicle id is required");
+  if (config_.mock_idle_direct_reprobe &&
+      (!config_.defer_control_bootstrap || config_.receive_only ||
+       vehicle_id_.rfind("test_bench_", 0) != 0 ||
+       config_.signaling_url.rfind("ws://127.0.0.1:", 0) != 0))
+    throw std::invalid_argument("mock idle direct reprobe requires isolated mock control");
   reset_control_profile_locked();
   if (!signaling_url_is_secure_or_loopback(config_.signaling_url)) {
     throw std::invalid_argument("public signaling URL must use HTTPS or WSS; HTTP/WS is allowed only on loopback");
@@ -6475,6 +6480,10 @@ bool DriverConsoleRuntime::send_native_control_sample(std::stop_token stop) {
         select_control_wss_locked(monotonic_ms, recovery_timeout_ms);
       if (control_transport_sender_.observe(dc_ready, current_media_attempt, monotonic_ms, recovery_timeout_ms))
         retire_control_dc_locked();
+      control_transport_sender_.observe_mock_idle_reprobe(
+          detail::mock_idle_reprobe_eligible(config_.mock_idle_direct_reprobe, dc_ready,
+              control_signaling_ack_recovery_.waiting(), sample, command.control_time_sync_ready),
+          sample.ui_control_epoch, monotonic_ms);
       if (dc_ready && !control_signaling_ack_recovery_.waiting() &&
           control_transport_sender_.consider_dc(current_media_attempt, monotonic_ms, recovery_timeout_ms)) {
         control_dc_ack_window_.reset(); control_dc_ack_recovery_.reset(); control_dc_last_ack_seq_ = 0;

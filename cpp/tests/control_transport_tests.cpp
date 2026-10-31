@@ -225,6 +225,66 @@ void confirmed_profile_permits_only_one_new_bounded_dc_budget() {
   expect(!sender.consider_dc("media-a", now + 600000, 5000), "profile retry became unbounded");
 }
 
+void mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt() {
+  ControlTransportSender sender; sender.set_data_channel_is_p2p(true);
+  std::int64_t now = 0; std::uint64_t seq = 1;
+  for (int failure = 1; failure <= 3; ++failure) {
+    expect(sender.consider_dc("media-a", now, 5000), "initial bounded trial missing");
+    expect(sender.observe(false, "media-a", ++now, 5000), "failed trial did not fall back");
+    auto frame = payload(seq++, now); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now);
+    sender.note_result(response(frame, true, true), now + 1, 5000);
+    now += 5000 * (1 << (failure - 1));
+  }
+  // Fresh neutral WSS results are required for a continuous interval. A
+  // stale loop, owner change, or active input must reset the interval.
+  auto tick = [&](bool idle, std::uint64_t owner_epoch, std::int64_t step = 50) {
+    now += step;
+    auto frame = payload(seq++, now - 10); sender.decorate(frame); sender.note_sent(frame, ControlPath::Wss, now - 10);
+    expect(sender.note_result(response(frame, true, false), now, 5000).matched, "fresh WSS result missing");
+    sender.observe_mock_idle_reprobe(idle, owner_epoch, now);
+  };
+  for (int i = 0; i < 1205; ++i) { tick(false, 1); expect(!sender.consider_dc("media-a", now, 5000), "active input enabled reprobe"); }
+  for (int i = 0; i < 600; ++i) { tick(true, 1); expect(!sender.consider_dc("media-a", now, 5000), "early idle reprobe"); }
+  tick(true, 2); // ownership handoff restarts the whole idle interval
+  for (int i = 0; i < 600; ++i) { tick(true, 2); expect(!sender.consider_dc("media-a", now, 5000), "owner handoff retained idle time"); }
+  tick(true, 2, 200); // a missed lease-sized observation restarts it too
+  for (int i = 0; i < 1199; ++i) { tick(true, 2); expect(!sender.consider_dc("media-a", now, 5000), "reprobe before 60 seconds"); }
+  tick(true, 2);
+  expect(sender.consider_dc("media-a", now, 5000) && sender.holding_motion() &&
+      sender.status().at("mock_idle_reprobe_used").get<bool>(), "qualified mock reprobe missing its motion fence");
+  expect(sender.observe(false, "media-a", ++now, 5000), "failed mock reprobe did not fall back");
+  auto selected = payload(seq++, now); sender.decorate(selected); sender.note_sent(selected, ControlPath::Wss, now);
+  sender.note_result(response(selected, true, true), now + 1, 5000);
+  for (int i = 0; i < 2405; ++i) { tick(true, 2); expect(!sender.consider_dc("media-a", now, 5000), "mock reprobe exceeded its one-attempt budget"); }
+  expect(sender.consider_dc("media-b", now + 1, 5000) && sender.holding_motion(), "new media attempt did not rearm safely");
+}
+
+void mock_idle_reprobe_requires_all_fresh_neutral_guards() {
+  NativeControlIntentSample sample;
+  sample.active = sample.fresh = sample.refresh_sample_healthy = true;
+  sample.requires_fresh_input = false; sample.ui_control_epoch = 1;
+  sample.intent.critical_video_ready = sample.intent.critical_video_sample_healthy = true;
+  auto eligible = [&](bool enabled = true, bool dc = true, bool waiting = false, bool clock = true) {
+    return mock_idle_reprobe_eligible(enabled, dc, waiting, sample, clock);
+  };
+  expect(eligible(), "healthy neutral mock sample rejected");
+  expect(!eligible(false) && !eligible(true, false) && !eligible(true, true, true) &&
+      !eligible(true, true, false, false), "mock, DC, ACK, or clock guard omitted");
+  auto original = sample;
+  sample.active = false; expect(!eligible(), "inactive owner accepted"); sample = original;
+  sample.fresh = false; expect(!eligible(), "stale input accepted"); sample = original;
+  sample.refresh_sample_healthy = false; expect(!eligible(), "unhealthy refresh accepted"); sample = original;
+  sample.requires_fresh_input = true; expect(!eligible(), "unrearmed input accepted"); sample = original;
+  sample.ui_control_epoch = 0; expect(!eligible(), "missing owner accepted"); sample = original;
+  sample.intent.gear = "D"; expect(!eligible(), "drive gear accepted"); sample = original;
+  sample.intent.throttle = .1; expect(!eligible(), "throttle accepted"); sample = original;
+  sample.intent.estop = true; expect(!eligible(), "emergency accepted"); sample = original;
+  sample.intent.critical_video_ready = false; expect(!eligible(), "unready video accepted"); sample = original;
+  sample.intent.critical_video_sample_healthy = false; expect(!eligible(), "unhealthy video accepted");
+  DriverConfig invalid; invalid.mock_idle_direct_reprobe = true;
+  throws([&] { DriverConsoleRuntime runtime(invalid, "vehicle-001", "fixture"); });
+}
+
 void signatures_bind_native_bytes_and_vehicle_results() {
   const std::string key = "01234567890123456789012345678901"; // Public test vector, never a deployed key.
   expect(control_transport_mac("abc", key) == "d5c75dc69d8243aa0882a04342d9ff7c73537a0311a7950800607be225594009", "SHA256 MAC disagrees with independent test vector");
@@ -331,9 +391,11 @@ int main() {
   try {
     publication_is_owned_only_by_its_current_dc_epoch();
     failed_direct_trials_back_off_and_exhaust_per_attempt();
+    mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt();
+    mock_idle_reprobe_requires_all_fresh_neutral_guards();
     confirmed_profile_permits_only_one_new_bounded_dc_budget();
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "13 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "15 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

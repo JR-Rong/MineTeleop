@@ -396,6 +396,8 @@ struct DriverConfig {
   // In-process opt-in for a control client that must verify its peer and
   // video before creating the first input. Not loaded from YAML.
   bool defer_control_bootstrap{false};
+  // In-process isolated zero-speed mock experiment; never loaded from YAML.
+  bool mock_idle_direct_reprobe{false};
   std::filesystem::path browser_event_log_path;
   std::uint64_t browser_event_log_max_bytes{2 * 1024 * 1024};
   int browser_event_log_files{3};

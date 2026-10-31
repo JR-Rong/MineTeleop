@@ -20,6 +20,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 PURE_TESTS = (
+    ("IPv6 DTLS metadata capture", (sys.executable, "scripts/test/ipv6_dtls_metadata_capture.test.py")),
     ("codec probe supervisor", (sys.executable, "scripts/test/codec_roundtrip_probe.test.py")),
     ("hybrid evidence acceptance", (sys.executable, "scripts/test/hybrid_receiver_analyze.test.py")),
     ("release helpers", (sys.executable, "-m", "unittest", "discover", "-s", "scripts/ci", "-p", "test_*.py", "-v")),
