@@ -1,6 +1,7 @@
 #include "mine_teleop/detail/control_transport.hpp"
 #include "mine_teleop/detail/control_transport_sender.hpp"
 #include "mine_teleop/detail/mock_compact_control.hpp"
+#include "mine_teleop/detail/mock_compact_telemetry.hpp"
 #include "control_time_fixture.hpp"
 #include "mine_teleop/server.hpp"
 
@@ -40,6 +41,24 @@ namespace {
 using namespace mine_teleop;
 using namespace mine_teleop::detail;
 void expect(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+void mock_telemetry_summary_preserves_safety_fields() {
+  Json full = {{"event", "vehicle_telemetry"}, {"protocol_version", 1},
+      {"vehicle_id", "test_bench_001"}, {"driver_id", "driver"}, {"session_id", "session"},
+      {"seq", 42}, {"sent_at_utc_ms", 12345}, {"control_status_seq", 44},
+      {"safety_state", "CONTROL_ACTIVE"}, {"control_timing", {{"control_braking_wait", true},
+          {"driver_critical_video_ready", false}, {"rearm_required", true}, {"last_valid_control_age_ms", 201}}},
+      {"speed_mps", 0.0}, {"gear", "N"}, {"estop", false}, {"stop_source", ""},
+      {"stop_reason", ""}, {"stop_sequence", 0}, {"control_limits", {{"large", std::string(4000, 'x')}}}};
+  const auto compact = mock_compact_telemetry(full);
+  expect(compact && compact->at("mock_telemetry_summary") == true && compact->dump().size() <= 1200,
+      "mock telemetry summary was not bounded");
+  for (const auto* field : {"vehicle_id", "driver_id", "session_id", "seq", "sent_at_utc_ms",
+      "control_status_seq", "safety_state", "control_timing", "speed_mps", "gear", "estop",
+      "stop_source", "stop_reason", "stop_sequence"})
+    expect(compact->at(field) == full.at(field), "mock telemetry changed a safety or identity field");
+  full.erase("control_timing");
+  expect(!mock_compact_telemetry(full), "incomplete mock telemetry became a summary");
+}
 template<class F> void throws(F action) { bool failed = false; try { action(); } catch (const std::exception&) { failed = true; } expect(failed, "invalid protocol accepted"); }
 ControlCommand command(std::uint64_t seq, std::int64_t now) {
   ControlCommand value; value.vehicle_id = "vehicle-001"; value.driver_id = "driver-001";
@@ -468,6 +487,7 @@ void real_service_switch_does_not_disable_watchdog() {
 }  // namespace
 int main() {
   try {
+    mock_telemetry_summary_preserves_safety_fields();
     compact_mock_wire_preserves_the_signed_command();
     publication_is_owned_only_by_its_current_dc_epoch();
     late_dc_results_withdraw_publication_in_result_handler();

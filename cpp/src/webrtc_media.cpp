@@ -1,6 +1,7 @@
 #include "mine_teleop/media.hpp"
 #include "mine_teleop/detail/control_transport.hpp"
 #include "mine_teleop/detail/mock_compact_control.hpp"
+#include "mine_teleop/detail/mock_compact_telemetry.hpp"
 #include "mine_teleop/detail/direct_authority.hpp"
 #include "mine_teleop/detail/emergency_stop.hpp"
 #include "mine_teleop/detail/feedback_transport.hpp"
@@ -3082,6 +3083,17 @@ struct VehicleMediaRuntime::Impl {
     if (sequence == last_vehicle_telemetry_seq) return;
     auto payload_value = telemetry;
     payload_value["control_status_seq"] = ++control_status_seq;
+    const auto* compact_telemetry_env = std::getenv("MINE_TELEOP_MOCK_COMPACT_TELEMETRY");
+    const auto telemetry_now = steady_now_ms();
+    const bool compact_telemetry = mock_compact_control_enabled() && compact_telemetry_env &&
+        std::string_view(compact_telemetry_env) == "1" && control_link_open &&
+        control_transport_fence.path() == detail::ControlPath::DataChannel;
+    if (compact_telemetry && last_mock_full_telemetry_ms > 0 &&
+        telemetry_now >= last_mock_full_telemetry_ms && telemetry_now - last_mock_full_telemetry_ms < 1000) {
+      if (auto compact = detail::mock_compact_telemetry(payload_value)) payload_value = std::move(*compact);
+    } else if (compact_telemetry) {
+      last_mock_full_telemetry_ms = telemetry_now;
+    }
     // Bench-only metadata: distinguish a stopped telemetry producer from a
     // status lost after publication. Never log the telemetry payload itself.
     const auto trace_now = steady_now_ms();
@@ -3089,7 +3101,7 @@ struct VehicleMediaRuntime::Impl {
         config.vehicle_adapter.type == "mock" && trace_now - last_mock_telemetry_trace_ms >= 1000) {
       enqueue_control_trace({{"stage", "mock_telemetry_publish"}, {"seq", sequence},
           {"event_monotonic_ms", trace_now}, {"bytes", payload_value.dump().size()},
-          {"channel_open", control_link_open.load()},
+          {"channel_open", control_link_open.load()}, {"summary", payload_value.value("mock_telemetry_summary", false)},
           {"control_path", std::string(detail::control_path_name(control_transport_fence.path()))}});
       last_mock_telemetry_trace_ms = trace_now;
     }
@@ -5610,6 +5622,7 @@ struct VehicleMediaRuntime::Impl {
   std::optional<std::int64_t> last_vcu_status_ms;
   std::uint64_t last_vehicle_telemetry_seq{0};
   std::int64_t last_mock_telemetry_trace_ms{0};
+  std::int64_t last_mock_full_telemetry_ms{0};
   std::string control_status_session_id;
   std::uint64_t control_status_seq{0};
   std::uint64_t last_control_rejection_status_seq{0};
