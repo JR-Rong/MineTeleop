@@ -558,21 +558,22 @@ void product_recovery_withdraws_unfetched_motion() {
           !transport().at("selecting").get<bool>()) break;
     }
     expect(transport().at("path") == "dc" && !transport().at("qualifying").get<bool>(), "DC not qualified");
-    // Complete the asynchronous route-boundary rearm with fresh neutral
-    // input and live vehicle receipts before asking for a motion publication.
-    // A sender tick can still invalidate input immediately after the first
-    // qualified status is observed, especially on a loaded CI runner.
-    deadline = steady() + 150;
-    while (steady() < deadline) f.pump(true);
-    f.input(); f.requested_throttle = 0.4; f.input();
-    // Do not pump/fetch any further DC frames. The native sender produces a
-    // genuinely nonzero command which the vehicle has never received.
     Json pending;
-    deadline = steady() + 1000;
-    while (steady() < deadline && pending.is_null()) {
-      if (steady() - f.last_input >= 60) f.input();
-      pending = DriverConsoleTransportTestAccess::withdraw_with_pending_motion(*f.driver, cause);
-      if (pending.is_null()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // A qualified status can precede a sender-thread route-boundary rearm.
+    // Re-establish neutral with live receipts before each bounded attempt.
+    // If the motion sample races that rearm, resume pumping before the actual
+    // ACK watchdog expires and try a fresh release/press; never retimestamp a
+    // previously published command or fetch the frame being tested.
+    for (int attempt = 0; attempt < 3 && pending.is_null(); ++attempt) {
+      f.requested_throttle = 0.0; f.input();
+      deadline = steady() + 150;
+      while (steady() < deadline) f.pump(true);
+      f.input(); f.requested_throttle = 0.4; f.input();
+      deadline = steady() + 120;
+      while (steady() < deadline && pending.is_null()) {
+        pending = DriverConsoleTransportTestAccess::withdraw_with_pending_motion(*f.driver, cause);
+        if (pending.is_null()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
     }
     expect(pending.is_object(), "no unfetched nonzero native publication; cause=" + std::to_string(cause) +
         "; native=" + f.driver->status().at("native_control").dump());
