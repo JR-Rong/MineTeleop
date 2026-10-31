@@ -5701,6 +5701,12 @@ bool DriverConsoleRuntime::consume_vehicle_control_result_locked(const Json& inp
       control_dc_last_ack_seq_ = seq;
       const auto transition = control_dc_ack_recovery_.note_ack_progress(now, seq, receipt.round_trip_ms, timeout_ms);
       rearm = rearm || transition.entered || transition.recovered;
+      // A direct result can be consumed on the courier thread. Retire the
+      // existing DC publication in this same critical section when its ACK
+      // health enters recovery; waiting for the next sender tick would allow
+      // that courier call to fetch an older still-live motion publication.
+      if (transition.entered && control_transport_sender_.path() == detail::ControlPath::DataChannel)
+        select_control_wss_locked(now, timeout_ms);
     }
   }
   if (rearm) native_control_intent_.invalidate(true);

@@ -6,6 +6,35 @@
 #include <iostream>
 #include <stdexcept>
 
+namespace mine_teleop {
+struct DriverConsoleTransportTestAccess {
+  static void begin_direct(DriverConsoleRuntime& runtime, const std::string& key) {
+    { std::lock_guard lock(runtime.mutex_); runtime.control_transport_mac_key_ = key; }
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    runtime.control_transport_sender_.set_data_channel_is_p2p(true);
+    runtime.control_transport_sender_.begin(detail::ControlPath::DataChannel, "media-a", 500, 5000);
+  }
+  static Json sent(DriverConsoleRuntime& runtime, Json frame, std::int64_t sent_ms) {
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    runtime.control_transport_sender_.decorate(frame);
+    runtime.control_transport_sender_.note_sent(frame, detail::ControlPath::DataChannel, sent_ms);
+    runtime.control_dc_ack_window_.note_sent(frame.at("seq").get<std::uint64_t>(), sent_ms);
+    runtime.control_transport_latest_dc_ = frame;
+    runtime.control_transport_latest_dc_at_ms_ = sent_ms;
+    return frame;
+  }
+  static void deliver(DriverConsoleRuntime& runtime, const Json& result, std::int64_t now) {
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    static_cast<void>(runtime.consume_vehicle_control_result_locked(result, "session-001", "vehicle-001", "driver-001", now, true));
+  }
+  static bool direct_retired(DriverConsoleRuntime& runtime) {
+    std::lock_guard lock(runtime.control_signaling_websocket_mutex_);
+    return runtime.control_transport_sender_.path() == detail::ControlPath::Wss &&
+        runtime.control_transport_latest_dc_.is_null() && runtime.control_dc_ack_window_.pending_count() == 0;
+  }
+};
+}  // namespace mine_teleop
+
 namespace {
 using namespace mine_teleop;
 using namespace mine_teleop::detail;
@@ -69,6 +98,23 @@ Json response(const Json& frame, bool accepted = true, bool selected = false) {
       {"transport_admitted", true}, {"transport_selected", selected},
       {"authority_epoch", frame.contains("control_transport") ? frame.at("control_transport").at("epoch") : Json(0)},
       {"control_transport", frame.value("control_transport", Json(nullptr))}};
+}
+void late_dc_results_withdraw_publication_in_result_handler() {
+  DriverConfig config; config.driver_id = "driver-001"; config.signaling_url = "http://127.0.0.1:1";
+  config.browser_event_log_path.clear();
+  DriverConsoleRuntime runtime(config, "vehicle-001", "fixture");
+  const std::string key = "01234567890123456789012345678901";
+  DriverConsoleTransportTestAccess::begin_direct(runtime, key);
+  for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+    const std::int64_t now = 1000 + static_cast<std::int64_t>(seq) * 300;
+    const auto frame = DriverConsoleTransportTestAccess::sent(runtime, payload(seq, now - 250), now - 250);
+    auto result = response(frame, true, seq == 1);
+    result["vehicle_mac"] = transport_message_mac(result, key, true);
+    DriverConsoleTransportTestAccess::deliver(runtime, result, now);
+    if (seq < 3) expect(!DriverConsoleTransportTestAccess::direct_retired(runtime), "DC retired before three late results");
+  }
+  expect(DriverConsoleTransportTestAccess::direct_retired(runtime),
+      "third late DC result did not synchronously retire publication and select WSS");
 }
 void baseline(ControlTransportSender& sender) {
   for (std::uint64_t seq = 1; seq <= 3; ++seq) {
@@ -390,12 +436,13 @@ void real_service_switch_does_not_disable_watchdog() {
 int main() {
   try {
     publication_is_owned_only_by_its_current_dc_epoch();
+    late_dc_results_withdraw_publication_in_result_handler();
     failed_direct_trials_back_off_and_exhaust_per_attempt();
     mock_idle_reprobe_is_fenced_fresh_and_once_per_attempt();
     mock_idle_reprobe_requires_all_fresh_neutral_guards();
     confirmed_profile_permits_only_one_new_bounded_dc_budget();
     version_scope_and_expiry(); single_receiver_epoch_replay_and_emergency(); exact_result_and_neutral_qualification();
     slower_dc_and_lost_selection(); cloud_ingress_without_vehicle_result_can_only_start_a_neutral_trial(); healthy_proven_p2p_is_preferred_to_a_faster_cloud_backup(); signatures_bind_native_bytes_and_vehicle_results(); private_signing_material_is_not_public_session_state(); bounded_status_rejects_unsupported_kinds_and_scope_mismatch(); real_service_switch_does_not_disable_watchdog();
-    std::cout << "15 control transport cases passed; real common safety service, no sockets\n";
+    std::cout << "16 control transport cases passed; real common safety service, no sockets\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
