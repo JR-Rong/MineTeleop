@@ -745,7 +745,8 @@ class Receiver {
     const std::string_view name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
     if (self.options_.trace_dtls_headers && name == "nicesink") {
       if (auto* sink = gst_element_get_static_pad(element, "sink")) {
-        gst_pad_add_probe(sink, GST_PAD_PROBE_TYPE_BUFFER, retained_probe<detail::DtlsRecordTrace, trace_outbound_dtls>,
+        gst_pad_add_probe(sink, static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+            retained_probe<detail::DtlsRecordTrace, trace_outbound_dtls>,
             new std::shared_ptr<detail::DtlsRecordTrace>(self.dtls_trace_), release_callback_owner<detail::DtlsRecordTrace>);
         gst_object_unref(sink);
       }
@@ -757,12 +758,18 @@ class Receiver {
     gst_object_unref(sink);
   }
   static GstPadProbeReturn trace_outbound_dtls(GstPad*, GstPadProbeInfo* info, gpointer data) {
-    auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-    if (!buffer) return GST_PAD_PROBE_OK;
-    std::array<std::uint8_t, 13> header{};
-    const auto count = gst_buffer_extract(buffer, 0, header.data(), header.size());
-    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
-    static_cast<detail::DtlsRecordTrace*>(data)->record(header.data(), count, gst_buffer_get_size(buffer), now);
+    const auto record = [data](GstBuffer* buffer) {
+      if (!buffer) return;
+      std::array<std::uint8_t, 13> header{};
+      const auto count = gst_buffer_extract(buffer, 0, header.data(), header.size());
+      const auto now = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+      static_cast<detail::DtlsRecordTrace*>(data)->record(header.data(), count, gst_buffer_get_size(buffer), now);
+    };
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) record(GST_PAD_PROBE_INFO_BUFFER(info));
+    else if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+      auto* list = GST_PAD_PROBE_INFO_BUFFER_LIST(info);
+      if (list) for (guint i = 0; i < gst_buffer_list_length(list); ++i) record(gst_buffer_list_get(list, i));
+    }
     return GST_PAD_PROBE_OK;
   }
   static const char* candidate_type(NiceCandidateType type) {

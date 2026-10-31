@@ -4,7 +4,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -38,20 +37,21 @@ class DtlsRecordTrace {
     const auto parsed = parse_dtls_record_header(header, header_size);
     if (!parsed) return;
     std::unique_lock lock(mutex_, std::try_to_lock);
-    if (!lock || records_.size() >= kCapacity) { ++dropped_; return; }
-    records_.push_back({now_us, bytes, *parsed});
+    if (!lock || count_ >= kCapacity) { ++dropped_; return; }
+    records_[count_++] = {now_us, bytes, *parsed};
   }
   Batch drain() {
     std::lock_guard lock(mutex_);
     Batch batch{{}, dropped_.exchange(0)};
-    batch.records.assign(records_.begin(), records_.end());
-    records_.clear();
+    batch.records.assign(records_.begin(), records_.begin() + count_);
+    count_ = 0;
     return batch;
   }
 
  private:
   std::mutex mutex_;
-  std::deque<Entry> records_;
+  std::array<Entry, kCapacity> records_{};
+  std::size_t count_{0};
   std::atomic<std::uint64_t> dropped_{0};
 };
 
